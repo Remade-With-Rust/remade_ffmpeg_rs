@@ -1,0 +1,12 @@
+[package]
+name = "rff-format-avi"
+description = "Remade FFmpeg (Rust): AVI (Audio Video Interleaved) container muxer/demuxer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true

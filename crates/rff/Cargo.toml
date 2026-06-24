@@ -1,0 +1,18 @@
+[package]
+name = "rff"
+description = "Remade FFmpeg (Rust): the engine facade — registers built-in codecs/formats and exposes the high-level transcode & probe API."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
+rff-format.workspace = true
+rff-codec-h264.workspace = true
+rff-codec-opus.workspace = true
+rff-codec-avif.workspace = true
+rff-format-avi.workspace = true
+rff-format-avif.workspace = true

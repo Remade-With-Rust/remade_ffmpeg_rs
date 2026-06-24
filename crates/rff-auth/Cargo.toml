@@ -1,0 +1,18 @@
+[package]
+name = "rff-auth"
+description = "Remade FFmpeg (Rust): authentication abstraction with a MATA mID (sovereign identity) verifier."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Enables the MATA mID verifier. The real verification will wire the
+# `@matanetwork/sovereign-id-verify` crate (Remade-With-Rust org); until that
+# dependency is added the verifier is a clearly-labelled stub.
+mata-mid = []
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "rff-codec-avif"
+description = "Remade FFmpeg (Rust): AVIF still-image codec (AV1 intra frame)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
+
+# AV1 encoder backing the AVIF encode path.
+rav1e.workspace = true
+# AV1 decoder backing the AVIF decode path (pure-Rust, via its C-ABI binding).
+rav1d.workspace = true

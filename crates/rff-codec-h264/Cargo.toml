@@ -1,0 +1,12 @@
+[package]
+name = "rff-codec-h264"
+description = "Remade FFmpeg (Rust): H.264 / AVC video codec."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true

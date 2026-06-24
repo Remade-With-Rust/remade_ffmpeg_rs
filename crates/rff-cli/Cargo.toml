@@ -1,0 +1,23 @@
+[package]
+name = "rff-cli"
+description = "Remade FFmpeg (Rust): the ffmpeg & ffprobe command-line front-ends."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Drop-in binary names so existing scripts and muscle memory just work.
+# (See the README "Trademark" note: the product is remade_ffmpeg_rs; these
+# executable names are for command-line compatibility only.)
+[[bin]]
+name = "ffmpeg"
+path = "src/bin/ffmpeg.rs"
+
+[[bin]]
+name = "ffprobe"
+path = "src/bin/ffprobe.rs"
+
+[dependencies]
+rff.workspace = true
+rff-core.workspace = true

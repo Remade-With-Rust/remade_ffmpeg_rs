@@ -1,0 +1,11 @@
+[package]
+name = "rff-core"
+description = "Remade FFmpeg (Rust): core media primitives — frames, packets, formats, errors (libavutil-equivalent)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true

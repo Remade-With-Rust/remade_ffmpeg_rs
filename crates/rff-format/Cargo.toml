@@ -1,0 +1,11 @@
+[package]
+name = "rff-format"
+description = "Remade FFmpeg (Rust): container abstraction — Demuxer/Muxer traits and the format registry (libavformat core)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true

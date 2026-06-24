@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# `cargo build` (no args) builds the whole engine + CLI + server, but NOT the
+# Dioxus UI — that one pulls a heavy webview toolchain, so build it on demand
+# with `cargo build -p rff-ui`.
+default-members = [
+    "crates/rff-core",
+    "crates/rff-codec",
+    "crates/rff-format",
+    "crates/rff-codec-h264",
+    "crates/rff-codec-opus",
+    "crates/rff-codec-avif",
+    "crates/rff-format-avi",
+    "crates/rff-format-avif",
+    "crates/rff",
+    "crates/rff-cli",
+    "crates/rff-auth",
+    "crates/rff-server",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+authors = ["Mata Network <https://www.mata.network>"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates (path-linked; versions track the workspace).
+rff-core = { path = "crates/rff-core", version = "0.0.1" }
+rff-codec = { path = "crates/rff-codec", version = "0.0.1" }
+rff-format = { path = "crates/rff-format", version = "0.0.1" }
+rff-codec-h264 = { path = "crates/rff-codec-h264", version = "0.0.1" }
+rff-codec-opus = { path = "crates/rff-codec-opus", version = "0.0.1" }
+rff-codec-avif = { path = "crates/rff-codec-avif", version = "0.0.1" }
+rff-format-avi = { path = "crates/rff-format-avi", version = "0.0.1" }
+rff-format-avif = { path = "crates/rff-format-avif", version = "0.0.1" }
+rff = { path = "crates/rff", version = "0.0.1" }
+rff-auth = { path = "crates/rff-auth", version = "0.0.1" }
+
+# Third-party (all permissive — MIT/Apache-2.0; CI-enforced by cargo-deny).
+# rav1e: AV1 encoder, BSD-2-Clause. default-features off drops the `asm`
+# feature (no nasm toolchain needed) and the bundled CLI binaries; we consume
+# it purely as a library.
+rav1e = { version = "0.8", default-features = false }
+# rav1d: pure-Rust AV1 decoder, BSD-2-Clause. default-features off drops the
+# `asm` feature (no nasm/cc toolchain); we keep both bit depths. Pinned to a
+# `main` commit because the native, safe Rust API (`rust_api`, mirroring
+# dav1d-rs) is not in the published 1.1.0 yet — using it keeps the decode path
+# 100% safe Rust (no FFI/unsafe in our tree). Revisit when rav1d 1.2 ships.
+rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "2a734dc9cd52190146796fb24b29a8c7e3d2af1e", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+axum = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

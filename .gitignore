@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+dist/
+*.log
+.DS_Store
+# Build artifacts from the Dioxus UI
+crates/rff-ui/dist/

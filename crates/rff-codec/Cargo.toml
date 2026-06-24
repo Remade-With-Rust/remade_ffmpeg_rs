@@ -1,0 +1,11 @@
+[package]
+name = "rff-codec"
+description = "Remade FFmpeg (Rust): codec abstraction — Decoder/Encoder traits and the codec registry (libavcodec core)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true

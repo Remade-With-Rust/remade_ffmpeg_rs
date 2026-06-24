@@ -1,0 +1,20 @@
+[package]
+name = "rff-ui"
+description = "Remade FFmpeg (Rust): Dioxus front-end (web / PWA / desktop / mobile)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rff-ui"
+path = "src/main.rs"
+
+[dependencies]
+# The Dioxus desktop renderer pulls a system webview (WebView2 on Windows), so
+# this crate is excluded from the workspace default build. Build it explicitly:
+#   cargo build -p rff-ui
+# For web/mobile targets, swap the feature and use the `dx` CLI (dioxus-cli).
+dioxus = { version = "0.6", features = ["desktop"] }
+rff.workspace = true
