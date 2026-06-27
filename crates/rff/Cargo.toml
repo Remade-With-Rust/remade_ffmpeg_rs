@@ -45,10 +45,12 @@ rff-format-mkv.workspace = true
 rff-codec-openh264 = { workspace = true, optional = true }
 
 [features]
-# H.264 ships with rusty_h264's vendored openh264 SIMD asm on by default — it makes
-# the codec competitive. This requires `nasm` at build time; drop it with
-# `--no-default-features` for the pure-Rust scalar path (no nasm, no `unsafe`).
-default = ["h264-asm"]
+# Default build is 100% pure Rust: the in-house rusty_h264 codec on its scalar
+# path — no `nasm`, no C, no openh264, builds out of the box.
+default = []
+# Opt-in SIMD speedup for deploy builds: rusty_h264's vendored openh264 SIMD asm.
+# Needs `nasm` at build time and links openh264-sys2's kernels, so this path is
+# NOT pure Rust — keep it off the default build.
 h264-asm = ["rff-codec-h264/asm"]
 # Working H.264 via the C openh264 library — an opt-in cross-check / fallback to
 # the default in-house pure-Rust codec. NOT pure Rust; needs a C toolchain.

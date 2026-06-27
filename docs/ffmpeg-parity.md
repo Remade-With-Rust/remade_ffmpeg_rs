@@ -38,10 +38,10 @@ device support) but defensible.
 
 | # | Codec | Type | Status |
 |---|---|---|---|
-| 1 | **H.264 / AVC** | video | 🟡 **pending** — in-house decoder finalizing; works today via the off-by-default `openh264` FFI stopgap |
+| 1 | **H.264 / AVC** | video | ✅ **decode + encode** — pure-Rust `rusty_h264`, default (optional `h264-asm` SIMD / `h264-openh264` C fallback) |
 | 2 | **AAC** | audio | ✅ in-house decoder, bit-exact vs FFmpeg (decode-only) |
 | 3 | **H.265 / HEVC** | video | ❌ not yet |
-| 4 | **MP3** | audio | 🟡 **pending** — in-house decoder + encoder framework scaffolded (`rff-codec-mp3`), building brick by brick |
+| 4 | **MP3** | audio | ✅ in-house **decoder, bit-exact vs FFmpeg**; encoder framework scaffolded (`rff-codec-mp3`) |
 | 5 | **VP9** | video | ✅ in-house decoder, 315/315 libvpx conformance (decode-only) |
 | 6 | **JPEG** | image | ✅ decode + encode |
 | 7 | **AV1** | video | ✅ decode + encode (rav1d/rav1e) |
@@ -52,13 +52,15 @@ device support) but defensible.
 Beyond the top 10 we also cover GIF (enc+dec), Vorbis (dec), FLAC (dec), PCM
 (enc+dec), JPEG XL (dec).
 
-## In flight (pending decoders)
+With H.264 now pure-Rust by default, **9 of the top 10** have a pure-Rust
+decoder (HEVC is the lone gap).
 
-- **H.264** — in-house pure-Rust decoder, finalizing. Removes the one FFI
-  exception (`openh264`) and the "100% pure Rust" asterisk.
+## In flight
+
 - **AV2** — in-house pure-Rust decoder, forward-looking (successor to AV1; not
   yet deployed globally).
-- **MP3** — in-house encoder + decoder, scaffolded in `rff-codec-mp3`.
+- **MP3 encoder** — psychoacoustic model + two-loop quantizer (the decoder is
+  done and bit-exact).
 
 ### MP3: why in-house
 
@@ -78,6 +80,7 @@ AAC and VP9. `puremp3` stays a possible fast-start reference.
 
 ## Highest-impact next additions
 
-After H.264 lands (7→8 of the top 10, and a clean pure-Rust claim): **HEVC** and
-**MP3** are the biggest remaining traffic-movers. Just outside the top 10,
-**AC-3 / E-AC-3** (Dolby) and **MPEG-2** (DVD/broadcast legacy) are the next tier.
+With H.264 and MP3 decode done, **HEVC** is the biggest remaining traffic-mover
+(the one top-10 gap). Just outside the top 10, **AC-3 / E-AC-3** (Dolby) and
+**MPEG-2** (DVD/broadcast legacy) are the next tier; an in-house **MP3 encoder**
+rounds out MP3.
