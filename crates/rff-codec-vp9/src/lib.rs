@@ -500,7 +500,7 @@ fn decode_term_subexp(b: &mut BoolDecoder) -> u32 {
 struct Vp9Decoder {
     width: u32,
     height: u32,
-    queue: VecDeque<(Vec<u8>, Option<i64>)>,
+    queue: VecDeque<(Vec<u8>, Option<i64>, bool)>,
     eof: bool,
     /// The eight reference-frame slots (`ref_frame_map`).
     ref_frames: [Option<std::sync::Arc<decode::RefFrame>>; 8],
@@ -555,15 +555,20 @@ impl Decoder for Vp9Decoder {
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         // A VP9 "superframe" packs several coded frames (e.g. a hidden alt-ref
         // plus the shown frame) into one packet, with a trailing index. Split it
-        // so each coded frame is decoded in turn.
-        for f in split_superframe(&packet.data) {
-            self.queue.push_back((f, packet.pts));
+        // so each coded frame is decoded in turn. libvpx outputs exactly one
+        // frame per packet — the *last* displayable one — so for spatial
+        // scalability (multiple shown layers in a superframe) only the top layer
+        // is emitted; the lower layers are decoded as references then suppressed.
+        let frames = split_superframe(&packet.data);
+        let last_disp = frames.iter().rposition(|f| peek_displayable(f));
+        for (i, f) in frames.into_iter().enumerate() {
+            self.queue.push_back((f, packet.pts, last_disp == Some(i)));
         }
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        let Some((data, pts)) = self.queue.pop_front() else {
+        let Some((data, pts, display)) = self.queue.pop_front() else {
             return if self.eof { Err(Error::Eof) } else { Err(Error::Again) };
         };
         let mut r = BitReader::new(&data);
@@ -574,6 +579,9 @@ impl Decoder for Vp9Decoder {
             let rf = self.ref_frames[h.frame_to_show as usize]
                 .clone()
                 .ok_or_else(|| Error::invalid("vp9: show_existing_frame on empty slot"))?;
+            if !display {
+                return Err(Error::Again);
+            }
             return Ok(crop_frame(&rf, self.ss_x, self.ss_y, pts));
         }
 
@@ -704,8 +712,11 @@ impl Decoder for Vp9Decoder {
         self.width = h.width;
         self.height = h.height;
 
-        if !h.show_frame {
-            // Decoded but not shown (e.g. an alt-ref); caller should ask again.
+        if !h.show_frame || !display {
+            // Decoded but not output: a hidden alt-ref (`!show_frame`), or a
+            // lower spatial layer superseded by a later shown frame in the same
+            // superframe (`!display`). The references are updated either way;
+            // the caller should ask again.
             return Err(Error::Again);
         }
         Ok(crop_frame(&rf, self.ss_x, self.ss_y, pts))
@@ -714,6 +725,31 @@ impl Decoder for Vp9Decoder {
     fn flush(&mut self) {
         self.eof = true;
     }
+}
+
+/// Peek whether a coded frame would be displayed (`show_frame` or
+/// `show_existing_frame`), reading only the leading uncompressed-header bits.
+/// Used to pick the single output frame of a superframe. Any parse shortfall
+/// defaults to `true` so a malformed frame still reaches the decoder's own
+/// error path rather than being silently dropped.
+fn peek_displayable(data: &[u8]) -> bool {
+    let mut r = BitReader::new(data);
+    (|| -> Result<bool> {
+        if r.f(2)? != FRAME_MARKER {
+            return Ok(true);
+        }
+        let pl = r.f1()?;
+        let ph = r.f1()?;
+        if (ph << 1) | pl == 3 {
+            r.f1()?; // reserved_zero (profile 3)
+        }
+        if r.f1()? == 1 {
+            return Ok(true); // show_existing_frame
+        }
+        let _key_frame = r.f1()?;
+        Ok(r.f1()? == 1) // show_frame
+    })()
+    .unwrap_or(true)
 }
 
 /// Split a VP9 superframe packet into its component coded frames
