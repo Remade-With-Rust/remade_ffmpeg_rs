@@ -13,7 +13,7 @@
 
 use rff_core::{Error, Result};
 
-use crate::frame::{GranuleSpectrum, SideInfo, GRANULE_LINES, SUBBANDS};
+use crate::frame::{GranuleSpectrum, SideInfo, GRANULE_LINES};
 use crate::header::FrameHeader;
 
 pub mod antialias;
@@ -76,12 +76,20 @@ impl Mp3Decode {
         // 3..6. Per granule / channel: Huffman → scalefactors → requantize.
         let mut pcm = Vec::with_capacity(granules * GRANULE_LINES * channels);
         let mut bit_pos = 0usize;
+        // Granule 0's scalefactors are retained per channel for granule 1 `scfsi`
+        // reuse.
+        let mut scalefac: [[scalefactors::ScaleFactors; 2]; 2] = Default::default();
         for gr in 0..granules {
             let mut spectrum = GranuleSpectrum::default();
             for ch in 0..channels {
                 let gi = &si.granules[gr][ch];
-                let sf = scalefactors::decode(&main, &mut bit_pos, header, &si, gr, ch);
-                let (coeffs, nz) = huffman::decode(&main, &mut bit_pos, header, gi);
+                // part2 (scalefactors) + part3 (Huffman) share one bit budget.
+                let part2_3_start = bit_pos;
+                let prev = if gr == 1 { Some(scalefac[0][ch].clone()) } else { None };
+                let sf = scalefactors::decode(&main, &mut bit_pos, header, &si, gr, ch, prev.as_ref());
+                scalefac[gr][ch] = sf.clone();
+                let part2_3_end = part2_3_start + gi.part2_3_length as usize;
+                let (coeffs, nz) = huffman::decode(&main, &mut bit_pos, part2_3_end, header, gi);
                 requantize::apply(header, gi, &sf, &coeffs, nz, &mut spectrum.lines[ch]);
                 spectrum.nonzero[ch] = nz;
             }
@@ -90,6 +98,7 @@ impl Mp3Decode {
             stereo::process(header, &si.granules[gr], &mut spectrum);
 
             // 8..10. Per channel: alias reduction → hybrid IMDCT → synthesis.
+            let mut chan_pcm = [[0f32; GRANULE_LINES]; 2];
             for ch in 0..channels {
                 antialias::reduce(&si.granules[gr][ch], &mut spectrum.lines[ch]);
                 let time = imdct::hybrid(
@@ -97,10 +106,15 @@ impl Mp3Decode {
                     &spectrum.lines[ch],
                     &mut self.imdct_overlap[ch],
                 );
-                synthesis::polyphase(&time, &mut self.synth_fifo[ch], &mut pcm, ch, channels);
+                chan_pcm[ch] = synthesis::polyphase(&time, &mut self.synth_fifo[ch]);
+            }
+            // Interleave the channels into the frame's PCM output.
+            for s in 0..GRANULE_LINES {
+                for cp in chan_pcm.iter().take(channels) {
+                    pcm.push(cp[s]);
+                }
             }
         }
-        let _ = SUBBANDS;
         Ok(pcm)
     }
 }

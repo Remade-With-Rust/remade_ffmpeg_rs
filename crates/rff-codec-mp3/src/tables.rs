@@ -61,6 +61,32 @@ pub const SFB_OFFSET_SHORT_V1: [[u16; 14]; 3] = [
 // brick: SFB_OFFSET_{LONG,SHORT}_V2 for MPEG-2 (22050/24000/16000) and MPEG-2.5
 // (11025/12000/8000) from ISO 13818-3 Table B.8.
 
+/// Long-block scalefactor-band offsets for a sample rate (MPEG-1 rates for now).
+pub fn sfb_long_offsets(sample_rate: u32) -> &'static [u16; 23] {
+    let idx = match sample_rate {
+        48000 => 1,
+        32000 => 2,
+        _ => 0, // 44100 (and, until V2 tables land, the fallback)
+    };
+    &SFB_OFFSET_LONG_V1[idx]
+}
+
+/// Short-block scalefactor-band offsets for a sample rate (MPEG-1 rates).
+pub fn sfb_short_offsets(sample_rate: u32) -> &'static [u16; 14] {
+    let idx = match sample_rate {
+        48000 => 1,
+        32000 => 2,
+        _ => 0,
+    };
+    &SFB_OFFSET_SHORT_V1[idx]
+}
+
+/// Preflag additive table for long blocks (added to high-band scalefactors when
+/// `preflag` is set). 22 entries (band 21 is uncoded → 0).
+pub const PRETAB: [u8; 22] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 3, 2, 0,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,8 +124,9 @@ pub const HUFFMAN_TABLE_COUNT: usize = 34;
 
 // ---- synthesis filterbank (to port) ------------------------------------------
 
-/// The 512-tap polyphase synthesis window `D[i]` (ISO Annex B, Table 3-B.3),
-/// shared by decode (synthesis) and encode (analysis, mirrored).
+/// The 512-tap polyphase synthesis window `D[i]` (ISO Annex B, Table 3-B.3).
 ///
-/// brick: port the 512 coefficients.
-pub const SYNTH_WINDOW_LEN: usize = 512;
+/// brick: port the 512 coefficients in the reference-verification pass (a wrong
+/// window shows up immediately as a PCM mismatch vs FFmpeg). The zero placeholder
+/// keeps the synthesis room compiling and its matrixing/FIFO logic testable.
+pub static SYNTH_D: [f32; 512] = [0.0; 512];
