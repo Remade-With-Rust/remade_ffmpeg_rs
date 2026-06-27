@@ -35,6 +35,8 @@ default-members = [
     "crates/rff-format-jxl",
     "crates/rff-format-mp4",
     "crates/rff-format-mkv",
+    "crates/rff-format-ts",
+    "crates/rff-format-flv",
     "crates/rff-filter",
     "crates/rff-resample",
     "crates/rff",
@@ -84,6 +86,8 @@ rff-format-flac = { path = "crates/rff-format-flac", version = "0.0.1" }
 rff-format-jxl = { path = "crates/rff-format-jxl", version = "0.0.1" }
 rff-format-mp4 = { path = "crates/rff-format-mp4", version = "0.0.1" }
 rff-format-mkv = { path = "crates/rff-format-mkv", version = "0.0.1" }
+rff-format-ts = { path = "crates/rff-format-ts", version = "0.0.1" }
+rff-format-flv = { path = "crates/rff-format-flv", version = "0.0.1" }
 rff-filter = { path = "crates/rff-filter", version = "0.0.1" }
 rff-resample = { path = "crates/rff-resample", version = "0.0.1" }
 rff = { path = "crates/rff", version = "0.0.1" }

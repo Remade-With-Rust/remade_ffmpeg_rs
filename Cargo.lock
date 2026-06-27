@@ -4354,6 +4354,7 @@ dependencies = [
  "rff-format-avi",
  "rff-format-avif",
  "rff-format-flac",
+ "rff-format-flv",
  "rff-format-gif",
  "rff-format-jpeg",
  "rff-format-jxl",
@@ -4361,6 +4362,7 @@ dependencies = [
  "rff-format-mp4",
  "rff-format-ogg",
  "rff-format-png",
+ "rff-format-ts",
  "rff-format-wav",
  "rff-format-webp",
  "rff-resample",
@@ -4567,6 +4569,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rff-format-flv"
+version = "0.0.1"
+dependencies = [
+ "rff-core",
+ "rff-format",
+]
+
+[[package]]
 name = "rff-format-gif"
 version = "0.0.1"
 dependencies = [
@@ -4620,6 +4630,14 @@ name = "rff-format-png"
 version = "0.0.1"
 dependencies = [
  "png",
+ "rff-core",
+ "rff-format",
+]
+
+[[package]]
+name = "rff-format-ts"
+version = "0.0.1"
+dependencies = [
  "rff-core",
  "rff-format",
 ]

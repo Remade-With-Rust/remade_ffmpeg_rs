@@ -86,6 +86,8 @@ fn register_builtin_formats(formats: &mut FormatRegistry) {
     rff_format_jxl::register(formats);
     rff_format_mp4::register(formats);
     rff_format_mkv::register(formats);
+    rff_format_ts::register(formats);
+    rff_format_flv::register(formats);
 }
 
 /// The crate version, surfaced in the CLI/server banners.
