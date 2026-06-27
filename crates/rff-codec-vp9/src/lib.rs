@@ -694,7 +694,21 @@ impl Decoder for Vp9Decoder {
             self.frame_contexts[ctx_idx] = out_fc;
         }
         self.prev_mvs = Some(mvs);
-        self.prev_seg_map = Some(seg_map);
+        // The segment map persists exactly like libvpx's ping-pong buffers: the
+        // swap that promotes this frame's map to the next frame's "previous"
+        // (`vp9_swap_current_and_last_seg_map`) only runs when segmentation is
+        // enabled. A frame with segmentation *disabled* therefore leaves the
+        // last enabled frame's map intact for the next frame's temporal
+        // prediction — overwriting it with this frame's all-zero map (as we did
+        // before) silently wiped the segmentation across a disabled frame and
+        // broke later SEG_LVL_SKIP blocks (the skip-02 conformance vector).
+        // Key / intra / error-resilient frames clear the map instead
+        // (setup_past_independence).
+        if h.seg_enabled {
+            self.prev_seg_map = Some(seg_map);
+        } else if h.key_frame || h.intra_only || h.error_resilient {
+            self.prev_seg_map = None;
+        }
         self.last_frame_key = h.key_frame;
         self.last_show_frame = h.show_frame;
         self.last_intra_only = h.intra_only;
