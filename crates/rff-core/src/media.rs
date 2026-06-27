@@ -68,6 +68,10 @@ pub enum CodecId {
     Vp9,
     /// MP3 audio (MPEG-1/2 Audio Layer III).
     Mp3,
+    /// SubRip subtitle (`.srt`): plain-text cues with `HH:MM:SS,mmm` timing.
+    Subrip,
+    /// WebVTT subtitle (`.vtt`): plain-text cues with `HH:MM:SS.mmm` timing.
+    WebVtt,
 }
 
 impl Default for CodecId {
@@ -96,6 +100,8 @@ impl CodecId {
             CodecId::Aac => "aac",
             CodecId::Vp9 => "vp9",
             CodecId::Mp3 => "mp3",
+            CodecId::Subrip => "subrip",
+            CodecId::WebVtt => "webvtt",
         }
     }
 
@@ -118,6 +124,8 @@ impl CodecId {
             CodecId::Aac => MediaType::Audio,
             CodecId::Vp9 => MediaType::Video,
             CodecId::Mp3 => MediaType::Audio,
+            CodecId::Subrip => MediaType::Subtitle,
+            CodecId::WebVtt => MediaType::Subtitle,
         }
     }
 
@@ -138,6 +146,8 @@ impl CodecId {
             "aac" => Some(CodecId::Aac),
             "vp9" | "libvpx-vp9" => Some(CodecId::Vp9),
             "mp3" | "mp3float" | "libmp3lame" => Some(CodecId::Mp3),
+            "srt" | "subrip" => Some(CodecId::Subrip),
+            "vtt" | "webvtt" => Some(CodecId::WebVtt),
             _ => None,
         }
     }

@@ -4362,9 +4362,11 @@ dependencies = [
  "rff-format-mp4",
  "rff-format-ogg",
  "rff-format-png",
+ "rff-format-srt",
  "rff-format-ts",
  "rff-format-wav",
  "rff-format-webp",
+ "rff-format-webvtt",
  "rff-resample",
 ]
 
@@ -4635,6 +4637,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rff-format-srt"
+version = "0.0.1"
+dependencies = [
+ "rff-core",
+ "rff-format",
+ "rff-subtitle",
+]
+
+[[package]]
 name = "rff-format-ts"
 version = "0.0.1"
 dependencies = [
@@ -4660,6 +4671,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rff-format-webvtt"
+version = "0.0.1"
+dependencies = [
+ "rff-core",
+ "rff-format",
+ "rff-subtitle",
+]
+
+[[package]]
 name = "rff-resample"
 version = "0.0.1"
 
@@ -4677,6 +4697,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "rff-subtitle"
+version = "0.0.1"
 
 [[package]]
 name = "rff-ui"

@@ -289,7 +289,10 @@ fn select_streams(
     if output.maps.is_empty() {
         for (ii, streams) in inputs.iter().enumerate() {
             for (i, s) in streams.iter().enumerate() {
-                if matches!(s.media_type, MediaType::Video | MediaType::Audio) {
+                if matches!(
+                    s.media_type,
+                    MediaType::Video | MediaType::Audio | MediaType::Subtitle
+                ) {
                     selection.push((ii, i));
                 }
             }

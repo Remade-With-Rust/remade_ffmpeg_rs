@@ -41,6 +41,8 @@ rff-format-mp4.workspace = true
 rff-format-mkv.workspace = true
 rff-format-ts.workspace = true
 rff-format-flv.workspace = true
+rff-format-srt.workspace = true
+rff-format-webvtt.workspace = true
 
 # TEMPORARY, opt-in only: Cisco openh264 (C/FFI). Off by default so the normal
 # build stays 100% Rust. Enable with `--features h264-openh264`.

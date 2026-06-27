@@ -1,0 +1,13 @@
+[package]
+name = "rff-format-webvtt"
+description = "Remade FFmpeg (Rust): WebVTT (.vtt) subtitle container."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true
+rff-subtitle.workspace = true

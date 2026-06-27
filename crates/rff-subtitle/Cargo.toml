@@ -1,0 +1,10 @@
+[package]
+name = "rff-subtitle"
+description = "Remade FFmpeg (Rust): shared text-subtitle helpers (cue timing parse/format)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
