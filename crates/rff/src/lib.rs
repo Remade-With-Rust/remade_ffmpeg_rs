@@ -64,6 +64,7 @@ fn register_builtin_codecs(codecs: &mut CodecRegistry) {
     rff_codec_jxl::register(codecs);
     rff_codec_aac::register(codecs);
     rff_codec_vp9::register(codecs);
+    rff_codec_mp3::register(codecs);
     // TEMPORARY: when the `h264-openh264` feature is on, override the scaffolded
     // H.264 with the working (C/FFI) openh264 codec. Removed once the in-house
     // pure-Rust H.264 lands.

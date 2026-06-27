@@ -66,6 +66,8 @@ pub enum CodecId {
     Aac,
     /// VP9 video.
     Vp9,
+    /// MP3 audio (MPEG-1/2 Audio Layer III).
+    Mp3,
 }
 
 impl Default for CodecId {
@@ -93,6 +95,7 @@ impl CodecId {
             CodecId::Jxl => "jpegxl",
             CodecId::Aac => "aac",
             CodecId::Vp9 => "vp9",
+            CodecId::Mp3 => "mp3",
         }
     }
 
@@ -114,6 +117,7 @@ impl CodecId {
             CodecId::Jxl => MediaType::Video,
             CodecId::Aac => MediaType::Audio,
             CodecId::Vp9 => MediaType::Video,
+            CodecId::Mp3 => MediaType::Audio,
         }
     }
 
@@ -133,6 +137,7 @@ impl CodecId {
             "jpegxl" | "jxl" => Some(CodecId::Jxl),
             "aac" => Some(CodecId::Aac),
             "vp9" | "libvpx-vp9" => Some(CodecId::Vp9),
+            "mp3" | "mp3float" | "libmp3lame" => Some(CodecId::Mp3),
             _ => None,
         }
     }

@@ -28,6 +28,7 @@ default-members = [
     "crates/rff-codec-jxl",
     "crates/rff-codec-aac",
     "crates/rff-codec-vp9",
+    "crates/rff-codec-mp3",
     "crates/rff-format-wav",
     "crates/rff-format-ogg",
     "crates/rff-format-flac",
@@ -74,6 +75,7 @@ rff-codec-flac = { path = "crates/rff-codec-flac", version = "0.0.1" }
 rff-codec-jxl = { path = "crates/rff-codec-jxl", version = "0.0.1" }
 rff-codec-aac = { path = "crates/rff-codec-aac", version = "0.0.1" }
 rff-codec-vp9 = { path = "crates/rff-codec-vp9", version = "0.0.1" }
+rff-codec-mp3 = { path = "crates/rff-codec-mp3", version = "0.0.1" }
 # TEMPORARY C/FFI H.264 — deliberately NOT in default-members; opt-in only.
 rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.0.1" }
 rff-format-wav = { path = "crates/rff-format-wav", version = "0.0.1" }

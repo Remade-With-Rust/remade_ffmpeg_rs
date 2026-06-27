@@ -4340,6 +4340,7 @@ dependencies = [
  "rff-codec-h264",
  "rff-codec-jpeg",
  "rff-codec-jxl",
+ "rff-codec-mp3",
  "rff-codec-openh264",
  "rff-codec-opus",
  "rff-codec-pcm",
@@ -4446,6 +4447,14 @@ name = "rff-codec-jxl"
 version = "0.0.1"
 dependencies = [
  "jxl-oxide",
+ "rff-codec",
+ "rff-core",
+]
+
+[[package]]
+name = "rff-codec-mp3"
+version = "0.0.1"
+dependencies = [
  "rff-codec",
  "rff-core",
 ]

@@ -26,6 +26,7 @@ rff-codec-flac.workspace = true
 rff-codec-jxl.workspace = true
 rff-codec-aac.workspace = true
 rff-codec-vp9.workspace = true
+rff-codec-mp3.workspace = true
 rff-format-avi.workspace = true
 rff-format-avif.workspace = true
 rff-format-png.workspace = true

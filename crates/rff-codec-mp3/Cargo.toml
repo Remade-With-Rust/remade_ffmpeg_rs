@@ -1,0 +1,10 @@
+[package]
+name = "rff-codec-mp3"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "In-house pure-Rust MP3 (MPEG-1/2 Audio Layer III) decoder + encoder for remade_ffmpeg_rs"
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
