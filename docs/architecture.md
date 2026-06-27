@@ -88,10 +88,13 @@ tree and the muxer writes `hdrl`/`movi`/`idx1` — so `ffprobe in.avi` and
 stream-copy remuxing through AVI work; a full *transcode* out of AVI still waits
 on a decodable AVI codec body.
 
-The remaining codec *bodies* (`h264`, `opus`) are still scaffolded: each returns
-`Error::Unimplemented` with a precise label, so a transcode using them resolves
-the whole graph and then stops at the first unimplemented stage. Implementation
-order per codec lives in each crate's module docs.
+`h264` is implemented end to end by the pure-Rust
+[`rusty_h264`](https://crates.io/crates/rusty_h264) encoder + decoder (the
+`rff-codec-h264` crate delegates to it; `--features h264-openh264` swaps in the
+C/FFI openh264 as a cross-check). Of the remaining codec *bodies*, `opus` is still
+scaffolded: it returns `Error::Unimplemented` with a precise label, so a transcode
+using it resolves the whole graph and then stops at the first unimplemented stage.
+Implementation order per codec lives in each crate's module docs.
 
 ## Design rules (from the project requirements)
 

@@ -65,9 +65,9 @@ fn register_builtin_codecs(codecs: &mut CodecRegistry) {
     rff_codec_aac::register(codecs);
     rff_codec_vp9::register(codecs);
     rff_codec_mp3::register(codecs);
-    // TEMPORARY: when the `h264-openh264` feature is on, override the scaffolded
-    // H.264 with the working (C/FFI) openh264 codec. Removed once the in-house
-    // pure-Rust H.264 lands.
+    // H.264 defaults to the in-house pure-Rust `rusty_h264` (registered above).
+    // The `h264-openh264` feature swaps in Cisco's C/FFI openh264 instead — a
+    // cross-check / fallback option, off by default.
     #[cfg(feature = "h264-openh264")]
     rff_codec_openh264::register(codecs);
 }
