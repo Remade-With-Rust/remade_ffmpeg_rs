@@ -232,7 +232,7 @@ impl Muxer for TsMuxer {
 /// is the high nibble's guard pattern (`0x2` PTS-only, `0x3` PTS-of-PTS+DTS,
 /// `0x1` DTS).
 fn push_ts33(out: &mut Vec<u8>, guard: u8, v: i64) {
-    out.push((guard << 4) as u8 | (((v >> 30) & 0x07) << 1) as u8 | 0x01);
+    out.push((guard << 4) | (((v >> 30) & 0x07) << 1) as u8 | 0x01);
     out.push(((v >> 22) & 0xFF) as u8);
     out.push((((v >> 15) & 0x7F) << 1) as u8 | 0x01);
     out.push(((v >> 7) & 0xFF) as u8);

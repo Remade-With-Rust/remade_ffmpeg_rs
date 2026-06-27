@@ -36,7 +36,7 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
 /// WebVTT cue settings after the end stamp.
 pub fn parse_cue_timing(line: &str) -> Option<(i64, i64)> {
     let (a, b) = line.split_once("-->")?;
-    let end = b.trim().split_whitespace().next()?;
+    let end = b.split_whitespace().next()?;
     Some((parse_timestamp(a)?, parse_timestamp(end)?))
 }
 
