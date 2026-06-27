@@ -124,9 +124,5 @@ pub const HUFFMAN_TABLE_COUNT: usize = 34;
 
 // ---- synthesis filterbank (to port) ------------------------------------------
 
-/// The 512-tap polyphase synthesis window `D[i]` (ISO Annex B, Table 3-B.3).
-///
-/// brick: port the 512 coefficients in the reference-verification pass (a wrong
-/// window shows up immediately as a PCM mismatch vs FFmpeg). The zero placeholder
-/// keeps the synthesis room compiling and its matrixing/FIFO logic testable.
-pub static SYNTH_D: [f32; 512] = [0.0; 512];
+// The 512-tap polyphase synthesis window `D[i]` (ISO 11172-3 Table 3-B.3) is the
+// canonical ISO data generated into `decode/synth_window.rs`.

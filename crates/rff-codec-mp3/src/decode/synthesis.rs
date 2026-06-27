@@ -9,7 +9,8 @@ use std::f64::consts::PI;
 use std::sync::OnceLock;
 
 use crate::frame::{GRANULE_LINES, SUBBANDS, SUBBAND_LINES};
-use crate::tables;
+
+use super::synth_window::SYNTH_D;
 
 /// Matrixing coefficients `N[i][k] = cos((16+i)·(2k+1)·π/64)`, 64×32.
 fn matrix() -> &'static [[f32; SUBBANDS]; 64] {
@@ -29,7 +30,7 @@ fn matrix() -> &'static [[f32; SUBBANDS]; 64] {
 /// returning 576 PCM samples. `fifo` is the persistent `V[]` state.
 pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; GRANULE_LINES] {
     let n = matrix();
-    let d = &tables::SYNTH_D;
+    let d = &SYNTH_D;
     let mut pcm = [0f32; GRANULE_LINES];
 
     for v in 0..SUBBAND_LINES {

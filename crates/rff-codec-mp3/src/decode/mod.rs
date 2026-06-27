@@ -17,6 +17,7 @@ use crate::frame::{GranuleSpectrum, SideInfo, GRANULE_LINES};
 use crate::header::FrameHeader;
 
 pub mod antialias;
+pub mod codebooks;
 pub mod huffman;
 pub mod imdct;
 pub mod requantize;
@@ -24,6 +25,7 @@ pub mod reservoir;
 pub mod scalefactors;
 pub mod sideinfo;
 pub mod stereo;
+pub mod synth_window;
 pub mod synthesis;
 
 /// Persistent decoder state across frames.

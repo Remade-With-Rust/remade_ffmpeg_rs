@@ -45,27 +45,22 @@ pub fn decode(
         let (s1, s2) = (slen1 as u32, slen2 as u32);
 
         if gi.window_switching && gi.block_type == BlockType::Short {
-            if gi.mixed_block {
+            // Short scalefactors are stored band-major (each band's three windows
+            // together): for sfb, for window. slen1 covers bands < 6, slen2 the
+            // rest. Reading them window-major scrambles values when slen1 ≠ slen2.
+            let start = if gi.mixed_block {
                 // Mixed: long bands 0..8 (slen1), then short bands 3..12.
                 for b in 0..8 {
                     sf.long[b] = r.read(s1) as u8;
                 }
-                for w in 0..3 {
-                    for b in 3..6 {
-                        sf.short[w][b] = r.read(s1) as u8;
-                    }
-                    for b in 6..12 {
-                        sf.short[w][b] = r.read(s2) as u8;
-                    }
-                }
+                3
             } else {
-                for w in 0..3 {
-                    for b in 0..6 {
-                        sf.short[w][b] = r.read(s1) as u8;
-                    }
-                    for b in 6..12 {
-                        sf.short[w][b] = r.read(s2) as u8;
-                    }
+                0
+            };
+            for sfb in start..12 {
+                let slen = if sfb < 6 { s1 } else { s2 };
+                for window in 0..3 {
+                    sf.short[window][sfb] = r.read(slen) as u8;
                 }
             }
         } else {
@@ -92,7 +87,7 @@ pub fn decode(
 mod tests {
     use super::*;
     use crate::bitio::BitWriter;
-    use crate::frame::{ChannelMode, GranuleSideInfo};
+    use crate::frame::{BlockType, ChannelMode, GranuleSideInfo};
 
     fn hdr() -> FrameHeader {
         FrameHeader {
@@ -106,6 +101,36 @@ mod tests {
             original: true,
             emphasis: 0,
         }
+    }
+
+    #[test]
+    fn short_block_scalefactors_are_band_major() {
+        // Short scalefactors are stored band-major; with slen1 ≠ slen2 a
+        // window-major read scrambles them (the bug that broke window-switching).
+        // scalefac_compress 12 → (slen1, slen2) = (3, 2).
+        let mut w = BitWriter::new();
+        let mut expect = [[0u8; crate::frame::SFB_SHORT]; 3];
+        for sfb in 0..12 {
+            let slen = if sfb < 6 { 3 } else { 2 };
+            for window in 0..3 {
+                let v = ((sfb * 3 + window) as u32) & ((1 << slen) - 1);
+                w.write(v, slen);
+                expect[window][sfb] = v as u8;
+            }
+        }
+        let data = w.finish();
+
+        let mut si = SideInfo::default();
+        si.granules[0][0] = GranuleSideInfo {
+            scalefac_compress: 12,
+            window_switching: true,
+            block_type: BlockType::Short,
+            ..Default::default()
+        };
+        let mut pos = 0;
+        let sf = decode(&data, &mut pos, &hdr(), &si, 0, 0, None);
+        assert_eq!(sf.short, expect);
+        assert_eq!(pos, 3 * (6 * 3 + 6 * 2), "band-major bit accounting");
     }
 
     #[test]

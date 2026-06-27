@@ -189,15 +189,20 @@ mod tests {
 
         let mut frames = 0usize;
         let mut samples = 0usize;
+        let mut pcm: Vec<u8> = Vec::new();
         while let Ok(Frame::Audio(af)) = dec.receive_frame() {
             assert_eq!(af.sample_rate, 44100);
             assert_eq!(af.channels, 1);
             assert_eq!(af.planes[0].len(), af.samples * af.channels as usize * 4);
+            pcm.extend_from_slice(&af.planes[0]);
             frames += 1;
             samples += af.samples;
         }
         eprintln!("[MP3] decoded frames={frames} samples={samples}");
         assert!(frames > 0, "must decode at least one frame from real data");
+        if let Ok(out) = std::env::var("MP3_OUT") {
+            std::fs::write(out, &pcm).expect("write MP3_OUT");
+        }
     }
 
     #[test]

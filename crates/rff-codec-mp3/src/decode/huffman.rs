@@ -16,6 +16,8 @@ use crate::frame::{BlockType, GranuleSideInfo, GRANULE_LINES};
 use crate::header::FrameHeader;
 use crate::tables;
 
+use super::codebooks::{PAIR_TABLES, QUAD_A, QUAD_B};
+
 /// A prefix-free codeword book: parallel codeword / bit-length arrays.
 pub struct HuffBook {
     codes: &'static [u16],
@@ -205,49 +207,8 @@ pub fn decode(
     (out, nonzero)
 }
 
-// ---- ISO codebook data (laid + validated brick by brick) ---------------------
-
-/// linbits per pair-table 0..=31 (the escape width on the max coordinate).
-pub const LINBITS: [u8; 32] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0..15 (16 has linbits 1)
-    1, 2, 3, 4, 6, 8, 10, 13, 4, 5, 6, 7, 8, 9, 11, 13,
-];
-
-/// Pair-table 1 (2×2), the simplest real codebook. Entries are in (x·2 + y)
-/// order: (0,0),(0,1),(1,0),(1,1). Kraft sum = 1, prefix-free (see tests).
-static T1: PairTable = PairTable {
-    book: HuffBook::new(&[0b1, 0b001, 0b01, 0b000], &[1, 3, 2, 3]),
-    dim: 2,
-    linbits: 0,
-};
-
-/// Empty table (table 0): codes a constant (0, 0) pair, consuming no bits.
-static T0: PairTable = PairTable { book: HuffBook::new(&[], &[]), dim: 0, linbits: 0 };
-
-/// The 32 pair-tables. brick: tables 2,3,5..31 are still the empty placeholder —
-/// transcribed from ISO Table B.7 and Kraft/prefix-free validated as laid.
-static PAIR_TABLES: [&PairTable; 32] = [
-    &T0, &T1, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0,
-    &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0, &T0,
-];
-
-/// count1 table B (`count1table_select == 1`): fixed 4-bit codes — index i is
-/// coded as the 4-bit value i. Complete and prefix-free by construction.
-static QUAD_B: QuadTable = QuadTable {
-    book: HuffBook::new(
-        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-        &[4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],
-    ),
-};
-
-/// count1 table A (`count1table_select == 0`): a Huffman table.
-/// brick: transcribe the ISO count1 table-A codewords; placeholder = table B.
-static QUAD_A: QuadTable = QuadTable {
-    book: HuffBook::new(
-        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-        &[4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],
-    ),
-};
+// The 32 pair-tables + 2 count1 quad-tables are the canonical ISO codebooks,
+// generated into `codebooks.rs` and imported above.
 
 #[cfg(test)]
 mod tests {
@@ -263,25 +224,35 @@ mod tests {
     }
 
     #[test]
-    fn table1_is_complete_and_prefix_free() {
-        assert!((T1.book.kraft_sum() - 1.0).abs() < 1e-9, "table 1 must be complete");
-        assert!(T1.book.is_prefix_free());
-        assert!(QUAD_B.book.is_prefix_free());
+    fn all_codebooks_complete_and_prefix_free() {
+        // Every canonical ISO codebook must be a complete (Kraft = 1) prefix code.
+        for (n, t) in PAIR_TABLES.iter().enumerate() {
+            if t.dim == 0 {
+                continue; // tables 0, 4, 14 are unused/empty
+            }
+            let k = t.book.kraft_sum();
+            assert!((k - 1.0).abs() < 1e-9, "pair table {n}: Kraft = {k}");
+            assert!(t.book.is_prefix_free(), "pair table {n} not prefix-free");
+        }
+        for (name, q) in [("A", &QUAD_A), ("B", &QUAD_B)] {
+            let k = q.book.kraft_sum();
+            assert!((k - 1.0).abs() < 1e-9, "count1 table {name}: Kraft = {k}");
+            assert!(q.book.is_prefix_free(), "count1 table {name} not prefix-free");
+        }
     }
 
     #[test]
     fn pair_decode_with_signs() {
-        // Synthetic: table 1 codeword for (1,1) is "000" (len 3), no signs (both
-        // zero-free? (1,1) are non-zero → each needs a sign bit). Code "000" then
-        // sign x=1 (negative), sign y=0 (positive) → (-1, 1).
+        // Real table 1: codeword "000" → (1,1); each non-zero gets a sign bit.
+        // sign x = 1 (negative), sign y = 0 (positive) → (-1, 1).
         let bits = pack(&[(0b000, 3), (1, 1), (0, 1)]);
         let mut r = BitReader::new(&bits);
-        assert_eq!(T1.read(&mut r), (-1, 1));
+        assert_eq!(PAIR_TABLES[1].read(&mut r), (-1, 1));
 
-        // Codeword for (0,0) is "1" (len 1), no sign bits → (0,0).
+        // Codeword "1" → (0,0), no sign bits.
         let bits = pack(&[(0b1, 1)]);
         let mut r = BitReader::new(&bits);
-        assert_eq!(T1.read(&mut r), (0, 0));
+        assert_eq!(PAIR_TABLES[1].read(&mut r), (0, 0));
     }
 
     #[test]
@@ -302,8 +273,9 @@ mod tests {
 
     #[test]
     fn quad_decode_bits_and_signs() {
-        // count1 table B: index 0b1010 = (1,0,1,0). v=1 sign1→-1, x=1 sign0→+1.
-        let bits = pack(&[(0b1010, 4), (1, 1), (0, 1)]);
+        // count1 table B codes index i as the 4 bits of 15-i. Index 10 = (1,0,1,0)
+        // → codeword 0b0101; then v=1 sign1→-1, x=1 sign0→+1.
+        let bits = pack(&[(0b0101, 4), (1, 1), (0, 1)]);
         let mut r = BitReader::new(&bits);
         assert_eq!(QUAD_B.read(&mut r), (-1, 0, 1, 0));
     }
