@@ -22,8 +22,10 @@
 //! cleanly at MP3.
 #![allow(dead_code)] // Scaffold: stage bricks are wired but not yet implemented.
 
+use std::collections::VecDeque;
+
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
-use rff_core::{CodecId, Error, Frame, MediaType, Packet, Result};
+use rff_core::{AudioFrame, CodecId, Error, Frame, MediaType, Packet, Result, SampleFormat};
 
 mod bitio;
 mod decode;
@@ -32,6 +34,7 @@ mod frame;
 mod header;
 mod tables;
 
+use header::FrameHeader;
 pub use decode::Mp3Decode;
 pub use encode::Mp3Encode;
 
@@ -50,17 +53,84 @@ pub fn register(registry: &mut CodecRegistry) {
 #[derive(Default)]
 struct Mp3Decoder {
     state: Mp3Decode,
+    /// Accumulated bytes awaiting frame-sync (packets may split/join frames).
+    buf: Vec<u8>,
+    queue: VecDeque<Frame>,
     eof: bool,
 }
 
+impl Mp3Decoder {
+    /// Frame-sync the buffer: for each complete frame, split header / side-info /
+    /// main-data, decode it, and queue an `AudioFrame`. Leaves a trailing partial
+    /// frame in `buf` for the next packet.
+    fn parse_frames(&mut self) {
+        let mut pos = 0;
+        while pos + 4 <= self.buf.len() {
+            // Sync = 11 set bits: 0xFF then top 3 bits of the next byte.
+            if self.buf[pos] != 0xFF || self.buf[pos + 1] & 0xE0 != 0xE0 {
+                pos += 1;
+                continue;
+            }
+            let hb = [self.buf[pos], self.buf[pos + 1], self.buf[pos + 2], self.buf[pos + 3]];
+            let header = match FrameHeader::parse(hb) {
+                Ok(h) => h,
+                Err(_) => {
+                    pos += 1;
+                    continue;
+                }
+            };
+            let frame_size = header.frame_size();
+            if frame_size < 4 {
+                pos += 1;
+                continue;
+            }
+            if pos + frame_size > self.buf.len() {
+                break; // incomplete frame — wait for more data
+            }
+
+            let crc = if header.crc_protected { 2 } else { 0 };
+            let si_start = pos + 4 + crc;
+            let si_len = header.side_info_len();
+            let main_start = si_start + si_len;
+            if main_start > pos + frame_size {
+                pos += 1;
+                continue;
+            }
+            let side_info = self.buf[si_start..main_start].to_vec();
+            let main_data = self.buf[main_start..pos + frame_size].to_vec();
+
+            if let Ok(pcm) = self.state.decode_frame(&header, &side_info, &main_data) {
+                let channels = header.channel_mode.channels().max(1);
+                let mut bytes = Vec::with_capacity(pcm.len() * 4);
+                for s in &pcm {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                self.queue.push_back(Frame::Audio(AudioFrame {
+                    sample_rate: header.sample_rate,
+                    channels: channels as u16,
+                    format: SampleFormat::F32,
+                    planes: vec![bytes],
+                    samples: pcm.len() / channels,
+                    pts: None,
+                }));
+            }
+            pos += frame_size;
+        }
+        self.buf.drain(0..pos);
+    }
+}
+
 impl Decoder for Mp3Decoder {
-    fn send_packet(&mut self, _packet: &Packet) -> Result<()> {
-        // brick: frame-sync the packet, parse each header, feed side-info +
-        // main-data to `self.state.decode_frame`, queue the resulting AudioFrames.
-        Err(Error::Unimplemented("mp3 decode: pipeline not yet built"))
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        self.buf.extend_from_slice(&packet.data);
+        self.parse_frames();
+        Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
+        if let Some(frame) = self.queue.pop_front() {
+            return Ok(frame);
+        }
         if self.eof {
             Err(Error::Eof)
         } else {
@@ -102,6 +172,33 @@ impl Encoder for Mp3Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decode a real MP3 file (path in `MP3_REF`) and report structure. Validates
+    /// frame-sync (skips ID3), header/side-info parsing, and main-data extraction
+    /// on real data. Output is silent until D[]/codebooks are laid; this checks
+    /// the *structure* (frame count, sample count, no panics, finite samples).
+    #[test]
+    fn decode_real_mp3_structure() {
+        let Ok(path) = std::env::var("MP3_REF") else {
+            return; // self-skip when not running the reference harness
+        };
+        let data = std::fs::read(&path).expect("read MP3_REF");
+        let mut dec = Mp3Decoder::default();
+        dec.send_packet(&Packet::from_data(0, data)).unwrap();
+        dec.flush();
+
+        let mut frames = 0usize;
+        let mut samples = 0usize;
+        while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+            assert_eq!(af.sample_rate, 44100);
+            assert_eq!(af.channels, 1);
+            assert_eq!(af.planes[0].len(), af.samples * af.channels as usize * 4);
+            frames += 1;
+            samples += af.samples;
+        }
+        eprintln!("[MP3] decoded frames={frames} samples={samples}");
+        assert!(frames > 0, "must decode at least one frame from real data");
+    }
 
     #[test]
     fn registers_as_audio_codec() {
