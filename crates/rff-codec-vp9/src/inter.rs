@@ -242,6 +242,121 @@ unsafe fn predict_block_avx2(
     }
 }
 
+// ---- aarch64 NEON: mirror of the AVX2 path -------------------------------
+// NEON is the mandatory baseline on aarch64, so these are always reachable
+// there. Each kernel performs the SAME integer math as the scalar reference
+// (`(Σ src·f + 64) >> 7`, clamped to `[0,max]`), so it is bit-exact by
+// construction; `conv8_neon_matches_scalar` is the regression gate (runs on an
+// aarch64 target). Built/verified via `cargo build --target aarch64-*`.
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn has_neon() -> bool {
+    std::arch::is_aarch64_feature_detected!("neon")
+}
+
+/// NEON 8-tap separable-convolution kernel, bit-identical to the scalar
+/// `Σ_k src[i + k*tap_stride] * f[k]`, rounded `>>7` and clamped to `[0,max]`.
+/// Processes 4 outputs per iteration; the `<4` tail is scalar. `tap_stride == 1`
+/// is the horizontal pass, `== row_stride` the vertical.
+///
+/// # Safety
+/// `src` must be readable for `i + 7*tap_stride + 3` u16s and `dst` writable for
+/// `n` u16s; the caller guarantees this via an in-bounds (no edge-clamp) check.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn conv8_neon(src: *const u16, tap_stride: usize, f: &[i32; 8], dst: *mut u16, n: usize, max: i32) {
+    use std::arch::aarch64::*;
+    let round = vdupq_n_s32(64);
+    let zero = vdupq_n_s32(0);
+    let maxv = vdupq_n_s32(max);
+    let mut i = 0usize;
+    while i + 4 <= n {
+        let mut acc = zero;
+        // 8 taps: load 4 consecutive u16 (the k-th tap of 4 adjacent outputs),
+        // zero-widen to u32 (values are non-negative samples ≤ max), and MAC by
+        // the signed scalar tap. Bit-identical to the scalar inner loop.
+        for k in 0..8 {
+            let s = vreinterpretq_s32_u32(vmovl_u16(vld1_u16(src.add(i + k * tap_stride))));
+            acc = vmlaq_n_s32(acc, s, f[k]);
+        }
+        // (Σ + 64) >> 7 with a signed (arithmetic) shift, then clamp [0,max].
+        acc = vshrq_n_s32::<7>(vaddq_s32(acc, round));
+        acc = vminq_s32(vmaxq_s32(acc, zero), maxv);
+        // Narrow i32 (already in [0,max]) → u16 by truncation (exact: fits u16).
+        vst1_u16(dst.add(i), vmovn_u32(vreinterpretq_u32_s32(acc)));
+        i += 4;
+    }
+    while i < n {
+        let mut sum = 0i32;
+        for k in 0..8 {
+            sum += *src.add(i + k * tap_stride) as i32 * f[k];
+        }
+        *dst.add(i) = ((sum + 64) >> 7).clamp(0, max) as u16;
+        i += 1;
+    }
+}
+
+/// NEON separable MC for an interior block (no border clamp, no compound
+/// averaging). Mirrors the four [`predict_block`] branches exactly.
+///
+/// # Safety
+/// The full read window must lie inside the plane (caller checks bounds).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn predict_block_neon(
+    refp: &RefPlane,
+    bx: i32,
+    by: i32,
+    fx: &[i32; 8],
+    fy: &[i32; 8],
+    subx: bool,
+    suby: bool,
+    dst: &mut [u16],
+    dst_stride: usize,
+    w: usize,
+    h: usize,
+    max: i32,
+) {
+    let buf = refp.buf.as_ptr();
+    let stride = refp.stride;
+    let dptr = dst.as_mut_ptr();
+    match (subx, suby) {
+        (false, false) => {
+            for y in 0..h {
+                let s = buf.add((by as usize + y) * stride + bx as usize);
+                std::ptr::copy_nonoverlapping(s, dptr.add(y * dst_stride), w);
+            }
+        }
+        (true, false) => {
+            for y in 0..h {
+                let s = buf.add((by as usize + y) * stride + (bx - 3) as usize);
+                conv8_neon(s, 1, fx, dptr.add(y * dst_stride), w, max);
+            }
+        }
+        (false, true) => {
+            for y in 0..h {
+                let s = buf.add((by + y as i32 - 3) as usize * stride + bx as usize);
+                conv8_neon(s, stride, fy, dptr.add(y * dst_stride), w, max);
+            }
+        }
+        (true, true) => {
+            MC_TMP.with(|cell| {
+                let mut tmp = cell.borrow_mut();
+                let tmp_h = h + TAPS - 1;
+                let tptr = tmp.as_mut_ptr();
+                for r in 0..tmp_h {
+                    let s = buf.add((by + r as i32 - 3) as usize * stride + (bx - 3) as usize);
+                    conv8_neon(s, 1, fx, tptr.add(r * w), w, max);
+                }
+                for y in 0..h {
+                    conv8_neon(tptr.add(y * w) as *const u16, w, fy, dptr.add(y * dst_stride), w, max);
+                }
+            });
+        }
+    }
+}
+
 /// Motion-compensate one block into `dst`. `(bx, by)` is the integer-pel block
 /// origin in the reference plane (block position + the integer part of the MV);
 /// `subpel_x/y` are the 1/16-pel fractional phases (0..16). `filter` selects the
@@ -279,6 +394,25 @@ pub fn predict_block(
             // SAFETY: bounds checked above; AVX2 confirmed present.
             unsafe {
                 predict_block_avx2(refp, bx, by, fx, fy, subx, suby, dst, dst_stride, w, h, max);
+            }
+            return;
+        }
+    }
+
+    // NEON fast path (aarch64): same interior-block / single-ref condition.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let (subx, suby) = (subpel_x != 0, subpel_y != 0);
+        let (nl, nr) = if subx { (3, 4) } else { (0, 0) };
+        let (nt, nb) = if suby { (3, 4) } else { (0, 0) };
+        let in_bounds = bx - nl >= 0
+            && bx + w as i32 + nr <= refp.w
+            && by - nt >= 0
+            && by + h as i32 + nb <= refp.h;
+        if !avg && in_bounds && has_neon() {
+            // SAFETY: bounds checked above; NEON is the aarch64 baseline.
+            unsafe {
+                predict_block_neon(refp, bx, by, fx, fy, subx, suby, dst, dst_stride, w, h, max);
             }
             return;
         }
@@ -428,6 +562,54 @@ mod tests {
         // Phase 0 is the identity tap for all filters.
         for f in &SUBPEL_FILTERS {
             assert_eq!(f[0], [0, 0, 0, 128, 0, 0, 0, 0]);
+        }
+    }
+
+    /// Bit-exact parity gate for the aarch64 NEON convolution kernel. Runs only
+    /// on an aarch64 target; mirrors the scalar `(Σ src·f + 64) >> 7` clamp over
+    /// every filter/phase, both passes (tap_stride 1 and a row stride), the <4
+    /// SIMD tail, and 8/10/12-bit ranges. This is the gate that validates the
+    /// NEON path (which is written to be bit-exact by construction).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn conv8_neon_matches_scalar() {
+        if !has_neon() {
+            return;
+        }
+        let stride = 80usize;
+        let mut s = 0x1234_5678u32;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s
+        };
+        for &max in &[255i32, 1023, 4095] {
+            let src: Vec<u16> = (0..stride * 40).map(|_| (rng() % (max as u32 + 1)) as u16).collect();
+            for filter in 0..SUBPEL_FILTERS.len() {
+                for &phase in &[0usize, 1, 7, 8, 15] {
+                    let f = &SUBPEL_FILTERS[filter][phase];
+                    for &tap_stride in &[1usize, stride] {
+                        for n in [1usize, 3, 4, 7, 8, 13, 16] {
+                            let base = 5 * stride + 5;
+                            let mut got = vec![0u16; n];
+                            unsafe {
+                                conv8_neon(src.as_ptr().add(base), tap_stride, f, got.as_mut_ptr(), n, max);
+                            }
+                            let want: Vec<u16> = (0..n)
+                                .map(|i| {
+                                    let mut sum = 0i32;
+                                    for k in 0..8 {
+                                        sum += src[base + i + k * tap_stride] as i32 * f[k];
+                                    }
+                                    ((sum + 64) >> 7).clamp(0, max) as u16
+                                })
+                                .collect();
+                            assert_eq!(got, want, "max={max} filter={filter} phase={phase} tap_stride={tap_stride} n={n}");
+                        }
+                    }
+                }
+            }
         }
     }
 
