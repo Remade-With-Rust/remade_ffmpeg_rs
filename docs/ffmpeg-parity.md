@@ -38,7 +38,7 @@ device support) but defensible.
 
 | # | Codec | Type | Status |
 |---|---|---|---|
-| 1 | **H.264 / AVC** | video | ✅ **decode + encode** — pure-Rust `rusty_h264`, default (optional `h264-asm` SIMD / `h264-openh264` C fallback) |
+| 1 | **H.264 / AVC** | video | ✅ **decode + encode** — `rusty_h264`, default with SIMD asm (vendored openh264 BSD-2, needs `nasm`); `--no-default-features` for scalar pure Rust |
 | 2 | **AAC** | audio | ✅ in-house decoder, bit-exact vs FFmpeg (decode-only) |
 | 3 | **H.265 / HEVC** | video | ❌ not yet |
 | 4 | **MP3** | audio | ✅ in-house **decoder, bit-exact vs FFmpeg**; encoder framework scaffolded (`rff-codec-mp3`) |

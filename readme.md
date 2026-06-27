@@ -100,15 +100,16 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 | Audio codec | **aac** | in-house **AAC-LC decoder**, all features (short blocks, M/S, intensity stereo, PNS, TNS) — verified bit-exact vs FFmpeg |
 | Audio codec | **mp3** (MPEG-1/2 Layer III) | in-house **decoder + encoder** — framework scaffolded (`rff-codec-mp3`), building brick by brick 🚧 |
 | Video codec | **vp9** (VP9) | **decode** — in-house pure-Rust decoder, **bit-exact against all 315 official libvpx conformance vectors**; profiles 0–3 (4:2:0/4:2:2/4:4:4, 8/10/12-bit), AVX2 + NEON kernels (no encoder; perf tuning to follow) |
-| Video codec | **h264** (H.264 / AVC) | **decode + encode** — pure-Rust [`rusty_h264`](https://crates.io/crates/rusty_h264), **default** |
+| Video codec | **h264** (H.264 / AVC) | **decode + encode** — [`rusty_h264`](https://crates.io/crates/rusty_h264) with SIMD asm, **default** |
 
-> **H.264 is pure Rust by default.** The default build wires the in-house-style
-> pure-Rust `rusty_h264` decoder + encoder — no C, no `nasm`, builds out of the
-> box. Two opt-in paths exist for deploy/cross-checking: `--features h264-asm`
-> adds a SIMD speedup via `rusty_h264`'s vendored openh264 assembly (needs
-> `nasm`, links openh264 kernels — *not* pure Rust), and
-> `--features h264-openh264` swaps in Cisco's C `openh264` as a reference
-> fallback. Both are off by default, so the default binaries stay 100% Rust.
+> **H.264 defaults to `rusty_h264` with SIMD asm on** — substantially faster.
+> Like `rav1e`, the speedup is hand-written x86 **assembly, no C** (openh264's
+> kernels, **vendored** under BSD-2 — no external source tree), isolated in a
+> single `unsafe` crate (`rusty_h264-accel`). The one practical cost: the default
+> build needs **`nasm`** (`choco install nasm` / `apt install nasm` /
+> `brew install nasm`). `--no-default-features` drops to `rusty_h264`'s scalar
+> path (no `nasm`, no asm, zero `unsafe`); `--features h264-openh264` swaps in
+> Cisco's C `openh264` as a reference cross-check.
 
 The **audio path** is real: `ffmpeg -i in.wav -c:a opus out.opus` decodes PCM, encodes Opus, and writes an Ogg file — through the same engine the image codecs use. Parametric codecs (PCM) and ones with out-of-band config (Opus' channels/rate from `OpusHead`) receive their parameters via a `Decoder::configure` step — the same plumbing H.264 will use for SPS/PPS.
 
@@ -126,6 +127,7 @@ With the `format` filter bridging colorspaces, `ffmpeg -i photo.png -vf format=y
 |---|---|---|---|
 | AV1 encode (avif) | [`rav1e`](https://github.com/xiph/rav1e) | BSD-2-Clause | ✅ (asm, no C) |
 | AV1 decode (avif) | [`rav1d`](https://github.com/memorysafety/rav1d) | BSD-2-Clause | ✅ (Rust port of dav1d) |
+| H.264 decode/encode | [`rusty_h264`](https://crates.io/crates/rusty_h264) | BSD-2-Clause | ✅ (vendored asm, no C; default needs `nasm`) |
 | PNG encode/decode | [`png`](https://crates.io/crates/png) | MIT/Apache-2.0 | ✅ |
 | JPEG decode | [`jpeg-decoder`](https://crates.io/crates/jpeg-decoder) | MIT/Apache-2.0 | ✅ |
 | JPEG encode | [`jpeg-encoder`](https://crates.io/crates/jpeg-encoder) | MIT/Apache-2.0 AND IJG | ✅ |
