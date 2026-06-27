@@ -1059,6 +1059,15 @@ pub fn decode_frame(
     }
     let (ss_x, ss_y) = (h.subsampling_x as usize, h.subsampling_y as usize);
     let (w, hgt) = (h.width as usize, h.height as usize);
+    // Reject absurd dimensions before allocating frame buffers. The header can
+    // encode up to 65535×65535 (≈26 GB of planes) — a memory-DoS on untrusted
+    // input. 16384 per side is 4× a 4K width, beyond any real VP9 content, yet
+    // rejects the pathological case. (A 0 dimension can arise from an
+    // uninitialised reference in a corrupt inter frame.)
+    const MAX_DIM: usize = 16384;
+    if w == 0 || hgt == 0 || w > MAX_DIM || hgt > MAX_DIM {
+        return Err(crate::Error::invalid("vp9: frame dimensions out of range"));
+    }
     let mi_cols = (w + 7) / MI_SIZE;
     let mi_rows = (hgt + 7) / MI_SIZE;
     let aligned_cols = (mi_cols + 7) & !7;

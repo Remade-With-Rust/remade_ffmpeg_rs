@@ -131,18 +131,23 @@ multi-stream throughput scales ~linearly (≈4400 fps aggregate at 16 threads).
 **Robustness (untrusted input):** a fuzz harness (mutated/truncated/random byte
 streams, seeded from real coded frames, via the public `send_packet`/`receive_frame`
 API) drove the panic rate from ~28% to 0 — header-size/reference-bounds validation
-upstream, a defensive `RefPlane`/intra-edge border path, and a `catch_unwind` net at
-the decode boundary (release is now `panic = "unwind"`) so any residual malformed
-input surfaces as `Err`, never a process abort. **AddressSanitizer** is clean on both
-valid streams (full SIMD coverage) and 15k+ malformed inputs — no out-of-bounds in
-the `unsafe` AVX2 kernels. **Conformance:** bit-exact against the full broad
-official-vector subset tested — quantizer sweep, odd/non-aligned sizes, tile
-columns **and tile rows** (4×1, 4×4), frame-parallel, show-existing-frame,
-droppable, bilinear, Δq, **lf-deltas**, segmentation, sub-pixel, and the **resize**
-suite (mid-stream frame-size changes with scaled references). Three feature gaps
-surfaced by the broad suite were fixed: loop-filter delta persistence across
-frames, above-context handling across tile-row boundaries, and intra prediction
-reading reconstructed neighbours at the coded (vs display) frame border. |
+upstream, a defensive `RefPlane`/intra-edge border path, a frame-dimension cap
+(rejects the pathological 65535×65535 ≈26 GB allocation before it happens — a
+malformed header otherwise balloons the decoder to >1.8 GB; capped it stays ~7 MB),
+and a `catch_unwind` net at the decode boundary (release is now `panic = "unwind"`)
+so any residual malformed input surfaces as `Err`, never a process abort.
+**AddressSanitizer** is clean on both valid streams (full SIMD coverage) and 15k+
+malformed inputs — no out-of-bounds in the `unsafe` AVX2 kernels. **Conformance:**
+bit-exact against the full broad official-vector subset tested — quantizer sweep,
+odd/non-aligned sizes (incl. 351×287), tile columns **and tile rows** (4×1, 4×4),
+frame-parallel, show-existing-frame, droppable, bilinear, Δq, **lf-deltas**,
+segmentation, sub-pixel, and the **resize** suite (mid-stream frame-size changes
+with scaled references). **Profiles 0–3** are cross-validated bit-exact against
+FFmpeg across every chroma layout (4:2:0 / 4:2:2 / 4:4:0 / 4:4:4) at 8/10/12-bit.
+Three feature gaps surfaced by the broad suite were fixed: loop-filter delta
+persistence across frames, above-context handling across tile-row boundaries, and
+intra prediction reading reconstructed neighbours at the coded (vs display) frame
+border. |
 | **Theora** | No mature pure-Rust implementation. |
 
 ## Explicitly avoid — C/C++ FFI or wrapping
