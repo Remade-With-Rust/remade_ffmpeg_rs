@@ -135,13 +135,14 @@ upstream, a defensive `RefPlane`/intra-edge border path, and a `catch_unwind` ne
 the decode boundary (release is now `panic = "unwind"`) so any residual malformed
 input surfaces as `Err`, never a process abort. **AddressSanitizer** is clean on both
 valid streams (full SIMD coverage) and 15k+ malformed inputs — no out-of-bounds in
-the `unsafe` AVX2 kernels. **Conformance:** validated bit-exact against a broad
-official-vector subset (quantizer sweep, odd/non-aligned sizes, tile columns,
-frame-parallel, show-existing-frame, droppable, bilinear, Δq, lf-deltas, segmentation)
-plus the resize suite. Known correctness gaps to close before claiming full
-feature-completeness: ≥4 **tile rows**, intra prediction at non-8-aligned frame
-borders (content-specific), and a couple of resize configs — none are crashes
-(the net contains them); they produce wrong pixels on those specific features. |
+the `unsafe` AVX2 kernels. **Conformance:** bit-exact against the full broad
+official-vector subset tested — quantizer sweep, odd/non-aligned sizes, tile
+columns **and tile rows** (4×1, 4×4), frame-parallel, show-existing-frame,
+droppable, bilinear, Δq, **lf-deltas**, segmentation, sub-pixel, and the **resize**
+suite (mid-stream frame-size changes with scaled references). Three feature gaps
+surfaced by the broad suite were fixed: loop-filter delta persistence across
+frames, above-context handling across tile-row boundaries, and intra prediction
+reading reconstructed neighbours at the coded (vs display) frame border. |
 | **Theora** | No mature pure-Rust implementation. |
 
 ## Explicitly avoid — C/C++ FFI or wrapping

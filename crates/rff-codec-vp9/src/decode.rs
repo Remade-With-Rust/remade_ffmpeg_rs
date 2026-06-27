@@ -856,7 +856,6 @@ pub struct Reconstructor {
     /// mi bounds of the tile currently being decoded (for neighbour clipping).
     tile_col_start: usize,
     tile_col_end: usize,
-    tile_row_start: usize,
     mi_rows: usize,
     mi_cols: usize,
     mi: Vec<ModeInfo>,
@@ -1074,7 +1073,6 @@ pub fn decode_frame(
         cur_seg_map: vec![0u8; mi_rows * mi_cols],
         tile_col_start: 0,
         tile_col_end: mi_cols,
-        tile_row_start: 0,
         mi_rows,
         mi_cols,
         mi: vec![ModeInfo::default(); mi_rows * mi_cols],
@@ -1163,15 +1161,19 @@ impl Reconstructor {
         let tile_cols = 1usize << tile_cols_log2;
         let tile_rows = 1usize << tile_rows_log2;
         let mut off = 0usize;
+        // Above contexts persist across the whole frame, so clear them once here
+        // — NOT per tile row. In VP9 only tile *columns* are independent; a tile
+        // row reads the row above from the previous tile row. This matches
+        // libvpx, which memsets above_context/above_seg_context once before the
+        // tile loop and sets `up_available = (mi_row != 0)`. Left contexts still
+        // reset per superblock row below.
+        for c in self.above_ctx.iter_mut() {
+            c.iter_mut().for_each(|v| *v = 0);
+        }
+        self.above_seg.iter_mut().for_each(|v| *v = 0);
         for tr in 0..tile_rows {
             let mr_start = tile_offset(tr, self.mi_rows, tile_rows_log2);
             let mr_end = tile_offset(tr + 1, self.mi_rows, tile_rows_log2);
-            self.tile_row_start = mr_start;
-            // The above contexts are independent per tile row.
-            for c in self.above_ctx.iter_mut() {
-                c.iter_mut().for_each(|v| *v = 0);
-            }
-            self.above_seg.iter_mut().for_each(|v| *v = 0);
             for tc in 0..tile_cols {
                 self.tile_col_start = tile_offset(tc, self.mi_cols, tile_cols_log2);
                 self.tile_col_end = tile_offset(tc + 1, self.mi_cols, tile_cols_log2);
@@ -1282,8 +1284,10 @@ impl Reconstructor {
     }
 
     fn above_mi(&self, mi_row: usize, mi_col: usize) -> Option<ModeInfo> {
-        // Neighbours are unavailable across a tile boundary (tiles are independent).
-        (mi_row > self.tile_row_start).then(|| self.mi[(mi_row - 1) * self.mi_cols + mi_col])
+        // The above neighbour is available across tile-row boundaries (only tile
+        // *columns* are independent); it's unavailable only at the frame top.
+        // Matches libvpx `up_available = (mi_row != 0)`.
+        (mi_row > 0).then(|| self.mi[(mi_row - 1) * self.mi_cols + mi_col])
     }
     fn left_mi(&self, mi_row: usize, mi_col: usize) -> Option<ModeInfo> {
         (mi_col > self.tile_col_start).then(|| self.mi[mi_row * self.mi_cols + mi_col - 1])
@@ -1855,8 +1859,15 @@ impl Reconstructor {
         let txw = 1usize << tx_size; // 4×4 units
         let bs = 4usize << tx_size; // pixels
         let stride = self.planes[plane].stride;
-        let fw = self.planes[plane].width as i32;
-        let fh = self.planes[plane].height as i32;
+        // Intra edge construction must see the *coded* plane extent — the mi grid
+        // rounded up to 8 px, subsampled — not the display size. libvpx reads
+        // reconstructed neighbour pixels up to mi_cols*8 / mi_rows*8, and the
+        // `mb_to_*_edge` values are computed against that same grid. Using the
+        // display height here replicated the bottom coded rows (e.g. rows 230-231
+        // of a 230-tall frame) instead of reading the reconstructed left/above
+        // neighbours, corrupting intra blocks in the last (partial) mi row.
+        let fw = ((self.mi_cols * 8) >> self.planes[plane].ss_x) as i32;
+        let fh = ((self.mi_rows * 8) >> self.planes[plane].ss_y) as i32;
 
         let x0 = base_x + col * 4;
         let y0 = base_y + row * 4;
