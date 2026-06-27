@@ -1,0 +1,16 @@
+[package]
+name = "rff-codec-openh264"
+description = "Remade FFmpeg (Rust): TEMPORARY H.264 codec via Cisco openh264 (C/FFI). Stopgap until the pure-Rust H.264 lands — NOT pure Rust."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
+# openh264 wraps Cisco's C libopenh264 via openh264-sys2 (compiles C with a C
+# toolchain). This is the project's ONLY C/FFI dependency and is deliberately
+# kept out of the default build (see the `h264-openh264` feature in `rff`).
+openh264 = "0.9"

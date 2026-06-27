@@ -1,0 +1,13 @@
+[package]
+name = "rff-codec-webp"
+description = "Remade FFmpeg (Rust): WebP still-image codec (VP8/VP8L)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
+image-webp.workspace = true

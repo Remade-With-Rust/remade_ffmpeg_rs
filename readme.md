@@ -78,10 +78,64 @@ safer.
 
 | Kind | Supported | Status |
 |---|---|---|
-| Video codec | **h264** (H.264 / AVC) | scaffolded |
-| Audio codec | **opus** | scaffolded |
-| Image codec | **avif** (AV1 still image) | scaffolded |
-| Container | **avi** (Audio Video Interleaved) | scaffolded |
+| Image codec | **avif** (AV1 still image) | **decode + encode**, 8- & 10-bit (rav1d / rav1e) |
+| Image codec | **png** (RGB/RGBA) | **decode + encode** (pure-Rust `png`) |
+| Image codec | **mjpeg** (JPEG/MJPEG) | **decode + encode** (pure-Rust `jpeg-decoder`/`jpeg-encoder`) |
+| Image codec | **gif** | **decode + encode** (pure-Rust `gif`; first frame) |
+| Image codec | **webp** (VP8/VP8L) | **decode + lossless encode** (pure-Rust `image-webp`) |
+| Image codec | **jpegxl** (JPEG XL) | **decode** (pure-Rust `jxl-oxide`; no Rust encoder yet) |
+| Audio codec | **opus** | **decode + encode** (pure-Rust `opus-rs`) |
+| Audio codec | **vorbis** | **decode** (pure-Rust `lewton`; no permissive Rust encoder exists) |
+| Audio codec | **flac** | **decode** (pure-Rust `claxon`; no permissive Rust encoder exists) |
+| Audio codec | **pcm** (s16le / f32le) | **decode + encode** (in-house) |
+| Container | **avif** (AV1 Image File Format) | **demux + mux** (reads foreign AVIFs too) |
+| Container | **png** / **jpeg** / **gif** / **webp** / **jpegxl** | **demux + mux** |
+| Container | **wav** (RIFF/WAVE) / **ogg** (Opus/Vorbis) / **flac** | **demux + mux** |
+| Container | **avi** (Audio Video Interleaved) | **demux + mux** (RIFF/`hdrl`/`movi`/`idx1`) |
+| Container | **mp4** / **mov** (ISOBMFF) | **demux + mux** — sample tables; **A/V**: AV1 (`av01`/`av1C`) or H.264 (`avc1`/`avcC`) video + Opus audio (`dOps`); AAC `esds`→config |
+| Container | **matroska** / **webm** (EBML) | **demux** — track tree + Cluster/(Simple)Block packets; AV1/H.264 video + Opus/Vorbis/AAC/FLAC audio |
+| Audio codec | **aac** | in-house **AAC-LC decoder**, all features (short blocks, M/S, intensity stereo, PNS, TNS) — verified bit-exact vs FFmpeg |
+| Video codec | **h264** (H.264 / AVC) | scaffolded (pure-Rust, in progress); **working today via the optional `h264-openh264` feature** ⚠️ |
+
+> ⚠️ **H.264 today is the one exception to "pure Rust."** It works via an
+> *opt-in, off-by-default* `h264-openh264` feature that links Cisco's C
+> `openh264` (FFI). The default build and binaries remain 100% Rust; build the
+> CLI with `cargo build -p rff-cli --features h264-openh264` to enable it. This
+> is a deliberate temporary stopgap — it's deleted the moment the in-house
+> pure-Rust H.264 decoder lands.
+
+The **audio path** is real: `ffmpeg -i in.wav -c:a opus out.opus` decodes PCM, encodes Opus, and writes an Ogg file — through the same engine the image codecs use. Parametric codecs (PCM) and ones with out-of-band config (Opus' channels/rate from `OpusHead`) receive their parameters via a `Decoder::configure` step — the same plumbing H.264 will use for SPS/PPS.
+
+**Audio resampling.** When an encoder only accepts certain sample rates, the transcode loop auto-inserts a resampler (a streaming windowed-sinc FIR, the `libswresample` equivalent) — exactly like FFmpeg's implicit `aresample`. So `ffmpeg -i in_44100.wav -c:a opus out.mp4` converts 44.1 kHz to Opus's nearest accepted rate (48 kHz) with no extra flags.
+
+**A/V muxing.** Multiple inputs combine into one multi-stream output. `ffmpeg -i v -i a -c:v avif -c:a opus out.mp4` writes a single MP4 carrying **AV1 video + Opus audio** — entirely pure-Rust, no extra features. (Swap `-c:v h264` with the `h264-openh264` feature for H.264 video instead.) AVI muxing works the same way (`-c:v copy -c:a copy out.avi`). MP4 output carries **real timing** (each track's `stts`/timescale come from packet PTS, not a nominal frame rate) and is **time-interleaved** — samples are written in PTS order across tracks so players can read audio + video progressively.
+
+**Stream selection (`-map`).** Pick exactly which input streams reach the output: `-map 0:v` (all video of input 0), `-map 0:a`, `-map 1:0` (stream 0 of input 1), or `-map 0` (everything) — repeatable and order-preserving. With no `-map`, every video + audio stream is carried by default. Combine with `-c copy` to losslessly lift a single track, e.g. `ffmpeg -i av.mp4 -map 0:a -c:a copy audio.mp4` pulls the Opus track out of an MP4 without re-encoding.
+
+With the `format` filter bridging colorspaces, `ffmpeg -i photo.png -vf format=yuv420p -c:v avif out.avif` (and the reverse) does real PNG↔AVIF image conversion today.
+
+**Codec backends — every one is 100% Rust (no C/C++ FFI) and permissively licensed.** Container (de)muxers are our own code. See [docs/pure-rust-codecs.md](docs/pure-rust-codecs.md) for the full vetted survey (what's clean, what's license-blocked, what has no pure-Rust option).
+
+| Codec | Backing crate | License | Pure Rust |
+|---|---|---|---|
+| AV1 encode (avif) | [`rav1e`](https://github.com/xiph/rav1e) | BSD-2-Clause | ✅ (asm, no C) |
+| AV1 decode (avif) | [`rav1d`](https://github.com/memorysafety/rav1d) | BSD-2-Clause | ✅ (Rust port of dav1d) |
+| PNG encode/decode | [`png`](https://crates.io/crates/png) | MIT/Apache-2.0 | ✅ |
+| JPEG decode | [`jpeg-decoder`](https://crates.io/crates/jpeg-decoder) | MIT/Apache-2.0 | ✅ |
+| JPEG encode | [`jpeg-encoder`](https://crates.io/crates/jpeg-encoder) | MIT/Apache-2.0 AND IJG | ✅ |
+| GIF encode/decode | [`gif`](https://crates.io/crates/gif) | MIT/Apache-2.0 | ✅ |
+| WebP encode/decode | [`image-webp`](https://crates.io/crates/image-webp) | MIT/Apache-2.0 | ✅ |
+| Opus encode/decode | [`opus-rs`](https://crates.io/crates/opus-rs) | BSD-3-Clause | ✅ |
+| Vorbis decode | [`lewton`](https://crates.io/crates/lewton) | MIT/Apache-2.0 | ✅ |
+| FLAC decode | [`claxon`](https://crates.io/crates/claxon) | Apache-2.0 | ✅ |
+| JPEG XL decode | [`jxl-oxide`](https://crates.io/crates/jxl-oxide) | MIT/Apache-2.0 | ✅ |
+
+The **avif** path is real end to end: a frame decodes (via the pure-Rust
+[`rav1d`](https://github.com/memorysafety/rav1d)) and encodes (via
+[`rav1e`](https://github.com/xiph/rav1e)) AV1 bitstream, wrapped/unwrapped in
+HEIF/ISOBMFF boxes, and driven through the `demux → decode → encode → mux`
+loop — so `ffmpeg -i in.avif -c:v avif out.avif` works today. Both AV1 crates
+are BSD-2-Clause; the decode path adds zero `unsafe` to this tree.
 
 "Scaffolded" = registered and wired through the engine, CLI and server; the
 bitstream body is the next implementation step. More codecs/containers to come.
@@ -104,10 +158,13 @@ ffmpeg -codecs
 ffmpeg -formats
 
 # Inspect a file:
-ffprobe input.avi
+ffprobe input.avif
 
-# Transcode (interface is wired; codec bodies are in progress):
-ffmpeg -i input.avi -c:v h264 -b:v 2M -c:a opus output.avi
+# Transcode AVIF → AVIF end to end (decode AV1, re-encode AV1, rewrap):
+ffmpeg -i input.avif -c:v avif -y output.avif
+
+# Other codecs/containers (h264, opus, avi) are wired but their bodies are
+# still in progress, so those transcodes stop at the unimplemented stage.
 ```
 
 Or talk to the engine over HTTP (API-first):
@@ -172,16 +229,23 @@ implement the `Decoder`/`Encoder` or `Demuxer`/`Muxer` traits and call
 
 ## Roadmap
 
-- [ ] Land the first real codec body end-to-end (decode → re-encode → mux).
-- [ ] Content-sniffing probe (magic bytes) in addition to extension matching.
-- [ ] Filter graph layer (`libavfilter` equivalent) + scaling/resampling.
+- [x] Land the first real codec body end-to-end (AVIF: decode → re-encode → mux).
+- [x] 10-bit AVIF and reading foreign AVIFs (sequence header in `av1C`). *(12-bit pending.)*
+- [x] AVI container (demux + mux). *(Codec bodies — h264, opus — still pending.)*
+- [x] Content-sniffing probe (magic bytes) in addition to extension matching.
+- [x] Filter graph layer (`libavfilter` equivalent): `scale` (+ aspect `-1`), `crop`, `hflip`, `vflip`, `transpose`, `pad`.
+- [ ] Implement the next codec bodies (h264, opus).
 - [ ] Reproducible benchmark suite and published numbers.
 - [ ] Wire real MATA mID verification (`sovereign-id-verify`).
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE). No GPL/LGPL anywhere in the dependency tree
-(CI-enforced via `cargo-deny`; see [deny.toml](deny.toml)).
+Apache-2.0 — see [LICENSE](LICENSE). The embeddable **core** — the library, the
+`ffmpeg`/`ffprobe` CLI, the server, and every codec/format crate — has **no
+copyleft anywhere** in its dependency tree, CI-enforced via `cargo-deny` (see
+[deny.toml](deny.toml)). The optional Dioxus UI (`rff-ui`, built on demand and
+never part of the published binaries) pulls MPL-2.0 crates transitively through
+its webview stack, so it's scoped out of the gate and tracked separately.
 
 ## Trademark
 

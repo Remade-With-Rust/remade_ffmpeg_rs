@@ -4,6 +4,15 @@
 # Any license NOT in `allow` causes a hard failure, so GPL/LGPL/AGPL/MPL can
 # never sneak into the dependency tree.
 
+[graph]
+# Scope the gate to the embeddable core (library, CLI, server, codecs, formats).
+# `rff-ui` is the optional Dioxus front-end — built on demand, never part of the
+# core or the published binaries — and it transitively pulls MPL-2.0 crates via
+# wry/servo. Excluding it drops its unique subtree, so the license promise is
+# enforced everywhere it actually applies. The UI's own licensing is tracked
+# separately (see docs/architecture.md).
+exclude = ["rff-ui"]
+
 [licenses]
 confidence-threshold = 0.9
 allow = [
@@ -17,6 +26,13 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "CC0-1.0",
+    # University of Illinois/NCSA Open Source License — BSD-style, permissive,
+    # OSI-approved and FSF-Free (NOT copyleft). Reaches us via libfuzzer-sys in
+    # rav1e's tree.
+    "NCSA",
+    # Independent JPEG Group license — the permissive libjpeg license (NOT
+    # copyleft); the `jpeg-encoder` crate reimplements IJG's algorithms in Rust.
+    "IJG",
 ]
 
 [bans]

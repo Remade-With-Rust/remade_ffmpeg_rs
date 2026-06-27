@@ -14,6 +14,28 @@ default-members = [
     "crates/rff-codec-avif",
     "crates/rff-format-avi",
     "crates/rff-format-avif",
+    "crates/rff-codec-png",
+    "crates/rff-format-png",
+    "crates/rff-codec-jpeg",
+    "crates/rff-format-jpeg",
+    "crates/rff-codec-gif",
+    "crates/rff-format-gif",
+    "crates/rff-codec-webp",
+    "crates/rff-format-webp",
+    "crates/rff-codec-pcm",
+    "crates/rff-codec-vorbis",
+    "crates/rff-codec-flac",
+    "crates/rff-codec-jxl",
+    "crates/rff-codec-aac",
+    "crates/rff-codec-vp9",
+    "crates/rff-format-wav",
+    "crates/rff-format-ogg",
+    "crates/rff-format-flac",
+    "crates/rff-format-jxl",
+    "crates/rff-format-mp4",
+    "crates/rff-format-mkv",
+    "crates/rff-filter",
+    "crates/rff-resample",
     "crates/rff",
     "crates/rff-cli",
     "crates/rff-auth",
@@ -38,6 +60,30 @@ rff-codec-opus = { path = "crates/rff-codec-opus", version = "0.0.1" }
 rff-codec-avif = { path = "crates/rff-codec-avif", version = "0.0.1" }
 rff-format-avi = { path = "crates/rff-format-avi", version = "0.0.1" }
 rff-format-avif = { path = "crates/rff-format-avif", version = "0.0.1" }
+rff-codec-png = { path = "crates/rff-codec-png", version = "0.0.1" }
+rff-format-png = { path = "crates/rff-format-png", version = "0.0.1" }
+rff-codec-jpeg = { path = "crates/rff-codec-jpeg", version = "0.0.1" }
+rff-format-jpeg = { path = "crates/rff-format-jpeg", version = "0.0.1" }
+rff-codec-gif = { path = "crates/rff-codec-gif", version = "0.0.1" }
+rff-format-gif = { path = "crates/rff-format-gif", version = "0.0.1" }
+rff-codec-webp = { path = "crates/rff-codec-webp", version = "0.0.1" }
+rff-format-webp = { path = "crates/rff-format-webp", version = "0.0.1" }
+rff-codec-pcm = { path = "crates/rff-codec-pcm", version = "0.0.1" }
+rff-codec-vorbis = { path = "crates/rff-codec-vorbis", version = "0.0.1" }
+rff-codec-flac = { path = "crates/rff-codec-flac", version = "0.0.1" }
+rff-codec-jxl = { path = "crates/rff-codec-jxl", version = "0.0.1" }
+rff-codec-aac = { path = "crates/rff-codec-aac", version = "0.0.1" }
+rff-codec-vp9 = { path = "crates/rff-codec-vp9", version = "0.0.1" }
+# TEMPORARY C/FFI H.264 — deliberately NOT in default-members; opt-in only.
+rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.0.1" }
+rff-format-wav = { path = "crates/rff-format-wav", version = "0.0.1" }
+rff-format-ogg = { path = "crates/rff-format-ogg", version = "0.0.1" }
+rff-format-flac = { path = "crates/rff-format-flac", version = "0.0.1" }
+rff-format-jxl = { path = "crates/rff-format-jxl", version = "0.0.1" }
+rff-format-mp4 = { path = "crates/rff-format-mp4", version = "0.0.1" }
+rff-format-mkv = { path = "crates/rff-format-mkv", version = "0.0.1" }
+rff-filter = { path = "crates/rff-filter", version = "0.0.1" }
+rff-resample = { path = "crates/rff-resample", version = "0.0.1" }
 rff = { path = "crates/rff", version = "0.0.1" }
 rff-auth = { path = "crates/rff-auth", version = "0.0.1" }
 
@@ -52,6 +98,22 @@ rav1e = { version = "0.8", default-features = false }
 # dav1d-rs) is not in the published 1.1.0 yet — using it keeps the decode path
 # 100% safe Rust (no FFI/unsafe in our tree). Revisit when rav1d 1.2 ships.
 rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "2a734dc9cd52190146796fb24b29a8c7e3d2af1e", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+# png: pure-Rust PNG codec (MIT/Apache-2.0), DEFLATE via miniz_oxide/fdeflate.
+png = "0.17"
+# jpeg: pure-Rust JPEG decode (MIT/Apache) + encode (MIT/Apache AND IJG).
+jpeg-decoder = "0.3"
+jpeg-encoder = "0.7"
+# gif: pure-Rust GIF de/encoder (MIT/Apache); image-webp: pure-Rust WebP (MIT/Apache).
+gif = "0.14"
+image-webp = "0.2"
+# opus-rs: pure-Rust Opus codec (BSD-3-Clause), port of libopus 1.6 — no FFI.
+opus-rs = "0.1"
+# lewton: pure-Rust Vorbis decoder (MIT/Apache-2.0) — decode only, no FFI.
+lewton = "0.10"
+# claxon: pure-Rust FLAC decoder (Apache-2.0) — decode only, no FFI.
+claxon = "0.4"
+# jxl-oxide: pure-Rust JPEG XL decoder (MIT/Apache-2.0) — decode only, no FFI.
+jxl-oxide = "0.12"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -63,4 +125,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# `unwind` (not `abort`) so decoders can contain a panic on malformed/untrusted
+# input at their API boundary (see VP9 `receive_frame`) and surface it as an
+# `Err` rather than killing the process. The unwind path is cold (hot decode
+# loops never panic), so the cost is binary size, not throughput.
+panic = "unwind"

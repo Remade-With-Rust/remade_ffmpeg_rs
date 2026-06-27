@@ -29,7 +29,38 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["avif"],
         demuxer: Some(|input| Box::new(AvifDemuxer::new(input))),
         muxer: Some(|output| Box::new(AvifMuxer::new(output))),
+        probe: Some(probe_avif),
     });
+}
+
+/// Sniff AVIF: an ISOBMFF `ftyp` box carrying an `avif`/`avis` brand (as major
+/// brand or in the compatible-brand list). `mif1`/`miaf` (generic HEIF) scores
+/// lower since those aren't necessarily AV1.
+fn probe_avif(data: &[u8]) -> i32 {
+    if data.len() < 12 || &data[4..8] != b"ftyp" {
+        return 0;
+    }
+    let size = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let end = size.clamp(12, data.len());
+
+    let is_avif = |b: &[u8]| b == b"avif" || b == b"avis";
+    let major = &data[8..12];
+    if is_avif(major) {
+        return 100;
+    }
+    // Compatible brands begin after major(4) + minor(4), at offset 16, 4 bytes each.
+    let mut i = 16;
+    while i + 4 <= end {
+        if is_avif(&data[i..i + 4]) {
+            return 100;
+        }
+        i += 4;
+    }
+    if major == b"mif1" || major == b"miaf" {
+        50
+    } else {
+        0
+    }
 }
 
 // ===========================================================================
@@ -127,48 +158,54 @@ impl Muxer for AvifMuxer {
         };
         let av1c = build_av1c(&fields, &config_obus);
 
-        // --- iprp (item properties): ispe, av1C, pixi, then their association ---
-        let mut ipco = Vec::new();
-        ipco.extend_from_slice(&ispe(self.width, self.height)); // property #1
-        ipco.extend_from_slice(&av1c); // property #2
-        ipco.extend_from_slice(&pixi()); // property #3
-        let ipco = bx(b"ipco", &ipco);
-
-        let mut iprp = Vec::new();
-        iprp.extend_from_slice(&ipco);
-        iprp.extend_from_slice(&ipma());
-        let iprp = bx(b"iprp", &iprp);
-
-        // --- iloc, with a placeholder extent offset patched in below ---
-        let (iloc, off_field_in_iloc) = build_iloc(self.payload.len() as u32);
-
-        // --- meta: hdlr, pitm, iloc, iinf, iprp ---
-        let mut meta_body = Vec::new();
-        meta_body.extend_from_slice(&hdlr());
-        meta_body.extend_from_slice(&pitm());
-        let iloc_start = meta_body.len();
-        meta_body.extend_from_slice(&iloc);
-        meta_body.extend_from_slice(&iinf());
-        meta_body.extend_from_slice(&iprp);
-        let mut meta = full_bx(b"meta", 0, 0, &meta_body);
-
-        // Patch the iloc extent offset. The meta FullBox body begins 12 bytes in
-        // (8 box header + 4 version/flags); the iloc box sits at `iloc_start`
-        // within that body, and `off_field_in_iloc` locates the offset field
-        // within the iloc box.
-        let ftyp = ftyp();
-        let off_field_in_file_minus_mdat = 12 + iloc_start + off_field_in_iloc;
-        let mdat_data_offset = ftyp.len() + meta.len() + 8; // +8 for mdat header
-        meta[off_field_in_file_minus_mdat..off_field_in_file_minus_mdat + 4]
-            .copy_from_slice(&(mdat_data_offset as u32).to_be_bytes());
-
-        // --- assemble & write ---
-        self.out.write_all(&ftyp)?;
-        self.out.write_all(&meta)?;
-        self.out.write_all(&bx(b"mdat", &self.payload))?;
+        let file = assemble_avif(self.width, self.height, &av1c, &self.payload);
+        self.out.write_all(&file)?;
         self.out.flush()?;
         Ok(())
     }
+}
+
+/// Assemble a complete AVIF file: `ftyp` + `meta` + `mdat`, with the `iloc`
+/// extent offset patched to point at the `mdat` payload.
+fn assemble_avif(width: u32, height: u32, av1c: &[u8], payload: &[u8]) -> Vec<u8> {
+    // --- iprp (item properties): ispe, av1C, pixi, then their association ---
+    let mut ipco = Vec::new();
+    ipco.extend_from_slice(&ispe(width, height)); // property #1
+    ipco.extend_from_slice(av1c); // property #2
+    ipco.extend_from_slice(&pixi()); // property #3
+    let ipco = bx(b"ipco", &ipco);
+
+    let mut iprp = Vec::new();
+    iprp.extend_from_slice(&ipco);
+    iprp.extend_from_slice(&ipma());
+    let iprp = bx(b"iprp", &iprp);
+
+    // --- iloc, with a placeholder extent offset patched in below ---
+    let (iloc, off_field_in_iloc) = build_iloc(payload.len() as u32);
+
+    // --- meta: hdlr, pitm, iloc, iinf, iprp ---
+    let mut meta_body = Vec::new();
+    meta_body.extend_from_slice(&hdlr());
+    meta_body.extend_from_slice(&pitm());
+    let iloc_start = meta_body.len();
+    meta_body.extend_from_slice(&iloc);
+    meta_body.extend_from_slice(&iinf());
+    meta_body.extend_from_slice(&iprp);
+    let mut meta = full_bx(b"meta", 0, 0, &meta_body);
+
+    // Patch the iloc extent offset. The meta FullBox body begins 12 bytes in
+    // (8 box header + 4 version/flags); the iloc box sits at `iloc_start` within
+    // that body, and `off_field_in_iloc` locates the offset field within iloc.
+    let ftyp = ftyp();
+    let off_field = 12 + iloc_start + off_field_in_iloc;
+    let mdat_data_offset = ftyp.len() + meta.len() + 8; // +8 for mdat header
+    meta[off_field..off_field + 4].copy_from_slice(&(mdat_data_offset as u32).to_be_bytes());
+
+    let mut file = Vec::with_capacity(ftyp.len() + meta.len() + 8 + payload.len());
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&meta);
+    file.extend_from_slice(&bx(b"mdat", payload));
+    file
 }
 
 fn ftyp() -> Vec<u8> {
@@ -473,7 +510,23 @@ impl Demuxer for AvifDemuxer {
             .checked_add(length)
             .filter(|&e| e <= buf.len())
             .ok_or_else(|| Error::invalid("avif demux: item extent out of range"))?;
-        self.sample = Some(buf[offset..end].to_vec());
+        let raw_sample = &buf[offset..end];
+
+        // Foreign AVIFs (from libavif/ffmpeg) store the sequence header only in
+        // the `av1C` property, with just the frame OBUs in `mdat`. If the sample
+        // has no sequence header of its own, prepend the configOBUs so the
+        // decoder gets a self-contained bitstream. (Our own files keep the
+        // sequence header in `mdat`, so this is a no-op for them.)
+        let config_obus = read_av1c_config(&meta_children).unwrap_or_default();
+        let sample = if !config_obus.is_empty() && find_seq_header_obu(raw_sample).is_none() {
+            let mut s = Vec::with_capacity(config_obus.len() + raw_sample.len());
+            s.extend_from_slice(&config_obus);
+            s.extend_from_slice(raw_sample);
+            s
+        } else {
+            raw_sample.to_vec()
+        };
+        self.sample = Some(sample);
 
         let mut stream = Stream::new(0, CodecId::Avif);
         stream.width = width;
@@ -581,6 +634,16 @@ fn read_iloc(meta_children: &[([u8; 4], &[u8])]) -> Result<(usize, usize)> {
     Ok((offset as usize, length as usize))
 }
 
+/// Read the `av1C` configOBUs (everything after its 4 fixed bytes) from the
+/// `iprp`/`ipco` property container, if present.
+fn read_av1c_config(meta_children: &[([u8; 4], &[u8])]) -> Option<Vec<u8>> {
+    let iprp = find(meta_children, b"iprp")?;
+    let ipco = find(&child_boxes(iprp), b"ipco").map(child_boxes)?;
+    let av1c = find(&ipco, b"av1C")?;
+    // av1C = 4 fixed bytes (marker/version, seq fields, flags), then configOBUs.
+    av1c.get(4..).map(|c| c.to_vec())
+}
+
 fn find<'a>(boxes: &[([u8; 4], &'a [u8])], typ: &[u8; 4]) -> Option<&'a [u8]> {
     boxes.iter().find(|(t, _)| t == typ).map(|(_, p)| *p)
 }
@@ -638,5 +701,50 @@ mod tests {
         assert_eq!(packet.data, payload);
         assert!(packet.is_keyframe());
         assert!(matches!(dem.read_packet(), Err(Error::Eof)));
+    }
+
+    /// A "foreign" AVIF keeps the sequence header only in `av1C` and the frame
+    /// OBUs in `mdat`. The demuxer should prepend the configOBUs so the decoder
+    /// receives a self-contained bitstream.
+    #[test]
+    fn foreign_avif_prepends_seq_header_from_av1c() {
+        // OBU headers: type in bits 6..3, has_size in bit 1.
+        let seq_header_obu = [0x0A, 0x02, 0x00, 0x00]; // type 1 (seq hdr), 2-byte payload
+        let frame_obus = [0x32, 0x03, 0xAA, 0xBB, 0xCC]; // type 6 (frame), 3-byte payload
+
+        // Sanity: the frame-only sample must NOT look like it has a seq header.
+        assert!(find_seq_header_obu(&frame_obus).is_none());
+
+        let av1c = build_av1c(&Av1cFields::default(), &seq_header_obu);
+        let file = assemble_avif(48, 32, &av1c, &frame_obus);
+
+        let mut dem = AvifDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = dem.read_header().unwrap();
+        assert_eq!((streams[0].width, streams[0].height), (48, 32));
+
+        let packet = dem.read_packet().unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&seq_header_obu); // from av1C
+        expected.extend_from_slice(&frame_obus); // from mdat
+        assert_eq!(packet.data, expected, "configOBUs should be prepended");
+    }
+
+    /// Build a minimal `ftyp` box with the given major brand + compatible brands.
+    fn ftyp_box(major: &[u8; 4], compatible: &[&[u8; 4]]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(major);
+        payload.extend_from_slice(&[0, 0, 0, 0]); // minor_version
+        for c in compatible {
+            payload.extend_from_slice(*c);
+        }
+        bx(b"ftyp", &payload)
+    }
+
+    #[test]
+    fn sniffs_avif_by_brand() {
+        assert_eq!(probe_avif(&ftyp_box(b"avif", &[])), 100); // major brand
+        assert_eq!(probe_avif(&ftyp_box(b"mif1", &[b"avif"])), 100); // compatible brand
+        assert_eq!(probe_avif(&ftyp_box(b"mif1", &[])), 50); // generic HEIF
+        assert_eq!(probe_avif(b"not an isobmff file"), 0);
     }
 }

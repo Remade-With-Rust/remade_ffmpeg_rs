@@ -54,12 +54,37 @@ fn register_builtin_codecs(codecs: &mut CodecRegistry) {
     rff_codec_h264::register(codecs);
     rff_codec_opus::register(codecs);
     rff_codec_avif::register(codecs);
+    rff_codec_png::register(codecs);
+    rff_codec_jpeg::register(codecs);
+    rff_codec_gif::register(codecs);
+    rff_codec_webp::register(codecs);
+    rff_codec_pcm::register(codecs);
+    rff_codec_vorbis::register(codecs);
+    rff_codec_flac::register(codecs);
+    rff_codec_jxl::register(codecs);
+    rff_codec_aac::register(codecs);
+    rff_codec_vp9::register(codecs);
+    // TEMPORARY: when the `h264-openh264` feature is on, override the scaffolded
+    // H.264 with the working (C/FFI) openh264 codec. Removed once the in-house
+    // pure-Rust H.264 lands.
+    #[cfg(feature = "h264-openh264")]
+    rff_codec_openh264::register(codecs);
 }
 
 /// Register every container format compiled into this build.
 fn register_builtin_formats(formats: &mut FormatRegistry) {
     rff_format_avi::register(formats);
     rff_format_avif::register(formats);
+    rff_format_png::register(formats);
+    rff_format_jpeg::register(formats);
+    rff_format_gif::register(formats);
+    rff_format_webp::register(formats);
+    rff_format_wav::register(formats);
+    rff_format_ogg::register(formats);
+    rff_format_flac::register(formats);
+    rff_format_jxl::register(formats);
+    rff_format_mp4::register(formats);
+    rff_format_mkv::register(formats);
 }
 
 /// The crate version, surfaced in the CLI/server banners.

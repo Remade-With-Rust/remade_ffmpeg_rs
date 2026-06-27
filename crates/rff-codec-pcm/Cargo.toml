@@ -1,0 +1,12 @@
+[package]
+name = "rff-codec-pcm"
+description = "Remade FFmpeg (Rust): linear PCM audio codec (s16le / f32le)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true

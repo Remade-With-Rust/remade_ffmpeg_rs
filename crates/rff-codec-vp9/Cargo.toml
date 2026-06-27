@@ -1,0 +1,12 @@
+[package]
+name = "rff-codec-vp9"
+description = "Remade FFmpeg (Rust): in-house pure-Rust VP9 decoder (no C/FFI)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true

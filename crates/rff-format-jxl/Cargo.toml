@@ -1,0 +1,13 @@
+[package]
+name = "rff-format-jxl"
+description = "Remade FFmpeg (Rust): JPEG XL single-image container."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true
+jxl-oxide.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "rff-codec-png"
+description = "Remade FFmpeg (Rust): PNG still-image codec (RGB/RGBA)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
+png.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "rff-format-ogg"
+description = "Remade FFmpeg (Rust): Ogg container (Opus)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true

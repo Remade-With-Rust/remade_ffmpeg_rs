@@ -11,8 +11,40 @@ rust-version.workspace = true
 rff-core.workspace = true
 rff-codec.workspace = true
 rff-format.workspace = true
+rff-filter.workspace = true
+rff-resample.workspace = true
 rff-codec-h264.workspace = true
 rff-codec-opus.workspace = true
 rff-codec-avif.workspace = true
+rff-codec-png.workspace = true
+rff-codec-jpeg.workspace = true
+rff-codec-gif.workspace = true
+rff-codec-webp.workspace = true
+rff-codec-pcm.workspace = true
+rff-codec-vorbis.workspace = true
+rff-codec-flac.workspace = true
+rff-codec-jxl.workspace = true
+rff-codec-aac.workspace = true
+rff-codec-vp9.workspace = true
 rff-format-avi.workspace = true
 rff-format-avif.workspace = true
+rff-format-png.workspace = true
+rff-format-jpeg.workspace = true
+rff-format-gif.workspace = true
+rff-format-webp.workspace = true
+rff-format-wav.workspace = true
+rff-format-ogg.workspace = true
+rff-format-flac.workspace = true
+rff-format-jxl.workspace = true
+rff-format-mp4.workspace = true
+rff-format-mkv.workspace = true
+
+# TEMPORARY, opt-in only: Cisco openh264 (C/FFI). Off by default so the normal
+# build stays 100% Rust. Enable with `--features h264-openh264`.
+rff-codec-openh264 = { workspace = true, optional = true }
+
+[features]
+default = []
+# Working H.264 via the C openh264 library — a stopgap until the in-house
+# pure-Rust H.264 decoder lands. NOT pure Rust; needs a C toolchain to build.
+h264-openh264 = ["dep:rff-codec-openh264"]

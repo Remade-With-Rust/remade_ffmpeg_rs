@@ -6,7 +6,28 @@
       "WebFetch(domain:crates.io)",
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "Bash(./target/debug/ffmpeg.exe -hide_banner -codecs)",
+      "Bash(./target/debug/ffmpeg.exe -hide_banner -formats)",
+      "Bash(cargo deny *)",
+      "Bash(grep -E \"error|rejected|FAILED|advisories|licenses ok|^licenses|ok$\")",
+      "Bash(bc)",
+      "Bash(sed 's|let scale=2.0/n as f64|let scale=4.0/n as f64|' /tmp/mdct_check.rs)",
+      "Bash(rustc -O /tmp/mdct_check2.rs -o /tmp/mdct_check2)",
+      "Bash(/tmp/mdct_check2)",
+      "WebFetch(domain:ffmpeg.org)",
+      "Bash(cat)",
+      "Bash(python /tmp/kraft.py)",
+      "Bash(python3 /tmp/kraft.py)",
+      "Bash(python3 -)",
+      "Bash(python3 -c \"import av; print\\('PyAV', av.__version__\\)\")",
+      "Bash(python3 -c \"import imageio_ffmpeg as i; print\\('imageio-ffmpeg bundled:', i.get_ffmpeg_exe\\(\\)\\)\")",
+      "Bash(python3 -c \"import soundfile; print\\('soundfile', soundfile.__version__\\)\")",
+      "Bash(python3 -m pip list)",
+      "Bash(curl -sI -m 8 https://github.com)",
+      "Bash(curl -sI -m 8 https://cdn.winget.microsoft.com)",
+      "PowerShell($t=$env:TEMP; Expand-Archive -Path \"$t\\\\ffmpeg.zip\" -DestinationPath \"$t\\\\ffmpeg_extract\" -Force; $exe=Get-ChildItem -Path \"$t\\\\ffmpeg_extract\" -Recurse -Filter ffmpeg.exe | Select-Object -First 1; Copy-Item $exe.FullName \"$t\\\\ffmpeg.exe\" -Force; & \"$t\\\\ffmpeg.exe\" -version 2>&1 | Select-Object -First 1)",
+      "Bash(rg -n \"Io\\\\\\(|read_to_end|map_err|enum Error\" crates/rff-core/src/*.rs crates/rff-format-mp4/src/lib.rs)"
     ]
   }
 }

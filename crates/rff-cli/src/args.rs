@@ -16,8 +16,21 @@
 
 use std::path::PathBuf;
 
-use rff::transcode::{InputSpec, OutputSpec, StreamCodec, TranscodeSpec};
-use rff_core::{CodecId, Dictionary};
+use rff::transcode::{InputSpec, MapSelector, MapSpec, OutputSpec, StreamCodec, TranscodeSpec};
+use rff_core::{CodecId, Dictionary, MediaType};
+
+/// Parse a `-map` value like `0`, `0:v`, `0:a`, or `0:2`.
+fn parse_map(spec: &str) -> Option<MapSpec> {
+    let mut parts = spec.split(':');
+    let input: usize = parts.next()?.parse().ok()?;
+    let selector = match parts.next() {
+        None => MapSelector::All,
+        Some("v") | Some("V") => MapSelector::Kind(MediaType::Video),
+        Some("a") => MapSelector::Kind(MediaType::Audio),
+        Some(idx) => MapSelector::Index(idx.parse().ok()?),
+    };
+    Some(MapSpec { input, selector })
+}
 
 /// What the user actually asked `ffmpeg` to do. Informational sub-commands
 /// (`-version`, `-codecs`, ...) short-circuit a transcode.
@@ -58,6 +71,8 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut audio_codec: Option<CodecId> = None;
     let mut video_opts = Dictionary::new();
     let mut audio_opts = Dictionary::new();
+    let mut video_filters: Option<String> = None;
+    let mut maps: Vec<MapSpec> = Vec::new();
     let mut overwrite = false;
     let mut output_path: Option<PathBuf> = None;
 
@@ -128,6 +143,28 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                 apply_codec(Some("a"), &name, &mut video_codec, &mut audio_codec, &mut warnings);
             }
 
+            // Stream selection: -map INPUT[:v|:a|:N] (repeatable).
+            "map" => {
+                let value = take_value(args, &mut i, arg)?;
+                match parse_map(&value) {
+                    Some(m) => maps.push(m),
+                    None => warnings.push(format!("ignoring invalid -map `{value}`")),
+                }
+            }
+
+            // Video filter graph: -vf / -filter:v.
+            "vf" => video_filters = Some(take_value(args, &mut i, arg)?),
+            "filter" => {
+                let value = take_value(args, &mut i, arg)?;
+                match spec {
+                    Some(s) if s.starts_with('v') => video_filters = Some(value),
+                    Some(s) if s.starts_with('a') => {
+                        warnings.push("audio filters (-filter:a) are not supported yet".into())
+                    }
+                    _ => warnings.push(format!("ignoring filter spec `{value}`")),
+                }
+            }
+
             // Bitrate: -b:v / -b:a (bare -b defaults to video).
             "b" => {
                 let value = take_value(args, &mut i, arg)?;
@@ -180,6 +217,8 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             codec,
             options: audio_opts,
         }),
+        video_filters,
+        maps,
         overwrite,
     });
 

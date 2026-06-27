@@ -6,11 +6,10 @@
 //! wrapping itself is handled at the format layer when an `avif` container
 //! lands; this crate is the pixel codec.
 //!
-//! * **Encode** — implemented over [`rav1e`], the BSD-2-Clause native-Rust AV1
-//!   encoder, in `still_picture` mode.
-//! * **Decode** — not yet wired. AV1 decode needs an AV1 decoder dependency,
-//!   and the obvious candidates each trade off against a project rule (license
-//!   vs. Rust-API vs. no-C); see [`AvifDecoder`].
+//! * **Encode** — over [`rav1e`], the BSD-2-Clause native-Rust AV1 encoder, in
+//!   `still_picture` mode (8- and 10-bit planar YUV).
+//! * **Decode** — over [`rav1d`], a pure-Rust AV1 decoder, through its safe
+//!   Rust API (no `unsafe`, no C); see [`AvifDecoder`].
 
 use std::collections::VecDeque;
 
@@ -37,15 +36,23 @@ pub fn register(registry: &mut CodecRegistry) {
 // Encoder (rav1e)
 // ---------------------------------------------------------------------------
 
+/// rav1e is generic over the pixel sample type: 8-bit content uses `u8`,
+/// 10/12-bit uses `u16`. We pick the matching context from the first frame and
+/// keep it for the life of the encoder.
+enum Av1Context {
+    Bd8(Context<u8>),
+    Bd16(Context<u16>),
+}
+
 /// AVIF encoder: bridges the engine's send/receive [`Encoder`] contract onto a
 /// [`rav1e`] `Context`.
 ///
 /// The rav1e context is created lazily from the first frame (it needs the
-/// dimensions and chroma layout up front). Encoded packets are buffered in
-/// `queue` and handed out one per `receive_packet`, matching the FFmpeg-style
-/// drain loop the rest of the engine expects.
+/// dimensions, chroma layout and bit depth up front). Encoded packets are
+/// buffered in `queue` and handed out one per `receive_packet`, matching the
+/// FFmpeg-style drain loop the rest of the engine expects.
 struct AvifEncoder {
-    ctx: Option<Context<u8>>,
+    ctx: Option<Av1Context>,
     /// Geometry locked in from the first frame; later frames must match.
     geometry: Option<(u32, u32, PixelFormat)>,
     /// Encoded packets ready to hand out.
@@ -64,12 +71,12 @@ impl AvifEncoder {
         }
     }
 
-    /// Build the rav1e context for the first frame's geometry.
+    /// Build the rav1e context for the first frame's geometry + bit depth.
     fn init(&mut self, vf: &VideoFrame) -> Result<()> {
         let chroma = match vf.format {
-            PixelFormat::Yuv420p => ChromaSampling::Cs420,
-            PixelFormat::Yuv422p => ChromaSampling::Cs422,
-            PixelFormat::Yuv444p => ChromaSampling::Cs444,
+            PixelFormat::Yuv420p | PixelFormat::Yuv420p10 => ChromaSampling::Cs420,
+            PixelFormat::Yuv422p | PixelFormat::Yuv422p10 => ChromaSampling::Cs422,
+            PixelFormat::Yuv444p | PixelFormat::Yuv444p10 => ChromaSampling::Cs444,
             other => {
                 return Err(Error::unsupported(format!(
                     "avif encode: pixel format `{}` (needs planar YUV)",
@@ -77,19 +84,23 @@ impl AvifEncoder {
                 )))
             }
         };
+        let bit_depth = vf.format.bit_depth() as usize;
 
         let mut enc = EncoderConfig::with_speed_preset(6);
         enc.width = vf.width as usize;
         enc.height = vf.height as usize;
-        enc.bit_depth = 8;
+        enc.bit_depth = bit_depth;
         enc.chroma_sampling = chroma;
         // AVIF is a single key frame; this tunes rav1e for one-shot intra.
         enc.still_picture = true;
 
         let cfg = Config::new().with_encoder_config(enc);
-        let ctx = cfg
-            .new_context::<u8>()
-            .map_err(|e| Error::InvalidData(format!("rav1e config rejected: {e}")))?;
+        let on_err = |e| Error::InvalidData(format!("rav1e config rejected: {e}"));
+        let ctx = if bit_depth > 8 {
+            Av1Context::Bd16(cfg.new_context::<u16>().map_err(on_err)?)
+        } else {
+            Av1Context::Bd8(cfg.new_context::<u8>().map_err(on_err)?)
+        };
 
         self.ctx = Some(ctx);
         self.geometry = Some((vf.width, vf.height, vf.format));
@@ -98,15 +109,17 @@ impl AvifEncoder {
 
     /// Pull every packet rav1e currently has buffered into `queue`.
     fn pump(&mut self) -> Result<()> {
-        let ctx = self
-            .ctx
-            .as_mut()
-            .expect("pump called before context init");
         loop {
-            match ctx.receive_packet() {
-                Ok(pkt) => {
-                    let mut out = Packet::from_data(0, pkt.data);
-                    out.flags.keyframe = pkt.frame_type == FrameType::KEY;
+            // Both pixel widths yield the same `(bytes, frame_type)` shape.
+            let received = match self.ctx.as_mut() {
+                Some(Av1Context::Bd8(c)) => c.receive_packet().map(|p| (p.data, p.frame_type)),
+                Some(Av1Context::Bd16(c)) => c.receive_packet().map(|p| (p.data, p.frame_type)),
+                None => return Ok(()),
+            };
+            match received {
+                Ok((data, frame_type)) => {
+                    let mut out = Packet::from_data(0, data);
+                    out.flags.keyframe = frame_type == FrameType::KEY;
                     self.queue.push_back(out);
                 }
                 // A frame was consumed but produced no output packet yet.
@@ -146,26 +159,34 @@ impl Encoder for AvifEncoder {
             Some(_) => {}
         }
 
-        let expected_planes = match vf.format {
-            PixelFormat::Yuv420p | PixelFormat::Yuv422p | PixelFormat::Yuv444p => 3,
-            // init() already rejected anything else.
-            _ => unreachable!(),
-        };
-        if vf.planes.len() < expected_planes || vf.strides.len() < expected_planes {
+        if vf.planes.len() < 3 || vf.strides.len() < 3 {
             return Err(Error::invalid(format!(
-                "avif encode: expected {expected_planes} planes, got {}",
+                "avif encode: expected 3 planes, got {}",
                 vf.planes.len()
             )));
         }
 
-        let ctx = self.ctx.as_mut().expect("context initialized above");
-        let mut rframe = ctx.new_frame();
-        for (i, plane) in rframe.planes.iter_mut().enumerate() {
-            // 1 byte per sample (8-bit); source stride may exceed plane width.
-            plane.copy_from_raw_u8(&vf.planes[i], vf.strides[i], 1);
-        }
+        // 1 byte/sample for 8-bit, 2 for 10-bit (little-endian u16). rav1e's
+        // `copy_from_raw_u8` interprets the source by this bytewidth.
+        let bytes = vf.format.bytes_per_sample();
+        let send_result = match self.ctx.as_mut().expect("context initialized above") {
+            Av1Context::Bd8(c) => {
+                let mut rframe = c.new_frame();
+                for (i, plane) in rframe.planes.iter_mut().enumerate() {
+                    plane.copy_from_raw_u8(&vf.planes[i], vf.strides[i], bytes);
+                }
+                c.send_frame(rframe)
+            }
+            Av1Context::Bd16(c) => {
+                let mut rframe = c.new_frame();
+                for (i, plane) in rframe.planes.iter_mut().enumerate() {
+                    plane.copy_from_raw_u8(&vf.planes[i], vf.strides[i], bytes);
+                }
+                c.send_frame(rframe)
+            }
+        };
 
-        match ctx.send_frame(rframe) {
+        match send_result {
             Ok(()) => {}
             // Buffer is full; draining below will make room.
             Err(EncoderStatus::EnoughData) => {}
@@ -188,15 +209,18 @@ impl Encoder for AvifEncoder {
     }
 
     fn flush(&mut self) {
-        if let Some(ctx) = self.ctx.as_mut() {
-            ctx.flush();
-            // Drain whatever the flush released; ignore errors here — they'll
-            // resurface from receive_packet if the queue ends up empty.
-            let _ = self.pump();
-        } else {
+        match self.ctx.as_mut() {
+            Some(Av1Context::Bd8(c)) => c.flush(),
+            Some(Av1Context::Bd16(c)) => c.flush(),
             // Nothing was ever sent; there is nothing to flush.
-            self.eof = true;
+            None => {
+                self.eof = true;
+                return;
+            }
         }
+        // Drain whatever the flush released; ignore errors here — they'll
+        // resurface from receive_packet if the queue ends up empty.
+        let _ = self.pump();
     }
 }
 
@@ -298,21 +322,24 @@ impl Decoder for AvifDecoder {
 /// [`Frame`]. Copies plane data out (the picture is reference-counted and freed
 /// when dropped).
 fn picture_to_frame(pic: &rav1d::Picture) -> Result<Frame> {
-    let format = match pic.pixel_layout() {
-        PixelLayout::I420 => PixelFormat::Yuv420p,
-        PixelLayout::I422 => PixelFormat::Yuv422p,
-        PixelLayout::I444 => PixelFormat::Yuv444p,
-        PixelLayout::I400 => {
+    // Plane bytes are copied verbatim (1 byte/sample at 8-bit, 2 at 10-bit), so
+    // bit depth only affects which pixel format we tag the frame with.
+    let format = match (pic.pixel_layout(), pic.bit_depth()) {
+        (PixelLayout::I420, 8) => PixelFormat::Yuv420p,
+        (PixelLayout::I422, 8) => PixelFormat::Yuv422p,
+        (PixelLayout::I444, 8) => PixelFormat::Yuv444p,
+        (PixelLayout::I420, 10) => PixelFormat::Yuv420p10,
+        (PixelLayout::I422, 10) => PixelFormat::Yuv422p10,
+        (PixelLayout::I444, 10) => PixelFormat::Yuv444p10,
+        (PixelLayout::I400, _) => {
             return Err(Error::unsupported("avif decode: monochrome (I400) not yet mapped"))
         }
+        (_, depth) => {
+            return Err(Error::unsupported(format!(
+                "avif decode: {depth}-bit depth (only 8- and 10-bit are mapped so far)"
+            )))
+        }
     };
-
-    if pic.bit_depth() != 8 {
-        return Err(Error::unsupported(format!(
-            "avif decode: {}-bit depth (only 8-bit is mapped so far)",
-            pic.bit_depth()
-        )));
-    }
 
     let mut planes = Vec::with_capacity(3);
     let mut strides = Vec::with_capacity(3);
@@ -428,6 +455,63 @@ mod tests {
         assert!(
             mean_abs_diff < 30.0,
             "luma drifted too far in round-trip: mean abs diff {mean_abs_diff:.2}"
+        );
+    }
+
+    /// Build a 64×64 YUV420p **10-bit** frame: a horizontal luma gradient over
+    /// flat mid-gray chroma. Samples are little-endian `u16`.
+    fn gradient_frame_10bit() -> Frame {
+        let (w, h) = (64usize, 64usize);
+        let mut y = vec![0u8; w * h * 2];
+        for row in 0..h {
+            for col in 0..w {
+                let val = (col * 1023 / (w - 1)) as u16;
+                let i = (row * w + col) * 2;
+                y[i..i + 2].copy_from_slice(&val.to_le_bytes());
+            }
+        }
+        // Mid-gray chroma at 10-bit is 512.
+        let mut chroma = vec![0u8; (w / 2) * (h / 2) * 2];
+        for s in chroma.chunks_mut(2) {
+            s.copy_from_slice(&512u16.to_le_bytes());
+        }
+        Frame::Video(VideoFrame {
+            width: w as u32,
+            height: h as u32,
+            format: PixelFormat::Yuv420p10,
+            planes: vec![y, chroma.clone(), chroma],
+            strides: vec![w * 2, (w / 2) * 2, (w / 2) * 2],
+            pts: Some(0),
+        })
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_10bit() {
+        let original = gradient_frame_10bit();
+        let decoded = decode(encode(&original));
+
+        assert_eq!(decoded.width, 64);
+        assert_eq!(decoded.height, 64);
+        assert_eq!(decoded.format, PixelFormat::Yuv420p10);
+
+        // Compare luma as little-endian u16 samples, with a 10-bit-scaled
+        // tolerance (~4× the 8-bit bound).
+        let Frame::Video(src) = &original else { unreachable!() };
+        let (w, h) = (src.width as usize, src.height as usize);
+        let mut total_diff = 0u64;
+        for row in 0..h {
+            let src_row = &src.planes[0][row * src.strides[0]..][..w * 2];
+            let dec_row = &decoded.planes[0][row * decoded.strides[0]..][..w * 2];
+            for (a, b) in src_row.chunks_exact(2).zip(dec_row.chunks_exact(2)) {
+                let av = u16::from_le_bytes([a[0], a[1]]) as i32;
+                let bv = u16::from_le_bytes([b[0], b[1]]) as i32;
+                total_diff += (av - bv).unsigned_abs() as u64;
+            }
+        }
+        let mean_abs_diff = total_diff as f64 / (w * h) as f64;
+        assert!(
+            mean_abs_diff < 120.0,
+            "10-bit luma drifted too far: mean abs diff {mean_abs_diff:.2}"
         );
     }
 }

@@ -13,7 +13,25 @@
 
 use std::collections::HashMap;
 
-use rff_core::{CodecId, Error, Frame, MediaType, Packet, Result};
+use rff_core::{CodecId, Error, Frame, MediaType, Packet, PixelFormat, Result, SampleFormat};
+
+/// Stream parameters handed to a decoder before the first packet. Self-describing
+/// codecs (AV1, PNG, ...) can ignore these; raw/parametric codecs (PCM, and
+/// codecs that carry config out of band like H.264 SPS/PPS) need them.
+#[derive(Debug, Clone, Default)]
+pub struct CodecParams {
+    pub codec_id: CodecId,
+    // Video
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: Option<PixelFormat>,
+    // Audio
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub sample_format: Option<SampleFormat>,
+    /// Codec-private init data (SPS/PPS, OpusHead, ...).
+    pub extradata: Vec<u8>,
+}
 
 /// Decodes compressed [`Packet`]s into raw [`Frame`]s.
 ///
@@ -21,6 +39,12 @@ use rff_core::{CodecId, Error, Frame, MediaType, Packet, Result};
 /// then pull frames with [`receive_frame`](Decoder::receive_frame) until it
 /// returns [`Error::Again`] (needs more input) or [`Error::Eof`].
 pub trait Decoder: Send {
+    /// Receive the stream's parameters before decoding begins. Default: ignore
+    /// them (the bitstream is self-describing). Called once, after construction.
+    fn configure(&mut self, _params: &CodecParams) -> Result<()> {
+        Ok(())
+    }
+
     /// Submit one compressed packet for decoding.
     fn send_packet(&mut self, packet: &Packet) -> Result<()>;
 
@@ -37,6 +61,13 @@ pub trait Decoder: Send {
 
 /// Encodes raw [`Frame`]s into compressed [`Packet`]s. Mirror of [`Decoder`].
 pub trait Encoder: Send {
+    /// The input sample rates this encoder accepts, or `None` for "any rate".
+    /// The transcode pipeline resamples audio to the nearest accepted rate
+    /// before feeding frames (mirrors FFmpeg's automatic `aresample`).
+    fn accepted_sample_rates(&self) -> Option<Vec<u32>> {
+        None
+    }
+
     /// Submit one raw frame for encoding.
     fn send_frame(&mut self, frame: &Frame) -> Result<()>;
 

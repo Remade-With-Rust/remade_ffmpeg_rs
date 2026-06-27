@@ -46,6 +46,32 @@ pub enum CodecId {
     Opus,
     /// AVIF still image (an AV1 intra frame in a HEIF box).
     Avif,
+    /// PNG still image (DEFLATE-compressed RGB/RGBA).
+    Png,
+    /// JPEG still image (a.k.a. MJPEG).
+    Jpeg,
+    /// GIF image (first frame; palette-based).
+    Gif,
+    /// WebP image (VP8 / VP8L).
+    Webp,
+    /// Linear PCM audio (uncompressed; layout in the stream's sample format).
+    Pcm,
+    /// Vorbis audio (Ogg Vorbis).
+    Vorbis,
+    /// FLAC lossless audio.
+    Flac,
+    /// JPEG XL image.
+    Jxl,
+    /// AAC audio (Advanced Audio Coding).
+    Aac,
+    /// VP9 video.
+    Vp9,
+}
+
+impl Default for CodecId {
+    fn default() -> Self {
+        CodecId::None
+    }
 }
 
 impl CodecId {
@@ -57,6 +83,16 @@ impl CodecId {
             CodecId::H264 => "h264",
             CodecId::Opus => "opus",
             CodecId::Avif => "avif",
+            CodecId::Png => "png",
+            CodecId::Jpeg => "mjpeg",
+            CodecId::Gif => "gif",
+            CodecId::Webp => "webp",
+            CodecId::Pcm => "pcm",
+            CodecId::Vorbis => "vorbis",
+            CodecId::Flac => "flac",
+            CodecId::Jxl => "jpegxl",
+            CodecId::Aac => "aac",
+            CodecId::Vp9 => "vp9",
         }
     }
 
@@ -66,8 +102,18 @@ impl CodecId {
             CodecId::None => MediaType::Data,
             CodecId::H264 => MediaType::Video,
             CodecId::Opus => MediaType::Audio,
-            // AVIF carries image data; we model it as a (single-frame) video stream.
+            // Image codecs carry pixel data; we model them as (single-frame) video.
             CodecId::Avif => MediaType::Video,
+            CodecId::Png => MediaType::Video,
+            CodecId::Jpeg => MediaType::Video,
+            CodecId::Gif => MediaType::Video,
+            CodecId::Webp => MediaType::Video,
+            CodecId::Pcm => MediaType::Audio,
+            CodecId::Vorbis => MediaType::Audio,
+            CodecId::Flac => MediaType::Audio,
+            CodecId::Jxl => MediaType::Video,
+            CodecId::Aac => MediaType::Audio,
+            CodecId::Vp9 => MediaType::Video,
         }
     }
 
@@ -77,6 +123,16 @@ impl CodecId {
             "h264" | "avc" | "libx264" => Some(CodecId::H264),
             "opus" | "libopus" => Some(CodecId::Opus),
             "avif" => Some(CodecId::Avif),
+            "png" => Some(CodecId::Png),
+            "mjpeg" | "jpeg" | "jpg" => Some(CodecId::Jpeg),
+            "gif" => Some(CodecId::Gif),
+            "webp" => Some(CodecId::Webp),
+            "pcm" | "pcm_s16le" | "pcm_f32le" => Some(CodecId::Pcm),
+            "vorbis" => Some(CodecId::Vorbis),
+            "flac" => Some(CodecId::Flac),
+            "jpegxl" | "jxl" => Some(CodecId::Jxl),
+            "aac" => Some(CodecId::Aac),
+            "vp9" | "libvpx-vp9" => Some(CodecId::Vp9),
             _ => None,
         }
     }
@@ -98,6 +154,18 @@ pub enum PixelFormat {
     Yuv422p,
     /// Planar Y'CbCr 4:4:4, 8-bit.
     Yuv444p,
+    /// Planar Y'CbCr 4:2:0, 10-bit (each sample stored as little-endian u16).
+    Yuv420p10,
+    /// Planar Y'CbCr 4:2:2, 10-bit (little-endian u16 samples).
+    Yuv422p10,
+    /// Planar Y'CbCr 4:4:4, 10-bit (little-endian u16 samples).
+    Yuv444p10,
+    /// Planar Y'CbCr 4:2:0, 12-bit (little-endian u16 samples).
+    Yuv420p12,
+    /// Planar Y'CbCr 4:2:2, 12-bit (little-endian u16 samples).
+    Yuv422p12,
+    /// Planar Y'CbCr 4:4:4, 12-bit (little-endian u16 samples).
+    Yuv444p12,
     /// Packed RGB, 8 bits per channel.
     Rgb24,
     /// Packed RGBA, 8 bits per channel.
@@ -110,8 +178,34 @@ impl PixelFormat {
             PixelFormat::Yuv420p => "yuv420p",
             PixelFormat::Yuv422p => "yuv422p",
             PixelFormat::Yuv444p => "yuv444p",
+            PixelFormat::Yuv420p10 => "yuv420p10le",
+            PixelFormat::Yuv422p10 => "yuv422p10le",
+            PixelFormat::Yuv444p10 => "yuv444p10le",
+            PixelFormat::Yuv420p12 => "yuv420p12le",
+            PixelFormat::Yuv422p12 => "yuv422p12le",
+            PixelFormat::Yuv444p12 => "yuv444p12le",
             PixelFormat::Rgb24 => "rgb24",
             PixelFormat::Rgba => "rgba",
+        }
+    }
+
+    /// Bits per component sample (8 for the 8-bit formats, 10 for the 10-bit
+    /// planar ones).
+    pub fn bit_depth(self) -> u32 {
+        match self {
+            PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 | PixelFormat::Yuv444p10 => 10,
+            PixelFormat::Yuv420p12 | PixelFormat::Yuv422p12 | PixelFormat::Yuv444p12 => 12,
+            _ => 8,
+        }
+    }
+
+    /// Bytes used to store one component sample: 1 for 8-bit, 2 for the 10-bit
+    /// formats (whose samples live in the low bits of a little-endian `u16`).
+    pub fn bytes_per_sample(self) -> usize {
+        if self.bit_depth() > 8 {
+            2
+        } else {
+            1
         }
     }
 }

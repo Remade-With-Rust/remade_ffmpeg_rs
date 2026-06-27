@@ -93,6 +93,8 @@ fn print_help() {
     println!("  -c:v CODEC         video codec for the output (e.g. h264, copy)");
     println!("  -c:a CODEC         audio codec for the output (e.g. opus, copy)");
     println!("  -b:v / -b:a RATE   target bitrate (e.g. 2M, 128k)");
+    println!("  -vf FILTERS        video filter graph (e.g. scale=640:480, crop=W:H:X:Y)");
+    println!("  -map SPEC          select streams: INPUT[:v|:a|:N] (repeatable)");
     println!("  -y / -n            overwrite / never overwrite the output");
     println!("  -codecs            list supported codecs");
     println!("  -formats           list supported container formats");

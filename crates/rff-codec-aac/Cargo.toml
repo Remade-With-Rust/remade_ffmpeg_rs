@@ -1,0 +1,12 @@
+[package]
+name = "rff-codec-aac"
+description = "Remade FFmpeg (Rust): in-house pure-Rust AAC-LC decoder (no C/FFI)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true

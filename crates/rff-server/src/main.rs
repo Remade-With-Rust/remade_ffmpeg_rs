@@ -150,6 +150,8 @@ struct TranscodeRequest {
     #[serde(default)]
     audio_codec: Option<String>,
     #[serde(default)]
+    video_filters: Option<String>,
+    #[serde(default)]
     overwrite: bool,
 }
 
@@ -181,6 +183,8 @@ async fn transcode(
                 codec,
                 options: Dictionary::new(),
             }),
+            video_filters: req.video_filters,
+            maps: Vec::new(),
             overwrite: req.overwrite,
         }],
     };

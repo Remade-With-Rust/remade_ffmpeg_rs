@@ -4,9 +4,10 @@
 //! headers, and returns a structured [`MediaInfo`]. The CLI's `ffprobe` and the
 //! server's `POST /v1/probe` both call straight into this.
 
+use std::io::Read;
 use std::path::Path;
 
-use rff_core::{CodecId, MediaType, Rational, Result};
+use rff_core::{CodecId, Error, MediaType, Rational, Result};
 
 use crate::Engine;
 
@@ -42,16 +43,7 @@ pub struct StreamInfo {
 /// real; only the per-format parsing is pending.
 pub fn probe(engine: &Engine, path: impl AsRef<Path>) -> Result<MediaInfo> {
     let path = path.as_ref();
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default();
-
-    let format = engine
-        .formats
-        .by_extension(ext)
-        .ok_or_else(|| rff_core::Error::DemuxerNotFound(path.display().to_string()))?;
-    let format_name = format.name.to_string();
+    let format_name = detect_input_format(engine, path, None)?;
 
     let file = std::fs::File::open(path)?;
     let mut demuxer = engine
@@ -77,4 +69,39 @@ pub fn probe(engine: &Engine, path: impl AsRef<Path>) -> Result<MediaInfo> {
         format_name,
         streams,
     })
+}
+
+/// Decide which container a path should be read as: an explicit `-f` override
+/// wins; otherwise sniff the file's leading bytes (content beats filename);
+/// otherwise fall back to the extension. Shared by [`probe`] and the transcode
+/// input path so both detect formats the same way.
+pub(crate) fn detect_input_format(
+    engine: &Engine,
+    path: &Path,
+    forced: Option<&str>,
+) -> Result<String> {
+    if let Some(name) = forced {
+        return Ok(name.to_string());
+    }
+    // Content sniff (best effort — an unreadable head just falls through).
+    if let Ok(head) = read_head(path, 4096) {
+        if let Some(format) = engine.formats.probe(&head) {
+            return Ok(format.name.to_string());
+        }
+    }
+    // Filename fallback.
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    engine
+        .formats
+        .by_extension(ext)
+        .map(|f| f.name.to_string())
+        .ok_or_else(|| Error::DemuxerNotFound(path.display().to_string()))
+}
+
+/// Read up to `max` leading bytes of a file for content sniffing.
+fn read_head(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.take(max as u64).read_to_end(&mut buf)?;
+    Ok(buf)
 }

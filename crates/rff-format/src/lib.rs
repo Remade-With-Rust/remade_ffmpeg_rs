@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
-use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result};
+use rff_core::{CodecId, Error, MediaType, Packet, PixelFormat, Rational, Result, SampleFormat};
 
 /// Description of one elementary stream within a container.
 #[derive(Debug, Clone)]
@@ -27,9 +27,16 @@ pub struct Stream {
     // --- Video parameters (zero/ignored for non-video) ---
     pub width: u32,
     pub height: u32,
+    /// Raw pixel layout, when known (raw video). Self-describing codecs leave this `None`.
+    pub pixel_format: Option<PixelFormat>,
     // --- Audio parameters (zero/ignored for non-audio) ---
     pub sample_rate: u32,
     pub channels: u16,
+    /// Raw sample layout, when known (PCM). Self-describing codecs leave this `None`.
+    pub sample_format: Option<SampleFormat>,
+    /// Codec-private initialization data (e.g. H.264 SPS/PPS, OpusHead). Empty
+    /// for codecs whose bitstream is fully self-describing.
+    pub extradata: Vec<u8>,
 }
 
 impl Stream {
@@ -42,8 +49,11 @@ impl Stream {
             time_base: Rational::new(1, 1000),
             width: 0,
             height: 0,
+            pixel_format: None,
             sample_rate: 0,
             channels: 0,
+            sample_format: None,
+            extradata: Vec::new(),
         }
     }
 }
@@ -80,6 +90,9 @@ pub trait Muxer: Send {
 pub type DemuxerFactory = fn(Input) -> Box<dyn Demuxer>;
 /// Factory opening a muxer over an output byte sink.
 pub type MuxerFactory = fn(Output) -> Box<dyn Muxer>;
+/// Content sniffer: scores how strongly a byte prefix looks like this format,
+/// `0` (no match) to `100` (certain) — mirrors FFmpeg's `AVInputFormat::read_probe`.
+pub type ProbeFn = fn(&[u8]) -> i32;
 
 /// Static description of a container format and its read/write support.
 pub struct Format {
@@ -92,6 +105,8 @@ pub struct Format {
     pub demuxer: Option<DemuxerFactory>,
     /// Present if this format can be muxed (written).
     pub muxer: Option<MuxerFactory>,
+    /// Content sniffer for magic-byte detection (independent of the filename).
+    pub probe: Option<ProbeFn>,
 }
 
 impl Format {
@@ -123,13 +138,25 @@ impl FormatRegistry {
     }
 
     /// Find a format whose extension list contains `ext` (case-insensitive,
-    /// no leading dot). This is the cheap "guess by filename" path; a real
-    /// content-sniffing probe comes later.
+    /// no leading dot). The cheap "guess by filename" path; [`probe`](Self::probe)
+    /// inspects content instead.
     pub fn by_extension(&self, ext: &str) -> Option<&Format> {
         let ext = ext.trim_start_matches('.').to_ascii_lowercase();
         self.by_name
             .values()
             .find(|f| f.extensions.iter().any(|e| e.eq_ignore_ascii_case(&ext)))
+    }
+
+    /// Identify a format by sniffing a byte prefix: the registered format whose
+    /// [`probe`](Format::probe) returns the highest positive score wins. Returns
+    /// `None` if nothing recognizes the data.
+    pub fn probe(&self, data: &[u8]) -> Option<&Format> {
+        self.by_name
+            .values()
+            .filter_map(|f| f.probe.map(|p| (p(data), f)))
+            .filter(|(score, _)| *score > 0)
+            .max_by_key(|(score, _)| *score)
+            .map(|(_, f)| f)
     }
 
     /// Open a demuxer for the format named `name`.

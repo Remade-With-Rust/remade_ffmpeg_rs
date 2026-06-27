@@ -10,3 +10,4 @@ rust-version.workspace = true
 [dependencies]
 rff-core.workspace = true
 rff-codec.workspace = true
+opus-rs.workspace = true

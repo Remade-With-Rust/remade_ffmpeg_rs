@@ -21,3 +21,10 @@ path = "src/bin/ffprobe.rs"
 [dependencies]
 rff.workspace = true
 rff-core.workspace = true
+
+[features]
+default = []
+# Pass-through to the engine's TEMPORARY C/FFI H.264 (Cisco openh264). Build the
+# `ffmpeg`/`ffprobe` binaries with `--features h264-openh264` to get H.264 now;
+# off by default so the standard binaries stay 100% Rust.
+h264-openh264 = ["rff/h264-openh264"]
