@@ -89,6 +89,82 @@ impl FilterChain {
 }
 
 // ---------------------------------------------------------------------------
+// filter_complex (multi-input graphs)
+// ---------------------------------------------------------------------------
+
+/// A `-filter_complex` graph. For now it models the most-used multi-input
+/// operation: **overlay** — compositing a second input over the first (logo /
+/// watermark / picture-in-picture). The labels (`[0:v][1:v]...`) are parsed but
+/// the wiring is fixed: input 0 is the base, input 1 the overlay.
+pub struct FilterComplex {
+    /// `(x, y)` placement of the overlay's top-left on the base, or `None` if
+    /// the graph has no overlay.
+    pub overlay: Option<(u32, u32)>,
+}
+
+impl FilterComplex {
+    /// Parse a filter_complex spec. Recognizes `overlay=X:Y` (numeric, plus the
+    /// common corner shorthands `W-w`, `H-h` resolved against the base size at
+    /// apply time — for now numeric offsets only).
+    pub fn parse(spec: &str) -> Result<FilterComplex> {
+        if let Some(pos) = spec.find("overlay") {
+            let after = spec[pos + "overlay".len()..].trim_start_matches('=');
+            // Stop at the next filter (`,`) or output label (`[`).
+            let args = after.split([',', '[', ';']).next().unwrap_or("");
+            let mut parts = args.split(':');
+            let x = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            let y = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            return Ok(FilterComplex { overlay: Some((x, y)) });
+        }
+        Err(Error::unsupported(format!(
+            "filter_complex: unsupported graph `{spec}` (only `overlay` so far)"
+        )))
+    }
+}
+
+/// Composite `over` onto a copy of `base` at `(x, y)`, both 8-bit planar YUV of
+/// the same format. Overlay pixels replace the base (YUV carries no alpha);
+/// the overlay is clipped to the base bounds and `(x, y)` snaps down to the
+/// chroma grid so the planes stay aligned.
+pub fn overlay(base: VideoFrame, over: &VideoFrame, x: u32, y: u32) -> Result<VideoFrame> {
+    ensure_planar_yuv(&base, "overlay")?;
+    ensure_planar_yuv(over, "overlay")?;
+    if base.format != over.format {
+        return Err(Error::unsupported(format!(
+            "overlay: base {} vs overlay {} — convert with the `format` filter first",
+            base.format.name(),
+            over.format.name()
+        )));
+    }
+    let (sx, sy) = subsampling(base.format)?;
+    let (x, y) = (x - x % sx, y - y % sy);
+    let mut base = base;
+    for i in 0..3 {
+        let (div_x, div_y) = if i == 0 { (1, 1) } else { (sx, sy) };
+        let (ox, oy) = ((x / div_x) as usize, (y / div_y) as usize);
+        let (ow, oh) = plane_dims(over.format, over.width, over.height, i)?;
+        let (bw, bh) = plane_dims(base.format, base.width, base.height, i)?;
+        let (bw, bh) = (bw as usize, bh as usize);
+        let (bstride, ostride) = (base.strides[i], over.strides[i]);
+        for row in 0..oh as usize {
+            let by = oy + row;
+            if by >= bh {
+                break;
+            }
+            let copy_w = (ow as usize).min(bw.saturating_sub(ox));
+            if copy_w == 0 {
+                break;
+            }
+            let bstart = by * bstride + ox;
+            let ostart = row * ostride;
+            base.planes[i][bstart..bstart + copy_w]
+                .copy_from_slice(&over.planes[i][ostart..ostart + copy_w]);
+        }
+    }
+    Ok(base)
+}
+
+// ---------------------------------------------------------------------------
 // Pixel-format helpers
 // ---------------------------------------------------------------------------
 
@@ -988,5 +1064,39 @@ mod tests {
         assert_eq!(out.planes[0][4 * 16 + 4], 200); // input top-left at (4,4)
         assert_eq!(out.planes[1][0], 128); // border chroma is neutral
         assert!(chain.apply(frame(64, 64, |_, _| 0)).is_err()); // doesn't fit
+    }
+
+    #[test]
+    fn filter_complex_parses_overlay_offset() {
+        let fc = FilterComplex::parse("[0:v][1:v]overlay=16:8[out]").unwrap();
+        assert_eq!(fc.overlay, Some((16, 8)));
+        // Bare overlay (no offset) defaults to the top-left corner.
+        assert_eq!(FilterComplex::parse("overlay").unwrap().overlay, Some((0, 0)));
+        assert!(FilterComplex::parse("[0][1]hstack").is_err());
+    }
+
+    #[test]
+    fn overlay_composites_at_offset() {
+        // Base luma = 10 everywhere; overlay luma = 200 everywhere. After an
+        // overlay at (8, 4), the 8×8 patch there must read 200, elsewhere 10.
+        let base = frame(32, 32, |_, _| 10);
+        let over = frame(8, 8, |_, _| 200);
+        let out = overlay(base, &over, 8, 4).unwrap();
+        assert_eq!((out.width, out.height), (32, 32));
+        assert_eq!(out.planes[0][4 * 32 + 8], 200); // top-left of the patch
+        assert_eq!(out.planes[0][11 * 32 + 15], 200); // bottom-right of the patch
+        assert_eq!(out.planes[0][0], 10); // outside, untouched
+        assert_eq!(out.planes[0][12 * 32 + 8], 10); // one row below the patch
+    }
+
+    #[test]
+    fn overlay_clips_to_base_bounds() {
+        // An overlay placed near the corner spills past the edge; the copy must
+        // clip rather than panic, and the in-bounds corner still lands.
+        let base = frame(16, 16, |_, _| 0);
+        let over = frame(8, 8, |_, _| 99);
+        let out = overlay(base, &over, 12, 12).unwrap();
+        assert_eq!(out.planes[0][12 * 16 + 12], 99); // the 4×4 visible corner
+        assert_eq!(out.planes[0][15 * 16 + 15], 99);
     }
 }

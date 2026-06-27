@@ -56,6 +56,7 @@ fn transcode(engine: &Engine, input: &Path, output: &Path, codec: CodecId) {
                 options: Dictionary::new(),
             }),
             video_filters: None,
+            filter_complex: None,
             maps: Vec::new(),
             overwrite: true,
         }],

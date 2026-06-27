@@ -82,6 +82,7 @@ fn av_spec(inputs: Vec<PathBuf>, out: &Path) -> TranscodeSpec {
             video_codec: Some(StreamCodec { codec: CodecId::Avif, options: Dictionary::new() }),
             audio_codec: Some(StreamCodec { codec: CodecId::Opus, options: Dictionary::new() }),
             video_filters: None,
+            filter_complex: None,
             maps: Vec::new(),
             overwrite: true,
         }],

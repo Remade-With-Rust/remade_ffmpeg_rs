@@ -90,6 +90,7 @@ fn wav_transcode_preserves_pcm() {
                 options: Dictionary::new(),
             }),
             video_filters: None,
+            filter_complex: None,
             maps: Vec::new(),
             overwrite: true,
         }],

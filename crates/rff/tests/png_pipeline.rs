@@ -69,6 +69,7 @@ fn transcode(engine: &Engine, input: &Path, output: &Path, codec: CodecId, vf: &
             }),
             audio_codec: None,
             video_filters: Some(vf.to_string()),
+            filter_complex: None,
             maps: Vec::new(),
             overwrite: true,
         }],

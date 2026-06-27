@@ -23,8 +23,11 @@ use std::fs::File;
 use std::path::PathBuf;
 
 use rff_codec::{CodecParams, Decoder, Encoder};
-use rff_core::{AudioFrame, CodecId, Dictionary, Error, Frame, MediaType, Packet, Result, SampleFormat};
-use rff_filter::FilterChain;
+use rff_core::{
+    AudioFrame, CodecId, Dictionary, Error, Frame, MediaType, Packet, Result, SampleFormat,
+    VideoFrame,
+};
+use rff_filter::{FilterChain, FilterComplex};
 use rff_format::{Muxer, Stream};
 use rff_resample::Resampler;
 
@@ -79,6 +82,9 @@ pub struct OutputSpec {
     /// Video filter graph (`-vf`), e.g. `scale=320:240,crop=...`. Applied to
     /// decoded video frames before re-encoding (transcode streams only).
     pub video_filters: Option<String>,
+    /// Multi-input filter graph (`-filter_complex`). Currently models `overlay`:
+    /// the last input is composited over input #0's video.
+    pub filter_complex: Option<String>,
     /// Explicit stream selection (`-map`). Empty = default (all video + audio,
     /// in input/stream order).
     pub maps: Vec<MapSpec>,
@@ -112,12 +118,26 @@ enum StreamOp {
         decoder: Box<dyn Decoder>,
         encoder: Box<dyn Encoder>,
         filters: FilterChain,
+        /// `-filter_complex` overlay: a pre-decoded frame composited onto each
+        /// of this stream's frames at `(x, y)` (after `filters`). Video only.
+        overlay: Option<(VideoFrame, u32, u32)>,
         /// Sample rate the encoder needs (0 = no audio resampling required).
         target_rate: u32,
         /// Lazily built once the first audio frame reveals the input rate.
         resampler: Option<Resampler>,
         out_index: usize,
     },
+}
+
+/// Composite the `-filter_complex` overlay onto a video frame, if one is set.
+/// Audio frames and the no-overlay case pass through untouched.
+fn apply_overlay(overlay: &Option<(VideoFrame, u32, u32)>, frame: Frame) -> Result<Frame> {
+    match (overlay, frame) {
+        (Some((over, x, y)), Frame::Video(v)) => {
+            Ok(Frame::Video(rff_filter::overlay(v, over, *x, *y)?))
+        }
+        (_, frame) => Ok(frame),
+    }
 }
 
 /// Apply a video filter chain to a frame. Filters are video-only; audio passes
@@ -212,6 +232,24 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     }
     let output = &spec.outputs[0];
 
+    // -filter_complex overlay: the last input is composited over input #0's
+    // video. Resolve it up front so stream selection can exclude that input.
+    let overlay_xy = output
+        .filter_complex
+        .as_deref()
+        .map(FilterComplex::parse)
+        .transpose()?
+        .and_then(|fc| fc.overlay);
+    let overlay_input = match overlay_xy {
+        Some(_) if spec.inputs.len() >= 2 => Some(spec.inputs.len() - 1),
+        Some(_) => {
+            return Err(Error::Option(
+                "filter_complex overlay needs a second input (the overlay image/video)".into(),
+            ))
+        }
+        None => None,
+    };
+
     // --- open every input demuxer and read its streams ---
     let mut demuxers: Vec<Box<dyn rff_format::Demuxer>> = Vec::new();
     let mut input_streams: Vec<Vec<Stream>> = Vec::new();
@@ -224,7 +262,11 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     }
 
     // --- select which (input, stream) pairs go to the output, in order ---
-    let selection = select_streams(&input_streams, output)?;
+    let mut selection = select_streams(&input_streams, output)?;
+    // The overlay input is consumed by the filter, not muxed as its own stream.
+    if let Some(oin) = overlay_input {
+        selection.retain(|(inp, _)| *inp != oin);
+    }
     if selection.is_empty() {
         return Err(Error::unsupported("no streams selected for the output"));
     }
@@ -239,6 +281,24 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
         let (op, os) = build_op(engine, &input_streams[inp][local], output, out_index)?;
         per_input_ops[inp][local] = op;
         out_streams.push(os);
+    }
+
+    // --- filter_complex overlay: pre-decode the overlay frame and hand it to
+    // input #0's video transcode op (which composites it onto every frame) ---
+    if let (Some((x, y)), Some(oin)) = (overlay_xy, overlay_input) {
+        let over = decode_overlay_frame(engine, &mut *demuxers[oin], &input_streams[oin])?;
+        let vidx = input_streams[0]
+            .iter()
+            .position(|s| s.media_type == MediaType::Video)
+            .ok_or_else(|| Error::Option("filter_complex overlay: input #0 has no video".into()))?;
+        match &mut per_input_ops[0][vidx] {
+            StreamOp::Transcode { overlay, .. } => *overlay = Some((over, x, y)),
+            _ => {
+                return Err(Error::unsupported(
+                    "filter_complex overlay needs input #0's video re-encoded — pass -c:v",
+                ))
+            }
+        }
     }
 
     // --- confirm the muxer exists before touching disk ---
@@ -380,6 +440,7 @@ fn build_op(
                     decoder,
                     encoder,
                     filters,
+                    overlay: None,
                     target_rate,
                     resampler: None,
                     out_index,
@@ -392,6 +453,49 @@ fn build_op(
             let mut os = stream.clone();
             os.index = out_index;
             Ok((StreamOp::Copy { out_index }, os))
+        }
+    }
+}
+
+/// Decode the first video frame of the overlay input and convert it to 4:2:0,
+/// ready to composite onto the base's YUV frames.
+fn decode_overlay_frame(
+    engine: &Engine,
+    demuxer: &mut dyn rff_format::Demuxer,
+    streams: &[Stream],
+) -> Result<VideoFrame> {
+    let vidx = streams
+        .iter()
+        .position(|s| s.media_type == MediaType::Video)
+        .ok_or_else(|| Error::Option("filter_complex overlay: overlay input has no video".into()))?;
+    let mut decoder = engine.codecs.find_decoder(streams[vidx].codec_id)?;
+    decoder.configure(&codec_params(&streams[vidx]))?;
+    let mut to_yuv = FilterChain::parse("format=yuv420p")?;
+    let mut got_eof = false;
+    loop {
+        let frame = match demuxer.read_packet() {
+            Ok(pkt) if pkt.stream_index as usize != vidx => continue,
+            Ok(pkt) => {
+                decoder.send_packet(&pkt)?;
+                decoder.receive_frame()
+            }
+            Err(Error::Eof) if !got_eof => {
+                got_eof = true;
+                decoder.flush();
+                decoder.receive_frame()
+            }
+            Err(e) => return Err(e),
+        };
+        match frame {
+            Ok(Frame::Video(v)) => return to_yuv.apply(v),
+            Ok(_) => continue,
+            Err(Error::Again) if !got_eof => continue,
+            Err(Error::Again) | Err(Error::Eof) => {
+                return Err(Error::Option(
+                    "filter_complex overlay: no decodable frame in the overlay input".into(),
+                ))
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -433,6 +537,7 @@ fn process_packet(
             decoder,
             encoder,
             filters,
+            overlay,
             target_rate,
             resampler,
             out_index,
@@ -443,6 +548,7 @@ fn process_packet(
                     Ok(frame) => {
                         report.frames_decoded += 1;
                         let frame = apply_filters(filters, frame)?;
+                        let frame = apply_overlay(overlay, frame)?;
                         let frame = conform_audio(resampler, *target_rate, frame)?;
                         encoder.send_frame(&frame)?;
                         drain_encoder(&mut **encoder, *out_index, muxer, report)?;
@@ -468,6 +574,7 @@ fn flush_streams(
             decoder,
             encoder,
             filters,
+            overlay,
             target_rate,
             resampler,
             out_index,
@@ -482,6 +589,7 @@ fn flush_streams(
                 Ok(frame) => {
                     report.frames_decoded += 1;
                     let frame = apply_filters(filters, frame)?;
+                    let frame = apply_overlay(overlay, frame)?;
                     let frame = conform_audio(resampler, *target_rate, frame)?;
                     encoder.send_frame(&frame)?;
                     drain_encoder(&mut **encoder, *out_index, muxer, report)?;

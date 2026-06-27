@@ -72,6 +72,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut video_opts = Dictionary::new();
     let mut audio_opts = Dictionary::new();
     let mut video_filters: Option<String> = None;
+    let mut filter_complex: Option<String> = None;
     let mut maps: Vec<MapSpec> = Vec::new();
     let mut overwrite = false;
     let mut output_path: Option<PathBuf> = None;
@@ -154,6 +155,10 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
 
             // Video filter graph: -vf / -filter:v.
             "vf" => video_filters = Some(take_value(args, &mut i, arg)?),
+            // Multi-input filter graph: -filter_complex / -lavfi.
+            "filter_complex" | "lavfi" => {
+                filter_complex = Some(take_value(args, &mut i, arg)?)
+            }
             "filter" => {
                 let value = take_value(args, &mut i, arg)?;
                 match spec {
@@ -233,6 +238,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             options: audio_opts,
         }),
         video_filters,
+        filter_complex,
         maps,
         overwrite,
     });

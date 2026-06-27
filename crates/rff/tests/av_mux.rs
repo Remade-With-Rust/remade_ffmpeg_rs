@@ -93,6 +93,7 @@ fn muxes_video_and_audio_into_one_avi() {
             video_codec: None, // copy
             audio_codec: None, // copy
             video_filters: None,
+            filter_complex: None,
             maps: Vec::new(),
             overwrite: true,
         }],

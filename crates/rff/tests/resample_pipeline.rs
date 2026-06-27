@@ -62,6 +62,7 @@ fn wav_44100_resamples_to_opus_48000() {
             video_codec: None,
             audio_codec: Some(StreamCodec { codec: CodecId::Opus, options: Dictionary::new() }),
             video_filters: None,
+            filter_complex: None,
             maps: Vec::new(),
             overwrite: true,
         }],
