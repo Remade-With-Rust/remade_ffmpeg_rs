@@ -335,7 +335,8 @@ fn build_op(
         Some(target) => {
             let mut decoder = engine.codecs.find_decoder(stream.codec_id)?;
             decoder.configure(&codec_params(stream))?;
-            let encoder = engine.codecs.find_encoder(target.codec)?;
+            let mut encoder = engine.codecs.find_encoder(target.codec)?;
+            encoder.configure(&target.options)?; // rate control: -crf / -preset / -b
             // Video filter graph (`-vf`); applies to video streams only.
             let filters = if stream.media_type == MediaType::Video {
                 FilterChain::parse(output.video_filters.as_deref().unwrap_or(""))?

@@ -174,6 +174,21 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                 }
             }
 
+            // Rate control / tuning (video by default; `:a` targets audio):
+            // -crf / -qp (quality), -preset (speed<->quality), -pass (1|2).
+            "crf" | "qp" | "preset" | "pass" => {
+                let value = take_value(args, &mut i, arg)?;
+                if base == "pass" && value != "1" {
+                    warnings.push(
+                        "two-pass (-pass 2) is parsed but runs single-pass for now".into(),
+                    );
+                }
+                match spec {
+                    Some(s) if s.starts_with('a') => audio_opts.set(base, value),
+                    _ => video_opts.set(base, value),
+                }
+            }
+
             // Anything else: accept gracefully. Best-effort consume a trailing
             // value so we don't mistake it for the output path.
             _ => {

@@ -18,7 +18,38 @@ use rav1e::prelude::{
     ChromaSampling, Config, Context, EncoderConfig, EncoderStatus, FrameType,
 };
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
-use rff_core::{Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
+use rff_core::{Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
+
+/// Map an `ffmpeg`-style `-preset` (named or numeric) to a rav1e speed (0 =
+/// slowest/best … 10 = fastest). Unknown/absent → 6 (rav1e's balanced default).
+fn preset_to_speed(preset: Option<&str>) -> u8 {
+    match preset {
+        Some(p) => match p.to_ascii_lowercase().as_str() {
+            "ultrafast" => 10,
+            "superfast" => 9,
+            "veryfast" => 8,
+            "faster" => 7,
+            "fast" => 6,
+            "medium" => 5,
+            "slow" => 3,
+            "slower" => 2,
+            "veryslow" | "placebo" => 0,
+            n => n.parse::<u8>().unwrap_or(6).min(10),
+        },
+        None => 6,
+    }
+}
+
+/// Parse a bitrate like `2M` / `500k` / `128000` into bits per second.
+fn parse_bitrate(b: Option<&str>) -> Option<i32> {
+    let b = b?.trim();
+    let (num, mul) = match b.chars().last() {
+        Some('k') | Some('K') => (&b[..b.len() - 1], 1_000),
+        Some('m') | Some('M') => (&b[..b.len() - 1], 1_000_000),
+        _ => (b, 1),
+    };
+    num.trim().parse::<f64>().ok().map(|v| (v * mul as f64) as i32)
+}
 
 /// Register the AVIF codec into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
@@ -59,6 +90,8 @@ struct AvifEncoder {
     queue: VecDeque<Packet>,
     /// Set once the encoder has been flushed and fully drained.
     eof: bool,
+    /// Output rate-control / tuning options (`-crf`, `-preset`, `-b`, ...).
+    options: Dictionary,
 }
 
 impl AvifEncoder {
@@ -68,6 +101,7 @@ impl AvifEncoder {
             geometry: None,
             queue: VecDeque::new(),
             eof: false,
+            options: Dictionary::new(),
         }
     }
 
@@ -86,13 +120,23 @@ impl AvifEncoder {
         };
         let bit_depth = vf.format.bit_depth() as usize;
 
-        let mut enc = EncoderConfig::with_speed_preset(6);
+        let mut enc = EncoderConfig::with_speed_preset(preset_to_speed(self.options.get("preset")));
         enc.width = vf.width as usize;
         enc.height = vf.height as usize;
         enc.bit_depth = bit_depth;
         enc.chroma_sampling = chroma;
         // AVIF is a single key frame; this tunes rav1e for one-shot intra.
         enc.still_picture = true;
+        // Rate control: -qp sets rav1e's quantizer directly; -crf (ffmpeg's
+        // 0–63 scale) maps onto it ×4; -b targets a bitrate (bits/sec).
+        if let Some(qp) = self.options.get_int("qp") {
+            enc.quantizer = qp.clamp(0, 255) as usize;
+        } else if let Some(crf) = self.options.get_int("crf") {
+            enc.quantizer = (crf * 4).clamp(0, 255) as usize;
+        }
+        if let Some(bitrate) = parse_bitrate(self.options.get("b")) {
+            enc.bitrate = bitrate;
+        }
 
         let cfg = Config::new().with_encoder_config(enc);
         let on_err = |e| Error::InvalidData(format!("rav1e config rejected: {e}"));
@@ -141,6 +185,11 @@ impl AvifEncoder {
 }
 
 impl Encoder for AvifEncoder {
+    fn configure(&mut self, options: &Dictionary) -> Result<()> {
+        self.options = options.clone();
+        Ok(())
+    }
+
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let vf = match frame {
             Frame::Video(v) => v,

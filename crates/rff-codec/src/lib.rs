@@ -13,7 +13,9 @@
 
 use std::collections::HashMap;
 
-use rff_core::{CodecId, Error, Frame, MediaType, Packet, PixelFormat, Result, SampleFormat};
+use rff_core::{
+    CodecId, Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result, SampleFormat,
+};
 
 /// Stream parameters handed to a decoder before the first packet. Self-describing
 /// codecs (AV1, PNG, ...) can ignore these; raw/parametric codecs (PCM, and
@@ -61,6 +63,13 @@ pub trait Decoder: Send {
 
 /// Encodes raw [`Frame`]s into compressed [`Packet`]s. Mirror of [`Decoder`].
 pub trait Encoder: Send {
+    /// Receive output options before encoding begins — rate control and tuning:
+    /// `crf`/`qp` (quality), `preset` (speed/quality trade-off), `b` (bitrate),
+    /// `pass` (1 or 2). Default: ignore them. Called once, after construction.
+    fn configure(&mut self, _options: &Dictionary) -> Result<()> {
+        Ok(())
+    }
+
     /// The input sample rates this encoder accepts, or `None` for "any rate".
     /// The transcode pipeline resamples audio to the nearest accepted rate
     /// before feeding frames (mirrors FFmpeg's automatic `aresample`).
