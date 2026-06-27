@@ -42,6 +42,7 @@ rff-format-mp4.workspace = true
 rff-format-mkv.workspace = true
 rff-format-ts.workspace = true
 rff-format-flv.workspace = true
+rff-format-hls.workspace = true
 rff-format-srt.workspace = true
 rff-format-webvtt.workspace = true
 

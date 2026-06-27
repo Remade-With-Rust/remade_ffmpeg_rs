@@ -62,6 +62,9 @@ struct Pes {
     dts: Option<i64>,
     /// Declared PES length (0 = unbounded → ends at the next PUSI).
     expect: usize,
+    /// Set when this PES began on a TS packet whose adaptation field flagged a
+    /// random-access point (a keyframe / IDR).
+    keyframe: bool,
 }
 
 pub struct TsDemuxer {
@@ -125,8 +128,15 @@ impl TsDemuxer {
         let afc = (pkt[3] >> 4) & 0x3;
         // Payload offset: skip the 4-byte header + the adaptation field if present.
         let mut off = 4;
+        let mut rai = false;
         if afc & 0x2 != 0 {
-            off += 1 + pkt[4] as usize; // adaptation_field_length + the field
+            let af_len = pkt[4] as usize;
+            // The adaptation flags byte (when present) carries the
+            // random_access_indicator (0x40) — the keyframe marker.
+            if af_len >= 1 {
+                rai = pkt[5] & 0x40 != 0;
+            }
+            off += 1 + af_len; // adaptation_field_length + the field
         }
         if afc & 0x1 == 0 || off >= TS_PACKET {
             return; // no payload (adaptation only)
@@ -138,7 +148,7 @@ impl TsDemuxer {
         } else if Some(pid) == self.pmt_pid {
             self.parse_pmt(payload, pusi);
         } else if self.pid_index.contains_key(&pid) {
-            self.feed_pes(pid, payload, pusi);
+            self.feed_pes(pid, payload, pusi, rai);
         }
     }
 
@@ -187,13 +197,13 @@ impl TsDemuxer {
         }
     }
 
-    fn feed_pes(&mut self, pid: u16, payload: &[u8], pusi: bool) {
+    fn feed_pes(&mut self, pid: u16, payload: &[u8], pusi: bool, rai: bool) {
         if pusi {
             // A new PES starts here; finalize any in-flight one for this PID first.
             if let Some(done) = self.partial.remove(&pid) {
                 self.emit(pid, done);
             }
-            let mut pes = Pes::default();
+            let mut pes = Pes { keyframe: rai, ..Default::default() };
             self.start_pes(&mut pes, payload);
             self.partial.insert(pid, pes);
         } else if let Some(pes) = self.partial.get_mut(&pid) {
@@ -245,6 +255,7 @@ impl TsDemuxer {
         let mut pkt = Packet::from_data(idx, pes.data);
         pkt.pts = pes.pts;
         pkt.dts = pes.dts.or(pes.pts);
+        pkt.flags.keyframe = pes.keyframe;
         self.ready.push_back(pkt);
     }
 }

@@ -4356,6 +4356,7 @@ dependencies = [
  "rff-format-flac",
  "rff-format-flv",
  "rff-format-gif",
+ "rff-format-hls",
  "rff-format-jpeg",
  "rff-format-jxl",
  "rff-format-mkv",
@@ -4585,6 +4586,15 @@ version = "0.0.1"
 dependencies = [
  "rff-core",
  "rff-format",
+]
+
+[[package]]
+name = "rff-format-hls"
+version = "0.0.1"
+dependencies = [
+ "rff-core",
+ "rff-format",
+ "rff-format-ts",
 ]
 
 [[package]]

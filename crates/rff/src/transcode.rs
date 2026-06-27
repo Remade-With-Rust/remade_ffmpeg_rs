@@ -216,6 +216,10 @@ fn conform_audio(
     Ok(f32_frame(out, target_rate, af.channels, pts))
 }
 
+/// Nominal seconds per HLS segment before rolling over on a keyframe. (A
+/// `-hls_time` override is a planned follow-up.)
+const HLS_SEGMENT_SECONDS: f64 = 4.0;
+
 /// Resolve and run a transcode job against `engine`.
 ///
 /// Resolution (formats, decoders, encoders) happens up front so failures are
@@ -301,13 +305,23 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
         }
     }
 
-    // --- confirm the muxer exists before touching disk ---
-    let out_format = resolve_output_format(engine, output)?;
-    engine
-        .formats
-        .by_name(&out_format)
-        .filter(|f| f.can_mux())
-        .ok_or_else(|| Error::MuxerNotFound(out_format.clone()))?;
+    // --- pick the muxer: HLS fans packets across many segment files (so it is
+    // built with the playlist path, not a single writer); every other format
+    // writes one container. Confirm a non-HLS muxer exists before touching disk.
+    let is_hls = output.format.as_deref() == Some("hls")
+        || output.path.extension().and_then(|e| e.to_str()) == Some("m3u8");
+    let out_format = if is_hls {
+        None
+    } else {
+        Some(resolve_output_format(engine, output)?)
+    };
+    if let Some(f) = &out_format {
+        engine
+            .formats
+            .by_name(f)
+            .filter(|fmt| fmt.can_mux())
+            .ok_or_else(|| Error::MuxerNotFound(f.clone()))?;
+    }
 
     // --- refuse to clobber an existing file unless -y was given ---
     if !output.overwrite && output.path.exists() {
@@ -316,8 +330,16 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
             output.path.display()
         )));
     }
-    let out_file = File::create(&output.path)?;
-    let mut muxer = engine.formats.open_muxer(&out_format, Box::new(out_file))?;
+    let mut muxer: Box<dyn Muxer> = match out_format {
+        None => Box::new(rff_format_hls::HlsSegmenter::new(
+            &output.path,
+            HLS_SEGMENT_SECONDS,
+        )?),
+        Some(f) => {
+            let out_file = File::create(&output.path)?;
+            engine.formats.open_muxer(&f, Box::new(out_file))?
+        }
+    };
     muxer.write_header(&out_streams)?;
 
     let mut report = TranscodeReport::default();
