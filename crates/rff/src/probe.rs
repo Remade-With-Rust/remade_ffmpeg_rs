@@ -43,12 +43,11 @@ pub struct StreamInfo {
 /// real; only the per-format parsing is pending.
 pub fn probe(engine: &Engine, path: impl AsRef<Path>) -> Result<MediaInfo> {
     let path = path.as_ref();
-    let format_name = detect_input_format(engine, path, None)?;
-
-    let file = std::fs::File::open(path)?;
-    let mut demuxer = engine
-        .formats
-        .open_demuxer(&format_name, Box::new(file))?;
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| Error::Option("input path is not valid UTF-8".into()))?;
+    let (format_name, reader) = open_source(engine, path_str, None)?;
+    let mut demuxer = engine.formats.open_demuxer(&format_name, reader)?;
 
     let streams = demuxer.read_header()?;
     let streams = streams
@@ -104,4 +103,60 @@ fn read_head(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     file.take(max as u64).read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// Open a path-or-URL as a streaming reader and decide its container format.
+///
+/// Local files keep the read-twice (sniff then open) path. For `http(s)://`
+/// URLs the stream is opened once, its head peeked for content sniffing, then
+/// chained back in front so the demuxer sees the whole stream from byte 0.
+/// Shared by [`probe`] (ffprobe) and the transcode input path (ffmpeg).
+pub(crate) fn open_source(
+    engine: &Engine,
+    path: &str,
+    forced: Option<&str>,
+) -> Result<(String, Box<dyn Read + Send>)> {
+    if !rff_io::is_url(path) {
+        let format = detect_input_format(engine, Path::new(path), forced)?;
+        return Ok((format, Box::new(std::fs::File::open(path)?)));
+    }
+
+    let mut reader = rff_io::open(path)?;
+    let mut head = vec![0u8; 4096];
+    let n = read_some(&mut reader, &mut head)?;
+    head.truncate(n);
+    let format = match forced {
+        Some(f) => f.to_string(),
+        None => engine
+            .formats
+            .probe(&head)
+            .map(|f| f.name.to_string())
+            .or_else(|| url_extension_format(engine, path))
+            .ok_or_else(|| Error::DemuxerNotFound(path.to_string()))?,
+    };
+    let chained: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(head).chain(reader));
+    Ok((format, chained))
+}
+
+/// Read up to `buf.len()` bytes, tolerating short reads (network streams arrive
+/// in pieces); stops at EOF.
+fn read_some(reader: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(filled)
+}
+
+/// Guess a container from a URL's extension (after the last `.`, ignoring any
+/// `?query`/`#fragment`).
+fn url_extension_format(engine: &Engine, url: &str) -> Option<String> {
+    let stem = url.split(['?', '#']).next().unwrap_or(url);
+    let ext = stem.rsplit('.').next().unwrap_or("");
+    engine.formats.by_extension(ext).map(|f| f.name.to_string())
 }

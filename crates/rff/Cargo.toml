@@ -12,6 +12,7 @@ rff-core.workspace = true
 rff-codec.workspace = true
 rff-format.workspace = true
 rff-filter.workspace = true
+rff-io.workspace = true
 rff-resample.workspace = true
 rff-codec-h264.workspace = true
 rff-codec-opus.workspace = true

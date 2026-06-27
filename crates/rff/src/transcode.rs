@@ -20,6 +20,7 @@
 //! implicit `aresample`).
 
 use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 
 use rff_codec::{CodecParams, Decoder, Encoder};
@@ -254,9 +255,8 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     let mut demuxers: Vec<Box<dyn rff_format::Demuxer>> = Vec::new();
     let mut input_streams: Vec<Vec<Stream>> = Vec::new();
     for input in &spec.inputs {
-        let in_format = resolve_input_format(engine, input)?;
-        let file = File::open(&input.path)?;
-        let mut demuxer = engine.formats.open_demuxer(&in_format, Box::new(file))?;
+        let (in_format, reader) = open_input(engine, input)?;
+        let mut demuxer = engine.formats.open_demuxer(&in_format, reader)?;
         input_streams.push(demuxer.read_header()?);
         demuxers.push(demuxer);
     }
@@ -636,10 +636,15 @@ fn drain_encoder(
     Ok(())
 }
 
-/// Decide which container to demux an input as: explicit `-f`, else content
-/// sniffing, else by extension. Shared with [`crate::probe`].
-fn resolve_input_format(engine: &Engine, input: &InputSpec) -> Result<String> {
-    crate::probe::detect_input_format(engine, &input.path, input.format.as_deref())
+/// Open an input as a streaming reader and decide its container format —
+/// local file or `http://` URL. Delegates to the shared [`crate::probe`] opener
+/// so ffmpeg and ffprobe resolve inputs identically.
+fn open_input(engine: &Engine, input: &InputSpec) -> Result<(String, Box<dyn Read + Send>)> {
+    let path = input
+        .path
+        .to_str()
+        .ok_or_else(|| Error::Option("input path is not valid UTF-8".into()))?;
+    crate::probe::open_source(engine, path, input.format.as_deref())
 }
 
 /// Decide which container to mux an output as: explicit `-f`, else by extension.

@@ -4367,6 +4367,7 @@ dependencies = [
  "rff-format-wav",
  "rff-format-webp",
  "rff-format-webvtt",
+ "rff-io",
  "rff-resample",
 ]
 
@@ -4677,6 +4678,13 @@ dependencies = [
  "rff-core",
  "rff-format",
  "rff-subtitle",
+]
+
+[[package]]
+name = "rff-io"
+version = "0.0.1"
+dependencies = [
+ "rff-core",
 ]
 
 [[package]]

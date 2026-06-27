@@ -1,0 +1,11 @@
+[package]
+name = "rff-io"
+description = "Remade FFmpeg (Rust): I/O sources — local files and HTTP(S) streaming input."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
