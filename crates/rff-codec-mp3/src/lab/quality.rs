@@ -82,6 +82,11 @@ fn frame_nmr(
     }
     fft::fft(&mut ro, &mut io);
     fft::fft(&mut rc, &mut ic);
+    // Floor each band's mask relative to the loudest band's, so a near-silent band
+    // (tiny mask) can't manufacture a huge NMR — the artifact that made `max NMR`
+    // useless (calibration: max NMR ↔ ODG only −0.20). Noise below the loudest
+    // band's mask by 50 dB is inaudible regardless.
+    let mask_floor = mask.iter().copied().fold(0f32, f32::max) * 1e-5;
     let mut nmr = [0f32; SFB_LONG];
     for b in 0..SFB_LONG {
         let (lo, hi) = bins[b];
@@ -91,7 +96,7 @@ fn frame_nmr(
             let di = io[k] - ic[k];
             noise += dr * dr + di * di;
         }
-        nmr[b] = noise / mask[b].max(1e-20);
+        nmr[b] = noise / mask[b].max(mask_floor).max(1e-20);
     }
     nmr
 }
