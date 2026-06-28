@@ -284,6 +284,11 @@ The house, bottom-up. Each floor is independently green before the next.
    noise under the mask — peak NMR **7.4 → 0.2 dB** on a two-tone signal — and a
    multitone round-trips at **69 dB** through our decoder and **FFmpeg**.
 6. **Roof** R1 → R4 (R5 later) — stereo, rate modes, LAME header, conformance.
+   ✅ **R1 + R3 done.** Independent L/R **stereo** (78/68 dB per channel; FFmpeg
+   reports `stereo`); **Xing/Info header** so FFmpeg reads an exact duration (no
+   more "estimating from bitrate"). Remaining: **Q5** (block switching, needs the
+   short-block coding path), **R2** (VBR/ABR), **R4** (conformance corpus), **R5**
+   (MPEG-2/2.5), and joint stereo (M/S) as an R1 enhancement.
 
 The payoff of this order: ~70% of the encoder (Foundation + Floors 1–3) is
 mechanical and provable against our own bit-exact decoder, and yields a working
