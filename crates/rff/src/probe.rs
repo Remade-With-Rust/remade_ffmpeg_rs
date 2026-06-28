@@ -89,7 +89,10 @@ pub(crate) fn detect_input_format(
         }
     }
     // Filename fallback.
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
     engine
         .formats
         .by_extension(ext)

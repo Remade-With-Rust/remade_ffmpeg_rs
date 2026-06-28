@@ -59,9 +59,7 @@ impl FilterChain {
                 "format" => filters.push(Box::new(FormatConv::parse(&parts)?)),
                 "negate" => filters.push(Box::new(Negate)),
                 "gray" | "grayscale" => filters.push(Box::new(Grayscale)),
-                other => {
-                    return Err(Error::unsupported(format!("unknown filter `{other}`")))
-                }
+                other => return Err(Error::unsupported(format!("unknown filter `{other}`"))),
             }
         }
         Ok(FilterChain { filters })
@@ -112,9 +110,17 @@ impl FilterComplex {
             // Stop at the next filter (`,`) or output label (`[`).
             let args = after.split([',', '[', ';']).next().unwrap_or("");
             let mut parts = args.split(':');
-            let x = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-            let y = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-            return Ok(FilterComplex { overlay: Some((x, y)) });
+            let x = parts
+                .next()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            let y = parts
+                .next()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            return Ok(FilterComplex {
+                overlay: Some((x, y)),
+            });
         }
         Err(Error::unsupported(format!(
             "filter_complex: unsupported graph `{spec}` (only `overlay` so far)"
@@ -501,7 +507,9 @@ impl Transpose {
             Some("cclock") | Some("2") => 2,
             Some("clock_flip") | Some("3") => 3,
             Some(other) => {
-                return Err(Error::Option(format!("transpose: unknown direction `{other}`")))
+                return Err(Error::Option(format!(
+                    "transpose: unknown direction `{other}`"
+                )))
             }
         };
         Ok(Transpose { dir })
@@ -838,7 +846,13 @@ impl Filter for Negate {
         let mut strides = Vec::with_capacity(src.planes.len());
         for (i, plane) in src.planes.iter().enumerate() {
             let (pw, ph) = plane_dims(src.format, src.width, src.height, i)?;
-            planes.push(map_plane(plane, src.strides[i], pw as usize, ph as usize, |v| 255 - v));
+            planes.push(map_plane(
+                plane,
+                src.strides[i],
+                pw as usize,
+                ph as usize,
+                |v| 255 - v,
+            ));
             strides.push(pw as usize);
         }
         Ok(VideoFrame {
@@ -1071,7 +1085,10 @@ mod tests {
         let fc = FilterComplex::parse("[0:v][1:v]overlay=16:8[out]").unwrap();
         assert_eq!(fc.overlay, Some((16, 8)));
         // Bare overlay (no offset) defaults to the top-left corner.
-        assert_eq!(FilterComplex::parse("overlay").unwrap().overlay, Some((0, 0)));
+        assert_eq!(
+            FilterComplex::parse("overlay").unwrap().overlay,
+            Some((0, 0))
+        );
         assert!(FilterComplex::parse("[0][1]hstack").is_err());
     }
 

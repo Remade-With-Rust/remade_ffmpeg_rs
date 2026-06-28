@@ -86,11 +86,14 @@ impl Muxer for FlvMuxer {
         let has_video = streams.iter().any(|s| s.media_type == MediaType::Video);
         let flags = (has_audio as u8) << 2 | has_video as u8;
         // "FLV", version 1, flags, data_offset = 9.
-        self.out.write_all(&[b'F', b'L', b'V', 0x01, flags, 0, 0, 0, 9])?;
+        self.out
+            .write_all(&[b'F', b'L', b'V', 0x01, flags, 0, 0, 0, 9])?;
         for s in streams {
             if matches!(s.media_type, MediaType::Video | MediaType::Audio) {
-                self.streams.insert(s.index, (s.media_type, s.extradata.clone()));
-                self.order.push((s.index, s.media_type, s.extradata.clone()));
+                self.streams
+                    .insert(s.index, (s.media_type, s.extradata.clone()));
+                self.order
+                    .push((s.index, s.media_type, s.extradata.clone()));
             }
         }
         Ok(())

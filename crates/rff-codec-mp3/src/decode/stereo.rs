@@ -12,7 +12,10 @@ use crate::header::FrameHeader;
 /// independent left/right.
 pub fn process(header: &FrameHeader, _gi: &[GranuleSideInfo; 2], spectrum: &mut GranuleSpectrum) {
     let (ms, intensity) = match header.channel_mode {
-        ChannelMode::JointStereo { ms_stereo, intensity_stereo } => (ms_stereo, intensity_stereo),
+        ChannelMode::JointStereo {
+            ms_stereo,
+            intensity_stereo,
+        } => (ms_stereo, intensity_stereo),
         _ => return, // plain stereo / mono: nothing to undo
     };
 
@@ -45,7 +48,10 @@ mod tests {
             bitrate_kbps: 128,
             sample_rate: 44100,
             padding: false,
-            channel_mode: ChannelMode::JointStereo { ms_stereo: ms, intensity_stereo: is },
+            channel_mode: ChannelMode::JointStereo {
+                ms_stereo: ms,
+                intensity_stereo: is,
+            },
             copyright: false,
             original: true,
             emphasis: 0,
@@ -57,7 +63,11 @@ mod tests {
         let mut spec = GranuleSpectrum::default();
         spec.lines[0][0] = 1.0; // M
         spec.lines[1][0] = 1.0; // S
-        process(&joint(true, false), &[GranuleSideInfo::default(), GranuleSideInfo::default()], &mut spec);
+        process(
+            &joint(true, false),
+            &[GranuleSideInfo::default(), GranuleSideInfo::default()],
+            &mut spec,
+        );
         // L = (1+1)/√2 = √2, R = (1-1)/√2 = 0.
         assert!((spec.lines[0][0] - 2f32.sqrt()).abs() < 1e-6);
         assert!(spec.lines[1][0].abs() < 1e-6);
@@ -70,7 +80,11 @@ mod tests {
         spec.lines[1][0] = 0.3;
         let mut h = joint(true, false);
         h.channel_mode = ChannelMode::Stereo;
-        process(&h, &[GranuleSideInfo::default(), GranuleSideInfo::default()], &mut spec);
+        process(
+            &h,
+            &[GranuleSideInfo::default(), GranuleSideInfo::default()],
+            &mut spec,
+        );
         assert_eq!(spec.lines[0][0], 0.7);
         assert_eq!(spec.lines[1][0], 0.3);
     }

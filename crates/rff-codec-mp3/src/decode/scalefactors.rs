@@ -148,7 +148,10 @@ mod tests {
         let data = w.finish();
 
         let mut si = SideInfo::default();
-        si.granules[0][0] = GranuleSideInfo { scalefac_compress: 15, ..Default::default() };
+        si.granules[0][0] = GranuleSideInfo {
+            scalefac_compress: 15,
+            ..Default::default()
+        };
         let mut pos = 0;
         let sf = decode(&data, &mut pos, &hdr(), &si, 0, 0, None);
 
@@ -165,7 +168,10 @@ mod tests {
         }
         let mut si = SideInfo::default();
         si.scfsi[0][0] = true; // reuse group 0 (bands 0..6)
-        si.granules[1][0] = GranuleSideInfo { scalefac_compress: 0, ..Default::default() };
+        si.granules[1][0] = GranuleSideInfo {
+            scalefac_compress: 0,
+            ..Default::default()
+        };
 
         // scalefac_compress 0 → (0,0): no bits read for the non-reused bands.
         let mut pos = 0;

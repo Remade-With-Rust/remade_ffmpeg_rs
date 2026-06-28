@@ -35,7 +35,10 @@ fn encode_mux_demux_decode_roundtrip() {
     let original = gradient_frame(w as usize, h as usize);
 
     // --- encode the frame to an AV1 bitstream ---
-    let mut enc = engine.codecs.find_encoder(CodecId::Avif).expect("avif encoder");
+    let mut enc = engine
+        .codecs
+        .find_encoder(CodecId::Avif)
+        .expect("avif encoder");
     enc.send_frame(&original).expect("send_frame");
     enc.flush();
     let mut payload = Vec::new();
@@ -57,7 +60,8 @@ fn encode_mux_demux_decode_roundtrip() {
         stream.width = w;
         stream.height = h;
         mux.write_header(&[stream]).expect("write_header");
-        mux.write_packet(&Packet::from_data(0, payload)).expect("write_packet");
+        mux.write_packet(&Packet::from_data(0, payload))
+            .expect("write_packet");
         mux.write_trailer().expect("write_trailer");
     } // dropping the muxer closes the file
 
@@ -68,7 +72,10 @@ fn encode_mux_demux_decode_roundtrip() {
 
     // --- demux the file back ---
     let input: Input = Box::new(fs::File::open(&path).expect("open file"));
-    let mut dem = engine.formats.open_demuxer("avif", input).expect("avif demuxer");
+    let mut dem = engine
+        .formats
+        .open_demuxer("avif", input)
+        .expect("avif demuxer");
     let streams = dem.read_header().expect("read_header");
     assert_eq!(streams[0].width, w);
     assert_eq!(streams[0].height, h);
@@ -76,7 +83,10 @@ fn encode_mux_demux_decode_roundtrip() {
     let packet = dem.read_packet().expect("read_packet");
 
     // --- decode back to pixels ---
-    let mut dec = engine.codecs.find_decoder(CodecId::Avif).expect("avif decoder");
+    let mut dec = engine
+        .codecs
+        .find_decoder(CodecId::Avif)
+        .expect("avif decoder");
     dec.send_packet(&packet).expect("send_packet");
     dec.flush();
     let decoded = match dec.receive_frame().expect("receive_frame") {
@@ -91,7 +101,9 @@ fn encode_mux_demux_decode_roundtrip() {
     assert_eq!(decoded.height, h);
     assert_eq!(decoded.format, PixelFormat::Yuv420p);
 
-    let Frame::Video(src) = &original else { unreachable!() };
+    let Frame::Video(src) = &original else {
+        unreachable!()
+    };
     let (w, h) = (w as usize, h as usize);
     let mut total_diff = 0u64;
     for row in 0..h {

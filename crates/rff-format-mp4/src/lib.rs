@@ -44,7 +44,8 @@ fn probe_mp4(data: &[u8]) -> i32 {
 // ---------------------------------------------------------------------------
 
 fn be16(b: &[u8], o: usize) -> u32 {
-    b.get(o..o + 2).map_or(0, |s| ((s[0] as u32) << 8) | s[1] as u32)
+    b.get(o..o + 2)
+        .map_or(0, |s| ((s[0] as u32) << 8) | s[1] as u32)
 }
 fn be32(b: &[u8], o: usize) -> u32 {
     b.get(o..o + 4)
@@ -65,7 +66,11 @@ fn child_boxes(buf: &[u8]) -> Vec<([u8; 4], &[u8])> {
         let size32 = be32(buf, i) as usize;
         let typ = [buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]];
         let (start, end) = if size32 == 1 {
-            (i + 16, i.checked_add(be64(buf, i + 8) as usize).unwrap_or(buf.len()))
+            (
+                i + 16,
+                i.checked_add(be64(buf, i + 8) as usize)
+                    .unwrap_or(buf.len()),
+            )
         } else if size32 == 0 {
             (i + 8, buf.len())
         } else {
@@ -348,7 +353,11 @@ fn parse_avcc(avcc: &[u8]) -> Option<AvcConfig> {
 }
 
 /// Reconstruct per-sample `(offset, size, pts, keyframe)` from the sample table.
-fn build_samples(stbl: &[([u8; 4], &[u8])], stream_index: usize, _timescale: u32) -> Option<Vec<SampleLoc>> {
+fn build_samples(
+    stbl: &[([u8; 4], &[u8])],
+    stream_index: usize,
+    _timescale: u32,
+) -> Option<Vec<SampleLoc>> {
     let stsz = find(stbl, b"stsz")?;
     let stsc = find(stbl, b"stsc")?;
     let stts = find(stbl, b"stts")?;
@@ -359,7 +368,9 @@ fn build_samples(stbl: &[([u8; 4], &[u8])], stream_index: usize, _timescale: u32
             .collect(),
         None => {
             let co64 = find(stbl, b"co64")?;
-            (0..be32(co64, 4)).map(|n| be64(co64, 8 + 8 * n as usize)).collect()
+            (0..be32(co64, 4))
+                .map(|n| be64(co64, 8 + 8 * n as usize))
+                .collect()
         }
     };
 
@@ -722,7 +733,8 @@ impl Muxer for Mp4Muxer {
         for (t, track) in tracks.iter().enumerate() {
             let (timescale, durations) = &plans[t];
             let media_dur: u64 = durations.iter().map(|&d| d as u64).sum();
-            let movie_dur = (media_dur * movie_timescale as u64 / (*timescale).max(1) as u64) as u32;
+            let movie_dur =
+                (media_dur * movie_timescale as u64 / (*timescale).max(1) as u64) as u32;
             max_movie_dur = max_movie_dur.max(movie_dur);
             traks.push(build_trak(
                 track,
@@ -782,7 +794,9 @@ fn sample_durations(
     let have_all = samples.iter().all(|(_, _, p)| p.is_some());
     let monotonic = pts.windows(2).all(|w| w[1] >= w[0]);
     if have_all && monotonic && n >= 2 && pts[n - 1] > pts[0] {
-        let mut d: Vec<u32> = (0..n - 1).map(|i| (pts[i + 1] - pts[i]).max(0) as u32).collect();
+        let mut d: Vec<u32> = (0..n - 1)
+            .map(|i| (pts[i + 1] - pts[i]).max(0) as u32)
+            .collect();
         let last = *d.iter().rev().find(|x| **x > 0).unwrap_or(&nominal);
         d.push(last);
         d
@@ -905,7 +919,12 @@ fn build_trak(
     bx(b"trak", &[tkhd, mdia].concat())
 }
 
-fn build_stbl(track: &TrackOut, durations: &[u32], chunks: &[(u32, u32)], sizes: &[u32]) -> Vec<u8> {
+fn build_stbl(
+    track: &TrackOut,
+    durations: &[u32],
+    chunks: &[(u32, u32)],
+    sizes: &[u32],
+) -> Vec<u8> {
     let s = &track.stream;
     let n = sizes.len() as u32;
 
@@ -1060,12 +1079,15 @@ mod tests {
         let stts = full(b"stts", &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0x03, 0xE8]); // 1 sample, delta 1000
         let stsc = full(b"stsc", &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]); // chunk1, 1 spc
         let stsz = full(b"stsz", &[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 7]); // size 0→per-sample, 1 sample, size 7
-        // stco offset patched after assembly.
+                                                                         // stco offset patched after assembly.
         let stco = full(b"stco", &[0, 0, 0, 1, 0, 0, 0, 0]);
 
         let stbl = bx(b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
         let minf = bx(b"minf", &stbl);
-        let mdhd = full(b"mdhd", &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x03, 0xE8, 0, 0, 0, 0]); // timescale 1000
+        let mdhd = full(
+            b"mdhd",
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x03, 0xE8, 0, 0, 0, 0],
+        ); // timescale 1000
         let hdlr = full(b"hdlr", &{
             let mut h = vec![0u8; 4];
             h.extend_from_slice(b"vide");
@@ -1171,7 +1193,11 @@ mod tests {
     #[test]
     fn mux_then_demux_av_mp4() {
         // Video: a fake H.264 keyframe. Audio: a fake Opus packet.
-        let (sps, pps, idr) = ([0x67u8, 0x42, 0, 0x1E, 0xAA], [0x68u8, 0xCE, 0xBB], [0x65u8, 0x11, 0x22]);
+        let (sps, pps, idr) = (
+            [0x67u8, 0x42, 0, 0x1E, 0xAA],
+            [0x68u8, 0xCE, 0xBB],
+            [0x65u8, 0x11, 0x22],
+        );
         let mut video = Vec::new();
         for nal in [sps.as_slice(), pps.as_slice(), idr.as_slice()] {
             video.extend_from_slice(&[0, 0, 0, 1]);
@@ -1194,7 +1220,8 @@ mod tests {
             let mut vp = Packet::from_data(0, video.clone());
             vp.flags.keyframe = true;
             mux.write_packet(&vp).unwrap();
-            mux.write_packet(&Packet::from_data(1, opus_pkt.clone())).unwrap();
+            mux.write_packet(&Packet::from_data(1, opus_pkt.clone()))
+                .unwrap();
             mux.write_trailer().unwrap();
         }
         let file = sink.0.lock().unwrap().clone();
@@ -1202,10 +1229,16 @@ mod tests {
         let mut dem = Mp4Demuxer::new(Box::new(Cursor::new(file)));
         let streams = dem.read_header().unwrap();
         assert_eq!(streams.len(), 2);
-        let v = streams.iter().find(|s| s.media_type == MediaType::Video).unwrap();
+        let v = streams
+            .iter()
+            .find(|s| s.media_type == MediaType::Video)
+            .unwrap();
         assert_eq!(v.codec_id, CodecId::H264);
         assert_eq!((v.width, v.height), (16, 16));
-        let a = streams.iter().find(|s| s.media_type == MediaType::Audio).unwrap();
+        let a = streams
+            .iter()
+            .find(|s| s.media_type == MediaType::Audio)
+            .unwrap();
         assert_eq!(a.codec_id, CodecId::Opus);
         assert_eq!(a.channels, 2);
         assert_eq!(a.sample_rate, 48_000);
@@ -1288,9 +1321,16 @@ mod tests {
         let file = sink.0.lock().unwrap().clone();
 
         // File positions must alternate: V0 < A0 < V1 < A1 < V2 < A2.
-        let pos = |k: u8| file.windows(4).position(|w| w == tag(k).as_slice()).unwrap();
+        let pos = |k: u8| {
+            file.windows(4)
+                .position(|w| w == tag(k).as_slice())
+                .unwrap()
+        };
         let order = [pos(0), pos(0x10), pos(1), pos(0x11), pos(2), pos(0x12)];
-        assert!(order.windows(2).all(|w| w[0] < w[1]), "mdat not interleaved: {order:?}");
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "mdat not interleaved: {order:?}"
+        );
 
         // And both tracks still demux back in their own order.
         let mut dem = Mp4Demuxer::new(Box::new(Cursor::new(file)));

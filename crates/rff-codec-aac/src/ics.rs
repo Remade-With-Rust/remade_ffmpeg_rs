@@ -145,7 +145,13 @@ mod tests {
         let info = parse_ics_info(&mut r, 3).unwrap();
         assert_eq!(info.num_windows, 8);
         // 0,1,0,1,0,1,0 grouping bits → groups: [1,2,2,2,1] (sum 8).
-        assert_eq!(info.window_group_length.iter().map(|&x| x as usize).sum::<usize>(), 8);
+        assert_eq!(
+            info.window_group_length
+                .iter()
+                .map(|&x| x as usize)
+                .sum::<usize>(),
+            8
+        );
         assert_eq!(info.num_window_groups, info.window_group_length.len());
     }
 

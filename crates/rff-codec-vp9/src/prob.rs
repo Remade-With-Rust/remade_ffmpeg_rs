@@ -113,9 +113,16 @@ mod tests {
             }
         }
         // Mode / partition / skip anchors verified against libvpx.
-        assert_eq!(KF_UV_MODE_PROBS[0], [144, 11, 54, 157, 195, 130, 46, 58, 108]);
+        assert_eq!(
+            KF_UV_MODE_PROBS[0],
+            [144, 11, 54, 157, 195, 130, 46, 58, 108]
+        );
         assert_eq!(KF_PARTITION_PROBS[0], [158, 97, 94]);
         assert_eq!(DEFAULT_SKIP_PROB, [192, 128, 64]);
-        assert!(KF_Y_MODE_PROBS.iter().flatten().flatten().all(|&p| (1..=255).contains(&p)));
+        assert!(KF_Y_MODE_PROBS
+            .iter()
+            .flatten()
+            .flatten()
+            .all(|&p| (1..=255).contains(&p)));
     }
 }

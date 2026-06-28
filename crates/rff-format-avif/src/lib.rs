@@ -132,7 +132,9 @@ impl Muxer for AvifMuxer {
             )));
         }
         if stream.width == 0 || stream.height == 0 {
-            return Err(Error::invalid("avif mux: stream is missing image dimensions"));
+            return Err(Error::invalid(
+                "avif mux: stream is missing image dimensions",
+            ));
         }
         self.width = stream.width;
         self.height = stream.height;
@@ -270,7 +272,7 @@ fn ipma() -> Vec<u8> {
     push_u32(&mut b, 1); // entry_count
     push_u16(&mut b, 1); // item_ID (version 0 → u16)
     b.push(3); // association_count
-    // essential(1) << 7 | property_index(7); property indices are 1-based into ipco.
+               // essential(1) << 7 | property_index(7); property indices are 1-based into ipco.
     b.push(1); // ispe (#1), not essential
     b.push(0x80 | 2); // av1C (#2), essential
     b.push(3); // pixi (#3), not essential
@@ -286,7 +288,7 @@ fn build_iloc(length: u32) -> (Vec<u8>, usize) {
     push_u16(&mut body, 1); // item_count
     push_u16(&mut body, 1); // item_ID
     push_u16(&mut body, 0); // data_reference_index
-    // base_offset: 0 bytes
+                            // base_offset: 0 bytes
     push_u16(&mut body, 1); // extent_count
     let off_field = body.len();
     push_u32(&mut body, 0); // extent_offset (patched later)
@@ -578,8 +580,8 @@ fn child_boxes(buf: &[u8]) -> Vec<([u8; 4], &[u8])> {
 
 /// Read image dimensions from the `ispe` property under `iprp`/`ipco`.
 fn read_ispe(meta_children: &[([u8; 4], &[u8])]) -> Result<(u32, u32)> {
-    let iprp = find(meta_children, b"iprp")
-        .ok_or_else(|| Error::invalid("avif demux: no `iprp` box"))?;
+    let iprp =
+        find(meta_children, b"iprp").ok_or_else(|| Error::invalid("avif demux: no `iprp` box"))?;
     let ipco_children = find(&child_boxes(iprp), b"ipco")
         .map(child_boxes)
         .ok_or_else(|| Error::invalid("avif demux: no `ipco` box"))?;
@@ -596,10 +598,12 @@ fn read_ispe(meta_children: &[([u8; 4], &[u8])]) -> Result<(u32, u32)> {
 
 /// Read the first item's `(offset, length)` from the `iloc` box.
 fn read_iloc(meta_children: &[([u8; 4], &[u8])]) -> Result<(usize, usize)> {
-    let p = find(meta_children, b"iloc")
-        .ok_or_else(|| Error::invalid("avif demux: no `iloc` box"))?;
+    let p =
+        find(meta_children, b"iloc").ok_or_else(|| Error::invalid("avif demux: no `iloc` box"))?;
     // FullBox: byte 0 = version, 1..4 = flags.
-    let version = *p.first().ok_or_else(|| Error::invalid("avif demux: empty `iloc`"))?;
+    let version = *p
+        .first()
+        .ok_or_else(|| Error::invalid("avif demux: empty `iloc`"))?;
     let mut i = 4;
     let read = |p: &[u8], at: usize, n: usize| -> Option<u64> {
         let mut v = 0u64;
@@ -608,7 +612,9 @@ fn read_iloc(meta_children: &[([u8; 4], &[u8])]) -> Result<(usize, usize)> {
         }
         Some(v)
     };
-    let sizes = *p.get(i).ok_or_else(|| Error::invalid("avif demux: short `iloc`"))?;
+    let sizes = *p
+        .get(i)
+        .ok_or_else(|| Error::invalid("avif demux: short `iloc`"))?;
     i += 1;
     let offset_size = (sizes >> 4) as usize;
     let length_size = (sizes & 0x0f) as usize;
@@ -682,7 +688,8 @@ mod tests {
             stream.width = 96;
             stream.height = 64;
             mux.write_header(&[stream]).unwrap();
-            mux.write_packet(&Packet::from_data(0, payload.clone())).unwrap();
+            mux.write_packet(&Packet::from_data(0, payload.clone()))
+                .unwrap();
             mux.write_trailer().unwrap();
         }
         let file = sink.0.lock().unwrap().clone();

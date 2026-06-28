@@ -44,8 +44,16 @@ impl Decoder for JxlDecoder {
         let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
 
         let (format, planes, stride) = match channels {
-            3 => (PixelFormat::Rgb24, buf.iter().map(|&v| to_u8(v)).collect(), w * 3),
-            4 => (PixelFormat::Rgba, buf.iter().map(|&v| to_u8(v)).collect(), w * 4),
+            3 => (
+                PixelFormat::Rgb24,
+                buf.iter().map(|&v| to_u8(v)).collect(),
+                w * 3,
+            ),
+            4 => (
+                PixelFormat::Rgba,
+                buf.iter().map(|&v| to_u8(v)).collect(),
+                w * 4,
+            ),
             1 => {
                 let mut rgb = Vec::with_capacity(w * h * 3);
                 for &v in buf {
@@ -103,6 +111,8 @@ mod tests {
     #[test]
     fn decode_rejects_garbage() {
         let mut dec = JxlDecoder::default();
-        assert!(dec.send_packet(&Packet::from_data(0, vec![0u8; 32])).is_err());
+        assert!(dec
+            .send_packet(&Packet::from_data(0, vec![0u8; 32]))
+            .is_err());
     }
 }

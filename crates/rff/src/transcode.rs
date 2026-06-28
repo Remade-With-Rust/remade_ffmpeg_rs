@@ -209,10 +209,12 @@ fn conform_audio(
     if af.sample_rate == target_rate {
         return Ok(Frame::Audio(af));
     }
-    let rs = resampler
-        .get_or_insert_with(|| Resampler::new(af.sample_rate, target_rate, af.channels));
+    let rs =
+        resampler.get_or_insert_with(|| Resampler::new(af.sample_rate, target_rate, af.channels));
     let out = rs.process(&audio_to_f32(&af)?);
-    let pts = af.pts.map(|p| p * target_rate as i64 / af.sample_rate.max(1) as i64);
+    let pts = af
+        .pts
+        .map(|p| p * target_rate as i64 / af.sample_rate.max(1) as i64);
     Ok(f32_frame(out, target_rate, af.channels, pts))
 }
 
@@ -363,10 +365,7 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
 /// Resolve which `(input_index, stream_index)` pairs go to the output, in
 /// output order. With no `-map`, defaults to every video + audio stream across
 /// all inputs (input order, then stream order).
-fn select_streams(
-    inputs: &[Vec<Stream>],
-    output: &OutputSpec,
-) -> Result<Vec<(usize, usize)>> {
+fn select_streams(inputs: &[Vec<Stream>], output: &OutputSpec) -> Result<Vec<(usize, usize)>> {
     let mut selection = Vec::new();
     if output.maps.is_empty() {
         for (ii, streams) in inputs.iter().enumerate() {
@@ -419,7 +418,7 @@ fn build_op(
             decoder.configure(&codec_params(stream))?;
             let mut encoder = engine.codecs.find_encoder(target.codec)?;
             encoder.configure(&target.options)?; // rate control: -crf / -preset / -b
-            // Video filter graph (`-vf`); applies to video streams only.
+                                                 // Video filter graph (`-vf`); applies to video streams only.
             let filters = if stream.media_type == MediaType::Video {
                 FilterChain::parse(output.video_filters.as_deref().unwrap_or(""))?
             } else {
@@ -489,7 +488,9 @@ fn decode_overlay_frame(
     let vidx = streams
         .iter()
         .position(|s| s.media_type == MediaType::Video)
-        .ok_or_else(|| Error::Option("filter_complex overlay: overlay input has no video".into()))?;
+        .ok_or_else(|| {
+            Error::Option("filter_complex overlay: overlay input has no video".into())
+        })?;
     let mut decoder = engine.codecs.find_decoder(streams[vidx].codec_id)?;
     decoder.configure(&codec_params(&streams[vidx]))?;
     let mut to_yuv = FilterChain::parse("format=yuv420p")?;

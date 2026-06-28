@@ -62,7 +62,12 @@ fn kernels() -> &'static Kernels {
         for (n, w) in win_short.iter_mut().enumerate() {
             *w = sin(PI / 12.0 * (n as f64 + 0.5));
         }
-        Kernels { cos36, cos12, win, win_short }
+        Kernels {
+            cos36,
+            cos12,
+            win,
+            win_short,
+        }
     })
 }
 
@@ -143,7 +148,12 @@ mod tests {
         let mut overlap = [0f32; GRANULE_LINES];
         let out = hybrid(&GranuleSideInfo::default(), &lines, &mut overlap);
         let expected = (PI / 72.0 * 19.0).cos() as f32 * (PI / 36.0 * 0.5).sin() as f32;
-        assert!((out[0] - expected).abs() < 1e-5, "out[0]={} expected={}", out[0], expected);
+        assert!(
+            (out[0] - expected).abs() < 1e-5,
+            "out[0]={} expected={}",
+            out[0],
+            expected
+        );
         // The second half of the 36-sample frame is saved as the next overlap.
         let expect_ov = (PI / 72.0 * 55.0).cos() as f32 * (PI / 36.0 * 18.5).sin() as f32;
         assert!((overlap[0] - expect_ov).abs() < 1e-5);
@@ -157,6 +167,9 @@ mod tests {
         let mut overlap = [0f32; GRANULE_LINES];
         let out = hybrid(&GranuleSideInfo::default(), &lines, &mut overlap);
         let raw1 = (PI / 72.0 * (2.0 + 1.0 + 18.0)).cos() as f32 * (PI / 36.0 * 1.5).sin() as f32;
-        assert!((out[SUBBAND_LINES + 1] + raw1).abs() < 1e-5, "odd sample must be negated");
+        assert!(
+            (out[SUBBAND_LINES + 1] + raw1).abs() < 1e-5,
+            "odd sample must be negated"
+        );
     }
 }

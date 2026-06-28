@@ -158,7 +158,8 @@ mod tests {
 
         // Skip the filter warm-up region before measuring RMS.
         let body = &out[2000..out.len() - 2000];
-        let rms = (body.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / body.len() as f64).sqrt();
+        let rms =
+            (body.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / body.len() as f64).sqrt();
         assert!((rms - 0.707).abs() < 0.05, "rms {rms:.3}");
     }
 
@@ -172,7 +173,8 @@ mod tests {
         out.extend(rs.finish());
 
         let body = &out[1000..out.len() - 1000];
-        let rms = (body.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / body.len() as f64).sqrt();
+        let rms =
+            (body.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / body.len() as f64).sqrt();
         assert!(rms < 0.1, "aliasing not suppressed: rms {rms:.3}");
     }
 

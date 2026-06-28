@@ -74,7 +74,10 @@ fn print_human(input: &str, info: &MediaInfo) {
     for stream in &info.streams {
         let detail = match stream.media_type {
             rff_core::MediaType::Video => {
-                format!("Video: {}, {}x{}", stream.codec_id, stream.width, stream.height)
+                format!(
+                    "Video: {}, {}x{}",
+                    stream.codec_id, stream.width, stream.height
+                )
             }
             rff_core::MediaType::Audio => format!(
                 "Audio: {}, {} Hz, {} ch",
@@ -96,11 +99,21 @@ fn print_json(input: &str, info: &MediaInfo) {
     println!("  }},");
     println!("  \"streams\": [");
     for (idx, stream) in info.streams.iter().enumerate() {
-        let comma = if idx + 1 < info.streams.len() { "," } else { "" };
+        let comma = if idx + 1 < info.streams.len() {
+            ","
+        } else {
+            ""
+        };
         println!("    {{");
         println!("      \"index\": {},", stream.index);
-        println!("      \"codec_type\": {},", json_str(&stream.media_type.to_string()));
-        println!("      \"codec_name\": {},", json_str(stream.codec_id.name()));
+        println!(
+            "      \"codec_type\": {},",
+            json_str(&stream.media_type.to_string())
+        );
+        println!(
+            "      \"codec_name\": {},",
+            json_str(stream.codec_id.name())
+        );
         println!("      \"width\": {},", stream.width);
         println!("      \"height\": {},", stream.height);
         println!("      \"sample_rate\": {},", stream.sample_rate);

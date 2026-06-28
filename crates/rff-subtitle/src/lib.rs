@@ -71,7 +71,11 @@ pub fn parse_cues(text: &str) -> Vec<Cue> {
             }
         }
         if let Some((start, end)) = timing {
-            cues.push(Cue { start_ms: start, end_ms: end, text: rest.join("\n") });
+            cues.push(Cue {
+                start_ms: start,
+                end_ms: end,
+                text: rest.join("\n"),
+            });
         }
     }
     cues

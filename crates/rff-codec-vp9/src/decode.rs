@@ -15,7 +15,7 @@ use crate::block::{
     ModeInfo, BLOCK_8X8, PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT, PARTITION_VERT,
 };
 use crate::block::{
-    ALTREF_FRAME, GOLDEN_FRAME, INTRA_FRAME, LAST_FRAME, Mv, NEARESTMV, NEARMV, NEWMV, NONE_FRAME,
+    Mv, ALTREF_FRAME, GOLDEN_FRAME, INTRA_FRAME, LAST_FRAME, NEARESTMV, NEARMV, NEWMV, NONE_FRAME,
     ZEROMV,
 };
 use crate::geom_tables::{
@@ -29,14 +29,17 @@ const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
 use crate::predict::{build_intra_edges, predict};
 use crate::prob::inv_remap_prob;
 use crate::prob_tables::{
-    DEFAULT_COEF_PROBS, DEFAULT_COMP_INTER_P, DEFAULT_COMP_REF_P, DEFAULT_IF_UV_PROBS,
+    NmvContext, DEFAULT_COEF_PROBS, DEFAULT_COMP_INTER_P, DEFAULT_COMP_REF_P, DEFAULT_IF_UV_PROBS,
     DEFAULT_IF_Y_PROBS, DEFAULT_INTER_MODE_PROBS, DEFAULT_INTRA_INTER_P, DEFAULT_NMV_CONTEXT,
-    DEFAULT_PARTITION_PROBS, DEFAULT_SINGLE_REF_P, DEFAULT_SKIP_PROB, DEFAULT_SWITCHABLE_INTERP_PROB,
-    KF_PARTITION_PROBS, NmvContext,
+    DEFAULT_PARTITION_PROBS, DEFAULT_SINGLE_REF_P, DEFAULT_SKIP_PROB,
+    DEFAULT_SWITCHABLE_INTERP_PROB, KF_PARTITION_PROBS,
 };
 use crate::quant::Dequant;
 use crate::token::{decode_coefs, get_scan};
-use crate::transform::{inverse_transform_add_rows, inverse_transform_dc_add, inverse_wht_add, TxType, INTRA_MODE_TO_TX_TYPE};
+use crate::transform::{
+    inverse_transform_add_rows, inverse_transform_dc_add, inverse_wht_add, TxType,
+    INTRA_MODE_TO_TX_TYPE,
+};
 use crate::FrameHeader;
 
 const TX_MODE_SELECT: usize = 4;
@@ -171,7 +174,13 @@ const MV_FP_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 const SWITCHABLE_TREE: [i8; 4] = [0, 2, -1, -2];
 
 /// `vp9_adapt_coef_probs` — merge coefficient model probs from token counts.
-fn adapt_coef_probs(fc: &mut FrameContext, pre: &FrameContext, counts: &FrameCounts, count_sat: u32, update_factor: u32) {
+fn adapt_coef_probs(
+    fc: &mut FrameContext,
+    pre: &FrameContext,
+    counts: &FrameCounts,
+    count_sat: u32,
+    update_factor: u32,
+) {
     use crate::adapt::merge_probs;
     for tx in 0..4 {
         for i in 0..2 {
@@ -184,8 +193,12 @@ fn adapt_coef_probs(fc: &mut FrameContext, pre: &FrameContext, counts: &FrameCou
                         let eob = counts.eob_branch[tx][i][j][k][l];
                         let branch = [[neob, eob - neob], [n0, n1 + n2], [n1, n2]];
                         for m in 0..3 {
-                            fc.coef_probs[tx][i][j][k][l][m] =
-                                merge_probs(pre.coef_probs[tx][i][j][k][l][m], branch[m], count_sat, update_factor);
+                            fc.coef_probs[tx][i][j][k][l][m] = merge_probs(
+                                pre.coef_probs[tx][i][j][k][l][m],
+                                branch[m],
+                                count_sat,
+                                update_factor,
+                            );
                         }
                     }
                 }
@@ -195,7 +208,13 @@ fn adapt_coef_probs(fc: &mut FrameContext, pre: &FrameContext, counts: &FrameCou
 }
 
 /// `vp9_adapt_mode_probs`.
-fn adapt_mode_probs(fc: &mut FrameContext, pre: &FrameContext, counts: &FrameCounts, interp_switchable: bool, tx_select: bool) {
+fn adapt_mode_probs(
+    fc: &mut FrameContext,
+    pre: &FrameContext,
+    counts: &FrameCounts,
+    interp_switchable: bool,
+    tx_select: bool,
+) {
     use crate::adapt::{mode_mv_merge_probs as mm, tree_merge_probs};
     for i in 0..4 {
         fc.intra_inter_prob[i] = mm(pre.intra_inter_prob[i], counts.intra_inter[i]);
@@ -208,20 +227,45 @@ fn adapt_mode_probs(fc: &mut FrameContext, pre: &FrameContext, counts: &FrameCou
         }
     }
     for i in 0..7 {
-        tree_merge_probs(&INTER_MODE_TREE, &pre.inter_mode_probs[i], &counts.inter_mode[i], &mut fc.inter_mode_probs[i]);
+        tree_merge_probs(
+            &INTER_MODE_TREE,
+            &pre.inter_mode_probs[i],
+            &counts.inter_mode[i],
+            &mut fc.inter_mode_probs[i],
+        );
     }
     for i in 0..4 {
-        tree_merge_probs(&INTRA_MODE_TREE, &pre.y_mode_prob[i], &counts.y_mode[i], &mut fc.y_mode_prob[i]);
+        tree_merge_probs(
+            &INTRA_MODE_TREE,
+            &pre.y_mode_prob[i],
+            &counts.y_mode[i],
+            &mut fc.y_mode_prob[i],
+        );
     }
     for i in 0..10 {
-        tree_merge_probs(&INTRA_MODE_TREE, &pre.uv_mode_prob[i], &counts.uv_mode[i], &mut fc.uv_mode_prob[i]);
+        tree_merge_probs(
+            &INTRA_MODE_TREE,
+            &pre.uv_mode_prob[i],
+            &counts.uv_mode[i],
+            &mut fc.uv_mode_prob[i],
+        );
     }
     for i in 0..16 {
-        tree_merge_probs(&PARTITION_TREE, &pre.partition_prob[i], &counts.partition[i], &mut fc.partition_prob[i]);
+        tree_merge_probs(
+            &PARTITION_TREE,
+            &pre.partition_prob[i],
+            &counts.partition[i],
+            &mut fc.partition_prob[i],
+        );
     }
     if interp_switchable {
         for i in 0..4 {
-            tree_merge_probs(&SWITCHABLE_TREE, &pre.switchable_interp_prob[i], &counts.switchable_interp[i], &mut fc.switchable_interp_prob[i]);
+            tree_merge_probs(
+                &SWITCHABLE_TREE,
+                &pre.switchable_interp_prob[i],
+                &counts.switchable_interp[i],
+                &mut fc.switchable_interp_prob[i],
+            );
         }
     }
     if tx_select {
@@ -237,7 +281,11 @@ fn adapt_mode_probs(fc: &mut FrameContext, pre: &FrameContext, counts: &FrameCou
             }
             // 32x32.
             let p = &counts.tx_p32x32[i];
-            let b32 = [[p[0], p[1] + p[2] + p[3]], [p[1], p[2] + p[3]], [p[2], p[3]]];
+            let b32 = [
+                [p[0], p[1] + p[2] + p[3]],
+                [p[1], p[2] + p[3]],
+                [p[2], p[3]],
+            ];
             for j in 0..3 {
                 fc.tx_p32x32[i][j] = mm(pre.tx_p32x32[i][j], b32[j]);
             }
@@ -251,9 +299,18 @@ fn adapt_mode_probs(fc: &mut FrameContext, pre: &FrameContext, counts: &FrameCou
 /// `vp9_adapt_mv_probs`.
 fn adapt_mv_probs(fc: &mut FrameContext, pre: &FrameContext, counts: &FrameCounts, allow_hp: bool) {
     use crate::adapt::{mode_mv_merge_probs as mm, tree_merge_probs};
-    tree_merge_probs(&MV_JOINT_TREE, &pre.nmvc.joints, &counts.mv.joints, &mut fc.nmvc.joints);
+    tree_merge_probs(
+        &MV_JOINT_TREE,
+        &pre.nmvc.joints,
+        &counts.mv.joints,
+        &mut fc.nmvc.joints,
+    );
     for i in 0..2 {
-        let (fco, pco, cco) = (&mut fc.nmvc.comps[i], &pre.nmvc.comps[i], &counts.mv.comps[i]);
+        let (fco, pco, cco) = (
+            &mut fc.nmvc.comps[i],
+            &pre.nmvc.comps[i],
+            &counts.mv.comps[i],
+        );
         fco.sign = mm(pco.sign, cco.sign);
         tree_merge_probs(&MV_CLASS_TREE, &pco.classes, &cco.classes, &mut fco.classes);
         tree_merge_probs(&MV_CLASS0_TREE, &pco.class0, &cco.class0, &mut fco.class0);
@@ -261,7 +318,12 @@ fn adapt_mv_probs(fc: &mut FrameContext, pre: &FrameContext, counts: &FrameCount
             fco.bits[j] = mm(pco.bits[j], cco.bits[j]);
         }
         for j in 0..2 {
-            tree_merge_probs(&MV_FP_TREE, &pco.class0_fp[j], &cco.class0_fp[j], &mut fco.class0_fp[j]);
+            tree_merge_probs(
+                &MV_FP_TREE,
+                &pco.class0_fp[j],
+                &cco.class0_fp[j],
+                &mut fco.class0_fp[j],
+            );
         }
         tree_merge_probs(&MV_FP_TREE, &pco.fp, &cco.fp, &mut fco.fp);
         if allow_hp {
@@ -294,7 +356,14 @@ fn read_inter_mode(b: &mut BoolDecoder, probs: &[u8; 3]) -> u8 {
 
 /// `clamp_mv_to_umv_border_sb` — scale an MV to the plane's 1/16-pel grid and
 /// clamp it so the reference access stays within the unrestricted-MV border.
-fn clamp_mv_umv(mv: Mv, bw: i32, bh: i32, ss_x: usize, ss_y: usize, edges: (i32, i32, i32, i32)) -> Mv {
+fn clamp_mv_umv(
+    mv: Mv,
+    bw: i32,
+    bh: i32,
+    ss_x: usize,
+    ss_y: usize,
+    edges: (i32, i32, i32, i32),
+) -> Mv {
     let spel_left = (4 + bw) << 4;
     let spel_right = spel_left - 16;
     let spel_top = (4 + bh) << 4;
@@ -390,9 +459,17 @@ fn single_ref_p1(above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> usize {
                 last(if ai { l } else { a })
             } else {
                 let (ah, lh) = (a.has_second_ref(), l.has_second_ref());
-                let (a0, a1, l0, l1) = (a.ref_frame[0], a.ref_frame[1], l.ref_frame[0], l.ref_frame[1]);
+                let (a0, a1, l0, l1) = (
+                    a.ref_frame[0],
+                    a.ref_frame[1],
+                    l.ref_frame[0],
+                    l.ref_frame[1],
+                );
                 if ah && lh {
-                    1 + (a0 == LAST_FRAME || a1 == LAST_FRAME || l0 == LAST_FRAME || l1 == LAST_FRAME) as usize
+                    1 + (a0 == LAST_FRAME
+                        || a1 == LAST_FRAME
+                        || l0 == LAST_FRAME
+                        || l1 == LAST_FRAME) as usize
                 } else if ah || lh {
                     let rfs = if !ah { a0 } else { l0 };
                     let crf1 = if ah { a0 } else { l0 };
@@ -440,10 +517,18 @@ fn single_ref_p2(above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> usize {
                 edge(if ai { l } else { a })
             } else {
                 let (ah, lh) = (a.has_second_ref(), l.has_second_ref());
-                let (a0, a1, l0, l1) = (a.ref_frame[0], a.ref_frame[1], l.ref_frame[0], l.ref_frame[1]);
+                let (a0, a1, l0, l1) = (
+                    a.ref_frame[0],
+                    a.ref_frame[1],
+                    l.ref_frame[0],
+                    l.ref_frame[1],
+                );
                 if ah && lh {
                     if a0 == l0 && a1 == l1 {
-                        3 * (a0 == GOLDEN_FRAME || a1 == GOLDEN_FRAME || l0 == GOLDEN_FRAME || l1 == GOLDEN_FRAME) as usize
+                        3 * (a0 == GOLDEN_FRAME
+                            || a1 == GOLDEN_FRAME
+                            || l0 == GOLDEN_FRAME
+                            || l1 == GOLDEN_FRAME) as usize
                     } else {
                         2
                     }
@@ -482,7 +567,12 @@ fn single_ref_p2(above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> usize {
 }
 
 /// `vp9_get_reference_mode_context` — single-vs-compound prediction context.
-fn reference_mode_context(a: Option<&ModeInfo>, l: Option<&ModeInfo>, _sb: [bool; 4], fixed: usize) -> usize {
+fn reference_mode_context(
+    a: Option<&ModeInfo>,
+    l: Option<&ModeInfo>,
+    _sb: [bool; 4],
+    fixed: usize,
+) -> usize {
     let f = fixed as i8;
     match (a, l) {
         (Some(a), Some(l)) => {
@@ -508,7 +598,12 @@ fn reference_mode_context(a: Option<&ModeInfo>, l: Option<&ModeInfo>, _sb: [bool
 }
 
 /// `vp9_get_pred_context_comp_ref_p` — the compound-reference bit context.
-fn comp_ref_context(a: Option<&ModeInfo>, l: Option<&ModeInfo>, sb: [bool; 4], fc: &FrameContext) -> usize {
+fn comp_ref_context(
+    a: Option<&ModeInfo>,
+    l: Option<&ModeInfo>,
+    sb: [bool; 4],
+    fc: &FrameContext,
+) -> usize {
     let fixed = fc.comp_fixed_ref as i8;
     let var0 = fc.comp_var_ref[0] as i8;
     let var1 = fc.comp_var_ref[1] as i8;
@@ -529,8 +624,16 @@ fn comp_ref_context(a: Option<&ModeInfo>, l: Option<&ModeInfo>, sb: [bool; 4], f
             } else {
                 let a_sg = !a.has_second_ref();
                 let l_sg = !l.has_second_ref();
-                let vrfa = if a_sg { a.ref_frame[0] } else { a.ref_frame[var_ref_idx] };
-                let vrfl = if l_sg { l.ref_frame[0] } else { l.ref_frame[var_ref_idx] };
+                let vrfa = if a_sg {
+                    a.ref_frame[0]
+                } else {
+                    a.ref_frame[var_ref_idx]
+                };
+                let vrfl = if l_sg {
+                    l.ref_frame[0]
+                } else {
+                    l.ref_frame[var_ref_idx]
+                };
                 if vrfa == vrfl && var1 == vrfa {
                     0
                 } else if l_sg && a_sg {
@@ -654,7 +757,11 @@ fn read_coef_probs(b: &mut BoolDecoder, fc: &mut FrameContext) {
 }
 
 /// Parse the compressed header into a [`FrameContext`] (key/intra or inter).
-fn parse_compressed_header(data: &[u8], h: &FrameHeader, pre_fc: &FrameContext) -> crate::Result<FrameContext> {
+fn parse_compressed_header(
+    data: &[u8],
+    h: &FrameHeader,
+    pre_fc: &FrameContext,
+) -> crate::Result<FrameContext> {
     let mut b = BoolDecoder::new(data)?;
     // Forward updates are applied on top of the loaded (saved) frame context.
     let mut fc = pre_fc.clone();
@@ -783,7 +890,14 @@ impl Plane {
         let h = (height + ss_y) >> ss_y;
         // Pad the stride/height to a superblock so edge reads stay in-bounds.
         let stride = (w + 64 + 8).next_power_of_two();
-        Plane { buf: vec![0u16; stride * (h + 64 + 8)], stride, width: w, height: h, ss_x, ss_y }
+        Plane {
+            buf: vec![0u16; stride * (h + 64 + 8)],
+            stride,
+            width: w,
+            height: h,
+            ss_x,
+            ss_y,
+        }
     }
 }
 
@@ -891,7 +1005,9 @@ impl Reconstructor {
     /// prediction is enabled for this frame.
     fn prev_mv(&self, mi_row: usize, mi_col: usize) -> Option<&MvRef> {
         if self.use_prev_mvs {
-            self.prev_mvs.as_ref().map(|g| &g[mi_row * self.mi_cols + mi_col])
+            self.prev_mvs
+                .as_ref()
+                .map(|g| &g[mi_row * self.mi_cols + mi_col])
         } else {
             None
         }
@@ -901,7 +1017,10 @@ impl Reconstructor {
     fn seg_mis(&self, mi_row: usize, mi_col: usize, bsize: usize) -> (usize, usize) {
         let bw8 = (1usize << B_WIDTH_LOG2[bsize] >> 1).max(1);
         let bh8 = (1usize << B_HEIGHT_LOG2[bsize] >> 1).max(1);
-        (bw8.min(self.mi_cols - mi_col), bh8.min(self.mi_rows - mi_row))
+        (
+            bw8.min(self.mi_cols - mi_col),
+            bh8.min(self.mi_rows - mi_row),
+        )
     }
     fn set_seg_id(&mut self, mi_row: usize, mi_col: usize, x_mis: usize, y_mis: usize, sid: u8) {
         for y in 0..y_mis {
@@ -938,7 +1057,13 @@ impl Reconstructor {
     fn read_segment_id_tree(&mut self, b: &mut BoolDecoder) -> u8 {
         crate::token::read_tree(b, &SEGMENT_TREE, &self.seg.tree_probs) as u8
     }
-    fn read_intra_segment_id(&mut self, b: &mut BoolDecoder, mi_row: usize, mi_col: usize, bsize: usize) -> u8 {
+    fn read_intra_segment_id(
+        &mut self,
+        b: &mut BoolDecoder,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+    ) -> u8 {
         if !self.seg.enabled {
             return 0;
         }
@@ -951,7 +1076,15 @@ impl Reconstructor {
         self.set_seg_id(mi_row, mi_col, xm, ym, sid);
         sid
     }
-    fn read_inter_segment_id(&mut self, b: &mut BoolDecoder, mi_row: usize, mi_col: usize, bsize: usize, above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> (u8, bool) {
+    fn read_inter_segment_id(
+        &mut self,
+        b: &mut BoolDecoder,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+        above: Option<&ModeInfo>,
+        left: Option<&ModeInfo>,
+    ) -> (u8, bool) {
         if !self.seg.enabled {
             return (0, false);
         }
@@ -963,7 +1096,8 @@ impl Reconstructor {
         }
         let mut seg_pred = false;
         let sid = if self.seg.temporal_update {
-            let ctx = above.map_or(0, |m| m.seg_id_predicted as usize) + left.map_or(0, |m| m.seg_id_predicted as usize);
+            let ctx = above.map_or(0, |m| m.seg_id_predicted as usize)
+                + left.map_or(0, |m| m.seg_id_predicted as usize);
             seg_pred = b.read_bool(self.seg.pred_probs[ctx]) != 0;
             if seg_pred {
                 predicted
@@ -1007,7 +1141,16 @@ pub fn decode_intra_frame(
     data: &[u8],
 ) -> crate::Result<([Vec<u8>; 3], [usize; 3], [usize; 3])> {
     let no_refs: [Option<std::sync::Arc<RefFrame>>; 3] = [None, None, None];
-    let (rf, _fc, _mvs, _seg) = decode_frame(h, data, &no_refs, &FrameContext::defaults(), false, None, false, None)?;
+    let (rf, _fc, _mvs, _seg) = decode_frame(
+        h,
+        data,
+        &no_refs,
+        &FrameContext::defaults(),
+        false,
+        None,
+        false,
+        None,
+    )?;
     let mut out: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut widths = [0usize; 3];
     let mut heights = [0usize; 3];
@@ -1016,7 +1159,11 @@ pub fn decode_intra_frame(
         let mut v = Vec::with_capacity(w * hh);
         for y in 0..hh {
             // 8-bit dump helper: planes are stored u16, downcast to bytes.
-            v.extend(rf.planes[p][y * stride..y * stride + w].iter().map(|&px| px as u8));
+            v.extend(
+                rf.planes[p][y * stride..y * stride + w]
+                    .iter()
+                    .map(|&px| px as u8),
+            );
         }
         out[p] = v;
         widths[p] = w;
@@ -1038,11 +1185,18 @@ pub fn decode_frame(
     prev_mvs: Option<std::sync::Arc<Vec<MvRef>>>,
     use_prev_mvs: bool,
     prev_seg_map: Option<std::sync::Arc<Vec<u8>>>,
-) -> crate::Result<(RefFrame, FrameContext, std::sync::Arc<Vec<MvRef>>, std::sync::Arc<Vec<u8>>)> {
+) -> crate::Result<(
+    RefFrame,
+    FrameContext,
+    std::sync::Arc<Vec<MvRef>>,
+    std::sync::Arc<Vec<u8>>,
+)> {
     let start = h.uncompressed_bytes;
     let end = start.saturating_add(h.header_size as usize);
     if h.header_size == 0 || end > data.len() {
-        return Err(crate::Error::invalid("vp9: compressed header out of bounds"));
+        return Err(crate::Error::invalid(
+            "vp9: compressed header out of bounds",
+        ));
     }
     let fc = parse_compressed_header(&data[start..end], h, pre_fc)?;
     let _ = refs;
@@ -1053,7 +1207,13 @@ pub fn decode_frame(
     let mut dq_uv = [(0i32, 0i32); 8];
     for s in 0..8 {
         let qidx = seg.qindex(s, h.base_q_idx as i32);
-        let dq = Dequant::new(qidx, h.delta_q_y_dc, h.delta_q_uv_dc, h.delta_q_uv_ac, h.bit_depth.max(8));
+        let dq = Dequant::new(
+            qidx,
+            h.delta_q_y_dc,
+            h.delta_q_uv_dc,
+            h.delta_q_uv_ac,
+            h.bit_depth.max(8),
+        );
         dq_y[s] = (dq.y_dc, dq.y_ac);
         dq_uv[s] = (dq.uv_dc, dq.uv_ac);
     }
@@ -1104,7 +1264,12 @@ pub fn decode_frame(
         is_inter_frame: !(h.key_frame || h.intra_only),
         interp_filter: h.interp_filter,
         allow_hp: h.allow_high_precision_mv,
-        sign_bias: [false, h.ref_sign_bias[0], h.ref_sign_bias[1], h.ref_sign_bias[2]],
+        sign_bias: [
+            false,
+            h.ref_sign_bias[0],
+            h.ref_sign_bias[1],
+            h.ref_sign_bias[2],
+        ],
         refs: [refs[0].clone(), refs[1].clone(), refs[2].clone()],
         counts: FrameCounts::zeroed(),
         prev_mvs,
@@ -1134,12 +1299,22 @@ pub fn decode_frame(
     if h.refresh_frame_context && !h.frame_parallel_decoding_mode {
         let intra_only = h.key_frame || h.intra_only;
         // Coefficient adaptation update factor depends on frame position.
-        let update_factor = if intra_only || !last_frame_key { 112 } else { 128 };
+        let update_factor = if intra_only || !last_frame_key {
+            112
+        } else {
+            128
+        };
         let count_sat = 24;
         let tx_select = out_fc.tx_mode == TX_MODE_SELECT;
         adapt_coef_probs(&mut out_fc, pre_fc, &rec.counts, count_sat, update_factor);
         if !intra_only {
-            adapt_mode_probs(&mut out_fc, pre_fc, &rec.counts, h.interp_filter == 4, tx_select);
+            adapt_mode_probs(
+                &mut out_fc,
+                pre_fc,
+                &rec.counts,
+                h.interp_filter == 4,
+                tx_select,
+            );
             adapt_mv_probs(&mut out_fc, pre_fc, &rec.counts, h.allow_high_precision_mv);
         }
     }
@@ -1152,9 +1327,21 @@ pub fn decode_frame(
     ];
     let rf = RefFrame {
         planes,
-        stride: [rec.planes[0].stride, rec.planes[1].stride, rec.planes[2].stride],
-        w: [rec.planes[0].width, rec.planes[1].width, rec.planes[2].width],
-        h: [rec.planes[0].height, rec.planes[1].height, rec.planes[2].height],
+        stride: [
+            rec.planes[0].stride,
+            rec.planes[1].stride,
+            rec.planes[2].stride,
+        ],
+        w: [
+            rec.planes[0].width,
+            rec.planes[1].width,
+            rec.planes[2].width,
+        ],
+        h: [
+            rec.planes[0].height,
+            rec.planes[1].height,
+            rec.planes[2].height,
+        ],
         ss_x,
         ss_y,
         bit_depth: h.bit_depth.max(8),
@@ -1163,13 +1350,26 @@ pub fn decode_frame(
     let mvs: Vec<MvRef> = rec
         .mi
         .iter()
-        .map(|m| MvRef { ref_frame: m.ref_frame, mv: m.mv })
+        .map(|m| MvRef {
+            ref_frame: m.ref_frame,
+            mv: m.mv,
+        })
         .collect();
-    Ok((rf, out_fc, std::sync::Arc::new(mvs), std::sync::Arc::new(rec.cur_seg_map)))
+    Ok((
+        rf,
+        out_fc,
+        std::sync::Arc::new(mvs),
+        std::sync::Arc::new(rec.cur_seg_map),
+    ))
 }
 
 impl Reconstructor {
-    fn decode_tiles(&mut self, data: &[u8], tile_cols_log2: u32, tile_rows_log2: u32) -> crate::Result<()> {
+    fn decode_tiles(
+        &mut self,
+        data: &[u8],
+        tile_cols_log2: u32,
+        tile_rows_log2: u32,
+    ) -> crate::Result<()> {
         let tile_cols = 1usize << tile_cols_log2;
         let tile_rows = 1usize << tile_rows_log2;
         let mut off = 0usize;
@@ -1196,7 +1396,12 @@ impl Reconstructor {
                     if off + 4 > data.len() {
                         return Err(crate::Error::invalid("vp9: tile size overruns frame"));
                     }
-                    let sz = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
+                    let sz = u32::from_be_bytes([
+                        data[off],
+                        data[off + 1],
+                        data[off + 2],
+                        data[off + 3],
+                    ]) as usize;
                     off += 4;
                     if off + sz > data.len() {
                         return Err(crate::Error::invalid("vp9: tile data overruns frame"));
@@ -1258,7 +1463,9 @@ impl Reconstructor {
             self.decode_block(b, mi_row, mi_col, subsize, n4x4_l2, n4x4_l2)?;
         } else {
             match partition {
-                PARTITION_NONE => self.decode_block(b, mi_row, mi_col, subsize, n4x4_l2, n4x4_l2)?,
+                PARTITION_NONE => {
+                    self.decode_block(b, mi_row, mi_col, subsize, n4x4_l2, n4x4_l2)?
+                }
                 PARTITION_HORZ => {
                     self.decode_block(b, mi_row, mi_col, subsize, n4x4_l2, n8x8_l2)?;
                     if has_rows {
@@ -1333,13 +1540,23 @@ impl Reconstructor {
         Ok(())
     }
 
-    fn read_mode_info(&mut self, b: &mut BoolDecoder, mi_row: usize, mi_col: usize, bsize: usize) -> ModeInfo {
+    fn read_mode_info(
+        &mut self,
+        b: &mut BoolDecoder,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+    ) -> ModeInfo {
         if self.is_inter_frame {
             return self.read_inter_frame_mode_info(b, mi_row, mi_col, bsize);
         }
         let above = self.above_mi(mi_row, mi_col);
         let left = self.left_mi(mi_row, mi_col);
-        let mut mi = ModeInfo { sb_type: bsize as u8, is_inter: false, ..Default::default() };
+        let mut mi = ModeInfo {
+            sb_type: bsize as u8,
+            is_inter: false,
+            ..Default::default()
+        };
         mi.segment_id = self.read_intra_segment_id(b, mi_row, mi_col, bsize);
 
         // skip flag.
@@ -1391,7 +1608,15 @@ impl Reconstructor {
         mi
     }
 
-    fn read_tx_size(&mut self, b: &mut BoolDecoder, bsize: usize, cur: &ModeInfo, above: Option<&ModeInfo>, left: Option<&ModeInfo>, allow_select: bool) -> u8 {
+    fn read_tx_size(
+        &mut self,
+        b: &mut BoolDecoder,
+        bsize: usize,
+        cur: &ModeInfo,
+        above: Option<&ModeInfo>,
+        left: Option<&ModeInfo>,
+        allow_select: bool,
+    ) -> u8 {
         let max_tx = MAX_TXSIZE[bsize] as usize;
         if allow_select && self.fc.tx_mode == TX_MODE_SELECT && bsize >= BLOCK_8X8 {
             let ctx = tx_size_context(cur, above, left);
@@ -1419,13 +1644,23 @@ impl Reconstructor {
 
     // ---- Component 6: inter mode-info decode -----------------------------
 
-    fn read_inter_frame_mode_info(&mut self, b: &mut BoolDecoder, mi_row: usize, mi_col: usize, bsize: usize) -> ModeInfo {
+    fn read_inter_frame_mode_info(
+        &mut self,
+        b: &mut BoolDecoder,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+    ) -> ModeInfo {
         let above = self.above_mi(mi_row, mi_col);
         let left = self.left_mi(mi_row, mi_col);
-        let mut mi = ModeInfo { sb_type: bsize as u8, ..Default::default() };
+        let mut mi = ModeInfo {
+            sb_type: bsize as u8,
+            ..Default::default()
+        };
 
         // segment_id (spatial tree or temporal prediction).
-        let (sid, seg_pred) = self.read_inter_segment_id(b, mi_row, mi_col, bsize, above.as_ref(), left.as_ref());
+        let (sid, seg_pred) =
+            self.read_inter_segment_id(b, mi_row, mi_col, bsize, above.as_ref(), left.as_ref());
         mi.segment_id = sid;
         mi.seg_id_predicted = seg_pred;
         let sidx = sid as usize;
@@ -1453,7 +1688,15 @@ impl Reconstructor {
         mi.is_inter = inter_block;
 
         if inter_block {
-            self.read_inter_block_mode_info(b, &mut mi, mi_row, mi_col, bsize, above.as_ref(), left.as_ref());
+            self.read_inter_block_mode_info(
+                b,
+                &mut mi,
+                mi_row,
+                mi_col,
+                bsize,
+                above.as_ref(),
+                left.as_ref(),
+            );
         } else {
             self.read_intra_block_mode_info_inter(b, &mut mi, bsize);
             mi.ref_frame = [INTRA_FRAME, NONE_FRAME];
@@ -1463,7 +1706,12 @@ impl Reconstructor {
     }
 
     /// Intra block inside an inter frame (uses the frame's adapted y/uv probs).
-    fn read_intra_block_mode_info_inter(&mut self, b: &mut BoolDecoder, mi: &mut ModeInfo, bsize: usize) {
+    fn read_intra_block_mode_info_inter(
+        &mut self,
+        b: &mut BoolDecoder,
+        mi: &mut ModeInfo,
+        bsize: usize,
+    ) {
         match bsize {
             0 => {
                 for i in 0..4 {
@@ -1503,7 +1751,13 @@ impl Reconstructor {
         m
     }
 
-    fn read_ref_frames(&mut self, b: &mut BoolDecoder, mi: &mut ModeInfo, above: Option<&ModeInfo>, left: Option<&ModeInfo>) {
+    fn read_ref_frames(
+        &mut self,
+        b: &mut BoolDecoder,
+        mi: &mut ModeInfo,
+        above: Option<&ModeInfo>,
+        left: Option<&ModeInfo>,
+    ) {
         // SEG_LVL_REF_FRAME forces a single reference with no coded bits.
         let sidx = mi.segment_id as usize;
         if self.seg.active(sidx, SEG_LVL_REF_FRAME) {
@@ -1546,11 +1800,29 @@ impl Reconstructor {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn read_inter_block_mode_info(&mut self, b: &mut BoolDecoder, mi: &mut ModeInfo, mi_row: usize, mi_col: usize, bsize: usize, above: Option<&ModeInfo>, left: Option<&ModeInfo>) {
+    fn read_inter_block_mode_info(
+        &mut self,
+        b: &mut BoolDecoder,
+        mi: &mut ModeInfo,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+        above: Option<&ModeInfo>,
+        left: Option<&ModeInfo>,
+    ) {
         let allow_hp = self.allow_hp;
         self.read_ref_frames(b, mi, above, left);
         let is_compound = mi.has_second_ref();
-        let inter_mode_ctx = get_mode_context(&self.mi, self.mi_cols, self.mi_rows, self.tile_col_start, self.tile_col_end, mi_row, mi_col, bsize);
+        let inter_mode_ctx = get_mode_context(
+            &self.mi,
+            self.mi_cols,
+            self.mi_rows,
+            self.tile_col_start,
+            self.tile_col_end,
+            mi_row,
+            mi_col,
+            bsize,
+        );
 
         // SEG_LVL_SKIP forces ZEROMV with no coded mode.
         let seg_skip = self.seg.active(mi.segment_id as usize, SEG_LVL_SKIP);
@@ -1586,18 +1858,42 @@ impl Reconstructor {
                     let mut near_nearest = [(0i32, 0i32); 2];
                     if b_mode == NEARESTMV || b_mode == NEARMV {
                         for r in 0..nrefs {
-                            near_nearest[r] = self.append_sub8x8_mvs(mi, b_mode, j, r, mi_row, mi_col, bsize, edges);
+                            near_nearest[r] = self
+                                .append_sub8x8_mvs(mi, b_mode, j, r, mi_row, mi_col, bsize, edges);
                         }
                     } else if b_mode == NEWMV && !got_new {
                         for r in 0..nrefs {
                             let frame = mi.ref_frame[r];
-                            let (tmp, _) = find_mv_refs(&self.mi, self.mi_cols, self.mi_rows, self.tile_col_start, self.tile_col_end, mi_row, mi_col, bsize, frame, &self.sign_bias, NEWMV, -1, edges, self.prev_mv(mi_row, mi_col));
+                            let (tmp, _) = find_mv_refs(
+                                &self.mi,
+                                self.mi_cols,
+                                self.mi_rows,
+                                self.tile_col_start,
+                                self.tile_col_end,
+                                mi_row,
+                                mi_col,
+                                bsize,
+                                frame,
+                                &self.sign_bias,
+                                NEWMV,
+                                -1,
+                                edges,
+                                self.prev_mv(mi_row, mi_col),
+                            );
                             best_ref_mvs[r] = lower_mv_precision(tmp[0], allow_hp);
                         }
                         got_new = true;
                     }
                     let mut bmv = [(0i32, 0i32); 2];
-                    self.assign_mv(b, b_mode, &mut bmv, &best_ref_mvs, &near_nearest, is_compound, allow_hp);
+                    self.assign_mv(
+                        b,
+                        b_mode,
+                        &mut bmv,
+                        &best_ref_mvs,
+                        &near_nearest,
+                        is_compound,
+                        allow_hp,
+                    );
                     mi.bmi_mv[j] = bmv;
                     if num_4x4_h == 2 {
                         mi.bmi_mv[j + 2] = bmv;
@@ -1616,7 +1912,22 @@ impl Reconstructor {
             if mi.mode != ZEROMV {
                 for r in 0..nrefs {
                     let frame = mi.ref_frame[r];
-                    let (tmp, _count) = find_mv_refs(&self.mi, self.mi_cols, self.mi_rows, self.tile_col_start, self.tile_col_end, mi_row, mi_col, bsize, frame, &self.sign_bias, mi.mode, -1, edges, self.prev_mv(mi_row, mi_col));
+                    let (tmp, _count) = find_mv_refs(
+                        &self.mi,
+                        self.mi_cols,
+                        self.mi_rows,
+                        self.tile_col_start,
+                        self.tile_col_end,
+                        mi_row,
+                        mi_col,
+                        bsize,
+                        frame,
+                        &self.sign_bias,
+                        mi.mode,
+                        -1,
+                        edges,
+                        self.prev_mv(mi_row, mi_col),
+                    );
                     // NEARESTMV / NEWMV use the nearest candidate (slot 0); NEARMV
                     // uses the near candidate (slot 1), which is the zero MV when no
                     // distinct second candidate was found (libvpx `mv_ref_list[1]`).
@@ -1625,15 +1936,50 @@ impl Reconstructor {
                 }
             }
             let mode = mi.mode;
-            self.assign_mv(b, mode, &mut mi.mv, &best_ref_mvs, &best_ref_mvs, is_compound, allow_hp);
+            self.assign_mv(
+                b,
+                mode,
+                &mut mi.mv,
+                &best_ref_mvs,
+                &best_ref_mvs,
+                is_compound,
+                allow_hp,
+            );
         }
     }
 
     /// `append_sub8x8_mvs_for_idx` — best ref MV for a sub-8×8 sub-block.
     #[allow(clippy::too_many_arguments)]
-    fn append_sub8x8_mvs(&self, mi: &ModeInfo, b_mode: u8, block: usize, r: usize, mi_row: usize, mi_col: usize, bsize: usize, edges: (i32, i32, i32, i32)) -> Mv {
+    fn append_sub8x8_mvs(
+        &self,
+        mi: &ModeInfo,
+        b_mode: u8,
+        block: usize,
+        r: usize,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+        edges: (i32, i32, i32, i32),
+    ) -> Mv {
         let frame = mi.ref_frame[r];
-        let find = |blk: i32| find_mv_refs(&self.mi, self.mi_cols, self.mi_rows, self.tile_col_start, self.tile_col_end, mi_row, mi_col, bsize, frame, &self.sign_bias, b_mode, blk, edges, self.prev_mv(mi_row, mi_col));
+        let find = |blk: i32| {
+            find_mv_refs(
+                &self.mi,
+                self.mi_cols,
+                self.mi_rows,
+                self.tile_col_start,
+                self.tile_col_end,
+                mi_row,
+                mi_col,
+                bsize,
+                frame,
+                &self.sign_bias,
+                b_mode,
+                blk,
+                edges,
+                self.prev_mv(mi_row, mi_col),
+            )
+        };
         match block {
             0 => {
                 let (list, count) = find(0);
@@ -1676,7 +2022,16 @@ impl Reconstructor {
         }
     }
 
-    fn assign_mv(&mut self, b: &mut BoolDecoder, mode: u8, mv: &mut [Mv; 2], ref_mv: &[Mv; 2], near_nearest: &[Mv; 2], is_compound: bool, allow_hp: bool) {
+    fn assign_mv(
+        &mut self,
+        b: &mut BoolDecoder,
+        mode: u8,
+        mv: &mut [Mv; 2],
+        ref_mv: &[Mv; 2],
+        near_nearest: &[Mv; 2],
+        is_compound: bool,
+        allow_hp: bool,
+    ) {
         match mode {
             NEWMV => {
                 for i in 0..(1 + is_compound as usize) {
@@ -1695,7 +2050,12 @@ impl Reconstructor {
         }
     }
 
-    fn read_switchable_interp_filter(&mut self, b: &mut BoolDecoder, above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> u8 {
+    fn read_switchable_interp_filter(
+        &mut self,
+        b: &mut BoolDecoder,
+        above: Option<&ModeInfo>,
+        left: Option<&ModeInfo>,
+    ) -> u8 {
         let ctx = switchable_interp_context(above, left);
         // tree {-EIGHTTAP(0), 2, -EIGHTTAP_SMOOTH(1), -EIGHTTAP_SHARP(2)}
         const TREE: [i8; 4] = [0, 2, -1, -2];
@@ -1719,7 +2079,16 @@ impl Reconstructor {
 
     /// Build the inter prediction for one plane of a coding block into the
     /// frame buffer (libvpx `dec_build_inter_predictors_sb`, non-scaled path).
-    fn inter_predict_plane(&mut self, mi: &ModeInfo, plane: usize, mi_row: usize, mi_col: usize, bsize: usize, bwl: usize, bhl: usize) {
+    fn inter_predict_plane(
+        &mut self,
+        mi: &ModeInfo,
+        plane: usize,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+        bwl: usize,
+        bhl: usize,
+    ) {
         let (ss_x, ss_y) = (self.planes[plane].ss_x, self.planes[plane].ss_y);
         let base_x = (mi_col * MI_SIZE) >> ss_x;
         let base_y = (mi_row * MI_SIZE) >> ss_y;
@@ -1737,18 +2106,64 @@ impl Reconstructor {
                 for y in 0..n4_h {
                     for x in 0..n4_w {
                         let mv = average_split_mvs(mi, r, i, ss_x, ss_y);
-                        self.mc_one(plane, frame, mv, base_x + x * 4, base_y + y * 4, 4, 4, bw, bh, ss_x, ss_y, edges, mi.interp_filter, avg);
+                        self.mc_one(
+                            plane,
+                            frame,
+                            mv,
+                            base_x + x * 4,
+                            base_y + y * 4,
+                            4,
+                            4,
+                            bw,
+                            bh,
+                            ss_x,
+                            ss_y,
+                            edges,
+                            mi.interp_filter,
+                            avg,
+                        );
                         i += 1;
                     }
                 }
             } else {
-                self.mc_one(plane, frame, mi.mv[r], base_x, base_y, n4_w * 4, n4_h * 4, bw, bh, ss_x, ss_y, edges, mi.interp_filter, avg);
+                self.mc_one(
+                    plane,
+                    frame,
+                    mi.mv[r],
+                    base_x,
+                    base_y,
+                    n4_w * 4,
+                    n4_h * 4,
+                    bw,
+                    bh,
+                    ss_x,
+                    ss_y,
+                    edges,
+                    mi.interp_filter,
+                    avg,
+                );
             }
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn mc_one(&mut self, plane: usize, frame: i8, mv: Mv, dst_x: usize, dst_y: usize, w: usize, h: usize, bw: i32, bh: i32, ss_x: usize, ss_y: usize, edges: (i32, i32, i32, i32), filter: u8, avg: bool) {
+    fn mc_one(
+        &mut self,
+        plane: usize,
+        frame: i8,
+        mv: Mv,
+        dst_x: usize,
+        dst_y: usize,
+        w: usize,
+        h: usize,
+        bw: i32,
+        bh: i32,
+        ss_x: usize,
+        ss_y: usize,
+        edges: (i32, i32, i32, i32),
+        filter: u8,
+        avg: bool,
+    ) {
         let rf = match self.refs[(frame - LAST_FRAME) as usize].clone() {
             Some(rf) => rf,
             None => return, // missing reference (corrupt stream)
@@ -1790,20 +2205,55 @@ impl Reconstructor {
             let bx = x0 + (smv_col >> 4);
             let by = y0 + (smv_row >> 4);
             scaled_predict_block(
-                &refp, bx, by, (smv_col & 15) as usize, (smv_row & 15) as usize, x_step_q4, y_step_q4,
-                filter as usize, &mut self.planes[plane].buf[dst_off..], stride, w, h, avg, self.max_px,
+                &refp,
+                bx,
+                by,
+                (smv_col & 15) as usize,
+                (smv_row & 15) as usize,
+                x_step_q4,
+                y_step_q4,
+                filter as usize,
+                &mut self.planes[plane].buf[dst_off..],
+                stride,
+                w,
+                h,
+                avg,
+                self.max_px,
             );
         } else {
             let bx = dst_x as i32 + (mv_q4.1 >> 4);
             let by = dst_y as i32 + (mv_q4.0 >> 4);
             let subpel_x = (mv_q4.1 & 15) as usize;
             let subpel_y = (mv_q4.0 & 15) as usize;
-            predict_block(&refp, bx, by, subpel_x, subpel_y, filter as usize, &mut self.planes[plane].buf[dst_off..], stride, w, h, avg, self.max_px);
+            predict_block(
+                &refp,
+                bx,
+                by,
+                subpel_x,
+                subpel_y,
+                filter as usize,
+                &mut self.planes[plane].buf[dst_off..],
+                stride,
+                w,
+                h,
+                avg,
+                self.max_px,
+            );
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn reconstruct_plane(&mut self, b: &mut BoolDecoder, mi: &ModeInfo, plane: usize, mi_row: usize, mi_col: usize, bsize: usize, bwl: usize, bhl: usize) -> crate::Result<()> {
+    fn reconstruct_plane(
+        &mut self,
+        b: &mut BoolDecoder,
+        mi: &ModeInfo,
+        plane: usize,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+        bwl: usize,
+        bhl: usize,
+    ) -> crate::Result<()> {
         if mi.is_inter {
             self.inter_predict_plane(mi, plane, mi_row, mi_col, bsize, bwl, bhl);
         }
@@ -1812,16 +2262,30 @@ impl Reconstructor {
         // set_plane_n4) — for sub-8×8 this differs from num_4x4[bsize].
         let n4_w = (1usize << bwl) >> ss_x;
         let n4_h = (1usize << bhl) >> ss_y;
-        let tx_size = if plane == 0 { mi.tx_size as usize } else { uv_tx_size(bsize, mi.tx_size as usize, ss_x, ss_y) };
+        let tx_size = if plane == 0 {
+            mi.tx_size as usize
+        } else {
+            uv_tx_size(bsize, mi.tx_size as usize, ss_x, ss_y)
+        };
         let step = 1usize << tx_size;
 
         // Frame-edge clipping of the transform-block grid (libvpx max_blocks_*).
         let bw_mi = 1usize << (bwl - 1); // mi-unit width of the block
         let bh_mi = 1usize << (bhl - 1);
-        let mb_to_right = (self.mi_cols as i32 - bw_mi as i32 - mi_col as i32) * (MI_SIZE as i32) * 8;
-        let mb_to_bottom = (self.mi_rows as i32 - bh_mi as i32 - mi_row as i32) * (MI_SIZE as i32) * 8;
-        let max_w = if mb_to_right >= 0 { n4_w } else { (n4_w as i32 + (mb_to_right >> (5 + ss_x))).max(0) as usize };
-        let max_h = if mb_to_bottom >= 0 { n4_h } else { (n4_h as i32 + (mb_to_bottom >> (5 + ss_y))).max(0) as usize };
+        let mb_to_right =
+            (self.mi_cols as i32 - bw_mi as i32 - mi_col as i32) * (MI_SIZE as i32) * 8;
+        let mb_to_bottom =
+            (self.mi_rows as i32 - bh_mi as i32 - mi_row as i32) * (MI_SIZE as i32) * 8;
+        let max_w = if mb_to_right >= 0 {
+            n4_w
+        } else {
+            (n4_w as i32 + (mb_to_right >> (5 + ss_x))).max(0) as usize
+        };
+        let max_h = if mb_to_bottom >= 0 {
+            n4_h
+        } else {
+            (n4_h as i32 + (mb_to_bottom >> (5 + ss_y))).max(0) as usize
+        };
 
         let above_some = self.above_mi(mi_row, mi_col).is_some();
         let left_some = self.left_mi(mi_row, mi_col).is_some();
@@ -1837,8 +2301,23 @@ impl Reconstructor {
             let mut col = 0;
             while col < max_w {
                 self.reconstruct_tx_block(
-                    b, mi, plane, tx_size, n4_w, row, col, base_x, base_y, above_col0, left_row0,
-                    above_some, left_some, max_w, max_h, mb_to_right, mb_to_bottom,
+                    b,
+                    mi,
+                    plane,
+                    tx_size,
+                    n4_w,
+                    row,
+                    col,
+                    base_x,
+                    base_y,
+                    above_col0,
+                    left_row0,
+                    above_some,
+                    left_some,
+                    max_w,
+                    max_h,
+                    mb_to_right,
+                    mb_to_bottom,
                 )?;
                 col += step;
             }
@@ -1904,10 +2383,34 @@ impl Reconstructor {
             let mut above_buf = [0u16; 1 + 64];
             let mut left_buf = [0u16; 32];
             build_intra_edges(
-                mode, bs, up_avail, left_avail, right_avail, &self.planes[plane].buf, stride, fw, fh,
-                x0 as i32, y0 as i32, mb_to_right, mb_to_bottom, &mut above_buf, &mut left_buf, self.max_px,
+                mode,
+                bs,
+                up_avail,
+                left_avail,
+                right_avail,
+                &self.planes[plane].buf,
+                stride,
+                fw,
+                fh,
+                x0 as i32,
+                y0 as i32,
+                mb_to_right,
+                mb_to_bottom,
+                &mut above_buf,
+                &mut left_buf,
+                self.max_px,
             );
-            predict(&mut self.planes[plane].buf[dst_off..], stride, mode, bs, &above_buf, &left_buf, left_avail, up_avail, self.max_px);
+            predict(
+                &mut self.planes[plane].buf[dst_off..],
+                stride,
+                mode,
+                bs,
+                &above_buf,
+                &left_buf,
+                left_avail,
+                up_avail,
+                self.max_px,
+            );
         }
 
         let inframe_w = (max_w - col).min(txw);
@@ -1915,7 +2418,16 @@ impl Reconstructor {
 
         if mi.skip {
             // Skipped: no residual; clear the entropy context for this block.
-            self.set_ctx(plane, above_col0 + col, left_row0 + row, txw, txw, inframe_w, inframe_h, false);
+            self.set_ctx(
+                plane,
+                above_col0 + col,
+                left_row0 + row,
+                txw,
+                txw,
+                inframe_w,
+                inframe_h,
+                false,
+            );
             return Ok(());
         }
 
@@ -1928,7 +2440,11 @@ impl Reconstructor {
         };
         let (scan, nb) = get_scan(tx_size, tx_type);
         let sid = mi.segment_id as usize;
-        let dq = if plane == 0 { self.dq_y[sid] } else { self.dq_uv[sid] };
+        let dq = if plane == 0 {
+            self.dq_y[sid]
+        } else {
+            self.dq_uv[sid]
+        };
 
         let act = self.above_ctx_val(plane, above_col0 + col, txw);
         let lct = self.left_ctx_val(plane, left_row0 + row, txw);
@@ -1938,13 +2454,30 @@ impl Reconstructor {
         let rt = mi.is_inter as usize;
         let bd_bits = (self.max_px as u32 + 1).trailing_zeros();
         let (eob, max_row) = decode_coefs(
-            b, &self.fc.coef_probs[tx_size][pt][rt], tx_size, scan, nb, dq, ctx0,
-            &mut self.dqcoeff, &mut self.token_cache,
-            &mut self.counts.coef[tx_size][pt][rt], &mut self.counts.eob_branch[tx_size][pt][rt],
+            b,
+            &self.fc.coef_probs[tx_size][pt][rt],
+            tx_size,
+            scan,
+            nb,
+            dq,
+            ctx0,
+            &mut self.dqcoeff,
+            &mut self.token_cache,
+            &mut self.counts.coef[tx_size][pt][rt],
+            &mut self.counts.eob_branch[tx_size][pt][rt],
             bd_bits,
         );
 
-        self.set_ctx(plane, above_col0 + col, left_row0 + row, txw, txw, inframe_w, inframe_h, eob > 0);
+        self.set_ctx(
+            plane,
+            above_col0 + col,
+            left_row0 + row,
+            txw,
+            txw,
+            inframe_w,
+            inframe_h,
+            eob > 0,
+        );
 
         if eob > 0 {
             let dst = &mut self.planes[plane].buf[dst_off..];
@@ -1955,14 +2488,24 @@ impl Reconstructor {
                 inverse_transform_dc_add(self.dqcoeff[0], bs, dst, stride, self.max_px);
             } else {
                 // Sparse-EOB: only rows 0..=max_row hold non-zero coefficients.
-                inverse_transform_add_rows(&self.dqcoeff, bs, tx_type, dst, stride, self.max_px, max_row + 1);
+                inverse_transform_add_rows(
+                    &self.dqcoeff,
+                    bs,
+                    tx_type,
+                    dst,
+                    stride,
+                    self.max_px,
+                    max_row + 1,
+                );
             }
         }
         Ok(())
     }
 
     fn above_ctx_val(&self, plane: usize, idx: usize, txw: usize) -> u8 {
-        self.above_ctx[plane][idx..idx + txw].iter().any(|&v| v != 0) as u8
+        self.above_ctx[plane][idx..idx + txw]
+            .iter()
+            .any(|&v| v != 0) as u8
     }
     fn left_ctx_val(&self, plane: usize, idx: usize, txh: usize) -> u8 {
         self.left_ctx[plane][idx..idx + txh].iter().any(|&v| v != 0) as u8
@@ -1972,7 +2515,17 @@ impl Reconstructor {
     /// The above row is trimmed to the in-frame columns and the left column to
     /// the in-frame rows (libvpx ctx_shift) so out-of-frame units stay zero.
     #[allow(clippy::too_many_arguments)]
-    fn set_ctx(&mut self, plane: usize, above_idx: usize, left_idx: usize, txw: usize, txh: usize, inframe_w: usize, inframe_h: usize, nonzero: bool) {
+    fn set_ctx(
+        &mut self,
+        plane: usize,
+        above_idx: usize,
+        left_idx: usize,
+        txw: usize,
+        txh: usize,
+        inframe_w: usize,
+        inframe_h: usize,
+        nonzero: bool,
+    ) {
         let v = nonzero as u8;
         for i in 0..txw {
             self.above_ctx[plane][above_idx + i] = if i < inframe_w { v } else { 0 };

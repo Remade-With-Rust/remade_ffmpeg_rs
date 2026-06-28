@@ -100,7 +100,9 @@ impl Encoder for PcmEncoder {
         let af = match frame {
             Frame::Audio(a) => a,
             Frame::Video(_) => {
-                return Err(Error::unsupported("pcm encode: video frame on an audio codec"))
+                return Err(Error::unsupported(
+                    "pcm encode: video frame on an audio codec",
+                ))
             }
         };
         check_interleaved(af.format, "pcm encode")?;
@@ -143,7 +145,8 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        dec.send_packet(&Packet::from_data(0, data.clone())).unwrap();
+        dec.send_packet(&Packet::from_data(0, data.clone()))
+            .unwrap();
         let Frame::Audio(af) = dec.receive_frame().unwrap() else {
             unreachable!()
         };

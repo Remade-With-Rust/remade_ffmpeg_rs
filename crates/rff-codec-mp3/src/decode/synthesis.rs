@@ -69,7 +69,8 @@ mod tests {
     fn matrix_matches_cosine_formula() {
         let n = matrix();
         // Spot-check a couple of entries against N[i][k] = cos((16+i)(2k+1)π/64).
-        let e = |i: usize, k: usize| (PI / 64.0 * (16 + i) as f64 * (2 * k + 1) as f64).cos() as f32;
+        let e =
+            |i: usize, k: usize| (PI / 64.0 * (16 + i) as f64 * (2 * k + 1) as f64).cos() as f32;
         assert!((n[0][0] - e(0, 0)).abs() < 1e-6);
         assert!((n[33][7] - e(33, 7)).abs() < 1e-6);
         assert!((n[63][31] - e(63, 31)).abs() < 1e-6);
@@ -84,6 +85,9 @@ mod tests {
         let mut fifo = [0f32; 1024];
         let pcm = polyphase(&time, &mut fifo);
         assert!(pcm.iter().all(|v| v.is_finite()));
-        assert!(fifo.iter().any(|&v| v != 0.0), "matrixing must fill the FIFO");
+        assert!(
+            fifo.iter().any(|&v| v != 0.0),
+            "matrixing must fill the FIFO"
+        );
     }
 }

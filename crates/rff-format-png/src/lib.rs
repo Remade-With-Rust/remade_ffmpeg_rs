@@ -108,7 +108,9 @@ impl Muxer for PngMuxer {
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
         match streams.first() {
             Some(s) if s.codec_id == CodecId::Png => Ok(()),
-            Some(_) => Err(Error::unsupported("png mux: only the `png` codec is supported")),
+            Some(_) => Err(Error::unsupported(
+                "png mux: only the `png` codec is supported",
+            )),
             None => Err(Error::invalid("png mux: no streams")),
         }
     }
@@ -176,7 +178,8 @@ mod tests {
         {
             let mut mux = PngMuxer::new(Box::new(sink.clone()));
             mux.write_header(&[Stream::new(0, CodecId::Png)]).unwrap();
-            mux.write_packet(&Packet::from_data(0, png.clone())).unwrap();
+            mux.write_packet(&Packet::from_data(0, png.clone()))
+                .unwrap();
             mux.write_trailer().unwrap();
         }
         assert_eq!(*sink.0.lock().unwrap(), png);

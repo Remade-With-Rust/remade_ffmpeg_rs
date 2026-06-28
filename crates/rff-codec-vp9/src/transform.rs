@@ -105,8 +105,8 @@ pub fn idct16(input: &[i32; 16], output: &mut [i32; 16]) {
     let rs = round_shift;
     // stage 1 (reorder)
     let s1 = [
-        input[0], input[8], input[4], input[12], input[2], input[10], input[6], input[14], input[1],
-        input[9], input[5], input[13], input[3], input[11], input[7], input[15],
+        input[0], input[8], input[4], input[12], input[2], input[10], input[6], input[14],
+        input[1], input[9], input[5], input[13], input[3], input[11], input[7], input[15],
     ];
     // stage 2
     let mut s = [0i32; 16];
@@ -232,7 +232,16 @@ pub fn idct32(input: &[i32; 32], output: &mut [i32; 32]) {
     s2[13] = p(s1[10], s1[13], c(10), c(22));
     s2[11] = m(s1[11], s1[12], c(6), c(26));
     s2[12] = p(s1[11], s1[12], c(26), c(6));
-    for (a, sgn) in [(16, 1), (18, -1), (20, 1), (22, -1), (24, 1), (26, -1), (28, 1), (30, -1)] {
+    for (a, sgn) in [
+        (16, 1),
+        (18, -1),
+        (20, 1),
+        (22, -1),
+        (24, 1),
+        (26, -1),
+        (28, 1),
+        (30, -1),
+    ] {
         s2[a] = sgn * s1[a] + s1[a + 1];
         s2[a + 1] = s1[a] - sgn * s1[a + 1];
     }
@@ -423,8 +432,14 @@ pub fn iadst8(input: &[i32; 8], output: &mut [i32; 8]) {
     let c = |i: usize| COSPI[i];
     let rs = round_shift;
     let (x0, x1, x2, x3, x4, x5, x6, x7) = (
-        input[7] as i64, input[0] as i64, input[5] as i64, input[2] as i64,
-        input[3] as i64, input[4] as i64, input[1] as i64, input[6] as i64,
+        input[7] as i64,
+        input[0] as i64,
+        input[5] as i64,
+        input[2] as i64,
+        input[3] as i64,
+        input[4] as i64,
+        input[1] as i64,
+        input[6] as i64,
     );
     // stage 1
     let s0 = x0 * c(2) + x1 * c(30);
@@ -435,15 +450,30 @@ pub fn iadst8(input: &[i32; 8], output: &mut [i32; 8]) {
     let s5 = x4 * c(14) - x5 * c(18);
     let s6 = x6 * c(26) + x7 * c(6);
     let s7 = x6 * c(6) - x7 * c(26);
-    let (x0, x1, x2, x3) = (rs(s0 + s4) as i64, rs(s1 + s5) as i64, rs(s2 + s6) as i64, rs(s3 + s7) as i64);
-    let (x4, x5, x6, x7) = (rs(s0 - s4) as i64, rs(s1 - s5) as i64, rs(s2 - s6) as i64, rs(s3 - s7) as i64);
+    let (x0, x1, x2, x3) = (
+        rs(s0 + s4) as i64,
+        rs(s1 + s5) as i64,
+        rs(s2 + s6) as i64,
+        rs(s3 + s7) as i64,
+    );
+    let (x4, x5, x6, x7) = (
+        rs(s0 - s4) as i64,
+        rs(s1 - s5) as i64,
+        rs(s2 - s6) as i64,
+        rs(s3 - s7) as i64,
+    );
     // stage 2
     let s4 = x4 * c(8) + x5 * c(24);
     let s5 = x4 * c(24) - x5 * c(8);
     let s6 = -x6 * c(24) + x7 * c(8);
     let s7 = x6 * c(8) + x7 * c(24);
     let (x0, x1, x2, x3) = (x0 + x2, x1 + x3, x0 - x2, x1 - x3);
-    let (x4, x5, x6, x7) = (rs(s4 + s6) as i64, rs(s5 + s7) as i64, rs(s4 - s6) as i64, rs(s5 - s7) as i64);
+    let (x4, x5, x6, x7) = (
+        rs(s4 + s6) as i64,
+        rs(s5 + s7) as i64,
+        rs(s4 - s6) as i64,
+        rs(s5 - s7) as i64,
+    );
     // stage 3
     let x2r = rs((x2 + x3) * c(16)) as i64;
     let x3r = rs((x2 - x3) * c(16)) as i64;
@@ -469,14 +499,22 @@ pub fn iadst16(input: &[i32; 16], output: &mut [i32; 16]) {
         .collect();
     // stage 1
     let s = [
-        x[0] * c(1) + x[1] * c(31), x[0] * c(31) - x[1] * c(1),
-        x[2] * c(5) + x[3] * c(27), x[2] * c(27) - x[3] * c(5),
-        x[4] * c(9) + x[5] * c(23), x[4] * c(23) - x[5] * c(9),
-        x[6] * c(13) + x[7] * c(19), x[6] * c(19) - x[7] * c(13),
-        x[8] * c(17) + x[9] * c(15), x[8] * c(15) - x[9] * c(17),
-        x[10] * c(21) + x[11] * c(11), x[10] * c(11) - x[11] * c(21),
-        x[12] * c(25) + x[13] * c(7), x[12] * c(7) - x[13] * c(25),
-        x[14] * c(29) + x[15] * c(3), x[14] * c(3) - x[15] * c(29),
+        x[0] * c(1) + x[1] * c(31),
+        x[0] * c(31) - x[1] * c(1),
+        x[2] * c(5) + x[3] * c(27),
+        x[2] * c(27) - x[3] * c(5),
+        x[4] * c(9) + x[5] * c(23),
+        x[4] * c(23) - x[5] * c(9),
+        x[6] * c(13) + x[7] * c(19),
+        x[6] * c(19) - x[7] * c(13),
+        x[8] * c(17) + x[9] * c(15),
+        x[8] * c(15) - x[9] * c(17),
+        x[10] * c(21) + x[11] * c(11),
+        x[10] * c(11) - x[11] * c(21),
+        x[12] * c(25) + x[13] * c(7),
+        x[12] * c(7) - x[13] * c(25),
+        x[14] * c(29) + x[15] * c(3),
+        x[14] * c(3) - x[15] * c(29),
     ];
     let x: Vec<i64> = (0..16)
         .map(|i| {
@@ -497,10 +535,22 @@ pub fn iadst16(input: &[i32; 16], output: &mut [i32; 16]) {
     let s14 = -x[14] * c(12) + x[15] * c(20);
     let s15 = x[14] * c(20) + x[15] * c(12);
     let x = vec![
-        x[0] + x[4], x[1] + x[5], x[2] + x[6], x[3] + x[7],
-        x[0] - x[4], x[1] - x[5], x[2] - x[6], x[3] - x[7],
-        rs(s8 + s12) as i64, rs(s9 + s13) as i64, rs(s10 + s14) as i64, rs(s11 + s15) as i64,
-        rs(s8 - s12) as i64, rs(s9 - s13) as i64, rs(s10 - s14) as i64, rs(s11 - s15) as i64,
+        x[0] + x[4],
+        x[1] + x[5],
+        x[2] + x[6],
+        x[3] + x[7],
+        x[0] - x[4],
+        x[1] - x[5],
+        x[2] - x[6],
+        x[3] - x[7],
+        rs(s8 + s12) as i64,
+        rs(s9 + s13) as i64,
+        rs(s10 + s14) as i64,
+        rs(s11 + s15) as i64,
+        rs(s8 - s12) as i64,
+        rs(s9 - s13) as i64,
+        rs(s10 - s14) as i64,
+        rs(s11 - s15) as i64,
     ];
     // stage 3
     let s4 = x[4] * c(8) + x[5] * c(24);
@@ -512,10 +562,22 @@ pub fn iadst16(input: &[i32; 16], output: &mut [i32; 16]) {
     let s14 = -x[14] * c(24) + x[15] * c(8);
     let s15 = x[14] * c(8) + x[15] * c(24);
     let x = vec![
-        x[0] + x[2], x[1] + x[3], x[0] - x[2], x[1] - x[3],
-        rs(s4 + s6) as i64, rs(s5 + s7) as i64, rs(s4 - s6) as i64, rs(s5 - s7) as i64,
-        x[8] + x[10], x[9] + x[11], x[8] - x[10], x[9] - x[11],
-        rs(s12 + s14) as i64, rs(s13 + s15) as i64, rs(s12 - s14) as i64, rs(s13 - s15) as i64,
+        x[0] + x[2],
+        x[1] + x[3],
+        x[0] - x[2],
+        x[1] - x[3],
+        rs(s4 + s6) as i64,
+        rs(s5 + s7) as i64,
+        rs(s4 - s6) as i64,
+        rs(s5 - s7) as i64,
+        x[8] + x[10],
+        x[9] + x[11],
+        x[8] - x[10],
+        x[9] - x[11],
+        rs(s12 + s14) as i64,
+        rs(s13 + s15) as i64,
+        rs(s12 - s14) as i64,
+        rs(s13 - s15) as i64,
     ];
     // stage 4
     let x2 = rs(-c(16) * (x[2] + x[3])) as i64;
@@ -614,10 +676,22 @@ fn round_pow2(x: i32, n: u32) -> i32 {
 /// Apply the size-`n` inverse DCT to a row/column slice.
 fn idct_1d(input: &[i32], output: &mut [i32]) {
     match input.len() {
-        4 => idct4(input.try_into().unwrap(), (&mut output[..4]).try_into().unwrap()),
-        8 => idct8(input.try_into().unwrap(), (&mut output[..8]).try_into().unwrap()),
-        16 => idct16(input.try_into().unwrap(), (&mut output[..16]).try_into().unwrap()),
-        32 => idct32(input.try_into().unwrap(), (&mut output[..32]).try_into().unwrap()),
+        4 => idct4(
+            input.try_into().unwrap(),
+            (&mut output[..4]).try_into().unwrap(),
+        ),
+        8 => idct8(
+            input.try_into().unwrap(),
+            (&mut output[..8]).try_into().unwrap(),
+        ),
+        16 => idct16(
+            input.try_into().unwrap(),
+            (&mut output[..16]).try_into().unwrap(),
+        ),
+        32 => idct32(
+            input.try_into().unwrap(),
+            (&mut output[..32]).try_into().unwrap(),
+        ),
         _ => unreachable!(),
     }
 }
@@ -625,9 +699,18 @@ fn idct_1d(input: &[i32], output: &mut [i32]) {
 /// Apply the size-`n` inverse ADST to a row/column slice (n ∈ {4,8,16}).
 fn iadst_1d(input: &[i32], output: &mut [i32]) {
     match input.len() {
-        4 => iadst4(input.try_into().unwrap(), (&mut output[..4]).try_into().unwrap()),
-        8 => iadst8(input.try_into().unwrap(), (&mut output[..8]).try_into().unwrap()),
-        16 => iadst16(input.try_into().unwrap(), (&mut output[..16]).try_into().unwrap()),
+        4 => iadst4(
+            input.try_into().unwrap(),
+            (&mut output[..4]).try_into().unwrap(),
+        ),
+        8 => iadst8(
+            input.try_into().unwrap(),
+            (&mut output[..8]).try_into().unwrap(),
+        ),
+        16 => iadst16(
+            input.try_into().unwrap(),
+            (&mut output[..16]).try_into().unwrap(),
+        ),
         _ => unreachable!(),
     }
 }
@@ -831,7 +914,12 @@ mod tests {
             idct8(&x, &mut out);
             let r = float_idct(&x);
             for n in 0..8 {
-                assert!((out[n] as f64 - r[n]).abs() < 2.0, "k={k} n={n}: {} vs {:.2}", out[n], r[n]);
+                assert!(
+                    (out[n] as f64 - r[n]).abs() < 2.0,
+                    "k={k} n={n}: {} vs {:.2}",
+                    out[n],
+                    r[n]
+                );
             }
         }
     }
@@ -845,7 +933,12 @@ mod tests {
             idct16(&x, &mut out);
             let r = float_idct(&x);
             for n in 0..16 {
-                assert!((out[n] as f64 - r[n]).abs() < 3.0, "k={k} n={n}: {} vs {:.2}", out[n], r[n]);
+                assert!(
+                    (out[n] as f64 - r[n]).abs() < 3.0,
+                    "k={k} n={n}: {} vs {:.2}",
+                    out[n],
+                    r[n]
+                );
             }
         }
     }
@@ -859,7 +952,12 @@ mod tests {
             idct32(&x, &mut out);
             let r = float_idct(&x);
             for n in 0..32 {
-                assert!((out[n] as f64 - r[n]).abs() < 4.0, "k={k} n={n}: {} vs {:.2}", out[n], r[n]);
+                assert!(
+                    (out[n] as f64 - r[n]).abs() < 4.0,
+                    "k={k} n={n}: {} vs {:.2}",
+                    out[n],
+                    r[n]
+                );
             }
         }
     }
@@ -873,7 +971,8 @@ mod tests {
             .map(|m| {
                 (0..n)
                     .map(|k| {
-                        x[k] as f64 * (PI * ((2 * k + 1) * (m + 1)) as f64 / (2 * n + 1) as f64).sin()
+                        x[k] as f64
+                            * (PI * ((2 * k + 1) * (m + 1)) as f64 / (2 * n + 1) as f64).sin()
                     })
                     .sum()
             })
@@ -885,9 +984,18 @@ mod tests {
         let num: f64 = out.iter().zip(r).map(|(o, r)| *o as f64 * r).sum();
         let den: f64 = r.iter().map(|r| r * r).sum::<f64>() + 1e-9;
         let s = num / den;
-        let resid: f64 = out.iter().zip(r).map(|(o, r)| (*o as f64 - s * r).powi(2)).sum::<f64>().sqrt();
+        let resid: f64 = out
+            .iter()
+            .zip(r)
+            .map(|(o, r)| (*o as f64 - s * r).powi(2))
+            .sum::<f64>()
+            .sqrt();
         let norm: f64 = (out.iter().map(|o| (*o as f64).powi(2)).sum::<f64>()).sqrt() + 1e-9;
-        assert!(resid / norm < 0.02, "ADST residual {:.4} (scale {s:.3})", resid / norm);
+        assert!(
+            resid / norm < 0.02,
+            "ADST residual {:.4} (scale {s:.3})",
+            resid / norm
+        );
     }
 
     #[test]
@@ -901,7 +1009,11 @@ mod tests {
 
     fn energy_ratio(out: &[i32], inp: &[i32]) -> f64 {
         let eo: f64 = out.iter().map(|v| (*v as f64).powi(2)).sum();
-        let ei: f64 = inp.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().max(1.0);
+        let ei: f64 = inp
+            .iter()
+            .map(|v| (*v as f64).powi(2))
+            .sum::<f64>()
+            .max(1.0);
         eo / ei
     }
 
@@ -924,8 +1036,14 @@ mod tests {
             })
             .collect();
         let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
-        assert!((mean - gain).abs() < 0.05 * gain, "gain {mean:.3} vs {gain}");
-        assert!(ratios.iter().all(|r| (r - mean).abs() < 0.05 * mean), "not orthogonal: {ratios:?}");
+        assert!(
+            (mean - gain).abs() < 0.05 * gain,
+            "gain {mean:.3} vs {gain}"
+        );
+        assert!(
+            ratios.iter().all(|r| (r - mean).abs() < 0.05 * mean),
+            "not orthogonal: {ratios:?}"
+        );
     }
 
     #[test]

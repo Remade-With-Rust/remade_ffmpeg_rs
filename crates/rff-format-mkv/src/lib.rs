@@ -122,11 +122,13 @@ impl<'a> Ebml<'a> {
         let v = match len {
             4 => {
                 let b = self.d.get(self.pos..self.pos + 4);
-                b.map(|b| f32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64).unwrap_or(0.0)
+                b.map(|b| f32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64)
+                    .unwrap_or(0.0)
             }
             8 => {
                 let b = self.d.get(self.pos..self.pos + 8);
-                b.map(|b| f64::from_be_bytes(b.try_into().unwrap())).unwrap_or(0.0)
+                b.map(|b| f64::from_be_bytes(b.try_into().unwrap()))
+                    .unwrap_or(0.0)
             }
             _ => 0.0,
         };
@@ -169,8 +171,14 @@ impl MkvDemuxer {
         // EBML header, then the Segment.
         while top.remaining() > 0 {
             let Some(id) = top.read_id() else { break };
-            let Some((size, unknown)) = top.read_size() else { break };
-            let end = if unknown { data.len() } else { (top.pos + size as usize).min(data.len()) };
+            let Some((size, unknown)) = top.read_size() else {
+                break;
+            };
+            let end = if unknown {
+                data.len()
+            } else {
+                (top.pos + size as usize).min(data.len())
+            };
             if id == ID_SEGMENT {
                 self.parse_segment(data, top.pos, end);
                 break;
@@ -187,8 +195,14 @@ impl MkvDemuxer {
         let mut e = Ebml::at(data, start);
         while e.pos < end {
             let Some(id) = e.read_id() else { break };
-            let Some((size, unknown)) = e.read_size() else { break };
-            let child_end = if unknown { end } else { (e.pos + size as usize).min(end) };
+            let Some((size, unknown)) = e.read_size() else {
+                break;
+            };
+            let child_end = if unknown {
+                end
+            } else {
+                (e.pos + size as usize).min(end)
+            };
             match id {
                 ID_INFO => self.parse_info(data, e.pos, child_end),
                 ID_TRACKS => self.parse_tracks(data, e.pos, child_end),
@@ -205,7 +219,9 @@ impl MkvDemuxer {
         let mut e = Ebml::at(data, start);
         while e.pos < end {
             let Some(id) = e.read_id() else { break };
-            let Some((size, _)) = e.read_size() else { break };
+            let Some((size, _)) = e.read_size() else {
+                break;
+            };
             if id == ID_TIMESTAMP_SCALE {
                 self.timestamp_scale = e.read_uint(size as usize);
             } else {
@@ -218,7 +234,9 @@ impl MkvDemuxer {
         let mut e = Ebml::at(data, start);
         while e.pos < end {
             let Some(id) = e.read_id() else { break };
-            let Some((size, _)) = e.read_size() else { break };
+            let Some((size, _)) = e.read_size() else {
+                break;
+            };
             let entry_end = (e.pos + size as usize).min(end);
             if id == ID_TRACK_ENTRY {
                 self.parse_track_entry(data, e.pos, entry_end);
@@ -238,7 +256,9 @@ impl MkvDemuxer {
         let mut e = Ebml::at(data, start);
         while e.pos < end {
             let Some(id) = e.read_id() else { break };
-            let Some((size, _)) = e.read_size() else { break };
+            let Some((size, _)) = e.read_size() else {
+                break;
+            };
             let len = size as usize;
             match id {
                 ID_TRACK_NUMBER => number = e.read_uint(len),
@@ -301,7 +321,9 @@ impl MkvDemuxer {
         let mut e = Ebml::at(data, start);
         while e.pos < end {
             let Some(id) = e.read_id() else { break };
-            let Some((size, _)) = e.read_size() else { break };
+            let Some((size, _)) = e.read_size() else {
+                break;
+            };
             let len = size as usize;
             match id {
                 ID_TIMESTAMP => cluster_ts = e.read_uint(len) as i64,
@@ -333,7 +355,9 @@ impl MkvDemuxer {
     /// then the frame payload (no-lacing only for now).
     fn parse_block(&mut self, block: &[u8], cluster_ts: i64) {
         let mut b = Ebml::new(block);
-        let Some((track_num, _)) = b.read_size() else { return };
+        let Some((track_num, _)) = b.read_size() else {
+            return;
+        };
         if b.pos + 3 > block.len() {
             return;
         }

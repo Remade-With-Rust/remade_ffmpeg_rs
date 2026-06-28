@@ -28,8 +28,22 @@ pub const SAMPLE_RATE: [u32; 4] = [44100, 48000, 32000, 0];
 /// `scalefac_compress` → (slen1, slen2): bit-lengths of the two scalefactor
 /// groups for MPEG-1 long blocks.
 pub const SCALEFAC_COMPRESS_V1: [(u8, u8); 16] = [
-    (0, 0), (0, 1), (0, 2), (0, 3), (3, 0), (1, 1), (1, 2), (1, 3),
-    (2, 1), (2, 2), (2, 3), (3, 1), (3, 2), (3, 3), (4, 2), (4, 3),
+    (0, 0),
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (3, 0),
+    (1, 1),
+    (1, 2),
+    (1, 3),
+    (2, 1),
+    (2, 2),
+    (2, 3),
+    (3, 1),
+    (3, 2),
+    (3, 3),
+    (4, 2),
+    (4, 3),
 ];
 
 // ---- scalefactor-band boundary tables (to port) ------------------------------
@@ -39,11 +53,20 @@ pub const SCALEFAC_COMPRESS_V1: [(u8, u8); 16] = [
 /// MPEG-1. Drives requantization, region derivation, and stereo band maps.
 pub const SFB_OFFSET_LONG_V1: [[u16; 23]; 3] = [
     // 44100 Hz
-    [0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 52, 62, 74, 90, 110, 134, 162, 196, 238, 288, 342, 418, 576],
+    [
+        0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 52, 62, 74, 90, 110, 134, 162, 196, 238, 288, 342,
+        418, 576,
+    ],
     // 48000 Hz
-    [0, 4, 8, 12, 16, 20, 24, 30, 36, 42, 50, 60, 72, 88, 106, 128, 156, 190, 230, 276, 330, 384, 576],
+    [
+        0, 4, 8, 12, 16, 20, 24, 30, 36, 42, 50, 60, 72, 88, 106, 128, 156, 190, 230, 276, 330,
+        384, 576,
+    ],
     // 32000 Hz
-    [0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 54, 66, 82, 102, 126, 156, 194, 240, 296, 364, 448, 550, 576],
+    [
+        0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 54, 66, 82, 102, 126, 156, 194, 240, 296, 364, 448,
+        550, 576,
+    ],
 ];
 
 /// Short-block scalefactor-band boundaries: per-window line offsets (14 entries =
@@ -95,13 +118,23 @@ mod tests {
     fn sfb_offsets_monotonic_and_complete() {
         for row in &SFB_OFFSET_LONG_V1 {
             assert_eq!(row[0], 0);
-            assert_eq!(*row.last().unwrap(), 576, "long bands must cover all 576 lines");
-            assert!(row.windows(2).all(|w| w[0] < w[1]), "long sfb strictly increasing");
+            assert_eq!(
+                *row.last().unwrap(),
+                576,
+                "long bands must cover all 576 lines"
+            );
+            assert!(
+                row.windows(2).all(|w| w[0] < w[1]),
+                "long sfb strictly increasing"
+            );
         }
         for row in &SFB_OFFSET_SHORT_V1 {
             assert_eq!(row[0], 0);
             assert_eq!(*row.last().unwrap(), 192, "short window spans 576/3 lines");
-            assert!(row.windows(2).all(|w| w[0] < w[1]), "short sfb strictly increasing");
+            assert!(
+                row.windows(2).all(|w| w[0] < w[1]),
+                "short sfb strictly increasing"
+            );
         }
     }
 }

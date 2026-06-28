@@ -14,9 +14,7 @@
 use std::collections::VecDeque;
 
 use rav1d::{Decoder as Rav1dDec, PixelLayout, PlanarImageComponent, Rav1dError};
-use rav1e::prelude::{
-    ChromaSampling, Config, Context, EncoderConfig, EncoderStatus, FrameType,
-};
+use rav1e::prelude::{ChromaSampling, Config, Context, EncoderConfig, EncoderStatus, FrameType};
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
 use rff_core::{Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
 
@@ -48,7 +46,10 @@ fn parse_bitrate(b: Option<&str>) -> Option<i32> {
         Some('m') | Some('M') => (&b[..b.len() - 1], 1_000_000),
         _ => (b, 1),
     };
-    num.trim().parse::<f64>().ok().map(|v| (v * mul as f64) as i32)
+    num.trim()
+        .parse::<f64>()
+        .ok()
+        .map(|v| (v * mul as f64) as i32)
 }
 
 /// Register the AVIF codec into a [`CodecRegistry`].
@@ -194,7 +195,9 @@ impl Encoder for AvifEncoder {
         let vf = match frame {
             Frame::Video(v) => v,
             Frame::Audio(_) => {
-                return Err(Error::unsupported("avif encode: audio frame on a video codec"))
+                return Err(Error::unsupported(
+                    "avif encode: audio frame on a video codec",
+                ))
             }
         };
 
@@ -239,9 +242,7 @@ impl Encoder for AvifEncoder {
             Ok(()) => {}
             // Buffer is full; draining below will make room.
             Err(EncoderStatus::EnoughData) => {}
-            Err(e) => {
-                return Err(Error::InvalidData(format!("rav1e send_frame: {e:?}")))
-            }
+            Err(e) => return Err(Error::InvalidData(format!("rav1e send_frame: {e:?}"))),
         }
         self.pump()
     }
@@ -325,7 +326,12 @@ impl Decoder for AvifDecoder {
         let pts = packet.pts;
         let duration = Some(packet.duration);
 
-        match self.dec.as_mut().unwrap().send_data(buf, None, pts, duration) {
+        match self
+            .dec
+            .as_mut()
+            .unwrap()
+            .send_data(buf, None, pts, duration)
+        {
             Ok(()) => {}
             // The decoder couldn't take all the data yet: pull pictures out to
             // make room, then push the remaining pending bytes through.
@@ -381,7 +387,9 @@ fn picture_to_frame(pic: &rav1d::Picture) -> Result<Frame> {
         (PixelLayout::I422, 10) => PixelFormat::Yuv422p10,
         (PixelLayout::I444, 10) => PixelFormat::Yuv444p10,
         (PixelLayout::I400, _) => {
-            return Err(Error::unsupported("avif decode: monochrome (I400) not yet mapped"))
+            return Err(Error::unsupported(
+                "avif decode: monochrome (I400) not yet mapped",
+            ))
         }
         (_, depth) => {
             return Err(Error::unsupported(format!(
@@ -490,7 +498,9 @@ mod tests {
 
         // AV1 is lossy, so compare the luma plane with tolerance. The encoded
         // gradient should come back close to the original.
-        let Frame::Video(src) = &original else { unreachable!() };
+        let Frame::Video(src) = &original else {
+            unreachable!()
+        };
         let (w, h) = (src.width as usize, src.height as usize);
         let mut total_diff = 0u64;
         for row in 0..h {
@@ -545,7 +555,9 @@ mod tests {
 
         // Compare luma as little-endian u16 samples, with a 10-bit-scaled
         // tolerance (~4× the 8-bit bound).
-        let Frame::Video(src) = &original else { unreachable!() };
+        let Frame::Video(src) = &original else {
+            unreachable!()
+        };
         let (w, h) = (src.width as usize, src.height as usize);
         let mut total_diff = 0u64;
         for row in 0..h {

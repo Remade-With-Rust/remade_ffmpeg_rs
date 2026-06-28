@@ -31,18 +31,78 @@ pub struct Codebook {
 
 /// Codebook properties indexed by codebook number 0..=11 (0 = ZERO_HCB).
 pub const CODEBOOKS: [Codebook; 12] = [
-    Codebook { dim: 0, unsigned: false, lav: 0, esc: false }, // 0 ZERO
-    Codebook { dim: 4, unsigned: false, lav: 1, esc: false }, // 1
-    Codebook { dim: 4, unsigned: false, lav: 1, esc: false }, // 2
-    Codebook { dim: 4, unsigned: true, lav: 2, esc: false },  // 3
-    Codebook { dim: 4, unsigned: true, lav: 2, esc: false },  // 4
-    Codebook { dim: 2, unsigned: false, lav: 4, esc: false }, // 5
-    Codebook { dim: 2, unsigned: false, lav: 4, esc: false }, // 6
-    Codebook { dim: 2, unsigned: true, lav: 7, esc: false },  // 7
-    Codebook { dim: 2, unsigned: true, lav: 7, esc: false },  // 8
-    Codebook { dim: 2, unsigned: true, lav: 12, esc: false }, // 9
-    Codebook { dim: 2, unsigned: true, lav: 12, esc: false }, // 10
-    Codebook { dim: 2, unsigned: true, lav: 16, esc: true },  // 11
+    Codebook {
+        dim: 0,
+        unsigned: false,
+        lav: 0,
+        esc: false,
+    }, // 0 ZERO
+    Codebook {
+        dim: 4,
+        unsigned: false,
+        lav: 1,
+        esc: false,
+    }, // 1
+    Codebook {
+        dim: 4,
+        unsigned: false,
+        lav: 1,
+        esc: false,
+    }, // 2
+    Codebook {
+        dim: 4,
+        unsigned: true,
+        lav: 2,
+        esc: false,
+    }, // 3
+    Codebook {
+        dim: 4,
+        unsigned: true,
+        lav: 2,
+        esc: false,
+    }, // 4
+    Codebook {
+        dim: 2,
+        unsigned: false,
+        lav: 4,
+        esc: false,
+    }, // 5
+    Codebook {
+        dim: 2,
+        unsigned: false,
+        lav: 4,
+        esc: false,
+    }, // 6
+    Codebook {
+        dim: 2,
+        unsigned: true,
+        lav: 7,
+        esc: false,
+    }, // 7
+    Codebook {
+        dim: 2,
+        unsigned: true,
+        lav: 7,
+        esc: false,
+    }, // 8
+    Codebook {
+        dim: 2,
+        unsigned: true,
+        lav: 12,
+        esc: false,
+    }, // 9
+    Codebook {
+        dim: 2,
+        unsigned: true,
+        lav: 12,
+        esc: false,
+    }, // 10
+    Codebook {
+        dim: 2,
+        unsigned: true,
+        lav: 16,
+        esc: true,
+    }, // 11
 ];
 
 /// First codebook number for intensity stereo (14, 15) and the special markers.

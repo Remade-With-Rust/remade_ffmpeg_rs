@@ -93,7 +93,9 @@ impl Muxer for WebpMuxer {
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
         match streams.first() {
             Some(s) if s.codec_id == CodecId::Webp => Ok(()),
-            Some(_) => Err(Error::unsupported("webp mux: only the `webp` codec is supported")),
+            Some(_) => Err(Error::unsupported(
+                "webp mux: only the `webp` codec is supported",
+            )),
             None => Err(Error::invalid("webp mux: no streams")),
         }
     }

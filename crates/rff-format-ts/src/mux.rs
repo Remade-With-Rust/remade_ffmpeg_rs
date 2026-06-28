@@ -118,10 +118,17 @@ impl Muxer for TsMuxer {
         for (slot, s) in streams.iter().enumerate() {
             let pid = 0x0100 + s.index as u16;
             self.by_index.insert(s.index, slot);
-            if s.media_type == MediaType::Video && self.streams.iter().all(|o| o.media != MediaType::Video) {
+            if s.media_type == MediaType::Video
+                && self.streams.iter().all(|o| o.media != MediaType::Video)
+            {
                 self.pcr_pid = pid;
             }
-            self.streams.push(OutStream { pid, codec: s.codec_id, media: s.media_type, cc: 0 });
+            self.streams.push(OutStream {
+                pid,
+                codec: s.codec_id,
+                media: s.media_type,
+                cc: 0,
+            });
         }
         if self.streams.is_empty() {
             return Err(rff_core::Error::invalid("mpegts: no streams to mux"));
@@ -148,7 +155,11 @@ impl Muxer for TsMuxer {
         let dts = packet.dts.unwrap_or(pts);
 
         // --- build the PES ---
-        let stream_id = if media == MediaType::Video { 0xE0 } else { 0xC0 };
+        let stream_id = if media == MediaType::Video {
+            0xE0
+        } else {
+            0xC0
+        };
         let has_dts = packet.dts.is_some() && packet.dts != packet.pts;
         let mut pes = vec![0x00, 0x00, 0x01, stream_id];
         let mut hdr = Vec::new();
@@ -163,7 +174,11 @@ impl Muxer for TsMuxer {
         }
         // PES_packet_length: 0 (unbounded) for video, else the actual length.
         let pes_len = hdr.len() + packet.data.len();
-        let len_field = if media == MediaType::Video { 0 } else { pes_len.min(0xFFFF) };
+        let len_field = if media == MediaType::Video {
+            0
+        } else {
+            pes_len.min(0xFFFF)
+        };
         pes.push((len_field >> 8) as u8);
         pes.push((len_field & 0xFF) as u8);
         pes.extend_from_slice(&hdr);
@@ -183,7 +198,11 @@ impl Muxer for TsMuxer {
 
             // Adaptation field if we need PCR (first pkt of PCR PID) or stuffing.
             let want_pcr = first && is_pcr;
-            let max_payload = if want_pcr { TS_PACKET - 4 - 8 } else { TS_PACKET - 4 };
+            let max_payload = if want_pcr {
+                TS_PACKET - 4 - 8
+            } else {
+                TS_PACKET - 4
+            };
             let take = payload.len().min(max_payload);
             let need_stuffing = take < TS_PACKET - 4 || want_pcr;
 

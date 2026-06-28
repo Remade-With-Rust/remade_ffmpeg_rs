@@ -161,7 +161,9 @@ impl Encoder for H264Encoder {
         let vf = match frame {
             Frame::Video(v) => v,
             Frame::Audio(_) => {
-                return Err(Error::unsupported("h264 encode: audio frame on a video codec"))
+                return Err(Error::unsupported(
+                    "h264 encode: audio frame on a video codec",
+                ))
             }
         };
         if vf.format != PixelFormat::Yuv420p {

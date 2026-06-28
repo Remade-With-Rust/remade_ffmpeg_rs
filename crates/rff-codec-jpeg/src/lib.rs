@@ -102,7 +102,9 @@ impl RffEncoder for JpegEncoder {
         let vf = match frame {
             Frame::Video(v) => v,
             Frame::Audio(_) => {
-                return Err(Error::unsupported("jpeg encode: audio frame on an image codec"))
+                return Err(Error::unsupported(
+                    "jpeg encode: audio frame on an image codec",
+                ))
             }
         };
         self.packet = Some(Packet::from_data(0, encode_jpeg(vf)?));

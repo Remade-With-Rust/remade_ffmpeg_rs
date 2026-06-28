@@ -55,12 +55,18 @@ fn wav_44100_resamples_to_opus_48000() {
     write_wav_44100(&engine, &wav);
 
     let spec = TranscodeSpec {
-        inputs: vec![InputSpec { path: wav.clone(), format: None }],
+        inputs: vec![InputSpec {
+            path: wav.clone(),
+            format: None,
+        }],
         outputs: vec![OutputSpec {
             path: mp4.clone(),
             format: None,
             video_codec: None,
-            audio_codec: Some(StreamCodec { codec: CodecId::Opus, options: Dictionary::new() }),
+            audio_codec: Some(StreamCodec {
+                codec: CodecId::Opus,
+                options: Dictionary::new(),
+            }),
             video_filters: None,
             filter_complex: None,
             maps: Vec::new(),
@@ -72,9 +78,16 @@ fn wav_44100_resamples_to_opus_48000() {
 
     // The Opus track was resampled 44100 → 48000 (nearest accepted rate).
     let info = rff::probe::probe(&engine, &mp4).unwrap();
-    let a = info.streams.iter().find(|s| s.media_type == MediaType::Audio).unwrap();
+    let a = info
+        .streams
+        .iter()
+        .find(|s| s.media_type == MediaType::Audio)
+        .unwrap();
     assert_eq!(a.codec_id, CodecId::Opus);
-    assert_eq!(a.sample_rate, 48_000, "input 44.1 kHz should resample to 48 kHz");
+    assert_eq!(
+        a.sample_rate, 48_000,
+        "input 44.1 kHz should resample to 48 kHz"
+    );
     assert_eq!(a.time_base, Rational::new(1, 48_000));
 
     // PTS advance by a 20 ms Opus frame at 48 kHz = 960 samples.

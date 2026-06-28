@@ -39,7 +39,11 @@ pub struct VttDemuxer {
 
 impl VttDemuxer {
     pub fn new(input: Input) -> VttDemuxer {
-        VttDemuxer { input, cues: Default::default(), parsed: false }
+        VttDemuxer {
+            input,
+            cues: Default::default(),
+            parsed: false,
+        }
     }
 }
 
@@ -79,7 +83,10 @@ pub struct VttMuxer {
 
 impl VttMuxer {
     pub fn new(out: Output) -> VttMuxer {
-        VttMuxer { out, wrote_header: false }
+        VttMuxer {
+            out,
+            wrote_header: false,
+        }
     }
 }
 

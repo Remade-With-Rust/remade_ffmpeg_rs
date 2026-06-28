@@ -85,6 +85,8 @@ mod tests {
     #[test]
     fn decode_rejects_non_flac() {
         let mut dec = FlacDecoder::default();
-        assert!(dec.send_packet(&Packet::from_data(0, b"not flac".to_vec())).is_err());
+        assert!(dec
+            .send_packet(&Packet::from_data(0, b"not flac".to_vec()))
+            .is_err());
     }
 }

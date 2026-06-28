@@ -104,7 +104,9 @@ impl Muxer for JxlMuxer {
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
         match streams.first() {
             Some(s) if s.codec_id == CodecId::Jxl => Ok(()),
-            Some(_) => Err(Error::unsupported("jxl mux: only the `jpegxl` codec is supported")),
+            Some(_) => Err(Error::unsupported(
+                "jxl mux: only the `jpegxl` codec is supported",
+            )),
             None => Err(Error::invalid("jxl mux: no streams")),
         }
     }

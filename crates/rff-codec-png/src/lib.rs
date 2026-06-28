@@ -121,7 +121,9 @@ impl Encoder for PngEncoder {
         let vf = match frame {
             Frame::Video(v) => v,
             Frame::Audio(_) => {
-                return Err(Error::unsupported("png encode: audio frame on an image codec"))
+                return Err(Error::unsupported(
+                    "png encode: audio frame on an image codec",
+                ))
             }
         };
         self.packet = Some(Packet::from_data(0, encode_png(vf)?));
@@ -213,7 +215,9 @@ mod tests {
     #[test]
     fn png_encode_decode_is_lossless() {
         let original = rgb_frame(40, 24);
-        let Frame::Video(src) = &original else { unreachable!() };
+        let Frame::Video(src) = &original else {
+            unreachable!()
+        };
 
         let bytes = encode_png(src).unwrap();
         assert_eq!(&bytes[1..4], b"PNG"); // PNG signature

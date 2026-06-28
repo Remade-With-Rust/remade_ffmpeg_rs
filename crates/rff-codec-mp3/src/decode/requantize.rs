@@ -21,7 +21,9 @@ fn pow43(n: i32) -> f64 {
     static T: OnceLock<Vec<f64>> = OnceLock::new();
     let t = T.get_or_init(|| (0..8207).map(|i| (i as f64).powf(4.0 / 3.0)).collect());
     let a = n.unsigned_abs() as usize;
-    t.get(a).copied().unwrap_or_else(|| (a as f64).powf(4.0 / 3.0))
+    t.get(a)
+        .copied()
+        .unwrap_or_else(|| (a as f64).powf(4.0 / 3.0))
 }
 
 fn dequant(c: i32, scale: f64) -> f32 {
@@ -107,7 +109,10 @@ mod tests {
     fn long_block_power_law_and_sign() {
         // global_gain 210 → gain 0, scalefac 0, no preflag → scale = 2^0 = 1, so
         // xr = sign(is)·|is|^(4/3).
-        let gi = GranuleSideInfo { global_gain: 210, ..Default::default() };
+        let gi = GranuleSideInfo {
+            global_gain: 210,
+            ..Default::default()
+        };
         let sf = ScaleFactors::default();
         let mut coeffs = [0i32; GRANULE_LINES];
         coeffs[0] = 3;
@@ -123,7 +128,10 @@ mod tests {
     #[test]
     fn scalefactor_halves_the_step() {
         // scalefac 2 on band 0, scalefac_scale 0 (×0.5) → B = 0.5·2 = 1 → ÷2.
-        let gi = GranuleSideInfo { global_gain: 210, ..Default::default() };
+        let gi = GranuleSideInfo {
+            global_gain: 210,
+            ..Default::default()
+        };
         let mut sf = ScaleFactors::default();
         sf.long[0] = 2;
         let mut coeffs = [0i32; GRANULE_LINES];

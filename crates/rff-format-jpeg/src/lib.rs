@@ -129,7 +129,9 @@ impl Muxer for JpegMuxer {
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
         match streams.first() {
             Some(s) if s.codec_id == CodecId::Jpeg => Ok(()),
-            Some(_) => Err(Error::unsupported("jpeg mux: only the `mjpeg` codec is supported")),
+            Some(_) => Err(Error::unsupported(
+                "jpeg mux: only the `mjpeg` codec is supported",
+            )),
             None => Err(Error::invalid("jpeg mux: no streams")),
         }
     }
@@ -153,7 +155,7 @@ mod tests {
     /// A minimal baseline-JPEG header: SOI + a SOF0 declaring 5×7.
     fn jpeg_header_5x7() -> Vec<u8> {
         let mut v = vec![0xFF, 0xD8]; // SOI
-        // SOF0: marker, len=17, precision=8, height=7, width=5, 3 components...
+                                      // SOF0: marker, len=17, precision=8, height=7, width=5, 3 components...
         v.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08]);
         v.extend_from_slice(&7u16.to_be_bytes());
         v.extend_from_slice(&5u16.to_be_bytes());

@@ -201,7 +201,9 @@ impl Encoder for OpusEnc {
         let af = match frame {
             Frame::Audio(a) => a,
             Frame::Video(_) => {
-                return Err(Error::unsupported("opus encode: video frame on an audio codec"))
+                return Err(Error::unsupported(
+                    "opus encode: video frame on an audio codec",
+                ))
             }
         };
         if self.enc.is_none() {
@@ -209,7 +211,9 @@ impl Encoder for OpusEnc {
             // Seed output PTS from the first frame's timestamp (per-channel samples).
             self.next_pts = af.pts.unwrap_or(0);
         } else if af.sample_rate != self.sample_rate || af.channels != self.channels {
-            return Err(Error::unsupported("opus encode: stream layout changed mid-stream"));
+            return Err(Error::unsupported(
+                "opus encode: stream layout changed mid-stream",
+            ));
         }
         self.buffer.extend(frame_to_f32(af)?);
         self.drain_frames()
@@ -232,7 +236,8 @@ impl Encoder for OpusEnc {
             let frame_samples = self.frame_size * self.channels as usize;
             let rem = self.buffer.len() % frame_samples;
             if rem != 0 {
-                self.buffer.extend(std::iter::repeat(0.0).take(frame_samples - rem));
+                self.buffer
+                    .extend(std::iter::repeat(0.0).take(frame_samples - rem));
             }
             let _ = self.drain_frames();
         }
@@ -279,7 +284,11 @@ mod tests {
                 Err(e) => panic!("encode: {e}"),
             }
         }
-        assert!(packets.len() >= 8, "expected ~10 frames, got {}", packets.len());
+        assert!(
+            packets.len() >= 8,
+            "expected ~10 frames, got {}",
+            packets.len()
+        );
 
         let mut dec = OpusDec::default();
         dec.configure(&CodecParams {

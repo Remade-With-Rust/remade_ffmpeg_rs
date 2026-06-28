@@ -47,7 +47,12 @@ pub(crate) struct NmvCounts {
 }
 
 /// Decode one MV component difference (`read_mv_component`), counting symbols.
-fn read_mv_component(b: &mut BoolDecoder, c: &NmvComp, usehp: bool, cnt: &mut NmvCompCounts) -> i32 {
+fn read_mv_component(
+    b: &mut BoolDecoder,
+    c: &NmvComp,
+    usehp: bool,
+    cnt: &mut NmvCompCounts,
+) -> i32 {
     let sign = b.read_bool(c.sign) != 0;
     cnt.sign[sign as usize] += 1;
     let mv_class = read_tree(b, &MV_CLASS_TREE, &c.classes); // 0..=10
@@ -103,7 +108,13 @@ fn read_mv_component(b: &mut BoolDecoder, c: &NmvComp, usehp: bool, cnt: &mut Nm
 
 /// Decode an MV: joint type, then the present components, added to `ref_mv`.
 /// MVs are in 1/8-pel units. Returns `(row, col)`. Accumulates entropy counts.
-pub fn read_mv(b: &mut BoolDecoder, ref_mv: (i32, i32), ctx: &NmvContext, allow_hp: bool, cnt: &mut NmvCounts) -> (i32, i32) {
+pub fn read_mv(
+    b: &mut BoolDecoder,
+    ref_mv: (i32, i32),
+    ctx: &NmvContext,
+    allow_hp: bool,
+    cnt: &mut NmvCounts,
+) -> (i32, i32) {
     let joint = read_tree(b, &MV_JOINT_TREE, &ctx.joints); // 0..=3
     cnt.joints[joint as usize] += 1;
     let use_hp = allow_hp && use_mv_hp(ref_mv);
@@ -135,36 +146,151 @@ pub(crate) struct MvRef {
 /// pattern per block size (libvpx `vp9_mvref_common.h`).
 const MV_REF_BLOCKS: [[(i32, i32); 8]; 13] = [
     // 4X4 / 4X8 / 8X4 / 8X8 share the same pattern.
-    [(-1, 0), (0, -1), (-1, -1), (-2, 0), (0, -2), (-2, -1), (-1, -2), (-2, -2)],
-    [(-1, 0), (0, -1), (-1, -1), (-2, 0), (0, -2), (-2, -1), (-1, -2), (-2, -2)],
-    [(-1, 0), (0, -1), (-1, -1), (-2, 0), (0, -2), (-2, -1), (-1, -2), (-2, -2)],
-    [(-1, 0), (0, -1), (-1, -1), (-2, 0), (0, -2), (-2, -1), (-1, -2), (-2, -2)],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-2, -1),
+        (-1, -2),
+        (-2, -2),
+    ],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-2, -1),
+        (-1, -2),
+        (-2, -2),
+    ],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-2, -1),
+        (-1, -2),
+        (-2, -2),
+    ],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-2, -1),
+        (-1, -2),
+        (-2, -2),
+    ],
     // 8X16
-    [(0, -1), (-1, 0), (1, -1), (-1, -1), (0, -2), (-2, 0), (-2, -1), (-1, -2)],
+    [
+        (0, -1),
+        (-1, 0),
+        (1, -1),
+        (-1, -1),
+        (0, -2),
+        (-2, 0),
+        (-2, -1),
+        (-1, -2),
+    ],
     // 16X8
-    [(-1, 0), (0, -1), (-1, 1), (-1, -1), (-2, 0), (0, -2), (-1, -2), (-2, -1)],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, 1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-1, -2),
+        (-2, -1),
+    ],
     // 16X16
-    [(-1, 0), (0, -1), (-1, 1), (1, -1), (-1, -1), (-3, 0), (0, -3), (-3, -3)],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, 1),
+        (1, -1),
+        (-1, -1),
+        (-3, 0),
+        (0, -3),
+        (-3, -3),
+    ],
     // 16X32
-    [(0, -1), (-1, 0), (2, -1), (-1, -1), (-1, 1), (0, -3), (-3, 0), (-3, -3)],
+    [
+        (0, -1),
+        (-1, 0),
+        (2, -1),
+        (-1, -1),
+        (-1, 1),
+        (0, -3),
+        (-3, 0),
+        (-3, -3),
+    ],
     // 32X16
-    [(-1, 0), (0, -1), (-1, 2), (-1, -1), (1, -1), (-3, 0), (0, -3), (-3, -3)],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, 2),
+        (-1, -1),
+        (1, -1),
+        (-3, 0),
+        (0, -3),
+        (-3, -3),
+    ],
     // 32X32
-    [(-1, 1), (1, -1), (-1, 2), (2, -1), (-1, -1), (-3, 0), (0, -3), (-3, -3)],
+    [
+        (-1, 1),
+        (1, -1),
+        (-1, 2),
+        (2, -1),
+        (-1, -1),
+        (-3, 0),
+        (0, -3),
+        (-3, -3),
+    ],
     // 32X64
-    [(0, -1), (-1, 0), (4, -1), (-1, 2), (-1, -1), (0, -3), (-3, 0), (2, -1)],
+    [
+        (0, -1),
+        (-1, 0),
+        (4, -1),
+        (-1, 2),
+        (-1, -1),
+        (0, -3),
+        (-3, 0),
+        (2, -1),
+    ],
     // 64X32
-    [(-1, 0), (0, -1), (-1, 4), (2, -1), (-1, -1), (-3, 0), (0, -3), (-1, 2)],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, 4),
+        (2, -1),
+        (-1, -1),
+        (-3, 0),
+        (0, -3),
+        (-1, 2),
+    ],
     // 64X64
-    [(-1, 3), (3, -1), (-1, 4), (4, -1), (-1, -1), (-1, 0), (0, -1), (-1, 6)],
+    [
+        (-1, 3),
+        (3, -1),
+        (-1, 4),
+        (4, -1),
+        (-1, -1),
+        (-1, 0),
+        (0, -1),
+        (-1, 6),
+    ],
 ];
 
 const IDX_N_COLUMN_TO_SUBBLOCK: [[usize; 2]; 4] = [[1, 2], [1, 3], [3, 2], [3, 3]];
 
 const MODE_2_COUNTER: [i32; 14] = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 3, 1];
-const COUNTER_TO_CONTEXT: [u8; 19] = [
-    2, 3, 4, 1, 3, 9, 0, 9, 9, 5, 5, 9, 5, 9, 9, 9, 9, 9, 6,
-];
+const COUNTER_TO_CONTEXT: [u8; 19] = [2, 3, 4, 1, 3, 9, 0, 9, 9, 5, 5, 9, 5, 9, 9, 9, 9, 9, 6];
 
 const MV_BORDER: i32 = 16 << 3; // 1/8-pel border for ref-MV clamping
 
@@ -172,7 +298,14 @@ const MV_BORDER: i32 = 16 << 3; // 1/8-pel border for ref-MV clamping
 pub type Edges = (i32, i32, i32, i32);
 
 #[inline]
-fn is_inside(mi_col: usize, mi_row: usize, col_start: usize, col_end: usize, mi_rows: usize, p: (i32, i32)) -> bool {
+fn is_inside(
+    mi_col: usize,
+    mi_row: usize,
+    col_start: usize,
+    col_end: usize,
+    mi_rows: usize,
+    p: (i32, i32),
+) -> bool {
     let r = mi_row as i32 + p.0;
     let c = mi_col as i32 + p.1;
     // Neighbours must stay within the frame rows and the current tile's columns.
@@ -325,14 +458,22 @@ pub fn find_mv_refs(
                     let cand = &mi[cand_at(p)];
                     if cand.is_inter_block() {
                         if cand.ref_frame[0] != ref_frame
-                            && add(scale_mv(cand, 0, ref_frame, sign_bias), &mut list, &mut count)
+                            && add(
+                                scale_mv(cand, 0, ref_frame, sign_bias),
+                                &mut list,
+                                &mut count,
+                            )
                         {
                             break 'scan;
                         }
                         if cand.has_second_ref()
                             && cand.ref_frame[1] != ref_frame
                             && cand.mv[1] != cand.mv[0]
-                            && add(scale_mv(cand, 1, ref_frame, sign_bias), &mut list, &mut count)
+                            && add(
+                                scale_mv(cand, 1, ref_frame, sign_bias),
+                                &mut list,
+                                &mut count,
+                            )
                         {
                             break 'scan;
                         }
@@ -403,9 +544,24 @@ mod tests {
         // Drive the decoder over arbitrary bytes; every decode must terminate
         // and land a valid joint/class and an in-range component.
         for seed in 0..32u8 {
-            let bytes = [seed, seed ^ 0x5a, 0x13, 0xC4, 0x77, seed.wrapping_mul(3), 0x01, 0xFE];
+            let bytes = [
+                seed,
+                seed ^ 0x5a,
+                0x13,
+                0xC4,
+                0x77,
+                seed.wrapping_mul(3),
+                0x01,
+                0xFE,
+            ];
             let mut b = BoolDecoder::new(&bytes).unwrap();
-            let mv = read_mv(&mut b, (4, -8), &DEFAULT_NMV_CONTEXT, true, &mut NmvCounts::default());
+            let mv = read_mv(
+                &mut b,
+                (4, -8),
+                &DEFAULT_NMV_CONTEXT,
+                true,
+                &mut NmvCounts::default(),
+            );
             // Component magnitudes are bounded; just assert the call returns.
             let _ = mv;
         }
@@ -418,7 +574,13 @@ mod tests {
         // common path; a 0x00-leading buffer decodes bit 0 first -> ZERO.
         let bytes = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let mut b = BoolDecoder::new(&bytes).unwrap();
-        let mv = read_mv(&mut b, (10, 20), &DEFAULT_NMV_CONTEXT, false, &mut NmvCounts::default());
+        let mv = read_mv(
+            &mut b,
+            (10, 20),
+            &DEFAULT_NMV_CONTEXT,
+            false,
+            &mut NmvCounts::default(),
+        );
         assert_eq!(mv, (10, 20));
     }
 }

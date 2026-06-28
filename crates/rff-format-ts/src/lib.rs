@@ -36,7 +36,9 @@ fn probe_ts(d: &[u8]) -> i32 {
     if d.len() < TS_PACKET * 2 + 1 {
         return if !d.is_empty() && d[0] == SYNC { 1 } else { 0 };
     }
-    let hits = (0..3).filter(|i| d.get(i * TS_PACKET) == Some(&SYNC)).count();
+    let hits = (0..3)
+        .filter(|i| d.get(i * TS_PACKET) == Some(&SYNC))
+        .count();
     match hits {
         3 => 90,
         2 => 50,
@@ -203,7 +205,10 @@ impl TsDemuxer {
             if let Some(done) = self.partial.remove(&pid) {
                 self.emit(pid, done);
             }
-            let mut pes = Pes { keyframe: rai, ..Default::default() };
+            let mut pes = Pes {
+                keyframe: rai,
+                ..Default::default()
+            };
             self.start_pes(&mut pes, payload);
             self.partial.insert(pid, pes);
         } else if let Some(pes) = self.partial.get_mut(&pid) {

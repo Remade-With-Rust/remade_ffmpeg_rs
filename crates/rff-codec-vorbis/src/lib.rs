@@ -93,9 +93,8 @@ impl Decoder for VorbisDecoder {
             .as_mut()
             .ok_or_else(|| Error::invalid("vorbis decode: not configured"))?;
 
-        let pcm: Vec<Vec<i16>> =
-            read_audio_packet(&st.ident, &st.setup, &packet.data, &mut st.pwr)
-                .map_err(|e| Error::invalid(format!("vorbis decode: {e:?}")))?;
+        let pcm: Vec<Vec<i16>> = read_audio_packet(&st.ident, &st.setup, &packet.data, &mut st.pwr)
+            .map_err(|e| Error::invalid(format!("vorbis decode: {e:?}")))?;
         if pcm.is_empty() || pcm[0].is_empty() {
             return Ok(()); // some packets carry no output samples
         }

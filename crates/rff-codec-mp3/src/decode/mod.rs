@@ -71,9 +71,7 @@ impl Mp3Decode {
         let si: SideInfo = sideinfo::parse(header, side_info_bytes)?;
 
         // 2. Reassemble main data across the reservoir boundary.
-        let main = self
-            .reservoir
-            .assemble(si.main_data_begin, frame_main_data);
+        let main = self.reservoir.assemble(si.main_data_begin, frame_main_data);
 
         // 3..6. Per granule / channel: Huffman → scalefactors → requantize.
         let mut pcm = Vec::with_capacity(granules * GRANULE_LINES * channels);
@@ -87,8 +85,13 @@ impl Mp3Decode {
                 let gi = &si.granules[gr][ch];
                 // part2 (scalefactors) + part3 (Huffman) share one bit budget.
                 let part2_3_start = bit_pos;
-                let prev = if gr == 1 { Some(scalefac[0][ch].clone()) } else { None };
-                let sf = scalefactors::decode(&main, &mut bit_pos, header, &si, gr, ch, prev.as_ref());
+                let prev = if gr == 1 {
+                    Some(scalefac[0][ch].clone())
+                } else {
+                    None
+                };
+                let sf =
+                    scalefactors::decode(&main, &mut bit_pos, header, &si, gr, ch, prev.as_ref());
                 scalefac[gr][ch] = sf.clone();
                 let part2_3_end = part2_3_start + gi.part2_3_length as usize;
                 let (coeffs, nz) = huffman::decode(&main, &mut bit_pos, part2_3_end, header, gi);

@@ -70,7 +70,8 @@ fn build_lf_info(h: &FrameHeader) -> LfInfo {
         let mut lvl_seg = base;
         if h.seg_enabled && h.seg_feature_enabled[seg_id][1] {
             let data = h.seg_feature_data[seg_id][1];
-            lvl_seg = (if h.seg_abs_delta { data } else { base + data }).clamp(0, MAX_LOOP_FILTER as i32);
+            lvl_seg =
+                (if h.seg_abs_delta { data } else { base + data }).clamp(0, MAX_LOOP_FILTER as i32);
         }
         if !h.lf_delta_enabled {
             for refs in seg.iter_mut() {
@@ -94,7 +95,11 @@ fn build_lf_info(h: &FrameHeader) -> LfInfo {
 fn get_filter_level(lf: &LfInfo, mi: &ModeInfo) -> u8 {
     // Indexed by the block's reference (INTRA=0, LAST=1, GOLDEN=2, ALTREF=3) so
     // GOLDEN/ALTREF blocks pick up their own ref-delta level, not LAST's.
-    let refidx = if mi.is_inter { (mi.ref_frame[0] as usize).clamp(1, 3) } else { 0 };
+    let refidx = if mi.is_inter {
+        (mi.ref_frame[0] as usize).clamp(1, 3)
+    } else {
+        0
+    };
     lf.lvl[mi.segment_id as usize][refidx][MODE_LF_LUT[mi.mode as usize] as usize]
 }
 
@@ -137,149 +142,190 @@ fn ss_size_lookup(bsize: usize, ss_x: usize, ss_y: usize) -> usize {
 mod scalar_ref {
     use super::*;
 
-// High-bit-depth aware leaf math. `base = 1<<(bd-1)` (128 at 8-bit); the signed
-// clamp range is `[-base, base-1]`. The mask thresholds are pre-scaled by
-// `<<(bd-8)` in `build_lf_info`, and the flat threshold is `1<<(bd-8)`.
-#[inline]
-fn sclamp(v: i32, base: i32) -> i32 {
-    v.clamp(-base, base - 1)
-}
-#[inline]
-fn to_s(p: u16, base: i32) -> i32 {
-    p as i32 - base
-}
-#[inline]
-fn from_s(v: i32, base: i32) -> u16 {
-    (sclamp(v, base) + base) as u16
-}
-#[inline]
-fn rpo2(x: i32, n: u32) -> u16 {
-    ((x + (1 << (n - 1))) >> n) as u16
-}
-
-#[inline]
-fn filter_mask(limit: i32, blimit: i32, p: [u16; 4], q: [u16; 4]) -> bool {
-    let d = |a: u16, b: u16| (a as i32 - b as i32).unsigned_abs();
-    let lim = limit as u32;
-    d(p[3], p[2]) <= lim
-        && d(p[2], p[1]) <= lim
-        && d(p[1], p[0]) <= lim
-        && d(q[1], q[0]) <= lim
-        && d(q[2], q[1]) <= lim
-        && d(q[3], q[2]) <= lim
-        && d(p[0], q[0]) * 2 + d(p[1], q[1]) / 2 <= blimit as u32
-}
-
-#[inline]
-fn flat_mask4(p: [u16; 4], q: [u16; 4], flat_thr: u32) -> bool {
-    let d = |a: u16, b: u16| (a as i32 - b as i32).unsigned_abs();
-    d(p[1], p[0]) <= flat_thr
-        && d(q[1], q[0]) <= flat_thr
-        && d(p[2], p[0]) <= flat_thr
-        && d(q[2], q[0]) <= flat_thr
-        && d(p[3], p[0]) <= flat_thr
-        && d(q[3], q[0]) <= flat_thr
-}
-
-#[inline]
-fn hev_mask(thresh: i32, p1: u16, p0: u16, q0: u16, q1: u16) -> bool {
-    let d = |a: u16, b: u16| (a as i32 - b as i32).unsigned_abs();
-    d(p1, p0) > thresh as u32 || d(q1, q0) > thresh as u32
-}
-
-/// 4-tap narrow filter. `buf[i]` is q0; pixels accessed at ±`st`.
-fn filter4(buf: &mut [u16], i: usize, st: usize, thresh: i32, base: i32) {
-    let p1 = buf[i - 2 * st];
-    let p0 = buf[i - st];
-    let q0 = buf[i];
-    let q1 = buf[i + st];
-    let (ps1, ps0, qs0, qs1) = (to_s(p1, base), to_s(p0, base), to_s(q0, base), to_s(q1, base));
-    let hev = hev_mask(thresh, p1, p0, q0, q1);
-    let mut filter = if hev { sclamp(ps1 - qs1, base) } else { 0 };
-    filter = sclamp(filter + 3 * (qs0 - ps0), base);
-    let filter1 = sclamp(filter + 4, base) >> 3;
-    let filter2 = sclamp(filter + 3, base) >> 3;
-    buf[i] = from_s(qs0 - filter1, base);
-    buf[i - st] = from_s(ps0 + filter2, base);
-    let f = if !hev { (filter1 + 1) >> 1 } else { 0 };
-    buf[i + st] = from_s(qs1 - f, base);
-    buf[i - 2 * st] = from_s(ps1 + f, base);
-}
-
-/// Apply the appropriate-width filter at a single edge position `i` (q0), with
-/// across-edge step `st`. `width` is 4, 8, or 16 (mblim is the wide limit).
-pub(super) fn filter_edge(buf: &mut [u16], i: usize, st: usize, width: usize, t: &Thresh, bd: i32) {
-    let base = 1 << (bd - 1);
-    let flat_thr = 1u32 << (bd - 8);
-    let g = |buf: &[u16], k: i32| buf[(i as i32 + k * st as i32) as usize];
-    let p = [g(buf, -1), g(buf, -2), g(buf, -3), g(buf, -4)];
-    let q = [g(buf, 0), g(buf, 1), g(buf, 2), g(buf, 3)];
-    if !filter_mask(t.lim, t.mblim, p, q) {
-        return;
+    // High-bit-depth aware leaf math. `base = 1<<(bd-1)` (128 at 8-bit); the signed
+    // clamp range is `[-base, base-1]`. The mask thresholds are pre-scaled by
+    // `<<(bd-8)` in `build_lf_info`, and the flat threshold is `1<<(bd-8)`.
+    #[inline]
+    fn sclamp(v: i32, base: i32) -> i32 {
+        v.clamp(-base, base - 1)
     }
-    let flat = flat_mask4(p, q, flat_thr);
-    if width >= 16 && flat {
-        // flat2 over the 8-wide neighbourhood.
-        let pe = [g(buf, -5), g(buf, -6), g(buf, -7), g(buf, -8)];
-        let qe = [g(buf, 4), g(buf, 5), g(buf, 6), g(buf, 7)];
+    #[inline]
+    fn to_s(p: u16, base: i32) -> i32 {
+        p as i32 - base
+    }
+    #[inline]
+    fn from_s(v: i32, base: i32) -> u16 {
+        (sclamp(v, base) + base) as u16
+    }
+    #[inline]
+    fn rpo2(x: i32, n: u32) -> u16 {
+        ((x + (1 << (n - 1))) >> n) as u16
+    }
+
+    #[inline]
+    fn filter_mask(limit: i32, blimit: i32, p: [u16; 4], q: [u16; 4]) -> bool {
         let d = |a: u16, b: u16| (a as i32 - b as i32).unsigned_abs();
-        let flat2 = d(pe[0], p[0]) <= flat_thr
-            && d(qe[0], q[0]) <= flat_thr
-            && d(pe[1], p[0]) <= flat_thr
-            && d(qe[1], q[0]) <= flat_thr
-            && d(pe[2], p[0]) <= flat_thr
-            && d(qe[2], q[0]) <= flat_thr
-            && d(pe[3], p[0]) <= flat_thr
-            && d(qe[3], q[0]) <= flat_thr;
-        if flat2 {
-            filter16(buf, i, st);
+        let lim = limit as u32;
+        d(p[3], p[2]) <= lim
+            && d(p[2], p[1]) <= lim
+            && d(p[1], p[0]) <= lim
+            && d(q[1], q[0]) <= lim
+            && d(q[2], q[1]) <= lim
+            && d(q[3], q[2]) <= lim
+            && d(p[0], q[0]) * 2 + d(p[1], q[1]) / 2 <= blimit as u32
+    }
+
+    #[inline]
+    fn flat_mask4(p: [u16; 4], q: [u16; 4], flat_thr: u32) -> bool {
+        let d = |a: u16, b: u16| (a as i32 - b as i32).unsigned_abs();
+        d(p[1], p[0]) <= flat_thr
+            && d(q[1], q[0]) <= flat_thr
+            && d(p[2], p[0]) <= flat_thr
+            && d(q[2], q[0]) <= flat_thr
+            && d(p[3], p[0]) <= flat_thr
+            && d(q[3], q[0]) <= flat_thr
+    }
+
+    #[inline]
+    fn hev_mask(thresh: i32, p1: u16, p0: u16, q0: u16, q1: u16) -> bool {
+        let d = |a: u16, b: u16| (a as i32 - b as i32).unsigned_abs();
+        d(p1, p0) > thresh as u32 || d(q1, q0) > thresh as u32
+    }
+
+    /// 4-tap narrow filter. `buf[i]` is q0; pixels accessed at ±`st`.
+    fn filter4(buf: &mut [u16], i: usize, st: usize, thresh: i32, base: i32) {
+        let p1 = buf[i - 2 * st];
+        let p0 = buf[i - st];
+        let q0 = buf[i];
+        let q1 = buf[i + st];
+        let (ps1, ps0, qs0, qs1) = (
+            to_s(p1, base),
+            to_s(p0, base),
+            to_s(q0, base),
+            to_s(q1, base),
+        );
+        let hev = hev_mask(thresh, p1, p0, q0, q1);
+        let mut filter = if hev { sclamp(ps1 - qs1, base) } else { 0 };
+        filter = sclamp(filter + 3 * (qs0 - ps0), base);
+        let filter1 = sclamp(filter + 4, base) >> 3;
+        let filter2 = sclamp(filter + 3, base) >> 3;
+        buf[i] = from_s(qs0 - filter1, base);
+        buf[i - st] = from_s(ps0 + filter2, base);
+        let f = if !hev { (filter1 + 1) >> 1 } else { 0 };
+        buf[i + st] = from_s(qs1 - f, base);
+        buf[i - 2 * st] = from_s(ps1 + f, base);
+    }
+
+    /// Apply the appropriate-width filter at a single edge position `i` (q0), with
+    /// across-edge step `st`. `width` is 4, 8, or 16 (mblim is the wide limit).
+    pub(super) fn filter_edge(
+        buf: &mut [u16],
+        i: usize,
+        st: usize,
+        width: usize,
+        t: &Thresh,
+        bd: i32,
+    ) {
+        let base = 1 << (bd - 1);
+        let flat_thr = 1u32 << (bd - 8);
+        let g = |buf: &[u16], k: i32| buf[(i as i32 + k * st as i32) as usize];
+        let p = [g(buf, -1), g(buf, -2), g(buf, -3), g(buf, -4)];
+        let q = [g(buf, 0), g(buf, 1), g(buf, 2), g(buf, 3)];
+        if !filter_mask(t.lim, t.mblim, p, q) {
             return;
         }
+        let flat = flat_mask4(p, q, flat_thr);
+        if width >= 16 && flat {
+            // flat2 over the 8-wide neighbourhood.
+            let pe = [g(buf, -5), g(buf, -6), g(buf, -7), g(buf, -8)];
+            let qe = [g(buf, 4), g(buf, 5), g(buf, 6), g(buf, 7)];
+            let d = |a: u16, b: u16| (a as i32 - b as i32).unsigned_abs();
+            let flat2 = d(pe[0], p[0]) <= flat_thr
+                && d(qe[0], q[0]) <= flat_thr
+                && d(pe[1], p[0]) <= flat_thr
+                && d(qe[1], q[0]) <= flat_thr
+                && d(pe[2], p[0]) <= flat_thr
+                && d(qe[2], q[0]) <= flat_thr
+                && d(pe[3], p[0]) <= flat_thr
+                && d(qe[3], q[0]) <= flat_thr;
+            if flat2 {
+                filter16(buf, i, st);
+                return;
+            }
+        }
+        if width >= 8 && flat {
+            filter8(buf, i, st);
+        } else {
+            filter4(buf, i, st, t.hev_thr, base);
+        }
     }
-    if width >= 8 && flat {
-        filter8(buf, i, st);
-    } else {
-        filter4(buf, i, st, t.hev_thr, base);
+
+    /// 7-tap wide filter (used when `flat`).
+    fn filter8(buf: &mut [u16], i: usize, st: usize) {
+        let g = |k: i32| buf[(i as i32 + k * st as i32) as usize] as i32;
+        let (p3, p2, p1, p0) = (g(-4), g(-3), g(-2), g(-1));
+        let (q0, q1, q2, q3) = (g(0), g(1), g(2), g(3));
+        buf[i - 3 * st] = rpo2(p3 + p3 + p3 + 2 * p2 + p1 + p0 + q0, 3);
+        buf[i - 2 * st] = rpo2(p3 + p3 + p2 + 2 * p1 + p0 + q0 + q1, 3);
+        buf[i - st] = rpo2(p3 + p2 + p1 + 2 * p0 + q0 + q1 + q2, 3);
+        buf[i] = rpo2(p2 + p1 + p0 + 2 * q0 + q1 + q2 + q3, 3);
+        buf[i + st] = rpo2(p1 + p0 + q0 + 2 * q1 + q2 + q3 + q3, 3);
+        buf[i + 2 * st] = rpo2(p0 + q0 + q1 + 2 * q2 + q3 + q3 + q3, 3);
     }
-}
 
-/// 7-tap wide filter (used when `flat`).
-fn filter8(buf: &mut [u16], i: usize, st: usize) {
-    let g = |k: i32| buf[(i as i32 + k * st as i32) as usize] as i32;
-    let (p3, p2, p1, p0) = (g(-4), g(-3), g(-2), g(-1));
-    let (q0, q1, q2, q3) = (g(0), g(1), g(2), g(3));
-    buf[i - 3 * st] = rpo2(p3 + p3 + p3 + 2 * p2 + p1 + p0 + q0, 3);
-    buf[i - 2 * st] = rpo2(p3 + p3 + p2 + 2 * p1 + p0 + q0 + q1, 3);
-    buf[i - st] = rpo2(p3 + p2 + p1 + 2 * p0 + q0 + q1 + q2, 3);
-    buf[i] = rpo2(p2 + p1 + p0 + 2 * q0 + q1 + q2 + q3, 3);
-    buf[i + st] = rpo2(p1 + p0 + q0 + 2 * q1 + q2 + q3 + q3, 3);
-    buf[i + 2 * st] = rpo2(p0 + q0 + q1 + 2 * q2 + q3 + q3 + q3, 3);
-}
-
-/// 15-tap wide filter (used when `flat` and `flat2`).
-fn filter16(buf: &mut [u16], i: usize, st: usize) {
-    let g = |k: i32| buf[(i as i32 + k * st as i32) as usize] as i32;
-    let p: Vec<i32> = (0..8).map(|k| g(-1 - k)).collect(); // p0..p7
-    let q: Vec<i32> = (0..8).map(|k| g(k)).collect(); // q0..q7
-    let s = |off: i32| (i as i32 + off * st as i32) as usize;
-    let (p0, p1, p2, p3, p4, p5, p6, p7) = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
-    let (q0, q1, q2, q3, q4, q5, q6, q7) = (q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
-    buf[s(-7)] = rpo2(p7 * 7 + p6 * 2 + p5 + p4 + p3 + p2 + p1 + p0 + q0, 4);
-    buf[s(-6)] = rpo2(p7 * 6 + p6 + p5 * 2 + p4 + p3 + p2 + p1 + p0 + q0 + q1, 4);
-    buf[s(-5)] = rpo2(p7 * 5 + p6 + p5 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + q1 + q2, 4);
-    buf[s(-4)] = rpo2(p7 * 4 + p6 + p5 + p4 + p3 * 2 + p2 + p1 + p0 + q0 + q1 + q2 + q3, 4);
-    buf[s(-3)] = rpo2(p7 * 3 + p6 + p5 + p4 + p3 + p2 * 2 + p1 + p0 + q0 + q1 + q2 + q3 + q4, 4);
-    buf[s(-2)] = rpo2(p7 * 2 + p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 + q0 + q1 + q2 + q3 + q4 + q5, 4);
-    buf[s(-1)] = rpo2(p7 + p6 + p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + q3 + q4 + q5 + q6, 4);
-    buf[s(0)] = rpo2(p6 + p5 + p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + q4 + q5 + q6 + q7, 4);
-    buf[s(1)] = rpo2(p5 + p4 + p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 + q3 + q4 + q5 + q6 + q7 * 2, 4);
-    buf[s(2)] = rpo2(p4 + p3 + p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 + q4 + q5 + q6 + q7 * 3, 4);
-    buf[s(3)] = rpo2(p3 + p2 + p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 + q5 + q6 + q7 * 4, 4);
-    buf[s(4)] = rpo2(p2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 + q6 + q7 * 5, 4);
-    buf[s(5)] = rpo2(p1 + p0 + q0 + q1 + q2 + q3 + q4 + q5 * 2 + q6 + q7 * 6, 4);
-    buf[s(6)] = rpo2(p0 + q0 + q1 + q2 + q3 + q4 + q5 + q6 * 2 + q7 * 7, 4);
-}
-
+    /// 15-tap wide filter (used when `flat` and `flat2`).
+    fn filter16(buf: &mut [u16], i: usize, st: usize) {
+        let g = |k: i32| buf[(i as i32 + k * st as i32) as usize] as i32;
+        let p: Vec<i32> = (0..8).map(|k| g(-1 - k)).collect(); // p0..p7
+        let q: Vec<i32> = (0..8).map(|k| g(k)).collect(); // q0..q7
+        let s = |off: i32| (i as i32 + off * st as i32) as usize;
+        let (p0, p1, p2, p3, p4, p5, p6, p7) = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+        let (q0, q1, q2, q3, q4, q5, q6, q7) = (q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
+        buf[s(-7)] = rpo2(p7 * 7 + p6 * 2 + p5 + p4 + p3 + p2 + p1 + p0 + q0, 4);
+        buf[s(-6)] = rpo2(p7 * 6 + p6 + p5 * 2 + p4 + p3 + p2 + p1 + p0 + q0 + q1, 4);
+        buf[s(-5)] = rpo2(
+            p7 * 5 + p6 + p5 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + q1 + q2,
+            4,
+        );
+        buf[s(-4)] = rpo2(
+            p7 * 4 + p6 + p5 + p4 + p3 * 2 + p2 + p1 + p0 + q0 + q1 + q2 + q3,
+            4,
+        );
+        buf[s(-3)] = rpo2(
+            p7 * 3 + p6 + p5 + p4 + p3 + p2 * 2 + p1 + p0 + q0 + q1 + q2 + q3 + q4,
+            4,
+        );
+        buf[s(-2)] = rpo2(
+            p7 * 2 + p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 + q0 + q1 + q2 + q3 + q4 + q5,
+            4,
+        );
+        buf[s(-1)] = rpo2(
+            p7 + p6 + p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + q3 + q4 + q5 + q6,
+            4,
+        );
+        buf[s(0)] = rpo2(
+            p6 + p5 + p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + q4 + q5 + q6 + q7,
+            4,
+        );
+        buf[s(1)] = rpo2(
+            p5 + p4 + p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 + q3 + q4 + q5 + q6 + q7 * 2,
+            4,
+        );
+        buf[s(2)] = rpo2(
+            p4 + p3 + p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 + q4 + q5 + q6 + q7 * 3,
+            4,
+        );
+        buf[s(3)] = rpo2(
+            p3 + p2 + p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 + q5 + q6 + q7 * 4,
+            4,
+        );
+        buf[s(4)] = rpo2(
+            p2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 + q6 + q7 * 5,
+            4,
+        );
+        buf[s(5)] = rpo2(p1 + p0 + q0 + q1 + q2 + q3 + q4 + q5 * 2 + q6 + q7 * 6, 4);
+        buf[s(6)] = rpo2(p0 + q0 + q1 + q2 + q3 + q4 + q5 + q6 * 2 + q7 * 7, 4);
+    }
 } // mod scalar_ref
 
 // ---- per-plane superblock filtering (vp9_filter_block_plane_non420) -----
@@ -345,24 +391,48 @@ fn filter_block_plane(
 
             if tx_size == 3 {
                 if !skip_this_c && (cc & 3) == 0 {
-                    if !skip_border_4x4_c { m16c |= 1 << cc } else { m8c |= 1 << cc }
+                    if !skip_border_4x4_c {
+                        m16c |= 1 << cc
+                    } else {
+                        m8c |= 1 << cc
+                    }
                 }
                 if !skip_this_r && ((r >> ss_y) & 3) == 0 {
-                    if !skip_border_4x4_r { m16x16[r] |= 1 << cc } else { m8x8[r] |= 1 << cc }
+                    if !skip_border_4x4_r {
+                        m16x16[r] |= 1 << cc
+                    } else {
+                        m8x8[r] |= 1 << cc
+                    }
                 }
             } else if tx_size == 2 {
                 if !skip_this_c && (cc & 1) == 0 {
-                    if !skip_border_4x4_c { m16c |= 1 << cc } else { m8c |= 1 << cc }
+                    if !skip_border_4x4_c {
+                        m16c |= 1 << cc
+                    } else {
+                        m8c |= 1 << cc
+                    }
                 }
                 if !skip_this_r && ((r >> ss_y) & 1) == 0 {
-                    if !skip_border_4x4_r { m16x16[r] |= 1 << cc } else { m8x8[r] |= 1 << cc }
+                    if !skip_border_4x4_r {
+                        m16x16[r] |= 1 << cc
+                    } else {
+                        m8x8[r] |= 1 << cc
+                    }
                 }
             } else {
                 if !skip_this_c {
-                    if tx_size == 1 || (cc & 3) == 0 { m8c |= 1 << cc } else { m4c |= 1 << cc }
+                    if tx_size == 1 || (cc & 3) == 0 {
+                        m8c |= 1 << cc
+                    } else {
+                        m4c |= 1 << cc
+                    }
                 }
                 if !skip_this_r {
-                    if tx_size == 1 || ((r >> ss_y) & 3) == 0 { m8x8[r] |= 1 << cc } else { m4x4[r] |= 1 << cc }
+                    if tx_size == 1 || ((r >> ss_y) & 3) == 0 {
+                        m8x8[r] |= 1 << cc
+                    } else {
+                        m4x4[r] |= 1 << cc
+                    }
                 }
                 if !skip_this && tx_size == 0 && !skip_border_4x4_c {
                     m4x4_int[r] |= 1 << cc;
@@ -401,7 +471,19 @@ fn filter_block_plane(
             a4 = 0;
         }
         let row_y = base_y + (r >> ss_y) * 8;
-        filter_selectively_horiz(buf, stride, base_x, row_y, a16, a8, a4, m4i, &lf.thr, &lfl[r << 3..], bd);
+        filter_selectively_horiz(
+            buf,
+            stride,
+            base_x,
+            row_y,
+            a16,
+            a8,
+            a4,
+            m4i,
+            &lf.thr,
+            &lfl[r << 3..],
+            bd,
+        );
         r += row_step;
     }
 }
@@ -499,7 +581,15 @@ fn filter_selectively_horiz(
 /// orientation. `lane_stride == 1` (horizontal edge) makes the gather/scatter
 /// contiguous; the strided case (vertical edge) still vectorizes the arithmetic.
 #[allow(clippy::needless_range_loop)]
-fn filter_edge8(buf: &mut [u16], i: usize, pos_stride: usize, lane_stride: usize, width: usize, t: &Thresh, bd: i32) {
+fn filter_edge8(
+    buf: &mut [u16],
+    i: usize,
+    pos_stride: usize,
+    lane_stride: usize,
+    width: usize,
+    t: &Thresh,
+    bd: i32,
+) {
     // AVX2: horizontal edges (lane_stride == 1) gather/scatter contiguously;
     // vertical edges transpose an 8×8 (or 8×16) tile in-register.
     #[cfg(target_arch = "x86_64")]
@@ -527,7 +617,8 @@ fn filter_edge8(buf: &mut [u16], i: usize, pos_stride: usize, lane_stride: usize
         }
     }
 
-    let ad = |a: [i32; 8], b: [i32; 8]| -> [i32; 8] { core::array::from_fn(|l| (a[l] - b[l]).abs()) };
+    let ad =
+        |a: [i32; 8], b: [i32; 8]| -> [i32; 8] { core::array::from_fn(|l| (a[l] - b[l]).abs()) };
     let le = |d: [i32; 8], t: i32| -> [i32; 8] { core::array::from_fn(|l| -((d[l] <= t) as i32)) };
     let gt = |d: [i32; 8], t: i32| -> [i32; 8] { core::array::from_fn(|l| -((d[l] > t) as i32)) };
     let and = |a: [i32; 8], b: [i32; 8]| -> [i32; 8] { core::array::from_fn(|l| a[l] & b[l]) };
@@ -544,7 +635,8 @@ fn filter_edge8(buf: &mut [u16], i: usize, pos_stride: usize, lane_stride: usize
     mask = and(mask, le(ad(q[1], q[0]), lim));
     mask = and(mask, le(ad(q[2], q[1]), lim));
     mask = and(mask, le(ad(q[3], q[2]), lim));
-    let grad: [i32; 8] = core::array::from_fn(|l| (p[0][l] - q[0][l]).abs() * 2 + (p[1][l] - q[1][l]).abs() / 2);
+    let grad: [i32; 8] =
+        core::array::from_fn(|l| (p[0][l] - q[0][l]).abs() * 2 + (p[1][l] - q[1][l]).abs() / 2);
     mask = and(mask, le(grad, blimit));
 
     // flat (flat_mask4) over the inner 4 taps.
@@ -555,7 +647,8 @@ fn filter_edge8(buf: &mut [u16], i: usize, pos_stride: usize, lane_stride: usize
     flat = and(flat, le(ad(q[3], q[0]), ft));
 
     // hev (high edge variance).
-    let hev: [i32; 8] = core::array::from_fn(|l| gt(ad(p[1], p[0]), hev_thr)[l] | gt(ad(q[1], q[0]), hev_thr)[l]);
+    let hev: [i32; 8] =
+        core::array::from_fn(|l| gt(ad(p[1], p[0]), hev_thr)[l] | gt(ad(q[1], q[0]), hev_thr)[l]);
 
     // --- filter4 (always computed; selected where !flat) ---
     let scl = |v: [i32; 8]| -> [i32; 8] { core::array::from_fn(|l| v[l].clamp(-base, base - 1)) };
@@ -566,13 +659,19 @@ fn filter_edge8(buf: &mut [u16], i: usize, pos_stride: usize, lane_stride: usize
     let f_hev = scl(core::array::from_fn(|l| ps1[l] - qs1[l]));
     let mut filt: [i32; 8] = core::array::from_fn(|l| f_hev[l] & hev[l]); // hev ? f_hev : 0
     filt = scl(core::array::from_fn(|l| filt[l] + 3 * (qs0[l] - ps0[l])));
-    let filter1: [i32; 8] = core::array::from_fn(|l| scl(core::array::from_fn(|j| filt[j] + 4))[l] >> 3);
-    let filter2: [i32; 8] = core::array::from_fn(|l| scl(core::array::from_fn(|j| filt[j] + 3))[l] >> 3);
-    let f4q0: [i32; 8] = core::array::from_fn(|l| scl(core::array::from_fn(|j| qs0[j] - filter1[j]))[l] + base);
-    let f4p0: [i32; 8] = core::array::from_fn(|l| scl(core::array::from_fn(|j| ps0[j] + filter2[j]))[l] + base);
+    let filter1: [i32; 8] =
+        core::array::from_fn(|l| scl(core::array::from_fn(|j| filt[j] + 4))[l] >> 3);
+    let filter2: [i32; 8] =
+        core::array::from_fn(|l| scl(core::array::from_fn(|j| filt[j] + 3))[l] >> 3);
+    let f4q0: [i32; 8] =
+        core::array::from_fn(|l| scl(core::array::from_fn(|j| qs0[j] - filter1[j]))[l] + base);
+    let f4p0: [i32; 8] =
+        core::array::from_fn(|l| scl(core::array::from_fn(|j| ps0[j] + filter2[j]))[l] + base);
     let ff: [i32; 8] = core::array::from_fn(|l| ((filter1[l] + 1) >> 1) & !hev[l]); // !hev ? (f1+1)>>1 : 0
-    let f4q1: [i32; 8] = core::array::from_fn(|l| scl(core::array::from_fn(|j| qs1[j] - ff[j]))[l] + base);
-    let f4p1: [i32; 8] = core::array::from_fn(|l| scl(core::array::from_fn(|j| ps1[j] + ff[j]))[l] + base);
+    let f4q1: [i32; 8] =
+        core::array::from_fn(|l| scl(core::array::from_fn(|j| qs1[j] - ff[j]))[l] + base);
+    let f4p1: [i32; 8] =
+        core::array::from_fn(|l| scl(core::array::from_fn(|j| ps1[j] + ff[j]))[l] + base);
 
     let r3 = |x: [i32; 8]| -> [i32; 8] { core::array::from_fn(|l| (x[l] + 4) >> 3) }; // round_pow2(.,3)
 
@@ -582,19 +681,38 @@ fn filter_edge8(buf: &mut [u16], i: usize, pos_stride: usize, lane_stride: usize
         let np1 = sel(mask, f4p1, p[1]);
         let nq0 = sel(mask, f4q0, q[0]);
         let nq1 = sel(mask, f4q1, q[1]);
-        scatter(buf, i, pos_stride, lane_stride, &[(0, np0), (1, np1)], &[(0, nq0), (1, nq1)]);
+        scatter(
+            buf,
+            i,
+            pos_stride,
+            lane_stride,
+            &[(0, np0), (1, np1)],
+            &[(0, nq0), (1, nq1)],
+        );
         return;
     }
 
     // --- filter8 (7-tap, computed for width>=8; selected where flat) ---
     let (p0, p1, p2, p3) = (p[0], p[1], p[2], p[3]);
     let (q0, q1, q2, q3) = (q[0], q[1], q[2], q[3]);
-    let f8p2 = r3(core::array::from_fn(|l| p3[l] * 3 + 2 * p2[l] + p1[l] + p0[l] + q0[l]));
-    let f8p1 = r3(core::array::from_fn(|l| p3[l] + p3[l] + p2[l] + 2 * p1[l] + p0[l] + q0[l] + q1[l]));
-    let f8p0 = r3(core::array::from_fn(|l| p3[l] + p2[l] + p1[l] + 2 * p0[l] + q0[l] + q1[l] + q2[l]));
-    let f8q0 = r3(core::array::from_fn(|l| p2[l] + p1[l] + p0[l] + 2 * q0[l] + q1[l] + q2[l] + q3[l]));
-    let f8q1 = r3(core::array::from_fn(|l| p1[l] + p0[l] + q0[l] + 2 * q1[l] + q2[l] + q3[l] + q3[l]));
-    let f8q2 = r3(core::array::from_fn(|l| p0[l] + q0[l] + q1[l] + 2 * q2[l] + q3[l] + q3[l] + q3[l]));
+    let f8p2 = r3(core::array::from_fn(|l| {
+        p3[l] * 3 + 2 * p2[l] + p1[l] + p0[l] + q0[l]
+    }));
+    let f8p1 = r3(core::array::from_fn(|l| {
+        p3[l] + p3[l] + p2[l] + 2 * p1[l] + p0[l] + q0[l] + q1[l]
+    }));
+    let f8p0 = r3(core::array::from_fn(|l| {
+        p3[l] + p2[l] + p1[l] + 2 * p0[l] + q0[l] + q1[l] + q2[l]
+    }));
+    let f8q0 = r3(core::array::from_fn(|l| {
+        p2[l] + p1[l] + p0[l] + 2 * q0[l] + q1[l] + q2[l] + q3[l]
+    }));
+    let f8q1 = r3(core::array::from_fn(|l| {
+        p1[l] + p0[l] + q0[l] + 2 * q1[l] + q2[l] + q3[l] + q3[l]
+    }));
+    let f8q2 = r3(core::array::from_fn(|l| {
+        p0[l] + q0[l] + q1[l] + 2 * q2[l] + q3[l] + q3[l] + q3[l]
+    }));
 
     if width < 16 {
         let use8 = and(mask, flat);
@@ -605,8 +723,14 @@ fn filter_edge8(buf: &mut [u16], i: usize, pos_stride: usize, lane_stride: usize
         let nq0 = sel(use8, f8q0, sel(use4, f4q0, q0));
         let nq1 = sel(use8, f8q1, sel(use4, f4q1, q1));
         let nq2 = sel(use8, f8q2, q2);
-        scatter(buf, i, pos_stride, lane_stride,
-            &[(0, np0), (1, np1), (2, np2)], &[(0, nq0), (1, nq1), (2, nq2)]);
+        scatter(
+            buf,
+            i,
+            pos_stride,
+            lane_stride,
+            &[(0, np0), (1, np1), (2, np2)],
+            &[(0, nq0), (1, nq1), (2, nq2)],
+        );
         return;
     }
 
@@ -621,19 +745,160 @@ fn filter_edge8(buf: &mut [u16], i: usize, pos_stride: usize, lane_stride: usize
     flat2 = and(flat2, le(ad(p7, p0), ft));
     flat2 = and(flat2, le(ad(q7, q0), ft));
     let r4 = |x: [i32; 8]| -> [i32; 8] { core::array::from_fn(|l| (x[l] + 8) >> 4) };
-    let s = |arr: &[[i32; 8]]| -> [i32; 8] { core::array::from_fn(|l| arr.iter().map(|a| a[l]).sum()) };
+    let s =
+        |arr: &[[i32; 8]]| -> [i32; 8] { core::array::from_fn(|l| arr.iter().map(|a| a[l]).sum()) };
     let f16p6 = r4(s(&[mul(p7, 7), mul(p6, 2), p5, p4, p3, p2, p1, p0, q0]));
     let f16p5 = r4(s(&[mul(p7, 6), p6, mul(p5, 2), p4, p3, p2, p1, p0, q0, q1]));
-    let f16p4 = r4(s(&[mul(p7, 5), p6, p5, mul(p4, 2), p3, p2, p1, p0, q0, q1, q2]));
-    let f16p3 = r4(s(&[mul(p7, 4), p6, p5, p4, mul(p3, 2), p2, p1, p0, q0, q1, q2, q3]));
-    let f16p2 = r4(s(&[mul(p7, 3), p6, p5, p4, p3, mul(p2, 2), p1, p0, q0, q1, q2, q3, q4]));
-    let f16p1 = r4(s(&[mul(p7, 2), p6, p5, p4, p3, p2, mul(p1, 2), p0, q0, q1, q2, q3, q4, q5]));
-    let f16p0 = r4(s(&[p7, p6, p5, p4, p3, p2, p1, mul(p0, 2), q0, q1, q2, q3, q4, q5, q6]));
-    let f16q0 = r4(s(&[p6, p5, p4, p3, p2, p1, p0, mul(q0, 2), q1, q2, q3, q4, q5, q6, q7]));
-    let f16q1 = r4(s(&[p5, p4, p3, p2, p1, p0, q0, mul(q1, 2), q2, q3, q4, q5, q6, mul(q7, 2)]));
-    let f16q2 = r4(s(&[p4, p3, p2, p1, p0, q0, q1, mul(q2, 2), q3, q4, q5, q6, mul(q7, 3)]));
-    let f16q3 = r4(s(&[p3, p2, p1, p0, q0, q1, q2, mul(q3, 2), q4, q5, q6, mul(q7, 4)]));
-    let f16q4 = r4(s(&[p2, p1, p0, q0, q1, q2, q3, mul(q4, 2), q5, q6, mul(q7, 5)]));
+    let f16p4 = r4(s(&[
+        mul(p7, 5),
+        p6,
+        p5,
+        mul(p4, 2),
+        p3,
+        p2,
+        p1,
+        p0,
+        q0,
+        q1,
+        q2,
+    ]));
+    let f16p3 = r4(s(&[
+        mul(p7, 4),
+        p6,
+        p5,
+        p4,
+        mul(p3, 2),
+        p2,
+        p1,
+        p0,
+        q0,
+        q1,
+        q2,
+        q3,
+    ]));
+    let f16p2 = r4(s(&[
+        mul(p7, 3),
+        p6,
+        p5,
+        p4,
+        p3,
+        mul(p2, 2),
+        p1,
+        p0,
+        q0,
+        q1,
+        q2,
+        q3,
+        q4,
+    ]));
+    let f16p1 = r4(s(&[
+        mul(p7, 2),
+        p6,
+        p5,
+        p4,
+        p3,
+        p2,
+        mul(p1, 2),
+        p0,
+        q0,
+        q1,
+        q2,
+        q3,
+        q4,
+        q5,
+    ]));
+    let f16p0 = r4(s(&[
+        p7,
+        p6,
+        p5,
+        p4,
+        p3,
+        p2,
+        p1,
+        mul(p0, 2),
+        q0,
+        q1,
+        q2,
+        q3,
+        q4,
+        q5,
+        q6,
+    ]));
+    let f16q0 = r4(s(&[
+        p6,
+        p5,
+        p4,
+        p3,
+        p2,
+        p1,
+        p0,
+        mul(q0, 2),
+        q1,
+        q2,
+        q3,
+        q4,
+        q5,
+        q6,
+        q7,
+    ]));
+    let f16q1 = r4(s(&[
+        p5,
+        p4,
+        p3,
+        p2,
+        p1,
+        p0,
+        q0,
+        mul(q1, 2),
+        q2,
+        q3,
+        q4,
+        q5,
+        q6,
+        mul(q7, 2),
+    ]));
+    let f16q2 = r4(s(&[
+        p4,
+        p3,
+        p2,
+        p1,
+        p0,
+        q0,
+        q1,
+        mul(q2, 2),
+        q3,
+        q4,
+        q5,
+        q6,
+        mul(q7, 3),
+    ]));
+    let f16q3 = r4(s(&[
+        p3,
+        p2,
+        p1,
+        p0,
+        q0,
+        q1,
+        q2,
+        mul(q3, 2),
+        q4,
+        q5,
+        q6,
+        mul(q7, 4),
+    ]));
+    let f16q4 = r4(s(&[
+        p2,
+        p1,
+        p0,
+        q0,
+        q1,
+        q2,
+        q3,
+        mul(q4, 2),
+        q5,
+        q6,
+        mul(q7, 5),
+    ]));
     let f16q5 = r4(s(&[p1, p0, q0, q1, q2, q3, q4, mul(q5, 2), q6, mul(q7, 6)]));
     let f16q6 = r4(s(&[p0, q0, q1, q2, q3, q4, q5, mul(q6, 2), mul(q7, 7)]));
 
@@ -656,9 +921,30 @@ fn filter_edge8(buf: &mut [u16], i: usize, pos_stride: usize, lane_stride: usize
     let nq4 = sel(use16, f16q4, q4);
     let nq5 = sel(use16, f16q5, q5);
     let nq6 = sel(use16, f16q6, q6);
-    scatter(buf, i, pos_stride, lane_stride,
-        &[(0, np0), (1, np1), (2, np2), (3, np3), (4, np4), (5, np5), (6, np6)],
-        &[(0, nq0), (1, nq1), (2, nq2), (3, nq3), (4, nq4), (5, nq5), (6, nq6)]);
+    scatter(
+        buf,
+        i,
+        pos_stride,
+        lane_stride,
+        &[
+            (0, np0),
+            (1, np1),
+            (2, np2),
+            (3, np3),
+            (4, np4),
+            (5, np5),
+            (6, np6),
+        ],
+        &[
+            (0, nq0),
+            (1, nq1),
+            (2, nq2),
+            (3, nq3),
+            (4, nq4),
+            (5, nq5),
+            (6, nq6),
+        ],
+    );
 }
 
 #[inline]
@@ -669,7 +955,14 @@ fn mul(a: [i32; 8], k: i32) -> [i32; 8] {
 /// Scatter modified p/q lanes back: `pk` entries write `buf[i + l*lane_stride - (k+1)*pos_stride]`,
 /// `qk` entries write `buf[i + l*lane_stride + k*pos_stride]`.
 #[inline]
-fn scatter(buf: &mut [u16], i: usize, pos_stride: usize, lane_stride: usize, pk: &[(usize, [i32; 8])], qk: &[(usize, [i32; 8])]) {
+fn scatter(
+    buf: &mut [u16],
+    i: usize,
+    pos_stride: usize,
+    lane_stride: usize,
+    pk: &[(usize, [i32; 8])],
+    qk: &[(usize, [i32; 8])],
+) {
     for l in 0..8 {
         let c = i + l * lane_stride;
         for &(k, v) in pk {
@@ -725,7 +1018,10 @@ unsafe fn lf_core8(
     width: usize,
     t: &Thresh,
     bd: i32,
-) -> ([std::arch::x86_64::__m256i; 7], [std::arch::x86_64::__m256i; 7]) {
+) -> (
+    [std::arch::x86_64::__m256i; 7],
+    [std::arch::x86_64::__m256i; 7],
+) {
     use std::arch::x86_64::*;
     let basei = 1i32 << (bd - 1);
     let ftv = _mm256_set1_epi32(1i32 << (bd - 8));
@@ -767,7 +1063,10 @@ unsafe fn lf_core8(
     let (ps1, ps0, qs0, qs1) = (s(p1), s(p0), s(q0), s(q1));
     let f_hev = scl(_mm256_sub_epi32(ps1, qs1));
     let mut filt = _mm256_and_si256(f_hev, hev);
-    filt = scl(add(filt, _mm256_mullo_epi32(_mm256_set1_epi32(3), _mm256_sub_epi32(qs0, ps0))));
+    filt = scl(add(
+        filt,
+        _mm256_mullo_epi32(_mm256_set1_epi32(3), _mm256_sub_epi32(qs0, ps0)),
+    ));
     let filter1 = _mm256_srai_epi32::<3>(scl(add(filt, _mm256_set1_epi32(4))));
     let filter2 = _mm256_srai_epi32::<3>(scl(add(filt, _mm256_set1_epi32(3))));
     let frm = |v| add(scl(v), base);
@@ -788,7 +1087,13 @@ unsafe fn lf_core8(
     }
 
     let r3 = |x| _mm256_srai_epi32::<3>(add(x, _mm256_set1_epi32(4)));
-    let f8p2 = r3(add(add(add(_mm256_mullo_epi32(_mm256_set1_epi32(3), p3), x2(p2)), add(p1, p0)), q0));
+    let f8p2 = r3(add(
+        add(
+            add(_mm256_mullo_epi32(_mm256_set1_epi32(3), p3), x2(p2)),
+            add(p1, p0),
+        ),
+        q0,
+    ));
     let f8p1 = r3(add(add(add(p3, p3), add(p2, x2(p1))), add(add(p0, q0), q1)));
     let f8p0 = r3(add(add(add(p3, p2), add(p1, x2(p0))), add(add(q0, q1), q2)));
     let f8q0 = r3(add(add(add(p2, p1), add(p0, x2(q0))), add(add(q1, q2), q3)));
@@ -818,24 +1123,172 @@ unsafe fn lf_core8(
     flat2 = and(flat2, le(ad(q7, q0), ftv));
     let r4 = |x| _mm256_srai_epi32::<4>(add(x, _mm256_set1_epi32(8)));
     let mk = |k, a| _mm256_mullo_epi32(_mm256_set1_epi32(k), a);
-    let sum = |xs: &[__m256i]| xs.iter().copied().reduce(|a, b| _mm256_add_epi32(a, b)).unwrap();
+    let sum = |xs: &[__m256i]| {
+        xs.iter()
+            .copied()
+            .reduce(|a, b| _mm256_add_epi32(a, b))
+            .unwrap()
+    };
     let f16p6 = r4(sum(&[mk(7, p7), x2(p6), p5, p4, p3, p2, p1, p0, q0]));
     let f16p5 = r4(sum(&[mk(6, p7), p6, x2(p5), p4, p3, p2, p1, p0, q0, q1]));
-    let f16p4 = r4(sum(&[mk(5, p7), p6, p5, x2(p4), p3, p2, p1, p0, q0, q1, q2]));
-    let f16p3 = r4(sum(&[mk(4, p7), p6, p5, p4, x2(p3), p2, p1, p0, q0, q1, q2, q3]));
-    let f16p2 = r4(sum(&[mk(3, p7), p6, p5, p4, p3, x2(p2), p1, p0, q0, q1, q2, q3, q4]));
-    let f16p1 = r4(sum(&[x2(p7), p6, p5, p4, p3, p2, x2(p1), p0, q0, q1, q2, q3, q4, q5]));
-    let f16p0 = r4(sum(&[p7, p6, p5, p4, p3, p2, p1, x2(p0), q0, q1, q2, q3, q4, q5, q6]));
-    let f16q0 = r4(sum(&[p6, p5, p4, p3, p2, p1, p0, x2(q0), q1, q2, q3, q4, q5, q6, q7]));
-    let f16q1 = r4(sum(&[p5, p4, p3, p2, p1, p0, q0, x2(q1), q2, q3, q4, q5, q6, x2(q7)]));
-    let f16q2 = r4(sum(&[p4, p3, p2, p1, p0, q0, q1, x2(q2), q3, q4, q5, q6, mk(3, q7)]));
-    let f16q3 = r4(sum(&[p3, p2, p1, p0, q0, q1, q2, x2(q3), q4, q5, q6, mk(4, q7)]));
-    let f16q4 = r4(sum(&[p2, p1, p0, q0, q1, q2, q3, x2(q4), q5, q6, mk(5, q7)]));
+    let f16p4 = r4(sum(&[
+        mk(5, p7),
+        p6,
+        p5,
+        x2(p4),
+        p3,
+        p2,
+        p1,
+        p0,
+        q0,
+        q1,
+        q2,
+    ]));
+    let f16p3 = r4(sum(&[
+        mk(4, p7),
+        p6,
+        p5,
+        p4,
+        x2(p3),
+        p2,
+        p1,
+        p0,
+        q0,
+        q1,
+        q2,
+        q3,
+    ]));
+    let f16p2 = r4(sum(&[
+        mk(3, p7),
+        p6,
+        p5,
+        p4,
+        p3,
+        x2(p2),
+        p1,
+        p0,
+        q0,
+        q1,
+        q2,
+        q3,
+        q4,
+    ]));
+    let f16p1 = r4(sum(&[
+        x2(p7),
+        p6,
+        p5,
+        p4,
+        p3,
+        p2,
+        x2(p1),
+        p0,
+        q0,
+        q1,
+        q2,
+        q3,
+        q4,
+        q5,
+    ]));
+    let f16p0 = r4(sum(&[
+        p7,
+        p6,
+        p5,
+        p4,
+        p3,
+        p2,
+        p1,
+        x2(p0),
+        q0,
+        q1,
+        q2,
+        q3,
+        q4,
+        q5,
+        q6,
+    ]));
+    let f16q0 = r4(sum(&[
+        p6,
+        p5,
+        p4,
+        p3,
+        p2,
+        p1,
+        p0,
+        x2(q0),
+        q1,
+        q2,
+        q3,
+        q4,
+        q5,
+        q6,
+        q7,
+    ]));
+    let f16q1 = r4(sum(&[
+        p5,
+        p4,
+        p3,
+        p2,
+        p1,
+        p0,
+        q0,
+        x2(q1),
+        q2,
+        q3,
+        q4,
+        q5,
+        q6,
+        x2(q7),
+    ]));
+    let f16q2 = r4(sum(&[
+        p4,
+        p3,
+        p2,
+        p1,
+        p0,
+        q0,
+        q1,
+        x2(q2),
+        q3,
+        q4,
+        q5,
+        q6,
+        mk(3, q7),
+    ]));
+    let f16q3 = r4(sum(&[
+        p3,
+        p2,
+        p1,
+        p0,
+        q0,
+        q1,
+        q2,
+        x2(q3),
+        q4,
+        q5,
+        q6,
+        mk(4, q7),
+    ]));
+    let f16q4 = r4(sum(&[
+        p2,
+        p1,
+        p0,
+        q0,
+        q1,
+        q2,
+        q3,
+        x2(q4),
+        q5,
+        q6,
+        mk(5, q7),
+    ]));
     let f16q5 = r4(sum(&[p1, p0, q0, q1, q2, q3, q4, x2(q5), q6, mk(6, q7)]));
     let f16q6 = r4(sum(&[p0, q0, q1, q2, q3, q4, q5, x2(q6), mk(7, q7)]));
 
     let use16 = and(and(mask, flat), flat2);
-    let use8 = and(and(mask, flat), _mm256_andnot_si256(flat2, _mm256_set1_epi32(-1)));
+    let use8 = and(
+        and(mask, flat),
+        _mm256_andnot_si256(flat2, _mm256_set1_epi32(-1)),
+    );
     let use4 = _mm256_andnot_si256(flat, mask);
     np[6] = sel(use16, f16p6, p6);
     np[5] = sel(use16, f16p5, p5);
@@ -869,7 +1322,15 @@ fn p_to_arr(p: &[std::arch::x86_64::__m256i; 8]) -> &[std::arch::x86_64::__m256i
 /// AVX2 present; the p7..q7 window in-bounds (caller's mask guarantees it).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn filter_edge8_avx2(buf: &mut [u16], i: usize, pos_stride: usize, lane_stride: usize, width: usize, t: &Thresh, bd: i32) {
+unsafe fn filter_edge8_avx2(
+    buf: &mut [u16],
+    i: usize,
+    pos_stride: usize,
+    lane_stride: usize,
+    width: usize,
+    t: &Thresh,
+    bd: i32,
+) {
     use std::arch::x86_64::*;
     let bp = buf.as_mut_ptr();
     let ls = lane_stride as isize;
@@ -882,7 +1343,11 @@ unsafe fn filter_edge8_avx2(buf: &mut [u16], i: usize, pos_stride: usize, lane_s
     let mut q = [zero; 8];
     if lane_stride == 1 {
         // contiguous lanes: one load per position.
-        let ld = |r: isize| _mm256_cvtepu16_epi32(_mm_loadu_si128(bp.offset(i as isize + r * ps) as *const __m128i));
+        let ld = |r: isize| {
+            _mm256_cvtepu16_epi32(_mm_loadu_si128(
+                bp.offset(i as isize + r * ps) as *const __m128i
+            ))
+        };
         for k in 0..n {
             p[k] = ld(-(k as isize) - 1);
             q[k] = ld(k as isize);
@@ -895,8 +1360,14 @@ unsafe fn filter_edge8_avx2(buf: &mut [u16], i: usize, pos_stride: usize, lane_s
             col[l] = _mm256_cvtepu16_epi32(_mm_loadu_si128(bp.offset(row - 4) as *const __m128i));
         }
         transpose8(&mut col); // col[j] = column (i-4+j) across rows
-        p[0] = col[3]; p[1] = col[2]; p[2] = col[1]; p[3] = col[0];
-        q[0] = col[4]; q[1] = col[5]; q[2] = col[6]; q[3] = col[7];
+        p[0] = col[3];
+        p[1] = col[2];
+        p[2] = col[1];
+        p[3] = col[0];
+        q[0] = col[4];
+        q[1] = col[5];
+        q[2] = col[6];
+        q[3] = col[7];
     } else {
         // vertical, wide: two 8-col tiles, p7..p0 and q0..q7.
         let mut lo = [zero; 8];
@@ -908,45 +1379,81 @@ unsafe fn filter_edge8_avx2(buf: &mut [u16], i: usize, pos_stride: usize, lane_s
         }
         transpose8(&mut lo); // lo[j] = column (i-8+j) = p(7-j)
         transpose8(&mut hi); // hi[j] = column (i+j) = q(j)
-        for k in 0..8 { p[k] = lo[7 - k]; q[k] = hi[k]; }
+        for k in 0..8 {
+            p[k] = lo[7 - k];
+            q[k] = hi[k];
+        }
     }
 
     let (np, nq) = lf_core8(&p, &q, width, t, bd);
 
     // number of modified positions each side: 2 / 3 / 7.
-    let m = if width >= 16 { 7 } else if width >= 8 { 3 } else { 2 };
+    let m = if width >= 16 {
+        7
+    } else if width >= 8 {
+        3
+    } else {
+        2
+    };
 
     if lane_stride == 1 {
         let st = |r: isize, v: __m256i| {
             let packed = _mm256_permute4x64_epi64::<0x08>(_mm256_packus_epi32(v, v));
-            _mm_storeu_si128(bp.offset(i as isize + r * ps) as *mut __m128i, _mm256_castsi256_si128(packed));
+            _mm_storeu_si128(
+                bp.offset(i as isize + r * ps) as *mut __m128i,
+                _mm256_castsi256_si128(packed),
+            );
         };
-        for k in 0..m { st(-(k as isize) - 1, np[k]); st(k as isize, nq[k]); }
+        for k in 0..m {
+            st(-(k as isize) - 1, np[k]);
+            st(k as isize, nq[k]);
+        }
     } else if n == 4 {
         // rebuild the 8-col tile [p3,p2,p1,p0,q0,q1,q2,q3] with modified values.
         let mut col = [zero; 8];
-        col[0] = p[3]; col[1] = p[2]; col[2] = p[1]; col[3] = p[0];
-        col[4] = q[0]; col[5] = q[1]; col[6] = q[2]; col[7] = q[3];
-        for k in 0..m { col[3 - k] = np[k]; col[4 + k] = nq[k]; }
+        col[0] = p[3];
+        col[1] = p[2];
+        col[2] = p[1];
+        col[3] = p[0];
+        col[4] = q[0];
+        col[5] = q[1];
+        col[6] = q[2];
+        col[7] = q[3];
+        for k in 0..m {
+            col[3 - k] = np[k];
+            col[4 + k] = nq[k];
+        }
         transpose8(&mut col);
         for l in 0..8 {
             let row = i as isize + l as isize * ls;
             let packed = _mm256_permute4x64_epi64::<0x08>(_mm256_packus_epi32(col[l], col[l]));
-            _mm_storeu_si128(bp.offset(row - 4) as *mut __m128i, _mm256_castsi256_si128(packed));
+            _mm_storeu_si128(
+                bp.offset(row - 4) as *mut __m128i,
+                _mm256_castsi256_si128(packed),
+            );
         }
     } else {
         // width 16 vertical: rebuild both 8-col tiles, transpose, store.
         let mut lo = [zero; 8]; // p7..p0
         let mut hi = [zero; 8]; // q0..q7
-        for k in 0..8 { lo[7 - k] = p[k]; hi[k] = q[k]; }
-        for k in 0..m { lo[7 - k] = np[k]; hi[k] = nq[k]; }
+        for k in 0..8 {
+            lo[7 - k] = p[k];
+            hi[k] = q[k];
+        }
+        for k in 0..m {
+            lo[7 - k] = np[k];
+            hi[k] = nq[k];
+        }
         transpose8(&mut lo);
         transpose8(&mut hi);
         for l in 0..8 {
             let row = i as isize + l as isize * ls;
             let plo = _mm256_permute4x64_epi64::<0x08>(_mm256_packus_epi32(lo[l], lo[l]));
             let phi = _mm256_permute4x64_epi64::<0x08>(_mm256_packus_epi32(hi[l], hi[l]));
-            _mm_storeu_si128(bp.offset(row - 8) as *mut __m128i, _mm256_castsi256_si128(plo));
+            _mm_storeu_si128(
+                bp.offset(row - 8) as *mut __m128i,
+                _mm256_castsi256_si128(plo),
+            );
             _mm_storeu_si128(bp.offset(row) as *mut __m128i, _mm256_castsi256_si128(phi));
         }
     }
@@ -983,15 +1490,25 @@ mod tests {
         let stride = 40usize;
         let bd = 8;
         for &(lim, mblim, hev) in &[(8i32, 28, 1i32), (4, 16, 0), (16, 52, 2), (1, 9, 0)] {
-            let t = Thresh { lim, mblim, hev_thr: hev };
+            let t = Thresh {
+                lim,
+                mblim,
+                hev_thr: hev,
+            };
             for &width in &[4usize, 8, 16] {
                 for kind in 0..3 {
                     let mut buf = vec![0u16; stride * 40];
                     for (idx, v) in buf.iter_mut().enumerate() {
                         *v = match kind {
-                            0 => (rng() % 256) as u16,                       // textured
-                            1 => (110 + (rng() % 5)) as u16,                 // near-flat
-                            _ => if (idx % stride) >= 20 { 200 } else { 40 }, // step edge
+                            0 => (rng() % 256) as u16,       // textured
+                            1 => (110 + (rng() % 5)) as u16, // near-flat
+                            _ => {
+                                if (idx % stride) >= 20 {
+                                    200
+                                } else {
+                                    40
+                                }
+                            } // step edge
                         };
                     }
                     let base = 16 * stride + 16;

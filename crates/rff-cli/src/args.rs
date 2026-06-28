@@ -133,15 +133,33 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             // -vcodec / -acodec aliases.
             "c" | "codec" => {
                 let name = take_value(args, &mut i, arg)?;
-                apply_codec(spec, &name, &mut video_codec, &mut audio_codec, &mut warnings);
+                apply_codec(
+                    spec,
+                    &name,
+                    &mut video_codec,
+                    &mut audio_codec,
+                    &mut warnings,
+                );
             }
             "vcodec" => {
                 let name = take_value(args, &mut i, arg)?;
-                apply_codec(Some("v"), &name, &mut video_codec, &mut audio_codec, &mut warnings);
+                apply_codec(
+                    Some("v"),
+                    &name,
+                    &mut video_codec,
+                    &mut audio_codec,
+                    &mut warnings,
+                );
             }
             "acodec" => {
                 let name = take_value(args, &mut i, arg)?;
-                apply_codec(Some("a"), &name, &mut video_codec, &mut audio_codec, &mut warnings);
+                apply_codec(
+                    Some("a"),
+                    &name,
+                    &mut video_codec,
+                    &mut audio_codec,
+                    &mut warnings,
+                );
             }
 
             // Stream selection: -map INPUT[:v|:a|:N] (repeatable).
@@ -156,9 +174,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             // Video filter graph: -vf / -filter:v.
             "vf" => video_filters = Some(take_value(args, &mut i, arg)?),
             // Multi-input filter graph: -filter_complex / -lavfi.
-            "filter_complex" | "lavfi" => {
-                filter_complex = Some(take_value(args, &mut i, arg)?)
-            }
+            "filter_complex" | "lavfi" => filter_complex = Some(take_value(args, &mut i, arg)?),
             "filter" => {
                 let value = take_value(args, &mut i, arg)?;
                 match spec {
@@ -184,9 +200,8 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             "crf" | "qp" | "preset" | "pass" => {
                 let value = take_value(args, &mut i, arg)?;
                 if base == "pass" && value != "1" {
-                    warnings.push(
-                        "two-pass (-pass 2) is parsed but runs single-pass for now".into(),
-                    );
+                    warnings
+                        .push("two-pass (-pass 2) is parsed but runs single-pass for now".into());
                 }
                 match spec {
                     Some(s) if s.starts_with('a') => audio_opts.set(base, value),

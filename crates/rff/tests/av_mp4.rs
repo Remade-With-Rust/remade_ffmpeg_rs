@@ -6,7 +6,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rff::core::{AudioFrame, CodecId, Dictionary, Frame, MediaType, Packet, PixelFormat, Rational, SampleFormat, VideoFrame};
+use rff::core::{
+    AudioFrame, CodecId, Dictionary, Frame, MediaType, Packet, PixelFormat, Rational, SampleFormat,
+    VideoFrame,
+};
 use rff::format::Stream;
 use rff::transcode::{InputSpec, MapSelector, MapSpec, OutputSpec, StreamCodec, TranscodeSpec};
 use rff::Engine;
@@ -37,7 +40,10 @@ fn write_avif(engine: &Engine, path: &Path) {
     while let Ok(p) = enc.receive_packet() {
         payload.extend_from_slice(&p.data);
     }
-    let mut mux = engine.formats.open_muxer("avif", Box::new(fs::File::create(path).unwrap())).unwrap();
+    let mut mux = engine
+        .formats
+        .open_muxer("avif", Box::new(fs::File::create(path).unwrap()))
+        .unwrap();
     let mut s = Stream::new(0, CodecId::Avif);
     s.width = w;
     s.height = h;
@@ -63,7 +69,10 @@ fn write_wav(engine: &Engine, path: &Path) {
     enc.send_frame(&Frame::Audio(af)).unwrap();
     enc.flush();
     let packet = enc.receive_packet().unwrap();
-    let mut mux = engine.formats.open_muxer("wav", Box::new(fs::File::create(path).unwrap())).unwrap();
+    let mut mux = engine
+        .formats
+        .open_muxer("wav", Box::new(fs::File::create(path).unwrap()))
+        .unwrap();
     let mut s = Stream::new(0, CodecId::Pcm);
     s.sample_rate = 8000;
     s.channels = 1;
@@ -75,12 +84,24 @@ fn write_wav(engine: &Engine, path: &Path) {
 
 fn av_spec(inputs: Vec<PathBuf>, out: &Path) -> TranscodeSpec {
     TranscodeSpec {
-        inputs: inputs.into_iter().map(|p| InputSpec { path: p, format: None }).collect(),
+        inputs: inputs
+            .into_iter()
+            .map(|p| InputSpec {
+                path: p,
+                format: None,
+            })
+            .collect(),
         outputs: vec![OutputSpec {
             path: out.to_path_buf(),
             format: None,
-            video_codec: Some(StreamCodec { codec: CodecId::Avif, options: Dictionary::new() }),
-            audio_codec: Some(StreamCodec { codec: CodecId::Opus, options: Dictionary::new() }),
+            video_codec: Some(StreamCodec {
+                codec: CodecId::Avif,
+                options: Dictionary::new(),
+            }),
+            audio_codec: Some(StreamCodec {
+                codec: CodecId::Opus,
+                options: Dictionary::new(),
+            }),
             video_filters: None,
             filter_complex: None,
             maps: Vec::new(),
@@ -104,10 +125,18 @@ fn av1_plus_opus_mp4_roundtrip() {
     let info = rff::probe::probe(&engine, &mp4).unwrap();
     assert_eq!(info.format_name, "mp4");
     assert_eq!(info.streams.len(), 2);
-    let v = info.streams.iter().find(|s| s.media_type == MediaType::Video).unwrap();
+    let v = info
+        .streams
+        .iter()
+        .find(|s| s.media_type == MediaType::Video)
+        .unwrap();
     assert_eq!(v.codec_id, CodecId::Avif);
     assert_eq!((v.width, v.height), (64, 64));
-    let a = info.streams.iter().find(|s| s.media_type == MediaType::Audio).unwrap();
+    let a = info
+        .streams
+        .iter()
+        .find(|s| s.media_type == MediaType::Audio)
+        .unwrap();
     assert_eq!(a.codec_id, CodecId::Opus);
 
     // Audio timing is real, not nominal: an 8 kHz timescale with 20 ms
@@ -127,12 +156,23 @@ fn av1_plus_opus_mp4_roundtrip() {
     }
     assert!(audio_pts.len() >= 2, "expected several Opus frames");
     assert_eq!(audio_pts[0], 0);
-    assert_eq!(audio_pts[1] - audio_pts[0], 160, "20 ms @ 8 kHz = 160 samples");
-    assert!(audio_pts.windows(2).all(|w| w[1] > w[0]), "PTS must increase");
+    assert_eq!(
+        audio_pts[1] - audio_pts[0],
+        160,
+        "20 ms @ 8 kHz = 160 samples"
+    );
+    assert!(
+        audio_pts.windows(2).all(|w| w[1] > w[0]),
+        "PTS must increase"
+    );
 
     // Re-transcode the MP4: this decodes BOTH tracks back out of it.
     let report = rff::transcode::run(&engine, &av_spec(vec![mp4.clone()], &mp4b)).expect("re-mux");
-    assert!(report.frames_decoded >= 2, "expected video + audio frames decoded, got {}", report.frames_decoded);
+    assert!(
+        report.frames_decoded >= 2,
+        "expected video + audio frames decoded, got {}",
+        report.frames_decoded
+    );
     assert_eq!(rff::probe::probe(&engine, &mp4b).unwrap().streams.len(), 2);
 
     for p in [avif, wav, mp4, mp4b] {
@@ -166,7 +206,10 @@ fn map_selects_individual_streams() {
     // `-map 0:0` → just the first (video) stream by index.
     let video_only = tmp("vonly", "mp4");
     let mut v_spec = av_spec(vec![mp4.clone()], &video_only);
-    v_spec.outputs[0].maps = vec![MapSpec { input: 0, selector: MapSelector::Index(0) }];
+    v_spec.outputs[0].maps = vec![MapSpec {
+        input: 0,
+        selector: MapSelector::Index(0),
+    }];
     rff::transcode::run(&engine, &v_spec).expect("map video");
     let vi = rff::probe::probe(&engine, &video_only).unwrap();
     assert_eq!(vi.streams.len(), 1);

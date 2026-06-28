@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn mode_mv_merge_matches_libvpx() {
         assert_eq!(mode_mv_merge_probs(128, [0, 0]), 128); // no counts -> unchanged
-        // den=20 -> factor 128, prob=get_prob(20,20)=255 -> weighted(128,255,128)=192
+                                                           // den=20 -> factor 128, prob=get_prob(20,20)=255 -> weighted(128,255,128)=192
         assert_eq!(mode_mv_merge_probs(128, [20, 0]), 192);
         // equal counts -> prob 128 -> stays 128
         assert_eq!(mode_mv_merge_probs(128, [10, 10]), 128);

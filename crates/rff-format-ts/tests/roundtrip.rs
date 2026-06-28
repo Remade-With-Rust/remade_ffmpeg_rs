@@ -18,7 +18,10 @@ fn demux_and_remux_real_ts() {
     eprintln!(
         "[TS] {} streams: {:?}",
         streams.len(),
-        streams.iter().map(|s| (s.codec_id, s.media_type)).collect::<Vec<_>>()
+        streams
+            .iter()
+            .map(|s| (s.codec_id, s.media_type))
+            .collect::<Vec<_>>()
     );
     assert!(!streams.is_empty(), "must find at least one stream");
 

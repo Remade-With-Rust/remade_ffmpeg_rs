@@ -5,7 +5,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rff::core::{AudioFrame, CodecId, Frame, MediaType, Packet, PixelFormat, SampleFormat, VideoFrame};
+use rff::core::{
+    AudioFrame, CodecId, Frame, MediaType, Packet, PixelFormat, SampleFormat, VideoFrame,
+};
 use rff::format::Stream;
 use rff::transcode::{InputSpec, OutputSpec, TranscodeSpec};
 use rff::Engine;
@@ -84,8 +86,14 @@ fn muxes_video_and_audio_into_one_avi() {
     // `ffmpeg -i v.avif -i a.wav -c:v copy -c:a copy -y out.avi`
     let spec = TranscodeSpec {
         inputs: vec![
-            InputSpec { path: avif.clone(), format: None },
-            InputSpec { path: wav.clone(), format: None },
+            InputSpec {
+                path: avif.clone(),
+                format: None,
+            },
+            InputSpec {
+                path: wav.clone(),
+                format: None,
+            },
         ],
         outputs: vec![OutputSpec {
             path: out.clone(),
@@ -99,7 +107,10 @@ fn muxes_video_and_audio_into_one_avi() {
         }],
     };
     let report = rff::transcode::run(&engine, &spec).expect("a/v mux");
-    assert!(report.packets_written >= 2, "expected video + audio packets");
+    assert!(
+        report.packets_written >= 2,
+        "expected video + audio packets"
+    );
 
     // The AVI now carries both streams.
     let info = rff::probe::probe(&engine, &out).expect("probe avi");
@@ -117,10 +128,16 @@ fn muxes_video_and_audio_into_one_avi() {
     let _ = dem.read_header().unwrap();
     let mut by_stream: std::collections::BTreeMap<usize, Vec<u8>> = Default::default();
     while let Ok(p) = dem.read_packet() {
-        by_stream.entry(p.stream_index).or_default().extend_from_slice(&p.data);
+        by_stream
+            .entry(p.stream_index)
+            .or_default()
+            .extend_from_slice(&p.data);
     }
     assert_eq!(by_stream.len(), 2, "both streams should have packets");
-    assert!(by_stream.values().any(|d| *d == pcm), "audio PCM survived the copy");
+    assert!(
+        by_stream.values().any(|d| *d == pcm),
+        "audio PCM survived the copy"
+    );
 
     for p in [avif, wav, out] {
         let _ = fs::remove_file(p);

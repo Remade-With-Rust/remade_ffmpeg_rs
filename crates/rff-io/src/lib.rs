@@ -88,7 +88,12 @@ fn parse_url(url: &str) -> Result<Url<'_>> {
     if host.is_empty() {
         return Err(Error::invalid("URL has no host"));
     }
-    Ok(Url { scheme, host, port, path })
+    Ok(Url {
+        scheme,
+        host,
+        port,
+        path,
+    })
 }
 
 /// Resolve `host:port` and connect with a bounded timeout, then arm read/write
@@ -219,7 +224,9 @@ fn exchange<S: Read + Write + Send + 'static>(
         return fetch(&resolve_redirect(u, &loc), redirects - 1);
     }
     if !(200..300).contains(&status) {
-        return Err(Error::invalid(format!("HTTP request failed: status {status}")));
+        return Err(Error::invalid(format!(
+            "HTTP request failed: status {status}"
+        )));
     }
 
     // --- body ---
@@ -247,10 +254,7 @@ mod tls {
 
     /// Open a TLS client session to `host` over an established TCP stream, using
     /// a RustCrypto crypto provider and the OS trust store for roots.
-    pub fn connect(
-        tcp: TcpStream,
-        host: &str,
-    ) -> Result<StreamOwned<ClientConnection, TcpStream>> {
+    pub fn connect(tcp: TcpStream, host: &str) -> Result<StreamOwned<ClientConnection, TcpStream>> {
         let provider = Arc::new(rustls_rustcrypto::provider());
 
         let mut roots = RootCertStore::empty();
@@ -289,13 +293,19 @@ struct ChunkedReader<R: BufRead> {
 
 impl<R: BufRead> ChunkedReader<R> {
     fn new(inner: R) -> ChunkedReader<R> {
-        ChunkedReader { inner, remaining: 0, done: false }
+        ChunkedReader {
+            inner,
+            remaining: 0,
+            done: false,
+        }
     }
 
     /// Read the next `len\r\n` size line, setting `remaining`.
     fn next_size(&mut self) -> std::io::Result<()> {
         let mut line = String::new();
-        let n = (&mut self.inner).take(MAX_CHUNK_LINE).read_line(&mut line)?;
+        let n = (&mut self.inner)
+            .take(MAX_CHUNK_LINE)
+            .read_line(&mut line)?;
         if n as u64 == MAX_CHUNK_LINE && !line.ends_with('\n') {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -365,7 +375,10 @@ mod tests {
         assert_eq!(u.path, "/dir/file.ts?x=1");
         // https default port + root path.
         let u = parse_url("https://host.example").unwrap();
-        assert_eq!((u.scheme, u.host, u.port, u.path.as_str()), ("https", "host.example", 443, "/"));
+        assert_eq!(
+            (u.scheme, u.host, u.port, u.path.as_str()),
+            ("https", "host.example", 443, "/")
+        );
     }
 
     #[test]
@@ -405,7 +418,9 @@ mod tests {
         }
     }
     fn serve(resp: &[u8]) -> Mock {
-        Mock { resp: Cursor::new(resp.to_vec()) }
+        Mock {
+            resp: Cursor::new(resp.to_vec()),
+        }
     }
 
     #[test]

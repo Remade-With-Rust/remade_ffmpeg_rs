@@ -9,7 +9,9 @@ use rff::format::Stream;
 use rff::Engine;
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "sample.avif".into());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "sample.avif".into());
     let (w, h) = (96usize, 64usize);
 
     // Luma gradient left→right; chroma sweeps so it isn't flat gray.
@@ -37,7 +39,10 @@ fn main() {
     });
 
     let engine = Engine::new();
-    let mut enc = engine.codecs.find_encoder(CodecId::Avif).expect("avif encoder");
+    let mut enc = engine
+        .codecs
+        .find_encoder(CodecId::Avif)
+        .expect("avif encoder");
     enc.send_frame(&frame).expect("send_frame");
     enc.flush();
     let mut payload = Vec::new();
@@ -53,7 +58,8 @@ fn main() {
     stream.width = w as u32;
     stream.height = h as u32;
     mux.write_header(&[stream]).expect("write_header");
-    mux.write_packet(&Packet::from_data(0, payload)).expect("write_packet");
+    mux.write_packet(&Packet::from_data(0, payload))
+        .expect("write_packet");
     mux.write_trailer().expect("write_trailer");
 
     println!("wrote {path}");

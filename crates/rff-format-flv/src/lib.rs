@@ -64,7 +64,9 @@ impl FlvDemuxer {
 
     fn read_file_header(&mut self) -> Result<()> {
         let mut h = [0u8; 9];
-        self.input.read_exact(&mut h).map_err(|_| Error::invalid("flv: short header"))?;
+        self.input
+            .read_exact(&mut h)
+            .map_err(|_| Error::invalid("flv: short header"))?;
         if &h[0..3] != b"FLV" {
             return Err(Error::invalid("flv: bad signature"));
         }
@@ -92,7 +94,8 @@ impl FlvDemuxer {
         }
         let tag_type = th[0];
         let size = u32::from_be_bytes([0, th[1], th[2], th[3]]) as usize;
-        let ts = ((th[7] as i64) << 24) | ((th[4] as i64) << 16) | ((th[5] as i64) << 8) | th[6] as i64;
+        let ts =
+            ((th[7] as i64) << 24) | ((th[4] as i64) << 16) | ((th[5] as i64) << 8) | th[6] as i64;
         let mut data = vec![0u8; size];
         if self.input.read_exact(&mut data).is_err() {
             return Ok(None);
@@ -169,7 +172,8 @@ impl Demuxer for FlvDemuxer {
                         continue; // 0 = seq header (already), 2 = end of sequence
                     }
                     let idx = self.ensure_video_stream(Vec::new());
-                    let cts = ((data[2] as i64) << 16 | (data[3] as i64) << 8 | data[4] as i64) as i64;
+                    let cts =
+                        ((data[2] as i64) << 16 | (data[3] as i64) << 8 | data[4] as i64) as i64;
                     let mut pkt = Packet::from_data(idx, data[5..].to_vec());
                     pkt.dts = Some(ts);
                     pkt.pts = Some(ts + cts);

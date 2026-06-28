@@ -73,18 +73,18 @@ pub const NEWMV: u8 = 13;
 /// Per-block mode information (intra key-frame *and* inter).
 #[derive(Clone, Copy, Debug)]
 pub struct ModeInfo {
-    pub sb_type: u8,    // BLOCK_SIZE
-    pub mode: u8,       // block Y mode (or inter mode ≥ NEARESTMV)
-    pub bmi: [u8; 4],   // sub-8×8 Y modes
-    pub uv_mode: u8,    // chroma mode
-    pub skip: bool,     // skip flag
-    pub tx_size: u8,    // TX_SIZE 0..=3
+    pub sb_type: u8,  // BLOCK_SIZE
+    pub mode: u8,     // block Y mode (or inter mode ≥ NEARESTMV)
+    pub bmi: [u8; 4], // sub-8×8 Y modes
+    pub uv_mode: u8,  // chroma mode
+    pub skip: bool,   // skip flag
+    pub tx_size: u8,  // TX_SIZE 0..=3
     pub is_inter: bool,
     // ---- inter fields ----
-    pub ref_frame: [i8; 2], // [NONE/INTRA/LAST/GOLDEN/ALTREF; 2]
-    pub mv: [Mv; 2],        // block MVs (per reference)
+    pub ref_frame: [i8; 2],   // [NONE/INTRA/LAST/GOLDEN/ALTREF; 2]
+    pub mv: [Mv; 2],          // block MVs (per reference)
     pub bmi_mv: [[Mv; 2]; 4], // sub-8×8 per-4×4 MVs
-    pub interp_filter: u8,  // 0..3 or SWITCHABLE_FILTERS(3) sentinel
+    pub interp_filter: u8,    // 0..3 or SWITCHABLE_FILTERS(3) sentinel
     pub segment_id: u8,
     pub seg_id_predicted: bool,
 }
@@ -157,7 +157,12 @@ pub fn left_block_mode(cur: &ModeInfo, left: Option<&ModeInfo>, b: usize) -> u8 
 
 /// Key-frame Y-mode tree probabilities for sub-block `b`, indexed by the above
 /// and left neighbour modes (libvpx `get_y_mode_probs`).
-pub fn kf_y_mode_probs(cur: &ModeInfo, above: Option<&ModeInfo>, left: Option<&ModeInfo>, b: usize) -> &'static [u8; 9] {
+pub fn kf_y_mode_probs(
+    cur: &ModeInfo,
+    above: Option<&ModeInfo>,
+    left: Option<&ModeInfo>,
+    b: usize,
+) -> &'static [u8; 9] {
     let a = above_block_mode(cur, above, b) as usize;
     let l = left_block_mode(cur, left, b) as usize;
     &KF_Y_MODE_PROBS[a][l]
@@ -198,7 +203,13 @@ pub fn tx_size_context(cur: &ModeInfo, above: Option<&ModeInfo>, left: Option<&M
 /// Partition context (libvpx `dec_partition_plane_context`):
 /// `(left*2 + above) + bsl*4`, where `above`/`left` are the `bsl`-th bit of the
 /// above/left segment-context bytes.
-pub fn partition_plane_context(above_seg: &[u8], left_seg: &[u8], mi_row: usize, mi_col: usize, bsl: usize) -> usize {
+pub fn partition_plane_context(
+    above_seg: &[u8],
+    left_seg: &[u8],
+    mi_row: usize,
+    mi_col: usize,
+    bsl: usize,
+) -> usize {
     let above = (above_seg[mi_col] >> bsl) & 1;
     let left = (left_seg[mi_row & MI_MASK] >> bsl) & 1;
     (left as usize * 2 + above as usize) + bsl * 4
@@ -206,7 +217,14 @@ pub fn partition_plane_context(above_seg: &[u8], left_seg: &[u8], mi_row: usize,
 
 /// Update the above/left partition (segment) context after a block of size
 /// `subsize` covering `bw` mi units (libvpx `dec_update_partition_context`).
-pub fn update_partition_context(above_seg: &mut [u8], left_seg: &mut [u8], mi_row: usize, mi_col: usize, subsize: usize, bw: usize) {
+pub fn update_partition_context(
+    above_seg: &mut [u8],
+    left_seg: &mut [u8],
+    mi_row: usize,
+    mi_col: usize,
+    subsize: usize,
+    bw: usize,
+) {
     let a = PARTITION_CTX_ABOVE[subsize];
     let l = PARTITION_CTX_LEFT[subsize];
     for i in 0..bw {
@@ -223,7 +241,12 @@ pub fn subsize(partition: usize, bsize: usize) -> u8 {
 
 /// Read a partition type given its context probabilities and whether the lower
 /// /right halves are inside the frame (libvpx `read_partition`).
-pub fn read_partition(bd: &mut BoolDecoder, probs: &[u8; 3], has_rows: bool, has_cols: bool) -> usize {
+pub fn read_partition(
+    bd: &mut BoolDecoder,
+    probs: &[u8; 3],
+    has_rows: bool,
+    has_cols: bool,
+) -> usize {
     if has_rows && has_cols {
         read_tree(bd, &PARTITION_TREE, probs) as usize
     } else if !has_rows && has_cols {
@@ -263,7 +286,14 @@ pub fn read_selected_tx_size(bd: &mut BoolDecoder, tx_probs: &[u8], max_tx_size:
 
 /// Resolve the TX size for a block (libvpx `read_tx_size`). On the intra path
 /// `allow_select` is true; `tx_mode` selects the cap when not reading bits.
-pub fn read_tx_size(bd: &mut BoolDecoder, bsize: usize, tx_mode: usize, allow_select: bool, tx_probs: &[u8], ctx_max_tx_probs: usize) -> u8 {
+pub fn read_tx_size(
+    bd: &mut BoolDecoder,
+    bsize: usize,
+    tx_mode: usize,
+    allow_select: bool,
+    tx_probs: &[u8],
+    ctx_max_tx_probs: usize,
+) -> u8 {
     let _ = ctx_max_tx_probs;
     let max_tx_size = MAX_TXSIZE[bsize] as usize;
     if allow_select && tx_mode == TX_MODE_SELECT && bsize >= BLOCK_8X8 {
@@ -313,15 +343,27 @@ mod tests {
         assert_eq!(above_block_mode(&cur, None, 0), DC_PRED);
         assert_eq!(left_block_mode(&cur, None, 0), DC_PRED);
         // An inter neighbour is also treated as DC for intra mode prediction.
-        let inter = ModeInfo { is_inter: true, mode: TM_PRED, ..Default::default() };
+        let inter = ModeInfo {
+            is_inter: true,
+            mode: TM_PRED,
+            ..Default::default()
+        };
         assert_eq!(above_block_mode(&cur, Some(&inter), 1), DC_PRED);
     }
 
     #[test]
     fn block_mode_reads_neighbour_and_self() {
         // 8×8 above neighbour with mode V → above mode of top sub-blocks is V.
-        let above = ModeInfo { sb_type: BLOCK_8X8 as u8, mode: 1, ..Default::default() };
-        let cur = ModeInfo { sb_type: BLOCK_8X8 as u8, bmi: [3, 4, 5, 6], ..Default::default() };
+        let above = ModeInfo {
+            sb_type: BLOCK_8X8 as u8,
+            mode: 1,
+            ..Default::default()
+        };
+        let cur = ModeInfo {
+            sb_type: BLOCK_8X8 as u8,
+            bmi: [3, 4, 5, 6],
+            ..Default::default()
+        };
         assert_eq!(above_block_mode(&cur, Some(&above), 0), 1);
         // Lower sub-blocks (b=2,3) read the current block's own bmi.
         assert_eq!(above_block_mode(&cur, Some(&above), 2), cur.bmi[0]);
@@ -330,24 +372,47 @@ mod tests {
 
     #[test]
     fn kf_mode_prob_selection_indexes_by_neighbours() {
-        let above = ModeInfo { sb_type: BLOCK_8X8 as u8, mode: 2, ..Default::default() };
-        let left = ModeInfo { sb_type: BLOCK_8X8 as u8, mode: 5, ..Default::default() };
-        let cur = ModeInfo { sb_type: BLOCK_8X8 as u8, ..Default::default() };
+        let above = ModeInfo {
+            sb_type: BLOCK_8X8 as u8,
+            mode: 2,
+            ..Default::default()
+        };
+        let left = ModeInfo {
+            sb_type: BLOCK_8X8 as u8,
+            mode: 5,
+            ..Default::default()
+        };
+        let cur = ModeInfo {
+            sb_type: BLOCK_8X8 as u8,
+            ..Default::default()
+        };
         let p = kf_y_mode_probs(&cur, Some(&above), Some(&left), 0);
         assert_eq!(p, &KF_Y_MODE_PROBS[2][5]);
     }
 
     #[test]
     fn contexts_match_formulas() {
-        let s0 = ModeInfo { skip: false, ..Default::default() };
-        let s1 = ModeInfo { skip: true, ..Default::default() };
+        let s0 = ModeInfo {
+            skip: false,
+            ..Default::default()
+        };
+        let s1 = ModeInfo {
+            skip: true,
+            ..Default::default()
+        };
         assert_eq!(skip_context(Some(&s1), Some(&s1)), 2);
         assert_eq!(skip_context(Some(&s0), None), 0);
         // partition context: bsl picks the bit, packs (left*2+above)+bsl*4.
         let above_seg = [0b1000u8; 8];
         let left_seg = [0b1000u8; 8];
-        assert_eq!(partition_plane_context(&above_seg, &left_seg, 0, 0, 3), (1 * 2 + 1) + 3 * 4);
-        assert_eq!(partition_plane_context(&above_seg, &left_seg, 0, 0, 2), 0 + 2 * 4);
+        assert_eq!(
+            partition_plane_context(&above_seg, &left_seg, 0, 0, 3),
+            (1 * 2 + 1) + 3 * 4
+        );
+        assert_eq!(
+            partition_plane_context(&above_seg, &left_seg, 0, 0, 2),
+            0 + 2 * 4
+        );
     }
 
     #[test]

@@ -17,7 +17,8 @@ fn main() {
     // ~0.3s of a 440 Hz tone as interleaved s16, at the chosen rate.
     let mut pcm = Vec::new();
     for i in 0..(sample_rate as usize * 3 / 10) {
-        let s = ((std::f32::consts::TAU * 440.0 * i as f32 / sample_rate as f32).sin() * 12000.0) as i16;
+        let s = ((std::f32::consts::TAU * 440.0 * i as f32 / sample_rate as f32).sin() * 12000.0)
+            as i16;
         pcm.extend_from_slice(&s.to_le_bytes());
     }
 

@@ -10,7 +10,9 @@ use std::sync::OnceLock;
 use crate::frame::{BlockType, GranuleSideInfo, GRANULE_LINES};
 
 /// The eight alias-reduction `ci` coefficients (ISO 11172-3 Table B.9).
-const CI: [f32; 8] = [-0.6, -0.535, -0.33, -0.185, -0.095, -0.041, -0.0142, -0.0037];
+const CI: [f32; 8] = [
+    -0.6, -0.535, -0.33, -0.185, -0.095, -0.041, -0.0142, -0.0037,
+];
 
 /// `(cs, ca)` butterfly weights: `cs = 1/√(1+ci²)`, `ca = ci/√(1+ci²)`.
 fn weights() -> &'static ([f32; 8], [f32; 8]) {
@@ -33,7 +35,11 @@ pub fn reduce(gi: &GranuleSideInfo, lines: &mut [f32; GRANULE_LINES]) {
     // Subband boundaries to butterfly: none for pure short, 1 for the long part
     // of a mixed block, all 31 for long blocks.
     let boundaries = if is_short {
-        if gi.mixed_block { 1 } else { 0 }
+        if gi.mixed_block {
+            1
+        } else {
+            0
+        }
     } else {
         31
     };
@@ -65,7 +71,10 @@ mod tests {
         reduce(&GranuleSideInfo::default(), &mut lines); // long block
         let after: f32 = lines.iter().map(|v| v * v).sum();
         // Orthogonal rotations conserve energy.
-        assert!((before - after).abs() < 1e-2, "before {before} after {after}");
+        assert!(
+            (before - after).abs() < 1e-2,
+            "before {before} after {after}"
+        );
     }
 
     #[test]
@@ -81,6 +90,9 @@ mod tests {
             ..Default::default()
         };
         reduce(&gi, &mut lines);
-        assert_eq!(lines, snapshot, "pure short blocks must not be alias-reduced");
+        assert_eq!(
+            lines, snapshot,
+            "pure short blocks must not be alias-reduced"
+        );
     }
 }

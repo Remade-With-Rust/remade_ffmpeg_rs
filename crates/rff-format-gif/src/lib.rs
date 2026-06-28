@@ -92,7 +92,9 @@ impl Muxer for GifMuxer {
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
         match streams.first() {
             Some(s) if s.codec_id == CodecId::Gif => Ok(()),
-            Some(_) => Err(Error::unsupported("gif mux: only the `gif` codec is supported")),
+            Some(_) => Err(Error::unsupported(
+                "gif mux: only the `gif` codec is supported",
+            )),
             None => Err(Error::invalid("gif mux: no streams")),
         }
     }

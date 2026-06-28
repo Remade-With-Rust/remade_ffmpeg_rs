@@ -34,9 +34,9 @@ mod frame;
 mod header;
 mod tables;
 
-use header::FrameHeader;
 pub use decode::Mp3Decode;
 pub use encode::Mp3Encode;
+use header::FrameHeader;
 
 /// Register the MP3 codec (decoder + encoder) into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
@@ -71,7 +71,12 @@ impl Mp3Decoder {
                 pos += 1;
                 continue;
             }
-            let hb = [self.buf[pos], self.buf[pos + 1], self.buf[pos + 2], self.buf[pos + 3]];
+            let hb = [
+                self.buf[pos],
+                self.buf[pos + 1],
+                self.buf[pos + 2],
+                self.buf[pos + 3],
+            ];
             let header = match FrameHeader::parse(hb) {
                 Ok(h) => h,
                 Err(_) => {
@@ -256,7 +261,12 @@ mod tests {
         use frame::ChannelMode::{Mono, Stereo};
         use header::MpegVersion::{V1, V2};
         // (version, channel mode, expected side-info length in bytes)
-        for (v, m, len) in [(V1, Stereo, 32), (V1, Mono, 17), (V2, Stereo, 17), (V2, Mono, 9)] {
+        for (v, m, len) in [
+            (V1, Stereo, 32),
+            (V1, Mono, 17),
+            (V2, Stereo, 17),
+            (V2, Mono, 9),
+        ] {
             let h = hdr(v, m);
             assert_eq!(h.side_info_len(), len);
             // An all-zero block parses cleanly; parse()'s debug_assert verifies

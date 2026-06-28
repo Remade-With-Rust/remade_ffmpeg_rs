@@ -148,20 +148,35 @@ fn has_avx2() -> bool {
 /// `n` u16s; the caller guarantees this via an in-bounds (no edge-clamp) check.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn conv8_avx2(src: *const u16, tap_stride: usize, f: &[i32; 8], dst: *mut u16, n: usize, max: i32) {
+unsafe fn conv8_avx2(
+    src: *const u16,
+    tap_stride: usize,
+    f: &[i32; 8],
+    dst: *mut u16,
+    n: usize,
+    max: i32,
+) {
     use std::arch::x86_64::*;
     let round = _mm256_set1_epi32(64);
     let maxv = _mm256_set1_epi32(max);
     let zero = _mm256_setzero_si256();
     let fk = [
-        _mm256_set1_epi32(f[0]), _mm256_set1_epi32(f[1]), _mm256_set1_epi32(f[2]), _mm256_set1_epi32(f[3]),
-        _mm256_set1_epi32(f[4]), _mm256_set1_epi32(f[5]), _mm256_set1_epi32(f[6]), _mm256_set1_epi32(f[7]),
+        _mm256_set1_epi32(f[0]),
+        _mm256_set1_epi32(f[1]),
+        _mm256_set1_epi32(f[2]),
+        _mm256_set1_epi32(f[3]),
+        _mm256_set1_epi32(f[4]),
+        _mm256_set1_epi32(f[5]),
+        _mm256_set1_epi32(f[6]),
+        _mm256_set1_epi32(f[7]),
     ];
     let mut i = 0usize;
     while i + 8 <= n {
         let mut acc = zero;
         for k in 0..8 {
-            let s = _mm256_cvtepu16_epi32(_mm_loadu_si128(src.add(i + k * tap_stride) as *const __m128i));
+            let s = _mm256_cvtepu16_epi32(_mm_loadu_si128(
+                src.add(i + k * tap_stride) as *const __m128i
+            ));
             acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(s, fk[k]));
         }
         acc = _mm256_srai_epi32::<7>(_mm256_add_epi32(acc, round));
@@ -235,7 +250,14 @@ unsafe fn predict_block_avx2(
                     conv8_avx2(s, 1, fx, tptr.add(r * w), w, max);
                 }
                 for y in 0..h {
-                    conv8_avx2(tptr.add(y * w) as *const u16, w, fy, dptr.add(y * dst_stride), w, max);
+                    conv8_avx2(
+                        tptr.add(y * w) as *const u16,
+                        w,
+                        fy,
+                        dptr.add(y * dst_stride),
+                        w,
+                        max,
+                    );
                 }
             });
         }
@@ -265,7 +287,14 @@ fn has_neon() -> bool {
 /// `n` u16s; the caller guarantees this via an in-bounds (no edge-clamp) check.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn conv8_neon(src: *const u16, tap_stride: usize, f: &[i32; 8], dst: *mut u16, n: usize, max: i32) {
+unsafe fn conv8_neon(
+    src: *const u16,
+    tap_stride: usize,
+    f: &[i32; 8],
+    dst: *mut u16,
+    n: usize,
+    max: i32,
+) {
     use std::arch::aarch64::*;
     let round = vdupq_n_s32(64);
     let zero = vdupq_n_s32(0);
@@ -350,7 +379,14 @@ unsafe fn predict_block_neon(
                     conv8_neon(s, 1, fx, tptr.add(r * w), w, max);
                 }
                 for y in 0..h {
-                    conv8_neon(tptr.add(y * w) as *const u16, w, fy, dptr.add(y * dst_stride), w, max);
+                    conv8_neon(
+                        tptr.add(y * w) as *const u16,
+                        w,
+                        fy,
+                        dptr.add(y * dst_stride),
+                        w,
+                        max,
+                    );
                 }
             });
         }
@@ -442,7 +478,11 @@ pub fn predict_block(
                     for (k, &f) in fx.iter().enumerate() {
                         sum += refp.px(bx + x as i32 + k as i32 - 3, by + y as i32) * f;
                     }
-                    put(dst, y * dst_stride + x, clip_pixel(round_pow2(sum, FILTER_BITS), max));
+                    put(
+                        dst,
+                        y * dst_stride + x,
+                        clip_pixel(round_pow2(sum, FILTER_BITS), max),
+                    );
                 }
             }
         }
@@ -453,7 +493,11 @@ pub fn predict_block(
                     for (k, &f) in fy.iter().enumerate() {
                         sum += refp.px(bx + x as i32, by + y as i32 + k as i32 - 3) * f;
                     }
-                    put(dst, y * dst_stride + x, clip_pixel(round_pow2(sum, FILTER_BITS), max));
+                    put(
+                        dst,
+                        y * dst_stride + x,
+                        clip_pixel(round_pow2(sum, FILTER_BITS), max),
+                    );
                 }
             }
         }
@@ -461,26 +505,30 @@ pub fn predict_block(
             // Horizontal pass into an intermediate (h + 7 rows), then vertical.
             let tmp_h = h + TAPS - 1;
             MC_TMP.with(|cell| {
-            let mut tmp = cell.borrow_mut();
-            for r in 0..tmp_h {
-                let sy = by + r as i32 - 3;
-                for x in 0..w {
-                    let mut sum = 0i32;
-                    for (k, &f) in fx.iter().enumerate() {
-                        sum += refp.px(bx + x as i32 + k as i32 - 3, sy) * f;
+                let mut tmp = cell.borrow_mut();
+                for r in 0..tmp_h {
+                    let sy = by + r as i32 - 3;
+                    for x in 0..w {
+                        let mut sum = 0i32;
+                        for (k, &f) in fx.iter().enumerate() {
+                            sum += refp.px(bx + x as i32 + k as i32 - 3, sy) * f;
+                        }
+                        tmp[r * w + x] = clip_pixel(round_pow2(sum, FILTER_BITS), max);
                     }
-                    tmp[r * w + x] = clip_pixel(round_pow2(sum, FILTER_BITS), max);
                 }
-            }
-            for y in 0..h {
-                for x in 0..w {
-                    let mut sum = 0i32;
-                    for (k, &f) in fy.iter().enumerate() {
-                        sum += tmp[(y + k) * w + x] as i32 * f;
+                for y in 0..h {
+                    for x in 0..w {
+                        let mut sum = 0i32;
+                        for (k, &f) in fy.iter().enumerate() {
+                            sum += tmp[(y + k) * w + x] as i32 * f;
+                        }
+                        put(
+                            dst,
+                            y * dst_stride + x,
+                            clip_pixel(round_pow2(sum, FILTER_BITS), max),
+                        );
                     }
-                    put(dst, y * dst_stride + x, clip_pixel(round_pow2(sum, FILTER_BITS), max));
                 }
-            }
             });
         }
     }
@@ -530,7 +578,11 @@ pub fn scaled_predict_block(
     }
     // Vertical pass over the intermediate.
     let put = |dst: &mut [u16], o: usize, val: u16| {
-        dst[o] = if avg { round_pow2(dst[o] as i32 + val as i32, 1) as u16 } else { val };
+        dst[o] = if avg {
+            round_pow2(dst[o] as i32 + val as i32, 1) as u16
+        } else {
+            val
+        };
     };
     for x in 0..w {
         let mut y_q4 = subpel_y as i32;
@@ -541,7 +593,11 @@ pub fn scaled_predict_block(
             for (k, &c) in f.iter().enumerate() {
                 sum += tmp[(row + k) * w + x] as i32 * c;
             }
-            put(dst, y * dst_stride + x, clip_pixel(round_pow2(sum, FILTER_BITS), max));
+            put(
+                dst,
+                y * dst_stride + x,
+                clip_pixel(round_pow2(sum, FILTER_BITS), max),
+            );
             y_q4 += y_step_q4;
         }
     }
@@ -585,7 +641,9 @@ mod tests {
             s
         };
         for &max in &[255i32, 1023, 4095] {
-            let src: Vec<u16> = (0..stride * 40).map(|_| (rng() % (max as u32 + 1)) as u16).collect();
+            let src: Vec<u16> = (0..stride * 40)
+                .map(|_| (rng() % (max as u32 + 1)) as u16)
+                .collect();
             for filter in 0..SUBPEL_FILTERS.len() {
                 for &phase in &[0usize, 1, 7, 8, 15] {
                     let f = &SUBPEL_FILTERS[filter][phase];
@@ -594,7 +652,14 @@ mod tests {
                             let base = 5 * stride + 5;
                             let mut got = vec![0u16; n];
                             unsafe {
-                                conv8_neon(src.as_ptr().add(base), tap_stride, f, got.as_mut_ptr(), n, max);
+                                conv8_neon(
+                                    src.as_ptr().add(base),
+                                    tap_stride,
+                                    f,
+                                    got.as_mut_ptr(),
+                                    n,
+                                    max,
+                                );
                             }
                             let want: Vec<u16> = (0..n)
                                 .map(|i| {
@@ -618,7 +683,12 @@ mod tests {
         // subpel (0,0) copies the reference block verbatim.
         let w = 8;
         let buf: Vec<u16> = (0..64u16).collect();
-        let refp = RefPlane { buf: &buf, stride: w, w: 8, h: 8 };
+        let refp = RefPlane {
+            buf: &buf,
+            stride: w,
+            w: 8,
+            h: 8,
+        };
         let mut dst = [0u16; 16];
         predict_block(&refp, 1, 1, 0, 0, 0, &mut dst, 4, 4, 4, false, 255);
         for y in 0..4 {
@@ -632,7 +702,12 @@ mod tests {
     fn horiz_matches_manual_eighttap() {
         // One interior pixel, EIGHTTAP phase 8, computed by the same formula.
         let buf: Vec<u16> = (0..256).map(|i| i as u16).collect(); // 16x16 ramp
-        let refp = RefPlane { buf: &buf, stride: 16, w: 16, h: 16 };
+        let refp = RefPlane {
+            buf: &buf,
+            stride: 16,
+            w: 16,
+            h: 16,
+        };
         let mut dst = [0u16; 1];
         predict_block(&refp, 5, 5, 8, 0, 0, &mut dst, 1, 1, 1, false, 255);
         let f = &SUBPEL_FILTERS[0][8];
@@ -646,7 +721,12 @@ mod tests {
     #[test]
     fn avg_rounds_toward_existing() {
         let buf = vec![200u16; 64];
-        let refp = RefPlane { buf: &buf, stride: 8, w: 8, h: 8 };
+        let refp = RefPlane {
+            buf: &buf,
+            stride: 8,
+            w: 8,
+            h: 8,
+        };
         let mut dst = [100u16; 16];
         predict_block(&refp, 0, 0, 0, 0, 0, &mut dst, 4, 4, 4, true, 255);
         // round((100 + 200)/2) = 150.

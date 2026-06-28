@@ -89,7 +89,9 @@ fn drive_loop_transcodes_avif_to_avif() {
     let engine = Engine::new();
     let (w, h) = (64u32, 64u32);
     let original = gradient_frame(w as usize, h as usize);
-    let Frame::Video(src) = &original else { unreachable!() };
+    let Frame::Video(src) = &original else {
+        unreachable!()
+    };
 
     let in_path = tmp("xcode_in");
     let out_path = tmp("xcode_out");
@@ -125,7 +127,10 @@ fn drive_loop_transcodes_avif_to_avif() {
     assert_eq!(decoded.format, PixelFormat::Yuv420p);
     // Two lossy AV1 passes now; allow more drift than a single round-trip.
     let diff = mean_luma_diff(src, &decoded);
-    assert!(diff < 40.0, "luma drifted too far after transcode: {diff:.2}");
+    assert!(
+        diff < 40.0,
+        "luma drifted too far after transcode: {diff:.2}"
+    );
 
     let _ = fs::remove_file(&in_path);
     let _ = fs::remove_file(&out_path);
@@ -167,7 +172,10 @@ fn drive_loop_copies_stream_without_reencode() {
     let in_frame = read_avif(&engine, &in_path);
     let out_frame = read_avif(&engine, &out_path);
     assert_eq!((out_frame.width, out_frame.height), (w, h));
-    assert!(mean_luma_diff(&in_frame, &out_frame) < 0.01, "copy altered pixels");
+    assert!(
+        mean_luma_diff(&in_frame, &out_frame) < 0.01,
+        "copy altered pixels"
+    );
 
     let _ = fs::remove_file(&in_path);
     let _ = fs::remove_file(&out_path);

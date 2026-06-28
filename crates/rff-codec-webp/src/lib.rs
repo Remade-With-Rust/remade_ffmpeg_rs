@@ -89,7 +89,9 @@ impl Encoder for WebpEncoder {
         let vf = match frame {
             Frame::Video(v) => v,
             Frame::Audio(_) => {
-                return Err(Error::unsupported("webp encode: audio frame on an image codec"))
+                return Err(Error::unsupported(
+                    "webp encode: audio frame on an image codec",
+                ))
             }
         };
         self.packet = Some(Packet::from_data(0, encode_webp(vf)?));
@@ -180,7 +182,10 @@ mod tests {
         // Lossless: an RGB source round-trips exactly (decoded may carry alpha).
         let got_rgb: Vec<u8> = match decoded.format {
             PixelFormat::Rgb24 => decoded.planes[0].clone(),
-            PixelFormat::Rgba => decoded.planes[0].chunks_exact(4).flat_map(|p| p[0..3].to_vec()).collect(),
+            PixelFormat::Rgba => decoded.planes[0]
+                .chunks_exact(4)
+                .flat_map(|p| p[0..3].to_vec())
+                .collect(),
             other => panic!("unexpected format {other:?}"),
         };
         assert_eq!(got_rgb, rgb);

@@ -91,7 +91,11 @@ fn riff_chunks(buf: &[u8], mut p: usize, end: usize) -> Vec<([u8; 4], Range<usiz
 
 /// Find a `LIST` chunk of the given list type, returning its data range
 /// (including the 4-byte list type at the front).
-fn find_list(chunks: &[([u8; 4], Range<usize>)], buf: &[u8], list_type: &[u8; 4]) -> Option<Range<usize>> {
+fn find_list(
+    chunks: &[([u8; 4], Range<usize>)],
+    buf: &[u8],
+    list_type: &[u8; 4],
+) -> Option<Range<usize>> {
     chunks
         .iter()
         .find(|(id, r)| id == b"LIST" && r.len() >= 4 && &buf[r.start..r.start + 4] == list_type)
@@ -380,7 +384,10 @@ impl Muxer for AviMuxer {
     }
 
     fn write_trailer(&mut self) -> Result<()> {
-        let primary_video = self.streams.iter().find(|s| s.media_type == MediaType::Video);
+        let primary_video = self
+            .streams
+            .iter()
+            .find(|s| s.media_type == MediaType::Video);
         let (vw, vh) = primary_video.map_or((0, 0), |s| (s.width, s.height));
         let micros_per_frame = primary_video.map_or(0, |s| {
             let tb = s.time_base;
@@ -394,7 +401,11 @@ impl Muxer for AviMuxer {
 
         // --- hdrl: avih + one strl (strh + strf) per stream ---
         let mut hdrl = Vec::new();
-        put_chunk(&mut hdrl, b"avih", &self.avih(micros_per_frame, total_frames, vw, vh));
+        put_chunk(
+            &mut hdrl,
+            b"avih",
+            &self.avih(micros_per_frame, total_frames, vw, vh),
+        );
         for s in &self.streams {
             let length = self.packet_count(s.index);
             let mut strl = Vec::new();
@@ -620,7 +631,8 @@ mod tests {
         {
             let mut mux = AviMuxer::new(Box::new(sink.clone()));
             mux.write_header(&[vstream]).unwrap();
-            mux.write_packet(&Packet::from_data(0, b"frame-one".to_vec())).unwrap();
+            mux.write_packet(&Packet::from_data(0, b"frame-one".to_vec()))
+                .unwrap();
             let mut p2 = Packet::from_data(0, b"frame-two!".to_vec());
             p2.flags.keyframe = true;
             mux.write_packet(&p2).unwrap();

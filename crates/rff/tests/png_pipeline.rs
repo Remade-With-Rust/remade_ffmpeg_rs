@@ -36,7 +36,9 @@ fn rgb_gradient(w: u32, h: u32) -> Frame {
 }
 
 fn write_png(engine: &Engine, path: &Path, frame: &Frame) {
-    let Frame::Video(v) = frame else { unreachable!() };
+    let Frame::Video(v) = frame else {
+        unreachable!()
+    };
     let mut enc = engine.codecs.find_encoder(CodecId::Png).unwrap();
     enc.send_frame(frame).unwrap();
     enc.flush();
@@ -98,7 +100,9 @@ fn png_to_avif_and_back() {
     let engine = Engine::new();
     let (w, h) = (48u32, 32u32);
     let original = rgb_gradient(w, h);
-    let Frame::Video(src) = &original else { unreachable!() };
+    let Frame::Video(src) = &original else {
+        unreachable!()
+    };
 
     let src_png = tmp("src", "png");
     write_png(&engine, &src_png, &original);
@@ -130,7 +134,10 @@ fn png_to_avif_and_back() {
         .map(|(a, b)| (*a as i16 - *b as i16).unsigned_abs() as u64)
         .sum();
     let mean = total as f64 / (w * h * 3) as f64;
-    assert!(mean < 20.0, "png↔avif round-trip drifted too far: {mean:.2}");
+    assert!(
+        mean < 20.0,
+        "png↔avif round-trip drifted too far: {mean:.2}"
+    );
 
     for p in [src_png, avif, out_png] {
         let _ = fs::remove_file(p);

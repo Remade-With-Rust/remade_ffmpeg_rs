@@ -14,8 +14,8 @@
 //! This is copy-friendly VOD output (`#EXT-X-ENDLIST`); live/event playlists,
 //! fMP4 segments, and DASH are the natural follow-ups.
 
-use std::fs::File;
 use std::fmt::Write as _;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use rff_core::{Error, MediaType, Packet, Rational, Result};
@@ -56,7 +56,10 @@ impl HlsSegmenter {
     /// `dir/out0.ts`, `dir/out1.ts`, … `target_duration` is the nominal seconds
     /// per segment.
     pub fn new(playlist_path: &Path, target_duration: f64) -> Result<HlsSegmenter> {
-        let dir = playlist_path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let dir = playlist_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         let stem = playlist_path
             .file_stem()
             .and_then(|s| s.to_str())

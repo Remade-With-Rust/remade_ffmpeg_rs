@@ -256,7 +256,8 @@ mod tests {
             s.sample_rate = 44_100;
             s.sample_format = Some(SampleFormat::S16);
             mux.write_header(&[s]).unwrap();
-            mux.write_packet(&Packet::from_data(0, pcm.clone())).unwrap();
+            mux.write_packet(&Packet::from_data(0, pcm.clone()))
+                .unwrap();
             mux.write_trailer().unwrap();
         }
         let file = sink.0.lock().unwrap().clone();

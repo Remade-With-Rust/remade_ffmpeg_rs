@@ -35,7 +35,11 @@ impl HuffBook {
             }
             i += 1;
         }
-        HuffBook { codes, lens, max_len: max }
+        HuffBook {
+            codes,
+            lens,
+            max_len: max,
+        }
     }
 
     /// Decode the next codeword MSB-first, returning its symbol index, or `None`
@@ -191,7 +195,11 @@ pub fn decode(
     }
 
     // count1: quads until the part2_3 budget is spent.
-    let quad = if gi.count1table_select { &QUAD_B } else { &QUAD_A };
+    let quad = if gi.count1table_select {
+        &QUAD_B
+    } else {
+        &QUAD_A
+    };
     while i + 3 < GRANULE_LINES && r.bit_pos() < part2_3_end {
         let (v, w, x, y) = quad.read(&mut r);
         out[i] = v;
@@ -237,7 +245,10 @@ mod tests {
         for (name, q) in [("A", &QUAD_A), ("B", &QUAD_B)] {
             let k = q.book.kraft_sum();
             assert!((k - 1.0).abs() < 1e-9, "count1 table {name}: Kraft = {k}");
-            assert!(q.book.is_prefix_free(), "count1 table {name} not prefix-free");
+            assert!(
+                q.book.is_prefix_free(),
+                "count1 table {name} not prefix-free"
+            );
         }
     }
 
@@ -285,7 +296,12 @@ mod tests {
         use crate::frame::GranuleSideInfo;
         let sfb = tables::sfb_long_offsets(44100);
         // Long: region0_count=7, region1_count=2 → i1=8 (sfb[8]=36), i2=11 (sfb[11]=62).
-        let mut gi = GranuleSideInfo { big_values: 100, region0_count: 7, region1_count: 2, ..Default::default() };
+        let mut gi = GranuleSideInfo {
+            big_values: 100,
+            region0_count: 7,
+            region1_count: 2,
+            ..Default::default()
+        };
         assert_eq!(region_bounds(&gi, sfb, 200), (36, 62));
         // Short window-switched: fixed (36, bv2).
         gi.window_switching = true;

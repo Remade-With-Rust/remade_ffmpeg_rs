@@ -186,7 +186,14 @@ impl Demuxer for OggDemuxer {
             if first.len() >= 19 && &first[0..8] == b"OpusHead" {
                 let ch = first[9] as u16;
                 let sr = u32::from_le_bytes([first[12], first[13], first[14], first[15]]);
-                (CodecId::Opus, ch, sr, SampleFormat::F32, 2usize, first.clone())
+                (
+                    CodecId::Opus,
+                    ch,
+                    sr,
+                    SampleFormat::F32,
+                    2usize,
+                    first.clone(),
+                )
             } else if first.len() >= 16 && first[0] == 1 && &first[1..7] == b"vorbis" {
                 if packets.len() < 3 {
                     return Err(Error::invalid("ogg demux: Vorbis is missing setup headers"));
@@ -194,7 +201,14 @@ impl Demuxer for OggDemuxer {
                 let ch = first[11] as u16;
                 let sr = u32::from_le_bytes([first[12], first[13], first[14], first[15]]);
                 let three: Vec<&[u8]> = packets.iter().take(3).map(|p| p.as_slice()).collect();
-                (CodecId::Vorbis, ch, sr, SampleFormat::S16, 3usize, pack_headers(&three))
+                (
+                    CodecId::Vorbis,
+                    ch,
+                    sr,
+                    SampleFormat::S16,
+                    3usize,
+                    pack_headers(&three),
+                )
             } else {
                 return Err(Error::unsupported(
                     "ogg demux: unrecognized codec (expected Opus or Vorbis)",
@@ -209,7 +223,11 @@ impl Demuxer for OggDemuxer {
 
         let mut stream = Stream::new(0, codec_id);
         stream.channels = channels;
-        stream.sample_rate = if sample_rate == 0 { 48_000 } else { sample_rate };
+        stream.sample_rate = if sample_rate == 0 {
+            48_000
+        } else {
+            sample_rate
+        };
         stream.sample_format = Some(sample_format);
         stream.extradata = extradata;
         stream.time_base = Rational::new(1, stream.sample_rate.max(1) as i32);
@@ -265,7 +283,13 @@ impl Muxer for OggMuxer {
     fn write_trailer(&mut self) -> Result<()> {
         let mut out = Vec::new();
         // BOS page: OpusHead. Then OpusTags. (seq 0, 1)
-        write_page(&mut out, 0x02, 0, 0, &opus_head(self.channels, self.sample_rate));
+        write_page(
+            &mut out,
+            0x02,
+            0,
+            0,
+            &opus_head(self.channels, self.sample_rate),
+        );
         write_page(&mut out, 0x00, 0, 1, &opus_tags());
 
         // Audio pages: one packet each; Opus granule is in 48 kHz samples and a

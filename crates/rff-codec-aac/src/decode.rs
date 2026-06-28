@@ -106,7 +106,15 @@ impl Decoder {
                     // M/S and intensity stereo require a shared window/grouping.
                     if common {
                         apply_ms(&c0.info, &ms_used, fs, &c1.cb, &mut c0.spec, &mut c1.spec);
-                        apply_is(&c0.info, &ms_used, fs, &c1.cb, &c1.sf, &c0.spec, &mut c1.spec);
+                        apply_is(
+                            &c0.info,
+                            &ms_used,
+                            fs,
+                            &c1.cb,
+                            &c1.sf,
+                            &c0.spec,
+                            &mut c1.spec,
+                        );
                     }
                     apply_tns(&mut c0.spec, &c0.tns, &c0.info, fs);
                     apply_tns(&mut c1.spec, &c1.tns, &c1.info, fs);
@@ -208,8 +216,14 @@ impl Decoder {
             self.short_frame(spec, info.window_shape_kbd)
         } else {
             let time = dsp::imdct(spec); // 2048
-            let win = self.long_window(info.window_sequence, self.prev_kbd[ch], info.window_shape_kbd);
-            (0..LONG_N).map(|n| time[n] * win[n] * OUTPUT_NORM).collect()
+            let win = self.long_window(
+                info.window_sequence,
+                self.prev_kbd[ch],
+                info.window_shape_kbd,
+            );
+            (0..LONG_N)
+                .map(|n| time[n] * win[n] * OUTPUT_NORM)
+                .collect()
         };
 
         let mut out = vec![0.0f32; FRAME_LEN];
@@ -258,7 +272,11 @@ fn decode_channel(
     let sfb_cb = read_sections(r, info.num_window_groups, max_sfb, is_short)?;
     let sf = read_scalefactors(r, &sfb_cb, global_gain)?;
 
-    let pulse = if r.read_bool()? { Some(read_pulse(r)?) } else { None };
+    let pulse = if r.read_bool()? {
+        Some(read_pulse(r)?)
+    } else {
+        None
+    };
     let tns = if r.read_bool()? {
         parse_tns(r, &info)?
     } else {
@@ -528,12 +546,21 @@ fn parse_tns(r: &mut BitReader, info: &IcsInfo) -> Result<Tns> {
                     } else {
                         raw
                     };
-                    let t = if c >= 0 { c as f32 / iqfac } else { c as f32 / iqfac_m };
+                    let t = if c >= 0 {
+                        c as f32 / iqfac
+                    } else {
+                        c as f32 / iqfac_m
+                    };
                     *p = t.sin();
                 }
                 lpc = parcor_to_lpc(&parcor);
             }
-            filters.push(TnsFilter { length, order, direction, lpc });
+            filters.push(TnsFilter {
+                length,
+                order,
+                direction,
+                lpc,
+            });
         }
         windows.push(filters);
     }

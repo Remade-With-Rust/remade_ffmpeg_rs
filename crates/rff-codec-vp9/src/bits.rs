@@ -74,7 +74,13 @@ impl<'a> BoolDecoder<'a> {
         if data.is_empty() {
             return Err(Error::invalid("vp9: empty bool decoder input"));
         }
-        let mut d = BoolDecoder { data, pos: 0, value: 0, count: -8, range: 255 };
+        let mut d = BoolDecoder {
+            data,
+            pos: 0,
+            value: 0,
+            count: -8,
+            range: 255,
+        };
         d.fill();
         let _marker = d.read_bool(128);
         Ok(d)

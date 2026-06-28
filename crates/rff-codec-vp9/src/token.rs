@@ -36,7 +36,9 @@ pub fn get_scan(tx_size: usize, tx_type: TxType) -> (&'static [i16], &'static [i
             TxType::DctAdst => (&COL_SCAN_8X8, &COL_SCAN_8X8_NEIGHBORS),
         },
         2 => match tx_type {
-            TxType::DctDct | TxType::AdstAdst => (&DEFAULT_SCAN_16X16, &DEFAULT_SCAN_16X16_NEIGHBORS),
+            TxType::DctDct | TxType::AdstAdst => {
+                (&DEFAULT_SCAN_16X16, &DEFAULT_SCAN_16X16_NEIGHBORS)
+            }
             TxType::AdstDct => (&ROW_SCAN_16X16, &ROW_SCAN_16X16_NEIGHBORS),
             TxType::DctAdst => (&COL_SCAN_16X16, &COL_SCAN_16X16_NEIGHBORS),
         },
@@ -48,7 +50,8 @@ pub fn get_scan(tx_size: usize, tx_type: TxType) -> (&'static [i16], &'static [i
 /// (libvpx `get_coef_context`): `(1 + cache[nb[2c]] + cache[nb[2c+1]]) >> 1`.
 #[inline]
 fn get_coef_context(nb: &[i16], cache: &[u8], c: usize) -> usize {
-    ((1 + cache[nb[2 * c] as usize] as usize + cache[nb[2 * c + 1] as usize] as usize) >> 1) as usize
+    ((1 + cache[nb[2 * c] as usize] as usize + cache[nb[2 * c + 1] as usize] as usize) >> 1)
+        as usize
 }
 
 /// Read an `n`-bit magnitude MSB-first, each bit with its own probability
@@ -88,7 +91,11 @@ pub fn decode_coefs(
     let max_eob = 16usize << (tx_size << 1);
     let n = 4usize << tx_size; // transform side; row = pos / n
     let mut max_row = 0usize; // highest row index holding a non-zero coefficient
-    let band_translate: &[u8] = if tx_size == 0 { &COEFBAND_4X4 } else { &COEFBAND_8X8PLUS };
+    let band_translate: &[u8] = if tx_size == 0 {
+        &COEFBAND_4X4
+    } else {
+        &COEFBAND_8X8PLUS
+    };
     let dq_shift = if tx_size == 3 { 1 } else { 0 };
     // Category-6 token reads `14 + (bd-8)` extra bits with a bit-depth-specific
     // probability table (libvpx `cat6_prob` / `cat6_prob_high10/12`).
@@ -98,8 +105,8 @@ pub fn decode_coefs(
         _ => (&CAT6_PROB, 14),
     };
     let mut dqv = dq.0; // DC quant for the first coefficient
-    // Caller passes reusable scratch; clear only the live `max_eob` prefix (the
-    // tail is never read — neighbour positions are always `< max_eob`).
+                        // Caller passes reusable scratch; clear only the live `max_eob` prefix (the
+                        // tail is never read — neighbour positions are always `< max_eob`).
     dqcoeff[..max_eob].iter_mut().for_each(|v| *v = 0);
     token_cache[..max_eob].iter_mut().for_each(|v| *v = 0);
 
@@ -277,7 +284,20 @@ mod tests {
         let mut tc = [0u8; 16];
         let mut cc = [[[0u32; 4]; 6]; 6];
         let mut ec = [[0u32; 6]; 6];
-        let (eob, _max_row) = decode_coefs(&mut bd, probs, 0, scan, nb, (20, 18), 0, &mut out, &mut tc, &mut cc, &mut ec, 8);
+        let (eob, _max_row) = decode_coefs(
+            &mut bd,
+            probs,
+            0,
+            scan,
+            nb,
+            (20, 18),
+            0,
+            &mut out,
+            &mut tc,
+            &mut cc,
+            &mut ec,
+            8,
+        );
         assert!(eob <= 16);
     }
 }

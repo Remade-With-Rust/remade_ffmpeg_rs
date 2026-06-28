@@ -108,7 +108,9 @@ impl Muxer for FlacMuxer {
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
         match streams.first() {
             Some(s) if s.codec_id == CodecId::Flac => Ok(()),
-            Some(_) => Err(Error::unsupported("flac mux: only the `flac` codec is supported")),
+            Some(_) => Err(Error::unsupported(
+                "flac mux: only the `flac` codec is supported",
+            )),
             None => Err(Error::invalid("flac mux: no streams")),
         }
     }
@@ -135,8 +137,8 @@ mod tests {
         let mut v = b"fLaC".to_vec();
         v.extend_from_slice(&[0x00, 0x00, 0x00, 0x22]); // block header: STREAMINFO, len 34
         v.extend_from_slice(&[0u8; 10]); // min/max block + min/max frame sizes
-        // 64-bit packed field: sample_rate=44100 (0x0AC44), channels=2, bits=16.
-        // bytes: [0x0A, 0xC4, 0x42, ...] → sr top20, then chan(3)=001, bits(5)=01111
+                                         // 64-bit packed field: sample_rate=44100 (0x0AC44), channels=2, bits=16.
+                                         // bytes: [0x0A, 0xC4, 0x42, ...] → sr top20, then chan(3)=001, bits(5)=01111
         v.push(0x0A);
         v.push(0xC4);
         // byte 20: sr low4 = 0x4, channels-1=1 (bits), bits-1 high...

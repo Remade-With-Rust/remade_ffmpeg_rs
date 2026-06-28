@@ -12,9 +12,9 @@
 
 use rff_core::{Error, Result};
 
+use crate::bitio::BitWriter;
 use crate::frame::{SideInfo, GRANULE_LINES};
 use crate::header::FrameHeader;
-use crate::bitio::BitWriter;
 
 pub mod bitstream;
 pub mod filterbank;

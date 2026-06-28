@@ -62,7 +62,11 @@ pub struct SrtDemuxer {
 
 impl SrtDemuxer {
     pub fn new(input: Input) -> SrtDemuxer {
-        SrtDemuxer { input, cues: Default::default(), parsed: false }
+        SrtDemuxer {
+            input,
+            cues: Default::default(),
+            parsed: false,
+        }
     }
 }
 

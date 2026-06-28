@@ -114,7 +114,10 @@ fn wav_to_opus_and_back() {
     // Opus is lossy and adds a little latency/padding, but the duration and
     // energy must survive: ~9600 samples of a loud tone.
     assert!(count >= 8000, "decoded too few samples: {count}");
-    assert!(rms > 0.05, "decoded audio is essentially silent: rms {rms:.4}");
+    assert!(
+        rms > 0.05,
+        "decoded audio is essentially silent: rms {rms:.4}"
+    );
 
     for p in [wav_in, opus, wav_out] {
         let _ = fs::remove_file(p);

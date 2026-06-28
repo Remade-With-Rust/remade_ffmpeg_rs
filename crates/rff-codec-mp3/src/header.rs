@@ -71,7 +71,9 @@ impl FrameHeader {
         };
         // Layer field: 0b01 == Layer III. This codec only does Layer III.
         if (h >> 17) & 0x3 != 0b01 {
-            return Err(Error::unsupported("mp3 header: only Layer III is supported"));
+            return Err(Error::unsupported(
+                "mp3 header: only Layer III is supported",
+            ));
         }
         let crc_protected = (h >> 16) & 1 == 0;
 
@@ -141,7 +143,10 @@ impl FrameHeader {
             MpegVersion::V1 => &tables::BITRATE_V1_L3,
             _ => &tables::BITRATE_V2_L3,
         };
-        let br_idx = br_table.iter().position(|&b| b == self.bitrate_kbps).unwrap_or(0) as u32;
+        let br_idx = br_table
+            .iter()
+            .position(|&b| b == self.bitrate_kbps)
+            .unwrap_or(0) as u32;
         h |= br_idx << 12;
 
         let base = match self.version {
@@ -149,15 +154,19 @@ impl FrameHeader {
             MpegVersion::V2 => self.sample_rate * 2,
             MpegVersion::V2_5 => self.sample_rate * 4,
         };
-        let sr_idx = tables::SAMPLE_RATE.iter().position(|&s| s == base).unwrap_or(0) as u32;
+        let sr_idx = tables::SAMPLE_RATE
+            .iter()
+            .position(|&s| s == base)
+            .unwrap_or(0) as u32;
         h |= sr_idx << 10;
         h |= (self.padding as u32) << 9;
 
         let (chan, ext) = match self.channel_mode {
             ChannelMode::Stereo => (0b00, 0),
-            ChannelMode::JointStereo { ms_stereo, intensity_stereo } => {
-                (0b01, (ms_stereo as u32) << 1 | intensity_stereo as u32)
-            }
+            ChannelMode::JointStereo {
+                ms_stereo,
+                intensity_stereo,
+            } => (0b01, (ms_stereo as u32) << 1 | intensity_stereo as u32),
             ChannelMode::DualMono => (0b10, 0),
             ChannelMode::Mono => (0b11, 0),
         };
