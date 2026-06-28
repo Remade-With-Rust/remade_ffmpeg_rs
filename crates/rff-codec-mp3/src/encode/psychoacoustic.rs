@@ -66,6 +66,30 @@ fn ath_db(f: f32) -> f32 {
     3.64 * k.powf(-0.8) - 6.5 * (-0.6 * (k - 3.3).powi(2)).exp() + 1e-3 * k.powi(4)
 }
 
+/// Detect a transient/attack in a granule's PCM: a sub-block whose energy jumps
+/// well above the recent running average. Such granules want short blocks so the
+/// pre-echo a long window would smear before the attack is confined to one short
+/// window. (Brick **Q5** — the block-type trigger; the FSM that turns it into a
+/// valid Long/Start/Short/Stop sequence lives in `shortblock`.)
+pub fn detect_attack(pcm: &[f32]) -> bool {
+    const BLOCKS: usize = 8;
+    const RATIO: f32 = 10.0;
+    let n = pcm.len().min(crate::frame::GRANULE_LINES);
+    let bs = n / BLOCKS;
+    if bs == 0 {
+        return false;
+    }
+    let mut running = 1e-6f32;
+    for b in 0..BLOCKS {
+        let e: f32 = pcm[b * bs..(b + 1) * bs].iter().map(|x| x * x).sum::<f32>() / bs as f32;
+        if e > running * RATIO {
+            return true;
+        }
+        running = (running * 2.0 + e) / 3.0; // smoothed recent energy
+    }
+    false
+}
+
 /// Run the psychoacoustic model over one granule of PCM at `sample_rate`.
 pub fn analyze(pcm: &[f32], sample_rate: u32) -> PsyResult {
     let sfb = tables::sfb_long_offsets(sample_rate);

@@ -441,9 +441,9 @@ pub static BRICKS: &[Brick] = &[
         "Q5",
         Phase::Quality,
         Class::Alg,
-        Verify::Metric,
-        Status::Todo,
-        "Block-type decision (deferred: needs short-block coding path)",
+        Verify::External,
+        Status::Verified,
+        "Block switching: short-block coding path + attack FSM (transients→short)",
     ),
     b(
         "Q6",
@@ -607,8 +607,8 @@ mod tests {
 
     #[test]
     fn next_unbuilt_is_first_incomplete() {
-        // Floor 4 psymodel (Q1–Q4, Q6) done; Q5 (block switching) deferred → next.
-        assert_eq!(next_unbuilt().map(|b| b.id), Some("Q5"));
+        // Only MPEG-2/2.5 (R5) remains unbuilt.
+        assert_eq!(next_unbuilt().map(|b| b.id), Some("R5"));
     }
 
     #[test]

@@ -137,6 +137,17 @@ fn region_bounds_long(sfb: &[u16; 23], r0c: u8, r1c: u8, bv2: usize) -> (usize, 
     (r1, r2)
 }
 
+/// Region boundaries for either block type, mirroring the decoder: window-switched
+/// (short/start/stop) blocks use a fixed `(36, bv2)` split; long blocks derive
+/// them from the region counts.
+fn region_bounds(gi: &GranuleSideInfo, sfb: &[u16; 23], bv2: usize) -> (usize, usize) {
+    if gi.window_switching && gi.block_type != BlockType::Long {
+        (36.min(bv2), bv2)
+    } else {
+        region_bounds_long(sfb, gi.region0_count, gi.region1_count, bv2)
+    }
+}
+
 /// Cheapest pair table covering `coeffs[lo..hi]` (an even-aligned region).
 fn best_pair_table(coeffs: &[i32; GRANULE_LINES], lo: usize, hi: usize) -> u8 {
     if lo >= hi {
@@ -195,10 +206,15 @@ fn choose_regions(sfb: &[u16; 23], big_end: usize) -> (u8, u8) {
     ((i1 - 1).min(15) as u8, (i2 - i1).min(7) as u8)
 }
 
-/// **B4** — partition a quantized spectrum (long block) and pick its codebooks:
-/// fills the Huffman-relevant `GranuleSideInfo` fields so [`encode`] and the
-/// decoder agree on the layout.
-pub fn select(header: &FrameHeader, coeffs: &[i32; GRANULE_LINES]) -> GranuleSideInfo {
+/// **B4 / Q5** — partition a quantized spectrum and pick its codebooks, for any
+/// `block_type`. Long blocks split into three region-count-derived regions; window-
+/// switched blocks (short/start/stop) use the decoder's fixed `(36, bv2)` split.
+/// Fills the Huffman side-info so [`encode`] and the decoder agree on the layout.
+pub fn select(
+    header: &FrameHeader,
+    coeffs: &[i32; GRANULE_LINES],
+    block_type: BlockType,
+) -> GranuleSideInfo {
     // big_values must cover every line with magnitude > 1 (count1 only codes ±1).
     let big_end = match coeffs.iter().rposition(|&c| c.abs() > 1) {
         Some(i) => (i / 2 + 1) * 2, // even, includes the pair holding line i
@@ -213,23 +229,57 @@ pub fn select(header: &FrameHeader, coeffs: &[i32; GRANULE_LINES]) -> GranuleSid
         "rzero invariant: no non-zero line past the coded region"
     );
 
-    let sfb = tables::sfb_long_offsets(header.sample_rate);
-    let (r0c, r1c) = choose_regions(sfb, big_end);
-    let (r1, r2) = region_bounds_long(sfb, r0c, r1c, big_end);
-
-    GranuleSideInfo {
+    let common = GranuleSideInfo {
         big_values: (big_end / 2) as u16,
-        block_type: BlockType::Long,
-        region0_count: r0c,
-        region1_count: r1c,
-        table_select: [
-            best_pair_table(coeffs, 0, r1),
-            best_pair_table(coeffs, r1, r2),
-            best_pair_table(coeffs, r2, big_end),
-        ],
         count1table_select: best_quad_table(coeffs, big_end, count1_end),
         ..Default::default()
+    };
+
+    if block_type == BlockType::Long {
+        let sfb = tables::sfb_long_offsets(header.sample_rate);
+        let (r0c, r1c) = choose_regions(sfb, big_end);
+        let (r1, r2) = region_bounds_long(sfb, r0c, r1c, big_end);
+        GranuleSideInfo {
+            region0_count: r0c,
+            region1_count: r1c,
+            table_select: [
+                best_pair_table(coeffs, 0, r1),
+                best_pair_table(coeffs, r1, r2),
+                best_pair_table(coeffs, r2, big_end),
+            ],
+            ..common
+        }
+    } else {
+        GranuleSideInfo {
+            window_switching: true,
+            block_type,
+            table_select: windowed_table_select(coeffs, big_end),
+            ..common
+        }
     }
+}
+
+/// Pair-table selection for the window-switched fixed `(36, bv2)` region split
+/// (used by short, start, and stop blocks). Region 2 is empty.
+pub fn windowed_table_select(coeffs: &[i32; GRANULE_LINES], bv2: usize) -> [u8; 3] {
+    let r1 = 36.min(bv2);
+    [
+        best_pair_table(coeffs, 0, r1),
+        best_pair_table(coeffs, r1, bv2),
+        0,
+    ]
+}
+
+/// Huffman bit cost of a short-block coefficient set.
+pub fn cost_short(header: &FrameHeader, coeffs: &[i32; GRANULE_LINES]) -> usize {
+    let side = select(header, coeffs, BlockType::Short);
+    let q = QuantizedGranule {
+        coeffs: *coeffs,
+        side,
+        scalefactors: [0; 39],
+    };
+    let mut w = BitWriter::new();
+    encode(&q, header, &mut w)
 }
 
 // ── B3: emit the whole spectrum ───────────────────────────────────────────────
@@ -243,7 +293,7 @@ pub fn encode(quant: &QuantizedGranule, header: &FrameHeader, writer: &mut BitWr
     let coeffs = &quant.coeffs;
     let sfb = tables::sfb_long_offsets(header.sample_rate);
     let bv2 = (gi.big_values as usize * 2).min(GRANULE_LINES);
-    let (r1, r2) = region_bounds_long(sfb, gi.region0_count, gi.region1_count, bv2);
+    let (r1, r2) = region_bounds(gi, sfb, bv2);
 
     // big_values: pairs, table chosen per region.
     let mut i = 0;
@@ -314,7 +364,7 @@ mod tests {
     /// Select tables, encode, decode back — coefficients must survive exactly.
     fn round_trip(coeffs: [i32; GRANULE_LINES]) {
         let header = hdr();
-        let side = select(&header, &coeffs);
+        let side = select(&header, &coeffs, BlockType::Long);
         let quant = QuantizedGranule {
             coeffs,
             side: side.clone(),

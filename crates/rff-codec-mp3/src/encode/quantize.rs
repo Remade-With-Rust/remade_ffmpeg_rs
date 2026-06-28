@@ -11,7 +11,7 @@
 
 use std::sync::OnceLock;
 
-use crate::frame::{GranuleSideInfo, GRANULE_LINES};
+use crate::frame::{BlockType, GranuleSideInfo, GRANULE_LINES};
 use crate::header::FrameHeader;
 
 use super::psychoacoustic::PsyResult;
@@ -166,9 +166,14 @@ fn choose_compress(sf: &[u8; 22]) -> (u16, usize) {
     (15, 11 * 4 + 10 * 3)
 }
 
-/// Huffman bit cost of a coefficient set under the best table selection.
-fn huff_cost(header: &FrameHeader, coeffs: &[i32; GRANULE_LINES]) -> (GranuleSideInfo, usize) {
-    let side = super::huffman::select(header, coeffs);
+/// Huffman bit cost of a coefficient set under the best table selection for
+/// `block_type` (long vs window-switched regions — the emit must use the same).
+fn huff_cost(
+    header: &FrameHeader,
+    coeffs: &[i32; GRANULE_LINES],
+    block_type: BlockType,
+) -> (GranuleSideInfo, usize) {
+    let side = super::huffman::select(header, coeffs, block_type);
     let q = QuantizedGranule {
         coeffs: *coeffs,
         side: side.clone(),
@@ -186,11 +191,12 @@ fn inner_gain(
     freq: &[f32; GRANULE_LINES],
     sf: &[u8; 22],
     huff_budget: usize,
+    block_type: BlockType,
 ) -> i32 {
     let ok = |g: i32| {
         let coeffs = quantize_with_sf(header, freq, g, sf);
         coeffs.iter().all(|&c| c.abs() <= MAX_UNCLIPPED)
-            && huff_cost(header, &coeffs).1 <= huff_budget
+            && huff_cost(header, &coeffs, block_type).1 <= huff_budget
     };
     let (mut lo, mut hi) = (0i32, 255i32);
     while lo < hi {
@@ -214,6 +220,7 @@ pub fn loops(
     freq: &[f32; GRANULE_LINES],
     psy: &PsyResult,
     bit_budget: usize,
+    block_type: BlockType,
 ) -> QuantizedGranule {
     let mut sf = [0u8; 22];
     let mut best: Option<(f32, QuantizedGranule)> = None;
@@ -222,9 +229,9 @@ pub fn loops(
         let (compress, sf_bits) = choose_compress(&sf);
         let huff_budget = bit_budget.saturating_sub(sf_bits);
 
-        let gain = inner_gain(header, freq, &sf, huff_budget);
+        let gain = inner_gain(header, freq, &sf, huff_budget, block_type);
         let coeffs = quantize_with_sf(header, freq, gain, &sf);
-        let (mut side, _) = huff_cost(header, &coeffs);
+        let (mut side, _) = huff_cost(header, &coeffs, block_type);
         side.global_gain = gain as u8;
         side.scalefac_compress = compress;
         let mut scalefactors = [0u8; 39];
@@ -291,6 +298,7 @@ pub fn loops_vbr(
     freq: &[f32; GRANULE_LINES],
     psy: &PsyResult,
     target_nmr: f32,
+    block_type: BlockType,
 ) -> QuantizedGranule {
     let flat = [0u8; 22];
     let peak = |g: i32| {
@@ -336,7 +344,7 @@ pub fn loops_vbr(
 
     let coeffs = quantize_with_sf(header, freq, gain, &sf);
     let (compress, _) = choose_compress(&sf);
-    let mut side = super::huffman::select(header, &coeffs);
+    let mut side = super::huffman::select(header, &coeffs, block_type);
     side.global_gain = gain as u8;
     side.scalefac_compress = compress;
     let mut scalefactors = [0u8; 39];
@@ -380,7 +388,7 @@ mod c2_tests {
         freq[200] = 0.6;
 
         let psy = PsyResult::default();
-        let q = loops(&header, &freq, &psy, 100_000); // generous budget → fine gain
+        let q = loops(&header, &freq, &psy, 100_000, BlockType::Long); // generous → fine gain
         eprintln!(
             "[C2dbg] gain={} part2_3={} nz_coeffs={}",
             q.side.global_gain,
@@ -472,8 +480,8 @@ mod q6_tests {
             thresholds: [f32::MAX; 22], // never over threshold → no shaping (pure rate)
             ..psy.clone()
         };
-        let shaped = loops(&header, &freq, &psy, budget);
-        let plain = loops(&header, &freq, &flat, budget);
+        let shaped = loops(&header, &freq, &psy, budget, BlockType::Long);
+        let plain = loops(&header, &freq, &flat, budget, BlockType::Long);
 
         let nmr_shaped = peak_nmr_db(&header, &freq, &shaped, &psy.thresholds);
         let nmr_plain = peak_nmr_db(&header, &freq, &plain, &psy.thresholds);

@@ -471,6 +471,78 @@ mod tests {
         );
     }
 
+    /// **Q5 — block switching.** A castanet-like transient (silence then a sharp
+    /// burst, repeating) drives the encoder into short blocks; the stream must
+    /// carry window-switched frames and still reconstruct.
+    #[test]
+    fn block_switching_on_transients() {
+        let sr = 44100u32;
+        let frames = 20;
+        let n = frames * 1152;
+        let mut s = 0xBEEF_1234u32;
+        // Repeating impulse-train: a sharp burst every ~1500 samples on silence.
+        let input: Vec<f32> = (0..n)
+            .map(|i| {
+                if i % 1500 < 80 {
+                    s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    0.7 * ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        let mp3 = encode_mono(&input, sr);
+        assert!(!mp3.is_empty());
+        if let Ok(path) = std::env::var("MP3_ENC_OUT") {
+            std::fs::write(path, &mp3).expect("write MP3_ENC_OUT");
+        }
+
+        // Count window-switched frames: in the side info, the first granule's
+        // `window_switching` bit. For MPEG-1 mono it's bit 8 of the per-granule
+        // fields — simplest to detect by decoding and checking the stream carries
+        // short blocks via the side-info parser.
+        let si_len = header::FrameHeader::parse([mp3[0], mp3[1], mp3[2], mp3[3]])
+            .map(|h| h.side_info_len())
+            .unwrap_or(17);
+        let mut switched = 0;
+        let mut pos = 0;
+        while pos + 4 <= mp3.len() {
+            if mp3[pos] == 0xFF && mp3[pos + 1] & 0xE0 == 0xE0 {
+                if let Ok(h) =
+                    header::FrameHeader::parse([mp3[pos], mp3[pos + 1], mp3[pos + 2], mp3[pos + 3]])
+                {
+                    let si = &mp3[pos + 4..pos + 4 + si_len];
+                    if let Ok(parsed) = decode::sideinfo::parse(&h, si) {
+                        if (0..h.version.granules())
+                            .any(|gr| parsed.granules[gr][0].window_switching)
+                        {
+                            switched += 1;
+                        }
+                    }
+                    pos += h.frame_size();
+                    continue;
+                }
+            }
+            pos += 1;
+        }
+        eprintln!("[Q5] window-switched frames: {switched}/{frames}");
+        assert!(
+            switched >= 3,
+            "transients must trigger block switching, got {switched}"
+        );
+
+        // And the switched stream still decodes frame-for-frame.
+        let mut dec = Mp3Decoder::default();
+        dec.send_packet(&Packet::from_data(0, mp3)).unwrap();
+        dec.flush();
+        let mut decoded = 0;
+        while let Ok(Frame::Audio(_)) = dec.receive_frame() {
+            decoded += 1;
+        }
+        assert!(decoded >= frames, "all frames must decode, got {decoded}");
+    }
+
     /// **R4 — conformance corpus.** A broad set of signals each round-trips through
     /// encode → our decoder above a per-signal floor. With `MP3_ENC_DIR` set, the
     /// `.mp3`s are dumped for the out-of-band FFmpeg/LAME cross-check.
