@@ -13,6 +13,7 @@ licensed (CI-enforced by `cargo-deny`).
   (`ffmpeg` / `ffprobe`) in the test suite.
 - **basic** — implemented with unit tests; not yet cross-checked against FFmpeg
   at scale.
+- 🚧 **in development** — being built; not in the shipping build yet.
 
 ## Codecs
 
@@ -23,6 +24,7 @@ licensed (CI-enforced by `cargo-deny`).
 | AAC&#8209;LC | ✅ | — | in-house | validated · ⚖ |
 | PCM | ✅ | ✅ | in-house | validated |
 | AV1 / AVIF | ✅ | ✅ | rav1d / rav1e (pure Rust) | validated |
+| AV2 | 🚧 | — | in-house | **in development** (decoder nearly complete) |
 | H.264 / AVC | ✅ | ✅ | rusty_h264 (pure Rust; opt-in SIMD asm) | validated · ⚖ |
 | Opus | ✅ | ✅ | opus-rs (pure Rust) | validated |
 | Vorbis | ✅ | — | lewton (pure Rust) | validated |
@@ -87,9 +89,16 @@ The permissive `Apache-2.0` license also does **not** help here: its patent
 grant (§3) only licenses patents held by *contributors*, not the
 standard-essential patents held by third-party pools.
 
-**Royalty-free or expired** (ship freely): AV1/AVIF, VP9, Opus, FLAC, Vorbis,
-PNG, JPEG (baseline), GIF, WebP, JPEG XL, **MP3** (core patents expired 2017),
-PCM.
+**Royalty-free or expired** (ship freely): AV1/AVIF, **AV2**, VP9, Opus, FLAC,
+Vorbis, PNG, JPEG (baseline), GIF, WebP, JPEG XL, **MP3** (core patents expired
+2017), PCM.
+
+AV1/AVIF, **AV2**, and VP9 are royalty-free *by design* under the **AOMedia
+Patent License** — members cross-license the patents essential to the spec at no
+charge. AV2 (the AOMedia successor to AV1) carries the same grant. The only
+theoretical exposure is a third-party/non-member claim — e.g. the **disputed
+Sisvel AV1 pool** — which AOMedia contests and which is an industry-wide matter,
+not specific to this implementation.
 
 **Patent-relevant** — decide a posture before distributing commercially:
 
