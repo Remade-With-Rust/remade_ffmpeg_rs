@@ -79,7 +79,13 @@ fn code_extra<S: BitSink>(sink: &mut S, value: u32, probs: &[u8], n: usize) {
 /// tree (inverse of `decode_coefs`'s token branch). `prob2` is the model pivot
 /// node, which also indexes the Pareto tail. Returns the energy class to store
 /// in the token cache (matching the decoder).
-fn code_magnitude<S: BitSink>(sink: &mut S, aval: u32, prob2: u8, cat6: &[u8], cat6_bits: usize) -> u8 {
+fn code_magnitude<S: BitSink>(
+    sink: &mut S,
+    aval: u32,
+    prob2: u8,
+    cat6: &[u8],
+    cat6_bits: usize,
+) -> u8 {
     if aval == 1 {
         sink.put(0, prob2); // ONE
         return 1;
@@ -231,7 +237,17 @@ pub fn encode_coefs(
     bit_depth: u32,
 ) {
     code_block(
-        enc, levels, scan, nb, eob, coef_probs, tx_size, ctx, token_cache, coef_cnt, eob_cnt,
+        enc,
+        levels,
+        scan,
+        nb,
+        eob,
+        coef_probs,
+        tx_size,
+        ctx,
+        token_cache,
+        coef_cnt,
+        eob_cnt,
         bit_depth,
     );
 }
@@ -256,7 +272,17 @@ pub fn coef_cost(
     let mut cc = [[[0u32; 4]; 6]; 6];
     let mut ec = [[0u32; 6]; 6];
     code_block(
-        &mut sink, levels, scan, nb, eob, coef_probs, tx_size, ctx, token_cache, &mut cc, &mut ec,
+        &mut sink,
+        levels,
+        scan,
+        nb,
+        eob,
+        coef_probs,
+        tx_size,
+        ctx,
+        token_cache,
+        &mut cc,
+        &mut ec,
         bit_depth,
     );
     sink.0
@@ -347,8 +373,18 @@ mod tests {
                 let mut cc_d = [[[0u32; 4]; 6]; 6];
                 let mut ec_d = [[0u32; 6]; 6];
                 let (c, _) = decode_coefs(
-                    &mut bd, coef_probs, tx_size, scan, nb, (dc, ac), ctx0, &mut dqcoeff,
-                    &mut tc_d, &mut cc_d, &mut ec_d, 8,
+                    &mut bd,
+                    coef_probs,
+                    tx_size,
+                    scan,
+                    nb,
+                    (dc, ac),
+                    ctx0,
+                    &mut dqcoeff,
+                    &mut tc_d,
+                    &mut cc_d,
+                    &mut ec_d,
+                    8,
                 );
 
                 assert_eq!(c, eob, "eob {tx_size} {tx:?}");
@@ -396,8 +432,9 @@ mod tests {
                 let (levels, eob) = gen_block(&mut s, scan, n, max_eob);
                 let ctx0 = (xs(&mut s) % 3) as usize;
                 let mut tc = vec![0u8; max_eob];
-                total_cost_q8 +=
-                    coef_cost(&levels, scan, nb, eob, coef_probs, tx_size, ctx0, &mut tc, 8);
+                total_cost_q8 += coef_cost(
+                    &levels, scan, nb, eob, coef_probs, tx_size, ctx0, &mut tc, 8,
+                );
                 let mut tc2 = vec![0u8; max_eob];
                 let mut cc = [[[0u32; 4]; 6]; 6];
                 let mut ec = [[0u32; 6]; 6];

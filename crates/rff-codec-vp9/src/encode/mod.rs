@@ -12,6 +12,7 @@
 
 mod adapt;
 mod bitwriter;
+mod mv;
 mod prob;
 mod quantize;
 mod syntax;
@@ -19,6 +20,7 @@ mod tokens;
 mod transform;
 
 pub(crate) use bitwriter::{BitWriter, BoolEncoder};
+pub(crate) use mv::encode_mv;
 pub(crate) use prob::{
     diff_update_encode, encode_term_subexp, forward_remap_prob, update_mv_prob_encode,
 };

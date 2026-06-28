@@ -39,7 +39,12 @@ pub fn write_intra_mode(enc: &mut BoolEncoder, mode: u8, probs: &[u8; 9]) {
 
 /// Inverse of [`read_selected_tx_size`](crate::block::read_selected_tx_size):
 /// the variable-depth TX-size tree (1..3 bits depending on `max_tx_size`).
-pub fn write_selected_tx_size(enc: &mut BoolEncoder, tx_size: u8, tx_probs: &[u8], max_tx_size: usize) {
+pub fn write_selected_tx_size(
+    enc: &mut BoolEncoder,
+    tx_size: u8,
+    tx_probs: &[u8],
+    max_tx_size: usize,
+) {
     let t = tx_size as usize;
     enc.write_bool((t >= 1) as u32, tx_probs[0]);
     if t >= 1 && max_tx_size >= 2 {
@@ -76,28 +81,35 @@ mod tests {
         for part in 0..4usize {
             let mut enc = BoolEncoder::new();
             write_partition(&mut enc, part, &probs, true, true);
-            let mut bd = BoolDecoder::new(&enc.finish()).unwrap();
+            let bytes = enc.finish();
+            let mut bd = BoolDecoder::new(&bytes).unwrap();
             assert_eq!(read_partition(&mut bd, &probs, true, true), part);
         }
         // Bottom edge (no rows): HORZ or SPLIT only.
         for part in [PARTITION_HORZ, PARTITION_SPLIT] {
             let mut enc = BoolEncoder::new();
             write_partition(&mut enc, part, &probs, false, true);
-            let mut bd = BoolDecoder::new(&enc.finish()).unwrap();
+            let bytes = enc.finish();
+            let mut bd = BoolDecoder::new(&bytes).unwrap();
             assert_eq!(read_partition(&mut bd, &probs, false, true), part);
         }
         // Right edge (no cols): VERT or SPLIT only.
         for part in [PARTITION_VERT, PARTITION_SPLIT] {
             let mut enc = BoolEncoder::new();
             write_partition(&mut enc, part, &probs, true, false);
-            let mut bd = BoolDecoder::new(&enc.finish()).unwrap();
+            let bytes = enc.finish();
+            let mut bd = BoolDecoder::new(&bytes).unwrap();
             assert_eq!(read_partition(&mut bd, &probs, true, false), part);
         }
         // Corner (neither): SPLIT forced, no bits.
         let mut enc = BoolEncoder::new();
         write_partition(&mut enc, PARTITION_SPLIT, &probs, false, false);
-        let mut bd = BoolDecoder::new(&enc.finish()).unwrap();
-        assert_eq!(read_partition(&mut bd, &probs, false, false), PARTITION_SPLIT);
+        let bytes = enc.finish();
+        let mut bd = BoolDecoder::new(&bytes).unwrap();
+        assert_eq!(
+            read_partition(&mut bd, &probs, false, false),
+            PARTITION_SPLIT
+        );
     }
 
     #[test]
@@ -106,7 +118,8 @@ mod tests {
         for mode in 0..10u8 {
             let mut enc = BoolEncoder::new();
             write_intra_mode(&mut enc, mode, &probs);
-            let mut bd = BoolDecoder::new(&enc.finish()).unwrap();
+            let bytes = enc.finish();
+            let mut bd = BoolDecoder::new(&bytes).unwrap();
             assert_eq!(read_intra_mode(&mut bd, &probs), mode);
         }
     }
@@ -118,7 +131,8 @@ mod tests {
             for tx in 0..=max as u8 {
                 let mut enc = BoolEncoder::new();
                 write_selected_tx_size(&mut enc, tx, &tx_probs, max);
-                let mut bd = BoolDecoder::new(&enc.finish()).unwrap();
+                let bytes = enc.finish();
+                let mut bd = BoolDecoder::new(&bytes).unwrap();
                 assert_eq!(read_selected_tx_size(&mut bd, &tx_probs, max), tx);
             }
         }
@@ -130,7 +144,8 @@ mod tests {
         for seg in 0..8u8 {
             let mut enc = BoolEncoder::new();
             write_segment_id(&mut enc, seg, &tree_probs);
-            let mut bd = BoolDecoder::new(&enc.finish()).unwrap();
+            let bytes = enc.finish();
+            let mut bd = BoolDecoder::new(&bytes).unwrap();
             assert_eq!(read_tree(&mut bd, &SEGMENT_TREE, &tree_probs) as u8, seg);
         }
     }
@@ -141,7 +156,8 @@ mod tests {
             for prob in [1u8, 64, 128, 200, 255] {
                 let mut enc = BoolEncoder::new();
                 write_skip(&mut enc, skip, prob);
-                let mut bd = BoolDecoder::new(&enc.finish()).unwrap();
+                let bytes = enc.finish();
+                let mut bd = BoolDecoder::new(&bytes).unwrap();
                 assert_eq!(bd.read_bool(prob) != 0, skip);
             }
         }

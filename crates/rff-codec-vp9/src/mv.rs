@@ -12,11 +12,11 @@ use crate::prob_tables::{NmvComp, NmvContext};
 use crate::token::read_tree;
 
 // MV trees (libvpx `vp9_entropymv.c`). Leaves are non-positive; `-0 == 0`.
-const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
-const MV_CLASS_TREE: [i8; 20] = [
+pub(crate) const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+pub(crate) const MV_CLASS_TREE: [i8; 20] = [
     0, 2, -1, 4, 6, 8, -2, -3, 10, 12, -4, -5, -6, 14, 16, 18, -7, -8, -9, -10,
 ];
-const MV_FP_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+pub(crate) const MV_FP_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 
 const CLASS0_BITS: i32 = 1;
 const CLASS0_SIZE: i32 = 2;
@@ -27,7 +27,7 @@ fn use_mv_hp(ref_mv: (i32, i32)) -> bool {
 }
 
 /// One MV component's symbol counts (`nmv_component_counts`).
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct NmvCompCounts {
     pub sign: [u32; 2],
     pub classes: [u32; 11],
@@ -40,7 +40,7 @@ pub(crate) struct NmvCompCounts {
 }
 
 /// MV entropy counts (`nmv_context_counts`).
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct NmvCounts {
     pub joints: [u32; 4],
     pub comps: [NmvCompCounts; 2],
