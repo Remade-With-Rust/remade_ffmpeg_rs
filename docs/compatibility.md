@@ -69,6 +69,9 @@ Output only: **HLS** (`.m3u8` playlist + MPEG-TS segments).
 
 ## Planned / not yet implemented
 
+The prioritized, next-gen-first plan lives in [roadmap.md](roadmap.md). The
+near-term items and their current state:
+
 | Feature | Status |
 |---------|--------|
 | `filter_complex` `concat` and arbitrary graphs | **planned** (only `overlay` today) |

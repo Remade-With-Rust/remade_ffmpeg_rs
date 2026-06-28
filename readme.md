@@ -18,7 +18,7 @@
 
 ---
 
-## ⚡ The headline
+## The headline
 
 <!-- Lead with the number. This is why someone clicks the repo. -->
 
@@ -255,14 +255,18 @@ implement the `Decoder`/`Encoder` or `Demuxer`/`Muxer` traits and call
 
 ## Roadmap
 
-- [x] Land the first real codec body end-to-end (AVIF: decode → re-encode → mux).
-- [x] 10-bit AVIF and reading foreign AVIFs (sequence header in `av1C`). *(12-bit pending.)*
-- [x] AVI container (demux + mux). *(Codec bodies — h264, opus — still pending.)*
-- [x] Content-sniffing probe (magic bytes) in addition to extension matching.
-- [x] Filter graph layer (`libavfilter` equivalent): `scale` (+ aspect `-1`), `crop`, `hflip`, `vflip`, `transpose`, `pad`.
-- [ ] Implement the next codec bodies (h264, opus).
-- [ ] Reproducible benchmark suite and published numbers.
-- [ ] Wire real MATA mID verification (`sovereign-id-verify`).
+Prioritized **next-gen first** — full detail in [docs/roadmap.md](docs/roadmap.md).
+What's shipped today is the [compatibility matrix](docs/compatibility.md).
+
+- **Next-gen (priority):** AV2 decode *(in progress)* · fMP4/CMAF segments ·
+  low-latency live (SRT / WebRTC / Media-over-QUIC) · IAMF spatial audio.
+- **Current-modern:** DASH output · HLS completion (`-hls_time`, live playlists) ·
+  `filter_complex` `concat` · two-pass execution · HTTPS in the default build.
+- **Patent-gated (gate or skip):** HEVC/H.265 · VVC/H.266 · AC-3 — standard-
+  essential-patent encumbered, unlike the royalty-free AV1/AV2 stack.
+
+Also tracked: reproducible benchmark suite + published numbers, and real MATA mID
+verification (`sovereign-id-verify`).
 
 ## License
 
