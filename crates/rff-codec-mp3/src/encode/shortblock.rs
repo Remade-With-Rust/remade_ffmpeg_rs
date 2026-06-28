@@ -88,7 +88,7 @@ pub fn quantize_short(
         }
     }
     let coeffs = quantize_uniform(freq_bitstream, &xrp, lo);
-    let mut side = super::huffman::select(header, &coeffs, BlockType::Short);
+    let (mut side, _) = super::huffman::select(header, &coeffs, BlockType::Short);
     side.global_gain = lo as u8;
     side.scalefac_compress = 0; // flat scalefactors → zero scalefactor bits
     QuantizedGranule {

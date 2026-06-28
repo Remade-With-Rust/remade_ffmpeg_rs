@@ -59,16 +59,17 @@ pub fn quantize_level(xr: f64) -> i32 {
 
 /// Round a pre-powered magnitude `p = |xr|^(3/4)` to its quantized level:
 /// `nint(p − BIAS)`, clamped to `[0, MAX_LEVEL]`. Factored out so the hot rate
-/// loop can supply `p` from a precomputed `|xr|^(3/4)` (see [`xrpow`]) instead of
-/// calling `powf` per line per gain probe.
+/// loop can supply `p` from a precomputed `|xr|^(3/4)` (see [`xrpow`]).
+///
+/// **C (vectorization):** written branchlessly — clamp in `f64` before the cast
+/// instead of an `if m <= 0` guard — so the per-line quantize loops auto-vectorize.
+/// Byte-identical to the guarded form: for `m ≤ 0`, `round(m).clamp(0,·)` is `0`
+/// (round of a non-positive is ≤ 0); for `m > 0` it is `round(m).min(MAX)`, the
+/// same as the old `i32` clamp since `round(m) ≥ 0`. Pinned by `level_from_*` tests.
 #[inline]
 pub(crate) fn level_from(powered: f64) -> i32 {
     let m = powered - QUANT_BIAS;
-    if m <= 0.0 {
-        0
-    } else {
-        (m.round() as i32).clamp(0, MAX_LEVEL)
-    }
+    m.round().clamp(0.0, MAX_LEVEL as f64) as i32
 }
 
 /// **A1** — precompute `|freq[i]|^(3/4)` for the whole granule, once. The forward
@@ -198,10 +199,9 @@ fn huff_cost(
     coeffs: &[i32; GRANULE_LINES],
     block_type: BlockType,
 ) -> (GranuleSideInfo, usize) {
-    let side = super::huffman::select(header, coeffs, block_type);
-    // A2: count bits directly instead of encoding into a throwaway BitWriter.
-    let bits = super::huffman::cost(&side, coeffs, header);
-    (side, bits)
+    // C (redundancy): select already computed the winning bit cost while choosing
+    // the tables — take it directly instead of re-walking the spectrum.
+    super::huffman::select(header, coeffs, block_type)
 }
 
 /// Inner rate loop: smallest `global_gain` (finest, best quality) that neither
@@ -371,7 +371,7 @@ pub fn loops_vbr(
 
     let coeffs = quantize_with_sf(header, freq, &xrp, gain, &sf);
     let (compress, _) = choose_compress(&sf);
-    let mut side = super::huffman::select(header, &coeffs, block_type);
+    let (mut side, _) = super::huffman::select(header, &coeffs, block_type);
     side.global_gain = gain as u8;
     side.scalefac_compress = compress;
     let mut scalefactors = [0u8; 39];
@@ -613,5 +613,36 @@ mod n4_tests {
         assert_eq!(quantize_level(0.3), 0);
         // Saturates at MAX_LEVEL rather than overflowing.
         assert_eq!(quantize_level(1.0e9), MAX_LEVEL);
+    }
+
+    /// C gate: the branchless `level_from` must equal the original guarded form
+    /// for every input, including the boundaries (≤0, the rounding seam, and the
+    /// saturation knee) — a wide dense sweep plus the exact lattice midpoints.
+    #[test]
+    fn level_from_matches_guarded() {
+        // The reference: the pre-optimisation guarded implementation.
+        let guarded = |powered: f64| -> i32 {
+            let m = powered - QUANT_BIAS;
+            if m <= 0.0 {
+                0
+            } else {
+                (m.round() as i32).clamp(0, MAX_LEVEL)
+            }
+        };
+        // Dense sweep across the working range and a bit past saturation.
+        let mut p = -1.0f64;
+        while p < 9000.0 {
+            assert_eq!(level_from(p), guarded(p), "level_from mismatch at {p}");
+            p += 0.013; // irrational-ish step to land near many rounding seams
+        }
+        // Exact half-integer + bias midpoints (the rounding boundary itself).
+        for n in 0..50 {
+            let mid = n as f64 + 0.5 + QUANT_BIAS;
+            assert_eq!(level_from(mid), guarded(mid), "midpoint {mid}");
+        }
+        // Extremes.
+        for &p in &[f64::from(0), 1e9, MAX_LEVEL as f64 + 5.0] {
+            assert_eq!(level_from(p), guarded(p));
+        }
     }
 }

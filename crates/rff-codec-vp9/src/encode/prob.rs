@@ -89,12 +89,15 @@ pub fn diff_update_encode(enc: &mut BoolEncoder, old_p: u8, new_p: u8) -> u8 {
 /// MV probs are always odd; `new_p` is rounded to the nearest representable odd
 /// value, and the value actually coded is returned.
 pub fn update_mv_prob_encode(enc: &mut BoolEncoder, old_p: u8, new_p: u8) -> u8 {
-    let coded = (new_p & !1) | 1; // nearest odd ≤ new_p, then |1
-    if coded == old_p {
+    if new_p == old_p {
+        // No update keeps the current prob exactly — which may be even (the
+        // defaults are), so this decision must key on equality, not the coded form.
         enc.write_bool(0, 252);
         old_p
     } else {
+        // An update can only encode an odd prob: `(literal << 1) | 1`.
         enc.write_bool(1, 252);
+        let coded = (new_p & !1) | 1;
         enc.write_literal((coded >> 1) as u32, 7);
         coded
     }

@@ -32,9 +32,9 @@ mod token;
 mod transform;
 pub use bits::{BitReader, BoolDecoder};
 
-const FRAME_MARKER: u32 = 2;
-const SYNC_CODE: u32 = 0x49_8342;
-const CS_RGB: u32 = 7;
+pub(crate) const FRAME_MARKER: u32 = 2;
+pub(crate) const SYNC_CODE: u32 = 0x49_8342;
+pub(crate) const CS_RGB: u32 = 7;
 
 /// Register the VP9 decoder into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
@@ -49,7 +49,7 @@ pub fn register(registry: &mut CodecRegistry) {
 }
 
 /// The parsed VP9 uncompressed frame header (the fields decoded so far).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrameHeader {
     pub profile: u32,
     pub show_existing_frame: bool,

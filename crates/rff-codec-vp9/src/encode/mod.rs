@@ -12,6 +12,10 @@
 
 mod adapt;
 mod bitwriter;
+mod compressed;
+mod frame;
+mod header;
+mod intermode;
 mod mv;
 mod prob;
 mod quantize;
@@ -20,6 +24,13 @@ mod tokens;
 mod transform;
 
 pub(crate) use bitwriter::{BitWriter, BoolEncoder};
+pub(crate) use compressed::write_compressed_header;
+pub(crate) use frame::{assemble_frame, assemble_tiles};
+pub(crate) use header::write_uncompressed_header;
+pub(crate) use intermode::{
+    write_comp_inter, write_comp_ref, write_inter_mode, write_interp_filter, write_is_inter,
+    write_single_ref,
+};
 pub(crate) use mv::encode_mv;
 pub(crate) use prob::{
     diff_update_encode, encode_term_subexp, forward_remap_prob, update_mv_prob_encode,

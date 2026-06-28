@@ -1348,7 +1348,7 @@ pub(crate) const DEFAULT_SWITCHABLE_INTERP_PROB: [[u8; 2]; 4] =
     [[235, 162], [36, 255], [34, 3], [149, 144]];
 
 /// One MV component's entropy model (`nmv_component`).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NmvComp {
     pub sign: u8,
     pub classes: [u8; 10],
@@ -1361,7 +1361,7 @@ pub(crate) struct NmvComp {
 }
 
 /// The motion-vector entropy context (`nmv_context`): joints + two components.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NmvContext {
     pub joints: [u8; 3],
     pub comps: [NmvComp; 2],

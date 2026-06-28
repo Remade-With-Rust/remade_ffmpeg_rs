@@ -162,33 +162,99 @@ fn pair_table_max(t: &PairTable) -> i32 {
     }
 }
 
-/// Cheapest pair table covering `coeffs[lo..hi]` (an even-aligned region).
+/// Cheapest pair table covering `coeffs[lo..hi]` (an even-aligned region), and its
+/// bit cost.
 ///
 /// **A3** — only tables whose range covers the region's peak magnitude are costed;
 /// the rest can't represent it (`estimate_bits` would score them "infinity"
 /// anyway), so skipping them in O(1) avoids walking the region per dead table.
 /// Output-identical to costing all 32.
-fn best_pair_table(coeffs: &[i32; GRANULE_LINES], lo: usize, hi: usize) -> u8 {
+///
+/// **C (redundancy):** returns the winning cost alongside the table, so callers
+/// that need the region's bit count don't have to re-walk it (the cost was already
+/// computed to choose the table).
+fn best_pair_table(coeffs: &[i32; GRANULE_LINES], lo: usize, hi: usize) -> (u8, usize) {
     if lo >= hi {
-        return 0;
+        return (0, 0);
     }
     let slice = &coeffs[lo..hi];
+
+    // ── One region walk → a compact histogram (C: kill the per-table re-walk) ──
+    // `pair_bits` decomposes exactly as: codeword(clamp(x),clamp(y)) + sign(x≠0) +
+    // sign(y≠0) + linbits·[|x|≥maxc] + linbits·[|y|≥maxc]. So per table the cost is
+    // a sum over the (few) distinct clamped pairs + a sign count (table-independent)
+    // + an escape count derived from a coordinate-magnitude histogram. Magnitudes
+    // clamp at 15 because no table's `maxc` exceeds 15 (`min(|v|,15)≥maxc ⇔ |v|≥maxc`).
+    // Peak is taken over the whole slice (including any trailing unpaired element),
+    // matching the reference: that element is uncoded, yet it still gates the
+    // coverage prune — replicated here so the selection stays byte-identical.
     let peak = slice.iter().map(|c| c.unsigned_abs()).max().unwrap_or(0) as i32;
+    let mut hist = [[0u32; 16]; 16]; // counts of clamped (|x|,|y|) pairs
+    let mut cells: [(u8, u8); 256] = [(0, 0); 256]; // the populated pair cells
+    let mut ncells = 0usize;
+    let mut cmag = [0u32; 16]; // counts of clamped coordinate magnitudes
+    let mut i = 0;
+    while i + 1 < slice.len() {
+        let (x, y) = (slice[i], slice[i + 1]);
+        let ax = x.unsigned_abs().min(15) as usize;
+        let ay = y.unsigned_abs().min(15) as usize;
+        if hist[ax][ay] == 0 {
+            cells[ncells] = (ax as u8, ay as u8);
+            ncells += 1;
+        }
+        hist[ax][ay] += 1;
+        cmag[ax] += 1;
+        cmag[ay] += 1;
+        i += 2;
+    }
+    // sign bits: one per nonzero coordinate (the same for every table).
+    let total_signs = cmag[1..].iter().sum::<u32>() as usize;
+    // cum[m] = #coords with magnitude ≥ m (for the linbits escape count).
+    let mut cum = [0u32; 17];
+    for m in (0..16).rev() {
+        cum[m] = cum[m + 1] + cmag[m];
+    }
+
     let mut best = (usize::MAX, 0u8);
     for table in 0u8..PAIR_TABLES.len() as u8 {
-        if pair_table_max(PAIR_TABLES[table as usize]) < peak {
+        let t = PAIR_TABLES[table as usize];
+        if pair_table_max(t) < peak {
             continue; // can't code this region's peak — would cost "infinity"
         }
-        let cost = estimate_bits(slice, table);
+        if t.dim == 0 {
+            // The empty book codes only all-zero regions (peak == 0), at zero cost.
+            if best.0 > 0 {
+                best = (0, table);
+            }
+            continue;
+        }
+        let dim = t.dim as usize;
+        let maxc = dim - 1;
+        let mut codeword = 0usize;
+        for &(a, b) in &cells[..ncells] {
+            let (cx, cy) = ((a as usize).min(maxc), (b as usize).min(maxc));
+            let len = t
+                .book
+                .code_len(cx * dim + cy)
+                .map_or(usize::MAX / 4, |(_, l)| l as usize);
+            codeword += hist[a as usize][b as usize] as usize * len;
+        }
+        let escape = if t.linbits > 0 {
+            t.linbits as usize * cum[maxc] as usize
+        } else {
+            0
+        };
+        let cost = codeword.saturating_add(escape).saturating_add(total_signs);
         if cost < best.0 {
             best = (cost, table);
         }
     }
-    best.1
+    (best.1, best.0)
 }
 
-/// Cheaper of the two count1 quad tables for `coeffs[lo..hi]` (`false`=A, `true`=B).
-fn best_quad_table(coeffs: &[i32; GRANULE_LINES], lo: usize, hi: usize) -> bool {
+/// Cheaper of the two count1 quad tables for `coeffs[lo..hi]` (`false`=A, `true`=B),
+/// and that table's bit cost.
+fn best_quad_table(coeffs: &[i32; GRANULE_LINES], lo: usize, hi: usize) -> (bool, usize) {
     let (mut a, mut b) = (0usize, 0usize);
     let mut i = lo;
     while i + 4 <= hi {
@@ -208,7 +274,11 @@ fn best_quad_table(coeffs: &[i32; GRANULE_LINES], lo: usize, hi: usize) -> bool 
         );
         i += 4;
     }
-    b < a
+    if b < a {
+        (true, b)
+    } else {
+        (false, a)
+    }
 }
 
 /// Roughly split the big-values region into thirds at scalefactor-band boundaries.
@@ -237,7 +307,7 @@ pub fn select(
     header: &FrameHeader,
     coeffs: &[i32; GRANULE_LINES],
     block_type: BlockType,
-) -> GranuleSideInfo {
+) -> (GranuleSideInfo, usize) {
     // big_values must cover every line with magnitude > 1 (count1 only codes ±1).
     let big_end = match coeffs.iter().rposition(|&c| c.abs() > 1) {
         Some(i) => (i / 2 + 1) * 2, // even, includes the pair holding line i
@@ -252,51 +322,59 @@ pub fn select(
         "rzero invariant: no non-zero line past the coded region"
     );
 
+    let (count1_select, count1_bits) = best_quad_table(coeffs, big_end, count1_end);
     let common = GranuleSideInfo {
         big_values: (big_end / 2) as u16,
-        count1table_select: best_quad_table(coeffs, big_end, count1_end),
+        count1table_select: count1_select,
         ..Default::default()
     };
 
-    if block_type == BlockType::Long {
+    let (side, big_bits) = if block_type == BlockType::Long {
         let sfb = tables::sfb_long_offsets(header.sample_rate);
         let (r0c, r1c) = choose_regions(sfb, big_end);
         let (r1, r2) = region_bounds_long(sfb, r0c, r1c, big_end);
-        GranuleSideInfo {
-            region0_count: r0c,
-            region1_count: r1c,
-            table_select: [
-                best_pair_table(coeffs, 0, r1),
-                best_pair_table(coeffs, r1, r2),
-                best_pair_table(coeffs, r2, big_end),
-            ],
-            ..common
-        }
+        let (t0, c0) = best_pair_table(coeffs, 0, r1);
+        let (t1, c1) = best_pair_table(coeffs, r1, r2);
+        let (t2, c2) = best_pair_table(coeffs, r2, big_end);
+        (
+            GranuleSideInfo {
+                region0_count: r0c,
+                region1_count: r1c,
+                table_select: [t0, t1, t2],
+                ..common
+            },
+            c0 + c1 + c2,
+        )
     } else {
-        GranuleSideInfo {
-            window_switching: true,
-            block_type,
-            table_select: windowed_table_select(coeffs, big_end),
-            ..common
-        }
-    }
+        let (tables, big_bits) = windowed_table_select(coeffs, big_end);
+        (
+            GranuleSideInfo {
+                window_switching: true,
+                block_type,
+                table_select: tables,
+                ..common
+            },
+            big_bits,
+        )
+    };
+    // Total part-3 bits = big_values + count1 — already summed here, so callers
+    // never re-walk the spectrum (the `cost`-equals-this invariant is tested).
+    (side, big_bits + count1_bits)
 }
 
 /// Pair-table selection for the window-switched fixed `(36, bv2)` region split
-/// (used by short, start, and stop blocks). Region 2 is empty.
-pub fn windowed_table_select(coeffs: &[i32; GRANULE_LINES], bv2: usize) -> [u8; 3] {
+/// (used by short, start, and stop blocks), with the two regions' total bits.
+/// Region 2 is empty.
+pub fn windowed_table_select(coeffs: &[i32; GRANULE_LINES], bv2: usize) -> ([u8; 3], usize) {
     let r1 = 36.min(bv2);
-    [
-        best_pair_table(coeffs, 0, r1),
-        best_pair_table(coeffs, r1, bv2),
-        0,
-    ]
+    let (t0, c0) = best_pair_table(coeffs, 0, r1);
+    let (t1, c1) = best_pair_table(coeffs, r1, bv2);
+    ([t0, t1, 0], c0 + c1)
 }
 
-/// Huffman bit cost of a short-block coefficient set (A2: counted, not emitted).
+/// Huffman bit cost of a short-block coefficient set (counted, not emitted).
 pub fn cost_short(header: &FrameHeader, coeffs: &[i32; GRANULE_LINES]) -> usize {
-    let side = select(header, coeffs, BlockType::Short);
-    cost(&side, coeffs, header)
+    select(header, coeffs, BlockType::Short).1
 }
 
 // ── B3: emit the whole spectrum ───────────────────────────────────────────────
@@ -424,7 +502,7 @@ mod tests {
     /// Select tables, encode, decode back — coefficients must survive exactly.
     fn round_trip(coeffs: [i32; GRANULE_LINES]) {
         let header = hdr();
-        let side = select(&header, &coeffs, BlockType::Long);
+        let (side, _) = select(&header, &coeffs, BlockType::Long);
         let quant = QuantizedGranule {
             coeffs,
             side: side.clone(),
@@ -493,12 +571,13 @@ mod tests {
         round_trip(c);
     }
 
-    /// A2 invariant: the count-only `cost` must equal what `encode` actually
-    /// writes, for every layout the rate loop might probe.
+    /// A2 + C invariant: `select`'s returned bit cost and the standalone `cost`
+    /// must both equal what `encode` actually writes, for every layout the rate
+    /// loop might probe — so the redundancy-eliminated path stays bit-exact.
     fn assert_cost_matches(coeffs: [i32; GRANULE_LINES]) {
         let header = hdr();
         for bt in [BlockType::Long, BlockType::Short] {
-            let side = select(&header, &coeffs, bt);
+            let (side, sel_cost) = select(&header, &coeffs, bt);
             let q = QuantizedGranule {
                 coeffs,
                 side: side.clone(),
@@ -511,6 +590,7 @@ mod tests {
                 emitted,
                 "cost vs encode ({bt:?})"
             );
+            assert_eq!(sel_cost, emitted, "select cost vs encode ({bt:?})");
         }
     }
 
@@ -535,13 +615,63 @@ mod tests {
         assert_cost_matches([0i32; GRANULE_LINES]);
     }
 
+    /// Reference: the pre-C per-table `estimate_bits` search the histogram replaces.
+    fn best_pair_table_ref(coeffs: &[i32; GRANULE_LINES], lo: usize, hi: usize) -> (u8, usize) {
+        if lo >= hi {
+            return (0, 0);
+        }
+        let slice = &coeffs[lo..hi];
+        let peak = slice.iter().map(|c| c.unsigned_abs()).max().unwrap_or(0) as i32;
+        let mut best = (usize::MAX, 0u8);
+        for table in 0u8..PAIR_TABLES.len() as u8 {
+            if pair_table_max(PAIR_TABLES[table as usize]) < peak {
+                continue;
+            }
+            let cost = estimate_bits(slice, table);
+            if cost < best.0 {
+                best = (cost, table);
+            }
+        }
+        (best.1, best.0)
+    }
+
+    /// **C gate.** The histogram table search must return the identical
+    /// `(table, cost)` as the per-table reference — across small values (the common
+    /// case), escape-range values, all-zero regions, and odd region lengths.
+    #[test]
+    fn best_pair_table_hist_matches_ref() {
+        let mut st = 0x517C_C1EFu32;
+        let mut rng = || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            st >> 8
+        };
+        for trial in 0..4000 {
+            let mut c = [0i32; GRANULE_LINES];
+            // Vary the value range per trial: mostly small, sometimes large (escape).
+            let span = [2i32, 4, 8, 16, 64, 600][trial % 6];
+            let fill = (rng() as usize % 400) + 1;
+            for v in c.iter_mut().take(fill) {
+                let m = (rng() as i32) % (span + 1);
+                *v = if rng() & 1 == 0 { m } else { -m };
+            }
+            // Random even-aligned region, plus an occasional odd hi.
+            let lo = (rng() as usize % 100) & !1;
+            let hi = (lo + 2 + (rng() as usize % 300)).min(GRANULE_LINES);
+            assert_eq!(
+                best_pair_table(&c, lo, hi),
+                best_pair_table_ref(&c, lo, hi),
+                "trial {trial}: span {span}, region [{lo},{hi})"
+            );
+        }
+    }
+
     #[test]
     fn estimate_matches_emitted_bits() {
         // B2's estimate must equal what B3 actually writes for a pure pair region.
         let mut c = [0i32; GRANULE_LINES];
         let seed = [4, -3, 2, -1, 5, 6, -2, 1];
         c[..seed.len()].copy_from_slice(&seed);
-        let table = best_pair_table(&c, 0, seed.len());
+        let (table, _) = best_pair_table(&c, 0, seed.len());
         let est = estimate_bits(&c[0..seed.len()], table);
 
         let t = PAIR_TABLES[table as usize];

@@ -25,7 +25,7 @@ use crate::inter::{predict_block, scaled_predict_block, RefPlane};
 use crate::mv::{find_mv_refs, get_mode_context, lower_mv_precision, read_mv, MvRef};
 
 /// `vp9_inter_mode_tree` — leaves are `-INTER_OFFSET(mode)`; result + NEARESTMV.
-const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
+pub(crate) const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
 use crate::predict::{build_intra_edges, predict};
 use crate::prob::inv_remap_prob;
 use crate::prob_tables::{
@@ -50,30 +50,30 @@ const MI_SIZE: usize = 8; // pixels per mode-info unit
 /// The full entropy state for a frame (`FRAME_CONTEXT`): coefficient model
 /// probs, skip / tx-size probs, and all inter-frame mode/reference/mv probs.
 /// Persisted across frames (the 4 saved contexts) and adapted backward.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct FrameContext {
-    coef_probs: [[[[[[u8; 3]; 6]; 6]; 2]; 2]; 4],
-    skip_probs: [u8; 3],
-    tx_p8x8: [[u8; 1]; 2],
-    tx_p16x16: [[u8; 2]; 2],
-    tx_p32x32: [[u8; 3]; 2],
-    tx_mode: usize,
+    pub(crate) coef_probs: [[[[[[u8; 3]; 6]; 6]; 2]; 2]; 4],
+    pub(crate) skip_probs: [u8; 3],
+    pub(crate) tx_p8x8: [[u8; 1]; 2],
+    pub(crate) tx_p16x16: [[u8; 2]; 2],
+    pub(crate) tx_p32x32: [[u8; 3]; 2],
+    pub(crate) tx_mode: usize,
     // ---- inter-frame probabilities ----
-    y_mode_prob: [[u8; 9]; 4],
-    uv_mode_prob: [[u8; 9]; 10],
-    partition_prob: [[u8; 3]; 16],
-    inter_mode_probs: [[u8; 3]; 7],
-    intra_inter_prob: [u8; 4],
-    comp_inter_prob: [u8; 5],
-    comp_ref_prob: [u8; 5],
-    single_ref_prob: [[u8; 2]; 5],
-    switchable_interp_prob: [[u8; 2]; 4],
-    nmvc: NmvContext,
+    pub(crate) y_mode_prob: [[u8; 9]; 4],
+    pub(crate) uv_mode_prob: [[u8; 9]; 10],
+    pub(crate) partition_prob: [[u8; 3]; 16],
+    pub(crate) inter_mode_probs: [[u8; 3]; 7],
+    pub(crate) intra_inter_prob: [u8; 4],
+    pub(crate) comp_inter_prob: [u8; 5],
+    pub(crate) comp_ref_prob: [u8; 5],
+    pub(crate) single_ref_prob: [[u8; 2]; 5],
+    pub(crate) switchable_interp_prob: [[u8; 2]; 4],
+    pub(crate) nmvc: NmvContext,
     /// 0 = SINGLE_REFERENCE, 1 = COMPOUND_REFERENCE, 2 = REFERENCE_MODE_SELECT.
-    reference_mode: usize,
+    pub(crate) reference_mode: usize,
     /// Resolved fixed/var compound references (`vp9_setup_compound_reference_mode`).
-    comp_fixed_ref: usize,
-    comp_var_ref: [usize; 2],
+    pub(crate) comp_fixed_ref: usize,
+    pub(crate) comp_var_ref: [usize; 2],
 }
 
 impl Default for FrameContext {
@@ -389,7 +389,7 @@ fn update_mv_probs(b: &mut BoolDecoder, p: &mut [u8]) {
 }
 
 /// `read_inter_mode` — the inter mode (NEARESTMV..NEWMV) for one block.
-fn read_inter_mode(b: &mut BoolDecoder, probs: &[u8; 3]) -> u8 {
+pub(crate) fn read_inter_mode(b: &mut BoolDecoder, probs: &[u8; 3]) -> u8 {
     NEARESTMV + crate::token::read_tree(b, &INTER_MODE_TREE, probs) as u8
 }
 
@@ -796,7 +796,7 @@ fn read_coef_probs(b: &mut BoolDecoder, fc: &mut FrameContext) {
 }
 
 /// Parse the compressed header into a [`FrameContext`] (key/intra or inter).
-fn parse_compressed_header(
+pub(crate) fn parse_compressed_header(
     data: &[u8],
     h: &FrameHeader,
     pre_fc: &FrameContext,
