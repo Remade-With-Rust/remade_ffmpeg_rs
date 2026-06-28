@@ -100,10 +100,16 @@ became a fast Huffman decoder, not a fast transform.
   decode 169× → 288× realtime (1.75×)**, Huffman stage 7× faster, output
   bit-identical, still matches FFmpeg at 119.6 dB. Decode gap vs FFmpeg: 2.9× → ~1.7×.
 
-- **B3 — Fast decode synthesis + IMDCT.** *Now* the top decode stage (synthesis,
-  the dense 64→32 matrix, is 42% after B-Huff; IMDCT ~4%). The plan's original B3,
-  validated by measurement this time. **Risk:** a fast DCT changes the float
-  arithmetic and may erode the 119.6 dB FFmpeg match — gate carefully.
+- **B3 — Fast decode synthesis matrixing** ✅ **DONE (2026-06-28).** The dense
+  64→32 cosine product (2048 mults) replaced by two exact symmetries (fold k↔31−k
+  → 16 terms; all 64 `V[i]` are signed copies of 32 DCT values `G[m]`, `V[16]≡0`)
+  → 512 mults. Gated against the dense matrix kept as the oracle
+  (`fast_matrixing_matches_dense`, worst 1.55e-7). **Synthesis 6.1ms → 2.9ms
+  (2.1×); decode 288× → ~306× realtime.** FFmpeg match preserved at 119.6 dB; 73
+  tests pass. *Lesson:* the dense matrix auto-vectorizes well, so the algorithmic
+  FLOP cut (4×) yields ~2× wall-clock, not 4× — and one noisy run even looked
+  slower until re-measured. The windowing (512-tap D dot products) is now the
+  synthesis remainder → a Phase-C SIMD target. IMDCT (~4%) left as-is (cold).
 - **B1/B2 — Encode transforms.** Deprioritised: Phase A's profile shows the encode
   filterbank is 9% and the forward MDCT 1.4% — cold. The encode transform worth
   attacking is the **psychoacoustic FFT (~19%)**, not the filterbank/MDCT.
