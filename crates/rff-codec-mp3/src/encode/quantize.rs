@@ -84,63 +84,114 @@ impl Default for QuantizedGranule {
     }
 }
 
-/// Quantize one granule at `global_gain` into integer levels (sign-separated).
-/// Forward of the decoder's `xr = sign·|is|^(4/3)·2^(0.25·(gain−210))`.
-fn quantize_at(freq: &[f32; GRANULE_LINES], gain: i32) -> [i32; GRANULE_LINES] {
-    let scale_inv = 2f64.powf(-0.25 * (gain - 210) as f64);
+/// Largest non-clipping quantized level. Above this the value would saturate at
+/// `MAX_LEVEL`, losing precision — so a gain that produces it is *too fine*.
+const MAX_UNCLIPPED: i32 = 8191;
+/// Scalefactor multiplier when `scalefac_scale = 0` (the half-step we use).
+const SF_MULT: f64 = 0.5;
+/// Largest scalefactor value (a 4-bit `slen` field caps it).
+const MAX_SF: u8 = 15;
+/// Outer distortion-loop iteration cap.
+const MAX_OUTER: usize = 24;
+
+/// Quantize one granule at `global_gain` with per-band scalefactors applied:
+/// band `b` is amplified by `2^(SF_MULT·sf[b])` before quantizing (finer step →
+/// less noise there), the forward of the decoder's per-band requantization.
+fn quantize_with_sf(
+    header: &FrameHeader,
+    freq: &[f32; GRANULE_LINES],
+    gain: i32,
+    sf: &[u8; 22],
+) -> [i32; GRANULE_LINES] {
+    let off = crate::tables::sfb_long_offsets(header.sample_rate);
+    let base = -0.25 * (gain - 210) as f64;
     let mut coeffs = [0i32; GRANULE_LINES];
-    for (i, &x) in freq.iter().enumerate() {
-        let mag = quantize_level(x.abs() as f64 * scale_inv);
-        coeffs[i] = if x < 0.0 { -mag } else { mag };
+    for b in 0..22 {
+        let s = if b < 21 { sf[b] } else { 0 } as f64; // band 21 is uncoded
+        let scale_inv = 2f64.powf(base + SF_MULT * s);
+        let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
+        for i in lo..hi {
+            let mag = quantize_level(freq[i].abs() as f64 * scale_inv);
+            coeffs[i] = if freq[i] < 0.0 { -mag } else { mag };
+        }
     }
     coeffs
 }
 
-/// Build a granule (coeffs + Huffman layout) at a candidate `global_gain`.
-fn build(header: &FrameHeader, freq: &[f32; GRANULE_LINES], gain: i32) -> QuantizedGranule {
-    let coeffs = quantize_at(freq, gain);
-    let mut side = super::huffman::select(header, &coeffs);
-    side.global_gain = gain as u8;
-    side.scalefac_compress = 0; // flat scalefactors (C1/C2 do no shaping)
-    QuantizedGranule {
-        coeffs,
-        side,
-        scalefactors: [0; 39],
+/// Per-band quantization-noise energy: `Σ (freq − requantized)²` over each of the
+/// 21 coded long bands, using the decoder's exact requantization.
+fn band_noise(
+    header: &FrameHeader,
+    freq: &[f32; GRANULE_LINES],
+    coeffs: &[i32; GRANULE_LINES],
+    gain: i32,
+    sf: &[u8; 22],
+) -> [f32; 21] {
+    let off = crate::tables::sfb_long_offsets(header.sample_rate);
+    let mut noise = [0f32; 21];
+    for (b, n) in noise.iter_mut().enumerate() {
+        let scale = 2f64.powf(0.25 * (gain - 210) as f64 - SF_MULT * sf[b] as f64);
+        let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
+        let mut e = 0f64;
+        for i in lo..hi {
+            let xr = coeffs[i].signum() as f64 * requant_magnitude(coeffs[i]) * scale;
+            let d = freq[i] as f64 - xr;
+            e += d * d;
+        }
+        *n = e as f32;
+    }
+    noise
+}
+
+/// Bits to represent values `0..=v`.
+fn bits_for(v: u8) -> u8 {
+    if v == 0 {
+        0
+    } else {
+        (8 - v.leading_zeros()) as u8
     }
 }
 
-/// Huffman bit cost of a candidate granule.
-fn cost(header: &FrameHeader, q: &QuantizedGranule) -> usize {
-    let mut w = crate::bitio::BitWriter::new();
-    super::huffman::encode(q, header, &mut w)
+/// Pick the smallest `scalefac_compress` covering the current scalefactors, and
+/// its scalefactor-bit cost (`11·slen1 + 10·slen2`).
+fn choose_compress(sf: &[u8; 22]) -> (u16, usize) {
+    let max1 = sf[0..11].iter().copied().max().unwrap_or(0);
+    let max2 = sf[11..21].iter().copied().max().unwrap_or(0);
+    let (need1, need2) = (bits_for(max1), bits_for(max2));
+    for (idx, &(slen1, slen2)) in crate::tables::SCALEFAC_COMPRESS_V1.iter().enumerate() {
+        if slen1 >= need1 && slen2 >= need2 {
+            return (idx as u16, 11 * slen1 as usize + 10 * slen2 as usize);
+        }
+    }
+    (15, 11 * 4 + 10 * 3)
 }
 
-/// Largest non-clipping quantized level. Above this the value would saturate at
-/// `MAX_LEVEL`, losing precision — so a gain that produces it is *too fine*.
-const MAX_UNCLIPPED: i32 = 8191;
+/// Huffman bit cost of a coefficient set under the best table selection.
+fn huff_cost(header: &FrameHeader, coeffs: &[i32; GRANULE_LINES]) -> (GranuleSideInfo, usize) {
+    let side = super::huffman::select(header, coeffs);
+    let q = QuantizedGranule {
+        coeffs: *coeffs,
+        side: side.clone(),
+        scalefactors: [0; 39],
+    };
+    let mut w = crate::bitio::BitWriter::new();
+    let bits = super::huffman::encode(&q, header, &mut w);
+    (side, bits)
+}
 
-/// **C2 — the rate loop.** Find the *smallest* `global_gain` (finest step, best
-/// quality) whose Huffman-coded spectrum fits `bit_budget`, then fill the granule.
-///
-/// Bits decrease monotonically as the gain rises (coarser step → smaller levels →
-/// fewer bits), so a binary search pins the boundary. There is no outer distortion
-/// loop yet (that's Q6) and scalefactors stay flat — this is rate control only.
-pub fn loops(
+/// Inner rate loop: smallest `global_gain` (finest, best quality) that neither
+/// clips nor exceeds `huff_budget`, for the given scalefactors.
+fn inner_gain(
     header: &FrameHeader,
     freq: &[f32; GRANULE_LINES],
-    _psy: &PsyResult,
-    bit_budget: usize,
-) -> QuantizedGranule {
-    // A gain is acceptable when nothing clips *and* the spectrum fits the budget.
-    // Both improve as the gain rises (coarser step → smaller levels → fewer bits,
-    // no clipping), so the smallest acceptable gain is the best-quality one.
-    // Crucially this rejects tiny gains where everything clamps to MAX_LEVEL but
-    // still costs few bits (which a budget-only test would wrongly accept).
+    sf: &[u8; 22],
+    huff_budget: usize,
+) -> i32 {
     let ok = |g: i32| {
-        let q = build(header, freq, g);
-        q.coeffs.iter().all(|&c| c.abs() <= MAX_UNCLIPPED) && cost(header, &q) <= bit_budget
+        let coeffs = quantize_with_sf(header, freq, g, sf);
+        coeffs.iter().all(|&c| c.abs() <= MAX_UNCLIPPED)
+            && huff_cost(header, &coeffs).1 <= huff_budget
     };
-
     let (mut lo, mut hi) = (0i32, 255i32);
     while lo < hi {
         let mid = (lo + hi) / 2;
@@ -150,11 +201,63 @@ pub fn loops(
             lo = mid + 1;
         }
     }
+    lo
+}
 
-    let mut q = build(header, freq, lo);
-    // Scalefactors are zero-length here, so part2_3_length == the Huffman bits.
-    q.side.part2_3_length = cost(header, &q) as u16;
-    q
+/// **C2 + Q6 — the two-loop quantizer.** The inner loop ([`inner_gain`]) hits the
+/// bit budget; the outer distortion loop raises the scalefactor of the worst
+/// over-threshold band, re-runs the inner loop, and keeps the lowest-peak-NMR
+/// result. With a flat threshold (C1) it degrades to pure rate control; with the
+/// real psymodel (Q1–Q4) it shapes quantization noise under the masking curve.
+pub fn loops(
+    header: &FrameHeader,
+    freq: &[f32; GRANULE_LINES],
+    psy: &PsyResult,
+    bit_budget: usize,
+) -> QuantizedGranule {
+    let mut sf = [0u8; 22];
+    let mut best: Option<(f32, QuantizedGranule)> = None;
+
+    for _ in 0..MAX_OUTER {
+        let (compress, sf_bits) = choose_compress(&sf);
+        let huff_budget = bit_budget.saturating_sub(sf_bits);
+
+        let gain = inner_gain(header, freq, &sf, huff_budget);
+        let coeffs = quantize_with_sf(header, freq, gain, &sf);
+        let (mut side, _) = huff_cost(header, &coeffs);
+        side.global_gain = gain as u8;
+        side.scalefac_compress = compress;
+        let mut scalefactors = [0u8; 39];
+        scalefactors[..22].copy_from_slice(&sf);
+        let granule = QuantizedGranule {
+            coeffs,
+            side,
+            scalefactors,
+        };
+
+        // Score: peak noise-to-mask ratio across the coded bands.
+        let noise = band_noise(header, freq, &granule.coeffs, gain, &sf);
+        let mut peak_nmr = f32::NEG_INFINITY;
+        let mut worst: Option<usize> = None;
+        let mut worst_nmr = f32::NEG_INFINITY;
+        for (b, &n) in noise.iter().enumerate() {
+            let nmr = n / psy.thresholds[b].max(1e-20);
+            peak_nmr = peak_nmr.max(nmr);
+            if n > psy.thresholds[b] && sf[b] < MAX_SF && nmr > worst_nmr {
+                worst_nmr = nmr;
+                worst = Some(b);
+            }
+        }
+        if best.as_ref().is_none_or(|(bn, _)| peak_nmr < *bn) {
+            best = Some((peak_nmr, granule));
+        }
+        match worst {
+            Some(b) => sf[b] += 1, // amplify the worst band, then re-quantize
+            None => break,         // every band already masked, or all saturated
+        }
+    }
+
+    best.expect("at least one iteration runs").1
 }
 
 #[cfg(test)]
@@ -197,17 +300,12 @@ mod c2_tests {
             q.coeffs.iter().filter(|&&c| c != 0).count()
         );
 
-        // Requantize the way the decoder does.
+        // Requantize the way the decoder does, with the granule's scalefactors.
+        let mut sf = ScaleFactors::default();
+        sf.long.copy_from_slice(&q.scalefactors[..22]);
         let mut out = [0f32; GRANULE_LINES];
         let nz = q.coeffs.iter().rposition(|&c| c != 0).map_or(0, |i| i + 1);
-        crate::decode::requantize::apply(
-            &header,
-            &q.side,
-            &ScaleFactors::default(),
-            &q.coeffs,
-            nz,
-            &mut out,
-        );
+        crate::decode::requantize::apply(&header, &q.side, &sf, &q.coeffs, nz, &mut out);
 
         let mut maxerr = 0f32;
         for i in 0..GRANULE_LINES {
@@ -218,6 +316,84 @@ mod c2_tests {
             out[40], out[41]
         );
         assert!(maxerr < 0.2, "spectrum round-trip error {maxerr}");
+    }
+}
+
+#[cfg(test)]
+mod q6_tests {
+    use super::*;
+    use crate::frame::{BlockType, ChannelMode, GranuleSideInfo};
+    use crate::header::MpegVersion;
+
+    fn hdr() -> FrameHeader {
+        FrameHeader {
+            version: MpegVersion::V1,
+            crc_protected: false,
+            bitrate_kbps: 128,
+            sample_rate: 44100,
+            padding: false,
+            channel_mode: ChannelMode::Mono,
+            copyright: false,
+            original: true,
+            emphasis: 0,
+        }
+    }
+
+    /// Peak noise-to-mask ratio (dB) of a granule under `thresholds`.
+    fn peak_nmr_db(
+        header: &FrameHeader,
+        freq: &[f32; GRANULE_LINES],
+        g: &QuantizedGranule,
+        thresholds: &[f32; 22],
+    ) -> f32 {
+        let mut sf = [0u8; 22];
+        sf.copy_from_slice(&g.scalefactors[..22]);
+        let noise = band_noise(header, freq, &g.coeffs, g.side.global_gain as i32, &sf);
+        let mut peak = f32::NEG_INFINITY;
+        for (b, &n) in noise.iter().enumerate() {
+            peak = peak.max(10.0 * (n / thresholds[b].max(1e-20)).log10());
+        }
+        peak
+    }
+
+    #[test]
+    fn distortion_loop_beats_flat_on_a_complex_signal() {
+        // Two tones in different critical bands → low-masking bands sit next to
+        // high-masking ones, so shaping noise to the threshold helps.
+        let header = hdr();
+        let sr = 44100.0;
+        let pcm: Vec<f32> = (0..1152)
+            .map(|i| {
+                let t = i as f32 / sr;
+                0.35 * (2.0 * std::f32::consts::PI * 600.0 * t).sin()
+                    + 0.2 * (2.0 * std::f32::consts::PI * 5200.0 * t).sin()
+            })
+            .collect();
+
+        let psy = super::super::psychoacoustic::analyze(&pcm, 44100);
+
+        // Forward path to the MDCT spectrum.
+        let mut fifo = [0f32; 512];
+        let sub = super::super::filterbank::analyze(&pcm, &mut fifo);
+        let mut overlap = [0f32; GRANULE_LINES];
+        let mut freq = super::super::mdct::forward(&sub, BlockType::Long, &mut overlap);
+        super::super::antialias::expand(&GranuleSideInfo::default(), &mut freq);
+
+        let budget = 1600;
+        let flat = PsyResult {
+            thresholds: [f32::MAX; 22], // never over threshold → no shaping (pure rate)
+            ..psy.clone()
+        };
+        let shaped = loops(&header, &freq, &psy, budget);
+        let plain = loops(&header, &freq, &flat, budget);
+
+        let nmr_shaped = peak_nmr_db(&header, &freq, &shaped, &psy.thresholds);
+        let nmr_plain = peak_nmr_db(&header, &freq, &plain, &psy.thresholds);
+        eprintln!("[Q6] peak NMR: shaped {nmr_shaped:.1} dB vs flat {nmr_plain:.1} dB");
+        assert!(
+            nmr_shaped <= nmr_plain + 0.01,
+            "psymodel shaping must not worsen peak NMR: {nmr_shaped} vs {nmr_plain}"
+        );
     }
 }
 

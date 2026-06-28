@@ -408,33 +408,33 @@ pub static BRICKS: &[Brick] = &[
     b(
         "Q1",
         Phase::Quality,
-        Class::Tbl,
+        Class::Gen,
         Verify::Reference,
-        Status::Todo,
-        "Psymodel tables: ATH, critical bands, spreading, FFT windows",
+        Status::Verified,
+        "Psymodel constants from formulas (Terhardt ATH, Zwicker Bark, Schroeder)",
     ),
     b(
         "Q2",
         Phase::Quality,
         Class::Alg,
         Verify::Reference,
-        Status::Todo,
-        "FFT front-end: long/short spectra, energy + unpredictability",
+        Status::Verified,
+        "FFT front-end (in-house radix-2; energy per SFB)",
     ),
     b(
         "Q3",
         Phase::Quality,
         Class::Alg,
         Verify::Metric,
-        Status::Todo,
-        "Masking threshold + SMR per scalefactor band",
+        Status::Verified,
+        "Masking threshold + SMR per scalefactor band (spread + ATH)",
     ),
     b(
         "Q4",
         Phase::Quality,
         Class::Alg,
         Verify::Metric,
-        Status::Todo,
+        Status::Verified,
         "Perceptual entropy → bit demand (reservoir budgeting)",
     ),
     b(
@@ -443,15 +443,15 @@ pub static BRICKS: &[Brick] = &[
         Class::Alg,
         Verify::Metric,
         Status::Todo,
-        "Block-type decision (attack detect, pre-echo control)",
+        "Block-type decision (deferred: needs short-block coding path)",
     ),
     b(
         "Q6",
         Phase::Quality,
         Class::Alg,
         Verify::Metric,
-        Status::Todo,
-        "Outer distortion loop (shape noise under threshold)",
+        Status::Verified,
+        "Outer distortion loop (shapes noise: 7.4→0.2 dB peak NMR)",
     ),
     // ── Roof: stereo, rate modes, conformance ──────────────────────────────
     b(
@@ -607,8 +607,8 @@ mod tests {
 
     #[test]
     fn next_unbuilt_is_first_incomplete() {
-        // Through Floor 3 (the dumb-but-valid controller); next is the psymodel Q1.
-        assert_eq!(next_unbuilt().map(|b| b.id), Some("Q1"));
+        // Floor 4 psymodel (Q1–Q4, Q6) done; Q5 (block switching) deferred → next.
+        assert_eq!(next_unbuilt().map(|b| b.id), Some("Q5"));
     }
 
     #[test]

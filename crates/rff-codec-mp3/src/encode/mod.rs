@@ -13,11 +13,13 @@
 use rff_core::Result;
 
 use crate::bitio::BitWriter;
+use crate::decode::scalefactors::ScaleFactors;
 use crate::frame::{GranuleSideInfo, SideInfo, GRANULE_LINES};
 use crate::header::FrameHeader;
 
 pub mod antialias;
 pub mod bitstream;
+pub mod fft;
 pub mod filterbank;
 pub mod huffman;
 pub mod mdct;
@@ -62,7 +64,7 @@ impl Mp3Encode {
         for gr in 0..granules {
             let gpcm = &pcm[gr * GRANULE_LINES..];
             let sub = filterbank::analyze(gpcm, &mut self.analysis_fifo[0]);
-            let psy = psychoacoustic::analyze(gpcm);
+            let psy = psychoacoustic::analyze(gpcm, header.sample_rate);
             let mut freq = mdct::forward(&sub, psy.block_type, &mut self.mdct_overlap[0]);
             // Forward alias butterflies — the inverse of the decoder's reduce(),
             // which it applies before the IMDCT.
@@ -73,10 +75,15 @@ impl Mp3Encode {
             };
             antialias::expand(&block, &mut freq);
             let quant = quantize::loops(header, &freq, &psy, budget_per_gr);
-            // Scalefactors are zero-length (flat), so main data is just the Huffman
-            // bits; `part2_3_length` (set by the rate loop) records their count.
+
+            // Main data per granule: scalefactors (part2) then Huffman (part3).
+            side.granules[gr][0] = quant.side.clone();
+            let mut sfac = ScaleFactors::default();
+            sfac.long.copy_from_slice(&quant.scalefactors[..22]);
+            let part2_3_start = main.bit_len();
+            bitstream::serialize_scalefactors(&mut main, header, &side, gr, 0, &sfac);
             huffman::encode(&quant, header, &mut main);
-            side.granules[gr][0] = quant.side;
+            side.granules[gr][0].part2_3_length = (main.bit_len() - part2_3_start) as u16;
         }
         let main_data = main.finish();
         Ok(bitstream::format(

@@ -277,6 +277,12 @@ The house, bottom-up. Each floor is independently green before the next.
    which it applies before the IMDCT.
 5. **Floor 4** Q1 → … → Q6 — the quality brain, swapped in behind the same
    interfaces. The only research-grade work, now isolated.
+   ✅ **Q1–Q4 + Q6 done** (Q5 block-switching deferred — needs the short-block
+   coding path). Constants from the published formulas (Terhardt ATH, Zwicker
+   Bark, Schroeder spreading); in-house radix-2 FFT (Q2); spread-energy masking
+   thresholds (Q3); perceptual entropy (Q4). The two-loop quantizer (Q6) shapes
+   noise under the mask — peak NMR **7.4 → 0.2 dB** on a two-tone signal — and a
+   multitone round-trips at **69 dB** through our decoder and **FFmpeg**.
 6. **Roof** R1 → R4 (R5 later) — stereo, rate modes, LAME header, conformance.
 
 The payoff of this order: ~70% of the encoder (Foundation + Floors 1–3) is

@@ -328,23 +328,28 @@ mod tests {
         best
     }
 
-    /// **C4 — the pipeline gate.** A mono tone round-trips PCM → our encoder → our
-    /// decoder → PCM and reconstructs well above the noise floor. (FFmpeg/LAME
-    /// decodability is checked out-of-band; see docs/mp3-encoder-plan.md.)
+    /// **C4 — the pipeline gate.** A multi-tone signal (which exercises Q6's
+    /// non-flat scalefactors) round-trips PCM → encoder → decoder → PCM well above
+    /// the noise floor, and the `.mp3` decodes in FFmpeg (checked out-of-band; see
+    /// docs/mp3-encoder-plan.md).
     #[test]
-    fn encode_decode_pipeline_tone() {
+    fn encode_decode_pipeline_multitone() {
         let sr = 44100u32;
         let n = 16 * 1152;
         let input: Vec<f32> = (0..n)
-            .map(|i| 0.4 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / sr as f32).sin())
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let pi2 = 2.0 * std::f32::consts::PI;
+                0.3 * (pi2 * 600.0 * t).sin()
+                    + 0.2 * (pi2 * 2300.0 * t).sin()
+                    + 0.12 * (pi2 * 9000.0 * t).sin()
+            })
             .collect();
 
         let mp3 = encode_mono(&input, sr);
         assert!(!mp3.is_empty(), "encoder produced no data");
-        // Real MP3 frame sync at the start.
         assert_eq!(mp3[0], 0xFF);
         assert_eq!(mp3[1] & 0xE0, 0xE0);
-        // Optionally dump the .mp3 for out-of-band FFmpeg/LAME decode checks.
         if let Ok(path) = std::env::var("MP3_ENC_OUT") {
             std::fs::write(path, &mp3).expect("write MP3_ENC_OUT");
         }
@@ -353,7 +358,7 @@ mod tests {
         assert!(out.len() > n / 2, "decoder produced too few samples");
 
         let snr = best_snr(&input, &out);
-        eprintln!("[C4] encode→decode tone SNR {snr:.1} dB");
+        eprintln!("[C4] encode→decode multitone SNR {snr:.1} dB");
         assert!(snr > 20.0, "round-trip SNR too low: {snr:.1} dB");
     }
 
