@@ -51,7 +51,7 @@ The surprising, measured result: **motion compensation and the loop filter are
 
 ### Optimization attempts — and what they revealed
 
-Three bit-exact attempts (each gated by the conformance suite), and what each
+Four bit-exact attempts (each gated by the conformance suite), and what each
 measured:
 
 | Attempt | Result | Kept? |
@@ -59,25 +59,37 @@ measured:
 | Tile-column threading (clone, then no-clone fork) | **~1.7–3× *slower*** — per-worker buffer + merge is ~2× the memory traffic | no |
 | Compound (averaged) inter SIMD | **~1.8%** (closed a 100%-scalar gap) | yes |
 | `madd_epi16` core convolution | **~0%** (best-of-N tied with `mullo`) | no |
+| `target-cpu=native` / `-v2` / `-v3` build flags | **~0%** (interleaved best-of-N tied with default; `native` if anything slightly *slower*) | no |
 
 The pattern is the lesson: **VP9 decode here is memory-bandwidth-bound, not
 compute-bound.** Inter prediction is dominated by *copying reference pixels*
 (integer-MV blocks) and the loop filter by *moving pixels* — so SIMD-ing the
-*arithmetic* (madd, compound) barely moves the needle, and adding threads just
-adds memory traffic. The ~5–6× gap to FFmpeg is mostly structural (memory
+*arithmetic* (madd, compound) barely moves the needle, telling the compiler to
+use newer instructions (`target-cpu`) does nothing, and adding threads just adds
+memory traffic. The ~5–6× gap to FFmpeg is mostly structural (memory
 layout/prefetch + decades of tuning), not a missing multiply trick.
 
-**Conclusion:** the decoder is near its practical single-thread ceiling for a
-safe pure-Rust implementation. Further compute-level SIMD is low-value; the only
-real levers left are algorithmic memory-traffic reduction (hard) — or accepting
-the gap, since *bit-exact + memory-safe* is the honest story. `target-cpu=native`
-still buys ~30% on the non-kernel glue, for free.
+> **Correction.** An earlier draft of this doc claimed `target-cpu=native` buys
+> "a free ~30%." That was wrong — an artifact of a single cold-build-vs-warm-build
+> comparison. Careful *interleaved* best-of-N puts native within noise of the
+> default (often slower). A compute-codegen flag can't speed up a memory-bound
+> workload; the phantom win was thermal drift. Lesson recorded in Caveats.
+
+**Conclusion:** the decoder is at its practical single-thread ceiling for a safe
+pure-Rust implementation. There is no free build-flag or compute-SIMD lever left;
+the only real levers are algorithmic memory-traffic reduction (hard) — or
+accepting the gap, since *bit-exact + memory-safe* is the honest story.
 
 ## Caveats
 
 - One machine, one synthetic clip, single-thread, wall-clock medians.
 - Compared against ffmpeg's **native** VP9 decoder (faster than libvpx) — the
   decoder users actually run.
+- **Cross-build comparisons need *interleaved* best-of-N.** Separate process
+  invocations drift ±5–10% with thermal/scheduling state; a single
+  before-vs-after run will manufacture phantom "wins" (we cited a phantom +30%
+  from `target-cpu=native` before measuring properly). Alternate the two builds
+  round-by-round and take the min — only a gap that survives that is real.
 - Re-captured per release and as the decoder is optimized.
 
 ## Not yet benchmarked
