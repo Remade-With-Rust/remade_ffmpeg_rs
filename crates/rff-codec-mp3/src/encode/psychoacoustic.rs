@@ -66,6 +66,74 @@ fn ath_db(f: f32) -> f32 {
     3.64 * k.powf(-0.8) - 6.5 * (-0.6 * (k - 3.3).powi(2)).exp() + 1e-3 * k.powi(4)
 }
 
+/// **SIMD-house masking brick:** the signal-INDEPENDENT band geometry, computed
+/// once per sample rate and cached. The Q3 masking loop used to recompute all of
+/// this — ~22×22 `spreading_db` (`sqrt`) + `powf`, plus per-band `bark`/`ath`
+/// transcendentals — for *every granule*. None of it depends on the signal.
+struct BandModel {
+    /// FFT-bin range `[lo, hi)` summed for each band's energy.
+    bin_lo: [usize; SFB_LONG],
+    bin_hi: [usize; SFB_LONG],
+    /// Spreading matrix `10^(spreading_db(barkᵢ−barkⱼ)/10)` — the per-granule
+    /// masking sum is now `Σⱼ energy[j]·spread[i][j]` (no transcendentals; a dot
+    /// product that auto-vectorizes).
+    spread: [[f32; SFB_LONG]; SFB_LONG],
+    /// `10^(ath_db/10)` per band (scaled by the per-granule `ath_scale` at runtime).
+    ath_base: [f32; SFB_LONG],
+}
+
+impl BandModel {
+    /// Build the band model for `sample_rate` — each value computed by the exact
+    /// same f32 formula the Q3 loop used inline, so the result is bit-identical.
+    fn new(sample_rate: u32) -> BandModel {
+        let sfb = tables::sfb_long_offsets(sample_rate);
+        let bin_per_line = N_FFT as f32 / 1152.0;
+        let mut bin_lo = [0usize; SFB_LONG];
+        let mut bin_hi = [0usize; SFB_LONG];
+        let mut center_bark = [0f32; SFB_LONG];
+        let mut ath_base = [0f32; SFB_LONG];
+        for b in 0..SFB_LONG {
+            bin_lo[b] = (sfb[b] as f32 * bin_per_line).round() as usize;
+            bin_hi[b] = ((sfb[b + 1] as f32 * bin_per_line).round() as usize).min(N_FFT / 2 + 1);
+            let center_line = (sfb[b] as f32 + sfb[b + 1] as f32) * 0.5;
+            center_bark[b] = bark(center_line * sample_rate as f32 / 1152.0);
+            ath_base[b] = 10f32.powf(ath_db(center_line * sample_rate as f32 / 1152.0) / 10.0);
+        }
+        let mut spread = [[0f32; SFB_LONG]; SFB_LONG];
+        for i in 0..SFB_LONG {
+            for j in 0..SFB_LONG {
+                spread[i][j] = 10f32.powf(spreading_db(center_bark[i] - center_bark[j]) / 10.0);
+            }
+        }
+        BandModel {
+            bin_lo,
+            bin_hi,
+            spread,
+            ath_base,
+        }
+    }
+}
+
+/// Cached band model for a sample rate (leaked once per rate — at most the ~8 valid
+/// rates ever, ~2 KB each). A thread-local keeps the common same-rate path lock-free.
+fn band_model(sample_rate: u32) -> &'static BandModel {
+    use std::cell::RefCell;
+    thread_local! {
+        static CACHE: RefCell<Option<(u32, &'static BandModel)>> = const { RefCell::new(None) };
+    }
+    CACHE.with(|cell| {
+        let mut c = cell.borrow_mut();
+        if let Some((sr, m)) = *c {
+            if sr == sample_rate {
+                return m;
+            }
+        }
+        let m: &'static BandModel = Box::leak(Box::new(BandModel::new(sample_rate)));
+        *c = Some((sample_rate, m));
+        m
+    })
+}
+
 /// Detect a transient/attack in a granule's PCM: a sub-block whose energy jumps
 /// well above the recent running average. Such granules want short blocks so the
 /// pre-echo a long window would smear before the attack is confined to one short
@@ -94,6 +162,7 @@ pub fn detect_attack(pcm: &[f32]) -> bool {
 pub fn analyze(pcm: &[f32], sample_rate: u32) -> PsyResult {
     let sfb = tables::sfb_long_offsets(sample_rate);
     let win = hann();
+    let model = band_model(sample_rate); // signal-independent geometry, cached
 
     // Q2 — windowed FFT power spectrum.
     let mut re = [0f32; N_FFT];
@@ -105,34 +174,29 @@ pub fn analyze(pcm: &[f32], sample_rate: u32) -> PsyResult {
     let mut power = [0f32; N_FFT / 2 + 1];
     fft::power_spectrum(&mut re, &mut im, &mut power);
 
-    // Per-band signal energy. FFT bin ≈ MDCT line × 1024/1152 (= 8/9).
-    let bin_per_line = N_FFT as f32 / 1152.0;
+    // Per-band signal energy, over the cached bin ranges.
     let mut energy = [0f32; SFB_LONG];
-    let mut center_bark = [0f32; SFB_LONG];
     for b in 0..SFB_LONG {
-        let lo = (sfb[b] as f32 * bin_per_line).round() as usize;
-        let hi = ((sfb[b + 1] as f32 * bin_per_line).round() as usize).min(N_FFT / 2 + 1);
         let mut e = 1e-12f32;
-        for &p in power.iter().take(hi).skip(lo) {
+        for &p in power.iter().take(model.bin_hi[b]).skip(model.bin_lo[b]) {
             e += p;
         }
         energy[b] = e;
-        let center_line = (sfb[b] as f32 + sfb[b + 1] as f32) * 0.5;
-        center_bark[b] = bark(center_line * sample_rate as f32 / 1152.0);
     }
 
-    // Q3 — spread energy across Bark, lower by the SMR offset, floor at the ATH.
+    // Q3 — spread energy across Bark (cached matrix → a dot product, no powf),
+    // lower by the SMR offset, floor at the ATH.
     let smr = 10f32.powf(-SMR_OFFSET_DB / 10.0);
     let total_energy: f32 = energy.iter().sum();
     let ath_scale = (total_energy / N_FFT as f32).max(1e-9) * 1e-3;
     let mut thresholds = [0f32; SFB_LONG];
     for i in 0..SFB_LONG {
+        let row = &model.spread[i];
         let mut masker = 0f32;
         for j in 0..SFB_LONG {
-            masker += energy[j] * 10f32.powf(spreading_db(center_bark[i] - center_bark[j]) / 10.0);
+            masker += energy[j] * row[j];
         }
-        let center_line = (sfb[i] as f32 + sfb[i + 1] as f32) * 0.5;
-        let ath = 10f32.powf(ath_db(center_line * sample_rate as f32 / 1152.0) / 10.0) * ath_scale;
+        let ath = model.ath_base[i] * ath_scale;
         // Cap at the band's own energy: a band quantized to zero already produces
         // noise = its energy, so a higher threshold means the same thing (drop it)
         // while bounding the wild ATH values in the inaudible top bands.
@@ -181,6 +245,35 @@ mod tests {
         assert!(spreading_db(-2.0) < -3.0);
         // Asymmetric: a masker spreads further toward higher frequencies (dz>0).
         assert!(spreading_db(1.5) > spreading_db(-1.5));
+    }
+
+    /// **Masking-brick gate.** The cached band model must hold the EXACT values the
+    /// Q3 loop used to compute inline (same f32 formulas) — so precomputing them
+    /// leaves the thresholds, and thus the output, bit-identical.
+    #[test]
+    fn band_model_matches_inline() {
+        for &sr in &[44100u32, 48000, 32000, 24000] {
+            let sfb = tables::sfb_long_offsets(sr);
+            let m = BandModel::new(sr);
+            let bin_per_line = N_FFT as f32 / 1152.0;
+            let mut cb = [0f32; SFB_LONG];
+            for b in 0..SFB_LONG {
+                let lo = (sfb[b] as f32 * bin_per_line).round() as usize;
+                let hi = ((sfb[b + 1] as f32 * bin_per_line).round() as usize).min(N_FFT / 2 + 1);
+                assert_eq!(m.bin_lo[b], lo, "bin_lo b{b} sr{sr}");
+                assert_eq!(m.bin_hi[b], hi, "bin_hi b{b} sr{sr}");
+                let center_line = (sfb[b] as f32 + sfb[b + 1] as f32) * 0.5;
+                cb[b] = bark(center_line * sr as f32 / 1152.0);
+                let ath = 10f32.powf(ath_db(center_line * sr as f32 / 1152.0) / 10.0);
+                assert_eq!(m.ath_base[b], ath, "ath_base b{b} sr{sr}");
+            }
+            for i in 0..SFB_LONG {
+                for j in 0..SFB_LONG {
+                    let s = 10f32.powf(spreading_db(cb[i] - cb[j]) / 10.0);
+                    assert_eq!(m.spread[i][j], s, "spread[{i}][{j}] sr{sr}");
+                }
+            }
+        }
     }
 
     #[test]
