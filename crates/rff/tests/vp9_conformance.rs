@@ -61,12 +61,21 @@ fn drain(decoder: &mut dyn Decoder, hashes: &mut Vec<String>) {
 /// Decode a `.webm` vector to its sequence of per-frame MD5s.
 fn decode_vector(engine: &Engine, webm: &Path) -> Vec<String> {
     let file = fs::File::open(webm).unwrap();
-    let mut demuxer = engine.formats.open_demuxer("matroska", Box::new(file)).unwrap();
+    let mut demuxer = engine
+        .formats
+        .open_demuxer("matroska", Box::new(file))
+        .unwrap();
     let streams = demuxer.read_header().unwrap();
-    let vidx = streams.iter().position(|s| s.media_type == MediaType::Video).unwrap();
+    let vidx = streams
+        .iter()
+        .position(|s| s.media_type == MediaType::Video)
+        .unwrap();
 
     let mut decoder = engine.codecs.find_decoder(CodecId::Vp9).unwrap();
-    let _ = decoder.configure(&CodecParams { codec_id: CodecId::Vp9, ..Default::default() });
+    let _ = decoder.configure(&CodecParams {
+        codec_id: CodecId::Vp9,
+        ..Default::default()
+    });
 
     let mut hashes = Vec::new();
     loop {
@@ -123,7 +132,11 @@ fn vp9_conformance() {
             passed += 1;
             println!("PASS  {name}  ({} frames)", got.len());
         } else {
-            let matched = got.iter().zip(&expected).take_while(|(a, b)| a == b).count();
+            let matched = got
+                .iter()
+                .zip(&expected)
+                .take_while(|(a, b)| a == b)
+                .count();
             println!(
                 "FAIL  {name}  got {} / expected {} frames, first {matched} match",
                 got.len(),
@@ -134,5 +147,17 @@ fn vp9_conformance() {
     }
 
     println!("\nVP9 conformance: {passed}/{total} vectors bit-exact");
-    assert!(failures.is_empty(), "{} vectors failed: {failures:?}", failures.len());
+    // Guard against a false green: an empty/half-fetched VP9_VECTORS_DIR must
+    // FAIL the gate, not pass vacuously (in CI a broken download would otherwise
+    // look like a clean run).
+    assert!(
+        total > 0,
+        "no .webm+.md5 vector pairs found in {dir} — VP9_VECTORS_DIR is empty \
+         (did scripts/fetch-vp9-vectors.sh fail?)"
+    );
+    assert!(
+        failures.is_empty(),
+        "{} vectors failed: {failures:?}",
+        failures.len()
+    );
 }
