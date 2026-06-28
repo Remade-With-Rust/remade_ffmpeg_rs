@@ -262,6 +262,11 @@ The house, bottom-up. Each floor is independently green before the next.
    (PCM→analyze→MDCT→IMDCT→synthesis→PCM) reconstructs at **82 dB** (delay 1057).
 3. **Floor 2** B1 → B2 → B3 → B4, then B5 → B6 → B7 → B8 — coding + framing, each
    round-tripped through the matching decoder parser.
+   ✅ **B1–B7 done.** Huffman cost/encode + region/table selection (B1–B4)
+   round-trip the spectrum exactly through `decode::huffman`; side-info +
+   scalefactor serializers (B5/B6) round-trip the structs; frame assembly (B7)
+   produces frames the real `Mp3Decoder` decodes. **B8** (reservoir *borrowing*)
+   remains — B7 runs reservoir-free (`main_data_begin=0`), which is valid CBR.
 4. **Floor 3** C1 → C2 → C3 → C4 — the dumb-but-valid controller. **First playable
    MP3; first FFmpeg-accepted output.** De-risks the whole pipeline before any
    psychoacoustics.

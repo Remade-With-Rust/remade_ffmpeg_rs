@@ -157,6 +157,45 @@ impl FrameCounts {
             mv: Default::default(),
         }
     }
+
+    /// Sum another set of counts into these — merges the per-tile counts from
+    /// parallel tile-column decode back into the frame total.
+    fn merge(&mut self, o: &FrameCounts) {
+        self.coef.merge(o.coef.as_ref());
+        self.eob_branch.merge(o.eob_branch.as_ref());
+        self.intra_inter.merge(&o.intra_inter);
+        self.comp_inter.merge(&o.comp_inter);
+        self.comp_ref.merge(&o.comp_ref);
+        self.single_ref.merge(&o.single_ref);
+        self.inter_mode.merge(&o.inter_mode);
+        self.y_mode.merge(&o.y_mode);
+        self.uv_mode.merge(&o.uv_mode);
+        self.partition.merge(&o.partition);
+        self.switchable_interp.merge(&o.switchable_interp);
+        self.skip.merge(&o.skip);
+        self.tx_p8x8.merge(&o.tx_p8x8);
+        self.tx_p16x16.merge(&o.tx_p16x16);
+        self.tx_p32x32.merge(&o.tx_p32x32);
+        self.mv.merge(&o.mv);
+    }
+}
+
+/// Element-wise `+=` over the nested count arrays — tile workers count
+/// independently and merge afterward, no `unsafe`, no flattening.
+pub(crate) trait CountAdd {
+    fn merge(&mut self, other: &Self);
+}
+impl CountAdd for u32 {
+    fn merge(&mut self, other: &u32) {
+        *self += *other;
+    }
+}
+impl<T: CountAdd, const N: usize> CountAdd for [T; N] {
+    fn merge(&mut self, other: &Self) {
+        for (a, b) in self.iter_mut().zip(other.iter()) {
+            a.merge(b);
+        }
+    }
 }
 
 // ---- Primitives 1.4/1.5/1.6: backward probability adaptation -------------

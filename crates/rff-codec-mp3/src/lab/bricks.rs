@@ -359,9 +359,9 @@ pub static BRICKS: &[Brick] = &[
         "B7",
         Phase::Coding,
         Class::Glue,
-        Verify::External,
-        Status::Todo,
-        "Frame assembly + CRC-16",
+        Verify::RoundTrip,
+        Status::Verified,
+        "Frame assembly (reservoir-free; decodes via Mp3Decoder)",
     ),
     b(
         "B8",
@@ -607,8 +607,8 @@ mod tests {
 
     #[test]
     fn next_unbuilt_is_first_incomplete() {
-        // Through the side-info/scalefactor serializers; next is frame assembly B7.
-        assert_eq!(next_unbuilt().map(|b| b.id), Some("B7"));
+        // Through frame assembly (B7); next is the reservoir borrowing (B8).
+        assert_eq!(next_unbuilt().map(|b| b.id), Some("B8"));
     }
 
     #[test]

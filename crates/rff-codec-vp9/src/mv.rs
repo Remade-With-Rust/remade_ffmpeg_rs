@@ -46,6 +46,26 @@ pub(crate) struct NmvCounts {
     pub comps: [NmvCompCounts; 2],
 }
 
+use crate::decode::CountAdd;
+impl CountAdd for NmvCounts {
+    fn merge(&mut self, o: &Self) {
+        self.joints.merge(&o.joints);
+        self.comps.merge(&o.comps);
+    }
+}
+impl CountAdd for NmvCompCounts {
+    fn merge(&mut self, o: &Self) {
+        self.sign.merge(&o.sign);
+        self.classes.merge(&o.classes);
+        self.class0.merge(&o.class0);
+        self.bits.merge(&o.bits);
+        self.class0_fp.merge(&o.class0_fp);
+        self.fp.merge(&o.fp);
+        self.class0_hp.merge(&o.class0_hp);
+        self.hp.merge(&o.hp);
+    }
+}
+
 /// Decode one MV component difference (`read_mv_component`), counting symbols.
 fn read_mv_component(
     b: &mut BoolDecoder,

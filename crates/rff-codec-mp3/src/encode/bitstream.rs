@@ -129,7 +129,7 @@ pub fn serialize_scalefactors(
     }
 }
 
-// ── B7/B8: frame assembly + reservoir (still to build) ────────────────────────
+// ── B7: frame assembly (B8 reservoir borrowing deferred) ──────────────────────
 
 /// Encoder-side reservoir: how many spare main-data bytes are banked.
 #[derive(Debug, Clone, Default)]
@@ -138,18 +138,40 @@ pub struct EncReservoir {
     pub spare_bytes: usize,
 }
 
-/// Assemble one complete MP3 frame: header + CRC + side info + main data, with
-/// `main_data_begin` set from the reservoir state (which this updates).
+/// **B7** — assemble one complete MP3 frame: header (+ optional CRC) + side info +
+/// main data, padded to the frame size.
+///
+/// This runs **reservoir-free** (`main_data_begin = 0`): each frame's main data
+/// must fit within its own region, and the unused tail is zero stuffing. That is a
+/// fully valid, decodable CBR frame — the bit-reservoir *borrowing* (**B8**, using
+/// `spare_bytes` to set `main_data_begin > 0`) is the quality optimisation layered
+/// on next. The reservoir's banked slack is tracked here so B8 can consume it.
 pub fn format(
-    _header: &FrameHeader,
-    _side_info: &SideInfo,
-    _main_data: &[u8],
-    _reservoir: &mut EncReservoir,
+    header: &FrameHeader,
+    side_info: &SideInfo,
+    main_data: &[u8],
+    reservoir: &mut EncReservoir,
 ) -> Vec<u8> {
-    // brick: emit FrameHeader::to_bytes; serialize SideInfo (set main_data_begin
-    // from spare_bytes); pad main_data to the frame size; update spare_bytes with
-    // the leftover. Optional CRC-16 over header+side-info.
-    todo!("mp3 encode: frame assembly")
+    let mut si = side_info.clone();
+    si.main_data_begin = 0; // B8: reservoir borrowing not yet wired.
+
+    let mut out = header.to_bytes().to_vec();
+    if header.crc_protected {
+        // brick (B7+): real CRC-16 over header bits 16..32 + the side-info block.
+        // The decoder skips these two bytes without validating, so a placeholder
+        // keeps the framing correct until the CRC is computed.
+        out.extend_from_slice(&[0, 0]);
+    }
+    out.extend_from_slice(&serialize_side_info(header, &si));
+
+    let region_cap = header.frame_size().saturating_sub(out.len());
+    let used = main_data.len().min(region_cap);
+    out.extend_from_slice(&main_data[..used]);
+    out.resize(header.frame_size(), 0); // zero stuffing fills the rest
+
+    // Bank the slack this frame leaves for B8 to borrow later.
+    reservoir.spare_bytes = region_cap - used;
+    out
 }
 
 #[cfg(test)]
@@ -288,6 +310,52 @@ mod tests {
             }
         }
         sf_round_trip(&si, 0, 0, &sf, None);
+    }
+
+    #[test]
+    fn frame_assembly_is_decodable() {
+        use crate::frame::GranuleSideInfo;
+        use rff_codec::Decoder;
+        use rff_core::{Frame, Packet};
+
+        let header = hdr(ChannelMode::Mono);
+        // A trivial-but-valid granule: no scalefactors, no big_values, no count1 —
+        // decodes to silence. Both granules (MPEG-1) identical.
+        let mut si = SideInfo::default();
+        for gr in 0..2 {
+            si.granules[gr][0] = GranuleSideInfo {
+                part2_3_length: 0,
+                ..Default::default()
+            };
+        }
+        let main_data = [0u8; 10]; // a few bytes; the rest is stuffing
+
+        let mut res = EncReservoir::default();
+        let frame = format(&header, &si, &main_data, &mut res);
+
+        // Structural checks.
+        assert_eq!(frame.len(), header.frame_size());
+        assert_eq!(&frame[0..4], &header.to_bytes());
+        let si_bytes = &frame[4..4 + header.side_info_len()];
+        assert_eq!(
+            crate::decode::sideinfo::parse(&header, si_bytes).unwrap(),
+            si
+        );
+
+        // The real decoder must accept two concatenated frames and yield two
+        // audio frames of one frame's samples each.
+        let mut stream = frame.clone();
+        stream.extend_from_slice(&format(&header, &si, &main_data, &mut res));
+
+        let mut dec = crate::Mp3Decoder::default();
+        dec.send_packet(&Packet::from_data(0, stream)).unwrap();
+        dec.flush();
+        let mut frames = 0;
+        while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+            assert_eq!(af.samples, header.version.samples_per_frame());
+            frames += 1;
+        }
+        assert_eq!(frames, 2, "both assembled frames must decode");
     }
 
     #[test]
