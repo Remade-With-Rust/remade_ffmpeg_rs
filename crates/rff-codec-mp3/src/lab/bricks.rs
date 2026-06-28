@@ -490,9 +490,9 @@ pub static BRICKS: &[Brick] = &[
         "R5",
         Phase::Roof,
         Class::Tbl,
-        Verify::RoundTrip,
-        Status::Todo,
-        "MPEG-2/2.5 LSF tables + framing (deferred)",
+        Verify::External,
+        Status::Verified,
+        "MPEG-2/2.5 LSF: V2 sfb tables + framing (6 rates, FFmpeg-validated)",
     ),
 ];
 
@@ -607,8 +607,8 @@ mod tests {
 
     #[test]
     fn next_unbuilt_is_first_incomplete() {
-        // Only MPEG-2/2.5 (R5) remains unbuilt.
-        assert_eq!(next_unbuilt().map(|b| b.id), Some("R5"));
+        // Every brick is built — the house is complete.
+        assert_eq!(next_unbuilt().map(|b| b.id), None);
     }
 
     #[test]

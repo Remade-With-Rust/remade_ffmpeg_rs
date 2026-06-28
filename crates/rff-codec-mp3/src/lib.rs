@@ -175,20 +175,22 @@ struct Mp3Encoder {
     eof: bool,
 }
 
-/// Snap a requested bitrate (kbps) to the nearest valid MPEG-1 Layer III value.
-fn snap_bitrate(kbps: u32) -> u32 {
-    let valid = &tables_v1_bitrates();
+/// Snap a requested bitrate (kbps) to the nearest valid Layer III value for the
+/// MPEG version (the V1 and V2/2.5 bitrate tables differ).
+fn snap_bitrate(version: header::MpegVersion, kbps: u32) -> u32 {
+    let v1 = [
+        32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ];
+    let v2 = [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+    let valid: &[u32] = if version == header::MpegVersion::V1 {
+        &v1
+    } else {
+        &v2
+    };
     *valid
         .iter()
         .min_by_key(|&&b| b.abs_diff(kbps))
         .unwrap_or(&128)
-}
-
-/// The coded MPEG-1 Layer III bitrates (kbps), excluding free/reserved.
-fn tables_v1_bitrates() -> [u32; 14] {
-    [
-        32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
-    ]
 }
 
 /// Parse an FFmpeg-style bitrate string ("128k", "192000") into kbps.
@@ -210,9 +212,11 @@ fn parse_bitrate(s: &str) -> Option<u32> {
 fn encoder_header(sample_rate: u32, channels: u16, cbr_kbps: u32) -> Result<FrameHeader> {
     let version = match sample_rate {
         32000 | 44100 | 48000 => header::MpegVersion::V1,
+        16000 | 22050 | 24000 => header::MpegVersion::V2,
+        8000 | 11025 | 12000 => header::MpegVersion::V2_5,
         _ => {
             return Err(Error::unsupported(
-                "mp3 encode: sample rate must be 32/44.1/48 kHz (MPEG-1)",
+                "mp3 encode: unsupported sample rate (need 8–48 kHz MPEG-1/2/2.5)",
             ))
         }
     };
@@ -221,7 +225,20 @@ fn encoder_header(sample_rate: u32, channels: u16, cbr_kbps: u32) -> Result<Fram
     } else {
         frame::ChannelMode::Mono
     };
-    let bitrate_kbps = snap_bitrate(if cbr_kbps == 0 { 128 } else { cbr_kbps });
+    // V2/2.5 default to a lower nominal bitrate to fit the smaller frame.
+    let default_kbps = if version == header::MpegVersion::V1 {
+        128
+    } else {
+        64
+    };
+    let bitrate_kbps = snap_bitrate(
+        version,
+        if cbr_kbps == 0 {
+            default_kbps
+        } else {
+            cbr_kbps
+        },
+    );
     Ok(FrameHeader {
         version,
         crc_protected: false,
@@ -469,6 +486,43 @@ mod tests {
             snr_l > 20.0 && snr_r > 20.0,
             "stereo channels too noisy: L {snr_l} R {snr_r}"
         );
+    }
+
+    /// **R5 — MPEG-2 / 2.5 (LSF).** Each low sample rate encodes as MPEG-2 (≥16 kHz)
+    /// or MPEG-2.5 (<16 kHz) — 1 granule/frame, V2 bitrate + side-info — and
+    /// round-trips through our decoder. FFmpeg validates the band tables out of band
+    /// (`MP3_ENC_DIR`); all six rates decode to >69 dB there.
+    #[test]
+    fn encode_decode_mpeg2() {
+        let dump_dir = std::env::var("MP3_ENC_DIR").ok();
+        for &sr in &[22050u32, 24000, 16000, 12000, 11025, 8000] {
+            let n = 24 * 576; // MPEG-2: 576 samples/frame
+            let input: Vec<f32> = (0..n)
+                .map(|i| 0.4 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / sr as f32).sin())
+                .collect();
+
+            let mp3 = encode_mono(&input, sr);
+            assert!(!mp3.is_empty());
+            if let Some(dir) = &dump_dir {
+                std::fs::write(format!("{dir}/v2_{sr}.mp3"), &mp3).expect("dump");
+            }
+            let h = header::FrameHeader::parse([mp3[0], mp3[1], mp3[2], mp3[3]]).unwrap();
+            assert_ne!(
+                h.version,
+                header::MpegVersion::V1,
+                "{sr}: must be MPEG-2/2.5"
+            );
+            assert_eq!(h.sample_rate, sr);
+
+            let out = decode_mono(mp3);
+            assert!(out.len() > n / 2);
+            let snr = best_snr(&input, &out);
+            eprintln!("[R5] MPEG-2 {sr} Hz round-trip SNR {snr:.1} dB");
+            assert!(
+                snr > 30.0,
+                "{sr}: MPEG-2 round-trip SNR too low: {snr:.1} dB"
+            );
+        }
     }
 
     /// **Q5 — block switching.** A castanet-like transient (silence then a sharp

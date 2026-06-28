@@ -81,27 +81,72 @@ pub const SFB_OFFSET_SHORT_V1: [[u16; 14]; 3] = [
     [0, 4, 8, 12, 16, 22, 30, 42, 58, 78, 104, 138, 180, 192],
 ];
 
-// brick: SFB_OFFSET_{LONG,SHORT}_V2 for MPEG-2 (22050/24000/16000) and MPEG-2.5
-// (11025/12000/8000) from ISO 13818-3 Table B.8.
+/// Long-block scalefactor-band boundaries for MPEG-2 LSF (ISO/IEC 13818-3),
+/// indexed `0 = 22050, 1 = 24000, 2 = 16000`. Validated against FFmpeg's decode.
+pub const SFB_OFFSET_LONG_V2: [[u16; 23]; 3] = [
+    // 22050 Hz
+    [
+        0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 116, 140, 168, 200, 238, 284, 336, 396, 464,
+        522, 576,
+    ],
+    // 24000 Hz
+    [
+        0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 114, 136, 162, 194, 232, 278, 332, 394, 464,
+        540, 576,
+    ],
+    // 16000 Hz
+    [
+        0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 116, 140, 168, 200, 238, 284, 336, 396, 464,
+        522, 576,
+    ],
+];
 
-/// Long-block scalefactor-band offsets for a sample rate (MPEG-1 rates for now).
+/// Short-block scalefactor-band boundaries for MPEG-2 LSF, per window (×3).
+pub const SFB_OFFSET_SHORT_V2: [[u16; 14]; 3] = [
+    // 22050 Hz
+    [0, 4, 8, 12, 18, 24, 32, 42, 56, 74, 100, 132, 174, 192],
+    // 24000 Hz
+    [0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 136, 180, 192],
+    // 16000 Hz
+    [0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174, 192],
+];
+
+/// MPEG-2.5 8000 Hz has its own bands (a very cramped top end), unlike 11025 and
+/// 12000 which reuse the MPEG-2 22050/24000 grids. Long table validated vs FFmpeg.
+pub const SFB_OFFSET_LONG_V25_8000: [u16; 23] = [
+    0, 12, 24, 36, 48, 60, 72, 88, 108, 132, 160, 192, 232, 280, 336, 400, 476, 566, 568, 570, 572,
+    574, 576,
+];
+
+/// MPEG-2.5 8000 Hz short bands (not exercised by the long-only V2/2.5 encoder).
+pub const SFB_OFFSET_SHORT_V25_8000: [u16; 14] =
+    [0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166, 192];
+
+/// Long-block scalefactor-band offsets for a sample rate (MPEG-1 + MPEG-2 LSF).
 pub fn sfb_long_offsets(sample_rate: u32) -> &'static [u16; 23] {
-    let idx = match sample_rate {
-        48000 => 1,
-        32000 => 2,
-        _ => 0, // 44100 (and, until V2 tables land, the fallback)
-    };
-    &SFB_OFFSET_LONG_V1[idx]
+    match sample_rate {
+        48000 => &SFB_OFFSET_LONG_V1[1],
+        32000 => &SFB_OFFSET_LONG_V1[2],
+        // MPEG-2, plus MPEG-2.5 11025/12000 which reuse the 22050/24000 grids.
+        22050 | 11025 => &SFB_OFFSET_LONG_V2[0],
+        24000 | 12000 => &SFB_OFFSET_LONG_V2[1],
+        16000 => &SFB_OFFSET_LONG_V2[2],
+        8000 => &SFB_OFFSET_LONG_V25_8000, // MPEG-2.5 8000 has its own bands
+        _ => &SFB_OFFSET_LONG_V1[0],       // 44100 and fallback
+    }
 }
 
-/// Short-block scalefactor-band offsets for a sample rate (MPEG-1 rates).
+/// Short-block scalefactor-band offsets for a sample rate (MPEG-1 + MPEG-2 LSF).
 pub fn sfb_short_offsets(sample_rate: u32) -> &'static [u16; 14] {
-    let idx = match sample_rate {
-        48000 => 1,
-        32000 => 2,
-        _ => 0,
-    };
-    &SFB_OFFSET_SHORT_V1[idx]
+    match sample_rate {
+        48000 => &SFB_OFFSET_SHORT_V1[1],
+        32000 => &SFB_OFFSET_SHORT_V1[2],
+        22050 | 11025 => &SFB_OFFSET_SHORT_V2[0],
+        24000 | 12000 => &SFB_OFFSET_SHORT_V2[1],
+        16000 => &SFB_OFFSET_SHORT_V2[2],
+        8000 => &SFB_OFFSET_SHORT_V25_8000,
+        _ => &SFB_OFFSET_SHORT_V1[0],
+    }
 }
 
 /// Preflag additive table for long blocks (added to high-band scalefactors when

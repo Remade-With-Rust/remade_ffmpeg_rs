@@ -116,7 +116,12 @@ impl Mp3Encode {
             for ch in 0..nch {
                 let gpcm = &coded[ch][gr * GRANULE_LINES..];
                 let sub = filterbank::analyze(gpcm, &mut self.analysis_fifo[ch]);
-                let psy = psychoacoustic::analyze(gpcm, fheader.sample_rate);
+                let mut psy = psychoacoustic::analyze(gpcm, fheader.sample_rate);
+                // MPEG-2/2.5 uses flat scalefactors (the LSF scalefactor scheme is
+                // not yet coded), so disable the distortion loop's shaping there.
+                if !matches!(fheader.version, crate::header::MpegVersion::V1) {
+                    psy.thresholds = [f32::MAX; crate::frame::SFB_LONG];
+                }
                 let mut freq = mdct::forward(&sub, bt, &mut self.mdct_overlap[ch]);
                 // Forward alias butterflies — the inverse of the decoder's reduce()
                 // (applied for long/start/stop; pure short blocks skip it).
