@@ -102,9 +102,16 @@ PCM.
   newer **HE-AAC** extensions (SBR/PS) are *not* implemented here. Decode-only of
   the oldest profile is the lower-exposure corner of AAC.
 
-This project ships these implementations with **no patent grant** and, like
-FFmpeg, leaves distribution/use responsibility to the distributor/user. Options:
-(a) document and ship (the FFmpeg model), (b) gate H.264/AAC behind a Cargo
-feature so the default artifact excludes them, or (c) obtain a pool license.
-**Commercial users should consult IP counsel** — this section is engineering
-context, not legal advice.
+**Project posture: ship and document (the FFmpeg model).** H.264 and AAC ship
+in the default build. The project grants **no patent license, express or
+implied**, and does not pay or collect any codec royalty. Any patent obligation
+(e.g. to the Via LA AVC pool) falls on the party that **distributes or
+commercially deploys** a product incorporating these codecs — *not* on the
+project, and *not* on individuals who simply run the tool, who are not the
+target of pool licensing.
+
+If a patent-clean default artifact matters for your use, you can **gate H.264
+and/or AAC out** behind a Cargo feature (they live in their own
+`rff-codec-h264` / `rff-codec-aac` crates), or obtain a pool license.
+**Commercial deployments should consult IP counsel** — this section is
+engineering context, not legal advice.

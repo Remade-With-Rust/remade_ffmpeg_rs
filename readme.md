@@ -255,6 +255,30 @@ copyleft anywhere** in its dependency tree, CI-enforced via `cargo-deny` (see
 never part of the published binaries) pulls MPL-2.0 crates transitively through
 its webview stack, so it's scoped out of the gate and tracked separately.
 
+## Patents
+
+Licensing and patents are **separate** things. The clean-room work clears
+*copyright* — there's no GPL/FFmpeg code here, hence the permissive license
+above — but an independent implementation does **not** clear *patents*: a patent
+covers a *technique in the standard*, which any implementation practices
+regardless of language or authorship.
+
+Most of the stack is **royalty-free or patent-expired** — AV1/AVIF, VP9, Opus,
+FLAC, Vorbis, PNG, JPEG, GIF, WebP, JPEG XL, MP3 (expired 2017), PCM — and
+carries no patent obligation for anyone.
+
+Two codecs are **patent-relevant**: **H.264/AVC** (via `rusty_h264`) and
+**AAC** (our in-house AAC-LC *decoder* only — the largely-expired, lowest-risk
+corner; no HE-AAC). We take the same posture as FFmpeg: these ship in the
+default build, **no patent license is granted or implied**, and any patent
+royalties (e.g. to the Via LA pools) are the responsibility of the party that
+distributes or commercially deploys a product incorporating them — not of the
+project or of people simply running the tool. If that matters for your use,
+gate H.264/AAC out behind a feature or obtain a pool license, and **consult IP
+counsel** for commercial deployments. Full breakdown:
+[docs/compatibility.md#patents](docs/compatibility.md#patents). *(This is
+engineering context, not legal advice.)*
+
 ## Trademark
 
 This is an independent, clean-room reimplementation. It is **not affiliated
