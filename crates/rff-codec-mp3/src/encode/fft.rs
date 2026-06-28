@@ -29,26 +29,40 @@ pub fn fft(re: &mut [f32], im: &mut [f32]) {
     }
 
     // Butterfly stages.
+    //
+    // **SIMD Floor 1 / 1A:** the per-stage twiddle factors are precomputed once (via
+    // the same recurrence that used to run inline) into `tw_r`/`tw_i`, instead of
+    // being advanced by a serial recurrence *inside* the butterfly loop. That data
+    // dependency (`cr,ci` carried k→k+1) blocked vectorization; hoisting it makes the
+    // inner `k` loop independent and contiguous. Byte-identical (same recurrence
+    // values, just computed once and reused across base-blocks) — pinned by
+    // `hoisted_matches_inline`.
+    let mut tw_r = vec![0f32; n / 2];
+    let mut tw_i = vec![0f32; n / 2];
     let mut len = 2usize;
     while len <= n {
         let ang = -2.0 * PI / len as f32;
         let (wr, wi) = (ang.cos(), ang.sin());
         let half = len / 2;
+        // Stage twiddles, computed once (the old per-base-block recurrence).
+        tw_r[0] = 1.0;
+        tw_i[0] = 0.0;
+        for k in 1..half {
+            tw_r[k] = tw_r[k - 1] * wr - tw_i[k - 1] * wi;
+            tw_i[k] = tw_r[k - 1] * wi + tw_i[k - 1] * wr;
+        }
         let mut base = 0;
         while base < n {
-            let (mut cr, mut ci) = (1.0f32, 0.0f32);
             for k in 0..half {
                 let a = base + k;
                 let b = a + half;
+                let (cr, ci) = (tw_r[k], tw_i[k]);
                 let tr = cr * re[b] - ci * im[b];
                 let ti = cr * im[b] + ci * re[b];
                 re[b] = re[a] - tr;
                 im[b] = im[a] - ti;
                 re[a] += tr;
                 im[a] += ti;
-                let ncr = cr * wr - ci * wi;
-                ci = cr * wi + ci * wr;
-                cr = ncr;
             }
             base += len;
         }
@@ -82,6 +96,71 @@ mod tests {
             }
         }
         (or, oi)
+    }
+
+    /// The pre-1A FFT: twiddle advanced by a serial recurrence inside the loop.
+    /// Kept as the bit-identity oracle for the hoisted version.
+    fn fft_inline_ref(re: &mut [f32], im: &mut [f32]) {
+        let n = re.len();
+        let mut j = 0usize;
+        for i in 1..n {
+            let mut bit = n >> 1;
+            while j & bit != 0 {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j |= bit;
+            if i < j {
+                re.swap(i, j);
+                im.swap(i, j);
+            }
+        }
+        let mut len = 2usize;
+        while len <= n {
+            let ang = -2.0 * PI / len as f32;
+            let (wr, wi) = (ang.cos(), ang.sin());
+            let half = len / 2;
+            let mut base = 0;
+            while base < n {
+                let (mut cr, mut ci) = (1.0f32, 0.0f32);
+                for k in 0..half {
+                    let a = base + k;
+                    let b = a + half;
+                    let tr = cr * re[b] - ci * im[b];
+                    let ti = cr * im[b] + ci * re[b];
+                    re[b] = re[a] - tr;
+                    im[b] = im[a] - ti;
+                    re[a] += tr;
+                    im[a] += ti;
+                    let ncr = cr * wr - ci * wi;
+                    ci = cr * wi + ci * wr;
+                    cr = ncr;
+                }
+                base += len;
+            }
+            len <<= 1;
+        }
+    }
+
+    /// **1A gate.** Hoisting the twiddle recurrence must be BIT-identical to the old
+    /// inline recurrence — the same float values, just computed once and reused.
+    #[test]
+    fn hoisted_matches_inline() {
+        let mut s = 0xC0FF_EE11u32;
+        let mut rng = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        for &n in &[2usize, 4, 8, 16, 64, 256, 1024] {
+            let re0: Vec<f32> = (0..n).map(|_| rng()).collect();
+            let im0: Vec<f32> = (0..n).map(|_| rng()).collect();
+            let (mut ra, mut ia) = (re0.clone(), im0.clone());
+            let (mut rb, mut ib) = (re0.clone(), im0.clone());
+            fft(&mut ra, &mut ia);
+            fft_inline_ref(&mut rb, &mut ib);
+            assert_eq!(ra, rb, "re mismatch at n={n}");
+            assert_eq!(ia, ib, "im mismatch at n={n}");
+        }
     }
 
     #[test]
