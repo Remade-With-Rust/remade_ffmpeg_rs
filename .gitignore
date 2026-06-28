@@ -8,3 +8,6 @@ crates/rff-ui/dist/
 
 # Local-only Claude skills (not deployed to open source)
 .claude/skills/
+
+# External PEAQ oracle (fetched by tools/quality/setup_peaq.py, not vendored)
+/PEAQ_python/

@@ -71,8 +71,32 @@ signals say otherwise: on transient `chimes`, **LAME's worst-case is far tighter
 noise better, the real perceptual risk.
 
 **What this harness IS good for:** a *self-consistent* gauge of OUR encoder across
-changes (does a tuning lower our NMR / worst-case?), and catching gross failures.
-**What it CANNOT do:** rank us against LAME — that needs an *external* PEAQ
-(unavailable here; `peaqb`/GstPEAQ not installed). Use the **max-NMR / % audible**
-columns (less biased) over the mean, and treat worst-case noise control as the
-target — that's where LAME leads.
+changes (does a tuning lower our NMR?), and catching gross failures. **What it
+CANNOT do alone:** rank us against LAME — see the calibration below.
+
+## Calibration vs external PEAQ (2026-06-28)
+
+Installed an external **PEAQ** ([lsg1213/PEAQ_python](https://github.com/lsg1213/PEAQ_python),
+patched for numpy-2/py-3.13 + a silent-frame edge case + delay-alignment;
+**validated to the MATLAB reference, ODG −3.875 exact**). Swept 2 real clips ×
+{64,96,128,192,320}k × {ours, LAME} = 20 pairs, scoring each by PEAQ ODG (the
+unbiased oracle) **and** our NMR. Driver: `peaq_run.py` (+ `analyze_calib.py`) —
+external/licensed, kept out-of-tree; reproduce by cloning PEAQ_python.
+
+**Findings:**
+- **Our NMR IS a valid *self*-metric.** Within one encoder, mean NMR ↔ ODG Spearman
+  **−0.81 (ours), −0.88 (LAME)** — lower NMR reliably means higher ODG. Trust it for
+  measuring *our own* tuning changes.
+- **`% audible` is the best cross-encoder ODG predictor (Spearman −0.90)** — better
+  than mean NMR (−0.64) and far better than **max NMR (−0.20, BROKEN** — saturates
+  ~66 dB on silent-band artifacts; fix the mask floor or drop it). **→ make `% audible`
+  the headline; fix/retire max NMR.**
+- **Unbiased verdict (PEAQ): LAME wins 7/10, ours 3/10.** LAME leads on Ring05 at every
+  bitrate; **we genuinely beat LAME on Ring09 at 64/96/128k** (PEAQ-confirmed) — so we're
+  competitive on some content, behind on others. Our NMR's *mean* flatters us (claims
+  8/10, wrong on 5) — the bias, now measured.
+
+**Net:** the harness is calibrated. Use mean NMR for self-tracking, `% audible` for a
+rough cross-codec read, and **PEAQ for any real ranking**. We're in the same league as
+LAME, content-dependent, with LAME ahead on average — the honest verdict SNR could
+never give.
