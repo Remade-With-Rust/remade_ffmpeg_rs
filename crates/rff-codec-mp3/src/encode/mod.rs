@@ -252,6 +252,51 @@ mod profile_tests {
     /// — the case that actually stresses the two-loop quantizer — and prints the
     /// per-stage breakdown. `cargo test -p rff-codec-mp3 profile_encode_dense --
     /// --ignored --nocapture`.
+    /// Diagnostic: how many granules of a REAL clip go short vs long? If short
+    /// dominates, the psymodel (long-block only) is bypassed — the lever is the
+    /// attack detector / short-block shaping, not Floor-1 psymodel tuning.
+    /// `cargo test -p rff-codec-mp3 block_mix_real_clip -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn block_mix_real_clip() {
+        let Ok(path) = std::env::var("MP3_BLOCK_CLIP") else {
+            eprintln!("set MP3_BLOCK_CLIP=<f32le mono wav> to run");
+            return;
+        };
+        let d = std::fs::read(&path).expect("MP3_BLOCK_CLIP wav");
+        let i = d.windows(4).position(|w| w == b"data").unwrap() + 8;
+        let pcm: Vec<f32> = d[i..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let header = FrameHeader {
+            version: MpegVersion::V1,
+            crc_protected: false,
+            bitrate_kbps: 128,
+            sample_rate: 44100,
+            padding: false,
+            channel_mode: ChannelMode::Mono,
+            copyright: false,
+            original: true,
+            emphasis: 0,
+        };
+        prof::N_LONG.store(0, std::sync::atomic::Ordering::Relaxed);
+        prof::N_SHORT.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut enc = Mp3Encode::new();
+        let per = 2 * GRANULE_LINES;
+        for ch in pcm.chunks(per) {
+            if ch.len() == per {
+                enc.encode_frame(&header, &[ch.to_vec()], None).unwrap();
+            }
+        }
+        let nl = prof::N_LONG.load(std::sync::atomic::Ordering::Relaxed);
+        let ns = prof::N_SHORT.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[block-mix Ring05] long={nl} short={ns}  ({:.0}% short)",
+            100.0 * ns as f64 / (nl + ns).max(1) as f64
+        );
+    }
+
     #[test]
     #[ignore]
     fn profile_encode_dense() {

@@ -22,7 +22,10 @@ use super::fft;
 /// Psymodel FFT size (Q2). 1024-point, like LAME's long-block analysis.
 const N_FFT: usize = 1024;
 /// Signal-to-mask offset (dB): the masking energy is lowered by this to get the
-/// just-masked noise threshold. A fixed, conservative value for the first model.
+/// just-masked noise threshold. A fixed value — tonality-dependent variation (Floor
+/// 1A) was MEASURED to give zero corpus-ODG change at CBR (the rate loop dominates
+/// the allocation, not the threshold shape), so it was reverted. The lever for these
+/// clips was the block-type decision (attack detector), not the threshold values.
 const SMR_OFFSET_DB: f32 = 12.0;
 
 /// Per-granule perceptual analysis result.
@@ -147,9 +150,18 @@ pub fn detect_attack(pcm: &[f32]) -> bool {
     if bs == 0 {
         return false;
     }
-    let mut running = 1e-6f32;
-    for b in 0..BLOCKS {
-        let e: f32 = pcm[b * bs..(b + 1) * bs].iter().map(|x| x * x).sum::<f32>() / bs as f32;
+    let energy = |b: usize| -> f32 {
+        pcm[b * bs..(b + 1) * bs].iter().map(|x| x * x).sum::<f32>() / bs as f32
+    };
+    // **Quality fix:** seed the running baseline from the FIRST sub-block, not a
+    // ~zero constant. The old `running = 1e-6` meant block 0's energy (any audible
+    // signal) instantly exceeded `running·RATIO`, so a transient was "detected" in
+    // essentially every non-silent granule — 95% short blocks on a ringtone, which
+    // then quantize with flat scalefactors and bypass the psymodel. Now an attack is
+    // a sub-block that genuinely SPIKES ≥RATIO× above the recent energy.
+    let mut running = energy(0).max(1e-9);
+    for b in 1..BLOCKS {
+        let e = energy(b);
         if e > running * RATIO {
             return true;
         }
