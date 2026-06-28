@@ -10,6 +10,12 @@
 > [FFmpeg](https://github.com/FFmpeg/FFmpeg) (LGPL-2.1+/GPL-2.0+/C), under a
 > permissive license, built for speed, safety, and zero copyleft strings.
 
+> **Status — pre-1.0, and not yet independently audited.** APIs and codec
+> coverage are still moving; use it accordingly. See the
+> [security policy](SECURITY.md), the
+> [compatibility & patent matrix](docs/compatibility.md), and
+> [how to contribute](CONTRIBUTING.md).
+
 ---
 
 ## ⚡ The headline
@@ -151,7 +157,8 @@ bitstream body is the next implementation step. More codecs/containers to come.
 ## Install
 
 ```sh
-# From source (see "Building from source"); published crates/binaries to follow.
+# From source — needs `nasm` for the default H.264 SIMD path (see Building from
+# source for the no-nasm alternative). Add `--features https` for https:// input.
 cargo install --path crates/rff-cli
 ```
 
@@ -213,16 +220,27 @@ dependency-free core (`rff-core`), codec/format abstraction layers
 
 ## Building from source
 
+> **⚠ Build prerequisite — `nasm`.** The **default** build enables `h264-asm`
+> (rusty_h264's hand-written SIMD kernels), which assembles with
+> [`nasm`](https://nasm.us). **Without `nasm` on your `PATH`, `cargo build`
+> fails.** Either install it first — `winget install NASM` (Windows) /
+> `brew install nasm` (macOS) / `apt install nasm` (Debian/Ubuntu) — **or** skip
+> the assembly entirely with `--no-default-features` for the pure-Rust scalar
+> H.264 path (no `nasm` needed).
+
 ```sh
 git clone https://github.com/Remade-With-Rust/remade_ffmpeg_rs
 cd remade_ffmpeg_rs
-cargo build              # engine + CLI + server (UI excluded; see below)
-cargo run -p rff-ui      # build/run the Dioxus desktop UI on demand
+cargo build                          # default: needs nasm (h264-asm)
+cargo build --no-default-features    # pure-Rust scalar H.264 — no nasm
+cargo build --features https         # add rustls TLS for https:// input
+cargo run -p rff-ui                  # build/run the Dioxus desktop UI on demand
 ```
 
-**Requirements:** Rust 1.85+ (stable). The Dioxus UI additionally needs a system
-webview (WebView2 on Windows, WebKitGTK on Linux) and, for web/mobile targets,
-the `dx` CLI (`cargo install dioxus-cli`).
+**Requirements:** Rust 1.85+ (stable), plus **`nasm`** for the default
+(`h264-asm`) build — see the callout above. The Dioxus UI additionally needs a
+system webview (WebView2 on Windows, WebKitGTK on Linux) and, for web/mobile
+targets, the `dx` CLI (`cargo install dioxus-cli`).
 
 ## Platform support
 
