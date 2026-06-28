@@ -475,8 +475,8 @@ pub static BRICKS: &[Brick] = &[
         Phase::Roof,
         Class::Tbl,
         Verify::External,
-        Status::Todo,
-        "Xing/LAME info header (VBR TOC + delay/padding)",
+        Status::Verified,
+        "Xing/Info header (CBR frame count; FFmpeg reads exact duration)",
     ),
     b(
         "R4",

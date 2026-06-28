@@ -163,6 +163,9 @@ struct Mp3Encoder {
     /// Accumulated samples per channel awaiting a full frame.
     pcm: [Vec<f32>; 2],
     queue: VecDeque<rff_core::Packet>,
+    /// Audio frames emitted and their total byte length (for the Info header).
+    total_frames: u32,
+    total_bytes: usize,
     eof: bool,
 }
 
@@ -207,6 +210,8 @@ impl Mp3Encoder {
                 .map(|c| self.pcm[c].drain(0..spf).collect())
                 .collect();
             if let Ok(bytes) = self.state.encode_frame(&header, &block) {
+                self.total_frames += 1;
+                self.total_bytes += bytes.len();
                 self.queue.push_back(Packet::from_data(0, bytes));
             }
         }
@@ -263,6 +268,18 @@ impl Encoder for Mp3Encoder {
                     self.pcm[c].resize(padded, 0.0);
                 }
                 self.drain_frames();
+            }
+            // Prepend the Xing/Info header now that the totals are known (counts
+            // include the Info frame itself). Streaming consumers that drain before
+            // flush won't get it first — that case wants two-pass.
+            if self.total_frames > 0 {
+                let fsize = header.frame_size() as u32;
+                let info = encode::bitstream::info_frame(
+                    &header,
+                    self.total_frames + 1,
+                    self.total_bytes as u32 + fsize,
+                );
+                self.queue.push_front(Packet::from_data(0, info));
             }
         }
         self.eof = true;

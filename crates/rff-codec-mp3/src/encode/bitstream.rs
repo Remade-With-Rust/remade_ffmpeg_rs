@@ -129,6 +129,32 @@ pub fn serialize_scalefactors(
     }
 }
 
+// ── R3: Xing/Info tag frame ───────────────────────────────────────────────────
+
+/// **R3** — build the Xing/Info header frame to prepend to a CBR stream so players
+/// read an exact frame count (accurate duration + seeking) instead of estimating
+/// from the bitrate. It is a valid, silent MPEG frame carrying the ASCII tag
+/// (`Info` for CBR) right after the side info, at the canonical Xing offset.
+///
+/// `frame_count` and `byte_count` describe the whole file *including* this frame.
+pub fn info_frame(header: &FrameHeader, frame_count: u32, byte_count: u32) -> Vec<u8> {
+    let mut out = header.to_bytes().to_vec();
+    if header.crc_protected {
+        out.extend_from_slice(&[0, 0]);
+    }
+    // Silent side info (all zero: main_data_begin 0, part2_3_length 0 → no audio).
+    out.resize(out.len() + header.side_info_len(), 0);
+
+    // The tag, at offset 4 + side_info_len (the canonical Xing position).
+    out.extend_from_slice(b"Info"); // "Xing" would mark VBR; we are CBR
+    out.extend_from_slice(&0x0000_0003u32.to_be_bytes()); // flags: frames | bytes
+    out.extend_from_slice(&frame_count.to_be_bytes());
+    out.extend_from_slice(&byte_count.to_be_bytes());
+
+    out.resize(header.frame_size(), 0); // pad to a full frame
+    out
+}
+
 // ── B7: single-frame assembly (reservoir-free) ────────────────────────────────
 
 /// Encoder-side reservoir: how many spare main-data bytes are banked.
@@ -371,6 +397,38 @@ mod tests {
             }
         }
         sf_round_trip(&si, 0, 0, &sf, None);
+    }
+
+    #[test]
+    fn info_frame_is_well_formed() {
+        let header = hdr(ChannelMode::Stereo);
+        let frame = info_frame(&header, 1234, 567_890);
+        // A valid MPEG frame of the right size, with the tag at the Xing offset.
+        assert_eq!(frame.len(), header.frame_size());
+        assert_eq!(frame[0], 0xFF);
+        assert_eq!(frame[1] & 0xE0, 0xE0);
+        let tag = 4 + header.side_info_len(); // no CRC
+        assert_eq!(&frame[tag..tag + 4], b"Info");
+        assert_eq!(
+            u32::from_be_bytes(frame[tag + 4..tag + 8].try_into().unwrap()),
+            3
+        ); // flags
+        assert_eq!(
+            u32::from_be_bytes(frame[tag + 8..tag + 12].try_into().unwrap()),
+            1234
+        );
+        assert_eq!(
+            u32::from_be_bytes(frame[tag + 12..tag + 16].try_into().unwrap()),
+            567_890
+        );
+
+        // Our own decoder accepts it as a (silent) frame.
+        use rff_codec::Decoder;
+        use rff_core::{Frame, Packet};
+        let mut dec = crate::Mp3Decoder::default();
+        dec.send_packet(&Packet::from_data(0, frame)).unwrap();
+        dec.flush();
+        assert!(matches!(dec.receive_frame(), Ok(Frame::Audio(_))));
     }
 
     #[test]
