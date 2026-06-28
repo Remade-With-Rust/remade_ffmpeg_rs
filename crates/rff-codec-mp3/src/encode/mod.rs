@@ -25,6 +25,7 @@ pub mod huffman;
 pub mod mdct;
 pub mod psychoacoustic;
 pub mod quantize;
+pub mod stereo;
 
 /// Persistent encoder state across frames.
 pub struct Mp3Encode {
@@ -55,21 +56,39 @@ impl Mp3Encode {
     /// `granules × 576` samples): per granule, per channel, analysis filterbank →
     /// forward MDCT → rate-loop quantize → Huffman, then assemble (reservoir-free).
     ///
-    /// Mono and **independent-stereo** (each channel coded on its own; no joint
-    /// stereo yet). Main data is laid out granule-major then channel-major, the
-    /// order the decoder reads it.
+    /// Mono, independent stereo, or **mid/side joint stereo** (chosen per frame
+    /// when the channels are correlated). Main data is laid out granule-major then
+    /// channel-major, the order the decoder reads it.
     pub fn encode_frame(&mut self, header: &FrameHeader, channels: &[Vec<f32>]) -> Result<Vec<u8>> {
         let nch = header.channel_mode.channels();
         let granules = header.version.granules();
-        let budget = (bitstream::region_capacity(header) * 8) / (granules * nch);
 
+        // Per-frame M/S decision (stereo only). M/S is exact in the PCM domain
+        // because the filterbank/MDCT are linear: storing M=(L+R)/√2, S=(L−R)/√2
+        // and letting the decoder rotate back reconstructs L/R. Only worth it when
+        // the channels are correlated (S small → cheap to code).
+        let use_ms = nch == 2 && stereo::prefer_mid_side(&channels[0], &channels[1]);
+        let coded = if use_ms {
+            stereo::mid_side(&channels[0], &channels[1])
+        } else {
+            channels.to_vec()
+        };
+        let mut fheader = header.clone();
+        if use_ms {
+            fheader.channel_mode = crate::frame::ChannelMode::JointStereo {
+                ms_stereo: true,
+                intensity_stereo: false,
+            };
+        }
+
+        let budget = (bitstream::region_capacity(&fheader) * 8) / (granules * nch);
         let mut side = SideInfo::default();
         let mut main = BitWriter::new();
         for gr in 0..granules {
             for ch in 0..nch {
-                let gpcm = &channels[ch][gr * GRANULE_LINES..];
+                let gpcm = &coded[ch][gr * GRANULE_LINES..];
                 let sub = filterbank::analyze(gpcm, &mut self.analysis_fifo[ch]);
-                let psy = psychoacoustic::analyze(gpcm, header.sample_rate);
+                let psy = psychoacoustic::analyze(gpcm, fheader.sample_rate);
                 let mut freq = mdct::forward(&sub, psy.block_type, &mut self.mdct_overlap[ch]);
                 // Forward alias butterflies — the inverse of the decoder's reduce(),
                 // which it applies before the IMDCT.
@@ -79,21 +98,21 @@ impl Mp3Encode {
                     ..Default::default()
                 };
                 antialias::expand(&block, &mut freq);
-                let quant = quantize::loops(header, &freq, &psy, budget);
+                let quant = quantize::loops(&fheader, &freq, &psy, budget);
 
                 // Main data per granule/channel: scalefactors (part2) then Huffman.
                 side.granules[gr][ch] = quant.side.clone();
                 let mut sfac = ScaleFactors::default();
                 sfac.long.copy_from_slice(&quant.scalefactors[..22]);
                 let part2_3_start = main.bit_len();
-                bitstream::serialize_scalefactors(&mut main, header, &side, gr, ch, &sfac);
-                huffman::encode(&quant, header, &mut main);
+                bitstream::serialize_scalefactors(&mut main, &fheader, &side, gr, ch, &sfac);
+                huffman::encode(&quant, &fheader, &mut main);
                 side.granules[gr][ch].part2_3_length = (main.bit_len() - part2_3_start) as u16;
             }
         }
         let main_data = main.finish();
         Ok(bitstream::format(
-            header,
+            &fheader,
             &side,
             &main_data,
             &mut self.reservoir,

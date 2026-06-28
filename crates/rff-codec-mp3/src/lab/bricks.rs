@@ -460,7 +460,7 @@ pub static BRICKS: &[Brick] = &[
         Class::Alg,
         Verify::RoundTrip,
         Status::Verified,
-        "Independent L/R stereo (joint M/S deferred)",
+        "Stereo: independent L/R + mid/side joint stereo (per-frame)",
     ),
     b(
         "R2",

@@ -154,8 +154,8 @@ impl Decoder for Mp3Decoder {
 }
 
 /// MP3 encoder: accumulates per-channel PCM, emits one MP3 frame per 1152 samples
-/// per channel. MPEG-1, 128 kbps CBR, psychoacoustic noise shaping; mono or
-/// **independent stereo** (no joint stereo yet).
+/// per channel. MPEG-1, 128 kbps CBR, psychoacoustic noise shaping; mono, stereo,
+/// or per-frame mid/side joint stereo.
 #[derive(Default)]
 struct Mp3Encoder {
     state: Mp3Encode,
@@ -414,6 +414,76 @@ mod tests {
         assert!(
             snr_l > 20.0 && snr_r > 20.0,
             "stereo channels too noisy: L {snr_l} R {snr_r}"
+        );
+    }
+
+    /// **R1+ — mid/side joint stereo.** Correlated channels (L ≈ R, slightly
+    /// panned) trigger M/S; the stream must still reconstruct L and R.
+    #[test]
+    fn encode_decode_joint_stereo() {
+        let sr = 44100u32;
+        let n = 16 * 1152;
+        let pi2 = 2.0 * std::f32::consts::PI;
+        // Near-mono content with a small inter-channel difference → M/S wins.
+        let mut interleaved = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let t = i as f32 / sr as f32;
+            let base = 0.4 * (pi2 * 900.0 * t).sin();
+            interleaved.push(base); // L
+            interleaved.push(base * 0.95 + 0.02 * (pi2 * 1500.0 * t).sin()); // R ≈ L
+        }
+
+        let mut enc = Mp3Encoder::default();
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            sample_rate: sr,
+            channels: 2,
+            format: SampleFormat::F32,
+            planes: vec![pcm_to_bytes(&interleaved)],
+            samples: n,
+            pts: None,
+        }))
+        .unwrap();
+        enc.flush();
+        let mut mp3 = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            mp3.extend_from_slice(&p.data);
+        }
+        if let Ok(path) = std::env::var("MP3_ENC_OUT") {
+            std::fs::write(path, &mp3).expect("write MP3_ENC_OUT");
+        }
+
+        // At least one frame must have chosen joint stereo (header mode 0b01).
+        let joint = mp3
+            .windows(2)
+            .step_by(1)
+            .any(|w| w[0] == 0xFF && (w[1] & 0xE0) == 0xE0 && (w[1] & 0x06) == 0x02);
+        assert!(joint, "no joint-stereo frame emitted");
+
+        let mut dec = Mp3Decoder::default();
+        dec.send_packet(&Packet::from_data(0, mp3)).unwrap();
+        dec.flush();
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+            for fr in af.planes[0].chunks_exact(8) {
+                left.push(f32::from_le_bytes([fr[0], fr[1], fr[2], fr[3]]));
+                right.push(f32::from_le_bytes([fr[4], fr[5], fr[6], fr[7]]));
+            }
+        }
+        let ref_l: Vec<f32> = (0..n)
+            .map(|i| 0.4 * (pi2 * 900.0 * i as f32 / sr as f32).sin())
+            .collect();
+        let ref_r: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                0.4 * (pi2 * 900.0 * t).sin() * 0.95 + 0.02 * (pi2 * 1500.0 * t).sin()
+            })
+            .collect();
+        let snr_l = best_snr(&ref_l, &left);
+        let snr_r = best_snr(&ref_r, &right);
+        eprintln!("[R1+] joint-stereo SNR L {snr_l:.1} dB  R {snr_r:.1} dB");
+        assert!(
+            snr_l > 20.0 && snr_r > 20.0,
+            "joint stereo too noisy: L {snr_l} R {snr_r}"
         );
     }
 
