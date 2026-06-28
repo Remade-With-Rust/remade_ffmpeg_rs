@@ -84,17 +84,32 @@ in Phase B/C than by more A-style micro-tuning.
 on this short-block-heavy signal, but the win is real and byte-exact; the rest
 needs the fast transforms + SIMD of B/C, and the psy-FFT, to go further).
 
-## Phase B — Fast transforms (encode + decode, still portable)
+## Phase B — Fast decode (IN PROGRESS — profiling re-scoped it)
 
-- **B1 — Fast analysis filterbank.** Replace the dense 64→32 matrix with a fast
-  32-point DCT (the standard MP3/AAC filterbank factorization). O(N log N) vs O(N²).
-- **B2 — Fast forward MDCT.** Replace the dense 36/12-point matrices with the
-  standard DCT-IV/FFT factorization used by decoders, run in reverse.
-- **B3 — Fast decode synthesis + IMDCT.** The inverses of B1/B2 — the decode
-  hotspots. This is where the 2.9× decode gap closes.
+**Profiling the decoder (`decode::prof`) overturned the plan's premise, exactly
+like Phase A.** The decode hotspot was **NOT the transforms** — it was the
+**Huffman decoder at 83%** (synthesis 12%, IMDCT 1%). So Phase B's first brick
+became a fast Huffman decoder, not a fast transform.
 
-**Gate:** round-trip SNR ≥ current (80.5 dB tone); **decode stays bit-exact on
-the conformance corpus**; benchmark re-run. decode ≥ ~300× RT target.
+- **B-Huff — Table-driven Huffman decode** ✅ **DONE (2026-06-28).** `decode_index`
+  was a bit-by-bit linear scan over the whole codebook per symbol
+  (O(max_len×table) ≈ thousands of compares/pair). Replaced with a peek-and-lookup
+  table (per book, lazy `2^min(max_len,12)` LUT → `(symbol, length)`; rare >12-bit
+  codes fall back to the kept linear scan). Added `BitReader::peek/skip`.
+  **Bit-exactness proven** by `lut_matches_linear_for_every_codeword`. **Result:
+  decode 169× → 288× realtime (1.75×)**, Huffman stage 7× faster, output
+  bit-identical, still matches FFmpeg at 119.6 dB. Decode gap vs FFmpeg: 2.9× → ~1.7×.
+
+- **B3 — Fast decode synthesis + IMDCT.** *Now* the top decode stage (synthesis,
+  the dense 64→32 matrix, is 42% after B-Huff; IMDCT ~4%). The plan's original B3,
+  validated by measurement this time. **Risk:** a fast DCT changes the float
+  arithmetic and may erode the 119.6 dB FFmpeg match — gate carefully.
+- **B1/B2 — Encode transforms.** Deprioritised: Phase A's profile shows the encode
+  filterbank is 9% and the forward MDCT 1.4% — cold. The encode transform worth
+  attacking is the **psychoacoustic FFT (~19%)**, not the filterbank/MDCT.
+
+**Gate:** round-trip SNR ≥ current; **decode stays bit-exact** (proven, not
+assumed); FFmpeg match preserved; benchmark re-run.
 
 ## Phase C — SIMD (the explicit ask)
 

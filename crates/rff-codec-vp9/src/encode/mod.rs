@@ -14,6 +14,7 @@ mod adapt;
 mod bitwriter;
 mod prob;
 mod quantize;
+mod syntax;
 mod tokens;
 mod transform;
 
@@ -22,6 +23,9 @@ pub(crate) use prob::{
     diff_update_encode, encode_term_subexp, forward_remap_prob, update_mv_prob_encode,
 };
 pub(crate) use quantize::quantize;
+pub(crate) use syntax::{
+    write_intra_mode, write_partition, write_segment_id, write_selected_tx_size, write_skip,
+};
 pub(crate) use tokens::{coef_cost, encode_coefs};
 pub(crate) use transform::forward_transform;
 
