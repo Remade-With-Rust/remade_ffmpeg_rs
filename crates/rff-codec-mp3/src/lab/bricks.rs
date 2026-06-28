@@ -270,15 +270,15 @@ pub static BRICKS: &[Brick] = &[
         Phase::Foundation,
         Class::Tbl,
         Verify::Reuse,
-        Status::Todo,
-        "linbits per Huffman table (encode twin)",
+        Status::Verified,
+        "linbits per Huffman table (reused from decode PAIR_TABLES)",
     ),
     b(
         "N9",
         Phase::Foundation,
         Class::Gen,
         Verify::RoundTrip,
-        Status::Todo,
+        Status::Verified,
         "Region-boundary ↔ (region0/1_count) maps",
     ),
     // ── Floor 1: analysis ──────────────────────────────────────────────────
@@ -312,7 +312,7 @@ pub static BRICKS: &[Brick] = &[
         Phase::Coding,
         Class::Alg,
         Verify::RoundTrip,
-        Status::Todo,
+        Status::Verified,
         "Huffman encode-table builder (invert codebooks)",
     ),
     b(
@@ -320,7 +320,7 @@ pub static BRICKS: &[Brick] = &[
         Phase::Coding,
         Class::Alg,
         Verify::RoundTrip,
-        Status::Todo,
+        Status::Verified,
         "estimate_bits(region, table) — inner-loop cost oracle",
     ),
     b(
@@ -328,7 +328,7 @@ pub static BRICKS: &[Brick] = &[
         Phase::Coding,
         Class::Alg,
         Verify::RoundTrip,
-        Status::Todo,
+        Status::Verified,
         "Huffman spectrum encode (big_values + count1 + linbits)",
     ),
     b(
@@ -336,7 +336,7 @@ pub static BRICKS: &[Brick] = &[
         Phase::Coding,
         Class::Alg,
         Verify::RoundTrip,
-        Status::Todo,
+        Status::Verified,
         "Region + table selection (minimise B2 cost)",
     ),
     b(
@@ -607,8 +607,8 @@ mod tests {
 
     #[test]
     fn next_unbuilt_is_first_incomplete() {
-        // Foundation N1–N7 + analysis L1–L3 are verified; next is N8.
-        assert_eq!(next_unbuilt().map(|b| b.id), Some("N8"));
+        // Foundation + analysis + the Huffman coding bricks are verified; next is B5.
+        assert_eq!(next_unbuilt().map(|b| b.id), Some("B5"));
     }
 
     #[test]

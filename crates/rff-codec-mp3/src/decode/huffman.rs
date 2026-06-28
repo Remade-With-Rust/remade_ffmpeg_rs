@@ -60,6 +60,19 @@ impl HuffBook {
         None
     }
 
+    /// Encode side: the `(codeword, bit-length)` for symbol index `idx` (the
+    /// inverse of [`decode_index`]). The empty book (table 0) codes index 0 as a
+    /// zero-length word. Returns `None` if `idx` is outside the book.
+    pub fn code_len(&self, idx: usize) -> Option<(u16, u8)> {
+        if self.codes.is_empty() {
+            return if idx == 0 { Some((0, 0)) } else { None };
+        }
+        match self.codes.get(idx) {
+            Some(&c) => Some((c, self.lens[idx])),
+            None => None,
+        }
+    }
+
     #[cfg(test)]
     pub fn kraft_sum(&self) -> f64 {
         self.lens.iter().map(|&l| 2f64.powi(-(l as i32))).sum()

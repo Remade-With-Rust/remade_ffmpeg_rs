@@ -63,7 +63,7 @@ impl Mp3Encode {
                 let psy = psychoacoustic::analyze(pcm);
                 let freq = mdct::forward(&sub, psy.block_type, &mut self.mdct_overlap[ch]);
                 let quant = quantize::loops(&freq, &psy, bit_budget / (granules * channels));
-                huffman::encode(&quant, &mut writer);
+                huffman::encode(&quant, header, &mut writer);
                 side.granules[gr][ch] = quant.side.clone();
             }
         }
