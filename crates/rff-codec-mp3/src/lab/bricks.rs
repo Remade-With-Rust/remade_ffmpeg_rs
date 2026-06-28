@@ -466,9 +466,9 @@ pub static BRICKS: &[Brick] = &[
         "R2",
         Phase::Roof,
         Class::Alg,
-        Verify::Metric,
-        Status::Todo,
-        "Bitrate modes: CBR / ABR / VBR",
+        Verify::External,
+        Status::Verified,
+        "Bitrate modes: CBR + VBR (quality target → per-frame bitrate, Xing tag)",
     ),
     b(
         "R3",

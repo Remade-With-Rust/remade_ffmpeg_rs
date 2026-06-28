@@ -260,6 +260,94 @@ pub fn loops(
     best.expect("at least one iteration runs").1
 }
 
+/// Smallest gain whose flat-scalefactor quantization doesn't clip — the finest
+/// representable step for this spectrum.
+fn nonclip_floor(header: &FrameHeader, freq: &[f32; GRANULE_LINES]) -> i32 {
+    let flat = [0u8; 22];
+    let ok = |g: i32| {
+        quantize_with_sf(header, freq, g, &flat)
+            .iter()
+            .all(|&c| c.abs() <= MAX_UNCLIPPED)
+    };
+    let (mut lo, mut hi) = (0i32, 255i32);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if ok(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+/// **R2 (VBR)** — quantize to a *quality* target instead of a bit budget. Picks the
+/// coarsest gain whose peak noise-to-mask ratio stays under `target_nmr` (fewest
+/// bits that still meet quality), never finer than the no-clip floor, then shapes
+/// scalefactors under the threshold. The resulting bit count — and hence the
+/// frame's bitrate — varies with content.
+pub fn loops_vbr(
+    header: &FrameHeader,
+    freq: &[f32; GRANULE_LINES],
+    psy: &PsyResult,
+    target_nmr: f32,
+) -> QuantizedGranule {
+    let flat = [0u8; 22];
+    let peak = |g: i32| {
+        let coeffs = quantize_with_sf(header, freq, g, &flat);
+        let noise = band_noise(header, freq, &coeffs, g, &flat);
+        noise
+            .iter()
+            .enumerate()
+            .map(|(b, &n)| n / psy.thresholds[b].max(1e-20))
+            .fold(0f32, f32::max)
+    };
+    // Largest gain (coarsest → fewest bits) whose peak NMR meets the target.
+    let (mut lo, mut hi) = (0i32, 255i32);
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if peak(mid) <= target_nmr {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let gain = lo.max(nonclip_floor(header, freq));
+
+    // Distortion loop at the fixed gain: raise the worst over-threshold band.
+    let mut sf = [0u8; 22];
+    for _ in 0..MAX_OUTER {
+        let coeffs = quantize_with_sf(header, freq, gain, &sf);
+        let noise = band_noise(header, freq, &coeffs, gain, &sf);
+        let mut worst = None;
+        let mut worst_nmr = f32::NEG_INFINITY;
+        for (b, &n) in noise.iter().enumerate() {
+            let nmr = n / psy.thresholds[b].max(1e-20);
+            if n > psy.thresholds[b] && sf[b] < MAX_SF && nmr > worst_nmr {
+                worst_nmr = nmr;
+                worst = Some(b);
+            }
+        }
+        match worst {
+            Some(b) => sf[b] += 1,
+            None => break,
+        }
+    }
+
+    let coeffs = quantize_with_sf(header, freq, gain, &sf);
+    let (compress, _) = choose_compress(&sf);
+    let mut side = super::huffman::select(header, &coeffs);
+    side.global_gain = gain as u8;
+    side.scalefac_compress = compress;
+    let mut scalefactors = [0u8; 39];
+    scalefactors[..22].copy_from_slice(&sf);
+    QuantizedGranule {
+        coeffs,
+        side,
+        scalefactors,
+    }
+}
+
 #[cfg(test)]
 mod c2_tests {
     use super::*;

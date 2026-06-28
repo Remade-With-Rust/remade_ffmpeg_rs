@@ -59,7 +59,16 @@ impl Mp3Encode {
     /// Mono, independent stereo, or **mid/side joint stereo** (chosen per frame
     /// when the channels are correlated). Main data is laid out granule-major then
     /// channel-major, the order the decoder reads it.
-    pub fn encode_frame(&mut self, header: &FrameHeader, channels: &[Vec<f32>]) -> Result<Vec<u8>> {
+    ///
+    /// `quality` selects the rate mode: `None` is CBR (the header's bitrate);
+    /// `Some(target_nmr)` is **VBR** — each granule quantizes to that quality and
+    /// the frame's bitrate is picked to fit the result.
+    pub fn encode_frame(
+        &mut self,
+        header: &FrameHeader,
+        channels: &[Vec<f32>],
+        quality: Option<f32>,
+    ) -> Result<Vec<u8>> {
         let nch = header.channel_mode.channels();
         let granules = header.version.granules();
 
@@ -98,7 +107,10 @@ impl Mp3Encode {
                     ..Default::default()
                 };
                 antialias::expand(&block, &mut freq);
-                let quant = quantize::loops(&fheader, &freq, &psy, budget);
+                let quant = match quality {
+                    Some(target) => quantize::loops_vbr(&fheader, &freq, &psy, target),
+                    None => quantize::loops(&fheader, &freq, &psy, budget),
+                };
 
                 // Main data per granule/channel: scalefactors (part2) then Huffman.
                 side.granules[gr][ch] = quant.side.clone();
@@ -111,6 +123,11 @@ impl Mp3Encode {
             }
         }
         let main_data = main.finish();
+
+        // VBR: size the frame to its actual main data (CBR keeps the fixed rate).
+        if quality.is_some() {
+            fheader.bitrate_kbps = bitstream::smallest_bitrate_for(&fheader, main_data.len());
+        }
         Ok(bitstream::format(
             &fheader,
             &side,

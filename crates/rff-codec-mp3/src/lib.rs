@@ -25,7 +25,9 @@
 use std::collections::VecDeque;
 
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
-use rff_core::{AudioFrame, CodecId, Error, Frame, MediaType, Packet, Result, SampleFormat};
+use rff_core::{
+    AudioFrame, CodecId, Dictionary, Error, Frame, MediaType, Packet, Result, SampleFormat,
+};
 
 mod bitio;
 mod decode;
@@ -154,8 +156,8 @@ impl Decoder for Mp3Decoder {
 }
 
 /// MP3 encoder: accumulates per-channel PCM, emits one MP3 frame per 1152 samples
-/// per channel. MPEG-1, 128 kbps CBR, psychoacoustic noise shaping; mono, stereo,
-/// or per-frame mid/side joint stereo.
+/// per channel. MPEG-1, CBR or VBR, psychoacoustic noise shaping; mono, stereo,
+/// or per-frame mid/side joint stereo. Configured via `-b:a` (CBR) / `-q:a` (VBR).
 #[derive(Default)]
 struct Mp3Encoder {
     state: Mp3Encode,
@@ -166,11 +168,46 @@ struct Mp3Encoder {
     /// Audio frames emitted and their total byte length (for the Info header).
     total_frames: u32,
     total_bytes: usize,
+    /// CBR target (kbps); 0 ⇒ default 128.
+    cbr_kbps: u32,
+    /// VBR quality target (peak NMR). `Some` ⇒ VBR, `None` ⇒ CBR.
+    quality: Option<f32>,
     eof: bool,
 }
 
-/// Build the frame header from the input's sample rate and channel count.
-fn encoder_header(sample_rate: u32, channels: u16) -> Result<FrameHeader> {
+/// Snap a requested bitrate (kbps) to the nearest valid MPEG-1 Layer III value.
+fn snap_bitrate(kbps: u32) -> u32 {
+    let valid = &tables_v1_bitrates();
+    *valid
+        .iter()
+        .min_by_key(|&&b| b.abs_diff(kbps))
+        .unwrap_or(&128)
+}
+
+/// The coded MPEG-1 Layer III bitrates (kbps), excluding free/reserved.
+fn tables_v1_bitrates() -> [u32; 14] {
+    [
+        32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ]
+}
+
+/// Parse an FFmpeg-style bitrate string ("128k", "192000") into kbps.
+fn parse_bitrate(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix(['k', 'K']) {
+        n.trim().parse::<f32>().ok().map(|x| x as u32)
+    } else if let Some(n) = s.strip_suffix(['m', 'M']) {
+        n.trim().parse::<f32>().ok().map(|x| (x * 1000.0) as u32)
+    } else {
+        s.parse::<u32>()
+            .ok()
+            .map(|x| if x >= 1000 { x / 1000 } else { x })
+    }
+}
+
+/// Build the frame header from the input's sample rate, channel count, and the
+/// configured CBR bitrate (VBR overrides the bitrate per frame later).
+fn encoder_header(sample_rate: u32, channels: u16, cbr_kbps: u32) -> Result<FrameHeader> {
     let version = match sample_rate {
         32000 | 44100 | 48000 => header::MpegVersion::V1,
         _ => {
@@ -184,10 +221,11 @@ fn encoder_header(sample_rate: u32, channels: u16) -> Result<FrameHeader> {
     } else {
         frame::ChannelMode::Mono
     };
+    let bitrate_kbps = snap_bitrate(if cbr_kbps == 0 { 128 } else { cbr_kbps });
     Ok(FrameHeader {
         version,
         crc_protected: false,
-        bitrate_kbps: 128,
+        bitrate_kbps,
         sample_rate,
         padding: false,
         channel_mode,
@@ -209,7 +247,7 @@ impl Mp3Encoder {
             let block: Vec<Vec<f32>> = (0..nch)
                 .map(|c| self.pcm[c].drain(0..spf).collect())
                 .collect();
-            if let Ok(bytes) = self.state.encode_frame(&header, &block) {
+            if let Ok(bytes) = self.state.encode_frame(&header, &block, self.quality) {
                 self.total_frames += 1;
                 self.total_bytes += bytes.len();
                 self.queue.push_back(Packet::from_data(0, bytes));
@@ -219,12 +257,27 @@ impl Mp3Encoder {
 }
 
 impl Encoder for Mp3Encoder {
+    fn configure(&mut self, options: &Dictionary) -> Result<()> {
+        if let Some(b) = options.get("b").and_then(parse_bitrate) {
+            self.cbr_kbps = b;
+        }
+        // VBR quality via -q:a / -qp:a / -crf:a (0 = best … 9 = smallest). Its
+        // presence switches to VBR; map the index to a peak-NMR target.
+        for key in ["q", "qp", "crf", "qscale"] {
+            if let Some(q) = options.get(key).and_then(|v| v.trim().parse::<f32>().ok()) {
+                self.quality = Some(10f32.powf((q.clamp(0.0, 9.0) * 2.0) / 10.0));
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let Frame::Audio(af) = frame else {
             return Ok(());
         };
         if self.header.is_none() {
-            self.header = Some(encoder_header(af.sample_rate, af.channels)?);
+            self.header = Some(encoder_header(af.sample_rate, af.channels, self.cbr_kbps)?);
         }
         let nch = self.header.as_ref().unwrap().channel_mode.channels();
         let in_ch = (af.channels as usize).max(1);
@@ -278,6 +331,7 @@ impl Encoder for Mp3Encoder {
                     &header,
                     self.total_frames + 1,
                     self.total_bytes as u32 + fsize,
+                    self.quality.is_some(),
                 );
                 self.queue.push_front(Packet::from_data(0, info));
             }
@@ -415,6 +469,82 @@ mod tests {
             snr_l > 20.0 && snr_r > 20.0,
             "stereo channels too noisy: L {snr_l} R {snr_r}"
         );
+    }
+
+    /// **R2 — VBR.** Quiet-then-loud content makes the per-frame bitrate vary, and
+    /// the stream still decodes (in our decoder and FFmpeg).
+    #[test]
+    fn vbr_varies_bitrate_and_round_trips() {
+        let sr = 44100u32;
+        let pi2 = 2.0 * std::f32::consts::PI;
+        // 10 quiet simple frames, then 10 loud broadband-noise frames.
+        let mut input = Vec::new();
+        let mut s = 0x1234_5678u32;
+        for f in 0..20 {
+            for i in 0..1152 {
+                let t = (f * 1152 + i) as f32 / sr as f32;
+                if f < 10 {
+                    input.push(0.05 * (pi2 * 500.0 * t).sin()); // quiet tone → few bits
+                } else {
+                    s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    input.push(0.6 * ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5));
+                    // loud noise
+                }
+            }
+        }
+
+        let mut enc = Mp3Encoder::default();
+        let mut opts = Dictionary::new();
+        opts.set("q", "3"); // request VBR
+        enc.configure(&opts).unwrap();
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            sample_rate: sr,
+            channels: 1,
+            format: SampleFormat::F32,
+            planes: vec![pcm_to_bytes(&input)],
+            samples: input.len(),
+            pts: None,
+        }))
+        .unwrap();
+        enc.flush();
+        let mut mp3 = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            mp3.extend_from_slice(&p.data);
+        }
+        if let Ok(path) = std::env::var("MP3_ENC_OUT") {
+            std::fs::write(path, &mp3).expect("write MP3_ENC_OUT");
+        }
+
+        // Walk the frames and collect their coded bitrates — VBR must use ≥2.
+        let mut bitrates = std::collections::BTreeSet::new();
+        let mut pos = 0;
+        while pos + 4 <= mp3.len() {
+            if mp3[pos] == 0xFF && mp3[pos + 1] & 0xE0 == 0xE0 {
+                if let Ok(h) =
+                    header::FrameHeader::parse([mp3[pos], mp3[pos + 1], mp3[pos + 2], mp3[pos + 3]])
+                {
+                    bitrates.insert(h.bitrate_kbps);
+                    pos += h.frame_size();
+                    continue;
+                }
+            }
+            pos += 1;
+        }
+        eprintln!("[R2] VBR bitrates used: {bitrates:?}");
+        assert!(
+            bitrates.len() >= 2,
+            "VBR must vary the bitrate, got {bitrates:?}"
+        );
+
+        // And it still decodes frame-for-frame.
+        let mut dec = Mp3Decoder::default();
+        dec.send_packet(&Packet::from_data(0, mp3)).unwrap();
+        dec.flush();
+        let mut frames = 0;
+        while let Ok(Frame::Audio(_)) = dec.receive_frame() {
+            frames += 1;
+        }
+        assert!(frames >= 20, "expected all frames to decode, got {frames}");
     }
 
     /// **R1+ — mid/side joint stereo.** Correlated channels (L ≈ R, slightly

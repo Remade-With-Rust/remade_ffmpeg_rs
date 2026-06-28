@@ -137,7 +137,8 @@ pub fn serialize_scalefactors(
 /// (`Info` for CBR) right after the side info, at the canonical Xing offset.
 ///
 /// `frame_count` and `byte_count` describe the whole file *including* this frame.
-pub fn info_frame(header: &FrameHeader, frame_count: u32, byte_count: u32) -> Vec<u8> {
+/// `vbr` selects the `Xing` tag (variable bitrate) over `Info` (constant).
+pub fn info_frame(header: &FrameHeader, frame_count: u32, byte_count: u32, vbr: bool) -> Vec<u8> {
     let mut out = header.to_bytes().to_vec();
     if header.crc_protected {
         out.extend_from_slice(&[0, 0]);
@@ -146,13 +147,26 @@ pub fn info_frame(header: &FrameHeader, frame_count: u32, byte_count: u32) -> Ve
     out.resize(out.len() + header.side_info_len(), 0);
 
     // The tag, at offset 4 + side_info_len (the canonical Xing position).
-    out.extend_from_slice(b"Info"); // "Xing" would mark VBR; we are CBR
+    out.extend_from_slice(if vbr { b"Xing" } else { b"Info" });
     out.extend_from_slice(&0x0000_0003u32.to_be_bytes()); // flags: frames | bytes
     out.extend_from_slice(&frame_count.to_be_bytes());
     out.extend_from_slice(&byte_count.to_be_bytes());
 
     out.resize(header.frame_size(), 0); // pad to a full frame
     out
+}
+
+/// Smallest MPEG-1 bitrate (kbps) whose frame can hold `main_data_bytes`, capped
+/// at 320. Lets VBR size each frame to its content.
+pub fn smallest_bitrate_for(header: &FrameHeader, main_data_bytes: usize) -> u32 {
+    for &br in tables::BITRATE_V1_L3[1..15].iter() {
+        let mut h = header.clone();
+        h.bitrate_kbps = br;
+        if region_capacity(&h) >= main_data_bytes {
+            return br;
+        }
+    }
+    320
 }
 
 // ── B7: single-frame assembly (reservoir-free) ────────────────────────────────
@@ -402,7 +416,7 @@ mod tests {
     #[test]
     fn info_frame_is_well_formed() {
         let header = hdr(ChannelMode::Stereo);
-        let frame = info_frame(&header, 1234, 567_890);
+        let frame = info_frame(&header, 1234, 567_890, false);
         // A valid MPEG frame of the right size, with the tag at the Xing offset.
         assert_eq!(frame.len(), header.frame_size());
         assert_eq!(frame[0], 0xFF);
