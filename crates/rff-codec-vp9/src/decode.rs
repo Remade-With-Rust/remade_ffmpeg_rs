@@ -2578,7 +2578,7 @@ impl Reconstructor {
 /// Chroma transform size from the luma tx size and subsampling
 /// (libvpx `get_uv_tx_size_impl`): sub-8×8 luma → chroma TX_4X4; otherwise the
 /// luma tx clamped to the largest tx of the subsampled (chroma) block size.
-fn uv_tx_size(bsize: usize, tx_size: usize, ss_x: usize, ss_y: usize) -> usize {
+pub(crate) fn uv_tx_size(bsize: usize, tx_size: usize, ss_x: usize, ss_y: usize) -> usize {
     if bsize < BLOCK_8X8 {
         return 0;
     }

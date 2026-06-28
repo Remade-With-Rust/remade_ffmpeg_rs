@@ -117,26 +117,46 @@ became a fast Huffman decoder, not a fast transform.
 **Gate:** round-trip SNR ≥ current; **decode stays bit-exact** (proven, not
 assumed); FFmpeg match preserved; benchmark re-run.
 
-## Phase C — SIMD (the explicit ask)
+## Phase C — Redundancy + vectorization ✅ DONE (2026-06-28)
 
-**Posture (unchanged from `lab::bricks::accel`):** scalar stays the default and
-the correctness oracle; SIMD lives behind a feature flag and is validated against
-its scalar twin on every run. No `unsafe` math without a scalar reference test.
+**Result: encode 32.7× → 39.8× realtime, byte-for-byte identical output (cumulative
+18.8× → 39.8× = 2.1× since the pre-optimisation baseline). 75 tests pass.**
 
-- **Approach:** `std::simd` (portable SIMD) first — one code path covers x86-64
-  (SSE/AVX) and aarch64 (NEON). Drop to `target_feature` intrinsics only where a
-  kernel measurably underperforms. Runtime dispatch via `is_x86_feature_detected!`
-  picking AVX2 / SSE2 / scalar at startup.
-- **C1 — Filterbank kernels.** Vectorize the 512-tap window-fold MAC and the DCT
-  butterflies (B1).
-- **C2 — MDCT/IMDCT butterflies.** Vectorize B2/B3's inner butterflies (4–8 lanes).
-- **C3 — Quantizer line loop.** After A1, the per-line quantize + noise
-  accumulation is a vectorizable map+reduce (gather on the power table, or a
-  vectorized polynomial approximation of `x^0.75`).
-- **C4 — Synthesis filterbank (decode).** Vectorize the decode DCT + window MAC.
+The framing changed once the profiles were in hand. On **stable** Rust `std::simd`
+isn't available, and the Phase-B lesson already showed the dense float loops
+auto-vectorize — so explicit intrinsics would be redundant *and* break the
+byte-identical gate (the round mode / reassociation differ). So Phase C became
+**byte-identical restructures that (a) remove redundant compute and (b) let LLVM
+auto-vectorize** — no `unsafe`, portable to aarch64, provably identical output.
 
-**Gate:** SIMD output matches scalar within tolerance (bit-exact for decode
-integer paths; SNR-equal for float); feature-flag build + scalar build both green.
+Profiling `quantize` (69% of encode) split it: multiply-round loop ~35ms, Huffman
+table search ~56ms. Three bricks, each gated by a reference test + a byte-diff:
+
+- **C-Redundancy-1 — `select` returns its cost.** `best_pair_table`/`select` already
+  compute the winning bit count to pick tables, then discarded it so `cost()`
+  re-walked the spectrum. Return it. Pinned: `select`-cost == `cost()` == `encode()`.
+- **C-Vectorize — branchless `level_from`.** The `if m≤0` guard blocked
+  vectorisation of the per-line quantize loops; clamp in `f64` before the cast.
+  Proven identical to the guarded form over a dense sweep incl. the rounding seam.
+  quantize-lines 36ms → 27ms.
+- **C-Redundancy-2 — histogram table search (the big one).** `best_pair_table`
+  re-walked each region per candidate table. `pair_bits` decomposes exactly as
+  codeword(clamped pair) + sign(nonzero count, *table-independent*) + linbits·(count
+  |v|≥maxc), so **one** region walk → a compact histogram, then every table is
+  costed from it. Gated by `best_pair_table_hist_matches_ref` (4000 random regions;
+  caught a real byte-identity bug — peak must include the uncoded trailing element).
+  **huffman-select 56ms → 15ms (3.7×).**
+
+*Tried and reverted:* swapping the decode synthesis windowing loops for
+vectorisation — bit-identical but no measurable win (synthesis is matrixing-bound
+after B3; the windowing was already small). Per the B3 lesson, not kept.
+
+**Lesson:** the headline wins here were **redundancy elimination + auto-vectorisation**,
+not hand-SIMD. On these workloads explicit intrinsics would buy little over what
+LLVM already does for the dense loops, at the cost of byte-identity and portability.
+Remaining encode cost is the **psychoacoustic FFT (27%)** and the quantize loop +
+`xrpow` `powf`s — candidates for a future explicit-SIMD pass if the byte-identity
+gate is relaxed to SNR/ODG.
 
 ## Phase D — Perceptual quality harness (guardrail, runs alongside A–C)
 
