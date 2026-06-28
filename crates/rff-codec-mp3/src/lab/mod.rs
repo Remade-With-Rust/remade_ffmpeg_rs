@@ -24,6 +24,7 @@
 pub mod bricks;
 pub mod experiment;
 pub mod metrics;
+pub mod quality;
 pub mod quantizer;
 pub mod signals;
 pub mod variant;

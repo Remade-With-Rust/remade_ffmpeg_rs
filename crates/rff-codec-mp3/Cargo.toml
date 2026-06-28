@@ -17,3 +17,7 @@ lab = []
 [[example]]
 name = "mp3lab"
 required-features = ["lab"]
+
+[[example]]
+name = "mp3quality"
+required-features = ["lab"]
