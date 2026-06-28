@@ -59,6 +59,9 @@ rff-codec-openh264 = { workspace = true, optional = true }
 # Build with `--no-default-features` for the pure-Rust scalar path (no `nasm`).
 default = ["h264-asm"]
 h264-asm = ["rff-codec-h264/asm"]
+# Enable `https://` streaming input (rustls + RustCrypto provider, pure Rust).
+# Off by default; pulls the optional TLS dependency tree only when requested.
+https = ["rff-io/https"]
 # Working H.264 via the C openh264 library — an opt-in cross-check / fallback to
 # the default in-house pure-Rust codec. NOT pure Rust; needs a C toolchain.
 h264-openh264 = ["dep:rff-codec-openh264"]

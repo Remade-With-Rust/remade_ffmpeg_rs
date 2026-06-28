@@ -28,3 +28,6 @@ default = []
 # `ffmpeg`/`ffprobe` binaries with `--features h264-openh264` to get H.264 now;
 # off by default so the standard binaries stay 100% Rust.
 h264-openh264 = ["rff/h264-openh264"]
+# Pass-through to enable `https://` streaming input (rustls, pure Rust). Build
+# `ffmpeg`/`ffprobe` with `--features https`. Off by default.
+https = ["rff/https"]

@@ -9,3 +9,14 @@ rust-version.workspace = true
 
 [dependencies]
 rff-core.workspace = true
+# `https` feature only — a pure-Rust, permissively-licensed TLS stack.
+rustls = { workspace = true, optional = true }
+rustls-rustcrypto = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+
+[features]
+# Enable `https://` input via rustls + a RustCrypto crypto provider + the OS
+# trust store. Off by default so the standard build stays C-free, dependency-
+# free, and TLS-free. Plumbed through `rff` and `rff-cli` as their own `https`
+# feature: build the binaries with `cargo build -p rff-cli --features https`.
+https = ["dep:rustls", "dep:rustls-rustcrypto", "dep:rustls-native-certs"]

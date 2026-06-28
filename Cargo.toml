@@ -130,6 +130,19 @@ lewton = "0.10"
 claxon = "0.4"
 # jxl-oxide: pure-Rust JPEG XL decoder (MIT/Apache-2.0) — decode only, no FFI.
 jxl-oxide = "0.12"
+# Optional TLS stack for `https://` input (rff-io `https` feature) — all
+# permissive AND pure-Rust, so it satisfies both project promises:
+#  * rustls (Apache-2.0/ISC/MIT) with NO default provider — `default-features =
+#    false` drops the C `aws-lc-rs` backend (and `ring`); we inject a provider.
+#  * rustls-rustcrypto (MIT/Apache) supplies a CryptoProvider built on the
+#    RustCrypto crates — pure Rust, but pre-1.0 and NOT yet security-audited
+#    (constant-time guarantees are weaker than ring/aws-lc-rs): the accepted
+#    "burden of immaturity" until a hardened pure-Rust provider lands.
+#  * roots come from the OS trust store via rustls-native-certs (Apache/ISC/MIT),
+#    deliberately NOT the MPL-2.0 `webpki-roots` Mozilla bundle.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
+rustls-native-certs = "0.8"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
