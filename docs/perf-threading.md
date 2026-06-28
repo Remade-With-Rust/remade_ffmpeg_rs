@@ -42,20 +42,33 @@ range, reading its own range + the shared refs), then a single-threaded **merge*
 copies each worker's column strip + `mi` range into the frame, and sums the
 `counts`. No `unsafe`, threads via `std::thread::scope`.
 
-## Step plan (each step keeps 315/315 green)
+## First cut: clone-per-tile — built, verified, **rejected on perf**
 
-1. **Extract** the per-tile-column decode (`decode_tiles`' inner loop) into a unit
-   that takes explicit per-tile state instead of `self` fields — still called
-   serially. Verify: identical output, 315/315 unchanged.
-2. **Run the units on `std::thread::scope`** with per-tile scratch + the merge
-   step. Verify: 315/315 unchanged; measure speedup on the 4-tile clip.
-3. **Thread the loop filter** (by column strips, with boundary handling) — the
-   second ~2× toward the ~4× ceiling.
-4. A `threads` knob (default = available parallelism, `1` = today's path) and a
-   benchmark row.
+The pragmatic first cut cloned the whole `Reconstructor` per tile column
+(`#[derive(Clone)]`), decoded each on `std::thread::scope`, and merged the pixel
+strips + `mi`/seg ranges + `CountAdd`-summed counts back. It was **bit-exact —
+11/11 conformance vectors, including the multi-tile `tile-4x4`/`tile_1x*`** — so
+the whole parallel-decode-and-merge mechanism is proven correct.
+
+But it was **~3× slower** on the 4-tile 720p clip (105 vs ~315–390 Mpixels/s).
+The deep clone copies the full frame state — padded planes (~5 MB) + the
+mode-info grid (~1 MB) — **~25 MB per frame**, which costs more than the
+parallelism saves at these frame sizes. Reverted; the lesson is the deliverable:
+**a tile worker must not own a full-frame copy.**
+
+## Next: no-clone state-extraction
+
+Split `Reconstructor` into shared read-only (`fc`, `refs`, dq, header) borrowed
+by all workers, and a small per-tile `TileState` (bool decoder, left/above
+contexts, `dqcoeff`/`token_cache`, counts) threaded through the decode methods.
+Workers write into **tile-width scratch** (≈1/Ntiles the memory, with a
+column-offset coordinate translation) — *not* a full-frame buffer — then merge.
+This is more refactor (≈15 method signatures) but removes the copy that sank the
+first cut.
 
 ## Verification
 
-Every step: the full libvpx conformance set stays **315/315 bit-exact**, and the
-`cargo bench -p rff-codec-vp9` number is recorded. Threading that changes a
+Every step: the conformance gate (`crates/rff/tests/vp9_conformance.rs`) stays
+**bit-exact** (315/315 with the full set; 11/11 with the tile-focused set), and
+the `cargo bench -p rff-codec-vp9` number is recorded. Threading that changes a
 single output pixel is a bug, not an optimization.
