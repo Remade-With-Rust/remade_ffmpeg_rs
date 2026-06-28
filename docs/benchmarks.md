@@ -35,11 +35,24 @@ conformance vectors) and **memory-safe**, but **~5–6× slower** than ffmpeg's
 decades-tuned native decoder, single-thread. That's a respectable *starting*
 point for a young pure-Rust decoder — not parity, and we don't claim it.
 
-**Why, and the headroom:** the hand-written **AVX2** kernels (runtime-detected,
-so on by default here) cover inter-prediction and the loop filter; the
-transform, intra-prediction, and entropy-decode paths are still scalar
-(auto-vectorized — `target-cpu=native` alone buys ~30%). Optimizing those hot
-paths, plus frame/tile threading, is the obvious next gain.
+**Where the time goes (profiled, this clip):**
+
+| Phase | Share | Already SIMD? |
+|-------|------:|---------------|
+| Inter prediction (sub-pixel motion comp) | **~53%** | yes (AVX2) |
+| Loop filter (deblocking) | **~41%** | yes (AVX2) |
+| Inverse transform | ~2% | no (scalar) |
+| Intra prediction | ~2% | no (scalar) |
+| Entropy / token decode | ~2% | no (scalar) |
+
+The surprising, measured result: **motion compensation and the loop filter are
+~94% of decode** — and both already use hand-written AVX2. The scalar paths
+(transform / intra / entropy) are a rounding error, so optimizing *them* would
+do nothing. The real headroom is in the two SIMD kernels themselves (the same
+places FFmpeg has spent decades), plus reducing per-block dispatch overhead and
+adding frame/tile threading. `target-cpu=native` buys ~30% by improving the
+non-kernel glue. This is a focused, bit-exact-critical optimization project, not
+a quick win — but now it's pointed at the right 94%.
 
 ## Caveats
 
