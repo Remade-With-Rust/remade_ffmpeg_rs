@@ -1,11 +1,12 @@
-# cargo-fuzz harness for the demuxers. Detached from the main workspace (its own
-# empty [workspace] table) so libfuzzer-sys never enters the normal build or the
-# cargo-deny graph. Runs on Linux/macOS (libfuzzer needs clang's sanitizer
-# runtime; Windows/MSVC is unsupported):
+# cargo-fuzz harness for the demuxers + decoders. Detached from the main
+# workspace (its own empty [workspace] table) so libfuzzer-sys never enters the
+# normal build or the cargo-deny graph. Runs on Linux/macOS (libfuzzer needs
+# clang's sanitizer runtime; Windows/MSVC is unsupported):
 #
 #   cargo install cargo-fuzz
 #   cargo +nightly fuzz run demux            # fuzz the demuxers
-#   cargo +nightly fuzz run demux -- -runs=100000   # bounded run (CI)
+#   cargo +nightly fuzz run decode           # fuzz the decoders
+#   cargo +nightly fuzz run decode -- -runs=100000   # bounded run (CI)
 [package]
 name = "rff-fuzz"
 version = "0.0.0"
@@ -18,10 +19,18 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 rff = { path = ".." }
+rff-core = { path = "../../rff-core" }
 
 [[bin]]
 name = "demux"
 path = "fuzz_targets/demux.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
 test = false
 doc = false
 bench = false
