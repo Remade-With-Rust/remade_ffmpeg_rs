@@ -34,6 +34,11 @@ mod frame;
 mod header;
 mod tables;
 
+/// MP3 encoder experiment harness — brick tracking, corpus, metrics, variant
+/// sweeps. Opt-in behind the `lab` feature; see docs/mp3-lab.md.
+#[cfg(feature = "lab")]
+pub mod lab;
+
 pub use decode::Mp3Decode;
 pub use encode::Mp3Encode;
 use header::FrameHeader;
