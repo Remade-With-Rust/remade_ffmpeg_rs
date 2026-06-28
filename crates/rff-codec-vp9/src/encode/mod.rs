@@ -13,11 +13,15 @@
 mod adapt;
 mod bitwriter;
 mod prob;
+mod quantize;
+mod transform;
 
 pub(crate) use bitwriter::{BitWriter, BoolEncoder};
 pub(crate) use prob::{
     diff_update_encode, encode_term_subexp, forward_remap_prob, update_mv_prob_encode,
 };
+pub(crate) use quantize::quantize;
+pub(crate) use transform::forward_transform;
 
 #[cfg(test)]
 mod tests {

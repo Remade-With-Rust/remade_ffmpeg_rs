@@ -148,14 +148,37 @@ fn region_bounds(gi: &GranuleSideInfo, sfb: &[u16; 23], bv2: usize) -> (usize, u
     }
 }
 
+/// Largest magnitude a pair table can represent: `dim−1` plus the linbits escape
+/// range. A table can't code a region whose peak exceeds this.
+fn pair_table_max(t: &PairTable) -> i32 {
+    if t.dim == 0 {
+        return 0; // the empty table codes only (0, 0)
+    }
+    let maxc = t.dim as i32 - 1;
+    if t.linbits == 0 {
+        maxc
+    } else {
+        maxc + (1i32 << t.linbits) - 1
+    }
+}
+
 /// Cheapest pair table covering `coeffs[lo..hi]` (an even-aligned region).
+///
+/// **A3** — only tables whose range covers the region's peak magnitude are costed;
+/// the rest can't represent it (`estimate_bits` would score them "infinity"
+/// anyway), so skipping them in O(1) avoids walking the region per dead table.
+/// Output-identical to costing all 32.
 fn best_pair_table(coeffs: &[i32; GRANULE_LINES], lo: usize, hi: usize) -> u8 {
     if lo >= hi {
         return 0;
     }
     let slice = &coeffs[lo..hi];
+    let peak = slice.iter().map(|c| c.unsigned_abs()).max().unwrap_or(0) as i32;
     let mut best = (usize::MAX, 0u8);
     for table in 0u8..PAIR_TABLES.len() as u8 {
+        if pair_table_max(PAIR_TABLES[table as usize]) < peak {
+            continue; // can't code this region's peak — would cost "infinity"
+        }
         let cost = estimate_bits(slice, table);
         if cost < best.0 {
             best = (cost, table);
@@ -270,16 +293,10 @@ pub fn windowed_table_select(coeffs: &[i32; GRANULE_LINES], bv2: usize) -> [u8; 
     ]
 }
 
-/// Huffman bit cost of a short-block coefficient set.
+/// Huffman bit cost of a short-block coefficient set (A2: counted, not emitted).
 pub fn cost_short(header: &FrameHeader, coeffs: &[i32; GRANULE_LINES]) -> usize {
     let side = select(header, coeffs, BlockType::Short);
-    let q = QuantizedGranule {
-        coeffs: *coeffs,
-        side,
-        scalefactors: [0; 39],
-    };
-    let mut w = BitWriter::new();
-    encode(&q, header, &mut w)
+    cost(&side, coeffs, header)
 }
 
 // ── B3: emit the whole spectrum ───────────────────────────────────────────────
@@ -339,6 +356,49 @@ pub fn encode(quant: &QuantizedGranule, header: &FrameHeader, writer: &mut BitWr
     }
 
     writer.bit_len() - start
+}
+
+/// **A2** — bit cost of encoding `coeffs` under layout `gi`, counted without
+/// emitting. Walks the exact regions [`encode`] does and sums [`pair_bits`] /
+/// [`quad_bits`] (which equal the bits those coordinates emit), so the rate loop
+/// can probe a gain without allocating a `BitWriter` or writing any codewords.
+/// Returns the same value [`encode`] would return — pinned by a test.
+pub fn cost(gi: &GranuleSideInfo, coeffs: &[i32; GRANULE_LINES], header: &FrameHeader) -> usize {
+    let sfb = tables::sfb_long_offsets(header.sample_rate);
+    let bv2 = (gi.big_values as usize * 2).min(GRANULE_LINES);
+    let (r1, r2) = region_bounds(gi, sfb, bv2);
+    let mut bits = 0usize;
+
+    let mut i = 0;
+    while i + 1 < bv2 {
+        let t = if i < r1 {
+            gi.table_select[0]
+        } else if i < r2 {
+            gi.table_select[1]
+        } else {
+            gi.table_select[2]
+        } as usize;
+        let pt = PAIR_TABLES[t.min(PAIR_TABLES.len() - 1)];
+        bits =
+            bits.saturating_add(pair_bits(pt, coeffs[i], coeffs[i + 1]).unwrap_or(usize::MAX / 4));
+        i += 2;
+    }
+
+    let quad = if gi.count1table_select {
+        &QUAD_B
+    } else {
+        &QUAD_A
+    };
+    let rzero = coeffs
+        .iter()
+        .rposition(|&c| c != 0)
+        .map_or(0, |x| x + 1)
+        .max(bv2);
+    while i + 4 <= GRANULE_LINES && i < rzero {
+        bits += quad_bits(quad, coeffs[i], coeffs[i + 1], coeffs[i + 2], coeffs[i + 3]);
+        i += 4;
+    }
+    bits
 }
 
 #[cfg(test)]
@@ -431,6 +491,48 @@ mod tests {
             *v = (r % 11) - 5; // -5..5
         }
         round_trip(c);
+    }
+
+    /// A2 invariant: the count-only `cost` must equal what `encode` actually
+    /// writes, for every layout the rate loop might probe.
+    fn assert_cost_matches(coeffs: [i32; GRANULE_LINES]) {
+        let header = hdr();
+        for bt in [BlockType::Long, BlockType::Short] {
+            let side = select(&header, &coeffs, bt);
+            let q = QuantizedGranule {
+                coeffs,
+                side: side.clone(),
+                scalefactors: [0; 39],
+            };
+            let mut w = BitWriter::new();
+            let emitted = encode(&q, &header, &mut w);
+            assert_eq!(
+                cost(&side, &coeffs, &header),
+                emitted,
+                "cost vs encode ({bt:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn cost_matches_encoded_bits() {
+        let mut dense = [0i32; GRANULE_LINES];
+        let mut s = 0x1234_5678u32;
+        for v in dense.iter_mut().take(530) {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = ((s >> 23) as i32 % 21) - 10; // -10..10, exercises pairs+escapes+count1
+        }
+        assert_cost_matches(dense);
+
+        let mut esc = [0i32; GRANULE_LINES];
+        esc[0] = 700;
+        esc[1] = -512;
+        esc[2] = 40;
+        esc[3] = -1;
+        esc[4] = 1;
+        assert_cost_matches(esc);
+
+        assert_cost_matches([0i32; GRANULE_LINES]);
     }
 
     #[test]

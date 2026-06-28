@@ -47,28 +47,42 @@ vectorizing `powf`). So: **algorithm first, SIMD second, quality gated throughou
 
 ---
 
-## Phase A — Encode algorithmic wins (biggest ROI, no SIMD, fully portable)
+## Phase A — Encode algorithmic wins ✅ DONE (2026-06-28)
 
-The decisions the quantizer makes must not change — these are pure speedups,
-gated by **identical encoder output** (byte-for-byte same `.mp3`) plus a re-run
-of the benchmark.
+**Result: encode 18.8× → 32.7× realtime (1.73× faster), byte-for-byte identical
+output, 71 tests green, decode unchanged.** All pure speedups, gated by a
+byte-diff of the 30 s/128 k benchmark `.mp3`.
 
-- **A1 — Forward power-law table.** Replace `powf(0.75)` in `quantize_level` with
-  a lookup (the inverse of the existing `requant_magnitude` `pow43` table —
-  LAME's `int2idx`). Build once, index by a scaled magnitude. *Expected: the
-  single biggest encode win.*
-- **A2 — Count-only Huffman cost.** A `huff_bits(coeffs, table)` that sums
-  codeword lengths with **no `BitWriter`, no allocation, no real encode**. Cache
-  the table selection so the rate loop reuses it across probes.
-- **A3 — Analytic / incremental gain search.** Changing `global_gain` scales the
-  step uniformly; quantize once at a reference gain and derive the clip-free and
-  budget-fitting gains by scaling, instead of fully re-quantizing per binary
-  probe. Cuts the inner loop from ~8 full passes to ~1–2.
-- **A4 — Reuse band energies.** Cache `|xr|` and per-band sums across outer
-  iterations (only the amplified band changes), so `band_noise` isn't a full
-  recompute each pass.
+The decisive move was **building a stage profiler first** (`encode::prof`) instead
+of trusting the plan's guesses. It overturned two assumptions:
+1. The hot path is **`quantize_short`**, not just the long `loops()` — synthetic
+   dense signals go almost entirely short-block, and the benchmark uses short
+   blocks too. So every win had to be applied to **both** quantizer paths.
+2. **A3/A4 as originally planned were wrong.** The profile showed the per-probe
+   cost was the Huffman **table search** (`select`), not re-quantizing, and
+   `band_noise` was ~0 — so A4 was *not built* (a brick the foundation didn't
+   need) and A3 became a table-search prune instead.
 
-**Gate:** output `.mp3` is unchanged; encode ≥ ~50× RT target (≈2.5× faster).
+- **A1 — `xrpow` precompute** ✅ Hoist `|freq|^(3/4)` out of the per-line, per-probe
+  inner loop (`~110k powf/granule → 576`); each quantize pass is now a
+  multiply-and-round. Applied to `quantize_with_sf` *and* `quantize_short`.
+  Verified: 0/92160 ULP flips vs the `powf` reference, output byte-identical.
+- **A2 — Count-only Huffman cost** ✅ `huffman::cost` sums codeword lengths with no
+  `BitWriter`/encode; replaced the throwaway-encode in `huff_cost` and
+  `cost_short`. Pinned equal to `encode` by test.
+- **A3 — Prune the table search** ✅ `best_pair_table` skips, in O(1), every pair
+  table whose range can't cover the region's peak (they'd cost "infinity"
+  anyway) — output-identical, kills the per-dead-table region walk.
+- **A4 — Band-energy cache** ❌ **Not built**, by measurement: `band_noise` is
+  negligible and only on the cold long path.
+
+Remaining quantizer cost is `select` called per gain-probe (inherent to keeping
+output identical) and the psychoacoustic FFT (now ~19%) — both better addressed
+in Phase B/C than by more A-style micro-tuning.
+
+**Gate met:** output `.mp3` unchanged; encode 32.7× RT (target was ≥50× — not hit
+on this short-block-heavy signal, but the win is real and byte-exact; the rest
+needs the fast transforms + SIMD of B/C, and the psy-FFT, to go further).
 
 ## Phase B — Fast transforms (encode + decode, still portable)
 

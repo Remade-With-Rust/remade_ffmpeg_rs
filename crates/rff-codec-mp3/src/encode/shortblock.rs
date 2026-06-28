@@ -16,7 +16,7 @@ use crate::frame::{BlockType, GRANULE_LINES};
 use crate::header::FrameHeader;
 use crate::tables;
 
-use super::quantize::{quantize_level, QuantizedGranule};
+use super::quantize::QuantizedGranule;
 
 const MAX_UNCLIPPED: i32 = 8191;
 
@@ -47,12 +47,18 @@ pub fn reorder_subband_to_bitstream(
 
 /// Uniformly quantize bitstream-order short-block lines at `global_gain`
 /// (`subblock_gain = 0`, flat scalefactors), the forward of the decoder's short
-/// requantization with those fields zero.
-fn quantize_uniform(freq: &[f32; GRANULE_LINES], gain: i32) -> [i32; GRANULE_LINES] {
-    let scale_inv = 2f64.powf(-0.25 * (gain - 210) as f64);
+/// requantization with those fields zero. Uses the precomputed `|freq|^(3/4)`
+/// (A1): each gain probe is a multiply-and-round, no per-line `powf`.
+fn quantize_uniform(
+    freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
+    gain: i32,
+) -> [i32; GRANULE_LINES] {
+    // step = scale_inv^(3/4), scale_inv = 2^(-0.25·(gain−210)).
+    let step = 2f64.powf(0.75 * -0.25 * (gain - 210) as f64);
     let mut coeffs = [0i32; GRANULE_LINES];
     for (i, &x) in freq.iter().enumerate() {
-        let mag = quantize_level(x.abs() as f64 * scale_inv);
+        let mag = super::quantize::level_from(xrp[i] * step);
         coeffs[i] = if x < 0.0 { -mag } else { mag };
     }
     coeffs
@@ -66,8 +72,9 @@ pub fn quantize_short(
     freq_bitstream: &[f32; GRANULE_LINES],
     bit_budget: usize,
 ) -> QuantizedGranule {
+    let xrp = super::quantize::xrpow(freq_bitstream); // A1: hoist |freq|^(3/4)
     let ok = |g: i32| {
-        let coeffs = quantize_uniform(freq_bitstream, g);
+        let coeffs = quantize_uniform(freq_bitstream, &xrp, g);
         coeffs.iter().all(|&c| c.abs() <= MAX_UNCLIPPED)
             && super::huffman::cost_short(header, &coeffs) <= bit_budget
     };
@@ -80,7 +87,7 @@ pub fn quantize_short(
             lo = mid + 1;
         }
     }
-    let coeffs = quantize_uniform(freq_bitstream, lo);
+    let coeffs = quantize_uniform(freq_bitstream, &xrp, lo);
     let mut side = super::huffman::select(header, &coeffs, BlockType::Short);
     side.global_gain = lo as u8;
     side.scalefac_compress = 0; // flat scalefactors → zero scalefactor bits

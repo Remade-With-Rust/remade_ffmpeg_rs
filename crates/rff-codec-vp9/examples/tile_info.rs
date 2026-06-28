@@ -7,16 +7,21 @@ use std::io::Read;
 use rff_codec_vp9::{parse_uncompressed_header, BitReader};
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: tile_info <file.ivf>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: tile_info <file.ivf>");
     let mut data = Vec::new();
-    std::fs::File::open(&path).unwrap().read_to_end(&mut data).unwrap();
+    std::fs::File::open(&path)
+        .unwrap()
+        .read_to_end(&mut data)
+        .unwrap();
 
     let header_len = u16::from_le_bytes([data[6], data[7]]) as usize;
     let mut pos = header_len;
     let mut frame = 0;
     while pos + 12 <= data.len() && frame < 2 {
-        let size = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-            as usize;
+        let size =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 12;
         let fdata = &data[pos..pos + size];
         pos += size;

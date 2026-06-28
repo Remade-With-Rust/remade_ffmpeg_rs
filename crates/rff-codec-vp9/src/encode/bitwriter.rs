@@ -66,7 +66,8 @@ impl BoolEncoder {
                     self.out[x as usize] += 1;
                 }
             }
-            self.out.push(((low >> ((24 - offset) as u32)) & 0xff) as u8);
+            self.out
+                .push(((low >> ((24 - offset) as u32)) & 0xff) as u8);
             low <<= offset as u32;
             shift = count;
             low &= 0x00ff_ffff;
@@ -265,7 +266,10 @@ mod tests {
         let bytes = enc.finish();
         let mut dec = BoolDecoder::new(&bytes).unwrap();
         for sym in syms {
-            assert_eq!(crate::token::read_tree(&mut dec, &PARTITION_TREE, &probs), sym);
+            assert_eq!(
+                crate::token::read_tree(&mut dec, &PARTITION_TREE, &probs),
+                sym
+            );
         }
     }
 

@@ -836,8 +836,15 @@ mod tests {
         // the scalar tail for w=4 — across all four subpel cases. `avg=true` must
         // equal `(mc + dst0 + 1) >> 1` where `mc` is the same block with avg=false.
         let stride = 48usize;
-        let buf: Vec<u16> = (0..stride * 48).map(|i| ((i * 7 + 13) % 256) as u16).collect();
-        let refp = RefPlane { buf: &buf, stride, w: 48, h: 48 };
+        let buf: Vec<u16> = (0..stride * 48)
+            .map(|i| ((i * 7 + 13) % 256) as u16)
+            .collect();
+        let refp = RefPlane {
+            buf: &buf,
+            stride,
+            w: 48,
+            h: 48,
+        };
         let max = 255;
         for &(sx, sy) in &[(0usize, 0usize), (8, 0), (0, 8), (8, 8), (4, 12)] {
             for &w in &[4usize, 8, 16] {
@@ -856,7 +863,10 @@ mod tests {
                     .map(|(&a, &b)| ((a as i32 + b as i32 + 1) >> 1) as u16)
                     .collect();
 
-                assert_eq!(dst_avg, manual, "compound mismatch: subpel ({sx},{sy}), w={w}");
+                assert_eq!(
+                    dst_avg, manual,
+                    "compound mismatch: subpel ({sx},{sy}), w={w}"
+                );
             }
         }
     }

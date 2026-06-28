@@ -54,12 +54,34 @@ pub fn requant_magnitude(level: i32) -> f64 {
 /// under unit step: `ix = nint(|xr|^(3/4) − BIAS)`, clamped to `[0, MAX_LEVEL]`.
 /// The sign is carried separately, exactly as the bitstream does.
 pub fn quantize_level(xr: f64) -> i32 {
-    let m = xr.abs().powf(0.75) - QUANT_BIAS;
+    level_from(xr.abs().powf(0.75))
+}
+
+/// Round a pre-powered magnitude `p = |xr|^(3/4)` to its quantized level:
+/// `nint(p − BIAS)`, clamped to `[0, MAX_LEVEL]`. Factored out so the hot rate
+/// loop can supply `p` from a precomputed `|xr|^(3/4)` (see [`xrpow`]) instead of
+/// calling `powf` per line per gain probe.
+#[inline]
+pub(crate) fn level_from(powered: f64) -> i32 {
+    let m = powered - QUANT_BIAS;
     if m <= 0.0 {
         0
     } else {
         (m.round() as i32).clamp(0, MAX_LEVEL)
     }
+}
+
+/// **A1** — precompute `|freq[i]|^(3/4)` for the whole granule, once. The forward
+/// quantizer needs `(|freq|·scale)^(3/4)`; since that equals `|freq|^(3/4)·scale^(3/4)`,
+/// hoisting the per-line `powf` out of the rate/distortion loops turns each later
+/// quantize pass into a multiply-and-round. (The two factor orders differ only by a
+/// last-ULP rounding, which the byte-identical-output gate verifies in practice.)
+pub fn xrpow(freq: &[f32; GRANULE_LINES]) -> [f64; GRANULE_LINES] {
+    let mut p = [0f64; GRANULE_LINES];
+    for (pi, &f) in p.iter_mut().zip(freq.iter()) {
+        *pi = (f.abs() as f64).powf(0.75);
+    }
+    p
 }
 
 /// One granule's quantized output.
@@ -100,6 +122,7 @@ const MAX_OUTER: usize = 24;
 fn quantize_with_sf(
     header: &FrameHeader,
     freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
     gain: i32,
     sf: &[u8; 22],
 ) -> [i32; GRANULE_LINES] {
@@ -108,10 +131,12 @@ fn quantize_with_sf(
     let mut coeffs = [0i32; GRANULE_LINES];
     for b in 0..22 {
         let s = if b < 21 { sf[b] } else { 0 } as f64; // band 21 is uncoded
-        let scale_inv = 2f64.powf(base + SF_MULT * s);
+                                                       // step = scale_inv^(3/4): the per-band factor applied to the precomputed
+                                                       // |freq|^(3/4), instead of re-powering |freq|·scale_inv per line.
+        let step = 2f64.powf(0.75 * (base + SF_MULT * s));
         let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
         for i in lo..hi {
-            let mag = quantize_level(freq[i].abs() as f64 * scale_inv);
+            let mag = level_from(xrp[i] * step);
             coeffs[i] = if freq[i] < 0.0 { -mag } else { mag };
         }
     }
@@ -174,13 +199,8 @@ fn huff_cost(
     block_type: BlockType,
 ) -> (GranuleSideInfo, usize) {
     let side = super::huffman::select(header, coeffs, block_type);
-    let q = QuantizedGranule {
-        coeffs: *coeffs,
-        side: side.clone(),
-        scalefactors: [0; 39],
-    };
-    let mut w = crate::bitio::BitWriter::new();
-    let bits = super::huffman::encode(&q, header, &mut w);
+    // A2: count bits directly instead of encoding into a throwaway BitWriter.
+    let bits = super::huffman::cost(&side, coeffs, header);
     (side, bits)
 }
 
@@ -189,12 +209,13 @@ fn huff_cost(
 fn inner_gain(
     header: &FrameHeader,
     freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
     sf: &[u8; 22],
     huff_budget: usize,
     block_type: BlockType,
 ) -> i32 {
     let ok = |g: i32| {
-        let coeffs = quantize_with_sf(header, freq, g, sf);
+        let coeffs = quantize_with_sf(header, freq, xrp, g, sf);
         coeffs.iter().all(|&c| c.abs() <= MAX_UNCLIPPED)
             && huff_cost(header, &coeffs, block_type).1 <= huff_budget
     };
@@ -224,13 +245,14 @@ pub fn loops(
 ) -> QuantizedGranule {
     let mut sf = [0u8; 22];
     let mut best: Option<(f32, QuantizedGranule)> = None;
+    let xrp = xrpow(freq);
 
     for _ in 0..MAX_OUTER {
         let (compress, sf_bits) = choose_compress(&sf);
         let huff_budget = bit_budget.saturating_sub(sf_bits);
 
-        let gain = inner_gain(header, freq, &sf, huff_budget, block_type);
-        let coeffs = quantize_with_sf(header, freq, gain, &sf);
+        let gain = inner_gain(header, freq, &xrp, &sf, huff_budget, block_type);
+        let coeffs = quantize_with_sf(header, freq, &xrp, gain, &sf);
         let (mut side, _) = huff_cost(header, &coeffs, block_type);
         side.global_gain = gain as u8;
         side.scalefac_compress = compress;
@@ -269,10 +291,14 @@ pub fn loops(
 
 /// Smallest gain whose flat-scalefactor quantization doesn't clip — the finest
 /// representable step for this spectrum.
-fn nonclip_floor(header: &FrameHeader, freq: &[f32; GRANULE_LINES]) -> i32 {
+fn nonclip_floor(
+    header: &FrameHeader,
+    freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
+) -> i32 {
     let flat = [0u8; 22];
     let ok = |g: i32| {
-        quantize_with_sf(header, freq, g, &flat)
+        quantize_with_sf(header, freq, xrp, g, &flat)
             .iter()
             .all(|&c| c.abs() <= MAX_UNCLIPPED)
     };
@@ -301,8 +327,9 @@ pub fn loops_vbr(
     block_type: BlockType,
 ) -> QuantizedGranule {
     let flat = [0u8; 22];
+    let xrp = xrpow(freq);
     let peak = |g: i32| {
-        let coeffs = quantize_with_sf(header, freq, g, &flat);
+        let coeffs = quantize_with_sf(header, freq, &xrp, g, &flat);
         let noise = band_noise(header, freq, &coeffs, g, &flat);
         noise
             .iter()
@@ -320,12 +347,12 @@ pub fn loops_vbr(
             hi = mid - 1;
         }
     }
-    let gain = lo.max(nonclip_floor(header, freq));
+    let gain = lo.max(nonclip_floor(header, freq, &xrp));
 
     // Distortion loop at the fixed gain: raise the worst over-threshold band.
     let mut sf = [0u8; 22];
     for _ in 0..MAX_OUTER {
-        let coeffs = quantize_with_sf(header, freq, gain, &sf);
+        let coeffs = quantize_with_sf(header, freq, &xrp, gain, &sf);
         let noise = band_noise(header, freq, &coeffs, gain, &sf);
         let mut worst = None;
         let mut worst_nmr = f32::NEG_INFINITY;
@@ -342,7 +369,7 @@ pub fn loops_vbr(
         }
     }
 
-    let coeffs = quantize_with_sf(header, freq, gain, &sf);
+    let coeffs = quantize_with_sf(header, freq, &xrp, gain, &sf);
     let (compress, _) = choose_compress(&sf);
     let mut side = super::huffman::select(header, &coeffs, block_type);
     side.global_gain = gain as u8;
@@ -375,6 +402,62 @@ mod c2_tests {
             original: true,
             emphasis: 0,
         }
+    }
+
+    /// A1 invariant: quantizing via the precomputed `|freq|^(3/4)` table must
+    /// reproduce the per-line `powf` reference. The two differ only by last-ULP
+    /// float rounding, so we allow an off-by-one at a quantization boundary but
+    /// require it to be vanishingly rare (the byte-identical-output gate is the
+    /// real proof; this catches any systematic error).
+    #[test]
+    fn xrpow_path_matches_powf_reference() {
+        let header = hdr();
+        let mut s = 0xABCD_1234u32;
+        let mut total = 0usize;
+        let mut diffs = 0usize;
+        for trial in 0..40 {
+            let mut freq = [0f32; GRANULE_LINES];
+            for f in freq.iter_mut() {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                // magnitudes spanning the quantizer's working range
+                *f = ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0 * 1000.0;
+            }
+            let xrp = xrpow(&freq);
+            let off = crate::tables::sfb_long_offsets(header.sample_rate);
+            for &gain in &[120i32, 180, 210, 230] {
+                let mut sf = [0u8; 22];
+                for (b, sfb) in sf.iter_mut().enumerate() {
+                    *sfb = ((trial + b) % 4) as u8;
+                }
+                let got = quantize_with_sf(&header, &freq, &xrp, gain, &sf);
+                // Reference: the original per-line powf path.
+                let base = -0.25 * (gain - 210) as f64;
+                for b in 0..22 {
+                    let sv = if b < 21 { sf[b] } else { 0 } as f64;
+                    let scale_inv = 2f64.powf(base + SF_MULT * sv);
+                    let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
+                    for i in lo..hi {
+                        let mag = quantize_level(freq[i].abs() as f64 * scale_inv);
+                        let want = if freq[i] < 0.0 { -mag } else { mag };
+                        total += 1;
+                        if got[i] != want {
+                            assert!(
+                                (got[i] - want).abs() <= 1,
+                                "line {i}: table {} vs powf {want} (gain {gain})",
+                                got[i]
+                            );
+                            diffs += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Expect near-perfect agreement: well under 0.1% of lines may ULP-flip.
+        assert!(
+            diffs * 1000 < total,
+            "too many xrpow/powf mismatches: {diffs}/{total}"
+        );
+        eprintln!("[A1] xrpow vs powf: {diffs}/{total} off-by-one (ULP) lines");
     }
 
     #[test]

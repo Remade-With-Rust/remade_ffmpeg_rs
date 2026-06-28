@@ -13,7 +13,7 @@ const DCT_CONST_BITS: i64 = 14;
 /// `cospi_i_64 = round(cos(i·π/64)·2^14)`, i = 1..=31 (`COSPI[0]` unused). These
 /// are the exact VP9 transform constants; the `cospi_constants_match_formula`
 /// test asserts each against the generating formula.
-const COSPI: [i64; 32] = [
+pub(crate) const COSPI: [i64; 32] = [
     0, 16364, 16305, 16207, 16069, 15893, 15679, 15426, 15137, 14811, 14449, 14053, 13623, 13160,
     12665, 12140, 11585, 11003, 10394, 9760, 9102, 8423, 7723, 7005, 6270, 5520, 4756, 3981, 3196,
     2404, 1606, 804,
@@ -399,7 +399,7 @@ pub fn idct32(input: &[i32; 32], output: &mut [i32; 32]) {
 }
 
 /// ADST sine constants `sinpi_i_9`, i = 1..=4 (`SINPI[0]` unused).
-const SINPI: [i64; 5] = [0, 5283, 9929, 13377, 15212];
+pub(crate) const SINPI: [i64; 5] = [0, 5283, 9929, 13377, 15212];
 
 /// 4-point inverse ADST (ISO/VP9 §8.7.1.2), one dimension.
 pub fn iadst4(input: &[i32; 4], output: &mut [i32; 4]) {

@@ -88,12 +88,17 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 
 | Kind | Supported | Status |
 |---|---|---|
+| Video codec | **vp9** (VP9) | **decode** — in-house pure-Rust decoder, **bit-exact against all 315 official libvpx conformance vectors**; profiles 0–3 (4:2:0/4:2:2/4:4:4, 8/10/12-bit), AVX2 + NEON kernels (no encoder; perf tuning to follow) |
+| Video codec | **h264** (H.264 / AVC) | **decode + encode** — [`rusty_h264`](https://crates.io/crates/rusty_h264) with SIMD asm, **default** |
+| Video codec | **AV1** (AV1) | **decode + encode** — [`rav1d`] and ['rav1e'] |
 | Image codec | **avif** (AV1 still image) | **decode + encode**, 8- & 10-bit (rav1d / rav1e) |
 | Image codec | **png** (RGB/RGBA) | **decode + encode** (pure-Rust `png`) |
 | Image codec | **mjpeg** (JPEG/MJPEG) | **decode + encode** (pure-Rust `jpeg-decoder`/`jpeg-encoder`) |
 | Image codec | **gif** | **decode + encode** (pure-Rust `gif`; first frame) |
 | Image codec | **webp** (VP8/VP8L) | **decode + lossless encode** (pure-Rust `image-webp`) |
 | Image codec | **jpegxl** (JPEG XL) | **decode** (pure-Rust `jxl-oxide`; no Rust encoder yet) |
+| Audio codec | **aac** | in-house **AAC-LC decoder**, all features (short blocks, M/S, intensity stereo, PNS, TNS) — verified bit-exact vs FFmpeg |
+| Audio codec | **mp3** (MPEG-1/2 Layer III) | in-house **decoder + encoder** — framework scaffolded (`rff-codec-mp3`), building brick by brick 🚧 |
 | Audio codec | **opus** | **decode + encode** (pure-Rust `opus-rs`) |
 | Audio codec | **vorbis** | **decode** (pure-Rust `lewton`; no permissive Rust encoder exists) |
 | Audio codec | **flac** | **decode** (pure-Rust `claxon`; no permissive Rust encoder exists) |
@@ -104,10 +109,6 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 | Container | **avi** (Audio Video Interleaved) | **demux + mux** (RIFF/`hdrl`/`movi`/`idx1`) |
 | Container | **mp4** / **mov** (ISOBMFF) | **demux + mux** — sample tables; **A/V**: AV1 (`av01`/`av1C`) or H.264 (`avc1`/`avcC`) video + Opus audio (`dOps`); AAC `esds`→config |
 | Container | **matroska** / **webm** (EBML) | **demux** — track tree + Cluster/(Simple)Block packets; AV1/H.264 video + Opus/Vorbis/AAC/FLAC audio |
-| Audio codec | **aac** | in-house **AAC-LC decoder**, all features (short blocks, M/S, intensity stereo, PNS, TNS) — verified bit-exact vs FFmpeg |
-| Audio codec | **mp3** (MPEG-1/2 Layer III) | in-house **decoder + encoder** — framework scaffolded (`rff-codec-mp3`), building brick by brick 🚧 |
-| Video codec | **vp9** (VP9) | **decode** — in-house pure-Rust decoder, **bit-exact against all 315 official libvpx conformance vectors**; profiles 0–3 (4:2:0/4:2:2/4:4:4, 8/10/12-bit), AVX2 + NEON kernels (no encoder; perf tuning to follow) |
-| Video codec | **h264** (H.264 / AVC) | **decode + encode** — [`rusty_h264`](https://crates.io/crates/rusty_h264) with SIMD asm, **default** |
 
 > **H.264 defaults to `rusty_h264` with SIMD asm on** — substantially faster.
 > Like `rav1e`, the speedup is hand-written x86 **assembly, no C** (openh264's

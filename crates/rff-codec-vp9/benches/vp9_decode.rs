@@ -13,15 +13,18 @@ use rff_core::{CodecId, Error, Packet};
 
 /// Split an IVF file into its raw VP9 frames + frame size.
 fn parse_ivf(data: &[u8]) -> (Vec<Vec<u8>>, u32, u32) {
-    assert!(data.len() >= 32 && &data[0..4] == b"DKIF", "not an IVF file");
+    assert!(
+        data.len() >= 32 && &data[0..4] == b"DKIF",
+        "not an IVF file"
+    );
     let header_len = u16::from_le_bytes([data[6], data[7]]) as usize;
     let width = u16::from_le_bytes([data[12], data[13]]) as u32;
     let height = u16::from_le_bytes([data[14], data[15]]) as u32;
     let mut frames = Vec::new();
     let mut pos = header_len;
     while pos + 12 <= data.len() {
-        let size = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-            as usize;
+        let size =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 12; // 4-byte size + 8-byte timestamp
         if pos + size > data.len() {
             break;
@@ -54,18 +57,27 @@ fn decode_all(registry: &CodecRegistry, packets: &[Packet]) -> u64 {
 
 fn main() {
     // Default: the committed 720p clip; override with VP9_BENCH_CLIP=<file.ivf>.
-    let owned = std::env::var("VP9_BENCH_CLIP").ok().map(|p| std::fs::read(p).unwrap());
-    let ivf: &[u8] = owned.as_deref().unwrap_or(include_bytes!("data/vp9_720p.ivf"));
+    let owned = std::env::var("VP9_BENCH_CLIP")
+        .ok()
+        .map(|p| std::fs::read(p).unwrap());
+    let ivf: &[u8] = owned
+        .as_deref()
+        .unwrap_or(include_bytes!("data/vp9_720p.ivf"));
     let (raw_frames, w, h) = parse_ivf(ivf);
-    let packets: Vec<Packet> =
-        raw_frames.iter().map(|f| Packet::from_data(0, f.clone())).collect();
+    let packets: Vec<Packet> = raw_frames
+        .iter()
+        .map(|f| Packet::from_data(0, f.clone()))
+        .collect();
 
     let mut registry = CodecRegistry::new();
     rff_codec_vp9::register(&mut registry);
 
     let decoded = decode_all(&registry, &packets);
     assert!(decoded > 0, "no frames decoded — VP9 input/decoder problem");
-    eprintln!("VP9 decode benchmark: {w}x{h}, {} packets, {decoded} frames/pass", packets.len());
+    eprintln!(
+        "VP9 decode benchmark: {w}x{h}, {} packets, {decoded} frames/pass",
+        packets.len()
+    );
 
     // Warm up (let the branch predictor / caches settle).
     for _ in 0..2 {
