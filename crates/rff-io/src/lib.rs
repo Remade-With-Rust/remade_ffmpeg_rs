@@ -17,12 +17,24 @@
 //! error and the crate pulls in no TLS code at all.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 use rff_core::{Error, Result};
 
 /// Maximum number of HTTP redirects to follow before giving up.
 const MAX_REDIRECTS: usize = 5;
+/// Connect timeout, and per-read/per-write timeout once connected — bounds a
+/// slow or stalled server (e.g. slowloris) instead of hanging forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cap on a single status/header line so a hostile server can't grow one line
+/// without bound and exhaust memory.
+const MAX_HEADER_LINE: u64 = 16 * 1024;
+/// Cap on the number of response header lines.
+const MAX_HEADERS: usize = 100;
+/// Cap on a chunked transfer-encoding size line.
+const MAX_CHUNK_LINE: u64 = 4 * 1024;
 
 /// Is `path` a URL we should fetch over the network rather than open on disk?
 pub fn is_url(path: &str) -> bool {
@@ -79,6 +91,29 @@ fn parse_url(url: &str) -> Result<Url<'_>> {
     Ok(Url { scheme, host, port, path })
 }
 
+/// Resolve `host:port` and connect with a bounded timeout, then arm read/write
+/// timeouts so a stalled peer can't hang the pipeline indefinitely.
+fn connect(host: &str, port: u16) -> Result<TcpStream> {
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| Error::invalid(format!("cannot resolve {host}:{port}: {e}")))?;
+    let mut last_err = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(stream) => {
+                stream.set_read_timeout(Some(IO_TIMEOUT))?;
+                stream.set_write_timeout(Some(IO_TIMEOUT))?;
+                return Ok(stream);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(match last_err {
+        Some(e) => Error::from(e),
+        None => Error::invalid(format!("no addresses resolved for {host}:{port}")),
+    })
+}
+
 /// Connect, run the HTTP exchange, and return a reader over the response body.
 /// `http` goes over a raw TCP stream; `https` wraps it in TLS (feature-gated).
 fn fetch(url: &str, redirects: usize) -> Result<Box<dyn Read + Send>> {
@@ -88,7 +123,7 @@ fn fetch(url: &str, redirects: usize) -> Result<Box<dyn Read + Send>> {
             "https:// needs the `https` feature (rustls); rebuild with `--features https`, or use http://",
         ));
     }
-    let tcp = TcpStream::connect((u.host, u.port))?;
+    let tcp = connect(u.host, u.port)?;
     match u.scheme {
         "http" => exchange(tcp, &u, redirects),
         #[cfg(feature = "https")]
@@ -111,6 +146,18 @@ fn resolve_redirect(base: &Url, loc: &str) -> String {
     }
 }
 
+/// Read one line, bounded to `MAX_HEADER_LINE` bytes, so a server that never
+/// sends a newline can't grow the buffer without limit. Errors if the cap is
+/// hit before the line terminates.
+fn read_capped_line<R: BufRead>(reader: &mut R, line: &mut String) -> Result<usize> {
+    line.clear();
+    let n = (&mut *reader).take(MAX_HEADER_LINE).read_line(line)?;
+    if n as u64 == MAX_HEADER_LINE && !line.ends_with('\n') {
+        return Err(Error::invalid("HTTP header line exceeds limit"));
+    }
+    Ok(n)
+}
+
 /// Perform the HTTP/1.1 `GET` conversation over any read/write stream (plain TCP
 /// or a TLS session) and return a reader positioned at the body. Redirects are
 /// followed by re-dispatching through [`fetch`] (which may switch scheme).
@@ -131,21 +178,25 @@ fn exchange<S: Read + Write + Send + 'static>(
 
     // --- status line ---
     let mut line = String::new();
-    reader.read_line(&mut line)?;
+    read_capped_line(&mut reader, &mut line)?;
     let status: u16 = line
         .split_whitespace()
         .nth(1)
         .and_then(|c| c.parse().ok())
         .ok_or_else(|| Error::invalid(format!("malformed HTTP status line: {line:?}")))?;
 
-    // --- headers ---
+    // --- headers (bounded in both line length and count) ---
     let mut location = None;
     let mut content_length = None;
     let mut chunked = false;
+    let mut header_count = 0usize;
     loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 || line == "\r\n" || line == "\n" {
+        if read_capped_line(&mut reader, &mut line)? == 0 || line == "\r\n" || line == "\n" {
             break;
+        }
+        header_count += 1;
+        if header_count > MAX_HEADERS {
+            return Err(Error::invalid("too many HTTP response headers"));
         }
         if let Some((name, value)) = line.split_once(':') {
             let (name, value) = (name.trim().to_ascii_lowercase(), value.trim());
@@ -244,7 +295,13 @@ impl<R: BufRead> ChunkedReader<R> {
     /// Read the next `len\r\n` size line, setting `remaining`.
     fn next_size(&mut self) -> std::io::Result<()> {
         let mut line = String::new();
-        self.inner.read_line(&mut line)?;
+        let n = (&mut self.inner).take(MAX_CHUNK_LINE).read_line(&mut line)?;
+        if n as u64 == MAX_CHUNK_LINE && !line.ends_with('\n') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "chunk size line too long",
+            ));
+        }
         // Ignore any chunk extensions after `;`, parse the hex length.
         let hex = line.trim().split(';').next().unwrap_or("").trim();
         self.remaining = u64::from_str_radix(hex, 16)
@@ -327,5 +384,64 @@ mod tests {
             .read_to_string(&mut out)
             .unwrap();
         assert_eq!(out, "Wikipedia");
+    }
+
+    /// A duplex stream: serves a canned response, swallows the request — enough
+    /// to drive `exchange` offline.
+    struct Mock {
+        resp: Cursor<Vec<u8>>,
+    }
+    impl Read for Mock {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            self.resp.read(b)
+        }
+    }
+    impl Write for Mock {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn serve(resp: &[u8]) -> Mock {
+        Mock { resp: Cursor::new(resp.to_vec()) }
+    }
+
+    #[test]
+    fn exchange_reads_a_content_length_body() {
+        let u = parse_url("http://h/x").unwrap();
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloEXTRA";
+        let mut body = String::new();
+        exchange(serve(resp), &u, 0)
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        assert_eq!(body, "hello"); // bounded to Content-Length, ignores trailing bytes
+    }
+
+    #[test]
+    fn exchange_rejects_an_unbounded_header_line() {
+        let u = parse_url("http://h/x").unwrap();
+        let bomb = "a".repeat((MAX_HEADER_LINE as usize) + 4096);
+        let resp = format!("HTTP/1.1 200 OK\r\nX-Bomb: {bomb}\r\n\r\n");
+        match exchange(serve(resp.as_bytes()), &u, 0) {
+            Err(e) => assert!(e.to_string().contains("exceeds limit"), "got: {e}"),
+            Ok(_) => panic!("an unbounded header line should be rejected"),
+        }
+    }
+
+    #[test]
+    fn exchange_rejects_too_many_headers() {
+        let u = parse_url("http://h/x").unwrap();
+        let mut resp = String::from("HTTP/1.1 200 OK\r\n");
+        for i in 0..(MAX_HEADERS + 10) {
+            resp.push_str(&format!("X-H{i}: v\r\n"));
+        }
+        resp.push_str("\r\n");
+        match exchange(serve(resp.as_bytes()), &u, 0) {
+            Err(e) => assert!(e.to_string().contains("too many"), "got: {e}"),
+            Ok(_) => panic!("an over-long header list should be rejected"),
+        }
     }
 }
