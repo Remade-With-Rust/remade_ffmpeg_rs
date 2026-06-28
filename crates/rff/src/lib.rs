@@ -83,6 +83,7 @@ fn register_builtin_formats(formats: &mut FormatRegistry) {
     rff_format_wav::register(formats);
     rff_format_ogg::register(formats);
     rff_format_flac::register(formats);
+    rff_format_mp3::register(formats);
     rff_format_jxl::register(formats);
     rff_format_mp4::register(formats);
     rff_format_mkv::register(formats);

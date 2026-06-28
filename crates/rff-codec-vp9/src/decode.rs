@@ -720,7 +720,7 @@ fn read_bit(b: &mut BoolDecoder) -> u32 {
 }
 
 /// `decode_term_subexp` (libvpx) — the sub-exponential magnitude for a prob update.
-fn decode_term_subexp(b: &mut BoolDecoder) -> u32 {
+pub(crate) fn decode_term_subexp(b: &mut BoolDecoder) -> u32 {
     if read_bit(b) == 0 {
         return b.literal(4);
     }
@@ -739,7 +739,7 @@ fn decode_term_subexp(b: &mut BoolDecoder) -> u32 {
 }
 
 /// `vp9_diff_update_prob` — conditionally update a probability in place.
-fn diff_update(b: &mut BoolDecoder, p: &mut u8) {
+pub(crate) fn diff_update(b: &mut BoolDecoder, p: &mut u8) {
     if b.read_bool(252) == 1 {
         let delta = decode_term_subexp(b) as i32;
         *p = inv_remap_prob(delta, *p as i32);

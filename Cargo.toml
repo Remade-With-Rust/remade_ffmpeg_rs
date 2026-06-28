@@ -32,6 +32,7 @@ default-members = [
     "crates/rff-format-wav",
     "crates/rff-format-ogg",
     "crates/rff-format-flac",
+    "crates/rff-format-mp3",
     "crates/rff-format-jxl",
     "crates/rff-format-mp4",
     "crates/rff-format-mkv",
@@ -88,6 +89,7 @@ rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.0.1" }
 rff-format-wav = { path = "crates/rff-format-wav", version = "0.0.1" }
 rff-format-ogg = { path = "crates/rff-format-ogg", version = "0.0.1" }
 rff-format-flac = { path = "crates/rff-format-flac", version = "0.0.1" }
+rff-format-mp3 = { path = "crates/rff-format-mp3", version = "0.0.1" }
 rff-format-jxl = { path = "crates/rff-format-jxl", version = "0.0.1" }
 rff-format-mp4 = { path = "crates/rff-format-mp4", version = "0.0.1" }
 rff-format-mkv = { path = "crates/rff-format-mkv", version = "0.0.1" }

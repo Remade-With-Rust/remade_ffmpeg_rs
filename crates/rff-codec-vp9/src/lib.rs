@@ -17,6 +17,8 @@ mod adapt;
 mod bits;
 mod block;
 mod decode;
+#[allow(dead_code, unused_imports)] // Foundation API; consumed from plan Floor 1+.
+mod encode;
 mod geom_tables;
 mod inter;
 mod loopfilter;
