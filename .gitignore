@@ -5,3 +5,6 @@ dist/
 .DS_Store
 # Build artifacts from the Dioxus UI
 crates/rff-ui/dist/
+
+# Local-only Claude skills (not deployed to open source)
+.claude/skills/
