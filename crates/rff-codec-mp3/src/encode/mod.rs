@@ -10,12 +10,13 @@
 //! bricks — they decide block type and how to shape quantization noise under the
 //! masking threshold, the way LAME does. Everything else is mechanical.
 
-use rff_core::{Error, Result};
+use rff_core::Result;
 
 use crate::bitio::BitWriter;
-use crate::frame::{SideInfo, GRANULE_LINES};
+use crate::frame::{GranuleSideInfo, SideInfo, GRANULE_LINES};
 use crate::header::FrameHeader;
 
+pub mod antialias;
 pub mod bitstream;
 pub mod filterbank;
 pub mod huffman;
@@ -48,32 +49,41 @@ impl Mp3Encode {
         Mp3Encode::default()
     }
 
-    /// Encode one frame of interleaved PCM into an MP3 frame. The orchestration
-    /// is the wiring diagram; each stage is a brick still to be laid.
+    /// Encode one frame of **mono** PCM (`granules × 576` samples) into an MP3
+    /// frame: per granule, analysis filterbank → forward MDCT → rate-loop quantize
+    /// → Huffman, then assemble (reservoir-free). The dumb-but-valid Floor-3 path.
     pub fn encode_frame(&mut self, header: &FrameHeader, pcm: &[f32]) -> Result<Vec<u8>> {
-        let channels = header.channel_mode.channels();
         let granules = header.version.granules();
-        let bit_budget = header.frame_size() * 8;
+        let region_bits = bitstream::region_capacity(header) * 8;
+        let budget_per_gr = region_bits / granules;
 
-        let mut writer = BitWriter::new();
         let mut side = SideInfo::default();
+        let mut main = BitWriter::new();
         for gr in 0..granules {
-            for ch in 0..channels {
-                let sub = filterbank::analyze(pcm, &mut self.analysis_fifo[ch]);
-                let psy = psychoacoustic::analyze(pcm);
-                let freq = mdct::forward(&sub, psy.block_type, &mut self.mdct_overlap[ch]);
-                let quant = quantize::loops(&freq, &psy, bit_budget / (granules * channels));
-                huffman::encode(&quant, header, &mut writer);
-                side.granules[gr][ch] = quant.side.clone();
-            }
+            let gpcm = &pcm[gr * GRANULE_LINES..];
+            let sub = filterbank::analyze(gpcm, &mut self.analysis_fifo[0]);
+            let psy = psychoacoustic::analyze(gpcm);
+            let mut freq = mdct::forward(&sub, psy.block_type, &mut self.mdct_overlap[0]);
+            // Forward alias butterflies — the inverse of the decoder's reduce(),
+            // which it applies before the IMDCT.
+            let block = GranuleSideInfo {
+                window_switching: psy.block_type != crate::frame::BlockType::Long,
+                block_type: psy.block_type,
+                ..Default::default()
+            };
+            antialias::expand(&block, &mut freq);
+            let quant = quantize::loops(header, &freq, &psy, budget_per_gr);
+            // Scalefactors are zero-length (flat), so main data is just the Huffman
+            // bits; `part2_3_length` (set by the rate loop) records their count.
+            huffman::encode(&quant, header, &mut main);
+            side.granules[gr][0] = quant.side;
         }
-        let main_data = writer.finish();
-        let frame = bitstream::format(header, &side, &main_data, &mut self.reservoir);
-        Ok(frame)
+        let main_data = main.finish();
+        Ok(bitstream::format(
+            header,
+            &side,
+            &main_data,
+            &mut self.reservoir,
+        ))
     }
-}
-
-/// Entry used by the public encoder once the bricks are in place.
-pub fn encode_frame_stub() -> Result<()> {
-    Err(Error::Unimplemented("mp3 encode: pipeline not yet built"))
 }

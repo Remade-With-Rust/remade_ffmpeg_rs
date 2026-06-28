@@ -12,6 +12,7 @@
 use std::sync::OnceLock;
 
 use crate::frame::{GranuleSideInfo, GRANULE_LINES};
+use crate::header::FrameHeader;
 
 use super::psychoacoustic::PsyResult;
 
@@ -83,18 +84,141 @@ impl Default for QuantizedGranule {
     }
 }
 
-/// Quantize one granule's frequency lines under `psy`'s thresholds into at most
-/// `bit_budget` bits.
+/// Quantize one granule at `global_gain` into integer levels (sign-separated).
+/// Forward of the decoder's `xr = sign·|is|^(4/3)·2^(0.25·(gain−210))`.
+fn quantize_at(freq: &[f32; GRANULE_LINES], gain: i32) -> [i32; GRANULE_LINES] {
+    let scale_inv = 2f64.powf(-0.25 * (gain - 210) as f64);
+    let mut coeffs = [0i32; GRANULE_LINES];
+    for (i, &x) in freq.iter().enumerate() {
+        let mag = quantize_level(x.abs() as f64 * scale_inv);
+        coeffs[i] = if x < 0.0 { -mag } else { mag };
+    }
+    coeffs
+}
+
+/// Build a granule (coeffs + Huffman layout) at a candidate `global_gain`.
+fn build(header: &FrameHeader, freq: &[f32; GRANULE_LINES], gain: i32) -> QuantizedGranule {
+    let coeffs = quantize_at(freq, gain);
+    let mut side = super::huffman::select(header, &coeffs);
+    side.global_gain = gain as u8;
+    side.scalefac_compress = 0; // flat scalefactors (C1/C2 do no shaping)
+    QuantizedGranule {
+        coeffs,
+        side,
+        scalefactors: [0; 39],
+    }
+}
+
+/// Huffman bit cost of a candidate granule.
+fn cost(header: &FrameHeader, q: &QuantizedGranule) -> usize {
+    let mut w = crate::bitio::BitWriter::new();
+    super::huffman::encode(q, header, &mut w)
+}
+
+/// Largest non-clipping quantized level. Above this the value would saturate at
+/// `MAX_LEVEL`, losing precision — so a gain that produces it is *too fine*.
+const MAX_UNCLIPPED: i32 = 8191;
+
+/// **C2 — the rate loop.** Find the *smallest* `global_gain` (finest step, best
+/// quality) whose Huffman-coded spectrum fits `bit_budget`, then fill the granule.
+///
+/// Bits decrease monotonically as the gain rises (coarser step → smaller levels →
+/// fewer bits), so a binary search pins the boundary. There is no outer distortion
+/// loop yet (that's Q6) and scalefactors stay flat — this is rate control only.
 pub fn loops(
-    _freq: &[f32; GRANULE_LINES],
+    header: &FrameHeader,
+    freq: &[f32; GRANULE_LINES],
     _psy: &PsyResult,
-    _bit_budget: usize,
+    bit_budget: usize,
 ) -> QuantizedGranule {
-    // brick: nonuniform-quantize via x^(3/4); inner loop adjusts global_gain to
-    // hit the bit budget (Huffman-cost estimate per candidate); outer loop pushes
-    // scalefactors where band noise > threshold; pick region boundaries and
-    // Huffman tables; fill GranuleSideInfo. Default to QuantizedGranule::default.
-    todo!("mp3 encode: rate/distortion quantization loops")
+    // A gain is acceptable when nothing clips *and* the spectrum fits the budget.
+    // Both improve as the gain rises (coarser step → smaller levels → fewer bits,
+    // no clipping), so the smallest acceptable gain is the best-quality one.
+    // Crucially this rejects tiny gains where everything clamps to MAX_LEVEL but
+    // still costs few bits (which a budget-only test would wrongly accept).
+    let ok = |g: i32| {
+        let q = build(header, freq, g);
+        q.coeffs.iter().all(|&c| c.abs() <= MAX_UNCLIPPED) && cost(header, &q) <= bit_budget
+    };
+
+    let (mut lo, mut hi) = (0i32, 255i32);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if ok(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+
+    let mut q = build(header, freq, lo);
+    // Scalefactors are zero-length here, so part2_3_length == the Huffman bits.
+    q.side.part2_3_length = cost(header, &q) as u16;
+    q
+}
+
+#[cfg(test)]
+mod c2_tests {
+    use super::*;
+    use crate::decode::scalefactors::ScaleFactors;
+    use crate::frame::ChannelMode;
+    use crate::header::MpegVersion;
+
+    fn hdr() -> FrameHeader {
+        FrameHeader {
+            version: MpegVersion::V1,
+            crc_protected: false,
+            bitrate_kbps: 128,
+            sample_rate: 44100,
+            padding: false,
+            channel_mode: ChannelMode::Mono,
+            copyright: false,
+            original: true,
+            emphasis: 0,
+        }
+    }
+
+    #[test]
+    fn spectrum_roundtrip_through_quantizer() {
+        // A small synthetic spectrum: quantize then requantize should recover it.
+        let header = hdr();
+        let mut freq = [0f32; GRANULE_LINES];
+        freq[40] = 5.0;
+        freq[41] = -3.0;
+        freq[100] = 1.2;
+        freq[200] = 0.6;
+
+        let psy = PsyResult::default();
+        let q = loops(&header, &freq, &psy, 100_000); // generous budget → fine gain
+        eprintln!(
+            "[C2dbg] gain={} part2_3={} nz_coeffs={}",
+            q.side.global_gain,
+            q.side.part2_3_length,
+            q.coeffs.iter().filter(|&&c| c != 0).count()
+        );
+
+        // Requantize the way the decoder does.
+        let mut out = [0f32; GRANULE_LINES];
+        let nz = q.coeffs.iter().rposition(|&c| c != 0).map_or(0, |i| i + 1);
+        crate::decode::requantize::apply(
+            &header,
+            &q.side,
+            &ScaleFactors::default(),
+            &q.coeffs,
+            nz,
+            &mut out,
+        );
+
+        let mut maxerr = 0f32;
+        for i in 0..GRANULE_LINES {
+            maxerr = maxerr.max((out[i] - freq[i]).abs());
+        }
+        eprintln!(
+            "[C2dbg] requant maxerr={maxerr} out[40]={} out[41]={}",
+            out[40], out[41]
+        );
+        assert!(maxerr < 0.2, "spectrum round-trip error {maxerr}");
+    }
 }
 
 #[cfg(test)]

@@ -153,20 +153,92 @@ impl Decoder for Mp3Decoder {
     }
 }
 
+/// Floor-3 MP3 encoder: accumulates **mono** PCM (stereo is downmixed), emits one
+/// MP3 frame per 1152 samples. Dumb-but-valid — MPEG-1, 128 kbps CBR, flat
+/// scalefactors, no psychoacoustics yet.
 #[derive(Default)]
 struct Mp3Encoder {
     state: Mp3Encode,
+    header: Option<FrameHeader>,
+    /// Accumulated mono samples awaiting a full frame.
+    pcm: Vec<f32>,
+    queue: VecDeque<rff_core::Packet>,
     eof: bool,
 }
 
+/// Build the fixed Floor-3 frame header from the input's sample rate.
+fn encoder_header(sample_rate: u32) -> Result<FrameHeader> {
+    let version = match sample_rate {
+        32000 | 44100 | 48000 => header::MpegVersion::V1,
+        _ => {
+            return Err(Error::unsupported(
+                "mp3 encode: sample rate must be 32/44.1/48 kHz (MPEG-1)",
+            ))
+        }
+    };
+    Ok(FrameHeader {
+        version,
+        crc_protected: false,
+        bitrate_kbps: 128,
+        sample_rate,
+        padding: false,
+        channel_mode: frame::ChannelMode::Mono,
+        copyright: false,
+        original: true,
+        emphasis: 0,
+    })
+}
+
+impl Mp3Encoder {
+    /// Emit a frame for each full 1152-sample block accumulated.
+    fn drain_frames(&mut self) {
+        let Some(header) = self.header.clone() else {
+            return;
+        };
+        let spf = header.version.samples_per_frame();
+        while self.pcm.len() >= spf {
+            let block: Vec<f32> = self.pcm.drain(0..spf).collect();
+            if let Ok(bytes) = self.state.encode_frame(&header, &block) {
+                self.queue.push_back(Packet::from_data(0, bytes));
+            }
+        }
+    }
+}
+
 impl Encoder for Mp3Encoder {
-    fn send_frame(&mut self, _frame: &Frame) -> Result<()> {
-        // brick: gather a frame's worth of PCM, call `self.state.encode_frame`,
-        // queue the resulting MP3 frame as a Packet.
-        Err(Error::Unimplemented("mp3 encode: pipeline not yet built"))
+    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        let Frame::Audio(af) = frame else {
+            return Ok(());
+        };
+        if self.header.is_none() {
+            self.header = Some(encoder_header(af.sample_rate)?);
+        }
+        // Downmix interleaved f32 to mono.
+        let data = &af.planes[0];
+        let ch = (af.channels as usize).max(1);
+        for s in 0..af.samples {
+            let mut sum = 0.0f32;
+            for c in 0..ch {
+                let off = (s * ch + c) * 4;
+                if off + 4 <= data.len() {
+                    sum += f32::from_le_bytes([
+                        data[off],
+                        data[off + 1],
+                        data[off + 2],
+                        data[off + 3],
+                    ]);
+                }
+            }
+            self.pcm.push(sum / ch as f32);
+        }
+        self.drain_frames();
+        Ok(())
     }
 
     fn receive_packet(&mut self) -> Result<Packet> {
+        if let Some(p) = self.queue.pop_front() {
+            return Ok(p);
+        }
         if self.eof {
             Err(Error::Eof)
         } else {
@@ -175,6 +247,15 @@ impl Encoder for Mp3Encoder {
     }
 
     fn flush(&mut self) {
+        // Pad the tail to a whole frame and encode it.
+        if let Some(header) = self.header.clone() {
+            let spf = header.version.samples_per_frame();
+            if !self.pcm.is_empty() {
+                let padded = self.pcm.len().div_ceil(spf) * spf;
+                self.pcm.resize(padded, 0.0);
+                self.drain_frames();
+            }
+        }
         self.eof = true;
     }
 }
@@ -182,6 +263,99 @@ impl Encoder for Mp3Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helpers for the encode→decode pipeline gate.
+    fn pcm_to_bytes(pcm: &[f32]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(pcm.len() * 4);
+        for &s in pcm {
+            b.extend_from_slice(&s.to_le_bytes());
+        }
+        b
+    }
+
+    fn encode_mono(input: &[f32], sample_rate: u32) -> Vec<u8> {
+        let mut enc = Mp3Encoder::default();
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            sample_rate,
+            channels: 1,
+            format: SampleFormat::F32,
+            planes: vec![pcm_to_bytes(input)],
+            samples: input.len(),
+            pts: None,
+        }))
+        .unwrap();
+        enc.flush();
+        let mut mp3 = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            mp3.extend_from_slice(&p.data);
+        }
+        mp3
+    }
+
+    fn decode_mono(mp3: Vec<u8>) -> Vec<f32> {
+        let mut dec = Mp3Decoder::default();
+        dec.send_packet(&Packet::from_data(0, mp3)).unwrap();
+        dec.flush();
+        let mut out = Vec::new();
+        while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+            for c in af.planes[0].chunks_exact(4) {
+                out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+        }
+        out
+    }
+
+    /// Best-aligned reconstruction SNR (dB) of `out` vs `reference`, searching the
+    /// codec delay and skipping warm-up at both ends.
+    fn best_snr(reference: &[f32], out: &[f32]) -> f64 {
+        let (mut best, skip) = (f64::NEG_INFINITY, 2304usize);
+        for delay in 0..3000 {
+            let mut sig = 0f64;
+            let mut err = 0f64;
+            let mut n = 0;
+            let mut i = skip;
+            while i + delay < out.len() && i < reference.len() {
+                let r = reference[i] as f64;
+                sig += r * r;
+                err += (r - out[i + delay] as f64).powi(2);
+                n += 1;
+                i += 1;
+            }
+            if n > 5000 && err > 0.0 {
+                best = best.max(10.0 * (sig / err).log10());
+            }
+        }
+        best
+    }
+
+    /// **C4 — the pipeline gate.** A mono tone round-trips PCM → our encoder → our
+    /// decoder → PCM and reconstructs well above the noise floor. (FFmpeg/LAME
+    /// decodability is checked out-of-band; see docs/mp3-encoder-plan.md.)
+    #[test]
+    fn encode_decode_pipeline_tone() {
+        let sr = 44100u32;
+        let n = 16 * 1152;
+        let input: Vec<f32> = (0..n)
+            .map(|i| 0.4 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / sr as f32).sin())
+            .collect();
+
+        let mp3 = encode_mono(&input, sr);
+        assert!(!mp3.is_empty(), "encoder produced no data");
+        // Real MP3 frame sync at the start.
+        assert_eq!(mp3[0], 0xFF);
+        assert_eq!(mp3[1] & 0xE0, 0xE0);
+        // Optionally dump the .mp3 for out-of-band FFmpeg/LAME decode checks.
+        if let Ok(path) = std::env::var("MP3_ENC_OUT") {
+            std::fs::write(path, &mp3).expect("write MP3_ENC_OUT");
+        }
+
+        let out = decode_mono(mp3);
+        assert!(out.len() > n / 2, "decoder produced too few samples");
+
+        let snr = best_snr(&input, &out);
+        eprintln!("[C4] encode→decode tone SNR {snr:.1} dB");
+        assert!(snr > 20.0, "round-trip SNR too low: {snr:.1} dB");
+    }
 
     /// Decode a real MP3 file (path in `MP3_REF`) and report structure. Validates
     /// frame-sync (skips ID3), header/side-info parsing, and main-data extraction

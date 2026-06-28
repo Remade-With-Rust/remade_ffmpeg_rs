@@ -262,14 +262,19 @@ The house, bottom-up. Each floor is independently green before the next.
    (PCM→analyze→MDCT→IMDCT→synthesis→PCM) reconstructs at **82 dB** (delay 1057).
 3. **Floor 2** B1 → B2 → B3 → B4, then B5 → B6 → B7 → B8 — coding + framing, each
    round-tripped through the matching decoder parser.
-   ✅ **B1–B7 done.** Huffman cost/encode + region/table selection (B1–B4)
+   ✅ **DONE (B1–B8).** Huffman cost/encode + region/table selection (B1–B4)
    round-trip the spectrum exactly through `decode::huffman`; side-info +
-   scalefactor serializers (B5/B6) round-trip the structs; frame assembly (B7)
-   produces frames the real `Mp3Decoder` decodes. **B8** (reservoir *borrowing*)
-   remains — B7 runs reservoir-free (`main_data_begin=0`), which is valid CBR.
-4. **Floor 3** C1 → C2 → C3 → C4 — the dumb-but-valid controller. **First playable
-   MP3; first FFmpeg-accepted output.** De-risks the whole pipeline before any
-   psychoacoustics.
+   scalefactor serializers (B5/B6) round-trip the structs; frame assembly (B7) +
+   the reservoir stream assembler (B8, borrows + caps at 511) produce frames the
+   real `Mp3Decoder` decodes.
+4. **Floor 3** C1 → C2 → C3 → C4 — the dumb-but-valid controller.
+   ✅ **DONE.** Trivial psymodel (C1) + rate-loop quantizer (C2, binary-search
+   `global_gain`, reject clipping) + Encoder plumbing (C3, mono) yield a real MP3.
+   The pipeline gate (C4): a tone round-trips PCM→encode→our-decode→PCM at **81 dB**,
+   **and the `.mp3` decodes in FFmpeg** to the correct waveform (rms/peak exact).
+   Needed one fix beyond the bricks: the encoder must apply the *forward* alias
+   butterfly (`encode/antialias.rs`) — the inverse of the decoder's `reduce()`,
+   which it applies before the IMDCT.
 5. **Floor 4** Q1 → … → Q6 — the quality brain, swapped in behind the same
    interfaces. The only research-grade work, now isolated.
 6. **Roof** R1 → R4 (R5 later) — stereo, rate modes, LAME header, conformance.

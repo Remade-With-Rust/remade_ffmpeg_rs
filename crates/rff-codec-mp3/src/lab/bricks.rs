@@ -377,7 +377,7 @@ pub static BRICKS: &[Brick] = &[
         Phase::Controller,
         Class::Alg,
         Verify::Metric,
-        Status::Todo,
+        Status::Verified,
         "Trivial psymodel: always-long, flat threshold",
     ),
     b(
@@ -385,24 +385,24 @@ pub static BRICKS: &[Brick] = &[
         Phase::Controller,
         Class::Alg,
         Verify::Metric,
-        Status::Todo,
-        "Rate-only quantizer (inner loop: search global_gain)",
+        Status::Verified,
+        "Rate-only quantizer (binary-search global_gain, reject clipping)",
     ),
     b(
         "C3",
         Phase::Controller,
         Class::Glue,
         Verify::External,
-        Status::Todo,
-        "Encoder::send_frame / receive_packet plumbing",
+        Status::Verified,
+        "Encoder::send_frame / receive_packet plumbing (mono)",
     ),
     b(
         "C4",
         Phase::Controller,
         Class::Alg,
         Verify::External,
-        Status::Todo,
-        "Pipeline gate: playable MP3, FFmpeg-accepted",
+        Status::Verified,
+        "Pipeline gate: 81 dB round-trip, FFmpeg-decoded ✓",
     ),
     // ── Floor 4: quality brain ─────────────────────────────────────────────
     b(
@@ -607,8 +607,8 @@ mod tests {
 
     #[test]
     fn next_unbuilt_is_first_incomplete() {
-        // Foundation + analysis + all of Floor 2 (coding) are verified; next is C1.
-        assert_eq!(next_unbuilt().map(|b| b.id), Some("C1"));
+        // Through Floor 3 (the dumb-but-valid controller); next is the psymodel Q1.
+        assert_eq!(next_unbuilt().map(|b| b.id), Some("Q1"));
     }
 
     #[test]

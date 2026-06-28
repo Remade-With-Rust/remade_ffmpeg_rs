@@ -139,7 +139,7 @@ pub struct EncReservoir {
 }
 
 /// Physical main-data capacity of a frame (bytes after header/CRC/side-info).
-fn region_capacity(header: &FrameHeader) -> usize {
+pub fn region_capacity(header: &FrameHeader) -> usize {
     let crc = if header.crc_protected { 2 } else { 0 };
     header
         .frame_size()

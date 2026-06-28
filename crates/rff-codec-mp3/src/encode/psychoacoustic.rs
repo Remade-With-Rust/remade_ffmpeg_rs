@@ -20,9 +20,21 @@ pub struct PsyResult {
 }
 
 /// Run the psychoacoustic model over one granule of PCM.
-pub fn analyze(_pcm: &[f32]) -> PsyResult {
-    // brick: FFT the PCM (long + short windows), spread energy across critical
-    // bands, compute the masking threshold and SMR per band, derive perceptual
-    // entropy, and decide long vs short (attack detection / pre-echo control).
-    todo!("mp3 encode: psychoacoustic model")
+///
+/// **C1 — the trivial model.** Always a long block, a flat (zero) masking
+/// threshold, and perceptual entropy = signal energy. It satisfies the
+/// [`PsyResult`] contract so the rest of the pipeline runs end to end; the real
+/// FFT-based masking model (Q1–Q5) replaces it on Floor 4. There is deliberately
+/// no perceptual shaping here — the encoder is correct-but-dumb at this stage.
+pub fn analyze(pcm: &[f32]) -> PsyResult {
+    let energy: f32 = pcm
+        .iter()
+        .take(crate::frame::GRANULE_LINES)
+        .map(|x| x * x)
+        .sum();
+    PsyResult {
+        block_type: BlockType::Long,
+        thresholds: [0.0; SFB_LONG],
+        perceptual_entropy: energy,
+    }
 }
