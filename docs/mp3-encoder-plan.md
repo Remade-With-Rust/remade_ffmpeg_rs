@@ -283,6 +283,11 @@ The house, bottom-up. Each floor is independently green before the next.
    thresholds (Q3); perceptual entropy (Q4). The two-loop quantizer (Q6) shapes
    noise under the mask — peak NMR **7.4 → 0.2 dB** on a two-tone signal — and a
    multitone round-trips at **69 dB** through our decoder and **FFmpeg**.
+   ✅ **Q5 (block switching) done.** Forward reorder (subband→bitstream), short
+   quantizer (79 dB coefficient round-trip), the LONG/START/SHORT/STOP FSM, and an
+   attack detector — transients drive short blocks and the switched stream decodes
+   clean in our decoder and FFmpeg. Per-window perceptual shaping of short blocks
+   is a later refinement (they use flat scalefactors today).
 6. **Roof** R1 → R4 (R5 later) — stereo, rate modes, LAME header, conformance.
    ✅ **R1, R1+, R2, R3, R4 done.** Stereo (independent L/R + per-frame **mid/side
    joint stereo**); **VBR** (quality-target quantizer → per-frame bitrate, Xing
