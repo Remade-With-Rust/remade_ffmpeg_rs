@@ -65,3 +65,8 @@ https = ["rff-io/https"]
 # Working H.264 via the C openh264 library — an opt-in cross-check / fallback to
 # the default in-house pure-Rust codec. NOT pure Rust; needs a C toolchain.
 h264-openh264 = ["dep:rff-codec-openh264"]
+
+[dev-dependencies]
+# MD5 (RustCrypto, MIT/Apache) — used only by the VP9 conformance harness to
+# match libvpx's per-frame I420 hashes. Dev-only; not in the shipped graph.
+md-5 = "0.10"
