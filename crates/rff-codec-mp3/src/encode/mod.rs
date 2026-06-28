@@ -51,39 +51,45 @@ impl Mp3Encode {
         Mp3Encode::default()
     }
 
-    /// Encode one frame of **mono** PCM (`granules × 576` samples) into an MP3
-    /// frame: per granule, analysis filterbank → forward MDCT → rate-loop quantize
-    /// → Huffman, then assemble (reservoir-free). The dumb-but-valid Floor-3 path.
-    pub fn encode_frame(&mut self, header: &FrameHeader, pcm: &[f32]) -> Result<Vec<u8>> {
+    /// Encode one frame from per-channel PCM (`channels[ch]` holds this frame's
+    /// `granules × 576` samples): per granule, per channel, analysis filterbank →
+    /// forward MDCT → rate-loop quantize → Huffman, then assemble (reservoir-free).
+    ///
+    /// Mono and **independent-stereo** (each channel coded on its own; no joint
+    /// stereo yet). Main data is laid out granule-major then channel-major, the
+    /// order the decoder reads it.
+    pub fn encode_frame(&mut self, header: &FrameHeader, channels: &[Vec<f32>]) -> Result<Vec<u8>> {
+        let nch = header.channel_mode.channels();
         let granules = header.version.granules();
-        let region_bits = bitstream::region_capacity(header) * 8;
-        let budget_per_gr = region_bits / granules;
+        let budget = (bitstream::region_capacity(header) * 8) / (granules * nch);
 
         let mut side = SideInfo::default();
         let mut main = BitWriter::new();
         for gr in 0..granules {
-            let gpcm = &pcm[gr * GRANULE_LINES..];
-            let sub = filterbank::analyze(gpcm, &mut self.analysis_fifo[0]);
-            let psy = psychoacoustic::analyze(gpcm, header.sample_rate);
-            let mut freq = mdct::forward(&sub, psy.block_type, &mut self.mdct_overlap[0]);
-            // Forward alias butterflies — the inverse of the decoder's reduce(),
-            // which it applies before the IMDCT.
-            let block = GranuleSideInfo {
-                window_switching: psy.block_type != crate::frame::BlockType::Long,
-                block_type: psy.block_type,
-                ..Default::default()
-            };
-            antialias::expand(&block, &mut freq);
-            let quant = quantize::loops(header, &freq, &psy, budget_per_gr);
+            for ch in 0..nch {
+                let gpcm = &channels[ch][gr * GRANULE_LINES..];
+                let sub = filterbank::analyze(gpcm, &mut self.analysis_fifo[ch]);
+                let psy = psychoacoustic::analyze(gpcm, header.sample_rate);
+                let mut freq = mdct::forward(&sub, psy.block_type, &mut self.mdct_overlap[ch]);
+                // Forward alias butterflies — the inverse of the decoder's reduce(),
+                // which it applies before the IMDCT.
+                let block = GranuleSideInfo {
+                    window_switching: psy.block_type != crate::frame::BlockType::Long,
+                    block_type: psy.block_type,
+                    ..Default::default()
+                };
+                antialias::expand(&block, &mut freq);
+                let quant = quantize::loops(header, &freq, &psy, budget);
 
-            // Main data per granule: scalefactors (part2) then Huffman (part3).
-            side.granules[gr][0] = quant.side.clone();
-            let mut sfac = ScaleFactors::default();
-            sfac.long.copy_from_slice(&quant.scalefactors[..22]);
-            let part2_3_start = main.bit_len();
-            bitstream::serialize_scalefactors(&mut main, header, &side, gr, 0, &sfac);
-            huffman::encode(&quant, header, &mut main);
-            side.granules[gr][0].part2_3_length = (main.bit_len() - part2_3_start) as u16;
+                // Main data per granule/channel: scalefactors (part2) then Huffman.
+                side.granules[gr][ch] = quant.side.clone();
+                let mut sfac = ScaleFactors::default();
+                sfac.long.copy_from_slice(&quant.scalefactors[..22]);
+                let part2_3_start = main.bit_len();
+                bitstream::serialize_scalefactors(&mut main, header, &side, gr, ch, &sfac);
+                huffman::encode(&quant, header, &mut main);
+                side.granules[gr][ch].part2_3_length = (main.bit_len() - part2_3_start) as u16;
+            }
         }
         let main_data = main.finish();
         Ok(bitstream::format(

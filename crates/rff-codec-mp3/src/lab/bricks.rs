@@ -459,8 +459,8 @@ pub static BRICKS: &[Brick] = &[
         Phase::Roof,
         Class::Alg,
         Verify::RoundTrip,
-        Status::Todo,
-        "Joint-stereo decision (M/S, intensity)",
+        Status::Verified,
+        "Independent L/R stereo (joint M/S deferred)",
     ),
     b(
         "R2",

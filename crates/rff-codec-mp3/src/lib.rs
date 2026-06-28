@@ -153,21 +153,21 @@ impl Decoder for Mp3Decoder {
     }
 }
 
-/// Floor-3 MP3 encoder: accumulates **mono** PCM (stereo is downmixed), emits one
-/// MP3 frame per 1152 samples. Dumb-but-valid — MPEG-1, 128 kbps CBR, flat
-/// scalefactors, no psychoacoustics yet.
+/// MP3 encoder: accumulates per-channel PCM, emits one MP3 frame per 1152 samples
+/// per channel. MPEG-1, 128 kbps CBR, psychoacoustic noise shaping; mono or
+/// **independent stereo** (no joint stereo yet).
 #[derive(Default)]
 struct Mp3Encoder {
     state: Mp3Encode,
     header: Option<FrameHeader>,
-    /// Accumulated mono samples awaiting a full frame.
-    pcm: Vec<f32>,
+    /// Accumulated samples per channel awaiting a full frame.
+    pcm: [Vec<f32>; 2],
     queue: VecDeque<rff_core::Packet>,
     eof: bool,
 }
 
-/// Build the fixed Floor-3 frame header from the input's sample rate.
-fn encoder_header(sample_rate: u32) -> Result<FrameHeader> {
+/// Build the frame header from the input's sample rate and channel count.
+fn encoder_header(sample_rate: u32, channels: u16) -> Result<FrameHeader> {
     let version = match sample_rate {
         32000 | 44100 | 48000 => header::MpegVersion::V1,
         _ => {
@@ -176,13 +176,18 @@ fn encoder_header(sample_rate: u32) -> Result<FrameHeader> {
             ))
         }
     };
+    let channel_mode = if channels >= 2 {
+        frame::ChannelMode::Stereo
+    } else {
+        frame::ChannelMode::Mono
+    };
     Ok(FrameHeader {
         version,
         crc_protected: false,
         bitrate_kbps: 128,
         sample_rate,
         padding: false,
-        channel_mode: frame::ChannelMode::Mono,
+        channel_mode,
         copyright: false,
         original: true,
         emphasis: 0,
@@ -190,14 +195,17 @@ fn encoder_header(sample_rate: u32) -> Result<FrameHeader> {
 }
 
 impl Mp3Encoder {
-    /// Emit a frame for each full 1152-sample block accumulated.
+    /// Emit a frame for each full 1152-sample-per-channel block accumulated.
     fn drain_frames(&mut self) {
         let Some(header) = self.header.clone() else {
             return;
         };
+        let nch = header.channel_mode.channels();
         let spf = header.version.samples_per_frame();
-        while self.pcm.len() >= spf {
-            let block: Vec<f32> = self.pcm.drain(0..spf).collect();
+        while self.pcm[0].len() >= spf && (nch == 1 || self.pcm[1].len() >= spf) {
+            let block: Vec<Vec<f32>> = (0..nch)
+                .map(|c| self.pcm[c].drain(0..spf).collect())
+                .collect();
             if let Ok(bytes) = self.state.encode_frame(&header, &block) {
                 self.queue.push_back(Packet::from_data(0, bytes));
             }
@@ -211,25 +219,23 @@ impl Encoder for Mp3Encoder {
             return Ok(());
         };
         if self.header.is_none() {
-            self.header = Some(encoder_header(af.sample_rate)?);
+            self.header = Some(encoder_header(af.sample_rate, af.channels)?);
         }
-        // Downmix interleaved f32 to mono.
+        let nch = self.header.as_ref().unwrap().channel_mode.channels();
+        let in_ch = (af.channels as usize).max(1);
         let data = &af.planes[0];
-        let ch = (af.channels as usize).max(1);
+        // Deinterleave; if the input has fewer channels than the output, replicate.
         for s in 0..af.samples {
-            let mut sum = 0.0f32;
-            for c in 0..ch {
-                let off = (s * ch + c) * 4;
-                if off + 4 <= data.len() {
-                    sum += f32::from_le_bytes([
-                        data[off],
-                        data[off + 1],
-                        data[off + 2],
-                        data[off + 3],
-                    ]);
-                }
+            for c in 0..nch {
+                let ic = c.min(in_ch - 1);
+                let off = (s * in_ch + ic) * 4;
+                let v = if off + 4 <= data.len() {
+                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                } else {
+                    0.0
+                };
+                self.pcm[c].push(v);
             }
-            self.pcm.push(sum / ch as f32);
         }
         self.drain_frames();
         Ok(())
@@ -247,12 +253,15 @@ impl Encoder for Mp3Encoder {
     }
 
     fn flush(&mut self) {
-        // Pad the tail to a whole frame and encode it.
+        // Pad each channel's tail to a whole frame and encode it.
         if let Some(header) = self.header.clone() {
+            let nch = header.channel_mode.channels();
             let spf = header.version.samples_per_frame();
-            if !self.pcm.is_empty() {
-                let padded = self.pcm.len().div_ceil(spf) * spf;
-                self.pcm.resize(padded, 0.0);
+            if (0..nch).any(|c| !self.pcm[c].is_empty()) {
+                for c in 0..nch {
+                    let padded = self.pcm[c].len().div_ceil(spf) * spf;
+                    self.pcm[c].resize(padded, 0.0);
+                }
                 self.drain_frames();
             }
         }
@@ -326,6 +335,69 @@ mod tests {
             }
         }
         best
+    }
+
+    /// **R1 — stereo.** Two different tones in L and R survive independently.
+    #[test]
+    fn encode_decode_stereo() {
+        let sr = 44100u32;
+        let frames = 16;
+        let n = frames * 1152;
+        let pi2 = 2.0 * std::f32::consts::PI;
+        // Interleaved L/R: L = 700 Hz, R = 3000 Hz.
+        let mut interleaved = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let t = i as f32 / sr as f32;
+            interleaved.push(0.35 * (pi2 * 700.0 * t).sin()); // L
+            interleaved.push(0.30 * (pi2 * 3000.0 * t).sin()); // R
+        }
+
+        let mut enc = Mp3Encoder::default();
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            sample_rate: sr,
+            channels: 2,
+            format: SampleFormat::F32,
+            planes: vec![pcm_to_bytes(&interleaved)],
+            samples: n,
+            pts: None,
+        }))
+        .unwrap();
+        enc.flush();
+        let mut mp3 = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            mp3.extend_from_slice(&p.data);
+        }
+        assert!(!mp3.is_empty());
+        if let Ok(path) = std::env::var("MP3_ENC_OUT") {
+            std::fs::write(path, &mp3).expect("write MP3_ENC_OUT");
+        }
+
+        // Decode and split the interleaved stereo output back into L and R.
+        let mut dec = Mp3Decoder::default();
+        dec.send_packet(&Packet::from_data(0, mp3)).unwrap();
+        dec.flush();
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+            assert_eq!(af.channels, 2, "decoded stream must be stereo");
+            for fr in af.planes[0].chunks_exact(8) {
+                left.push(f32::from_le_bytes([fr[0], fr[1], fr[2], fr[3]]));
+                right.push(f32::from_le_bytes([fr[4], fr[5], fr[6], fr[7]]));
+            }
+        }
+
+        let ref_l: Vec<f32> = (0..n)
+            .map(|i| 0.35 * (pi2 * 700.0 * i as f32 / sr as f32).sin())
+            .collect();
+        let ref_r: Vec<f32> = (0..n)
+            .map(|i| 0.30 * (pi2 * 3000.0 * i as f32 / sr as f32).sin())
+            .collect();
+        let snr_l = best_snr(&ref_l, &left);
+        let snr_r = best_snr(&ref_r, &right);
+        eprintln!("[R1] stereo SNR L {snr_l:.1} dB  R {snr_r:.1} dB");
+        assert!(
+            snr_l > 20.0 && snr_r > 20.0,
+            "stereo channels too noisy: L {snr_l} R {snr_r}"
+        );
     }
 
     /// **C4 — the pipeline gate.** A multi-tone signal (which exercises Q6's
