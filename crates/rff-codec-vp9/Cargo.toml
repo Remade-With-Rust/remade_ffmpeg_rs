@@ -10,3 +10,13 @@ rust-version.workspace = true
 [dependencies]
 rff-core.workspace = true
 rff-codec.workspace = true
+
+[dev-dependencies]
+# Benchmark uses internal crates only — no third-party harness — so it adds
+# nothing to the dependency / license graph.
+rff-core.workspace = true
+rff-codec.workspace = true
+
+[[bench]]
+name = "vp9_decode"
+harness = false
