@@ -30,14 +30,29 @@ impl<'a> BitReader<'a> {
 
     /// Read `n` bits (0..=32) MSB-first as an unsigned integer.
     pub fn read(&mut self, n: u32) -> u32 {
+        let v = self.peek(n);
+        self.pos += n as usize;
+        v
+    }
+
+    /// Look at the next `n` bits (0..=32) MSB-first without consuming them, zero-
+    /// padding past the end of the buffer (matching [`read`]). The Huffman LUT
+    /// peeks `max_len` bits, then [`skip`](Self::skip)s the matched codeword.
+    pub fn peek(&self, n: u32) -> u32 {
         let mut v = 0u32;
+        let mut p = self.pos;
         for _ in 0..n {
-            let byte = self.data.get(self.pos >> 3).copied().unwrap_or(0);
-            let bit = (byte >> (7 - (self.pos & 7))) & 1;
+            let byte = self.data.get(p >> 3).copied().unwrap_or(0);
+            let bit = (byte >> (7 - (p & 7))) & 1;
             v = (v << 1) | bit as u32;
-            self.pos += 1;
+            p += 1;
         }
         v
+    }
+
+    /// Advance the bit cursor by `n` bits (after a [`peek`](Self::peek)).
+    pub fn skip(&mut self, n: u32) {
+        self.pos += n as usize;
     }
 
     /// Read a single bit as a bool.

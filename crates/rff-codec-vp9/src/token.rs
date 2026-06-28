@@ -49,7 +49,7 @@ pub fn get_scan(tx_size: usize, tx_type: TxType) -> (&'static [i16], &'static [i
 /// Coefficient context from the two causal neighbours' energy classes
 /// (libvpx `get_coef_context`): `(1 + cache[nb[2c]] + cache[nb[2c+1]]) >> 1`.
 #[inline]
-fn get_coef_context(nb: &[i16], cache: &[u8], c: usize) -> usize {
+pub(crate) fn get_coef_context(nb: &[i16], cache: &[u8], c: usize) -> usize {
     ((1 + cache[nb[2 * c] as usize] as usize + cache[nb[2 * c + 1] as usize] as usize) >> 1)
         as usize
 }

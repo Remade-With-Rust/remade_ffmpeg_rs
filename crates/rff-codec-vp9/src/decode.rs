@@ -950,7 +950,7 @@ fn tile_offset(idx: usize, mis: usize, log2: u32) -> usize {
 // ---- segmentation (ISO/VP9 §6.4.10) -------------------------------------
 
 /// `vp9_segment_tree` — the 8-segment id tree (leaves are `-segment`).
-const SEGMENT_TREE: [i8; 14] = [2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7];
+pub(crate) const SEGMENT_TREE: [i8; 14] = [2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7];
 const SEG_LVL_ALT_Q: usize = 0;
 const SEG_LVL_REF_FRAME: usize = 2;
 const SEG_LVL_SKIP: usize = 3;

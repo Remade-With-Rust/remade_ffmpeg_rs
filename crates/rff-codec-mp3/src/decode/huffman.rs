@@ -11,6 +11,8 @@
 //! gated by Kraft/prefix-free validation. A table is two parallel arrays —
 //! `codes[i]`/`lens[i]` in (x·dim + y) raster order — matched MSB-first.
 
+use std::sync::OnceLock;
+
 use crate::bitio::BitReader;
 use crate::frame::{BlockType, GranuleSideInfo, GRANULE_LINES};
 use crate::header::FrameHeader;
@@ -18,11 +20,29 @@ use crate::tables;
 
 use super::codebooks::{PAIR_TABLES, QUAD_A, QUAD_B};
 
-/// A prefix-free codeword book: parallel codeword / bit-length arrays.
+/// Root LUT width cap. Codewords up to this length resolve in one table lookup;
+/// the (rare, large-coefficient) longer codes fall back to a linear scan. Bounds
+/// each book's table at `2^12 = 4096` entries.
+const LUT_BITS_CAP: u8 = 12;
+
+/// One decode-LUT slot: `(symbol_index, codeword_length)`. `len == 0` marks an
+/// "escape" — the peeked prefix belongs to a codeword longer than `lut_bits`
+/// (or no codeword), to be resolved by the linear fallback.
+#[derive(Clone, Copy)]
+struct LutSlot {
+    sym: u16,
+    len: u8,
+}
+
+/// A prefix-free codeword book: parallel codeword / bit-length arrays, plus a
+/// lazily-built lookup table for O(1) decode.
 pub struct HuffBook {
     codes: &'static [u16],
     lens: &'static [u8],
     max_len: u8,
+    /// Peek width for the LUT = `min(max_len, LUT_BITS_CAP)`.
+    lut_bits: u8,
+    lut: OnceLock<Vec<LutSlot>>,
 }
 
 impl HuffBook {
@@ -35,19 +55,60 @@ impl HuffBook {
             }
             i += 1;
         }
+        let lut_bits = if max < LUT_BITS_CAP {
+            max
+        } else {
+            LUT_BITS_CAP
+        };
         HuffBook {
             codes,
             lens,
             max_len: max,
+            lut_bits,
+            lut: OnceLock::new(),
         }
     }
 
+    /// Build (once) the peek table: every `lut_bits`-bit prefix maps to its
+    /// codeword's `(symbol, length)`, or stays an escape if it heads a longer
+    /// codeword. Prefix-freeness guarantees no short code overwrites a long one's
+    /// prefix region, so escapes are exactly the long-code / invalid prefixes.
+    fn lut(&self) -> &[LutSlot] {
+        self.lut.get_or_init(|| {
+            let bits = self.lut_bits as u32;
+            let mut t = vec![LutSlot { sym: 0, len: 0 }; 1usize << bits];
+            for (i, (&code, &len)) in self.codes.iter().zip(self.lens.iter()).enumerate() {
+                if len == 0 || len as u32 > bits {
+                    continue; // empty slot / resolved by the linear fallback
+                }
+                let shift = bits - len as u32;
+                let start = (code as usize) << shift;
+                for slot in &mut t[start..start + (1usize << shift)] {
+                    *slot = LutSlot { sym: i as u16, len };
+                }
+            }
+            t
+        })
+    }
+
     /// Decode the next codeword MSB-first, returning its symbol index, or `None`
-    /// if the bits match no codeword (corrupt stream).
+    /// if the bits match no codeword (corrupt stream). One table lookup for the
+    /// common short codes; a linear scan only for codewords past `lut_bits`.
     pub fn decode_index(&self, r: &mut BitReader) -> Option<usize> {
         if self.codes.is_empty() {
             return Some(0); // the empty book (table 0) codes a constant 0 pair.
         }
+        let slot = self.lut()[r.peek(self.lut_bits as u32) as usize];
+        if slot.len != 0 {
+            r.skip(slot.len as u32);
+            return Some(slot.sym as usize);
+        }
+        self.decode_linear(r)
+    }
+
+    /// Bit-by-bit fallback: the reference decoder, used only when the peeked
+    /// prefix escapes the LUT (a codeword longer than `lut_bits`).
+    fn decode_linear(&self, r: &mut BitReader) -> Option<usize> {
         let mut code = 0u32;
         for len in 1..=self.max_len {
             code = (code << 1) | r.read(1);
@@ -302,6 +363,49 @@ mod tests {
         let bits = pack(&[(0b0101, 4), (1, 1), (0, 1)]);
         let mut r = BitReader::new(&bits);
         assert_eq!(QUAD_B.read(&mut r), (-1, 0, 1, 0));
+    }
+
+    /// The LUT decode must be bit-identical to the reference linear scan: for
+    /// every codeword in every book, both return the same symbol and consume the
+    /// same number of bits — under several trailing-bit contexts (so escapes and
+    /// the buffer boundary are exercised). This is the bit-exact gate for the LUT.
+    #[test]
+    fn lut_matches_linear_for_every_codeword() {
+        fn check(book: &HuffBook) {
+            for (i, &len) in book.lens.iter().enumerate() {
+                if len == 0 {
+                    continue;
+                }
+                let code = book.codes[i];
+                for &filler in &[0u32, 0xFFFF_FFFF, 0xAAAA_AAAA, 0x5555_5555] {
+                    let mut w = crate::bitio::BitWriter::new();
+                    w.write(code as u32, len as u32);
+                    w.write(filler, 24); // plenty of trailing bits to peek into
+                    let bits = w.finish();
+
+                    let mut rl = BitReader::new(&bits);
+                    let sym_lin = book.decode_linear(&mut rl);
+                    let mut ru = BitReader::new(&bits);
+                    let sym_lut = book.decode_index(&mut ru);
+
+                    assert_eq!(sym_lin, Some(i), "linear must decode its own codeword");
+                    assert_eq!(sym_lut, sym_lin, "LUT vs linear symbol (book idx {i})");
+                    assert_eq!(
+                        ru.bit_pos(),
+                        rl.bit_pos(),
+                        "LUT vs linear bits consumed (book idx {i})"
+                    );
+                    assert_eq!(rl.bit_pos(), len as usize, "consumed == codeword length");
+                }
+            }
+        }
+        for t in PAIR_TABLES.iter() {
+            if t.dim != 0 {
+                check(&t.book);
+            }
+        }
+        check(&QUAD_A.book);
+        check(&QUAD_B.book);
     }
 
     #[test]

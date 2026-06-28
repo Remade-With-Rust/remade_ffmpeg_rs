@@ -28,6 +28,54 @@ pub mod stereo;
 pub mod synth_window;
 pub mod synthesis;
 
+/// Lightweight decode-stage profiler (near-zero cost; read via [`prof::dump`]).
+/// Same role as the encoder's: find the real decode hotspots before optimizing.
+pub mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    pub static HUFFMAN: AtomicU64 = AtomicU64::new(0);
+    pub static SCALEFAC: AtomicU64 = AtomicU64::new(0);
+    pub static REQUANT: AtomicU64 = AtomicU64::new(0);
+    pub static STEREO: AtomicU64 = AtomicU64::new(0);
+    pub static ANTIALIAS: AtomicU64 = AtomicU64::new(0);
+    pub static IMDCT: AtomicU64 = AtomicU64::new(0);
+    pub static SYNTH: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub fn time<T>(bucket: &AtomicU64, f: impl FnOnce() -> T) -> T {
+        let t = Instant::now();
+        let r = f();
+        bucket.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        r
+    }
+
+    pub fn dump() {
+        let stages = [
+            ("huffman", &HUFFMAN),
+            ("scalefactors", &SCALEFAC),
+            ("requantize", &REQUANT),
+            ("stereo", &STEREO),
+            ("antialias", &ANTIALIAS),
+            ("imdct+overlap", &IMDCT),
+            ("synthesis", &SYNTH),
+        ];
+        let total: u64 = stages.iter().map(|(_, b)| b.load(Ordering::Relaxed)).sum();
+        eprintln!(
+            "--- decode stage profile (total {:.1} ms) ---",
+            total as f64 / 1e6
+        );
+        for (name, b) in stages {
+            let ns = b.swap(0, Ordering::Relaxed);
+            eprintln!(
+                "  {name:<14} {:>8.1} ms  {:>5.1}%",
+                ns as f64 / 1e6,
+                100.0 * ns as f64 / total.max(1) as f64
+            );
+        }
+    }
+}
+
 /// Persistent decoder state across frames.
 pub struct Mp3Decode {
     /// Carries leftover main-data bytes between frames (`main_data_begin`).
@@ -90,28 +138,41 @@ impl Mp3Decode {
                 } else {
                     None
                 };
-                let sf =
-                    scalefactors::decode(&main, &mut bit_pos, header, &si, gr, ch, prev.as_ref());
+                let sf = prof::time(&prof::SCALEFAC, || {
+                    scalefactors::decode(&main, &mut bit_pos, header, &si, gr, ch, prev.as_ref())
+                });
                 scalefac[gr][ch] = sf.clone();
                 let part2_3_end = part2_3_start + gi.part2_3_length as usize;
-                let (coeffs, nz) = huffman::decode(&main, &mut bit_pos, part2_3_end, header, gi);
-                requantize::apply(header, gi, &sf, &coeffs, nz, &mut spectrum.lines[ch]);
+                let (coeffs, nz) = prof::time(&prof::HUFFMAN, || {
+                    huffman::decode(&main, &mut bit_pos, part2_3_end, header, gi)
+                });
+                prof::time(&prof::REQUANT, || {
+                    requantize::apply(header, gi, &sf, &coeffs, nz, &mut spectrum.lines[ch])
+                });
                 spectrum.nonzero[ch] = nz;
             }
 
             // 7. Joint-stereo (MS / intensity) across the two channels.
-            stereo::process(header, &si.granules[gr], &mut spectrum);
+            prof::time(&prof::STEREO, || {
+                stereo::process(header, &si.granules[gr], &mut spectrum)
+            });
 
             // 8..10. Per channel: alias reduction → hybrid IMDCT → synthesis.
             let mut chan_pcm = [[0f32; GRANULE_LINES]; 2];
             for ch in 0..channels {
-                antialias::reduce(&si.granules[gr][ch], &mut spectrum.lines[ch]);
-                let time = imdct::hybrid(
-                    &si.granules[gr][ch],
-                    &spectrum.lines[ch],
-                    &mut self.imdct_overlap[ch],
-                );
-                chan_pcm[ch] = synthesis::polyphase(&time, &mut self.synth_fifo[ch]);
+                prof::time(&prof::ANTIALIAS, || {
+                    antialias::reduce(&si.granules[gr][ch], &mut spectrum.lines[ch])
+                });
+                let time = prof::time(&prof::IMDCT, || {
+                    imdct::hybrid(
+                        &si.granules[gr][ch],
+                        &spectrum.lines[ch],
+                        &mut self.imdct_overlap[ch],
+                    )
+                });
+                chan_pcm[ch] = prof::time(&prof::SYNTH, || {
+                    synthesis::polyphase(&time, &mut self.synth_fifo[ch])
+                });
             }
             // Interleave the channels into the frame's PCM output.
             for s in 0..GRANULE_LINES {

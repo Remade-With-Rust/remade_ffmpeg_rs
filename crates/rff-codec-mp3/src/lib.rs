@@ -389,6 +389,38 @@ mod tests {
         mp3
     }
 
+    /// Decode profiling driver (run explicitly): encode ~10 s of dense audio, then
+    /// decode it while the per-stage profiler runs. `cargo test -p rff-codec-mp3
+    /// --release profile_decode -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn profile_decode() {
+        let sr = 44100u32;
+        let n = 10 * sr as usize;
+        let mut s = 0x9E37_79B9u32;
+        let mut rng = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        // Dense harmonic + noise → busy spectrum, realistic decode work per frame.
+        let input: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let mut v = 0f32;
+                for k in 1..=24 {
+                    v += (1.0 / k as f32)
+                        * (2.0 * std::f32::consts::PI * 130.0 * k as f32 * t).sin();
+                }
+                (0.2 * v + 0.03 * rng()).clamp(-1.0, 1.0)
+            })
+            .collect();
+        let mp3 = encode_mono(&input, sr);
+        eprintln!("[profile] decoding {} KB of mp3 (~10 s)", mp3.len() / 1024);
+        let out = decode_mono(mp3);
+        eprintln!("[profile] {} PCM samples out", out.len());
+        crate::decode::prof::dump();
+    }
+
     fn decode_mono(mp3: Vec<u8>) -> Vec<f32> {
         let mut dec = Mp3Decoder::default();
         dec.send_packet(&Packet::from_data(0, mp3)).unwrap();
