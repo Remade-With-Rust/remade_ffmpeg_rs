@@ -292,11 +292,21 @@ The house, bottom-up. Each floor is independently green before the next.
    ✅ **R1, R1+, R2, R3, R4 done.** Stereo (independent L/R + per-frame **mid/side
    joint stereo**); **VBR** (quality-target quantizer → per-frame bitrate, Xing
    tag); **Xing/Info header** (FFmpeg reads exact duration); **conformance corpus**
-   (8 signals, our-decoder floors + FFmpeg clean). **Remaining (both large): Q5**
-   (block switching — needs the short-block *coding* path) and **R5** (MPEG-2/2.5 —
-   needs V2 SFB tables + the V2 scalefactor scheme on the *decoder* too).
+   (8 signals, our-decoder floors + FFmpeg clean); **R5 MPEG-2/2.5** (V2 LSF band
+   tables + framing, six rates 8–24 kHz, all FFmpeg-validated).
 
-The payoff of this order: ~70% of the encoder (Foundation + Floors 1–3) is
-mechanical and provable against our own bit-exact decoder, and yields a working
-encoder early. The genuinely hard part — psychoacoustic quality — is cornered by
+## ✅ Complete — 35/35 bricks
+
+Every brick is built and verified; `cargo run --example mp3lab -- bricks` shows
+35 ✓. The encoder is MPEG-1/2/2.5, mono / stereo / joint-stereo, CBR / VBR,
+psychoacoustically noise-shaped, with block switching and a Xing/Info header —
+and **every output decodes correctly in both our bit-exact decoder and FFmpeg 8.1**.
+
+Remaining refinements (quality, not coverage): per-window perceptual shaping of
+short blocks and the MPEG-2 LSF scalefactor *scheme* (both use flat scalefactors
+today, which is valid); intensity stereo; the real CRC-16.
+
+The payoff of the build order: ~70% of the encoder (Foundation + Floors 1–3) was
+mechanical and provable against our own bit-exact decoder, yielding a working
+encoder early. The genuinely hard part — psychoacoustic quality — was cornered by
 itself on Floor 4, never tangled up with a filterbank sign bug.
