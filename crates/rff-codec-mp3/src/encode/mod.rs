@@ -43,6 +43,10 @@ pub mod prof {
     // Block-type distribution (the split decides which quantizer path runs).
     pub static N_LONG: AtomicU64 = AtomicU64::new(0);
     pub static N_SHORT: AtomicU64 = AtomicU64::new(0);
+    // Distortion-loop behaviour: how often the kept result is iteration 0 (the loop
+    // never improved past the rate-loop quantization) vs total long granules.
+    pub static OUTER_KEPT0: AtomicU64 = AtomicU64::new(0);
+    pub static OUTER_TOTAL: AtomicU64 = AtomicU64::new(0);
 
     /// Time `f` into `bucket` (nanoseconds, summed across calls).
     #[inline]
@@ -289,11 +293,16 @@ mod profile_tests {
                 enc.encode_frame(&header, &[ch.to_vec()], None).unwrap();
             }
         }
-        let nl = prof::N_LONG.load(std::sync::atomic::Ordering::Relaxed);
-        let ns = prof::N_SHORT.load(std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        let (nl, ns) = (prof::N_LONG.load(Relaxed), prof::N_SHORT.load(Relaxed));
+        let (k0, ot) = (
+            prof::OUTER_KEPT0.load(Relaxed),
+            prof::OUTER_TOTAL.load(Relaxed),
+        );
         eprintln!(
-            "[block-mix Ring05] long={nl} short={ns}  ({:.0}% short)",
-            100.0 * ns as f64 / (nl + ns).max(1) as f64
+            "[block-mix] long={nl} short={ns} ({:.0}% short); distortion loop kept iter-0 in {k0}/{ot} long granules ({:.0}%)",
+            100.0 * ns as f64 / (nl + ns).max(1) as f64,
+            100.0 * k0 as f64 / ot.max(1) as f64
         );
     }
 

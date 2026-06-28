@@ -245,9 +245,10 @@ pub fn loops(
 ) -> QuantizedGranule {
     let mut sf = [0u8; 22];
     let mut best: Option<(f32, QuantizedGranule)> = None;
+    let mut best_iter = 0usize;
     let xrp = xrpow(freq);
 
-    for _ in 0..MAX_OUTER {
+    for outer in 0..MAX_OUTER {
         let (compress, sf_bits) = choose_compress(&sf);
         let huff_budget = bit_budget.saturating_sub(sf_bits);
 
@@ -264,7 +265,13 @@ pub fn loops(
             scalefactors,
         };
 
-        // Score: peak noise-to-mask ratio across the coded bands.
+        // Score: peak noise-to-mask ratio across the coded bands. (Floor 3 NOTE: the
+        // calibration says ODG tracks TOTAL `% audible`, not peak — but changing this
+        // to a total-audible objective made ZERO difference, because the loop kept
+        // iteration 0 in 100% of granules: at a hard per-granule CBR budget, amplifying
+        // any band forces the rate loop to coarsen everything, so no shaping step ever
+        // beats iter 0. Effective bit allocation needs a reservoir-aware RD redesign,
+        // not a scoring tweak — see the OUTER_KEPT0 diagnostic.)
         let noise = band_noise(header, freq, &granule.coeffs, gain, &sf);
         let mut peak_nmr = f32::NEG_INFINITY;
         let mut worst: Option<usize> = None;
@@ -279,6 +286,7 @@ pub fn loops(
         }
         if best.as_ref().is_none_or(|(bn, _)| peak_nmr < *bn) {
             best = Some((peak_nmr, granule));
+            best_iter = outer;
         }
         match worst {
             Some(b) => sf[b] += 1, // amplify the worst band, then re-quantize
@@ -286,6 +294,10 @@ pub fn loops(
         }
     }
 
+    super::prof::OUTER_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if best_iter == 0 {
+        super::prof::OUTER_KEPT0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     best.expect("at least one iteration runs").1
 }
 
