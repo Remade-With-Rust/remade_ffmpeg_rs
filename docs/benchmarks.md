@@ -47,12 +47,31 @@ point for a young pure-Rust decoder — not parity, and we don't claim it.
 
 The surprising, measured result: **motion compensation and the loop filter are
 ~94% of decode** — and both already use hand-written AVX2. The scalar paths
-(transform / intra / entropy) are a rounding error, so optimizing *them* would
-do nothing. The real headroom is in the two SIMD kernels themselves (the same
-places FFmpeg has spent decades), plus reducing per-block dispatch overhead and
-adding frame/tile threading. `target-cpu=native` buys ~30% by improving the
-non-kernel glue. This is a focused, bit-exact-critical optimization project, not
-a quick win — but now it's pointed at the right 94%.
+(transform / intra / entropy) are a rounding error.
+
+### Optimization attempts — and what they revealed
+
+Three bit-exact attempts (each gated by the conformance suite), and what each
+measured:
+
+| Attempt | Result | Kept? |
+|---------|--------|-------|
+| Tile-column threading (clone, then no-clone fork) | **~1.7–3× *slower*** — per-worker buffer + merge is ~2× the memory traffic | no |
+| Compound (averaged) inter SIMD | **~1.8%** (closed a 100%-scalar gap) | yes |
+| `madd_epi16` core convolution | **~0%** (best-of-N tied with `mullo`) | no |
+
+The pattern is the lesson: **VP9 decode here is memory-bandwidth-bound, not
+compute-bound.** Inter prediction is dominated by *copying reference pixels*
+(integer-MV blocks) and the loop filter by *moving pixels* — so SIMD-ing the
+*arithmetic* (madd, compound) barely moves the needle, and adding threads just
+adds memory traffic. The ~5–6× gap to FFmpeg is mostly structural (memory
+layout/prefetch + decades of tuning), not a missing multiply trick.
+
+**Conclusion:** the decoder is near its practical single-thread ceiling for a
+safe pure-Rust implementation. Further compute-level SIMD is low-value; the only
+real levers left are algorithmic memory-traffic reduction (hard) — or accepting
+the gap, since *bit-exact + memory-safe* is the honest story. `target-cpu=native`
+still buys ~30% on the non-kernel glue, for free.
 
 ## Caveats
 
