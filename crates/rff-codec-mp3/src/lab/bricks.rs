@@ -483,8 +483,8 @@ pub static BRICKS: &[Brick] = &[
         Phase::Roof,
         Class::Alg,
         Verify::External,
-        Status::Todo,
-        "Conformance corpus (round-trip + FFmpeg/LAME + quality)",
+        Status::Verified,
+        "Conformance corpus (8 signals: our-decoder floors + FFmpeg clean)",
     ),
     b(
         "R5",

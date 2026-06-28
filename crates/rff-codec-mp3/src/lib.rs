@@ -471,6 +471,75 @@ mod tests {
         );
     }
 
+    /// **R4 — conformance corpus.** A broad set of signals each round-trips through
+    /// encode → our decoder above a per-signal floor. With `MP3_ENC_DIR` set, the
+    /// `.mp3`s are dumped for the out-of-band FFmpeg/LAME cross-check.
+    #[test]
+    fn conformance_corpus_round_trips() {
+        let sr = 44100u32;
+        let frames = 14;
+        let n = frames * 1152;
+        let pi2 = std::f32::consts::TAU;
+        let tone = |f: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| 0.4 * (pi2 * f * i as f32 / sr as f32).sin())
+                .collect()
+        };
+        let noise = |seed: u32, amp: f32| -> Vec<f32> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    amp * ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+                })
+                .collect()
+        };
+        let sweep: Vec<f32> = {
+            let mut ph = 0f32;
+            (0..n)
+                .map(|i| {
+                    let f = 80.0 + (16000.0 - 80.0) * (i as f32 / n as f32);
+                    ph += pi2 * f / sr as f32;
+                    0.4 * ph.sin()
+                })
+                .collect()
+        };
+        // (name, mono signal, SNR floor dB) — tones reconstruct cleanly, noise
+        // is lossy at 128k so the floor is lower.
+        let corpus: Vec<(&str, Vec<f32>, f64)> = vec![
+            ("tone-250", tone(250.0), 40.0),
+            ("tone-1k", tone(1000.0), 50.0),
+            ("tone-4k", tone(4000.0), 45.0),
+            ("tone-12k", tone(12000.0), 30.0),
+            ("sweep", sweep, 15.0),
+            ("noise", noise(0xC0FFEE, 0.4), 5.0),
+            ("quiet-noise", noise(0x1234, 0.02), 3.0),
+            (
+                "two-tone",
+                {
+                    let a = tone(600.0);
+                    let b = tone(5200.0);
+                    a.iter().zip(&b).map(|(x, y)| 0.5 * (x + y)).collect()
+                },
+                25.0,
+            ),
+        ];
+
+        let dump_dir = std::env::var("MP3_ENC_DIR").ok();
+        for (name, sig, floor) in &corpus {
+            let mp3 = encode_mono(sig, sr);
+            assert!(!mp3.is_empty(), "{name}: no output");
+            if let Some(dir) = &dump_dir {
+                std::fs::write(format!("{dir}/{name}.mp3"), &mp3).expect("dump");
+            }
+            let out = decode_mono(mp3);
+            assert!(out.len() > n / 2, "{name}: too few samples");
+            let snr = best_snr(sig, &out);
+            eprintln!("[R4] {name:<12} SNR {snr:.1} dB (floor {floor})");
+            assert!(snr >= *floor, "{name}: SNR {snr:.1} below floor {floor}");
+        }
+    }
+
     /// **R2 — VBR.** Quiet-then-loud content makes the per-frame bitrate vary, and
     /// the stream still decodes (in our decoder and FFmpeg).
     #[test]
