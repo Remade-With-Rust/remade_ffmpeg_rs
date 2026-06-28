@@ -1,0 +1,74 @@
+name: release
+
+# Build the ffmpeg/ffprobe binaries for every platform and attach them to a
+# GitHub Release. Triggered by pushing a version tag (e.g. `v0.1.0`); also runs
+# on manual dispatch (builds the artifacts without publishing) for testing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # create the release and upload assets
+
+jobs:
+  binaries:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # The default build enables `h264-asm`, which assembles with nasm.
+      - uses: ilammy/setup-nasm@v1
+
+      - name: Build (release, default features + https)
+        run: cargo build --release --locked -p rff-cli --features https --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME:-dev}"
+          name="remade_ffmpeg_rs-${version}-${{ matrix.target }}"
+          bindir="target/${{ matrix.target }}/release"
+          mkdir "$name"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "$bindir/ffmpeg.exe" "$bindir/ffprobe.exe" "$name/"
+          else
+            cp "$bindir/ffmpeg" "$bindir/ffprobe" "$name/"
+          fi
+          cp readme.md LICENSE "$name/" 2>/dev/null || true
+          # SHA-256 checksums (sha256sum on Linux/Git-Bash, shasum on macOS).
+          if command -v sha256sum >/dev/null; then sumcmd="sha256sum"; else sumcmd="shasum -a 256"; fi
+          ( cd "$name" && $sumcmd ffmpeg* ffprobe* > SHA256SUMS.txt )
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "$name.zip" "$name" >/dev/null
+            echo "ASSET=$name.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$name.tar.gz" "$name"
+            echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          draft: true # review the draft before publishing
+          generate_release_notes: true
