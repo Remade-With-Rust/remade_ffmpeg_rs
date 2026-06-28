@@ -12,7 +12,7 @@ use crate::header::{FrameHeader, MpegVersion};
 use crate::tables;
 
 /// Decoded scalefactors for one granule/channel.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScaleFactors {
     /// Long-block bands `[0..21)` (band 21 is not coded).
     pub long: [u8; crate::frame::SFB_LONG],

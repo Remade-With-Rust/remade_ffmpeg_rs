@@ -54,7 +54,7 @@ pub enum BlockType {
 
 /// Per-granule, per-channel side information — the recipe for reconstructing one
 /// granule's spectrum from the Huffman-coded main data.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GranuleSideInfo {
     /// Bits of main data for this granule/channel (scalefactors + Huffman).
     pub part2_3_length: u16,
@@ -86,7 +86,7 @@ pub struct GranuleSideInfo {
 }
 
 /// All side information for one frame (both granules, both channels).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SideInfo {
     /// Back-pointer into the bit reservoir: where this frame's main data begins,
     /// counted in bytes *before* the current frame's main-data boundary.

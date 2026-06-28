@@ -344,7 +344,7 @@ pub static BRICKS: &[Brick] = &[
         Phase::Coding,
         Class::Alg,
         Verify::RoundTrip,
-        Status::Todo,
+        Status::Verified,
         "Side-info serializer (inverse of decode/sideinfo)",
     ),
     b(
@@ -352,7 +352,7 @@ pub static BRICKS: &[Brick] = &[
         Phase::Coding,
         Class::Alg,
         Verify::RoundTrip,
-        Status::Todo,
+        Status::Verified,
         "Scalefactor serializer (band-major, scfsi reuse)",
     ),
     b(
@@ -607,8 +607,8 @@ mod tests {
 
     #[test]
     fn next_unbuilt_is_first_incomplete() {
-        // Foundation + analysis + the Huffman coding bricks are verified; next is B5.
-        assert_eq!(next_unbuilt().map(|b| b.id), Some("B5"));
+        // Through the side-info/scalefactor serializers; next is frame assembly B7.
+        assert_eq!(next_unbuilt().map(|b| b.id), Some("B7"));
     }
 
     #[test]
