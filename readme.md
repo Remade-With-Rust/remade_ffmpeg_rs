@@ -22,18 +22,19 @@
 
 <!-- Lead with the number. This is why someone clicks the repo. -->
 
-> **Pre-release / scaffold.** The numbers below are **engineering targets**, not
-> yet measured — the codec bodies are still being implemented. They state what
-> "good" looks like and will be replaced with reproducible captures as each
-> codec lands. We will not ship a benchmark we can't reproduce.
+> **Pre-1.0, measured honestly.** Where a number is benchmarked we report it as
+> measured — flattering or not. We lead on what's structurally true today
+> (safety, correctness, license); raw speed is younger than FFmpeg's and we say
+> so. We will not ship a benchmark we can't reproduce.
 
-| | FFmpeg (C) | **remade_ffmpeg_rs (Rust)** | Target |
-|---|---:|---:|:---:|
-| Memory-safety CVEs in core path | many, historically | **0 (safe Rust)** | **structural** |
-| H.264 decode throughput | baseline | **≥ parity** | **≥ 1.0×** |
-| Cold-start / embed overhead | baseline | **lower (no FFI, no GPL)** | **≤ 1.0×** |
+| Dimension | FFmpeg (C) | **remade_ffmpeg_rs (Rust) — today** | Goal |
+|---|:---:|:---:|:---:|
+| Memory-safety CVEs (core path) | many, historically | **0 — safe Rust** | structural |
+| Conformance | reference | **bit-exact** (VP9 315/315 vectors; MP3 vs FFmpeg) | maintain |
+| VP9 decode, 1 thread | 1.0× | **~0.16–0.21×** — younger, optimizing | → parity |
+| License + embedding | LGPL/GPL · C FFI | **Apache-2.0 · pure Rust · no FFI** | — |
 
-<sub>Methodology + raw captures will live in [docs/benchmarks.md](docs/benchmarks.md) once codecs are implemented.</sub>
+<sub>Real numbers + how to reproduce them: [docs/benchmarks.md](docs/benchmarks.md). The VP9 speed figure is decode throughput on an i7-14650HX vs FFmpeg's native decoder.</sub>
 
 ---
 
