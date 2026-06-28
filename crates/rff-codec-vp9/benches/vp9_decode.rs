@@ -53,7 +53,9 @@ fn decode_all(registry: &CodecRegistry, packets: &[Packet]) -> u64 {
 }
 
 fn main() {
-    let ivf = include_bytes!("data/vp9_720p.ivf");
+    // Default: the committed 720p clip; override with VP9_BENCH_CLIP=<file.ivf>.
+    let owned = std::env::var("VP9_BENCH_CLIP").ok().map(|p| std::fs::read(p).unwrap());
+    let ivf: &[u8] = owned.as_deref().unwrap_or(include_bytes!("data/vp9_720p.ivf"));
     let (raw_frames, w, h) = parse_ivf(ivf);
     let packets: Vec<Packet> =
         raw_frames.iter().map(|f| Packet::from_data(0, f.clone())).collect();
