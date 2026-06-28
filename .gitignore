@@ -11,3 +11,5 @@ crates/rff-ui/dist/
 
 # External PEAQ oracle (fetched by tools/quality/setup_peaq.py, not vendored)
 /PEAQ_python/
+__pycache__/
+*.pyc
