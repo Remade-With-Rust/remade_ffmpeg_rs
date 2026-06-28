@@ -129,7 +129,7 @@ pub fn serialize_scalefactors(
     }
 }
 
-// ── B7: frame assembly (B8 reservoir borrowing deferred) ──────────────────────
+// ── B7: single-frame assembly (reservoir-free) ────────────────────────────────
 
 /// Encoder-side reservoir: how many spare main-data bytes are banked.
 #[derive(Debug, Clone, Default)]
@@ -138,14 +138,21 @@ pub struct EncReservoir {
     pub spare_bytes: usize,
 }
 
+/// Physical main-data capacity of a frame (bytes after header/CRC/side-info).
+fn region_capacity(header: &FrameHeader) -> usize {
+    let crc = if header.crc_protected { 2 } else { 0 };
+    header
+        .frame_size()
+        .saturating_sub(4 + crc + header.side_info_len())
+}
+
 /// **B7** — assemble one complete MP3 frame: header (+ optional CRC) + side info +
 /// main data, padded to the frame size.
 ///
 /// This runs **reservoir-free** (`main_data_begin = 0`): each frame's main data
 /// must fit within its own region, and the unused tail is zero stuffing. That is a
-/// fully valid, decodable CBR frame — the bit-reservoir *borrowing* (**B8**, using
-/// `spare_bytes` to set `main_data_begin > 0`) is the quality optimisation layered
-/// on next. The reservoir's banked slack is tracked here so B8 can consume it.
+/// fully valid, decodable CBR frame. [`assemble_stream`] (**B8**) layers the
+/// bit-reservoir *borrowing* on top when the whole frame sequence is known.
 pub fn format(
     header: &FrameHeader,
     side_info: &SideInfo,
@@ -153,24 +160,78 @@ pub fn format(
     reservoir: &mut EncReservoir,
 ) -> Vec<u8> {
     let mut si = side_info.clone();
-    si.main_data_begin = 0; // B8: reservoir borrowing not yet wired.
+    si.main_data_begin = 0;
 
     let mut out = header.to_bytes().to_vec();
     if header.crc_protected {
-        // brick (B7+): real CRC-16 over header bits 16..32 + the side-info block.
-        // The decoder skips these two bytes without validating, so a placeholder
-        // keeps the framing correct until the CRC is computed.
-        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&[0, 0]); // brick: real CRC-16 (decoder skips it)
     }
     out.extend_from_slice(&serialize_side_info(header, &si));
 
-    let region_cap = header.frame_size().saturating_sub(out.len());
+    let region_cap = region_capacity(header);
     let used = main_data.len().min(region_cap);
     out.extend_from_slice(&main_data[..used]);
     out.resize(header.frame_size(), 0); // zero stuffing fills the rest
 
-    // Bank the slack this frame leaves for B8 to borrow later.
     reservoir.spare_bytes = region_cap - used;
+    out
+}
+
+// ── B8: reservoir-aware stream assembly ───────────────────────────────────────
+
+/// **B8** — assemble a whole sequence of frames using the bit reservoir.
+///
+/// The main data of all frames forms one continuous stream `MD`; each frame's
+/// fixed-size physical region holds the next `C_n` bytes of `MD`, so a frame whose
+/// data is shorter than its region leaves room that the *following* frame's data
+/// flows into. `main_data_begin_n = P_n − S_n` (physical-region start minus the
+/// frame's start in `MD`) tells the decoder how far back to reach. This is the
+/// exact inverse of the decoder's rolling-buffer `Reservoir::assemble`, so the
+/// stream round-trips; it also lets a complex frame spend more than its own
+/// region by borrowing the slack earlier frames banked.
+///
+/// Each item is `(header, side_info, main_data)`; `side_info.main_data_begin` is
+/// overwritten. Requires the cumulative data never to outrun cumulative capacity
+/// (the rate loop's job) and `main_data_begin ≤ 511`.
+pub fn assemble_stream(frames: &[(FrameHeader, SideInfo, Vec<u8>)]) -> Vec<u8> {
+    const MAX_BEGIN: usize = 511; // the 9-bit main_data_begin field
+
+    let caps: Vec<usize> = frames.iter().map(|(h, _, _)| region_capacity(h)).collect();
+
+    // Build the continuous main-data stream, recording each frame's begin. When
+    // banked slack would exceed 511, insert stuffing so the back-reference fits
+    // (the standard reservoir cap — the wasted bytes are unreferenced ancillary).
+    let mut md = Vec::new();
+    let mut begins = Vec::with_capacity(frames.len());
+    let mut p = 0usize; // P_n
+    for (n, (_, _, data)) in frames.iter().enumerate() {
+        if p > md.len() + MAX_BEGIN {
+            md.resize(p - MAX_BEGIN, 0); // stuffing → begin == MAX_BEGIN
+        }
+        let begin = p
+            .checked_sub(md.len())
+            .expect("frame data outran cumulative capacity (needs rate control)");
+        begins.push(begin);
+        md.extend_from_slice(data);
+        p += caps[n];
+    }
+    if md.len() < p {
+        md.resize(p, 0); // pad the final region
+    }
+
+    let mut out = Vec::new();
+    let mut p = 0usize;
+    for (n, (header, side_info, _)) in frames.iter().enumerate() {
+        let mut si = side_info.clone();
+        si.main_data_begin = begins[n] as u16;
+        out.extend_from_slice(&header.to_bytes());
+        if header.crc_protected {
+            out.extend_from_slice(&[0, 0]);
+        }
+        out.extend_from_slice(&serialize_side_info(header, &si));
+        out.extend_from_slice(&md[p..p + caps[n]]);
+        p += caps[n];
+    }
     out
 }
 
@@ -356,6 +417,78 @@ mod tests {
             frames += 1;
         }
         assert_eq!(frames, 2, "both assembled frames must decode");
+    }
+
+    #[test]
+    fn reservoir_stream_round_trips_and_borrows() {
+        use crate::decode::reservoir::Reservoir;
+        use crate::frame::GranuleSideInfo;
+
+        let header = hdr(ChannelMode::Mono);
+        let cap = region_capacity(&header);
+        // Frame 0 banks slack (tiny data); frame 1 borrows (data > its region);
+        // frame 2 settles. part2_3_length=0 → the bytes are pure reservoir payload.
+        let datas = [
+            vec![0xAAu8; 40],        // small → banks ~cap-40
+            vec![0xBBu8; cap + 120], // larger than one region → must borrow
+            vec![0xCCu8; 60],
+            vec![0xDDu8; 30],
+        ];
+        let si_silent = {
+            let mut si = SideInfo::default();
+            for gr in 0..2 {
+                si.granules[gr][0] = GranuleSideInfo::default();
+            }
+            si
+        };
+        let frames: Vec<_> = datas
+            .iter()
+            .map(|d| (header.clone(), si_silent.clone(), d.clone()))
+            .collect();
+
+        let stream = assemble_stream(&frames);
+        assert_eq!(stream.len(), frames.len() * header.frame_size());
+
+        // Walk the assembled stream the way a demuxer would: read each frame's
+        // physical region + its coded main_data_begin, run the *decoder's*
+        // reservoir, and confirm each frame's data is recovered as the prefix of
+        // the assembled main data.
+        let fsz = header.frame_size();
+        let si_len = header.side_info_len();
+        let mut res = Reservoir::default();
+        let mut saw_borrow = false;
+        for (n, d) in datas.iter().enumerate() {
+            let frame = &stream[n * fsz..(n + 1) * fsz];
+            let si = crate::decode::sideinfo::parse(&header, &frame[4..4 + si_len]).unwrap();
+            let begin = si.main_data_begin;
+            if begin > 0 {
+                saw_borrow = true;
+            }
+            let region = &frame[4 + si_len..];
+            let assembled = res.assemble(begin, region);
+            let want = d.len().min(assembled.len());
+            assert_eq!(
+                &assembled[..want],
+                &d[..want],
+                "frame {n} data not recovered"
+            );
+        }
+        assert!(
+            saw_borrow,
+            "the scenario must exercise a non-zero back-reference"
+        );
+
+        // And the whole stream must decode frame-for-frame.
+        use rff_codec::Decoder;
+        use rff_core::{Frame, Packet};
+        let mut dec = crate::Mp3Decoder::default();
+        dec.send_packet(&Packet::from_data(0, stream)).unwrap();
+        dec.flush();
+        let mut frames_out = 0;
+        while let Ok(Frame::Audio(_)) = dec.receive_frame() {
+            frames_out += 1;
+        }
+        assert_eq!(frames_out, datas.len(), "every frame must decode");
     }
 
     #[test]

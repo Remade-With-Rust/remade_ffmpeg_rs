@@ -368,8 +368,8 @@ pub static BRICKS: &[Brick] = &[
         Phase::Coding,
         Class::Alg,
         Verify::RoundTrip,
-        Status::Todo,
-        "Encoder bit reservoir (main_data_begin bookkeeping)",
+        Status::Verified,
+        "Encoder bit reservoir (stream assembler, borrows + caps at 511)",
     ),
     // ── Floor 3: dumb-but-valid controller ─────────────────────────────────
     b(
@@ -607,8 +607,8 @@ mod tests {
 
     #[test]
     fn next_unbuilt_is_first_incomplete() {
-        // Through frame assembly (B7); next is the reservoir borrowing (B8).
-        assert_eq!(next_unbuilt().map(|b| b.id), Some("B8"));
+        // Foundation + analysis + all of Floor 2 (coding) are verified; next is C1.
+        assert_eq!(next_unbuilt().map(|b| b.id), Some("C1"));
     }
 
     #[test]
