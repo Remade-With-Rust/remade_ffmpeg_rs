@@ -43,3 +43,8 @@ multiple-versions = "warn"
 
 [advisories]
 yanked = "deny"
+# `paste` (RUSTSEC-2024-0436) is flagged *unmaintained*, not vulnerable — a
+# stable proc-macro pulled in transitively (via rav1e / codec deps) with no
+# known security issue and no drop-in replacement under our control.
+# Acknowledge it explicitly; revisit if the upstreams migrate off it.
+ignore = ["RUSTSEC-2024-0436"]

@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# `rff-ui` (the Dioxus front-end) is excluded from build-requiring jobs: it
+# needs a system webview toolchain and pulls MPL deps, and is never part of the
+# core or the published binaries — the same scoping as `default-members` and
+# `deny.toml`. The default build also needs `nasm` for the `h264-asm` path.
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/setup-nasm@v1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --exclude rff-ui --locked
+
+  clippy:
+    name: clippy (informational)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: ilammy/setup-nasm@v1
+      - uses: Swatinem/rust-cache@v2
+      # Not yet `-D warnings`: ~350 pre-existing lints, ~220 of them intentional
+      # excessive-precision in codec constant tables. Surfaced here; tightening
+      # to a hard gate is a tracked follow-up cleanup.
+      - run: cargo clippy --workspace --exclude rff-ui --all-targets
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
