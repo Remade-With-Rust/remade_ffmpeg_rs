@@ -62,7 +62,9 @@ pub(crate) fn cost_bit(prob: u8, bit: u32) -> u64 {
 pub(crate) fn tree_bit_cost(tree: &[i8], probs: &[u8], symbol: i32) -> u64 {
     let mut path: Vec<(usize, u32)> = Vec::new();
     super::bitwriter::find_tree_path(tree, 0, symbol, &mut path);
-    path.iter().map(|&(node, bit)| cost_bit(probs[node >> 1], bit)).sum()
+    path.iter()
+        .map(|&(node, bit)| cost_bit(probs[node >> 1], bit))
+        .sum()
 }
 
 /// Cost-accumulating sink (Q8 bits) for B2.

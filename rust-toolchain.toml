@@ -1,3 +1,5 @@
 [toolchain]
-channel = "stable"
+# Pinned so rustfmt/clippy are reproducible: a floating `stable` lets a rustfmt
+# bump silently re-break the `fmt --check` CI gate. Bump this deliberately.
+channel = "1.95.0"
 components = ["rustfmt", "clippy"]

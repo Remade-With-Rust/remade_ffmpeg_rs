@@ -499,7 +499,11 @@ mod profile_tests {
             enc.encode_frame_reservoir(&header, &[pcm], 0.5);
         }
         let stream = enc.finish_reservoir();
-        assert_eq!(stream.len(), n * fsize, "reservoir stream must be frame-aligned");
+        assert_eq!(
+            stream.len(),
+            n * fsize,
+            "reservoir stream must be frame-aligned"
+        );
         let mut borrowed = false;
         for f in 0..n {
             let h = &stream[f * fsize..];
@@ -509,7 +513,10 @@ mod profile_tests {
             let mdb = ((h[4] as u16) << 1) | (h[5] >> 7) as u16;
             borrowed |= mdb > 0;
         }
-        assert!(borrowed, "reservoir never borrowed — main_data_begin was 0 everywhere");
+        assert!(
+            borrowed,
+            "reservoir never borrowed — main_data_begin was 0 everywhere"
+        );
     }
 
     /// **3R1 lookahead** — the two-pass path must emit a frame-aligned, sync-valid stream,
@@ -538,7 +545,11 @@ mod profile_tests {
         };
 
         let stream = Mp3Encode::new().encode_reservoir_lookahead(&mkframes(), 0.5);
-        assert_eq!(stream.len(), n * fsize, "lookahead stream must be frame-aligned");
+        assert_eq!(
+            stream.len(),
+            n * fsize,
+            "lookahead stream must be frame-aligned"
+        );
         for f in 0..n {
             assert_eq!(stream[f * fsize], 0xFF, "frame {f} lost sync");
             assert_eq!(stream[f * fsize + 1], 0xFB, "frame {f} bad version/layer");
@@ -550,7 +561,11 @@ mod profile_tests {
         for (h, ch) in &mkframes() {
             causal.encode_frame_reservoir(h, ch, 0.0);
         }
-        assert_eq!(la0, causal.finish_reservoir(), "gain=0 lookahead must equal causal");
+        assert_eq!(
+            la0,
+            causal.finish_reservoir(),
+            "gain=0 lookahead must equal causal"
+        );
     }
 
     /// Profiling driver (run explicitly): encodes ~10 s of *dense* broadband audio

@@ -19,11 +19,11 @@ licensed (CI-enforced by `cargo-deny`).
 
 | Codec | Decode | Encode | Implementation | Verification |
 |-------|:------:|:------:|----------------|--------------|
-| VP9 | ✅ | — | in-house | **bit-exact** (315/315 libvpx vectors) |
-| MP3 (MPEG-1/2 Layer III) | ✅ | ✅ | in-house | decode **bit-exact** vs FFmpeg; encode basic |
+| VP9 | ✅ | ✅ | in-house | decode **bit-exact** (315/315 libvpx vectors); encode **pixel-exact vs libvpx & ffmpeg** (RDO, golden/ALT-REF, two-pass) |
+| MP3 (MPEG-1/2 Layer III) | ✅ | ✅ | in-house | decode **bit-exact** vs FFmpeg; encode (CBR/VBR, joint stereo, block switching) |
 | AAC&#8209;LC | ✅ | — | in-house | validated · ⚖ |
 | PCM | ✅ | ✅ | in-house | validated |
-| AV1 / AVIF | ✅ | ✅ | rav1d / rav1e (pure Rust) | validated |
+| AV1 / AVIF | ✅ | ✅ | rav1d / rav1e (pure Rust) | validated · **decode robustness:** rav1d's input validation `abort()`s on malformed AV1 under `debug_assertions` (debug builds); **release returns `Err`** (verified). We pre-validate the sample at our boundary, but sandbox the AVIF path if you decode untrusted input in debug/CI. |
 | AV2 | 🚧 | — | in-house | **in development** (decoder nearly complete) |
 | H.264 / AVC | ✅ | ✅ | rusty_h264 (pure Rust; opt-in SIMD asm) | validated · ⚖ |
 | Opus | ✅ | ✅ | opus-rs (pure Rust) | validated |

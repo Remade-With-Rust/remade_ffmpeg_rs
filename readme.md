@@ -88,7 +88,7 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 
 | Kind | Supported | Status |
 |---|---|---|
-| Video codec | **vp9** (VP9) | **decode** — in-house pure-Rust decoder, **bit-exact against all 315 official libvpx conformance vectors**; profiles 0–3 (4:2:0/4:2:2/4:4:4, 8/10/12-bit), AVX2 + NEON kernels (no encoder; perf tuning to follow) |
+| Video codec | **vp9** (VP9) | **decode + encode** — in-house pure-Rust. Decoder **bit-exact against all 315 official libvpx conformance vectors** (profiles 0–3, 8/10/12-bit, AVX2 + NEON). Encoder: RDO partition/mode, rate control (CBR + two-pass), golden/ALT-REF + temporal filtering, **validated pixel-exact vs libvpx & ffmpeg** (~+0.9% keyframe BD-rate; younger than libvpx, optimizing) |
 | Video codec | **h264** (H.264 / AVC) | **decode + encode** — [`rusty_h264`](https://crates.io/crates/rusty_h264) with SIMD asm, **default** |
 | Video codec | **AV1** (AV1) | **decode + encode** — [`rav1d`] and ['rav1e'] |
 | Image codec | **avif** (AV1 still image) | **decode + encode**, 8- & 10-bit (rav1d / rav1e) |

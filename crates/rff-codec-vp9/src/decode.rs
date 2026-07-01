@@ -159,7 +159,9 @@ impl FrameCounts {
     }
 
     /// Sum another set of counts into these — merges the per-tile counts from
-    /// parallel tile-column decode back into the frame total.
+    /// parallel tile-column decode back into the frame total. Kept as scaffolding for
+    /// tile-threaded decode (not currently wired up — see the perf notes).
+    #[allow(dead_code)]
     fn merge(&mut self, o: &FrameCounts) {
         self.coef.merge(o.coef.as_ref());
         self.eob_branch.merge(o.eob_branch.as_ref());

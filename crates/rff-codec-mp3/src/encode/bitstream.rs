@@ -327,8 +327,15 @@ mod tests {
         let mut h = hdr(ChannelMode::Mono);
         h.crc_protected = true;
         let out = format(&h, &SideInfo::default(), &[], &mut EncReservoir::default());
-        let want = crc16([h.to_bytes()[2], h.to_bytes()[3]], &serialize_side_info(&h, &SideInfo::default()));
-        assert_eq!(&out[4..6], &want.to_be_bytes(), "CRC bytes follow the 4-byte header");
+        let want = crc16(
+            [h.to_bytes()[2], h.to_bytes()[3]],
+            &serialize_side_info(&h, &SideInfo::default()),
+        );
+        assert_eq!(
+            &out[4..6],
+            &want.to_be_bytes(),
+            "CRC bytes follow the 4-byte header"
+        );
     }
 
     #[test]

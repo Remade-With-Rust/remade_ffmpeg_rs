@@ -125,8 +125,8 @@ mod tests {
                     for (idx, &p) in scan.iter().enumerate() {
                         let pos = p as usize;
                         let st = if idx == 0 { dc } else { ac };
-                        let mag = ((levels[pos].unsigned_abs() as i64 * st as i64) >> dq_shift)
-                            as i32;
+                        let mag =
+                            ((levels[pos].unsigned_abs() as i64 * st as i64) >> dq_shift) as i32;
                         let want = if levels[pos] < 0 { -mag } else { mag };
                         assert_eq!(dqcoeff[pos], want, "dequant identity {n}x{n} pos {pos}");
                         if idx >= eob {

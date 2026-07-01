@@ -153,11 +153,7 @@ fn temporal_filter(
         let d = mc as f64 - a as f64;
         MAX_W * (-(d * d) / two_sig2).exp()
     };
-    let mut out = [
-        anchor[0].clone(),
-        anchor[1].clone(),
-        anchor[2].clone(),
-    ];
+    let mut out = [anchor[0].clone(), anchor[1].clone(), anchor[2].clone()];
     let mut by = 0;
     while by < ch {
         let mut bx = 0;
@@ -675,7 +671,13 @@ impl Vp9Encoder {
 
     /// Shown P frame: predicts from LAST(slot0)/GOLDEN(golden_slot)/ALTREF(arf_slot when
     /// `with_altref`), refreshes LAST(slot0). Returns the coded bytes.
-    fn code_p_slotted(&mut self, coded: [Vec<u16>; 3], w: u32, h: u32, with_altref: bool) -> Vec<u8> {
+    fn code_p_slotted(
+        &mut self,
+        coded: [Vec<u16>; 3],
+        w: u32,
+        h: u32,
+        with_altref: bool,
+    ) -> Vec<u8> {
         let q = self.next_qindex();
         let idx = [0, self.golden_slot, self.arf_slot];
         let mut enc = FrameEncoder::new(w, h, q, coded, self.slots[0].clone());
@@ -830,7 +832,9 @@ mod tests {
                 .enumerate()
                 {
                     for yy in 0..ph {
-                        raw.extend_from_slice(&vf.planes[p][yy * vf.strides[p]..yy * vf.strides[p] + pw]);
+                        raw.extend_from_slice(
+                            &vf.planes[p][yy * vf.strides[p]..yy * vf.strides[p] + pw],
+                        );
                     }
                 }
             }
@@ -1000,7 +1004,10 @@ mod tests {
             "temporal filter did not denoise: on={on_psnr:.2} off={off_psnr:.2}"
         );
         // ...and does not cost group size.
-        assert!(on_bytes <= off_bytes, "tf grew the group: on={on_bytes} off={off_bytes}");
+        assert!(
+            on_bytes <= off_bytes,
+            "tf grew the group: on={on_bytes} off={off_bytes}"
+        );
     }
 
     /// Cross-GOP chaining: two `-lag 8` groups over 16 frames must contain exactly ONE
@@ -1045,7 +1052,10 @@ mod tests {
         // A frame is a key frame iff (not show_existing and frame_type=0), i.e. the
         // show_existing (bit3) and frame_type (bit2) bits of byte0 are both 0.
         let keyframes = packets.iter().filter(|p| p[0] & 0x0C == 0).count();
-        assert_eq!(keyframes, 1, "exactly one key frame expected (chained groups)");
+        assert_eq!(
+            keyframes, 1,
+            "exactly one key frame expected (chained groups)"
+        );
 
         let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
         let mut ours: Vec<VideoFrame> = Vec::new();
@@ -1086,7 +1096,9 @@ mod tests {
                 .enumerate()
                 {
                     for yy in 0..ph {
-                        raw.extend_from_slice(&vf.planes[p][yy * vf.strides[p]..yy * vf.strides[p] + pw]);
+                        raw.extend_from_slice(
+                            &vf.planes[p][yy * vf.strides[p]..yy * vf.strides[p] + pw],
+                        );
                     }
                 }
             }

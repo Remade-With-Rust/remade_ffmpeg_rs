@@ -191,7 +191,14 @@ impl FrameEncoder {
         let mk = |ss_x: usize, ss_y: usize, buf: Vec<u16>| {
             let w = cw >> ss_x;
             let h = ch >> ss_y;
-            Plane { buf, stride: w, ss_x, ss_y, w, h }
+            Plane {
+                buf,
+                stride: w,
+                ss_x,
+                ss_y,
+                w,
+                h,
+            }
         };
         // Copy an unpadded (`w×h`) source plane into a `w×hp` buffer, replicating the
         // last in-frame row into the vertical padding (libvpx `extend_frame`), so the
@@ -876,7 +883,11 @@ impl FrameEncoder {
         }
         let yprobs = kf_y_mode_probs(mi, above.as_ref(), left.as_ref(), 0);
         c += tree_bit_cost(&INTRA_MODE_TREE, yprobs, mi.mode as i32);
-        c += tree_bit_cost(&INTRA_MODE_TREE, kf_uv_mode_probs(mi.mode), mi.uv_mode as i32);
+        c += tree_bit_cost(
+            &INTRA_MODE_TREE,
+            kf_uv_mode_probs(mi.mode),
+            mi.uv_mode as i32,
+        );
         c
     }
 
@@ -933,7 +944,14 @@ impl FrameEncoder {
                 );
             }
             let mctx = get_mode_context(
-                &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, bsize,
+                &self.mi,
+                self.mi_cols,
+                self.mi_rows,
+                0,
+                self.mi_cols,
+                mi_row,
+                mi_col,
+                bsize,
             );
             c += tree_bit_cost(
                 &INTER_MODE_TREE,
@@ -995,7 +1013,13 @@ impl FrameEncoder {
     }
 
     /// λ-weighted cost of the partition flag itself at this node.
-    fn part_flag_cost(&self, probs: &[u8; 3], partition: usize, has_rows: bool, has_cols: bool) -> f64 {
+    fn part_flag_cost(
+        &self,
+        probs: &[u8; 3],
+        partition: usize,
+        has_rows: bool,
+        has_cols: bool,
+    ) -> f64 {
         let q8 = if has_rows && has_cols {
             tree_bit_cost(&PARTITION_TREE, probs, partition as i32)
         } else if !has_rows && has_cols {
@@ -1009,7 +1033,14 @@ impl FrameEncoder {
     }
 
     /// In-frame pixel extent of a block on plane `p` (clamped for partial edge SBs).
-    fn block_px(&self, mi_row: usize, mi_col: usize, bwl: usize, bhl: usize, p: usize) -> (usize, usize, usize, usize) {
+    fn block_px(
+        &self,
+        mi_row: usize,
+        mi_col: usize,
+        bwl: usize,
+        bhl: usize,
+        p: usize,
+    ) -> (usize, usize, usize, usize) {
         let ss = (p != 0) as usize;
         let (x0, y0) = ((mi_col * 8) >> ss, (mi_row * 8) >> ss);
         let (cwp, chp) = ((self.mi_cols * 8) >> ss, (self.mi_rows * 8) >> ss);
@@ -1047,7 +1078,14 @@ impl FrameEncoder {
         }
     }
 
-    fn restore_block(&mut self, mi_row: usize, mi_col: usize, bwl: usize, bhl: usize, s: &BlockSnap) {
+    fn restore_block(
+        &mut self,
+        mi_row: usize,
+        mi_col: usize,
+        bwl: usize,
+        bhl: usize,
+        s: &BlockSnap,
+    ) {
         for p in 0..3 {
             let (x0, y0, bw, bh) = self.block_px(mi_row, mi_col, bwl, bhl, p);
             let st = self.rec[p].stride;
@@ -1073,7 +1111,13 @@ impl FrameEncoder {
     /// exact RD, mirroring `encode_partition`'s geometry. Records the decision in
     /// `part_map`, evolves the entropy/segment context as the winner would, and
     /// leaves the winner's reconstruction in `rec`. Returns the block's RD cost.
-    fn rd_pick_partition(&mut self, mi_row: usize, mi_col: usize, bsize: usize, n4x4_l2: usize) -> f64 {
+    fn rd_pick_partition(
+        &mut self,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+        n4x4_l2: usize,
+    ) -> f64 {
         // A quadrant entirely outside the frame contributes nothing (mirrors the
         // early return in `encode_partition`).
         if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
@@ -1128,10 +1172,17 @@ impl FrameEncoder {
         let (partition, cost) = if choose_none {
             (PARTITION_NONE, none_rd) // NONE's recon+context already in place
         } else {
-            self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, split_snap.as_ref().unwrap());
+            self.restore_block(
+                mi_row,
+                mi_col,
+                n4x4_l2,
+                n4x4_l2,
+                split_snap.as_ref().unwrap(),
+            );
             (PARTITION_SPLIT, split_rd)
         };
-        self.part_map.insert((mi_row, mi_col, bsize), partition as u8);
+        self.part_map
+            .insert((mi_row, mi_col, bsize), partition as u8);
 
         // Evolve the segment (partition) context exactly as the emit pass will.
         let subsize = subsize(partition, bsize) as usize;
@@ -1210,7 +1261,14 @@ impl FrameEncoder {
                 self.fc.single_ref_prob[ctx1][1],
             );
             let mctx = get_mode_context(
-                &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, bsize,
+                &self.mi,
+                self.mi_cols,
+                self.mi_rows,
+                0,
+                self.mi_cols,
+                mi_row,
+                mi_col,
+                bsize,
             );
             write_inter_mode(enc, mi.mode, &self.fc.inter_mode_probs[mctx]);
             if mi.mode == NEWMV {
@@ -1219,7 +1277,11 @@ impl FrameEncoder {
             }
         } else {
             // Intra inside an inter frame: Y mode by block-size group, then UV.
-            write_intra_mode(enc, mi.mode, &self.fc.y_mode_prob[SIZE_GROUP[bsize] as usize]);
+            write_intra_mode(
+                enc,
+                mi.mode,
+                &self.fc.y_mode_prob[SIZE_GROUP[bsize] as usize],
+            );
             write_intra_mode(enc, mi.uv_mode, &self.fc.uv_mode_prob[mi.mode as usize]);
         }
 
@@ -1274,8 +1336,20 @@ impl FrameEncoder {
             }
             self.active_ref = slot;
             let (cand, _) = find_mv_refs(
-                &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, bsize,
-                rf, &self.sign_bias, NEWMV, -1, edges, None,
+                &self.mi,
+                self.mi_cols,
+                self.mi_rows,
+                0,
+                self.mi_cols,
+                mi_row,
+                mi_col,
+                bsize,
+                rf,
+                &self.sign_bias,
+                NEWMV,
+                -1,
+                edges,
+                None,
             );
             let predictor = lower_mv_precision(cand[0], false);
             let best_mv = self.search_mv(mi_row, mi_col, predictor);
@@ -1283,14 +1357,28 @@ impl FrameEncoder {
             // ALTREF (two) on near-ties.
             let ref_bits = if rf == LAST_FRAME { 1.0 } else { 2.0 };
             let j_zero = self.rd_cost_y(
-                &mk_inter(rf, ZEROMV, (0, 0)), mi_row, mi_col, bsize, bwl, bhl, &snap, 4.0 + ref_bits,
+                &mk_inter(rf, ZEROMV, (0, 0)),
+                mi_row,
+                mi_col,
+                bsize,
+                bwl,
+                bhl,
+                &snap,
+                4.0 + ref_bits,
             );
             if j_zero < best_inter.0 {
                 best_inter = (j_zero, slot, rf, ZEROMV, (0, 0), predictor);
             }
             if best_mv != (0, 0) {
                 let j_new = self.rd_cost_y(
-                    &mk_inter(rf, NEWMV, best_mv), mi_row, mi_col, bsize, bwl, bhl, &snap, 16.0 + ref_bits,
+                    &mk_inter(rf, NEWMV, best_mv),
+                    mi_row,
+                    mi_col,
+                    bsize,
+                    bwl,
+                    bhl,
+                    &snap,
+                    16.0 + ref_bits,
                 );
                 if j_new < best_inter.0 {
                     best_inter = (j_new, slot, rf, NEWMV, best_mv, predictor);
@@ -2224,7 +2312,10 @@ mod tests {
 
         // Most of P2 should reference GOLDEN (key ≈ P2), not the unrelated LAST.
         let refs = p2.debug_block_refs();
-        let gold = refs.iter().filter(|&&r| r == crate::block::GOLDEN_FRAME).count();
+        let gold = refs
+            .iter()
+            .filter(|&&r| r == crate::block::GOLDEN_FRAME)
+            .count();
         assert!(
             gold > refs.len() / 2,
             "expected majority GOLDEN, got {gold}/{}",
@@ -2272,7 +2363,10 @@ mod tests {
                 ivf.extend_from_slice(b);
             }
             std::fs::write(format!("{dir}/gold.ivf"), &ivf).unwrap();
-            let raw: Vec<u8> = p2rec.iter().flat_map(|p| p.iter().map(|&v| v as u8)).collect();
+            let raw: Vec<u8> = p2rec
+                .iter()
+                .flat_map(|p| p.iter().map(|&v| v as u8))
+                .collect();
             std::fs::write(format!("{dir}/gold.p2.yuv"), &raw).unwrap();
         }
     }
@@ -2953,7 +3047,8 @@ mod tests {
         let rec: Vec<Vec<u16>> = enc.recon().iter().map(|p| p.to_vec()).collect();
 
         // The decision must adapt: more than one distinct block size in the frame.
-        let sizes: std::collections::HashSet<u8> = enc.debug_block_sizes().iter().copied().collect();
+        let sizes: std::collections::HashSet<u8> =
+            enc.debug_block_sizes().iter().copied().collect();
         assert!(
             sizes.len() >= 2,
             "partition RD produced a single block size {sizes:?} — not adapting"
@@ -3079,7 +3174,8 @@ mod tests {
         crate::register(&mut reg);
         let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
         for t in 0..n {
-            dec.send_packet(&Packet::from_data(0, streams[t].clone())).unwrap();
+            dec.send_packet(&Packet::from_data(0, streams[t].clone()))
+                .unwrap();
             let Frame::Video(vf) = dec.receive_frame().unwrap() else {
                 panic!("video")
             };
@@ -3131,8 +3227,7 @@ mod tests {
     fn inter_empty_blocks_coded_as_skip() {
         let (w, h) = (64u32, 64u32);
         let (cw, ch) = (64usize, 64usize);
-        let pat =
-            |x: usize, y: usize| ((x.wrapping_mul(31) ^ y.wrapping_mul(57)) % 256) as u16;
+        let pat = |x: usize, y: usize| ((x.wrapping_mul(31) ^ y.wrapping_mul(57)) % 256) as u16;
         let src = || -> [Vec<u16>; 3] {
             let y: Vec<u16> = (0..cw * ch).map(|i| pat(i % cw, i / cw)).collect();
             let uv = vec![128u16; (cw / 2) * (ch / 2)];

@@ -382,7 +382,8 @@ impl Encoder for Mp3Encoder {
                 let fsize = header.frame_size();
                 let stream = if self.resv_lookahead {
                     let frames = std::mem::take(&mut self.resv_frames_pcm);
-                    self.state.encode_reservoir_lookahead(&frames, self.resv_gain)
+                    self.state
+                        .encode_reservoir_lookahead(&frames, self.resv_gain)
                 } else {
                     self.state.finish_reservoir()
                 };
@@ -1013,7 +1014,10 @@ mod tests {
     /// Used to check our V1/V2/V2.5 encoder output is valid (decodable by a neutral ref).
     #[test]
     fn encode_at_rate_to_file() {
-        let Some(rate) = std::env::var("ENC_RATE").ok().and_then(|s| s.parse::<u32>().ok()) else {
+        let Some(rate) = std::env::var("ENC_RATE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
             return;
         };
         let n = rate as usize * 2;

@@ -1069,12 +1069,22 @@ mod tests {
     #[test]
     fn dc_add_matches_libvpx() {
         fn drs(x: i64) -> i64 {
-            if x >= 0 { (x + 8192) >> 14 } else { -(((-x) + 8192) >> 14) }
+            if x >= 0 {
+                (x + 8192) >> 14
+            } else {
+                -(((-x) + 8192) >> 14)
+            }
         }
-        fn rp2(x: i64, n: u32) -> i64 { (x + (1 << (n - 1))) >> n }
+        fn rp2(x: i64, n: u32) -> i64 {
+            (x + (1 << (n - 1))) >> n
+        }
         fn libvpx_dc(dc: i64, n: usize) -> i64 {
             let o = drs(drs(dc * 11585) * 11585);
-            match n { 4 => rp2(o, 4), 8 => rp2(o, 5), _ => rp2(o, 6) }
+            match n {
+                4 => rp2(o, 4),
+                8 => rp2(o, 5),
+                _ => rp2(o, 6),
+            }
         }
         let mut bad = 0;
         for &n in &[4usize, 8, 16, 32] {
@@ -1162,12 +1172,19 @@ mod tests {
             let s3 = drs(inp[1] * C8 + inp[3] * C24);
             [s0 + s3, s1 + s2, s1 - s2, s0 - s3]
         }
-        fn rp2(x: i64, n: u32) -> i64 { (x + (1 << (n - 1))) >> n }
+        fn rp2(x: i64, n: u32) -> i64 {
+            (x + (1 << (n - 1))) >> n
+        }
         // libvpx idct4x4_16_add over a 128 base plane.
         fn libvpx4x4(co: &[i32]) -> Vec<i64> {
             let mut out = [[0i64; 4]; 4];
             for r in 0..4 {
-                let row = [co[r * 4] as i64, co[r * 4 + 1] as i64, co[r * 4 + 2] as i64, co[r * 4 + 3] as i64];
+                let row = [
+                    co[r * 4] as i64,
+                    co[r * 4 + 1] as i64,
+                    co[r * 4 + 2] as i64,
+                    co[r * 4 + 3] as i64,
+                ];
                 out[r] = idct4(&row);
             }
             let mut dst = vec![0i64; 16];
@@ -1181,7 +1198,12 @@ mod tests {
             dst
         }
         let mut s = 0xdead_beef_1234u64;
-        let mut rng = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
         let mut bad = 0;
         for _ in 0..5000 {
             let mut co = [0i32; 16];
@@ -1194,7 +1216,12 @@ mod tests {
             let want = libvpx4x4(&co);
             for i in 0..16 {
                 if ours[i] as i64 != want[i] {
-                    if bad < 8 { eprintln!("MISMATCH co={co:?} pos {i}: ours={} libvpx={}", ours[i], want[i]); }
+                    if bad < 8 {
+                        eprintln!(
+                            "MISMATCH co={co:?} pos {i}: ours={} libvpx={}",
+                            ours[i], want[i]
+                        );
+                    }
                     bad += 1;
                     break;
                 }

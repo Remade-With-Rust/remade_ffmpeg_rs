@@ -326,6 +326,18 @@ impl Decoder for AvifDecoder {
         let pts = packet.pts;
         let duration = Some(packet.duration);
 
+        // Pre-validate rav1d's own `sz > 0 && sz <= usize::MAX/2` input check: on a
+        // failed check rav1d's `validate_input!` calls `debug_abort()` → `process::abort()`
+        // *under `debug_assertions`* — an uncatchable crash (`catch_unwind` can't contain an
+        // abort). A malformed/empty AV1 sample from a hostile file would trip it, so we
+        // reject it here and fail gracefully in EVERY build (debug/CI included), not just
+        // release (where rav1d already returns `Err`).
+        if buf.is_empty() || buf.len() > usize::MAX / 2 {
+            return Err(Error::InvalidData(
+                "avif: empty or oversized AV1 sample".into(),
+            ));
+        }
+
         match self
             .dec
             .as_mut()
@@ -484,6 +496,19 @@ mod tests {
             Ok(Frame::Audio(_)) => panic!("decoded audio from a video codec"),
             Err(e) => panic!("decode receive_frame: {e}"),
         }
+    }
+
+    /// An empty AV1 sample must return `Err`, not crash. Before the pre-validation
+    /// guard this ABORTED the process under `debug_assertions` (rav1d's `validate_input!`
+    /// → `debug_abort()`), an uncatchable DoS on hostile input; now it fails gracefully.
+    #[test]
+    fn empty_sample_is_err_not_abort() {
+        let mut dec = AvifDecoder::new();
+        let err = dec.send_packet(&Packet::from_data(0, Vec::new()));
+        assert!(
+            err.is_err(),
+            "empty AV1 sample must be rejected, not aborted"
+        );
     }
 
     #[test]

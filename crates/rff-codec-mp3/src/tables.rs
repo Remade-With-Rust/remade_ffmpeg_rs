@@ -226,7 +226,10 @@ pub const NR_OF_SFB_BLOCK: [[[u8; 4]; 3]; 6] = [
 pub fn lsf_scale_params(scalefac_compress: u16, blocktype: usize) -> ([u8; 4], [u8; 4]) {
     let sfc = scalefac_compress as u32;
     let (slen, blocknumber) = if sfc < 400 {
-        ([(sfc >> 4) / 5, (sfc >> 4) % 5, (sfc % 16) >> 2, sfc % 4], 0)
+        (
+            [(sfc >> 4) / 5, (sfc >> 4) % 5, (sfc % 16) >> 2, sfc % 4],
+            0,
+        )
     } else if sfc < 500 {
         let s = sfc - 400;
         ([(s >> 2) / 5, (s >> 2) % 5, s % 4, 0], 1)
