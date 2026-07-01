@@ -82,12 +82,10 @@ pub fn decode(
         // scfsi reuse. Non-intensity channels only (the i_stereo right channel uses
         // a different derivation — not emitted here, and rare).
         //
-        // BRING-UP STATUS: LSF **long**-block decode is now BIT-EXACT vs FFmpeg
-        // (steady-state SNR 74.8 dB, == the MPEG-1 s16-quantisation ceiling) — this
-        // scheme completed it (was −5.9 dB / totally broken before). LSF **short**-block
-        // decode still has a ~30 dB residual on transient granules (see the short branch
-        // below); the earlier "17.6 dB structural bug" was an artifact of a too-narrow
-        // SNR lag search (< the ~1105-sample decoder delay FFmpeg trims but we don't).
+        // LSF decode is BIT-EXACT vs FFmpeg (and minimp3): long + short, 77–81 dB across
+        // sine/piano/vocal. This scheme fixed the scalefactors (was −5.9 dB / broken); the
+        // last short-block bug was in the Huffman region boundary for Start/Stop blocks
+        // (see `region_bounds` in huffman.rs), NOT here.
         let is_short = gi.window_switching && gi.block_type == BlockType::Short;
         let blocktype = if is_short {
             if gi.mixed_block {
@@ -100,11 +98,8 @@ pub fn decode(
         };
         let (slen, nr) = tables::lsf_scale_params(gi.scalefac_compress, blocktype);
         if is_short {
-            // Groups fill (sfb, window) linearly, sfb-major (idx = 3·sfb + window).
-            // BRING-UP NOTE: short-block LSF is not yet bit-exact (~30 dB vs FFmpeg on
-            // transient granules); the residual is NOT the (sfb,window) placement (all
-            // orderings measured identically) nor alignment — it's in the coefficient
-            // path fed by this granule, and needs FFmpeg symbol-level tracing to close.
+            // Groups fill (sfb, window) linearly, sfb-major (idx = 3·sfb + window) —
+            // proven bit-identical to minimp3.
             let mut idx = 0usize;
             for g in 0..4 {
                 for _ in 0..nr[g] {

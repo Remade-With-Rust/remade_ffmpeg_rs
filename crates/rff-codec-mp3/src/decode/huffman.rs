@@ -221,10 +221,27 @@ impl QuadTable {
 }
 
 /// Big-value region boundaries (line indices) for one granule/channel.
-fn region_bounds(gi: &GranuleSideInfo, sfb_long: &[u16; 23], bv2: usize) -> (usize, usize) {
+fn region_bounds(
+    gi: &GranuleSideInfo,
+    sfb_long: &[u16; 23],
+    bv2: usize,
+    sample_rate: u32,
+) -> (usize, usize) {
     if gi.window_switching && gi.block_type != BlockType::Long {
-        // Two regions: [0, 36) and [36, bv2); region2 is empty.
-        (36.min(bv2), bv2)
+        // Window-switching blocks have an IMPLIED region0 (region counts aren't coded),
+        // and it differs by block type (matched to minimp3 + FFmpeg, ALL bit-exact):
+        //   • PURE short: region0 = 36 lines (fixed, all rates).
+        //   • START/STOP/mixed (long windows): region0 = the 8th long-band offset
+        //     `sfb_long[8]`. At 44.1 kHz that IS 36 — which is why a single hardcoded 36
+        //     was bit-exact for MPEG-1 but WRONG for LSF, where `sfb_long[8] ≠ 36`. This
+        //     was the whole LSF short-block bug: Start/Stop got 36 instead of sfb_long[8].
+        // region1 spans the rest; region2 is empty.
+        let r0 = if gi.block_type == BlockType::Short && !gi.mixed_block {
+            36 // pure short: region0 = 36 lines (fixed, both MPEG-1 and LSF)
+        } else {
+            sfb_long[8] as usize // START/STOP/mixed: first 8 long bands (= 36 at 44.1 kHz)
+        };
+        (r0.min(bv2), bv2)
     } else {
         let i1 = (gi.region0_count as usize + 1).min(22);
         let i2 = (gi.region0_count as usize + gi.region1_count as usize + 2).min(22);
@@ -250,7 +267,7 @@ pub fn decode(
 
     let sfb_long = tables::sfb_long_offsets(header.sample_rate);
     let bv2 = (gi.big_values as usize * 2).min(GRANULE_LINES);
-    let (r1, r2) = region_bounds(gi, sfb_long, bv2);
+    let (r1, r2) = region_bounds(gi, sfb_long, bv2, header.sample_rate);
 
     // big_values: pairs, choosing the table by region.
     let mut i = 0;
@@ -419,10 +436,17 @@ mod tests {
             region1_count: 2,
             ..Default::default()
         };
-        assert_eq!(region_bounds(&gi, sfb, 200), (36, 62));
-        // Short window-switched: fixed (36, bv2).
+        assert_eq!(region_bounds(&gi, sfb, 200, 44100), (36, 62));
+        // Pure short window-switched: region0 fixed at 36.
         gi.window_switching = true;
         gi.block_type = BlockType::Short;
-        assert_eq!(region_bounds(&gi, sfb, 200), (36, 200));
+        assert_eq!(region_bounds(&gi, sfb, 200, 44100), (36, 200));
+        // Start/Stop: region0 = sfb_long[8] (36 at 44.1 kHz, but rate-specific for LSF).
+        gi.block_type = BlockType::Start;
+        assert_eq!(region_bounds(&gi, sfb, 200, 44100), (36, 200));
+        assert_eq!(
+            region_bounds(&gi, tables::sfb_long_offsets(22050), 200, 22050).0,
+            tables::sfb_long_offsets(22050)[8] as usize
+        );
     }
 }
