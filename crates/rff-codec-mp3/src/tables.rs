@@ -200,6 +200,43 @@ pub const POW43_LEN: usize = 8207;
 /// brick: port the codeword tables from ISO Table B.7 and the linbits per table.
 pub const HUFFMAN_TABLE_COUNT: usize = 34;
 
+// ---- MPEG-2 / 2.5 (LSF) scalefactor scheme (ISO 13818-3 §2.4.3.4) -------------
+
+/// Band counts per scalefactor group, indexed `[blocknumber][blocktype][group]`,
+/// where blocktype is 0=long, 1=short, 2=mixed. For long blocks a group's count is
+/// scalefactor bands; for short it counts individual (sfb,window) scalefactors
+/// (sum = 3·sfb). ISO 13818-3 Table (derived-slen scheme).
+pub const NR_OF_SFB_BLOCK: [[[u8; 4]; 3]; 6] = [
+    [[6, 5, 5, 5], [9, 9, 9, 9], [6, 9, 9, 9]],
+    [[6, 5, 7, 3], [9, 9, 12, 6], [6, 9, 12, 6]],
+    [[11, 10, 0, 0], [18, 18, 0, 0], [15, 18, 0, 0]],
+    [[7, 7, 7, 0], [12, 12, 12, 0], [6, 15, 12, 0]],
+    [[6, 6, 6, 3], [12, 9, 9, 6], [6, 12, 9, 6]],
+    [[8, 8, 5, 0], [15, 12, 9, 0], [6, 18, 9, 0]],
+];
+
+/// LSF scalefactor bit-lengths `slen[4]` and per-group band counts `nr[4]`, derived
+/// from `scalefac_compress` and the block type. Non-intensity (left channel / no
+/// intensity stereo — the right channel of an i_stereo pair uses a different table,
+/// not emitted by this encoder yet). `blocktype`: 0=long, 1=short, 2=mixed.
+pub fn lsf_scale_params(scalefac_compress: u16, blocktype: usize) -> ([u8; 4], [u8; 4]) {
+    let sfc = scalefac_compress as u32;
+    let (slen, blocknumber) = if sfc < 400 {
+        ([(sfc >> 4) / 5, (sfc >> 4) % 5, (sfc % 16) >> 2, sfc % 4], 0)
+    } else if sfc < 500 {
+        let s = sfc - 400;
+        ([(s >> 2) / 5, (s >> 2) % 5, s % 4, 0], 1)
+    } else {
+        let s = sfc - 500;
+        ([s / 3, s % 3, 0, 0], 2)
+    };
+    let nr = NR_OF_SFB_BLOCK[blocknumber][blocktype];
+    (
+        [slen[0] as u8, slen[1] as u8, slen[2] as u8, slen[3] as u8],
+        nr,
+    )
+}
+
 // ---- synthesis filterbank (to port) ------------------------------------------
 
 // The 512-tap polyphase synthesis window `D[i]` (ISO 11172-3 Table 3-B.3) is the

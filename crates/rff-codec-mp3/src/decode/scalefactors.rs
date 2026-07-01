@@ -76,8 +76,55 @@ pub fn decode(
                 }
             }
         }
+    } else {
+        // MPEG-2/2.5 (LSF): bit-lengths + per-group band counts are DERIVED from
+        // scalefac_compress (no fixed table), and there's one granule/frame so no
+        // scfsi reuse. Non-intensity channels only (the i_stereo right channel uses
+        // a different derivation — not emitted here, and rare).
+        //
+        // BRING-UP STATUS: this scalefactor scheme is implemented and lifts LSF decode
+        // from broken (−5.9 dB vs FFmpeg) to ~15 dB, but LSF is NOT yet bit-exact — a
+        // separate STRUCTURAL bug remains (a pure sine @160k, negligible scalefactors,
+        // still reads 17.6 dB), so the residual is independent of this code. Full LSF
+        // conformance needs a dedicated bringup-decoder pass (symbol-by-symbol vs FFmpeg).
+        let is_short = gi.window_switching && gi.block_type == BlockType::Short;
+        let blocktype = if is_short {
+            if gi.mixed_block {
+                2
+            } else {
+                1
+            }
+        } else {
+            0
+        };
+        let (slen, nr) = tables::lsf_scale_params(gi.scalefac_compress, blocktype);
+        if is_short {
+            // Groups fill (sfb, window) linearly: idx = sfb·3 + window.
+            let mut idx = 0usize;
+            for g in 0..4 {
+                for _ in 0..nr[g] {
+                    let v = r.read(slen[g] as u32) as u8;
+                    let (sfb, window) = (idx / 3, idx % 3);
+                    if sfb < crate::frame::SFB_SHORT {
+                        sf.short[window][sfb] = v;
+                    }
+                    idx += 1;
+                }
+            }
+        } else {
+            // Long: groups fill scalefactor bands linearly.
+            let mut sfb = 0usize;
+            for g in 0..4 {
+                for _ in 0..nr[g] {
+                    let v = r.read(slen[g] as u32) as u8;
+                    if sfb < crate::frame::SFB_LONG {
+                        sf.long[sfb] = v;
+                    }
+                    sfb += 1;
+                }
+            }
+        }
     }
-    // brick: MPEG-2/2.5 scalefactor scheme (intensity-stereo-aware, derived slen).
 
     *bit_pos = r.bit_pos();
     sf
