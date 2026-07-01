@@ -193,6 +193,25 @@ pub fn region_capacity(header: &FrameHeader) -> usize {
 /// must fit within its own region, and the unused tail is zero stuffing. That is a
 /// fully valid, decodable CBR frame. [`assemble_stream`] (**B8**) layers the
 /// bit-reservoir *borrowing* on top when the whole frame sequence is known.
+/// MP3 CRC-16 (ISO 11172-3 §2.4.3.1): computed over the last two header bytes
+/// (bytes 2–3) followed by the whole side-information block, MSB-first, polynomial
+/// `0x8005`, initial value `0xFFFF`. Written big-endian between header and side info
+/// when `protection_bit` (our `crc_protected`) is set.
+fn crc16(header_tail: [u8; 2], side_info: &[u8]) -> u16 {
+    let mut crc = 0xFFFFu16;
+    for &byte in header_tail.iter().chain(side_info) {
+        for i in (0..8).rev() {
+            let bit = ((byte >> i) & 1) as u16;
+            let msb = crc >> 15;
+            crc <<= 1;
+            if (msb ^ bit) & 1 == 1 {
+                crc ^= 0x8005;
+            }
+        }
+    }
+    crc
+}
+
 pub fn format(
     header: &FrameHeader,
     side_info: &SideInfo,
@@ -202,11 +221,13 @@ pub fn format(
     let mut si = side_info.clone();
     si.main_data_begin = 0;
 
-    let mut out = header.to_bytes().to_vec();
+    let hdr = header.to_bytes();
+    let si_bytes = serialize_side_info(header, &si);
+    let mut out = hdr.to_vec();
     if header.crc_protected {
-        out.extend_from_slice(&[0, 0]); // brick: real CRC-16 (decoder skips it)
+        out.extend_from_slice(&crc16([hdr[2], hdr[3]], &si_bytes).to_be_bytes());
     }
-    out.extend_from_slice(&serialize_side_info(header, &si));
+    out.extend_from_slice(&si_bytes);
 
     let region_cap = region_capacity(header);
     let used = main_data.len().min(region_cap);
@@ -264,11 +285,13 @@ pub fn assemble_stream(frames: &[(FrameHeader, SideInfo, Vec<u8>)]) -> Vec<u8> {
     for (n, (header, side_info, _)) in frames.iter().enumerate() {
         let mut si = side_info.clone();
         si.main_data_begin = begins[n] as u16;
-        out.extend_from_slice(&header.to_bytes());
+        let hdr = header.to_bytes();
+        let si_bytes = serialize_side_info(header, &si);
+        out.extend_from_slice(&hdr);
         if header.crc_protected {
-            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(&crc16([hdr[2], hdr[3]], &si_bytes).to_be_bytes());
         }
-        out.extend_from_slice(&serialize_side_info(header, &si));
+        out.extend_from_slice(&si_bytes);
         out.extend_from_slice(&md[p..p + caps[n]]);
         p += caps[n];
     }
@@ -293,6 +316,19 @@ mod tests {
             original: true,
             emphasis: 0,
         }
+    }
+
+    #[test]
+    fn crc16_matches_known_vector() {
+        // MP3 CRC-16 == CRC-16/CMS (poly 0x8005, init 0xFFFF, MSB-first, no reflect/xorout).
+        // Its canonical check value for the ASCII bytes "123456789" is 0xAEE7.
+        assert_eq!(crc16([b'1', b'2'], b"3456789"), 0xAEE7);
+        // A protected frame writes 2 CRC bytes between header and side info.
+        let mut h = hdr(ChannelMode::Mono);
+        h.crc_protected = true;
+        let out = format(&h, &SideInfo::default(), &[], &mut EncReservoir::default());
+        let want = crc16([h.to_bytes()[2], h.to_bytes()[3]], &serialize_side_info(&h, &SideInfo::default()));
+        assert_eq!(&out[4..6], &want.to_be_bytes(), "CRC bytes follow the 4-byte header");
     }
 
     #[test]

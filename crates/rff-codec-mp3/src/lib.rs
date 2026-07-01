@@ -939,6 +939,26 @@ mod tests {
         }
     }
 
+    /// Encode a synthetic tone+noise signal at `ENC_RATE` Hz → mp3 at `ENC_OUT`.
+    /// Used to check our V1/V2/V2.5 encoder output is valid (decodable by a neutral ref).
+    #[test]
+    fn encode_at_rate_to_file() {
+        let Some(rate) = std::env::var("ENC_RATE").ok().and_then(|s| s.parse::<u32>().ok()) else {
+            return;
+        };
+        let n = rate as usize * 2;
+        let mut pcm = vec![0f32; n];
+        let mut s = 0x1234_5u32;
+        for (i, v) in pcm.iter_mut().enumerate() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+            let t = i as f32 / rate as f32;
+            *v = 0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin() + 0.05 * noise;
+        }
+        let mp3 = encode_mono(&pcm, rate);
+        std::fs::write(std::env::var("ENC_OUT").unwrap(), mp3).unwrap();
+    }
+
     /// Rate-agnostic decode of `MP3_REF` → f32le PCM at `MP3_OUT` (any rate/channels).
     /// Used to verify LSF/MPEG-2.5 decode via the full pipeline without the CLI.
     #[test]
