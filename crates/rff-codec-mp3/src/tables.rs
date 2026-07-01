@@ -128,8 +128,10 @@ pub fn sfb_long_offsets(sample_rate: u32) -> &'static [u16; 23] {
         48000 => &SFB_OFFSET_LONG_V1[1],
         32000 => &SFB_OFFSET_LONG_V1[2],
         // MPEG-2, plus MPEG-2.5 11025/12000 which reuse the 22050/24000 grids.
-        22050 | 11025 => &SFB_OFFSET_LONG_V2[0],
-        24000 | 12000 => &SFB_OFFSET_LONG_V2[1],
+        // MPEG-2.5 11025/12000 share the MPEG-2 22050 LONG grid (ISO/minimp3 sr_idx 0);
+        // note 12000 does NOT follow 24000 here (it's the low-rate family, not the mid).
+        22050 | 11025 | 12000 => &SFB_OFFSET_LONG_V2[0],
+        24000 => &SFB_OFFSET_LONG_V2[1],
         16000 => &SFB_OFFSET_LONG_V2[2],
         8000 => &SFB_OFFSET_LONG_V25_8000, // MPEG-2.5 8000 has its own bands
         _ => &SFB_OFFSET_LONG_V1[0],       // 44100 and fallback
@@ -141,9 +143,11 @@ pub fn sfb_short_offsets(sample_rate: u32) -> &'static [u16; 14] {
     match sample_rate {
         48000 => &SFB_OFFSET_SHORT_V1[1],
         32000 => &SFB_OFFSET_SHORT_V1[2],
-        22050 | 11025 => &SFB_OFFSET_SHORT_V2[0],
-        24000 | 12000 => &SFB_OFFSET_SHORT_V2[1],
-        16000 => &SFB_OFFSET_SHORT_V2[2],
+        22050 => &SFB_OFFSET_SHORT_V2[0],
+        24000 => &SFB_OFFSET_SHORT_V2[1],
+        // MPEG-2.5 11025/12000 share the 16000 SHORT grid (ISO/minimp3 sr_idx 0) — NOT
+        // the 22050/24000 short grids their LONG bands use. (LONG 11025/12000 = 22050.)
+        16000 | 11025 | 12000 => &SFB_OFFSET_SHORT_V2[2],
         8000 => &SFB_OFFSET_SHORT_V25_8000,
         _ => &SFB_OFFSET_SHORT_V1[0],
     }

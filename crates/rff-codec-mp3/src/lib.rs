@@ -939,6 +939,27 @@ mod tests {
         }
     }
 
+    /// Rate-agnostic decode of `MP3_REF` → f32le PCM at `MP3_OUT` (any rate/channels).
+    /// Used to verify LSF/MPEG-2.5 decode via the full pipeline without the CLI.
+    #[test]
+    fn decode_any_mp3_to_pcm() {
+        let Ok(path) = std::env::var("MP3_REF2") else {
+            return;
+        };
+        let data = std::fs::read(&path).expect("read MP3_REF2");
+        let mut dec = Mp3Decoder::default();
+        dec.send_packet(&Packet::from_data(0, data)).unwrap();
+        dec.flush();
+        let mut pcm: Vec<u8> = Vec::new();
+        while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+            pcm.extend_from_slice(&af.planes[0]);
+        }
+        assert!(!pcm.is_empty());
+        if let Ok(out) = std::env::var("MP3_OUT2") {
+            std::fs::write(out, &pcm).expect("write MP3_OUT2");
+        }
+    }
+
     #[test]
     fn registers_as_audio_codec() {
         let mut reg = CodecRegistry::new();

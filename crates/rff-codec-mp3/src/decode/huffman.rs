@@ -237,7 +237,10 @@ fn region_bounds(
         //     was the whole LSF short-block bug: Start/Stop got 36 instead of sfb_long[8].
         // region1 spans the rest; region2 is empty.
         let r0 = if gi.block_type == BlockType::Short && !gi.mixed_block {
-            36 // pure short: region0 = 36 lines (fixed, both MPEG-1 and LSF)
+            // pure short: region0 = 3 · the 4th short-band offset. That's 36 at every
+            // rate where the low short bands are 4 wide (sfb_short[3]=12), but 72 at
+            // 8 kHz where they're 8 wide (sfb_short[3]=24) — another 44.1k-masked const.
+            3 * tables::sfb_short_offsets(sample_rate)[3] as usize
         } else {
             sfb_long[8] as usize // START/STOP/mixed: first 8 long bands (= 36 at 44.1 kHz)
         };
