@@ -98,7 +98,7 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 | Image codec | **webp** (VP8/VP8L) | **decode + lossless encode** (pure-Rust `image-webp`) |
 | Image codec | **jpegxl** (JPEG XL) | **decode** (pure-Rust `jxl-oxide`; no Rust encoder yet) |
 | Audio codec | **aac** | in-house **AAC-LC decoder**, all features (short blocks, M/S, intensity stereo, PNS, TNS) — verified bit-exact vs FFmpeg |
-| Audio codec | **mp3** (MPEG-1/2 Layer III) | in-house **decoder + encoder** — framework scaffolded (`rff-codec-mp3`), building brick by brick 🚧 |
+| Audio codec | **mp3** (MPEG-1/2 Layer III) | in-house **decoder + encoder** (`rff-codec-mp3`) — decoder **bit-exact vs FFmpeg**; encoder MPEG-1/2/2.5, CBR + VBR, joint stereo, block switching |
 | Audio codec | **opus** | **decode + encode** (pure-Rust `opus-rs`) |
 | Audio codec | **vorbis** | **decode** (pure-Rust `lewton`; no permissive Rust encoder exists) |
 | Audio codec | **flac** | **decode** (pure-Rust `claxon`; no permissive Rust encoder exists) |
