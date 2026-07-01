@@ -17,6 +17,7 @@ use std::collections::VecDeque;
 use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder, Encoder};
 use rff_core::{Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
 use rusty_h264::{Decoder as RustyDecoder, Encoder as RustyEncoder, EncoderConfig, YuvFrame};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 /// Register the pure-Rust H.264 codec into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
@@ -91,14 +92,32 @@ impl Decoder for H264Decoder {
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         // Prepend Annex-B SPS/PPS once, ahead of the first coded packet.
-        let frames = if !self.started && !self.extradata.is_empty() {
+        let owned_au;
+        let data: &[u8] = if !self.started && !self.extradata.is_empty() {
             self.started = true;
             let mut au = std::mem::take(&mut self.extradata);
             au.extend_from_slice(&packet.data);
-            self.inner.decode_stream(&au).map_err(map_err)?
+            owned_au = au;
+            &owned_au
         } else {
             self.started = true;
-            self.inner.decode_stream(&packet.data).map_err(map_err)?
+            &packet.data
+        };
+
+        // Defense in depth: the decoder eats attacker-controlled bytes. It is fuzzed to
+        // never panic, but a bug here must never take down the host app — so catch any
+        // unwind, reset the decoder, and surface a decode error instead of crashing.
+        let inner = &mut self.inner;
+        let frames = match catch_unwind(AssertUnwindSafe(|| inner.decode_stream(data))) {
+            Ok(Ok(frames)) => frames,
+            Ok(Err(e)) => return Err(map_err(e)),
+            Err(_) => {
+                self.inner = RustyDecoder::new();
+                self.started = false;
+                return Err(Error::InvalidData(
+                    "rusty_h264: decoder panicked on malformed input (recovered)".into(),
+                ));
+            }
         };
 
         for yuv in frames {
@@ -272,6 +291,28 @@ mod tests {
                 assert_eq!(v.format, PixelFormat::Yuv420p);
             }
             Frame::Audio(_) => panic!("expected a video frame"),
+        }
+    }
+
+    #[test]
+    fn malformed_packets_never_crash() {
+        // A decoder eats attacker-controlled bytes; send_packet must return Ok/Err for
+        // ANY input, never unwind out of the codec. The catch_unwind boundary makes even
+        // a hypothetical decoder panic a recoverable error (and resets the decoder).
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut dec = H264Decoder::new();
+        for _ in 0..4000 {
+            let len = (next() % 256) as usize;
+            let data: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            // A panic here would unwind and fail the test; a graceful Ok/Err passes.
+            let _ = dec.send_packet(&Packet::from_data(0, data));
+            let _ = dec.receive_frame();
         }
     }
 }
