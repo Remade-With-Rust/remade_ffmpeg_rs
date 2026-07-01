@@ -663,10 +663,36 @@ impl Filter for Pad {
 // format (pixel-format / colorspace conversion)
 // ---------------------------------------------------------------------------
 
-/// `format=PIXFMT` — convert between `rgb24` and `yuv420p` (BT.601, full range).
-/// Bridges RGB sources (e.g. PNG) and the YUV codecs (e.g. AVIF).
+/// Colour matrix + quantisation range for YUV↔RGB. Coefficients derive from the
+/// luma weights `(Kr, Kb)`: BT.601 = (0.299, 0.114), BT.709 = (0.2126, 0.0722).
+/// Limited ("TV", Y 16–235 / C 16–240) vs full ("PC", 0–255) range scales Y and
+/// chroma accordingly. H.264/AVC video is BT.709 for HD and BT.601 for SD, almost
+/// always limited-range — so the BT.601/full default is correct only for full-range
+/// sources (PNG/JPEG bridges); pick the right one with `format=rgb24:bt709:limited`.
+#[derive(Clone, Copy)]
+struct ColorSpec {
+    kr: f32,
+    kb: f32,
+    limited: bool,
+}
+impl Default for ColorSpec {
+    fn default() -> Self {
+        ColorSpec { kr: 0.299, kb: 0.114, limited: false } // BT.601 full-range (legacy)
+    }
+}
+impl ColorSpec {
+    #[inline]
+    fn kg(&self) -> f32 {
+        1.0 - self.kr - self.kb
+    }
+}
+
+/// `format=PIXFMT[:MATRIX][:RANGE]` — convert between `rgb24` and `yuv420p`.
+/// MATRIX ∈ {`bt601`, `bt709`}; RANGE ∈ {`full`/`pc`, `limited`/`tv`}. Defaults to
+/// BT.601 full range for backward compatibility.
 struct FormatConv {
     target: PixelFormat,
+    spec: ColorSpec,
 }
 
 impl FormatConv {
@@ -681,7 +707,28 @@ impl FormatConv {
                 )))
             }
         };
-        Ok(FormatConv { target })
+        let mut spec = ColorSpec::default();
+        for opt in args.iter().skip(1).map(|s| s.trim()) {
+            match opt {
+                "" => {}
+                "bt601" | "601" | "smpte170m" => {
+                    spec.kr = 0.299;
+                    spec.kb = 0.114;
+                }
+                "bt709" | "709" => {
+                    spec.kr = 0.2126;
+                    spec.kb = 0.0722;
+                }
+                "full" | "pc" | "jpeg" => spec.limited = false,
+                "limited" | "tv" | "mpeg" => spec.limited = true,
+                other => {
+                    return Err(Error::unsupported(format!(
+                        "format: option `{other}` (matrix bt601/bt709, range full/limited)"
+                    )))
+                }
+            }
+        }
+        Ok(FormatConv { target, spec })
     }
 }
 
@@ -695,10 +742,10 @@ impl Filter for FormatConv {
             return Ok(src);
         }
         match (src.format, self.target) {
-            (PixelFormat::Rgb24, PixelFormat::Yuv420p) => rgb_to_yuv420(&src, 3),
-            (PixelFormat::Rgba, PixelFormat::Yuv420p) => rgb_to_yuv420(&src, 4),
+            (PixelFormat::Rgb24, PixelFormat::Yuv420p) => rgb_to_yuv420(&src, 3, self.spec),
+            (PixelFormat::Rgba, PixelFormat::Yuv420p) => rgb_to_yuv420(&src, 4, self.spec),
             (PixelFormat::Rgba, PixelFormat::Rgb24) => rgba_to_rgb(&src),
-            (PixelFormat::Yuv420p, PixelFormat::Rgb24) => yuv420_to_rgb(&src),
+            (PixelFormat::Yuv420p, PixelFormat::Rgb24) => yuv420_to_rgb(&src, self.spec),
             (from, to) => Err(Error::unsupported(format!(
                 "format: {} → {} not supported",
                 from.name(),
@@ -713,7 +760,7 @@ fn clamp_u8(v: f32) -> u8 {
 }
 
 /// Packed RGB(A) → planar 4:2:0 (chroma averaged over each 2×2 block).
-fn rgb_to_yuv420(src: &VideoFrame, bpp: usize) -> Result<VideoFrame> {
+fn rgb_to_yuv420(src: &VideoFrame, bpp: usize, spec: ColorSpec) -> Result<VideoFrame> {
     let (w, h) = (src.width as usize, src.height as usize);
     let stride = src.strides[0];
     let rgb = &src.planes[0];
@@ -722,11 +769,22 @@ fn rgb_to_yuv420(src: &VideoFrame, bpp: usize) -> Result<VideoFrame> {
         (rgb[p] as f32, rgb[p + 1] as f32, rgb[p + 2] as f32)
     };
 
+    // Forward coeffs from (Kr, Kb): Y = yoff + yscale·(Kr·R+Kg·G+Kb·B),
+    // U = 128 + cscale·(ur·R+ug·G+0.5·B), V = 128 + cscale·(0.5·R+vg·G+vb·B).
+    let (kr, kb, kg) = (spec.kr, spec.kb, spec.kg());
+    let (yoff, yscale, cscale) = if spec.limited {
+        (16.0, 219.0 / 255.0, 224.0 / 255.0)
+    } else {
+        (0.0, 1.0, 1.0)
+    };
+    let (ur, ug) = (-0.5 * kr / (1.0 - kb), -0.5 * kg / (1.0 - kb));
+    let (vg, vb) = (-0.5 * kg / (1.0 - kr), -0.5 * kb / (1.0 - kr));
+
     let mut y = vec![0u8; w * h];
     for j in 0..h {
         for i in 0..w {
             let (r, g, b) = px(i, j);
-            y[j * w + i] = clamp_u8(0.299 * r + 0.587 * g + 0.114 * b);
+            y[j * w + i] = clamp_u8(yoff + yscale * (kr * r + kg * g + kb * b));
         }
     }
 
@@ -749,8 +807,8 @@ fn rgb_to_yuv420(src: &VideoFrame, bpp: usize) -> Result<VideoFrame> {
                 }
             }
             let (r, g, b) = (sr / n, sg / n, sb / n);
-            u[cj * cw + ci] = clamp_u8(-0.169 * r - 0.331 * g + 0.5 * b + 128.0);
-            v[cj * cw + ci] = clamp_u8(0.5 * r - 0.419 * g - 0.081 * b + 128.0);
+            u[cj * cw + ci] = clamp_u8(128.0 + cscale * (ur * r + ug * g + 0.5 * b));
+            v[cj * cw + ci] = clamp_u8(128.0 + cscale * (0.5 * r + vg * g + vb * b));
         }
     }
 
@@ -765,21 +823,34 @@ fn rgb_to_yuv420(src: &VideoFrame, bpp: usize) -> Result<VideoFrame> {
 }
 
 /// Planar 4:2:0 → packed RGB (chroma upsampled nearest-neighbour).
-fn yuv420_to_rgb(src: &VideoFrame) -> Result<VideoFrame> {
+fn yuv420_to_rgb(src: &VideoFrame, spec: ColorSpec) -> Result<VideoFrame> {
     let (w, h) = (src.width as usize, src.height as usize);
     let (ys, us, vs) = (src.strides[0], src.strides[1], src.strides[2]);
     let (yp, up, vp) = (&src.planes[0], &src.planes[1], &src.planes[2]);
 
+    // Derive from (Kr, Kb): R = ya + kr_c·cv, G = ya + kgu·cu + kgv·cv,
+    // B = ya + kb_c·cu, where ya = yscale·(Y − yoff), cu = Cu−128, cv = Cv−128.
+    let kg = spec.kg();
+    let (yoff, yscale, cscale) = if spec.limited {
+        (16.0, 255.0 / 219.0, 255.0 / 224.0)
+    } else {
+        (0.0, 1.0, 1.0)
+    };
+    let kr_c = 2.0 * (1.0 - spec.kr) * cscale;
+    let kb_c = 2.0 * (1.0 - spec.kb) * cscale;
+    let kgv = -2.0 * spec.kr * (1.0 - spec.kr) / kg * cscale;
+    let kgu = -2.0 * spec.kb * (1.0 - spec.kb) / kg * cscale;
+
     let mut out = vec![0u8; w * h * 3];
     for j in 0..h {
         for i in 0..w {
-            let yy = yp[j * ys + i] as f32;
+            let ya = yscale * (yp[j * ys + i] as f32 - yoff);
             let cu = up[(j / 2) * us + i / 2] as f32 - 128.0;
             let cv = vp[(j / 2) * vs + i / 2] as f32 - 128.0;
             let o = (j * w + i) * 3;
-            out[o] = clamp_u8(yy + 1.402 * cv);
-            out[o + 1] = clamp_u8(yy - 0.344 * cu - 0.714 * cv);
-            out[o + 2] = clamp_u8(yy + 1.772 * cu);
+            out[o] = clamp_u8(ya + kr_c * cv);
+            out[o + 1] = clamp_u8(ya + kgu * cu + kgv * cv);
+            out[o + 2] = clamp_u8(ya + kb_c * cu);
         }
     }
     Ok(VideoFrame {
@@ -1066,6 +1137,48 @@ mod tests {
             .sum();
         let mean = total as f64 / (w * h * 3) as f64;
         assert!(mean < 8.0, "rgb↔yuv round-trip drifted too far: {mean:.2}");
+    }
+
+    #[test]
+    fn colorspace_matrices_and_range() {
+        // A 2×2 solid RGB frame (chroma-subsample averages to the same value → exact).
+        let solid = |r: u8, g: u8, b: u8| VideoFrame {
+            width: 2,
+            height: 2,
+            format: PixelFormat::Rgb24,
+            planes: vec![[r, g, b].repeat(4)],
+            strides: vec![6],
+            pts: Some(0),
+        };
+        let to_yuv = |opts: &str, f: VideoFrame| {
+            let mut c = FilterChain::parse(&format!("format=yuv420p{opts}")).unwrap();
+            let y = c.apply(f).unwrap();
+            (y.planes[0][0], y.planes[1][0], y.planes[2][0])
+        };
+        // Range anchors (matrix-independent): limited white→235/black→16; full→255/0.
+        assert_eq!(to_yuv(":limited", solid(255, 255, 255)).0, 235);
+        assert_eq!(to_yuv(":limited", solid(0, 0, 0)).0, 16);
+        assert_eq!(to_yuv(":full", solid(255, 255, 255)).0, 255);
+        assert_eq!(to_yuv(":full", solid(0, 0, 0)).0, 0);
+        // Matrix matters: pure-red luma is higher in BT.601 (0.299) than BT.709 (0.2126).
+        let y601 = to_yuv(":bt601:full", solid(255, 0, 0)).0;
+        let y709 = to_yuv(":bt709:full", solid(255, 0, 0)).0;
+        assert!(y601 > y709, "601 red-luma {y601} should exceed 709 {y709}");
+        // Greyscale is chroma-neutral (U=V=128) in every mode (luma scales with range).
+        for m in [":full", ":limited", ":bt709:limited"] {
+            let (_, u, v) = to_yuv(m, solid(128, 128, 128));
+            assert_eq!((u, v), (128, 128), "grey chroma ({m})");
+        }
+        // Each colorspace round-trips tightly (the decode-display path).
+        for m in [":bt709:limited", ":bt601:limited", ":bt709:full"] {
+            let mut to_y = FilterChain::parse(&format!("format=yuv420p{m}")).unwrap();
+            let mut to_r = FilterChain::parse(&format!("format=rgb24{m}")).unwrap();
+            let src = solid(200, 100, 50);
+            let back = to_r.apply(to_y.apply(src.clone()).unwrap()).unwrap();
+            let drift: u32 = src.planes[0].iter().zip(&back.planes[0])
+                .map(|(a, b)| (*a as i16 - *b as i16).unsigned_abs() as u32).sum::<u32>() / 12;
+            assert!(drift < 6, "round-trip drift for {m}: {drift}");
+        }
     }
 
     #[test]
