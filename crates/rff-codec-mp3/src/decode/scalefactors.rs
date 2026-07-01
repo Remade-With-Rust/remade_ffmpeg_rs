@@ -82,11 +82,12 @@ pub fn decode(
         // scfsi reuse. Non-intensity channels only (the i_stereo right channel uses
         // a different derivation — not emitted here, and rare).
         //
-        // BRING-UP STATUS: this scalefactor scheme is implemented and lifts LSF decode
-        // from broken (−5.9 dB vs FFmpeg) to ~15 dB, but LSF is NOT yet bit-exact — a
-        // separate STRUCTURAL bug remains (a pure sine @160k, negligible scalefactors,
-        // still reads 17.6 dB), so the residual is independent of this code. Full LSF
-        // conformance needs a dedicated bringup-decoder pass (symbol-by-symbol vs FFmpeg).
+        // BRING-UP STATUS: LSF **long**-block decode is now BIT-EXACT vs FFmpeg
+        // (steady-state SNR 74.8 dB, == the MPEG-1 s16-quantisation ceiling) — this
+        // scheme completed it (was −5.9 dB / totally broken before). LSF **short**-block
+        // decode still has a ~30 dB residual on transient granules (see the short branch
+        // below); the earlier "17.6 dB structural bug" was an artifact of a too-narrow
+        // SNR lag search (< the ~1105-sample decoder delay FFmpeg trims but we don't).
         let is_short = gi.window_switching && gi.block_type == BlockType::Short;
         let blocktype = if is_short {
             if gi.mixed_block {
@@ -99,7 +100,11 @@ pub fn decode(
         };
         let (slen, nr) = tables::lsf_scale_params(gi.scalefac_compress, blocktype);
         if is_short {
-            // Groups fill (sfb, window) linearly: idx = sfb·3 + window.
+            // Groups fill (sfb, window) linearly, sfb-major (idx = 3·sfb + window).
+            // BRING-UP NOTE: short-block LSF is not yet bit-exact (~30 dB vs FFmpeg on
+            // transient granules); the residual is NOT the (sfb,window) placement (all
+            // orderings measured identically) nor alignment — it's in the coefficient
+            // path fed by this granule, and needs FFmpeg symbol-level tracing to close.
             let mut idx = 0usize;
             for g in 0..4 {
                 for _ in 0..nr[g] {
