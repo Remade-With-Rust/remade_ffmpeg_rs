@@ -97,6 +97,12 @@ pub struct Mp3Encode {
     reservoir: bitstream::EncReservoir,
     /// Last granule's window type — the block-switch FSM carries it across frames.
     prev_block_type: crate::frame::BlockType,
+    /// **3R1 reservoir-RD** buffered path: raw frames banked for B8 assembly at flush,
+    /// the running spare-bit bank (bits, ≤ `RESV_MAX_BANK`), and the smoothed frame
+    /// perceptual entropy the causal budget is measured against.
+    resv_frames: Vec<(FrameHeader, SideInfo, Vec<u8>)>,
+    resv_bank: usize,
+    resv_pe_avg: f32,
 }
 
 impl Default for Mp3Encode {
@@ -106,8 +112,29 @@ impl Default for Mp3Encode {
             mdct_overlap: [[0.0; GRANULE_LINES]; 2],
             reservoir: bitstream::EncReservoir::default(),
             prev_block_type: crate::frame::BlockType::Long,
+            resv_frames: Vec::new(),
+            resv_bank: 0,
+            resv_pe_avg: 0.0,
         }
     }
+}
+
+/// B8 back-reference cap (`main_data_begin` is 9 bits): the most a frame can borrow.
+const RESV_MAX_BANK: usize = 511 * 8;
+
+/// **3R1** causal per-frame main-data budget: a frame `pe/pe_avg` above the running
+/// average draws extra bits from the bank (capped by what's physically available),
+/// an easier one banks — sum-preserving around the CBR `base`, so the average bitrate
+/// holds and the bank never goes negative (⇒ B8's cumulative constraint is satisfied).
+fn reservoir_budget(pe: f32, pe_avg: f32, base: usize, bank: usize, gain: f32) -> usize {
+    if pe_avg <= 0.0 || gain <= 0.0 {
+        return base;
+    }
+    let demand = (pe / pe_avg - 1.0) as f64; // >0 harder than average
+    let extra = (demand * gain as f64 * base as f64) as i64;
+    // draw at most the available bank; give back at most 30% of base (don't starve).
+    let extra = extra.clamp(-(base as i64) * 3 / 10, bank.min(RESV_MAX_BANK) as i64);
+    ((base as i64) + extra).max(base as i64 / 2) as usize
 }
 
 impl Mp3Encode {
@@ -132,13 +159,71 @@ impl Mp3Encode {
         channels: &[Vec<f32>],
         quality: Option<f32>,
     ) -> Result<Vec<u8>> {
+        // B7 (streaming, reservoir-free): the frame's whole region is its own budget.
+        let frame_budget = bitstream::region_capacity(header) * 8;
+        let (fheader, side, main_data, _pe) =
+            self.encode_frame_raw(header, channels, quality, |_pe| frame_budget);
+        Ok(bitstream::format(
+            &fheader,
+            &side,
+            &main_data,
+            &mut self.reservoir,
+        ))
+    }
+
+    /// **3R1** — encode a CBR frame into the reservoir buffer: the causal PE-weighted
+    /// budget lets a demanding frame borrow banked bits, an easy one bank them. The raw
+    /// frame is stored for B8 assembly at [`finish_reservoir`]. `gain` is the knob.
+    pub fn encode_frame_reservoir(
+        &mut self,
+        header: &FrameHeader,
+        channels: &[Vec<f32>],
+        gain: f32,
+    ) {
+        let base = bitstream::region_capacity(header) * 8;
+        let (bank, pe_avg) = (self.resv_bank, self.resv_pe_avg);
+        let (fheader, side, main_data, pe) = self.encode_frame_raw(header, channels, None, |pe| {
+            reservoir_budget(pe, pe_avg, base, bank, gain)
+        });
+        // Bank what this frame left unspent (bounded by the 511-byte back-reference).
+        let used = main_data.len() * 8;
+        self.resv_bank = (bank + base).saturating_sub(used).min(RESV_MAX_BANK);
+        self.resv_pe_avg = if self.resv_frames.is_empty() {
+            pe
+        } else {
+            0.9 * pe_avg + 0.1 * pe
+        };
+        self.resv_frames.push((fheader, side, main_data));
+    }
+
+    /// **3R1** — assemble all banked frames into one reservoir-borrowed CBR stream (B8),
+    /// clearing the buffer. Returns the frames in order, each padded to its fixed size.
+    pub fn finish_reservoir(&mut self) -> Vec<u8> {
+        let frames = std::mem::take(&mut self.resv_frames);
+        self.resv_bank = 0;
+        self.resv_pe_avg = 0.0;
+        bitstream::assemble_stream(&frames)
+    }
+
+    /// Analyse every granule×channel of a frame (advancing the filterbank/MDCT state)
+    /// and its perceptual entropy, then quantise all of them to a frame main-data
+    /// budget chosen by `budget_fn(frame_pe)` — the seam that lets B7 pass a flat
+    /// per-region budget and 3R1 pass a reservoir-weighted one. Returns the (possibly
+    /// M/S) header, side info, raw main data, and the frame's total perceptual entropy.
+    fn encode_frame_raw(
+        &mut self,
+        header: &FrameHeader,
+        channels: &[Vec<f32>],
+        quality: Option<f32>,
+        budget_fn: impl FnOnce(f32) -> usize,
+    ) -> (FrameHeader, SideInfo, Vec<u8>, f32) {
+        use std::sync::atomic::Ordering::Relaxed;
         let nch = header.channel_mode.channels();
         let granules = header.version.granules();
 
-        // Per-frame M/S decision (stereo only). M/S is exact in the PCM domain
-        // because the filterbank/MDCT are linear: storing M=(L+R)/√2, S=(L−R)/√2
-        // and letting the decoder rotate back reconstructs L/R. Only worth it when
-        // the channels are correlated (S small → cheap to code).
+        // Per-frame M/S decision (stereo only). M/S is exact in the PCM domain because
+        // the filterbank/MDCT are linear: storing M=(L+R)/√2, S=(L−R)/√2 and letting
+        // the decoder rotate back reconstructs L/R. Only worth it when correlated.
         let use_ms = nch == 2 && stereo::prefer_mid_side(&channels[0], &channels[1]);
         let coded = if use_ms {
             stereo::mid_side(&channels[0], &channels[1])
@@ -167,9 +252,11 @@ impl Mp3Encode {
             shortblock::decide_block_types(self.prev_block_type, &attacks);
         self.prev_block_type = new_prev;
 
-        let budget = (bitstream::region_capacity(&fheader) * 8) / (granules * nch);
-        let mut side = SideInfo::default();
-        let mut main = BitWriter::new();
+        // Pass 1 — analyse (advances state, gr-major ch-major) + perceptual entropy.
+        let n_units = granules * nch;
+        let mut analyzed: Vec<([f32; GRANULE_LINES], psychoacoustic::PsyResult, BlockType)> =
+            Vec::with_capacity(n_units);
+        let mut frame_pe = 0f32;
         for gr in 0..granules {
             let bt = block_types[gr];
             for ch in 0..nch {
@@ -192,44 +279,47 @@ impl Mp3Encode {
                 };
                 let freq = prof::time(&prof::MDCT, || {
                     let mut freq = mdct::forward(&sub, bt, &mut self.mdct_overlap[ch]);
-                    // Forward alias butterflies — the inverse of the decoder's reduce()
-                    // (applied for long/start/stop; pure short blocks skip it).
                     antialias::expand(&block, &mut freq);
                     freq
                 });
-
-                let quant = prof::time(&prof::QUANT, || {
-                    if bt == BlockType::Short {
-                        prof::N_SHORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // Reorder to bitstream order, then the short quantizer.
-                        let fbs =
-                            shortblock::reorder_subband_to_bitstream(fheader.sample_rate, &freq);
-                        shortblock::quantize_short(&fheader, &fbs, budget)
-                    } else {
-                        prof::N_LONG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // Long/start/stop: the quantizer uses the right regions for the
-                        // block type, so the cost it budgets matches the emit.
-                        match quality {
-                            Some(target) => quantize::loops_vbr(&fheader, &freq, &psy, target, bt),
-                            None => quantize::loops(&fheader, &freq, &psy, budget, bt),
-                        }
-                    }
-                });
-
-                // Main data per granule/channel: scalefactors (part2) then Huffman.
-                // Long/start/stop carry long scalefactors; short uses flat (zero).
-                side.granules[gr][ch] = quant.side.clone();
-                let mut sfac = ScaleFactors::default();
-                if bt != BlockType::Short {
-                    sfac.long.copy_from_slice(&quant.scalefactors[..22]);
-                }
-                let part2_3_start = main.bit_len();
-                prof::time(&prof::HUFF, || {
-                    bitstream::serialize_scalefactors(&mut main, &fheader, &side, gr, ch, &sfac);
-                    huffman::encode(&quant, &fheader, &mut main);
-                });
-                side.granules[gr][ch].part2_3_length = (main.bit_len() - part2_3_start) as u16;
+                frame_pe += psy.perceptual_entropy;
+                analyzed.push((freq, psy, bt));
             }
+        }
+
+        let per_gran = budget_fn(frame_pe) / n_units.max(1);
+
+        // Pass 2 — quantise each unit to its budget and emit (gr,ch order).
+        let mut side = SideInfo::default();
+        let mut main = BitWriter::new();
+        for (idx, (freq, psy, bt)) in analyzed.iter().enumerate() {
+            let (gr, ch) = (idx / nch, idx % nch);
+            let bt = *bt;
+            let quant = prof::time(&prof::QUANT, || {
+                if bt == BlockType::Short {
+                    prof::N_SHORT.fetch_add(1, Relaxed);
+                    let fbs = shortblock::reorder_subband_to_bitstream(fheader.sample_rate, freq);
+                    shortblock::quantize_short(&fheader, &fbs, per_gran)
+                } else {
+                    prof::N_LONG.fetch_add(1, Relaxed);
+                    match quality {
+                        Some(target) => quantize::loops_vbr(&fheader, freq, psy, target, bt),
+                        None => quantize::loops(&fheader, freq, psy, per_gran, bt),
+                    }
+                }
+            });
+
+            side.granules[gr][ch] = quant.side.clone();
+            let mut sfac = ScaleFactors::default();
+            if bt != BlockType::Short {
+                sfac.long.copy_from_slice(&quant.scalefactors[..22]);
+            }
+            let part2_3_start = main.bit_len();
+            prof::time(&prof::HUFF, || {
+                bitstream::serialize_scalefactors(&mut main, &fheader, &side, gr, ch, &sfac);
+                huffman::encode(&quant, &fheader, &mut main);
+            });
+            side.granules[gr][ch].part2_3_length = (main.bit_len() - part2_3_start) as u16;
         }
         let main_data = main.finish();
 
@@ -237,12 +327,7 @@ impl Mp3Encode {
         if quality.is_some() {
             fheader.bitrate_kbps = bitstream::smallest_bitrate_for(&fheader, main_data.len());
         }
-        Ok(bitstream::format(
-            &fheader,
-            &side,
-            &main_data,
-            &mut self.reservoir,
-        ))
+        (fheader, side, main_data, frame_pe)
     }
 }
 
@@ -251,6 +336,56 @@ mod profile_tests {
     use super::*;
     use crate::frame::ChannelMode;
     use crate::header::{FrameHeader, MpegVersion};
+
+    fn cbr_header() -> FrameHeader {
+        FrameHeader {
+            version: MpegVersion::V1,
+            crc_protected: false,
+            bitrate_kbps: 128,
+            sample_rate: 44100,
+            padding: false,
+            channel_mode: ChannelMode::Mono,
+            copyright: false,
+            original: true,
+            emphasis: 0,
+        }
+    }
+
+    /// **3R1** — the reservoir path must emit a frame-aligned, sync-valid CBR stream
+    /// AND actually borrow (some frame's `main_data_begin > 0`): with energy varying
+    /// frame-to-frame, easy frames bank slack that demanding ones reach back into.
+    #[test]
+    fn reservoir_stream_is_frame_aligned_and_borrows() {
+        let header = cbr_header();
+        let fsize = header.frame_size();
+        let spf = 2 * GRANULE_LINES;
+        let n = 24;
+        let mut enc = Mp3Encode::new();
+        let mut s = 0x9E37_79B9u32;
+        for f in 0..n {
+            let loud = f % 3 == 0; // dense every 3rd frame → perceptual-entropy spikes
+            let pcm: Vec<f32> = (0..spf)
+                .map(|_| {
+                    s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let r = (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+                    r * if loud { 0.8 } else { 0.02 }
+                })
+                .collect();
+            enc.encode_frame_reservoir(&header, &[pcm], 0.5);
+        }
+        let stream = enc.finish_reservoir();
+        assert_eq!(stream.len(), n * fsize, "reservoir stream must be frame-aligned");
+        let mut borrowed = false;
+        for f in 0..n {
+            let h = &stream[f * fsize..];
+            assert_eq!(h[0], 0xFF, "frame {f} lost sync (byte 0)");
+            assert_eq!(h[1], 0xFB, "frame {f} bad version/layer (byte 1)");
+            // main_data_begin = first 9 bits of side info (bytes 4..6, no CRC).
+            let mdb = ((h[4] as u16) << 1) | (h[5] >> 7) as u16;
+            borrowed |= mdb > 0;
+        }
+        assert!(borrowed, "reservoir never borrowed — main_data_begin was 0 everywhere");
+    }
 
     /// Profiling driver (run explicitly): encodes ~10 s of *dense* broadband audio
     /// — the case that actually stresses the two-loop quantizer — and prints the

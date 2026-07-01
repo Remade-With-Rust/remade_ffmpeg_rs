@@ -172,6 +172,11 @@ struct Mp3Encoder {
     cbr_kbps: u32,
     /// VBR quality target (peak NMR). `Some` ⇒ VBR, `None` ⇒ CBR.
     quality: Option<f32>,
+    /// **3R1** — CBR reservoir-RD mode (buffer all frames, allocate bits across them by
+    /// perceptual entropy, assemble with the bit reservoir at flush). Gated by
+    /// `MP3_RESERVOIR`; `resv_gain` (`MP3_RESV_GAIN`, 0 ⇒ flat/byte-identical) is the knob.
+    reservoir: bool,
+    resv_gain: f32,
     eof: bool,
 }
 
@@ -264,7 +269,13 @@ impl Mp3Encoder {
             let block: Vec<Vec<f32>> = (0..nch)
                 .map(|c| self.pcm[c].drain(0..spf).collect())
                 .collect();
-            if let Ok(bytes) = self.state.encode_frame(&header, &block, self.quality) {
+            if self.reservoir {
+                // Bank the raw frame; the whole stream is assembled at flush (B8).
+                self.state
+                    .encode_frame_reservoir(&header, &block, self.resv_gain);
+                self.total_frames += 1;
+                self.total_bytes += header.frame_size();
+            } else if let Ok(bytes) = self.state.encode_frame(&header, &block, self.quality) {
                 self.total_frames += 1;
                 self.total_bytes += bytes.len();
                 self.queue.push_back(Packet::from_data(0, bytes));
@@ -295,6 +306,15 @@ impl Encoder for Mp3Encoder {
         };
         if self.header.is_none() {
             self.header = Some(encoder_header(af.sample_rate, af.channels, self.cbr_kbps)?);
+            // 3R1: opt-in reservoir RD (CBR only). MP3_RESV_GAIN=0 ⇒ flat (neutral).
+            self.reservoir =
+                self.quality.is_none() && std::env::var("MP3_RESERVOIR").is_ok_and(|v| v != "0");
+            // gain 0.2 = the swept corpus optimum (mean ODG +0.029 vs flat, no clip
+            // regressed); MP3_RESV_GAIN overrides (0 ⇒ flat, for the neutrality check).
+            self.resv_gain = std::env::var("MP3_RESV_GAIN")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.2);
         }
         let nch = self.header.as_ref().unwrap().channel_mode.channels();
         let in_ch = (af.channels as usize).max(1);
@@ -338,6 +358,15 @@ impl Encoder for Mp3Encoder {
                     self.pcm[c].resize(padded, 0.0);
                 }
                 self.drain_frames();
+            }
+            // 3R1: all frames are banked — assemble the reservoir stream now and split
+            // it back into fixed-size frame packets (B8 output is frame_size-aligned).
+            if self.reservoir {
+                let fsize = header.frame_size();
+                let stream = self.state.finish_reservoir();
+                for chunk in stream.chunks(fsize) {
+                    self.queue.push_back(Packet::from_data(0, chunk.to_vec()));
+                }
             }
             // Prepend the Xing/Info header now that the totals are known (counts
             // include the Info frame itself). Streaming consumers that drain before
