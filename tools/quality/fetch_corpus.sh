@@ -27,8 +27,13 @@ for row in "${CLIPS[@]}"; do
   ext="${url##*.}"
   echo ">> $name ($lic)"
   curl -sL --max-time 180 -A "$UA" -o "$OUT/dl/$name.$ext" "$url"
-  # f32 reference for PEAQ + s16 sibling for the encoder/NMR harness
+  # SHORT (6 s) — transient / short-block work: f32 ref + s16 sibling.
   "$FF" -y -loglevel error -ss "$ss" -t "$t" -i "$OUT/dl/$name.$ext" -ac 1 -ar 44100 -c:a pcm_f32le "$OUT/corp_$name.wav"
   "$FF" -y -loglevel error -ss "$ss" -t "$t" -i "$OUT/dl/$name.$ext" -ac 1 -ar 44100 -c:a pcm_s16le "$OUT/$name.wav"
+  # LONG (24 s, dynamic section) — cross-frame RD / RESERVOIR work, where a
+  # warm-up/build-up effect needs many transient events + refill/spend cycles to
+  # register (a 6 s clip barely stresses the 511-byte reservoir bank). PEAQ ~2 s/s.
+  "$FF" -y -loglevel error -ss "$((ss + 6))" -t 24 -i "$OUT/dl/$name.$ext" -ac 1 -ar 44100 -c:a pcm_f32le "$OUT/corp_long_$name.wav"
 done
 echo "corpus ready in $OUT (CC0/PD only — safe to encode/redistribute results)"
+echo "  corp_<name>.wav = 6 s (transient/short-block);  corp_long_<name>.wav = 24 s (RD/reservoir)"

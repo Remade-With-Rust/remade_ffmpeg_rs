@@ -177,9 +177,10 @@ struct Mp3Encoder {
     /// `MP3_RESERVOIR`; `resv_gain` (`MP3_RESV_GAIN`, 0 ⇒ flat/byte-identical) is the knob.
     reservoir: bool,
     resv_gain: f32,
-    /// **3R1 lookahead**: buffer all frame PCM and allocate against the GLOBAL perceptual-
-    /// entropy distribution (two-pass) instead of a causal running average. `MP3_RESV_LOOKAHEAD`
-    /// (default on when the reservoir is on); the buffer holds `(header, channels-PCM)`.
+    /// **3R1 lookahead** (opt-in, `MP3_RESV_LOOKAHEAD=1`): buffer all frame PCM and allocate
+    /// against the GLOBAL perceptual-entropy distribution (two-pass) instead of the default
+    /// causal running average. Off by default — on representative-length content the causal
+    /// EMA tracks the short-term (≤511 B) reservoir better; the buffer holds `(header, PCM)`.
     resv_lookahead: bool,
     resv_frames_pcm: Vec<(FrameHeader, Vec<Vec<f32>>)>,
     eof: bool,
@@ -325,8 +326,12 @@ impl Encoder for Mp3Encoder {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.2);
-            // lookahead on by default when the reservoir is on (MP3_RESV_LOOKAHEAD=0 ⇒ causal).
-            self.resv_lookahead = std::env::var("MP3_RESV_LOOKAHEAD").map_or(true, |v| v != "0");
+            // CAUSAL by default; lookahead is opt-in (MP3_RESV_LOOKAHEAD=1). On a
+            // representative 24 s corpus the causal lagging-EMA BEAT the global-mean
+            // lookahead on the dynamic clip (vocal@128 −0.156 vs −0.205) — the 511 B
+            // bank is a short-term smoother, so a LOCAL demand signal fits it better;
+            // and causal is streaming-friendly (no full-file PCM buffer). See tune-quality.
+            self.resv_lookahead = std::env::var("MP3_RESV_LOOKAHEAD").is_ok_and(|v| v != "0");
         }
         let nch = self.header.as_ref().unwrap().channel_mode.channels();
         let in_ch = (af.channels as usize).max(1);
