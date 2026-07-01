@@ -13,7 +13,7 @@ const DCT_CONST_BITS: i64 = 14;
 /// `cospi_i_64 = round(cos(i·π/64)·2^14)`, i = 1..=31 (`COSPI[0]` unused). These
 /// are the exact VP9 transform constants; the `cospi_constants_match_formula`
 /// test asserts each against the generating formula.
-const COSPI: [i64; 32] = [
+pub(crate) const COSPI: [i64; 32] = [
     0, 16364, 16305, 16207, 16069, 15893, 15679, 15426, 15137, 14811, 14449, 14053, 13623, 13160,
     12665, 12140, 11585, 11003, 10394, 9760, 9102, 8423, 7723, 7005, 6270, 5520, 4756, 3981, 3196,
     2404, 1606, 804,
@@ -399,7 +399,7 @@ pub fn idct32(input: &[i32; 32], output: &mut [i32; 32]) {
 }
 
 /// ADST sine constants `sinpi_i_9`, i = 1..=4 (`SINPI[0]` unused).
-const SINPI: [i64; 5] = [0, 5283, 9929, 13377, 15212];
+pub(crate) const SINPI: [i64; 5] = [0, 5283, 9929, 13377, 15212];
 
 /// 4-point inverse ADST (ISO/VP9 §8.7.1.2), one dimension.
 pub fn iadst4(input: &[i32; 4], output: &mut [i32; 4]) {
@@ -1062,5 +1062,144 @@ mod tests {
         let mut out = [0i32; 4];
         iwht4(&[8, 0, 0, 0], &mut out);
         assert!(out.iter().all(|&v| v == out[0]) && out[0] != 0);
+    }
+
+    /// The DC-only fast path must equal libvpx `idct*x*_1_add`:
+    /// `ROUND_POWER_OF_TWO(drs(drs(dc·cospi16)·cospi16), shift)`.
+    #[test]
+    fn dc_add_matches_libvpx() {
+        fn drs(x: i64) -> i64 {
+            if x >= 0 { (x + 8192) >> 14 } else { -(((-x) + 8192) >> 14) }
+        }
+        fn rp2(x: i64, n: u32) -> i64 { (x + (1 << (n - 1))) >> n }
+        fn libvpx_dc(dc: i64, n: usize) -> i64 {
+            let o = drs(drs(dc * 11585) * 11585);
+            match n { 4 => rp2(o, 4), 8 => rp2(o, 5), _ => rp2(o, 6) }
+        }
+        let mut bad = 0;
+        for &n in &[4usize, 8, 16, 32] {
+            for dc in -200i64..200 {
+                let mut dest = vec![128u16; n * n];
+                inverse_transform_dc_add(dc as i32, n, &mut dest, n, 4095);
+                let (ours, want) = (dest[0] as i64 - 128, libvpx_dc(dc, n));
+                if ours != want {
+                    if bad < 12 {
+                        eprintln!("MISMATCH n={n} dc={dc}: ours={ours} libvpx={want}");
+                    }
+                    bad += 1;
+                }
+            }
+        }
+        assert_eq!(bad, 0, "{bad} DC-add mismatches vs libvpx");
+    }
+
+    /// The `max_row` fast path must equal the full inverse: truncating rows past the
+    /// last non-zero coefficient row is only valid if those rows are all-zero, which
+    /// holds by construction. Any mismatch is a real reconstruction bug.
+    #[test]
+    fn add_rows_maxrow_equals_full() {
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut bad = 0;
+        for &(n, tx) in &[
+            (4usize, TxType::DctDct),
+            (8, TxType::DctDct),
+            (16, TxType::DctDct),
+            (4, TxType::AdstDct),
+            (8, TxType::DctAdst),
+        ] {
+            for _ in 0..2000 {
+                // Sparse coefficients with a random highest non-zero row.
+                let mut co = vec![0i32; n * n];
+                let hi_row = (rng() as usize) % n;
+                for r in 0..=hi_row {
+                    for c in 0..n {
+                        if rng() & 7 == 0 {
+                            co[r * n + c] = (rng() % 61) as i32 - 30;
+                        }
+                    }
+                }
+                let max_row = (0..n * n)
+                    .filter(|&p| co[p] != 0)
+                    .map(|p| p / n)
+                    .max()
+                    .unwrap_or(0);
+                let (mut a, mut b) = (vec![128u16; n * n], vec![128u16; n * n]);
+                inverse_transform_add_rows(&co, n, tx, &mut a, n, 4095, max_row + 1);
+                inverse_transform_add_rows(&co, n, tx, &mut b, n, 4095, n); // full
+                if a != b {
+                    if bad < 6 {
+                        eprintln!("MISMATCH n={n} {tx:?} max_row={max_row}");
+                    }
+                    bad += 1;
+                }
+            }
+        }
+        assert_eq!(bad, 0, "{bad} max_row-vs-full mismatches");
+    }
+
+    /// Our 4×4 DCT inverse must equal libvpx `vpx_idct4x4_16_add_c` exactly,
+    /// including on sparse inputs (single coefficient) — the keyframe only exercised
+    /// full blocks, which hide scan/inverse errors.
+    #[test]
+    fn idct4x4_matches_libvpx() {
+        const C16: i64 = 11585;
+        const C8: i64 = 15137;
+        const C24: i64 = 6270;
+        fn drs(x: i64) -> i64 {
+            let v = x + 8192;
+            v >> 14
+        }
+        fn idct4(inp: &[i64; 4]) -> [i64; 4] {
+            let s0 = drs((inp[0] + inp[2]) * C16);
+            let s1 = drs((inp[0] - inp[2]) * C16);
+            let s2 = drs(inp[1] * C24 - inp[3] * C8);
+            let s3 = drs(inp[1] * C8 + inp[3] * C24);
+            [s0 + s3, s1 + s2, s1 - s2, s0 - s3]
+        }
+        fn rp2(x: i64, n: u32) -> i64 { (x + (1 << (n - 1))) >> n }
+        // libvpx idct4x4_16_add over a 128 base plane.
+        fn libvpx4x4(co: &[i32]) -> Vec<i64> {
+            let mut out = [[0i64; 4]; 4];
+            for r in 0..4 {
+                let row = [co[r * 4] as i64, co[r * 4 + 1] as i64, co[r * 4 + 2] as i64, co[r * 4 + 3] as i64];
+                out[r] = idct4(&row);
+            }
+            let mut dst = vec![0i64; 16];
+            for c in 0..4 {
+                let col = [out[0][c], out[1][c], out[2][c], out[3][c]];
+                let o = idct4(&col);
+                for r in 0..4 {
+                    dst[r * 4 + c] = 128 + rp2(o[r], 4);
+                }
+            }
+            dst
+        }
+        let mut s = 0xdead_beef_1234u64;
+        let mut rng = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        let mut bad = 0;
+        for _ in 0..5000 {
+            let mut co = [0i32; 16];
+            let k = 1 + (rng() % 4) as usize; // 1..4 non-zero coefs
+            for _ in 0..k {
+                co[(rng() % 16) as usize] = (rng() % 121) as i32 - 60;
+            }
+            let mut ours = vec![128u16; 16];
+            inverse_transform_add(&co, 4, TxType::DctDct, &mut ours, 4, 4095);
+            let want = libvpx4x4(&co);
+            for i in 0..16 {
+                if ours[i] as i64 != want[i] {
+                    if bad < 8 { eprintln!("MISMATCH co={co:?} pos {i}: ours={} libvpx={}", ours[i], want[i]); }
+                    bad += 1;
+                    break;
+                }
+            }
+        }
+        assert_eq!(bad, 0, "{bad} idct4x4 mismatches vs libvpx");
     }
 }

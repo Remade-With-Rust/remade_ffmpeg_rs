@@ -17,6 +17,8 @@ mod adapt;
 mod bits;
 mod block;
 mod decode;
+#[allow(dead_code, unused_imports)] // Foundation API; consumed from plan Floor 1+.
+mod encode;
 mod geom_tables;
 mod inter;
 mod loopfilter;
@@ -30,9 +32,9 @@ mod token;
 mod transform;
 pub use bits::{BitReader, BoolDecoder};
 
-const FRAME_MARKER: u32 = 2;
-const SYNC_CODE: u32 = 0x49_8342;
-const CS_RGB: u32 = 7;
+pub(crate) const FRAME_MARKER: u32 = 2;
+pub(crate) const SYNC_CODE: u32 = 0x49_8342;
+pub(crate) const CS_RGB: u32 = 7;
 
 /// Register the VP9 decoder into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
@@ -42,12 +44,12 @@ pub fn register(registry: &mut CodecRegistry) {
         long_name: "Google VP9",
         media_type: MediaType::Video,
         decoder: Some(|| Box::new(Vp9Decoder::default())),
-        encoder: None,
+        encoder: Some(|| Box::new(encode::Vp9Encoder::default())),
     });
 }
 
 /// The parsed VP9 uncompressed frame header (the fields decoded so far).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrameHeader {
     pub profile: u32,
     pub show_existing_frame: bool,

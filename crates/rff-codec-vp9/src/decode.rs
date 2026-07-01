@@ -25,7 +25,7 @@ use crate::inter::{predict_block, scaled_predict_block, RefPlane};
 use crate::mv::{find_mv_refs, get_mode_context, lower_mv_precision, read_mv, MvRef};
 
 /// `vp9_inter_mode_tree` — leaves are `-INTER_OFFSET(mode)`; result + NEARESTMV.
-const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
+pub(crate) const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
 use crate::predict::{build_intra_edges, predict};
 use crate::prob::inv_remap_prob;
 use crate::prob_tables::{
@@ -50,30 +50,30 @@ const MI_SIZE: usize = 8; // pixels per mode-info unit
 /// The full entropy state for a frame (`FRAME_CONTEXT`): coefficient model
 /// probs, skip / tx-size probs, and all inter-frame mode/reference/mv probs.
 /// Persisted across frames (the 4 saved contexts) and adapted backward.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct FrameContext {
-    coef_probs: [[[[[[u8; 3]; 6]; 6]; 2]; 2]; 4],
-    skip_probs: [u8; 3],
-    tx_p8x8: [[u8; 1]; 2],
-    tx_p16x16: [[u8; 2]; 2],
-    tx_p32x32: [[u8; 3]; 2],
-    tx_mode: usize,
+    pub(crate) coef_probs: [[[[[[u8; 3]; 6]; 6]; 2]; 2]; 4],
+    pub(crate) skip_probs: [u8; 3],
+    pub(crate) tx_p8x8: [[u8; 1]; 2],
+    pub(crate) tx_p16x16: [[u8; 2]; 2],
+    pub(crate) tx_p32x32: [[u8; 3]; 2],
+    pub(crate) tx_mode: usize,
     // ---- inter-frame probabilities ----
-    y_mode_prob: [[u8; 9]; 4],
-    uv_mode_prob: [[u8; 9]; 10],
-    partition_prob: [[u8; 3]; 16],
-    inter_mode_probs: [[u8; 3]; 7],
-    intra_inter_prob: [u8; 4],
-    comp_inter_prob: [u8; 5],
-    comp_ref_prob: [u8; 5],
-    single_ref_prob: [[u8; 2]; 5],
-    switchable_interp_prob: [[u8; 2]; 4],
-    nmvc: NmvContext,
+    pub(crate) y_mode_prob: [[u8; 9]; 4],
+    pub(crate) uv_mode_prob: [[u8; 9]; 10],
+    pub(crate) partition_prob: [[u8; 3]; 16],
+    pub(crate) inter_mode_probs: [[u8; 3]; 7],
+    pub(crate) intra_inter_prob: [u8; 4],
+    pub(crate) comp_inter_prob: [u8; 5],
+    pub(crate) comp_ref_prob: [u8; 5],
+    pub(crate) single_ref_prob: [[u8; 2]; 5],
+    pub(crate) switchable_interp_prob: [[u8; 2]; 4],
+    pub(crate) nmvc: NmvContext,
     /// 0 = SINGLE_REFERENCE, 1 = COMPOUND_REFERENCE, 2 = REFERENCE_MODE_SELECT.
-    reference_mode: usize,
+    pub(crate) reference_mode: usize,
     /// Resolved fixed/var compound references (`vp9_setup_compound_reference_mode`).
-    comp_fixed_ref: usize,
-    comp_var_ref: [usize; 2],
+    pub(crate) comp_fixed_ref: usize,
+    pub(crate) comp_var_ref: [usize; 2],
 }
 
 impl Default for FrameContext {
@@ -115,11 +115,11 @@ use crate::mv::NmvCounts;
 
 /// All symbol counts accumulated while decoding one frame (`FRAME_COUNTS`).
 #[derive(Clone)]
-struct FrameCounts {
+pub(crate) struct FrameCounts {
     /// `coef[tx][plane][ref][band][ctx][ZERO|ONE|TWO|EOB_MODEL]`.
-    coef: Box<[[[[[[u32; 4]; 6]; 6]; 2]; 2]; 4]>,
+    pub(crate) coef: Box<[[[[[[u32; 4]; 6]; 6]; 2]; 2]; 4]>,
     /// `eob_branch[tx][plane][ref][band][ctx]`.
-    eob_branch: Box<[[[[[u32; 6]; 6]; 2]; 2]; 4]>,
+    pub(crate) eob_branch: Box<[[[[[u32; 6]; 6]; 2]; 2]; 4]>,
     intra_inter: [[u32; 2]; 4],
     comp_inter: [[u32; 2]; 5],
     comp_ref: [[u32; 2]; 5],
@@ -137,7 +137,7 @@ struct FrameCounts {
 }
 
 impl FrameCounts {
-    fn zeroed() -> FrameCounts {
+    pub(crate) fn zeroed() -> FrameCounts {
         FrameCounts {
             coef: Box::new([[[[[[0; 4]; 6]; 6]; 2]; 2]; 4]),
             eob_branch: Box::new([[[[[0; 6]; 6]; 2]; 2]; 4]),
@@ -157,6 +157,45 @@ impl FrameCounts {
             mv: Default::default(),
         }
     }
+
+    /// Sum another set of counts into these — merges the per-tile counts from
+    /// parallel tile-column decode back into the frame total.
+    fn merge(&mut self, o: &FrameCounts) {
+        self.coef.merge(o.coef.as_ref());
+        self.eob_branch.merge(o.eob_branch.as_ref());
+        self.intra_inter.merge(&o.intra_inter);
+        self.comp_inter.merge(&o.comp_inter);
+        self.comp_ref.merge(&o.comp_ref);
+        self.single_ref.merge(&o.single_ref);
+        self.inter_mode.merge(&o.inter_mode);
+        self.y_mode.merge(&o.y_mode);
+        self.uv_mode.merge(&o.uv_mode);
+        self.partition.merge(&o.partition);
+        self.switchable_interp.merge(&o.switchable_interp);
+        self.skip.merge(&o.skip);
+        self.tx_p8x8.merge(&o.tx_p8x8);
+        self.tx_p16x16.merge(&o.tx_p16x16);
+        self.tx_p32x32.merge(&o.tx_p32x32);
+        self.mv.merge(&o.mv);
+    }
+}
+
+/// Element-wise `+=` over the nested count arrays — tile workers count
+/// independently and merge afterward, no `unsafe`, no flattening.
+pub(crate) trait CountAdd {
+    fn merge(&mut self, other: &Self);
+}
+impl CountAdd for u32 {
+    fn merge(&mut self, other: &u32) {
+        *self += *other;
+    }
+}
+impl<T: CountAdd, const N: usize> CountAdd for [T; N] {
+    fn merge(&mut self, other: &Self) {
+        for (a, b) in self.iter_mut().zip(other.iter()) {
+            a.merge(b);
+        }
+    }
 }
 
 // ---- Primitives 1.4/1.5/1.6: backward probability adaptation -------------
@@ -174,7 +213,7 @@ const MV_FP_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 const SWITCHABLE_TREE: [i8; 4] = [0, 2, -1, -2];
 
 /// `vp9_adapt_coef_probs` — merge coefficient model probs from token counts.
-fn adapt_coef_probs(
+pub(crate) fn adapt_coef_probs(
     fc: &mut FrameContext,
     pre: &FrameContext,
     counts: &FrameCounts,
@@ -350,13 +389,13 @@ fn update_mv_probs(b: &mut BoolDecoder, p: &mut [u8]) {
 }
 
 /// `read_inter_mode` — the inter mode (NEARESTMV..NEWMV) for one block.
-fn read_inter_mode(b: &mut BoolDecoder, probs: &[u8; 3]) -> u8 {
+pub(crate) fn read_inter_mode(b: &mut BoolDecoder, probs: &[u8; 3]) -> u8 {
     NEARESTMV + crate::token::read_tree(b, &INTER_MODE_TREE, probs) as u8
 }
 
 /// `clamp_mv_to_umv_border_sb` — scale an MV to the plane's 1/16-pel grid and
 /// clamp it so the reference access stays within the unrestricted-MV border.
-fn clamp_mv_umv(
+pub(crate) fn clamp_mv_umv(
     mv: Mv,
     bw: i32,
     bh: i32,
@@ -410,7 +449,7 @@ fn average_split_mvs(mi: &ModeInfo, r: usize, block: usize, ss_x: usize, ss_y: u
 
 // ---- inter prediction contexts (libvpx vp9_pred_common.c) ---------------
 
-fn intra_inter_context(above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> usize {
+pub(crate) fn intra_inter_context(above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> usize {
     match (above, left) {
         (Some(a), Some(l)) => {
             let ai = !a.is_inter_block();
@@ -441,7 +480,7 @@ fn switchable_interp_context(above: Option<&ModeInfo>, left: Option<&ModeInfo>) 
     }
 }
 
-fn single_ref_p1(above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> usize {
+pub(crate) fn single_ref_p1(above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> usize {
     let last = |m: &ModeInfo| {
         if !m.has_second_ref() {
             4 * (m.ref_frame[0] == LAST_FRAME) as usize
@@ -495,7 +534,7 @@ fn single_ref_p1(above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> usize {
     }
 }
 
-fn single_ref_p2(above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> usize {
+pub(crate) fn single_ref_p2(above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> usize {
     let edge = |m: &ModeInfo| {
         if !m.has_second_ref() {
             if m.ref_frame[0] == LAST_FRAME {
@@ -681,7 +720,7 @@ fn read_bit(b: &mut BoolDecoder) -> u32 {
 }
 
 /// `decode_term_subexp` (libvpx) — the sub-exponential magnitude for a prob update.
-fn decode_term_subexp(b: &mut BoolDecoder) -> u32 {
+pub(crate) fn decode_term_subexp(b: &mut BoolDecoder) -> u32 {
     if read_bit(b) == 0 {
         return b.literal(4);
     }
@@ -700,7 +739,7 @@ fn decode_term_subexp(b: &mut BoolDecoder) -> u32 {
 }
 
 /// `vp9_diff_update_prob` — conditionally update a probability in place.
-fn diff_update(b: &mut BoolDecoder, p: &mut u8) {
+pub(crate) fn diff_update(b: &mut BoolDecoder, p: &mut u8) {
     if b.read_bool(252) == 1 {
         let delta = decode_term_subexp(b) as i32;
         *p = inv_remap_prob(delta, *p as i32);
@@ -757,7 +796,7 @@ fn read_coef_probs(b: &mut BoolDecoder, fc: &mut FrameContext) {
 }
 
 /// Parse the compressed header into a [`FrameContext`] (key/intra or inter).
-fn parse_compressed_header(
+pub(crate) fn parse_compressed_header(
     data: &[u8],
     h: &FrameHeader,
     pre_fc: &FrameContext,
@@ -911,7 +950,7 @@ fn tile_offset(idx: usize, mis: usize, log2: u32) -> usize {
 // ---- segmentation (ISO/VP9 §6.4.10) -------------------------------------
 
 /// `vp9_segment_tree` — the 8-segment id tree (leaves are `-segment`).
-const SEGMENT_TREE: [i8; 14] = [2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7];
+pub(crate) const SEGMENT_TREE: [i8; 14] = [2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7];
 const SEG_LVL_ALT_Q: usize = 0;
 const SEG_LVL_REF_FRAME: usize = 2;
 const SEG_LVL_SKIP: usize = 3;
@@ -2539,7 +2578,7 @@ impl Reconstructor {
 /// Chroma transform size from the luma tx size and subsampling
 /// (libvpx `get_uv_tx_size_impl`): sub-8×8 luma → chroma TX_4X4; otherwise the
 /// luma tx clamped to the largest tx of the subsampled (chroma) block size.
-fn uv_tx_size(bsize: usize, tx_size: usize, ss_x: usize, ss_y: usize) -> usize {
+pub(crate) fn uv_tx_size(bsize: usize, tx_size: usize, ss_x: usize, ss_y: usize) -> usize {
     if bsize < BLOCK_8X8 {
         return 0;
     }

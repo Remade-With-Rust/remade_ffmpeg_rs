@@ -155,9 +155,11 @@ unsafe fn conv8_avx2(
     dst: *mut u16,
     n: usize,
     max: i32,
+    avg: bool,
 ) {
     use std::arch::x86_64::*;
     let round = _mm256_set1_epi32(64);
+    let one = _mm256_set1_epi32(1);
     let maxv = _mm256_set1_epi32(max);
     let zero = _mm256_setzero_si256();
     let fk = [
@@ -181,6 +183,12 @@ unsafe fn conv8_avx2(
         }
         acc = _mm256_srai_epi32::<7>(_mm256_add_epi32(acc, round));
         acc = _mm256_min_epi32(_mm256_max_epi32(acc, zero), maxv);
+        if avg {
+            // Compound: blend with the first reference already in dst,
+            // `(pred + dst + 1) >> 1` — bit-identical to the scalar `put`.
+            let d = _mm256_cvtepu16_epi32(_mm_loadu_si128(dst.add(i) as *const __m128i));
+            acc = _mm256_srai_epi32::<1>(_mm256_add_epi32(_mm256_add_epi32(acc, d), one));
+        }
         // pack i32x8 -> u16x8: packus gives [a0..3|a0..3 || a4..7|a4..7]; pull 64-bit lanes 0,2.
         let packed = _mm256_packus_epi32(acc, acc);
         let perm = _mm256_permute4x64_epi64::<0x08>(packed);
@@ -192,7 +200,38 @@ unsafe fn conv8_avx2(
         for k in 0..8 {
             sum += *src.add(i + k * tap_stride) as i32 * f[k];
         }
-        *dst.add(i) = ((sum + 64) >> 7).clamp(0, max) as u16;
+        let v = ((sum + 64) >> 7).clamp(0, max);
+        *dst.add(i) = if avg {
+            ((v + *dst.add(i) as i32 + 1) >> 1) as u16
+        } else {
+            v as u16
+        };
+        i += 1;
+    }
+}
+
+/// AVX2 averaging copy: `dst[i] = (src[i] + dst[i] + 1) >> 1` — the integer-pel
+/// (no-subpel) compound case. `<8` tail is scalar.
+///
+/// # Safety
+/// `src`/`dst` readable+writable for `n` u16s (caller checks bounds).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avg8_avx2(src: *const u16, dst: *mut u16, n: usize) {
+    use std::arch::x86_64::*;
+    let one = _mm256_set1_epi32(1);
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let sv = _mm256_cvtepu16_epi32(_mm_loadu_si128(src.add(i) as *const __m128i));
+        let dv = _mm256_cvtepu16_epi32(_mm_loadu_si128(dst.add(i) as *const __m128i));
+        let a = _mm256_srai_epi32::<1>(_mm256_add_epi32(_mm256_add_epi32(sv, dv), one));
+        let packed = _mm256_packus_epi32(a, a);
+        let perm = _mm256_permute4x64_epi64::<0x08>(packed);
+        _mm_storeu_si128(dst.add(i) as *mut __m128i, _mm256_castsi256_si128(perm));
+        i += 8;
+    }
+    while i < n {
+        *dst.add(i) = ((*src.add(i) as i32 + *dst.add(i) as i32 + 1) >> 1) as u16;
         i += 1;
     }
 }
@@ -217,6 +256,7 @@ unsafe fn predict_block_avx2(
     w: usize,
     h: usize,
     max: i32,
+    avg: bool,
 ) {
     let buf = refp.buf.as_ptr();
     let stride = refp.stride;
@@ -225,19 +265,24 @@ unsafe fn predict_block_avx2(
         (false, false) => {
             for y in 0..h {
                 let s = buf.add((by as usize + y) * stride + bx as usize);
-                std::ptr::copy_nonoverlapping(s, dptr.add(y * dst_stride), w);
+                let d = dptr.add(y * dst_stride);
+                if avg {
+                    avg8_avx2(s, d, w);
+                } else {
+                    std::ptr::copy_nonoverlapping(s, d, w);
+                }
             }
         }
         (true, false) => {
             for y in 0..h {
                 let s = buf.add((by as usize + y) * stride + (bx - 3) as usize);
-                conv8_avx2(s, 1, fx, dptr.add(y * dst_stride), w, max);
+                conv8_avx2(s, 1, fx, dptr.add(y * dst_stride), w, max, avg);
             }
         }
         (false, true) => {
             for y in 0..h {
                 let s = buf.add((by + y as i32 - 3) as usize * stride + bx as usize);
-                conv8_avx2(s, stride, fy, dptr.add(y * dst_stride), w, max);
+                conv8_avx2(s, stride, fy, dptr.add(y * dst_stride), w, max, avg);
             }
         }
         (true, true) => {
@@ -245,9 +290,11 @@ unsafe fn predict_block_avx2(
                 let mut tmp = cell.borrow_mut();
                 let tmp_h = h + TAPS - 1;
                 let tptr = tmp.as_mut_ptr();
+                // Intermediate horizontal pass is never averaged (avg only the
+                // final write into dst).
                 for r in 0..tmp_h {
                     let s = buf.add((by + r as i32 - 3) as usize * stride + (bx - 3) as usize);
-                    conv8_avx2(s, 1, fx, tptr.add(r * w), w, max);
+                    conv8_avx2(s, 1, fx, tptr.add(r * w), w, max, false);
                 }
                 for y in 0..h {
                     conv8_avx2(
@@ -257,6 +304,7 @@ unsafe fn predict_block_avx2(
                         dptr.add(y * dst_stride),
                         w,
                         max,
+                        avg,
                     );
                 }
             });
@@ -294,9 +342,11 @@ unsafe fn conv8_neon(
     dst: *mut u16,
     n: usize,
     max: i32,
+    avg: bool,
 ) {
     use std::arch::aarch64::*;
     let round = vdupq_n_s32(64);
+    let one = vdupq_n_s32(1);
     let zero = vdupq_n_s32(0);
     let maxv = vdupq_n_s32(max);
     let mut i = 0usize;
@@ -312,6 +362,11 @@ unsafe fn conv8_neon(
         // (Σ + 64) >> 7 with a signed (arithmetic) shift, then clamp [0,max].
         acc = vshrq_n_s32::<7>(vaddq_s32(acc, round));
         acc = vminq_s32(vmaxq_s32(acc, zero), maxv);
+        if avg {
+            // Compound: `(pred + dst + 1) >> 1`, bit-identical to scalar `put`.
+            let d = vreinterpretq_s32_u32(vmovl_u16(vld1_u16(dst.add(i))));
+            acc = vshrq_n_s32::<1>(vaddq_s32(vaddq_s32(acc, d), one));
+        }
         // Narrow i32 (already in [0,max]) → u16 by truncation (exact: fits u16).
         vst1_u16(dst.add(i), vmovn_u32(vreinterpretq_u32_s32(acc)));
         i += 4;
@@ -321,7 +376,36 @@ unsafe fn conv8_neon(
         for k in 0..8 {
             sum += *src.add(i + k * tap_stride) as i32 * f[k];
         }
-        *dst.add(i) = ((sum + 64) >> 7).clamp(0, max) as u16;
+        let v = ((sum + 64) >> 7).clamp(0, max);
+        *dst.add(i) = if avg {
+            ((v + *dst.add(i) as i32 + 1) >> 1) as u16
+        } else {
+            v as u16
+        };
+        i += 1;
+    }
+}
+
+/// NEON averaging copy: `dst[i] = (src[i] + dst[i] + 1) >> 1` (integer-pel
+/// compound). `<4` tail is scalar.
+///
+/// # Safety
+/// `src`/`dst` readable+writable for `n` u16s (caller checks bounds).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn avg8_neon(src: *const u16, dst: *mut u16, n: usize) {
+    use std::arch::aarch64::*;
+    let one = vdupq_n_s32(1);
+    let mut i = 0usize;
+    while i + 4 <= n {
+        let s = vreinterpretq_s32_u32(vmovl_u16(vld1_u16(src.add(i))));
+        let d = vreinterpretq_s32_u32(vmovl_u16(vld1_u16(dst.add(i))));
+        let a = vshrq_n_s32::<1>(vaddq_s32(vaddq_s32(s, d), one));
+        vst1_u16(dst.add(i), vmovn_u32(vreinterpretq_u32_s32(a)));
+        i += 4;
+    }
+    while i < n {
+        *dst.add(i) = ((*src.add(i) as i32 + *dst.add(i) as i32 + 1) >> 1) as u16;
         i += 1;
     }
 }
@@ -346,6 +430,7 @@ unsafe fn predict_block_neon(
     w: usize,
     h: usize,
     max: i32,
+    avg: bool,
 ) {
     let buf = refp.buf.as_ptr();
     let stride = refp.stride;
@@ -354,19 +439,24 @@ unsafe fn predict_block_neon(
         (false, false) => {
             for y in 0..h {
                 let s = buf.add((by as usize + y) * stride + bx as usize);
-                std::ptr::copy_nonoverlapping(s, dptr.add(y * dst_stride), w);
+                let d = dptr.add(y * dst_stride);
+                if avg {
+                    avg8_neon(s, d, w);
+                } else {
+                    std::ptr::copy_nonoverlapping(s, d, w);
+                }
             }
         }
         (true, false) => {
             for y in 0..h {
                 let s = buf.add((by as usize + y) * stride + (bx - 3) as usize);
-                conv8_neon(s, 1, fx, dptr.add(y * dst_stride), w, max);
+                conv8_neon(s, 1, fx, dptr.add(y * dst_stride), w, max, avg);
             }
         }
         (false, true) => {
             for y in 0..h {
                 let s = buf.add((by + y as i32 - 3) as usize * stride + bx as usize);
-                conv8_neon(s, stride, fy, dptr.add(y * dst_stride), w, max);
+                conv8_neon(s, stride, fy, dptr.add(y * dst_stride), w, max, avg);
             }
         }
         (true, true) => {
@@ -374,9 +464,10 @@ unsafe fn predict_block_neon(
                 let mut tmp = cell.borrow_mut();
                 let tmp_h = h + TAPS - 1;
                 let tptr = tmp.as_mut_ptr();
+                // Intermediate pass is never averaged (avg only the final write).
                 for r in 0..tmp_h {
                     let s = buf.add((by + r as i32 - 3) as usize * stride + (bx - 3) as usize);
-                    conv8_neon(s, 1, fx, tptr.add(r * w), w, max);
+                    conv8_neon(s, 1, fx, tptr.add(r * w), w, max, false);
                 }
                 for y in 0..h {
                     conv8_neon(
@@ -386,6 +477,7 @@ unsafe fn predict_block_neon(
                         dptr.add(y * dst_stride),
                         w,
                         max,
+                        avg,
                     );
                 }
             });
@@ -426,10 +518,12 @@ pub fn predict_block(
             && bx + w as i32 + nr <= refp.w
             && by - nt >= 0
             && by + h as i32 + nb <= refp.h;
-        if !avg && in_bounds && has_avx2() {
+        if in_bounds && has_avx2() {
             // SAFETY: bounds checked above; AVX2 confirmed present.
             unsafe {
-                predict_block_avx2(refp, bx, by, fx, fy, subx, suby, dst, dst_stride, w, h, max);
+                predict_block_avx2(
+                    refp, bx, by, fx, fy, subx, suby, dst, dst_stride, w, h, max, avg,
+                );
             }
             return;
         }
@@ -445,10 +539,12 @@ pub fn predict_block(
             && bx + w as i32 + nr <= refp.w
             && by - nt >= 0
             && by + h as i32 + nb <= refp.h;
-        if !avg && in_bounds && has_neon() {
+        if in_bounds && has_neon() {
             // SAFETY: bounds checked above; NEON is the aarch64 baseline.
             unsafe {
-                predict_block_neon(refp, bx, by, fx, fy, subx, suby, dst, dst_stride, w, h, max);
+                predict_block_neon(
+                    refp, bx, by, fx, fy, subx, suby, dst, dst_stride, w, h, max, avg,
+                );
             }
             return;
         }
@@ -659,6 +755,7 @@ mod tests {
                                     got.as_mut_ptr(),
                                     n,
                                     max,
+                                    false,
                                 );
                             }
                             let want: Vec<u16> = (0..n)
@@ -731,5 +828,46 @@ mod tests {
         predict_block(&refp, 0, 0, 0, 0, 0, &mut dst, 4, 4, 4, true, 255);
         // round((100 + 200)/2) = 150.
         assert!(dst.iter().take(4).all(|&v| v == 150));
+    }
+
+    #[test]
+    fn compound_avg_matches_mc_blend() {
+        // Exercises the compound (avg) kernel — the AVX2 8-wide blend for w≥8 and
+        // the scalar tail for w=4 — across all four subpel cases. `avg=true` must
+        // equal `(mc + dst0 + 1) >> 1` where `mc` is the same block with avg=false.
+        let stride = 48usize;
+        let buf: Vec<u16> = (0..stride * 48)
+            .map(|i| ((i * 7 + 13) % 256) as u16)
+            .collect();
+        let refp = RefPlane {
+            buf: &buf,
+            stride,
+            w: 48,
+            h: 48,
+        };
+        let max = 255;
+        for &(sx, sy) in &[(0usize, 0usize), (8, 0), (0, 8), (8, 8), (4, 12)] {
+            for &w in &[4usize, 8, 16] {
+                let h = w;
+                let (bx, by) = (12i32, 12i32); // window stays interior → AVX2 path
+                let dst0: Vec<u16> = (0..w * h).map(|i| ((i * 3 + 41) % 256) as u16).collect();
+
+                let mut dst_avg = dst0.clone();
+                predict_block(&refp, bx, by, sx, sy, 0, &mut dst_avg, w, w, h, true, max);
+
+                let mut mc = vec![0u16; w * h];
+                predict_block(&refp, bx, by, sx, sy, 0, &mut mc, w, w, h, false, max);
+                let manual: Vec<u16> = dst0
+                    .iter()
+                    .zip(&mc)
+                    .map(|(&a, &b)| ((a as i32 + b as i32 + 1) >> 1) as u16)
+                    .collect();
+
+                assert_eq!(
+                    dst_avg, manual,
+                    "compound mismatch: subpel ({sx},{sy}), w={w}"
+                );
+            }
+        }
     }
 }
