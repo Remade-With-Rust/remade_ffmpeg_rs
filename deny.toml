@@ -47,4 +47,24 @@ yanked = "deny"
 # stable proc-macro pulled in transitively (via rav1e / codec deps) with no
 # known security issue and no drop-in replacement under our control.
 # Acknowledge it explicitly; revisit if the upstreams migrate off it.
-ignore = ["RUSTSEC-2024-0436"]
+#
+# The five below ALL originate from `rustls-rustcrypto 0.0.2-alpha` — the pure-Rust
+# (ring-free) crypto provider behind the *opt-in, experimental* HTTPS input stack.
+# It is present only under `--all-features` (never in the default build), is the
+# LATEST published version, and pins the affected transitive crates, so there is no
+# upstream fix to take today (a `[patch]` to newer webpki would break its API):
+#   * RUSTSEC-2023-0071 — `rsa` "Marvin" RSA timing sidechannel. No fixed `rsa`
+#     release exists, and it is not in a practical attack path here (we don't run
+#     attacker-probed RSA operations when fetching HTTPS media).
+#   * RUSTSEC-2026-0049/0098/0099/0104 — `rustls-webpki 0.102` cert-path bugs (CRL
+#     matching, URI/wildcard name constraints, a reachable panic in CRL parsing).
+# Accepted ONLY for the experimental HTTPS feature. TRACK: update/replace
+# `rustls-rustcrypto` (or swap the crypto provider) to clear these.
+ignore = [
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+]
