@@ -677,7 +677,11 @@ struct ColorSpec {
 }
 impl Default for ColorSpec {
     fn default() -> Self {
-        ColorSpec { kr: 0.299, kb: 0.114, limited: false } // BT.601 full-range (legacy)
+        ColorSpec {
+            kr: 0.299,
+            kb: 0.114,
+            limited: false,
+        } // BT.601 full-range (legacy)
     }
 }
 impl ColorSpec {
@@ -1175,8 +1179,12 @@ mod tests {
             let mut to_r = FilterChain::parse(&format!("format=rgb24{m}")).unwrap();
             let src = solid(200, 100, 50);
             let back = to_r.apply(to_y.apply(src.clone()).unwrap()).unwrap();
-            let drift: u32 = src.planes[0].iter().zip(&back.planes[0])
-                .map(|(a, b)| (*a as i16 - *b as i16).unsigned_abs() as u32).sum::<u32>() / 12;
+            let drift: u32 = src.planes[0]
+                .iter()
+                .zip(&back.planes[0])
+                .map(|(a, b)| (*a as i16 - *b as i16).unsigned_abs() as u32)
+                .sum::<u32>()
+                / 12;
             assert!(drift < 6, "round-trip drift for {m}: {drift}");
         }
     }
