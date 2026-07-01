@@ -223,6 +223,42 @@ impl Mp3Encode {
         (fheader, side, main_data, fa.frame_pe)
     }
 
+    /// Per-frame joint-stereo (M/S vs independent L/R) decision.
+    ///
+    /// Default is the raw-energy heuristic ([`stereo::prefer_mid_side`]), whose choice
+    /// changes SLOWLY (energy is smooth frame-to-frame → mode switches in blocks). That
+    /// matters: per-frame M/S switching has a residual corruption bug — a mode that
+    /// flips nearly every frame destroys the reconstruction (corr → 0.27, confirmed by
+    /// BOTH ffmpeg and our own decoder), while blocky switching reconstructs cleanly
+    /// (corr 1.0). The frequency-domain M/S in `analyze_frame` fixed the common *blocky*
+    /// case (piano@128 −3.87 → −0.71); the every-frame case is still broken.
+    ///
+    /// `MP3_STEREO=pe` selects a cost-based decision — pick the lower summed perceptual
+    /// entropy (bit demand), `PE(M)+PE(S)` vs `PE(L)+PE(R)`; M/S is lossless so fewer
+    /// bits ⇒ finer quantiser ⇒ better CBR quality. It out-scores the energy test *in
+    /// principle* (force-M/S beat it by up to +0.07 ODG) but oscillates the mode every
+    /// frame → triggers the switching bug. OPT-IN until that bug is root-caused; a robust
+    /// version needs hysteresis to keep switches blocky. `lr`/`ms` force a fixed mode.
+    fn decide_stereo(&self, channels: &[Vec<f32>], granules: usize, sample_rate: u32) -> bool {
+        match std::env::var("MP3_STEREO").as_deref() {
+            Ok("lr") => return false,
+            Ok("ms") => return true,
+            Ok("pe") => {
+                let ms = stereo::mid_side(&channels[0], &channels[1]);
+                let (mut pe_lr, mut pe_ms) = (0f32, 0f32);
+                let pe = |pcm: &[f32]| psychoacoustic::analyze(pcm, sample_rate).perceptual_entropy;
+                for gr in 0..granules {
+                    let s = gr * GRANULE_LINES;
+                    pe_lr += pe(&channels[0][s..]) + pe(&channels[1][s..]);
+                    pe_ms += pe(&ms[0][s..]) + pe(&ms[1][s..]);
+                }
+                return pe_ms < pe_lr;
+            }
+            _ => {}
+        }
+        stereo::prefer_mid_side(&channels[0], &channels[1])
+    }
+
     /// Analyse one frame (M/S decision, block-switch FSM, filterbank → MDCT → psymodel
     /// per granule×channel) WITHOUT quantising — advances the persistent state exactly
     /// once. Splitting this from [`quantize_frame`] lets the 3R1 lookahead path analyse
@@ -232,7 +268,7 @@ impl Mp3Encode {
         let nch = header.channel_mode.channels();
         let granules = header.version.granules();
 
-        let use_ms = nch == 2 && stereo::prefer_mid_side(&channels[0], &channels[1]);
+        let use_ms = nch == 2 && self.decide_stereo(channels, granules, header.sample_rate);
         let coded = if use_ms {
             stereo::mid_side(&channels[0], &channels[1])
         } else {
@@ -246,10 +282,14 @@ impl Mp3Encode {
             };
         }
 
+        // Detect attacks on the RAW L/R channels (what the lapped MDCT actually
+        // transforms), NOT on `coded`: if attacks tracked the M/S choice, a per-frame
+        // M/S flip would make the block-type window oscillate too, and rapid block-type
+        // churn breaks MDCT time-domain aliasing cancellation across frames.
         let attacks: Vec<bool> = (0..granules)
             .map(|gr| {
                 (0..nch).any(|ch| {
-                    let g = &coded[ch][gr * GRANULE_LINES..(gr + 1) * GRANULE_LINES];
+                    let g = &channels[ch][gr * GRANULE_LINES..(gr + 1) * GRANULE_LINES];
                     psychoacoustic::detect_attack(g)
                 })
             })
@@ -263,29 +303,54 @@ impl Mp3Encode {
         let mut frame_pe = 0f32;
         for gr in 0..granules {
             let bt = block_types[gr];
+            let block = GranuleSideInfo {
+                window_switching: bt != BlockType::Long,
+                block_type: bt,
+                ..Default::default()
+            };
+            // The lapped filterbank/MDCT carry PERSISTENT per-channel overlap
+            // (`analysis_fifo`/`mdct_overlap`), so they must run on a domain that is
+            // CONTINUOUS across frames. Always transform the raw L/R channels; M/S is
+            // then a per-line SPECTRAL rotation (below). That rotation commutes with
+            // MDCT+antialias (identical coefficients in steady state) and matches the
+            // decoder — but, unlike rotating in the PCM domain before the lapped
+            // transform, it does NOT corrupt the overlap when the mode switches
+            // L/R<->M/S between adjacent frames (which mangled every switch boundary).
+            let mut freqs: Vec<[f32; GRANULE_LINES]> = Vec::with_capacity(nch);
             for ch in 0..nch {
-                let gpcm = &coded[ch][gr * GRANULE_LINES..];
+                let gpcm = &channels[ch][gr * GRANULE_LINES..];
                 let sub = prof::time(&prof::FILTERBANK, || {
                     filterbank::analyze(gpcm, &mut self.analysis_fifo[ch])
                 });
-                let mut psy = prof::time(&prof::PSY, || {
-                    psychoacoustic::analyze(gpcm, fheader.sample_rate)
-                });
-                if !matches!(fheader.version, crate::header::MpegVersion::V1) {
-                    psy.thresholds = [f32::MAX; crate::frame::SFB_LONG];
-                }
-                let block = GranuleSideInfo {
-                    window_switching: bt != BlockType::Long,
-                    block_type: bt,
-                    ..Default::default()
-                };
                 let freq = prof::time(&prof::MDCT, || {
                     let mut freq = mdct::forward(&sub, bt, &mut self.mdct_overlap[ch]);
                     antialias::expand(&block, &mut freq);
                     freq
                 });
+                freqs.push(freq);
+            }
+            // Spectral M/S: M=(L+R)/√2, S=(L−R)/√2 — the inverse of the decoder's
+            // (M,S)→(L,R) rotation, applied to the full granule spectrum.
+            if use_ms && nch == 2 {
+                let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+                let (l, r) = freqs.split_at_mut(1);
+                for i in 0..l[0].len() {
+                    let (lv, rv) = (l[0][i], r[0][i]);
+                    l[0][i] = (lv + rv) * inv_sqrt2;
+                    r[0][i] = (lv - rv) * inv_sqrt2;
+                }
+            }
+            for ch in 0..nch {
+                // Psymodel on the CODED domain (M/S or L/R): stateless and frame-local,
+                // so it follows the mode without the lapped-overlap constraint.
+                let mut psy = prof::time(&prof::PSY, || {
+                    psychoacoustic::analyze(&coded[ch][gr * GRANULE_LINES..], fheader.sample_rate)
+                });
+                if !matches!(fheader.version, crate::header::MpegVersion::V1) {
+                    psy.thresholds = [f32::MAX; crate::frame::SFB_LONG];
+                }
                 frame_pe += psy.perceptual_entropy;
-                analyzed.push((freq, psy, bt));
+                analyzed.push((freqs[ch], psy, bt)); // [f32; N] is Copy
             }
         }
         FrameAnalysis {

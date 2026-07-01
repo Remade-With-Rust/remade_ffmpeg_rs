@@ -986,16 +986,18 @@ mod tests {
                 .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
                 .collect()
         };
+        // Channel count from the fmt chunk (offset +2..+4); pcm is interleaved as read.
+        let nch = u16::from_le_bytes([d[fmt + 2], d[fmt + 3]]).max(1);
         let mut enc = Mp3Encoder::default();
         let mut opts = rff_core::Dictionary::new();
         opts.set("b", &std::env::var("BR").unwrap_or_else(|_| "128".into()));
         enc.configure(&opts).unwrap();
         enc.send_frame(&Frame::Audio(AudioFrame {
             sample_rate: rate,
-            channels: 1,
+            channels: nch,
             format: SampleFormat::F32,
             planes: vec![pcm_to_bytes(&pcm)],
-            samples: pcm.len(),
+            samples: pcm.len() / nch as usize,
             pts: None,
         }))
         .unwrap();

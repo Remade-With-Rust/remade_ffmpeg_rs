@@ -34,6 +34,10 @@ for row in "${CLIPS[@]}"; do
   # warm-up/build-up effect needs many transient events + refill/spend cycles to
   # register (a 6 s clip barely stresses the 511-byte reservoir bank). PEAQ ~2 s/s.
   "$FF" -y -loglevel error -ss "$((ss + 6))" -t 24 -i "$OUT/dl/$name.$ext" -ac 1 -ar 44100 -c:a pcm_f32le "$OUT/corp_long_$name.wav"
+  # STEREO (6 s) — joint-stereo / M/S work. Measure per-channel (L,R) PEAQ and
+  # average: a mono downmix hides side-channel quantisation noise, which is exactly
+  # what the M/S decision trades. Sources are all 2-ch (Wikimedia).
+  "$FF" -y -loglevel error -ss "$ss" -t "$t" -i "$OUT/dl/$name.$ext" -ac 2 -ar 44100 -c:a pcm_f32le "$OUT/corp_st_$name.wav"
 done
 echo "corpus ready in $OUT (CC0/PD only — safe to encode/redistribute results)"
-echo "  corp_<name>.wav = 6 s (transient/short-block);  corp_long_<name>.wav = 24 s (RD/reservoir)"
+echo "  corp_<name> = 6 s mono (transient);  corp_long_<name> = 24 s mono (RD/reservoir);  corp_st_<name> = 6 s stereo (M/S)"

@@ -22,10 +22,11 @@ pub fn mid_side(left: &[f32], right: &[f32]) -> Vec<Vec<f32>> {
     vec![mid, side]
 }
 
-/// Decide whether mid/side is worthwhile for this frame. M/S concentrates energy
-/// into the mid channel when the channels are positively correlated, leaving the
-/// side channel small (cheap to code). We switch when the side energy is well
-/// below the mid energy; uncorrelated/wide stereo stays independent L/R.
+/// The legacy raw-energy M/S heuristic — M/S concentrates energy into the mid
+/// channel when the channels are positively correlated, leaving the side channel
+/// small (cheap to code), so switch when the side energy is well below the mid.
+/// Superseded by the perceptual-entropy cost test in `Mp3State::decide_stereo`
+/// (this was too conservative); retained for the `MP3_STEREO=energy` A/B path.
 pub fn prefer_mid_side(left: &[f32], right: &[f32]) -> bool {
     let mut mid_e = 0f64;
     let mut side_e = 0f64;
