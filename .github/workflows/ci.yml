@@ -59,3 +59,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # The decoder's defining property — bit-exact vs the official libvpx vectors —
+  # is otherwise only checkable by hand (the gate is `#[ignore]` because the
+  # vectors are large + external). Fetch a cached subset and run it on every PR
+  # so a change that moves one output pixel turns CI red.
+  conformance:
+    name: vp9 conformance (bit-exact)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/setup-nasm@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache VP9 test vectors
+        id: vectors
+        uses: actions/cache@v4
+        with:
+          path: vp9-vectors
+          # Re-fetch only when the vector list changes.
+          key: vp9-vectors-${{ hashFiles('scripts/fetch-vp9-vectors.sh') }}
+      - name: Fetch vectors (on cache miss)
+        if: steps.vectors.outputs.cache-hit != 'true'
+        run: bash scripts/fetch-vp9-vectors.sh "$GITHUB_WORKSPACE/vp9-vectors"
+      - name: Decode every vector, assert per-frame I420 MD5 is bit-exact
+        env:
+          VP9_VECTORS_DIR: ${{ github.workspace }}/vp9-vectors
+        run: cargo test -p rff --test vp9_conformance --release --locked -- --ignored --nocapture
+
+  # Untrusted-input robustness: mutated/truncated/random byte streams (seeded
+  # from a real coded frame) must surface as `Err`, never panic. Deterministic
+  # seed, so a failure is reproducible from the printed seed. No external data.
+  fuzz:
+    name: vp9 decode fuzz (robustness)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 50k malformed streams must never panic
+        env:
+          VP9_FUZZ_ITERS: "50000"
+        run: cargo test -p rff-codec-vp9 --release --locked fuzz_robustness -- --ignored --nocapture

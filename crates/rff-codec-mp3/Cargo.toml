@@ -8,3 +8,16 @@ description = "In-house pure-Rust MP3 (MPEG-1/2 Audio Layer III) decoder + encod
 [dependencies]
 rff-core.workspace = true
 rff-codec.workspace = true
+
+[features]
+# The MP3 encoder experiment harness (brick registry, corpus, metrics, variant
+# sweeps). Opt-in — zero weight on the default build. See docs/mp3-lab.md.
+lab = []
+
+[[example]]
+name = "mp3lab"
+required-features = ["lab"]
+
+[[example]]
+name = "mp3quality"
+required-features = ["lab"]

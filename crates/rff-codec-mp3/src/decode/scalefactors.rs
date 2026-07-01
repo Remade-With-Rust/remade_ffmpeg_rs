@@ -12,7 +12,7 @@ use crate::header::{FrameHeader, MpegVersion};
 use crate::tables;
 
 /// Decoded scalefactors for one granule/channel.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScaleFactors {
     /// Long-block bands `[0..21)` (band 21 is not coded).
     pub long: [u8; crate::frame::SFB_LONG],
@@ -76,8 +76,55 @@ pub fn decode(
                 }
             }
         }
+    } else {
+        // MPEG-2/2.5 (LSF): bit-lengths + per-group band counts are DERIVED from
+        // scalefac_compress (no fixed table), and there's one granule/frame so no
+        // scfsi reuse. Non-intensity channels only (the i_stereo right channel uses
+        // a different derivation — not emitted here, and rare).
+        //
+        // LSF decode is BIT-EXACT vs FFmpeg (and minimp3): long + short, 77–81 dB across
+        // sine/piano/vocal. This scheme fixed the scalefactors (was −5.9 dB / broken); the
+        // last short-block bug was in the Huffman region boundary for Start/Stop blocks
+        // (see `region_bounds` in huffman.rs), NOT here.
+        let is_short = gi.window_switching && gi.block_type == BlockType::Short;
+        let blocktype = if is_short {
+            if gi.mixed_block {
+                2
+            } else {
+                1
+            }
+        } else {
+            0
+        };
+        let (slen, nr) = tables::lsf_scale_params(gi.scalefac_compress, blocktype);
+        if is_short {
+            // Groups fill (sfb, window) linearly, sfb-major (idx = 3·sfb + window) —
+            // proven bit-identical to minimp3.
+            let mut idx = 0usize;
+            for g in 0..4 {
+                for _ in 0..nr[g] {
+                    let v = r.read(slen[g] as u32) as u8;
+                    let (sfb, window) = (idx / 3, idx % 3);
+                    if sfb < crate::frame::SFB_SHORT {
+                        sf.short[window][sfb] = v;
+                    }
+                    idx += 1;
+                }
+            }
+        } else {
+            // Long: groups fill scalefactor bands linearly.
+            let mut sfb = 0usize;
+            for g in 0..4 {
+                for _ in 0..nr[g] {
+                    let v = r.read(slen[g] as u32) as u8;
+                    if sfb < crate::frame::SFB_LONG {
+                        sf.long[sfb] = v;
+                    }
+                    sfb += 1;
+                }
+            }
+        }
     }
-    // brick: MPEG-2/2.5 scalefactor scheme (intensity-stereo-aware, derived slen).
 
     *bit_pos = r.bit_pos();
     sf

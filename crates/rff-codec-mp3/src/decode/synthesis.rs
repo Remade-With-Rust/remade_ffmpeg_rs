@@ -12,7 +12,8 @@ use crate::frame::{GRANULE_LINES, SUBBANDS, SUBBAND_LINES};
 
 use super::synth_window::SYNTH_D;
 
-/// Matrixing coefficients `N[i][k] = cos((16+i)·(2k+1)·π/64)`, 64×32.
+/// Matrixing coefficients `N[i][k] = cos((16+i)·(2k+1)·π/64)`, 64×32. The dense
+/// reference — still the source of truth that [`matrixing_fast`] is gated against.
 fn matrix() -> &'static [[f32; SUBBANDS]; 64] {
     static T: OnceLock<[[f32; SUBBANDS]; 64]> = OnceLock::new();
     T.get_or_init(|| {
@@ -26,10 +27,69 @@ fn matrix() -> &'static [[f32; SUBBANDS]; 64] {
     })
 }
 
+/// Half-width DCT kernel `C[m][k] = cos(m·(2k+1)·π/64)`, `m=0..31`, `k=0..15` —
+/// the 32 distinct matrixing values `G[m]` after both symmetries are folded out.
+fn half_dct() -> &'static [[f32; 16]; 32] {
+    static T: OnceLock<[[f32; 16]; 32]> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut c = [[0f32; 16]; 32];
+        for (m, row) in c.iter_mut().enumerate() {
+            for (k, e) in row.iter_mut().enumerate() {
+                *e = (PI / 64.0 * m as f64 * (2 * k + 1) as f64).cos() as f32;
+            }
+        }
+        c
+    })
+}
+
+/// **B3** — the 64 matrixing outputs `V[i] = Σ_k cos((16+i)(2k+1)π/64)·s[k]`,
+/// computed via two exact cosine symmetries instead of a dense 64×32 product:
+///
+/// * within `k`: `cos(m·(63−2k)π/64) = (−1)^m cos(m·(2k+1)π/64)` folds the 32
+///   inputs into 16 sum/difference terms, so each `G[m]` is 16 mults not 32;
+/// * across `i`: every `V[i]` is a signed copy of one of just 32 values
+///   `G[m] = Σ_k cos(m(2k+1)π/64)·s[k]` (`m=0..31`) — `V[16]` is identically 0.
+///
+/// 512 mults vs 2048. Equal to [`matrix`] up to float reassociation (the symmetry
+/// is exact; only ULP rounding differs) — pinned by `fast_matrixing_matches_dense`.
+fn matrixing_fast(s: &[f32; SUBBANDS]) -> [f32; 64] {
+    let c = half_dct();
+    // Fold k↔31−k: even-m terms use the sum, odd-m terms the difference.
+    let mut plus = [0f32; 16];
+    let mut minus = [0f32; 16];
+    for k in 0..16 {
+        plus[k] = s[k] + s[31 - k];
+        minus[k] = s[k] - s[31 - k];
+    }
+    // The 32 distinct DCT outputs G[0..31].
+    let mut g = [0f32; 32];
+    for (m, gm) in g.iter_mut().enumerate() {
+        let src = if m & 1 == 0 { &plus } else { &minus };
+        let mut acc = 0f32;
+        for k in 0..16 {
+            acc += c[m][k] * src[k];
+        }
+        *gm = acc;
+    }
+    // Map G → the 64 V outputs by sign/index (V[16] = 0).
+    let mut vv = [0f32; 64];
+    for (i, vi) in vv.iter_mut().enumerate() {
+        *vi = if i < 16 {
+            g[16 + i]
+        } else if i == 16 {
+            0.0
+        } else if i < 48 {
+            -g[48 - i]
+        } else {
+            -g[i - 48]
+        };
+    }
+    vv
+}
+
 /// Run the synthesis filterbank for one channel's granule (subband-major `time`),
 /// returning 576 PCM samples. `fifo` is the persistent `V[]` state.
 pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; GRANULE_LINES] {
-    let n = matrix();
     let d = &SYNTH_D;
     let mut pcm = [0f32; GRANULE_LINES];
 
@@ -41,13 +101,7 @@ pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; G
         }
         // Shift V down by 64, then matrix the new 64 values into the front.
         fifo.copy_within(0..1024 - 64, 64);
-        for (i, fi) in fifo.iter_mut().take(64).enumerate() {
-            let mut acc = 0f32;
-            for k in 0..SUBBANDS {
-                acc += n[i][k] * s[k];
-            }
-            *fi = acc;
-        }
+        fifo[..64].copy_from_slice(&matrixing_fast(&s));
         // Build U from V, window with D, sum 16 taps → one PCM sample per j.
         for j in 0..32 {
             let mut sum = 0f32;
@@ -74,6 +128,52 @@ mod tests {
         assert!((n[0][0] - e(0, 0)).abs() < 1e-6);
         assert!((n[33][7] - e(33, 7)).abs() < 1e-6);
         assert!((n[63][31] - e(63, 31)).abs() < 1e-6);
+    }
+
+    /// The dense 64×32 matrixing — the reference `matrixing_fast` must reproduce.
+    fn matrixing_dense(s: &[f32; SUBBANDS]) -> [f32; 64] {
+        let n = matrix();
+        let mut v = [0f32; 64];
+        for (i, vi) in v.iter_mut().enumerate() {
+            let mut acc = 0f32;
+            for k in 0..SUBBANDS {
+                acc += n[i][k] * s[k];
+            }
+            *vi = acc;
+        }
+        v
+    }
+
+    /// **B3 gate.** The fast matrixing must equal the dense reference to float
+    /// precision (the symmetries are exact; only ULP reassociation differs) — for
+    /// many random subband inputs. A bug in the index/sign map shows up as a large
+    /// error here, long before it could reach the FFmpeg-conformance check.
+    #[test]
+    fn fast_matrixing_matches_dense() {
+        let mut st = 0x1234_9ABCu32;
+        let mut rng = || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (st >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        let mut worst = 0f32;
+        for _ in 0..2000 {
+            let mut s = [0f32; SUBBANDS];
+            for sv in s.iter_mut() {
+                *sv = rng() * 100.0;
+            }
+            let dense = matrixing_dense(&s);
+            let fast = matrixing_fast(&s);
+            for i in 0..64 {
+                // relative error vs the row's scale (sum of |s|).
+                let scale = s.iter().map(|x| x.abs()).sum::<f32>().max(1.0);
+                worst = worst.max((dense[i] - fast[i]).abs() / scale);
+            }
+        }
+        eprintln!("[B3] worst relative matrixing error fast vs dense: {worst:.2e}");
+        assert!(
+            worst < 1e-5,
+            "fast matrixing diverges from dense: {worst:.2e}"
+        );
     }
 
     #[test]

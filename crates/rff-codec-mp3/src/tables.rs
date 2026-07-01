@@ -81,27 +81,76 @@ pub const SFB_OFFSET_SHORT_V1: [[u16; 14]; 3] = [
     [0, 4, 8, 12, 16, 22, 30, 42, 58, 78, 104, 138, 180, 192],
 ];
 
-// brick: SFB_OFFSET_{LONG,SHORT}_V2 for MPEG-2 (22050/24000/16000) and MPEG-2.5
-// (11025/12000/8000) from ISO 13818-3 Table B.8.
+/// Long-block scalefactor-band boundaries for MPEG-2 LSF (ISO/IEC 13818-3),
+/// indexed `0 = 22050, 1 = 24000, 2 = 16000`. Validated against FFmpeg's decode.
+pub const SFB_OFFSET_LONG_V2: [[u16; 23]; 3] = [
+    // 22050 Hz
+    [
+        0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 116, 140, 168, 200, 238, 284, 336, 396, 464,
+        522, 576,
+    ],
+    // 24000 Hz
+    [
+        0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 114, 136, 162, 194, 232, 278, 332, 394, 464,
+        540, 576,
+    ],
+    // 16000 Hz
+    [
+        0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 116, 140, 168, 200, 238, 284, 336, 396, 464,
+        522, 576,
+    ],
+];
 
-/// Long-block scalefactor-band offsets for a sample rate (MPEG-1 rates for now).
+/// Short-block scalefactor-band boundaries for MPEG-2 LSF, per window (×3).
+pub const SFB_OFFSET_SHORT_V2: [[u16; 14]; 3] = [
+    // 22050 Hz
+    [0, 4, 8, 12, 18, 24, 32, 42, 56, 74, 100, 132, 174, 192],
+    // 24000 Hz
+    [0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 136, 180, 192],
+    // 16000 Hz
+    [0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174, 192],
+];
+
+/// MPEG-2.5 8000 Hz has its own bands (a very cramped top end), unlike 11025 and
+/// 12000 which reuse the MPEG-2 22050/24000 grids. Long table validated vs FFmpeg.
+pub const SFB_OFFSET_LONG_V25_8000: [u16; 23] = [
+    0, 12, 24, 36, 48, 60, 72, 88, 108, 132, 160, 192, 232, 280, 336, 400, 476, 566, 568, 570, 572,
+    574, 576,
+];
+
+/// MPEG-2.5 8000 Hz short bands (not exercised by the long-only V2/2.5 encoder).
+pub const SFB_OFFSET_SHORT_V25_8000: [u16; 14] =
+    [0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166, 192];
+
+/// Long-block scalefactor-band offsets for a sample rate (MPEG-1 + MPEG-2 LSF).
 pub fn sfb_long_offsets(sample_rate: u32) -> &'static [u16; 23] {
-    let idx = match sample_rate {
-        48000 => 1,
-        32000 => 2,
-        _ => 0, // 44100 (and, until V2 tables land, the fallback)
-    };
-    &SFB_OFFSET_LONG_V1[idx]
+    match sample_rate {
+        48000 => &SFB_OFFSET_LONG_V1[1],
+        32000 => &SFB_OFFSET_LONG_V1[2],
+        // MPEG-2, plus MPEG-2.5 11025/12000 which reuse the 22050/24000 grids.
+        // MPEG-2.5 11025/12000 share the MPEG-2 22050 LONG grid (ISO/minimp3 sr_idx 0);
+        // note 12000 does NOT follow 24000 here (it's the low-rate family, not the mid).
+        22050 | 11025 | 12000 => &SFB_OFFSET_LONG_V2[0],
+        24000 => &SFB_OFFSET_LONG_V2[1],
+        16000 => &SFB_OFFSET_LONG_V2[2],
+        8000 => &SFB_OFFSET_LONG_V25_8000, // MPEG-2.5 8000 has its own bands
+        _ => &SFB_OFFSET_LONG_V1[0],       // 44100 and fallback
+    }
 }
 
-/// Short-block scalefactor-band offsets for a sample rate (MPEG-1 rates).
+/// Short-block scalefactor-band offsets for a sample rate (MPEG-1 + MPEG-2 LSF).
 pub fn sfb_short_offsets(sample_rate: u32) -> &'static [u16; 14] {
-    let idx = match sample_rate {
-        48000 => 1,
-        32000 => 2,
-        _ => 0,
-    };
-    &SFB_OFFSET_SHORT_V1[idx]
+    match sample_rate {
+        48000 => &SFB_OFFSET_SHORT_V1[1],
+        32000 => &SFB_OFFSET_SHORT_V1[2],
+        22050 => &SFB_OFFSET_SHORT_V2[0],
+        24000 => &SFB_OFFSET_SHORT_V2[1],
+        // MPEG-2.5 11025/12000 share the 16000 SHORT grid (ISO/minimp3 sr_idx 0) — NOT
+        // the 22050/24000 short grids their LONG bands use. (LONG 11025/12000 = 22050.)
+        16000 | 11025 | 12000 => &SFB_OFFSET_SHORT_V2[2],
+        8000 => &SFB_OFFSET_SHORT_V25_8000,
+        _ => &SFB_OFFSET_SHORT_V1[0],
+    }
 }
 
 /// Preflag additive table for long blocks (added to high-band scalefactors when
@@ -154,6 +203,43 @@ pub const POW43_LEN: usize = 8207;
 ///
 /// brick: port the codeword tables from ISO Table B.7 and the linbits per table.
 pub const HUFFMAN_TABLE_COUNT: usize = 34;
+
+// ---- MPEG-2 / 2.5 (LSF) scalefactor scheme (ISO 13818-3 §2.4.3.4) -------------
+
+/// Band counts per scalefactor group, indexed `[blocknumber][blocktype][group]`,
+/// where blocktype is 0=long, 1=short, 2=mixed. For long blocks a group's count is
+/// scalefactor bands; for short it counts individual (sfb,window) scalefactors
+/// (sum = 3·sfb). ISO 13818-3 Table (derived-slen scheme).
+pub const NR_OF_SFB_BLOCK: [[[u8; 4]; 3]; 6] = [
+    [[6, 5, 5, 5], [9, 9, 9, 9], [6, 9, 9, 9]],
+    [[6, 5, 7, 3], [9, 9, 12, 6], [6, 9, 12, 6]],
+    [[11, 10, 0, 0], [18, 18, 0, 0], [15, 18, 0, 0]],
+    [[7, 7, 7, 0], [12, 12, 12, 0], [6, 15, 12, 0]],
+    [[6, 6, 6, 3], [12, 9, 9, 6], [6, 12, 9, 6]],
+    [[8, 8, 5, 0], [15, 12, 9, 0], [6, 18, 9, 0]],
+];
+
+/// LSF scalefactor bit-lengths `slen[4]` and per-group band counts `nr[4]`, derived
+/// from `scalefac_compress` and the block type. Non-intensity (left channel / no
+/// intensity stereo — the right channel of an i_stereo pair uses a different table,
+/// not emitted by this encoder yet). `blocktype`: 0=long, 1=short, 2=mixed.
+pub fn lsf_scale_params(scalefac_compress: u16, blocktype: usize) -> ([u8; 4], [u8; 4]) {
+    let sfc = scalefac_compress as u32;
+    let (slen, blocknumber) = if sfc < 400 {
+        ([(sfc >> 4) / 5, (sfc >> 4) % 5, (sfc % 16) >> 2, sfc % 4], 0)
+    } else if sfc < 500 {
+        let s = sfc - 400;
+        ([(s >> 2) / 5, (s >> 2) % 5, s % 4, 0], 1)
+    } else {
+        let s = sfc - 500;
+        ([s / 3, s % 3, 0, 0], 2)
+    };
+    let nr = NR_OF_SFB_BLOCK[blocknumber][blocktype];
+    (
+        [slen[0] as u8, slen[1] as u8, slen[2] as u8, slen[3] as u8],
+        nr,
+    )
+}
 
 // ---- synthesis filterbank (to port) ------------------------------------------
 

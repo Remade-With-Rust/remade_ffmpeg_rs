@@ -16,22 +16,20 @@ use crate::tables;
 
 use super::scalefactors::ScaleFactors;
 
-/// `|n|^(4/3)`, table-backed (Huffman magnitudes reach 8206 with linbits).
-fn pow43(n: i32) -> f64 {
+/// `|n|^(4/3)` table for the `0..=8206` Huffman magnitudes (linbits reach 8206).
+/// Returned by reference so the per-line loop indexes it directly instead of
+/// re-checking the `OnceLock` and making a call 576× per granule.
+fn pow43_table() -> &'static [f64] {
     static T: OnceLock<Vec<f64>> = OnceLock::new();
-    let t = T.get_or_init(|| (0..8207).map(|i| (i as f64).powf(4.0 / 3.0)).collect());
-    let a = n.unsigned_abs() as usize;
-    t.get(a)
-        .copied()
-        .unwrap_or_else(|| (a as f64).powf(4.0 / 3.0))
+    T.get_or_init(|| (0..8207).map(|i| (i as f64).powf(4.0 / 3.0)).collect())
 }
 
-fn dequant(c: i32, scale: f64) -> f32 {
-    if c == 0 {
-        0.0
-    } else {
-        (c.signum() as f64 * pow43(c) * scale) as f32
-    }
+/// Dequantize one line: `sign(c)·|c|^(4/3)·scale`. Branchless — for `c == 0`,
+/// `sign(0)=0` and `pow[0]=0`, so the product is `0.0`, identical to a guard
+/// (which kept the per-line loop from vectorizing). `pow` is the hoisted table.
+#[inline]
+fn dequant(c: i32, pow: &[f64], scale: f64) -> f32 {
+    (c.signum() as f64 * pow[c.unsigned_abs() as usize] * scale) as f32
 }
 
 /// Dequantize `coeffs` into `out` (576 lines), applying gains, scalefactors, and
@@ -45,6 +43,7 @@ pub fn apply(
     out: &mut [f32; GRANULE_LINES],
 ) {
     out.fill(0.0);
+    let pow = pow43_table(); // hoisted once per granule, not per line
     let gain = gi.global_gain as i32 - 210;
     let sf_mult = if gi.scalefac_scale { 1.0f64 } else { 0.5 };
     let is_short = gi.window_switching && gi.block_type == BlockType::Short;
@@ -59,7 +58,7 @@ pub fn apply(
             let exp = 0.25 * gain as f64 - sf_mult * (sf.long[sfb] as f64 + pre);
             let scale = 2f64.powf(exp);
             for i in start..end {
-                out[i] = dequant(coeffs[i], scale);
+                out[i] = dequant(coeffs[i], pow, scale);
             }
         }
     } else {
@@ -77,7 +76,7 @@ pub fn apply(
                     let src = start * 3 + window * width + f;
                     let dst = start * 3 + window + f * 3;
                     if src < GRANULE_LINES && dst < GRANULE_LINES {
-                        out[dst] = dequant(coeffs[src], scale);
+                        out[dst] = dequant(coeffs[src], pow, scale);
                     }
                 }
             }

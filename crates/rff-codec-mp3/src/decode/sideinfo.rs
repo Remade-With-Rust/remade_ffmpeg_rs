@@ -74,6 +74,10 @@ pub fn parse(header: &FrameHeader, bytes: &[u8]) -> Result<SideInfo> {
             }
             if mpeg1 {
                 g.preflag = r.read_bool();
+            } else {
+                // LSF carries no preflag bit — it's DERIVED: the pretab applies when
+                // the scalefactor scheme's blocknumber is 2 (scalefac_compress ≥ 500).
+                g.preflag = g.scalefac_compress >= 500;
             }
             g.scalefac_scale = r.read_bool();
             g.count1table_select = r.read_bool();
