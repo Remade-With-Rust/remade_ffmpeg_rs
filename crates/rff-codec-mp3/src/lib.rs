@@ -177,6 +177,11 @@ struct Mp3Encoder {
     /// `MP3_RESERVOIR`; `resv_gain` (`MP3_RESV_GAIN`, 0 ⇒ flat/byte-identical) is the knob.
     reservoir: bool,
     resv_gain: f32,
+    /// **3R1 lookahead**: buffer all frame PCM and allocate against the GLOBAL perceptual-
+    /// entropy distribution (two-pass) instead of a causal running average. `MP3_RESV_LOOKAHEAD`
+    /// (default on when the reservoir is on); the buffer holds `(header, channels-PCM)`.
+    resv_lookahead: bool,
+    resv_frames_pcm: Vec<(FrameHeader, Vec<Vec<f32>>)>,
     eof: bool,
 }
 
@@ -269,8 +274,13 @@ impl Mp3Encoder {
             let block: Vec<Vec<f32>> = (0..nch)
                 .map(|c| self.pcm[c].drain(0..spf).collect())
                 .collect();
-            if self.reservoir {
-                // Bank the raw frame; the whole stream is assembled at flush (B8).
+            if self.reservoir && self.resv_lookahead {
+                // Lookahead: buffer PCM; analyse-all + allocate + assemble at flush.
+                self.resv_frames_pcm.push((header.clone(), block));
+                self.total_frames += 1;
+                self.total_bytes += header.frame_size();
+            } else if self.reservoir {
+                // Causal: encode now, bank the raw frame; assemble (B8) at flush.
                 self.state
                     .encode_frame_reservoir(&header, &block, self.resv_gain);
                 self.total_frames += 1;
@@ -315,6 +325,8 @@ impl Encoder for Mp3Encoder {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.2);
+            // lookahead on by default when the reservoir is on (MP3_RESV_LOOKAHEAD=0 ⇒ causal).
+            self.resv_lookahead = std::env::var("MP3_RESV_LOOKAHEAD").map_or(true, |v| v != "0");
         }
         let nch = self.header.as_ref().unwrap().channel_mode.channels();
         let in_ch = (af.channels as usize).max(1);
@@ -363,7 +375,12 @@ impl Encoder for Mp3Encoder {
             // it back into fixed-size frame packets (B8 output is frame_size-aligned).
             if self.reservoir {
                 let fsize = header.frame_size();
-                let stream = self.state.finish_reservoir();
+                let stream = if self.resv_lookahead {
+                    let frames = std::mem::take(&mut self.resv_frames_pcm);
+                    self.state.encode_reservoir_lookahead(&frames, self.resv_gain)
+                } else {
+                    self.state.finish_reservoir()
+                };
                 for chunk in stream.chunks(fsize) {
                     self.queue.push_back(Packet::from_data(0, chunk.to_vec()));
                 }
@@ -937,6 +954,52 @@ mod tests {
         if let Ok(out) = std::env::var("MP3_OUT") {
             std::fs::write(out, &pcm).expect("write MP3_OUT");
         }
+    }
+
+    /// Encode a WAV file (`WAV_IN`, f32le or s16le mono) → mp3 at `ENC_OUT`, at `BR` kbps.
+    /// Honors `MP3_RESERVOIR`/`MP3_RESV_GAIN`. Lets the quality gate run without the CLI.
+    #[test]
+    fn encode_wav_env() {
+        let Ok(inp) = std::env::var("WAV_IN") else {
+            return;
+        };
+        let d = std::fs::read(&inp).expect("read WAV_IN");
+        // minimal WAV parse: fmt (rate, bits, format) + data chunk
+        let fmt = d.windows(4).position(|w| w == b"fmt ").unwrap() + 8;
+        let audio_fmt = u16::from_le_bytes([d[fmt], d[fmt + 1]]);
+        let rate = u32::from_le_bytes([d[fmt + 4], d[fmt + 5], d[fmt + 6], d[fmt + 7]]);
+        let bits = u16::from_le_bytes([d[fmt + 14], d[fmt + 15]]);
+        let data = d.windows(4).position(|w| w == b"data").unwrap() + 8;
+        let pcm: Vec<f32> = if audio_fmt == 3 || bits == 32 {
+            d[data..]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        } else {
+            d[data..]
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+                .collect()
+        };
+        let mut enc = Mp3Encoder::default();
+        let mut opts = rff_core::Dictionary::new();
+        opts.set("b", &std::env::var("BR").unwrap_or_else(|_| "128".into()));
+        enc.configure(&opts).unwrap();
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            sample_rate: rate,
+            channels: 1,
+            format: SampleFormat::F32,
+            planes: vec![pcm_to_bytes(&pcm)],
+            samples: pcm.len(),
+            pts: None,
+        }))
+        .unwrap();
+        enc.flush();
+        let mut mp3 = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            mp3.extend_from_slice(&p.data);
+        }
+        std::fs::write(std::env::var("ENC_OUT").unwrap(), mp3).unwrap();
     }
 
     /// Encode a synthetic tone+noise signal at `ENC_RATE` Hz → mp3 at `ENC_OUT`.
