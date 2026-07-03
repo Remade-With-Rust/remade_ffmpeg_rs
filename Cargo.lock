@@ -341,7 +341,10 @@ dependencies = [
  "anyhow",
  "arg_enum_proc_macro",
  "arrayvec",
+ "cc",
+ "libc",
  "log",
+ "nasm-rs",
  "num-rational",
  "num-traits",
  "pastey",
@@ -4567,7 +4570,7 @@ dependencies = [
 [[package]]
 name = "rav1d"
 version = "1.1.0"
-source = "git+https://github.com/memorysafety/rav1d?rev=2a734dc9cd52190146796fb24b29a8c7e3d2af1e#2a734dc9cd52190146796fb24b29a8c7e3d2af1e"
+source = "git+https://github.com/Remade-With-Rust/rusty-av1-toolkit?rev=517d4ecb7a7a54cba5a972587ebf4e953e2e695b#517d4ecb7a7a54cba5a972587ebf4e953e2e695b"
 dependencies = [
  "assert_matches",
  "atomig",
@@ -4588,9 +4591,8 @@ dependencies = [
 
 [[package]]
 name = "rav1e"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43b6dd56e85d9483277cde964fd1bdb0428de4fec5ebba7540995639a21cb32b"
+version = "0.8.0"
+source = "git+https://github.com/Remade-With-Rust/rusty-av1-toolkit?rev=517d4ecb7a7a54cba5a972587ebf4e953e2e695b#517d4ecb7a7a54cba5a972587ebf4e953e2e695b"
 dependencies = [
  "aligned-vec",
  "arbitrary",
@@ -4611,7 +4613,7 @@ dependencies = [
  "noop_proc_macro",
  "num-derive",
  "num-traits",
- "paste",
+ "pastey",
  "profiling",
  "rand 0.9.4",
  "rand_chacha 0.9.0",

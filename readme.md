@@ -90,8 +90,8 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 |---|---|---|
 | Video codec | **vp9** (VP9) | **decode + encode** — in-house pure-Rust. Decoder **bit-exact against all 315 official libvpx conformance vectors** (profiles 0–3, 8/10/12-bit, AVX2 + NEON). Encoder: RDO partition/mode, rate control (CBR + two-pass), golden/ALT-REF + temporal filtering, **validated pixel-exact vs libvpx & ffmpeg** (~+0.9% keyframe BD-rate; younger than libvpx, optimizing) |
 | Video codec | **h264** (H.264 / AVC) | **decode + encode** — [`rusty_h264`](https://crates.io/crates/rusty_h264) with SIMD asm, **default** |
-| Video codec | **AV1** (AV1) | **decode + encode** — [`rav1d`] and ['rav1e'] |
-| Image codec | **avif** (AV1 still image) | **decode + encode**, 8- & 10-bit (rav1d / rav1e) |
+| Video codec | **AV1** (AV1) | **decode + encode** — `rusty_av1d` + `rusty_av1e`, our [rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) forks of rav1d/rav1e |
+| Image codec | **avif** (AV1 still image) | **decode + encode**, 8- & 10-bit (`rusty_av1d` / `rusty_av1e`) |
 | Image codec | **png** (RGB/RGBA) | **decode + encode** (pure-Rust `png`) |
 | Image codec | **mjpeg** (JPEG/MJPEG) | **decode + encode** (pure-Rust `jpeg-decoder`/`jpeg-encoder`) |
 | Image codec | **gif** | **decode + encode** (pure-Rust `gif`; first frame) |
@@ -133,8 +133,8 @@ With the `format` filter bridging colorspaces, `ffmpeg -i photo.png -vf format=y
 
 | Codec | Backing crate | License | Pure Rust |
 |---|---|---|---|
-| AV1 encode (avif) | [`rav1e`](https://github.com/xiph/rav1e) | BSD-2-Clause | ✅ (asm, no C) |
-| AV1 decode (avif) | [`rav1d`](https://github.com/memorysafety/rav1d) | BSD-2-Clause | ✅ (Rust port of dav1d) |
+| AV1 encode (avif) | [`rusty_av1e`](https://github.com/Remade-With-Rust/rusty-av1-toolkit) | BSD-2-Clause | ✅ (our rav1e fork; pure-Rust, no asm) |
+| AV1 decode (avif) | [`rusty_av1d`](https://github.com/Remade-With-Rust/rusty-av1-toolkit) | BSD-2-Clause | ✅ (our rav1d fork; Rust port of dav1d) |
 | H.264 decode/encode | [`rusty_h264`](https://crates.io/crates/rusty_h264) | BSD-2-Clause | ✅ (vendored asm, no C; default needs `nasm`) |
 | PNG encode/decode | [`png`](https://crates.io/crates/png) | MIT/Apache-2.0 | ✅ |
 | JPEG decode | [`jpeg-decoder`](https://crates.io/crates/jpeg-decoder) | MIT/Apache-2.0 | ✅ |
@@ -147,11 +147,12 @@ With the `format` filter bridging colorspaces, `ffmpeg -i photo.png -vf format=y
 | JPEG XL decode | [`jxl-oxide`](https://crates.io/crates/jxl-oxide) | MIT/Apache-2.0 | ✅ |
 
 The **avif** path is real end to end: a frame decodes (via the pure-Rust
-[`rav1d`](https://github.com/memorysafety/rav1d)) and encodes (via
-[`rav1e`](https://github.com/xiph/rav1e)) AV1 bitstream, wrapped/unwrapped in
-HEIF/ISOBMFF boxes, and driven through the `demux → decode → encode → mux`
-loop — so `ffmpeg -i in.avif -c:v avif out.avif` works today. Both AV1 crates
-are BSD-2-Clause; the decode path adds zero `unsafe` to this tree.
+[`rusty_av1d`](https://github.com/Remade-With-Rust/rusty-av1-toolkit)) and encodes
+(via [`rusty_av1e`](https://github.com/Remade-With-Rust/rusty-av1-toolkit)) AV1
+bitstream, wrapped/unwrapped in HEIF/ISOBMFF boxes, and driven through the
+`demux → decode → encode → mux` loop — so `ffmpeg -i in.avif -c:v avif out.avif`
+works today. Both AV1 crates are our BSD-2-Clause rusty-av1-toolkit forks (of
+rav1e/rav1d); the decode path adds zero `unsafe` to this tree.
 
 "Scaffolded" = registered and wired through the engine, CLI and server; the
 bitstream body is the next implementation step. More codecs/containers to come.

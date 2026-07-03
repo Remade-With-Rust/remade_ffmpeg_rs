@@ -11,7 +11,8 @@ rust-version.workspace = true
 rff-core.workspace = true
 rff-codec.workspace = true
 
-# AV1 encoder backing the AVIF encode path.
-rav1e.workspace = true
-# AV1 decoder backing the AVIF decode path (pure-Rust, via its C-ABI binding).
-rav1d.workspace = true
+# AV1 encoder backing the AVIF encode path (rusty-av1-toolkit fork of rav1e).
+rusty_av1e.workspace = true
+# AV1 decoder backing the AVIF decode path (rusty-av1-toolkit fork of rav1d),
+# pure-Rust via its native safe Rust API (`rust_api`) — no FFI.
+rusty_av1d.workspace = true

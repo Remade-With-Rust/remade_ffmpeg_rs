@@ -106,16 +106,17 @@ rff = { path = "crates/rff", version = "0.0.1" }
 rff-auth = { path = "crates/rff-auth", version = "0.0.1" }
 
 # Third-party (all permissive — MIT/Apache-2.0; CI-enforced by cargo-deny).
-# rav1e: AV1 encoder, BSD-2-Clause. default-features off drops the `asm`
-# feature (no nasm toolchain needed) and the bundled CLI binaries; we consume
-# it purely as a library.
-rav1e = { version = "0.8", default-features = false }
-# rav1d: pure-Rust AV1 decoder, BSD-2-Clause. default-features off drops the
-# `asm` feature (no nasm/cc toolchain); we keep both bit depths. Pinned to a
-# `main` commit because the native, safe Rust API (`rust_api`, mirroring
-# dav1d-rs) is not in the published 1.1.0 yet — using it keeps the decode path
-# 100% safe Rust (no FFI/unsafe in our tree). Revisit when rav1d 1.2 ships.
-rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "2a734dc9cd52190146796fb24b29a8c7e3d2af1e", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+# AV1 encode + decode come from our own rusty-av1-toolkit (BSD-2-Clause forks of
+# rav1e / rav1d). We alias them to `rusty_av1e` / `rusty_av1d` (the toolkit dir
+# names) via `package = …`, so the forks keep their upstream package names and
+# future upstream syncs stay clean. `default-features = false` drops the `asm`
+# feature (no nasm toolchain); the decoder keeps both bit depths and exposes the
+# native safe Rust API (`rust_api`, mirroring dav1d-rs) — the decode path stays
+# 100% safe Rust (no FFI/unsafe in our tree). Pinned to the toolkit's
+# `fix/no-asm-avx2-cpufeature` branch commit (a no-asm build fix — the asm-only
+# `CpuFeatureLevel` had no `AVX2` variant); re-pin to a main SHA once it merges.
+rusty_av1e = { git = "https://github.com/Remade-With-Rust/rusty-av1-toolkit", rev = "517d4ecb7a7a54cba5a972587ebf4e953e2e695b", package = "rav1e", default-features = false }
+rusty_av1d = { git = "https://github.com/Remade-With-Rust/rusty-av1-toolkit", rev = "517d4ecb7a7a54cba5a972587ebf4e953e2e695b", package = "rav1d", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 # png: pure-Rust PNG codec (MIT/Apache-2.0), DEFLATE via miniz_oxide/fdeflate.
 png = "0.17"
 # jpeg: pure-Rust JPEG decode (MIT/Apache) + encode (MIT/Apache AND IJG).

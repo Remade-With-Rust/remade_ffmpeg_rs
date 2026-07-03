@@ -6,20 +6,20 @@
 //! wrapping itself is handled at the format layer when an `avif` container
 //! lands; this crate is the pixel codec.
 //!
-//! * **Encode** — over [`rav1e`], the BSD-2-Clause native-Rust AV1 encoder, in
+//! * **Encode** — over [`rusty_av1e`], the BSD-2-Clause native-Rust AV1 encoder, in
 //!   `still_picture` mode (8- and 10-bit planar YUV).
-//! * **Decode** — over [`rav1d`], a pure-Rust AV1 decoder, through its safe
+//! * **Decode** — over [`rusty_av1d`], a pure-Rust AV1 decoder, through its safe
 //!   Rust API (no `unsafe`, no C); see [`AvifDecoder`].
 
 use std::collections::VecDeque;
 
-use rav1d::{Decoder as Rav1dDec, PixelLayout, PlanarImageComponent, Rav1dError};
-use rav1e::prelude::{ChromaSampling, Config, Context, EncoderConfig, EncoderStatus, FrameType};
+use rusty_av1d::{Decoder as Rav1dDec, PixelLayout, PlanarImageComponent, Rav1dError};
+use rusty_av1e::prelude::{ChromaSampling, Config, Context, EncoderConfig, EncoderStatus, FrameType};
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
 use rff_core::{Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
 
-/// Map an `ffmpeg`-style `-preset` (named or numeric) to a rav1e speed (0 =
-/// slowest/best … 10 = fastest). Unknown/absent → 6 (rav1e's balanced default).
+/// Map an `ffmpeg`-style `-preset` (named or numeric) to a rusty_av1e speed (0 =
+/// slowest/best … 10 = fastest). Unknown/absent → 6 (rusty_av1e's balanced default).
 fn preset_to_speed(preset: Option<&str>) -> u8 {
     match preset {
         Some(p) => match p.to_ascii_lowercase().as_str() {
@@ -65,10 +65,10 @@ pub fn register(registry: &mut CodecRegistry) {
 }
 
 // ---------------------------------------------------------------------------
-// Encoder (rav1e)
+// Encoder (rusty_av1e)
 // ---------------------------------------------------------------------------
 
-/// rav1e is generic over the pixel sample type: 8-bit content uses `u8`,
+/// rusty_av1e is generic over the pixel sample type: 8-bit content uses `u8`,
 /// 10/12-bit uses `u16`. We pick the matching context from the first frame and
 /// keep it for the life of the encoder.
 enum Av1Context {
@@ -77,9 +77,9 @@ enum Av1Context {
 }
 
 /// AVIF encoder: bridges the engine's send/receive [`Encoder`] contract onto a
-/// [`rav1e`] `Context`.
+/// [`rusty_av1e`] `Context`.
 ///
-/// The rav1e context is created lazily from the first frame (it needs the
+/// The rusty_av1e context is created lazily from the first frame (it needs the
 /// dimensions, chroma layout and bit depth up front). Encoded packets are
 /// buffered in `queue` and handed out one per `receive_packet`, matching the
 /// FFmpeg-style drain loop the rest of the engine expects.
@@ -106,7 +106,7 @@ impl AvifEncoder {
         }
     }
 
-    /// Build the rav1e context for the first frame's geometry + bit depth.
+    /// Build the rusty_av1e context for the first frame's geometry + bit depth.
     fn init(&mut self, vf: &VideoFrame) -> Result<()> {
         let chroma = match vf.format {
             PixelFormat::Yuv420p | PixelFormat::Yuv420p10 => ChromaSampling::Cs420,
@@ -126,9 +126,9 @@ impl AvifEncoder {
         enc.height = vf.height as usize;
         enc.bit_depth = bit_depth;
         enc.chroma_sampling = chroma;
-        // AVIF is a single key frame; this tunes rav1e for one-shot intra.
+        // AVIF is a single key frame; this tunes rusty_av1e for one-shot intra.
         enc.still_picture = true;
-        // Rate control: -qp sets rav1e's quantizer directly; -crf (ffmpeg's
+        // Rate control: -qp sets rusty_av1e's quantizer directly; -crf (ffmpeg's
         // 0–63 scale) maps onto it ×4; -b targets a bitrate (bits/sec).
         if let Some(qp) = self.options.get_int("qp") {
             enc.quantizer = qp.clamp(0, 255) as usize;
@@ -140,7 +140,7 @@ impl AvifEncoder {
         }
 
         let cfg = Config::new().with_encoder_config(enc);
-        let on_err = |e| Error::InvalidData(format!("rav1e config rejected: {e}"));
+        let on_err = |e| Error::InvalidData(format!("rusty_av1e config rejected: {e}"));
         let ctx = if bit_depth > 8 {
             Av1Context::Bd16(cfg.new_context::<u16>().map_err(on_err)?)
         } else {
@@ -152,7 +152,7 @@ impl AvifEncoder {
         Ok(())
     }
 
-    /// Pull every packet rav1e currently has buffered into `queue`.
+    /// Pull every packet rusty_av1e currently has buffered into `queue`.
     fn pump(&mut self) -> Result<()> {
         loop {
             // Both pixel widths yield the same `(bytes, frame_type)` shape.
@@ -175,7 +175,7 @@ impl AvifEncoder {
                     break;
                 }
                 Err(EncoderStatus::Failure) => {
-                    return Err(Error::InvalidData("rav1e encode failure".into()))
+                    return Err(Error::InvalidData("rusty_av1e encode failure".into()))
                 }
                 // NeedMoreData / EnoughData / NotReady — nothing more right now.
                 Err(_) => break,
@@ -218,7 +218,7 @@ impl Encoder for AvifEncoder {
             )));
         }
 
-        // 1 byte/sample for 8-bit, 2 for 10-bit (little-endian u16). rav1e's
+        // 1 byte/sample for 8-bit, 2 for 10-bit (little-endian u16). rusty_av1e's
         // `copy_from_raw_u8` interprets the source by this bytewidth.
         let bytes = vf.format.bytes_per_sample();
         let send_result = match self.ctx.as_mut().expect("context initialized above") {
@@ -242,7 +242,7 @@ impl Encoder for AvifEncoder {
             Ok(()) => {}
             // Buffer is full; draining below will make room.
             Err(EncoderStatus::EnoughData) => {}
-            Err(e) => return Err(Error::InvalidData(format!("rav1e send_frame: {e:?}"))),
+            Err(e) => return Err(Error::InvalidData(format!("rusty_av1e send_frame: {e:?}"))),
         }
         self.pump()
     }
@@ -275,13 +275,13 @@ impl Encoder for AvifEncoder {
 }
 
 // ---------------------------------------------------------------------------
-// Decoder (rav1d)
+// Decoder (rusty_av1d)
 // ---------------------------------------------------------------------------
 
 /// AVIF decoder: bridges the engine's send/receive [`Decoder`] contract onto a
-/// [`rav1d`] decoder via its safe Rust API (no `unsafe`, no C).
+/// [`rusty_av1d`] decoder via its safe Rust API (no `unsafe`, no C).
 ///
-/// The rav1d decoder is created lazily on the first packet (construction is
+/// The rusty_av1d decoder is created lazily on the first packet (construction is
 /// fallible, but the engine's decoder factory is not). Decoded pictures are
 /// copied into `queue` and handed out one per `receive_frame`.
 struct AvifDecoder {
@@ -301,7 +301,7 @@ impl AvifDecoder {
         }
     }
 
-    /// Pull every picture rav1d currently has ready into `queue`.
+    /// Pull every picture rusty_av1d currently has ready into `queue`.
     fn drain_pictures(&mut self) -> Result<()> {
         let dec = self.dec.as_mut().expect("decoder initialized");
         loop {
@@ -309,7 +309,7 @@ impl AvifDecoder {
                 Ok(pic) => self.queue.push_back(picture_to_frame(&pic)?),
                 // No more pictures available right now.
                 Err(Rav1dError::TryAgain) => break,
-                Err(e) => return Err(map_rav1d_err(e)),
+                Err(e) => return Err(map_rusty_av1d_err(e)),
             }
         }
         Ok(())
@@ -319,19 +319,19 @@ impl AvifDecoder {
 impl Decoder for AvifDecoder {
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         if self.dec.is_none() {
-            self.dec = Some(Rav1dDec::new().map_err(map_rav1d_err)?);
+            self.dec = Some(Rav1dDec::new().map_err(map_rusty_av1d_err)?);
         }
 
         let buf = packet.data.clone().into_boxed_slice();
         let pts = packet.pts;
         let duration = Some(packet.duration);
 
-        // Pre-validate rav1d's own `sz > 0 && sz <= usize::MAX/2` input check: on a
-        // failed check rav1d's `validate_input!` calls `debug_abort()` → `process::abort()`
+        // Pre-validate rusty_av1d's own `sz > 0 && sz <= usize::MAX/2` input check: on a
+        // failed check rusty_av1d's `validate_input!` calls `debug_abort()` → `process::abort()`
         // *under `debug_assertions`* — an uncatchable crash (`catch_unwind` can't contain an
         // abort). A malformed/empty AV1 sample from a hostile file would trip it, so we
         // reject it here and fail gracefully in EVERY build (debug/CI included), not just
-        // release (where rav1d already returns `Err`).
+        // release (where rusty_av1d already returns `Err`).
         if buf.is_empty() || buf.len() > usize::MAX / 2 {
             return Err(Error::InvalidData(
                 "avif: empty or oversized AV1 sample".into(),
@@ -353,11 +353,11 @@ impl Decoder for AvifDecoder {
                     match self.dec.as_mut().unwrap().send_pending_data() {
                         Ok(()) => break,
                         Err(Rav1dError::TryAgain) => self.drain_pictures()?,
-                        Err(e) => return Err(map_rav1d_err(e)),
+                        Err(e) => return Err(map_rusty_av1d_err(e)),
                     }
                 }
             }
-            Err(e) => return Err(map_rav1d_err(e)),
+            Err(e) => return Err(map_rusty_av1d_err(e)),
         }
 
         self.drain_pictures()
@@ -376,7 +376,7 @@ impl Decoder for AvifDecoder {
 
     fn flush(&mut self) {
         // Pictures are pulled eagerly on send, so by here the queue already
-        // holds everything. Note: rav1d's own `flush()` is for seeking (it
+        // holds everything. Note: rusty_av1d's own `flush()` is for seeking (it
         // *discards* buffered frames), so we deliberately do not call it.
         if self.dec.is_some() {
             let _ = self.drain_pictures();
@@ -385,10 +385,10 @@ impl Decoder for AvifDecoder {
     }
 }
 
-/// Convert a decoded rav1d [`Picture`](rav1d::Picture) into the engine's
+/// Convert a decoded rusty_av1d [`Picture`](rusty_av1d::Picture) into the engine's
 /// [`Frame`]. Copies plane data out (the picture is reference-counted and freed
 /// when dropped).
-fn picture_to_frame(pic: &rav1d::Picture) -> Result<Frame> {
+fn picture_to_frame(pic: &rusty_av1d::Picture) -> Result<Frame> {
     // Plane bytes are copied verbatim (1 byte/sample at 8-bit, 2 at 10-bit), so
     // bit depth only affects which pixel format we tag the frame with.
     let format = match (pic.pixel_layout(), pic.bit_depth()) {
@@ -431,12 +431,12 @@ fn picture_to_frame(pic: &rav1d::Picture) -> Result<Frame> {
     }))
 }
 
-/// Map a rav1d error onto the engine's error type, preserving the
+/// Map a rusty_av1d error onto the engine's error type, preserving the
 /// "needs more input" control-flow signal.
-fn map_rav1d_err(e: Rav1dError) -> Error {
+fn map_rusty_av1d_err(e: Rav1dError) -> Error {
     match e {
         Rav1dError::TryAgain => Error::Again,
-        other => Error::InvalidData(format!("rav1d decode: {other:?}")),
+        other => Error::InvalidData(format!("rusty_av1d decode: {other:?}")),
     }
 }
 
@@ -499,7 +499,7 @@ mod tests {
     }
 
     /// An empty AV1 sample must return `Err`, not crash. Before the pre-validation
-    /// guard this ABORTED the process under `debug_assertions` (rav1d's `validate_input!`
+    /// guard this ABORTED the process under `debug_assertions` (rusty_av1d's `validate_input!`
     /// → `debug_abort()`), an uncatchable DoS on hostile input; now it fails gracefully.
     #[test]
     fn empty_sample_is_err_not_abort() {
