@@ -13,10 +13,12 @@
 
 use std::collections::VecDeque;
 
-use rusty_av1d::{Decoder as Rav1dDec, PixelLayout, PlanarImageComponent, Rav1dError};
-use rusty_av1e::prelude::{ChromaSampling, Config, Context, EncoderConfig, EncoderStatus, FrameType};
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
 use rff_core::{Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
+use rusty_av1d::{Decoder as Rav1dDec, PixelLayout, PlanarImageComponent, Rav1dError};
+use rusty_av1e::prelude::{
+    ChromaSampling, Config, Context, EncoderConfig, EncoderStatus, FrameType,
+};
 
 /// Map an `ffmpeg`-style `-preset` (named or numeric) to a rusty_av1e speed (0 =
 /// slowest/best … 10 = fastest). Unknown/absent → 6 (rusty_av1e's balanced default).
