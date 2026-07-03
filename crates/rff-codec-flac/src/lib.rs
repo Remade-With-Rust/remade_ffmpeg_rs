@@ -7,14 +7,17 @@
 //! whole stream decodes to one interleaved `f32` [`AudioFrame`] (samples
 //! normalized from FLAC's native bit depth).
 //!
-//! Decode only — there is no permissive pure-Rust FLAC *encoder* (registered
-//! with `encoder: None`).
+//! Decode is via `claxon`; **encode** is our own in-house lossless encoder
+//! ([`encode`], built brick by brick — see `docs/codec-flac-encoder.md`).
 
 use std::io::Cursor;
 
 use claxon::FlacReader;
 use rff_codec::{Codec, CodecRegistry, Decoder};
 use rff_core::{AudioFrame, Error, Frame, MediaType, Packet, Result, SampleFormat};
+
+mod encode;
+mod md5;
 
 /// Register the FLAC codec (decode only) into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
@@ -24,7 +27,7 @@ pub fn register(registry: &mut CodecRegistry) {
         long_name: "FLAC (Free Lossless Audio Codec)",
         media_type: MediaType::Audio,
         decoder: Some(|| Box::new(FlacDecoder::default())),
-        encoder: None,
+        encoder: Some(|| Box::new(encode::FlacEncoder::new())),
     });
 }
 
