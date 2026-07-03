@@ -101,7 +101,7 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 | Audio codec | **mp3** (MPEG-1/2 Layer III) | in-house **decoder + encoder** (`rff-codec-mp3`) — decoder **bit-exact vs FFmpeg**; encoder MPEG-1/2/2.5, CBR + VBR, joint stereo, block switching |
 | Audio codec | **opus** | **decode + encode** (pure-Rust `opus-rs`) |
 | Audio codec | **vorbis** | **decode** (pure-Rust `lewton`; no permissive Rust encoder exists) |
-| Audio codec | **flac** | **decode** (pure-Rust `claxon`; no permissive Rust encoder exists) |
+| Audio codec | **flac** | **decode + encode** — decode via pure-Rust `claxon`; **in-house lossless encoder** (LPC + stereo decorrelation + partitioned Rice + MD5), **at parity with ffmpeg's FLAC** |
 | Audio codec | **pcm** (s16le / f32le) | **decode + encode** (in-house) |
 | Container | **avif** (AV1 Image File Format) | **demux + mux** (reads foreign AVIFs too) |
 | Container | **png** / **jpeg** / **gif** / **webp** / **jpegxl** | **demux + mux** |
@@ -144,6 +144,7 @@ With the `format` filter bridging colorspaces, `ffmpeg -i photo.png -vf format=y
 | Opus encode/decode | [`opus-rs`](https://crates.io/crates/opus-rs) | BSD-3-Clause | ✅ |
 | Vorbis decode | [`lewton`](https://crates.io/crates/lewton) | MIT/Apache-2.0 | ✅ |
 | FLAC decode | [`claxon`](https://crates.io/crates/claxon) | Apache-2.0 | ✅ |
+| FLAC encode | **in-house** (`rff-codec-flac`) | Apache-2.0 | ✅ (lossless, no dep) |
 | JPEG XL decode | [`jxl-oxide`](https://crates.io/crates/jxl-oxide) | MIT/Apache-2.0 | ✅ |
 
 The **avif** path is real end to end: a frame decodes (via the pure-Rust
