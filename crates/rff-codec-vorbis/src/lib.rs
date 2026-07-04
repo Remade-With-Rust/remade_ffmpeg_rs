@@ -7,17 +7,24 @@
 //! identification + setup headers, and each audio packet then decodes to an
 //! interleaved `s16` [`AudioFrame`].
 //!
-//! Decode only — there is no permissive pure-Rust Vorbis *encoder* (the codec
-//! is registered with `encoder: None`); use Opus for encoding.
+//! Decode is backed by lewton. Encode is the in-house pure-Rust Vorbis **encoder**
+//! ([`encode`], see `docs/codec-vorbis-encoder.md`) — masking-driven floor, rate-distortion
+//! residue, stereo coupling, `-q` control. The encoder emits its three setup headers via
+//! [`VorbisEncoder::headers`]; the Ogg muxer pages them ahead of the audio packets.
 
 use std::collections::VecDeque;
+
+/// In-house pure-Rust Vorbis encoder.
+mod encode;
+
+pub use encode::VorbisEncoder;
 
 use lewton::audio::{read_audio_packet, PreviousWindowRight};
 use lewton::header::{read_header_ident, read_header_setup, IdentHeader, SetupHeader};
 use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder};
 use rff_core::{AudioFrame, Error, Frame, MediaType, Packet, Result, SampleFormat};
 
-/// Register the Vorbis codec (decode only) into a [`CodecRegistry`].
+/// Register the Vorbis codec (decode + encode) into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
     registry.register(Codec {
         id: rff_core::CodecId::Vorbis,
@@ -25,7 +32,7 @@ pub fn register(registry: &mut CodecRegistry) {
         long_name: "Vorbis (Ogg Vorbis)",
         media_type: MediaType::Audio,
         decoder: Some(|| Box::new(VorbisDecoder::default())),
-        encoder: None,
+        encoder: Some(|| Box::new(VorbisEncoder::new())),
     });
 }
 

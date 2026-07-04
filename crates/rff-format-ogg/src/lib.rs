@@ -248,6 +248,7 @@ impl Demuxer for OggDemuxer {
 
 struct OggMuxer {
     out: Output,
+    codec: CodecId,
     channels: u8,
     sample_rate: u32,
     packets: Vec<Vec<u8>>,
@@ -257,6 +258,7 @@ impl OggMuxer {
     fn new(out: Output) -> OggMuxer {
         OggMuxer {
             out,
+            codec: CodecId::Opus,
             channels: 0,
             sample_rate: 0,
             packets: Vec::new(),
@@ -268,8 +270,9 @@ impl Muxer for OggMuxer {
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
         let s = streams
             .first()
-            .filter(|s| s.codec_id == CodecId::Opus)
-            .ok_or_else(|| Error::unsupported("ogg mux: needs a single `opus` stream"))?;
+            .filter(|s| matches!(s.codec_id, CodecId::Opus | CodecId::Vorbis))
+            .ok_or_else(|| Error::unsupported("ogg mux: needs a single `opus` or `vorbis` stream"))?;
+        self.codec = s.codec_id;
         self.channels = s.channels.clamp(1, 255) as u8;
         self.sample_rate = s.sample_rate.max(1);
         Ok(())
@@ -282,29 +285,48 @@ impl Muxer for OggMuxer {
 
     fn write_trailer(&mut self) -> Result<()> {
         let mut out = Vec::new();
-        // BOS page: OpusHead. Then OpusTags. (seq 0, 1)
-        write_page(
-            &mut out,
-            0x02,
-            0,
-            0,
-            &opus_head(self.channels, self.sample_rate),
-        );
-        write_page(&mut out, 0x00, 0, 1, &opus_tags());
+        match self.codec {
+            CodecId::Vorbis => self.write_vorbis(&mut out),
+            _ => self.write_opus(&mut out),
+        }
+        self.out.write_all(&out)?;
+        self.out.flush()?;
+        Ok(())
+    }
+}
 
-        // Audio pages: one packet each; Opus granule is in 48 kHz samples and a
-        // 20 ms frame is 960 of them.
+impl OggMuxer {
+    /// Opus: synthesize OpusHead + OpusTags, then one audio packet per page (48 kHz
+    /// granule, 960 samples per 20 ms frame).
+    fn write_opus(&self, out: &mut Vec<u8>) {
+        write_page(out, 0x02, 0, 0, &opus_head(self.channels, self.sample_rate));
+        write_page(out, 0x00, 0, 1, &opus_tags());
         let mut granule: u64 = 0;
         let last = self.packets.len().saturating_sub(1);
         for (i, packet) in self.packets.iter().enumerate() {
             granule += 960;
-            let header_type = if i == last { 0x04 } else { 0x00 }; // EOS on last
-            write_page(&mut out, header_type, granule, (i + 2) as u32, packet);
+            let header_type = if i == last { 0x04 } else { 0x00 };
+            write_page(out, header_type, granule, (i + 2) as u32, packet);
         }
+    }
 
-        self.out.write_all(&out)?;
-        self.out.flush()?;
-        Ok(())
+    /// Vorbis: the encoder emits its three setup headers (ident/comment/setup) as the first
+    /// three packets. Page those as the header pages, then the audio packets (one long-block
+    /// hop = 1024 samples of granule each). The demuxer likewise treats the first 3 as headers.
+    fn write_vorbis(&self, out: &mut Vec<u8>) {
+        let nheaders = 3.min(self.packets.len());
+        for (i, h) in self.packets[..nheaders].iter().enumerate() {
+            let htype = if i == 0 { 0x02 } else { 0x00 }; // BOS on the ident header
+            write_page(out, htype, 0, i as u32, h);
+        }
+        let audio = &self.packets[nheaders..];
+        let last = audio.len().saturating_sub(1);
+        let mut granule: u64 = 0;
+        for (i, packet) in audio.iter().enumerate() {
+            granule += 1024; // long-block hop
+            let header_type = if i == last { 0x04 } else { 0x00 }; // EOS on last
+            write_page(out, header_type, granule, (nheaders + i) as u32, packet);
+        }
     }
 }
 
@@ -360,6 +382,56 @@ mod tests {
         assert_eq!(streams[0].codec_id, CodecId::Opus);
         assert_eq!(streams[0].channels, 2);
         assert_eq!(streams[0].sample_rate, 48_000);
+        assert_eq!(dem.read_packet().unwrap().data, a);
+        assert_eq!(dem.read_packet().unwrap().data, b);
+        assert!(matches!(dem.read_packet(), Err(Error::Eof)));
+    }
+
+    #[test]
+    fn ogg_mux_then_demux_roundtrips_vorbis() {
+        // Real-shaped Vorbis headers (ident/comment/setup) + two audio packets.
+        let mut ident = vec![1u8];
+        ident.extend_from_slice(b"vorbis");
+        ident.extend_from_slice(&0u32.to_le_bytes());
+        ident.push(2); // channels @ 11
+        ident.extend_from_slice(&44_100u32.to_le_bytes()); // rate @ 12
+        ident.resize(30, 0);
+        let comment = {
+            let mut v = vec![3u8];
+            v.extend_from_slice(b"vorbis");
+            v.resize(20, 0);
+            v
+        };
+        let setup = {
+            let mut v = vec![5u8];
+            v.extend_from_slice(b"vorbis");
+            v.resize(64, 0);
+            v
+        };
+        let a = vec![0x00u8; 60]; // audio packet (type bit clear)
+        let b = vec![0x00u8; 300]; // >255 → exercises lacing
+
+        let sink = SharedBuf(Arc::new(Mutex::new(Vec::new())));
+        {
+            let mut mux = OggMuxer::new(Box::new(sink.clone()));
+            let mut s = Stream::new(0, CodecId::Vorbis);
+            s.channels = 2;
+            s.sample_rate = 44_100;
+            mux.write_header(&[s]).unwrap();
+            for p in [&ident, &comment, &setup, &a, &b] {
+                mux.write_packet(&Packet::from_data(0, p.clone())).unwrap();
+            }
+            mux.write_trailer().unwrap();
+        }
+        let file = sink.0.lock().unwrap().clone();
+        assert_eq!(&file[0..4], b"OggS");
+
+        let mut dem = OggDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = dem.read_header().unwrap();
+        assert_eq!(streams[0].codec_id, CodecId::Vorbis);
+        assert_eq!(streams[0].channels, 2);
+        assert_eq!(streams[0].sample_rate, 44_100);
+        assert!(!streams[0].extradata.is_empty()); // 3 headers packed
         assert_eq!(dem.read_packet().unwrap().data, a);
         assert_eq!(dem.read_packet().unwrap().data, b);
         assert!(matches!(dem.read_packet(), Err(Error::Eof)));
