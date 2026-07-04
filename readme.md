@@ -33,6 +33,7 @@
 | Conformance | reference | **bit-exact** (VP9 315/315 vectors; MP3 vs FFmpeg) | maintain |
 | VP9 decode, 1 thread | 1.0× | **~0.16–0.21×** — younger, optimizing | → parity |
 | AAC encode (60 s stereo) | 1.0× | **~6× faster** — frame-parallel (ffmpeg's AAC is 1-thread); ~1.15× single-thread | maintain |
+| Vorbis encode (60 s stereo) | 1.0× | **~3.6× faster** — frame-parallel; the **first permissive-Rust Vorbis encoder** | → single-thread |
 | License + embedding | LGPL/GPL · C FFI | **Apache-2.0 · pure Rust · no FFI** | — |
 
 <sub>Real numbers + how to reproduce them: [docs/benchmarks.md](docs/benchmarks.md). The VP9 speed figure is decode throughput on an i7-14650HX vs FFmpeg's native decoder.</sub>
@@ -48,6 +49,21 @@
 > answer. Every step was gated **bit-exact against a kept scalar oracle**; the pure-safe
 > `--no-default-features` build passes the same tests. Not a benchmark we can't reproduce —
 > just the right algorithm, then the right hardware.
+
+> **⚡ Performance spotlight — Vorbis encode: the first pure-Rust Vorbis encoder, and it beats
+> libvorbis.** No permissively-licensed Vorbis *encoder* had ever existed in Rust — `lewton`
+> decodes, nothing encoded. This is the first, and in one profile-gated campaign it went from
+> **64× slower** than FFmpeg's libvorbis to **~3.6× faster** (60 s stereo, 24 cores, **~331×
+> realtime**) — every step **byte-identical** (the output `.ogg` is unchanged to the byte) and
+> ffmpeg-decodable. The levers, in the order the profiler demanded them: an **N/4-point-FFT
+> MDCT** (O(N²) → O(N log N), collapsing the transform from **46% of runtime to 1%**), a
+> **separable-lattice** VQ quantizer, **structure-of-arrays + AVX2** for the residue-VQ
+> nearest-neighbour search (**2.7×** on the classifier — and the branch-split *reformulation*,
+> not the intrinsics, was most of it), and **frame-parallel encoding** (libvorbis is
+> single-threaded per stream). Single-thread we've closed the gap from **4.7× to ~2.3×** behind
+> and are still hammering — but the parallel win is one FFmpeg's single-threaded encoder can't
+> answer. Gated **byte-identical** at every step; `--no-default-features` drops to a 100%-safe
+> scalar build that passes the same tests.
 
 ---
 
@@ -113,7 +129,7 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 | Audio codec | **aac** | in-house **AAC-LC decoder + encoder** — decoder has all features (short blocks, M/S, intensity stereo, PNS, TNS), bit-exact vs FFmpeg; **encoder** (7 bricks) adds a psychoacoustic model (Bark-scale masking), bitrate rate-control, transient block switching, M/S stereo, and MP4 `esds` — **ffmpeg decodes our output at unity**; **~450× realtime** encode — **~6× faster than ffmpeg's own AAC** — via frame-parallel encoding (ffmpeg's AAC is single-threaded), an N/4-point-FFT MDCT, a two-phase rate loop, cached psychoacoustic tables, and AVX2 (+ opt-in AVX-512) quantize kernels. Single-thread it still edges ffmpeg (~1.15×) |
 | Audio codec | **mp3** (MPEG-1/2 Layer III) | in-house **decoder + encoder** (`rff-codec-mp3`) — decoder **bit-exact vs FFmpeg**; encoder MPEG-1/2/2.5, CBR + VBR, joint stereo, block switching |
 | Audio codec | **opus** | **decode + encode** (pure-Rust `opus-rs`) |
-| Audio codec | **vorbis** | **decode + encode** — decode via pure-Rust `lewton`; **in-house encoder** — *the first permissively-licensed Vorbis encoder in Rust* (none existed before). Window → **N/4-FFT MDCT** → Bark-scale masking floor → channel coupling + point stereo → rate-distortion residue VQ, emitting an embedded libvorbis setup header; `-q:a 0–9`. **ffmpeg decodes our output**, validated packet-exact against `lewton` + libvorbis. **~1.8× faster than libvorbis wall-clock** (60 s stereo, 24 cores) via **frame-parallel** encoding — libvorbis is single-threaded; per-thread the VQ residue search is not yet SIMD'd (the next lever) |
+| Audio codec | **vorbis** | **decode + encode** — decode via pure-Rust `lewton`; **in-house encoder** — *the first permissively-licensed Vorbis encoder in Rust* (none existed before). Window → **N/4-FFT MDCT** → Bark-scale masking floor → channel coupling + point stereo → rate-distortion residue VQ, emitting an embedded libvorbis setup header; `-q:a 0–9`. **ffmpeg decodes our output**, validated packet-exact against `lewton` + libvorbis. **~3.6× faster than libvorbis wall-clock** (60 s stereo, 24 cores) via **frame-parallel** encoding (libvorbis is single-threaded) over a structure-of-arrays + AVX2 residue-VQ search; per-thread it's ~2.3× behind libvorbis, since our rate-distortion classifier trials all 10 residue classes (a quality lever, not a SIMD one) |
 | Audio codec | **flac** | **decode + encode** — decode via pure-Rust `claxon`; **in-house lossless encoder** (LPC + stereo decorrelation + partitioned Rice + MD5), **at parity with ffmpeg's FLAC** |
 | Audio codec | **pcm** (s16le / f32le) | **decode + encode** (in-house) |
 | Container | **avif** (AV1 Image File Format) | **demux + mux** (reads foreign AVIFs too) |
