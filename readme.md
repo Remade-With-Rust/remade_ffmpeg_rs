@@ -103,7 +103,7 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 |---|---|---|
 | Video codec | **vp9** (VP9) | **decode + encode** — in-house pure-Rust. Decoder **bit-exact against all 315 official libvpx conformance vectors** (profiles 0–3, 8/10/12-bit, AVX2 + NEON). Encoder: RDO partition/mode, rate control (CBR + two-pass), golden/ALT-REF + temporal filtering, **validated pixel-exact vs libvpx & ffmpeg** (~+0.9% keyframe BD-rate; younger than libvpx, optimizing) |
 | Video codec | **h264** (H.264 / AVC) | **decode + encode** — [`rusty_h264`](https://crates.io/crates/rusty_h264) with SIMD asm, **default** |
-| Video codec | **AV1** (AV1) | **decode + encode** — `rusty_av1d` + `rusty_av1e`, our [rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) forks of rav1d/rav1e |
+| Video codec | **AV1** (AV1) | **decode + encode** — the royalty-free next-gen codec, **100% pure Rust, no C/FFI**. Our [rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) (`rusty_av1d` / `rusty_av1e`, BSD-2) forks **rav1d** (Rust port of VideoLAN's **dav1d**, the world's fastest AV1 decoder) + **rav1e** (the reference pure-Rust AV1 encoder), with a no-`nasm`, no-asm pure-Rust build path. Our encoder fork runs **~1.10× faster than stock rav1e at byte-identical output**, or up to **~1.69× faster** in opt-in `--racecar` mode |
 | Image codec | **avif** (AV1 still image) | **decode + encode**, 8- & 10-bit (`rusty_av1d` / `rusty_av1e`) |
 | Image codec | **png** (RGB/RGBA) | **decode + encode** (pure-Rust `png`) |
 | Image codec | **mjpeg** (JPEG/MJPEG) | **decode + encode** (pure-Rust `jpeg-decoder`/`jpeg-encoder`) |
@@ -160,13 +160,26 @@ With the `format` filter bridging colorspaces, `ffmpeg -i photo.png -vf format=y
 | FLAC encode | **in-house** (`rff-codec-flac`) | Apache-2.0 | ✅ (lossless, no dep) |
 | JPEG XL decode | [`jxl-oxide`](https://crates.io/crates/jxl-oxide) | MIT/Apache-2.0 | ✅ |
 
-The **avif** path is real end to end: a frame decodes (via the pure-Rust
-[`rusty_av1d`](https://github.com/Remade-With-Rust/rusty-av1-toolkit)) and encodes
-(via [`rusty_av1e`](https://github.com/Remade-With-Rust/rusty-av1-toolkit)) AV1
-bitstream, wrapped/unwrapped in HEIF/ISOBMFF boxes, and driven through the
-`demux → decode → encode → mux` loop — so `ffmpeg -i in.avif -c:v avif out.avif`
-works today. Both AV1 crates are our BSD-2-Clause rusty-av1-toolkit forks (of
-rav1e/rav1d); the decode path adds zero `unsafe` to this tree.
+> **🎬 Spotlight — a full AV1 stack, both ways, in pure Rust with no C.** AV1 is the
+> next-generation codec that's genuinely *free* — no patent pool, no per-unit royalties,
+> unlike H.264/HEVC/VVC — and we ship the **complete pipeline in both directions**: the
+> decoder is a Rust port of **dav1d** (VideoLAN's world-fastest AV1 decoder); the encoder
+> is **rav1e** (the reference pure-Rust AV1 encoder). Both are forked into our permissively
+> licensed BSD-2 [rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit),
+> and — unlike a `libaom`/`libdav1d` C binding — a **pure-Rust build path** (no `nasm`, no C
+> toolchain, zero FFI), with the decode side adding **zero `unsafe`** to this tree. One AV1
+> core powers **both video and AVIF stills** (8- &
+> 10-bit): a frame decodes → re-encodes → rewraps through the `demux → decode → encode → mux`
+> loop, so `ffmpeg -i in.avif -c:v avif out.avif` and `ffmpeg -i v -i a -c:v avif -c:a opus
+> out.mp4` (AV1 video + Opus in one MP4) work today.
+>
+> **And these aren't just repackaged upstreams — the fork is faster.** Our `rusty_av1e`
+> encodes **~1.10× faster than stock rav1e while emitting its byte-identical bitstream**
+> (whole-encode wall-clock, real CLI A/B on one machine), with an opt-in `--racecar` mode
+> that trades bit-exactness for **~1.69× faster** (pair with `--tune Psnr`) — and the
+> `rusty_av1d` decoder doubles as the encoder's own conformance oracle, so every speedup is
+> checked against a safe-Rust dav1d port. **AV2 decode is already in progress** — we're onto
+> the codec *after* next.
 
 "Scaffolded" = registered and wired through the engine, CLI and server; the
 bitstream body is the next implementation step. More codecs/containers to come.
