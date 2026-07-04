@@ -113,7 +113,7 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 | Audio codec | **aac** | in-house **AAC-LC decoder + encoder** — decoder has all features (short blocks, M/S, intensity stereo, PNS, TNS), bit-exact vs FFmpeg; **encoder** (7 bricks) adds a psychoacoustic model (Bark-scale masking), bitrate rate-control, transient block switching, M/S stereo, and MP4 `esds` — **ffmpeg decodes our output at unity**; **~450× realtime** encode — **~6× faster than ffmpeg's own AAC** — via frame-parallel encoding (ffmpeg's AAC is single-threaded), an N/4-point-FFT MDCT, a two-phase rate loop, cached psychoacoustic tables, and AVX2 (+ opt-in AVX-512) quantize kernels. Single-thread it still edges ffmpeg (~1.15×) |
 | Audio codec | **mp3** (MPEG-1/2 Layer III) | in-house **decoder + encoder** (`rff-codec-mp3`) — decoder **bit-exact vs FFmpeg**; encoder MPEG-1/2/2.5, CBR + VBR, joint stereo, block switching |
 | Audio codec | **opus** | **decode + encode** (pure-Rust `opus-rs`) |
-| Audio codec | **vorbis** | **decode** (pure-Rust `lewton`; no permissive Rust encoder exists) |
+| Audio codec | **vorbis** | **decode + encode** — decode via pure-Rust `lewton`; **in-house encoder** — *the first permissively-licensed Vorbis encoder in Rust* (none existed before). Window → **N/4-FFT MDCT** → Bark-scale masking floor → channel coupling + point stereo → rate-distortion residue VQ, emitting an embedded libvorbis setup header; `-q:a 0–9`. **ffmpeg decodes our output**, validated packet-exact against `lewton` + libvorbis. **~1.8× faster than libvorbis wall-clock** (60 s stereo, 24 cores) via **frame-parallel** encoding — libvorbis is single-threaded; per-thread the VQ residue search is not yet SIMD'd (the next lever) |
 | Audio codec | **flac** | **decode + encode** — decode via pure-Rust `claxon`; **in-house lossless encoder** (LPC + stereo decorrelation + partitioned Rice + MD5), **at parity with ffmpeg's FLAC** |
 | Audio codec | **pcm** (s16le / f32le) | **decode + encode** (in-house) |
 | Container | **avif** (AV1 Image File Format) | **demux + mux** (reads foreign AVIFs too) |
@@ -156,6 +156,7 @@ With the `format` filter bridging colorspaces, `ffmpeg -i photo.png -vf format=y
 | WebP encode/decode | [`image-webp`](https://crates.io/crates/image-webp) | MIT/Apache-2.0 | ✅ |
 | Opus encode/decode | [`opus-rs`](https://crates.io/crates/opus-rs) | BSD-3-Clause | ✅ |
 | Vorbis decode | [`lewton`](https://crates.io/crates/lewton) | MIT/Apache-2.0 | ✅ |
+| Vorbis encode | **in-house** (`rff-codec-vorbis`) | Apache-2.0 | ✅ (first permissive Rust Vorbis encoder) |
 | FLAC decode | [`claxon`](https://crates.io/crates/claxon) | Apache-2.0 | ✅ |
 | FLAC encode | **in-house** (`rff-codec-flac`) | Apache-2.0 | ✅ (lossless, no dep) |
 | JPEG XL decode | [`jxl-oxide`](https://crates.io/crates/jxl-oxide) | MIT/Apache-2.0 | ✅ |
@@ -212,8 +213,9 @@ ffmpeg -i input.avif -c:v avif -y output.avif
 # (psychoacoustic model, transient block switching, M/S stereo, esds config):
 ffmpeg -i input.wav -c:a aac -b:a 128k -y output.m4a
 
-# …or FLAC (lossless, at ffmpeg parity), MP3, or Opus — same engine:
+# …or FLAC (lossless, at ffmpeg parity), MP3, Vorbis, or Opus — same engine:
 ffmpeg -i input.wav -c:a flac -y output.flac
+ffmpeg -i input.wav -c:a vorbis -q:a 4 -y output.ogg
 ```
 
 Or talk to the engine over HTTP (API-first):
