@@ -7,6 +7,13 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# `simd` (default) enables the runtime-detected AVX2 residue-VQ distance kernel on x86_64 —
+# a bit-exact `unsafe` block (no FMA, so it's byte-identical to the scalar path) with a scalar
+# fallback. `--no-default-features` gives a 100%-safe scalar build.
+default = ["simd"]
+simd = []
+
 [dependencies]
 rff-core.workspace = true
 rff-codec.workspace = true

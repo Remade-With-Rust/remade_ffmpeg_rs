@@ -67,19 +67,23 @@ fn vq_pass(seg: &mut [f32], book: &Codebook, lambda: f32, mut bw: Option<&mut Bi
 }
 
 /// Distortion (residual energy) and bit cost of coding `seg` with class `c`'s full cascade.
+/// `work` is a caller-owned scratch buffer (reused across the classify trials to avoid a
+/// per-trial allocation); its prior contents are overwritten.
 fn cascade_cost(
     seg: &[f32],
     resid: &Residue,
     codebooks: &[Codebook],
     c: usize,
     lambda: f32,
+    work: &mut Vec<f32>,
 ) -> Result<(f32, u32)> {
-    let mut work = seg.to_vec();
+    work.clear();
+    work.extend_from_slice(seg);
     let mut bits = 0u32;
     for pass in 0..8 {
         let book = resid.books[c][pass];
         if book >= 0 {
-            bits += vq_pass(&mut work, &codebooks[book as usize], lambda, None)?;
+            bits += vq_pass(work, &codebooks[book as usize], lambda, None)?;
         }
     }
     Ok((work.iter().map(|x| x * x).sum(), bits))
@@ -120,12 +124,13 @@ fn encode_residue2(
     #[cfg(test)]
     let _tc = std::time::Instant::now();
     let mut classes = vec![0u8; partitions];
+    let mut work = Vec::with_capacity(psize);
     for (p, cl) in classes.iter_mut().enumerate() {
         let seg = &v[begin + p * psize..begin + (p + 1) * psize];
         let mut best_c = 0usize;
         let mut best_cost = f32::INFINITY;
         for c in 0..resid.classifications as usize {
-            let (dist, bits) = cascade_cost(seg, resid, codebooks, c, lambda)?;
+            let (dist, bits) = cascade_cost(seg, resid, codebooks, c, lambda, &mut work)?;
             let cost = dist + lambda * bits as f32;
             if cost < best_cost {
                 best_cost = cost;

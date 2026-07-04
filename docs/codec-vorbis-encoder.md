@@ -308,7 +308,7 @@ floor 0 / residue 0, plus the LongStart/LongStop window-flag transitions matchin
 overlap-add — the AAC-style block-switch, adapted to Vorbis's per-packet window flags). The
 generalized `encode_packet(mode)` + a transient detector + the transition windows are the work.
 
-### Performance pass (profile-first) — DONE ☑ (64× slower → 1.80× faster than libvorbis, quality-neutral)
+### Performance pass (profile-first) — DONE ☑ (64× slower → 3.6× faster than libvorbis, quality-neutral)
 
 Side-by-side vs ffmpeg's libvorbis on 6 s of real music revealed we were **64× slower**
 (0.8× realtime). Profiled the encode phases (`encode/frame.rs` test-only `prof` counters):
@@ -347,12 +347,31 @@ Side-by-side vs ffmpeg's libvorbis on 6 s of real music revealed we were **64× 
   (1%) — a ~50× stage collapse**, quality-neutral (oracle ≤1e-3, TDAC round-trip <1e-3, lewton +
   ffmpeg decode clean). The 60 s CLI encode: **ours ~348 ms (~173× realtime) vs libvorbis ~626 ms
   (~96×) → we are 1.80× FASTER.**
-- **Net journey:** **64× slower → 1.80× FASTER** (≈180× throughput), every step quality-neutral,
-  every step decoder-validated. Batch-encodes at flush (buffers the whole stream — fine for audio).
-- **Remaining single-thread lever:** per-core the profile is now **classify 85%** (VQ over the
-  residue books) — MDCT is done (1%). Next: energy-bucket the residue-class candidates (skip
-  trialing all 10 classes) to attack that 85%, then AVX on the VQ / dot products. Redundancy /
-  algorithmic before SIMD, per the playbook.
+- **Classify (residue-VQ search) — the 85% lever, hammered.** With MDCT gone, the RD classifier
+  (each partition trials all 10 residue classes; the hot ones are brute-force nearest-neighbour VQ
+  over the sparse books — class 6 = 217-entry dim-2, class 8 = 143, class 1 = dim-8) dominated at
+  85%. Four byte-identical bricks took the stage **0.175 s → 0.065 s (~2.7×)**: (1) **structure-of-
+  arrays** layout for the used-entry dictionaries (each dimension's column contiguous); (2) a
+  **branchless two-pass** distance loop (compute all squared distances, *then* argmin — the fused
+  `best_cost` branch was a loop-carried dependency); (3) reformulating the argmin as **min-value +
+  first-equal** (a vectorizable reduction plus an early-exit scan, exactly the scalar first-wins
+  result); (4) an **AVX2** distance kernel (`mul`+`add`, *no* FMA → bit-identical; runtime-detected,
+  `simd` feature, scalar fallback) plus a **reusable scratch buffer** (killed 550 `to_vec` allocs
+  per block). All gated by a new `brute_quantize_matches_reference` test at λ∈{0, .05, .15, .4}
+  (the RD term participates in the argmin — the brute books have non-uniform lengths, so the
+  lattice shortcut does *not* apply). ★ Two findings: the pure-Rust distance loop **would not
+  auto-vectorize** even at SSE2 baseline (`--emit asm` showed 0 packed ops — a two-provenance
+  scratch pointer defeated alias analysis; the real win was the *reformulation*, not the SIMD), and
+  a fully-AVX2 argmin (vectorized find-first + horizontal min) **regressed** vs the scalar
+  early-exit `position` — reverted.
+- **Net journey:** **64× slower → 3.6× FASTER** (60 s stereo, 24 cores; ~331× realtime), every step
+  quality-neutral (byte-identical output, ffmpeg-decodable), every step decoder-validated.
+  Single-thread the gap to libvorbis closed **4.7× → 2.3× behind** (2755 → 1415 ms).
+- **Remaining single-thread lever (now a QUALITY tradeoff, not a SIMD one):** classify is still
+  ~73% per-core because the RD classifier trials all 10 classes per partition — libvorbis uses a
+  cheaper heuristic classification. Closing the last of the single-thread gap means a cheaper
+  (energy-bucketed) class shortlist, which changes the encoding decision → gate on PEAQ/correlation,
+  not the byte-exact oracle. Out of scope for the byte-identical speed pass.
 
 ### Also still open (quality validation)
 - Real NMR/PEAQ perceptual bench vs libvorbis at matched `-q` (correlation ≠ perceptual parity).

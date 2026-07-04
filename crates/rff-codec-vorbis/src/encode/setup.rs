@@ -183,12 +183,33 @@ pub struct Codebook {
     /// entry is the per-dimension nearest in `O(dim·levels)` vs `O(entries·dim)`. Quality-neutral
     /// (it's the min-error entry, same as the brute-force search at λ=0; verified).
     pub lattice: Option<(Vec<f32>, u32)>,
-    /// Used-entry VQ vectors packed contiguously (`used_count · dimensions`), for the brute-force
-    /// path. Sparse books (e.g. the dim-8 residue book uses 81 of 6561 entries) then iterate only
-    /// the ~81 live entries densely instead of looping all 6561 with a skip branch.
+    /// Used-entry VQ vectors in **structure-of-arrays** layout: `used_vq[d·used_count + i]` is
+    /// dimension `d` of the `i`-th used entry, so each dimension's column is contiguous. Sparse
+    /// books (e.g. the dim-8 residue book uses 81 of 6561 entries) iterate only the live entries;
+    /// the SoA columns let the branchless distance pass in [`quantize_vector`] auto-vectorize.
     used_vq: Vec<f32>,
-    /// `(original entry index, codeword length)` for each packed used entry, aligned with `used_vq`.
-    used: Vec<(u32, u8)>,
+    /// Original entry index for each packed used column `i` (maps the argmin back to a codebook entry).
+    used_entry: Vec<u32>,
+    /// Codeword length (as `f32`) for each packed used column `i` — a contiguous column so the
+    /// rate-distortion term `λ·len` adds into the cost vector without a gather.
+    used_len: Vec<f32>,
+}
+
+/// Cached AVX2 availability — the residue-VQ quantizer is called hundreds of thousands of times
+/// per stream, so resolve the feature probe once into a relaxed atomic.
+#[cfg(all(target_arch = "x86_64", feature = "simd"))]
+fn have_avx2() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(2); // 0 = no, 1 = yes, 2 = unresolved
+    match CACHE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::arch::is_x86_feature_detected!("avx2");
+            CACHE.store(v as u8, Ordering::Relaxed);
+            v
+        }
+    }
 }
 
 impl Codebook {
@@ -221,24 +242,114 @@ impl Codebook {
             }
             return entry;
         }
-        // Brute force over only the *used* entries, packed contiguously (dense, no skip branch).
-        let mut best = 0u32;
-        let mut best_cost = f32::INFINITY;
-        for (ci, &(e, len)) in self.used.iter().enumerate() {
-            let base = ci * dim;
-            let mut err = 0.0f32;
-            for (v, u) in vector[..dim].iter().zip(&self.used_vq[base..base + dim]) {
-                let diff = v - u;
-                err += diff * diff;
-            }
-            // Rate-distortion: trade a slightly worse match for a shorter codeword.
-            let cost = err + lambda * len as f32;
-            if cost < best_cost {
-                best_cost = cost;
-                best = e;
+        // Brute force over only the *used* entries. `cost` is a fresh single-provenance scratch
+        // slice (stack for the common small case) so the SoA distance passes carry clean `noalias`;
+        // a heap buffer covers the rare oversized book.
+        let uc = self.used_entry.len();
+        if uc == 0 {
+            return 0;
+        }
+        const CAP: usize = 512;
+        if uc <= CAP {
+            let mut cost = [0.0f32; CAP];
+            self.brute_quantize(vector, lambda, &mut cost[..uc])
+        } else {
+            let mut cost = vec![0.0f32; uc];
+            self.brute_quantize(vector, lambda, &mut cost)
+        }
+    }
+
+    /// Rate-distortion nearest used entry: fill `cost[i] = Σ_d (v[d]−col_d[i])² + λ·len[i]` then
+    /// take the first-wins argmin. Dispatches to the AVX2 kernel when available (byte-identical —
+    /// no FMA, same accumulation order), else the scalar path.
+    #[inline]
+    fn brute_quantize(&self, vector: &[f32], lambda: f32, cost: &mut [f32]) -> u32 {
+        #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+        {
+            if have_avx2() {
+                // SAFETY: `have_avx2()` confirmed the ISA; the kernel only does aligned-agnostic
+                // `loadu`/`storeu` within `[0, cost.len())` and the SoA columns of matching length.
+                unsafe { self.brute_cost_avx2(vector, lambda, cost) };
+                return self.argmin_entry(cost);
             }
         }
-        best
+        self.brute_cost_scalar(vector, lambda, cost);
+        self.argmin_entry(cost)
+    }
+
+    /// Scalar fill of the cost vector (the oracle + the non-AVX2 fallback). Four branchless SoA
+    /// passes; `cost.len()` == used-entry count.
+    #[inline]
+    fn brute_cost_scalar(&self, vector: &[f32], lambda: f32, cost: &mut [f32]) {
+        let dim = self.dimensions as usize;
+        let uc = cost.len();
+        let v0 = vector[0];
+        for (c, &u) in cost.iter_mut().zip(&self.used_vq[0..uc]) {
+            let diff = v0 - u;
+            *c = diff * diff;
+        }
+        for (d, &vd) in vector[..dim].iter().enumerate().skip(1) {
+            for (c, &u) in cost.iter_mut().zip(&self.used_vq[d * uc..(d + 1) * uc]) {
+                let diff = vd - u;
+                *c += diff * diff;
+            }
+        }
+        for (c, &len) in cost.iter_mut().zip(&self.used_len) {
+            *c += lambda * len;
+        }
+    }
+
+    /// AVX2 fill of the cost vector — 8 used entries per iteration. Uses `mul`+`add` (NOT `fmadd`)
+    /// and the same `d`-ascending accumulation as [`Self::brute_cost_scalar`], so every `cost[i]`
+    /// is bit-identical to the scalar path (gated by `brute_quantize_matches_reference`). The
+    /// first-wins argmin is left to the scalar [`Self::argmin_entry`] (min-fold + early-exit
+    /// `position` measured faster than a vectorized scan on these ~80–220-entry books).
+    ///
+    /// # Safety
+    /// Requires the `avx2` target feature (checked by the caller). Reads/writes stay within
+    /// `cost[0..uc]` and the `dim` SoA columns `used_vq[d*uc .. (d+1)*uc]`, each of length `uc`.
+    #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn brute_cost_avx2(&self, vector: &[f32], lambda: f32, cost: &mut [f32]) {
+        use std::arch::x86_64::*;
+        let dim = self.dimensions as usize;
+        let uc = cost.len();
+        let lam = _mm256_set1_ps(lambda);
+        let vq = self.used_vq.as_ptr();
+        let lens = self.used_len.as_ptr();
+        let out = cost.as_mut_ptr();
+        let mut i = 0usize;
+        while i + 8 <= uc {
+            let mut acc = _mm256_setzero_ps();
+            for d in 0..dim {
+                let vd = _mm256_set1_ps(*vector.get_unchecked(d));
+                let col = _mm256_loadu_ps(vq.add(d * uc + i));
+                let diff = _mm256_sub_ps(vd, col);
+                acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
+            }
+            let rd = _mm256_mul_ps(lam, _mm256_loadu_ps(lens.add(i)));
+            _mm256_storeu_ps(out.add(i), _mm256_add_ps(acc, rd));
+            i += 8;
+        }
+        // Scalar tail (same order → same rounding).
+        while i < uc {
+            let mut e = 0.0f32;
+            for d in 0..dim {
+                let diff = *vector.get_unchecked(d) - *vq.add(d * uc + i);
+                e += diff * diff;
+            }
+            *out.add(i) = e + lambda * *lens.add(i);
+            i += 1;
+        }
+    }
+
+    /// First-wins argmin over a filled cost vector, mapped back to a codebook entry. `min` value
+    /// (a reduction) then the first index equal to it — exactly the scalar `if cost < best` result.
+    #[inline]
+    fn argmin_entry(&self, cost: &[f32]) -> u32 {
+        let best_cost = cost.iter().copied().fold(f32::INFINITY, f32::min);
+        let best_i = cost.iter().position(|&c| c == best_cost).unwrap_or(0);
+        self.used_entry[best_i]
     }
 }
 
@@ -368,21 +479,30 @@ fn read_codebook(rdr: &mut BitReader) -> Result<Codebook> {
         .map(|(&c, &l)| reverse_bits(c, l))
         .collect();
 
-    // Pack the used entries contiguously for the brute-force quantizer (skips dead entries).
-    let (used_vq, used) = match (&vq, lattice.is_some()) {
+    // Pack the used entries for the brute-force quantizer (skips dead entries), in SoA layout:
+    // column `d` (all used entries' dimension `d`) is contiguous, so the distance pass vectorizes.
+    let (used_vq, used_entry, used_len) = match (&vq, lattice.is_some()) {
         (Some(v), false) => {
             let dim = dimensions as usize;
-            let mut uvq = Vec::new();
-            let mut u = Vec::new();
+            let mut entry = Vec::new();
+            let mut len_f = Vec::new();
             for (e, &len) in lengths.iter().enumerate() {
                 if len > 0 {
-                    uvq.extend_from_slice(&v[e * dim..(e + 1) * dim]);
-                    u.push((e as u32, len));
+                    entry.push(e as u32);
+                    len_f.push(len as f32);
                 }
             }
-            (uvq, u)
+            let uc = entry.len();
+            let mut uvq = vec![0.0f32; dim * uc];
+            for (i, &e) in entry.iter().enumerate() {
+                let src = e as usize * dim;
+                for d in 0..dim {
+                    uvq[d * uc + i] = v[src + d];
+                }
+            }
+            (uvq, entry, len_f)
         }
-        _ => (Vec::new(), Vec::new()),
+        _ => (Vec::new(), Vec::new(), Vec::new()),
     };
 
     Ok(Codebook {
@@ -393,7 +513,8 @@ fn read_codebook(rdr: &mut BitReader) -> Result<Codebook> {
         vq,
         lattice,
         used_vq,
-        used,
+        used_entry,
+        used_len,
     })
 }
 
@@ -873,6 +994,62 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn dump_residue_structure() {
+        let s = parse_setup(SETUP_Q4_STEREO, 2).unwrap();
+        for (ri, r) in s.residues.iter().enumerate() {
+            eprintln!(
+                "RESIDUE {ri}: type={} begin={} end={} psize={} nclass={} classbook={} (dim={})",
+                r.residue_type,
+                r.begin,
+                r.end,
+                r.partition_size,
+                r.classifications,
+                r.classbook,
+                s.codebooks[r.classbook as usize].dimensions
+            );
+            for c in 0..r.classifications as usize {
+                let books: Vec<String> = r.books[c]
+                    .iter()
+                    .map(|&b| {
+                        if b < 0 {
+                            "-".to_string()
+                        } else {
+                            let cb = &s.codebooks[b as usize];
+                            let used = cb.lengths.iter().filter(|&&l| l > 0).count();
+                            format!("b{b}(d{},e{},u{used},{})", cb.dimensions, cb.entries,
+                                if cb.lattice.is_some() { "LAT" } else { "brute" })
+                        }
+                    })
+                    .filter(|s| s != "-")
+                    .collect();
+                eprintln!("  class {c}: {}", books.join(" "));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_book_lengths() {
+        let s = parse_setup(SETUP_Q4_STEREO, 2).unwrap();
+        for (i, cb) in s.codebooks.iter().enumerate() {
+            if cb.vq.is_none() || cb.lattice.is_some() {
+                continue;
+            }
+            let lens: Vec<u8> = cb.lengths.iter().copied().filter(|&l| l > 0).collect();
+            let mn = *lens.iter().min().unwrap();
+            let mx = *lens.iter().max().unwrap();
+            eprintln!(
+                "BOOK {i}: dim={} entries={} used={} len[min={mn} max={mx}] uniform={}",
+                cb.dimensions,
+                cb.entries,
+                lens.len(),
+                mn == mx
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn dump_vq_book_status() {
         let s = parse_setup(SETUP_Q4_STEREO, 2).unwrap();
         for (i, cb) in s.codebooks.iter().enumerate() {
@@ -888,6 +1065,64 @@ mod tests {
                 cb.lattice.is_some()
             );
         }
+    }
+
+    /// The SoA two-pass brute quantizer must return the exact same entry as a from-scratch
+    /// reference search over the full dictionary — at λ=0 AND λ>0 (production uses λ>0, where the
+    /// codeword-length term participates in the argmin). Pins the layout/two-pass as byte-identical.
+    #[test]
+    fn brute_quantize_matches_reference() {
+        let s = parse_setup(SETUP_Q4_STEREO, 2).unwrap();
+        // Reference: min (Σ(v−vq)² + λ·len) over used entries, same accumulation order, first wins.
+        fn reference(cb: &Codebook, v: &[f32], lambda: f32) -> u32 {
+            let dim = cb.dimensions as usize;
+            let vq = cb.vq.as_ref().unwrap();
+            let (mut best, mut best_cost) = (0u32, f32::INFINITY);
+            for e in 0..cb.entries as usize {
+                let len = cb.lengths[e];
+                if len == 0 {
+                    continue;
+                }
+                let mut err = 0.0f32;
+                for d in 0..dim {
+                    let diff = v[d] - vq[e * dim + d];
+                    err += diff * diff;
+                }
+                let cost = err + lambda * len as f32;
+                if cost < best_cost {
+                    best_cost = cost;
+                    best = e as u32;
+                }
+            }
+            best
+        }
+        let mut nbrute = 0;
+        for cb in &s.codebooks {
+            // Only the non-lattice VQ books take the brute path.
+            if cb.vq.is_none() || cb.lattice.is_some() {
+                continue;
+            }
+            nbrute += 1;
+            let dim = cb.dimensions as usize;
+            let vq = cb.vq.as_ref().unwrap();
+            for seed in 0..40usize {
+                let v: Vec<f32> = (0..dim)
+                    .map(|d| {
+                        let base = (seed * 13 + d * 7) % cb.entries as usize;
+                        vq[base * dim + d] + 0.05 * ((seed + 3 * d) as f32).sin()
+                    })
+                    .collect();
+                for &lambda in &[0.0f32, 0.05, 0.15, 0.4] {
+                    assert_eq!(
+                        cb.quantize_vector(&v, lambda),
+                        reference(cb, &v, lambda),
+                        "brute mismatch dim={dim} entries={} λ={lambda}",
+                        cb.entries
+                    );
+                }
+            }
+        }
+        assert!(nbrute > 0, "expected non-lattice brute books");
     }
 
     /// The lattice fast quantizer must return the exact same entry as the brute-force min-error
