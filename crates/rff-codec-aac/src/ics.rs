@@ -30,6 +30,16 @@ impl WindowSequence {
     pub fn is_short(self) -> bool {
         self == WindowSequence::EightShort
     }
+
+    /// The 2-bit window-sequence code (the encode side of `from_bits`).
+    pub fn to_bits(self) -> u32 {
+        match self {
+            WindowSequence::OnlyLong => 0,
+            WindowSequence::LongStart => 1,
+            WindowSequence::EightShort => 2,
+            WindowSequence::LongStop => 3,
+        }
+    }
 }
 
 /// Parsed `ics_info` plus the derived grouping for this channel.

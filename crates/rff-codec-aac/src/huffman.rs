@@ -43,6 +43,11 @@ impl HuffBook {
         self.codes.len()
     }
 
+    /// The `(codeword, bit-length)` for symbol index `i` — the encoder side.
+    pub fn code(&self, i: usize) -> (u32, u8) {
+        (self.codes[i], self.lens[i])
+    }
+
     /// Decode the next codeword, returning its symbol index.
     pub fn decode(&self, r: &mut BitReader) -> Result<u16> {
         let mut code = 0u32;

@@ -25,6 +25,7 @@ mod bits;
 mod codebook;
 mod decode;
 mod dsp;
+mod encode;
 mod huffman;
 mod ics;
 mod swb;
@@ -42,6 +43,15 @@ pub fn sample_rate_for_index(idx: u8) -> u32 {
     SAMPLE_RATES.get(idx as usize).copied().unwrap_or(0)
 }
 
+/// Map a sampling rate to its 4-bit index, or None if non-standard (the encoder
+/// then uses the 0x0F + explicit-24-bit-rate escape).
+pub fn sf_index_for_rate(rate: u32) -> Option<u8> {
+    SAMPLE_RATES
+        .iter()
+        .position(|&r| r == rate)
+        .map(|i| i as u8)
+}
+
 /// Register the AAC decoder into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
     registry.register(Codec {
@@ -50,7 +60,7 @@ pub fn register(registry: &mut CodecRegistry) {
         long_name: "AAC (Advanced Audio Coding, Low Complexity)",
         media_type: MediaType::Audio,
         decoder: Some(|| Box::new(AacDecoder::default())),
-        encoder: None,
+        encoder: Some(|| Box::new(encode::AacEncoder::new())),
     });
 }
 

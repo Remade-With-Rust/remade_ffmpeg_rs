@@ -827,6 +827,42 @@ fn build_dops(channels: u16, sample_rate: u32) -> Vec<u8> {
     bx(b"dOps", &b)
 }
 
+/// AAC sample-rate → 4-bit samplingFrequencyIndex (ISO 14496-3); 44.1 kHz default.
+fn aac_sf_index(rate: u32) -> u32 {
+    const RATES: [u32; 13] = [
+        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+    ];
+    RATES.iter().position(|&r| r == rate).unwrap_or(4) as u32
+}
+
+/// AudioSpecificConfig for AAC-LC: objectType=2 (5b) + samplingFrequencyIndex (4b)
+/// + channelConfiguration (4b) + GASpecificConfig (3b, all zero) = 16 bits.
+fn build_asc(sample_rate: u32, channels: u16) -> Vec<u8> {
+    let bits =
+        (2u32 << 11) | (aac_sf_index(sample_rate) << 7) | ((channels.clamp(1, 7) as u32) << 3);
+    vec![(bits >> 8) as u8, (bits & 0xff) as u8]
+}
+
+/// `esds` box: ES_Descriptor → DecoderConfigDescriptor → DecoderSpecificInfo
+/// (the AudioSpecificConfig). The AAC audio sample entry references this for config.
+fn build_esds(asc: &[u8]) -> Vec<u8> {
+    // DecoderSpecificInfo (0x05) = the ASC.
+    let mut dsi = vec![0x05u8, asc.len() as u8];
+    dsi.extend_from_slice(asc);
+    // DecoderConfigDescriptor (0x04): objectTypeIndication=0x40 (MPEG-4 Audio),
+    // streamType=audio(5)<<2|reserved(1)=0x15, bufferSizeDB(3), max+avg bitrate(4+4).
+    let mut dcd = vec![0x04u8, (13 + dsi.len()) as u8];
+    dcd.extend_from_slice(&[0x40, 0x15, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0]);
+    dcd.extend_from_slice(&dsi);
+    // ES_Descriptor (0x03): ES_ID(2)=0 + flags(1)=0 + DCD + SLConfigDescriptor(predef=2).
+    let mut es = vec![0x00u8, 0x00, 0x00];
+    es.extend_from_slice(&dcd);
+    es.extend_from_slice(&[0x06, 0x01, 0x02]);
+    let mut esd = vec![0x03u8, es.len() as u8];
+    esd.extend_from_slice(&es);
+    fbx(b"esds", 0, 0, &esd)
+}
+
 fn build_mvhd(timescale: u32, duration: u32, next_track_id: u32) -> Vec<u8> {
     let mut b = Vec::new();
     pu32(&mut b, 0); // creation
@@ -962,6 +998,15 @@ fn build_stbl(
         pu32(&mut entry, s.sample_rate << 16); // samplerate
         if s.codec_id == CodecId::Opus {
             entry.extend_from_slice(&build_dops(s.channels, s.sample_rate));
+        } else if s.codec_id == CodecId::Aac {
+            // esds carries the AudioSpecificConfig: use the stream's extradata (a
+            // remux) or synthesize it from rate/channels (a fresh encode).
+            let asc = if s.extradata.is_empty() {
+                build_asc(s.sample_rate, s.channels)
+            } else {
+                s.extradata.clone()
+            };
+            entry.extend_from_slice(&build_esds(&asc));
         }
     }
     let sample_entry = bx(&track.fourcc, &entry);
@@ -1053,6 +1098,22 @@ mod tests {
         let mut b = vec![0u8; 4]; // version+flags
         b.extend_from_slice(body);
         bx(typ, &b)
+    }
+
+    #[test]
+    fn esds_builds_and_parses_back() {
+        // Stereo 44.1 kHz AAC-LC ASC is the canonical 0x12 0x10.
+        let asc = build_asc(44_100, 2);
+        assert_eq!(asc, vec![0x12, 0x10]);
+        // build_esds → parse_esds must recover exactly that ASC (the descriptor
+        // tree the demuxer walks). Strip the 8-byte box header first.
+        let esds = build_esds(&asc);
+        assert_eq!(&esds[4..8], b"esds");
+        assert_eq!(parse_esds(&esds[8..]), Some(asc));
+        // Mono 48 kHz too.
+        let asc = build_asc(48_000, 1);
+        let esds = build_esds(&asc);
+        assert_eq!(parse_esds(&esds[8..]), Some(asc));
     }
 
     #[test]

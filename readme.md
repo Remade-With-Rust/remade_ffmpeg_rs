@@ -32,9 +32,22 @@
 | Memory-safety CVEs (core path) | many, historically | **0 — safe Rust** | structural |
 | Conformance | reference | **bit-exact** (VP9 315/315 vectors; MP3 vs FFmpeg) | maintain |
 | VP9 decode, 1 thread | 1.0× | **~0.16–0.21×** — younger, optimizing | → parity |
+| AAC encode (60 s stereo) | 1.0× | **~6× faster** — frame-parallel (ffmpeg's AAC is 1-thread); ~1.15× single-thread | maintain |
 | License + embedding | LGPL/GPL · C FFI | **Apache-2.0 · pure Rust · no FFI** | — |
 
 <sub>Real numbers + how to reproduce them: [docs/benchmarks.md](docs/benchmarks.md). The VP9 speed figure is decode throughput on an i7-14650HX vs FFmpeg's native decoder.</sub>
+
+> **⚡ Performance spotlight — AAC encode, faster than the C.** Our in-house, pure-Rust
+> AAC-LC encoder went from 0.79× realtime to **449× realtime** — a **~570× throughput gain**
+> — landing **~6× faster than FFmpeg's own AAC encoder** (best-of-7, 60 s stereo @128k, 24
+> cores), while its bitstream stays **byte-identical** and FFmpeg decodes it at unity. The
+> wins, in the order profiling demanded them: an O(N²) MDCT replaced by an FFT (**940×** on
+> that stage), a two-phase rate loop, cached psychoacoustic tables, an **N/4-point-FFT MDCT**,
+> **AVX2** (+ opt-in AVX-512) quantize kernels — that reached single-thread parity — and
+> finally **frame-parallel encoding**, the structural move FFmpeg's single-threaded AAC can't
+> answer. Every step was gated **bit-exact against a kept scalar oracle**; the pure-safe
+> `--no-default-features` build passes the same tests. Not a benchmark we can't reproduce —
+> just the right algorithm, then the right hardware.
 
 ---
 
@@ -97,7 +110,7 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 | Image codec | **gif** | **decode + encode** (pure-Rust `gif`; first frame) |
 | Image codec | **webp** (VP8/VP8L) | **decode + lossless encode** (pure-Rust `image-webp`) |
 | Image codec | **jpegxl** (JPEG XL) | **decode** (pure-Rust `jxl-oxide`; no Rust encoder yet) |
-| Audio codec | **aac** | in-house **AAC-LC decoder**, all features (short blocks, M/S, intensity stereo, PNS, TNS) — verified bit-exact vs FFmpeg |
+| Audio codec | **aac** | in-house **AAC-LC decoder + encoder** — decoder has all features (short blocks, M/S, intensity stereo, PNS, TNS), bit-exact vs FFmpeg; **encoder** (7 bricks) adds a psychoacoustic model (Bark-scale masking), bitrate rate-control, transient block switching, M/S stereo, and MP4 `esds` — **ffmpeg decodes our output at unity**; **~450× realtime** encode — **~6× faster than ffmpeg's own AAC** — via frame-parallel encoding (ffmpeg's AAC is single-threaded), an N/4-point-FFT MDCT, a two-phase rate loop, cached psychoacoustic tables, and AVX2 (+ opt-in AVX-512) quantize kernels. Single-thread it still edges ffmpeg (~1.15×) |
 | Audio codec | **mp3** (MPEG-1/2 Layer III) | in-house **decoder + encoder** (`rff-codec-mp3`) — decoder **bit-exact vs FFmpeg**; encoder MPEG-1/2/2.5, CBR + VBR, joint stereo, block switching |
 | Audio codec | **opus** | **decode + encode** (pure-Rust `opus-rs`) |
 | Audio codec | **vorbis** | **decode** (pure-Rust `lewton`; no permissive Rust encoder exists) |
@@ -107,7 +120,7 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 | Container | **png** / **jpeg** / **gif** / **webp** / **jpegxl** | **demux + mux** |
 | Container | **wav** (RIFF/WAVE) / **ogg** (Opus/Vorbis) / **flac** | **demux + mux** |
 | Container | **avi** (Audio Video Interleaved) | **demux + mux** (RIFF/`hdrl`/`movi`/`idx1`) |
-| Container | **mp4** / **mov** (ISOBMFF) | **demux + mux** — sample tables; **A/V**: AV1 (`av01`/`av1C`) or H.264 (`avc1`/`avcC`) video + Opus audio (`dOps`); AAC `esds`→config |
+| Container | **mp4** / **mov** (ISOBMFF) | **demux + mux** — sample tables; **A/V**: AV1 (`av01`/`av1C`) or H.264 (`avc1`/`avcC`) video + Opus audio (`dOps`); **AAC `esds` config (demux + mux)** so `rff -i in.wav out.m4a` writes a playable AAC MP4 |
 | Container | **matroska** / **webm** (EBML) | **demux** — track tree + Cluster/(Simple)Block packets; AV1/H.264 video + Opus/Vorbis/AAC/FLAC audio |
 
 > **H.264 defaults to `rusty_h264` with SIMD asm on** — substantially faster.
@@ -182,8 +195,12 @@ ffprobe input.avif
 # Transcode AVIF → AVIF end to end (decode AV1, re-encode AV1, rewrap):
 ffmpeg -i input.avif -c:v avif -y output.avif
 
-# Other codecs/containers (h264, opus, avi) are wired but their bodies are
-# still in progress, so those transcodes stop at the unimplemented stage.
+# Encode audio with an in-house, pure-Rust encoder — WAV → AAC in an MP4
+# (psychoacoustic model, transient block switching, M/S stereo, esds config):
+ffmpeg -i input.wav -c:a aac -b:a 128k -y output.m4a
+
+# …or FLAC (lossless, at ffmpeg parity), MP3, or Opus — same engine:
+ffmpeg -i input.wav -c:a flac -y output.flac
 ```
 
 Or talk to the engine over HTTP (API-first):
@@ -294,8 +311,8 @@ FLAC, Vorbis, PNG, JPEG, GIF, WebP, JPEG XL, MP3 (expired 2017), PCM — and
 carries no patent obligation for anyone.
 
 Two codecs are **patent-relevant**: **H.264/AVC** (via `rusty_h264`) and
-**AAC** (our in-house AAC-LC *decoder* only — the largely-expired, lowest-risk
-corner; no HE-AAC). We take the same posture as FFmpeg: these ship in the
+**AAC** (our in-house AAC-LC *decoder and encoder* — the largely-expired,
+lowest-risk corner; no HE-AAC). We take the same posture as FFmpeg: these ship in the
 default build, **no patent license is granted or implied**, and any patent
 royalties (e.g. to the Via LA pools) are the responsibility of the party that
 distributes or commercially deploys a product incorporating them — not of the

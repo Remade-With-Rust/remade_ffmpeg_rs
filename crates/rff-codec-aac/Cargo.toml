@@ -7,6 +7,16 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# `simd` (default) enables the runtime-detected AVX2 quantize kernel on x86_64 —
+# an isolated, bit-exact `unsafe` block with a scalar fallback. `--no-default-features`
+# gives a 100%-safe scalar build. `simd-avx512` adds an 8-lane AVX-512 tier on top
+# (opt-in: its intrinsics require Rust ≥1.89, above the workspace MSRV; runtime-detected,
+# falls back to AVX2 on non-AVX-512 hosts).
+default = ["simd"]
+simd = []
+simd-avx512 = ["simd"]
+
 [dependencies]
 rff-core.workspace = true
 rff-codec.workspace = true
