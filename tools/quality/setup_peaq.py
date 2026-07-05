@@ -32,6 +32,15 @@ def patch(d: str) -> None:
     src = src.replace(
         "X2MatT[...,:int(BWRef-1)]", "X2MatT[...,:max(int(BWRef-1),1)]"
     )
+    # numpy>=2: `int(BWRef-1)` raises when BWRef is a size-1 array (computeBW builds it
+    # via `[None]` broadcasting). Extract the scalar first. Matches the once-patched form
+    # above too, so re-running on an already-patched tree stays correct.
+    src = src.replace("max(int(BWRef-1),1)", "max(int(np.ravel(BWRef)[0])-1,1)")
+    # ...and the same size-1 arrays are returned into scalar slots (`self.BWRef[i] = ...`),
+    # which numpy>=2 rejects — squeeze them to scalars.
+    src = src.replace(
+        "return BWRef, BWTest", "return np.ravel(BWRef)[0], np.ravel(BWTest)[0]"
+    )
     open(f, "w", encoding="utf-8").write(src)
 
 
