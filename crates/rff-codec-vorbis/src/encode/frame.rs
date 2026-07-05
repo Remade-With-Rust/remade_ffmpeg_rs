@@ -16,6 +16,27 @@ fn ilog(v: u32) -> u32 {
     32 - v.leading_zeros()
 }
 
+/// Residue-class shortlist half-width: `2·W+1` classes trialed around the energy-predicted centre
+/// (plus class 0, always a candidate) instead of trialing all classifications. **Default 3** — a
+/// PEAQ-validated speed/quality operating point (2.3× faster classify; ΔODG ≤ 0.03 vs trialing all
+/// 10, i.e. perceptually neutral, on the CC0/PD music corpus at q 0.6–0.8). A large value (e.g.
+/// `VORBIS_CLASS_WINDOW=100`) restores the exhaustive RD baseline; smaller trades quality for speed.
+fn class_window() -> usize {
+    use std::sync::OnceLock;
+    static W: OnceLock<usize> = OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("VORBIS_CLASS_WINDOW").ok().and_then(|s| s.parse().ok()).unwrap_or(3)
+    })
+}
+
+/// Predict the residue class whose typical energy matches a partition of residual energy `energy`
+/// (linear scale). Fitted to the codebook-determined class energy ladder (medians ≈ 0.47·dB−2.3
+/// classes, monotone in energy); the shortlist window absorbs the residual + `lambda` dependence.
+fn predict_class(energy: f32, nclasses: usize) -> usize {
+    let db = 10.0 * (energy + 1e-20).log10();
+    (0.47 * db - 2.3).round().clamp(0.0, (nclasses - 1) as f32) as usize
+}
+
 /// Forward channel coupling: given the two per-channel residues `(m_out, a_out)` that
 /// the decoder must reconstruct, return the encoded `(m, a)`. Exact inverse of lewton's
 /// `inverse_couple` (verified in tests).
@@ -123,13 +144,25 @@ fn encode_residue2(
     // 1. Classify each partition by rate-distortion: min (distortion + λ·bits).
     #[cfg(test)]
     let _tc = std::time::Instant::now();
+    let nclasses_us = resid.classifications as usize;
+    let window = class_window();
     let mut classes = vec![0u8; partitions];
     let mut work = Vec::with_capacity(psize);
     for (p, cl) in classes.iter_mut().enumerate() {
         let seg = &v[begin + p * psize..begin + (p + 1) * psize];
+        // Class 0 has no books: its RD cost is exactly the partition residual energy (0 bits).
+        let energy: f32 = seg.iter().map(|x| x * x).sum();
         let mut best_c = 0usize;
-        let mut best_cost = f32::INFINITY;
-        for c in 0..resid.classifications as usize {
+        let mut best_cost = energy;
+        // Which non-zero classes to trial: all of them (byte-identical RD baseline), or a window
+        // around the energy-predicted class (the shortlist speed lever).
+        let (lo, hi) = if window >= nclasses_us {
+            (1, nclasses_us - 1)
+        } else {
+            let center = predict_class(energy, nclasses_us);
+            (center.saturating_sub(window).max(1), (center + window).min(nclasses_us - 1))
+        };
+        for c in lo..=hi {
             let (dist, bits) = cascade_cost(seg, resid, codebooks, c, lambda, &mut work)?;
             let cost = dist + lambda * bits as f32;
             if cost < best_cost {
@@ -138,6 +171,10 @@ fn encode_residue2(
             }
         }
         *cl = best_c as u8;
+        #[cfg(test)]
+        if classdump::ON.load(std::sync::atomic::Ordering::Relaxed) {
+            classdump::DATA.lock().unwrap().push((energy, best_c as u8));
+        }
     }
     #[cfg(test)]
     prof::CLASSIFY_NS.fetch_add(_tc.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -186,6 +223,16 @@ pub(crate) mod prof {
     pub static FLOOR_NS: AtomicU64 = AtomicU64::new(0);
     pub static CLASSIFY_NS: AtomicU64 = AtomicU64::new(0);
     pub static EMIT_NS: AtomicU64 = AtomicU64::new(0);
+}
+
+/// Test-only collector: `(partition residual energy, RD-chosen class)` pairs, for studying how
+/// well energy predicts the class (the premise of an energy-bucket class shortlist).
+#[cfg(test)]
+pub(crate) mod classdump {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+    pub static ON: AtomicBool = AtomicBool::new(false);
+    pub static DATA: Mutex<Vec<(f32, u8)>> = Mutex::new(Vec::new());
 }
 
 /// Encode one long block (mode 1, n=2048) for all channels into a Vorbis audio packet.
@@ -710,6 +757,135 @@ mod tests {
             let corr = best_correlation(&sig[0], &decoded, 2 * n);
             let kbps = (bytes as f32 / pkts as f32) * (rate as f32 / hop as f32) * 8.0 / 1000.0;
             eprintln!("REAL q={q:.1}  ~{kbps:.0} kb/s  corr={corr:.4}");
+        }
+    }
+
+    /// Opt-in: encode `$VORBIS_WAV_IN` (s16 stereo) at `$VORBIS_Q` and write lewton's decode to
+    /// `$VORBIS_WAV_OUT` (s16 stereo). A clean encoder-quality reference (the known-good decode
+    /// path) for PEAQ, independent of the Ogg muxer.
+    #[test]
+    #[ignore]
+    fn dump_lewton_decode() {
+        let (Ok(inp), Ok(outp)) = (std::env::var("VORBIS_WAV_IN"), std::env::var("VORBIS_WAV_OUT"))
+        else {
+            return;
+        };
+        let q: f32 = std::env::var("VORBIS_Q").ok().and_then(|s| s.parse().ok()).unwrap_or(0.9);
+        let (rate, channels, inter) = read_wav(&inp);
+        assert_eq!(channels, 2, "expects stereo");
+        let n = 2048usize;
+        let hop = n / 2;
+        let frames = inter.len() / channels;
+        let sig: Vec<Vec<f32>> =
+            (0..2).map(|c| (0..frames).map(|i| inter[i * channels + c]).collect()).collect();
+        let setup = parse_setup(SETUP_Q4_STEREO, 2).unwrap();
+        let ident = write_ident_header(2, rate, BS0_LOG2, BS1_LOG2, BITRATE_NOMINAL);
+        let l_ident = lewton::header::read_header_ident(&ident).unwrap();
+        let l_setup =
+            lewton::header::read_header_setup(SETUP_Q4_STEREO, 2, (BS0_LOG2, BS1_LOG2)).unwrap();
+        let mut pwr = lewton::audio::PreviousWindowRight::new();
+        let mut dec: Vec<Vec<f32>> = vec![Vec::new(), Vec::new()];
+        let mut pos = 0;
+        while pos + n <= frames {
+            let blocks: Vec<Vec<f32>> = (0..2).map(|c| sig[c][pos..pos + n].to_vec()).collect();
+            let packet = encode_long_packet(&setup, &blocks, rate, q).unwrap();
+            let pcm = lewton::audio::read_audio_packet(&l_ident, &l_setup, &packet, &mut pwr).unwrap();
+            if !pcm.is_empty() && !pcm[0].is_empty() {
+                for (c, ch) in pcm.iter().enumerate() {
+                    dec[c].extend(ch.iter().map(|&s| s as f32 / 32768.0));
+                }
+            }
+            pos += hop;
+        }
+        // Write interleaved s16 stereo wav.
+        let nsamp = dec[0].len().min(dec[1].len());
+        let mut body = Vec::with_capacity(nsamp * 4);
+        for i in 0..nsamp {
+            for c in 0..2 {
+                let v = (dec[c][i] * 32768.0).clamp(-32768.0, 32767.0) as i16;
+                body.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let mut w = Vec::new();
+        let data_len = body.len() as u32;
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + data_len).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        w.extend_from_slice(&2u16.to_le_bytes()); // channels
+        w.extend_from_slice(&rate.to_le_bytes());
+        w.extend_from_slice(&(rate * 4).to_le_bytes()); // byte rate
+        w.extend_from_slice(&4u16.to_le_bytes()); // block align
+        w.extend_from_slice(&16u16.to_le_bytes()); // bits
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&data_len.to_le_bytes());
+        w.extend_from_slice(&body);
+        std::fs::write(&outp, &w).unwrap();
+        eprintln!("wrote {nsamp} samples/ch to {outp}");
+    }
+
+    /// Opt-in: study how well partition energy predicts the RD-chosen residue class (the premise
+    /// of an energy-bucket class shortlist). Encodes `$VORBIS_WAV_IN` at `$VORBIS_Q`, then prints
+    /// per-class energy ranges + a per-dB-bucket class histogram.
+    #[test]
+    #[ignore]
+    fn dump_class_stats() {
+        let Ok(inp) = std::env::var("VORBIS_WAV_IN") else { return };
+        let q: f32 = std::env::var("VORBIS_Q").ok().and_then(|s| s.parse().ok()).unwrap_or(0.8);
+        let (rate, channels, inter) = read_wav(&inp);
+        assert_eq!(channels, 2);
+        let n = 2048usize;
+        let hop = n / 2;
+        let frames = inter.len() / channels;
+        let sig: Vec<Vec<f32>> =
+            (0..2).map(|c| (0..frames).map(|i| inter[i * channels + c]).collect()).collect();
+        let setup = parse_setup(SETUP_Q4_STEREO, 2).unwrap();
+        classdump::DATA.lock().unwrap().clear();
+        classdump::ON.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut pos = 0;
+        while pos + n <= frames {
+            let blocks: Vec<Vec<f32>> = (0..2).map(|c| sig[c][pos..pos + n].to_vec()).collect();
+            encode_long_packet(&setup, &blocks, rate, q).unwrap();
+            pos += hop;
+        }
+        classdump::ON.store(false, std::sync::atomic::Ordering::Relaxed);
+        let data = classdump::DATA.lock().unwrap();
+        let total = data.len();
+        eprintln!("=== {inp}  q={q}  {total} partitions ===");
+        // Per-class: count + energy percentiles (dB).
+        let db = |e: f32| 10.0 * (e + 1e-20).log10();
+        for c in 0u8..10 {
+            let mut es: Vec<f32> = data.iter().filter(|(_, cc)| *cc == c).map(|(e, _)| db(*e)).collect();
+            if es.is_empty() {
+                continue;
+            }
+            es.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pct = |p: f32| es[((es.len() - 1) as f32 * p) as usize];
+            eprintln!(
+                "class {c}: n={:5} ({:4.1}%)  dB[p5={:6.1} p50={:6.1} p95={:6.1}]",
+                es.len(), 100.0 * es.len() as f32 / total as f32, pct(0.05), pct(0.5), pct(0.95)
+            );
+        }
+        // Per-dB-bucket: which classes appear, and how concentrated.
+        eprintln!("--- per-2dB-bucket class histogram ---");
+        let mut buckets: std::collections::BTreeMap<i32, [u32; 10]> = std::collections::BTreeMap::new();
+        for (e, c) in data.iter() {
+            let b = (db(*e) / 2.0).floor() as i32 * 2;
+            buckets.entry(b).or_default()[*c as usize] += 1;
+        }
+        for (b, h) in &buckets {
+            let tot: u32 = h.iter().sum();
+            if tot < 10 {
+                continue;
+            }
+            // classes sorted by count desc, showing coverage of the top-3
+            let mut idx: Vec<usize> = (0..10).collect();
+            idx.sort_by_key(|&i| std::cmp::Reverse(h[i]));
+            let top3: u32 = idx[..3].iter().map(|&i| h[i]).sum();
+            let shown: Vec<String> = idx.iter().filter(|&&i| h[i] > 0)
+                .map(|&i| format!("{i}:{:.0}%", 100.0 * h[i] as f32 / tot as f32)).collect();
+            eprintln!("dB {b:4}: n={tot:5}  top3cover={:4.1}%  [{}]", 100.0 * top3 as f32 / tot as f32, shown.join(" "));
         }
     }
 

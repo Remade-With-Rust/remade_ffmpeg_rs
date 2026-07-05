@@ -308,7 +308,7 @@ floor 0 / residue 0, plus the LongStart/LongStop window-flag transitions matchin
 overlap-add — the AAC-style block-switch, adapted to Vorbis's per-packet window flags). The
 generalized `encode_packet(mode)` + a transient detector + the transition windows are the work.
 
-### Performance pass (profile-first) — DONE ☑ (64× slower → 3.6× faster than libvorbis, quality-neutral)
+### Performance pass (profile-first) — DONE ☑ (64× slower → 5.3× faster than libvorbis, PEAQ-neutral)
 
 Side-by-side vs ffmpeg's libvorbis on 6 s of real music revealed we were **64× slower**
 (0.8× realtime). Profiled the encode phases (`encode/frame.rs` test-only `prof` counters):
@@ -367,11 +367,28 @@ Side-by-side vs ffmpeg's libvorbis on 6 s of real music revealed we were **64× 
 - **Net journey:** **64× slower → 3.6× FASTER** (60 s stereo, 24 cores; ~331× realtime), every step
   quality-neutral (byte-identical output, ffmpeg-decodable), every step decoder-validated.
   Single-thread the gap to libvorbis closed **4.7× → 2.3× behind** (2755 → 1415 ms).
-- **Remaining single-thread lever (now a QUALITY tradeoff, not a SIMD one):** classify is still
-  ~73% per-core because the RD classifier trials all 10 classes per partition — libvorbis uses a
-  cheaper heuristic classification. Closing the last of the single-thread gap means a cheaper
-  (energy-bucketed) class shortlist, which changes the encoding decision → gate on PEAQ/correlation,
-  not the byte-exact oracle. Out of scope for the byte-identical speed pass.
+- **Energy-bucket class shortlist (the PEAQ-gated lever) — DONE ☑.** Classify was still ~73%
+  per-core because the RD classifier trialed all 10 residue classes per partition. The residue
+  classes form an energy ladder (verified: chosen-class medians climb monotonically with partition
+  energy, ≈ `0.47·dB − 2.3` classes), so instead of trialing all ten we predict a centre class from
+  the partition's residual energy and trial a **±3 window** around it (plus class 0, always a
+  candidate). This changes the encoding decision, so it is **not** byte-identical — it is gated
+  **perceptually** against the exhaustive search: **ΔODG ≤ 0.03** (PEAQ, CC0/PD piano+guitar at
+  q 0.6–0.8), i.e. perceptually neutral, with bitrate within ~0.7%. Window default 3 (env
+  `VORBIS_CLASS_WINDOW` overrides for A/B; a large value restores the exhaustive RD baseline).
+  **Classify 2.3× faster** → on stereo music: **single-thread 2.2× → 1.4× behind libvorbis**
+  (1.53×), **parallel 3.7× → 5.3× faster** (~457× realtime). ★ The bench must be **real music**:
+  a dense synthetic signal (uniform high energy) overstates the win to single-thread *parity*;
+  real music has many cheap low-energy partitions, so the honest figure is ~1.4× behind.
+- **PEAQ perceptual gate (unblocked + first benchmark).** The `tools/quality` PEAQ oracle was
+  broken under numpy≥2 (`computeBW` returned size-1 arrays / called `int()` on them); fixed in
+  `setup_peaq.py` (validated against the bundled MATLAB reference, ODG −3.875). Our decoder isn't
+  end-trimmed (leading priming samples, so the decode *leads* the reference) — the stock coarse
+  aligner reads garbage, so `tools/quality/peaq_align.py` does a **signed** sample-accurate
+  alignment. First real perceptual numbers (the long-open "corr ≠ perceptual, never benchmarked"
+  question): at ~155 kb/s our encoder is **ODG ≈ −0.24** (lewton decode) / −0.36 (ffmpeg) vs
+  libvorbis −0.06 — genuinely decent, libvorbis still ahead. (Also confirmed the encoder core is
+  sound end-to-end: ffmpeg and lewton decode our packets identically, corr 0.996.)
 
 ### Also still open (quality validation)
 - Real NMR/PEAQ perceptual bench vs libvorbis at matched `-q` (correlation ≠ perceptual parity).
