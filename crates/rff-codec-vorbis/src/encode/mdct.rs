@@ -33,6 +33,43 @@ pub fn vorbis_window(blocksize: usize) -> Vec<f32> {
     w
 }
 
+/// The short blocksize used for the long-block transition ramps (Vorbis mode-0 / `blocksize_0`).
+pub const BS0: usize = 256;
+
+/// Block-switching Vorbis window of size `n`, matched to lewton's decode windowing. A long block
+/// (`n = 2048`) adjacent to a short one gets a *narrow* (`BS0/2`) transition ramp on that side
+/// instead of the full `n/2` ramp; short blocks (`n = 256`) are always symmetric. `prev_long` /
+/// `next_long` are the neighbour block sizes. The ramp regions are lewton's `left/right_win_*`:
+/// full side → `[0, n/2)` / `[n/2, n)`; transition side → `[(n∓BS0)/4, (n±BS0)/4)` centred on
+/// `n/4` / `3n/4`. The analysis window here is the same as the synthesis window (Princen–Bradley).
+pub fn vorbis_window_bs(n: usize, prev_long: bool, next_long: bool) -> Vec<f32> {
+    let (lws, lwe) = if prev_long { (0, n / 2) } else { ((n - BS0) / 4, (n + BS0) / 4) };
+    let (rws, rwe) = if next_long { (n / 2, n) } else { ((3 * n - BS0) / 4, (3 * n + BS0) / 4) };
+    let lslope = window_slope(lwe - lws);
+    let rslope = window_slope(rwe - rws);
+    let mut w = vec![0.0f32; n];
+    for (i, s) in (lws..lwe).zip(&lslope) {
+        w[i] = *s;
+    }
+    for wi in w[lwe..rws].iter_mut() {
+        *wi = 1.0;
+    }
+    for i in rws..rwe {
+        w[i] = rslope[rwe - 1 - i];
+    }
+    w
+}
+
+/// Lewton's per-block window regions `(left_win_start, right_win_start)` for size `n`. The decoder
+/// emits `right_win_start − left_win_start` PCM samples per block, so these drive the encoder's
+/// output cursor + read position (block reads `n` samples starting `left_win_start` before its
+/// first output sample).
+pub fn window_bounds(n: usize, prev_long: bool, next_long: bool) -> (usize, usize) {
+    let lws = if prev_long { 0 } else { (n - BS0) / 4 };
+    let rws = if next_long { n / 2 } else { (3 * n - BS0) / 4 };
+    (lws, rws)
+}
+
 /// In-place radix-2 Cooley–Tukey FFT (forward, `exp(-i2πkn/N)`); `re.len()` must be a power of
 /// two and equal `im.len()`. Pure in-house `f64` — the fast MDCT's engine. Uses precomputed
 /// per-stage twiddles (`tw_c`/`tw_s`, flattened over stages) so a transform is pure multiply-add.
@@ -249,6 +286,69 @@ mod tests {
                 assert!((a - b).abs() <= 1e-3 * (1.0 + b.abs()), "bs={bs}: {a} vs {b}");
             }
         }
+    }
+
+    /// Block switching TDAC: a mixed long→short-run→long sequence, analysis-windowed + MDCT'd per
+    /// block, then IMDCT + synthesis-windowed + overlap-added at lewton's positions, must
+    /// reconstruct the input in the steady region. Validates `vorbis_window_bs` + `window_bounds`.
+    #[test]
+    fn block_switch_windows_reconstruct() {
+        // (n, prev_long, next_long) — 3 long, a long→short transition, 8 shorts, short→long, 2 long.
+        let mut seq: Vec<(usize, bool, bool)> = vec![
+            (2048, true, true),
+            (2048, true, true),
+            (2048, true, true),
+            (2048, true, false), // last long before the short run (next is short)
+        ];
+        for _ in 0..8 {
+            seq.push((256, true, true)); // shorts are always symmetric
+        }
+        seq.push((2048, false, true)); // resuming long (prev is short)
+        seq.push((2048, true, true));
+        seq.push((2048, true, true));
+
+        let total = 16384usize;
+        let signal: Vec<f32> = (0..total)
+            .map(|i| {
+                let t = i as f32;
+                let base = 0.5 * (0.02 * t).sin() + 0.3 * (0.09 * t + 0.7).sin();
+                // a transient burst mid-stream (where the short run sits)
+                let tr = if (7000..7200).contains(&i) { 0.8 * (0.9 * t).sin() } else { 0.0 };
+                base + tr
+            })
+            .collect();
+
+        let mut out = vec![0.0f32; total + 4096];
+        let mut cursor: i64 = 0;
+        for &(n, pl, nl) in &seq {
+            let (lws, rws) = window_bounds(n, pl, nl);
+            let pos = cursor - lws as i64;
+            let mut block = vec![0.0f32; n];
+            for (i, b) in block.iter_mut().enumerate() {
+                let s = pos + i as i64;
+                if s >= 0 && (s as usize) < total {
+                    *b = signal[s as usize];
+                }
+            }
+            let w = vorbis_window_bs(n, pl, nl);
+            apply_window(&mut block, &w);
+            let coeffs = mdct_forward(&block);
+            let mut y = imdct_lewton(&coeffs);
+            apply_window(&mut y, &w);
+            for (i, &yi) in y.iter().enumerate() {
+                let s = pos + i as i64;
+                if s >= 0 && (s as usize) < out.len() {
+                    out[s as usize] += yi;
+                }
+            }
+            cursor += (rws - lws) as i64;
+        }
+        // Steady region (fully overlapped, spans the transition) must match the input.
+        let mut max_err = 0.0f32;
+        for i in 4000..cursor as usize - 2048 {
+            max_err = max_err.max((out[i] - signal[i]).abs());
+        }
+        assert!(max_err < 1e-2, "block-switch reconstruction error {max_err}");
     }
 
     /// Princen–Bradley: `w[i]² + w[i+n/2]² == 1`.

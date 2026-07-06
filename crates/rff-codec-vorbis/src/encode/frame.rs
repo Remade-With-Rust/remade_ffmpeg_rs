@@ -7,9 +7,14 @@
 
 use rff_core::{Error, Result};
 
-use super::mdct::{apply_window, mdct_forward, vorbis_window};
+use super::mdct::{apply_window, mdct_forward, vorbis_window_bs, window_bounds};
 use super::setup::{Codebook, Floor, Mapping, Residue, SetupTables};
 use super::{floor, psy, BitWriter};
+
+/// Long-block size (mode 1) and its output hop (n/2), and the short-block size (mode 0).
+const LONG: usize = 2048;
+const HOP: usize = LONG / 2; // 1024 — one "long period" of PCM output
+const SHORT: usize = 256;
 
 /// vorbis `ilog`.
 fn ilog(v: u32) -> u32 {
@@ -249,11 +254,27 @@ pub fn encode_long_packet(
         .iter()
         .position(|m| m.blockflag)
         .ok_or_else(|| Error::invalid("vorbis encode: no long-block mode"))?;
+    encode_block(setup, ch_blocks, mode_idx, true, true, sample_rate, quality)
+}
+
+/// Encode one block of any size/mode for all channels into a Vorbis audio packet. `mode_idx`
+/// selects long (blockflag) or short; `prev_long`/`next_long` are the neighbour sizes, driving the
+/// long block's transition window + its emitted window flags (short blocks are always symmetric and
+/// emit no flags). `ch_blocks[c]` is the raw block of `1<<blocksize` samples for channel `c`.
+pub fn encode_block(
+    setup: &SetupTables,
+    ch_blocks: &[Vec<f32>],
+    mode_idx: usize,
+    prev_long: bool,
+    next_long: bool,
+    sample_rate: u32,
+    quality: f32,
+) -> Result<Vec<u8>> {
     let mode = &setup.modes[mode_idx];
     let mapping: &Mapping = &setup.mappings[mode.mapping as usize];
     let n = ch_blocks[0].len();
     let m = n / 2;
-    let window = vorbis_window(n);
+    let window = vorbis_window_bs(n, prev_long, next_long);
     let channels = ch_blocks.len();
 
     // Window + forward MDCT per channel.
@@ -274,8 +295,8 @@ pub fn encode_long_packet(
     let mode_bits = ilog(setup.modes.len() as u32 - 1);
     bw.write(mode_idx as u32, mode_bits);
     if mode.blockflag {
-        bw.write(1, 1); // previous window flag (all-long)
-        bw.write(1, 1); // next window flag
+        bw.write(prev_long as u32, 1); // previous window flag (1 = prev is long)
+        bw.write(next_long as u32, 1); // next window flag (1 = next is long)
     }
 
     // Per-channel floor-1: fit the floor to the masking threshold, emit its bits, then
@@ -337,6 +358,121 @@ pub fn encode_long_packet(
     encode_residue2(&mut bw, resid, &setup.codebooks, &residue, m, lambda)?;
 
     Ok(bw.into_bytes())
+}
+
+/// Transient-detection attack ratio: a 128-sample sub-block whose energy jumps by more than this
+/// factor over the previous one marks the long period for a short-block run. `VORBIS_TRANSIENT`
+/// overrides it; a huge value disables block switching (all long blocks).
+fn transient_ratio() -> f32 {
+    use std::sync::OnceLock;
+    static R: OnceLock<f32> = OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("VORBIS_TRANSIENT").ok().and_then(|s| s.parse().ok()).unwrap_or(6.0)
+    })
+}
+
+/// Flag each `HOP`-sample long period that contains a transient attack (a sudden energy rise in a
+/// 128-sample sub-block vs the preceding one, summed over channels) — those periods are coded with
+/// short blocks to time-localize the attack and avoid pre-echo.
+fn detect_transients(channels: &[Vec<f32>], total: usize) -> Vec<bool> {
+    let ratio = transient_ratio();
+    let nsub = total.div_ceil(SHORT / 2); // 128-sample sub-blocks
+    let mut sub_e = vec![0.0f32; nsub + 1];
+    for ch in channels {
+        for (s, &x) in ch.iter().enumerate() {
+            sub_e[s / (SHORT / 2)] += x * x;
+        }
+    }
+    let peak = sub_e.iter().fold(0.0f32, |a, &e| a.max(e));
+    let floor = peak * 1e-3; // ignore attacks in near-silence
+    let n_periods = total.div_ceil(HOP);
+    let mut out = vec![false; n_periods];
+    for (p, o) in out.iter_mut().enumerate() {
+        let base = p * (HOP / (SHORT / 2)); // 8 sub-blocks per period
+        for k in 0..(HOP / (SHORT / 2)) {
+            let i = base + k;
+            if i == 0 || i >= nsub {
+                continue;
+            }
+            if sub_e[i] > ratio * (sub_e[i - 1] + 1e-9) && sub_e[i] > floor {
+                *o = true;
+            }
+        }
+    }
+    out
+}
+
+/// Encode a whole multi-channel signal into Vorbis audio packets **with block switching**: long
+/// blocks by default, a short-block run bracketed by long start/stop transition blocks over each
+/// transient period. Returns one packet per block. Positions follow lewton's window geometry
+/// ([`window_bounds`]) via an output cursor, so the packets overlap-add to the original PCM.
+pub fn encode_stream_bs(
+    setup: &SetupTables,
+    channels: &[Vec<f32>],
+    sample_rate: u32,
+    quality: f32,
+) -> Result<Vec<Vec<u8>>> {
+    let total = channels[0].len();
+    let long_mode = setup
+        .modes
+        .iter()
+        .position(|m| m.blockflag)
+        .ok_or_else(|| Error::invalid("vorbis encode: no long-block mode"))?;
+    let short_mode = setup
+        .modes
+        .iter()
+        .position(|m| !m.blockflag)
+        .ok_or_else(|| Error::invalid("vorbis encode: no short-block mode"))?;
+    let trans = detect_transients(channels, total);
+    let n_periods = total.div_ceil(HOP);
+
+    // Build the block-size sequence (true = long). A transient period becomes a short-block run
+    // bracketed by a long start (→short) and long stop (short→): [L, S×8, L], spanning 3 periods.
+    let mut sizes: Vec<bool> = Vec::new();
+    let mut p = 0;
+    while p < n_periods {
+        // Trigger one period early so the short run covers the attack, not the long-start's tail.
+        let transient_soon = trans.get(p + 1).copied().unwrap_or(false) || trans.get(p).copied().unwrap_or(false);
+        if transient_soon && p + 3 <= n_periods {
+            sizes.push(true); // long start
+            sizes.resize(sizes.len() + 8, false); // short run (8 shorts = one long period)
+            sizes.push(true); // long stop
+            p += 3;
+        } else {
+            sizes.push(true);
+            p += 1;
+        }
+    }
+
+    // Encode each block at its cursor-driven position.
+    let mut packets = Vec::with_capacity(sizes.len());
+    let mut cursor: i64 = 0;
+    for i in 0..sizes.len() {
+        let is_long = sizes[i];
+        let prev_long = if i == 0 { true } else { sizes[i - 1] };
+        let next_long = if i + 1 == sizes.len() { true } else { sizes[i + 1] };
+        let (n, mode_idx) = if is_long { (LONG, long_mode) } else { (SHORT, short_mode) };
+        let (lws, rws) = window_bounds(n, prev_long, next_long);
+        let pos = cursor - lws as i64;
+        let ch_blocks: Vec<Vec<f32>> = channels
+            .iter()
+            .map(|ch| {
+                (0..n)
+                    .map(|k| {
+                        let s = pos + k as i64;
+                        if s >= 0 && (s as usize) < total {
+                            ch[s as usize]
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        packets.push(encode_block(setup, &ch_blocks, mode_idx, prev_long, next_long, sample_rate, quality)?);
+        cursor += (rws - lws) as i64;
+    }
+    Ok(packets)
 }
 
 #[cfg(test)]
@@ -601,6 +737,54 @@ mod tests {
         assert!(best > 0.8, "decoded audio does not resemble the input (corr={best:.4})");
     }
 
+    /// Block switching: a signal with a transient must encode via `encode_stream_bs` (which fires
+    /// a short-block run over the transient), decode in lewton, and reconstruct — proving the mixed
+    /// long/short/transition packet stream is valid Vorbis that overlap-adds correctly.
+    #[test]
+    fn block_switch_decodes_in_lewton() {
+        let setup = parse_setup(SETUP_Q4_STEREO, 2).unwrap();
+        let ident = write_ident_header(2, 44_100, BS0_LOG2, BS1_LOG2, BITRATE_NOMINAL);
+        let l_ident = lewton::header::read_header_ident(&ident).unwrap();
+        let l_setup =
+            lewton::header::read_header_setup(SETUP_Q4_STEREO, 2, (BS0_LOG2, BS1_LOG2)).unwrap();
+
+        let total = 2048 * 10;
+        // Tones + two transient bursts (castanet-like attacks) that should trigger short blocks.
+        let signal: Vec<Vec<f32>> = (0..2)
+            .map(|ch| {
+                (0..total)
+                    .map(|i| {
+                        let t = i as f32;
+                        let base = 0.4 * (0.02 * t).sin() + 0.2 * (0.07 * t + 0.5).sin();
+                        let attack = (7000..7160).contains(&i) || (12000..12160).contains(&i);
+                        base + if attack { 0.8 * (0.8 * t + ch as f32).sin() } else { 0.0 }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let packets = encode_stream_bs(&setup, &signal, 44_100, 0.7).unwrap();
+        // Confirm a mix of block sizes was actually emitted (not all long).
+        let shorts = packets.iter().filter(|p| p.len() < 80).count();
+        eprintln!("BS: {} packets, ~{} short", packets.len(), shorts);
+
+        let mut pwr = lewton::audio::PreviousWindowRight::new();
+        let mut decoded: Vec<Vec<f32>> = vec![Vec::new(), Vec::new()];
+        for pkt in &packets {
+            let pcm = lewton::audio::read_audio_packet(&l_ident, &l_setup, pkt, &mut pwr)
+                .expect("lewton decodes our block-switched packet");
+            if !pcm.is_empty() && !pcm[0].is_empty() {
+                for (c, ch) in pcm.iter().enumerate() {
+                    decoded[c].extend(ch.iter().map(|&s| s as f32 / 32768.0));
+                }
+            }
+        }
+        assert!(!decoded[0].is_empty(), "no audio decoded");
+        let best = best_correlation(&signal[0], &decoded[0], 2 * 2048);
+        eprintln!("BS corr = {best:.4}");
+        assert!(best > 0.9, "block-switched decode does not reconstruct (corr={best:.4})");
+    }
+
     /// Brick 3: on a multi-tone signal the fitted floor should reconstruct with high
     /// correlation (a flat floor smears multi-formant spectra).
     #[test]
@@ -783,21 +967,30 @@ mod tests {
         let l_ident = lewton::header::read_header_ident(&ident).unwrap();
         let l_setup =
             lewton::header::read_header_setup(SETUP_Q4_STEREO, 2, (BS0_LOG2, BS1_LOG2)).unwrap();
+        // Encode: block-switching path when VORBIS_BS is set, else the long-only path.
+        let packets: Vec<Vec<u8>> = if std::env::var("VORBIS_BS").is_ok() {
+            encode_stream_bs(&setup, &sig, rate, q).unwrap()
+        } else {
+            let mut pkts = Vec::new();
+            let mut pos = 0;
+            while pos + n <= frames {
+                let blocks: Vec<Vec<f32>> = (0..2).map(|c| sig[c][pos..pos + n].to_vec()).collect();
+                pkts.push(encode_long_packet(&setup, &blocks, rate, q).unwrap());
+                pos += hop;
+            }
+            pkts
+        };
         let mut pwr = lewton::audio::PreviousWindowRight::new();
         let mut dec: Vec<Vec<f32>> = vec![Vec::new(), Vec::new()];
-        let mut pos = 0;
         let mut bytes = 0usize;
-        while pos + n <= frames {
-            let blocks: Vec<Vec<f32>> = (0..2).map(|c| sig[c][pos..pos + n].to_vec()).collect();
-            let packet = encode_long_packet(&setup, &blocks, rate, q).unwrap();
+        for packet in &packets {
             bytes += packet.len();
-            let pcm = lewton::audio::read_audio_packet(&l_ident, &l_setup, &packet, &mut pwr).unwrap();
+            let pcm = lewton::audio::read_audio_packet(&l_ident, &l_setup, packet, &mut pwr).unwrap();
             if !pcm.is_empty() && !pcm[0].is_empty() {
                 for (c, ch) in pcm.iter().enumerate() {
                     dec[c].extend(ch.iter().map(|&s| s as f32 / 32768.0));
                 }
             }
-            pos += hop;
         }
         let kbps = bytes as f64 * 8.0 * rate as f64 / (frames as f64 * 1000.0);
         eprintln!("KBPS {kbps:.1}");
