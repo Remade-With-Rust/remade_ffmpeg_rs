@@ -80,6 +80,50 @@ pure-Rust implementation. There is no free build-flag or compute-SIMD lever left
 the only real levers are algorithmic memory-traffic reduction (hard) — or
 accepting the gap, since *bit-exact + memory-safe* is the honest story.
 
+## Vorbis encode
+
+72 s of concatenated CC0/PD music (piano + guitar), best-of-7 (parallel) / best-of-5
+(single), 24-core box. Realtime = clip duration ÷ encode time. libvorbis is
+single-threaded per stream by design.
+
+| Encoder · setting | bitrate | parallel (24-core) | single-thread |
+|---|---:|---:|---:|
+| **rff** −q:a 4 | 50 kb/s | **650× RT** | 98× RT |
+| **rff** −q:a 6 | 85 kb/s | 537× RT | 74× RT |
+| **rff** −q:a 8 | 139 kb/s | 443× RT | 60× RT |
+| ffmpeg libvorbis −q:a 5 *(ref)* | 147 kb/s | 86× RT | 87× RT |
+| ffmpeg libvorbis −q:a 7 *(ref)* | 204 kb/s | 84× RT | — |
+
+At a matched ~140 kb/s: **parallel 443× vs 86× → ~5.2× faster**; **single-thread 60×
+vs 87× → ~1.45× slower**. The frame-parallel encode is the lever libvorbis can't
+answer; the single-thread deficit is our rate-distortion residue classifier doing more
+work than libvorbis's cheaper heuristic (closed from 4.7× to ~1.4× via an energy-bucket
+class shortlist).
+
+### Quality (PEAQ ODG)
+
+Encode → **ffmpeg** decode → PEAQ (numpy_PEAQ, validated to the MATLAB reference
+ODG −3.875) with signed sample-accurate alignment. ODG scale [−4, 0]; **higher is
+better**, 0 = transparent. At matched bitrate **libvorbis leads** — its psychoacoustic
+model allocates bits better.
+
+| clip | rate | rff ODG | libvorbis ODG |
+|---|---:|---:|---:|
+| piano (tonal) | ~85 kb/s | −2.25 | **−1.53** |
+| piano (tonal) | ~120 kb/s | −0.87 | **−0.25** |
+| guitar (transient) | ~135 kb/s | −1.4 (interp.) | **−0.91** |
+
+- **libvorbis is ~0.6–0.7 ODG ahead on tonal content** at every matched bitrate.
+- **Guitar shows a pre-echo dip:** rff's ODG *sags* near 50–70 kb/s (−3.8) even as
+  waveform correlation *rises* (0.80 → 0.97). That's the long-block window smearing
+  each attack backwards in time — audible pre-echo PEAQ penalises. **Block switching**
+  (short blocks over transients) is implemented and TDAC-proven; enabling it (`VORBIS_BS`)
+  lifts guitar +0.14 ODG. Env-gated pending a tuned detector + streaming integration.
+
+Reproduce: `tools/quality/` (`fetch_corpus.sh`, `peaq_align.py`, `setup_peaq.py`).
+Honest summary: **decisively faster (5–6× parallel), competitive single-thread (~1.4×
+slower), behind on perceptual quality** (libvorbis's two decades of tuning lead).
+
 ## Caveats
 
 - One machine, one synthetic clip, single-thread, wall-clock medians.
@@ -94,5 +138,5 @@ accepting the gap, since *bit-exact + memory-safe* is the honest story.
 
 ## Not yet benchmarked
 
-MP3 / AAC / AVIF decode, and the encode paths — same methodology, added as they
-are tuned.
+MP3 / AAC / AVIF decode, and the remaining encode paths — same methodology, added as
+they are tuned. (VP9 decode + Vorbis encode measured above.)
