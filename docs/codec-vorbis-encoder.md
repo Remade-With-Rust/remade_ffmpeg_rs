@@ -302,11 +302,39 @@ Ogg Vorbis file that ffmpeg + our own stack decode.**
   (`rff -i our.ogg out.wav`). Regression tests: `streaming_encode_decodes_in_lewton`,
   `ogg_mux_then_demux_roundtrips_vorbis`. 25 crate + 4 ogg tests pass, clippy clean.
 
-**✱ Deferred — block switching (short blocks for transients).** Long-blocks-only produces valid,
-good-quality Vorbis; transient handling is a bounded quality enhancement (mode-0 short blocks use
-floor 0 / residue 0, plus the LongStart/LongStop window-flag transitions matching lewton's
-overlap-add — the AAC-style block-switch, adapted to Vorbis's per-packet window flags). The
-generalized `encode_packet(mode)` + a transient detector + the transition windows are the work.
+### Quality pass (PEAQ-gated) — three levers
+
+Unblocked the perceptual gate first: `tools/quality`'s PEAQ oracle was broken under numpy≥2 (fixed
+in `setup_peaq.py`, re-validated vs the MATLAB reference ODG −3.875), and our un-trimmed decode
+*leads* the reference (priming), so added `peaq_align.py` (signed sample-accurate alignment). First
+perceptual numbers: our encoder ≈ **ODG −0.24** (lewton) / −0.36 (ffmpeg) vs libvorbis −0.06 at
+155 kb/s. All three levers A/B'd via cached env knobs on the piano+guitar CC0/PD corpus.
+
+- **Psychoacoustics — a crude ATH wins (SHIPPED).** The masking knobs (`VORBIS_SMR_*`, spread
+  slopes, ceiling) swept out near the R-D frontier — no free allocation win. But the flat
+  `peak·1e-4` noise floor coded inaudible quiet HF; a **quality-coupled ATH tilt** (raise the floor
+  ∝ (f/nyq)², ramped off by q≈0.78 where the HF becomes audible) is **+0.085 ODG at q0.6, +0.017 at
+  q0.7, neutral at q0.8+** and slightly cheaper. Default `VORBIS_ATH_TILT=60`.
+- **Point-stereo — current gate validated, left as-is.** Extensive per-channel A/B (point stereo
+  changes the *angle*/right channel, so `peaq_align.py` grew a channel selector): the current gate
+  (active < q0.55, 5.5 kHz cutoff) is well-placed — it wins on wide/tonal content (piano +0.04 at
+  q0.5, both channels) and is neutral on the rest. Raising it helps piano through q0.7 (+0.06) but
+  *hurts* guitar (−0.10) — a masking-dependent tradeoff (guitar's HF is less masked → more audible),
+  so a fixed gate can't win both. The real improvement is a per-frame perceptual PS decision (deferred).
+
+**✱ Block switching (short blocks for transients) — IMPLEMENTED, env-gated (`VORBIS_BS`).** No
+longer fully deferred. Feasible because both q4 modes are floor-type-1 / residue-type-2 (mode 0's
+floor *index* 0 is TYPE 1, not the LSP floor 0), so no new floor/residue code. Built:
+`vorbis_window_bs`/`window_bounds` (variable transition windows matched to lewton's geometry; the
+decoder emits `right_win_start − left_win_start` PCM/block so the encoder is output-cursor-driven —
+proven by a mixed-sequence TDAC round-trip test), `encode_block` (generalizes `encode_long_packet`
+to any mode/size + window flags), `detect_transients` + `encode_stream_bs` (a `[long-start, short×8,
+long-stop]` run per transient period, `VORBIS_TRANSIENT` ratio). Validated: a mixed stream decodes in
+lewton at corr 0.992. PEAQ: a real pre-echo fix on transient content (guitar **+0.139 ODG at q0.7**
+aggressive / +0.024 conservative) at a bitrate cost (+2..11 kb); tonal content neutral. **Not
+default-on** pending a refined detector, a transient-rich corpus, and integration into the
+frame-parallel streaming path (its inter-block window-flag deps break per-block independence — the
+default encoder is still long-only, unchanged).
 
 ### Performance pass (profile-first) — DONE ☑ (64× slower → 5.3× faster than libvorbis, PEAQ-neutral)
 
