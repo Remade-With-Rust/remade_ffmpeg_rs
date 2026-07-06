@@ -786,9 +786,11 @@ mod tests {
         let mut pwr = lewton::audio::PreviousWindowRight::new();
         let mut dec: Vec<Vec<f32>> = vec![Vec::new(), Vec::new()];
         let mut pos = 0;
+        let mut bytes = 0usize;
         while pos + n <= frames {
             let blocks: Vec<Vec<f32>> = (0..2).map(|c| sig[c][pos..pos + n].to_vec()).collect();
             let packet = encode_long_packet(&setup, &blocks, rate, q).unwrap();
+            bytes += packet.len();
             let pcm = lewton::audio::read_audio_packet(&l_ident, &l_setup, &packet, &mut pwr).unwrap();
             if !pcm.is_empty() && !pcm[0].is_empty() {
                 for (c, ch) in pcm.iter().enumerate() {
@@ -797,6 +799,8 @@ mod tests {
             }
             pos += hop;
         }
+        let kbps = bytes as f64 * 8.0 * rate as f64 / (frames as f64 * 1000.0);
+        eprintln!("KBPS {kbps:.1}");
         // Write interleaved s16 stereo wav.
         let nsamp = dec[0].len().min(dec[1].len());
         let mut body = Vec::with_capacity(nsamp * 4);

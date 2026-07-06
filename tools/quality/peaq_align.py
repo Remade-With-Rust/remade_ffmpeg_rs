@@ -16,10 +16,13 @@ sys.path.insert(0, PEAQDIR)
 import numpy_PEAQ
 
 
+CH = int(sys.argv[4]) if len(sys.argv) > 4 else 0  # channel to score (0=L, 1=R)
+
+
 def load(p):
     sr, d = wavfile.read(p)
     if d.ndim > 1:
-        d = d[:, 0]
+        d = d[:, min(CH, d.shape[1] - 1)]
     d = d.astype(np.float64)
     if np.max(np.abs(d)) <= 1.5:  # float wav in [-1, 1]
         d *= 32768.0
