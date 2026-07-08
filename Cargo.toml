@@ -125,8 +125,13 @@ jpeg-encoder = "0.7"
 # gif: pure-Rust GIF de/encoder (MIT/Apache); image-webp: pure-Rust WebP (MIT/Apache).
 gif = "0.14"
 image-webp = "0.2"
-# opus-rs: pure-Rust Opus codec (BSD-3-Clause), port of libopus 1.6 — no FFI.
-opus-rs = "0.1"
+# Opus comes from our own rusty-opus (BSD-3-Clause fork of opus-rs, the pure-Rust
+# port of libopus 1.6 — no FFI). Same aliasing pattern as the AV1 toolkit: the fork
+# keeps its upstream package name (`opus-rs`) so upstream syncs stay clean, and we
+# alias it to `rusty_opus` (the fork repo's name) via `package = …`. Our fork adds
+# byte-identical AVX2 SILK kernels (~+30% single-thread) + frame-parallel encoding
+# (~3× libopus wall-clock, PEAQ-neutral). Pinned to a SHA; bump on new fork commits.
+rusty_opus = { git = "https://github.com/Remade-With-Rust/rusty-opus", rev = "680a21b3024ec4b33b0d5c948b2a3f5e7e91835d", package = "opus-rs" }
 # lewton: pure-Rust Vorbis decoder (MIT/Apache-2.0) — decode only, no FFI.
 lewton = "0.10"
 # claxon: pure-Rust FLAC decoder (Apache-2.0) — decode only, no FFI.

@@ -3938,8 +3938,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 [[package]]
 name = "opus-rs"
 version = "0.1.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1cc978697f3ada0ad98b323b9d85e85c6b08d478830148636c19b6d5f2ac9b85"
+source = "git+https://github.com/Remade-With-Rust/rusty-opus?rev=680a21b3024ec4b33b0d5c948b2a3f5e7e91835d#680a21b3024ec4b33b0d5c948b2a3f5e7e91835d"
 
 [[package]]
 name = "ordered-stream"

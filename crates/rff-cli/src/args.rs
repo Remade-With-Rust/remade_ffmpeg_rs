@@ -209,6 +209,19 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                 }
             }
 
+            // Codec private / tuning options forwarded to the encoder's
+            // `configure` Dictionary (audio by default; `:v` targets video).
+            // Includes Opus: -compression_level, -application, -vbr, and the R1
+            // frame-parallel controls -opus_parallel / -opus_warmup / -threads.
+            "compression_level" | "application" | "vbr" | "opus_parallel"
+            | "opus_warmup" | "threads" | "frame_duration" => {
+                let value = take_value(args, &mut i, arg)?;
+                match spec {
+                    Some(s) if s.starts_with('v') => video_opts.set(base, value),
+                    _ => audio_opts.set(base, value),
+                }
+            }
+
             // Anything else: accept gracefully. Best-effort consume a trailing
             // value so we don't mistake it for the output path.
             _ => {

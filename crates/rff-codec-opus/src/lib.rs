@@ -1,5 +1,5 @@
-//! Opus audio codec, backed by the pure-Rust [`opus_rs`] (BSD-3-Clause, a port
-//! of libopus 1.6 — no FFI).
+//! Opus audio codec, backed by our pure-Rust [`rusty_opus`] (BSD-3-Clause, our
+//! performance fork of `opus-rs`, a port of libopus 1.6 — no FFI).
 //!
 //! Opus works in `f32` samples at one of 8/12/16/24/48 kHz, in fixed frame
 //! durations; we use 20 ms frames. The encoder buffers incoming audio and emits
@@ -12,9 +12,10 @@
 
 use std::collections::VecDeque;
 
-use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use rusty_opus::parallel::{encode_parallel, ParallelConfig};
+use rusty_opus::{Application, OpusDecoder, OpusEncoder};
 use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder, Encoder};
-use rff_core::{AudioFrame, Error, Frame, MediaType, Packet, Result, SampleFormat};
+use rff_core::{AudioFrame, Dictionary, Error, Frame, MediaType, Packet, Result, SampleFormat};
 
 /// Opus frame duration in milliseconds (samples/frame = rate/1000 * this).
 const FRAME_MS: usize = 20;
@@ -141,7 +142,6 @@ impl Decoder for OpusDec {
 // Encoder
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
 struct OpusEnc {
     enc: Option<OpusEncoder>,
     sample_rate: u32,
@@ -154,16 +154,63 @@ struct OpusEnc {
     next_pts: i64,
     queue: VecDeque<Packet>,
     eof: bool,
+    // --- rate-control / tuning (from `configure`, FFmpeg-style opts) ---
+    /// Target bitrate (bits/s), `-b:a`. Default 64 kbps (matches libopus's default).
+    bitrate: i32,
+    /// Encoder complexity 0–10 (`-compression_level`). Higher = better/slower.
+    complexity: i32,
+    /// Constant bitrate when set (`-vbr off` / `-b:a` with CBR). Default VBR.
+    use_cbr: bool,
+    /// `voip` vs `audio` application (`-application`). Default audio.
+    voip: bool,
+    /// Frame/chunk-parallel encoding (R1): buffer the whole stream and encode it
+    /// across cores at `flush`, beating single-threaded libopus wall-clock.
+    /// Default on (batch/file semantics); `-opus_parallel 0` forces serial for
+    /// low-latency/streaming. Chunk seams are PEAQ-neutral (see `warmup`).
+    parallel: bool,
+    /// Look-back frames each worker re-encodes to prime its state (PEAQ-neutral
+    /// at ≥4; default 8). `-opus_warmup N`.
+    warmup: usize,
+    /// Worker thread count (`0` = all cores). `-threads N`.
+    threads: usize,
+}
+
+impl Default for OpusEnc {
+    fn default() -> Self {
+        OpusEnc {
+            enc: None,
+            sample_rate: 0,
+            channels: 0,
+            frame_size: 0,
+            buffer: Vec::new(),
+            next_pts: 0,
+            queue: VecDeque::new(),
+            eof: false,
+            bitrate: 64_000,
+            complexity: 9,
+            use_cbr: false,
+            voip: false,
+            parallel: true,
+            warmup: 8,
+            threads: 0,
+        }
+    }
 }
 
 impl OpusEnc {
     fn init(&mut self, af: &AudioFrame) -> Result<()> {
         check_rate(af.sample_rate)?;
         let channels = af.channels.max(1);
-        let mut enc =
-            OpusEncoder::new(af.sample_rate as i32, channels as usize, Application::Audio)
-                .map_err(|e| Error::invalid(format!("opus encode init: {e}")))?;
-        enc.bitrate_bps = 64_000;
+        let app = if self.voip {
+            Application::Voip
+        } else {
+            Application::Audio
+        };
+        let mut enc = OpusEncoder::new(af.sample_rate as i32, channels as usize, app)
+            .map_err(|e| Error::invalid(format!("opus encode init: {e}")))?;
+        enc.bitrate_bps = self.bitrate;
+        enc.complexity = self.complexity.clamp(0, 10);
+        enc.use_cbr = self.use_cbr;
         self.enc = Some(enc);
         self.sample_rate = af.sample_rate;
         self.channels = channels;
@@ -190,9 +237,72 @@ impl OpusEnc {
         }
         Ok(())
     }
+
+    /// Encode the whole buffered stream in parallel (R1) at flush, emitting one
+    /// PTS-stamped packet per 20 ms frame in order.
+    fn drain_parallel(&mut self) {
+        let frame_samples = self.frame_size * self.channels as usize;
+        if frame_samples == 0 || self.buffer.is_empty() {
+            return;
+        }
+        let rem = self.buffer.len() % frame_samples;
+        if rem != 0 {
+            self.buffer
+                .extend(std::iter::repeat(0.0).take(frame_samples - rem));
+        }
+        let app = if self.voip {
+            Application::Voip
+        } else {
+            Application::Audio
+        };
+        let mut cfg = ParallelConfig::new(self.sample_rate as i32, self.channels as usize, app);
+        cfg.bitrate_bps = self.bitrate;
+        cfg.complexity = self.complexity;
+        cfg.use_cbr = self.use_cbr;
+        cfg.warmup = self.warmup;
+        cfg.threads = self.threads;
+        let packets = encode_parallel(&cfg, &self.buffer, self.frame_size);
+        self.buffer.clear();
+        for data in packets {
+            let mut packet = Packet::from_data(0, data);
+            packet.pts = Some(self.next_pts);
+            self.next_pts += self.frame_size as i64;
+            self.queue.push_back(packet);
+        }
+    }
 }
 
 impl Encoder for OpusEnc {
+    fn configure(&mut self, options: &Dictionary) -> Result<()> {
+        if let Some(b) = options.get_bitrate("b") {
+            if b > 0 {
+                self.bitrate = b as i32;
+            }
+        }
+        // `-compression_level 0..10` maps to Opus complexity (FFmpeg's mapping).
+        if let Some(c) = options.get_int("compression_level") {
+            self.complexity = (c as i32).clamp(0, 10);
+        }
+        if let Some(app) = options.get("application") {
+            self.voip = app.eq_ignore_ascii_case("voip") || app.eq_ignore_ascii_case("lowdelay");
+        }
+        // `-vbr off` / `-vbr 0` → CBR (FFmpeg's libopus `vbr` option).
+        if let Some(v) = options.get("vbr") {
+            self.use_cbr = v == "off" || v == "0" || v.eq_ignore_ascii_case("false");
+        }
+        // R1 frame-parallel controls.
+        if let Some(p) = options.get("opus_parallel") {
+            self.parallel = !(p == "0" || p == "off" || p.eq_ignore_ascii_case("false"));
+        }
+        if let Some(w) = options.get_int("opus_warmup") {
+            self.warmup = w.max(0) as usize;
+        }
+        if let Some(t) = options.get_int("threads") {
+            self.threads = t.max(0) as usize;
+        }
+        Ok(())
+    }
+
     fn accepted_sample_rates(&self) -> Option<Vec<u32>> {
         Some(RATES.to_vec())
     }
@@ -216,7 +326,13 @@ impl Encoder for OpusEnc {
             ));
         }
         self.buffer.extend(frame_to_f32(af)?);
-        self.drain_frames()
+        // Parallel mode accumulates the whole stream and encodes it at `flush`;
+        // serial mode drains whole frames incrementally as they arrive.
+        if self.parallel {
+            Ok(())
+        } else {
+            self.drain_frames()
+        }
     }
 
     fn receive_packet(&mut self) -> Result<Packet> {
@@ -231,15 +347,20 @@ impl Encoder for OpusEnc {
     }
 
     fn flush(&mut self) {
-        // Pad a trailing partial frame with silence so it still encodes.
-        if self.enc.is_some() && !self.buffer.is_empty() {
-            let frame_samples = self.frame_size * self.channels as usize;
-            let rem = self.buffer.len() % frame_samples;
-            if rem != 0 {
-                self.buffer
-                    .extend(std::iter::repeat(0.0).take(frame_samples - rem));
+        // `init` runs on the first frame, so `frame_size` is set iff we saw input.
+        if self.frame_size != 0 && !self.buffer.is_empty() {
+            if self.parallel {
+                self.drain_parallel();
+            } else {
+                // Pad a trailing partial frame with silence so it still encodes.
+                let frame_samples = self.frame_size * self.channels as usize;
+                let rem = self.buffer.len() % frame_samples;
+                if rem != 0 {
+                    self.buffer
+                        .extend(std::iter::repeat(0.0).take(frame_samples - rem));
+                }
+                let _ = self.drain_frames();
             }
-            let _ = self.drain_frames();
         }
         self.eof = true;
     }
