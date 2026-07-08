@@ -362,21 +362,33 @@ fn build_samples(
     let stsc = find(stbl, b"stsc")?;
     let stts = find(stbl, b"stts")?;
     let stss = find(stbl, b"stss");
+    // A count field is attacker-controlled; clamp every one to the entries the
+    // box can physically hold (`(box_len - header) / stride`) so a malformed file
+    // claiming billions of entries can't drive an eager multi-GB allocation
+    // (OOM-abort DoS). Well-formed boxes never exceed this, so it's lossless.
+    let entries = |b: &[u8], stride: usize| (b.len().saturating_sub(8)) / stride;
     let chunk_offsets: Vec<u64> = match find(stbl, b"stco") {
-        Some(stco) => (0..be32(stco, 4))
-            .map(|n| be32(stco, 8 + 4 * n as usize) as u64)
-            .collect(),
+        Some(stco) => {
+            let n = be32(stco, 4).min(entries(stco, 4) as u32);
+            (0..n).map(|n| be32(stco, 8 + 4 * n as usize) as u64).collect()
+        }
         None => {
             let co64 = find(stbl, b"co64")?;
-            (0..be32(co64, 4))
-                .map(|n| be64(co64, 8 + 8 * n as usize))
-                .collect()
+            let n = be32(co64, 4).min(entries(co64, 8) as u32);
+            (0..n).map(|n| be64(co64, 8 + 8 * n as usize)).collect()
         }
     };
 
-    // Sample sizes (uniform if stsz[4] != 0).
+    // Sample sizes (uniform if stsz[4] != 0). Non-uniform stores a 4-byte size
+    // per sample, so a claimed count beyond the box is bogus; uniform has no size
+    // table, so cap it against a generous sanity ceiling (bounds the walk below).
+    const MAX_SAMPLES: usize = 1 << 24; // ~16M, far beyond any real media
     let uniform = be32(stsz, 4);
-    let sample_count = be32(stsz, 8) as usize;
+    let sample_count = if uniform != 0 {
+        (be32(stsz, 8) as usize).min(MAX_SAMPLES)
+    } else {
+        (be32(stsz, 8) as usize).min((stsz.len().saturating_sub(12)) / 4)
+    };
     let size_of = |i: usize| -> usize {
         if uniform != 0 {
             uniform as usize
@@ -385,8 +397,8 @@ fn build_samples(
         }
     };
 
-    // stsc entries: (first_chunk, samples_per_chunk).
-    let stsc_n = be32(stsc, 4) as usize;
+    // stsc entries: (first_chunk, samples_per_chunk) — 12 bytes each.
+    let stsc_n = (be32(stsc, 4) as usize).min(entries(stsc, 12));
     let stsc_entries: Vec<(u32, u32)> = (0..stsc_n)
         .map(|e| {
             let o = 8 + 12 * e;
@@ -401,8 +413,10 @@ fn build_samples(
             .map_or(0, |(_, spc)| *spc)
     };
 
-    // Walk chunks, laying out samples sequentially within each.
-    let mut samples = Vec::with_capacity(sample_count);
+    // Walk chunks, laying out samples sequentially within each. The capacity is
+    // only a hint (bounded so a huge uniform sample_count can't pre-allocate GBs);
+    // the actual pushes are bounded by sample_count (clamped above).
+    let mut samples = Vec::with_capacity(sample_count.min(1 << 16));
     let mut sample_idx = 0usize;
     for (ci, &chunk_off) in chunk_offsets.iter().enumerate() {
         let spc = samples_in_chunk(ci as u32 + 1);
@@ -425,16 +439,19 @@ fn build_samples(
     }
 
     // Timestamps from stts (run-length of per-sample deltas), in media units.
-    let stts_n = be32(stts, 4) as usize;
+    // Clamp the entry count to the box; stop once every sample is timestamped so
+    // a malicious run-length can't spin billions of empty iterations.
+    let stts_n = (be32(stts, 4) as usize).min(entries(stts, 8));
     let mut pts: i64 = 0;
     let mut s = 0usize;
-    for e in 0..stts_n {
+    'stts: for e in 0..stts_n {
         let o = 8 + 8 * e;
         let (count, delta) = (be32(stts, o), be32(stts, o + 4) as i64);
         for _ in 0..count {
-            if let Some(sample) = samples.get_mut(s) {
-                sample.pts = pts;
+            if s >= samples.len() {
+                break 'stts;
             }
+            samples[s].pts = pts;
             pts += delta;
             s += 1;
         }
@@ -443,7 +460,7 @@ fn build_samples(
     // Keyframes: from stss if present, else every sample is a sync sample.
     match stss {
         Some(stss) => {
-            let n = be32(stss, 4) as usize;
+            let n = (be32(stss, 4) as usize).min(entries(stss, 4));
             for e in 0..n {
                 let num = be32(stss, 8 + 4 * e) as usize; // 1-based
                 if let Some(sample) = samples.get_mut(num.wrapping_sub(1)) {

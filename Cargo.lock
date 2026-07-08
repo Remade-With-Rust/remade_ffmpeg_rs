@@ -3938,7 +3938,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 [[package]]
 name = "opus-rs"
 version = "0.1.23"
-source = "git+https://github.com/Remade-With-Rust/rusty-opus?rev=680a21b3024ec4b33b0d5c948b2a3f5e7e91835d#680a21b3024ec4b33b0d5c948b2a3f5e7e91835d"
+source = "git+https://github.com/Remade-With-Rust/rusty-opus?rev=a0b671a366a280c3d2ac83c973a7e6689660a9a3#a0b671a366a280c3d2ac83c973a7e6689660a9a3"
 
 [[package]]
 name = "ordered-stream"

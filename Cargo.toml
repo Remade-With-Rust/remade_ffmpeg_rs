@@ -131,7 +131,7 @@ image-webp = "0.2"
 # alias it to `rusty_opus` (the fork repo's name) via `package = …`. Our fork adds
 # byte-identical AVX2 SILK kernels (~+30% single-thread) + frame-parallel encoding
 # (~3× libopus wall-clock, PEAQ-neutral). Pinned to a SHA; bump on new fork commits.
-rusty_opus = { git = "https://github.com/Remade-With-Rust/rusty-opus", rev = "680a21b3024ec4b33b0d5c948b2a3f5e7e91835d", package = "opus-rs" }
+rusty_opus = { git = "https://github.com/Remade-With-Rust/rusty-opus", rev = "a0b671a366a280c3d2ac83c973a7e6689660a9a3", package = "opus-rs" }
 # lewton: pure-Rust Vorbis decoder (MIT/Apache-2.0) — decode only, no FFI.
 lewton = "0.10"
 # claxon: pure-Rust FLAC decoder (Apache-2.0) — decode only, no FFI.

@@ -73,11 +73,12 @@ impl FlvDemuxer {
         self.has_audio = h[4] & 0x04 != 0;
         self.has_video = h[4] & 0x01 != 0;
         let data_offset = u32::from_be_bytes([h[5], h[6], h[7], h[8]]) as usize;
-        // Skip any bytes between the 9-byte header and the first tag.
-        for _ in 9..data_offset {
-            let mut b = [0u8; 1];
-            self.input.read_exact(&mut b).ok();
-        }
+        // Skip any bytes between the 9-byte header and the first tag. `data_offset`
+        // is attacker-controlled (up to 4 GB); skip via a chunked copy that stops
+        // at real EOF, NOT a byte-at-a-time loop to `data_offset` that ignores the
+        // read result and spins billions of times on a short/malformed file.
+        let skip = (data_offset.saturating_sub(9)) as u64;
+        let _ = std::io::copy(&mut self.input.by_ref().take(skip), &mut std::io::sink());
         self.header_read = true;
         Ok(())
     }
@@ -96,8 +97,17 @@ impl FlvDemuxer {
         let size = u32::from_be_bytes([0, th[1], th[2], th[3]]) as usize;
         let ts =
             ((th[7] as i64) << 24) | ((th[4] as i64) << 16) | ((th[5] as i64) << 8) | th[6] as i64;
-        let mut data = vec![0u8; size];
-        if self.input.read_exact(&mut data).is_err() {
+        // Read up to `size` bytes without pre-allocating `size` (a claimed size
+        // beyond the actual input must not drive an eager allocation); short read
+        // ⇒ truncated tag ⇒ EOF.
+        let mut data = Vec::new();
+        let got = self
+            .input
+            .by_ref()
+            .take(size as u64)
+            .read_to_end(&mut data)
+            .unwrap_or(0);
+        if got < size {
             return Ok(None);
         }
         Ok(Some((tag_type, ts, data)))

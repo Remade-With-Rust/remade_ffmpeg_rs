@@ -125,7 +125,9 @@ impl Decoder {
                 ID_FIL => {
                     let mut count = r.read_bits(4)? as usize;
                     if count == 15 {
-                        count += r.read_bits(8)? as usize - 1;
+                        // count = 15 + next8 - 1; group as (count + next8) - 1 so a
+                        // zero escape byte can't underflow usize (`0usize - 1` panics).
+                        count = count + r.read_bits(8)? as usize - 1;
                     }
                     r.skip(count * 8)?;
                 }
@@ -301,6 +303,9 @@ fn decode_channel(
             if cb == ZERO_HCB {
                 continue;
             }
+            if sfb + 1 >= swb.len() {
+                break; // malformed: more coded bands than the swb offset table holds
+            }
             let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
             for w in 0..info.window_group_length[g] as usize {
                 let base = (wbase + w) * window_len;
@@ -415,9 +420,18 @@ fn read_spectrum(
             if cb == ZERO_HCB || cb == NOISE_HCB || cb >= INTENSITY_HCB2 {
                 continue;
             }
-            let meta = &CODEBOOKS[cb as usize];
+            // Skip books that carry no spectral data or are out of range: the
+            // filter above misses INTENSITY_HCB (14) and reserved (12), which
+            // would index CODEBOOKS out of bounds on malformed (or intensity)
+            // input. `.get` skips them (intensity is applied later in apply_is).
+            let Some(meta) = CODEBOOKS.get(cb as usize) else {
+                continue;
+            };
             let book = spectral_book(cb);
             let dim = meta.dim as usize;
+            if sfb + 1 >= swb.len() {
+                break; // malformed: more coded bands than the swb offset table holds
+            }
             let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
             for w in 0..info.window_group_length[g] as usize {
                 let base = (wbase + w) * window_len;
@@ -675,7 +689,10 @@ fn apply_ms(
     for g in 0..info.num_window_groups {
         for sfb in 0..max_sfb {
             if ms_used[g * max_sfb + sfb] && cb1[g][sfb] < INTENSITY_HCB2 {
-                let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+                if sfb + 1 >= swb.len() {
+                break; // malformed: more coded bands than the swb offset table holds
+            }
+            let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
                 for w in 0..info.window_group_length[g] as usize {
                     let base = (wbase + w) * window_len;
                     for i in s..e {
@@ -718,7 +735,10 @@ fn apply_is(
                 if !ms_used.is_empty() && ms_used[g * max_sfb + sfb] {
                     scale = -scale; // M/S flips intensity sign
                 }
-                let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+                if sfb + 1 >= swb.len() {
+                break; // malformed: more coded bands than the swb offset table holds
+            }
+            let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
                 for w in 0..info.window_group_length[g] as usize {
                     let base = (wbase + w) * window_len;
                     for i in s..e {
