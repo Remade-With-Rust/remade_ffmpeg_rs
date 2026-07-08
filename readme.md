@@ -34,6 +34,7 @@
 | VP9 decode, 1 thread | 1.0× | **~0.16–0.21×** — younger, optimizing | → parity |
 | AAC encode (60 s stereo) | 1.0× | **~6× faster** — frame-parallel (ffmpeg's AAC is 1-thread); ~1.15× single-thread | maintain |
 | Vorbis encode (stereo music) | 1.0× | **~5.3× faster** — frame-parallel; the **first permissive-Rust Vorbis encoder** | → single-thread |
+| Opus encode (speech, `libopus`) | 1.0× | **~3× faster** wall-clock — frame-parallel, PEAQ-neutral (`libopus` is 1-thread); ~0.35× single-thread | → single-thread |
 | License + embedding | LGPL/GPL · C FFI | **Apache-2.0 · pure Rust · no FFI** | — |
 
 <sub>Real numbers + how to reproduce them: [docs/benchmarks.md](docs/benchmarks.md). The VP9 speed figure is decode throughput on an i7-14650HX vs FFmpeg's native decoder.</sub>
@@ -64,6 +65,25 @@
 > 0.03 vs the exhaustive search, on a CC0/PD music corpus) for a further **~1.5×**. Together they
 > closed single-thread from **4.7× → ~1.4×** behind libvorbis; the parallel win is one FFmpeg's
 > single-threaded encoder can't answer. `--no-default-features` stays a 100%-safe scalar build.
+
+> **⚡ Performance spotlight — Opus encode: our fork beats `libopus` on wall-clock.** Opus
+> uses our own **[rusty-opus](https://github.com/Remade-With-Rust/rusty-opus)** — a
+> performance fork (BSD-3) of the pure-Rust `opus-rs`. The upstream had scalar x86 for the
+> SILK noise-shaping path, so we wrote **three byte-identical AVX2 kernels** — the LPC
+> short-prediction, the warped-autocorrelation correlation, and (the flagship) the
+> **cross-state NSQ shaping filter**, where the 4 delayed-decision states run as **i64 lanes**
+> of one register and the state is held in a **persistent SoA** transposed once per subframe
+> (an isolated micro-benchmark found this after a naïve first attempt went *slower* — the
+> lesson being that cross-lane SIMD wins on serial recurrences and *loses* on branchy
+> straight-line code, which we proved by measuring the RD kernel at **5× slower** and
+> shipping only the winners). Those make single-thread SILK **~30% faster than the upstream
+> fork, byte-identical**. Then the structural move, as with AAC and Vorbis: **frame-parallel
+> encoding** — chunk the stream and let each worker **prime** its inter-frame state (SILK LTP,
+> CELT overlap) by re-encoding a few look-back frames, so chunk seams are **PEAQ-neutral**
+> (ΔODG ≤ 0.03). Since `libopus` is single-threaded per stream, this puts **`rff -c:a opus` at
+> ~3× `ffmpeg -c:a libopus` wall-clock** (and ~8× the opus-rs we forked) on speech, decoding
+> at unity. Per-thread we're still ~2.9× behind `libopus`'s hand-written assembly NSQ — the
+> honest single-thread gap — but the wall-clock race is one a single-threaded encoder can't win.
 
 ---
 
@@ -128,7 +148,7 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 | Image codec | **jpegxl** (JPEG XL) | **decode** (pure-Rust `jxl-oxide`; no Rust encoder yet) |
 | Audio codec | **aac** | in-house **AAC-LC decoder + encoder** — decoder has all features (short blocks, M/S, intensity stereo, PNS, TNS), bit-exact vs FFmpeg; **encoder** (7 bricks) adds a psychoacoustic model (Bark-scale masking), bitrate rate-control, transient block switching, M/S stereo, and MP4 `esds` — **ffmpeg decodes our output at unity**; **~450× realtime** encode — **~6× faster than ffmpeg's own AAC** — via frame-parallel encoding (ffmpeg's AAC is single-threaded), an N/4-point-FFT MDCT, a two-phase rate loop, cached psychoacoustic tables, and AVX2 (+ opt-in AVX-512) quantize kernels. Single-thread it still edges ffmpeg (~1.15×) |
 | Audio codec | **mp3** (MPEG-1/2 Layer III) | in-house **decoder + encoder** (`rff-codec-mp3`) — decoder **bit-exact vs FFmpeg**; encoder MPEG-1/2/2.5, CBR + VBR, joint stereo, block switching |
-| Audio codec | **opus** | **decode + encode** (pure-Rust `opus-rs`) |
+| Audio codec | **opus** | **decode + encode** — our own **[rusty-opus](https://github.com/Remade-With-Rust/rusty-opus)** (BSD-3 performance fork of the pure-Rust `opus-rs`). Three **byte-identical AVX2 SILK kernels** (LPC short-prediction, warped-autocorrelation, cross-state NSQ shaping filter) make single-thread SILK **~30% faster than the upstream fork**; **frame-parallel encoding** (chunked + state-primed, **PEAQ-neutral** ΔODG ≤ 0.03) makes `rff -c:a opus` **~3× faster than ffmpeg's `libopus` wall-clock** (libopus is single-threaded per stream, ~8× faster than the opus-rs we forked) — **ffmpeg decodes our output at unity**. Knobs: `-b:a`, `-compression_level`, `-opus_parallel` |
 | Audio codec | **vorbis** | **decode + encode** — decode via pure-Rust `lewton`; **in-house encoder** — *the first permissively-licensed Vorbis encoder in Rust* (none existed before). Window → **N/4-FFT MDCT** → Bark-scale masking floor → channel coupling + point stereo → rate-distortion residue VQ, emitting an embedded libvorbis setup header; `-q:a 0–9`. **ffmpeg decodes our output**, validated packet-exact against `lewton` + libvorbis. **~5.3× faster than libvorbis wall-clock** (stereo music, 24 cores) via **frame-parallel** encoding (libvorbis is single-threaded) over a structure-of-arrays + AVX2 residue-VQ search and an **energy-bucket class shortlist** (PEAQ-validated perceptually neutral, ΔODG ≤ 0.03); per-thread ~1.4× behind libvorbis (was 4.7×) |
 | Audio codec | **flac** | **decode + encode** — decode via pure-Rust `claxon`; **in-house lossless encoder** (LPC + stereo decorrelation + partitioned Rice + MD5), **at parity with ffmpeg's FLAC** |
 | Audio codec | **pcm** (s16le / f32le) | **decode + encode** (in-house) |
@@ -170,7 +190,7 @@ With the `format` filter bridging colorspaces, `ffmpeg -i photo.png -vf format=y
 | JPEG encode | [`jpeg-encoder`](https://crates.io/crates/jpeg-encoder) | MIT/Apache-2.0 AND IJG | ✅ |
 | GIF encode/decode | [`gif`](https://crates.io/crates/gif) | MIT/Apache-2.0 | ✅ |
 | WebP encode/decode | [`image-webp`](https://crates.io/crates/image-webp) | MIT/Apache-2.0 | ✅ |
-| Opus encode/decode | [`opus-rs`](https://crates.io/crates/opus-rs) | BSD-3-Clause | ✅ |
+| Opus encode/decode | [`rusty-opus`](https://github.com/Remade-With-Rust/rusty-opus) (our `opus-rs` fork) | BSD-3-Clause | ✅ (AVX2 SILK + frame-parallel; pure Rust, no C/FFI) |
 | Vorbis decode | [`lewton`](https://crates.io/crates/lewton) | MIT/Apache-2.0 | ✅ |
 | Vorbis encode | **in-house** (`rff-codec-vorbis`) | Apache-2.0 | ✅ (first permissive Rust Vorbis encoder) |
 | FLAC decode | [`claxon`](https://crates.io/crates/claxon) | Apache-2.0 | ✅ |
