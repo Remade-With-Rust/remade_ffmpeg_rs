@@ -2504,6 +2504,9 @@ impl FrameEncoder {
                 dst_off,
                 stride,
                 plane,
+                dq.0 as i64,
+                dq.1 as i64,
+                dq_shift as u32,
             );
         }
         let mut token_cache = [0u8; 1024];
@@ -2630,6 +2633,9 @@ impl FrameEncoder {
         dst_off: usize,
         stride: usize,
         plane: usize,
+        dc_step: i64,
+        ac_step: i64,
+        dq_shift: u32,
     ) -> usize {
         let n = bs * bs;
         // The prediction still sits in the recon buffer (residual added later).
@@ -2691,6 +2697,38 @@ impl FrameEncoder {
                 levels[last] = sl;
                 dqcoeff[last] = sd;
                 break;
+            }
+        }
+        // Full trellis: lower each surviving coefficient by one quantizer step wherever
+        // the RD improves (level → level−1, and → 0 when it was ±1). This is the
+        // interior-coefficient optimization the EOB trim misses and libvpx's optimize_b
+        // does — a single backward pass captures most of it. Re-dequantize the lowered
+        // level exactly as the decoder will (`(mag·step)>>dq_shift`) so recon stays exact.
+        let mut i = eob;
+        while i > 0 {
+            i -= 1;
+            let pos = scan[i] as usize;
+            let lv = levels[pos];
+            if lv == 0 {
+                continue;
+            }
+            let step = if pos == 0 { dc_step } else { ac_step };
+            let sign = if lv < 0 { -1i32 } else { 1 };
+            let mag = lv.unsigned_abs() as i64 - 1;
+            let (ol, od) = (levels[pos], dqcoeff[pos]);
+            levels[pos] = sign * mag as i32;
+            dqcoeff[pos] = sign * ((mag * step) >> dq_shift) as i32;
+            let mut ne = eob;
+            while ne > 0 && levels[scan[ne - 1] as usize] == 0 {
+                ne -= 1;
+            }
+            let jp = rd(dqcoeff, levels, ne);
+            if jp < j {
+                j = jp;
+                eob = ne;
+            } else {
+                levels[pos] = ol;
+                dqcoeff[pos] = od;
             }
         }
         eob
