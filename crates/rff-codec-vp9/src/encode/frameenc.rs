@@ -37,7 +37,7 @@ use crate::block::{
     tx_size_context, update_partition_context, ModeInfo, Mv, ALTREF_FRAME, BLOCK_4X4, BLOCK_8X8,
     GOLDEN_FRAME,
     INTRA_FRAME, INTRA_MODE_TREE, LAST_FRAME, NEARESTMV, NEARMV, NEWMV, NONE_FRAME, PARTITION_NONE,
-    PARTITION_SPLIT, PARTITION_TREE, ZEROMV,
+    PARTITION_HORZ, PARTITION_SPLIT, PARTITION_TREE, PARTITION_VERT, ZEROMV,
 };
 use crate::decode::{average_split_mvs, INTER_MODE_TREE};
 use crate::geom_tables::{B_HEIGHT_LOG2, B_WIDTH_LOG2};
@@ -1306,20 +1306,28 @@ impl FrameEncoder {
 
         // Sub-8×8 SPLIT at BLOCK_8X8: here PARTITION_SPLIT codes ONE sub-8×8 (BLOCK_4X4)
         // leaf with per-4×4 modes (not a recursion — `can_split` is false at 8×8).
-        let mut sub_rd = f64::MAX;
-        let mut sub_snap = None;
+        // Try all three: SPLIT (4×4), HORZ (8×4), VERT (4×8). Each codes ONE sub-8×8 leaf
+        // of the corresponding subsize; the cheapest wins and its partition symbol is
+        // recorded so the emit codes it.
+        let mut sub_best: Option<(usize, f64, BlockSnap)> = None;
         if self.sub8x8 && self.is_inter && bsize == BLOCK_8X8 && full_fit {
-            let subsize = subsize(PARTITION_SPLIT, bsize) as usize; // BLOCK_4X4
-            let (mi, coef, sse) =
-                self.decide_sub8x8(mi_row, mi_col, subsize, n4x4_l2, n4x4_l2, true);
-            self.store_mi(mi_row, mi_col, n4x4_l2, n4x4_l2, &mi);
-            let bits = coef + self.sub8x8_modeinfo_cost_q8(&mi, mi_row, mi_col);
-            sub_rd = self.part_flag_cost(&probs, PARTITION_SPLIT, has_rows, has_cols)
-                + sse as f64
-                + self.lambda * (bits as f64 / 256.0);
-            sub_snap = Some(self.snap_block(mi_row, mi_col, n4x4_l2, n4x4_l2));
-            self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, &start);
+            for part in [PARTITION_SPLIT, PARTITION_HORZ, PARTITION_VERT] {
+                let subsz = subsize(part, bsize) as usize; // BLOCK_4X4 / 8X4 / 4X8
+                let (mi, coef, sse) =
+                    self.decide_sub8x8(mi_row, mi_col, subsz, n4x4_l2, n4x4_l2, true);
+                self.store_mi(mi_row, mi_col, n4x4_l2, n4x4_l2, &mi);
+                let bits = coef + self.sub8x8_modeinfo_cost_q8(&mi, mi_row, mi_col);
+                let rd = self.part_flag_cost(&probs, part, has_rows, has_cols)
+                    + sse as f64
+                    + self.lambda * (bits as f64 / 256.0);
+                let snap = self.snap_block(mi_row, mi_col, n4x4_l2, n4x4_l2);
+                self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, &start);
+                if sub_best.as_ref().map_or(true, |b| rd < b.1) {
+                    sub_best = Some((part, rd, snap));
+                }
+            }
         }
+        let sub_rd = sub_best.as_ref().map_or(f64::MAX, |b| b.1);
 
         // NONE — code the whole block once (only when it fully fits the frame).
         let mut none_rd = f64::MAX;
@@ -1332,9 +1340,10 @@ impl FrameEncoder {
         let (partition, cost) = if none_rd <= best_split {
             (PARTITION_NONE, none_rd) // NONE's recon+context already in place
         } else if sub_rd <= split_rd {
-            // Sub-8×8 SPLIT — restore its recon (a distinct SPLIT that codes a 4×4 leaf).
-            self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, sub_snap.as_ref().unwrap());
-            (PARTITION_SPLIT, sub_rd)
+            // Sub-8×8 (SPLIT/HORZ/VERT) — restore the winning subsize's recon.
+            let (part, rd, snap) = sub_best.unwrap();
+            self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, &snap);
+            (part, rd)
         } else {
             self.restore_block(
                 mi_row,
