@@ -3938,7 +3938,6 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 [[package]]
 name = "opus-rs"
 version = "0.1.23"
-source = "git+https://github.com/Remade-With-Rust/rusty-opus?rev=a0b671a366a280c3d2ac83c973a7e6689660a9a3#a0b671a366a280c3d2ac83c973a7e6689660a9a3"
 
 [[package]]
 name = "ordered-stream"
@@ -4786,6 +4785,7 @@ dependencies = [
  "rff-codec-opus",
  "rff-codec-pcm",
  "rff-codec-png",
+ "rff-codec-rawvideo",
  "rff-codec-vorbis",
  "rff-codec-vp9",
  "rff-codec-webp",
@@ -4798,6 +4798,7 @@ dependencies = [
  "rff-format-flv",
  "rff-format-gif",
  "rff-format-hls",
+ "rff-format-ivf",
  "rff-format-jpeg",
  "rff-format-jxl",
  "rff-format-mkv",
@@ -4810,6 +4811,7 @@ dependencies = [
  "rff-format-wav",
  "rff-format-webp",
  "rff-format-webvtt",
+ "rff-format-y4m",
  "rff-io",
  "rff-resample",
 ]
@@ -4944,6 +4946,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rff-codec-rawvideo"
+version = "0.0.1"
+dependencies = [
+ "rff-codec",
+ "rff-core",
+]
+
+[[package]]
 name = "rff-codec-vorbis"
 version = "0.0.1"
 dependencies = [
@@ -5037,6 +5047,14 @@ dependencies = [
  "rff-core",
  "rff-format",
  "rff-format-ts",
+]
+
+[[package]]
+name = "rff-format-ivf"
+version = "0.0.1"
+dependencies = [
+ "rff-core",
+ "rff-format",
 ]
 
 [[package]]
@@ -5138,6 +5156,14 @@ dependencies = [
  "rff-core",
  "rff-format",
  "rff-subtitle",
+]
+
+[[package]]
+name = "rff-format-y4m"
+version = "0.0.1"
+dependencies = [
+ "rff-core",
+ "rff-format",
 ]
 
 [[package]]

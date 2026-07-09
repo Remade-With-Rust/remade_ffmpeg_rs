@@ -1,0 +1,12 @@
+[package]
+name = "rff-format-ivf"
+description = "Remade FFmpeg (Rust): IVF container — the native VP8/VP9 test wrapper (vpxenc/vpxdec/ffmpeg compatible)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true

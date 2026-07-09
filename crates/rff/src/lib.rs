@@ -65,6 +65,7 @@ fn register_builtin_codecs(codecs: &mut CodecRegistry) {
     rff_codec_aac::register(codecs);
     rff_codec_vp9::register(codecs);
     rff_codec_mp3::register(codecs);
+    rff_codec_rawvideo::register(codecs);
     // H.264 defaults to the in-house pure-Rust `rusty_h264` (registered above).
     // The `h264-openh264` feature swaps in Cisco's C/FFI openh264 instead — a
     // cross-check / fallback option, off by default.
@@ -81,6 +82,8 @@ fn register_builtin_formats(formats: &mut FormatRegistry) {
     rff_format_gif::register(formats);
     rff_format_webp::register(formats);
     rff_format_wav::register(formats);
+    rff_format_y4m::register(formats);
+    rff_format_ivf::register(formats);
     rff_format_ogg::register(formats);
     rff_format_flac::register(formats);
     rff_format_mp3::register(formats);

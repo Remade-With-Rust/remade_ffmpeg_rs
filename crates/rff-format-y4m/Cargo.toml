@@ -1,0 +1,12 @@
+[package]
+name = "rff-format-y4m"
+description = "Remade FFmpeg (Rust): YUV4MPEG2 (.y4m) raw-video container — the standard codec-testing interchange."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true

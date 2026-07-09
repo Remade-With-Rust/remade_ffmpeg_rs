@@ -29,7 +29,10 @@ default-members = [
     "crates/rff-codec-aac",
     "crates/rff-codec-vp9",
     "crates/rff-codec-mp3",
+    "crates/rff-codec-rawvideo",
     "crates/rff-format-wav",
+    "crates/rff-format-y4m",
+    "crates/rff-format-ivf",
     "crates/rff-format-ogg",
     "crates/rff-format-flac",
     "crates/rff-format-mp3",
@@ -84,12 +87,15 @@ rff-codec-jxl = { path = "crates/rff-codec-jxl", version = "0.0.1" }
 rff-codec-aac = { path = "crates/rff-codec-aac", version = "0.0.1" }
 rff-codec-vp9 = { path = "crates/rff-codec-vp9", version = "0.0.1" }
 rff-codec-mp3 = { path = "crates/rff-codec-mp3", version = "0.0.1" }
+rff-codec-rawvideo = { path = "crates/rff-codec-rawvideo", version = "0.0.1" }
 # TEMPORARY C/FFI H.264 — deliberately NOT in default-members; opt-in only.
 rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.0.1" }
 rff-format-wav = { path = "crates/rff-format-wav", version = "0.0.1" }
 rff-format-ogg = { path = "crates/rff-format-ogg", version = "0.0.1" }
 rff-format-flac = { path = "crates/rff-format-flac", version = "0.0.1" }
 rff-format-mp3 = { path = "crates/rff-format-mp3", version = "0.0.1" }
+rff-format-y4m = { path = "crates/rff-format-y4m", version = "0.0.1" }
+rff-format-ivf = { path = "crates/rff-format-ivf", version = "0.0.1" }
 rff-format-jxl = { path = "crates/rff-format-jxl", version = "0.0.1" }
 rff-format-mp4 = { path = "crates/rff-format-mp4", version = "0.0.1" }
 rff-format-mkv = { path = "crates/rff-format-mkv", version = "0.0.1" }
@@ -131,7 +137,11 @@ image-webp = "0.2"
 # alias it to `rusty_opus` (the fork repo's name) via `package = …`. Our fork adds
 # byte-identical AVX2 SILK kernels (~+30% single-thread) + frame-parallel encoding
 # (~3× libopus wall-clock, PEAQ-neutral). Pinned to a SHA; bump on new fork commits.
-rusty_opus = { git = "https://github.com/Remade-With-Rust/rusty-opus", rev = "a0b671a366a280c3d2ac83c973a7e6689660a9a3", package = "opus-rs" }
+# TEMP dev override (local path) — carries the CM1 mono-CELT fix (fork commit a69cb2d,
+# "correct BAND_ALLOCATION row 10") which is NOT yet pushed to origin. Do NOT revert to the
+# old `rev = a0b671a` git pin: it pre-dates the fix and re-breaks mono. Re-pin to a git rev
+# `>= a69cb2d` once the fork publishes it.
+rusty_opus = { path = "../rusty-opus", package = "opus-rs" }
 # lewton: pure-Rust Vorbis decoder (MIT/Apache-2.0) — decode only, no FFI.
 lewton = "0.10"
 # claxon: pure-Rust FLAC decoder (Apache-2.0) — decode only, no FFI.

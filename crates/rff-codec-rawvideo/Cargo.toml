@@ -1,0 +1,12 @@
+[package]
+name = "rff-codec-rawvideo"
+description = "Remade FFmpeg (Rust): raw uncompressed video codec (planar YUV) — the video analog of PCM."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
