@@ -21,6 +21,7 @@ use crate::prob_tables::{KF_UV_MODE_PROBS, KF_Y_MODE_PROBS};
 use crate::token::read_tree;
 
 // Block sizes.
+pub const BLOCK_4X4: usize = 0;
 pub const BLOCK_8X8: usize = 3;
 pub const BLOCK_64X64: usize = 12;
 pub const BLOCK_INVALID: u8 = 13;

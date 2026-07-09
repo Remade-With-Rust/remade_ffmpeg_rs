@@ -417,17 +417,17 @@ pub(crate) fn clamp_mv_umv(
 }
 
 #[inline]
-fn round_q2(v: i32) -> i32 {
+pub(crate) fn round_q2(v: i32) -> i32 {
     (if v < 0 { v - 1 } else { v + 1 }) / 2
 }
 #[inline]
-fn round_q4(v: i32) -> i32 {
+pub(crate) fn round_q4(v: i32) -> i32 {
     (if v < 0 { v - 2 } else { v + 2 }) / 4
 }
 
 /// `average_split_mvs` — the MV for a plane's 4×4 sub-block, combining the
 /// sub-8×8 per-block MVs according to chroma subsampling.
-fn average_split_mvs(mi: &ModeInfo, r: usize, block: usize, ss_x: usize, ss_y: usize) -> Mv {
+pub(crate) fn average_split_mvs(mi: &ModeInfo, r: usize, block: usize, ss_x: usize, ss_y: usize) -> Mv {
     let q2 = |b0: usize, b1: usize| {
         (
             round_q2(mi.bmi_mv[b0][r].0 + mi.bmi_mv[b1][r].0),

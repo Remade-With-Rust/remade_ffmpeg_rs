@@ -34,11 +34,25 @@ use super::tokens::{coef_cost, cost_bit, encode_coefs, tree_bit_cost};
 use super::transform::forward_transform;
 use crate::block::{
     kf_uv_mode_probs, kf_y_mode_probs, partition_plane_context, skip_context, subsize,
-    tx_size_context, update_partition_context, ModeInfo, Mv, ALTREF_FRAME, BLOCK_8X8, GOLDEN_FRAME,
-    INTRA_FRAME, INTRA_MODE_TREE, LAST_FRAME, NEARESTMV, NEWMV, NONE_FRAME, PARTITION_NONE,
+    tx_size_context, update_partition_context, ModeInfo, Mv, ALTREF_FRAME, BLOCK_4X4, BLOCK_8X8,
+    GOLDEN_FRAME,
+    INTRA_FRAME, INTRA_MODE_TREE, LAST_FRAME, NEARESTMV, NEARMV, NEWMV, NONE_FRAME, PARTITION_NONE,
     PARTITION_SPLIT, PARTITION_TREE, ZEROMV,
 };
-use crate::decode::INTER_MODE_TREE;
+use crate::decode::{average_split_mvs, INTER_MODE_TREE};
+use crate::geom_tables::{B_HEIGHT_LOG2, B_WIDTH_LOG2};
+/// Env-gated (`VP9_INTERPROBE`) per-P-frame inter-mode accountant — LOCATE cut 2.
+mod interprobe {
+    use std::sync::atomic::AtomicU64;
+    pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
+    pub static SKIP: AtomicU64 = AtomicU64::new(0);
+    pub static INTRA: AtomicU64 = AtomicU64::new(0);
+    pub static ZM: AtomicU64 = AtomicU64::new(0); // ZEROMV
+    pub static NST: AtomicU64 = AtomicU64::new(0); // NEARESTMV
+    pub static NR: AtomicU64 = AtomicU64::new(0); // NEARMV
+    pub static NW: AtomicU64 = AtomicU64::new(0); // NEWMV
+    pub static RESID: AtomicU64 = AtomicU64::new(0); // residual (coefficient) bytes
+}
 use crate::decode::{
     adapt_coef_probs, clamp_mv_umv, intra_inter_context, single_ref_p1, single_ref_p2, uv_tx_size,
     FrameContext, FrameCounts,
@@ -160,6 +174,8 @@ pub struct FrameEncoder {
     // reaches this size (default BLOCK_8X8 = the historical all-8×8). Larger values
     // bring up bigger blocks; `use_partition_rd` turns on the recursive RD search.
     force_min_bsize: usize,
+    // Brick 2: offer sub-8×8 (4×4) inter prediction at BLOCK_8X8 (env `VP9_SUB8X8`).
+    sub8x8: bool,
     use_partition_rd: bool,
     /// Partition decision recorded by the RD pass, keyed by `(mi_row, mi_col,
     /// bsize)`; read by `encode_partition` during the emit pass(es).
@@ -253,7 +269,7 @@ impl FrameEncoder {
             refresh_frame_flags: 1, // refresh LAST (slot 0) by default
             show_frame: true,
             ref_frame_idx: [0, 1, 2],
-            interp_filter: 0,      // EIGHTTAP, frame-level fixed (not switchable)
+            interp_filter: 0, // EIGHTTAP, frame-level fixed (not switchable)
             sign_bias: [false; 4], // all same ⇒ no compound, reference_mode forced single
             fc: FrameContext::defaults(),
             use_rdo: true,
@@ -279,6 +295,9 @@ impl FrameEncoder {
             // smooth residual far better than four 4×4s — fewer bits AND higher PSNR).
             use_tx_search: true,
             force_min_bsize: BLOCK_8X8, // only used when partition RD is off
+            // Sub-8×8 (4×4/8×4/4×8) inter prediction: on by default (conformant, a BD-rate
+            // win); `VP9_NO_SUB8X8` disables it (faster encode).
+            sub8x8: std::env::var("VP9_NO_SUB8X8").is_err(),
             // Roof — ON: BD-rate oracle scores recursive partitioning −37% vs all-8×8
             // (large blocks are far cheaper on smooth content; it can always fall back
             // to 8×8 on detail). Key-frame only for now — inter stays all-8×8.
@@ -558,6 +577,21 @@ impl FrameEncoder {
     /// context) and return its bytes. Driven twice by `encode_frame` for R4.
     fn encode_tile(&mut self) -> Vec<u8> {
         let mut enc = BoolEncoder::new();
+        if std::env::var("VP9_INTERPROBE").is_ok() {
+            use std::sync::atomic::Ordering::Relaxed;
+            for s in [
+                &interprobe::BLOCKS,
+                &interprobe::SKIP,
+                &interprobe::INTRA,
+                &interprobe::ZM,
+                &interprobe::NST,
+                &interprobe::NR,
+                &interprobe::NW,
+                &interprobe::RESID,
+            ] {
+                s.store(0, Relaxed);
+            }
+        }
         for c in self.above_ctx.iter_mut() {
             c.iter_mut().for_each(|v| *v = 0);
         }
@@ -572,6 +606,26 @@ impl FrameEncoder {
                 mi_col += 8;
             }
             mi_row += 8;
+        }
+        if std::env::var("VP9_INTERPROBE").is_ok() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let g = |s: &std::sync::atomic::AtomicU64| s.load(Relaxed);
+            let b = g(&interprobe::BLOCKS).max(1);
+            let total = enc.tell_bytes().max(1);
+            let resid = g(&interprobe::RESID);
+            eprintln!(
+                "[IMIX] blocks={} skip={:.0}% intra={:.0}% ZEROMV={:.0}% NEAREST={:.0}% NEAR={:.0}% NEWMV={:.0}% | resid={}B/{}B ({:.0}% of frame)",
+                b,
+                100.0 * g(&interprobe::SKIP) as f64 / b as f64,
+                100.0 * g(&interprobe::INTRA) as f64 / b as f64,
+                100.0 * g(&interprobe::ZM) as f64 / b as f64,
+                100.0 * g(&interprobe::NST) as f64 / b as f64,
+                100.0 * g(&interprobe::NR) as f64 / b as f64,
+                100.0 * g(&interprobe::NW) as f64 / b as f64,
+                resid,
+                total,
+                100.0 * resid as f64 / total as f64,
+            );
         }
         enc.finish()
     }
@@ -758,9 +812,11 @@ impl FrameEncoder {
         write_partition(enc, partition, probs, has_rows, has_cols);
         let subsize = subsize(partition, bsize) as usize;
 
-        // NONE codes the whole block here; SPLIT recurses. (Gated on the partition,
-        // NOT hbs — a forced-/RD-NONE at 16×16+ must not fall through to recursion.)
-        if partition == PARTITION_NONE {
+        // NONE codes the whole block here; SPLIT recurses — EXCEPT at BLOCK_8X8, where
+        // SPLIT (like HORZ/VERT) codes a single sub-8×8 leaf of `subsize` (4×4/8×4/4×8),
+        // never a recursion. (Gated on the partition, NOT hbs — a forced-/RD-NONE at
+        // 16×16+ must not fall through to recursion.)
+        if partition == PARTITION_NONE || bsize == BLOCK_8X8 {
             self.encode_block(enc, mi_row, mi_col, subsize, n4x4_l2, n4x4_l2);
         } else {
             self.encode_partition(enc, mi_row, mi_col, subsize, n8x8_l2);
@@ -980,6 +1036,93 @@ impl FrameEncoder {
         c
     }
 
+    /// Signaling-bit cost (Q8) of a sub-8×8 block: skip + is_inter + single-ref (LAST),
+    /// then each 4×4 sub-block's inter-mode symbol and NEWMV MV delta (relative to the
+    /// shared `find_mv_refs(NEWMV)` predictor). No tx_size (sub-8×8 forces 4×4).
+    fn sub8x8_modeinfo_cost_q8(&self, mi: &ModeInfo, mi_row: usize, mi_col: usize) -> u64 {
+        let above = self.above_mi(mi_row, mi_col);
+        let left = self.left_mi(mi_row, mi_col);
+        let bsize = mi.sb_type as usize;
+        let sctx = skip_context(above.as_ref(), left.as_ref());
+        let mut c = cost_bit(self.fc.skip_probs[sctx], mi.skip as u32);
+        let ictx = intra_inter_context(above.as_ref(), left.as_ref());
+        c += cost_bit(self.fc.intra_inter_prob[ictx], mi.is_inter as u32);
+        let ctx0 = single_ref_p1(above.as_ref(), left.as_ref());
+        c += cost_bit(self.fc.single_ref_prob[ctx0][0], 0); // LAST
+        let mctx = get_mode_context(
+            &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, bsize,
+        );
+        let num_4x4_w = 1usize << B_WIDTH_LOG2[bsize];
+        let num_4x4_h = 1usize << B_HEIGHT_LOG2[bsize];
+        let edges = self.block_edges(mi_row, mi_col, bsize);
+        let (cand, _) = find_mv_refs(
+            &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, bsize,
+            LAST_FRAME, &self.sign_bias, NEWMV, -1, edges, None,
+        );
+        let pred = lower_mv_precision(cand[0], false);
+        let mut idy = 0;
+        while idy < 2 {
+            let mut idx = 0;
+            while idx < 2 {
+                let j = idy * 2 + idx;
+                c += tree_bit_cost(
+                    &INTER_MODE_TREE,
+                    &self.fc.inter_mode_probs[mctx],
+                    (mi.bmi[j] - NEARESTMV) as i32,
+                );
+                if mi.bmi[j] == NEWMV {
+                    let dr = (mi.bmi_mv[j][0].0 - pred.0).unsigned_abs();
+                    let dc = (mi.bmi_mv[j][0].1 - pred.1).unsigned_abs();
+                    let bits = 10 + 2 * ((32 - dr.leading_zeros()) + (32 - dc.leading_zeros()));
+                    c += bits as u64 * 256;
+                }
+                idx += num_4x4_w;
+            }
+            idy += num_4x4_h;
+        }
+        c
+    }
+
+    /// Sub-8×8-aware inter leaf decision. At BLOCK_8X8 (when `sub8x8` is on) it RD-compares
+    /// PARTITION_NONE (8×8 `decide_inter`) against sub-8×8 SPLIT (`decide_sub8x8`) — each
+    /// measured with a rolled-back trial — then commits the winner with the caller's
+    /// `keep_recon` (a deterministic re-run that re-establishes the recon). Elsewhere it is
+    /// plain `decide_inter`. Returns `(mode_info, newmv_predictor, TOTAL bits_q8, sse)`.
+    #[allow(dead_code)]
+    fn decide_inter_leaf(
+        &mut self,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+        bwl: usize,
+        bhl: usize,
+        keep_recon: bool,
+    ) -> (ModeInfo, Mv, u64, u64) {
+        if bsize != BLOCK_8X8 || !self.sub8x8 {
+            let (mi, pred, coef, sse) =
+                self.decide_inter(mi_row, mi_col, bsize, bwl, bhl, keep_recon);
+            let bits = coef + self.inter_modeinfo_cost_q8(&mi, mi_row, mi_col, pred);
+            return (mi, pred, bits, sse);
+        }
+        let (mi_a, pred_a, coef_a, sse_a) =
+            self.decide_inter(mi_row, mi_col, bsize, bwl, bhl, false);
+        let bits_a = coef_a + self.inter_modeinfo_cost_q8(&mi_a, mi_row, mi_col, pred_a);
+        let j_a = sse_a as f64 + self.lambda * (bits_a as f64 / 256.0);
+        let (mi_b, coef_b, sse_b) = self.decide_sub8x8(mi_row, mi_col, BLOCK_4X4, bwl, bhl, false);
+        let bits_b = coef_b + self.sub8x8_modeinfo_cost_q8(&mi_b, mi_row, mi_col);
+        let j_b = sse_b as f64 + self.lambda * (bits_b as f64 / 256.0);
+        if j_b < j_a {
+            let (mi, coef, sse) = self.decide_sub8x8(mi_row, mi_col, BLOCK_4X4, bwl, bhl, keep_recon);
+            let bits = coef + self.sub8x8_modeinfo_cost_q8(&mi, mi_row, mi_col);
+            (mi, (0, 0), bits, sse)
+        } else {
+            let (mi, pred, coef, sse) =
+                self.decide_inter(mi_row, mi_col, bsize, bwl, bhl, keep_recon);
+            let bits = coef + self.inter_modeinfo_cost_q8(&mi, mi_row, mi_col, pred);
+            (mi, pred, bits, sse)
+        }
+    }
+
     /// RD cost of coding this block as a single (PARTITION_NONE) unit:
     /// `SSE + λ·(coef_bits + mode-info bits)`. Decides the modes, stores them,
     /// and leaves the block reconstructed into `rec` (so siblings predict from it).
@@ -1161,6 +1304,23 @@ impl FrameEncoder {
             self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, &start);
         }
 
+        // Sub-8×8 SPLIT at BLOCK_8X8: here PARTITION_SPLIT codes ONE sub-8×8 (BLOCK_4X4)
+        // leaf with per-4×4 modes (not a recursion — `can_split` is false at 8×8).
+        let mut sub_rd = f64::MAX;
+        let mut sub_snap = None;
+        if self.sub8x8 && self.is_inter && bsize == BLOCK_8X8 && full_fit {
+            let subsize = subsize(PARTITION_SPLIT, bsize) as usize; // BLOCK_4X4
+            let (mi, coef, sse) =
+                self.decide_sub8x8(mi_row, mi_col, subsize, n4x4_l2, n4x4_l2, true);
+            self.store_mi(mi_row, mi_col, n4x4_l2, n4x4_l2, &mi);
+            let bits = coef + self.sub8x8_modeinfo_cost_q8(&mi, mi_row, mi_col);
+            sub_rd = self.part_flag_cost(&probs, PARTITION_SPLIT, has_rows, has_cols)
+                + sse as f64
+                + self.lambda * (bits as f64 / 256.0);
+            sub_snap = Some(self.snap_block(mi_row, mi_col, n4x4_l2, n4x4_l2));
+            self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, &start);
+        }
+
         // NONE — code the whole block once (only when it fully fits the frame).
         let mut none_rd = f64::MAX;
         if full_fit {
@@ -1168,9 +1328,13 @@ impl FrameEncoder {
                 + self.rd_block_none(mi_row, mi_col, bsize, n4x4_l2, n4x4_l2);
         }
 
-        let choose_none = none_rd <= split_rd;
-        let (partition, cost) = if choose_none {
+        let best_split = split_rd.min(sub_rd);
+        let (partition, cost) = if none_rd <= best_split {
             (PARTITION_NONE, none_rd) // NONE's recon+context already in place
+        } else if sub_rd <= split_rd {
+            // Sub-8×8 SPLIT — restore its recon (a distinct SPLIT that codes a 4×4 leaf).
+            self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, sub_snap.as_ref().unwrap());
+            (PARTITION_SPLIT, sub_rd)
         } else {
             self.restore_block(
                 mi_row,
@@ -1234,13 +1398,42 @@ impl FrameEncoder {
         bwl: usize,
         bhl: usize,
     ) {
-        let (mi, predictor, _, _) = self.decide_inter(mi_row, mi_col, bsize, bwl, bhl, false);
+        // Sub-8×8 leaf (bsize<8×8, reached via SPLIT at BLOCK_8X8) decides per-4×4 modes;
+        // an 8×8+ block decides a single mode.
+        let (mi, predictor) = if bsize < BLOCK_8X8 {
+            let (m, _, _) = self.decide_sub8x8(mi_row, mi_col, bsize, bwl, bhl, false);
+            (m, (0i32, 0i32))
+        } else {
+            let (m, p, _, _) = self.decide_inter(mi_row, mi_col, bsize, bwl, bhl, false);
+            (m, p)
+        };
         let above = self.above_mi(mi_row, mi_col);
         let left = self.left_mi(mi_row, mi_col);
-        let max_tx = MAX_TXSIZE[bsize] as usize;
+        // Use the ACTUAL coded size (sub-8×8 sets sb_type<8×8): its max tx is 4×4, so
+        // tx_size is not coded, exactly as the decoder gates it.
+        let max_tx = MAX_TXSIZE[mi.sb_type as usize] as usize;
 
         // segment_id = 0 (no bits). skip, is_inter, tx_size (not coded when skipped).
         let sctx = skip_context(above.as_ref(), left.as_ref());
+        if std::env::var("VP9_INTERPROBE").is_ok() {
+            use std::sync::atomic::Ordering::Relaxed;
+            interprobe::BLOCKS.fetch_add(1, Relaxed);
+            if mi.skip {
+                interprobe::SKIP.fetch_add(1, Relaxed);
+            }
+            if !mi.is_inter {
+                interprobe::INTRA.fetch_add(1, Relaxed);
+            } else {
+                match mi.mode {
+                    ZEROMV => &interprobe::ZM,
+                    NEARESTMV => &interprobe::NST,
+                    NEARMV => &interprobe::NR,
+                    NEWMV => &interprobe::NW,
+                    _ => &interprobe::ZM,
+                }
+                .fetch_add(1, Relaxed);
+            }
+        }
         write_skip(enc, mi.skip, self.fc.skip_probs[sctx]);
         let ictx = intra_inter_context(above.as_ref(), left.as_ref());
         write_is_inter(enc, mi.is_inter, self.fc.intra_inter_prob[ictx]);
@@ -1260,20 +1453,45 @@ impl FrameEncoder {
                 self.fc.single_ref_prob[ctx0][0],
                 self.fc.single_ref_prob[ctx1][1],
             );
-            let mctx = get_mode_context(
-                &self.mi,
-                self.mi_cols,
-                self.mi_rows,
-                0,
-                self.mi_cols,
-                mi_row,
-                mi_col,
-                bsize,
-            );
-            write_inter_mode(enc, mi.mode, &self.fc.inter_mode_probs[mctx]);
-            if mi.mode == NEWMV {
-                let mut counts = NmvCounts::default();
-                encode_mv(enc, mi.mv[0], predictor, &self.fc.nmvc, false, &mut counts);
+            if (mi.sb_type as usize) < BLOCK_8X8 {
+                // Sub-8×8: per-4×4 mode + MV (NEWMV coded relative to the shared
+                // find_mv_refs(NEWMV) predictor). All sizes/contexts use the SUBSIZE
+                // (mi.sb_type), exactly as the decoder does.
+                let sub = mi.sb_type as usize;
+                let mctx = get_mode_context(
+                    &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, sub,
+                );
+                let edges = self.block_edges(mi_row, mi_col, sub);
+                let (cand, _) = find_mv_refs(
+                    &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, sub,
+                    mi.ref_frame[0], &self.sign_bias, NEWMV, -1, edges, None,
+                );
+                let pred = lower_mv_precision(cand[0], false);
+                let num_4x4_w = 1usize << B_WIDTH_LOG2[sub];
+                let num_4x4_h = 1usize << B_HEIGHT_LOG2[sub];
+                let mut idy = 0;
+                while idy < 2 {
+                    let mut idx = 0;
+                    while idx < 2 {
+                        let j = idy * 2 + idx;
+                        write_inter_mode(enc, mi.bmi[j], &self.fc.inter_mode_probs[mctx]);
+                        if mi.bmi[j] == NEWMV {
+                            let mut counts = NmvCounts::default();
+                            encode_mv(enc, mi.bmi_mv[j][0], pred, &self.fc.nmvc, false, &mut counts);
+                        }
+                        idx += num_4x4_w;
+                    }
+                    idy += num_4x4_h;
+                }
+            } else {
+                let mctx = get_mode_context(
+                    &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, bsize,
+                );
+                write_inter_mode(enc, mi.mode, &self.fc.inter_mode_probs[mctx]);
+                if mi.mode == NEWMV {
+                    let mut counts = NmvCounts::default();
+                    encode_mv(enc, mi.mv[0], predictor, &self.fc.nmvc, false, &mut counts);
+                }
             }
         } else {
             // Intra inside an inter frame: Y mode by block-size group, then UV.
@@ -1289,8 +1507,95 @@ impl FrameEncoder {
         // Skipped blocks emit no coefficients; `decide_inter` already left the
         // motion-compensated prediction (and zeroed entropy context) in place.
         if !mi.skip {
+            let probe = std::env::var("VP9_INTERPROBE").is_ok();
+            let before = if probe { enc.tell_bytes() } else { 0 };
             for plane in 0..3 {
-                self.encode_plane(Some(enc), &mi, plane, mi_row, mi_col, bsize, bwl, bhl);
+                // Coded size = sb_type (subsize for sub-8×8) so the residual (4×4 tx) and
+                // MC dispatch match the trial in decide_sub8x8.
+                self.encode_plane(Some(enc), &mi, plane, mi_row, mi_col, mi.sb_type as usize, bwl, bhl);
+            }
+            if probe {
+                use std::sync::atomic::Ordering::Relaxed;
+                interprobe::RESID.fetch_add((enc.tell_bytes() - before) as u64, Relaxed);
+            }
+        }
+    }
+
+    /// Sub-8×8 per-4×4 MV predictor — the exact inverse of the decoder's
+    /// `append_sub8x8_mvs` (decode.rs). For sub-block `block` (0..4) it derives the
+    /// NEAREST/NEAR candidate from the already-decided earlier sub-blocks' `bmi_mv`
+    /// and, when needed, a `find_mv_refs` scan at that sub-block index. Encoder uses
+    /// the single-tile range `0..mi_cols` and `None` temporal predictor (mirrors the
+    /// error-resilient decode path), so the candidate matches the decoder bit-exactly.
+    #[allow(clippy::too_many_arguments, dead_code)] // wired in sub-8×8 Part B
+    fn enc_sub8x8_mv(
+        &self,
+        mi: &ModeInfo,
+        b_mode: u8,
+        block: usize,
+        r: usize,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+        edges: (i32, i32, i32, i32),
+    ) -> Mv {
+        let frame = mi.ref_frame[r];
+        let find = |blk: i32| {
+            find_mv_refs(
+                &self.mi,
+                self.mi_cols,
+                self.mi_rows,
+                0,
+                self.mi_cols,
+                mi_row,
+                mi_col,
+                bsize,
+                frame,
+                &self.sign_bias,
+                b_mode,
+                blk,
+                edges,
+                None,
+            )
+        };
+        match block {
+            0 => {
+                let (list, count) = find(0);
+                list[count - 1]
+            }
+            1 | 2 => {
+                if b_mode == NEARESTMV {
+                    mi.bmi_mv[0][r]
+                } else {
+                    let (list, _) = find(block as i32);
+                    let mut res = (0, 0);
+                    for n in 0..2 {
+                        if mi.bmi_mv[0][r] != list[n] {
+                            res = list[n];
+                            break;
+                        }
+                    }
+                    res
+                }
+            }
+            _ => {
+                if b_mode == NEARESTMV {
+                    mi.bmi_mv[2][r]
+                } else if mi.bmi_mv[2][r] != mi.bmi_mv[1][r] {
+                    mi.bmi_mv[1][r]
+                } else if mi.bmi_mv[2][r] != mi.bmi_mv[0][r] {
+                    mi.bmi_mv[0][r]
+                } else {
+                    let (list, _) = find(block as i32);
+                    let mut res = (0, 0);
+                    for n in 0..2 {
+                        if mi.bmi_mv[2][r] != list[n] {
+                            res = list[n];
+                            break;
+                        }
+                    }
+                    res
+                }
             }
         }
     }
@@ -1330,6 +1635,26 @@ impl FrameEncoder {
         // frame, so this is overwritten at least once.
         let mut best_inter: (f64, usize, i8, u8, Mv, Mv) =
             (f64::INFINITY, 0, LAST_FRAME, ZEROMV, (0, 0), (0, 0));
+        // Accurate per-mode signalling cost (bits): the real inter-mode-tree cost at this
+        // block's mode context, replacing the old rough 4.0/16.0 constants so the mode
+        // search's RD matches what will actually be coded.
+        let mctx = get_mode_context(
+            &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, bsize,
+        );
+        let mode_bits = |m: u8| -> f64 {
+            tree_bit_cost(
+                &INTER_MODE_TREE,
+                &self.fc.inter_mode_probs[mctx],
+                (m - NEARESTMV) as i32,
+            ) as f64
+                / 256.0
+        };
+        let (c_zero, c_nearest, c_near, c_new) = (
+            mode_bits(ZEROMV),
+            mode_bits(NEARESTMV),
+            mode_bits(NEARMV),
+            mode_bits(NEWMV),
+        );
         for (slot, rf) in [(0usize, LAST_FRAME), (1, GOLDEN_FRAME), (2, ALTREF_FRAME)] {
             if self.refs[slot].is_none() {
                 continue;
@@ -1364,12 +1689,16 @@ impl FrameEncoder {
                 bwl,
                 bhl,
                 &snap,
-                4.0 + ref_bits,
+                c_zero + ref_bits,
             );
             if j_zero < best_inter.0 {
                 best_inter = (j_zero, slot, rf, ZEROMV, (0, 0), predictor);
             }
             if best_mv != (0, 0) {
+                let dr = (best_mv.0 - predictor.0).unsigned_abs();
+                let dc = (best_mv.1 - predictor.1).unsigned_abs();
+                let mvb =
+                    (10 + 2 * ((32 - dr.leading_zeros()) + (32 - dc.leading_zeros()))) as f64;
                 let j_new = self.rd_cost_y(
                     &mk_inter(rf, NEWMV, best_mv),
                     mi_row,
@@ -1378,10 +1707,67 @@ impl FrameEncoder {
                     bwl,
                     bhl,
                     &snap,
-                    16.0 + ref_bits,
+                    c_new + mvb + ref_bits,
                 );
                 if j_new < best_inter.0 {
                     best_inter = (j_new, slot, rf, NEWMV, best_mv, predictor);
+                }
+            }
+            // --- NEARESTMV / NEARMV: reuse a neighbour's MV for ZERO MV bits (only the
+            // mode symbol). This is the dominant libvpx win on coherent motion — where
+            // NEWMV pays a full MV diff, the predicted MV is free. The block's MV IS the
+            // candidate (no delta coded), so it must match the decoder's `find_mv_refs`
+            // exactly; we mirror the decoder's per-mode call. ---
+            // NEARESTMV uses the nearest candidate (`predictor` == cand[0]); skip when it
+            // degenerates to (0,0) since ZEROMV already covers that, cheaper.
+            if predictor != (0, 0) {
+                let j = self.rd_cost_y(
+                    &mk_inter(rf, NEARESTMV, predictor),
+                    mi_row,
+                    mi_col,
+                    bsize,
+                    bwl,
+                    bhl,
+                    &snap,
+                    c_nearest + ref_bits,
+                );
+                if j < best_inter.0 {
+                    best_inter = (j, slot, rf, NEARESTMV, predictor, predictor);
+                }
+            }
+            // NEARMV uses the DISTINCT second candidate (slot 1), which is only populated
+            // when find_mv_refs is called with NEARMV (early_break=false) — re-scan to
+            // match the decoder. Skip if it's zero or identical to nearest.
+            let (cand_near, _) = find_mv_refs(
+                &self.mi,
+                self.mi_cols,
+                self.mi_rows,
+                0,
+                self.mi_cols,
+                mi_row,
+                mi_col,
+                bsize,
+                rf,
+                &self.sign_bias,
+                NEARMV,
+                -1,
+                edges,
+                None,
+            );
+            let mv_near = lower_mv_precision(cand_near[1], false);
+            if mv_near != (0, 0) && mv_near != predictor {
+                let j = self.rd_cost_y(
+                    &mk_inter(rf, NEARMV, mv_near),
+                    mi_row,
+                    mi_col,
+                    bsize,
+                    bwl,
+                    bhl,
+                    &snap,
+                    c_near + ref_bits,
+                );
+                if j < best_inter.0 {
+                    best_inter = (j, slot, rf, NEARMV, mv_near, predictor);
                 }
             }
         }
@@ -1632,6 +2018,284 @@ impl FrameEncoder {
         );
     }
 
+    /// Sub-8×8 motion compensation for one plane — the exact inverse of the decoder's
+    /// `inter_predict_plane` sub-8×8 branch (non-scaled `mc_one`): MC each 4×4 sub-block
+    /// in raster order using `average_split_mvs` (luma = `bmi_mv[i]`; chroma = the 2/4-way
+    /// average), clamping each MV with the FULL block `bw/bh` (not the 4×4), exactly as the
+    /// decoder does. Single reference (`active_ref`), no compound — matches our P frames.
+    fn inter_predict_sub8x8(
+        &mut self,
+        plane: usize,
+        mi: &ModeInfo,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+        bwl: usize,
+        bhl: usize,
+    ) {
+        let (ss_x, ss_y) = (self.rec[plane].ss_x, self.rec[plane].ss_y);
+        let base_x = (mi_col * MI_SIZE) >> ss_x;
+        let base_y = (mi_row * MI_SIZE) >> ss_y;
+        let n4_w = (1usize << bwl) >> ss_x;
+        let n4_h = (1usize << bhl) >> ss_y;
+        let (bw, bh) = ((n4_w * 4) as i32, (n4_h * 4) as i32);
+        let edges = self.block_edges(mi_row, mi_col, bsize);
+        let stride = self.rec[plane].stride;
+        let rp = &self.refs[self.active_ref].as_ref().unwrap()[plane];
+        let refp = RefPlane {
+            buf: &rp.buf,
+            stride: rp.stride,
+            w: rp.w as i32,
+            h: rp.h as i32,
+        };
+        let mut i = 0;
+        for y in 0..n4_h {
+            for x in 0..n4_w {
+                let mv = average_split_mvs(mi, 0, i, ss_x, ss_y);
+                let mv_q4 = clamp_mv_umv(mv, bw, bh, ss_x, ss_y, edges);
+                let (dst_x, dst_y) = (base_x + x * 4, base_y + y * 4);
+                let bx = dst_x as i32 + (mv_q4.1 >> 4);
+                let by = dst_y as i32 + (mv_q4.0 >> 4);
+                let subpel_x = (mv_q4.1 & 15) as usize;
+                let subpel_y = (mv_q4.0 & 15) as usize;
+                let dst_off = dst_y * stride + dst_x;
+                predict_block(
+                    &refp,
+                    bx,
+                    by,
+                    subpel_x,
+                    subpel_y,
+                    self.interp_filter as usize,
+                    &mut self.rec[plane].buf[dst_off..],
+                    stride,
+                    4,
+                    4,
+                    false,
+                    self.max_px,
+                );
+                i += 1;
+            }
+        }
+    }
+
+    /// SAD of one 4×4 luma sub-block (at 4-pel offset `sub_x,sub_y` within the block)
+    /// against its motion-compensated prediction for `mv`, clamping with the full
+    /// block `bw/bh` exactly as `mc_one` does. Drives the sub-8×8 per-sub-block search.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    fn sub4x4_sad(
+        &self,
+        mi_row: usize,
+        mi_col: usize,
+        sub_x: usize,
+        sub_y: usize,
+        mv: Mv,
+        bw: i32,
+        bh: i32,
+        edges: (i32, i32, i32, i32),
+    ) -> i64 {
+        let base_x = mi_col * 8 + sub_x * 4;
+        let base_y = mi_row * 8 + sub_y * 4;
+        let mv_q4 = clamp_mv_umv(mv, bw, bh, 0, 0, edges);
+        let bx = base_x as i32 + (mv_q4.1 >> 4);
+        let by = base_y as i32 + (mv_q4.0 >> 4);
+        let rp = self.aref(0);
+        let refp = RefPlane {
+            buf: &rp.buf,
+            stride: rp.stride,
+            w: rp.w as i32,
+            h: rp.h as i32,
+        };
+        let mut pred = [0u16; 16];
+        predict_block(
+            &refp,
+            bx,
+            by,
+            (mv_q4.1 & 15) as usize,
+            (mv_q4.0 & 15) as usize,
+            self.interp_filter as usize,
+            &mut pred,
+            4,
+            4,
+            4,
+            false,
+            self.max_px,
+        );
+        let sp = &self.src[0];
+        let mut sad = 0i64;
+        for r in 0..4 {
+            for c in 0..4 {
+                let s = sp.buf[(base_y + r) * sp.stride + base_x + c] as i64;
+                sad += (s - pred[r * 4 + c] as i64).abs();
+            }
+        }
+        sad
+    }
+
+    /// Integer ±4 (around zero + `predictor`) then ¼-pel motion search for one 4×4
+    /// luma sub-block. Returns the best 1/8-pel MV.
+    #[allow(clippy::too_many_arguments, dead_code)]
+    fn search_mv_sub(
+        &self,
+        mi_row: usize,
+        mi_col: usize,
+        sub_x: usize,
+        sub_y: usize,
+        predictor: Mv,
+        bw: i32,
+        bh: i32,
+        edges: (i32, i32, i32, i32),
+    ) -> Mv {
+        const R: i32 = 4;
+        let mut best = (0i32, 0i32);
+        let mut best_sad = i64::MAX;
+        for &(cr, cc) in &[(0i32, 0i32), (predictor.0 / 8, predictor.1 / 8)] {
+            for dr in -R..=R {
+                for dc in -R..=R {
+                    let mv = ((cr + dr) * 8, (cc + dc) * 8);
+                    let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges);
+                    if sad < best_sad {
+                        best_sad = sad;
+                        best = mv;
+                    }
+                }
+            }
+        }
+        let int = best;
+        for dr in [-4i32, -2, 0, 2, 4] {
+            for dc in [-4i32, -2, 0, 2, 4] {
+                let mv = (int.0 + dr, int.1 + dc);
+                let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges);
+                if sad < best_sad {
+                    best_sad = sad;
+                    best = mv;
+                }
+            }
+        }
+        best
+    }
+
+    /// Sub-8×8 per-sub-block decision (Part B). For `subsize` (BLOCK_4X4/8X4/4X8) it
+    /// decides each 4×4 sub-block's inter mode + MV in raster order — mirroring the
+    /// decoder's `bmi`/`bmi_mv` fill so the reconstruction matches bit-exactly — using
+    /// `enc_sub8x8_mv` for the NEAREST/NEAR predictors (which read earlier sub-blocks)
+    /// and a per-sub-block search for NEWMV. Mode chosen by SAD + a NEWMV MV-bit penalty
+    /// (so free predicted MVs win on ties). Then reconstructs + costs the residual (4×4
+    /// tx) via `encode_plane`, which dispatches to `inter_predict_sub8x8`. Single ref
+    /// (LAST). Returns `(mode_info, coef_bits, sse)`.
+    fn decide_sub8x8(
+        &mut self,
+        mi_row: usize,
+        mi_col: usize,
+        subsize: usize,
+        bwl: usize,
+        bhl: usize,
+        keep_recon: bool,
+    ) -> (ModeInfo, u64, u64) {
+        let bsize = subsize;
+        let num_4x4_w = 1usize << B_WIDTH_LOG2[bsize];
+        let num_4x4_h = 1usize << B_HEIGHT_LOG2[bsize];
+        let edges = self.block_edges(mi_row, mi_col, bsize);
+        let (bw, bh) = (((1i32 << bwl) * 4), ((1i32 << bhl) * 4));
+        self.active_ref = 0;
+        let rf = LAST_FRAME;
+        // A NEWMV must beat a predicted mode by ~this SAD to justify its MV bits.
+        const NEWMV_SAD_PENALTY: i64 = 48;
+        let mut mi = ModeInfo {
+            sb_type: bsize as u8,
+            skip: false,
+            tx_size: 0,
+            is_inter: true,
+            ref_frame: [rf, NONE_FRAME],
+            interp_filter: self.interp_filter as u8,
+            ..Default::default()
+        };
+        let mut last_mode = ZEROMV;
+        let mut idy = 0;
+        while idy < 2 {
+            let mut idx = 0;
+            while idx < 2 {
+                let j = idy * 2 + idx;
+                // ZEROMV baseline.
+                let mut best_cost = self.sub4x4_sad(mi_row, mi_col, idx, idy, (0, 0), bw, bh, edges);
+                let mut best_mode = ZEROMV;
+                let mut best_mv = (0i32, 0i32);
+                // NEAREST / NEAR — free predicted MVs (no MV bits).
+                for m in [NEARESTMV, NEARMV] {
+                    let mv = lower_mv_precision(
+                        self.enc_sub8x8_mv(&mi, m, j, 0, mi_row, mi_col, bsize, edges),
+                        false,
+                    );
+                    let c = self.sub4x4_sad(mi_row, mi_col, idx, idy, mv, bw, bh, edges);
+                    if c < best_cost {
+                        best_cost = c;
+                        best_mode = m;
+                        best_mv = mv;
+                    }
+                }
+                // NEWMV — searched, charged the MV-bit penalty.
+                let (cand, _) = find_mv_refs(
+                    &self.mi,
+                    self.mi_cols,
+                    self.mi_rows,
+                    0,
+                    self.mi_cols,
+                    mi_row,
+                    mi_col,
+                    bsize,
+                    rf,
+                    &self.sign_bias,
+                    NEWMV,
+                    -1,
+                    edges,
+                    None,
+                );
+                let pred = lower_mv_precision(cand[0], false);
+                let mvw = self.search_mv_sub(mi_row, mi_col, idx, idy, pred, bw, bh, edges);
+                let cw = self.sub4x4_sad(mi_row, mi_col, idx, idy, mvw, bw, bh, edges)
+                    + NEWMV_SAD_PENALTY;
+                if cw < best_cost {
+                    best_mode = NEWMV;
+                    best_mv = mvw;
+                }
+                mi.bmi[j] = best_mode;
+                mi.bmi_mv[j] = [best_mv, (0, 0)];
+                if num_4x4_h == 2 {
+                    mi.bmi[j + 2] = best_mode;
+                    mi.bmi_mv[j + 2] = [best_mv, (0, 0)];
+                }
+                if num_4x4_w == 2 {
+                    mi.bmi[j + 1] = best_mode;
+                    mi.bmi_mv[j + 1] = [best_mv, (0, 0)];
+                }
+                last_mode = best_mode;
+                idx += num_4x4_w;
+            }
+            idy += num_4x4_h;
+        }
+        mi.mode = last_mode;
+        mi.mv = mi.bmi_mv[3];
+        // Residual trial (4×4 tx); encode_plane MCs via inter_predict_sub8x8. Same
+        // snap/keep_recon contract as decide_inter: skip keeps the MC-only recon; a
+        // non-skip block rolls back (emit re-reconstructs) unless the caller keeps it.
+        let start = self.snap_block(mi_row, mi_col, bwl, bhl);
+        self.pending_eob = 0;
+        self.skip_trial = true;
+        let (mut coef_bits, mut sse) = (0u64, 0u64);
+        for plane in 0..3 {
+            let (b, s) = self.encode_plane(None, &mi, plane, mi_row, mi_col, bsize, bwl, bhl);
+            coef_bits += b;
+            sse += s;
+        }
+        self.skip_trial = false;
+        mi.skip = self.pending_eob == 0;
+        if mi.skip {
+            coef_bits = 0;
+        } else if !keep_recon {
+            self.restore_block(mi_row, mi_col, bwl, bhl, &start);
+        }
+        (mi, coef_bits, sse)
+    }
+
     /// Pick the cheapest intra mode (SAD of source vs prediction) for a plane —
     /// evaluated once on the top-left transform block as a cheap proxy.
     fn best_intra_mode(
@@ -1759,8 +2423,13 @@ impl FrameEncoder {
         // Inter blocks: motion-compensate the whole coding block first; the
         // per-tx-block loop then only adds the residual. Intra blocks (key frame,
         // or an intra fallback inside a P frame) predict per tx block instead.
+        // Sub-8×8 blocks carry per-4×4 MVs (`bmi_mv`) and MC each sub-block separately.
         if mi.is_inter {
-            self.inter_predict_mv(plane, mi_row, mi_col, bsize, bwl, bhl, mi.mv[0]);
+            if (mi.sb_type as usize) < BLOCK_8X8 {
+                self.inter_predict_sub8x8(plane, mi, mi_row, mi_col, bsize, bwl, bhl);
+            } else {
+                self.inter_predict_mv(plane, mi_row, mi_col, bsize, bwl, bhl, mi.mv[0]);
+            }
         }
 
         let mut bits = 0u64;
