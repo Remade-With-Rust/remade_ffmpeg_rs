@@ -291,6 +291,11 @@ pub struct Vp9Encoder {
     arf_slot: usize,
     /// Frame dims of the current chain; a change forces a fresh key-started group.
     group_dims: Option<(u32, u32)>,
+    /// Encoder speed preset (`-cpu-used`/`-speed`, 0 = best quality/slowest .. 4 =
+    /// fastest). Higher levels progressively drop RD tools (sub-8×8, forward-prob
+    /// two-pass, trellis, tx-search) for a graceful quality→speed trade. See
+    /// [`FrameEncoder::set_speed`](super::frameenc::FrameEncoder::set_speed).
+    speed: u32,
 }
 
 impl Default for Vp9Encoder {
@@ -310,6 +315,7 @@ impl Default for Vp9Encoder {
             golden_slot: 1,
             arf_slot: 2,
             group_dims: None,
+            speed: 0,
         }
     }
 }
@@ -376,6 +382,16 @@ impl Encoder for Vp9Encoder {
             || options.get("twopass").map(|v| v.trim()) == Some("1")
         {
             self.twopass = true;
+        }
+        // Speed preset: `-cpu-used N` / `-speed N` (0 best..4 fastest), à la libvpx.
+        // Higher = progressively drop RD tools for a graceful quality→speed trade.
+        if let Some(sp) = options
+            .get("cpu-used")
+            .or_else(|| options.get("speed"))
+            .or_else(|| options.get("quality"))
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            self.speed = sp.min(4);
         }
         Ok(())
     }
@@ -494,6 +510,7 @@ impl Vp9Encoder {
         };
         let is_key = reference.is_none();
         let mut enc = FrameEncoder::new(w, h, qindex, coded, reference);
+        enc.set_speed(self.speed);
         if !is_key {
             if let Some((g, gw, gh)) = &self.golden {
                 if *gw == w && *gh == h {
@@ -649,6 +666,7 @@ impl Vp9Encoder {
     fn code_key_slotted(&mut self, coded: [Vec<u16>; 3], w: u32, h: u32) -> Vec<u8> {
         let q = self.next_qindex();
         let mut enc = FrameEncoder::new(w, h, q, coded, None);
+        enc.set_speed(self.speed);
         let bytes = enc.encode_frame();
         let recon = enc.recon_owned();
         self.slots = [Some(recon.clone()), Some(recon.clone()), Some(recon)];
@@ -661,6 +679,7 @@ impl Vp9Encoder {
         let q = self.next_qindex();
         let idx = [0, self.golden_slot, self.arf_slot];
         let mut enc = FrameEncoder::new(w, h, q, coded, self.slots[0].clone());
+        enc.set_speed(self.speed);
         enc.set_golden(self.slots[self.golden_slot].clone().unwrap());
         enc.set_ref_frame_idx(idx);
         enc.set_hidden_altref(self.arf_slot);
@@ -681,6 +700,7 @@ impl Vp9Encoder {
         let q = self.next_qindex();
         let idx = [0, self.golden_slot, self.arf_slot];
         let mut enc = FrameEncoder::new(w, h, q, coded, self.slots[0].clone());
+        enc.set_speed(self.speed);
         if self.slots[0].is_some() {
             enc.set_golden(self.slots[self.golden_slot].clone().unwrap());
             if with_altref {

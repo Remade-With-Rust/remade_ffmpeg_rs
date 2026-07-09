@@ -19,6 +19,7 @@ mod frameenc;
 mod header;
 mod intermode;
 mod mv;
+pub(crate) mod prof;
 mod prob;
 #[cfg(test)]
 mod quality;

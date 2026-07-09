@@ -31,6 +31,7 @@ use super::mv::encode_mv;
 use super::quantize::quantize;
 use super::syntax::{write_intra_mode, write_partition, write_selected_tx_size, write_skip};
 use super::tokens::{coef_cost, cost_bit, encode_coefs, tree_bit_cost};
+use super::prof;
 use super::transform::forward_transform;
 use crate::block::{
     kf_uv_mode_probs, kf_y_mode_probs, partition_plane_context, skip_context, subsize,
@@ -39,6 +40,12 @@ use crate::block::{
     INTRA_FRAME, INTRA_MODE_TREE, LAST_FRAME, NEARESTMV, NEARMV, NEWMV, NONE_FRAME, PARTITION_NONE,
     PARTITION_HORZ, PARTITION_SPLIT, PARTITION_TREE, PARTITION_VERT, ZEROMV,
 };
+use std::sync::atomic::AtomicU64;
+// VP9_PROF: cumulative wall-clock per encode stage (µs), summed across frames.
+static PROF_DECISION: AtomicU64 = AtomicU64::new(0);
+static PROF_EMIT1: AtomicU64 = AtomicU64::new(0);
+static PROF_EMIT2: AtomicU64 = AtomicU64::new(0);
+static PROF_HDR: AtomicU64 = AtomicU64::new(0);
 use crate::decode::{average_split_mvs, INTER_MODE_TREE};
 use crate::geom_tables::{B_HEIGHT_LOG2, B_WIDTH_LOG2};
 use crate::decode::{
@@ -168,6 +175,8 @@ pub struct FrameEncoder {
     /// Partition decision recorded by the RD pass, keyed by `(mi_row, mi_col,
     /// bsize)`; read by `encode_partition` during the emit pass(es).
     part_map: std::collections::HashMap<(usize, usize, usize), u8>,
+    /// AVX2 available (cached once; the SAD hot loop dispatches on it per call).
+    has_avx2: bool,
 }
 
 impl FrameEncoder {
@@ -269,7 +278,13 @@ impl FrameEncoder {
             lf_level: 0,
             counts: FrameCounts::zeroed(),
             commit_fc: None,
-            use_prob_updates: true,
+            // Forward coefficient-prob update (R4 "two-pass"): DEFAULT-OFF. Measured
+            // 2026-07-09 to INFLATE the bitstream 26–39% at identical PSNR (akiyo
+            // 29401→40980 B, foreman 97822→123387 B) — the delta-signalling / adaptation
+            // is net-harmful (a real bug: VP9's forward update must be RD-gated per prob,
+            // `savings>0`, or it costs more than it saves). Off is both smaller AND faster
+            // (skips the gather pass). Opt back in with `VP9_2PASS=1` for debugging the fix.
+            use_prob_updates: std::env::var("VP9_2PASS").is_ok(),
             // R5 AC deadzone: OFF (4 = round-to-nearest). It lowered the encoder's
             // own RD cost J ~1.6%, but the unbiased BD-rate oracle
             // (`encode::quality`) proved it's a **+1.66% LOSS** (sheds bitrate for
@@ -278,10 +293,10 @@ impl FrameEncoder {
             ac_round_num: 4,
             // R5 — ON: BD-rate oracle scores it −0.45% at the calibrated λ (a real
             // win; the same knob was a +40% catastrophe at the old too-high λ).
-            use_trellis: true,
+            use_trellis: std::env::var("VP9_NO_TRELLIS").is_err(),
             // Roof — ON: BD-rate oracle scores it −18% (an 8×8 transform decorrelates
             // smooth residual far better than four 4×4s — fewer bits AND higher PSNR).
-            use_tx_search: true,
+            use_tx_search: std::env::var("VP9_NO_TXSEARCH").is_err(),
             force_min_bsize: BLOCK_8X8, // only used when partition RD is off
             // Sub-8×8 (4×4/8×4/4×8) inter prediction: on by default (conformant, a BD-rate
             // win); `VP9_NO_SUB8X8` disables it (faster encode).
@@ -294,6 +309,16 @@ impl FrameEncoder {
             pending_eob: 0,
             skip_trial: false,
             part_map: std::collections::HashMap::new(),
+            has_avx2: {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    std::is_x86_feature_detected!("avx2")
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    false
+                }
+            },
         }
     }
 
@@ -401,6 +426,25 @@ impl FrameEncoder {
     #[cfg(test)]
     pub fn set_use_prob_updates(&mut self, v: bool) {
         self.use_prob_updates = v;
+    }
+
+    /// Apply an encoder speed preset (`-cpu-used`/`-speed`, 0 best..4 fastest) by
+    /// progressively dropping RD tools, in *worst time-per-bit-saved order first*
+    /// (measured by ablation on the Derf corpus). Level 0 is the quality anchor.
+    /// (The forward-prob two-pass is already default-off — it was a net loss — so it
+    /// is not part of the ladder.) Env `VP9_NO_*` overrides still apply on top.
+    pub fn set_speed(&mut self, speed: u32) {
+        if speed >= 1 {
+            self.sub8x8 = false; // ~25% of encode for ~2% of bits — the worst trade
+        }
+        if speed >= 2 {
+            self.use_tx_search = false; // fix the transform size (skip the per-block search)
+        }
+        if speed >= 3 {
+            self.use_trellis = false; // blind quantization, no per-coefficient RD
+        }
+        // speed 4 reserved for core-loop pruning (partition/mode early-exit) — a
+        // separate brick; today it behaves as speed 3.
     }
 
     /// Set the AC deadzone numerator (R5): 4 = round-to-nearest, 3 = deadzone.
@@ -586,6 +630,8 @@ impl FrameEncoder {
     /// Encode the frame and return the complete VP9 bitstream.
     pub fn encode_frame(&mut self) -> Vec<u8> {
         let defaults = FrameContext::defaults();
+        let _prof = std::env::var("VP9_PROF").is_ok();
+        let _t = std::time::Instant::now();
         if self.partition_rd_active() {
             // Choose every partition by RD first; the emit pass(es) below replay
             // the recorded decisions. Reset the recon the decision pass left behind.
@@ -594,6 +640,10 @@ impl FrameEncoder {
                 p.buf.iter_mut().for_each(|v| *v = 0);
             }
         }
+        if _prof {
+            PROF_DECISION.fetch_add(_t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _t = std::time::Instant::now();
         if self.use_prob_updates {
             // R4 pass 1: code with default probs to gather the committed token
             // counts, then forward-adapt the coefficient probs toward them.
@@ -618,6 +668,10 @@ impl FrameEncoder {
         } else {
             self.commit_fc = None;
         }
+        if _prof {
+            PROF_EMIT1.fetch_add(_t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _t = std::time::Instant::now();
         // Final (or only) pass: code with the adapted probs if set, else defaults.
         let tile = self.encode_tile();
         let mut target = self.commit_fc.take().unwrap_or_else(FrameContext::defaults);
@@ -626,6 +680,10 @@ impl FrameEncoder {
         }
         let tile_data = assemble_tiles(&[tile]);
 
+        if _prof {
+            PROF_EMIT2.fetch_add(_t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _t = std::time::Instant::now();
         // ---- compressed header: signal the coef deltas; deblock the recon (R3) ----
         let mut h = self.frame_header();
         self.apply_loop_filter(&mut h);
@@ -647,6 +705,25 @@ impl FrameEncoder {
         if frame.last().is_some_and(|&b| b & 0xe0 == 0xc0) {
             frame.push(0);
         }
+        if _prof {
+            use std::sync::atomic::Ordering::Relaxed;
+            PROF_HDR.fetch_add(_t.elapsed().as_micros() as u64, Relaxed);
+            let (d, e1, e2, hd) = (
+                PROF_DECISION.load(Relaxed),
+                PROF_EMIT1.load(Relaxed),
+                PROF_EMIT2.load(Relaxed),
+                PROF_HDR.load(Relaxed),
+            );
+            let tot = (d + e1 + e2 + hd).max(1);
+            eprintln!(
+                "VP9_PROF cum(ms): decision={:.0} ({:.0}%)  emit1_gather={:.0} ({:.0}%)  emit2_final={:.0} ({:.0}%)  hdr+lf={:.0} ({:.0}%)",
+                d as f64 / 1e3, d as f64 * 100.0 / tot as f64,
+                e1 as f64 / 1e3, e1 as f64 * 100.0 / tot as f64,
+                e2 as f64 / 1e3, e2 as f64 * 100.0 / tot as f64,
+                hd as f64 / 1e3, hd as f64 * 100.0 / tot as f64,
+            );
+        }
+        prof::dump();
         frame
     }
 
@@ -1759,6 +1836,19 @@ impl FrameEncoder {
         let src = &self.src[0];
         let rp = self.aref(0);
         let (rw, rh) = (rp.w as i32, rp.h as i32);
+        let x0 = base_x as i32 + mv_c;
+        let y0 = base_y as i32 + mv_r;
+        // Fast interior path: the whole 8×8 window is in-bounds, so the per-pixel
+        // clamp is a no-op — drop it. The branch-free inner loop auto-vectorizes,
+        // and this covers the vast majority of searches (only frame-edge blocks with
+        // a large MV fall to the clamped path). Byte-identical to the clamped loop.
+        if x0 >= 0 && y0 >= 0 && x0 + 8 <= rw && y0 + 8 <= rh {
+            let (x0, y0) = (x0 as usize, y0 as usize);
+            let s = &src.buf[(base_y * src.stride + base_x)..];
+            let r = &rp.buf[(y0 * rp.stride + x0)..];
+            return sad8x8(s, src.stride, r, rp.stride, self.has_avx2) as i64;
+        }
+        // Edge path: clamp each sample to the coded region (unchanged semantics).
         let mut sad = 0i64;
         for y in 0..8i32 {
             for x in 0..8i32 {
@@ -1790,20 +1880,23 @@ impl FrameEncoder {
             h: rp.h as i32,
         };
         let mut pred = [0u16; 64];
-        predict_block(
-            &refp,
-            bx,
-            by,
-            (mv_q4.1 & 15) as usize,
-            (mv_q4.0 & 15) as usize,
-            self.interp_filter as usize,
-            &mut pred,
-            8,
-            8,
-            8,
-            false,
-            self.max_px,
-        );
+        {
+            let _s = prof::Scope::new(prof::S::Interp);
+            predict_block(
+                &refp,
+                bx,
+                by,
+                (mv_q4.1 & 15) as usize,
+                (mv_q4.0 & 15) as usize,
+                self.interp_filter as usize,
+                &mut pred,
+                8,
+                8,
+                8,
+                false,
+                self.max_px,
+            );
+        }
         let src = &self.src[0];
         let mut sad = 0i64;
         for y in 0..8 {
@@ -1822,21 +1915,25 @@ impl FrameEncoder {
     /// Both whole-pixel and 1/4-pel MVs keep the difference vs the (even)
     /// predictor even, so the `!allow_high_precision_mv` "hp = 1" invariant holds.
     fn search_mv(&self, mi_row: usize, mi_col: usize, predictor: Mv) -> Mv {
+        let _s = prof::Scope::new(prof::S::MotionSearch);
         let base_x = mi_col * 8;
         let base_y = mi_row * 8;
         const RANGE: i32 = 8;
         let centers = [(0i32, 0i32), (predictor.0 / 8, predictor.1 / 8)];
         let mut best_px = (0i32, 0i32);
         let mut best_sad = i64::MAX;
-        for &(cr, cc) in &centers {
-            for dr in -RANGE..=RANGE {
-                for dc in -RANGE..=RANGE {
-                    let (r, c) = (cr + dr, cc + dc);
-                    let sad = self.block_sad(base_x, base_y, r, c);
-                    let shorter = r.abs() + c.abs() < best_px.0.abs() + best_px.1.abs();
-                    if sad < best_sad || (sad == best_sad && shorter) {
-                        best_sad = sad;
-                        best_px = (r, c);
+        {
+            let _s = prof::Scope::new(prof::S::IntSearch);
+            for &(cr, cc) in &centers {
+                for dr in -RANGE..=RANGE {
+                    for dc in -RANGE..=RANGE {
+                        let (r, c) = (cr + dr, cc + dc);
+                        let sad = self.block_sad(base_x, base_y, r, c);
+                        let shorter = r.abs() + c.abs() < best_px.0.abs() + best_px.1.abs();
+                        if sad < best_sad || (sad == best_sad && shorter) {
+                            best_sad = sad;
+                            best_px = (r, c);
+                        }
                     }
                 }
             }
@@ -1845,6 +1942,7 @@ impl FrameEncoder {
         // best lies within ±1/2 pel of the true minimum, so ±4 covers it.
         let int = (best_px.0 * 8, best_px.1 * 8);
         let mut best = int;
+        let _s = prof::Scope::new(prof::S::SubpelSearch);
         let mut best_sad = self.predicted_sad(mi_row, mi_col, int);
         for dr in [-4i32, -2, 0, 2, 4] {
             for dc in [-4i32, -2, 0, 2, 4] {
@@ -1876,6 +1974,7 @@ impl FrameEncoder {
         bhl: usize,
         mv: Mv,
     ) {
+        let _s = prof::Scope::new(prof::S::Mc);
         let (ss_x, ss_y) = (self.rec[plane].ss_x, self.rec[plane].ss_y);
         let base_x = (mi_col * MI_SIZE) >> ss_x;
         let base_y = (mi_row * MI_SIZE) >> ss_y;
@@ -1996,6 +2095,28 @@ impl FrameEncoder {
         let bx = base_x as i32 + (mv_q4.1 >> 4);
         let by = base_y as i32 + (mv_q4.0 >> 4);
         let rp = self.aref(0);
+        // Fast path: integer MV (no subpel fraction) + in-bounds 4×4 window → direct
+        // SAD, skipping the 8-tap `predict_block` (which for frac=0 is a plain copy).
+        // Byte-identical; covers the bulk of the integer search grid.
+        if (mv_q4.0 & 15) == 0
+            && (mv_q4.1 & 15) == 0
+            && bx >= 0
+            && by >= 0
+            && bx + 4 <= rp.w as i32
+            && by + 4 <= rp.h as i32
+        {
+            let (bx, by) = (bx as usize, by as usize);
+            let sp = &self.src[0];
+            let mut sad = 0i32;
+            for r in 0..4 {
+                let roff = (by + r) * rp.stride + bx;
+                let soff = (base_y + r) * sp.stride + base_x;
+                for c in 0..4 {
+                    sad += (sp.buf[soff + c] as i32 - rp.buf[roff + c] as i32).abs();
+                }
+            }
+            return sad as i64;
+        }
         let refp = RefPlane {
             buf: &rp.buf,
             stride: rp.stride,
@@ -2088,6 +2209,7 @@ impl FrameEncoder {
         bhl: usize,
         keep_recon: bool,
     ) -> (ModeInfo, u64, u64) {
+        let _s = prof::Scope::new(prof::S::Sub8x8);
         let bsize = subsize;
         let num_4x4_w = 1usize << B_WIDTH_LOG2[bsize];
         let num_4x4_h = 1usize << B_HEIGHT_LOG2[bsize];
@@ -2460,19 +2582,25 @@ impl FrameEncoder {
         let dq = if plane == 0 { self.dq_y } else { self.dq_uv };
         let dq_shift = if tx_size == 3 { 1 } else { 0 };
         let mut coeffs = [0i32; 1024];
-        forward_transform(&residual[..n], bs, tx_type, &mut coeffs[..n]);
+        {
+            let _s = prof::Scope::new(prof::S::FwdTx);
+            forward_transform(&residual[..n], bs, tx_type, &mut coeffs[..n]);
+        }
         let mut levels = [0i32; 1024];
         let mut dqcoeff = [0i32; 1024];
-        let mut eob = quantize(
-            &coeffs[..n],
-            scan,
-            dq.0,
-            dq.1,
-            dq.1 as i64 * self.ac_round_num / 8,
-            dq_shift,
-            &mut levels[..n],
-            &mut dqcoeff[..n],
-        );
+        let mut eob = {
+            let _s = prof::Scope::new(prof::S::Quantize);
+            quantize(
+                &coeffs[..n],
+                scan,
+                dq.0,
+                dq.1,
+                dq.1 as i64 * self.ac_round_num / 8,
+                dq_shift,
+                &mut levels[..n],
+                &mut dqcoeff[..n],
+            )
+        };
 
         // ---- entropy context, then encode the tokens ----
         let act = self.above_ctx[plane][above_col0 + col..above_col0 + col + txw]
@@ -2488,6 +2616,7 @@ impl FrameEncoder {
         // R5: trellis-style RD-optimal EOB on the commit path (uses the default
         // probs so the levels reproduce identically across the R4 two-pass).
         if (enc.is_some() || self.skip_trial) && self.use_trellis && eob > 0 {
+            let _s = prof::Scope::new(prof::S::Trellis);
             eob = self.trellis_eob(
                 &mut levels[..n],
                 &mut dqcoeff[..n],
@@ -2547,6 +2676,7 @@ impl FrameEncoder {
             0
         } else {
             // RDO trial: cost the exact same token walk (default probs) without emitting.
+            let _s = prof::Scope::new(prof::S::CoefCost);
             coef_cost(
                 &levels[..n],
                 scan,
@@ -2572,6 +2702,7 @@ impl FrameEncoder {
 
         // ---- reconstruct: add the dequantized residual back ----
         if eob > 0 {
+            let _s = prof::Scope::new(prof::S::InvTxRecon);
             let dst = &mut self.rec[plane].buf[dst_off..];
             if eob == 1 && tx_type == TxType::DctDct {
                 inverse_transform_dc_add(dqcoeff[0], bs, dst, stride, self.max_px);
@@ -2702,8 +2833,11 @@ impl FrameEncoder {
         // Full trellis: lower each surviving coefficient by one quantizer step wherever
         // the RD improves (level → level−1, and → 0 when it was ±1). This is the
         // interior-coefficient optimization the EOB trim misses and libvpx's optimize_b
-        // does — a single backward pass captures most of it. Re-dequantize the lowered
-        // level exactly as the decoder will (`(mag·step)>>dq_shift`) so recon stays exact.
+        // does — a single backward pass captures it: the RD cost is convex in the level
+        // (the quantizer already rounded to nearest, so level−1 is the only useful
+        // alternative), and iterating to convergence / multi-step lowering was measured
+        // byte-identical. Re-dequantize the lowered level exactly as the decoder will
+        // (`(mag·step)>>dq_shift`) so recon stays exact.
         let mut i = eob;
         while i > 0 {
             i -= 1;
@@ -2794,11 +2928,114 @@ impl FrameEncoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SAD kernel — the encoder's hottest primitive (integer motion search, ~half of
+// encode time). The scalar version is the oracle + the non-AVX2 fallback; the
+// AVX2 twin is bit-identical (integer ops only). See `codec-vectorize-kernel`.
+// ---------------------------------------------------------------------------
+
+/// Σ|src − ref| over an 8×8 block. `s`/`r` start at the block top-left; `ss`/`rs`
+/// are element strides. Scalar oracle. Values are 8-bit-in-`u16`, so the sum
+/// (≤ 64·65535) fits `u32`.
+#[inline]
+fn sad8x8_scalar(s: &[u16], ss: usize, r: &[u16], rs: usize) -> u32 {
+    let mut sad = 0u32;
+    for y in 0..8 {
+        let (so, ro) = (y * ss, y * rs);
+        for x in 0..8 {
+            sad += (s[so + x] as i32 - r[ro + x] as i32).unsigned_abs();
+        }
+    }
+    sad
+}
+
+/// AVX2 twin of [`sad8x8_scalar`], bit-identical. Two rows (16×`u16`) per
+/// iteration: `|a−b|` via a pair of saturating subtracts OR'd together, then
+/// `madd_epi16` with 1s horizontally sums each lane into `i32` accumulators
+/// (valid because every `|a−b| ≤ 255` here, well inside `i16`).
+///
+/// # Safety
+/// Requires AVX2. The caller passes an in-bounds interior window, so `s`/`r`
+/// have at least `7·stride + 8` elements (each `loadu` reads 8 `u16`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sad8x8_avx2(s: &[u16], ss: usize, r: &[u16], rs: usize) -> u32 {
+    use std::arch::x86_64::*;
+    let (sp, rp) = (s.as_ptr(), r.as_ptr());
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = _mm256_setzero_si256();
+    let mut y = 0usize;
+    while y < 8 {
+        let s0 = _mm_loadu_si128(sp.add(y * ss) as *const __m128i);
+        let s1 = _mm_loadu_si128(sp.add((y + 1) * ss) as *const __m128i);
+        let sa = _mm256_set_m128i(s1, s0);
+        let r0 = _mm_loadu_si128(rp.add(y * rs) as *const __m128i);
+        let r1 = _mm_loadu_si128(rp.add((y + 1) * rs) as *const __m128i);
+        let ra = _mm256_set_m128i(r1, r0);
+        let d = _mm256_or_si256(_mm256_subs_epu16(sa, ra), _mm256_subs_epu16(ra, sa));
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(d, ones));
+        y += 2;
+    }
+    // Horizontal sum of the 8 i32 lanes.
+    let lo = _mm256_castsi256_si128(acc);
+    let hi = _mm256_extracti128_si256::<1>(acc);
+    let mut t = _mm_add_epi32(lo, hi);
+    t = _mm_add_epi32(t, _mm_shuffle_epi32::<0b11_10_11_10>(t));
+    t = _mm_add_epi32(t, _mm_shuffle_epi32::<0b01_01_01_01>(t));
+    _mm_cvtsi128_si32(t) as u32
+}
+
+/// Dispatch: AVX2 when available (flag cached by the caller), else scalar.
+#[inline]
+fn sad8x8(s: &[u16], ss: usize, r: &[u16], rs: usize, has_avx2: bool) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2 {
+        // SAFETY: `has_avx2` proves the target feature; the window is in-bounds.
+        return unsafe { sad8x8_avx2(s, ss, r, rs) };
+    }
+    let _ = has_avx2;
+    sad8x8_scalar(s, ss, r, rs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rff_codec::Decoder;
     use rff_core::{CodecId, Frame, Packet};
+
+    /// The AVX2 SAD kernel must be bit-identical to the scalar oracle over many
+    /// random strided 8-bit blocks (the codec is 8-bit, values 0..=255).
+    #[test]
+    fn sad8x8_avx2_matches_scalar() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !std::is_x86_feature_detected!("avx2") {
+                return; // non-AVX2 CI host: scalar is the only path anyway.
+            }
+            let mut seed = 0x1234_5678_9abc_def0u64;
+            let mut xr = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            for _ in 0..4000 {
+                let ss = 8 + (xr() % 40) as usize;
+                let rs = 8 + (xr() % 40) as usize;
+                let mut s = vec![0u16; ss * 8];
+                let mut r = vec![0u16; rs * 8];
+                for v in s.iter_mut() {
+                    *v = (xr() % 256) as u16;
+                }
+                for v in r.iter_mut() {
+                    *v = (xr() % 256) as u16;
+                }
+                let a = sad8x8_scalar(&s, ss, &r, rs);
+                let b = unsafe { sad8x8_avx2(&s, ss, &r, rs) };
+                assert_eq!(a, b, "mismatch ss={ss} rs={rs}");
+            }
+        }
+    }
 
     /// C4 — "the house stands": encode a key frame, decode it with our own
     /// decoder, and assert the decoded pixels equal the encoder's reconstruction,
@@ -3415,7 +3652,12 @@ mod tests {
             off.set_use_prob_updates(false);
             total_off += off.encode_frame().len();
 
+            // Forward prob update is now default-OFF (it inflates inter frames — see the
+            // constructor note), so opt it back in explicitly: this test validates that
+            // when ENABLED it still shrinks this dense synthetic keyframe corpus and
+            // round-trips bit-exact (the regime where the feature is a genuine win).
             let mut on = FrameEncoder::new(w, h, 64, src, None);
+            on.set_use_prob_updates(true);
             let bytes = on.encode_frame();
             total_on += bytes.len();
             let rec: Vec<Vec<u16>> = on.recon().iter().map(|p| p.to_vec()).collect();
