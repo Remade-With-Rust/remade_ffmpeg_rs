@@ -69,6 +69,35 @@ fn ath_db(f: f32) -> f32 {
     3.64 * k.powf(-0.8) - 6.5 * (-0.6 * (k - 3.3).powi(2)).exp() + 1e-3 * k.powi(4)
 }
 
+/// **Prometheus telemetry hooks** (feature-gated, off by default — the whole
+/// module compiles out, so the production build is byte-identical). Exposes the
+/// psychoacoustic model's *signal-independent* curves so the private Prometheus
+/// refinery can harvest them and discover compact closed-form replacements. This
+/// is generic instrumentation: it only surfaces functions this file already
+/// computes, and reveals nothing about Prometheus itself. See
+/// `Prometheus/docs/telemetry-hooks.md`.
+#[cfg(feature = "prometheus-telemetry")]
+pub mod prometheus {
+    /// Schema version of these telemetry records; bump on any signature change.
+    pub const TELEMETRY_SCHEMA: u32 = 1;
+
+    /// Terhardt absolute threshold of hearing (dB SPL) at each frequency (Hz).
+    /// The canonical C1 discovery target: a 1-variable perceptual curve.
+    pub fn sample_ath(freqs_hz: &[f32]) -> Vec<f32> {
+        freqs_hz.iter().map(|&f| super::ath_db(f)).collect()
+    }
+
+    /// Schroeder spreading function (dB) at each Bark distance `dz`.
+    pub fn sample_spreading(dz: &[f32]) -> Vec<f32> {
+        dz.iter().map(|&d| super::spreading_db(d)).collect()
+    }
+
+    /// Bark-scale value at each frequency (Hz).
+    pub fn sample_bark(freqs_hz: &[f32]) -> Vec<f32> {
+        freqs_hz.iter().map(|&f| super::bark(f)).collect()
+    }
+}
+
 /// **SIMD-house masking brick:** the signal-INDEPENDENT band geometry, computed
 /// once per sample rate and cached. The Q3 masking loop used to recompute all of
 /// this — ~22×22 `spreading_db` (`sqrt`) + `powf`, plus per-band `bark`/`ath`
@@ -144,6 +173,11 @@ fn band_model(sample_rate: u32) -> &'static BandModel {
 /// valid Long/Start/Short/Stop sequence lives in `shortblock`.)
 pub fn detect_attack(pcm: &[f32]) -> bool {
     const BLOCKS: usize = 8;
+    // RATIO=10 is corpus-tuned (PEAQ, 2026-07-08): lowering it adds short blocks but
+    // does NOT help guitar transients (our short-block path uses flat scalefactors, so
+    // more short blocks trade pre-echo for worse steady-state noise) and REGRESSES
+    // piano (piano@320k −0.62→−0.87 at RATIO=4). Fix the short-block quantizer before
+    // touching this. See [[mp3-encoder-progress]].
     const RATIO: f32 = 10.0;
     let n = pcm.len().min(crate::frame::GRANULE_LINES);
     let bs = n / BLOCKS;

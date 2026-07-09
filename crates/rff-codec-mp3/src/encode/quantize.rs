@@ -77,12 +77,48 @@ pub(crate) fn level_from(powered: f64) -> i32 {
 /// hoisting the per-line `powf` out of the rate/distortion loops turns each later
 /// quantize pass into a multiply-and-round. (The two factor orders differ only by a
 /// last-ULP rounding, which the byte-identical-output gate verifies in practice.)
+///
+/// **Prometheus keeper `perf001`** (profiled: quantize = 62.7% of encode time;
+/// this `powf` is its hot transcendental). Strength reduction: `x^(3/4) = √(x·√x)`
+/// — two hardware `sqrt`s replace one libm `powf`, ~8× on this kernel at
+/// **byte-identical** quantizer output (1 ULP absorbed by integer rounding).
+///
+/// **`perf003` (AVX2 xrpow) — PRUNED 2026-07-08.** An explicit AVX2 twin of this
+/// loop was *not* faster (kernel micro-bench 0.97×; encode-level within noise),
+/// so it was reverted. The deep reason is what makes perf001 so good: unlike
+/// `powf` (no SIMD), `sqrt` is SSE2-baseline, so this scalar loop **already
+/// auto-vectorizes** — perf001 captured the SIMD win *implicitly*. And `sqrt`
+/// throughput does not scale with vector width (256-bit `sqrtpd` ≈ two 128-bit),
+/// so hand-written AVX2 adds nothing. (The AAC "auto-vec can't reach AVX2"
+/// caveat applies to `powf`, not `sqrt`.) Recorded in the Prometheus ledger.
 pub fn xrpow(freq: &[f32; GRANULE_LINES]) -> [f64; GRANULE_LINES] {
     let mut p = [0f64; GRANULE_LINES];
-    for (pi, &f) in p.iter_mut().zip(freq.iter()) {
-        *pi = (f.abs() as f64).powf(0.75);
+    if xrpow_use_powf() {
+        for (pi, &f) in p.iter_mut().zip(freq.iter()) {
+            *pi = (f.abs() as f64).powf(0.75); // the scalar `powf` oracle
+        }
+    } else {
+        for (pi, &f) in p.iter_mut().zip(freq.iter()) {
+            // x^0.75 = x^0.5 · x^0.25 = √(x·√x). 1 ULP vs powf, absorbed by the
+            // quantizer's integer rounding. `sqrt` is SSE2-baseline so this loop
+            // auto-vectorizes for free (see perf003 prune above).
+            let a = f.abs() as f64;
+            *pi = (a * a.sqrt()).sqrt();
+        }
     }
     p
+}
+
+/// Whether to use the original `powf` path (the oracle). Read once — an env
+/// lookup per granule would perturb the very timing this optimizes. Default is
+/// the fast `sqrt` identity; `RFF_MP3_XRPOW=powf` forces the oracle.
+fn xrpow_use_powf() -> bool {
+    static USE_POWF: OnceLock<bool> = OnceLock::new();
+    *USE_POWF.get_or_init(|| {
+        std::env::var("RFF_MP3_XRPOW")
+            .map(|v| v == "powf")
+            .unwrap_or(false)
+    })
 }
 
 /// One granule's quantized output.
@@ -134,6 +170,17 @@ fn quantize_with_sf(
         let s = if b < 21 { sf[b] } else { 0 } as f64; // band 21 is uncoded
                                                        // step = scale_inv^(3/4): the per-band factor applied to the precomputed
                                                        // |freq|^(3/4), instead of re-powering |freq|·scale_inv per line.
+                                                       //
+                                                       // Prometheus `perf002` (PRUNED 2026-07-08): factoring this into
+                                                       // `2^(0.75·base)·LUT[sf]` (per-band `powf`→LUT) was byte-identical but NOT
+                                                       // measurably faster (delta within run-to-run noise). Unlike xrpow's
+                                                       // `powf(0.75)` (arbitrary exponent → a real libm call → 8×), `2f64.powf(y)`
+                                                       // is base-2 and LLVM already lowers it to a fast `exp2` — so a LUT saves
+                                                       // nothing. Reverted; recorded in the Prometheus ledger.
+                                                       // VERIFIED 2026-07-08 at the asm level: rewriting these four base-2
+                                                       // `2f64.powf(x)` sites as explicit `x.exp2()` left the emitted call
+                                                       // counts identical (exp2=15/pow=10/powf=4 both ways) — the compiler
+                                                       // already does it, so `powf→exp2` is a genuine no-op. Don't re-try it.
         let step = 2f64.powf(0.75 * (base + SF_MULT * s));
         let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
         for i in lo..hi {
@@ -156,6 +203,8 @@ fn band_noise(
     let off = crate::tables::sfb_long_offsets(header.sample_rate);
     let mut noise = [0f32; 21];
     for (b, n) in noise.iter_mut().enumerate() {
+        // perf002 (pruned — see `quantize_with_sf`): base-2 `powf` LUT gave no
+        // measurable speedup; LLVM already lowers `2f64.powf` to `exp2`.
         let scale = 2f64.powf(0.25 * (gain - 210) as f64 - SF_MULT * sf[b] as f64);
         let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
         let mut e = 0f64;
@@ -204,8 +253,26 @@ fn huff_cost(
     super::huffman::select(header, coeffs, block_type)
 }
 
+/// The winning gain's quantization + Huffman selection, captured *during* the
+/// rate-loop search so [`loops`] need not recompute it (Prometheus `perf004`,
+/// redundancy move #3 — "stop recomputing what you already computed").
+struct InnerResult {
+    gain: i32,
+    coeffs: [i32; GRANULE_LINES],
+    side: GranuleSideInfo,
+}
+
 /// Inner rate loop: smallest `global_gain` (finest, best quality) that neither
 /// clips nor exceeds `huff_budget`, for the given scalefactors.
+///
+/// Also returns the quantization + Huffman side-info at the winning gain when it
+/// was produced by the search (the common case): the binary search evaluates the
+/// leftmost gain that fits, and that gain's `quantize_with_sf` + `huff_cost`
+/// (table selection, the expensive part) are exactly what `loops` would redo.
+/// The leftmost-fits gain is the *last* fits-true evaluation, so caching the
+/// last one captures the winner. `None` only in the rare cases where the winner
+/// was never evaluated as fitting (e.g. nothing fit, so `gain` saturates to 255
+/// unchecked) — then `loops` quantizes fresh, byte-identically.
 fn inner_gain(
     header: &FrameHeader,
     freq: &[f32; GRANULE_LINES],
@@ -213,22 +280,37 @@ fn inner_gain(
     sf: &[u8; 22],
     huff_budget: usize,
     block_type: BlockType,
-) -> i32 {
-    let ok = |g: i32| {
-        let coeffs = quantize_with_sf(header, freq, xrp, g, sf);
-        coeffs.iter().all(|&c| c.abs() <= MAX_UNCLIPPED)
-            && huff_cost(header, &coeffs, block_type).1 <= huff_budget
-    };
+) -> (i32, Option<InnerResult>) {
+    let mut cached: Option<InnerResult> = None;
     let (mut lo, mut hi) = (0i32, 255i32);
     while lo < hi {
         let mid = (lo + hi) / 2;
-        if ok(mid) {
+        let coeffs = quantize_with_sf(header, freq, xrp, mid, sf);
+        // Short-circuit: the cheap no-clip scan first; only then the costly
+        // `huff_cost` (table selection). Cache the fitting result (the last such
+        // is the leftmost-fits winner).
+        let fits = coeffs.iter().all(|&c| c.abs() <= MAX_UNCLIPPED) && {
+            let (side, bits) = huff_cost(header, &coeffs, block_type);
+            let fits = bits <= huff_budget;
+            if fits {
+                cached = Some(InnerResult {
+                    gain: mid,
+                    coeffs,
+                    side,
+                });
+            }
+            fits
+        };
+        if fits {
             hi = mid;
         } else {
             lo = mid + 1;
         }
     }
-    lo
+    // Keep the cache only if it is the winning gain (the invariant above); a
+    // mismatch (winner never evaluated as fitting) falls back to a fresh quantize.
+    let cached = cached.filter(|c| c.gain == lo);
+    (lo, cached)
 }
 
 /// **C2 + Q6 — the two-loop quantizer.** The inner loop ([`inner_gain`]) hits the
@@ -252,9 +334,17 @@ pub fn loops(
         let (compress, sf_bits) = choose_compress(&sf);
         let huff_budget = bit_budget.saturating_sub(sf_bits);
 
-        let gain = inner_gain(header, freq, &xrp, &sf, huff_budget, block_type);
-        let coeffs = quantize_with_sf(header, freq, &xrp, gain, &sf);
-        let (mut side, _) = huff_cost(header, &coeffs, block_type);
+        let (gain, inner) = inner_gain(header, freq, &xrp, &sf, huff_budget, block_type);
+        // Reuse the quantization + Huffman selection the rate loop already did at
+        // the winning gain (perf004); recompute only in the rare uncached case.
+        let (coeffs, mut side) = match inner {
+            Some(r) => (r.coeffs, r.side),
+            None => {
+                let coeffs = quantize_with_sf(header, freq, &xrp, gain, &sf);
+                let (side, _) = huff_cost(header, &coeffs, block_type);
+                (coeffs, side)
+            }
+        };
         side.global_gain = gain as u8;
         side.scalefac_compress = compress;
         let mut scalefactors = [0u8; 39];

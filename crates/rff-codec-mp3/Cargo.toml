@@ -13,6 +13,11 @@ rff-codec.workspace = true
 # The MP3 encoder experiment harness (brick registry, corpus, metrics, variant
 # sweeps). Opt-in — zero weight on the default build. See docs/mp3-lab.md.
 lab = []
+# Prometheus telemetry: expose the psychoacoustic model's signal-independent
+# curves (ATH, spreading, Bark) for offline formula discovery by the private
+# Prometheus refinery. Generic instrumentation — reveals nothing about
+# Prometheus; zero weight on the default build (the module compiles out).
+prometheus-telemetry = []
 
 [[example]]
 name = "mp3lab"
