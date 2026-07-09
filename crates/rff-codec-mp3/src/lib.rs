@@ -41,6 +41,16 @@ mod tables;
 #[cfg(feature = "lab")]
 pub mod lab;
 
+/// Prometheus telemetry hooks — samplers for the psychoacoustic model's
+/// signal-independent curves (ATH, spreading, Bark), for offline formula
+/// discovery by the private Prometheus refinery. Opt-in behind the
+/// `prometheus-telemetry` feature; the production build is byte-identical
+/// without it. See `Prometheus/docs/telemetry-hooks.md`.
+#[cfg(feature = "prometheus-telemetry")]
+pub mod prometheus_telemetry {
+    pub use crate::encode::psychoacoustic::prometheus::*;
+}
+
 pub use decode::Mp3Decode;
 pub use encode::Mp3Encode;
 use header::FrameHeader;
@@ -317,9 +327,26 @@ impl Encoder for Mp3Encoder {
         };
         if self.header.is_none() {
             self.header = Some(encoder_header(af.sample_rate, af.channels, self.cbr_kbps)?);
-            // 3R1: opt-in reservoir RD (CBR only). MP3_RESV_GAIN=0 ⇒ flat (neutral).
-            self.reservoir =
-                self.quality.is_none() && std::env::var("MP3_RESERVOIR").is_ok_and(|v| v != "0");
+            // 3R1 reservoir RD — DEFAULT ON for CBR ≤ 256 kbps (2026-07-08). Measured
+            // vs LAME on real music (guitar/piano, PEAQ): the bit reservoir closes the
+            // whole quality gap — e.g. guitar@128k −0.59→+0.04 (LAME +0.06), piano@128k
+            // −0.97→−0.13; +0.5–0.85 ODG across 96–256k, at parity with LAME. (It was
+            // gated OFF and mis-judged "does nothing" by prom_qual001 — but that verdict
+            // was measured on the SILENT encoder, before the s16-format fix.)
+            // ⚠ 320 kbps EXCLUDED: the reservoir assembly produces valid-but-garbled
+            // frames at the top bitrate (guitar@320k −0.85→−3.31) and the reservoir
+            // barely helps there anyway (little cross-frame headroom to redistribute).
+            // Known follow-up bug. `MP3_RESERVOIR=0` forces it off for A/B.
+            // ⚠ MPEG-1 (V1) ONLY: the assembler hardcodes the 9-bit `main_data_begin`
+            // (MAX_BEGIN=511); MPEG-2/2.5 use an 8-bit field (max 255) + 1 granule/frame,
+            // so the reservoir would corrupt LSF streams. V2/2.5 keep the fixed path.
+            let is_v1 = self.header.as_ref().unwrap().version == crate::header::MpegVersion::V1;
+            self.reservoir = self.quality.is_none()
+                && is_v1
+                && match std::env::var("MP3_RESERVOIR") {
+                    Ok(v) => v != "0",             // explicit override (still V1/CBR only)
+                    Err(_) => self.cbr_kbps <= 256, // default: on for common bitrates
+                };
             // gain 0.2 = the swept corpus optimum (mean ODG +0.029 vs flat, no clip
             // regressed); MP3_RESV_GAIN overrides (0 ⇒ flat, for the neutrality check).
             self.resv_gain = std::env::var("MP3_RESV_GAIN")
@@ -336,13 +363,37 @@ impl Encoder for Mp3Encoder {
         let nch = self.header.as_ref().unwrap().channel_mode.channels();
         let in_ch = (af.channels as usize).max(1);
         let data = &af.planes[0];
-        // Deinterleave; if the input has fewer channels than the output, replicate.
+        // Bytes per interleaved sample for the input's declared format. The PCM/WAV
+        // demuxer path delivers S16 (not F32), so we MUST honor `af.format` here —
+        // reading s16 bytes with an f32 stride yields denormal garbage (a silent
+        // encode). The unit tests only ever feed F32, which is why this slipped.
+        let bps = match af.format {
+            SampleFormat::F32 => 4,
+            SampleFormat::S16 => 2,
+            other => {
+                return Err(Error::unsupported(format!(
+                    "mp3 encode: sample format `{}` (need interleaved s16/f32)",
+                    other.name()
+                )))
+            }
+        };
+        // Deinterleave to f32; if the input has fewer channels than output, replicate.
         for s in 0..af.samples {
             for c in 0..nch {
                 let ic = c.min(in_ch - 1);
-                let off = (s * in_ch + ic) * 4;
-                let v = if off + 4 <= data.len() {
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                let off = (s * in_ch + ic) * bps;
+                let v = if off + bps <= data.len() {
+                    match af.format {
+                        SampleFormat::S16 => {
+                            i16::from_le_bytes([data[off], data[off + 1]]) as f32 / 32768.0
+                        }
+                        _ => f32::from_le_bytes([
+                            data[off],
+                            data[off + 1],
+                            data[off + 2],
+                            data[off + 3],
+                        ]),
+                    }
                 } else {
                     0.0
                 };
@@ -439,6 +490,51 @@ mod tests {
             mp3.extend_from_slice(&p.data);
         }
         mp3
+    }
+
+    /// Encode interleaved **S16** mono — the sample format the WAV/PCM demuxer
+    /// actually delivers (the encode tests otherwise only ever feed F32).
+    fn encode_mono_s16(input: &[i16], sample_rate: u32) -> Vec<u8> {
+        let bytes: Vec<u8> = input.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut enc = Mp3Encoder::default();
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            sample_rate,
+            channels: 1,
+            format: SampleFormat::S16,
+            planes: vec![bytes],
+            samples: input.len(),
+            pts: None,
+        }))
+        .unwrap();
+        enc.flush();
+        let mut mp3 = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            mp3.extend_from_slice(&p.data);
+        }
+        mp3
+    }
+
+    /// REGRESSION (silent-encode bug): `send_frame` must honor `af.format`. The
+    /// WAV/PCM demuxer delivers S16; reading those bytes with an F32 (4-byte)
+    /// stride over 2-byte samples yields denormal garbage → a full-size but
+    /// SILENT MP3 that every decoder reproduces as silence. Feed S16, require
+    /// audible output. (Brick tests all fed F32, so this class of bug slipped.)
+    #[test]
+    fn s16_input_encodes_to_audible_output() {
+        let sr = 44100u32;
+        let n = sr as usize; // 1 s
+        let s16: Vec<i16> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                (0.5 * (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 32767.0) as i16
+            })
+            .collect();
+        let out = decode_mono(encode_mono_s16(&s16, sr));
+        let rms = (out.iter().map(|x| x * x).sum::<f32>() / out.len().max(1) as f32).sqrt();
+        assert!(
+            rms > 0.1,
+            "S16 input produced near-silent output (rms={rms}); encoder ignored af.format"
+        );
     }
 
     /// Decode profiling driver (run explicitly): encode ~10 s of dense audio, then
