@@ -34,13 +34,6 @@ impl BoolEncoder {
         e
     }
 
-    /// Approximate output position in flushed bytes — for coarse per-category bit
-    /// accounting (the range coder buffers ~1 byte, so single-call deltas are ±1B,
-    /// but summed over a whole frame the category proportions are meaningful).
-    pub fn tell_bytes(&self) -> usize {
-        self.out.len()
-    }
-
     /// Encode one boolean `bit` (0/1) at probability `prob` (1..=255 of 256).
     /// Mirrors `BoolDecoder::read_bool` exactly, in reverse.
     pub fn write_bool(&mut self, bit: u32, prob: u8) {

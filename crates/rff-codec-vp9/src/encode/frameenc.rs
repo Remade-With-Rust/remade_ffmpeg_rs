@@ -41,18 +41,6 @@ use crate::block::{
 };
 use crate::decode::{average_split_mvs, INTER_MODE_TREE};
 use crate::geom_tables::{B_HEIGHT_LOG2, B_WIDTH_LOG2};
-/// Env-gated (`VP9_INTERPROBE`) per-P-frame inter-mode accountant — LOCATE cut 2.
-mod interprobe {
-    use std::sync::atomic::AtomicU64;
-    pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
-    pub static SKIP: AtomicU64 = AtomicU64::new(0);
-    pub static INTRA: AtomicU64 = AtomicU64::new(0);
-    pub static ZM: AtomicU64 = AtomicU64::new(0); // ZEROMV
-    pub static NST: AtomicU64 = AtomicU64::new(0); // NEARESTMV
-    pub static NR: AtomicU64 = AtomicU64::new(0); // NEARMV
-    pub static NW: AtomicU64 = AtomicU64::new(0); // NEWMV
-    pub static RESID: AtomicU64 = AtomicU64::new(0); // residual (coefficient) bytes
-}
 use crate::decode::{
     adapt_coef_probs, clamp_mv_umv, intra_inter_context, single_ref_p1, single_ref_p2, uv_tx_size,
     FrameContext, FrameCounts,
@@ -577,21 +565,6 @@ impl FrameEncoder {
     /// context) and return its bytes. Driven twice by `encode_frame` for R4.
     fn encode_tile(&mut self) -> Vec<u8> {
         let mut enc = BoolEncoder::new();
-        if std::env::var("VP9_INTERPROBE").is_ok() {
-            use std::sync::atomic::Ordering::Relaxed;
-            for s in [
-                &interprobe::BLOCKS,
-                &interprobe::SKIP,
-                &interprobe::INTRA,
-                &interprobe::ZM,
-                &interprobe::NST,
-                &interprobe::NR,
-                &interprobe::NW,
-                &interprobe::RESID,
-            ] {
-                s.store(0, Relaxed);
-            }
-        }
         for c in self.above_ctx.iter_mut() {
             c.iter_mut().for_each(|v| *v = 0);
         }
@@ -606,26 +579,6 @@ impl FrameEncoder {
                 mi_col += 8;
             }
             mi_row += 8;
-        }
-        if std::env::var("VP9_INTERPROBE").is_ok() {
-            use std::sync::atomic::Ordering::Relaxed;
-            let g = |s: &std::sync::atomic::AtomicU64| s.load(Relaxed);
-            let b = g(&interprobe::BLOCKS).max(1);
-            let total = enc.tell_bytes().max(1);
-            let resid = g(&interprobe::RESID);
-            eprintln!(
-                "[IMIX] blocks={} skip={:.0}% intra={:.0}% ZEROMV={:.0}% NEAREST={:.0}% NEAR={:.0}% NEWMV={:.0}% | resid={}B/{}B ({:.0}% of frame)",
-                b,
-                100.0 * g(&interprobe::SKIP) as f64 / b as f64,
-                100.0 * g(&interprobe::INTRA) as f64 / b as f64,
-                100.0 * g(&interprobe::ZM) as f64 / b as f64,
-                100.0 * g(&interprobe::NST) as f64 / b as f64,
-                100.0 * g(&interprobe::NR) as f64 / b as f64,
-                100.0 * g(&interprobe::NW) as f64 / b as f64,
-                resid,
-                total,
-                100.0 * resid as f64 / total as f64,
-            );
         }
         enc.finish()
     }
@@ -1083,46 +1036,6 @@ impl FrameEncoder {
         c
     }
 
-    /// Sub-8×8-aware inter leaf decision. At BLOCK_8X8 (when `sub8x8` is on) it RD-compares
-    /// PARTITION_NONE (8×8 `decide_inter`) against sub-8×8 SPLIT (`decide_sub8x8`) — each
-    /// measured with a rolled-back trial — then commits the winner with the caller's
-    /// `keep_recon` (a deterministic re-run that re-establishes the recon). Elsewhere it is
-    /// plain `decide_inter`. Returns `(mode_info, newmv_predictor, TOTAL bits_q8, sse)`.
-    #[allow(dead_code)]
-    fn decide_inter_leaf(
-        &mut self,
-        mi_row: usize,
-        mi_col: usize,
-        bsize: usize,
-        bwl: usize,
-        bhl: usize,
-        keep_recon: bool,
-    ) -> (ModeInfo, Mv, u64, u64) {
-        if bsize != BLOCK_8X8 || !self.sub8x8 {
-            let (mi, pred, coef, sse) =
-                self.decide_inter(mi_row, mi_col, bsize, bwl, bhl, keep_recon);
-            let bits = coef + self.inter_modeinfo_cost_q8(&mi, mi_row, mi_col, pred);
-            return (mi, pred, bits, sse);
-        }
-        let (mi_a, pred_a, coef_a, sse_a) =
-            self.decide_inter(mi_row, mi_col, bsize, bwl, bhl, false);
-        let bits_a = coef_a + self.inter_modeinfo_cost_q8(&mi_a, mi_row, mi_col, pred_a);
-        let j_a = sse_a as f64 + self.lambda * (bits_a as f64 / 256.0);
-        let (mi_b, coef_b, sse_b) = self.decide_sub8x8(mi_row, mi_col, BLOCK_4X4, bwl, bhl, false);
-        let bits_b = coef_b + self.sub8x8_modeinfo_cost_q8(&mi_b, mi_row, mi_col);
-        let j_b = sse_b as f64 + self.lambda * (bits_b as f64 / 256.0);
-        if j_b < j_a {
-            let (mi, coef, sse) = self.decide_sub8x8(mi_row, mi_col, BLOCK_4X4, bwl, bhl, keep_recon);
-            let bits = coef + self.sub8x8_modeinfo_cost_q8(&mi, mi_row, mi_col);
-            (mi, (0, 0), bits, sse)
-        } else {
-            let (mi, pred, coef, sse) =
-                self.decide_inter(mi_row, mi_col, bsize, bwl, bhl, keep_recon);
-            let bits = coef + self.inter_modeinfo_cost_q8(&mi, mi_row, mi_col, pred);
-            (mi, pred, bits, sse)
-        }
-    }
-
     /// RD cost of coding this block as a single (PARTITION_NONE) unit:
     /// `SSE + λ·(coef_bits + mode-info bits)`. Decides the modes, stores them,
     /// and leaves the block reconstructed into `rec` (so siblings predict from it).
@@ -1424,25 +1337,6 @@ impl FrameEncoder {
 
         // segment_id = 0 (no bits). skip, is_inter, tx_size (not coded when skipped).
         let sctx = skip_context(above.as_ref(), left.as_ref());
-        if std::env::var("VP9_INTERPROBE").is_ok() {
-            use std::sync::atomic::Ordering::Relaxed;
-            interprobe::BLOCKS.fetch_add(1, Relaxed);
-            if mi.skip {
-                interprobe::SKIP.fetch_add(1, Relaxed);
-            }
-            if !mi.is_inter {
-                interprobe::INTRA.fetch_add(1, Relaxed);
-            } else {
-                match mi.mode {
-                    ZEROMV => &interprobe::ZM,
-                    NEARESTMV => &interprobe::NST,
-                    NEARMV => &interprobe::NR,
-                    NEWMV => &interprobe::NW,
-                    _ => &interprobe::ZM,
-                }
-                .fetch_add(1, Relaxed);
-            }
-        }
         write_skip(enc, mi.skip, self.fc.skip_probs[sctx]);
         let ictx = intra_inter_context(above.as_ref(), left.as_ref());
         write_is_inter(enc, mi.is_inter, self.fc.intra_inter_prob[ictx]);
@@ -1516,16 +1410,10 @@ impl FrameEncoder {
         // Skipped blocks emit no coefficients; `decide_inter` already left the
         // motion-compensated prediction (and zeroed entropy context) in place.
         if !mi.skip {
-            let probe = std::env::var("VP9_INTERPROBE").is_ok();
-            let before = if probe { enc.tell_bytes() } else { 0 };
             for plane in 0..3 {
                 // Coded size = sb_type (subsize for sub-8×8) so the residual (4×4 tx) and
                 // MC dispatch match the trial in decide_sub8x8.
                 self.encode_plane(Some(enc), &mi, plane, mi_row, mi_col, mi.sb_type as usize, bwl, bhl);
-            }
-            if probe {
-                use std::sync::atomic::Ordering::Relaxed;
-                interprobe::RESID.fetch_add((enc.tell_bytes() - before) as u64, Relaxed);
             }
         }
     }
