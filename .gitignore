@@ -13,3 +13,10 @@ crates/rff-ui/dist/
 /PEAQ_python/
 __pycache__/
 *.pyc
+
+# Prometheus — private codec R&D refinery (local-only, never published)
+/Prometheus/
+/RDO experimental - scirs, oxieml.md
+
+# Local media corpora for quality campaigns (WAV/Y4M, tens of MB) — never published
+/corpus/
