@@ -277,6 +277,23 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
         return Err(Error::unsupported("no streams selected for the output"));
     }
 
+    // Raw-video containers (y4m) can't carry a compressed codec, so an unset `-c:v`
+    // must DECODE to rawvideo rather than stream-copy the source packets. Apply that
+    // default here (mirrors ffmpeg picking `rawvideo` for a .y4m output).
+    let mut output_owned;
+    let output = if output.video_codec.is_none()
+        && resolve_output_format(engine, output).ok().as_deref() == Some("yuv4mpegpipe")
+    {
+        output_owned = output.clone();
+        output_owned.video_codec = Some(StreamCodec {
+            codec: CodecId::RawVideo,
+            options: Dictionary::default(),
+        });
+        &output_owned
+    } else {
+        output
+    };
+
     // Per-input op tables (Skip for unselected streams) + ordered output streams.
     let mut per_input_ops: Vec<Vec<StreamOp>> = input_streams
         .iter()

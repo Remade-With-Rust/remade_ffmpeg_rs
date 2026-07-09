@@ -189,9 +189,9 @@ impl Muxer for Y4mMuxer {
             .first()
             .filter(|s| s.codec_id == CodecId::RawVideo)
             .ok_or_else(|| Error::unsupported("y4m mux: needs a single `rawvideo` stream"))?;
-        let format = s
-            .pixel_format
-            .ok_or_else(|| Error::invalid("y4m mux: stream is missing a pixel format"))?;
+        // A compressed source (e.g. VP9) leaves the stream's pixel_format unset; the
+        // decoded frames are 8-bit planar 4:2:0, so default to that.
+        let format = s.pixel_format.unwrap_or(PixelFormat::Yuv420p);
         let cs = match format {
             PixelFormat::Yuv420p => "420mpeg2",
             PixelFormat::Yuv422p => "422",
