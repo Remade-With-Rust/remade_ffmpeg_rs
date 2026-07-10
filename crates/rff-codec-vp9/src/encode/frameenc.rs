@@ -93,6 +93,7 @@ struct BlockSnap {
 }
 
 /// One reconstructed/source plane (coded size: `mi_*·8 >> ss`).
+#[derive(Clone)]
 struct Plane {
     buf: Vec<u16>,
     stride: usize,
@@ -103,6 +104,7 @@ struct Plane {
 }
 
 /// Intra key-frame encoder. Coordinates are in the coded grid (rounded up to 8).
+#[derive(Clone)]
 pub struct FrameEncoder {
     width: u32,
     height: u32,
@@ -213,6 +215,13 @@ pub struct FrameEncoder {
     subpel_fast: bool,
     /// `VP9_G1_HARVEST`: observe-only partition-gate telemetry (G1) to stderr.
     g1_harvest: bool,
+    /// Current tile's mi-column range (whole frame when single-tile). Entropy
+    /// contexts, MV refs, and left-availability are bounded by these, exactly
+    /// mirroring the decoder's `tile_col_start/end` (`tile_offset`).
+    tile_start: usize,
+    tile_end: usize,
+    /// log2 of tile columns (header `tile_cols_log2`); auto ≥16 SB cols → 2.
+    tile_cols_log2: u32,
     /// G1 partition gate (skip SPLIT/sub-8x8 when NONE's RD is below the discovered
     /// per-bsize threshold). `VP9_NO_G1GATE` disables (the exhaustive oracle).
     g1_gate: bool,
@@ -366,6 +375,19 @@ impl FrameEncoder {
                 .unwrap_or(64),
             subpel_fast: false,
             g1_harvest: std::env::var("VP9_G1_HARVEST").is_ok(),
+            tile_start: 0,
+            tile_end: mi_cols,
+            tile_cols_log2: {
+                let sb_cols = mi_cols.div_ceil(8);
+                let mut l2: u32 = std::env::var("VP9_TILE_COLS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(if sb_cols >= 16 { 2 } else { 0 });
+                while l2 > 0 && (sb_cols >> l2) < 4 {
+                    l2 -= 1; // spec: min tile width 4 SBs
+                }
+                l2
+            },
             g1_gate: std::env::var("VP9_NO_G1GATE").is_err(),
             g3_gate: std::env::var("VP9_G3GATE").is_ok(), // harvest-first: off by default
             g1_scale: 1.0,
@@ -681,23 +703,30 @@ impl FrameEncoder {
         (mi_row > 0).then(|| self.mi[(mi_row - 1) * self.mi_cols + mi_col])
     }
     fn left_mi(&self, mi_row: usize, mi_col: usize) -> Option<ModeInfo> {
-        (mi_col > 0).then(|| self.mi[mi_row * self.mi_cols + mi_col - 1])
+        (mi_col > self.tile_start).then(|| self.mi[mi_row * self.mi_cols + mi_col - 1])
     }
 
     /// Code the single tile over the whole frame (resetting the per-tile entropy
     /// context) and return its bytes. Driven twice by `encode_frame` for R4.
-    fn encode_tile(&mut self) -> Vec<u8> {
+    fn encode_tile(&mut self, tile_start: usize, tile_end: usize) -> Vec<u8> {
+        self.tile_start = tile_start;
+        self.tile_end = tile_end;
         let mut enc = BoolEncoder::new();
-        for c in self.above_ctx.iter_mut() {
-            c.iter_mut().for_each(|v| *v = 0);
+        for (p, c) in self.above_ctx.iter_mut().enumerate() {
+            let ss = (p > 0) as usize;
+            c[(tile_start * 2) >> ss..(tile_end * 2) >> ss]
+                .iter_mut()
+                .for_each(|v| *v = 0);
         }
-        self.above_seg.iter_mut().for_each(|v| *v = 0);
+        self.above_seg[tile_start..tile_end]
+            .iter_mut()
+            .for_each(|v| *v = 0);
         let mut mi_row = 0;
         while mi_row < self.mi_rows {
             self.left_seg = [0; 8];
             self.left_ctx = [[0; 16]; 3];
-            let mut mi_col = 0;
-            while mi_col < self.mi_cols {
+            let mut mi_col = tile_start;
+            while mi_col < tile_end {
                 self.encode_partition(&mut enc, mi_row, mi_col, BLOCK_64X64, 4);
                 mi_col += 8;
             }
@@ -784,7 +813,11 @@ impl FrameEncoder {
             // counts, then forward-adapt the coefficient probs toward them.
             self.counts = FrameCounts::zeroed();
             self.commit_fc = None;
-            let _ = self.encode_tile();
+            for t in 0..(1usize << self.tile_cols_log2) {
+                let ts = tile_offset_enc(t, self.mi_cols, self.tile_cols_log2);
+                let te = tile_offset_enc(t + 1, self.mi_cols, self.tile_cols_log2);
+                let _ = self.encode_tile(ts, te);
+            }
             let mut updated = FrameContext::defaults();
             adapt_coef_probs(
                 &mut updated,
@@ -814,12 +847,18 @@ impl FrameEncoder {
         }
         let _t = std::time::Instant::now();
         // Final (or only) pass: code with the adapted probs if set, else defaults.
-        let tile = self.encode_tile();
+        let tiles: Vec<Vec<u8>> = (0..(1usize << self.tile_cols_log2))
+            .map(|t| {
+                let ts = tile_offset_enc(t, self.mi_cols, self.tile_cols_log2);
+                let te = tile_offset_enc(t + 1, self.mi_cols, self.tile_cols_log2);
+                self.encode_tile(ts, te)
+            })
+            .collect();
         let mut target = self.commit_fc.take().unwrap_or_else(FrameContext::defaults);
         if self.use_tx_search {
             target.tx_mode = 4; // TX_MODE_SELECT — per-block tx_size is coded
         }
-        let tile_data = assemble_tiles(&[tile]);
+        let tile_data = assemble_tiles(&tiles);
 
         if _prof {
             PROF_EMIT2.fetch_add(_t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -899,7 +938,7 @@ impl FrameEncoder {
             lf_mode_deltas: [0, 0],
             seg_tree_probs: [255; 7],
             seg_pred_probs: [255; 3],
-            tile_cols_log2: 0,
+            tile_cols_log2: self.tile_cols_log2,
             tile_rows_log2: 0,
             sized: true,
             ..Default::default()
@@ -1174,8 +1213,8 @@ impl FrameEncoder {
                 &self.mi,
                 self.mi_cols,
                 self.mi_rows,
-                0,
-                self.mi_cols,
+                self.tile_start,
+                self.tile_end,
                 mi_row,
                 mi_col,
                 bsize,
@@ -1221,13 +1260,13 @@ impl FrameEncoder {
         let ctx0 = single_ref_p1(above.as_ref(), left.as_ref());
         c += cost_bit(self.fc.single_ref_prob[ctx0][0], 0); // LAST
         let mctx = get_mode_context(
-            &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, bsize,
+            &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, bsize,
         );
         let num_4x4_w = 1usize << B_WIDTH_LOG2[bsize];
         let num_4x4_h = 1usize << B_HEIGHT_LOG2[bsize];
         let edges = self.block_edges(mi_row, mi_col, bsize);
         let (cand, _) = find_mv_refs(
-            &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, bsize,
+            &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, bsize,
             LAST_FRAME, &self.sign_bias, NEWMV, -1, edges, None,
         );
         let pred = lower_mv_precision(cand[0], false);
@@ -1563,20 +1602,59 @@ impl FrameEncoder {
     fn run_partition_decision(&mut self) {
         self.part_map.clear();
         self.mode_map.clear();
-        for c in self.above_ctx.iter_mut() {
-            c.iter_mut().for_each(|v| *v = 0);
-        }
-        self.above_seg.iter_mut().for_each(|v| *v = 0);
-        let mut mi_row = 0;
-        while mi_row < self.mi_rows {
-            self.left_seg = [0; 8];
-            self.left_ctx = [[0; 16]; 3];
-            let mut mi_col = 0;
-            while mi_col < self.mi_cols {
-                self.rd_pick_partition(mi_row, mi_col, BLOCK_64X64, 4);
-                mi_col += 8;
+        let ntiles = 1usize << self.tile_cols_log2;
+        if ntiles > 1 {
+            // Tile columns are decision-independent (MC reads the reference frames,
+            // intra/contexts/MV-refs are tile-bounded), so the RD pass — 97% of
+            // encode — runs one clone per tile in parallel. Only the decision maps
+            // survive; the sequential emit replays them into the real state.
+            let decided = std::thread::scope(|sc| {
+                let handles: Vec<_> = (0..ntiles)
+                    .map(|t| {
+                        let mut worker = self.clone();
+                        sc.spawn(move || {
+                            worker.decide_tile(t);
+                            (worker.part_map, worker.mode_map)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("tile decision thread"))
+                    .collect::<Vec<_>>()
+            });
+            for (pm, mm) in decided {
+                self.part_map.extend(pm);
+                self.mode_map.extend(mm);
             }
-            mi_row += 8;
+            return;
+        }
+        self.decide_tile(0);
+    }
+
+    /// The RD decision pass over one tile column (`rd_pick_partition` per SB).
+    fn decide_tile(&mut self, t: usize) {
+        {
+            let ts = tile_offset_enc(t, self.mi_cols, self.tile_cols_log2);
+            let te = tile_offset_enc(t + 1, self.mi_cols, self.tile_cols_log2);
+            self.tile_start = ts;
+            self.tile_end = te;
+            for (p, c) in self.above_ctx.iter_mut().enumerate() {
+                let ss = (p > 0) as usize;
+                c[(ts * 2) >> ss..(te * 2) >> ss].iter_mut().for_each(|v| *v = 0);
+            }
+            self.above_seg[ts..te].iter_mut().for_each(|v| *v = 0);
+            let mut mi_row = 0;
+            while mi_row < self.mi_rows {
+                self.left_seg = [0; 8];
+                self.left_ctx = [[0; 16]; 3];
+                let mut mi_col = ts;
+                while mi_col < te {
+                    self.rd_pick_partition(mi_row, mi_col, BLOCK_64X64, 4);
+                    mi_col += 8;
+                }
+                mi_row += 8;
+            }
         }
     }
 
@@ -1671,11 +1749,11 @@ impl FrameEncoder {
                 // (mi.sb_type), exactly as the decoder does.
                 let sub = mi.sb_type as usize;
                 let mctx = get_mode_context(
-                    &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, sub,
+                    &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, sub,
                 );
                 let edges = self.block_edges(mi_row, mi_col, sub);
                 let (cand, _) = find_mv_refs(
-                    &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, sub,
+                    &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, sub,
                     mi.ref_frame[0], &self.sign_bias, NEWMV, -1, edges, None,
                 );
                 let pred = lower_mv_precision(cand[0], false);
@@ -1697,7 +1775,7 @@ impl FrameEncoder {
                 }
             } else {
                 let mctx = get_mode_context(
-                    &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, bsize,
+                    &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, bsize,
                 );
                 write_inter_mode(enc, mi.mode, &self.fc.inter_mode_probs[mctx]);
                 if mi.mode == NEWMV {
@@ -1751,8 +1829,8 @@ impl FrameEncoder {
                 &self.mi,
                 self.mi_cols,
                 self.mi_rows,
-                0,
-                self.mi_cols,
+                self.tile_start,
+                self.tile_end,
                 mi_row,
                 mi_col,
                 bsize,
@@ -1845,7 +1923,7 @@ impl FrameEncoder {
         // block's mode context, replacing the old rough 4.0/16.0 constants so the mode
         // search's RD matches what will actually be coded.
         let mctx = get_mode_context(
-            &self.mi, self.mi_cols, self.mi_rows, 0, self.mi_cols, mi_row, mi_col, bsize,
+            &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, bsize,
         );
         let mode_bits = |m: u8| -> f64 {
             tree_bit_cost(
@@ -1878,8 +1956,8 @@ impl FrameEncoder {
                 &self.mi,
                 self.mi_cols,
                 self.mi_rows,
-                0,
-                self.mi_cols,
+                self.tile_start,
+                self.tile_end,
                 mi_row,
                 mi_col,
                 bsize,
@@ -1956,8 +2034,8 @@ impl FrameEncoder {
                 &self.mi,
                 self.mi_cols,
                 self.mi_rows,
-                0,
-                self.mi_cols,
+                self.tile_start,
+                self.tile_end,
                 mi_row,
                 mi_col,
                 bsize,
@@ -2770,8 +2848,8 @@ impl FrameEncoder {
                     &self.mi,
                     self.mi_cols,
                     self.mi_rows,
-                    0,
-                    self.mi_cols,
+                    self.tile_start,
+                    self.tile_end,
                     mi_row,
                     mi_col,
                     bsize,
@@ -3446,6 +3524,12 @@ impl FrameEncoder {
             loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
         }
     }
+}
+
+/// Decoder's `tile_offset`, mirrored: mi-col start of tile `idx`.
+fn tile_offset_enc(idx: usize, mi_cols: usize, log2: u32) -> usize {
+    let sb_cols = mi_cols.div_ceil(8);
+    (((idx * sb_cols) >> log2) << 3).min(mi_cols)
 }
 
 // ---------------------------------------------------------------------------
