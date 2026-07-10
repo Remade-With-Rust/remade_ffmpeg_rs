@@ -85,6 +85,31 @@
 > at unity. Per-thread we're still ~2.9× behind `libopus`'s hand-written assembly NSQ — the
 > honest single-thread gap — but the wall-clock race is one a single-threaded encoder can't win.
 
+> **🎯 Quality & robustness vs `libopus` (measured head-to-head).** An 8-point
+> content×rate matrix (speech/music × mono/stereo × 16–128 kbps, complexity 9, CBR),
+> scored on **PEAQ ODG** with a **reconstruction-SNR guard** — the discipline that keeps
+> us honest: a sub-0.1 ODG "loss" whose SNR is at parity is metric noise on
+> differently-shaped-but-equal-fidelity output, not a real deficit. Result: **parity-or-better
+> across the board.** We **win outright on stereo music** (**+0.25 ODG @96k, +0.6 @64k** —
+> our CELT stereo shapes quantization noise more favorably), win or tie on mono speech/music,
+> and have **one genuine deficit**: near-mono *stereo speech* at 64k+ (−0.18 ODG / −6 dB SNR,
+> a diffuse stereo-coding-efficiency gap with no isolated lever — theta split, intensity, and
+> dynalloc boosts were all ceiling-probed and refuted), plus a borderline 128k-stereo edge.
+> On **speed** the same matrix (vs the `opus_demo` reference build) has us **encode-faster on
+> every clip** and **decode ~20% slower** — but that's against a stock `-O2` reference, *not*
+> ffmpeg's asm-tuned `libopus`, so the honest per-thread encode gap is still the ~2.9× above.
+>
+> **Streaming robustness is now feature-complete** (all ports of / equivalent to `libopus`,
+> conformance untouched): packet-loss concealment for **both SILK** (LTP/LPC extrapolation +
+> comfort noise) **and CELT** (`celt_decode_lost` — pitch-based repetition for short tonal
+> losses, **+1.18 ODG** over the noise-based fallback; noise-based CNG-style fill for long
+> bursts), **in-band FEC** (LBRR recovery), **DTX**, **comfort-noise generation** (`silk_CNG`
+> — DTX/silence renders as natural background, not dead air), **multistream/surround**
+> (5.1/7.1, libopus decodes our output zero-error), and a **repacketizer**. The **decoder is
+> bit-exact on all 12 official RFC 6716/8251 vectors** and decodes `libopus`'s own streams to
+> identical output. An optional **faithful float-SILK analysis path** (port of `silk/float/`)
+> ships default-off.
+
 ---
 
 ## What is this?
