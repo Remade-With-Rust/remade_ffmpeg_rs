@@ -198,7 +198,8 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             // Rate control / tuning (video by default; `:a` targets audio):
             // -crf / -qp / -q / -qscale (quality), -preset (speed<->quality), -pass (1|2),
             // -cpu-used / -speed (VP9 speed preset 0 best..4 fastest).
-            "crf" | "qp" | "preset" | "pass" | "q" | "qscale" | "cpu-used" | "speed" => {
+            "crf" | "qp" | "preset" | "pass" | "q" | "qscale" | "cpu-used" | "speed"
+            | "lag" | "lag-in-frames" | "arnr-strength" => {
                 let value = take_value(args, &mut i, arg)?;
                 if base == "pass" && value != "1" {
                     warnings
