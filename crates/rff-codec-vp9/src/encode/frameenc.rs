@@ -218,6 +218,9 @@ pub struct FrameEncoder {
     g1_gate: bool,
     /// G3 ref shortlist (skip GOLDEN/ALTREF when LAST's J is below threshold).
     g3_gate: bool,
+    /// G1 threshold scale — 1.0 at speed 0; presets raise it (a speed/BD trade
+    /// the G2 sweep mapped: bumps help motion clips, cost static ones).
+    g1_scale: f64,
 }
 
 impl FrameEncoder {
@@ -365,6 +368,7 @@ impl FrameEncoder {
             g1_harvest: std::env::var("VP9_G1_HARVEST").is_ok(),
             g1_gate: std::env::var("VP9_NO_G1GATE").is_err(),
             g3_gate: std::env::var("VP9_G3GATE").is_ok(), // harvest-first: off by default
+            g1_scale: 1.0,
             has_avx2: {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -494,10 +498,12 @@ impl FrameEncoder {
             self.sub8x8 = false; // ~25% of encode for ~2% of bits — the worst trade
             self.full_msearch = false; // diamond search: ~1.2× for +2% BD-rate
             self.subpel_fast = true; // iterative ¼-pel refinement (≤ ~10 vs 24 scores)
+            self.g1_scale = 2.0; // partition gate ×2 (swept: ~50% 8×8 skip, 92%+ gain kept)
         }
         if speed >= 2 {
             self.use_tx_search = false; // fix the transform size (skip the per-block search)
             self.use_prob_updates = false; // skip the token-count gather pass
+            self.g1_scale = 4.0; // partition gate ×4
         }
         if speed >= 3 {
             self.use_trellis = false; // blind quantization, no per-coefficient RD
@@ -1438,12 +1444,13 @@ impl FrameEncoder {
         let g1_skip = self.g1_gate
             && none_rd < f64::MAX
             && none_rd / self.lambda
-                < match bsize {
-                    BLOCK_8X8 => 18.0, // G2 bump to 33 REVERTED: +0.16% BD for ~1% speed (weak trade)
-                    6 => 64.0,  // 16x16
-                    9 => 280.0, // 32x32
-                    _ => 0.0,   // 64x64: never skip
-                };
+                < self.g1_scale
+                    * match bsize {
+                        BLOCK_8X8 => 18.0, // bump to 33 at speed 0 was a weak trade (+0.16% BD)
+                        6 => 64.0,  // 16x16
+                        9 => 280.0, // 32x32
+                        _ => 0.0,   // 64x64: never skip
+                    };
 
         // SPLIT — recurse into four quadrants (each leaves its own recon+context).
         let mut split_rd = f64::MAX;
