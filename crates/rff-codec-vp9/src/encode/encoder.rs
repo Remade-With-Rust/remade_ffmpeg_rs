@@ -301,6 +301,9 @@ pub struct Vp9Encoder {
     chain_prev_p: bool,
     /// Active while coding an ALT-REF group with chaining on.
     group_chain: bool,
+    /// Active during two-pass PASS 2: chaining engages (pass 1 is a throwaway
+    /// probe that must not touch the companion).
+    pass2_chaining: bool,
     /// ARF q scale (`VP9_ARF_QSCALE`): the hidden ALT-REF is a long-term reference,
     /// so libvpx codes it at LOWER q (higher quality) — the extra bits pay off across
     /// every P frame that predicts from it. 1.0 = code at the frame q (the old,
@@ -335,6 +338,7 @@ impl Default for Vp9Encoder {
             companion: None,
             chain_prev_p: false,
             group_chain: false,
+            pass2_chaining: false,
             // 0.5 = the ARF q-boost (measured -8.87% BD vs plain IPPP on 1080p
             // motion). 1.0 restores the old un-boosted, net-loss ARF.
             arf_qscale: std::env::var("VP9_ARF_QSCALE")
@@ -536,7 +540,7 @@ impl Vp9Encoder {
         let is_key = reference.is_none();
         let mut enc = FrameEncoder::new(w, h, qindex, coded, reference);
         enc.set_speed(self.speed);
-        let chaining = self.chain && self.lag == 0 && !self.twopass;
+        let chaining = self.chain && ((self.lag == 0 && !self.twopass) || self.pass2_chaining);
         if chaining && !is_key {
             if let Some(c) = &self.companion {
                 let mvs = if self.chain_prev_p {
@@ -627,14 +631,20 @@ impl Vp9Encoder {
             );
         }
 
-        // Pass 2: emit at the derived qindex (fresh reference chain).
+        // Pass 2: emit at the derived qindex (fresh reference chain). Context
+        // chaining engages here (pass 1 was a throwaway probe): fresh companion,
+        // each frame coded against the previous frame's adapted context/MVs.
         self.reference = None;
         self.golden = None;
+        self.companion = None;
+        self.chain_prev_p = false;
+        self.pass2_chaining = self.chain;
         for (i, (c, w, h)) in frames.into_iter().enumerate() {
             let q = if i == 0 { q_key } else { q_inter };
             let b = self.code_frame_q(c, w, h, None, q);
             self.packets.push_back(Packet::from_data(0, b));
         }
+        self.pass2_chaining = false;
     }
 
     /// Code a display-order group as an ALT-REF GOP. The **first** group is key-started
