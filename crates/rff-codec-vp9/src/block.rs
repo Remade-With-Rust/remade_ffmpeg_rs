@@ -72,7 +72,7 @@ pub const ZEROMV: u8 = 12;
 pub const NEWMV: u8 = 13;
 
 /// Per-block mode information (intra key-frame *and* inter).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModeInfo {
     pub sb_type: u8,  // BLOCK_SIZE
     pub mode: u8,     // block Y mode (or inter mode ≥ NEARESTMV)
