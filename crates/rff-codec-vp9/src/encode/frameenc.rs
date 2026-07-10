@@ -2290,6 +2290,12 @@ impl FrameEncoder {
             }
         };
         let mut best_sad = score(int);
+        // Provable skip: subpel SAD >= 0 and ties break toward the shorter MV
+        // (the integer candidate), so nothing can beat a perfect integer match.
+        if best_sad == 0 {
+            self.mv_memo.borrow_mut().insert(key, int);
+            return int;
+        }
         if self.subpel_fast {
             // Preset lever: iterative diamond at ½- then ¼-pel (≤ ~10 scores vs 24).
             for step in [4i32, 2] {
