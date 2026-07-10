@@ -55,7 +55,7 @@ use crate::decode::{
 use crate::geom_tables::{MAX_TXSIZE, SIZE_GROUP};
 use crate::inter::{predict_block, RefPlane};
 use crate::loopfilter::loop_filter_frame;
-use crate::mv::{find_mv_refs, get_mode_context, lower_mv_precision, NmvCounts};
+use crate::mv::{find_mv_refs, get_mode_context, lower_mv_precision, MvRef, NmvCounts};
 use crate::predict::{build_intra_edges, predict};
 use crate::prob_tables::{DEFAULT_COEF_PROBS, KF_PARTITION_PROBS};
 use crate::quant::{ac_quant, dc_quant};
@@ -222,6 +222,12 @@ pub struct FrameEncoder {
     tile_end: usize,
     /// log2 of tile columns (header `tile_cols_log2`); auto ≥16 SB cols → 2.
     tile_cols_log2: u32,
+    /// F3 context chaining: code this frame against the (companion-decoder
+    /// adapted) previous context instead of defaults, with temporal MV
+    /// prediction — `error_resilient=0`, mirroring the decoder's rules.
+    chain: bool,
+    /// Previous frame's per-mi motion records (temporal MV candidates).
+    prev_mvs: Option<std::sync::Arc<Vec<MvRef>>>,
     /// G1 partition gate (skip SPLIT/sub-8x8 when NONE's RD is below the discovered
     /// per-bsize threshold). `VP9_NO_G1GATE` disables (the exhaustive oracle).
     g1_gate: bool,
@@ -377,6 +383,8 @@ impl FrameEncoder {
             g1_harvest: std::env::var("VP9_G1_HARVEST").is_ok(),
             tile_start: 0,
             tile_end: mi_cols,
+            chain: false,
+            prev_mvs: None,
             tile_cols_log2: {
                 let sb_cols = mi_cols.div_ceil(8);
                 let mut l2: u32 = std::env::var("VP9_TILE_COLS")
@@ -502,6 +510,26 @@ impl FrameEncoder {
     #[cfg(test)]
     pub fn lf_level(&self) -> u32 {
         self.lf_level
+    }
+
+    /// F3: chain this frame onto `fc` (the decoder's adapted context) with the
+    /// previous frame's MV records for temporal prediction (None when the
+    /// previous frame was a key/none — mirroring the decoder's `use_prev_mvs`).
+    pub fn set_chain(
+        &mut self,
+        fc: FrameContext,
+        prev_mvs: Option<std::sync::Arc<Vec<MvRef>>>,
+    ) {
+        self.fc = fc;
+        self.prev_mvs = prev_mvs;
+        self.chain = true;
+    }
+
+    /// The previous frame's MV record at this mi position (decoder's `prev_mv`).
+    fn prev_mv(&self, mi_row: usize, mi_col: usize) -> Option<&MvRef> {
+        self.prev_mvs
+            .as_ref()
+            .map(|g| &g[mi_row * self.mi_cols + mi_col])
     }
 
     /// Toggle R4 forward coefficient-probability updates (default on).
@@ -793,7 +821,7 @@ impl FrameEncoder {
 
     /// Encode the frame and return the complete VP9 bitstream.
     pub fn encode_frame(&mut self) -> Vec<u8> {
-        let defaults = FrameContext::defaults();
+        let initial = self.fc.clone();
         let _prof = std::env::var("VP9_PROF").is_ok();
         let _t = std::time::Instant::now();
         if self.partition_rd_active() {
@@ -818,10 +846,10 @@ impl FrameEncoder {
                 let te = tile_offset_enc(t + 1, self.mi_cols, self.tile_cols_log2);
                 let _ = self.encode_tile(ts, te);
             }
-            let mut updated = FrameContext::defaults();
+            let mut updated = initial.clone();
             adapt_coef_probs(
                 &mut updated,
-                &defaults,
+                &initial,
                 &self.counts,
                 COEF_COUNT_SAT,
                 COEF_MAX_UPDATE_FACTOR,
@@ -831,7 +859,7 @@ impl FrameEncoder {
             // signal. Unconditional adaptation measured a 20–28% INFLATION on inter
             // frames (sparse residual: hundreds of subexp deltas, each saving <1
             // token bit); gating reverts those while keeping the dense-keyframe wins.
-            self.rd_gate_coef_update(&defaults, &mut updated);
+            self.rd_gate_coef_update(&initial, &mut updated);
             // RDO scores against the *default* probs, so pass 2 reproduces every
             // decision, level, and reconstructed pixel exactly — only the emitted
             // tokens (and the signalled probs) change. Reset the recon for it.
@@ -854,7 +882,7 @@ impl FrameEncoder {
                 self.encode_tile(ts, te)
             })
             .collect();
-        let mut target = self.commit_fc.take().unwrap_or_else(FrameContext::defaults);
+        let mut target = self.commit_fc.take().unwrap_or_else(|| initial.clone());
         if self.use_tx_search {
             target.tx_mode = 4; // TX_MODE_SELECT — per-block tx_size is coded
         }
@@ -868,7 +896,7 @@ impl FrameEncoder {
         let mut h = self.frame_header();
         self.apply_loop_filter(&mut h);
         let mut cenc = BoolEncoder::new();
-        write_compressed_header(&mut cenc, &defaults, &target, &h);
+        write_compressed_header(&mut cenc, &initial, &target, &h);
         let compressed = cenc.finish();
 
         // ---- uncompressed header (header_size now known) ----
@@ -961,7 +989,14 @@ impl FrameEncoder {
             // forward-signal prob deltas), and codes every frame against the default
             // context. Without it a conformant decoder would use the previous P
             // frame's MVs as temporal candidates and diverge from frame 2 onward.
-            h.error_resilient = true;
+            h.error_resilient = !self.chain;
+            if self.chain {
+                // Context chaining: the decoder backward-adapts (refresh, not
+                // frame-parallel) and uses temporal MVs — we mirrored both.
+                h.refresh_frame_context = true;
+                h.frame_parallel_decoding_mode = false;
+                h.frame_context_idx = 0;
+            }
             // Color config is inherited (not coded) on inter frames → leave default.
         } else {
             h.key_frame = true;
@@ -1267,7 +1302,7 @@ impl FrameEncoder {
         let edges = self.block_edges(mi_row, mi_col, bsize);
         let (cand, _) = find_mv_refs(
             &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, bsize,
-            LAST_FRAME, &self.sign_bias, NEWMV, -1, edges, None,
+            LAST_FRAME, &self.sign_bias, NEWMV, -1, edges, self.prev_mv(mi_row, mi_col),
         );
         let pred = lower_mv_precision(cand[0], false);
         let mut idy = 0;
@@ -1754,7 +1789,7 @@ impl FrameEncoder {
                 let edges = self.block_edges(mi_row, mi_col, sub);
                 let (cand, _) = find_mv_refs(
                     &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, sub,
-                    mi.ref_frame[0], &self.sign_bias, NEWMV, -1, edges, None,
+                    mi.ref_frame[0], &self.sign_bias, NEWMV, -1, edges, self.prev_mv(mi_row, mi_col),
                 );
                 let pred = lower_mv_precision(cand[0], false);
                 let num_4x4_w = 1usize << B_WIDTH_LOG2[sub];
@@ -1839,7 +1874,7 @@ impl FrameEncoder {
                 b_mode,
                 blk,
                 edges,
-                None,
+                self.prev_mv(mi_row, mi_col),
             )
         };
         match block {
@@ -1966,7 +2001,7 @@ impl FrameEncoder {
                 NEWMV,
                 -1,
                 edges,
-                None,
+                self.prev_mv(mi_row, mi_col),
             );
             let predictor = lower_mv_precision(cand[0], false);
             let best_mv = self.search_mv(mi_row, mi_col, predictor, bwl, bhl);
@@ -2044,7 +2079,7 @@ impl FrameEncoder {
                 NEARMV,
                 -1,
                 edges,
-                None,
+                self.prev_mv(mi_row, mi_col),
             );
             let mv_near = lower_mv_precision(cand_near[1], false);
             if mv_near != (0, 0) && mv_near != predictor {
@@ -2858,7 +2893,7 @@ impl FrameEncoder {
                     NEWMV,
                     -1,
                     edges,
-                    None,
+                    self.prev_mv(mi_row, mi_col),
                 );
                 let pred = lower_mv_precision(cand[0], false);
                 let mvw = self.search_mv_sub(mi_row, mi_col, idx, idy, pred, bw, bh, edges);
@@ -3210,7 +3245,12 @@ impl FrameEncoder {
         let ctx0 = act + lct;
         let pt = plane.min(1);
         let inter = mi.is_inter as usize;
-        let default_probs = &DEFAULT_COEF_PROBS[tx_size][pt][inter];
+        // Cost/trial probs = the frame's INITIAL context (== the spec defaults
+        // when not chaining; the adapted context when chaining) so the RD cost
+        // model matches what the emit actually pays. Static defaults here made
+        // chained decisions systematically wrong (cost said expensive, emit was
+        // cheap -> over-skipping, -2.3dB on akiyo).
+        let default_probs = &self.fc.coef_probs[tx_size][pt][inter];
         // R5: trellis-style RD-optimal EOB on the commit path (uses the default
         // probs so the levels reproduce identically across the R4 two-pass).
         if (enc.is_some() || self.skip_trial) && self.use_trellis && eob > 0 {

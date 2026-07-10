@@ -291,6 +291,14 @@ pub struct Vp9Encoder {
     arf_slot: usize,
     /// Frame dims of the current chain; a change forces a fresh key-started group.
     group_dims: Option<(u32, u32)>,
+    /// F3 context chaining (`VP9_CHAIN`): a companion copy of our own conformant
+    /// decoder tracks the adapted FrameContext + prev-frame MVs; each new P frame
+    /// chains onto them (error_resilient=0). Bit-exact adaptation by construction.
+    chain: bool,
+    companion: Option<Box<crate::Vp9Decoder>>,
+    /// Previous chained frame was a shown, same-size P (the decoder's
+    /// `use_prev_mvs` precondition).
+    chain_prev_p: bool,
     /// Encoder speed preset (`-cpu-used`/`-speed`, 0 = best quality/slowest .. 4 =
     /// fastest). Higher levels progressively drop RD tools (sub-8×8, forward-prob
     /// two-pass, trellis, tx-search) for a graceful quality→speed trade. See
@@ -316,6 +324,9 @@ impl Default for Vp9Encoder {
             arf_slot: 2,
             group_dims: None,
             speed: 0,
+            chain: std::env::var("VP9_NO_CHAIN").is_err(), // F3: corpus-gated −11.15% BD
+            companion: None,
+            chain_prev_p: false,
         }
     }
 }
@@ -511,6 +522,17 @@ impl Vp9Encoder {
         let is_key = reference.is_none();
         let mut enc = FrameEncoder::new(w, h, qindex, coded, reference);
         enc.set_speed(self.speed);
+        let chaining = self.chain && self.lag == 0 && !self.twopass;
+        if chaining && !is_key {
+            if let Some(c) = &self.companion {
+                let mvs = if self.chain_prev_p {
+                    c.prev_mvs.clone()
+                } else {
+                    None
+                };
+                enc.set_chain(c.frame_contexts[0].clone(), mvs);
+            }
+        }
         if !is_key {
             if let Some((g, gw, gh)) = &self.golden {
                 if *gw == w && *gh == h {
@@ -522,6 +544,24 @@ impl Vp9Encoder {
             }
         }
         let bytes = enc.encode_frame();
+        if chaining {
+            use rff_codec::Decoder as _;
+            let comp = self
+                .companion
+                .get_or_insert_with(|| Box::new(crate::Vp9Decoder::default()));
+            let ok = comp
+                .send_packet(&Packet::from_data(0, bytes.clone()))
+                .and_then(|_| comp.receive_frame())
+                .is_ok();
+            if ok {
+                self.chain_prev_p = !is_key;
+            } else {
+                // Companion desync: fail safe back to independent frames.
+                self.chain = false;
+                self.companion = None;
+                self.chain_prev_p = false;
+            }
+        }
         let recon = enc.recon_owned();
         if is_key {
             self.golden = Some((recon.clone(), w, h));
