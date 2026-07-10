@@ -299,6 +299,11 @@ pub struct Vp9Encoder {
     /// Previous chained frame was a shown, same-size P (the decoder's
     /// `use_prev_mvs` precondition).
     chain_prev_p: bool,
+    /// ARF q scale (`VP9_ARF_QSCALE`): the hidden ALT-REF is a long-term reference,
+    /// so libvpx codes it at LOWER q (higher quality) — the extra bits pay off across
+    /// every P frame that predicts from it. 1.0 = code at the frame q (the old,
+    /// net-loss behavior); <1 = the arf boost.
+    arf_qscale: f64,
     /// Encoder speed preset (`-cpu-used`/`-speed`, 0 = best quality/slowest .. 4 =
     /// fastest). Higher levels progressively drop RD tools (sub-8×8, forward-prob
     /// two-pass, trellis, tx-search) for a graceful quality→speed trade. See
@@ -327,6 +332,12 @@ impl Default for Vp9Encoder {
             chain: std::env::var("VP9_NO_CHAIN").is_err(), // F3: corpus-gated −11.15% BD
             companion: None,
             chain_prev_p: false,
+            // 0.5 = the ARF q-boost (measured -8.87% BD vs plain IPPP on 1080p
+            // motion). 1.0 restores the old un-boosted, net-loss ARF.
+            arf_qscale: std::env::var("VP9_ARF_QSCALE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.5),
         }
     }
 }
@@ -716,7 +727,7 @@ impl Vp9Encoder {
     /// Hidden ALT-REF: predicts from LAST(slot0)/GOLDEN(golden_slot), refreshes
     /// `arf_slot`. Returns the coded bytes (stores its recon in `arf_slot`).
     fn code_arf_slotted(&mut self, coded: [Vec<u16>; 3], w: u32, h: u32) -> Vec<u8> {
-        let q = self.next_qindex();
+        let q = ((self.next_qindex() as f64 * self.arf_qscale).round() as u32).clamp(4, 255);
         let idx = [0, self.golden_slot, self.arf_slot];
         let mut enc = FrameEncoder::new(w, h, q, coded, self.slots[0].clone());
         enc.set_speed(self.speed);
