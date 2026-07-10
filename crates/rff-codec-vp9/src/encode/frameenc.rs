@@ -189,6 +189,27 @@ pub struct FrameEncoder {
     mode_map: std::collections::HashMap<(usize, usize, usize), (ModeInfo, Mv, u8)>,
     /// Tx size the most recent `decide_*` trial reconstructed with (see `mode_map`).
     last_trial_tx: u8,
+    /// Prediction-only SSE (`Σ(src−pred)²`) accumulated during the skip trial — the
+    /// distortion the block would have if coded `skip` (recon == MC prediction). Feeds
+    /// the RD skip decision (`rd_skip`).
+    pending_pred_sse: u64,
+    /// When set, the trial forces every tx block's EOB to 0 — reproducing an empty
+    /// (skip) block's recon (MC prediction, no residual) + zeroed entropy contexts.
+    /// Used to re-materialise a block the RD skip decision chose to drop.
+    force_skip: bool,
+    /// RD skip decision (libvpx `x->skip`): even when the residual quantises to a few
+    /// coefficients, drop the whole residual when `J_skip = pred_sse + λ·rate(skip=1)`
+    /// beats `J_noskip = recon_sse + λ·(coef_bits + rate(skip=0))`. Default ON (corpus
+    /// BD-rate −2.75% CIF / −0.57% 1080p, bit-exact); `VP9_NO_RD_SKIP` disables it.
+    rd_skip: bool,
+    /// Partition-cascade lever (`VP9_SPLIT_PEN`, DEFAULT 1.0 = OFF): when the NONE arm
+    /// codes `skip`, multiply the SPLIT/sub RD by this before the NONE-vs-SPLIT compare,
+    /// biasing static regions toward one large skip block (fewer per-block headers).
+    /// Measured 2026-07-10: CONTENT-DEPENDENT, not a clean default. At 1.02: CIF −0.55%
+    /// BD (akiyo −1.60%, the static win) but 1080p +1.44% (park_joy +2.76% — busy texture
+    /// needs fine partitions even when skipping). Bit-exact/conformant. Kept opt-in for
+    /// static/low-res content; a frame-motion gate could make it a keeper (see memory).
+    split_penalty: f64,
     /// AVX2 available (cached once; the SAD hot loop dispatches on it per call).
     has_avx2: bool,
     /// Exhaustive ±8 integer motion search (speed-0 default). The diamond search
@@ -369,6 +390,13 @@ impl FrameEncoder {
             part_map: std::collections::HashMap::new(),
             mode_map: std::collections::HashMap::new(),
             last_trial_tx: 0,
+            pending_pred_sse: 0,
+            force_skip: false,
+            rd_skip: std::env::var("VP9_NO_RD_SKIP").is_err(),
+            split_penalty: std::env::var("VP9_SPLIT_PEN")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0),
             full_msearch: std::env::var("VP9_DIAMOND_MSEARCH").is_err(),
             mv_memo: std::cell::RefCell::new(std::collections::HashMap::new()),
             corner_sad: std::env::var("VP9_CORNER_SAD").is_ok(),
@@ -1508,6 +1536,10 @@ impl FrameEncoder {
             none_snap = Some(self.snap_block(mi_row, mi_col, n4x4_l2, n4x4_l2));
             self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, &start);
         }
+        let none_skip = self
+            .mode_map
+            .get(&(mi_row, mi_col, bsize))
+            .map_or(false, |(m, _, _)| m.skip);
 
         // G1 partition gate (discovered 2026-07-09, ceiling-swept on 1.6M nodes,
         // clip-level holdout): when NONE already fits this well, the expensive arms
@@ -1595,7 +1627,10 @@ impl FrameEncoder {
         }
 
         let best_split = split_rd.min(sub_rd);
-        let (partition, cost) = if none_rd <= best_split {
+        // Partition cascade: when NONE codes skip, bias the compare toward the large
+        // skip block (its per-block header savings are real but small vs pred_sse).
+        let none_gate = if none_skip { best_split * self.split_penalty } else { best_split };
+        let (partition, cost) = if none_rd <= none_gate {
             // NONE ran first — reinstate its end-state.
             self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, &none_snap.unwrap());
             (PARTITION_NONE, none_rd)
@@ -1729,6 +1764,10 @@ impl FrameEncoder {
                 trial.tx_size = trial_tx;
                 self.pending_eob = 0;
                 self.skip_trial = true;
+                // force_skip reproduces the empty-block recon (MC prediction, zeroed
+                // contexts) for BOTH a naturally-empty skip (eob already 0, no-op) and
+                // an RD-forced skip (drops the residual the trial would otherwise add).
+                self.force_skip = true;
                 for plane in 0..3 {
                     self.encode_plane(
                         None,
@@ -1741,6 +1780,7 @@ impl FrameEncoder {
                         bhl,
                     );
                 }
+                self.force_skip = false;
                 self.skip_trial = false;
             }
             (m, p)
@@ -2152,6 +2192,7 @@ impl FrameEncoder {
         let start = self.snap_block(mi_row, mi_col, bwl, bhl);
         let (mut coef_bits, mut sse) = (0u64, 0u64);
         self.pending_eob = 0;
+        self.pending_pred_sse = 0;
         self.skip_trial = true;
         for plane in 0..3 {
             let (b, s) = self.encode_plane(None, &chosen, plane, mi_row, mi_col, bsize, bwl, bhl);
@@ -2163,7 +2204,36 @@ impl FrameEncoder {
         // replay (mode_map) must re-run the trial at THIS size, not the max_tx the
         // syntax convention below substitutes.
         self.last_trial_tx = chosen.tx_size;
-        let skip = !use_intra && self.pending_eob == 0;
+        let mut skip = !use_intra && self.pending_eob == 0;
+        // RD skip decision (libvpx `x->skip`): when the residual is non-empty, drop it
+        // whole if coding `skip` (recon == MC prediction, distortion = pred_sse) beats
+        // coding the residual. Cascades into partitioning — a block that skips no longer
+        // pulls SPLIT ahead of NONE — which is the static-content bit-rate win.
+        if self.rd_skip && !use_intra && !skip {
+            let above = self.above_mi(mi_row, mi_col);
+            let left = self.left_mi(mi_row, mi_col);
+            let sctx = skip_context(above.as_ref(), left.as_ref());
+            let rate_skip = cost_bit(self.fc.skip_probs[sctx], 1) as f64 / 256.0;
+            let rate_noskip =
+                coef_bits as f64 / 256.0 + cost_bit(self.fc.skip_probs[sctx], 0) as f64 / 256.0;
+            let j_skip = self.pending_pred_sse as f64 + self.lambda * rate_skip;
+            let j_noskip = sse as f64 + self.lambda * rate_noskip;
+            if j_skip <= j_noskip {
+                skip = true;
+                let pred_sse = self.pending_pred_sse;
+                // Re-materialise the block as empty: MC prediction, no residual, zeroed
+                // entropy contexts — bit-identical to a naturally-empty skip block.
+                self.pending_eob = 0;
+                self.force_skip = true;
+                self.skip_trial = true;
+                for plane in 0..3 {
+                    self.encode_plane(None, &chosen, plane, mi_row, mi_col, bsize, bwl, bhl);
+                }
+                self.skip_trial = false;
+                self.force_skip = false;
+                sse = pred_sse;
+            }
+        }
         if skip {
             chosen.tx_size = if self.use_tx_search { max_tx as u8 } else { 0 };
             coef_bits = 0; // a skipped block codes no coefficient tokens
@@ -3203,6 +3273,17 @@ impl FrameEncoder {
                 residual[y * bs + x] = s - p;
             }
         }
+        // Prediction-only SSE (Σ(src−pred)² = Σ residual²) — the distortion if this
+        // block were coded `skip`. Accumulated on the measuring trial only (the
+        // force_skip re-run re-uses the captured value). Same pixels the recon SSE
+        // below sums, so the two are directly RD-comparable.
+        if self.skip_trial && !self.force_skip {
+            let mut psse = 0u64;
+            for &r in &residual[..n] {
+                psse += (r as i64 * r as i64) as u64;
+            }
+            self.pending_pred_sse += psse;
+        }
 
         // ---- forward transform + quantize (inter / lossless / chroma / 32×32
         // are always DCT_DCT; only ≤16×16 intra luma uses the hybrid transform) ----
@@ -3234,6 +3315,13 @@ impl FrameEncoder {
                 &mut dqcoeff[..n],
             )
         };
+
+        // force_skip: re-materialise this block as empty (RD skip decision dropped
+        // the residual). eob=0 ⇒ no residual added below, context set to 0, recon ==
+        // MC prediction — bit-identical to a naturally-empty (skip) block.
+        if self.force_skip {
+            eob = 0;
+        }
 
         // ---- entropy context, then encode the tokens ----
         let act = self.above_ctx[plane][above_col0 + col..above_col0 + col + txw]
