@@ -1439,7 +1439,7 @@ impl FrameEncoder {
             && none_rd < f64::MAX
             && none_rd / self.lambda
                 < match bsize {
-                    BLOCK_8X8 => 18.0,
+                    BLOCK_8X8 => 18.0, // G2 bump to 33 REVERTED: +0.16% BD for ~1% speed (weak trade)
                     6 => 64.0,  // 16x16
                     9 => 280.0, // 32x32
                     _ => 0.0,   // 64x64: never skip
@@ -2290,6 +2290,7 @@ impl FrameEncoder {
             }
         };
         let mut best_sad = score(int);
+        let ip_sad = best_sad;
         // Provable skip: subpel SAD >= 0 and ties break toward the shorter MV
         // (the integer candidate), so nothing can beat a perfect integer match.
         if best_sad == 0 {
@@ -2332,6 +2333,13 @@ impl FrameEncoder {
                     }
                 }
             }
+        }
+        // G5 harvest: integer SAD vs what subpel refinement actually bought.
+        if self.g1_harvest {
+            eprintln!(
+                "G5 bw={} bh={} int_sad={} final_sad={} moved={}",
+                1 << bwl, 1 << bhl, ip_sad, best_sad, (best != int) as u8
+            );
         }
         self.mv_memo.borrow_mut().insert(key, best);
         best
