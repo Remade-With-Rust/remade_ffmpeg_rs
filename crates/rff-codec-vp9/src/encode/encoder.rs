@@ -125,6 +125,28 @@ fn tf_search(
     best
 }
 
+/// Mean absolute consecutive-frame luma difference over a group (subsampled) —
+/// a cheap motion proxy. High motion ⇒ the hidden ALT-REF pays off (temporal
+/// bracketing helps prediction); low motion ⇒ the ARF is pure overhead. Measured
+/// crossover ≈ 8 (akiyo 0.4 / foreman 5.2 code plain; bus 21 / crowd_run 12 use ARF).
+fn group_motion(frames: &[([Vec<u16>; 3], u32, u32)]) -> f64 {
+    if frames.len() < 2 {
+        return 0.0;
+    }
+    let (mut tot, mut cnt) = (0u64, 0u64);
+    for w in frames.windows(2) {
+        let (a, b) = (&w[0].0[0], &w[1].0[0]);
+        let n = a.len().min(b.len());
+        let mut i = 0;
+        while i < n {
+            tot += (a[i] as i64 - b[i] as i64).unsigned_abs();
+            cnt += 1;
+            i += 37; // stride-subsample for speed
+        }
+    }
+    tot as f64 / cnt.max(1) as f64
+}
+
 /// Simplified libvpx temporal filter (`vp9_temporal_filter`): denoise the ALT-REF
 /// `anchor` by blending each `neighbor` — motion-compensated to the anchor — with a
 /// per-pixel weight that decays with the aligned difference, so static regions are
@@ -304,6 +326,10 @@ pub struct Vp9Encoder {
     /// Active during two-pass PASS 2: chaining engages (pass 1 is a throwaway
     /// probe that must not touch the companion).
     pass2_chaining: bool,
+    /// Content-adaptive-lag motion threshold: ALT-REF groups below this mean
+    /// inter-frame luma diff are coded as plain chained P frames instead (the ARF
+    /// is overhead on low-motion content). `VP9_LAG_MOTION_THRESH` overrides.
+    lag_motion_thresh: f64,
     /// ARF q scale (`VP9_ARF_QSCALE`): the hidden ALT-REF is a long-term reference,
     /// so libvpx codes it at LOWER q (higher quality) — the extra bits pay off across
     /// every P frame that predicts from it. 1.0 = code at the frame q (the old,
@@ -339,6 +365,10 @@ impl Default for Vp9Encoder {
             chain_prev_p: false,
             group_chain: false,
             pass2_chaining: false,
+            lag_motion_thresh: std::env::var("VP9_LAG_MOTION_THRESH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8.0),
             // 0.5 = the ARF q-boost (measured -8.87% BD vs plain IPPP on 1080p
             // motion). 1.0 restores the old un-boosted, net-loss ARF.
             arf_qscale: std::env::var("VP9_ARF_QSCALE")
@@ -715,8 +745,12 @@ impl Vp9Encoder {
         self.group_dims = Some((w, h));
         self.group_chain = self.chain && !self.twopass;
 
-        // Groups too short for a hidden ALT-REF: code plainly (key iff needed, then P…).
-        if n <= 2 {
+        // Content-adaptive lag: a hidden ALT-REF pays off on high-motion content
+        // (bus -27% BD) but is pure overhead on static/low-motion (akiyo +31%),
+        // so code low-motion groups as plain chained P frames. Also the fallback
+        // for groups too short for an ARF.
+        let plain = n <= 2 || group_motion(&frames) < self.lag_motion_thresh;
+        if plain {
             for (i, (c, fw, fh)) in frames.into_iter().enumerate() {
                 let b = if need_key && i == 0 {
                     self.code_key_slotted(c, fw, fh)
