@@ -299,6 +299,8 @@ pub struct Vp9Encoder {
     /// Previous chained frame was a shown, same-size P (the decoder's
     /// `use_prev_mvs` precondition).
     chain_prev_p: bool,
+    /// Active while coding an ALT-REF group with chaining on.
+    group_chain: bool,
     /// ARF q scale (`VP9_ARF_QSCALE`): the hidden ALT-REF is a long-term reference,
     /// so libvpx codes it at LOWER q (higher quality) — the extra bits pay off across
     /// every P frame that predicts from it. 1.0 = code at the frame q (the old,
@@ -332,6 +334,7 @@ impl Default for Vp9Encoder {
             chain: std::env::var("VP9_NO_CHAIN").is_err(), // F3: corpus-gated −11.15% BD
             companion: None,
             chain_prev_p: false,
+            group_chain: false,
             // 0.5 = the ARF q-boost (measured -8.87% BD vs plain IPPP on 1080p
             // motion). 1.0 restores the old un-boosted, net-loss ARF.
             arf_qscale: std::env::var("VP9_ARF_QSCALE")
@@ -643,6 +646,54 @@ impl Vp9Encoder {
     /// (which may reference LAST/GOLDEN/ALTREF) refreshing slot0, then a
     /// `show_existing_frame(arf_slot)`. GOLDEN and ALTREF slots swap for the next group,
     /// so the just-coded ARF becomes the next group's GOLDEN anchor.
+    /// Chain args for the next group frame from the persistent companion decoder.
+    fn chain_args(
+        &self,
+    ) -> Option<(
+        crate::decode::FrameContext,
+        Option<std::sync::Arc<Vec<crate::mv::MvRef>>>,
+    )> {
+        let c = self.companion.as_ref()?;
+        let temporal_ok = !c.last_intra_only && c.last_show_frame && !c.last_frame_key;
+        let mvs = if temporal_ok { c.prev_mvs.clone() } else { None };
+        Some((c.frame_contexts[0].clone(), mvs))
+    }
+
+    /// Feed one emitted coded frame to the persistent companion, advancing its
+    /// adapted-context / temporal-MV / ref-slot state. A hidden ALT-REF decodes
+    /// then yields `Again` (no shown output) - not a desync. A hard error fails
+    /// safe to independent frames.
+    fn companion_feed(&mut self, bytes: &[u8]) {
+        if !self.group_chain {
+            return;
+        }
+        use rff_codec::Decoder as _;
+        let comp = self
+            .companion
+            .get_or_insert_with(|| Box::new(crate::Vp9Decoder::default()));
+        if comp
+            .send_packet(&Packet::from_data(0, bytes.to_vec()))
+            .is_err()
+        {
+            self.group_chain = false;
+            self.chain = false;
+            self.companion = None;
+            return;
+        }
+        loop {
+            match comp.receive_frame() {
+                Ok(_) => {}
+                Err(Error::Again) | Err(Error::Eof) => break,
+                Err(_) => {
+                    self.group_chain = false;
+                    self.chain = false;
+                    self.companion = None;
+                    return;
+                }
+            }
+        }
+    }
+
     fn code_altref_group(&mut self, frames: Vec<([Vec<u16>; 3], u32, u32)>) {
         let n = frames.len();
         if n == 0 {
@@ -652,6 +703,7 @@ impl Vp9Encoder {
         // The first group, or any resize, restarts with a key frame + fresh slots.
         let need_key = self.slots[0].is_none() || self.group_dims != Some((w, h));
         self.group_dims = Some((w, h));
+        self.group_chain = self.chain && !self.twopass;
 
         // Groups too short for a hidden ALT-REF: code plainly (key iff needed, then P…).
         if n <= 2 {
@@ -661,6 +713,7 @@ impl Vp9Encoder {
                 } else {
                     self.code_p_slotted(c, fw, fh, false)
                 };
+                self.companion_feed(&b);
                 self.packets.push_back(Packet::from_data(0, b));
             }
             return;
@@ -673,6 +726,7 @@ impl Vp9Encoder {
             self.arf_slot = 2;
             let (c0, kw, kh) = frames[0].clone();
             let kb = self.code_key_slotted(c0, kw, kh);
+            self.companion_feed(&kb);
             self.packets.push_back(Packet::from_data(0, kb));
             i0 = 1;
         }
@@ -691,10 +745,12 @@ impl Vp9Encoder {
             frames[n - 1].0.clone()
         };
         let ab = self.code_arf_slotted(carf, aw, ah);
+        self.companion_feed(&ab);
 
         // First shown P (F_i0) packed WITH the hidden ARF into one superframe.
         let (c1, w1, h1) = frames[i0].clone();
         let pb1 = self.code_p_slotted(c1, w1, h1, true);
+        self.companion_feed(&pb1);
         self.packets
             .push_back(Packet::from_data(0, pack_superframe(&[ab, pb1])));
 
@@ -702,14 +758,14 @@ impl Vp9Encoder {
         for f in frames.iter().take(n - 1).skip(i0 + 1) {
             let (ci, iw, ih) = f.clone();
             let pb = self.code_p_slotted(ci, iw, ih, true);
+            self.companion_feed(&pb);
             self.packets.push_back(Packet::from_data(0, pb));
         }
 
         // Display the ALT-REF, then swap GOLDEN↔ALTREF so this ARF anchors the next group.
-        self.packets.push_back(Packet::from_data(
-            0,
-            FrameEncoder::encode_show_existing_frame(self.arf_slot as u32),
-        ));
+        let se = FrameEncoder::encode_show_existing_frame(self.arf_slot as u32);
+        self.companion_feed(&se);
+        self.packets.push_back(Packet::from_data(0, se));
         std::mem::swap(&mut self.golden_slot, &mut self.arf_slot);
     }
 
@@ -731,6 +787,11 @@ impl Vp9Encoder {
         let idx = [0, self.golden_slot, self.arf_slot];
         let mut enc = FrameEncoder::new(w, h, q, coded, self.slots[0].clone());
         enc.set_speed(self.speed);
+        if self.group_chain {
+            if let Some((fc, mvs)) = self.chain_args() {
+                enc.set_chain(fc, mvs);
+            }
+        }
         enc.set_golden(self.slots[self.golden_slot].clone().unwrap());
         enc.set_ref_frame_idx(idx);
         enc.set_hidden_altref(self.arf_slot);
@@ -752,6 +813,11 @@ impl Vp9Encoder {
         let idx = [0, self.golden_slot, self.arf_slot];
         let mut enc = FrameEncoder::new(w, h, q, coded, self.slots[0].clone());
         enc.set_speed(self.speed);
+        if self.group_chain && self.slots[0].is_some() {
+            if let Some((fc, mvs)) = self.chain_args() {
+                enc.set_chain(fc, mvs);
+            }
+        }
         if self.slots[0].is_some() {
             enc.set_golden(self.slots[self.golden_slot].clone().unwrap());
             if with_altref {
