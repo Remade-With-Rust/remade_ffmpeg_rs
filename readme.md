@@ -131,6 +131,26 @@
 > identical output. An optional **faithful float-SILK analysis path** (port of `silk/float/`)
 > ships default-off.
 
+> **⚡ Performance spotlight — audio resampler (`swresample`): 54× faster, and it flipped a
+> loss into a win.** Most audio is 44.1 kHz and Opus runs at 48 kHz, so nearly every real
+> transcode hits our resampler — and profiling caught it dragging: a 44.1→48 kHz Opus
+> transcode was **~4× *slower* than `ffmpeg -c:a libopus`**, entirely in the resample, not the
+> codec. Four profile-gated bricks, biggest-lever-first: the windowed-sinc recomputed **~110
+> million transcendentals** (a `sin` + two `cos` per tap per output) — but the kernel weights
+> depend only on the sub-sample phase, which for a fixed rational ratio **repeats exactly**
+> (44.1↔48 k → 160 phases), so a **precomputed polyphase bank** turns them into a table lookup
+> (**16.3×**, redundancy-elimination beating SIMD again); then an **AVX2+FMA** dot product the
+> f64 reduction wouldn't auto-vectorize (1.74×), output preallocation + a specialized
+> deinterleave (1.38×), and an **f32** path for 2× SIMD width (1.38×). Net **671 → 12.5 ms**
+> on 24 s of 44.1→48 k stereo — **53.8×**, gated **>100 dB** against the scalar oracle — which
+> turned that 4×-slower transcode into **~2× *faster* than `libopus`**. Then, hunting *any*
+> error across a **131-config domain sweep** (every sample rate 8–96 kHz × mono/stereo ×
+> bitrates 6 k–510 k × sweeps/tones/noise/silence/impulse), the only thing it surfaced was our
+> own resampler's stopband — so we deepened it (16-tap Blackman → **64-tap Blackman-Harris**),
+> taking supersonic content that would fold into the audible band from ~−58 dB to **−110 dB+**:
+> genuinely hi-res-transparent, passband flat through 20 kHz. **Zero functional errors across
+> the whole domain.**
+
 ---
 
 ## What is this?
