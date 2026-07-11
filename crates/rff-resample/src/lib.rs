@@ -126,8 +126,36 @@ impl Resampler {
     /// output. Output lags input by ~TAPS/ratio samples (flushed by `finish`).
     pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
         let ch = self.channels;
-        for (i, s) in input.iter().enumerate() {
-            self.buf[i % ch].push(*s as f64);
+        // Deinterleave into per-channel history, reserving up front. Specialise
+        // the mono/stereo hot paths so the per-sample `i % ch` divide is gone.
+        match ch {
+            1 => {
+                let b = &mut self.buf[0];
+                b.reserve(input.len());
+                for &s in input {
+                    b.push(s as f64);
+                }
+            }
+            2 => {
+                let n = input.len() / 2;
+                self.buf[0].reserve(n + 1);
+                self.buf[1].reserve(n + 1);
+                for frame in input.chunks_exact(2) {
+                    self.buf[0].push(frame[0] as f64);
+                    self.buf[1].push(frame[1] as f64);
+                }
+                if input.len() & 1 == 1 {
+                    self.buf[0].push(input[input.len() - 1] as f64);
+                }
+            }
+            _ => {
+                for c in 0..ch {
+                    self.buf[c].reserve(input.len() / ch + 1);
+                }
+                for (i, s) in input.iter().enumerate() {
+                    self.buf[i % ch].push(*s as f64);
+                }
+            }
         }
         self.run()
     }
@@ -158,6 +186,11 @@ impl Resampler {
         let mut out: Vec<f32> = Vec::new();
         let poly = self.poly.as_ref().unwrap();
         let (num, den) = (poly.num, poly.den);
+        // Reserve output up front (avoid repeated Vec growth): each output
+        // advances `ipos` by num/den on average, so consuming the available
+        // input positions yields ≈ avail·den/num outputs per channel.
+        let avail = len.saturating_sub(self.ipos + TAPS as usize);
+        out.reserve(avail.saturating_mul(den) / num.max(1) * ch + ch);
         // An output at `ipos` needs input indices ipos-TAPS+1 ..= ipos+TAPS.
         while self.ipos + TAPS as usize + 1 <= len {
             let base = self.ipos + 1 - TAPS as usize;
