@@ -260,6 +260,30 @@ pub struct FrameEncoder {
 }
 
 impl FrameEncoder {
+    /// Resolution-adaptive λ multiplier for `λ = ac²·mult`. λ only DECREASES with
+    /// resolution: CIF/SD stays at the calibrated 0.001, HD ramps down to 0.0005.
+    ///
+    /// Measured 2026-07-10 (BD-rate oracle, PSNR **and** VMAF, post-RD-skip): raising λ
+    /// for CIF won BD-PSNR (−0.87%) but LOST BD-VMAF (+2.07%) — over-skipping trades away
+    /// perceptual quality PSNR doesn't see — so the CIF end is pinned at the unchanged
+    /// 0.001 (SD output is byte-identical to before). Lowering λ for HD codes more residual
+    /// and preserves detail: a large BD-VMAF win (crowd_run −10.83%) at ~neutral PSNR.
+    /// Log-linear interp in pixel count between the two points, clamped. `VP9_LAMBDA_MULT`
+    /// overrides (A/B probe / calibration).
+    fn lambda_mult(width: u32, height: u32) -> f64 {
+        if let Some(m) = std::env::var("VP9_LAMBDA_MULT")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            return m;
+        }
+        const LO_PX: f64 = 101_376.0; // 352×288 (CIF)   → mult 0.001 (unchanged)
+        const HI_PX: f64 = 2_073_600.0; // 1920×1080 (HD) → mult 0.0005
+        let px = ((width as f64) * (height as f64)).max(1.0);
+        let t = ((px.ln() - LO_PX.ln()) / (HI_PX.ln() - LO_PX.ln())).clamp(0.0, 1.0);
+        0.001 + t * (0.0005 - 0.001)
+    }
+
     /// Create an encoder for a `width`×`height` frame. `src` holds the three
     /// planes (Y full-res, U/V half-res for 4:2:0) at the **coded** size
     /// (`mi_*·8`), row-major, 8-bit values in `u16`.
@@ -350,11 +374,9 @@ impl FrameEncoder {
             sign_bias: [false; 4], // all same ⇒ no compound, reference_mode forced single
             fc: FrameContext::defaults(),
             use_rdo: true,
-            // Rate-distortion multiplier `ac²·mult` for `J = SSE + lambda·bits`.
-            // mult = 0.001 was calibrated via the BD-rate oracle (`lambda_calibration`):
-            // it beats the original 0.02 guess by −2.2% BD-rate (which was ~20× too
-            // high — the trellis exposed it as a +40% catastrophe).
-            lambda: (ac_y as f64) * (ac_y as f64) * 0.001,
+            // Rate-distortion multiplier `ac²·mult` for `J = SSE + lambda·bits`,
+            // resolution-adaptive (`Self::lambda_mult`). `VP9_LAMBDA_MULT` overrides.
+            lambda: (ac_y as f64) * (ac_y as f64) * Self::lambda_mult(width, height),
             lf_level: 0,
             counts: FrameCounts::zeroed(),
             commit_fc: None,
