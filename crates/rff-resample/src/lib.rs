@@ -165,11 +165,7 @@ impl Resampler {
             let inv = poly.inv_wsum[self.iphase];
             for c in 0..ch {
                 let bc = &self.buf[c][base..base + WIDTH];
-                let mut acc = 0.0;
-                for k in 0..WIDTH {
-                    acc += bc[k] * w[k];
-                }
-                out.push((acc * inv) as f32);
+                out.push((dot_width(bc, w) * inv) as f32);
             }
             self.iphase += num;
             while self.iphase >= den {
@@ -231,6 +227,57 @@ impl Resampler {
         }
         out
     }
+}
+
+/// `WIDTH`-tap FIR dot product `Σ a[k]·b[k]`. AVX2+FMA on x86 (4 independent
+/// partial sums break the reduction dependency; FMA rounds once per term —
+/// differs from the scalar chain by ~1 ULP/term, gated by SNR vs the oracle),
+/// scalar elsewhere. Both slices are exactly `WIDTH` long.
+#[inline]
+fn dot_width(a: &[f64], b: &[f64]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            return unsafe { dot_width_avx2(a, b) };
+        }
+    }
+    let mut acc = 0.0;
+    for k in 0..WIDTH {
+        acc += a[k] * b[k];
+    }
+    acc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_width_avx2(a: &[f64], b: &[f64]) -> f64 {
+    use std::arch::x86_64::*;
+    let (mut s0, mut s1, mut s2, mut s3) = (
+        _mm256_setzero_pd(),
+        _mm256_setzero_pd(),
+        _mm256_setzero_pd(),
+        _mm256_setzero_pd(),
+    );
+    let (pa, pb) = (a.as_ptr(), b.as_ptr());
+    let mut i = 0;
+    while i + 16 <= WIDTH {
+        s0 = _mm256_fmadd_pd(_mm256_loadu_pd(pa.add(i)), _mm256_loadu_pd(pb.add(i)), s0);
+        s1 = _mm256_fmadd_pd(_mm256_loadu_pd(pa.add(i + 4)), _mm256_loadu_pd(pb.add(i + 4)), s1);
+        s2 = _mm256_fmadd_pd(_mm256_loadu_pd(pa.add(i + 8)), _mm256_loadu_pd(pb.add(i + 8)), s2);
+        s3 = _mm256_fmadd_pd(_mm256_loadu_pd(pa.add(i + 12)), _mm256_loadu_pd(pb.add(i + 12)), s3);
+        i += 16;
+    }
+    while i + 4 <= WIDTH {
+        s0 = _mm256_fmadd_pd(_mm256_loadu_pd(pa.add(i)), _mm256_loadu_pd(pb.add(i)), s0);
+        i += 4;
+    }
+    let s = _mm256_add_pd(_mm256_add_pd(s0, s1), _mm256_add_pd(s2, s3));
+    let lo = _mm256_castpd256_pd128(s);
+    let hi = _mm256_extractf128_pd(s, 1);
+    let sum2 = _mm_add_pd(lo, hi);
+    let hi2 = _mm_unpackhi_pd(sum2, sum2);
+    _mm_cvtsd_f64(_mm_add_sd(sum2, hi2))
 }
 
 /// Windowed-sinc kernel value at distance `x` (input samples) for cutoff `fc`.
