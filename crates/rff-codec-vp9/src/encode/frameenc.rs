@@ -460,10 +460,24 @@ impl FrameEncoder {
             pending_pred_sse: 0,
             force_skip: false,
             rd_skip: std::env::var("VP9_NO_RD_SKIP").is_err(),
+            // Activity-gated partition-merge bias. On near-static frames we over-split the
+            // background into small skip blocks (akiyo: 84 8×8/frame vs libvpx's 21) —
+            // splitting to code noise-level residual libvpx skips as one large block. Bias
+            // SPLIT-vs-NONE toward the large skip block, but ONLY for near-static content
+            // (the same signal the λ uses); any real motion keeps fine partitions. Env
+            // `VP9_SPLIT_PEN` overrides with a fixed value.
             split_penalty: std::env::var("VP9_SPLIT_PEN")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(1.0),
+                .unwrap_or_else(|| {
+                    if is_inter {
+                        // activity 2 (akiyo) → 1.05; activity ≥ 5 (foreman+) → 1.0 (off).
+                        let t = ((5.0 - activity) / (5.0 - 2.0)).clamp(0.0, 1.0);
+                        1.0 + t * 0.05
+                    } else {
+                        1.0
+                    }
+                }),
             full_msearch: std::env::var("VP9_DIAMOND_MSEARCH").is_err(),
             mv_memo: std::cell::RefCell::new(std::collections::HashMap::new()),
             corner_sad: std::env::var("VP9_CORNER_SAD").is_ok(),
