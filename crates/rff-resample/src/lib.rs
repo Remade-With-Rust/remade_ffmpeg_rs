@@ -24,10 +24,10 @@ const MAX_PHASES: usize = 8192;
 /// — so all per-output transcendentals collapse to a table lookup.
 struct Poly {
     /// `den` phases × `WIDTH` taps, row-major (`weights[phase*WIDTH + k]`).
-    weights: Vec<f64>,
+    weights: Vec<f32>,
     /// Reciprocal kernel-weight sum per phase (turns the per-output divide into
     /// a multiply). `1.0` where the sum was zero.
-    inv_wsum: Vec<f64>,
+    inv_wsum: Vec<f32>,
     /// Phase step per output (= in_rate/gcd) and modulus (= out_rate/gcd).
     num: usize,
     den: usize,
@@ -39,8 +39,9 @@ pub struct Resampler {
     channels: usize,
     ratio: f64,  // out_rate / in_rate
     cutoff: f64, // normalised cutoff (cycles/input-sample), ≤ 0.5
-    /// Per-channel pending input, each pre-padded with TAPS zeros of history.
-    buf: Vec<Vec<f64>>,
+    /// Per-channel pending input (`f32`, the input format — no widening), each
+    /// pre-padded with TAPS zeros of history.
+    buf: Vec<Vec<f32>>,
     /// Read position (input-sample index into `buf`) of the next output sample.
     pos: f64,
     /// Polyphase bank + integer position/phase (present iff the ratio is
@@ -74,21 +75,24 @@ impl Resampler {
         let g = gcd(in_rate, out_rate);
         let den = (out_rate / g) as usize;
         let num = (in_rate / g) as usize;
+        // Weights are derived in f64 (accuracy) then stored as f32: the FIR runs
+        // in f32 (2× SIMD width, input is already f32) with per-tap error ~2^-24
+        // — inaudible and gated at >90 dB SNR vs the f64 oracle.
         let poly = (den <= MAX_PHASES).then(|| {
-            let mut weights = vec![0.0f64; den * WIDTH];
-            let mut inv_wsum = vec![0.0f64; den];
+            let mut weights = vec![0.0f32; den * WIDTH];
+            let mut inv_wsum = vec![0.0f32; den];
             for p in 0..den {
                 let frac = p as f64 / den as f64; // sub-sample offset in [0,1)
-                let mut wsum = 0.0;
+                let mut wsum = 0.0f64;
                 for k in 0..WIDTH {
                     // Matches the scalar path's x = pos - j with j = center-TAPS+1+k:
                     // x = frac + (TAPS-1-k).
                     let x = frac + (TAPS - 1 - k as isize) as f64;
                     let w = kernel(x, cutoff);
-                    weights[p * WIDTH + k] = w;
+                    weights[p * WIDTH + k] = w as f32;
                     wsum += w;
                 }
-                inv_wsum[p] = if wsum == 0.0 { 1.0 } else { 1.0 / wsum };
+                inv_wsum[p] = if wsum == 0.0 { 1.0 } else { (1.0 / wsum) as f32 };
             }
             Poly { weights, inv_wsum, num, den }
         });
@@ -130,22 +134,18 @@ impl Resampler {
         // the mono/stereo hot paths so the per-sample `i % ch` divide is gone.
         match ch {
             1 => {
-                let b = &mut self.buf[0];
-                b.reserve(input.len());
-                for &s in input {
-                    b.push(s as f64);
-                }
+                self.buf[0].extend_from_slice(input);
             }
             2 => {
                 let n = input.len() / 2;
                 self.buf[0].reserve(n + 1);
                 self.buf[1].reserve(n + 1);
                 for frame in input.chunks_exact(2) {
-                    self.buf[0].push(frame[0] as f64);
-                    self.buf[1].push(frame[1] as f64);
+                    self.buf[0].push(frame[0]);
+                    self.buf[1].push(frame[1]);
                 }
                 if input.len() & 1 == 1 {
-                    self.buf[0].push(input[input.len() - 1] as f64);
+                    self.buf[0].push(input[input.len() - 1]);
                 }
             }
             _ => {
@@ -153,7 +153,7 @@ impl Resampler {
                     self.buf[c].reserve(input.len() / ch + 1);
                 }
                 for (i, s) in input.iter().enumerate() {
-                    self.buf[i % ch].push(*s as f64);
+                    self.buf[i % ch].push(*s);
                 }
             }
         }
@@ -198,7 +198,7 @@ impl Resampler {
             let inv = poly.inv_wsum[self.iphase];
             for c in 0..ch {
                 let bc = &self.buf[c][base..base + WIDTH];
-                out.push((dot_width(bc, w) * inv) as f32);
+                out.push(dot_width(bc, w) * inv);
             }
             self.iphase += num;
             while self.iphase >= den {
@@ -240,10 +240,10 @@ impl Resampler {
                 wsum = 1.0;
             }
             for c in 0..ch {
-                let mut acc = 0.0;
+                let mut acc = 0.0f64;
                 for (k, w) in weights.iter().enumerate() {
                     let j = (center - TAPS + 1 + k as isize) as usize;
-                    acc += self.buf[c][j] * w;
+                    acc += self.buf[c][j] as f64 * w;
                 }
                 out.push((acc / wsum) as f32);
             }
@@ -262,12 +262,13 @@ impl Resampler {
     }
 }
 
-/// `WIDTH`-tap FIR dot product `Σ a[k]·b[k]`. AVX2+FMA on x86 (4 independent
-/// partial sums break the reduction dependency; FMA rounds once per term —
-/// differs from the scalar chain by ~1 ULP/term, gated by SNR vs the oracle),
-/// scalar elsewhere. Both slices are exactly `WIDTH` long.
+/// `WIDTH`-tap `f32` FIR dot product `Σ a[k]·b[k]`. AVX2+FMA on x86 (8-wide,
+/// 4 independent partial sums break the reduction dependency; FMA rounds once
+/// per term), scalar elsewhere. `f32` throughout gives 2× the SIMD width of the
+/// f64 path at ~2^-24 per-tap error — gated by SNR vs the f64 oracle. Both
+/// slices are exactly `WIDTH` (= 32) long.
 #[inline]
-fn dot_width(a: &[f64], b: &[f64]) -> f64 {
+fn dot_width(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
@@ -275,7 +276,7 @@ fn dot_width(a: &[f64], b: &[f64]) -> f64 {
             return unsafe { dot_width_avx2(a, b) };
         }
     }
-    let mut acc = 0.0;
+    let mut acc = 0.0f32;
     for k in 0..WIDTH {
         acc += a[k] * b[k];
     }
@@ -284,33 +285,32 @@ fn dot_width(a: &[f64], b: &[f64]) -> f64 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn dot_width_avx2(a: &[f64], b: &[f64]) -> f64 {
+unsafe fn dot_width_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     let (mut s0, mut s1, mut s2, mut s3) = (
-        _mm256_setzero_pd(),
-        _mm256_setzero_pd(),
-        _mm256_setzero_pd(),
-        _mm256_setzero_pd(),
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
+        _mm256_setzero_ps(),
     );
     let (pa, pb) = (a.as_ptr(), b.as_ptr());
     let mut i = 0;
-    while i + 16 <= WIDTH {
-        s0 = _mm256_fmadd_pd(_mm256_loadu_pd(pa.add(i)), _mm256_loadu_pd(pb.add(i)), s0);
-        s1 = _mm256_fmadd_pd(_mm256_loadu_pd(pa.add(i + 4)), _mm256_loadu_pd(pb.add(i + 4)), s1);
-        s2 = _mm256_fmadd_pd(_mm256_loadu_pd(pa.add(i + 8)), _mm256_loadu_pd(pb.add(i + 8)), s2);
-        s3 = _mm256_fmadd_pd(_mm256_loadu_pd(pa.add(i + 12)), _mm256_loadu_pd(pb.add(i + 12)), s3);
-        i += 16;
+    while i + 32 <= WIDTH {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), s0);
+        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i + 8)), _mm256_loadu_ps(pb.add(i + 8)), s1);
+        s2 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i + 16)), _mm256_loadu_ps(pb.add(i + 16)), s2);
+        s3 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i + 24)), _mm256_loadu_ps(pb.add(i + 24)), s3);
+        i += 32;
     }
-    while i + 4 <= WIDTH {
-        s0 = _mm256_fmadd_pd(_mm256_loadu_pd(pa.add(i)), _mm256_loadu_pd(pb.add(i)), s0);
-        i += 4;
+    while i + 8 <= WIDTH {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), s0);
+        i += 8;
     }
-    let s = _mm256_add_pd(_mm256_add_pd(s0, s1), _mm256_add_pd(s2, s3));
-    let lo = _mm256_castpd256_pd128(s);
-    let hi = _mm256_extractf128_pd(s, 1);
-    let sum2 = _mm_add_pd(lo, hi);
-    let hi2 = _mm_unpackhi_pd(sum2, sum2);
-    _mm_cvtsd_f64(_mm_add_sd(sum2, hi2))
+    // Reduce 8 lanes → scalar.
+    let s = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
+    let q = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps(s, 1)); // 4 lanes
+    let d = _mm_add_ps(q, _mm_movehl_ps(q, q)); // 2 lanes
+    _mm_cvtss_f32(_mm_add_ss(d, _mm_shuffle_ps(d, d, 1)))
 }
 
 /// Windowed-sinc kernel value at distance `x` (input samples) for cutoff `fc`.
