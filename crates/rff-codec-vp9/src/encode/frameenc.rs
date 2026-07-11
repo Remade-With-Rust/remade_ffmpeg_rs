@@ -296,7 +296,17 @@ impl FrameEncoder {
         const MULT_HI: f64 = 0.0013;
         const MULT_LO: f64 = 0.0005;
         let t = ((activity.max(0.1).ln() - A_LO.ln()) / (A_HI.ln() - A_LO.ln())).clamp(0.0, 1.0);
-        MULT_HI + t * (MULT_LO - MULT_HI)
+        let act_mult = MULT_HI + t * (MULT_LO - MULT_HI);
+        // Resolution FLOOR: the same activity carries less *real* detail to preserve at low
+        // resolution, so lowering λ over-codes there (CIF mobile/bus paid PSNR that equally-
+        // active 1080p didn't). Floor the activity λ at `res_mult` (0.0007 CIF → 0.0005 1080p)
+        // — the full model is λ(activity, resolution): activity picks λ, resolution floors it.
+        // Only bites low-res high-activity blocks; akiyo/foreman/1080p are unchanged.
+        if std::env::var("VP9_LAMBDA_NOFLOOR").is_ok() {
+            act_mult
+        } else {
+            act_mult.max(res_mult)
+        }
     }
 
     /// Create an encoder for a `width`×`height` frame. `src` holds the three
