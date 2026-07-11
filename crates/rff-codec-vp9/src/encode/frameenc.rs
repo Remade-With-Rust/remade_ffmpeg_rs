@@ -260,28 +260,43 @@ pub struct FrameEncoder {
 }
 
 impl FrameEncoder {
-    /// Resolution-adaptive λ multiplier for `λ = ac²·mult`, tuned for perceptual (VMAF)
-    /// quality: 0.0007 at CIF/SD ramping down to 0.0005 at 1080p (log-linear in pixels).
+    /// Content-**activity**-adaptive λ multiplier for `λ = ac²·mult`, tuned for perceptual
+    /// (VMAF) quality. Our RD minimises SSE, so the SSE-optimal λ under-codes the detail
+    /// VMAF rewards; lowering λ preserves it — but only where there IS detail to preserve.
     ///
-    /// Measured 2026-07-10 (BD-rate oracle, PSNR **and** VMAF, post-RD-skip). Our RD
-    /// minimises SSE, so the SSE-optimal λ (the old 0.001) systematically UNDER-codes the
-    /// detail VMAF rewards; lowering λ preserves it. The PSNR↔VMAF tradeoff differs by
-    /// resolution: at 1080p lowering to 0.0005 wins BOTH (−1.03% PSNR AND −9.28% VMAF), a
-    /// clean win. At CIF no λ wins both (0.001 is the Pareto crossover); 0.0007 spends
-    /// +1.30% PSNR-BD to buy −1.43% VMAF-BD — a deliberate perceptual-quality choice
-    /// (favour VMAF). `VP9_LAMBDA_MULT` overrides (A/B / recalibration).
-    fn lambda_mult(width: u32, height: u32) -> f64 {
+    /// Measured 2026-07-10: the right λ tracks CONTENT ACTIVITY, not resolution (the earlier
+    /// resolution model was a proxy — detailed content wants low λ at 480p/720p/1080p alike,
+    /// crowd_run BD-VMAF −7.7/−9.4/−10.8%). `activity` = mean |source − reference| luma.
+    /// High activity (detail/motion) → low λ (0.0005): preserve detail, big VMAF win. Static
+    /// content (akiyo, activity≈2) → high λ (0.0013): skip more, a PSNR win at ~0 VMAF cost
+    /// (no detail to lose). Log-linear interp, calibrated to per-clip optima (akiyo 2.0→0.0013,
+    /// foreman 5.9→~0.0008, crowd/mobile/bus/park 11–22→0.0005). Key/intra frames have no
+    /// temporal signal → resolution fallback. `VP9_LAMBDA_MULT` fixes it; `VP9_LAMBDA_RES`
+    /// forces the old resolution model (A/B).
+    fn lambda_mult(activity: f64, is_inter: bool, width: u32, height: u32) -> f64 {
         if let Some(m) = std::env::var("VP9_LAMBDA_MULT")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
         {
             return m;
         }
-        const LO_PX: f64 = 101_376.0; // 352×288 (CIF)   → mult 0.0007 (VMAF-favouring)
-        const HI_PX: f64 = 2_073_600.0; // 1920×1080 (HD) → mult 0.0005 (wins both metrics)
-        let px = ((width as f64) * (height as f64)).max(1.0);
-        let t = ((px.ln() - LO_PX.ln()) / (HI_PX.ln() - LO_PX.ln())).clamp(0.0, 1.0);
-        0.0007 + t * (0.0005 - 0.0007)
+        // Resolution model (old default / key-frame fallback): 0.0007 CIF → 0.0005 1080p.
+        let res_mult = {
+            const LO_PX: f64 = 101_376.0;
+            const HI_PX: f64 = 2_073_600.0;
+            let px = ((width as f64) * (height as f64)).max(1.0);
+            let t = ((px.ln() - LO_PX.ln()) / (HI_PX.ln() - LO_PX.ln())).clamp(0.0, 1.0);
+            0.0007 + t * (0.0005 - 0.0007)
+        };
+        if !is_inter || std::env::var("VP9_LAMBDA_RES").is_ok() {
+            return res_mult;
+        }
+        const A_LO: f64 = 2.0; // ≤ this (static) → MULT_HI
+        const A_HI: f64 = 11.0; // ≥ this (detail/motion) → MULT_LO
+        const MULT_HI: f64 = 0.0013;
+        const MULT_LO: f64 = 0.0005;
+        let t = ((activity.max(0.1).ln() - A_LO.ln()) / (A_HI.ln() - A_LO.ln())).clamp(0.0, 1.0);
+        MULT_HI + t * (MULT_LO - MULT_HI)
     }
 
     /// Create an encoder for a `width`×`height` frame. `src` holds the three
@@ -341,6 +356,24 @@ impl FrameEncoder {
         ];
         let is_inter = ref_recon.is_some();
         let ref_planes = ref_recon.map(|[ry, ru, rv]| [mk(0, 0, ry), mk(1, 1, ru), mk(1, 1, rv)]);
+        // Per-frame temporal activity = mean |source − reference| over the luma (stride-4
+        // subsample) — the ZEROMV residual energy, a motion/detail proxy that drives the
+        // activity-adaptive λ. 0 on key frames (no reference → treated as low activity).
+        let activity = ref_planes.as_ref().map_or(0.0, |rp| {
+            let (s, r) = (&src[0].buf, &rp[0].buf);
+            let n = s.len().min(r.len());
+            let (mut acc, mut cnt) = (0u64, 0u64);
+            let mut i = 0;
+            while i < n {
+                acc += (s[i] as i32 - r[i] as i32).unsigned_abs() as u64;
+                cnt += 1;
+                i += 4;
+            }
+            if cnt > 0 { acc as f64 / cnt as f64 } else { 0.0 }
+        });
+        if std::env::var("VP9_ACT_DEBUG").is_ok() {
+            eprintln!("ACT activity={:.3} inter={}", activity, is_inter);
+        }
         let dc_y = dc_quant(qindex as i32, 8);
         let ac_y = ac_quant(qindex as i32, 8);
         FrameEncoder {
@@ -375,8 +408,10 @@ impl FrameEncoder {
             fc: FrameContext::defaults(),
             use_rdo: true,
             // Rate-distortion multiplier `ac²·mult` for `J = SSE + lambda·bits`,
-            // resolution-adaptive (`Self::lambda_mult`). `VP9_LAMBDA_MULT` overrides.
-            lambda: (ac_y as f64) * (ac_y as f64) * Self::lambda_mult(width, height),
+            // content-activity-adaptive (`Self::lambda_mult`). `VP9_LAMBDA_MULT` overrides.
+            lambda: (ac_y as f64)
+                * (ac_y as f64)
+                * Self::lambda_mult(activity, is_inter, width, height),
             lf_level: 0,
             counts: FrameCounts::zeroed(),
             commit_fc: None,
