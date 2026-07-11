@@ -260,16 +260,16 @@ pub struct FrameEncoder {
 }
 
 impl FrameEncoder {
-    /// Resolution-adaptive λ multiplier for `λ = ac²·mult`. λ only DECREASES with
-    /// resolution: CIF/SD stays at the calibrated 0.001, HD ramps down to 0.0005.
+    /// Resolution-adaptive λ multiplier for `λ = ac²·mult`, tuned for perceptual (VMAF)
+    /// quality: 0.0007 at CIF/SD ramping down to 0.0005 at 1080p (log-linear in pixels).
     ///
-    /// Measured 2026-07-10 (BD-rate oracle, PSNR **and** VMAF, post-RD-skip): raising λ
-    /// for CIF won BD-PSNR (−0.87%) but LOST BD-VMAF (+2.07%) — over-skipping trades away
-    /// perceptual quality PSNR doesn't see — so the CIF end is pinned at the unchanged
-    /// 0.001 (SD output is byte-identical to before). Lowering λ for HD codes more residual
-    /// and preserves detail: a large BD-VMAF win (crowd_run −10.83%) at ~neutral PSNR.
-    /// Log-linear interp in pixel count between the two points, clamped. `VP9_LAMBDA_MULT`
-    /// overrides (A/B probe / calibration).
+    /// Measured 2026-07-10 (BD-rate oracle, PSNR **and** VMAF, post-RD-skip). Our RD
+    /// minimises SSE, so the SSE-optimal λ (the old 0.001) systematically UNDER-codes the
+    /// detail VMAF rewards; lowering λ preserves it. The PSNR↔VMAF tradeoff differs by
+    /// resolution: at 1080p lowering to 0.0005 wins BOTH (−1.03% PSNR AND −9.28% VMAF), a
+    /// clean win. At CIF no λ wins both (0.001 is the Pareto crossover); 0.0007 spends
+    /// +1.30% PSNR-BD to buy −1.43% VMAF-BD — a deliberate perceptual-quality choice
+    /// (favour VMAF). `VP9_LAMBDA_MULT` overrides (A/B / recalibration).
     fn lambda_mult(width: u32, height: u32) -> f64 {
         if let Some(m) = std::env::var("VP9_LAMBDA_MULT")
             .ok()
@@ -277,11 +277,11 @@ impl FrameEncoder {
         {
             return m;
         }
-        const LO_PX: f64 = 101_376.0; // 352×288 (CIF)   → mult 0.001 (unchanged)
-        const HI_PX: f64 = 2_073_600.0; // 1920×1080 (HD) → mult 0.0005
+        const LO_PX: f64 = 101_376.0; // 352×288 (CIF)   → mult 0.0007 (VMAF-favouring)
+        const HI_PX: f64 = 2_073_600.0; // 1920×1080 (HD) → mult 0.0005 (wins both metrics)
         let px = ((width as f64) * (height as f64)).max(1.0);
         let t = ((px.ln() - LO_PX.ln()) / (HI_PX.ln() - LO_PX.ln())).clamp(0.0, 1.0);
-        0.001 + t * (0.0005 - 0.001)
+        0.0007 + t * (0.0005 - 0.0007)
     }
 
     /// Create an encoder for a `width`×`height` frame. `src` holds the three
@@ -4850,11 +4850,16 @@ mod tests {
             let uv = vec![128u16; (cw / 2) * (ch / 2)];
             [y, uv.clone(), uv]
         };
+        // Pin λ to the historical default: this test verifies the empty-block→skip
+        // *conformance* machinery, not the shipped resolution-adaptive λ tuning (which
+        // deliberately lowers λ, coding more residual so fewer blocks fall fully empty).
         let mut enc0 = FrameEncoder::new(w, h, 48, src(), None);
+        enc0.set_lambda_mult(0.001);
         let key = enc0.encode_frame();
         let recon0 = enc0.recon_owned();
         // Same content ⇒ ZEROMV re-predicts it exactly ⇒ most blocks empty ⇒ skip.
         let mut enc1 = FrameEncoder::new(w, h, 48, src(), Some(recon0));
+        enc1.set_lambda_mult(0.001);
         let bytes = enc1.encode_frame();
         assert!(
             enc1.debug_skip_count() > 0,
