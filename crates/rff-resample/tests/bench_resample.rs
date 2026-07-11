@@ -21,6 +21,32 @@ fn make_stereo_44k(seconds: usize) -> Vec<f32> {
     v
 }
 
+/// Measure the resampler's anti-alias stopband IN ISOLATION (no codec): resample
+/// an 88.2 kHz tone to 48 kHz and report output level vs a passband reference.
+/// Above the 24 kHz output Nyquist the tone must be deeply suppressed.
+#[test]
+#[ignore]
+fn stopband_isolation_88k_to_48k() {
+    let rate_in = 88_200u32;
+    let tone = |f: f64| -> f64 {
+        let n = rate_in as usize; // 1 s
+        let inp: Vec<f32> = (0..n)
+            .map(|i| (0.6 * (std::f64::consts::TAU * f * i as f64 / rate_in as f64).sin()) as f32)
+            .collect();
+        let mut rs = Resampler::new(rate_in, 48_000, 1);
+        let mut out = rs.process(&inp);
+        out.extend(rs.finish());
+        let body = &out[2000..out.len().saturating_sub(2000)];
+        (body.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / body.len().max(1) as f64).sqrt()
+    };
+    let refr = tone(10_000.0);
+    eprintln!("resampler-only 88.2k->48k stopband (ref 10 kHz rms={refr:.4}):");
+    for f in [10_000.0, 20_000.0, 22_000.0, 24_000.0, 26_000.0, 30_000.0, 40_000.0] {
+        let db = 20.0 * (tone(f).max(1e-12) / refr).log10();
+        eprintln!("  {:6.0} Hz  {:+7.1} dB", f, db);
+    }
+}
+
 #[test]
 #[ignore]
 fn bench_44k_to_48k_stereo() {

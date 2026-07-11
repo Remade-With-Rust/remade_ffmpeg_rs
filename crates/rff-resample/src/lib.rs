@@ -9,8 +9,12 @@
 //! The cutoff tracks the lower of the input/output Nyquist limits, so
 //! downsampling is anti-aliased rather than naively decimated.
 
-/// Half-width of the FIR kernel, in input samples (so 2·TAPS taps total).
-const TAPS: isize = 16;
+/// Half-width of the FIR kernel, in input samples (so 2·TAPS taps total). 32
+/// half-taps (64-tap FIR) sharpen the transition band enough that, with the
+/// Blackman-Harris window below, supersonic content is suppressed to ~−90 dB
+/// (a 16-tap Blackman filter only reached ~−50 dB near the cutoff, folding
+/// >24 kHz material from 88.2/96 kHz sources down at audible-ish levels).
+const TAPS: isize = 32;
 /// Total kernel width (number of taps).
 const WIDTH: usize = 2 * TAPS as usize;
 /// Largest polyphase table (distinct sub-sample phases) we precompute. Every
@@ -319,10 +323,12 @@ fn kernel(x: f64, fc: f64) -> f64 {
     if x.abs() > n {
         return 0.0;
     }
-    // Blackman window over [-TAPS, TAPS].
+    // 4-term Blackman-Harris window over [-TAPS, TAPS] (peak sidelobe ≈ −92 dB,
+    // vs Blackman's ≈ −58 dB) — sets the FIR stopband floor for anti-aliasing.
     let t = (x + n) / (2.0 * n); // 0..1
     let two_pi = std::f64::consts::TAU;
-    let window = 0.42 - 0.5 * (two_pi * t).cos() + 0.08 * (2.0 * two_pi * t).cos();
+    let window = 0.358_75 - 0.488_29 * (two_pi * t).cos() + 0.141_28 * (2.0 * two_pi * t).cos()
+        - 0.011_68 * (3.0 * two_pi * t).cos();
     2.0 * fc * sinc(2.0 * fc * x) * window
 }
 
