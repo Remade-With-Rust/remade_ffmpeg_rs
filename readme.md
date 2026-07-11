@@ -96,8 +96,23 @@
 > a diffuse stereo-coding-efficiency gap with no isolated lever — theta split, intensity, and
 > dynalloc boosts were all ceiling-probed and refuted), plus a borderline 128k-stereo edge.
 > On **speed** the same matrix (vs the `opus_demo` reference build) has us **encode-faster on
-> every clip** and **decode ~20% slower** — but that's against a stock `-O2` reference, *not*
-> ffmpeg's asm-tuned `libopus`, so the honest per-thread encode gap is still the ~2.9× above.
+> every clip** — but that's against a stock `-O2` reference, *not* ffmpeg's asm-tuned `libopus`,
+> so the honest per-thread encode gap is still the ~2.9× above.
+>
+> **⚡ Decoder speed campaign — SIMD where it pays, and a proof of where it can't.** We turned
+> the same profile-first discipline on the *decode* path and shipped **two byte-identical
+> kernels**: an **SSE2 8-tap resampler FIR** (`madd_epi16` + a contiguous coefficient table
+> that also kills a double-index — **~18% off the SILK output resampler**) and an **AVX2 comb
+> filter** for the CELT postfilter (**~4–5× on the kernel**, min/max non-overlapping). The comb
+> filter is the fun one: it *looks* like an un-vectorizable feedback recurrence, but the pitch
+> delay `t1 ≥ 15` always exceeds the 8-wide vector, so a batch never reads its own writes — five
+> *overlapping contiguous* loads (no gather) with non-FMA math reproduce the scalar rounding
+> **bit-for-bit**. Then the honest part: we profiled the rest, tried the obvious levers
+> (`exp_rotation` SIMD, unchecked/`#[inline]` on the hot lookup), **measured them flat, and
+> reverted them.** The decoder is at its **algorithmic ceiling** — 61% of decode is the PVQ
+> combinatorial `cwrsi`, whose lookup table *and* search are **identical to `libopus`** (a
+> bit-exact entropy path has no faster form), and the deemphasis is an inherently serial IIR.
+> Every kernel that *could* be vectorized now is; what's left is asm scheduling, not missing SIMD.
 >
 > **Streaming robustness is now feature-complete** (all ports of / equivalent to `libopus`,
 > conformance untouched): packet-loss concealment for **both SILK** (LTP/LPC extrapolation +
