@@ -94,8 +94,12 @@
 > narrowing to parity by ~200k. It is *not* the near-mono corner and *not* explained by bit-spend.
 > Per-frame instrumentation traced it: our mid/side split spends ~46% of stereo-band bits on the
 > side channel and reconstructs the stereo image *more* faithfully than `libopus` — so the lever
-> is **not** the stereo split (narrowing the transmitted angle only makes PEAQ worse, confirmed).
-> The gap is broader mid/overall CELT coding on spectrally-richer stereo content, still open.
+> is **not** the stereo split (narrowing the transmitted angle only makes PEAQ worse, confirmed);
+> recon-SNR is equal per bit, so it's noise *shaping*, not fidelity. The tractable lever turned
+> out to be **`alloc_trim`**: a **+1 LF tilt on stereo music** (gated to `channels==2`, transmitted
+> so fully conformant) recovers **~0.03–0.10 ODG** across 64–192k with no mono/low-rate regressions,
+> closing roughly a quarter of the gap. The remainder — broader mid/overall CELT coding on
+> spectrally-richer stereo content — is still open.
 > *(An earlier internal matrix reported a stereo-music win; the bitrate-matched sweep overturns
 > that — we correct the record here rather than keep a number that doesn't reproduce.)*
 > On **speed**, our per-thread CELT is competitive and frame-parallel encoding wins wall-clock
