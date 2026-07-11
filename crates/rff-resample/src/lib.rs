@@ -11,6 +11,27 @@
 
 /// Half-width of the FIR kernel, in input samples (so 2·TAPS taps total).
 const TAPS: isize = 16;
+/// Total kernel width (number of taps).
+const WIDTH: usize = 2 * TAPS as usize;
+/// Largest polyphase table (distinct sub-sample phases) we precompute. Every
+/// common audio-rate pair reduces to a small denominator (44.1↔48k → 160,
+/// 22.05→48k → 320, …); anything larger falls back to the scalar kernel.
+const MAX_PHASES: usize = 8192;
+
+/// Precomputed polyphase filter bank for a fixed rational ratio. The kernel
+/// weights depend only on the sub-sample phase (and cutoff), both
+/// signal-independent, and the phase set repeats *exactly* every `den` outputs
+/// — so all per-output transcendentals collapse to a table lookup.
+struct Poly {
+    /// `den` phases × `WIDTH` taps, row-major (`weights[phase*WIDTH + k]`).
+    weights: Vec<f64>,
+    /// Reciprocal kernel-weight sum per phase (turns the per-output divide into
+    /// a multiply). `1.0` where the sum was zero.
+    inv_wsum: Vec<f64>,
+    /// Phase step per output (= in_rate/gcd) and modulus (= out_rate/gcd).
+    num: usize,
+    den: usize,
+}
 
 /// A stateful interleaved-`f32` audio resampler from one rate to another.
 pub struct Resampler {
@@ -22,21 +43,75 @@ pub struct Resampler {
     buf: Vec<Vec<f64>>,
     /// Read position (input-sample index into `buf`) of the next output sample.
     pos: f64,
+    /// Polyphase bank + integer position/phase (present iff the ratio is
+    /// rational with `den ≤ MAX_PHASES`). `None` → scalar per-output kernel.
+    poly: Option<Poly>,
+    ipos: usize,   // integer input index of the next output (mirrors pos.floor())
+    iphase: usize, // sub-sample phase in [0, den)
+    force_scalar: bool, // test-only: bypass the polyphase path to exercise the oracle
+}
+
+/// Greatest common divisor (Euclid).
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a.max(1)
 }
 
 impl Resampler {
     /// Create a resampler converting `in_rate` → `out_rate` for `channels`.
     pub fn new(in_rate: u32, out_rate: u32, channels: u16) -> Resampler {
         let channels = channels.max(1) as usize;
-        let ratio = out_rate.max(1) as f64 / in_rate.max(1) as f64;
+        let in_rate = in_rate.max(1);
+        let out_rate = out_rate.max(1);
+        let ratio = out_rate as f64 / in_rate as f64;
+        let cutoff = 0.5 * ratio.min(1.0);
+
+        // Build the polyphase bank when the reduced denominator is small enough.
+        let g = gcd(in_rate, out_rate);
+        let den = (out_rate / g) as usize;
+        let num = (in_rate / g) as usize;
+        let poly = (den <= MAX_PHASES).then(|| {
+            let mut weights = vec![0.0f64; den * WIDTH];
+            let mut inv_wsum = vec![0.0f64; den];
+            for p in 0..den {
+                let frac = p as f64 / den as f64; // sub-sample offset in [0,1)
+                let mut wsum = 0.0;
+                for k in 0..WIDTH {
+                    // Matches the scalar path's x = pos - j with j = center-TAPS+1+k:
+                    // x = frac + (TAPS-1-k).
+                    let x = frac + (TAPS - 1 - k as isize) as f64;
+                    let w = kernel(x, cutoff);
+                    weights[p * WIDTH + k] = w;
+                    wsum += w;
+                }
+                inv_wsum[p] = if wsum == 0.0 { 1.0 } else { 1.0 / wsum };
+            }
+            Poly { weights, inv_wsum, num, den }
+        });
+
         Resampler {
             out_rate,
             channels,
             ratio,
-            cutoff: 0.5 * ratio.min(1.0),
+            cutoff,
             buf: vec![vec![0.0; TAPS as usize]; channels],
             pos: TAPS as f64,
+            poly,
+            ipos: TAPS as usize,
+            iphase: 0,
+            force_scalar: false,
         }
+    }
+
+    /// Test-only: force the scalar per-output kernel (the oracle) so the
+    /// polyphase output can be gated against it.
+    #[doc(hidden)]
+    pub fn force_scalar_oracle(&mut self) {
+        self.force_scalar = true;
     }
 
     pub fn out_rate(&self) -> u32 {
@@ -66,8 +141,57 @@ impl Resampler {
     }
 
     /// Produce every output whose kernel window is fully covered by `buf`, then
-    /// trim consumed history.
+    /// trim consumed history. Dispatches to the precomputed polyphase bank when
+    /// available (the common case), else the scalar per-output kernel.
     fn run(&mut self) -> Vec<f32> {
+        if self.poly.is_some() && !self.force_scalar {
+            return self.run_poly();
+        }
+        self.run_scalar()
+    }
+
+    /// Polyphase hot path: per output, look up the phase's precomputed weights
+    /// and do the FIR dot product — zero transcendentals in steady state.
+    fn run_poly(&mut self) -> Vec<f32> {
+        let ch = self.channels;
+        let len = self.buf[0].len();
+        let mut out: Vec<f32> = Vec::new();
+        let poly = self.poly.as_ref().unwrap();
+        let (num, den) = (poly.num, poly.den);
+        // An output at `ipos` needs input indices ipos-TAPS+1 ..= ipos+TAPS.
+        while self.ipos + TAPS as usize + 1 <= len {
+            let base = self.ipos + 1 - TAPS as usize;
+            let w = &poly.weights[self.iphase * WIDTH..self.iphase * WIDTH + WIDTH];
+            let inv = poly.inv_wsum[self.iphase];
+            for c in 0..ch {
+                let bc = &self.buf[c][base..base + WIDTH];
+                let mut acc = 0.0;
+                for k in 0..WIDTH {
+                    acc += bc[k] * w[k];
+                }
+                out.push((acc * inv) as f32);
+            }
+            self.iphase += num;
+            while self.iphase >= den {
+                self.iphase -= den;
+                self.ipos += 1;
+            }
+        }
+
+        // Drop history we no longer need (keep TAPS-1 samples before `ipos`).
+        let keep_from = (self.ipos as isize - TAPS + 1).max(0) as usize;
+        if keep_from > 0 {
+            for c in 0..ch {
+                self.buf[c].drain(0..keep_from);
+            }
+            self.ipos -= keep_from;
+        }
+        out
+    }
+
+    /// Scalar per-output kernel (the correctness oracle + fallback for
+    /// irrational / large-denominator ratios).
+    fn run_scalar(&mut self) -> Vec<f32> {
         let ch = self.channels;
         let len = self.buf[0].len() as isize;
         let mut out: Vec<f32> = Vec::new();
@@ -176,6 +300,42 @@ mod tests {
         let rms =
             (body.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / body.len() as f64).sqrt();
         assert!(rms < 0.1, "aliasing not suppressed: rms {rms:.3}");
+    }
+
+    #[test]
+    fn polyphase_matches_scalar_oracle() {
+        // The polyphase bank must reproduce the scalar per-output kernel to well
+        // within float precision (the only difference is exact-rational phase vs
+        // f64-accumulated phase — sub-ULP). Gate: SNR > 100 dB on a real signal.
+        let input: Vec<f32> = (0..44_100 * 4)
+            .flat_map(|i| {
+                let t = i as f64 / 44_100.0;
+                let s = (std::f64::consts::TAU * 997.0 * t).sin()
+                    + 0.5 * (std::f64::consts::TAU * 5000.0 * t).sin();
+                [(s * 0.4) as f32]
+            })
+            .collect();
+
+        let mut poly = Resampler::new(44_100, 48_000, 1);
+        let mut po = poly.process(&input);
+        po.extend(poly.finish());
+
+        let mut scal = Resampler::new(44_100, 48_000, 1);
+        scal.force_scalar_oracle();
+        let mut so = scal.process(&input);
+        so.extend(scal.finish());
+
+        assert_eq!(po.len(), so.len(), "poly/scalar length mismatch");
+        let n = po.len().min(so.len());
+        let (mut sig, mut err) = (0.0f64, 0.0f64);
+        for i in 0..n {
+            let a = so[i] as f64;
+            let d = po[i] as f64 - a;
+            sig += a * a;
+            err += d * d;
+        }
+        let snr = 10.0 * (sig / err.max(1e-30)).log10();
+        assert!(snr > 100.0, "polyphase vs oracle SNR only {snr:.1} dB");
     }
 
     #[test]
