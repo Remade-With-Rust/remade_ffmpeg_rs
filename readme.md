@@ -85,19 +85,21 @@
 > at unity. Per-thread we're still ~2.9× behind `libopus`'s hand-written assembly NSQ — the
 > honest single-thread gap — but the wall-clock race is one a single-threaded encoder can't win.
 
-> **🎯 Quality & robustness vs `libopus` (measured head-to-head).** An 8-point
-> content×rate matrix (speech/music × mono/stereo × 16–128 kbps, complexity 9, CBR),
-> scored on **PEAQ ODG** with a **reconstruction-SNR guard** — the discipline that keeps
-> us honest: a sub-0.1 ODG "loss" whose SNR is at parity is metric noise on
-> differently-shaped-but-equal-fidelity output, not a real deficit. Result: **parity-or-better
-> across the board.** We **win outright on stereo music** (**+0.25 ODG @96k, +0.6 @64k** —
-> our CELT stereo shapes quantization noise more favorably), win or tie on mono speech/music,
-> and have **one genuine deficit**: near-mono *stereo speech* at 64k+ (−0.18 ODG / −6 dB SNR,
-> a diffuse stereo-coding-efficiency gap with no isolated lever — theta split, intensity, and
-> dynalloc boosts were all ceiling-probed and refuted), plus a borderline 128k-stereo edge.
-> On **speed** the same matrix (vs the `opus_demo` reference build) has us **encode-faster on
-> every clip** — but that's against a stock `-O2` reference, *not* ffmpeg's asm-tuned `libopus`,
-> so the honest per-thread encode gap is still the ~2.9× above.
+> **🎯 Quality vs `libopus` (measured head-to-head, PEAQ ODG).** Scored on **PEAQ ODG**
+> with a **reconstruction-SNR guard** — the discipline that keeps us honest: a sub-0.1 ODG
+> "loss" whose SNR is at parity is metric noise, not a real deficit. **Mono** (speech and
+> music) sits at **parity** with `libopus` once bitrate-matched. **Stereo music is an honest
+> deficit**, though — a fresh **bitrate-matched RD sweep** (real guitar + piano clips, 4 rates,
+> ODG interpolated to equal *actual* kbps) shows us **~0.4–0.5 ODG behind `libopus` at 96–128k**,
+> narrowing to parity by ~200k. It is *not* the near-mono corner and *not* explained by bit-spend.
+> Per-frame instrumentation traced it: our mid/side split spends ~46% of stereo-band bits on the
+> side channel and reconstructs the stereo image *more* faithfully than `libopus` — so the lever
+> is **not** the stereo split (narrowing the transmitted angle only makes PEAQ worse, confirmed).
+> The gap is broader mid/overall CELT coding on spectrally-richer stereo content, still open.
+> *(An earlier internal matrix reported a stereo-music win; the bitrate-matched sweep overturns
+> that — we correct the record here rather than keep a number that doesn't reproduce.)*
+> On **speed**, our per-thread CELT is competitive and frame-parallel encoding wins wall-clock
+> (~3× `libopus` on music, see the spotlight above); the honest single-thread SILK gap is ~2.9×.
 >
 > **⚡ Decoder speed campaign — SIMD where it pays, and a proof of where it can't.** We turned
 > the same profile-first discipline on the *decode* path and shipped **two byte-identical
