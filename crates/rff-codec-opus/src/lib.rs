@@ -221,20 +221,40 @@ impl OpusEnc {
     /// Encode as many whole frames as `buffer` currently holds.
     fn drain_frames(&mut self) -> Result<()> {
         let frame_samples = self.frame_size * self.channels as usize;
-        let enc = self.enc.as_mut().expect("encoder initialized");
-        while self.buffer.len() >= frame_samples {
-            let chunk: Vec<f32> = self.buffer.drain(..frame_samples).collect();
+        if frame_samples == 0 || self.buffer.len() < frame_samples {
+            return Ok(());
+        }
+        // Iterate whole frames in place with a cursor and drain the consumed
+        // prefix ONCE at the end. Draining a frame off the FRONT each iteration
+        // (`buffer.drain(..frame_samples)`) shifts the whole remaining buffer down
+        // per frame — O(n²) over a fully-buffered stream, and it dominated encode
+        // wall time (~5× the codec itself). Destructure `self` so the input slice
+        // (`buffer`) and the encoder (`enc`) borrow as distinct fields.
+        let OpusEnc {
+            enc,
+            buffer,
+            queue,
+            next_pts,
+            frame_size,
+            ..
+        } = self;
+        let enc = enc.as_mut().expect("encoder initialized");
+        let frame_size = *frame_size;
+        let n_full = buffer.len() / frame_samples;
+        for i in 0..n_full {
+            let chunk = &buffer[i * frame_samples..(i + 1) * frame_samples];
             let mut out = vec![0u8; 4000]; // max Opus packet size
             let n = enc
-                .encode(&chunk, self.frame_size, &mut out)
+                .encode(chunk, frame_size, &mut out)
                 .map_err(|e| Error::invalid(format!("opus encode: {e}")))?;
             out.truncate(n);
             // PTS in per-channel samples; each 20 ms frame advances by frame_size.
             let mut packet = Packet::from_data(0, out);
-            packet.pts = Some(self.next_pts);
-            self.next_pts += self.frame_size as i64;
-            self.queue.push_back(packet);
+            packet.pts = Some(*next_pts);
+            *next_pts += frame_size as i64;
+            queue.push_back(packet);
         }
+        buffer.drain(..n_full * frame_samples);
         Ok(())
     }
 
