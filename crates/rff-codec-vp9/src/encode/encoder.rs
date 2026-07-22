@@ -340,6 +340,19 @@ pub struct Vp9Encoder {
     /// two-pass, trellis, tx-search) for a graceful quality→speed trade. See
     /// [`FrameEncoder::set_speed`](super::frameenc::FrameEncoder::set_speed).
     speed: u32,
+    /// Lever 2 — time-budget controller target: the per-frame decision-pass wall
+    /// time (µs) the content-adaptive dispatch should hold. `Some` engages the
+    /// controller (`VP9_DISPATCH_BUDGET=<ms>`); then `dispatch_q_state` is
+    /// steered per frame to hit this, making per-frame
+    /// encode time content-INVARIANT (bus/mobile route more to the variance
+    /// partition, akiyo less) rather than merely flatter. `None` = fixed-q dispatch.
+    dispatch_budget_us: Option<u64>,
+    /// Lever 2 — the controller's live route fraction, persisted across frames
+    /// (a `FrameEncoder` is per-frame, so the state lives here). Fed into each
+    /// frame via [`FrameEncoder::set_dispatch_q`] and nudged after by the measured
+    /// decision time. Seeded at 0.5; the integral update drives steady-state error
+    /// to zero when the budget is reachable within `[0, 0.95]`.
+    dispatch_q_state: f64,
 }
 
 impl Default for Vp9Encoder {
@@ -359,7 +372,13 @@ impl Default for Vp9Encoder {
             golden_slot: 1,
             arf_slot: 2,
             group_dims: None,
-            speed: 0,
+            // Default speed preset. 3 = the balanced default (2026-07-18): on top
+            // of speed 2 it adds the libvpx-cpu3-derived speed features (split
+            // early-termination, adaptive mode-skip, 64×64 partition gate) for
+            // +1.02% BD-rate at ~1.3× faster — a clean Pareto step. Speed 2 (the
+            // prior default, byte-identical to the pinned corpus) and speed 0 (the
+            // exhaustive-RD anchor) remain selectable. `-speed`/`-cpu-used N` overrides.
+            speed: 3,
             chain: std::env::var("VP9_NO_CHAIN").is_err(), // F3: corpus-gated −11.15% BD
             companion: None,
             chain_prev_p: false,
@@ -375,6 +394,12 @@ impl Default for Vp9Encoder {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.5),
+            dispatch_budget_us: std::env::var("VP9_DISPATCH_BUDGET")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|ms| *ms > 0.0)
+                .map(|ms| (ms * 1000.0) as u64),
+            dispatch_q_state: 0.5,
         }
     }
 }
@@ -435,6 +460,21 @@ impl Encoder for Vp9Encoder {
         {
             self.tf_strength = s.max(0.0);
         }
+        // `-dispatch-budget MS` engages the content-adaptive time-budget controller:
+        // per frame, the variance-partition route fraction is steered to hold the
+        // decision pass near MS milliseconds — a per-frame latency/throughput target
+        // that caps encode time on complex content while easy content stays full-RD.
+        // 0/absent = off. Overrides the `VP9_DISPATCH_BUDGET` env default.
+        if let Some(ms) = options
+            .get("dispatch-budget")
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            self.dispatch_budget_us = if ms > 0.0 {
+                Some((ms * 1000.0) as u64)
+            } else {
+                None
+            };
+        }
         // Two-pass: `-pass 2` (ffmpeg-style; `-pass 1` is a discardable analysis pass we
         // fold into pass 2 internally) or an explicit `twopass=1`. Needs `-b:v`.
         if options.get("pass").map(|v| v.trim()) == Some("2")
@@ -450,7 +490,9 @@ impl Encoder for Vp9Encoder {
             .or_else(|| options.get("quality"))
             .and_then(|v| v.parse::<u32>().ok())
         {
-            self.speed = sp.min(4);
+            // 0–3 = the RD-quality ladder; 4–6 = the realtime rungs (content-adaptive
+            // variance-partition dispatcher, rising route fraction). See `set_speed`.
+            self.speed = sp.min(6);
         }
         Ok(())
     }
@@ -534,6 +576,39 @@ impl Vp9Encoder {
         }
     }
 
+    /// Lever 2 (time-budget controller) — feed the current adapted route fraction
+    /// into a frame encoder before it encodes. No-op unless the budget is engaged.
+    fn budget_apply(&self, enc: &mut FrameEncoder) {
+        if self.dispatch_budget_us.is_some() {
+            enc.set_dispatch_q(self.dispatch_q_state);
+        }
+    }
+
+    /// Lever 2 — after a frame encodes, steer the route fraction toward the target
+    /// decision-pass time from the measured cost. The key frame's intra cost is
+    /// anomalous, so it feeds q in but never drives the controller.
+    fn budget_update(&mut self, enc: &FrameEncoder, is_key: bool) {
+        if let Some(budget) = self.dispatch_budget_us {
+            if !is_key {
+                // Integral controller on q: it accumulates the normalized error, so
+                // steady-state error → 0 when the target is reachable within [0,0.95].
+                let err = (enc.decision_us() as f64 - budget as f64) / budget as f64;
+                const K: f64 = 0.4; // gain: settles in a few frames without ringing
+                let prev = self.dispatch_q_state;
+                self.dispatch_q_state = (prev + K * err).clamp(0.0, 0.95);
+                if std::env::var("VP9_BUDGET_DEBUG").is_ok() {
+                    eprintln!(
+                        "BUDGET decision={:.1}ms target={:.1}ms q {:.3}->{:.3}",
+                        enc.decision_us() as f64 / 1000.0,
+                        budget as f64 / 1000.0,
+                        prev,
+                        self.dispatch_q_state
+                    );
+                }
+            }
+        }
+    }
+
     /// Code one shown KEY or P frame at the single-pass qindex, feeding the rate
     /// controller the bits it spent.
     fn code_frame(
@@ -570,6 +645,7 @@ impl Vp9Encoder {
         let is_key = reference.is_none();
         let mut enc = FrameEncoder::new(w, h, qindex, coded, reference);
         enc.set_speed(self.speed);
+        self.budget_apply(&mut enc);
         let chaining = self.chain && ((self.lag == 0 && !self.twopass) || self.pass2_chaining);
         if chaining && !is_key {
             if let Some(c) = &self.companion {
@@ -592,6 +668,7 @@ impl Vp9Encoder {
             }
         }
         let bytes = enc.encode_frame();
+        self.budget_update(&enc, is_key);
         if chaining {
             use rff_codec::Decoder as _;
             let comp = self
@@ -818,7 +895,9 @@ impl Vp9Encoder {
         let q = self.next_qindex();
         let mut enc = FrameEncoder::new(w, h, q, coded, None);
         enc.set_speed(self.speed);
+        self.budget_apply(&mut enc);
         let bytes = enc.encode_frame();
+        self.budget_update(&enc, true);
         let recon = enc.recon_owned();
         self.slots = [Some(recon.clone()), Some(recon.clone()), Some(recon)];
         bytes
@@ -831,6 +910,11 @@ impl Vp9Encoder {
         let idx = [0, self.golden_slot, self.arf_slot];
         let mut enc = FrameEncoder::new(w, h, q, coded, self.slots[0].clone());
         enc.set_speed(self.speed);
+        self.budget_apply(&mut enc);
+        // Compound default-on for the whole ARF group (quality tier): the ARF frame does
+        // LAST+GOLDEN, the shown P frames that reference it do true bi-prediction — kept
+        // consistent across the group so libvpx accepts it. `VP9_NO_COMPOUND` opts out.
+        enc.set_compound(self.speed <= 3);
         if self.group_chain {
             if let Some((fc, mvs)) = self.chain_args() {
                 enc.set_chain(fc, mvs);
@@ -840,6 +924,7 @@ impl Vp9Encoder {
         enc.set_ref_frame_idx(idx);
         enc.set_hidden_altref(self.arf_slot);
         let bytes = enc.encode_frame();
+        self.budget_update(&enc, false);
         self.slots[self.arf_slot] = Some(enc.recon_owned());
         bytes
     }
@@ -857,6 +942,10 @@ impl Vp9Encoder {
         let idx = [0, self.golden_slot, self.arf_slot];
         let mut enc = FrameEncoder::new(w, h, q, coded, self.slots[0].clone());
         enc.set_speed(self.speed);
+        self.budget_apply(&mut enc);
+        // Compound default-on across the ARF group (a shown P referencing the future ARF
+        // does true bi-prediction). Quality tier only. `VP9_NO_COMPOUND` opts out.
+        enc.set_compound(self.speed <= 3);
         if self.group_chain && self.slots[0].is_some() {
             if let Some((fc, mvs)) = self.chain_args() {
                 enc.set_chain(fc, mvs);
@@ -873,6 +962,7 @@ impl Vp9Encoder {
             enc.set_refresh_frame_flags(1); // refresh LAST (slot 0)
         }
         let bytes = enc.encode_frame();
+        self.budget_update(&enc, self.slots[0].is_none());
         self.slots[0] = Some(enc.recon_owned());
         bytes
     }

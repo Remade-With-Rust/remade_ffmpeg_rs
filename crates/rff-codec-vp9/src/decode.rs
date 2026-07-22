@@ -467,7 +467,7 @@ pub(crate) fn intra_inter_context(above: Option<&ModeInfo>, left: Option<&ModeIn
     }
 }
 
-fn switchable_interp_context(above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> usize {
+pub(crate) fn switchable_interp_context(above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> usize {
     const SW: usize = 3; // SWITCHABLE_FILTERS
     let left_type = left.map_or(SW, |m| m.interp_filter as usize);
     let above_type = above.map_or(SW, |m| m.interp_filter as usize);
@@ -608,7 +608,7 @@ pub(crate) fn single_ref_p2(above: Option<&ModeInfo>, left: Option<&ModeInfo>) -
 }
 
 /// `vp9_get_reference_mode_context` — single-vs-compound prediction context.
-fn reference_mode_context(
+pub(crate) fn reference_mode_context(
     a: Option<&ModeInfo>,
     l: Option<&ModeInfo>,
     _sb: [bool; 4],
@@ -639,7 +639,7 @@ fn reference_mode_context(
 }
 
 /// `vp9_get_pred_context_comp_ref_p` — the compound-reference bit context.
-fn comp_ref_context(
+pub(crate) fn comp_ref_context(
     a: Option<&ModeInfo>,
     l: Option<&ModeInfo>,
     sb: [bool; 4],

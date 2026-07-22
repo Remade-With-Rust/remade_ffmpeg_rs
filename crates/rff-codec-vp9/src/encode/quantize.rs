@@ -35,15 +35,60 @@ pub fn quantize(
     let n = coeffs.len();
     levels[..n].fill(0);
     dqcoeff[..n].fill(0);
+    // Early-out threshold: `level = (|c|·2^dq_shift + round) / step ≥ 1` iff
+    // `|c| ≥ ceil((step − round) / 2^dq_shift)` — any coefficient below it
+    // provably quantizes to 0, so the (expensive) i64 division is skipped for
+    // the sub-threshold majority. Bit-identical: the skipped path would have
+    // written level 0, which the upfront fill already did.
+    let ac_thresh = ((ac_step as i64 - ac_round + ((1i64 << dq_shift) - 1)) >> dq_shift).max(0);
+
+    // AVX2 mask-scan: one vector pass flags the above-threshold positions in
+    // natural order (u64 mask per 64 positions), then only the set bits are
+    // visited via the inverse scan — versus walking all `n` scan positions.
+    // Identical output: the threshold is exact (see above), per-position writes
+    // are order-independent, and `eob = max(iscan[pos]) + 1` equals the last
+    // nonzero in scan order. The scalar loop below stays as the oracle/fallback.
+    #[cfg(target_arch = "x86_64")]
+    if n >= 16 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 confirmed; n is a multiple of 16 (4×4 .. 32×32 blocks).
+        return unsafe {
+            quantize_masked_avx2(
+                coeffs, scan, dc_step, ac_step, ac_round, dq_shift, ac_thresh, levels, dqcoeff,
+            )
+        };
+    }
+
+    quantize_scan_loop(
+        coeffs, scan, dc_step, ac_step, ac_round, dq_shift, ac_thresh, levels, dqcoeff,
+    )
+}
+
+/// The scan-order reference loop (early-out on the AC threshold) — the oracle
+/// and non-AVX2 fallback for [`quantize`].
+#[allow(clippy::too_many_arguments)]
+fn quantize_scan_loop(
+    coeffs: &[i32],
+    scan: &[i16],
+    dc_step: i32,
+    ac_step: i32,
+    ac_round: i64,
+    dq_shift: u32,
+    ac_thresh: i64,
+    levels: &mut [i32],
+    dqcoeff: &mut [i32],
+) -> usize {
     let mut eob = 0usize;
     for (idx, &p) in scan.iter().enumerate() {
         let pos = p as usize;
+        let coeff = coeffs[pos] as i64;
         let (step, round) = if idx == 0 {
             (dc_step as i64, dc_step as i64 / 2)
         } else {
+            if (coeff.unsigned_abs() as i64) < ac_thresh {
+                continue;
+            }
             (ac_step as i64, ac_round)
         };
-        let coeff = coeffs[pos] as i64;
         // (|coeff|·2^dq_shift + round) / step.
         let acoef = (coeff.unsigned_abs() << dq_shift) as i64;
         let level = ((acoef + round) / step) as i32;
@@ -61,6 +106,104 @@ pub fn quantize(
     eob
 }
 
+/// Inverse scan (`iscan[pos] = scan index`) for a static scan table, cached by
+/// pointer identity (the scan tables are `'static`; there are ~10 of them).
+fn iscan_for(scan: &[i16]) -> std::rc::Rc<[u16]> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    thread_local! {
+        static CACHE: RefCell<Vec<(usize, Rc<[u16]>)>> = const { RefCell::new(Vec::new()) };
+    }
+    let key = scan.as_ptr() as usize;
+    CACHE.with(|c| {
+        if let Some((_, v)) = c.borrow().iter().find(|(k, _)| *k == key) {
+            return v.clone();
+        }
+        let mut inv = vec![0u16; scan.len()];
+        for (idx, &p) in scan.iter().enumerate() {
+            inv[p as usize] = idx as u16;
+        }
+        let rc: Rc<[u16]> = inv.into();
+        c.borrow_mut().push((key, rc.clone()));
+        rc
+    })
+}
+
+/// AVX2 mask-scan quantize: flag above-threshold positions, visit only those.
+/// Bit-identical to [`quantize_scan_loop`] (gated by
+/// `quantize_masked_matches_scan_loop`).
+///
+/// # Safety
+/// AVX2 must be present; `n` a multiple of 8.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn quantize_masked_avx2(
+    coeffs: &[i32],
+    scan: &[i16],
+    dc_step: i32,
+    ac_step: i32,
+    ac_round: i64,
+    dq_shift: u32,
+    ac_thresh: i64,
+    levels: &mut [i32],
+    dqcoeff: &mut [i32],
+) -> usize {
+    use std::arch::x86_64::*;
+    let n = coeffs.len();
+    let iscan = iscan_for(scan);
+    let mut eob = 0usize;
+
+    // DC (scan index 0 == position 0 in every VP9 scan): always evaluated, with
+    // its own round-to-nearest offset.
+    let dc = coeffs[0] as i64;
+    if dc != 0 {
+        let level = (((dc.unsigned_abs() << dq_shift) as i64 + dc_step as i64 / 2)
+            / dc_step as i64) as i32;
+        if level != 0 {
+            let mag = ((level as i64 * dc_step as i64) >> dq_shift) as i32;
+            levels[0] = if dc < 0 { -level } else { level };
+            dqcoeff[0] = if dc < 0 { -mag } else { mag };
+            eob = 1;
+        }
+    }
+
+    // AC: chunked 64-bit masks of |c| ≥ ac_thresh, natural position order.
+    let cmp_bound = _mm256_set1_epi32((ac_thresh as i32).saturating_sub(1));
+    let mut base = 0usize;
+    while base < n {
+        let mut mask = 0u64;
+        let lanes = (n - base).min(64);
+        let mut off = 0usize;
+        while off < lanes {
+            let v = _mm256_loadu_si256(coeffs.as_ptr().add(base + off) as *const __m256i);
+            let a = _mm256_abs_epi32(v);
+            let m = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(a, cmp_bound)));
+            mask |= (m as u32 as u64) << off;
+            off += 8;
+        }
+        if base == 0 {
+            mask &= !1u64; // DC handled above
+        }
+        while mask != 0 {
+            let bit = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let pos = base + bit;
+            let coeff = coeffs[pos] as i64;
+            let acoef = (coeff.unsigned_abs() << dq_shift) as i64;
+            let level = ((acoef + ac_round) / ac_step as i64) as i32;
+            if level != 0 {
+                let mag = ((level as i64 * ac_step as i64) >> dq_shift) as i32;
+                levels[pos] = if coeff < 0 { -level } else { level };
+                dqcoeff[pos] = if coeff < 0 { -mag } else { mag };
+                eob = eob.max(iscan[pos] as usize + 1);
+            }
+        }
+        base += 64;
+    }
+    eob
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +216,67 @@ mod tests {
         *s ^= *s >> 7;
         *s ^= *s << 17;
         *s
+    }
+
+    /// The AVX2 mask-scan must produce identical (levels, dqcoeff, eob) to the
+    /// scan-order reference loop across sizes, qindexes (thresholds), deadzone
+    /// roundings, densities, and the dq_shift=1 (32×32) path.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn quantize_masked_matches_scan_loop() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut s = 0x5151_a3a3_7777_0202u64;
+        for &(n, tx) in &[
+            (4usize, TxType::DctDct),
+            (4, TxType::AdstAdst),
+            (8, TxType::DctDct),
+            (8, TxType::AdstDct),
+            (16, TxType::DctDct),
+            (32, TxType::DctDct),
+        ] {
+            let tx_size = (n.trailing_zeros() - 2) as usize;
+            let dq_shift = if n == 32 { 1u32 } else { 0 };
+            let (scan, _) = get_scan(tx_size, tx);
+            for &qindex in &[0i32, 32, 96, 200, 255] {
+                let dc = dc_quant(qindex, 8);
+                let ac = ac_quant(qindex, 8);
+                for &round_div in &[2i64, 3] {
+                    let ac_round = ac as i64 / round_div; // nearest + deadzone
+                    let ac_thresh =
+                        ((ac as i64 - ac_round + ((1i64 << dq_shift) - 1)) >> dq_shift).max(0);
+                    for density in [1u64, 4, 16] {
+                        let coeffs: Vec<i32> = (0..n * n)
+                            .map(|_| {
+                                if xs(&mut s) % density != 0 {
+                                    0
+                                } else {
+                                    (xs(&mut s) % 4001) as i32 - 2000
+                                }
+                            })
+                            .collect();
+                        let mut l1 = vec![0i32; n * n];
+                        let mut d1 = vec![0i32; n * n];
+                        let mut l2 = vec![0i32; n * n];
+                        let mut d2 = vec![0i32; n * n];
+                        let e1 = quantize_scan_loop(
+                            &coeffs, scan, dc, ac, ac_round, dq_shift, ac_thresh, &mut l1,
+                            &mut d1,
+                        );
+                        let e2 = unsafe {
+                            quantize_masked_avx2(
+                                &coeffs, scan, dc, ac, ac_round, dq_shift, ac_thresh, &mut l2,
+                                &mut d2,
+                            )
+                        };
+                        assert_eq!(e1, e2, "eob {n}x{n} q{qindex} rd{round_div}");
+                        assert_eq!(l1, l2, "levels {n}x{n} q{qindex}");
+                        assert_eq!(d1, d2, "dqcoeff {n}x{n} q{qindex}");
+                    }
+                }
+            }
+        }
     }
 
     /// T4 — the pixel↔coefficient core gate. For each size/tx/qindex:

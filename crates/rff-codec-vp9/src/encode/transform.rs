@@ -101,9 +101,152 @@ fn fdct8(inp: &[i32; 8], out: &mut [i32; 8]) {
     out[3] = round_shift(x2 * c(12) - x1 * c(20));
 }
 
+/// AVX2 `fdct8x8`: the 1-D butterfly runs 8 independent transforms at once, one
+/// per i32 lane. Column pass needs NO transpose (lane j IS column j when the 8
+/// rows are loaded as vectors); the row pass transposes in and back out. Uses
+/// i32 `mullo` where the scalar uses i64 — bit-identical because the largest
+/// intermediate product (row pass, odd part) is < 2^31 for residuals up to
+/// 10-bit (±1023); 12-bit would overflow, so the caller must keep this to the
+/// 8-bit encode path (debug_assert below).
+///
+/// # Safety
+/// AVX2 must be present (caller checks).
+#[cfg(target_arch = "x86_64")]
+mod fdct_avx2 {
+    // Split into #[target_feature] helper fns (NOT closures — closures inside a
+    // target_feature fn may not inherit the feature and then spill __m256i
+    // through the stack per call, which cost ~2.5× on first measurement).
+    use super::c;
+    use std::arch::x86_64::*;
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn rs(x: __m256i) -> __m256i {
+        _mm256_srai_epi32::<14>(_mm256_add_epi32(x, _mm256_set1_epi32(1 << 13)))
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn mul(x: __m256i, k: i64) -> __m256i {
+        _mm256_mullo_epi32(x, _mm256_set1_epi32(k as i32))
+    }
+
+    /// The 8-lane 1-D fdct8 butterfly (mirrors the scalar `fdct8` exactly).
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn bfly(r: [__m256i; 8]) -> [__m256i; 8] {
+        let s0 = _mm256_add_epi32(r[0], r[7]);
+        let s1 = _mm256_add_epi32(r[1], r[6]);
+        let s2 = _mm256_add_epi32(r[2], r[5]);
+        let s3 = _mm256_add_epi32(r[3], r[4]);
+        let s4 = _mm256_sub_epi32(r[3], r[4]);
+        let s5 = _mm256_sub_epi32(r[2], r[5]);
+        let s6 = _mm256_sub_epi32(r[1], r[6]);
+        let s7 = _mm256_sub_epi32(r[0], r[7]);
+        let x0 = _mm256_add_epi32(s0, s3);
+        let x1 = _mm256_add_epi32(s1, s2);
+        let x2 = _mm256_sub_epi32(s1, s2);
+        let x3 = _mm256_sub_epi32(s0, s3);
+        let o0 = rs(mul(_mm256_add_epi32(x0, x1), c(16)));
+        let o4 = rs(mul(_mm256_sub_epi32(x0, x1), c(16)));
+        let o2 = rs(_mm256_add_epi32(mul(x2, c(24)), mul(x3, c(8))));
+        let o6 = rs(_mm256_sub_epi32(mul(x3, c(24)), mul(x2, c(8))));
+        let t2 = rs(mul(_mm256_sub_epi32(s6, s5), c(16)));
+        let t3 = rs(mul(_mm256_add_epi32(s6, s5), c(16)));
+        let y0 = _mm256_add_epi32(s4, t2);
+        let y1 = _mm256_sub_epi32(s4, t2);
+        let y2 = _mm256_sub_epi32(s7, t3);
+        let y3 = _mm256_add_epi32(s7, t3);
+        let o1 = rs(_mm256_add_epi32(mul(y0, c(28)), mul(y3, c(4))));
+        let o7 = rs(_mm256_sub_epi32(mul(y3, c(28)), mul(y0, c(4))));
+        let o5 = rs(_mm256_add_epi32(mul(y1, c(12)), mul(y2, c(20))));
+        let o3 = rs(_mm256_sub_epi32(mul(y2, c(12)), mul(y1, c(20))));
+        [o0, o1, o2, o3, o4, o5, o6, o7]
+    }
+
+    /// 8×8 i32 transpose across the two 128-bit halves.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn transpose(m: [__m256i; 8]) -> [__m256i; 8] {
+        let t0 = _mm256_unpacklo_epi32(m[0], m[1]);
+        let t1 = _mm256_unpackhi_epi32(m[0], m[1]);
+        let t2 = _mm256_unpacklo_epi32(m[2], m[3]);
+        let t3 = _mm256_unpackhi_epi32(m[2], m[3]);
+        let t4 = _mm256_unpacklo_epi32(m[4], m[5]);
+        let t5 = _mm256_unpackhi_epi32(m[4], m[5]);
+        let t6 = _mm256_unpacklo_epi32(m[6], m[7]);
+        let t7 = _mm256_unpackhi_epi32(m[6], m[7]);
+        let u0 = _mm256_unpacklo_epi64(t0, t2);
+        let u1 = _mm256_unpackhi_epi64(t0, t2);
+        let u2 = _mm256_unpacklo_epi64(t1, t3);
+        let u3 = _mm256_unpackhi_epi64(t1, t3);
+        let u4 = _mm256_unpacklo_epi64(t4, t6);
+        let u5 = _mm256_unpackhi_epi64(t4, t6);
+        let u6 = _mm256_unpacklo_epi64(t5, t7);
+        let u7 = _mm256_unpackhi_epi64(t5, t7);
+        [
+            _mm256_permute2x128_si256::<0x20>(u0, u4),
+            _mm256_permute2x128_si256::<0x20>(u1, u5),
+            _mm256_permute2x128_si256::<0x20>(u2, u6),
+            _mm256_permute2x128_si256::<0x20>(u3, u7),
+            _mm256_permute2x128_si256::<0x31>(u0, u4),
+            _mm256_permute2x128_si256::<0x31>(u1, u5),
+            _mm256_permute2x128_si256::<0x31>(u2, u6),
+            _mm256_permute2x128_si256::<0x31>(u3, u7),
+        ]
+    }
+
+    /// See `fdct8x8`'s docs; byte-identical to the scalar for residuals ≤ 10-bit.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn fdct8x8(residual: &[i32], out: &mut [i32]) {
+        debug_assert!(residual.iter().all(|&r| r.unsigned_abs() <= 1023));
+        // Column pass: rows as vectors (lane = column), inputs pre-scaled ×4.
+        let mut r: [__m256i; 8] = std::array::from_fn(|i| {
+            _mm256_slli_epi32::<2>(_mm256_loadu_si256(
+                residual.as_ptr().add(i * 8) as *const __m256i
+            ))
+        });
+        r = bfly(r); // r[k] now = inter row k (coefficient k of every column)
+        // Row pass: transpose so lanes become rows, butterfly, transpose back.
+        r = transpose(r);
+        r = bfly(r);
+        let r = transpose(r);
+        // Final (x + (x<0)) >> 1 (round toward zero) and store.
+        for (i, v) in r.iter().enumerate() {
+            let neg = _mm256_srli_epi32::<31>(*v);
+            let o = _mm256_srai_epi32::<1>(_mm256_add_epi32(*v, neg));
+            _mm256_storeu_si256(out.as_mut_ptr().add(i * 8) as *mut __m256i, o);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn fdct8x8_avx2(residual: &[i32], out: &mut [i32]) {
+    fdct_avx2::fdct8x8(residual, out)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_avx2() -> bool {
+    std::is_x86_feature_detected!("avx2")
+}
+
 /// Forward 2-D DCT for an 8×8 block (libvpx `vpx_fdct8x8`): columns pre-scaled
 /// ×4 through `fdct8`, then rows, with a final `>>1` rounded toward zero.
 fn fdct8x8(residual: &[i32], out: &mut [i32]) {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: AVX2 confirmed; slices are 64 i32 (asserted by the caller).
+        unsafe {
+            fdct8x8_avx2(residual, out);
+        }
+        return;
+    }
+    fdct8x8_scalar(residual, out)
+}
+
+/// The scalar reference — kept as the byte-identity oracle for the AVX2 twin.
+fn fdct8x8_scalar(residual: &[i32], out: &mut [i32]) {
     let mut inter = [0i32; 64];
     for col in 0..8 {
         let cin: [i32; 8] = std::array::from_fn(|r| residual[r * 8 + col] * 4);
@@ -371,6 +514,67 @@ mod tests {
     #[test]
     fn fdct8x8_roundtrips_through_decoder() {
         assert_transform_roundtrips(8, TxType::DctDct, 2);
+    }
+
+    /// Microbenchmark: scalar vs AVX2 fdct8x8 (run with --ignored --nocapture).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore]
+    fn bench_fdct8x8() {
+        if !has_avx2() { return; }
+        let mut s = 0x1111_2222_3333_4444u64;
+        let blocks: Vec<[i32; 64]> = (0..1000)
+            .map(|_| std::array::from_fn(|_| (xs(&mut s) % 511) as i32 - 255))
+            .collect();
+        let mut out = [0i32; 64];
+        let mut sink = 0i64;
+        for (name, use_avx) in [("scalar", false), ("avx2", true)] {
+            let t0 = std::time::Instant::now();
+            for _ in 0..2000 {
+                for b in &blocks {
+                    if use_avx { unsafe { fdct8x8_avx2(b, &mut out) } } else { fdct8x8_scalar(b, &mut out) }
+                    sink += out[0] as i64;
+                }
+            }
+            let el = t0.elapsed().as_secs_f64();
+            println!("{name}: {:.4} us/call", el / 2e6 * 1e6);
+        }
+        assert!(sink != 0);
+    }
+
+    /// Byte-identity gate for the AVX2 `fdct8x8` vs the scalar oracle, over
+    /// random residuals at 8-bit (±255) and 10-bit (±1023) ranges plus the
+    /// extremes (all-max, all-min, impulse) — the i32-product headroom proof.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fdct8x8_avx2_matches_scalar() {
+        if !has_avx2() {
+            return;
+        }
+        let mut s = 0xfeed_beef_cafe_0001u64;
+        let mut check = |residual: &[i32]| {
+            let mut want = [0i32; 64];
+            let mut got = [0i32; 64];
+            fdct8x8_scalar(residual, &mut want);
+            unsafe { fdct8x8_avx2(residual, &mut got) };
+            assert_eq!(got, want);
+        };
+        for &range in &[255i32, 1023] {
+            for _ in 0..2000 {
+                let r: Vec<i32> = (0..64)
+                    .map(|_| (xs(&mut s) % (2 * range as u64 + 1)) as i32 - range)
+                    .collect();
+                check(&r);
+            }
+            check(&[range; 64]);
+            check(&[-range; 64]);
+            let mut imp = [0i32; 64];
+            imp[0] = range;
+            check(&imp);
+            imp[0] = 0;
+            imp[63] = -range;
+            check(&imp);
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::prob_tables::{NmvComp, NmvContext};
 /// High precision is used only when the reference MV is small (`use_mv_hp`,
 /// replicated from the decoder — it must agree exactly).
 #[inline]
-fn use_mv_hp(ref_mv: (i32, i32)) -> bool {
+pub(crate) fn use_mv_hp(ref_mv: (i32, i32)) -> bool {
     ref_mv.0.abs() < 64 && ref_mv.1.abs() < 64
 }
 

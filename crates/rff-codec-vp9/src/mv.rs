@@ -22,7 +22,7 @@ const CLASS0_BITS: i32 = 1;
 const CLASS0_SIZE: i32 = 2;
 
 /// High precision is used only when the reference MV is small (`use_mv_hp`).
-fn use_mv_hp(ref_mv: (i32, i32)) -> bool {
+pub(crate) fn use_mv_hp(ref_mv: (i32, i32)) -> bool {
     ref_mv.0.abs() < 64 && ref_mv.1.abs() < 64
 }
 

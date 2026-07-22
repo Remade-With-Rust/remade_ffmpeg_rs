@@ -18,7 +18,7 @@ pub fn write_inter_mode(enc: &mut BoolEncoder, mode: u8, probs: &[u8; 3]) {
 }
 
 /// SWITCHABLE interpolation-filter tree (EIGHTTAP / EIGHTTAP_SMOOTH / EIGHTTAP_SHARP).
-const SWITCHABLE_INTERP_TREE: [i8; 4] = [0, 2, -1, -2];
+pub(crate) const SWITCHABLE_INTERP_TREE: [i8; 4] = [0, 2, -1, -2];
 
 /// Inverse of `read_switchable_interp_filter`: write the filter (0..=2).
 pub fn write_interp_filter(enc: &mut BoolEncoder, filter: u8, probs: &[u8; 2]) {

@@ -26,13 +26,24 @@ use super::bitwriter::{BitWriter, BoolEncoder};
 use super::compressed::write_compressed_header;
 use super::frame::{assemble_frame, assemble_tiles};
 use super::header::write_uncompressed_header;
-use super::intermode::{write_inter_mode, write_is_inter, write_single_ref};
+use super::intermode::{
+    write_comp_inter, write_comp_ref, write_inter_mode, write_interp_filter, write_is_inter,
+    write_single_ref, SWITCHABLE_INTERP_TREE,
+};
+use crate::decode::{comp_ref_context, reference_mode_context};
 use super::mv::encode_mv;
 use super::quantize::quantize;
-use super::syntax::{write_intra_mode, write_partition, write_selected_tx_size, write_skip};
-use super::tokens::{coef_cost, cost_bit, encode_coefs, tree_bit_cost};
+use super::syntax::{
+    write_intra_mode, write_partition, write_segment_id, write_selected_tx_size, write_skip,
+};
+use super::tokens::{coef_cost, cost_bit, encode_coefs, tree_bit_cost, RateTracker};
+
+pub static DEDUP: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3]; // emit_lookups, hits, matches
 use super::prof;
 use super::transform::forward_transform;
+use super::varpart::VarTree;
+use super::varrd;
 use crate::block::{
     kf_uv_mode_probs, kf_y_mode_probs, partition_plane_context, skip_context, subsize,
     tx_size_context, update_partition_context, ModeInfo, Mv, ALTREF_FRAME, BLOCK_4X4, BLOCK_8X8,
@@ -46,22 +57,36 @@ static PROF_DECISION: AtomicU64 = AtomicU64::new(0);
 static PROF_EMIT1: AtomicU64 = AtomicU64::new(0);
 static PROF_EMIT2: AtomicU64 = AtomicU64::new(0);
 static PROF_HDR: AtomicU64 = AtomicU64::new(0);
+// VP9_IF_HARVEST: interp-filter ceiling probe. [0]=Σ residual SSE @ EIGHTTAP,
+// [1]=Σ residual SSE @ per-block best filter, [2]=inter blocks, [3]=blocks a
+// non-EIGHTTAP filter beat EIGHTTAP on. The per-block residual reduction ([0]−[1])/[0]
+// is the upper bound on the switchable-filter win (before signaling cost).
+static IF_HARVEST: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+// VP9_SUB8_PROBE: sub-8×8 compound ceiling. [0]=Σ single-ref best SAD, [1]=Σ min(single,
+// compound) SAD, [2]=sub-blocks, [3]=sub-blocks compound beat single. ([0]−[1])/[0] bounds
+// the sub-8×8 compound PREDICTION win (before comp_inter/comp_ref/second-MV signalling).
+static SUB8_PROBE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+// VP9_LFSEG_PROBE: per-segment loop-filter ceiling. [0]=Σ global-best-level luma SSE,
+// [1]=Σ per-SB-oracle luma SSE (each 64×64 SB picks its own level), [2]=frames. ([0]−[1])/[0]
+// is the UPPER bound on the spatial per-segment-lf win (before the seg-map signalling cost).
+static LFSEG_PROBE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 use crate::decode::{average_split_mvs, INTER_MODE_TREE};
 use crate::geom_tables::{B_HEIGHT_LOG2, B_WIDTH_LOG2};
 use crate::decode::{
-    adapt_coef_probs, clamp_mv_umv, intra_inter_context, single_ref_p1, single_ref_p2, uv_tx_size,
-    FrameContext, FrameCounts,
+    adapt_coef_probs, clamp_mv_umv, intra_inter_context, single_ref_p1, single_ref_p2,
+    switchable_interp_context, uv_tx_size, FrameContext, FrameCounts,
 };
 use crate::geom_tables::{MAX_TXSIZE, SIZE_GROUP};
 use crate::inter::{predict_block, RefPlane};
 use crate::loopfilter::loop_filter_frame;
-use crate::mv::{find_mv_refs, get_mode_context, lower_mv_precision, MvRef, NmvCounts};
+use crate::mv::{find_mv_refs, get_mode_context, lower_mv_precision, use_mv_hp, MvRef, NmvCounts};
 use crate::predict::{build_intra_edges, predict};
 use crate::prob_tables::{DEFAULT_COEF_PROBS, KF_PARTITION_PROBS};
 use crate::quant::{ac_quant, dc_quant};
 use crate::token::get_scan;
 use crate::transform::{
-    inverse_transform_add_rows, inverse_transform_dc_add, TxType, INTRA_MODE_TO_TX_TYPE,
+    inv_basis_normsq_1d, inverse_transform_add_rows, inverse_transform_dc_add, TxType,
+    INTRA_MODE_TO_TX_TYPE,
 };
 use crate::FrameHeader;
 
@@ -73,9 +98,21 @@ const V_PRED: u8 = 1;
 const H_PRED: u8 = 2;
 const TM_PRED: u8 = 9;
 
+/// AQ segment tree probs (2 segments): the path to leaves 0/1 is bits [0,0,·], so nodes
+/// 0/1 (probs[0],[1]) are pinned to 0 (prob 255 ≈ free) and probs[3] = 128 splits seg0/seg1.
+const AQ_TREE_PROBS: [u8; 7] = [255, 255, 255, 128, 255, 255, 255];
+// NOTE: directional intra search (all 10 modes) was TRIED and REVERTED (2026-07-19).
+// The decoder supports D45..D63 (315/315 vectors), but adding them to the ENCODER
+// search was (a) NEUTRAL at best on a clean 4-clip corpus (−0.03% mean BD, bus LOST
+// +2.10% — the search RD under-prices directional modes vs their real coded cost),
+// and (b) the CHROMA path (best_intra_mode → uv_mode directional) DESYNCED on bus
+// (ours 29.8 dB vs libvpx 18.8 dB) — the encoder's chroma intra recon diverges from
+// spec for directional modes. A decoder supporting a tool ≠ the encoder search
+// gaining from it. The real BD gap vs libvpx is compound prediction (see memory).
+
 /// RDO trial snapshot of a luma block: `(pixels[row·bw+col] up to 64×64, above_ctx
 /// footprint, whole left_ctx column)`.
-type YSnap = ([u16; 4096], [u8; 16], [u8; 16]);
+type YSnap = (Vec<u16>, [u8; 16], [u8; 16]);
 
 /// Full-block snapshot for the recursive partition RD: everything a block trial
 /// mutates (all three reconstructed planes over the block region, the entropy
@@ -112,6 +149,11 @@ pub struct FrameEncoder {
     mi_cols: usize,
     qindex: u32,
     src: [Plane; 3],
+    /// u8 mirror of the luma source (8-bit content only) — the search domain:
+    /// half the load traffic of u16 and `psadbw` SADs, bit-identical values.
+    src8: Vec<u8>,
+    /// Lazily-built u8 mirrors of the reference lumas, one per ref slot.
+    refs8: std::cell::RefCell<[Option<std::sync::Arc<[u8]>>; 3]>,
     rec: [Plane; 3],
     mi: Vec<ModeInfo>,
     above_seg: Vec<u8>,
@@ -120,6 +162,21 @@ pub struct FrameEncoder {
     left_ctx: [[u8; 16]; 3],
     dq_y: (i32, i32),
     dq_uv: (i32, i32),
+    /// Activity-based ADAPTIVE QUANTIZATION (AQ, `VP9_AQ=<delta>`): per-SB variance sorts
+    /// each 64×64 into a low/high-activity SEGMENT that carries a per-segment ALT_Q qindex
+    /// delta (VP9 segmentation). `aq` = the delta magnitude (0 = off; sign = direction).
+    /// `aq_seg` holds the per-SB segment id; `aq_dq_y/uv`/`aq_lambda` the resolved per-segment
+    /// dequant + RD-λ (set into `dq_y`/`dq_uv`/`lambda` at each SB root). `aq_ncols` = SB cols.
+    aq: i32,
+    /// This frame actually uses AQ: `aq != 0` AND the content gate passed (frame median SB
+    /// variance ≤ `VP9_AQ_MAXVAR`). AQ is a SSIM win on low-activity content but a loss on
+    /// uniformly high-activity content (mobile), so it's content-adaptively enabled per frame.
+    aq_active: bool,
+    aq_seg: Vec<u8>,
+    aq_ncols: usize,
+    aq_dq_y: [(i32, i32); 2],
+    aq_dq_uv: [(i32, i32); 2],
+    aq_lambda: [f64; 2],
     max_px: i32,
     // Inter-frame state (no references ⇒ key frame). Slots are [LAST, GOLDEN,
     // ALTREF]; `active_ref` selects which one the motion search / MC currently read.
@@ -136,6 +193,11 @@ pub struct FrameEncoder {
     /// decoder does `active[i] = ref_frames[ref_frame_idx[i]]`; the encoder must match.
     ref_frame_idx: [usize; 3],
     interp_filter: u32,
+    /// The CURRENT block's motion-compensation filter (0=EIGHTTAP/1=SMOOTH/2=SHARP).
+    /// Distinct from the frame-header `interp_filter` (which is 4=SWITCHABLE when the
+    /// per-block filter is coded): the MC/pred_sse read THIS, set per block by the
+    /// filter RD search (switchable) or held at the fixed frame filter otherwise.
+    active_filter: u8,
     sign_bias: [bool; 4],
     fc: FrameContext,
     // RDO: when `use_rdo`, mode decisions minimise `SSE + lambda·bits` instead of
@@ -156,6 +218,10 @@ pub struct FrameEncoder {
     /// `encode_inter_block` detect a fully-empty block and code `skip` instead of
     /// empty coefficient tokens (which a conformant decoder mis-tracks).
     pending_eob: u32,
+    /// RD-trial early-abort bound: when a luma trial's running `sse + λ·bits`
+    /// strictly exceeds this, `encode_plane` returns the (u64::MAX, u64::MAX)
+    /// sentinel — the candidate has provably lost to the incumbent.
+    trial_abort_at: Option<f64>,
     /// When set, the trial (`encode_plane(None)`) applies the trellis just like the
     /// commit — so the skip decision sees the *post-trellis* EOB (the trellis can
     /// empty a block the raw quantizer didn't).
@@ -165,8 +231,42 @@ pub struct FrameEncoder {
     ac_round_num: i64,
     // R5 — trellis-style RD-optimal end-of-block (drop trailing coefficients by RD).
     use_trellis: bool,
+    /// Trellis-λ scale (`VP9_TRELLIS_LAMBDA`, default 1.0): the RDOQ uses `self.lambda ·
+    /// this`. >1 zeros/trims MORE aggressively (fewer coeff bits, more distortion), <1 less.
+    trellis_lambda_scale: f64,
+    /// Content-adaptive trellis-λ strength (`VP9_TRELLIS_K`): the RDOQ λ is scaled by
+    /// `1 + k·(eob/n)` — DENSE blocks (many coeffs = noisy high-motion residual) trim
+    /// aggressively, SPARSE blocks (few coeffs = static detail) keep λ≈self.lambda. A
+    /// sign-flip lever: a flat high λ wins high-motion but loses static; this dispatches it.
+    trellis_k: f64,
+    // Trellis distortion: false = fast coefficient-domain estimate (parity with
+    // libvpx, default); `VP9_TRELLIS_EXACT=1` = the exact pixel-SSE oracle.
+    trellis_exact: bool,
     // Roof — per-block transform-size search (4×4 vs 8×8 for 8×8 luma blocks).
     use_tx_search: bool,
+    // When the full tx-size search is OFF (fast presets), the mode search + final
+    // coding start from the block's MAX tx instead of 4×4. Falling back to 4×4 was
+    // both a transform flood (RD trials transform the whole block at 4×4 for every
+    // candidate) AND poor compression (large tx codes smooth residual far cheaper).
+    // `VP9_TX4X4=1` restores the historical 4×4 default (the A/B oracle).
+    tx4x4: bool,
+    // Max tx size the fast-preset default uses (0=4×4 … 3=32×32). 1 (8×8) is the
+    // speed-neutral sweet spot; `VP9_TXCAP` overrides for A/B (2/3 improve
+    // compression but our naive large-tx kernels make them slower).
+    tx_cap: u8,
+    // Brick 2 — skip the 4-mode intra alternative on an inter block when the best
+    // inter mode is already good (`best_inter.J / λ < intra_gate_t`). Intra almost
+    // never wins on a well-predicted inter block, so this drops those 4 full-RD
+    // transforms. `VP9_NO_INTRA_GATE` restores the always-try oracle;
+    // `VP9_INTRA_GATE_T` tunes the threshold (higher ⇒ try intra more ⇒ safer).
+    intra_gate: bool,
+    intra_gate_t: f64,
+    // Brick 2b — inter-mode SHORTLIST: rank all (ref×mode) candidates by the cheap
+    // skip-RD estimate J_skip = pred_SSE + λ·bits and full-RD only the top
+    // `shortlist_k`, instead of a full transform trial on every candidate.
+    // `VP9_NO_SHORTLIST` full-RDs all; `VP9_SHORTLIST_K` tunes K.
+    mode_shortlist: bool,
+    shortlist_k: usize,
     // Roof — partition control. `force_min_bsize` codes PARTITION_NONE once a block
     // reaches this size (default BLOCK_8X8 = the historical all-8×8). Larger values
     // bring up bigger blocks; `use_partition_rd` turns on the recursive RD search.
@@ -217,13 +317,6 @@ pub struct FrameEncoder {
     /// landed, so it's a speed-preset lever (speed ≥ 1), not the quality default.
     /// `VP9_DIAMOND_MSEARCH` forces diamond; `VP9_FULL_MSEARCH` forces exhaustive.
     full_msearch: bool,
-    /// Motion-search memo. `search_mv` is a pure function of `(mi_row, mi_col,
-    /// active_ref, predictor, bwl, bhl)` against the frame-constant source and
-    /// reference, and the emit passes re-ask the decision pass's questions.
-    /// Exact (byte-identical) cache; lives for the FrameEncoder's one frame.
-    #[allow(clippy::type_complexity)]
-    mv_memo:
-        std::cell::RefCell<std::collections::HashMap<(usize, usize, usize, Mv, usize, usize), Mv>>,
     /// `VP9_CORNER_SAD`: restore the corner-only (top-left 8×8) integer-search
     /// scoring — the oracle the full-block SAD was BD-rate-gated against.
     corner_sad: bool,
@@ -231,9 +324,118 @@ pub struct FrameEncoder {
     /// when a free predicted mode already fits at least this well. 0 = always
     /// search (the speed-0 default); set by `VP9_SUB8X8_PRESCREEN` or presets.
     sub8x8_prescreen: i64,
+    /// `VP9_SUB8_PROBE`: observe-only sub-8×8 compound ceiling harvest (SAD reduction).
+    sub8_probe: bool,
+    /// `VP9_LFSEG_PROBE`: observe-only per-segment loop-filter ceiling harvest (SSE reduction).
+    lfseg_probe_on: bool,
+    /// Multi-reference sub-8×8 (`VP9_NO_SUB8X8_MULTIREF` opts out): sub-8×8 is otherwise
+    /// hardcoded to LAST — try GOLDEN/ALTREF too and pick the best single ref per 8×8
+    /// (no added MV bits, just a better reference for fine-motion leaves).
+    sub8x8_multiref: bool,
+    /// SAD penalty (`VP9_SUB8X8_REF_PENALTY`) added to a non-LAST sub-8×8 ref's cost so the
+    /// SAD proxy only switches away from LAST on a real margin — the proxy under-prices
+    /// non-LAST (equal-residual static content over-selected GOLDEN/ALTREF for ref bits).
+    sub8x8_ref_penalty: f64,
+    /// Content gate (`VP9_SUB8X8_MULTIREF_GATE`, SAD): only pay the GOLDEN/ALTREF sub-8×8
+    /// search when LAST's summed sub-block SAD exceeds this — LAST-fits-well leaves stay
+    /// LAST-only (byte-identical, no cost), so the ~3× search cost lands only on hard leaves.
+    sub8x8_multiref_gate: f64,
     /// Iterative (diamond) subpel refinement instead of the 5×5 grid — a preset
     /// lever (speed ≥ 1); the quality default keeps the exhaustive grid.
     subpel_fast: bool,
+    /// Subsample the full-block interp scoring in the mode-shortlist `pred_sse`
+    /// (2× tile stride, SSE scaled back) — a speed lever; the shortlist only ranks
+    /// candidates, so the coarser estimate costs little quality.
+    motion_fast: bool,
+    /// Score subpel refinement with the 2-tap BILINEAR filter (libvpx
+    /// `sub_pixel_tree` semantics) instead of the commit-grade 8-tap — the
+    /// ranking approximation that makes their search ~2× cheaper. BD-gated.
+    subpel_bilinear: bool,
+    /// Skip the ¼-pel ring when the ½-pel ring found no improvement.
+    subpel_tree: bool,
+    /// Plus+diagonal single-pass subpel shape (libvpx tree geometry).
+    subpel_diag: bool,
+    /// High-precision (⅛-pel) motion vectors (`allow_high_precision_mv`). DEFAULT ON:
+    /// the subpel search refines to ⅛-pel and MVs code at ⅛-pel — but ONLY where
+    /// `use_mv_hp(predictor)` holds (small MVs, <8 px), which is both the codability
+    /// condition AND an inherent content gate, so only low-motion blocks pay the extra
+    /// subpel level (akiyo ~1.15×, high-motion bus/mobile ~1.06×). A −3.13% BD-rate win
+    /// @s3 (mobile −7.18%, all clips win) for that tiny cost. Bit-exact vs libvpx.
+    /// `VP9_NO_HP_MV` escapes to ¼-pel (the old behaviour).
+    hp_mv: bool,
+    /// COMPOUND (bi-directional) prediction. When on (inter frame, GOLDEN present), the
+    /// frame codes `reference_mode = SELECT` with GOLDEN as the fixed compound ref
+    /// (`sign_bias[GOLDEN]=1` ⇒ comp_fixed_ref=2, comp_var_ref=[LAST,ALTREF]); blocks may
+    /// pick LAST+GOLDEN compound (averaged prediction `(p0+p1+1)>>1`). `VP9_COMPOUND`
+    /// enables; `VP9_COMPOUND_FORCE` forces every inter block to ZEROMV-compound (a
+    /// conformance-plumbing probe). Default OFF — baseline byte-identical.
+    compound: bool,
+    /// Force every inter block to ZEROMV-compound (Brick-1 plumbing gate).
+    compound_force: bool,
+    /// Opt out of the default-on bi-prediction (`VP9_NO_COMPOUND`).
+    no_compound: bool,
+    /// The ALTREF slot holds a FUTURE frame (set by `set_altref`, i.e. an ARF-group P
+    /// frame referencing the group's hidden last frame). Enables TRUE bi-prediction:
+    /// `sign_bias[ALTREF]=1` is the CORRECT display-order bias (no MV-pred corruption,
+    /// unlike the LAST+GOLDEN sign-bias trick), and ALTREF becomes the fixed compound ref.
+    altref_future: bool,
+    /// Content-adaptive compound gate: only spend the compound RD trials on blocks whose
+    /// single-ref winner J exceeds `compound_gate · λ` — i.e. blocks the single ref
+    /// predicts POORLY, where bi-prediction can help (search-skip gate; λ-normalized so
+    /// the threshold transfers across QPs). 0 = always try. `VP9_COMPOUND_GATE` sets it.
+    compound_gate: f64,
+    /// Add NEAREST/NEAR compound modes (derived MVs, no bits). Conformant (decoder-exact
+    /// `find_mv_refs(ref,mode)[idx]`), but DEFAULT-OFF: a net BD LOSS — mobile regresses
+    /// (the RD under-prices the derived-MV modes → over-selection). `VP9_COMPOUND_NEAR` on.
+    compound_near: bool,
+    /// Compound-aware switchable interp-filter search (`VP9_NO_COMPOUND_FILTER` opts out):
+    /// score the filter on the actual AVERAGED compound prediction at the two compound MVs,
+    /// not the single-ref `pred_sse(best_mv)` (which scores the wrong ref at the wrong MV).
+    compound_filter: bool,
+    /// JOINT compound MV refinement (`VP9_NO_COMPOUND_JOINT` opts out): refine each
+    /// NEWMV-compound MV against the averaged prediction and add the refined pair as an EXTRA
+    /// candidate for the full RD to pick — a clean BD win on all clips (~−0.05..−0.25%, 0
+    /// desyncs). The earlier REPLACE form lost (the SAD-8×8 proxy over-moves); making it a
+    /// proposal the full-block RD can reject (propose-cheap/dispose-by-RD) turned it positive.
+    compound_joint: bool,
+    /// Cost penalty (bits) added to NEAREST/NEAR compound candidates to correct the RD
+    /// under-pricing that over-selects them (they win on averaged SSE but spend bits for
+    /// ~0 quality). `VP9_COMPOUND_NEAR_PEN`.
+    compound_near_penalty: f64,
+    /// Speed >= 3: abort SPLIT recursion once its running cost exceeds NONE.
+    split_early: bool,
+    /// Speed >= 3: stop shortlist trials once J_skip > best_J × this (0 = off).
+    mode_thresh_mult: f64,
+    /// Speed >= 3: 64×64 G1 partition-gate threshold in none_rd/λ units (0 = off).
+    g1_64: f64,
+    /// DP-lite: frozen-context pricing for interior magnitude lowerings
+    /// (libvpx optimize_b's approximation). `VP9_TRELLIS_EXACT_CTX` disables.
+    trellis_frozen: bool,
+    /// libvpx-mirrored residual-MSE trellis gate threshold (0 = gate off).
+    trellis_mse_t: f64,
+    /// Emit-dedup: the emit re-runs the winning skip-trial's exact
+    /// fwd+quantize+trellis pipeline on ~92% of tx blocks (measured). Cache the
+    /// trial outputs keyed by the RESIDUAL HASH — the pipeline is a pure
+    /// function of the residual (+ static params in the key), so a hash match
+    /// makes reuse byte-identical BY CONSTRUCTION (losing partition arms have
+    /// different residuals and simply miss). `VP9_NO_DEDUP` disables.
+    emit_dedup: bool,
+    #[allow(clippy::type_complexity)]
+    dedup_map: std::cell::RefCell<
+        std::collections::HashMap<(u8, u32, u32, u8), (u64, Vec<i32>, Vec<i32>, u16)>,
+    >,
+    /// `VP9_TRIAL_RECON=1`: restore exact pixel recon+SSE in inter mode-trials
+    /// (the A/B oracle for the Parseval trial-distortion estimate).
+    trial_recon: bool,
+    /// Run the trellis inside exploration skip-trials. DEFAULT ON — measured
+    /// LOAD-BEARING for the RD-skip decision (fast trials inflate j_noskip via
+    /// non-trellised coef bits → systematic over-skip, +21.5% BD mean, mobile
+    /// +50%). `VP9_FAST_TRIALS=1` opts into the fast mode for future study.
+    trellis_trials: bool,
+    /// Max re-centering rounds per subpel precision level (0 = unbounded, the
+    /// original shape). One-round measured +5% BD (REFUTED); the cap trades
+    /// tail scores for bounded quality cost.
+    subpel_rounds: u32,
     /// `VP9_G1_HARVEST`: observe-only partition-gate telemetry (G1) to stderr.
     g1_harvest: bool,
     /// Current tile's mi-column range (whole frame when single-tile). Entropy
@@ -257,6 +459,90 @@ pub struct FrameEncoder {
     /// G1 threshold scale — 1.0 at speed 0; presets raise it (a speed/BD trade
     /// the G2 sweep mapped: bumps help motion clips, cost static ones).
     g1_scale: f64,
+    /// Content-adaptive partition: route this superblock's partition decision
+    /// through the O(pixels) variance tree (`varpart`) instead of the recursive RD
+    /// search. `VP9_VAR_PART=1` forces it ON for EVERY SB (the Brick-2 standalone
+    /// A/B — a whole-frame variance partition); the dispatcher (Brick 3) sets it
+    /// per-SB. Content-invariant cost: the lever that flattens the ~15× content
+    /// speed variance.
+    var_part: bool,
+    /// Variance split threshold multiplier: an SB node splits when its residual
+    /// variance ≥ `var_thresh_mult · ac_dequant · level_scale`. Higher ⇒ coarser
+    /// partitions ⇒ faster/lower-quality. `VP9_VAR_THRESH` overrides for sweeps.
+    var_thresh_mult: f64,
+    /// The current superblock's variance tree (built at the 64×64 root, read by the
+    /// recursion). Transient per-SB scratch; `None` outside the variance path.
+    vt: Option<VarTree>,
+    /// Content-adaptive DISPATCH: per-SB, choose the variance partition when the SB's
+    /// root residual variance is below `dispatch_thresh` (RD wins nothing there — it
+    /// over-splits flat blocks), else the full RD search (where RD's finer partitions
+    /// pay). This is the "one encoder" core: RD quality where it matters, variance
+    /// speed where it doesn't. `VP9_DISPATCH=1` enables; Brick 4 adapts the threshold
+    /// per frame. Independent of `var_part` (which forces variance for every SB).
+    dispatch: bool,
+    /// Root-variance cutoff for the dispatcher (SB uses variance partition when its
+    /// 64×64 residual variance is on the variance side of this). `VP9_DISPATCH_T`
+    /// pins it (fixed-T mode); otherwise Brick 4's per-frame pre-pass sets it from
+    /// the actual variance distribution (`dispatch_q`).
+    dispatch_thresh: i64,
+    /// `true` ⇒ pin `dispatch_thresh` (skip the per-frame percentile pre-pass) —
+    /// set when `VP9_DISPATCH_T` is given, for threshold sweeps.
+    dispatch_fixed_t: bool,
+    /// Target FRACTION of superblocks routed to the variance partition (Brick 4).
+    /// The per-frame pre-pass sets `dispatch_thresh` to the matching percentile of
+    /// this frame's SB root variances, so the routing fraction — hence the relative
+    /// work — is content-invariant. `VP9_DISPATCH_Q` overrides (default 0.5).
+    dispatch_q: f64,
+    /// Dispatch DIRECTION: `false` (default) routes the LOW-variance SBs to the
+    /// variance partition (quality-optimal — RD kept for the busy SBs where it
+    /// helps); `true` routes the HIGH-variance (most RD-expensive) SBs to variance
+    /// (time-capping — the small quality edge RD holds on busy content is cheap to
+    /// concede). `VP9_DISPATCH_HI=1` selects the time-capping direction.
+    dispatch_hi: bool,
+    /// Lever 2 — the decision-pass wall time (µs) this frame spent, measured in
+    /// `encode_frame` and read back by the outer encoder's time-budget controller
+    /// (which owns the cross-frame `dispatch_q` state, since a `FrameEncoder` is
+    /// per-frame). 0 until the frame is encoded.
+    decision_us: u64,
+    /// Model-based early SKIP (libvpx non-RD philosophy, CALIBRATED): force skip with
+    /// an MC-only recon — avoiding the decision pass's per-block transform — when the
+    /// block's `varrd::model_xsq` (normalized quantizer²/residual-variance) is above
+    /// `model_skip_t`. A non-skip falls through to the normal transform (the real
+    /// eob-based decision), so no decision/emit desync. The threshold is CALIBRATED
+    /// from a harvest (log2(xsq) vs the real rd_skip): skip% rises with xsq and plateaus
+    /// ~94% (variance misses localized detail), so a conservative cutoff skips only
+    /// high-confidence blocks. `VP9_MODEL_SKIP=1` enables; `VP9_MODEL_SKIP_T` sets the
+    /// log2(xsq) cutoff (default 23 ≈ 91% real-skip). DEFAULT OFF.
+    model_skip: bool,
+    /// log2(xsq) cutoff for `model_skip` (higher ⇒ fewer, safer skips). See above.
+    model_skip_t: u32,
+    /// NON-RD LEAF mode (floor-lowering): when a superblock is routed to the variance
+    /// partition (the dispatcher's fast arm), its leaves take a CHEAPER `decide_inter`
+    /// — LAST-ref only (no GOLDEN/ALTREF motion search + candidate transforms) and a
+    /// forced model-SKIP gate (MC-only recon on small-residual leaves, no transform).
+    /// This lowers the all-variance floor so the time-budget controller can reach
+    /// faster per-frame targets on complex content. Confined to variance-routed SBs
+    /// (`variance_leaf`), so the RD partition path is untouched. `VP9_NONRD_LEAF=1`.
+    nonrd_leaf: bool,
+    /// Runtime flag: currently inside a variance-partition leaf (`var_pick_partition`
+    /// sets it around `rd_block_none`), so `decide_inter` takes the `nonrd_leaf` fast
+    /// path. False on the RD partition path — the fast leaf never touches full RD.
+    variance_leaf: bool,
+    /// Non-RD leaf NEARESTMV early-out (search-skip gate): skip the NEWMV diamond +
+    /// subpel search when the predictor's SAD-per-pixel is below this — the block is
+    /// already well-predicted, so NEWMV≈NEARESTMV and the search is redundant (unlike
+    /// cutting subpel PRECISION, this skips work that wouldn't change the answer).
+    /// 0 = off. Decision-only (MV recorded + replayed). `VP9_NONRD_ME_SKIP` sets it.
+    nonrd_me_skip: f64,
+    /// CHROMA-aware inter mode RD: cost the full-RD candidates on luma+chroma
+    /// (`rd_cost_yuv`) instead of luma alone (`rd_cost_y`). The mode/MV is luma-searched
+    /// and chroma follows (MV/2), but the luma-best candidate isn't always the
+    /// luma+chroma-best — colour structure the luma predictor misses (chroma edges) can
+    /// pick a different mode. Adds NEW information the luma-only pick lacks (unlike the
+    /// neutral model-RD reweighting). `VP9_CHROMA_RD=1`; gated on BD-rate.
+    chroma_rd: bool,
+    /// Weight on the chroma SSE + bits in `rd_cost_yuv` (`VP9_CHROMA_RD_W`, default 1.0).
+    chroma_rd_w: f64,
 }
 
 impl FrameEncoder {
@@ -386,7 +672,7 @@ impl FrameEncoder {
         }
         let dc_y = dc_quant(qindex as i32, 8);
         let ac_y = ac_quant(qindex as i32, 8);
-        FrameEncoder {
+        let mut fe = FrameEncoder {
             width,
             height,
             mi_rows,
@@ -406,14 +692,37 @@ impl FrameEncoder {
             // No segmentation / delta-q: one quantizer for Y and one for UV.
             dq_y: (dc_y, ac_y),
             dq_uv: (dc_quant(qindex as i32, 8), ac_quant(qindex as i32, 8)),
+            aq: std::env::var("VP9_AQ").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            aq_active: false,
+            aq_seg: Vec::new(),
+            aq_ncols: 0,
+            aq_dq_y: [(dc_y, ac_y); 2],
+            aq_dq_uv: [(dc_quant(qindex as i32, 8), ac_quant(qindex as i32, 8)); 2],
+            aq_lambda: [0.0; 2],
             max_px: 255,
             is_inter,
             refs: [ref_planes, None, None],
+            src8: Vec::new(), // built below once `src` is in place
+            refs8: std::cell::RefCell::new([None, None, None]),
             active_ref: 0,
             refresh_frame_flags: 1, // refresh LAST (slot 0) by default
             show_frame: true,
             ref_frame_idx: [0, 1, 2],
-            interp_filter: 0, // EIGHTTAP, frame-level fixed (not switchable)
+            // Frame-header interp filter. DEFAULT = 4 (SWITCHABLE: per-block filter RD
+            // search — a −1.58% BD-rate win at speed 3, −0.90% at speed 0, decoder-ready).
+            // `VP9_INTERP_FILTER=N` pins a fixed frame filter (0=EIGHTTAP/1=SMOOTH/2=SHARP,
+            // the ceiling probe); `VP9_NO_SWITCHABLE` escapes to fixed EIGHTTAP.
+            interp_filter: if let Some(f) = std::env::var("VP9_INTERP_FILTER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                f
+            } else if std::env::var("VP9_NO_SWITCHABLE").is_ok() {
+                0
+            } else {
+                4
+            },
+            active_filter: 0, // fixed up after construction (frame filter, or 0 if switchable)
             sign_bias: [false; 4], // all same ⇒ no compound, reference_mode forced single
             fc: FrameContext::defaults(),
             use_rdo: true,
@@ -437,12 +746,38 @@ impl FrameEncoder {
             // far more PSNR) — the J self-metric flattered a loss. Kept as the
             // worked example of why a video RD knob needs the BD-rate gate.
             ac_round_num: 4,
+            trellis_lambda_scale: std::env::var("VP9_TRELLIS_LAMBDA")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0),
+            // 2.5 = the content-adaptive sweet spot (mean −4.19% BD, all clips win, 32/32
+            // conformant); k≈4 over-trims and can desync at extreme λ, so it's capped here.
+            trellis_k: std::env::var("VP9_TRELLIS_K")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2.5),
             // R5 — ON: BD-rate oracle scores it −0.45% at the calibrated λ (a real
             // win; the same knob was a +40% catastrophe at the old too-high λ).
             use_trellis: std::env::var("VP9_NO_TRELLIS").is_err(),
+            trellis_exact: std::env::var("VP9_TRELLIS_EXACT").is_ok(),
             // Roof — ON: BD-rate oracle scores it −18% (an 8×8 transform decorrelates
             // smooth residual far better than four 4×4s — fewer bits AND higher PSNR).
             use_tx_search: std::env::var("VP9_NO_TXSEARCH").is_err(),
+            tx4x4: std::env::var("VP9_TX4X4").is_ok(),
+            tx_cap: std::env::var("VP9_TXCAP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1),
+            intra_gate: std::env::var("VP9_NO_INTRA_GATE").is_err(),
+            intra_gate_t: std::env::var("VP9_INTRA_GATE_T")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000.0),
+            mode_shortlist: std::env::var("VP9_NO_SHORTLIST").is_err(),
+            shortlist_k: std::env::var("VP9_SHORTLIST_K")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3),
             force_min_bsize: BLOCK_8X8, // only used when partition RD is off
             // Sub-8×8 (4×4/8×4/4×8) inter prediction: on by default (conformant, a BD-rate
             // win); `VP9_NO_SUB8X8` disables it (faster encode).
@@ -453,6 +788,7 @@ impl FrameEncoder {
             use_partition_rd: true,
             disable_lf: false,
             pending_eob: 0,
+            trial_abort_at: None,
             skip_trial: false,
             part_map: std::collections::HashMap::new(),
             mode_map: std::collections::HashMap::new(),
@@ -479,7 +815,6 @@ impl FrameEncoder {
                     }
                 }),
             full_msearch: std::env::var("VP9_DIAMOND_MSEARCH").is_err(),
-            mv_memo: std::cell::RefCell::new(std::collections::HashMap::new()),
             corner_sad: std::env::var("VP9_CORNER_SAD").is_ok(),
             // 48 == NEWMV_SAD_PENALTY is PROVABLY lossless (a searched MV pays SAD+48).
             // Default 64 is the aggressive child: harvest showed <=0.8% of NEWMV wins
@@ -488,7 +823,64 @@ impl FrameEncoder {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(64),
+            sub8_probe: std::env::var("VP9_SUB8_PROBE").is_ok(),
+            lfseg_probe_on: std::env::var("VP9_LFSEG_PROBE").is_ok(),
+            sub8x8_multiref: std::env::var("VP9_NO_SUB8X8_MULTIREF").is_err(),
+            sub8x8_ref_penalty: std::env::var("VP9_SUB8X8_REF_PENALTY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256.0),
+            sub8x8_multiref_gate: std::env::var("VP9_SUB8X8_MULTIREF_GATE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500.0),
             subpel_fast: false,
+            motion_fast: std::env::var("VP9_MOTION_FAST").is_ok(),
+            subpel_bilinear: std::env::var("VP9_SUBPEL_BILINEAR").is_ok()
+                || std::env::var("VP9_SUBPEL_8TAP").is_err() && false, // set by presets
+            subpel_tree: std::env::var("VP9_SUBPEL_TREE").is_ok(),
+            subpel_diag: std::env::var("VP9_SUBPEL_DIAG").is_ok(),
+            hp_mv: std::env::var("VP9_NO_HP_MV").is_err(),
+            compound: std::env::var("VP9_COMPOUND").is_ok()
+                || std::env::var("VP9_COMPOUND_FORCE").is_ok(),
+            compound_force: std::env::var("VP9_COMPOUND_FORCE").is_ok(),
+            no_compound: std::env::var("VP9_NO_COMPOUND").is_ok(),
+            altref_future: false,
+            compound_gate: std::env::var("VP9_COMPOUND_GATE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
+            // Default-ON with the cost penalty that makes it a net win (mobile −6.57→−7.19%,
+            // bus −1.55→−1.97%). `VP9_NO_COMPOUND_NEAR` opts out.
+            compound_near: std::env::var("VP9_NO_COMPOUND_NEAR").is_err(),
+            compound_filter: std::env::var("VP9_NO_COMPOUND_FILTER").is_err(),
+            compound_joint: std::env::var("VP9_NO_COMPOUND_JOINT").is_err(),
+            compound_near_penalty: std::env::var("VP9_COMPOUND_NEAR_PEN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(24.0),
+            trellis_trials: std::env::var("VP9_FAST_TRIALS").is_err(),
+            trial_recon: std::env::var("VP9_TRIAL_RECON").is_ok(),
+            split_early: std::env::var("VP9_SPLIT_EARLY").is_ok(),
+            mode_thresh_mult: std::env::var("VP9_MODE_THRESH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
+            g1_64: std::env::var("VP9_G1_64")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
+            trellis_frozen: std::env::var("VP9_TRELLIS_EXACT_CTX").is_err(),
+            trellis_mse_t: std::env::var("VP9_TRELLIS_MSE_T")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
+            emit_dedup: std::env::var("VP9_NO_DEDUP").is_err(),
+            dedup_map: std::cell::RefCell::new(std::collections::HashMap::new()),
+            subpel_rounds: std::env::var("VP9_SUBPEL_ROUNDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             g1_harvest: std::env::var("VP9_G1_HARVEST").is_ok(),
             tile_start: 0,
             tile_end: mi_cols,
@@ -508,6 +900,43 @@ impl FrameEncoder {
             g1_gate: std::env::var("VP9_NO_G1GATE").is_err(),
             g3_gate: std::env::var("VP9_G3GATE").is_ok(), // harvest-first: off by default
             g1_scale: 1.0,
+            var_part: std::env::var("VP9_VAR_PART").is_ok(),
+            var_thresh_mult: std::env::var("VP9_VAR_THRESH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(24.0),
+            vt: None,
+            dispatch: std::env::var("VP9_DISPATCH").is_ok(),
+            dispatch_thresh: std::env::var("VP9_DISPATCH_T")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3000),
+            dispatch_fixed_t: std::env::var("VP9_DISPATCH_T").is_ok(),
+            dispatch_q: std::env::var("VP9_DISPATCH_Q")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.5),
+            dispatch_hi: std::env::var("VP9_DISPATCH_HI").is_ok(),
+            decision_us: 0,
+            nonrd_leaf: std::env::var("VP9_NONRD_LEAF").is_ok(),
+            variance_leaf: false,
+            // Default 1.0 SAD/px: BD-neutral (−0.05%) at ~1.05× (1.14× on static content
+            // where the gate fires often). Only ever active on the nonrd leaf (gated), so
+            // harmless at the RD tiers. `VP9_NONRD_ME_SKIP=0` disables.
+            nonrd_me_skip: std::env::var("VP9_NONRD_ME_SKIP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0),
+            model_skip: std::env::var("VP9_MODEL_SKIP").is_ok(),
+            model_skip_t: std::env::var("VP9_MODEL_SKIP_T")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(23),
+            chroma_rd: std::env::var("VP9_CHROMA_RD").is_ok(), // set_speed enables for speed ≤ 3
+            chroma_rd_w: std::env::var("VP9_CHROMA_RD_W")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.35), // tuned optimum (BD-rate-swept @s3)
             has_avx2: {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -518,7 +947,15 @@ impl FrameEncoder {
                     false
                 }
             },
+        };
+        // The MC filter defaults to the fixed frame filter; a switchable frame (4)
+        // starts the mode search at EIGHTTAP(0) and the per-block search refines it.
+        fe.active_filter = if fe.interp_filter < 4 { fe.interp_filter as u8 } else { 0 };
+        // u8 search mirror of the luma source (values are exact for 8-bit).
+        if fe.max_px == 255 {
+            fe.src8 = fe.src[0].buf.iter().map(|&v| v as u8).collect();
         }
+        fe
     }
 
     pub fn recon_owned(&self) -> [Vec<u16>; 3] {
@@ -546,11 +983,22 @@ impl FrameEncoder {
     /// key frame) the per-block RD may choose instead of LAST. Same size as the frame.
     pub fn set_golden(&mut self, recon: [Vec<u16>; 3]) {
         self.refs[1] = Some(self.ref_planes_from(recon));
+        self.refs8.borrow_mut()[1] = None;
     }
 
     /// Install the ALTREF reference (slot 2) — a (usually hidden, future) frame.
     pub fn set_altref(&mut self, recon: [Vec<u16>; 3]) {
         self.refs[2] = Some(self.ref_planes_from(recon));
+        self.refs8.borrow_mut()[2] = None;
+        self.altref_future = true; // ARF = a future reference (true bi-prediction)
+    }
+
+    /// Enable compound for this frame (the outer encoder turns it on for a whole ARF
+    /// group so reference_mode stays consistent). Respects the `VP9_NO_COMPOUND` opt-out.
+    pub fn set_compound(&mut self, on: bool) {
+        if !self.no_compound {
+            self.compound = on;
+        }
     }
 
     /// Mark this frame as a hidden ALT-REF: not shown (`show_frame = 0`) and refreshing
@@ -663,12 +1111,98 @@ impl FrameEncoder {
             self.use_tx_search = false; // fix the transform size (skip the per-block search)
             self.use_prob_updates = false; // skip the token-count gather pass
             self.g1_scale = 4.0; // partition gate ×4
+            self.motion_fast = true; // subsample mode-shortlist SSE (≤±0.03 dB, ~1.05×)
+            // Bilinear-scored subpel refinement (libvpx sub_pixel_tree semantics):
+            // BD +0.55% mean for a cheaper scorer; `VP9_SUBPEL_8TAP` restores the
+            // commit-grade 8-tap scorer.
+            self.subpel_bilinear = std::env::var("VP9_SUBPEL_8TAP").is_err();
+            // Plus+diagonal single-pass subpel (8.3 scores/search vs 12.9,
+            // subpel 2.4→1.2µs — BELOW libvpx's 1.75): BD +1.35% mean, the
+            // speed-first trade; `VP9_SUBPEL_WALK` restores the iterating diamond.
+            self.subpel_diag = std::env::var("VP9_SUBPEL_WALK").is_err();
         }
         if speed >= 3 {
-            self.use_trellis = false; // blind quantization, no per-coefficient RD
+            // Rebuilt from libvpx's cpu3-4 speed-features (the old rung dropped
+            // the trellis: +14% size for ~5% speed — broken, removed). Screened
+            // per-knob: escalating g1_scale was the toxic lever (8.0 alone ≈
+            // +18% BD — the partition gate prunes where split matters); the
+            // ladder leans on the mild ones instead.
+            self.split_early = true; // abort losing SPLIT recursions early (~free)
+            self.mode_thresh_mult = 1.25; // adaptive mode-skip on the shortlist
+            self.g1_64 = 900.0; // gate 64×64 SPLIT on very-easy blocks
+            self.subpel_tree = true; // skip ¼-ring when ½-ring didn't move
+            self.intra_gate_t = 2000.0; // rarer intra alternatives
+            // Lever 1 (a MILD fixed-percentile dispatch at this default tier) was
+            // tried and REVERTED: BD-rate refuted it. A single-CRF PSNR looked ~free
+            // (mobile −0.03 dB), but over the full RD ladder it cost +2.29% mean
+            // BD-rate for only ~1.1× — and was a PURE LOSS on easy content (akiyo
+            // +0.93% BD-rate AND 0.97× i.e. slower), because a fixed percentile
+            // routes the flat-but-cheap SBs that RD handles cheaply anyway (quality
+            // lost, no time saved). The default tier stays quality-optimal (RD-only).
+            // The content-invariant speedup lives in Lever 2 (the `VP9_DISPATCH_BUDGET`
+            // time-budget controller in the outer encoder), which routes only what a
+            // per-frame time target needs — +1.2% BD @30 ms for up to 1.7× on complex
+            // clips while easy content stays full-RD (−1.1%). `VP9_DISPATCH` still
+            // enables the manual fixed-q dispatch here for sweeps.
         }
-        // speed 4 reserved for core-loop pruning (partition/mode early-exit) — a
-        // separate brick; today it behaves as speed 3.
+        // speeds 4+ are the REALTIME rungs the old ladder couldn't reach with
+        // thresholds alone: the content-adaptive dispatcher (Bricks 1–4) routes a
+        // rising fraction `q` of each frame's superblocks through the O(pixels)
+        // variance partition instead of the recursive RD search — the SBs where RD
+        // buys nothing (flat/well-predicted). `q` is a PERCENTILE of the frame's own
+        // variance distribution, so the routed fraction — and thus the speed — is
+        // content-invariant: the lever that flattens the ~5× content-speed variance
+        // the threshold ladder could not. `VP9_DISPATCH_Q` pins `q` for sweeps.
+        if speed >= 4 {
+            self.dispatch = true;
+            // Non-RD leaf on the dispatcher's fast arm: variance-routed leaves take the
+            // cheaper LAST-ref-only + forced-model-skip decision. A Pareto improvement
+            // to these tiers — ~1.1× faster at neutral-or-better BD-rate (s5 −0.26%,
+            // s6 −0.10% mean; akiyo −1.6% where model-skip helps most). `VP9_NO_NONRD_LEAF`
+            // disables. See the non-RD leaf field doc.
+            if std::env::var("VP9_NO_NONRD_LEAF").is_err() {
+                self.nonrd_leaf = true;
+            }
+            if std::env::var("VP9_DISPATCH_Q").is_err() {
+                self.dispatch_q = match speed {
+                    4 => 0.50, // ~1.4× on busy content, near-neutral quality
+                    5 => 0.75, // ~1.8×
+                    _ => 0.90, // speed 6+: ~2.2×, approaching the all-variance floor
+                };
+            }
+        }
+        // Chroma-aware mode RD (`rd_cost_yuv`): the inter/intra pick minimises luma +
+        // 0.35·chroma RD instead of luma alone. A −0.30% BD-rate win @s3 (akiyo −0.83%,
+        // mobile −0.38%) for ~1.18× encode, so a COMPRESSION-tier default (speed ≤ 3);
+        // the realtime rungs (≥4) stay fast. `VP9_CHROMA_RD`/`VP9_NO_CHROMA_RD` override.
+        self.chroma_rd = if std::env::var("VP9_CHROMA_RD").is_ok() {
+            true
+        } else if std::env::var("VP9_NO_CHROMA_RD").is_ok() {
+            false
+        } else {
+            speed <= 3
+        };
+    }
+
+    /// Lever 2 — force the content-adaptive dispatch on at an externally-chosen
+    /// route fraction `q`. The outer encoder's time-budget controller calls this
+    /// each frame with the `q` it has adapted from the previous frames' decision
+    /// times (overriding whatever `set_speed` picked), since the controller's
+    /// cross-frame state can't live in a per-frame `FrameEncoder`.
+    pub(crate) fn set_dispatch_q(&mut self, q: f64) {
+        self.dispatch = true;
+        self.dispatch_q = q.clamp(0.0, 1.0);
+        // The budget controller uses the variance path for speed, so its fast arm gets
+        // the non-RD leaf too (Pareto: ~1.1× faster at neutral BD). `VP9_NO_NONRD_LEAF` off.
+        if std::env::var("VP9_NO_NONRD_LEAF").is_err() {
+            self.nonrd_leaf = true;
+        }
+    }
+
+    /// Lever 2 — the decision-pass wall time (µs) the last `encode_frame` spent,
+    /// the feedback signal the outer time-budget controller steers `q` on.
+    pub(crate) fn decision_us(&self) -> u64 {
+        self.decision_us
     }
 
     /// Set the AC deadzone numerator (R5): 4 = round-to-nearest, 3 = deadzone.
@@ -723,13 +1257,15 @@ impl FrameEncoder {
     /// (up to 64×64), so an RDO trial (which reconstructs into them) can be rolled
     /// back. Luma is stored row-major with stride = block width.
     fn snap_y(&self, mi_row: usize, mi_col: usize, bwl: usize, bhl: usize) -> YSnap {
+        let _s = prof::Scope::new(prof::S::SnapRestore);
         let (x0, y0, bw, bh) = self.block_px(mi_row, mi_col, bwl, bhl, 0);
         let cw = self.rec[0].stride;
-        let mut y = [0u16; 4096];
+        // Vec + row memcpys: the fixed [u16; 4096] zero-initialized 8 KB per
+        // snapshot (GBs of memset per encode) and copied per-pixel.
+        let mut y = Vec::with_capacity(bw * bh);
         for r in 0..bh {
-            for c in 0..bw {
-                y[r * bw + c] = self.rec[0].buf[(y0 + r) * cw + x0 + c];
-            }
+            let row = (y0 + r) * cw + x0;
+            y.extend_from_slice(&self.rec[0].buf[row..row + bw]);
         }
         let mut above = [0u8; 16];
         let aw = bw / 4; // in-frame 4×4-columns the block spans
@@ -738,12 +1274,12 @@ impl FrameEncoder {
     }
 
     fn restore_y(&mut self, mi_row: usize, mi_col: usize, bwl: usize, bhl: usize, snap: &YSnap) {
+        let _s = prof::Scope::new(prof::S::SnapRestore);
         let (x0, y0, bw, bh) = self.block_px(mi_row, mi_col, bwl, bhl, 0);
         let cw = self.rec[0].stride;
         for r in 0..bh {
-            for c in 0..bw {
-                self.rec[0].buf[(y0 + r) * cw + x0 + c] = snap.0[r * bw + c];
-            }
+            let row = (y0 + r) * cw + x0;
+            self.rec[0].buf[row..row + bw].copy_from_slice(&snap.0[r * bw..r * bw + bw]);
         }
         let aw = bw / 4;
         self.above_ctx[0][mi_col * 2..mi_col * 2 + aw].copy_from_slice(&snap.1[..aw]);
@@ -765,15 +1301,75 @@ impl FrameEncoder {
         bhl: usize,
         snap: &YSnap,
         extra_bits: f64,
+        best_so_far: f64,
     ) -> f64 {
+        // Early abort: J accumulates monotonically over tx blocks (sse and bits
+        // are non-negative integer sums; int→f64 and +/× by λ>0 are monotone),
+        // so once the running J strictly exceeds the incumbent the candidate has
+        // PROVABLY lost — the exact final value can't change the decision. The
+        // trial state is restored below either way.
+        let abort_at = if self.use_rdo && best_so_far.is_finite() {
+            Some(best_so_far - self.lambda * extra_bits)
+        } else {
+            None
+        };
+        self.trial_abort_at = abort_at;
         let (bits_q8, sse) = self.encode_plane(None, mi, 0, mi_row, mi_col, bsize, bwl, bhl);
+        self.trial_abort_at = None;
         self.restore_y(mi_row, mi_col, bwl, bhl, snap);
+        if bits_q8 == u64::MAX {
+            return f64::INFINITY; // aborted: strictly worse than the incumbent
+        }
         let rate = if self.use_rdo {
             self.lambda * (bits_q8 as f64 / 256.0 + extra_bits)
         } else {
             0.0
         };
         sse as f64 + rate
+    }
+
+    /// Chroma-aware candidate RD: like `rd_cost_y` but costs all three planes
+    /// (luma + both chroma) so the mode/MV pick minimises the JOINT luma+chroma RD.
+    /// Snapshots/restores the whole block (chroma recon + contexts too). No early
+    /// abort (the running J spans planes) — a `chroma_rd` speed-tier feature.
+    #[allow(clippy::too_many_arguments)]
+    fn rd_cost_yuv(
+        &mut self,
+        mi: &ModeInfo,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+        bwl: usize,
+        bhl: usize,
+        extra_bits: f64,
+    ) -> f64 {
+        let snap = self.snap_block(mi_row, mi_col, bwl, bhl);
+        let (mut y_bits, mut y_sse) = (0u64, 0u64);
+        let (mut c_bits, mut c_sse) = (0u64, 0u64);
+        for plane in 0..3 {
+            let (b, s) = self.encode_plane(None, mi, plane, mi_row, mi_col, bsize, bwl, bhl);
+            if plane == 0 {
+                y_bits += b;
+                y_sse += s;
+            } else {
+                c_bits += b;
+                c_sse += s;
+            }
+        }
+        self.restore_block(mi_row, mi_col, bwl, bhl, &snap);
+        // Chroma enters as a weighted tiebreaker (`chroma_rd_w`): full weight can tip a
+        // borderline luma decision the wrong way on chroma-heavy content (bus lost luma
+        // at full weight); a lighter weight keeps chroma as a discriminator without
+        // overriding the luma-dominant pick.
+        let w = self.chroma_rd_w;
+        let sse = y_sse as f64 + w * c_sse as f64;
+        let bits = y_bits as f64 / 256.0 + w * (c_bits as f64 / 256.0);
+        let rate = if self.use_rdo {
+            self.lambda * (bits + extra_bits)
+        } else {
+            0.0
+        };
+        sse + rate
     }
 
     /// Emit the selected tx size using the prob array for this block's max tx
@@ -784,6 +1380,23 @@ impl FrameEncoder {
             1 => write_selected_tx_size(enc, tx_size, &self.fc.tx_p8x8[ctx], max_tx),
             2 => write_selected_tx_size(enc, tx_size, &self.fc.tx_p16x16[ctx], max_tx),
             _ => write_selected_tx_size(enc, tx_size, &self.fc.tx_p32x32[ctx], max_tx),
+        }
+    }
+
+    /// The tx size a candidate's RD trial (and the final coding, when the tx-size
+    /// search is off) starts from. With the search ON, start at 4×4 and let
+    /// `best_tx_size` refine up. With it OFF (fast presets), start at the block's
+    /// MAX tx: 4×4 would transform the whole block per candidate (the flood) and
+    /// code smooth residual with far too many small transforms. `VP9_TX4X4` pins 4×4.
+    fn base_tx(&self, bsize: usize) -> u8 {
+        if self.use_tx_search || self.tx4x4 {
+            0
+        } else {
+            // Cap at 8×8 (tx_cap=1) by default: it reduces the 4×4 transform flood AND
+            // improves compression, while staying speed-neutral. 16×16/32×32 are a
+            // BD-rate win too but our large-tx fwd/trellis kernels are naive (super-
+            // linear per call), so they'd be 2–3× SLOWER — capped out until optimized.
+            (MAX_TXSIZE[bsize] as u8).min(self.tx_cap)
         }
     }
 
@@ -818,7 +1431,7 @@ impl FrameEncoder {
             } else {
                 0.0
             };
-            let j = self.rd_cost_y(&m, mi_row, mi_col, bsize, bwl, bhl, snap, extra);
+            let j = self.rd_cost_y(&m, mi_row, mi_col, bsize, bwl, bhl, snap, extra, best.1);
             if j < best.1 {
                 best = (t, j);
             }
@@ -864,6 +1477,7 @@ impl FrameEncoder {
             self.left_ctx = [[0; 16]; 3];
             let mut mi_col = tile_start;
             while mi_col < tile_end {
+                self.set_sb_aq(mi_row, mi_col);
                 self.encode_partition(&mut enc, mi_row, mi_col, BLOCK_64X64, 4);
                 mi_col += 8;
             }
@@ -930,10 +1544,81 @@ impl FrameEncoder {
 
     /// Encode the frame and return the complete VP9 bitstream.
     pub fn encode_frame(&mut self) -> Vec<u8> {
+        // Compound setup (before the decision pass reads sign_bias / reference_mode).
+        // `self.compound` is enabled by the outer encoder for the WHOLE ARF group (or by
+        // `VP9_COMPOUND`); a shown P frame that references the future ARF does TRUE
+        // bi-prediction, the ARF frame / non-ARF P frames fall back to LAST+GOLDEN — so
+        // reference_mode is consistent across the group (mixing single/compound across a
+        // group desyncs libvpx, a self-tolerated-but-illegal stream).
+        if self.is_inter && self.compound && !self.no_compound && self.altref_future && self.refs[2].is_some() {
+            self.sign_bias = [false, false, false, true]; // INTRA,LAST,GOLDEN,ALTREF
+            self.fc.reference_mode = 2; // REFERENCE_MODE_SELECT
+            self.fc.comp_fixed_ref = 3; // ALTREF (future) is the fixed compound ref
+            self.fc.comp_var_ref = [1, 2]; // LAST, GOLDEN
+        } else if self.is_inter && self.compound && !self.no_compound && self.refs[1].is_some() {
+            // Fallback (no future ARF, explicit VP9_COMPOUND): LAST+GOLDEN via the trick.
+            self.sign_bias = [false, false, true, false];
+            self.fc.reference_mode = 2;
+            self.fc.comp_fixed_ref = 2; // GOLDEN
+            self.fc.comp_var_ref = [1, 3]; // LAST, ALTREF
+        } else {
+            self.compound = false; // key frame / no usable second ref ⇒ no compound
+        }
+        // Activity-based ADAPTIVE QUANTIZATION: a per-SB variance pre-pass sorts each 64×64
+        // into a low/high-activity segment (median split, content-invariant), each carrying
+        // an ALT_Q qindex delta (seg0 = base−aq, seg1 = base+aq). Precompute per-segment
+        // dequant + λ; the SB root sets dq_y/dq_uv/lambda from `aq_seg`. seg_id coded per block.
+        if self.aq != 0 {
+            let sb_rows = self.mi_rows.div_ceil(8);
+            let sb_cols = self.mi_cols.div_ceil(8);
+            self.aq_ncols = sb_cols;
+            let mut vars: Vec<i64> = Vec::with_capacity(sb_rows * sb_cols);
+            for sbr in 0..sb_rows {
+                for sbc in 0..sb_cols {
+                    self.build_vt(sbr * 8, sbc * 8);
+                    vars.push(self.vt.as_ref().unwrap().variance(3, 0, 0));
+                }
+            }
+            self.vt = None;
+            let mut sorted = vars.clone();
+            sorted.sort_unstable();
+            let median = sorted[sorted.len() / 2];
+            // Content gate: AQ (variance direction) is a SSIM win on low/mixed-activity
+            // content but a loss on uniformly high-activity content — enable per frame only
+            // when the frame's median SB variance is below the threshold.
+            // ~8000 enables AQ on mostly-flat frames (akiyo inter ~1.4k) where it wins on
+            // BOTH PSNR and SSIM, and disables it on textured content (foreman ~15k,
+            // mobile ~130k) where it loses. Calibrated on the CIF set.
+            let maxvar: i64 = std::env::var("VP9_AQ_MAXVAR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8000);
+            if std::env::var("VP9_AQ_DEBUG").is_ok() {
+                eprintln!("AQ median_var={} gate_max={} active={}", median, maxvar, median <= maxvar);
+            }
+            self.aq_active = median <= maxvar;
+            if self.aq_active {
+                self.aq_seg = vars.iter().map(|&v| (v > median) as u8).collect();
+                let base_q = self.qindex as i32;
+                let q0 = (base_q - self.aq).clamp(1, 255);
+                let q1 = (base_q + self.aq).clamp(1, 255);
+                self.aq_dq_y[0] = (dc_quant(q0, 8), ac_quant(q0, 8));
+                self.aq_dq_y[1] = (dc_quant(q1, 8), ac_quant(q1, 8));
+                self.aq_dq_uv[0] = self.aq_dq_y[0];
+                self.aq_dq_uv[1] = self.aq_dq_y[1];
+                let base_ac = self.dq_y.1 as f64;
+                let mult = self.lambda / (base_ac * base_ac);
+                self.aq_lambda[0] = (self.aq_dq_y[0].1 as f64).powi(2) * mult;
+                self.aq_lambda[1] = (self.aq_dq_y[1].1 as f64).powi(2) * mult;
+            }
+        }
         let initial = self.fc.clone();
         let _prof = std::env::var("VP9_PROF").is_ok();
         let _t = std::time::Instant::now();
         if self.partition_rd_active() {
+            // Brick 4: measure this frame's SB variance distribution and set the
+            // content-adaptive dispatch threshold before the decision pass reads it.
+            self.set_dispatch_threshold();
             // Choose every partition by RD first; the emit pass(es) below replay
             // the recorded decisions. Reset the recon the decision pass left behind.
             self.run_partition_decision();
@@ -941,8 +1626,9 @@ impl FrameEncoder {
                 p.buf.iter_mut().for_each(|v| *v = 0);
             }
         }
+        self.decision_us = _t.elapsed().as_micros() as u64;
         if _prof {
-            PROF_DECISION.fetch_add(_t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            PROF_DECISION.fetch_add(self.decision_us, std::sync::atomic::Ordering::Relaxed);
         }
         let _t = std::time::Instant::now();
         if self.use_prob_updates {
@@ -994,6 +1680,12 @@ impl FrameEncoder {
         let mut target = self.commit_fc.take().unwrap_or_else(|| initial.clone());
         if self.use_tx_search {
             target.tx_mode = 4; // TX_MODE_SELECT — per-block tx_size is coded
+        } else if !self.tx4x4 {
+            // Fast presets: no per-block tx bits, every block uses its capped max tx.
+            // ALLOW_{n} makes the decoder DERIVE tx = min(max_tx[bsize], n) = exactly
+            // `base_tx` — matching the residual we coded, zero tx syntax. The ALLOW
+            // mode index equals its biggest tx, so tx_mode == tx_cap.
+            target.tx_mode = self.tx_cap as usize; // 1=ALLOW_8X8 2=ALLOW_16X16 3=ALLOW_32X32
         }
         let tile_data = assemble_tiles(&tiles);
 
@@ -1003,6 +1695,20 @@ impl FrameEncoder {
         let _t = std::time::Instant::now();
         // ---- compressed header: signal the coef deltas; deblock the recon (R3) ----
         let mut h = self.frame_header();
+        if self.aq_active {
+            // AQ segmentation: seg0 = base−aq (finer, low-activity), seg1 = base+aq
+            // (coarser, high-activity). Tree-only map (no temporal pred), fresh each frame.
+            h.seg_enabled = true;
+            h.seg_update_map = true;
+            h.seg_temporal_update = false;
+            h.seg_update_data = true;
+            h.seg_abs_delta = false;
+            h.seg_tree_probs = AQ_TREE_PROBS;
+            h.seg_feature_enabled[0][0] = true; // ALT_Q, segment 0
+            h.seg_feature_data[0][0] = -self.aq;
+            h.seg_feature_enabled[1][0] = true; // ALT_Q, segment 1
+            h.seg_feature_data[1][0] = self.aq;
+        }
         self.apply_loop_filter(&mut h);
         let mut cenc = BoolEncoder::new();
         write_compressed_header(&mut cenc, &initial, &target, &h);
@@ -1041,6 +1747,40 @@ impl FrameEncoder {
             );
         }
         prof::dump();
+        if std::env::var("VP9_IF_HARVEST").is_ok() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let s0 = IF_HARVEST[0].load(Relaxed);
+            let smin = IF_HARVEST[1].load(Relaxed);
+            let n = IF_HARVEST[2].load(Relaxed).max(1);
+            let wins = IF_HARVEST[3].load(Relaxed);
+            eprintln!(
+                "VP9_IF_HARVEST cum: blocks={} filter-wins={} ({:.1}%)  residual-SSE eighttap={} best={}  reduction={:.2}%",
+                n, wins, 100.0 * wins as f64 / n as f64, s0, smin,
+                100.0 * (s0.saturating_sub(smin)) as f64 / s0.max(1) as f64,
+            );
+        }
+        if std::env::var("VP9_SUB8_PROBE").is_ok() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let s0 = SUB8_PROBE[0].load(Relaxed);
+            let smin = SUB8_PROBE[1].load(Relaxed);
+            let n = SUB8_PROBE[2].load(Relaxed).max(1);
+            let wins = SUB8_PROBE[3].load(Relaxed);
+            eprintln!(
+                "VP9_SUB8_PROBE cum: sub-blocks={} comp-wins={} ({:.1}%)  SAD single={} best={}  reduction={:.2}%",
+                n, wins, 100.0 * wins as f64 / n as f64, s0, smin,
+                100.0 * (s0.saturating_sub(smin)) as f64 / s0.max(1) as f64,
+            );
+        }
+        if std::env::var("VP9_LFSEG_PROBE").is_ok() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let g = LFSEG_PROBE[0].load(Relaxed);
+            let c = LFSEG_PROBE[1].load(Relaxed);
+            let n = LFSEG_PROBE[2].load(Relaxed).max(1);
+            eprintln!(
+                "VP9_LFSEG_PROBE cum: frames={} global-SSE={} per-SB-oracle-SSE={}  ceiling-reduction={:.2}%",
+                n, g, c, 100.0 * (g.saturating_sub(c)) as f64 / g.max(1) as f64,
+            );
+        }
         frame
     }
 
@@ -1088,8 +1828,18 @@ impl FrameEncoder {
             h.key_frame = false;
             h.refresh_frame_flags = self.refresh_frame_flags;
             h.ref_frame_idx = self.ref_frame_idx;
-            h.ref_sign_bias = [false, false, false];
-            h.allow_high_precision_mv = false;
+            // Compound: the fixed ref gets the opposite sign bias. `compound_allowed` in
+            // the compressed header keys on this, so the reference_mode bits are emitted.
+            h.ref_sign_bias = if self.compound {
+                if self.fc.comp_fixed_ref == 3 {
+                    [false, false, true] // ALTREF fixed (true bi-prediction)
+                } else {
+                    [false, true, false] // GOLDEN fixed (LAST+GOLDEN fallback)
+                }
+            } else {
+                [false, false, false]
+            };
+            h.allow_high_precision_mv = self.hp_mv;
             h.interp_filter = self.interp_filter;
             h.reset_frame_context = 0;
             // Error-resilient: each frame is independently decodable. This forces
@@ -1210,6 +1960,10 @@ impl FrameEncoder {
         // modes, so we decide everything then emit in the decoder's read order.
         let mi = self.decide_intra(mi_row, mi_col, bsize, bwl, bhl);
 
+        // AQ: segment_id is the first per-block syntax (key-frame intra path).
+        if self.aq_active {
+            write_segment_id(enc, self.sb_seg(mi_row, mi_col), &AQ_TREE_PROBS);
+        }
         let sctx = skip_context(above.as_ref(), left.as_ref());
         write_skip(enc, false, self.fc.skip_probs[sctx]);
         let max_tx = MAX_TXSIZE[bsize] as usize;
@@ -1243,14 +1997,14 @@ impl FrameEncoder {
             sb_type: bsize as u8,
             is_inter: false,
             skip: false,
-            tx_size: 0,
+            tx_size: self.base_tx(bsize),
             ..Default::default()
         };
         let snap = self.snap_y(mi_row, mi_col, bwl, bhl);
         let mut best = (DC_PRED, f64::MAX);
         for &m in &[DC_PRED, V_PRED, H_PRED, TM_PRED] {
             mi.mode = m;
-            let j = self.rd_cost_y(&mi, mi_row, mi_col, bsize, bwl, bhl, &snap, 0.0);
+            let j = self.rd_cost_y(&mi, mi_row, mi_col, bsize, bwl, bhl, &snap, 0.0, best.1);
             if j < best.1 {
                 best = (m, j);
             }
@@ -1413,7 +2167,7 @@ impl FrameEncoder {
             &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, bsize,
             LAST_FRAME, &self.sign_bias, NEWMV, -1, edges, self.prev_mv(mi_row, mi_col),
         );
-        let pred = lower_mv_precision(cand[0], false);
+        let pred = lower_mv_precision(cand[0], self.hp_mv);
         let mut idy = 0;
         while idy < 2 {
             let mut idx = 0;
@@ -1510,6 +2264,7 @@ impl FrameEncoder {
     }
 
     fn snap_block(&self, mi_row: usize, mi_col: usize, bwl: usize, bhl: usize) -> BlockSnap {
+        let _s = prof::Scope::new(prof::S::SnapRestore);
         let rec = std::array::from_fn(|p| {
             let (x0, y0, bw, bh) = self.block_px(mi_row, mi_col, bwl, bhl, p);
             let st = self.rec[p].stride;
@@ -1526,11 +2281,22 @@ impl FrameEncoder {
             let base = (mi_row + y) * self.mi_cols + mi_col;
             mi.extend_from_slice(&self.mi[base..base + x_mis]);
         }
+        // Slice the above-ctx/seg snapshots to the block's span — cloning the
+        // frame-width Vecs per snapshot was pure overhead (a trial only mutates
+        // the columns the block covers).
+        let above_ctx = std::array::from_fn(|pl| {
+            let ss = self.rec[pl].ss_x;
+            let c0 = (mi_col * 2) >> ss;
+            let w = ((x_mis * 2) >> ss).max(1);
+            let end = (c0 + w).min(self.above_ctx[pl].len());
+            self.above_ctx[pl][c0..end].to_vec()
+        });
+        let above_seg = self.above_seg[mi_col..(mi_col + x_mis).min(self.above_seg.len())].to_vec();
         BlockSnap {
             rec,
-            above_ctx: self.above_ctx.clone(),
+            above_ctx,
             left_ctx: self.left_ctx,
-            above_seg: self.above_seg.clone(),
+            above_seg,
             left_seg: self.left_seg,
             mi,
             x_mis,
@@ -1546,6 +2312,7 @@ impl FrameEncoder {
         bhl: usize,
         s: &BlockSnap,
     ) {
+        let _sc = prof::Scope::new(prof::S::SnapRestore);
         for p in 0..3 {
             let (x0, y0, bw, bh) = self.block_px(mi_row, mi_col, bwl, bhl, p);
             let st = self.rec[p].stride;
@@ -1554,9 +2321,16 @@ impl FrameEncoder {
                 self.rec[p].buf[(y0 + r) * st + x0..(y0 + r) * st + x0 + bw].copy_from_slice(src);
             }
         }
-        self.above_ctx = s.above_ctx.clone();
+        for pl in 0..3 {
+            let ss = self.rec[pl].ss_x;
+            let c0 = (mi_col * 2) >> ss;
+            let end = (c0 + s.above_ctx[pl].len()).min(self.above_ctx[pl].len());
+            self.above_ctx[pl][c0..end].copy_from_slice(&s.above_ctx[pl][..end - c0]);
+        }
         self.left_ctx = s.left_ctx;
-        self.above_seg = s.above_seg.clone();
+        let sc0 = mi_col;
+        let send = (sc0 + s.above_seg.len()).min(self.above_seg.len());
+        self.above_seg[sc0..send].copy_from_slice(&s.above_seg[..send - sc0]);
         self.left_seg = s.left_seg;
         let mut k = 0;
         for y in 0..s.y_mis {
@@ -1582,6 +2356,28 @@ impl FrameEncoder {
         // early return in `encode_partition`).
         if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
             return 0.0;
+        }
+        // Content-adaptive dispatch (Brick 3), decided once at the 64×64 SB root:
+        // route this superblock through the variance partition (content-invariant
+        // cost) when it is simple enough that RD search buys nothing, else keep the
+        // full RD search. `var_part` forces the variance path for every SB (the
+        // Brick-2 A/B). The variance tree, built here, is reused by whichever path
+        // runs (the recursion reads `self.vt`).
+        if bsize == BLOCK_64X64 && (self.var_part || self.dispatch) {
+            self.build_vt(mi_row, mi_col);
+            let use_var = self.var_part || {
+                let v = self.vt.as_ref().unwrap().variance(3, 0, 0);
+                // `dispatch_hi`: route the busy (RD-expensive) SBs to variance; else
+                // route the flat SBs to variance and keep RD for the busy ones.
+                if self.dispatch_hi {
+                    v >= self.dispatch_thresh
+                } else {
+                    v < self.dispatch_thresh
+                }
+            };
+            if use_var {
+                return self.var_pick_partition(mi_row, mi_col, bsize, n4x4_l2);
+            }
         }
         let n8x8_l2 = n4x4_l2 - 1;
         let num_8x8 = 1usize << n8x8_l2;
@@ -1636,7 +2432,8 @@ impl FrameEncoder {
                         BLOCK_8X8 => 18.0, // bump to 33 at speed 0 was a weak trade (+0.16% BD)
                         6 => 64.0,  // 16x16
                         9 => 280.0, // 32x32
-                        _ => 0.0,   // 64x64: never skip
+                        // 64×64: gated only at speed >= 3 (g1_64 = 0 disables).
+                        _ => self.g1_64 / self.g1_scale.max(1e-9),
                     };
 
         // SPLIT — recurse into four quadrants (each leaves its own recon+context).
@@ -1645,12 +2442,29 @@ impl FrameEncoder {
         if can_split && !g1_skip {
             let subsize = subsize(PARTITION_SPLIT, bsize) as usize;
             let mut s = self.part_flag_cost(&probs, PARTITION_SPLIT, has_rows, has_cols);
-            s += self.rd_pick_partition(mi_row, mi_col, subsize, n8x8_l2);
-            s += self.rd_pick_partition(mi_row, mi_col + hbs, subsize, n8x8_l2);
-            s += self.rd_pick_partition(mi_row + hbs, mi_col, subsize, n8x8_l2);
-            s += self.rd_pick_partition(mi_row + hbs, mi_col + hbs, subsize, n8x8_l2);
-            split_rd = s;
-            split_snap = Some(self.snap_block(mi_row, mi_col, n4x4_l2, n4x4_l2));
+            let quads = [
+                (mi_row, mi_col),
+                (mi_row, mi_col + hbs),
+                (mi_row + hbs, mi_col),
+                (mi_row + hbs, mi_col + hbs),
+            ];
+            let mut aborted = false;
+            for (i, &(qr, qc)) in quads.iter().enumerate() {
+                s += self.rd_pick_partition(qr, qc, subsize, n8x8_l2);
+                // Early termination: once the running SPLIT total exceeds the
+                // NONE incumbent the split provably loses. NOT byte-identical to
+                // the exhaustive walk though — the skipped quadrants' mode_map
+                // insertions are load-bearing for later cache lookups — so this
+                // is a speed>=3 preset feature, BD-gated with the rest.
+                if self.split_early && i < 3 && s > none_rd {
+                    aborted = true;
+                    break;
+                }
+            }
+            if !aborted {
+                split_rd = s;
+                split_snap = Some(self.snap_block(mi_row, mi_col, n4x4_l2, n4x4_l2));
+            }
             self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, &start);
         }
 
@@ -1748,6 +2562,298 @@ impl FrameEncoder {
         cost
     }
 
+    /// Build the variance tree for the 64×64 superblock rooted at (`mi_row`,`mi_col`).
+    /// Residual variance vs the zero-MV LAST reference on inter frames (the coding
+    /// difficulty signal), source variance on key frames (no reference).
+    fn build_vt(&mut self, mi_row: usize, mi_col: usize) {
+        let (x0, y0) = (mi_col * 8, mi_row * 8);
+        let (sw, sh, sstride) = (self.src[0].w, self.src[0].h, self.src[0].stride);
+        let tree = {
+            let sbuf = &self.src[0].buf;
+            // refs[0] = LAST; aligned co-located (zero-MV) reference. Same cw×ch dims.
+            let refp = self.refs[0].as_ref().map(|r| (&r[0].buf[..], r[0].stride));
+            VarTree::build(sbuf, sstride, refp, x0, y0, sw, sh)
+        };
+        self.vt = Some(tree);
+    }
+
+    /// Brick 4 — per-frame adaptive dispatch threshold. A cheap O(pixels) pre-pass
+    /// computes one root variance per 64×64 superblock (the "channel" measurement),
+    /// then sets `dispatch_thresh` to the percentile matching `dispatch_q` (the
+    /// target fraction of SBs routed to the variance partition). Because the cut is a
+    /// percentile of *this frame's* distribution, the routing fraction — and thus the
+    /// relative work split between the RD and variance algorithms — is content-
+    /// invariant: the same `dispatch_q` yields the same split on akiyo and mobile,
+    /// even though their absolute variance scales differ by ~50×. No-op in fixed-T
+    /// mode (`VP9_DISPATCH_T`).
+    fn set_dispatch_threshold(&mut self) {
+        if !self.dispatch || self.dispatch_fixed_t {
+            return;
+        }
+        let sb_rows = self.mi_rows.div_ceil(8);
+        let sb_cols = self.mi_cols.div_ceil(8);
+        let mut vars: Vec<i64> = Vec::with_capacity(sb_rows * sb_cols);
+        for sbr in 0..sb_rows {
+            for sbc in 0..sb_cols {
+                self.build_vt(sbr * 8, sbc * 8);
+                vars.push(self.vt.as_ref().unwrap().variance(3, 0, 0));
+            }
+        }
+        self.vt = None;
+        if vars.is_empty() {
+            return;
+        }
+        vars.sort_unstable();
+        let n = vars.len();
+        // `dispatch_q` fraction goes to the variance partition. In the low-var
+        // direction that fraction sits at the BOTTOM of the sorted variances (cut at
+        // index q·n); in the high-var direction it sits at the TOP (cut at (1−q)·n).
+        let frac = self.dispatch_q.clamp(0.0, 1.0);
+        let idx = if self.dispatch_hi {
+            ((n as f64) * (1.0 - frac)).round() as usize
+        } else {
+            ((n as f64) * frac).round() as usize
+        };
+        self.dispatch_thresh = if idx == 0 {
+            i64::MIN
+        } else if idx >= n {
+            i64::MAX
+        } else {
+            vars[idx]
+        };
+    }
+
+    /// Variance split threshold for a node at `level` (0=8×8 … 3=64×64). Mirrors
+    /// libvpx's per-level scaling: smaller blocks tolerate more variance before
+    /// splitting — a whole 64×64 is taken NONE only if very flat, a 16×16 readily.
+    /// `base = var_thresh_mult · ac_dequant`; `VP9_VAR_THRESH` tunes the multiplier.
+    fn vt_threshold(&self, level: usize) -> i64 {
+        let base = self.var_thresh_mult * self.dq_y.1 as f64;
+        let scale = match level {
+            3 => 0.125, // 64×64 — split unless very flat
+            2 => 0.5,   // 32×32
+            _ => 8.0,   // 16×16 (level 0/8×8 never consults this)
+        };
+        (base * scale) as i64
+    }
+
+    /// Variance-driven partition for one node — the content-*invariant* alternative
+    /// to `rd_pick_partition`. Chooses NONE vs SPLIT from the SB variance tree (no
+    /// RD trial), then runs the SAME leaf machinery (`rd_block_none`) so the recon,
+    /// contexts, and `part_map`/`mode_map` evolve exactly as the emit pass expects —
+    /// making the stream decodable by construction, same guarantee as the RD path.
+    /// Only NONE/SPLIT are produced (the emit path's vocabulary above 8×8); the
+    /// finest granularity is an 8×8 NONE leaf (no sub-8×8 — that stays RD-only).
+    fn var_pick_partition(
+        &mut self,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+        n4x4_l2: usize,
+    ) -> f64 {
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return 0.0;
+        }
+        // (The variance tree is built once at the SB root by the dispatch block in
+        // `rd_pick_partition` before this is entered; the recursion reuses it.)
+        let n8x8_l2 = n4x4_l2 - 1;
+        let num_8x8 = 1usize << n8x8_l2;
+        let hbs = num_8x8 >> 1;
+        let has_rows = mi_row + hbs < self.mi_rows;
+        let has_cols = mi_col + hbs < self.mi_cols;
+        let ctx = partition_plane_context(&self.above_seg, &self.left_seg, mi_row, mi_col, n8x8_l2);
+        let probs = if self.is_inter {
+            self.fc.partition_prob[ctx]
+        } else {
+            KF_PARTITION_PROBS[ctx]
+        };
+        let can_split = hbs > 0;
+        // NONE eligibility mirrors the RD path: `has_rows` and a full horizontal fit
+        // (a `has_rows`-only block may overhang the bottom into the height padding;
+        // horizontal overhang would need a padded stride, so it must split).
+        let full_fit = has_rows && mi_col + num_8x8 <= self.mi_cols;
+        let level = n4x4_l2 - 1;
+
+        // Choose NONE vs SPLIT from the variance tree.
+        let force_none = if !can_split {
+            true // 8×8: finest granularity — always a NONE leaf
+        } else if !full_fit {
+            false // edge overhang can't code NONE → forced split (as the RD path)
+        } else {
+            let sb_mr = (mi_row / 8) * 8;
+            let sb_mc = (mi_col / 8) * 8;
+            let r = (mi_row - sb_mr) >> level;
+            let c = (mi_col - sb_mc) >> level;
+            let var = self.vt.as_ref().unwrap().variance(level, r, c);
+            var < self.vt_threshold(level)
+        };
+
+        let (partition, cost) = if force_none {
+            // Mark the leaf so `decide_inter` may take the non-RD fast path (LAST-ref
+            // only + forced model-skip). Confined to this variance-routed leaf; the
+            // RD partition path never sets `variance_leaf`.
+            self.variance_leaf = true;
+            let rd = self.part_flag_cost(&probs, PARTITION_NONE, has_rows, has_cols)
+                + self.rd_block_none(mi_row, mi_col, bsize, n4x4_l2, n4x4_l2);
+            self.variance_leaf = false;
+            (PARTITION_NONE, rd)
+        } else {
+            let subsize = subsize(PARTITION_SPLIT, bsize) as usize;
+            let mut s = self.part_flag_cost(&probs, PARTITION_SPLIT, has_rows, has_cols);
+            for &(qr, qc) in &[
+                (mi_row, mi_col),
+                (mi_row, mi_col + hbs),
+                (mi_row + hbs, mi_col),
+                (mi_row + hbs, mi_col + hbs),
+            ] {
+                s += self.var_pick_partition(qr, qc, subsize, n8x8_l2);
+            }
+            (PARTITION_SPLIT, s)
+        };
+        self.part_map
+            .insert((mi_row, mi_col, bsize), partition as u8);
+
+        // Evolve the partition context exactly as the emit pass will.
+        let subsize = subsize(partition, bsize) as usize;
+        if bsize >= BLOCK_8X8 && (bsize == BLOCK_8X8 || partition != PARTITION_SPLIT) {
+            update_partition_context(
+                &mut self.above_seg,
+                &mut self.left_seg,
+                mi_row,
+                mi_col,
+                subsize,
+                num_8x8,
+            );
+        }
+        cost
+    }
+
+    /// Joint compound refine: subpel-diamond `mv_search` (holding `mv_hold` fixed) to
+    /// minimise the AVERAGED-prediction SAD `(search + hold + 1)>>1` vs source (a top-left-8×8
+    /// proxy, like the subpel search). The HELD prediction is invariant across the diamond, so
+    /// it's computed ONCE and only the search ref is re-predicted per candidate. ½- then ¼-pel.
+    fn compound_refine(
+        &self,
+        mi_row: usize,
+        mi_col: usize,
+        mv_search: Mv,
+        slot_search: usize,
+        mv_hold: Mv,
+        slot_hold: usize,
+        edges: (i32, i32, i32, i32),
+    ) -> Mv {
+        let (base_x, base_y) = (mi_col * 8, mi_row * 8);
+        let filt = self.active_filter as usize;
+        // The held ref's prediction is constant across the search diamond — compute it once.
+        let mut hold = [0u16; 64];
+        {
+            let q = clamp_mv_umv(mv_hold, 8, 8, 0, 0, edges);
+            let rp = &self.refs[slot_hold].as_ref().unwrap()[0];
+            let refp = RefPlane { buf: &rp.buf, stride: rp.stride, w: rp.w as i32, h: rp.h as i32 };
+            predict_block(
+                &refp, base_x as i32 + (q.1 >> 4), base_y as i32 + (q.0 >> 4),
+                (q.1 & 15) as usize, (q.0 & 15) as usize, filt, &mut hold, 8, 8, 8, false, self.max_px,
+            );
+        }
+        let src = &self.src[0];
+        let s0 = base_y * src.stride + base_x;
+        let rp = &self.refs[slot_search].as_ref().unwrap()[0];
+        let refp = RefPlane { buf: &rp.buf, stride: rp.stride, w: rp.w as i32, h: rp.h as i32 };
+        let score = |mv: Mv| -> i64 {
+            let q = clamp_mv_umv(mv, 8, 8, 0, 0, edges);
+            let mut buf = [0u16; 64];
+            predict_block(
+                &refp, base_x as i32 + (q.1 >> 4), base_y as i32 + (q.0 >> 4),
+                (q.1 & 15) as usize, (q.0 & 15) as usize, filt, &mut buf, 8, 8, 8, false, self.max_px,
+            );
+            let mut sad = 0i64;
+            for r in 0..8 {
+                let sr = s0 + r * src.stride;
+                for c in 0..8 {
+                    let p = (buf[r * 8 + c] as i32 + hold[r * 8 + c] as i32 + 1) >> 1;
+                    sad += (p - src.buf[sr + c] as i32).abs() as i64;
+                }
+            }
+            sad
+        };
+        let mut best = mv_search;
+        let mut best_sad = score(best);
+        for &step in &[4i32, 2] {
+            let (cr, cc) = best;
+            for (dr, dc) in [(-step, 0), (step, 0), (0, -step), (0, step)] {
+                let cand = (cr + dr, cc + dc);
+                let sad = score(cand);
+                if sad < best_sad {
+                    best_sad = sad;
+                    best = cand;
+                }
+            }
+        }
+        best
+    }
+
+    /// Full-block SSE of source vs the AVERAGED compound prediction `(ref0@mv0 + ref1@mv1
+    /// + 1)>>1` under the current `active_filter` — the filter-search scorer for compound
+    /// winners (mirrors the emit MC at encode_plane: ref0 avg=false, ref1 avg=true).
+    fn pred_sse_compound(
+        &self,
+        mi_row: usize,
+        mi_col: usize,
+        mv0: Mv,
+        slot0: usize,
+        mv1: Mv,
+        slot1: usize,
+        edges: (i32, i32, i32, i32),
+        bwl: usize,
+        bhl: usize,
+    ) -> i64 {
+        let (base_x, base_y) = (mi_col * 8, mi_row * 8);
+        let (w, h) = ((1usize << bwl) * 4, (1usize << bhl) * 4);
+        let filt = self.active_filter as usize;
+        let mut buf = [0u16; 64 * 64];
+        for (i, (mv, slot)) in [(mv0, slot0), (mv1, slot1)].iter().enumerate() {
+            let q = clamp_mv_umv(*mv, w as i32, h as i32, 0, 0, edges);
+            let rp = &self.refs[*slot].as_ref().unwrap()[0];
+            let refp = RefPlane { buf: &rp.buf, stride: rp.stride, w: rp.w as i32, h: rp.h as i32 };
+            predict_block(
+                &refp, base_x as i32 + (q.1 >> 4), base_y as i32 + (q.0 >> 4),
+                (q.1 & 15) as usize, (q.0 & 15) as usize, filt, &mut buf, w, w, h, i == 1, self.max_px,
+            );
+        }
+        let src = &self.src[0];
+        let mut sse = 0i64;
+        for r in 0..h {
+            let sr = (base_y + r) * src.stride + base_x;
+            let br = r * w;
+            for c in 0..w {
+                let d = buf[br + c] as i64 - src.buf[sr + c] as i64;
+                sse += d * d;
+            }
+        }
+        sse
+    }
+
+    /// AQ segment of the 64×64 SB covering `(mi_row, mi_col)` (0 when AQ is off).
+    fn sb_seg(&self, mi_row: usize, mi_col: usize) -> u8 {
+        if !self.aq_active || self.aq_seg.is_empty() {
+            return 0;
+        }
+        let idx = (mi_row / 8) * self.aq_ncols + (mi_col / 8);
+        self.aq_seg.get(idx).copied().unwrap_or(0)
+    }
+
+    /// Set the per-SB dequant + RD-λ from the AQ segment (called at each SB root in the
+    /// decision AND emit passes — deterministic segment ⇒ they can't disagree).
+    fn set_sb_aq(&mut self, mi_row: usize, mi_col: usize) {
+        if !self.aq_active {
+            return;
+        }
+        let s = self.sb_seg(mi_row, mi_col) as usize;
+        self.dq_y = self.aq_dq_y[s];
+        self.dq_uv = self.aq_dq_uv[s];
+        self.lambda = self.aq_lambda[s];
+    }
+
     /// Fill `part_map` by running the recursive partition RD over every superblock,
     /// then leave `rec`/context ready to be reset for the emit pass.
     fn run_partition_decision(&mut self) {
@@ -1785,6 +2891,7 @@ impl FrameEncoder {
 
     /// The RD decision pass over one tile column (`rd_pick_partition` per SB).
     fn decide_tile(&mut self, t: usize) {
+        let _tot = prof::Scope::new(prof::S::Total); // VP9_PROF2 % denominator (per tile/thread)
         {
             let ts = tile_offset_enc(t, self.mi_cols, self.tile_cols_log2);
             let te = tile_offset_enc(t + 1, self.mi_cols, self.tile_cols_log2);
@@ -1801,6 +2908,7 @@ impl FrameEncoder {
                 self.left_ctx = [[0; 16]; 3];
                 let mut mi_col = ts;
                 while mi_col < te {
+                    self.set_sb_aq(mi_row, mi_col);
                     self.rd_pick_partition(mi_row, mi_col, BLOCK_64X64, 4);
                     mi_col += 8;
                 }
@@ -1835,6 +2943,16 @@ impl FrameEncoder {
                 ALTREF_FRAME => 2,
                 _ => 0,
             };
+            // The block's chosen filter drives the commit MC on a switchable frame; on
+            // a fixed frame (incl. a frame the gate flipped to EIGHTTAP) use the frame
+            // filter, so mode_map's per-block filters are ignored and recon stays in sync.
+            if m.is_inter {
+                self.active_filter = if self.interp_filter == 4 {
+                    m.interp_filter
+                } else {
+                    self.interp_filter as u8
+                };
+            }
             if m.skip {
                 // A skip block emits no tokens: the commit relies on the recon +
                 // zeroed entropy contexts the decide-trial left behind. Replay
@@ -1872,13 +2990,26 @@ impl FrameEncoder {
             let (m, p, _, _) = self.decide_inter(mi_row, mi_col, bsize, bwl, bhl, false);
             (m, p)
         };
+        // Lock the block's filter for the commit MC: the block's own filter on a
+        // switchable frame, else the frame filter (also covers a gate-flipped frame).
+        if mi.is_inter {
+            self.active_filter = if self.interp_filter == 4 {
+                mi.interp_filter
+            } else {
+                self.interp_filter as u8
+            };
+        }
         let above = self.above_mi(mi_row, mi_col);
         let left = self.left_mi(mi_row, mi_col);
         // Use the ACTUAL coded size (sub-8×8 sets sb_type<8×8): its max tx is 4×4, so
         // tx_size is not coded, exactly as the decoder gates it.
         let max_tx = MAX_TXSIZE[mi.sb_type as usize] as usize;
 
-        // segment_id = 0 (no bits). skip, is_inter, tx_size (not coded when skipped).
+        // AQ: segment_id is the first per-block syntax (inter frame — tree only, no temporal
+        // prediction). Then skip, is_inter, tx_size (not coded when skipped).
+        if self.aq_active {
+            write_segment_id(enc, self.sb_seg(mi_row, mi_col), &AQ_TREE_PROBS);
+        }
         let sctx = skip_context(above.as_ref(), left.as_ref());
         write_skip(enc, mi.skip, self.fc.skip_probs[sctx]);
         let ictx = intra_inter_context(above.as_ref(), left.as_ref());
@@ -1888,21 +3019,49 @@ impl FrameEncoder {
             self.write_tx_size(enc, mi.tx_size, ctx, max_tx);
         }
         if mi.is_inter {
-            // Reference (single-prediction; compound disabled): p1 selects LAST vs
-            // {GOLDEN,ALTREF} in context `single_ref_p1`; p2 selects between the latter
-            // two in the *distinct* context `single_ref_p2` (mirrors `read_ref_frames`).
-            let ctx0 = single_ref_p1(above.as_ref(), left.as_ref());
-            let ctx1 = single_ref_p2(above.as_ref(), left.as_ref());
-            write_single_ref(
-                enc,
-                mi.ref_frame[0],
-                self.fc.single_ref_prob[ctx0][0],
-                self.fc.single_ref_prob[ctx1][1],
-            );
+            // Reference. On a SELECT frame (compound), a comp_inter bit picks
+            // single-vs-compound; compound then codes a comp_ref bit (which var ref
+            // pairs with the fixed GOLDEN), else the usual single_ref pair. Mirrors
+            // the decoder's `read_ref_frames`.
+            let write_single = |enc: &mut BoolEncoder, fc: &FrameContext, rf: i8| {
+                let ctx0 = single_ref_p1(above.as_ref(), left.as_ref());
+                let ctx1 = single_ref_p2(above.as_ref(), left.as_ref());
+                write_single_ref(enc, rf, fc.single_ref_prob[ctx0][0], fc.single_ref_prob[ctx1][1]);
+            };
+            if self.fc.reference_mode == 2 {
+                let rmctx = reference_mode_context(
+                    above.as_ref(), left.as_ref(), self.sign_bias, self.fc.comp_fixed_ref,
+                );
+                let is_comp = mi.has_second_ref();
+                write_comp_inter(enc, is_comp, self.fc.comp_inter_prob[rmctx]);
+                if is_comp {
+                    let crctx = comp_ref_context(above.as_ref(), left.as_ref(), self.sign_bias, &self.fc);
+                    // The var ref sits opposite the fixed ref's slot; its bit selects
+                    // which comp_var_ref element it is.
+                    let idx = self.sign_bias[self.fc.comp_fixed_ref] as usize;
+                    let var_ref = mi.ref_frame[1 - idx];
+                    let var_bit = (var_ref == self.fc.comp_var_ref[1] as i8) as u32;
+                    write_comp_ref(enc, var_bit, self.fc.comp_ref_prob[crctx]);
+                } else {
+                    write_single(enc, &self.fc, mi.ref_frame[0]);
+                }
+            } else {
+                write_single(enc, &self.fc, mi.ref_frame[0]);
+            }
+            // interp_filter is coded per inter block on a switchable frame, right after
+            // the reference (and the 8×8+ block mode) and BEFORE any MV — mirroring the
+            // decoder's read order (ref → inter_mode → interp_filter → MV).
+            let write_filter = |enc: &mut BoolEncoder, fc: &FrameContext, mi: &ModeInfo| {
+                let ctx = switchable_interp_context(above.as_ref(), left.as_ref());
+                write_interp_filter(enc, mi.interp_filter, &fc.switchable_interp_prob[ctx]);
+            };
             if (mi.sb_type as usize) < BLOCK_8X8 {
                 // Sub-8×8: per-4×4 mode + MV (NEWMV coded relative to the shared
                 // find_mv_refs(NEWMV) predictor). All sizes/contexts use the SUBSIZE
                 // (mi.sb_type), exactly as the decoder does.
+                if self.interp_filter == 4 {
+                    write_filter(enc, &self.fc, &mi);
+                }
                 let sub = mi.sb_type as usize;
                 let mctx = get_mode_context(
                     &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, sub,
@@ -1912,7 +3071,7 @@ impl FrameEncoder {
                     &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, sub,
                     mi.ref_frame[0], &self.sign_bias, NEWMV, -1, edges, self.prev_mv(mi_row, mi_col),
                 );
-                let pred = lower_mv_precision(cand[0], false);
+                let pred = lower_mv_precision(cand[0], self.hp_mv);
                 let num_4x4_w = 1usize << B_WIDTH_LOG2[sub];
                 let num_4x4_h = 1usize << B_HEIGHT_LOG2[sub];
                 let mut idy = 0;
@@ -1923,7 +3082,7 @@ impl FrameEncoder {
                         write_inter_mode(enc, mi.bmi[j], &self.fc.inter_mode_probs[mctx]);
                         if mi.bmi[j] == NEWMV {
                             let mut counts = NmvCounts::default();
-                            encode_mv(enc, mi.bmi_mv[j][0], pred, &self.fc.nmvc, false, &mut counts);
+                            encode_mv(enc, mi.bmi_mv[j][0], pred, &self.fc.nmvc, self.hp_mv, &mut counts);
                         }
                         idx += num_4x4_w;
                     }
@@ -1934,9 +3093,24 @@ impl FrameEncoder {
                     &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, bsize,
                 );
                 write_inter_mode(enc, mi.mode, &self.fc.inter_mode_probs[mctx]);
+                if self.interp_filter == 4 {
+                    write_filter(enc, &self.fc, &mi);
+                }
                 if mi.mode == NEWMV {
                     let mut counts = NmvCounts::default();
-                    encode_mv(enc, mi.mv[0], predictor, &self.fc.nmvc, false, &mut counts);
+                    encode_mv(enc, mi.mv[0], predictor, &self.fc.nmvc, self.hp_mv, &mut counts);
+                    // Compound NEWMV codes a SECOND MV for ref[1] (GOLDEN), against its
+                    // own find_mv_refs predictor — exactly the decoder's per-ref assign_mv.
+                    if mi.has_second_ref() {
+                        let edges = self.block_edges(mi_row, mi_col, bsize);
+                        let (cand1, _) = find_mv_refs(
+                            &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end,
+                            mi_row, mi_col, bsize, mi.ref_frame[1], &self.sign_bias, NEWMV, -1,
+                            edges, self.prev_mv(mi_row, mi_col),
+                        );
+                        let pred1 = lower_mv_precision(cand1[0], self.hp_mv);
+                        encode_mv(enc, mi.mv[1], pred1, &self.fc.nmvc, self.hp_mv, &mut counts);
+                    }
                 }
             }
         } else {
@@ -2059,11 +3233,18 @@ impl FrameEncoder {
         // ZEROMV/NEWMV; the cheapest (ref, mode) across all refs wins (J = SSE+λ·bits). ---
         let edges = self.block_edges(mi_row, mi_col, bsize);
         let snap = self.snap_y(mi_row, mi_col, bwl, bhl);
-        let ifilt = self.interp_filter as u8;
+        // On a switchable frame the mode/MV search runs at EIGHTTAP; the per-block
+        // filter is refined after the winner (below). Reset here so a previous block's
+        // chosen filter doesn't leak into this block's search.
+        if self.interp_filter == 4 {
+            self.active_filter = 0;
+        }
+        let ifilt = self.active_filter as u8; // 0 (EIGHTTAP) while searching a switchable frame
+        let base_tx = self.base_tx(bsize);
         let mk_inter = |rf: i8, mode: u8, mv: Mv| ModeInfo {
             sb_type: bsize as u8,
             skip: false,
-            tx_size: 0,
+            tx_size: base_tx,
             is_inter: true,
             ref_frame: [rf, NONE_FRAME],
             mode,
@@ -2095,11 +3276,29 @@ impl FrameEncoder {
             mode_bits(NEARMV),
             mode_bits(NEWMV),
         );
+        // Brick 2b — collect every (ref × mode) candidate with its cheap skip-RD
+        // estimate J_skip = pred_SSE + λ·bits, then full-RD (transform) only the
+        // top `shortlist_k`. Candidate = (J_skip, slot, rf, mode, mv, predictor, extra_bits).
+        let mut topk = [f64::INFINITY; 4];
+        let mut cands: Vec<(f64, usize, i8, u8, Mv, Mv, f64)> = Vec::with_capacity(12);
         let mut g3_last_j = f64::INFINITY;
+        // Per-slot search results (compound reuses these): slot_pred = NEARESTMV MV,
+        // slot_mv = NEWMV; per-ref, indexed by slot.
+        let mut slot_mv = [(0i32, 0i32); 3];
+        let mut slot_pred = [(0i32, 0i32); 3];
+        let mut slot_j = [f64::INFINITY; 3]; // best single-ref J per slot (compound var pick)
+        let mut slot_searched = [false; 3];
+        // Non-RD leaf fast path (variance-routed leaves only): LAST-ref only — skip the
+        // GOLDEN/ALTREF motion search + candidate transforms entirely. The single
+        // biggest floor lever, since each extra ref is a full search + shortlist.
+        let fast = self.nonrd_leaf && self.variance_leaf;
         for (slot, rf) in [(0usize, LAST_FRAME), (1, GOLDEN_FRAME), (2, ALTREF_FRAME)] {
+            if fast && slot > 0 {
+                break;
+            }
             if slot == 1 {
-                g3_last_j = best_inter.0; // LAST's best J — the G3 gate feature
-                // G3 gate: skip GOLDEN/ALTREF when LAST already fits this well.
+                // G3 gate: skip GOLDEN/ALTREF when LAST already fits well. The
+                // shortlist defers full-RD, so gate on LAST's best skip-RD estimate.
                 if self.g3_gate && g3_last_j / self.lambda < 32.0 {
                     break;
                 }
@@ -2108,114 +3307,234 @@ impl FrameEncoder {
                 continue;
             }
             self.active_ref = slot;
-            let (cand, _) = find_mv_refs(
-                &self.mi,
-                self.mi_cols,
-                self.mi_rows,
-                self.tile_start,
-                self.tile_end,
-                mi_row,
-                mi_col,
-                bsize,
-                rf,
-                &self.sign_bias,
-                NEWMV,
-                -1,
-                edges,
-                self.prev_mv(mi_row, mi_col),
-            );
-            let predictor = lower_mv_precision(cand[0], false);
+            let (cand, _) = {
+                let _mvr = prof::Scope::new(prof::S::MvRefs);
+                find_mv_refs(
+                    &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end,
+                    mi_row, mi_col, bsize, rf, &self.sign_bias, NEWMV, -1, edges,
+                    self.prev_mv(mi_row, mi_col),
+                )
+            };
+            let predictor = lower_mv_precision(cand[0], self.hp_mv);
             let best_mv = self.search_mv(mi_row, mi_col, predictor, bwl, bhl);
-            // Rough ref-signalling cost so LAST (one bool) is preferred over GOLDEN/
-            // ALTREF (two) on near-ties.
+            slot_mv[slot] = best_mv;
+            slot_pred[slot] = predictor;
+            slot_searched[slot] = true;
+            // Rough ref-signalling cost so LAST (one bool) is preferred over GOLDEN/ALTREF.
             let ref_bits = if rf == LAST_FRAME { 1.0 } else { 2.0 };
-            let j_zero = self.rd_cost_y(
-                &mk_inter(rf, ZEROMV, (0, 0)),
-                mi_row,
-                mi_col,
-                bsize,
-                bwl,
-                bhl,
-                &snap,
-                c_zero + ref_bits,
-            );
-            if j_zero < best_inter.0 {
-                best_inter = (j_zero, slot, rf, ZEROMV, (0, 0), predictor);
-            }
+            let mut ref_min = f64::INFINITY;
+            let mut add = |cands: &mut Vec<_>,
+                           ref_min: &mut f64,
+                           topk: &mut [f64; 4],
+                           mode,
+                           mv,
+                           sse: i64,
+                           extra: f64| {
+                let js = sse as f64 + self.lambda * extra;
+                *ref_min = ref_min.min(js);
+                // Maintain the K smallest J's seen so far (K ≤ 4 slots).
+                let mut v = js;
+                for t in topk.iter_mut() {
+                    if v < *t {
+                        std::mem::swap(&mut v, t);
+                    }
+                }
+                cands.push((js, slot, rf, mode, mv, predictor, extra));
+            };
+            // Abort bound for the next candidate: it must beat the current
+            // kth-best J to make the shortlist (∞ until K have been collected,
+            // or when the shortlist is off — the full-RD-all oracle).
+            let kq = if self.mode_shortlist { self.shortlist_k.clamp(1, 4) } else { usize::MAX };
+            let bound_for = |topk: &[f64; 4], extra: f64| -> f64 {
+                if kq <= 4 && topk[kq - 1].is_finite() {
+                    topk[kq - 1] - self.lambda * extra
+                } else {
+                    f64::INFINITY
+                }
+            };
+            // ZEROMV (always a candidate).
+            let e = c_zero + ref_bits;
+            let sse = self.pred_sse(mi_row, mi_col, (0, 0), edges, bwl, bhl, bound_for(&topk, e));
+            add(&mut cands, &mut ref_min, &mut topk, ZEROMV, (0, 0), sse, e);
             if best_mv != (0, 0) {
                 let dr = (best_mv.0 - predictor.0).unsigned_abs();
                 let dc = (best_mv.1 - predictor.1).unsigned_abs();
                 let mvb =
                     (10 + 2 * ((32 - dr.leading_zeros()) + (32 - dc.leading_zeros()))) as f64;
-                let j_new = self.rd_cost_y(
-                    &mk_inter(rf, NEWMV, best_mv),
-                    mi_row,
-                    mi_col,
-                    bsize,
-                    bwl,
-                    bhl,
-                    &snap,
-                    c_new + mvb + ref_bits,
-                );
-                if j_new < best_inter.0 {
-                    best_inter = (j_new, slot, rf, NEWMV, best_mv, predictor);
-                }
+                let e = c_new + mvb + ref_bits;
+                let sse =
+                    self.pred_sse(mi_row, mi_col, best_mv, edges, bwl, bhl, bound_for(&topk, e));
+                add(&mut cands, &mut ref_min, &mut topk, NEWMV, best_mv, sse, e);
             }
-            // --- NEARESTMV / NEARMV: reuse a neighbour's MV for ZERO MV bits (only the
-            // mode symbol). This is the dominant libvpx win on coherent motion — where
-            // NEWMV pays a full MV diff, the predicted MV is free. The block's MV IS the
-            // candidate (no delta coded), so it must match the decoder's `find_mv_refs`
-            // exactly; we mirror the decoder's per-mode call. ---
-            // NEARESTMV uses the nearest candidate (`predictor` == cand[0]); skip when it
-            // degenerates to (0,0) since ZEROMV already covers that, cheaper.
+            // NEARESTMV uses the nearest candidate; skip when it degenerates to (0,0).
             if predictor != (0, 0) {
-                let j = self.rd_cost_y(
-                    &mk_inter(rf, NEARESTMV, predictor),
-                    mi_row,
-                    mi_col,
-                    bsize,
-                    bwl,
-                    bhl,
-                    &snap,
-                    c_nearest + ref_bits,
-                );
-                if j < best_inter.0 {
-                    best_inter = (j, slot, rf, NEARESTMV, predictor, predictor);
-                }
+                let e = c_nearest + ref_bits;
+                let sse =
+                    self.pred_sse(mi_row, mi_col, predictor, edges, bwl, bhl, bound_for(&topk, e));
+                add(&mut cands, &mut ref_min, &mut topk, NEARESTMV, predictor, sse, e);
             }
-            // NEARMV uses the DISTINCT second candidate (slot 1), which is only populated
-            // when find_mv_refs is called with NEARMV (early_break=false) — re-scan to
-            // match the decoder. Skip if it's zero or identical to nearest.
+            // NEARMV uses the DISTINCT second candidate (re-scan to match the decoder).
             let (cand_near, _) = find_mv_refs(
-                &self.mi,
-                self.mi_cols,
-                self.mi_rows,
-                self.tile_start,
-                self.tile_end,
-                mi_row,
-                mi_col,
-                bsize,
-                rf,
-                &self.sign_bias,
-                NEARMV,
-                -1,
-                edges,
+                &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end,
+                mi_row, mi_col, bsize, rf, &self.sign_bias, NEARMV, -1, edges,
                 self.prev_mv(mi_row, mi_col),
             );
-            let mv_near = lower_mv_precision(cand_near[1], false);
+            let mv_near = lower_mv_precision(cand_near[1], self.hp_mv);
             if mv_near != (0, 0) && mv_near != predictor {
-                let j = self.rd_cost_y(
-                    &mk_inter(rf, NEARMV, mv_near),
-                    mi_row,
-                    mi_col,
-                    bsize,
-                    bwl,
-                    bhl,
-                    &snap,
-                    c_near + ref_bits,
-                );
-                if j < best_inter.0 {
-                    best_inter = (j, slot, rf, NEARMV, mv_near, predictor);
+                let e = c_near + ref_bits;
+                let sse =
+                    self.pred_sse(mi_row, mi_col, mv_near, edges, bwl, bhl, bound_for(&topk, e));
+                add(&mut cands, &mut ref_min, &mut topk, NEARMV, mv_near, sse, e);
+            }
+            slot_j[slot] = ref_min; // per-ref best skip-RD estimate (compound var pick)
+            if slot == 0 {
+                g3_last_j = ref_min; // LAST's best skip-RD estimate → the G3 feature
+            }
+        }
+        // Full-RD only the top-K candidates by skip-RD estimate (all when the
+        // shortlist is off — the A/B oracle).
+        cands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let k = if self.mode_shortlist {
+            self.shortlist_k.max(1)
+        } else {
+            cands.len()
+        };
+        for &(js, slot, rf, mode, mv, predictor, extra) in cands.iter().take(k) {
+            // Adaptive mode-skip (libvpx adaptive_rd_thresh, speed >= 3): the
+            // list is sorted by the J_skip estimate; once an estimate exceeds
+            // the best FULL J by the factor, stop trialling entirely.
+            if self.mode_thresh_mult > 0.0
+                && best_inter.0.is_finite()
+                && js > best_inter.0 * self.mode_thresh_mult
+            {
+                break;
+            }
+            self.active_ref = slot;
+            let mi_c = mk_inter(rf, mode, mv);
+            // chroma-RD costs each candidate on luma+chroma. A top-2-only variant
+            // (luma-rank the candidates, chroma-refine the top 2) was ~1.05× vs 1.18×
+            // but LOST the win (+0.21% vs −0.30%): the chroma tiebreak needs candidates
+            // the luma-only break prunes. Full yuv per candidate is the keeper.
+            let j = if self.chroma_rd {
+                self.rd_cost_yuv(&mi_c, mi_row, mi_col, bsize, bwl, bhl, extra)
+            } else {
+                self.rd_cost_y(
+                    &mi_c, mi_row, mi_col, bsize, bwl, bhl, &snap, extra, best_inter.0,
+                )
+            };
+            if j < best_inter.0 {
+                best_inter = (j, slot, rf, mode, mv, predictor);
+            }
+        }
+
+        // --- Compound (bi-directional): LAST+GOLDEN averaged prediction (Brick 2). ---
+        // Reuses the per-slot NEWMV searches; full-RD-compared against the single-ref
+        // winner. ZEROMV compound codes no MV bits; NEWMV compound codes two.
+        let mut compound_mi: Option<ModeInfo> = None;
+        let mut compound_j = best_inter.0;
+        // Content-adaptive gate: skip the compound trials on blocks the single ref already
+        // predicts well (best_inter.0 ≤ compound_gate·λ) — bi-pred only pays where the
+        // residual is high. λ-normalized ⇒ one threshold across QPs.
+        let gate_ok = self.compound_gate <= 0.0
+            || best_inter.0 > self.compound_gate * self.lambda;
+        if self.compound && !self.compound_force && self.fc.reference_mode == 2 && gate_ok {
+            // Fixed compound ref (ALTREF for bi-pred, GOLDEN for the LAST+GOLDEN fallback);
+            // it pairs with each searched var ref. Placement: sign_bias[fixed]=1 ⇒ the
+            // fixed ref lands in slot 1, the var in slot 0 (mv[0]=var, mv[1]=fixed).
+            let fixed_rf = self.fc.comp_fixed_ref as i8;
+            let var_refs = self.fc.comp_var_ref;
+            let fixed_slot = (fixed_rf as usize).wrapping_sub(1);
+            let mvcost = |mv: Mv, pred: Mv| -> f64 {
+                let dr = (mv.0 - pred.0).unsigned_abs();
+                let dc = (mv.1 - pred.1).unsigned_abs();
+                (10 + 2 * ((32 - dr.leading_zeros()) + (32 - dc.leading_zeros()))) as f64
+            };
+            // Content-adaptive var pick: pair the fixed ref with only the var ref that
+            // predicts BEST on its own (lower single-ref J). The other var almost never
+            // wins the averaged prediction, so this halves the compound trials at ~0 BD.
+            // `VP9_COMPOUND_ALLVAR` restores the exhaustive both-vars A/B oracle.
+            let all_var = std::env::var("VP9_COMPOUND_ALLVAR").is_ok();
+            let best_var = if all_var {
+                usize::MAX // sentinel: don't filter
+            } else {
+                var_refs
+                    .iter()
+                    .copied()
+                    .filter(|&vr| {
+                        let s = vr.wrapping_sub(1);
+                        s < 3 && slot_searched[s]
+                    })
+                    .min_by(|&a, &b| {
+                        slot_j[a.wrapping_sub(1)]
+                            .partial_cmp(&slot_j[b.wrapping_sub(1)])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .unwrap_or(usize::MAX)
+            };
+            if fixed_slot < 3 && slot_searched[fixed_slot] {
+                let (fixed_mv, fixed_pred) = (slot_mv[fixed_slot], slot_pred[fixed_slot]);
+                for &vr in &var_refs {
+                    let var_slot = vr.wrapping_sub(1);
+                    if var_slot >= 3 || !slot_searched[var_slot] {
+                        continue;
+                    }
+                    if best_var != usize::MAX && vr != best_var {
+                        continue; // only the content-chosen best var ref
+                    }
+                    let (var_rf, var_mv, var_pred) =
+                        (vr as i8, slot_mv[var_slot], slot_pred[var_slot]);
+                    let new_mvbits = mvcost(var_mv, var_pred) + mvcost(fixed_mv, fixed_pred);
+                    let mut comp_cands: Vec<(u8, Mv, Mv, f64, f64)> = vec![
+                        (ZEROMV, (0, 0), (0, 0), 0.0, c_zero),
+                        (NEWMV, var_mv, fixed_mv, new_mvbits, c_new),
+                    ];
+                    // Joint compound MV refinement: refine each MV against the AVERAGED
+                    // prediction (the single-ref bests aren't jointly optimal), and add the
+                    // refined pair as an EXTRA NEWMV candidate — the full RD below keeps it
+                    // only when it truly wins (the cheap SAD search proposes, the RD disposes).
+                    if self.compound_joint {
+                        let jv = self.compound_refine(mi_row, mi_col, var_mv, var_slot, fixed_mv, fixed_slot, edges);
+                        let jf = self.compound_refine(mi_row, mi_col, fixed_mv, fixed_slot, jv, var_slot, edges);
+                        if (jv, jf) != (var_mv, fixed_mv) {
+                            let jb = mvcost(jv, var_pred) + mvcost(jf, fixed_pred);
+                            comp_cands.push((NEWMV, jv, jf, jb, c_new));
+                        }
+                    }
+                    // NEAREST/NEAR compound (opt-in): NO MV bits — the decoder DERIVES both
+                    // MVs per ref as `find_mv_refs(ref, mode)[idx]` (idx=1 for NEARMV else 0),
+                    // lowered. Reproduce EXACTLY (the earlier slot_pred used mode=NEWMV and
+                    // desynced). Computed before the &mut rd trials so the &self.mi borrow ends.
+                    if self.compound_near {
+                        let hp = self.hp_mv;
+                        let derive = |rf: i8, mode: u8| -> Mv {
+                            let (tmp, _) = find_mv_refs(
+                                &self.mi, self.mi_cols, self.mi_rows, self.tile_start,
+                                self.tile_end, mi_row, mi_col, bsize, rf, &self.sign_bias, mode,
+                                -1, edges, self.prev_mv(mi_row, mi_col),
+                            );
+                            lower_mv_precision(tmp[if mode == NEARMV { 1 } else { 0 }], hp)
+                        };
+                        let pen = self.compound_near_penalty;
+                        comp_cands.push((NEARESTMV, derive(var_rf, NEARESTMV), derive(fixed_rf, NEARESTMV), pen, c_nearest));
+                        comp_cands.push((NEARMV, derive(var_rf, NEARMV), derive(fixed_rf, NEARMV), pen, c_near));
+                    }
+                    for &(cmode, mv0, mv1, mvbits, mbits) in comp_cands.iter() {
+                        let mut cmi = mk_inter(var_rf, cmode, mv0);
+                        cmi.ref_frame = [var_rf, fixed_rf]; // [var, fixed]
+                        cmi.mv = [mv0, mv1];
+                        let extra = 2.0 + mbits + mvbits; // comp_inter + comp_ref ≈ 2
+                        let j = if self.chroma_rd {
+                            self.rd_cost_yuv(&cmi, mi_row, mi_col, bsize, bwl, bhl, extra)
+                        } else {
+                            self.rd_cost_y(
+                                &cmi, mi_row, mi_col, bsize, bwl, bhl, &snap, extra, compound_j,
+                            )
+                        };
+                        if j < compound_j {
+                            compound_j = j;
+                            compound_mi = Some(cmi);
+                        }
+                    }
                 }
             }
         }
@@ -2230,35 +3549,178 @@ impl FrameEncoder {
         let mut intra_mi = ModeInfo {
             sb_type: bsize as u8,
             skip: false,
-            tx_size: 0,
+            tx_size: self.base_tx(bsize),
             is_inter: false,
             ref_frame: [INTRA_FRAME, NONE_FRAME],
             interp_filter: 3, // SWITCHABLE sentinel (matches the decoder)
             ..Default::default()
         };
+        // Interp-filter ceiling probe (env `VP9_IF_HARVEST`, observe-only): score the
+        // winning inter MV's residual SSE under EIGHTTAP/SMOOTH/SHARP; accumulate the
+        // per-block minimum vs EIGHTTAP. The reduction bounds the switchable-filter win.
+        if best_inter.0.is_finite() && std::env::var("VP9_IF_HARVEST").is_ok() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let (_j, slot, _rf, _mode, mv, _p) = best_inter;
+            let save_ref = self.active_ref;
+            let save_filt = self.active_filter;
+            self.active_ref = slot;
+            self.active_filter = 0;
+            let s0 = self.pred_sse(mi_row, mi_col, mv, edges, bwl, bhl, f64::INFINITY);
+            self.active_filter = 1;
+            let s1 = self.pred_sse(mi_row, mi_col, mv, edges, bwl, bhl, f64::INFINITY);
+            self.active_filter = 2;
+            let s2 = self.pred_sse(mi_row, mi_col, mv, edges, bwl, bhl, f64::INFINITY);
+            self.active_filter = save_filt;
+            self.active_ref = save_ref;
+            let smin = s0.min(s1).min(s2).max(0);
+            IF_HARVEST[0].fetch_add(s0.max(0) as u64, Relaxed);
+            IF_HARVEST[1].fetch_add(smin as u64, Relaxed);
+            IF_HARVEST[2].fetch_add(1, Relaxed);
+            if s1 < s0 || s2 < s0 {
+                IF_HARVEST[3].fetch_add(1, Relaxed);
+            }
+        }
         let mut best_intra = (DC_PRED, f64::INFINITY);
-        for &m in &[DC_PRED, V_PRED, H_PRED, TM_PRED] {
-            intra_mi.mode = m;
-            let j = self.rd_cost_y(&intra_mi, mi_row, mi_col, bsize, bwl, bhl, &snap, 8.0);
-            if j < best_intra.1 {
-                best_intra = (m, j);
+        // Brick 2: only spend the 4 intra RD trials when inter isn't already good.
+        let try_intra = !self.intra_gate || best_inter.0 >= self.lambda * self.intra_gate_t;
+        if try_intra {
+            for &m in &[DC_PRED, V_PRED, H_PRED, TM_PRED] {
+                intra_mi.mode = m;
+                let j = self.rd_cost_y(
+                    &intra_mi, mi_row, mi_col, bsize, bwl, bhl, &snap, 8.0,
+                    best_intra.1.min(best_inter.0),
+                );
+                if j < best_intra.1 {
+                    best_intra = (m, j);
+                }
+            }
+            // Chroma-RD: re-cost the winning intra mode on luma+chroma (with its chosen
+            // UV mode) so the intra-vs-inter compare is on the SAME (yuv) basis — else
+            // inter's added chroma cost would hand borderline blocks to intra unfairly.
+            if self.chroma_rd {
+                intra_mi.mode = best_intra.0;
+                intra_mi.uv_mode = self.best_intra_mode(mi_row, mi_col, 1, bwl, bhl);
+                best_intra.1 = self.rd_cost_yuv(&intra_mi, mi_row, mi_col, bsize, bwl, bhl, 8.0);
             }
         }
 
-        let (best_j, best_slot, best_rf, best_mode, best_mv, predictor) = best_inter;
-        let use_intra = best_intra.1 < best_j;
+        let (best_j, best_slot, best_rf, best_mode, best_mv, mut predictor) = best_inter;
+        // Three-way: single-inter (best_j) vs intra (best_intra.1) vs compound (compound_j).
+        let compound_wins = compound_mi.is_some() && compound_j < best_j && compound_j < best_intra.1;
+        let use_intra = !compound_wins && best_intra.1 < best_j;
         // Lock the chosen reference in for the trial reconstruct + the emit MC.
-        self.active_ref = best_slot;
-        let mut chosen = if use_intra {
+        let mut chosen = if compound_wins {
+            let cmi = compound_mi.take().unwrap();
+            let s0 = (cmi.ref_frame[0] as usize).wrapping_sub(1).min(2);
+            self.active_ref = s0; // ref[0]'s slot (ref[1] handled per-ref in encode_plane)
+            predictor = slot_pred[s0]; // for the returned modeinfo-cost estimate
+            cmi
+        } else if use_intra {
+            self.active_ref = best_slot;
             let mut m = intra_mi;
             m.mode = best_intra.0;
             m
         } else {
+            self.active_ref = best_slot;
             mk_inter(best_rf, best_mode, best_mv)
         };
+        // Brick-1 plumbing probe: force every inter block to LAST+GOLDEN ZEROMV compound
+        // (no MV bits, non-skip so encode_plane runs in both passes ⇒ no skip trap). Only
+        // proves the compound header/emit/recon inverse; quality is irrelevant here.
+        if self.compound_force && !use_intra {
+            chosen.ref_frame = [LAST_FRAME, GOLDEN_FRAME];
+            chosen.mode = ZEROMV;
+            chosen.mv = [(0, 0), (0, 0)];
+            self.active_ref = 0; // ref[0] = LAST (ref[1] handled per-ref in encode_plane)
+        }
         // UV mode for the intra path (before the trial, so its chroma cost is right).
         if use_intra {
             chosen.uv_mode = self.best_intra_mode(mi_row, mi_col, 1, bwl, bhl);
+        }
+        // Switchable interp-filter RD (switchable frame, inter block only): pick the
+        // filter minimising pred_sse + λ·filter_signal_bits for the winning MV. The
+        // block's filter drives the trial reconstruct (active_filter) + the emit MC,
+        // and is coded per block (ref→mode→FILTER→MV order) by encode_inter_block.
+        if self.interp_filter == 4 && !use_intra {
+            let above = self.above_mi(mi_row, mi_col);
+            let left = self.left_mi(mi_row, mi_col);
+            let ctx = switchable_interp_context(above.as_ref(), left.as_ref());
+            let probs = self.fc.switchable_interp_prob[ctx];
+            // Compound winners: score the actual averaged prediction at BOTH compound MVs,
+            // not the single-ref best_mv (which is disconnected from the compound block).
+            let comp = self.compound_filter && chosen.has_second_ref();
+            let (cs0, cs1) = if comp {
+                ((chosen.ref_frame[0] - 1) as usize, (chosen.ref_frame[1] - 1) as usize)
+            } else {
+                (0, 0)
+            };
+            let mut best = (0u8, f64::INFINITY);
+            for f in 0u8..3 {
+                self.active_filter = f;
+                let sse = if comp {
+                    self.pred_sse_compound(
+                        mi_row, mi_col, chosen.mv[0], cs0, chosen.mv[1], cs1, edges, bwl, bhl,
+                    )
+                } else {
+                    self.pred_sse(mi_row, mi_col, best_mv, edges, bwl, bhl, f64::INFINITY)
+                };
+                let bits = tree_bit_cost(&SWITCHABLE_INTERP_TREE, &probs, f as i32) as f64 / 256.0;
+                let j = sse as f64 + self.lambda * bits;
+                if j < best.1 {
+                    best = (f, j);
+                }
+            }
+            chosen.interp_filter = best.0;
+            self.active_filter = best.0;
+        }
+        // Model-based early SKIP (CALIBRATED xsq gate): when the winner's residual is
+        // small enough relative to the quantizer that the real rd_skip almost always
+        // skips it (log2(xsq) ≥ model_skip_t, calibrated from a harvest), force skip
+        // with an MC-only recon — avoiding this block's transform. A block below the
+        // cutoff falls through to the normal transform (the real eob-based decision), so
+        // mode_map's skip is emit-consistent. The mean-SSE / raw-model gates over-skipped
+        // by skipping at LOW xsq (12–60% real-skip); the calibrated cutoff fires only
+        // where real-skip is high (~91%), so false-skips are rare + small-residual.
+        // The non-RD leaf fast path forces this gate on (with the same calibrated,
+        // conservative cutoff) so variance-routed low-residual leaves skip the
+        // transform — the second floor lever after LAST-ref-only.
+        if (self.model_skip || fast) && !use_intra {
+            // Compound winners: estimate the residual from the actual averaged prediction,
+            // not the single-ref `pred_sse(best_mv)` (same fix as the interp-filter search —
+            // a wrong residual estimate here forces wrong skip decisions on compound blocks).
+            let sse = if self.compound_filter && chosen.has_second_ref() {
+                self.pred_sse_compound(
+                    mi_row, mi_col, chosen.mv[0], (chosen.ref_frame[0] - 1) as usize,
+                    chosen.mv[1], (chosen.ref_frame[1] - 1) as usize, edges, bwl, bhl,
+                )
+            } else {
+                self.pred_sse(mi_row, mi_col, best_mv, edges, bwl, bhl, f64::INFINITY)
+            }
+            .max(0) as u64;
+            let n_log2 = (bwl + bhl + 4) as u32; // luma pixels = 2^(bwl+bhl+4)
+            let xsq = varrd::model_xsq(sse, n_log2, self.dq_y.1 as i64);
+            let log2xsq = 63 - xsq.max(1).leading_zeros();
+            if log2xsq >= self.model_skip_t {
+                chosen.tx_size = if self.use_tx_search {
+                    MAX_TXSIZE[bsize] as u8
+                } else {
+                    self.base_tx(bsize)
+                };
+                self.last_trial_tx = chosen.tx_size;
+                self.pending_eob = 0;
+                self.force_skip = true;
+                self.skip_trial = true;
+                let mut sse_recon = 0u64;
+                for plane in 0..3 {
+                    let (_, s) =
+                        self.encode_plane(None, &chosen, plane, mi_row, mi_col, bsize, bwl, bhl);
+                    sse_recon += s;
+                }
+                self.skip_trial = false;
+                self.force_skip = false;
+                chosen.skip = true;
+                return (chosen, predictor, 0, sse_recon);
+            }
         }
         let max_tx = MAX_TXSIZE[bsize] as usize;
         if self.use_tx_search && max_tx >= 1 {
@@ -2316,7 +3778,14 @@ impl FrameEncoder {
             }
         }
         if skip {
-            chosen.tx_size = if self.use_tx_search { max_tx as u8 } else { 0 };
+            // A skip block codes no residual, but its tx_size still drives the
+            // entropy-context width the decoder updates — so it must equal what the
+            // decoder DERIVES (base_tx under ALLOW mode), not a hardcoded 4×4.
+            chosen.tx_size = if self.use_tx_search {
+                max_tx as u8
+            } else {
+                self.base_tx(bsize)
+            };
             coef_bits = 0; // a skipped block codes no coefficient tokens
         } else if !keep_recon {
             // The emit path re-reconstructs from a clean neighbour-context state; the
@@ -2342,6 +3811,26 @@ impl FrameEncoder {
     /// clamping reference reads to the plane border (as the MC convolver does).
     /// The currently-selected reference plane (LAST/GOLDEN/ALTREF per `active_ref`).
     #[inline]
+    /// u8 mirror of the ACTIVE reference luma, built on first use per slot.
+    /// Fetch ONCE per search/score call and pass the slice down — per-SAD Arc
+    /// clones would cost millions of refcount atomics.
+    fn ref8_active(&self) -> std::sync::Arc<[u8]> {
+        let slot = self.active_ref;
+        if let Some(r) = &self.refs8.borrow()[slot] {
+            return r.clone();
+        }
+        let luma = &self.refs[slot].as_ref().unwrap()[0];
+        let rc: std::sync::Arc<[u8]> = luma.buf.iter().map(|&v| v as u8).collect();
+        self.refs8.borrow_mut()[slot] = Some(rc.clone());
+        rc
+    }
+
+    /// The u8 search domain is usable when content is 8-bit and AVX2 is present.
+    #[inline]
+    fn u8_search(&self) -> bool {
+        cfg!(target_arch = "x86_64") && self.has_avx2 && self.max_px == 255
+    }
+
     fn aref(&self, plane: usize) -> &Plane {
         &self.refs[self.active_ref].as_ref().unwrap()[plane]
     }
@@ -2351,6 +3840,68 @@ impl FrameEncoder {
     /// for 32×32/64×64 — bounding cost while still seeing the block's full-extent
     /// motion (scoring only the top-left 8×8 was a measured quality bug).
     /// Out-of-frame tiles (edge overhang) are skipped.
+    /// Four candidates' block SADs in one tile pass (libvpx `sad_x4d` shape):
+    /// each source tile is loaded once and scored against all four refs. Caller
+    /// guarantees every candidate's full block extent is interior to the ref.
+    /// Per-tile abort fires only when ALL four partials exceed `bound` — the
+    /// sequential accept loop then sees exact-or-provably-losing values either
+    /// way, so decisions are identical to four scalar calls.
+    #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::too_many_arguments)]
+    fn block_sad_sized_x4(
+        &self,
+        base_x: usize,
+        base_y: usize,
+        cands: [(i32, i32); 4],
+        bwl: usize,
+        bhl: usize,
+        bound: i64,
+        ref8: &[u8],
+    ) -> [i64; 4] {
+        let tiles_w = 1usize << bwl.saturating_sub(1);
+        let tiles_h = 1usize << bhl.saturating_sub(1);
+        let step = if tiles_w > 2 || tiles_h > 2 { 2 } else { 1 };
+        let src = &self.src[0];
+        let rp = self.aref(0);
+        let mut sad = [0i64; 4];
+        let mut ty = 0;
+        while ty < tiles_h {
+            let mut tx = 0;
+            while tx < tiles_w {
+                let (bx, by) = (base_x + tx * 8, base_y + ty * 8);
+                if bx + 8 <= src.w && by + 8 <= src.h {
+                    let refs: [*const u8; 4] = std::array::from_fn(|k| unsafe {
+                        ref8.as_ptr().add(
+                            (by as i32 + cands[k].0) as usize * rp.stride
+                                + (bx as i32 + cands[k].1) as usize,
+                        )
+                    });
+                    // SAFETY: caller checked full-block interior for every cand;
+                    // AVX2 implied by the u8 search path.
+                    let t = unsafe {
+                        crate::inter::sad8x8_x4_u8(
+                            self.src8.as_ptr().add(by * src.stride + bx),
+                            src.stride,
+                            refs,
+                            rp.stride,
+                        )
+                    };
+                    let mut min = i64::MAX;
+                    for k in 0..4 {
+                        sad[k] += t[k] as i64;
+                        min = min.min(sad[k]);
+                    }
+                    if min > bound {
+                        return [i64::MAX; 4];
+                    }
+                }
+                tx += step;
+            }
+            ty += step;
+        }
+        sad
+    }
+
     fn block_sad_sized(
         &self,
         base_x: usize,
@@ -2359,6 +3910,8 @@ impl FrameEncoder {
         mv_c: i32,
         bwl: usize,
         bhl: usize,
+        bound: i64,
+        ref8: Option<&[u8]>,
     ) -> i64 {
         let tiles_w = 1usize << bwl.saturating_sub(1); // 8-px tiles across
         let tiles_h = 1usize << bhl.saturating_sub(1);
@@ -2371,7 +3924,13 @@ impl FrameEncoder {
             while tx < tiles_w {
                 let (bx, by) = (base_x + tx * 8, base_y + ty * 8);
                 if bx + 8 <= src.w && by + 8 <= src.h {
-                    sad += self.block_sad(bx, by, mv_r, mv_c);
+                    sad += self.block_sad(bx, by, mv_r, mv_c, ref8);
+                    // SAD accumulates non-negatively: once STRICTLY over the
+                    // incumbent the candidate loses both the `<` and the `==`
+                    // tie-break — identical decisions, remaining tiles skipped.
+                    if sad > bound {
+                        return i64::MAX;
+                    }
                 }
                 tx += step;
             }
@@ -2380,7 +3939,14 @@ impl FrameEncoder {
         sad
     }
 
-    fn block_sad(&self, base_x: usize, base_y: usize, mv_r: i32, mv_c: i32) -> i64 {
+    fn block_sad(
+        &self,
+        base_x: usize,
+        base_y: usize,
+        mv_r: i32,
+        mv_c: i32,
+        ref8: Option<&[u8]>,
+    ) -> i64 {
         let src = &self.src[0];
         let rp = self.aref(0);
         let (rw, rh) = (rp.w as i32, rp.h as i32);
@@ -2392,6 +3958,19 @@ impl FrameEncoder {
         // a large MV fall to the clamped path). Byte-identical to the clamped loop.
         if x0 >= 0 && y0 >= 0 && x0 + 8 <= rw && y0 + 8 <= rh {
             let (x0, y0) = (x0 as usize, y0 as usize);
+            #[cfg(target_arch = "x86_64")]
+            if let Some(r8) = ref8 {
+                // u8 search domain: bit-identical values, psadbw SAD.
+                // SAFETY: interior window checked above; AVX2 implied by ref8.
+                return unsafe {
+                    crate::inter::sad8x8_u8(
+                        self.src8.as_ptr().add(base_y * src.stride + base_x),
+                        src.stride,
+                        r8.as_ptr().add(y0 * rp.stride + x0),
+                        rp.stride,
+                    )
+                } as i64;
+            }
             let s = &src.buf[(base_y * src.stride + base_x)..];
             let r = &rp.buf[(y0 * rp.stride + x0)..];
             return sad8x8(s, src.stride, r, rp.stride, self.has_avx2) as i64;
@@ -2443,7 +4022,7 @@ impl FrameEncoder {
                 by,
                 (mv_q4.1 & 15) as usize,
                 (mv_q4.0 & 15) as usize,
-                self.interp_filter as usize,
+                self.active_filter as usize,
                 &mut pred,
                 8,
                 8,
@@ -2465,21 +4044,30 @@ impl FrameEncoder {
     /// Both whole-pixel and 1/4-pel MVs keep the difference vs the (even)
     /// predictor even, so the `!allow_high_precision_mv` "hp = 1" invariant holds.
     fn search_mv(&self, mi_row: usize, mi_col: usize, predictor: Mv, bwl: usize, bhl: usize) -> Mv {
-        // Exact memo: the search reads only the (frame-constant) source/reference
-        // and these inputs (block dims included — the integer stage scores the
-        // whole block), so a repeat call — the partition recursion asks at every
-        // bsize, and the emit passes re-ask — returns the cached MV.
-        let key = (mi_row, mi_col, self.active_ref, predictor, bwl, bhl);
-        if let Some(&mv) = self.mv_memo.borrow().get(&key) {
-            return mv;
-        }
+        // (A (row,col,ref,predictor,size)-keyed memo lived here; measured 0 hits
+        // on every clip — mode_map replay upstream means no repeat asks — so the
+        // per-search SipHash+insert was pure overhead and was removed.)
         // `VP9_CORNER_SAD` restores the old corner-only scoring (the A/B oracle).
         let (swl, shl) = if self.corner_sad { (1, 1) } else { (bwl, bhl) };
+        // u8 search mirror, fetched ONCE per search (a per-eval fetch measurably
+        // cost more than the psadbw kernel saved).
+        let r8_arc = if self.u8_search() { Some(self.ref8_active()) } else { None };
+        let ref8 = r8_arc.as_deref();
         let _s = prof::Scope::new(prof::S::MotionSearch);
         let base_x = mi_col * 8;
         let base_y = mi_row * 8;
         const RANGE: i32 = 8;
         let centers = [(0i32, 0i32), (predictor.0 / 8, predictor.1 / 8)];
+        // NEARESTMV early-out: on the realtime leaf, if the predictor already fits well,
+        // skip the whole diamond+subpel search and take it (NEWMV≈NEARESTMV ⇒ ~0 BD).
+        if self.nonrd_me_skip > 0.0 && self.nonrd_leaf && self.variance_leaf {
+            let (pr, pc) = (predictor.0 / 8, predictor.1 / 8);
+            let psad = self.block_sad_sized(base_x, base_y, pr, pc, swl, shl, i64::MAX, ref8);
+            let area = ((1i64 << bwl) * (1i64 << bhl) * 16) as f64; // luma pixels
+            if (psad as f64) < self.nonrd_me_skip * area {
+                return predictor;
+            }
+        }
         let mut best_px = (0i32, 0i32);
         let mut best_sad = i64::MAX;
         {
@@ -2491,7 +4079,9 @@ impl FrameEncoder {
                     for dr in -RANGE..=RANGE {
                         for dc in -RANGE..=RANGE {
                             let (r, c) = (cr + dr, cc + dc);
-                            let sad = self.block_sad_sized(base_x, base_y, r, c, swl, shl);
+                            let sad = self.block_sad_sized(
+                                base_x, base_y, r, c, swl, shl, best_sad, ref8,
+                            );
                             let shorter = r.abs() + c.abs() < best_px.0.abs() + best_px.1.abs();
                             if sad < best_sad || (sad == best_sad && shorter) {
                                 best_sad = sad;
@@ -2504,8 +4094,13 @@ impl FrameEncoder {
                 // Diamond (square-pattern step) search: evaluate the start candidates,
                 // then refine with an 8-neighbour pattern at halving radii 8→4→2→1,
                 // re-centering while it improves. ~30–50 SADs vs 578 exhaustive.
+                // (A visited-set dedup was tried here and REVERTED: an integer
+                // SAD is cheaper than the dedup scan — the check cost more than
+                // the redundant work it saved. The subpel diamond keeps its dedup
+                // because each of its scores is a full MC interpolation.)
                 let mut consider = |best_sad: &mut i64, best_px: &mut (i32, i32), r: i32, c: i32| {
-                    let sad = self.block_sad_sized(base_x, base_y, r, c, swl, shl);
+                    let sad =
+                        self.block_sad_sized(base_x, base_y, r, c, swl, shl, *best_sad, ref8);
                     let shorter = r.abs() + c.abs() < best_px.0.abs() + best_px.1.abs();
                     if sad < *best_sad || (sad == *best_sad && shorter) {
                         *best_sad = sad;
@@ -2518,23 +4113,58 @@ impl FrameEncoder {
                 if centers[1] != (0, 0) {
                     consider(&mut best_sad, &mut best_px, centers[1].0, centers[1].1);
                 }
+                // Full-block interior test for a candidate (all scored tiles then
+                // read the reference without clamping) — the x4 batch precondition.
+                let rp0 = self.aref(0);
+                let (w_px, h_px) = ((1i32 << swl) * 4, (1i32 << shl) * 4);
+                let interior = |r: i32, c: i32| -> bool {
+                    base_x as i32 + c >= 0
+                        && base_y as i32 + r >= 0
+                        && base_x as i32 + c + w_px <= rp0.w as i32
+                        && base_y as i32 + r + h_px <= rp0.h as i32
+                };
                 let mut step = 8i32;
                 while step >= 1 {
                     // Cap re-centerings per radius so the worst case stays bounded.
                     for _ in 0..8 {
                         let (cr, cc) = best_px;
                         let mut moved = false;
-                        for (dr, dc) in [
-                            (-step, 0),
-                            (step, 0),
-                            (0, -step),
-                            (0, step),
-                            (-step, -step),
-                            (-step, step),
-                            (step, -step),
-                            (step, step),
+                        for quad in [
+                            [(-step, 0), (step, 0), (0, -step), (0, step)],
+                            [
+                                (-step, -step),
+                                (-step, step),
+                                (step, -step),
+                                (step, step),
+                            ],
                         ] {
-                            moved |= consider(&mut best_sad, &mut best_px, cr + dr, cc + dc);
+                            let all_interior =
+                                quad.iter().all(|&(dr, dc)| interior(cr + dr, cc + dc));
+                            #[cfg(target_arch = "x86_64")]
+                            if all_interior {
+                                if let Some(r8) = ref8 {
+                                    let cands: [(i32, i32); 4] =
+                                        std::array::from_fn(|k| (cr + quad[k].0, cc + quad[k].1));
+                                    let sads = self.block_sad_sized_x4(
+                                        base_x, base_y, cands, swl, shl, best_sad, r8,
+                                    );
+                                    for k in 0..4 {
+                                        let (r, c) = cands[k];
+                                        let sad = sads[k];
+                                        let shorter = r.abs() + c.abs()
+                                            < best_px.0.abs() + best_px.1.abs();
+                                        if sad < best_sad || (sad == best_sad && shorter) {
+                                            best_sad = sad;
+                                            best_px = (r, c);
+                                            moved = true;
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                            for (dr, dc) in quad {
+                                moved |= consider(&mut best_sad, &mut best_px, cr + dr, cc + dc);
+                            }
                         }
                         if !moved {
                             break;
@@ -2553,38 +4183,141 @@ impl FrameEncoder {
         let edges = self.block_edges(mi_row, mi_col, BLOCK_8X8);
         let mut best = int;
         let _s = prof::Scope::new(prof::S::SubpelSearch);
-        let score = |mv: Mv| -> i64 {
+        let score = |mv: Mv, bound: i64| -> i64 {
             if self.corner_sad {
                 self.predicted_sad(mi_row, mi_col, mv, edges)
             } else {
-                self.predicted_sad_sized(mi_row, mi_col, mv, edges, bwl, bhl)
+                self.predicted_sad_sized(mi_row, mi_col, mv, edges, bwl, bhl, bound, ref8)
             }
         };
-        let mut best_sad = score(int);
+        // The integer stage just scored `int` over the SAME tiles with the SAME
+        // kernels; when the UMV clamp is an identity, the subpel-entry re-score
+        // is bit-for-bit that value — reuse it (one full-block score saved per
+        // search). `corner_sad` uses a different tiling, so it still re-scores.
+        let (w_px, h_px) = ((1i32 << bwl) * 4, (1i32 << bhl) * 4);
+        let clamped = clamp_mv_umv(int, w_px, h_px, 0, 0, edges);
+        let mut best_sad = if !self.corner_sad && clamped == (int.0 * 2, int.1 * 2) {
+            best_sad
+        } else {
+            score(int, i64::MAX)
+        };
         let ip_sad = best_sad;
         // Provable skip: subpel SAD >= 0 and ties break toward the shorter MV
         // (the integer candidate), so nothing can beat a perfect integer match.
         if best_sad == 0 {
-            self.mv_memo.borrow_mut().insert(key, int);
             return int;
         }
         if self.subpel_fast {
-            // Preset lever: iterative diamond at ½- then ¼-pel (≤ ~10 scores vs 24).
-            for step in [4i32, 2] {
+            // Preset lever: diamond at ½- then ¼-pel. Default = ONE round per
+            // precision level (libvpx sub_pixel_tree shape, ≤8 scores); the
+            // re-centering loop (`VP9_SUBPEL_ITER`) re-scores until no move
+            // (~17 scores/search) for +BD oracle comparisons.
+            let max_rounds = self.subpel_rounds;
+            let mut visited = [(i32::MIN, i32::MIN); 32];
+            visited[0] = int;
+            let mut vlen = 1usize;
+            // ⅛-pel refinement (hp-MV) ONLY when the predictor is in the high-precision
+            // range — that is both the codability condition (else the ⅛-pel diff can't
+            // be signalled) AND the content gate: high-motion blocks (large predictor)
+            // stay at ¼-pel, so only low-motion blocks pay the extra subpel level.
+            // NOTE: cutting subpel levels on the non-RD leaf was TRIED + REVERTED —
+            // ½-pel-only cost +16% BD (mobile +32%) for only 1.05× (subpel MC is already
+            // AVX2, so the wall barely moves while quarter-pel precision is load-bearing).
+            let steps: &[i32] = if self.hp_mv && use_mv_hp(predictor) {
+                &[4, 2, 1]
+            } else {
+                &[4, 2]
+            };
+            if self.subpel_diag {
+                // Plus+diagonal tree (libvpx sub_pixel_tree geometry): one pass
+                // per precision level — score the 4 plus points, then the corner
+                // combining any improving horizontal+vertical directions. Reaches
+                // diagonal optima in ONE level (the iterating plus-only diamond
+                // needed 2+ re-center rounds, ~3 extra scores each).
+                for &step in steps {
+                    let (cr, cc) = best;
+                    let mut mh = 0i32; // improving horizontal direction (dc)
+                    let mut mv_ = 0i32; // improving vertical direction (dr)
+                    for (dr, dc) in [(0, -step), (0, step), (-step, 0), (step, 0)] {
+                        let cand = (cr + dr, cc + dc);
+                        if visited[..vlen].contains(&cand) {
+                            continue;
+                        }
+                        if vlen < visited.len() {
+                            visited[vlen] = cand;
+                            vlen += 1;
+                        }
+                        let sad = score(cand, best_sad);
+                        let shorter = cand.0.abs() + cand.1.abs() < best.0.abs() + best.1.abs();
+                        if sad < best_sad || (sad == best_sad && shorter) {
+                            best_sad = sad;
+                            best = cand;
+                            if dr == 0 {
+                                mh = dc;
+                            } else {
+                                mv_ = dr;
+                            }
+                        }
+                    }
+                    if mh != 0 && mv_ != 0 {
+                        let cand = (cr + mv_, cc + mh);
+                        if !visited[..vlen].contains(&cand) {
+                            if vlen < visited.len() {
+                                visited[vlen] = cand;
+                                vlen += 1;
+                            }
+                            let sad = score(cand, best_sad);
+                            let shorter =
+                                cand.0.abs() + cand.1.abs() < best.0.abs() + best.1.abs();
+                            if sad < best_sad || (sad == best_sad && shorter) {
+                                best_sad = sad;
+                                best = cand;
+                            }
+                        }
+                    }
+                }
+                if self.g1_harvest {
+                    eprintln!(
+                        "G5 bw={} bh={} int_sad={} final_sad={} moved={}",
+                        1 << bwl, 1 << bhl, ip_sad, best_sad, (best != int) as u8
+                    );
+                }
+                return best;
+            }
+            let mut half_moved = false;
+            for &step in steps {
+                // Conditional tree-prune (`VP9_SUBPEL_TREE`): if the half-pel ring
+                // never improved on the integer MV, the quarter ring almost never
+                // does — skip it (libvpx-tree-like, but conditional not forced).
+                if step == 2 && self.subpel_tree && !half_moved {
+                    break;
+                }
+                let mut rounds = 0u32;
                 loop {
                     let (cr, cc) = best;
                     let mut moved = false;
                     for (dr, dc) in [(-step, 0), (step, 0), (0, -step), (0, step)] {
                         let cand = (cr + dr, cc + dc);
-                        let sad = score(cand);
+                        if visited[..vlen].contains(&cand) {
+                            continue; // already scored; cannot change the incumbent
+                        }
+                        if vlen < visited.len() {
+                            visited[vlen] = cand;
+                            vlen += 1;
+                        }
+                        let sad = score(cand, best_sad);
                         let shorter = cand.0.abs() + cand.1.abs() < best.0.abs() + best.1.abs();
                         if sad < best_sad || (sad == best_sad && shorter) {
                             best_sad = sad;
                             best = cand;
                             moved = true;
+                            if step == 4 {
+                                half_moved = true;
+                            }
                         }
                     }
-                    if !moved {
+                    rounds += 1;
+                    if !moved || (max_rounds > 0 && rounds >= max_rounds) {
                         break;
                     }
                 }
@@ -2596,7 +4329,7 @@ impl FrameEncoder {
                         continue;
                     }
                     let cand = (int.0 + dr, int.1 + dc);
-                    let sad = score(cand);
+                    let sad = score(cand, best_sad);
                     let shorter = cand.0.abs() + cand.1.abs() < best.0.abs() + best.1.abs();
                     if sad < best_sad || (sad == best_sad && shorter) {
                         best_sad = sad;
@@ -2604,6 +4337,12 @@ impl FrameEncoder {
                     }
                 }
             }
+            // (⅛-pel refinement was tried here for the exhaustive-grid s0 path but
+            // REVERTED: it introduced an hp×switchable conformance desync on some
+            // content at s0 — the flat 8-neighbour ⅛-pel pass reached a MV the fast
+            // diamond doesn't, and it desynced with the per-block filter. hp-MV keeps
+            // its ⅛-pel refinement in the fast paths (s1+, incl. the s3 default),
+            // which are conformant; s0 stays ¼-pel. See campaign memory.)
         }
         // G5 harvest: integer SAD vs what subpel refinement actually bought.
         if self.g1_harvest {
@@ -2612,7 +4351,6 @@ impl FrameEncoder {
                 1 << bwl, 1 << bhl, ip_sad, best_sad, (best != int) as u8
             );
         }
-        self.mv_memo.borrow_mut().insert(key, best);
         best
     }
 
@@ -2630,6 +4368,8 @@ impl FrameEncoder {
         edges: (i32, i32, i32, i32),
         bwl: usize,
         bhl: usize,
+        bound: i64,
+        ref8: Option<&[u8]>,
     ) -> i64 {
         let base_x = mi_col * 8;
         let base_y = mi_row * 8;
@@ -2648,6 +4388,24 @@ impl FrameEncoder {
         let src = &self.src[0];
         let (tiles_w, tiles_h) = (w / 8, h / 8);
         let step = if tiles_w > 2 || tiles_h > 2 { 2 } else { 1 };
+        // u8 score domain (8-bit content): fused interpolate+psadbw per tile,
+        // bit-identical to the u16 predict+SAD path (gated by
+        // `u8_score_matches_u16_path`). Edge tiles fall back to the u16 path.
+        // nr = 5 (not the u16 path's 4): the 16-wide u8 h-kernels use one
+        // 16-byte window load reaching bx+12; edge tiles fall back to the
+        // (value-identical) u16 path.
+        let (nl, nr) = if fx != 0 { (3i32, 5i32) } else { (0, 0) };
+        let (nt, nb) = if fy != 0 { (3i32, 4i32) } else { (0, 0) };
+        // Hoisted out of the tile loop: the u8 plane view and the profiler scope
+        // are per-CALL invariants (building them per tile was measurable glue).
+        #[cfg(target_arch = "x86_64")]
+        let refp8_c = ref8.map(|r8| crate::inter::RefPlane8 {
+            buf: r8,
+            stride: rp.stride,
+            w: refp.w,
+            h: refp.h,
+        });
+        let _s_call = prof::Scope::new(prof::S::Interp);
         let mut pred = [0u16; 64];
         let mut sad = 0i64;
         let mut ty = 0;
@@ -2656,14 +4414,68 @@ impl FrameEncoder {
             while tx < tiles_w {
                 let (px, py) = (base_x + tx * 8, base_y + ty * 8);
                 if px + 8 <= src.w && py + 8 <= src.h {
-                    let _s = prof::Scope::new(prof::S::Interp);
+                    let (bx, by) = (bx0 + (tx * 8) as i32, by0 + (ty * 8) as i32);
+                    #[cfg(target_arch = "x86_64")]
+                    if let Some(refp8) = &refp8_c {
+                        // Bilinear scorer window is smaller ((bx,by)..(bx+9,by+9))
+                        // so MORE tiles qualify than the 8-tap's filtered window.
+                        if self.subpel_bilinear
+                            && bx >= 0
+                            && bx + 9 <= refp.w
+                            && by >= 0
+                            && by + 9 <= refp.h
+                        {
+                            // SAFETY: window checked; AVX2 implied by u8_search.
+                            sad += unsafe {
+                                crate::inter::subpel_bilinear_score8x8_u8(
+                                    refp8,
+                                    bx,
+                                    by,
+                                    fx,
+                                    fy,
+                                    self.src8.as_ptr().add(py * src.stride + px),
+                                    src.stride,
+                                )
+                            } as i64;
+                            if sad > bound {
+                                return i64::MAX;
+                            }
+                            tx += step;
+                            continue;
+                        }
+                        if bx - nl >= 0
+                            && bx + 8 + nr <= refp.w
+                            && by - nt >= 0
+                            && by + 8 + nb <= refp.h
+                        {
+                            // SAFETY: window checked in-bounds; AVX2 implied by
+                            // `u8_search`; src8 covers the same plane as src.
+                            sad += unsafe {
+                                crate::inter::subpel_score8x8_u8(
+                                    refp8,
+                                    bx,
+                                    by,
+                                    fx,
+                                    fy,
+                                    self.active_filter as usize,
+                                    self.src8.as_ptr().add(py * src.stride + px),
+                                    src.stride,
+                                )
+                            } as i64;
+                            if sad > bound {
+                                return i64::MAX;
+                            }
+                            tx += step;
+                            continue;
+                        }
+                    }
                     predict_block(
                         &refp,
-                        bx0 + (tx * 8) as i32,
-                        by0 + (ty * 8) as i32,
+                        bx,
+                        by,
                         fx,
                         fy,
-                        self.interp_filter as usize,
+                        self.active_filter as usize,
                         &mut pred,
                         8,
                         8,
@@ -2673,12 +4485,163 @@ impl FrameEncoder {
                     );
                     let s = &src.buf[(py * src.stride + px)..];
                     sad += sad8x8(s, src.stride, &pred, 8, self.has_avx2) as i64;
+                    // Same provable abort as block_sad_sized: strictly over the
+                    // incumbent means this MV cannot win, so its remaining tiles
+                    // (and their interpolation, the dominant cost) are skipped.
+                    if sad > bound {
+                        return i64::MAX;
+                    }
                 }
                 tx += step;
             }
             ty += step;
         }
         sad
+    }
+
+    /// Full-block prediction SSE for an inter `mv` — the distortion term of the
+    /// SKIP RD cost `J_skip = pred_SSE + λ·bits` used to shortlist mode candidates
+    /// (same units as `rd_cost_y`'s `J`, so it ranks bit-cheap predicted-MV modes
+    /// against NEWMV correctly — a pure SAD would not). Cheap: MC + Σ(src−pred)²,
+    /// NO forward transform / quantize / trellis. Full block (no tile sampling) so
+    /// the SSE scale matches `λ·bits`.
+    fn pred_sse(
+        &self,
+        mi_row: usize,
+        mi_col: usize,
+        mv: Mv,
+        edges: (i32, i32, i32, i32),
+        bwl: usize,
+        bhl: usize,
+        bound: f64,
+    ) -> i64 {
+        let base_x = mi_col * 8;
+        let base_y = mi_row * 8;
+        let (w, h) = ((1usize << bwl) * 4, (1usize << bhl) * 4);
+        let mv_q4 = clamp_mv_umv(mv, w as i32, h as i32, 0, 0, edges);
+        let bx0 = base_x as i32 + (mv_q4.1 >> 4);
+        let by0 = base_y as i32 + (mv_q4.0 >> 4);
+        let (fx, fy) = ((mv_q4.1 & 15) as usize, (mv_q4.0 & 15) as usize);
+        let rp = self.aref(0);
+        let refp = RefPlane {
+            buf: &rp.buf,
+            stride: rp.stride,
+            w: rp.w as i32,
+            h: rp.h as i32,
+        };
+        let src = &self.src[0];
+        let (tiles_w, tiles_h) = (w / 8, h / 8);
+        // Shortlist scoring only ranks candidates, so a 2× tile stride (with the SSE
+        // scaled back to full-block magnitude for the λ·bits comparison) trades a
+        // little ranking precision for ~4× fewer interps on 16×16+ blocks.
+        let step = if self.motion_fast && (tiles_w > 1 || tiles_h > 1) { 2 } else { 1 };
+        // u8 SSE domain (8-bit content): fused interpolate + squared error per
+        // tile, bit-identical (gated by `u8_sse_matches_u16_path`) — this also
+        // replaces the SCALAR per-pixel d² loop below. Edge tiles fall back.
+        let r8_arc = if self.u8_search() { Some(self.ref8_active()) } else { None };
+        let (nl, nr) = if fx != 0 { (3i32, 5i32) } else { (0, 0) };
+        let (nt, nb) = if fy != 0 { (3i32, 4i32) } else { (0, 0) };
+        let mut pred = [0u16; 64];
+        let mut sse = 0i64;
+        let mut sampled = 0i64;
+        let mut ty = 0;
+        while ty < tiles_h {
+            let mut tx = 0;
+            while tx < tiles_w {
+                let (px, py) = (base_x + tx * 8, base_y + ty * 8);
+                if px + 8 <= src.w && py + 8 <= src.h {
+                    sampled += 1;
+                    let _s = prof::Scope::new(prof::S::Interp);
+                    let (bx, by) = (bx0 + (tx * 8) as i32, by0 + (ty * 8) as i32);
+                    #[cfg(target_arch = "x86_64")]
+                    if let Some(r8) = &r8_arc {
+                        if bx - nl >= 0
+                            && bx + 8 + nr <= refp.w
+                            && by - nt >= 0
+                            && by + 8 + nb <= refp.h
+                        {
+                            let refp8 = crate::inter::RefPlane8 {
+                                buf: r8,
+                                stride: rp.stride,
+                                w: refp.w,
+                                h: refp.h,
+                            };
+                            // SAFETY: window checked; AVX2 implied by u8_search;
+                            // src8 mirrors src exactly for 8-bit content.
+                            sse += unsafe {
+                                crate::inter::subpel_sse8x8_u8(
+                                    &refp8,
+                                    bx,
+                                    by,
+                                    fx,
+                                    fy,
+                                    self.active_filter as usize,
+                                    self.src8.as_ptr().add(py * src.stride + px),
+                                    src.stride,
+                                )
+                            } as i64;
+                            if (sse as f64) > bound {
+                                return i64::MAX;
+                            }
+                            tx += step;
+                            continue;
+                        }
+                    }
+                    predict_block(
+                        &refp,
+                        bx,
+                        by,
+                        fx,
+                        fy,
+                        self.active_filter as usize,
+                        &mut pred,
+                        8,
+                        8,
+                        8,
+                        false,
+                        self.max_px,
+                    );
+                    let s = &src.buf[(py * src.stride + px)..];
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            let d = s[r * src.stride + c] as i64 - pred[r * 8 + c] as i64;
+                            sse += d * d;
+                        }
+                    }
+                    // Shortlist abort: SSE accumulates non-negatively, so once
+                    // STRICTLY over the bound this candidate provably cannot
+                    // enter the top-K (the bound only shrinks as more collect) —
+                    // identical top-K set, remaining tiles (and their MC) skipped.
+                    if (sse as f64) > bound {
+                        return i64::MAX;
+                    }
+                }
+                tx += step;
+            }
+            ty += step;
+        }
+        // Scale the sampled SSE back to full-block magnitude so J_skip stays on the
+        // same scale as `rd_cost_y`'s full-block SSE (+ λ·bits).
+        let total: i64 = {
+            let mut n = 0i64;
+            let mut yy = 0;
+            while yy < tiles_h {
+                let mut xx = 0;
+                while xx < tiles_w {
+                    let (px, py) = (base_x + xx * 8, base_y + yy * 8);
+                    if px + 8 <= src.w && py + 8 <= src.h {
+                        n += 1;
+                    }
+                    xx += 1;
+                }
+                yy += 1;
+            }
+            n
+        };
+        if sampled > 0 && total > sampled {
+            sse = sse * total / sampled;
+        }
+        sse
     }
 
     /// Motion-compensate the whole coding block for `mv` (1/8-pel) into the recon
@@ -2693,6 +4656,7 @@ impl FrameEncoder {
         bwl: usize,
         bhl: usize,
         mv: Mv,
+        avg: bool,
     ) {
         let _s = prof::Scope::new(prof::S::Mc);
         let (ss_x, ss_y) = (self.rec[plane].ss_x, self.rec[plane].ss_y);
@@ -2724,12 +4688,12 @@ impl FrameEncoder {
             by,
             subpel_x,
             subpel_y,
-            self.interp_filter as usize,
+            self.active_filter as usize,
             &mut self.rec[plane].buf[dst_off..],
             stride,
             w,
             h,
-            false,
+            avg,
             self.max_px,
         );
     }
@@ -2781,7 +4745,7 @@ impl FrameEncoder {
                     by,
                     subpel_x,
                     subpel_y,
-                    self.interp_filter as usize,
+                    self.active_filter as usize,
                     &mut self.rec[plane].buf[dst_off..],
                     stride,
                     4,
@@ -2846,7 +4810,7 @@ impl FrameEncoder {
             by,
             (mv_q4.1 & 15) as usize,
             (mv_q4.0 & 15) as usize,
-            self.interp_filter as usize,
+            self.active_filter as usize,
             &mut pred,
             4,
             4,
@@ -2863,6 +4827,78 @@ impl FrameEncoder {
             }
         }
         sad
+    }
+
+    /// SAD of one 4×4 luma sub-block vs the AVERAGED compound prediction
+    /// `(slot0@mv0 + slot1@mv1 + 1)>>1` — the sub-8×8 compound scorer.
+    #[allow(clippy::too_many_arguments)]
+    fn sub4x4_sad_compound(
+        &self,
+        mi_row: usize,
+        mi_col: usize,
+        sub_x: usize,
+        sub_y: usize,
+        mv0: Mv,
+        slot0: usize,
+        mv1: Mv,
+        slot1: usize,
+        bw: i32,
+        bh: i32,
+        edges: (i32, i32, i32, i32),
+    ) -> i64 {
+        let base_x = mi_col * 8 + sub_x * 4;
+        let base_y = mi_row * 8 + sub_y * 4;
+        let filt = self.active_filter as usize;
+        let mut buf = [0u16; 16];
+        for (i, (mv, slot)) in [(mv0, slot0), (mv1, slot1)].iter().enumerate() {
+            let q = clamp_mv_umv(*mv, bw, bh, 0, 0, edges);
+            let rp = &self.refs[*slot].as_ref().unwrap()[0];
+            let refp = RefPlane { buf: &rp.buf, stride: rp.stride, w: rp.w as i32, h: rp.h as i32 };
+            predict_block(
+                &refp, base_x as i32 + (q.1 >> 4), base_y as i32 + (q.0 >> 4),
+                (q.1 & 15) as usize, (q.0 & 15) as usize, filt, &mut buf, 4, 4, 4, i == 1, self.max_px,
+            );
+        }
+        let sp = &self.src[0];
+        let mut sad = 0i64;
+        for r in 0..4 {
+            let sr = (base_y + r) * sp.stride + base_x;
+            for c in 0..4 {
+                sad += (buf[r * 4 + c] as i64 - sp.buf[sr + c] as i64).abs();
+            }
+        }
+        sad
+    }
+
+    /// Accumulate the sub-8×8 compound ceiling probe for one finalized sub-block: single-ref
+    /// best SAD vs the best of three cheap compound partners on the fixed ref (ZEROMV, the
+    /// same MV, the NEGATED MV = bi-directional guess). Observe-only.
+    #[allow(clippy::too_many_arguments)]
+    fn sub8_probe_acc(
+        &self,
+        mi_row: usize,
+        mi_col: usize,
+        idx: usize,
+        idy: usize,
+        best_mv: Mv,
+        fixed_slot: usize,
+        bw: i32,
+        bh: i32,
+        edges: (i32, i32, i32, i32),
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let single = self.sub4x4_sad(mi_row, mi_col, idx, idy, best_mv, bw, bh, edges);
+        let neg = (-best_mv.0, -best_mv.1);
+        let c0 = self.sub4x4_sad_compound(mi_row, mi_col, idx, idy, best_mv, 0, (0, 0), fixed_slot, bw, bh, edges);
+        let c1 = self.sub4x4_sad_compound(mi_row, mi_col, idx, idy, best_mv, 0, best_mv, fixed_slot, bw, bh, edges);
+        let c2 = self.sub4x4_sad_compound(mi_row, mi_col, idx, idy, best_mv, 0, neg, fixed_slot, bw, bh, edges);
+        let comp = c0.min(c1).min(c2);
+        SUB8_PROBE[0].fetch_add(single as u64, Relaxed);
+        SUB8_PROBE[1].fetch_add(comp.min(single) as u64, Relaxed);
+        SUB8_PROBE[2].fetch_add(1, Relaxed);
+        if comp < single {
+            SUB8_PROBE[3].fetch_add(1, Relaxed);
+        }
     }
 
     /// Integer ±4 (around zero + `predictor`) then ¼-pel motion search for one 4×4
@@ -2960,6 +4996,124 @@ impl FrameEncoder {
     /// (so free predicted MVs win on ties). Then reconstructs + costs the residual (4×4
     /// tx) via `encode_plane`, which dispatches to `inter_predict_sub8x8`. Single ref
     /// (LAST). Returns `(mode_info, coef_bits, sse)`.
+    /// Run the per-4×4 sub-8×8 mode/MV search for ONE reference `rf` (slot `slot`), filling
+    /// `bmi`/`bmi_mv`. Returns the decided ModeInfo + the summed best-mode cost (SAD, plus the
+    /// NEWMV bit-penalty) — the proxy the multi-ref pick uses to compare references.
+    #[allow(clippy::too_many_arguments)]
+    fn sub8x8_search_ref(
+        &mut self,
+        mi_row: usize,
+        mi_col: usize,
+        bsize: usize,
+        num_4x4_w: usize,
+        num_4x4_h: usize,
+        bw: i32,
+        bh: i32,
+        edges: (i32, i32, i32, i32),
+        rf: i8,
+        slot: usize,
+        do_probe: bool,
+        fixed_slot: usize,
+    ) -> (ModeInfo, i64) {
+        // A NEWMV must beat a predicted mode by ~this SAD to justify its MV bits.
+        const NEWMV_SAD_PENALTY: i64 = 48;
+        self.active_ref = slot;
+        let mut mi = ModeInfo {
+            sb_type: bsize as u8,
+            skip: false,
+            tx_size: 0,
+            is_inter: true,
+            ref_frame: [rf, NONE_FRAME],
+            interp_filter: self.active_filter as u8,
+            ..Default::default()
+        };
+        let mut last_mode = ZEROMV;
+        let mut total = 0i64;
+        let mut idy = 0;
+        while idy < 2 {
+            let mut idx = 0;
+            while idx < 2 {
+                let j = idy * 2 + idx;
+                // ZEROMV baseline.
+                let mut best_cost = self.sub4x4_sad(mi_row, mi_col, idx, idy, (0, 0), bw, bh, edges);
+                let mut best_mode = ZEROMV;
+                let mut best_mv = (0i32, 0i32);
+                // NEAREST / NEAR — free predicted MVs (no MV bits).
+                for m in [NEARESTMV, NEARMV] {
+                    let mv = lower_mv_precision(
+                        self.enc_sub8x8_mv(&mi, m, j, 0, mi_row, mi_col, bsize, edges),
+                        self.hp_mv,
+                    );
+                    let c = self.sub4x4_sad(mi_row, mi_col, idx, idy, mv, bw, bh, edges);
+                    if c < best_cost {
+                        best_cost = c;
+                        best_mode = m;
+                        best_mv = mv;
+                    }
+                }
+                // NEWMV — searched, charged the MV-bit penalty. Pre-screen: when a free
+                // predicted mode already fits this 4×4 well, skip the search.
+                if self.sub8x8_prescreen > 0 && best_cost <= self.sub8x8_prescreen {
+                    if do_probe {
+                        self.sub8_probe_acc(mi_row, mi_col, idx, idy, best_mv, fixed_slot, bw, bh, edges);
+                    }
+                    mi.bmi[j] = best_mode;
+                    mi.bmi_mv[j] = [best_mv, (0, 0)];
+                    if num_4x4_h == 2 {
+                        mi.bmi[j + 2] = best_mode;
+                        mi.bmi_mv[j + 2] = [best_mv, (0, 0)];
+                    }
+                    if num_4x4_w == 2 {
+                        mi.bmi[j + 1] = best_mode;
+                        mi.bmi_mv[j + 1] = [best_mv, (0, 0)];
+                    }
+                    total += best_cost;
+                    last_mode = best_mode;
+                    idx += num_4x4_w;
+                    continue;
+                }
+                let (cand, _) = find_mv_refs(
+                    &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end,
+                    mi_row, mi_col, bsize, rf, &self.sign_bias, NEWMV, -1, edges,
+                    self.prev_mv(mi_row, mi_col),
+                );
+                let pred = lower_mv_precision(cand[0], self.hp_mv);
+                let mvw = self.search_mv_sub(mi_row, mi_col, idx, idy, pred, bw, bh, edges);
+                let cw = self.sub4x4_sad(mi_row, mi_col, idx, idy, mvw, bw, bh, edges)
+                    + NEWMV_SAD_PENALTY;
+                // G4 harvest (observe-only): predicted-mode SAD vs the searched NEWMV.
+                if self.g1_harvest {
+                    eprintln!("G4 pred_sad={} newmv_cost={} won={}", best_cost, cw, (cw < best_cost) as u8);
+                }
+                if cw < best_cost {
+                    best_mode = NEWMV;
+                    best_mv = mvw;
+                    best_cost = cw;
+                }
+                if do_probe {
+                    self.sub8_probe_acc(mi_row, mi_col, idx, idy, best_mv, fixed_slot, bw, bh, edges);
+                }
+                mi.bmi[j] = best_mode;
+                mi.bmi_mv[j] = [best_mv, (0, 0)];
+                if num_4x4_h == 2 {
+                    mi.bmi[j + 2] = best_mode;
+                    mi.bmi_mv[j + 2] = [best_mv, (0, 0)];
+                }
+                if num_4x4_w == 2 {
+                    mi.bmi[j + 1] = best_mode;
+                    mi.bmi_mv[j + 1] = [best_mv, (0, 0)];
+                }
+                total += best_cost;
+                last_mode = best_mode;
+                idx += num_4x4_w;
+            }
+            idy += num_4x4_h;
+        }
+        mi.mode = last_mode;
+        mi.mv = mi.bmi_mv[3];
+        (mi, total)
+    }
+
     fn decide_sub8x8(
         &mut self,
         mi_row: usize,
@@ -2975,107 +5129,42 @@ impl FrameEncoder {
         let num_4x4_h = 1usize << B_HEIGHT_LOG2[bsize];
         let edges = self.block_edges(mi_row, mi_col, bsize);
         let (bw, bh) = (((1i32 << bwl) * 4), ((1i32 << bhl) * 4));
-        self.active_ref = 0;
-        let rf = LAST_FRAME;
-        // A NEWMV must beat a predicted mode by ~this SAD to justify its MV bits.
-        const NEWMV_SAD_PENALTY: i64 = 48;
-        let mut mi = ModeInfo {
-            sb_type: bsize as u8,
-            skip: false,
-            tx_size: 0,
-            is_inter: true,
-            ref_frame: [rf, NONE_FRAME],
-            interp_filter: self.interp_filter as u8,
-            ..Default::default()
-        };
-        let mut last_mode = ZEROMV;
-        let mut idy = 0;
-        while idy < 2 {
-            let mut idx = 0;
-            while idx < 2 {
-                let j = idy * 2 + idx;
-                // ZEROMV baseline.
-                let mut best_cost = self.sub4x4_sad(mi_row, mi_col, idx, idy, (0, 0), bw, bh, edges);
-                let mut best_mode = ZEROMV;
-                let mut best_mv = (0i32, 0i32);
-                // NEAREST / NEAR — free predicted MVs (no MV bits).
-                for m in [NEARESTMV, NEARMV] {
-                    let mv = lower_mv_precision(
-                        self.enc_sub8x8_mv(&mi, m, j, 0, mi_row, mi_col, bsize, edges),
-                        false,
-                    );
-                    let c = self.sub4x4_sad(mi_row, mi_col, idx, idy, mv, bw, bh, edges);
-                    if c < best_cost {
-                        best_cost = c;
-                        best_mode = m;
-                        best_mv = mv;
-                    }
-                }
-                // NEWMV — searched, charged the MV-bit penalty. Pre-screen: when a
-                // free predicted mode already fits this 4×4 well (SAD below the
-                // threshold), the search can't beat it by more than the MV bits it
-                // costs — skip it. 0 = always search (the speed-0 default).
-                if self.sub8x8_prescreen > 0 && best_cost <= self.sub8x8_prescreen {
-                    mi.bmi[j] = best_mode;
-                    mi.bmi_mv[j] = [best_mv, (0, 0)];
-                    if num_4x4_h == 2 {
-                        mi.bmi[j + 2] = best_mode;
-                        mi.bmi_mv[j + 2] = [best_mv, (0, 0)];
-                    }
-                    if num_4x4_w == 2 {
-                        mi.bmi[j + 1] = best_mode;
-                        mi.bmi_mv[j + 1] = [best_mv, (0, 0)];
-                    }
-                    last_mode = best_mode;
-                    idx += num_4x4_w;
+        // Sub-8×8 compound ceiling probe: the fixed compound ref's slot (comp_fixed_ref-1),
+        // and whether to accumulate the SAD-reduction stats (observe-only).
+        let fixed_slot = (self.fc.comp_fixed_ref as usize).wrapping_sub(1);
+        let probe = self.sub8_probe
+            && self.compound
+            && fixed_slot < 3
+            && self.refs[fixed_slot].is_some();
+        // LAST first (always). Its summed sub-block SAD is the cheap content signal: only
+        // pay the GOLDEN/ALTREF search when LAST fits POORLY (gate) — static/well-predicted
+        // leaves stay LAST-only (byte-identical, no extra cost), so the ~3× search lands only
+        // on hard leaves. A better single ref adds NO MV bits, just less residual; the SAD
+        // proxy under-prices non-LAST, so a margin penalty guards against equal-residual flips.
+        let (last_mi, last_total) = self.sub8x8_search_ref(
+            mi_row, mi_col, bsize, num_4x4_w, num_4x4_h, bw, bh, edges,
+            LAST_FRAME, 0, probe, fixed_slot,
+        );
+        let mut mi = last_mi;
+        if self.sub8x8_multiref && (last_total as f64) > self.sub8x8_multiref_gate {
+            let mut best_cost = last_total as f64 + self.lambda; // LAST: one ref bool
+            for &(cand_rf, cand_slot) in &[(GOLDEN_FRAME, 1usize), (ALTREF_FRAME, 2usize)] {
+                if self.refs[cand_slot].is_none() {
                     continue;
                 }
-                let (cand, _) = find_mv_refs(
-                    &self.mi,
-                    self.mi_cols,
-                    self.mi_rows,
-                    self.tile_start,
-                    self.tile_end,
-                    mi_row,
-                    mi_col,
-                    bsize,
-                    rf,
-                    &self.sign_bias,
-                    NEWMV,
-                    -1,
-                    edges,
-                    self.prev_mv(mi_row, mi_col),
+                let (m, total) = self.sub8x8_search_ref(
+                    mi_row, mi_col, bsize, num_4x4_w, num_4x4_h, bw, bh, edges,
+                    cand_rf, cand_slot, false, fixed_slot,
                 );
-                let pred = lower_mv_precision(cand[0], false);
-                let mvw = self.search_mv_sub(mi_row, mi_col, idx, idy, pred, bw, bh, edges);
-                let cw = self.sub4x4_sad(mi_row, mi_col, idx, idy, mvw, bw, bh, edges)
-                    + NEWMV_SAD_PENALTY;
-                // G4 harvest (observe-only): predicted-mode SAD vs the searched
-                // NEWMV outcome — the pre-screen threshold's training data.
-                if self.g1_harvest {
-                    eprintln!("G4 pred_sad={} newmv_cost={} won={}", best_cost, cw, (cw < best_cost) as u8);
+                let cost = total as f64 + self.lambda * 2.0 + self.sub8x8_ref_penalty;
+                if cost < best_cost {
+                    best_cost = cost;
+                    mi = m;
                 }
-                if cw < best_cost {
-                    best_mode = NEWMV;
-                    best_mv = mvw;
-                }
-                mi.bmi[j] = best_mode;
-                mi.bmi_mv[j] = [best_mv, (0, 0)];
-                if num_4x4_h == 2 {
-                    mi.bmi[j + 2] = best_mode;
-                    mi.bmi_mv[j + 2] = [best_mv, (0, 0)];
-                }
-                if num_4x4_w == 2 {
-                    mi.bmi[j + 1] = best_mode;
-                    mi.bmi_mv[j + 1] = [best_mv, (0, 0)];
-                }
-                last_mode = best_mode;
-                idx += num_4x4_w;
             }
-            idy += num_4x4_h;
         }
-        mi.mode = last_mode;
-        mi.mv = mi.bmi_mv[3];
+        // Lock active_ref to the chosen reference for the residual trial + emit recon.
+        self.active_ref = (mi.ref_frame[0] as usize) - 1;
         // Residual trial (4×4 tx); encode_plane MCs via inter_predict_sub8x8. Same
         // snap/keep_recon contract as decide_inter: skip keeps the MC-only recon; a
         // non-skip block rolls back (emit re-reconstructs) unless the caller keeps it.
@@ -3230,13 +5319,28 @@ impl FrameEncoder {
         if mi.is_inter {
             if (mi.sb_type as usize) < BLOCK_8X8 {
                 self.inter_predict_sub8x8(plane, mi, mi_row, mi_col, bsize, bwl, bhl);
+            } else if mi.has_second_ref() {
+                // Compound: ref 0 writes the prediction, ref 1 blends `(p0+p1+1)>>1`.
+                let save = self.active_ref;
+                self.active_ref = (mi.ref_frame[0] - 1) as usize;
+                self.inter_predict_mv(plane, mi_row, mi_col, bsize, bwl, bhl, mi.mv[0], false);
+                self.active_ref = (mi.ref_frame[1] - 1) as usize;
+                self.inter_predict_mv(plane, mi_row, mi_col, bsize, bwl, bhl, mi.mv[1], true);
+                self.active_ref = save;
             } else {
-                self.inter_predict_mv(plane, mi_row, mi_col, bsize, bwl, bhl, mi.mv[0]);
+                self.inter_predict_mv(plane, mi_row, mi_col, bsize, bwl, bhl, mi.mv[0], false);
             }
         }
 
         let mut bits = 0u64;
         let mut sse = 0u64;
+        // Abort bound applies only to costing trials (never the emit pass) and
+        // only on luma (rd_cost_y's plane); chroma/skip trials need full sums.
+        let abort_at = if enc.is_none() && plane == 0 {
+            self.trial_abort_at
+        } else {
+            None
+        };
         let mut row = 0;
         while row < max_h {
             let mut col = 0;
@@ -3262,6 +5366,11 @@ impl FrameEncoder {
                 );
                 bits += b;
                 sse += s;
+                if let Some(bound) = abort_at {
+                    if sse as f64 + self.lambda * (bits as f64 / 256.0) > bound {
+                        return (u64::MAX, u64::MAX);
+                    }
+                }
                 col += step;
             }
             row += step;
@@ -3306,6 +5415,7 @@ impl FrameEncoder {
         // ---- intra prediction into the recon buffer (inter blocks were already
         // motion-compensated by `inter_predict`) ----
         if !mi.is_inter {
+            let _s = prof::Scope::new(prof::S::IntraPred);
             let mode = if plane == 0 { mi.mode } else { mi.uv_mode };
             let up_avail = row > 0 || above_some;
             let left_avail = col > 0 || left_some;
@@ -3373,38 +5483,12 @@ impl FrameEncoder {
         } else {
             INTRA_MODE_TO_TX_TYPE[mi.mode as usize]
         };
-        let (scan, nb) = get_scan(tx_size, tx_type);
-        let dq = if plane == 0 { self.dq_y } else { self.dq_uv };
-        let dq_shift = if tx_size == 3 { 1 } else { 0 };
-        let mut coeffs = [0i32; 1024];
-        {
-            let _s = prof::Scope::new(prof::S::FwdTx);
-            forward_transform(&residual[..n], bs, tx_type, &mut coeffs[..n]);
-        }
-        let mut levels = [0i32; 1024];
-        let mut dqcoeff = [0i32; 1024];
-        let mut eob = {
-            let _s = prof::Scope::new(prof::S::Quantize);
-            quantize(
-                &coeffs[..n],
-                scan,
-                dq.0,
-                dq.1,
-                dq.1 as i64 * self.ac_round_num / 8,
-                dq_shift,
-                &mut levels[..n],
-                &mut dqcoeff[..n],
-            )
-        };
-
-        // force_skip: re-materialise this block as empty (RD skip decision dropped
-        // the residual). eob=0 ⇒ no residual added below, context set to 0, recon ==
-        // MC prediction — bit-identical to a naturally-empty (skip) block.
-        if self.force_skip {
-            eob = 0;
-        }
-
-        // ---- entropy context, then encode the tokens ----
+        // Residual fingerprint for the emit-dedup cache (FNV over the pipeline's
+        // pure-function input; tx_type is implied by the key's plane+size+mi path).
+        let is_emit = enc.is_some();
+        // The pipeline output = f(residual, tx_type, quant params[plane/size],
+        // trellis probs[inter], trellis entry ctx0) — ALL must be in the
+        // fingerprint or the reuse silently drifts (measured: ctx0/inter leak).
         let act = self.above_ctx[plane][above_col0 + col..above_col0 + col + txw]
             .iter()
             .any(|&v| v != 0) as usize;
@@ -3414,6 +5498,70 @@ impl FrameEncoder {
         let ctx0 = act + lct;
         let pt = plane.min(1);
         let inter = mi.is_inter as usize;
+        let dedup_active = self.emit_dedup && (is_emit || self.skip_trial) && !self.force_skip;
+        let dedup_hash = if dedup_active {
+            let mut h = 0xcbf29ce484222325u64
+                ^ (tx_type as u64)
+                ^ ((ctx0 as u64) << 8)
+                ^ ((inter as u64) << 16);
+            for &r in &residual[..n] {
+                h ^= r as u32 as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        } else {
+            0
+        };
+        let (scan, nb) = get_scan(tx_size, tx_type);
+        let dq = if plane == 0 { self.dq_y } else { self.dq_uv };
+        let dq_shift = if tx_size == 3 { 1 } else { 0 };
+        let mut coeffs = [0i32; 1024];
+        let mut levels = [0i32; 1024];
+        let mut dqcoeff = [0i32; 1024];
+        // Emit-dedup reuse: on a residual-hash match the trial's outputs ARE this
+        // block's outputs (pure function) — skip fwd+quantize+trellis entirely.
+        let mut from_cache = false;
+        let mut eob = 0usize;
+        if dedup_active && is_emit {
+            if let Some((h, lv, dqv, e)) =
+                self.dedup_map.borrow().get(&(plane as u8, x0 as u32, y0 as u32, tx_size as u8))
+            {
+                if *h == dedup_hash {
+                    levels[..n].copy_from_slice(lv);
+                    dqcoeff[..n].copy_from_slice(dqv);
+                    eob = *e as usize;
+                    from_cache = true;
+                }
+            }
+        }
+        if !from_cache {
+            {
+                let _s = prof::Scope::new(prof::S::FwdTx);
+                forward_transform(&residual[..n], bs, tx_type, &mut coeffs[..n]);
+            }
+            eob = {
+                let _s = prof::Scope::new(prof::S::Quantize);
+                quantize(
+                    &coeffs[..n],
+                    scan,
+                    dq.0,
+                    dq.1,
+                    dq.1 as i64 * self.ac_round_num / 8,
+                    dq_shift,
+                    &mut levels[..n],
+                    &mut dqcoeff[..n],
+                )
+            };
+        }
+
+        // force_skip: re-materialise this block as empty (RD skip decision dropped
+        // the residual). eob=0 ⇒ no residual added below, context set to 0, recon ==
+        // MC prediction — bit-identical to a naturally-empty (skip) block.
+        if self.force_skip {
+            eob = 0;
+        }
+
+        // ---- entropy context (ctx0/pt/inter computed above, pre-dedup) ----
         // Cost/trial probs = the frame's INITIAL context (== the spec defaults
         // when not chaining; the adapted context when chaining) so the RD cost
         // model matches what the emit actually pays. Static defaults here made
@@ -3422,11 +5570,41 @@ impl FrameEncoder {
         let default_probs = &self.fc.coef_probs[tx_size][pt][inter];
         // R5: trellis-style RD-optimal EOB on the commit path (uses the default
         // probs so the levels reproduce identically across the R4 two-pass).
-        if (enc.is_some() || self.skip_trial) && self.use_trellis && eob > 0 {
+        let mut trellis_rate: Option<u64> = None;
+        // Trellis runs in emits AND exploration skip-trials (default): removing
+        // it from trials (libvpx-style) was REFUTED at +21.5% BD — our RD-skip
+        // gate compares j_noskip built from these coef bits, and non-trellised
+        // bits inflate it into systematic over-skipping.
+        let trellis_here =
+            !from_cache && (enc.is_some() || (self.skip_trial && self.trellis_trials));
+        // libvpx `trellis_opt_tx_rd` RESIDUAL_MSE gate (vp9_encoder.h
+        // do_trellis_opt): run the trellis only when the residual energy is
+        // small relative to the quantizer — `SSE ≤ npix·qstep²·thresh`,
+        // qstep = ac_dequant>>3, their cpu-used-2 thresh = 3.0. DETERMINISTIC on
+        // block data ⇒ identical decision in trial and emit ⇒ the RD-skip
+        // coupling stays consistent (unlike the refuted asymmetric fast-trials).
+        // `VP9_TRELLIS_MSE_T=0` disables the gate (always-trellis oracle).
+        // NOTE: dropping trellis on the realtime tier was TRIED + REVERTED — only ~1.06×
+        // (freed time shifts into coding more surviving coefficients) for +6.87% BD-rate;
+        // trellis is load-bearing for our quality (libvpx compensates elsewhere in realtime).
+        let trellis_gated = trellis_here && self.use_trellis && eob > 0 && {
+            if self.trellis_mse_t > 0.0 {
+                let mut rss = 0i64;
+                for &r in &residual[..n] {
+                    rss += (r as i64) * (r as i64);
+                }
+                let qstep = (dq.1 >> 3).max(1) as i64;
+                (rss as f64) <= (n as f64) * ((qstep * qstep) as f64) * self.trellis_mse_t
+            } else {
+                true
+            }
+        };
+        if trellis_gated {
             let _s = prof::Scope::new(prof::S::Trellis);
-            eob = self.trellis_eob(
+            let (new_eob, rate) = self.trellis_eob(
                 &mut levels[..n],
                 &mut dqcoeff[..n],
+                &coeffs[..n],
                 scan,
                 nb,
                 eob,
@@ -3443,6 +5621,21 @@ impl FrameEncoder {
                 dq.0 as i64,
                 dq.1 as i64,
                 dq_shift as u32,
+            );
+            eob = new_eob;
+            trellis_rate = rate;
+        }
+        // Emit-dedup store: the skip trial's final (levels, dqcoeff, eob) become
+        // the cache entry for this tx block, keyed by the residual hash.
+        if self.emit_dedup && self.skip_trial && !self.force_skip {
+            self.dedup_map.borrow_mut().insert(
+                (plane as u8, x0 as u32, y0 as u32, tx_size as u8),
+                (
+                    dedup_hash,
+                    levels[..n].to_vec(),
+                    dqcoeff[..n].to_vec(),
+                    eob as u16,
+                ),
             );
         }
         let mut token_cache = [0u8; 1024];
@@ -3481,6 +5674,10 @@ impl FrameEncoder {
                 }
             }
             0
+        } else if let Some(rate) = trellis_rate {
+            // The trellis already tracked the exact rate of the final block —
+            // identical to the coef_cost walk below, so don't re-walk.
+            rate
         } else {
             // RDO trial: cost the exact same token walk (default probs) without emitting.
             let _s = prof::Scope::new(prof::S::CoefCost);
@@ -3498,6 +5695,7 @@ impl FrameEncoder {
         };
 
         // ---- update entropy context (libvpx ctx_shift) ----
+        let _s = prof::Scope::new(prof::S::CtxUpdate);
         let inframe_w = (max_w - col).min(txw);
         let inframe_h = (max_h - row).min(txw);
         let v = (eob > 0) as u8;
@@ -3505,7 +5703,25 @@ impl FrameEncoder {
             self.above_ctx[plane][above_col0 + col + i] = if i < inframe_w { v } else { 0 };
             self.left_ctx[plane][left_row0 + row + i] = if i < inframe_h { v } else { 0 };
         }
+        drop(_s);
         self.pending_eob += eob as u32;
+
+        // skip_recode analog (libvpx SF): INTER mode-trials never read the recon
+        // (block-level MC prediction; restore_y follows immediately), so skip the
+        // inverse transform + pixel-SSE and estimate the distortion in the
+        // COEFFICIENT domain by Parseval — the same model the trellis uses
+        // (measured −0.50% BD there). Intra trials keep the real recon (it feeds
+        // the next tx block's prediction edges); emits/skip-trials unchanged.
+        // `VP9_TRIAL_RECON=1` restores the exact path.
+        if !is_emit && !self.skip_trial && mi.is_inter && !self.trial_recon {
+            let norm = basis_normsq(tx_size, tx_type);
+            let mut d = 0.0f64;
+            for p in 0..n {
+                let e = (dqcoeff[p] - coeffs[p]) as f64;
+                d += e * e * norm[p];
+            }
+            return (bits, d as u64);
+        }
 
         // ---- reconstruct: add the dequantized residual back ----
         if eob > 0 {
@@ -3558,6 +5774,7 @@ impl FrameEncoder {
         &self,
         levels: &mut [i32],
         dqcoeff: &mut [i32],
+        coeffs: &[i32],
         scan: &[i16],
         nb: &[i16],
         eob: usize,
@@ -3574,62 +5791,151 @@ impl FrameEncoder {
         dc_step: i64,
         ac_step: i64,
         dq_shift: u32,
-    ) -> usize {
+    ) -> (usize, Option<u64>) {
         let n = bs * bs;
-        // The prediction still sits in the recon buffer (residual added later).
-        let mut pred = [0u16; 1024];
-        for y in 0..bs {
-            for x in 0..bs {
-                pred[y * bs + x] = self.rec[plane].buf[dst_off + y * stride + x];
-            }
-        }
-        let src = &self.src[plane];
-        let rd = |dq: &[i32], lv: &[i32], e: usize| -> f64 {
-            let mut temp = [0u16; 1024];
-            temp[..n].copy_from_slice(&pred[..n]);
-            if e > 0 {
-                let mut max_row = 0;
-                for (p, &c) in dq[..n].iter().enumerate() {
-                    if c != 0 {
-                        max_row = max_row.max(p / bs);
-                    }
-                }
-                inverse_transform_add_rows(
-                    &dq[..n],
-                    bs,
-                    tx_type,
-                    &mut temp[..n],
-                    bs,
-                    self.max_px,
-                    max_row + 1,
-                );
-            }
-            let mut d = 0u64;
+        // COEFFICIENT-DOMAIN distortion (parity with libvpx `optimize_b`): the pixel
+        // SSE of dequantized coefficients equals, by Parseval on the orthogonal
+        // DCT/ADST basis, Σ_p (dqcoeff[p] − coeff[p])²·norm[p] where `coeff` is the
+        // un-quantized forward transform and norm[p] is position p's basis energy —
+        // so we NEVER run an inverse transform per candidate (the 31×-slower path).
+        // It's an approximation (integer-idct rounding + clamp break exactness), so
+        // `VP9_TRELLIS_EXACT=1` restores the pixel-SSE oracle for A/B.
+        // Content-adaptive λ: DENSE blocks (high eob/n = noisy high-motion residual) trim
+        // more aggressively; SPARSE blocks (static detail) stay near self.lambda.
+        let frac = eob as f64 / (bs * bs) as f64;
+        let lambda = self.lambda * self.trellis_lambda_scale * (1.0 + self.trellis_k * frac);
+        // ---- Exact pixel-SSE oracle (VP9_TRELLIS_EXACT): inverse-transform + SSE per
+        // candidate — the slow 31× path, kept only for A/B against the fast one. ----
+        if self.trellis_exact {
+            let mut pred = [0u16; 1024];
             for y in 0..bs {
                 for x in 0..bs {
-                    let s = src.buf[(y0 + y) * src.stride + x0 + x] as i64;
-                    let r = temp[y * bs + x] as i64;
-                    d += ((s - r) * (s - r)) as u64;
+                    pred[y * bs + x] = self.rec[plane].buf[dst_off + y * stride + x];
                 }
             }
+            let src = &self.src[plane];
             let mut tc = [0u8; 1024];
-            let r = coef_cost(&lv[..n], scan, nb, e, probs, tx_size, ctx0, &mut tc[..n], 8);
-            d as f64 + self.lambda * (r as f64 / 256.0)
+            let mut rd = |dq: &[i32], lv: &[i32], e: usize| -> f64 {
+                let mut temp = [0u16; 1024];
+                temp[..n].copy_from_slice(&pred[..n]);
+                if e > 0 {
+                    let mut max_row = 0;
+                    for (p, &c) in dq[..n].iter().enumerate() {
+                        if c != 0 {
+                            max_row = max_row.max(p / bs);
+                        }
+                    }
+                    inverse_transform_add_rows(
+                        &dq[..n], bs, tx_type, &mut temp[..n], bs, self.max_px, max_row + 1,
+                    );
+                }
+                let mut d = 0u64;
+                for y in 0..bs {
+                    for x in 0..bs {
+                        let s = src.buf[(y0 + y) * src.stride + x0 + x] as i64;
+                        let r = temp[y * bs + x] as i64;
+                        d += ((s - r) * (s - r)) as u64;
+                    }
+                }
+                let r = coef_cost(&lv[..n], scan, nb, e, probs, tx_size, ctx0, &mut tc[..n], 8);
+                d as f64 + lambda * (r as f64 / 256.0)
+            };
+            let mut eob = eob;
+            let mut j = rd(dqcoeff, levels, eob);
+            while eob > 0 {
+                let last = scan[eob - 1] as usize;
+                let (sl, sd) = (levels[last], dqcoeff[last]);
+                levels[last] = 0;
+                dqcoeff[last] = 0;
+                let mut ne = eob - 1;
+                while ne > 0 && levels[scan[ne - 1] as usize] == 0 {
+                    ne -= 1;
+                }
+                let jp = rd(dqcoeff, levels, ne);
+                if jp < j {
+                    j = jp;
+                    eob = ne;
+                } else {
+                    levels[last] = sl;
+                    dqcoeff[last] = sd;
+                    break;
+                }
+            }
+            let mut i = eob;
+            while i > 0 {
+                i -= 1;
+                let pos = scan[i] as usize;
+                let lv = levels[pos];
+                if lv == 0 {
+                    continue;
+                }
+                let step = if pos == 0 { dc_step } else { ac_step };
+                let sign = if lv < 0 { -1i32 } else { 1 };
+                let mag = lv.unsigned_abs() as i64 - 1;
+                let (ol, od) = (levels[pos], dqcoeff[pos]);
+                levels[pos] = sign * mag as i32;
+                dqcoeff[pos] = sign * ((mag * step) >> dq_shift) as i32;
+                let mut ne = eob;
+                while ne > 0 && levels[scan[ne - 1] as usize] == 0 {
+                    ne -= 1;
+                }
+                let jp = rd(dqcoeff, levels, ne);
+                if jp < j {
+                    j = jp;
+                    eob = ne;
+                } else {
+                    levels[pos] = ol;
+                    dqcoeff[pos] = od;
+                }
+            }
+            return (eob, None);
+        }
+        // ---- Fast coefficient-domain trellis (default): distortion maintained
+        // INCREMENTALLY (O(1)/candidate via Parseval); only the rate is re-costed. ----
+        let norm = basis_normsq(tx_size, tx_type);
+        let dist_of = |p: usize, dqv: i32| -> f64 {
+            let e = (dqv - coeffs[p]) as f64;
+            e * e * norm[p]
         };
+        // Distortion is tracked RELATIVE to the initial block (baseline 0): every
+        // decision is a `jp < j` comparison, so the absolute Σ(dq−coeff)²·norm
+        // baseline cancels and need never be summed — dropping an O(bs²) per-call loop.
+        let mut dist = 0.0f64;
+        // Rate maintained INCREMENTALLY too (parity with libvpx `optimize_b`): the
+        // O(1)-per-candidate `RateTracker` replaces the O(eob) `coef_cost` re-walk —
+        // its `total()` is bit-for-bit the same rate the re-walk produced, so the
+        // trellis decisions are byte-identical, only the whole loop is now O(eob).
+        // Its per-position scratch is thread-local + reused so building a tracker per
+        // block costs no allocation.
+        thread_local! {
+            static TR_SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<u64>, Vec<u8>)> =
+                std::cell::RefCell::new((vec![0u8; 1024], vec![0u64; 1025], vec![0u8; 1024]));
+        }
+        TR_SCRATCH.with(|s| {
+        let mut g = s.borrow_mut();
+        let (cbuf, pbuf, bbuf) = &mut *g;
+        let mut tr = RateTracker::new(
+            levels, scan, nb, eob, probs, tx_size, tx_type as u8, ctx0, 8, cbuf, pbuf, bbuf,
+        );
+        let rj = |q8: u64| lambda * (q8 as f64 / 256.0);
         let mut eob = eob;
-        let mut j = rd(dqcoeff, levels, eob);
+        let mut j = dist + rj(tr.total());
+        // EOB trim.
         while eob > 0 {
             let last = scan[eob - 1] as usize;
             let (sl, sd) = (levels[last], dqcoeff[last]);
+            let d_new = dist - dist_of(last, sd) + dist_of(last, 0);
             levels[last] = 0;
             dqcoeff[last] = 0;
             let mut ne = eob - 1;
             while ne > 0 && levels[scan[ne - 1] as usize] == 0 {
                 ne -= 1;
             }
-            let jp = rd(dqcoeff, levels, ne);
+            let jp = d_new + rj(tr.probe(levels, eob - 1, ne));
             if jp < j {
                 j = jp;
+                dist = d_new;
+                tr.commit(levels, eob - 1, ne);
                 eob = ne;
             } else {
                 levels[last] = sl;
@@ -3637,14 +5943,14 @@ impl FrameEncoder {
                 break;
             }
         }
-        // Full trellis: lower each surviving coefficient by one quantizer step wherever
-        // the RD improves (level → level−1, and → 0 when it was ±1). This is the
-        // interior-coefficient optimization the EOB trim misses and libvpx's optimize_b
-        // does — a single backward pass captures it: the RD cost is convex in the level
-        // (the quantizer already rounded to nearest, so level−1 is the only useful
-        // alternative), and iterating to convergence / multi-step lowering was measured
-        // byte-identical. Re-dequantize the lowered level exactly as the decoder will
-        // (`(mag·step)>>dq_shift`) so recon stays exact.
+        // Interior lowering. DP-lite (default): pure magnitude lowerings
+        // (|lv| ≥ 2, not the last nonzero) price the rate delta with the FROZEN
+        // build-time (band, ctx) — a single table difference, no neighbour
+        // updates — exactly libvpx optimize_b's frozen-context approximation.
+        // Status-changing candidates (1→0, tail) keep the exact tracker path.
+        // `VP9_TRELLIS_EXACT_CTX=1` restores exact pricing for everything.
+        let frozen = self.trellis_frozen;
+        let mut rate_adj = 0i64; // Σ accepted frozen deltas (Q8)
         let mut i = eob;
         while i > 0 {
             i -= 1;
@@ -3655,24 +5961,53 @@ impl FrameEncoder {
             }
             let step = if pos == 0 { dc_step } else { ac_step };
             let sign = if lv < 0 { -1i32 } else { 1 };
-            let mag = lv.unsigned_abs() as i64 - 1;
+            let aval = lv.unsigned_abs();
+            let mag = aval as i64 - 1;
             let (ol, od) = (levels[pos], dqcoeff[pos]);
+            let new_dq = sign * ((mag * step) >> dq_shift) as i32;
+            let d_new = dist - dist_of(pos, od) + dist_of(pos, new_dq);
+            if frozen && aval >= 2 && i + 1 != eob {
+                let (band, fctx) = tr.frozen(i);
+                let p2 = tr.probs()[band][fctx][2];
+                if let (Some(cn), Some(co)) = (
+                    crate::encode::tokens::mag_cost_q8(p2, aval - 1),
+                    crate::encode::tokens::mag_cost_q8(p2, aval),
+                ) {
+                    let delta = cn as i64 - co as i64;
+                    let jp = d_new + lambda * ((rate_adj + delta) as f64 / 256.0)
+                        + rj(tr.total());
+                    if jp < j {
+                        levels[pos] = sign * mag as i32;
+                        dqcoeff[pos] = new_dq;
+                        dist = d_new;
+                        rate_adj += delta;
+                        j = jp;
+                    }
+                    continue;
+                }
+            }
             levels[pos] = sign * mag as i32;
-            dqcoeff[pos] = sign * ((mag * step) >> dq_shift) as i32;
+            dqcoeff[pos] = new_dq;
             let mut ne = eob;
             while ne > 0 && levels[scan[ne - 1] as usize] == 0 {
                 ne -= 1;
             }
-            let jp = rd(dqcoeff, levels, ne);
+            let jp = d_new + lambda * (rate_adj as f64 / 256.0) + rj(tr.probe(levels, i, ne));
             if jp < j {
                 j = jp;
+                dist = d_new;
+                tr.commit(levels, i, ne);
                 eob = ne;
             } else {
                 levels[pos] = ol;
                 dqcoeff[pos] = od;
             }
         }
-        eob
+        // The tracker total plus the frozen-delta adjustment approximates the
+        // final rate (exact when DP-lite is off — then rate_adj == 0 and this is
+        // bit-for-bit coef_cost, per `rate_tracker_matches_coef_cost_incrementally`).
+        (eob, Some((tr.total() as i64 + rate_adj).max(0) as u64))
+        })
     }
 
     fn frame_lossless(&self) -> bool {
@@ -3696,31 +6031,112 @@ impl FrameEncoder {
     /// and apply that filter to the reconstruction (a uniform filter —
     /// `lf_delta_enabled = false`). The decoder reads the level and reproduces the
     /// exact same deblocked frame, so the round-trip stays bit-exact.
+    /// Luma SSE of the reconstruction deblocked at `lvl` (into scratch `c0`), for the R3
+    /// level search. Filters ONLY luma — the level choice is luma-SSE-gated, so cloning +
+    /// deblocking chroma per candidate would be discarded work; the winner's real 3-plane
+    /// filter is applied by the caller.
+    fn lf_luma_sse(&self, h: &mut FrameHeader, c0: &mut [u16], lvl: u32) -> u64 {
+        h.loop_filter_level = lvl;
+        c0.copy_from_slice(&self.rec[0].buf);
+        let mut planes = [(c0, self.rec[0].stride, 0usize, 0usize)];
+        loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
+        self.luma_sse_of(planes[0].0)
+    }
+
+    /// Observe-only per-segment-lf ceiling probe: the per-64×64-SB oracle (each SB filtered at
+    /// its own best level) vs the global-best-level SSE. Bounds the spatial per-segment win.
+    fn lfseg_probe(&self, h: &mut FrameHeader, global_sse: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let levels: [u32; 13] = [0, 4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 63];
+        let src = &self.src[0];
+        let (w, hgt, stride) = (src.w, src.h, src.stride);
+        let (sb_cols, sb_rows) = (w.div_ceil(64), hgt.div_ceil(64));
+        let mut sb_min = vec![u64::MAX; sb_cols * sb_rows];
+        let mut c0 = self.rec[0].buf.clone();
+        for &lvl in &levels {
+            let filtered: &[u16] = if lvl == 0 {
+                &self.rec[0].buf
+            } else {
+                h.loop_filter_level = lvl;
+                c0.copy_from_slice(&self.rec[0].buf);
+                let mut planes = [(&mut c0[..], self.rec[0].stride, 0usize, 0usize)];
+                loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
+                &c0
+            };
+            for sr in 0..sb_rows {
+                let (y0, y1) = (sr * 64, ((sr + 1) * 64).min(hgt));
+                for sc in 0..sb_cols {
+                    let (x0, x1) = (sc * 64, ((sc + 1) * 64).min(w));
+                    let mut sse = 0u64;
+                    for y in y0..y1 {
+                        let row = y * stride;
+                        for x in x0..x1 {
+                            let d = src.buf[row + x] as i64 - filtered[row + x] as i64;
+                            sse += (d * d) as u64;
+                        }
+                    }
+                    let sb = sr * sb_cols + sc;
+                    sb_min[sb] = sb_min[sb].min(sse);
+                }
+            }
+        }
+        let ceiling: u64 = sb_min.iter().sum();
+        LFSEG_PROBE[0].fetch_add(global_sse, Relaxed);
+        LFSEG_PROBE[1].fetch_add(ceiling, Relaxed);
+        LFSEG_PROBE[2].fetch_add(1, Relaxed);
+    }
+
     fn apply_loop_filter(&mut self, h: &mut FrameHeader) {
         if self.disable_lf {
             h.loop_filter_level = 0;
             self.lf_level = 0;
             return;
         }
-        // Level 0 (no filter) is the baseline; coarse candidates cover the useful
-        // range (high levels rarely beat moderate ones for SSE).
+        // The level costs a fixed 6 header bits regardless of value, so a finer/wider search
+        // is a MONOTONIC recon-SSE improvement (same rate, lower distortion) — it can only
+        // help BD. Level 0 (no filter) is the baseline; a step-8 coarse sweep across the FULL
+        // 0..=63 range (the old search capped at 32 + step 8 missed the fine optimum and the
+        // heavy-filter regime low-bitrate frames want), then a ±4/±2/±1 descent to the exact
+        // per-frame optimum. `VP9_LF_COARSE` restores the old {8,16,24,32} search (A/B oracle).
         let mut best = (0u32, self.luma_sse_of(&self.rec[0].buf));
-        for &lvl in &[8u32, 16, 24, 32] {
-            h.loop_filter_level = lvl;
-            let mut c0 = self.rec[0].buf.clone();
-            let mut c1 = self.rec[1].buf.clone();
-            let mut c2 = self.rec[2].buf.clone();
-            let mut planes = [
-                (&mut c0[..], self.rec[0].stride, 0usize, 0usize),
-                (&mut c1[..], self.rec[1].stride, 1usize, 1usize),
-                (&mut c2[..], self.rec[2].stride, 1usize, 1usize),
-            ];
-            loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
-            let sse = self.luma_sse_of(&c0);
+        let mut c0 = self.rec[0].buf.clone();
+        let coarse: &[u32] = if std::env::var("VP9_LF_COARSE").is_ok() {
+            &[8, 16, 24, 32]
+        } else {
+            &[8, 16, 24, 32, 40, 48, 56, 63]
+        };
+        for &lvl in coarse {
+            let sse = self.lf_luma_sse(h, &mut c0, lvl);
             if sse < best.1 {
                 best = (lvl, sse);
             }
         }
+        if std::env::var("VP9_LF_COARSE").is_err() {
+            // Local descent around the coarse best (re-centres each step → bridges the
+            // step-8 gaps to the true minimum).
+            for step in [4u32, 2, 1] {
+                for cand in [best.0.saturating_sub(step), (best.0 + step).min(63)] {
+                    if cand == 0 || cand == best.0 {
+                        continue;
+                    }
+                    let sse = self.lf_luma_sse(h, &mut c0, cand);
+                    if sse < best.1 {
+                        best = (cand, sse);
+                    }
+                }
+            }
+        }
+        // (Sharpness search REMOVED: measured a proven no-op — sharpness=0 is always the
+        // SSE-optimal choice, since max deblocking minimises blocking error vs source and any
+        // sharpness>0 only reduces filtering ⇒ higher SSE. +0.00% BD on all clips, cost only.)
+        if self.lfseg_probe_on {
+            self.lfseg_probe(h, best.1);
+        }
+        // (Mode/ref + per-segment loop-filter DELTAS were tested and PRUNED — the per-SB
+        // oracle ceiling is only ~0.26–0.49% luma SSE, and an SSE-searched mode/ref-delta
+        // pass LOST BD on every clip (+0.35..+0.94%): the tiny luma gain doesn't cover the
+        // header signalling AND the luma-only search over-filters chroma. The global level
+        // search above already captures the loop-filter BD. See `lfseg_probe`.)
         h.loop_filter_level = best.0;
         self.lf_level = best.0;
         if best.0 > 0 {
@@ -3736,6 +6152,47 @@ impl FrameEncoder {
 }
 
 /// Decoder's `tile_offset`, mirrored: mi-col start of tile `idx`.
+/// Per-position basis energy `norm[r·bs+c] = norm_col[r]·norm_row[c] / 2^(2·shift)`
+/// for the size/type's separable inverse transform — the weights that turn a
+/// coefficient-domain error into a pixel-SSE estimate (the encoder's fast trellis
+/// distortion). Cached per (tx_size, tx_type); built once from the 1-D basis norms.
+fn basis_normsq(tx_size: usize, tx_type: TxType) -> std::rc::Rc<[f64; 1024]> {
+    thread_local! {
+        // 16 (tx_size × tx_type) combos — flat array, no hashing on the hot path.
+        static CACHE: std::cell::RefCell<[Option<std::rc::Rc<[f64; 1024]>>; 16]> =
+            const { std::cell::RefCell::new([const { None }; 16]) };
+    }
+    let key = tx_size * 4 + tx_type as usize;
+    if let Some(v) = CACHE.with(|c| c.borrow()[key].clone()) {
+        return v;
+    }
+    let bs = 4usize << tx_size;
+    let shift = match bs {
+        4 => 4,
+        8 => 5,
+        _ => 6,
+    };
+    // inverse_transform_add_rows: (row_adst, col_adst) per tx_type.
+    let (row_adst, col_adst) = match tx_type {
+        TxType::DctDct => (false, false),
+        TxType::AdstDct => (false, true),
+        TxType::DctAdst => (true, false),
+        TxType::AdstAdst => (true, true),
+    };
+    let norm_row = inv_basis_normsq_1d(bs, row_adst);
+    let norm_col = inv_basis_normsq_1d(bs, col_adst);
+    let scale = 1.0f64 / (1u64 << (2 * shift)) as f64;
+    let mut norm = [0.0f64; 1024];
+    for r in 0..bs {
+        for c in 0..bs {
+            norm[r * bs + c] = norm_col[r] * norm_row[c] * scale;
+        }
+    }
+    let rc = std::rc::Rc::new(norm);
+    CACHE.with(|cache| cache.borrow_mut()[key] = Some(rc.clone()));
+    rc
+}
+
 fn tile_offset_enc(idx: usize, mi_cols: usize, log2: u32) -> usize {
     let sb_cols = mi_cols.div_ceil(8);
     (((idx * sb_cols) >> log2) << 3).min(mi_cols)

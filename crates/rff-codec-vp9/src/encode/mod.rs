@@ -27,6 +27,8 @@ mod quantize;
 mod syntax;
 mod tokens;
 mod transform;
+mod varpart;
+mod varrd;
 
 pub(crate) use bitwriter::{BitWriter, BoolEncoder};
 pub(crate) use compressed::write_compressed_header;
