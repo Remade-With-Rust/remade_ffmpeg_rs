@@ -128,6 +128,9 @@ struct BlockSnap {
     x_mis: usize,
     y_mis: usize,
 }
+// (A thread-local rec-buffer POOL was tried to cut snap_block's alloc churn — WASH: SnapRestore
+// stayed ~33ms, so it's COPY-dominated (Rust's allocator already recycles same-size Vecs), not
+// alloc-dominated. The only lever is not copying the recon, which isn't byte-identical.)
 
 /// One reconstructed/source plane (coded size: `mi_*·8 >> ss`).
 #[derive(Clone)]
@@ -244,6 +247,17 @@ pub struct FrameEncoder {
     trellis_exact: bool,
     // Roof — per-block transform-size search (4×4 vs 8×8 for 8×8 luma blocks).
     use_tx_search: bool,
+    /// Content-adaptive tx-size search ORDER (`VP9_NO_TXORDER` disables): likely-best-first
+    /// so the abort prunes losers. Byte-identical; a speed lever only.
+    tx_order: bool,
+    /// tx-size search early-break factor (`VP9_TX_THRESH`, 0 = off, default): once a
+    /// later size's J exceeds the confident best by this factor, stop the search.
+    /// MEASURED NEGATIVE (2026-07-23): a content SIGN-FLIP, not a clean win — @1.15
+    /// akiyo/mobile gain (BD −0.47/−0.06%, +5/+2%) but foreman/bus REGRESS (BD +0.54/
+    /// +0.13%, and slower). The tx-size RD is already well-calibrated (tx_order + abort
+    /// + tx-cost charge); the marginal speed doesn't justify a per-content dispatch.
+    /// Kept env-gated as the documented A/B; default off ⇒ full search unchanged.
+    tx_thresh: f64,
     // When the full tx-size search is OFF (fast presets), the mode search + final
     // coding start from the block's MAX tx instead of 4×4. Falling back to 4×4 was
     // both a transform flood (RD trials transform the whole block at 4×4 for every
@@ -317,6 +331,10 @@ pub struct FrameEncoder {
     /// landed, so it's a speed-preset lever (speed ≥ 1), not the quality default.
     /// `VP9_DIAMOND_MSEARCH` forces diamond; `VP9_FULL_MSEARCH` forces exhaustive.
     full_msearch: bool,
+    /// x4-batched exhaustive integer search (`VP9_NO_MSEARCH_X4` disables → the
+    /// one-position-at-a-time scalar oracle). The x4 kernel scores four ref positions
+    /// from one source-tile load; byte-identical to four scalar SADs (A/B oracle).
+    msearch_x4: bool,
     /// `VP9_CORNER_SAD`: restore the corner-only (top-left 8×8) integer-search
     /// scoring — the oracle the full-block SAD was BD-rate-gated against.
     corner_sad: bool,
@@ -413,12 +431,16 @@ pub struct FrameEncoder {
     trellis_frozen: bool,
     /// libvpx-mirrored residual-MSE trellis gate threshold (0 = gate off).
     trellis_mse_t: f64,
-    /// Emit-dedup: the emit re-runs the winning skip-trial's exact
-    /// fwd+quantize+trellis pipeline on ~92% of tx blocks (measured). Cache the
-    /// trial outputs keyed by the RESIDUAL HASH — the pipeline is a pure
-    /// function of the residual (+ static params in the key), so a hash match
-    /// makes reuse byte-identical BY CONSTRUCTION (losing partition arms have
-    /// different residuals and simply miss). `VP9_NO_DEDUP` disables.
+    /// Emit-dedup (`VP9_DEDUP` opt-in, DEFAULT OFF): cache each skip-trial's
+    /// (levels, dqcoeff, eob) keyed by residual hash so the emit pass can reuse
+    /// them instead of re-running fwd+quantize+trellis. Reuse is byte-identical
+    /// (pure function of the residual). ★ MEASURED NET-NEGATIVE (2026-07-23):
+    /// the store runs in the DECISION pass (95% of encode) — an FNV hash over
+    /// the residual + a HashMap insert with TWO `to_vec()` heap allocs, PER tx
+    /// block PER trial (most for losing arms the emit never reuses) — to save the
+    /// EMIT pass (only ~4%). Disabling it is +2.2% (mobile s0) … +9.6% (akiyo s3),
+    /// byte-identical on every clip×speed. Paying the expensive pass to save the
+    /// cheap one; kept opt-in only as the A/B oracle.
     emit_dedup: bool,
     #[allow(clippy::type_complexity)]
     dedup_map: std::cell::RefCell<
@@ -543,6 +565,20 @@ pub struct FrameEncoder {
     chroma_rd: bool,
     /// Weight on the chroma SSE + bits in `rd_cost_yuv` (`VP9_CHROMA_RD_W`, default 1.0).
     chroma_rd_w: f64,
+    /// Luma-abort in `rd_cost_yuv` (`VP9_NO_YUV_ABORT` disables): skip the chroma trial
+    /// reconstruct once the luma-only J already loses. Byte-identical; A/B toggle.
+    yuv_abort: bool,
+    /// Model-RD shortlist ranking (`VP9_MODEL_RANK`, default OFF): rank by the Laplacian
+    /// model's estimated coded (dist, residual-rate) instead of raw pred_SSE. Tested: BD-neutral
+    /// but does NOT let K shrink (K=2 still loses ~1% — our exact reconstructs are load-bearing),
+    /// and the per-candidate model_rd cost makes it a MIXED speed wash (foreman +5%, mobile −3%).
+    /// Kept for experiments.
+    model_rank: bool,
+    /// Snapshot the RECON in `snap_block` (default ON; `VP9_NO_SNAP_RECON` skips). The recon
+    /// save/restore LOOKS redundant (trials overwrite, winner re-reconstructs) but SKIPPING IT
+    /// IS NOT BYTE-IDENTICAL (measured — all clips diverge), so some path reads the pre-trial
+    /// recon (a real dependency). Kept ON; skip only for experiments (would need BD-gating).
+    snap_recon: bool,
 }
 
 impl FrameEncoder {
@@ -763,6 +799,11 @@ impl FrameEncoder {
             // Roof — ON: BD-rate oracle scores it −18% (an 8×8 transform decorrelates
             // smooth residual far better than four 4×4s — fewer bits AND higher PSNR).
             use_tx_search: std::env::var("VP9_NO_TXSEARCH").is_err(),
+            tx_order: std::env::var("VP9_NO_TXORDER").is_err(),
+            tx_thresh: std::env::var("VP9_TX_THRESH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
             tx4x4: std::env::var("VP9_TX4X4").is_ok(),
             tx_cap: std::env::var("VP9_TXCAP")
                 .ok()
@@ -815,6 +856,7 @@ impl FrameEncoder {
                     }
                 }),
             full_msearch: std::env::var("VP9_DIAMOND_MSEARCH").is_err(),
+            msearch_x4: std::env::var("VP9_NO_MSEARCH_X4").is_err(),
             corner_sad: std::env::var("VP9_CORNER_SAD").is_ok(),
             // 48 == NEWMV_SAD_PENALTY is PROVABLY lossless (a searched MV pays SAD+48).
             // Default 64 is the aggressive child: harvest showed <=0.8% of NEWMV wins
@@ -875,7 +917,7 @@ impl FrameEncoder {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0),
-            emit_dedup: std::env::var("VP9_NO_DEDUP").is_err(),
+            emit_dedup: std::env::var("VP9_DEDUP").is_ok(),
             dedup_map: std::cell::RefCell::new(std::collections::HashMap::new()),
             subpel_rounds: std::env::var("VP9_SUBPEL_ROUNDS")
                 .ok()
@@ -937,6 +979,9 @@ impl FrameEncoder {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.35), // tuned optimum (BD-rate-swept @s3)
+            yuv_abort: std::env::var("VP9_NO_YUV_ABORT").is_err(),
+            snap_recon: std::env::var("VP9_NO_SNAP_RECON").is_err(),
+            model_rank: std::env::var("VP9_MODEL_RANK").is_ok(),
             has_avx2: {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -1303,6 +1348,7 @@ impl FrameEncoder {
         extra_bits: f64,
         best_so_far: f64,
     ) -> f64 {
+        let _s = prof::Scope::new(prof::S::RdCost);
         // Early abort: J accumulates monotonically over tx blocks (sse and bits
         // are non-negative integer sums; int→f64 and +/× by λ>0 are monotone),
         // so once the running J strictly exceeds the incumbent the candidate has
@@ -1342,19 +1388,31 @@ impl FrameEncoder {
         bwl: usize,
         bhl: usize,
         extra_bits: f64,
+        best_so_far: f64,
     ) -> f64 {
+        let _s = prof::Scope::new(prof::S::RdCost);
         let snap = self.snap_block(mi_row, mi_col, bwl, bhl);
-        let (mut y_bits, mut y_sse) = (0u64, 0u64);
+        // Luma first, then a bound check. Chroma only ADDS to J (SSE/bits ≥ 0), so once the
+        // luma-only J exceeds the incumbent this candidate has provably lost — the chroma
+        // trial reconstruct is pure waste. Abort: byte-identical decision (a winner has
+        // J ≤ best_so_far and never aborts, so the committed recon is unchanged), skips ~⅔
+        // of the trial planes for losers — the biggest chunk of rd_cost wrapper overhead.
+        let (y_bits, y_sse) = self.encode_plane(None, mi, 0, mi_row, mi_col, bsize, bwl, bhl);
+        let rate0 = if self.use_rdo {
+            self.lambda * (y_bits as f64 / 256.0 + extra_bits)
+        } else {
+            0.0
+        };
+        let j_luma = y_sse as f64 + rate0;
+        if self.yuv_abort && j_luma > best_so_far {
+            self.restore_block(mi_row, mi_col, bwl, bhl, &snap);
+            return j_luma;
+        }
         let (mut c_bits, mut c_sse) = (0u64, 0u64);
-        for plane in 0..3 {
+        for plane in 1..3 {
             let (b, s) = self.encode_plane(None, mi, plane, mi_row, mi_col, bsize, bwl, bhl);
-            if plane == 0 {
-                y_bits += b;
-                y_sse += s;
-            } else {
-                c_bits += b;
-                c_sse += s;
-            }
+            c_bits += b;
+            c_sse += s;
         }
         self.restore_block(mi_row, mi_col, bwl, bhl, &snap);
         // Chroma enters as a weighted tiebreaker (`chroma_rd_w`): full weight can tip a
@@ -1423,7 +1481,17 @@ impl FrameEncoder {
         let left = self.left_mi(mi_row, mi_col);
         let ctx = tx_size_context(mi, above.as_ref(), left.as_ref());
         let mut best = (0u8, f64::INFINITY);
-        for t in 0..=max_tx as u8 {
+        // Content-adaptive evaluation ORDER (byte-identical, `VP9_NO_TXORDER` restores
+        // ascending): try the LIKELY-BEST size first so rd_cost_y's monotone-J abort prunes
+        // the losers. A winner's running J never exceeds the incumbent ⇒ never aborts, so
+        // the min-J size always wins (ties broken toward the SMALLER tx either way). Small-MV
+        // / well-predicted blocks have smooth residual ⇒ favour the LARGE tx (descend);
+        // high-motion blocks favour SMALL (the default ascend). Same work either direction
+        // when nothing prunes; big prune when the first-tried size is the winner.
+        let descend =
+            self.tx_order && (mi.mv[0].0.abs() + mi.mv[0].1.abs()) <= 16 && mi.mode != NEWMV;
+        for i in 0..=max_tx as u8 {
+            let t = if descend { max_tx as u8 - i } else { i };
             let mut m = *mi;
             m.tx_size = t;
             let extra = if charge {
@@ -1432,8 +1500,13 @@ impl FrameEncoder {
                 0.0
             };
             let j = self.rd_cost_y(&m, mi_row, mi_col, bsize, bwl, bhl, snap, extra, best.1);
-            if j < best.1 {
+            if j < best.1 || (j == best.1 && t < best.0) {
                 best = (t, j);
+            } else if self.tx_thresh > 0.0 && best.1.is_finite() && j > best.1 * self.tx_thresh {
+                // Confidence early-break: with likely-best-first order, a size that
+                // loses to the incumbent by this factor means the remaining (further
+                // from the predicted best) sizes won't win — stop the search.
+                break;
             }
         }
         best.0
@@ -2265,15 +2338,23 @@ impl FrameEncoder {
 
     fn snap_block(&self, mi_row: usize, mi_col: usize, bwl: usize, bhl: usize) -> BlockSnap {
         let _s = prof::Scope::new(prof::S::SnapRestore);
-        let rec = std::array::from_fn(|p| {
-            let (x0, y0, bw, bh) = self.block_px(mi_row, mi_col, bwl, bhl, p);
-            let st = self.rec[p].stride;
-            let mut v = Vec::with_capacity(bw * bh);
-            for r in 0..bh {
-                v.extend_from_slice(&self.rec[p].buf[(y0 + r) * st + x0..(y0 + r) * st + x0 + bw]);
-            }
-            v
-        });
+        let rec = if self.snap_recon {
+            std::array::from_fn(|p| {
+                let (x0, y0, bw, bh) = self.block_px(mi_row, mi_col, bwl, bhl, p);
+                let st = self.rec[p].stride;
+                let mut v = Vec::with_capacity(bw * bh);
+                for r in 0..bh {
+                    v.extend_from_slice(
+                        &self.rec[p].buf[(y0 + r) * st + x0..(y0 + r) * st + x0 + bw],
+                    );
+                }
+                v
+            })
+        } else {
+            // Recon save/restore is redundant (every trial overwrites the block, winner is
+            // re-reconstructed) — snapshot only the entropy context below.
+            std::array::from_fn(|_| Vec::new())
+        };
         let x_mis = (1usize << (bwl - 1)).min(self.mi_cols - mi_col);
         let y_mis = (1usize << (bhl - 1)).min(self.mi_rows - mi_row);
         let mut mi = Vec::with_capacity(x_mis * y_mis);
@@ -2313,12 +2394,15 @@ impl FrameEncoder {
         s: &BlockSnap,
     ) {
         let _sc = prof::Scope::new(prof::S::SnapRestore);
-        for p in 0..3 {
-            let (x0, y0, bw, bh) = self.block_px(mi_row, mi_col, bwl, bhl, p);
-            let st = self.rec[p].stride;
-            for r in 0..bh {
-                let src = &s.rec[p][r * bw..r * bw + bw];
-                self.rec[p].buf[(y0 + r) * st + x0..(y0 + r) * st + x0 + bw].copy_from_slice(src);
+        if self.snap_recon {
+            for p in 0..3 {
+                let (x0, y0, bw, bh) = self.block_px(mi_row, mi_col, bwl, bhl, p);
+                let st = self.rec[p].stride;
+                for r in 0..bh {
+                    let src = &s.rec[p][r * bw..r * bw + bw];
+                    self.rec[p].buf[(y0 + r) * st + x0..(y0 + r) * st + x0 + bw]
+                        .copy_from_slice(src);
+                }
             }
         }
         for pl in 0..3 {
@@ -3228,6 +3312,7 @@ impl FrameEncoder {
         bhl: usize,
         keep_recon: bool,
     ) -> (ModeInfo, Mv, u64, u64) {
+        let _sdl = prof::Scope::new(prof::S::DecideLeaf);
         // --- motion + mode search over every available reference (LAST/GOLDEN/ALTREF).
         // Each ref gets its own `find_mv_refs` predictor + motion search, then RD over
         // ZEROMV/NEWMV; the cheapest (ref, mode) across all refs wins (J = SSE+λ·bits). ---
@@ -3330,7 +3415,20 @@ impl FrameEncoder {
                            mv,
                            sse: i64,
                            extra: f64| {
-                let js = sse as f64 + self.lambda * extra;
+                // Rank by the Laplacian model's estimated CODED (dist, residual-rate) rather
+                // than raw pred-SSE — pred-SSE omits the residual bits that vary per candidate,
+                // which is exactly why a pred-SSE shortlist needs a large K. Model ranking is
+                // meant to shrink K (fewer full reconstructs) at neutral BD.
+                let js = if self.model_rank {
+                    let (r, d) = varrd::model_rd(
+                        sse.max(0) as u64,
+                        (bwl + bhl + 4) as u32,
+                        self.dq_y.1 as i64,
+                    );
+                    d + self.lambda * (r + extra)
+                } else {
+                    sse as f64 + self.lambda * extra
+                };
                 *ref_min = ref_min.min(js);
                 // Maintain the K smallest J's seen so far (K ≤ 4 slots).
                 let mut v = js;
@@ -3394,6 +3492,10 @@ impl FrameEncoder {
         // Full-RD only the top-K candidates by skip-RD estimate (all when the
         // shortlist is off — the A/B oracle).
         cands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // (A content-adaptive shortlist BUMP — more full-RD candidates on high-residual
+        // blocks — was tested and PRUNED: a wash (akiyo −0.38% but foreman/mobile +0.06..0.10%).
+        // More candidates CAN lose because the locally-optimal mode it finds hurts downstream
+        // entropy adaptation — the mode λ is already well-calibrated, like the sigrate result.)
         let k = if self.mode_shortlist {
             self.shortlist_k.max(1)
         } else {
@@ -3416,7 +3518,7 @@ impl FrameEncoder {
             // but LOST the win (+0.21% vs −0.30%): the chroma tiebreak needs candidates
             // the luma-only break prunes. Full yuv per candidate is the keeper.
             let j = if self.chroma_rd {
-                self.rd_cost_yuv(&mi_c, mi_row, mi_col, bsize, bwl, bhl, extra)
+                self.rd_cost_yuv(&mi_c, mi_row, mi_col, bsize, bwl, bhl, extra, best_inter.0)
             } else {
                 self.rd_cost_y(
                     &mi_c, mi_row, mi_col, bsize, bwl, bhl, &snap, extra, best_inter.0,
@@ -3524,7 +3626,7 @@ impl FrameEncoder {
                         cmi.mv = [mv0, mv1];
                         let extra = 2.0 + mbits + mvbits; // comp_inter + comp_ref ≈ 2
                         let j = if self.chroma_rd {
-                            self.rd_cost_yuv(&cmi, mi_row, mi_col, bsize, bwl, bhl, extra)
+                            self.rd_cost_yuv(&cmi, mi_row, mi_col, bsize, bwl, bhl, extra, compound_j)
                         } else {
                             self.rd_cost_y(
                                 &cmi, mi_row, mi_col, bsize, bwl, bhl, &snap, extra, compound_j,
@@ -3600,7 +3702,10 @@ impl FrameEncoder {
             if self.chroma_rd {
                 intra_mi.mode = best_intra.0;
                 intra_mi.uv_mode = self.best_intra_mode(mi_row, mi_col, 1, bwl, bhl);
-                best_intra.1 = self.rd_cost_yuv(&intra_mi, mi_row, mi_col, bsize, bwl, bhl, 8.0);
+                // No abort here — this final re-cost needs the accurate full-YUV J for the
+                // intra-vs-inter compare, and it runs once per block (negligible cost).
+                best_intra.1 =
+                    self.rd_cost_yuv(&intra_mi, mi_row, mi_col, bsize, bwl, bhl, 8.0, f64::INFINITY);
             }
         }
 
@@ -4072,21 +4177,63 @@ impl FrameEncoder {
         let mut best_sad = i64::MAX;
         {
             let _s = prof::Scope::new(prof::S::IntSearch);
+            // Full-block interior test (all scored tiles read the reference without
+            // clamping) — the precondition for the x4 SIMD batch. Hoisted so BOTH the
+            // exhaustive and the diamond integer search share it.
+            let rp0 = self.aref(0);
+            let (msw_px, msh_px) = ((1i32 << swl) * 4, (1i32 << shl) * 4);
+            let interior = |r: i32, c: i32| -> bool {
+                base_x as i32 + c >= 0
+                    && base_y as i32 + r >= 0
+                    && base_x as i32 + c + msw_px <= rp0.w as i32
+                    && base_y as i32 + r + msh_px <= rp0.h as i32
+            };
             if self.full_msearch {
                 // Reference exhaustive search (±8 around zero + predictor) — the
                 // oracle the diamond search is BD-rate-gated against (`VP9_FULL_MSEARCH`).
+                // Interior runs of 4 go through the x4 SIMD batch (one source-tile load
+                // scored against four ref positions) — byte-identical to four scalar
+                // `block_sad_sized` calls but ~2-4× fewer tile loads; the exhaustive
+                // path used to score one scalar position at a time. Edge tiles (where a
+                // candidate overhangs the frame) fall back to the clamping scalar SAD.
                 for &(cr, cc) in &centers {
                     for dr in -RANGE..=RANGE {
-                        for dc in -RANGE..=RANGE {
-                            let (r, c) = (cr + dr, cc + dc);
-                            let sad = self.block_sad_sized(
-                                base_x, base_y, r, c, swl, shl, best_sad, ref8,
-                            );
+                        let r = cr + dr;
+                        let mut dc = -RANGE;
+                        while dc <= RANGE {
+                            #[cfg(target_arch = "x86_64")]
+                            if self.msearch_x4 && dc + 3 <= RANGE {
+                                if let Some(r8) = ref8 {
+                                    let cands: [(i32, i32); 4] =
+                                        std::array::from_fn(|k| (r, cc + dc + k as i32));
+                                    if cands.iter().all(|&(rr, cc2)| interior(rr, cc2)) {
+                                        let sads = self.block_sad_sized_x4(
+                                            base_x, base_y, cands, swl, shl, best_sad, r8,
+                                        );
+                                        for k in 0..4 {
+                                            let (rr, cc2) = cands[k];
+                                            let sad = sads[k];
+                                            let shorter = rr.abs() + cc2.abs()
+                                                < best_px.0.abs() + best_px.1.abs();
+                                            if sad < best_sad || (sad == best_sad && shorter) {
+                                                best_sad = sad;
+                                                best_px = (rr, cc2);
+                                            }
+                                        }
+                                        dc += 4;
+                                        continue;
+                                    }
+                                }
+                            }
+                            let c = cc + dc;
+                            let sad =
+                                self.block_sad_sized(base_x, base_y, r, c, swl, shl, best_sad, ref8);
                             let shorter = r.abs() + c.abs() < best_px.0.abs() + best_px.1.abs();
                             if sad < best_sad || (sad == best_sad && shorter) {
                                 best_sad = sad;
                                 best_px = (r, c);
                             }
+                            dc += 1;
                         }
                     }
                 }
@@ -4113,16 +4260,7 @@ impl FrameEncoder {
                 if centers[1] != (0, 0) {
                     consider(&mut best_sad, &mut best_px, centers[1].0, centers[1].1);
                 }
-                // Full-block interior test for a candidate (all scored tiles then
-                // read the reference without clamping) — the x4 batch precondition.
-                let rp0 = self.aref(0);
-                let (w_px, h_px) = ((1i32 << swl) * 4, (1i32 << shl) * 4);
-                let interior = |r: i32, c: i32| -> bool {
-                    base_x as i32 + c >= 0
-                        && base_y as i32 + r >= 0
-                        && base_x as i32 + c + w_px <= rp0.w as i32
-                        && base_y as i32 + r + h_px <= rp0.h as i32
-                };
+                // (`interior` + `rp0` are hoisted above the full_msearch/diamond split.)
                 let mut step = 8i32;
                 while step >= 1 {
                     // Cap re-centerings per radius so the worst case stays bounded.
@@ -4515,6 +4653,7 @@ impl FrameEncoder {
         bhl: usize,
         bound: f64,
     ) -> i64 {
+        let _s = prof::Scope::new(prof::S::PredSse);
         let base_x = mi_col * 8;
         let base_y = mi_row * 8;
         let (w, h) = ((1usize << bwl) * 4, (1usize << bhl) * 4);

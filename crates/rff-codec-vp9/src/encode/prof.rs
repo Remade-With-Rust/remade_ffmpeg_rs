@@ -32,6 +32,11 @@ pub enum S {
     SnapRestore,  // GLUE: entropy-context snapshot/restore around RD trials
     CtxUpdate,    // GLUE: entropy-context maintenance (set_ctx, partition ctx)
     MvRefs,       // GLUE: MV reference prediction (find_mv_refs, NEAREST/NEAR)
+    PredSse,      // shortlist prediction+SSE scoring (pred_sse — inline interp, own leaf)
+    // --- INFO stages (NOT in TOPLEVEL; inclusive totals for decomposing orchestration).
+    // self-time = the stage's total minus its scoped kernel children (computed by hand).
+    RdCost,       // INFO: rd_cost_yuv + rd_cost_y (per-candidate RD; nests encode_plane kernels)
+    DecideLeaf,   // INFO: decide_inter (whole leaf mode decision; nests motion/pred_sse/rd_cost)
     Count,
 }
 
@@ -53,13 +58,17 @@ const NAMES: [&str; N] = [
     "snap_restore",
     "ctx_update",
     "mv_refs",
+    "pred_sse",
+    "[i]rd_cost",
+    "[i]decide_leaf",
 ];
 
 // The disjoint, non-nested top-level stages (so glue = TOTAL − Σ these). Excludes
 // the nested motion children (int/subpel/interp) and TOTAL itself.
-const TOPLEVEL: [S; 12] = [
+const TOPLEVEL: [S; 13] = [
     S::MotionSearch, S::Mc, S::FwdTx, S::Quantize, S::CoefCost, S::Trellis,
     S::InvTxRecon, S::IntraPred, S::Sub8x8, S::SnapRestore, S::CtxUpdate, S::MvRefs,
+    S::PredSse,
 ];
 
 static CYC: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
