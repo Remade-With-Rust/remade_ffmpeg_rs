@@ -121,8 +121,8 @@ rff-auth = { path = "crates/rff-auth", version = "0.0.1" }
 # 100% safe Rust (no FFI/unsafe in our tree). Pinned to the toolkit's
 # `fix/no-asm-avx2-cpufeature` branch commit (a no-asm build fix — the asm-only
 # `CpuFeatureLevel` had no `AVX2` variant); re-pin to a main SHA once it merges.
-rusty_av1e = { git = "https://github.com/Remade-With-Rust/rusty-av1-toolkit", rev = "517d4ecb7a7a54cba5a972587ebf4e953e2e695b", package = "rav1e", default-features = false }
-rusty_av1d = { git = "https://github.com/Remade-With-Rust/rusty-av1-toolkit", rev = "517d4ecb7a7a54cba5a972587ebf4e953e2e695b", package = "rav1d", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+rusty_av1e = { git = "https://github.com/Remade-With-Rust/rusty-av1-toolkit", rev = "b471be0a8da4ee8b90017514bf11735fbacd5bfe", package = "rav1e", default-features = false }
+rusty_av1d = { git = "https://github.com/Remade-With-Rust/rusty-av1-toolkit", rev = "b471be0a8da4ee8b90017514bf11735fbacd5bfe", package = "rav1d", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 # png: pure-Rust PNG codec (MIT/Apache-2.0), DEFLATE via miniz_oxide/fdeflate.
 png = "0.17"
 # jpeg: pure-Rust JPEG decode (MIT/Apache) + encode (MIT/Apache AND IJG).
