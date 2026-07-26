@@ -424,6 +424,8 @@ pub struct FrameEncoder {
     split_early: bool,
     /// Speed >= 3: stop shortlist trials once J_skip > best_J × this (0 = off).
     mode_thresh_mult: f64,
+    /// Predict the loop-filter level from q instead of searching (`VP9_LF_FROM_Q`).
+    lf_from_q: bool,
     /// Speed >= 3: 64×64 G1 partition-gate threshold in none_rd/λ units (0 = off).
     g1_64: f64,
     /// DP-lite: frozen-context pricing for interior magnitude lowerings
@@ -579,6 +581,20 @@ pub struct FrameEncoder {
     /// IS NOT BYTE-IDENTICAL (measured — all clips diverge), so some path reads the pre-trial
     /// recon (a real dependency). Kept ON; skip only for experiments (would need BD-gating).
     snap_recon: bool,
+}
+
+/// Read an `f64` tuning knob from the environment.
+///
+/// `set_speed` runs AFTER `new()`, so a preset assigning a knob directly would
+/// silently overwrite whatever the environment asked for — which is exactly what
+/// happened to `VP9_MODE_THRESH`, `VP9_G1_64`, `VP9_INTRA_GATE_T` and
+/// `VP9_SUBPEL_TREE`: all four were read in `new()` and then clobbered by the
+/// speed-3 block, so every sweep of them measured an unchanged encoder (verified:
+/// four different `VP9_MODE_THRESH` values produced one identical bitstream).
+/// Presets must therefore use `env_f64(..).unwrap_or(default)`, never a bare
+/// assignment, or the knob is not sweepable at that tier.
+fn env_f64(key: &str) -> Option<f64> {
+    std::env::var(key).ok().and_then(|v| v.parse().ok())
 }
 
 impl FrameEncoder {
@@ -788,6 +804,7 @@ impl FrameEncoder {
                 .unwrap_or(1.0),
             // 2.5 = the content-adaptive sweet spot (mean −4.19% BD, all clips win, 32/32
             // conformant); k≈4 over-trims and can desync at extreme λ, so it's capped here.
+            lf_from_q: std::env::var("VP9_LF_FROM_Q").is_ok(),
             trellis_k: std::env::var("VP9_TRELLIS_K")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -1166,6 +1183,20 @@ impl FrameEncoder {
             // speed-first trade; `VP9_SUBPEL_WALK` restores the iterating diamond.
             self.subpel_diag = std::env::var("VP9_SUBPEL_WALK").is_err();
         }
+        if speed >= 4 {
+            // Loop-filter level from a closed form instead of the 14-evaluation
+            // search — libvpx makes the same call (LPF_PICK_FROM_Q at faster
+            // cpu-used). GATED on a real BD run over 4 clips x 4 CRFs x 20
+            // frames: **+0.155% BD-rate mean** (akiyo +0.125, foreman -0.118,
+            // bus +0.421, mobile +0.190) for **+4.7% mean encode speed**
+            // (+9.1% foreman, +6.4% akiyo, +1.7% bus, +1.6% mobile).
+            //
+            // Deliberately NOT default at the quality tiers: our BD gap to
+            // libvpx is the scarce resource there, so trading 0.155% BD for
+            // ~5% speed only pays where speed is the objective. `VP9_LF_FROM_Q`
+            // forces it on at any tier; `VP9_LF_SEARCH` forces the search.
+            self.lf_from_q = std::env::var("VP9_LF_SEARCH").is_err();
+        }
         if speed >= 3 {
             // Rebuilt from libvpx's cpu3-4 speed-features (the old rung dropped
             // the trellis: +14% size for ~5% speed — broken, removed). Screened
@@ -1173,10 +1204,18 @@ impl FrameEncoder {
             // +18% BD — the partition gate prunes where split matters); the
             // ladder leans on the mild ones instead.
             self.split_early = true; // abort losing SPLIT recursions early (~free)
-            self.mode_thresh_mult = 1.25; // adaptive mode-skip on the shortlist
-            self.g1_64 = 900.0; // gate 64×64 SPLIT on very-easy blocks
+            self.mode_thresh_mult = env_f64("VP9_MODE_THRESH").unwrap_or(1.25);
+            // 450, not 900: the first real BD sweep of this knob (it was NOT
+            // sweepable before the env-clobber fix below — every prior sweep
+            // measured an unchanged encoder). 50 frames x 4 clips x 4 CRFs,
+            // anchor = gate off:
+            //   450 -> +0.242% BD, +7.3% speed
+            //   900 -> +0.784% BD, +7.7% speed   (the old guess)
+            // 450 is better on EVERY clip (akiyo +0.76 vs +1.66, foreman +0.12
+            // vs +1.45), i.e. -0.54% BD for -0.4% speed — not a sign-flip trade.
+            self.g1_64 = env_f64("VP9_G1_64").unwrap_or(450.0);
             self.subpel_tree = true; // skip ¼-ring when ½-ring didn't move
-            self.intra_gate_t = 2000.0; // rarer intra alternatives
+            self.intra_gate_t = env_f64("VP9_INTRA_GATE_T").unwrap_or(2000.0);
             // Lever 1 (a MILD fixed-percentile dispatch at this default tier) was
             // tried and REVERTED: BD-rate refuted it. A single-CRF PSNR looked ~free
             // (mobile −0.03 dB), but over the full RD ladder it cost +2.29% mean
@@ -6237,6 +6276,34 @@ impl FrameEncoder {
         // 0..=63 range (the old search capped at 32 + step 8 missed the fine optimum and the
         // heavy-filter regime low-bitrate frames want), then a ±4/±2/±1 descent to the exact
         // per-frame optimum. `VP9_LF_COARSE` restores the old {8,16,24,32} search (A/B oracle).
+        // FAST PATH (`VP9_LF_FROM_Q=1`): predict the level from the AC quantizer
+        // instead of searching, à la libvpx's LPF_PICK_FROM_Q. The constants are
+        // OUR OWN least-squares refit (libvpx's were fitted to libvpx's encoder),
+        // harvested over 1440 frames × 4 clips × 3 QPs:
+        //   KEY   level = 0.11137·q + 1.068   (MAE 1.51, R² 0.994)
+        //   INTER level = 0.06849·q + 6.956   (MAE 4.17, R² 0.845)
+        // Fixed-point at 2^18 to keep the encoder integer-only.
+        if self.lf_from_q {
+            let q = crate::quant::ac_quant(h.base_q_idx as i32, 8);
+            let lvl = if h.key_frame || h.intra_only {
+                (q * 29193 + 279970 + (1 << 17)) >> 18
+            } else {
+                (q * 17952 + 1823274 + (1 << 17)) >> 18
+            }
+            .clamp(0, 63) as u32;
+            h.loop_filter_level = lvl;
+            self.lf_level = lvl;
+            if lvl > 0 {
+                let [p0, p1, p2] = &mut self.rec;
+                let mut planes = [
+                    (&mut p0.buf[..], p0.stride, p0.ss_x, p0.ss_y),
+                    (&mut p1.buf[..], p1.stride, p1.ss_x, p1.ss_y),
+                    (&mut p2.buf[..], p2.stride, p2.ss_x, p2.ss_y),
+                ];
+                loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
+            }
+            return;
+        }
         let mut best = (0u32, self.luma_sse_of(&self.rec[0].buf));
         let mut c0 = self.rec[0].buf.clone();
         let coarse: &[u32] = if std::env::var("VP9_LF_COARSE").is_ok() {
@@ -6276,6 +6343,26 @@ impl FrameEncoder {
         // pass LOST BD on every clip (+0.35..+0.94%): the tiny luma gain doesn't cover the
         // header signalling AND the luma-only search over-filters chroma. The global level
         // search above already captures the loop-filter BD. See `lfseg_probe`.)
+        // HARVEST TAP (observe-only, `VP9_LFHARVEST=1`): the searched optimum
+        // alongside the features a predictor could use. Feeds the offline
+        // question "can a formula replace this 14-evaluation search?".
+        if std::env::var_os("VP9_LFHARVEST").is_some() {
+            let q = crate::quant::ac_quant(h.base_q_idx as i32, 8);
+            let key = h.key_frame || h.intra_only;
+            // libvpx's LPF_PICK_FROM_Q closed form, for comparison.
+            let guess = if key {
+                ((q * 17563 - 421574) + (1 << 17)) >> 18
+            } else {
+                ((q * 20723 + 1015158) + (1 << 17)) >> 18
+            }
+            .clamp(0, 63);
+            let sse_guess = self.lf_luma_sse(h, &mut c0, guess as u32);
+            eprintln!(
+                "LFHARVEST	q={}	qidx={}	key={}	best={}	sse_best={}	guess={}	sse_guess={}	sse_lvl0={}",
+                q, h.base_q_idx, key as u8, best.0, best.1, guess, sse_guess,
+                self.luma_sse_of(&self.rec[0].buf)
+            );
+        }
         h.loop_filter_level = best.0;
         self.lf_level = best.0;
         if best.0 > 0 {
