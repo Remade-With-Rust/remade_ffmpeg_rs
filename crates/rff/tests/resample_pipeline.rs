@@ -71,6 +71,7 @@ fn wav_44100_resamples_to_opus_48000() {
             filter_complex: None,
             maps: Vec::new(),
             overwrite: true,
+            max_video_frames: None,
         }],
     };
     let report = rff::transcode::run(&engine, &spec).expect("resample transcode");

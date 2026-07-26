@@ -91,6 +91,12 @@ pub struct OutputSpec {
     pub maps: Vec<MapSpec>,
     /// Overwrite the output if it exists (`-y`); otherwise fail (`-n`).
     pub overwrite: bool,
+    /// Stop after this many VIDEO frames (`-frames:v N`). `None` = whole input.
+    ///
+    /// This is a measurement-critical option: without it a harness that thinks
+    /// it is encoding a 50-frame prefix silently encodes the whole clip, and any
+    /// rate-vs-quality pairing computed against a prefix is then wrong.
+    pub max_video_frames: Option<u64>,
 }
 
 /// A complete, declarative transcoding job.
@@ -127,6 +133,9 @@ enum StreamOp {
         /// Lazily built once the first audio frame reveals the input rate.
         resampler: Option<Resampler>,
         out_index: usize,
+        /// `-frames:v` limit for this output, and how many we have sent.
+        max_video_frames: Option<u64>,
+        video_frames_sent: u64,
     },
 }
 
@@ -482,6 +491,8 @@ fn build_op(
                     target_rate,
                     resampler: None,
                     out_index,
+                    max_video_frames: output.max_video_frames,
+                    video_frames_sent: 0,
                 },
                 os,
             ))
@@ -581,12 +592,22 @@ fn process_packet(
             target_rate,
             resampler,
             out_index,
+            max_video_frames,
+            video_frames_sent,
         } => {
             decoder.send_packet(&packet)?;
             loop {
                 match decoder.receive_frame() {
                     Ok(frame) => {
                         report.frames_decoded += 1;
+                        if let Some(limit) = *max_video_frames {
+                            if matches!(frame, Frame::Video(_)) {
+                                if *video_frames_sent >= limit {
+                                    break;
+                                }
+                                *video_frames_sent += 1;
+                            }
+                        }
                         let frame = apply_filters(filters, frame)?;
                         let frame = apply_overlay(overlay, frame)?;
                         let frame = conform_audio(resampler, *target_rate, frame)?;
@@ -618,6 +639,8 @@ fn flush_streams(
             target_rate,
             resampler,
             out_index,
+            max_video_frames,
+            video_frames_sent,
         } = op
         else {
             continue;
@@ -628,6 +651,16 @@ fn flush_streams(
             match decoder.receive_frame() {
                 Ok(frame) => {
                     report.frames_decoded += 1;
+                    // Honour `-frames:v` on the flush path too, or the tail of a
+                    // truncated encode would leak past the requested count.
+                    if let Some(limit) = *max_video_frames {
+                        if matches!(frame, Frame::Video(_)) {
+                            if *video_frames_sent >= limit {
+                                break;
+                            }
+                            *video_frames_sent += 1;
+                        }
+                    }
                     let frame = apply_filters(filters, frame)?;
                     let frame = apply_overlay(overlay, frame)?;
                     let frame = conform_audio(resampler, *target_rate, frame)?;

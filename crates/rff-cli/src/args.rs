@@ -71,6 +71,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut audio_codec: Option<CodecId> = None;
     let mut video_opts = Dictionary::new();
     let mut audio_opts = Dictionary::new();
+    let mut max_video_frames: Option<u64> = None;
     let mut video_filters: Option<String> = None;
     let mut filter_complex: Option<String> = None;
     let mut maps: Vec<MapSpec> = Vec::new();
@@ -198,8 +199,19 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             // Rate control / tuning (video by default; `:a` targets audio):
             // -crf / -qp / -q / -qscale (quality), -preset (speed<->quality), -pass (1|2),
             // -cpu-used / -speed (VP9 speed preset 0 best..4 fastest).
+            // `-frames:v N` / `-frames N` — stop after N video frames. Needed for
+            // any rate-vs-quality measurement over a clip prefix: without it a
+            // harness silently encodes the whole input while scoring a prefix.
+            "frames" | "vframes" => {
+                let value = take_value(args, &mut i, arg)?;
+                match value.parse::<u64>() {
+                    Ok(n) => max_video_frames = Some(n),
+                    Err(_) => warnings.push(format!("ignoring non-numeric -{arg} {value}")),
+                }
+            }
+
             "crf" | "qp" | "preset" | "pass" | "q" | "qscale" | "cpu-used" | "speed"
-            | "lag" | "lag-in-frames" | "arnr-strength" => {
+            | "lag" | "lag-in-frames" | "arnr-strength" | "dispatch-budget" => {
                 let value = take_value(args, &mut i, arg)?;
                 if base == "pass" && value != "1" {
                     warnings
@@ -269,6 +281,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         }),
         video_filters,
         filter_complex,
+        max_video_frames,
         maps,
         overwrite,
     });

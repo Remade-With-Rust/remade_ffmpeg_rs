@@ -60,6 +60,7 @@ fn transcode_flac(engine: &Engine, input: &Path, output: &Path) {
             filter_complex: None,
             maps: Vec::new(),
             overwrite: true,
+            max_video_frames: None,
         }],
     };
     rff::transcode::run(engine, &spec).expect("transcode");

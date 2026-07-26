@@ -1186,10 +1186,14 @@ impl FrameEncoder {
         if speed >= 4 {
             // Loop-filter level from a closed form instead of the 14-evaluation
             // search — libvpx makes the same call (LPF_PICK_FROM_Q at faster
-            // cpu-used). GATED on a real BD run over 4 clips x 4 CRFs x 20
-            // frames: **+0.155% BD-rate mean** (akiyo +0.125, foreman -0.118,
-            // bus +0.421, mobile +0.190) for **+4.7% mean encode speed**
-            // (+9.1% foreman, +6.4% akiyo, +1.7% bus, +1.6% mobile).
+            // cpu-used). GATED on a real BD run, 4 clips x 4 CRFs x 50 frames,
+            // with rate and quality measured over the SAME frames:
+            //   akiyo +0.178%  foreman +0.008%  bus +0.002%  mobile +0.381%
+            //   MEAN  +0.142% BD  for ~+4.7% mean encode speed
+            // (An earlier run read +0.155% before `-frames:v` existed and the
+            // harness was pairing 120-frame rate with 50-frame PSNR; the
+            // corrected number is essentially the same, but the old one was not
+            // measuring what it claimed.)
             //
             // Deliberately NOT default at the quality tiers: our BD gap to
             // libvpx is the scarce resource there, so trading 0.155% BD for
@@ -1207,12 +1211,12 @@ impl FrameEncoder {
             self.mode_thresh_mult = env_f64("VP9_MODE_THRESH").unwrap_or(1.25);
             // 450, not 900: the first real BD sweep of this knob (it was NOT
             // sweepable before the env-clobber fix below — every prior sweep
-            // measured an unchanged encoder). 50 frames x 4 clips x 4 CRFs,
-            // anchor = gate off:
-            //   450 -> +0.242% BD, +7.3% speed
-            //   900 -> +0.784% BD, +7.7% speed   (the old guess)
-            // 450 is better on EVERY clip (akiyo +0.76 vs +1.66, foreman +0.12
-            // vs +1.45), i.e. -0.54% BD for -0.4% speed — not a sign-flip trade.
+            // measured an unchanged encoder). Verified head-to-head over whole
+            // clips with rate AND quality measured on the same frames:
+            //   akiyo -0.769%  foreman -1.500%  bus +0.045%  mobile +0.000%
+            //   MEAN  -0.556% BD  for ~-0.4% speed
+            // Better or neutral on every clip — not a sign-flip trade. The old
+            // 900 was a never-swept guess costing ~0.56% BD for nothing.
             self.g1_64 = env_f64("VP9_G1_64").unwrap_or(450.0);
             self.subpel_tree = true; // skip ¼-ring when ½-ring didn't move
             self.intra_gate_t = env_f64("VP9_INTRA_GATE_T").unwrap_or(2000.0);

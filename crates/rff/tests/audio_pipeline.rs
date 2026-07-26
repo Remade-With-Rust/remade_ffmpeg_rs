@@ -93,6 +93,7 @@ fn wav_transcode_preserves_pcm() {
             filter_complex: None,
             maps: Vec::new(),
             overwrite: true,
+            max_video_frames: None,
         }],
     };
     let report = rff::transcode::run(&engine, &spec).expect("audio transcode");

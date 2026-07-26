@@ -106,6 +106,7 @@ fn av_spec(inputs: Vec<PathBuf>, out: &Path) -> TranscodeSpec {
             filter_complex: None,
             maps: Vec::new(),
             overwrite: true,
+            max_video_frames: None,
         }],
     }
 }

@@ -115,6 +115,7 @@ fn drive_loop_transcodes_avif_to_avif() {
             filter_complex: None,
             maps: Vec::new(),
             overwrite: true,
+            max_video_frames: None,
         }],
     };
 
@@ -161,6 +162,7 @@ fn drive_loop_copies_stream_without_reencode() {
             filter_complex: None,
             maps: Vec::new(),
             overwrite: true,
+            max_video_frames: None,
         }],
     };
 
@@ -209,6 +211,7 @@ fn drive_loop_applies_scale_filter() {
             filter_complex: None,
             maps: Vec::new(),
             overwrite: true,
+            max_video_frames: None,
         }],
     };
 

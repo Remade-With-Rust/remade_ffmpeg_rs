@@ -74,6 +74,7 @@ fn transcode(engine: &Engine, input: &Path, output: &Path, codec: CodecId, vf: &
             filter_complex: None,
             maps: Vec::new(),
             overwrite: true,
+            max_video_frames: None,
         }],
     };
     rff::transcode::run(engine, &spec).expect("transcode");
