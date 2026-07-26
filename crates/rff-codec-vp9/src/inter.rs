@@ -132,6 +132,13 @@ impl RefPlane<'_> {
     }
 }
 
+/// A/B switch for the clamped-tile edge path (DEFAULT ON; set to disable).
+#[cfg(target_arch = "x86_64")]
+fn no_edge_tile() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("VP9_NO_MC_EDGE_TILE").is_ok())
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn has_avx2() -> bool {
@@ -1504,6 +1511,48 @@ pub fn predict_block(
             }
             return;
         }
+        // EDGE BLOCKS: gather a clamped tile, then run the SAME fast kernel on
+        // it. The scalar clamping convolve below is 3-12x slower than the AVX2
+        // path (8x8 xy: 2277 vs 188 cyc/call), and although only ~10-14% of
+        // blocks are edge blocks, that made them ~46% of all inter-prediction
+        // time. Replicating the edge pixels into a small local tile costs
+        // (w+7)*(h+7) copies and lets the vector kernel run instead.
+        //
+        // Bit-identical by construction: the tile holds exactly `refp.px()` for
+        // every position the kernel can touch, which is what the scalar path
+        // reads. `refp.px` clamps to the last row/column, so this is edge
+        // replication, not zero-fill.
+        if has_avx2() && w <= 64 && h <= 64 && !no_edge_tile() {
+            const TS: usize = 72; // 64 + 7, rounded up
+            thread_local! {
+                static TILE: std::cell::RefCell<[u16; TS * TS]> =
+                    const { std::cell::RefCell::new([0; TS * TS]) };
+            }
+            let (tw, th) = (w + 7, h + 7);
+            return TILE.with(|cell| {
+                let mut tile = cell.borrow_mut();
+                for ty in 0..th {
+                    let sy = by - 3 + ty as i32;
+                    let row = ty * TS;
+                    for tx in 0..tw {
+                        tile[row + tx] = refp.px(bx - 3 + tx as i32, sy) as u16;
+                    }
+                }
+                let tref = RefPlane {
+                    buf: &tile[..],
+                    stride: TS,
+                    w: tw as i32,
+                    h: th as i32,
+                };
+                // SAFETY: AVX2 confirmed; the block sits at (3,3) in a tile that
+                // extends 3 left/up and 4 right/down, so every tap is in bounds.
+                unsafe {
+                    predict_block_avx2(
+                        &tref, 3, 3, fx, fy, subx, suby, dst, dst_stride, w, h, max, avg,
+                    );
+                }
+            });
+        }
     }
 
     // NEON fast path (aarch64): same interior-block / single-ref condition.
@@ -2308,6 +2357,82 @@ mod tests {
                     "compound mismatch: subpel ({sx},{sy}), w={w}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mc_microbench {
+    //! In-process microbenchmark for inter prediction — the same instrument
+    //! discipline as `transform::tx_microbench`, for the same reason: the decode
+    //! stage wall carries ±7..14% noise here, far more than most MC bricks.
+    //!
+    //!   cargo test -p rff-codec-vp9 --release mc_microbench -- --ignored --nocapture
+    use super::*;
+
+    fn rdtsc() -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `_rdtsc` has no operands and no side effects.
+        unsafe {
+            std::arch::x86_64::_rdtsc()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        0
+    }
+
+    /// Times `predict_block` alone, with every parameter hoisted out of the
+    /// timed region — so this is the KERNEL cost, excluding `mc_one`'s per-call
+    /// setup (Arc clone, RefPlane build, MV clamp, scaled check).
+    fn bench(w: usize, h: usize, subx: usize, suby: usize, interior: bool) -> f64 {
+        let (rw, rh) = (352usize, 288usize);
+        let stride = 448usize;
+        let mut src = vec![0u16; stride * (rh + 80)];
+        let mut st = 0x1234_5678_9ABC_DEF0u64;
+        for p in src.iter_mut() {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            *p = (st % 256) as u16;
+        }
+        let refp = RefPlane {
+            buf: &src,
+            stride,
+            w: rw as i32,
+            h: rh as i32,
+        };
+        let mut dst = vec![128u16; stride * (h + 8)];
+        // `interior` picks a position where the AVX2 in-bounds test passes;
+        // otherwise a left-edge position that forces the scalar clamp path.
+        let (bx, by) = if interior { (40i32, 40i32) } else { (0i32, 0i32) };
+        let iters = 2000usize;
+        let mut best = f64::MAX;
+        for _ in 0..9 {
+            let t0 = rdtsc();
+            for _ in 0..iters {
+                predict_block(
+                    &refp, bx, by, subx, suby, 0, &mut dst, stride, w, h, false, 255,
+                );
+            }
+            best = best.min((rdtsc() - t0) as f64 / iters as f64);
+        }
+        best
+    }
+
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn profile_predict_block() {
+        let _ = bench(8, 8, 4, 4, true); // warm up
+        println!("\npredict_block — best-of-9, cycles/call");
+        println!("  {:<10} {:>10} {:>10} {:>10} {:>12}", "size", "full-pel", "x-only", "xy", "xy(edge)");
+        for (w, h) in [(4usize, 4usize), (4, 8), (8, 8), (8, 16), (16, 16), (32, 32), (64, 64)] {
+            println!(
+                "  {:<10} {:>10.1} {:>10.1} {:>10.1} {:>12.1}",
+                format!("{w}x{h}"),
+                bench(w, h, 0, 0, true),
+                bench(w, h, 4, 0, true),
+                bench(w, h, 4, 4, true),
+                bench(w, h, 4, 4, false),
+            );
         }
     }
 }

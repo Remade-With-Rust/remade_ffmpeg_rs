@@ -24,6 +24,9 @@ mod inter;
 mod loopfilter;
 mod mv;
 mod predict;
+/// Function-level decode profiler (`VP9_DPROF`). Public so the `video-tests`
+/// analyzer can drive it in-process; a normal decode never touches it.
+pub mod prof;
 mod prob;
 mod prob_tables;
 mod quant;
@@ -31,6 +34,10 @@ mod scan_tables;
 mod token;
 mod transform;
 pub use bits::{BitReader, BoolDecoder};
+/// The ENCODER's stage profiler (`VP9_PROF2`), re-exported for the `video-tests`
+/// analyzer. The encoder itself stays private; only the read side of the
+/// instrument is public. See [`prof`] for the decoder's.
+pub use encode::prof as encode_prof;
 
 pub(crate) const FRAME_MARKER: u32 = 2;
 pub(crate) const SYNC_CODE: u32 = 0x49_8342;
@@ -509,6 +516,15 @@ struct Vp9Decoder {
     eof: bool,
     /// The eight reference-frame slots (`ref_frame_map`).
     ref_frames: [Option<std::sync::Arc<decode::RefFrame>>; 8],
+    /// Retired reference-frame plane buffers, kept for reuse.
+    ///
+    /// Allocating three fresh planes per frame was measured at 80-82% of all
+    /// per-frame setup — not the zeroing but the PAGE FAULTS, ~144 first-touch
+    /// pages for a CIF frame, every frame. A reference buffer becomes reusable
+    /// the moment the last slot holding it is overwritten, which is exactly what
+    /// libvpx's frame-buffer pool exploits. Two entries is enough to keep the
+    /// steady state fed without holding memory hostage.
+    plane_pool: Vec<[Vec<u16>; 3]>,
     /// The four saved entropy contexts (`frame_contexts`).
     frame_contexts: [decode::FrameContext; 4],
     /// Previous frame's per-mi motion records (for temporal MV prediction).
@@ -550,6 +566,16 @@ impl Vp9Decoder {
     }
 }
 
+/// Print the stage table when the decoder goes away, so `VP9_DPROF=1 ffmpeg -i
+/// clip.ivf -f null -` is a complete profiling run with no extra tooling. A
+/// no-op unless the profiler is enabled; the `video-tests` analyzer bypasses
+/// this and reads [`prof::snapshot`] directly instead.
+impl Drop for Vp9Decoder {
+    fn drop(&mut self) {
+        prof::dump();
+    }
+}
+
 impl Decoder for Vp9Decoder {
     fn configure(&mut self, params: &CodecParams) -> Result<()> {
         self.width = params.width;
@@ -580,8 +606,15 @@ impl Decoder for Vp9Decoder {
                 Err(Error::Again)
             };
         };
+        // Bounds the profiler's residue to real decode work: everything outside
+        // this scope (demux, output writing, the caller's loop) is charged to the
+        // discarded idle sink instead of the reported glue bucket.
+        let _frame = prof::Scope::new(prof::S::Other);
         let mut r = BitReader::new(&data);
-        let mut h = parse_uncompressed_header(&mut r, &self.ref_dims())?;
+        let mut h = prof::dprof!(
+            prof::S::Header,
+            parse_uncompressed_header(&mut r, &self.ref_dims())
+        )?;
 
         // show_existing_frame: re-emit a previously decoded reference, no decode.
         if h.show_existing_frame {
@@ -694,6 +727,7 @@ impl Decoder for Vp9Decoder {
         // (it never mutates `self`), so a caught panic leaves the decoder
         // consistent — the frame just fails. The common malformed cases are
         // already rejected as `Err` upstream; this contains the long tail.
+        let recycled = if pool_disabled() { None } else { self.plane_pool.pop() };
         let decode_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             decode::decode_frame(
                 &h,
@@ -704,8 +738,15 @@ impl Decoder for Vp9Decoder {
                 prev_mvs,
                 use_prev_mvs,
                 prev_seg_map,
+                recycled,
             )
         }));
+        // Release the decode-time reference handles BEFORE the slot update below.
+        // They are clones of the very frames that update is about to retire, so
+        // holding them keeps every refcount >= 2 and `Arc::into_inner` can never
+        // succeed — which silently made the buffer pool a no-op (measured:
+        // recycled=0 of 30 frames) until this drop was added.
+        drop(active);
         let (decoded, out_fc, mvs, seg_map) = match decode_res {
             Ok(inner) => inner?,
             Err(_) => return Err(Error::invalid("vp9: decode aborted on malformed input")),
@@ -734,6 +775,7 @@ impl Decoder for Vp9Decoder {
         self.last_intra_only = h.intra_only;
         self.last_width = h.width;
         self.last_height = h.height;
+        let _p = prof::Scope::new(prof::S::RefUpdate);
         let rf = std::sync::Arc::new(decoded);
 
         // Update the reference slots selected by refresh_frame_flags.
@@ -744,7 +786,16 @@ impl Decoder for Vp9Decoder {
         };
         for i in 0..8 {
             if refresh & (1 << i) != 0 {
-                self.ref_frames[i] = Some(rf.clone());
+                // Reclaim the outgoing buffer when this was its last holder.
+                // `into_inner` succeeds only at refcount 1, so a frame still
+                // referenced by another slot (or mid-output) is never touched.
+                if let Some(old) = self.ref_frames[i].replace(rf.clone()) {
+                    if !pool_disabled() && self.plane_pool.len() < 2 {
+                        if let Some(inner) = std::sync::Arc::into_inner(old) {
+                            self.plane_pool.push(inner.planes);
+                        }
+                    }
+                }
             }
         }
         self.width = h.width;
@@ -826,6 +877,12 @@ fn split_superframe(data: &[u8]) -> Vec<Vec<u8>> {
 
 /// Crop a decoded reference frame to its visible planes and wrap it as a `Frame`.
 /// 8-bit planes are emitted as bytes; 10/12-bit planes as little-endian `u16`.
+/// A/B switch for the frame-buffer pool (DEFAULT ON; set to disable).
+fn pool_disabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("VP9_NO_PLANE_POOL").is_ok())
+}
+
 fn crop_frame(rf: &decode::RefFrame, ss_x: u32, ss_y: u32, pts: Option<i64>) -> Frame {
     let hbd = rf.bit_depth > 8;
     let mut planes: Vec<Vec<u8>> = Vec::with_capacity(3);

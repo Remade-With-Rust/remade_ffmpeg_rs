@@ -331,11 +331,28 @@ mod scalar_ref {
 // ---- per-plane superblock filtering (vp9_filter_block_plane_non420) -----
 
 #[allow(clippy::too_many_arguments)]
-fn filter_block_plane(
-    buf: &mut [u16],
-    stride: usize,
-    base_x: usize,
-    base_y: usize,
+/// A/B switch for mask sharing (DEFAULT ON; set to rebuild per plane).
+fn no_mask_share() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("VP9_NO_LF_MASK_SHARE").is_ok())
+}
+
+/// The per-superblock loop-filter masks. Built once per (subsampling, SB) and
+/// reused across planes that share a subsampling — for 4:2:0/4:2:2/4:4:4 the U
+/// and V planes always do, so this removes one of the three walks over the
+/// `ModeInfo` grid that the loop filter used to make per superblock.
+struct SbMasks {
+    v16: [u32; MI_BLOCK_SIZE],
+    v8: [u32; MI_BLOCK_SIZE],
+    v4: [u32; MI_BLOCK_SIZE],
+    m16x16: [u32; MI_BLOCK_SIZE],
+    m8x8: [u32; MI_BLOCK_SIZE],
+    m4x4: [u32; MI_BLOCK_SIZE],
+    m4x4_int: [u32; MI_BLOCK_SIZE],
+    lfl: [u8; MI_BLOCK_SIZE * MI_BLOCK_SIZE],
+}
+
+fn build_sb_masks(
     ss_x: usize,
     ss_y: usize,
     lf: &LfInfo,
@@ -344,8 +361,7 @@ fn filter_block_plane(
     mi_cols: usize,
     mi_row: usize,
     mi_col: usize,
-    bd: i32,
-) {
+) -> SbMasks {
     let row_step = 1 << ss_y;
     let col_step = 1 << ss_x;
     // Masks per mi-row (within the SB), indexed [r].
@@ -354,12 +370,15 @@ fn filter_block_plane(
     let mut m4x4 = [0u32; MI_BLOCK_SIZE];
     let mut m4x4_int = [0u32; MI_BLOCK_SIZE];
     let mut lfl = [0u8; MI_BLOCK_SIZE * MI_BLOCK_SIZE];
+    // Vertical-edge column masks, kept per mi-row so the whole mask build can
+    // complete before any filtering starts — which is what lets the result be
+    // shared between the U and V planes.
+    let mut v16 = [0u32; MI_BLOCK_SIZE];
+    let mut v8 = [0u32; MI_BLOCK_SIZE];
+    let mut v4 = [0u32; MI_BLOCK_SIZE];
 
     let mut r = 0;
     while r < MI_BLOCK_SIZE && mi_row + r < mi_rows {
-        let mut m16c = 0u32;
-        let mut m8c = 0u32;
-        let mut m4c = 0u32;
         let mut c = 0;
         while c < MI_BLOCK_SIZE && mi_col + c < mi_cols {
             let mi = &mi_grid[(mi_row + r) * mi_cols + (mi_col + c)];
@@ -392,9 +411,9 @@ fn filter_block_plane(
             if tx_size == 3 {
                 if !skip_this_c && (cc & 3) == 0 {
                     if !skip_border_4x4_c {
-                        m16c |= 1 << cc
+                        v16[r] |= 1 << cc
                     } else {
-                        m8c |= 1 << cc
+                        v8[r] |= 1 << cc
                     }
                 }
                 if !skip_this_r && ((r >> ss_y) & 3) == 0 {
@@ -407,9 +426,9 @@ fn filter_block_plane(
             } else if tx_size == 2 {
                 if !skip_this_c && (cc & 1) == 0 {
                     if !skip_border_4x4_c {
-                        m16c |= 1 << cc
+                        v16[r] |= 1 << cc
                     } else {
-                        m8c |= 1 << cc
+                        v8[r] |= 1 << cc
                     }
                 }
                 if !skip_this_r && ((r >> ss_y) & 1) == 0 {
@@ -422,9 +441,9 @@ fn filter_block_plane(
             } else {
                 if !skip_this_c {
                     if tx_size == 1 || (cc & 3) == 0 {
-                        m8c |= 1 << cc
+                        v8[r] |= 1 << cc
                     } else {
-                        m4c |= 1 << cc
+                        v4[r] |= 1 << cc
                     }
                 }
                 if !skip_this_r {
@@ -440,7 +459,37 @@ fn filter_block_plane(
             }
             c += col_step;
         }
-        // Vertical edges for this mi-row. Disable the frame's leftmost column.
+        r += row_step;
+    }
+    SbMasks { v16, v8, v4, m16x16, m8x8, m4x4, m4x4_int, lfl }
+}
+
+/// Apply already-built masks to one plane.
+#[allow(clippy::too_many_arguments)]
+fn apply_sb_masks(
+    buf: &mut [u16],
+    stride: usize,
+    base_x: usize,
+    base_y: usize,
+    ss_y: usize,
+    lf: &LfInfo,
+    m: &SbMasks,
+    mi_rows: usize,
+    mi_row: usize,
+    mi_col: usize,
+    bd: i32,
+) {
+    let row_step = 1 << ss_y;
+    let (v16, v8, v4) = (&m.v16, &m.v8, &m.v4);
+    let (m16x16, m8x8, m4x4, m4x4_int) = (&m.m16x16, &m.m8x8, &m.m4x4, &m.m4x4_int);
+    let lfl = &m.lfl;
+    // Vertical pass. Split out of the build loop above: mask construction reads
+    // only `mi_grid`, and vertical filtering of mi-row `r` touches only pixel
+    // rows [row_y, row_y+8), so no row can observe another's filtering and the
+    // reordering is exact.
+    let mut r = 0;
+    while r < MI_BLOCK_SIZE && mi_row + r < mi_rows {
+        // Disable the frame's leftmost column.
         let border = if mi_col == 0 { !1u32 } else { !0u32 };
         let row_y = base_y + (r >> ss_y) * 8;
         filter_selectively_vert(
@@ -448,9 +497,9 @@ fn filter_block_plane(
             stride,
             base_x,
             row_y,
-            m16c & border,
-            m8c & border,
-            m4c & border,
+            v16[r] & border,
+            v8[r] & border,
+            v4[r] & border,
             m4x4_int[r],
             &lf.thr,
             &lfl[r << 3..],
@@ -1582,12 +1631,27 @@ pub fn loop_filter_frame(
     while mi_row < mi_rows {
         let mut mi_col = 0;
         while mi_col < mi_cols {
+            // Build the masks ONCE per distinct subsampling and reuse them.
+            // The mask depends only on (ss_x, ss_y) and the mi grid, so the U
+            // and V planes — which always share a subsampling — produce
+            // byte-identical masks. This removes one of the three walks over
+            // the ModeInfo grid the loop filter made per superblock.
+            let mut cached: Option<((usize, usize), SbMasks)> = None;
             for (buf, stride, ss_x, ss_y) in planes.iter_mut() {
+                let key = (*ss_x, *ss_y);
+                let masks = match &cached {
+                    Some((k, m)) if *k == key && !no_mask_share() => m,
+                    _ => {
+                        let m =
+                            build_sb_masks(*ss_x, *ss_y, &lf, mi_grid, mi_rows, mi_cols, mi_row, mi_col);
+                        cached = Some((key, m));
+                        &cached.as_ref().unwrap().1
+                    }
+                };
                 let base_x = (mi_col * 8) >> *ss_x;
                 let base_y = (mi_row * 8) >> *ss_y;
-                filter_block_plane(
-                    buf, *stride, base_x, base_y, *ss_x, *ss_y, &lf, mi_grid, mi_rows, mi_cols,
-                    mi_row, mi_col, bd,
+                apply_sb_masks(
+                    buf, *stride, base_x, base_y, *ss_y, &lf, masks, mi_rows, mi_row, mi_col, bd,
                 );
             }
             mi_col += MI_BLOCK_SIZE;

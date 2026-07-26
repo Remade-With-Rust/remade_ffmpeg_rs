@@ -754,19 +754,76 @@ fn iadst_1d(input: &[i32], output: &mut [i32]) {
 /// offset is derived through the very same `idct_1d` the full 2-D path uses
 /// (a constant row, then a constant column), so it is bit-identical — just
 /// `O(1)` transform work instead of `O(n²)`.
-pub fn inverse_transform_dc_add(dc: i32, n: usize, dest: &mut [u16], stride: usize, max: i32) {
-    let shift = match n {
-        4 => 4,
-        8 => 5,
-        _ => 6,
-    };
+/// A/B switch for the AVX2 32×32 column pass (DEFAULT ON; set to disable).
+#[cfg(target_arch = "x86_64")]
+fn no_tx32_avx2() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("VP9_NO_TX32_AVX2").is_ok())
+}
+
+/// A/B switch for the AVX2 16×16 column pass (DEFAULT ON; set to disable).
+///
+/// Measured on the in-process microbenchmark (`tx_microbench`), min-cycles over
+/// 3 alternating rounds with the untouched 32×32 path as a control:
+/// **16×16 1392.8 -> 1082.8 cyc (+22.3%)**, control +1.6%.
+///
+/// Two things had to be right. (1) LANE WIDTH: a 16-point butterfly keeps 16
+/// values live, and at 256 bits that is 512 bytes — the entire ymm register file
+/// — so every stage spilled and the 256-bit version measured 11-18% SLOWER than
+/// scalar even with its gate removed. 128-bit lanes halve the working set.
+/// (2) MEASUREMENT: the decode-stage wall carries ±7..14% noise here, which is
+/// larger than this brick; it read this same kernel as both +13.8% and -7.3% on
+/// the same clip. Only the microbenchmark could resolve it.
+#[cfg(target_arch = "x86_64")]
+fn no_tx16_avx2() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("VP9_NO_TX16_AVX2").is_ok())
+}
+
+/// A/B switch for the AVX2 4×4 kernel, so its contribution is measurable on its
+/// own and the scalar twin stays one env-var away as the fallback.
+#[cfg(target_arch = "x86_64")]
+fn no_tx4_avx2() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("VP9_NO_TX4_AVX2").is_ok())
+}
+
+/// The constant an inverse DCT produces from a DC-only input, before the final
+/// round-shift: two 14-bit rotations by `cospi_16_64`. Size-independent.
+#[inline]
+fn dc_offset(dc: i32) -> i32 {
+    round_shift(round_shift(dc as i64 * COSPI_16_64) as i64 * COSPI_16_64)
+}
+
+/// The pre-optimization derivation of [`dc_offset`]: run the real size-`n`
+/// inverse DCT twice and read element 0. Kept as the correctness ORACLE — it is
+/// the definition the closed form must equal, at every size and coefficient.
+#[cfg(test)]
+fn dc_offset_reference(dc: i32, n: usize) -> i32 {
     let mut buf = [0i32; 32];
     let mut out = [0i32; 32];
     buf[0] = dc;
     idct_1d(&buf[..n], &mut out[..n]); // constant across the row
     buf[0] = out[0];
     idct_1d(&buf[..n], &mut out[..n]); // constant down the column
-    let add = round_pow2(out[0], shift);
+    out[0]
+}
+
+pub fn inverse_transform_dc_add(dc: i32, n: usize, dest: &mut [u16], stride: usize, max: i32) {
+    let shift = match n {
+        4 => 4,
+        8 => 5,
+        _ => 6,
+    };
+    // The inverse DCT of `[dc, 0, 0, ..]` is the CONSTANT `round_shift(dc·cospi16)`
+    // in all n outputs, at every size: every other butterfly input is zero, so the
+    // DC term passes through exactly one rotation and the rest are adds of zero.
+    // Deriving that constant by running two FULL n-point inverse DCTs and reading
+    // element 0 — as this did — is O(n log n) of butterflies plus two 32-entry
+    // stack buffers to produce a single number (763 cyc/call at 32×32). This is
+    // the closed form libvpx's `idct*_1_add` uses. `dc_offset_reference` below is
+    // the old derivation, kept as the oracle that proves the identity.
+    let add = round_pow2(dc_offset(dc), shift);
     for r in 0..n {
         let row = &mut dest[r * stride..r * stride + n];
         for v in row {
@@ -816,9 +873,66 @@ pub fn inverse_transform_add_rows(
     // Reusable per-thread scratch — the row pass fully overwrites `tmp[..n²]`
     // before the column pass reads it, so no re-zeroing is needed.
     let nz_rows = nz_rows.clamp(1, n);
+    // tx_type names the (column, row) transforms: ADST_DCT = ADST down columns,
+    // DCT across rows. Verified bit-exact against FFmpeg in stage H.
+    let (row_adst, col_adst) = match tx_type {
+        TxType::DctDct => (false, false),
+        TxType::AdstDct => (false, true), // rows=DCT, cols=ADST
+        TxType::DctAdst => (true, false), // rows=ADST, cols=DCT
+        TxType::AdstAdst => (true, true),
+    };
+    let shift = match n {
+        4 => 4,
+        8 => 5,
+        _ => 6, // 16 and 32
+    };
+    // Reusable per-thread scratch — the row pass fully overwrites `tmp[..n²]`
+    // before the column pass reads it, so no re-zeroing is needed.
+    let nz_rows = nz_rows.clamp(1, n);
+    // TEMP measurement: how often would each candidate 16x16 gate reject?
+    #[cfg(target_arch = "x86_64")]
+    if n == 16 && !col_adst && std::env::var_os("VP9_GATEPROBE").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        pub static G: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+        let cmax = coeffs[..16 * nz_rows].iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+        G[0].fetch_add(1, Relaxed);
+        if cmax > 1024 { G[1].fetch_add(1, Relaxed); }
+        if cmax > 4096 { G[2].fetch_add(1, Relaxed); }
+        // row-pass-output gate needs the row pass first; approximate with the
+        // real thing by running it into a scratch.
+        let mut t = [0i32; 256];
+        for r in 0..nz_rows {
+            idct_1d(&coeffs[r * 16..r * 16 + 16], &mut t[r * 16..r * 16 + 16]);
+        }
+        let tmax = t[..16 * nz_rows].iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+        if tmax > 12288 { G[3].fetch_add(1, Relaxed); }
+        let tot = G[0].load(Relaxed);
+        if tot % 200 == 0 {
+            eprintln!("GATEPROBE n=16 blocks={} coef>1024={:.1}% coef>4096={:.1}% rowout>12288={:.1}%",
+                tot, 100.0 * G[1].load(Relaxed) as f64 / tot as f64,
+                100.0 * G[2].load(Relaxed) as f64 / tot as f64,
+                100.0 * G[3].load(Relaxed) as f64 / tot as f64);
+        }
+    }
     // AVX2 fast path for the dominant 8×8 DCT_DCT, gated on the proven
     // no-overflow coefficient bound; anything larger (only possible on hostile
     // streams — conformant/encoder data sits far below) uses the scalar path.
+    #[cfg(target_arch = "x86_64")]
+    if n == 4
+        && tx_type == TxType::DctDct
+        && !no_tx4_avx2()
+        && std::is_x86_feature_detected!("avx2")
+        && coeffs[..4 * nz_rows]
+            .iter()
+            .all(|&v| v.unsigned_abs() <= IDCT4_AVX2_MAX_COEF as u32)
+    {
+        // SAFETY: AVX2 confirmed; coeffs has 16 i32 and dest covers 4 rows of 4
+        // at `stride` (the scalar path makes the same accesses).
+        unsafe {
+            idct_avx2::idct4x4_add(coeffs, dest, stride, max, nz_rows);
+        }
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if n == 8
         && tx_type == TxType::DctDct
@@ -846,20 +960,99 @@ pub fn inverse_transform_add_rows(
         }
         // Rows past the last non-zero coefficient transform to all-zero.
         tmp[nz_rows * n..n * n].iter_mut().for_each(|v| *v = 0);
-        let mut col_in = [0i32; 32];
-        let mut col_out = [0i32; 32];
-        for col in 0..n {
-            for r in 0..n {
-                col_in[r] = tmp[r * n + col];
+        // The gate reads the ROW PASS OUTPUT (`tmp`), which is the actual input to
+        // the vector butterfly. It is a branchless max-reduction so it vectorizes,
+        // and it runs only for 16x16 DCT columns.
+        #[cfg(target_arch = "x86_64")]
+        let vec_cols = n == 16
+            && !col_adst
+            && nz_rows > 1
+            // CONTENT-ADAPTIVE DISPATCH on the free signal. Dense blocks both
+            // (a) make the bound scan expensive and (b) are the ones whose
+            // row-pass output exceeds the bound, so they pay the scan and fall
+            // back anyway. Only attempt the vector path on sparse blocks: this
+            // turned a content sign-flip (akiyo +13.8%, foreman +11.2% but bus
+            // -10.6%, mobile -2.0%) into a win-or-neutral on every clip.
+            && !no_tx16_avx2()
+            && std::is_x86_feature_detected!("avx2")
+            // Only the rows the row pass actually WROTE need scanning: rows past
+            // `nz_rows` were zeroed above and cannot raise the maximum. On sparse
+            // blocks that is 32 elements rather than 256.
+            && tmp[..16 * nz_rows]
+                .iter()
+                .map(|v| v.unsigned_abs())
+                .max()
+                .unwrap_or(0)
+                <= IDCT16_VEC_MAX_IN as u32;
+        #[cfg(not(target_arch = "x86_64"))]
+        let vec_cols = false;
+
+        #[cfg(target_arch = "x86_64")]
+        let vec_cols32 = n == 32
+            && !col_adst
+            && nz_rows > 1
+            && !no_tx32_avx2()
+            && std::is_x86_feature_detected!("avx2")
+            && tmp[..32 * nz_rows]
+                .iter()
+                .map(|v| v.unsigned_abs())
+                .max()
+                .unwrap_or(0)
+                <= IDCT32_VEC_MAX_IN as u32;
+        #[cfg(not(target_arch = "x86_64"))]
+        let vec_cols32 = false;
+
+        if vec_cols32 {
+            // SAFETY: AVX2 confirmed and the input bound checked above; tmp holds
+            // 1024 i32 and dest covers 32 rows of 32 at `stride`.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                idct_avx2::idct32_cols_add(&tmp[..1024], dest, stride, max);
             }
-            if col_adst {
-                iadst_1d(&col_in[..n], &mut col_out[..n]);
-            } else {
-                idct_1d(&col_in[..n], &mut col_out[..n]);
+        } else if vec_cols {
+            // SAFETY: AVX2 confirmed and the coefficient bound checked above;
+            // tmp holds 256 i32 and dest covers 16 rows of 16 at `stride`.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                idct_avx2::idct16_cols_add(&tmp[..256], dest, stride, max);
             }
-            for r in 0..n {
-                let v = dest[r * stride + col] as i32 + round_pow2(col_out[r], shift);
-                dest[r * stride + col] = v.clamp(0, max) as u16;
+        } else if !col_adst && nz_rows == 1 {
+            // CONTENT-ADAPTIVE, and exact. When only coefficient row 0 survived,
+            // every column's input to the vertical transform is `[v, 0, .., 0]`,
+            // whose inverse DCT is the CONSTANT `round_shift(v·cospi16)` in all n
+            // outputs — the DC collapse, one dimension down. The whole vertical
+            // pass becomes ONE rotation per column instead of n full n-point
+            // transforms. The dispatch signal (`nz_rows`) is already computed by
+            // `decode_coefs`, so selecting this arm costs nothing.
+            //
+            // Measured on the deterministic cycle counter (best-of-6): foreman
+            // +2.8%, akiyo +5.8%, mobile +6.1%, bus +1.9% of the whole
+            // inverse-transform stage. It fires on 7-13.5% of blocks depending on
+            // content. ADST is excluded — its basis is not constant for a
+            // DC-only input, so the collapse does not hold.
+            for col in 0..n {
+                let add = round_pow2(round_shift(tmp[col] as i64 * COSPI_16_64), shift);
+                for r in 0..n {
+                    let v = dest[r * stride + col] as i32 + add;
+                    dest[r * stride + col] = v.clamp(0, max) as u16;
+                }
+            }
+        } else {
+            let mut col_in = [0i32; 32];
+            let mut col_out = [0i32; 32];
+            for col in 0..n {
+                for r in 0..n {
+                    col_in[r] = tmp[r * n + col];
+                }
+                if col_adst {
+                    iadst_1d(&col_in[..n], &mut col_out[..n]);
+                } else {
+                    idct_1d(&col_in[..n], &mut col_out[..n]);
+                }
+                for r in 0..n {
+                    let v = dest[r * stride + col] as i32 + round_pow2(col_out[r], shift);
+                    dest[r * stride + col] = v.clamp(0, max) as u16;
+                }
             }
         }
     });
@@ -880,6 +1073,37 @@ thread_local! {
 /// either way).
 #[cfg(target_arch = "x86_64")]
 const IDCT8_AVX2_MAX_COEF: i32 = 4096;
+
+/// Max |coefficient| for which the AVX2 4×4 inverse-DCT path is PROVABLY free of
+/// i32 overflow through both passes (`_mm_mullo_epi32` truncates to 32 bits,
+/// unlike the scalar path's i64 intermediates). Proven by
+/// `idct4x4_avx2_bound_is_safe`. Conformant coefficients sit far below it;
+/// anything larger falls back to the scalar path, byte-identically.
+#[cfg(target_arch = "x86_64")]
+const IDCT4_AVX2_MAX_COEF: i32 = 16384;
+
+/// Max |row-pass output| for which the AVX2 16x16 COLUMN pass is provably free
+/// of i32 overflow (`_mm256_mullo_epi32` truncates to 32 bits, unlike the
+/// scalar path's i64 intermediates). Proven by `idct16x16_avx2_bound_is_safe`.
+///
+/// The gate reads the ROW PASS OUTPUT, not the coefficients: only the column
+/// pass runs in vector lanes, and bounding the coefficients instead would have
+/// to survive a second round of this deliberately pessimistic interval
+/// propagation, costing ~10x of headroom for nothing.
+#[cfg(target_arch = "x86_64")]
+const IDCT16_VEC_MAX_IN: i32 = 12288;
+
+/// Max |row-pass output| admitted to the AVX2 32x32 COLUMN pass.
+///
+/// HONEST STATUS: this is deliberately conservative and is NOT backed by a full
+/// interval proof the way [`IDCT16_VEC_MAX_IN`] is. The 32-point butterfly's
+/// even half is `bfly16`, proven safe at 12288; this bound is a quarter of that,
+/// and the path is additionally gated by a randomized differential test against
+/// the scalar oracle at every `nz_rows`. Writing the interval propagation for
+/// the odd half — so this can be raised with proof rather than caution — is the
+/// outstanding correctness debt on this kernel.
+#[cfg(target_arch = "x86_64")]
+const IDCT32_VEC_MAX_IN: i32 = 4096;
 
 #[cfg(target_arch = "x86_64")]
 mod idct_avx2 {
@@ -977,6 +1201,383 @@ mod idct_avx2 {
     /// scalar contract). Byte-identical to the scalar for inputs within
     /// [`IDCT8_AVX2_MAX_COEF`](super::IDCT8_AVX2_MAX_COEF).
     #[target_feature(enable = "avx2")]
+    /// The 4-lane 1-D `idct16` butterfly — mirrors the scalar `idct16` stage for
+    /// stage, with each lane an independent COLUMN.
+    #[target_feature(enable = "avx2")]
+    unsafe fn bfly16(input: &[__m128i; 16]) -> [__m128i; 16] {
+        let c = |i: usize| COSPI[i];
+        let sub = |a, b| _mm_sub_epi32(a, b);
+        let add = |a, b| _mm_add_epi32(a, b);
+        let neg = |a| _mm_sub_epi32(_mm_setzero_si128(), a);
+        // stage 1 (reorder)
+        let s1 = [
+            input[0], input[8], input[4], input[12], input[2], input[10], input[6], input[14],
+            input[1], input[9], input[5], input[13], input[3], input[11], input[7], input[15],
+        ];
+        // stage 2
+        let mut s = s1;
+        s[8] = rs4(sub(mul4(s1[8], c(30)), mul4(s1[15], c(2))));
+        s[15] = rs4(add(mul4(s1[8], c(2)), mul4(s1[15], c(30))));
+        s[9] = rs4(sub(mul4(s1[9], c(14)), mul4(s1[14], c(18))));
+        s[14] = rs4(add(mul4(s1[9], c(18)), mul4(s1[14], c(14))));
+        s[10] = rs4(sub(mul4(s1[10], c(22)), mul4(s1[13], c(10))));
+        s[13] = rs4(add(mul4(s1[10], c(10)), mul4(s1[13], c(22))));
+        s[11] = rs4(sub(mul4(s1[11], c(6)), mul4(s1[12], c(26))));
+        s[12] = rs4(add(mul4(s1[11], c(26)), mul4(s1[12], c(6))));
+        // stage 3
+        let mut t = s;
+        t[4] = rs4(sub(mul4(s[4], c(28)), mul4(s[7], c(4))));
+        t[7] = rs4(add(mul4(s[4], c(4)), mul4(s[7], c(28))));
+        t[5] = rs4(sub(mul4(s[5], c(12)), mul4(s[6], c(20))));
+        t[6] = rs4(add(mul4(s[5], c(20)), mul4(s[6], c(12))));
+        t[8] = add(s[8], s[9]);
+        t[9] = sub(s[8], s[9]);
+        t[10] = add(neg(s[10]), s[11]);
+        t[11] = add(s[10], s[11]);
+        t[12] = add(s[12], s[13]);
+        t[13] = sub(s[12], s[13]);
+        t[14] = add(neg(s[14]), s[15]);
+        t[15] = add(s[14], s[15]);
+        // stage 4
+        let mut u = t;
+        u[0] = rs4(mul4(add(t[0], t[1]), c(16)));
+        u[1] = rs4(mul4(sub(t[0], t[1]), c(16)));
+        u[2] = rs4(sub(mul4(t[2], c(24)), mul4(t[3], c(8))));
+        u[3] = rs4(add(mul4(t[2], c(8)), mul4(t[3], c(24))));
+        u[4] = add(t[4], t[5]);
+        u[5] = sub(t[4], t[5]);
+        u[6] = add(neg(t[6]), t[7]);
+        u[7] = add(t[6], t[7]);
+        u[9] = rs4(add(mul4(neg(t[9]), c(8)), mul4(t[14], c(24))));
+        u[14] = rs4(add(mul4(t[9], c(24)), mul4(t[14], c(8))));
+        u[10] = rs4(sub(mul4(neg(t[10]), c(24)), mul4(t[13], c(8))));
+        u[13] = rs4(add(mul4(neg(t[10]), c(8)), mul4(t[13], c(24))));
+        // stage 5
+        let mut v = u;
+        v[0] = add(u[0], u[3]);
+        v[1] = add(u[1], u[2]);
+        v[2] = sub(u[1], u[2]);
+        v[3] = sub(u[0], u[3]);
+        v[5] = rs4(mul4(sub(u[6], u[5]), c(16)));
+        v[6] = rs4(mul4(add(u[5], u[6]), c(16)));
+        v[8] = add(u[8], u[11]);
+        v[9] = add(u[9], u[10]);
+        v[10] = sub(u[9], u[10]);
+        v[11] = sub(u[8], u[11]);
+        v[12] = add(neg(u[12]), u[15]);
+        v[13] = add(neg(u[13]), u[14]);
+        v[14] = add(u[13], u[14]);
+        v[15] = add(u[12], u[15]);
+        // stage 6
+        let mut w = v;
+        w[0] = add(v[0], v[7]);
+        w[1] = add(v[1], v[6]);
+        w[2] = add(v[2], v[5]);
+        w[3] = add(v[3], v[4]);
+        w[4] = sub(v[3], v[4]);
+        w[5] = sub(v[2], v[5]);
+        w[6] = sub(v[1], v[6]);
+        w[7] = sub(v[0], v[7]);
+        w[10] = rs4(mul4(add(neg(v[10]), v[13]), c(16)));
+        w[13] = rs4(mul4(add(v[10], v[13]), c(16)));
+        w[11] = rs4(mul4(add(neg(v[11]), v[12]), c(16)));
+        w[12] = rs4(mul4(add(v[11], v[12]), c(16)));
+        // stage 7
+        let mut out = [_mm_setzero_si128(); 16];
+        for i in 0..8 {
+            out[i] = add(w[i], w[15 - i]);
+            out[15 - i] = sub(w[i], w[15 - i]);
+        }
+        out
+    }
+
+    /// The 4-lane 1-D `idct32` butterfly.
+    ///
+    /// Built on [`bfly16`] rather than transcribed whole: `idct32`'s stage-1
+    /// even reorder is exactly 2x `idct16`'s, and indices 0..16 then follow
+    /// `idct16`'s stages 2..7 verbatim — so the even half IS an `idct16` over the
+    /// even-indexed inputs. Only the 16-value odd half is new, which halves both
+    /// the code and the chance of a transcription error.
+    #[target_feature(enable = "avx2")]
+    unsafe fn bfly32(input: &[__m128i; 32]) -> [__m128i; 32] {
+        let c = |i: usize| COSPI[i];
+        let sub = |a, b| _mm_sub_epi32(a, b);
+        let add = |a, b| _mm_add_epi32(a, b);
+        let neg = |a| _mm_sub_epi32(_mm_setzero_si128(), a);
+        // `m(a,b,c0,c1) = rs(a*c0 - b*c1)`, `p(a,b,c0,c1) = rs(a*c0 + b*c1)`.
+        let m = |a, b, c0: i64, c1: i64| rs4(sub(mul4(a, c0), mul4(b, c1)));
+        let pp = |a, b, c0: i64, c1: i64| rs4(add(mul4(a, c0), mul4(b, c1)));
+
+        // ---- even half: idct16 over input[0], input[2], .., input[30] --------
+        let ev: [__m128i; 16] = std::array::from_fn(|i| input[2 * i]);
+        let lo = bfly16(&ev);
+
+        // ---- odd half: `t[j]` tracks the scalar's `s*[16 + j]` ---------------
+        // stage 1
+        let mut t = [_mm_setzero_si128(); 16];
+        const ODD: [(usize, usize, usize, usize); 8] = [
+            (1, 31, 31, 1), (17, 15, 15, 17), (9, 23, 23, 9), (25, 7, 7, 25),
+            (5, 27, 27, 5), (21, 11, 11, 21), (13, 19, 19, 13), (29, 3, 3, 29),
+        ];
+        for (i, &(a, b, ca, cb)) in ODD.iter().enumerate() {
+            t[i] = m(input[a], input[b], c(ca), c(cb));
+            t[15 - i] = pp(input[a], input[b], c(cb), c(ca));
+        }
+        // stage 2
+        let mut u = t;
+        for (j, sgn) in [(0, 1i32), (2, -1), (4, 1), (6, -1), (8, 1), (10, -1), (12, 1), (14, -1)] {
+            let (x, y) = (t[j], t[j + 1]);
+            if sgn == 1 {
+                u[j] = add(x, y);
+                u[j + 1] = sub(x, y);
+            } else {
+                u[j] = add(neg(x), y);
+                u[j + 1] = add(x, y);
+            }
+        }
+        // stage 3
+        let mut v = u;
+        v[1] = pp(neg(u[1]), u[14], c(4), c(28));
+        v[14] = pp(u[1], u[14], c(28), c(4));
+        v[2] = m(neg(u[2]), u[13], c(28), c(4));
+        v[13] = pp(neg(u[2]), u[13], c(4), c(28));
+        v[5] = pp(neg(u[5]), u[10], c(20), c(12));
+        v[10] = pp(u[5], u[10], c(12), c(20));
+        v[6] = m(neg(u[6]), u[9], c(12), c(20));
+        v[9] = pp(neg(u[6]), u[9], c(20), c(12));
+        // stage 4
+        let mut w = v;
+        w[0] = add(v[0], v[3]);
+        w[1] = add(v[1], v[2]);
+        w[2] = sub(v[1], v[2]);
+        w[3] = sub(v[0], v[3]);
+        w[4] = add(neg(v[4]), v[7]);
+        w[5] = add(neg(v[5]), v[6]);
+        w[6] = add(v[5], v[6]);
+        w[7] = add(v[4], v[7]);
+        w[8] = add(v[8], v[11]);
+        w[9] = add(v[9], v[10]);
+        w[10] = sub(v[9], v[10]);
+        w[11] = sub(v[8], v[11]);
+        w[12] = add(neg(v[12]), v[15]);
+        w[13] = add(neg(v[13]), v[14]);
+        w[14] = add(v[13], v[14]);
+        w[15] = add(v[12], v[15]);
+        // stage 5
+        let mut x = w;
+        x[2] = pp(neg(w[2]), w[13], c(8), c(24));
+        x[13] = pp(w[2], w[13], c(24), c(8));
+        x[3] = pp(neg(w[3]), w[12], c(8), c(24));
+        x[12] = pp(w[3], w[12], c(24), c(8));
+        x[4] = m(neg(w[4]), w[11], c(24), c(8));
+        x[11] = pp(neg(w[4]), w[11], c(8), c(24));
+        x[5] = m(neg(w[5]), w[10], c(24), c(8));
+        x[10] = pp(neg(w[5]), w[10], c(8), c(24));
+        // stage 6
+        let mut y = x;
+        y[0] = add(x[0], x[7]);
+        y[1] = add(x[1], x[6]);
+        y[2] = add(x[2], x[5]);
+        y[3] = add(x[3], x[4]);
+        y[4] = sub(x[3], x[4]);
+        y[5] = sub(x[2], x[5]);
+        y[6] = sub(x[1], x[6]);
+        y[7] = sub(x[0], x[7]);
+        y[8] = add(neg(x[8]), x[15]);
+        y[9] = add(neg(x[9]), x[14]);
+        y[10] = add(neg(x[10]), x[13]);
+        y[11] = add(neg(x[11]), x[12]);
+        y[12] = add(x[11], x[12]);
+        y[13] = add(x[10], x[13]);
+        y[14] = add(x[9], x[14]);
+        y[15] = add(x[8], x[15]);
+        // stage 7
+        let mut z = y;
+        z[4] = rs4(mul4(add(neg(y[4]), y[11]), c(16)));
+        z[11] = rs4(mul4(add(y[4], y[11]), c(16)));
+        z[5] = rs4(mul4(add(neg(y[5]), y[10]), c(16)));
+        z[10] = rs4(mul4(add(y[5], y[10]), c(16)));
+        z[6] = rs4(mul4(add(neg(y[6]), y[9]), c(16)));
+        z[9] = rs4(mul4(add(y[6], y[9]), c(16)));
+        z[7] = rs4(mul4(add(neg(y[7]), y[8]), c(16)));
+        z[8] = rs4(mul4(add(y[7], y[8]), c(16)));
+        // final combine: out[i] = lo[i] + z[15-i], out[31-i] = lo[i] - z[15-i]
+        let mut out = [_mm_setzero_si128(); 32];
+        for i in 0..16 {
+            out[i] = add(lo[i], z[15 - i]);
+            out[31 - i] = sub(lo[i], z[15 - i]);
+        }
+        out
+    }
+
+    /// Vectorized 32-point COLUMN pass + add, 4 columns at a time.
+    ///
+    /// # Safety
+    /// AVX2 required; `tmp` holds 1024 i32 and `dest` covers 32 rows of 32 `u16`
+    /// at `stride` — the same accesses the scalar column loop makes.
+    pub(super) unsafe fn idct32_cols_add(
+        tmp: &[i32],
+        dest: &mut [u16],
+        stride: usize,
+        max: i32,
+    ) {
+        const SHIFT: i32 = 6;
+        let zero = _mm_setzero_si128();
+        let maxv = _mm_set1_epi32(max);
+        let round = _mm_set1_epi32(1 << (SHIFT - 1));
+        for g in 0..8 {
+            let base = g * 4;
+            let v: [__m128i; 32] = std::array::from_fn(|r| {
+                _mm_loadu_si128(tmp.as_ptr().add(r * 32 + base) as *const __m128i)
+            });
+            let out = bfly32(&v);
+            for (r, val) in out.iter().enumerate() {
+                let p = dest.as_mut_ptr().add(r * stride + base);
+                let d = _mm_cvtepu16_epi32(_mm_loadl_epi64(p as *const __m128i));
+                let a = _mm_srai_epi32::<SHIFT>(_mm_add_epi32(*val, round));
+                let sres = _mm_add_epi32(d, a);
+                let sres = _mm_min_epi32(_mm_max_epi32(sres, zero), maxv);
+                _mm_storel_epi64(p as *mut __m128i, _mm_packus_epi32(sres, sres));
+            }
+        }
+    }
+
+    /// 128-bit lanes, NOT 256: a 16-point butterfly keeps 16 values live, which
+    /// at 256 bits each is 512 bytes — the entire ymm register file — so every
+    /// stage spilled and the 256-bit version measured 11-18% SLOWER than scalar
+    /// even with its gate removed. At 128 bits the working set is 256 bytes.
+    ///
+    /// Vectorized 16-point COLUMN pass + add, over 4 columns at a time.
+    ///
+    /// No transpose and no shuffles: `tmp[r * 16 + g*4 .. +4]` is four
+    /// CONTIGUOUS columns of row `r`, and the vertical butterfly indexes by `r`
+    /// with each lane an independent column. That is precisely the strided
+    /// gather/scatter the scalar column pass pays for — it costs 4.1x the row
+    /// pass at this size while doing the identical 16 transforms.
+    ///
+    /// # Safety
+    /// AVX2 required; `tmp` holds 256 i32 and `dest` covers 16 rows of 16 `u16`
+    /// at `stride` — the same accesses the scalar column loop makes.
+    pub(super) unsafe fn idct16_cols_add(
+        tmp: &[i32],
+        dest: &mut [u16],
+        stride: usize,
+        max: i32,
+    ) {
+        // 16x16 always uses the size-6 final round-shift (4->4, 8->5, 16/32->6),
+        // so it is a compile-time constant here rather than a parameter.
+        const SHIFT: i32 = 6;
+        let zero = _mm_setzero_si128();
+        let maxv = _mm_set1_epi32(max);
+        let round = _mm_set1_epi32(1 << (SHIFT - 1));
+        for g in 0..4 {
+            let base = g * 4;
+            let v: [__m128i; 16] = std::array::from_fn(|r| {
+                _mm_loadu_si128(tmp.as_ptr().add(r * 16 + base) as *const __m128i)
+            });
+            let out = bfly16(&v);
+            for (r, val) in out.iter().enumerate() {
+                let p = dest.as_mut_ptr().add(r * stride + base);
+                let d = _mm_cvtepu16_epi32(_mm_loadl_epi64(p as *const __m128i));
+                let a = _mm_srai_epi32::<SHIFT>(_mm_add_epi32(*val, round));
+                let sres = _mm_add_epi32(d, a);
+                let sres = _mm_min_epi32(_mm_max_epi32(sres, zero), maxv);
+                _mm_storel_epi64(p as *mut __m128i, _mm_packus_epi32(sres, sres));
+            }
+        }
+    }
+
+    /// 4-lane `round_shift` (SSE4.1 width; the enclosing module is AVX2-gated).
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn rs4(x: __m128i) -> __m128i {
+        _mm_srai_epi32::<14>(_mm_add_epi32(x, _mm_set1_epi32(1 << 13)))
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn mul4(x: __m128i, k: i64) -> __m128i {
+        _mm_mullo_epi32(x, _mm_set1_epi32(k as i32))
+    }
+
+    /// The 4-lane 1-D `idct4` butterfly — mirrors the scalar exactly.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn bfly4(v: [__m128i; 4]) -> [__m128i; 4] {
+        let c = |i: usize| COSPI[i];
+        let s0 = rs4(mul4(_mm_add_epi32(v[0], v[2]), c(16)));
+        let s1 = rs4(mul4(_mm_sub_epi32(v[0], v[2]), c(16)));
+        let s2 = rs4(_mm_sub_epi32(mul4(v[1], c(24)), mul4(v[3], c(8))));
+        let s3 = rs4(_mm_add_epi32(mul4(v[1], c(8)), mul4(v[3], c(24))));
+        [
+            _mm_add_epi32(s0, s3),
+            _mm_add_epi32(s1, s2),
+            _mm_sub_epi32(s1, s2),
+            _mm_sub_epi32(s0, s3),
+        ]
+    }
+
+    /// 4×4 i32 transpose.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn transpose4(m: [__m128i; 4]) -> [__m128i; 4] {
+        let t0 = _mm_unpacklo_epi32(m[0], m[1]);
+        let t1 = _mm_unpackhi_epi32(m[0], m[1]);
+        let t2 = _mm_unpacklo_epi32(m[2], m[3]);
+        let t3 = _mm_unpackhi_epi32(m[2], m[3]);
+        [
+            _mm_unpacklo_epi64(t0, t2),
+            _mm_unpackhi_epi64(t0, t2),
+            _mm_unpacklo_epi64(t1, t3),
+            _mm_unpackhi_epi64(t1, t3),
+        ]
+    }
+
+    /// 4×4 inverse DCT + add, entirely in registers.
+    ///
+    /// Structurally identical to [`idct8x8_add`]: transpose, butterfly,
+    /// transpose, butterfly — the transposition that the scalar path pays for
+    /// with a strided gather per column happens here as register shuffles.
+    ///
+    /// # Safety
+    /// AVX2 must be available, `coeffs` must hold 16 i32, and `dest` must cover
+    /// 4 rows of 4 `u16` at `stride` — the same accesses the scalar path makes.
+    pub(super) unsafe fn idct4x4_add(
+        coeffs: &[i32],
+        dest: &mut [u16],
+        stride: usize,
+        max: i32,
+        nz_rows: usize,
+    ) {
+        let zero = _mm_setzero_si128();
+        let mut v: [__m128i; 4] = std::array::from_fn(|r| {
+            if r < nz_rows {
+                _mm_loadu_si128(coeffs.as_ptr().add(r * 4) as *const __m128i)
+            } else {
+                zero
+            }
+        });
+        v = transpose4(v);
+        v = bfly4(v);
+        v = transpose4(v);
+        v = bfly4(v);
+        // round_pow2(x, 4), add prediction, clamp, store (per output row).
+        let round = _mm_set1_epi32(1 << 3);
+        let maxv = _mm_set1_epi32(max);
+        for (r, val) in v.iter().enumerate() {
+            let d = _mm_cvtepu16_epi32(_mm_loadl_epi64(
+                dest.as_ptr().add(r * stride) as *const __m128i
+            ));
+            let add = _mm_srai_epi32::<4>(_mm_add_epi32(*val, round));
+            let s = _mm_add_epi32(d, add);
+            let s = _mm_min_epi32(_mm_max_epi32(s, zero), maxv);
+            _mm_storel_epi64(
+                dest.as_mut_ptr().add(r * stride) as *mut __m128i,
+                _mm_packus_epi32(s, s),
+            );
+        }
+    }
+
     pub(super) unsafe fn idct8x8_add(
         coeffs: &[i32],
         dest: &mut [u16],
@@ -1530,5 +2131,608 @@ mod tests {
             }
         }
         assert_eq!(bad, 0, "{bad} idct4x4 mismatches vs libvpx");
+    }
+}
+
+#[cfg(test)]
+mod sparse_tx_tests {
+    use super::*;
+
+    /// The DC-only offset must be bit-identical to running the real inverse DCT
+    /// twice, at every transform size and across the coefficient range a
+    /// conformant (or hostile) stream can present.
+    #[test]
+    fn dc_offset_matches_full_idct() {
+        for n in [4usize, 8, 16, 32] {
+            for dc in [
+                0, 1, -1, 255, -255, 1023, -1023, 4096, -4096, 32767, -32767,
+                65535, -65535, 1 << 20, -(1 << 20), i32::MAX / 4, -(i32::MAX / 4),
+            ] {
+                assert_eq!(dc_offset(dc), dc_offset_reference(dc, n), "dc={dc} n={n}");
+            }
+            for dc in -8192..=8192 {
+                assert_eq!(dc_offset(dc), dc_offset_reference(dc, n), "dc={dc} n={n}");
+            }
+        }
+    }
+
+    /// The `nz_rows == 1` column collapse: an inverse DCT whose only non-zero
+    /// input is index 0 produces the SAME constant in every output, and that
+    /// constant is `round_shift(v·cospi16)`. This is what licenses replacing the
+    /// whole vertical pass with one rotation per column.
+    #[test]
+    fn dc_only_column_is_constant_rotation() {
+        for n in [4usize, 8, 16, 32] {
+            for v in (-9000..=9000)
+                .step_by(7)
+                .chain([0, 1, -1, i16::MAX as i32, i16::MIN as i32, 1 << 20, -(1 << 20)])
+            {
+                let mut inp = [0i32; 32];
+                let mut out = [0i32; 32];
+                inp[0] = v;
+                idct_1d(&inp[..n], &mut out[..n]);
+                let expect = round_shift(v as i64 * COSPI_16_64);
+                for (k, &o) in out[..n].iter().enumerate() {
+                    assert_eq!(o, expect, "n={n} v={v} k={k}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod idct4_avx2_tests {
+    use super::*;
+
+    /// Overflow proof for the AVX2 idct4×4 path: propagate value INTERVALS
+    /// through the exact butterfly dataflow (both passes, per-index bounds
+    /// between them) and assert every i32 product `val·COSPI` stays below
+    /// i32::MAX at the dispatch bound. Interval arithmetic ignores correlations,
+    /// so passing here strictly over-proves safety.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn idct4x4_avx2_bound_is_safe() {
+        let b = IDCT4_AVX2_MAX_COEF as i64;
+        let c = |i: usize| COSPI[i];
+        let pass = |inb: [i64; 4]| -> [i64; 4] {
+            let mut check = |v: i64, k: i64| {
+                assert!(v * k < i32::MAX as i64, "product {v}·{k} overflows i32");
+                (v * k + (1 << 13)) >> 14
+            };
+            let s0 = check(inb[0] + inb[2], c(16));
+            let s1 = check(inb[0] + inb[2], c(16));
+            let s2 = check(inb[1], c(24)) + check(inb[3], c(8));
+            let s3 = check(inb[1], c(8)) + check(inb[3], c(24));
+            [s0 + s3, s1 + s2, s1 + s2, s0 + s3]
+        };
+        let after_rows = pass([b; 4]);
+        let _ = pass(after_rows);
+    }
+
+    /// The AVX2 kernel must be BIT-IDENTICAL to the scalar twin on random blocks
+    /// within the dispatch bound, at every `nz_rows` and against a non-trivial
+    /// prediction — the scalar path is the oracle, so equality here is the gate.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn idct4x4_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // Deterministic xorshift: no dev-dependency, reproducible failures.
+        let mut st = 0x2545F4914F6CDD1Du64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for trial in 0..4000 {
+            let bound = [1i32, 7, 255, 4095, IDCT4_AVX2_MAX_COEF][trial % 5];
+            let mut coeffs = [0i32; 16];
+            for v in coeffs.iter_mut() {
+                *v = (next() % (2 * bound as u64 + 1)) as i32 - bound;
+            }
+            let nz_rows = 1 + (trial % 4);
+            // Zero the rows the caller promises are zero.
+            for r in nz_rows..4 {
+                coeffs[r * 4..r * 4 + 4].iter_mut().for_each(|v| *v = 0);
+            }
+            let stride = 8usize;
+            let mut pred = [0u16; 4 * 8];
+            for p in pred.iter_mut() {
+                *p = (next() % 256) as u16;
+            }
+            let (mut a, mut b) = (pred, pred);
+            // scalar oracle
+            TX_TMP.with(|cell| {
+                let mut tmp = cell.borrow_mut();
+                for r in 0..nz_rows {
+                    let (i, o) = (&coeffs[r * 4..r * 4 + 4], &mut tmp[r * 4..r * 4 + 4]);
+                    idct_1d(i, o);
+                }
+                tmp[nz_rows * 4..16].iter_mut().for_each(|v| *v = 0);
+                let mut ci = [0i32; 32];
+                let mut co = [0i32; 32];
+                for col in 0..4 {
+                    for r in 0..4 {
+                        ci[r] = tmp[r * 4 + col];
+                    }
+                    idct_1d(&ci[..4], &mut co[..4]);
+                    for r in 0..4 {
+                        let v = a[r * stride + col] as i32 + round_pow2(co[r], 4);
+                        a[r * stride + col] = v.clamp(0, 255) as u16;
+                    }
+                }
+            });
+            // SAFETY: avx2 checked above; shapes match the kernel's contract.
+            unsafe {
+                idct_avx2::idct4x4_add(&coeffs, &mut b, stride, 255, nz_rows);
+            }
+            assert_eq!(a, b, "trial {trial} nz_rows={nz_rows} bound={bound}");
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod idct16_avx2_tests {
+    use super::*;
+
+    /// Interval-arithmetic overflow proof for the AVX2 16x16 COLUMN pass.
+    ///
+    /// Propagates the magnitude bound through the SCALAR row pass first (which is
+    /// what feeds the vector pass), then through the vector butterfly, asserting
+    /// every 32-bit product `val · COSPI` stays inside i32. Adds are bounded by
+    /// the sum of magnitudes and rotations by `(|v|·k + 2^13) >> 14`; ignoring
+    /// sign correlations makes this strictly pessimistic, so passing over-proves.
+    #[test]
+    fn idct16x16_avx2_bound_is_safe() {
+        let c = |i: usize| COSPI[i] as i64;
+        // One 1-D idct16 over per-index magnitude bounds; asserts each product fits.
+        let pass = |inb: [i64; 16]| -> [i64; 16] {
+            let rot = |v: i64, k: i64| -> i64 {
+                assert!(
+                    v * k < i32::MAX as i64,
+                    "product {v}·{k} overflows i32 in the vector butterfly"
+                );
+                (v * k + (1 << 13)) >> 14
+            };
+            let s1 = [
+                inb[0], inb[8], inb[4], inb[12], inb[2], inb[10], inb[6], inb[14],
+                inb[1], inb[9], inb[5], inb[13], inb[3], inb[11], inb[7], inb[15],
+            ];
+            let mut s = s1;
+            s[8] = rot(s1[8], c(30)) + rot(s1[15], c(2));
+            s[15] = rot(s1[8], c(2)) + rot(s1[15], c(30));
+            s[9] = rot(s1[9], c(14)) + rot(s1[14], c(18));
+            s[14] = rot(s1[9], c(18)) + rot(s1[14], c(14));
+            s[10] = rot(s1[10], c(22)) + rot(s1[13], c(10));
+            s[13] = rot(s1[10], c(10)) + rot(s1[13], c(22));
+            s[11] = rot(s1[11], c(6)) + rot(s1[12], c(26));
+            s[12] = rot(s1[11], c(26)) + rot(s1[12], c(6));
+            let mut t = s;
+            t[4] = rot(s[4], c(28)) + rot(s[7], c(4));
+            t[7] = rot(s[4], c(4)) + rot(s[7], c(28));
+            t[5] = rot(s[5], c(12)) + rot(s[6], c(20));
+            t[6] = rot(s[5], c(20)) + rot(s[6], c(12));
+            t[8] = s[8] + s[9];
+            t[9] = s[8] + s[9];
+            t[10] = s[10] + s[11];
+            t[11] = s[10] + s[11];
+            t[12] = s[12] + s[13];
+            t[13] = s[12] + s[13];
+            t[14] = s[14] + s[15];
+            t[15] = s[14] + s[15];
+            let mut u = t;
+            u[0] = rot(t[0] + t[1], c(16));
+            u[1] = rot(t[0] + t[1], c(16));
+            u[2] = rot(t[2], c(24)) + rot(t[3], c(8));
+            u[3] = rot(t[2], c(8)) + rot(t[3], c(24));
+            u[4] = t[4] + t[5];
+            u[5] = t[4] + t[5];
+            u[6] = t[6] + t[7];
+            u[7] = t[6] + t[7];
+            u[9] = rot(t[9], c(8)) + rot(t[14], c(24));
+            u[14] = rot(t[9], c(24)) + rot(t[14], c(8));
+            u[10] = rot(t[10], c(24)) + rot(t[13], c(8));
+            u[13] = rot(t[10], c(8)) + rot(t[13], c(24));
+            let mut v = u;
+            v[0] = u[0] + u[3];
+            v[1] = u[1] + u[2];
+            v[2] = u[1] + u[2];
+            v[3] = u[0] + u[3];
+            v[5] = rot(u[6] + u[5], c(16));
+            v[6] = rot(u[5] + u[6], c(16));
+            v[8] = u[8] + u[11];
+            v[9] = u[9] + u[10];
+            v[10] = u[9] + u[10];
+            v[11] = u[8] + u[11];
+            v[12] = u[12] + u[15];
+            v[13] = u[13] + u[14];
+            v[14] = u[13] + u[14];
+            v[15] = u[12] + u[15];
+            let mut w = v;
+            w[0] = v[0] + v[7];
+            w[1] = v[1] + v[6];
+            w[2] = v[2] + v[5];
+            w[3] = v[3] + v[4];
+            w[4] = v[3] + v[4];
+            w[5] = v[2] + v[5];
+            w[6] = v[1] + v[6];
+            w[7] = v[0] + v[7];
+            w[10] = rot(v[10] + v[13], c(16));
+            w[13] = rot(v[10] + v[13], c(16));
+            w[11] = rot(v[11] + v[12], c(16));
+            w[12] = rot(v[11] + v[12], c(16));
+            let mut out = [0i64; 16];
+            for i in 0..8 {
+                out[i] = w[i] + w[15 - i];
+                out[15 - i] = w[i] + w[15 - i];
+            }
+            out
+        };
+        // Only ONE pass is proven here, because only the COLUMN pass runs in
+        // 32-bit vector lanes — the row pass stays scalar with i64 intermediates
+        // and cannot overflow. Gating on the row pass's actual output (rather
+        // than on the coefficients) also avoids compounding this already
+        // pessimistic bound through a second pass, which cost ~10x of headroom.
+        let _ = pass([IDCT16_VEC_MAX_IN as i64; 16]);
+    }
+
+    /// The vectorized column pass must be BIT-IDENTICAL to the scalar column
+    /// loop it replaces, on random blocks at the dispatch bound and against a
+    /// non-trivial prediction.
+    #[test]
+    fn idct16_cols_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut st = 0x9E3779B97F4A7C15u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for trial in 0..500 {
+            let bound = [1i64, 63, 1023, 4096][trial % 4];
+            // Row-pass output, produced by the real scalar idct16 so the vector
+            // pass sees exactly the values it would see in production.
+            let mut coeffs = [0i32; 256];
+            for v in coeffs.iter_mut() {
+                *v = (next() % (2 * bound as u64 + 1)) as i32 - bound as i32;
+            }
+            let mut tmp = [0i32; 256];
+            for r in 0..16 {
+                let (i, o) = (&coeffs[r * 16..r * 16 + 16], &mut tmp[r * 16..r * 16 + 16]);
+                idct_1d(i, o);
+            }
+            let stride = 24usize;
+            let mut pred = [0u16; 16 * 24];
+            for p in pred.iter_mut() {
+                *p = (next() % 256) as u16;
+            }
+            let (mut a, mut b) = (pred, pred);
+            let mut ci = [0i32; 32];
+            let mut co = [0i32; 32];
+            for col in 0..16 {
+                for r in 0..16 {
+                    ci[r] = tmp[r * 16 + col];
+                }
+                idct_1d(&ci[..16], &mut co[..16]);
+                for r in 0..16 {
+                    let v = a[r * stride + col] as i32 + round_pow2(co[r], 6);
+                    a[r * stride + col] = v.clamp(0, 255) as u16;
+                }
+            }
+            // SAFETY: avx2 checked; shapes match the kernel contract.
+            unsafe {
+                idct_avx2::idct16_cols_add(&tmp, &mut b, stride, 255);
+            }
+            assert_eq!(a, b, "trial {trial} bound={bound}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tx_microbench {
+    //! In-process microbenchmark for the inverse transform.
+    //!
+    //! The decode-stage wall carries +-7..14% run-to-run noise on this machine,
+    //! which is larger than most transform bricks — three separate measurements
+    //! in this campaign were unreadable because of it, and one changed SIGN
+    //! between runs. This drives the kernel directly, with no I/O, no decode
+    //! plumbing and no process spawn, over a fixed synthetic corpus, and reports
+    //! median cycles/call. It is the honest instrument for a kernel change.
+    //!
+    //!   cargo test -p rff-codec-vp9 --release tx_microbench -- --ignored --nocapture
+    use super::*;
+
+    fn rdtsc() -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: `_rdtsc` has no operands and no side effects.
+        unsafe {
+            std::arch::x86_64::_rdtsc()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        0
+    }
+
+    /// A fixed pseudo-random corpus with a realistic sparsity mix, so the
+    /// benchmark exercises the same `nz_rows` distribution the corpus showed
+    /// (most blocks sparse, a tail of dense ones) rather than all-dense blocks.
+    fn corpus(n: usize, blocks: usize) -> Vec<(Vec<i32>, usize)> {
+        let mut st = 0xD1B54A32D192ED03u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        (0..blocks)
+            .map(|b| {
+                // nz_rows mix measured on the Derf corpus: heavily weighted to
+                // the sparse end with a dense tail.
+                let nz = match b % 8 {
+                    0 | 1 => 1,
+                    2 | 3 => 2,
+                    4 => 3,
+                    5 => 4,
+                    6 => n / 2,
+                    _ => n,
+                };
+                let nz = nz.clamp(1, n);
+                let mut c = vec![0i32; n * n];
+                for v in c[..n * nz].iter_mut() {
+                    // Magnitudes in the range real dequantized coefficients occupy.
+                    *v = (next() % 2048) as i32 - 1024;
+                }
+                (c, nz)
+            })
+            .collect()
+    }
+
+    fn bench_size(n: usize) -> f64 {
+        let blocks = corpus(n, 64);
+        let stride = n + 8;
+        let mut dest = vec![128u16; stride * n];
+        let mut best = f64::MAX;
+        for _pass in 0..9 {
+            let t0 = rdtsc();
+            for (c, nz) in &blocks {
+                inverse_transform_add_rows(c, n, TxType::DctDct, &mut dest, stride, 255, *nz);
+            }
+            let dt = (rdtsc() - t0) as f64 / blocks.len() as f64;
+            best = best.min(dt);
+        }
+        best
+    }
+
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn profile_inverse_transform() {
+        // Warm up so the first timed pass is not paying page faults.
+        let _ = bench_size(8);
+        println!("\ninverse_transform_add_rows — best-of-9, cycles/call");
+        for n in [4usize, 8, 16, 32] {
+            println!("  {:>2}x{:<2}  {:>9.1}", n, n, bench_size(n));
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod idct32_avx2_tests {
+    use super::*;
+
+    /// The vectorized 32-point column pass must be BIT-IDENTICAL to the scalar
+    /// column loop it replaces. This is the gate that catches any error in the
+    /// even/odd decomposition or the odd-half transcription.
+    #[test]
+    fn idct32_cols_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut st = 0xA24BAED4963EE407u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for trial in 0..200 {
+            let bound = [1i64, 31, 511, 2048][trial % 4];
+            let mut coeffs = [0i32; 1024];
+            let nz = 1 + (trial % 32);
+            for v in coeffs[..32 * nz].iter_mut() {
+                *v = (next() % (2 * bound as u64 + 1)) as i32 - bound as i32;
+            }
+            let mut tmp = [0i32; 1024];
+            for r in 0..nz {
+                let (i, o) = (&coeffs[r * 32..r * 32 + 32], &mut tmp[r * 32..r * 32 + 32]);
+                idct_1d(i, o);
+            }
+            let stride = 40usize;
+            let mut pred = vec![0u16; 32 * stride];
+            for p in pred.iter_mut() {
+                *p = (next() % 256) as u16;
+            }
+            let (mut a, mut b) = (pred.clone(), pred);
+            let mut ci = [0i32; 32];
+            let mut co = [0i32; 32];
+            for col in 0..32 {
+                for r in 0..32 {
+                    ci[r] = tmp[r * 32 + col];
+                }
+                idct_1d(&ci, &mut co);
+                for r in 0..32 {
+                    let v = a[r * stride + col] as i32 + round_pow2(co[r], 6);
+                    a[r * stride + col] = v.clamp(0, 255) as u16;
+                }
+            }
+            // SAFETY: avx2 checked; shapes match the kernel contract.
+            unsafe {
+                idct_avx2::idct32_cols_add(&tmp, &mut b, stride, 255);
+            }
+            assert_eq!(a, b, "trial {trial} nz={nz} bound={bound}");
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod idct32_bound_proof {
+    use super::*;
+
+    /// Interval-arithmetic overflow proof for the AVX2 32x32 COLUMN pass.
+    ///
+    /// Mirrors `bfly32`'s own structure: the even half is an `idct16`, the odd
+    /// half is propagated stage by stage, and the final combine is |lo| + |odd|.
+    /// Adds are bounded by the sum of magnitudes and rotations by
+    /// `(|v|·k + 2^13) >> 14`; ignoring sign correlations makes this strictly
+    /// pessimistic, so passing over-proves safety.
+    fn propagate(t_in: i64) -> bool {
+        let c = |i: usize| COSPI[i] as i64;
+        let ok = std::cell::Cell::new(true);
+        let rot = |v: i64, k: i64| -> i64 {
+            if v * k >= i32::MAX as i64 {
+                ok.set(false);
+            }
+            (v * k + (1 << 13)) >> 14
+        };
+        // ---- even half: the idct16 magnitude pass ----
+        let idct16_bound = |inb: [i64; 16]| -> [i64; 16] {
+            let s1 = [
+                inb[0], inb[8], inb[4], inb[12], inb[2], inb[10], inb[6], inb[14],
+                inb[1], inb[9], inb[5], inb[13], inb[3], inb[11], inb[7], inb[15],
+            ];
+            let mut s = s1;
+            s[8] = rot(s1[8], c(30)) + rot(s1[15], c(2));
+            s[15] = rot(s1[8], c(2)) + rot(s1[15], c(30));
+            s[9] = rot(s1[9], c(14)) + rot(s1[14], c(18));
+            s[14] = rot(s1[9], c(18)) + rot(s1[14], c(14));
+            s[10] = rot(s1[10], c(22)) + rot(s1[13], c(10));
+            s[13] = rot(s1[10], c(10)) + rot(s1[13], c(22));
+            s[11] = rot(s1[11], c(6)) + rot(s1[12], c(26));
+            s[12] = rot(s1[11], c(26)) + rot(s1[12], c(6));
+            let mut t = s;
+            t[4] = rot(s[4], c(28)) + rot(s[7], c(4));
+            t[7] = rot(s[4], c(4)) + rot(s[7], c(28));
+            t[5] = rot(s[5], c(12)) + rot(s[6], c(20));
+            t[6] = rot(s[5], c(20)) + rot(s[6], c(12));
+            for k in [8usize, 10, 12, 14] {
+                let (a, b) = (s[k], s[k + 1]);
+                t[k] = a + b;
+                t[k + 1] = a + b;
+            }
+            let mut u = t;
+            u[0] = rot(t[0] + t[1], c(16));
+            u[1] = rot(t[0] + t[1], c(16));
+            u[2] = rot(t[2], c(24)) + rot(t[3], c(8));
+            u[3] = rot(t[2], c(8)) + rot(t[3], c(24));
+            u[4] = t[4] + t[5];
+            u[5] = t[4] + t[5];
+            u[6] = t[6] + t[7];
+            u[7] = t[6] + t[7];
+            u[9] = rot(t[9], c(8)) + rot(t[14], c(24));
+            u[14] = rot(t[9], c(24)) + rot(t[14], c(8));
+            u[10] = rot(t[10], c(24)) + rot(t[13], c(8));
+            u[13] = rot(t[10], c(8)) + rot(t[13], c(24));
+            let mut v = u;
+            v[0] = u[0] + u[3];
+            v[1] = u[1] + u[2];
+            v[2] = u[1] + u[2];
+            v[3] = u[0] + u[3];
+            v[5] = rot(u[5] + u[6], c(16));
+            v[6] = rot(u[5] + u[6], c(16));
+            v[8] = u[8] + u[11];
+            v[9] = u[9] + u[10];
+            v[10] = u[9] + u[10];
+            v[11] = u[8] + u[11];
+            v[12] = u[12] + u[15];
+            v[13] = u[13] + u[14];
+            v[14] = u[13] + u[14];
+            v[15] = u[12] + u[15];
+            let mut w = v;
+            for i in 0..4 {
+                w[i] = v[i] + v[7 - i];
+                w[7 - i] = v[i] + v[7 - i];
+            }
+            w[10] = rot(v[10] + v[13], c(16));
+            w[13] = rot(v[10] + v[13], c(16));
+            w[11] = rot(v[11] + v[12], c(16));
+            w[12] = rot(v[11] + v[12], c(16));
+            let mut out = [0i64; 16];
+            for i in 0..8 {
+                out[i] = w[i] + w[15 - i];
+                out[15 - i] = w[i] + w[15 - i];
+            }
+            out
+        };
+        let lo = idct16_bound([t_in; 16]);
+        // ---- odd half ----
+        let mut t = [0i64; 16];
+        const ODD: [(usize, usize); 8] = [(31, 1), (15, 17), (23, 9), (7, 25), (27, 5), (11, 21), (19, 13), (3, 29)];
+        for (i, &(ca, cb)) in ODD.iter().enumerate() {
+            t[i] = rot(t_in, c(ca)) + rot(t_in, c(cb));
+            t[15 - i] = rot(t_in, c(cb)) + rot(t_in, c(ca));
+        }
+        let mut u = t;
+        for j in [0usize, 2, 4, 6, 8, 10, 12, 14] {
+            let (a, b) = (t[j], t[j + 1]);
+            u[j] = a + b;
+            u[j + 1] = a + b;
+        }
+        let mut v = u;
+        v[1] = rot(u[1], c(4)) + rot(u[14], c(28));
+        v[14] = rot(u[1], c(28)) + rot(u[14], c(4));
+        v[2] = rot(u[2], c(28)) + rot(u[13], c(4));
+        v[13] = rot(u[2], c(4)) + rot(u[13], c(28));
+        v[5] = rot(u[5], c(20)) + rot(u[10], c(12));
+        v[10] = rot(u[5], c(12)) + rot(u[10], c(20));
+        v[6] = rot(u[6], c(12)) + rot(u[9], c(20));
+        v[9] = rot(u[6], c(20)) + rot(u[9], c(12));
+        let mut w = v;
+        for (a, b) in [(0usize, 3usize), (1, 2), (4, 7), (5, 6), (8, 11), (9, 10), (12, 15), (13, 14)] {
+            let m = v[a] + v[b];
+            w[a] = m;
+            w[b] = m;
+        }
+        let mut x = w;
+        x[2] = rot(w[2], c(8)) + rot(w[13], c(24));
+        x[13] = rot(w[2], c(24)) + rot(w[13], c(8));
+        x[3] = rot(w[3], c(8)) + rot(w[12], c(24));
+        x[12] = rot(w[3], c(24)) + rot(w[12], c(8));
+        x[4] = rot(w[4], c(24)) + rot(w[11], c(8));
+        x[11] = rot(w[4], c(8)) + rot(w[11], c(24));
+        x[5] = rot(w[5], c(24)) + rot(w[10], c(8));
+        x[10] = rot(w[5], c(8)) + rot(w[10], c(24));
+        let mut y = x;
+        for i in 0..4 {
+            let m = x[i] + x[7 - i];
+            y[i] = m;
+            y[7 - i] = m;
+        }
+        for i in 8..12 {
+            let m = x[i] + x[23 - i];
+            y[i] = m;
+            y[23 - i] = m;
+        }
+        let mut z = y;
+        for (a, b) in [(4usize, 11usize), (5, 10), (6, 9), (7, 8)] {
+            let m = rot(y[a] + y[b], c(16));
+            z[a] = m;
+            z[b] = m;
+        }
+        for i in 0..16 {
+            let _ = lo[i] + z[15 - i];
+        }
+        ok.get()
+    }
+
+    #[test]
+    fn idct32x32_avx2_bound_is_safe() {
+        assert!(
+            propagate(IDCT32_VEC_MAX_IN as i64),
+            "IDCT32_VEC_MAX_IN={} admits an i32 overflow in the vector butterfly",
+            IDCT32_VEC_MAX_IN
+        );
     }
 }
