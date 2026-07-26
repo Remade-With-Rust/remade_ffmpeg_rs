@@ -1,0 +1,44 @@
+# Function-level speed analyzer: our AV1 (rusty_av1e / rusty_av1d) vs libaom,
+# dav1d and ffmpeg, on the same fixed `video-tests` corpus as the VP9 analyzer.
+#
+# Pure Rust and OUTSIDE the main workspace. The AV1 codecs come from PATH deps
+# into the local rusty-av1-toolkit checkout rather than the git rev pinned in the
+# root Cargo.toml, for one reason: the stage profilers in both forks are behind a
+# `profile` cargo feature, and a feature cannot be enabled on a git dependency
+# from a different workspace. The checkout MUST sit at the pinned rev
+# (b471be0) or this measures a different encoder than the one rff ships.
+[package]
+name = "rff-av1-analyzer"
+version = "0.0.0"
+edition = "2021"
+license = "BSD-2-Clause"
+publish = false
+
+[workspace]
+
+[dependencies]
+rff-video-harness = { path = "../harness" }
+
+# `default-features = false` drops rav1e's `binaries` feature (clap, y4m, ivf,
+# av-metrics, ...) — we drive the library API directly and none of that would be
+# linked, only built. `asm` and `threading` are kept: they are what the shipped
+# encoder uses, and measuring without them would flatter every reference.
+rusty_av1e = { path = "../../../rs_AV2ed/rusty-av1-toolkit/rusty_av1e", package = "rav1e", default-features = false, features = ["asm", "threading"] }
+rusty_av1d = { path = "../../../rs_AV2ed/rusty-av1-toolkit/rusty_av1d", package = "rav1d", default-features = false, features = ["asm", "bitdepth_8", "bitdepth_16"] }
+
+[features]
+# Turns on the stage profilers inside both forks. Unlike our VP9 profilers (which
+# are runtime-gated, so one binary serves both passes), these are compile-time
+# feature gates, so the AV1 analyzer really is built TWICE — exactly the split
+# `_ref_x264`/`_ref_libvpx` use, and for the same reason: the profiler-off build
+# must carry no instrumentation at all.
+profile = ["rusty_av1e/profile", "rusty_av1d/profile"]
+
+[[bin]]
+name = "analyzer-av1"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

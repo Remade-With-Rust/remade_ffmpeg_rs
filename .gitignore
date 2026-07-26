@@ -20,3 +20,8 @@ __pycache__/
 
 # Local media corpora for quality campaigns (WAV/Y4M, tens of MB) — never published
 /corpus/
+
+# video-tests: measurement outputs and the optional local corpus copy.
+video-tests/results/
+video-tests/clips/
+video-tests/*/target/

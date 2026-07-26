@@ -1,0 +1,21 @@
+# Pieces every per-codec analyzer needs, factored out so VP9 and AV1 measure the
+# same way: the y4m corpus reader, the manifest, the ffmpeg arm, and the quality
+# metric. Codec-specific arms live in the analyzer crates.
+#
+# Pure Rust, no path deps into the codec crates — this crate must stay usable by
+# an analyzer whose codec lives in another repository (the AV1 forks do).
+[package]
+name = "rff-video-harness"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

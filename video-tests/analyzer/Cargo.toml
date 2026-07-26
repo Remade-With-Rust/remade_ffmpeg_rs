@@ -1,0 +1,31 @@
+# Function-level speed analyzer: rff-vp9 vs libvpx/ffmpeg, on the fixed
+# `video-tests` corpus.
+#
+# Pure Rust and OUTSIDE the main workspace (empty [workspace] table) so it shares
+# no build graph with the codec crates and can never be pulled into a shipped
+# binary. libvpx and ffmpeg are driven as EXTERNAL processes; nothing here
+# compiles C or C++.
+[package]
+name = "rff-vp9-analyzer"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+rff-core = { path = "../../crates/rff-core" }
+rff-codec = { path = "../../crates/rff-codec" }
+rff-codec-vp9 = { path = "../../crates/rff-codec-vp9" }
+
+[[bin]]
+name = "analyzer"
+path = "src/main.rs"
+
+# Matches the release profile the CLI ships with, so the throughput numbers here
+# are the numbers a user would actually get.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
