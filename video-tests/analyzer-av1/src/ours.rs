@@ -20,7 +20,7 @@ use rff_video_harness::y4m::Clip;
 pub use rusty_av1d::prof as dec_prof;
 pub use rusty_av1e::prof as enc_prof;
 
-use rusty_av1d::{Decoder as Rav1dDec, Rav1dError};
+use rusty_av1d::{Decoder as Rav1dDec, Rav1dError, Settings as Rav1dSettings};
 use rusty_av1e::prelude::{ChromaSampling, Config, Context, EncoderConfig, EncoderStatus};
 
 /// Build the encoder at library defaults for this clip's geometry.
@@ -113,7 +113,15 @@ pub fn encode_speed(
 }
 
 fn decode_once(packets: &[Vec<u8>]) -> Result<(Duration, usize), String> {
-    let mut dec = Rav1dDec::new().map_err(|e| format!("rav1d init: {e:?}"))?;
+    // PIN TO ONE THREAD. rav1d's `n_threads` defaults to 0, which means AUTO =
+    // every core (lib.rs: `if s.n_threads.get() != 0`), so `Decoder::new()` would
+    // race a multi-threaded decoder against the `-threads 1` we pin ffmpeg to —
+    // inflating our numbers by the core count. The harness's whole premise is
+    // single-threaded per-function attribution on every arm.
+    let mut settings = Rav1dSettings::new();
+    settings.set_n_threads(1);
+    let mut dec =
+        Rav1dDec::with_settings(&settings).map_err(|e| format!("rav1d init: {e:?}"))?;
     let mut n = 0usize;
     let t = Instant::now();
     for (i, p) in packets.iter().enumerate() {
