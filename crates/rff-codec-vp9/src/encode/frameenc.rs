@@ -584,6 +584,30 @@ pub struct FrameEncoder {
     /// G1 threshold scale — 1.0 at speed 0; presets raise it (a speed/BD trade
     /// the G2 sweep mapped: bumps help motion clips, cost static ones).
     g1_scale: f64,
+    /// Resolution-aware multiplier on the G1 partition gate, `(pixels/CIF)^alpha`.
+    /// `VP9_G1_AREA` sets alpha; **default 0.0 = off, and REFUTED — see below.**
+    ///
+    /// The motivating measurement is sound: on identical content at two resolutions
+    /// (city, 352x288 vs 704x576, 30 frames, both encoders at their quality preset)
+    /// 4x the pixels costs libvpx 1.71x the time and costs us 2.64x, so libvpx
+    /// amortizes 2.34x per pixel against our 1.51x — a real 1.55x scaling deficit.
+    /// The theory was that larger frames spread detail over more pixels, so a big
+    /// partition is more often optimal and the gate can afford to be aggressive.
+    ///
+    /// BD-rate REFUTED it. 4 CRFs x 30 frames, PSNR and rate over the same frames:
+    ///
+    ///            alpha=0.3            alpha=0.6
+    ///   city     +4.25% BD / -11.8%   +6.59% BD / -22.7%
+    ///   harbour  +1.17% BD / -15.7%   +1.86% BD / -25.0%
+    ///   soccer   +2.81% BD / -12.8%   +8.50% BD / -25.2%
+    ///
+    /// Worse on 6 of 6 cells. This reproduces the existing `set_speed` finding that
+    /// escalating `g1_scale` is the toxic lever because the partition gate prunes
+    /// exactly where split matters — making that escalation resolution-aware does
+    /// not rescue it. The scaling deficit is real but the partition gate is the
+    /// WRONG lever for it; the knob is kept default-off so the next attempt starts
+    /// from the measurement rather than repeating it.
+    g1_area: f64,
     /// Content-adaptive partition: route this superblock's partition decision
     /// through the O(pixels) variance tree (`varpart`) instead of the recursive RD
     /// search. `VP9_VAR_PART=1` forces it ON for EVERY SB (the Brick-2 standalone
@@ -1060,6 +1084,7 @@ impl FrameEncoder {
             g1_gate: std::env::var("VP9_NO_G1GATE").is_err(),
             g3_gate: std::env::var("VP9_G3GATE").is_ok(), // harvest-first: off by default
             g1_scale: 1.0,
+            g1_area: 1.0,
             var_part: std::env::var("VP9_VAR_PART").is_ok(),
             var_thresh_mult: std::env::var("VP9_VAR_THRESH")
                 .ok()
@@ -1113,6 +1138,18 @@ impl FrameEncoder {
         };
         // The MC filter defaults to the fixed frame filter; a switchable frame (4)
         // starts the mode search at EIGHTTAP(0) and the per-block search refines it.
+        // Resolution-aware G1 gate. `VP9_G1_AREA` is the exponent alpha; unset (0.0)
+        // reproduces the fixed-threshold behaviour byte-for-byte. CIF (352x288) is the
+        // reference area because the gate's percentiles were swept on CIF content.
+        {
+            const CIF_PX: f64 = 352.0 * 288.0;
+            let alpha = env_f64("VP9_G1_AREA").unwrap_or(0.0);
+            fe.g1_area = if alpha == 0.0 {
+                1.0
+            } else {
+                ((width * height) as f64 / CIF_PX).max(1.0).powf(alpha)
+            };
+        }
         fe.active_filter = if fe.interp_filter < 4 { fe.interp_filter as u8 } else { 0 };
         // u8 search mirror of the luma source (values are exact for 8-bit).
         if fe.max_px == 255 {
@@ -2237,6 +2274,7 @@ impl FrameEncoder {
 
     /// Store one block's mode info across the mi cells it covers.
     fn store_mi(&mut self, mi_row: usize, mi_col: usize, bwl: usize, bhl: usize, mi: &ModeInfo) {
+        let _sm = prof::Scope::new(prof::S::StoreMi);
         let x_mis = (1usize << (bwl - 1)).min(self.mi_cols - mi_col);
         let y_mis = (1usize << (bhl - 1)).min(self.mi_rows - mi_row);
         for y in 0..y_mis {
@@ -2252,6 +2290,7 @@ impl FrameEncoder {
     /// the signaling the coefficient cost doesn't include, needed so the partition
     /// RD counts SPLIT's ~4× mode-info overhead against it.
     fn intra_modeinfo_cost_q8(&self, mi: &ModeInfo, mi_row: usize, mi_col: usize) -> u64 {
+        let _mc = prof::Scope::new(prof::S::MiCost);
         let above = self.above_mi(mi_row, mi_col);
         let left = self.left_mi(mi_row, mi_col);
         let sctx = skip_context(above.as_ref(), left.as_ref());
@@ -2300,6 +2339,7 @@ impl FrameEncoder {
         mi_col: usize,
         predictor: Mv,
     ) -> u64 {
+        let _mc = prof::Scope::new(prof::S::MiCost);
         let above = self.above_mi(mi_row, mi_col);
         let left = self.left_mi(mi_row, mi_col);
         let bsize = mi.sb_type as usize;
@@ -2365,6 +2405,7 @@ impl FrameEncoder {
     /// then each 4×4 sub-block's inter-mode symbol and NEWMV MV delta (relative to the
     /// shared `find_mv_refs(NEWMV)` predictor). No tx_size (sub-8×8 forces 4×4).
     fn sub8x8_modeinfo_cost_q8(&self, mi: &ModeInfo, mi_row: usize, mi_col: usize) -> u64 {
+        let _mc = prof::Scope::new(prof::S::MiCost);
         let above = self.above_mi(mi_row, mi_col);
         let left = self.left_mi(mi_row, mi_col);
         let bsize = mi.sb_type as usize;
@@ -2666,6 +2707,7 @@ impl FrameEncoder {
             && none_rd < f64::MAX
             && none_rd / self.lambda
                 < self.g1_scale
+                    * self.g1_area
                     * match bsize {
                         BLOCK_8X8 => 18.0, // bump to 33 at speed 0 was a weak trade (+0.16% BD)
                         6 => 64.0,  // 16x16

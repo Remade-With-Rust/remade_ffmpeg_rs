@@ -54,6 +54,10 @@ pub enum S {
     SnapDrop,     // INFO: BlockSnap Drop — the free() half of snap_block's 7 Vecs
     PartCtx,      // INFO: partition_plane_context + part_flag_cost + G1 gate arithmetic
     VarTree,      // INFO: build_vt + variance (the content-dispatch tree)
+    // Round 2 (2026-07-26): the first bisection left 65% of the glue dark. These
+    // cover the remaining unscoped per-block bookkeeping in the decision path.
+    StoreMi,      // INFO: store_mi — splat the winning ModeInfo across the block's mi grid
+    MiCost,       // INFO: {intra,inter,sub8x8}_modeinfo_cost_q8 — mode-info bit pricing
     Count,
 }
 
@@ -84,6 +88,8 @@ const NAMES: [&str; N] = [
     "[i]snap_drop",
     "[i]part_ctx",
     "[i]var_tree",
+    "[i]store_mi",
+    "[i]mi_cost",
 ];
 
 // The disjoint, non-nested top-level stages (so glue = TOTAL − Σ these). Excludes
@@ -202,6 +208,8 @@ pub fn is_info(i: usize) -> bool {
             || x == S::SnapDrop as usize
             || x == S::PartCtx as usize
             || x == S::VarTree as usize
+            || x == S::StoreMi as usize
+            || x == S::MiCost as usize
     )
 }
 
