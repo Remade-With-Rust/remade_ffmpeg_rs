@@ -12,7 +12,12 @@
 //! repeatable point of the distribution. Interleaving means any drift over the run hits
 //! both arms equally instead of landing entirely on whichever ran second.
 //!
-//! Usage: `cargo run --release -p rff-codec-vp9 --example poolbench -- <in.y4m> <crf> <speed> [reps] [frames]`
+//! Usage: `... --example poolbench -- <in.y4m> <crf> <speed> [reps] [frames] [lever]`
+//! `lever` is `pool` (default), `modemap`, or `null`.
+//!
+//! `null` sets NOTHING, so both arms are the identical encoder. Its output is the
+//! harness's own noise floor — the number below which a reported win or loss means
+//! nothing. Run it before believing any small result.
 
 use std::time::Instant;
 
@@ -24,15 +29,28 @@ fn main() {
     let (path, crf, speed) = (&a[1], &a[2], &a[3]);
     let reps: usize = a.get(4).map_or(5, |s| s.parse().unwrap());
     let want: usize = a.get(5).map_or(usize::MAX, |s| s.parse().unwrap());
+    let lever = a.get(6).map_or("pool", |s| s.as_str());
 
     let frames = read_y4m(path, want);
     let (w, h) = (frames[0].width as usize, frames[0].height as usize);
 
     let mut best = [f64::MAX; 2]; // [pool ON, pool OFF]
     let mut bytes = [0usize; 2];
-    for _ in 0..reps {
-        for (arm, on) in [(0usize, true), (1usize, false)] {
-            rff_codec_vp9::set_snap_pool(on);
+    for rep in 0..reps {
+        // ABBA, not AABB. Running arm 0 first in every rep gives it a systematic edge:
+        // the `null` control (identical arms) measured +2.9/-0.4/+3.4/-0.4% across four
+        // clips — a mean of +1.4% for whichever arm went first, which is pure artefact.
+        // Swapping the order on odd reps cancels it.
+        let order: [(usize, bool); 2] =
+            if rep % 2 == 0 { [(0, true), (1, false)] } else { [(1, false), (0, true)] };
+        for (arm, on) in order {
+            // `on` = the NEW arm in both cases: pooled buffers / packed-key FxHash map.
+            match lever {
+                "modemap" => rff_codec_vp9::set_modemap_std(!on),
+                // Control arm: change nothing, so any spread is pure measurement noise.
+                "null" => {}
+                _ => rff_codec_vp9::set_snap_pool(on),
+            }
             let (dt, n) = encode_once(&frames, crf, speed);
             if dt < best[arm] {
                 best[arm] = dt;
@@ -49,10 +67,10 @@ fn main() {
         std::path::Path::new(path).file_stem().unwrap().to_string_lossy(),
         w, h, frames.len(),
     );
-    println!("  pool ON   {on:7.3} s   ({:6.1} fps)  {} B", frames.len() as f64 / on, bytes[0]);
-    println!("  pool OFF  {off:7.3} s   ({:6.1} fps)  {} B", frames.len() as f64 / off, bytes[1]);
+    println!("  {lever} NEW  {on:7.3} s   ({:6.1} fps)  {} B", frames.len() as f64 / on, bytes[0]);
+    println!("  {lever} OLD  {off:7.3} s   ({:6.1} fps)  {} B", frames.len() as f64 / off, bytes[1]);
     println!(
-        "  => pool is {:+.1}% {}   [size check: {}]",
+        "  => {lever} NEW is {:+.1}% {}   [size check: {}]",
         100.0 * (off / on - 1.0),
         if on < off { "FASTER" } else { "SLOWER" },
         if bytes[0] == bytes[1] { "same bytes" } else { "MISMATCH — arms differ!" },

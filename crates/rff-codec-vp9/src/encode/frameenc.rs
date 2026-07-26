@@ -153,6 +153,145 @@ thread_local! {
     static POOL_U8: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
     static POOL_MI: RefCell<Vec<Vec<ModeInfo>>> = const { RefCell::new(Vec::new()) };
 }
+/// The RD pass's decision cache: `(mi_row, mi_col, bsize) -> (winning mode, predictor,
+/// tx size)`, written by the partition search and replayed by the emit pass.
+///
+/// It was a `std::collections::HashMap` keyed on a `(usize, usize, usize)` tuple — 24
+/// bytes of key hashed with SipHash, measured at 102.3 ns/op and 12.5% of the encoder's
+/// unscoped-orchestration residue. But the key is a dense bounded coordinate, so it packs
+/// losslessly into one `u32` and needs no cryptographic hashing at all:
+///
+///   mi_row < 2^13, mi_col < 2^13, bsize < 2^5   ->   bsize<<26 | row<<13 | col
+///
+/// FIELD ORDER IS LOad-BEARING. FxHash mixes with a single multiply, which pushes entropy
+/// toward the HIGH bits, while hashbrown picks its bucket from the LOW bits. Packing
+/// `bsize` low (the original `row<<18 | col<<5 | bsize`) left the bottom 5 bits taking
+/// only ~4 distinct values across a whole frame, so `key*SEED`'s low bits clustered and
+/// the table degenerated into probe chains — measured 11.3% SLOWER than SipHash on
+/// akiyo_cif. `mi_col` is the fastest-varying field, so it goes in the low bits.
+///
+/// The entries stay in a hash map rather than a flat table on purpose. A dense
+/// `mi_rows*mi_cols*13` array is 27 MB at 1080p and the per-tile decision workers CLONE
+/// the encoder, so a flat table would trade ~100 ns/op for tens of MB of allocation and
+/// zeroing per frame per worker — a much worse deal than the hashing it removes.
+///
+/// `VP9_MODEMAP_STD` selects the old tuple/SipHash backend so the two can be alternated
+/// inside one process; cross-process A/B on this codebase has produced flatly
+/// contradictory numbers (see `poolbench`), so both arms live here together.
+#[derive(Clone, Default)]
+struct ModeMap {
+    fast: std::collections::HashMap<u32, (ModeInfo, Mv, u8), BuildFxHasher>,
+    std_: std::collections::HashMap<(usize, usize, usize), (ModeInfo, Mv, u8)>,
+    use_std: bool,
+}
+
+#[inline(always)]
+fn mm_key(mi_row: usize, mi_col: usize, bsize: usize) -> u32 {
+    debug_assert!(mi_row < (1 << 13) && mi_col < (1 << 13) && bsize < (1 << 5));
+    ((bsize as u32) << 26) | ((mi_row as u32) << 13) | mi_col as u32
+}
+
+impl ModeMap {
+    fn new() -> ModeMap {
+        let use_std = match MODEMAP_STD.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var("VP9_MODEMAP_STD").is_ok();
+                MODEMAP_STD.store(v as u8, std::sync::atomic::Ordering::Relaxed);
+                v
+            }
+        };
+        ModeMap { use_std, ..Default::default() }
+    }
+    #[inline]
+    fn get(&self, mi_row: usize, mi_col: usize, bsize: usize) -> Option<(ModeInfo, Mv, u8)> {
+        let _mm = prof::Scope::new(prof::S::ModeMap);
+        if self.use_std {
+            self.std_.get(&(mi_row, mi_col, bsize)).copied()
+        } else {
+            self.fast.get(&mm_key(mi_row, mi_col, bsize)).copied()
+        }
+    }
+    #[inline]
+    fn insert(&mut self, mi_row: usize, mi_col: usize, bsize: usize, v: (ModeInfo, Mv, u8)) {
+        let _mm = prof::Scope::new(prof::S::ModeMap);
+        if self.use_std {
+            self.std_.insert((mi_row, mi_col, bsize), v);
+        } else {
+            self.fast.insert(mm_key(mi_row, mi_col, bsize), v);
+        }
+    }
+    fn clear(&mut self) {
+        self.fast.clear();
+        self.std_.clear();
+    }
+    /// Merge a decision worker's map in. Tile columns are disjoint, so no key can
+    /// collide and the merge order cannot matter.
+    fn merge(&mut self, other: ModeMap) {
+        self.fast.extend(other.fast);
+        self.std_.extend(other.std_);
+    }
+}
+
+static MODEMAP_STD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+/// Select the old tuple/SipHash backend at runtime, so a bench can ALTERNATE the arms
+/// inside one process (same reasoning as `set_snap_pool`).
+pub fn set_modemap_std(on: bool) {
+    MODEMAP_STD.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// FxHash — the rustc/Firefox multiply-rotate mixer, reproduced here rather than pulled
+/// in as a dependency (it is four lines). For a single `u32` write this is one multiply
+/// and one rotate against SipHash-1-3's full keyed permutation. It is NOT collision
+/// resistant, which is irrelevant: the keys are our own dense coordinates, never
+/// attacker-supplied.
+#[derive(Clone, Default)]
+struct BuildFxHasher;
+impl std::hash::BuildHasher for BuildFxHasher {
+    type Hasher = FxHasher;
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher(0)
+    }
+}
+struct FxHasher(u64);
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u8(b);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+impl FxHasher {
+    #[inline(always)]
+    fn add(&mut self, i: u64) {
+        const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(SEED);
+    }
+}
+
 /// Cap the free-lists: the partition recursion holds at most ~3 snapshots per level
 /// over 4 levels, so a couple of dozen buffers covers every live snapshot with room
 /// to spare. Unbounded lists would hoard the largest capacity ever seen, per thread.
@@ -401,7 +540,7 @@ pub struct FrameEncoder {
     /// SKIP block must replay that trial to leave the MC recon + zeroed entropy
     /// contexts in place, exactly as `decide_*` did (the commit emits no tokens
     /// for skip blocks and relies on those side effects).
-    mode_map: std::collections::HashMap<(usize, usize, usize), (ModeInfo, Mv, u8)>,
+    mode_map: ModeMap,
     /// Tx size the most recent `decide_*` trial reconstructed with (see `mode_map`).
     last_trial_tx: u8,
     /// Prediction-only SSE (`Σ(src−pred)²`) accumulated during the skip trial — the
@@ -596,10 +735,12 @@ pub struct FrameEncoder {
     ///
     /// BD-rate REFUTED it. 4 CRFs x 30 frames, PSNR and rate over the same frames:
     ///
+    /// ```text
     ///            alpha=0.3            alpha=0.6
     ///   city     +4.25% BD / -11.8%   +6.59% BD / -22.7%
     ///   harbour  +1.17% BD / -15.7%   +1.86% BD / -25.0%
     ///   soccer   +2.81% BD / -12.8%   +8.50% BD / -25.2%
+    /// ```
     ///
     /// Worse on 6 of 6 cells. This reproduces the existing `set_speed` finding that
     /// escalating `g1_scale` is the toxic lever because the partition gate prunes
@@ -974,7 +1115,7 @@ impl FrameEncoder {
             trial_abort_at: None,
             skip_trial: false,
             part_map: std::collections::HashMap::new(),
-            mode_map: std::collections::HashMap::new(),
+            mode_map: ModeMap::new(),
             last_trial_tx: 0,
             pending_pred_sse: 0,
             force_skip: false,
@@ -2465,11 +2606,7 @@ impl FrameEncoder {
             let (mi, predictor, coef_q8, sse) =
                 self.decide_inter(mi_row, mi_col, bsize, bwl, bhl, true);
             // Record the decision for the emit pass (it only re-reads winning keys).
-            {
-                let _mm = prof::Scope::new(prof::S::ModeMap);
-                self.mode_map
-                    .insert((mi_row, mi_col, bsize), (mi, predictor, self.last_trial_tx));
-            }
+            self.mode_map.insert(mi_row, mi_col, bsize, (mi, predictor, self.last_trial_tx));
             self.store_mi(mi_row, mi_col, bwl, bhl, &mi);
             let bits_q8 = coef_q8 + self.inter_modeinfo_cost_q8(&mi, mi_row, mi_col, predictor);
             return sse as f64 + self.lambda * (bits_q8 as f64 / 256.0);
@@ -2690,12 +2827,8 @@ impl FrameEncoder {
             none_snap = Some(self.snap_block(mi_row, mi_col, n4x4_l2, n4x4_l2));
             self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, &start);
         }
-        let _mm_probe = prof::Scope::new(prof::S::ModeMap);
-        let none_skip = self
-            .mode_map
-            .get(&(mi_row, mi_col, bsize))
-            .map_or(false, |(m, _, _)| m.skip);
-        drop(_mm_probe);
+        let none_skip =
+            self.mode_map.get(mi_row, mi_col, bsize).map_or(false, |(m, _, _)| m.skip);
 
         // G1 partition gate (discovered 2026-07-09, ceiling-swept on 1.6M nodes,
         // clip-level holdout): when NONE already fits this well, the expensive arms
@@ -2759,11 +2892,7 @@ impl FrameEncoder {
                 let subsz = subsize(part, bsize) as usize; // BLOCK_4X4 / 8X4 / 4X8
                 let (mi, coef, sse) =
                     self.decide_sub8x8(mi_row, mi_col, subsz, n4x4_l2, n4x4_l2, true);
-                {
-                    let _mm = prof::Scope::new(prof::S::ModeMap);
-                    self.mode_map
-                        .insert((mi_row, mi_col, subsz), (mi, (0, 0), self.last_trial_tx));
-                }
+                self.mode_map.insert(mi_row, mi_col, subsz, (mi, (0, 0), self.last_trial_tx));
                 self.store_mi(mi_row, mi_col, n4x4_l2, n4x4_l2, &mi);
                 let bits = coef + self.sub8x8_modeinfo_cost_q8(&mi, mi_row, mi_col);
                 let rd = self.part_flag_cost(&probs, part, has_rows, has_cols)
@@ -3166,7 +3295,7 @@ impl FrameEncoder {
             });
             for (pm, mm) in decided {
                 self.part_map.extend(pm);
-                self.mode_map.extend(mm);
+                self.mode_map.merge(mm);
             }
             return;
         }
@@ -3220,10 +3349,7 @@ impl FrameEncoder {
         // leaf, reuse its decision instead of re-running the whole mode search — the
         // commit below redoes the reconstruction either way, so only the (identical)
         // search is skipped. `active_ref` must be re-locked for the commit MC.
-        let cached = {
-            let _mm = prof::Scope::new(prof::S::ModeMap);
-            self.mode_map.get(&(mi_row, mi_col, bsize)).copied()
-        };
+        let cached = self.mode_map.get(mi_row, mi_col, bsize);
         let (mi, predictor) = if let Some((m, p, trial_tx)) = cached {
             self.active_ref = match m.ref_frame[0] {
                 GOLDEN_FRAME => 1,

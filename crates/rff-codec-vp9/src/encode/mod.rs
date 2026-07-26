@@ -36,7 +36,7 @@ pub(crate) use encoder::Vp9Encoder;
 pub(crate) use frame::{assemble_frame, assemble_tiles};
 pub(crate) use frameenc::FrameEncoder;
 /// Runtime A/B switch for the snapshot buffer pool (see `frameenc::set_snap_pool`).
-pub use frameenc::set_snap_pool;
+pub use frameenc::{set_modemap_std, set_snap_pool};
 pub(crate) use header::write_uncompressed_header;
 pub(crate) use intermode::{
     write_comp_inter, write_comp_ref, write_inter_mode, write_interp_filter, write_is_inter,
