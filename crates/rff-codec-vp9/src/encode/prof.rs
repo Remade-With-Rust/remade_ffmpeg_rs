@@ -45,6 +45,15 @@ pub enum S {
     // self-time = the stage's total minus its scoped kernel children (computed by hand).
     RdCost,       // INFO: rd_cost_yuv + rd_cost_y (per-candidate RD; nests encode_plane kernels)
     DecideLeaf,   // INFO: decide_inter (whole leaf mode decision; nests motion/pred_sse/rd_cost)
+    // --- Phase-0 glue bisection (2026-07-26). `rd_pick_partition` carries no scope,
+    // so its whole body falls into the unscoped-orchestration residue (67.7 s =
+    // 20.9% of encode vs libvpx's 3.3%). These four INFO buckets carve up that
+    // body. They are deliberately NOT a scope on the function itself: it RECURSES,
+    // and a nested-inclusive bucket would re-add the same span at every depth.
+    ModeMap,      // INFO: mode_map HashMap probe/insert (SipHash on a dense coord key)
+    SnapDrop,     // INFO: BlockSnap Drop — the free() half of snap_block's 7 Vecs
+    PartCtx,      // INFO: partition_plane_context + part_flag_cost + G1 gate arithmetic
+    VarTree,      // INFO: build_vt + variance (the content-dispatch tree)
     Count,
 }
 
@@ -71,6 +80,10 @@ const NAMES: [&str; N] = [
     "pred_sse",
     "[i]rd_cost",
     "[i]decide_leaf",
+    "[i]mode_map",
+    "[i]snap_drop",
+    "[i]part_ctx",
+    "[i]var_tree",
 ];
 
 // The disjoint, non-nested top-level stages (so glue = TOTAL − Σ these). Excludes
@@ -181,7 +194,15 @@ pub fn is_toplevel(i: usize) -> bool {
 /// decomposing orchestration, deliberately NOT part of any partition. Summing
 /// these with the top-level stages double-counts.
 pub fn is_info(i: usize) -> bool {
-    i == S::RdCost as usize || i == S::DecideLeaf as usize
+    matches!(
+        i,
+        x if x == S::RdCost as usize
+            || x == S::DecideLeaf as usize
+            || x == S::ModeMap as usize
+            || x == S::SnapDrop as usize
+            || x == S::PartCtx as usize
+            || x == S::VarTree as usize
+    )
 }
 
 /// The two instrument-tax figures, measured against THIS machine at read time

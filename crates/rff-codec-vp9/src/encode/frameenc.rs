@@ -21,6 +21,8 @@
 //! controller otherwise: a fixed all-8×8 partition, 4×4 transforms, one frame-wide
 //! quantizer (rate control picks it per frame), a single tile.
 
+use std::cell::RefCell;
+
 use super::adapt::{COEF_COUNT_SAT, COEF_MAX_UPDATE_FACTOR};
 use super::bitwriter::{BitWriter, BoolEncoder};
 use super::compressed::write_compressed_header;
@@ -131,6 +133,105 @@ struct BlockSnap {
 // (A thread-local rec-buffer POOL was tried to cut snap_block's alloc churn — WASH: SnapRestore
 // stayed ~33ms, so it's COPY-dominated (Rust's allocator already recycles same-size Vecs), not
 // alloc-dominated. The only lever is not copying the recon, which isn't byte-identical.)
+//
+// ...but that verdict was drawn from the `SnapRestore` bucket, which only spans the ALLOCATING
+// half. A snapshot's seven `Vec`s are freed when it drops, and every drop site sits OUTSIDE any
+// scope — so the `free()` half has always landed in the unscoped-orchestration residue. This
+// `Drop` charges it explicitly. NOTE the ordering: the fields must be taken and dropped INSIDE
+// the scope, because an implicit field drop would run AFTER `_sd` closes and leak right back
+// into the parent (exactly the bug that inflated the AV1 profiler 3.45×).
+// Buffer free-lists. A snapshot's seven `Vec`s are allocated in `snap_block` and freed
+// when it drops; the sizes repeat endlessly (one per block size), so recycling them
+// turns ~7 malloc/free pairs per snapshot into a pop/push of an already-sized buffer.
+// Thread-local, so the per-tile decision workers each keep their own and never contend.
+//
+// VERIFIED (2026-07-26) as the byte-identical half of the snapshot cost: skipping the
+// RECON copy instead (`VP9_NO_SNAP_RECON`) changes the bitstream on 8/8 gate streams, so
+// the copy itself is load-bearing and only where its memory COMES FROM is free to change.
+thread_local! {
+    static POOL_U16: RefCell<Vec<Vec<u16>>> = const { RefCell::new(Vec::new()) };
+    static POOL_U8: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    static POOL_MI: RefCell<Vec<Vec<ModeInfo>>> = const { RefCell::new(Vec::new()) };
+}
+/// Cap the free-lists: the partition recursion holds at most ~3 snapshots per level
+/// over 4 levels, so a couple of dozen buffers covers every live snapshot with room
+/// to spare. Unbounded lists would hoard the largest capacity ever seen, per thread.
+const SNAP_POOL_CAP: usize = 48;
+
+/// Oracle gate: `VP9_NO_SNAP_POOL=1` restores plain per-snapshot allocation, so the
+/// pooled and unpooled arms can be A/B'd inside ONE binary (same thermal state, same
+/// build) rather than across two.
+fn snap_pool_enabled() -> bool {
+    match SNAP_POOL.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var("VP9_NO_SNAP_POOL").is_err();
+            SNAP_POOL.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+            on
+        }
+    }
+}
+static SNAP_POOL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+/// Flip the pool at runtime so a bench can ALTERNATE the two arms inside one process.
+/// Comparing two separate runs cannot separate the change from machine state: the first
+/// attempt here read -10.6% and the second +16.9%, with stages the pool never touches
+/// moving just as much. Interleaving is the only honest A/B.
+pub fn set_snap_pool(on: bool) {
+    SNAP_POOL.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+    if !on {
+        let _ = POOL_U16.try_with(|p| p.borrow_mut().clear());
+        let _ = POOL_U8.try_with(|p| p.borrow_mut().clear());
+        let _ = POOL_MI.try_with(|p| p.borrow_mut().clear());
+    }
+}
+
+macro_rules! pool_ops {
+    ($take:ident, $put:ident, $pool:ident, $t:ty) => {
+        #[inline]
+        fn $take(cap: usize) -> Vec<$t> {
+            if !snap_pool_enabled() {
+                return Vec::with_capacity(cap);
+            }
+            let mut v = $pool.try_with(|p| p.borrow_mut().pop()).ok().flatten().unwrap_or_default();
+            v.reserve(cap);
+            v
+        }
+        #[inline]
+        fn $put(mut v: Vec<$t>) {
+            if v.capacity() == 0 || !snap_pool_enabled() {
+                return;
+            }
+            v.clear();
+            // `try_with`: a snapshot can outlive TLS destruction at thread teardown, in
+            // which case the buffer simply frees normally.
+            let _ = $pool.try_with(|p| {
+                let mut p = p.borrow_mut();
+                if p.len() < SNAP_POOL_CAP {
+                    p.push(v);
+                }
+            });
+        }
+    };
+}
+pool_ops!(take_u16, put_u16, POOL_U16, u16);
+pool_ops!(take_u8, put_u8, POOL_U8, u8);
+pool_ops!(take_mi, put_mi, POOL_MI, ModeInfo);
+
+impl Drop for BlockSnap {
+    fn drop(&mut self) {
+        let _sd = prof::Scope::new(prof::S::SnapDrop);
+        for v in &mut self.rec {
+            put_u16(std::mem::take(v));
+        }
+        for v in &mut self.above_ctx {
+            put_u8(std::mem::take(v));
+        }
+        put_u8(std::mem::take(&mut self.above_seg));
+        put_mi(std::mem::take(&mut self.mi));
+    }
+}
 
 /// One reconstructed/source plane (coded size: `mi_*·8 >> ss`).
 #[derive(Clone)]
@@ -2323,8 +2424,11 @@ impl FrameEncoder {
             let (mi, predictor, coef_q8, sse) =
                 self.decide_inter(mi_row, mi_col, bsize, bwl, bhl, true);
             // Record the decision for the emit pass (it only re-reads winning keys).
-            self.mode_map
-                .insert((mi_row, mi_col, bsize), (mi, predictor, self.last_trial_tx));
+            {
+                let _mm = prof::Scope::new(prof::S::ModeMap);
+                self.mode_map
+                    .insert((mi_row, mi_col, bsize), (mi, predictor, self.last_trial_tx));
+            }
             self.store_mi(mi_row, mi_col, bwl, bhl, &mi);
             let bits_q8 = coef_q8 + self.inter_modeinfo_cost_q8(&mi, mi_row, mi_col, predictor);
             return sse as f64 + self.lambda * (bits_q8 as f64 / 256.0);
@@ -2350,6 +2454,7 @@ impl FrameEncoder {
         has_rows: bool,
         has_cols: bool,
     ) -> f64 {
+        let _pc = prof::Scope::new(prof::S::PartCtx);
         let q8 = if has_rows && has_cols {
             tree_bit_cost(&PARTITION_TREE, probs, partition as i32)
         } else if !has_rows && has_cols {
@@ -2385,7 +2490,7 @@ impl FrameEncoder {
             std::array::from_fn(|p| {
                 let (x0, y0, bw, bh) = self.block_px(mi_row, mi_col, bwl, bhl, p);
                 let st = self.rec[p].stride;
-                let mut v = Vec::with_capacity(bw * bh);
+                let mut v = take_u16(bw * bh);
                 for r in 0..bh {
                     v.extend_from_slice(
                         &self.rec[p].buf[(y0 + r) * st + x0..(y0 + r) * st + x0 + bw],
@@ -2400,7 +2505,7 @@ impl FrameEncoder {
         };
         let x_mis = (1usize << (bwl - 1)).min(self.mi_cols - mi_col);
         let y_mis = (1usize << (bhl - 1)).min(self.mi_rows - mi_row);
-        let mut mi = Vec::with_capacity(x_mis * y_mis);
+        let mut mi = take_mi(x_mis * y_mis);
         for y in 0..y_mis {
             let base = (mi_row + y) * self.mi_cols + mi_col;
             mi.extend_from_slice(&self.mi[base..base + x_mis]);
@@ -2413,9 +2518,13 @@ impl FrameEncoder {
             let c0 = (mi_col * 2) >> ss;
             let w = ((x_mis * 2) >> ss).max(1);
             let end = (c0 + w).min(self.above_ctx[pl].len());
-            self.above_ctx[pl][c0..end].to_vec()
+            let mut v = take_u8(end.saturating_sub(c0));
+            v.extend_from_slice(&self.above_ctx[pl][c0..end]);
+            v
         });
-        let above_seg = self.above_seg[mi_col..(mi_col + x_mis).min(self.above_seg.len())].to_vec();
+        let seg_end = (mi_col + x_mis).min(self.above_seg.len());
+        let mut above_seg = take_u8(seg_end.saturating_sub(mi_col));
+        above_seg.extend_from_slice(&self.above_seg[mi_col..seg_end]);
         BlockSnap {
             rec,
             above_ctx,
@@ -2540,10 +2649,12 @@ impl FrameEncoder {
             none_snap = Some(self.snap_block(mi_row, mi_col, n4x4_l2, n4x4_l2));
             self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, &start);
         }
+        let _mm_probe = prof::Scope::new(prof::S::ModeMap);
         let none_skip = self
             .mode_map
             .get(&(mi_row, mi_col, bsize))
             .map_or(false, |(m, _, _)| m.skip);
+        drop(_mm_probe);
 
         // G1 partition gate (discovered 2026-07-09, ceiling-swept on 1.6M nodes,
         // clip-level holdout): when NONE already fits this well, the expensive arms
@@ -2606,8 +2717,11 @@ impl FrameEncoder {
                 let subsz = subsize(part, bsize) as usize; // BLOCK_4X4 / 8X4 / 4X8
                 let (mi, coef, sse) =
                     self.decide_sub8x8(mi_row, mi_col, subsz, n4x4_l2, n4x4_l2, true);
-                self.mode_map
-                    .insert((mi_row, mi_col, subsz), (mi, (0, 0), self.last_trial_tx));
+                {
+                    let _mm = prof::Scope::new(prof::S::ModeMap);
+                    self.mode_map
+                        .insert((mi_row, mi_col, subsz), (mi, (0, 0), self.last_trial_tx));
+                }
                 self.store_mi(mi_row, mi_col, n4x4_l2, n4x4_l2, &mi);
                 let bits = coef + self.sub8x8_modeinfo_cost_q8(&mi, mi_row, mi_col);
                 let rd = self.part_flag_cost(&probs, part, has_rows, has_cols)
@@ -2693,6 +2807,7 @@ impl FrameEncoder {
     /// Residual variance vs the zero-MV LAST reference on inter frames (the coding
     /// difficulty signal), source variance on key frames (no reference).
     fn build_vt(&mut self, mi_row: usize, mi_col: usize) {
+        let _vt = prof::Scope::new(prof::S::VarTree);
         let (x0, y0) = (mi_col * 8, mi_row * 8);
         let (sw, sh, sstride) = (self.src[0].w, self.src[0].h, self.src[0].stride);
         let tree = {
@@ -3063,7 +3178,10 @@ impl FrameEncoder {
         // leaf, reuse its decision instead of re-running the whole mode search — the
         // commit below redoes the reconstruction either way, so only the (identical)
         // search is skipped. `active_ref` must be re-locked for the commit MC.
-        let cached = self.mode_map.get(&(mi_row, mi_col, bsize)).copied();
+        let cached = {
+            let _mm = prof::Scope::new(prof::S::ModeMap);
+            self.mode_map.get(&(mi_row, mi_col, bsize)).copied()
+        };
         let (mi, predictor) = if let Some((m, p, trial_tx)) = cached {
             self.active_ref = match m.ref_frame[0] {
                 GOLDEN_FRAME => 1,
