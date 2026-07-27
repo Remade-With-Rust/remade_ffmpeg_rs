@@ -538,6 +538,8 @@ pub struct FrameEncoder {
     // `VP9_NO_SHORTLIST` full-RDs all; `VP9_SHORTLIST_K` tunes K.
     mode_shortlist: bool,
     shortlist_k: usize,
+    /// `VP9_SHORTLIST_K` was set explicitly, so `set_speed` must not override it.
+    shortlist_k_env: bool,
     // Roof — partition control. `force_min_bsize` codes PARTITION_NONE once a block
     // reaches this size (default BLOCK_8X8 = the historical all-8×8). Larger values
     // bring up bigger blocks; `use_partition_rd` turns on the recursive RD search.
@@ -1188,10 +1190,24 @@ impl FrameEncoder {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1000.0),
             mode_shortlist: std::env::var("VP9_NO_SHORTLIST").is_err(),
+            // Speed-0 value. BD-gated over 7 clips (CIF + 4CIF + 720p + 1080p),
+            // 5-point ladders: full-RD-ing only the TOP shortlist candidate is
+            // -1.25% mean BD-rate with no clip regressing (akiyo -3.79, foreman
+            // -1.48, mobile -1.11, shields -0.90, city -0.89, bus -0.58, park_joy
+            // +0.01). Evaluating MORE candidates with exact RD codes WORSE, which
+            // says our per-candidate J mis-ranks against the cheap
+            // pred_SSE + lambda*bits estimate that proposed them.
+            //
+            // ★ It SIGN-FLIPS by tier and is therefore restored to 3 at speed >= 1
+            // (see `set_speed`): at speed 3 the same K=1 measures **+2.06% mean,
+            // worst +3.30%**, because the tier's other prunes (mode_thresh_mult,
+            // g1_scale, no tx-search, no sub-8x8) have already removed the slack,
+            // so the shortlist is the last real RD comparison left.
             shortlist_k: std::env::var("VP9_SHORTLIST_K")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(3),
+                .unwrap_or(1),
+            shortlist_k_env: std::env::var("VP9_SHORTLIST_K").is_ok(),
             force_min_bsize: BLOCK_8X8, // only used when partition RD is off
             // Sub-8×8 (4×4/8×4/4×8) inter prediction: on by default (conformant, a BD-rate
             // win); `VP9_NO_SUB8X8` disables it (faster encode).
@@ -1546,6 +1562,11 @@ impl FrameEncoder {
     /// is not part of the ladder.) Env `VP9_NO_*` overrides still apply on top.
     pub fn set_speed(&mut self, speed: u32) {
         if speed >= 1 {
+            // K=1 is a speed-0-only win — at this tier it measured +2.06% mean BD
+            // (worst +3.30%) because the tier's other prunes already took the slack.
+            if !self.shortlist_k_env {
+                self.shortlist_k = 3;
+            }
             self.sub8x8 = false; // ~25% of encode for ~2% of bits — the worst trade
             self.full_msearch = false; // diamond search: ~1.2× for +2% BD-rate
             self.subpel_fast = true; // iterative ¼-pel refinement (≤ ~10 vs 24 scores)

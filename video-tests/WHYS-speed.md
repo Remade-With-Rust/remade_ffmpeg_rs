@@ -286,3 +286,77 @@ call over 91,233 calls. It is a pure SAD search whose subpel arm pays a full 8-t
 Reducing it means cutting candidates, which changes the bitstream — so it belongs to the
 BD-gated queue with the trial-multiplicity work, not to a byte-identical pass. Recorded
 rather than attempted.
+
+---
+
+# Second pass — attacking the two BD-gated targets
+
+The first pass deferred these for lack of a gate, so the gate got built:
+`video-tests/bd.py` — BD-rate by PCHIP over the PSNR overlap ONLY, with a
+rate-monotonicity check and the overlap width / points-inside reported, so a BD
+computed from one usable point announces itself instead of being believed.
+
+## Target 2 — sub-8×8  **(landed, cd45363)**
+
+The G1 gate used ONE threshold at BLOCK_8X8 for two arms of very different price:
+the SPLIT recursion, and sub-8×8 (three partitions, each a per-4×4 search plus a
+full residual trial, for ~2% of the bits). Gave sub-8×8 its own bar, plus a second
+gate on an anti-correlated null arm — if the 8×8 already codes SKIP, splitting it
+can only ADD mode and MV bits.
+
+| arm | mean BD | worst clip |
+|---|---:|---:|
+| T=40 | +0.07% | +0.33% |
+| T=90 | +0.05% | +0.56% |
+| T=200 | +0.49% | +0.78% |
+| skipgate | -0.02% | +0.41% |
+| **T=40 + skipgate** | **-0.10%** | **+0.32%** |
+
+Speed by ABBA: akiyo **-12.5%** (8/8, z=+2.83), mobile **-3.9%** (8/8, z=+2.83),
+bus -5.7% but 5/8 so not claimed. Conformance checked BEFORE the BD was believed:
+libvpx decodes 20/20 frames, ffmpeg-decoded PSNR sane. Note this only moves speed 0
+— sub-8×8 is off entirely at speed >= 1, so the ladder was previously binary.
+
+## Target 1 — RD trial multiplicity  **(landed; and it SIGN-FLIPS by tier)**
+
+The dominant cause from D3b: 7.2x libvpx's transform calls. The direct handle is
+`shortlist_k` — how many (ref x mode) candidates get a full-RD transform trial
+after being ranked by the cheap `pred_SSE + lambda*bits` estimate.
+
+**At speed 0, fewer candidates code BETTER.** 7 clips, 5-point ladders:
+
+| K | mean BD | worst clip |
+|---|---:|---:|
+| 3 (was) | — | — |
+| 2 | -0.55% | -0.11% |
+| **1** | **-1.25%** | **+0.01%** (park_joy) |
+
+Per clip at K=1: akiyo -3.79, foreman -1.48, mobile -1.11, shields_720p -0.90,
+city_4cif -0.89, bus -0.58, park_joy_1080p +0.01. **No clip regresses.**
+
+That result is the interesting one: evaluating MORE candidates with exact RD codes
+WORSE than trusting the cheap estimate that proposed them. Our per-candidate J
+mis-ranks — the same "a superset search that regresses proves the cost model is
+wrong for the new candidates" law this campaign already hit on directional intra,
+compound NEAREST/NEAR and sub-8×8 multiref. **The RD cost model itself is now the
+named suspect**, and that is a better lead than any remaining kernel.
+
+**★ But it SIGN-FLIPS across the speed tier.** At speed 3 — the SHIPPED default —
+the identical K=1 measures **+2.06% mean BD, worst +3.30%, a loss on all four
+clips**, because that tier's other prunes (mode_thresh_mult, g1_scale=4, no
+tx-search, no sub-8×8) have already taken the slack and the shortlist is the last
+real RD comparison left. Defaulting K=1 globally would have shipped a +2%
+regression at the preset most users run. It is therefore restored to 3 in
+`set_speed` for speed >= 1, and speed 3 is verified BYTE-IDENTICAL.
+
+Speed at s0 by ABBA (A = K=1, B = K=3): akiyo -16.6% (6/8, z=+1.41), mobile
+**-9.7% (7/8, z=+2.12, real)**, bus -11.7% (6/8, z=+1.41). Magnitudes consistent
+at -10..-17%; only mobile clears the win-rate bar, so that is the one claimed.
+
+## Still open
+
+- The RD cost model's mis-ranking (named above) — why does exact J rank worse than
+  `pred_SSE + lambda*bits`? Fixing that should let K rise again AND improve BD.
+- `int_search` at 12.8x libvpx's per-call cost (exhaustive vs diamond at speed 0).
+- Our ARF path costs 2.5x where libvpx's costs 1.5x.
+- Re-run the ARF quality comparison at FRAMES >= 60 so the lookahead fills.

@@ -25,9 +25,13 @@ export PARETO_SPEED="${PARETO_SPEED:-0}"
 export PARETO_LAG="${PARETO_LAG:-0}"
 export PARETO_NOREF=1
 
+# Arm B sets the knob to KNOB_VALUE (default 1). For a knob whose oracle value is
+# not 1 — e.g. restoring VP9_SHORTLIST_K to its pre-change 3 — pass KNOB_VALUE=3,
+# otherwise both arms would run the same configuration and this becomes a null arm.
+KNOB_VALUE="${KNOB_VALUE:-1}"
 run() { # $1 = "A" | "B"
   if [ "$1" = "A" ]; then env -u "$KNOB" ./target/release/analyzer pareto 2>&1
-  else env "$KNOB=1" ./target/release/analyzer pareto 2>&1
+  else env "$KNOB=$KNOB_VALUE" ./target/release/analyzer pareto 2>&1
   fi | awk '/^  ours/{print $3}'
 }
 
@@ -43,7 +47,7 @@ for i in $(seq 1 "$ROUNDS"); do
 done
 
 echo
-echo "$CLIP  ($KNOB unset = A = candidate,  $KNOB=1 = B = oracle)"
+echo "$CLIP  ($KNOB unset = A = candidate,  $KNOB=$KNOB_VALUE = B = oracle)"
 echo " A wins $wins / $n rounds"
 awk -v w="$wins" -v n="$n" 'BEGIN{
   if (n==0) exit
