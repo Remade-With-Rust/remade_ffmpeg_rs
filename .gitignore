@@ -9,8 +9,12 @@ crates/rff-ui/dist/
 # Local-only Claude skills (not deployed to open source)
 .claude/skills/
 
-# External PEAQ oracle (fetched by tools/quality/setup_peaq.py, not vendored)
+# External PEAQ oracle (fetched by tools/quality/setup_peaq.py, not vendored).
+# Both locations: it has been checked out at the repo root and under tools/quality/,
+# and the latter went in once as a bare gitlink with no .gitmodules entry — a
+# submodule reference nobody could initialise.
 /PEAQ_python/
+/tools/quality/PEAQ_python/
 __pycache__/
 *.pyc
 
@@ -20,6 +24,14 @@ __pycache__/
 
 # Local media corpora for quality campaigns (WAV/Y4M, tens of MB) — never published
 /corpus/
+# libvpx VP9 conformance vectors (~1.5 MB of .webm + .md5). Same policy: fetched
+# locally, not vendored — the suite is reproducible from media.xiph.org / libvpx.
+/vp9-vectors/
+
+# Stray build artifacts. A file literally named `-o` gets created by a mistyped
+# `... -o` invocation where the flag lost its argument; one such 3.9 MB artifact
+# reached a commit before being caught.
+/-o
 
 # video-tests: measurement outputs and the optional local corpus copy.
 video-tests/results/
