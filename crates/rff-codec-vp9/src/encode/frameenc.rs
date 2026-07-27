@@ -749,6 +749,9 @@ pub struct FrameEncoder {
     /// WRONG lever for it; the knob is kept default-off so the next attempt starts
     /// from the measurement rather than repeating it.
     g1_area: f64,
+    /// Raw SSE of the most recent NONE trial (`rd_block_none`). Kept for the G1 gate
+    /// diagnosis recorded on `g1_64`; no live consumer.
+    last_none_sse: u64,
     /// Content-adaptive partition: route this superblock's partition decision
     /// through the O(pixels) variance tree (`varpart`) instead of the recursive RD
     /// search. `VP9_VAR_PART=1` forces it ON for EVERY SB (the Brick-2 standalone
@@ -1226,6 +1229,7 @@ impl FrameEncoder {
             g3_gate: std::env::var("VP9_G3GATE").is_ok(), // harvest-first: off by default
             g1_scale: 1.0,
             g1_area: 1.0,
+            last_none_sse: 0,
             var_part: std::env::var("VP9_VAR_PART").is_ok(),
             var_thresh_mult: std::env::var("VP9_VAR_THRESH")
                 .ok()
@@ -1488,15 +1492,39 @@ impl FrameEncoder {
             // ladder leans on the mild ones instead.
             self.split_early = true; // abort losing SPLIT recursions early (~free)
             self.mode_thresh_mult = env_f64("VP9_MODE_THRESH").unwrap_or(1.25);
-            // 450, not 900: the first real BD sweep of this knob (it was NOT
-            // sweepable before the env-clobber fix below — every prior sweep
-            // measured an unchanged encoder). Verified head-to-head over whole
-            // clips with rate AND quality measured on the same frames:
-            //   akiyo -0.769%  foreman -1.500%  bus +0.045%  mobile +0.000%
-            //   MEAN  -0.556% BD  for ~-0.4% speed
-            // Better or neutral on every clip — not a sign-flip trade. The old
-            // 900 was a never-swept guess costing ~0.56% BD for nothing.
-            self.g1_64 = env_f64("VP9_G1_64").unwrap_or(450.0);
+            // DISABLED (0), 2026-07-26. This gate shipped at 450 on the strength of a
+            // 450-vs-900 sweep over four CIF clips (akiyo/foreman/bus/mobile, mean
+            // -0.556% BD). That sweep never compared against OFF, and its corpus held
+            // no high-motion HD, so it could not see either of the following.
+            //
+            // 1. It is a catastrophe on fast-motion HD. park_joy_1080p50 at speed 3:
+            //    15.96 dB with the gate, 31.24 dB without — a 15.3 dB loss for +0.02%
+            //    bytes. Frames 1-12 hold ~32.5 dB, frame 13 falls to 18.75, then decays
+            //    to 12.86. It fires on just 2.9% of 64x64 nodes (harvested at qindex
+            //    160), but a damaged block feeds the next frame's prediction, so the
+            //    error compounds instead of staying local.
+            //
+            //    Mechanism: the gate's feature is `none_rd/lambda` = `SSE/lambda + bits`.
+            //    lambda grows with q^2, so at high q the SSE term vanishes and the test
+            //    degenerates into "did NONE code CHEAPLY" — firing hardest on SKIP
+            //    blocks, i.e. exactly the blocks whose prediction was given up on.
+            //
+            //    A per-pixel SSE guard on the NONE arm was tried and NOT shipped: the
+            //    response was non-monotonic (cap 50 -> 31.3 dB, but 25 -> 18.1 and
+            //    100 -> 16.0), and the outcome is bimodal at near-identical byte counts.
+            //    That is a fragile state divergence, not a smooth RD trade, so no cap
+            //    constant is defensible without understanding it. `last_none_sse` is
+            //    left plumbed for whoever picks that up.
+            //
+            // 2. It does not even pay on its own tuning corpus. BD-rate of OFF vs 450,
+            //    4 CRFs x whole clips, rate and PSNR over the same frames:
+            //      akiyo -0.507%  foreman -0.384%  bus +0.086%  mobile +0.000%
+            //      MEAN  -0.201%  (negative = turning it OFF is BETTER)
+            //    Better or neutral on three of four, and its own note priced the speed
+            //    it bought at ~0.4%.
+            //
+            // `VP9_G1_64=450` restores the old behaviour for anyone re-investigating.
+            self.g1_64 = env_f64("VP9_G1_64").unwrap_or(0.0);
             self.subpel_tree = true; // skip ¼-ring when ½-ring didn't move
             self.intra_gate_t = env_f64("VP9_INTRA_GATE_T").unwrap_or(2000.0);
             // Lever 1 (a MILD fixed-percentile dispatch at this default tier) was
@@ -2609,6 +2637,7 @@ impl FrameEncoder {
             self.mode_map.insert(mi_row, mi_col, bsize, (mi, predictor, self.last_trial_tx));
             self.store_mi(mi_row, mi_col, bwl, bhl, &mi);
             let bits_q8 = coef_q8 + self.inter_modeinfo_cost_q8(&mi, mi_row, mi_col, predictor);
+            self.last_none_sse = sse;
             return sse as f64 + self.lambda * (bits_q8 as f64 / 256.0);
         }
         let mi = self.decide_intra(mi_row, mi_col, bsize, bwl, bhl);
@@ -2621,6 +2650,7 @@ impl FrameEncoder {
             sse += s;
         }
         let bits_q8 = coef_q8 + self.intra_modeinfo_cost_q8(&mi, mi_row, mi_col);
+        self.last_none_sse = sse;
         sse as f64 + self.lambda * (bits_q8 as f64 / 256.0)
     }
 
