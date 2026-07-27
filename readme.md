@@ -9,6 +9,7 @@
 > transcode, mux and probe audio/video — a ground-up **Rust** rebuild of
 > [FFmpeg](https://github.com/FFmpeg/FFmpeg) (LGPL-2.1+/GPL-2.0+/C), under a
 > permissive license, built for speed, safety, and zero copyleft strings.
+> Check out [FFAI](https://github.com/remade-with-rust/ffai), a sister project providing media for AI first world.
 
 > **Status — pre-1.0, and not yet independently audited.** APIs and codec
 > coverage are still moving; use it accordingly. See the
@@ -88,80 +89,6 @@
 > | 48 kHz Hybrid @32k · speech | **0.046s (1.39×)** | 0.064s | 0.047s |
 > | 48 kHz stereo Audio @128k · music | **0.175s (1.46×)** | 0.255s | 0.074s |
 > | 44.1 kHz stereo Audio @128k · music | **0.196s (1.33×)** | 0.260s | 0.100s |
->
-> **We're 1.0–1.5× faster than `libopus` per core** across the whole typical range. On top of
-> that, **frame-parallel encoding** — chunk the stream, each worker priming its inter-frame
-> state so seams stay **PEAQ-neutral** (ΔODG ≤ 0.03) — takes wall-clock to **2–4× faster**, a
-> race `libopus`'s single-threaded-per-stream encoder can't answer. `ffmpeg` decodes our output
-> at unity throughout. *(Lesson banked: profile the whole pipeline — the codec was never the
-> bottleneck; a copy in the plumbing was.)*
-
-> **🎯 Quality vs `libopus` (measured head-to-head, PEAQ ODG).** Scored on **PEAQ ODG**
-> with a **reconstruction-SNR guard** — the discipline that keeps us honest: a sub-0.1 ODG
-> "loss" whose SNR is at parity is metric noise, not a real deficit. **Mono** (speech and
-> music) sits at **parity** with `libopus` once bitrate-matched. On **stereo music**, PEAQ shows
-> us ~0.3 ODG lower at 96–128k — but it **doesn't survive the reconstruction-SNR guard**. At
-> matched bitrate (ours@128k = 141 kbps vs `libopus`@115k = 140 kbps, real guitar/piano) our
-> **reconstruction-SNR is actually *higher*** (18.9 vs 18.0 dB — cleaner), our **per-critical-band
-> noise is lower in every band** (mid *and* side), and our **temporal noise-to-signal masking is
-> identical** (correlation 0.605 vs 0.600 — pre-echo ruled out). A **+1 `alloc_trim` LF tilt**
-> (stereo-only, transmitted, conformant) shipped as a genuine small win; beyond it **no isolable
-> coding lever moves the PEAQ number** (M/S angle, transient threshold, complexity all refuted),
-> and the PEAQ tool scores a *null* ref-vs-ref pair at **+0.2**. By the objective measures this
-> project trusts — recon-SNR, per-band noise, temporal masking — our stereo-music reconstruction
-> is **competitive-to-better** than `libopus`; the PEAQ delta is metric shaping on equal-or-cleaner
-> output, not a defect. *(An earlier internal matrix reported a stereo-music win, a later
-> bitrate-matched sweep a deficit; the SNR-guarded look says the truth is ~parity — we keep only
-> what reproduces under the guard.)*
-> On **speed**, once an O(n²) copy in the encoder wrapper was fixed we run **1.0–1.5× faster than
-> `libopus` per core** on both speech and music (see the spotlight above), with frame-parallel
-> taking wall-clock to 2–4×.
->
-> **⚡ Decoder speed campaign — SIMD where it pays, and a proof of where it can't.** We turned
-> the same profile-first discipline on the *decode* path and shipped **two byte-identical
-> kernels**: an **SSE2 8-tap resampler FIR** (`madd_epi16` + a contiguous coefficient table
-> that also kills a double-index — **~18% off the SILK output resampler**) and an **AVX2 comb
-> filter** for the CELT postfilter (**~4–5× on the kernel**, min/max non-overlapping). The comb
-> filter is the fun one: it *looks* like an un-vectorizable feedback recurrence, but the pitch
-> delay `t1 ≥ 15` always exceeds the 8-wide vector, so a batch never reads its own writes — five
-> *overlapping contiguous* loads (no gather) with non-FMA math reproduce the scalar rounding
-> **bit-for-bit**. Then the honest part: we profiled the rest, tried the obvious levers
-> (`exp_rotation` SIMD, unchecked/`#[inline]` on the hot lookup), **measured them flat, and
-> reverted them.** The decoder is at its **algorithmic ceiling** — 61% of decode is the PVQ
-> combinatorial `cwrsi`, whose lookup table *and* search are **identical to `libopus`** (a
-> bit-exact entropy path has no faster form), and the deemphasis is an inherently serial IIR.
-> Every kernel that *could* be vectorized now is; what's left is asm scheduling, not missing SIMD.
->
-> **Streaming robustness is now feature-complete** (all ports of / equivalent to `libopus`,
-> conformance untouched): packet-loss concealment for **both SILK** (LTP/LPC extrapolation +
-> comfort noise) **and CELT** (`celt_decode_lost` — pitch-based repetition for short tonal
-> losses, **+1.18 ODG** over the noise-based fallback; noise-based CNG-style fill for long
-> bursts), **in-band FEC** (LBRR recovery), **DTX**, **comfort-noise generation** (`silk_CNG`
-> — DTX/silence renders as natural background, not dead air), **multistream/surround**
-> (5.1/7.1, libopus decodes our output zero-error), and a **repacketizer**. The **decoder is
-> bit-exact on all 12 official RFC 6716/8251 vectors** and decodes `libopus`'s own streams to
-> identical output. An optional **faithful float-SILK analysis path** (port of `silk/float/`)
-> ships default-off.
-
-> **⚡ Performance spotlight — audio resampler (`swresample`): 54× faster, a real bottleneck
-> removed.** Most audio is 44.1 kHz and Opus runs at 48 kHz, so nearly every real transcode
-> hits our resampler — and profiling caught it eating **~0.6 s of pure single-threaded time on
-> a 24 s file**, more than the codec itself. Four profile-gated bricks, biggest-lever-first: the
-> windowed-sinc recomputed **~110 million transcendentals** (a `sin` + two `cos` per tap per
-> output) — but the kernel weights depend only on the sub-sample phase, which for a fixed
-> rational ratio **repeats exactly** (44.1↔48 k → 160 phases), so a **precomputed polyphase
-> bank** turns them into a table lookup (**16.3×**, redundancy-elimination beating SIMD again);
-> then an **AVX2+FMA** dot product the f64 reduction wouldn't auto-vectorize (1.74×), output
-> preallocation + a specialized deinterleave (1.38×), and an **f32** path for 2× SIMD width
-> (1.38×). Net **671 → 12.5 ms** on 24 s of 44.1→48 k stereo — **53.8×**, gated **>100 dB**
-> against the scalar oracle — cutting that ~0.6 s of per-thread waste to ~12 ms on every non-48 k
-> transcode. Then, hunting *any*
-> error across a **131-config domain sweep** (every sample rate 8–96 kHz × mono/stereo ×
-> bitrates 6 k–510 k × sweeps/tones/noise/silence/impulse), the only thing it surfaced was our
-> own resampler's stopband — so we deepened it (16-tap Blackman → **64-tap Blackman-Harris**),
-> taking supersonic content that would fold into the audible band from ~−58 dB to **−110 dB+**:
-> genuinely hi-res-transparent, passband flat through 20 kHz. **Zero functional errors across
-> the whole domain.**
 
 ---
 
@@ -237,25 +164,6 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 | Container | **mp4** / **mov** (ISOBMFF) | **demux + mux** — sample tables; **A/V**: AV1 (`av01`/`av1C`) or H.264 (`avc1`/`avcC`) video + Opus audio (`dOps`); **AAC `esds` config (demux + mux)** so `rff -i in.wav out.m4a` writes a playable AAC MP4 |
 | Container | **matroska** / **webm** (EBML) | **demux** — track tree + Cluster/(Simple)Block packets; AV1/H.264 video + Opus/Vorbis/AAC/FLAC audio |
 
-> **H.264 defaults to `rusty_h264` with SIMD asm on** — substantially faster.
-> Like `rav1e`, the speedup is hand-written x86 **assembly, no C** (openh264's
-> kernels, **vendored** under BSD-2 — no external source tree), isolated in a
-> single `unsafe` crate (`rusty_h264-accel`). The one practical cost: the default
-> build needs **`nasm`** (`choco install nasm` / `apt install nasm` /
-> `brew install nasm`). `--no-default-features` drops to `rusty_h264`'s scalar
-> path (no `nasm`, no asm, zero `unsafe`); `--features h264-openh264` swaps in
-> Cisco's C `openh264` as a reference cross-check.
-
-The **audio path** is real: `ffmpeg -i in.wav -c:a opus out.opus` decodes PCM, encodes Opus, and writes an Ogg file — through the same engine the image codecs use. Parametric codecs (PCM) and ones with out-of-band config (Opus' channels/rate from `OpusHead`) receive their parameters via a `Decoder::configure` step — the same plumbing H.264 will use for SPS/PPS.
-
-**Audio resampling.** When an encoder only accepts certain sample rates, the transcode loop auto-inserts a resampler (a streaming windowed-sinc FIR, the `libswresample` equivalent) — exactly like FFmpeg's implicit `aresample`. So `ffmpeg -i in_44100.wav -c:a opus out.mp4` converts 44.1 kHz to Opus's nearest accepted rate (48 kHz) with no extra flags.
-
-**A/V muxing.** Multiple inputs combine into one multi-stream output. `ffmpeg -i v -i a -c:v avif -c:a opus out.mp4` writes a single MP4 carrying **AV1 video + Opus audio** — entirely pure-Rust, no extra features. (Swap `-c:v h264` with the `h264-openh264` feature for H.264 video instead.) AVI muxing works the same way (`-c:v copy -c:a copy out.avi`). MP4 output carries **real timing** (each track's `stts`/timescale come from packet PTS, not a nominal frame rate) and is **time-interleaved** — samples are written in PTS order across tracks so players can read audio + video progressively.
-
-**Stream selection (`-map`).** Pick exactly which input streams reach the output: `-map 0:v` (all video of input 0), `-map 0:a`, `-map 1:0` (stream 0 of input 1), or `-map 0` (everything) — repeatable and order-preserving. With no `-map`, every video + audio stream is carried by default. Combine with `-c copy` to losslessly lift a single track, e.g. `ffmpeg -i av.mp4 -map 0:a -c:a copy audio.mp4` pulls the Opus track out of an MP4 without re-encoding.
-
-With the `format` filter bridging colorspaces, `ffmpeg -i photo.png -vf format=yuv420p -c:v avif out.avif` (and the reverse) does real PNG↔AVIF image conversion today.
-
 **Codec backends — every one is 100% Rust (no C/C++ FFI) and permissively licensed.** Container (de)muxers are our own code. See [docs/pure-rust-codecs.md](docs/pure-rust-codecs.md) for the full vetted survey (what's clean, what's license-blocked, what has no pure-Rust option).
 
 | Codec | Backing crate | License | Pure Rust |
@@ -274,27 +182,6 @@ With the `format` filter bridging colorspaces, `ffmpeg -i photo.png -vf format=y
 | FLAC decode | [`claxon`](https://crates.io/crates/claxon) | Apache-2.0 | ✅ |
 | FLAC encode | **in-house** (`rff-codec-flac`) | Apache-2.0 | ✅ (lossless, no dep) |
 | JPEG XL decode | [`jxl-oxide`](https://crates.io/crates/jxl-oxide) | MIT/Apache-2.0 | ✅ |
-
-> **🎬 Spotlight — a full AV1 stack, both ways, in pure Rust with no C.** AV1 is the
-> next-generation codec that's genuinely *free* — no patent pool, no per-unit royalties,
-> unlike H.264/HEVC/VVC — and we ship the **complete pipeline in both directions**: the
-> decoder is a Rust port of **dav1d** (VideoLAN's world-fastest AV1 decoder); the encoder
-> is **rav1e** (the reference pure-Rust AV1 encoder). Both are forked into our permissively
-> licensed BSD-2 [rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit),
-> and — unlike a `libaom`/`libdav1d` C binding — a **pure-Rust build path** (no `nasm`, no C
-> toolchain, zero FFI), with the decode side adding **zero `unsafe`** to this tree. One AV1
-> core powers **both video and AVIF stills** (8- &
-> 10-bit): a frame decodes → re-encodes → rewraps through the `demux → decode → encode → mux`
-> loop, so `ffmpeg -i in.avif -c:v avif out.avif` and `ffmpeg -i v -i a -c:v avif -c:a opus
-> out.mp4` (AV1 video + Opus in one MP4) work today.
->
-> **And these aren't just repackaged upstreams — the fork is faster.** Our `rusty_av1e`
-> encodes **~1.10× faster than stock rav1e while emitting its byte-identical bitstream**
-> (whole-encode wall-clock, real CLI A/B on one machine), with an opt-in `--racecar` mode
-> that trades bit-exactness for **~1.69× faster** (pair with `--tune Psnr`) — and the
-> `rusty_av1d` decoder doubles as the encoder's own conformance oracle, so every speedup is
-> checked against a safe-Rust dav1d port. **AV2 decode is already in progress** — we're onto
-> the codec *after* next.
 
 "Scaffolded" = registered and wired through the engine, CLI and server; the
 bitstream body is the next implementation step. More codecs/containers to come.
@@ -408,15 +295,10 @@ implement the `Decoder`/`Encoder` or `Demuxer`/`Muxer` traits and call
 Prioritized **next-gen first** — full detail in [docs/roadmap.md](docs/roadmap.md).
 What's shipped today is the [compatibility matrix](docs/compatibility.md).
 
-- **Next-gen (priority):** AV2 decode *(in progress)* · fMP4/CMAF segments ·
+- **Next-gen (priority):** AV2 encode and decode *(in progress)* · fMP4/CMAF segments ·
   low-latency live (SRT / WebRTC / Media-over-QUIC) · IAMF spatial audio.
 - **Current-modern:** DASH output · HLS completion (`-hls_time`, live playlists) ·
   `filter_complex` `concat` · two-pass execution · HTTPS in the default build.
-- **Patent-gated (gate or skip):** HEVC/H.265 · VVC/H.266 · AC-3 — standard-
-  essential-patent encumbered, unlike the royalty-free AV1/AV2 stack.
-
-Also tracked: reproducible benchmark suite + published numbers, and real MATA mID
-verification (`sovereign-id-verify`).
 
 ## License
 
