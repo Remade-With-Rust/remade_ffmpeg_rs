@@ -281,9 +281,16 @@ impl Mp3Encoder {
         };
         let nch = header.channel_mode.channels();
         let spf = header.version.samples_per_frame();
-        while self.pcm[0].len() >= spf && (nch == 1 || self.pcm[1].len() >= spf) {
+        // Consume full frames via an advancing OFFSET, then remove the whole
+        // consumed prefix ONCE at the end. Front-draining `spf` at a time shifts
+        // the entire remaining tail every frame — O(n²) when a demuxer hands us
+        // the whole file in one `send_frame` (the WAV path yields the `data`
+        // chunk as a single packet). The offset walk is O(n). Byte-identical:
+        // the same `[off..off+spf]` samples in the same order.
+        let mut off = 0usize;
+        while self.pcm[0].len() - off >= spf && (nch == 1 || self.pcm[1].len() - off >= spf) {
             let block: Vec<Vec<f32>> = (0..nch)
-                .map(|c| self.pcm[c].drain(0..spf).collect())
+                .map(|c| self.pcm[c][off..off + spf].to_vec())
                 .collect();
             if self.reservoir && self.resv_lookahead {
                 // Lookahead: buffer PCM; analyse-all + allocate + assemble at flush.
@@ -300,6 +307,14 @@ impl Mp3Encoder {
                 self.total_frames += 1;
                 self.total_bytes += bytes.len();
                 self.queue.push_back(Packet::from_data(0, bytes));
+            }
+            off += spf;
+        }
+        // Drop all consumed samples in one shift (O(n) total, not O(n²)); the
+        // sub-frame remainder stays at the front for the next call / flush pad.
+        if off > 0 {
+            for c in 0..nch {
+                self.pcm[c].drain(0..off);
             }
         }
     }
