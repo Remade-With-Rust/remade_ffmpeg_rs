@@ -33,12 +33,13 @@
 | Memory-safety CVEs (core path) | many, historically | **0 — safe Rust** | structural |
 | Conformance | reference | **bit-exact** (VP9 315/315 vectors; MP3 vs FFmpeg) | maintain |
 | VP9 decode, 1 thread | 1.0× | **~0.16–0.21×** — younger, optimizing | → parity |
+| VP9 encode, 1 thread | 1.0× | **~0.3×**, at **~+36% bitrate** — matched settings, equal PSNR | → parity |
 | AAC encode (60 s stereo) | 1.0× | **~6× faster** — frame-parallel (ffmpeg's AAC is 1-thread); ~1.15× single-thread | maintain |
 | Vorbis encode (stereo music) | 1.0× | **~5.3× faster** — frame-parallel; the **first permissive-Rust Vorbis encoder** | → single-thread |
 | Opus encode (`libopus`) | 1.0× | **1.0–1.5× faster single-thread** (fair, 1 core each; speech + music) · **2–4× faster** wall-clock (frame-parallel) | maintain |
 | License + embedding | LGPL/GPL · C FFI | **Apache-2.0 · pure Rust · no FFI** | — |
 
-<sub>Real numbers + how to reproduce them: [docs/benchmarks.md](docs/benchmarks.md). The VP9 speed figure is decode throughput on an i7-14650HX vs FFmpeg's native decoder.</sub>
+<sub>Real numbers + how to reproduce them: [docs/benchmarks.md](docs/benchmarks.md). The VP9 decode figure is throughput on an i7-14650HX vs FFmpeg's native decoder. The VP9 encode figures are against `libvpx-vp9` at a **matched operating point** — both encoders in constant-quality mode at the same cq ladder, speed preset and lookahead, then read at **equal PSNR** — on the Derf CIF set (`video-tests/`, reproduce with `analyzer pareto`). Comparing default-to-default instead is meaningless here: the two default configurations differ in rate-control mode, operating point, speed preset and lookahead at once, which on 1080p put the two arms **72× apart in bitrate**.</sub>
 
 > **⚡ Performance spotlight — AAC encode, faster than the C.** Our in-house, pure-Rust
 > AAC-LC encoder went from 0.79× realtime to **449× realtime** — a **~570× throughput gain**
@@ -142,7 +143,7 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 
 | Kind | Supported | Status |
 |---|---|---|
-| Video codec | **vp9** (VP9) | **decode + encode** — in-house pure-Rust. Decoder **bit-exact against all 315 official libvpx conformance vectors** (profiles 0–3, 8/10/12-bit, AVX2 + NEON). Encoder: RDO partition/mode, rate control (CBR + two-pass), golden/ALT-REF + temporal filtering, **validated pixel-exact vs libvpx & ffmpeg** (~+0.9% keyframe BD-rate; younger than libvpx, optimizing) |
+| Video codec | **vp9** (VP9) | **decode + encode** — in-house pure-Rust. Decoder **bit-exact against all 315 official libvpx conformance vectors** (profiles 0–3, 8/10/12-bit, AVX2 + NEON). Encoder: RDO partition/mode, rate control (CBR + two-pass), golden/ALT-REF + temporal filtering, compound (bi-directional) prediction, **validated pixel-exact vs libvpx & ffmpeg**. Read at a **matched operating point** — both encoders in constant-quality mode at the same cq ladder, speed preset and lookahead, compared at equal PSNR — it needs **~+36% bitrate** and runs **~3× slower** than libvpx on the Derf CIF set. (Keyframe-only BD-rate is ~+0.9%: the gap is the **inter** path, not residual coding.) Younger than libvpx, actively optimizing |
 | Video codec | **h264** (H.264 / AVC) | **decode + encode** — [`rusty_h264`](https://crates.io/crates/rusty_h264) with SIMD asm, **default** |
 | Video codec | **AV1** (AV1) | **decode + encode** — the royalty-free next-gen codec, **100% pure Rust, no C/FFI**. Our [rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) (`rusty_av1d` / `rusty_av1e`, BSD-2) forks **rav1d** (Rust port of VideoLAN's **dav1d**, the world's fastest AV1 decoder) + **rav1e** (the reference pure-Rust AV1 encoder), with a no-`nasm`, no-asm pure-Rust build path. Our encoder fork runs **~1.10× faster than stock rav1e at byte-identical output**, or up to **~1.69× faster** in opt-in `--racecar` mode |
 | Image codec | **avif** (AV1 still image) | **decode + encode**, 8- & 10-bit (`rusty_av1d` / `rusty_av1e`) |
