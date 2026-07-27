@@ -1009,7 +1009,27 @@ impl Vp9Encoder {
     /// Hidden ALT-REF: predicts from LAST(slot0)/GOLDEN(golden_slot), refreshes
     /// `arf_slot`. Returns the coded bytes (stores its recon in `arf_slot`).
     fn code_arf_slotted(&mut self, coded: [Vec<u16>; 3], w: u32, h: u32) -> Vec<u8> {
-        let q = ((self.next_qindex() as f64 * self.arf_qscale).round() as u32).clamp(4, 255);
+        // ARF q boost, RATE-AWARE. `arf_qscale` is a MULTIPLIER on qindex, so a fixed
+        // 0.5 gives a mild absolute boost at low q and an enormous one at high q —
+        // i.e. it spends hardest exactly when the budget is smallest. Measured on
+        // akiyo_cif at crf 60 the hidden ARF took 5,481 B of a 7,845 B stream (70%)
+        // while ordinary frames cost 31 B, so the group could not reach low rates at
+        // all and BD-rate collapsed (+46% over the low-quality half of the ladder).
+        //
+        // Fade the boost out as qindex rises: full `arf_qscale` at q=0, none at the
+        // top of the usable range. Measured BD vs no-ARF (+ = ARF worse):
+        //   akiyo  qscale 0.5 -> +21.31%   1.0 -> +1.15%   rate-aware -> see below
+        //   bus    qscale 0.5 -> +37.11%   1.0 -> +14.31%
+        // `VP9_ARF_QSCALE_FLAT=1` restores the old flat multiplier (the A/B oracle).
+        let base = self.next_qindex() as f64;
+        let qs = if std::env::var("VP9_ARF_QSCALE_FLAT").is_ok() {
+            self.arf_qscale
+        } else {
+            const Q_MAX: f64 = 220.0; // top of the qindex range rate control uses
+            let headroom = ((Q_MAX - base) / Q_MAX).clamp(0.0, 1.0);
+            1.0 - (1.0 - self.arf_qscale) * headroom
+        };
+        let q = ((base * qs).round() as u32).clamp(4, 255);
         let idx = [0, self.golden_slot, self.arf_slot];
         let mut enc = FrameEncoder::new(w, h, q, coded, self.slots[0].clone());
         enc.set_speed(self.speed);

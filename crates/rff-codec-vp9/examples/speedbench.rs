@@ -15,6 +15,7 @@ use rff_core::{CodecId, Dictionary, Frame, VideoFrame};
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let (path, out, crf, speed) = (&a[1], &a[2], &a[3], &a[4]);
+    let lag = a.get(5).cloned();
 
     // --- minimal y4m parse (4:2:0, 8-bit) ---
     let buf = std::fs::read(path).unwrap();
@@ -61,6 +62,11 @@ fn main() {
     let mut opts = Dictionary::new();
     opts.set("crf", crf);
     opts.set("cpu-used", speed);
+    // Optional 5th arg: lag-in-frames (ALT-REF lookahead). libvpx defaults to 25;
+    // ours defaults to 0, so this makes the two comparable.
+    if let Some(l) = &lag {
+        opts.set("lag", l);
+    }
     enc.configure(&opts).unwrap();
 
     let mut packets: Vec<Vec<u8>> = Vec::new();
