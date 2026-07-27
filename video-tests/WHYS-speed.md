@@ -360,3 +360,79 @@ at -10..-17%; only mobile clears the win-rate bar, so that is the one claimed.
 - `int_search` at 12.8x libvpx's per-call cost (exhaustive vs diamond at speed 0).
 - Our ARF path costs 2.5x where libvpx's costs 1.5x.
 - Re-run the ARF quality comparison at FRAMES >= 60 so the lookahead fills.
+
+---
+
+# Third pass — six whys on `int_search`
+
+## D6 — is the "12.8x per call vs libvpx" comparison sound?  **No — it is algorithm vs algorithm.**
+
+- **MEASURED:** ours at speed 0 is `full_msearch`, an EXHAUSTIVE +/-8 sweep;
+  libvpx's `motion_fullpel` is a diamond. 15.5 us vs 1.21 us per call is two
+  different algorithms, not a per-call inefficiency. (We also call it 2.7x LESS
+  often.) So "12.8x slower per call" is not by itself a defect — the real question
+  is whether the exhaustive sweep earns its cost, and whether it contains waste.
+- **STATUS:** closed. Re-framed the descent as (a) waste inside the sweep,
+  (b) is the sweep worth it.
+
+## Lever A — the grid was scanned TWICE  **(KEEP, landed 69ce95a)**
+
+`centers = [(0,0), predictor/8]` and each swept its own +/-8 square with NO overlap
+check. Predictor rounds to zero on static content ⇒ all 289 positions scored twice;
+small-but-nonzero ⇒ most of them. The diamond branch below had always deduped its
+centres; only the exhaustive path (the speed-0 default) had not.
+
+Byte-identical — a repeat (r,c) gives the same SAD and the same |r|+|c|, so neither
+`sad < best` nor `sad == best && shorter` can fire. Expressed as the column interval
+already covered, so partial overlap is removed too.
+
+  akiyo -6.0% (8/8, z=+2.83)   foreman -8.5% (8/8, z=+2.83)
+  mobile -9.6% (7/8, z=+2.12)  bus inside the noise (4/8)
+
+## Lever B — hoist the x4 batch guards to the run's ends  **(PRUNE — measured FLAT)**
+
+In-bounds and already-scored are both column INTERVALS, so four consecutive
+candidates need their two ends tested, not four predicates of four comparisons.
+Byte-identical, and measured against the untouched stages as drift normalizers:
+akiyo drift 1.10-1.15x with int_search at 1.12x (normalized 1.00); mobile drift
+2.91-3.22x with int_search at 2.90x. **No effect** — LLVM already hoists the
+invariant row test and inlines the closure. Reverted rather than kept as dead
+weight; recorded so it is not retried.
+
+## Lever C — diamond search at speed 0  **(PRUNE — reproduces the old verdict)**
+
+  akiyo +0.47%  bus +1.87%  foreman +2.72%  mobile +1.05%  -> mean +1.53%
+
+Confirms the recorded "+2.05% for 1.18x" with a better BD tool. Still a bad trade
+at the quality anchor. It remains the speed>=1 default, correctly.
+
+## Levers D/E — a motion-search skip gate  **(BD-positive, speed-FLAT; opt-in)**
+
+D (the existing realtime formulation, opened to all tiers — take the predictor and
+`return`): mean +0.26%, and the whole loss is **akiyo +1.19%** while
+foreman/bus/mobile are neutral. A sign-flip.
+
+**The loss localized the defect.** `return predictor` skips the 1/4-pel refinement
+as well as the integer sweep, and sub-pel precision is exactly what carries PSNR on
+static content at high quality. E — skip only the INTEGER sweep and seed sub-pel
+from the predictor — turns the loser into a winner without touching the others:
+
+  | clip | D (return) | E (sub-pel kept) |
+  |---|---:|---:|
+  | akiyo | +1.19% | **-0.28%** |
+  | foreman | -0.08% | **-0.37%** |
+  | bus | -0.02% | **-0.10%** |
+  | mobile | -0.05% | +0.15% |
+  | mean | +0.26% | **-0.15%** |
+
+But the speed is FLAT (akiyo 2/8 z=-1.41, foreman 7/8 z=+2.12, mobile 5/8 z=+0.71;
+best-of within +/-1%): the gate pays an extra full-block SAD on every search where
+it does NOT fire, and at speed 0 the fire rate does not repay that. Shipped as
+`VP9_ME_SKIP` **default 0 = off** (default byte-identical), because a knob with no
+measured speed win should not be on.
+
+★ **The finding worth more than the lever:** the SHIPPED realtime gate
+(`nonrd_me_skip`, default-on at speed >= 4) still uses the `return predictor` form
+and therefore still skips sub-pel. On static content that cost 1.19% BD here. The
+realtime tier was BD-gated with that flaw baked in, so it was left alone in this
+pass — but re-gating it with the E formulation is a live, measured lead.

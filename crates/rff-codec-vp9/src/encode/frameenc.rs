@@ -594,6 +594,10 @@ pub struct FrameEncoder {
     /// already scored (`VP9_NO_MSEARCH_DEDUP` restores the double scan — the
     /// byte-identity oracle).
     msearch_dedup: bool,
+    /// Tier-independent motion-search skip threshold in SAD/pixel (`VP9_ME_SKIP`,
+    /// default 0 = off): take the predictor and skip the integer+subpel search when
+    /// it already fits this well.
+    me_skip: f64,
     /// x4-batched exhaustive integer search (`VP9_NO_MSEARCH_X4` disables → the
     /// one-position-at-a-time scalar oracle). The x4 kernel scores four ref positions
     /// from one source-tile load; byte-identical to four scalar SADs (A/B oracle).
@@ -1250,6 +1254,10 @@ impl FrameEncoder {
                 }),
             full_msearch: std::env::var("VP9_DIAMOND_MSEARCH").is_err(),
             msearch_dedup: std::env::var("VP9_NO_MSEARCH_DEDUP").is_err(),
+            me_skip: std::env::var("VP9_ME_SKIP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0),
             msearch_x4: std::env::var("VP9_NO_MSEARCH_X4").is_err(),
             corner_sad: std::env::var("VP9_CORNER_SAD").is_ok(),
             // 48 == NEWMV_SAD_PENALTY is PROVABLY lossless (a searched MV pays SAD+48).
@@ -4706,16 +4714,37 @@ impl FrameEncoder {
         let centers = [(0i32, 0i32), (predictor.0 / 8, predictor.1 / 8)];
         // NEARESTMV early-out: on the realtime leaf, if the predictor already fits well,
         // skip the whole diamond+subpel search and take it (NEWMV≈NEARESTMV ⇒ ~0 BD).
-        if self.nonrd_me_skip > 0.0 && self.nonrd_leaf && self.variance_leaf {
+        // Threshold in SAD-per-luma-pixel. The realtime leaf has always had this
+        // (`nonrd_me_skip`); `me_skip` opens the same gate to every tier so the
+        // exhaustive speed-0 sweep can be skipped on blocks the predictor already
+        // fits. Null arm of a search whose expensive arm rarely wins there — the
+        // shape codec-search-skip-gate calls gateable. Default 0 = off, BD-swept.
+        let realtime_skip = self.nonrd_leaf && self.variance_leaf && self.nonrd_me_skip > 0.0;
+        let mut best_px = (0i32, 0i32);
+        let mut best_sad = i64::MAX;
+        // Does the predictor already fit well enough to skip the sweep?
+        let mut seeded = false;
+        if realtime_skip || self.me_skip > 0.0 {
+            let t = if realtime_skip { self.nonrd_me_skip } else { self.me_skip };
             let (pr, pc) = (predictor.0 / 8, predictor.1 / 8);
             let psad = self.block_sad_sized(base_x, base_y, pr, pc, swl, shl, i64::MAX, ref8);
             let area = ((1i64 << bwl) * (1i64 << bhl) * 16) as f64; // luma pixels
-            if (psad as f64) < self.nonrd_me_skip * area {
-                return predictor;
+            if (psad as f64) < t * area {
+                if realtime_skip {
+                    // Realtime leaf keeps its original form — return outright, no
+                    // sub-pel. That tier was BD-gated as-is; leave it alone.
+                    return predictor;
+                }
+                // Every other tier: skip only the INTEGER sweep and seed sub-pel from
+                // the predictor. Returning outright also skipped the 1/4-pel
+                // refinement, which is what carries PSNR on static content — measured
+                // as akiyo +1.19% BD while foreman/mobile/bus were neutral, i.e. the
+                // loss was the missing sub-pel, not the missing integer sweep.
+                best_px = (pr, pc);
+                best_sad = psad;
+                seeded = true;
             }
         }
-        let mut best_px = (0i32, 0i32);
-        let mut best_sad = i64::MAX;
         {
             let _s = prof::Scope::new(prof::S::IntSearch);
             // Full-block interior test (all scored tiles read the reference without
@@ -4729,7 +4758,10 @@ impl FrameEncoder {
                     && base_x as i32 + c + msw_px <= rp0.w as i32
                     && base_y as i32 + r + msh_px <= rp0.h as i32
             };
-            if self.full_msearch {
+            if seeded {
+                // The predictor cleared the skip threshold: no integer sweep, but
+                // sub-pel below still refines from it.
+            } else if self.full_msearch {
                 // Reference exhaustive search (±8 around zero + predictor) — the
                 // oracle the diamond search is BD-rate-gated against (`VP9_FULL_MSEARCH`).
                 // Interior runs of 4 go through the x4 SIMD batch (one source-tile load
@@ -4768,6 +4800,13 @@ impl FrameEncoder {
                             #[cfg(target_arch = "x86_64")]
                             if self.msearch_x4 && dc + 3 <= RANGE {
                                 if let Some(r8) = ref8 {
+                                    // Hoisting these two guards to the run's ENDS
+                                    // (in-bounds and `scored` are both column
+                                    // intervals, so the ends bound the middle) was
+                                    // TRIED and measured FLAT against the untouched
+                                    // stages — LLVM already hoists the invariant row
+                                    // test and inlines the closure. Reverted rather
+                                    // than kept as dead weight.
                                     let cands: [(i32, i32); 4] =
                                         std::array::from_fn(|k| (r, cc + dc + k as i32));
                                     if cands.iter().all(|&(rr, cc2)| interior(rr, cc2))
