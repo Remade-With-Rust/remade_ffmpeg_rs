@@ -5631,6 +5631,11 @@ impl FrameEncoder {
         do_probe: bool,
         fixed_slot: usize,
     ) -> (ModeInfo, i64) {
+        // Pure SAD search — opens no other scope, so this is a disjoint partition
+        // member and can be summed alongside the transform kernels. Its parent
+        // `decide_sub8x8` is inclusive of a whole residual trial and is therefore
+        // an `[i]` diagnostic only.
+        let _s = prof::Scope::new(prof::S::Sub8x8Search);
         // A NEWMV must beat a predicted mode by ~this SAD to justify its MV bits.
         const NEWMV_SAD_PENALTY: i64 = 48;
         self.active_ref = slot;

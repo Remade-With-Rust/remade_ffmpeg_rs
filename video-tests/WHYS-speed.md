@@ -245,3 +245,44 @@ across two `pareto` invocations.
 4. **Our ARF/compound path costs 2.5x where libvpx's costs 1.5x** — a separate, unexplored
    target surfaced by the lag-25 run.
 5. **Re-run the ARF quality comparison at FRAMES >= 60** so the 25-frame lookahead fills.
+
+---
+
+## D6d — the PROFILER's own partition was overlapping  (found while descending on sub8x8)
+
+- **ASKED:** `sub8x8` measured 459 ms against libvpx's 28.7 ms — a 16x per-stage gap that
+  looked like the next brick. Is that comparison sound?
+- **MEASURED:** `prof::Scope` is a plain inclusive RAII timer with **no child
+  subtraction**, and `parent()` declares only the motion chain. But `decide_sub8x8` calls
+  `snap_block` and runs a full residual trial through `encode_plane` — so its span already
+  contains `SnapRestore`, `FwdTx`, `Quantize`, `CoefCost`, `Trellis` and `InvTxRecon`.
+  It was nevertheless listed in `TOPLEVEL`, the set summed as a disjoint partition.
+- **ANSWER:** the denominator double-counted those kernels, which correspondingly
+  UNDERSTATED the unscoped glue, and the D2 delta table over-attributed sub8x8 against a
+  reference whose profiler is exclusive by construction. This is the same class as the
+  x264 lesson already in `codec-analyzer` ("overlapping scopes make a foreign profiler's
+  percentages non-additive") — except the overlapping profiler was ours.
+- **FIX:** `Sub8x8` demoted to an `[i]` inclusive diagnostic; its exclusive part — the
+  per-4x4 SAD search, which opens no other scope — got its own `Sub8x8Search` bucket and
+  is a legitimate partition member.
+- **GATE:** profiler-only; byte-identical on akiyo/mobile, 157 tests pass.
+
+### The corrected ranking (matched crf32/s0, 20 frames)
+
+| akiyo_cif | ms | | mobile_cif | ms |
+|---|---:|---|---|---:|
+| TOTAL | 1635.4 | | TOTAL | 7561.3 |
+| orchestration/glue | 546.4 | | `[i]sub8x8` (incl) | 2433.1 |
+| `[i]sub8x8` (incl) | 262.4 | | orchestration/glue | 1990.2 |
+| int_search | 234.7 | | **sub8x8_search** | **1747.1** |
+| fwd_tx | 196.8 | | int_search | 825.7 |
+| **sub8x8_search** | **161.4** | | trellis | 456.0 |
+
+**`sub8x8_search` is 23% of mobile's whole encode** — the largest single named primitive,
+and it was invisible while it sat inside the double-counted `sub8x8` bucket. 19.1 us per
+call over 91,233 calls. It is a pure SAD search whose subpel arm pays a full 8-tap
+`predict_block` per candidate (the integer arm already has a byte-identical fast path).
+
+Reducing it means cutting candidates, which changes the bitstream — so it belongs to the
+BD-gated queue with the trial-multiplicity work, not to a byte-identical pass. Recorded
+rather than attempted.

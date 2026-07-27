@@ -36,13 +36,14 @@ pub enum S {
     Trellis,      // trellis_eob (per-coef RD + inverse transforms)
     InvTxRecon,   // inverse transform + add (reconstruction)
     IntraPred,    // build_intra_edges + intra predict
-    Sub8x8,       // decide_sub8x8 (per-4×4 RD; may nest MC/SAD)
+    Sub8x8Search, // sub8x8_search_ref (per-4×4 SAD search) — nests NO other scope
     SnapRestore,  // GLUE: entropy-context snapshot/restore around RD trials
     CtxUpdate,    // GLUE: entropy-context maintenance (set_ctx, partition ctx)
     MvRefs,       // GLUE: MV reference prediction (find_mv_refs, NEAREST/NEAR)
     PredSse,      // shortlist prediction+SSE scoring (pred_sse — inline interp, own leaf)
     // --- INFO stages (NOT in TOPLEVEL; inclusive totals for decomposing orchestration).
     // self-time = the stage's total minus its scoped kernel children (computed by hand).
+    Sub8x8,       // INFO: decide_sub8x8 — inclusive, nests the search AND a full residual trial
     RdCost,       // INFO: rd_cost_yuv + rd_cost_y (per-candidate RD; nests encode_plane kernels)
     DecideLeaf,   // INFO: decide_inter (whole leaf mode decision; nests motion/pred_sse/rd_cost)
     // --- Phase-0 glue bisection (2026-07-26). `rd_pick_partition` carries no scope,
@@ -77,11 +78,12 @@ const NAMES: [&str; N] = [
     "trellis",
     "invtx_recon",
     "intra_pred",
-    "sub8x8",
+    "  sub8x8_search",
     "snap_restore",
     "ctx_update",
     "mv_refs",
     "pred_sse",
+    "[i]sub8x8",
     "[i]rd_cost",
     "[i]decide_leaf",
     "[i]mode_map",
@@ -94,9 +96,18 @@ const NAMES: [&str; N] = [
 
 // The disjoint, non-nested top-level stages (so glue = TOTAL − Σ these). Excludes
 // the nested motion children (int/subpel/interp) and TOTAL itself.
+//
+// `Sub8x8` is deliberately NOT here. `Scope` is a plain inclusive RAII timer with
+// no child subtraction, and `decide_sub8x8` runs a full residual trial —
+// `snap_block` plus `encode_plane` — so its span already contains SnapRestore,
+// FwdTx, Quantize, CoefCost, Trellis and InvTxRecon. Summing it alongside those
+// double-counted them, which inflated the denominator and correspondingly
+// UNDERSTATED the unscoped glue. It is reported as an inclusive `[i]` diagnostic
+// instead, and its exclusive part — the per-4×4 SAD search — carries its own
+// `Sub8x8Search` scope, which nests nothing and so is a legitimate partition member.
 const TOPLEVEL: [S; 13] = [
     S::MotionSearch, S::Mc, S::FwdTx, S::Quantize, S::CoefCost, S::Trellis,
-    S::InvTxRecon, S::IntraPred, S::Sub8x8, S::SnapRestore, S::CtxUpdate, S::MvRefs,
+    S::InvTxRecon, S::IntraPred, S::Sub8x8Search, S::SnapRestore, S::CtxUpdate, S::MvRefs,
     S::PredSse,
 ];
 
@@ -203,6 +214,7 @@ pub fn is_info(i: usize) -> bool {
     matches!(
         i,
         x if x == S::RdCost as usize
+            || x == S::Sub8x8 as usize
             || x == S::DecideLeaf as usize
             || x == S::ModeMap as usize
             || x == S::SnapDrop as usize
