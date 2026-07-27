@@ -369,6 +369,242 @@ fn cmd_speed() {
 {} row(s) over {} clip(s)", rows.len(), clips.len());
 }
 
+// ---------------------------------------------------------------------------
+// pareto — the MATCHED-OPERATING-POINT pass.
+//
+// `speed` runs every arm at its own defaults, which answers "what do I get out
+// of the box" but CANNOT answer "why are we slower": our default is constant
+// quality at qindex 64 with no lookahead, while libvpx's is 256 kbps VBR with
+// lag 25. On park_joy that is a 72x bitrate difference, so the two arms are not
+// doing remotely the same work and neither the speed ratio nor the quality
+// delta means anything.
+//
+// Here both arms are pinned to the SAME rate-control mode (constant quality),
+// the SAME cq-level, the SAME speed preset and the SAME lookahead, and the
+// ladder is swept so encode time can be read at matched quality rather than at
+// two unrelated points on two different curves.
+// ---------------------------------------------------------------------------
+
+/// The matched operating point, as (our options, libvpx flags). Empty when
+/// `MATCH_CRF` is unset, so `stages` keeps its historical default-settings
+/// behaviour unless a matched run is explicitly requested.
+fn matched_cfg(frames: usize) -> (rff_core::Dictionary, Vec<String>) {
+    let mut opts = rff_core::Dictionary::new();
+    let mut extra: Vec<String> = Vec::new();
+    let crf = match std::env::var("MATCH_CRF").ok().and_then(|v| v.parse::<u32>().ok()) {
+        Some(c) => c,
+        None => return (opts, extra),
+    };
+    let sp = std::env::var("MATCH_SPEED")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    let lag = std::env::var("MATCH_LAG")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    opts.set("crf", crf.to_string());
+    opts.set("speed", sp.to_string());
+    if lag > 0 {
+        opts.set("lag", lag.to_string());
+    }
+    extra.extend([
+        "--crf".into(),
+        crf.to_string(),
+        "--cpu-used".into(),
+        sp.to_string(),
+        "--lag".into(),
+        lag.to_string(),
+        "--frames".into(),
+        frames.to_string(),
+    ]);
+    (opts, extra)
+}
+
+fn env_list(key: &str, default: &str) -> Vec<u32> {
+    std::env::var(key)
+        .unwrap_or_else(|_| default.to_string())
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect()
+}
+
+fn cmd_pareto() {
+    if let Err(e) = libvpx::check() {
+        eprintln!("!! {e}");
+        std::process::exit(2);
+    }
+    let clips = manifest();
+    let tmp = scratch();
+    let crfs = env_list("PARETO_CRF", "20,32,43,55");
+    let speeds = env_list("PARETO_SPEED", "0");
+    let lag: u32 = env_list("PARETO_LAG", "0").first().copied().unwrap_or(0);
+    let mut rows: Vec<Row> = Vec::new();
+
+    eprintln!(
+        "matched operating point: crf {crfs:?} x speed {speeds:?}, lag {lag}, constant-quality both arms"
+    );
+
+    for c in &clips {
+        let clip = match y4m::read(&c.path, 0) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("  ! {e}");
+                continue;
+            }
+        };
+        let n = cfg_frames(clip.frames.len());
+        eprintln!("\n=== {} ({}) {}x{} x{n} ===", c.name, c.class, clip.width, clip.height);
+
+        let src = tmp.join(format!("{}.p.src.y4m", c.name));
+        if y4m::write_prefix(&clip, &src, n).is_err() {
+            continue;
+        }
+
+        for &sp in &speeds {
+            for &crf in &crfs {
+                let tag = format!("crf{crf}/s{sp}/lag{lag}");
+
+                // ---- ours, explicitly configured -------------------------
+                let mut opts = rff_core::Dictionary::new();
+                opts.set("crf", crf.to_string());
+                opts.set("speed", sp.to_string());
+                if lag > 0 {
+                    opts.set("lag", lag.to_string());
+                }
+                let ivf = tmp.join(format!("{}.p.ours.ivf", c.name));
+                match ours::encode_speed_cfg(&clip, n, CFG.reps, &opts) {
+                    Ok((d, packets)) => {
+                        let bytes: usize = packets.iter().map(|p| p.len()).sum();
+                        let mut r = row_of(c, &clip, n, "ours", "encode");
+                        r.source = tag.clone();
+                        fill(&mut r, &clip, n, d, bytes);
+                        std::fs::write(&ivf, ours::to_ivf(&clip, &packets)).ok();
+                        if let Some((p, s)) = quality::measure(&ivf, &clip, n) {
+                            r.psnr = p;
+                            r.ssim = s;
+                        }
+                        eprintln!(
+                            "  ours   {tag:<16} {:>9.1} ms {:>8.0} kb/s {:>6.2} dB",
+                            r.wall_ms, r.kbps, r.psnr
+                        );
+                        rows.push(r);
+                    }
+                    Err(e) => eprintln!("  ours   {tag} FAILED: {e}"),
+                }
+
+                // ---- libvpx, the same operating point --------------------
+                // Skipped for A/B loops over our own knobs, where the reference
+                // arm is constant and only doubles the wall time.
+                if std::env::var("PARETO_NOREF").is_ok() {
+                    write_rows(&results_dir().join("pareto.tsv"), &rows);
+                    continue;
+                }
+                let mut extra = vec![
+                    "--crf".to_string(),
+                    crf.to_string(),
+                    "--cpu-used".to_string(),
+                    sp.to_string(),
+                    "--lag".to_string(),
+                    lag.to_string(),
+                    "--frames".to_string(),
+                    n.to_string(),
+                ];
+                if sp >= 5 {
+                    extra.push("--realtime".to_string());
+                }
+                let lv = tmp.join(format!("{}.p.libvpx.ivf", c.name));
+                match libvpx::encode_best(&src, &lv, &extra, CFG.reps) {
+                    Ok(run) => {
+                        let mut r = row_of(c, &clip, n, "libvpx", "encode");
+                        r.source = tag.clone();
+                        fill(&mut r, &clip, n, run.inner, run.bytes);
+                        if let Some((p, s)) = quality::measure(&lv, &clip, n) {
+                            r.psnr = p;
+                            r.ssim = s;
+                        }
+                        eprintln!(
+                            "  libvpx {tag:<16} {:>9.1} ms {:>8.0} kb/s {:>6.2} dB",
+                            r.wall_ms, r.kbps, r.psnr
+                        );
+                        rows.push(r);
+                    }
+                    Err(e) => eprintln!("  libvpx {tag} FAILED: {e}"),
+                }
+                write_rows(&results_dir().join("pareto.tsv"), &rows);
+            }
+        }
+        let _ = std::fs::remove_file(&src);
+    }
+    eprintln!("\n{} row(s) -> results/pareto.tsv", rows.len());
+}
+
+// ---------------------------------------------------------------------------
+// noise — the NULL ARM.
+//
+// Two arms that are the SAME encoder at the SAME settings, run ABBA-interleaved.
+// Any reported difference is the harness's own floor, and every speed claim
+// smaller than it is a coin flip. This machine has previously manufactured
+// +0.2%..+10.8% between two identical VP9 encoders, so it is measured, not
+// assumed.
+// ---------------------------------------------------------------------------
+
+fn cmd_noise() {
+    let clips = manifest();
+    let reps: usize = std::env::var("NOISE_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6);
+    let crf: u32 = env_list("PARETO_CRF", "32").first().copied().unwrap_or(32);
+    let sp: u32 = env_list("PARETO_SPEED", "0").first().copied().unwrap_or(0);
+
+    for c in &clips {
+        let clip = match y4m::read(&c.path, 0) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let n = cfg_frames(clip.frames.len());
+        let mut opts = rff_core::Dictionary::new();
+        opts.set("crf", crf.to_string());
+        opts.set("speed", sp.to_string());
+
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for i in 0..reps {
+            // ABBA: alternate which arm runs first so a warm-second-run effect
+            // cancels instead of accumulating into whichever arm always leads.
+            let first_is_a = i % 2 == 0;
+            let mut one = || {
+                ours::encode_speed_cfg(&clip, n, 1, &opts)
+                    .map(|(d, _)| d.as_secs_f64() * 1e3)
+                    .unwrap_or(f64::NAN)
+            };
+            let (x, y) = (one(), one());
+            if first_is_a {
+                a.push(x);
+                b.push(y);
+            } else {
+                b.push(x);
+                a.push(y);
+            }
+        }
+        let best = |v: &[f64]| v.iter().cloned().fold(f64::INFINITY, f64::min);
+        let (ba, bb) = (best(&a), best(&b));
+        let spread = (bb - ba) / ba * 100.0;
+        let allmin = ba.min(bb);
+        let allmax = a.iter().chain(b.iter()).cloned().fold(0.0f64, f64::max);
+        eprintln!(
+            "{:<24} null arm: best-of-{reps} A {ba:8.1} ms  B {bb:8.1} ms  \
+             delta {spread:+6.2}%   worst/best {:.2}x",
+            c.name,
+            allmax / allmin
+        );
+    }
+    eprintln!(
+        "\nAny A/B speed claim smaller than |delta| above is inside the harness floor \
+         and is NOT a result."
+    );
+}
+
 /// Time one decoder arm over a stream that exists both as in-memory packets
 /// (for our in-process decoder) and as an IVF file (for the external ones).
 fn decode_arm(
@@ -467,8 +703,17 @@ fn cmd_stages() {
             CFG.profile_passes
         };
 
+        // The matched operating point, if one was asked for. Without it each
+        // arm profiles its own defaults, which are a 5-72x bitrate apart on this
+        // corpus — and an arm that codes more coefficients inflates its own
+        // coefficient stages for reasons unrelated to efficiency.
+        let (opts, extra) = matched_cfg(n);
+        if !extra.is_empty() {
+            eprintln!("  (matched operating point: {})", extra.join(" "));
+        }
+
         // ---- ours: encoder -------------------------------------------------
-        let s = ours::encode_stages(&clip, n, passes);
+        let s = ours::encode_stages_cfg(&clip, n, passes, &opts);
         rows.extend(our_encode_rows(&c.name, &s));
 
         eprintln!("  ours   encode stages captured");
@@ -477,7 +722,7 @@ fn cmd_stages() {
         let src = tmp.join(format!("{}.src.y4m", c.name));
         if y4m::write_prefix(&clip, &src, n).is_ok() {
             let out = tmp.join(format!("{}.libvpxp.ivf", c.name));
-            match libvpx::encode(&src, &out, true) {
+            match libvpx::encode_cfg(&src, &out, true, &extra) {
                 Ok(run) => {
                     rows.extend(ref_rows(&c.name, "encode", &run));
                     eprintln!("  libvpx encode: {} stage buckets", run.stages.len());
@@ -693,15 +938,22 @@ fn main() {
     match mode.as_str() {
         "speed" => cmd_speed(),
         "stages" => cmd_stages(),
+        "pareto" => cmd_pareto(),
+        "noise" => cmd_noise(),
         "report" => report::generate(&results_dir()),
         _ => {
-            eprintln!("usage: analyzer <speed|stages|report>");
+            eprintln!("usage: analyzer <speed|stages|pareto|noise|report>");
             eprintln!("  speed   profiler OFF — throughput / size / PSNR / SSIM at defaults");
             eprintln!("  stages  profiler ON  — per-function ms, %, calls, ns/call");
+            eprintln!("  pareto  MATCHED operating point — both arms at the same crf/speed/lag");
+            eprintln!("  noise   NULL arm — the harness's own A/B floor, ABBA-interleaved");
             eprintln!("  report  merge results/*.tsv into results/REPORT.md");
             eprintln!();
             eprintln!("env: CLIPS=a,b   restrict the corpus");
             eprintln!("     FRAMES=N    frames per clip (0 = whole clip; default 30)");
+            eprintln!("     PARETO_CRF=20,32,43,55   the matched cq ladder");
+            eprintln!("     PARETO_SPEED=0           matched speed preset (ours -speed == libvpx --cpu-used)");
+            eprintln!("     PARETO_LAG=0             matched lookahead");
             eprintln!("     CLIPS_DIR   where the .y4m files live");
             eprintln!("     LIBVPX_DIR  the _ref_libvpx checkout");
             eprintln!("     FFMPEG      the upstream ffmpeg binary");

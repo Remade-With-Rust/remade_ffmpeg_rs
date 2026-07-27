@@ -9,7 +9,7 @@
 
 use rff_codec::CodecRegistry;
 use rff_codec_vp9::prof as dec_prof;
-use rff_core::{CodecId, Error, Frame, Packet, PixelFormat, VideoFrame};
+use rff_core::{CodecId, Dictionary, Error, Frame, Packet, PixelFormat, VideoFrame};
 use std::time::{Duration, Instant};
 
 use crate::y4m::Clip;
@@ -38,10 +38,24 @@ fn video_frame(clip: &Clip, i: usize) -> Frame {
 
 /// One encode pass. Returns (elapsed, concatenated packet payloads, packet count).
 fn encode_once(clip: &Clip, frames: usize) -> Result<(Duration, Vec<Vec<u8>>), String> {
+    encode_once_cfg(clip, frames, &Dictionary::new())
+}
+
+/// One encode pass at an EXPLICIT configuration — the matched-operating-point
+/// path. `encode_once` is this with an empty dictionary, so the default arm and
+/// the matched arm run byte-identical code and differ only in the options.
+fn encode_once_cfg(
+    clip: &Clip,
+    frames: usize,
+    opts: &Dictionary,
+) -> Result<(Duration, Vec<Vec<u8>>), String> {
     let reg = registry();
     let mut enc = reg
         .find_encoder(CodecId::Vp9)
         .map_err(|e| format!("find_encoder: {e}"))?;
+    if !opts.is_empty() {
+        enc.configure(opts).map_err(|e| format!("configure: {e}"))?;
+    }
     let mut out: Vec<Vec<u8>> = Vec::new();
     let t = Instant::now();
     for i in 0..frames {
@@ -72,10 +86,20 @@ fn encode_once(clip: &Clip, frames: usize) -> Result<(Duration, Vec<Vec<u8>>), S
 /// scheduler and by turbo/thermal excursions, so it is the most repeatable
 /// statistic — which is the whole point of a fixed corpus.
 pub fn encode_speed(clip: &Clip, frames: usize, reps: usize) -> Result<(Duration, Vec<Vec<u8>>), String> {
+    encode_speed_cfg(clip, frames, reps, &Dictionary::new())
+}
+
+/// Best-of-N encode at an explicit configuration (the `pareto` pass).
+pub fn encode_speed_cfg(
+    clip: &Clip,
+    frames: usize,
+    reps: usize,
+    opts: &Dictionary,
+) -> Result<(Duration, Vec<Vec<u8>>), String> {
     let mut best = Duration::MAX;
     let mut kept = Vec::new();
     for _ in 0..reps.max(1) {
-        let (d, pkts) = encode_once(clip, frames)?;
+        let (d, pkts) = encode_once_cfg(clip, frames, opts)?;
         if d < best {
             best = d;
             kept = pkts;
@@ -154,10 +178,23 @@ pub fn profile_median<const K: usize>(
 
 /// Encoder stage snapshot for one clip, median over `passes` full encodes.
 pub fn encode_stages(clip: &Clip, frames: usize, passes: usize) -> [(f64, u64); enc_prof::N] {
+    encode_stages_cfg(clip, frames, passes, &Dictionary::new())
+}
+
+/// Encoder stage snapshot at an EXPLICIT configuration. Attribution is only
+/// comparable against the reference when both sides encode the same operating
+/// point — otherwise the arm emitting more coefficients inflates its own
+/// coefficient stages for reasons that have nothing to do with efficiency.
+pub fn encode_stages_cfg(
+    clip: &Clip,
+    frames: usize,
+    passes: usize,
+    opts: &Dictionary,
+) -> [(f64, u64); enc_prof::N] {
     enc_prof::set_enabled(true);
     let s = profile_median(
         || {
-            let _ = encode_once(clip, frames);
+            let _ = encode_once_cfg(clip, frames, opts);
         },
         passes,
         enc_prof::reset,

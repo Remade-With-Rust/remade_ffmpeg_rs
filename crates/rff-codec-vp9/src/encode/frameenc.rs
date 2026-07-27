@@ -867,6 +867,61 @@ pub struct FrameEncoder {
     /// IS NOT BYTE-IDENTICAL (measured — all clips diverge), so some path reads the pre-trial
     /// recon (a real dependency). Kept ON; skip only for experiments (would need BD-gating).
     snap_recon: bool,
+    /// Reused per-tx-block scratch (see [`TxScratch`]). Boxed and moved out with
+    /// `mem::take` for the duration of `encode_tx_block` so it does not conflict
+    /// with the `&self.src` / `&mut self.rec` borrows that function needs.
+    tx_scratch: Box<TxScratch>,
+    /// Re-zero [`TxScratch`] on entry, reproducing the old stack-array cost
+    /// exactly (`VP9_TX_MEMSET=1`). The A/B oracle for the scratch brick: output
+    /// is byte-identical either way, so any difference is purely the memset.
+    tx_memset: bool,
+}
+
+/// The five per-tx-block working buffers.
+///
+/// These used to be `[0i32; 1024]` locals declared inside `encode_tx_block`.
+/// Every one is sized for the largest transform (32x32) but only `[..bs*bs]` is
+/// ever touched, and a 4x4 luma block uses 16 of the 1024 entries — so each call
+/// paid a ~17 KB zero-init to use as little as 320 bytes of it. `encode_tx_block`
+/// runs 2.1M times on a 20-frame CIF clip at crf 32, which made that memset the
+/// single largest unattributed bucket in the encoder.
+///
+/// Reuse is sound because every buffer is fully written over `[..n]` before it is
+/// read over `[..n]`: `residual` by the differencing loop, `coeffs` by
+/// `forward_transform`, `levels`/`dqcoeff` by `quantize` (or by the dedup cache's
+/// `copy_from_slice`), and `token_cache` by the coefficient walk that consumes it.
+/// Nothing carries meaning across calls, so stale bytes past `n` are unreachable.
+#[derive(Clone)]
+pub(crate) struct TxScratch {
+    residual: [i32; 1024],
+    coeffs: [i32; 1024],
+    levels: [i32; 1024],
+    dqcoeff: [i32; 1024],
+    token_cache: [u8; 1024],
+}
+
+impl Default for TxScratch {
+    fn default() -> TxScratch {
+        TxScratch {
+            residual: [0; 1024],
+            coeffs: [0; 1024],
+            levels: [0; 1024],
+            dqcoeff: [0; 1024],
+            token_cache: [0; 1024],
+        }
+    }
+}
+
+impl TxScratch {
+    /// Reproduce the old per-call zero-init — the A/B arm, never the default.
+    #[inline]
+    fn clear(&mut self) {
+        self.residual = [0; 1024];
+        self.coeffs = [0; 1024];
+        self.levels = [0; 1024];
+        self.dqcoeff = [0; 1024];
+        self.token_cache = [0; 1024];
+    }
 }
 
 /// Read an `f64` tuning knob from the environment.
@@ -1287,6 +1342,8 @@ impl FrameEncoder {
             yuv_abort: std::env::var("VP9_NO_YUV_ABORT").is_err(),
             snap_recon: std::env::var("VP9_NO_SNAP_RECON").is_err(),
             model_rank: std::env::var("VP9_MODEL_RANK").is_ok(),
+            tx_scratch: Box::default(),
+            tx_memset: std::env::var("VP9_TX_MEMSET").is_ok(),
             has_avx2: {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -3270,27 +3327,43 @@ impl FrameEncoder {
         let (base_x, base_y) = (mi_col * 8, mi_row * 8);
         let (w, h) = ((1usize << bwl) * 4, (1usize << bhl) * 4);
         let filt = self.active_filter as usize;
-        let mut buf = [0u16; 64 * 64];
-        for (i, (mv, slot)) in [(mv0, slot0), (mv1, slot1)].iter().enumerate() {
-            let q = clamp_mv_umv(*mv, w as i32, h as i32, 0, 0, edges);
-            let rp = &self.refs[*slot].as_ref().unwrap()[0];
-            let refp = RefPlane { buf: &rp.buf, stride: rp.stride, w: rp.w as i32, h: rp.h as i32 };
-            predict_block(
-                &refp, base_x as i32 + (q.1 >> 4), base_y as i32 + (q.0 >> 4),
-                (q.1 & 15) as usize, (q.0 & 15) as usize, filt, &mut buf, w, w, h, i == 1, self.max_px,
-            );
+        // Reused rather than a `[0u16; 64*64]` local: that is an 8 KB zero-init on
+        // every call, and this runs per compound candidate whenever `-lag` is
+        // active. Same bug class as `TxScratch`. Safe because the ref-0 pass
+        // (`avg = false`) writes all of `[..w*h]` before the ref-1 pass blends
+        // into it and before the SSE loop reads it.
+        thread_local! {
+            static PSC_BUF: std::cell::RefCell<Vec<u16>> =
+                std::cell::RefCell::new(vec![0u16; 64 * 64]);
         }
-        let src = &self.src[0];
-        let mut sse = 0i64;
-        for r in 0..h {
-            let sr = (base_y + r) * src.stride + base_x;
-            let br = r * w;
-            for c in 0..w {
-                let d = buf[br + c] as i64 - src.buf[sr + c] as i64;
-                sse += d * d;
+        PSC_BUF.with(|b| {
+            let mut buf = b.borrow_mut();
+            if self.tx_memset {
+                buf.fill(0); // VP9_TX_MEMSET=1 — reproduce the old per-call cost
             }
-        }
-        sse
+            for (i, (mv, slot)) in [(mv0, slot0), (mv1, slot1)].iter().enumerate() {
+                let q = clamp_mv_umv(*mv, w as i32, h as i32, 0, 0, edges);
+                let rp = &self.refs[*slot].as_ref().unwrap()[0];
+                let refp =
+                    RefPlane { buf: &rp.buf, stride: rp.stride, w: rp.w as i32, h: rp.h as i32 };
+                predict_block(
+                    &refp, base_x as i32 + (q.1 >> 4), base_y as i32 + (q.0 >> 4),
+                    (q.1 & 15) as usize, (q.0 & 15) as usize, filt, &mut buf, w, w, h, i == 1,
+                    self.max_px,
+                );
+            }
+            let src = &self.src[0];
+            let mut sse = 0i64;
+            for r in 0..h {
+                let s_row = &src.buf[(base_y + r) * src.stride + base_x..][..w];
+                let b_row = &buf[r * w..][..w];
+                for c in 0..w {
+                    let d = b_row[c] as i64 - s_row[c] as i64;
+                    sse += d * d;
+                }
+            }
+            sse
+        })
     }
 
     /// AQ segment of the 64×64 SB covering `(mi_row, mi_col)` (0 when AQ is off).
@@ -5996,15 +6069,39 @@ impl FrameEncoder {
             );
         }
 
-        // Reused stack scratch (max 32×32 = 1024) — no per-block heap allocation.
+        // Per-block working buffers. These are moved out of `self` rather than
+        // declared as locals: as `[0i32; 1024]` stack arrays they cost a ~17 KB
+        // zero-init on every one of the ~2.1M calls a 20-frame CIF encode makes,
+        // which measured as the largest single unattributed bucket in the
+        // encoder. Every buffer is fully written over `[..n]` before it is read,
+        // so carrying stale bytes past `n` is unobservable. `mem::take` (a
+        // pointer move on a `Box`) keeps the borrow checker happy alongside the
+        // `&self.src` / `&mut self.rec` borrows below; it is restored at BOTH
+        // exits. `encode_tx_block` is not re-entrant, so the box is never empty.
+        let mut scratch = std::mem::take(&mut self.tx_scratch);
+        if self.tx_memset {
+            scratch.clear(); // VP9_TX_MEMSET=1 — the A/B oracle arm
+        }
+        let TxScratch {
+            residual,
+            coeffs,
+            levels,
+            dqcoeff,
+            token_cache,
+        } = &mut *scratch;
+
         let n = bs * bs;
-        let mut residual = [0i32; 1024];
         let src = &self.src[plane];
+        // Row-sliced rather than 2-D indexed: the old form recomputed
+        // `(y0+y)*src.stride + x0+x` per pixel and defeated vectorisation across
+        // two different strides. Bounds are checked once per row, and the inner
+        // loop is a flat u16->i32 subtract that LLVM can widen.
         for y in 0..bs {
+            let s_row = &src.buf[(y0 + y) * src.stride + x0..][..bs];
+            let p_row = &self.rec[plane].buf[dst_off + y * stride..][..bs];
+            let d_row = &mut residual[y * bs..][..bs];
             for x in 0..bs {
-                let s = src.buf[(y0 + y) * src.stride + x0 + x] as i32;
-                let p = self.rec[plane].buf[dst_off + y * stride + x] as i32;
-                residual[y * bs + x] = s - p;
+                d_row[x] = s_row[x] as i32 - p_row[x] as i32;
             }
         }
         // Prediction-only SSE (Σ(src−pred)² = Σ residual²) — the distortion if this
@@ -6058,9 +6155,6 @@ impl FrameEncoder {
         let (scan, nb) = get_scan(tx_size, tx_type);
         let dq = if plane == 0 { self.dq_y } else { self.dq_uv };
         let dq_shift = if tx_size == 3 { 1 } else { 0 };
-        let mut coeffs = [0i32; 1024];
-        let mut levels = [0i32; 1024];
-        let mut dqcoeff = [0i32; 1024];
         // Emit-dedup reuse: on a residual-hash match the trial's outputs ARE this
         // block's outputs (pure function) — skip fwd+quantize+trellis entirely.
         let mut from_cache = false;
@@ -6181,7 +6275,6 @@ impl FrameEncoder {
                 ),
             );
         }
-        let mut token_cache = [0u8; 1024];
         let bits = if let Some(enc) = enc {
             // Commit: code with the adapted probs in pass 2 (R4), else the
             // defaults, and tally the token counts for the forward update.
@@ -6263,6 +6356,7 @@ impl FrameEncoder {
                 let e = (dqcoeff[p] - coeffs[p]) as f64;
                 d += e * e * norm[p];
             }
+            self.tx_scratch = scratch; // restore before the early exit
             return (bits, d as u64);
         }
 
@@ -6293,17 +6387,24 @@ impl FrameEncoder {
         }
 
         // ---- distortion: SSE of the reconstruction vs the source (for RDO) ----
+        // Row-sliced for the same reason as the residual loop above: one bounds
+        // check per row instead of two per pixel, and an inner loop LLVM can
+        // widen. The i32 product cannot overflow: pixels are <= 16-bit, so the
+        // squared difference is < 2^32 and 1024 of them still fit in u64.
         let src = &self.src[plane];
         let rec = &self.rec[plane].buf;
         let mut sse = 0u64;
         for y in 0..bs {
+            let s_row = &src.buf[(y0 + y) * src.stride + x0..][..bs];
+            let r_row = &rec[dst_off + y * stride..][..bs];
+            let mut acc = 0u64;
             for x in 0..bs {
-                let s = src.buf[(y0 + y) * src.stride + x0 + x] as i64;
-                let r = rec[dst_off + y * stride + x] as i64;
-                let d = s - r;
-                sse += (d * d) as u64;
+                let d = s_row[x] as i64 - r_row[x] as i64;
+                acc += (d * d) as u64;
             }
+            sse += acc;
         }
+        self.tx_scratch = scratch;
         (bits, sse)
     }
 

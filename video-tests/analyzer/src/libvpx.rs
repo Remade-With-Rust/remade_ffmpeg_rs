@@ -150,17 +150,40 @@ fn run(exe: &Path, args: &[&str], prof_out: Option<&Path>) -> Result<Run, String
 /// Encode `src` (a y4m) to `out` (an IVF) at libvpx's DEFAULT settings, pinned to
 /// one thread. `prof` selects the instrumented binary and harvests its taps.
 pub fn encode(src: &Path, out: &Path, prof: bool) -> Result<Run, String> {
+    encode_cfg(src, out, prof, &[])
+}
+
+/// Encode with EXTRA arguments appended after the pinned `--threads 1` — the
+/// matched-operating-point path (`--crf N --cpu-used N --lag N`). `encode` is
+/// this with an empty slice, so the default arm and the matched arm differ only
+/// in the flags, never in the driver.
+///
+/// Best-of-N is NOT done here: the reference reports its own codec-loop time and
+/// re-running it would also re-encode the file. The caller repeats if it wants a
+/// distribution.
+pub fn encode_cfg(src: &Path, out: &Path, prof: bool, extra: &[String]) -> Result<Run, String> {
     let exe = bin("vp9enc", prof);
     let prof_out = out.with_extension("vpxprof.tsv");
     let src_s = src.to_string_lossy().into_owned();
     let out_s = out.to_string_lossy().into_owned();
-    let mut r = run(
-        &exe,
-        &[&src_s, &out_s, "--threads", "1"],
-        if prof { Some(&prof_out) } else { None },
-    )?;
+    let mut args: Vec<&str> = vec![&src_s, &out_s, "--threads", "1"];
+    args.extend(extra.iter().map(String::as_str));
+    let mut r = run(&exe, &args, if prof { Some(&prof_out) } else { None })?;
     r.bytes = std::fs::metadata(out).map(|m| m.len() as usize).unwrap_or(0);
     Ok(r)
+}
+
+/// Best-of-N wrapper: the reference is an external process, so the only honest
+/// repeat is a full re-invocation. Keeps the fastest reported codec-loop time.
+pub fn encode_best(src: &Path, out: &Path, extra: &[String], reps: usize) -> Result<Run, String> {
+    let mut best: Option<Run> = None;
+    for _ in 0..reps.max(1) {
+        let r = encode_cfg(src, out, false, extra)?;
+        if best.as_ref().is_none_or(|b| r.inner < b.inner) {
+            best = Some(r);
+        }
+    }
+    best.ok_or_else(|| "no reps".to_string())
 }
 
 /// Decode `src` (an IVF) with the libvpx reference, best of `reps` passes.
