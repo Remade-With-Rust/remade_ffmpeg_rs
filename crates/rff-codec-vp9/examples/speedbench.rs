@@ -84,6 +84,16 @@ fn main() {
     let dt = t0.elapsed().as_secs_f64();
 
     // --- write IVF ---
+    // Observe-only: which reference did the emitted inter blocks actually pick?
+    if std::env::var("VP9_REF_HIST").is_ok() {
+        let h = rff_codec_vp9::ref_hist_take();
+        let n: u64 = h.iter().sum();
+        let pct = |v: u64| if n > 0 { 100.0 * v as f64 / n as f64 } else { 0.0 };
+        eprintln!(
+            "REF_HIST blocks={n}  LAST {:.1}%  GOLDEN {:.1}%  ALTREF {:.1}%  COMPOUND {:.1}%",
+            pct(h[0]), pct(h[1]), pct(h[2]), pct(h[3])
+        );
+    }
     let total: usize = packets.iter().map(|p| p.len()).sum();
     write_ivf(out, w as u16, h as u16, &packets);
     eprintln!(

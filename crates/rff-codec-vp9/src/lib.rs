@@ -38,7 +38,7 @@ pub use bits::{BitReader, BoolDecoder};
 /// analyzer. The encoder itself stays private; only the read side of the
 /// instrument is public. See [`prof`] for the decoder's.
 pub use encode::prof as encode_prof;
-pub use encode::{set_modemap_std, set_snap_pool};
+pub use encode::{ref_hist_take, set_modemap_std, set_snap_pool};
 
 pub(crate) const FRAME_MARKER: u32 = 2;
 pub(crate) const SYNC_CODE: u32 = 0x49_8342;

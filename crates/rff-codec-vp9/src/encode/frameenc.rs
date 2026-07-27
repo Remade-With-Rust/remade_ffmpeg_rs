@@ -292,6 +292,23 @@ impl FxHasher {
     }
 }
 
+/// Observe-only reference-selection histogram (`VP9_REF_HIST=1`): [LAST, GOLDEN, ALTREF,
+/// compound] counts over emitted inter blocks. Answers whether a coded ALT-REF is actually
+/// being CHOSEN as a predictor — the difference between "the tool is useless on this
+/// content" and "the tool is coded but never consulted".
+pub static REF_HIST: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn ref_hist_on() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("VP9_REF_HIST").is_ok())
+}
+
+/// Read and clear the reference histogram.
+pub fn ref_hist_take() -> [u64; 4] {
+    std::array::from_fn(|i| REF_HIST[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Cap the free-lists: the partition recursion holds at most ~3 snapshots per level
 /// over 4 levels, so a couple of dozen buffers covers every live snapshot with room
 /// to spare. Unbounded lists would hoard the largest capacity ever seen, per thread.
@@ -3462,6 +3479,18 @@ impl FrameEncoder {
             self.write_tx_size(enc, mi.tx_size, ctx, max_tx);
         }
         if mi.is_inter {
+            // REF-SELECTION HARVEST (`VP9_REF_HIST=1`, observe-only). Counts which
+            // reference each EMITTED inter block actually chose, so "the ALT-REF is
+            // coded but never used" can be measured instead of assumed. Indices:
+            // 0=LAST 1=GOLDEN 2=ALTREF 3=compound.
+            if ref_hist_on() {
+                let i = if mi.has_second_ref() {
+                    3
+                } else {
+                    (mi.ref_frame[0] - LAST_FRAME).clamp(0, 2) as usize
+                };
+                REF_HIST[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             // Reference. On a SELECT frame (compound), a comp_inter bit picks
             // single-vs-compound; compound then codes a comp_ref bit (which var ref
             // pairs with the fixed GOLDEN), else the usual single_ref pair. Mirrors

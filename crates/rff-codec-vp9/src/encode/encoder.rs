@@ -321,6 +321,8 @@ pub struct Vp9Encoder {
     /// Previous chained frame was a shown, same-size P (the decoder's
     /// `use_prev_mvs` precondition).
     chain_prev_p: bool,
+    /// Reconstruction of the most recent slotted-coded frame (for the recon oracle).
+    last_recon: Option<[Vec<u16>; 3]>,
     /// Frame counter for the `VP9_RECON_CHECK` oracle.
     recon_check_n: usize,
     /// Persistent oracle decoder (holds the reference chain).
@@ -386,6 +388,7 @@ impl Default for Vp9Encoder {
             chain: std::env::var("VP9_NO_CHAIN").is_err(), // F3: corpus-gated −11.15% BD
             companion: None,
             chain_prev_p: false,
+            last_recon: None,
             recon_check_n: 0,
             recon_check_dec: None,
             group_chain: false,
@@ -713,6 +716,33 @@ impl Vp9Encoder {
         bytes
     }
 
+    /// Feed one coded frame to the oracle decoder and, if it emits a picture, diff that
+    /// picture against the reconstruction the encoder believes it produced.
+    ///
+    /// `expect = None` means "this frame is HIDDEN (an ALT-REF) — advance the decoder's
+    /// state but do not compare", because a hidden frame emits no picture. The ARF is
+    /// verified later, when `show_existing_frame` displays it and `expect` is its recon.
+    /// Without this the whole ALT-REF path was invisible to the oracle: `recon_check` ran
+    /// only from `code_frame_q`, and the lag>1 path goes through `code_altref_group`.
+    fn recon_verify(&mut self, bytes: &[u8], expect: Option<&[Vec<u16>; 3]>, w: u32, h: u32) {
+        if std::env::var("VP9_RECON_CHECK").is_err() {
+            return;
+        }
+        match expect {
+            Some(r) => self.recon_check(bytes, r, w, h),
+            None => {
+                use rff_codec::Decoder as _;
+                let dec = self
+                    .recon_check_dec
+                    .get_or_insert_with(|| Box::new(crate::Vp9Decoder::default()));
+                let _ = dec.send_packet(&Packet::from_data(0, bytes.to_vec()));
+                while dec.receive_frame().is_ok() {}
+                eprintln!("RECON_CHECK frame {}: hidden (fed, not compared)", self.recon_check_n);
+                self.recon_check_n += 1;
+            }
+        }
+    }
+
     /// Decode `bytes` with a scratch decoder and compare against the encoder's own
     /// reconstruction. Reports the first differing sample per frame; counts frames.
     fn recon_check(&mut self, bytes: &[u8], recon: &[Vec<u16>; 3], w: u32, h: u32) {
@@ -938,6 +968,8 @@ impl Vp9Encoder {
                     self.code_p_slotted(c, fw, fh, false)
                 };
                 self.companion_feed(&b);
+                let r = self.last_recon.take();
+                self.recon_verify(&b, r.as_ref(), fw, fh);
                 self.packets.push_back(Packet::from_data(0, b));
             }
             return;
@@ -951,6 +983,8 @@ impl Vp9Encoder {
             let (c0, kw, kh) = frames[0].clone();
             let kb = self.code_key_slotted(c0, kw, kh);
             self.companion_feed(&kb);
+            let r = self.last_recon.clone();
+            self.recon_verify(&kb, r.as_ref(), kw, kh);
             self.packets.push_back(Packet::from_data(0, kb));
             i0 = 1;
         }
@@ -970,11 +1004,17 @@ impl Vp9Encoder {
         };
         let ab = self.code_arf_slotted(carf, aw, ah);
         self.companion_feed(&ab);
+        // The ARF is HIDDEN: feed it so the oracle's decoder tracks the reference slots,
+        // and keep its recon to compare when `show_existing_frame` finally displays it.
+        let arf_recon = self.last_recon.take();
+        self.recon_verify(&ab, None, aw, ah);
 
         // First shown P (F_i0) packed WITH the hidden ARF into one superframe.
         let (c1, w1, h1) = frames[i0].clone();
         let pb1 = self.code_p_slotted(c1, w1, h1, true);
         self.companion_feed(&pb1);
+        let r = self.last_recon.take();
+        self.recon_verify(&pb1, r.as_ref(), w1, h1);
         self.packets
             .push_back(Packet::from_data(0, pack_superframe(&[ab, pb1])));
 
@@ -983,12 +1023,16 @@ impl Vp9Encoder {
             let (ci, iw, ih) = f.clone();
             let pb = self.code_p_slotted(ci, iw, ih, true);
             self.companion_feed(&pb);
+            let r = self.last_recon.take();
+            self.recon_verify(&pb, r.as_ref(), iw, ih);
             self.packets.push_back(Packet::from_data(0, pb));
         }
 
         // Display the ALT-REF, then swap GOLDEN↔ALTREF so this ARF anchors the next group.
         let se = FrameEncoder::encode_show_existing_frame(self.arf_slot as u32);
         self.companion_feed(&se);
+        // show_existing displays the hidden ARF — the one chance to verify it.
+        self.recon_verify(&se, arf_recon.as_ref(), aw, ah);
         self.packets.push_back(Packet::from_data(0, se));
         std::mem::swap(&mut self.golden_slot, &mut self.arf_slot);
     }
@@ -1002,6 +1046,7 @@ impl Vp9Encoder {
         let bytes = enc.encode_frame();
         self.budget_update(&enc, true);
         let recon = enc.recon_owned();
+        self.last_recon = Some(recon.clone());
         self.slots = [Some(recon.clone()), Some(recon.clone()), Some(recon)];
         bytes
     }
@@ -1048,7 +1093,9 @@ impl Vp9Encoder {
         enc.set_hidden_altref(self.arf_slot);
         let bytes = enc.encode_frame();
         self.budget_update(&enc, false);
-        self.slots[self.arf_slot] = Some(enc.recon_owned());
+        let arf_recon = enc.recon_owned();
+        self.last_recon = Some(arf_recon.clone());
+        self.slots[self.arf_slot] = Some(arf_recon);
         bytes
     }
 
@@ -1086,7 +1133,9 @@ impl Vp9Encoder {
         }
         let bytes = enc.encode_frame();
         self.budget_update(&enc, self.slots[0].is_none());
-        self.slots[0] = Some(enc.recon_owned());
+        let recon = enc.recon_owned();
+        self.last_recon = Some(recon.clone());
+        self.slots[0] = Some(recon);
         bytes
     }
 }
