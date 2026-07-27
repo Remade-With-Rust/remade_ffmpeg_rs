@@ -762,6 +762,36 @@ impl Vp9Encoder {
                 "RECON_CHECK frame {}: {} samples DIVERGE (first plane{} ({},{}) enc={} dec={})",
                 self.recon_check_n, bad, p, x, y, e, d
             );
+            // Level 2: a 64x64-superblock map of where luma diverges, so the pattern
+            // (tile column, SB column, scattered, edge) is visible instead of guessed.
+            if std::env::var("VP9_RECON_CHECK").ok().as_deref() == Some("2") {
+                let (pw, ph) = (w as usize, h as usize);
+                let cw = recon[0].len() / ph.max(1);
+                let (sbx, sby) = (pw.div_ceil(64), ph.div_ceil(64));
+                let mut map = vec![0u32; sbx * sby];
+                for yy in 0..ph {
+                    for xx in 0..pw {
+                        let e = recon[0].get(yy * cw + xx).copied().unwrap_or(0) as u8;
+                        let dv = vf.planes[0].get(yy * vf.strides[0] + xx).copied().unwrap_or(0);
+                        if e != dv {
+                            map[(yy / 64) * sbx + xx / 64] += 1;
+                        }
+                    }
+                }
+                eprintln!("  SB map ({}x{} superblocks, '.'=clean, #=count/410):", sbx, sby);
+                for r in 0..sby {
+                    let row: String = (0..sbx)
+                        .map(|c| match map[r * sbx + c] {
+                            0 => '.',
+                            n if n < 410 => '1',
+                            n if n < 1640 => '2',
+                            n if n < 3277 => '3',
+                            _ => '#',
+                        })
+                        .collect();
+                    eprintln!("   {r:2} {row}");
+                }
+            }
         } else {
             eprintln!("RECON_CHECK frame {}: ok", self.recon_check_n);
         }

@@ -1113,7 +1113,7 @@ impl FrameEncoder {
             // (large blocks are far cheaper on smooth content; it can always fall back
             // to 8×8 on detail). Key-frame only for now — inter stays all-8×8.
             use_partition_rd: true,
-            disable_lf: false,
+            disable_lf: std::env::var("VP9_NO_LF").is_ok(),
             pending_eob: 0,
             trial_abort_at: None,
             skip_trial: false,
@@ -4262,11 +4262,27 @@ impl FrameEncoder {
 
     /// `mb_to_edges` (luma 1/8-pel border) for our only block size, 8×8 — where
     /// the libvpx `bw8`/`bh8` (block size in 8-pel units, halved) are both 1.
-    fn block_edges(&self, mi_row: usize, mi_col: usize, _bsize: usize) -> (i32, i32, i32, i32) {
+    /// MV clamp bounds for a block — MUST match the decoder's `mb_to_edges` exactly.
+    ///
+    /// This used to hardcode `1` where the decoder subtracts the block's size in 8x8
+    /// units (`bw8`/`bh8`), and ignored `bsize` entirely. The two agree only for 8x8
+    /// blocks, where `bw8 == 1`. For a 64x64 block `bw8 == 8`, so the encoder let an MV
+    /// point 7*64 = 448 eighth-pels further right than the decoder would allow: the
+    /// encoder predicted from one position, the decoder clamped to another, and since
+    /// the encoder feeds its own recon forward as the reference, the error compounded
+    /// frame over frame.
+    ///
+    /// It only bites where the clamp actually binds — large blocks near the right or
+    /// bottom edge with MVs pointing outward — which is why it showed up as right-edge
+    /// damage on fast-panning content (park_joy_1080p50) and stayed invisible on quiet
+    /// clips. Found with `VP9_RECON_CHECK`.
+    fn block_edges(&self, mi_row: usize, mi_col: usize, bsize: usize) -> (i32, i32, i32, i32) {
+        let bw8 = (1usize << B_WIDTH_LOG2[bsize] >> 1).max(1) as i32;
+        let bh8 = (1usize << B_HEIGHT_LOG2[bsize] >> 1).max(1) as i32;
         let left = -((mi_col as i32 * 8) << 3);
-        let right = (self.mi_cols as i32 - 1 - mi_col as i32) * 8 * 8;
+        let right = (self.mi_cols as i32 - bw8 - mi_col as i32) * 8 * 8;
         let top = -((mi_row as i32 * 8) << 3);
-        let bottom = (self.mi_rows as i32 - 1 - mi_row as i32) * 8 * 8;
+        let bottom = (self.mi_rows as i32 - bh8 - mi_row as i32) * 8 * 8;
         (left, right, top, bottom)
     }
 
