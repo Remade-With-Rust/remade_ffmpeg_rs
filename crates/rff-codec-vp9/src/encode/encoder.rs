@@ -321,6 +321,10 @@ pub struct Vp9Encoder {
     /// Previous chained frame was a shown, same-size P (the decoder's
     /// `use_prev_mvs` precondition).
     chain_prev_p: bool,
+    /// Frame counter for the `VP9_RECON_CHECK` oracle.
+    recon_check_n: usize,
+    /// Persistent oracle decoder (holds the reference chain).
+    recon_check_dec: Option<Box<crate::Vp9Decoder>>,
     /// Active while coding an ALT-REF group with chaining on.
     group_chain: bool,
     /// Active during two-pass PASS 2: chaining engages (pass 1 is a throwaway
@@ -382,6 +386,8 @@ impl Default for Vp9Encoder {
             chain: std::env::var("VP9_NO_CHAIN").is_err(), // F3: corpus-gated −11.15% BD
             companion: None,
             chain_prev_p: false,
+            recon_check_n: 0,
+            recon_check_dec: None,
             group_chain: false,
             pass2_chaining: false,
             lag_motion_thresh: std::env::var("VP9_LAG_MOTION_THRESH")
@@ -688,11 +694,78 @@ impl Vp9Encoder {
             }
         }
         let recon = enc.recon_owned();
+        // Encoder/decoder reconstruction oracle (`VP9_RECON_CHECK=1`). The encoder feeds
+        // its OWN `recon` forward as the next frame's reference, so if that ever differs
+        // from what a decoder produces from the emitted bytes, prediction diverges and
+        // the error compounds frame over frame — the worst failure mode this encoder
+        // has, and invisible to both the decoder conformance vectors (they test the
+        // decoder against libvpx streams) and a byte-diff (the bitstream is perfectly
+        // self-consistent; it is the encoder's belief about it that is wrong).
+        //
+        // Our decoder is 315/315 bit-exact against libvpx, so it is a trustworthy oracle.
+        if std::env::var("VP9_RECON_CHECK").is_ok() {
+            self.recon_check(&bytes, &recon, w, h);
+        }
         if is_key {
             self.golden = Some((recon.clone(), w, h));
         }
         self.reference = Some((recon, w, h));
         bytes
+    }
+
+    /// Decode `bytes` with a scratch decoder and compare against the encoder's own
+    /// reconstruction. Reports the first differing sample per frame; counts frames.
+    fn recon_check(&mut self, bytes: &[u8], recon: &[Vec<u16>; 3], w: u32, h: u32) {
+        use rff_codec::Decoder as _;
+        // PERSISTENT across frames. A fresh decoder per frame holds no reference
+        // buffers, so every inter frame decodes to garbage and the check reports a
+        // 100% mismatch that says nothing about the encoder.
+        let dec = self
+            .recon_check_dec
+            .get_or_insert_with(|| Box::new(crate::Vp9Decoder::default()));
+        let got = dec
+            .send_packet(&Packet::from_data(0, bytes.to_vec()))
+            .ok()
+            .and_then(|_| dec.receive_frame().ok());
+        let Some(rff_core::Frame::Video(vf)) = got else {
+            eprintln!("RECON_CHECK frame {}: DECODE FAILED", self.recon_check_n);
+            self.recon_check_n += 1;
+            return;
+        };
+        let mut bad = 0usize;
+        let mut first = None;
+        for p in 0..3 {
+            let (pw, ph) = if p == 0 {
+                (w as usize, h as usize)
+            } else {
+                ((w as usize).div_ceil(2), (h as usize).div_ceil(2))
+            };
+            // The encoder's recon is stored at the CODED size (mi-aligned); the decoded
+            // frame is the display crop, so compare only the visible region row by row.
+            let cw = recon[p].len() / ph.max(1);
+            for y in 0..ph {
+                for x in 0..pw {
+                    let e = recon[p].get(y * cw + x).copied().unwrap_or(0) as u8;
+                    let d = vf.planes[p].get(y * vf.strides[p] + x).copied().unwrap_or(0);
+                    if e != d {
+                        bad += 1;
+                        if first.is_none() {
+                            first = Some((p, x, y, e, d));
+                        }
+                    }
+                }
+            }
+        }
+        if bad > 0 {
+            let (p, x, y, e, d) = first.unwrap();
+            eprintln!(
+                "RECON_CHECK frame {}: {} samples DIVERGE (first plane{} ({},{}) enc={} dec={})",
+                self.recon_check_n, bad, p, x, y, e, d
+            );
+        } else {
+            eprintln!("RECON_CHECK frame {}: ok", self.recon_check_n);
+        }
+        self.recon_check_n += 1;
     }
 
     /// Two-pass rate control: pass 1 codes every buffered frame at a probe qindex to
