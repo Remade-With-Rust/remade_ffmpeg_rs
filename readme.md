@@ -9,6 +9,7 @@
 > transcode, mux and probe audio/video — a ground-up **Rust** rebuild of
 > [FFmpeg](https://github.com/FFmpeg/FFmpeg) (LGPL-2.1+/GPL-2.0+/C), under a
 > permissive license, built for speed, safety, and zero copyleft strings.
+> Check out [FFAI](https://github.com/remade-with-rust/ffai), a sister project providing media for AI first world.
 
 > **Status — pre-1.0, and not yet independently audited.** APIs and codec
 > coverage are still moving; use it accordingly. See the
