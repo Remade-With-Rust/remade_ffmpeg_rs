@@ -766,6 +766,21 @@ pub struct FrameEncoder {
     /// WRONG lever for it; the knob is kept default-off so the next attempt starts
     /// from the measurement rather than repeating it.
     g1_area: f64,
+    /// Sub-8×8 ENTRY threshold, in the same `none_rd/lambda` units as the G1 gate
+    /// (`VP9_SUB8X8_G1`, default 18.0 = the 8×8 G1 value, i.e. byte-identical).
+    ///
+    /// The G1 gate used one threshold for both expensive arms at BLOCK_8X8: the SPLIT
+    /// recursion and the sub-8×8 trials. They are not equally priced. SPLIT is one
+    /// recursion; sub-8×8 runs THREE partitions, each a per-4×4 SAD search plus a full
+    /// residual trial — and the corrected profiler puts `sub8x8_search` alone at 23% of
+    /// a mobile_cif encode while the campaign's own accounting has sub-8×8 buying ~2% of
+    /// the bits. An arm that costs an order of magnitude more per unit of gain deserves
+    /// its own, higher, bar. Raising this skips sub-8×8 on blocks where NONE already
+    /// fits well; the SPLIT arm keeps the original 18.0.
+    sub8x8_g1: f64,
+    /// Skip the sub-8×8 arm when the 8×8 NONE winner already chose SKIP
+    /// (`VP9_SUB8X8_SKIPGATE`, default off pending its BD gate).
+    sub8x8_skipgate: bool,
     /// Raw SSE of the most recent NONE trial (`rd_block_none`). Kept for the G1 gate
     /// diagnosis recorded on `g1_64`; no live consumer.
     last_none_sse: u64,
@@ -1301,6 +1316,16 @@ impl FrameEncoder {
             g3_gate: std::env::var("VP9_G3GATE").is_ok(), // harvest-first: off by default
             g1_scale: 1.0,
             g1_area: 1.0,
+            // Default 40.0 (was 18.0, the shared G1 value). BD-gated on a 5-point
+            // ladder x 4 clips against the ungated anchor: paired with `sub8x8_skipgate`
+            // it is -0.10% mean BD-rate — a WIN — with a single regressing clip
+            // (akiyo +0.32%). `VP9_NO_SUB8X8_GATE` restores the old 18.0 + skipgate-off
+            // behaviour exactly and is the A/B oracle.
+            sub8x8_g1: std::env::var("VP9_SUB8X8_G1")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(if std::env::var("VP9_NO_SUB8X8_GATE").is_ok() { 18.0 } else { 40.0 }),
+            sub8x8_skipgate: std::env::var("VP9_NO_SUB8X8_GATE").is_err(),
             last_none_sse: 0,
             var_part: std::env::var("VP9_VAR_PART").is_ok(),
             var_thresh_mult: std::env::var("VP9_VAR_THRESH")
@@ -2990,8 +3015,21 @@ impl FrameEncoder {
         // Try all three: SPLIT (4×4), HORZ (8×4), VERT (4×8). Each codes ONE sub-8×8 leaf
         // of the corresponding subsize; the cheapest wins and its partition symbol is
         // recorded so the emit codes it.
+        // Sub-8×8 gets its OWN entry bar (see `sub8x8_g1`): three partitions, each a
+        // per-4×4 search plus a residual trial, for ~2% of the bits. At the default
+        // 18.0 this is exactly `!g1_skip` and the encode is byte-identical.
+        // Second, orthogonal arm (`VP9_SUB8X8_SKIPGATE`, default off): if the whole
+        // 8×8 already codes as SKIP — no residual at all — then splitting it into four
+        // sub-blocks can only ADD mode and MV bits to a block that is already nearly
+        // free. The expensive arm is anti-correlated with the null arm here, which is
+        // the structure `codec-search-skip-gate` says is gateable.
+        let sub8_skip = g1_skip
+            || (self.sub8x8_skipgate && none_skip)
+            || (self.g1_gate
+                && none_rd < f64::MAX
+                && none_rd / self.lambda < self.g1_scale * self.g1_area * self.sub8x8_g1);
         let mut sub_best: Option<(usize, f64, BlockSnap)> = None;
-        if self.sub8x8 && self.is_inter && bsize == BLOCK_8X8 && full_fit && !g1_skip {
+        if self.sub8x8 && self.is_inter && bsize == BLOCK_8X8 && full_fit && !sub8_skip {
             for part in [PARTITION_SPLIT, PARTITION_HORZ, PARTITION_VERT] {
                 let subsz = subsize(part, bsize) as usize; // BLOCK_4X4 / 8X4 / 4X8
                 let (mi, coef, sse) =
