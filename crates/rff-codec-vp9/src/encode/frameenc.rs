@@ -590,6 +590,10 @@ pub struct FrameEncoder {
     /// landed, so it's a speed-preset lever (speed ≥ 1), not the quality default.
     /// `VP9_DIAMOND_MSEARCH` forces diamond; `VP9_FULL_MSEARCH` forces exhaustive.
     full_msearch: bool,
+    /// Skip the exhaustive search's second-centre columns that the first centre
+    /// already scored (`VP9_NO_MSEARCH_DEDUP` restores the double scan — the
+    /// byte-identity oracle).
+    msearch_dedup: bool,
     /// x4-batched exhaustive integer search (`VP9_NO_MSEARCH_X4` disables → the
     /// one-position-at-a-time scalar oracle). The x4 kernel scores four ref positions
     /// from one source-tile load; byte-identical to four scalar SADs (A/B oracle).
@@ -1245,6 +1249,7 @@ impl FrameEncoder {
                     }
                 }),
             full_msearch: std::env::var("VP9_DIAMOND_MSEARCH").is_err(),
+            msearch_dedup: std::env::var("VP9_NO_MSEARCH_DEDUP").is_err(),
             msearch_x4: std::env::var("VP9_NO_MSEARCH_X4").is_err(),
             corner_sad: std::env::var("VP9_CORNER_SAD").is_ok(),
             // 48 == NEWMV_SAD_PENALTY is PROVABLY lossless (a searched MV pays SAD+48).
@@ -4732,17 +4737,42 @@ impl FrameEncoder {
                 // `block_sad_sized` calls but ~2-4× fewer tile loads; the exhaustive
                 // path used to score one scalar position at a time. Edge tiles (where a
                 // candidate overhangs the frame) fall back to the clamping scalar SAD.
-                for &(cr, cc) in &centers {
+                for (ci, &(cr, cc)) in centers.iter().enumerate() {
                     for dr in -RANGE..=RANGE {
                         let r = cr + dr;
+                        // Columns this row already had scored by an earlier centre.
+                        // The two centres are `(0,0)` and the predictor, and each
+                        // sweeps the SAME ±RANGE square — so whenever the predictor
+                        // is near zero the two grids overlap, and when it rounds to
+                        // exactly zero (the common case on static content) the entire
+                        // 289-position grid was being scored TWICE. Re-scoring cannot
+                        // change the outcome: the same (r, c) yields the same SAD, and
+                        // the tie-break `shorter` compares the identical distance, so
+                        // neither `sad < best_sad` nor `sad == best_sad && shorter` can
+                        // fire on a repeat. Skipping it is byte-identical. (The diamond
+                        // branch below already dedups its centres; only the exhaustive
+                        // path was missing it.)
+                        let done: Option<(i32, i32)> = if ci == 0 || !self.msearch_dedup {
+                            None
+                        } else {
+                            let (pr, pc) = centers[0];
+                            ((r - pr).abs() <= RANGE).then_some((pc - RANGE, pc + RANGE))
+                        };
+                        let scored = |c: i32| done.is_some_and(|(lo, hi)| c >= lo && c <= hi);
                         let mut dc = -RANGE;
                         while dc <= RANGE {
+                            if scored(cc + dc) {
+                                dc += 1;
+                                continue;
+                            }
                             #[cfg(target_arch = "x86_64")]
                             if self.msearch_x4 && dc + 3 <= RANGE {
                                 if let Some(r8) = ref8 {
                                     let cands: [(i32, i32); 4] =
                                         std::array::from_fn(|k| (r, cc + dc + k as i32));
-                                    if cands.iter().all(|&(rr, cc2)| interior(rr, cc2)) {
+                                    if cands.iter().all(|&(rr, cc2)| interior(rr, cc2))
+                                        && !cands.iter().any(|&(_, cc2)| scored(cc2))
+                                    {
                                         let sads = self.block_sad_sized_x4(
                                             base_x, base_y, cands, swl, shl, best_sad, r8,
                                         );
