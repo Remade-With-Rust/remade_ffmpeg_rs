@@ -313,7 +313,7 @@ fn inner_gain(
     (lo, cached)
 }
 
-/// **C2 + Q6 — the two-loop quantizer.** The inner loop ([`inner_gain`]) hits the
+/// **C2 + Q6 — the two-loop quantizer.** The inner loop (`inner_gain`) hits the
 /// bit budget; the outer distortion loop raises the scalefactor of the worst
 /// over-threshold band, re-runs the inner loop, and keeps the lowest-peak-NMR
 /// result. With a flat threshold (C1) it degrades to pure rate control; with the

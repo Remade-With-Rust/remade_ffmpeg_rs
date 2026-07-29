@@ -29,6 +29,9 @@ default-members = [
     "crates/rff-codec-aac",
     "crates/rff-codec-vp9",
     "crates/rff-codec-mp3",
+    "crates/rusty_vp9",
+    "crates/rusty_mp3",
+    "crates/rusty_aac",
     "crates/rff-codec-rawvideo",
     "crates/rff-format-wav",
     "crates/rff-format-y4m",
@@ -87,6 +90,12 @@ rff-codec-jxl = { path = "crates/rff-codec-jxl", version = "0.0.1" }
 rff-codec-aac = { path = "crates/rff-codec-aac", version = "0.0.1" }
 rff-codec-vp9 = { path = "crates/rff-codec-vp9", version = "0.0.1" }
 rff-codec-mp3 = { path = "crates/rff-codec-mp3", version = "0.0.1" }
+# Standalone, publishable codec cores (the `rusty_h264` pattern: pure codec
+# crate + thin rff-codec-* adapter). Independent 0.1.x versions — these ship
+# to crates.io on their own cadence, decoupled from the workspace 0.0.1.
+rusty_vp9 = { path = "crates/rusty_vp9", version = "0.1.0" }
+rusty_mp3 = { path = "crates/rusty_mp3", version = "0.1.0" }
+rusty_aac = { path = "crates/rusty_aac", version = "0.1.0" }
 rff-codec-rawvideo = { path = "crates/rff-codec-rawvideo", version = "0.0.1" }
 # TEMPORARY C/FFI H.264 — deliberately NOT in default-members; opt-in only.
 rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.0.1" }

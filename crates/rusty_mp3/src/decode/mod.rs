@@ -11,7 +11,7 @@
 //! State that persists across frames lives on [`Mp3Decode`]: the bit reservoir,
 //! the per-channel IMDCT overlap, and the synthesis filterbank FIFO.
 
-use rff_core::{Error, Result};
+use crate::{Error, Result};
 
 use crate::frame::{GranuleSpectrum, SideInfo, GRANULE_LINES};
 use crate::header::FrameHeader;

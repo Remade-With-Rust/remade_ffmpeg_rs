@@ -1,11 +1,11 @@
 //! `mp3lab` — the MP3 encoder lab CLI.
 //!
 //! ```text
-//!   cargo run -p rff-codec-mp3 --features lab --example mp3lab -- bricks
-//!   cargo run -p rff-codec-mp3 --features lab --example mp3lab -- next
-//!   cargo run -p rff-codec-mp3 --features lab --example mp3lab -- corpus
-//!   cargo run -p rff-codec-mp3 --features lab --example mp3lab -- variants N4
-//!   cargo run -p rff-codec-mp3 --features lab --example mp3lab -- run N4 iso
+//!   cargo run -p rusty_mp3 --features lab --example mp3lab -- bricks
+//!   cargo run -p rusty_mp3 --features lab --example mp3lab -- next
+//!   cargo run -p rusty_mp3 --features lab --example mp3lab -- corpus
+//!   cargo run -p rusty_mp3 --features lab --example mp3lab -- variants N4
+//!   cargo run -p rusty_mp3 --features lab --example mp3lab -- run N4 iso
 //!   cargo run ... -- run N4 iso --bias 0.0 --step 0.0008   # override on the fly
 //! ```
 //!
@@ -15,7 +15,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use rff_codec_mp3::lab::{self, bricks, experiment::Overrides, quantizer, signals, variant};
+use rusty_mp3::lab::{self, bricks, experiment::Overrides, quantizer, signals, variant};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

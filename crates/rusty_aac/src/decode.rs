@@ -9,15 +9,13 @@
 //! parsed (for sync) but not yet applied; intensity stereo and PNS are rejected
 //! with a clear error rather than mis-decoded.
 
-use rff_core::{AudioFrame, Error, Frame, Result, SampleFormat};
-
 use crate::bits::BitReader;
 use crate::codebook::{decode_tuple, CODEBOOKS, INTENSITY_HCB2, NOISE_HCB, ZERO_HCB};
 use crate::dsp;
 use crate::ics::{parse_ics_info, IcsInfo, WindowSequence};
 use crate::swb::swb_offsets;
 use crate::tables::{spectral_book, SCALEFACTOR_BOOK};
-use crate::SAMPLE_RATES;
+use crate::{DecodedAudio, Error, Result, SAMPLE_RATES};
 
 const FRAME_LEN: usize = 1024;
 const LONG_N: usize = 2048;
@@ -71,8 +69,8 @@ impl Decoder {
         }
     }
 
-    /// Decode one raw access unit into an interleaved-`f32` [`Frame`].
-    pub fn decode(&mut self, au: &[u8], pts: Option<i64>) -> Result<Frame> {
+    /// Decode one raw access unit into interleaved-`f32` PCM.
+    pub fn decode(&mut self, au: &[u8], pts: Option<i64>) -> Result<DecodedAudio> {
         let mut r = BitReader::new(au);
         let mut outputs: Vec<Vec<f32>> = Vec::new();
         let mut ch = 0usize;
@@ -751,22 +749,20 @@ fn apply_is(
     }
 }
 
-fn interleave(outputs: Vec<Vec<f32>>, sample_rate: u32, pts: Option<i64>) -> Frame {
+fn interleave(outputs: Vec<Vec<f32>>, sample_rate: u32, pts: Option<i64>) -> DecodedAudio {
     let nch = outputs.len();
-    let mut bytes = Vec::with_capacity(FRAME_LEN * nch * 4);
+    let mut samples = Vec::with_capacity(FRAME_LEN * nch);
     for n in 0..FRAME_LEN {
         for ch in &outputs {
-            bytes.extend_from_slice(&ch[n].to_le_bytes());
+            samples.push(ch[n]);
         }
     }
-    Frame::Audio(AudioFrame {
+    DecodedAudio {
         sample_rate,
         channels: nch as u16,
-        format: SampleFormat::F32,
-        planes: vec![bytes],
-        samples: FRAME_LEN,
+        samples,
         pts,
-    })
+    }
 }
 
 fn fs_index_for(rate: u32) -> u8 {
@@ -807,16 +803,10 @@ mod tests {
     fn hand_built_frame_matches_independent_imdct() {
         let au = [0x00, 0xC8, 0x00, 0x84, 0x21, 0x1E];
         let mut dec = Decoder::new(48_000);
-        let frame = dec.decode(&au, Some(0)).unwrap();
-        let Frame::Audio(af) = frame else {
-            panic!("expected audio")
-        };
+        let af = dec.decode(&au, Some(0)).unwrap();
         assert_eq!(af.channels, 1);
-        assert_eq!(af.samples, FRAME_LEN);
-        let got: Vec<f32> = af.planes[0]
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
+        assert_eq!(af.frames(), FRAME_LEN);
+        let got: Vec<f32> = af.samples;
 
         let mut spec = [0f32; FRAME_LEN];
         spec[0] = -1.0;

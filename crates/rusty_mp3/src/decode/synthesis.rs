@@ -3,7 +3,7 @@
 //! Each of the 18 passes takes 32 subband samples and produces 32 PCM samples.
 //! A 32→64 cosine matrixing feeds the 1024-sample FIFO `V[]`; a windowing step
 //! gathers `U[]` from `V[]`, multiplies by the 512-tap `D[]` window, and sums to
-//! 32 outputs. The matrixing is computed here; `D[]` is tabulated in [`tables`].
+//! 32 outputs. The matrixing is computed here; `D[]` is tabulated in [`tables`](crate::tables).
 
 use std::f64::consts::PI;
 use std::sync::OnceLock;

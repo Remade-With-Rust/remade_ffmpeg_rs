@@ -33,6 +33,7 @@ version = "0.0.1"
 dependencies = [
  "rff-codec",
  "rff-core",
+ "rusty_vp9",
 ]
 
 [[package]]
@@ -50,6 +51,10 @@ dependencies = [
  "rff-codec-vp9",
  "rff-core",
 ]
+
+[[package]]
+name = "rusty_vp9"
+version = "0.1.0"
 
 [[package]]
 name = "syn"

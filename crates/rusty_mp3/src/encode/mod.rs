@@ -10,7 +10,7 @@
 //! bricks — they decide block type and how to shape quantization noise under the
 //! masking threshold, the way LAME does. Everything else is mechanical.
 
-use rff_core::Result;
+use crate::Result;
 
 use crate::bitio::BitWriter;
 use crate::decode::scalefactors::ScaleFactors;
@@ -173,7 +173,7 @@ impl Mp3Encode {
 
     /// **3R1** — encode a CBR frame into the reservoir buffer: the causal PE-weighted
     /// budget lets a demanding frame borrow banked bits, an easy one bank them. The raw
-    /// frame is stored for B8 assembly at [`finish_reservoir`]. `gain` is the knob.
+    /// frame is stored for B8 assembly at [`finish_reservoir`](Self::finish_reservoir). `gain` is the knob.
     pub fn encode_frame_reservoir(
         &mut self,
         header: &FrameHeader,

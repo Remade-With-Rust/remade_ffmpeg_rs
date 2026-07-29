@@ -1,6 +1,6 @@
 //! MSB-first bit reader for AAC bitstreams.
 
-use rff_core::{Error, Result};
+use crate::{Error, Result};
 
 /// Reads bits most-significant-first from a byte slice (the order AAC uses).
 pub struct BitReader<'a> {

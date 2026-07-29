@@ -11,7 +11,7 @@
 
 #![allow(dead_code)]
 
-use rff_core::{Error, Result};
+use crate::{Error, Result};
 
 use crate::bits::BitReader;
 

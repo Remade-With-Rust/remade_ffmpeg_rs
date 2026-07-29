@@ -4,7 +4,7 @@
 //! header (`f(n)` / `s(n)` in the spec), and the VP9 **boolean arithmetic
 //! decoder** used for the compressed header and tile/residual data.
 
-use rff_core::{Error, Result};
+use crate::{Error, Result};
 
 /// MSB-first bit reader for the uncompressed header.
 pub struct BitReader<'a> {

@@ -1,0 +1,19 @@
+[package]
+name = "rusty_aac"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+description = "Pure-Rust AAC-LC decoder + encoder, no C/FFI. Decoder bit-exact vs FFmpeg; psychoacoustic encoder with block switching, M/S stereo and AVX2 kernels."
+readme = "README.md"
+keywords = ["aac", "audio", "codec", "decoder", "encoder"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+rust-version = "1.85"
+
+[features]
+default = ["simd"]
+simd = []
+simd-avx512 = ["simd"]
+
+[dependencies]

@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-/// Hot-path stages we attribute time to. Keep in sync with [`NAMES`].
+/// Hot-path stages we attribute time to. Keep in sync with `NAMES`.
 /// Indented names = a subset that nests inside the parent above it.
 #[derive(Clone, Copy)]
 pub enum S {

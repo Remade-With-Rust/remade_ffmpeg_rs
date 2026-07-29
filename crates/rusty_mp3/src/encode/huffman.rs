@@ -437,8 +437,8 @@ pub fn encode(quant: &QuantizedGranule, header: &FrameHeader, writer: &mut BitWr
 }
 
 /// **A2** — bit cost of encoding `coeffs` under layout `gi`, counted without
-/// emitting. Walks the exact regions [`encode`] does and sums [`pair_bits`] /
-/// [`quad_bits`] (which equal the bits those coordinates emit), so the rate loop
+/// emitting. Walks the exact regions [`encode`] does and sums `pair_bits` /
+/// `quad_bits` (which equal the bits those coordinates emit), so the rate loop
 /// can probe a gain without allocating a `BitWriter` or writing any codewords.
 /// Returns the same value [`encode`] would return — pinned by a test.
 pub fn cost(gi: &GranuleSideInfo, coeffs: &[i32; GRANULE_LINES], header: &FrameHeader) -> usize {

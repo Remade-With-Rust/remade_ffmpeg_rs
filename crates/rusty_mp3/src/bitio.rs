@@ -36,7 +36,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Look at the next `n` bits (0..=32) MSB-first without consuming them, zero-
-    /// padding past the end of the buffer (matching [`read`]). The Huffman LUT
+    /// padding past the end of the buffer (matching [`read`](Self::read)). The Huffman LUT
     /// peeks `max_len` bits, then [`skip`](Self::skip)s the matched codeword.
     pub fn peek(&self, n: u32) -> u32 {
         let mut v = 0u32;

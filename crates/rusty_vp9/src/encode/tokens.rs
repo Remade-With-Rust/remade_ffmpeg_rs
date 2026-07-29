@@ -546,7 +546,7 @@ impl<'a> RateTracker<'a> {
     fn affected(&self, i: usize, class_changed: bool, status_flipped: bool, eob: usize, out: &mut [usize; 8]) -> usize {
         let mut n = 0usize;
         let codeable = |d: usize| d < eob || (d == eob && eob < self.max_eob);
-        let mut push = |out: &mut [usize; 8], n: &mut usize, d: usize| {
+        let push = |out: &mut [usize; 8], n: &mut usize, d: usize| {
             if codeable(d) && !out[..*n].contains(&d) {
                 out[*n] = d;
                 *n += 1;

@@ -1,6 +1,6 @@
 //! Function-level stage profiler for the VP9 **decoder** hot path.
 //!
-//! Off unless `VP9_DPROF` is set or [`set_enabled`] is called, so a normal
+//! Off unless `VP9_DPROF` is set or `set_enabled` is called, so a normal
 //! decode pays one relaxed atomic load per scope and nothing else.
 //!
 //! **Exclusive self-time**, deliberately unlike the encoder's

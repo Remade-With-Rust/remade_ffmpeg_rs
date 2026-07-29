@@ -368,14 +368,11 @@ mod tests {
             mp / (enc_ms / 1000.0)
         );
 
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
         let t = Instant::now();
         for _ in 0..n {
-            let mut dec = reg.find_decoder(rff_core::CodecId::Vp9).unwrap();
-            dec.send_packet(&rff_core::Packet::from_data(0, bytes.clone()))
-                .unwrap();
-            let _ = dec.receive_frame().unwrap();
+            let mut dec = crate::Vp9Decoder::new();
+            dec.push(&bytes, None).unwrap();
+            let _ = dec.next_frame().unwrap();
         }
         let dec_ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
         eprintln!(

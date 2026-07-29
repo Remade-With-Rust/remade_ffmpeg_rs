@@ -1,58 +1,31 @@
-//! In-house **AAC-LC decoder**, pure Rust with no C/FFI.
+//! AAC-LC audio codec, backed by the pure-Rust
+//! [`rusty_aac`](https://crates.io/crates/rusty_aac) decoder + encoder.
 //!
-//! AAC decoding is a multi-stage pipeline; this crate is being built up in
-//! stages so each layer is correct and tested before the next is added:
+//! This crate is a thin adapter: it maps the rff [`Decoder`]/[`Encoder`] traits
+//! onto `rusty_aac`'s native API (which owns the whole AAC-LC engine — framing,
+//! spectral reconstruction, filterbank, psychoacoustic encoder). No C, no FFI;
+//! `rusty_aac`'s `simd` feature (on by default here) enables the runtime-detected
+//! AVX2 quantize kernels, `--no-default-features` gives a 100%-safe scalar build.
 //!
-//! 1. **Framing & config** (this layer, done): a bit reader, the
-//!    [`AudioSpecificConfig`] (the MP4 `esds` payload) and [`AdtsHeader`]
-//!    (the `.aac` elementary-stream header) parsers, and the codec registration.
-//! 2. **Syntactic elements**: the `raw_data_block` loop (SCE/CPE/LFE/…) and
-//!    `individual_channel_stream` / `ics_info` parsing.
-//! 3. **Spectral reconstruction**: Huffman codebooks → quantized coefficients,
-//!    inverse quantization with scalefactors, M/S & intensity stereo, TNS.
-//! 4. **Synthesis**: IMDCT (2048/256), window (sine/KBD) + overlap-add → PCM.
-//!
-//! Until stages 2-4 land, [`receive_frame`](rff_codec::Decoder::receive_frame)
-//! reports [`Error::Unimplemented`] with a precise message, while configuration
-//! and framing are fully functional (so probing AAC tracks already works).
+//! The MP4 `esds` extradata (the 2-byte `AudioSpecificConfig`) is available via
+//! the re-exported [`rusty_aac::audio_specific_config_bytes`].
 
 use std::collections::VecDeque;
 
-use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder};
-use rff_core::{CodecId, Error, Frame, MediaType, Packet, Result};
+use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder, Encoder};
+use rff_core::{
+    AudioFrame, CodecId, Dictionary, Error, Frame, MediaType, Packet, Result, SampleFormat,
+};
 
-mod bits;
-mod codebook;
-mod decode;
-mod dsp;
-mod encode;
-mod huffman;
-mod ics;
-mod swb;
-mod tables;
-pub use bits::BitReader;
+pub use rusty_aac;
+// Preserved re-exports for downstream users of the old rff-codec-aac API.
+pub use rusty_aac::{
+    audio_specific_config_bytes, is_adts, parse_adts, parse_audio_specific_config,
+    sample_rate_for_index, sf_index_for_rate, write_adts_header, write_audio_specific_config,
+    AdtsHeader, AudioSpecificConfig, BitReader, SAMPLE_RATES,
+};
 
-/// AAC sample-rate table, indexed by `samplingFrequencyIndex` (ISO 14496-3).
-pub const SAMPLE_RATES: [u32; 13] = [
-    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
-];
-
-/// Map a 4-bit sampling-frequency index to a rate (0 for the reserved/escape
-/// values 13-15, which require an explicit 24-bit rate).
-pub fn sample_rate_for_index(idx: u8) -> u32 {
-    SAMPLE_RATES.get(idx as usize).copied().unwrap_or(0)
-}
-
-/// Map a sampling rate to its 4-bit index, or None if non-standard (the encoder
-/// then uses the 0x0F + explicit-24-bit-rate escape).
-pub fn sf_index_for_rate(rate: u32) -> Option<u8> {
-    SAMPLE_RATES
-        .iter()
-        .position(|&r| r == rate)
-        .map(|i| i as u8)
-}
-
-/// Register the AAC decoder into a [`CodecRegistry`].
+/// Register the AAC decoder + encoder into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
     registry.register(Codec {
         id: CodecId::Aac,
@@ -60,105 +33,21 @@ pub fn register(registry: &mut CodecRegistry) {
         long_name: "AAC (Advanced Audio Coding, Low Complexity)",
         media_type: MediaType::Audio,
         decoder: Some(|| Box::new(AacDecoder::default())),
-        encoder: Some(|| Box::new(encode::AacEncoder::new())),
+        encoder: Some(|| Box::new(AacEncoder::new())),
     });
 }
 
-// ---------------------------------------------------------------------------
-// AudioSpecificConfig — the MP4 `esds` DecoderSpecificInfo (raw AAC config).
-// ---------------------------------------------------------------------------
-
-/// Parsed `AudioSpecificConfig` (ISO 14496-3 §1.6.2.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct AudioSpecificConfig {
-    /// Audio Object Type (2 = AAC-LC, the only one we target).
-    pub object_type: u8,
-    pub sample_rate: u32,
-    /// Channel configuration (1 = mono, 2 = stereo, …).
-    pub channels: u16,
-}
-
-/// Parse an `AudioSpecificConfig` from its raw bytes (the `esds`/`stsd` config).
-pub fn parse_audio_specific_config(data: &[u8]) -> Result<AudioSpecificConfig> {
-    let mut r = BitReader::new(data);
-    let object_type = read_object_type(&mut r)?;
-    let sf_index = r.read_bits(4)? as u8;
-    let sample_rate = if sf_index == 0x0F {
-        r.read_bits(24)?
-    } else {
-        sample_rate_for_index(sf_index)
-    };
-    let channels = r.read_bits(4)? as u16;
-    if sample_rate == 0 {
-        return Err(Error::invalid("aac: invalid sampling frequency in config"));
+/// Map a `rusty_aac` error onto the equivalent rff [`Error`], preserving the
+/// EAGAIN-style `Again`/`Eof` flow-control variants.
+fn map_err(e: rusty_aac::Error) -> Error {
+    match e {
+        rusty_aac::Error::Again => Error::Again,
+        rusty_aac::Error::Eof => Error::Eof,
+        rusty_aac::Error::Unimplemented(what) => Error::Unimplemented(what),
+        rusty_aac::Error::InvalidData(msg) => Error::InvalidData(msg),
+        rusty_aac::Error::Unsupported(msg) => Error::Unsupported(msg),
+        other => Error::InvalidData(format!("rusty_aac: {other}")),
     }
-    Ok(AudioSpecificConfig {
-        object_type,
-        sample_rate,
-        channels,
-    })
-}
-
-/// Read the (possibly escaped) 5-bit Audio Object Type.
-fn read_object_type(r: &mut BitReader) -> Result<u8> {
-    let ot = r.read_bits(5)? as u8;
-    if ot == 31 {
-        Ok((32 + r.read_bits(6)?) as u8)
-    } else {
-        Ok(ot)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ADTS — the `.aac` elementary-stream frame header.
-// ---------------------------------------------------------------------------
-
-/// A parsed ADTS frame header (ISO 14496-3 §1.A.2.2.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AdtsHeader {
-    /// Audio Object Type (profile + 1).
-    pub object_type: u8,
-    pub sample_rate: u32,
-    pub channels: u16,
-    /// Total frame length including this header.
-    pub frame_length: usize,
-    /// Header size in bytes (7 without CRC, 9 with).
-    pub header_len: usize,
-}
-
-/// True if `data` begins with an ADTS syncword (0xFFF, layer 00).
-pub fn is_adts(data: &[u8]) -> bool {
-    data.len() >= 2 && data[0] == 0xFF && (data[1] & 0xF6) == 0xF0
-}
-
-/// Parse an ADTS header from the start of `data`.
-pub fn parse_adts(data: &[u8]) -> Result<AdtsHeader> {
-    if !is_adts(data) || data.len() < 7 {
-        return Err(Error::invalid("aac: not an ADTS frame"));
-    }
-    let mut r = BitReader::new(data);
-    r.skip(12)?; // syncword
-    r.skip(1)?; // MPEG version
-    r.skip(2)?; // layer (00)
-    let protection_absent = r.read_bool()?;
-    let profile = r.read_bits(2)? as u8; // object_type - 1
-    let sf_index = r.read_bits(4)? as u8;
-    r.skip(1)?; // private
-    let channel_config = r.read_bits(3)? as u16;
-    r.skip(4)?; // original/home/copyright id+start
-    let frame_length = r.read_bits(13)? as usize;
-    // remaining: buffer_fullness(11) + num_raw_data_blocks(2) — not needed here.
-    let sample_rate = sample_rate_for_index(sf_index);
-    if sample_rate == 0 || frame_length < 7 {
-        return Err(Error::invalid("aac: invalid ADTS header"));
-    }
-    Ok(AdtsHeader {
-        object_type: profile + 1,
-        sample_rate,
-        channels: channel_config,
-        frame_length,
-        header_len: if protection_absent { 7 } else { 9 },
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -167,23 +56,26 @@ pub fn parse_adts(data: &[u8]) -> Result<AdtsHeader> {
 
 #[derive(Default)]
 struct AacDecoder {
-    config: Option<AudioSpecificConfig>,
-    decoder: Option<decode::Decoder>,
+    inner: rusty_aac::AacDecoder,
     queue: VecDeque<Frame>,
     eof: bool,
 }
 
-impl AacDecoder {
-    /// Lazily build the stateful decoder once rate/channels are known.
-    fn ensure_decoder(&mut self) -> Result<&mut decode::Decoder> {
-        if self.decoder.is_none() {
-            let cfg = self
-                .config
-                .ok_or_else(|| Error::invalid("aac: stream parameters unknown"))?;
-            self.decoder = Some(decode::Decoder::new(cfg.sample_rate));
-        }
-        Ok(self.decoder.as_mut().unwrap())
+/// Map decoded PCM to an rff interleaved-`f32` [`AudioFrame`].
+fn pcm_to_frame(d: rusty_aac::DecodedAudio) -> Frame {
+    let samples = d.frames();
+    let mut bytes = Vec::with_capacity(d.samples.len() * 4);
+    for s in &d.samples {
+        bytes.extend_from_slice(&s.to_le_bytes());
     }
+    Frame::Audio(AudioFrame {
+        sample_rate: d.sample_rate,
+        channels: d.channels,
+        format: SampleFormat::F32,
+        planes: vec![bytes],
+        samples,
+        pts: d.pts,
+    })
 }
 
 impl Decoder for AacDecoder {
@@ -191,9 +83,10 @@ impl Decoder for AacDecoder {
         // Prefer the out-of-band AudioSpecificConfig (MP4 esds); otherwise fall
         // back to the stream's declared rate/channels (e.g. ADTS streams).
         if !params.extradata.is_empty() {
-            self.config = Some(parse_audio_specific_config(&params.extradata)?);
+            let cfg = parse_audio_specific_config(&params.extradata).map_err(map_err)?;
+            self.inner = rusty_aac::AacDecoder::with_config(cfg);
         } else if params.sample_rate > 0 {
-            self.config = Some(AudioSpecificConfig {
+            self.inner = rusty_aac::AacDecoder::with_config(AudioSpecificConfig {
                 object_type: 2,
                 sample_rate: params.sample_rate,
                 channels: params.channels,
@@ -203,29 +96,15 @@ impl Decoder for AacDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        // Strip ADTS framing if present; MP4 delivers bare access units.
-        let mut data = packet.data.as_slice();
-        if is_adts(data) {
-            let header = parse_adts(data)?;
-            if self.config.is_none() {
-                self.config = Some(AudioSpecificConfig {
-                    object_type: header.object_type,
-                    sample_rate: header.sample_rate,
-                    channels: header.channels,
-                });
+        match self.inner.decode(&packet.data, packet.pts) {
+            Ok(pcm) => {
+                self.queue.push_back(pcm_to_frame(pcm));
+                Ok(())
             }
-            data = data
-                .get(header.header_len..header.frame_length.min(data.len()))
-                .unwrap_or(&[]);
+            // An empty packet decodes to nothing — not an error at this layer.
+            Err(rusty_aac::Error::Again) => Ok(()),
+            Err(e) => Err(map_err(e)),
         }
-        if data.is_empty() {
-            return Ok(());
-        }
-        let pts = packet.pts;
-        let au = data.to_vec();
-        let frame = self.ensure_decoder()?.decode(&au, pts)?;
-        self.queue.push_back(frame);
-        Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
@@ -244,56 +123,179 @@ impl Decoder for AacDecoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Encoder
+// ---------------------------------------------------------------------------
+
+struct AacEncoder {
+    config: rusty_aac::AacEncoderConfig,
+    inner: Option<rusty_aac::AacEncoder>,
+}
+
+impl AacEncoder {
+    fn new() -> AacEncoder {
+        AacEncoder {
+            config: rusty_aac::AacEncoderConfig::default(),
+            inner: None,
+        }
+    }
+
+    fn inner(&mut self) -> &mut rusty_aac::AacEncoder {
+        self.inner
+            .get_or_insert_with(|| rusty_aac::AacEncoder::new(self.config))
+    }
+}
+
+impl Encoder for AacEncoder {
+    fn configure(&mut self, options: &Dictionary) -> Result<()> {
+        if let Some(b) = options.get_int("b") {
+            if b > 0 {
+                self.config.bitrate_bps = b as u32;
+            }
+        }
+        Ok(())
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        let Frame::Audio(a) = frame else {
+            return Err(Error::invalid("aac encode: expected an audio frame"));
+        };
+        let ch = a.channels.max(1) as usize;
+        let n = a.samples;
+        let (sr, channels) = (a.sample_rate, a.channels.max(1));
+        // Convert to interleaved f32 — the same sample math the encoder used
+        // when it ingested rff frames directly, so output stays byte-identical.
+        let enc = match a.format {
+            SampleFormat::S16 => {
+                let d = &a.planes[0];
+                let mut pcm = Vec::with_capacity(n * ch);
+                for i in 0..n * ch {
+                    let o = i * 2;
+                    pcm.push(i16::from_le_bytes([d[o], d[o + 1]]) as f32 / 32768.0);
+                }
+                self.inner().push_pcm(&pcm, channels, sr)
+            }
+            SampleFormat::F32 => {
+                let d = &a.planes[0];
+                let mut pcm = Vec::with_capacity(n * ch);
+                for i in 0..n * ch {
+                    let o = i * 4;
+                    pcm.push(f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]));
+                }
+                self.inner().push_pcm(&pcm, channels, sr)
+            }
+            SampleFormat::F32Planar => {
+                let planes: Vec<Vec<f32>> = a
+                    .planes
+                    .iter()
+                    .take(ch)
+                    .map(|plane| {
+                        plane
+                            .chunks_exact(4)
+                            .take(n)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect()
+                    })
+                    .collect();
+                let refs: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
+                self.inner().push_pcm_planar(&refs, sr)
+            }
+            _ => return Err(Error::invalid("aac encode: unsupported sample format")),
+        };
+        enc.map_err(map_err)
+    }
+
+    fn receive_packet(&mut self) -> Result<Packet> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Err(Error::Again); // nothing sent yet
+        };
+        let ep = inner.next_packet().map_err(map_err)?;
+        let mut p = Packet::from_data(0, ep.data);
+        p.pts = Some(ep.pts);
+        Ok(p)
+    }
+
+    fn flush(&mut self) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.finish();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn asc_stereo_44100_aac_lc() {
-        // object_type=2 (00010), sf_index=4 (0100)=44100, channels=2 (0010).
-        // 00010 0100 0010 → 0001 0010  0001 0000 = 0x12 0x10 (trailing pad).
-        let cfg = parse_audio_specific_config(&[0x12, 0x10]).unwrap();
-        assert_eq!(cfg.object_type, 2);
-        assert_eq!(cfg.sample_rate, 44_100);
-        assert_eq!(cfg.channels, 2);
+    fn registers_aac_codec() {
+        let mut reg = CodecRegistry::new();
+        register(&mut reg);
+        assert!(reg.find_decoder(CodecId::Aac).is_ok());
+        assert!(reg.find_encoder(CodecId::Aac).is_ok());
     }
 
+    /// Thin end-to-end pass through the rff trait path: encode a tone via the
+    /// `Encoder` trait, decode the packets via the `Decoder` trait, and confirm
+    /// audible, sane PCM comes back (the deep gates live in `rusty_aac`).
     #[test]
-    fn asc_mono_48000() {
-        // object_type=2 (00010), sf_index=3 (0011)=48000, channels=1 (0001).
-        // 00010 0011 0001 → 0001 0001 1000 1... = 0x11 0x88.
-        let cfg = parse_audio_specific_config(&[0x11, 0x88]).unwrap();
-        assert_eq!(cfg.sample_rate, 48_000);
-        assert_eq!(cfg.channels, 1);
-    }
+    fn trait_path_encode_decode_roundtrip() {
+        let sr = 44100u32;
+        let n = 8192usize;
+        let mut interleaved = Vec::with_capacity(n * 4);
+        for i in 0..n {
+            let s =
+                ((i as f64 * 2.0 * std::f64::consts::PI * 440.0 / sr as f64).sin() * 0.5) as f32;
+            interleaved.extend_from_slice(&s.to_le_bytes());
+        }
+        let frame = Frame::Audio(AudioFrame {
+            sample_rate: sr,
+            channels: 1,
+            format: SampleFormat::F32,
+            planes: vec![interleaved],
+            samples: n,
+            pts: Some(0),
+        });
 
-    #[test]
-    fn adts_header_parses() {
-        // 7-byte ADTS header (no CRC): sync 0xFFF, MPEG-4, layer 0,
-        // protection_absent=1, profile 1 (AAC-LC), sf_index 4 (44100),
-        // channel_config 2, frame_length 100. Layout verified bit-by-bit.
-        let h = [0xFFu8, 0xF1, 0x50, 0x80, 0x0C, 0x9F, 0xFC];
-        let hdr = parse_adts(&h).unwrap();
-        assert_eq!(hdr.object_type, 2); // profile 1 + 1
-        assert_eq!(hdr.sample_rate, 44_100);
-        assert_eq!(hdr.channels, 2);
-        assert_eq!(hdr.frame_length, 100);
-        assert_eq!(hdr.header_len, 7);
-    }
+        let mut enc = AacEncoder::new();
+        let mut opts = Dictionary::new();
+        opts.set("b", "96000");
+        enc.configure(&opts).unwrap();
+        enc.send_frame(&frame).unwrap();
+        assert!(matches!(enc.receive_packet(), Err(Error::Again)));
+        enc.flush();
 
-    #[test]
-    fn is_adts_detects_syncword() {
-        assert!(is_adts(&[0xFF, 0xF1, 0x00]));
-        assert!(is_adts(&[0xFF, 0xF0, 0x00]));
-        assert!(!is_adts(&[0xFF, 0x00]));
-        assert!(!is_adts(&[0x00, 0xF1]));
-    }
+        let mut dec = AacDecoder::default();
+        dec.configure(&CodecParams {
+            sample_rate: sr,
+            channels: 1,
+            ..CodecParams::default()
+        })
+        .unwrap();
 
-    #[test]
-    fn sample_rate_table() {
-        assert_eq!(sample_rate_for_index(3), 48_000);
-        assert_eq!(sample_rate_for_index(4), 44_100);
-        assert_eq!(sample_rate_for_index(8), 16_000);
-        assert_eq!(sample_rate_for_index(15), 0); // escape value
+        let mut decoded = 0usize;
+        let mut energy = 0f64;
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    assert!(!p.data.is_empty());
+                    dec.send_packet(&p).unwrap();
+                    let Frame::Audio(a) = dec.receive_frame().unwrap() else {
+                        panic!("expected audio");
+                    };
+                    assert_eq!(a.sample_rate, sr);
+                    assert_eq!(a.channels, 1);
+                    assert_eq!(a.format, SampleFormat::F32);
+                    decoded += a.samples;
+                    for c in a.planes[0].chunks_exact(4) {
+                        energy +=
+                            (f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64).powi(2);
+                    }
+                }
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected encoder error: {e}"),
+            }
+        }
+        assert!(decoded >= n, "decoded fewer samples than encoded");
+        assert!(energy > 1.0, "decoded audio is silent");
     }
 }

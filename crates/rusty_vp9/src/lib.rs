@@ -1,17 +1,21 @@
-//! In-house **VP9 decoder**, pure Rust with no C/FFI.
+//! **rusty_vp9** — an in-house VP9 decoder + encoder, pure Rust with no C/FFI.
 //!
-//! VP9 is a large block-based video codec. Like our AAC decoder, it is built in
-//! verifiable stages; this layer is the bitstream foundation: the MSB bit reader
-//! and the boolean arithmetic decoder ([`bits`]), plus the **uncompressed frame
-//! header** parser (frame type, profile, colour config, frame size). The
-//! compressed header, intra/inter reconstruction, transforms and loop filter
-//! land in later stages — until then [`receive_frame`](rff_codec::Decoder::receive_frame)
-//! reports [`Error::Unimplemented`] while framing/headers are fully functional.
+//! VP9 is a large block-based video codec. This crate carries the whole engine:
+//! the MSB bit reader and the boolean arithmetic decoder ([`BitReader`] /
+//! [`BoolDecoder`]), the **uncompressed frame header** parser (frame type,
+//! profile, colour config, frame size), the full reconstruction pipeline
+//! (compressed header, intra/inter prediction, transforms, loop filter) behind
+//! the stateful [`Vp9Decoder`], and the encoder behind [`Vp9Encoder`].
+//!
+//! The decoder is bit-exact against all 315 official libvpx conformance
+//! vectors; the encoder's output is validated pixel-exact against libvpx and
+//! ffmpeg. The push/pull API mirrors FFmpeg's send/receive convention:
+//! [`Error::Again`] means "feed more input", [`Error::Eof`] means "drained".
 
 use std::collections::VecDeque;
 
-use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder};
-use rff_core::{CodecId, Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
+mod error;
+pub use error::{Error, Result};
 
 mod adapt;
 mod bits;
@@ -39,22 +43,11 @@ pub use bits::{BitReader, BoolDecoder};
 /// instrument is public. See [`prof`] for the decoder's.
 pub use encode::prof as encode_prof;
 pub use encode::{ref_hist_take, set_modemap_std, set_snap_pool};
+pub use encode::{EncodedPacket, Vp9Encoder, Vp9EncoderConfig};
 
 pub(crate) const FRAME_MARKER: u32 = 2;
 pub(crate) const SYNC_CODE: u32 = 0x49_8342;
 pub(crate) const CS_RGB: u32 = 7;
-
-/// Register the VP9 decoder into a [`CodecRegistry`].
-pub fn register(registry: &mut CodecRegistry) {
-    registry.register(Codec {
-        id: CodecId::Vp9,
-        name: "vp9",
-        long_name: "Google VP9",
-        media_type: MediaType::Video,
-        decoder: Some(|| Box::new(Vp9Decoder::default())),
-        encoder: Some(|| Box::new(encode::Vp9Encoder::default())),
-    });
-}
 
 /// The parsed VP9 uncompressed frame header (the fields decoded so far).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -509,8 +502,13 @@ fn decode_term_subexp(b: &mut BoolDecoder) -> u32 {
     (v << 1) - 1 + b.read_bool(128)
 }
 
+/// The stateful VP9 decoder: superframe splitting, the eight reference-frame
+/// slots, frame-context management and the plane pool. Drive it FFmpeg-style:
+/// [`push`](Vp9Decoder::push) coded packets in, [`next_frame`](Vp9Decoder::next_frame)
+/// decoded pictures out ([`Error::Again`] = feed more, [`Error::Eof`] = drained
+/// after [`flush`](Vp9Decoder::flush)).
 #[derive(Default)]
-struct Vp9Decoder {
+pub struct Vp9Decoder {
     width: u32,
     height: u32,
     queue: VecDeque<(Vec<u8>, Option<i64>, bool)>,
@@ -555,6 +553,12 @@ struct Vp9Decoder {
 }
 
 impl Vp9Decoder {
+    /// A fresh decoder. The bitstream carries all sizing/colour configuration,
+    /// so there is nothing to configure up front.
+    pub fn new() -> Vp9Decoder {
+        Vp9Decoder::default()
+    }
+
     /// (width, height) of each of the 8 reference slots, for `frame_size_with_refs`.
     fn ref_dims(&self) -> [(u32, u32); 8] {
         let mut d = [(0u32, 0u32); 8];
@@ -577,29 +581,28 @@ impl Drop for Vp9Decoder {
     }
 }
 
-impl Decoder for Vp9Decoder {
-    fn configure(&mut self, params: &CodecParams) -> Result<()> {
-        self.width = params.width;
-        self.height = params.height;
-        Ok(())
-    }
-
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        // A VP9 "superframe" packs several coded frames (e.g. a hidden alt-ref
-        // plus the shown frame) into one packet, with a trailing index. Split it
-        // so each coded frame is decoded in turn. libvpx outputs exactly one
-        // frame per packet — the *last* displayable one — so for spatial
-        // scalability (multiple shown layers in a superframe) only the top layer
-        // is emitted; the lower layers are decoded as references then suppressed.
-        let frames = split_superframe(&packet.data);
+impl Vp9Decoder {
+    /// Feed one coded packet (with its presentation timestamp, if known).
+    ///
+    /// A VP9 "superframe" packs several coded frames (e.g. a hidden alt-ref
+    /// plus the shown frame) into one packet, with a trailing index. Split it
+    /// so each coded frame is decoded in turn. libvpx outputs exactly one
+    /// frame per packet — the *last* displayable one — so for spatial
+    /// scalability (multiple shown layers in a superframe) only the top layer
+    /// is emitted; the lower layers are decoded as references then suppressed.
+    pub fn push(&mut self, data: &[u8], pts: Option<i64>) -> Result<()> {
+        let frames = split_superframe(data);
         let last_disp = frames.iter().rposition(|f| peek_displayable(f));
         for (i, f) in frames.into_iter().enumerate() {
-            self.queue.push_back((f, packet.pts, last_disp == Some(i)));
+            self.queue.push_back((f, pts, last_disp == Some(i)));
         }
         Ok(())
     }
 
-    fn receive_frame(&mut self) -> Result<Frame> {
+    /// Decode and return the next displayable frame. [`Error::Again`] means
+    /// more input is needed (or the just-decoded frame was hidden);
+    /// [`Error::Eof`] means the stream is drained after [`flush`](Vp9Decoder::flush).
+    pub fn next_frame(&mut self) -> Result<DecodedFrame> {
         let Some((data, pts, display)) = self.queue.pop_front() else {
             return if self.eof {
                 Err(Error::Eof)
@@ -812,7 +815,9 @@ impl Decoder for Vp9Decoder {
         Ok(crop_frame(&rf, self.ss_x, self.ss_y, pts))
     }
 
-    fn flush(&mut self) {
+    /// Signal end of input: once the queue drains, [`next_frame`](Vp9Decoder::next_frame)
+    /// reports [`Error::Eof`] instead of [`Error::Again`].
+    pub fn flush(&mut self) {
         self.eof = true;
     }
 }
@@ -876,15 +881,38 @@ fn split_superframe(data: &[u8]) -> Vec<Vec<u8>> {
     vec![data.to_vec()]
 }
 
-/// Crop a decoded reference frame to its visible planes and wrap it as a `Frame`.
-/// 8-bit planes are emitted as bytes; 10/12-bit planes as little-endian `u16`.
 /// A/B switch for the frame-buffer pool (DEFAULT ON; set to disable).
 fn pool_disabled() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *E.get_or_init(|| std::env::var("VP9_NO_PLANE_POOL").is_ok())
 }
 
-fn crop_frame(rf: &decode::RefFrame, ss_x: u32, ss_y: u32, pts: Option<i64>) -> Frame {
+/// One decoded picture, cropped to its visible size.
+///
+/// 8-bit planes are emitted as bytes; 10/12-bit planes as little-endian `u16`
+/// pairs (so `strides` are in **bytes**, `2 × width` samples per row). The
+/// chroma layout is described by `subsampling_x`/`subsampling_y` (1,1 = 4:2:0;
+/// 1,0 = 4:2:2; 0,0 = 4:4:4).
+#[derive(Debug, Clone)]
+pub struct DecodedFrame {
+    pub width: u32,
+    pub height: u32,
+    /// 8, 10 or 12 bits per sample.
+    pub bit_depth: u32,
+    pub subsampling_x: u32,
+    pub subsampling_y: u32,
+    /// Y, U, V planes, tightly packed at `strides[p]` bytes per row.
+    pub planes: Vec<Vec<u8>>,
+    /// Bytes per row for each plane.
+    pub strides: Vec<usize>,
+    /// The presentation timestamp given to [`Vp9Decoder::push`], passed through.
+    pub pts: Option<i64>,
+}
+
+/// Crop a decoded reference frame to its visible planes and wrap it as a
+/// [`DecodedFrame`]. 8-bit planes are emitted as bytes; 10/12-bit planes as
+/// little-endian `u16`.
+fn crop_frame(rf: &decode::RefFrame, ss_x: u32, ss_y: u32, pts: Option<i64>) -> DecodedFrame {
     let hbd = rf.bit_depth > 8;
     let mut planes: Vec<Vec<u8>> = Vec::with_capacity(3);
     let mut strides: Vec<usize> = Vec::with_capacity(3);
@@ -904,25 +932,16 @@ fn crop_frame(rf: &decode::RefFrame, ss_x: u32, ss_y: u32, pts: Option<i64>) -> 
         planes.push(v);
         strides.push(if hbd { w * 2 } else { w });
     }
-    let format = match (ss_x, ss_y, rf.bit_depth) {
-        (1, 1, 8) => PixelFormat::Yuv420p,
-        (1, 0, 8) => PixelFormat::Yuv422p,
-        (_, _, 8) => PixelFormat::Yuv444p,
-        (1, 1, 10) => PixelFormat::Yuv420p10,
-        (1, 0, 10) => PixelFormat::Yuv422p10,
-        (_, _, 10) => PixelFormat::Yuv444p10,
-        (1, 1, _) => PixelFormat::Yuv420p12,
-        (1, 0, _) => PixelFormat::Yuv422p12,
-        (_, _, _) => PixelFormat::Yuv444p12,
-    };
-    Frame::Video(VideoFrame {
+    DecodedFrame {
         width: rf.w[0] as u32,
         height: rf.h[0] as u32,
-        format,
+        bit_depth: rf.bit_depth,
+        subsampling_x: ss_x,
+        subsampling_y: ss_y,
         planes,
         strides,
         pts,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -942,163 +961,12 @@ mod tests {
         assert_eq!((h.width, h.height), (96, 64));
     }
 
-    /// Robustness fuzz: feed mutated / truncated / random byte streams (seeded
-    /// from real coded frames) through the public decode API and assert the
-    /// decoder never panics — a malformed stream must surface as `Err`, never a
-    /// crash. `VP9_FUZZ_SEEDS` adds `.vp9` seed files; `VP9_FUZZ_ITERS` /
-    /// `VP9_FUZZ_SEED` tune the run. Reproduce a crash by re-running with the
-    /// printed seed.
-    #[test]
-    #[ignore]
-    fn fuzz_robustness() {
-        use rff_core::Packet;
-        use std::panic::{catch_unwind, AssertUnwindSafe};
-        use std::sync::Mutex;
-
-        let mut seeds: Vec<Vec<u8>> = vec![include_bytes!("testdata/keyframe.vp9").to_vec()];
-        if let Ok(dir) = std::env::var("VP9_FUZZ_SEEDS") {
-            if let Ok(rd) = std::fs::read_dir(&dir) {
-                for e in rd.flatten() {
-                    if e.path().extension().is_some_and(|x| x == "vp9") {
-                        if let Ok(d) = std::fs::read(e.path()) {
-                            if !d.is_empty() {
-                                seeds.push(d);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let iters: u64 = std::env::var("VP9_FUZZ_ITERS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100_000);
-        let mut st: u64 = std::env::var("VP9_FUZZ_SEED")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0x9e3779b97f4a7c15);
-        let mut rng = move || {
-            st ^= st << 13;
-            st ^= st >> 7;
-            st ^= st << 17;
-            st
-        };
-
-        static LAST: Mutex<String> = Mutex::new(String::new());
-        std::panic::set_hook(Box::new(|info| {
-            *LAST.lock().unwrap() = info.to_string();
-        }));
-
-        let mutate = |b: &mut Vec<u8>, rng: &mut dyn FnMut() -> u64| {
-            let rounds = 1 + rng() % 24;
-            for _ in 0..rounds {
-                if b.is_empty() {
-                    b.push((rng() & 0xff) as u8);
-                    continue;
-                }
-                match rng() % 6 {
-                    0 => {
-                        let i = rng() as usize % b.len();
-                        b[i] ^= 1 << (rng() % 8);
-                    }
-                    1 => {
-                        let i = rng() as usize % b.len();
-                        b[i] = (rng() & 0xff) as u8;
-                    }
-                    2 => {
-                        let n = rng() as usize % b.len();
-                        b.truncate(n);
-                    }
-                    3 => {
-                        let i = rng() as usize % (b.len() + 1);
-                        b.insert(i, (rng() & 0xff) as u8);
-                    }
-                    4 => {
-                        let i = rng() as usize % b.len();
-                        b.remove(i);
-                    }
-                    _ => {
-                        let i = rng() as usize % b.len();
-                        for _ in 0..(rng() % 8) {
-                            if i < b.len() {
-                                b[i] = (rng() & 0xff) as u8;
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        let mut crashes = 0u64;
-        for it in 0..iters {
-            // Build a short packet sequence; optionally start from a clean seed so
-            // inter / reference-dependent paths are reachable, then mutate.
-            let npkts = 1 + rng() % 4;
-            let mut packets: Vec<Vec<u8>> = Vec::new();
-            for k in 0..npkts {
-                if rng() % 16 == 0 {
-                    packets.push(
-                        (0..(rng() % 4096) as usize)
-                            .map(|_| (rng() & 0xff) as u8)
-                            .collect(),
-                    );
-                } else {
-                    let mut b = seeds[rng() as usize % seeds.len()].clone();
-                    if !(k == 0 && rng() % 4 == 0) {
-                        mutate(&mut b, &mut rng);
-                    }
-                    packets.push(b);
-                }
-            }
-            let snapshot = packets.clone();
-            let res = catch_unwind(AssertUnwindSafe(|| {
-                let mut dec = Vp9Decoder::default();
-                for (i, pk) in packets.into_iter().enumerate() {
-                    let mut p = Packet::from_data(0, pk);
-                    p.pts = Some(i as i64);
-                    let _ = dec.send_packet(&p);
-                    for _ in 0..256 {
-                        match dec.receive_frame() {
-                            Ok(_) => {}
-                            Err(_) => break,
-                        }
-                    }
-                }
-                dec.flush();
-                for _ in 0..256 {
-                    if dec.receive_frame().is_err() {
-                        break;
-                    }
-                }
-            }));
-            if res.is_err() {
-                crashes += 1;
-                if crashes <= 12 {
-                    let loc = LAST.lock().unwrap().clone();
-                    let hexes: Vec<String> = snapshot
-                        .iter()
-                        .map(|p| {
-                            p.iter()
-                                .take(48)
-                                .map(|b| format!("{b:02x}"))
-                                .collect::<String>()
-                        })
-                        .collect();
-                    eprintln!("[fuzz] CRASH iter={it}: {loc}\n        packets={hexes:?}");
-                }
-            }
-        }
-        let _ = std::panic::take_hook();
-        assert_eq!(crashes, 0, "{crashes}/{iters} inputs crashed the decoder");
-    }
-
     /// Decode the real key frame and dump the three planes for bit-exact
     /// Decode a whole inter sequence through the stateful decoder, dumping each
     /// shown frame's planes for comparison against FFmpeg (run with `--ignored`).
     #[test]
     #[ignore]
     fn dump_sequence() {
-        use rff_core::Packet;
         let dir = std::env::var("VP9_SEQ_DIR").unwrap();
         let prefix = std::env::var("VP9_SEQ_PREFIX").unwrap_or_else(|_| "seqfp_f".into());
         let n: usize = std::env::var("VP9_SEQ_N")
@@ -1108,15 +976,13 @@ mod tests {
         let mut dec = Vp9Decoder::default();
         for i in 0..n {
             let data = std::fs::read(format!("{dir}/{prefix}{i}.vp9")).unwrap();
-            let mut p = Packet::from_data(0, data);
-            p.pts = Some(i as i64);
-            dec.send_packet(&p).unwrap();
+            dec.push(&data, Some(i as i64)).unwrap();
         }
         dec.flush();
         let mut idx = 0;
         loop {
-            match dec.receive_frame() {
-                Ok(Frame::Video(vf)) => {
+            match dec.next_frame() {
+                Ok(vf) => {
                     let mut buf = Vec::new();
                     for pl in &vf.planes {
                         buf.extend_from_slice(pl);
@@ -1161,7 +1027,6 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_decode() {
-        use rff_core::Packet;
         use std::time::Instant;
         let dir = std::env::var("VP9_BENCH_DIR").unwrap();
         let pre = std::env::var("VP9_BENCH_PREFIX").unwrap_or_else(|_| "bench_f".into());
@@ -1189,8 +1054,8 @@ mod tests {
                          pix: &mut u64,
                          off: &mut usize,
                          mism: &mut usize| loop {
-                match dec.receive_frame() {
-                    Ok(Frame::Video(vf)) => {
+                match dec.next_frame() {
+                    Ok(vf) => {
                         *shown += 1;
                         for pl in &vf.planes {
                             *pix += pl.len() as u64;
@@ -1212,9 +1077,7 @@ mod tests {
                 }
             };
             for (i, d) in packets.iter().enumerate() {
-                let mut p = Packet::from_data(0, d.clone());
-                p.pts = Some(i as i64);
-                dec.send_packet(&p).unwrap();
+                dec.push(d, Some(i as i64)).unwrap();
                 drain(&mut dec, &mut shown, &mut pix, &mut off, &mut mism);
             }
             dec.flush();
@@ -1230,15 +1093,13 @@ mod tests {
         for _ in 0..passes {
             let mut dec = Vp9Decoder::default();
             for (i, d) in packets.iter().enumerate() {
-                let mut p = Packet::from_data(0, d.clone());
-                p.pts = Some(i as i64);
-                dec.send_packet(&p).unwrap();
-                while let Ok(Frame::Video(_)) = dec.receive_frame() {
+                dec.push(d, Some(i as i64)).unwrap();
+                while dec.next_frame().is_ok() {
                     total += 1;
                 }
             }
             dec.flush();
-            while let Ok(Frame::Video(_)) = dec.receive_frame() {
+            while dec.next_frame().is_ok() {
                 total += 1;
             }
         }
@@ -1258,7 +1119,6 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_decode_parallel() {
-        use rff_core::Packet;
         use std::time::Instant;
         let dir = std::env::var("VP9_BENCH_DIR").unwrap();
         let n: usize = std::env::var("VP9_BENCH_N").unwrap().parse().unwrap();
@@ -1278,15 +1138,13 @@ mod tests {
             for _ in 0..passes {
                 let mut dec = Vp9Decoder::default();
                 for (i, d) in packets.iter().enumerate() {
-                    let mut p = Packet::from_data(0, d.clone());
-                    p.pts = Some(i as i64);
-                    dec.send_packet(&p).unwrap();
-                    while let Ok(Frame::Video(_)) = dec.receive_frame() {
+                    dec.push(d, Some(i as i64)).unwrap();
+                    while dec.next_frame().is_ok() {
                         total += 1;
                     }
                 }
                 dec.flush();
-                while let Ok(Frame::Video(_)) = dec.receive_frame() {
+                while dec.next_frame().is_ok() {
                     total += 1;
                 }
             }

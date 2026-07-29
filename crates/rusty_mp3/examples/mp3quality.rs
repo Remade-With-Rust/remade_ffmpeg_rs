@@ -5,9 +5,9 @@
 //! the SAME neutral decoder so the comparison is fair). Prints mean/max NMR, the
 //! audible %, and the per-band profile. Lower mean NMR = perceptually better.
 //!
-//! `cargo run -p rff-codec-mp3 --features lab --example mp3quality -- orig.wav ours=o.wav lame=l.wav`
+//! `cargo run -p rusty_mp3 --features lab --example mp3quality -- orig.wav ours=o.wav lame=l.wav`
 
-use rff_codec_mp3::lab::quality::{track_nmr, NmrReport};
+use rusty_mp3::lab::quality::{track_nmr, NmrReport};
 use std::{env, fs};
 
 /// Read a RIFF/WAVE file into mono `f32` samples + its sample rate. Handles PCM s16

@@ -3,26 +3,15 @@ name = "rff-codec-mp3"
 version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
-description = "In-house pure-Rust MP3 (MPEG-1/2 Audio Layer III) decoder + encoder for remade_ffmpeg_rs"
+description = "MP3 (MPEG-1/2 Audio Layer III) codec adapter for remade_ffmpeg_rs, backed by the pure-Rust rusty_mp3 crate"
 
 [dependencies]
 rff-core.workspace = true
 rff-codec.workspace = true
+rusty_mp3.workspace = true
 
 [features]
-# The MP3 encoder experiment harness (brick registry, corpus, metrics, variant
-# sweeps). Opt-in — zero weight on the default build. See docs/mp3-lab.md.
-lab = []
-# Prometheus telemetry: expose the psychoacoustic model's signal-independent
-# curves (ATH, spreading, Bark) for offline formula discovery by the private
-# Prometheus refinery. Generic instrumentation — reveals nothing about
-# Prometheus; zero weight on the default build (the module compiles out).
-prometheus-telemetry = []
-
-[[example]]
-name = "mp3lab"
-required-features = ["lab"]
-
-[[example]]
-name = "mp3quality"
-required-features = ["lab"]
+# Compatibility forwards — the lab harness and telemetry hooks live in
+# `rusty_mp3` now (as do the `mp3lab`/`mp3quality` examples).
+lab = ["rusty_mp3/lab"]
+prometheus-telemetry = ["rusty_mp3/prometheus-telemetry"]

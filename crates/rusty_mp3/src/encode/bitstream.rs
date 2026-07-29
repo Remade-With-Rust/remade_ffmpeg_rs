@@ -480,19 +480,15 @@ mod tests {
         );
 
         // Our own decoder accepts it as a (silent) frame.
-        use rff_codec::Decoder;
-        use rff_core::{Frame, Packet};
         let mut dec = crate::Mp3Decoder::default();
-        dec.send_packet(&Packet::from_data(0, frame)).unwrap();
+        dec.push(&frame);
         dec.flush();
-        assert!(matches!(dec.receive_frame(), Ok(Frame::Audio(_))));
+        assert!(dec.next_frame().is_ok());
     }
 
     #[test]
     fn frame_assembly_is_decodable() {
         use crate::frame::GranuleSideInfo;
-        use rff_codec::Decoder;
-        use rff_core::{Frame, Packet};
 
         let header = hdr(ChannelMode::Mono);
         // A trivial-but-valid granule: no scalefactors, no big_values, no count1 —
@@ -524,11 +520,14 @@ mod tests {
         stream.extend_from_slice(&format(&header, &si, &main_data, &mut res));
 
         let mut dec = crate::Mp3Decoder::default();
-        dec.send_packet(&Packet::from_data(0, stream)).unwrap();
+        dec.push(&stream);
         dec.flush();
         let mut frames = 0;
-        while let Ok(Frame::Audio(af)) = dec.receive_frame() {
-            assert_eq!(af.samples, header.version.samples_per_frame());
+        while let Ok(af) = dec.next_frame() {
+            assert_eq!(
+                af.samples.len() / af.channels as usize,
+                header.version.samples_per_frame()
+            );
             frames += 1;
         }
         assert_eq!(frames, 2, "both assembled frames must decode");
@@ -594,13 +593,11 @@ mod tests {
         );
 
         // And the whole stream must decode frame-for-frame.
-        use rff_codec::Decoder;
-        use rff_core::{Frame, Packet};
         let mut dec = crate::Mp3Decoder::default();
-        dec.send_packet(&Packet::from_data(0, stream)).unwrap();
+        dec.push(&stream);
         dec.flush();
         let mut frames_out = 0;
-        while let Ok(Frame::Audio(_)) = dec.receive_frame() {
+        while dec.next_frame().is_ok() {
             frames_out += 1;
         }
         assert_eq!(frames_out, datas.len(), "every frame must decode");

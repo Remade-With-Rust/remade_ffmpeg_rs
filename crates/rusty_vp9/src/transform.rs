@@ -859,13 +859,13 @@ pub fn inverse_transform_add_rows(
 ) {
     // tx_type names the (column, row) transforms: ADST_DCT = ADST down columns,
     // DCT across rows. Verified bit-exact against FFmpeg in stage H.
-    let (row_adst, col_adst) = match tx_type {
+    let (_row_adst, _col_adst) = match tx_type {
         TxType::DctDct => (false, false),
         TxType::AdstDct => (false, true), // rows=DCT, cols=ADST
         TxType::DctAdst => (true, false), // rows=ADST, cols=DCT
         TxType::AdstAdst => (true, true),
     };
-    let shift = match n {
+    let _shift = match n {
         4 => 4,
         8 => 5,
         _ => 6, // 16 and 32
@@ -2444,7 +2444,7 @@ mod tx_microbench {
     //! plumbing and no process spawn, over a fixed synthetic corpus, and reports
     //! median cycles/call. It is the honest instrument for a kernel change.
     //!
-    //!   cargo test -p rff-codec-vp9 --release tx_microbench -- --ignored --nocapture
+    //!   cargo test -p rusty_vp9 --release tx_microbench -- --ignored --nocapture
     use super::*;
 
     fn rdtsc() -> u64 {

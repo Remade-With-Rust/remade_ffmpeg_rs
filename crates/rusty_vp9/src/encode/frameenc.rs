@@ -3941,7 +3941,7 @@ impl FrameEncoder {
             // Rough ref-signalling cost so LAST (one bool) is preferred over GOLDEN/ALTREF.
             let ref_bits = if rf == LAST_FRAME { 1.0 } else { 2.0 };
             let mut ref_min = f64::INFINITY;
-            let mut add = |cands: &mut Vec<_>,
+            let add = |cands: &mut Vec<_>,
                            ref_min: &mut f64,
                            topk: &mut [f64; 4],
                            mode,
@@ -4850,7 +4850,7 @@ impl FrameEncoder {
                 // SAD is cheaper than the dedup scan — the check cost more than
                 // the redundant work it saved. The subpel diamond keeps its dedup
                 // because each of its scores is a full MC interpolation.)
-                let mut consider = |best_sad: &mut i64, best_px: &mut (i32, i32), r: i32, c: i32| {
+                let consider = |best_sad: &mut i64, best_px: &mut (i32, i32), r: i32, c: i32| {
                     let sad =
                         self.block_sad_sized(base_x, base_y, r, c, swl, shl, *best_sad, ref8);
                     let shorter = r.abs() + c.abs() < best_px.0.abs() + best_px.1.abs();
@@ -5679,7 +5679,7 @@ impl FrameEncoder {
         } else {
             // Diamond: start candidates, then the 8-neighbour pattern at radii 4→2→1
             // (~15–25 SADs vs 162 exhaustive). Whole-pel candidates, 1/8-pel units.
-            let mut consider = |best_sad: &mut i64, best: &mut Mv, r: i32, c: i32| {
+            let consider = |best_sad: &mut i64, best: &mut Mv, r: i32, c: i32| {
                 let mv = (r * 8, c * 8);
                 let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges);
                 if sad < *best_sad {
@@ -7112,8 +7112,6 @@ fn sad4x4_scalar(s: &[u16], ss: usize, r: &[u16], rs: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rff_codec::Decoder;
-    use rff_core::{CodecId, Frame, Packet};
 
     /// The AVX2 SAD kernel must be bit-identical to the scalar oracle over many
     /// random strided 8-bit blocks (the codec is 8-bit, values 0..=255).
@@ -7206,14 +7204,9 @@ mod tests {
         }
 
         // Decode with our own decoder.
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
-        let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-        dec.send_packet(&Packet::from_data(0, bytes)).unwrap();
-        let frame = dec.receive_frame().expect("a frame");
-        let Frame::Video(vf) = frame else {
-            panic!("expected video frame")
-        };
+        let mut dec = crate::Vp9Decoder::new();
+        dec.push(&bytes, None).unwrap();
+        let vf = dec.next_frame().expect("a frame");
         assert_eq!((vf.width, vf.height), (w, h));
 
         // Compare each plane (display size) to the encoder's recon (coded size).
@@ -7276,15 +7269,11 @@ mod tests {
         );
 
         // Round-trip: feed key, P1, P2 in order; compare the decoded P2 to its recon.
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
-        let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
+        let mut dec = crate::Vp9Decoder::new();
         let mut last = None;
         for b in [&kb, &p1b, &p2b] {
-            dec.send_packet(&Packet::from_data(0, b.clone())).unwrap();
-            let Frame::Video(vf) = dec.receive_frame().unwrap() else {
-                panic!("video")
-            };
+            dec.push(b, None).unwrap();
+            let vf = dec.next_frame().unwrap();
             last = Some(vf);
         }
         let vf = last.unwrap();
@@ -7382,15 +7371,11 @@ mod tests {
             let p_bytes = enc1.encode_frame();
             let rec1: Vec<Vec<u16>> = enc1.recon().iter().map(|p| p.to_vec()).collect();
 
-            let mut reg = rff_codec::CodecRegistry::new();
-            crate::register(&mut reg);
-            let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-            dec.send_packet(&Packet::from_data(0, key_bytes)).unwrap();
-            let _ = dec.receive_frame().expect("key frame");
-            dec.send_packet(&Packet::from_data(0, p_bytes)).unwrap();
-            let Frame::Video(vf) = dec.receive_frame().expect("p frame") else {
-                panic!("video")
-            };
+            let mut dec = crate::Vp9Decoder::new();
+            dec.push(&key_bytes, None).unwrap();
+            let _ = dec.next_frame().expect("key frame");
+            dec.push(&p_bytes, None).unwrap();
+            let vf = dec.next_frame().expect("p frame");
             assert_eq!((vf.width, vf.height), (w, h));
 
             let dims = [
@@ -7461,15 +7446,11 @@ mod tests {
         );
 
         // Bit-exact through the decoder.
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
-        let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-        dec.send_packet(&Packet::from_data(0, key)).unwrap();
-        let _ = dec.receive_frame().unwrap();
-        dec.send_packet(&Packet::from_data(0, p)).unwrap();
-        let Frame::Video(vf) = dec.receive_frame().unwrap() else {
-            panic!("video")
-        };
+        let mut dec = crate::Vp9Decoder::new();
+        dec.push(&key, None).unwrap();
+        let _ = dec.next_frame().unwrap();
+        dec.push(&p, None).unwrap();
+        let vf = dec.next_frame().unwrap();
         let dec_stride = vf.strides[0];
         for yy in 0..h as usize {
             for xx in 0..w as usize {
@@ -7559,15 +7540,11 @@ mod tests {
             "subpel search found the half-pel MV in only {hit}/{total} interior blocks"
         );
 
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
-        let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-        dec.send_packet(&Packet::from_data(0, key)).unwrap();
-        let _ = dec.receive_frame().unwrap();
-        dec.send_packet(&Packet::from_data(0, p)).unwrap();
-        let Frame::Video(vf) = dec.receive_frame().unwrap() else {
-            panic!("video")
-        };
+        let mut dec = crate::Vp9Decoder::new();
+        dec.push(&key, None).unwrap();
+        let _ = dec.next_frame().unwrap();
+        dec.push(&p, None).unwrap();
+        let vf = dec.next_frame().unwrap();
         for yy in 0..h as usize {
             for xx in 0..w as usize {
                 assert_eq!(
@@ -7620,15 +7597,11 @@ mod tests {
             "intra fallback chosen for only {intra_v}/{total} interior blocks"
         );
 
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
-        let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-        dec.send_packet(&Packet::from_data(0, key)).unwrap();
-        let _ = dec.receive_frame().unwrap();
-        dec.send_packet(&Packet::from_data(0, p)).unwrap();
-        let Frame::Video(vf) = dec.receive_frame().unwrap() else {
-            panic!("video")
-        };
+        let mut dec = crate::Vp9Decoder::new();
+        dec.push(&key, None).unwrap();
+        let _ = dec.next_frame().unwrap();
+        dec.push(&p, None).unwrap();
+        let vf = dec.next_frame().unwrap();
         for yy in 0..h as usize {
             for xx in 0..w as usize {
                 assert_eq!(
@@ -7715,13 +7688,9 @@ mod tests {
         assert!(enc.lf_level() > 0, "loop filter not engaged (level 0)");
         let rec0: Vec<Vec<u16>> = enc.recon().iter().map(|p| p.to_vec()).collect();
 
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
-        let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-        dec.send_packet(&Packet::from_data(0, bytes)).unwrap();
-        let Frame::Video(vf) = dec.receive_frame().unwrap() else {
-            panic!("video")
-        };
+        let mut dec = crate::Vp9Decoder::new();
+        dec.push(&bytes, None).unwrap();
+        let vf = dec.next_frame().unwrap();
         // The decoder reproduces our deblocked reconstruction exactly.
         for yy in 0..h as usize {
             for xx in 0..w as usize {
@@ -7775,13 +7744,9 @@ mod tests {
             let rec: Vec<Vec<u16>> = on.recon().iter().map(|p| p.to_vec()).collect();
 
             // Bit-exact: the decoder reproduces the prob-updated frame exactly.
-            let mut reg = rff_codec::CodecRegistry::new();
-            crate::register(&mut reg);
-            let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-            dec.send_packet(&Packet::from_data(0, bytes)).unwrap();
-            let Frame::Video(vf) = dec.receive_frame().unwrap() else {
-                panic!("video")
-            };
+            let mut dec = crate::Vp9Decoder::new();
+            dec.push(&bytes, None).unwrap();
+            let vf = dec.next_frame().unwrap();
             for yy in 0..h as usize {
                 for xx in 0..w as usize {
                     assert_eq!(
@@ -7858,13 +7823,9 @@ mod tests {
             enc.set_lambda_mult(0.02);
             enc.set_ac_round_num(3);
             let bytes = enc.encode_frame();
-            let mut reg = rff_codec::CodecRegistry::new();
-            crate::register(&mut reg);
-            let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-            dec.send_packet(&Packet::from_data(0, bytes)).unwrap();
-            let Frame::Video(vf) = dec.receive_frame().unwrap() else {
-                panic!("video")
-            };
+            let mut dec = crate::Vp9Decoder::new();
+            dec.push(&bytes, None).unwrap();
+            let vf = dec.next_frame().unwrap();
             for yy in 0..h as usize {
                 for xx in 0..w as usize {
                     assert_eq!(
@@ -7912,13 +7873,9 @@ mod tests {
         let total = mi_rows * mi_cols;
         assert!(n8 > total / 4, "tx-search rarely picked 8×8: {n8}/{total}");
 
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
-        let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-        dec.send_packet(&Packet::from_data(0, bytes)).unwrap();
-        let Frame::Video(vf) = dec.receive_frame().unwrap() else {
-            panic!("video")
-        };
+        let mut dec = crate::Vp9Decoder::new();
+        dec.push(&bytes, None).unwrap();
+        let vf = dec.next_frame().unwrap();
         for yy in 0..h as usize {
             for xx in 0..w as usize {
                 assert_eq!(
@@ -7955,13 +7912,9 @@ mod tests {
                 "no block of size {bs} was coded"
             );
 
-            let mut reg = rff_codec::CodecRegistry::new();
-            crate::register(&mut reg);
-            let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-            dec.send_packet(&Packet::from_data(0, bytes)).unwrap();
-            let Frame::Video(vf) = dec.receive_frame().unwrap() else {
-                panic!("video")
-            };
+            let mut dec = crate::Vp9Decoder::new();
+            dec.push(&bytes, None).unwrap();
+            let vf = dec.next_frame().unwrap();
             for yy in 0..h as usize {
                 for xx in 0..w as usize {
                     assert_eq!(
@@ -8012,13 +7965,9 @@ mod tests {
             "partition RD produced a single block size {sizes:?} — not adapting"
         );
 
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
-        let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-        dec.send_packet(&Packet::from_data(0, bytes)).unwrap();
-        let Frame::Video(vf) = dec.receive_frame().unwrap() else {
-            panic!("video")
-        };
+        let mut dec = crate::Vp9Decoder::new();
+        dec.push(&bytes, None).unwrap();
+        let vf = dec.next_frame().unwrap();
         for yy in 0..h as usize {
             for xx in 0..w as usize {
                 assert_eq!(
@@ -8128,15 +8077,10 @@ mod tests {
             recons.push(recon);
         }
         // Round-trip every frame through our decoder against the encoder recon.
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
-        let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
+        let mut dec = crate::Vp9Decoder::new();
         for t in 0..n {
-            dec.send_packet(&Packet::from_data(0, streams[t].clone()))
-                .unwrap();
-            let Frame::Video(vf) = dec.receive_frame().unwrap() else {
-                panic!("video")
-            };
+            dec.push(&streams[t], None).unwrap();
+            let vf = dec.next_frame().unwrap();
             for yy in 0..h as usize {
                 for xx in 0..w as usize {
                     assert_eq!(
@@ -8208,15 +8152,11 @@ mod tests {
         );
         let rec: Vec<Vec<u16>> = enc1.recon().iter().map(|p| p.to_vec()).collect();
 
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
-        let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-        dec.send_packet(&Packet::from_data(0, key)).unwrap(); // key first (the P ref)
-        let _ = dec.receive_frame().unwrap();
-        dec.send_packet(&Packet::from_data(0, bytes)).unwrap();
-        let Frame::Video(vf) = dec.receive_frame().unwrap() else {
-            panic!("video")
-        };
+        let mut dec = crate::Vp9Decoder::new();
+        dec.push(&key, None).unwrap(); // key first (the P ref)
+        let _ = dec.next_frame().unwrap();
+        dec.push(&bytes, None).unwrap();
+        let vf = dec.next_frame().unwrap();
         for yy in 0..h as usize {
             for xx in 0..w as usize {
                 assert_eq!(

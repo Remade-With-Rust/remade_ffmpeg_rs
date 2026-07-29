@@ -986,6 +986,7 @@ impl Plane {
         }
     }
 
+    #[allow(dead_code)] // Kept as the plain (non-pooled) twin of the recycling constructor.
     fn new(width: usize, height: usize, ss_x: usize, ss_y: usize) -> Plane {
         let w = (width + ss_x) >> ss_x;
         let h = (height + ss_y) >> ss_y;

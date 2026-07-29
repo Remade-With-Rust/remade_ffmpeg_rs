@@ -1,0 +1,14 @@
+[package]
+name = "rusty_vp9"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+description = "Pure-Rust VP9 video decoder + encoder, no C/FFI. Decoder bit-exact against all 315 official libvpx conformance vectors."
+readme = "README.md"
+keywords = ["vp9", "video", "codec", "decoder", "encoder"]
+categories = ["multimedia::video", "multimedia::encoding"]
+rust-version = "1.85"
+
+[dependencies]

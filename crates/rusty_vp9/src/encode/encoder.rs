@@ -1,13 +1,13 @@
-//! VP9 encoder — the `Encoder` trait bridge (Floor 3, brick C3).
+//! VP9 encoder — the push/pull driver around [`FrameEncoder`] (Floor 3, brick C3).
 //!
-//! Wraps [`FrameEncoder`] in the `rff_codec::Encoder` send/receive interface and
-//! converts an incoming YUV 4:2:0 [`VideoFrame`] (display size) into the coded
-//! grid (rounded up to 8, edge-replicated) the frame encoder expects.
+//! Wraps [`FrameEncoder`] in a send/receive interface (FFmpeg-style: push
+//! frames in, pull [`EncodedPacket`]s out) and converts an incoming YUV 4:2:0
+//! frame (display size) into the coded grid (rounded up to 8, edge-replicated)
+//! the frame encoder expects.
 
 use std::collections::VecDeque;
 
-use rff_codec::Encoder;
-use rff_core::{Dictionary, Error, Frame, Packet, PixelFormat, Result, VideoFrame};
+use crate::{Error, Result};
 
 use super::frameenc::FrameEncoder;
 
@@ -268,23 +268,65 @@ fn temporal_filter(
     out
 }
 
-/// Parse an ffmpeg-style bitrate (`"2M"`, `"128k"`, `"500000"`) into bits/sec.
-fn parse_bitrate_bps(s: &str) -> Option<f64> {
-    let s = s.trim();
-    if let Some(n) = s.strip_suffix(['k', 'K']) {
-        n.trim().parse::<f64>().ok().map(|x| x * 1_000.0)
-    } else if let Some(n) = s.strip_suffix(['m', 'M']) {
-        n.trim().parse::<f64>().ok().map(|x| x * 1_000_000.0)
-    } else {
-        s.parse::<f64>().ok()
+/// One coded VP9 packet out of the encoder. `data` is a raw coded frame (or a
+/// superframe when a hidden ALT-REF rides with the next shown frame) — exactly
+/// the payload an IVF/WebM muxer stores per packet. Packets are emitted in
+/// coded order; `pts` is currently always `None` (callers timestamp packets by
+/// order). `keyframe` is derived from the leading frame-type bits.
+#[derive(Debug, Clone)]
+pub struct EncodedPacket {
+    pub data: Vec<u8>,
+    pub pts: Option<i64>,
+    pub keyframe: bool,
+}
+
+/// Wrap coded bytes as an [`EncodedPacket`]. Key frame iff the first coded
+/// frame's `show_existing_frame` and `frame_type` bits are both 0 (this
+/// encoder emits profile 0, where they sit at bits 3..2 of byte 0).
+fn packet(data: Vec<u8>) -> EncodedPacket {
+    let keyframe = data.first().is_some_and(|&b| b & 0x0c == 0);
+    EncodedPacket {
+        data,
+        pts: None,
+        keyframe,
     }
+}
+
+/// Configuration for [`Vp9Encoder::configure`] — the native mirror of the
+/// ffmpeg-style options the rff adapter parses (`-qp`/`-crf`/`-q`, `-b:v`+`-r`,
+/// `-lag`, `arnr-strength`, `dispatch-budget`, `-pass 2`/`twopass=1`,
+/// `-cpu-used`/`-speed`). `None` leaves the encoder's default untouched.
+#[derive(Debug, Clone, Default)]
+pub struct Vp9EncoderConfig {
+    /// VP9 qindex directly (0..255); qindex 0 would mean lossless.
+    pub qindex: Option<u32>,
+    /// A 0..63 quality mapped onto the qindex (`crf * 4`, clamped away from 0).
+    pub crf: Option<u32>,
+    /// Alias for a direct qindex (checked after `qindex` and `crf`).
+    pub q: Option<u32>,
+    /// Target bitrate in bits/sec — engages frame-level rate control.
+    pub bitrate_bps: Option<f64>,
+    /// Frame rate for the per-frame bit budget (values ≤ 0 ignored; default 30).
+    pub fps: Option<f64>,
+    /// ALT-REF lookahead group size (0 ⇒ off; capped at 32).
+    pub lag: Option<usize>,
+    /// ALT-REF temporal-filter strength (0 disables; clamped at 0).
+    pub arnr_strength: Option<f64>,
+    /// Per-frame decision-pass time budget in milliseconds for the
+    /// content-adaptive dispatch controller; ≤ 0 disables (overriding the
+    /// `VP9_DISPATCH_BUDGET` env default).
+    pub dispatch_budget_ms: Option<f64>,
+    /// Two-pass rate control (buffer the clip, probe, encode at a solved q).
+    pub two_pass: bool,
+    /// Speed preset, 0 best..6 fastest (values above 6 are clamped).
+    pub speed: Option<u32>,
 }
 
 /// In-house VP9 encoder: the first frame is a key frame, subsequent frames are
 /// P frames (ZEROMV, single-reference LAST) against the previous reconstruction.
 pub struct Vp9Encoder {
     qindex: u32,
-    packets: VecDeque<Packet>,
+    packets: VecDeque<EncodedPacket>,
     eof: bool,
     /// Previous frame's reconstruction (coded size) + its dimensions, used as the
     /// LAST reference; `None` ⇒ the next frame is coded as a key frame.
@@ -427,78 +469,57 @@ fn to_coded(plane: &[u8], stride: usize, dw: usize, dh: usize, cw: usize, ch: us
     out
 }
 
-impl Encoder for Vp9Encoder {
-    fn configure(&mut self, options: &Dictionary) -> Result<()> {
-        // `-qp N` sets the VP9 qindex directly (0..255); `-crf N` maps a 0..63
+impl Vp9Encoder {
+    /// Apply a [`Vp9EncoderConfig`]. `None` fields leave the current value
+    /// untouched, so this mirrors the incremental ffmpeg-option semantics.
+    pub fn configure(&mut self, cfg: &Vp9EncoderConfig) -> Result<()> {
+        // `qindex` sets the VP9 qindex directly (0..255); `crf` maps a 0..63
         // quality onto it. qindex 0 would mean lossless — clamp away from it.
-        if let Some(qp) = options.get("qp").and_then(|v| v.parse::<u32>().ok()) {
+        if let Some(qp) = cfg.qindex {
             self.qindex = qp.min(255);
-        } else if let Some(crf) = options.get("crf").and_then(|v| v.parse::<u32>().ok()) {
+        } else if let Some(crf) = cfg.crf {
             self.qindex = (crf * 4).clamp(1, 255);
-        } else if let Some(q) = options.get("q").and_then(|v| v.parse::<u32>().ok()) {
+        } else if let Some(q) = cfg.q {
             self.qindex = q.min(255);
         }
-        // `-b:v RATE` engages rate control toward `RATE` bits/sec. The per-frame
-        // budget needs a frame rate; honour `-r`/`framerate`, else assume 30 fps.
-        if let Some(bps) = options.get("b").and_then(parse_bitrate_bps) {
-            let fps = options
-                .get("framerate")
-                .or_else(|| options.get("r"))
-                .and_then(|v| v.parse::<f64>().ok())
-                .filter(|&f| f > 0.0)
-                .unwrap_or(30.0);
+        // A target bitrate engages rate control toward `bitrate_bps` bits/sec.
+        // The per-frame budget needs a frame rate; honour `fps`, else assume 30.
+        if let Some(bps) = cfg.bitrate_bps {
+            let fps = cfg.fps.filter(|&f| f > 0.0).unwrap_or(30.0);
             self.rc = Some(RateCtl {
                 target_per_frame: bps / fps,
                 q: self.qindex as f64,
             });
         }
-        // `-lag N` (aka lag-in-frames) turns on ALT-REF lookahead with a group size of
+        // `lag` (aka lag-in-frames) turns on ALT-REF lookahead with a group size of
         // `N` (each group is coded key/P… + one hidden future ALT-REF shown last).
-        if let Some(lag) = options
-            .get("lag")
-            .or_else(|| options.get("lag-in-frames"))
-            .and_then(|v| v.parse::<usize>().ok())
-        {
+        if let Some(lag) = cfg.lag {
             self.lag = lag.min(32);
         }
         // ALT-REF temporal-filter strength (`arnr-strength`, 0 disables).
-        if let Some(s) = options
-            .get("arnr-strength")
-            .or_else(|| options.get("tf"))
-            .and_then(|v| v.parse::<f64>().ok())
-        {
+        if let Some(s) = cfg.arnr_strength {
             self.tf_strength = s.max(0.0);
         }
-        // `-dispatch-budget MS` engages the content-adaptive time-budget controller:
+        // `dispatch_budget_ms` engages the content-adaptive time-budget controller:
         // per frame, the variance-partition route fraction is steered to hold the
         // decision pass near MS milliseconds — a per-frame latency/throughput target
         // that caps encode time on complex content while easy content stays full-RD.
         // 0/absent = off. Overrides the `VP9_DISPATCH_BUDGET` env default.
-        if let Some(ms) = options
-            .get("dispatch-budget")
-            .and_then(|v| v.parse::<f64>().ok())
-        {
+        if let Some(ms) = cfg.dispatch_budget_ms {
             self.dispatch_budget_us = if ms > 0.0 {
                 Some((ms * 1000.0) as u64)
             } else {
                 None
             };
         }
-        // Two-pass: `-pass 2` (ffmpeg-style; `-pass 1` is a discardable analysis pass we
-        // fold into pass 2 internally) or an explicit `twopass=1`. Needs `-b:v`.
-        if options.get("pass").map(|v| v.trim()) == Some("2")
-            || options.get("twopass").map(|v| v.trim()) == Some("1")
-        {
+        // Two-pass: ffmpeg's `-pass 2` (`-pass 1` is a discardable analysis pass we
+        // fold into pass 2 internally) or an explicit `twopass=1`. Needs a bitrate.
+        if cfg.two_pass {
             self.twopass = true;
         }
-        // Speed preset: `-cpu-used N` / `-speed N` (0 best..4 fastest), à la libvpx.
+        // Speed preset: `cpu-used`/`speed` (0 best..4 fastest), à la libvpx.
         // Higher = progressively drop RD tools for a graceful quality→speed trade.
-        if let Some(sp) = options
-            .get("cpu-used")
-            .or_else(|| options.get("speed"))
-            .or_else(|| options.get("quality"))
-            .and_then(|v| v.parse::<u32>().ok())
-        {
+        if let Some(sp) = cfg.speed {
             // 0–3 = the RD-quality ladder; 4–6 = the realtime rungs (content-adaptive
             // variance-partition dispatcher, rising route fraction). See `set_speed`.
             self.speed = sp.min(6);
@@ -506,40 +527,36 @@ impl Encoder for Vp9Encoder {
         Ok(())
     }
 
-    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
-        let vf: &VideoFrame = match frame {
-            Frame::Video(v) => v,
-            Frame::Audio(_) => {
-                return Err(Error::unsupported(
-                    "vp9 encode: audio frame on a video codec",
-                ))
-            }
-        };
-        if vf.format != PixelFormat::Yuv420p {
-            return Err(Error::unsupported(format!(
-                "vp9 encode: needs yuv420p, got `{}` (convert with -vf format=yuv420p)",
-                vf.format.name()
-            )));
-        }
-        let (w, h) = (vf.width as usize, vf.height as usize);
+    /// Feed one 8-bit YUV 4:2:0 frame: `planes`/`strides` are the display-size
+    /// Y, U, V rows (chroma dimensions rounded up). Packets may become available
+    /// immediately or only after later frames / [`flush`](Vp9Encoder::flush)
+    /// (lookahead and two-pass buffer internally).
+    pub fn push_frame(
+        &mut self,
+        planes: [&[u8]; 3],
+        strides: [usize; 3],
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let (w, h) = (width as usize, height as usize);
         let mi_cols = (w + 7) >> 3;
         let mi_rows = (h + 7) >> 3;
         let (cw, ch) = (mi_cols * 8, mi_rows * 8);
         let (cwc, chc) = (cw / 2, ch / 2);
         let (dwc, dhc) = (w.div_ceil(2), h.div_ceil(2));
 
-        let y = to_coded(&vf.planes[0], vf.strides[0], w, h, cw, ch);
-        let u = to_coded(&vf.planes[1], vf.strides[1], dwc, dhc, cwc, chc);
-        let v = to_coded(&vf.planes[2], vf.strides[2], dwc, dhc, cwc, chc);
+        let y = to_coded(planes[0], strides[0], w, h, cw, ch);
+        let u = to_coded(planes[1], strides[1], dwc, dhc, cwc, chc);
+        let v = to_coded(planes[2], strides[2], dwc, dhc, cwc, chc);
 
         if self.twopass {
             // Two-pass needs the whole clip before it can solve for the qindex — buffer.
-            self.lookahead.push_back(([y, u, v], vf.width, vf.height));
+            self.lookahead.push_back(([y, u, v], width, height));
             return Ok(());
         }
         if self.lag > 1 {
             // ALT-REF lookahead: buffer, and emit a group once it is `lag` frames long.
-            self.lookahead.push_back(([y, u, v], vf.width, vf.height));
+            self.lookahead.push_back(([y, u, v], width, height));
             if self.lookahead.len() >= self.lag {
                 let group: Vec<_> = self.lookahead.drain(..).collect();
                 self.code_altref_group(group);
@@ -548,12 +565,14 @@ impl Encoder for Vp9Encoder {
         }
 
         // Default path: code immediately as KEY (first frame / resize) or P (+ GOLDEN).
-        let bytes = self.code_frame([y, u, v], vf.width, vf.height, None);
-        self.packets.push_back(Packet::from_data(0, bytes));
+        let bytes = self.code_frame([y, u, v], width, height, None);
+        self.packets.push_back(packet(bytes));
         Ok(())
     }
 
-    fn receive_packet(&mut self) -> Result<Packet> {
+    /// Pull the next coded packet. [`Error::Again`] means push more frames (or
+    /// [`flush`](Vp9Encoder::flush)); [`Error::Eof`] means fully drained.
+    pub fn next_packet(&mut self) -> Result<EncodedPacket> {
         if let Some(p) = self.packets.pop_front() {
             Ok(p)
         } else if self.eof {
@@ -563,7 +582,9 @@ impl Encoder for Vp9Encoder {
         }
     }
 
-    fn flush(&mut self) {
+    /// Signal end of input: codes any buffered lookahead / two-pass group, after
+    /// which [`next_packet`](Vp9Encoder::next_packet) drains to [`Error::Eof`].
+    pub fn flush(&mut self) {
         if !self.lookahead.is_empty() {
             let group: Vec<_> = self.lookahead.drain(..).collect();
             if self.twopass {
@@ -679,13 +700,12 @@ impl Vp9Encoder {
         let bytes = enc.encode_frame();
         self.budget_update(&enc, is_key);
         if chaining {
-            use rff_codec::Decoder as _;
             let comp = self
                 .companion
                 .get_or_insert_with(|| Box::new(crate::Vp9Decoder::default()));
             let ok = comp
-                .send_packet(&Packet::from_data(0, bytes.clone()))
-                .and_then(|_| comp.receive_frame())
+                .push(&bytes, None)
+                .and_then(|_| comp.next_frame())
                 .is_ok();
             if ok {
                 self.chain_prev_p = !is_key;
@@ -731,12 +751,11 @@ impl Vp9Encoder {
         match expect {
             Some(r) => self.recon_check(bytes, r, w, h),
             None => {
-                use rff_codec::Decoder as _;
                 let dec = self
                     .recon_check_dec
                     .get_or_insert_with(|| Box::new(crate::Vp9Decoder::default()));
-                let _ = dec.send_packet(&Packet::from_data(0, bytes.to_vec()));
-                while dec.receive_frame().is_ok() {}
+                let _ = dec.push(bytes, None);
+                while dec.next_frame().is_ok() {}
                 eprintln!("RECON_CHECK frame {}: hidden (fed, not compared)", self.recon_check_n);
                 self.recon_check_n += 1;
             }
@@ -746,18 +765,14 @@ impl Vp9Encoder {
     /// Decode `bytes` with a scratch decoder and compare against the encoder's own
     /// reconstruction. Reports the first differing sample per frame; counts frames.
     fn recon_check(&mut self, bytes: &[u8], recon: &[Vec<u16>; 3], w: u32, h: u32) {
-        use rff_codec::Decoder as _;
         // PERSISTENT across frames. A fresh decoder per frame holds no reference
         // buffers, so every inter frame decodes to garbage and the check reports a
         // 100% mismatch that says nothing about the encoder.
         let dec = self
             .recon_check_dec
             .get_or_insert_with(|| Box::new(crate::Vp9Decoder::default()));
-        let got = dec
-            .send_packet(&Packet::from_data(0, bytes.to_vec()))
-            .ok()
-            .and_then(|_| dec.receive_frame().ok());
-        let Some(rff_core::Frame::Video(vf)) = got else {
+        let got = dec.push(bytes, None).ok().and_then(|_| dec.next_frame().ok());
+        let Some(vf) = got else {
             eprintln!("RECON_CHECK frame {}: DECODE FAILED", self.recon_check_n);
             self.recon_check_n += 1;
             return;
@@ -844,7 +859,7 @@ impl Vp9Encoder {
         let Some(tpf) = target_per_frame else {
             for (c, w, h) in frames {
                 let b = self.code_frame_q(c, w, h, None, self.qindex);
-                self.packets.push_back(Packet::from_data(0, b));
+                self.packets.push_back(packet(b));
             }
             return;
         };
@@ -882,7 +897,7 @@ impl Vp9Encoder {
         for (i, (c, w, h)) in frames.into_iter().enumerate() {
             let q = if i == 0 { q_key } else { q_inter };
             let b = self.code_frame_q(c, w, h, None, q);
-            self.packets.push_back(Packet::from_data(0, b));
+            self.packets.push_back(packet(b));
         }
         self.pass2_chaining = false;
     }
@@ -917,21 +932,17 @@ impl Vp9Encoder {
         if !self.group_chain {
             return;
         }
-        use rff_codec::Decoder as _;
         let comp = self
             .companion
             .get_or_insert_with(|| Box::new(crate::Vp9Decoder::default()));
-        if comp
-            .send_packet(&Packet::from_data(0, bytes.to_vec()))
-            .is_err()
-        {
+        if comp.push(bytes, None).is_err() {
             self.group_chain = false;
             self.chain = false;
             self.companion = None;
             return;
         }
         loop {
-            match comp.receive_frame() {
+            match comp.next_frame() {
                 Ok(_) => {}
                 Err(Error::Again) | Err(Error::Eof) => break,
                 Err(_) => {
@@ -970,7 +981,7 @@ impl Vp9Encoder {
                 self.companion_feed(&b);
                 let r = self.last_recon.take();
                 self.recon_verify(&b, r.as_ref(), fw, fh);
-                self.packets.push_back(Packet::from_data(0, b));
+                self.packets.push_back(packet(b));
             }
             return;
         }
@@ -985,7 +996,7 @@ impl Vp9Encoder {
             self.companion_feed(&kb);
             let r = self.last_recon.clone();
             self.recon_verify(&kb, r.as_ref(), kw, kh);
-            self.packets.push_back(Packet::from_data(0, kb));
+            self.packets.push_back(packet(kb));
             i0 = 1;
         }
 
@@ -1015,8 +1026,7 @@ impl Vp9Encoder {
         self.companion_feed(&pb1);
         let r = self.last_recon.take();
         self.recon_verify(&pb1, r.as_ref(), w1, h1);
-        self.packets
-            .push_back(Packet::from_data(0, pack_superframe(&[ab, pb1])));
+        self.packets.push_back(packet(pack_superframe(&[ab, pb1])));
 
         // Remaining shown P frames F_{i0+1}..F_{n-2}.
         for f in frames.iter().take(n - 1).skip(i0 + 1) {
@@ -1025,7 +1035,7 @@ impl Vp9Encoder {
             self.companion_feed(&pb);
             let r = self.last_recon.take();
             self.recon_verify(&pb, r.as_ref(), iw, ih);
-            self.packets.push_back(Packet::from_data(0, pb));
+            self.packets.push_back(packet(pb));
         }
 
         // Display the ALT-REF, then swap GOLDEN↔ALTREF so this ARF anchors the next group.
@@ -1033,7 +1043,7 @@ impl Vp9Encoder {
         self.companion_feed(&se);
         // show_existing displays the hidden ARF — the one chance to verify it.
         self.recon_verify(&se, arf_recon.as_ref(), aw, ah);
-        self.packets.push_back(Packet::from_data(0, se));
+        self.packets.push_back(packet(se));
         std::mem::swap(&mut self.golden_slot, &mut self.arf_slot);
     }
 
@@ -1137,482 +1147,5 @@ impl Vp9Encoder {
         self.last_recon = Some(recon.clone());
         self.slots[0] = Some(recon);
         bytes
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rff_codec::Decoder;
-    use rff_core::CodecId;
-
-    #[test]
-    fn encoder_trait_roundtrips_through_registry() {
-        // A 96×64 YUV420p frame through the registered encoder, then the
-        // registered decoder; the decode must be valid (a key frame of the right
-        // size). Bit-exactness vs the recon is covered by frameenc's tests.
-        let (w, h) = (96u32, 64u32);
-        let ylen = (w * h) as usize;
-        let clen = ((w / 2) * (h / 2)) as usize;
-        let vf = VideoFrame {
-            width: w,
-            height: h,
-            format: PixelFormat::Yuv420p,
-            planes: vec![
-                (0..ylen).map(|i| (i % 256) as u8).collect(),
-                vec![128u8; clen],
-                vec![128u8; clen],
-            ],
-            strides: vec![w as usize, (w / 2) as usize, (w / 2) as usize],
-            pts: None,
-        };
-
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
-        let mut enc = reg.find_encoder(CodecId::Vp9).unwrap();
-        enc.configure(&Dictionary::new()).unwrap();
-        enc.send_frame(&Frame::Video(vf)).unwrap();
-        enc.flush();
-        let pkt = enc.receive_packet().unwrap();
-        assert!(!pkt.data.is_empty());
-        // First three bytes: frame marker (10) + profile 0 + show_existing 0 +
-        // key_frame bit 0 ... → byte 0 high bits 0b100... ; just confirm it decodes.
-
-        let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-        dec.send_packet(&pkt).unwrap();
-        let Frame::Video(out) = dec.receive_frame().unwrap() else {
-            panic!("video")
-        };
-        assert_eq!((out.width, out.height), (w, h));
-        assert_eq!(out.format, PixelFormat::Yuv420p);
-    }
-
-    /// ALT-REF lookahead: a `-lag N` group codes KEY + a hidden future ALT-REF + P
-    /// frames + a `show_existing_frame`, and must decode to `N` displayed frames that
-    /// are pixel-identical across our decoder, libvpx, and ffmpeg. Set `VP9_ARF_OUT` to
-    /// dump the IVF + our decoded YUV for the external comparison.
-    #[test]
-    fn altref_lookahead_structure_and_roundtrip() {
-        use rff_core::CodecId;
-        let (w, h) = (128u32, 96u32);
-        let (cw, ch) = (w as usize, h as usize);
-        let n = 8u32;
-        let frame = |f: u32| -> VideoFrame {
-            let s = f as usize;
-            let y: Vec<u8> = (0..cw * ch)
-                .map(|i| (((i % cw + s) ^ (i / cw)) % 200 + 20) as u8)
-                .collect();
-            let uv = vec![128u8; (cw / 2) * (ch / 2)];
-            VideoFrame {
-                width: w,
-                height: h,
-                format: PixelFormat::Yuv420p,
-                planes: vec![y, uv.clone(), uv],
-                strides: vec![cw, cw / 2, cw / 2],
-                pts: Some(f as i64),
-            }
-        };
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
-        let mut enc = reg.find_encoder(CodecId::Vp9).unwrap();
-        let mut opts = Dictionary::new();
-        opts.set("lag", &n.to_string());
-        enc.configure(&opts).unwrap();
-        for f in 0..n {
-            enc.send_frame(&Frame::Video(frame(f))).unwrap();
-        }
-        enc.flush();
-        let mut packets = Vec::new();
-        while let Ok(p) = enc.receive_packet() {
-            packets.push(p.data);
-        }
-        // One group of n frames ⇒ KEY + superframe[ARF,P1] + (n-3) P + show_existing = n.
-        assert_eq!(
-            packets.len() as u32,
-            n,
-            "expected KEY + superframe(ARF,P1) + P… + show_existing"
-        );
-
-        // Decode with our decoder; a hidden ARF yields no displayed frame, the
-        // show_existing yields the ARF's frame — so exactly n frames are displayed.
-        let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-        let mut ours: Vec<VideoFrame> = Vec::new();
-        for pkt in &packets {
-            dec.send_packet(&Packet::from_data(0, pkt.clone())).unwrap();
-            while let Ok(Frame::Video(vf)) = dec.receive_frame() {
-                ours.push(vf);
-            }
-        }
-        assert_eq!(ours.len() as u32, n, "displayed frame count");
-
-        if let Ok(dir) = std::env::var("VP9_ARF_OUT") {
-            let mut ivf = Vec::new();
-            ivf.extend_from_slice(b"DKIF");
-            ivf.extend_from_slice(&0u16.to_le_bytes());
-            ivf.extend_from_slice(&32u16.to_le_bytes());
-            ivf.extend_from_slice(b"VP90");
-            ivf.extend_from_slice(&(w as u16).to_le_bytes());
-            ivf.extend_from_slice(&(h as u16).to_le_bytes());
-            ivf.extend_from_slice(&30u32.to_le_bytes());
-            ivf.extend_from_slice(&1u32.to_le_bytes());
-            ivf.extend_from_slice(&(packets.len() as u32).to_le_bytes());
-            ivf.extend_from_slice(&0u32.to_le_bytes());
-            for (i, b) in packets.iter().enumerate() {
-                ivf.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                ivf.extend_from_slice(&(i as u64).to_le_bytes());
-                ivf.extend_from_slice(b);
-            }
-            std::fs::write(format!("{dir}/arf.ivf"), &ivf).unwrap();
-            // Our decoded frames, display order, planar 4:2:0 (display size).
-            let mut raw = Vec::new();
-            for vf in &ours {
-                for (p, &(pw, ph)) in [
-                    (w as usize, h as usize),
-                    ((w / 2) as usize, (h / 2) as usize),
-                    ((w / 2) as usize, (h / 2) as usize),
-                ]
-                .iter()
-                .enumerate()
-                {
-                    for yy in 0..ph {
-                        raw.extend_from_slice(
-                            &vf.planes[p][yy * vf.strides[p]..yy * vf.strides[p] + pw],
-                        );
-                    }
-                }
-            }
-            std::fs::write(format!("{dir}/arf.ours.yuv"), &raw).unwrap();
-        }
-    }
-
-    /// Two-pass rate control: on a clip whose complexity varies over time, the encode
-    /// should land near the requested size (better than single-pass, which overshoots
-    /// at the start before the leaky bucket catches up) and decode cleanly.
-    #[test]
-    fn two_pass_hits_target_and_decodes() {
-        use rff_core::CodecId;
-        let (w, h) = (128u32, 96u32);
-        let (cw, ch) = (w as usize, h as usize);
-        let n = 16u32;
-        let fps = 30.0;
-        // First half smooth, second half busy — a moving-complexity clip so a global
-        // (lookahead) allocation clearly beats a reactive one.
-        let frame = |f: u32| -> VideoFrame {
-            let busy = f >= n / 2;
-            let y: Vec<u8> = (0..cw * ch)
-                .map(|i| {
-                    let (x, yy) = (i % cw, i / cw);
-                    if busy {
-                        (((x * 13) ^ (yy * 7) ^ (f as usize * 5)) % 256) as u8
-                    } else {
-                        ((x + yy) / 3 % 200) as u8
-                    }
-                })
-                .collect();
-            let uv = vec![128u8; (cw / 2) * (ch / 2)];
-            VideoFrame {
-                width: w,
-                height: h,
-                format: PixelFormat::Yuv420p,
-                planes: vec![y, uv.clone(), uv],
-                strides: vec![cw, cw / 2, cw / 2],
-                pts: Some(f as i64),
-            }
-        };
-
-        let target = "300k";
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
-        let mut enc = reg.find_encoder(CodecId::Vp9).unwrap();
-        let mut opts = Dictionary::new();
-        opts.set("b", target);
-        opts.set("twopass", "1");
-        enc.configure(&opts).unwrap();
-        for f in 0..n {
-            enc.send_frame(&Frame::Video(frame(f))).unwrap();
-        }
-        enc.flush();
-        let mut total_bits = 0u64;
-        let mut packets = Vec::new();
-        while let Ok(p) = enc.receive_packet() {
-            total_bits += p.data.len() as u64 * 8;
-            packets.push(p.data);
-        }
-        let achieved = total_bits as f64 * fps / n as f64;
-        eprintln!("two-pass: target=300000 bps, achieved={achieved:.0} bps");
-        // Within ±35% of target — the qindex model is coarse but the global solve keeps
-        // it in the ballpark (single-pass on this clip swings far wider at the start).
-        assert!(
-            (achieved - 300_000.0).abs() < 0.35 * 300_000.0,
-            "two-pass missed target badly: {achieved:.0} bps"
-        );
-
-        // The stream must decode to all n frames.
-        let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-        let mut shown = 0u32;
-        for pkt in &packets {
-            dec.send_packet(&Packet::from_data(0, pkt.clone())).unwrap();
-            while let Ok(Frame::Video(_)) = dec.receive_frame() {
-                shown += 1;
-            }
-        }
-        assert_eq!(shown, n, "two-pass decoded frame count");
-    }
-
-    /// ALT-REF temporal filtering: on a static scene corrupted by per-frame noise, the
-    /// filter averages the motion-compensated neighbors so the ALT-REF *recovers the
-    /// clean signal*. The displayed ALT-REF (last frame, via `show_existing`) is then
-    /// markedly closer to the noise-free ground truth than the raw noisy anchor is —
-    /// higher PSNR-vs-clean — at no cost in group size.
-    #[test]
-    fn temporal_filter_denoises_altref() {
-        use rff_core::CodecId;
-        let (w, h) = (128u32, 96u32);
-        let (cw, ch) = (w as usize, h as usize);
-        let n = 8u32;
-        // Clean static base + strong per-frame noise (uncorrelated frame-to-frame).
-        let base = |x: usize, y: usize| (((x * 5) ^ (y * 3)) % 180 + 40) as i32;
-        let clean: Vec<u8> = (0..cw * ch).map(|i| base(i % cw, i / cw) as u8).collect();
-        let frame = |f: u32| -> VideoFrame {
-            let mut s = 0x9E3779B9u32.wrapping_mul(f + 1).wrapping_add(1);
-            let mut noise = move || {
-                s ^= s << 13;
-                s ^= s >> 17;
-                s ^= s << 5;
-                (s % 41) as i32 - 20
-            };
-            let y: Vec<u8> = (0..cw * ch)
-                .map(|i| (base(i % cw, i / cw) + noise()).clamp(0, 255) as u8)
-                .collect();
-            let uv = vec![128u8; (cw / 2) * (ch / 2)];
-            VideoFrame {
-                width: w,
-                height: h,
-                format: PixelFormat::Yuv420p,
-                planes: vec![y, uv.clone(), uv],
-                strides: vec![cw, cw / 2, cw / 2],
-                pts: Some(f as i64),
-            }
-        };
-        // Encode a group, then decode; return (group bytes, PSNR of the last displayed
-        // frame — the ALT-REF — against the clean ground truth).
-        let run = |strength: &str| -> (usize, f64) {
-            let mut reg = rff_codec::CodecRegistry::new();
-            crate::register(&mut reg);
-            let mut enc = reg.find_encoder(CodecId::Vp9).unwrap();
-            let mut opts = Dictionary::new();
-            opts.set("lag", &n.to_string());
-            opts.set("qp", "48");
-            opts.set("arnr-strength", strength);
-            enc.configure(&opts).unwrap();
-            for f in 0..n {
-                enc.send_frame(&Frame::Video(frame(f))).unwrap();
-            }
-            enc.flush();
-            let mut total = 0;
-            let mut packets = Vec::new();
-            while let Ok(p) = enc.receive_packet() {
-                total += p.data.len();
-                packets.push(p.data);
-            }
-            let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-            let mut last: Option<VideoFrame> = None;
-            for pkt in &packets {
-                dec.send_packet(&Packet::from_data(0, pkt.clone())).unwrap();
-                while let Ok(Frame::Video(vf)) = dec.receive_frame() {
-                    last = Some(vf);
-                }
-            }
-            let vf = last.unwrap();
-            let mut se = 0u64;
-            for y in 0..ch {
-                for x in 0..cw {
-                    let d = clean[y * cw + x] as i64 - vf.planes[0][y * vf.strides[0] + x] as i64;
-                    se += (d * d) as u64;
-                }
-            }
-            let mse = se as f64 / (cw * ch) as f64;
-            let psnr = 10.0 * (255.0f64 * 255.0 / mse).log10();
-            (total, psnr)
-        };
-        let (on_bytes, on_psnr) = run("4");
-        let (off_bytes, off_psnr) = run("0");
-        eprintln!(
-            "temporal filter: ALT-REF PSNR-vs-clean off={off_psnr:.2} dB on={on_psnr:.2} dB (+{:.2}); group bytes off={off_bytes} on={on_bytes}",
-            on_psnr - off_psnr
-        );
-        // The filtered ALT-REF recovers the clean signal far better...
-        assert!(
-            on_psnr > off_psnr + 2.0,
-            "temporal filter did not denoise: on={on_psnr:.2} off={off_psnr:.2}"
-        );
-        // ...and does not cost group size.
-        assert!(
-            on_bytes <= off_bytes,
-            "tf grew the group: on={on_bytes} off={off_bytes}"
-        );
-    }
-
-    /// Cross-GOP chaining: two `-lag 8` groups over 16 frames must contain exactly ONE
-    /// key frame (the very first) — the second group chains through the reference slots
-    /// with no key — yet still decode to 16 displayed frames that are pixel-identical
-    /// across our decoder, libvpx, and ffmpeg. `VP9_XGOP_OUT` dumps for the external arm.
-    #[test]
-    fn cross_gop_chaining_no_extra_keyframe() {
-        use rff_core::CodecId;
-        let (w, h) = (128u32, 96u32);
-        let (cw, ch) = (w as usize, h as usize);
-        let n = 16u32;
-        let frame = |f: u32| -> VideoFrame {
-            let s = f as usize;
-            let y: Vec<u8> = (0..cw * ch)
-                .map(|i| (((i % cw + s) ^ (i / cw + s / 2)) % 220 + 18) as u8)
-                .collect();
-            let uv = vec![128u8; (cw / 2) * (ch / 2)];
-            VideoFrame {
-                width: w,
-                height: h,
-                format: PixelFormat::Yuv420p,
-                planes: vec![y, uv.clone(), uv],
-                strides: vec![cw, cw / 2, cw / 2],
-                pts: Some(f as i64),
-            }
-        };
-        let mut reg = rff_codec::CodecRegistry::new();
-        crate::register(&mut reg);
-        let mut enc = reg.find_encoder(CodecId::Vp9).unwrap();
-        let mut opts = Dictionary::new();
-        opts.set("lag", "8");
-        enc.configure(&opts).unwrap();
-        for f in 0..n {
-            enc.send_frame(&Frame::Video(frame(f))).unwrap();
-        }
-        enc.flush();
-        let mut packets = Vec::new();
-        while let Ok(p) = enc.receive_packet() {
-            packets.push(p.data);
-        }
-        // A frame is a key frame iff (not show_existing and frame_type=0), i.e. the
-        // show_existing (bit3) and frame_type (bit2) bits of byte0 are both 0.
-        let keyframes = packets.iter().filter(|p| p[0] & 0x0C == 0).count();
-        assert_eq!(
-            keyframes, 1,
-            "exactly one key frame expected (chained groups)"
-        );
-
-        let mut dec = reg.find_decoder(CodecId::Vp9).unwrap();
-        let mut ours: Vec<VideoFrame> = Vec::new();
-        for pkt in &packets {
-            dec.send_packet(&Packet::from_data(0, pkt.clone())).unwrap();
-            while let Ok(Frame::Video(vf)) = dec.receive_frame() {
-                ours.push(vf);
-            }
-        }
-        assert_eq!(ours.len() as u32, n, "displayed frame count");
-
-        if let Ok(dir) = std::env::var("VP9_XGOP_OUT") {
-            let mut ivf = Vec::new();
-            ivf.extend_from_slice(b"DKIF");
-            ivf.extend_from_slice(&0u16.to_le_bytes());
-            ivf.extend_from_slice(&32u16.to_le_bytes());
-            ivf.extend_from_slice(b"VP90");
-            ivf.extend_from_slice(&(w as u16).to_le_bytes());
-            ivf.extend_from_slice(&(h as u16).to_le_bytes());
-            ivf.extend_from_slice(&30u32.to_le_bytes());
-            ivf.extend_from_slice(&1u32.to_le_bytes());
-            ivf.extend_from_slice(&(packets.len() as u32).to_le_bytes());
-            ivf.extend_from_slice(&0u32.to_le_bytes());
-            for (i, b) in packets.iter().enumerate() {
-                ivf.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                ivf.extend_from_slice(&(i as u64).to_le_bytes());
-                ivf.extend_from_slice(b);
-            }
-            std::fs::write(format!("{dir}/xgop.ivf"), &ivf).unwrap();
-            let mut raw = Vec::new();
-            for vf in &ours {
-                for (p, &(pw, ph)) in [
-                    (w as usize, h as usize),
-                    ((w / 2) as usize, (h / 2) as usize),
-                    ((w / 2) as usize, (h / 2) as usize),
-                ]
-                .iter()
-                .enumerate()
-                {
-                    for yy in 0..ph {
-                        raw.extend_from_slice(
-                            &vf.planes[p][yy * vf.strides[p]..yy * vf.strides[p] + pw],
-                        );
-                    }
-                }
-            }
-            std::fs::write(format!("{dir}/xgop.ours.yuv"), &raw).unwrap();
-        }
-    }
-
-    #[test]
-    fn parse_bitrate_handles_suffixes() {
-        assert_eq!(parse_bitrate_bps("2M"), Some(2_000_000.0));
-        assert_eq!(parse_bitrate_bps("128k"), Some(128_000.0));
-        assert_eq!(parse_bitrate_bps("500000"), Some(500_000.0));
-        assert_eq!(parse_bitrate_bps("oops"), None);
-    }
-
-    /// R2 — `-b:v` drives the bitrate: a higher target spends more bits, and a low
-    /// target is tracked (not wildly overshot). Robust to the clip's compressibility.
-    #[test]
-    fn rate_control_tracks_target_bitrate() {
-        let (w, h) = (96u32, 96u32);
-        let (cw, ch) = (w as usize, h as usize);
-        let fps = 30.0;
-        let n = 12u32;
-
-        let frame = |f: u32| -> VideoFrame {
-            let shift = f as usize; // a panning texture ⇒ real inter residual
-            let y: Vec<u8> = (0..cw * ch)
-                .map(|i| {
-                    (((i % cw + shift).wrapping_mul(31) ^ (i / cw).wrapping_mul(57)) % 256) as u8
-                })
-                .collect();
-            let uv = vec![128u8; (cw / 2) * (ch / 2)];
-            VideoFrame {
-                width: w,
-                height: h,
-                format: PixelFormat::Yuv420p,
-                planes: vec![y, uv.clone(), uv],
-                strides: vec![cw, cw / 2, cw / 2],
-                pts: Some(f as i64),
-            }
-        };
-
-        let run = |bitrate: &str| -> f64 {
-            let mut reg = rff_codec::CodecRegistry::new();
-            crate::register(&mut reg);
-            let mut enc = reg.find_encoder(CodecId::Vp9).unwrap();
-            let mut opts = Dictionary::new();
-            opts.set("b", bitrate);
-            enc.configure(&opts).unwrap();
-            let mut total_bits = 0u64;
-            for f in 0..n {
-                enc.send_frame(&Frame::Video(frame(f))).unwrap();
-                while let Ok(pkt) = enc.receive_packet() {
-                    total_bits += pkt.data.len() as u64 * 8;
-                }
-            }
-            total_bits as f64 * fps / n as f64
-        };
-
-        let lo = run("120k");
-        let hi = run("3M");
-        eprintln!("rate control: 120k→{lo:.0} bps, 3M→{hi:.0} bps");
-        // A higher target spends more bits...
-        assert!(
-            hi > lo * 1.5,
-            "no response to target: lo={lo:.0} hi={hi:.0}"
-        );
-        // ...and the low target is tracked, not blown past.
-        assert!(
-            lo < 120_000.0 * 2.5,
-            "overshot the 120k target: {lo:.0} bps"
-        );
     }
 }

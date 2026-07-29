@@ -1020,7 +1020,7 @@ pub fn bilinear_score8x8_scalar(
     src_off: usize,
     src_stride: usize,
 ) -> u32 {
-    let f = |a: u32, b: u32, p: usize| ((a * (128 - 8 * p as u32) + b * (8 * p as u32) + 64) >> 7);
+    let f = |a: u32, b: u32, p: usize| (a * (128 - 8 * p as u32) + b * (8 * p as u32) + 64) >> 7;
     let mut sad = 0u32;
     for y in 0..8usize {
         for x in 0..8usize {
@@ -2367,7 +2367,7 @@ mod mc_microbench {
     //! discipline as `transform::tx_microbench`, for the same reason: the decode
     //! stage wall carries ±7..14% noise here, far more than most MC bricks.
     //!
-    //!   cargo test -p rff-codec-vp9 --release mc_microbench -- --ignored --nocapture
+    //!   cargo test -p rusty_vp9 --release mc_microbench -- --ignored --nocapture
     use super::*;
 
     fn rdtsc() -> u64 {

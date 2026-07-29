@@ -7,8 +7,9 @@
 //! the decoder, already validated by 315/315 conformance. Floors 1+ (forward
 //! transforms, coefficient/mode coding, the control brain) build on this.
 //!
-//! The encoder is not yet registered as a [`Codec`](rff_codec::Codec) encoder —
-//! that wiring lands with the first decodable key frame (plan Floor 3, C3).
+//! The encoder is exposed as the crate-level [`Vp9Encoder`](crate::Vp9Encoder)
+//! (native push/pull API); the first decodable key frame landed with plan
+//! Floor 3, C3.
 
 mod adapt;
 mod bitwriter;
@@ -32,7 +33,7 @@ mod varrd;
 
 pub(crate) use bitwriter::{BitWriter, BoolEncoder};
 pub(crate) use compressed::write_compressed_header;
-pub(crate) use encoder::Vp9Encoder;
+pub use encoder::{EncodedPacket, Vp9Encoder, Vp9EncoderConfig};
 pub(crate) use frame::{assemble_frame, assemble_tiles};
 pub(crate) use frameenc::FrameEncoder;
 /// Runtime A/B switch for the snapshot buffer pool (see `frameenc::set_snap_pool`).

@@ -1,0 +1,35 @@
+[package]
+name = "rusty_mp3"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+description = "Pure-Rust MP3 (MPEG-1/2/2.5 Layer III) decoder + encoder, no C/FFI. Decoder bit-exact vs FFmpeg; the first pure-Rust MP3 encoder (CBR/VBR, joint stereo, bit reservoir)."
+readme = "README.md"
+keywords = ["mp3", "audio", "codec", "decoder", "encoder"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+rust-version = "1.85"
+# Lab sweep outputs (JSON reports from the `mp3lab` example) — dev artifacts,
+# not crate content.
+exclude = ["lab-results/"]
+
+[dependencies]
+
+[features]
+# The MP3 encoder experiment harness (brick registry, corpus, metrics, variant
+# sweeps). Opt-in — zero weight on the default build.
+lab = []
+# Prometheus telemetry: expose the psychoacoustic model's signal-independent
+# curves (ATH, spreading, Bark) for offline formula discovery by the private
+# Prometheus refinery. Generic instrumentation — reveals nothing about
+# Prometheus; zero weight on the default build (the module compiles out).
+prometheus-telemetry = []
+
+[[example]]
+name = "mp3lab"
+required-features = ["lab"]
+
+[[example]]
+name = "mp3quality"
+required-features = ["lab"]

@@ -9,9 +9,7 @@ use crate::codebook::{Codebook, CODEBOOKS};
 use crate::ics::{IcsInfo, WindowSequence};
 use crate::swb::swb_offsets;
 use crate::tables::spectral_book;
-use crate::{AdtsHeader, AudioSpecificConfig};
-use rff_codec::Encoder;
-use rff_core::{AudioFrame, Dictionary, Error, Frame, Packet, Result, SampleFormat};
+use crate::{AdtsHeader, AudioSpecificConfig, Error, Result};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -167,6 +165,16 @@ fn emit_escape(m: u32, w: &mut BitWriter) {
 // ---------------------------------------------------------------------------
 // Header / config serializers — inverses of the decoder's parsers.
 // ---------------------------------------------------------------------------
+
+/// The `AudioSpecificConfig` bytes for an AAC-LC stream — the MP4 `esds`
+/// DecoderSpecificInfo the muxer needs (2 bytes for standard rates).
+pub fn audio_specific_config_bytes(sample_rate: u32, channels: u16) -> Vec<u8> {
+    write_audio_specific_config(&AudioSpecificConfig {
+        object_type: 2, // AAC-LC
+        sample_rate,
+        channels,
+    })
+}
 
 /// Serialize an `AudioSpecificConfig` (ISO §1.6.2.1) — the `esds`/`stsd` config
 /// bytes the MP4 muxer needs. Inverse of `parse_audio_specific_config`.
@@ -1419,30 +1427,62 @@ fn encode_cpe(
 }
 
 // ---------------------------------------------------------------------------
-// The encoder: buffers input, blocks into 1024-sample long frames, emits ADTS.
+// The encoder: buffers input, blocks into 1024-sample long frames, emits raw
+// access units (add ADTS or MP4 framing around them as needed).
 // ---------------------------------------------------------------------------
+
+/// Encoder options.
+#[derive(Debug, Clone, Copy)]
+pub struct AacEncoderConfig {
+    /// Target bitrate in bits per second. Drives the per-frame rate loop.
+    /// Default: 128 000 (128 kbps).
+    pub bitrate_bps: u32,
+}
+
+impl Default for AacEncoderConfig {
+    fn default() -> Self {
+        AacEncoderConfig {
+            bitrate_bps: 128_000,
+        }
+    }
+}
+
+/// One encoded raw access unit (a `raw_data_block`, no ADTS framing).
+#[derive(Debug, Clone)]
+pub struct EncodedPacket {
+    pub data: Vec<u8>,
+    /// Presentation timestamp in samples (frame index × 1024).
+    pub pts: i64,
+    /// Duration in samples (always one AAC frame = 1024).
+    pub duration: u32,
+}
+
+/// AAC-LC encoder. Push PCM with [`push_pcm`](AacEncoder::push_pcm) (or
+/// [`push_pcm_planar`](AacEncoder::push_pcm_planar)), call
+/// [`finish`](AacEncoder::finish), then drain [`next_packet`](AacEncoder::next_packet)
+/// until it returns [`Error::Eof`].
 pub struct AacEncoder {
     sample_rate: u32,
     channels: usize,
     fs_index: u8,
-    /// Target bitrate (bits/s), set by `-b`. Drives the per-frame rate loop.
+    /// Target bitrate (bits/s). Drives the per-frame rate loop.
     bitrate: u32,
     win: Vec<f32>,
     chans: Vec<Vec<f32>>,
     initialized: bool,
-    /// Encoded raw access units (raw_data_block, no ADTS) awaiting `receive_packet`,
-    /// each with its sample-domain PTS. Filled on `flush`.
+    /// Encoded raw access units (raw_data_block, no ADTS) awaiting `next_packet`,
+    /// each with its sample-domain PTS. Filled on `finish`.
     queue: VecDeque<(Vec<u8>, i64)>,
     flushed: bool,
 }
 
 impl AacEncoder {
-    pub fn new() -> Self {
+    pub fn new(config: AacEncoderConfig) -> Self {
         AacEncoder {
             sample_rate: 0,
             channels: 0,
             fs_index: 0,
-            bitrate: 128_000,
+            bitrate: config.bitrate_bps.max(1),
             win: Vec::new(),
             chans: Vec::new(),
             initialized: false,
@@ -1451,47 +1491,55 @@ impl AacEncoder {
         }
     }
 
-    fn ingest(&mut self, f: &AudioFrame) -> Result<()> {
+    /// The stream's sample rate (0 until the first PCM is pushed).
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// The stream's channel count (0 until the first PCM is pushed).
+    pub fn channels(&self) -> u16 {
+        self.channels as u16
+    }
+
+    /// Initialize (or validate) the stream parameters from a PCM push.
+    fn init(&mut self, channels: u16, sample_rate: u32) -> Result<()> {
+        if !self.initialized {
+            self.sample_rate = sample_rate;
+            self.channels = channels.max(1) as usize;
+            self.fs_index = crate::sf_index_for_rate(sample_rate)
+                .ok_or_else(|| Error::invalid("aac encode: unsupported sample rate"))?;
+            self.win = crate::dsp::sine_window(LONG_N);
+            self.chans = vec![Vec::new(); self.channels];
+            self.initialized = true;
+        } else if channels.max(1) as usize != self.channels {
+            return Err(Error::invalid(
+                "aac encode: channel count changed mid-stream",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Buffer interleaved `f32` PCM in [-1, 1] (`interleaved.len()` must be a
+    /// multiple of `channels`). The first push fixes the stream's channel count
+    /// and sample rate.
+    pub fn push_pcm(&mut self, interleaved: &[f32], channels: u16, sample_rate: u32) -> Result<()> {
+        self.init(channels, sample_rate)?;
         let ch = self.channels;
-        let n = f.samples;
-        match f.format {
-            SampleFormat::S16 => {
-                let d = &f.planes[0];
-                for i in 0..n {
-                    for c in 0..ch {
-                        let o = (i * ch + c) * 2;
-                        self.chans[c].push(i16::from_le_bytes([d[o], d[o + 1]]) as f32 / 32768.0);
-                    }
-                }
+        let n = interleaved.len() / ch;
+        for i in 0..n {
+            for c in 0..ch {
+                self.chans[c].push(interleaved[i * ch + c]);
             }
-            SampleFormat::F32 => {
-                let d = &f.planes[0];
-                for i in 0..n {
-                    for c in 0..ch {
-                        let o = (i * ch + c) * 4;
-                        self.chans[c].push(f32::from_le_bytes([
-                            d[o],
-                            d[o + 1],
-                            d[o + 2],
-                            d[o + 3],
-                        ]));
-                    }
-                }
-            }
-            SampleFormat::F32Planar => {
-                for (c, plane) in f.planes.iter().enumerate().take(ch) {
-                    for i in 0..n {
-                        let o = i * 4;
-                        self.chans[c].push(f32::from_le_bytes([
-                            plane[o],
-                            plane[o + 1],
-                            plane[o + 2],
-                            plane[o + 3],
-                        ]));
-                    }
-                }
-            }
-            _ => return Err(Error::invalid("aac encode: unsupported sample format")),
+        }
+        Ok(())
+    }
+
+    /// Buffer planar `f32` PCM, one slice per channel (`planes.len()` is the
+    /// channel count; all planes the same length).
+    pub fn push_pcm_planar(&mut self, planes: &[&[f32]], sample_rate: u32) -> Result<()> {
+        self.init(planes.len() as u16, sample_rate)?;
+        for (c, plane) in planes.iter().enumerate().take(self.channels) {
+            self.chans[c].extend_from_slice(plane);
         }
         Ok(())
     }
@@ -1628,58 +1676,10 @@ impl AacEncoder {
         });
         parts.into_iter().flatten().collect()
     }
-}
 
-impl Default for AacEncoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Encoder for AacEncoder {
-    fn configure(&mut self, options: &Dictionary) -> Result<()> {
-        if let Some(b) = options.get_int("b") {
-            if b > 0 {
-                self.bitrate = b as u32;
-            }
-        }
-        Ok(())
-    }
-
-    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
-        let Frame::Audio(a) = frame else {
-            return Err(Error::invalid("aac encode: expected an audio frame"));
-        };
-        if !self.initialized {
-            self.sample_rate = a.sample_rate;
-            self.channels = a.channels.max(1) as usize;
-            self.fs_index = crate::sf_index_for_rate(a.sample_rate)
-                .ok_or_else(|| Error::invalid("aac encode: unsupported sample rate"))?;
-            self.win = crate::dsp::sine_window(LONG_N);
-            self.chans = vec![Vec::new(); self.channels];
-            self.initialized = true;
-        } else if a.channels.max(1) as usize != self.channels {
-            return Err(Error::invalid(
-                "aac encode: channel count changed mid-stream",
-            ));
-        }
-        self.ingest(a)
-    }
-
-    fn receive_packet(&mut self) -> Result<Packet> {
-        if let Some((data, pts)) = self.queue.pop_front() {
-            let mut p = Packet::from_data(0, data);
-            p.pts = Some(pts);
-            return Ok(p);
-        }
-        if self.flushed {
-            Err(Error::Eof)
-        } else {
-            Err(Error::Again)
-        }
-    }
-
-    fn flush(&mut self) {
+    /// Signal end-of-input: encode all buffered PCM (frame-parallel) so packets
+    /// can be drained via [`next_packet`](AacEncoder::next_packet). Idempotent.
+    pub fn finish(&mut self) {
         if self.flushed {
             return;
         }
@@ -1687,6 +1687,30 @@ impl Encoder for AacEncoder {
         if self.initialized {
             self.queue = self.encode_stream().into();
         }
+    }
+
+    /// Retrieve the next encoded access unit. Returns [`Error::Again`] before
+    /// [`finish`](AacEncoder::finish) has been called, and [`Error::Eof`] once
+    /// fully drained.
+    pub fn next_packet(&mut self) -> Result<EncodedPacket> {
+        if let Some((data, pts)) = self.queue.pop_front() {
+            return Ok(EncodedPacket {
+                data,
+                pts,
+                duration: FRAME_LEN as u32,
+            });
+        }
+        if self.flushed {
+            Err(Error::Eof)
+        } else {
+            Err(Error::Again)
+        }
+    }
+}
+
+impl Default for AacEncoder {
+    fn default() -> Self {
+        Self::new(AacEncoderConfig::default())
     }
 }
 
@@ -1699,9 +1723,9 @@ mod tests {
     /// Drain the encoder into a concatenated ADTS elementary stream — the container
     /// framing the encoder no longer emits itself — for decoder/ffmpeg validation.
     fn encode_to_adts(enc: &mut AacEncoder) -> Vec<u8> {
-        enc.flush();
+        enc.finish();
         let mut out = Vec::new();
-        while let Ok(p) = enc.receive_packet() {
+        while let Ok(p) = enc.next_packet() {
             let hdr = AdtsHeader {
                 object_type: 2,
                 sample_rate: enc.sample_rate,
@@ -1948,19 +1972,11 @@ mod tests {
                 let env = (1.0 - k as f64 / 600.0).max(0.0);
                 v += 0.8 * env * (2.0 * std::f64::consts::PI * 3000.0 * k as f64 / sr as f64).sin();
             }
-            interleaved.extend_from_slice(&(v as f32).to_le_bytes());
+            interleaved.push(v as f32);
         }
 
-        let mut enc = AacEncoder::new();
-        enc.send_frame(&Frame::Audio(AudioFrame {
-            sample_rate: sr,
-            channels: 1,
-            format: SampleFormat::F32,
-            planes: vec![interleaved],
-            samples: n,
-            pts: Some(0),
-        }))
-        .unwrap();
+        let mut enc = AacEncoder::default();
+        enc.push_pcm(&interleaved, 1, sr).unwrap();
         let adts = encode_to_adts(&mut enc);
 
         // Parse each frame's first SCE window_sequence; EightShort (2) must appear.
@@ -1979,9 +1995,7 @@ mod tests {
             if r.read_bits(2).unwrap() == WindowSequence::EightShort.to_bits() {
                 saw_short = true;
             }
-            if let Frame::Audio(a) = dec.decode(au, None).unwrap() {
-                decoded += a.samples;
-            }
+            decoded += dec.decode(au, None).unwrap().frames();
             pos += hdr.frame_length;
         }
         assert!(saw_short, "a transient must produce EightShort blocks");
@@ -2019,19 +2033,11 @@ mod tests {
         for i in 0..n {
             let s =
                 (0.4 * (2.0 * std::f64::consts::PI * 600.0 * i as f64 / sr as f64).sin()) as f32;
-            interleaved.extend_from_slice(&s.to_le_bytes()); // L
-            interleaved.extend_from_slice(&s.to_le_bytes()); // R == L
+            interleaved.push(s); // L
+            interleaved.push(s); // R == L
         }
-        let mut enc = AacEncoder::new();
-        enc.send_frame(&Frame::Audio(AudioFrame {
-            sample_rate: sr,
-            channels: 2,
-            format: SampleFormat::F32,
-            planes: vec![interleaved],
-            samples: n,
-            pts: Some(0),
-        }))
-        .unwrap();
+        let mut enc = AacEncoder::default();
+        enc.push_pcm(&interleaved, 2, sr).unwrap();
         let adts = encode_to_adts(&mut enc);
 
         assert_ne!(
@@ -2046,20 +2052,12 @@ mod tests {
         while pos + 7 <= adts.len() {
             let hdr = crate::parse_adts(&adts[pos..]).unwrap();
             let au = &adts[pos + hdr.header_len..pos + hdr.frame_length];
-            if let Frame::Audio(a) = dec.decode(au, None).unwrap() {
-                let d = &a.planes[0];
-                for k in 0..a.samples {
-                    let l =
-                        f32::from_le_bytes([d[k * 8], d[k * 8 + 1], d[k * 8 + 2], d[k * 8 + 3]]);
-                    let rr = f32::from_le_bytes([
-                        d[k * 8 + 4],
-                        d[k * 8 + 5],
-                        d[k * 8 + 6],
-                        d[k * 8 + 7],
-                    ]);
-                    lsum += (l as f64).powi(2);
-                    diff += ((l - rr) as f64).powi(2);
-                }
+            let a = dec.decode(au, None).unwrap();
+            for k in 0..a.frames() {
+                let l = a.samples[k * 2];
+                let rr = a.samples[k * 2 + 1];
+                lsum += (l as f64).powi(2);
+                diff += ((l - rr) as f64).powi(2);
             }
             pos += hdr.frame_length;
         }
@@ -2084,38 +2082,22 @@ mod tests {
             let t = i as f64 / sr as f64;
             let l = (0.4 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as f32;
             let r = (0.4 * (2.0 * std::f64::consts::PI * 660.0 * t).sin()) as f32;
-            interleaved.extend_from_slice(&l.to_le_bytes());
-            interleaved.extend_from_slice(&r.to_le_bytes());
+            interleaved.push(l);
+            interleaved.push(r);
         }
-        let mut enc = AacEncoder::new();
-        enc.send_frame(&Frame::Audio(AudioFrame {
-            sample_rate: sr,
-            channels: 2,
-            format: SampleFormat::F32,
-            planes: vec![interleaved],
-            samples: n,
-            pts: Some(0),
-        }))
-        .unwrap();
-        enc.flush();
+        let mut enc = AacEncoder::default();
+        enc.push_pcm(&interleaved, 2, sr).unwrap();
+        enc.finish();
         let mut dec = crate::decode::Decoder::new(sr);
         let (mut lsq, mut rsq, mut cnt) = (0.0f64, 0.0f64, 0usize);
-        while let Ok(p) = enc.receive_packet() {
-            if let Frame::Audio(a) = dec.decode(&p.data, None).unwrap() {
-                let d = &a.planes[0];
-                for k in 0..a.samples {
-                    let l =
-                        f32::from_le_bytes([d[k * 8], d[k * 8 + 1], d[k * 8 + 2], d[k * 8 + 3]]);
-                    let r = f32::from_le_bytes([
-                        d[k * 8 + 4],
-                        d[k * 8 + 5],
-                        d[k * 8 + 6],
-                        d[k * 8 + 7],
-                    ]);
-                    lsq += (l as f64).powi(2);
-                    rsq += (r as f64).powi(2);
-                    cnt += 1;
-                }
+        while let Ok(p) = enc.next_packet() {
+            let a = dec.decode(&p.data, None).unwrap();
+            for k in 0..a.frames() {
+                let l = a.samples[k * 2];
+                let r = a.samples[k * 2 + 1];
+                lsq += (l as f64).powi(2);
+                rsq += (r as f64).powi(2);
+                cnt += 1;
             }
         }
         let (lrms, rrms) = ((lsq / cnt as f64).sqrt(), (rsq / cnt as f64).sqrt());
@@ -2300,24 +2282,14 @@ mod tests {
         let sr = 44100u32;
         let n = 44100usize; // 1 s
         let mut samples = Vec::with_capacity(n);
-        let mut interleaved = Vec::with_capacity(n * 4);
         for i in 0..n {
             let s =
                 ((i as f64 * 2.0 * std::f64::consts::PI * 440.0 / sr as f64).sin() * 0.5) as f32;
             samples.push(s);
-            interleaved.extend_from_slice(&s.to_le_bytes());
         }
-        let frame = Frame::Audio(AudioFrame {
-            sample_rate: sr,
-            channels: 1,
-            format: SampleFormat::F32,
-            planes: vec![interleaved],
-            samples: n,
-            pts: Some(0),
-        });
 
-        let mut enc = AacEncoder::new();
-        enc.send_frame(&frame).unwrap();
+        let mut enc = AacEncoder::default();
+        enc.push_pcm(&samples, 1, sr).unwrap();
         let adts = encode_to_adts(&mut enc);
         assert!(crate::is_adts(&adts), "encoder output is not ADTS");
 
@@ -2327,11 +2299,7 @@ mod tests {
         while pos + 7 <= adts.len() {
             let hdr = crate::parse_adts(&adts[pos..]).unwrap();
             let au = &adts[pos + hdr.header_len..pos + hdr.frame_length];
-            if let Frame::Audio(a) = dec.decode(au, None).unwrap() {
-                for c in a.planes[0].chunks_exact(4) {
-                    decoded.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
-                }
-            }
+            decoded.extend_from_slice(&dec.decode(au, None).unwrap().samples);
             pos += hdr.frame_length;
         }
         assert!(
@@ -2373,23 +2341,12 @@ mod tests {
             st ^= st << 5;
             let noise = ((st >> 24) as f64 - 128.0) / 128.0 * 0.1;
             let v = ((s * 0.2 + noise) * 0.7).clamp(-1.0, 1.0) as f32;
-            interleaved.extend_from_slice(&v.to_le_bytes());
+            interleaved.push(v);
         }
 
-        for &kbps in &[64_000i64, 128_000] {
-            let mut d = Dictionary::new();
-            d.set("b", kbps.to_string());
-            let mut enc = AacEncoder::new();
-            enc.configure(&d).unwrap();
-            let frame = Frame::Audio(AudioFrame {
-                sample_rate: sr,
-                channels: 1,
-                format: SampleFormat::F32,
-                planes: vec![interleaved.clone()],
-                samples: n,
-                pts: Some(0),
-            });
-            enc.send_frame(&frame).unwrap();
+        for &kbps in &[64_000u32, 128_000] {
+            let mut enc = AacEncoder::new(AacEncoderConfig { bitrate_bps: kbps });
+            enc.push_pcm(&interleaved, 1, sr).unwrap();
             let adts = encode_to_adts(&mut enc);
 
             let measured = adts.len() as f64 * 8.0 / secs as f64;
@@ -2404,9 +2361,7 @@ mod tests {
             while pos + 7 <= adts.len() {
                 let hdr = crate::parse_adts(&adts[pos..]).unwrap();
                 let au = &adts[pos + hdr.header_len..pos + hdr.frame_length];
-                if let Frame::Audio(a) = dec.decode(au, None).unwrap() {
-                    got |= !a.planes[0].is_empty();
-                }
+                got |= !dec.decode(au, None).unwrap().samples.is_empty();
                 pos += hdr.frame_length;
             }
             assert!(got, "bitrate {kbps}: no decodable audio");
@@ -2495,18 +2450,10 @@ mod tests {
         for i in 0..n {
             let s =
                 ((i as f64 * 2.0 * std::f64::consts::PI * 440.0 / sr as f64).sin() * 0.5) as f32;
-            interleaved.extend_from_slice(&s.to_le_bytes());
+            interleaved.push(s);
         }
-        let frame = Frame::Audio(AudioFrame {
-            sample_rate: sr,
-            channels: 1,
-            format: SampleFormat::F32,
-            planes: vec![interleaved],
-            samples: n,
-            pts: Some(0),
-        });
-        let mut enc = AacEncoder::new();
-        enc.send_frame(&frame).unwrap();
+        let mut enc = AacEncoder::default();
+        enc.push_pcm(&interleaved, 1, sr).unwrap();
         let adts = encode_to_adts(&mut enc);
         let dir = std::env::temp_dir();
         std::fs::write(dir.join("rff_aac_tone.aac"), &adts).unwrap();
@@ -2534,18 +2481,10 @@ mod tests {
                 let env = (1.0 - k as f64 / 700.0).max(0.0);
                 v += 0.8 * env * (2.0 * std::f64::consts::PI * 3500.0 * k as f64 / sr as f64).sin();
             }
-            interleaved.extend_from_slice(&(v as f32).to_le_bytes());
+            interleaved.push(v as f32);
         }
-        let mut enc = AacEncoder::new();
-        enc.send_frame(&Frame::Audio(AudioFrame {
-            sample_rate: sr,
-            channels: 1,
-            format: SampleFormat::F32,
-            planes: vec![interleaved],
-            samples: n,
-            pts: Some(0),
-        }))
-        .unwrap();
+        let mut enc = AacEncoder::default();
+        enc.push_pcm(&interleaved, 1, sr).unwrap();
         let adts = encode_to_adts(&mut enc);
         let dir = std::env::temp_dir();
         std::fs::write(dir.join("rff_aac_transient.aac"), &adts).unwrap();
@@ -2569,19 +2508,11 @@ mod tests {
             let bass = 0.4 * (2.0 * std::f64::consts::PI * 300.0 * t).sin(); // shared → M/S
             let l = bass + 0.2 * (2.0 * std::f64::consts::PI * 1200.0 * t).sin();
             let r = bass + 0.2 * (2.0 * std::f64::consts::PI * 1900.0 * t).sin();
-            interleaved.extend_from_slice(&(l as f32).to_le_bytes());
-            interleaved.extend_from_slice(&(r as f32).to_le_bytes());
+            interleaved.push(l as f32);
+            interleaved.push(r as f32);
         }
-        let mut enc = AacEncoder::new();
-        enc.send_frame(&Frame::Audio(AudioFrame {
-            sample_rate: sr,
-            channels: 2,
-            format: SampleFormat::F32,
-            planes: vec![interleaved],
-            samples: n,
-            pts: Some(0),
-        }))
-        .unwrap();
+        let mut enc = AacEncoder::default();
+        enc.push_pcm(&interleaved, 2, sr).unwrap();
         let adts = encode_to_adts(&mut enc);
         let dir = std::env::temp_dir();
         std::fs::write(dir.join("rff_aac_stereo.aac"), &adts).unwrap();

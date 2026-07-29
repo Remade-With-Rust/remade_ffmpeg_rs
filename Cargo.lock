@@ -4840,6 +4840,7 @@ version = "0.0.1"
 dependencies = [
  "rff-codec",
  "rff-core",
+ "rusty_aac",
 ]
 
 [[package]]
@@ -4904,6 +4905,7 @@ version = "0.0.1"
 dependencies = [
  "rff-codec",
  "rff-core",
+ "rusty_mp3",
 ]
 
 [[package]]
@@ -4964,6 +4966,7 @@ version = "0.0.1"
 dependencies = [
  "rff-codec",
  "rff-core",
+ "rusty_vp9",
 ]
 
 [[package]]
@@ -5364,6 +5367,10 @@ version = "0.1.23"
 source = "git+https://github.com/Remade-With-Rust/rusty-opus?rev=77a838fe21ba6916860c942248136cdda4bed2bc#77a838fe21ba6916860c942248136cdda4bed2bc"
 
 [[package]]
+name = "rusty_aac"
+version = "0.1.0"
+
+[[package]]
 name = "rusty_h264"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5413,6 +5420,14 @@ dependencies = [
  "rusty_h264-accel",
  "rusty_h264-common",
 ]
+
+[[package]]
+name = "rusty_mp3"
+version = "0.1.0"
+
+[[package]]
+name = "rusty_vp9"
+version = "0.1.0"
 
 [[package]]
 name = "ryu"

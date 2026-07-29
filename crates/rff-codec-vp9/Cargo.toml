@@ -1,6 +1,6 @@
 [package]
 name = "rff-codec-vp9"
-description = "Remade FFmpeg (Rust): in-house pure-Rust VP9 decoder (no C/FFI)."
+description = "Remade FFmpeg (Rust): VP9 codec, backed by the in-house pure-Rust rusty_vp9 engine (no C/FFI)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 rff-core.workspace = true
 rff-codec.workspace = true
+rusty_vp9.workspace = true
 
 [dev-dependencies]
 # Benchmark uses internal crates only — no third-party harness — so it adds

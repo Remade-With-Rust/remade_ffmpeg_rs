@@ -10,7 +10,7 @@
 //! they're derived later by the Huffman stage — so this parser only reads the
 //! bits that are actually present.
 
-use rff_core::{Error, Result};
+use crate::{Error, Result};
 
 use crate::bitio::BitReader;
 use crate::frame::{BlockType, SideInfo};

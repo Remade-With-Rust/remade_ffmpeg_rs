@@ -122,7 +122,7 @@ impl HuffBook {
     }
 
     /// Encode side: the `(codeword, bit-length)` for symbol index `idx` (the
-    /// inverse of [`decode_index`]). The empty book (table 0) codes index 0 as a
+    /// inverse of [`decode_index`](Self::decode_index)). The empty book (table 0) codes index 0 as a
     /// zero-length word. Returns `None` if `idx` is outside the book.
     pub fn code_len(&self, idx: usize) -> Option<(u16, u8)> {
         if self.codes.is_empty() {

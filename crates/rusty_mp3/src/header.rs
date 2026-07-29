@@ -9,7 +9,7 @@
 //! From these fields we derive the frame size in bytes and the per-frame sample
 //! count, which the demux/packetizer needs to walk the stream.
 
-use rff_core::{Error, Result};
+use crate::{Error, Result};
 
 use crate::frame::ChannelMode;
 use crate::tables;
@@ -127,7 +127,7 @@ impl FrameHeader {
         })
     }
 
-    /// Serialize back to 4 bytes (encoder side) — the exact inverse of [`parse`].
+    /// Serialize back to 4 bytes (encoder side) — the exact inverse of [`parse`](Self::parse).
     pub fn to_bytes(&self) -> [u8; 4] {
         let mut h: u32 = 0x7FF << 21; // frame sync
         let version = match self.version {
