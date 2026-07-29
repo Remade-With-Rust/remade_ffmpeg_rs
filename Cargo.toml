@@ -124,16 +124,18 @@ rff-auth = { path = "crates/rff-auth", version = "0.0.1" }
 
 # Third-party (all permissive — MIT/Apache-2.0; CI-enforced by cargo-deny).
 # AV1 encode + decode come from our own rusty-av1-toolkit (BSD-2-Clause forks of
-# rav1e / rav1d). We alias them to `rusty_av1e` / `rusty_av1d` (the toolkit dir
-# names) via `package = …`, so the forks keep their upstream package names and
-# future upstream syncs stay clean. `default-features = false` drops the `asm`
-# feature (no nasm toolchain); the decoder keeps both bit depths and exposes the
-# native safe Rust API (`rust_api`, mirroring dav1d-rs) — the decode path stays
-# 100% safe Rust (no FFI/unsafe in our tree). Pinned to the toolkit's
-# `fix/no-asm-avx2-cpufeature` branch commit (a no-asm build fix — the asm-only
-# `CpuFeatureLevel` had no `AVX2` variant); re-pin to a main SHA once it merges.
-rusty_av1e = { git = "https://github.com/Remade-With-Rust/rusty-av1-toolkit", rev = "b471be0a8da4ee8b90017514bf11735fbacd5bfe", package = "rav1e", default-features = false }
-rusty_av1d = { git = "https://github.com/Remade-With-Rust/rusty-av1-toolkit", rev = "b471be0a8da4ee8b90017514bf11735fbacd5bfe", package = "rav1d", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+# rav1e / rav1d), now published on crates.io AS `rusty_av1e` / `rusty_av1d`
+# (the packages were renamed for publication — upstream owns the rav1e/rav1d
+# names — so no `package =` alias is needed anymore). This removed rff's last
+# git dependencies: the whole tree is registry-resolvable. `default-features =
+# false` drops the `asm` feature (no nasm toolchain — the published crates also
+# fixed av-scenechange's force-enabled asm, so no-asm truly needs no nasm); the
+# decoder keeps both bit depths and the native safe Rust API — the decode path
+# stays 100% safe Rust (no FFI/unsafe in our tree). The registry versions are
+# toolkit MAIN (the merged no-asm fix + the prom_av1e content-dispatch tier),
+# ahead of the old b471be0 branch pin.
+rusty_av1e = { version = "0.8.0", default-features = false }
+rusty_av1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 # png: pure-Rust PNG codec (MIT/Apache-2.0), DEFLATE via miniz_oxide/fdeflate.
 png = "0.17"
 # jpeg: pure-Rust JPEG decode (MIT/Apache) + encode (MIT/Apache AND IJG).
@@ -154,7 +156,7 @@ image-webp = "0.2"
 # code-identical, includes the CM1 mono-CELT fix "correct BAND_ALLOCATION row 10").
 # Dropping the git pin removes one git dep on rff's own path to crates.io
 # (crates.io rejects git dependencies). Bump the version on new fork releases.
-rusty_opus = { path = "../rusty-opus", package = "rusty-opus" }
+rusty_opus = { version = "0.1.24", package = "rusty-opus" }
 # lewton: pure-Rust Vorbis decoder (MIT/Apache-2.0) — decode only, no FFI.
 lewton = "0.10"
 # claxon: pure-Rust FLAC decoder (Apache-2.0) — decode only, no FFI.
