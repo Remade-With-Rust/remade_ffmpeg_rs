@@ -8,7 +8,7 @@
 //! against a real libvorbis blob. Floor/residue/mapping/mode configs are parsed and
 //! kept for later bricks (they must be read anyway to reach the framing bit).
 
-use rff_core::{Error, Result};
+use crate::{Error, Result};
 
 /// The embedded q4 / stereo / 44.1 kHz setup (packet 3), emitted verbatim + parsed.
 pub const SETUP_Q4_STEREO: &[u8] = include_bytes!("setup_q4_stereo.bin");

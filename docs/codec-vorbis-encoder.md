@@ -1,6 +1,6 @@
 # In-house Vorbis encoder — brick ledger + deployment plan
 
-An in-house **Ogg Vorbis I encoder** for `rff-codec-vorbis` — the last major
+An in-house **Ogg Vorbis I encoder** — now the standalone [`rusty_vorbis`](https://crates.io/crates/rusty_vorbis) crate (adapter: `rff-codec-vorbis`) — the last major
 **royalty-free** audio gap (we decode Vorbis via lewton; **no permissive-Rust
 Vorbis *encoder* exists anywhere**). Built brick by brick like the FLAC / MP3 /
 AAC encoders, validated against a decoder oracle + ffmpeg at every step.
@@ -120,7 +120,7 @@ true ABR/CBR reservoir, `lowpass`/`impulse` tuning.
 - **Spike (crux de-risked):** encoded `ffmpeg -c:a libvorbis -q:a 4` → parsed the Ogg
   pages → pulled the 3 header packets. ident = 30 B (v0, 2ch, 44100, br_nom 128k,
   blocksizes 256/2048), comment = 64 B, **setup = 4140 B** — embedded verbatim as
-  `crates/rff-codec-vorbis/src/setup_q4_stereo.bin`.
+  `crates/rusty_vorbis/src/setup_q4_stereo.bin`.
 - **`encode.rs` scaffold:** LSB-first `BitWriter` (opposite of AAC's MSB-first);
   `write_ident_header` / `write_comment_header` (byte-aligned LE records); the setup
   emitted verbatim; `VorbisEncoder` skeleton (buffers S16/F32 input per-channel, the

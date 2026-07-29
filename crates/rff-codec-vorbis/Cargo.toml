@@ -1,6 +1,6 @@
 [package]
 name = "rff-codec-vorbis"
-description = "Remade FFmpeg (Rust): Vorbis audio decoder (Ogg Vorbis)."
+description = "Remade FFmpeg (Rust): Vorbis codec adapter — lewton-backed decoder + the pure-Rust rusty_vorbis encoder (no C/FFI)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,13 +8,15 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-# `simd` (default) enables the runtime-detected AVX2 residue-VQ distance kernel on x86_64 —
-# a bit-exact `unsafe` block (no FMA, so it's byte-identical to the scalar path) with a scalar
-# fallback. `--no-default-features` gives a 100%-safe scalar build.
+# `simd` (default) enables rusty_vorbis's runtime-detected AVX2 residue-VQ distance
+# kernel on x86_64 — a bit-exact `unsafe` block (no FMA, so it's byte-identical to
+# the scalar path) with a scalar fallback. `--no-default-features` gives a
+# 100%-safe scalar build.
 default = ["simd"]
-simd = []
+simd = ["rusty_vorbis/simd"]
 
 [dependencies]
 rff-core.workspace = true
 rff-codec.workspace = true
 lewton.workspace = true
+rusty_vorbis.workspace = true

@@ -32,6 +32,7 @@ default-members = [
     "crates/rusty_vp9",
     "crates/rusty_mp3",
     "crates/rusty_aac",
+    "crates/rusty_vorbis",
     "crates/rff-codec-rawvideo",
     "crates/rff-format-wav",
     "crates/rff-format-y4m",
@@ -96,6 +97,7 @@ rff-codec-mp3 = { path = "crates/rff-codec-mp3", version = "0.0.1" }
 rusty_vp9 = { path = "crates/rusty_vp9", version = "0.1.0" }
 rusty_mp3 = { path = "crates/rusty_mp3", version = "0.1.0" }
 rusty_aac = { path = "crates/rusty_aac", version = "0.1.0" }
+rusty_vorbis = { path = "crates/rusty_vorbis", version = "0.1.0" }
 rff-codec-rawvideo = { path = "crates/rff-codec-rawvideo", version = "0.0.1" }
 # TEMPORARY C/FFI H.264 — deliberately NOT in default-members; opt-in only.
 rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.0.1" }
@@ -152,7 +154,7 @@ image-webp = "0.2"
 # code-identical, includes the CM1 mono-CELT fix "correct BAND_ALLOCATION row 10").
 # Dropping the git pin removes one git dep on rff's own path to crates.io
 # (crates.io rejects git dependencies). Bump the version on new fork releases.
-rusty_opus = { version = "0.1.23", package = "rusty-opus" }
+rusty_opus = { path = "../rusty-opus", package = "rusty-opus" }
 # lewton: pure-Rust Vorbis decoder (MIT/Apache-2.0) — decode only, no FFI.
 lewton = "0.10"
 # claxon: pure-Rust FLAC decoder (Apache-2.0) — decode only, no FFI.

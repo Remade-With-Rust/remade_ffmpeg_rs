@@ -6,7 +6,7 @@
 //! the class / subclass / masterbook structure. The exact reconstructed curve is returned so
 //! the caller divides it out of the spectrum to form a well-conditioned residue.
 
-use rff_core::{Error, Result};
+use crate::{Error, Result};
 
 use super::setup::{Codebook, Floor1};
 use super::BitWriter;

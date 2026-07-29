@@ -180,8 +180,8 @@ fn mdct_twiddles(n: usize) -> Option<&'static MdctTwiddles> {
 /// to lewton's IMDCT. The textbook N/4 method — fold the N real inputs to L=N/2 (TDAC), pack into
 /// M=N/4 complex with a pre-rotation, one **M-point** FFT, then a post-rotation unpacks the N/2
 /// coefficients (4× fewer FFT points than a length-N transform). The `2/M` (=`2/l`) Vorbis scale
-/// replaces AAC's `×2`; the cosine basis is identical, so this matches [`mdct_direct`] within f32
-/// rounding. `blocksize` is a power of two ≥ 4.
+/// replaces AAC's `×2`; the cosine basis is identical, so this matches `mdct_direct` (the
+/// test-only O(N²) oracle) within f32 rounding. `blocksize` is a power of two ≥ 4.
 pub fn mdct_forward(xw: &[f32]) -> Vec<f32> {
     let n = xw.len();
     let (l, m) = (n / 2, n / 4);

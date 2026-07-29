@@ -106,7 +106,7 @@ Sibling engines from the same effort:
 [`rusty_h264`](https://crates.io/crates/rusty_h264) (H.264/AVC),
 [`rusty_mp3`](https://crates.io/crates/rusty_mp3) (MP3),
 [`rusty_aac`](https://crates.io/crates/rusty_aac) (AAC-LC),
-[`rusty-opus`](https://crates.io/crates/rusty-opus) (Opus), and the
+[`rusty-opus`](https://crates.io/crates/rusty-opus) (Opus), [`rusty_vorbis`](https://crates.io/crates/rusty_vorbis) (Vorbis), and the
 [rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) (AV1).
 
 ## License
