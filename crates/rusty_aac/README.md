@@ -109,9 +109,11 @@ ground-up, permissively-licensed Rust rebuild of FFmpeg. Sister project:
 **[FFAI](https://github.com/Remade-With-Rust/FFAI)** — media for an AI-first
 world. More at **[github.com/remade-with-rust](https://github.com/remade-with-rust)**.
 
-Sibling codec crates: [`rusty_h264`](https://crates.io/crates/rusty_h264) (on
-crates.io), `rusty_vp9`, `rusty_mp3`, `rusty-opus`, and the rusty-av1-toolkit
-forks.
+Sibling codec crates: [`rusty_h264`](https://crates.io/crates/rusty_h264),
+[`rusty_vp9`](https://crates.io/crates/rusty_vp9),
+[`rusty_mp3`](https://crates.io/crates/rusty_mp3),
+[`rusty-opus`](https://crates.io/crates/rusty-opus), and the
+[rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) forks.
 
 ## License
 

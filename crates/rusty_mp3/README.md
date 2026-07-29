@@ -91,8 +91,11 @@ sister project **[FFAI](https://github.com/Remade-With-Rust/FFAI)** — media fo
 an AI-first world — and the rest of
 **[github.com/remade-with-rust](https://github.com/remade-with-rust)**, including
 the sibling codec crates
-[`rusty_h264`](https://crates.io/crates/rusty_h264) (on crates.io), `rusty_vp9`,
-`rusty_aac`, `rusty-opus`, and the rusty-av1-toolkit forks.
+[`rusty_h264`](https://crates.io/crates/rusty_h264),
+[`rusty_vp9`](https://crates.io/crates/rusty_vp9),
+[`rusty_aac`](https://crates.io/crates/rusty_aac),
+[`rusty-opus`](https://crates.io/crates/rusty-opus), and the
+[rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) forks.
 
 ## License
 

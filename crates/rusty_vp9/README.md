@@ -103,9 +103,11 @@ world — and the org page
 **[github.com/remade-with-rust](https://github.com/remade-with-rust)**.
 
 Sibling engines from the same effort:
-[`rusty_h264`](https://crates.io/crates/rusty_h264) (H.264/AVC), `rusty_mp3`
-(MP3), `rusty_aac` (AAC-LC), `rusty-opus` (Opus), and the rusty-av1-toolkit
-(AV1).
+[`rusty_h264`](https://crates.io/crates/rusty_h264) (H.264/AVC),
+[`rusty_mp3`](https://crates.io/crates/rusty_mp3) (MP3),
+[`rusty_aac`](https://crates.io/crates/rusty_aac) (AAC-LC),
+[`rusty-opus`](https://crates.io/crates/rusty-opus) (Opus), and the
+[rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) (AV1).
 
 ## License
 

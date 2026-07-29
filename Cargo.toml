@@ -148,12 +148,11 @@ image-webp = "0.2"
 # AVX2 SILK kernels (~+30% vs the pre-fork scalar baseline) + AVX2 decode kernels
 # (resampler FIR, CELT comb filter) + frame-parallel encoding (~3× libopus wall-clock,
 # PEAQ-neutral).
-# Pinned to a git rev that INCLUDES the CM1 mono-CELT fix (fork commit a69cb2d,
-# "correct BAND_ALLOCATION row 10"), now published on the fork's origin/main — so the
-# earlier TEMP local-path override is no longer needed and main builds standalone.
-# Do NOT revert to `rev = a0b671a`: it pre-dates that fix and re-breaks mono.
-# Bump on new fork commits.
-rusty_opus = { git = "https://github.com/Remade-With-Rust/rusty-opus", rev = "77a838fe21ba6916860c942248136cdda4bed2bc", package = "rusty-opus" }
+# Now consumed from crates.io (v0.1.23 == fork rev 77a838f + publish metadata;
+# code-identical, includes the CM1 mono-CELT fix "correct BAND_ALLOCATION row 10").
+# Dropping the git pin removes one git dep on rff's own path to crates.io
+# (crates.io rejects git dependencies). Bump the version on new fork releases.
+rusty_opus = { version = "0.1.23", package = "rusty-opus" }
 # lewton: pure-Rust Vorbis decoder (MIT/Apache-2.0) — decode only, no FFI.
 lewton = "0.10"
 # claxon: pure-Rust FLAC decoder (Apache-2.0) — decode only, no FFI.
