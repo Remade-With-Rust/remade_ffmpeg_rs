@@ -188,6 +188,7 @@ async fn transcode(
             filter_complex: req.filter_complex,
             maps: Vec::new(),
             overwrite: req.overwrite,
+            max_video_frames: None,
         }],
     };
 
