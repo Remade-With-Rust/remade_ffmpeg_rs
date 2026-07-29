@@ -1,6 +1,6 @@
 # In-house AAC-LC encoder — brick ledger
 
-An in-house **AAC Low Complexity encoder** for `rff-codec-aac` — the highest-value
+An in-house **AAC Low Complexity encoder** for `rusty_aac` (the standalone crate behind `rff-codec-aac`) — the highest-value
 codec gap (dominant audio for MP4/HLS/streaming). Built brick by brick like the
 FLAC + MP3 encoders. Composes ~60% reused code: the AAC **decoder** supplies the
 body, the MP3 **encoder** supplies the brain.

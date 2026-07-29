@@ -5,7 +5,7 @@ then into a **good-sounding** one. This document enumerates every primitive the
 encoder needs as a numbered **brick**, classifies how each is obtained and
 verified, and orders the work so we can come back to it over months.
 
-The decode side of `rff-codec-mp3` is **bit-exact vs FFmpeg**. That is the whole
+The decode side of `rusty_mp3` (formerly `rff-codec-mp3`) is **bit-exact vs FFmpeg**. That is the whole
 strategy here: the encoder is largely the *inverse* of code we already trust, and
 **our own decoder is the verification oracle**. Almost every mechanical brick is
 provable by a round-trip (`encode → decode → compare`) without reaching for an
@@ -51,7 +51,7 @@ The bricks every floor rests on. Several already exist on the decode side and ar
 reused verbatim; the rest are new forward-direction data.
 
 - **N1 [done]** Scalefactor-band offsets — `SFB_OFFSET_LONG_V1` / `SHORT_V1`
-  ([tables.rs](../crates/rff-codec-mp3/src/tables.rs)). Shared, validated.
+  ([tables.rs](../crates/rusty_mp3/src/tables.rs)). Shared, validated.
 - **N2 [done]** `SCALEFAC_COMPRESS_V1` → (slen1, slen2); `PRETAB`. Shared.
 - **N3 [done]** Huffman codebooks `(code, len)` — `decode/codebooks.rs`,
   ISO-canonical and already proven by the bit-exact decoder. The encoder reuses
@@ -84,13 +84,13 @@ reference needed. This is where to start: highest certainty, zero psychoacoustic
 judgement.
 
 - **L1 [ALG]** Analysis filterbank `analyze(pcm, fifo) -> [[f32; 18]; 32]`
-  ([filterbank.rs](../crates/rff-codec-mp3/src/encode/filterbank.rs)). 18 passes
+  ([filterbank.rs](../crates/rusty_mp3/src/encode/filterbank.rs)). 18 passes
   per granule: shift 32 new samples into the 512-tap FIFO, window with `C[]` (N5),
   fold 512→64, apply `M` (N6) to get 32 subbands.
   **Verify:** feed white noise through `analyze` → decoder's synthesis filterbank;
   reconstruct the input within the filterbank's known delay + float epsilon.
 - **L2 [ALG]** Forward MDCT `forward(subbands, block_type, overlap) -> [f32; 576]`
-  ([mdct.rs](../crates/rff-codec-mp3/src/encode/mdct.rs)). One 36-pt MDCT/subband
+  ([mdct.rs](../crates/rusty_mp3/src/encode/mdct.rs)). One 36-pt MDCT/subband
   for long/start/stop, three 12-pt for short; carry overlap; frequency-invert odd
   subbands; mixed blocks keep subbands 0–1 long.
   **Verify:** `forward` → decoder's antialias⁻¹/IMDCT → exact reconstruction
@@ -111,7 +111,7 @@ matching decoder parser.
   value→`(code, len)` lookup per table (34 big-value + 2 count1 quad tables).
   **Verify:** for every table, every decodable symbol encodes to bits the decoder
   reads back to the same symbol (exhaustive).
-- **B2 [ALG]** `estimate_bits(coeffs, table)` ([huffman.rs](../crates/rff-codec-mp3/src/encode/huffman.rs))
+- **B2 [ALG]** `estimate_bits(coeffs, table)` ([huffman.rs](../crates/rusty_mp3/src/encode/huffman.rs))
   — sum codeword + linbits + sign lengths for a region under a table, **without
   emitting**. The quantizer's inner-loop cost oracle.
   **Verify:** equals the actual emitted bit count from B3 for random regions.
@@ -123,7 +123,7 @@ matching decoder parser.
   the implied short split, and per-region `table_select`, minimising B2 cost.
   **Verify:** decoder re-derives the same boundaries; total bits match the choice.
 - **B5 [ALG]** Side-info serializer — the exact inverse of
-  [decode/sideinfo.rs](../crates/rff-codec-mp3/src/decode/sideinfo.rs): write
+  [decode/sideinfo.rs](../crates/rusty_mp3/src/decode/sideinfo.rs): write
   `main_data_begin`, `scfsi`, and every per-granule field at the right widths.
   **Verify:** `serialize(si)` → `sideinfo::parse` → struct-equal; bit accounting
   hits `side_info_len()*8` exactly (the parser's `debug_assert`).
@@ -132,7 +132,7 @@ matching decoder parser.
   1 (the band-major gotcha that broke decode — mirror it exactly).
   **Verify:** round-trips through `decode/scalefactors.rs`.
 - **B7 [ALG/GLUE]** Frame assembly + CRC `format(...)`
-  ([bitstream.rs](../crates/rff-codec-mp3/src/encode/bitstream.rs)): header
+  ([bitstream.rs](../crates/rusty_mp3/src/encode/bitstream.rs)): header
   (`to_bytes`, [done]) + optional CRC-16 + side info + padded main data.
   **Verify:** the decoder's `parse_frames` accepts it; frame size matches header.
 - **B8 [ALG]** Encoder bit reservoir: set `main_data_begin` from banked spare
@@ -151,16 +151,16 @@ This is the milestone where `ffmpeg -i in.wav -c:a mp3 out.mp3` first works and
 
 - **C1 [ALG]** Trivial psymodel: always-long blocks, flat/constant masking
   threshold, perceptual-entropy = signal energy. Satisfies the `PsyResult`
-  contract ([psychoacoustic.rs](../crates/rff-codec-mp3/src/encode/psychoacoustic.rs))
+  contract ([psychoacoustic.rs](../crates/rusty_mp3/src/encode/psychoacoustic.rs))
   with zero research risk.
 - **C2 [ALG]** Rate-only quantizer (inner loop only)
-  ([quantize.rs](../crates/rff-codec-mp3/src/encode/quantize.rs)): binary-search
+  ([quantize.rs](../crates/rusty_mp3/src/encode/quantize.rs)): binary-search
   `global_gain` so the B2-estimated bits fit the granule budget; flat scalefactors;
   no distortion loop. Fills `GranuleSideInfo`.
   **Verify:** emitted bits ≤ budget; output decodes; round-trip PCM is recognisably
   the input (bounded error, not bit-exact).
 - **C3 [GLUE]** `Encoder::send_frame` / `receive_packet`
-  ([lib.rs](../crates/rff-codec-mp3/src/lib.rs)): accumulate 1152 samples/channel,
+  ([lib.rs](../crates/rusty_mp3/src/lib.rs)): accumulate 1152 samples/channel,
   call `encode_frame`, queue the `Packet`; flush the tail.
 - **C4 [E2E]** Pipeline gate: `wav → our encoder → our decoder → PCM` under a
   loose PSNR floor, **and** the `.mp3` decodes in stock FFmpeg without error. The

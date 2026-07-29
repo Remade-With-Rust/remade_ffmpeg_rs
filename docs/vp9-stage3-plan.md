@@ -193,7 +193,7 @@ Wrap `keyframe.vp9` in an IVF and decode with a static ffmpeg, then diff planes:
 ```
 # build IVF: DKIF hdr + (size u32le, ts u64) + frame; pix_fmt gbrp for sRGB 4:4:4
 ffmpeg -i keyframe.ivf -f rawvideo -pix_fmt gbrp ref.raw
-cargo test -p rff-codec-vp9 dump_keyframe_planes -- --ignored   # writes my_plane{0,1,2}.raw
+cargo test -p rusty_vp9 dump_keyframe_planes -- --ignored   # writes my_plane{0,1,2}.raw
 # compare my_plane[i] to ref plane i (G,B,R); per-8×8 heatmap localises any mismatch
 ```
 

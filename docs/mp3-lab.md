@@ -24,7 +24,7 @@ deterministic corpus, named variants, repeatable reports.
 
 ## The pieces
 
-All under [`crates/rff-codec-mp3/src/lab/`](../crates/rff-codec-mp3/src/lab/):
+All under [`crates/rusty_mp3/src/lab/`](../crates/rusty_mp3/src/lab/):
 
 - **`bricks.rs`** — the canonical manifest of all 35 bricks (id, phase, class,
   verification regime, status). The slice order *is* the build order, so
@@ -45,7 +45,7 @@ All under [`crates/rff-codec-mp3/src/lab/`](../crates/rff-codec-mp3/src/lab/):
 ## Using it
 
 ```sh
-cd crates/rff-codec-mp3
+cd crates/rusty_mp3
 F="--features lab --example mp3lab"
 
 cargo run -q $F -- bricks            # status table of every brick + the tally

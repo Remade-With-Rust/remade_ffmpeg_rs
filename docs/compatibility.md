@@ -124,6 +124,6 @@ target of pool licensing.
 
 If a patent-clean default artifact matters for your use, you can **gate H.264
 and/or AAC out** behind a Cargo feature (they live in their own
-`rff-codec-h264` / `rff-codec-aac` crates), or obtain a pool license.
+`rff-codec-h264` / `rff-codec-aac` adapter crates — the cores are the standalone `rusty_h264` / `rusty_aac`), or obtain a pool license.
 **Commercial deployments should consult IP counsel** — this section is
 engineering context, not legal advice.

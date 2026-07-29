@@ -28,9 +28,9 @@ using fixed codebooks — not a bit-budget search.
 |---|---|---|
 | **Ogg container (mux)** | `rff-format-ogg::OggMuxer` | ✅ done — takes the 3 headers as extradata + pages the audio packets |
 | **Decode oracle** | `lewton` (dep, pure-Rust, MIT/Apache) | ✅ `read_header_{ident,setup}` + `read_audio_packet` — our encode → lewton decode gate, and a reference for the setup format |
-| **Forward MDCT + FFT** | `rff-codec-aac::dsp::{mdct_fast, fft}` | ⚠️ reuse the O(N log N) engine; **re-match Vorbis's MDCT normalization/phase** (TDAC vs lewton's imdct) |
-| Psy concepts (masking, Bark spread) | `rff-codec-aac::encode` | ⚠️ adapt — in Vorbis the *floor IS* the masking curve |
-| Frame-parallel encode (`std::thread::scope`) | `rff-codec-aac::encode::encode_stream` | ✅ pattern reuses verbatim (frames independent) |
+| **Forward MDCT + FFT** | `rusty_aac::dsp::{mdct_fast, fft}` | ⚠️ reuse the O(N log N) engine; **re-match Vorbis's MDCT normalization/phase** (TDAC vs lewton's imdct) |
+| Psy concepts (masking, Bark spread) | `rusty_aac::encode` | ⚠️ adapt — in Vorbis the *floor IS* the masking curve |
+| Frame-parallel encode (`std::thread::scope`) | `rusty_aac::encode::encode_stream` | ✅ pattern reuses verbatim (frames independent) |
 | MD5 / bit primitives | mp3/flac | ✅ concepts |
 
 **Must build new:** LSB-first bit writer, codebook *encode* tables (VQ + scalar,
