@@ -4,6 +4,40 @@ Everything this fork does differently from upstream `jpeg-decoder` 0.3.2 and
 `jpeg-encoder` 0.7.0. Keep this current — it is what makes re-syncing with
 upstream possible.
 
+## 0.1.6
+
+Five codec improvements. The two bitstream-changing ones are gated on a corpus
+BD-rate over 5 quality points and 3 content types, plus an ffmpeg round-trip.
+
+- **Chroma is box-averaged when downsampling, not decimated.** `get_block` took
+  only the top-left sample of each subsampling box and discarded the other
+  three, aliasing every chroma frequency above the subsampled Nyquist into the
+  baseband. The tell: on saturated chroma edges, PSNR sat FLAT at ~14.1 dB from
+  quality 50 to 95 while the file grew 45 KB -> 83 KB. Error that does not
+  respond to bitrate is not quantization error. **BD-rate -17.12% on chroma
+  detail, -0.43% on photographic content, +2.30 dB on chroma edges** — better
+  quality AND fewer bits, no content regressing.
+
+- **Trellis quantization**, on by default. Chooses where each block's EOB falls
+  using real Huffman code lengths and real squared error, instead of keeping
+  every coefficient rounding produced. Lambda swept against the harness rather
+  than asserted: **-3.14% BD-rate for +3.1% encode time**.
+
+- **Interleaved scans with optimized Huffman tables.** Which encode route ran
+  was decided purely on an internal memory budget, so `-optimize_huffman`
+  emitted one scan PER COMPONENT at every practical resolution — a layout
+  mainstream encoders never produce. Now always interleaved, without paying the
+  streaming route's ~23% cost.
+
+- **NEON quantize kernel for aarch64.** The encoder was AVX2-only, so ARM ran the
+  scalar path and the crate's speed claim was silently x86-only. The forward DCT
+  remains scalar on ARM — deliberately, rather than shipping a 500-line kernel
+  that has never executed.
+
+- **Fuzzing.** A `fuzz/` crate with three cargo-fuzz targets, plus deterministic
+  robustness tests that run on stable in ordinary CI. Baseline: 80,000 malformed
+  inputs, 38,192 decoded, 41,808 cleanly rejected, **zero panics**.
+
 ## 0.1.5
 
 Housekeeping only, no behaviour change: drops the `Worker::fused_block` trait

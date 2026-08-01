@@ -81,14 +81,14 @@ pub(crate) fn truncate_rd(
     // Rate of keeping the first k non-zeros, symbols only (EOB added later).
     // Walking forward once gives every prefix.
     let mut prefix = [0u32; 64];
-    let mut run = 0u32;
     let mut acc = 0u32;
+    // `prev` starts at the DC position, so `p - prev - 1` is the zero-run before
+    // the first AC coefficient as well as every later one — no special case.
     let mut prev = 0usize;
     for k in 0..nnz {
         let p = pos[k] as usize;
-        run = (p - prev) as u32 - if k == 0 { 1 } else { 1 };
         // Zero-runs longer than 15 need a ZRL symbol each.
-        let mut r = run;
+        let mut r = (p - prev - 1) as u32;
         while r > 15 {
             acc += bits(0xF0);
             r -= 16;

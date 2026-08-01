@@ -54,7 +54,20 @@ choice:
   1.072 for the same build, and the paired test has been the conservative and
   reproducible number every time, so that is what we publish.
 
-Where the speed comes from, all gated on byte-identical output:
+### Compression, not just speed
+
+- **Chroma is box-averaged on downsample.** Point-sampling — taking one of every
+  four chroma samples — aliases detail above the subsampled Nyquist into the
+  baseband, and no bitrate recovers it. BD-rate **-17.12%** on chroma-detailed
+  content, **+2.30 dB** on saturated chroma edges, neutral on smooth photos.
+- **Trellis quantization** (on by default) picks each block's EOB position with
+  a real rate model instead of keeping whatever rounding produced: **-3.14%
+  BD-rate for +3.1% encode time**.
+
+Both are gated on a corpus BD-rate across 5 quality points and 3 content types
+plus an ffmpeg round-trip — never a single operating point.
+
+### Where the decode speed comes from, all gated on byte-identical output:
 
 - an **AVX2 forward-DCT + quantize** kernel in the encoder;
 - an **AVX2 IDCT that transforms two 8×8 blocks per instruction stream**
