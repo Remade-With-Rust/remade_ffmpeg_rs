@@ -1012,6 +1012,57 @@ Every one is gated byte-identical on six fixtures. The remaining ~6% would need
 hand-written assembly for the entropy symbol loop -- entropy is ~30% of decode at
 ~14 cycles/symbol, already at the floor for a portable implementation.
 
+## D5h - hand-written assembly: REFUTED on a measured ceiling, before writing any
+
+First time this descent has been pointed at an *assembly* question. The whole
+thing took one probe and no assembly.
+
+- **D1, the bar, computed first (Sec.11):** entropy is 30% of decode, and the
+  decoder sits at 1.039x vs ffmpeg. To reach the 10% goal from there, asm must
+  make entropy **1.35x faster** -- ~14 cyc/symbol down to ~10.4. Anything less
+  cannot close it however good the assembly is.
+
+- **D5, the mechanism probe** (`examples/entropy_probe.rs`). The question asm
+  turns on is what BOUND the loop is under, because that decides whether
+  instruction selection can help at all:
+
+  | quantity | cyc/symbol | spread over 15 reps |
+  |---|---:|---:|
+  | dependent-load chain (the serialisation the decoder inherits) | **3.48** | 1.18x |
+  | same loads, independent -> pipelined | 0.64 | - |
+  | peek + LUT + consume + refill | **9.53** | 1.13x |
+  | **+ run expansion, zig-zag walk, coefficient store** | **14.88** | 1.10x |
+  | **production decoder, in-context (ablation)** | **~14.00** | - |
+
+- **ANSWER, and it is a clean refutation.** The loop is **not** latency-bound --
+  the unavoidable chain is only 3.48 of ~14 cycles, so ~75% is issue-limited
+  work, which is exactly the regime where asm normally pays. But the last row is
+  what settles it: a **stripped-down idealised loop** doing only the essential
+  work -- no error handling, no marker detection, no EOB run, no restart markers,
+  no bounds checks beyond masks -- costs **14.88 cyc/symbol**, and production
+  already runs at **~14.00**.
+
+  **The production loop is at the cost of its own essential operations.** The
+  6 cycles above the dependency chain are REQUIRED instructions, not slack.
+  Assembly cannot delete work that has to happen; its upside here is scheduling
+  a loop already priced at its floor. Nowhere near 1.35x.
+
+- **CROSS-CHECK on the premise.** The assumption that "libjpeg-turbo is faster
+  because its Huffman decoder is assembly" is **wrong**: libjpeg-turbo's SIMD
+  covers IDCT, colour conversion, upsampling, quantization, and Huffman
+  *encode* -- the decoder's entropy path is C. Neither it nor ffmpeg hand-writes
+  asm for JPEG Huffman DECODE. Their speed is bit-reader design, which we already
+  have (64-bit reservoir, bulk 8-byte refill, combined run/value LUT).
+
+- **STATUS: refuted on a ceiling, ~30 minutes of probing, zero assembly written.**
+  The three varied probes (chain decomposition, idealised-floor comparison,
+  level-above arithmetic) all agree. Recorded so the idea is not re-litigated.
+
+- **The probe is kept** as `examples/entropy_probe.rs`. It reports its own
+  min->max spread and refuses to be quoted when unstable -- an earlier run of it
+  produced 32.8 where best-of-15 gives 14.88, and a single-rep read would have
+  manufactured a 2x "headroom" that does not exist.
+
 ---
 
 ## Standing rules for this descent
