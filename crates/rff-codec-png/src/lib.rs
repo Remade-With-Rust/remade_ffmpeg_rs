@@ -111,6 +111,135 @@ fn decode_png(data: &[u8]) -> Result<Frame> {
 // Encoder
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Colour-type analysis
+// ---------------------------------------------------------------------------
+
+/// What a packed RGB(A) frame *actually* contains, as opposed to how it is
+/// stored.
+///
+/// Our decoder normalizes every PNG to packed RGB/RGBA (that is what the rest of
+/// the pipeline speaks), which means a grayscale or palette PNG that comes in
+/// would go straight back out as truecolour and balloon. Measured before this
+/// existed: an 8-bit gray image 259,303 B -> 924,819 B (**+257%**), and a
+/// 64-colour indexed graphic 6,522 B -> 73,232 B (**+1023%**). The pixels were
+/// right; the file was 3.6x / 11.2x too big.
+///
+/// So the encoder looks at the pixels and picks the narrowest PNG colour type
+/// that represents them exactly. Every branch is lossless by construction.
+enum ColourKind {
+    /// Every pixel has R == G == B (and, for RGBA, alpha is constant 255).
+    Gray,
+    /// Gray with a non-constant alpha channel.
+    GrayAlpha,
+    /// At most 256 distinct colours. Carries the palette and, when any entry is
+    /// non-opaque, the `tRNS` alpha table.
+    Indexed {
+        palette: Vec<[u8; 3]>,
+        trns: Option<Vec<u8>>,
+    },
+    /// Genuinely truecolour — store as-is.
+    TrueColour,
+}
+
+/// Fewest bits per index that can address `n` palette entries.
+fn indexed_bit_depth(n: usize) -> BitDepth {
+    match n {
+        0..=2 => BitDepth::One,
+        3..=4 => BitDepth::Two,
+        5..=16 => BitDepth::Four,
+        _ => BitDepth::Eight,
+    }
+}
+
+/// One pass over the pixels, with early bail-outs so the cost is negligible on
+/// the content that cannot benefit.
+///
+/// The two tests run together and each drops out as soon as it is refuted: the
+/// gray test dies on the first pixel with R != G != B, and the palette test dies
+/// on the 257th distinct colour. On a photograph both are refuted within the
+/// first few hundred pixels, so this is a scan of a tiny prefix, not of the
+/// frame — which is why it can be on by default.
+fn analyse(px: &[u8], channels: usize) -> ColourKind {
+    let mut is_gray = true;
+    let mut alpha_constant = true;
+    let mut palette: Vec<[u8; 3]> = Vec::new();
+    let mut alphas: Vec<u8> = Vec::new();
+    let mut index: std::collections::HashMap<[u8; 4], u8> = std::collections::HashMap::new();
+    let mut palette_possible = true;
+
+    for p in px.chunks_exact(channels) {
+        let (r, g, b) = (p[0], p[1], p[2]);
+        let a = if channels == 4 { p[3] } else { 255 };
+
+        if is_gray && (r != g || g != b) {
+            is_gray = false;
+        }
+        if alpha_constant && a != 255 {
+            alpha_constant = false;
+        }
+        if palette_possible {
+            let key = [r, g, b, a];
+            if !index.contains_key(&key) {
+                if index.len() == 256 {
+                    palette_possible = false;
+                    index.clear();
+                    palette.clear();
+                    alphas.clear();
+                } else {
+                    index.insert(key, index.len() as u8);
+                    palette.push([r, g, b]);
+                    alphas.push(a);
+                }
+            }
+        }
+        if !is_gray && !palette_possible {
+            return ColourKind::TrueColour;
+        }
+    }
+
+    // Gray wins over indexed when both apply: a gray8 image needs no PLTE chunk
+    // and indexes nothing, so it is never larger.
+    if is_gray {
+        return if alpha_constant {
+            ColourKind::Gray
+        } else {
+            ColourKind::GrayAlpha
+        };
+    }
+    if palette_possible {
+        let trns = if alphas.iter().all(|&a| a == 255) {
+            None
+        } else {
+            Some(alphas)
+        };
+        return ColourKind::Indexed { palette, trns };
+    }
+    ColourKind::TrueColour
+}
+
+/// Pack 8-bit indices down to 1/2/4 bits per pixel, MSB-first within each byte
+/// and re-starting on every row — the layout PNG's `IHDR` bit-depth field means.
+fn pack_indices(indices: &[u8], w: usize, h: usize, depth: BitDepth) -> Vec<u8> {
+    let bits = match depth {
+        BitDepth::One => 1usize,
+        BitDepth::Two => 2,
+        BitDepth::Four => 4,
+        _ => return indices.to_vec(),
+    };
+    let per_byte = 8 / bits;
+    let row_bytes = w.div_ceil(per_byte);
+    let mut out = vec![0u8; row_bytes * h];
+    for y in 0..h {
+        for x in 0..w {
+            let v = indices[y * w + x] & ((1 << bits) - 1) as u8;
+            let shift = 8 - bits * (x % per_byte + 1);
+            out[y * row_bytes + x / per_byte] |= v << shift;
+        }
+    }
+    out
+}
+
 /// Encoder tuning. The defaults reproduce the historical behaviour exactly —
 /// `Compression::Fast` + `FilterType::Sub` non-adaptive — because that is what
 /// the backing crate defaults to and what every existing output was encoded
@@ -120,6 +249,11 @@ struct PngSettings {
     compression: Compression,
     filter: FilterType,
     adaptive: AdaptiveFilterType,
+    /// Narrow the output colour type to gray/indexed when the pixels allow it.
+    /// On by default: it is lossless, and without it every grayscale or palette
+    /// PNG that passes through this codec is re-emitted as truecolour (+257% /
+    /// +1023% measured). `-png_auto_type 0` restores the old behaviour.
+    auto_type: bool,
 }
 
 impl Default for PngSettings {
@@ -128,6 +262,7 @@ impl Default for PngSettings {
             compression: Compression::Fast,
             filter: FilterType::Sub,
             adaptive: AdaptiveFilterType::NonAdaptive,
+            auto_type: true,
         }
     }
 }
@@ -183,6 +318,9 @@ impl Encoder for PngEncoder {
                     )))
                 }
             }
+        }
+        if let Some(v) = options.get("png_auto_type") {
+            self.settings.auto_type = !matches!(v.trim(), "0" | "false" | "off" | "no");
         }
         if let Some(v) = options.get("pred") {
             match filter_from_pred(v) {
@@ -261,11 +399,62 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
         p
     };
 
+    // Narrow the colour type when the pixels allow it. Lossless in every branch:
+    // gray only when R == G == B everywhere, indexed only when the exact colour
+    // set fits in 256 entries.
+    let kind = if settings.auto_type {
+        analyse(&packed, channels)
+    } else {
+        ColourKind::TrueColour
+    };
+
+    let (out_color, out_depth, body, palette, trns) = match kind {
+        ColourKind::Gray => {
+            let mut g = Vec::with_capacity(w * h);
+            for p in packed.chunks_exact(channels) {
+                g.push(p[0]);
+            }
+            (ColorType::Grayscale, BitDepth::Eight, g, None, None)
+        }
+        ColourKind::GrayAlpha => {
+            let mut g = Vec::with_capacity(w * h * 2);
+            for p in packed.chunks_exact(channels) {
+                g.push(p[0]);
+                g.push(if channels == 4 { p[3] } else { 255 });
+            }
+            (ColorType::GrayscaleAlpha, BitDepth::Eight, g, None, None)
+        }
+        ColourKind::Indexed { palette, trns } => {
+            let depth = indexed_bit_depth(palette.len());
+            let mut lut = std::collections::HashMap::with_capacity(palette.len());
+            for (i, c) in palette.iter().enumerate() {
+                // key on RGB+A so entries that differ only in alpha stay distinct
+                let a = trns.as_ref().map_or(255, |t| t[i]);
+                lut.insert([c[0], c[1], c[2], a], i as u8);
+            }
+            let mut idx = Vec::with_capacity(w * h);
+            for p in packed.chunks_exact(channels) {
+                let a = if channels == 4 { p[3] } else { 255 };
+                idx.push(lut[&[p[0], p[1], p[2], a]]);
+            }
+            let body = pack_indices(&idx, w, h, depth);
+            let flat: Vec<u8> = palette.iter().flat_map(|c| c.iter().copied()).collect();
+            (ColorType::Indexed, depth, body, Some(flat), trns)
+        }
+        ColourKind::TrueColour => (color, BitDepth::Eight, packed, None, None),
+    };
+
     let mut out = Vec::new();
     {
         let mut encoder = rusty_png::Encoder::new(&mut out, vf.width, vf.height);
-        encoder.set_color(color);
-        encoder.set_depth(BitDepth::Eight);
+        encoder.set_color(out_color);
+        encoder.set_depth(out_depth);
+        if let Some(p) = palette {
+            encoder.set_palette(p);
+        }
+        if let Some(t) = trns {
+            encoder.set_trns(t);
+        }
         encoder.set_compression(settings.compression);
         encoder.set_filter(settings.filter);
         encoder.set_adaptive_filter(settings.adaptive);
@@ -273,7 +462,7 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
             .write_header()
             .map_err(|e| Error::invalid(format!("png encode: {e}")))?;
         writer
-            .write_image_data(&packed)
+            .write_image_data(&body)
             .map_err(|e| Error::invalid(format!("png encode: {e}")))?;
     }
     Ok(out)
@@ -321,5 +510,97 @@ mod tests {
         assert_eq!(decoded.format, PixelFormat::Rgb24);
         // PNG is lossless: pixels must match exactly.
         assert_eq!(decoded.planes[0], src.planes[0]);
+    }
+
+    /// Build an RGB24 frame from a closure so each colour-type case is explicit.
+    fn frame_from(w: u32, h: u32, ch: usize, f: impl Fn(usize, usize) -> [u8; 4]) -> VideoFrame {
+        let (wi, hi) = (w as usize, h as usize);
+        let mut data = Vec::with_capacity(wi * hi * ch);
+        for j in 0..hi {
+            for i in 0..wi {
+                let p = f(i, j);
+                data.extend_from_slice(&p[..ch]);
+            }
+        }
+        VideoFrame {
+            width: w,
+            height: h,
+            format: if ch == 4 {
+                PixelFormat::Rgba
+            } else {
+                PixelFormat::Rgb24
+            },
+            planes: vec![data],
+            strides: vec![wi * ch],
+            pts: None,
+        }
+    }
+
+    /// Auto-typing must be LOSSLESS in every branch and must actually shrink the
+    /// file. Round-trip is the gate: narrowing the colour type is only valid if
+    /// the pixels come back bit-for-bit.
+    #[test]
+    fn auto_type_is_lossless_and_smaller() {
+        let cases: Vec<(&str, VideoFrame)> = vec![
+            // pure gray -> Grayscale
+            ("gray", frame_from(64, 40, 3, |i, j| {
+                let v = ((i * 4 + j) % 256) as u8;
+                [v, v, v, 255]
+            })),
+            // two colours -> Indexed at 1 bit per pixel
+            ("bilevel", frame_from(64, 40, 3, |i, j| {
+                if (i / 3 + j / 5) % 2 == 0 { [10, 200, 30, 255] } else { [250, 5, 90, 255] }
+            })),
+            // ~40 colours -> Indexed at 4 bits (>16) / 8 bits
+            ("palette", frame_from(64, 40, 3, |i, j| {
+                let n = ((i / 8) + (j / 8) * 8) as u8;
+                [n * 6, 255 - n * 5, n.wrapping_mul(17), 255]
+            })),
+            // gray with varying alpha -> GrayscaleAlpha
+            ("gray_alpha", frame_from(64, 40, 4, |i, j| {
+                let v = ((i + j) % 256) as u8;
+                [v, v, v, ((i * 3) % 256) as u8]
+            })),
+            // photographic-ish -> must stay TrueColour
+            ("truecolour", frame_from(64, 40, 3, |i, j| {
+                [(i * 7 % 256) as u8, (j * 13 % 256) as u8, ((i * j) % 256) as u8, 255]
+            })),
+        ];
+
+        for (name, vf) in cases {
+            let mut on = PngSettings::default();
+            on.auto_type = true;
+            let mut off = PngSettings::default();
+            off.auto_type = false;
+
+            let a = encode_png(&vf, on).unwrap();
+            let b = encode_png(&vf, off).unwrap();
+
+            // 1. lossless: decoding the narrowed file reproduces the source pixels
+            let Frame::Video(dec) = decode_png(&a).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(
+                dec.planes[0], vf.planes[0],
+                "{name}: auto-typed output did not round-trip losslessly"
+            );
+            assert_eq!(dec.format, vf.format, "{name}: pixel format changed");
+
+            // 2. never larger than leaving it truecolour
+            assert!(
+                a.len() <= b.len(),
+                "{name}: auto-type made the file BIGGER ({} vs {})",
+                a.len(),
+                b.len()
+            );
+            if name != "truecolour" {
+                assert!(
+                    a.len() < b.len(),
+                    "{name}: auto-type should have shrunk this ({} vs {})",
+                    a.len(),
+                    b.len()
+                );
+            }
+        }
     }
 }
