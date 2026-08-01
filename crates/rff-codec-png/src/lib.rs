@@ -444,18 +444,24 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
         ColourKind::TrueColour => (color, BitDepth::Eight, packed, None, None),
     };
 
-    // Pre-size the output buffer.
+    // Pre-size the output buffer so it never reallocates.
     //
-    // The encoder builds the whole IDAT, then copies it into `out` through the
-    // generic `Write`. Starting `out` empty makes it double repeatedly on the
-    // way to (here) 17 MB, re-copying everything it already holds each time.
-    // Measured on an 8.3 MPx frame with the stage profiler: the chunk-write
-    // stage ran at 1.70 GB/s — far below memcpy — and pre-sizing took it from
-    // 14.755 ms to 6.247 ms (-58%), whole-encode 98.8 -> 82.7 ms.
+    // The encoder builds the whole IDAT then copies it into `out` through the
+    // generic `Write`; starting empty makes `out` double repeatedly on the way
+    // to (e.g.) 17 MB, re-copying what it already holds each time. The stage
+    // profiler measured that chunk-write at 1.70 GB/s — far below memcpy — and
+    // pre-sizing cut the stage from 14.755 ms to 6.247 ms on an 8.3 MPx frame.
     //
-    // `body.len() + 1024` is a real upper bound, not a guess: DEFLATE's stored
-    // mode is the worst case and expands by well under 1 KB of block headers at
-    // these sizes, so this reserves once and never grows.
+    // HONEST CAVEAT: that stage win does NOT show up end-to-end. Paired,
+    // ABBA-interleaved, byte-identical-output A/B against a pre-change binary:
+    // 1.017x / 0.982x / 0.983x / 0.974x at 0.4-2 MPx and 1.010x at 8.3 MPx —
+    // every one inside the 2.0-2.3% null-arm floor. So this is kept because it
+    // removes real redundant work and cannot change output, NOT because it
+    // makes anything measurably faster. Do not quote it as a speedup.
+    //
+    // `body.len() + 1024` is an upper bound, not a guess: DEFLATE's stored mode
+    // is the worst case and adds well under 1 KB of block headers at these
+    // sizes, so this reserves exactly once.
     let mut out = Vec::with_capacity(body.len() + 1024);
     {
         let mut encoder = rusty_png::Encoder::new(&mut out, vf.width, vf.height);

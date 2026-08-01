@@ -104,6 +104,49 @@ a result.
   demux and file read while timing our side in-process with none of those. The
   symmetric re-run is what decides this; do not quote P3.
 
+## D2b — the unexplained encode residue (SOLVED)
+
+- ASKED: at the shipped `Fast`/`Sub` default the profiler left **11–40%** of
+  encode unattributed (gfx_terminal 40.1%, ducks 18.1%, park_joy 17.9%), while
+  `Default`/`Best` left only 0.4–3.5%. What is it?
+- D6 FIRST — is it the profiler's own tax? Priced: 4,320 rows × 2 scopes × 2
+  `Instant` reads ≈ 17,280 calls ≈ **0.5 ms**, against a residue of **15.2 ms**.
+  Tax is ~3% of the residue. It is real work. Closed.
+- MEASURED: two regions had no scope — fdeflate's `finish()` (outside the
+  per-row loop) and `write_zlib_encoded_idat`. Scoping both collapsed the
+  residue to **2.9–3.7%**:
+
+  | image | filter | deflate | **enc.chunk** | enc.finish | residue |
+  |---|---:|---:|---:|---:|---:|
+  | park_joy | 4.1% | 77.0% | **16.1%** | 0.0% | 2.9% |
+  | ducks_take_off | 4.1% | 76.7% | **16.0%** | 0.0% | 3.2% |
+  | gfx_terminal | 7.2% | 77.0% | **12.1%** | 0.0% | 3.7% |
+  | gfx_uiart | 7.4% | 82.1% | **7.6%** | 0.0% | 2.9% |
+
+- ANSWER: the residue was **`write_zlib_encoded_idat`** — CRC32 plus the IDAT
+  write — at 7.6–16.1% of encode. `enc.finish` reads **0.0%**: that hypothesis
+  was refuted, cheaply, by one scope.
+- **D3 — which op inside it?** Split further: `enc.crc` = 1.630 ms for 17.28 MB
+  = **10.6 GB/s**, i.e. the hardware CRC32 path is working and is not the
+  problem. The remainder is `write_all`: 10.14 ms for 17.28 MB = **1.70 GB/s**,
+  far under memcpy — the signature of `Vec` reallocation growth.
+- **D5 — ceiling probe before building.** Pre-sizing the output `Vec` took the
+  stage from 14.755 ms to 6.247 ms (**−58%**).
+- **REBUILD GATE — and it FAILED at the level above.** Paired ABBA A/B of the
+  fixed binary against a pre-change binary, output byte-identical throughout:
+  **1.017× / 0.982× / 0.983× / 0.974×** at 0.4–2 MPx and **1.010×** at 8.3 MPx.
+  Every one inside the 2.0–2.3% null-arm floor.
+- VERDICT: **kept, but NOT as a speedup.** It removes genuinely redundant
+  copying and cannot alter output, so it stays; the whole-pipeline effect is
+  unmeasurable and must not be quoted. Reverting the *claim*, not the code.
+  Recorded as "delta sat inside the noise", not "measured worse".
+- LESSON: the −58% came from two single un-interleaved runs. The stage profiler
+  is fine for ATTRIBUTION (which stage owns the time) and untrustworthy for
+  DELTAS; those need the paired harness.
+- STATUS: closed. Consequence for the roadmap below: with the residue named,
+  encode is **77–82% deflate at `Fast`** and **94–99.5% at quality**, so nothing
+  outside DEFLATE can move the standing benchmark.
+
 ## Correctness findings (these outrank the descent)
 
 1. RGB path clean: 30/30 cross-checks pixel-exact — our PNG decoded by ffmpeg,
