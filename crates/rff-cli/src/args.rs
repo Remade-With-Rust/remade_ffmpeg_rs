@@ -71,6 +71,12 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut audio_codec: Option<CodecId> = None;
     let mut video_opts = Dictionary::new();
     let mut audio_opts = Dictionary::new();
+    // Options given WITHOUT a `:v`/`:a` stream specifier that more than one
+    // codec kind understands (FFmpeg treats `-compression_level` this way).
+    // Held aside and attached after parsing, once we know which codecs actually
+    // exist — attaching eagerly to both made every `-compression_level` on an
+    // image encode emit a spurious "audio options given without -c:a" warning.
+    let mut shared_opts = Dictionary::new();
     let mut max_video_frames: Option<u64> = None;
     let mut video_filters: Option<String> = None;
     let mut filter_complex: Option<String> = None;
@@ -210,8 +216,12 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                 }
             }
 
+            // `-pred` is PNG's filter/prediction knob (none/sub/up/avg/paeth/
+            // mixed), spelled as FFmpeg's PNG encoder spells it. Video-only by
+            // nature — no audio codec takes it.
             "crf" | "qp" | "preset" | "pass" | "q" | "qscale" | "cpu-used" | "speed"
-            | "lag" | "lag-in-frames" | "arnr-strength" | "dispatch-budget" => {
+            | "lag" | "lag-in-frames" | "arnr-strength" | "dispatch-budget"
+            | "pred" => {
                 let value = take_value(args, &mut i, arg)?;
                 if base == "pass" && value != "1" {
                     warnings
@@ -225,9 +235,23 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
 
             // Codec private / tuning options forwarded to the encoder's
             // `configure` Dictionary (audio by default; `:v` targets video).
-            // Includes Opus: -compression_level, -application, -vbr, and the R1
-            // frame-parallel controls -opus_parallel / -opus_warmup / -threads.
-            "compression_level" | "application" | "vbr" | "opus_parallel"
+            // `-compression_level` is not audio-only: FFmpeg treats it as a generic
+            // codec option, and PNG uses it (0..9) exactly as Opus does (0..10).
+            // Unscoped it must therefore reach BOTH sides, or
+            // `rff -i in.png -c:v png -compression_level 9 out.png` silently
+            // encodes at the default — which is what it used to do.
+            "compression_level" => {
+                let value = take_value(args, &mut i, arg)?;
+                match spec {
+                    Some(s) if s.starts_with('v') => video_opts.set(base, value),
+                    Some(s) if s.starts_with('a') => audio_opts.set(base, value),
+                    _ => shared_opts.set(base, value),
+                }
+            }
+
+            // Includes Opus: -application, -vbr, and the R1 frame-parallel
+            // controls -opus_parallel / -opus_warmup / -threads.
+            "application" | "vbr" | "opus_parallel"
             | "opus_warmup" | "threads" | "frame_duration" => {
                 let value = take_value(args, &mut i, arg)?;
                 match spec {
@@ -258,6 +282,17 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             warnings,
             action,
         });
+    }
+
+    // Attach the unscoped shared options to whichever codecs are actually
+    // present. An explicit `:v`/`:a` value already set above wins over these.
+    for (key, value) in shared_opts.iter() {
+        if video_codec.is_some() && video_opts.get(key).is_none() {
+            video_opts.set(key, value);
+        }
+        if audio_codec.is_some() && audio_opts.get(key).is_none() {
+            audio_opts.set(key, value);
+        }
     }
 
     // Warn about codec options that have no codec to attach to.

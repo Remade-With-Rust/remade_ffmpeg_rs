@@ -148,9 +148,9 @@ mod tests {
     /// A tiny but valid PNG (2×1, RGB) built with the `png` crate.
     fn tiny_png() -> Vec<u8> {
         let mut out = Vec::new();
-        let mut enc = png::Encoder::new(&mut out, 2, 1);
-        enc.set_color(png::ColorType::Rgb);
-        enc.set_depth(png::BitDepth::Eight);
+        let mut enc = rusty_png::Encoder::new(&mut out, 2, 1);
+        enc.set_color(rusty_png::ColorType::Rgb);
+        enc.set_depth(rusty_png::BitDepth::Eight);
         let mut w = enc.write_header().unwrap();
         w.write_image_data(&[1, 2, 3, 4, 5, 6]).unwrap();
         drop(w);

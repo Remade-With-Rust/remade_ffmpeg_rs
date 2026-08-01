@@ -33,6 +33,7 @@ default-members = [
     "crates/rusty_mp3",
     "crates/rusty_aac",
     "crates/rusty_vorbis",
+    "crates/rusty_png",
     "crates/rff-codec-rawvideo",
     "crates/rff-format-wav",
     "crates/rff-format-y4m",
@@ -136,8 +137,10 @@ rff-auth = { path = "crates/rff-auth", version = "0.0.1" }
 # ahead of the old b471be0 branch pin.
 rusty_av1e = { version = "0.8.0", default-features = false }
 rusty_av1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
-# png: pure-Rust PNG codec (MIT/Apache-2.0), DEFLATE via miniz_oxide/fdeflate.
-png = "0.17"
+# png: our own rusty_png — a performance fork of image-rs/image-png 0.17.16
+# (MIT/Apache-2.0), carried forward in-tree. DEFLATE via miniz_oxide/fdeflate,
+# with an opt-in pure-Rust `zlib-rs` backend. See crates/rusty_png/NOTICE.md.
+rusty_png = { path = "crates/rusty_png", version = "0.1.0" }
 # jpeg: pure-Rust JPEG decode (MIT/Apache) + encode (MIT/Apache AND IJG).
 jpeg-decoder = "0.3"
 jpeg-encoder = "0.7"

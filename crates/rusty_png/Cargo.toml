@@ -1,0 +1,92 @@
+[package]
+name = "rusty_png"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+authors = ["Mata Network <https://www.mata.network>"]
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+description = "Pure-Rust PNG decoder + encoder, no C/FFI. Performance fork of image-rs/image-png."
+readme = "README.md"
+keywords = ["png", "image", "decoder", "encoder"]
+categories = ["multimedia::images"]
+rust-version = "1.85"
+# Ship source + licences + attribution, but NOT the 0.7 MB of test fixtures —
+# they exist for CI, and upstream excludes them from its tarball for the same
+# reason. (Their absence is exactly why the vendored unit tests failed on the
+# first run here: the crates.io tarball this was forked from had no `tests/`.)
+include = [
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/NOTICE.md",
+    "/README.md",
+    "/WHYS.md",
+    "/UPSTREAM-CHANGES.md",
+    "/UPSTREAM-README.md",
+    "/src/",
+    "/benches/",
+]
+
+[lib]
+name = "rusty_png"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Exposes internal kernels (unfilter, expand_paletted) so benchmarks and the
+# scalar-oracle A/B tests can reach them. Upstream calls this `benchmarks`.
+benchmarks = []
+unstable = ["crc32fast/nightly"]
+# Feature-gated stage profiler (filter / deflate / chunk on encode; inflate /
+# unfilter / transform on decode). Scopes are PER ROW, so the tap costs <0.1%
+# of a 1080p encode. Compiles to nothing when off.
+profile = []
+
+# ---------------------------------------------------------------------------
+# DEFLATE backend. This is the measured hot spot, not the PNG layer.
+#
+# At a matched output size, ffmpeg's PNG encoder (zlib) beat this crate's
+# `Compression::Default`/`Best` path by 2.6-4.4x on an 8.3 MPx frame, and the
+# PNG-specific work (filtering) was a minor share -- the DEFLATE stream is where
+# the time goes. Upstream routes those levels through `flate2`, whose default
+# backend is `miniz_oxide`.
+#
+# `zlib-rs` is flate2's PURE-RUST zlib rewrite (it maps to flate2's `any_zlib`,
+# NOT `any_c_zlib`), so selecting it keeps the no-C/no-FFI property this project
+# exists for. Off by default until it is measured here.
+zlib-rs = ["flate2/zlib-rs"]
+
+[dependencies]
+bitflags = "1.0"
+crc32fast = "1.2.0"
+fdeflate = "0.3.3"
+flate2 = "1.0.11"
+miniz_oxide = { version = "0.8", features = ["simd"] }
+
+[dev-dependencies]
+approx = "0.5.1"
+byteorder = "1.5.0"
+criterion = "0.4.0"
+glob = "0.3"
+rand = "0.8.4"
+
+# Upstream's `decoder` bench is dropped: it needs ~10 MB of fixture images that
+# the crates.io tarball does not carry, and this fork is benchmarked against a
+# real-content corpus (Derf frames + real screenshots/charts) instead. The two
+# KERNEL benches below generate their own data and are kept — they are the ones
+# an optimisation campaign actually reaches for.
+[[bench]]
+name = "expand_paletted"
+path = "benches/expand_paletted.rs"
+harness = false
+required-features = ["benchmarks"]
+
+[[bench]]
+name = "unfilter"
+path = "benches/unfilter.rs"
+harness = false
+required-features = ["benchmarks"]
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(fuzzing)"]

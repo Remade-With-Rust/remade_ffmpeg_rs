@@ -1,4 +1,5 @@
-//! PNG still-image codec, backed by the pure-Rust [`png`] crate.
+//! PNG still-image codec, backed by our own pure-Rust [`rusty_png`] crate
+//! (a performance fork of image-rs/image-png).
 //!
 //! PNG is self-describing (its `IHDR` carries size + color type), so decode
 //! needs no stream parameters: a packet *is* the whole PNG file. We decode to
@@ -8,9 +9,9 @@
 
 use std::io::Cursor;
 
-use png::{BitDepth, ColorType, Transformations};
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
-use rff_core::{Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
+use rff_core::{Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
+use rusty_png::{AdaptiveFilterType, BitDepth, ColorType, Compression, FilterType, Transformations};
 
 /// Register the PNG codec into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
@@ -57,7 +58,7 @@ impl Decoder for PngDecoder {
 }
 
 fn decode_png(data: &[u8]) -> Result<Frame> {
-    let mut decoder = png::Decoder::new(Cursor::new(data));
+    let mut decoder = rusty_png::Decoder::new(Cursor::new(data));
     // Normalize: expand palette / sub-8-bit, and reduce 16-bit to 8-bit.
     decoder.set_transformations(Transformations::EXPAND | Transformations::STRIP_16);
     let mut reader = decoder
@@ -110,13 +111,101 @@ fn decode_png(data: &[u8]) -> Result<Frame> {
 // Encoder
 // ---------------------------------------------------------------------------
 
+/// Encoder tuning. The defaults reproduce the historical behaviour exactly —
+/// `Compression::Fast` + `FilterType::Sub` non-adaptive — because that is what
+/// the backing crate defaults to and what every existing output was encoded
+/// with. Changing the default is a separate, separately-gated decision.
+#[derive(Clone, Copy)]
+struct PngSettings {
+    compression: Compression,
+    filter: FilterType,
+    adaptive: AdaptiveFilterType,
+}
+
+impl Default for PngSettings {
+    fn default() -> Self {
+        PngSettings {
+            compression: Compression::Fast,
+            filter: FilterType::Sub,
+            adaptive: AdaptiveFilterType::NonAdaptive,
+        }
+    }
+}
+
+/// Map FFmpeg's `-compression_level 0..9` onto the backing crate's three-level
+/// enum. The crate exposes `Fast` (fdeflate), `Default` and `Best` rather than
+/// zlib's ten levels, so this is a documented bucketing, not a 1:1 translation:
+/// 0–1 stay on the fast path, 2–8 take the balanced path, 9 asks for the
+/// smallest file.
+fn compression_from_level(level: i32) -> Compression {
+    match level {
+        i32::MIN..=1 => Compression::Fast,
+        2..=8 => Compression::Default,
+        _ => Compression::Best,
+    }
+}
+
+/// FFmpeg's `-pred` names. `mixed` is FFmpeg's per-row adaptive choice, so it
+/// maps to the crate's adaptive filter rather than to a fixed filter type.
+fn filter_from_pred(pred: &str) -> Option<(FilterType, AdaptiveFilterType)> {
+    let f = match pred.trim().to_ascii_lowercase().as_str() {
+        "none" => (FilterType::NoFilter, AdaptiveFilterType::NonAdaptive),
+        "sub" => (FilterType::Sub, AdaptiveFilterType::NonAdaptive),
+        "up" => (FilterType::Up, AdaptiveFilterType::NonAdaptive),
+        "avg" | "average" => (FilterType::Avg, AdaptiveFilterType::NonAdaptive),
+        "paeth" => (FilterType::Paeth, AdaptiveFilterType::NonAdaptive),
+        "mixed" | "adaptive" => (FilterType::Paeth, AdaptiveFilterType::Adaptive),
+        _ => return None,
+    };
+    Some(f)
+}
+
 #[derive(Default)]
 struct PngEncoder {
     packet: Option<Packet>,
     eof: bool,
+    settings: PngSettings,
 }
 
 impl Encoder for PngEncoder {
+    /// `-compression_level 0..9` and `-pred none|sub|up|avg|paeth|mixed`, both
+    /// spelled the way FFmpeg's PNG encoder spells them so the CLI stays
+    /// drop-in. Before this existed neither knob was reachable at all: the
+    /// backing crate's defaults were the only operating point this codec could
+    /// ever produce.
+    fn configure(&mut self, options: &Dictionary) -> Result<()> {
+        if let Some(v) = options.get("compression_level") {
+            match v.trim().parse::<i32>() {
+                Ok(level) => self.settings.compression = compression_from_level(level),
+                Err(_) => {
+                    return Err(Error::invalid(format!(
+                        "png encode: -compression_level wants 0..9, got `{v}`"
+                    )))
+                }
+            }
+        }
+        if let Some(v) = options.get("pred") {
+            match filter_from_pred(v) {
+                Some((f, a)) => {
+                    self.settings.filter = f;
+                    self.settings.adaptive = a;
+                }
+                None => {
+                    return Err(Error::unsupported(format!(
+                        "png encode: unknown -pred `{v}` (want none/sub/up/avg/paeth/mixed)"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Packed RGB only — this encoder has no Y'CbCr path, so the pipeline
+    /// converts planar input (e.g. straight from the JPEG decoder) for us.
+    fn accepted_pixel_formats(&self) -> Option<Vec<PixelFormat>> {
+        Some(vec![PixelFormat::Rgb24, PixelFormat::Rgba])
+    }
+
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let vf = match frame {
             Frame::Video(v) => v,
@@ -126,7 +215,7 @@ impl Encoder for PngEncoder {
                 ))
             }
         };
-        self.packet = Some(Packet::from_data(0, encode_png(vf)?));
+        self.packet = Some(Packet::from_data(0, encode_png(vf, self.settings)?));
         Ok(())
     }
 
@@ -146,7 +235,7 @@ impl Encoder for PngEncoder {
     }
 }
 
-fn encode_png(vf: &VideoFrame) -> Result<Vec<u8>> {
+fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
     let (color, channels) = match vf.format {
         PixelFormat::Rgb24 => (ColorType::Rgb, 3usize),
         PixelFormat::Rgba => (ColorType::Rgba, 4usize),
@@ -174,9 +263,12 @@ fn encode_png(vf: &VideoFrame) -> Result<Vec<u8>> {
 
     let mut out = Vec::new();
     {
-        let mut encoder = png::Encoder::new(&mut out, vf.width, vf.height);
+        let mut encoder = rusty_png::Encoder::new(&mut out, vf.width, vf.height);
         encoder.set_color(color);
         encoder.set_depth(BitDepth::Eight);
+        encoder.set_compression(settings.compression);
+        encoder.set_filter(settings.filter);
+        encoder.set_adaptive_filter(settings.adaptive);
         let mut writer = encoder
             .write_header()
             .map_err(|e| Error::invalid(format!("png encode: {e}")))?;
@@ -219,7 +311,7 @@ mod tests {
             unreachable!()
         };
 
-        let bytes = encode_png(src).unwrap();
+        let bytes = encode_png(src, PngSettings::default()).unwrap();
         assert_eq!(&bytes[1..4], b"PNG"); // PNG signature
 
         let Frame::Video(decoded) = decode_png(&bytes).unwrap() else {

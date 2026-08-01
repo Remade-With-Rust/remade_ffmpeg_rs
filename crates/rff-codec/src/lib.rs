@@ -77,6 +77,18 @@ pub trait Encoder: Send {
         None
     }
 
+    /// The pixel formats this encoder accepts, most-preferred first, or `None`
+    /// for "any format". The transcode pipeline converts video to the first
+    /// accepted format before feeding frames (FFmpeg's automatic `scale`).
+    ///
+    /// Declaring this lets decoders emit whatever layout is cheapest for them —
+    /// a JPEG decoder can hand out planar Y'CbCr instead of converting to RGB —
+    /// without breaking encoders that need something else. An encoder that
+    /// leaves this `None` must genuinely handle every format it is given.
+    fn accepted_pixel_formats(&self) -> Option<Vec<PixelFormat>> {
+        None
+    }
+
     /// Submit one raw frame for encoding.
     fn send_frame(&mut self, frame: &Frame) -> Result<()>;
 
