@@ -67,6 +67,8 @@ mod common;
 mod decoder;
 mod encoder;
 mod filter;
+#[cfg(feature = "parallel")]
+pub mod pardeflate;
 pub mod prof;
 mod srgb;
 pub mod text_metadata;

@@ -53,6 +53,19 @@ unstable = ["crc32fast/nightly"]
 # unfilter / transform on decode). Scopes are PER ROW, so the tap costs <0.1%
 # of a 1080p encode. Compiles to nothing when off.
 profile = []
+# Multi-threaded DEFLATE for a SINGLE image (pigz-style block splitting).
+#
+# DEFLATE is 77-82% of encode at `Fast` and 94-99.5% at quality, so Amdahl
+# allows ~6.6x at 8 threads — and ffmpeg's PNG encoder is single-threaded for a
+# single image, so this is a structural win it cannot answer.
+#
+# The size cost is bounded by a MINIMUM BLOCK SIZE, not by thread count. Measured
+# (pessimistic: independent streams, no dictionary priming):
+#   24.9 MB filtered @ 1.04 MB/block -> +0.11%
+#    2.35 MB filtered @  98 KB/block -> +1.64%
+#    1.44 MB filtered @  60 KB/block -> +7.44%
+# so blocks are sized >= PAR_MIN_BLOCK and small images simply stay serial.
+parallel = []
 
 # ---------------------------------------------------------------------------
 # DEFLATE backend. This is the measured hot spot, not the PNG layer.
@@ -74,6 +87,8 @@ crc32fast = "1.2.0"
 fdeflate = "0.3.3"
 flate2 = "1.0.11"
 miniz_oxide = { version = "0.8", features = ["simd"] }
+# Adler-32 for the hand-assembled zlib container in the parallel path.
+simd-adler32 = "0.3"
 
 [dev-dependencies]
 approx = "0.5.1"
