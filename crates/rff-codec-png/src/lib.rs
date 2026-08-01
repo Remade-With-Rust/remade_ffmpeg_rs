@@ -295,6 +295,13 @@ struct PngSettings {
     compression: Compression,
     filter: FilterType,
     adaptive: AdaptiveFilterType,
+    /// Pick compression+filter from the content when the user has not chosen.
+    /// See [`content_signal`]. Off automatically the moment `-compression_level`
+    /// or `-pred` is given, so an explicit setting is never second-guessed.
+    auto_config: bool,
+    /// Set once the user names a compression level or filter explicitly.
+    explicit_compression: bool,
+    explicit_filter: bool,
     /// Narrow the output colour type to gray/indexed when the pixels allow it.
     /// On by default: it is lossless, and without it every grayscale or palette
     /// PNG that passes through this codec is re-emitted as truecolour (+257% /
@@ -308,6 +315,9 @@ impl Default for PngSettings {
             compression: Compression::Fast,
             filter: FilterType::Sub,
             adaptive: AdaptiveFilterType::NonAdaptive,
+            auto_config: true,
+            explicit_compression: false,
+            explicit_filter: false,
             auto_type: true,
         }
     }
@@ -357,13 +367,19 @@ impl Encoder for PngEncoder {
     fn configure(&mut self, options: &Dictionary) -> Result<()> {
         if let Some(v) = options.get("compression_level") {
             match v.trim().parse::<i32>() {
-                Ok(level) => self.settings.compression = compression_from_level(level),
+                Ok(level) => {
+                    self.settings.compression = compression_from_level(level);
+                    self.settings.explicit_compression = true;
+                }
                 Err(_) => {
                     return Err(Error::invalid(format!(
                         "png encode: -compression_level wants 0..9, got `{v}`"
                     )))
                 }
             }
+        }
+        if let Some(v) = options.get("png_auto_config") {
+            self.settings.auto_config = !matches!(v.trim(), "0" | "false" | "off" | "no");
         }
         if let Some(v) = options.get("png_auto_type") {
             self.settings.auto_type = !matches!(v.trim(), "0" | "false" | "off" | "no");
@@ -373,6 +389,7 @@ impl Encoder for PngEncoder {
                 Some((f, a)) => {
                     self.settings.filter = f;
                     self.settings.adaptive = a;
+                    self.settings.explicit_filter = true;
                 }
                 None => {
                     return Err(Error::unsupported(format!(
@@ -444,6 +461,38 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
         }
         p
     };
+
+    // Pick the operating point from the content, unless the caller named one.
+    //
+    // The shipped default (`Fast`/`Sub`) is genuinely good on photographs —
+    // faster AND smaller than every ffmpeg `-compression_level 1` setting — and
+    // catastrophic on graphics: measured over nine real screenshots, charts,
+    // diagrams and logos it ran **+130.1%** against ffmpeg's default, up to
+    // +1409% on a matplotlib chart. One fixed default cannot serve both, which
+    // makes this a dispatch, not a tuning choice.
+    //
+    // `Compression::Default` + adaptive filtering was chosen by measuring the
+    // whole graphics corpus rather than by counting per-image winners:
+    //
+    //   config              total vs ffmpeg   worst image   encode time
+    //   fast/sub (shipped)        +130.1%     +1409.0%          451 ms
+    //   default + adaptive          -2.4%        +0.7%          502 ms   <-- chosen
+    //   best + adaptive             -6.3%        -3.3%        3,638 ms
+    //
+    // i.e. +130.1% -> -2.4% for 11% more time. `best` buys 3.9 more points for
+    // 8.1x the time, which is a bad default however good the number looks.
+    let mut settings = settings;
+    if settings.auto_config && !(settings.explicit_compression && settings.explicit_filter) {
+        if content_signal(&packed, w, h, channels) >= GRAPHICS_SIGNAL {
+            if !settings.explicit_compression {
+                settings.compression = Compression::Default;
+            }
+            if !settings.explicit_filter {
+                settings.filter = FilterType::Paeth;
+                settings.adaptive = AdaptiveFilterType::Adaptive;
+            }
+        }
+    }
 
     // Narrow the colour type when the pixels allow it. Lossless in every branch:
     // gray only when R == G == B everywhere, indexed only when the exact colour

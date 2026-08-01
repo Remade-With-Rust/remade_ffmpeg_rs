@@ -41,7 +41,7 @@ fi
 
 # Exactly the crate content. Repo-only furniture (.github/, .gitignore) lives in
 # the mirror and is deliberately NOT touched.
-ITEMS=(Cargo.toml README.md NOTICE.md CHANGES.md WHYS.md LICENSE-APACHE LICENSE-MIT src tests examples)
+ITEMS=(Cargo.toml README.md NOTICE.md CHANGES.md WHYS.md LICENSE-APACHE LICENSE-MIT src tests examples fuzz)
 for item in "${ITEMS[@]}"; do
   [ -e "$SRC/$item" ] || { echo "missing from crate: $item" >&2; exit 1; }
   rm -rf "${MIRROR:?}/$item"

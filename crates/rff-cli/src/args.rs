@@ -225,7 +225,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             "crf" | "qp" | "preset" | "pass" | "q" | "qscale" | "cpu-used" | "speed" | "lag"
             | "lag-in-frames" | "arnr-strength" | "dispatch-budget" | "jpeg_quality"
             | "sampling" | "jpeg_sampling" | "progressive" | "optimize_huffman"
-            | "restart_interval" | "pred" | "png_auto_type" => {
+            | "restart_interval" | "pred" | "png_auto_type" | "png_auto_config" => {
                 let value = take_value(args, &mut i, arg)?;
                 if base == "pass" && value != "1" {
                     warnings
