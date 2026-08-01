@@ -302,6 +302,15 @@ impl QuantizationTable {
         q_table
     }
 
+    /// The actual divisor used when quantizing, in the encoder's scaled-DCT
+    /// units (pre-multiplied by 8 to match the 8x-scaled forward DCT output).
+    /// [`get`](Self::get) returns the table value as written to the DQT segment,
+    /// which is this shifted back down.
+    #[inline]
+    pub(crate) fn divisor(&self, index: usize) -> u16 {
+        self.table[index].get()
+    }
+
     #[inline]
     pub fn get(&self, index: usize) -> u8 {
         (self.table[index].get() >> 3) as u8

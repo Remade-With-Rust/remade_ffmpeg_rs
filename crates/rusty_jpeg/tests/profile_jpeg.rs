@@ -1002,3 +1002,67 @@ fn optimized_huffman_emits_one_interleaved_scan_that_round_trips() {
         assert!(psnr > 20.0, "{w}x{h}: round-trip PSNR only {psnr:.1} dB");
     }
 }
+
+/// Trellis quantization must produce a SMALLER file that still decodes, without
+/// collapsing quality.
+///
+/// It works by choosing where each block's EOB falls: dropping a trailing
+/// coefficient can delete several symbols at once, because keeping it forces the
+/// run before it to be coded too. The gate is rate AND distortion together —
+/// "smaller" alone is trivially satisfiable by throwing the image away.
+#[test]
+fn trellis_reduces_size_without_collapsing_quality() {
+    use rusty_jpeg::decode::Decoder;
+    use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
+    use std::io::Cursor;
+
+    const W: usize = 128;
+    const H: usize = 128;
+    let mut rgb = vec![0u8; W * H * 3];
+    for y in 0..H {
+        for x in 0..W {
+            let o = (y * W + x) * 3;
+            let v = ((x * x + y * y) / 7 % 200) as u8;
+            rgb[o] = v;
+            rgb[o + 1] = v.wrapping_add(40);
+            rgb[o + 2] = v.wrapping_add(90);
+        }
+    }
+
+    let encode = |trellis: bool| -> (usize, f64) {
+        let mut jpg = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut jpg, 85);
+            enc.set_sampling_factor(SamplingFactor::R_4_2_0);
+            enc.set_trellis(trellis);
+            enc.encode(&rgb, W as u16, H as u16, ColorType::Rgb)
+                .expect("encode");
+        }
+        let out = Decoder::new(Cursor::new(&jpg)).decode().expect("decode");
+        let mse: f64 = rgb
+            .iter()
+            .zip(&out)
+            .map(|(&a, &b)| {
+                let d = a as f64 - b as f64;
+                d * d
+            })
+            .sum::<f64>()
+            / rgb.len() as f64;
+        (jpg.len(), 10.0 * (255.0f64 * 255.0 / mse).log10())
+    };
+
+    let (size_off, psnr_off) = encode(false);
+    let (size_on, psnr_on) = encode(true);
+
+    assert!(
+        size_on < size_off,
+        "trellis did not shrink the file: {size_on} vs {size_off}"
+    );
+    // It trades distortion for rate by design; what it must not do is fall off a
+    // cliff. The BD-rate sweep that chose lambda showed well under 1 dB here.
+    assert!(
+        psnr_on > psnr_off - 1.5,
+        "trellis cost too much quality: {psnr_on:.2} dB vs {psnr_off:.2} dB \
+         (sizes {size_on} vs {size_off})"
+    );
+}

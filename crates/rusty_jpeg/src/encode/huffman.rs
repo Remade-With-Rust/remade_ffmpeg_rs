@@ -70,6 +70,12 @@ pub struct HuffmanTable {
 }
 
 impl HuffmanTable {
+    /// Code length in bits for a symbol, for rate estimation.
+    #[inline]
+    pub(crate) fn code_len(&self, symbol: u8) -> u8 {
+        self.lookup_table[symbol as usize].0
+    }
+
     pub fn new(length: &[u8; 16], values: &[u8]) -> HuffmanTable {
         HuffmanTable {
             lookup_table: create_lookup_table(length, values),

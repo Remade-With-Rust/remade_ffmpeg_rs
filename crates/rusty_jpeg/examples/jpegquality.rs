@@ -130,6 +130,9 @@ fn encode(rgb: &[u8], quality: u8) -> Vec<u8> {
     let mut out = Vec::new();
     let mut enc = Encoder::new(&mut out, quality);
     enc.set_sampling_factor(SamplingFactor::R_4_2_0);
+    if std::env::var("RUSTY_JPEG_ARM").map(|v| v == "trellis").unwrap_or(false) {
+        enc.set_trellis(true);
+    }
     enc.encode(rgb, W as u16, H as u16, ColorType::Rgb)
         .expect("encode");
     out

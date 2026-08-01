@@ -78,6 +78,9 @@ fn main() {
     let mut enc = Encoder::new(&mut jpeg, quality);
     enc.set_sampling_factor(SamplingFactor::R_4_2_0);
     enc.set_optimized_huffman_tables(true);
+    if std::env::var("RUSTY_JPEG_TRELLIS").is_ok() {
+        enc.set_trellis(true);
+    }
     if interleaved {
         enc.set_streaming_optimize(true);
     }
