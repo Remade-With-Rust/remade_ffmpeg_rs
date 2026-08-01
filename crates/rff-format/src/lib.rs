@@ -13,7 +13,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
-use rff_core::{CodecId, Error, MediaType, Packet, PixelFormat, Rational, Result, SampleFormat};
+use rff_core::{
+    CodecId, ColorRange, Error, MediaType, Packet, PixelFormat, Rational, Result, SampleFormat,
+};
 
 /// Description of one elementary stream within a container.
 #[derive(Debug, Clone)]
@@ -29,6 +31,10 @@ pub struct Stream {
     pub height: u32,
     /// Raw pixel layout, when known (raw video). Self-describing codecs leave this `None`.
     pub pixel_format: Option<PixelFormat>,
+    /// Luma/chroma value range. JPEG and PNG sources are always
+    /// [`ColorRange::Full`]; leaving it [`Unspecified`](ColorRange::Unspecified)
+    /// makes containers label the data limited-range, which silently corrupts it.
+    pub color_range: ColorRange,
     // --- Audio parameters (zero/ignored for non-audio) ---
     pub sample_rate: u32,
     pub channels: u16,
@@ -50,6 +56,7 @@ impl Stream {
             width: 0,
             height: 0,
             pixel_format: None,
+            color_range: ColorRange::Unspecified,
             sample_rate: 0,
             channels: 0,
             sample_format: None,

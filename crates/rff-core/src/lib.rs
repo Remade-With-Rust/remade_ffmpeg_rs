@@ -18,6 +18,6 @@ pub mod rational;
 pub use dict::Dictionary;
 pub use error::{Error, Result};
 pub use frame::{AudioFrame, Frame, VideoFrame};
-pub use media::{CodecId, MediaType, PixelFormat, SampleFormat};
+pub use media::{CodecId, ColorRange, MediaType, PixelFormat, SampleFormat};
 pub use packet::{Packet, PacketFlags};
 pub use rational::Rational;

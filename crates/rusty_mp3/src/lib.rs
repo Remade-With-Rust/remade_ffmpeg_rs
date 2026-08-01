@@ -325,7 +325,7 @@ impl Mp3Encoder {
             self.reservoir = self.quality.is_none()
                 && is_v1
                 && match std::env::var("MP3_RESERVOIR") {
-                    Ok(v) => v != "0",             // explicit override (still V1/CBR only)
+                    Ok(v) => v != "0",              // explicit override (still V1/CBR only)
                     Err(_) => self.cbr_kbps <= 256, // default: on for common bitrates
                 };
             // gain 0.2 = the swept corpus optimum (mean ODG +0.029 vs flat, no clip

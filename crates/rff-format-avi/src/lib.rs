@@ -108,6 +108,10 @@ fn map_video_fourcc(mut f: [u8; 4]) -> CodecId {
     match &f {
         b"H264" | b"X264" | b"AVC1" | b"DAVC" => CodecId::H264,
         b"AV01" => CodecId::Avif,
+        // Motion JPEG. `MJPG` is what FFmpeg and virtually every camera write;
+        // the rest are the long tail of encoder-specific tags for the same
+        // baseline-JPEG-per-frame payload.
+        b"MJPG" | b"JPEG" | b"MJPA" | b"MJPB" | b"AVRN" | b"DMB1" | b"LJPG" => CodecId::Jpeg,
         _ => CodecId::None,
     }
 }
@@ -316,6 +320,10 @@ fn codec_to_fourcc(id: CodecId) -> [u8; 4] {
     match id {
         CodecId::H264 => *b"H264",
         CodecId::Avif => *b"AV01",
+        // Without this the stream carried a zero fourcc, so FFmpeg fell back to
+        // reading our MJPEG AVI as `rawvideo` and rejected every frame
+        // ("packet size 1705862 < expected frame_size 6220800").
+        CodecId::Jpeg => *b"MJPG",
         _ => [0; 4],
     }
 }
@@ -616,6 +624,24 @@ mod tests {
         assert_eq!(packet.stream_index, 0);
         assert_eq!(packet.data, payload);
         assert!(matches!(dem.read_packet(), Err(Error::Eof)));
+    }
+
+    /// Regression: MJPEG was in neither fourcc map, so an MJPEG AVI we wrote
+    /// carried a zero fourcc (FFmpeg fell back to `rawvideo` and rejected every
+    /// frame) and an MJPEG AVI FFmpeg wrote failed on our side with "no decoder
+    /// found for codec none". Both directions were broken.
+    #[test]
+    fn mjpeg_fourcc_maps_both_ways() {
+        assert_eq!(codec_to_fourcc(CodecId::Jpeg), *b"MJPG");
+        // The tag FFmpeg and cameras actually write, plus the long tail.
+        for tag in [b"MJPG", b"mjpg", b"JPEG", b"MJPA", b"MJPB", b"DMB1"] {
+            assert_eq!(map_video_fourcc(*tag), CodecId::Jpeg, "{:?}", tag);
+        }
+        // Round-trip: what we write is what we read.
+        assert_eq!(
+            map_video_fourcc(codec_to_fourcc(CodecId::Jpeg)),
+            CodecId::Jpeg
+        );
     }
 
     #[test]

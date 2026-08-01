@@ -9,7 +9,7 @@
 //! other layouts return [`Error::Unsupported`]. Each filter is a 1-in/1-out
 //! transform.
 
-use rff_core::{Error, PixelFormat, Result, VideoFrame};
+use rff_core::{ColorRange, Error, PixelFormat, Result, VideoFrame};
 
 /// One frame transform. Implementors map a video frame to a new video frame.
 pub trait Filter: Send {
@@ -25,6 +25,20 @@ pub trait Filter: Send {
     fn output_dims(&self, in_w: u32, in_h: u32) -> (u32, u32) {
         (in_w, in_h)
     }
+
+    /// The luma/chroma range this filter's output is in, when the filter is the
+    /// one that decides it. Only a colour conversion knows this; everything else
+    /// passes the incoming range through, hence the `None` default.
+    ///
+    /// The muxer needs it: writing full-range samples into a container that
+    /// labels them limited-range silently rescales them on the way out.
+    fn output_color_range(&self) -> Option<ColorRange> {
+        None
+    }
+
+    /// Tell the filter what range its input is in. Only a colour conversion
+    /// cares, and only when the spec string did not pin the range itself.
+    fn set_source_color_range(&mut self, _range: ColorRange) {}
 }
 
 /// An ordered chain of filters (the `-vf` graph).
@@ -57,6 +71,7 @@ impl FilterChain {
                 "transpose" => filters.push(Box::new(Transpose::parse(&parts)?)),
                 "pad" => filters.push(Box::new(Pad::parse(&parts)?)),
                 "format" => filters.push(Box::new(FormatConv::parse(&parts)?)),
+                "setrange" => filters.push(Box::new(SetRange::parse(&parts)?)),
                 "negate" => filters.push(Box::new(Negate)),
                 "gray" | "grayscale" => filters.push(Box::new(Grayscale)),
                 other => return Err(Error::unsupported(format!("unknown filter `{other}`"))),
@@ -67,6 +82,29 @@ impl FilterChain {
 
     pub fn is_empty(&self) -> bool {
         self.filters.is_empty()
+    }
+
+    /// Insert a range conversion at the FRONT of the chain, so every later
+    /// filter (notably a colour conversion) sees full-range input.
+    pub fn prepend_range_conversion(&mut self, to_full: bool) {
+        self.filters.insert(0, Box::new(SetRange { to_full }));
+    }
+
+    /// Declare the range of the frames entering the chain, so colour
+    /// conversions interpret Y'CbCr correctly instead of assuming full-range.
+    pub fn set_source_color_range(&mut self, range: ColorRange) {
+        for f in &mut self.filters {
+            f.set_source_color_range(range);
+        }
+    }
+
+    /// The colour range the chain's output is in, if any filter in it decides.
+    /// Later filters win, matching evaluation order.
+    pub fn output_color_range(&self) -> Option<ColorRange> {
+        self.filters
+            .iter()
+            .rev()
+            .find_map(|f| f.output_color_range())
     }
 
     /// Run every filter in order.
@@ -697,6 +735,10 @@ impl ColorSpec {
 struct FormatConv {
     target: PixelFormat,
     spec: ColorSpec,
+    /// Did the spec string pin the range explicitly? If not, the chain fills it
+    /// in from the source stream — assuming full-range for everything was a
+    /// silent 8 dB error on limited-range YUV sources.
+    range_explicit: bool,
 }
 
 impl FormatConv {
@@ -712,6 +754,7 @@ impl FormatConv {
             }
         };
         let mut spec = ColorSpec::default();
+        let mut range_explicit = false;
         for opt in args.iter().skip(1).map(|s| s.trim()) {
             match opt {
                 "" => {}
@@ -723,8 +766,14 @@ impl FormatConv {
                     spec.kr = 0.2126;
                     spec.kb = 0.0722;
                 }
-                "full" | "pc" | "jpeg" => spec.limited = false,
-                "limited" | "tv" | "mpeg" => spec.limited = true,
+                "full" | "pc" | "jpeg" => {
+                    spec.limited = false;
+                    range_explicit = true;
+                }
+                "limited" | "tv" | "mpeg" => {
+                    spec.limited = true;
+                    range_explicit = true;
+                }
                 other => {
                     return Err(Error::unsupported(format!(
                         "format: option `{other}` (matrix bt601/bt709, range full/limited)"
@@ -732,13 +781,45 @@ impl FormatConv {
                 }
             }
         }
-        Ok(FormatConv { target, spec })
+        Ok(FormatConv {
+            target,
+            spec,
+            range_explicit,
+        })
     }
 }
 
 impl Filter for FormatConv {
     fn name(&self) -> &'static str {
         "format"
+    }
+
+    fn set_source_color_range(&mut self, range: ColorRange) {
+        // `spec.limited` always describes the Y'CbCr side of the conversion,
+        // whichever direction it runs, so one flag serves both.
+        if !self.range_explicit {
+            match range {
+                ColorRange::Limited => self.spec.limited = true,
+                ColorRange::Full => self.spec.limited = false,
+                ColorRange::Unspecified => {}
+            }
+        }
+    }
+
+    /// Only meaningful when the target is Y'CbCr — RGB has no limited/full
+    /// distinction, so converting *to* RGB leaves the question to whoever
+    /// converts back.
+    fn output_color_range(&self) -> Option<ColorRange> {
+        match self.target {
+            PixelFormat::Yuv420p | PixelFormat::Yuv422p | PixelFormat::Yuv444p => {
+                Some(if self.spec.limited {
+                    ColorRange::Limited
+                } else {
+                    ColorRange::Full
+                })
+            }
+            _ => None,
+        }
     }
 
     fn filter(&mut self, src: VideoFrame) -> Result<VideoFrame> {
@@ -750,6 +831,10 @@ impl Filter for FormatConv {
             (PixelFormat::Rgba, PixelFormat::Yuv420p) => rgb_to_yuv420(&src, 4, self.spec),
             (PixelFormat::Rgba, PixelFormat::Rgb24) => rgba_to_rgb(&src),
             (PixelFormat::Yuv420p, PixelFormat::Rgb24) => yuv420_to_rgb(&src, self.spec),
+            (PixelFormat::Yuv422p, PixelFormat::Rgb24)
+            | (PixelFormat::Yuv444p, PixelFormat::Rgb24) => yuv_planar_to_rgb(&src, self.spec),
+            (PixelFormat::Yuv422p, PixelFormat::Yuv420p)
+            | (PixelFormat::Yuv444p, PixelFormat::Yuv420p) => yuv_planar_to_420(&src),
             (from, to) => Err(Error::unsupported(format!(
                 "format: {} → {} not supported",
                 from.name(),
@@ -827,6 +912,126 @@ fn rgb_to_yuv420(src: &VideoFrame, bpp: usize, spec: ColorSpec) -> Result<VideoF
 }
 
 /// Planar 4:2:0 → packed RGB (chroma upsampled nearest-neighbour).
+/// Chroma subsampling `(horizontal, vertical)` of a planar 8-bit Y'CbCr format.
+fn planar_subsampling(format: PixelFormat) -> Option<(usize, usize)> {
+    match format {
+        PixelFormat::Yuv444p => Some((1, 1)),
+        PixelFormat::Yuv422p => Some((2, 1)),
+        PixelFormat::Yuv420p => Some((2, 2)),
+        _ => None,
+    }
+}
+
+/// Planar Y'CbCr (4:2:0 / 4:2:2 / 4:4:4) → packed RGB24.
+///
+/// Chroma is upsampled by replication. That is what the nearest-neighbour
+/// reading of a subsampled plane means, and it keeps this exactly invertible
+/// against the encoder's point-sampling.
+fn yuv_planar_to_rgb(src: &VideoFrame, spec: ColorSpec) -> Result<VideoFrame> {
+    let (sh, sv) = planar_subsampling(src.format).ok_or_else(|| {
+        Error::unsupported(format!(
+            "format: {} is not planar Y'CbCr",
+            src.format.name()
+        ))
+    })?;
+    let (w, h) = (src.width as usize, src.height as usize);
+    let (ys, us, vs) = (src.strides[0], src.strides[1], src.strides[2]);
+    let (yp, up, vp) = (&src.planes[0], &src.planes[1], &src.planes[2]);
+
+    let kg = spec.kg();
+    let (yoff, yscale, cscale) = if spec.limited {
+        (16.0, 255.0 / 219.0, 255.0 / 224.0)
+    } else {
+        (0.0, 1.0, 1.0)
+    };
+    let kr_c = 2.0 * (1.0 - spec.kr) * cscale;
+    let kb_c = 2.0 * (1.0 - spec.kb) * cscale;
+    let kgv = -2.0 * spec.kr * (1.0 - spec.kr) / kg * cscale;
+    let kgu = -2.0 * spec.kb * (1.0 - spec.kb) / kg * cscale;
+
+    let mut out = vec![0u8; w * h * 3];
+    for j in 0..h {
+        for i in 0..w {
+            let ya = yscale * (yp[j * ys + i] as f32 - yoff);
+            let cu = up[(j / sv) * us + i / sh] as f32 - 128.0;
+            let cv = vp[(j / sv) * vs + i / sh] as f32 - 128.0;
+            let o = (j * w + i) * 3;
+            out[o] = clamp_u8(ya + kr_c * cv);
+            out[o + 1] = clamp_u8(ya + kgu * cu + kgv * cv);
+            out[o + 2] = clamp_u8(ya + kb_c * cu);
+        }
+    }
+    Ok(VideoFrame {
+        width: src.width,
+        height: src.height,
+        format: PixelFormat::Rgb24,
+        planes: vec![out],
+        strides: vec![w * 3],
+        pts: src.pts,
+    })
+}
+
+/// Planar Y'CbCr → planar 4:2:0, **averaging** the chroma it drops.
+///
+/// Averaging rather than point-sampling matters: dropping 3 of every 4 chroma
+/// samples without a low-pass aliases, and the artefacts land on exactly the
+/// saturated edges people look at.
+fn yuv_planar_to_420(src: &VideoFrame) -> Result<VideoFrame> {
+    let (sh, sv) = planar_subsampling(src.format).ok_or_else(|| {
+        Error::unsupported(format!(
+            "format: {} is not planar Y'CbCr",
+            src.format.name()
+        ))
+    })?;
+    if (sh, sv) == (2, 2) {
+        return Ok(src.clone());
+    }
+    let (w, h) = (src.width as usize, src.height as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    // Source chroma plane dimensions.
+    let (scw, sch) = (w.div_ceil(sh), h.div_ceil(sv));
+
+    // Luma is untouched; repack it to a tight stride.
+    let ys = src.strides[0];
+    let mut luma = Vec::with_capacity(w * h);
+    for j in 0..h {
+        luma.extend_from_slice(&src.planes[0][j * ys..j * ys + w]);
+    }
+
+    let mut out_planes = vec![luma];
+    for plane_idx in 1..3 {
+        let stride = src.strides[plane_idx];
+        let plane = &src.planes[plane_idx];
+        let mut dst = vec![0u8; cw * ch];
+        // How many source chroma samples collapse into one output sample.
+        let (fx, fy) = (2 / sh, 2 / sv);
+        for j in 0..ch {
+            for i in 0..cw {
+                let mut sum = 0u32;
+                let mut n = 0u32;
+                for dy in 0..fy.max(1) {
+                    let sy = (j * fy + dy).min(sch - 1);
+                    for dx in 0..fx.max(1) {
+                        let sx = (i * fx + dx).min(scw - 1);
+                        sum += plane[sy * stride + sx] as u32;
+                        n += 1;
+                    }
+                }
+                dst[j * cw + i] = ((sum + n / 2) / n) as u8;
+            }
+        }
+        out_planes.push(dst);
+    }
+    Ok(VideoFrame {
+        width: src.width,
+        height: src.height,
+        format: PixelFormat::Yuv420p,
+        planes: out_planes,
+        strides: vec![w, cw, cw],
+        pts: src.pts,
+    })
+}
+
 fn yuv420_to_rgb(src: &VideoFrame, spec: ColorSpec) -> Result<VideoFrame> {
     let (w, h) = (src.width as usize, src.height as usize);
     let (ys, us, vs) = (src.strides[0], src.strides[1], src.strides[2]);
@@ -939,6 +1144,80 @@ impl Filter for Negate {
 }
 
 /// `grayscale` — keep luma, neutralize chroma (set both chroma planes to 128).
+/// `setrange=full|limited` — rescale planar Y'CbCr between limited ("TV",
+/// Y 16–235 / C 16–240) and full ("PC", 0–255) range.
+///
+/// This is a value rescale only: no colour-space change, no chroma resampling,
+/// planes keep their dimensions. It exists because JPEG is defined on full-range
+/// samples while most video is limited-range, so handing a limited-range plane
+/// straight to a JPEG encoder encodes the wrong signal. The transcode pipeline
+/// inserts this automatically when the target codec needs full range; the CLI
+/// name is exposed for when you need to override that.
+///
+/// RGB frames pass through untouched — the distinction is a Y'CbCr one.
+struct SetRange {
+    to_full: bool,
+}
+
+impl SetRange {
+    fn parse(args: &[&str]) -> Result<SetRange> {
+        match args.first().copied().unwrap_or("").trim() {
+            "full" | "pc" | "jpeg" => Ok(SetRange { to_full: true }),
+            "limited" | "tv" | "mpeg" => Ok(SetRange { to_full: false }),
+            other => Err(Error::unsupported(format!(
+                "setrange: `{other}` (want full/pc/jpeg or limited/tv/mpeg)"
+            ))),
+        }
+    }
+
+    /// 256-entry map for one component. Luma and chroma differ: limited luma is
+    /// 16–235, limited chroma 16–240.
+    fn lut(&self, chroma: bool) -> [u8; 256] {
+        let (lo, span) = if chroma { (16.0, 224.0) } else { (16.0, 219.0) };
+        let mut lut = [0u8; 256];
+        for (v, out) in lut.iter_mut().enumerate() {
+            let v = v as f32;
+            let mapped = if self.to_full {
+                (v - lo) * 255.0 / span
+            } else {
+                v * span / 255.0 + lo
+            };
+            *out = mapped.round().clamp(0.0, 255.0) as u8;
+        }
+        lut
+    }
+}
+
+impl Filter for SetRange {
+    fn name(&self) -> &'static str {
+        "setrange"
+    }
+
+    fn output_color_range(&self) -> Option<ColorRange> {
+        Some(if self.to_full {
+            ColorRange::Full
+        } else {
+            ColorRange::Limited
+        })
+    }
+
+    fn filter(&mut self, mut frame: VideoFrame) -> Result<VideoFrame> {
+        // Only planar Y'CbCr has a range to convert.
+        if ensure_planar_yuv(&frame, "setrange").is_err() {
+            return Ok(frame);
+        }
+        let luma = self.lut(false);
+        let chroma = self.lut(true);
+        for (i, plane) in frame.planes.iter_mut().enumerate() {
+            let lut = if i == 0 { &luma } else { &chroma };
+            for b in plane.iter_mut() {
+                *b = lut[*b as usize];
+            }
+        }
+        Ok(frame)
+    }
+}
+
 struct Grayscale;
 
 impl Filter for Grayscale {
@@ -1236,5 +1515,107 @@ mod tests {
         let out = overlay(base, &over, 12, 12).unwrap();
         assert_eq!(out.planes[0][12 * 16 + 12], 99); // the 4×4 visible corner
         assert_eq!(out.planes[0][15 * 16 + 15], 99);
+    }
+}
+
+#[cfg(test)]
+mod setrange_tests {
+    use super::*;
+
+    fn planar(y: Vec<u8>, u: Vec<u8>, v: Vec<u8>) -> VideoFrame {
+        VideoFrame {
+            width: 2,
+            height: 2,
+            format: PixelFormat::Yuv420p,
+            planes: vec![y, u, v],
+            strides: vec![2, 1, 1],
+            pts: None,
+        }
+    }
+
+    #[test]
+    fn limited_to_full_hits_the_anchors() {
+        let mut f = SetRange { to_full: true };
+        // Limited black/white (16/235) must land on full black/white (0/255).
+        let out = f
+            .filter(planar(vec![16, 235, 16, 235], vec![16], vec![240]))
+            .unwrap();
+        assert_eq!(out.planes[0], vec![0, 255, 0, 255]);
+        // Limited chroma spans 16..240.
+        assert_eq!(out.planes[1], vec![0]);
+        assert_eq!(out.planes[2], vec![255]);
+    }
+
+    #[test]
+    fn full_to_limited_hits_the_anchors() {
+        let mut f = SetRange { to_full: false };
+        let out = f
+            .filter(planar(vec![0, 255, 0, 255], vec![0], vec![255]))
+            .unwrap();
+        assert_eq!(out.planes[0], vec![16, 235, 16, 235]);
+        assert_eq!(out.planes[1], vec![16]);
+        assert_eq!(out.planes[2], vec![240]);
+    }
+
+    #[test]
+    fn out_of_range_values_clamp_not_wrap() {
+        // Below limited black / above limited white must saturate, not wrap.
+        let mut f = SetRange { to_full: true };
+        let out = f
+            .filter(planar(vec![0, 255, 8, 240], vec![0], vec![255]))
+            .unwrap();
+        assert_eq!(out.planes[0][0], 0);
+        assert_eq!(out.planes[0][1], 255);
+    }
+
+    #[test]
+    fn rgb_frames_pass_through_untouched() {
+        let mut f = SetRange { to_full: true };
+        let rgb = VideoFrame {
+            width: 1,
+            height: 1,
+            format: PixelFormat::Rgb24,
+            planes: vec![vec![10, 20, 30]],
+            strides: vec![3],
+            pts: None,
+        };
+        let out = f.filter(rgb).unwrap();
+        assert_eq!(out.planes[0], vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn reports_the_range_it_produces() {
+        assert_eq!(
+            SetRange { to_full: true }.output_color_range(),
+            Some(ColorRange::Full)
+        );
+        assert_eq!(
+            SetRange { to_full: false }.output_color_range(),
+            Some(ColorRange::Limited)
+        );
+    }
+
+    #[test]
+    fn format_conv_takes_the_source_range_unless_pinned() {
+        // Not pinned: the chain's declared source range wins.
+        let mut chain = FilterChain::parse("format=rgb24").unwrap();
+        chain.set_source_color_range(ColorRange::Limited);
+        // Pinned in the spec: the declaration must NOT override it.
+        let mut pinned = FilterChain::parse("format=rgb24:full").unwrap();
+        pinned.set_source_color_range(ColorRange::Limited);
+
+        // Limited black (16,128,128) is true black only under the limited reading.
+        let frame = || VideoFrame {
+            width: 2,
+            height: 2,
+            format: PixelFormat::Yuv420p,
+            planes: vec![vec![16; 4], vec![128], vec![128]],
+            strides: vec![2, 1, 1],
+            pts: None,
+        };
+        let a = chain.apply(frame()).unwrap();
+        let b = pinned.apply(frame()).unwrap();
+        assert_eq!(a.planes[0][0], 0, "limited reading maps 16 -> 0");
+        assert!(b.planes[0][0] > 0, "full reading leaves 16 above black");
     }
 }

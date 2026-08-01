@@ -370,7 +370,9 @@ fn build_samples(
     let chunk_offsets: Vec<u64> = match find(stbl, b"stco") {
         Some(stco) => {
             let n = be32(stco, 4).min(entries(stco, 4) as u32);
-            (0..n).map(|n| be32(stco, 8 + 4 * n as usize) as u64).collect()
+            (0..n)
+                .map(|n| be32(stco, 8 + 4 * n as usize) as u64)
+                .collect()
         }
         None => {
             let co64 = find(stbl, b"co64")?;

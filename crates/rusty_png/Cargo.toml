@@ -32,7 +32,19 @@ name = "rusty_png"
 path = "src/lib.rs"
 
 [features]
-default = []
+# `zlib-rs` is ON by default. Measured, single core, ABBA, z = 3.87 unless noted:
+#
+#   Compression::Default — zlib-rs faster on 13/13 images (1.26-2.72x), size
+#     within +-4.4%. Strictly dominates; no content class loses.
+#   Compression::Best    — photographic: faster (1.68-2.36x) AND smaller.
+#     Real graphics: SMALLER on 9/9 (-1.28% to -7.61%) but SLOWER on 5/9
+#     (0.62-0.88x). That is not a regression: it reaches sizes miniz_oxide
+#     cannot reach at any speed (gfx_diagram 198,896 B vs 215,275 B), and
+#     spending time for size is what `Best` exists to do.
+#
+# The speed sign-flip at `Best` is real and reproduced on real content — it is
+# recorded rather than averaged away. See WHYS.md.
+default = ["zlib-rs"]
 # Exposes internal kernels (unfilter, expand_paletted) so benchmarks and the
 # scalar-oracle A/B tests can reach them. Upstream calls this `benchmarks`.
 benchmarks = []

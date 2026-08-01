@@ -10,21 +10,24 @@
 /// Env-tunable psychoacoustic parameters, loaded once. Defaults reproduce the shipped model, so
 /// an unset environment is a no-op; the `VORBIS_*` overrides drive PEAQ-gated A/B tuning.
 pub(crate) struct PsyTune {
-    pub smr_base: f32,   // base signal-to-mask ratio (dB) added to every band
-    pub smr_tonal: f32,  // extra SMR (dB) for fully tonal bands (deeper mask → coded finer)
-    pub spread_up: f32,  // spreading slope (dB/Bark) toward higher bands
-    pub spread_dn: f32,  // spreading slope (dB/Bark) toward lower bands
-    pub q_scale: f32,    // dB the quality knob shifts the threshold across [0,1]
-    pub ceil: f32,       // floor ceiling as a fraction of frame peak
-    pub nfloor: f32,     // noise floor as a fraction of frame peak (at DC)
-    pub ath_tilt: f32,   // extra noise floor (dB, magnitude) at Nyquist vs DC — a crude ATH: the
+    pub smr_base: f32,  // base signal-to-mask ratio (dB) added to every band
+    pub smr_tonal: f32, // extra SMR (dB) for fully tonal bands (deeper mask → coded finer)
+    pub spread_up: f32, // spreading slope (dB/Bark) toward higher bands
+    pub spread_dn: f32, // spreading slope (dB/Bark) toward lower bands
+    pub q_scale: f32,   // dB the quality knob shifts the threshold across [0,1]
+    pub ceil: f32,      // floor ceiling as a fraction of frame peak
+    pub nfloor: f32,    // noise floor as a fraction of frame peak (at DC)
+    pub ath_tilt: f32,  // extra noise floor (dB, magnitude) at Nyquist vs DC — a crude ATH: the
     // ear can't hear quiet HF, so raise the floor there and don't waste bits coding it
-    pub ps_gate: f32,    // point-stereo active below this quality
-    pub ps_hz: f32,      // point-stereo cutoff frequency (Hz)
+    pub ps_gate: f32, // point-stereo active below this quality
+    pub ps_hz: f32,   // point-stereo cutoff frequency (Hz)
 }
 
 fn envf(name: &str, default: f32) -> f32 {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 pub(crate) fn tune() -> &'static PsyTune {

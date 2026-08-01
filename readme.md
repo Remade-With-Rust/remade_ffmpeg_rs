@@ -122,8 +122,9 @@ safer.
 
 ## Features
 
-- **Drop-in CLI.** `ffmpeg` and `ffprobe` binaries that speak the flags you
-  already know (`-i`, `-c:v`, `-c:a`, `-b:v`, `-f`, `-y`, `-codecs`, ...).
+- **Drop-in CLI.** `rff` and `rffprobe` binaries that speak the flags you
+  already know (`-i`, `-c:v`, `-c:a`, `-b:v`, `-f`, `-y`, `-codecs`, ...), and
+  install as `ffmpeg`/`ffprobe` on request (`--features drop-in-names`).
 - **Layered, swappable architecture.** One crate per codec and per container,
   registered into a central engine — mirrors FFmpeg's `libav*` split. See
   [docs/architecture.md](docs/architecture.md).
@@ -148,7 +149,7 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 | Video codec | **AV1** (AV1) | **decode + encode** — the royalty-free next-gen codec, **100% pure Rust, no C/FFI**. Our [rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) (`rusty_av1d` / `rusty_av1e`, BSD-2) forks **rav1d** (Rust port of VideoLAN's **dav1d**, the world's fastest AV1 decoder) + **rav1e** (the reference pure-Rust AV1 encoder), with a no-`nasm`, no-asm pure-Rust build path. Our encoder fork runs **~1.10× faster than stock rav1e at byte-identical output**, or up to **~1.69× faster** in opt-in `--racecar` mode |
 | Image codec | **avif** (AV1 still image) | **decode + encode**, 8- & 10-bit (`rusty_av1d` / `rusty_av1e`) |
 | Image codec | **png** (RGB/RGBA) | **decode + encode** (pure-Rust `png`) |
-| Image codec | **mjpeg** (JPEG/MJPEG) | **decode + encode** (pure-Rust `jpeg-decoder`/`jpeg-encoder`) |
+| Image codec | **mjpeg** (JPEG/MJPEG) | **decode + encode** — in-house pure-Rust (**[`rusty_jpeg`](https://crates.io/crates/rusty_jpeg)**, also usable standalone). A vendored merge of `jpeg-decoder` + `jpeg-encoder`, carried forward as one codec so the encoder is gated against the decoder as a round-trip oracle. Baseline **and** progressive DCT, planar YUV in/out (no needless upsample→resample round trip), real `-q:v` / sampling / `-optimize_huffman` control. Measured on one pinned core vs FFmpeg 8.1.2, at **matched output size** for encode and on a **byte-identical bitstream** for decode: **encode 1.19× faster (16%)**, **decode ~1.04× faster** (paired ABBA, N=15, 3000-frame arms, median 1.0390). AVX2 FDCT+quantize, an AVX2 IDCT doing **two 8×8 blocks per instruction stream** (byte-identical to SSSE3, +7.8% whole-decode), entropy decode **fused into the IDCT** so a baseline scan never buffers an MCU row of coefficients (deletes an ~18.8 MB/frame write→zero→read round trip), DC-only block shortcut, and rayon **removed** after it measured slower at *every* image size (1.32× / **1.91×** / 1.32× at 480p / 1080p / 4K — fork-join costs more than intra-frame parallelism buys) |
 | Image codec | **gif** | **decode + encode** (pure-Rust `gif`; first frame) |
 | Image codec | **webp** (VP8/VP8L) | **decode + lossless encode** (pure-Rust `image-webp`) |
 | Image codec | **jpegxl** (JPEG XL) | **decode** (pure-Rust `jxl-oxide`; no Rust encoder yet) |
@@ -176,8 +177,7 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 | AAC decode/encode | **in-house** ([`rusty_aac`](https://crates.io/crates/rusty_aac)) | Apache-2.0 | ✅ (AAC-LC; frame-parallel encoder; standalone crate) |
 | MP3 decode/encode | **in-house** ([`rusty_mp3`](https://crates.io/crates/rusty_mp3)) | Apache-2.0 | ✅ (decoder bit-exact vs FFmpeg; standalone crate) |
 | PNG encode/decode | [`png`](https://crates.io/crates/png) | MIT/Apache-2.0 | ✅ |
-| JPEG decode | [`jpeg-decoder`](https://crates.io/crates/jpeg-decoder) | MIT/Apache-2.0 | ✅ |
-| JPEG encode | [`jpeg-encoder`](https://crates.io/crates/jpeg-encoder) | MIT/Apache-2.0 AND IJG | ✅ |
+| JPEG decode/encode | **in-house** ([`rusty_jpeg`](https://crates.io/crates/rusty_jpeg)) | (MIT OR Apache-2.0) AND IJG | ✅ (vendored merge of `jpeg-decoder` + `jpeg-encoder`; baseline + progressive; standalone crate) |
 | GIF encode/decode | [`gif`](https://crates.io/crates/gif) | MIT/Apache-2.0 | ✅ |
 | WebP encode/decode | [`image-webp`](https://crates.io/crates/image-webp) | MIT/Apache-2.0 | ✅ |
 | Opus encode/decode | [`rusty-opus`](https://crates.io/crates/rusty-opus) (our `opus-rs` fork) | BSD-3-Clause | ✅ (AVX2 SILK + frame-parallel; pure Rust, no C/FFI) |
@@ -193,35 +193,57 @@ bitstream body is the next implementation step. More codecs/containers to come.
 ## Install
 
 ```sh
-# From source — needs `nasm` for the default H.264 SIMD path (see Building from
-# source for the no-nasm alternative). Add `--features https` for https:// input.
-cargo install --path crates/rff-cli
+# Needs `nasm` for the default H.264 SIMD path (see Building from source for the
+# no-nasm alternative). Add `--features https` for https:// input.
+cargo install rff-cli
 ```
 
-This installs the `ffmpeg` and `ffprobe` binaries. Prebuilt binaries will be
-posted to [Releases](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/releases).
+This installs the **`rff`** and **`rffprobe`** binaries.
+
+Want the drop-in `ffmpeg`/`ffprobe` names, so existing scripts work unchanged?
+
+```sh
+cargo install rff-cli --features drop-in-names
+```
+
+That's opt-in on purpose: those names shadow a real FFmpeg on your `PATH`, which
+should be your explicit choice rather than a side effect of installing. The
+prebuilt archives on
+[Releases](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/releases) ship
+both name pairs.
+
+To embed the engine in your own application, take the library instead:
+
+```sh
+cargo add rff
+```
+
+From a source checkout: `cargo install --path crates/rff-cli`.
 
 ## Quick start
 
 ```sh
 # List what this build supports — just like FFmpeg:
-ffmpeg -codecs
-ffmpeg -formats
+rff -codecs
+rff -formats
 
 # Inspect a file:
-ffprobe input.avif
+rffprobe input.avif
 
 # Transcode AVIF → AVIF end to end (decode AV1, re-encode AV1, rewrap):
-ffmpeg -i input.avif -c:v avif -y output.avif
+rff -i input.avif -c:v avif -y output.avif
 
 # Encode audio with an in-house, pure-Rust encoder — WAV → AAC in an MP4
 # (psychoacoustic model, transient block switching, M/S stereo, esds config):
-ffmpeg -i input.wav -c:a aac -b:a 128k -y output.m4a
+rff -i input.wav -c:a aac -b:a 128k -y output.m4a
 
 # …or FLAC (lossless, at ffmpeg parity), MP3, Vorbis, or Opus — same engine:
-ffmpeg -i input.wav -c:a flac -y output.flac
-ffmpeg -i input.wav -c:a vorbis -q:a 4 -y output.ogg
+rff -i input.wav -c:a flac -y output.flac
+rff -i input.wav -c:a vorbis -q:a 4 -y output.ogg
 ```
+
+<sub>Installed with `--features drop-in-names` (or taken from a release archive),
+the same commands work as `ffmpeg` / `ffprobe`.</sub>
 
 Or talk to the engine over HTTP (API-first):
 

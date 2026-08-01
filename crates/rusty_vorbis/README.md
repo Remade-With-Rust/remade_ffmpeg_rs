@@ -85,6 +85,16 @@ the sibling codec crates
 [`rusty-opus`](https://crates.io/crates/rusty-opus), and the
 [rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) forks.
 
+## About Mata Network
+
+<!-- ORG BOILERPLATE — keep identical across repos -->
+
+[Mata Network](https://www.mata.network) builds sovereign, self-hostable
+infrastructure. **Remade With Rust** is our open-source home for the
+permissively-licensed building blocks that work depends on.
+
+<!-- /ORG BOILERPLATE -->
+
 ## License
 
 Apache-2.0. See the workspace

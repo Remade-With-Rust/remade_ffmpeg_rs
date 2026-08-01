@@ -25,14 +25,39 @@ use std::path::PathBuf;
 
 use rff_codec::{CodecParams, Decoder, Encoder};
 use rff_core::{
-    AudioFrame, CodecId, Dictionary, Error, Frame, MediaType, Packet, Result, SampleFormat,
-    VideoFrame,
+    AudioFrame, CodecId, ColorRange, Dictionary, Error, Frame, MediaType, Packet, PixelFormat,
+    Result, SampleFormat, VideoFrame,
 };
 use rff_filter::{FilterChain, FilterComplex};
+
 use rff_format::{Muxer, Stream};
 use rff_resample::Resampler;
 
 use crate::Engine;
+
+/// Codecs whose decoded output is inherently full-range (they decode to RGB, or
+/// are defined on 0-255 samples). JPEG is the canonical case: the standard has
+/// no limited-range mode, which is why FFmpeg calls its pixel formats `yuvj*`.
+fn is_full_range_codec(codec: CodecId) -> bool {
+    matches!(
+        codec,
+        CodecId::Jpeg | CodecId::Png | CodecId::Gif | CodecId::Webp
+    )
+}
+
+/// What range this stream's decoded frames are actually in.
+///
+/// An `Unspecified` stream is not "unknown, do nothing" — every consumer has to
+/// pick something, so pick it here, once, explicitly:
+/// full-range for codecs that are defined that way, limited-range otherwise
+/// (the video convention, and what an untagged y4m means).
+fn effective_color_range(stream: &Stream) -> ColorRange {
+    match stream.color_range {
+        ColorRange::Unspecified if is_full_range_codec(stream.codec_id) => ColorRange::Full,
+        ColorRange::Unspecified => ColorRange::Limited,
+        explicit => explicit,
+    }
+}
 
 /// One input file for a job.
 #[derive(Debug, Clone)]
@@ -132,6 +157,12 @@ enum StreamOp {
         target_rate: u32,
         /// Lazily built once the first audio frame reveals the input rate.
         resampler: Option<Resampler>,
+        /// Pixel formats the encoder accepts (`None` = anything).
+        accepted_formats: Option<Vec<PixelFormat>>,
+        /// Lazily built conversion into an accepted format.
+        pixel_converter: Option<FilterChain>,
+        /// Range of the frames reaching the encoder, for that conversion.
+        source_range: ColorRange,
         out_index: usize,
         /// `-frames:v` limit for this output, and how many we have sent.
         max_video_frames: Option<u64>,
@@ -225,6 +256,55 @@ fn conform_audio(
         .pts
         .map(|p| p * target_rate as i64 / af.sample_rate.max(1) as i64);
     Ok(f32_frame(out, target_rate, af.channels, pts))
+}
+
+/// Convert a video frame into a pixel format the encoder accepts, if it isn't
+/// already in one. The converting chain is built lazily from the first frame
+/// that needs it, mirroring the audio resampler above.
+///
+/// This is what lets a decoder emit its cheapest native layout: the JPEG decoder
+/// hands out planar Y'CbCr, and a PNG encoder downstream still gets the RGB it
+/// requires because this inserts the conversion.
+fn conform_video(
+    converter: &mut Option<FilterChain>,
+    accepted: &Option<Vec<PixelFormat>>,
+    source_range: ColorRange,
+    frame: Frame,
+) -> Result<Frame> {
+    let Some(accepted) = accepted else {
+        return Ok(frame);
+    };
+    let Frame::Video(vf) = frame else {
+        return Ok(frame);
+    };
+    if accepted.is_empty() || accepted.contains(&vf.format) {
+        return Ok(Frame::Video(vf));
+    }
+    if converter.is_none() {
+        // First choice the encoder listed that we can actually convert to.
+        let target = accepted
+            .iter()
+            .find(|f| matches!(f, PixelFormat::Rgb24 | PixelFormat::Yuv420p))
+            .ok_or_else(|| {
+                Error::unsupported(format!(
+                    "no conversion from `{}` to any format this encoder accepts",
+                    vf.format.name()
+                ))
+            })?;
+        // Pin the range: `spec.limited` describes the Y'CbCr side either way,
+        // and guessing it wrong is a silent several-dB error.
+        let range = match source_range {
+            ColorRange::Limited => "limited",
+            _ => "full",
+        };
+        *converter = Some(FilterChain::parse(&format!(
+            "format={}:bt601:{}",
+            target.name(),
+            range
+        ))?);
+    }
+    let chain = converter.as_mut().expect("just built");
+    Ok(Frame::Video(chain.apply(vf)?))
 }
 
 /// Nominal seconds per HLS segment before rolling over on a keyframe. (A
@@ -445,11 +525,26 @@ fn build_op(
             let mut encoder = engine.codecs.find_encoder(target.codec)?;
             encoder.configure(&target.options)?; // rate control: -crf / -preset / -b
                                                  // Video filter graph (`-vf`); applies to video streams only.
-            let filters = if stream.media_type == MediaType::Video {
+            let mut filters = if stream.media_type == MediaType::Video {
                 FilterChain::parse(output.video_filters.as_deref().unwrap_or(""))?
             } else {
                 FilterChain::default()
             };
+            // Colour range has to be reconciled before any filter runs. JPEG (and
+            // the other image codecs) are defined on full-range samples, so
+            // handing them limited-range video encodes the wrong signal — it
+            // measured 28.35 dB where it should have been 36.15 dB, a deficit
+            // that looked exactly like poor encoder quality. Convert once, up
+            // front, then tell the rest of the chain what it is now looking at.
+            let mut source_range = ColorRange::Unspecified;
+            if stream.media_type == MediaType::Video {
+                source_range = effective_color_range(stream);
+                if is_full_range_codec(target.codec) && source_range == ColorRange::Limited {
+                    filters.prepend_range_conversion(true);
+                    source_range = ColorRange::Full;
+                }
+                filters.set_source_color_range(source_range);
+            }
             let (out_w, out_h) = filters.output_dims(stream.width, stream.height);
 
             // If the encoder only accepts certain sample rates and the input
@@ -466,12 +561,34 @@ fn build_op(
                 }
             }
 
+            let mut accepted_formats = encoder.accepted_pixel_formats();
+
             let mut os = Stream::new(out_index, target.codec);
             os.media_type = stream.media_type;
             os.time_base = stream.time_base;
             os.width = out_w;
             os.height = out_h;
             os.pixel_format = stream.pixel_format;
+            // Raw output declares its pixel format in the container header,
+            // which the muxer writes before a single frame has been seen. So the
+            // format cannot be discovered later — pin it now and force frames to
+            // match, or the header ends up describing data it does not have.
+            // (A 4:4:4 JPEG decoded straight to planes under a `C420mpeg2`
+            // header is silent corruption, not a mislabel.)
+            if target.codec == CodecId::RawVideo && stream.media_type == MediaType::Video {
+                let pinned = os.pixel_format.unwrap_or(PixelFormat::Yuv420p);
+                os.pixel_format = Some(pinned);
+                accepted_formats = Some(vec![pinned]);
+            }
+            // Colour range: a `format=` filter that converts to Y'CbCr decides
+            // it; otherwise it rides through from the input. Decoders whose
+            // native output is RGB (JPEG, PNG, GIF, WebP) are full-range by
+            // definition, so an untagged input from one of those is Full, not
+            // "unknown" — leaving it unspecified makes the muxer label the
+            // samples limited-range and every reader then rescales them.
+            // A colour conversion in the chain decides the output range;
+            // otherwise it is whatever we reconciled the source to above.
+            os.color_range = filters.output_color_range().unwrap_or(source_range);
             os.sample_rate = out_rate;
             os.channels = stream.channels;
             // Compressed-audio decoders (AAC/Opus/Vorbis/FLAC) emit f32; default
@@ -490,6 +607,9 @@ fn build_op(
                     overlay: None,
                     target_rate,
                     resampler: None,
+                    accepted_formats,
+                    pixel_converter: None,
+                    source_range,
                     out_index,
                     max_video_frames: output.max_video_frames,
                     video_frames_sent: 0,
@@ -591,6 +711,9 @@ fn process_packet(
             overlay,
             target_rate,
             resampler,
+            accepted_formats,
+            pixel_converter,
+            source_range,
             out_index,
             max_video_frames,
             video_frames_sent,
@@ -611,6 +734,8 @@ fn process_packet(
                         let frame = apply_filters(filters, frame)?;
                         let frame = apply_overlay(overlay, frame)?;
                         let frame = conform_audio(resampler, *target_rate, frame)?;
+                        let frame =
+                            conform_video(pixel_converter, accepted_formats, *source_range, frame)?;
                         encoder.send_frame(&frame)?;
                         drain_encoder(&mut **encoder, *out_index, muxer, report)?;
                     }
@@ -638,6 +763,9 @@ fn flush_streams(
             overlay,
             target_rate,
             resampler,
+            accepted_formats,
+            pixel_converter,
+            source_range,
             out_index,
             max_video_frames,
             video_frames_sent,
@@ -664,6 +792,8 @@ fn flush_streams(
                     let frame = apply_filters(filters, frame)?;
                     let frame = apply_overlay(overlay, frame)?;
                     let frame = conform_audio(resampler, *target_rate, frame)?;
+                    let frame =
+                        conform_video(pixel_converter, accepted_formats, *source_range, frame)?;
                     encoder.send_frame(&frame)?;
                     drain_encoder(&mut **encoder, *out_index, muxer, report)?;
                 }

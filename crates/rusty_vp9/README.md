@@ -109,6 +109,16 @@ Sibling engines from the same effort:
 [`rusty-opus`](https://crates.io/crates/rusty-opus) (Opus), [`rusty_vorbis`](https://crates.io/crates/rusty_vorbis) (Vorbis), and the
 [rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) (AV1).
 
+## About Mata Network
+
+<!-- ORG BOILERPLATE — keep identical across repos -->
+
+[Mata Network](https://www.mata.network) builds sovereign, self-hostable
+infrastructure. **Remade With Rust** is our open-source home for the
+permissively-licensed building blocks that work depends on.
+
+<!-- /ORG BOILERPLATE -->
+
 ## License
 
 Apache-2.0. VP9 itself is an open, **royalty-free** codec published by Google,

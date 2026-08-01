@@ -455,7 +455,15 @@ fn read_codebook(rdr: &mut BitReader) -> Result<Codebook> {
         for _ in 0..lookup_values {
             multiplicands.push(rdr.read(value_bits as u32)?);
         }
-        let vq = vq_lookup(lookup_type, min, delta, seq_p, &multiplicands, entries, dimensions);
+        let vq = vq_lookup(
+            lookup_type,
+            min,
+            delta,
+            seq_p,
+            &multiplicands,
+            entries,
+            dimensions,
+        );
         // A full, non-sequential lookup-1 book with every entry used is a separable lattice.
         let lattice = if lookup_type == 1 && !seq_p && lengths.iter().all(|&l| l > 0) {
             let mut prod = 1u64;
@@ -463,7 +471,10 @@ fn read_codebook(rdr: &mut BitReader) -> Result<Codebook> {
                 prod = prod.saturating_mul(lookup_values as u64);
             }
             (prod == entries as u64).then(|| {
-                let levels = multiplicands.iter().map(|&mc| mc as f32 * delta + min).collect();
+                let levels = multiplicands
+                    .iter()
+                    .map(|&mc| mc as f32 * delta + min)
+                    .collect();
                 (levels, lookup_values)
             })
         } else {
@@ -620,7 +631,9 @@ fn read_floor(rdr: &mut BitReader, codebook_cnt: u16) -> Result<Floor> {
                 if subclass != 0 {
                     let mb = rdr.read(8)? as u8;
                     if mb as u16 >= codebook_cnt {
-                        return Err(Error::invalid("vorbis setup: floor1 masterbook out of range"));
+                        return Err(Error::invalid(
+                            "vorbis setup: floor1 masterbook out of range",
+                        ));
                     }
                     class_masterbooks.push(mb);
                 } else {
@@ -631,7 +644,9 @@ fn read_floor(rdr: &mut BitReader, codebook_cnt: u16) -> Result<Floor> {
                 for _ in 0..books_cnt {
                     let book = (rdr.read(8)? as i16) - 1;
                     if book >= codebook_cnt as i16 {
-                        return Err(Error::invalid("vorbis setup: floor1 subclass book out of range"));
+                        return Err(Error::invalid(
+                            "vorbis setup: floor1 subclass book out of range",
+                        ));
                     }
                     books.push(book);
                 }
@@ -675,7 +690,11 @@ fn read_residue(rdr: &mut BitReader, codebook_cnt: usize) -> Result<Residue> {
     let mut cascade = Vec::with_capacity(classifications as usize);
     for _ in 0..classifications {
         let low = rdr.read(3)? as u8;
-        let high = if rdr.read_bool()? { rdr.read(5)? as u8 } else { 0 };
+        let high = if rdr.read_bool()? {
+            rdr.read(5)? as u8
+        } else {
+            0
+        };
         cascade.push((high << 3) | low);
     }
     let mut books = Vec::with_capacity(classifications as usize);
@@ -694,7 +713,9 @@ fn read_residue(rdr: &mut BitReader, codebook_cnt: usize) -> Result<Residue> {
         books.push(val_i);
     }
     if classbook as usize >= codebook_cnt {
-        return Err(Error::invalid("vorbis setup: residue classbook out of range"));
+        return Err(Error::invalid(
+            "vorbis setup: residue classbook out of range",
+        ));
     }
     Ok(Residue {
         residue_type: residue_type as u8,
@@ -738,7 +759,9 @@ fn read_mapping(
         coupling.push((mag, angle));
     }
     if rdr.read(2)? != 0 {
-        return Err(Error::invalid("vorbis setup: nonzero mapping reserved bits"));
+        return Err(Error::invalid(
+            "vorbis setup: nonzero mapping reserved bits",
+        ));
     }
     let mux = if submaps > 1 {
         let mut m = Vec::with_capacity(audio_channels as usize);
@@ -760,7 +783,9 @@ fn read_mapping(
         let floor = rdr.read(8)? as u8;
         let residue = rdr.read(8)? as u8;
         if floor >= floor_count || residue >= residue_count {
-            return Err(Error::invalid("vorbis setup: submap floor/residue out of range"));
+            return Err(Error::invalid(
+                "vorbis setup: submap floor/residue out of range",
+            ));
         }
         submap_floors.push(floor);
         submap_residues.push(residue);
@@ -860,7 +885,9 @@ pub fn parse_setup(packet: &[u8], audio_channels: u8) -> Result<SetupTables> {
     // The parse must have consumed the whole packet bar the final (partial) byte.
     let consumed_bytes = rdr.bit_pos().div_ceil(8) + 7; // +7 for the "vorbis" prefix
     if consumed_bytes != packet.len() {
-        return Err(Error::invalid("vorbis setup: trailing data after framing bit"));
+        return Err(Error::invalid(
+            "vorbis setup: trailing data after framing bit",
+        ));
     }
 
     Ok(SetupTables {
@@ -1016,8 +1043,12 @@ mod tests {
                         } else {
                             let cb = &s.codebooks[b as usize];
                             let used = cb.lengths.iter().filter(|&&l| l > 0).count();
-                            format!("b{b}(d{},e{},u{used},{})", cb.dimensions, cb.entries,
-                                if cb.lattice.is_some() { "LAT" } else { "brute" })
+                            format!(
+                                "b{b}(d{},e{},u{used},{})",
+                                cb.dimensions,
+                                cb.entries,
+                                if cb.lattice.is_some() { "LAT" } else { "brute" }
+                            )
                         }
                     })
                     .filter(|s| s != "-")

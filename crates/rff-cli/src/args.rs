@@ -216,12 +216,16 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                 }
             }
 
+            // JPEG/MJPEG private options default to video (an image codec has no
+            // audio side): -jpeg_quality 1..100, -sampling 444|440|422|420|411,
+            // -progressive, -optimize_huffman, -restart_interval.
             // `-pred` is PNG's filter/prediction knob (none/sub/up/avg/paeth/
-            // mixed), spelled as FFmpeg's PNG encoder spells it. Video-only by
-            // nature — no audio codec takes it.
-            "crf" | "qp" | "preset" | "pass" | "q" | "qscale" | "cpu-used" | "speed"
-            | "lag" | "lag-in-frames" | "arnr-strength" | "dispatch-budget"
-            | "pred" => {
+            // mixed), spelled as FFmpeg's PNG encoder spells it. It is video-only
+            // by nature — there is no audio codec that takes it.
+            "crf" | "qp" | "preset" | "pass" | "q" | "qscale" | "cpu-used" | "speed" | "lag"
+            | "lag-in-frames" | "arnr-strength" | "dispatch-budget" | "jpeg_quality"
+            | "sampling" | "jpeg_sampling" | "progressive" | "optimize_huffman"
+            | "restart_interval" | "pred" => {
                 let value = take_value(args, &mut i, arg)?;
                 if base == "pass" && value != "1" {
                     warnings
@@ -233,13 +237,12 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                 }
             }
 
-            // Codec private / tuning options forwarded to the encoder's
-            // `configure` Dictionary (audio by default; `:v` targets video).
-            // `-compression_level` is not audio-only: FFmpeg treats it as a generic
-            // codec option, and PNG uses it (0..9) exactly as Opus does (0..10).
-            // Unscoped it must therefore reach BOTH sides, or
+            // `-compression_level` is not audio-only: FFmpeg treats it as a
+            // generic codec option, and PNG uses it (0..9) exactly as Opus does
+            // (0..10). Unscoped it therefore has to reach BOTH dictionaries, or
             // `rff -i in.png -c:v png -compression_level 9 out.png` silently
-            // encodes at the default — which is what it used to do.
+            // encodes at the default — which is what it used to do. `:v` / `:a`
+            // still target one side.
             "compression_level" => {
                 let value = take_value(args, &mut i, arg)?;
                 match spec {
@@ -249,10 +252,12 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                 }
             }
 
+            // Codec private / tuning options forwarded to the encoder's
+            // `configure` Dictionary (audio by default; `:v` targets video).
             // Includes Opus: -application, -vbr, and the R1 frame-parallel
             // controls -opus_parallel / -opus_warmup / -threads.
-            "application" | "vbr" | "opus_parallel"
-            | "opus_warmup" | "threads" | "frame_duration" => {
+            "application" | "vbr" | "opus_parallel" | "opus_warmup" | "threads"
+            | "frame_duration" => {
                 let value = take_value(args, &mut i, arg)?;
                 match spec {
                     Some(s) if s.starts_with('v') => video_opts.set(base, value),

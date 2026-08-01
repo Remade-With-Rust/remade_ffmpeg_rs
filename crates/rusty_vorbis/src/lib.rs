@@ -260,7 +260,12 @@ impl VorbisEncoder {
     /// Input is buffered only; all blocks are encoded in parallel at
     /// [`VorbisEncoder::finish`] (each is an independent pure function of its
     /// window, so there's no benefit to encoding incrementally).
-    pub fn push_pcm_f32(&mut self, interleaved: &[f32], channels: u16, sample_rate: u32) -> Result<()> {
+    pub fn push_pcm_f32(
+        &mut self,
+        interleaved: &[f32],
+        channels: u16,
+        sample_rate: u32,
+    ) -> Result<()> {
         self.init_stream(channels, sample_rate)?;
         let ch = self.channels;
         let n = interleaved.len() / ch;
@@ -274,7 +279,12 @@ impl VorbisEncoder {
 
     /// Feed interleaved `i16` PCM (converted as `sample / 32768.0`, the exact
     /// math the rff adapter always used). See [`VorbisEncoder::push_pcm_f32`].
-    pub fn push_pcm_s16(&mut self, interleaved: &[i16], channels: u16, sample_rate: u32) -> Result<()> {
+    pub fn push_pcm_s16(
+        &mut self,
+        interleaved: &[i16],
+        channels: u16,
+        sample_rate: u32,
+    ) -> Result<()> {
         self.init_stream(channels, sample_rate)?;
         let ch = self.channels;
         let n = interleaved.len() / ch;
@@ -376,7 +386,9 @@ impl VorbisEncoder {
                             let bi = base + j;
                             let blocks: Vec<Vec<f32>> = if bi < starts.len() {
                                 let pos = starts[bi];
-                                (0..channels).map(|c| chans[c][pos..pos + N].to_vec()).collect()
+                                (0..channels)
+                                    .map(|c| chans[c][pos..pos + N].to_vec())
+                                    .collect()
                             } else {
                                 let pos = tail.unwrap();
                                 (0..channels)
@@ -461,7 +473,11 @@ mod tests {
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
-        assert!(packets.len() >= 5, "expected multiple audio packets, got {}", packets.len());
+        assert!(
+            packets.len() >= 5,
+            "expected multiple audio packets, got {}",
+            packets.len()
+        );
         // The first three packets are the setup headers, byte-equal to `headers()`.
         let headers = enc.headers();
         for (h, p) in headers.iter().zip(&packets) {

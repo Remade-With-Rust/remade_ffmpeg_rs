@@ -271,7 +271,9 @@ impl Muxer for OggMuxer {
         let s = streams
             .first()
             .filter(|s| matches!(s.codec_id, CodecId::Opus | CodecId::Vorbis))
-            .ok_or_else(|| Error::unsupported("ogg mux: needs a single `opus` or `vorbis` stream"))?;
+            .ok_or_else(|| {
+                Error::unsupported("ogg mux: needs a single `opus` or `vorbis` stream")
+            })?;
         self.codec = s.codec_id;
         self.channels = s.channels.clamp(1, 255) as u8;
         self.sample_rate = s.sample_rate.max(1);

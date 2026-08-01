@@ -30,7 +30,10 @@ fn class_window() -> usize {
     use std::sync::OnceLock;
     static W: OnceLock<usize> = OnceLock::new();
     *W.get_or_init(|| {
-        std::env::var("VORBIS_CLASS_WINDOW").ok().and_then(|s| s.parse().ok()).unwrap_or(3)
+        std::env::var("VORBIS_CLASS_WINDOW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3)
     })
 }
 
@@ -63,7 +66,9 @@ fn forward_couple(m_out: f32, a_out: f32) -> (f32, f32) {
 fn write_entry(bw: &mut BitWriter, book: &Codebook, e: u32) -> Result<()> {
     let (cw, len) = book.encode(e);
     if len == 0 {
-        return Err(Error::invalid("vorbis encode: tried to emit an unused codebook entry"));
+        return Err(Error::invalid(
+            "vorbis encode: tried to emit an unused codebook entry",
+        ));
     }
     bw.write(cw, len as u32);
     Ok(())
@@ -73,9 +78,17 @@ fn write_entry(bw: &mut BitWriter, book: &Codebook, e: u32) -> Result<()> {
 /// chunk, pick the (rate-distortion) best entry, optionally write its codeword, and subtract
 /// the reconstructed vector (so later passes refine the residual — the decode ADDs). Returns
 /// the number of codeword bits (written or simulated).
-fn vq_pass(seg: &mut [f32], book: &Codebook, lambda: f32, mut bw: Option<&mut BitWriter>) -> Result<u32> {
+fn vq_pass(
+    seg: &mut [f32],
+    book: &Codebook,
+    lambda: f32,
+    mut bw: Option<&mut BitWriter>,
+) -> Result<u32> {
     let dim = book.dimensions as usize;
-    let vq = book.vq.as_ref().expect("residue book must have a VQ lookup");
+    let vq = book
+        .vq
+        .as_ref()
+        .expect("residue book must have a VQ lookup");
     let mut bits = 0u32;
     let mut i = 0;
     while i + dim <= seg.len() {
@@ -165,7 +178,10 @@ fn encode_residue2(
             (1, nclasses_us - 1)
         } else {
             let center = predict_class(energy, nclasses_us);
-            (center.saturating_sub(window).max(1), (center + window).min(nclasses_us - 1))
+            (
+                center.saturating_sub(window).max(1),
+                (center + window).min(nclasses_us - 1),
+            )
         };
         for c in lo..=hi {
             let (dist, bits) = cascade_cost(seg, resid, codebooks, c, lambda, &mut work)?;
@@ -182,7 +198,10 @@ fn encode_residue2(
         }
     }
     #[cfg(test)]
-    prof::CLASSIFY_NS.fetch_add(_tc.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    prof::CLASSIFY_NS.fetch_add(
+        _tc.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // 2. Emit — exactly mirroring residue_packet_decode_inner's pass/partition order.
     #[cfg(test)]
@@ -196,7 +215,11 @@ fn encode_residue2(
                 // most-significant first). Pad past the end with class 0.
                 let mut entry = 0u32;
                 for i in 0..cpw {
-                    let c = if pc + i < partitions { classes[pc + i] as u32 } else { 0 };
+                    let c = if pc + i < partitions {
+                        classes[pc + i] as u32
+                    } else {
+                        0
+                    };
                     entry = entry * nclasses + c;
                 }
                 write_entry(bw, classbook, entry)?;
@@ -216,7 +239,10 @@ fn encode_residue2(
         }
     }
     #[cfg(test)]
-    prof::EMIT_NS.fetch_add(_te.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    prof::EMIT_NS.fetch_add(
+        _te.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     Ok(())
 }
 
@@ -287,7 +313,10 @@ pub fn encode_block(
         spectra.push(mdct_forward(&w));
     }
     #[cfg(test)]
-    prof::MDCT_NS.fetch_add(_tm.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    prof::MDCT_NS.fetch_add(
+        _tm.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // Bitstream header.
     let mut bw = BitWriter::new();
@@ -321,7 +350,10 @@ pub fn encode_block(
         }
     }
     #[cfg(test)]
-    prof::FLOOR_NS.fetch_add(_tf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    prof::FLOOR_NS.fetch_add(
+        _tf.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // Forward channel coupling (in order; decode inverse-couples in reverse).
     for &(mag, angle) in &mapping.coupling {
@@ -367,7 +399,10 @@ fn transient_ratio() -> f32 {
     use std::sync::OnceLock;
     static R: OnceLock<f32> = OnceLock::new();
     *R.get_or_init(|| {
-        std::env::var("VORBIS_TRANSIENT").ok().and_then(|s| s.parse().ok()).unwrap_or(6.0)
+        std::env::var("VORBIS_TRANSIENT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6.0)
     })
 }
 
@@ -432,7 +467,8 @@ pub fn encode_stream_bs(
     let mut p = 0;
     while p < n_periods {
         // Trigger one period early so the short run covers the attack, not the long-start's tail.
-        let transient_soon = trans.get(p + 1).copied().unwrap_or(false) || trans.get(p).copied().unwrap_or(false);
+        let transient_soon =
+            trans.get(p + 1).copied().unwrap_or(false) || trans.get(p).copied().unwrap_or(false);
         if transient_soon && p + 3 <= n_periods {
             sizes.push(true); // long start
             sizes.resize(sizes.len() + 8, false); // short run (8 shorts = one long period)
@@ -450,8 +486,16 @@ pub fn encode_stream_bs(
     for i in 0..sizes.len() {
         let is_long = sizes[i];
         let prev_long = if i == 0 { true } else { sizes[i - 1] };
-        let next_long = if i + 1 == sizes.len() { true } else { sizes[i + 1] };
-        let (n, mode_idx) = if is_long { (LONG, long_mode) } else { (SHORT, short_mode) };
+        let next_long = if i + 1 == sizes.len() {
+            true
+        } else {
+            sizes[i + 1]
+        };
+        let (n, mode_idx) = if is_long {
+            (LONG, long_mode)
+        } else {
+            (SHORT, short_mode)
+        };
         let (lws, rws) = window_bounds(n, prev_long, next_long);
         let pos = cursor - lws as i64;
         let ch_blocks: Vec<Vec<f32>> = channels
@@ -469,7 +513,15 @@ pub fn encode_stream_bs(
                     .collect()
             })
             .collect();
-        packets.push(encode_block(setup, &ch_blocks, mode_idx, prev_long, next_long, sample_rate, quality)?);
+        packets.push(encode_block(
+            setup,
+            &ch_blocks,
+            mode_idx,
+            prev_long,
+            next_long,
+            sample_rate,
+            quality,
+        )?);
         cursor += (rws - lws) as i64;
     }
     Ok(packets)
@@ -478,7 +530,9 @@ pub fn encode_stream_bs(
 #[cfg(test)]
 mod tests {
     use super::super::setup::{parse_setup, SETUP_Q4_STEREO};
-    use super::super::{write_comment_header, write_ident_header, BS0_LOG2, BS1_LOG2, BITRATE_NOMINAL};
+    use super::super::{
+        write_comment_header, write_ident_header, BITRATE_NOMINAL, BS0_LOG2, BS1_LOG2,
+    };
     use super::*;
 
     // --- Minimal Ogg pager (test-only, for the ffmpeg cross-decoder check) ---
@@ -576,7 +630,8 @@ mod tests {
         let mut audio = Vec::new();
         let mut pos = 0;
         while pos + n <= total {
-            let blocks: Vec<Vec<f32>> = (0..2).map(|ch| signal[ch][pos..pos + n].to_vec()).collect();
+            let blocks: Vec<Vec<f32>> =
+                (0..2).map(|ch| signal[ch][pos..pos + n].to_vec()).collect();
             audio.push(encode_long_packet(&setup, &blocks, 44_100, 0.5).unwrap());
             pos += hop;
         }
@@ -640,7 +695,11 @@ mod tests {
         // lewton's inverse_couple, verbatim.
         fn inverse_couple(m: f32, a: f32) -> (f32, f32) {
             if m > 0.0 {
-                if a > 0.0 { (m, m - a) } else { (m + a, m) }
+                if a > 0.0 {
+                    (m, m - a)
+                } else {
+                    (m + a, m)
+                }
             } else if a > 0.0 {
                 (m, m + a)
             } else {
@@ -651,7 +710,10 @@ mod tests {
             for &a in &[-4.0f32, -2.0, 0.0, 1.0, 6.0] {
                 let (cm, ca) = forward_couple(m, a);
                 let (rm, ra) = inverse_couple(cm, ca);
-                assert!((rm - m).abs() < 1e-4 && (ra - a).abs() < 1e-4, "m={m} a={a}");
+                assert!(
+                    (rm - m).abs() < 1e-4 && (ra - a).abs() < 1e-4,
+                    "m={m} a={a}"
+                );
             }
         }
     }
@@ -663,7 +725,9 @@ mod tests {
         let total = sig[0].len();
         let (mut bytes, mut pkts, mut pos) = (0usize, 0usize, 0usize);
         while pos + n <= total {
-            let blocks: Vec<Vec<f32>> = (0..sig.len()).map(|c| sig[c][pos..pos + n].to_vec()).collect();
+            let blocks: Vec<Vec<f32>> = (0..sig.len())
+                .map(|c| sig[c][pos..pos + n].to_vec())
+                .collect();
             bytes += encode_long_packet(setup, &blocks, 44_100, q).unwrap().len();
             pkts += 1;
             pos += hop;
@@ -729,15 +793,21 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_class_stats() {
-        let Ok(inp) = std::env::var("VORBIS_WAV_IN") else { return };
-        let q: f32 = std::env::var("VORBIS_Q").ok().and_then(|s| s.parse().ok()).unwrap_or(0.8);
+        let Ok(inp) = std::env::var("VORBIS_WAV_IN") else {
+            return;
+        };
+        let q: f32 = std::env::var("VORBIS_Q")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.8);
         let (rate, channels, inter) = read_wav(&inp);
         assert_eq!(channels, 2);
         let n = 2048usize;
         let hop = n / 2;
         let frames = inter.len() / channels;
-        let sig: Vec<Vec<f32>> =
-            (0..2).map(|c| (0..frames).map(|i| inter[i * channels + c]).collect()).collect();
+        let sig: Vec<Vec<f32>> = (0..2)
+            .map(|c| (0..frames).map(|i| inter[i * channels + c]).collect())
+            .collect();
         let setup = parse_setup(SETUP_Q4_STEREO, 2).unwrap();
         classdump::DATA.lock().unwrap().clear();
         classdump::ON.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -754,7 +824,11 @@ mod tests {
         // Per-class: count + energy percentiles (dB).
         let db = |e: f32| 10.0 * (e + 1e-20).log10();
         for c in 0u8..10 {
-            let mut es: Vec<f32> = data.iter().filter(|(_, cc)| *cc == c).map(|(e, _)| db(*e)).collect();
+            let mut es: Vec<f32> = data
+                .iter()
+                .filter(|(_, cc)| *cc == c)
+                .map(|(e, _)| db(*e))
+                .collect();
             if es.is_empty() {
                 continue;
             }
@@ -762,12 +836,17 @@ mod tests {
             let pct = |p: f32| es[((es.len() - 1) as f32 * p) as usize];
             eprintln!(
                 "class {c}: n={:5} ({:4.1}%)  dB[p5={:6.1} p50={:6.1} p95={:6.1}]",
-                es.len(), 100.0 * es.len() as f32 / total as f32, pct(0.05), pct(0.5), pct(0.95)
+                es.len(),
+                100.0 * es.len() as f32 / total as f32,
+                pct(0.05),
+                pct(0.5),
+                pct(0.95)
             );
         }
         // Per-dB-bucket: which classes appear, and how concentrated.
         eprintln!("--- per-2dB-bucket class histogram ---");
-        let mut buckets: std::collections::BTreeMap<i32, [u32; 10]> = std::collections::BTreeMap::new();
+        let mut buckets: std::collections::BTreeMap<i32, [u32; 10]> =
+            std::collections::BTreeMap::new();
         for (e, c) in data.iter() {
             let b = (db(*e) / 2.0).floor() as i32 * 2;
             buckets.entry(b).or_default()[*c as usize] += 1;
@@ -781,10 +860,16 @@ mod tests {
             let mut idx: Vec<usize> = (0..10).collect();
             idx.sort_by_key(|&i| std::cmp::Reverse(h[i]));
             let top3: u32 = idx[..3].iter().map(|&i| h[i]).sum();
-            let shown: Vec<String> = idx.iter().filter(|&&i| h[i] > 0)
-                .map(|&i| format!("{i}:{:.0}%", 100.0 * h[i] as f32 / tot as f32)).collect();
-            eprintln!("dB {b:4}: n={tot:5}  top3cover={:4.1}%  [{}]", 100.0 * top3 as f32 / tot as f32, shown.join(" "));
+            let shown: Vec<String> = idx
+                .iter()
+                .filter(|&&i| h[i] > 0)
+                .map(|&i| format!("{i}:{:.0}%", 100.0 * h[i] as f32 / tot as f32))
+                .collect();
+            eprintln!(
+                "dB {b:4}: n={tot:5}  top3cover={:4.1}%  [{}]",
+                100.0 * top3 as f32 / tot as f32,
+                shown.join(" ")
+            );
         }
     }
-
 }

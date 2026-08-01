@@ -158,8 +158,8 @@ unsafe fn quantize_masked_avx2(
     // its own round-to-nearest offset.
     let dc = coeffs[0] as i64;
     if dc != 0 {
-        let level = (((dc.unsigned_abs() << dq_shift) as i64 + dc_step as i64 / 2)
-            / dc_step as i64) as i32;
+        let level =
+            (((dc.unsigned_abs() << dq_shift) as i64 + dc_step as i64 / 2) / dc_step as i64) as i32;
         if level != 0 {
             let mag = ((level as i64 * dc_step as i64) >> dq_shift) as i32;
             levels[0] = if dc < 0 { -level } else { level };
@@ -261,8 +261,7 @@ mod tests {
                         let mut l2 = vec![0i32; n * n];
                         let mut d2 = vec![0i32; n * n];
                         let e1 = quantize_scan_loop(
-                            &coeffs, scan, dc, ac, ac_round, dq_shift, ac_thresh, &mut l1,
-                            &mut d1,
+                            &coeffs, scan, dc, ac, ac_round, dq_shift, ac_thresh, &mut l1, &mut d1,
                         );
                         let e2 = unsafe {
                             quantize_masked_avx2(

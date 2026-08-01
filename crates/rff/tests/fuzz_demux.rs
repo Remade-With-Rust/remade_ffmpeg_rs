@@ -42,17 +42,17 @@ const MAGICS: &[&[u8]] = &[
     b"OggS",                   // ogg
     b"____ftypisom",           // mp4/mov
     b"____ftypmp42",
-    b"____ftypavif", // avif
-    b"fLaC",         // flac
-    &[0xFF, 0xD8, 0xFF],       // jpeg
+    b"____ftypavif",                                   // avif
+    b"fLaC",                                           // flac
+    &[0xFF, 0xD8, 0xFF],                               // jpeg
     &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A], // png
-    b"GIF89a",                 // gif
-    b"FLV\x01",                // flv
-    &[0x47],                   // mpeg-ts sync
-    b"RIFF____WEBP",           // webp
-    &[0xFF, 0x0A],             // jpeg-xl
-    b"WEBVTT",                 // webvtt
-    b"1\n00:00:00,000",        // srt
+    b"GIF89a",                                         // gif
+    b"FLV\x01",                                        // flv
+    &[0x47],                                           // mpeg-ts sync
+    b"RIFF____WEBP",                                   // webp
+    &[0xFF, 0x0A],                                     // jpeg-xl
+    b"WEBVTT",                                         // webvtt
+    b"1\n00:00:00,000",                                // srt
 ];
 
 /// Build one malformed input: random bytes, optionally prefixed with a magic and
@@ -181,16 +181,25 @@ fn fuzz_demuxers_no_panic() {
     let _ = panic::take_hook();
 
     if !failures.is_empty() {
-        eprintln!("\n=== {} demuxer panic(s) (seed 0x{seed:016x}, {iters} iters) ===", failures.len());
+        eprintln!(
+            "\n=== {} demuxer panic(s) (seed 0x{seed:016x}, {iters} iters) ===",
+            failures.len()
+        );
         // De-dup by (format, panic site) so repeats collapse.
         let mut seen = std::collections::BTreeSet::new();
         for (fmt, cs, where_) in &failures {
             let key = format!("{fmt} :: {}", where_.lines().next().unwrap_or(""));
             if seen.insert(key.clone()) {
-                eprintln!("  [{fmt}] case_seed=0x{cs:016x}  {}", where_.lines().next().unwrap_or(""));
+                eprintln!(
+                    "  [{fmt}] case_seed=0x{cs:016x}  {}",
+                    where_.lines().next().unwrap_or("")
+                );
             }
         }
-        panic!("{} demuxer(s) panicked on malformed input (see list above)", seen.len());
+        panic!(
+            "{} demuxer(s) panicked on malformed input (see list above)",
+            seen.len()
+        );
     }
     println!("OK — no demuxer panicked over {iters} malformed inputs");
 }

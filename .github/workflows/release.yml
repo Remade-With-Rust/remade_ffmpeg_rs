@@ -38,8 +38,12 @@ jobs:
       # The default build enables `h264-asm`, which assembles with nasm.
       - uses: ilammy/setup-nasm@v1
 
-      - name: Build (release, default features + https)
-        run: cargo build --release --locked -p rff-cli --features https --target ${{ matrix.target }}
+      # `drop-in-names` additionally builds the `ffmpeg`/`ffprobe` executables.
+      # Release archives are an explicit "drop-in FFmpeg replacement" download,
+      # so they ship both name pairs; `cargo install rff-cli` (no feature) stays
+      # `rff`/`rffprobe` only and never shadows a real FFmpeg.
+      - name: Build (release, default features + https + drop-in names)
+        run: cargo build --release --locked -p rff-cli --features https,drop-in-names --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
@@ -49,14 +53,16 @@ jobs:
           bindir="target/${{ matrix.target }}/release"
           mkdir "$name"
           if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "$bindir/rff.exe" "$bindir/rffprobe.exe" "$name/"
             cp "$bindir/ffmpeg.exe" "$bindir/ffprobe.exe" "$name/"
           else
+            cp "$bindir/rff" "$bindir/rffprobe" "$name/"
             cp "$bindir/ffmpeg" "$bindir/ffprobe" "$name/"
           fi
           cp readme.md LICENSE "$name/" 2>/dev/null || true
           # SHA-256 checksums (sha256sum on Linux/Git-Bash, shasum on macOS).
           if command -v sha256sum >/dev/null; then sumcmd="sha256sum"; else sumcmd="shasum -a 256"; fi
-          ( cd "$name" && $sumcmd ffmpeg* ffprobe* > SHA256SUMS.txt )
+          ( cd "$name" && $sumcmd rff* ffmpeg* ffprobe* > SHA256SUMS.txt )
           if [ "${{ matrix.archive }}" = "zip" ]; then
             7z a "$name.zip" "$name" >/dev/null
             echo "ASSET=$name.zip" >> "$GITHUB_ENV"

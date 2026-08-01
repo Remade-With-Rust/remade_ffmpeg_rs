@@ -43,22 +43,22 @@ pub enum S {
     PredSse,      // shortlist prediction+SSE scoring (pred_sse — inline interp, own leaf)
     // --- INFO stages (NOT in TOPLEVEL; inclusive totals for decomposing orchestration).
     // self-time = the stage's total minus its scoped kernel children (computed by hand).
-    Sub8x8,       // INFO: decide_sub8x8 — inclusive, nests the search AND a full residual trial
-    RdCost,       // INFO: rd_cost_yuv + rd_cost_y (per-candidate RD; nests encode_plane kernels)
-    DecideLeaf,   // INFO: decide_inter (whole leaf mode decision; nests motion/pred_sse/rd_cost)
+    Sub8x8,     // INFO: decide_sub8x8 — inclusive, nests the search AND a full residual trial
+    RdCost,     // INFO: rd_cost_yuv + rd_cost_y (per-candidate RD; nests encode_plane kernels)
+    DecideLeaf, // INFO: decide_inter (whole leaf mode decision; nests motion/pred_sse/rd_cost)
     // --- Phase-0 glue bisection (2026-07-26). `rd_pick_partition` carries no scope,
     // so its whole body falls into the unscoped-orchestration residue (67.7 s =
     // 20.9% of encode vs libvpx's 3.3%). These four INFO buckets carve up that
     // body. They are deliberately NOT a scope on the function itself: it RECURSES,
     // and a nested-inclusive bucket would re-add the same span at every depth.
-    ModeMap,      // INFO: mode_map HashMap probe/insert (SipHash on a dense coord key)
-    SnapDrop,     // INFO: BlockSnap Drop — the free() half of snap_block's 7 Vecs
-    PartCtx,      // INFO: partition_plane_context + part_flag_cost + G1 gate arithmetic
-    VarTree,      // INFO: build_vt + variance (the content-dispatch tree)
+    ModeMap,  // INFO: mode_map HashMap probe/insert (SipHash on a dense coord key)
+    SnapDrop, // INFO: BlockSnap Drop — the free() half of snap_block's 7 Vecs
+    PartCtx,  // INFO: partition_plane_context + part_flag_cost + G1 gate arithmetic
+    VarTree,  // INFO: build_vt + variance (the content-dispatch tree)
     // Round 2 (2026-07-26): the first bisection left 65% of the glue dark. These
     // cover the remaining unscoped per-block bookkeeping in the decision path.
-    StoreMi,      // INFO: store_mi — splat the winning ModeInfo across the block's mi grid
-    MiCost,       // INFO: {intra,inter,sub8x8}_modeinfo_cost_q8 — mode-info bit pricing
+    StoreMi, // INFO: store_mi — splat the winning ModeInfo across the block's mi grid
+    MiCost,  // INFO: {intra,inter,sub8x8}_modeinfo_cost_q8 — mode-info bit pricing
     Count,
 }
 
@@ -106,8 +106,18 @@ const NAMES: [&str; N] = [
 // instead, and its exclusive part — the per-4×4 SAD search — carries its own
 // `Sub8x8Search` scope, which nests nothing and so is a legitimate partition member.
 const TOPLEVEL: [S; 13] = [
-    S::MotionSearch, S::Mc, S::FwdTx, S::Quantize, S::CoefCost, S::Trellis,
-    S::InvTxRecon, S::IntraPred, S::Sub8x8Search, S::SnapRestore, S::CtxUpdate, S::MvRefs,
+    S::MotionSearch,
+    S::Mc,
+    S::FwdTx,
+    S::Quantize,
+    S::CoefCost,
+    S::Trellis,
+    S::InvTxRecon,
+    S::IntraPred,
+    S::Sub8x8Search,
+    S::SnapRestore,
+    S::CtxUpdate,
+    S::MvRefs,
     S::PredSse,
 ];
 
@@ -161,7 +171,9 @@ pub fn snapshot() -> [(f64, u64); N] {
     let mut out = [(0.0f64, 0u64); N];
     for (i, o) in out.iter_mut().enumerate() {
         let calls = COUNT[i].load(Relaxed);
-        let cyc = CYC[i].load(Relaxed).saturating_sub(calls.saturating_mul(ovh_self));
+        let cyc = CYC[i]
+            .load(Relaxed)
+            .saturating_sub(calls.saturating_mul(ovh_self));
         *o = (cyc as f64 / hz * 1e3, calls);
     }
     out
@@ -278,9 +290,15 @@ impl Scope {
         let on = enabled();
         if on {
             let _ = CAL.get_or_init(|| (Instant::now(), rdtsc()));
-            Scope { stage: stage as usize, start: rdtsc().max(1) }
+            Scope {
+                stage: stage as usize,
+                start: rdtsc().max(1),
+            }
         } else {
-            Scope { stage: stage as usize, start: 0 }
+            Scope {
+                stage: stage as usize,
+                start: 0,
+            }
         }
     }
 }
@@ -315,8 +333,12 @@ pub fn dump() {
         let m = &crate::encode::frameenc::DEDUP;
         let (l, h, mt) = (m[0].load(Relaxed), m[1].load(Relaxed), m[2].load(Relaxed));
         if l > 0 {
-            eprintln!("  dedup: emit_lookups={} key_hits={:.1}% value_matches={:.1}%",
-                l, 100.0*h as f64/l as f64, 100.0*mt as f64/l as f64);
+            eprintln!(
+                "  dedup: emit_lookups={} key_hits={:.1}% value_matches={:.1}%",
+                l,
+                100.0 * h as f64 / l as f64,
+                100.0 * mt as f64 / l as f64
+            );
         }
     }
     let (t0, c0) = *CAL.get_or_init(|| (Instant::now(), rdtsc()));
@@ -340,9 +362,19 @@ pub fn dump() {
     // `ovh_full × (tens of millions of calls)` from the raw wall was not (a few-cyc
     // calibration wobble × 45M calls swung the total ±30%). The raw Total wall and
     // its instrument tax are printed separately as context, not used as the base.
-    let total = TOPLEVEL.iter().map(|&s| cor(s as usize)).sum::<u64>().max(1);
+    let total = TOPLEVEL
+        .iter()
+        .map(|&s| cor(s as usize))
+        .sum::<u64>()
+        .max(1);
     let ms = |c: u64| c as f64 / hz * 1e3;
-    let us_call = |c: u64, n: u64| if n > 0 { c as f64 / hz * 1e6 / n as f64 } else { 0.0 };
+    let us_call = |c: u64, n: u64| {
+        if n > 0 {
+            c as f64 / hz * 1e6 / n as f64
+        } else {
+            0.0
+        }
+    };
 
     eprintln!(
         "VP9_PROF2 (rdtsc @ {:.2} GHz; self-overhead {} cyc/scope removed; % = share of Σ measured primitives):",

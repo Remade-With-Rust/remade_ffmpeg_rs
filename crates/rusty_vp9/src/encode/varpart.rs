@@ -35,7 +35,10 @@ pub struct Var {
 impl Var {
     #[inline]
     fn add(self, o: Var) -> Var {
-        Var { sum: self.sum + o.sum, sum_sq: self.sum_sq + o.sum_sq }
+        Var {
+            sum: self.sum + o.sum,
+            sum_sq: self.sum_sq + o.sum_sq,
+        }
     }
     /// libvpx `get_variance`: `256 · (SSE − sum²/count) >> log2_count`, i.e. the
     /// per-sample variance scaled by 256. `log2_count` = log2 of the sample count.
@@ -102,8 +105,7 @@ impl VarTree {
         }
 
         // Aggregate each level from four children of the level below.
-        let mut level: [Vec<Var>; 4] =
-            [leaves, Vec::new(), Vec::new(), Vec::new()];
+        let mut level: [Vec<Var>; 4] = [leaves, Vec::new(), Vec::new(), Vec::new()];
         for l in 1..4 {
             let g = Self::grid(l);
             let cg = Self::grid(l - 1);

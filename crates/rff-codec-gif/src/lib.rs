@@ -80,6 +80,12 @@ struct GifEncoder {
 }
 
 impl RffEncoder for GifEncoder {
+    /// Packed RGB only — this encoder has no Y'CbCr path, so the pipeline
+    /// converts planar input (e.g. straight from the JPEG decoder) for us.
+    fn accepted_pixel_formats(&self) -> Option<Vec<PixelFormat>> {
+        Some(vec![PixelFormat::Rgb24, PixelFormat::Rgba])
+    }
+
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let vf = match frame {
             Frame::Video(v) => v,

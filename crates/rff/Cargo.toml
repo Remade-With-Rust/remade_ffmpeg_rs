@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["ffmpeg", "transcode", "video", "audio", "codec"]
+categories = ["multimedia", "multimedia::encoding"]
 
 [dependencies]
 rff-core.workspace = true
@@ -62,6 +67,9 @@ rff-codec-openh264 = { workspace = true, optional = true }
 # the kernels are hand-written x86 assembly in a single isolated `unsafe` crate.
 # Build with `--no-default-features` for the pure-Rust scalar path (no `nasm`).
 default = ["h264-asm"]
+# NOTE for docs.rs: see [package.metadata.docs.rs] at the foot of this file —
+# `h264-asm` needs `nasm`, which the docs.rs builder does not provide, so the
+# documentation build is pinned to --no-default-features.
 h264-asm = ["rff-codec-h264/asm"]
 # Enable `https://` streaming input (rustls + RustCrypto provider, pure Rust).
 # Off by default; pulls the optional TLS dependency tree only when requested.
@@ -74,3 +82,11 @@ h264-openh264 = ["dep:rff-codec-openh264"]
 # MD5 (RustCrypto, MIT/Apache) — used only by the VP9 conformance harness to
 # match libvpx's per-frame I420 hashes. Dev-only; not in the shipped graph.
 md-5 = "0.10"
+
+# docs.rs has no `nasm`, and the default `h264-asm` feature assembles
+# rusty_h264's vendored SIMD kernels — so the docs build would fail. Document
+# the pure-Rust configuration instead (identical public API), plus `https` so
+# the TLS input path is covered.
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["https"]

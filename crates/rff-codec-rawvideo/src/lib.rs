@@ -53,7 +53,9 @@ impl Decoder for RawVideoDecoder {
             .pixel_format
             .ok_or_else(|| Error::invalid("rawvideo decode: stream is missing a pixel format"))?;
         if params.width == 0 || params.height == 0 {
-            return Err(Error::invalid("rawvideo decode: stream is missing dimensions"));
+            return Err(Error::invalid(
+                "rawvideo decode: stream is missing dimensions",
+            ));
         }
         // Validate the format is one we handle.
         plane_dims(format, params.width as usize, params.height as usize)?;
@@ -137,7 +139,8 @@ impl Encoder for RawVideoEncoder {
         let dims = plane_dims(vf.format, w, h)?;
         // Emit tightly-packed planes, stripping any stride padding.
         let mut data = Vec::with_capacity(dims.iter().map(|(pw, ph)| pw * ph).sum());
-        for (plane, ((pw, ph), &stride)) in vf.planes.iter().zip(dims.iter().zip(vf.strides.iter())) {
+        for (plane, ((pw, ph), &stride)) in vf.planes.iter().zip(dims.iter().zip(vf.strides.iter()))
+        {
             for row in 0..*ph {
                 let start = row * stride;
                 data.extend_from_slice(&plane[start..start + pw]);
@@ -182,7 +185,8 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        dec.send_packet(&Packet::from_data(0, data.clone())).unwrap();
+        dec.send_packet(&Packet::from_data(0, data.clone()))
+            .unwrap();
         let Frame::Video(vf) = dec.receive_frame().unwrap() else {
             unreachable!()
         };

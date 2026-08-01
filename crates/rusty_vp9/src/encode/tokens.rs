@@ -449,8 +449,16 @@ impl<'a> RateTracker<'a> {
         }
         let a = self.nb[2 * c] as usize;
         let b = self.nb[2 * c + 1] as usize;
-        let ca = if a == ovr_pos { ovr_class } else { self.cache[a] };
-        let cb = if b == ovr_pos { ovr_class } else { self.cache[b] };
+        let ca = if a == ovr_pos {
+            ovr_class
+        } else {
+            self.cache[a]
+        };
+        let cb = if b == ovr_pos {
+            ovr_class
+        } else {
+            self.cache[b]
+        };
         (1 + ca as usize + cb as usize) >> 1
     }
 
@@ -459,7 +467,14 @@ impl<'a> RateTracker<'a> {
     /// non-zero) plus this position's ZERO / (non-zero + magnitude + sign) tokens.
     /// Exactly mirrors `code_block`'s per-position emission.
     #[inline]
-    fn recost(&self, c: usize, levels: &[i32], eob: usize, ovr_pos: usize, ovr_class: u8) -> (u64, u8) {
+    fn recost(
+        &self,
+        c: usize,
+        levels: &[i32],
+        eob: usize,
+        ovr_pos: usize,
+        ovr_class: u8,
+    ) -> (u64, u8) {
         let band = self.band[c] as usize;
         let ctx = self.ctx_at(c, ovr_pos, ovr_class);
         let mut cost = 0u64;
@@ -543,7 +558,14 @@ impl<'a> RateTracker<'a> {
     /// Collect the scan indices whose cost changes when `scan[i]` is altered to
     /// `new_class` (own position + neighbours + the checkpoint successor `i+1` when
     /// `i`'s zero/non-zero status flips). Small (≤ ~4); deduped, all ≤ `eob`.
-    fn affected(&self, i: usize, class_changed: bool, status_flipped: bool, eob: usize, out: &mut [usize; 8]) -> usize {
+    fn affected(
+        &self,
+        i: usize,
+        class_changed: bool,
+        status_flipped: bool,
+        eob: usize,
+        out: &mut [usize; 8],
+    ) -> usize {
         let mut n = 0usize;
         let codeable = |d: usize| d < eob || (d == eob && eob < self.max_eob);
         let push = |out: &mut [usize; 8], n: &mut usize, d: usize| {
@@ -589,7 +611,9 @@ impl<'a> RateTracker<'a> {
         self.p_costs[0] = (i, new_i);
         let mut pn = 1;
         for &d in &buf[..m] {
-            let nc = self.recost(d, levels, ne, self.scan[i] as usize, new_class).0;
+            let nc = self
+                .recost(d, levels, ne, self.scan[i] as usize, new_class)
+                .0;
             delta += nc as i64 - self.pcost[d] as i64;
             self.p_costs[pn] = (d, nc);
             pn += 1;
@@ -692,7 +716,17 @@ pub fn coef_cost(
         let (cc, ec) = &mut *b;
         let mut sink = CostSink(0);
         code_block::<_, false>(
-            &mut sink, levels, scan, nb, eob, coef_probs, tx_size, ctx, token_cache, cc, ec,
+            &mut sink,
+            levels,
+            scan,
+            nb,
+            eob,
+            coef_probs,
+            tx_size,
+            ctx,
+            token_cache,
+            cc,
+            ec,
             bit_depth,
         );
         sink.0
@@ -876,7 +910,8 @@ mod tests {
                 let mut walk = CostSink(0);
                 let class = code_magnitude(&mut walk, aval, prob2 as u8, &CAT6_PROB, 14);
                 assert_eq!(
-                    mag_cost_table()[prob2 as usize][aval as usize] as u64, walk.0,
+                    mag_cost_table()[prob2 as usize][aval as usize] as u64,
+                    walk.0,
                     "prob2={prob2} aval={aval}"
                 );
                 assert_eq!(class_of(aval), class, "class prob2={prob2} aval={aval}");
@@ -918,7 +953,11 @@ mod tests {
                     &levels, scan, nb, eob0, coef_probs, tx_size, tx as u8, ctx0, 8, &mut cbuf,
                     &mut pbuf, &mut bbuf,
                 );
-                assert_eq!(tr.total(), cc(&levels, eob0, &mut tc), "baseline {tx_size} {tx:?}");
+                assert_eq!(
+                    tr.total(),
+                    cc(&levels, eob0, &mut tc),
+                    "baseline {tx_size} {tx:?}"
+                );
                 let mut eob = eob0;
 
                 // EOB-tail drop pass (mirror trellis_eob): repeatedly zero scan[eob-1].
@@ -930,7 +969,11 @@ mod tests {
                         ne -= 1;
                     }
                     let want = cc(&levels, ne, &mut tc);
-                    assert_eq!(tr.probe(&levels, eob - 1, ne), want, "drop {tx_size} {tx:?} eob={eob}");
+                    assert_eq!(
+                        tr.probe(&levels, eob - 1, ne),
+                        want,
+                        "drop {tx_size} {tx:?} eob={eob}"
+                    );
                     tr.commit(&levels, eob - 1, ne);
                     assert_eq!(tr.total(), want, "drop commit {tx_size} {tx:?}");
                     eob = ne;
@@ -966,7 +1009,11 @@ mod tests {
                         assert_eq!(tr.total(), want, "lower commit {tx_size} {tx:?}");
                     } else {
                         levels[pos] = saved;
-                        assert_eq!(tr.total(), cc(&levels, eob, &mut tc), "lower reject {tx_size} {tx:?}");
+                        assert_eq!(
+                            tr.total(),
+                            cc(&levels, eob, &mut tc),
+                            "lower reject {tx_size} {tx:?}"
+                        );
                     }
                 }
             }

@@ -308,7 +308,9 @@ mod tests {
         let sr = 44100u32;
         let n = 4096usize;
         let pcm: Vec<f32> = (0..n)
-            .map(|i| ((i as f64 * 2.0 * std::f64::consts::PI * 440.0 / sr as f64).sin() * 0.5) as f32)
+            .map(|i| {
+                ((i as f64 * 2.0 * std::f64::consts::PI * 440.0 / sr as f64).sin() * 0.5) as f32
+            })
             .collect();
         let mut enc = AacEncoder::new(AacEncoderConfig::default());
         enc.push_pcm(&pcm, 1, sr).unwrap();
@@ -331,7 +333,9 @@ mod tests {
         let mut pos = 0usize;
         while pos + 7 <= adts.len() {
             let hdr = parse_adts(&adts[pos..]).unwrap();
-            let out = dec.decode(&adts[pos..pos + hdr.frame_length], None).unwrap();
+            let out = dec
+                .decode(&adts[pos..pos + hdr.frame_length], None)
+                .unwrap();
             assert_eq!(out.sample_rate, sr);
             assert_eq!(out.channels, 1);
             decoded += out.frames();

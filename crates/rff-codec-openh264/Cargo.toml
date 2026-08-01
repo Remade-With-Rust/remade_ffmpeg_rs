@@ -6,6 +6,17 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["h264", "openh264", "video", "codec", "ffi"]
+categories = ["multimedia", "multimedia::video", "external-ffi-bindings"]
+# PUBLISHED, but opt-in only. This is the project's one C/FFI crate. It ships to
+# crates.io because `rff` declares it as an OPTIONAL dependency (the
+# `h264-openh264` feature) and crates.io must be able to resolve optional deps —
+# an unpublished one makes `rff` itself unpublishable. Nobody compiles C unless
+# they explicitly enable that feature; the default H.264 path is the pure-Rust
+# `rff-codec-h264`.
 
 [dependencies]
 rff-core.workspace = true

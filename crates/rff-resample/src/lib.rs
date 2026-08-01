@@ -51,8 +51,8 @@ pub struct Resampler {
     /// Polyphase bank + integer position/phase (present iff the ratio is
     /// rational with `den ≤ MAX_PHASES`). `None` → scalar per-output kernel.
     poly: Option<Poly>,
-    ipos: usize,   // integer input index of the next output (mirrors pos.floor())
-    iphase: usize, // sub-sample phase in [0, den)
+    ipos: usize,        // integer input index of the next output (mirrors pos.floor())
+    iphase: usize,      // sub-sample phase in [0, den)
     force_scalar: bool, // test-only: bypass the polyphase path to exercise the oracle
 }
 
@@ -96,9 +96,18 @@ impl Resampler {
                     weights[p * WIDTH + k] = w as f32;
                     wsum += w;
                 }
-                inv_wsum[p] = if wsum == 0.0 { 1.0 } else { (1.0 / wsum) as f32 };
+                inv_wsum[p] = if wsum == 0.0 {
+                    1.0
+                } else {
+                    (1.0 / wsum) as f32
+                };
             }
-            Poly { weights, inv_wsum, num, den }
+            Poly {
+                weights,
+                inv_wsum,
+                num,
+                den,
+            }
         });
 
         Resampler {
@@ -301,9 +310,21 @@ unsafe fn dot_width_avx2(a: &[f32], b: &[f32]) -> f32 {
     let mut i = 0;
     while i + 32 <= WIDTH {
         s0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), s0);
-        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i + 8)), _mm256_loadu_ps(pb.add(i + 8)), s1);
-        s2 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i + 16)), _mm256_loadu_ps(pb.add(i + 16)), s2);
-        s3 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i + 24)), _mm256_loadu_ps(pb.add(i + 24)), s3);
+        s1 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(pa.add(i + 8)),
+            _mm256_loadu_ps(pb.add(i + 8)),
+            s1,
+        );
+        s2 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(pa.add(i + 16)),
+            _mm256_loadu_ps(pb.add(i + 16)),
+            s2,
+        );
+        s3 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(pa.add(i + 24)),
+            _mm256_loadu_ps(pb.add(i + 24)),
+            s3,
+        );
         i += 32;
     }
     while i + 8 <= WIDTH {

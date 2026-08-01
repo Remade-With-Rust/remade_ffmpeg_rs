@@ -6,6 +6,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+# NOT published. The Dioxus webview stack pulls MPL-2.0 crates transitively, so
+# this crate is scoped out of the `cargo-deny` no-copyleft gate — and out of
+# crates.io. The guard makes `cargo publish --workspace` skip it structurally
+# rather than relying on an `--exclude` flag being remembered.
+publish = false
 
 [[bin]]
 name = "rff-ui"

@@ -8,8 +8,8 @@
 use std::panic;
 
 use rff::Engine;
-use rff_core::{CodecId, Packet};
 use rff_codec::CodecParams;
+use rff_core::{CodecId, Packet};
 
 struct Rng(u64);
 impl Rng {
@@ -121,7 +121,11 @@ fn fuzz_decoders_no_panic() {
     for _ in 0..iters {
         let case_seed = rng.0;
         // Random bytes of varied length (occasionally longer, to hit size fields).
-        let len = if rng.range(100) < 10 { rng.range(65536) } else { rng.range(4096) } + 1;
+        let len = if rng.range(100) < 10 {
+            rng.range(65536)
+        } else {
+            rng.range(4096)
+        } + 1;
         let mut data = Vec::with_capacity(len);
         for _ in 0..len {
             data.push(rng.byte());
@@ -145,12 +149,18 @@ fn fuzz_decoders_no_panic() {
     let _ = panic::take_hook();
 
     if !failures.is_empty() {
-        eprintln!("\n=== {} decoder panic(s) (seed 0x{seed:016x}, {iters} iters) ===", failures.len());
+        eprintln!(
+            "\n=== {} decoder panic(s) (seed 0x{seed:016x}, {iters} iters) ===",
+            failures.len()
+        );
         let mut seen = std::collections::BTreeSet::new();
         for (id, cs, where_) in &failures {
             let key = format!("{id:?} :: {}", where_.lines().next().unwrap_or(""));
             if seen.insert(key.clone()) {
-                eprintln!("  [{id:?}] case_seed=0x{cs:016x}  {}", where_.lines().next().unwrap_or(""));
+                eprintln!(
+                    "  [{id:?}] case_seed=0x{cs:016x}  {}",
+                    where_.lines().next().unwrap_or("")
+                );
             }
         }
         panic!("{} decoder(s) panicked on malformed input", seen.len());

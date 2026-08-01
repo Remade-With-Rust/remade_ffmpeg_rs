@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["mpegts", "ts", "container", "demuxer", "muxer"]
+categories = ["multimedia", "parser-implementations"]
 
 [dependencies]
 rff-core.workspace = true

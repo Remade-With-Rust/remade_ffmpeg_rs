@@ -43,8 +43,16 @@ pub const BS0: usize = 256;
 /// full side → `[0, n/2)` / `[n/2, n)`; transition side → `[(n∓BS0)/4, (n±BS0)/4)` centred on
 /// `n/4` / `3n/4`. The analysis window here is the same as the synthesis window (Princen–Bradley).
 pub fn vorbis_window_bs(n: usize, prev_long: bool, next_long: bool) -> Vec<f32> {
-    let (lws, lwe) = if prev_long { (0, n / 2) } else { ((n - BS0) / 4, (n + BS0) / 4) };
-    let (rws, rwe) = if next_long { (n / 2, n) } else { ((3 * n - BS0) / 4, (3 * n + BS0) / 4) };
+    let (lws, lwe) = if prev_long {
+        (0, n / 2)
+    } else {
+        ((n - BS0) / 4, (n + BS0) / 4)
+    };
+    let (rws, rwe) = if next_long {
+        (n / 2, n)
+    } else {
+        ((3 * n - BS0) / 4, (3 * n + BS0) / 4)
+    };
     let lslope = window_slope(lwe - lws);
     let rslope = window_slope(rwe - rws);
     let mut w = vec![0.0f32; n];
@@ -283,7 +291,10 @@ mod tests {
             let fast = mdct_forward(&sig);
             let direct = mdct_direct(&sig);
             for (a, b) in fast.iter().zip(&direct) {
-                assert!((a - b).abs() <= 1e-3 * (1.0 + b.abs()), "bs={bs}: {a} vs {b}");
+                assert!(
+                    (a - b).abs() <= 1e-3 * (1.0 + b.abs()),
+                    "bs={bs}: {a} vs {b}"
+                );
             }
         }
     }
@@ -313,7 +324,11 @@ mod tests {
                 let t = i as f32;
                 let base = 0.5 * (0.02 * t).sin() + 0.3 * (0.09 * t + 0.7).sin();
                 // a transient burst mid-stream (where the short run sits)
-                let tr = if (7000..7200).contains(&i) { 0.8 * (0.9 * t).sin() } else { 0.0 };
+                let tr = if (7000..7200).contains(&i) {
+                    0.8 * (0.9 * t).sin()
+                } else {
+                    0.0
+                };
                 base + tr
             })
             .collect();
@@ -348,7 +363,10 @@ mod tests {
         for i in 4000..cursor as usize - 2048 {
             max_err = max_err.max((out[i] - signal[i]).abs());
         }
-        assert!(max_err < 1e-2, "block-switch reconstruction error {max_err}");
+        assert!(
+            max_err < 1e-2,
+            "block-switch reconstruction error {max_err}"
+        );
     }
 
     /// Princen–Bradley: `w[i]² + w[i+n/2]² == 1`.

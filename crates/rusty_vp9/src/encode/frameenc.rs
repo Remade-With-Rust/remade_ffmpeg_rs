@@ -32,13 +32,13 @@ use super::intermode::{
     write_comp_inter, write_comp_ref, write_inter_mode, write_interp_filter, write_is_inter,
     write_single_ref, SWITCHABLE_INTERP_TREE,
 };
-use crate::decode::{comp_ref_context, reference_mode_context};
 use super::mv::encode_mv;
 use super::quantize::quantize;
 use super::syntax::{
     write_intra_mode, write_partition, write_segment_id, write_selected_tx_size, write_skip,
 };
 use super::tokens::{coef_cost, cost_bit, encode_coefs, tree_bit_cost, RateTracker};
+use crate::decode::{comp_ref_context, reference_mode_context};
 
 pub static DEDUP: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3]; // emit_lookups, hits, matches
@@ -49,9 +49,8 @@ use super::varrd;
 use crate::block::{
     kf_uv_mode_probs, kf_y_mode_probs, partition_plane_context, skip_context, subsize,
     tx_size_context, update_partition_context, ModeInfo, Mv, ALTREF_FRAME, BLOCK_4X4, BLOCK_8X8,
-    GOLDEN_FRAME,
-    INTRA_FRAME, INTRA_MODE_TREE, LAST_FRAME, NEARESTMV, NEARMV, NEWMV, NONE_FRAME, PARTITION_NONE,
-    PARTITION_HORZ, PARTITION_SPLIT, PARTITION_TREE, PARTITION_VERT, ZEROMV,
+    GOLDEN_FRAME, INTRA_FRAME, INTRA_MODE_TREE, LAST_FRAME, NEARESTMV, NEARMV, NEWMV, NONE_FRAME,
+    PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT, PARTITION_TREE, PARTITION_VERT, ZEROMV,
 };
 use std::sync::atomic::AtomicU64;
 // VP9_PROF: cumulative wall-clock per encode stage (µs), summed across frames.
@@ -72,12 +71,12 @@ static SUB8_PROBE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 // [1]=Σ per-SB-oracle luma SSE (each 64×64 SB picks its own level), [2]=frames. ([0]−[1])/[0]
 // is the UPPER bound on the spatial per-segment-lf win (before the seg-map signalling cost).
 static LFSEG_PROBE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-use crate::decode::{average_split_mvs, INTER_MODE_TREE};
-use crate::geom_tables::{B_HEIGHT_LOG2, B_WIDTH_LOG2};
 use crate::decode::{
     adapt_coef_probs, clamp_mv_umv, intra_inter_context, single_ref_p1, single_ref_p2,
     switchable_interp_context, uv_tx_size, FrameContext, FrameCounts,
 };
+use crate::decode::{average_split_mvs, INTER_MODE_TREE};
+use crate::geom_tables::{B_HEIGHT_LOG2, B_WIDTH_LOG2};
 use crate::geom_tables::{MAX_TXSIZE, SIZE_GROUP};
 use crate::inter::{predict_block, RefPlane};
 use crate::loopfilter::loop_filter_frame;
@@ -202,7 +201,10 @@ impl ModeMap {
                 v
             }
         };
-        ModeMap { use_std, ..Default::default() }
+        ModeMap {
+            use_std,
+            ..Default::default()
+        }
     }
     #[inline]
     fn get(&self, mi_row: usize, mi_col: usize, bsize: usize) -> Option<(ModeInfo, Mv, u8)> {
@@ -350,7 +352,11 @@ macro_rules! pool_ops {
             if !snap_pool_enabled() {
                 return Vec::with_capacity(cap);
             }
-            let mut v = $pool.try_with(|p| p.borrow_mut().pop()).ok().flatten().unwrap_or_default();
+            let mut v = $pool
+                .try_with(|p| p.borrow_mut().pop())
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             v.reserve(cap);
             v
         }
@@ -1083,7 +1089,11 @@ impl FrameEncoder {
                 cnt += 1;
                 i += 4;
             }
-            if cnt > 0 { acc as f64 / cnt as f64 } else { 0.0 }
+            if cnt > 0 {
+                acc as f64 / cnt as f64
+            } else {
+                0.0
+            }
         });
         if std::env::var("VP9_ACT_DEBUG").is_ok() {
             eprintln!("ACT activity={:.3} inter={}", activity, is_inter);
@@ -1110,7 +1120,10 @@ impl FrameEncoder {
             // No segmentation / delta-q: one quantizer for Y and one for UV.
             dq_y: (dc_y, ac_y),
             dq_uv: (dc_quant(qindex as i32, 8), ac_quant(qindex as i32, 8)),
-            aq: std::env::var("VP9_AQ").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            aq: std::env::var("VP9_AQ")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             aq_active: false,
             aq_seg: Vec::new(),
             aq_ncols: 0,
@@ -1353,7 +1366,11 @@ impl FrameEncoder {
             sub8x8_g1: std::env::var("VP9_SUB8X8_G1")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(if std::env::var("VP9_NO_SUB8X8_GATE").is_ok() { 18.0 } else { 40.0 }),
+                .unwrap_or(if std::env::var("VP9_NO_SUB8X8_GATE").is_ok() {
+                    18.0
+                } else {
+                    40.0
+                }),
             sub8x8_skipgate: std::env::var("VP9_NO_SUB8X8_GATE").is_err(),
             last_none_sse: 0,
             var_part: std::env::var("VP9_VAR_PART").is_ok(),
@@ -1423,7 +1440,11 @@ impl FrameEncoder {
                 ((width * height) as f64 / CIF_PX).max(1.0).powf(alpha)
             };
         }
-        fe.active_filter = if fe.interp_filter < 4 { fe.interp_filter as u8 } else { 0 };
+        fe.active_filter = if fe.interp_filter < 4 {
+            fe.interp_filter as u8
+        } else {
+            0
+        };
         // u8 search mirror of the luma source (values are exact for 8-bit).
         if fe.max_px == 255 {
             fe.src8 = fe.src[0].buf.iter().map(|&v| v as u8).collect();
@@ -1545,11 +1566,7 @@ impl FrameEncoder {
     /// F3: chain this frame onto `fc` (the decoder's adapted context) with the
     /// previous frame's MV records for temporal prediction (None when the
     /// previous frame was a key/none — mirroring the decoder's `use_prev_mvs`).
-    pub fn set_chain(
-        &mut self,
-        fc: FrameContext,
-        prev_mvs: Option<std::sync::Arc<Vec<MvRef>>>,
-    ) {
+    pub fn set_chain(&mut self, fc: FrameContext, prev_mvs: Option<std::sync::Arc<Vec<MvRef>>>) {
         self.fc = fc;
         self.prev_mvs = prev_mvs;
         self.chain = true;
@@ -1590,9 +1607,9 @@ impl FrameEncoder {
             self.use_prob_updates = false; // skip the token-count gather pass
             self.g1_scale = 4.0; // partition gate ×4
             self.motion_fast = true; // subsample mode-shortlist SSE (≤±0.03 dB, ~1.05×)
-            // Bilinear-scored subpel refinement (libvpx sub_pixel_tree semantics):
-            // BD +0.55% mean for a cheaper scorer; `VP9_SUBPEL_8TAP` restores the
-            // commit-grade 8-tap scorer.
+                                     // Bilinear-scored subpel refinement (libvpx sub_pixel_tree semantics):
+                                     // BD +0.55% mean for a cheaper scorer; `VP9_SUBPEL_8TAP` restores the
+                                     // commit-grade 8-tap scorer.
             self.subpel_bilinear = std::env::var("VP9_SUBPEL_8TAP").is_err();
             // Plus+diagonal single-pass subpel (8.3 scores/search vs 12.9,
             // subpel 2.4→1.2µs — BELOW libvpx's 1.75): BD +1.35% mean, the
@@ -2106,7 +2123,12 @@ impl FrameEncoder {
         // bi-prediction, the ARF frame / non-ARF P frames fall back to LAST+GOLDEN — so
         // reference_mode is consistent across the group (mixing single/compound across a
         // group desyncs libvpx, a self-tolerated-but-illegal stream).
-        if self.is_inter && self.compound && !self.no_compound && self.altref_future && self.refs[2].is_some() {
+        if self.is_inter
+            && self.compound
+            && !self.no_compound
+            && self.altref_future
+            && self.refs[2].is_some()
+        {
             self.sign_bias = [false, false, false, true]; // INTRA,LAST,GOLDEN,ALTREF
             self.fc.reference_mode = 2; // REFERENCE_MODE_SELECT
             self.fc.comp_fixed_ref = 3; // ALTREF (future) is the fixed compound ref
@@ -2150,7 +2172,12 @@ impl FrameEncoder {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8000);
             if std::env::var("VP9_AQ_DEBUG").is_ok() {
-                eprintln!("AQ median_var={} gate_max={} active={}", median, maxvar, median <= maxvar);
+                eprintln!(
+                    "AQ median_var={} gate_max={} active={}",
+                    median,
+                    maxvar,
+                    median <= maxvar
+                );
             }
             self.aq_active = median <= maxvar;
             if self.aq_active {
@@ -2222,7 +2249,10 @@ impl FrameEncoder {
             self.commit_fc = None;
         }
         if _prof {
-            PROF_EMIT1.fetch_add(_t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            PROF_EMIT1.fetch_add(
+                _t.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         let _t = std::time::Instant::now();
         // Final (or only) pass: code with the adapted probs if set, else defaults.
@@ -2246,7 +2276,10 @@ impl FrameEncoder {
         let tile_data = assemble_tiles(&tiles);
 
         if _prof {
-            PROF_EMIT2.fetch_add(_t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            PROF_EMIT2.fetch_add(
+                _t.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         let _t = std::time::Instant::now();
         // ---- compressed header: signal the coef deltas; deblock the recon (R3) ----
@@ -2718,14 +2751,33 @@ impl FrameEncoder {
         let ctx0 = single_ref_p1(above.as_ref(), left.as_ref());
         c += cost_bit(self.fc.single_ref_prob[ctx0][0], 0); // LAST
         let mctx = get_mode_context(
-            &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, bsize,
+            &self.mi,
+            self.mi_cols,
+            self.mi_rows,
+            self.tile_start,
+            self.tile_end,
+            mi_row,
+            mi_col,
+            bsize,
         );
         let num_4x4_w = 1usize << B_WIDTH_LOG2[bsize];
         let num_4x4_h = 1usize << B_HEIGHT_LOG2[bsize];
         let edges = self.block_edges(mi_row, mi_col, bsize);
         let (cand, _) = find_mv_refs(
-            &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, bsize,
-            LAST_FRAME, &self.sign_bias, NEWMV, -1, edges, self.prev_mv(mi_row, mi_col),
+            &self.mi,
+            self.mi_cols,
+            self.mi_rows,
+            self.tile_start,
+            self.tile_end,
+            mi_row,
+            mi_col,
+            bsize,
+            LAST_FRAME,
+            &self.sign_bias,
+            NEWMV,
+            -1,
+            edges,
+            self.prev_mv(mi_row, mi_col),
         );
         let pred = lower_mv_precision(cand[0], self.hp_mv);
         let mut idy = 0;
@@ -2767,7 +2819,8 @@ impl FrameEncoder {
             let (mi, predictor, coef_q8, sse) =
                 self.decide_inter(mi_row, mi_col, bsize, bwl, bhl, true);
             // Record the decision for the emit pass (it only re-reads winning keys).
-            self.mode_map.insert(mi_row, mi_col, bsize, (mi, predictor, self.last_trial_tx));
+            self.mode_map
+                .insert(mi_row, mi_col, bsize, (mi, predictor, self.last_trial_tx));
             self.store_mi(mi_row, mi_col, bwl, bhl, &mi);
             let bits_q8 = coef_q8 + self.inter_modeinfo_cost_q8(&mi, mi_row, mi_col, predictor);
             self.last_none_sse = sse;
@@ -2990,8 +3043,10 @@ impl FrameEncoder {
             none_snap = Some(self.snap_block(mi_row, mi_col, n4x4_l2, n4x4_l2));
             self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, &start);
         }
-        let none_skip =
-            self.mode_map.get(mi_row, mi_col, bsize).map_or(false, |(m, _, _)| m.skip);
+        let none_skip = self
+            .mode_map
+            .get(mi_row, mi_col, bsize)
+            .map_or(false, |(m, _, _)| m.skip);
 
         // G1 partition gate (discovered 2026-07-09, ceiling-swept on 1.6M nodes,
         // clip-level holdout): when NONE already fits this well, the expensive arms
@@ -3006,8 +3061,8 @@ impl FrameEncoder {
                     * self.g1_area
                     * match bsize {
                         BLOCK_8X8 => 18.0, // bump to 33 at speed 0 was a weak trade (+0.16% BD)
-                        6 => 64.0,  // 16x16
-                        9 => 280.0, // 32x32
+                        6 => 64.0,         // 16x16
+                        9 => 280.0,        // 32x32
                         // 64×64: gated only at speed >= 3 (g1_64 = 0 disables).
                         _ => self.g1_64 / self.g1_scale.max(1e-9),
                     };
@@ -3068,7 +3123,8 @@ impl FrameEncoder {
                 let subsz = subsize(part, bsize) as usize; // BLOCK_4X4 / 8X4 / 4X8
                 let (mi, coef, sse) =
                     self.decide_sub8x8(mi_row, mi_col, subsz, n4x4_l2, n4x4_l2, true);
-                self.mode_map.insert(mi_row, mi_col, subsz, (mi, (0, 0), self.last_trial_tx));
+                self.mode_map
+                    .insert(mi_row, mi_col, subsz, (mi, (0, 0), self.last_trial_tx));
                 self.store_mi(mi_row, mi_col, n4x4_l2, n4x4_l2, &mi);
                 let bits = coef + self.sub8x8_modeinfo_cost_q8(&mi, mi_row, mi_col);
                 let rd = self.part_flag_cost(&probs, part, has_rows, has_cols)
@@ -3101,10 +3157,19 @@ impl FrameEncoder {
                 }
                 y += 2;
             }
-            let var = if cnt > 0 { (sq as f64 - (sum as f64) * (sum as f64) / cnt as f64) / cnt as f64 } else { 0.0 };
+            let var = if cnt > 0 {
+                (sq as f64 - (sum as f64) * (sum as f64) / cnt as f64) / cnt as f64
+            } else {
+                0.0
+            };
             eprintln!(
                 "G1 bsize={} q={} var={:.1} lambda={:.4} none={:.1} split={:.1} sub={:.1}",
-                bsize, self.qindex, var, self.lambda, none_rd, split_rd,
+                bsize,
+                self.qindex,
+                var,
+                self.lambda,
+                none_rd,
+                split_rd,
                 sub_best.as_ref().map_or(f64::MAX, |b| b.1)
             );
         }
@@ -3112,7 +3177,11 @@ impl FrameEncoder {
         let best_split = split_rd.min(sub_rd);
         // Partition cascade: when NONE codes skip, bias the compare toward the large
         // skip block (its per-block header savings are real but small vs pred_sse).
-        let none_gate = if none_skip { best_split * self.split_penalty } else { best_split };
+        let none_gate = if none_skip {
+            best_split * self.split_penalty
+        } else {
+            best_split
+        };
         let (partition, cost) = if none_rd <= none_gate {
             // NONE ran first — reinstate its end-state.
             self.restore_block(mi_row, mi_col, n4x4_l2, n4x4_l2, &none_snap.unwrap());
@@ -3338,22 +3407,52 @@ impl FrameEncoder {
         {
             let q = clamp_mv_umv(mv_hold, 8, 8, 0, 0, edges);
             let rp = &self.refs[slot_hold].as_ref().unwrap()[0];
-            let refp = RefPlane { buf: &rp.buf, stride: rp.stride, w: rp.w as i32, h: rp.h as i32 };
+            let refp = RefPlane {
+                buf: &rp.buf,
+                stride: rp.stride,
+                w: rp.w as i32,
+                h: rp.h as i32,
+            };
             predict_block(
-                &refp, base_x as i32 + (q.1 >> 4), base_y as i32 + (q.0 >> 4),
-                (q.1 & 15) as usize, (q.0 & 15) as usize, filt, &mut hold, 8, 8, 8, false, self.max_px,
+                &refp,
+                base_x as i32 + (q.1 >> 4),
+                base_y as i32 + (q.0 >> 4),
+                (q.1 & 15) as usize,
+                (q.0 & 15) as usize,
+                filt,
+                &mut hold,
+                8,
+                8,
+                8,
+                false,
+                self.max_px,
             );
         }
         let src = &self.src[0];
         let s0 = base_y * src.stride + base_x;
         let rp = &self.refs[slot_search].as_ref().unwrap()[0];
-        let refp = RefPlane { buf: &rp.buf, stride: rp.stride, w: rp.w as i32, h: rp.h as i32 };
+        let refp = RefPlane {
+            buf: &rp.buf,
+            stride: rp.stride,
+            w: rp.w as i32,
+            h: rp.h as i32,
+        };
         let score = |mv: Mv| -> i64 {
             let q = clamp_mv_umv(mv, 8, 8, 0, 0, edges);
             let mut buf = [0u16; 64];
             predict_block(
-                &refp, base_x as i32 + (q.1 >> 4), base_y as i32 + (q.0 >> 4),
-                (q.1 & 15) as usize, (q.0 & 15) as usize, filt, &mut buf, 8, 8, 8, false, self.max_px,
+                &refp,
+                base_x as i32 + (q.1 >> 4),
+                base_y as i32 + (q.0 >> 4),
+                (q.1 & 15) as usize,
+                (q.0 & 15) as usize,
+                filt,
+                &mut buf,
+                8,
+                8,
+                8,
+                false,
+                self.max_px,
             );
             let mut sad = 0i64;
             for r in 0..8 {
@@ -3416,11 +3515,24 @@ impl FrameEncoder {
             for (i, (mv, slot)) in [(mv0, slot0), (mv1, slot1)].iter().enumerate() {
                 let q = clamp_mv_umv(*mv, w as i32, h as i32, 0, 0, edges);
                 let rp = &self.refs[*slot].as_ref().unwrap()[0];
-                let refp =
-                    RefPlane { buf: &rp.buf, stride: rp.stride, w: rp.w as i32, h: rp.h as i32 };
+                let refp = RefPlane {
+                    buf: &rp.buf,
+                    stride: rp.stride,
+                    w: rp.w as i32,
+                    h: rp.h as i32,
+                };
                 predict_block(
-                    &refp, base_x as i32 + (q.1 >> 4), base_y as i32 + (q.0 >> 4),
-                    (q.1 & 15) as usize, (q.0 & 15) as usize, filt, &mut buf, w, w, h, i == 1,
+                    &refp,
+                    base_x as i32 + (q.1 >> 4),
+                    base_y as i32 + (q.0 >> 4),
+                    (q.1 & 15) as usize,
+                    (q.0 & 15) as usize,
+                    filt,
+                    &mut buf,
+                    w,
+                    w,
+                    h,
+                    i == 1,
                     self.max_px,
                 );
             }
@@ -3504,7 +3616,9 @@ impl FrameEncoder {
             self.tile_end = te;
             for (p, c) in self.above_ctx.iter_mut().enumerate() {
                 let ss = (p > 0) as usize;
-                c[(ts * 2) >> ss..(te * 2) >> ss].iter_mut().for_each(|v| *v = 0);
+                c[(ts * 2) >> ss..(te * 2) >> ss]
+                    .iter_mut()
+                    .for_each(|v| *v = 0);
             }
             self.above_seg[ts..te].iter_mut().for_each(|v| *v = 0);
             let mut mi_row = 0;
@@ -3643,16 +3757,25 @@ impl FrameEncoder {
             let write_single = |enc: &mut BoolEncoder, fc: &FrameContext, rf: i8| {
                 let ctx0 = single_ref_p1(above.as_ref(), left.as_ref());
                 let ctx1 = single_ref_p2(above.as_ref(), left.as_ref());
-                write_single_ref(enc, rf, fc.single_ref_prob[ctx0][0], fc.single_ref_prob[ctx1][1]);
+                write_single_ref(
+                    enc,
+                    rf,
+                    fc.single_ref_prob[ctx0][0],
+                    fc.single_ref_prob[ctx1][1],
+                );
             };
             if self.fc.reference_mode == 2 {
                 let rmctx = reference_mode_context(
-                    above.as_ref(), left.as_ref(), self.sign_bias, self.fc.comp_fixed_ref,
+                    above.as_ref(),
+                    left.as_ref(),
+                    self.sign_bias,
+                    self.fc.comp_fixed_ref,
                 );
                 let is_comp = mi.has_second_ref();
                 write_comp_inter(enc, is_comp, self.fc.comp_inter_prob[rmctx]);
                 if is_comp {
-                    let crctx = comp_ref_context(above.as_ref(), left.as_ref(), self.sign_bias, &self.fc);
+                    let crctx =
+                        comp_ref_context(above.as_ref(), left.as_ref(), self.sign_bias, &self.fc);
                     // The var ref sits opposite the fixed ref's slot; its bit selects
                     // which comp_var_ref element it is.
                     let idx = self.sign_bias[self.fc.comp_fixed_ref] as usize;
@@ -3681,12 +3804,31 @@ impl FrameEncoder {
                 }
                 let sub = mi.sb_type as usize;
                 let mctx = get_mode_context(
-                    &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, sub,
+                    &self.mi,
+                    self.mi_cols,
+                    self.mi_rows,
+                    self.tile_start,
+                    self.tile_end,
+                    mi_row,
+                    mi_col,
+                    sub,
                 );
                 let edges = self.block_edges(mi_row, mi_col, sub);
                 let (cand, _) = find_mv_refs(
-                    &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, sub,
-                    mi.ref_frame[0], &self.sign_bias, NEWMV, -1, edges, self.prev_mv(mi_row, mi_col),
+                    &self.mi,
+                    self.mi_cols,
+                    self.mi_rows,
+                    self.tile_start,
+                    self.tile_end,
+                    mi_row,
+                    mi_col,
+                    sub,
+                    mi.ref_frame[0],
+                    &self.sign_bias,
+                    NEWMV,
+                    -1,
+                    edges,
+                    self.prev_mv(mi_row, mi_col),
                 );
                 let pred = lower_mv_precision(cand[0], self.hp_mv);
                 let num_4x4_w = 1usize << B_WIDTH_LOG2[sub];
@@ -3699,7 +3841,14 @@ impl FrameEncoder {
                         write_inter_mode(enc, mi.bmi[j], &self.fc.inter_mode_probs[mctx]);
                         if mi.bmi[j] == NEWMV {
                             let mut counts = NmvCounts::default();
-                            encode_mv(enc, mi.bmi_mv[j][0], pred, &self.fc.nmvc, self.hp_mv, &mut counts);
+                            encode_mv(
+                                enc,
+                                mi.bmi_mv[j][0],
+                                pred,
+                                &self.fc.nmvc,
+                                self.hp_mv,
+                                &mut counts,
+                            );
                         }
                         idx += num_4x4_w;
                     }
@@ -3707,7 +3856,14 @@ impl FrameEncoder {
                 }
             } else {
                 let mctx = get_mode_context(
-                    &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, bsize,
+                    &self.mi,
+                    self.mi_cols,
+                    self.mi_rows,
+                    self.tile_start,
+                    self.tile_end,
+                    mi_row,
+                    mi_col,
+                    bsize,
                 );
                 write_inter_mode(enc, mi.mode, &self.fc.inter_mode_probs[mctx]);
                 if self.interp_filter == 4 {
@@ -3715,15 +3871,33 @@ impl FrameEncoder {
                 }
                 if mi.mode == NEWMV {
                     let mut counts = NmvCounts::default();
-                    encode_mv(enc, mi.mv[0], predictor, &self.fc.nmvc, self.hp_mv, &mut counts);
+                    encode_mv(
+                        enc,
+                        mi.mv[0],
+                        predictor,
+                        &self.fc.nmvc,
+                        self.hp_mv,
+                        &mut counts,
+                    );
                     // Compound NEWMV codes a SECOND MV for ref[1] (GOLDEN), against its
                     // own find_mv_refs predictor — exactly the decoder's per-ref assign_mv.
                     if mi.has_second_ref() {
                         let edges = self.block_edges(mi_row, mi_col, bsize);
                         let (cand1, _) = find_mv_refs(
-                            &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end,
-                            mi_row, mi_col, bsize, mi.ref_frame[1], &self.sign_bias, NEWMV, -1,
-                            edges, self.prev_mv(mi_row, mi_col),
+                            &self.mi,
+                            self.mi_cols,
+                            self.mi_rows,
+                            self.tile_start,
+                            self.tile_end,
+                            mi_row,
+                            mi_col,
+                            bsize,
+                            mi.ref_frame[1],
+                            &self.sign_bias,
+                            NEWMV,
+                            -1,
+                            edges,
+                            self.prev_mv(mi_row, mi_col),
                         );
                         let pred1 = lower_mv_precision(cand1[0], self.hp_mv);
                         encode_mv(enc, mi.mv[1], pred1, &self.fc.nmvc, self.hp_mv, &mut counts);
@@ -3747,7 +3921,16 @@ impl FrameEncoder {
             for plane in 0..3 {
                 // Coded size = sb_type (subsize for sub-8×8) so the residual (4×4 tx) and
                 // MC dispatch match the trial in decide_sub8x8.
-                self.encode_plane(Some(enc), &mi, plane, mi_row, mi_col, mi.sb_type as usize, bwl, bhl);
+                self.encode_plane(
+                    Some(enc),
+                    &mi,
+                    plane,
+                    mi_row,
+                    mi_col,
+                    mi.sb_type as usize,
+                    bwl,
+                    bhl,
+                );
             }
         }
     }
@@ -3878,7 +4061,14 @@ impl FrameEncoder {
         // block's mode context, replacing the old rough 4.0/16.0 constants so the mode
         // search's RD matches what will actually be coded.
         let mctx = get_mode_context(
-            &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end, mi_row, mi_col, bsize,
+            &self.mi,
+            self.mi_cols,
+            self.mi_rows,
+            self.tile_start,
+            self.tile_end,
+            mi_row,
+            mi_col,
+            bsize,
         );
         let mode_bits = |m: u8| -> f64 {
             tree_bit_cost(
@@ -3928,8 +4118,19 @@ impl FrameEncoder {
             let (cand, _) = {
                 let _mvr = prof::Scope::new(prof::S::MvRefs);
                 find_mv_refs(
-                    &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end,
-                    mi_row, mi_col, bsize, rf, &self.sign_bias, NEWMV, -1, edges,
+                    &self.mi,
+                    self.mi_cols,
+                    self.mi_rows,
+                    self.tile_start,
+                    self.tile_end,
+                    mi_row,
+                    mi_col,
+                    bsize,
+                    rf,
+                    &self.sign_bias,
+                    NEWMV,
+                    -1,
+                    edges,
                     self.prev_mv(mi_row, mi_col),
                 )
             };
@@ -3942,12 +4143,12 @@ impl FrameEncoder {
             let ref_bits = if rf == LAST_FRAME { 1.0 } else { 2.0 };
             let mut ref_min = f64::INFINITY;
             let add = |cands: &mut Vec<_>,
-                           ref_min: &mut f64,
-                           topk: &mut [f64; 4],
-                           mode,
-                           mv,
-                           sse: i64,
-                           extra: f64| {
+                       ref_min: &mut f64,
+                       topk: &mut [f64; 4],
+                       mode,
+                       mv,
+                       sse: i64,
+                       extra: f64| {
                 // Rank by the Laplacian model's estimated CODED (dist, residual-rate) rather
                 // than raw pred-SSE — pred-SSE omits the residual bits that vary per candidate,
                 // which is exactly why a pred-SSE shortlist needs a large K. Model ranking is
@@ -3975,7 +4176,11 @@ impl FrameEncoder {
             // Abort bound for the next candidate: it must beat the current
             // kth-best J to make the shortlist (∞ until K have been collected,
             // or when the shortlist is off — the full-RD-all oracle).
-            let kq = if self.mode_shortlist { self.shortlist_k.clamp(1, 4) } else { usize::MAX };
+            let kq = if self.mode_shortlist {
+                self.shortlist_k.clamp(1, 4)
+            } else {
+                usize::MAX
+            };
             let bound_for = |topk: &[f64; 4], extra: f64| -> f64 {
                 if kq <= 4 && topk[kq - 1].is_finite() {
                     topk[kq - 1] - self.lambda * extra
@@ -3990,31 +4195,70 @@ impl FrameEncoder {
             if best_mv != (0, 0) {
                 let dr = (best_mv.0 - predictor.0).unsigned_abs();
                 let dc = (best_mv.1 - predictor.1).unsigned_abs();
-                let mvb =
-                    (10 + 2 * ((32 - dr.leading_zeros()) + (32 - dc.leading_zeros()))) as f64;
+                let mvb = (10 + 2 * ((32 - dr.leading_zeros()) + (32 - dc.leading_zeros()))) as f64;
                 let e = c_new + mvb + ref_bits;
-                let sse =
-                    self.pred_sse(mi_row, mi_col, best_mv, edges, bwl, bhl, bound_for(&topk, e));
+                let sse = self.pred_sse(
+                    mi_row,
+                    mi_col,
+                    best_mv,
+                    edges,
+                    bwl,
+                    bhl,
+                    bound_for(&topk, e),
+                );
                 add(&mut cands, &mut ref_min, &mut topk, NEWMV, best_mv, sse, e);
             }
             // NEARESTMV uses the nearest candidate; skip when it degenerates to (0,0).
             if predictor != (0, 0) {
                 let e = c_nearest + ref_bits;
-                let sse =
-                    self.pred_sse(mi_row, mi_col, predictor, edges, bwl, bhl, bound_for(&topk, e));
-                add(&mut cands, &mut ref_min, &mut topk, NEARESTMV, predictor, sse, e);
+                let sse = self.pred_sse(
+                    mi_row,
+                    mi_col,
+                    predictor,
+                    edges,
+                    bwl,
+                    bhl,
+                    bound_for(&topk, e),
+                );
+                add(
+                    &mut cands,
+                    &mut ref_min,
+                    &mut topk,
+                    NEARESTMV,
+                    predictor,
+                    sse,
+                    e,
+                );
             }
             // NEARMV uses the DISTINCT second candidate (re-scan to match the decoder).
             let (cand_near, _) = find_mv_refs(
-                &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end,
-                mi_row, mi_col, bsize, rf, &self.sign_bias, NEARMV, -1, edges,
+                &self.mi,
+                self.mi_cols,
+                self.mi_rows,
+                self.tile_start,
+                self.tile_end,
+                mi_row,
+                mi_col,
+                bsize,
+                rf,
+                &self.sign_bias,
+                NEARMV,
+                -1,
+                edges,
                 self.prev_mv(mi_row, mi_col),
             );
             let mv_near = lower_mv_precision(cand_near[1], self.hp_mv);
             if mv_near != (0, 0) && mv_near != predictor {
                 let e = c_near + ref_bits;
-                let sse =
-                    self.pred_sse(mi_row, mi_col, mv_near, edges, bwl, bhl, bound_for(&topk, e));
+                let sse = self.pred_sse(
+                    mi_row,
+                    mi_col,
+                    mv_near,
+                    edges,
+                    bwl,
+                    bhl,
+                    bound_for(&topk, e),
+                );
                 add(&mut cands, &mut ref_min, &mut topk, NEARMV, mv_near, sse, e);
             }
             slot_j[slot] = ref_min; // per-ref best skip-RD estimate (compound var pick)
@@ -4054,7 +4298,15 @@ impl FrameEncoder {
                 self.rd_cost_yuv(&mi_c, mi_row, mi_col, bsize, bwl, bhl, extra, best_inter.0)
             } else {
                 self.rd_cost_y(
-                    &mi_c, mi_row, mi_col, bsize, bwl, bhl, &snap, extra, best_inter.0,
+                    &mi_c,
+                    mi_row,
+                    mi_col,
+                    bsize,
+                    bwl,
+                    bhl,
+                    &snap,
+                    extra,
+                    best_inter.0,
                 )
             };
             if j < best_inter.0 {
@@ -4070,8 +4322,7 @@ impl FrameEncoder {
         // Content-adaptive gate: skip the compound trials on blocks the single ref already
         // predicts well (best_inter.0 ≤ compound_gate·λ) — bi-pred only pays where the
         // residual is high. λ-normalized ⇒ one threshold across QPs.
-        let gate_ok = self.compound_gate <= 0.0
-            || best_inter.0 > self.compound_gate * self.lambda;
+        let gate_ok = self.compound_gate <= 0.0 || best_inter.0 > self.compound_gate * self.lambda;
         if self.compound && !self.compound_force && self.fc.reference_mode == 2 && gate_ok {
             // Fixed compound ref (ALTREF for bi-pred, GOLDEN for the LAST+GOLDEN fallback);
             // it pairs with each searched var ref. Placement: sign_bias[fixed]=1 ⇒ the
@@ -4128,8 +4379,12 @@ impl FrameEncoder {
                     // refined pair as an EXTRA NEWMV candidate — the full RD below keeps it
                     // only when it truly wins (the cheap SAD search proposes, the RD disposes).
                     if self.compound_joint {
-                        let jv = self.compound_refine(mi_row, mi_col, var_mv, var_slot, fixed_mv, fixed_slot, edges);
-                        let jf = self.compound_refine(mi_row, mi_col, fixed_mv, fixed_slot, jv, var_slot, edges);
+                        let jv = self.compound_refine(
+                            mi_row, mi_col, var_mv, var_slot, fixed_mv, fixed_slot, edges,
+                        );
+                        let jf = self.compound_refine(
+                            mi_row, mi_col, fixed_mv, fixed_slot, jv, var_slot, edges,
+                        );
                         if (jv, jf) != (var_mv, fixed_mv) {
                             let jb = mvcost(jv, var_pred) + mvcost(jf, fixed_pred);
                             comp_cands.push((NEWMV, jv, jf, jb, c_new));
@@ -4143,15 +4398,38 @@ impl FrameEncoder {
                         let hp = self.hp_mv;
                         let derive = |rf: i8, mode: u8| -> Mv {
                             let (tmp, _) = find_mv_refs(
-                                &self.mi, self.mi_cols, self.mi_rows, self.tile_start,
-                                self.tile_end, mi_row, mi_col, bsize, rf, &self.sign_bias, mode,
-                                -1, edges, self.prev_mv(mi_row, mi_col),
+                                &self.mi,
+                                self.mi_cols,
+                                self.mi_rows,
+                                self.tile_start,
+                                self.tile_end,
+                                mi_row,
+                                mi_col,
+                                bsize,
+                                rf,
+                                &self.sign_bias,
+                                mode,
+                                -1,
+                                edges,
+                                self.prev_mv(mi_row, mi_col),
                             );
                             lower_mv_precision(tmp[if mode == NEARMV { 1 } else { 0 }], hp)
                         };
                         let pen = self.compound_near_penalty;
-                        comp_cands.push((NEARESTMV, derive(var_rf, NEARESTMV), derive(fixed_rf, NEARESTMV), pen, c_nearest));
-                        comp_cands.push((NEARMV, derive(var_rf, NEARMV), derive(fixed_rf, NEARMV), pen, c_near));
+                        comp_cands.push((
+                            NEARESTMV,
+                            derive(var_rf, NEARESTMV),
+                            derive(fixed_rf, NEARESTMV),
+                            pen,
+                            c_nearest,
+                        ));
+                        comp_cands.push((
+                            NEARMV,
+                            derive(var_rf, NEARMV),
+                            derive(fixed_rf, NEARMV),
+                            pen,
+                            c_near,
+                        ));
                     }
                     for &(cmode, mv0, mv1, mvbits, mbits) in comp_cands.iter() {
                         let mut cmi = mk_inter(var_rf, cmode, mv0);
@@ -4159,7 +4437,9 @@ impl FrameEncoder {
                         cmi.mv = [mv0, mv1];
                         let extra = 2.0 + mbits + mvbits; // comp_inter + comp_ref ≈ 2
                         let j = if self.chroma_rd {
-                            self.rd_cost_yuv(&cmi, mi_row, mi_col, bsize, bwl, bhl, extra, compound_j)
+                            self.rd_cost_yuv(
+                                &cmi, mi_row, mi_col, bsize, bwl, bhl, extra, compound_j,
+                            )
                         } else {
                             self.rd_cost_y(
                                 &cmi, mi_row, mi_col, bsize, bwl, bhl, &snap, extra, compound_j,
@@ -4222,7 +4502,14 @@ impl FrameEncoder {
             for &m in &[DC_PRED, V_PRED, H_PRED, TM_PRED] {
                 intra_mi.mode = m;
                 let j = self.rd_cost_y(
-                    &intra_mi, mi_row, mi_col, bsize, bwl, bhl, &snap, 8.0,
+                    &intra_mi,
+                    mi_row,
+                    mi_col,
+                    bsize,
+                    bwl,
+                    bhl,
+                    &snap,
+                    8.0,
                     best_intra.1.min(best_inter.0),
                 );
                 if j < best_intra.1 {
@@ -4237,14 +4524,23 @@ impl FrameEncoder {
                 intra_mi.uv_mode = self.best_intra_mode(mi_row, mi_col, 1, bwl, bhl);
                 // No abort here — this final re-cost needs the accurate full-YUV J for the
                 // intra-vs-inter compare, and it runs once per block (negligible cost).
-                best_intra.1 =
-                    self.rd_cost_yuv(&intra_mi, mi_row, mi_col, bsize, bwl, bhl, 8.0, f64::INFINITY);
+                best_intra.1 = self.rd_cost_yuv(
+                    &intra_mi,
+                    mi_row,
+                    mi_col,
+                    bsize,
+                    bwl,
+                    bhl,
+                    8.0,
+                    f64::INFINITY,
+                );
             }
         }
 
         let (best_j, best_slot, best_rf, best_mode, best_mv, mut predictor) = best_inter;
         // Three-way: single-inter (best_j) vs intra (best_intra.1) vs compound (compound_j).
-        let compound_wins = compound_mi.is_some() && compound_j < best_j && compound_j < best_intra.1;
+        let compound_wins =
+            compound_mi.is_some() && compound_j < best_j && compound_j < best_intra.1;
         let use_intra = !compound_wins && best_intra.1 < best_j;
         // Lock the chosen reference in for the trial reconstruct + the emit MC.
         let mut chosen = if compound_wins {
@@ -4288,7 +4584,10 @@ impl FrameEncoder {
             // not the single-ref best_mv (which is disconnected from the compound block).
             let comp = self.compound_filter && chosen.has_second_ref();
             let (cs0, cs1) = if comp {
-                ((chosen.ref_frame[0] - 1) as usize, (chosen.ref_frame[1] - 1) as usize)
+                (
+                    (chosen.ref_frame[0] - 1) as usize,
+                    (chosen.ref_frame[1] - 1) as usize,
+                )
             } else {
                 (0, 0)
             };
@@ -4297,7 +4596,15 @@ impl FrameEncoder {
                 self.active_filter = f;
                 let sse = if comp {
                     self.pred_sse_compound(
-                        mi_row, mi_col, chosen.mv[0], cs0, chosen.mv[1], cs1, edges, bwl, bhl,
+                        mi_row,
+                        mi_col,
+                        chosen.mv[0],
+                        cs0,
+                        chosen.mv[1],
+                        cs1,
+                        edges,
+                        bwl,
+                        bhl,
                     )
                 } else {
                     self.pred_sse(mi_row, mi_col, best_mv, edges, bwl, bhl, f64::INFINITY)
@@ -4328,8 +4635,15 @@ impl FrameEncoder {
             // a wrong residual estimate here forces wrong skip decisions on compound blocks).
             let sse = if self.compound_filter && chosen.has_second_ref() {
                 self.pred_sse_compound(
-                    mi_row, mi_col, chosen.mv[0], (chosen.ref_frame[0] - 1) as usize,
-                    chosen.mv[1], (chosen.ref_frame[1] - 1) as usize, edges, bwl, bhl,
+                    mi_row,
+                    mi_col,
+                    chosen.mv[0],
+                    (chosen.ref_frame[0] - 1) as usize,
+                    chosen.mv[1],
+                    (chosen.ref_frame[1] - 1) as usize,
+                    edges,
+                    bwl,
+                    bhl,
                 )
             } else {
                 self.pred_sse(mi_row, mi_col, best_mv, edges, bwl, bhl, f64::INFINITY)
@@ -4705,7 +5019,11 @@ impl FrameEncoder {
         let (swl, shl) = if self.corner_sad { (1, 1) } else { (bwl, bhl) };
         // u8 search mirror, fetched ONCE per search (a per-eval fetch measurably
         // cost more than the psadbw kernel saved).
-        let r8_arc = if self.u8_search() { Some(self.ref8_active()) } else { None };
+        let r8_arc = if self.u8_search() {
+            Some(self.ref8_active())
+        } else {
+            None
+        };
         let ref8 = r8_arc.as_deref();
         let _s = prof::Scope::new(prof::S::MotionSearch);
         let base_x = mi_col * 8;
@@ -4725,7 +5043,11 @@ impl FrameEncoder {
         // Does the predictor already fit well enough to skip the sweep?
         let mut seeded = false;
         if realtime_skip || self.me_skip > 0.0 {
-            let t = if realtime_skip { self.nonrd_me_skip } else { self.me_skip };
+            let t = if realtime_skip {
+                self.nonrd_me_skip
+            } else {
+                self.me_skip
+            };
             let (pr, pc) = (predictor.0 / 8, predictor.1 / 8);
             let psad = self.block_sad_sized(base_x, base_y, pr, pc, swl, shl, i64::MAX, ref8);
             let area = ((1i64 << bwl) * (1i64 << bhl) * 16) as f64; // luma pixels
@@ -4831,8 +5153,8 @@ impl FrameEncoder {
                                 }
                             }
                             let c = cc + dc;
-                            let sad =
-                                self.block_sad_sized(base_x, base_y, r, c, swl, shl, best_sad, ref8);
+                            let sad = self
+                                .block_sad_sized(base_x, base_y, r, c, swl, shl, best_sad, ref8);
                             let shorter = r.abs() + c.abs() < best_px.0.abs() + best_px.1.abs();
                             if sad < best_sad || (sad == best_sad && shorter) {
                                 best_sad = sad;
@@ -4851,8 +5173,7 @@ impl FrameEncoder {
                 // the redundant work it saved. The subpel diamond keeps its dedup
                 // because each of its scores is a full MC interpolation.)
                 let consider = |best_sad: &mut i64, best_px: &mut (i32, i32), r: i32, c: i32| {
-                    let sad =
-                        self.block_sad_sized(base_x, base_y, r, c, swl, shl, *best_sad, ref8);
+                    let sad = self.block_sad_sized(base_x, base_y, r, c, swl, shl, *best_sad, ref8);
                     let shorter = r.abs() + c.abs() < best_px.0.abs() + best_px.1.abs();
                     if sad < *best_sad || (sad == *best_sad && shorter) {
                         *best_sad = sad;
@@ -4874,12 +5195,7 @@ impl FrameEncoder {
                         let mut moved = false;
                         for quad in [
                             [(-step, 0), (step, 0), (0, -step), (0, step)],
-                            [
-                                (-step, -step),
-                                (-step, step),
-                                (step, -step),
-                                (step, step),
-                            ],
+                            [(-step, -step), (-step, step), (step, -step), (step, step)],
                         ] {
                             let all_interior =
                                 quad.iter().all(|&(dr, dc)| interior(cr + dr, cc + dc));
@@ -4894,8 +5210,8 @@ impl FrameEncoder {
                                     for k in 0..4 {
                                         let (r, c) = cands[k];
                                         let sad = sads[k];
-                                        let shorter = r.abs() + c.abs()
-                                            < best_px.0.abs() + best_px.1.abs();
+                                        let shorter =
+                                            r.abs() + c.abs() < best_px.0.abs() + best_px.1.abs();
                                         if sad < best_sad || (sad == best_sad && shorter) {
                                             best_sad = sad;
                                             best_px = (r, c);
@@ -5010,8 +5326,7 @@ impl FrameEncoder {
                                 vlen += 1;
                             }
                             let sad = score(cand, best_sad);
-                            let shorter =
-                                cand.0.abs() + cand.1.abs() < best.0.abs() + best.1.abs();
+                            let shorter = cand.0.abs() + cand.1.abs() < best.0.abs() + best.1.abs();
                             if sad < best_sad || (sad == best_sad && shorter) {
                                 best_sad = sad;
                                 best = cand;
@@ -5022,7 +5337,11 @@ impl FrameEncoder {
                 if self.g1_harvest {
                     eprintln!(
                         "G5 bw={} bh={} int_sad={} final_sad={} moved={}",
-                        1 << bwl, 1 << bhl, ip_sad, best_sad, (best != int) as u8
+                        1 << bwl,
+                        1 << bhl,
+                        ip_sad,
+                        best_sad,
+                        (best != int) as u8
                     );
                 }
                 return best;
@@ -5091,7 +5410,11 @@ impl FrameEncoder {
         if self.g1_harvest {
             eprintln!(
                 "G5 bw={} bh={} int_sad={} final_sad={} moved={}",
-                1 << bwl, 1 << bhl, ip_sad, best_sad, (best != int) as u8
+                1 << bwl,
+                1 << bhl,
+                ip_sad,
+                best_sad,
+                (best != int) as u8
             );
         }
         best
@@ -5278,11 +5601,19 @@ impl FrameEncoder {
         // Shortlist scoring only ranks candidates, so a 2× tile stride (with the SSE
         // scaled back to full-block magnitude for the λ·bits comparison) trades a
         // little ranking precision for ~4× fewer interps on 16×16+ blocks.
-        let step = if self.motion_fast && (tiles_w > 1 || tiles_h > 1) { 2 } else { 1 };
+        let step = if self.motion_fast && (tiles_w > 1 || tiles_h > 1) {
+            2
+        } else {
+            1
+        };
         // u8 SSE domain (8-bit content): fused interpolate + squared error per
         // tile, bit-identical (gated by `u8_sse_matches_u16_path`) — this also
         // replaces the SCALAR per-pixel d² loop below. Edge tiles fall back.
-        let r8_arc = if self.u8_search() { Some(self.ref8_active()) } else { None };
+        let r8_arc = if self.u8_search() {
+            Some(self.ref8_active())
+        } else {
+            None
+        };
         let (nl, nr) = if fx != 0 { (3i32, 5i32) } else { (0, 0) };
         let (nt, nb) = if fy != 0 { (3i32, 4i32) } else { (0, 0) };
         let mut pred = [0u16; 64];
@@ -5597,10 +5928,25 @@ impl FrameEncoder {
         for (i, (mv, slot)) in [(mv0, slot0), (mv1, slot1)].iter().enumerate() {
             let q = clamp_mv_umv(*mv, bw, bh, 0, 0, edges);
             let rp = &self.refs[*slot].as_ref().unwrap()[0];
-            let refp = RefPlane { buf: &rp.buf, stride: rp.stride, w: rp.w as i32, h: rp.h as i32 };
+            let refp = RefPlane {
+                buf: &rp.buf,
+                stride: rp.stride,
+                w: rp.w as i32,
+                h: rp.h as i32,
+            };
             predict_block(
-                &refp, base_x as i32 + (q.1 >> 4), base_y as i32 + (q.0 >> 4),
-                (q.1 & 15) as usize, (q.0 & 15) as usize, filt, &mut buf, 4, 4, 4, i == 1, self.max_px,
+                &refp,
+                base_x as i32 + (q.1 >> 4),
+                base_y as i32 + (q.0 >> 4),
+                (q.1 & 15) as usize,
+                (q.0 & 15) as usize,
+                filt,
+                &mut buf,
+                4,
+                4,
+                4,
+                i == 1,
+                self.max_px,
             );
         }
         let sp = &self.src[0];
@@ -5633,9 +5979,25 @@ impl FrameEncoder {
         use std::sync::atomic::Ordering::Relaxed;
         let single = self.sub4x4_sad(mi_row, mi_col, idx, idy, best_mv, bw, bh, edges);
         let neg = (-best_mv.0, -best_mv.1);
-        let c0 = self.sub4x4_sad_compound(mi_row, mi_col, idx, idy, best_mv, 0, (0, 0), fixed_slot, bw, bh, edges);
-        let c1 = self.sub4x4_sad_compound(mi_row, mi_col, idx, idy, best_mv, 0, best_mv, fixed_slot, bw, bh, edges);
-        let c2 = self.sub4x4_sad_compound(mi_row, mi_col, idx, idy, best_mv, 0, neg, fixed_slot, bw, bh, edges);
+        let c0 = self.sub4x4_sad_compound(
+            mi_row,
+            mi_col,
+            idx,
+            idy,
+            best_mv,
+            0,
+            (0, 0),
+            fixed_slot,
+            bw,
+            bh,
+            edges,
+        );
+        let c1 = self.sub4x4_sad_compound(
+            mi_row, mi_col, idx, idy, best_mv, 0, best_mv, fixed_slot, bw, bh, edges,
+        );
+        let c2 = self.sub4x4_sad_compound(
+            mi_row, mi_col, idx, idy, best_mv, 0, neg, fixed_slot, bw, bh, edges,
+        );
         let comp = c0.min(c1).min(c2);
         SUB8_PROBE[0].fetch_add(single as u64, Relaxed);
         SUB8_PROBE[1].fetch_add(comp.min(single) as u64, Relaxed);
@@ -5784,7 +6146,8 @@ impl FrameEncoder {
             while idx < 2 {
                 let j = idy * 2 + idx;
                 // ZEROMV baseline.
-                let mut best_cost = self.sub4x4_sad(mi_row, mi_col, idx, idy, (0, 0), bw, bh, edges);
+                let mut best_cost =
+                    self.sub4x4_sad(mi_row, mi_col, idx, idy, (0, 0), bw, bh, edges);
                 let mut best_mode = ZEROMV;
                 let mut best_mv = (0i32, 0i32);
                 // NEAREST / NEAR — free predicted MVs (no MV bits).
@@ -5804,7 +6167,9 @@ impl FrameEncoder {
                 // predicted mode already fits this 4×4 well, skip the search.
                 if self.sub8x8_prescreen > 0 && best_cost <= self.sub8x8_prescreen {
                     if do_probe {
-                        self.sub8_probe_acc(mi_row, mi_col, idx, idy, best_mv, fixed_slot, bw, bh, edges);
+                        self.sub8_probe_acc(
+                            mi_row, mi_col, idx, idy, best_mv, fixed_slot, bw, bh, edges,
+                        );
                     }
                     mi.bmi[j] = best_mode;
                     mi.bmi_mv[j] = [best_mv, (0, 0)];
@@ -5822,8 +6187,19 @@ impl FrameEncoder {
                     continue;
                 }
                 let (cand, _) = find_mv_refs(
-                    &self.mi, self.mi_cols, self.mi_rows, self.tile_start, self.tile_end,
-                    mi_row, mi_col, bsize, rf, &self.sign_bias, NEWMV, -1, edges,
+                    &self.mi,
+                    self.mi_cols,
+                    self.mi_rows,
+                    self.tile_start,
+                    self.tile_end,
+                    mi_row,
+                    mi_col,
+                    bsize,
+                    rf,
+                    &self.sign_bias,
+                    NEWMV,
+                    -1,
+                    edges,
                     self.prev_mv(mi_row, mi_col),
                 );
                 let pred = lower_mv_precision(cand[0], self.hp_mv);
@@ -5832,7 +6208,12 @@ impl FrameEncoder {
                     + NEWMV_SAD_PENALTY;
                 // G4 harvest (observe-only): predicted-mode SAD vs the searched NEWMV.
                 if self.g1_harvest {
-                    eprintln!("G4 pred_sad={} newmv_cost={} won={}", best_cost, cw, (cw < best_cost) as u8);
+                    eprintln!(
+                        "G4 pred_sad={} newmv_cost={} won={}",
+                        best_cost,
+                        cw,
+                        (cw < best_cost) as u8
+                    );
                 }
                 if cw < best_cost {
                     best_mode = NEWMV;
@@ -5840,7 +6221,9 @@ impl FrameEncoder {
                     best_cost = cw;
                 }
                 if do_probe {
-                    self.sub8_probe_acc(mi_row, mi_col, idx, idy, best_mv, fixed_slot, bw, bh, edges);
+                    self.sub8_probe_acc(
+                        mi_row, mi_col, idx, idy, best_mv, fixed_slot, bw, bh, edges,
+                    );
                 }
                 mi.bmi[j] = best_mode;
                 mi.bmi_mv[j] = [best_mv, (0, 0)];
@@ -5881,18 +6264,16 @@ impl FrameEncoder {
         // Sub-8×8 compound ceiling probe: the fixed compound ref's slot (comp_fixed_ref-1),
         // and whether to accumulate the SAD-reduction stats (observe-only).
         let fixed_slot = (self.fc.comp_fixed_ref as usize).wrapping_sub(1);
-        let probe = self.sub8_probe
-            && self.compound
-            && fixed_slot < 3
-            && self.refs[fixed_slot].is_some();
+        let probe =
+            self.sub8_probe && self.compound && fixed_slot < 3 && self.refs[fixed_slot].is_some();
         // LAST first (always). Its summed sub-block SAD is the cheap content signal: only
         // pay the GOLDEN/ALTREF search when LAST fits POORLY (gate) — static/well-predicted
         // leaves stay LAST-only (byte-identical, no extra cost), so the ~3× search lands only
         // on hard leaves. A better single ref adds NO MV bits, just less residual; the SAD
         // proxy under-prices non-LAST, so a margin penalty guards against equal-residual flips.
         let (last_mi, last_total) = self.sub8x8_search_ref(
-            mi_row, mi_col, bsize, num_4x4_w, num_4x4_h, bw, bh, edges,
-            LAST_FRAME, 0, probe, fixed_slot,
+            mi_row, mi_col, bsize, num_4x4_w, num_4x4_h, bw, bh, edges, LAST_FRAME, 0, probe,
+            fixed_slot,
         );
         let mut mi = last_mi;
         if self.sub8x8_multiref && (last_total as f64) > self.sub8x8_multiref_gate {
@@ -5902,8 +6283,8 @@ impl FrameEncoder {
                     continue;
                 }
                 let (m, total) = self.sub8x8_search_ref(
-                    mi_row, mi_col, bsize, num_4x4_w, num_4x4_h, bw, bh, edges,
-                    cand_rf, cand_slot, false, fixed_slot,
+                    mi_row, mi_col, bsize, num_4x4_w, num_4x4_h, bw, bh, edges, cand_rf, cand_slot,
+                    false, fixed_slot,
                 );
                 let cost = total as f64 + self.lambda * 2.0 + self.sub8x8_ref_penalty;
                 if cost < best_cost {
@@ -6294,7 +6675,9 @@ impl FrameEncoder {
         let mut eob = 0usize;
         if dedup_active && is_emit {
             if let Some((h, lv, dqv, e)) =
-                self.dedup_map.borrow().get(&(plane as u8, x0 as u32, y0 as u32, tx_size as u8))
+                self.dedup_map
+                    .borrow()
+                    .get(&(plane as u8, x0 as u32, y0 as u32, tx_size as u8))
             {
                 if *h == dedup_hash {
                     levels[..n].copy_from_slice(lv);
@@ -6603,7 +6986,13 @@ impl FrameEncoder {
                         }
                     }
                     inverse_transform_add_rows(
-                        &dq[..n], bs, tx_type, &mut temp[..n], bs, self.max_px, max_row + 1,
+                        &dq[..n],
+                        bs,
+                        tx_type,
+                        &mut temp[..n],
+                        bs,
+                        self.max_px,
+                        max_row + 1,
                     );
                 }
                 let mut d = 0u64;
@@ -6689,101 +7078,112 @@ impl FrameEncoder {
                 std::cell::RefCell::new((vec![0u8; 1024], vec![0u64; 1025], vec![0u8; 1024]));
         }
         TR_SCRATCH.with(|s| {
-        let mut g = s.borrow_mut();
-        let (cbuf, pbuf, bbuf) = &mut *g;
-        let mut tr = RateTracker::new(
-            levels, scan, nb, eob, probs, tx_size, tx_type as u8, ctx0, 8, cbuf, pbuf, bbuf,
-        );
-        let rj = |q8: u64| lambda * (q8 as f64 / 256.0);
-        let mut eob = eob;
-        let mut j = dist + rj(tr.total());
-        // EOB trim.
-        while eob > 0 {
-            let last = scan[eob - 1] as usize;
-            let (sl, sd) = (levels[last], dqcoeff[last]);
-            let d_new = dist - dist_of(last, sd) + dist_of(last, 0);
-            levels[last] = 0;
-            dqcoeff[last] = 0;
-            let mut ne = eob - 1;
-            while ne > 0 && levels[scan[ne - 1] as usize] == 0 {
-                ne -= 1;
-            }
-            let jp = d_new + rj(tr.probe(levels, eob - 1, ne));
-            if jp < j {
-                j = jp;
-                dist = d_new;
-                tr.commit(levels, eob - 1, ne);
-                eob = ne;
-            } else {
-                levels[last] = sl;
-                dqcoeff[last] = sd;
-                break;
-            }
-        }
-        // Interior lowering. DP-lite (default): pure magnitude lowerings
-        // (|lv| ≥ 2, not the last nonzero) price the rate delta with the FROZEN
-        // build-time (band, ctx) — a single table difference, no neighbour
-        // updates — exactly libvpx optimize_b's frozen-context approximation.
-        // Status-changing candidates (1→0, tail) keep the exact tracker path.
-        // `VP9_TRELLIS_EXACT_CTX=1` restores exact pricing for everything.
-        let frozen = self.trellis_frozen;
-        let mut rate_adj = 0i64; // Σ accepted frozen deltas (Q8)
-        let mut i = eob;
-        while i > 0 {
-            i -= 1;
-            let pos = scan[i] as usize;
-            let lv = levels[pos];
-            if lv == 0 {
-                continue;
-            }
-            let step = if pos == 0 { dc_step } else { ac_step };
-            let sign = if lv < 0 { -1i32 } else { 1 };
-            let aval = lv.unsigned_abs();
-            let mag = aval as i64 - 1;
-            let (ol, od) = (levels[pos], dqcoeff[pos]);
-            let new_dq = sign * ((mag * step) >> dq_shift) as i32;
-            let d_new = dist - dist_of(pos, od) + dist_of(pos, new_dq);
-            if frozen && aval >= 2 && i + 1 != eob {
-                let (band, fctx) = tr.frozen(i);
-                let p2 = tr.probs()[band][fctx][2];
-                if let (Some(cn), Some(co)) = (
-                    crate::encode::tokens::mag_cost_q8(p2, aval - 1),
-                    crate::encode::tokens::mag_cost_q8(p2, aval),
-                ) {
-                    let delta = cn as i64 - co as i64;
-                    let jp = d_new + lambda * ((rate_adj + delta) as f64 / 256.0)
-                        + rj(tr.total());
-                    if jp < j {
-                        levels[pos] = sign * mag as i32;
-                        dqcoeff[pos] = new_dq;
-                        dist = d_new;
-                        rate_adj += delta;
-                        j = jp;
-                    }
-                    continue;
+            let mut g = s.borrow_mut();
+            let (cbuf, pbuf, bbuf) = &mut *g;
+            let mut tr = RateTracker::new(
+                levels,
+                scan,
+                nb,
+                eob,
+                probs,
+                tx_size,
+                tx_type as u8,
+                ctx0,
+                8,
+                cbuf,
+                pbuf,
+                bbuf,
+            );
+            let rj = |q8: u64| lambda * (q8 as f64 / 256.0);
+            let mut eob = eob;
+            let mut j = dist + rj(tr.total());
+            // EOB trim.
+            while eob > 0 {
+                let last = scan[eob - 1] as usize;
+                let (sl, sd) = (levels[last], dqcoeff[last]);
+                let d_new = dist - dist_of(last, sd) + dist_of(last, 0);
+                levels[last] = 0;
+                dqcoeff[last] = 0;
+                let mut ne = eob - 1;
+                while ne > 0 && levels[scan[ne - 1] as usize] == 0 {
+                    ne -= 1;
+                }
+                let jp = d_new + rj(tr.probe(levels, eob - 1, ne));
+                if jp < j {
+                    j = jp;
+                    dist = d_new;
+                    tr.commit(levels, eob - 1, ne);
+                    eob = ne;
+                } else {
+                    levels[last] = sl;
+                    dqcoeff[last] = sd;
+                    break;
                 }
             }
-            levels[pos] = sign * mag as i32;
-            dqcoeff[pos] = new_dq;
-            let mut ne = eob;
-            while ne > 0 && levels[scan[ne - 1] as usize] == 0 {
-                ne -= 1;
+            // Interior lowering. DP-lite (default): pure magnitude lowerings
+            // (|lv| ≥ 2, not the last nonzero) price the rate delta with the FROZEN
+            // build-time (band, ctx) — a single table difference, no neighbour
+            // updates — exactly libvpx optimize_b's frozen-context approximation.
+            // Status-changing candidates (1→0, tail) keep the exact tracker path.
+            // `VP9_TRELLIS_EXACT_CTX=1` restores exact pricing for everything.
+            let frozen = self.trellis_frozen;
+            let mut rate_adj = 0i64; // Σ accepted frozen deltas (Q8)
+            let mut i = eob;
+            while i > 0 {
+                i -= 1;
+                let pos = scan[i] as usize;
+                let lv = levels[pos];
+                if lv == 0 {
+                    continue;
+                }
+                let step = if pos == 0 { dc_step } else { ac_step };
+                let sign = if lv < 0 { -1i32 } else { 1 };
+                let aval = lv.unsigned_abs();
+                let mag = aval as i64 - 1;
+                let (ol, od) = (levels[pos], dqcoeff[pos]);
+                let new_dq = sign * ((mag * step) >> dq_shift) as i32;
+                let d_new = dist - dist_of(pos, od) + dist_of(pos, new_dq);
+                if frozen && aval >= 2 && i + 1 != eob {
+                    let (band, fctx) = tr.frozen(i);
+                    let p2 = tr.probs()[band][fctx][2];
+                    if let (Some(cn), Some(co)) = (
+                        crate::encode::tokens::mag_cost_q8(p2, aval - 1),
+                        crate::encode::tokens::mag_cost_q8(p2, aval),
+                    ) {
+                        let delta = cn as i64 - co as i64;
+                        let jp =
+                            d_new + lambda * ((rate_adj + delta) as f64 / 256.0) + rj(tr.total());
+                        if jp < j {
+                            levels[pos] = sign * mag as i32;
+                            dqcoeff[pos] = new_dq;
+                            dist = d_new;
+                            rate_adj += delta;
+                            j = jp;
+                        }
+                        continue;
+                    }
+                }
+                levels[pos] = sign * mag as i32;
+                dqcoeff[pos] = new_dq;
+                let mut ne = eob;
+                while ne > 0 && levels[scan[ne - 1] as usize] == 0 {
+                    ne -= 1;
+                }
+                let jp = d_new + lambda * (rate_adj as f64 / 256.0) + rj(tr.probe(levels, i, ne));
+                if jp < j {
+                    j = jp;
+                    dist = d_new;
+                    tr.commit(levels, i, ne);
+                    eob = ne;
+                } else {
+                    levels[pos] = ol;
+                    dqcoeff[pos] = od;
+                }
             }
-            let jp = d_new + lambda * (rate_adj as f64 / 256.0) + rj(tr.probe(levels, i, ne));
-            if jp < j {
-                j = jp;
-                dist = d_new;
-                tr.commit(levels, i, ne);
-                eob = ne;
-            } else {
-                levels[pos] = ol;
-                dqcoeff[pos] = od;
-            }
-        }
-        // The tracker total plus the frozen-delta adjustment approximates the
-        // final rate (exact when DP-lite is off — then rate_adj == 0 and this is
-        // bit-for-bit coef_cost, per `rate_tracker_matches_coef_cost_incrementally`).
-        (eob, Some((tr.total() as i64 + rate_adj).max(0) as u64))
+            // The tracker total plus the frozen-delta adjustment approximates the
+            // final rate (exact when DP-lite is off — then rate_adj == 0 and this is
+            // bit-for-bit coef_cost, per `rate_tracker_matches_coef_cost_incrementally`).
+            (eob, Some((tr.total() as i64 + rate_adj).max(0) as u64))
         })
     }
 

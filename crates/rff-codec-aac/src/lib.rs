@@ -287,8 +287,7 @@ mod tests {
                     assert_eq!(a.format, SampleFormat::F32);
                     decoded += a.samples;
                     for c in a.planes[0].chunks_exact(4) {
-                        energy +=
-                            (f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64).powi(2);
+                        energy += (f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64).powi(2);
                     }
                 }
                 Err(Error::Eof) => break,

@@ -12,10 +12,10 @@
 
 use std::collections::VecDeque;
 
-use rusty_opus::parallel::{encode_parallel, ParallelConfig};
-use rusty_opus::{Application, OpusDecoder, OpusEncoder};
 use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder, Encoder};
 use rff_core::{AudioFrame, Dictionary, Error, Frame, MediaType, Packet, Result, SampleFormat};
+use rusty_opus::parallel::{encode_parallel, ParallelConfig};
+use rusty_opus::{Application, OpusDecoder, OpusEncoder};
 
 /// Opus frame duration in milliseconds (samples/frame = rate/1000 * this).
 const FRAME_MS: usize = 20;

@@ -28,11 +28,11 @@ mod inter;
 mod loopfilter;
 mod mv;
 mod predict;
+mod prob;
+mod prob_tables;
 /// Function-level decode profiler (`VP9_DPROF`). Public so the `video-tests`
 /// analyzer can drive it in-process; a normal decode never touches it.
 pub mod prof;
-mod prob;
-mod prob_tables;
 mod quant;
 mod scan_tables;
 mod token;
@@ -731,7 +731,11 @@ impl Vp9Decoder {
         // (it never mutates `self`), so a caught panic leaves the decoder
         // consistent — the frame just fails. The common malformed cases are
         // already rejected as `Err` upstream; this contains the long tail.
-        let recycled = if pool_disabled() { None } else { self.plane_pool.pop() };
+        let recycled = if pool_disabled() {
+            None
+        } else {
+            self.plane_pool.pop()
+        };
         let decode_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             decode::decode_frame(
                 &h,

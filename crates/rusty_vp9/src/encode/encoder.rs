@@ -756,7 +756,10 @@ impl Vp9Encoder {
                     .get_or_insert_with(|| Box::new(crate::Vp9Decoder::default()));
                 let _ = dec.push(bytes, None);
                 while dec.next_frame().is_ok() {}
-                eprintln!("RECON_CHECK frame {}: hidden (fed, not compared)", self.recon_check_n);
+                eprintln!(
+                    "RECON_CHECK frame {}: hidden (fed, not compared)",
+                    self.recon_check_n
+                );
                 self.recon_check_n += 1;
             }
         }
@@ -771,7 +774,10 @@ impl Vp9Encoder {
         let dec = self
             .recon_check_dec
             .get_or_insert_with(|| Box::new(crate::Vp9Decoder::default()));
-        let got = dec.push(bytes, None).ok().and_then(|_| dec.next_frame().ok());
+        let got = dec
+            .push(bytes, None)
+            .ok()
+            .and_then(|_| dec.next_frame().ok());
         let Some(vf) = got else {
             eprintln!("RECON_CHECK frame {}: DECODE FAILED", self.recon_check_n);
             self.recon_check_n += 1;
@@ -791,7 +797,10 @@ impl Vp9Encoder {
             for y in 0..ph {
                 for x in 0..pw {
                     let e = recon[p].get(y * cw + x).copied().unwrap_or(0) as u8;
-                    let d = vf.planes[p].get(y * vf.strides[p] + x).copied().unwrap_or(0);
+                    let d = vf.planes[p]
+                        .get(y * vf.strides[p] + x)
+                        .copied()
+                        .unwrap_or(0);
                     if e != d {
                         bad += 1;
                         if first.is_none() {
@@ -817,13 +826,19 @@ impl Vp9Encoder {
                 for yy in 0..ph {
                     for xx in 0..pw {
                         let e = recon[0].get(yy * cw + xx).copied().unwrap_or(0) as u8;
-                        let dv = vf.planes[0].get(yy * vf.strides[0] + xx).copied().unwrap_or(0);
+                        let dv = vf.planes[0]
+                            .get(yy * vf.strides[0] + xx)
+                            .copied()
+                            .unwrap_or(0);
                         if e != dv {
                             map[(yy / 64) * sbx + xx / 64] += 1;
                         }
                     }
                 }
-                eprintln!("  SB map ({}x{} superblocks, '.'=clean, #=count/410):", sbx, sby);
+                eprintln!(
+                    "  SB map ({}x{} superblocks, '.'=clean, #=count/410):",
+                    sbx, sby
+                );
                 for r in 0..sby {
                     let row: String = (0..sbx)
                         .map(|c| match map[r * sbx + c] {
@@ -920,7 +935,11 @@ impl Vp9Encoder {
     )> {
         let c = self.companion.as_ref()?;
         let temporal_ok = !c.last_intra_only && c.last_show_frame && !c.last_frame_key;
-        let mvs = if temporal_ok { c.prev_mvs.clone() } else { None };
+        let mvs = if temporal_ok {
+            c.prev_mvs.clone()
+        } else {
+            None
+        };
         Some((c.frame_contexts[0].clone(), mvs))
     }
 

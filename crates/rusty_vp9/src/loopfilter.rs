@@ -461,7 +461,16 @@ fn build_sb_masks(
         }
         r += row_step;
     }
-    SbMasks { v16, v8, v4, m16x16, m8x8, m4x4, m4x4_int, lfl }
+    SbMasks {
+        v16,
+        v8,
+        v4,
+        m16x16,
+        m8x8,
+        m4x4,
+        m4x4_int,
+        lfl,
+    }
 }
 
 /// Apply already-built masks to one plane.
@@ -1642,8 +1651,9 @@ pub fn loop_filter_frame(
                 let masks = match &cached {
                     Some((k, m)) if *k == key && !no_mask_share() => m,
                     _ => {
-                        let m =
-                            build_sb_masks(*ss_x, *ss_y, &lf, mi_grid, mi_rows, mi_cols, mi_row, mi_col);
+                        let m = build_sb_masks(
+                            *ss_x, *ss_y, &lf, mi_grid, mi_rows, mi_cols, mi_row, mi_col,
+                        );
                         cached = Some((key, m));
                         &cached.as_ref().unwrap().1
                     }

@@ -1,9 +1,10 @@
 [package]
 name = "rusty_vorbis"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+authors = ["Mata Network <https://www.mata.network>"]
 homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 description = "The first pure-Rust Ogg Vorbis encoder — psychoacoustic floor fit, channel coupling, RD residue VQ. Zero dependencies, no C/FFI; ffmpeg- and lewton-validated output."
 readme = "README.md"

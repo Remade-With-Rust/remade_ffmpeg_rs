@@ -458,10 +458,22 @@ unsafe fn predict8x8_v_avx2(
         row(4),
     ];
     for y in 0..8usize {
-        let v01 = _mm256_set_m128i(_mm_unpackhi_epi16(w[0], w[1]), _mm_unpacklo_epi16(w[0], w[1]));
-        let v23 = _mm256_set_m128i(_mm_unpackhi_epi16(w[2], w[3]), _mm_unpacklo_epi16(w[2], w[3]));
-        let v45 = _mm256_set_m128i(_mm_unpackhi_epi16(w[4], w[5]), _mm_unpacklo_epi16(w[4], w[5]));
-        let v67 = _mm256_set_m128i(_mm_unpackhi_epi16(w[6], w[7]), _mm_unpacklo_epi16(w[6], w[7]));
+        let v01 = _mm256_set_m128i(
+            _mm_unpackhi_epi16(w[0], w[1]),
+            _mm_unpacklo_epi16(w[0], w[1]),
+        );
+        let v23 = _mm256_set_m128i(
+            _mm_unpackhi_epi16(w[2], w[3]),
+            _mm_unpacklo_epi16(w[2], w[3]),
+        );
+        let v45 = _mm256_set_m128i(
+            _mm_unpackhi_epi16(w[4], w[5]),
+            _mm_unpacklo_epi16(w[4], w[5]),
+        );
+        let v67 = _mm256_set_m128i(
+            _mm_unpackhi_epi16(w[6], w[7]),
+            _mm_unpacklo_epi16(w[6], w[7]),
+        );
         let mut acc = _mm256_add_epi32(
             _mm256_add_epi32(_mm256_madd_epi16(v01, p01), _mm256_madd_epi16(v23, p23)),
             _mm256_add_epi32(_mm256_madd_epi16(v45, p45), _mm256_madd_epi16(v67, p67)),
@@ -561,10 +573,7 @@ mod u8score {
         let r = _mm256_adds_epi16(sum, _mm256_set1_epi16(64));
         let o = _mm256_srai_epi16::<7>(r);
         let p = _mm256_packus_epi16(o, o); // per-lane [0,255] clamp to u8
-        _mm_unpacklo_epi64(
-            _mm256_castsi256_si128(p),
-            _mm256_extracti128_si256::<1>(p),
-        )
+        _mm_unpacklo_epi64(_mm256_castsi256_si128(p), _mm256_extracti128_si256::<1>(p))
     }
 
     /// Horizontal pair-interleaves for 2 rows from one 16-byte window each
@@ -777,11 +786,12 @@ mod u8score {
         let ty = tp(fy);
         let base = refp.buf.as_ptr();
         let row = |r: i32| {
-            _mm_loadl_epi64(base.add((by + r) as usize * refp.stride + bx as usize) as *const __m128i)
+            _mm_loadl_epi64(
+                base.add((by + r) as usize * refp.stride + bx as usize) as *const __m128i
+            )
         };
         let rows: [__m128i; 15] = std::array::from_fn(|j| row(j as i32 - 3));
-        let inter: [__m128i; 14] =
-            std::array::from_fn(|j| _mm_unpacklo_epi8(rows[j], rows[j + 1]));
+        let inter: [__m128i; 14] = std::array::from_fn(|j| _mm_unpacklo_epi8(rows[j], rows[j + 1]));
         let mut sse = 0u32;
         for y in (0..8usize).step_by(2) {
             let m: [__m256i; 4] =
@@ -831,11 +841,12 @@ mod u8score {
         let ty = tp(fy);
         let base = refp.buf.as_ptr();
         let row = |r: i32| {
-            _mm_loadl_epi64(base.add((by + r) as usize * refp.stride + bx as usize) as *const __m128i)
+            _mm_loadl_epi64(
+                base.add((by + r) as usize * refp.stride + bx as usize) as *const __m128i
+            )
         };
         let rows: [__m128i; 15] = std::array::from_fn(|j| row(j as i32 - 3));
-        let inter: [__m128i; 14] =
-            std::array::from_fn(|j| _mm_unpacklo_epi8(rows[j], rows[j + 1]));
+        let inter: [__m128i; 14] = std::array::from_fn(|j| _mm_unpacklo_epi8(rows[j], rows[j + 1]));
         let mut sad = 0u32;
         for y in (0..8usize).step_by(2) {
             let m: [__m256i; 4] =
@@ -875,10 +886,7 @@ mod u8bilin {
         let v = _mm256_maddubs_epi16(m, t);
         let r = _mm256_srai_epi16::<7>(_mm256_add_epi16(v, _mm256_set1_epi16(64)));
         let p = _mm256_packus_epi16(r, r);
-        _mm_unpacklo_epi64(
-            _mm256_castsi256_si128(p),
-            _mm256_extracti128_si256::<1>(p),
-        )
+        _mm_unpacklo_epi64(_mm256_castsi256_si128(p), _mm256_extracti128_si256::<1>(p))
     }
 
     /// Horizontal (s[i], s[i+1]) interleaves for 2 rows from one 16B window each.
@@ -992,7 +1000,9 @@ mod u8bilin {
         let ty = bt(py);
         let base = refp.buf.as_ptr();
         let row = |r: i32| {
-            _mm_loadl_epi64(base.add((by + r) as usize * refp.stride + bx as usize) as *const __m128i)
+            _mm_loadl_epi64(
+                base.add((by + r) as usize * refp.stride + bx as usize) as *const __m128i
+            )
         };
         let rows: [__m128i; 9] = std::array::from_fn(|j| row(j as i32));
         let mut sad = 0u32;
@@ -1063,7 +1073,9 @@ pub unsafe fn subpel_bilinear_score8x8_u8(
         (false, false) => sad8x8_u8(
             src,
             src_stride,
-            refp.buf.as_ptr().add(by as usize * refp.stride + bx as usize),
+            refp.buf
+                .as_ptr()
+                .add(by as usize * refp.stride + bx as usize),
             refp.stride,
         ),
         (true, false) => u8bilin::score_h(refp, bx, by, px, src, src_stride),
@@ -1079,12 +1091,7 @@ pub unsafe fn subpel_bilinear_score8x8_u8(
 /// AVX2 present; all five windows readable for `7·stride + 8` bytes.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-pub unsafe fn sad8x8_x4_u8(
-    src: *const u8,
-    ss: usize,
-    refs: [*const u8; 4],
-    rs: usize,
-) -> [u32; 4] {
+pub unsafe fn sad8x8_x4_u8(src: *const u8, ss: usize, refs: [*const u8; 4], rs: usize) -> [u32; 4] {
     use std::arch::x86_64::*;
     let mut acc = [_mm_setzero_si128(); 4];
     for y in (0..8).step_by(2) {
@@ -1138,7 +1145,9 @@ pub unsafe fn subpel_score8x8_u8(
         (false, false) => sad8x8_u8(
             src,
             src_stride,
-            refp.buf.as_ptr().add(by as usize * refp.stride + bx as usize),
+            refp.buf
+                .as_ptr()
+                .add(by as usize * refp.stride + bx as usize),
             refp.stride,
         ),
         (true, false) => u8score::score_h(refp, bx, by, fx, src, src_stride),
@@ -1169,7 +1178,9 @@ pub unsafe fn subpel_sse8x8_u8(
     let fy = &SUBPEL_FILTERS[filter][subpel_y];
     match (subpel_x != 0, subpel_y != 0) {
         (false, false) => u8score::sse_copy(
-            refp.buf.as_ptr().add(by as usize * refp.stride + bx as usize),
+            refp.buf
+                .as_ptr()
+                .add(by as usize * refp.stride + bx as usize),
             refp.stride,
             src,
             src_stride,
@@ -1848,7 +1859,11 @@ mod tests {
                                         sum += src[base + i + k * tap_stride] as i32 * f[k];
                                     }
                                     let v = ((sum + 64) >> 7).clamp(0, max);
-                                    *w = if avg { ((v + *w as i32 + 1) >> 1) as u16 } else { v as u16 };
+                                    *w = if avg {
+                                        ((v + *w as i32 + 1) >> 1) as u16
+                                    } else {
+                                        v as u16
+                                    };
                                 }
                                 assert_eq!(got, want, "max={max} filter={filter} phase={phase} ts={tap_stride} n={n} avg={avg}");
                             }
@@ -1955,10 +1970,9 @@ mod tests {
                                 for (k, t) in tmp_col.iter_mut().enumerate() {
                                     let mut sum = 0i32;
                                     for (j, &f) in fx.iter().enumerate() {
-                                        sum += refp.px(
-                                            bx + x + j as i32 - 3,
-                                            by + y + k as i32 - 3,
-                                        ) * f;
+                                        sum += refp
+                                            .px(bx + x + j as i32 - 3, by + y + k as i32 - 3)
+                                            * f;
                                     }
                                     *t = clip_pixel(round_pow2(sum, 7), max) as i32;
                                 }
@@ -1966,8 +1980,7 @@ mod tests {
                                 for (k, &f) in fy.iter().enumerate() {
                                     sum += tmp_col[k] * f;
                                 }
-                                want[(y * 8 + x) as usize] =
-                                    clip_pixel(round_pow2(sum, 7), max);
+                                want[(y * 8 + x) as usize] = clip_pixel(round_pow2(sum, 7), max);
                             }
                         }
                         let mut got = [0u16; 64];
@@ -2098,14 +2111,28 @@ mod tests {
                         4 => y % 4 < 2,
                         _ => (x / 2 + y / 2) % 2 == 0,
                     };
-                    if bit { 255 } else { 0 }
+                    if bit {
+                        255
+                    } else {
+                        0
+                    }
                 })
                 .collect();
             let refbuf8: Vec<u8> = refbuf16.iter().map(|&v| v as u8).collect();
             let srcbuf8: Vec<u8> = vec![128u8; stride * ph as usize];
             let srcbuf16: Vec<u16> = srcbuf8.iter().map(|&v| v as u16).collect();
-            let refp16 = RefPlane { buf: &refbuf16, stride, w: pw, h: ph };
-            let refp8 = RefPlane8 { buf: &refbuf8, stride, w: pw, h: ph };
+            let refp16 = RefPlane {
+                buf: &refbuf16,
+                stride,
+                w: pw,
+                h: ph,
+            };
+            let refp8 = RefPlane8 {
+                buf: &refbuf8,
+                stride,
+                w: pw,
+                h: ph,
+            };
             for filter in 0..4usize {
                 for px in 0..16usize {
                     for py in 0..16usize {
@@ -2133,7 +2160,10 @@ mod tests {
                                 stride,
                             )
                         };
-                        assert_eq!(got, want, "pattern={pattern} filter={filter} px={px} py={py}");
+                        assert_eq!(
+                            got, want,
+                            "pattern={pattern} filter={filter} px={px} py={py}"
+                        );
                     }
                 }
             }
@@ -2163,18 +2193,37 @@ mod tests {
                     0 => (xs() % 256) as u8,
                     _ => {
                         let (x, y) = (i % stride, i / stride);
-                        if (x + y) % 2 == 0 { 255 } else { 0 }
+                        if (x + y) % 2 == 0 {
+                            255
+                        } else {
+                            0
+                        }
                     }
                 })
                 .collect();
-            let srcbuf8: Vec<u8> = (0..stride * ph as usize).map(|_| (xs() % 256) as u8).collect();
-            let refp8 = RefPlane8 { buf: &refbuf8, stride, w: pw, h: ph };
+            let srcbuf8: Vec<u8> = (0..stride * ph as usize)
+                .map(|_| (xs() % 256) as u8)
+                .collect();
+            let refp8 = RefPlane8 {
+                buf: &refbuf8,
+                stride,
+                w: pw,
+                h: ph,
+            };
             for px in 0..16usize {
                 for py in 0..16usize {
                     let (bx, by) = (4 + (xs() % 30) as usize, 4 + (xs() % 30) as usize);
                     let (sx, sy) = (4 + (xs() % 30) as usize, 4 + (xs() % 30) as usize);
                     let want = bilinear_score8x8_scalar(
-                        &refbuf8, stride, bx, by, px, py, &srcbuf8, sy * stride + sx, stride,
+                        &refbuf8,
+                        stride,
+                        bx,
+                        by,
+                        px,
+                        py,
+                        &srcbuf8,
+                        sy * stride + sx,
+                        stride,
                     );
                     let got = unsafe {
                         subpel_bilinear_score8x8_u8(
@@ -2216,17 +2265,38 @@ mod tests {
                     0 => (xs() % 256) as u16,
                     1 => {
                         let (x, y) = (i % stride, i / stride);
-                        if (x + y) % 2 == 0 { 255 } else { 0 }
+                        if (x + y) % 2 == 0 {
+                            255
+                        } else {
+                            0
+                        }
                     }
-                    _ => if (i % stride) % 4 < 2 { 255 } else { 0 },
+                    _ => {
+                        if (i % stride) % 4 < 2 {
+                            255
+                        } else {
+                            0
+                        }
+                    }
                 })
                 .collect();
             let refbuf8: Vec<u8> = refbuf16.iter().map(|&v| v as u8).collect();
-            let srcbuf16: Vec<u16> =
-                (0..stride * ph as usize).map(|_| (xs() % 256) as u16).collect();
+            let srcbuf16: Vec<u16> = (0..stride * ph as usize)
+                .map(|_| (xs() % 256) as u16)
+                .collect();
             let srcbuf8: Vec<u8> = srcbuf16.iter().map(|&v| v as u8).collect();
-            let refp16 = RefPlane { buf: &refbuf16, stride, w: pw, h: ph };
-            let refp8 = RefPlane8 { buf: &refbuf8, stride, w: pw, h: ph };
+            let refp16 = RefPlane {
+                buf: &refbuf16,
+                stride,
+                w: pw,
+                h: ph,
+            };
+            let refp8 = RefPlane8 {
+                buf: &refbuf8,
+                stride,
+                w: pw,
+                h: ph,
+            };
             for filter in 0..4usize {
                 for px in 0..16usize {
                     for py in [0usize, 1, 5, 8, 12, 15] {
@@ -2280,12 +2350,26 @@ mod tests {
             s
         };
         let (pw, ph, stride) = (48i32, 48i32, 48usize);
-        let refbuf16: Vec<u16> = (0..stride * ph as usize).map(|_| (xs() % 256) as u16).collect();
+        let refbuf16: Vec<u16> = (0..stride * ph as usize)
+            .map(|_| (xs() % 256) as u16)
+            .collect();
         let refbuf8: Vec<u8> = refbuf16.iter().map(|&v| v as u8).collect();
-        let srcbuf16: Vec<u16> = (0..stride * ph as usize).map(|_| (xs() % 256) as u16).collect();
+        let srcbuf16: Vec<u16> = (0..stride * ph as usize)
+            .map(|_| (xs() % 256) as u16)
+            .collect();
         let srcbuf8: Vec<u8> = srcbuf16.iter().map(|&v| v as u8).collect();
-        let refp16 = RefPlane { buf: &refbuf16, stride, w: pw, h: ph };
-        let refp8 = RefPlane8 { buf: &refbuf8, stride, w: pw, h: ph };
+        let refp16 = RefPlane {
+            buf: &refbuf16,
+            stride,
+            w: pw,
+            h: ph,
+        };
+        let refp8 = RefPlane8 {
+            buf: &refbuf8,
+            stride,
+            w: pw,
+            h: ph,
+        };
         for filter in 0..4usize {
             for px in 0..16usize {
                 for py in [0usize, 1, 7, 8, 15] {
@@ -2293,7 +2377,9 @@ mod tests {
                     let (sx, sy) = (8 + (xs() % 20) as usize, 8 + (xs() % 20) as usize);
                     // u16 oracle: full predict + scalar SAD.
                     let mut pred = [0u16; 64];
-                    predict_block(&refp16, bx, by, px, py, filter, &mut pred, 8, 8, 8, false, 255);
+                    predict_block(
+                        &refp16, bx, by, px, py, filter, &mut pred, 8, 8, 8, false, 255,
+                    );
                     let mut want = 0u32;
                     for y in 0..8usize {
                         for x in 0..8usize {
@@ -2403,7 +2489,11 @@ mod mc_microbench {
         let mut dst = vec![128u16; stride * (h + 8)];
         // `interior` picks a position where the AVX2 in-bounds test passes;
         // otherwise a left-edge position that forces the scalar clamp path.
-        let (bx, by) = if interior { (40i32, 40i32) } else { (0i32, 0i32) };
+        let (bx, by) = if interior {
+            (40i32, 40i32)
+        } else {
+            (0i32, 0i32)
+        };
         let iters = 2000usize;
         let mut best = f64::MAX;
         for _ in 0..9 {
@@ -2423,8 +2513,19 @@ mod mc_microbench {
     fn profile_predict_block() {
         let _ = bench(8, 8, 4, 4, true); // warm up
         println!("\npredict_block — best-of-9, cycles/call");
-        println!("  {:<10} {:>10} {:>10} {:>10} {:>12}", "size", "full-pel", "x-only", "xy", "xy(edge)");
-        for (w, h) in [(4usize, 4usize), (4, 8), (8, 8), (8, 16), (16, 16), (32, 32), (64, 64)] {
+        println!(
+            "  {:<10} {:>10} {:>10} {:>10} {:>12}",
+            "size", "full-pel", "x-only", "xy", "xy(edge)"
+        );
+        for (w, h) in [
+            (4usize, 4usize),
+            (4, 8),
+            (8, 8),
+            (8, 16),
+            (16, 16),
+            (32, 32),
+            (64, 64),
+        ] {
             println!(
                 "  {:<10} {:>10.1} {:>10.1} {:>10.1} {:>12.1}",
                 format!("{w}x{h}"),

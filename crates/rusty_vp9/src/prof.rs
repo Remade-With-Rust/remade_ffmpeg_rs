@@ -171,7 +171,9 @@ pub fn snapshot() -> [(f64, u64); N] {
     let mut out = [(0.0f64, 0u64); N];
     for (i, o) in out.iter_mut().enumerate() {
         let calls = COUNT[i].load(Relaxed);
-        let cyc = CYC[i].load(Relaxed).saturating_sub(calls.saturating_mul(ovh));
+        let cyc = CYC[i]
+            .load(Relaxed)
+            .saturating_sub(calls.saturating_mul(ovh));
         *o = (cyc as f64 / hz * 1e3, calls);
     }
     out
@@ -267,7 +269,10 @@ pub fn dump() {
     let total: f64 = snap.iter().map(|&(ms, _)| ms).sum::<f64>().max(1e-9);
     let calls: u64 = snap.iter().map(|&(_, c)| c).sum();
     eprintln!("VP9_DPROF — decoder stage profile (exclusive self-time):");
-    eprintln!("  {:16} {:>10} {:>7} {:>14} {:>10}", "stage", "ms", "pct", "calls", "us/call");
+    eprintln!(
+        "  {:16} {:>10} {:>7} {:>14} {:>10}",
+        "stage", "ms", "pct", "calls", "us/call"
+    );
     for (i, &(ms, c)) in snap.iter().enumerate() {
         if i != S::Other as usize && c == 0 {
             continue;
@@ -281,5 +286,8 @@ pub fn dump() {
             if c > 0 { ms * 1e3 / c as f64 } else { 0.0 }
         );
     }
-    eprintln!("  {:16} {:10.3} {:6.2}% {:14}", "TOTAL", total, 100.0, calls);
+    eprintln!(
+        "  {:16} {:10.3} {:6.2}% {:14}",
+        "TOTAL", total, 100.0, calls
+    );
 }

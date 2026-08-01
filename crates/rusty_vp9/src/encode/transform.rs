@@ -207,7 +207,7 @@ mod fdct_avx2 {
             ))
         });
         r = bfly(r); // r[k] now = inter row k (coefficient k of every column)
-        // Row pass: transpose so lanes become rows, butterfly, transpose back.
+                     // Row pass: transpose so lanes become rows, butterfly, transpose back.
         r = transpose(r);
         r = bfly(r);
         let r = transpose(r);
@@ -916,7 +916,9 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_fdct8x8() {
-        if !has_avx2() { return; }
+        if !has_avx2() {
+            return;
+        }
         let mut s = 0x1111_2222_3333_4444u64;
         let blocks: Vec<[i32; 64]> = (0..1000)
             .map(|_| std::array::from_fn(|_| (xs(&mut s) % 511) as i32 - 255))
@@ -927,7 +929,11 @@ mod tests {
             let t0 = std::time::Instant::now();
             for _ in 0..2000 {
                 for b in &blocks {
-                    if use_avx { unsafe { fdct8x8_avx2(b, &mut out) } } else { fdct8x8_scalar(b, &mut out) }
+                    if use_avx {
+                        unsafe { fdct8x8_avx2(b, &mut out) }
+                    } else {
+                        fdct8x8_scalar(b, &mut out)
+                    }
                     sink += out[0] as i64;
                 }
             }

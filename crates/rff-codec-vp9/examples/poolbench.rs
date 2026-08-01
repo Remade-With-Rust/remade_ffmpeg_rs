@@ -41,8 +41,11 @@ fn main() {
         // the `null` control (identical arms) measured +2.9/-0.4/+3.4/-0.4% across four
         // clips — a mean of +1.4% for whichever arm went first, which is pure artefact.
         // Swapping the order on odd reps cancels it.
-        let order: [(usize, bool); 2] =
-            if rep % 2 == 0 { [(0, true), (1, false)] } else { [(1, false), (0, true)] };
+        let order: [(usize, bool); 2] = if rep % 2 == 0 {
+            [(0, true), (1, false)]
+        } else {
+            [(1, false), (0, true)]
+        };
         for (arm, on) in order {
             // `on` = the NEW arm in both cases: pooled buffers / packed-key FxHash map.
             match lever {
@@ -64,16 +67,33 @@ fn main() {
     let (on, off) = (best[0], best[1]);
     println!(
         "{:<22} {}x{} {} frames  speed={speed} crf={crf}  reps={reps}",
-        std::path::Path::new(path).file_stem().unwrap().to_string_lossy(),
-        w, h, frames.len(),
+        std::path::Path::new(path)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy(),
+        w,
+        h,
+        frames.len(),
     );
-    println!("  {lever} NEW  {on:7.3} s   ({:6.1} fps)  {} B", frames.len() as f64 / on, bytes[0]);
-    println!("  {lever} OLD  {off:7.3} s   ({:6.1} fps)  {} B", frames.len() as f64 / off, bytes[1]);
+    println!(
+        "  {lever} NEW  {on:7.3} s   ({:6.1} fps)  {} B",
+        frames.len() as f64 / on,
+        bytes[0]
+    );
+    println!(
+        "  {lever} OLD  {off:7.3} s   ({:6.1} fps)  {} B",
+        frames.len() as f64 / off,
+        bytes[1]
+    );
     println!(
         "  => {lever} NEW is {:+.1}% {}   [size check: {}]",
         100.0 * (off / on - 1.0),
         if on < off { "FASTER" } else { "SLOWER" },
-        if bytes[0] == bytes[1] { "same bytes" } else { "MISMATCH — arms differ!" },
+        if bytes[0] == bytes[1] {
+            "same bytes"
+        } else {
+            "MISMATCH — arms differ!"
+        },
     );
 }
 

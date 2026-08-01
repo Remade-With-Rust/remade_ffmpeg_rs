@@ -79,7 +79,7 @@ impl Muxer for IvfMuxer {
         h.extend_from_slice(&(s.height as u16).to_le_bytes());
         h.extend_from_slice(&fnum.to_le_bytes()); // framerate numerator
         h.extend_from_slice(&fden.to_le_bytes()); // framerate denominator
-        // Frame count is not authoritative (decoders read to EOF); leave 0.
+                                                  // Frame count is not authoritative (decoders read to EOF); leave 0.
         h.extend_from_slice(&0u32.to_le_bytes());
         h.extend_from_slice(&0u32.to_le_bytes()); // unused
         self.out.write_all(&h)?;

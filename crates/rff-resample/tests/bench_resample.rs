@@ -41,7 +41,9 @@ fn stopband_isolation_88k_to_48k() {
     };
     let refr = tone(10_000.0);
     eprintln!("resampler-only 88.2k->48k stopband (ref 10 kHz rms={refr:.4}):");
-    for f in [10_000.0, 20_000.0, 22_000.0, 24_000.0, 26_000.0, 30_000.0, 40_000.0] {
+    for f in [
+        10_000.0, 20_000.0, 22_000.0, 24_000.0, 26_000.0, 30_000.0, 40_000.0,
+    ] {
         let db = 20.0 * (tone(f).max(1e-12) / refr).log10();
         eprintln!("  {:6.0} Hz  {:+7.1} dB", f, db);
     }

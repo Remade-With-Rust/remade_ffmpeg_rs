@@ -894,24 +894,41 @@ pub fn inverse_transform_add_rows(
     if n == 16 && !col_adst && std::env::var_os("VP9_GATEPROBE").is_some() {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         pub static G: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-        let cmax = coeffs[..16 * nz_rows].iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+        let cmax = coeffs[..16 * nz_rows]
+            .iter()
+            .map(|v| v.unsigned_abs())
+            .max()
+            .unwrap_or(0);
         G[0].fetch_add(1, Relaxed);
-        if cmax > 1024 { G[1].fetch_add(1, Relaxed); }
-        if cmax > 4096 { G[2].fetch_add(1, Relaxed); }
+        if cmax > 1024 {
+            G[1].fetch_add(1, Relaxed);
+        }
+        if cmax > 4096 {
+            G[2].fetch_add(1, Relaxed);
+        }
         // row-pass-output gate needs the row pass first; approximate with the
         // real thing by running it into a scratch.
         let mut t = [0i32; 256];
         for r in 0..nz_rows {
             idct_1d(&coeffs[r * 16..r * 16 + 16], &mut t[r * 16..r * 16 + 16]);
         }
-        let tmax = t[..16 * nz_rows].iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
-        if tmax > 12288 { G[3].fetch_add(1, Relaxed); }
+        let tmax = t[..16 * nz_rows]
+            .iter()
+            .map(|v| v.unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        if tmax > 12288 {
+            G[3].fetch_add(1, Relaxed);
+        }
         let tot = G[0].load(Relaxed);
         if tot % 200 == 0 {
-            eprintln!("GATEPROBE n=16 blocks={} coef>1024={:.1}% coef>4096={:.1}% rowout>12288={:.1}%",
-                tot, 100.0 * G[1].load(Relaxed) as f64 / tot as f64,
+            eprintln!(
+                "GATEPROBE n=16 blocks={} coef>1024={:.1}% coef>4096={:.1}% rowout>12288={:.1}%",
+                tot,
+                100.0 * G[1].load(Relaxed) as f64 / tot as f64,
                 100.0 * G[2].load(Relaxed) as f64 / tot as f64,
-                100.0 * G[3].load(Relaxed) as f64 / tot as f64);
+                100.0 * G[3].load(Relaxed) as f64 / tot as f64
+            );
         }
     }
     // AVX2 fast path for the dominant 8×8 DCT_DCT, gated on the proven
@@ -1316,8 +1333,14 @@ mod idct_avx2 {
         // stage 1
         let mut t = [_mm_setzero_si128(); 16];
         const ODD: [(usize, usize, usize, usize); 8] = [
-            (1, 31, 31, 1), (17, 15, 15, 17), (9, 23, 23, 9), (25, 7, 7, 25),
-            (5, 27, 27, 5), (21, 11, 11, 21), (13, 19, 19, 13), (29, 3, 3, 29),
+            (1, 31, 31, 1),
+            (17, 15, 15, 17),
+            (9, 23, 23, 9),
+            (25, 7, 7, 25),
+            (5, 27, 27, 5),
+            (21, 11, 11, 21),
+            (13, 19, 19, 13),
+            (29, 3, 3, 29),
         ];
         for (i, &(a, b, ca, cb)) in ODD.iter().enumerate() {
             t[i] = m(input[a], input[b], c(ca), c(cb));
@@ -1325,7 +1348,16 @@ mod idct_avx2 {
         }
         // stage 2
         let mut u = t;
-        for (j, sgn) in [(0, 1i32), (2, -1), (4, 1), (6, -1), (8, 1), (10, -1), (12, 1), (14, -1)] {
+        for (j, sgn) in [
+            (0, 1i32),
+            (2, -1),
+            (4, 1),
+            (6, -1),
+            (8, 1),
+            (10, -1),
+            (12, 1),
+            (14, -1),
+        ] {
             let (x, y) = (t[j], t[j + 1]);
             if sgn == 1 {
                 u[j] = add(x, y);
@@ -1415,12 +1447,7 @@ mod idct_avx2 {
     /// # Safety
     /// AVX2 required; `tmp` holds 1024 i32 and `dest` covers 32 rows of 32 `u16`
     /// at `stride` — the same accesses the scalar column loop makes.
-    pub(super) unsafe fn idct32_cols_add(
-        tmp: &[i32],
-        dest: &mut [u16],
-        stride: usize,
-        max: i32,
-    ) {
+    pub(super) unsafe fn idct32_cols_add(tmp: &[i32], dest: &mut [u16], stride: usize, max: i32) {
         const SHIFT: i32 = 6;
         let zero = _mm_setzero_si128();
         let maxv = _mm_set1_epi32(max);
@@ -1458,12 +1485,7 @@ mod idct_avx2 {
     /// # Safety
     /// AVX2 required; `tmp` holds 256 i32 and `dest` covers 16 rows of 16 `u16`
     /// at `stride` — the same accesses the scalar column loop makes.
-    pub(super) unsafe fn idct16_cols_add(
-        tmp: &[i32],
-        dest: &mut [u16],
-        stride: usize,
-        max: i32,
-    ) {
+    pub(super) unsafe fn idct16_cols_add(tmp: &[i32], dest: &mut [u16], stride: usize, max: i32) {
         // 16x16 always uses the size-6 final round-shift (4->4, 8->5, 16/32->6),
         // so it is a compile-time constant here rather than a parameter.
         const SHIFT: i32 = 6;
@@ -2145,8 +2167,23 @@ mod sparse_tx_tests {
     fn dc_offset_matches_full_idct() {
         for n in [4usize, 8, 16, 32] {
             for dc in [
-                0, 1, -1, 255, -255, 1023, -1023, 4096, -4096, 32767, -32767,
-                65535, -65535, 1 << 20, -(1 << 20), i32::MAX / 4, -(i32::MAX / 4),
+                0,
+                1,
+                -1,
+                255,
+                -255,
+                1023,
+                -1023,
+                4096,
+                -4096,
+                32767,
+                -32767,
+                65535,
+                -65535,
+                1 << 20,
+                -(1 << 20),
+                i32::MAX / 4,
+                -(i32::MAX / 4),
             ] {
                 assert_eq!(dc_offset(dc), dc_offset_reference(dc, n), "dc={dc} n={n}");
             }
@@ -2163,10 +2200,15 @@ mod sparse_tx_tests {
     #[test]
     fn dc_only_column_is_constant_rotation() {
         for n in [4usize, 8, 16, 32] {
-            for v in (-9000..=9000)
-                .step_by(7)
-                .chain([0, 1, -1, i16::MAX as i32, i16::MIN as i32, 1 << 20, -(1 << 20)])
-            {
+            for v in (-9000..=9000).step_by(7).chain([
+                0,
+                1,
+                -1,
+                i16::MAX as i32,
+                i16::MIN as i32,
+                1 << 20,
+                -(1 << 20),
+            ]) {
                 let mut inp = [0i32; 32];
                 let mut out = [0i32; 32];
                 inp[0] = v;
@@ -2297,8 +2339,8 @@ mod idct16_avx2_tests {
                 (v * k + (1 << 13)) >> 14
             };
             let s1 = [
-                inb[0], inb[8], inb[4], inb[12], inb[2], inb[10], inb[6], inb[14],
-                inb[1], inb[9], inb[5], inb[13], inb[3], inb[11], inb[7], inb[15],
+                inb[0], inb[8], inb[4], inb[12], inb[2], inb[10], inb[6], inb[14], inb[1], inb[9],
+                inb[5], inb[13], inb[3], inb[11], inb[7], inb[15],
             ];
             let mut s = s1;
             s[8] = rot(s1[8], c(30)) + rot(s1[15], c(2));
@@ -2600,8 +2642,8 @@ mod idct32_bound_proof {
         // ---- even half: the idct16 magnitude pass ----
         let idct16_bound = |inb: [i64; 16]| -> [i64; 16] {
             let s1 = [
-                inb[0], inb[8], inb[4], inb[12], inb[2], inb[10], inb[6], inb[14],
-                inb[1], inb[9], inb[5], inb[13], inb[3], inb[11], inb[7], inb[15],
+                inb[0], inb[8], inb[4], inb[12], inb[2], inb[10], inb[6], inb[14], inb[1], inb[9],
+                inb[5], inb[13], inb[3], inb[11], inb[7], inb[15],
             ];
             let mut s = s1;
             s[8] = rot(s1[8], c(30)) + rot(s1[15], c(2));
@@ -2669,7 +2711,16 @@ mod idct32_bound_proof {
         let lo = idct16_bound([t_in; 16]);
         // ---- odd half ----
         let mut t = [0i64; 16];
-        const ODD: [(usize, usize); 8] = [(31, 1), (15, 17), (23, 9), (7, 25), (27, 5), (11, 21), (19, 13), (3, 29)];
+        const ODD: [(usize, usize); 8] = [
+            (31, 1),
+            (15, 17),
+            (23, 9),
+            (7, 25),
+            (27, 5),
+            (11, 21),
+            (19, 13),
+            (3, 29),
+        ];
         for (i, &(ca, cb)) in ODD.iter().enumerate() {
             t[i] = rot(t_in, c(ca)) + rot(t_in, c(cb));
             t[15 - i] = rot(t_in, c(cb)) + rot(t_in, c(ca));
@@ -2690,7 +2741,16 @@ mod idct32_bound_proof {
         v[6] = rot(u[6], c(12)) + rot(u[9], c(20));
         v[9] = rot(u[6], c(20)) + rot(u[9], c(12));
         let mut w = v;
-        for (a, b) in [(0usize, 3usize), (1, 2), (4, 7), (5, 6), (8, 11), (9, 10), (12, 15), (13, 14)] {
+        for (a, b) in [
+            (0usize, 3usize),
+            (1, 2),
+            (4, 7),
+            (5, 6),
+            (8, 11),
+            (9, 10),
+            (12, 15),
+            (13, 14),
+        ] {
             let m = v[a] + v[b];
             w[a] = m;
             w[b] = m;

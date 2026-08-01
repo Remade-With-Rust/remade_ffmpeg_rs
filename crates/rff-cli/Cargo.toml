@@ -6,17 +6,34 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["ffmpeg", "ffprobe", "transcode", "cli", "video"]
+categories = ["command-line-utilities", "multimedia"]
 
-# Drop-in binary names so existing scripts and muscle memory just work.
-# (See the README "Trademark" note: the product is remade_ffmpeg_rs; these
-# executable names are for command-line compatibility only.)
+# Default binary names. `cargo install rff-cli` must not silently shadow a real
+# FFmpeg on the user's PATH, so the drop-in `ffmpeg`/`ffprobe` names are opt-in
+# via the `drop-in-names` feature below. Same source files either way.
+# (See the README "Trademark" note: the product is remade_ffmpeg_rs; the
+# FFmpeg-compatible executable names are for command-line compatibility only.)
+[[bin]]
+name = "rff"
+path = "src/bin/rff.rs"
+
+[[bin]]
+name = "rffprobe"
+path = "src/bin/rffprobe.rs"
+
 [[bin]]
 name = "ffmpeg"
 path = "src/bin/ffmpeg.rs"
+required-features = ["drop-in-names"]
 
 [[bin]]
 name = "ffprobe"
 path = "src/bin/ffprobe.rs"
+required-features = ["drop-in-names"]
 
 [dependencies]
 rff.workspace = true
@@ -24,10 +41,21 @@ rff-core.workspace = true
 
 [features]
 default = []
+# Additionally install the drop-in `ffmpeg` and `ffprobe` executables, so
+# existing scripts and muscle memory just work:
+#   cargo install rff-cli --features drop-in-names
+# Off by default: these names shadow a real FFmpeg install, which must be the
+# user's explicit choice, not a side effect of `cargo install`.
+drop-in-names = []
 # Pass-through to the engine's TEMPORARY C/FFI H.264 (Cisco openh264). Build the
-# `ffmpeg`/`ffprobe` binaries with `--features h264-openh264` to get H.264 now;
+# `rff`/`rffprobe` binaries with `--features h264-openh264` to get H.264 now;
 # off by default so the standard binaries stay 100% Rust.
 h264-openh264 = ["rff/h264-openh264"]
 # Pass-through to enable `https://` streaming input (rustls, pure Rust). Build
-# `ffmpeg`/`ffprobe` with `--features https`. Off by default.
+# `rff`/`rffprobe` with `--features https`. Off by default.
 https = ["rff/https"]
+
+# `rff-cli`'s own default feature set is empty, but it depends on `rff` with
+# default features (which enable `h264-asm` → needs `nasm`, absent on docs.rs).
+[package.metadata.docs.rs]
+no-default-features = true

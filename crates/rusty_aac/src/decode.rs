@@ -688,9 +688,9 @@ fn apply_ms(
         for sfb in 0..max_sfb {
             if ms_used[g * max_sfb + sfb] && cb1[g][sfb] < INTENSITY_HCB2 {
                 if sfb + 1 >= swb.len() {
-                break; // malformed: more coded bands than the swb offset table holds
-            }
-            let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+                    break; // malformed: more coded bands than the swb offset table holds
+                }
+                let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
                 for w in 0..info.window_group_length[g] as usize {
                     let base = (wbase + w) * window_len;
                     for i in s..e {
@@ -734,9 +734,9 @@ fn apply_is(
                     scale = -scale; // M/S flips intensity sign
                 }
                 if sfb + 1 >= swb.len() {
-                break; // malformed: more coded bands than the swb offset table holds
-            }
-            let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+                    break; // malformed: more coded bands than the swb offset table holds
+                }
+                let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
                 for w in 0..info.window_group_length[g] as usize {
                     let base = (wbase + w) * window_len;
                     for i in s..e {

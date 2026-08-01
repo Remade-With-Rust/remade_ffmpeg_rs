@@ -263,8 +263,13 @@ pub fn fit_and_encode_floor(
     for i in 2..nposts {
         let (li, lx) = low_neighbor(&fl.x_list, i);
         let (hi_i, hx) = high_neighbor(&fl.x_list, i);
-        let predicted =
-            render_point(lx, final_y[li] as u32, hx, final_y[hi_i] as u32, fl.x_list[i]) as i32;
+        let predicted = render_point(
+            lx,
+            final_y[li] as u32,
+            hx,
+            final_y[hi_i] as u32,
+            fl.x_list[i],
+        ) as i32;
         let raw = encode_val(target[i], predicted, range);
         let (val, sc) = fit_val_to_books(fl, codebooks, classes[i], raw);
         floor1_y[i] = val;
@@ -310,7 +315,9 @@ pub fn fit_and_encode_floor(
 fn write_entry(bw: &mut BitWriter, book: &Codebook, e: u32) -> Result<()> {
     let (cw, len) = book.encode(e);
     if len == 0 {
-        return Err(Error::invalid("vorbis floor: tried to emit an unused codebook entry"));
+        return Err(Error::invalid(
+            "vorbis floor: tried to emit an unused codebook entry",
+        ));
     }
     bw.write(cw, len as u32);
     Ok(())
@@ -361,7 +368,10 @@ mod tests {
                 for target in 0..range {
                     let val = encode_val(target, predicted, range);
                     let back = decode_val(val as i32, predicted, range).clamp(0, range - 1);
-                    assert_eq!(back, target, "range={range} predicted={predicted} target={target}");
+                    assert_eq!(
+                        back, target,
+                        "range={range} predicted={predicted} target={target}"
+                    );
                 }
             }
         }

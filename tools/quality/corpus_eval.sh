@@ -1,9 +1,9 @@
 #!/bin/bash
-# Quality gate: corpus mean PEAQ ODG (+ NMR % audible) for the current ./ffmpeg encoder.
+# Quality gate: corpus mean PEAQ ODG (+ NMR % audible) for the current ./rff encoder.
 LABEL="$1"
 S="/c/Users/talmo/AppData/Local/Temp/claude/c--Users-talmo-coding-remade-ffmpeg-rs/d3234c79-a622-4891-b393-dfed899bb5dc/scratchpad"
 SYS="/c/Users/talmo/AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-8.1.2-full_build/bin/ffmpeg.exe"
-OURS="./target/release/ffmpeg.exe"; Q="./target/release/examples/mp3quality"
+OURS="./target/release/rff.exe"; Q="./target/release/examples/mp3quality"
 CLIPS="Ring05 Ring09 Ring01 chimes"; BRS="64 128"
 for c in $CLIPS; do [ -f "$S/corp_$c.wav" ] || "$SYS" -hide_banner -loglevel error -t 4 -i "/c/Windows/Media/$c.wav" -ac 1 -ar 44100 -c:a pcm_f32le -y "$S/corp_$c.wav"; done
 echo "clip,br,odg,pct" > "$S/eval_$LABEL.csv"

@@ -38,7 +38,10 @@ impl Dictionary {
             Some('m') | Some('M') => (&v[..v.len() - 1], 1_000_000i64),
             _ => (v, 1),
         };
-        num.trim().parse::<f64>().ok().map(|n| (n * mult as f64) as i64)
+        num.trim()
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n * mult as f64) as i64)
     }
 
     pub fn is_empty(&self) -> bool {

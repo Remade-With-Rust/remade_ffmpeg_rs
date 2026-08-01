@@ -27,7 +27,6 @@ use crate::mv::{find_mv_refs, get_mode_context, lower_mv_precision, read_mv, MvR
 /// `vp9_inter_mode_tree` — leaves are `-INTER_OFFSET(mode)`; result + NEARESTMV.
 pub(crate) const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
 use crate::predict::{build_intra_edges, predict};
-use crate::prof::{dprof, S as DS};
 use crate::prob::inv_remap_prob;
 use crate::prob_tables::{
     NmvContext, DEFAULT_COEF_PROBS, DEFAULT_COMP_INTER_P, DEFAULT_COMP_REF_P, DEFAULT_IF_UV_PROBS,
@@ -35,6 +34,7 @@ use crate::prob_tables::{
     DEFAULT_PARTITION_PROBS, DEFAULT_SINGLE_REF_P, DEFAULT_SKIP_PROB,
     DEFAULT_SWITCHABLE_INTERP_PROB, KF_PARTITION_PROBS,
 };
+use crate::prof::{dprof, S as DS};
 use crate::quant::Dequant;
 use crate::token::{decode_coefs, get_scan};
 use crate::transform::{
@@ -428,7 +428,13 @@ pub(crate) fn round_q4(v: i32) -> i32 {
 
 /// `average_split_mvs` — the MV for a plane's 4×4 sub-block, combining the
 /// sub-8×8 per-block MVs according to chroma subsampling.
-pub(crate) fn average_split_mvs(mi: &ModeInfo, r: usize, block: usize, ss_x: usize, ss_y: usize) -> Mv {
+pub(crate) fn average_split_mvs(
+    mi: &ModeInfo,
+    r: usize,
+    block: usize,
+    ss_x: usize,
+    ss_y: usize,
+) -> Mv {
     let q2 = |b0: usize, b1: usize| {
         (
             round_q2(mi.bmi_mv[b0][r].0 + mi.bmi_mv[b1][r].0),
@@ -468,7 +474,10 @@ pub(crate) fn intra_inter_context(above: Option<&ModeInfo>, left: Option<&ModeIn
     }
 }
 
-pub(crate) fn switchable_interp_context(above: Option<&ModeInfo>, left: Option<&ModeInfo>) -> usize {
+pub(crate) fn switchable_interp_context(
+    above: Option<&ModeInfo>,
+    left: Option<&ModeInfo>,
+) -> usize {
     const SW: usize = 3; // SWITCHABLE_FILTERS
     let left_type = left.map_or(SW, |m| m.interp_filter as usize);
     let above_type = above.map_or(SW, |m| m.interp_filter as usize);
@@ -1302,7 +1311,10 @@ pub fn decode_frame(
             "vp9: compressed header out of bounds",
         ));
     }
-    let fc = dprof!(DS::Header, parse_compressed_header(&data[start..end], h, pre_fc))?;
+    let fc = dprof!(
+        DS::Header,
+        parse_compressed_header(&data[start..end], h, pre_fc)
+    )?;
     let _ = refs;
 
     let seg = Seg::from_header(h);
@@ -1402,7 +1414,13 @@ pub fn decode_frame(
             .collect();
         dprof!(
             DS::LoopFilter,
-            crate::loopfilter::loop_filter_frame(&mut lf_planes, &rec.mi, rec.mi_rows, rec.mi_cols, h)
+            crate::loopfilter::loop_filter_frame(
+                &mut lf_planes,
+                &rec.mi,
+                rec.mi_rows,
+                rec.mi_cols,
+                h
+            )
         );
     }
 
@@ -2577,18 +2595,18 @@ impl Reconstructor {
         let (eob, max_row) = dprof!(
             DS::Detokenize,
             decode_coefs(
-            b,
-            &self.fc.coef_probs[tx_size][pt][rt],
-            tx_size,
-            scan,
-            nb,
-            dq,
-            ctx0,
-            &mut self.dqcoeff,
-            &mut self.token_cache,
-            &mut self.counts.coef[tx_size][pt][rt],
-            &mut self.counts.eob_branch[tx_size][pt][rt],
-            bd_bits,
+                b,
+                &self.fc.coef_probs[tx_size][pt][rt],
+                tx_size,
+                scan,
+                nb,
+                dq,
+                ctx0,
+                &mut self.dqcoeff,
+                &mut self.token_cache,
+                &mut self.counts.coef[tx_size][pt][rt],
+                &mut self.counts.eob_branch[tx_size][pt][rt],
+                bd_bits,
             )
         );
 

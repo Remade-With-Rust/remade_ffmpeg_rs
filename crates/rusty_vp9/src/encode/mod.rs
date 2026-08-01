@@ -20,8 +20,8 @@ mod frameenc;
 mod header;
 mod intermode;
 mod mv;
-pub mod prof;
 mod prob;
+pub mod prof;
 #[cfg(test)]
 mod quality;
 mod quantize;

@@ -8,9 +8,7 @@ use rff_codec_vorbis::VorbisEncoder;
 use rff_core::{AudioFrame, Frame, SampleFormat};
 use rusty_vorbis::frame::{encode_long_packet, encode_stream_bs};
 use rusty_vorbis::setup::{parse_setup, SETUP_Q4_STEREO};
-use rusty_vorbis::{
-    write_comment_header, write_ident_header, BITRATE_NOMINAL, BS0_LOG2, BS1_LOG2,
-};
+use rusty_vorbis::{write_comment_header, write_ident_header, BITRATE_NOMINAL, BS0_LOG2, BS1_LOG2};
 
 /// Best normalized cross-correlation of `got` against `reference` over lags `0..max_lag`.
 fn best_correlation(reference: &[f32], got: &[f32], max_lag: usize) -> f32 {
@@ -118,12 +116,15 @@ fn streaming_encode_decodes_in_lewton() {
     while let Ok(p) = enc.receive_packet() {
         packets.push(p);
     }
-    assert!(packets.len() >= 5, "expected multiple audio packets, got {}", packets.len());
+    assert!(
+        packets.len() >= 5,
+        "expected multiple audio packets, got {}",
+        packets.len()
+    );
 
     let headers = enc.headers();
     let l_ident = lewton::header::read_header_ident(&headers[0]).unwrap();
-    let l_setup =
-        lewton::header::read_header_setup(&headers[2], 2, (BS0_LOG2, BS1_LOG2)).unwrap();
+    let l_setup = lewton::header::read_header_setup(&headers[2], 2, (BS0_LOG2, BS1_LOG2)).unwrap();
     let mut pwr = lewton::audio::PreviousWindowRight::new();
     let mut decoded: Vec<f32> = Vec::new();
     for p in &packets {
@@ -131,15 +132,17 @@ fn streaming_encode_decodes_in_lewton() {
         if p.data.len() >= 7 && p.data[0] & 1 == 1 && &p.data[1..7] == b"vorbis" {
             continue;
         }
-        let pcm =
-            lewton::audio::read_audio_packet(&l_ident, &l_setup, &p.data, &mut pwr).unwrap();
+        let pcm = lewton::audio::read_audio_packet(&l_ident, &l_setup, &p.data, &mut pwr).unwrap();
         if !pcm.is_empty() && !pcm[0].is_empty() {
             decoded.extend(pcm[0].iter().map(|&s| s as f32 / 32768.0));
         }
     }
     assert!(!decoded.is_empty(), "no audio decoded");
     let energy: f32 = decoded.iter().map(|x| x * x).sum::<f32>() / decoded.len() as f32;
-    assert!(energy > 1e-4 && energy < 1.0, "decoded energy out of range: {energy}");
+    assert!(
+        energy > 1e-4 && energy < 1.0,
+        "decoded energy out of range: {energy}"
+    );
 }
 
 /// Encode long-block packets from a test tone, decode them with lewton, and confirm the
@@ -152,8 +155,7 @@ fn packets_decode_in_lewton() {
     let setup_bytes = SETUP_Q4_STEREO;
     let l_ident = lewton::header::read_header_ident(&ident_bytes).unwrap();
     let _l_comment = lewton::header::read_header_comment(&comment_bytes).unwrap();
-    let l_setup =
-        lewton::header::read_header_setup(setup_bytes, 2, (BS0_LOG2, BS1_LOG2)).unwrap();
+    let l_setup = lewton::header::read_header_setup(setup_bytes, 2, (BS0_LOG2, BS1_LOG2)).unwrap();
 
     let n = 2048usize;
     let hop = n / 2;
@@ -189,12 +191,18 @@ fn packets_decode_in_lewton() {
     assert!(!decoded[0].is_empty(), "no audio decoded");
     let got = &decoded[0];
     let out_energy: f32 = got.iter().map(|x| x * x).sum::<f32>() / got.len() as f32;
-    assert!(out_energy > 1e-4, "decoded audio is basically silent: {out_energy}");
+    assert!(
+        out_energy > 1e-4,
+        "decoded audio is basically silent: {out_energy}"
+    );
     assert!(out_energy < 1.0, "decoded audio blew up: {out_energy}");
 
     let best = best_correlation(&signal[0], got, 2 * n);
     eprintln!("CORR ch0 best normalized correlation = {best:.4}");
-    assert!(best > 0.8, "decoded audio does not resemble the input (corr={best:.4})");
+    assert!(
+        best > 0.8,
+        "decoded audio does not resemble the input (corr={best:.4})"
+    );
 }
 
 /// Block switching: a signal with a transient must encode via `encode_stream_bs` (which fires
@@ -217,7 +225,11 @@ fn block_switch_decodes_in_lewton() {
                     let t = i as f32;
                     let base = 0.4 * (0.02 * t).sin() + 0.2 * (0.07 * t + 0.5).sin();
                     let attack = (7000..7160).contains(&i) || (12000..12160).contains(&i);
-                    base + if attack { 0.8 * (0.8 * t + ch as f32).sin() } else { 0.0 }
+                    base + if attack {
+                        0.8 * (0.8 * t + ch as f32).sin()
+                    } else {
+                        0.0
+                    }
                 })
                 .collect()
         })
@@ -242,7 +254,10 @@ fn block_switch_decodes_in_lewton() {
     assert!(!decoded[0].is_empty(), "no audio decoded");
     let best = best_correlation(&signal[0], &decoded[0], 2 * 2048);
     eprintln!("BS corr = {best:.4}");
-    assert!(best > 0.9, "block-switched decode does not reconstruct (corr={best:.4})");
+    assert!(
+        best > 0.9,
+        "block-switched decode does not reconstruct (corr={best:.4})"
+    );
 }
 
 /// Brick 3: on a multi-tone signal the fitted floor should reconstruct with high
@@ -289,7 +304,10 @@ fn fitted_floor_reconstructs_multitone() {
     assert!(!decoded.is_empty());
     let best = best_correlation(&signal[0], &decoded, 2 * n);
     eprintln!("CORR multitone best correlation = {best:.4}");
-    assert!(best > 0.9, "fitted floor multitone reconstruction poor (corr={best:.4})");
+    assert!(
+        best > 0.9,
+        "fitted floor multitone reconstruction poor (corr={best:.4})"
+    );
 }
 
 /// A dense broadband spectrum (many partials, shaped envelope) — the case a flat floor
@@ -340,7 +358,10 @@ fn fitted_floor_reconstructs_broadband() {
     assert!(!decoded.is_empty());
     let best = best_correlation(&signal[0], &decoded, 2 * n);
     eprintln!("CORR broadband = {best:.4}");
-    assert!(best > 0.85, "fitted floor broadband reconstruction poor (corr={best:.4})");
+    assert!(
+        best > 0.85,
+        "fitted floor broadband reconstruction poor (corr={best:.4})"
+    );
 }
 
 /// Opt-in: `-q` sweep — bitrate must rise monotonically with quality, and correlation
@@ -392,7 +413,10 @@ fn quality_sweep() {
         }
         let corr = best_correlation(&signal[0], &decoded, 2 * n);
         let kbps = (bytes as f32 / pkts as f32) * (44100.0 / 1024.0) * 8.0 / 1000.0;
-        eprintln!("QSWEEP q={q:.1}  {} B/pkt  ~{kbps:.0} kb/s  corr={corr:.4}", bytes / pkts);
+        eprintln!(
+            "QSWEEP q={q:.1}  {} B/pkt  ~{kbps:.0} kb/s  corr={corr:.4}",
+            bytes / pkts
+        );
     }
 }
 
@@ -423,8 +447,7 @@ fn compare_real_audio() {
         let mut decoded: Vec<f32> = Vec::new();
         let (mut bytes, mut pkts, mut pos) = (0usize, 0usize, 0usize);
         while pos + n <= dur {
-            let blocks: Vec<Vec<f32>> =
-                (0..2).map(|c| sig[c][pos..pos + n].to_vec()).collect();
+            let blocks: Vec<Vec<f32>> = (0..2).map(|c| sig[c][pos..pos + n].to_vec()).collect();
             let packet = encode_long_packet(&setup, &blocks, rate, q).unwrap();
             bytes += packet.len();
             pkts += 1;
@@ -447,18 +470,24 @@ fn compare_real_audio() {
 #[test]
 #[ignore]
 fn dump_lewton_decode() {
-    let (Ok(inp), Ok(outp)) = (std::env::var("VORBIS_WAV_IN"), std::env::var("VORBIS_WAV_OUT"))
-    else {
+    let (Ok(inp), Ok(outp)) = (
+        std::env::var("VORBIS_WAV_IN"),
+        std::env::var("VORBIS_WAV_OUT"),
+    ) else {
         return;
     };
-    let q: f32 = std::env::var("VORBIS_Q").ok().and_then(|s| s.parse().ok()).unwrap_or(0.9);
+    let q: f32 = std::env::var("VORBIS_Q")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.9);
     let (rate, channels, inter) = read_wav(&inp);
     assert_eq!(channels, 2, "expects stereo");
     let n = 2048usize;
     let hop = n / 2;
     let frames = inter.len() / channels;
-    let sig: Vec<Vec<f32>> =
-        (0..2).map(|c| (0..frames).map(|i| inter[i * channels + c]).collect()).collect();
+    let sig: Vec<Vec<f32>> = (0..2)
+        .map(|c| (0..frames).map(|i| inter[i * channels + c]).collect())
+        .collect();
     let setup = parse_setup(SETUP_Q4_STEREO, 2).unwrap();
     let ident = write_ident_header(2, rate, BS0_LOG2, BS1_LOG2, BITRATE_NOMINAL);
     let l_ident = lewton::header::read_header_ident(&ident).unwrap();
