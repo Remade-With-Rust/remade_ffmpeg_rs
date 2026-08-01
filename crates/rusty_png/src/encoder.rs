@@ -550,10 +550,14 @@ pub(crate) fn write_chunk<W: Write>(mut w: W, name: chunk::ChunkType, data: &[u8
     w.write_be(data.len() as u32)?;
     w.write_all(&name.0)?;
     w.write_all(data)?;
-    let mut crc = Crc32::new();
-    crc.update(&name.0);
-    crc.update(data);
-    w.write_be(crc.finalize())?;
+    let checksum = {
+        crate::prof_scope!(crate::prof::ENC_CRC);
+        let mut crc = Crc32::new();
+        crc.update(&name.0);
+        crc.update(data);
+        crc.finalize()
+    };
+    w.write_be(checksum)?;
     Ok(())
 }
 
@@ -720,7 +724,10 @@ impl<W: Write> Writer<W> {
                     prev = line;
                 }
 
-                let compressed = compressor.finish()?.into_inner();
+                let compressed = {
+                    crate::prof_scope!(crate::prof::ENC_FINISH);
+                    compressor.finish()?.into_inner()
+                };
                 if compressed.len()
                     > fdeflate::StoredOnlyCompressor::<()>::compressed_size((in_len + 1) * height)
                 {
@@ -827,6 +834,10 @@ impl<W: Write> Writer<W> {
     }
 
     fn write_zlib_encoded_idat(&mut self, zlib_encoded: &[u8]) -> Result<()> {
+        // CRC32 over every IDAT payload plus the writes themselves. Previously
+        // unscoped, so it landed in the profiler's residue rather than in a
+        // stage — on a 14 MB IDAT that is not a rounding error.
+        crate::prof_scope!(crate::prof::ENC_CHUNK);
         for chunk in zlib_encoded.chunks(Self::MAX_IDAT_CHUNK_LEN as usize) {
             self.write_chunk(chunk::IDAT, chunk)?;
         }

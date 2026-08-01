@@ -855,3 +855,63 @@ fn decode_file() {
         mpx / (ms_rgb / 1000.0)
     );
 }
+
+/// Chroma downsampling must AVERAGE the box, not point-sample it.
+///
+/// Point-sampling is decimation: it aliases chroma above the subsampled Nyquist
+/// straight into the baseband, and no bitrate recovers it. The tell that found
+/// it was a PSNR that sat flat at ~14.1 dB from quality 50 to 95 while the file
+/// doubled — error that does not respond to bitrate is not quantization error.
+///
+/// This gates the fix with content built to expose it: fine vertical chroma bars
+/// at luma-neutral transitions, where essentially all the signal is chroma.
+#[test]
+fn chroma_downsampling_averages_rather_than_decimates() {
+    use rusty_jpeg::decode::Decoder;
+    use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
+    use std::io::Cursor;
+
+    const W: usize = 128;
+    const H: usize = 128;
+    let mut rgb = vec![0u8; W * H * 3];
+    for y in 0..H {
+        for x in 0..W {
+            let o = (y * W + x) * 3;
+            // 3-pixel bars: right at the 4:2:0 chroma Nyquist.
+            let (r, g, b) = if (x / 3) % 2 == 0 {
+                (200u8, 60u8, 60u8)
+            } else {
+                (60, 200, 200)
+            };
+            rgb[o] = r;
+            rgb[o + 1] = g;
+            rgb[o + 2] = b;
+        }
+    }
+
+    let mut jpg = Vec::new();
+    let mut enc = Encoder::new(&mut jpg, 90);
+    enc.set_sampling_factor(SamplingFactor::R_4_2_0);
+    enc.encode(&rgb, W as u16, H as u16, ColorType::Rgb)
+        .expect("encode");
+
+    let out = Decoder::new(Cursor::new(&jpg)).decode().expect("decode");
+    let mse: f64 = rgb
+        .iter()
+        .zip(&out)
+        .map(|(&a, &b)| {
+            let d = a as f64 - b as f64;
+            d * d
+        })
+        .sum::<f64>()
+        / rgb.len() as f64;
+    let psnr = 10.0 * (255.0f64 * 255.0 / mse).log10();
+
+    // Point-sampling scores ~14.2 dB on this content; box-averaging ~16.5 dB.
+    // The threshold sits between them with room for codec drift on either side.
+    assert!(
+        psnr > 15.5,
+        "chroma PSNR {psnr:.2} dB suggests the downsampler is decimating rather \
+         than averaging (point-sampling scores ~14.2 dB here, averaging ~16.5)"
+    );
+}

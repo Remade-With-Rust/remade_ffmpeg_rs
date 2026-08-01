@@ -23,10 +23,12 @@ mod imp {
         "dec.inflate",
         "dec.unfilter",
         "dec.transform",
+        "enc.finish",
+        "enc.crc",
     ];
 
     thread_local! {
-        static ACC: RefCell<[(f64, u64); 6]> = const { RefCell::new([(0.0, 0); 6]) };
+        static ACC: RefCell<[(f64, u64); 8]> = const { RefCell::new([(0.0, 0); 8]) };
     }
 
     pub struct Scope {
@@ -59,7 +61,7 @@ mod imp {
 
     /// Clear all buckets. Call between timed repetitions.
     pub fn reset() {
-        ACC.with(|a| *a.borrow_mut() = [(0.0, 0); 6]);
+        ACC.with(|a| *a.borrow_mut() = [(0.0, 0); 8]);
     }
 
     /// `(stage, milliseconds, call count)` for every non-empty bucket.
@@ -100,6 +102,13 @@ pub const ENC_CHUNK: usize = 2;
 pub const DEC_INFLATE: usize = 3;
 pub const DEC_UNFILTER: usize = 4;
 pub const DEC_TRANSFORM: usize = 5;
+/// fdeflate's `finish()` — flush + finalize, OUTSIDE the per-row loop. It had no
+/// scope, which is a large part of why the shipped `Fast` path showed an
+/// 11-40% unexplained residue while `Default`/`Best` showed 0.4-3.5%.
+pub const ENC_FINISH: usize = 6;
+/// CRC32 over the IDAT payload, split out of `enc.chunk` so the chunk stage can
+/// be attributed between the checksum and the raw write.
+pub const ENC_CRC: usize = 7;
 
 /// Open a stage scope for the enclosing block. Compiles away entirely when the
 /// `profile` feature is off.

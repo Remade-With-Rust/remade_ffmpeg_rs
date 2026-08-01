@@ -1415,6 +1415,28 @@ impl Default for HuffmanStats {
 /// this; 8K does not.
 const OPTIMIZE_BUFFER_BUDGET: usize = 256 * 1024 * 1024;
 
+/// `RUSTY_JPEG_ARM=pointsample` restores the old point-sampling downsampler,
+/// so the two can be compared in one binary. Resolved once, not per block.
+fn point_sample_chroma() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("RUSTY_JPEG_ARM").map(|v| v == "pointsample").unwrap_or(false))
+}
+
+/// Extract one 8x8 block, box-averaging when the component is subsampled.
+///
+/// `col_stride`/`row_stride` are the subsampling ratios — 2 and 2 for 4:2:0
+/// chroma. This used to take only the top-left sample of each box and DISCARD
+/// the other three, which is not downsampling but decimation: it aliases every
+/// chroma frequency above the subsampled Nyquist straight back into the
+/// baseband, and no amount of bitrate can undo it afterwards.
+///
+/// The tell, on content built from saturated chroma edges: PSNR sat at ~14.1 dB
+/// FLAT from quality 50 to 95 while the file grew from 45 KB to 83 KB. Error
+/// that does not respond to bitrate is not quantization error.
+///
+/// libjpeg, mozjpeg and ffmpeg all box-average here. The average is rounded
+/// half-up, matching libjpeg's `h2v2_downsample`.
 fn get_block(
     data: &[u8],
     start_x: usize,
@@ -1425,12 +1447,37 @@ fn get_block(
 ) -> [i16; 64] {
     let mut block = [0i16; 64];
 
+    // Fast path: no subsampling, so there is nothing to average.
+    if (col_stride == 1 && row_stride == 1) || point_sample_chroma() {
+        for y in 0..8 {
+            for x in 0..8 {
+                let ix = start_x + (x * col_stride);
+                let iy = start_y + (y * row_stride);
+                block[y * 8 + x] = (data[iy * width + ix] as i16) - 128;
+            }
+        }
+        return block;
+    }
+
+    let n = (col_stride * row_stride) as u32;
+    let half = n / 2;
+    let height = data.len() / width;
     for y in 0..8 {
         for x in 0..8 {
             let ix = start_x + (x * col_stride);
             let iy = start_y + (y * row_stride);
-
-            block[y * 8 + x] = (data[iy * width + ix] as i16) - 128;
+            let mut sum = 0u32;
+            for dy in 0..row_stride {
+                // The row buffer is padded to block boundaries, but clamp
+                // anyway so a ragged edge cannot read out of the plane.
+                let sy = (iy + dy).min(height - 1);
+                let base = sy * width;
+                for dx in 0..col_stride {
+                    let sx = (ix + dx).min(width - 1);
+                    sum += data[base + sx] as u32;
+                }
+            }
+            block[y * 8 + x] = ((sum + half) / n) as i16 - 128;
         }
     }
 
