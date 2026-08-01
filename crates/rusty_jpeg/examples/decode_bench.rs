@@ -22,6 +22,7 @@ fn main() {
     // Read once, up front: this benchmarks the codec, not the filesystem.
     let bytes = std::fs::read(&path).expect("read jpeg");
 
+    let verify = std::env::var("RUSTY_JPEG_VERIFY").is_ok();
     let mut sink = 0u64;
     // Recycle output planes between frames, as any streaming consumer would.
     // Set RUSTY_JPEG_ABLATE=nopool to measure without it.
@@ -49,9 +50,24 @@ fn main() {
                 .wrapping_add(px[0] as u64);
         } else {
             let img = d.decode_planar().expect("decode_planar");
-            sink = sink
-                .wrapping_add(img.components[0].data.len() as u64)
-                .wrapping_add(img.components[0].data[0] as u64);
+            // FULL-CONTENT hash under `RUSTY_JPEG_VERIFY=1` only. `len + data[0]`
+            // is too weak to validate buffer recycling — a recycled plane keeps
+            // the previous frame's pixels, so an unwritten byte would slip past
+            // a sampled checksum. But hashing walks 3.1 MB per 1080p decode, so
+            // leaving it on would put that work inside the timed arm and make
+            // every comparison against an external reference meaningless.
+            if verify {
+                for c in &img.components {
+                    for &b in &c.data {
+                        sink ^= b as u64;
+                        sink = sink.wrapping_mul(0x100000001b3);
+                    }
+                }
+            } else {
+                sink = sink
+                    .wrapping_add(img.components[0].data.len() as u64)
+                    .wrapping_add(img.components[0].data[0] as u64);
+            }
             if !pool_off {
                 pool = img.into_planes();
             }
@@ -74,6 +90,9 @@ fn main() {
         ("fast_ac_hit", Count::DecFastAcHit as usize),
         ("fast_ac_miss", Count::DecFastAcMiss as usize),
         ("idct_PAIRS", Count::DecIdctPairs as usize),
+        ("bottom_half_zero", Count::DecBottomHalfZero as usize),
+        ("top_row_only", Count::DecTopRowOnly as usize),
+        ("coef_span_sum", Count::DecCoefSpanSum as usize),
     ] {
         if c[idx] > 0 {
             println!(

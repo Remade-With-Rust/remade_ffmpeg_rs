@@ -34,6 +34,17 @@ impl Default for ImmediateWorker {
     }
 }
 
+/// `RUSTY_JPEG_ABLATE=planezero` — restore the unconditional plane memset.
+pub(crate) fn ablate_plane_zero() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RUSTY_JPEG_ABLATE")
+            .map(|v| v.split(',').any(|t| t == "planezero"))
+            .unwrap_or(false)
+    })
+}
+
 /// `RUSTY_JPEG_ABLATE=planeinit` — see `start_immediate`.
 pub(crate) fn ablate_plane_init() -> bool {
     use std::sync::OnceLock;
@@ -58,19 +69,39 @@ impl ImmediateWorker {
         }
 
         self.offsets[data.index] = 0;
+        let needed = data.component.block_size.width as usize
+            * data.component.block_size.height as usize
+            * data.component.dct_scale
+            * data.component.dct_scale;
+
         // Refill a recycled allocation when the caller supplied one: its pages
         // are already resident, which is the entire cost being avoided.
-        if let Some(buf) = data.recycled {
-            self.results[data.index] = buf;
-            self.results[data.index].clear();
+        //
+        // When it is ALREADY the right length, leave it completely alone. The
+        // plane is exactly the block grid and every block writes its own 8x8,
+        // so the decode overwrites all of it -- the `clear()` + `resize(.., 0)`
+        // this replaces was a full 3.1 MB memset per 1080p frame whose every
+        // byte was then overwritten.
+        //
+        // Note what this does and does not risk. The bytes stay INITIALISED
+        // (they are last frame's pixels), so there is no undefined behaviour and
+        // nothing uninitialised can escape; the only exposure would be stale
+        // pixels if a block were somehow not written, and a scan that fails to
+        // decode returns `Err` rather than handing back a plane.
+        // `RUSTY_JPEG_ABLATE=planezero` forces the old always-memset behaviour,
+        // so the change can be A/B'd inside ONE binary instead of against a
+        // number from an earlier session.
+        match data.recycled {
+            Some(buf) if buf.len() == needed && !ablate_plane_zero() => {
+                self.results[data.index] = buf;
+            }
+            Some(mut buf) => {
+                buf.clear();
+                buf.resize(needed, 0u8);
+                self.results[data.index] = buf;
+            }
+            None => self.results[data.index].resize(needed, 0u8),
         }
-        self.results[data.index].resize(
-            data.component.block_size.width as usize
-                * data.component.block_size.height as usize
-                * data.component.dct_scale
-                * data.component.dct_scale,
-            0u8,
-        );
         self.components[data.index] = Some(data.component);
         self.quantization_tables[data.index] = Some(data.quantization_table);
     }
@@ -202,6 +233,17 @@ impl ImmediateWorker {
         let dc_only = crate::decode::idct::is_dc_only(coeffs);
         if dc_only {
             crate::prof::bump(crate::prof::Count::DecDcOnlyBlocks, 1);
+        }
+        #[cfg(feature = "counters")]
+        {
+            if coeffs[32..].iter().all(|&c| c == 0) {
+                crate::prof::bump(crate::prof::Count::DecBottomHalfZero, 1);
+            }
+            if coeffs[8..].iter().all(|&c| c == 0) {
+                crate::prof::bump(crate::prof::Count::DecTopRowOnly, 1);
+            }
+            let span = coeffs.iter().rposition(|&c| c != 0).unwrap_or(0);
+            crate::prof::bump(crate::prof::Count::DecCoefSpanSum, span as u64);
         }
 
         // A DC-only block is a fill, cheaper than half a vectorized IDCT, so it

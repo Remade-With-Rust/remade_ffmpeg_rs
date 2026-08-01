@@ -8,9 +8,9 @@
 //! ```
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use rand::Rng;
 use rusty_png::benchable_apis::unfilter;
 use rusty_png::FilterType;
-use rand::Rng;
 
 fn unfilter_all(c: &mut Criterion) {
     let bpps = [1, 2, 3, 4, 6, 8];

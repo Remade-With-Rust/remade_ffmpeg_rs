@@ -8,9 +8,11 @@
 //! ```
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use rusty_png::benchable_apis::{create_info_from_plte_trns_bitdepth, create_transform_fn, TransformFn};
-use rusty_png::{Info, Transformations};
 use rand::Rng;
+use rusty_png::benchable_apis::{
+    create_info_from_plte_trns_bitdepth, create_transform_fn, TransformFn,
+};
+use rusty_png::{Info, Transformations};
 use std::fmt::{self, Display};
 
 #[derive(Clone, Copy)]

@@ -117,6 +117,19 @@ mod pair_tests {
                     cb[i] = (next() % 2048) as i16 - 1024;
                     qa[i] = (next() % 255 + 1) as u16;
                 }
+                // Half the rounds drive the SPARSE column pass (rows 4-7 zero),
+                // which 82.7% of real blocks take. Dense random data almost
+                // never triggers it, so without this the sparse path would be
+                // shipped untested.
+                if round % 2 == 1 && i >= 32 {
+                    ca[i] = 0;
+                    cb[i] = 0;
+                }
+                // ...and one round drives the boundary: sparse in A, dense in B,
+                // which must fall back to the general path for BOTH lanes.
+                if round == 3 && i >= 32 {
+                    cb[i] = (next() % 512) as i16 - 256;
+                }
             }
 
             // Non-trivial, and DIFFERENT, strides: a lane-crossing bug that

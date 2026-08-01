@@ -1063,6 +1063,65 @@ thing took one probe and no assembly.
   produced 32.8 where best-of-15 gives 14.88, and a single-rep read would have
   manufactured a 2x "headroom" that does not exist.
 
+## D4g - plumbing, per-block zeroing, IDCT: one shipped, one pruned, one refuted
+
+All three priced from COUNTS first (per 1080p frame, 48,960 blocks):
+`bottom_half_zero` **40,479 = 82.7%**, mean last-nonzero index **17.6 of 63**.
+
+### 1. Plumbing: the redundant plane memset — SHIPPED
+
+`start_immediate` did `clear()` + `resize(n, 0)` on every plane, every frame:
+a full **3.1 MB memset per 1080p frame whose every byte is then overwritten**,
+because the plane is exactly the block grid and every block writes its own 8x8.
+A recycled buffer that is already the right length is now left untouched.
+
+- **Safety:** the bytes stay INITIALISED (last frame's pixels), so nothing
+  uninitialised can escape and there is no UB — the only exposure would be stale
+  pixels if a block went unwritten, and a scan that fails returns `Err`.
+- **GATE:** the old `len + data[0]` checksum was far too weak for this — it would
+  not notice an unwritten byte. Added a **full-content FNV hash over every plane**
+  (`RUSTY_JPEG_VERIFY=1`, kept OUT of the timed path since it walks 3.1 MB) and
+  confirmed pooled output is **identical to fresh-zeroed** on all six fixtures.
+- **MEASURED:** same-binary A/B, 3000-frame arms: 7/11, z 0.90, **median 1.0039**
+  -> inside noise. **Kept on work-removal** (Sec.15): 3.1 MB/frame of memset
+  deleted is a deterministic fact; ~0.4% is correctly below this box's resolution.
+- Also: `DecPlaneInit`'s "3.03%" was profiled-build inflation AGAIN. And a
+  cross-session comparison read 18,984 vs 17,312 ms — pure drift, which the
+  same-binary A/B exposed as +0.4%. Sec.12, twice in one brick.
+
+### 2. Per-block buffer zeroing — PRUNED on arithmetic, nothing built
+
+- `[i16; 64]` = 128 B = **4 wide stores/block** = 196k cyc/frame = **1.09% of
+  decode**. Deleting it *entirely* is worth 1.09%.
+- The clear-by-extent alternative costs ~19 **scattered** i16 stores against 4
+  wide ones — **4.7x worse per block**. Refuted before a line was written.
+
+### 3. Sparse IDCT column pass — BUILT, gated, MEASURED WORSE, REVERTED
+
+82.7% of blocks have rows 4-7 zero, so a half-height column pass looked like the
+best remaining IDCT lever. Built as `idct8_top_half`, hand-folded from `idct8`
+with `data[4..8] == 0` and **bit-identical by construction** (`adds_epi16(x,0)==x`,
+`mulhrs_epi16(0,k)==0`); the oracle was extended with sparse rounds and a
+mixed sparse/dense boundary round, and passed.
+
+- **MEASURED: 2/11, z -2.11, A LOSES** — twice (batched with the plane fix at
+  median 0.9769, and alone at 0.9968).
+- **WHY:** the per-pair zero test (4 loads + OR + `testz`) plus an
+  **unpredictable branch** costs more than the ~15 instructions saved. And 82.7%
+  is a **per-block** figure while the pair kernel needs BOTH blocks sparse.
+- **REMOVED rather than left behind a toggle** (departing from Sec.12
+  deliberately): the branch *was* the cost, so keeping it switchable would keep
+  paying it.
+
+### The pattern across all three
+
+Two of the three failed the same way: **swapping bulk work for per-item
+conditional work loses.** A wide store beats a scattered one; a predictable
+straight line beats a correct branch. On a loop already at its essential cost,
+"do less work" is not automatically "take less time" — the test that decides
+whether to skip is itself work, and it runs on every item including the ones
+that do not benefit.
+
 ---
 
 ## Standing rules for this descent

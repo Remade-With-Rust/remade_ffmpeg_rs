@@ -128,6 +128,7 @@ unsafe fn transpose8(data: &mut [__m256i; 8]) {
     data[7] = _mm256_unpackhi_epi64(d0123hh, d4567hh);
 }
 
+
 /// Dequantize and inverse-transform two 8x8 blocks in one instruction stream.
 ///
 /// Both blocks belong to the SAME component, so they share a quantization
@@ -174,6 +175,12 @@ pub unsafe fn dequantize_and_idct_block_8x8_pair(
         *item = _mm256_slli_epi16::<SHIFT>(_mm256_mullo_epi16(coef, quant));
     }
 
+    // A half-height column pass for the 82.7% of blocks whose rows 4-7 are zero
+    // was built, gated bit-identical, and MEASURED WORSE (2/11, z -2.11, twice):
+    // the per-pair zero test plus an unpredictable branch cost more than the ~15
+    // instructions it saved, and the pair kernel needs BOTH blocks sparse where
+    // 82.7% is a per-block figure. Removed rather than left behind a toggle,
+    // because the branch was the cost. See WHYS.md D4g.
     idct8(&mut data);
     transpose8(&mut data);
     idct8(&mut data);

@@ -83,7 +83,7 @@ impl Stage {
 }
 
 impl Stage {
-    pub const COUNT: usize = 18;
+    pub const COUNT: usize = 21;
     pub fn name(self) -> &'static str {
         match self {
             Stage::Total => "Total",
@@ -419,10 +419,21 @@ pub enum Count {
     DecFastAcMiss,
     /// Decoder: block pairs put through the AVX2 two-block IDCT.
     DecIdctPairs,
+    /// Decoder: blocks whose coefficients 32..64 (natural order rows 4-7) are
+    /// all zero — candidates for a half-height IDCT column pass.
+    DecBottomHalfZero,
+    /// Decoder: blocks whose coefficients 8..64 are all zero (only the top row
+    /// has energy) — candidates for an even cheaper path.
+    DecTopRowOnly,
+    /// Decoder: summed index of the LAST non-zero coefficient per block, in
+    /// NATURAL order. Divided by block count this gives the average span that
+    /// would have to be cleared if the per-block buffer were cleared by extent
+    /// rather than wholesale.
+    DecCoefSpanSum,
 }
 
 impl Count {
-    pub const COUNT: usize = 18;
+    pub const COUNT: usize = 21;
     pub fn name(self) -> &'static str {
         match self {
             Count::Symbols => "symbols",
@@ -443,6 +454,9 @@ impl Count {
             Count::DecFastAcHit => "fast_ac_hit",
             Count::DecFastAcMiss => "fast_ac_miss",
             Count::DecIdctPairs => "idct_PAIRS",
+            Count::DecBottomHalfZero => "bottom_half_zero",
+            Count::DecTopRowOnly => "top_row_only",
+            Count::DecCoefSpanSum => "coef_span_sum",
         }
     }
 }
