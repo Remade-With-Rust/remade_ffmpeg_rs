@@ -34,20 +34,23 @@ different behaviour.
 | | vs FFmpeg | verdict |
 |---|---|---|
 | **Decode** | **2.67–2.95× faster** | 6 real images, 15/15 paired wins each, z = 3.87 |
-| **Encode** | **parity to 1.17× faster, at 0.2–6.0% smaller** | at a matched operating point, with `zlib-rs` |
+| **Encode, vs FFmpeg's default** | **parity to 1.17× faster, 0.2–6.0% smaller** | what a user gets out of the box |
+| **Encode, same filter + same size** | **0.69–0.92× (FFmpeg 1.09–1.45× faster)** | which DEFLATE is faster doing identical work |
 
-Both numbers are deliberately unflattering to us where the methodology allows a
-choice:
+Both encode rows are true; they answer different questions, and the second is
+the one that flatters us least, so read that one as the codec comparison.
 
-- **Encode is compared at a matched operating point, and the operating point is
-  chosen against us.** PNG is lossless, so "faster" is meaningless without
-  fixing size. Our shipped default (`Fast`/`Sub`) is 6.0× faster than FFmpeg's
-  default but **+16.5% larger** — a different point on the curve, and quoting it
-  would price our missing bits as speed. At `Compression::Default` + `Up` with
-  `zlib-rs` we are **1.00×/1.06×/1.14×/1.17×** against FFmpeg's default while
-  producing **−6.0%/−0.2%/−3.3%/−4.5%** bytes. Against `Compression::Best` the
-  fair reference is FFmpeg `-compression_level 9`, not its default; comparing
-  our maximum to their default is the same error in the other direction.
+- **The two encode numbers differ only in what FFmpeg is allowed to do.**
+  Against FFmpeg's *default* (`paeth`, zlib L6) we are at parity-to-faster and
+  smaller. But FFmpeg's `up` filter is cheaper than its `paeth`, so scoring our
+  `up` against its `paeth` quietly hands us the easier side. Matching the filter
+  **and** the size (within 0.3%), FFmpeg wins: 0.83×/0.90×/0.89× at
+  `Compression::Default`, 0.92×/0.69×/0.89× at `Best`. An earlier revision of
+  this file quoted only the flattering row; that was an operating-point error of
+  exactly the kind this project keeps catching in other people's benchmarks.
+- **Our shipped default is a different point again.** `Fast`/`Sub` is 6.0×
+  faster than FFmpeg's default and **+16.5% larger** — quoting *that* as a speed
+  win would price our missing bits as throughput.
 - **Decode is compared with identical work on both sides** — one process per
   arm, same input, same job, output discarded on both. An earlier probe read the
   *opposite* way (FFmpeg ahead) purely because it charged FFmpeg for process
@@ -85,8 +88,10 @@ Two things upstream cannot address for a drop-in FFmpeg replacement:
    upstream routes those through `flate2` → `miniz_oxide` while FFmpeg uses
    zlib. Switching to `zlib-rs` — flate2's **pure-Rust** zlib rewrite, which maps
    to `any_zlib`, *not* `any_c_zlib`, so no C enters the tree — measured
-   **1.68–2.72× faster** at `Default` with size within ±3%, closing that gap to
-   parity-or-better.
+   **1.68–2.72× faster** at `Default` with size within ±3%. That closed most of
+   the gap but **not all of it**: at matched filter and size FFmpeg's zlib is
+   still 1.09–1.45× ahead, and since the profiler puts DEFLATE at 94–99.5% of
+   encode, that residual gap *is* the deflate gap. It is the open item.
 2. **One hard-coded operating point is the wrong default for PNG.**
    `Fast`/`Sub`/non-adaptive is genuinely excellent on photographs — faster *and*
    smaller than every FFmpeg `-compression_level 1` configuration — and poor on
