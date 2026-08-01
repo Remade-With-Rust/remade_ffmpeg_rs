@@ -147,6 +147,81 @@ a result.
   encode is **77–82% deflate at `Fast`** and **94–99.5% at quality**, so nothing
   outside DEFLATE can move the standing benchmark.
 
+## D3a — parallel DEFLATE (BUILT)
+
+- ASKED: with DEFLATE at 77–99.5% of encode and ffmpeg's zlib 1.09–1.45× ahead
+  single-threaded, what actually moves the standing benchmark?
+- ARITHMETIC FIRST (prune before building): Amdahl on a 97% parallel stage gives
+  ~6.6× at 8 threads — far more than the 1.20× needed for parity. **The speedup
+  was never the risk.** The size cost was, and it is deterministic, so it was
+  measured before a line of threading was written.
+- MEASURED (pessimistic bound — independent streams, no dictionary priming):
+
+  | filtered | bytes/block | size delta |
+  |---|---|---|
+  | 24.9 MB | 1.04 MB | **+0.11%** |
+  | 2.35 MB | 98 KB | +1.64% |
+  | 1.44 MB | 60 KB | **+7.44%** |
+
+- ANSWER: the cost tracks **bytes per block**, not block count. So blocks are
+  *sized* (`PAR_MIN_BLOCK` = 1 MiB), never counted, and an image too small to
+  yield two of them stays serial and pays nothing.
+- BUILT AND MEASURED (level 6, zlib-rs, 8 workers):
+
+  | image | filtered | serial | parallel | speedup | size |
+  |---|---|---|---|---|---|
+  | park_joy 8.3 MPx | 24.9 MB | 698 ms | 148 ms | **4.71×** | +0.03% |
+  | blue_sky 8.3 MPx | 24.9 MB | 873 ms | 162 ms | **5.40×** | +0.04% |
+  | gfx_uiart 3.9 MPx | 11.7 MB | 190 ms | 29 ms | **6.53×** | +0.05% |
+  | gfx_chart 0.5 MPx | 1.44 MB | 5.1 ms | **1 block** | 1.04× | **+0.00%** |
+
+  gfx_chart is the row that matters: it refuses to split, so the +7.44% never
+  happens.
+- GATED: the split stream is valid zlib and round-trips byte-for-byte at
+  1/2/3/4/8 workers *decoded by flate2, not by our own decoder*; end-to-end, a
+  PNG encoded through the parallel path decodes to identical pixels, with an
+  assertion that a split actually occurred so a silent serial fallback cannot
+  pass as success.
+- STATUS: closed. Opt-in (`parallel` + `set_parallel`), because it changes the
+  compressed bytes — never the pixels.
+
+## D2c — the fixed default is an unfinished dispatch (SOLVED)
+
+- ASKED: `Fast`/`Sub` is faster *and* smaller than every ffmpeg
+  `-compression_level 1` config on photographs, and **+130.1%** against ffmpeg's
+  default across nine real graphics assets (up to +1409% on a chart). What signal
+  separates them?
+- MEASURED — fraction of horizontally repeated pixels (DEFLATE exploits LZ77
+  matches, so this is the cheapest honest proxy), sampled over ~64 rows:
+
+  | class | signal |
+  |---|---|
+  | photographic (9 Derf frames) | 0.0366 – **0.2037** |
+  | real graphics (9 assets) | **0.5312** – 0.9790 |
+
+  Nothing lands between 0.204 and 0.531, so the 0.35 threshold sits in an **empty
+  band**, not on a fitted boundary.
+- CONFIG CHOSEN BY CORPUS TOTAL, not by counting per-image winners (which were
+  spread across `best/sub`, `best/up`, `best/paeth`, `default/adaptive`):
+
+  | config | total vs ffmpeg | worst image | encode time |
+  |---|---|---|---|
+  | fast/sub (shipped) | +130.1% | +1409.0% | 451 ms |
+  | **default + adaptive** | **−2.4%** | **+0.7%** | **502 ms** |
+  | best + adaptive | −6.3% | −3.3% | 3,638 ms |
+
+  `best` buys 3.9 more points for **8.1×** the time — a bad default however good
+  the number looks in isolation.
+- RESULT end to end: graphics corpus **5,443,716 → 2,372,444 B (−56.4%)**, i.e.
+  **+115.6% → −6.1% vs ffmpeg**; photographs **byte-identical** (the dispatch
+  correctly does not fire); 13/13 lossless; an explicit `-compression_level` /
+  `-pred` still overrides the dispatch.
+- BUG FOUND BY THE UNIT TEST, not by measurement: `PLTE` is 3 *incompressible*
+  bytes per entry, and on a 64×40 40-colour frame indexing cost **more** than it
+  saved (252 B vs 188 B). Small inputs now encode both candidates and keep the
+  smaller; above 1 MB of raw data the palette is ≤768 B and the check is skipped.
+- STATUS: closed.
+
 ## Correctness findings (these outrank the descent)
 
 1. RGB path clean: 30/30 cross-checks pixel-exact — our PNG decoded by ffmpeg,
