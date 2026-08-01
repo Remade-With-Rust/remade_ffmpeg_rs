@@ -915,3 +915,90 @@ fn chroma_downsampling_averages_rather_than_decimates() {
          than averaging (point-sampling scores ~14.2 dB here, averaging ~16.5)"
     );
 }
+
+/// With optimized Huffman tables the encoder must still emit ONE INTERLEAVED
+/// scan, and that scan must round-trip.
+///
+/// Two defects hid behind this gap. The route was chosen on an internal memory
+/// budget, so `-optimize_huffman` produced one scan PER COMPONENT at every
+/// practical resolution — legal, but a layout mainstream encoders never emit.
+/// And when that was fixed, the histogram was gathered AFTER `write_frame_header`
+/// had already emitted the DHT segments, so the file declared one set of tables
+/// and coded the scan with another. Our own decoder tolerated it; ffmpeg did not.
+///
+/// The suite missed both because the raw `Encoder` defaults `optimize_huffman`
+/// OFF, so nothing exercised the path the CLI actually uses.
+#[test]
+fn optimized_huffman_emits_one_interleaved_scan_that_round_trips() {
+    use rusty_jpeg::decode::Decoder;
+    use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
+    use std::io::Cursor;
+
+    /// Components in the first SOS. >1 means interleaved.
+    fn first_sos_components(d: &[u8]) -> usize {
+        let mut i = 2;
+        while i + 4 < d.len() {
+            if d[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let m = d[i + 1];
+            if m == 0xD8 || m == 0xD9 || (0xD0..=0xD7).contains(&m) {
+                i += 2;
+                continue;
+            }
+            let ln = ((d[i + 2] as usize) << 8) | d[i + 3] as usize;
+            if m == 0xDA {
+                return d[i + 4] as usize;
+            }
+            i += 2 + ln;
+        }
+        0
+    }
+
+    // Ragged dimensions on purpose: the last MCU then needs blocks the raster
+    // block grid never materialized, which is where an interleaved walk off the
+    // end of the grid would panic.
+    for (w, h) in [(64usize, 64usize), (127, 65), (200, 97)] {
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * w + x) * 3;
+                rgb[o] = ((x * 7 + y * 3) % 256) as u8;
+                rgb[o + 1] = ((x * 3 + y * 11) % 256) as u8;
+                rgb[o + 2] = ((x * 13 + y * 5) % 256) as u8;
+            }
+        }
+
+        let mut jpg = Vec::new();
+        let mut enc = Encoder::new(&mut jpg, 90);
+        enc.set_sampling_factor(SamplingFactor::R_4_2_0);
+        enc.set_optimized_huffman_tables(true);
+        enc.encode(&rgb, w as u16, h as u16, ColorType::Rgb)
+            .expect("encode");
+
+        assert!(
+            first_sos_components(&jpg) > 1,
+            "{w}x{h}: optimized Huffman emitted a NON-INTERLEAVED scan"
+        );
+
+        let out = Decoder::new(Cursor::new(&jpg))
+            .decode()
+            .expect("decode own optimized-Huffman output");
+        assert_eq!(out.len(), w * h * 3, "{w}x{h}: wrong output size");
+
+        // A table/scan mismatch survives a size check but destroys the image, so
+        // gate on fidelity too.
+        let mse: f64 = rgb
+            .iter()
+            .zip(&out)
+            .map(|(&a, &b)| {
+                let d = a as f64 - b as f64;
+                d * d
+            })
+            .sum::<f64>()
+            / rgb.len() as f64;
+        let psnr = 10.0 * (255.0f64 * 255.0 / mse).log10();
+        assert!(psnr > 20.0, "{w}x{h}: round-trip PSNR only {psnr:.1} dB");
+    }
+}

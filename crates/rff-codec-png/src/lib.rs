@@ -142,6 +142,52 @@ enum ColourKind {
     TrueColour,
 }
 
+/// Fraction of horizontally repeated pixels, sampled over ~64 rows.
+///
+/// This is the dispatch signal for [`auto_config`](PngSettings::auto_config).
+/// What decides the right encoder setting is how much extra DEFLATE effort buys
+/// — on graphics, `Fast` → `Default`+adaptive is 2.4× smaller; on photographs it
+/// is marginal. DEFLATE exploits LZ77 matches, so the cheapest honest proxy is
+/// "does this image repeat horizontally".
+///
+/// Measured on the corpus, and it separates with a wide empty band:
+///
+/// | class | signal |
+/// |---|---|
+/// | photographic (9 Derf frames) | 0.0366 – **0.2037** |
+/// | real graphics (9 assets) | **0.5312** – 0.9790 |
+///
+/// Nothing lands between 0.204 and 0.531, so [`GRAPHICS_SIGNAL`] sits in an
+/// empty gap rather than on a fitted boundary.
+fn content_signal(px: &[u8], w: usize, h: usize, ch: usize) -> f64 {
+    if w < 2 || h == 0 {
+        return 0.0;
+    }
+    let row = w * ch;
+    let step = (h / 64).max(1);
+    let (mut repeats, mut total) = (0usize, 0usize);
+    let mut y = 0usize;
+    while y < h {
+        let line = &px[y * row..(y + 1) * row];
+        for x in 1..w {
+            if line[(x - 1) * ch..(x - 1) * ch + ch] == line[x * ch..x * ch + ch] {
+                repeats += 1;
+            }
+            total += 1;
+        }
+        y += step;
+    }
+    if total == 0 {
+        0.0
+    } else {
+        repeats as f64 / total as f64
+    }
+}
+
+/// Above this repeated-pixel fraction, treat the image as graphics.
+/// Chosen from the empty band between the two measured classes (0.204 / 0.531).
+const GRAPHICS_SIGNAL: f64 = 0.35;
+
 /// Fewest bits per index that can address `n` palette entries.
 fn indexed_bit_depth(n: usize) -> BitDepth {
     match n {

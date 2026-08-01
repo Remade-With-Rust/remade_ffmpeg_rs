@@ -169,6 +169,7 @@ impl SamplingFactor {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Component {
     pub id: u8,
     pub quantization_table: u8,
@@ -903,13 +904,175 @@ impl<W: JfifWrite> Encoder<W> {
         Ok(())
     }
 
+    /// Visit the materialized blocks in MCU (interleaved) order.
+    ///
+    /// `encode_blocks` sizes its BUFFER to MCU-aligned dimensions but rebuilds
+    /// the BLOCK GRID from the unaligned `ceil_div(dim, 8)` — for 1080p luma
+    /// that is 240x135, while an interleaved walk wants 136 rows. The last MCU
+    /// row therefore has no materialized second block row.
+    ///
+    /// Coordinates are clamped to the last real block, which is valid MCU
+    /// padding: those samples fall outside the image and the decoder discards
+    /// them. (The streaming path pads differently — it reads edge-replicated
+    /// pixels from the padded buffer — so the two routes can differ by a few
+    /// bytes in the final MCU. Both are conformant; neither affects any pixel
+    /// the decoder keeps.)
+    fn for_each_block_interleaved(
+        components: &[Component],
+        blocks: &[Vec<[i16; 64]>; 4],
+        grid: &[(usize, usize); 4],
+        mcu_cols: usize,
+        mcu_rows: usize,
+        mut f: impl FnMut(usize, usize, &[i16; 64]),
+    ) {
+        for my in 0..mcu_rows {
+            for mx in 0..mcu_cols {
+                for (i, c) in components.iter().enumerate() {
+                    let ch = c.horizontal_sampling_factor as usize;
+                    let cv = c.vertical_sampling_factor as usize;
+                    let (cols_i, rows_i) = grid[i];
+                    for v in 0..cv {
+                        for h in 0..ch {
+                            let bx = (mx * ch + h).min(cols_i - 1);
+                            let by = (my * cv + v).min(rows_i - 1);
+                            f(my * mcu_cols + mx, i, &blocks[i][by * cols_i + bx]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One INTERLEAVED scan written from materialized blocks.
+    ///
+    /// The block-materializing route used to emit one scan PER COMPONENT, which
+    /// is legal but a layout mainstream encoders never produce and some hardware
+    /// decoders handle poorly — and which route was taken depended on nothing
+    /// but an internal memory budget, so the scan layout of the output changed
+    /// with resolution. This keeps the materializing route's speed and gives it
+    /// the standard layout.
+    ///
+    /// The Huffman histogram is gathered in the SAME MCU order it is written in.
+    /// That matters: MCU order visits a component's blocks in a different
+    /// sequence than raster order, so the DC differences — and therefore the
+    /// symbol frequencies — differ between them. Counting in raster order would
+    /// build tables for a scan that is not the one being written.
+    /// Gather the Huffman histogram in MCU order.
+    ///
+    /// MUST run BEFORE `write_frame_header`, which emits the DHT segments: the
+    /// tables written into the file have to be the tables the scan is coded
+    /// with. Getting this backwards produces a file our own decoder happens to
+    /// tolerate and ffmpeg rejects outright ("error count: 65") — which is why
+    /// the interop check earns its place in the gate.
+    fn optimize_huffman_interleaved(
+        &mut self,
+        blocks: &[Vec<[i16; 64]>; 4],
+        grid: &[(usize, usize); 4],
+        mcu_cols: usize,
+        mcu_rows: usize,
+    ) {
+        let _s = crate::prof::scope(crate::prof::Stage::HuffmanOptimize);
+        let components = self.components.clone();
+        let restart_interval = self.restart_interval.unwrap_or(0) as usize;
+        let mut stats = HuffmanStats::default();
+        let mut prev_dc = [0i16; 4];
+        let mut last_mcu = usize::MAX;
+        Self::for_each_block_interleaved(
+            &components,
+            blocks,
+            grid,
+            mcu_cols,
+            mcu_rows,
+            |mcu, i, block| {
+                if restart_interval > 0 && mcu != last_mcu && mcu % restart_interval == 0 {
+                    prev_dc = [0i16; 4];
+                }
+                last_mcu = mcu;
+                let c = &components[i];
+                JfifWriter::<W>::count_block(
+                    block,
+                    prev_dc[i],
+                    &mut stats.dc[c.dc_huffman_table as usize],
+                    &mut stats.ac[c.ac_huffman_table as usize],
+                );
+                prev_dc[i] = block[0];
+            },
+        );
+        self.optimize_huffman_table_from_stats(&stats);
+    }
+
+    fn write_interleaved_from_blocks(
+        &mut self,
+        blocks: &[Vec<[i16; 64]>; 4],
+        grid: &[(usize, usize); 4],
+        mcu_cols: usize,
+        mcu_rows: usize,
+    ) -> Result<(), EncodingError> {
+        let components = self.components.clone();
+
+        self.writer
+            .write_scan_header(&components.iter().collect::<Vec<_>>(), None)?;
+
+        let restart_interval = self.restart_interval.unwrap_or(0) as usize;
+        let mut prev_dc = [0i16; 4];
+        let mut restarts = 0usize;
+        let mut last_mcu = usize::MAX;
+        let mut pending: Vec<(usize, usize)> = Vec::new();
+
+        // Collect (mcu, component) order first so the writer borrow stays clear
+        // of the closure that walks `blocks`.
+        let mut order: Vec<(usize, usize, [i16; 64])> = Vec::new();
+        Self::for_each_block_interleaved(&components, blocks, grid, mcu_cols, mcu_rows, |mcu, i, b| {
+            order.push((mcu, i, *b));
+        });
+        pending.clear();
+
+        for (mcu, i, block) in order {
+            if restart_interval > 0 && mcu != last_mcu && mcu % restart_interval == 0 && mcu != 0 {
+                self.writer.finalize_bit_buffer()?;
+                self.writer.write_marker(Marker::RST((restarts % 8) as u8))?;
+                restarts += 1;
+                prev_dc = [0i16; 4];
+            }
+            last_mcu = mcu;
+            let c = &components[i];
+            {
+                let _s = crate::prof::scope(crate::prof::Stage::Entropy);
+                self.writer.write_block(
+                    &block,
+                    prev_dc[i],
+                    &self.huffman_tables[c.dc_huffman_table as usize].0,
+                    &self.huffman_tables[c.ac_huffman_table as usize].1,
+                )?;
+            }
+            prev_dc[i] = block[0];
+        }
+        self.writer.finalize_bit_buffer()?;
+        Ok(())
+    }
+
     /// Encode components with one scan per component
     fn encode_image_sequential<I: ImageBuffer, OP: Operations>(
         &mut self,
         image: I,
         q_tables: &[QuantizationTable; 2],
     ) -> Result<(), EncodingError> {
-        let blocks = self.encode_blocks::<_, OP>(&image, q_tables);
+        let (blocks, grid) = self.encode_blocks::<_, OP>(&image, q_tables);
+
+        // Prefer the standard interleaved layout whenever the sampling factors
+        // allow it. Only genuinely non-interleavable sampling falls through to
+        // per-component scans below.
+        if self.sampling_factor.supports_interleaved() {
+            let (max_h, max_v) = self.get_max_sampling_size();
+            let mcu_cols = ceil_div(usize::from(image.width()), 8 * max_h);
+            let mcu_rows = ceil_div(usize::from(image.height()), 8 * max_v);
+            if self.optimize_huffman_table {
+                self.optimize_huffman_interleaved(&blocks, &grid, mcu_cols, mcu_rows);
+            }
+            // Only now may the header go out: it carries the DHT segments.
+            self.write_frame_header(&image, q_tables)?;
+            return self.write_interleaved_from_blocks(&blocks, &grid, mcu_cols, mcu_rows);
+        }
 
         if self.optimize_huffman_table {
             let _s = crate::prof::scope(crate::prof::Stage::HuffmanOptimize);
@@ -973,7 +1136,7 @@ impl<W: JfifWrite> Encoder<W> {
         scans: u8,
         q_tables: &[QuantizationTable; 2],
     ) -> Result<(), EncodingError> {
-        let blocks = self.encode_blocks::<_, OP>(&image, q_tables);
+        let (blocks, _grid) = self.encode_blocks::<_, OP>(&image, q_tables);
 
         if self.optimize_huffman_table {
             let _s = crate::prof::scope(crate::prof::Stage::HuffmanOptimize);
@@ -1080,9 +1243,10 @@ impl<W: JfifWrite> Encoder<W> {
         &mut self,
         image: &I,
         q_tables: &[QuantizationTable; 2],
-    ) -> [Vec<[i16; 64]>; 4] {
+    ) -> ([Vec<[i16; 64]>; 4], [(usize, usize); 4]) {
         let width = image.width();
         let height = image.height();
+        let mut grid = [(1usize, 1usize); 4];
 
         let (max_h_sampling, max_v_sampling) = self.get_max_sampling_size();
 
@@ -1131,6 +1295,7 @@ impl<W: JfifWrite> Encoder<W> {
 
             let cols = ceil_div(num_cols, h_scale);
             let rows = ceil_div(num_rows, v_scale);
+            grid[i] = (cols, rows);
 
             debug_assert!(cols > 0);
             debug_assert!(rows > 0);
@@ -1178,7 +1343,7 @@ impl<W: JfifWrite> Encoder<W> {
                 }
             }
         }
-        blocks
+        (blocks, grid)
     }
 
     fn init_block_buffers(&mut self, buffer_size: usize) -> [Vec<[i16; 64]>; 4] {

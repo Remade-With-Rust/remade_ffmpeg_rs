@@ -5595,6 +5595,7 @@ dependencies = [
  "glob",
  "miniz_oxide",
  "rand 0.8.6",
+ "simd-adler32",
 ]
 
 [[package]]
