@@ -741,3 +741,123 @@ mod avx2_kernel_tests {
         }
     }
 }
+
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+pub(crate) mod neon {
+    use super::{QuantizationTable, SHIFT};
+    use crate::encode::writer::ZIGZAG;
+
+    /// NEON mirror of [`super::avx2::quantize_block_avx2`].
+    ///
+    /// Same arithmetic in the same order, 128-bit registers instead of 256:
+    /// widen i16 -> i32, `|v| + correction`, multiply by the reciprocal, shift
+    /// by `SHIFT`, re-apply the sign, saturating-narrow back to i16, then the
+    /// same zig-zag gather.
+    ///
+    /// The sign step needs no special case for `v == 0`. AVX2's `sign_epi32`
+    /// forces the result to zero there and this does not — but at `v == 0` the
+    /// quantized magnitude is already zero (`correction` is about `divisor / 2`
+    /// and `reciprocal` about `2^SHIFT / divisor`, so their product shifts down
+    /// to 0), and negating zero is zero. The two agree.
+    ///
+    /// **Not executed on the machine this was written on**, which is x86 only.
+    /// It is gated by `neon_matches_scalar`, which compares it exhaustively
+    /// against the scalar oracle and runs wherever the target is aarch64 — ARM
+    /// CI is what actually certifies it. The scalar path remains the fallback.
+    ///
+    /// # Safety
+    /// NEON is baseline on aarch64, so no runtime detection is needed. All
+    /// accesses are to fixed-size 64-element arrays at known offsets.
+    #[target_feature(enable = "neon")]
+    pub(crate) unsafe fn quantize_block_neon(
+        block: &[i16; 64],
+        q_block: &mut [i16; 64],
+        table: &QuantizationTable,
+    ) {
+        use core::arch::aarch64::*;
+
+        let mut tmp = [0i16; 64];
+        let recip = table.reciprocals.as_ptr();
+        let corr = table.corrections.as_ptr();
+        let src = block.as_ptr();
+
+        for c in 0..8 {
+            let base = c * 8;
+
+            let v = vld1q_s16(src.add(base));
+            let v_lo = vmovl_s16(vget_low_s16(v));
+            let v_hi = vmovl_high_s16(v);
+
+            let q_lo = vshrq_n_s32::<{ SHIFT as i32 }>(vmulq_s32(
+                vaddq_s32(vabsq_s32(v_lo), vld1q_s32(corr.add(base))),
+                vld1q_s32(recip.add(base)),
+            ));
+            let q_hi = vshrq_n_s32::<{ SHIFT as i32 }>(vmulq_s32(
+                vaddq_s32(vabsq_s32(v_hi), vld1q_s32(corr.add(base + 4))),
+                vld1q_s32(recip.add(base + 4)),
+            ));
+
+            let s_lo = vbslq_s32(vcltzq_s32(v_lo), vnegq_s32(q_lo), q_lo);
+            let s_hi = vbslq_s32(vcltzq_s32(v_hi), vnegq_s32(q_hi), q_hi);
+
+            // Saturating narrow, matching AVX2's `packs_epi32`.
+            let packed = vcombine_s16(vqmovn_s32(s_lo), vqmovn_s32(s_hi));
+            vst1q_s16(tmp.as_mut_ptr().add(base), packed);
+        }
+
+        for i in 0..64 {
+            *q_block.get_unchecked_mut(i) =
+                *tmp.get_unchecked(*ZIGZAG.get_unchecked(i) as usize & 0x3f);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::encode::quantization::{quantize_block_scalar, QuantizationTableType};
+
+        /// The NEON kernel must be BIT-IDENTICAL to the scalar oracle. This is
+        /// integer arithmetic doing the same operations in the same order, so
+        /// the gate is `assert_eq!`, not a tolerance.
+        ///
+        /// This test is the entire verification for the NEON path — it was
+        /// written on x86 and has never executed. If it is not run on ARM, the
+        /// kernel is unverified.
+        #[test]
+        fn neon_matches_scalar() {
+            for &quality in &[1u8, 25, 50, 75, 90, 100] {
+                for &luma in &[true, false] {
+                    let t = QuantizationTable::new_with_quality(
+                        &QuantizationTableType::Default,
+                        quality,
+                        luma,
+                    );
+                    let mut block = [0i16; 64];
+                    let mut state = 0x2545_F491_4F6C_DD1Du64;
+                    for round in 0..256 {
+                        for (i, b) in block.iter_mut().enumerate() {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            *b = match round {
+                                0 => i16::MAX,
+                                1 => i16::MIN,
+                                2 => 0,
+                                3 => if i == 0 { i16::MAX } else { 0 },
+                                _ => (state % 4096) as i16 - 2048,
+                            };
+                        }
+                        let mut want = [0i16; 64];
+                        let mut got = [0i16; 64];
+                        quantize_block_scalar(&block, &mut want, &t);
+                        unsafe { quantize_block_neon(&block, &mut got, &t) };
+                        assert_eq!(
+                            got, want,
+                            "quality={quality} luma={luma} round={round}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

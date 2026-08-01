@@ -534,6 +534,16 @@ impl<W: JfifWrite> Encoder<W> {
                 return self.encode_image_internal::<_, AVX2Operations>(image);
             }
         }
+        // NEON is baseline on aarch64, so this needs no runtime detection. Only
+        // quantize is vectorized here; the forward DCT stays scalar (see
+        // `encode::neon` for why that gap is deliberate rather than an oversight).
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        {
+            if !self.branchy_quantize {
+                return self
+                    .encode_image_internal::<_, crate::encode::neon::NeonOperations>(image);
+            }
+        }
         if self.branchy_quantize {
             return self.encode_image_internal::<_, BranchyQuantizeOperations>(image);
         }

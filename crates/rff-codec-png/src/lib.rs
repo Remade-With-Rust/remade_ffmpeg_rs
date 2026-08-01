@@ -452,7 +452,7 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
     let stride = vf.strides[0];
 
     // png wants tightly packed rows; repack if the source stride has padding.
-    let packed: Vec<u8> = if stride == row {
+    let mut packed: Vec<u8> = if stride == row {
         vf.planes[0].clone()
     } else {
         let mut p = Vec::with_capacity(row * h);
@@ -536,7 +536,16 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
             let flat: Vec<u8> = palette.iter().flat_map(|c| c.iter().copied()).collect();
             (ColorType::Indexed, depth, body, Some(flat), trns)
         }
-        ColourKind::TrueColour => (color, BitDepth::Eight, packed, None, None),
+        // `take` rather than clone: on this path `packed` is the body, and the
+        // small-image palette re-check below only runs when indexing WAS used,
+        // so nothing reads `packed` afterwards here.
+        ColourKind::TrueColour => (
+            color,
+            BitDepth::Eight,
+            std::mem::take(&mut packed),
+            None,
+            None,
+        ),
     };
 
     // Pre-size the output buffer so it never reallocates.
@@ -557,11 +566,49 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
     // `body.len() + 1024` is an upper bound, not a guess: DEFLATE's stored mode
     // is the worst case and adds well under 1 KB of block headers at these
     // sizes, so this reserves exactly once.
+    let indexed_used = matches!(out_color, ColorType::Indexed);
+    let out = emit(
+        vf, settings, out_color, out_depth, &body, palette, trns,
+    )?;
+
+    // A palette is not free: PLTE is 3 bytes per entry of essentially
+    // incompressible data. On a real image that is nothing against a multi-KB
+    // IDAT, but on a small one it can cost more than indexing saves — measured
+    // on a 64x40, 40-colour frame, indexed came out 252 B against 188 B
+    // truecolour, because DEFLATE crushes the smooth truecolour data while the
+    // palette stays ~120 B.
+    //
+    // Rather than guess a threshold, encode the alternative too and keep the
+    // smaller — but only for inputs small enough that a second encode is free.
+    // Above this size the palette is at most 768 B against a megabyte of raw
+    // data, so indexing always wins and the check is skipped.
+    const DUAL_ENCODE_LIMIT: usize = 1_000_000;
+    if indexed_used && packed.len() < DUAL_ENCODE_LIMIT {
+        let alt = emit(vf, settings, color, BitDepth::Eight, &packed, None, None)?;
+        if alt.len() < out.len() {
+            return Ok(alt);
+        }
+    }
+    Ok(out)
+}
+
+/// Write one PNG with an explicit colour type / palette. Split out so the
+/// small-image palette check can encode a second candidate cheaply.
+#[allow(clippy::too_many_arguments)]
+fn emit(
+    vf: &VideoFrame,
+    settings: PngSettings,
+    color: ColorType,
+    depth: BitDepth,
+    body: &[u8],
+    palette: Option<Vec<u8>>,
+    trns: Option<Vec<u8>>,
+) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(body.len() + 1024);
     {
         let mut encoder = rusty_png::Encoder::new(&mut out, vf.width, vf.height);
-        encoder.set_color(out_color);
-        encoder.set_depth(out_depth);
+        encoder.set_color(color);
+        encoder.set_depth(depth);
         if let Some(p) = palette {
             encoder.set_palette(p);
         }
@@ -575,7 +622,7 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
             .write_header()
             .map_err(|e| Error::invalid(format!("png encode: {e}")))?;
         writer
-            .write_image_data(&body)
+            .write_image_data(body)
             .map_err(|e| Error::invalid(format!("png encode: {e}")))?;
     }
     Ok(out)
@@ -664,8 +711,16 @@ mod tests {
             ("bilevel", frame_from(64, 40, 3, |i, j| {
                 if (i / 3 + j / 5) % 2 == 0 { [10, 200, 30, 255] } else { [250, 5, 90, 255] }
             })),
-            // ~40 colours -> Indexed at 4 bits (>16) / 8 bits
-            ("palette", frame_from(64, 40, 3, |i, j| {
+            // ~40 colours, big enough that the 120-byte PLTE is negligible
+            // -> Indexed must win outright.
+            ("palette", frame_from(400, 300, 3, |i, j| {
+                let n = ((i / 50) + (j / 40) * 8) as u8;
+                [n * 6, 255 - n * 5, n.wrapping_mul(17), 255]
+            })),
+            // Same content but TINY: here the incompressible PLTE costs more
+            // than indexing saves, so auto-type must fall back rather than
+            // inflate the file. Measured before the guard: 252 B vs 188 B.
+            ("palette_tiny", frame_from(64, 40, 3, |i, j| {
                 let n = ((i / 8) + (j / 8) * 8) as u8;
                 [n * 6, 255 - n * 5, n.wrapping_mul(17), 255]
             })),
@@ -706,7 +761,10 @@ mod tests {
                 a.len(),
                 b.len()
             );
-            if name != "truecolour" {
+            // `truecolour` has nothing to narrow to, and `palette_tiny` is the
+            // case where narrowing legitimately does not pay — both must simply
+            // never come out LARGER, which is asserted above.
+            if name != "truecolour" && name != "palette_tiny" {
                 assert!(
                     a.len() < b.len(),
                     "{name}: auto-type should have shrunk this ({} vs {})",
