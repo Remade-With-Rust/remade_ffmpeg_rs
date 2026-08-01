@@ -30,7 +30,7 @@ licensed (CI-enforced by `cargo-deny`).
 | Vorbis | ✅ | — | lewton (pure Rust) | validated |
 | FLAC | ✅ | — | claxon (pure Rust) | validated |
 | PNG | ✅ | ✅ | png (pure Rust) | validated |
-| JPEG | ✅ | ✅ | jpeg-decoder / jpeg-encoder (pure Rust) | validated |
+| JPEG | ✅ | ✅ | in-house `rusty_jpeg` (pure Rust; vendored merge of jpeg-decoder + jpeg-encoder) | validated |
 | GIF | ✅ | ✅ | gif (pure Rust) | validated |
 | WebP | ✅ | ✅ | image-webp (pure Rust) | validated |
 | JPEG XL | ✅ | — | jxl-oxide (pure Rust) | validated |

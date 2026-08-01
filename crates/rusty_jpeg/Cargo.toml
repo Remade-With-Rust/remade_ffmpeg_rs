@@ -1,0 +1,48 @@
+[package]
+name = "rusty_jpeg"
+version = "0.1.5"
+edition = "2021"
+license = "(MIT OR Apache-2.0) AND IJG"
+repository = "https://github.com/Remade-With-Rust/rusty_jpeg"
+authors = ["Mata Network <https://www.mata.network>"]
+homepage = "https://github.com/Remade-With-Rust/rusty_jpeg"
+description = "Pure-Rust JPEG/MJPEG decoder + encoder, no C/FFI. Baseline and progressive DCT, planar YUV in/out, AVX2 FDCT/quantize and a two-block AVX2 IDCT. Encodes 1.19x faster than FFmpeg at matched output size; decodes ~1.04x faster."
+readme = "README.md"
+keywords = ["jpeg", "mjpeg", "image", "decoder", "encoder"]
+categories = ["multimedia::images", "multimedia::encoding"]
+rust-version = "1.85"
+
+[features]
+# `rayon` is deliberately NOT here. Upstream `jpeg-decoder` enables it by
+# default; measured on this decoder it is a net LOSS at every image size, because
+# the fork-join costs more than the parallelism it buys on a single frame:
+#
+#   640x480    1.32x SLOWER with rayon
+#   1920x1080  1.91x SLOWER
+#   3840x2160  1.32x SLOWER
+#
+# Turning it off took 1080p decode from 6.94 to 3.82 ms/frame. The feature is
+# kept so the measurement is cheap to repeat (and in case a future worker design
+# changes the answer), but it must not be on by default.
+default = ["std", "simd"]
+std = []
+# Encoder AVX2 kernels (FDCT + RGB->YCbCr). NOT default upstream, which is how
+# they sat dead in this tree for the whole life of the dependency.
+simd = ["std"]
+# Decoder work-stealing threading.
+rayon = ["dep:rayon"]
+# Decoder: drop all arch-specific code (forbids unsafe outright).
+platform_independent = []
+nightly_aarch64_neon = []
+# Exposes internal kernels for benchmarks/oracle A-B tests.
+benchmark = []
+# Feature-gated stage profiler; zero-cost when off.
+profile = []
+# Deterministic work counters (symbols, bits, flushes). SEPARATE from `profile`
+# on purpose: the counters fire hundreds of millions of times inside the entropy
+# coder, so enabling both makes the cycle buckets measure the instrument. Counts
+# from this build; cycles from a `profile` build; never the same binary.
+counters = []
+
+[dependencies]
+rayon = { version = "1.5.1", optional = true }

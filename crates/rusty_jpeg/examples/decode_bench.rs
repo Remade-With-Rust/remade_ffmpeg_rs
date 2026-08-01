@@ -1,0 +1,93 @@
+//! Decode one JPEG N times. A clean, single-purpose executable so a pinned,
+//! CPU-time measurement has something to measure that is not cargo, not a test
+//! harness, and not file I/O.
+//!
+//! ```text
+//! decode_bench <file.jpg> [reps] [planar|rgb]
+//! ```
+
+use rusty_jpeg::decode::Decoder;
+use std::io::Cursor;
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let path = args
+        .next()
+        .expect("usage: decode_bench <file.jpg> [reps] [mode]");
+    let reps: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(100);
+    let mode = args.next().unwrap_or_else(|| "planar".into());
+    // 4th arg: "st" forces single-threaded decoding.
+    let single = args.next().map(|v| v == "st").unwrap_or(false);
+
+    // Read once, up front: this benchmarks the codec, not the filesystem.
+    let bytes = std::fs::read(&path).expect("read jpeg");
+
+    let mut sink = 0u64;
+    // Recycle output planes between frames, as any streaming consumer would.
+    // Set RUSTY_JPEG_ABLATE=nopool to measure without it.
+    let pool_off = std::env::var("RUSTY_JPEG_ABLATE")
+        .map(|v| v.split(',').any(|t| t == "nopool"))
+        .unwrap_or(false);
+    let mut pool: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..reps {
+        let mut d = Decoder::new(Cursor::new(&bytes));
+        d.set_single_threaded(single);
+        if !pool_off {
+            d.recycle_planes(std::mem::take(&mut pool));
+        }
+        if mode == "headers" {
+            // Prices per-frame SETUP only: construct the decoder, parse the
+            // markers, build the Huffman LUTs. Everything the full decode pays
+            // before a single coefficient is read.
+            d.read_info().expect("read_info");
+            let info = d.info().expect("info");
+            sink = sink.wrapping_add(info.width as u64);
+        } else if mode == "rgb" {
+            let px = d.decode().expect("decode");
+            sink = sink
+                .wrapping_add(px.len() as u64)
+                .wrapping_add(px[0] as u64);
+        } else {
+            let img = d.decode_planar().expect("decode_planar");
+            sink = sink
+                .wrapping_add(img.components[0].data.len() as u64)
+                .wrapping_add(img.components[0].data[0] as u64);
+            if !pool_off {
+                pool = img.into_planes();
+            }
+        }
+    }
+    // Consume the result so nothing above can be optimized away.
+    println!("{reps} decodes, checksum {sink}");
+    println!("{}", rusty_jpeg::prof::dump());
+    let c = rusty_jpeg::prof::read();
+    use rusty_jpeg::prof::Count;
+    let blocks = c[Count::DecBlocks as usize];
+    let reps_f = reps as f64;
+    for (name, idx) in [
+        ("refills", Count::DecRefills as usize),
+        ("bytes_read", Count::DecBytesRead as usize),
+        ("symbols", Count::DecSymbols as usize),
+        ("receive_extend", Count::DecReceiveExtend as usize),
+        ("lut_hit", Count::DecLutHit as usize),
+        ("lut_MISS", Count::DecLutMiss as usize),
+        ("fast_ac_hit", Count::DecFastAcHit as usize),
+        ("fast_ac_miss", Count::DecFastAcMiss as usize),
+        ("idct_PAIRS", Count::DecIdctPairs as usize),
+    ] {
+        if c[idx] > 0 {
+            println!(
+                "  {name:<16} {:>12} total  {:>10.0} /frame",
+                c[idx],
+                c[idx] as f64 / reps_f
+            );
+        }
+    }
+    if blocks > 0 {
+        println!(
+            "dec_blocks {blocks}, dc_only {} = {:.1}%",
+            c[Count::DecDcOnlyBlocks as usize],
+            100.0 * c[Count::DecDcOnlyBlocks as usize] as f64 / blocks as f64
+        );
+    }
+}

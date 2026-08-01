@@ -22,7 +22,7 @@ Licenses below were verified against crates.io (2026-06).
 | image | AV1 (AVIF) | `rav1e` | BSD-2-Clause | ✅ (asm, no C) | encode |
 | image | AV1 (AVIF) | `rav1d` | BSD-2-Clause | ✅ (Rust port of dav1d) | decode |
 | image | PNG | `png` | MIT/Apache-2.0 | ✅ | encode + decode |
-| image | JPEG/MJPEG | `jpeg-decoder` / `jpeg-encoder` | MIT/Apache-2.0 (+ IJG) | ✅ | encode + decode |
+| image | JPEG/MJPEG | **in-house** `rusty_jpeg` (vendored merge of `jpeg-decoder` + `jpeg-encoder`) | (MIT OR Apache-2.0) AND IJG | ✅ | encode + decode; baseline + progressive |
 | image | GIF | `gif` | MIT/Apache-2.0 | ✅ (LZW in Rust) | encode + decode (first frame) |
 | image | WebP | `image-webp` | MIT/Apache-2.0 | ✅ (VP8/VP8L) | decode + lossless encode |
 | image | **JPEG XL** | `jxl-oxide` | MIT/Apache-2.0 | ✅ (no FFI) | **decode** (no permissive Rust encoder) |
