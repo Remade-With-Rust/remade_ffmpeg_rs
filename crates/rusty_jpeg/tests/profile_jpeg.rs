@@ -12,7 +12,7 @@
 //! Throughput comes from the profiler-OFF build; the breakdown from the ON one.
 
 use rusty_jpeg::decode::Decoder;
-use rusty_jpeg::encode::{ColorType, Encoder, PlanarYcbcrImage, SamplingFactor};
+use rusty_jpeg::encode::{Encoder, PlanarYcbcrImage, SamplingFactor};
 use std::io::Cursor;
 use std::time::Instant;
 
