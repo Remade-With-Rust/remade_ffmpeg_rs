@@ -18,6 +18,19 @@ use rff_core::{
 /// The underlying pure-Rust MP3 engine, re-exported for direct use.
 pub use rusty_mp3;
 
+/// Re-export the Prometheus telemetry hooks.
+///
+/// This crate FORWARDS the `prometheus-telemetry` feature to `rusty_mp3`
+/// (see Cargo.toml) but stopped re-exporting the module when mp3 was
+/// extracted into a standalone crate — so `rff_codec_mp3::prometheus_telemetry`
+/// vanished while the feature that implies it kept working. Prometheus's
+/// harvester imports exactly that path and no longer compiles.
+///
+/// Forwarding a feature without re-exporting what the feature provides is a
+/// silent break: the manifest still says yes and the module is gone.
+#[cfg(feature = "prometheus-telemetry")]
+pub use rusty_mp3::prometheus_telemetry;
+
 /// Register the MP3 codec (decoder + encoder) into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
     registry.register(Codec {
