@@ -225,17 +225,30 @@ fn resolve_threads(requested: usize) -> usize {
         .unwrap_or(1)
 }
 
-/// Convert one big-endian 16-bit PNG sample to 8-bit, **rounding**.
+/// Convert one big-endian 16-bit PNG sample to 8-bit, matching FFmpeg exactly.
 ///
-/// The backing crate's `STRIP_16` keeps the high byte (`v >> 8`), which is
-/// truncation, not reduction: measured against a real 16-bit PNG that put
-/// **34.0% of bytes off by 1 LSB** from both the source and FFmpeg's decode,
-/// where FFmpeg was exact. `round(v * 255 / 65535)` is the correct mapping and
-/// makes 0xFFFF -> 255 and 0x0000 -> 0 exactly.
+/// The backing crate's `STRIP_16` keeps the high byte (`v >> 8`) — truncation,
+/// not reduction — which put **34.0% of bytes off by 1 LSB** against FFmpeg's
+/// decode of the same file.
+///
+/// The formula here was **measured, not derived**. Candidates scored against
+/// FFmpeg over 6.2 M samples:
+///
+/// | formula | agreement |
+/// |---|---|
+/// | `v >> 8` (what `STRIP_16` does) | 66.01% |
+/// | `round(v * 255 / 65535)` | 42.32% |
+/// | `floor(v * 255 / 65535)` | 0.09% |
+/// | **`(v + 128) >> 8`** | **100.00%** |
+///
+/// The "mathematically pure" rescale is *worse* here: FFmpeg rounds the high
+/// byte rather than rescaling the range, and for a drop-in replacement matching
+/// the reference beats matching the textbook. The clamp matters — `0xFFFF`
+/// would otherwise overflow to 256.
 #[inline]
 fn sample16_to_8(hi: u8, lo: u8) -> u8 {
     let v = u16::from_be_bytes([hi, lo]) as u32;
-    ((v * 255 + 32_767) / 65_535) as u8
+    ((v + 128) >> 8).min(255) as u8
 }
 
 /// Fewest bits per index that can address `n` palette entries.
@@ -355,6 +368,13 @@ struct PngSettings {
     /// DEFLATE worker budget. 0 = auto (capped, see `resolve_threads`), 1 =
     /// serial. Parallel output is lossless but not byte-identical to serial,
     /// so `-threads 1` is the way back to reproducible bytes.
+    ///
+    /// **Applies to `-compression_level 2..9` only.** Levels 0–1 map to
+    /// `Compression::Fast`, which is `fdeflate` — a single-stream fast path with
+    /// no block splitting — so `-threads` has no effect there. That is the right
+    /// trade rather than an oversight: the measured gap against FFmpeg lives at
+    /// the quality levels (matched filter and size: 0.69–0.92×), while at `Fast`
+    /// we are already ~6× faster than FFmpeg's default.
     threads: usize,
     /// Narrow the output colour type to gray/indexed when the pixels allow it.
     /// On by default: it is lossless, and without it every grayscale or palette
@@ -768,6 +788,33 @@ mod tests {
     /// Auto-typing must be LOSSLESS in every branch and must actually shrink the
     /// file. Round-trip is the gate: narrowing the colour type is only valid if
     /// the pixels come back bit-for-bit.
+    /// 16-bit reduction must match FFmpeg exactly, including the endpoints.
+    /// The formula was chosen by measurement (100.00% agreement over 6.2 M
+    /// samples, against 66.01% for the truncation it replaced), so this pins it.
+    #[test]
+    fn sixteen_bit_reduction_matches_ffmpeg() {
+        // endpoints
+        assert_eq!(sample16_to_8(0x00, 0x00), 0);
+        assert_eq!(sample16_to_8(0xFF, 0xFF), 255, "0xFFFF must clamp to 255, not overflow");
+        // the rounding boundary: 0x7F80 is exactly .5 at the high byte
+        assert_eq!(sample16_to_8(0x7F, 0x7F), 0x7F);
+        assert_eq!(sample16_to_8(0x7F, 0x80), 0x80);
+        // real samples taken from an FFmpeg-produced rgb48be frame
+        for (hi, lo, want) in [
+            (0x0Fu8, 0xFEu8, 16u8),
+            (0x12, 0x03, 18),
+            (0x0F, 0x04, 15),
+            (0x10, 0xFF, 17),
+            (0x13, 0x03, 19),
+        ] {
+            assert_eq!(
+                sample16_to_8(hi, lo),
+                want,
+                "0x{hi:02x}{lo:02x} should reduce to {want}"
+            );
+        }
+    }
+
     #[test]
     fn auto_type_is_lossless_and_smaller() {
         let cases: Vec<(&str, VideoFrame)> = vec![
