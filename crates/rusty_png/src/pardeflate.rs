@@ -53,10 +53,28 @@ pub const PAR_MIN_BLOCK: usize = 1 << 20;
 /// Returns 1 when the image cannot yield at least two full-size blocks, which is
 /// the case that would otherwise pay the +1.6%…+7.4% penalty for nothing.
 pub fn block_count(filtered_len: usize, threads: usize) -> usize {
-    if threads <= 1 || filtered_len < 2 * PAR_MIN_BLOCK {
+    // Platforms with no thread support: `std::thread::scope` COMPILES on
+    // wasm32-unknown-unknown but `spawn` is unsupported there and panics at
+    // runtime. A `cargo check --target wasm32-unknown-unknown` therefore passes
+    // while the code is still broken, which is exactly the kind of gap a
+    // compile-only gate misses. Force serial so the panic is unreachable rather
+    // than merely unlikely.
+    //
+    // (The default path already resolved to 1 by accident, because
+    // `available_parallelism()` returns `Err` here — but "safe by accident" is
+    // not safe: an explicit `-threads 8` walked straight into it.)
+    #[cfg(all(target_family = "wasm", not(target_feature = "atomics")))]
+    {
+        let _ = (filtered_len, threads);
         return 1;
     }
-    (filtered_len / PAR_MIN_BLOCK).min(threads).max(1)
+    #[cfg(not(all(target_family = "wasm", not(target_feature = "atomics"))))]
+    {
+        if threads <= 1 || filtered_len < 2 * PAR_MIN_BLOCK {
+            return 1;
+        }
+        (filtered_len / PAR_MIN_BLOCK).min(threads).max(1)
+    }
 }
 
 fn adler32(data: &[u8]) -> u32 {
