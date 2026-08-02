@@ -5465,9 +5465,9 @@ version = "0.1.1"
 
 [[package]]
 name = "rusty_av1d"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28d6c2276c1e7171c6c48dd78614d4cc709181e3881de4f3782668c72f88c361"
+checksum = "28505cb7e90ca07a4e2b91784cef217035937c833248191d95230b7f02423cd9"
 dependencies = [
  "assert_matches",
  "atomig",
@@ -5475,7 +5475,6 @@ dependencies = [
  "bitflags 2.13.0",
  "cc",
  "cfg-if",
- "libc",
  "parking_lot",
  "paste",
  "raw-cpuid",

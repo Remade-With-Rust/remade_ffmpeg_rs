@@ -138,7 +138,7 @@ rff-auth = { path = "crates/rff-auth", version = "0.1.0" }
 # toolkit MAIN (the merged no-asm fix + the prom_av1e content-dispatch tier),
 # ahead of the old b471be0 branch pin.
 rusty_av1e = { version = "0.8.0", default-features = false }
-rusty_av1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+rusty_av1d = { version = "1.2.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 # png: our own rusty_png — a performance fork of image-rs/image-png 0.17.16
 # (MIT/Apache-2.0), carried forward in-tree. DEFLATE via miniz_oxide/fdeflate,
 # with an opt-in pure-Rust `zlib-rs` backend. See crates/rusty_png/NOTICE.md.
