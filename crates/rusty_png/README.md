@@ -34,8 +34,14 @@ different behaviour.
 | | vs FFmpeg | verdict |
 |---|---|---|
 | **Decode** | **2.67–2.95× faster** | 6 real images, 15/15 paired wins each, z = 3.87 |
-| **Encode, vs FFmpeg's default** | **parity to 1.17× faster, 0.2–6.0% smaller** | what a user gets out of the box |
-| **Encode, same filter + same size** | **0.69–0.92× (FFmpeg 1.09–1.45× faster)** | which DEFLATE is faster doing identical work |
+| **Encode, wall clock, multi-core** | **2.11–3.06× faster, 0.1–0.2% smaller** | end-to-end, matched filter + level, `parallel` |
+| **Encode, per core, same filter + size** | **0.69–0.92× (FFmpeg 1.09–1.45× faster)** | which DEFLATE is faster doing identical work |
+| **Graphics size, default settings** | **−6.1%** *(was +115.6%)* | 9 real screenshots/charts/diagrams/logos |
+
+The wall-clock row is a **multi-core vs single-core** comparison and is labelled
+as such: FFmpeg's PNG encoder is single-threaded for one image, which is the
+structural point, but it is never quoted as a per-core win. Per core we are
+still behind, and that row is kept directly above it.
 
 Both encode rows are true; they answer different questions, and the second is
 the one that flatters us least, so read that one as the codec comparison.
@@ -96,11 +102,14 @@ Two things upstream cannot address for a drop-in FFmpeg replacement:
    `Fast`/`Sub`/non-adaptive is genuinely excellent on photographs — faster *and*
    smaller than every FFmpeg `-compression_level 1` configuration — and poor on
    graphics, where it ran **+130.1%** against FFmpeg's default across nine real
-   screenshots/charts/diagrams. The same corpus at the crate's *best reachable*
-   settings comes out **−5.7%**. The winning configuration is content-dependent
+   screenshots/charts/diagrams. The winning configuration is content-dependent
    and measured so (`best/up` on charts, `best/sub` on screenshots,
    `default/sub/adaptive` on diagrams, `best/paeth` on UI art), which makes a
    single fixed default an unfinished dispatch rather than a tuning choice.
+   `rff-codec-png` now dispatches on a measured content signal — repeated-pixel
+   fraction, which separates photographs (0.0366–0.2037) from real graphics
+   (0.5312–0.9790) with **nothing in between** — taking that corpus from
+   **+115.6% to −6.1%** vs FFmpeg while leaving photographs byte-identical.
 
 Every change is gated: the fork is **byte-identical to upstream `png` 0.17.16**
 across **600 comparisons** (20 images × 30 configurations, encode bytes *and*
@@ -159,8 +168,9 @@ is the strongest setting on text and screenshot content.
 
 | Feature | Default | Effect |
 |---|---|---|
-| `zlib-rs` | **no** | DEFLATE via flate2's **pure-Rust** zlib rewrite instead of `miniz_oxide`. Measured **1.68–2.72×** faster at `Compression::Default`, size within ±3%. Maps to flate2's `any_zlib`, not `any_c_zlib` — no C is introduced. Off by default pending the `Best`-on-graphics dispatch question (see `WHYS.md`). |
+| `zlib-rs` | **yes** | DEFLATE via flate2's **pure-Rust** zlib rewrite instead of `miniz_oxide`. Measured **1.68–2.72×** faster at `Compression::Default`, size within ±3%. Maps to flate2's `any_zlib`, not `any_c_zlib` — no C is introduced. On by default: it dominates at `Default` (faster on 13/13, size within ±4.4%). At `Best` it is smaller on 9/9 real graphics but slower on 5/9 — recorded, not averaged away; reaching sizes miniz_oxide cannot reach at any speed is what `Best` is for. |
 | `profile` | no | Per-row stage profiler (filter/deflate on encode; inflate/unfilter/transform on decode). Scopes are per *row*, so the tap costs <0.1% of a 1080p encode; compiles to nothing when off. |
+| `parallel` | no | Multi-threaded DEFLATE for a **single** image (pigz-style block splitting). **2.11–3.06× end-to-end vs FFmpeg** at matched filter and level, while staying 0.1–0.2% smaller. Applies to `Compression::Default`/`Best` only — `Fast` is `fdeflate`, a single-stream path. Blocks are *sized* (≥1 MiB), never counted, so an image too small to split stays serial and pays **+0.00%**; forcing 24 blocks on a 1.44 MB chart would have cost **+7.44%**. |
 | `benchmarks` | no | Expose internal kernels (`unfilter`, `expand_paletted`) for A/B oracle tests. |
 | `unstable` | no | `crc32fast/nightly`. |
 
