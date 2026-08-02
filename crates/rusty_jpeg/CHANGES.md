@@ -4,6 +4,40 @@ Everything this fork does differently from upstream `jpeg-decoder` 0.3.2 and
 `jpeg-encoder` 0.7.0. Keep this current — it is what makes re-syncing with
 upstream possible.
 
+## 0.1.7
+
+The two items 0.1.6 deferred, both taken.
+
+- **Per-coefficient magnitude lowering in the trellis.** Restricted to
+  `|q| >= 2 -> |q| - 1`, which can never produce a zero — that restriction is
+  what keeps every decision independent, since the set of non-zero positions is
+  unchanged and no run-length moves. It matters most where EOB truncation was
+  WORST: mean BD-rate **-1.88% -> -2.51%**, and the worst content (white noise)
+  improves from **+3.83% to +1.40%**.
+
+  | content   | EOB only | EOB+mag | mag alone |
+  |-----------|---------:|--------:|----------:|
+  | photo     |   -5.02% |  -5.70% |    -0.71% |
+  | diagonal  |   -1.25% |  -0.58% |    +0.67% |
+  | text      |   -0.49% |  -1.24% |    -0.75% |
+  | noise     |   +3.83% |  +1.40% |    -2.39% |
+  | gradient  |   -6.44% |  -6.41% |    +0.03% |
+
+  A density-adaptive lambda was then built and **refuted in both directions**
+  (tapering down: noise +1.40% -> +2.67%; tapering up: +12.07%). Flat lambda
+  wins, so block density is not the axis that explains the noise loss. Removed
+  rather than left switchable.
+
+- **NEON forward DCT.** Not a transcription of the AVX2 kernel. The butterfly is
+  written once over a five-method `Lanes` trait with two backends: a scalar
+  model verified **bit-exactly on x86** against the reference DCT, and a NEON
+  mapping of the same trait. The transform is verified on the machine it was
+  written on; only fifteen one-line intrinsic bodies are certified by ARM CI.
+  Ships with `RUSTY_JPEG_NEON_FDCT=0` as a runtime fallback.
+
+The RD corpus grew from 3 content types to 6 (adds text, noise, gradient),
+because a sign flip across two clips cannot support a dispatch rule.
+
 ## 0.1.6
 
 Five codec improvements. The two bitstream-changing ones are gated on a corpus

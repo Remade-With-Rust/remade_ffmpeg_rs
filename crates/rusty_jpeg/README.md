@@ -61,8 +61,9 @@ choice:
   baseband, and no bitrate recovers it. BD-rate **-17.12%** on chroma-detailed
   content, **+2.30 dB** on saturated chroma edges, neutral on smooth photos.
 - **Trellis quantization** (on by default) picks each block's EOB position with
-  a real rate model instead of keeping whatever rounding produced: **-3.14%
-  BD-rate for +3.1% encode time**.
+  a real rate model, then lowers coefficient magnitudes where the bits saved
+  outweigh the distortion: **-2.51% mean BD-rate** across six content types,
+  for about +3% encode time.
 
 Both are gated on a corpus BD-rate across 5 quality points and 3 content types
 plus an ffmpeg round-trip — never a single operating point.
@@ -153,7 +154,7 @@ Chroma subsampling (`SamplingFactor`) and quantization table selection
 | Feature | Default | Effect |
 |---|---|---|
 | `std` | yes | Standard library. |
-| `simd` | yes | Encoder AVX2 FDCT + quantize + colour conversion. |
+| `simd` | yes | Encoder AVX2 FDCT + quantize + colour conversion on x86; NEON forward DCT + quantize on aarch64. |
 | `rayon` | **no** | Decoder work-stealing threading. Off because it measured *slower* at every image size (see above); kept so the measurement is cheap to repeat. |
 | `platform_independent` | no | Decoder: drop arch-specific code, `forbid(unsafe_code)`. |
 | `benchmark` | no | Expose internal kernels for A/B oracle tests. |
