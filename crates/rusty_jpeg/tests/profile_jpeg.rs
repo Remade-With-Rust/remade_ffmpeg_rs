@@ -332,7 +332,8 @@ fn ab_streaming_vs_buffered_optimize() {
         "{:<26} {:>10} {:>8} {:>10} {:>20}",
         "arm B", "wins(A)", "z", "med B/A", "verdict"
     );
-    for density in [Density::Photo] {
+    {
+        let density = Density::Photo;
         let (y, cb, cr) = planar_source_at(w, h, density);
         let (wn, zn, mn) = paired_ab(
             REPS,
@@ -649,7 +650,8 @@ fn ab_chunked_chroma_fill() {
         "arm B", "wins(A)", "z", "med B/A", "verdict"
     );
     for (w, h) in [(3840usize, 2160usize)] {
-        for density in [Density::Photo] {
+        {
+            let density = Density::Photo;
             let (y, cb, cr) = planar_source_at(w, h, density);
             let (wn, zn, mn) = paired_ab(
                 REPS,

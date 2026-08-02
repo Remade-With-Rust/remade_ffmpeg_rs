@@ -5,12 +5,9 @@ use crate::decode::read_u8;
 use alloc::borrow::ToOwned;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::iter;
 use std::io::Read;
 
 const LUT_BITS: u8 = 8;
-
-
 
 #[derive(Debug)]
 pub struct HuffmanDecoder {
@@ -328,7 +325,7 @@ fn derive_huffman_codes(bits: &[u8; 16]) -> Result<(Vec<u16>, Vec<u8>)> {
         .iter()
         .enumerate()
         .fold(Vec::new(), |mut acc, (i, &value)| {
-            acc.extend(iter::repeat((i + 1) as u8).take(value as usize));
+            acc.extend(std::iter::repeat_n((i + 1) as u8, value as usize));
             acc
         });
 
@@ -369,7 +366,7 @@ pub fn fill_default_mjpeg_tables(
 ) {
     // Section K.3.3
 
-    if dc_huffman_tables[0].is_none() && scan.dc_table_indices.iter().any(|&i| i == 0) {
+    if dc_huffman_tables[0].is_none() && scan.dc_table_indices.contains(&0) {
         // Table K.3
         dc_huffman_tables[0] = Some(
             HuffmanTable::new(
@@ -385,7 +382,7 @@ pub fn fill_default_mjpeg_tables(
             .unwrap(),
         );
     }
-    if dc_huffman_tables[1].is_none() && scan.dc_table_indices.iter().any(|&i| i == 1) {
+    if dc_huffman_tables[1].is_none() && scan.dc_table_indices.contains(&1) {
         // Table K.4
         dc_huffman_tables[1] = Some(
             HuffmanTable::new(
@@ -401,7 +398,7 @@ pub fn fill_default_mjpeg_tables(
             .unwrap(),
         );
     }
-    if ac_huffman_tables[0].is_none() && scan.ac_table_indices.iter().any(|&i| i == 0) {
+    if ac_huffman_tables[0].is_none() && scan.ac_table_indices.contains(&0) {
         // Table K.5
         ac_huffman_tables[0] = Some(
             HuffmanTable::new(
@@ -429,7 +426,7 @@ pub fn fill_default_mjpeg_tables(
             .unwrap(),
         );
     }
-    if ac_huffman_tables[1].is_none() && scan.ac_table_indices.iter().any(|&i| i == 1) {
+    if ac_huffman_tables[1].is_none() && scan.ac_table_indices.contains(&1) {
         // Table K.6
         ac_huffman_tables[1] = Some(
             HuffmanTable::new(

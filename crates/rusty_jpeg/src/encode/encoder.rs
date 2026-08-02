@@ -169,6 +169,11 @@ impl SamplingFactor {
     }
 }
 
+/// Quantized blocks per component, plus each component's `(cols, rows)`
+/// block grid — the grid is needed to walk them in MCU order, and it is not
+/// recoverable from the block count alone for ragged image sizes.
+type MaterializedBlocks = ([Vec<[i16; 64]>; 4], [(usize, usize); 4]);
+
 #[derive(Clone)]
 pub(crate) struct Component {
     pub id: u8,
@@ -554,8 +559,7 @@ impl<W: JfifWrite> Encoder<W> {
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         {
             if !self.branchy_quantize {
-                return self
-                    .encode_image_internal::<_, crate::encode::neon::NeonOperations>(image);
+                return self.encode_image_internal::<_, crate::encode::neon::NeonOperations>(image);
             }
         }
         if self.branchy_quantize {
@@ -1059,15 +1063,23 @@ impl<W: JfifWrite> Encoder<W> {
         // Collect (mcu, component) order first so the writer borrow stays clear
         // of the closure that walks `blocks`.
         let mut order: Vec<(usize, usize, [i16; 64])> = Vec::new();
-        Self::for_each_block_interleaved(&components, blocks, grid, mcu_cols, mcu_rows, |mcu, i, b| {
-            order.push((mcu, i, *b));
-        });
+        Self::for_each_block_interleaved(
+            &components,
+            blocks,
+            grid,
+            mcu_cols,
+            mcu_rows,
+            |mcu, i, b| {
+                order.push((mcu, i, *b));
+            },
+        );
         pending.clear();
 
         for (mcu, i, block) in order {
             if restart_interval > 0 && mcu != last_mcu && mcu % restart_interval == 0 && mcu != 0 {
                 self.writer.finalize_bit_buffer()?;
-                self.writer.write_marker(Marker::RST((restarts % 8) as u8))?;
+                self.writer
+                    .write_marker(Marker::RST((restarts % 8) as u8))?;
                 restarts += 1;
                 prev_dc = [0i16; 4];
             }
@@ -1280,7 +1292,7 @@ impl<W: JfifWrite> Encoder<W> {
         &mut self,
         image: &I,
         q_tables: &[QuantizationTable; 2],
-    ) -> ([Vec<[i16; 64]>; 4], [(usize, usize); 4]) {
+    ) -> MaterializedBlocks {
         let width = image.width();
         let height = image.height();
         let mut grid = [(1usize, 1usize); 4];
@@ -1462,7 +1474,7 @@ impl<W: JfifWrite> Encoder<W> {
     /// at 4K that path allocates ~218 MB of `[i16; 64]` just to count symbols it
     /// has already computed once.
     fn optimize_huffman_table_from_stats(&mut self, stats: &HuffmanStats) {
-        let max_tables = self.components.len().min(2) as usize;
+        let max_tables = self.components.len().min(2);
         for table in 0..max_tables {
             let mut dc_freq = stats.dc[table];
             let mut ac_freq = stats.ac[table];
@@ -1639,7 +1651,11 @@ const OPTIMIZE_BUFFER_BUDGET: usize = 256 * 1024 * 1024;
 fn point_sample_chroma() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("RUSTY_JPEG_ARM").map(|v| v == "pointsample").unwrap_or(false))
+    *V.get_or_init(|| {
+        std::env::var("RUSTY_JPEG_ARM")
+            .map(|v| v == "pointsample")
+            .unwrap_or(false)
+    })
 }
 
 /// Extract one 8x8 block, box-averaging when the component is subsampled.

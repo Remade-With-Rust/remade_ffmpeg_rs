@@ -269,11 +269,11 @@ mod tests {
 
     #[test]
     pub fn test_fdct_libjpeg() {
-        let mut i1 = INPUT1.clone();
+        let mut i1 = INPUT1;
         fdct(&mut i1);
         assert_eq!(i1, OUTPUT1);
 
-        let mut i2 = INPUT2.clone();
+        let mut i2 = INPUT2;
         fdct(&mut i2);
         assert_eq!(i2, OUTPUT2);
     }

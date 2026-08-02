@@ -63,9 +63,8 @@ pub fn get_dequantize_and_idct_block_8x8(
 /// Only offered when the pair actually pays: the caller must have two blocks
 /// that both need a full transform (see `append_row_immediate`).
 #[allow(clippy::type_complexity)]
-pub fn get_dequantize_and_idct_block_8x8_pair() -> Option<
-    unsafe fn(&[i16; 64], &[i16; 64], &[u16; 64], usize, &mut [u8], usize),
-> {
+pub fn get_dequantize_and_idct_block_8x8_pair(
+) -> Option<unsafe fn(&[i16; 64], &[i16; 64], &[u16; 64], usize, &mut [u8], usize)> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[allow(unsafe_code)]
     {

@@ -207,6 +207,9 @@ fn bd_rate(base: &[(f64, f64)], test: &[(f64, f64)]) -> f64 {
         .map(|p| p.1)
         .fold(f64::NEG_INFINITY, f64::max)
         .min(test.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max));
+    // Deliberately negated rather than `hi <= lo`: this must also bail when
+    // either bound is NaN, which the positive form would not.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(hi > lo) {
         return f64::NAN;
     }

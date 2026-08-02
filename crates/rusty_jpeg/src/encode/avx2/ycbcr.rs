@@ -222,8 +222,8 @@ mod tests {
             avx_input.fill_buffers_avx2(0, &mut buffers);
         }
 
-        for i in 0..3 {
-            assert_eq!(buffers[i].len(), input.len() / 3);
+        for b in buffers.iter().take(3) {
+            assert_eq!(b.len(), input.len() / 3);
         }
 
         for (i, pixel) in scalar_result.iter().copied().enumerate() {

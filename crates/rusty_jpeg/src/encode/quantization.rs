@@ -474,8 +474,8 @@ mod zigzag_table_tests {
                     quality,
                     luma,
                 );
-                for i in 0..64 {
-                    let z = ZIGZAG[i] as usize & 0x3f;
+                for (i, &zz) in ZIGZAG.iter().enumerate() {
+                    let z = zz as usize & 0x3f;
                     for v in i16::MIN..=i16::MAX {
                         assert_eq!(
                             t.quantize_zz(v, i),
@@ -499,6 +499,10 @@ mod zigzag_table_tests {
 /// function cannot be checked. It is also the permanent fallback on any CPU
 /// without AVX2 and the correctness oracle for the SIMD twin.
 #[inline(never)]
+// The loops below walk `block`, `q_block` and the permuted tables in LOCKSTEP
+// by index; an iterator would need a zip of three sequences with one of them
+// permuted, which is less clear, not more.
+#[allow(clippy::needless_range_loop)]
 pub(crate) fn quantize_block_scalar(
     block: &[i16; 64],
     q_block: &mut [i16; 64],
@@ -852,7 +856,13 @@ pub(crate) mod neon {
                                 0 => i16::MAX,
                                 1 => i16::MIN,
                                 2 => 0,
-                                3 => if i == 0 { i16::MAX } else { 0 },
+                                3 => {
+                                    if i == 0 {
+                                        i16::MAX
+                                    } else {
+                                        0
+                                    }
+                                }
                                 _ => (state % 4096) as i16 - 2048,
                             };
                         }
@@ -860,10 +870,7 @@ pub(crate) mod neon {
                         let mut got = [0i16; 64];
                         quantize_block_scalar(&block, &mut want, &t);
                         unsafe { quantize_block_neon(&block, &mut got, &t) };
-                        assert_eq!(
-                            got, want,
-                            "quality={quality} luma={luma} round={round}"
-                        );
+                        assert_eq!(got, want, "quality={quality} luma={luma} round={round}");
                     }
                 }
             }

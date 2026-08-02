@@ -842,7 +842,7 @@ impl<R: Read> Decoder<R> {
             .len()
             .checked_mul(frame.output_size.width.into())
             .and_then(|m| m.checked_mul(frame.output_size.height.into()))
-            .map_or(true, |m| self.decoding_buffer_size_limit < m)
+            .is_none_or(|m| self.decoding_buffer_size_limit < m)
         {
             return Err(Error::Format(
                 "size of decoded image exceeds maximum allowed size".to_owned(),
@@ -1203,7 +1203,11 @@ impl<R: Read> Decoder<R> {
                 // STATIC call the optimizer can inline, instead of six indirect
                 // ones through `&mut dyn Worker`. The borrow is scoped to this
                 // loop so the row-dispatch code below can still use `worker`.
-                let mut fused_worker = if use_fused { worker.as_immediate() } else { None };
+                let mut fused_worker = if use_fused {
+                    worker.as_immediate()
+                } else {
+                    None
+                };
                 for (i, component) in components.iter().enumerate() {
                     // Hoisted out of the per-BLOCK loops below. All of this is
                     // fixed for the whole component, but it used to be
@@ -1231,10 +1235,8 @@ impl<R: Read> Decoder<R> {
                                     &mut eob_run,
                                     &mut dc_predictors[i],
                                 )?;
-                                let by =
-                                    (mcu_y * mcu_vertical_samples[i] + v_pos) as usize;
-                                let bx =
-                                    (mcu_x * mcu_horizontal_samples[i] + h_pos) as usize;
+                                let by = (mcu_y * mcu_vertical_samples[i] + v_pos) as usize;
+                                let bx = (mcu_x * mcu_horizontal_samples[i] + h_pos) as usize;
                                 fused_worker
                                     .as_mut()
                                     .unwrap()
@@ -1455,7 +1457,8 @@ fn decode_block<R: Read>(
                 break;
             }
 
-            coefficients[UNZIGZAG[index as usize & 63] as usize & 63] = value << successive_approximation_low;
+            coefficients[UNZIGZAG[index as usize & 63] as usize & 63] =
+                value << successive_approximation_low;
             index += 1;
         } else {
             let byte = huffman.decode(reader, ac_table)?;
@@ -1825,5 +1828,5 @@ fn stbi_f2f(x: f32) -> i32 {
 }
 
 fn clamp_fixed_point(value: i32) -> u8 {
-    (value >> FIXED_POINT_OFFSET).min(255).max(0) as u8
+    (value >> FIXED_POINT_OFFSET).clamp(0, 255) as u8
 }

@@ -6,7 +6,7 @@ use crate::decode::{read_u16_from_be, read_u8};
 use alloc::borrow::ToOwned;
 use alloc::vec::Vec;
 use alloc::{format, vec};
-use core::ops::{self, Range};
+use core::ops::Range;
 use std::io::{self, Read};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -481,7 +481,7 @@ pub fn parse_sos<R: Read>(reader: &mut R, frame: &FrameInfo) -> Result<ScanInfo>
             frame.components[i].horizontal_sampling_factor as u32
                 * frame.components[i].vertical_sampling_factor as u32
         })
-        .fold(0, ops::Add::add);
+        .sum::<u32>();
 
     if component_count > 1 && blocks_per_mcu > 10 {
         return Err(Error::Format(
@@ -648,7 +648,7 @@ pub fn parse_dqt<R: Read>(reader: &mut R) -> Result<[Option<[u16; 64]>; 4]> {
             };
         }
 
-        if table.iter().any(|&val| val == 0) {
+        if table.contains(&0) {
             return Err(Error::Format(
                 "quantization table contains element with a zero value".to_owned(),
             ));
@@ -695,10 +695,7 @@ pub fn parse_dht<R: Read>(
         let mut counts = [0u8; 16];
         reader.read_exact(&mut counts)?;
 
-        let size = counts
-            .iter()
-            .map(|&val| val as usize)
-            .fold(0, ops::Add::add);
+        let size = counts.iter().map(|&val| val as usize).sum::<usize>();
 
         if size == 0 {
             return Err(Error::Format(
@@ -763,19 +760,17 @@ pub fn parse_app<R: Read>(reader: &mut R, marker: Marker) -> Result<Option<AppDa
     let mut result = None;
 
     match marker {
-        APP(0) => {
-            if length >= 5 {
-                let mut buffer = [0u8; 5];
-                reader.read_exact(&mut buffer)?;
-                bytes_read = buffer.len();
+        APP(0) if length >= 5 => {
+            let mut buffer = [0u8; 5];
+            reader.read_exact(&mut buffer)?;
+            bytes_read = buffer.len();
 
-                // http://www.w3.org/Graphics/JPEG/jfif3.pdf
-                if buffer[0..5] == *b"JFIF\0" {
-                    result = Some(AppData::Jfif);
-                // https://sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#AVI1
-                } else if buffer[0..5] == *b"AVI1\0" {
-                    result = Some(AppData::Avi1);
-                }
+            // http://www.w3.org/Graphics/JPEG/jfif3.pdf
+            if buffer[0..5] == *b"JFIF\0" {
+                result = Some(AppData::Jfif);
+            // https://sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#AVI1
+            } else if buffer[0..5] == *b"AVI1\0" {
+                result = Some(AppData::Avi1);
             }
         }
         APP(1) => {
@@ -794,63 +789,57 @@ pub fn parse_app<R: Read>(reader: &mut R, marker: Marker) -> Result<Option<AppDa
                 result = Some(AppData::Xmp(buffer[29..].to_vec()));
             }
         }
-        APP(2) => {
-            if length > 14 {
-                let mut buffer = [0u8; 14];
-                reader.read_exact(&mut buffer)?;
-                bytes_read = buffer.len();
+        APP(2) if length > 14 => {
+            let mut buffer = [0u8; 14];
+            reader.read_exact(&mut buffer)?;
+            bytes_read = buffer.len();
 
-                // http://www.color.org/ICC_Minor_Revision_for_Web.pdf
-                // B.4 Embedding ICC profiles in JFIF files
-                if buffer[0..12] == *b"ICC_PROFILE\0" {
-                    let mut data = vec![0; length - bytes_read];
-                    reader.read_exact(&mut data)?;
-                    bytes_read += data.len();
-                    result = Some(AppData::Icc(IccChunk {
-                        seq_no: buffer[12],
-                        num_markers: buffer[13],
-                        data,
-                    }));
-                }
+            // http://www.color.org/ICC_Minor_Revision_for_Web.pdf
+            // B.4 Embedding ICC profiles in JFIF files
+            if buffer[0..12] == *b"ICC_PROFILE\0" {
+                let mut data = vec![0; length - bytes_read];
+                reader.read_exact(&mut data)?;
+                bytes_read += data.len();
+                result = Some(AppData::Icc(IccChunk {
+                    seq_no: buffer[12],
+                    num_markers: buffer[13],
+                    data,
+                }));
             }
         }
-        APP(13) => {
-            if length >= 14 {
-                let mut buffer = [0u8; 14];
-                reader.read_exact(&mut buffer)?;
-                bytes_read = buffer.len();
+        APP(13) if length >= 14 => {
+            let mut buffer = [0u8; 14];
+            reader.read_exact(&mut buffer)?;
+            bytes_read = buffer.len();
 
-                // PSIR (Photoshop)
-                // https://github.com/adobe/XMP-Toolkit-SDK/blob/main/docs/XMPSpecificationPart3.pdf
-                if buffer[0..14] == *b"Photoshop 3.0\0" {
-                    let mut data = vec![0; length - bytes_read];
-                    reader.read_exact(&mut data)?;
-                    bytes_read += data.len();
-                    result = Some(AppData::Psir(data));
-                }
+            // PSIR (Photoshop)
+            // https://github.com/adobe/XMP-Toolkit-SDK/blob/main/docs/XMPSpecificationPart3.pdf
+            if buffer[0..14] == *b"Photoshop 3.0\0" {
+                let mut data = vec![0; length - bytes_read];
+                reader.read_exact(&mut data)?;
+                bytes_read += data.len();
+                result = Some(AppData::Psir(data));
             }
         }
-        APP(14) => {
-            if length >= 12 {
-                let mut buffer = [0u8; 12];
-                reader.read_exact(&mut buffer)?;
-                bytes_read = buffer.len();
+        APP(14) if length >= 12 => {
+            let mut buffer = [0u8; 12];
+            reader.read_exact(&mut buffer)?;
+            bytes_read = buffer.len();
 
-                // http://www.sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#Adobe
-                if buffer[0..6] == *b"Adobe\0" {
-                    let color_transform = match buffer[11] {
-                        0 => AdobeColorTransform::Unknown,
-                        1 => AdobeColorTransform::YCbCr,
-                        2 => AdobeColorTransform::YCCK,
-                        _ => {
-                            return Err(Error::Format(
-                                "invalid color transform in adobe app segment".to_owned(),
-                            ))
-                        }
-                    };
+            // http://www.sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#Adobe
+            if buffer[0..6] == *b"Adobe\0" {
+                let color_transform = match buffer[11] {
+                    0 => AdobeColorTransform::Unknown,
+                    1 => AdobeColorTransform::YCbCr,
+                    2 => AdobeColorTransform::YCCK,
+                    _ => {
+                        return Err(Error::Format(
+                            "invalid color transform in adobe app segment".to_owned(),
+                        ))
+                    }
+                };
 
-                    result = Some(AppData::Adobe(color_transform));
-                }
+                result = Some(AppData::Adobe(color_transform));
             }
         }
         _ => {}

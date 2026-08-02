@@ -38,10 +38,10 @@ fn rdtsc() -> u64 {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline(always)]
 fn rdtsc() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::_rdtsc;
     #[cfg(target_arch = "x86")]
     use std::arch::x86::_rdtsc;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::_rdtsc;
     #[allow(unsafe_code)]
     unsafe {
         _rdtsc()
@@ -211,19 +211,36 @@ fn main() {
     println!("  dependent-load chain (serial)   {chain:6.2}  <- the floor the decoder inherits");
     println!("  independent loads (pipelined)   {indep:6.2}  <- same loads, no serialisation");
     println!("  full symbol step                {sym:6.2}  <- peek + LUT + consume + refill");
-    println!("  + run/zigzag/coefficient store  {real:6.2}  <- the HONEST floor for this structure");
+    println!(
+        "  + run/zigzag/coefficient store  {real:6.2}  <- the HONEST floor for this structure"
+    );
     println!();
     println!("  stability (min -> max over 15 reps):");
-    println!("    chain {chain:6.2} -> {chain_hi:6.2}   ({:.2}x spread)", chain_hi / chain);
-    println!("    symbol{sym:6.2} -> {sym_hi:6.2}   ({:.2}x spread)", sym_hi / sym);
-    println!("    real  {real:6.2} -> {real_hi:6.2}   ({:.2}x spread)", real_hi / real);
+    println!(
+        "    chain {chain:6.2} -> {chain_hi:6.2}   ({:.2}x spread)",
+        chain_hi / chain
+    );
+    println!(
+        "    symbol{sym:6.2} -> {sym_hi:6.2}   ({:.2}x spread)",
+        sym_hi / sym
+    );
+    println!(
+        "    real  {real:6.2} -> {real_hi:6.2}   ({:.2}x spread)",
+        real_hi / real
+    );
     let unstable = real_hi / real > 1.35;
     if unstable {
         println!("    !! the realistic-floor probe is UNSTABLE; do not quote it as a floor");
     }
     println!();
-    println!("  serialisation costs             {:6.2} cycles/symbol", chain - indep);
-    println!("  work above the chain            {:6.2} cycles/symbol", sym - chain);
+    println!(
+        "  serialisation costs             {:6.2} cycles/symbol",
+        chain - indep
+    );
+    println!(
+        "  work above the chain            {:6.2} cycles/symbol",
+        sym - chain
+    );
     println!();
     let measured = 14.0;
     println!("PRODUCTION decoder, in-context (ablation)  {measured:6.2}");
@@ -231,8 +248,10 @@ fn main() {
     if measured <= real * 1.05 {
         println!("VERDICT: the production loop is already AT the floor of a stripped-down");
         println!("loop doing only the essential work -- no error handling, no marker");
-        println!("detection, no EOB logic, no restart markers. The {:.2} cycles above the",
-                 real - chain);
+        println!(
+            "detection, no EOB logic, no restart markers. The {:.2} cycles above the",
+            real - chain
+        );
         println!("dependency chain are REQUIRED instructions, not slack.");
         println!();
         println!("Hand-written assembly cannot remove work that has to happen. Its upside");
@@ -241,7 +260,11 @@ fn main() {
     } else {
         let sp = measured / real;
         let gain = 0.30 * (1.0 - 1.0 / sp);
-        println!("VERDICT: {:.2}x of headroom to the floor -> {:.1}% whole-decode -> {:.3}x vs ffmpeg",
-                 sp, gain * 100.0, 1.039 / (1.0 - gain));
+        println!(
+            "VERDICT: {:.2}x of headroom to the floor -> {:.1}% whole-decode -> {:.3}x vs ffmpeg",
+            sp,
+            gain * 100.0,
+            1.039 / (1.0 - gain)
+        );
     }
 }

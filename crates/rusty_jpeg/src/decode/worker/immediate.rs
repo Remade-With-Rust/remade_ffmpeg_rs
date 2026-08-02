@@ -152,8 +152,7 @@ impl ImmediateWorker {
             #[cfg(not(feature = "platform_independent"))]
             if let Some(idct_pair) = pair_idct {
                 if !dc_only && i + 1 < block_count && (i % blocks_wide) + 1 < blocks_wide {
-                    let next: &[i16; 64] =
-                        data[(i + 1) * 64..(i + 2) * 64].try_into().unwrap();
+                    let next: &[i16; 64] = data[(i + 1) * 64..(i + 2) * 64].try_into().unwrap();
                     if !crate::decode::idct::is_dc_only(next) {
                         crate::prof::bump(crate::prof::Count::DecBlocks, 1);
                         crate::prof::bump(crate::prof::Count::DecIdctPairs, 1);
@@ -226,7 +225,13 @@ impl ImmediateWorker {
     /// Holds a block back so horizontally adjacent pairs can go through the
     /// two-block AVX2 kernel, exactly as the row-batched path does.
     #[inline]
-    pub(crate) fn fused_block_inner(&mut self, index: usize, block_y: usize, block_x: usize, coeffs: &[i16; 64]) {
+    pub(crate) fn fused_block_inner(
+        &mut self,
+        index: usize,
+        block_y: usize,
+        block_x: usize,
+        coeffs: &[i16; 64],
+    ) {
         let component = self.components[index].as_ref().unwrap();
         let scale = component.dct_scale;
         let line_stride = component.block_size.width as usize * scale;
@@ -270,7 +275,8 @@ impl ImmediateWorker {
         if let Some((pi, py, px, pcoeffs)) = self.pending.take() {
             if pi == index && py == block_y && px + 1 == block_x {
                 #[cfg(not(feature = "platform_independent"))]
-            if let Some(idct_pair) = crate::decode::arch::get_dequantize_and_idct_block_8x8_pair()
+                if let Some(idct_pair) =
+                    crate::decode::arch::get_dequantize_and_idct_block_8x8_pair()
                 {
                     let off = py * scale * line_stride + px * scale;
                     let qt = self.quantization_tables[index].as_ref().unwrap();
@@ -336,5 +342,4 @@ impl Worker for ImmediateWorker {
     fn as_immediate(&mut self) -> Option<&mut ImmediateWorker> {
         Some(self)
     }
-
 }

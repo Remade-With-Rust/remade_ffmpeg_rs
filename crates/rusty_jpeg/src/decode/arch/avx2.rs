@@ -128,7 +128,6 @@ unsafe fn transpose8(data: &mut [__m256i; 8]) {
     data[7] = _mm256_unpackhi_epi64(d0123hh, d4567hh);
 }
 
-
 /// Dequantize and inverse-transform two 8x8 blocks in one instruction stream.
 ///
 /// Both blocks belong to the SAME component, so they share a quantization

@@ -106,7 +106,8 @@ fn malformed_input_never_panics() {
 
     for (s, src) in seeds.iter().enumerate() {
         for i in 0..ITERS {
-            let mut rng = 0x9E3779B97F4A7C15u64 ^ ((s * ITERS + i) as u64).wrapping_mul(0x0F1B_2C3D);
+            let mut rng =
+                0x9E3779B97F4A7C15u64 ^ ((s * ITERS + i) as u64).wrapping_mul(0x0F1B_2C3D);
             xorshift(&mut rng);
             let data = mutate(src, i as u64, &mut rng);
 
@@ -158,9 +159,11 @@ fn our_encoder_output_always_decodes() {
         ] {
             for &(w, h) in &[(1usize, 1usize), (8, 8), (17, 9), (64, 64), (127, 65)] {
                 let jpg = seed_jpeg(w, h, sampling, optimize);
-                let out = Decoder::new(Cursor::new(&jpg)).decode().unwrap_or_else(|e| {
-                    panic!("{w}x{h} optimize={optimize} sampling={sampling:?}: {e}")
-                });
+                let out = Decoder::new(Cursor::new(&jpg))
+                    .decode()
+                    .unwrap_or_else(|e| {
+                        panic!("{w}x{h} optimize={optimize} sampling={sampling:?}: {e}")
+                    });
                 assert_eq!(
                     out.len(),
                     w * h * 3,

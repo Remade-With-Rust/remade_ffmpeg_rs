@@ -1,9 +1,6 @@
 mod immediate;
 mod multithreaded;
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    feature = "rayon"
-))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "rayon"))]
 mod rayon;
 
 use crate::decode::decoder::{choose_color_convert_func, ColorTransform};
@@ -75,8 +72,6 @@ pub trait Worker {
     fn supports_fused(&self) -> bool {
         false
     }
-
-
 }
 
 #[allow(dead_code)]
@@ -119,11 +114,13 @@ pub struct WorkerScope {
     inner: core::cell::RefCell<Option<WorkerScopeInner>>,
 }
 
+// The immediate worker embeds its plane buffers while the threaded one holds
+// channel handles, so the variants differ in size by design. Boxing the large
+// variant would add an allocation to the path this crate spends most of its
+// time in.
+#[allow(clippy::large_enum_variant)]
 enum WorkerScopeInner {
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        feature = "rayon"
-    ))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "rayon"))]
     Rayon(Box<rayon::Scoped>),
     #[cfg(not(target_arch = "wasm32"))]
     Multithreaded(multithreaded::MpscWorker),
@@ -147,10 +144,7 @@ impl WorkerScope {
             record_worker_choice(&prefer);
         }
         let inner = inner.get_or_insert_with(move || match prefer {
-            #[cfg(all(
-                not(target_arch = "wasm32"),
-                feature = "rayon"
-            ))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "rayon"))]
             PreferWorkerKind::Multithreaded => WorkerScopeInner::Rayon(Default::default()),
             #[allow(unreachable_patterns)]
             #[cfg(not(target_arch = "wasm32"))]
@@ -159,10 +153,7 @@ impl WorkerScope {
         });
 
         f(match &mut *inner {
-            #[cfg(all(
-                not(target_arch = "wasm32"),
-                feature = "rayon"
-            ))]
+            #[cfg(all(not(target_arch = "wasm32"), feature = "rayon"))]
             WorkerScopeInner::Rayon(worker) => worker.as_mut(),
             #[cfg(not(target_arch = "wasm32"))]
             WorkerScopeInner::Multithreaded(worker) => worker,
@@ -177,10 +168,7 @@ pub fn compute_image_parallel(
     output_size: Dimensions,
     color_transform: ColorTransform,
 ) -> Result<Vec<u8>> {
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        feature = "rayon"
-    ))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "rayon"))]
     return rayon::compute_image_parallel(components, data, output_size, color_transform);
 
     #[allow(unreachable_code)]

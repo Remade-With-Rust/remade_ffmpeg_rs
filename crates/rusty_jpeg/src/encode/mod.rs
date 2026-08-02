@@ -8,17 +8,17 @@
 
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
 mod avx2;
-#[cfg(all(feature = "simd", target_arch = "aarch64"))]
-mod neon;
-mod fdct_simd;
-mod trellis;
 mod encoder;
 mod error;
 mod fdct;
+mod fdct_simd;
 mod huffman;
 mod image_buffer;
 mod marker;
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+mod neon;
 mod quantization;
+mod trellis;
 mod writer;
 
 pub use encoder::{ColorType, Encoder, JpegColorType, SamplingFactor};
@@ -142,10 +142,10 @@ mod tests {
         data: Vec<u8>,
         width: u16,
         height: u16,
-        result: &mut Vec<u8>,
+        result: &[u8],
         pixel_format: PixelFormat,
     ) {
-        let (img, info) = decode(&result);
+        let (img, info) = decode(result);
 
         assert_eq!(info.pixel_format, pixel_format);
         assert_eq!(info.width, width);
@@ -174,7 +174,7 @@ mod tests {
             .encode(&data, width, height, ColorType::Luma)
             .unwrap();
 
-        check_result(data, width, height, &mut result, PixelFormat::L8);
+        check_result(data, width, height, &result, PixelFormat::L8);
     }
 
     #[test]
@@ -187,7 +187,7 @@ mod tests {
             .encode(&data, width, height, ColorType::Rgb)
             .unwrap();
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -200,7 +200,7 @@ mod tests {
             .encode(&data, width, height, ColorType::Rgb)
             .unwrap();
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -215,7 +215,7 @@ mod tests {
 
         let (data, width, height) = create_test_img_rgb();
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -237,7 +237,7 @@ mod tests {
             .encode(&data, width, height, ColorType::Rgb)
             .unwrap();
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -251,7 +251,7 @@ mod tests {
             .encode(&data, width, height, ColorType::Rgb)
             .unwrap();
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -265,7 +265,7 @@ mod tests {
             .encode(&data, width, height, ColorType::Rgb)
             .unwrap();
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -279,7 +279,7 @@ mod tests {
             .encode(&data, width, height, ColorType::Rgb)
             .unwrap();
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -293,7 +293,7 @@ mod tests {
             .encode(&data, width, height, ColorType::Rgb)
             .unwrap();
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -307,7 +307,7 @@ mod tests {
             .encode(&data, width, height, ColorType::Rgb)
             .unwrap();
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -323,7 +323,7 @@ mod tests {
             .encode(&data, width, height, ColorType::Rgb)
             .unwrap();
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -339,7 +339,7 @@ mod tests {
             .encode(&data, width, height, ColorType::Rgb)
             .unwrap();
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -356,7 +356,7 @@ mod tests {
             .encode(&data, width, height, ColorType::Rgb)
             .unwrap();
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -369,7 +369,7 @@ mod tests {
             .encode(&data, width, height, ColorType::Cmyk)
             .unwrap();
 
-        check_result(data, width, height, &mut result, PixelFormat::CMYK32);
+        check_result(data, width, height, &result, PixelFormat::CMYK32);
     }
 
     #[test]
@@ -382,7 +382,7 @@ mod tests {
             .encode(&data, width, height, ColorType::CmykAsYcck)
             .unwrap();
 
-        check_result(data, width, height, &mut result, PixelFormat::CMYK32);
+        check_result(data, width, height, &result, PixelFormat::CMYK32);
     }
 
     #[test]
@@ -404,7 +404,7 @@ mod tests {
             .windows(DRI_DATA.len())
             .any(|w| w == DRI_DATA));
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -427,7 +427,7 @@ mod tests {
             .windows(DRI_DATA.len())
             .any(|w| w == DRI_DATA));
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -450,7 +450,7 @@ mod tests {
             .windows(DRI_DATA.len())
             .any(|w| w == DRI_DATA));
 
-        check_result(data, width, height, &mut result, PixelFormat::RGB24);
+        check_result(data, width, height, &result, PixelFormat::RGB24);
     }
 
     #[test]
@@ -520,6 +520,6 @@ mod tests {
 
         encoder.encode(&data, 1, 1, ColorType::Rgb).unwrap();
 
-        check_result(data, 1, 1, &mut result, PixelFormat::RGB24);
+        check_result(data, 1, 1, &result, PixelFormat::RGB24);
     }
 }

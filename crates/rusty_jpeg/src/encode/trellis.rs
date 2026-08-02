@@ -113,6 +113,9 @@ fn lower_magnitudes(
 /// `coef_natural` is the pre-quantization DCT block in natural order;
 /// `q_block` is the quantized block in **zig-zag** order and is edited in place.
 /// Returns the number of coefficients zeroed, for instrumentation.
+// Indexes `q_block` and `coef_natural` together through the zig-zag map, so a
+// range loop is the readable form here.
+#[allow(clippy::needless_range_loop)]
 pub(crate) fn truncate_rd(
     coef_natural: &[i16; 64],
     q_block: &mut [i16; 64],
