@@ -4,6 +4,47 @@ Everything this fork does differently from upstream `jpeg-decoder` 0.3.2 and
 `jpeg-encoder` 0.7.0. Keep this current — it is what makes re-syncing with
 upstream possible.
 
+## 0.2.0
+
+**The first release in which every claim is verified by CI on every target it
+claims.** No API change and no output change from 0.1.7 — decode hashes and
+encoder RD curves are byte-identical — so this would be a patch release by
+semver. It is a minor bump as a deliberate boundary: the 0.1.x line silently
+changed encoder output twice (chroma box-averaging and trellis, both in 0.1.6),
+and anyone pinned to `"0.1"` got different bytes from `cargo update` with no
+signal. From here, output changes cross a version boundary users can see.
+
+Fixes two build configurations that were broken in 0.1.6/0.1.7:
+
+- **`--no-default-features --features std,platform_independent` did not
+  compile.** The fused decode->IDCT path reached for `decode::arch` and an
+  `unsafe` block, both of which that configuration removes — it drops the arch
+  modules and `forbid(unsafe_code)`s. Guarding with a `None` was not enough:
+  under that configuration the path must not EXIST, not merely be unreachable.
+
+- **`cargo test` did not compile on aarch64.** `examples/entropy_probe.rs`
+  defined `rdtsc()` behind `#[cfg(x86)]` and called it unconditionally, so the
+  ARM job died building examples.
+
+That second one matters more than it looks. The ARM CI job is the *only* thing
+that certifies the NEON kernels, and it had never reached a single test — so
+0.1.6 and 0.1.7 shipped NEON quantize and NEON forward DCT **enabled by default
+on aarch64 with zero execution behind them**. They are now verified bit-exactly
+against the scalar oracles on real ARM hardware:
+
+```
+test encode::fdct_simd::neon::tests::fdct_neon_matches_scalar ... ok
+test encode::quantization::neon::tests::neon_matches_scalar   ... ok
+```
+
+Also clears the crate to `cargo clippy --all-targets -- -D warnings` and
+`cargo fmt --check`. Where clippy was wrong for the context the allow is
+documented rather than the code contorted — the worker enum's variants differ in
+size by design, and the quantize/trellis loops index three arrays in lockstep.
+
+All seven CI jobs green: Linux, Windows, macOS, aarch64 (NEON), aarch64
+cross-compile, lint, and a short fuzz run.
+
 ## 0.1.7
 
 The two items 0.1.6 deferred, both taken.
