@@ -90,6 +90,16 @@ fn mutate(src: &[u8], kind: u64, rng: &mut u64) -> Vec<u8> {
     v
 }
 
+/// A real libjpeg progressive file, shipped as a fixture because THIS CRATE
+/// CANNOT PRODUCE ONE with the layout that matters: libjpeg emits DHT per scan,
+/// so its leading DC-only scan names an AC table defined only later, whereas our
+/// encoder writes all four tables up front.
+///
+/// Its absence from this corpus is exactly why 80,000 mutations over
+/// baseline-only seeds found zero panics while a DC-scan `unwrap` was live in
+/// two published releases. A fuzz corpus is only as good as the shapes in it.
+const LIBJPEG_PROGRESSIVE: &[u8] = include_bytes!("fixtures/progressive_libjpeg.jpg");
+
 #[test]
 fn malformed_input_never_panics() {
     let seeds = [
@@ -97,6 +107,8 @@ fn malformed_input_never_panics() {
         seed_jpeg(48, 48, SamplingFactor::R_4_4_4, false),
         // Ragged dimensions exercise the partial-MCU edge paths.
         seed_jpeg(37, 23, SamplingFactor::R_4_2_2, true),
+        // Progressive, with a scan layout our own encoder never emits.
+        LIBJPEG_PROGRESSIVE.to_vec(),
     ];
 
     // Small images and a modest count so this stays a CI test, not a fuzz run.

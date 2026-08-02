@@ -4,6 +4,41 @@ Everything this fork does differently from upstream `jpeg-decoder` 0.3.2 and
 `jpeg-encoder` 0.7.0. Keep this current — it is what makes re-syncing with
 upstream possible.
 
+## 0.2.1
+
+**Fixes a panic on most real progressive JPEGs.** Present in 0.1.6, 0.1.7 and
+0.2.0; anyone decoding progressive files should upgrade.
+
+libjpeg, mozjpeg and Photoshop emit DHT segments **per scan**, so a progressive
+file opens with a DC-only scan (`Ss=0, Se=0`) that names an AC table slot which
+is not defined until later. An optimization had hoisted `ac_table.unwrap()` out
+of the AC coefficient loop — and for a DC-only scan that loop never runs, so the
+unwrap had never been reached before it was moved in front of it. Result:
+`called Option::unwrap() on a None value` on the first scan.
+
+The AC table is now resolved only when the scan actually codes AC coefficients,
+and a file that genuinely codes AC without defining a table returns `Err` rather
+than panicking. Two sibling `unwrap`s — the DC table, and the AC table in the
+successive-approximation path — were the same hazard and are now errors too.
+
+Why nothing caught it: **this crate cannot generate a file with the layout that
+triggers it.** Our encoder writes all four Huffman tables up front and names an
+AC table even on DC-only scans, so every fixture we produce has a defined table
+there. The regression test therefore ships a real libjpeg-produced fixture, and
+that fixture is now also a seed in both the robustness corpus and `fuzz/corpus/`
+— its absence is precisely why 80,000 mutations over baseline-only seeds found
+zero panics while this was live.
+
+Verified: progressive decode is bit-for-bit as correct as baseline. Against
+libjpeg on identical images, progressive and baseline agree to within 0.00 dB at
+4:4:4, 4:2:2 and 4:2:0 — so the fix restores correctness, not merely silence.
+(The absolute 25–27 dB figure at subsampled chroma is our box upsampler versus
+libjpeg's triangular "fancy" upsampling; it affects baseline identically and is
+unrelated.)
+
+Reported from a document-processing workload, where progressive JPEGs are common
+in scanned material.
+
 ## 0.2.0
 
 **The first release in which every claim is verified by CI on every target it

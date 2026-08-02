@@ -1419,7 +1419,19 @@ fn decode_block<R: Read>(
     if spectral_selection.start == 0 {
         // Section F.2.2.1
         // Figure F.12
-        let value = huffman.decode(reader, dc_table.unwrap())?;
+        //
+        // A scan that codes DC must define a DC table. A file that names one it
+        // never defined is malformed, and malformed input is an error, not a
+        // panic — this is a decoder for bytes it did not produce.
+        let dc_table = match dc_table {
+            Some(table) => table,
+            None => {
+                return Err(Error::Format(
+                    "scan codes DC coefficients but defines no DC Huffman table".to_owned(),
+                ))
+            }
+        };
+        let value = huffman.decode(reader, dc_table)?;
         let diff = match value {
             0 => 0,
             1..=11 => huffman.receive_extend(reader, value)?,
@@ -1446,48 +1458,67 @@ fn decode_block<R: Read>(
     }
 
     // Section F.1.2.2.1
-    // Resolved once: the `unwrap` sat on a path taken ~362k times per 1080p
-    // frame, and the table cannot change inside a block.
-    let ac_table = ac_table.unwrap();
-    while index < spectral_selection.end {
-        if let Some((value, run)) = huffman.decode_fast_ac(reader, ac_table)? {
-            index += run;
-
-            if index >= spectral_selection.end {
-                break;
+    //
+    // Only a scan that actually codes AC coefficients needs an AC table, and
+    // the table is resolved ONCE here rather than per symbol (~362k times per
+    // 1080p frame).
+    //
+    // The guard is not decoration. A progressive DC-only scan has Ss=0, Se=0,
+    // so the loop below never runs — and libjpeg, mozjpeg and Photoshop all
+    // emit DHT segments PER SCAN, defining the AC tables only after the DC scan
+    // has been written. Such a scan therefore names an AC table slot that does
+    // not exist yet. Demanding the table before the loop panicked on the
+    // majority of real progressive JPEGs; a malformed file that genuinely codes
+    // AC without a table must be an error, never a panic.
+    if index < spectral_selection.end {
+        let ac_table = match ac_table {
+            Some(table) => table,
+            None => {
+                return Err(Error::Format(
+                    "scan codes AC coefficients but defines no AC Huffman table".to_owned(),
+                ))
             }
-
-            coefficients[UNZIGZAG[index as usize & 63] as usize & 63] =
-                value << successive_approximation_low;
-            index += 1;
-        } else {
-            let byte = huffman.decode(reader, ac_table)?;
-            let r = byte >> 4;
-            let s = byte & 0x0f;
-
-            if s == 0 {
-                match r {
-                    15 => index += 16, // Run length of 16 zero coefficients.
-                    _ => {
-                        *eob_run = (1 << r) - 1;
-
-                        if r > 0 {
-                            *eob_run += huffman.get_bits(reader, r)?;
-                        }
-
-                        break;
-                    }
-                }
-            } else {
-                index += r;
+        };
+        while index < spectral_selection.end {
+            if let Some((value, run)) = huffman.decode_fast_ac(reader, ac_table)? {
+                index += run;
 
                 if index >= spectral_selection.end {
                     break;
                 }
 
                 coefficients[UNZIGZAG[index as usize & 63] as usize & 63] =
-                    huffman.receive_extend(reader, s)? << successive_approximation_low;
+                    value << successive_approximation_low;
                 index += 1;
+            } else {
+                let byte = huffman.decode(reader, ac_table)?;
+                let r = byte >> 4;
+                let s = byte & 0x0f;
+
+                if s == 0 {
+                    match r {
+                        15 => index += 16, // Run length of 16 zero coefficients.
+                        _ => {
+                            *eob_run = (1 << r) - 1;
+
+                            if r > 0 {
+                                *eob_run += huffman.get_bits(reader, r)?;
+                            }
+
+                            break;
+                        }
+                    }
+                } else {
+                    index += r;
+
+                    if index >= spectral_selection.end {
+                        break;
+                    }
+
+                    coefficients[UNZIGZAG[index as usize & 63] as usize & 63] =
+                        huffman.receive_extend(reader, s)? << successive_approximation_low;
+                    index += 1;
+                }
             }
         }
     }
@@ -1525,8 +1556,19 @@ fn decode_block_successive_approximation<R: Read>(
 
         let mut index = spectral_selection.start;
 
+        // Same reasoning as the first-pass AC loop: resolve the table once, and
+        // report a missing one rather than unwrapping into a panic.
+        let ac_table = match ac_table {
+            Some(table) => table,
+            None => {
+                return Err(Error::Format(
+                    "refinement scan codes AC coefficients but defines no AC Huffman table"
+                        .to_owned(),
+                ))
+            }
+        };
         while index < spectral_selection.end {
-            let byte = huffman.decode(reader, ac_table.unwrap())?;
+            let byte = huffman.decode(reader, ac_table)?;
             let r = byte >> 4;
             let s = byte & 0x0f;
 
