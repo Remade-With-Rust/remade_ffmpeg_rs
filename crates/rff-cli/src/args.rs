@@ -243,7 +243,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             // `rff -i in.png -c:v png -compression_level 9 out.png` silently
             // encodes at the default — which is what it used to do. `:v` / `:a`
             // still target one side.
-            "compression_level" => {
+            "compression_level" | "threads" => {
                 let value = take_value(args, &mut i, arg)?;
                 match spec {
                     Some(s) if s.starts_with('v') => video_opts.set(base, value),
@@ -256,7 +256,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             // `configure` Dictionary (audio by default; `:v` targets video).
             // Includes Opus: -application, -vbr, and the R1 frame-parallel
             // controls -opus_parallel / -opus_warmup / -threads.
-            "application" | "vbr" | "opus_parallel" | "opus_warmup" | "threads"
+            "application" | "vbr" | "opus_parallel" | "opus_warmup"
             | "frame_duration" => {
                 let value = take_value(args, &mut i, arg)?;
                 match spec {

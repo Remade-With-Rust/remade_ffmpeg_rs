@@ -122,6 +122,7 @@ impl ImmediateWorker {
         // transform: a DC-only block is a fill, which is cheaper than half a
         // vectorized IDCT, and ~31% of blocks on photographic content are.
         let blocks_wide = component.block_size.width as usize;
+        #[cfg(not(feature = "platform_independent"))]
         let pair_idct = if component.dct_scale == 8 && !crate::decode::idct::ablate_idct() {
             crate::decode::arch::get_dequantize_and_idct_block_8x8_pair()
         } else {
@@ -148,6 +149,7 @@ impl ImmediateWorker {
             // Pair with the next block when it exists, sits on the SAME block
             // row (so its origin is exactly `dct_scale` bytes along), and also
             // needs a full transform.
+            #[cfg(not(feature = "platform_independent"))]
             if let Some(idct_pair) = pair_idct {
                 if !dc_only && i + 1 < block_count && (i % blocks_wide) + 1 < blocks_wide {
                     let next: &[i16; 64] =
@@ -267,7 +269,8 @@ impl ImmediateWorker {
 
         if let Some((pi, py, px, pcoeffs)) = self.pending.take() {
             if pi == index && py == block_y && px + 1 == block_x {
-                if let Some(idct_pair) = crate::decode::arch::get_dequantize_and_idct_block_8x8_pair()
+                #[cfg(not(feature = "platform_independent"))]
+            if let Some(idct_pair) = crate::decode::arch::get_dequantize_and_idct_block_8x8_pair()
                 {
                     let off = py * scale * line_stride + px * scale;
                     let qt = self.quantization_tables[index].as_ref().unwrap();

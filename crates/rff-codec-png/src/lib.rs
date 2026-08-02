@@ -59,8 +59,17 @@ impl Decoder for PngDecoder {
 
 fn decode_png(data: &[u8]) -> Result<Frame> {
     let mut decoder = rusty_png::Decoder::new(Cursor::new(data));
-    // Normalize: expand palette / sub-8-bit, and reduce 16-bit to 8-bit.
-    decoder.set_transformations(Transformations::EXPAND | Transformations::STRIP_16);
+    // EXPAND only — deliberately NOT `STRIP_16`.
+    //
+    // `STRIP_16` reduces 16-bit to 8-bit by keeping the high byte, which is
+    // truncation rather than rounding. Measured on a real 16-bit PNG that put
+    // **34.0% of bytes off by 1 LSB** from both the source and FFmpeg's decode,
+    // where FFmpeg was exact. We take the 16-bit samples and reduce them
+    // ourselves with [`sample16_to_8`].
+    //
+    // The pipeline still speaks 8-bit, so 16-bit input is narrowed rather than
+    // carried — but it is now narrowed *correctly*.
+    decoder.set_transformations(Transformations::EXPAND);
     let mut reader = decoder
         .read_info()
         .map_err(|e| Error::invalid(format!("png decode: {e}")))?;
@@ -71,6 +80,18 @@ fn decode_png(data: &[u8]) -> Result<Frame> {
         .map_err(|e| Error::invalid(format!("png decode: {e}")))?;
     buf.truncate(info.buffer_size());
     let (w, h) = (info.width as usize, info.height as usize);
+
+    // 16-bit sources arrive as big-endian sample pairs. Reduce them ourselves,
+    // rounding, rather than letting `STRIP_16` keep the high byte.
+    let buf = if reader.output_color_type().1 == BitDepth::Sixteen {
+        let mut out = Vec::with_capacity(buf.len() / 2);
+        for p in buf.chunks_exact(2) {
+            out.push(sample16_to_8(p[0], p[1]));
+        }
+        out
+    } else {
+        buf
+    };
 
     // Normalize whatever the PNG decoded to into packed RGB or RGBA.
     let (format, planes, stride) = match reader.output_color_type().0 {
@@ -188,6 +209,35 @@ fn content_signal(px: &[u8], w: usize, h: usize, ch: usize) -> f64 {
 /// Chosen from the empty band between the two measured classes (0.204 / 0.531).
 const GRAPHICS_SIGNAL: f64 = 0.35;
 
+/// Resolve `-threads` into a worker count.
+///
+/// `0` means auto, as it does in FFmpeg. The cap is **measured, not arbitrary**:
+/// at 8 workers the speedups were 4.71×/5.40×/6.53×, but at 16 one image
+/// (blue_sky) *regressed* to 2.57× while another improved to 8.02×. Since the
+/// gain past 8 is inconsistent and the downside is real, auto stops at 8 and
+/// anyone who wants more asks for it explicitly.
+fn resolve_threads(requested: usize) -> usize {
+    if requested != 0 {
+        return requested;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(1)
+}
+
+/// Convert one big-endian 16-bit PNG sample to 8-bit, **rounding**.
+///
+/// The backing crate's `STRIP_16` keeps the high byte (`v >> 8`), which is
+/// truncation, not reduction: measured against a real 16-bit PNG that put
+/// **34.0% of bytes off by 1 LSB** from both the source and FFmpeg's decode,
+/// where FFmpeg was exact. `round(v * 255 / 65535)` is the correct mapping and
+/// makes 0xFFFF -> 255 and 0x0000 -> 0 exactly.
+#[inline]
+fn sample16_to_8(hi: u8, lo: u8) -> u8 {
+    let v = u16::from_be_bytes([hi, lo]) as u32;
+    ((v * 255 + 32_767) / 65_535) as u8
+}
+
 /// Fewest bits per index that can address `n` palette entries.
 fn indexed_bit_depth(n: usize) -> BitDepth {
     match n {
@@ -302,6 +352,10 @@ struct PngSettings {
     /// Set once the user names a compression level or filter explicitly.
     explicit_compression: bool,
     explicit_filter: bool,
+    /// DEFLATE worker budget. 0 = auto (capped, see `resolve_threads`), 1 =
+    /// serial. Parallel output is lossless but not byte-identical to serial,
+    /// so `-threads 1` is the way back to reproducible bytes.
+    threads: usize,
     /// Narrow the output colour type to gray/indexed when the pixels allow it.
     /// On by default: it is lossless, and without it every grayscale or palette
     /// PNG that passes through this codec is re-emitted as truecolour (+257% /
@@ -315,6 +369,7 @@ impl Default for PngSettings {
             compression: Compression::Fast,
             filter: FilterType::Sub,
             adaptive: AdaptiveFilterType::NonAdaptive,
+            threads: 0,
             auto_config: true,
             explicit_compression: false,
             explicit_filter: false,
@@ -374,6 +429,16 @@ impl Encoder for PngEncoder {
                 Err(_) => {
                     return Err(Error::invalid(format!(
                         "png encode: -compression_level wants 0..9, got `{v}`"
+                    )))
+                }
+            }
+        }
+        if let Some(v) = options.get("threads") {
+            match v.trim().parse::<usize>() {
+                Ok(n) => self.settings.threads = n,
+                Err(_) => {
+                    return Err(Error::invalid(format!(
+                        "png encode: -threads wants a non-negative integer, got `{v}`"
                     )))
                 }
             }
@@ -618,6 +683,10 @@ fn emit(
         encoder.set_compression(settings.compression);
         encoder.set_filter(settings.filter);
         encoder.set_adaptive_filter(settings.adaptive);
+        // Multi-threaded DEFLATE. Lossless, but the compressed bytes differ
+        // from serial, so `-threads 1` restores byte-for-byte reproducibility.
+        // Images too small to split stay serial automatically and pay nothing.
+        encoder.set_parallel(resolve_threads(settings.threads));
         let mut writer = encoder
             .write_header()
             .map_err(|e| Error::invalid(format!("png encode: {e}")))?;

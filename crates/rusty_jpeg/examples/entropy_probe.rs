@@ -22,6 +22,19 @@
 
 use std::hint::black_box;
 
+/// Cycle counter on x86; elsewhere a nanosecond clock, so the example still
+/// builds and runs on ARM. The absolute numbers are only comparable within one
+/// architecture either way.
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[inline(always)]
+fn rdtsc() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline(always)]
 fn rdtsc() -> u64 {
