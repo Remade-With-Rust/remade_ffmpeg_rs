@@ -74,3 +74,56 @@ fn missing_ac_table_on_an_ac_scan_is_an_error_not_a_panic() {
         );
     }
 }
+
+/// A progressive frame header must not be able to size an unbounded allocation.
+///
+/// Progressive keeps every coefficient of the whole image resident, because
+/// later scans revisit the same blocks — so that buffer is sized straight from
+/// the SOF. A fuzzer reached `malloc(8589934592)` (8 GiB) from a small input:
+/// `decoding_buffer_size_limit` existed but was only enforced in
+/// `decode_planes`, which runs after every scan has been decoded, long after
+/// the allocation it is meant to bound.
+#[test]
+fn oversized_progressive_frame_is_rejected_before_allocating() {
+    // Rewrite the SOF2 dimensions of a real progressive file to 65535x65535.
+    // The entropy data no longer matches, which is the point: the guard must
+    // fire on the header, before anything large is allocated.
+    let mut data = LIBJPEG_PROGRESSIVE.to_vec();
+    let mut i = 2;
+    let mut patched = false;
+    while i + 9 < data.len() {
+        if data[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let m = data[i + 1];
+        if m == 0xD8 || m == 0xD9 || (0xD0..=0xD7).contains(&m) {
+            i += 2;
+            continue;
+        }
+        let ln = ((data[i + 2] as usize) << 8) | data[i + 3] as usize;
+        if m == 0xC2 {
+            // SOF2 payload: precision(1), height(2), width(2), ...
+            data[i + 5] = 0xFF;
+            data[i + 6] = 0xFF;
+            data[i + 7] = 0xFF;
+            data[i + 8] = 0xFF;
+            patched = true;
+            break;
+        }
+        i += 2 + ln;
+    }
+    assert!(patched, "test fixture has no SOF2 to patch");
+
+    let mut d = Decoder::new(Cursor::new(&data));
+    d.set_single_threaded(true);
+    // 64 MB: far above anything legitimate here, far below the ~8 GiB the
+    // unpatched header would demand.
+    d.set_max_decoding_buffer_size(64 * 1024 * 1024);
+
+    // Must be an error. Reaching the allocation would OOM rather than fail.
+    assert!(
+        d.decode().is_err(),
+        "a 65535x65535 progressive frame was accepted under a 64 MB limit"
+    );
+}

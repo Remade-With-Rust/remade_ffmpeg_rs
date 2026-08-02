@@ -4,6 +4,48 @@ Everything this fork does differently from upstream `jpeg-decoder` 0.3.2 and
 `jpeg-encoder` 0.7.0. Keep this current — it is what makes re-syncing with
 upstream possible.
 
+## 0.2.2
+
+Completes the 0.2.1 fix and adds the corpus that should have caught it. Anyone
+decoding untrusted or progressive JPEGs should take this over 0.2.1.
+
+- **Undefined Huffman tables are now validated at SCAN-HEADER time**, once per
+  scan, instead of being discovered three levels down mid-MCU. Which tables a
+  scan needs depends on what it codes — a progressive DC-only scan needs no AC
+  table, and a DC *refinement* scan reads raw bits and needs neither — so the
+  check applies exactly the conditions under which each table is used. The error
+  now names the offending table index instead of surfacing as a panic.
+
+  This is **not progressive-specific**. `decode_block` is shared with the
+  baseline path, so any scan that names a table slot no DHT defined could reach
+  it; progressive merely makes that common, because progressive scans
+  legitimately declare only DC or only AC. The three deep guards from 0.2.1 stay
+  as defence in depth.
+
+- **A malformed progressive frame header can no longer size an unbounded
+  allocation.** Progressive keeps every coefficient of the image resident, so
+  that buffer is sized straight from the SOF — and `decoding_buffer_size_limit`
+  was only enforced in `decode_planes`, which runs *after* every scan, long
+  after the allocation it is meant to bound. A fuzzer reached
+  `malloc(8589934592)` — 8 GiB — from a small input. The limit is now applied
+  before allocating, with checked arithmetic so the product cannot wrap.
+
+**Measured, not asserted.** A 960-file corpus from libjpeg (progressive and
+baseline, 4:4:4/4:2:2/4:2:0, greyscale, optimized and not, restart intervals,
+sizes from 1x1 to 255x127), each decoded through both `decode()` and
+`decode_planar()`:
+
+| build | result |
+|---|---|
+| shipped 0.2.0 | **960 of 1920 decodes PANICKED** — every progressive file |
+| this release | 1920 decoded, 0 panics |
+
+With 60 mutations per file: 117,120 decodes, 31,276 successful, 85,844 cleanly
+rejected, **0 panics**. The sweep ships as `examples/corpus_sweep.rs`.
+
+Both new tests were verified to FAIL against the shipped source before being
+kept.
+
 ## 0.2.1
 
 **Fixes a panic on most real progressive JPEGs.** Present in 0.1.6, 0.1.7 and

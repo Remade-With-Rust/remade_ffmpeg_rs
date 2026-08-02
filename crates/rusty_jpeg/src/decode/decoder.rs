@@ -585,9 +585,83 @@ impl<R: Read> Decoder<R> {
                     let frame = self.frame.clone().unwrap();
                     let scan = parse_sos(&mut self.reader, &frame)?;
 
+                    // Validate the scan's Huffman table references ONCE, here,
+                    // rather than discovering a missing table three levels down
+                    // in the middle of an MCU.
+                    //
+                    // Which tables a scan needs depends on what it codes, and
+                    // progressive scans legitimately declare only one kind: a
+                    // DC-only scan (Ss=0, Se=0) needs no AC table, and a DC
+                    // REFINEMENT scan reads raw bits and needs no table at all.
+                    // Demanding both unconditionally is what broke progressive
+                    // files; demanding neither is what let a panic reach the
+                    // block loop. The checks below are the exact conditions
+                    // under which `decode_block` will actually use each table.
+                    //
+                    // This is not progressive-specific: any scan, baseline
+                    // included, can name a table slot no DHT ever defined.
+                    // Progressive merely makes it common.
+                    {
+                        let needs_dc = scan.spectral_selection.start == 0
+                            && scan.successive_approximation_high == 0;
+                        let needs_ac = scan.spectral_selection.end > 1;
+                        for i in 0..scan.component_indices.len() {
+                            if needs_dc
+                                && self.dc_huffman_tables[scan.dc_table_indices[i]].is_none()
+                            {
+                                return Err(Error::Format(format!(
+                                    "scan references DC Huffman table {} which no DHT defines",
+                                    scan.dc_table_indices[i]
+                                )));
+                            }
+                            if needs_ac
+                                && self.ac_huffman_tables[scan.ac_table_indices[i]].is_none()
+                            {
+                                return Err(Error::Format(format!(
+                                    "scan references AC Huffman table {} which no DHT defines",
+                                    scan.ac_table_indices[i]
+                                )));
+                            }
+                        }
+                    }
+
                     if frame.coding_process == CodingProcess::DctProgressive
                         && self.coefficients.is_empty()
                     {
+                        // Progressive keeps every coefficient of the whole image
+                        // resident, because later scans revisit the same blocks.
+                        // That buffer is sized straight from the frame header,
+                        // so a malformed SOF sizes it directly: a fuzzer reached
+                        // `malloc(8589934592)` — 8 GiB — from a 906-byte input.
+                        //
+                        // `decoding_buffer_size_limit` existed but was only
+                        // enforced in `decode_planes`, which runs after every
+                        // scan has been decoded — far too late to prevent the
+                        // allocation it is meant to bound. Check it here, with
+                        // checked arithmetic so the product cannot wrap.
+                        let mut total = 0usize;
+                        for c in &frame.components {
+                            let n = (c.block_size.width as usize)
+                                .checked_mul(c.block_size.height as usize)
+                                .and_then(|b| b.checked_mul(64))
+                                .ok_or_else(|| {
+                                    Error::Format(
+                                        "progressive coefficient buffer size overflows".to_owned(),
+                                    )
+                                })?;
+                            total = total.checked_add(n).ok_or_else(|| {
+                                Error::Format(
+                                    "progressive coefficient buffer size overflows".to_owned(),
+                                )
+                            })?;
+                        }
+                        if total > self.decoding_buffer_size_limit {
+                            return Err(Error::Format(
+                                "progressive coefficient buffer exceeds maximum allowed size"
+                                    .to_owned(),
+                            ));
+                        }
+
                         self.coefficients = frame
                             .components
                             .iter()
