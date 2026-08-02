@@ -71,21 +71,21 @@
  * scaled fixed-point arithmetic, with a minimal number of shifts.
  */
 
-const CONST_BITS: i32 = 13;
-const PASS1_BITS: i32 = 2;
+pub(crate) const CONST_BITS: i32 = 13;
+pub(crate) const PASS1_BITS: i32 = 2;
 
-const FIX_0_298631336: i32 = 2446;
-const FIX_0_390180644: i32 = 3196;
-const FIX_0_541196100: i32 = 4433;
-const FIX_0_765366865: i32 = 6270;
-const FIX_0_899976223: i32 = 7373;
-const FIX_1_175875602: i32 = 9633;
-const FIX_1_501321110: i32 = 12299;
-const FIX_1_847759065: i32 = 15137;
-const FIX_1_961570560: i32 = 16069;
-const FIX_2_053119869: i32 = 16819;
-const FIX_2_562915447: i32 = 20995;
-const FIX_3_072711026: i32 = 25172;
+pub(crate) const FIX_0_298631336: i32 = 2446;
+pub(crate) const FIX_0_390180644: i32 = 3196;
+pub(crate) const FIX_0_541196100: i32 = 4433;
+pub(crate) const FIX_0_765366865: i32 = 6270;
+pub(crate) const FIX_0_899976223: i32 = 7373;
+pub(crate) const FIX_1_175875602: i32 = 9633;
+pub(crate) const FIX_1_501321110: i32 = 12299;
+pub(crate) const FIX_1_847759065: i32 = 15137;
+pub(crate) const FIX_1_961570560: i32 = 16069;
+pub(crate) const FIX_2_053119869: i32 = 16819;
+pub(crate) const FIX_2_562915447: i32 = 20995;
+pub(crate) const FIX_3_072711026: i32 = 25172;
 
 const DCT_SIZE: usize = 8;
 

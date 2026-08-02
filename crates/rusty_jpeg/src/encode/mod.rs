@@ -10,6 +10,7 @@
 mod avx2;
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
 mod neon;
+mod fdct_simd;
 mod trellis;
 mod encoder;
 mod error;
