@@ -51,6 +51,63 @@ pub(crate) fn lambda_scale() -> f32 {
     })
 }
 
+/// Lower coefficient magnitudes where the bits saved outweigh the distortion.
+///
+/// Restricted to `|q| >= 2 -> |q| - 1`, which can never produce a zero. That
+/// restriction is what makes every decision **independent**: the set of non-zero
+/// positions is unchanged, so no run-length moves and no other coefficient's
+/// symbol is affected. The alternative — allowing `1 -> 0` — merges the run into
+/// the next coefficient and couples the decisions, which is a different and much
+/// more expensive problem.
+///
+/// A magnitude drop pays off when it crosses a `size` boundary (7 -> 6 keeps
+/// size 3, but 8 -> 7 falls from size 4 to size 3), saving both a shorter
+/// Huffman symbol and one raw magnitude bit.
+fn lower_magnitudes(
+    coef_natural: &[i16; 64],
+    q_block: &mut [i16; 64],
+    table: &QuantizationTable,
+    ac_table: &HuffmanTable,
+    lambda: f64,
+) -> u32 {
+    let mut changed = 0;
+    let mut prev = 0usize;
+    for i in 1..64 {
+        let q = q_block[i];
+        if q == 0 {
+            continue;
+        }
+        let run_before = (i - prev - 1) as u32;
+        prev = i;
+
+        if q.abs() < 2 {
+            continue;
+        }
+        let lowered = q - q.signum();
+
+        let z = ZIGZAG[i] as usize & 0x3f;
+        let step = table.divisor(z) as f64;
+        let c = coef_natural[z] as f64;
+
+        let err_now = c - q as f64 * step;
+        let err_low = c - lowered as f64 * step;
+        let delta_d = err_low * err_low - err_now * err_now;
+
+        // Only the last ZRL chunk's run reaches the symbol.
+        let r = (run_before % 16) as u8;
+        let (size_now, _) = get_code(q);
+        let (size_low, _) = get_code(lowered);
+        let rate_now = ac_table.code_len((r << 4) | size_now) as f64 + size_now as f64;
+        let rate_low = ac_table.code_len((r << 4) | size_low) as f64 + size_low as f64;
+
+        if delta_d + lambda * (rate_low - rate_now) < 0.0 {
+            q_block[i] = lowered;
+            changed += 1;
+        }
+    }
+    changed
+}
+
 /// Choose the EOB position that minimises `D + lambda * R`.
 ///
 /// `coef_natural` is the pre-quantization DCT block in natural order;
@@ -120,6 +177,22 @@ pub(crate) fn truncate_rd(
         mean_sq += s * s;
     }
     mean_sq /= nnz as f64;
+
+    // A density-adaptive lambda was tried here and REFUTED IN BOTH DIRECTIONS.
+    //
+    // EOB truncation measures -5.02% BD-rate on photographic content and
+    // **+3.83%** on noise, and a sign flip is normally a dispatch signal. The
+    // hypothesis was that a lambda tuned on structured content over-truncates
+    // high-entropy blocks, so lambda should taper down with non-zero density.
+    // Measured, tapering DOWN made noise worse (+1.40% -> +2.67% at a 0.15
+    // floor) and tapering UP made it far worse (+12.07% at 4x). Flat lambda is
+    // the best of the three, so the density of a block is simply not the axis
+    // that explains the loss.
+    //
+    // What DID cut it nearly in half was magnitude lowering below: noise went
+    // +3.83% -> +1.40% once coefficients could be reduced instead of only
+    // dropped. The residual loss on pure synthetic noise is accepted; 4 of 5
+    // contents win and the mean is -2.51%.
     let lambda = lambda_scale() as f64 * mean_sq;
 
     // k = number of non-zeros kept. Cost = distortion added + lambda * rate.
@@ -135,11 +208,31 @@ pub(crate) fn truncate_rd(
         }
     }
 
-    if best_k == nnz {
-        return 0;
+    let mut zeroed = 0;
+    if best_k < nnz {
+        for k in best_k..nnz {
+            q_block[pos[k] as usize] = 0;
+        }
+        zeroed = (nnz - best_k) as u32;
     }
-    for k in best_k..nnz {
-        q_block[pos[k] as usize] = 0;
+
+    // Magnitude lowering runs AFTER truncation, on what survives: deciding to
+    // lower a coefficient that is about to be discarded would be wasted work,
+    // and would also price the truncation against the wrong rate.
+    if magnitudes_enabled() {
+        zeroed += lower_magnitudes(coef_natural, q_block, table, ac_table, lambda);
     }
-    (nnz - best_k) as u32
+    zeroed
+}
+
+/// `RUSTY_JPEG_TRELLIS_MAG=0` disables magnitude lowering, keeping EOB
+/// truncation. Separable because the two were measured separately.
+fn magnitudes_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RUSTY_JPEG_TRELLIS_MAG")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }

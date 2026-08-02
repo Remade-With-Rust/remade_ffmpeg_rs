@@ -101,6 +101,56 @@ fn content_diagonal() -> Vec<u8> {
     rgb
 }
 
+/// Sharp bilevel glyph-like blocks — the "text and line art" case, where
+/// coefficients are large and lowering one is expensive.
+fn content_text() -> Vec<u8> {
+    let mut rgb = vec![0u8; W * H * 3];
+    for y in 0..H {
+        for x in 0..W {
+            let o = (y * W + x) * 3;
+            let gx = (x / 4) % 3;
+            let gy = (y / 6) % 4;
+            let ink = (gx == 0 && gy != 3) || (gy == 0 && gx != 2) || (x / 4 + y / 6) % 11 == 0;
+            let v = if ink { 20u8 } else { 235 };
+            rgb[o] = v;
+            rgb[o + 1] = v;
+            rgb[o + 2] = v;
+        }
+    }
+    rgb
+}
+
+/// Near-white-noise luma: high entropy, coefficients spread across the whole
+/// block, so EOB placement has little to work with.
+fn content_noise() -> Vec<u8> {
+    let mut rgb = vec![0u8; W * H * 3];
+    let mut s = 0x243F_6A88_85A3_08D3u64;
+    for p in rgb.chunks_exact_mut(3) {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let v = (s >> 24) as u8;
+        p[0] = v;
+        p[1] = v.wrapping_add(11);
+        p[2] = v.wrapping_sub(7);
+    }
+    rgb
+}
+
+/// A very smooth gradient — almost all energy in DC and the first few AC terms.
+fn content_gradient() -> Vec<u8> {
+    let mut rgb = vec![0u8; W * H * 3];
+    for y in 0..H {
+        for x in 0..W {
+            let o = (y * W + x) * 3;
+            rgb[o] = (x * 255 / W) as u8;
+            rgb[o + 1] = (y * 255 / H) as u8;
+            rgb[o + 2] = ((x + y) * 255 / (W + H)) as u8;
+        }
+    }
+    rgb
+}
+
 fn psnr(a: &[u8], b: &[u8]) -> f64 {
     debug_assert_eq!(a.len(), b.len());
     let mse: f64 = a
@@ -130,8 +180,14 @@ fn encode(rgb: &[u8], quality: u8) -> Vec<u8> {
     let mut out = Vec::new();
     let mut enc = Encoder::new(&mut out, quality);
     enc.set_sampling_factor(SamplingFactor::R_4_2_0);
-    if std::env::var("RUSTY_JPEG_ARM").map(|v| v == "trellis").unwrap_or(false) {
-        enc.set_trellis(true);
+    // Trellis is ON by default in the encoder now, so the baseline arm must
+    // switch it OFF explicitly. Relying on the default made both arms identical
+    // and every BD-rate read exactly 0.00% -- the tell that the comparison was
+    // measuring one binary against itself.
+    match std::env::var("RUSTY_JPEG_ARM").as_deref() {
+        Ok("notrellis") => enc.set_trellis(false),
+        Ok("trellis") => enc.set_trellis(true),
+        _ => {}
     }
     enc.encode(rgb, W as u16, H as u16, ColorType::Rgb)
         .expect("encode");
@@ -195,6 +251,9 @@ fn main() {
         ("photo", content_photo()),
         ("chroma_edges", content_chroma_edges()),
         ("diagonal", content_diagonal()),
+        ("text", content_text()),
+        ("noise", content_noise()),
+        ("gradient", content_gradient()),
     ] {
         println!("--- {name} ---");
         println!(
