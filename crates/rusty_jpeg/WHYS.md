@@ -1168,11 +1168,22 @@ box-averaging added earlier in this campaign, and its per-sample
 compiler from proving the index - so each of the 256 samples of a 4:2:0 chroma
 block paid a `min` AND a bounds check.
 
-The clamps are **loop-invariant except for blocks overhanging the right or
-bottom edge**. Hoisting that test to the block level and slicing each row turns
-256 checks into 2 - in **safe Rust**, with no `unsafe` anywhere.
+**COUNT 3 - `getblock_EDGE` per encode: 0.** The clamps are dead on EVERY
+block, not merely interior ones: `encode_blocks` pads its row buffer to MCU
+boundaries, so a block's sampling window always fits. Counted on the geometries
+that ought to be worst-case - 127x65, 320x241, 1920x1080, 8x8 - the clamped path
+is taken **zero** times.
 
-- **GATE:** byte-identical encode across 6 contents x 5 qualities.
+Dead does not mean free: the clamps are what stop the compiler proving the
+index, so all 256 samples of a 4:2:0 chroma block paid a `min` AND a bounds
+check that could never fire. Proving the window fits, once per block, replaces
+256 bounds checks with two slice checks per row - in **safe Rust**, no `unsafe`.
+
+- **GATE:** **96 encodes compared BYTE-FOR-BYTE** against the clamped oracle -
+  16 geometries including ragged (1x1, 7x3, 17x9, 31x17, 127x65, 255x127,
+  320x241) x 3 subsamplings x 2 qualities, all identical. The first version of
+  this gate compared `jpegquality`'s size+PSNR curves, which is a proxy; a
+  change that skips edge blocks deserves the real thing.
 - **MEASURED**, encode-only, best-of-N over 9 process runs, 1080p 4:2:0:
 
   | arm | min | median | max |

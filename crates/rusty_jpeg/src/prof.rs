@@ -83,7 +83,7 @@ impl Stage {
 }
 
 impl Stage {
-    pub const COUNT: usize = 22;
+    pub const COUNT: usize = 24;
     pub fn name(self) -> &'static str {
         match self {
             Stage::Total => "Total",
@@ -425,6 +425,11 @@ pub enum Count {
     /// Decoder: blocks whose coefficients 8..64 are all zero (only the top row
     /// has energy) — candidates for an even cheaper path.
     DecTopRowOnly,
+    /// Encoder: `get_block` calls taking the interior (unclamped) fast path.
+    GetBlockInterior,
+    /// Encoder: `get_block` calls needing the clamped path because the sampling
+    /// window overhangs the row buffer.
+    GetBlockEdge,
     /// Decoder: calls into the upsampler's per-row loop — the entry the unsafe
     /// backlog names as the densest bounds-check-per-byte site in the crate.
     /// Zero on the planar path, which returns before `compute_image`.
@@ -437,7 +442,7 @@ pub enum Count {
 }
 
 impl Count {
-    pub const COUNT: usize = 22;
+    pub const COUNT: usize = 24;
     pub fn name(self) -> &'static str {
         match self {
             Count::Symbols => "symbols",
@@ -462,6 +467,8 @@ impl Count {
             Count::DecTopRowOnly => "top_row_only",
             Count::DecCoefSpanSum => "coef_span_sum",
             Count::DecUpsampleRows => "upsample_rows",
+            Count::GetBlockInterior => "getblock_interior",
+            Count::GetBlockEdge => "getblock_EDGE",
         }
     }
 }

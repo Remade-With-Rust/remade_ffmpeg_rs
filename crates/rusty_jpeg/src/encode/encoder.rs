@@ -1712,16 +1712,32 @@ fn get_block(
 
     // Interior fast path.
     //
-    // The clamps below exist only for blocks that overhang the right or bottom
-    // edge. For every other block they are loop-invariant and dead — but they
-    // also stop the compiler proving the index, so each of the 256 samples of a
-    // 4:2:0 chroma block paid a `min` AND a bounds check. Hoisting the edge test
-    // to the block level turns that into two slice checks per row.
+    // The clamps below are dead on EVERY block, not merely on interior ones:
+    // `encode_blocks` pads its row buffer to MCU boundaries, so a block's
+    // sampling window always fits. Counted on ragged geometries that ought to be
+    // the worst case — 127x65, 320x241, 1920x1080 — the clamped path is taken
+    // **0** times.
+    //
+    // Dead does not mean free. The clamps are what stop the compiler proving the
+    // index, so each of the 256 samples of a 4:2:0 chroma block paid a `min` AND
+    // a bounds check it could never need. Proving the window fits, once per
+    // block, replaces 256 bounds checks with two slice checks per row.
+    //
+    // The clamped path stays as the oracle and as cover should that padding
+    // invariant ever change.
     //
     // `RUSTY_JPEG_ARM=slowblock` forces the general path, so the two can be A/B'd
     // in one binary, and the general path stays as the oracle.
-    if !slow_get_block() && start_x + 8 * col_stride <= width && start_y + 8 * row_stride <= height
-    {
+    let interior = start_x + 8 * col_stride <= width && start_y + 8 * row_stride <= height;
+    crate::prof::bump(
+        if interior {
+            crate::prof::Count::GetBlockInterior
+        } else {
+            crate::prof::Count::GetBlockEdge
+        },
+        1,
+    );
+    if !slow_get_block() && interior {
         if col_stride == 2 && row_stride == 2 {
             // 4:2:0 — the dominant case, worth its own straight-line body.
             for y in 0..8 {

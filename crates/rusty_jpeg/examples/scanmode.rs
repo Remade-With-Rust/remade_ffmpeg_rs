@@ -61,6 +61,7 @@ fn first_sos_components(d: &[u8]) -> usize {
 }
 
 fn main() {
+    let dump_counts = std::env::var("RUSTY_JPEG_COUNTS").is_ok();
     let mut a = std::env::args().skip(1);
     let w: usize = a.next().and_then(|v| v.parse().ok()).unwrap_or(1920);
     let h: usize = a.next().and_then(|v| v.parse().ok()).unwrap_or(1080);
@@ -80,6 +81,9 @@ fn main() {
         }
     }
 
+    if dump_counts {
+        rusty_jpeg::prof::reset();
+    }
     for (label, streaming) in [("materialize", Some(false)), ("streaming", Some(true))] {
         let out = encode(&rgb, w, h, q, streaming);
         let comps = first_sos_components(&out);

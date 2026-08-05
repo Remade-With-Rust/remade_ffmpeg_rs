@@ -58,6 +58,8 @@ fn main() {
     // COMPONENT. A fixture built that way exercises the decoder's rare
     // non-interleaved path, which is not what real JPEGs look like.
     let interleaved: bool = args.next().map(|v| v == "interleaved").unwrap_or(false);
+    // 5th arg: sampling, so a byte-identity gate can sweep all three.
+    let sampling_arg = args.next().unwrap_or_else(|| "420".into());
 
     let mut rgb = vec![0u8; w * h * 3];
     for j in 0..h {
@@ -76,7 +78,11 @@ fn main() {
 
     let mut jpeg = Vec::new();
     let mut enc = Encoder::new(&mut jpeg, quality);
-    enc.set_sampling_factor(SamplingFactor::R_4_2_0);
+    enc.set_sampling_factor(match sampling_arg.as_str() {
+        "444" => SamplingFactor::R_4_4_4,
+        "422" => SamplingFactor::R_4_2_2,
+        _ => SamplingFactor::R_4_2_0,
+    });
     enc.set_optimized_huffman_tables(true);
     if std::env::var("RUSTY_JPEG_TRELLIS").is_ok() {
         enc.set_trellis(true);
@@ -93,4 +99,16 @@ fn main() {
         "{out}: {w}x{h} q{quality}, {} B, {ratio:.1}x compression",
         jpeg.len()
     );
+
+    // Does the clamped path ever actually run? The encoder pads its row buffer
+    // to MCU boundaries, so "edge block" may be unreachable in practice.
+    if std::env::var("RUSTY_JPEG_COUNTS").is_ok() {
+        use rusty_jpeg::prof::Count;
+        let c = rusty_jpeg::prof::read();
+        println!(
+            "  getblock_interior {}  getblock_EDGE {}",
+            c[Count::GetBlockInterior as usize],
+            c[Count::GetBlockEdge as usize]
+        );
+    }
 }
