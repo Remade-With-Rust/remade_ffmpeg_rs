@@ -33,8 +33,8 @@ badly, so this one is calibrated to real photographic coefficient density.
 
 | | vs FFmpeg | verdict |
 |---|---|---|
-| **Encode** | **1.45× faster** | matched output size, single-threaded, **fixed Huffman tables on both sides** (`-optimize_huffman 0`) |
-| **Decode** | **~1.04× faster (4%)** | paired ABBA, N=15, 3000-frame arms, median 1.0390 |
+| **Encode** | **at parity** (median 0.96x, i.e. ~4% slower) | matched output size, single-threaded, fixed Huffman tables both sides; paired N=41, z -3.59 |
+| **Decode** | **at parity** (median 1.02x) | byte-identical bitstream, both discarding output; paired N=31, z -0.18, inside noise |
 
 ## Why merge them
 

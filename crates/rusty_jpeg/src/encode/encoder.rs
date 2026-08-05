@@ -1736,6 +1736,85 @@ impl Default for HuffmanStats {
 /// this; 8K does not.
 const OPTIMIZE_BUFFER_BUDGET: usize = 256 * 1024 * 1024;
 
+/// Extract an 8x8 block with NO subsampling: 8 contiguous bytes per row, widened
+/// to i16 and level-shifted by -128.
+///
+/// This is the luma path, and on 4:2:0 it is **two thirds of all blocks**. The
+/// scalar form pays a multiply, an index computation and a bounds check per
+/// sample; here each row is one 8-byte load, one widen, one subtract, one store.
+///
+/// # Safety
+/// Caller guarantees `start_y + 8` rows and `start_x + 8` columns lie inside
+/// `data`, and that SSE4.1 is available.
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "sse4.1")]
+unsafe fn get_block_1x1_simd(
+    data: &[u8],
+    start_x: usize,
+    start_y: usize,
+    width: usize,
+) -> [i16; 64] {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    let mut block = [0i16; 64];
+    let bias = _mm_set1_epi16(128);
+    for y in 0..8 {
+        let src = data.as_ptr().add((start_y + y) * width + start_x);
+        let v = _mm_loadl_epi64(src as *const __m128i);
+        let widened = _mm_cvtepu8_epi16(v);
+        let shifted = _mm_sub_epi16(widened, bias);
+        _mm_storeu_si128(block.as_mut_ptr().add(y * 8) as *mut __m128i, shifted);
+    }
+    block
+}
+
+/// Extract an 8x8 block with 2x2 box averaging — the 4:2:0 chroma path, a third
+/// of all blocks.
+///
+/// `maddubs` does the horizontal pairwise sum of 16 samples in one instruction,
+/// which is exactly the inner two adds of the box filter; the two source rows
+/// then add vertically. Rounding is `(sum + 2) >> 2`, matching the scalar form's
+/// `(sum + half) / n` for `n == 4` exactly.
+///
+/// # Safety
+/// Caller guarantees `start_y + 16` rows and `start_x + 16` columns lie inside
+/// `data`, and that SSSE3 is available.
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "ssse3")]
+unsafe fn get_block_2x2_simd(
+    data: &[u8],
+    start_x: usize,
+    start_y: usize,
+    width: usize,
+) -> [i16; 64] {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    let mut block = [0i16; 64];
+    let ones = _mm_set1_epi8(1);
+    let round = _mm_set1_epi16(2);
+    let bias = _mm_set1_epi16(128);
+    for y in 0..8 {
+        let r0 = data.as_ptr().add((start_y + 2 * y) * width + start_x);
+        let r1 = r0.add(width);
+        // Pairwise horizontal sums: 16 u8 -> 8 i16.
+        let a = _mm_maddubs_epi16(_mm_loadu_si128(r0 as *const __m128i), ones);
+        let b = _mm_maddubs_epi16(_mm_loadu_si128(r1 as *const __m128i), ones);
+        let sum = _mm_add_epi16(a, b);
+        let avg = _mm_srai_epi16::<2>(_mm_add_epi16(sum, round));
+        _mm_storeu_si128(
+            block.as_mut_ptr().add(y * 8) as *mut __m128i,
+            _mm_sub_epi16(avg, bias),
+        );
+    }
+    block
+}
+
 /// `RUSTY_JPEG_ARM=pointsample` restores the old point-sampling downsampler,
 /// so the two can be compared in one binary. Resolved once, not per block.
 /// `RUSTY_JPEG_ARM=slowblock` forces the general clamped path — the A/B arm for
@@ -1825,6 +1904,41 @@ fn get_block(
     width: usize,
 ) -> [i16; 64] {
     let mut block = [0i16; 64];
+
+    // SIMD interior paths. Both require the whole sampling window inside the
+    // buffer, which `encode_blocks` guarantees by padding rows to MCU bounds —
+    // `getblock_EDGE` counts 0 on every geometry tried. `RUSTY_JPEG_ARM=slowblock`
+    // forces the scalar oracle.
+    #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        if !slow_get_block() && !point_sample_chroma() {
+            let h = data.len() / width;
+            if col_stride == 1
+                && row_stride == 1
+                && start_x + 8 <= width
+                && start_y + 8 <= h
+                && std::is_x86_feature_detected!("sse4.1")
+            {
+                // SAFETY: bounds proven above; SSE4.1 checked at runtime.
+                #[allow(unsafe_code)]
+                unsafe {
+                    return get_block_1x1_simd(data, start_x, start_y, width);
+                }
+            }
+            if col_stride == 2
+                && row_stride == 2
+                && start_x + 16 <= width
+                && start_y + 16 <= h
+                && std::is_x86_feature_detected!("ssse3")
+            {
+                // SAFETY: bounds proven above; SSSE3 checked at runtime.
+                #[allow(unsafe_code)]
+                unsafe {
+                    return get_block_2x2_simd(data, start_x, start_y, width);
+                }
+            }
+        }
+    }
 
     // Fast path: no subsampling, so there is nothing to average.
     if (col_stride == 1 && row_stride == 1) || point_sample_chroma() {

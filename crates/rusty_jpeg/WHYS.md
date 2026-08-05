@@ -1315,6 +1315,55 @@ Interleaving was necessary, not decorative: across this session the same ffmpeg
 command drifted 953 -> 1266 ms on the same box, more than the effect being
 measured. Sequential arms would have reported parity.
 
+## D5i - two wins, and a standing that was an artifact all along
+
+### Win 1 - mask-driven AC scan (already recorded in D4h): 1.28x, z 3.36
+
+### Win 2 - SIMD block extraction
+
+With the scan gone, `get_block` became the #2 stage and the first to reach a
+VERDICT: 1.1322, z 2.40, ~12% of encode. Two kernels replaced the scalar loops:
+
+- **1x1 (luma, two thirds of all 4:2:0 blocks):** each row is 8 contiguous
+  bytes, so one 8-byte load + widen + subtract replaces 8 indexed loads with
+  bounds checks.
+- **2x2 (4:2:0 chroma):** `maddubs` does the horizontal pairwise sum of 16
+  samples in one instruction - exactly the box filter's inner adds - then the
+  two rows add vertically. `(sum + 2) >> 2` matches the scalar `(sum + half) / n`
+  for `n == 4` exactly.
+
+- **GATE:** 81 encodes byte-for-byte vs the scalar oracle, 9 geometries
+  (incl. ragged) x 3 subsamplings x 3 qualities. 0 mismatches.
+- **MEASURED: 23/25, z 4.20, median 1.2540 - 1.25x faster whole encode.**
+- **CONFIRMED BY THE STAGE ITSELF:** `getblock`'s double-run share fell from
+  1.1322 (z 2.40, a verdict) to **1.0563 (z 0.65, inside noise)** - it is now at
+  the null floor. The stage was removed, not moved.
+
+### The standing was never what we published
+
+Same comparison, same clip, matched size, increasing N:
+
+| N | median (ffmpeg/ours) | z | reading |
+|---|---:|---:|---|
+| 15 | 1.4510 | 2.32 | "1.45x faster" |
+| 21 | 1.0286 | 0.65 | parity |
+| **41** | **0.9608** | **-3.59** | **~4% SLOWER, a verdict** |
+
+Decode, re-measured with both arms discarding output (the first attempt had both
+writing 933 MB of raw video and was measuring I/O): **15/31, z -0.18, median
+1.0157 - parity.** The published "1.04x faster" was N=15.
+
+**So: the codec got materially faster this session - two byte-identical,
+high-z, same-binary wins - and it is at PARITY with FFmpeg, not ahead of it.**
+Both statements are true, and only the second one belongs in a README.
+
+The rule this cost: **a cross-implementation ratio needs N >= 31 before it means
+anything**, because the estimator itself trends with N on this box. Same-binary
+A/Bs reached z 3.36 and 4.20 at N=15-25; the cross-binary one wandered from
++45% to -4% over the same range. `codec-measurement` §3 says N >= 20 for effects
+under 5%; for CROSS-IMPLEMENTATION comparisons on unlike binaries that is not
+enough.
+
 ---
 
 ## Standing rules for this descent

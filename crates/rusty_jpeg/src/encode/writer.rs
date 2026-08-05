@@ -107,6 +107,7 @@ impl<W: std::io::Write + ?Sized> JfifWrite for W {
 
 pub(crate) struct JfifWriter<W: JfifWrite> {
     w: W,
+    scratch: alloc::vec::Vec<u8>,
     bit_buffer: usize,
     free_bits: i8,
 }
@@ -115,6 +116,7 @@ impl<W: JfifWrite> JfifWriter<W> {
     pub fn new(w: W) -> Self {
         JfifWriter {
             w,
+            scratch: alloc::vec::Vec::new(),
             bit_buffer: 0,
             free_bits: BUFFER_SIZE as i8,
         }
@@ -193,10 +195,23 @@ impl<W: JfifWrite> JfifWriter<W> {
             }
             Ok(())
         } else {
+            if crate::encode::encoder::double_stage("flush") {
+                // Price the sink write itself: same 8 bytes, thrown away.
+                self.scratch
+                    .extend_from_slice(&self.bit_buffer.to_be_bytes());
+                if self.scratch.len() > 4096 {
+                    self.scratch.clear();
+                }
+            }
             self.w.write_all(&self.bit_buffer.to_be_bytes())
         }
     }
 
+    /// Inlined deliberately: this runs once per Huffman symbol — ~663k times
+    /// per 1080p frame — and is a handful of shifts around one predictable
+    /// branch. Left out-of-line it was a call plus a `Result` check per symbol,
+    /// against a body barely larger than the call sequence itself.
+    #[inline]
     pub fn write_bits(&mut self, value: u32, size: u8) -> Result<(), EncodingError> {
         crate::prof::bump(crate::prof::Count::BitWrites, 1);
         crate::prof::bump(crate::prof::Count::Bits, size as u64);
@@ -391,6 +406,7 @@ impl<W: JfifWrite> JfifWriter<W> {
         }
     }
 
+    #[inline]
     pub fn write_dc(
         &mut self,
         value: i16,
@@ -466,6 +482,9 @@ impl<W: JfifWrite> JfifWriter<W> {
             }
 
             crate::prof::bump(crate::prof::Count::NonZeroAc, 1);
+            if crate::encode::encoder::double_stage("getcode") {
+                core::hint::black_box(get_code(block[i]));
+            }
             let (size, value) = get_code(block[i]);
             self.huffman_encode_value(size, (zero_run << 4) | size, value, ac_table)?;
             prev = i + 1;

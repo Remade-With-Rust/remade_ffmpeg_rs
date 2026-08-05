@@ -4,6 +4,38 @@ Everything this fork does differently from upstream `jpeg-decoder` 0.3.2 and
 `jpeg-encoder` 0.7.0. Keep this current — it is what makes re-syncing with
 upstream possible.
 
+## 0.3.0
+
+Two byte-identical encoder wins — and a corrected standing that is the reason
+for the minor bump.
+
+- **AC coefficients are found with a SIMD mask, not a branch per coefficient.**
+  Counts showed the loop visiting all 63 AC positions to locate the ~16% that
+  are non-zero, and that scan alone measured ~12-13% of whole encode — about a
+  third of all entropy cost. `write_ac_block` now builds a 64-bit non-zero mask
+  with one AVX2 compare and steps the set bits with `trailing_zeros`.
+  **1.28x faster whole encode (25 pairs, z 3.36).**
+
+- **SIMD block extraction.** `get_block` was the #2 stage at ~12%. The luma path
+  (two thirds of 4:2:0 blocks) is now one 8-byte load + widen + subtract per row;
+  the 4:2:0 chroma path uses `maddubs` for the box filter's horizontal sums.
+  **1.25x faster whole encode (25 pairs, z 4.20)**, and the stage's own share
+  fell to the null floor.
+
+  Both gated byte-for-byte against their scalar oracles — 81 encodes across 9
+  geometries, 3 subsamplings and 3 qualities for the block extractor; baseline,
+  progressive and both Huffman modes for the AC scan.
+
+- **The FFmpeg comparison is corrected to PARITY.** Encode median **0.96x**
+  (paired interleaved, N=41, z -3.59, matched output size with ours 3.1%
+  smaller); decode median **1.02x** (N=31, z -0.18, inside noise).
+
+  0.1.x through 0.2.x claimed 1.19-1.45x faster. Those were small-N artifacts:
+  the same comparison read 1.45x at N=15, 1.03x at N=21 and 0.96x at N=41. The
+  codec genuinely improved — the two wins above are same-binary, byte-identical
+  and high-z — but it sits at parity with FFmpeg rather than ahead, and that is
+  what the README now says.
+
 ## 0.2.3
 
 **Trellis quantization is now OFF by default.** It shipped on in 0.1.7 through
