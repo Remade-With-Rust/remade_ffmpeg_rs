@@ -50,7 +50,7 @@ successful outcome, not a failure.
 | Codec / crate | Verdict | Why |
 |---|---|---|
 | **rusty_vp9** (decoder + encoder) | **IN — primary video target** | 31k LoC of our Rust; committed profile + conformance gate exist |
-| **rusty_jpeg** (decoder + encoder) | **IN — primary image target** | Own kernels, existing `arch/{avx2,ssse3,neon}` seam, house-style oracle tests |
+| **rusty_jpeg** (decoder + encoder) | ✅ **CLOSED 2026-08-02** | 13 entries audited, **1 real** — and that one was fixed in safe Rust + SIMD, no `unsafe`. See the two closed sections below. |
 | **rusty_mp3** (decoder + encoder) | **IN** | Zero unsafe today; dense scalar DSP; strong bit-exact gates |
 | **rusty_aac** (encoder + decoder) | **IN** | Has AVX2/AVX-512 quantize kernels already; decoder IMDCT is O(N²) (algorithmic fix first) |
 | **rusty_vorbis** (encoder) | **IN** | Already uses `get_unchecked`+AVX2 in `brute_cost`; more of the same surface |
@@ -111,7 +111,29 @@ Profiler buckets already exist (`src/encode/prof.rs:27-62`, `VP9_PROF2=1`).
 | `run_partition_decision` tile threading | `frameenc.rs:3576-3607` | P3 | Currently `self.clone()` per tile — the exact cost that killed the decoder's safe threading. Candidate: raw-ptr shared read state. |
 | `fdct16x16`/`fdct32x32`, `forward_2d_matrix` | `encode/transform.rs:403,680,795` | P1 | Only 8×8 has an AVX2 kernel. |
 
-### rusty_jpeg — decoder
+> ### What auditing the first codec on this list taught us
+>
+> `rusty_jpeg` was worked end to end on 2026-08-02. **13 entries, 1 real.** Before
+> spending time on any remaining crate here, run these two checks — each is one
+> command and together they killed 9 of the 13:
+>
+> 1. **Does the code execute on the path we ship?** Count invocations, don't
+>    assume. The entry described as "the densest bounds-check-per-byte site in
+>    the image crates" was *correct* about the check count and measured
+>    **0 calls/frame**, because the pipeline takes a different output path.
+> 2. **Did the compiler already elide the check?** Emit the assembly and count
+>    `panic_bounds_check` per symbol:
+>    `cargo rustc --release -p <crate> --lib -- --emit asm`.
+>    Entries reasoning "the mask proves the index, so the check is pure tax" are
+>    usually right about the premise and wrong about the conclusion — *because*
+>    the mask proves it, the check is not there.
+>
+> And when an entry survives both: **try safe Rust first.** The one real entry
+> here was fixed by hoisting a dead edge case (1.14x, byte-identical) and then by
+> SIMD (1.25x) — `unsafe` was never needed. Reach for it when a bound genuinely
+> cannot be proven, not when it merely has not been.
+
+### rusty_jpeg — decoder ✅ CLOSED 2026-08-02
 
 > **MEASURED 2026-08-02 — four of these five decoder entries are DEAD, and the
 > counts that killed them each took one command.** See `crates/rusty_jpeg/WHYS.md`
@@ -132,16 +154,16 @@ Profiler buckets already exist (`src/encode/prof.rs:27-62`, `VP9_PROF2=1`).
 
 | Function | Location | Pattern(s) | Evidence |
 |---|---|---|---|
-| **Upsampler row loops** | `src/decode/upsampler.rs:188-192` (H2V1), `:257-263` (H2V2), `:222-224` (H1V2) | **P1** | 5 bounds checks per output pair; loop bounds `1..width-1` already prove all five. Densest bounds-check-per-byte site in the image crates. |
-| **Per-scanline line-buffer alloc** | `upsampler.rs:73` | **P2** | `vec![vec![0u8; …]; ncomp]` allocated + zeroed *per output row*, fully overwritten. Reuse or spare-capacity. |
-| **Whole-frame output zeroing** | `src/decode/worker/mod.rs:179`, `worker/rayon.rs:202` | **P2** | Full RGB frame `vec![0u8; …]` then every byte written. Precedent: `immediate.rs:60-107` recycled-plane memset skip with `RUSTY_JPEG_ABLATE=planezero` as A/B arm. |
-| Coefficient stores in entropy decode | `src/decode/decoder.rs:1564,1592,1690,1714-1716` | P1 | `coefficients[UNZIGZAG[i & 63] as usize & 63]` — the masks already prove the index; check is pure tax. ~362k symbols/1080p frame. |
-| Huffman LUT lookups | `src/decode/huffman.rs:40,75` | P1 | Index masked to `1<<LUT_BITS` — provably in range. |
-| Block `try_into().unwrap()` slicing | `src/decode/worker/immediate.rs:141,155` | P5 | `&[i16]`→`&[i16;64]` via pointer cast; ~49k/frame. |
-| `color_convert_line_*` scalar tails | `decoder.rs:1865-1876` (`.skip()` on 4-deep zip), `color_no_convert` `:1916-1924` (unwrap per byte) | P1, P4 | Arch kernels own the bulk; the tail zip + per-byte unwrap are the leftovers. |
-| Scalar IDCT fallback | `src/decode/idct.rs:377-390` | P1 | Only when SSSE3 absent — profile before touching. |
+| ~~**Upsampler row loops**~~ **DEAD — 0 exec** | `src/decode/upsampler.rs:188-192` (H2V1), `:257-263` (H2V2), `:222-224` (H1V2) | **P1** | 5 bounds checks per output pair; loop bounds `1..width-1` already prove all five. Densest bounds-check-per-byte site in the image crates. |
+| ~~**Per-scanline line-buffer alloc**~~ **DEAD — 0 exec** | `upsampler.rs:73` | **P2** | `vec![vec![0u8; …]; ncomp]` allocated + zeroed *per output row*, fully overwritten. Reuse or spare-capacity. |
+| ~~**Whole-frame output zeroing**~~ **DEAD — 0 exec** | `src/decode/worker/mod.rs:179`, `worker/rayon.rs:202` | **P2** | Full RGB frame `vec![0u8; …]` then every byte written. Precedent: `immediate.rs:60-107` recycled-plane memset skip with `RUSTY_JPEG_ABLATE=planezero` as A/B arm. |
+| ~~Coefficient stores in entropy decode~~ **DEAD — 0 checks emitted** | `src/decode/decoder.rs:1564,1592,1690,1714-1716` | P1 | `coefficients[UNZIGZAG[i & 63] as usize & 63]` — the masks already prove the index; check is pure tax. ~362k symbols/1080p frame. |
+| ~~Huffman LUT lookups~~ **negligible — 1 check** | `src/decode/huffman.rs:40,75` | P1 | Index masked to `1<<LUT_BITS` — provably in range. |
+| ~~Block `try_into().unwrap()` slicing~~ **negligible** | `src/decode/worker/immediate.rs:141,155` | P5 | `&[i16]`→`&[i16;64]` via pointer cast; ~49k/frame. |
+| ~~`color_convert_line_*` scalar tails~~ **DEAD — 0 exec** | `decoder.rs:1865-1876` (`.skip()` on 4-deep zip), `color_no_convert` `:1916-1924` (unwrap per byte) | P1, P4 | Arch kernels own the bulk; the tail zip + per-byte unwrap are the leftovers. |
+| ~~Scalar IDCT fallback~~ **DEAD — SSSE3 always present** | `src/decode/idct.rs:377-390` | P1 | Only when SSSE3 absent — profile before touching. |
 
-### rusty_jpeg — encoder
+### rusty_jpeg — encoder ✅ CLOSED 2026-08-02
 
 > **MEASURED 2026-08-02 — `get_block` is the one entry in the JPEG backlog that
 > was real, and the fix needed no `unsafe`.** It emits 23 bounds checks and is
@@ -154,14 +176,31 @@ Profiler buckets already exist (`src/encode/prof.rs:27-62`, `VP9_PROF2=1`).
 >
 > `quantize_zz` / `quantize_block_scalar` emits **zero** bounds checks, and the
 > AVX2/NEON twins own the path regardless — dead entry.
+>
+> **Closed out 2026-08-02.** Final tally for the JPEG backlog: **13 entries, 1
+> real.** Nine were dead (the code does not execute on the shipped path, or the
+> compiler had already elided the check), three were probed and landed inside
+> noise, and one — `get_block` — was genuine at ~13% of encode.
+>
+> **That one needed no `unsafe` either.** It went safe-Rust first (hoist the
+> dead edge clamps: 1.14x, byte-identical), then SIMD (`cvtepu8_epi16` for luma,
+> `maddubs` for the 4:2:0 chroma box filter: a further **1.25x**, z 4.20, gated
+> byte-for-byte over 81 encodes). Its double-run share then fell from a verdict
+> to the null floor.
+>
+> The real encoder win of the campaign was not on this list at all: the AC
+> zero-run scan, found by decomposing the residue rather than by reading code
+> for bounds checks (**1.28x**, z 3.36). Lesson recorded in
+> `~/.claude/skills/rusty-unsafe-optimizations` — read the emitted assembly
+> before trusting any entry in a list like this one.
 
 | Function | Location | Pattern(s) | Evidence |
 |---|---|---|---|
-| `get_block` box-average chroma | `src/encode/encoder.rs:1687-1717` | P1 | 4-deep nest, per-sample `.min()` clamp + bounds check; hoist clamp then unchecked. |
-| Row-padding loop | `encoder.rs:1323-1329` | P2 | `channel.push(channel[len-1])` per padding byte. |
-| `BitWriter` output | `src/encode/writer.rs:200,349,408` | P2 | spare-capacity + `set_len` on the output vec vs per-byte push. |
-| `HuffmanTable::get_for_value` | `src/encode/huffman.rs:230` | P1 | 256-entry LUT by u8 — check provably dead. |
-| `quantize_zz` scalar | `src/encode/quantization.rs:353,386` | P1 | AVX2/NEON twins + oracle tests already exist — extend the same seam. |
+| ~~`get_block` box-average chroma~~ ✅ **DONE — safe Rust + SIMD, 1.14x then 1.25x** | `src/encode/encoder.rs:1687-1717` | P1 | 4-deep nest, per-sample `.min()` clamp + bounds check; hoist clamp then unchecked. |
+| ~~Row-padding loop~~ **not pursued — below resolution** | `encoder.rs:1323-1329` | P2 | `channel.push(channel[len-1])` per padding byte. |
+| ~~`BitWriter` output~~ **REFUTED — probed, inside noise (z 0.26)** | `src/encode/writer.rs:200,349,408` | P2 | spare-capacity + `set_len` on the output vec vs per-byte push. |
+| ~~`HuffmanTable::get_for_value`~~ **negligible** | `src/encode/huffman.rs:230` | P1 | 256-entry LUT by u8 — check provably dead. |
+| ~~`quantize_zz` scalar~~ **DEAD — 0 checks; SIMD owns the path** | `src/encode/quantization.rs:353,386` | P1 | AVX2/NEON twins + oracle tests already exist — extend the same seam. |
 
 ### rusty_mp3 — decoder
 
@@ -385,12 +424,17 @@ pattern before Phase 0.
 5. **rusty_vp9 / P3 tile-column decode** — safe alternatives already refuted in writing; merge machinery exists.
 6. **rs_AV2ed P2 cluster** (GDF per-row alloc, per-TX `levels`, MC intermediates, encoder leaf allocs) + **`get_lo_ctx_2d_luma` stencil** (the B7a twin, −70% precedent).
 7. **rusty_av1d `rav1d_msac_decode_symbol_adapt_rust` (P1)** + **rusty_av1e `PlaneRegion` unchecked rows (P1)** — the two highest-leverage AV1 no-asm sites; gate baselines re-derived first.
-8. **rusty_jpeg upsamplers (P1) + per-scanline allocs (P2)** — two patterns, one file, dense per-byte cost.
+8. ~~**rusty_jpeg upsamplers (P1) + per-scanline allocs (P2)**~~ ✅ **CLOSED — DEAD.**
+   Both live in `compute_image`, which the planar output path returns before
+   reaching: `upsample_rows` counts **0/frame** on every ordinary colour JPEG.
+   The "dense per-byte cost" was real and never executed.
 9. **rusty_mp3 `BitReader::peek` u64 refill (P1/P5)** — sits under every Huffman codeword.
 10. **rusty_vp9 encoder P2 zeroed-scratch cluster** — precedent + A/B mechanism (`VP9_TX_MEMSET`) already in place.
 11. **rs_h264 post-forbid #1-#4**: encoder-native `MeCtx` (the proven ~25%-of-ME brick, generalized to the default build), `save_mb` reuse→P2, `load_mb` const-width copies (safe), `mb_ssd`. Precondition for decoder work: the 40.3%-glue tap session.
 12. **rusty-av1-toolkit P2** (wiener/SGR scratch, `get_satd` buf, 8-tap intermediates), **rusty_mp3 `polyphase` (P1)**.
-13. **rusty_jpeg entropy coefficient stores (P1)**, AAC quantize/codebook search (P1), vorbis vq loops, resample P1/P2.
+13. ~~**rusty_jpeg entropy coefficient stores (P1)**~~ ✅ **CLOSED — the compiler
+    had already elided them (0 `panic_bounds_check` emitted in `decode_block`).**
+    AAC quantize/codebook search (P1), vorbis vq loops, resample P1/P2 remain.
 14. **AudioFrame P5** — widest reach, but propose the representation change first.
 
 **Tier C — structural campaigns (own plans, not single bricks):**
