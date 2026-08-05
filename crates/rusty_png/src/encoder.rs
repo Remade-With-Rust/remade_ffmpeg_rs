@@ -587,7 +587,7 @@ fn write_chunk_io<W: Write>(
     name: chunk::ChunkType,
     data: &[u8],
 ) -> std::io::Result<()> {
-    w.write_all(&(data.len() as u32).to_be_bytes())?;
+    w.write_be(data.len() as u32)?;
     w.write_all(&name.0)?;
     w.write_all(data)?;
     let checksum = {
@@ -597,7 +597,7 @@ fn write_chunk_io<W: Write>(
         crc.update(data);
         crc.finalize()
     };
-    w.write_all(&checksum.to_be_bytes())?;
+    w.write_be(checksum)?;
     Ok(())
 }
 
@@ -830,11 +830,14 @@ impl<W: Write> Writer<W> {
         // does fire. Giving it up would make incompressible images ~37% larger,
         // which is not a trade worth a few ms.
         //
-        // Parallel DEFLATE is excluded too, and this one is easy to get wrong:
-        // it joins its workers' blocks into one buffer, so it cannot stream —
-        // and because the check below sits in front of the `match`, forgetting
-        // it here would silently route every multi-threaded encode down the
-        // serial path and disable a 2.11-3.06x feature without failing a test.
+        // Parallel DEFLATE streams too. It builds `[header] [blocks in order]
+        // [Adler-32]`, none of which needs the total compressed size, so its
+        // workers' output can go straight out as each one is joined. NOTE that
+        // this check sits in FRONT of the `match` below: whatever it lets
+        // through never reaches the match arms, so a config handled here must
+        // be handled *correctly* here — routing a multi-threaded encode into
+        // the serial branch would silently disable a 2.11-3.06x feature without
+        // failing a test, because the output would still be valid.
         #[cfg(feature = "parallel")]
         let par_active = self.options.par_threads > 1
             && crate::pardeflate::block_count((in_len + 1) * height, self.options.par_threads) > 1;
@@ -842,13 +845,43 @@ impl<W: Write> Writer<W> {
         let par_active = false;
 
         let can_stream_idat = !matches!(self.info.compression, Compression::Fast)
-            && !par_active
             && (self.info.frame_control.is_none()
                 || self.should_skip_frame_control_on_default_image());
 
         if can_stream_idat {
             let mut current = vec![0; in_len];
             let mut sink = IdatStreamer::new(&mut self.w);
+
+            #[cfg(feature = "parallel")]
+            if par_active {
+                // The block splitter needs the whole filtered image up front,
+                // so this one buffer stays. Filtering is 0.2-4% of encode, so
+                // keeping it serial costs nothing measurable.
+                let mut filtered = Vec::with_capacity((in_len + 1) * height);
+                for line in data.chunks(in_len) {
+                    let filter_type = {
+                        crate::prof_scope!(crate::prof::ENC_FILTER);
+                        filter(filter_method, adaptive_method, bpp, prev, line, &mut current)
+                    };
+                    filtered.push(filter_type as u8);
+                    filtered.extend_from_slice(&current);
+                    prev = line;
+                }
+                {
+                    crate::prof_scope!(crate::prof::ENC_DEFLATE);
+                    crate::pardeflate::compress_parallel_to(
+                        &mut sink,
+                        &filtered,
+                        in_len + 1,
+                        self.info.compression.to_level(),
+                        self.options.par_threads,
+                    )?;
+                }
+                sink.finish()?;
+                self.increment_images_written();
+                return Ok(());
+            }
+
             {
                 let mut zlib = ZlibEncoder::new(&mut sink, self.info.compression.to_options());
                 for line in data.chunks(in_len) {

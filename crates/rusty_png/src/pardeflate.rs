@@ -95,47 +95,79 @@ pub fn compress_parallel(
     level: u32,
     threads: usize,
 ) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(filtered.len() / 2 + 1024);
+    compress_parallel_to(&mut out, filtered, row_stride, level, threads)?;
+    Ok(out)
+}
+
+/// [`compress_parallel`] writing straight to `w` instead of returning a `Vec`.
+///
+/// The layout this module builds — `[header] [blocks in order] [Adler-32]` —
+/// needs nothing that depends on the total compressed size: the header is a
+/// function of `level` alone and the checksum is over the *uncompressed* input.
+/// So the whole stream can go out as it is produced.
+///
+/// That matters because the returning form made **three** full-size copies of
+/// the compressed data: each worker's own `Vec`, then a `raw` buffer
+/// concatenating all of them, then `assemble` copying `raw` again to put two
+/// header bytes in front. With the encoder's own copy into the writer on top,
+/// a parallel encode held roughly four copies of the compressed stream at once.
+/// Here the workers' buffers are the only ones, and each is dropped the moment
+/// it has been written.
+pub fn compress_parallel_to<W: Write>(
+    w: &mut W,
+    filtered: &[u8],
+    row_stride: usize,
+    level: u32,
+    threads: usize,
+) -> std::io::Result<()> {
     let rows = filtered.len() / row_stride;
     let nblocks = block_count(filtered.len(), threads);
 
+    w.write_all(&zlib_header(level))?;
+
     if nblocks <= 1 {
-        // Serial path — identical output to the ordinary encoder.
-        let mut e = DeflateEncoder::new(Vec::new(), Compression::new(level));
+        // Serial path — identical bytes to the ordinary encoder.
+        let mut e = DeflateEncoder::new(&mut *w, Compression::new(level));
         e.write_all(filtered)?;
-        let raw = e.finish()?;
-        return Ok(assemble(&raw, level, adler32(filtered)));
+        e.finish()?;
+    } else {
+        let rows_per = rows.div_ceil(nblocks);
+        let mut ranges = Vec::with_capacity(nblocks);
+        let mut r0 = 0usize;
+        while r0 < rows {
+            let r1 = (r0 + rows_per).min(rows);
+            ranges.push((r0 * row_stride, r1 * row_stride));
+            r0 = r1;
+        }
+        let last = ranges.len() - 1;
+
+        // Scoped threads: the block count is small and bounded, and this keeps
+        // the crate free of a work-stealing runtime it does not otherwise need.
+        //
+        // Workers are joined IN ORDER and each block is written and dropped as
+        // it arrives. Joining in order is not a scheduling constraint — the
+        // threads all run concurrently regardless — it is what lets the bytes
+        // leave in stream order without staging them somewhere first.
+        std::thread::scope(|s| -> std::io::Result<()> {
+            let handles: Vec<_> = ranges
+                .iter()
+                .enumerate()
+                .map(|(i, &(a, b))| {
+                    let chunk = &filtered[a..b];
+                    s.spawn(move || compress_block(chunk, level, i == last))
+                })
+                .collect();
+            for h in handles {
+                let part = h.join().unwrap()?;
+                w.write_all(&part)?;
+            }
+            Ok(())
+        })?;
     }
 
-    let rows_per = rows.div_ceil(nblocks);
-    let mut ranges = Vec::with_capacity(nblocks);
-    let mut r0 = 0usize;
-    while r0 < rows {
-        let r1 = (r0 + rows_per).min(rows);
-        ranges.push((r0 * row_stride, r1 * row_stride));
-        r0 = r1;
-    }
-    let last = ranges.len() - 1;
-
-    // Scoped threads: the block count is small and bounded, and this keeps the
-    // crate free of a work-stealing runtime it does not otherwise need.
-    let mut parts: Vec<std::io::Result<Vec<u8>>> = Vec::new();
-    std::thread::scope(|s| {
-        let handles: Vec<_> = ranges
-            .iter()
-            .enumerate()
-            .map(|(i, &(a, b))| {
-                let chunk = &filtered[a..b];
-                s.spawn(move || compress_block(chunk, level, i == last))
-            })
-            .collect();
-        parts = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    });
-
-    let mut raw = Vec::with_capacity(filtered.len() / 2 + 1024);
-    for p in parts {
-        raw.extend_from_slice(&p?);
-    }
-    Ok(assemble(&raw, level, adler32(filtered)))
+    w.write_all(&adler32(filtered).to_be_bytes())?;
+    Ok(())
 }
 
 /// One block as RAW DEFLATE. Non-final blocks end with `Full`, which closes the
@@ -188,9 +220,12 @@ fn compress_block(chunk: &[u8], level: u32, is_last: bool) -> std::io::Result<Ve
     Ok(out)
 }
 
-/// Wrap raw DEFLATE in a zlib container: 2-byte header + data + big-endian
-/// Adler-32 of the uncompressed input.
-fn assemble(raw: &[u8], level: u32, adler: u32) -> Vec<u8> {
+/// The 2-byte zlib container header for `level`.
+///
+/// Split out from the old `assemble` so it can be written before the blocks
+/// exist: it depends only on the level, which is why the stream is emittable
+/// front-to-back at all.
+fn zlib_header(level: u32) -> [u8; 2] {
     // CMF: deflate, 32 KiB window. FLG: level hint + check bits so
     // (CMF<<8 | FLG) % 31 == 0.
     let cmf = 0x78u8;
@@ -205,12 +240,7 @@ fn assemble(raw: &[u8], level: u32, adler: u32) -> Vec<u8> {
     if rem != 0 {
         flg += (31 - rem) as u8;
     }
-    let mut out = Vec::with_capacity(raw.len() + 6);
-    out.push(cmf);
-    out.push(flg);
-    out.extend_from_slice(raw);
-    out.extend_from_slice(&adler.to_be_bytes());
-    out
+    [cmf, flg]
 }
 
 #[cfg(test)]

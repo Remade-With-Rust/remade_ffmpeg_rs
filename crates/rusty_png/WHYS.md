@@ -461,3 +461,56 @@ that will actually receive the fix.
    emitting a chunk would scatter short IDATs through the stream. It forwards to
    the inner writer and nothing else — the trailing partial chunk goes out in
    `finish`, which is explicit because `Drop` cannot report an I/O error.
+
+---
+
+## Streamed IDAT, part 2: the parallel path
+
+The previous entry left parallel DEFLATE on the buffered path, on the grounds
+that it "joins its workers' blocks into one buffer". That was true but it was
+not a reason — the join was itself avoidable.
+
+The layout this module builds is `[header] [blocks in order] [Adler-32]`. The
+header is a function of `level` alone and the checksum is over the
+*uncompressed* input, so **nothing in the stream depends on the total compressed
+size** and the whole thing can go out front-to-back. Workers are joined in
+order and each block is written and dropped as it arrives — joining in order is
+not a scheduling constraint (the threads run concurrently either way), it is
+what lets the bytes leave in stream order without staging them first.
+
+What was actually there was worse than one buffer. The returning form made
+**three** full-size copies of the compressed data:
+
+1. each worker's own `Vec`,
+2. `raw`, concatenating all of them,
+3. `assemble`, copying `raw` again to put two header bytes in front,
+
+and the encoder then copied the result into the writer. `assemble` is now
+`zlib_header`, returning `[u8; 2]`, and (2) and (3) are gone. The workers'
+buffers remain — bounding those means bounding concurrency, which is the
+feature.
+
+| | |
+|---|---|
+| peak memory, `-threads 4/8` | **-8% to -11%** (park_joy 95.2 -> 84.5 MB) |
+| IDAT payload | **byte-identical at 2, 4 and 8 threads** (sha256 match) |
+| speed, cycles and wall | **inside a ±9% null-arm floor — not claimed** |
+
+### The measurement notes, because two instruments lied first
+
+- The standing harness **pins to one core**. That is right for every
+  single-core comparison in this project and wrong here: it ran all eight
+  workers on one core. The A/B stayed controlled (both arms pinned alike) but
+  the wall figures described nothing real.
+- `Start-Process -Wait` reported ~1010 ms for four images of very different
+  sizes. A number that does not move with the work is the instrument, not the
+  result. `-PassThru` + `WaitForExit` gave 245-324 ms and tracked image size.
+- Unpinned, streamed looked 1.017-1.073x faster on 4/4 images — then the
+  **null arm** (same binary in both slots) spread 0.966-1.089x. The effect was
+  smaller than the floor, so it is recorded as no result. Its absolute times
+  also drifted from the treatment run's, which is the reason to run one.
+
+**Standing tally for this whole sweep: six speed hypotheses, six results inside
+noise; three memory results, all measurable and reproducible.** Peak working set
+for a level-6 encode went 101.0 -> 57.8 MB serial and 95.2 -> 84.5 MB parallel.
+The encoder was never spending its time where the space was being wasted.
