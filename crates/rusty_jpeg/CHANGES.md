@@ -4,6 +4,26 @@ Everything this fork does differently from upstream `jpeg-decoder` 0.3.2 and
 `jpeg-encoder` 0.7.0. Keep this current — it is what makes re-syncing with
 upstream possible.
 
+## 0.3.1
+
+README only — no code change. crates.io bakes the README into the published
+version, so 0.3.0 shipped a page that described the wrong measurement method and
+had two sections missing.
+
+- The methodology prose said "best-of-N with the arms alternated". These are
+  **paired win-rates with z-scores at N >= 31**, which is a different estimator —
+  and best-of-N is precisely the one that produced the retracted 1.19-1.45x
+  claims. Now stated correctly, with the N-trend that shows why it matters.
+- The content description applied the decode fixture to both halves. Encode is
+  measured on a 40-frame 1080p clip at ~680 KB/frame; decode on a 1/f-fractal
+  still stream-copied to 300 frames. Two fixtures on purpose — and mislabelling
+  them is the exact error that let a trellis cost figure ship 46x wrong.
+- **Restores the "Compression, not just speed" and speed-provenance sections**,
+  lost to a regex edit in the 0.2.x series. The compression story — chroma
+  box-averaging at -17.12% BD-rate, and the two opt-in size/speed trades — is
+  arguably this crate's better claim, and it had silently vanished from the
+  front page.
+
 ## 0.3.0
 
 Two byte-identical encoder wins — and a corrected standing that is the reason
