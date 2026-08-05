@@ -1648,6 +1648,18 @@ const OPTIMIZE_BUFFER_BUDGET: usize = 256 * 1024 * 1024;
 
 /// `RUSTY_JPEG_ARM=pointsample` restores the old point-sampling downsampler,
 /// so the two can be compared in one binary. Resolved once, not per block.
+/// `RUSTY_JPEG_ARM=slowblock` forces the general clamped path — the A/B arm for
+/// the interior fast path, and the oracle it is gated against.
+fn slow_get_block() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RUSTY_JPEG_ARM")
+            .map(|v| v == "slowblock")
+            .unwrap_or(false)
+    })
+}
+
 fn point_sample_chroma() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -1697,6 +1709,55 @@ fn get_block(
     let n = (col_stride * row_stride) as u32;
     let half = n / 2;
     let height = data.len() / width;
+
+    // Interior fast path.
+    //
+    // The clamps below exist only for blocks that overhang the right or bottom
+    // edge. For every other block they are loop-invariant and dead — but they
+    // also stop the compiler proving the index, so each of the 256 samples of a
+    // 4:2:0 chroma block paid a `min` AND a bounds check. Hoisting the edge test
+    // to the block level turns that into two slice checks per row.
+    //
+    // `RUSTY_JPEG_ARM=slowblock` forces the general path, so the two can be A/B'd
+    // in one binary, and the general path stays as the oracle.
+    if !slow_get_block() && start_x + 8 * col_stride <= width && start_y + 8 * row_stride <= height
+    {
+        if col_stride == 2 && row_stride == 2 {
+            // 4:2:0 — the dominant case, worth its own straight-line body.
+            for y in 0..8 {
+                let iy = start_y + 2 * y;
+                let a = iy * width + start_x;
+                let b = a + width;
+                let r0 = &data[a..a + 16];
+                let r1 = &data[b..b + 16];
+                for x in 0..8 {
+                    let sum = r0[2 * x] as u32
+                        + r0[2 * x + 1] as u32
+                        + r1[2 * x] as u32
+                        + r1[2 * x + 1] as u32;
+                    block[y * 8 + x] = ((sum + 2) / 4) as i16 - 128;
+                }
+            }
+            return block;
+        }
+        for y in 0..8 {
+            let iy = start_y + y * row_stride;
+            for x in 0..8 {
+                let ix = start_x + x * col_stride;
+                let mut sum = 0u32;
+                for dy in 0..row_stride {
+                    let base = (iy + dy) * width + ix;
+                    let row = &data[base..base + col_stride];
+                    for &v in row {
+                        sum += v as u32;
+                    }
+                }
+                block[y * 8 + x] = ((sum + half) / n) as i16 - 128;
+            }
+        }
+        return block;
+    }
+
     for y in 0..8 {
         for x in 0..8 {
             let ix = start_x + (x * col_stride);

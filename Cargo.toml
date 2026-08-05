@@ -130,13 +130,12 @@ rff-auth = { path = "crates/rff-auth", version = "0.1.0" }
 # rav1e / rav1d), now published on crates.io AS `rusty_av1e` / `rusty_av1d`
 # (the packages were renamed for publication — upstream owns the rav1e/rav1d
 # names — so no `package =` alias is needed anymore). This removed rff's last
-# git dependencies: the whole tree is registry-resolvable. `default-features =
-# false` drops the `asm` feature (no nasm toolchain — the published crates also
-# fixed av-scenechange's force-enabled asm, so no-asm truly needs no nasm); the
-# decoder keeps both bit depths and the native safe Rust API — the decode path
-# stays 100% safe Rust (no FFI/unsafe in our tree). The registry versions are
-# toolkit MAIN (the merged no-asm fix + the prom_av1e content-dispatch tier),
-# ahead of the old b471be0 branch pin.
+# git dependencies: the whole tree is registry-resolvable. The workspace entry
+# stays `default-features = false` so wasm32 builds get the no-asm/no-threading
+# base; rff-codec-avif re-adds `asm` + `threading` for non-wasm targets (nasm
+# is installed locally and on all three CI legs via the h264-asm setup step).
+# The registry versions are toolkit MAIN (the merged no-asm fix + the
+# prom_av1e content-dispatch tier), ahead of the old b471be0 branch pin.
 rusty_av1e = { version = "0.8.0", default-features = false }
 rusty_av1d = { version = "1.2.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 # png: our own rusty_png — a performance fork of image-rs/image-png 0.17.16

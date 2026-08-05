@@ -179,6 +179,7 @@ pub fn compute_image_parallel(
         let mut image = vec![0u8; line_size * output_size.height as usize];
 
         for (row, line) in image.chunks_mut(line_size).enumerate() {
+            crate::prof::bump(crate::prof::Count::DecUpsampleRows, 1);
             upsampler.upsample_and_interleave_row(
                 &data,
                 row,

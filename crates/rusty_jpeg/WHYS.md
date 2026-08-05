@@ -1122,6 +1122,87 @@ straight line beats a correct branch. On a loop already at its essential cost,
 whether to skip is itself work, and it runs on every item including the ones
 that do not benefit.
 
+## D1g - the `unsafe-opportunities.md` JPEG backlog, priced by COUNTS
+
+Question: are the rusty_jpeg entries in `docs/plans/unsafe-opportunities.md` a
+real performance win? Answered almost entirely with deterministic counts; only
+the one survivor needed a clock.
+
+### The two counts that did the work
+
+**COUNT 1 - `upsample_rows` per frame: 0 planar / 1,080 packed.**
+`decode_planes` returns early for planar output and never reaches
+`compute_image`, which is where the upsampler, the whole-frame `vec![0u8; ..]`
+and the colour-convert tails all live. `rff-codec-jpeg` calls `decode_planar()`
+and only falls back to packed for greyscale/CMYK or exotic subsampling, so every
+ordinary 4:4:4 / 4:2:2 / 4:2:0 colour JPEG takes the planar path.
+
+That voids **four** decoder entries at once - including the document's headline
+P1, described there as "the densest bounds-check-per-byte site in the image
+crates". The description is CORRECT: `UpsamplerH2V1` emits 14 bounds checks and
+`H2V2` 12, more than any other function in the crate. It simply never runs.
+
+**COUNT 2 - bounds-check sites emitted per function** (`--emit asm`, counting
+`panic_bounds_check` call sites and attributing them by symbol range):
+
+| function | checks | verdict |
+|---|---:|---|
+| `UpsamplerH2V1` / `H2V2` | 14 / 12 | 0 executions on our path |
+| `encoder::get_block` | **23** | **hot: 13.05% of encode** |
+| `trellis::truncate_rd` | 10 | per block, but trellis is ~3% of encode |
+| `decode_block` | **0** | **the check is already elided** |
+| `quantize_block_scalar` | **0** | and AVX2/NEON own the path anyway |
+
+`decode_block` is the one that matters most. The document says of
+`coefficients[UNZIGZAG[i & 63] as usize & 63]`: *"the masks already prove the
+index; check is pure tax."* The first half is right and the second half does not
+follow - **because the masks prove it, LLVM already removed the check.** There
+is no tax to reclaim. Same for `quantize_block_scalar`.
+
+### What survived, and it is not an unsafe fix
+
+`get_block` - 23 checks and **13.05% of encode**, the largest named encoder
+stage (Entropy 8.31%, Quantize 3.68%, Fdct 2.47%). This is the chroma
+box-averaging added earlier in this campaign, and its per-sample
+`(iy+dy).min(height-1)` / `(ix+dx).min(width-1)` clamps are what block the
+compiler from proving the index - so each of the 256 samples of a 4:2:0 chroma
+block paid a `min` AND a bounds check.
+
+The clamps are **loop-invariant except for blocks overhanging the right or
+bottom edge**. Hoisting that test to the block level and slicing each row turns
+256 checks into 2 - in **safe Rust**, with no `unsafe` anywhere.
+
+- **GATE:** byte-identical encode across 6 contents x 5 qualities.
+- **MEASURED**, encode-only, best-of-N over 9 process runs, 1080p 4:2:0:
+
+  | arm | min | median | max |
+  |---|---:|---:|---:|
+  | interior fast path | **21.4 ms** | 21.7 | **22.5** |
+  | general clamped | **24.3 ms** | 26.3 | 30.0 |
+
+  **Non-overlapping ranges.** Conservative min-of-9 ratio **1.136x**; median
+  1.212x. Quote the min.
+
+- **INSTRUMENT NOTE.** The whole-process paired harness returned
+  "7/11, z 0.90, inside noise" on the same change, while its median (1.2100)
+  matched the encode-only median (1.2120) exactly. Its per-pair variance is
+  inflated by fixed setup and by `scanmode`'s second internal encode arm, both
+  identical across arms. The null arm read **1.0271 for identical code**, so the
+  floor is ~2.7%. When a win-rate and a median disagree this hard, check what the
+  harness is actually timing before believing either - here the effect is 3-8x
+  the floor and the ranges do not overlap.
+
+### The transferable
+
+**Four of the five named P1s were dead, and each died to a count rather than a
+clock.** Two were dead because the code does not execute on the path we use; two
+because the compiler had already done the optimization the document proposed.
+The single live one is a *redundant-work* problem that safe Rust fixes, not a
+bounds-check problem that needs `unsafe`.
+
+A backlog of `unsafe` opportunities is a list of HYPOTHESES about generated code.
+Reading the emitted assembly costs one command and refutes most of them.
+
 ---
 
 ## Standing rules for this descent

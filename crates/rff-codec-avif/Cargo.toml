@@ -19,5 +19,15 @@ rff-codec.workspace = true
 # AV1 encoder backing the AVIF encode path (rusty-av1-toolkit fork of rav1e).
 rusty_av1e.workspace = true
 # AV1 decoder backing the AVIF decode path (rusty-av1-toolkit fork of rav1d),
-# pure-Rust via its native safe Rust API (`rust_api`) — no FFI.
+# via its native safe Rust API (`rust_api`).
 rusty_av1d.workspace = true
+
+# Native targets get the full-speed AV1 build: nasm SIMD kernels + rayon
+# tile-threading (the same feature set video-tests/analyzer-av1 builds with;
+# CI already installs nasm on all three OS legs for the h264-asm path).
+# wasm32 stays on the base no-asm/no-threading build: the asm feature is
+# x86_64/aarch64-only, and rayon thread spawns panic on wasm at runtime
+# (same lesson as rusty_png's forced-serial DEFLATE).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusty_av1e = { workspace = true, features = ["asm", "threading"] }
+rusty_av1d = { workspace = true, features = ["asm"] }

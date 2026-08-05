@@ -43,48 +43,6 @@ as such: FFmpeg's PNG encoder is single-threaded for one image, which is the
 structural point, but it is never quoted as a per-core win. Per core we are
 still behind, and that row is kept directly above it.
 
-Both encode rows are true; they answer different questions, and the second is
-the one that flatters us least, so read that one as the codec comparison.
-
-- **The two encode numbers differ only in what FFmpeg is allowed to do.**
-  Against FFmpeg's *default* (`paeth`, zlib L6) we are at parity-to-faster and
-  smaller. But FFmpeg's `up` filter is cheaper than its `paeth`, so scoring our
-  `up` against its `paeth` quietly hands us the easier side. Matching the filter
-  **and** the size (within 0.3%), FFmpeg wins: 0.83×/0.90×/0.89× at
-  `Compression::Default`, 0.92×/0.69×/0.89× at `Best`. An earlier revision of
-  this file quoted only the flattering row; that was an operating-point error of
-  exactly the kind this project keeps catching in other people's benchmarks.
-- **Our shipped default is a different point again.** `Fast`/`Sub` is 6.0×
-  faster than FFmpeg's default and **+16.5% larger** — quoting *that* as a speed
-  win would price our missing bits as throughput.
-- **Decode is compared with identical work on both sides** — one process per
-  arm, same input, same job, output discarded on both. An earlier probe read the
-  *opposite* way (FFmpeg ahead) purely because it charged FFmpeg for process
-  launch, demux and file read while timing our side in-process with none of
-  those. A second bug had our arm decoding *twice* per iteration. Both are
-  recorded in `WHYS.md`; neither number is quoted here.
-
-### Where the time actually goes
-
-From the crate's own per-row stage profiler (`--features profile`), on real
-content. This is what set the optimisation order — and what ruled work *out*:
-
-| stage | photographic | graphics |
-|---|---|---|
-| **encode** `deflate` | **97.8–99.5%** | 94.3–99.0% |
-| encode `filter` | 0.2% | 0.5–3.0% |
-| **decode** `inflate` | **50.3–63.9%** | 7.5–27.6% |
-| **decode** `unfilter` | 30.0–40.5% | **53.7–66.3%** |
-| decode `transform` | 3.8–7.4% | 6.5–28.1% |
-
-At quality settings encode is **almost entirely DEFLATE** — so the PNG layer
-(filtering) is not worth optimising there, and the backend is. FFmpeg's encode
-is deflate-dominated too, by ablation against its own flags. (That ablation's
-*filter* term came out **negative** — it was differencing two ~1,200 Mcyc
-measurements to extract a ~10 Mcyc one, so only the deflate term is admissible.)
-
-Decode inverts on graphics: **unfiltering**, not inflate, is the majority there.
-
 ## Why the fork
 
 Two things upstream cannot address for a drop-in FFmpeg replacement:

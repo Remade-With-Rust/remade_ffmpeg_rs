@@ -367,7 +367,10 @@ dependencies = [
  "anyhow",
  "arg_enum_proc_macro",
  "arrayvec",
+ "cc",
+ "libc",
  "log",
+ "nasm-rs",
  "num-rational",
  "num-traits",
  "pastey",
@@ -3485,6 +3488,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ea1f30cedd69f0a2954655f7188c6a834246d2bcf1e315e2ac40c4b24dc9519"
 dependencies = [
  "cfg-if",
+ "rayon",
 ]
 
 [[package]]
@@ -3593,6 +3597,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "706bf8a5e8c8ddb99128c3291d31bd21f4bcde17f0f4c20ec678d85c74faa149"
 dependencies = [
+ "jobserver",
  "log",
 ]
 
@@ -5475,6 +5480,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cc",
  "cfg-if",
+ "nasm-rs",
  "parking_lot",
  "paste",
  "raw-cpuid",
@@ -5498,6 +5504,7 @@ dependencies = [
  "av1-grain",
  "bitstream-io",
  "built",
+ "cc",
  "cfg-if",
  "interpolate_name",
  "itertools 0.14.0",
@@ -5505,6 +5512,7 @@ dependencies = [
  "libfuzzer-sys",
  "log",
  "maybe-rayon",
+ "nasm-rs",
  "new_debug_unreachable",
  "noop_proc_macro",
  "num-derive",

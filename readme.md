@@ -12,7 +12,7 @@
 > Check out [FFAI](https://github.com/remade-with-rust/ffai), a sister project providing media for AI first world.
 
 > **Status — pre-1.0, and not yet independently audited.** APIs and codec
-> coverage are still moving; use it accordingly. See the
+> coverage are still moving, but nothing will ship that is not byte exact. See the
 > [security policy](SECURITY.md), the
 > [compatibility & patent matrix](docs/compatibility.md), and
 > [how to contribute](CONTRIBUTING.md).
@@ -41,35 +41,6 @@
 | PNG encode | 1.0× | **0.69–0.92× per core** at matched filter *and* size — behind, and we say so · **2.11–3.06× faster** wall-clock (block-parallel), at 0.1–0.2% *smaller* | → per-core parity |
 | License + embedding | LGPL/GPL · C FFI | **Apache-2.0 · pure Rust · no FFI** | — |
 
-<sub>Real numbers + how to reproduce them: [docs/benchmarks.md](docs/benchmarks.md). The VP9 decode figure is throughput on an i7-14650HX vs FFmpeg's native decoder. The VP9 encode figures are against `libvpx-vp9` at a **matched operating point** — both encoders in constant-quality mode at the same cq ladder, speed preset and lookahead, then read at **equal PSNR** — on the Derf CIF set (`video-tests/`, reproduce with `analyzer pareto`). Comparing default-to-default instead is meaningless here: the two default configurations differ in rate-control mode, operating point, speed preset and lookahead at once, which on 1080p put the two arms **72× apart in bitrate**. The two PNG encode figures answer different questions and both are given on purpose: PNG is lossless, so "faster" means nothing without fixing the output size, and the **per-core row is the codec comparison** — we are behind there, and the wall-clock row is a multi-core-vs-single-core figure (ffmpeg's PNG encoder is single-threaded for one image) that must never be read as a per-core win. Quoting our default against ffmpeg's default would show ~6× and would be dishonest: it compares our fast/large operating point against their slow/small one and prices our missing bits as speed.</sub>
-
-> **⚡ Performance spotlight — AAC encode, faster than the C.** Our in-house, pure-Rust
-> AAC-LC encoder went from 0.79× realtime to **449× realtime** — a **~570× throughput gain**
-> — landing **~6× faster than FFmpeg's own AAC encoder** (best-of-7, 60 s stereo @128k, 24
-> cores), while its bitstream stays **byte-identical** and FFmpeg decodes it at unity. The
-> wins, in the order profiling demanded them: an O(N²) MDCT replaced by an FFT (**940×** on
-> that stage), a two-phase rate loop, cached psychoacoustic tables, an **N/4-point-FFT MDCT**,
-> **AVX2** (+ opt-in AVX-512) quantize kernels — that reached single-thread parity — and
-> finally **frame-parallel encoding**, the structural move FFmpeg's single-threaded AAC can't
-> answer. Every step was gated **bit-exact against a kept scalar oracle**; the pure-safe
-> `--no-default-features` build passes the same tests. Not a benchmark we can't reproduce —
-> just the right algorithm, then the right hardware.
-
-> **⚡ Performance spotlight — Vorbis encode: the first pure-Rust Vorbis encoder, and it beats
-> libvorbis.** No permissively-licensed Vorbis *encoder* had ever existed in Rust — `lewton`
-> decodes, nothing encoded. This is the first, and in a profile-gated campaign it went from
-> **64× slower** than FFmpeg's libvorbis to **~5.3× faster** (stereo music, 24 cores, **~457×
-> realtime**), ffmpeg-decodable throughout. The levers, in the order the profiler demanded them:
-> an **N/4-point-FFT MDCT** (O(N²) → O(N log N), collapsing the transform from **46% of runtime
-> to 1%**), a **separable-lattice** VQ quantizer, **structure-of-arrays + AVX2** for the
-> residue-VQ nearest-neighbour search (**2.7×** on the classifier — the branch-split
-> *reformulation*, not the intrinsics, was most of it) — all **byte-identical** — and finally an
-> **energy-bucket class shortlist** (trial the RD-likely residue classes, not all ten), the one
-> lever that changes the bitstream and so is gated **perceptually**: **PEAQ-neutral** (ΔODG ≤
-> 0.03 vs the exhaustive search, on a CC0/PD music corpus) for a further **~1.5×**. Together they
-> closed single-thread from **4.7× → ~1.4×** behind libvorbis; the parallel win is one FFmpeg's
-> single-threaded encoder can't answer. `--no-default-features` stays a 100%-safe scalar build.
-
 > **⚡ Performance spotlight — Opus encode: faster than `libopus` per core, on speech *and*
 > music.** Opus uses our own **[rusty-opus](https://github.com/Remade-With-Rust/rusty-opus)** —
 > a pure-Rust fork of `opus-rs` with **three byte-identical AVX2 SILK kernels** (LPC
@@ -81,17 +52,6 @@
 > pulled each 20 ms frame off the **front** of that buffer, an **O(n²)** memmove per frame. A
 > cursor-and-single-drain fix cut single-thread encode **4.7×** (full transcode 3.4×) and
 > flipped us from *behind* `libopus` to **ahead** of it.
->
-> **Fresh head-to-head, single-thread — both encoders on one core (the fair codec comparison),**
-> full-CLI wall-clock, best-of-7, real synthesized speech (SILK/Hybrid) + music (CELT):
->
-> | config | ours · 1-thread | `libopus` · 1-thread | ours · frame-parallel |
-> |---|---:|---:|---:|
-> | 8 kHz VoIP @16k · speech | **0.116s (1.06×)** | 0.123s | 0.054s |
-> | 16 kHz VoIP @24k · speech | **0.168s (1.07×)** | 0.179s | 0.068s |
-> | 48 kHz Hybrid @32k · speech | **0.046s (1.39×)** | 0.064s | 0.047s |
-> | 48 kHz stereo Audio @128k · music | **0.175s (1.46×)** | 0.255s | 0.074s |
-> | 44.1 kHz stereo Audio @128k · music | **0.196s (1.33×)** | 0.260s | 0.100s |
 
 ---
 
@@ -141,8 +101,26 @@ safer.
 
 ### Codecs & formats (growing)
 
-See [docs/ffmpeg-parity.md](docs/ffmpeg-parity.md) for the full FFmpeg
-tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
+| Codec | Backing crate | License | Pure Rust |
+|---|---|---|---|
+| AV1 encode (avif) | [`rusty_av1e`](https://github.com/Remade-With-Rust/rusty-av1-toolkit) | BSD-2-Clause | ✅ (our rav1e fork; pure-Rust, no asm) |
+| AV1 decode (avif) | [`rusty_av1d`](https://github.com/Remade-With-Rust/rusty-av1-toolkit) | BSD-2-Clause | ✅ (our rav1d fork; Rust port of dav1d) |
+| H.264 decode/encode | [`rusty_h264`](https://crates.io/crates/rusty_h264) | BSD-2-Clause | ✅ (vendored asm, no C; default needs `nasm`) |
+| VP9 decode/encode | **in-house** ([`rusty_vp9`](https://crates.io/crates/rusty_vp9)) | Apache-2.0 | ✅ (bit-exact vs all 315 libvpx vectors; standalone crate) |
+| AAC decode/encode | **in-house** ([`rusty_aac`](https://crates.io/crates/rusty_aac)) | Apache-2.0 | ✅ (AAC-LC; frame-parallel encoder; standalone crate) |
+| MP3 decode/encode | **in-house** ([`rusty_mp3`](https://crates.io/crates/rusty_mp3)) | Apache-2.0 | ✅ (decoder bit-exact vs FFmpeg; standalone crate) |
+| PNG encode/decode | **in-house** ([`rusty_png`](https://crates.io/crates/rusty_png)) | MIT OR Apache-2.0 | ✅ (performance fork of `image-rs/image-png`; pure-Rust `zlib-rs` DEFLATE, parallel encode; standalone crate) |
+| JPEG decode/encode | **in-house** ([`rusty_jpeg`](https://crates.io/crates/rusty_jpeg)) | (MIT OR Apache-2.0) AND IJG | ✅ (vendored merge of `jpeg-decoder` + `jpeg-encoder`; baseline + progressive; standalone crate) |
+| GIF encode/decode | [`gif`](https://crates.io/crates/gif) | MIT/Apache-2.0 | ✅ |
+| WebP encode/decode | [`image-webp`](https://crates.io/crates/image-webp) | MIT/Apache-2.0 | ✅ |
+| Opus encode/decode | [`rusty-opus`](https://crates.io/crates/rusty-opus) (our `opus-rs` fork) | BSD-3-Clause | ✅ (AVX2 SILK + frame-parallel; pure Rust, no C/FFI) |
+| Vorbis decode | [`lewton`](https://crates.io/crates/lewton) | MIT/Apache-2.0 | ✅ |
+| Vorbis encode | **in-house** ([`rusty_vorbis`](https://crates.io/crates/rusty_vorbis)) | Apache-2.0 | ✅ (first permissive Rust Vorbis encoder; standalone crate) |
+| FLAC decode | [`claxon`](https://crates.io/crates/claxon) | Apache-2.0 | ✅ |
+| FLAC encode | **in-house** (`rff-codec-flac`) | Apache-2.0 | ✅ (lossless, no dep) |
+| JPEG XL decode | [`jxl-oxide`](https://crates.io/crates/jxl-oxide) | MIT/Apache-2.0 | ✅ |
+
+**Codec backends — every one is 100% Rust (no C/C++ FFI) and permissively licensed.** Container (de)muxers are our own code. See [docs/pure-rust-codecs.md](docs/pure-rust-codecs.md) for the full vetted survey (what's clean, what's license-blocked, what has no pure-Rust option).
 
 | Kind | Supported | Status |
 |---|---|---|
@@ -167,30 +145,6 @@ tool/library parity map, the top-10 global-codec scorecard, and scope decisions.
 | Container | **avi** (Audio Video Interleaved) | **demux + mux** (RIFF/`hdrl`/`movi`/`idx1`) |
 | Container | **mp4** / **mov** (ISOBMFF) | **demux + mux** — sample tables; **A/V**: AV1 (`av01`/`av1C`) or H.264 (`avc1`/`avcC`) video + Opus audio (`dOps`); **AAC `esds` config (demux + mux)** so `rff -i in.wav out.m4a` writes a playable AAC MP4 |
 | Container | **matroska** / **webm** (EBML) | **demux** — track tree + Cluster/(Simple)Block packets; AV1/H.264 video + Opus/Vorbis/AAC/FLAC audio |
-
-**Codec backends — every one is 100% Rust (no C/C++ FFI) and permissively licensed.** Container (de)muxers are our own code. See [docs/pure-rust-codecs.md](docs/pure-rust-codecs.md) for the full vetted survey (what's clean, what's license-blocked, what has no pure-Rust option).
-
-| Codec | Backing crate | License | Pure Rust |
-|---|---|---|---|
-| AV1 encode (avif) | [`rusty_av1e`](https://github.com/Remade-With-Rust/rusty-av1-toolkit) | BSD-2-Clause | ✅ (our rav1e fork; pure-Rust, no asm) |
-| AV1 decode (avif) | [`rusty_av1d`](https://github.com/Remade-With-Rust/rusty-av1-toolkit) | BSD-2-Clause | ✅ (our rav1d fork; Rust port of dav1d) |
-| H.264 decode/encode | [`rusty_h264`](https://crates.io/crates/rusty_h264) | BSD-2-Clause | ✅ (vendored asm, no C; default needs `nasm`) |
-| VP9 decode/encode | **in-house** ([`rusty_vp9`](https://crates.io/crates/rusty_vp9)) | Apache-2.0 | ✅ (bit-exact vs all 315 libvpx vectors; standalone crate) |
-| AAC decode/encode | **in-house** ([`rusty_aac`](https://crates.io/crates/rusty_aac)) | Apache-2.0 | ✅ (AAC-LC; frame-parallel encoder; standalone crate) |
-| MP3 decode/encode | **in-house** ([`rusty_mp3`](https://crates.io/crates/rusty_mp3)) | Apache-2.0 | ✅ (decoder bit-exact vs FFmpeg; standalone crate) |
-| PNG encode/decode | **in-house** ([`rusty_png`](https://crates.io/crates/rusty_png)) | MIT OR Apache-2.0 | ✅ (performance fork of `image-rs/image-png`; pure-Rust `zlib-rs` DEFLATE, parallel encode; standalone crate) |
-| JPEG decode/encode | **in-house** ([`rusty_jpeg`](https://crates.io/crates/rusty_jpeg)) | (MIT OR Apache-2.0) AND IJG | ✅ (vendored merge of `jpeg-decoder` + `jpeg-encoder`; baseline + progressive; standalone crate) |
-| GIF encode/decode | [`gif`](https://crates.io/crates/gif) | MIT/Apache-2.0 | ✅ |
-| WebP encode/decode | [`image-webp`](https://crates.io/crates/image-webp) | MIT/Apache-2.0 | ✅ |
-| Opus encode/decode | [`rusty-opus`](https://crates.io/crates/rusty-opus) (our `opus-rs` fork) | BSD-3-Clause | ✅ (AVX2 SILK + frame-parallel; pure Rust, no C/FFI) |
-| Vorbis decode | [`lewton`](https://crates.io/crates/lewton) | MIT/Apache-2.0 | ✅ |
-| Vorbis encode | **in-house** ([`rusty_vorbis`](https://crates.io/crates/rusty_vorbis)) | Apache-2.0 | ✅ (first permissive Rust Vorbis encoder; standalone crate) |
-| FLAC decode | [`claxon`](https://crates.io/crates/claxon) | Apache-2.0 | ✅ |
-| FLAC encode | **in-house** (`rff-codec-flac`) | Apache-2.0 | ✅ (lossless, no dep) |
-| JPEG XL decode | [`jxl-oxide`](https://crates.io/crates/jxl-oxide) | MIT/Apache-2.0 | ✅ |
-
-"Scaffolded" = registered and wired through the engine, CLI and server; the
-bitstream body is the next implementation step. More codecs/containers to come.
 
 ## Install
 

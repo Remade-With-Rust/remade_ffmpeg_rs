@@ -36,66 +36,6 @@ badly, so this one is calibrated to real photographic coefficient density.
 | **Encode** | **1.19× faster (16%)** | at matched output size |
 | **Decode** | **~1.04× faster (4%)** | paired ABBA, N=15, 3000-frame arms, median 1.0390 |
 
-Both numbers are deliberately unflattering to us where the methodology allows a
-choice:
-
-- **Encode** is compared at **matched output size**, not matched `-q:v`. At
-  equal `-q:v` our files are 41% larger, which is a different operating point
-  and would price our extra bits as speed. Ours at `-q:v 5` is 27.17 MB against
-  FFmpeg's 28.04 MB at `-q:v 3` — we are *slightly smaller* and still faster.
-  Both run fixed Huffman tables in one pass, because our CLI defaults to
-  optimized tables (two passes) and FFmpeg's does not; comparing defaults would
-  price our better compression as a speed loss.
-- **Decode** is compared on a **byte-identical bitstream** — the reference clip
-  is stream-copied from the exact fixture and `cmp`-gated before timing, after
-  an earlier harness was caught feeding FFmpeg a 2.67× smaller file. Arms are
-  3000 frames (~18 s) each, because at 2 s the per-run transients swamped the
-  effect. The quoted figure is the **paired** one: single-instrument medians read
-  1.072 for the same build, and the paired test has been the conservative and
-  reproducible number every time, so that is what we publish.
-
-### Compression, not just speed
-
-- **Chroma is box-averaged on downsample.** Point-sampling — taking one of every
-  four chroma samples — aliases detail above the subsampled Nyquist into the
-  baseband, and no bitrate recovers it. BD-rate **-17.12%** on chroma-detailed
-  content, **+2.30 dB** on saturated chroma edges, neutral on smooth photos.
-- **Trellis quantization** (on by default) picks each block's EOB position with
-  a real rate model, then lowers coefficient magnitudes where the bits saved
-  outweigh the distortion: **-2.51% mean BD-rate** across six content types,
-  for about +3% encode time.
-
-Both are gated on a corpus BD-rate across 5 quality points and 3 content types
-plus an ffmpeg round-trip — never a single operating point.
-
-### Where the decode speed comes from, all gated on byte-identical output:
-
-- an **AVX2 forward-DCT + quantize** kernel in the encoder;
-- an **AVX2 IDCT that transforms two 8×8 blocks per instruction stream**
-  (block A in the low 128-bit lane, block B in the high one — every op involved
-  is lane-independent, so it is byte-identical to running the SSSE3 kernel
-  twice, which a 64-round oracle test asserts). Worth 7.8% of whole decode;
-- a **whole-block DC-only shortcut** ahead of the SIMD dispatch (~31% of blocks
-  on photographic content have no AC energy);
-- the fused path is reached through a **concrete, inlinable** call resolved once
-  per MCU rather than a `dyn` dispatch per block — worth 5.4% of whole decode,
-  mostly because it lets the transform dispatch inline into the decode loop;
-- **entropy decode fused into the IDCT**: a baseline interleaved scan transforms
-  each block the moment it is decoded, rather than accumulating an MCU row of
-  coefficients first. That row buffer existed only to ship work to another
-  thread, and cost a write → zero → read round trip of ~18.8 MB per 1080p frame
-  through a buffer too large for L1;
-- **buffered entropy reads with a bulk 8-byte refill**, and **recycled** output
-  planes;
-- **no rayon.** Upstream `jpeg-decoder` enables it by default; measured here it
-  is a net loss at **every** image size — 1.32× slower at 640×480, **1.91×** at
-  1920×1080, 1.32× at 3840×2160. The fork-join costs more than the parallelism
-  it buys within a single frame.
-
-`Decoder::set_single_threaded(true)` selects the synchronous worker, which uses
-**~38% less CPU** than the threaded one; the threaded default is still the
-faster choice in wall-clock on a multi-core box (6.97 vs 7.96 ms/frame).
-
 ## Why merge them
 
 Holding the two halves in one crate buys three things the separate crates
