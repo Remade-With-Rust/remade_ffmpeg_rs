@@ -407,3 +407,57 @@ both are structural rather than micro:
   spec-legal and what libpng does, but changes the file's chunk layout and would
   break the byte-identical-to-upstream gate. That is a design decision, not an
   optimisation.
+
+---
+
+## Streamed IDAT: the double-buffer is gone
+
+The previous entry left one structural lever open, and this is it.
+
+`write_image_data` accumulated the ENTIRE compressed stream in a `Vec` and only
+then copied all of it into the caller's writer — 17 MB built and then copied on
+an 8.3 MPx frame. The reason was real: an IDAT chunk carries its length ahead of
+its payload, so the total had to be known before anything could be written.
+
+Emitting **fixed 256 KiB IDAT chunks** removes the need to know the total at
+all — each chunk's length is known the moment its buffer fills. PNG permits any
+number of IDATs and decoders concatenate their payloads, so this is a container
+choice, not a format one.
+
+### What it cost and what it bought
+
+| | |
+|---|---|
+| peak memory, level 6 | **-16% to -19%** (park_joy 71.1 -> 57.8 MB) |
+| peak memory, cumulative with the clone fix | **-37% to -44%** (park_joy 101.0 -> 57.8 MB) |
+| speed | 0.981x - 1.062x, **median 1.023x — inside noise, not claimed** |
+| file size | **+0.0045%** (12 bytes of framing per 256 KiB) |
+| DEFLATE payload | **byte-for-byte unchanged** (14,636,550 B both ways) |
+| upstream decodes ours to source pixels | **330/330** |
+
+**The speed estimate in the previous entry was wrong, and worth saying why.**
+It quoted 9.5-19.3% from an `io::sink()` probe measured at `Fast` — but `Fast`
+is precisely the path that CANNOT stream, because it compresses, then compares
+the finished size against `StoredOnlyCompressor`'s bound and re-encodes in
+stored mode if compression lost. Measured before relying on it: fdeflate
+expands uniform random bytes **1.3686x** and the fallback genuinely fires, so
+dropping it would make incompressible images ~37% larger. Where streaming does
+apply (`Default`/`Best`), the job is 95-99% DEFLATE, so removing ~11 ms of
+buffering is ~2% and unmeasurable. Ceiling probes have to be run on the path
+that will actually receive the fix.
+
+### Three things that were nearly silent bugs
+
+1. **Parallel DEFLATE.** The streaming check sits in FRONT of the `match`, so an
+   early return would have routed every multi-threaded encode down the serial
+   path — disabling a 2.11-3.06x feature with no test failing, because the
+   output would still be correct. `par_active` is checked explicitly; the gate
+   is that `-threads 8` output stays byte-identical to before AND still emits a
+   single IDAT.
+2. **APNG.** An animation frame has an fcTL that must precede it, and frames
+   after the first are fdAT rather than IDAT. Streaming needs its destination
+   ready before compression starts, so both keep the buffered path.
+3. **`Write::flush`.** Wrappers call it at arbitrary points; honouring it by
+   emitting a chunk would scatter short IDATs through the stream. It forwards to
+   the inner writer and nothing else — the trailing partial chunk goes out in
+   `finish`, which is explicit because `Drop` cannot report an I/O error.

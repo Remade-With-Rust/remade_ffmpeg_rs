@@ -81,10 +81,20 @@ Two things upstream cannot address for a drop-in FFmpeg replacement:
    (0.5312–0.9790) with **nothing in between** — taking that corpus from
    **+115.6% to −6.1%** vs FFmpeg while leaving photographs byte-identical.
 
-Every change is gated: the fork is **byte-identical to upstream `png` 0.17.16**
-across **600 comparisons** (20 images × 30 configurations, encode bytes *and*
-decoded pixels), and the full upstream test suite — pngsuite conformance
-included — runs green.
+Every change is gated against upstream `png` 0.17.16, and since **streamed IDAT**
+landed the gate reports two properties separately rather than one verdict:
+
+- **Upstream decodes our output to the source pixels: 330/330.** This is the
+  property that must never break, and it holds everywhere.
+- **Encode bytes identical to upstream: 190/330.** The 140 that differ are
+  `Default`/`Best` on images whose compressed stream exceeds one 256 KiB chunk —
+  we emit a run of IDATs where upstream emits one. `Fast` is byte-identical on
+  every image, and so is anything small enough to fit a single chunk.
+
+The DEFLATE payload itself is unchanged — on a 14.6 MB stream the concatenated
+IDAT contents are byte-for-byte what upstream produces; only the chunk framing
+differs, at a cost of **+0.0045%** file size. The full upstream test suite —
+pngsuite conformance included — runs green.
 
 ## Decode
 

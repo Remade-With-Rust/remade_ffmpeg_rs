@@ -576,8 +576,18 @@ impl PartialInfo {
 
 const DEFAULT_BUFFER_LENGTH: usize = 4 * 1024;
 
-pub(crate) fn write_chunk<W: Write>(mut w: W, name: chunk::ChunkType, data: &[u8]) -> Result<()> {
-    w.write_be(data.len() as u32)?;
+pub(crate) fn write_chunk<W: Write>(w: W, name: chunk::ChunkType, data: &[u8]) -> Result<()> {
+    write_chunk_io(w, name, data).map_err(Into::into)
+}
+
+/// [`write_chunk`] with an `io::Result`, so it can be called from a `Write`
+/// impl without a detour through [`EncodingError`] and back.
+fn write_chunk_io<W: Write>(
+    mut w: W,
+    name: chunk::ChunkType,
+    data: &[u8],
+) -> std::io::Result<()> {
+    w.write_all(&(data.len() as u32).to_be_bytes())?;
     w.write_all(&name.0)?;
     w.write_all(data)?;
     let checksum = {
@@ -587,8 +597,83 @@ pub(crate) fn write_chunk<W: Write>(mut w: W, name: chunk::ChunkType, data: &[u8
         crc.update(data);
         crc.finalize()
     };
-    w.write_be(checksum)?;
+    w.write_all(&checksum.to_be_bytes())?;
     Ok(())
+}
+
+/// Payload of one streamed IDAT chunk.
+///
+/// PNG lets an image carry any number of IDAT chunks and decoders concatenate
+/// their payloads, so this is purely a buffering choice, not a format one.
+/// 256 KiB keeps the buffer cache-resident while holding the per-chunk overhead
+/// (4 length + 4 type + 4 CRC) to 12 bytes per 256 KiB — 0.005% of the stream,
+/// or 816 bytes on a 17 MB IDAT. libpng's default is 8 KiB, which would cost
+/// 0.15%.
+const STREAM_CHUNK: usize = 256 * 1024;
+
+/// A `Write` that emits IDAT chunks as the compressed bytes arrive.
+///
+/// The encoder used to accumulate the ENTIRE compressed stream in one `Vec` and
+/// only then copy all of it into the caller's writer, because an IDAT carries
+/// its length ahead of its payload and the total was not known until the end.
+/// On an 8.3 MPx frame that is a 17 MB buffer built and then copied in full.
+///
+/// Emitting fixed-size chunks removes the need to know the total at all: each
+/// chunk's length is known the moment its buffer fills. Peak memory drops from
+/// the whole compressed stream to [`STREAM_CHUNK`].
+struct IdatStreamer<'a, W: Write> {
+    w: &'a mut W,
+    buf: Vec<u8>,
+}
+
+impl<'a, W: Write> IdatStreamer<'a, W> {
+    fn new(w: &'a mut W) -> Self {
+        Self {
+            w,
+            buf: Vec::with_capacity(STREAM_CHUNK),
+        }
+    }
+
+    /// Emit whatever is buffered as one IDAT. A zero-length IDAT is legal but
+    /// pointless, so an empty buffer emits nothing.
+    fn emit(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        crate::prof_scope!(crate::prof::ENC_CHUNK);
+        write_chunk_io(&mut *self.w, chunk::IDAT, &self.buf)?;
+        self.buf.clear();
+        Ok(())
+    }
+
+    /// Flush the trailing partial chunk. Must be called before drop; `Drop`
+    /// cannot report an I/O failure, so this is explicit rather than implicit.
+    fn finish(mut self) -> std::io::Result<()> {
+        self.emit()
+    }
+}
+
+impl<W: Write> Write for IdatStreamer<'_, W> {
+    fn write(&mut self, mut data: &[u8]) -> std::io::Result<usize> {
+        let total = data.len();
+        while !data.is_empty() {
+            let space = STREAM_CHUNK - self.buf.len();
+            let take = space.min(data.len());
+            self.buf.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.buf.len() == STREAM_CHUNK {
+                self.emit()?;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Deliberately NOT emitting a chunk: `flush` is called by wrappers at
+    /// arbitrary points, and honouring it would cut short chunks all through
+    /// the stream. The trailing partial chunk goes out in [`Self::finish`].
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.w.flush()
+    }
 }
 
 impl<W: Write> Writer<W> {
@@ -727,6 +812,64 @@ impl<W: Write> Writer<W> {
         let bpp = self.info.bpp_in_prediction();
         let filter_method = self.options.filter;
         let adaptive_method = self.options.adaptive_filter;
+
+        // Can the compressed bytes go STRAIGHT OUT as IDAT chunks, or must they
+        // be accumulated first?
+        //
+        // Streaming needs the destination to be ready before compression
+        // starts, so it is only available when nothing has to be written
+        // between the header and the image data. An animation frame has an
+        // fcTL in front of it and animation frames after the first are fdAT,
+        // not IDAT, so those keep the accumulate-then-write path.
+        //
+        // `Fast` also keeps it, and not by choice: that path compresses, then
+        // compares the FINISHED size against `StoredOnlyCompressor`'s bound and
+        // re-encodes in stored mode if compression lost. Streaming can never
+        // know the finished size, and the check is not vestigial — measured,
+        // fdeflate expands uniform random bytes by 1.3686x and the fallback
+        // does fire. Giving it up would make incompressible images ~37% larger,
+        // which is not a trade worth a few ms.
+        //
+        // Parallel DEFLATE is excluded too, and this one is easy to get wrong:
+        // it joins its workers' blocks into one buffer, so it cannot stream —
+        // and because the check below sits in front of the `match`, forgetting
+        // it here would silently route every multi-threaded encode down the
+        // serial path and disable a 2.11-3.06x feature without failing a test.
+        #[cfg(feature = "parallel")]
+        let par_active = self.options.par_threads > 1
+            && crate::pardeflate::block_count((in_len + 1) * height, self.options.par_threads) > 1;
+        #[cfg(not(feature = "parallel"))]
+        let par_active = false;
+
+        let can_stream_idat = !matches!(self.info.compression, Compression::Fast)
+            && !par_active
+            && (self.info.frame_control.is_none()
+                || self.should_skip_frame_control_on_default_image());
+
+        if can_stream_idat {
+            let mut current = vec![0; in_len];
+            let mut sink = IdatStreamer::new(&mut self.w);
+            {
+                let mut zlib = ZlibEncoder::new(&mut sink, self.info.compression.to_options());
+                for line in data.chunks(in_len) {
+                    let filter_type = {
+                        crate::prof_scope!(crate::prof::ENC_FILTER);
+                        filter(filter_method, adaptive_method, bpp, prev, line, &mut current)
+                    };
+                    {
+                        crate::prof_scope!(crate::prof::ENC_DEFLATE);
+                        zlib.write_all(&[filter_type as u8])?;
+                        zlib.write_all(&current)?;
+                    }
+                    prev = line;
+                }
+                crate::prof_scope!(crate::prof::ENC_DEFLATE);
+                zlib.finish()?;
+            }
+            sink.finish()?;
+            self.increment_images_written();
+            return Ok(());
+        }
 
         let zlib_encoded = match self.info.compression {
             Compression::Fast => {
