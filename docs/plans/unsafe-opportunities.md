@@ -56,7 +56,8 @@ successful outcome, not a failure.
 | **rusty_vorbis** (encoder) | **IN** | Already uses `get_unchecked`+AVX2 in `brute_cost`; more of the same surface |
 | **rff-codec-flac** (encoder) | **IN** | Real in-repo encoder; claxon = independent lossless oracle |
 | **rff-resample** | **IN** | Own FIR kernels + the only proper audio A/B bench in the repo |
-| **rff-codec-png / rff-codec-jpeg** (wrapper glue) | IN (minor) | A few own per-pixel loops (`pack_indices`, gray→RGB expansion) |
+| **rff-codec-png** (wrapper glue) | ✅ **CLOSED 2026-08-06** | 3 entries, **1 real** — and it was a data-structure fix in safe Rust (3.55x whole-CLI, byte-identical). See Part 4. |
+| **rff-codec-jpeg** (wrapper glue) | IN (minor) | gray→RGB expansion |
 | **rff-core `AudioFrame` byte planes** (cross-cutting) | IN (P5, structural) | 319 per-sample `from_le_bytes`/`to_le_bytes` sites across 7 crates |
 | **rusty_h264 (owned repo `../rs_h264`)** | **IN — owned; forbid covenant being LIFTED (owner decision 2026-08-05)** | 5 crates, ~38k LoC, published to crates.io. The `unsafe_code = "forbid"` covenant (4 Cargo.toml lint blocks + a cfg_attr in common) is being removed, unlocking in-place P1–P5. Honest sizing from the repo's own ledgers: the covenant mostly blocked a *portability* win (generalizing the accel-only `MeCtx` to the default build, ~25% of ME) — decoder P1 is comprehensively refuted, and the decoder's largest cost (40.3% unnamed glue) must be *named* before any pattern can attack it. Ranked top-10 in the section below. |
 | **rusty_av1e / rusty_av1d (owned repo `../rusty-av1-toolkit`)** | **IN — owned** | rav1e fork (76k LoC, ~68 own commits) + rav1d fork (55k LoC). **2026-08-05: rff now enables `asm` + `threading` on native targets** (`rff-codec-avif/Cargo.toml` target-gated; wasm32 stays no-asm/no-threading). The repos' asm-ON optimization ledgers therefore describe rff's native build again; the no-asm concerns below apply only to the wasm32 path. |
@@ -293,9 +294,9 @@ bytes → **319** per-sample `from_le_bytes`/`to_le_bytes` sites across `rff`
 
 | Function | Location | Pattern(s) |
 |---|---|---|
-| `pack_indices` | `rff-codec-png/src/lib.rs:342-348` | P1 + strength-reduce the `/`,`%` by runtime `per_byte`. (Output zeroing is load-bearing — `|=` — NOT a set_len candidate.) |
-| `analyse` per-pixel HashMap probe | `rff-codec-png/src/lib.rs:280-308` | data-structure fix, not unsafe |
-| gray→RGB expansions | `rff-codec-jpeg/src/lib.rs:135-137`, `rff-codec-png/src/lib.rs:88-112` | P2 |
+| ~~`pack_indices`~~ **CLOSED-COLD** | `rff-codec-png/src/lib.rs:342-348` | 0.5–16 ms, and only does real work below 8 bits/index (≤16 colours); a plain `to_vec` otherwise. |
+| ~~`analyse` per-pixel HashMap probe~~ ✅ **DONE — 19.91x on the scan, 3.55x whole-CLI** | `rff-codec-png/src/lib.rs:280-308` | data-structure fix, not unsafe — **the row was exactly right**. Open-addressed table + fused single pass. |
+| gray→RGB expansions (~~png **CLOSED-COLD** 2–12 ms~~; jpeg open) | `rff-codec-jpeg/src/lib.rs:135-137`, ~~`rff-codec-png/src/lib.rs:88-112`~~ | P2 |
 
 ### rusty_h264 — owned repo `../rs_h264` (post-forbid campaign, 2026-08-05)
 
@@ -601,10 +602,81 @@ streams) · `cargo test --workspace --exclude rff-ui`.
 
 # Part 4 — Ledger
 
-*(empty — no attempts yet)*
-
 | date | crate | function | pattern | profile % before | result | commit |
 |---|---|---|---|---|---|---|
+| 2026-08-02 | rusty_jpeg | (13 entries) | P1/P2/P5 | — | **1 real, 9 DEAD, 3 in noise** — the one real fix needed no `unsafe` | see closed sections |
+| 2026-08-06 | rff-codec-png | `analyse` + Indexed lut | data-structure (**not** unsafe) | 222.8 ms of a 320 ms encode on the one image that hits it | **SHIPPED 3.55x** whole-CLI, byte-identical | swept into `8691d0f` |
+| 2026-08-06 | rff-codec-png | `pack_indices` | P1 + strength-reduce | 0.5–16 ms, and only below 8 bits/index | **CLOSED-COLD** | — |
+| 2026-08-06 | rff-codec-png | gray→RGB expansion | P2 | 2–12 ms vs an 80–700 ms encode | **CLOSED-COLD** | — |
+
+### 2026-08-06 — `rff-codec-png` closed. Three entries, one real, no `unsafe`.
+
+The same shape as the JPEG audit, and the same two checks did the work.
+
+**Check 1 — does it execute, and on what content?** The plan sizes `analyse` as
+a per-pixel `HashMap` probe. A synthetic ≤256-colour image put it at **69 ms**,
+which was the wrong target: on the **real** corpus almost everything trips the
+256-colour bail within a few hundred pixels and costs **~0.03 ms**. Exactly one
+real image does not — `gfx_diagram`, 5.35 MPx with **141 colours** — where the
+probe runs for all 5.35 M pixels. *Synthetic content chose the wrong image;
+only the real corpus found it.*
+
+**Check 2 — had LLVM already elided the bounds checks?** The entire crate emits
+**six** `panic_bounds_check`, all inside `send_frame` (every candidate inlines
+into it). The P1 framing was dead on arrival, exactly as it was for 9 of JPEG's
+13 entries.
+
+**What was actually expensive was the data structure** — which is what the plan
+row predicted, verbatim: *"data-structure fix, not unsafe"*.
+
+1. `HashMap` uses SipHash-1-3 — keyed, DoS-resistant — for a 4-byte key in a
+   table that never exceeds 256 entries.
+2. `analyse` built an index map, discarded it, and the `Indexed` branch then
+   built a **second** map and probed it once per pixel: two full walks.
+
+| on `gfx_diagram` (5,351,301 px) | ms |
+|---|---|
+| shipped `analyse` (HashMap) | 109.2 |
+| shipped second pass (lut probe) | 113.6 |
+| **= total shipped** | **222.8** |
+| fused single pass, open-addressed table | **11.2** (**19.91×**) |
+
+Fix: a fixed 1024-slot open-addressed table (`u32` key, `u8` value, Fibonacci
+multiply-shift hash) and `analyse` emits the per-pixel indices from the same
+pass. No allocation, **no `unsafe`** — ≤256 live entries in 1024 slots keeps the
+load factor under 25%.
+
+Gates: output **byte-identical on 9/9** real graphics images; per-pixel indices
+proved identical to the HashMap version by differential test; whole-CLI 15 ABBA
+pairs, pinned, on-core cycles — `gfx_diagram` **670.6 → 189.0 Mcyc (3.55×,
+z 3.87)**, `gfx_uiart` 1.07× (z 3.36), `gfx_logo` 1.07× (z 2.32), `gfx_chart` /
+`gfx_terminal` inside noise, and a **photograph unchanged at 1.00×** (no
+regression where `analyse` bails early).
+
+**Running tally across both audited codecs: 16 entries, 2 real, 0 `unsafe`
+written.** Both real wins were data-structure or loop-shape fixes in safe Rust.
+
+### `rusty_png` — still policy-blocked, but now sized
+
+The crate's `#![forbid(unsafe_code)]` was not touched. Fresh stage profile
+(2026-08-06, `--features profile`, real corpus) for whoever revisits it:
+
+| stage | photographic | graphics |
+|---|---|---|
+| **decode `unfilter`** | 30.0–40.5% | **53.7–66.3%** |
+| decode `inflate` | 50.3–63.9% | 7.5–27.6% |
+| decode `transform` | 3.8–7.4% | 6.5–28.1% |
+| encode `deflate` | 77–99.5% | 77–99% |
+| encode `filter` | 0.2–3.1% | 0.5–7.4% |
+
+So the plan's instinct was right about **where**: `filter.rs`'s unfilter arms
+are genuinely 30–66% of decode and are the only PNG target that clears the 5%
+bar by a wide margin. Two caveats before spending the covenant:
+
+- **We are already 2.67–2.95× faster than FFmpeg at decode.** Prize is small.
+- `inflate`/`deflate` — the majority of both directions — live in `fdeflate` and
+  `zlib-rs`, **outside this repo**, so the covenant buys nothing there.
+
 
 **Incidental findings from the survey (act on independently):**
 - 🐛 `rusty_aac::xpow_avx2` scalar tail missing `i += 1` (`encode.rs:737-741`) — infinite loop for non-multiple-of-4 lengths; currently unreachable but should be fixed now.
