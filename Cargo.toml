@@ -141,7 +141,7 @@ rusty_av1d = { version = "1.2.0", default-features = false, features = ["bitdept
 # png: our own rusty_png — a performance fork of image-rs/image-png 0.17.16
 # (MIT/Apache-2.0), carried forward in-tree. DEFLATE via miniz_oxide/fdeflate,
 # with an opt-in pure-Rust `zlib-rs` backend. See crates/rusty_png/NOTICE.md.
-rusty_png = { path = "crates/rusty_png", version = "0.3.1", features = ["parallel"] }
+rusty_png = { path = "crates/rusty_png", version = "0.3.2", features = ["parallel"] }
 # jpeg: our own rusty_jpeg — a vendored merge of jpeg-decoder 0.3.2 (MIT/Apache)
 # and jpeg-encoder 0.7.0 (MIT/Apache AND IJG), carried forward in-tree. See
 # crates/rusty_jpeg/NOTICE.md for attribution and the IJG obligations.

@@ -429,7 +429,7 @@ choice, not a format one.
 | | |
 |---|---|
 | peak memory, level 6 | **-16% to -19%** (park_joy 71.1 -> 57.8 MB) |
-| peak memory, cumulative with the clone fix | **-37% to -44%** (park_joy 101.0 -> 57.8 MB) |
+| peak memory, cumulative with the clone fix | **-39% to -40%** at this config (park_joy 94.9 -> 57.6 MB) — see the correction at the end of this file |
 | speed | 0.981x - 1.062x, **median 1.023x — inside noise, not claimed** |
 | file size | **+0.0045%** (12 bytes of framing per 256 KiB) |
 | DEFLATE payload | **byte-for-byte unchanged** (14,636,550 B both ways) |
@@ -512,5 +512,40 @@ feature.
 
 **Standing tally for this whole sweep: six speed hypotheses, six results inside
 noise; three memory results, all measurable and reproducible.** Peak working set
-for a level-6 encode went 101.0 -> 57.8 MB serial and 95.2 -> 84.5 MB parallel.
+for a level-6 encode went 94.9 -> 57.6 MB serial and 118.7 -> 85.1 MB parallel,
+both measured with the SAME configuration at each end.
 The encoder was never spending its time where the space was being wasted.
+
+
+---
+
+## Correction: a memory figure that chained two different configurations
+
+The two entries above originally reported **-37% to -44%**, from
+`park_joy 101.0 -> 57.8 MB`. That number was never measured. The 101.0 came
+from the clone-fix run, which used **default settings** (`Fast`); the 57.8 came
+from the streaming run, which used **`-compression_level 6`**. Subtracting one
+from the other compares two different jobs and silently credits the change with
+the difference between compression levels.
+
+Re-measured with the same configuration at both ends — the binary from before
+any of this work against the binary after all of it:
+
+| configuration | before | after | |
+|---|---|---|---|
+| `-compression_level 6`, 1 thread | 94.9 MB | 57.6 MB | **-39%** |
+| `-compression_level 6`, `-threads 8` | 118.7 MB | 85.1 MB | **-28%** |
+| default (`Fast`) | 101.1 MB | 77.3 MB | **-24%** |
+
+So the honest range is **24-40%, depending on configuration**, not 37-44%.
+The old figure happened to be about right for level-6 single-thread and
+overstated both `Fast` and multi-threaded — `Fast` gains least because it cannot
+stream at all, which the chained number completely hid.
+
+**The lesson is narrower than "measure carefully" and worth stating exactly:**
+every individual measurement in this campaign was a valid A/B, because each one
+held its configuration fixed across its own two arms. The error appeared only
+when a *before* from one run was paired with an *after* from another. Deltas do
+not compose across runs unless the configuration is identical — and a cumulative
+claim spanning several changes needs its own end-to-end measurement, not
+arithmetic on the individual ones.

@@ -54,6 +54,39 @@ Per core, encode is at **parity on photographs and ~13% behind on video
 frames**. That split is real and reproduces under one instrument, so it is
 reported as two ranges rather than averaged into one.
 
+## Memory
+
+The encoder used to hold several full copies of the image at once. Removing them
+is where this fork found its largest reproducible wins — and they are **memory**
+wins: every speed measurement taken alongside them landed inside the noise floor,
+so none is claimed.
+
+Measured as peak working set, **same configuration at both ends** (a 8.3 MPx
+frame unless noted):
+
+| configuration | before | after | |
+|---|---|---|---|
+| `-compression_level 6`, 1 thread | 94.9 MB | **57.6 MB** | **−39%** |
+| `-compression_level 6`, `-threads 8` | 118.7 MB | **85.1 MB** | **−28%** |
+| default (`Fast`) | 101.1 MB | **77.3 MB** | **−24%** |
+
+Three redundancies went:
+
+1. **A whole-frame clone** taken whenever the source rows were already tight —
+   the common case — duplicating a buffer the encoder already held.
+2. **The accumulated IDAT.** The whole compressed stream was built in one buffer
+   and then copied into the writer, because a chunk carries its length ahead of
+   its payload. Fixed 256 KiB chunks remove the need to know the total at all.
+3. **Two of the parallel path's three copies.** It wrote each worker's block to
+   its own `Vec`, concatenated them all into a second buffer, then copied that
+   again to prepend two header bytes. Blocks now go out as each worker is
+   joined, and the IDAT payload is **byte-identical at 2, 4 and 8 threads**.
+
+`Fast` gains the least on purpose: it compresses, then compares the finished
+size against a stored-mode bound and re-encodes if compression lost, so it
+cannot stream. That check is not vestigial — fdeflate expands uniform random
+bytes **1.3686×** and it does fire.
+
 ## Why the fork
 
 Two things upstream cannot address for a drop-in FFmpeg replacement:
