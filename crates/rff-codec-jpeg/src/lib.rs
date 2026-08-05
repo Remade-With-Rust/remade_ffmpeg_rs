@@ -163,6 +163,8 @@ struct JpegSettings {
     sampling: Option<SamplingFactor>,
     progressive: bool,
     optimize_huffman: bool,
+    /// RD-optimal coefficient decisions. Off by default: ~2.4x encode time.
+    trellis: bool,
     restart_interval: Option<u16>,
 }
 
@@ -180,6 +182,9 @@ impl Default for JpegSettings {
             // which is a known speed brick: FFmpeg does the same work far
             // cheaper. `-optimize_huffman 0` opts out.
             optimize_huffman: true,
+            // Off by default — it costs ~+144% encode time on real footage.
+            // `-trellis 1` opts in for smaller files.
+            trellis: false,
             restart_interval: None,
         }
     }
@@ -279,6 +284,9 @@ impl RffEncoder for JpegEncoder {
         if let Some(v) = options.get("progressive").and_then(|v| parse_bool(v)) {
             self.settings.progressive = v;
         }
+        if let Some(v) = options.get("trellis").and_then(|v| parse_bool(v)) {
+            self.settings.trellis = v;
+        }
         if let Some(v) = options.get("optimize_huffman").and_then(|v| parse_bool(v)) {
             self.settings.optimize_huffman = v;
         }
@@ -363,6 +371,7 @@ fn encode_jpeg(vf: &VideoFrame, settings: &JpegSettings) -> Result<Vec<u8>> {
     }
     encoder.set_progressive(settings.progressive);
     encoder.set_optimized_huffman_tables(settings.optimize_huffman);
+    encoder.set_trellis(settings.trellis);
     if let Some(interval) = settings.restart_interval {
         encoder.set_restart_interval(interval);
     }
@@ -423,6 +432,7 @@ fn encode_planar(vf: &VideoFrame, settings: &JpegSettings, sub: (usize, usize)) 
     encoder.set_sampling_factor(native);
     encoder.set_progressive(settings.progressive);
     encoder.set_optimized_huffman_tables(settings.optimize_huffman);
+    encoder.set_trellis(settings.trellis);
     if let Some(interval) = settings.restart_interval {
         encoder.set_restart_interval(interval);
     }

@@ -4,6 +4,42 @@ Everything this fork does differently from upstream `jpeg-decoder` 0.3.2 and
 `jpeg-encoder` 0.7.0. Keep this current — it is what makes re-syncing with
 upstream possible.
 
+## 0.2.3
+
+**Trellis quantization is now OFF by default.** It shipped on in 0.1.7 through
+0.2.2, and that was a mistake built on a bad measurement.
+
+The published cost was "+3.1% encode time". Measured on real 1080p footage it is
+**+144%** — 781 → 2062 ms pinned CPU over 40 frames. The +3.1% figure came from
+this crate's own synthetic corpus at ~223 KB/frame; trellis work is
+O(non-zero coefficients) per block in f64 arithmetic, so material with real
+detail (~700 KB/frame here) costs vastly more. The corpus was chosen to exercise
+chroma QUALITY and was never re-validated for COST.
+
+That single default is the whole reason the crate's "1.19x faster than FFmpeg"
+claim stopped holding: at matched output size with trellis on, encode was ~3.2x
+SLOWER than FFmpeg rather than faster.
+
+With it off, and with the `get_block` interior fast path added since:
+
+| arm | pinned CPU (40f, 1080p) | output |
+|---|---:|---:|
+| **rusty_jpeg (default)** | **781 ms** | 27,171,752 B |
+| FFmpeg 8.1.2 `-threads 1` | 953 ms | 28,040,482 B |
+
+**1.22× faster at matched output size, with our output 3.1% smaller** — so the
+size match slightly favours FFmpeg. Better than the original 1.19x, because the
+`get_block` fast path landed in between.
+
+Trellis remains available and unchanged — `Encoder::set_trellis(true)`, or
+`-trellis 1` on the CLI (which also fixes the flag never having been routed
+through the CLI's option allowlist, so it had no effect there at all). Its
+-2.51% BD-rate benefit comes from the same synthetic corpus whose cost figure was
+46x off, so treat it as unverified on real footage until re-measured.
+
+Both READMEs corrected. The old claim stated the pre-trellis SPEED alongside the
+post-trellis QUALITY, a combination that was never true at once.
+
 ## 0.2.2
 
 Completes the 0.2.1 fix and adds the corpus that should have caught it. Anyone

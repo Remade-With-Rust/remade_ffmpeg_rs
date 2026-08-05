@@ -1,12 +1,12 @@
 [package]
 name = "rusty_jpeg"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "(MIT OR Apache-2.0) AND IJG"
 repository = "https://github.com/Remade-With-Rust/rusty_jpeg"
 authors = ["Mata Network <https://www.mata.network>"]
 homepage = "https://github.com/Remade-With-Rust/rusty_jpeg"
-description = "Pure-Rust JPEG/MJPEG decoder + encoder, no C/FFI. Baseline and progressive DCT, planar YUV in/out, AVX2 FDCT/quantize and a two-block AVX2 IDCT. Trellis quantization, box-averaged chroma, fuzz-tested. Encodes 1.19x faster than FFmpeg at matched output size; decodes ~1.04x faster."
+description = "Pure-Rust JPEG/MJPEG decoder + encoder, no C/FFI. Baseline and progressive DCT, planar YUV in/out, AVX2 FDCT/quantize and a two-block AVX2 IDCT. Box-averaged chroma, opt-in trellis, fuzz-tested. Encodes 1.22x faster than FFmpeg at matched output size; decodes ~1.04x faster."
 readme = "README.md"
 keywords = ["jpeg", "mjpeg", "image", "decoder", "encoder"]
 categories = ["multimedia::images", "multimedia::encoding"]

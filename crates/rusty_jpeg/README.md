@@ -33,7 +33,7 @@ badly, so this one is calibrated to real photographic coefficient density.
 
 | | vs FFmpeg | verdict |
 |---|---|---|
-| **Encode** | **1.19× faster (16%)** | at matched output size |
+| **Encode** | **1.22× faster** | at matched output size, single-threaded, default settings |
 | **Decode** | **~1.04× faster (4%)** | paired ABBA, N=15, 3000-frame arms, median 1.0390 |
 
 ## Why merge them

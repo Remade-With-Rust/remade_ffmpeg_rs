@@ -218,14 +218,14 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
 
             // JPEG/MJPEG private options default to video (an image codec has no
             // audio side): -jpeg_quality 1..100, -sampling 444|440|422|420|411,
-            // -progressive, -optimize_huffman, -restart_interval.
+            // -progressive, -optimize_huffman, -restart_interval, -trellis.
             // `-pred` is PNG's filter/prediction knob (none/sub/up/avg/paeth/
             // mixed), spelled as FFmpeg's PNG encoder spells it. It is video-only
             // by nature — there is no audio codec that takes it.
             "crf" | "qp" | "preset" | "pass" | "q" | "qscale" | "cpu-used" | "speed" | "lag"
             | "lag-in-frames" | "arnr-strength" | "dispatch-budget" | "jpeg_quality"
             | "sampling" | "jpeg_sampling" | "progressive" | "optimize_huffman"
-            | "restart_interval" | "pred" | "png_auto_type" | "png_auto_config" => {
+            | "restart_interval" | "trellis" | "pred" | "png_auto_type" | "png_auto_config" => {
                 let value = take_value(args, &mut i, arg)?;
                 if base == "pass" && value != "1" {
                     warnings
@@ -256,8 +256,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             // `configure` Dictionary (audio by default; `:v` targets video).
             // Includes Opus: -application, -vbr, and the R1 frame-parallel
             // controls -opus_parallel / -opus_warmup / -threads.
-            "application" | "vbr" | "opus_parallel" | "opus_warmup"
-            | "frame_duration" => {
+            "application" | "vbr" | "opus_parallel" | "opus_warmup" | "frame_duration" => {
                 let value = take_value(args, &mut i, arg)?;
                 match spec {
                     Some(s) if s.starts_with('v') => video_opts.set(base, value),

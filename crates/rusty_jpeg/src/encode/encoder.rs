@@ -266,9 +266,20 @@ impl<W: JfifWrite> Encoder<W> {
             optimize_huffman_table: false,
             streaming_optimize: None,
             branchy_quantize: false,
-            // On by default: measured -3.14% BD-rate (photo -5.02%, diagonal
-            // -1.25%, no content showing a loss) for +3.1% encode time.
-            trellis: true,
+            // OFF by default. It shipped on in 0.1.7-0.2.2 on the strength of
+            // "-3.14% BD-rate for +3.1% encode time" — and that +3.1% was wrong
+            // by ~46x. It was calibrated on synthetic fBm at ~223 KB/frame,
+            // while trellis work is O(non-zero coefficients) per block in f64;
+            // on real 1080p footage at ~700 KB/frame it measures **+144%**
+            // (844 -> 2062 ms pinned CPU, 40 frames).
+            //
+            // That is a bad trade for a codec positioned as a fast drop-in, and
+            // it is the whole reason the crate's own "1.19x faster than FFmpeg"
+            // claim stopped holding. Opt in with `set_trellis(true)` or
+            // `-trellis 1` when smaller files are worth the time; the BD-rate
+            // benefit itself still needs re-measuring on real content, since the
+            // cost figure from that same corpus was so far off.
+            trellis: trellis_default(),
             push_blocks: false,
             app_segments: Vec::new(),
         }
@@ -373,9 +384,15 @@ impl<W: JfifWrite> Encoder<W> {
     /// transform work against peak memory.
     /// Enable rate-distortion optimization of the quantized coefficients.
     ///
-    /// Trades a little distortion for fewer bits by choosing where each block's
-    /// EOB falls, rather than keeping every coefficient rounding produced. Costs
-    /// encode time and changes the bitstream; off by default.
+    /// Chooses where each block's EOB falls, and lowers coefficient magnitudes
+    /// where the bits saved outweigh the distortion, instead of keeping whatever
+    /// rounding produced. Changes the bitstream.
+    ///
+    /// **Off by default, and expensive.** Measured on real 1080p footage it
+    /// costs **+144% encode time** — a figure that was originally published as
+    /// +3.1% because it had been calibrated on synthetic content with far fewer
+    /// non-zero coefficients than real material. Turn it on when smaller files
+    /// are worth roughly 2.4x the encode time.
     pub fn set_trellis(&mut self, enabled: bool) {
         self.trellis = enabled;
     }
@@ -1650,6 +1667,16 @@ const OPTIMIZE_BUFFER_BUDGET: usize = 256 * 1024 * 1024;
 /// so the two can be compared in one binary. Resolved once, not per block.
 /// `RUSTY_JPEG_ARM=slowblock` forces the general clamped path — the A/B arm for
 /// the interior fast path, and the oracle it is gated against.
+fn trellis_default() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RUSTY_JPEG_TRELLIS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 fn slow_get_block() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();

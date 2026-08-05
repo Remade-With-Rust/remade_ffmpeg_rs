@@ -8,7 +8,7 @@
 //!
 //! Usage: scanmode [width] [height] [quality] [reps]
 
-use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
+use rusty_jpeg::encode::{ColorType, Encoder, PlanarYcbcrImage, SamplingFactor};
 use std::time::Instant;
 
 fn fbm(x: usize, y: usize, amp: f32) -> f32 {
@@ -102,6 +102,47 @@ fn main() {
             } else {
                 "NON-INTERLEAVED"
             },
+        );
+    }
+
+    // The CLI feeds yuv420p planes through `PlanarYcbcrImage`, not RGB. Time
+    // that path too: a gap between them is CLI-path cost, not encoder cost.
+    {
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let mut yp = vec![0u8; w * h];
+        let mut cb = vec![128u8; cw * ch];
+        let mut cr = vec![128u8; cw * ch];
+        for j in 0..h {
+            for i in 0..w {
+                yp[j * w + i] = rgb[(j * w + i) * 3 + 1];
+            }
+        }
+        for j in 0..ch {
+            for i in 0..cw {
+                cb[j * cw + i] = rgb[((j * 2).min(h - 1) * w + (i * 2).min(w - 1)) * 3];
+                cr[j * cw + i] = rgb[((j * 2).min(h - 1) * w + (i * 2).min(w - 1)) * 3 + 2];
+            }
+        }
+        let mut best = f64::INFINITY;
+        let mut bytes = 0usize;
+        for _ in 0..reps.max(1) {
+            let t = Instant::now();
+            let mut out = Vec::new();
+            {
+                let img =
+                    PlanarYcbcrImage::new(&yp, &cb, &cr, [w, cw, cw], w as u16, h as u16, (2, 2))
+                        .expect("planar image");
+                let mut enc = Encoder::new(&mut out, q);
+                enc.set_sampling_factor(img.sampling_factor());
+                enc.set_optimized_huffman_tables(true);
+                enc.encode_image(img).expect("planar encode");
+            }
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            bytes = out.len();
+        }
+        println!(
+            "planar (CLI path) {:>9} B  yuv420p in                       best {:8.1} ms",
+            bytes, best
         );
     }
 }
