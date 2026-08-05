@@ -1264,6 +1264,57 @@ Also: the first double-run peel, read as raw pinned medians, put `fdct` BELOW
 baseline - impossible, since doubling only adds work. That was the box, not the
 method; pairing each stage against the null recovered every verdict.
 
+## D4h - inside entropy: a third of it was FINDING the non-zeros
+
+With the residue identified as entropy (D2b), the next question is which part.
+Counts first, from one 1080p encode:
+
+| count | value | what it says |
+|---|---|---|
+| `write_bits` per symbol | **1.0** | no redundancy in the call structure |
+| bits per buffer flush | **64.0** | the 64-bit accumulator is used optimally |
+| flushes needing byte-stuffing | **3.5%** | 96.5% take the bulk 8-byte write |
+| AC coefficients non-zero | **~16%** (500k of 3.08M) | **the loop visits 6x more than it codes** |
+
+The bit writer is already the libjpeg-turbo shape - 64-bit accumulator, SWAR
+`0xFF` detection, bulk 8-byte flush, byte-wise only when stuffing. Nothing to
+win there. The last row is the target.
+
+**Split, by double-run paired against the `copy` null:**
+
+| arm | median B/A | z | share |
+|---|---:|---:|---:|
+| entropy total (scan + symbols) | 1.3699 | 3.36 | ~36% |
+| **zero-run SCAN alone** | 1.1343 | 1.81 | **~12-13%** |
+| => symbol encoding | - | - | ~23% |
+
+### The brick: find non-zeros with arithmetic, not branches
+
+`write_ac_block` walked all 63 AC positions with a data-dependent branch on each,
+to locate the ~16% that are non-zero. Replaced with an AVX2 compare producing a
+64-bit non-zero mask, then stepping set bits via `trailing_zeros` - so the loop
+runs `popcount` times instead of 63.
+
+- **GATE:** byte-identical across baseline / progressive / both Huffman modes,
+  including the progressive sub-range path where a mask-restriction bug would
+  show. The SIMD mask is separately gated against a scalar oracle over 3000
+  rounds, including a single coefficient walked across all 64 positions - the
+  case that catches `packs`'s lane interleaving, which would otherwise yield a
+  plausible mask with each 16-coefficient group's halves swapped.
+- **MEASURED: 14/15, z 3.36, median 1.2826 - 1.28x faster WHOLE ENCODE.**
+
+That exceeds the scan's measured 12-13%, and should: the `escan` probe timed a
+BRANCHY scan, so replacing it removes the mispredicts as well as the iterations.
+
+### Standing
+
+Interleaved rff vs `ffmpeg -threads 1` at matched output size (ours 3.1%
+smaller), N=15: **12/15, z 2.32, median 1.4510 - 1.45x faster**, up from 1.22x.
+
+Interleaving was necessary, not decorative: across this session the same ffmpeg
+command drifted 953 -> 1266 ms on the same box, more than the effect being
+measured. Sequential arms would have reported parity.
+
 ---
 
 ## Standing rules for this descent

@@ -412,28 +412,68 @@ impl<W: JfifWrite> JfifWriter<W> {
         end: usize,
         ac_table: &HuffmanTable,
     ) -> Result<(), EncodingError> {
-        let mut zero_run = 0;
-
-        for &value in &block[start..end] {
-            if value == 0 {
-                zero_run += 1;
-            } else {
-                while zero_run > 15 {
-                    self.huffman_encode(0xF0, ac_table)?;
-                    zero_run -= 16;
+        // Visit only the non-zero coefficients.
+        //
+        // The straightforward form walks all 63 AC positions and pays a
+        // data-dependent branch on each, to find the ~16% that are non-zero.
+        // That scan measured **~12-13% of whole encode** by itself — about a
+        // third of all entropy cost. Finding them with a SIMD compare and then
+        // stepping the set bits turns 63 branchy iterations into one mask plus
+        // `popcount` iterations.
+        //
+        // `RUSTY_JPEG_ARM=scanloop` restores the branchy walk as the A/B arm and
+        // the oracle.
+        if slow_ac_scan() {
+            let mut zero_run = 0;
+            for &value in &block[start..end] {
+                if value == 0 {
+                    zero_run += 1;
+                } else {
+                    while zero_run > 15 {
+                        self.huffman_encode(0xF0, ac_table)?;
+                        zero_run -= 16;
+                    }
+                    crate::prof::bump(crate::prof::Count::NonZeroAc, 1);
+                    let (size, value) = get_code(value);
+                    self.huffman_encode_value(size, (zero_run << 4) | size, value, ac_table)?;
+                    zero_run = 0;
                 }
-
-                crate::prof::bump(crate::prof::Count::NonZeroAc, 1);
-                let (size, value) = get_code(value);
-                let symbol = (zero_run << 4) | size;
-
-                self.huffman_encode_value(size, symbol, value, ac_table)?;
-
-                zero_run = 0;
             }
+            if zero_run > 0 {
+                self.huffman_encode(0x00, ac_table)?;
+            }
+            return Ok(());
         }
 
-        if zero_run > 0 {
+        let mut mask = nonzero_mask(block);
+        // Restrict to [start, end). Progressive scans use sub-ranges.
+        mask &= u64::MAX << start;
+        if end < 64 {
+            mask &= !(u64::MAX << end);
+        }
+
+        // `prev` is the position just past the last coded coefficient, so
+        // `i - prev` is exactly the zero run the branchy form accumulated.
+        let mut prev = start;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+
+            let mut zero_run = (i - prev) as u8;
+            while zero_run > 15 {
+                self.huffman_encode(0xF0, ac_table)?;
+                zero_run -= 16;
+            }
+
+            crate::prof::bump(crate::prof::Count::NonZeroAc, 1);
+            let (size, value) = get_code(block[i]);
+            self.huffman_encode_value(size, (zero_run << 4) | size, value, ac_table)?;
+            prev = i + 1;
+        }
+
+        // Trailing zeros terminate the block with EOB, exactly as a non-zero
+        // `zero_run` did before.
+        if prev < end {
             self.huffman_encode(0x00, ac_table)?;
         }
 
@@ -505,6 +545,81 @@ impl<W: JfifWrite> JfifWriter<W> {
     }
 }
 
+/// Bitmask of the non-zero coefficients in `block[1..64]`, bit `i-1` set when
+/// `block[i] != 0`.
+///
+/// The AC loop's job is to find ~16% non-zero coefficients among 63, and the
+/// straightforward form pays a data-dependent branch on every one of them. That
+/// scan measured **~12-13% of whole encode** on its own (paired double-run vs a
+/// null arm), about a third of all entropy cost — so it is worth finding the
+/// non-zeros with arithmetic instead of branches, and then visiting only those.
+///
+/// AVX2 compares 16 coefficients per instruction; `movemask` on the packed
+/// comparison yields the bits directly. The scalar fallback is the oracle.
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "avx2")]
+unsafe fn nonzero_mask_avx2(block: &[i16; 64]) -> u64 {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    let p = block.as_ptr();
+    let zero = _mm256_setzero_si256();
+    let mut mask = 0u64;
+    for i in 0..4 {
+        // 16 coefficients per iteration.
+        let v = _mm256_loadu_si256(p.add(i * 16) as *const __m256i);
+        let eq = _mm256_cmpeq_epi16(v, zero);
+        // `packs` interleaves the 128-bit lanes, so undo that before movemask;
+        // otherwise bit k would not correspond to coefficient k.
+        let packed = _mm256_packs_epi16(eq, eq);
+        let ordered = _mm256_permute4x64_epi64::<0b11_01_10_00>(packed);
+        // movemask gives 1 where the coefficient EQUALS zero; invert for non-zero.
+        let m = !(_mm256_movemask_epi8(ordered) as u32) & 0xFFFF;
+        mask |= (m as u64) << (i * 16);
+    }
+    mask
+}
+
+/// Scalar twin and oracle for [`nonzero_mask_avx2`].
+#[inline]
+fn nonzero_mask_scalar(block: &[i16; 64]) -> u64 {
+    let mut mask = 0u64;
+    for (i, &v) in block.iter().enumerate() {
+        mask |= ((v != 0) as u64) << i;
+    }
+    mask
+}
+
+/// `RUSTY_JPEG_ARM=scanloop` restores the branchy AC walk — the A/B arm for the
+/// mask-driven one, and the oracle it is gated against.
+fn slow_ac_scan() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RUSTY_JPEG_ARM")
+            .map(|v| v == "scanloop")
+            .unwrap_or(false)
+    })
+}
+
+#[inline]
+fn nonzero_mask(block: &[i16; 64]) -> u64 {
+    #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by the runtime feature check; reads 64 i16 from a
+            // fixed-size array.
+            #[allow(unsafe_code)]
+            unsafe {
+                return nonzero_mask_avx2(block);
+            }
+        }
+    }
+    nonzero_mask_scalar(block)
+}
+
 #[inline]
 pub(crate) fn get_code(value: i16) -> (u8, u16) {
     let temp = value - (value.is_negative() as i16);
@@ -520,4 +635,54 @@ pub(crate) fn get_code(value: i16) -> (u8, u16) {
     let coefficient = temp & ((1 << num_bits as usize) - 1);
 
     (num_bits as u8, coefficient as u16)
+}
+
+#[cfg(test)]
+mod nonzero_mask_tests {
+    use super::*;
+
+    /// The SIMD mask must equal the scalar oracle exactly. `packs` interleaves
+    /// the 256-bit lanes, so a missing permute would still produce a
+    /// plausible-looking mask with the two halves of every 16 coefficients
+    /// swapped — which is precisely the bug this checks for.
+    #[test]
+    fn nonzero_mask_matches_scalar() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..3000 {
+            let mut b = [0i16; 64];
+            for (i, v) in b.iter_mut().enumerate() {
+                *v = match round {
+                    0 => 0,
+                    1 => 1,
+                    2 => -1,
+                    3 => i16::MIN,
+                    4 => i16::MAX,
+                    // One coefficient set, walked across every position: this is
+                    // what catches a lane-ordering error.
+                    5..=68 => {
+                        if i == round - 5 {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    _ => {
+                        // Sparse, like real quantized blocks (~16% non-zero).
+                        if next() % 100 < 16 {
+                            (next() % 64) as i16 - 32
+                        } else {
+                            0
+                        }
+                    }
+                };
+            }
+            assert_eq!(nonzero_mask(&b), nonzero_mask_scalar(&b), "round {round}");
+        }
+    }
 }

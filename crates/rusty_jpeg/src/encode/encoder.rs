@@ -946,6 +946,23 @@ impl<W: JfifWrite> Encoder<W> {
                                 );
                             }
 
+                            if double_stage("escan") {
+                                // The zero-run SCAN alone: walk all 63 AC
+                                // coefficients and find the non-zeros, without
+                                // encoding anything. Splits the loop's cost from
+                                // the symbol work `entropy` measures.
+                                let mut run = 0u32;
+                                let mut nz = 0u32;
+                                for &v in &q_block[1..64] {
+                                    if v == 0 {
+                                        run += 1;
+                                    } else {
+                                        nz += 1;
+                                        run = 0;
+                                    }
+                                }
+                                core::hint::black_box((run, nz));
+                            }
                             if double_stage("entropy") {
                                 // `count_block` is the writer's own symbol walk
                                 // with the bit output removed, so this prices the

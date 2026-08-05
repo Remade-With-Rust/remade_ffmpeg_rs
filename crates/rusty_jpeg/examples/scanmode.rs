@@ -145,4 +145,24 @@ fn main() {
             bytes, best
         );
     }
+
+    if std::env::var("RUSTY_JPEG_COUNTS").is_ok() {
+        use rusty_jpeg::prof::Count;
+        let c = rusty_jpeg::prof::read();
+        let f = |n: Count| c[n as usize];
+        println!(
+            "
+entropy counters (last encode):"
+        );
+        for (name, v) in [
+            ("symbols", f(Count::Symbols)),
+            ("bit_writes", f(Count::BitWrites)),
+            ("bits", f(Count::Bits)),
+            ("buffer_flushes", f(Count::BufferFlushes)),
+            ("stuffed_flushes", f(Count::StuffedFlushes)),
+            ("nonzero_ac", f(Count::NonZeroAc)),
+        ] {
+            println!("  {name:<18}{v:>12}");
+        }
+    }
 }
