@@ -7,6 +7,7 @@
 //! encode those back. To bridge PNG (RGB) and the YUV codecs (AVIF), insert a
 //! `-vf format=yuv420p` / `format=rgb24` conversion.
 
+use std::borrow::Cow;
 use std::io::Cursor;
 
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
@@ -619,14 +620,25 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
     let stride = vf.strides[0];
 
     // png wants tightly packed rows; repack if the source stride has padding.
-    let mut packed: Vec<u8> = if stride == row {
-        vf.planes[0].clone()
+    //
+    // BORROWED when the source is already tight, which is the overwhelmingly
+    // common case — every decoder in this tree hands back tight rows for
+    // rgb24/rgba, so the padded branch is the exception. This used to `clone()`
+    // the whole frame there, which on an 8.3 MPx frame is a 24.9 MB memcpy plus
+    // a first-touch soft fault on all ~6,100 pages of the copy, every encode,
+    // to produce a byte-for-byte duplicate of a buffer we already hold.
+    //
+    // Nothing downstream needs ownership: `content_signal` and `analyse` take
+    // `&[u8]`, the narrowed colour types build their own buffers, and the
+    // truecolour path only needs to hand a slice to the encoder.
+    let packed: Cow<'_, [u8]> = if stride == row {
+        Cow::Borrowed(&vf.planes[0][..row * h])
     } else {
         let mut p = Vec::with_capacity(row * h);
         for j in 0..h {
             p.extend_from_slice(&vf.planes[0][j * stride..j * stride + row]);
         }
-        p
+        Cow::Owned(p)
     };
 
     // Pick the operating point from the content, unless the caller named one.
@@ -676,7 +688,7 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
             for p in packed.chunks_exact(channels) {
                 g.push(p[0]);
             }
-            (ColorType::Grayscale, BitDepth::Eight, g, None, None)
+            (ColorType::Grayscale, BitDepth::Eight, Cow::Owned(g), None, None)
         }
         ColourKind::GrayAlpha => {
             let mut g = Vec::with_capacity(w * h * 2);
@@ -684,7 +696,7 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
                 g.push(p[0]);
                 g.push(if channels == 4 { p[3] } else { 255 });
             }
-            (ColorType::GrayscaleAlpha, BitDepth::Eight, g, None, None)
+            (ColorType::GrayscaleAlpha, BitDepth::Eight, Cow::Owned(g), None, None)
         }
         ColourKind::Indexed {
             palette,
@@ -697,18 +709,12 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
             // 113.6 ms on a 5.35 MPx diagram, on top of the scan's own 109.2 ms.
             let body = pack_indices(&indices, w, h, depth);
             let flat: Vec<u8> = palette.iter().flat_map(|c| c.iter().copied()).collect();
-            (ColorType::Indexed, depth, body, Some(flat), trns)
+            (ColorType::Indexed, depth, Cow::Owned(body), Some(flat), trns)
         }
-        // `take` rather than clone: on this path `packed` is the body, and the
-        // small-image palette re-check below only runs when indexing WAS used,
-        // so nothing reads `packed` afterwards here.
-        ColourKind::TrueColour => (
-            color,
-            BitDepth::Eight,
-            std::mem::take(&mut packed),
-            None,
-            None,
-        ),
+        // Borrow, not take: on this path the body IS `packed`, and `emit` only
+        // ever reads it. The previous `mem::take` existed to move a Vec out;
+        // with `packed` borrowed from the frame there is nothing to move.
+        ColourKind::TrueColour => (color, BitDepth::Eight, Cow::Borrowed(&*packed), None, None),
     };
 
     // Pre-size the output buffer so it never reallocates.

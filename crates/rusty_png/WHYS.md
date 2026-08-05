@@ -327,3 +327,83 @@ win in one direction, *any* pipeline that runs both directions will smuggle that
 win into the other one's row. Measuring encode means feeding raw pixels in.
 `-i x.png -c:v png` is a **transcode**, and it is a legitimate number — it is
 just never the encode number.
+
+---
+
+## Encoder optimisation sweep: four dead ends and one real result
+
+Went looking for slow functions in the encoder after the corrected benchmark
+showed ffmpeg still ahead per core. Recorded in full because four of these look
+obviously worth trying, and the next person will try them again otherwise.
+
+**First, where the time actually is.** Stage profile, park_joy 1920x4320:
+
+| config | filter | deflate | chunk | crc |
+|---|---|---|---|---|
+| `fast`/sub | 4.1% | **77.9%** | 15.2% | 2.6% |
+| `fast`/sub/adaptive | 22.9% | **64.3%** | 10.9% | 4.4% |
+| `default`/sub/adaptive | 2.9% | **95.1%** | 1.6% | 0.3% |
+| `best`/up | 0.2% | **98.7%** | 1.0% | 0.1% |
+
+At the matched-ffmpeg operating point (level 6, non-adaptive) everything that is
+ours totals **3.0%**, against a 14% deficit. Zeroing all of our own code cannot
+close that gap. It is a deflate gap, and deflate is zlib-rs.
+
+**Per-filter, same frame:** up 8.58 GB/s | none 5.92 | sub 5.88 | avg 5.91 |
+paeth 3.00. none/sub/avg touch the same streams and land within 1% of each
+other — that is read+write at ~12 GB/s, i.e. **memory-bound and finished**.
+
+### Refuted
+
+1. **Batch the per-row deflate calls.** The serial path calls the compressor
+   twice per row and one call carries a single byte, so 8,640 calls for a
+   4,320-row image. Measured: per-row-two-calls **816.8 ms**, per-row-one-call
+   1015.8, batched-256 KB 829.8, single-call 836.5. The shipped pattern is the
+   *fastest* of the four, and the one arm that only removed calls got worse.
+2. **SIMD `sum_buffer`.** Called 4x per row in adaptive mode, sum of absolute
+   deviations, textbook. It already runs at **24.83 GB/s**; a u32 accumulator
+   got 8.52, u16 20.24, 4-lane u32 10.82, fixed-array 5.24. LLVM's output for
+   the existing u64-over-`chunks_exact(32)` form beats every rewrite offered.
+3. **Branchless Paeth.** The three-way `if/else if/else` select looked like the
+   reason Paeth runs at half the rate of the other filters. Rewrote it as
+   min/eq + AND/OR masks (verified equal on all 2^24 triples) with
+   `inline(always)`. Whole-process A/B: inside a control arm that itself swung
+   0.878-1.019x. Same-process ABBA at full 24.9 MB size, which reproduces the
+   encoder (3.51 GB/s vs 3.00): **0.966x median, 1.002x min, 7/15 wins,
+   z = -0.26**. A tie. Paeth *is* genuinely slower than the others, but the
+   branchy select is not why.
+4. **Pre-size the internal deflate buffer.** It grows from zero by doubling to
+   ~17 MB. Pre-reserving measured 0.843x-1.139x — inside noise — and over-
+   reserves badly on graphics, where output can be 2% of input. Reverted. This
+   is the same class as the `emit` pre-size in `rff-codec-png`, which is kept
+   with the same honest caveat.
+
+### Kept
+
+**The whole-frame clone in `rff-codec-png::encode_png`.** It did
+`vf.planes[0].clone()` whenever the source rows were already tight — the common
+case — duplicating a buffer it already held. Now `Cow::Borrowed`.
+
+Speed is *also* inside noise (0.924-1.124x, median 1.003x at shipped defaults),
+so it is **not** a speedup and must not be quoted as one. What it does buy is
+measured and well outside noise: **peak working set down 23-28%**, exactly one
+frame — 101.0 -> 76.1 MB on park_joy, 86.4 -> 62.6 on blue_sky, 102.2 -> 78.5 on
+ducks_take_off, 56.9 -> 43.2 on FourPeople. Output byte-identical, 80 tests pass.
+
+### The standing conclusion
+
+Our own encoder code is at its ceiling: the filters are memory-bound, the
+adaptive sum is already optimal, and the buffer handling is dominated by
+first-touch page faults on freshly allocated multi-megabyte buffers. **The
+remaining gap to ffmpeg is DEFLATE and nothing else.** Two levers are left, and
+both are structural rather than micro:
+
+- **zlib-rs vs C zlib.** 96-99% of encode at quality levels. Not our code.
+- **Streaming IDAT.** The encoder builds the entire compressed stream in a temp
+  `Vec` and then copies all of it into the writer, because an IDAT carries its
+  length in front of its payload. Encoding to `io::sink()` — identical
+  compression, no second buffer — is **9.5-19.3% faster at `fast`**. Capturing
+  it means emitting fixed-size IDAT chunks as compression proceeds, which is
+  spec-legal and what libpng does, but changes the file's chunk layout and would
+  break the byte-identical-to-upstream gate. That is a design decision, not an
+  optimisation.
