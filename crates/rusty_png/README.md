@@ -26,22 +26,33 @@ Measured against system **FFmpeg 8.1.2** on the same machine, **one pinned core
 each**, on-core CPU **cycles** (not wall — wall on this box threw 8,285 ms
 outliers on a 156 ms job), arms **ABBA-interleaved**, best-of-N with a paired
 win-rate and z-score. **Null-arm floor 2.0–2.3%**; nothing inside that band is
-reported as a result. Content is **real**: frame 0 of the lossless Derf/xiph
+reported as a result, and a row whose useful work sits under 3× its own process
+launch is refused rather than estimated. Content is **real**, from two corpora:
+the public **CLIC professional** validation set (native-RGB photography, so it
+is citable and reproducible by anyone) and frame 0 of the lossless **Derf/xiph**
 originals, plus real screenshots, matplotlib charts, diagrams and logos — the
 two synthetic images in early runs were dropped once real graphics showed
 different behaviour.
 
 | | vs FFmpeg | verdict |
 |---|---|---|
-| **Decode** | **2.67–2.95× faster** | 6 real images, 15/15 paired wins each, z = 3.87 |
+| **Decode, per core** | **2.55–2.89× faster** (median 2.60×) | decode-only, PNG → rgb24, 5 admissible images, z = 3 |
 | **Encode, wall clock, multi-core** | **2.11–3.06× faster, 0.1–0.2% smaller** | end-to-end, matched filter + level, `parallel` |
-| **Encode, per core, same filter + size** | **0.69–0.92× (FFmpeg 1.09–1.45× faster)** | which DEFLATE is faster doing identical work |
+| **Encode, per core, same filter + size** | **0.94–1.05×** on CLIC photographs (median 0.97×) · **0.86–0.91×** on Derf video frames | encode-only from raw; which DEFLATE is faster doing identical work |
 | **Graphics size, default settings** | **−6.1%** *(was +115.6%)* | 9 real screenshots/charts/diagrams/logos |
 
-The wall-clock row is a **multi-core vs single-core** comparison and is labelled
-as such: FFmpeg's PNG encoder is single-threaded for one image, which is the
-structural point, but it is never quoted as a per-core win. Per core we are
-still behind, and that row is kept directly above it.
+Every row is one direction only. The **encode** row feeds both arms **raw
+pixels**, so neither decodes — measuring encode by transcoding a PNG lets a
+decode win (which we have, and it is large) inflate a number labelled encode,
+and that is exactly how an earlier draft of this table briefly read 1.20× in our
+favour. Likewise the wall-clock row is a **multi-core vs single-core**
+comparison and is labelled as such: FFmpeg's PNG encoder is single-threaded for
+one image, which is the structural point, but it is never quoted as a per-core
+win, and the per-core row is kept directly beneath it.
+
+Per core, encode is at **parity on photographs and ~13% behind on video
+frames**. That split is real and reproduces under one instrument, so it is
+reported as two ranges rather than averaged into one.
 
 ## Why the fork
 
@@ -52,10 +63,11 @@ Two things upstream cannot address for a drop-in FFmpeg replacement:
    upstream routes those through `flate2` → `miniz_oxide` while FFmpeg uses
    zlib. Switching to `zlib-rs` — flate2's **pure-Rust** zlib rewrite, which maps
    to `any_zlib`, *not* `any_c_zlib`, so no C enters the tree — measured
-   **1.68–2.72× faster** at `Default` with size within ±3%. That closed most of
-   the gap but **not all of it**: at matched filter and size FFmpeg's zlib is
-   still 1.09–1.45× ahead, and since the profiler puts DEFLATE at 94–99.5% of
-   encode, that residual gap *is* the deflate gap. It is the open item.
+   **1.68–2.72× faster** at `Default` with size within ±3%. That took the gap
+   from 2.6–4.4× to **parity on photographs (0.94–1.05×) and ~1.15× on video
+   frames**, at 0.2–0.3% *smaller* output. Since the profiler puts DEFLATE at
+   94–99.5% of encode, whatever residue remains *is* the deflate gap, not a PNG
+   gap — closing the last of it means beating zlib's C, which is the open item.
 2. **One hard-coded operating point is the wrong default for PNG.**
    `Fast`/`Sub`/non-adaptive is genuinely excellent on photographs — faster *and*
    smaller than every FFmpeg `-compression_level 1` configuration — and poor on

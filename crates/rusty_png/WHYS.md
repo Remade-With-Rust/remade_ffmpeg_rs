@@ -286,3 +286,44 @@ not, it was an artefact of flat synthetic fills and zlib-rs goes on unconditiona
 | 3 | gray/palette passthrough | pixels identical, colour type preserved, size strictly down |
 | 4 | content-adaptive default | **no image regresses** vs today's default; decided on real content only |
 | 5 | 16-bit | exact vs ffmpeg on a TRUE 16-bit source (not one up-converted from 8-bit) |
+
+---
+
+## Correction: the encode number was measured by transcoding
+
+*Recorded after the fact. The figures above this line were what the instrument
+said at the time; this is what a better instrument said later.*
+
+Adding the public **CLIC professional** corpus produced a run in our favour —
+1.04–1.34× per core at matched filter and level — that **contradicted our own
+published 0.69–0.92×**. A result in our favour that contradicts a published
+number gets checked harder, not accepted, so the Derf fixture was re-run under
+the same instrument. It also moved: 0.83–0.90× → 1.06–1.21×.
+
+Both corpora moving the same way is not a content effect. It is the method.
+Both arms were invoked as `-i image.png -c:v png`, so **both arms decoded and
+then encoded**. Our decode is ~2.6× ffmpeg's. A decode win was being reported in
+a row labelled ENCODE, on both corpora, which is why they agreed.
+
+Re-measured with **neither arm decoding** — ours reads `.rgb24` and calls the
+encoder, ffmpeg reads the same `.rgb24` through the rawvideo demuxer, Up filter
+non-adaptive, level 6, one thread, launch subtracted:
+
+| corpus | encode-only, per core | size |
+|---|---|---|
+| CLIC professional photographs (n=7) | **0.94–1.05×**, median 0.97× | −0.2% |
+| Derf video frames (n=4) | **0.86–0.91×**, median 0.87× | −0.3% |
+
+And decode measured **alone**, same instrument: **2.55–2.89×**, median 2.60×
+(n=5 admissible; smaller images refuse because ffmpeg's decode work falls under
+3× its own launch overhead).
+
+So the published 0.69–0.92× was **directionally right and numerically stale** —
+we have since moved to parity on photographs — and the corpus split is real but
+small. Neither correction came from the codec changing during the check.
+
+**The lesson, and it is the second time this session:** for a codec with a large
+win in one direction, *any* pipeline that runs both directions will smuggle that
+win into the other one's row. Measuring encode means feeding raw pixels in.
+`-i x.png -c:v png` is a **transcode**, and it is a legitimate number — it is
+just never the encode number.
