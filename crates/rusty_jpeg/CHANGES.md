@@ -4,6 +4,23 @@ Everything this fork does differently from upstream `jpeg-decoder` 0.3.2 and
 `jpeg-encoder` 0.7.0. Keep this current — it is what makes re-syncing with
 upstream possible.
 
+## 0.3.2
+
+Cleanup release. No behaviour change — output is byte-identical across default,
+`-optimize_huffman`, `-progressive` and `-trellis`.
+
+- **Removes the measurement scaffolding** built during the optimization campaign:
+  the `RUSTY_JPEG_ABLATE` stage-ablation knobs, the `RUSTY_JPEG_DOUBLE`
+  stage-pricing probes, the `RUSTY_JPEG_ARM` A/B arms for work that has landed,
+  and the campaign-only counters. The findings are recorded in `WHYS.md`; the
+  switches were only ever there to produce them.
+- **Keeps every scalar twin.** Those are the correctness oracles the SIMD tests
+  assert against, and the fallbacks for non-x86 targets — they stay in the tree.
+- **README rebuilt** around what the crate does now: performance, the compression
+  options and their real costs, and how correctness is gated. The per-kernel
+  performance narrative is gone; it documented the journey rather than the
+  product.
+
 ## 0.3.1
 
 README only — no code change. crates.io bakes the README into the published

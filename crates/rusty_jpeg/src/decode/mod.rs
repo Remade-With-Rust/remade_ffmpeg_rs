@@ -126,19 +126,6 @@ impl<R: io::Read> io::Read for Buffered<R> {
     }
 }
 
-/// `RUSTY_JPEG_ABLATE=slowbytes` restores the pre-buffer byte-at-a-time path, so
-/// the buffered reader can be A/B'd against its predecessor inside one binary
-/// with the arms interleaved. Read once; the branch is loop-invariant.
-pub(crate) fn ablate_slow_bytes() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RUSTY_JPEG_ABLATE")
-            .map(|v| v.split(',').any(|t| t == "slowbytes"))
-            .unwrap_or(false)
-    })
-}
-
 fn read_u8<R: io::Read>(reader: &mut R) -> io::Result<u8> {
     let mut buf = [0];
     reader.read_exact(&mut buf)?;

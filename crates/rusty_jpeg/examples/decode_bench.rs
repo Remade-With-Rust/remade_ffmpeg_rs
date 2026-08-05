@@ -90,10 +90,6 @@ fn main() {
         ("fast_ac_hit", Count::DecFastAcHit as usize),
         ("fast_ac_miss", Count::DecFastAcMiss as usize),
         ("idct_PAIRS", Count::DecIdctPairs as usize),
-        ("bottom_half_zero", Count::DecBottomHalfZero as usize),
-        ("top_row_only", Count::DecTopRowOnly as usize),
-        ("coef_span_sum", Count::DecCoefSpanSum as usize),
-        ("upsample_rows", Count::DecUpsampleRows as usize),
     ] {
         if c[idx] > 0 {
             println!(

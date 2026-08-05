@@ -279,7 +279,7 @@ impl<W: JfifWrite> Encoder<W> {
             // `-trellis 1` when smaller files are worth the time; the BD-rate
             // benefit itself still needs re-measuring on real content, since the
             // cost figure from that same corpus was so far off.
-            trellis: trellis_default(),
+            trellis: false,
             push_blocks: false,
             app_segments: Vec::new(),
         }
@@ -874,17 +874,6 @@ impl<W: JfifWrite> Encoder<W> {
                 for (i, component) in self.components.iter().enumerate() {
                     for v_offset in 0..component.vertical_sampling_factor as usize {
                         for h_offset in 0..component.horizontal_sampling_factor as usize {
-                            if double_stage("getblock") {
-                                let extra = get_block(
-                                    &row[i],
-                                    block_x * 8 * max_h_sampling + (h_offset * 8),
-                                    v_offset * 8,
-                                    max_h_sampling / component.horizontal_sampling_factor as usize,
-                                    max_v_sampling / component.vertical_sampling_factor as usize,
-                                    buffer_width,
-                                );
-                                core::hint::black_box(&extra);
-                            }
                             let mut block = {
                                 let _gb = crate::prof::scope(crate::prof::Stage::GetBlock);
                                 get_block(
@@ -899,32 +888,14 @@ impl<W: JfifWrite> Encoder<W> {
 
                             // The `copy` arm is the null: it pays the scratch
                             // duplication that doubling costs, and nothing else.
-                            if double_stage("copy") {
-                                let scratch = block;
-                                core::hint::black_box(&scratch);
-                            }
-                            if double_stage("fdct") {
-                                let mut scratch = block;
-                                OP::fdct(&mut scratch);
-                                core::hint::black_box(&scratch);
-                            }
-                            if !ablate_enc("fdct") {
+                            {
                                 let _s = crate::prof::scope(crate::prof::Stage::Fdct);
                                 OP::fdct(&mut block);
                             }
 
                             let mut q_block = [0i16; 64];
 
-                            if double_stage("quantize") {
-                                let mut scratch = [0i16; 64];
-                                OP::quantize_block(
-                                    &block,
-                                    &mut scratch,
-                                    &q_tables[component.quantization_table as usize],
-                                );
-                                core::hint::black_box(&scratch);
-                            }
-                            if !ablate_enc("quantize") {
+                            {
                                 let _s = crate::prof::scope(crate::prof::Stage::Quantize);
                                 OP::quantize_block(
                                     &block,
@@ -946,35 +917,6 @@ impl<W: JfifWrite> Encoder<W> {
                                 );
                             }
 
-                            if double_stage("escan") {
-                                // The zero-run SCAN alone: walk all 63 AC
-                                // coefficients and find the non-zeros, without
-                                // encoding anything. Splits the loop's cost from
-                                // the symbol work `entropy` measures.
-                                let mut run = 0u32;
-                                let mut nz = 0u32;
-                                for &v in &q_block[1..64] {
-                                    if v == 0 {
-                                        run += 1;
-                                    } else {
-                                        nz += 1;
-                                        run = 0;
-                                    }
-                                }
-                                core::hint::black_box((run, nz));
-                            }
-                            if double_stage("entropy") {
-                                // `count_block` is the writer's own symbol walk
-                                // with the bit output removed, so this prices the
-                                // run-length/category work but NOT the bit
-                                // packing. Read it as a lower bound on entropy.
-                                let mut dcf = [0u32; 257];
-                                let mut acf = [0u32; 257];
-                                JfifWriter::<W>::count_block(
-                                    &q_block, prev_dc[i], &mut dcf, &mut acf,
-                                );
-                                core::hint::black_box((&dcf, &acf));
-                            }
                             match stats.as_deref_mut() {
                                 Some(st) => {
                                     let _s =
@@ -1815,72 +1757,6 @@ unsafe fn get_block_2x2_simd(
     block
 }
 
-/// `RUSTY_JPEG_ARM=pointsample` restores the old point-sampling downsampler,
-/// so the two can be compared in one binary. Resolved once, not per block.
-/// `RUSTY_JPEG_ARM=slowblock` forces the general clamped path — the A/B arm for
-/// the interior fast path, and the oracle it is gated against.
-/// `RUSTY_JPEG_ABLATE=fdct,quantize,getblock,entropy` — price encoder stages on
-/// the UNINSTRUMENTED binary. The profiled build's per-block scopes carry a ~25%
-/// tax, which is the same order as the stages being measured.
-///
-/// Output is garbage under ablation; these arms exist to price stages, not to
-/// encode. Exit codes are still checked by the harness.
-/// `RUSTY_JPEG_DOUBLE=<stage>` — price an encoder stage by running it TWICE and
-/// taking the delta, instead of by removing it.
-///
-/// Removal cascades: with the FDCT ablated, quantize and entropy see different
-/// coefficients, so every downstream stage changes work and the peel is
-/// meaningless (it once priced quantize at 52% of encode). Doubling does not:
-/// the extra pass writes to scratch and is discarded, so **the output is
-/// byte-identical in every arm** — which makes work-parity provable rather than
-/// assumed, and is the first thing to check before reading any of these numbers.
-///
-/// `cost(stage) = t(double stage) - t(double `copy`)`, where the `copy` arm pays
-/// only the scratch duplication the doubling itself introduces.
-pub(crate) fn double_stage(what: &str) -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<alloc::string::String> = OnceLock::new();
-    let v = V.get_or_init(|| std::env::var("RUSTY_JPEG_DOUBLE").unwrap_or_default());
-    v.split(',').any(|t| t == what)
-}
-
-pub(crate) fn ablate_enc(what: &str) -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<alloc::string::String> = OnceLock::new();
-    let v = V.get_or_init(|| std::env::var("RUSTY_JPEG_ABLATE").unwrap_or_default());
-    v.split(',').any(|t| t == what)
-}
-
-fn trellis_default() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RUSTY_JPEG_TRELLIS")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
-}
-
-fn slow_get_block() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RUSTY_JPEG_ARM")
-            .map(|v| v == "slowblock")
-            .unwrap_or(false)
-    })
-}
-
-fn point_sample_chroma() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RUSTY_JPEG_ARM")
-            .map(|v| v == "pointsample")
-            .unwrap_or(false)
-    })
-}
-
 /// Extract one 8x8 block, box-averaging when the component is subsampled.
 ///
 /// `col_stride`/`row_stride` are the subsampling ratios — 2 and 2 for 4:2:0
@@ -1911,7 +1787,7 @@ fn get_block(
     // forces the scalar oracle.
     #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
     {
-        if !slow_get_block() && !point_sample_chroma() {
+        {
             let h = data.len() / width;
             if col_stride == 1
                 && row_stride == 1
@@ -1941,7 +1817,7 @@ fn get_block(
     }
 
     // Fast path: no subsampling, so there is nothing to average.
-    if (col_stride == 1 && row_stride == 1) || point_sample_chroma() {
+    if col_stride == 1 && row_stride == 1 {
         for y in 0..8 {
             for x in 0..8 {
                 let ix = start_x + (x * col_stride);
@@ -1974,16 +1850,7 @@ fn get_block(
     //
     // `RUSTY_JPEG_ARM=slowblock` forces the general path, so the two can be A/B'd
     // in one binary, and the general path stays as the oracle.
-    let interior = start_x + 8 * col_stride <= width && start_y + 8 * row_stride <= height;
-    crate::prof::bump(
-        if interior {
-            crate::prof::Count::GetBlockInterior
-        } else {
-            crate::prof::Count::GetBlockEdge
-        },
-        1,
-    );
-    if !slow_get_block() && interior {
+    if start_x + 8 * col_stride <= width && start_y + 8 * row_stride <= height {
         if col_stride == 2 && row_stride == 2 {
             // 4:2:0 — the dominant case, worth its own straight-line body.
             for y in 0..8 {

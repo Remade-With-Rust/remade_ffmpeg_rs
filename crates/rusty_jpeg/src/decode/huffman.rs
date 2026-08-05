@@ -1,7 +1,6 @@
 use crate::decode::error::{Error, Result};
 use crate::decode::marker::Marker;
 use crate::decode::parser::ScanInfo;
-use crate::decode::read_u8;
 use alloc::borrow::ToOwned;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -144,10 +143,6 @@ impl HuffmanDecoder {
 
     fn read_bits<R: Read>(&mut self, reader: &mut crate::decode::Buffered<R>) -> Result<()> {
         crate::prof::bump(crate::prof::Count::DecRefills, 1);
-        // Hoisted out of the byte loop: this is a measurement knob, and reading
-        // it per byte would put an atomic load on the hottest path in the
-        // decoder (260k bytes/frame) to serve a switch that never changes.
-        let slow = crate::decode::ablate_slow_bytes();
 
         // Bulk refill: absorb every byte the accumulator has room for in ONE
         // step, when the buffer holds them and none is 0xFF.
@@ -161,7 +156,7 @@ impl HuffmanDecoder {
         // The 0xFF test cannot be skipped: a 0xFF inside the entropy stream is
         // either byte-stuffing or a marker, and both need the slow path. Bailing
         // to it costs nothing because nothing has been consumed yet.
-        if !slow && self.marker.is_none() {
+        if self.marker.is_none() {
             let want = ((64 - self.num_bits) / 8) as usize;
             let avail = reader.buffered();
             if want > 0 && avail.len() >= want && !avail[..want].contains(&0xFF) {
@@ -180,7 +175,6 @@ impl HuffmanDecoder {
             // Fill with zero bits if we have reached the end.
             let byte = match self.marker {
                 Some(_) => 0,
-                None if slow => read_u8(reader)?,
                 None => reader.next_byte()?,
             };
 

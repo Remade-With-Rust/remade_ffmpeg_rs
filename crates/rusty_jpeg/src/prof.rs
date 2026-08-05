@@ -419,26 +419,6 @@ pub enum Count {
     DecFastAcMiss,
     /// Decoder: block pairs put through the AVX2 two-block IDCT.
     DecIdctPairs,
-    /// Decoder: blocks whose coefficients 32..64 (natural order rows 4-7) are
-    /// all zero — candidates for a half-height IDCT column pass.
-    DecBottomHalfZero,
-    /// Decoder: blocks whose coefficients 8..64 are all zero (only the top row
-    /// has energy) — candidates for an even cheaper path.
-    DecTopRowOnly,
-    /// Encoder: `get_block` calls taking the interior (unclamped) fast path.
-    GetBlockInterior,
-    /// Encoder: `get_block` calls needing the clamped path because the sampling
-    /// window overhangs the row buffer.
-    GetBlockEdge,
-    /// Decoder: calls into the upsampler's per-row loop — the entry the unsafe
-    /// backlog names as the densest bounds-check-per-byte site in the crate.
-    /// Zero on the planar path, which returns before `compute_image`.
-    DecUpsampleRows,
-    /// Decoder: summed index of the LAST non-zero coefficient per block, in
-    /// NATURAL order. Divided by block count this gives the average span that
-    /// would have to be cleared if the per-block buffer were cleared by extent
-    /// rather than wholesale.
-    DecCoefSpanSum,
 }
 
 impl Count {
@@ -463,12 +443,6 @@ impl Count {
             Count::DecFastAcHit => "fast_ac_hit",
             Count::DecFastAcMiss => "fast_ac_miss",
             Count::DecIdctPairs => "idct_PAIRS",
-            Count::DecBottomHalfZero => "bottom_half_zero",
-            Count::DecTopRowOnly => "top_row_only",
-            Count::DecCoefSpanSum => "coef_span_sum",
-            Count::DecUpsampleRows => "upsample_rows",
-            Count::GetBlockInterior => "getblock_interior",
-            Count::GetBlockEdge => "getblock_EDGE",
         }
     }
 }

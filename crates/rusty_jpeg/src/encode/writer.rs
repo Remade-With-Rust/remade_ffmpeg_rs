@@ -107,7 +107,6 @@ impl<W: std::io::Write + ?Sized> JfifWrite for W {
 
 pub(crate) struct JfifWriter<W: JfifWrite> {
     w: W,
-    scratch: alloc::vec::Vec<u8>,
     bit_buffer: usize,
     free_bits: i8,
 }
@@ -116,7 +115,6 @@ impl<W: JfifWrite> JfifWriter<W> {
     pub fn new(w: W) -> Self {
         JfifWriter {
             w,
-            scratch: alloc::vec::Vec::new(),
             bit_buffer: 0,
             free_bits: BUFFER_SIZE as i8,
         }
@@ -195,14 +193,6 @@ impl<W: JfifWrite> JfifWriter<W> {
             }
             Ok(())
         } else {
-            if crate::encode::encoder::double_stage("flush") {
-                // Price the sink write itself: same 8 bytes, thrown away.
-                self.scratch
-                    .extend_from_slice(&self.bit_buffer.to_be_bytes());
-                if self.scratch.len() > 4096 {
-                    self.scratch.clear();
-                }
-            }
             self.w.write_all(&self.bit_buffer.to_be_bytes())
         }
     }
@@ -428,39 +418,6 @@ impl<W: JfifWrite> JfifWriter<W> {
         end: usize,
         ac_table: &HuffmanTable,
     ) -> Result<(), EncodingError> {
-        // Visit only the non-zero coefficients.
-        //
-        // The straightforward form walks all 63 AC positions and pays a
-        // data-dependent branch on each, to find the ~16% that are non-zero.
-        // That scan measured **~12-13% of whole encode** by itself — about a
-        // third of all entropy cost. Finding them with a SIMD compare and then
-        // stepping the set bits turns 63 branchy iterations into one mask plus
-        // `popcount` iterations.
-        //
-        // `RUSTY_JPEG_ARM=scanloop` restores the branchy walk as the A/B arm and
-        // the oracle.
-        if slow_ac_scan() {
-            let mut zero_run = 0;
-            for &value in &block[start..end] {
-                if value == 0 {
-                    zero_run += 1;
-                } else {
-                    while zero_run > 15 {
-                        self.huffman_encode(0xF0, ac_table)?;
-                        zero_run -= 16;
-                    }
-                    crate::prof::bump(crate::prof::Count::NonZeroAc, 1);
-                    let (size, value) = get_code(value);
-                    self.huffman_encode_value(size, (zero_run << 4) | size, value, ac_table)?;
-                    zero_run = 0;
-                }
-            }
-            if zero_run > 0 {
-                self.huffman_encode(0x00, ac_table)?;
-            }
-            return Ok(());
-        }
-
         let mut mask = nonzero_mask(block);
         // Restrict to [start, end). Progressive scans use sub-ranges.
         mask &= u64::MAX << start;
@@ -482,9 +439,6 @@ impl<W: JfifWrite> JfifWriter<W> {
             }
 
             crate::prof::bump(crate::prof::Count::NonZeroAc, 1);
-            if crate::encode::encoder::double_stage("getcode") {
-                core::hint::black_box(get_code(block[i]));
-            }
             let (size, value) = get_code(block[i]);
             self.huffman_encode_value(size, (zero_run << 4) | size, value, ac_table)?;
             prev = i + 1;
@@ -609,18 +563,6 @@ fn nonzero_mask_scalar(block: &[i16; 64]) -> u64 {
         mask |= ((v != 0) as u64) << i;
     }
     mask
-}
-
-/// `RUSTY_JPEG_ARM=scanloop` restores the branchy AC walk — the A/B arm for the
-/// mask-driven one, and the oracle it is gated against.
-fn slow_ac_scan() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RUSTY_JPEG_ARM")
-            .map(|v| v == "scanloop")
-            .unwrap_or(false)
-    })
 }
 
 #[inline]

@@ -100,15 +100,4 @@ fn main() {
         jpeg.len()
     );
 
-    // Does the clamped path ever actually run? The encoder pads its row buffer
-    // to MCU boundaries, so "edge block" may be unreachable in practice.
-    if std::env::var("RUSTY_JPEG_COUNTS").is_ok() {
-        use rusty_jpeg::prof::Count;
-        let c = rusty_jpeg::prof::read();
-        println!(
-            "  getblock_interior {}  getblock_EDGE {}",
-            c[Count::GetBlockInterior as usize],
-            c[Count::GetBlockEdge as usize]
-        );
-    }
 }

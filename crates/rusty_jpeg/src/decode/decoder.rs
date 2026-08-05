@@ -1456,19 +1456,6 @@ impl<R: Read> Decoder<R> {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// `RUSTY_JPEG_ABLATE=entropy` — see [`crate::decode::idct::ablate_idct`] for why
-/// ablation rather than instrumentation is the right instrument here.
-pub(crate) fn ablate_entropy() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RUSTY_JPEG_ABLATE")
-            .map(|v| v.split(',').any(|t| t == "entropy"))
-            .unwrap_or(false)
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
 fn decode_block<R: Read>(
     reader: &mut crate::decode::Buffered<R>,
     coefficients: &mut [i16; 64],
@@ -1481,13 +1468,6 @@ fn decode_block<R: Read>(
     dc_predictor: &mut i16,
 ) -> Result<()> {
     let _s = crate::prof::scope(crate::prof::Stage::DecEntropy);
-    if ablate_entropy() {
-        // Cannot skip parsing without desyncing the stream, so this ablation is
-        // only valid on a single-block basis; it exists to price the DC/AC
-        // symbol loop, not to produce an image.
-        coefficients.fill(0);
-        return Ok(());
-    }
     debug_assert_eq!(coefficients.len(), 64);
 
     if spectral_selection.start == 0 {

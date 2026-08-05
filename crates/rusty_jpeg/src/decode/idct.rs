@@ -238,56 +238,12 @@ pub(crate) fn dequantize_and_idct_block(
     }
 }
 
-/// Ablation switches, read once from the environment.
-///
-/// A stage entered millions of times cannot be priced by wrapping it in a
-/// profiler scope — the scope becomes the measurement (an empty one costs ~88
-/// cycles here). The honest instrument for such a stage is **ablation on the
-/// uninstrumented binary**: delete the work, keep every surrounding access, and
-/// difference the wall.
-///
-/// `RUSTY_JPEG_ABLATE=idct` keeps the output stores (so memory traffic is
-/// unchanged) and removes only the transform arithmetic. The result is not a
-/// valid image — this is a measurement build, never a shipped path.
-pub(crate) fn ablate_idct() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RUSTY_JPEG_ABLATE")
-            .map(|v| v.split(',').any(|t| t == "idct"))
-            .unwrap_or(false)
-    })
-}
-
-/// `RUSTY_JPEG_ABLATE=stores` — only meaningful together with `idct`.
-pub(crate) fn ablate_stores() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RUSTY_JPEG_ABLATE")
-            .map(|v| v.split(',').any(|t| t == "stores"))
-            .unwrap_or(false)
-    })
-}
-
 pub fn dequantize_and_idct_block_8x8(
     coefficients: &[i16; 64],
     quantization_table: &[u16; 64],
     output_linestride: usize,
     output: &mut [u8],
 ) {
-    if ablate_idct() {
-        // `idct` keeps the stores and drops the transform, isolating arithmetic
-        // from traffic. `stores` additionally drops the writes, so the pair
-        // separates "what the output plane costs to fill" from everything else.
-        if !ablate_stores() {
-            for row in 0..8 {
-                let start = row * output_linestride;
-                output[start..start + 8].fill(128);
-            }
-        }
-        return;
-    }
     // Whole-block DC-only shortcut.
     //
     // When every AC coefficient is zero the inverse transform's output is a
