@@ -886,14 +886,14 @@ impl<W: JfifWrite> Encoder<W> {
                                 )
                             };
 
-                            {
+                            if !ablate_enc("fdct") {
                                 let _s = crate::prof::scope(crate::prof::Stage::Fdct);
                                 OP::fdct(&mut block);
                             }
 
                             let mut q_block = [0i16; 64];
 
-                            {
+                            if !ablate_enc("quantize") {
                                 let _s = crate::prof::scope(crate::prof::Stage::Quantize);
                                 OP::quantize_block(
                                     &block,
@@ -1075,43 +1075,56 @@ impl<W: JfifWrite> Encoder<W> {
         let mut prev_dc = [0i16; 4];
         let mut restarts = 0usize;
         let mut last_mcu = usize::MAX;
-        let mut pending: Vec<(usize, usize)> = Vec::new();
 
-        // Collect (mcu, component) order first so the writer borrow stays clear
-        // of the closure that walks `blocks`.
-        let mut order: Vec<(usize, usize, [i16; 64])> = Vec::new();
-        Self::for_each_block_interleaved(
-            &components,
-            blocks,
-            grid,
-            mcu_cols,
-            mcu_rows,
-            |mcu, i, b| {
-                order.push((mcu, i, *b));
-            },
-        );
-        pending.clear();
+        // Walk MCU order directly rather than materializing it.
+        //
+        // This used to collect `Vec<(usize, usize, [i16; 64])>` first, purely so
+        // the `self.writer` borrow stayed clear of a closure borrowing `blocks`
+        // — a borrow-checker workaround that copied every block a SECOND time:
+        // 48,960 x 144 B = **7.1 MB per 1080p frame**, on the path the CLI takes
+        // by default (`optimize_huffman` is on unless asked otherwise).
+        //
+        // The traversal is plain index arithmetic, so writing it out inline
+        // costs nothing and borrows only what it reads.
+        for my in 0..mcu_rows {
+            for mx in 0..mcu_cols {
+                let mcu = my * mcu_cols + mx;
+                if restart_interval > 0
+                    && mcu != last_mcu
+                    && mcu % restart_interval == 0
+                    && mcu != 0
+                {
+                    self.writer.finalize_bit_buffer()?;
+                    self.writer
+                        .write_marker(Marker::RST((restarts % 8) as u8))?;
+                    restarts += 1;
+                    prev_dc = [0i16; 4];
+                }
+                last_mcu = mcu;
 
-        for (mcu, i, block) in order {
-            if restart_interval > 0 && mcu != last_mcu && mcu % restart_interval == 0 && mcu != 0 {
-                self.writer.finalize_bit_buffer()?;
-                self.writer
-                    .write_marker(Marker::RST((restarts % 8) as u8))?;
-                restarts += 1;
-                prev_dc = [0i16; 4];
+                for (i, c) in components.iter().enumerate() {
+                    let ch = c.horizontal_sampling_factor as usize;
+                    let cv = c.vertical_sampling_factor as usize;
+                    let (cols_i, rows_i) = grid[i];
+                    for v in 0..cv {
+                        for h in 0..ch {
+                            let bx = (mx * ch + h).min(cols_i - 1);
+                            let by = (my * cv + v).min(rows_i - 1);
+                            let block = &blocks[i][by * cols_i + bx];
+                            {
+                                let _s = crate::prof::scope(crate::prof::Stage::Entropy);
+                                self.writer.write_block(
+                                    block,
+                                    prev_dc[i],
+                                    &self.huffman_tables[c.dc_huffman_table as usize].0,
+                                    &self.huffman_tables[c.ac_huffman_table as usize].1,
+                                )?;
+                            }
+                            prev_dc[i] = block[0];
+                        }
+                    }
+                }
             }
-            last_mcu = mcu;
-            let c = &components[i];
-            {
-                let _s = crate::prof::scope(crate::prof::Stage::Entropy);
-                self.writer.write_block(
-                    &block,
-                    prev_dc[i],
-                    &self.huffman_tables[c.dc_huffman_table as usize].0,
-                    &self.huffman_tables[c.ac_huffman_table as usize].1,
-                )?;
-            }
-            prev_dc[i] = block[0];
         }
         self.writer.finalize_bit_buffer()?;
         Ok(())
@@ -1667,6 +1680,19 @@ const OPTIMIZE_BUFFER_BUDGET: usize = 256 * 1024 * 1024;
 /// so the two can be compared in one binary. Resolved once, not per block.
 /// `RUSTY_JPEG_ARM=slowblock` forces the general clamped path — the A/B arm for
 /// the interior fast path, and the oracle it is gated against.
+/// `RUSTY_JPEG_ABLATE=fdct,quantize,getblock,entropy` — price encoder stages on
+/// the UNINSTRUMENTED binary. The profiled build's per-block scopes carry a ~25%
+/// tax, which is the same order as the stages being measured.
+///
+/// Output is garbage under ablation; these arms exist to price stages, not to
+/// encode. Exit codes are still checked by the harness.
+pub(crate) fn ablate_enc(what: &str) -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<alloc::string::String> = OnceLock::new();
+    let v = V.get_or_init(|| std::env::var("RUSTY_JPEG_ABLATE").unwrap_or_default());
+    v.split(',').any(|t| t == what)
+}
+
 fn trellis_default() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
