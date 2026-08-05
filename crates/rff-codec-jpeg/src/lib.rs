@@ -174,14 +174,13 @@ impl Default for JpegSettings {
             quality: DEFAULT_QUALITY,
             sampling: None,
             progressive: false,
-            // ON by default, matching FFmpeg's mjpeg (`-huffman optimal`).
-            // Building Huffman tables from the image's own histogram is
-            // lossless — decoded pixels are bit-identical — and measured 5.4%
-            // (q95) to 8.0% (q70) smaller on 1080p detail. It costs ~60% encode
-            // time in our implementation (measured in-process, not via the CLI),
-            // which is a known speed brick: FFmpeg does the same work far
-            // cheaper. `-optimize_huffman 0` opts out.
-            optimize_huffman: true,
+            // OFF by default, to match FFmpeg's MJPEG encoder, which has no
+            // optimized-table mode at all — it always writes the fixed standard
+            // tables. Measured on a 40-frame 1080p clip, turning it on costs
+            // **2.09x encode time** for **7.4% smaller files** (27.17 -> 25.17
+            // MB). That is a real and LOSSLESS win, but it is a choice, not a
+            // free one, so it is opt-in: `-optimize_huffman 1`.
+            optimize_huffman: false,
             // Off by default — it costs ~+144% encode time on real footage.
             // `-trellis 1` opts in for smaller files.
             trellis: false,

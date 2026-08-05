@@ -1214,6 +1214,56 @@ bounds-check problem that needs `unsafe`.
 A backlog of `unsafe` opportunities is a list of HYPOTHESES about generated code.
 Reading the emitted assembly costs one command and refutes most of them.
 
+## D2b - the encoder residue, decomposed: it was ENTROPY all along
+
+The encoder profile had a **57-67% unnamed residue**, larger than every named
+stage combined, and two instruments failed to break it open:
+
+- **Ablation cascades.** Removing the FDCT changes the coefficients quantize and
+  entropy then see, so every downstream stage does different work. That peel
+  priced quantize at **52% of encode**, which is nonsense.
+- **The profiled build cannot resolve it either.** Its per-block scopes carry a
+  ~25% tax, and the probe correction over-subtracts exactly the high-call stages
+  being measured - Fdct and Quantize both read **0.00%**.
+
+### The instrument that worked: double-run, not remove
+
+`RUSTY_JPEG_DOUBLE=<stage>` runs a stage TWICE, the second time into scratch that
+is discarded. `cost(stage) = t(double stage) - t(double copy)`.
+
+Why it works where ablation does not: **the output is byte-identical in every
+arm**, so work parity is PROVABLE rather than assumed. Verified before reading a
+single timing - baseline / copy / getblock / fdct / quantize / entropy all emit
+`27,171,752` bytes, md5 `9e2feab0a197`, exit 0.
+
+Paired ABBA against the `copy` null (which pays only the scratch duplication the
+method itself introduces), N=15, 280-frame arms:
+
+| stage | median B/A | z | share |
+|---|---:|---:|---:|
+| **entropy** (symbol walk only) | **1.3365** | **3.87** | **>= 32.7%** |
+| getblock | 1.0680 | 1.81 | ~5.8% (no verdict) |
+| quantize | 1.0541 | 3.36 | ~4.4% |
+| fdct | 1.0375 | 2.84 | ~2.8% |
+| *copy (null)* | *1.0101* | *0.77* | *the floor* |
+
+**ANSWER: the residue is entropy coding.** The profiler had it at 4.85%
+probe-corrected - understated roughly **7x**. And 32.7% is a LOWER BOUND: the
+double calls `count_block`, which is the writer's symbol walk with the bit
+packing removed, so the true figure is higher.
+
+### Transferable
+
+Two instruments disagreed with a third, and the tie-break was not precision but
+**whether the arms did identical work**. Ablation cannot prove that - by
+construction it changes what happens downstream. Doubling can, and a byte-compare
+settles it in one run. When a peel produces a share that cannot be true, suspect
+the cascade before the stopwatch.
+
+Also: the first double-run peel, read as raw pinned medians, put `fdct` BELOW
+baseline - impossible, since doubling only adds work. That was the box, not the
+method; pairing each stage against the null recovered every verdict.
+
 ---
 
 ## Standing rules for this descent

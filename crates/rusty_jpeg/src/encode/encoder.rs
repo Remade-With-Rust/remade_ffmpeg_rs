@@ -874,6 +874,17 @@ impl<W: JfifWrite> Encoder<W> {
                 for (i, component) in self.components.iter().enumerate() {
                     for v_offset in 0..component.vertical_sampling_factor as usize {
                         for h_offset in 0..component.horizontal_sampling_factor as usize {
+                            if double_stage("getblock") {
+                                let extra = get_block(
+                                    &row[i],
+                                    block_x * 8 * max_h_sampling + (h_offset * 8),
+                                    v_offset * 8,
+                                    max_h_sampling / component.horizontal_sampling_factor as usize,
+                                    max_v_sampling / component.vertical_sampling_factor as usize,
+                                    buffer_width,
+                                );
+                                core::hint::black_box(&extra);
+                            }
                             let mut block = {
                                 let _gb = crate::prof::scope(crate::prof::Stage::GetBlock);
                                 get_block(
@@ -886,6 +897,17 @@ impl<W: JfifWrite> Encoder<W> {
                                 )
                             };
 
+                            // The `copy` arm is the null: it pays the scratch
+                            // duplication that doubling costs, and nothing else.
+                            if double_stage("copy") {
+                                let scratch = block;
+                                core::hint::black_box(&scratch);
+                            }
+                            if double_stage("fdct") {
+                                let mut scratch = block;
+                                OP::fdct(&mut scratch);
+                                core::hint::black_box(&scratch);
+                            }
                             if !ablate_enc("fdct") {
                                 let _s = crate::prof::scope(crate::prof::Stage::Fdct);
                                 OP::fdct(&mut block);
@@ -893,6 +915,15 @@ impl<W: JfifWrite> Encoder<W> {
 
                             let mut q_block = [0i16; 64];
 
+                            if double_stage("quantize") {
+                                let mut scratch = [0i16; 64];
+                                OP::quantize_block(
+                                    &block,
+                                    &mut scratch,
+                                    &q_tables[component.quantization_table as usize],
+                                );
+                                core::hint::black_box(&scratch);
+                            }
                             if !ablate_enc("quantize") {
                                 let _s = crate::prof::scope(crate::prof::Stage::Quantize);
                                 OP::quantize_block(
@@ -915,6 +946,18 @@ impl<W: JfifWrite> Encoder<W> {
                                 );
                             }
 
+                            if double_stage("entropy") {
+                                // `count_block` is the writer's own symbol walk
+                                // with the bit output removed, so this prices the
+                                // run-length/category work but NOT the bit
+                                // packing. Read it as a lower bound on entropy.
+                                let mut dcf = [0u32; 257];
+                                let mut acf = [0u32; 257];
+                                JfifWriter::<W>::count_block(
+                                    &q_block, prev_dc[i], &mut dcf, &mut acf,
+                                );
+                                core::hint::black_box((&dcf, &acf));
+                            }
                             match stats.as_deref_mut() {
                                 Some(st) => {
                                     let _s =
@@ -1686,6 +1729,25 @@ const OPTIMIZE_BUFFER_BUDGET: usize = 256 * 1024 * 1024;
 ///
 /// Output is garbage under ablation; these arms exist to price stages, not to
 /// encode. Exit codes are still checked by the harness.
+/// `RUSTY_JPEG_DOUBLE=<stage>` — price an encoder stage by running it TWICE and
+/// taking the delta, instead of by removing it.
+///
+/// Removal cascades: with the FDCT ablated, quantize and entropy see different
+/// coefficients, so every downstream stage changes work and the peel is
+/// meaningless (it once priced quantize at 52% of encode). Doubling does not:
+/// the extra pass writes to scratch and is discarded, so **the output is
+/// byte-identical in every arm** — which makes work-parity provable rather than
+/// assumed, and is the first thing to check before reading any of these numbers.
+///
+/// `cost(stage) = t(double stage) - t(double `copy`)`, where the `copy` arm pays
+/// only the scratch duplication the doubling itself introduces.
+pub(crate) fn double_stage(what: &str) -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<alloc::string::String> = OnceLock::new();
+    let v = V.get_or_init(|| std::env::var("RUSTY_JPEG_DOUBLE").unwrap_or_default());
+    v.split(',').any(|t| t == what)
+}
+
 pub(crate) fn ablate_enc(what: &str) -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<alloc::string::String> = OnceLock::new();
