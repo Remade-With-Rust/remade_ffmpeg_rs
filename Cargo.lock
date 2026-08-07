@@ -4867,6 +4867,7 @@ dependencies = [
  "md-5",
  "rff-codec",
  "rff-codec-aac",
+ "rff-codec-av2",
  "rff-codec-avif",
  "rff-codec-flac",
  "rff-codec-gif",
@@ -4941,6 +4942,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rff-codec-av2"
+version = "0.1.0"
+dependencies = [
+ "rff-codec",
+ "rff-core",
+ "rusty_av2d",
+]
+
+[[package]]
 name = "rff-codec-avif"
 version = "0.1.0"
 dependencies = [
@@ -4970,7 +4980,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-h264"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5527,10 +5537,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "rusty_h264"
-version = "0.2.1"
+name = "rusty_av2d"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "363e230d4077795bce5d9220fbc57adfd992f7b88cb51da61fcc821db94cb11f"
+checksum = "971bc49ff55ebfc05075d5dc1083dcee16f0beb077a02523c07b4518b53398b0"
+dependencies = [
+ "assert_matches",
+ "atomig",
+ "av-data",
+ "bitflags 2.13.0",
+ "cc",
+ "cfg-if",
+ "libc",
+ "nasm-rs",
+ "parking_lot",
+ "paste",
+ "raw-cpuid",
+ "static_assertions",
+ "strum",
+ "to_method",
+ "zerocopy 0.7.35",
+]
+
+[[package]]
+name = "rusty_h264"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fbafa4757ced9c5c1d1185aa936bb040b00c456098874f209e04ed1c1c2d73b"
 dependencies = [
  "rusty_h264-common",
  "rusty_h264-decoder",
@@ -5539,18 +5572,18 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264-accel"
-version = "0.2.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0702d78ddd445e255607ad05d200b9ae0cf02c72a3bd196b896bd352a1c79d4"
+checksum = "2094232cdd4a1048894111dd905bb756402d08436fa7e9513c39829fa21239a6"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "rusty_h264-common"
-version = "0.2.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d55b68927b9fef8e7193b3d646e3a6a53ff48f00e1b3b2c9d0356d1fcf0317a0"
+checksum = "421e458fcfcb2580232f212f99451f9075a03d00752a934ee27be6148a6765e3"
 dependencies = [
  "bytemuck",
  "rusty_h264-accel",
@@ -5559,9 +5592,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264-decoder"
-version = "0.2.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7452c4bdc27d418d17ac7a08e026df05c95b76342aa31a637b270e6e776c0b7"
+checksum = "6316ecba57a77d530fff4fab7be9cc3e0e107e381360ac9d2ffa0895b5b0947a"
 dependencies = [
  "rusty_h264-accel",
  "rusty_h264-common",
@@ -5569,9 +5602,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264-encoder"
-version = "0.2.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30fd45781286cbfb8680a653482610476f91fb51c0565fd1a8637b6d29b5c41f"
+checksum = "f4fb69d8977d1d067d6d603df0614678c4a35ac1201fff38783c8847e429c879"
 dependencies = [
  "rusty_h264-accel",
  "rusty_h264-common",

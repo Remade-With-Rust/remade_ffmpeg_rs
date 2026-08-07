@@ -64,6 +64,7 @@ fn register_builtin_codecs(codecs: &mut CodecRegistry) {
     rff_codec_jxl::register(codecs);
     rff_codec_aac::register(codecs);
     rff_codec_vp9::register(codecs);
+    rff_codec_av2::register(codecs);
     rff_codec_mp3::register(codecs);
     rff_codec_rawvideo::register(codecs);
     // H.264 defaults to the in-house pure-Rust `rusty_h264` (registered above).

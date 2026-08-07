@@ -28,6 +28,7 @@ default-members = [
     "crates/rff-codec-jxl",
     "crates/rff-codec-aac",
     "crates/rff-codec-vp9",
+    "crates/rff-codec-av2",
     "crates/rff-codec-mp3",
     "crates/rusty_vp9",
     "crates/rusty_mp3",
@@ -73,7 +74,7 @@ rust-version = "1.85"
 rff-core = { path = "crates/rff-core", version = "0.1.0" }
 rff-codec = { path = "crates/rff-codec", version = "0.1.0" }
 rff-format = { path = "crates/rff-format", version = "0.1.0" }
-rff-codec-h264 = { path = "crates/rff-codec-h264", version = "0.1.0" }
+rff-codec-h264 = { path = "crates/rff-codec-h264", version = "0.2.0" }
 rff-codec-opus = { path = "crates/rff-codec-opus", version = "0.1.0" }
 rff-codec-avif = { path = "crates/rff-codec-avif", version = "0.1.0" }
 rff-format-avi = { path = "crates/rff-format-avi", version = "0.1.0" }
@@ -92,6 +93,7 @@ rff-codec-flac = { path = "crates/rff-codec-flac", version = "0.1.0" }
 rff-codec-jxl = { path = "crates/rff-codec-jxl", version = "0.1.0" }
 rff-codec-aac = { path = "crates/rff-codec-aac", version = "0.1.0" }
 rff-codec-vp9 = { path = "crates/rff-codec-vp9", version = "0.1.0" }
+rff-codec-av2 = { path = "crates/rff-codec-av2", version = "0.1.0" }
 rff-codec-mp3 = { path = "crates/rff-codec-mp3", version = "0.1.0" }
 # Standalone, publishable codec cores (the `rusty_h264` pattern: pure codec
 # crate + thin rff-codec-* adapter). Independent 0.1.x versions — these ship

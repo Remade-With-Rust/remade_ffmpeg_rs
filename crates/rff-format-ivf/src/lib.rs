@@ -66,15 +66,18 @@ impl Muxer for IvfMuxer {
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
         let s = streams
             .first()
-            .filter(|s| s.codec_id == CodecId::Vp9)
-            .ok_or_else(|| Error::unsupported("ivf mux: needs a single `vp9` stream"))?;
+            .filter(|s| fourcc_from_codec(s.codec_id).is_some())
+            .ok_or_else(|| {
+                Error::unsupported("ivf mux: needs a single `vp9`, `av1` or `av2` stream")
+            })?;
+        let fourcc = fourcc_from_codec(s.codec_id).expect("filtered above");
         // fps num:den = 1/time_base = time_base.den : time_base.num.
         let (fnum, fden) = (s.time_base.den.max(1) as u32, s.time_base.num.max(1) as u32);
         let mut h = Vec::with_capacity(32);
         h.extend_from_slice(b"DKIF");
         h.extend_from_slice(&0u16.to_le_bytes()); // version
         h.extend_from_slice(&32u16.to_le_bytes()); // header length
-        h.extend_from_slice(b"VP90"); // fourcc
+        h.extend_from_slice(fourcc); // fourcc
         h.extend_from_slice(&(s.width as u16).to_le_bytes());
         h.extend_from_slice(&(s.height as u16).to_le_bytes());
         h.extend_from_slice(&fnum.to_le_bytes()); // framerate numerator
@@ -126,6 +129,31 @@ impl IvfDemuxer {
     }
 }
 
+/// Map an IVF fourcc (bytes 8..12 of the header) onto a codec id.
+///
+/// IVF is a bare frame-length container with no codec description beyond this
+/// tag, so it is the only thing distinguishing a VP9 stream from an AV1 or AV2
+/// one. Assuming VP9 here silently hands AV2 packets to the VP9 decoder.
+fn codec_from_fourcc(tag: &[u8]) -> Result<CodecId> {
+    match tag {
+        b"VP90" => Ok(CodecId::Vp9),
+        b"AV02" => Ok(CodecId::Av2),
+        other => Err(Error::unsupported(format!(
+            "ivf demux: unsupported fourcc {:?}",
+            String::from_utf8_lossy(other)
+        ))),
+    }
+}
+
+/// The IVF fourcc to write for a codec, or `None` if IVF cannot carry it.
+fn fourcc_from_codec(id: CodecId) -> Option<&'static [u8; 4]> {
+    match id {
+        CodecId::Vp9 => Some(b"VP90"),
+        CodecId::Av2 => Some(b"AV02"),
+        _ => None,
+    }
+}
+
 impl Demuxer for IvfDemuxer {
     fn read_header(&mut self) -> Result<Vec<Stream>> {
         let mut input = self
@@ -142,7 +170,7 @@ impl Demuxer for IvfDemuxer {
         let fden = rd_u32(&self.buf, 20).max(1);
         self.pos = rd_u16(&self.buf, 6).max(32) as usize; // header length
 
-        let mut stream = Stream::new(0, CodecId::Vp9);
+        let mut stream = Stream::new(0, codec_from_fourcc(&self.buf[8..12])?);
         stream.width = width;
         stream.height = height;
         stream.time_base = Rational::new(fden as i32, fnum as i32);
