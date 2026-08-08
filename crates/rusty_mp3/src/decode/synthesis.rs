@@ -93,25 +93,55 @@ pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; G
     let d = &SYNTH_D;
     let mut pcm = [0f32; GRANULE_LINES];
 
+    // **D2** — the V FIFO is addressed circularly rather than shifted. Logical
+    // index `L` (0 = newest) lives at physical `(head + L) & 1023`, so advancing
+    // the FIFO by 64 is a subtraction on `head` instead of a 960-float memmove.
+    //
+    // The old form moved 960 floats on every one of the 18 passes — 17,280 float
+    // moves per granule per channel, ~17.5 GB across a 7-minute track. Here the
+    // only movement is one 1024-float rotation at the end, 16.9x less.
+    //
+    // Every span stays contiguous, so nothing is given up in exchange: `head` is
+    // always a multiple of 64, `i*128` a multiple of 128, and 1024 a multiple of
+    // 32 — so each 32-long run sits inside one 32-aligned block and never wraps
+    // mid-run.
+    let mut head = 0usize;
+
     for v in 0..SUBBAND_LINES {
         // Gather this pass's 32 subband samples.
         let mut s = [0f32; SUBBANDS];
         for (k, sv) in s.iter_mut().enumerate() {
             *sv = time[k * SUBBAND_LINES + v];
         }
-        // Shift V down by 64, then matrix the new 64 values into the front.
-        fifo.copy_within(0..1024 - 64, 64);
-        fifo[..64].copy_from_slice(&matrixing_fast(&s));
+        // Advance V by 64 and matrix the new 64 values into the front.
+        head = (head + 1024 - 64) & 1023;
+        fifo[head..head + 64].copy_from_slice(&matrixing_fast(&s));
         // Build U from V, window with D, sum 16 taps → one PCM sample per j.
-        for j in 0..32 {
-            let mut sum = 0f32;
-            for i in 0..8 {
-                sum += fifo[i * 128 + j] * d[i * 64 + j];
-                sum += fifo[i * 128 + 96 + j] * d[i * 64 + 32 + j];
+        //
+        // `i` outer, `j` inner: each of the four operands is then a CONTIGUOUS
+        // 32-float run, which auto-vectorizes. The old `j`-outer form walked the
+        // FIFO with a stride of 128 floats in its inner loop, which cannot
+        // vectorize, and it recomputed the two circular indices 32 times over.
+        //
+        // Each `out[j]` still accumulates its 16 taps in the original order
+        // (i ascending, the `a` term before the `b` term), so this is
+        // bit-identical, not merely close.
+        let out = &mut pcm[v * 32..v * 32 + 32];
+        out.fill(0.0);
+        for i in 0..8 {
+            let a = (head + i * 128) & 1023;
+            let b = (head + i * 128 + 96) & 1023;
+            let (fa, fb) = (&fifo[a..a + 32], &fifo[b..b + 32]);
+            let (da, db) = (&d[i * 64..i * 64 + 32], &d[i * 64 + 32..i * 64 + 64]);
+            for j in 0..32 {
+                out[j] += fa[j] * da[j];
+                out[j] += fb[j] * db[j];
             }
-            pcm[v * 32 + j] = sum;
         }
     }
+    // Restore the canonical `head == 0` layout the caller's state is defined in:
+    // 18 passes advanced head by 18*64 = 1152 ≡ 128 (mod 1024), leaving it at 896.
+    fifo.rotate_left(head);
     pcm
 }
 
