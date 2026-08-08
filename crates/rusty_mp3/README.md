@@ -81,6 +81,40 @@ means "feed more input", `Err(Error::Eof)` means the flushed stream is fully
 drained. Lower-level building blocks (frame-level `Mp3Decode`/`Mp3Encode`,
 `header::FrameHeader`, bit I/O, ISO tables) are public too.
 
+## Performance
+
+Measured on a real 6:53 stereo 44.1 kHz music track (412.9 s, 15,806 frames) at
+CBR 192 kbps.
+
+**0.4.0** caches the psychoacoustic model's FFT twiddle factors — they depend
+only on the transform size, but were rebuilt on every call, which cost ~1.26 M
+`cos`/`sin` evaluations across the track to produce ten distinct values — and
+reuses the mid/side scratch across frames instead of reallocating it:
+
+|                                     | before   | after        |
+| ----------------------------------- | -------- | ------------ |
+| encode CPU (median of 41 pairs)     | 7,047 ms | **6,766 ms** |
+| allocations per frame               | 32.06    | **21.06**    |
+| zero-filled allocations / 800 frames | 8,000    | **2**        |
+
+**1.045× faster encode**, 33/41 paired wins, z = 3.90. The output is
+byte-identical across the change (same md5 over the full track), so both arms
+are provably doing the same work rather than one of them doing less. Decode is
+untouched at 5.04 allocations per frame — its per-block path was already
+allocation-free.
+
+Method: pinned to one core at High priority, CPU time rather than wall,
+arms ABBA-interleaved, 41 pairs, with a null arm (the same binary against
+itself) reading 1.017 as the session's resolution floor. This is a
+same-binary-family delta, not a cross-implementation ratio.
+
+The allocation counts are reproducible with the bundled instrument, which
+counts through whichever global allocator the binary sets:
+
+```sh
+cargo run -p rusty_mp3 --release --example allocaudit -- 800 192
+```
+
 ## Part of Remade With Rust
 
 This crate is the standalone MP3 engine of
