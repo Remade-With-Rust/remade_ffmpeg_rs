@@ -87,6 +87,76 @@ fn matrixing_fast(s: &[f32; SUBBANDS]) -> [f32; 64] {
     vv
 }
 
+/// **D4** — AVX twin of the 16-tap windowing sum, 8 outputs per lane.
+///
+/// BIT-IDENTICAL to the scalar loop, not merely close: each output `j` stays in
+/// its own lane and accumulates its 16 taps in the original order (i ascending,
+/// the `a` term before the `b` term), and separate `mul`+`add` are used rather
+/// than FMA — an FMA would round once where the scalar rounds twice. Pinned by
+/// `window_simd_matches_scalar`.
+///
+/// Worth doing because auto-vectorization demonstrably did NOT happen here:
+/// `--emit asm` on the scalar version counts 0 packed ops against 1698 scalar
+/// ones, even after the operands were made contiguous.
+///
+/// # Safety
+/// Caller must have verified AVX is available. `out` must be 32 floats, and
+/// `a`/`b` must each leave 32 floats in bounds of `fifo`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn window_avx(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let mut acc = [unsafe { _mm256_setzero_ps() }; 4];
+    for i in 0..8 {
+        let a = (head + i * 128) & 1023;
+        let b = (head + i * 128 + 96) & 1023;
+        for (v, accv) in acc.iter_mut().enumerate() {
+            unsafe {
+                let fa = _mm256_loadu_ps(fifo.as_ptr().add(a + v * 8));
+                let da = _mm256_loadu_ps(d.as_ptr().add(i * 64 + v * 8));
+                *accv = _mm256_add_ps(*accv, _mm256_mul_ps(fa, da));
+                let fb = _mm256_loadu_ps(fifo.as_ptr().add(b + v * 8));
+                let db = _mm256_loadu_ps(d.as_ptr().add(i * 64 + 32 + v * 8));
+                *accv = _mm256_add_ps(*accv, _mm256_mul_ps(fb, db));
+            }
+        }
+    }
+    for (v, accv) in acc.iter().enumerate() {
+        unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(v * 8), *accv) };
+    }
+}
+
+/// The scalar windowing sum — the oracle the SIMD twin is gated against, and the
+/// fallback on machines without AVX.
+#[inline]
+fn window_scalar(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut [f32]) {
+    out.fill(0.0);
+    for i in 0..8 {
+        let a = (head + i * 128) & 1023;
+        let b = (head + i * 128 + 96) & 1023;
+        let (fa, fb) = (&fifo[a..a + 32], &fifo[b..b + 32]);
+        let (da, db) = (&d[i * 64..i * 64 + 32], &d[i * 64 + 32..i * 64 + 64]);
+        for j in 0..32 {
+            out[j] += fa[j] * da[j];
+            out[j] += fb[j] * db[j];
+        }
+    }
+}
+
+/// Resolve the windowing kernel ONCE per call rather than per pass — a feature
+/// check inside the 18-pass loop is overhead added to take a measurement.
+#[inline]
+fn have_avx() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 /// Run the synthesis filterbank for one channel's granule (subband-major `time`),
 /// returning 576 PCM samples. `fifo` is the persistent `V[]` state.
 pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; GRANULE_LINES] {
@@ -106,6 +176,9 @@ pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; G
     // 32 — so each 32-long run sits inside one 32-aligned block and never wraps
     // mid-run.
     let mut head = 0usize;
+    // Resolved once per call, not per pass (codec-measurement: the A/B switch
+    // itself is measurement overhead if it sits in the hot loop).
+    let avx = have_avx();
 
     for v in 0..SUBBAND_LINES {
         // Gather this pass's 32 subband samples.
@@ -127,16 +200,15 @@ pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; G
         // (i ascending, the `a` term before the `b` term), so this is
         // bit-identical, not merely close.
         let out = &mut pcm[v * 32..v * 32 + 32];
-        out.fill(0.0);
-        for i in 0..8 {
-            let a = (head + i * 128) & 1023;
-            let b = (head + i * 128 + 96) & 1023;
-            let (fa, fb) = (&fifo[a..a + 32], &fifo[b..b + 32]);
-            let (da, db) = (&d[i * 64..i * 64 + 32], &d[i * 64 + 32..i * 64 + 64]);
-            for j in 0..32 {
-                out[j] += fa[j] * da[j];
-                out[j] += fb[j] * db[j];
-            }
+        if avx {
+            // SAFETY: `avx` was resolved from runtime detection before the loop;
+            // `head` is a multiple of 64 so both spans leave 32 floats in bounds.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                window_avx(fifo, d, head, out)
+            };
+        } else {
+            window_scalar(fifo, d, head, out);
         }
     }
     // Restore the canonical `head == 0` layout the caller's state is defined in:
@@ -148,6 +220,42 @@ pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; G
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **D4 gate.** The AVX windowing twin must be BIT-identical to the scalar
+    /// oracle — not within a tolerance. It can be, because each output stays in
+    /// its own lane and accumulates in the original order, and the kernel uses
+    /// separate mul+add rather than FMA (an FMA rounds once where the scalar
+    /// rounds twice, which would change the result).
+    ///
+    /// Swept over every legal `head` (multiples of 64) so the circular wrap is
+    /// covered, with random FIFO contents.
+    #[test]
+    fn window_simd_matches_scalar() {
+        if !have_avx() {
+            eprintln!("AVX unavailable on this host - scalar path only, gate skipped");
+            return;
+        }
+        let mut st = 0x7F4A_7C15u32;
+        let mut rng = || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (st >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        let mut fifo = [0f32; 1024];
+        for f in fifo.iter_mut() {
+            *f = rng();
+        }
+        let d = &SYNTH_D;
+        for head in (0..1024).step_by(64) {
+            let mut a = [0f32; 32];
+            let mut b = [0f32; 32];
+            window_scalar(&fifo, d, head, &mut a);
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                window_avx(&fifo, d, head, &mut b)
+            };
+            assert_eq!(a, b, "SIMD/scalar mismatch at head={head}");
+        }
+    }
 
     #[test]
     fn matrix_matches_cosine_formula() {
