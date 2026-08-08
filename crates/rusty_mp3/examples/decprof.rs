@@ -81,4 +81,5 @@ fn main() {
     // ~1% here -- small enough to read shares from, too big to quote as absolute
     // decode time. Price it before trusting a residue.
     rusty_mp3::decode::prof::dump();
+    rusty_mp3::decode::prof::census();
 }

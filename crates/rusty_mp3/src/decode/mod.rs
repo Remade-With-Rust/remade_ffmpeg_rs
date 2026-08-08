@@ -42,6 +42,34 @@ pub mod prof {
     pub static IMDCT: AtomicU64 = AtomicU64::new(0);
     pub static SYNTH: AtomicU64 = AtomicU64::new(0);
 
+    /// Deterministic block-type census, counted per granule x channel. A stage
+    /// share tells you which path is hot; this tells you what POPULATION that
+    /// path serves — the two IMDCT paths (36-point long vs 3x12-point short)
+    /// have different kernels, so "the IMDCT got 2x cheaper" is only a claim
+    /// about the population these counters actually saw.
+    pub static N_LONG: AtomicU64 = AtomicU64::new(0);
+    pub static N_SHORT: AtomicU64 = AtomicU64::new(0);
+    /// Mixed blocks: short overall, but the lowest two subbands stay long, so
+    /// they exercise BOTH IMDCT paths within one granule.
+    pub static N_MIXED: AtomicU64 = AtomicU64::new(0);
+
+    /// Print the block-type census and reset it.
+    pub fn census() {
+        let (l, s, m) = (
+            N_LONG.swap(0, Ordering::Relaxed),
+            N_SHORT.swap(0, Ordering::Relaxed),
+            N_MIXED.swap(0, Ordering::Relaxed),
+        );
+        let tot = (l + s + m).max(1);
+        eprintln!(
+            "  block census: long {l} ({:.1}%), short {s} ({:.1}%), mixed {m} ({:.1}%)  \
+             [granule x channel]",
+            100.0 * l as f64 / tot as f64,
+            100.0 * s as f64 / tot as f64,
+            100.0 * m as f64 / tot as f64,
+        );
+    }
+
     #[inline]
     pub fn time<T>(bucket: &AtomicU64, f: impl FnOnce() -> T) -> T {
         let t = Instant::now();
@@ -131,6 +159,17 @@ impl Mp3Decode {
             let mut spectrum = GranuleSpectrum::default();
             for ch in 0..channels {
                 let gi = &si.granules[gr][ch];
+                // Block-type census: which IMDCT path this granule/channel takes.
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let short = gi.window_switching
+                        && gi.block_type == crate::frame::BlockType::Short;
+                    match (short, gi.mixed_block) {
+                        (true, true) => prof::N_MIXED.fetch_add(1, Relaxed),
+                        (true, false) => prof::N_SHORT.fetch_add(1, Relaxed),
+                        _ => prof::N_LONG.fetch_add(1, Relaxed),
+                    };
+                }
                 // part2 (scalefactors) + part3 (Huffman) share one bit budget.
                 let part2_3_start = bit_pos;
                 let prev = if gr == 1 {

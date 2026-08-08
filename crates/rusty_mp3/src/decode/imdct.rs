@@ -170,6 +170,109 @@ pub fn hybrid(
 mod tests {
     use super::*;
 
+    /// The pre-D3 dense IMDCT, verbatim: every one of the 36 (or 3x12) outputs
+    /// computed as its own full dot product. Kept as the oracle the half-work
+    /// form is gated against.
+    fn hybrid_dense(
+        gi: &GranuleSideInfo,
+        lines: &[f32; GRANULE_LINES],
+        overlap: &mut [f32; GRANULE_LINES],
+    ) -> [f32; GRANULE_LINES] {
+        let t = kernels();
+        let mut out = [0f32; GRANULE_LINES];
+        let is_short = gi.window_switching && gi.block_type == BlockType::Short;
+        for sb in 0..SUBBANDS {
+            let base = sb * SUBBAND_LINES;
+            let mut samp = [0f32; 36];
+            let short_here = is_short && !(gi.mixed_block && sb < 2);
+            if short_here {
+                for w in 0..3 {
+                    let mut y = [0f32; 12];
+                    for n in 0..12 {
+                        let mut acc = 0f32;
+                        for k in 0..6 {
+                            acc += lines[base + w + 3 * k] * t.cos12[n][k];
+                        }
+                        y[n] = acc * t.win_short[n];
+                    }
+                    for n in 0..12 {
+                        samp[6 + w * 6 + n] += y[n];
+                    }
+                }
+            } else {
+                let wt = match gi.block_type {
+                    BlockType::Start => 1,
+                    BlockType::Stop => 3,
+                    _ => 0,
+                };
+                for n in 0..36 {
+                    let mut acc = 0f32;
+                    for k in 0..18 {
+                        acc += lines[base + k] * t.cos36[n][k];
+                    }
+                    samp[n] = acc * t.win[wt][n];
+                }
+            }
+            for n in 0..18 {
+                out[base + n] = samp[n] + overlap[base + n];
+                overlap[base + n] = samp[n + 18];
+            }
+            if sb & 1 == 1 {
+                let mut i = 1;
+                while i < 18 {
+                    out[base + i] = -out[base + i];
+                    i += 2;
+                }
+            }
+        }
+        out
+    }
+
+    /// **D3 corpus-gap closer.** The 15-stream decode corpus covers long and
+    /// short blocks (15-37% short) but shows MIXED blocks at 0.0% on every
+    /// stream — LAME simply never emits them, so no LAME-sourced corpus can
+    /// reach that path. Rather than claim coverage we do not have, the mixed
+    /// case (and every other block type) is gated directly against the dense
+    /// oracle here, asserting BIT-identity, not a tolerance.
+    #[test]
+    fn half_work_imdct_matches_dense_for_every_block_type() {
+        let mut s = 0x9E37_79B9u32;
+        let mut rng = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        for &(bt, mixed) in &[
+            (BlockType::Long, false),
+            (BlockType::Start, false),
+            (BlockType::Stop, false),
+            (BlockType::Short, false),
+            (BlockType::Short, true), // the population the corpus cannot reach
+        ] {
+            let gi = GranuleSideInfo {
+                window_switching: bt != BlockType::Long,
+                block_type: bt,
+                mixed_block: mixed,
+                ..Default::default()
+            };
+            // Several granules in sequence, so the overlap state carries across
+            // exactly as it does in a real stream.
+            let (mut ov_a, mut ov_b) = ([0f32; GRANULE_LINES], [0f32; GRANULE_LINES]);
+            for g in 0..4 {
+                let mut lines = [0f32; GRANULE_LINES];
+                for l in lines.iter_mut() {
+                    *l = rng();
+                }
+                let fast = hybrid(&gi, &lines, &mut ov_a);
+                let dense = hybrid_dense(&gi, &lines, &mut ov_b);
+                assert_eq!(
+                    fast, dense,
+                    "block_type={bt:?} mixed={mixed} granule={g}: half-work IMDCT diverged from dense"
+                );
+                assert_eq!(ov_a, ov_b, "overlap diverged: block_type={bt:?} mixed={mixed}");
+            }
+        }
+    }
+
     /// **D3 gate.** The half-work IMDCT is bit-identical ONLY because these four
     /// symmetries hold exactly in the stored f32 tables — not merely to within a
     /// tolerance. If the table generation is ever changed (different argument
