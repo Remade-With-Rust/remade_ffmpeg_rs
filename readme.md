@@ -36,7 +36,7 @@
 | VP9 encode, 1 thread | 1.0× | **~0.3×**, at **~+36% bitrate** — matched settings, equal PSNR | → parity |
 | AAC encode (60 s stereo) | 1.0× | **~6× faster** — frame-parallel (ffmpeg's AAC is 1-thread); ~1.15× single-thread | maintain |
 | Vorbis encode (stereo music) | 1.0× | **~5.3× faster** — frame-parallel; the **first permissive-Rust Vorbis encoder** | → single-thread |
-| Opus encode (`libopus`) | 1.0× | **1.0–1.5× faster single-thread** (fair, 1 core each; speech + music) · **2–4× faster** wall-clock (frame-parallel) | maintain |
+| Opus encode (`libopus`) | 1.0× | **1.50× faster** CELT speech · **1.60×** stereo music · **0.96×** SILK — 1 core each, pinned CPU, coding path verified; **quality at parity** (mean −0.015 BD-ODG, 18 classes) · frame-parallel adds wall-clock on top | maintain |
 | PNG decode | 1.0× | **2.55–2.89× faster** (median 2.60×) — 1 core each, decode-only, identical work | maintain |
 | PNG encode | 1.0× | **0.94–1.05× per core** on public CLIC photographs, **0.86–0.91×** on video frames — encode-only from raw, matched filter *and* size, at 0.2–0.3% *smaller* · **2.11–3.06× faster** wall-clock (block-parallel) | → per-core parity on video frames |
 | License + embedding | LGPL/GPL · C FFI | **Apache-2.0 · pure Rust · no FFI** | — |

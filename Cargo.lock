@@ -4908,6 +4908,7 @@ dependencies = [
  "rff-format-y4m",
  "rff-io",
  "rff-resample",
+ "rusty_alloc-api",
 ]
 
 [[package]]
@@ -5074,6 +5075,7 @@ version = "0.1.0"
 dependencies = [
  "rff-codec",
  "rff-core",
+ "rusty_alloc-api",
  "rusty_vp9",
 ]
 
@@ -5295,6 +5297,7 @@ dependencies = [
  "rff",
  "rff-auth",
  "rff-core",
+ "rusty_alloc-api",
  "serde",
  "serde_json",
  "tokio",
@@ -5312,6 +5315,7 @@ version = "0.1.0"
 dependencies = [
  "dioxus",
  "rff",
+ "rusty_alloc-api",
 ]
 
 [[package]]
@@ -5471,13 +5475,16 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rusty-opus"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d35ebf558b608a93f940e0293f47bf9d0fe9d2ce599b301c36cecd219c8cac71"
+checksum = "aa2cbb720cf9bed36712efbae9ffc89d8977bf51b05687b792c1f98a33add8e2"
 
 [[package]]
 name = "rusty_aac"
 version = "0.1.1"
+dependencies = [
+ "rusty_alloc-api",
+]
 
 [[package]]
 name = "rusty_alloc"
@@ -5633,11 +5640,15 @@ name = "rusty_jpeg"
 version = "0.3.2"
 dependencies = [
  "rayon",
+ "rusty_alloc-api",
 ]
 
 [[package]]
 name = "rusty_mp3"
-version = "0.1.1"
+version = "0.4.0"
+dependencies = [
+ "rusty_alloc-api",
+]
 
 [[package]]
 name = "rusty_png"
@@ -5653,6 +5664,7 @@ dependencies = [
  "glob",
  "miniz_oxide",
  "rand 0.8.6",
+ "rusty_alloc-api",
  "simd-adler32",
 ]
 
