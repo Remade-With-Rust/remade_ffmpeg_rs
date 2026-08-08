@@ -72,6 +72,74 @@ fn matrixing_fast(s: &[f32; SUBBANDS]) -> [f32; 64] {
         *gm = acc;
     }
     // Map G → the 64 V outputs by sign/index (V[16] = 0).
+    expand_g(&g)
+}
+
+/// `half_dct` transposed to `[k][m]`, so the 32 outputs `G[m]` are CONTIGUOUS
+/// for a fixed `k`. Built once.
+///
+/// This is what makes the matrixing vectorisable without reassociating anything:
+/// the natural loop reduces over `k` (a horizontal sum, which would need
+/// reassociation and stop being bit-identical), but with `m` as the lane, each
+/// `G[m]` accumulates over `k` in the ORIGINAL order, independently.
+fn half_dct_t() -> &'static [[f32; 32]; 16] {
+    static T: OnceLock<[[f32; 32]; 16]> = OnceLock::new();
+    T.get_or_init(|| {
+        let c = half_dct();
+        let mut t = [[0f32; 32]; 16];
+        for (m, row) in c.iter().enumerate() {
+            for (k, v) in row.iter().enumerate() {
+                t[k][m] = *v;
+            }
+        }
+        t
+    })
+}
+
+/// **D5** — AVX twin of [`matrixing_fast`], 8 of the 32 `G[m]` per lane.
+///
+/// Bit-identical for the same reason as [`window_avx`]: `m` is the lane, so each
+/// output accumulates its 16 terms in the original `k` order, with separate
+/// mul+add rather than FMA. The even/odd `m` split (even takes the sum-folded
+/// input, odd the difference-folded one) becomes a single blend, because a
+/// lane group always starts on an even `m`.
+///
+/// # Safety
+/// Caller must have verified AVX is available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn matrixing_avx(s: &[f32; SUBBANDS]) -> [f32; 64] {
+    use std::arch::x86_64::*;
+    let ct = half_dct_t();
+    let mut plus = [0f32; 16];
+    let mut minus = [0f32; 16];
+    for k in 0..16 {
+        plus[k] = s[k] + s[31 - k];
+        minus[k] = s[k] - s[31 - k];
+    }
+    let mut acc = [unsafe { _mm256_setzero_ps() }; 4];
+    for k in 0..16 {
+        unsafe {
+            // Lane m takes plus[k] when m is even, minus[k] when odd. Each group
+            // of 8 starts at a multiple of 8, hence always even, so one mask does.
+            let src = _mm256_blend_ps(_mm256_set1_ps(plus[k]), _mm256_set1_ps(minus[k]), 0xAA);
+            for (v, accv) in acc.iter_mut().enumerate() {
+                let c = _mm256_loadu_ps(ct[k].as_ptr().add(v * 8));
+                *accv = _mm256_add_ps(*accv, _mm256_mul_ps(c, src));
+            }
+        }
+    }
+    let mut g = [0f32; 32];
+    for (v, accv) in acc.iter().enumerate() {
+        unsafe { _mm256_storeu_ps(g.as_mut_ptr().add(v * 8), *accv) };
+    }
+    expand_g(&g)
+}
+
+/// Map the 32 distinct DCT outputs onto the 64 `V` values by sign and index
+/// (`V[16]` is identically zero). Shared by the scalar and AVX matrixing.
+#[inline]
+fn expand_g(g: &[f32; 32]) -> [f32; 64] {
     let mut vv = [0f32; 64];
     for (i, vi) in vv.iter_mut().enumerate() {
         *vi = if i < 16 {
@@ -188,7 +256,16 @@ pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; G
         }
         // Advance V by 64 and matrix the new 64 values into the front.
         head = (head + 1024 - 64) & 1023;
-        fifo[head..head + 64].copy_from_slice(&matrixing_fast(&s));
+        let vv = if avx {
+            // SAFETY: `avx` came from runtime detection above.
+            #[cfg(target_arch = "x86_64")]
+            { unsafe { matrixing_avx(&s) } }
+            #[cfg(not(target_arch = "x86_64"))]
+            { matrixing_fast(&s) }
+        } else {
+            matrixing_fast(&s)
+        };
+        fifo[head..head + 64].copy_from_slice(&vv);
         // Build U from V, window with D, sum 16 taps → one PCM sample per j.
         //
         // `i` outer, `j` inner: each of the four operands is then a CONTIGUOUS
@@ -220,6 +297,34 @@ pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; G
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **D5 gate.** The AVX matrixing must be BIT-identical to the scalar
+    /// `matrixing_fast`. It can be, because `m` is the lane: each of the 32
+    /// outputs accumulates its 16 terms in the original `k` order, so nothing is
+    /// reassociated. (Reducing over `k` instead — the natural SIMD shape — would
+    /// be a horizontal sum and would NOT be bit-identical.)
+    #[test]
+    fn matrixing_simd_matches_scalar() {
+        if !have_avx() {
+            eprintln!("AVX unavailable on this host - scalar path only, gate skipped");
+            return;
+        }
+        let mut st = 0x3C6E_F372u32;
+        let mut rng = || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (st >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        for trial in 0..64 {
+            let mut s = [0f32; SUBBANDS];
+            for v in s.iter_mut() {
+                *v = rng();
+            }
+            let a = matrixing_fast(&s);
+            #[cfg(target_arch = "x86_64")]
+            let b = unsafe { matrixing_avx(&s) };
+            assert_eq!(a, b, "matrixing SIMD/scalar mismatch on trial {trial}");
+        }
+    }
 
     /// **D4 gate.** The AVX windowing twin must be BIT-identical to the scalar
     /// oracle — not within a tolerance. It can be, because each output stays in
