@@ -92,12 +92,23 @@ pub fn hybrid(
         if short_here {
             for w in 0..3 {
                 let mut y = [0f32; 12];
-                for n in 0..12 {
+                // The 12-point kernel carries the same two exact symmetries:
+                // cos12[5−n][k] == −cos12[n][k] and cos12[17−n][k] == +cos12[n][k].
+                for n in 0..3 {
                     let mut acc = 0f32;
                     for k in 0..6 {
                         acc += lines[base + w + 3 * k] * t.cos12[n][k];
                     }
                     y[n] = acc * t.win_short[n];
+                    y[5 - n] = -acc * t.win_short[5 - n];
+                }
+                for n in 6..9 {
+                    let mut acc = 0f32;
+                    for k in 0..6 {
+                        acc += lines[base + w + 3 * k] * t.cos12[n][k];
+                    }
+                    y[n] = acc * t.win_short[n];
+                    y[17 - n] = acc * t.win_short[17 - n];
                 }
                 for n in 0..12 {
                     samp[6 + w * 6 + n] += y[n];
@@ -109,12 +120,32 @@ pub fn hybrid(
                 BlockType::Stop => 3,
                 _ => 0,
             };
-            for n in 0..36 {
+            // **D3** — half the dot products are free. The kernel has two exact
+            // symmetries, and they hold BIT-EXACTLY in the stored f32 tables
+            // (pinned by `imdct_kernel_symmetries_are_bit_exact`):
+            //
+            //   cos36[17−n][k] == −cos36[n][k]   (first half, antisymmetric)
+            //   cos36[53−n][k] == +cos36[n][k]   (second half, symmetric)
+            //
+            // Because IEEE multiplication and round-to-nearest-even are both
+            // sign-symmetric, `Σ lines[k]·(−c[k])` is EXACTLY `−Σ lines[k]·c[k]`.
+            // So the mirrored output is bit-identical to computing its own dot
+            // product, not an approximation of it — 36×18 MACs become 18×18.
+            for n in 0..9 {
                 let mut acc = 0f32;
                 for k in 0..18 {
                     acc += lines[base + k] * t.cos36[n][k];
                 }
                 samp[n] = acc * t.win[wt][n];
+                samp[17 - n] = -acc * t.win[wt][17 - n];
+            }
+            for n in 18..27 {
+                let mut acc = 0f32;
+                for k in 0..18 {
+                    acc += lines[base + k] * t.cos36[n][k];
+                }
+                samp[n] = acc * t.win[wt][n];
+                samp[53 - n] = acc * t.win[wt][53 - n];
             }
         }
 
@@ -138,6 +169,36 @@ pub fn hybrid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **D3 gate.** The half-work IMDCT is bit-identical ONLY because these four
+    /// symmetries hold exactly in the stored f32 tables — not merely to within a
+    /// tolerance. If the table generation is ever changed (different argument
+    /// form, f32 math instead of f64, a fast-cos), this fires here rather than
+    /// letting the decoder drift off FFmpeg conformance silently.
+    #[test]
+    fn imdct_kernel_symmetries_are_bit_exact() {
+        let t = kernels();
+        for n in 0..9 {
+            for k in 0..18 {
+                assert_eq!(t.cos36[17 - n][k], -t.cos36[n][k], "cos36 antisym n={n} k={k}");
+            }
+        }
+        for n in 18..27 {
+            for k in 0..18 {
+                assert_eq!(t.cos36[53 - n][k], t.cos36[n][k], "cos36 sym n={n} k={k}");
+            }
+        }
+        for n in 0..3 {
+            for k in 0..6 {
+                assert_eq!(t.cos12[5 - n][k], -t.cos12[n][k], "cos12 antisym n={n} k={k}");
+            }
+        }
+        for n in 6..9 {
+            for k in 0..6 {
+                assert_eq!(t.cos12[17 - n][k], t.cos12[n][k], "cos12 sym n={n} k={k}");
+            }
+        }
+    }
 
     #[test]
     fn long_imdct_impulse_matches_formula() {
