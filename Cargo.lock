@@ -5470,9 +5470,9 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rusty-opus"
-version = "0.1.26"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecb6dae84d3fe8ad7d5043b807565570c2b40fc1450587bb8d6b6614d8706912"
+checksum = "d35ebf558b608a93f940e0293f47bf9d0fe9d2ce599b301c36cecd219c8cac71"
 
 [[package]]
 name = "rusty_aac"
