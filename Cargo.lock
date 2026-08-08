@@ -5481,7 +5481,7 @@ checksum = "aa2cbb720cf9bed36712efbae9ffc89d8977bf51b05687b792c1f98a33add8e2"
 
 [[package]]
 name = "rusty_aac"
-version = "0.1.1"
+version = "0.4.0"
 dependencies = [
  "rusty_alloc-api",
 ]
@@ -5645,7 +5645,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_mp3"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "rusty_alloc-api",
 ]
