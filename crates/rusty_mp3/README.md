@@ -115,6 +115,53 @@ counts through whichever global allocator the binary sets:
 cargo run -p rusty_mp3 --release --example allocaudit -- 800 192
 ```
 
+### VBR correctness — 0.5.0
+
+**If you use `-q:a` / `vbr_quality`, upgrade.** Every release up to and
+including 0.4.1 produced VBR streams that FFmpeg rejects (`invalid new backstep
+-1`) and that decode to noise. Three stacked defects:
+
+- the masking thresholds (FFT power domain) were compared directly against
+  quantization noise (MDCT domain), scales ~10⁴ apart — so the gain search
+  saturated at the coarsest setting for 97.5% of granules and every quality
+  setting produced the same ~39 kbps;
+- the quality scale was inverted (NMR ≥ 1 means noise *at or above* the masking
+  threshold, so even the best setting asked for audible noise);
+- with those fixed, quality could demand more bits than the largest legal frame
+  holds, and the overflow corrupted the bit-reservoir back-pointer.
+
+Measured on 60 s of real guitar, ours at each `-q:a`:
+
+| `-q:a` | kbps | SNR | FFmpeg decode |
+| ------ | ---- | --- | ------------- |
+| 0 | 315.1 | 54.47 dB | clean |
+| 4 | 300.3 | 47.34 dB | clean |
+| 9 | 143.8 | 9.01 dB | clean |
+
+CBR is unaffected and byte-identical across the change.
+
+Two known limits, stated rather than implied: short blocks still take the CBR
+budget rather than the quality target (short-block masking thresholds are not
+modelled yet), and the ladder sits above LAME's at matched `-q:a`, which is a
+rate-quality calibration question needing PEAQ rather than SNR.
+
+### Decode — 0.5.0 (SIMD)
+
+Two AVX kernels in the synthesis filterbank, both **bit-identical** to their
+scalar twins (each output owns a lane and accumulates in the original order;
+separate mul+add, never FMA). Runtime-detected, with the scalar paths kept as
+oracles and as the fallback.
+
+| kernel | share of the win |
+| ------ | ---------------- |
+| matrixing (`matrixing_avx`) | **1.162×** whole decode, 31/31 pairs, z = 5.57 |
+| windowing (`window_avx`) | 1.019×, 23/31 pairs, z = 2.69 |
+
+The gap between those two is the useful part: same stage, same instruction set,
+same effort, 16.2% versus 1.9%. Auto-vectorization had produced **0 packed ops
+against 1698 scalar ones** in this kernel, but "the stage is hot" was still not
+enough to aim a kernel — it took the split *within* the stage.
+
 ### Decode — 0.4.1
 
 Three structural changes, measured on a real 27.5-minute stereo stream encoded
