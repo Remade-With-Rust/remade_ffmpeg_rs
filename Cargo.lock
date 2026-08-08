@@ -5470,9 +5470,9 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rusty-opus"
-version = "0.1.25"
+version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92af285dd859c9424fc79b893d4e091cefbde3b51c0503ab49a9de565ca4b9a7"
+checksum = "ecb6dae84d3fe8ad7d5043b807565570c2b40fc1450587bb8d6b6614d8706912"
 
 [[package]]
 name = "rusty_aac"
@@ -5538,18 +5538,16 @@ dependencies = [
 
 [[package]]
 name = "rusty_av2d"
-version = "0.1.3"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "971bc49ff55ebfc05075d5dc1083dcee16f0beb077a02523c07b4518b53398b0"
+checksum = "7f651c39d3c2b7c8cefc19c589908c2552c1349bed8e6da851cf1ac7f06399f8"
 dependencies = [
  "assert_matches",
  "atomig",
  "av-data",
  "bitflags 2.13.0",
- "cc",
  "cfg-if",
  "libc",
- "nasm-rs",
  "parking_lot",
  "paste",
  "raw-cpuid",
