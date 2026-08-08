@@ -15,9 +15,35 @@ format is royalty-free everywhere.
   crates.io** — existing options are FFI bindings to LAME. MPEG-1/2/2.5, CBR
   and VBR, mono/stereo/joint (mid/side) stereo, psychoacoustic model with
   transient block switching, and a **bit reservoir** (default-on for MPEG-1 CBR
-  ≤ 256 kbps) that puts it at PEAQ parity with LAME across 96–256 kbps on the
-  content we've measured. Known gap: the reservoir is disabled at 320 kbps and
-  for MPEG-2/2.5 (fixed-frame path is used there instead).
+  ≤ 256 kbps). Quality currently sits **~0.3–0.46 ODG behind LAME** at matched
+  bitrate — close, but not parity; see [Quality](#quality) for the measured
+  table. Known gaps: the reservoir is disabled at 320 kbps and for MPEG-2/2.5
+  (fixed-frame path is used there instead), and the per-band distortion loop is
+  effectively inert, so we pick a global gain per granule where LAME shapes
+  noise per band.
+
+## Quality
+
+PEAQ ODG at matched **actual** bitrate on real music. Matching `-q:a` between
+encoders does not match the rate, so it proves nothing — everything here is
+compared at the rate we actually produced.
+
+| point | ours | LAME | gap |
+| ----- | ---- | ---- | --- |
+| CBR 192 kbps | −0.28 | +0.01 | **0.29** |
+| CBR 128 kbps | −1.28 | −0.90 | **0.37** |
+| VBR 192 kbps | −0.44 | +0.01 | **0.45** |
+| VBR 128 kbps | −1.36 | −0.90 | **0.46** |
+| VBR 80 kbps | −3.07 | −2.77 | **0.30** |
+| *VBR ~200 kbps, 0.5.1 and earlier* | *−3.50* | *+0.01* | *3.51* |
+
+ODG runs 0 (imperceptible) to −4 (very annoying). So we are consistently a
+few tenths behind LAME rather than at parity, and the VBR path — which was
+three ODG adrift through 0.5.1 — now sits in the same band as CBR.
+
+An earlier revision of this README claimed PEAQ parity across 96–256 kbps. That
+predated measuring against LAME at matched bitrate with an external oracle; the
+numbers above supersede it.
 
 ## Decode
 
