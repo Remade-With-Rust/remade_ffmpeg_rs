@@ -140,10 +140,33 @@ Measured on 60 s of real guitar, ours at each `-q:a`:
 
 CBR is unaffected and byte-identical across the change.
 
-Two known limits, stated rather than implied: short blocks still take the CBR
-budget rather than the quality target (short-block masking thresholds are not
-modelled yet), and the ladder sits above LAME's at matched `-q:a`, which is a
-rate-quality calibration question needing PEAQ rather than SNR.
+**VBR is conformant and responsive, but its quality is NOT yet competitive.**
+Measured with PEAQ ODG at matched *actual* bitrate on real music — the only
+comparison that means anything, since matching `-q:a` between encoders does not
+match the rate:
+
+| mode | ours | LAME | gap |
+| ---- | ---- | ---- | --- |
+| CBR 192 kbps | −0.28 | +0.01 | 0.29 |
+| CBR 128 kbps | −1.28 | −0.90 | 0.37 |
+| **VBR ~200 kbps** | **−3.50** | +0.01 | **3.51** |
+| **VBR ~268 kbps** | **−3.75** | −0.07 | **3.68** |
+
+So **CBR is close to LAME and VBR is not.** The tell that this is a defect
+rather than tuning: VBR at 268 kbps scores worse than CBR at 192 kbps — the same
+quantizer cannot be worse with 40% more bits unless it is choosing badly. It is.
+The VBR gain search targets a noise-to-mask ratio that is dimensionless but
+*unanchored*, so it settles on a globally too-coarse quantizer that per-band
+scalefactor shaping cannot rescue.
+
+**Use CBR (`-b:a`) for quality work until this is fixed.** VBR output is valid
+and decodes correctly everywhere; it just spends its bits badly. The fix is to
+route VBR through the same two-loop quantizer CBR uses, driven by a
+quality-derived bit budget, rather than the separate NMR search.
+
+Short blocks honour `-q:a` as of 0.5.0, but via long-band masking thresholds
+mapped onto the short grid — the psychoacoustic model does not yet produce
+short-block thresholds of its own.
 
 ### Decode — 0.5.0 (SIMD)
 
