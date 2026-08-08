@@ -179,6 +179,29 @@ jxl-oxide = "0.12"
 #    "burden of immaturity" until a hardened pure-Rust provider lands.
 #  * roots come from the OS trust store via rustls-native-certs (Apache/ISC/MIT),
 #    deliberately NOT the MPL-2.0 `webpki-roots` Mozilla bundle.
+# Allocator: our own rusty_alloc (pure-Rust remake of mimalloc v2.4.5, MIT).
+# `rusty_alloc-api` is the safe GlobalAlloc surface. PROJECT CONVENTION: every
+# encoder-carrying binary in this workspace (rff-cli bins, rff-server, rff-ui,
+# codec benches/examples) sets `RustyAlloc` as `#[global_allocator]` — it is the
+# primary allocator. Library crates must NOT set it (that would hijack
+# downstream consumers' allocator choice); it belongs in [[bin]]/bench roots
+# only.
+#
+# Two things that trip people up when auditing this:
+#  * A `#[global_allocator]` anywhere in the linked graph applies program-wide.
+#    The four rff-cli bins declare none of their own — they inherit it from
+#    rff-cli/src/lib.rs. Grepping the bin files reports them as missing; they
+#    are not.
+#  * Benches and examples are SEPARATE compilation units. They link the library
+#    (which correctly declares none), so each needs its own declaration or it
+#    silently benchmarks the system heap while the shipped binary runs on
+#    rusty_alloc. Measured gap on AV2 decode: 1.38x.
+#
+# One external exception: `rusty_h264-common` declares the allocator in a
+# LIBRARY behind a default-on `global-alloc` feature. That would hard-error
+# against the declaration above, so `rff-codec-h264` pins it with
+# `default-features = false`. Do not remove that.
+rusty_alloc-api = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.0.2-alpha"
 rustls-native-certs = "0.8"
