@@ -38,16 +38,36 @@ impl<'a> BitReader<'a> {
     /// Look at the next `n` bits (0..=32) MSB-first without consuming them, zero-
     /// padding past the end of the buffer (matching [`read`](Self::read)). The Huffman LUT
     /// peeks `max_len` bits, then [`skip`](Self::skip)s the matched codeword.
+    ///
+    /// Reads those bits in O(1) by loading eight bytes big-endian and shifting,
+    /// instead of looping once per bit.
+    ///
+    /// Eight bytes always suffice: the field starts at a bit offset of 0..=7 and
+    /// `n <= 32`, so `7 + 32 = 39` bits are always inside the 64-bit window. Past
+    /// the end of `data` the window zero-fills, matching the old loop's
+    /// `unwrap_or(0)`. Byte-for-byte the same bits — `peek_matches_bitwise_reference`
+    /// pins it against the original implementation.
     pub fn peek(&self, n: u32) -> u32 {
-        let mut v = 0u32;
-        let mut p = self.pos;
-        for _ in 0..n {
-            let byte = self.data.get(p >> 3).copied().unwrap_or(0);
-            let bit = (byte >> (7 - (p & 7))) & 1;
-            v = (v << 1) | bit as u32;
-            p += 1;
+        if n == 0 {
+            return 0; // `>> 64` would overflow; the old loop returned 0 here.
         }
-        v
+        let byte_idx = self.pos >> 3;
+        let bit_off = (self.pos & 7) as u32;
+        let word = match self.data.get(byte_idx..byte_idx + 8) {
+            // Fast path: eight bytes are in bounds, one unaligned load.
+            Some(w) => u64::from_be_bytes(w.try_into().unwrap()),
+            // Tail: zero-fill past the end, as the bitwise loop did. `byte_idx`
+            // may be entirely past `data`, so clamp the start before slicing —
+            // `data[byte_idx..byte_idx]` still panics when byte_idx > len.
+            None => {
+                let start = byte_idx.min(self.data.len());
+                let take = (self.data.len() - start).min(8);
+                let mut buf = [0u8; 8];
+                buf[..take].copy_from_slice(&self.data[start..start + take]);
+                u64::from_be_bytes(buf)
+            }
+        };
+        ((word << bit_off) >> (64 - n)) as u32
     }
 
     /// Advance the bit cursor by `n` bits (after a [`peek`](Self::peek)).
@@ -102,5 +122,58 @@ impl BitWriter {
             self.bytes.push(self.cur);
         }
         self.bytes
+    }
+}
+
+#[cfg(test)]
+mod peek_tests {
+    use super::*;
+
+    /// The original bit-at-a-time implementation, kept forever as the oracle the
+    /// word-load `peek` is gated against (codec-optimize: the slow version stays
+    /// in the tree as the correctness reference).
+    fn peek_bitwise(data: &[u8], pos: usize, n: u32) -> u32 {
+        let mut v = 0u32;
+        let mut p = pos;
+        for _ in 0..n {
+            let byte = data.get(p >> 3).copied().unwrap_or(0);
+            let bit = (byte >> (7 - (p & 7))) & 1;
+            v = (v << 1) | bit as u32;
+            p += 1;
+        }
+        v
+    }
+
+    /// Every bit offset x every width, including n=0, widths up to 32, and
+    /// positions that run off the end of the buffer (where both must zero-fill).
+    #[test]
+    fn peek_matches_bitwise_reference() {
+        let mut s = 0x2545_F491u32;
+        let data: Vec<u8> = (0..64)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect();
+        // Walk past the end so the zero-fill tail path is covered too.
+        for pos in 0..(data.len() * 8 + 40) {
+            for n in 0..=32u32 {
+                let r = BitReader { data: &data, pos };
+                assert_eq!(
+                    r.peek(n),
+                    peek_bitwise(&data, pos, n),
+                    "mismatch at pos={pos} n={n}"
+                );
+            }
+        }
+    }
+
+    /// An empty buffer must not panic and must read as all-zero.
+    #[test]
+    fn peek_on_empty_buffer_is_zero() {
+        let r = BitReader { data: &[], pos: 0 };
+        for n in 0..=32u32 {
+            assert_eq!(r.peek(n), 0);
+        }
     }
 }
