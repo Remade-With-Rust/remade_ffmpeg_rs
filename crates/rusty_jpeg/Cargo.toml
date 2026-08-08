@@ -46,3 +46,7 @@ counters = []
 
 [dependencies]
 rayon = { version = "1.5.1", optional = true }
+
+[dev-dependencies]
+# global allocator for bench/example roots (see project convention)
+rusty_alloc-api.workspace = true

@@ -17,6 +17,7 @@ name = "rff-server"
 path = "src/main.rs"
 
 [dependencies]
+rusty_alloc-api.workspace = true
 rff.workspace = true
 rff-core.workspace = true
 rff-auth.workspace = true

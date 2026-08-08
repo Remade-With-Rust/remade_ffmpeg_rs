@@ -18,6 +18,7 @@ name = "rff-ui"
 path = "src/main.rs"
 
 [dependencies]
+rusty_alloc-api.workspace = true
 # The Dioxus desktop renderer pulls a system webview (WebView2 on Windows), so
 # this crate is excluded from the workspace default build. Build it explicitly:
 #   cargo build -p rff-ui

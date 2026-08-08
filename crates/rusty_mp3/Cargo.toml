@@ -34,3 +34,7 @@ required-features = ["lab"]
 [[example]]
 name = "mp3quality"
 required-features = ["lab"]
+
+[dev-dependencies]
+# global allocator for bench/example roots (see project convention)
+rusty_alloc-api.workspace = true

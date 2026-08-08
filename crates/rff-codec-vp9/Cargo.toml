@@ -18,6 +18,8 @@ rff-codec.workspace = true
 rusty_vp9.workspace = true
 
 [dev-dependencies]
+# global allocator for bench/example roots (see project convention)
+rusty_alloc-api.workspace = true
 # Benchmark uses internal crates only — no third-party harness — so it adds
 # nothing to the dependency / license graph.
 rff-core.workspace = true

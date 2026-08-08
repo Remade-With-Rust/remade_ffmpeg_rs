@@ -91,6 +91,8 @@ miniz_oxide = { version = "0.8", features = ["simd"] }
 simd-adler32 = "0.3"
 
 [dev-dependencies]
+# global allocator for bench/example roots (see project convention)
+rusty_alloc-api.workspace = true
 approx = "0.5.1"
 byteorder = "1.5.0"
 criterion = "0.4.0"
