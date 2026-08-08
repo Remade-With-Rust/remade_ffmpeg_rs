@@ -74,6 +74,10 @@ pub struct StreamCodec {
     pub codec: CodecId,
     /// Codec options (`-b:v 2M`, `-crf 23`, ...).
     pub options: Dictionary,
+    /// Output sample format pinned by the codec NAME (`-c:a pcm_s16le`) or by
+    /// `-sample_fmt`. `None` = take whatever the decoder emits. Without this,
+    /// raw-PCM output silently ignored the format half of its own codec name.
+    pub sample_format: Option<SampleFormat>,
 }
 
 /// Which input stream(s) a `-map` entry selects.
@@ -155,6 +159,8 @@ enum StreamOp {
         overlay: Option<(VideoFrame, u32, u32)>,
         /// Sample rate the encoder needs (0 = no audio resampling required).
         target_rate: u32,
+        /// Sample format the output pins (`-c:a pcm_s16le`), if any.
+        target_sample_format: Option<SampleFormat>,
         /// Lazily built once the first audio frame reveals the input rate.
         resampler: Option<Resampler>,
         /// Pixel formats the encoder accepts (`None` = anything).
@@ -231,6 +237,49 @@ fn f32_frame(samples: Vec<f32>, rate: u32, channels: u16, pts: Option<i64>) -> F
         planes: vec![bytes],
         pts,
     })
+}
+
+/// Convert an audio frame to `target` sample format, if one is pinned and the
+/// frame is not already in it. The audio analogue of `conform_video`: raw PCM
+/// output declares its format in the container header, so the frames handed to
+/// the muxer must actually BE that format, not merely be labelled it.
+fn conform_sample_format(target: Option<SampleFormat>, frame: Frame) -> Result<Frame> {
+    let Some(target) = target else {
+        return Ok(frame);
+    };
+    let Frame::Audio(af) = frame else {
+        return Ok(frame);
+    };
+    if af.format == target {
+        return Ok(Frame::Audio(af));
+    }
+    let samples = audio_to_f32(&af)?;
+    let planes = match target {
+        SampleFormat::F32 => vec![samples.iter().flat_map(|s| s.to_le_bytes()).collect()],
+        SampleFormat::S16 => vec![samples
+            .iter()
+            .flat_map(|s| {
+                // Round-to-nearest and clamp, matching the usual f32->s16 rule:
+                // truncation would bias every sample toward zero.
+                let v = (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+                v.to_le_bytes()
+            })
+            .collect()],
+        other => {
+            return Err(Error::unsupported(format!(
+                "sample format conversion to `{}` (only interleaved s16/f32)",
+                other.name()
+            )))
+        }
+    };
+    Ok(Frame::Audio(AudioFrame {
+        sample_rate: af.sample_rate,
+        channels: af.channels,
+        format: target,
+        samples: af.samples,
+        planes,
+        pts: af.pts,
+    }))
 }
 
 /// Resample an audio frame to `target_rate` if needed (the resampler is built
@@ -377,6 +426,7 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
         output_owned.video_codec = Some(StreamCodec {
             codec: CodecId::RawVideo,
             options: Dictionary::default(),
+            sample_format: None, // video: no audio sample format to pin
         });
         &output_owned
     } else {
@@ -591,9 +641,15 @@ fn build_op(
             os.color_range = filters.output_color_range().unwrap_or(source_range);
             os.sample_rate = out_rate;
             os.channels = stream.channels;
-            // Compressed-audio decoders (AAC/Opus/Vorbis/FLAC) emit f32; default
-            // the output stream to that when the input doesn't declare a format.
-            os.sample_format = stream.sample_format.or(Some(SampleFormat::F32));
+            // A format pinned by the output codec NAME (`-c:a pcm_s16le`) wins:
+            // it is an explicit request, and the muxer writes it into the
+            // container header before any frame is seen. Otherwise compressed
+            // decoders (AAC/Opus/Vorbis/FLAC/MP3) emit f32, so default to that
+            // when the input doesn't declare a format.
+            let target_sample_format = target.sample_format;
+            os.sample_format = target_sample_format
+                .or(stream.sample_format)
+                .or(Some(SampleFormat::F32));
             // Audio encoders timestamp packets in per-channel samples, so the
             // output stream's time base is 1/sample_rate.
             if stream.media_type == MediaType::Audio && out_rate > 0 {
@@ -606,6 +662,7 @@ fn build_op(
                     filters,
                     overlay: None,
                     target_rate,
+                    target_sample_format,
                     resampler: None,
                     accepted_formats,
                     pixel_converter: None,
@@ -710,6 +767,7 @@ fn process_packet(
             filters,
             overlay,
             target_rate,
+            target_sample_format,
             resampler,
             accepted_formats,
             pixel_converter,
@@ -734,6 +792,7 @@ fn process_packet(
                         let frame = apply_filters(filters, frame)?;
                         let frame = apply_overlay(overlay, frame)?;
                         let frame = conform_audio(resampler, *target_rate, frame)?;
+                        let frame = conform_sample_format(*target_sample_format, frame)?;
                         let frame =
                             conform_video(pixel_converter, accepted_formats, *source_range, frame)?;
                         encoder.send_frame(&frame)?;
@@ -762,6 +821,7 @@ fn flush_streams(
             filters,
             overlay,
             target_rate,
+            target_sample_format,
             resampler,
             accepted_formats,
             pixel_converter,
@@ -792,6 +852,7 @@ fn flush_streams(
                     let frame = apply_filters(filters, frame)?;
                     let frame = apply_overlay(overlay, frame)?;
                     let frame = conform_audio(resampler, *target_rate, frame)?;
+                    let frame = conform_sample_format(*target_sample_format, frame)?;
                     let frame =
                         conform_video(pixel_converter, accepted_formats, *source_range, frame)?;
                     encoder.send_frame(&frame)?;
@@ -865,4 +926,66 @@ fn resolve_output_format(engine: &Engine, output: &OutputSpec) -> Result<String>
         .by_extension(ext)
         .map(|f| f.name.to_string())
         .ok_or_else(|| Error::MuxerNotFound(output.path.display().to_string()))
+}
+
+#[cfg(test)]
+mod sample_format_tests {
+    use super::*;
+
+    fn f32_af(samples: &[f32]) -> Frame {
+        f32_frame(samples.to_vec(), 44_100, 1, Some(0))
+    }
+
+    /// `-c:a pcm_s16le` used to be silently ignored on decode: the codec NAME
+    /// carries the format but `CodecId` does not, so raw output kept whatever
+    /// the decoder emitted (f32), writing double the bytes under an s16 request.
+    #[test]
+    fn pinned_format_converts_f32_to_s16() {
+        let src = [0.0f32, 0.5, -0.5, 1.0, -1.0];
+        let out = conform_sample_format(Some(SampleFormat::S16), f32_af(&src)).unwrap();
+        let Frame::Audio(af) = out else { unreachable!() };
+        assert_eq!(af.format, SampleFormat::S16);
+        assert_eq!(af.planes[0].len(), src.len() * 2, "s16 is 2 bytes/sample");
+        let got: Vec<i16> = af.planes[0]
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        // Round-to-nearest, and full scale must CLAMP rather than wrap: 1.0 maps
+        // to 32767, not to -32768 via overflow.
+        assert_eq!(got, vec![0, 16384, -16384, 32767, -32768]);
+    }
+
+    /// No pin, or a frame already in the target format, must pass through
+    /// untouched — the conversion is not allowed to cost anything when idle.
+    #[test]
+    fn unpinned_or_matching_format_is_a_passthrough() {
+        let src = [0.25f32, -0.25];
+        let Frame::Audio(a) = conform_sample_format(None, f32_af(&src)).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(a.format, SampleFormat::F32);
+        let Frame::Audio(b) =
+            conform_sample_format(Some(SampleFormat::F32), f32_af(&src)).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(b.format, SampleFormat::F32);
+        assert_eq!(b.planes[0], a.planes[0]);
+    }
+
+    /// The codec name is the only place the format lives for raw PCM.
+    #[test]
+    fn codec_name_pins_the_sample_format() {
+        assert_eq!(
+            CodecId::sample_format_from_name("pcm_s16le"),
+            Some(SampleFormat::S16)
+        );
+        assert_eq!(
+            CodecId::sample_format_from_name("pcm_f32le"),
+            Some(SampleFormat::F32)
+        );
+        // Bare `pcm` pins nothing, and compressed codecs never do.
+        assert_eq!(CodecId::sample_format_from_name("pcm"), None);
+        assert_eq!(CodecId::sample_format_from_name("mp3"), None);
+    }
 }

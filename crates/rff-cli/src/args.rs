@@ -69,6 +69,10 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut out_format: Option<String> = None;
     let mut video_codec: Option<CodecId> = None;
     let mut audio_codec: Option<CodecId> = None;
+    // Sample format pinned by the codec NAME (`-c:a pcm_s16le`) or by an
+    // explicit `-sample_fmt`. Kept separate from the codec id, which is
+    // format-agnostic by design.
+    let mut audio_sample_format: Option<rff_core::SampleFormat> = None;
     let mut video_opts = Dictionary::new();
     let mut audio_opts = Dictionary::new();
     // Options given WITHOUT a `:v`/`:a` stream specifier that more than one
@@ -145,6 +149,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                     &name,
                     &mut video_codec,
                     &mut audio_codec,
+                    &mut audio_sample_format,
                     &mut warnings,
                 );
             }
@@ -155,6 +160,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                     &name,
                     &mut video_codec,
                     &mut audio_codec,
+                    &mut audio_sample_format,
                     &mut warnings,
                 );
             }
@@ -165,6 +171,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                     &name,
                     &mut video_codec,
                     &mut audio_codec,
+                    &mut audio_sample_format,
                     &mut warnings,
                 );
             }
@@ -313,10 +320,12 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         video_codec: video_codec.map(|codec| StreamCodec {
             codec,
             options: video_opts,
+            sample_format: None,
         }),
         audio_codec: audio_codec.map(|codec| StreamCodec {
             codec,
             options: audio_opts,
+            sample_format: audio_sample_format,
         }),
         video_filters,
         filter_complex,
@@ -353,6 +362,7 @@ fn apply_codec(
     name: &str,
     video: &mut Option<CodecId>,
     audio: &mut Option<CodecId>,
+    audio_format: &mut Option<rff_core::SampleFormat>,
     warnings: &mut Vec<String>,
 ) {
     if name == "copy" {
@@ -363,14 +373,26 @@ fn apply_codec(
         warnings.push(format!("unknown codec `{name}` (ignored)"));
         return;
     };
+    // `pcm_s16le` vs `pcm_f32le` differ only in the name; keep what it pins.
+    let pinned = CodecId::sample_format_from_name(name);
     match spec {
         Some(s) if s.starts_with('v') => *video = Some(id),
-        Some(s) if s.starts_with('a') => *audio = Some(id),
+        Some(s) if s.starts_with('a') => {
+            *audio = Some(id);
+            if pinned.is_some() {
+                *audio_format = pinned;
+            }
+        }
         Some(s) if s.starts_with('s') => { /* subtitle codecs: not yet modeled */ }
         // No specifier: apply to whichever media type this codec is.
         None => match id.media_type() {
             rff_core::MediaType::Video => *video = Some(id),
-            rff_core::MediaType::Audio => *audio = Some(id),
+            rff_core::MediaType::Audio => {
+                *audio = Some(id);
+                if pinned.is_some() {
+                    *audio_format = pinned;
+                }
+            }
             _ => {}
         },
         _ => {}

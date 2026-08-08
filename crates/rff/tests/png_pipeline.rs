@@ -68,6 +68,7 @@ fn transcode(engine: &Engine, input: &Path, output: &Path, codec: CodecId, vf: &
             video_codec: Some(StreamCodec {
                 codec,
                 options: Dictionary::new(),
+                sample_format: None,
             }),
             audio_codec: None,
             video_filters: Some(vf.to_string()),

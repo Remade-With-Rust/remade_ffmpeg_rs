@@ -54,6 +54,7 @@ fn transcode(engine: &Engine, input: &Path, output: &Path, codec: CodecId) {
             audio_codec: Some(StreamCodec {
                 codec,
                 options: Dictionary::new(),
+                sample_format: None,
             }),
             video_filters: None,
             filter_complex: None,

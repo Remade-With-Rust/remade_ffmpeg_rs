@@ -138,6 +138,21 @@ impl CodecId {
         }
     }
 
+    /// The sample format a codec NAME pins, when the name carries one.
+    ///
+    /// `CodecId` is deliberately format-agnostic — `pcm_s16le` and `pcm_f32le`
+    /// are both [`CodecId::Pcm`] — but for raw PCM the name IS the format, and
+    /// dropping it means `-c:a pcm_s16le` silently writes whatever the decoder
+    /// happened to emit. Compressed codecs return `None`: their sample format is
+    /// an internal detail, not something the CLI name selects.
+    pub fn sample_format_from_name(name: &str) -> Option<SampleFormat> {
+        match name {
+            "pcm_s16le" => Some(SampleFormat::S16),
+            "pcm_f32le" => Some(SampleFormat::F32),
+            _ => None,
+        }
+    }
+
     /// Look up a codec id from its canonical CLI name.
     pub fn from_name(name: &str) -> Option<CodecId> {
         match name {

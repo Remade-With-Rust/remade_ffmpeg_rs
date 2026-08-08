@@ -85,6 +85,7 @@ fn transcode_sniffs_extensionless_input() {
             video_codec: Some(StreamCodec {
                 codec: CodecId::Avif,
                 options: Dictionary::new(),
+                sample_format: None,
             }),
             audio_codec: None,
             video_filters: None,

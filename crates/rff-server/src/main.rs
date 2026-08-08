@@ -179,10 +179,12 @@ async fn transcode(
             video_codec: video_codec.map(|codec| StreamCodec {
                 codec,
                 options: Dictionary::new(),
+                sample_format: None,
             }),
             audio_codec: audio_codec.map(|codec| StreamCodec {
                 codec,
                 options: Dictionary::new(),
+                sample_format: None,
             }),
             video_filters: req.video_filters,
             filter_complex: req.filter_complex,

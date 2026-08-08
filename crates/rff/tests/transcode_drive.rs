@@ -109,6 +109,7 @@ fn drive_loop_transcodes_avif_to_avif() {
             video_codec: Some(StreamCodec {
                 codec: CodecId::Avif,
                 options: Dictionary::new(),
+                sample_format: None,
             }),
             audio_codec: None,
             video_filters: None,
@@ -205,6 +206,7 @@ fn drive_loop_applies_scale_filter() {
             video_codec: Some(StreamCodec {
                 codec: CodecId::Avif,
                 options: Dictionary::new(),
+                sample_format: None,
             }),
             audio_codec: None,
             video_filters: Some("scale=32:24".into()),

@@ -88,6 +88,7 @@ fn wav_transcode_preserves_pcm() {
             audio_codec: Some(StreamCodec {
                 codec: CodecId::Pcm,
                 options: Dictionary::new(),
+                sample_format: None,
             }),
             video_filters: None,
             filter_complex: None,

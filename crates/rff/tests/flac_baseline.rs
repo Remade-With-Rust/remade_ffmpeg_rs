@@ -55,6 +55,7 @@ fn transcode_flac(engine: &Engine, input: &Path, output: &Path) {
             audio_codec: Some(StreamCodec {
                 codec: CodecId::Flac,
                 options: Dictionary::new(),
+                sample_format: None,
             }),
             video_filters: None,
             filter_complex: None,
