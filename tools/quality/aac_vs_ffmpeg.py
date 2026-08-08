@@ -61,8 +61,23 @@ def probe_duration(path):
     return h * 3600 + mn * 60 + s
 
 
+ARMS = []          # set from --arm; empty = shipped defaults
+AACENC = REPO / "target" / "release" / "examples" / (
+    "aacenc.exe" if os.name == "nt" else "aacenc")
+
+
 def encode_ours(src, dst, kbps):
-    """Our encoder, through the shipped CLI."""
+    """Our encoder.
+
+    With no arms selected this goes through the shipped CLI, which is what users
+    actually run. With arms selected it goes through the `aacenc` example, which
+    is the only way to switch the experimental flags. Both drive the identical
+    encoder core; the example emits ADTS rather than MP4, which the neutral
+    decoder reads just the same.
+    """
+    if ARMS:
+        d = str(dst).replace(".m4a", ".aac")
+        return run([str(AACENC), str(src), d, str(kbps * 1000), *ARMS])
     return run([str(OURS), "-i", str(src), "-c:a", "aac", "-b:a", f"{kbps}000",
                 "-y", str(dst)])
 
@@ -109,12 +124,18 @@ def main():
     ap.add_argument("--bitrates", default="64,96,128,192")
     ap.add_argument("--speed-reps", type=int, default=5)
     ap.add_argument("--skip-speed", action="store_true")
+    ap.add_argument("--arm", default="", help="space/comma separated arm flags")
     args = ap.parse_args()
 
     if not SYS_FFMPEG or not Path(SYS_FFMPEG).exists():
         sys.exit("no system ffmpeg found; set SYS_FFMPEG")
     if not OURS.exists():
         sys.exit(f"our CLI not built: {OURS} (cargo build --release -p rff-cli)")
+
+    global ARMS
+    ARMS = [x for x in args.arm.replace(",", " ").split() if x]
+    if ARMS:
+        print(f"# ARMS          : {' '.join(ARMS)}  (via aacenc)")
 
     work = Path(args.workdir)
     work.mkdir(parents=True, exist_ok=True)
@@ -133,8 +154,15 @@ def main():
         p = corpus_dir / f"{name}.wav"
         if p.exists():
             clips.append((name, label, p, "real"))
+    # Only pristine sources. The workdir also fills with this harness's OWN
+    # decoded outputs (`syn_x_128_ours.wav`, `_ref`, `probe_`...), and a naive
+    # glob sweeps those back in as "clips" — which silently turned a 13-clip run
+    # into an 85-clip one scoring our output against our output.
     for p in sorted(work.glob("syn_*.wav")):
-        clips.append((p.stem, p.stem.replace("syn_", "") + " (synthetic)", p, "synthetic"))
+        st = p.stem
+        if re.search(r"_\d+_(ours|ff)$", st) or st.endswith("_ref") or "probe_" in st:
+            continue
+        clips.append((st, st.replace("syn_", "") + " (synthetic)", p, "synthetic"))
 
     if not clips:
         sys.exit("no clips found; run the aacexport example and/or fetch_corpus.sh")
@@ -162,7 +190,7 @@ def main():
         ref_d = work / f"{name}_ref.wav"
         decode_neutral(src, ref_d, 44100)   # once per clip, not per bitrate
         for kbps in bitrates:
-            ours_f = work / f"{name}_{kbps}_ours.m4a"
+            ours_f = work / (f"{name}_{kbps}_ours.aac" if ARMS else f"{name}_{kbps}_ours.m4a")
             ff_f = work / f"{name}_{kbps}_ff.m4a"
             r1 = encode_ours(src, ours_f, kbps)
             r2 = encode_ffmpeg(src, ff_f, kbps)
