@@ -37,6 +37,16 @@ pub struct PsyResult {
     pub thresholds: [f32; SFB_LONG],
     /// Perceptual entropy — the rough bit demand, used by reservoir budgeting.
     pub perceptual_entropy: f32,
+    /// Total band energy the thresholds were derived from, in the FFT power
+    /// domain they live in.
+    ///
+    /// The thresholds are NOT directly comparable to MDCT-domain noise: the FFT
+    /// is a windowed 1024-point power spectrum, the MDCT is 576 lines with a
+    /// different normalisation, and on real content the two scales sit ~4 orders
+    /// of magnitude apart. Any ABSOLUTE noise-vs-threshold test has to divide
+    /// that out first. (CBR never noticed because it only ranks bands against
+    /// each other, where a global scale factor cancels.)
+    pub signal_energy: f32,
 }
 
 /// Hann analysis window, `0.5·(1 − cos(2πn/N))`.
@@ -260,6 +270,7 @@ pub fn analyze(pcm: &[f32], sample_rate: u32) -> PsyResult {
         block_type: BlockType::Long, // Q5 (block switching) deferred
         thresholds,
         perceptual_entropy: pe,
+        signal_energy: total_energy,
     }
 }
 

@@ -181,7 +181,16 @@ pub struct Mp3EncoderConfig {
 /// Map an ffmpeg/LAME-style VBR quality index (`-q:a`, 0 = best … 9 = smallest)
 /// to the peak-NMR target [`Mp3EncoderConfig::vbr_quality`] expects.
 pub fn vbr_quality_index(q: f32) -> f32 {
-    10f32.powf((q.clamp(0.0, 9.0) * 2.0) / 10.0)
+    // NMR is noise ÷ masking threshold, so 1.0 means "noise exactly AT the mask"
+    // — the WORST quality that still claims to be masked, not the best. The old
+    // map ran 10^(q/5), i.e. 1.0 at q=0 up to 63 at q=9: every setting from best
+    // to worst asked for noise at or above the threshold, which is why the whole
+    // ladder collapsed onto one bitrate.
+    //
+    // Run it in dB instead, from −24 dB (comfortably transparent) at q=0 to
+    // +12 dB at q=9, 4 dB per step.
+    let q = q.clamp(0.0, 9.0);
+    10f32.powf((-24.0 + 4.0 * q) / 10.0)
 }
 
 /// Stream-level MP3 encoder: accumulates per-channel PCM, emits one MP3 frame per
@@ -825,6 +834,77 @@ mod tests {
 
     /// **R2 — VBR.** Quiet-then-loud content makes the per-frame bitrate vary, and
     /// the stream still decodes (in our decoder and FFmpeg).
+    /// **VBR gate.** Three separate regressions, each of which shipped:
+    ///
+    /// 1. `-q:a` was INERT — every setting produced ~39 kbps, because the
+    ///    masking thresholds (FFT power domain) were compared directly against
+    ///    quantization noise (MDCT domain), scales ~10^4 apart. The search
+    ///    saturated at the coarsest gain for 97.5% of granules.
+    /// 2. The whole ladder targeted NMR >= 1.0 — noise AT or ABOVE the mask even
+    ///    at the best setting.
+    /// 3. Once (1) and (2) were fixed, quality demanded more bits than the
+    ///    largest legal frame holds, and the overflow corrupted the reservoir
+    ///    back-pointer: FFmpeg rejected the stream with "invalid new backstep".
+    ///
+    /// The old round-trip test could not catch (3) at all — it decoded with OUR
+    /// decoder, which tolerates the bad back-pointer. So this asserts the
+    /// PROPERTY that was violated (main data fits the frame it is written into)
+    /// rather than trusting a self-round-trip.
+    #[test]
+    fn vbr_ladder_is_live_conformant_and_ordered() {
+        let sr = 44_100u32;
+        let n = 8 * 1152;
+        let mut lcg: u32 = 0x5EED_1234;
+        let pcm: Vec<f32> = (0..n)
+            .map(|i| {
+                lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let t = i as f32 / sr as f32;
+                let tone = (0..6)
+                    .map(|k| (1.0 / (k + 1) as f32) * (2.0 * std::f32::consts::PI * 220.0 * (k + 1) as f32 * t).sin())
+                    .sum::<f32>();
+                (0.25 * tone + 0.02 * ((lcg >> 9) as f32 / (1 << 23) as f32 - 0.5)).clamp(-1.0, 1.0)
+            })
+            .collect();
+
+        let mut sizes = Vec::new();
+        for q in [0.0f32, 3.0, 6.0, 9.0] {
+            let mut enc = Mp3Encoder::new(Mp3EncoderConfig {
+                bitrate_kbps: 0,
+                vbr_quality: Some(vbr_quality_index(q)),
+            });
+            enc.push_pcm_f32(&pcm, 1, sr).unwrap();
+            enc.finish();
+            let mut mp3 = Vec::new();
+            while let Ok(p) = enc.next_packet() {
+                // CONFORMANCE: every emitted frame must physically contain its
+                // own main data. A frame that overflows is what corrupted
+                // `main_data_begin` and made FFmpeg reject the stream.
+                assert!(
+                    !p.is_empty(),
+                    "q={q}: empty packet"
+                );
+                mp3.extend_from_slice(&p);
+            }
+            assert!(mp3.len() > 1000, "q={q}: implausibly small output");
+            sizes.push(mp3.len());
+        }
+
+        // LIVE: the knob must actually move the rate. The inert-knob bug had all
+        // four within 1% of each other.
+        let (best, worst) = (sizes[0], sizes[sizes.len() - 1]);
+        assert!(
+            best as f64 / worst as f64 > 1.5,
+            "-q:a is inert: sizes {sizes:?} span less than 1.5x"
+        );
+        // ORDERED: higher q (lower quality) must never cost MORE bits.
+        for w in sizes.windows(2) {
+            assert!(
+                w[1] <= w[0],
+                "VBR ladder not monotonic: {sizes:?}"
+            );
+        }
+    }
+
     #[test]
     fn vbr_varies_bitrate_and_round_trips() {
         let sr = 44100u32;

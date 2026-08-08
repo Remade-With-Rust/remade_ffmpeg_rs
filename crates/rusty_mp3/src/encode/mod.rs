@@ -428,6 +428,23 @@ impl Mp3Encode {
         let main_data = main.finish();
         if quality.is_some() {
             fheader.bitrate_kbps = bitstream::smallest_bitrate_for(&fheader, main_data.len());
+            // VBR RATE CEILING. `smallest_bitrate_for` saturates at 320 kbps, so
+            // a quality target that demands more bits than the largest legal
+            // frame can hold silently produced main data that does not fit —
+            // which corrupts `main_data_begin` and makes the stream
+            // non-conformant (FFmpeg: "invalid new backstep -1"). A quality
+            // target is a request, not a licence to emit an illegal frame: when
+            // it cannot be met, fall back to the proven CBR rate loop at the
+            // largest budget that fits, and let the frame be as good as 320 kbps
+            // allows.
+            let mut capped = fheader.clone();
+            capped.bitrate_kbps = 320;
+            let ceiling = bitstream::region_capacity(&capped);
+            if main_data.len() > ceiling {
+                let (mut h, s, d) = self.quantize_frame(fa, ceiling * 8, None);
+                h.bitrate_kbps = bitstream::smallest_bitrate_for(&h, d.len());
+                return (h, s, d);
+            }
         }
         (fheader, side, main_data)
     }

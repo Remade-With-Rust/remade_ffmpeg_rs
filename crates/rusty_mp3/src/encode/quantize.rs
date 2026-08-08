@@ -430,13 +430,29 @@ pub fn loops_vbr(
 ) -> QuantizedGranule {
     let flat = [0u8; 22];
     let xrp = xrpow(freq);
+    // Put the thresholds in the SAME domain as the noise before comparing them.
+    //
+    // `psy.thresholds` are FFT power-spectrum energies (windowed, 1024-point);
+    // `band_noise` measures in the MDCT domain (576 lines, different
+    // normalisation). On real content the two scales differ by ~10^4, which made
+    // every absolute test pass: `peak(255)` — the COARSEST possible quantization,
+    // where nearly everything rounds to zero — read 2.5e-4 against a target of
+    // 1.0, so the search saturated at gain 255 for 97.5% of granules and VBR
+    // emitted ~39 kbps at every `-q:a`. Rescaling by the ratio of total energies
+    // is self-calibrating: no magic constant, and it tracks the content.
+    let mdct_energy: f32 = freq.iter().map(|x| x * x).sum();
+    let domain_scale = if psy.signal_energy > 1e-20 && mdct_energy > 1e-20 {
+        mdct_energy / psy.signal_energy
+    } else {
+        1.0
+    };
     let peak = |g: i32| {
         let coeffs = quantize_with_sf(header, freq, &xrp, g, &flat);
         let noise = band_noise(header, freq, &coeffs, g, &flat);
         noise
             .iter()
             .enumerate()
-            .map(|(b, &n)| n / psy.thresholds[b].max(1e-20))
+            .map(|(b, &n)| n / (psy.thresholds[b] * domain_scale).max(1e-20))
             .fold(0f32, f32::max)
     };
     // Largest gain (coarsest → fewest bits) whose peak NMR meets the target.
@@ -449,7 +465,41 @@ pub fn loops_vbr(
             hi = mid - 1;
         }
     }
-    let gain = lo.max(nonclip_floor(header, freq, &xrp));
+    let floor = nonclip_floor(header, freq, &xrp);
+    let gain = lo.max(floor);
+    // TEMPORARY VBR DIAGNOSTIC (removed after the fix is characterised).
+    {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        pub static N: AtomicU64 = AtomicU64::new(0);
+        pub static SUM_LO: AtomicU64 = AtomicU64::new(0);
+        pub static SUM_FLOOR: AtomicU64 = AtomicU64::new(0);
+        pub static CLAMPED: AtomicU64 = AtomicU64::new(0);
+        pub static SATURATED: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Relaxed);
+        SUM_LO.fetch_add(lo.max(0) as u64, Relaxed);
+        SUM_FLOOR.fetch_add(floor.max(0) as u64, Relaxed);
+        if floor > lo { CLAMPED.fetch_add(1, Relaxed); }
+        if lo >= 255 { SATURATED.fetch_add(1, Relaxed); }
+        let n = N.load(Relaxed);
+        if n % 2000 == 0 {
+            // What does the NMR actually read at the extremes?
+            let p_floor = peak(floor);
+            let p_max = peak(255);
+            let thr_min = psy.thresholds.iter().cloned().fold(f32::MAX, f32::min);
+            let thr_max = psy.thresholds.iter().cloned().fold(0f32, f32::max);
+            let sig: f32 = freq.iter().map(|x| x * x).sum();
+            eprintln!(
+                "[nmr] peak(floor={floor})={p_floor:.6e} peak(255)={p_max:.6e} thr[min={thr_min:.3e} max={thr_max:.3e}] sig_energy={sig:.3e}"
+            );
+            eprintln!(
+                "[vbr] n={n} target_nmr={target_nmr:.4} mean_lo={:.1} mean_floor={:.1} clamped={:.1}% saturated={:.1}%",
+                SUM_LO.load(Relaxed) as f64 / n as f64,
+                SUM_FLOOR.load(Relaxed) as f64 / n as f64,
+                100.0 * CLAMPED.load(Relaxed) as f64 / n as f64,
+                100.0 * SATURATED.load(Relaxed) as f64 / n as f64,
+            );
+        }
+    }
 
     // Distortion loop at the fixed gain: raise the worst over-threshold band.
     let mut sf = [0u8; 22];
@@ -459,8 +509,11 @@ pub fn loops_vbr(
         let mut worst = None;
         let mut worst_nmr = f32::NEG_INFINITY;
         for (b, &n) in noise.iter().enumerate() {
-            let nmr = n / psy.thresholds[b].max(1e-20);
-            if n > psy.thresholds[b] && sf[b] < MAX_SF && nmr > worst_nmr {
+            // Same domain correction as the gain search above — an absolute
+            // "is this band over threshold?" test needs the scaled threshold.
+            let thr = (psy.thresholds[b] * domain_scale).max(1e-20);
+            let nmr = n / thr;
+            if n > thr && sf[b] < MAX_SF && nmr > worst_nmr {
                 worst_nmr = nmr;
                 worst = Some(b);
             }
