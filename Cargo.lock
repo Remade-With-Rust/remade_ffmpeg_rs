@@ -5488,9 +5488,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_alloc"
-version = "0.3.2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5f05c71564028538eeba6e2e08c6a512267e85e6a1584beca45c6f26af8651b"
+checksum = "55d8238f1165c10d44f81659ef91520212bd19ecdf00334199f30cc2e23fa3d8"
 dependencies = [
  "libc",
  "windows-sys 0.60.2",
@@ -5498,9 +5498,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_alloc-api"
-version = "0.3.2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65c8c3ecd14424ba980d005147945a745836dea7798d447c419e08be1f79e88f"
+checksum = "3789bdf345c74197604e7234f20eab396fbe749954c2f1c46d405b6d56309edc"
 dependencies = [
  "rusty_alloc",
 ]
