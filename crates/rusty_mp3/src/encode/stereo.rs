@@ -10,15 +10,30 @@
 
 use std::f32::consts::FRAC_1_SQRT_2;
 
-/// Mid/side transform of a frame's two channels: returns `[mid, side]`.
-pub fn mid_side(left: &[f32], right: &[f32]) -> Vec<Vec<f32>> {
+/// Mid/side transform of a frame's two channels into **caller-owned** buffers,
+/// which are resized as needed and fully overwritten.
+///
+/// This is the form the encoder uses: it hands in scratch that persists across
+/// frames, so a steady-state encode allocates nothing here. [`mid_side`] is the
+/// owning convenience wrapper over it.
+pub fn mid_side_into(left: &[f32], right: &[f32], mid: &mut Vec<f32>, side: &mut Vec<f32>) {
     let n = left.len().min(right.len());
-    let mut mid = vec![0.0f32; n];
-    let mut side = vec![0.0f32; n];
+    // `resize` only touches the tail, and every element in `..n` is written
+    // below, so no zero-fill is paid on the steady-state path.
+    mid.resize(n, 0.0);
+    side.resize(n, 0.0);
+    mid.truncate(n);
+    side.truncate(n);
     for i in 0..n {
         mid[i] = (left[i] + right[i]) * FRAC_1_SQRT_2;
         side[i] = (left[i] - right[i]) * FRAC_1_SQRT_2;
     }
+}
+
+/// Mid/side transform of a frame's two channels: returns `[mid, side]`.
+pub fn mid_side(left: &[f32], right: &[f32]) -> Vec<Vec<f32>> {
+    let (mut mid, mut side) = (Vec::new(), Vec::new());
+    mid_side_into(left, right, &mut mid, &mut side);
     vec![mid, side]
 }
 

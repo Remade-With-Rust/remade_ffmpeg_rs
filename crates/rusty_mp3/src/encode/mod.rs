@@ -103,6 +103,10 @@ pub struct Mp3Encode {
     resv_frames: Vec<(FrameHeader, SideInfo, Vec<u8>)>,
     resv_bank: usize,
     resv_pe_avg: f32,
+    /// Reusable mid/side PCM scratch, `[mid, side]`. Persisting it across frames
+    /// keeps the joint-stereo path allocation-free in steady state — it used to
+    /// build two fresh zero-filled `Vec`s (plus an outer one) every frame.
+    ms_scratch: [Vec<f32>; 2],
 }
 
 impl Default for Mp3Encode {
@@ -115,6 +119,7 @@ impl Default for Mp3Encode {
             resv_frames: Vec::new(),
             resv_bank: 0,
             resv_pe_avg: 0.0,
+            ms_scratch: [Vec::new(), Vec::new()],
         }
     }
 }
@@ -269,10 +274,22 @@ impl Mp3Encode {
         let granules = header.version.granules();
 
         let use_ms = nch == 2 && self.decide_stereo(channels, granules, header.sample_rate);
-        let coded = if use_ms {
-            stereo::mid_side(&channels[0], &channels[1])
+        // The psymodel below is the only consumer of the CODED domain. For L/R that
+        // IS `channels`, so borrow it; for M/S, fill scratch that persists across
+        // frames. Neither branch allocates in steady state — the L/R branch used to
+        // deep-copy both channels via `to_vec()` purely to match the M/S branch's
+        // `Vec<Vec<f32>>` type.
+        let mut ms = std::mem::take(&mut self.ms_scratch);
+        if use_ms {
+            let [m, s] = &mut ms;
+            stereo::mid_side_into(&channels[0], &channels[1], m, s);
+        }
+        let coded: [&[f32]; 2] = if use_ms {
+            [ms[0].as_slice(), ms[1].as_slice()]
+        } else if nch == 2 {
+            [channels[0].as_slice(), channels[1].as_slice()]
         } else {
-            channels.to_vec()
+            [channels[0].as_slice(), channels[0].as_slice()]
         };
         let mut fheader = header.clone();
         if use_ms {
@@ -353,6 +370,9 @@ impl Mp3Encode {
                 analyzed.push((freqs[ch], psy, bt)); // [f32; N] is Copy
             }
         }
+        // `coded`'s last use is inside the loop, so the borrow of `ms` has ended
+        // and the scratch can go back for the next frame to reuse.
+        self.ms_scratch = ms;
         FrameAnalysis {
             fheader,
             analyzed,

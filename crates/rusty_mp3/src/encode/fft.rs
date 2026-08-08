@@ -4,7 +4,62 @@
 //! hotspot (`lab::bricks::accel` → SIMD), but the scalar path is the reference the
 //! SIMD twin will be checked against.
 
+use std::cell::RefCell;
 use std::f32::consts::PI;
+
+/// Every stage's twiddle factors for one FFT size, laid out end to end: stage
+/// `len` occupies `[len/2 - 1, len - 1)`, so the whole set is exactly `n - 1`
+/// entries.
+///
+/// The values depend only on `n`, so recomputing them per call was pure waste:
+/// the psymodel calls [`fft`] four times per frame at a fixed `N_FFT`, which had
+/// it rebuilding the same table — including two `cos`/`sin` per stage, ~1.26 M
+/// transcendental calls across a 7-minute track for **ten distinct values** —
+/// and heap-allocating two zero-filled buffers each time, only to overwrite
+/// every element before reading it.
+///
+/// Built by the *same recurrence* the inline version used, so the cached values
+/// are bit-for-bit what the old code produced; `hoisted_matches_inline` pins
+/// that against `fft_inline_ref`.
+struct Twiddles {
+    n: usize,
+    re: Vec<f32>,
+    im: Vec<f32>,
+}
+
+impl Twiddles {
+    fn build(n: usize) -> Twiddles {
+        let mut re = vec![0f32; n.saturating_sub(1)];
+        let mut im = vec![0f32; n.saturating_sub(1)];
+        let mut len = 2usize;
+        while len <= n {
+            let ang = -2.0 * PI / len as f32;
+            let (wr, wi) = (ang.cos(), ang.sin());
+            let half = len / 2;
+            let off = half - 1;
+            re[off] = 1.0;
+            im[off] = 0.0;
+            for k in 1..half {
+                // `re[off + k - 1]` is still the previous iteration's value when
+                // the second line reads it — matching the original ordering.
+                re[off + k] = re[off + k - 1] * wr - im[off + k - 1] * wi;
+                im[off + k] = re[off + k - 1] * wi + im[off + k - 1] * wr;
+            }
+            len <<= 1;
+        }
+        Twiddles { n, re, im }
+    }
+}
+
+thread_local! {
+    /// One table per thread, rebuilt only when the transform size changes — which
+    /// in the encoder it never does after the first call. Thread-local rather than
+    /// a `OnceLock` keyed by size so arbitrary `n` still works (the tests sweep
+    /// several) with no lock on the hot path.
+    static TWIDDLES: RefCell<Twiddles> = const {
+        RefCell::new(Twiddles { n: 0, re: Vec::new(), im: Vec::new() })
+    };
+}
 
 /// In-place complex FFT. `re`/`im` are the real/imaginary parts; `re.len()` must
 /// be a power of two and equal to `im.len()`. Forward transform (`exp(-i2πkn/N)`).
@@ -37,37 +92,37 @@ pub fn fft(re: &mut [f32], im: &mut [f32]) {
     // inner `k` loop independent and contiguous. Byte-identical (same recurrence
     // values, just computed once and reused across base-blocks) — pinned by
     // `hoisted_matches_inline`.
-    let mut tw_r = vec![0f32; n / 2];
-    let mut tw_i = vec![0f32; n / 2];
-    let mut len = 2usize;
-    while len <= n {
-        let ang = -2.0 * PI / len as f32;
-        let (wr, wi) = (ang.cos(), ang.sin());
-        let half = len / 2;
-        // Stage twiddles, computed once (the old per-base-block recurrence).
-        tw_r[0] = 1.0;
-        tw_i[0] = 0.0;
-        for k in 1..half {
-            tw_r[k] = tw_r[k - 1] * wr - tw_i[k - 1] * wi;
-            tw_i[k] = tw_r[k - 1] * wi + tw_i[k - 1] * wr;
+    TWIDDLES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.n != n {
+            *cache = Twiddles::build(n);
         }
-        let mut base = 0;
-        while base < n {
-            for k in 0..half {
-                let a = base + k;
-                let b = a + half;
-                let (cr, ci) = (tw_r[k], tw_i[k]);
-                let tr = cr * re[b] - ci * im[b];
-                let ti = cr * im[b] + ci * re[b];
-                re[b] = re[a] - tr;
-                im[b] = im[a] - ti;
-                re[a] += tr;
-                im[a] += ti;
+        let mut len = 2usize;
+        while len <= n {
+            let half = len / 2;
+            // Slice this stage's span once, so the inner loop indexes from 0 and
+            // stays as tight as when the table was per-stage.
+            let off = half - 1;
+            let tw_r = &cache.re[off..off + half];
+            let tw_i = &cache.im[off..off + half];
+            let mut base = 0;
+            while base < n {
+                for k in 0..half {
+                    let a = base + k;
+                    let b = a + half;
+                    let (cr, ci) = (tw_r[k], tw_i[k]);
+                    let tr = cr * re[b] - ci * im[b];
+                    let ti = cr * im[b] + ci * re[b];
+                    re[b] = re[a] - tr;
+                    im[b] = im[a] - ti;
+                    re[a] += tr;
+                    im[a] += ti;
+                }
+                base += len;
             }
-            base += len;
+            len <<= 1;
         }
-        len <<= 1;
-    }
+    });
 }
 
 /// Power spectrum `|X[k]|²` of a real signal windowed into `re` (with `im`
