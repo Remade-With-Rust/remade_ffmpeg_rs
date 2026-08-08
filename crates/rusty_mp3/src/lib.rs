@@ -173,24 +173,35 @@ pub struct Mp3EncoderConfig {
     /// MPEG version ([`snap_bitrate`]). `0` ⇒ default (128 for MPEG-1, 64 for
     /// MPEG-2/2.5).
     pub bitrate_kbps: u32,
-    /// VBR quality target (peak NMR). `Some` ⇒ VBR, `None` ⇒ CBR. To map an
-    /// ffmpeg/LAME-style `-q:a` 0–9 quality index, use [`vbr_quality_index`].
+    /// VBR **target average bitrate in kbps**. `Some` ⇒ VBR, `None` ⇒ CBR. To
+    /// map an ffmpeg/LAME-style `-q:a` 0–9 quality index, use
+    /// [`vbr_quality_index`].
+    ///
+    /// Was a peak-NMR target through 0.5.1; that path is gone (see
+    /// [`vbr_quality_index`] for why).
     pub vbr_quality: Option<f32>,
 }
 
 /// Map an ffmpeg/LAME-style VBR quality index (`-q:a`, 0 = best … 9 = smallest)
 /// to the peak-NMR target [`Mp3EncoderConfig::vbr_quality`] expects.
 pub fn vbr_quality_index(q: f32) -> f32 {
-    // NMR is noise ÷ masking threshold, so 1.0 means "noise exactly AT the mask"
-    // — the WORST quality that still claims to be masked, not the best. The old
-    // map ran 10^(q/5), i.e. 1.0 at q=0 up to 63 at q=9: every setting from best
-    // to worst asked for noise at or above the threshold, which is why the whole
-    // ladder collapsed onto one bitrate.
+    // Returns a TARGET AVERAGE BITRATE in kbps, not a noise-to-mask ratio.
     //
-    // Run it in dB instead, from −24 dB (comfortably transparent) at q=0 to
-    // +12 dB at q=9, 4 dB per step.
+    // Until 0.5.1 this returned an NMR target that drove a separate gain search.
+    // That search was measured at 3.5 ODG behind LAME at matched bitrate, and
+    // worse at 268 kbps than the CBR path was at 192 kbps -- the criterion was
+    // dimensionless but unanchored, so it settled on a globally too-coarse
+    // quantizer. Rate now drives quality through the SAME two-loop quantizer CBR
+    // uses, which PEAQ puts within ~0.3 ODG of LAME.
+    //
+    // The ladder tracks LAME's own V0..V9 average rates, so `-q:a N` lands near
+    // where users expect it to.
+    const KBPS: [f32; 10] = [245.0, 225.0, 190.0, 175.0, 165.0, 130.0, 115.0, 100.0, 85.0, 65.0];
     let q = q.clamp(0.0, 9.0);
-    10f32.powf((-24.0 + 4.0 * q) / 10.0)
+    let lo = q.floor() as usize;
+    let hi = (lo + 1).min(9);
+    let t = q - lo as f32;
+    KBPS[lo] * (1.0 - t) + KBPS[hi] * t
 }
 
 /// Stream-level MP3 encoder: accumulates per-channel PCM, emits one MP3 frame per

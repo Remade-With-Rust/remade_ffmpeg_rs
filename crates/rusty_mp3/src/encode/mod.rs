@@ -392,7 +392,21 @@ impl Mp3Encode {
         use std::sync::atomic::Ordering::Relaxed;
         let mut fheader = fa.fheader.clone();
         let nch = fheader.channel_mode.channels();
-        let per_gran = frame_budget / fa.analyzed.len().max(1);
+        let n_units = fa.analyzed.len().max(1);
+        // VBR: the quality target IS a target bitrate, so it becomes a per-granule
+        // BIT BUDGET and then runs the same two-loop quantizer CBR uses. The old
+        // path was a separate NMR gain search that PEAQ measured 3.5 ODG behind
+        // LAME -- worse at 268 kbps than CBR managed at 192 -- because its
+        // criterion was unanchored. Rate-driving it inherits CBR's quality, which
+        // PEAQ puts within ~0.3 ODG of LAME.
+        let per_gran = match quality {
+            Some(target_kbps) => {
+                let mut h = fheader.clone();
+                h.bitrate_kbps = crate::snap_bitrate(h.version, target_kbps.round() as u32);
+                bitstream::region_capacity(&h) * 8 / n_units
+            }
+            None => frame_budget / n_units,
+        };
 
         let mut side = SideInfo::default();
         let mut main = BitWriter::new();
@@ -403,33 +417,12 @@ impl Mp3Encode {
                 if bt == BlockType::Short {
                     prof::N_SHORT.fetch_add(1, Relaxed);
                     let fbs = shortblock::reorder_subband_to_bitstream(fheader.sample_rate, freq);
-                    match quality {
-                        // Short granules used to ignore `-q:a` entirely and always
-                        // take the CBR budget, so on transient-heavy content --
-                        // where short blocks are 15-37% of granules -- the quality
-                        // knob was still partly dead after the VBR rate control
-                        // was fixed.
-                        Some(target) => shortblock::quantize_short_vbr(
-                            &fheader,
-                            &fbs,
-                            &psy.thresholds,
-                            psy.signal_energy,
-                            target,
-                            bitstream::region_capacity(&{
-                                let mut h = fheader.clone();
-                                h.bitrate_kbps = 320;
-                                h
-                            }) * 8
-                                / fa.analyzed.len().max(1),
-                        ),
-                        None => shortblock::quantize_short(&fheader, &fbs, per_gran),
-                    }
+                    // `per_gran` already encodes the mode: CBR's frame budget or
+                    // VBR's target-rate budget. Short blocks need no special case.
+                    shortblock::quantize_short(&fheader, &fbs, per_gran)
                 } else {
                     prof::N_LONG.fetch_add(1, Relaxed);
-                    match quality {
-                        Some(target) => quantize::loops_vbr(&fheader, freq, psy, target, bt),
-                        None => quantize::loops(&fheader, freq, psy, per_gran, bt),
-                    }
+                    quantize::loops(&fheader, freq, psy, per_gran, bt)
                 }
             });
 

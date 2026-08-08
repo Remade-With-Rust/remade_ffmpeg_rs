@@ -140,33 +140,29 @@ Measured on 60 s of real guitar, ours at each `-q:a`:
 
 CBR is unaffected and byte-identical across the change.
 
-**VBR is conformant and responsive, but its quality is NOT yet competitive.**
-Measured with PEAQ ODG at matched *actual* bitrate on real music — the only
-comparison that means anything, since matching `-q:a` between encoders does not
-match the rate:
+**VBR quality — fixed in 0.6.0.** Through 0.5.1 the VBR path ran its own
+noise-to-mask gain search, and PEAQ measured it **3.5 ODG behind LAME** at
+matched bitrate — worse at 268 kbps than the CBR path managed at 192, because
+the criterion was dimensionless but unanchored. `-q:a` is now a target average
+bitrate that drives the **same two-loop quantizer CBR uses**.
 
-| mode | ours | LAME | gap |
-| ---- | ---- | ---- | --- |
-| CBR 192 kbps | −0.28 | +0.01 | 0.29 |
-| CBR 128 kbps | −1.28 | −0.90 | 0.37 |
-| **VBR ~200 kbps** | **−3.50** | +0.01 | **3.51** |
-| **VBR ~268 kbps** | **−3.75** | −0.07 | **3.68** |
+PEAQ ODG at matched *actual* bitrate (matching `-q:a` between encoders does not
+match the rate, so it proves nothing):
 
-So **CBR is close to LAME and VBR is not.** The tell that this is a defect
-rather than tuning: VBR at 268 kbps scores worse than CBR at 192 kbps — the same
-quantizer cannot be worse with 40% more bits unless it is choosing badly. It is.
-The VBR gain search targets a noise-to-mask ratio that is dimensionless but
-*unanchored*, so it settles on a globally too-coarse quantizer that per-band
-scalefactor shaping cannot rescue.
+| point | ours | LAME | gap |
+| ----- | ---- | ---- | --- |
+| 192 kbps | −0.44 | +0.01 | 0.45 |
+| 128 kbps | −1.36 | −0.90 | 0.46 |
+| 80 kbps | −3.07 | −2.77 | 0.30 |
+| *(0.5.1, 200 kbps)* | *−3.50* | *+0.01* | *3.51* |
 
-**Use CBR (`-b:a`) for quality work until this is fixed.** VBR output is valid
-and decodes correctly everywhere; it just spends its bits badly. The fix is to
-route VBR through the same two-loop quantizer CBR uses, driven by a
-quality-derived bit budget, rather than the separate NMR search.
+So VBR now sits in the same 0.3–0.5 ODG band as CBR rather than three ODG
+adrift, and `-q:a` lands where users expect (q=0 ≈ 245 kbps, q=5 ≈ 130,
+q=9 ≈ 65). Closing the remaining ~0.4 ODG is ordinary encoder tuning and
+applies to CBR and VBR alike.
 
-Short blocks honour `-q:a` as of 0.5.0, but via long-band masking thresholds
-mapped onto the short grid — the psychoacoustic model does not yet produce
-short-block thresholds of its own.
+Short blocks are covered by the same budget, so they no longer need a separate
+path.
 
 ### Decode — 0.5.0 (SIMD)
 
