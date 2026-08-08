@@ -229,3 +229,139 @@ mod tests {
         }
     }
 }
+
+/// Map the LONG-block masking thresholds onto the short-block band grid.
+///
+/// The psychoacoustic model only produces long-band thresholds (its
+/// `block_type` is hard-wired to `Long`), so a short granule has no masking
+/// curve of its own. Short blocks have 3x coarser frequency resolution — 192
+/// lines per window against 576 — so short band `b`, spanning per-window lines
+/// `[s0, s1)`, covers the same frequencies as long lines `[3·s0, 3·s1)`.
+///
+/// The overlapping long bands are combined by taking the MINIMUM. That is the
+/// conservative direction on purpose: a short band straddling a quiet long band
+/// must not inherit a loud neighbour's noise allowance, because the audible
+/// failure mode here is pre-echo on exactly the transients short blocks exist
+/// to code.
+///
+/// This is an approximation, and it is the reason short-block VBR is coarser
+/// than long-block VBR. The principled fix is a short-block psymodel.
+fn short_thresholds(sample_rate: u32, long_thr: &[f32; crate::frame::SFB_LONG]) -> [f32; 13] {
+    let long_off = crate::tables::sfb_long_offsets(sample_rate);
+    let short_off = crate::tables::sfb_short_offsets(sample_rate);
+    let mut out = [f32::MAX; 13];
+    for (b, o) in out.iter_mut().enumerate() {
+        let (lo, hi) = (3 * short_off[b] as usize, 3 * short_off[b + 1] as usize);
+        let mut m = f32::MAX;
+        for lb in 0..21 {
+            let (llo, lhi) = (long_off[lb] as usize, long_off[lb + 1] as usize);
+            if llo < hi && lo < lhi {
+                m = m.min(long_thr[lb]);
+            }
+        }
+        *o = if m == f32::MAX { long_thr[20] } else { m };
+    }
+    out
+}
+
+/// Quantization noise per short band, summed across the three windows.
+///
+/// In bitstream order a short band's three windows are adjacent, so band `b`
+/// occupies reordered indices `[3·off[b], 3·off[b+1])` — the same span the
+/// threshold mapping above uses.
+fn short_band_noise(
+    sample_rate: u32,
+    freq_bs: &[f32; GRANULE_LINES],
+    coeffs: &[i32; GRANULE_LINES],
+    gain: i32,
+) -> [f32; 13] {
+    let off = crate::tables::sfb_short_offsets(sample_rate);
+    let scale = 2f64.powf(0.25 * (gain - 210) as f64);
+    let mut noise = [0f32; 13];
+    for (b, n) in noise.iter_mut().enumerate() {
+        let (lo, hi) = (
+            (3 * off[b] as usize).min(GRANULE_LINES),
+            (3 * off[b + 1] as usize).min(GRANULE_LINES),
+        );
+        let mut e = 0f64;
+        for i in lo..hi {
+            let xr = coeffs[i].signum() as f64
+                * super::quantize::requant_magnitude(coeffs[i])
+                * scale;
+            let d = freq_bs[i] as f64 - xr;
+            e += d * d;
+        }
+        *n = e as f32;
+    }
+    noise
+}
+
+/// **VBR short blocks.** Coarsest gain (fewest bits) whose peak NMR still meets
+/// `target_nmr`, bounded by the frame's physical capacity.
+///
+/// Short granules previously ignored `-q:a` entirely and always took the CBR bit
+/// budget, so on transient-heavy content — where short blocks are 15-37% of
+/// granules — the quality knob was partly dead even after the VBR rate control
+/// was fixed.
+///
+/// Mirrors `quantize::loops_vbr`: same search shape, and the same domain
+/// rescaling, because the thresholds live in the FFT power domain while the
+/// noise is measured in the MDCT domain.
+pub fn quantize_short_vbr(
+    header: &FrameHeader,
+    freq_bitstream: &[f32; GRANULE_LINES],
+    long_thresholds: &[f32; crate::frame::SFB_LONG],
+    signal_energy: f32,
+    target_nmr: f32,
+    bit_ceiling: usize,
+) -> QuantizedGranule {
+    let xrp = super::quantize::xrpow(freq_bitstream);
+    let thr = short_thresholds(header.sample_rate, long_thresholds);
+    let mdct_energy: f32 = freq_bitstream.iter().map(|x| x * x).sum();
+    let domain_scale = if signal_energy > 1e-20 && mdct_energy > 1e-20 {
+        mdct_energy / signal_energy
+    } else {
+        1.0
+    };
+    let ok = |g: i32| {
+        let coeffs = quantize_uniform(freq_bitstream, &xrp, g);
+        if !coeffs.iter().all(|&c| c.abs() <= MAX_UNCLIPPED) {
+            return false;
+        }
+        // A quality target is never a licence to overflow the frame.
+        if super::huffman::cost_short(header, &coeffs) > bit_ceiling {
+            return false;
+        }
+        let noise = short_band_noise(header.sample_rate, freq_bitstream, &coeffs, g);
+        noise
+            .iter()
+            .zip(thr.iter())
+            .map(|(&n, &t)| n / (t * domain_scale).max(1e-20))
+            .fold(0f32, f32::max)
+            <= target_nmr
+    };
+    // Largest gain (coarsest, fewest bits) that still satisfies everything.
+    let (mut lo, mut hi) = (0i32, 255i32);
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if ok(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    // If nothing met the target, fall back to the budget-driven path rather than
+    // emitting an over-target or clipped granule.
+    if !ok(lo) {
+        return quantize_short(header, freq_bitstream, bit_ceiling);
+    }
+    let coeffs = quantize_uniform(freq_bitstream, &xrp, lo);
+    let (mut side, _) = super::huffman::select(header, &coeffs, BlockType::Short);
+    side.global_gain = lo as u8;
+    side.scalefac_compress = 0;
+    QuantizedGranule {
+        coeffs,
+        side,
+        scalefactors: [0; 39],
+    }
+}

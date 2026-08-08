@@ -403,7 +403,27 @@ impl Mp3Encode {
                 if bt == BlockType::Short {
                     prof::N_SHORT.fetch_add(1, Relaxed);
                     let fbs = shortblock::reorder_subband_to_bitstream(fheader.sample_rate, freq);
-                    shortblock::quantize_short(&fheader, &fbs, per_gran)
+                    match quality {
+                        // Short granules used to ignore `-q:a` entirely and always
+                        // take the CBR budget, so on transient-heavy content --
+                        // where short blocks are 15-37% of granules -- the quality
+                        // knob was still partly dead after the VBR rate control
+                        // was fixed.
+                        Some(target) => shortblock::quantize_short_vbr(
+                            &fheader,
+                            &fbs,
+                            &psy.thresholds,
+                            psy.signal_energy,
+                            target,
+                            bitstream::region_capacity(&{
+                                let mut h = fheader.clone();
+                                h.bitrate_kbps = 320;
+                                h
+                            }) * 8
+                                / fa.analyzed.len().max(1),
+                        ),
+                        None => shortblock::quantize_short(&fheader, &fbs, per_gran),
+                    }
                 } else {
                     prof::N_LONG.fetch_add(1, Relaxed);
                     match quality {
