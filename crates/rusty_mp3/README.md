@@ -115,6 +115,40 @@ counts through whichever global allocator the binary sets:
 cargo run -p rusty_mp3 --release --example allocaudit -- 800 192
 ```
 
+### Decode — 0.4.1
+
+Three structural changes, measured on a real 27.5-minute stereo stream encoded
+by LAME (a decoder benchmarked on its own encoder's output skips paths that
+encoder never emits, so provenance matters):
+
+| brick | change | effect |
+| ----- | ------ | ------ |
+| bit reader | `peek(n)` loaded eight bytes and shifted, instead of looping once per bit | huffman 954 → 706 ms |
+| synthesis | V FIFO addressed circularly instead of shifted (a 960-float memmove per pass, ~17.5 GB per track), plus a transposed window loop so the operands are contiguous | synthesis 1008 → 857 ms |
+| IMDCT | exact kernel symmetry — half the dot products are derived, 648 → 324 MACs per subband | imdct share 31.9% → 19.9% |
+
+**1.185× faster decode overall**, 39/41 paired wins, z = 5.78, against a null
+arm of 1.006. Measured directly rather than by chaining the per-brick ratios,
+which would have overstated it as 1.233×.
+
+All three are **bit-identical**, not merely close. The IMDCT one is the
+surprise: halving the work costs no precision because the symmetries
+(`cos36[17−n][k] == −cos36[n][k]`, `cos36[53−n][k] == +cos36[n][k]`, and the
+same pair in the 12-point short-block kernel) hold *exactly* in the stored f32
+tables, and IEEE multiplication and round-to-nearest are sign-symmetric — so a
+mirrored sum is exactly the negation of the computed one.
+
+Verified byte-identical over a 15-stream corpus spanning joint/true-L-R/mono,
+MPEG-1 (44.1/48/32 kHz), MPEG-2 (22.05/24 kHz — the 576-sample granule path),
+MPEG-2.5 (11.025 kHz), 128–320 kbps CBR plus VBR, and four content classes.
+Short blocks are 15–37% of granules there; **mixed** blocks are 0% on every
+stream because LAME never emits them, so that path is gated separately against
+a dense reference implementation instead of being assumed covered.
+
+```sh
+cargo run -p rusty_mp3 --release --example decprof -- input.mp3
+```
+
 ## Part of Remade With Rust
 
 This crate is the standalone MP3 engine of

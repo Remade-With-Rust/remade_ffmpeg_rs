@@ -100,7 +100,7 @@ rff-codec-mp3 = { path = "crates/rff-codec-mp3", version = "0.1.0" }
 # to crates.io on their own cadence, decoupled from the workspace version and
 # from each other, so these no longer move in lockstep at 0.1.x.
 rusty_vp9 = { path = "crates/rusty_vp9", version = "0.1.0" }
-rusty_mp3 = { path = "crates/rusty_mp3", version = "0.4.0" }
+rusty_mp3 = { path = "crates/rusty_mp3", version = "0.4.1" }
 rusty_aac = { path = "crates/rusty_aac", version = "0.1.0" }
 rusty_vorbis = { path = "crates/rusty_vorbis", version = "0.1.0" }
 rusty_jpeg = { path = "crates/rusty_jpeg", version = "0.3" }
