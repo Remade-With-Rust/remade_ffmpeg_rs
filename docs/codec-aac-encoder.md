@@ -37,12 +37,24 @@ psy/quantize outer loops.
 | 1 | **Scaffolding** | BitWriter, codebook *encode* tables (inverted), AudioSpecificConfig + ADTS writers, ICS-info serializer | unit round-trips (encode-tuple → decode == tuple; config writer → parser) | ☑ |
 | 2 | **Filterbank + first valid frame** | windowed forward MDCT + overlap-add, crude quantizer (flat), Huffman spectral coding, SCE/CPE → raw_data_block | our decoder + ffmpeg decode it to recognizable audio | ☑ |
 | 3 | **Quantizer + rate loop** | non-uniform quantizer (x^¾ + per-SFB scalefactors + global_gain), rate control to a target bitrate (MP3 inner-loop) | hits bitrate; decodes; energy preserved | ☑ |
-| 4 | **Psychoacoustic model** | adapt MP3 psy → per-SFB masking thresholds (AAC swb + 1024 MDCT, FFT front-end); outer distortion loop | quality (NMR below threshold); noise < masking | ☑ |
+| 4 | **Psychoacoustic model** | adapt MP3 psy → per-SFB masking thresholds (AAC swb + 1024 MDCT, FFT front-end) | quality (NMR below threshold); noise < masking | ☑ |
 | 5 | **Block switching** | transient detect → EightShort (8×128) + grouping + window shapes | transients clean; decodes | ☑ |
 | 6 | **Stereo (M/S)** | CPE with per-SFB ms_used | stereo quality/ratio | ☑ |
 | 7 | **Container + E2E + presets** | `esds` in MP4 muxer, ADTS for `.aac`, config in extradata, bitrate presets via `configure()`, engine transcode | `rff -i in.wav out.m4a`; ffmpeg decodes; quality vs ffmpeg AAC | ☑ |
 
-Later quality tools (optional): TNS, PNS, intensity stereo.
+**Correction (2026-08-08, P0.9 hygiene).** Brick 4's row above originally also
+claimed an "outer distortion loop." There is none: `rate_loop` searches a single
+global base offset, and the per-band psy offsets are computed once, analytically,
+by `perceptual_offsets` — never iterated against the per-band threshold. The row
+has been corrected to describe what shipped. The real distortion loop is tracked
+as **arm A12** in `docs/codec-aac-great-gate.md`.
+
+**What comes next** is no longer "optional later tools" — it is a campaign with a
+census, a corpus and a gate ledger: see **`docs/codec-aac-great-gate.md`**. TNS,
+PNS and intensity stereo are arms A3/A6/A7 there (all three already decode
+correctly in `crate::decode`, so each is gateable on round-trip from day one),
+alongside the larger missing structures: short-block psy (A1), tonality-adaptive
+SMR (A2), absolute threshold of hearing (A4) and the bit reservoir/VBR (A5).
 
 ## Milestones
 

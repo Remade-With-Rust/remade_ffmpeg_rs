@@ -5,9 +5,15 @@
 //! (`EIGHT_SHORT`) windows with grouped scalefactors/sections, regular Huffman
 //! codebooks, pulse data and M/S stereo, synthesised via the verified IMDCT +
 //! windowed overlap-add (2048 for long, 8×256 for short). Output is normalised
-//! to float [-1, 1] and is bit-exact against FFmpeg on real AAC-LC files. TNS is
-//! parsed (for sync) but not yet applied; intensity stereo and PNS are rejected
-//! with a clear error rather than mis-decoded.
+//! to float [-1, 1] and is bit-exact against FFmpeg on real AAC-LC files.
+//!
+//! **Tool coverage.** TNS is parsed *and applied* (`parse_tns` → `apply_tns`, on
+//! both the SCE and CPE paths); PNS (`NOISE_HCB`) bands are filled with
+//! energy-scaled noise; intensity stereo is applied via `apply_is`, including
+//! the M/S sign flip. Only `gain_control_data` is rejected as unsupported. This
+//! matters to the encoder campaign: the encoder-side arms for TNS, PNS and
+//! intensity stereo (see `docs/codec-aac-great-gate.md`) can all be gated on
+//! round-trip through this decoder, with no decode work needed first.
 
 use crate::bits::BitReader;
 use crate::codebook::{decode_tuple, CODEBOOKS, INTENSITY_HCB2, NOISE_HCB, ZERO_HCB};
@@ -43,6 +49,8 @@ pub struct Decoder {
     overlap: Vec<[f32; FRAME_LEN]>,
     /// Per-channel previous window shape (false = sine, true = KBD).
     prev_kbd: Vec<bool>,
+    /// Set when a fill_element carried SBR payload (implicit HE-AAC signalling).
+    saw_sbr: bool,
     /// Per-channel previous window sequence.
     prev_seq: Vec<WindowSequence>,
     sine: Vec<f32>,
@@ -60,6 +68,7 @@ impl Decoder {
             fs_index: fs_index_for(sample_rate),
             overlap: Vec::new(),
             prev_kbd: Vec::new(),
+            saw_sbr: false,
             prev_seq: Vec::new(),
             sine: dsp::sine_window(LONG_N),
             kbd: dsp::kbd_window(LONG_N, 4.0),
@@ -67,6 +76,12 @@ impl Decoder {
             kbd_s: dsp::kbd_window(SHORT_N, 6.0),
             rng: 0x1234_5678,
         }
+    }
+
+    /// True once a `fill_element` carrying SBR payload has been seen — implicit
+    /// HE-AAC signalling. The core still decodes; the high band does not exist.
+    pub fn saw_sbr(&self) -> bool {
+        self.saw_sbr
     }
 
     /// Decode one raw access unit into interleaved-`f32` PCM.
@@ -127,7 +142,19 @@ impl Decoder {
                         // zero escape byte can't underflow usize (`0usize - 1` panics).
                         count = count + r.read_bits(8)? as usize - 1;
                     }
-                    r.skip(count * 8)?;
+                    // Peek the 4-bit extension_type before skipping: SBR payload
+                    // here is how *implicit* HE-AAC signalling works, where the
+                    // config says nothing but the fill elements carry SBR anyway
+                    // (a shape MPEG-TS broadcast really produces). Recording it
+                    // lets the caller learn the output rate is doubled instead of
+                    // being handed half-speed audio.
+                    if count > 0 {
+                        let ext = r.read_bits(4)?;
+                        if ext == 13 || ext == 14 {
+                            self.saw_sbr = true;
+                        }
+                        r.skip(count * 8 - 4)?;
+                    }
                 }
                 ID_DSE => {
                     let _tag = r.read_bits(4)?;
@@ -526,8 +553,8 @@ struct Tns {
 }
 
 /// Max TNS-affected band per sampling-frequency index (ISO Table 4.A.45/46).
-const TNS_MAX_LONG: [u8; 13] = [31, 31, 34, 40, 42, 51, 46, 46, 42, 42, 42, 39, 39];
-const TNS_MAX_SHORT: [u8; 13] = [9, 9, 10, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14];
+pub(crate) const TNS_MAX_LONG: [u8; 13] = [31, 31, 34, 40, 42, 51, 46, 46, 42, 42, 42, 39, 39];
+pub(crate) const TNS_MAX_SHORT: [u8; 13] = [9, 9, 10, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14];
 
 /// Parse TNS, dequantizing PARCOR coefficients and converting them to LPC.
 fn parse_tns(r: &mut BitReader, info: &IcsInfo) -> Result<Tns> {
@@ -749,12 +776,31 @@ fn apply_is(
     }
 }
 
+/// Interleave decoded channels, **reordering AAC element order into the standard
+/// interleave order** the rest of the workspace uses (FL, FR, FC, LFE, BL, BR).
+///
+/// AAC carries 5.1 as `C, L, R, Ls, Rs, LFE`; every WAV writer and filter here
+/// expects `L, R, C, LFE, Ls, Rs`. Emitting element order straight out would put
+/// the centre channel in the left speaker. Mono and stereo are identity, so this
+/// changes nothing for the overwhelmingly common cases.
 fn interleave(outputs: Vec<Vec<f32>>, sample_rate: u32, pts: Option<i64>) -> DecodedAudio {
     let nch = outputs.len();
+    let order = crate::encode::aac_to_interleave_order(nch);
     let mut samples = Vec::with_capacity(FRAME_LEN * nch);
     for n in 0..FRAME_LEN {
-        for ch in &outputs {
-            samples.push(ch[n]);
+        match &order {
+            Some(map) => {
+                for &src in map {
+                    samples.push(outputs[src][n]);
+                }
+            }
+            // No defined layout (a PCE stream, once supported): pass elements
+            // through in stream order rather than guessing.
+            None => {
+                for ch in &outputs {
+                    samples.push(ch[n]);
+                }
+            }
         }
     }
     DecodedAudio {

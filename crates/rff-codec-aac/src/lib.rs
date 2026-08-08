@@ -83,8 +83,17 @@ impl Decoder for AacDecoder {
         // Prefer the out-of-band AudioSpecificConfig (MP4 esds); otherwise fall
         // back to the stream's declared rate/channels (e.g. ADTS streams).
         if !params.extradata.is_empty() {
-            let cfg = parse_audio_specific_config(&params.extradata).map_err(map_err)?;
-            self.inner = rusty_aac::AacDecoder::with_config(cfg);
+            // Use the RAW config bytes, not the parsed struct: HE-AAC signalling
+            // (SBR / Parametric Stereo) lives in fields `AudioSpecificConfig`
+            // does not carry. Through the parsed path an HE-AAC stream reports
+            // its *core* rate — half the real one — and the pipeline resamples
+            // or plays it at half speed.
+            self.inner = rusty_aac::AacDecoder::with_config_bytes(&params.extradata)
+                .or_else(|_| {
+                    parse_audio_specific_config(&params.extradata)
+                        .map(rusty_aac::AacDecoder::with_config)
+                })
+                .map_err(map_err)?;
         } else if params.sample_rate > 0 {
             self.inner = rusty_aac::AacDecoder::with_config(AudioSpecificConfig {
                 object_type: 2,

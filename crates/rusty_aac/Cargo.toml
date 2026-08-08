@@ -1,12 +1,12 @@
 [package]
 name = "rusty_aac"
-version = "0.1.1"
+version = "0.4.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 authors = ["Mata Network <https://www.mata.network>"]
 homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
-description = "Pure-Rust AAC-LC decoder + encoder, no C/FFI. Decoder bit-exact vs FFmpeg; psychoacoustic encoder with block switching, M/S stereo and AVX2 kernels."
+description = "Pure-Rust AAC-LC decoder + encoder, no C/FFI. Decoder bit-exact vs FFmpeg; psychoacoustic encoder ~5.3x faster than FFmpeg's native AAC. ADTS/MP4/LATM-LOAS transport, 5.1 channel layouts, HE-AAC signalling."
 readme = "README.md"
 keywords = ["aac", "audio", "codec", "decoder", "encoder"]
 categories = ["multimedia::audio", "multimedia::encoding"]
@@ -16,5 +16,32 @@ rust-version = "1.85"
 default = ["simd"]
 simd = []
 simd-avx512 = ["simd"]
+# The quality lab: deterministic corpus + NMR metric + bitrate-ladder runner.
+# Dev/analysis only — it is the verdict instrument for the Great Gate campaign
+# (`docs/codec-aac-great-gate.md`), not part of the shipped codec surface.
+lab = []
 
 [dependencies]
+
+# Bench/example roots only. PROJECT CONVENTION (see the root `Cargo.toml` and
+# `CLAUDE.md`): every encoder-carrying binary/bench/example sets our own
+# `rusty_alloc` as its `#[global_allocator]`, because that is what ships — an arm
+# measured under the system allocator is not comparable (measured gap on AV2
+# decode: 1.38x). Benches and examples are SEPARATE compilation units from the
+# library, so each root declares it individually; the lib target below must NOT
+# (a library must never hijack a downstream binary's allocator choice).
+[dev-dependencies]
+rusty_alloc-api.workspace = true
+
+# The quality-ladder driver and the gate-calculator harvester both need `lab`.
+[[example]]
+name = "aacquality"
+required-features = ["lab"]
+
+[[example]]
+name = "aacharvest"
+required-features = ["lab"]
+
+[[example]]
+name = "aacexport"
+required-features = ["lab"]

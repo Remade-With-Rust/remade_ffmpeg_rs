@@ -30,13 +30,25 @@ pub mod encode;
 mod error;
 mod huffman;
 mod ics;
+/// LATM/LOAS transport (ISO 14496-3 §1.7) — the MPEG-TS / broadcast carriage
+/// format, alongside ADTS (`.aac`) and MP4 `esds`.
+pub mod latm;
+/// The quality lab (feature `lab`): deterministic corpus, the NMR metric, and the
+/// bitrate-ladder runner. This is the verdict instrument for the Great Gate
+/// campaign — see `docs/codec-aac-great-gate.md`.
+#[cfg(feature = "lab")]
+pub mod lab;
+/// HE-AAC (SBR / Parametric Stereo) signalling and capability reporting — the
+/// broadcast and low-bitrate-streaming configuration. See the module docs for
+/// exactly which parts are implemented.
+pub mod sbr;
 mod swb;
 mod tables;
 
 pub use bits::BitReader;
 pub use encode::{
     audio_specific_config_bytes, write_adts_header, write_audio_specific_config, AacEncoder,
-    AacEncoderConfig, EncodedPacket,
+    AacEncoderConfig, EncodedPacket, WindowShape,
 };
 pub use error::{Error, Result};
 
@@ -191,6 +203,8 @@ impl DecodedAudio {
 pub struct AacDecoder {
     config: Option<AudioSpecificConfig>,
     decoder: Option<decode::Decoder>,
+    /// HE-AAC parameters, when built via [`AacDecoder::with_config_bytes`].
+    sbr: Option<sbr::SbrConfig>,
 }
 
 impl AacDecoder {
@@ -205,6 +219,59 @@ impl AacDecoder {
         AacDecoder {
             config: Some(cfg),
             decoder: None,
+            sbr: None,
+        }
+    }
+
+    /// A decoder configured from the **raw** `AudioSpecificConfig` bytes.
+    ///
+    /// Prefer this over [`with_config`](Self::with_config) whenever the raw bytes
+    /// are available (they always are — `esds`, `StreamMuxConfig`), because HE-AAC
+    /// signalling lives in fields the plain [`AudioSpecificConfig`] does not
+    /// carry. An HE-AAC stream configured through the plain path reports its
+    /// **core** rate, and a player that believes it plays the audio at half
+    /// speed.
+    pub fn with_config_bytes(data: &[u8]) -> Result<AacDecoder> {
+        let sbr = sbr::parse_sbr_config(data)?;
+        let mut cfg = parse_audio_specific_config(data)?;
+        // The core decodes at the core rate whatever the config's first field
+        // said; for hierarchical HE-AAC that field was the extension rate.
+        if sbr.sbr_present {
+            cfg.sample_rate = sbr.core_sample_rate;
+            cfg.object_type = sbr.core_object_type;
+        }
+        Ok(AacDecoder {
+            config: Some(cfg),
+            decoder: None,
+            sbr: Some(sbr),
+        })
+    }
+
+    /// HE-AAC parameters, when the decoder was built from raw config bytes.
+    pub fn sbr_config(&self) -> Option<sbr::SbrConfig> {
+        self.sbr
+    }
+
+    /// How much of this stream can actually be reconstructed.
+    ///
+    /// [`SbrSupport::CoreOnly`](sbr::SbrSupport::CoreOnly) means the output is
+    /// real audio, correct in rate and channels, but band-limited to the core's
+    /// Nyquist because the SBR high band is not reconstructed.
+    pub fn sbr_support(&self) -> sbr::SbrSupport {
+        match self.sbr {
+            Some(s) => s.support(),
+            None => sbr::SbrSupport::NotPresent,
+        }
+    }
+
+    /// The stream's **output** sample rate.
+    ///
+    /// For HE-AAC this is twice the rate the `raw_data_block`s are coded at.
+    /// Returns `None` until the configuration is known.
+    pub fn output_sample_rate(&self) -> Option<u32> {
+        match self.sbr {
+            Some(s) if s.sbr_present => Some(s.output_sample_rate),
+            _ => self.config.map(|c| c.sample_rate),
         }
     }
 
