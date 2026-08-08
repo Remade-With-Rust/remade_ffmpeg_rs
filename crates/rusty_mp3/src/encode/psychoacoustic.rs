@@ -26,7 +26,22 @@ const N_FFT: usize = 1024;
 /// 1A) was MEASURED to give zero corpus-ODG change at CBR (the rate loop dominates
 /// the allocation, not the threshold shape), so it was reverted. The lever for these
 /// clips was the block-type decision (attack detector), not the threshold values.
-const SMR_OFFSET_DB: f32 = 12.0;
+const SMR_OFFSET_DB: f32 = 3.0;
+
+/// Calibration override for [`SMR_OFFSET_DB`], via `MP3_SMR_DB`.
+///
+/// Read ONCE and cached: an env lookup inside the per-granule path would be
+/// overhead added in order to take a measurement. Unset (the shipping default)
+/// returns the constant, so the production build is unaffected.
+fn smr_offset_db() -> f32 {
+    static V: OnceLock<f32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MP3_SMR_DB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SMR_OFFSET_DB)
+    })
+}
 
 /// Per-granule perceptual analysis result.
 #[derive(Debug, Clone, Default)]
@@ -242,7 +257,7 @@ pub fn analyze(pcm: &[f32], sample_rate: u32) -> PsyResult {
 
     // Q3 — spread energy across Bark (cached matrix → a dot product, no powf),
     // lower by the SMR offset, floor at the ATH.
-    let smr = 10f32.powf(-SMR_OFFSET_DB / 10.0);
+    let smr = 10f32.powf(-smr_offset_db() / 10.0);
     let total_energy: f32 = energy.iter().sum();
     let ath_scale = (total_energy / N_FFT as f32).max(1e-9) * 1e-3;
     let mut thresholds = [0f32; SFB_LONG];
