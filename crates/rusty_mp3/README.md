@@ -15,35 +15,51 @@ format is royalty-free everywhere.
   crates.io** — existing options are FFI bindings to LAME. MPEG-1/2/2.5, CBR
   and VBR, mono/stereo/joint (mid/side) stereo, psychoacoustic model with
   transient block switching, and a **bit reservoir** (default-on for MPEG-1 CBR
-  ≤ 256 kbps). Quality currently sits **~0.3–0.46 ODG behind LAME** at matched
-  bitrate — close, but not parity; see [Quality](#quality) for the measured
-  table. Known gaps: the reservoir is disabled at 320 kbps and for MPEG-2/2.5
-  (fixed-frame path is used there instead), and the per-band distortion loop is
-  effectively inert, so we pick a global gain per granule where LAME shapes
-  noise per band.
+  ≤ 256 kbps). Quality is **behind LAME by ~0.7 ODG at 192 kbps and ~1.1 at
+  128 kbps** on a three-clip corpus, and the gap is content-dependent — ~0.3 on
+  tonal material, 1.4–1.8 on transients. See [Quality](#quality). Known gaps:
+  the reservoir is disabled at 320 kbps and for MPEG-2/2.5 (fixed-frame path is
+  used there instead); the per-band distortion loop is effectively inert, so we
+  pick a global gain per granule where LAME shapes noise per band; and the
+  psychoacoustic model has no short-block thresholds.
 
 ## Quality
 
-PEAQ ODG at matched **actual** bitrate on real music. Matching `-q:a` between
-encoders does not match the rate, so it proves nothing — everything here is
-compared at the rate we actually produced.
+PEAQ ODG at matched **actual** bitrate, on a three-clip corpus — tonal guitar,
+dense piano, transient clicks. Per clip, because the mean hides the thing that
+matters:
 
-| point | ours | LAME | gap |
-| ----- | ---- | ---- | --- |
-| CBR 192 kbps | −0.28 | +0.01 | **0.29** |
-| CBR 128 kbps | −1.28 | −0.90 | **0.37** |
-| VBR 192 kbps | −0.44 | +0.01 | **0.45** |
-| VBR 128 kbps | −1.36 | −0.90 | **0.46** |
-| VBR 80 kbps | −3.07 | −2.77 | **0.30** |
-| *VBR ~200 kbps, 0.5.1 and earlier* | *−3.50* | *+0.01* | *3.51* |
+| CBR 192 kbps | guitar | piano | clicks | mean |
+| ------------ | ------ | ----- | ------ | ---- |
+| LAME | +0.01 | +0.11 | −1.14 | −0.34 |
+| ours | −0.28 | −0.37 | −2.53 | −1.06 |
+| **gap** | **0.29** | **0.48** | **1.39** | **0.72** |
 
-ODG runs 0 (imperceptible) to −4 (very annoying). So we are consistently a
-few tenths behind LAME rather than at parity, and the VBR path — which was
-three ODG adrift through 0.5.1 — now sits in the same band as CBR.
+| CBR 128 kbps | guitar | piano | clicks | mean |
+| ------------ | ------ | ----- | ------ | ---- |
+| LAME | −0.90 | +0.06 | −1.32 | −0.72 |
+| ours | −1.28 | −1.07 | −3.06 | −1.80 |
+| **gap** | **0.37** | **1.13** | **1.75** | **1.08** |
 
-An earlier revision of this README claimed PEAQ parity across 96–256 kbps. That
-predated measuring against LAME at matched bitrate with an external oracle; the
-numbers above supersede it.
+ODG runs 0 (imperceptible) to −4 (very annoying).
+
+**The gap is content-dependent, and transients are where we lose.** On tonal
+guitar we are ~0.3 ODG behind LAME; on percussive material we are 1.4–1.8
+behind. Two known causes, both structural rather than tuning: the per-band
+distortion loop keeps iteration 0 in effectively every granule, so we choose a
+global gain per granule where LAME shapes noise per band; and the
+psychoacoustic model produces no short-block masking thresholds, so the block
+type that exists to control pre-echo is the one with the weakest model behind
+it.
+
+Sweeping the model's one masking constant across a 6× range moves tonal content
+by 0.002 ODG, which is the arithmetic confirming the above: the constant is not
+what is binding.
+
+*Earlier revisions of this README quoted a 0.29–0.46 ODG gap. That was measured
+on the guitar clip alone, which is our best content; the corpus numbers above
+supersede it. An earlier revision also claimed PEAQ parity with LAME, which
+predated measuring against it at matched bitrate.*
 
 ## Decode
 
