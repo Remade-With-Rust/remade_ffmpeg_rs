@@ -44,6 +44,7 @@ rff-format-webp.workspace = true
 rff-format-wav.workspace = true
 rff-format-y4m.workspace = true
 rff-format-ivf.workspace = true
+rff-format-av2f.workspace = true
 rff-format-ogg.workspace = true
 rff-format-flac.workspace = true
 rff-format-mp3.workspace = true

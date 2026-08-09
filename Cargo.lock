@@ -4886,6 +4886,7 @@ dependencies = [
  "rff-core",
  "rff-filter",
  "rff-format",
+ "rff-format-av2f",
  "rff-format-avi",
  "rff-format-avif",
  "rff-format-flac",
@@ -5107,6 +5108,15 @@ name = "rff-format"
 version = "0.1.0"
 dependencies = [
  "rff-core",
+]
+
+[[package]]
+name = "rff-format-av2f"
+version = "0.1.0"
+dependencies = [
+ "rff-core",
+ "rff-format",
+ "rusty_av2f",
 ]
 
 [[package]]
@@ -5481,7 +5491,7 @@ checksum = "aa2cbb720cf9bed36712efbae9ffc89d8977bf51b05687b792c1f98a33add8e2"
 
 [[package]]
 name = "rusty_aac"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "rusty_alloc-api",
 ]
@@ -5565,9 +5575,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_av2d"
-version = "0.2.1"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d9afd6c3fec35e2117d489c3f3817554ff4c5e368d445e085e3a4f0c7ae2752"
+checksum = "af372f1676c203a9bbb1b924f9cfca2ac8de8acb1aa6c8b708a9aa483525213a"
 dependencies = [
  "assert_matches",
  "atomig",
@@ -5583,6 +5593,12 @@ dependencies = [
  "to_method",
  "zerocopy 0.7.35",
 ]
+
+[[package]]
+name = "rusty_av2f"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcc2f14c94078bb518cc404975b3cada7862066ece7e7f0c5d2e86d72f9d8dac"
 
 [[package]]
 name = "rusty_h264"
@@ -5645,7 +5661,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_mp3"
-version = "0.4.1"
+version = "0.6.1"
 dependencies = [
  "rusty_alloc-api",
 ]

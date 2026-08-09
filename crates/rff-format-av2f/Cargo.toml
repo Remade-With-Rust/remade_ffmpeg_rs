@@ -1,0 +1,21 @@
+[package]
+name = "rff-format-av2f"
+description = "Remade FFmpeg (Rust): AV2F still-image container — EXPERIMENTAL, not an AOM standard."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["av2", "image", "still", "isobmff", "heif"]
+categories = ["multimedia", "multimedia::images"]
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true
+# The container itself, published standalone. Pinned tight on purpose: AV2F's
+# four-character codes are chosen rather than specified by AOM, so a 0.x bump is
+# potentially format-breaking, not merely additive.
+rusty_av2f = "0.1.0"

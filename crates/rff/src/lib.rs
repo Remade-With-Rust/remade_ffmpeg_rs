@@ -85,6 +85,9 @@ fn register_builtin_formats(formats: &mut FormatRegistry) {
     rff_format_wav::register(formats);
     rff_format_y4m::register(formats);
     rff_format_ivf::register(formats);
+    // AV2F is EXPERIMENTAL: its four-character codes are chosen by us, not
+    // specified by AOM. Files written here are readable here and nowhere else.
+    rff_format_av2f::register(formats);
     rff_format_ogg::register(formats);
     rff_format_flac::register(formats);
     rff_format_mp3::register(formats);
