@@ -22,7 +22,7 @@ use std::collections::VecDeque;
 use std::io::Read;
 use std::ops::Range;
 
-use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result, SampleFormat};
+use rff_core::{CodecId, Error, MediaType, Packet, PixelFormat, Rational, Result, SampleFormat};
 use rff_format::{Demuxer, Format, FormatRegistry, Input, Muxer, Output, Stream};
 
 /// Register the AVI format into a [`FormatRegistry`].
@@ -418,7 +418,7 @@ impl Muxer for AviMuxer {
             let length = self.packet_count(s.index);
             let mut strl = Vec::new();
             put_chunk(&mut strl, b"strh", &strh(s, length));
-            put_chunk(&mut strl, b"strf", &strf(s));
+            put_chunk(&mut strl, b"strf", &strf(s)?);
             put_list(&mut hdrl, b"strl", &strl);
         }
 
@@ -494,7 +494,7 @@ fn strh(s: &Stream, length: u32) -> Vec<u8> {
 }
 
 /// Stream format: BITMAPINFOHEADER (video) or WAVEFORMATEX (audio).
-fn strf(s: &Stream) -> Vec<u8> {
+fn strf(s: &Stream) -> Result<Vec<u8>> {
     match s.media_type {
         MediaType::Audio => {
             let (tag, bits): (u16, u16) = match s.sample_format {
@@ -509,18 +509,39 @@ fn strf(s: &Stream) -> Vec<u8> {
             put_u32(&mut w, 8, s.sample_rate * block_align as u32); // nAvgBytesPerSec
             put_u16(&mut w, 12, block_align); // nBlockAlign
             put_u16(&mut w, 14, bits); // wBitsPerSample
-            w
+            Ok(w)
         }
         _ => {
+            // Raw video must describe its actual pixel layout: a zero fourcc
+            // means BI_RGB, and readers then interpret planar-YUV packets as
+            // packed BGR of a different size — silent corruption. Planar YUV
+            // carries its own fourcc and true bits-per-pixel instead.
+            let (fourcc, bit_count, frame_bytes): ([u8; 4], u16, u32) =
+                if s.codec_id == CodecId::RawVideo {
+                    let (cw, ch) = (s.width.div_ceil(2), s.height.div_ceil(2));
+                    match s.pixel_format {
+                        Some(PixelFormat::Yuv420p) => (*b"I420", 12, s.width * s.height + 2 * cw * ch),
+                        Some(PixelFormat::Yuv422p) => (*b"Y42B", 16, s.width * s.height + 2 * cw * s.height),
+                        Some(PixelFormat::Yuv444p) => (*b"444P", 24, 3 * s.width * s.height),
+                        other => {
+                            return Err(Error::unsupported(format!(
+                                "avi mux: rawvideo pixel format {:?} has no AVI mapping",
+                                other
+                            )))
+                        }
+                    }
+                } else {
+                    (codec_to_fourcc(s.codec_id), 24, s.width * s.height * 3)
+                };
             let mut b = vec![0u8; 40]; // BITMAPINFOHEADER
             put_u32(&mut b, 0, 40); // biSize
             put_u32(&mut b, 4, s.width); // biWidth
             put_u32(&mut b, 8, s.height); // biHeight
             put_u16(&mut b, 12, 1); // biPlanes
-            put_u16(&mut b, 14, 24); // biBitCount
-            b[16..20].copy_from_slice(&codec_to_fourcc(s.codec_id)); // biCompression
-            put_u32(&mut b, 20, s.width * s.height * 3); // biSizeImage
-            b
+            put_u16(&mut b, 14, bit_count); // biBitCount
+            b[16..20].copy_from_slice(&fourcc); // biCompression
+            put_u32(&mut b, 20, frame_bytes); // biSizeImage
+            Ok(b)
         }
     }
 }
