@@ -65,13 +65,10 @@ impl Demuxer for WebpDemuxer {
         let lossy_yuv = probe.is_lossy() && !probe.has_alpha() && !probe.is_animated();
 
         // Animated files: frame pts are milliseconds (accumulated ANMF
-        // durations), so the stream carries a 1/1000 time base.
+        // durations), so the stream carries a 1/1000 time base. (The frame
+        // count is knowable here via `num_frames`, but `Stream::nb_frames`
+        // hasn't shipped in a published rff-format yet — set it when it has.)
         let animated = probe.is_animated();
-        let nb_frames = if animated {
-            Some(u64::from(probe.num_frames()))
-        } else {
-            None
-        };
 
         self.sample = Some(buf);
         let mut stream = Stream::new(0, CodecId::Webp);
@@ -82,7 +79,6 @@ impl Demuxer for WebpDemuxer {
         } else {
             Rational::new(1, 1)
         };
-        stream.nb_frames = nb_frames;
         if lossy_yuv {
             stream.color_range = ColorRange::Limited;
         }
