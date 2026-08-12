@@ -39,21 +39,41 @@ pub fn apply(
     gi: &GranuleSideInfo,
     sf: &ScaleFactors,
     coeffs: &[i32; GRANULE_LINES],
-    _nz: usize,
+    nz: usize,
     out: &mut [f32; GRANULE_LINES],
 ) {
     out.fill(0.0);
+    // D8 rests on this: the Huffman stage writes only [0, nz) into a zeroed
+    // array, so everything above the rzero boundary is zero and can be skipped.
+    // Cheap to assert, and a silent corruption if it ever stops holding.
+    debug_assert!(
+        coeffs[nz.min(GRANULE_LINES)..].iter().all(|&c| c == 0),
+        "rzero invariant broken: non-zero coefficient at or above nz={nz}"
+    );
     let pow = pow43_table(); // hoisted once per granule, not per line
     let gain = gi.global_gain as i32 - 210;
     let sf_mult = if gi.scalefac_scale { 1.0f64 } else { 0.5 };
     let is_short = gi.window_switching && gi.block_type == BlockType::Short;
 
+    // **D8** — stop at the rzero boundary. `nz` is the index past the last
+    // coefficient the Huffman stage actually decoded; everything above it is
+    // zero, `out` was just filled with 0.0, and `dequant(0, ..) == 0.0` exactly
+    // (`0.signum() == 0`), so the tail is already correct. This is byte-identical,
+    // not an approximation.
+    //
+    // It was already being computed and handed to us as `_nz`, then ignored: the
+    // stage dequantized all 576 lines on every granule. On real music the rzero
+    // boundary typically sits well below 576, so this also skips those bands'
+    // per-band `2f64.powf(exp)` entirely.
     if !is_short {
         // Long block: each band scales a contiguous run of lines.
         let off = tables::sfb_long_offsets(header.sample_rate);
         for sfb in 0..22 {
             let start = off[sfb] as usize;
-            let end = (off[sfb + 1] as usize).min(GRANULE_LINES);
+            if start >= nz {
+                break; // rzero: this band and every band above it is all zeros
+            }
+            let end = (off[sfb + 1] as usize).min(GRANULE_LINES).min(nz);
             let pre = if gi.preflag { tables::PRETAB[sfb] } else { 0 } as f64;
             let exp = 0.25 * gain as f64 - sf_mult * (sf.long[sfb] as f64 + pre);
             let scale = 2f64.powf(exp);
@@ -68,12 +88,18 @@ pub fn apply(
         for sfb in 0..13 {
             let start = off[sfb] as usize;
             let width = (off[sfb + 1] - off[sfb]) as usize;
+            if start * 3 >= nz {
+                break; // rzero, in bitstream order
+            }
             for window in 0..3 {
                 let gain_w = gain - 8 * gi.subblock_gain[window] as i32;
                 let exp = 0.25 * gain_w as f64 - sf_mult * (sf.short[window][sfb] as f64);
                 let scale = 2f64.powf(exp);
                 for f in 0..width {
                     let src = start * 3 + window * width + f;
+                    if src >= nz {
+                        break; // this window's run is past rzero
+                    }
                     let dst = start * 3 + window + f * 3;
                     if src < GRANULE_LINES && dst < GRANULE_LINES {
                         out[dst] = dequant(coeffs[src], pow, scale);
