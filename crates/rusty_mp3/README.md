@@ -206,7 +206,33 @@ applies to CBR and VBR alike.
 Short blocks are covered by the same budget, so they no longer need a separate
 path.
 
-### Decode — 0.5.0 (SIMD)
+### Decode — vs FFmpeg, at matched CPU
+
+Both sides decode the same 27.5-minute stream and **discard the output**, pinned
+to the same physical cores, wall clock, arms alternated, 15 pairs:
+
+| cores each | rusty_mp3 | FFmpeg | result |
+| ---------- | --------- | ------ | ------ |
+| 1 physical | 1,952 ms | 2,431 ms | **1.24× faster** (15/15, z = −3.87) |
+| 2 physical | **1,017 ms** | 1,455 ms | **1.39× faster** (15/15, z = −3.87) |
+| *2, our serial build (control)* | *1,807 ms* | *1,445 ms* | *1.30× slower* |
+
+We also use **less total CPU**: 1,875 ms against FFmpeg's 2,125 ms on one core.
+The win is not bought with extra work.
+
+The control row is the one that makes the two-core number trustworthy: our
+*serial* build on the same two cores reads `cpu/wall` 0.95 — it cannot use the
+second core and loses. Only the pipelined build converts the budget, at
+`cpu/wall` 1.78. So the gain is real concurrency, not scheduling luck.
+
+Three asymmetries had to be removed before any of this was visible, and one was
+ours: FFmpeg's CLI uses ~2 cores even with `-threads 1` (`cpu/wall` 1.96); our
+CLI wrote 582 MB while `-f null -` writes nothing; and our own profiler hashed
+every sample, 17% of its own runtime, work FFmpeg never did. A CLI-to-CLI
+comparison with those in place read 1.20× *behind* — it was measuring the output
+path, not the codec.
+
+### Decode — 0.5.0 (SIMD)### Decode — 0.5.0 (SIMD)
 
 Two AVX kernels in the synthesis filterbank, both **bit-identical** to their
 scalar twins (each output owns a lane and accumulates in the original order;
