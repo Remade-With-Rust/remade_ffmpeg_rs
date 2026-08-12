@@ -817,12 +817,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "color_quant"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
-
-[[package]]
 name = "combine"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2320,16 +2314,6 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
-]
-
-[[package]]
-name = "gif"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
-dependencies = [
- "color_quant",
- "weezl",
 ]
 
 [[package]]
@@ -4966,9 +4950,9 @@ dependencies = [
 name = "rff-codec-gif"
 version = "0.1.0"
 dependencies = [
- "gif",
  "rff-codec",
  "rff-core",
+ "rusty_gif",
 ]
 
 [[package]]
@@ -5565,9 +5549,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_av2d"
-version = "0.2.5"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b276734b8cf6f875f4fd354f9f1177ed67d43d8ae7146b7f0fb7cbb0c111dab2"
+checksum = "c4e1791708dffe38ef240a5494d1d1e223f68b9a08b4c994eed3b45907d5c8ca"
 dependencies = [
  "assert_matches",
  "atomig",
@@ -5589,6 +5573,14 @@ name = "rusty_av2f"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d73ba33bdce3e99a7b6952daf848eda737756e5db66bb3be91471660944a1922"
+
+[[package]]
+name = "rusty_gif"
+version = "0.1.0"
+dependencies = [
+ "rusty_alloc-api",
+ "weezl",
+]
 
 [[package]]
 name = "rusty_h264"
