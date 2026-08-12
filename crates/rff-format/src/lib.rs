@@ -10,6 +10,8 @@
 //!
 //! Concrete formats live in their own crates (`rff-format-avi`, ...).
 
+pub mod avc;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
@@ -43,6 +45,13 @@ pub struct Stream {
     /// Codec-private initialization data (e.g. H.264 SPS/PPS, OpusHead). Empty
     /// for codecs whose bitstream is fully self-describing.
     pub extradata: Vec<u8>,
+    /// Total stream duration in [`time_base`](Stream::time_base) units, when
+    /// the container declares it (MP4 `mdhd`, Matroska `Duration`). `None` when
+    /// unknown (live streams, TS).
+    pub duration: Option<i64>,
+    /// Total packet count (frames for video), when the container's index
+    /// declares it. `None` when unknown — never a guess.
+    pub nb_frames: Option<u64>,
 }
 
 impl Stream {
@@ -61,6 +70,8 @@ impl Stream {
             channels: 0,
             sample_format: None,
             extradata: Vec::new(),
+            duration: None,
+            nb_frames: None,
         }
     }
 }

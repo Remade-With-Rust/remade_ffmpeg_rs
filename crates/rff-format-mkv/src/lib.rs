@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::io::Read;
 
 use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result};
+use rff_format::avc::{avcc_to_annexb, parse_avcc, AvcConfig};
 use rff_format::{Demuxer, Format, FormatRegistry, Input, Stream};
 
 /// Register the Matroska/WebM demuxer.
@@ -37,6 +38,7 @@ pub fn probe_mkv(bytes: &[u8]) -> i32 {
 const ID_SEGMENT: u32 = 0x1853_8067;
 const ID_INFO: u32 = 0x1549_A966;
 const ID_TIMESTAMP_SCALE: u32 = 0x2AD7_B1;
+const ID_DURATION: u32 = 0x4489;
 const ID_TRACKS: u32 = 0x1654_AE6B;
 const ID_TRACK_ENTRY: u32 = 0xAE;
 const ID_TRACK_NUMBER: u32 = 0xD7;
@@ -149,7 +151,12 @@ struct MkvDemuxer {
     streams: Vec<Stream>,
     /// Maps a Matroska track number to our 0-based stream index.
     track_map: Vec<(u64, usize)>,
+    /// Indexed by stream index; `Some` for H.264 tracks whose CodecPrivate is
+    /// an `avcC` — their blocks are AVCC and get normalised to Annex-B.
+    avc: Vec<Option<AvcConfig>>,
     timestamp_scale: u64,
+    /// Segment duration in `timestamp_scale` ticks (same unit as `time_base`).
+    duration_ticks: Option<i64>,
     packets: VecDeque<Packet>,
     parsed: bool,
 }
@@ -160,7 +167,9 @@ impl MkvDemuxer {
             input: Some(input),
             streams: Vec::new(),
             track_map: Vec::new(),
+            avc: Vec::new(),
             timestamp_scale: 1_000_000, // default: 1 ms
+            duration_ticks: None,
             packets: VecDeque::new(),
             parsed: false,
         }
@@ -187,6 +196,14 @@ impl MkvDemuxer {
         }
         if self.streams.is_empty() {
             return Err(Error::invalid("mkv: no tracks found"));
+        }
+        // The whole file is buffered, so totals are exact, not declarations.
+        for s in &mut self.streams {
+            s.duration = self.duration_ticks;
+            let n = self.packets.iter().filter(|p| p.stream_index == s.index).count();
+            if n > 0 {
+                s.nb_frames = Some(n as u64);
+            }
         }
         Ok(())
     }
@@ -222,10 +239,16 @@ impl MkvDemuxer {
             let Some((size, _)) = e.read_size() else {
                 break;
             };
-            if id == ID_TIMESTAMP_SCALE {
-                self.timestamp_scale = e.read_uint(size as usize);
-            } else {
-                e.pos += size as usize;
+            match id {
+                ID_TIMESTAMP_SCALE => self.timestamp_scale = e.read_uint(size as usize),
+                // Duration is a float in `timestamp_scale` ticks — our time_base.
+                ID_DURATION => {
+                    let d = e.read_float(size as usize);
+                    if d > 0.0 {
+                        self.duration_ticks = Some(d as i64);
+                    }
+                }
+                _ => e.pos += size as usize,
             }
         }
     }
@@ -309,7 +332,14 @@ impl MkvDemuxer {
         s.height = height;
         s.sample_rate = rate;
         s.channels = channels;
-        s.extradata = codec_private;
+        // H.264 is stored AVCC (CodecPrivate = avcC, length-prefixed blocks).
+        // Normalise to rff's Annex-B packet contract — same as rff-format-mp4 —
+        // so extradata stays empty and the SPS/PPS ride in keyframe packets.
+        let avc = (codec_id == CodecId::H264)
+            .then(|| parse_avcc(&codec_private))
+            .flatten();
+        s.extradata = if avc.is_some() { Vec::new() } else { codec_private };
+        self.avc.push(avc);
         // Matroska timestamps are in `timestamp_scale` ns; expose ms time base.
         s.time_base = Rational::new(1, (1_000_000_000 / self.timestamp_scale.max(1)) as i32);
         self.track_map.push((number, index));
@@ -373,7 +403,20 @@ impl MkvDemuxer {
         if lacing != 0 {
             return; // laced blocks unsupported for now (rare for video/Opus)
         }
-        let data = block[b.pos..].to_vec();
+        let raw = &block[b.pos..];
+        // H.264: AVCC → Annex-B, prepending SPS/PPS on keyframes so the
+        // decoder is self-contained (mirrors the MP4 demuxer).
+        let data = match self.avc.get(index).and_then(|a| a.as_ref()) {
+            Some(cfg) => {
+                let mut out = Vec::with_capacity(cfg.headers_annexb.len() + raw.len() + 16);
+                if keyframe {
+                    out.extend_from_slice(&cfg.headers_annexb);
+                }
+                avcc_to_annexb(raw, cfg.nal_len, &mut out);
+                out
+            }
+            None => raw.to_vec(),
+        };
         let mut packet = Packet::from_data(index, data);
         packet.pts = Some(cluster_ts + rel);
         packet.flags.keyframe = keyframe;

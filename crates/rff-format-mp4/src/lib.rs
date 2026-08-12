@@ -102,11 +102,7 @@ struct SampleLoc {
     keyframe: bool,
 }
 
-/// Per-track H.264 config for AVCC→Annex-B conversion.
-struct AvcConfig {
-    nal_len: usize,
-    headers_annexb: Vec<u8>,
-}
+use rff_format::avc::{avcc_to_annexb, parse_avcc, AvcConfig};
 
 struct Mp4Demuxer {
     input: Option<Input>,
@@ -194,25 +190,6 @@ impl Demuxer for Mp4Demuxer {
     }
 }
 
-/// Convert one AVCC sample (a series of `nal_len`-byte length + NAL) to Annex-B
-/// (each NAL prefixed with a `00 00 00 01` start code), appending to `out`.
-fn avcc_to_annexb(sample: &[u8], nal_len: usize, out: &mut Vec<u8>) {
-    let mut i = 0;
-    while i + nal_len <= sample.len() {
-        let mut len = 0usize;
-        for _ in 0..nal_len {
-            len = (len << 8) | sample[i] as usize;
-            i += 1;
-        }
-        if i + len > sample.len() {
-            break;
-        }
-        out.extend_from_slice(&[0, 0, 0, 1]);
-        out.extend_from_slice(&sample[i..i + len]);
-        i += len;
-    }
-}
-
 /// Build a [`Stream`] + sample list + optional H.264 config from one `trak`.
 fn parse_track(trak: &[u8], index: usize) -> Option<(Stream, Vec<SampleLoc>, Option<AvcConfig>)> {
     let trak_children = child_boxes(trak);
@@ -225,12 +202,18 @@ fn parse_track(trak: &[u8], index: usize) -> Option<(Stream, Vec<SampleLoc>, Opt
 
     // Media timescale from mdhd (version 0: timescale @ 12 after ver/flags).
     let mdhd = find(&mdia, b"mdhd")?;
-    let timescale = if mdhd.first() == Some(&1) {
-        be32(mdhd, 20) // v1: 64-bit times push timescale to offset 20
+    let (timescale, duration) = if mdhd.first() == Some(&1) {
+        // v1: 64-bit times push timescale to offset 20, duration to 24.
+        (be32(mdhd, 20), be64(mdhd, 24))
     } else {
-        be32(mdhd, 12)
-    }
-    .max(1);
+        (be32(mdhd, 12), be32(mdhd, 16) as u64)
+    };
+    let timescale = timescale.max(1);
+    // All-ones means "unknown" per ISO 14496-12; so does 0 in practice.
+    let duration = match duration {
+        0 | 0xFFFF_FFFF | u64::MAX => None,
+        d => i64::try_from(d).ok(),
+    };
 
     let stsd = find(&stbl, b"stsd")?;
     let fourcc: [u8; 4] = stsd.get(12..16)?.try_into().ok()?; // entry format
@@ -275,6 +258,8 @@ fn parse_track(trak: &[u8], index: usize) -> Option<(Stream, Vec<SampleLoc>, Opt
     };
 
     let samples = build_samples(&stbl, index, timescale)?;
+    stream.duration = duration; // already in mdhd-timescale = time_base units
+    stream.nb_frames = Some(samples.len() as u64);
     Some((stream, samples, avc))
 }
 
@@ -316,40 +301,6 @@ fn map_codec(fourcc: &[u8; 4]) -> CodecId {
         b"mp4a" => CodecId::Aac,
         _ => CodecId::None,
     }
-}
-
-/// Parse an `avcC` box into the NAL length size and Annex-B SPS/PPS headers.
-fn parse_avcc(avcc: &[u8]) -> Option<AvcConfig> {
-    if avcc.len() < 6 {
-        return None;
-    }
-    let nal_len = (avcc[4] & 0x03) as usize + 1;
-    let mut headers = Vec::new();
-    let mut i = 5;
-    let num_sps = avcc[i] & 0x1F;
-    i += 1;
-    for _ in 0..num_sps {
-        let len = be16(avcc, i) as usize;
-        i += 2;
-        let nal = avcc.get(i..i + len)?;
-        headers.extend_from_slice(&[0, 0, 0, 1]);
-        headers.extend_from_slice(nal);
-        i += len;
-    }
-    let num_pps = *avcc.get(i)?;
-    i += 1;
-    for _ in 0..num_pps {
-        let len = be16(avcc, i) as usize;
-        i += 2;
-        let nal = avcc.get(i..i + len)?;
-        headers.extend_from_slice(&[0, 0, 0, 1]);
-        headers.extend_from_slice(nal);
-        i += len;
-    }
-    Some(AvcConfig {
-        nal_len,
-        headers_annexb: headers,
-    })
 }
 
 /// Reconstruct per-sample `(offset, size, pts, keyframe)` from the sample table.

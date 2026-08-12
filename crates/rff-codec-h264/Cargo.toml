@@ -1,7 +1,9 @@
 [package]
 name = "rff-codec-h264"
 description = "Remade FFmpeg (Rust): H.264 / AVC video codec — pure Rust via rusty_h264."
-version.workspace = true
+# Ahead of the workspace's 0.1: 0.2.0 relaxed the `rusty_h264 ^0.2` pin (which
+# silently capped consumers at CAVLC-only 0.2.1) to the current 0.8 line.
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -18,7 +20,7 @@ rff-codec.workspace = true
 # Our own pure-Rust H.264 codec. default-features off keeps rff's default build
 # 100% safe Rust with no `nasm`; enable this crate's `asm` feature for the
 # vendored openh264 SIMD speedup.
-rusty_h264 = { version = "0.2", default-features = false }
+rusty_h264 = { version = "0.8", default-features = false }
 
 [features]
 # Build the H.264 codec with rusty_h264's openh264 SIMD asm (needs `nasm`).

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io::Read;
 
 use rff_core::{CodecId, Error, Packet, Rational, Result};
+use rff_format::avc::{find_sps_annexb, sps_dimensions};
 use rff_format::{Demuxer, Format, FormatRegistry, Input, Stream};
 
 mod mux;
@@ -250,6 +251,19 @@ impl TsDemuxer {
         }
     }
 
+    /// If stream `idx` is an H.264 stream still missing dimensions, scan one
+    /// Annex-B payload for an SPS and fill them in.
+    fn fill_dims(streams: &mut [Stream], idx: usize, data: &[u8]) {
+        let Some(s) = streams.get_mut(idx) else { return };
+        if s.codec_id != CodecId::H264 || s.width != 0 {
+            return;
+        }
+        if let Some((w, h)) = find_sps_annexb(data).and_then(sps_dimensions) {
+            s.width = w;
+            s.height = h;
+        }
+    }
+
     fn emit(&mut self, pid: u16, pes: Pes) {
         let Some(&idx) = self.pid_index.get(&pid) else {
             return;
@@ -273,7 +287,7 @@ impl Demuxer for TsDemuxer {
                 Some(pkt) => {
                     self.consume(&pkt);
                     if !self.streams.is_empty() {
-                        return Ok(self.streams.clone());
+                        break;
                     }
                 }
                 None => break,
@@ -281,6 +295,41 @@ impl Demuxer for TsDemuxer {
         }
         if self.streams.is_empty() {
             return Err(Error::invalid("mpegts: no program/streams found"));
+        }
+        // The PMT carries no dimensions — they live in the first SPS. Keep
+        // consuming until we can parse one so callers sizing buffers from the
+        // header get real values; everything consumed stays queued for
+        // read_packet, so no data is skipped. Bounded (~4 MB) for
+        // non-conforming input; a decodable stream has an SPS by its first IDR.
+        let need = |streams: &[Stream]| {
+            streams
+                .iter()
+                .any(|s| s.codec_id == CodecId::H264 && s.width == 0)
+        };
+        if need(&self.streams) {
+            let mut scanned = 0;
+            'scan: for _ in 0..20_000 {
+                while scanned < self.ready.len() {
+                    let p = &self.ready[scanned];
+                    Self::fill_dims(&mut self.streams, p.stream_index, &p.data);
+                    scanned += 1;
+                    if !need(&self.streams) {
+                        break 'scan;
+                    }
+                }
+                match self.next_ts()? {
+                    Some(pkt) => self.consume(&pkt),
+                    None => break,
+                }
+            }
+            // EOF / bound hit: the SPS may sit in a still-unfinished PES.
+            if need(&self.streams) {
+                for (pid, pes) in &self.partial {
+                    if let Some(&idx) = self.pid_index.get(pid) {
+                        Self::fill_dims(&mut self.streams, idx, &pes.data);
+                    }
+                }
+            }
         }
         Ok(self.streams.clone())
     }
