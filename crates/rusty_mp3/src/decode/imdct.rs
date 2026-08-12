@@ -71,6 +71,84 @@ fn kernels() -> &'static Kernels {
     })
 }
 
+/// The 18 of the 36 long-block outputs that are actually computed; the other 18
+/// are exact mirrors of these (see the symmetries in `hybrid`).
+const IMDCT_N: [usize; 18] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 18, 19, 20, 21, 22, 23, 24, 25, 26];
+
+/// `cos36` transposed and compacted to `[k][j]`, `j` indexing [`IMDCT_N`], padded
+/// from 18 to 24 columns so it covers exactly three 8-wide lanes.
+///
+/// Transposing is what lets the transform vectorise WITHOUT reassociating
+/// anything: the natural loop reduces over `k` (a horizontal sum), but with the
+/// OUTPUT index as the lane each `out[j]` still accumulates over `k` in the
+/// original order. The padding lanes compute garbage that is never read.
+fn cos36_t() -> &'static [[f32; 24]; 18] {
+    static T: OnceLock<[[f32; 24]; 18]> = OnceLock::new();
+    T.get_or_init(|| {
+        let c = &kernels().cos36;
+        let mut t = [[0f32; 24]; 18];
+        for (j, &n) in IMDCT_N.iter().enumerate() {
+            for k in 0..18 {
+                t[k][j] = c[n][k];
+            }
+        }
+        t
+    })
+}
+
+/// **D6** — AVX twin of the 18 long-block dot products, 8 outputs per lane.
+///
+/// Bit-identical to the scalar form: `out[j]` owns a lane and accumulates its 18
+/// terms in the original `k` order, with separate mul+add rather than FMA.
+/// Float multiply is commutative and exact, so `c*x` here equals the scalar's
+/// `x*c`. Pinned by `imdct_simd_matches_scalar`.
+///
+/// # Safety
+/// Caller must have verified AVX is available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn imdct36_avx(lines: &[f32], out: &mut [f32; 24]) {
+    use std::arch::x86_64::*;
+    let ct = cos36_t();
+    let mut acc = [unsafe { _mm256_setzero_ps() }; 3];
+    for (k, row) in ct.iter().enumerate() {
+        unsafe {
+            let x = _mm256_set1_ps(lines[k]);
+            for (v, accv) in acc.iter_mut().enumerate() {
+                let c = _mm256_loadu_ps(row.as_ptr().add(v * 8));
+                *accv = _mm256_add_ps(*accv, _mm256_mul_ps(c, x));
+            }
+        }
+    }
+    for (v, accv) in acc.iter().enumerate() {
+        unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(v * 8), *accv) };
+    }
+}
+
+/// The scalar twin — oracle and non-AVX fallback.
+#[inline]
+fn imdct36_scalar(lines: &[f32], out: &mut [f32; 24]) {
+    for (j, &n) in IMDCT_N.iter().enumerate() {
+        let mut acc = 0f32;
+        for k in 0..18 {
+            acc += lines[k] * kernels().cos36[n][k];
+        }
+        out[j] = acc;
+    }
+}
+
+#[inline]
+fn have_avx() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 /// Run the hybrid IMDCT for one channel's granule. `overlap` holds the previous
 /// granule's tail on entry and is updated with this granule's tail on exit.
 /// Returns 576 time-domain values (subband-major) for the synthesis stage.
@@ -81,6 +159,8 @@ pub fn hybrid(
 ) -> [f32; GRANULE_LINES] {
     let t = kernels();
     let mut out = [0f32; GRANULE_LINES];
+    // Resolved once per granule, not per subband.
+    let avx = have_avx();
     let is_short = gi.window_switching && gi.block_type == BlockType::Short;
 
     for sb in 0..SUBBANDS {
@@ -131,21 +211,29 @@ pub fn hybrid(
             // sign-symmetric, `Σ lines[k]·(−c[k])` is EXACTLY `−Σ lines[k]·c[k]`.
             // So the mirrored output is bit-identical to computing its own dot
             // product, not an approximation of it — 36×18 MACs become 18×18.
-            for n in 0..9 {
-                let mut acc = 0f32;
-                for k in 0..18 {
-                    acc += lines[base + k] * t.cos36[n][k];
-                }
-                samp[n] = acc * t.win[wt][n];
-                samp[17 - n] = -acc * t.win[wt][17 - n];
+            //
+            // **D6** — those 18 dot products now run 8-wide with the OUTPUT index
+            // as the lane, so each still accumulates over `k` in the original
+            // order and the result is bit-identical (not merely close).
+            let mut dp = [0f32; 24];
+            if avx {
+                // SAFETY: `avx` came from runtime detection before the loop.
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    imdct36_avx(&lines[base..base + 18], &mut dp)
+                };
+            } else {
+                imdct36_scalar(&lines[base..base + 18], &mut dp);
             }
-            for n in 18..27 {
-                let mut acc = 0f32;
-                for k in 0..18 {
-                    acc += lines[base + k] * t.cos36[n][k];
+            for (j, &n) in IMDCT_N.iter().enumerate() {
+                let acc = dp[j];
+                if n < 9 {
+                    samp[n] = acc * t.win[wt][n];
+                    samp[17 - n] = -acc * t.win[wt][17 - n];
+                } else {
+                    samp[n] = acc * t.win[wt][n];
+                    samp[53 - n] = acc * t.win[wt][53 - n];
                 }
-                samp[n] = acc * t.win[wt][n];
-                samp[53 - n] = acc * t.win[wt][53 - n];
             }
         }
 
@@ -270,6 +358,33 @@ mod tests {
                 );
                 assert_eq!(ov_a, ov_b, "overlap diverged: block_type={bt:?} mixed={mixed}");
             }
+        }
+    }
+
+    /// **D6 gate.** The AVX IMDCT must be BIT-identical to the scalar twin — the
+    /// whole point of transposing the kernel is that the reduction over `k` is
+    /// never reassociated, so this is `assert_eq!`, not a tolerance.
+    #[test]
+    fn imdct_simd_matches_scalar() {
+        if !have_avx() {
+            eprintln!("AVX unavailable on this host - scalar path only, gate skipped");
+            return;
+        }
+        let mut st = 0x1F35_3D9Bu32;
+        let mut rng = || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (st >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        for trial in 0..128 {
+            let lines: Vec<f32> = (0..18).map(|_| rng()).collect();
+            let (mut a, mut b) = ([0f32; 24], [0f32; 24]);
+            imdct36_scalar(&lines, &mut a);
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                imdct36_avx(&lines, &mut b)
+            };
+            // Only the 18 real outputs; columns 18..24 are padding.
+            assert_eq!(a[..18], b[..18], "IMDCT SIMD/scalar mismatch on trial {trial}");
         }
     }
 
