@@ -27,14 +27,13 @@ and for measuring AV2 against AVIF on stills; **not for interchange**, and with 
 compatibility promise if a specification later says something different. See the
 [`rusty_av2f` README][`rusty_av2f`] for the full statement.
 
-## Payload restriction
+## Header forms
 
-The muxer accepts only AV2 still pictures coded with the **full** still-picture
-header (`avmenc --full-still-picture-hdr`). The compact form
-(`single_picture_header_flag = 1`) is what such a format would naturally use, but
-`rusty_av2d` does not decode it bit-exactly yet and refuses it — writing it would
-produce files our own decoder rejects. The restriction lifts in `rusty_av2f` when
-that parse lands.
+Both AV2 still-picture header forms mux and demux: the full form and the compact
+`single_picture_header_flag` form (the natural choice for an image format — it
+is what AVIF does for AV1). The historical full-only restriction was lifted with
+`rusty_av2f` 0.2.0, once `rusty_av2d` 0.2.5 decoded the compact form
+byte-identically to AOM's reference decoder.
 
 ## Behaviour worth knowing
 

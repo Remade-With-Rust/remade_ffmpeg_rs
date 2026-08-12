@@ -15,13 +15,13 @@
 //! Files written here are readable here and nowhere else. Useful for pipeline
 //! work and for measuring AV2 against AVIF on stills; not for interchange.
 //!
-//! # Payload restriction
+//! # Header forms
 //!
-//! The muxer accepts only AV2 still pictures coded with the **full**
-//! still-picture header (`avmenc --full-still-picture-hdr`). The compact form
-//! is what such a format would naturally use, but `rusty_av2d` does not decode
-//! it bit-exactly yet and refuses it, so writing it would produce files our own
-//! decoder rejects. Lift the restriction in `rusty_av2f` when that lands.
+//! Both AV2 still-picture header forms mux and demux: the full form and the
+//! compact `single_picture_header_flag` form (the natural choice for an image
+//! format — it is what AVIF does for AV1). The historical full-only
+//! restriction was lifted with `rusty_av2f` 0.2.0, once `rusty_av2d` 0.2.5
+//! decoded the compact form byte-identically to the reference.
 
 use std::io::Read;
 

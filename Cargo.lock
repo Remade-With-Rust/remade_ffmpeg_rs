@@ -5565,9 +5565,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_av2d"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71ab02bb2a0938e9d5d6bd8840b7b553d766c959c385ee9671d68a75a289c6a5"
+checksum = "b276734b8cf6f875f4fd354f9f1177ed67d43d8ae7146b7f0fb7cbb0c111dab2"
 dependencies = [
  "assert_matches",
  "atomig",
@@ -5586,9 +5586,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_av2f"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcc2f14c94078bb518cc404975b3cada7862066ece7e7f0c5d2e86d72f9d8dac"
+checksum = "d73ba33bdce3e99a7b6952daf848eda737756e5db66bb3be91471660944a1922"
 
 [[package]]
 name = "rusty_h264"

@@ -18,4 +18,4 @@ rff-format.workspace = true
 # The container itself, published standalone. Pinned tight on purpose: AV2F's
 # four-character codes are chosen rather than specified by AOM, so a 0.x bump is
 # potentially format-breaking, not merely additive.
-rusty_av2f = "0.1.0"
+rusty_av2f = "0.2.0"
