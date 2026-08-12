@@ -28,7 +28,12 @@
       "Bash(curl -sI -m 8 https://cdn.winget.microsoft.com)",
       "PowerShell($t=$env:TEMP; Expand-Archive -Path \"$t\\\\ffmpeg.zip\" -DestinationPath \"$t\\\\ffmpeg_extract\" -Force; $exe=Get-ChildItem -Path \"$t\\\\ffmpeg_extract\" -Recurse -Filter ffmpeg.exe | Select-Object -First 1; Copy-Item $exe.FullName \"$t\\\\ffmpeg.exe\" -Force; & \"$t\\\\ffmpeg.exe\" -version 2>&1 | Select-Object -First 1)",
       "Bash(rg -n \"Io\\\\\\(|read_to_end|map_err|enum Error\" crates/rff-core/src/*.rs crates/rff-format-mp4/src/lib.rs)",
-      "PowerShell(cargo publish -p rusty_vp9 2>&1)"
+      "PowerShell(cargo publish -p rusty_vp9 2>&1)",
+      "Read(//c/Users/talmo/coding/rs_h264/**)",
+      "Read(//c/Users/talmo/coding/**)",
+      "Bash(ls /c/Users/talmo/.claude/skills/ 2>/dev/null; echo \"=== local ===\"; ls /c/Users/talmo/coding/remade_ffmpeg_rs/.claude/skills/ 2>/dev/null)",
+      "Read(//c/Users/talmo/.claude/skills//**)",
+      "Bash(grep -n \"^pub \\\\|^///\" Prometheus/crates/prom-trial/src/lib.rs)"
     ]
   }
 }

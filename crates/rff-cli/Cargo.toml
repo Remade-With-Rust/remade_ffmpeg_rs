@@ -38,6 +38,7 @@ required-features = ["drop-in-names"]
 [dependencies]
 rff.workspace = true
 rff-core.workspace = true
+rusty_alloc-api.workspace = true
 
 [features]
 default = []

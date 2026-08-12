@@ -22,6 +22,11 @@ __pycache__/
 /Prometheus/
 /RDO experimental - scirs, oxieml.md
 
+# Great Gate — private content-adaptive-dispatch campaign (doc + gate
+# calculator; ported/generalized from private prior art). Same policy as
+# Prometheus/ and rs_h264's _greatgate/: local-only, never published.
+/_greatgate/
+
 # Local media corpora for quality campaigns (WAV/Y4M, tens of MB) — never published
 /corpus/
 # libvpx VP9 conformance vectors (~1.5 MB of .webm + .md5). Same policy: fetched
