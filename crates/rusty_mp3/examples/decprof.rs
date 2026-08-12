@@ -40,6 +40,10 @@ fn main() {
     // `pipe` selects the two-stage threaded path; output must match the serial
     // path exactly, so the same fnv1a gate covers both.
     let pipelined = std::env::var("MP3_PIPELINE").as_deref() == Ok("1");
+    // MP3_NOHASH=1 skips the FNV pass so this matches `ffmpeg -f null -`:
+    // decode and discard. The hash walks every output byte and is real work --
+    // leaving it in while the reference does not hash is a work-parity break.
+    let nohash = std::env::var("MP3_NOHASH").as_deref() == Ok("1");
 
     let bytes = std::fs::read(path).expect("read input");
     println!("input: {path}  ({} KiB)", bytes.len() / 1024);
@@ -65,10 +69,12 @@ fn main() {
             SAMPLES.fetch_add((f.samples.len() / f.channels.max(1) as usize) as u64, Relaxed);
             // FNV-1a over the raw PCM bits: the decode byte-identity gate. A
             // decoder change that claims to be output-preserving must not move it.
-            for s in &f.samples {
-                for b in s.to_bits().to_le_bytes() {
-                    h ^= b as u64;
-                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            if !nohash {
+                for s in &f.samples {
+                    for b in s.to_bits().to_le_bytes() {
+                        h ^= b as u64;
+                        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                    }
                 }
             }
         }
