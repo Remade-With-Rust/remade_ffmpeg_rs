@@ -43,6 +43,10 @@ trait BitSink {
 impl BitSink for BoolEncoder {
     #[inline]
     fn put(&mut self, bit: u32, prob: u8) {
+        // Prometheus entropy tap: the REAL emit path only — costing sinks
+        // never reach this impl, so RDO walks are invisible to the harvest.
+        #[cfg(feature = "prometheus-telemetry")]
+        crate::telemetry::record(bit as u8, prob);
         self.write_bool(bit, prob);
     }
 }
@@ -170,6 +174,11 @@ fn code_magnitude<S: BitSink>(
         return 1;
     }
     sink.put(1, prob2); // TWO+
+    // Everything below the pivot codes with STATIC Pareto/CAT probs — a
+    // different population than the model pivot; tag it node 3 so the
+    // harvest can keep them apart (band/ctx are not meaningful here).
+    #[cfg(feature = "prometheus-telemetry")]
+    crate::telemetry::set_site(3, 0, 0, 0);
     let p = &PARETO8_FULL[prob2 as usize - 1];
     if aval <= 4 {
         sink.put(0, p[0]);
@@ -260,6 +269,8 @@ fn code_block<S: BitSink, const COUNTS: bool>(
         if COUNTS {
             eob_cnt[band][ctx] += 1;
         }
+        #[cfg(feature = "prometheus-telemetry")]
+        crate::telemetry::set_site(0, band as u8, ctx as u8, tx_size as u8);
         if c == eob {
             // End of block: no more non-zero coefficients.
             sink.put(0, coef_probs[band][ctx][0]);
@@ -274,6 +285,8 @@ fn code_block<S: BitSink, const COUNTS: bool>(
         loop {
             let band = band_translate[c] as usize;
             let pos = scan[c] as usize;
+            #[cfg(feature = "prometheus-telemetry")]
+            crate::telemetry::set_site(1, band as u8, ctx as u8, tx_size as u8);
             if levels[pos] == 0 {
                 sink.put(0, coef_probs[band][ctx][1]); // ZERO
                 if COUNTS {
@@ -295,8 +308,12 @@ fn code_block<S: BitSink, const COUNTS: bool>(
         if COUNTS {
             coef_cnt[band][ctx][if aval >= 2 { 2 } else { 1 }] += 1; // TWO+ / ONE
         }
+        #[cfg(feature = "prometheus-telemetry")]
+        crate::telemetry::set_site(2, band as u8, ctx as u8, tx_size as u8);
         let class = sink.put_magnitude(aval, coef_probs[band][ctx][2], cat6, cat6_bits);
         token_cache[pos] = class;
+        #[cfg(feature = "prometheus-telemetry")]
+        crate::telemetry::set_site(4, 0, 0, tx_size as u8);
         sink.put((lvl < 0) as u32, 128); // sign
         c += 1;
         ctx = get_coef_context(nb, token_cache, c);

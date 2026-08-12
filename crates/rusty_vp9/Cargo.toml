@@ -12,4 +12,11 @@ keywords = ["vp9", "video", "codec", "decoder", "encoder"]
 categories = ["multimedia::video", "multimedia::encoding"]
 rust-version = "1.85"
 
+[features]
+# Entropy-bin telemetry for the private Prometheus refinery (CASC campaign):
+# records every coefficient-token boolean bin (site, bit, prob) on the real
+# emit path. Off by default; the production build is byte-identical without
+# it, and byte-identical WITH it too — the tap only observes.
+prometheus-telemetry = []
+
 [dependencies]

@@ -37,6 +37,18 @@ mod quant;
 mod scan_tables;
 mod token;
 mod transform;
+
+/// Prometheus telemetry hooks — the coefficient-bin entropy tap for offline
+/// probability-law discovery by the private Prometheus refinery (CASC
+/// campaign). Opt-in behind the `prometheus-telemetry` feature; the
+/// production build is byte-identical without it (and with it — the tap only
+/// observes the emit path, never steers it).
+#[cfg(feature = "prometheus-telemetry")]
+pub mod telemetry;
+#[cfg(feature = "prometheus-telemetry")]
+pub mod prometheus_telemetry {
+    pub use crate::telemetry::{enable, take, CoefBin, Site};
+}
 pub use bits::{BitReader, BoolDecoder};
 /// The ENCODER's stage profiler (`VP9_PROF2`), re-exported for the `video-tests`
 /// analyzer. The encoder itself stays private; only the read side of the
