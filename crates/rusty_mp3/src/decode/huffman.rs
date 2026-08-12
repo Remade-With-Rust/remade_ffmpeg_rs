@@ -25,6 +25,22 @@ use super::codebooks::{PAIR_TABLES, QUAD_A, QUAD_B};
 /// each book's table at `2^12 = 4096` entries.
 const LUT_BITS_CAP: u8 = 12;
 
+/// `DIV_TAB[d][i] == i / d` for `d <= 16`, `i < 256` — the pair tables' whole
+/// index range. Built at compile time so the hot path never divides.
+const DIV_TAB: [[u8; 256]; 17] = {
+    let mut t = [[0u8; 256]; 17];
+    let mut d = 1;
+    while d < 17 {
+        let mut i = 0;
+        while i < 256 {
+            t[d][i] = (i / d) as u8;
+            i += 1;
+        }
+        d += 1;
+    }
+    t
+};
+
 /// One decode-LUT slot: `(symbol_index, codeword_length)`. `len == 0` marks an
 /// "escape" — the peeked prefix belongs to a codeword longer than `lut_bits`
 /// (or no codeword), to be resolved by the linear fallback.
@@ -176,8 +192,16 @@ impl PairTable {
             Some(i) => i,
             None => return (0, 0),
         };
-        let mut x = (idx / self.dim as usize) as i32;
-        let mut y = (idx % self.dim as usize) as i32;
+        // **D7** — `idx / dim` and `idx % dim` used to run PER CODEWORD. Integer
+        // division is 20-40 cycles on x86 and a few minutes of audio carries tens
+        // of millions of pair codewords, on a stage that is now ~40% of decode.
+        // `dim <= 16` and `idx < dim*dim <= 256`, so the quotient is a small
+        // compile-time table; the remainder is then one multiply-subtract.
+        // A const table, not a OnceLock+Vec: that would trade the division for an
+        // atomic load and a pointer chase, which is not obviously cheaper.
+        let d = self.dim as usize;
+        let mut x = DIV_TAB[d][idx & 0xFF] as i32;
+        let mut y = (idx - x as usize * d) as i32;
         let maxc = self.dim as i32 - 1;
         if self.linbits > 0 && x == maxc {
             x += r.read(self.linbits as u32) as i32;
