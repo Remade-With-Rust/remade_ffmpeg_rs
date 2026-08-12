@@ -2844,16 +2844,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "image-webp"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
-dependencies = [
- "byteorder-lite",
- "quick-error",
-]
-
-[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5084,9 +5074,9 @@ dependencies = [
 name = "rff-codec-webp"
 version = "0.1.0"
 dependencies = [
- "image-webp",
  "rff-codec",
  "rff-core",
+ "rusty_webp",
 ]
 
 [[package]]
@@ -5263,9 +5253,9 @@ dependencies = [
 name = "rff-format-webp"
 version = "0.1.0"
 dependencies = [
- "image-webp",
  "rff-core",
  "rff-format",
+ "rusty_webp",
 ]
 
 [[package]]
@@ -5575,9 +5565,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_av2d"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af372f1676c203a9bbb1b924f9cfca2ac8de8acb1aa6c8b708a9aa483525213a"
+checksum = "71ab02bb2a0938e9d5d6bd8840b7b553d766c959c385ee9671d68a75a289c6a5"
 dependencies = [
  "assert_matches",
  "atomig",
@@ -5661,7 +5651,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_mp3"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "rusty_alloc-api",
 ]
@@ -5691,6 +5681,16 @@ version = "0.1.1"
 [[package]]
 name = "rusty_vp9"
 version = "0.1.1"
+
+[[package]]
+name = "rusty_webp"
+version = "0.1.0"
+dependencies = [
+ "byteorder-lite",
+ "quick-error",
+ "rand 0.8.6",
+ "rusty_alloc-api",
+]
 
 [[package]]
 name = "ryu"
