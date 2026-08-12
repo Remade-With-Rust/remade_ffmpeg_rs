@@ -13,7 +13,7 @@
 
 use crate::{Error, Result};
 
-use crate::frame::{GranuleSpectrum, SideInfo, GRANULE_LINES};
+use crate::frame::{GranuleSideInfo, GranuleSpectrum, SideInfo, GRANULE_LINES};
 use crate::header::FrameHeader;
 
 pub mod antialias;
@@ -104,22 +104,84 @@ pub mod prof {
     }
 }
 
-/// Persistent decoder state across frames.
-pub struct Mp3Decode {
-    /// Carries leftover main-data bytes between frames (`main_data_begin`).
-    reservoir: reservoir::Reservoir,
+/// The transform half of the decoder's persistent state.
+///
+/// Split out from [`Mp3Decode`] because the decoder's state divides cleanly in
+/// two: the bit reservoir belongs to the ENTROPY stage (frame-sync, Huffman,
+/// scalefactors, requantize), while the IMDCT overlap and synthesis FIFO belong
+/// to the TRANSFORM stage. Nothing is shared, which is what lets the two stages
+/// run as a pipeline on separate threads — see [`crate::Mp3Decoder::decode_pipelined`].
+pub struct TransformState {
     /// Previous granule's IMDCT tail for overlap-add, `[channel][line]`.
     imdct_overlap: [[f32; GRANULE_LINES]; 2],
     /// Synthesis filterbank FIFO `V[]`, `[channel][1024]`.
     synth_fifo: [[f32; 1024]; 2],
 }
 
+impl Default for TransformState {
+    fn default() -> Self {
+        TransformState {
+            imdct_overlap: [[0.0; GRANULE_LINES]; 2],
+            synth_fifo: [[0.0; 1024]; 2],
+        }
+    }
+}
+
+impl TransformState {
+    pub fn new() -> TransformState {
+        TransformState::default()
+    }
+
+    /// Stage 2 for one granule: alias reduction → hybrid IMDCT → polyphase
+    /// synthesis, appending interleaved PCM. Sequential per channel (the overlap
+    /// and FIFO carry across granules), which is why the pipeline parallelises
+    /// ACROSS stages rather than across granules.
+    pub fn granule_to_pcm(
+        &mut self,
+        gi: &[GranuleSideInfo; 2],
+        spectrum: &mut GranuleSpectrum,
+        channels: usize,
+        pcm: &mut Vec<f32>,
+    ) {
+        let mut chan_pcm = [[0f32; GRANULE_LINES]; 2];
+        for ch in 0..channels {
+            prof::time(&prof::ANTIALIAS, || {
+                antialias::reduce(&gi[ch], &mut spectrum.lines[ch])
+            });
+            let time = prof::time(&prof::IMDCT, || {
+                imdct::hybrid(&gi[ch], &spectrum.lines[ch], &mut self.imdct_overlap[ch])
+            });
+            chan_pcm[ch] = prof::time(&prof::SYNTH, || {
+                synthesis::polyphase(&time, &mut self.synth_fifo[ch])
+            });
+        }
+        for s in 0..GRANULE_LINES {
+            for cp in chan_pcm.iter().take(channels) {
+                pcm.push(cp[s]);
+            }
+        }
+    }
+}
+
+/// One granule handed from the entropy stage to the transform stage.
+pub struct GranuleWork {
+    pub side: [GranuleSideInfo; 2],
+    pub spectrum: GranuleSpectrum,
+}
+
+/// Persistent decoder state across frames.
+pub struct Mp3Decode {
+    /// Carries leftover main-data bytes between frames (`main_data_begin`).
+    reservoir: reservoir::Reservoir,
+    /// The transform half (IMDCT overlap + synthesis FIFO).
+    transform: TransformState,
+}
+
 impl Default for Mp3Decode {
     fn default() -> Self {
         Mp3Decode {
             reservoir: reservoir::Reservoir::default(),
-            imdct_overlap: [[0.0; GRANULE_LINES]; 2],
-            synth_fifo: [[0.0; 1024]; 2],
+            transform: TransformState::default(),
         }
     }
 }
@@ -134,12 +196,37 @@ impl Mp3Decode {
     /// The orchestration below is the wiring diagram; each `*::*` call is a brick
     /// still to be laid (`todo!()`). The public [`crate::Mp3Decoder`] returns
     /// `Unimplemented` until they're built, so this is never reached at runtime.
+    /// Decode one frame's side-info + main-data into interleaved PCM samples.
+    ///
+    /// Thin wrapper over the two stages, so the serial path and the pipelined
+    /// path run exactly the same code.
     pub fn decode_frame(
         &mut self,
         header: &FrameHeader,
         side_info_bytes: &[u8],
         frame_main_data: &[u8],
     ) -> Result<Vec<f32>> {
+        let channels = header.channel_mode.channels();
+        let work = self.decode_frame_entropy(header, side_info_bytes, frame_main_data)?;
+        let mut pcm = Vec::with_capacity(work.len() * GRANULE_LINES * channels);
+        for mut g in work {
+            self.transform
+                .granule_to_pcm(&g.side, &mut g.spectrum, channels, &mut pcm);
+        }
+        Ok(pcm)
+    }
+
+    /// **Stage 1 (entropy).** Side info → reservoir → Huffman → scalefactors →
+    /// requantize → joint stereo, producing one [`GranuleWork`] per granule.
+    ///
+    /// Touches only the bit reservoir, never the IMDCT overlap or synthesis FIFO,
+    /// which is what makes it safe to run on its own thread ahead of stage 2.
+    pub fn decode_frame_entropy(
+        &mut self,
+        header: &FrameHeader,
+        side_info_bytes: &[u8],
+        frame_main_data: &[u8],
+    ) -> Result<Vec<GranuleWork>> {
         let channels = header.channel_mode.channels();
         let granules = header.version.granules();
 
@@ -149,8 +236,7 @@ impl Mp3Decode {
         // 2. Reassemble main data across the reservoir boundary.
         let main = self.reservoir.assemble(si.main_data_begin, frame_main_data);
 
-        // 3..6. Per granule / channel: Huffman → scalefactors → requantize.
-        let mut pcm = Vec::with_capacity(granules * GRANULE_LINES * channels);
+        let mut out = Vec::with_capacity(granules);
         let mut bit_pos = 0usize;
         // Granule 0's scalefactors are retained per channel for granule 1 `scfsi`
         // reuse.
@@ -162,8 +248,8 @@ impl Mp3Decode {
                 // Block-type census: which IMDCT path this granule/channel takes.
                 {
                     use std::sync::atomic::Ordering::Relaxed;
-                    let short = gi.window_switching
-                        && gi.block_type == crate::frame::BlockType::Short;
+                    let short =
+                        gi.window_switching && gi.block_type == crate::frame::BlockType::Short;
                     match (short, gi.mixed_block) {
                         (true, true) => prof::N_MIXED.fetch_add(1, Relaxed),
                         (true, false) => prof::N_SHORT.fetch_add(1, Relaxed),
@@ -196,31 +282,12 @@ impl Mp3Decode {
                 stereo::process(header, &si.granules[gr], &mut spectrum)
             });
 
-            // 8..10. Per channel: alias reduction → hybrid IMDCT → synthesis.
-            let mut chan_pcm = [[0f32; GRANULE_LINES]; 2];
-            for ch in 0..channels {
-                prof::time(&prof::ANTIALIAS, || {
-                    antialias::reduce(&si.granules[gr][ch], &mut spectrum.lines[ch])
-                });
-                let time = prof::time(&prof::IMDCT, || {
-                    imdct::hybrid(
-                        &si.granules[gr][ch],
-                        &spectrum.lines[ch],
-                        &mut self.imdct_overlap[ch],
-                    )
-                });
-                chan_pcm[ch] = prof::time(&prof::SYNTH, || {
-                    synthesis::polyphase(&time, &mut self.synth_fifo[ch])
-                });
-            }
-            // Interleave the channels into the frame's PCM output.
-            for s in 0..GRANULE_LINES {
-                for cp in chan_pcm.iter().take(channels) {
-                    pcm.push(cp[s]);
-                }
-            }
+            out.push(GranuleWork {
+                side: [si.granules[gr][0].clone(), si.granules[gr][1].clone()],
+                spectrum,
+            });
         }
-        Ok(pcm)
+        Ok(out)
     }
 }
 

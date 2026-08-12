@@ -37,6 +37,9 @@ fn main() {
         std::process::exit(2);
     };
     let repeats: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+    // `pipe` selects the two-stage threaded path; output must match the serial
+    // path exactly, so the same fnv1a gate covers both.
+    let pipelined = std::env::var("MP3_PIPELINE").as_deref() == Ok("1");
 
     let bytes = std::fs::read(path).expect("read input");
     println!("input: {path}  ({} KiB)", bytes.len() / 1024);
@@ -44,11 +47,20 @@ fn main() {
     let mut pcm_hash: u64 = 0;
     let t0 = std::time::Instant::now();
     for _ in 0..repeats {
-        let mut dec = Mp3Decoder::new();
-        dec.push(&bytes);
-        dec.flush();
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        while let Ok(f) = dec.next_frame() {
+        let frames: Vec<rusty_mp3::DecodedAudio> = if pipelined {
+            rusty_mp3::decode_pipelined(&bytes)
+        } else {
+            let mut dec = Mp3Decoder::new();
+            dec.push(&bytes);
+            dec.flush();
+            let mut v = Vec::new();
+            while let Ok(f) = dec.next_frame() {
+                v.push(f);
+            }
+            v
+        };
+        for f in frames {
             FRAMES.fetch_add(1, Relaxed);
             SAMPLES.fetch_add((f.samples.len() / f.channels.max(1) as usize) as u64, Relaxed);
             // FNV-1a over the raw PCM bits: the decode byte-identity gate. A
