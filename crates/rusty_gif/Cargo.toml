@@ -1,0 +1,55 @@
+[package]
+name = "rusty_gif"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/rusty_gif"
+authors = ["Mata Network <https://www.mata.network>"]
+homepage = "https://github.com/Remade-With-Rust/rusty_gif"
+description = "Pure-Rust GIF decoder + encoder with content-routed quantization (exact / weighted k-means / NeuQuant). Encodes 1.5-2.5x faster than FFmpeg's palettegen at higher PSNR. forbid(unsafe). Fork of image-rs/image-gif + color_quant."
+readme = "README.md"
+keywords = ["gif", "image", "decoder", "encoder"]
+categories = ["multimedia::images"]
+include = [
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/NOTICE.md",
+    "/README.md",
+    "/UPSTREAM-CHANGES.md",
+    "/UPSTREAM-README.md",
+    "/src/",
+    "/examples/",
+]
+
+[lib]
+name = "rusty_gif"
+path = "src/lib.rs"
+bench = false
+
+[[example]]
+name = "stage_profile"
+required-features = ["color_quant"]
+
+[[example]]
+name = "encode_bench"
+required-features = ["color_quant"]
+
+[features]
+default = ["raii_no_panic", "std", "color_quant"]
+# Frame::from_rgb/from_rgba quantization via the vendored NeuQuant module
+# (formerly the external `color_quant` crate; no external dep behind this now).
+color_quant = []
+raii_no_panic = []
+std = []
+
+[dependencies]
+# LZW: pure Rust, kept external (the fork boundary is quantize+encode, not LZW —
+# mirrors rusty_png keeping zlib-rs external).
+weezl = "0.1.10"
+
+[dev-dependencies]
+# Project convention: encoder benches/examples run under rusty_alloc.
+# Direct version (not workspace-inherited) so the standalone GitHub repo
+# builds outside the remade_ffmpeg_rs workspace; same version either way.
+rusty_alloc-api = "0.4"

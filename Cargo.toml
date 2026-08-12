@@ -150,8 +150,11 @@ rusty_png = { path = "crates/rusty_png", version = "0.3.2", features = ["paralle
 # jpeg: our own rusty_jpeg â€” a vendored merge of jpeg-decoder 0.3.2 (MIT/Apache)
 # and jpeg-encoder 0.7.0 (MIT/Apache AND IJG), carried forward in-tree. See
 # crates/rusty_jpeg/NOTICE.md for attribution and the IJG obligations.
-# gif: pure-Rust GIF de/encoder (MIT/Apache).
-gif = "0.14"
+# gif: our own rusty_gif — a performance fork of image-rs/image-gif 0.14.2
+# with the NeuQuant quantizer (color_quant 1.1.0) vendored in-tree. Kept under
+# the `gif` dependency name so rff-side imports are unchanged. See
+# crates/rusty_gif/NOTICE.md for attribution.
+gif = { path = "crates/rusty_gif", version = "0.1.0", package = "rusty_gif" }
 # webp: our own rusty_webp â€” a fork of image-rs/image-webp 0.2.4 (MIT/Apache),
 # carried forward in-tree. See crates/rusty_webp/NOTICE.md.
 rusty_webp = { path = "crates/rusty_webp", version = "0.1.0" }
