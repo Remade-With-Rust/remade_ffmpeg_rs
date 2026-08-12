@@ -37,6 +37,7 @@
 | AAC encode (60 s stereo) | 1.0× | **~6× faster** — frame-parallel (ffmpeg's AAC is 1-thread); ~1.15× single-thread | maintain |
 | Vorbis encode (stereo music) | 1.0× | **~5.3× faster** — frame-parallel; the **first permissive-Rust Vorbis encoder** | → single-thread |
 | Opus encode (`libopus`) | 1.0× | **1.50× faster** CELT speech · **1.60×** stereo music · **0.96×** SILK — 1 core each, pinned CPU, coding path verified; **quality at parity** (mean −0.015 BD-ODG, 18 classes) · frame-parallel adds wall-clock on top | maintain |
+| **MP3 decode** | 1.0× | **1.24× faster** on 1 core · **1.39×** on 2 (two-stage pipeline) — matched physical cores, decode-only both sides, 15/15 pairs, at **lower total CPU** (1,875 vs 2,125 ms) | maintain |
 | PNG decode | 1.0× | **2.55–2.89× faster** (median 2.60×) — 1 core each, decode-only, identical work | maintain |
 | PNG encode | 1.0× | **0.94–1.05× per core** on public CLIC photographs, **0.86–0.91×** on video frames — encode-only from raw, matched filter *and* size, at 0.2–0.3% *smaller* · **2.11–3.06× faster** wall-clock (block-parallel) | → per-core parity on video frames |
 | License + embedding | LGPL/GPL · C FFI | **Apache-2.0 · pure Rust · no FFI** | — |
@@ -58,6 +59,20 @@
 > pulled each 20 ms frame off the **front** of that buffer, an **O(n²)** memmove per frame. A
 > cursor-and-single-drain fix cut single-thread encode **4.7×** (full transcode 3.4×) and
 > flipped us from *behind* `libopus` to **ahead** of it.
+
+> **⚡ Performance spotlight — MP3 decode: faster than FFmpeg per core, and the old number was measuring the wrong thing.**
+> Five **bit-identical** decode bricks (O(1) word-load bit reader · circular synthesis FIFO with a contiguous
+> window loop · an exact-kernel-symmetry IMDCT then vectorised with the OUTPUT index as the lane · AVX matrixing ·
+> a division-free Huffman pair decode) plus a **two-stage pipeline** that splits entropy from transform along a
+> state boundary — the bit reservoir belongs to one half, the IMDCT overlap and synthesis FIFO to the other, and
+> nothing is shared — so the threaded path is **bit-identical to the serial one**, gated on bit patterns rather
+> than a tolerance.
+> Matched to the same physical cores with both sides decoding and discarding: **1.24× faster on one core**
+> (1,952 vs 2,431 ms, 15/15, z = −3.87) and **1.39× on two** (1,017 vs 1,455 ms), at **lower total CPU**.
+> The honest part: a CLI-to-CLI comparison had this at **1.20× BEHIND**, and three asymmetries explain the flip —
+> FFmpeg's CLI uses ~2 cores even with `-threads 1` (`cpu/wall` 1.96), our CLI wrote 582 MB where `-f null -`
+> writes nothing, and **our own profiler hashed every output sample**, 17% of its own runtime, work FFmpeg never
+> did. The bricks did not close a gap to parity; they went past it and the output path hid it.
 
 ---
 
