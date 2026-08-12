@@ -415,20 +415,47 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
         return Err(Error::unsupported("no streams selected for the output"));
     }
 
-    // Raw-video containers (y4m) can't carry a compressed codec, so an unset `-c:v`
-    // must DECODE to rawvideo rather than stream-copy the source packets. Apply that
-    // default here (mirrors ffmpeg picking `rawvideo` for a .y4m output).
+    // Single-codec containers can't stream-copy a foreign codec, so an unset
+    // `-c:v` must mean TRANSCODE to the container's one codec, not copy (which
+    // the muxer would reject). y4m additionally can't carry anything compressed.
+    // Mirrors ffmpeg picking the muxer's default codec (`out.webp` → webp).
+    // When the source already IS that codec, `None` stays: stream-copy wins.
     let mut output_owned;
-    let output = if output.video_codec.is_none()
-        && resolve_output_format(engine, output).ok().as_deref() == Some("yuv4mpegpipe")
-    {
-        output_owned = output.clone();
-        output_owned.video_codec = Some(StreamCodec {
-            codec: CodecId::RawVideo,
-            options: Dictionary::default(),
-            sample_format: None, // video: no audio sample format to pin
-        });
-        &output_owned
+    let output = if output.video_codec.is_none() {
+        let format_name = resolve_output_format(engine, output).ok();
+        // y4m keeps its unconditional default: it can't carry anything
+        // compressed, so even rawvideo input goes through the decode path.
+        let required = match format_name.as_deref() {
+            Some("yuv4mpegpipe") => Some((CodecId::RawVideo, true)),
+            Some("webp") => Some((CodecId::Webp, false)),
+            Some("png") => Some((CodecId::Png, false)),
+            Some("jpeg") => Some((CodecId::Jpeg, false)),
+            Some("gif") => Some((CodecId::Gif, false)),
+            Some("avif") => Some((CodecId::Avif, false)),
+            Some("jpegxl") => Some((CodecId::Jxl, false)),
+            _ => None,
+        };
+        let apply = match required {
+            Some((_, true)) => true,
+            // Image containers: only when the source codec differs — a matching
+            // source keeps `None` and takes the stream-copy fast path.
+            Some((codec, false)) => !selection.iter().any(|&(inp, local)| {
+                let s = &input_streams[inp][local];
+                s.media_type == MediaType::Video && s.codec_id == codec
+            }),
+            None => false,
+        };
+        if apply {
+            output_owned = output.clone();
+            output_owned.video_codec = Some(StreamCodec {
+                codec: required.expect("apply implies required").0,
+                options: Dictionary::default(),
+                sample_format: None, // video: no audio sample format to pin
+            });
+            &output_owned
+        } else {
+            output
+        }
     } else {
         output
     };
