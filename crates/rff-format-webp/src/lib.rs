@@ -1,11 +1,11 @@
-//! WebP single-image container. A WebP file (RIFF/`WEBP`) is its own codec
+﻿//! WebP single-image container. A WebP file (RIFF/`WEBP`) is its own codec
 //! stream, so the demuxer hands the whole file to the [`webp`](rff-codec-webp)
 //! codec as one packet; dimensions are read from the header via `image-webp`.
 
 use std::io::{Cursor, Read, Write};
 
-use image_webp::WebPDecoder;
-use rff_core::{CodecId, Error, Packet, Rational, Result};
+use rusty_webp::WebPDecoder;
+use rff_core::{CodecId, ColorRange, Error, Packet, Rational, Result};
 use rff_format::{Demuxer, Format, FormatRegistry, Input, Muxer, Output, Stream};
 
 /// Register the WebP format into a [`FormatRegistry`].
@@ -54,15 +54,38 @@ impl Demuxer for WebpDemuxer {
         if probe_webp(&buf) == 0 {
             return Err(Error::invalid("webp demux: not a WebP file"));
         }
-        let (width, height) = WebPDecoder::new(Cursor::new(&buf))
-            .map(|d| d.dimensions())
+        let mut probe = WebPDecoder::new(Cursor::new(&buf))
             .map_err(|e| Error::invalid(format!("webp demux: {e}")))?;
+        let (width, height) = probe.dimensions();
+        // A still lossy (VP8) image without alpha decodes to its native
+        // BT.601 limited-range YUV planes; everything else (VP8L, alpha,
+        // animation) decodes to RGB, which is full-range by definition. The
+        // codec-level default assumes RGB, so the lossy case must be labelled
+        // here or the samples get range-converted as if they were full.
+        let lossy_yuv = probe.is_lossy() && !probe.has_alpha() && !probe.is_animated();
+
+        // Animated files: frame pts are milliseconds (accumulated ANMF
+        // durations), so the stream carries a 1/1000 time base.
+        let animated = probe.is_animated();
+        let nb_frames = if animated {
+            Some(u64::from(probe.num_frames()))
+        } else {
+            None
+        };
 
         self.sample = Some(buf);
         let mut stream = Stream::new(0, CodecId::Webp);
         stream.width = width;
         stream.height = height;
-        stream.time_base = Rational::new(1, 1);
+        stream.time_base = if animated {
+            Rational::new(1, 1000)
+        } else {
+            Rational::new(1, 1)
+        };
+        stream.nb_frames = nb_frames;
+        if lossy_yuv {
+            stream.color_range = ColorRange::Limited;
+        }
         Ok(vec![stream])
     }
 

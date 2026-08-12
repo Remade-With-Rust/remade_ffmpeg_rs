@@ -4,12 +4,24 @@
 [![By Mata Network](https://img.shields.io/badge/by-Mata%20Network-5b2be0)](https://www.mata.network)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/LICENSE)
 
-The **WebP** still-image codec adapter for **remade_ffmpeg_rs**, backed by the
-pure-Rust [`image-webp`](https://crates.io/crates/image-webp) crate.
+The **WebP** codec adapter for **remade_ffmpeg_rs**, backed by our own
+pure-Rust [`rusty_webp`](https://crates.io/crates/rusty_webp) (a
+performance/feature fork of image-rs/image-webp 0.2.4).
 
-- **Decode** both VP8 (lossy) and VP8L (lossless).
-- **Encode** lossless (VP8L).
+- **Decode** VP8 (lossy), VP8L (lossless), and **animated WebP** (all frames,
+  millisecond pts). Still lossy images without alpha decode straight to their
+  native YUV 4:2:0 planes — video pipelines skip the RGB round-trip, and the
+  output is **bit-exact with FFmpeg's** webp decoder.
+- **Encode** lossless (VP8L) with LZ77 backward references, color cache, and
+  per-tile predictor selection.
 - MIT/Apache-2.0 backing crate; WebP is royalty-free.
+
+Measured vs FFmpeg 8.1.2 (pinned CPU time, ABBA-interleaved, real-content
+corpus, decoded output verified bit-exact): lossy decode **1.24–1.29× faster**,
+lossless decode **~2.15× faster**, lossless encode **1.6–2.8× faster** than
+libwebp's default effort at +4–13% size on photos (and up to 39% *smaller* on
+screen content). FFmpeg's native decoder errors on animated WebP; this crate
+decodes every frame. Lossy encoding is not implemented yet.
 
 ## Usage
 

@@ -5072,7 +5072,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-webp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5251,7 +5251,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-webp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rff-core",
  "rff-format",

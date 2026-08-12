@@ -8,6 +8,9 @@ The **WebP** single-image container for **remade_ffmpeg_rs** — the file *is* t
 codec stream, and this crate models that.
 
 - **Demux + mux** — a one-stream, one-packet container wrapping the whole file.
+- Probes the stream shape via [`rusty_webp`](https://crates.io/crates/rusty_webp):
+  still lossy (VP8) images are labelled BT.601 limited-range (they decode to
+  native YUV planes), animated files get a 1/1000 time base and a frame count.
 - Pairs with [`rff-codec-webp`](https://crates.io/crates/rff-codec-webp).
 - Pure Rust, no C/FFI.
 

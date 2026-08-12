@@ -1,9 +1,9 @@
-[workspace]
+﻿[workspace]
 resolver = "2"
 members = ["crates/*"]
 
 # `cargo build` (no args) builds the whole engine + CLI + server, but NOT the
-# Dioxus UI — that one pulls a heavy webview toolchain, so build it on demand
+# Dioxus UI â€” that one pulls a heavy webview toolchain, so build it on demand
 # with `cargo build -p rff-ui`.
 default-members = [
     "crates/rff-core",
@@ -86,8 +86,8 @@ rff-codec-jpeg = { path = "crates/rff-codec-jpeg", version = "0.1.0" }
 rff-format-jpeg = { path = "crates/rff-format-jpeg", version = "0.1.0" }
 rff-codec-gif = { path = "crates/rff-codec-gif", version = "0.1.0" }
 rff-format-gif = { path = "crates/rff-format-gif", version = "0.1.0" }
-rff-codec-webp = { path = "crates/rff-codec-webp", version = "0.1.0" }
-rff-format-webp = { path = "crates/rff-format-webp", version = "0.1.0" }
+rff-codec-webp = { path = "crates/rff-codec-webp", version = "0.2.0" }
+rff-format-webp = { path = "crates/rff-format-webp", version = "0.2.0" }
 rff-codec-pcm = { path = "crates/rff-codec-pcm", version = "0.1.0" }
 rff-codec-vorbis = { path = "crates/rff-codec-vorbis", version = "0.1.0" }
 rff-codec-flac = { path = "crates/rff-codec-flac", version = "0.1.0" }
@@ -97,7 +97,7 @@ rff-codec-vp9 = { path = "crates/rff-codec-vp9", version = "0.1.0" }
 rff-codec-av2 = { path = "crates/rff-codec-av2", version = "0.1.0" }
 rff-codec-mp3 = { path = "crates/rff-codec-mp3", version = "0.1.0" }
 # Standalone, publishable codec cores (the `rusty_h264` pattern: pure codec
-# crate + thin rff-codec-* adapter). Each carries its OWN version — they ship
+# crate + thin rff-codec-* adapter). Each carries its OWN version â€” they ship
 # to crates.io on their own cadence, decoupled from the workspace version and
 # from each other, so these no longer move in lockstep at 0.1.x.
 rusty_vp9 = { path = "crates/rusty_vp9", version = "0.1.0" }
@@ -106,7 +106,7 @@ rusty_aac = { path = "crates/rusty_aac", version = "0.5.0" }
 rusty_vorbis = { path = "crates/rusty_vorbis", version = "0.1.0" }
 rusty_jpeg = { path = "crates/rusty_jpeg", version = "0.3" }
 rff-codec-rawvideo = { path = "crates/rff-codec-rawvideo", version = "0.1.0" }
-# TEMPORARY C/FFI H.264 — deliberately NOT in default-members; opt-in only.
+# TEMPORARY C/FFI H.264 â€” deliberately NOT in default-members; opt-in only.
 rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.1.0" }
 rff-format-wav = { path = "crates/rff-format-wav", version = "0.1.0" }
 rff-format-ogg = { path = "crates/rff-format-ogg", version = "0.1.0" }
@@ -130,11 +130,11 @@ rff-resample = { path = "crates/rff-resample", version = "0.1.0" }
 rff = { path = "crates/rff", version = "0.1.0" }
 rff-auth = { path = "crates/rff-auth", version = "0.1.0" }
 
-# Third-party (all permissive — MIT/Apache-2.0; CI-enforced by cargo-deny).
+# Third-party (all permissive â€” MIT/Apache-2.0; CI-enforced by cargo-deny).
 # AV1 encode + decode come from our own rusty-av1-toolkit (BSD-2-Clause forks of
 # rav1e / rav1d), now published on crates.io AS `rusty_av1e` / `rusty_av1d`
-# (the packages were renamed for publication — upstream owns the rav1e/rav1d
-# names — so no `package =` alias is needed anymore). This removed rff's last
+# (the packages were renamed for publication â€” upstream owns the rav1e/rav1d
+# names â€” so no `package =` alias is needed anymore). This removed rff's last
 # git dependencies: the whole tree is registry-resolvable. The workspace entry
 # stays `default-features = false` so wasm32 builds get the no-asm/no-threading
 # base; rff-codec-avif re-adds `asm` + `threading` for non-wasm targets (nasm
@@ -143,41 +143,43 @@ rff-auth = { path = "crates/rff-auth", version = "0.1.0" }
 # prom_av1e content-dispatch tier), ahead of the old b471be0 branch pin.
 rusty_av1e = { version = "0.8.0", default-features = false }
 rusty_av1d = { version = "1.2.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
-# png: our own rusty_png — a performance fork of image-rs/image-png 0.17.16
+# png: our own rusty_png â€” a performance fork of image-rs/image-png 0.17.16
 # (MIT/Apache-2.0), carried forward in-tree. DEFLATE via miniz_oxide/fdeflate,
 # with an opt-in pure-Rust `zlib-rs` backend. See crates/rusty_png/NOTICE.md.
 rusty_png = { path = "crates/rusty_png", version = "0.3.2", features = ["parallel"] }
-# jpeg: our own rusty_jpeg — a vendored merge of jpeg-decoder 0.3.2 (MIT/Apache)
+# jpeg: our own rusty_jpeg â€” a vendored merge of jpeg-decoder 0.3.2 (MIT/Apache)
 # and jpeg-encoder 0.7.0 (MIT/Apache AND IJG), carried forward in-tree. See
 # crates/rusty_jpeg/NOTICE.md for attribution and the IJG obligations.
-# gif: pure-Rust GIF de/encoder (MIT/Apache); image-webp: pure-Rust WebP (MIT/Apache).
+# gif: pure-Rust GIF de/encoder (MIT/Apache).
 gif = "0.14"
-image-webp = "0.2"
+# webp: our own rusty_webp â€” a fork of image-rs/image-webp 0.2.4 (MIT/Apache),
+# carried forward in-tree. See crates/rusty_webp/NOTICE.md.
+rusty_webp = { path = "crates/rusty_webp", version = "0.1.0" }
 # Opus comes from our own rusty-opus (BSD-3-Clause fork of the pure-Rust opus-rs
-# port of libopus 1.6 — no FFI). The fork's package is now named `rusty-opus`
-# (previously carried upstream's `opus-rs` name — renamed so the crate, Cargo.lock,
+# port of libopus 1.6 â€” no FFI). The fork's package is now named `rusty-opus`
+# (previously carried upstream's `opus-rs` name â€” renamed so the crate, Cargo.lock,
 # and every benchmark read as `rusty-opus`, not the old baseline label). The dep key
 # stays `rusty_opus` so the rff-side imports are unchanged. Our fork adds byte-identical
 # AVX2 SILK kernels (~+30% vs the pre-fork scalar baseline) + AVX2 decode kernels
-# (resampler FIR, CELT comb filter) + frame-parallel encoding (~3× libopus wall-clock,
+# (resampler FIR, CELT comb filter) + frame-parallel encoding (~3Ã— libopus wall-clock,
 # PEAQ-neutral).
 # Now consumed from crates.io (v0.1.23 == fork rev 77a838f + publish metadata;
 # code-identical, includes the CM1 mono-CELT fix "correct BAND_ALLOCATION row 10").
 # Dropping the git pin removes one git dep on rff's own path to crates.io
 # (crates.io rejects git dependencies). Bump the version on new fork releases.
 rusty_opus = { version = "0.9", package = "rusty-opus" }
-# lewton: pure-Rust Vorbis decoder (MIT/Apache-2.0) — decode only, no FFI.
+# lewton: pure-Rust Vorbis decoder (MIT/Apache-2.0) â€” decode only, no FFI.
 lewton = "0.10"
-# claxon: pure-Rust FLAC decoder (Apache-2.0) — decode only, no FFI.
+# claxon: pure-Rust FLAC decoder (Apache-2.0) â€” decode only, no FFI.
 claxon = "0.4"
-# jxl-oxide: pure-Rust JPEG XL decoder (MIT/Apache-2.0) — decode only, no FFI.
+# jxl-oxide: pure-Rust JPEG XL decoder (MIT/Apache-2.0) â€” decode only, no FFI.
 jxl-oxide = "0.12"
-# Optional TLS stack for `https://` input (rff-io `https` feature) — all
+# Optional TLS stack for `https://` input (rff-io `https` feature) â€” all
 # permissive AND pure-Rust, so it satisfies both project promises:
-#  * rustls (Apache-2.0/ISC/MIT) with NO default provider — `default-features =
+#  * rustls (Apache-2.0/ISC/MIT) with NO default provider â€” `default-features =
 #    false` drops the C `aws-lc-rs` backend (and `ring`); we inject a provider.
 #  * rustls-rustcrypto (MIT/Apache) supplies a CryptoProvider built on the
-#    RustCrypto crates — pure Rust, but pre-1.0 and NOT yet security-audited
+#    RustCrypto crates â€” pure Rust, but pre-1.0 and NOT yet security-audited
 #    (constant-time guarantees are weaker than ring/aws-lc-rs): the accepted
 #    "burden of immaturity" until a hardened pure-Rust provider lands.
 #  * roots come from the OS trust store via rustls-native-certs (Apache/ISC/MIT),
@@ -185,14 +187,14 @@ jxl-oxide = "0.12"
 # Allocator: our own rusty_alloc (pure-Rust remake of mimalloc v2.4.5, MIT).
 # `rusty_alloc-api` is the safe GlobalAlloc surface. PROJECT CONVENTION: every
 # encoder-carrying binary in this workspace (rff-cli bins, rff-server, rff-ui,
-# codec benches/examples) sets `RustyAlloc` as `#[global_allocator]` — it is the
+# codec benches/examples) sets `RustyAlloc` as `#[global_allocator]` â€” it is the
 # primary allocator. Library crates must NOT set it (that would hijack
 # downstream consumers' allocator choice); it belongs in [[bin]]/bench roots
 # only.
 #
 # Two things that trip people up when auditing this:
 #  * A `#[global_allocator]` anywhere in the linked graph applies program-wide.
-#    The four rff-cli bins declare none of their own — they inherit it from
+#    The four rff-cli bins declare none of their own â€” they inherit it from
 #    rff-cli/src/lib.rs. Grepping the bin files reports them as missing; they
 #    are not.
 #  * Benches and examples are SEPARATE compilation units. They link the library

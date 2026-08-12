@@ -1,7 +1,7 @@
-[package]
+﻿[package]
 name = "rff-format-webp"
 description = "Remade FFmpeg (Rust): WebP single-image container (file = codec stream)."
-version.workspace = true
+version = "0.2.0" # rusty_webp probe: range labeling + animation time base
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -15,4 +15,4 @@ categories = ["multimedia", "multimedia::images", "parser-implementations"]
 [dependencies]
 rff-core.workspace = true
 rff-format.workspace = true
-image-webp.workspace = true
+rusty_webp.workspace = true
