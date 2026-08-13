@@ -11,7 +11,11 @@
 //! prefixed (AVCC); we convert them to Annex-B and prepend the `avcC` SPS/PPS on
 //! keyframes so the H.264 decoder gets a self-contained bitstream.
 //!
-//! Demux only (no MP4 muxer yet).
+//! The fragmented profile lives in [`fmp4`] (init/media segments) and powers
+//! the DASH VOD muxer in [`dash`].
+
+pub mod dash;
+pub mod fmp4;
 
 use std::io::Read;
 
@@ -28,6 +32,21 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|output| Box::new(Mp4Muxer::new(output))),
         muxer_path: None,
         probe: Some(probe_mp4),
+    });
+    registry.register(Format {
+        name: "dash",
+        long_name: "DASH (static MPD + fMP4 segments)",
+        extensions: &["mpd"],
+        demuxer: None,
+        muxer: None,
+        muxer_path: Some(|path, options| {
+            let seconds = options
+                .get("seg_duration")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(4.0);
+            Ok(Box::new(dash::DashMuxer::new(path, seconds)?))
+        }),
+        probe: None,
     });
 }
 

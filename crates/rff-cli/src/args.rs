@@ -257,6 +257,11 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                 let value = take_value(args, &mut i, arg)?;
                 format_options.set("hls_time", value);
             }
+            // DASH segmenting: -seg_duration SECONDS (FFmpeg's dash option).
+            "seg_duration" => {
+                let value = take_value(args, &mut i, arg)?;
+                format_options.set("seg_duration", value);
+            }
             "hls_list_size" => {
                 let _ = take_value(args, &mut i, arg)?;
                 warnings.push("-hls_list_size: HLS output is a VOD playlist; ignored".into());
