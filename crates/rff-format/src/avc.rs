@@ -191,6 +191,55 @@ pub fn sps_dimensions(nal: &[u8]) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
+/// Split an Annex-B bitstream into NAL units (start codes removed). The
+/// mux-side inverse of [`avcc_to_annexb`], shared by every container that
+/// stores AVCC (MP4, Matroska).
+pub fn split_annexb(data: &[u8]) -> Vec<&[u8]> {
+    let mut nals = Vec::new();
+    let mut i = 0;
+    let mut nal_start: Option<usize> = None;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            if let Some(s) = nal_start {
+                // A leading zero before this start code belongs to a 4-byte code.
+                let end = if i > s && data[i - 1] == 0 { i - 1 } else { i };
+                if end > s {
+                    nals.push(&data[s..end]);
+                }
+            }
+            i += 3;
+            nal_start = Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    if let Some(s) = nal_start {
+        if s < data.len() {
+            nals.push(&data[s..]);
+        }
+    }
+    nals
+}
+
+/// Build an AVCDecoderConfigurationRecord (the `avcC` payload, no box header)
+/// from the SPS and PPS NALs. MP4 wraps it in an `avcC` box; Matroska stores it
+/// raw as CodecPrivate.
+pub fn build_avcc_record(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.push(1); // configurationVersion
+    b.push(*sps.get(1).unwrap_or(&0x42)); // AVCProfileIndication
+    b.push(*sps.get(2).unwrap_or(&0)); // profile_compatibility
+    b.push(*sps.get(3).unwrap_or(&30)); // AVCLevelIndication
+    b.push(0xFF); // 6 bits reserved + lengthSizeMinusOne = 3 (4-byte lengths)
+    b.push(0xE1); // 3 bits reserved + numOfSPS = 1
+    b.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    b.extend_from_slice(sps);
+    b.push(1); // numOfPPS
+    b.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+    b.extend_from_slice(pps);
+    b
+}
+
 /// Consume a `scaling_list()` of `size` entries (we only need the bits gone).
 fn skip_scaling_list(r: &mut Bits, size: u32) -> Option<()> {
     let mut next = 8i32;

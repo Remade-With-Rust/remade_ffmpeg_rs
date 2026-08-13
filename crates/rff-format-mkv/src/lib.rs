@@ -1,27 +1,42 @@
-//! Matroska / WebM demuxer.
+//! Matroska / WebM demuxer and muxer.
 //!
 //! Matroska is an [EBML](https://www.matroska.org/) (binary XML) container.
-//! WebM is its restricted profile (VP8/VP9/AV1 video + Opus/Vorbis audio). We
-//! parse the EBML element tree to extract the track list and then walk the
-//! Clusters, turning each (Simple)Block into a [`Packet`]. The whole input is
-//! buffered up front since the [`Input`] is not seekable.
+//! WebM is its restricted profile (VP8/VP9/AV1 video + Opus/Vorbis audio). The
+//! demuxer parses the EBML element tree to extract the track list and then
+//! walks the Clusters, turning each (Simple)Block into a [`Packet`]. The whole
+//! input is buffered up front since the [`Input`] is not seekable. The muxer
+//! (in [`mux`]) writes the inverse: SeekHead + Info + Tracks + Clusters + Cues.
+
+mod mux;
 
 use std::collections::VecDeque;
 use std::io::Read;
 
-use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result};
+use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result, SampleFormat};
 use rff_format::avc::{avcc_to_annexb, parse_avcc, AvcConfig};
 use rff_format::{Demuxer, Format, FormatRegistry, Input, Stream};
 
-/// Register the Matroska/WebM demuxer.
+pub use mux::MkvMuxer;
+
+/// Register the Matroska and WebM formats (demux + mux). WebM is a separate
+/// registry entry so `out.webm` gets the restricted doctype and codec checks;
+/// both share one demuxer.
 pub fn register(registry: &mut FormatRegistry) {
     registry.register(Format {
         name: "matroska",
-        long_name: "Matroska / WebM (EBML)",
-        extensions: &["mkv", "webm", "mka"],
+        long_name: "Matroska (EBML)",
+        extensions: &["mkv", "mka", "mks"],
         demuxer: Some(|input| Box::new(MkvDemuxer::new(input))),
-        muxer: None,
+        muxer: Some(|out| Box::new(MkvMuxer::new(out, false))),
         probe: Some(probe_mkv),
+    });
+    registry.register(Format {
+        name: "webm",
+        long_name: "WebM (restricted Matroska)",
+        extensions: &["webm"],
+        demuxer: Some(|input| Box::new(MkvDemuxer::new(input))),
+        muxer: Some(|out| Box::new(MkvMuxer::new(out, true))),
+        probe: None, // content-probing is matroska's job; webm is chosen by name
     });
 }
 
@@ -51,11 +66,14 @@ const ID_PIXEL_HEIGHT: u32 = 0xBA;
 const ID_AUDIO: u32 = 0xE1;
 const ID_SAMPLING_FREQUENCY: u32 = 0xB5;
 const ID_CHANNELS: u32 = 0x9F;
+const ID_BIT_DEPTH: u32 = 0x6264;
 const ID_CLUSTER: u32 = 0x1F43_B675;
 const ID_TIMESTAMP: u32 = 0xE7;
 const ID_SIMPLE_BLOCK: u32 = 0xA3;
 const ID_BLOCK_GROUP: u32 = 0xA0;
 const ID_BLOCK: u32 = 0xA1;
+const ID_BLOCK_DURATION: u32 = 0x9B;
+const ID_CUES: u32 = 0x1C53_BB6B;
 
 /// A cursor over the buffered file that reads EBML primitives.
 struct Ebml<'a> {
@@ -275,6 +293,7 @@ impl MkvDemuxer {
         let mut track_type = 0u64;
         let (mut width, mut height) = (0u32, 0u32);
         let (mut rate, mut channels) = (0u32, 0u16);
+        let mut bit_depth = 0u64;
 
         let mut e = Ebml::at(data, start);
         while e.pos < end {
@@ -311,6 +330,7 @@ impl MkvDemuxer {
                         match aid {
                             ID_SAMPLING_FREQUENCY => rate = a.read_float(asz as usize) as u32,
                             ID_CHANNELS => channels = a.read_uint(asz as usize) as u16,
+                            ID_BIT_DEPTH => bit_depth = a.read_uint(asz as usize),
                             _ => a.pos += asz as usize,
                         }
                     }
@@ -326,19 +346,37 @@ impl MkvDemuxer {
         s.media_type = match track_type {
             1 => MediaType::Video,
             2 => MediaType::Audio,
+            17 => MediaType::Subtitle,
             _ => MediaType::Data,
         };
         s.width = width;
         s.height = height;
         s.sample_rate = rate;
         s.channels = channels;
+        // PCM: the codec string + bit depth decide the sample layout.
+        if codec_id == CodecId::Pcm {
+            s.sample_format = match (codec.as_str(), bit_depth) {
+                ("A_PCM/FLOAT/IEEE", _) => Some(SampleFormat::F32),
+                (_, 0 | 16) => Some(SampleFormat::S16),
+                _ => None, // 24-bit int etc. — no rff layout yet
+            };
+        }
         // H.264 is stored AVCC (CodecPrivate = avcC, length-prefixed blocks).
         // Normalise to rff's Annex-B packet contract — same as rff-format-mp4 —
         // so extradata stays empty and the SPS/PPS ride in keyframe packets.
         let avc = (codec_id == CodecId::H264)
             .then(|| parse_avcc(&codec_private))
             .flatten();
-        s.extradata = if avc.is_some() { Vec::new() } else { codec_private };
+        s.extradata = if avc.is_some() {
+            Vec::new()
+        } else if codec_id == CodecId::Vorbis {
+            // Matroska stores the three Vorbis setup headers Xiph-laced; rff's
+            // decoder contract wants them u32-LE length-prefixed (the Ogg
+            // demuxer's packing). Convert, or the decoder can't configure.
+            xiph_to_packed(&codec_private).unwrap_or(codec_private)
+        } else {
+            codec_private
+        };
         self.avc.push(avc);
         // Matroska timestamps are in `timestamp_scale` ns; expose ms time base.
         s.time_base = Rational::new(1, (1_000_000_000 / self.timestamp_scale.max(1)) as i32);
@@ -359,20 +397,26 @@ impl MkvDemuxer {
                 ID_TIMESTAMP => cluster_ts = e.read_uint(len) as i64,
                 ID_SIMPLE_BLOCK => {
                     let block = e.read_bytes(len);
-                    self.parse_block(block, cluster_ts);
+                    self.parse_block(block, cluster_ts, 0);
                 }
                 ID_BLOCK_GROUP => {
+                    // BlockDuration may come before or after the Block: collect
+                    // both, then emit (subtitle cues need their duration).
                     let ge = e.pos + len;
                     let mut g = Ebml::at(data, e.pos);
+                    let mut block: Option<&[u8]> = None;
+                    let mut duration = 0i64;
                     while g.pos < ge {
                         let Some(gid) = g.read_id() else { break };
                         let Some((gsz, _)) = g.read_size() else { break };
-                        if gid == ID_BLOCK {
-                            let block = g.read_bytes(gsz as usize);
-                            self.parse_block(block, cluster_ts);
-                        } else {
-                            g.pos += gsz as usize;
+                        match gid {
+                            ID_BLOCK => block = Some(g.read_bytes(gsz as usize)),
+                            ID_BLOCK_DURATION => duration = g.read_uint(gsz as usize) as i64,
+                            _ => g.pos += gsz as usize,
                         }
+                    }
+                    if let Some(block) = block {
+                        self.parse_block(block, cluster_ts, duration);
                     }
                     e.pos = ge;
                 }
@@ -383,7 +427,7 @@ impl MkvDemuxer {
 
     /// Parse a (Simple)Block body: track vint, int16 relative timestamp, flags,
     /// then the frame payload (no-lacing only for now).
-    fn parse_block(&mut self, block: &[u8], cluster_ts: i64) {
+    fn parse_block(&mut self, block: &[u8], cluster_ts: i64, duration: i64) {
         let mut b = Ebml::new(block);
         let Some((track_num, _)) = b.read_size() else {
             return;
@@ -419,9 +463,40 @@ impl MkvDemuxer {
         };
         let mut packet = Packet::from_data(index, data);
         packet.pts = Some(cluster_ts + rel);
+        packet.duration = duration.max(0);
         packet.flags.keyframe = keyframe;
         self.packets.push_back(packet);
     }
+}
+
+/// Convert a Xiph-laced Vorbis CodecPrivate (count-1, lace sizes, packets) to
+/// rff's u32-LE length-prefixed `extradata` packing.
+fn xiph_to_packed(private: &[u8]) -> Option<Vec<u8>> {
+    let count = *private.first()? as usize + 1;
+    let mut sizes = Vec::with_capacity(count);
+    let mut i = 1;
+    for _ in 0..count - 1 {
+        let mut len = 0usize;
+        loop {
+            let b = *private.get(i)? as usize;
+            i += 1;
+            len += b;
+            if b != 255 {
+                break;
+            }
+        }
+        sizes.push(len);
+    }
+    let head: usize = sizes.iter().sum();
+    sizes.push(private.len().checked_sub(i + head)?); // last packet: remainder
+    let mut out = Vec::new();
+    for len in sizes {
+        let packet = private.get(i..i + len)?;
+        out.extend_from_slice(&(len as u32).to_le_bytes());
+        out.extend_from_slice(packet);
+        i += len;
+    }
+    Some(out)
 }
 
 impl Demuxer for MkvDemuxer {
@@ -475,6 +550,158 @@ mod tests {
         assert_eq!(probe_mkv(&[0x1A, 0x45, 0xDF, 0xA3, 0x00]), 90);
         assert_eq!(probe_mkv(&[0x00, 0x00]), 0);
     }
+
+    // ---- mux → demux round trips ------------------------------------------
+
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn mux_streams(
+        webm: bool,
+        streams: &[Stream],
+        packets: &[Packet],
+    ) -> std::result::Result<Vec<u8>, Error> {
+        use rff_format::Muxer;
+        let sink = SharedBuf(Arc::new(Mutex::new(Vec::new())));
+        let mut mux = MkvMuxer::new(Box::new(sink.clone()), webm);
+        mux.write_header(streams)?;
+        for p in packets {
+            mux.write_packet(p)?;
+        }
+        mux.write_trailer()?;
+        let file = sink.0.lock().unwrap().clone();
+        Ok(file)
+    }
+
+    fn pkt(stream: usize, pts: i64, key: bool, data: &[u8]) -> Packet {
+        let mut p = Packet::from_data(stream, data.to_vec());
+        p.pts = Some(pts);
+        p.flags.keyframe = key;
+        p
+    }
+
+    #[test]
+    fn mux_demux_roundtrips_vp9_opus() {
+        let mut v = Stream::new(0, CodecId::Vp9);
+        v.width = 320;
+        v.height = 240;
+        let mut a = Stream::new(1, CodecId::Opus);
+        a.sample_rate = 48_000;
+        a.channels = 2;
+        a.time_base = Rational::new(1, 48_000); // audio pts in samples
+
+        let packets = [
+            pkt(0, 0, true, &[0x11; 100]),
+            pkt(1, 0, true, &[0x22; 40]),
+            pkt(1, 960, true, &[0x33; 41]),
+            pkt(0, 33, false, &[0x44; 50]),
+        ];
+        let file = mux_streams(false, &[v, a], &packets).unwrap();
+        assert_eq!(probe_mkv(&file), 90);
+
+        let mut dem = MkvDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = dem.read_header().unwrap();
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0].codec_id, CodecId::Vp9);
+        assert_eq!((streams[0].width, streams[0].height), (320, 240));
+        assert_eq!(streams[1].codec_id, CodecId::Opus);
+        assert_eq!(streams[1].sample_rate, 48_000);
+        assert_eq!(streams[1].channels, 2);
+        assert!(streams[1].extradata.starts_with(b"OpusHead"));
+
+        // Blocks come back in timestamp order with data + keyframes intact.
+        let p1 = dem.read_packet().unwrap();
+        assert_eq!(p1.data, vec![0x11; 100]);
+        assert!(p1.flags.keyframe);
+        let p2 = dem.read_packet().unwrap();
+        assert_eq!(p2.data, vec![0x22; 40]);
+        let p3 = dem.read_packet().unwrap();
+        assert_eq!(p3.data, vec![0x33; 41]);
+        assert_eq!(p3.pts, Some(20)); // 960 samples @48 kHz = 20 ms
+        let p4 = dem.read_packet().unwrap();
+        assert_eq!(p4.data, vec![0x44; 50]);
+        assert_eq!(p4.pts, Some(33));
+        assert!(!p4.flags.keyframe);
+    }
+
+    #[test]
+    fn mux_demux_roundtrips_h264_as_annexb() {
+        let mut v = Stream::new(0, CodecId::H264);
+        v.width = 64;
+        v.height = 64;
+        // Annex-B keyframe: SPS + PPS + IDR slice.
+        let mut sample = Vec::new();
+        for nal in [&[0x67u8, 0xAA, 0xBB][..], &[0x68, 0xCC][..], &[0x65, 1, 2, 3][..]] {
+            sample.extend_from_slice(&[0, 0, 0, 1]);
+            sample.extend_from_slice(nal);
+        }
+        let file = mux_streams(false, &[v], &[pkt(0, 0, true, &sample)]).unwrap();
+
+        let mut dem = MkvDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = dem.read_header().unwrap();
+        assert_eq!(streams[0].codec_id, CodecId::H264);
+        assert!(streams[0].extradata.is_empty()); // normalised to Annex-B
+        let p = dem.read_packet().unwrap();
+        // Keyframe comes back with SPS/PPS prepended, then the slice.
+        assert_eq!(p.data, sample);
+    }
+
+    #[test]
+    fn webm_refuses_non_webm_codecs() {
+        let s = Stream::new(0, CodecId::H264);
+        let err = mux_streams(true, &[s], &[]).unwrap_err();
+        assert!(err.to_string().contains("webm"), "got: {err}");
+    }
+
+    #[test]
+    fn mux_demux_roundtrips_subtitles_with_duration() {
+        let mut v = Stream::new(0, CodecId::Vp9);
+        v.width = 16;
+        v.height = 16;
+        let s = Stream::new(1, CodecId::Subrip);
+        let mut cue = pkt(1, 500, true, b"Hello, Matroska!");
+        cue.duration = 1200;
+        let file =
+            mux_streams(false, &[v, s], &[pkt(0, 0, true, &[0x11; 10]), cue]).unwrap();
+
+        let mut dem = MkvDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = dem.read_header().unwrap();
+        assert_eq!(streams[1].codec_id, CodecId::Subrip);
+        assert_eq!(streams[1].media_type, MediaType::Subtitle);
+        let _video = dem.read_packet().unwrap();
+        let p = dem.read_packet().unwrap();
+        assert_eq!(p.data, b"Hello, Matroska!");
+        assert_eq!(p.pts, Some(500));
+        assert_eq!(p.duration, 1200);
+    }
+
+    #[test]
+    fn vorbis_xiph_private_unpacks_to_rff_packing() {
+        // 3 headers, first 300 bytes (lacing needs 255-continuation).
+        let h0 = vec![1u8; 300];
+        let h1 = vec![2u8; 10];
+        let h2 = vec![3u8; 5];
+        let mut private = vec![2u8, 255, 45, 10];
+        private.extend_from_slice(&h0);
+        private.extend_from_slice(&h1);
+        private.extend_from_slice(&h2);
+        let packed = xiph_to_packed(&private).unwrap();
+        assert_eq!(&packed[0..4], &300u32.to_le_bytes());
+        assert_eq!(packed.len(), 3 * 4 + 300 + 10 + 5);
+        assert_eq!(&packed[4 + 300..4 + 300 + 4], &10u32.to_le_bytes());
+    }
 }
 
 fn map_codec(codec: &str) -> CodecId {
@@ -486,6 +713,10 @@ fn map_codec(codec: &str) -> CodecId {
         "A_VORBIS" => CodecId::Vorbis,
         "A_AAC" => CodecId::Aac,
         "A_FLAC" => CodecId::Flac,
+        "A_MPEG/L3" => CodecId::Mp3,
+        "A_PCM/INT/LIT" | "A_PCM/FLOAT/IEEE" => CodecId::Pcm,
+        "S_TEXT/UTF8" => CodecId::Subrip,
+        "S_TEXT/WEBVTT" => CodecId::WebVtt,
         _ => CodecId::None,
     }
 }

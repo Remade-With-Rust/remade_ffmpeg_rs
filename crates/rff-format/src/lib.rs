@@ -10,13 +10,16 @@
 //!
 //! Concrete formats live in their own crates (`rff-format-avi`, ...).
 
+pub mod aac;
+pub mod av1;
 pub mod avc;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
 use rff_core::{
-    CodecId, ColorRange, Error, MediaType, Packet, PixelFormat, Rational, Result, SampleFormat,
+    CodecId, ColorRange, Dictionary, Error, MediaType, Packet, PixelFormat, Rational, Result,
+    SampleFormat,
 };
 
 /// Description of one elementary stream within a container.
@@ -94,6 +97,11 @@ pub trait Demuxer: Send {
 
 /// Writes a container format: declare streams, write packets, finalize.
 pub trait Muxer: Send {
+    /// Hand the muxer output metadata (`-metadata title=...`). Called before
+    /// [`write_header`](Muxer::write_header); formats without a metadata slot
+    /// simply ignore it (the default).
+    fn set_metadata(&mut self, _metadata: &Dictionary) {}
+
     /// Write the container header for the given set of streams.
     fn write_header(&mut self, streams: &[Stream]) -> Result<()>;
 

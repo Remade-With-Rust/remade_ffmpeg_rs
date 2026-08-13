@@ -102,7 +102,7 @@ struct SampleLoc {
     keyframe: bool,
 }
 
-use rff_format::avc::{avcc_to_annexb, parse_avcc, AvcConfig};
+use rff_format::avc::{avcc_to_annexb, parse_avcc, split_annexb, AvcConfig};
 
 struct Mp4Demuxer {
     input: Option<Input>,
@@ -463,101 +463,14 @@ fn identity_matrix(v: &mut Vec<u8>) {
     }
 }
 
-/// Split an Annex-B bitstream into NAL units (start codes removed).
-fn split_annexb(data: &[u8]) -> Vec<&[u8]> {
-    let mut nals = Vec::new();
-    let mut i = 0;
-    let mut nal_start: Option<usize> = None;
-    while i + 3 <= data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            if let Some(s) = nal_start {
-                // A leading zero before this start code belongs to a 4-byte code.
-                let end = if i > s && data[i - 1] == 0 { i - 1 } else { i };
-                if end > s {
-                    nals.push(&data[s..end]);
-                }
-            }
-            i += 3;
-            nal_start = Some(i);
-        } else {
-            i += 1;
-        }
-    }
-    if let Some(s) = nal_start {
-        if s < data.len() {
-            nals.push(&data[s..]);
-        }
-    }
-    nals
-}
-
-/// Build an `avcC` box from the SPS and PPS NALs.
+/// Build an `avcC` box from the SPS and PPS NALs (shared record + box header).
 fn build_avcc(sps: &[u8], pps: &[u8]) -> Vec<u8> {
-    let mut b = Vec::new();
-    b.push(1); // configurationVersion
-    b.push(*sps.get(1).unwrap_or(&0x42)); // AVCProfileIndication
-    b.push(*sps.get(2).unwrap_or(&0)); // profile_compatibility
-    b.push(*sps.get(3).unwrap_or(&30)); // AVCLevelIndication
-    b.push(0xFF); // 6 bits reserved + lengthSizeMinusOne = 3 (4-byte lengths)
-    b.push(0xE1); // 3 bits reserved + numOfSPS = 1
-    pu16(&mut b, sps.len() as u16);
-    b.extend_from_slice(sps);
-    b.push(1); // numOfPPS
-    pu16(&mut b, pps.len() as u16);
-    b.extend_from_slice(pps);
-    bx(b"avcC", &b)
+    bx(b"avcC", &rff_format::avc::build_avcc_record(sps, pps))
 }
 
-fn read_leb128(data: &[u8]) -> Option<(u64, usize)> {
-    let mut v = 0u64;
-    for i in 0..8 {
-        let byte = *data.get(i)?;
-        v |= ((byte & 0x7f) as u64) << (i * 7);
-        if byte & 0x80 == 0 {
-            return Some((v, i + 1));
-        }
-    }
-    None
-}
-
-/// Find the AV1 sequence-header OBU (type 1) in a temporal unit; return its bytes.
-fn find_seq_header_obu(data: &[u8]) -> Option<&[u8]> {
-    let mut i = 0;
-    while i < data.len() {
-        let start = i;
-        let header = data[i];
-        i += 1;
-        let obu_type = (header >> 3) & 0x0f;
-        if (header >> 2) & 1 == 1 {
-            i += 1; // extension header
-        }
-        let len = if (header >> 1) & 1 == 1 {
-            let (l, used) = read_leb128(data.get(i..)?)?;
-            i += used;
-            l as usize
-        } else {
-            data.len() - i
-        };
-        if i + len > data.len() {
-            return None;
-        }
-        i += len;
-        if obu_type == 1 {
-            return Some(&data[start..i]);
-        }
-    }
-    None
-}
-
-/// Best-effort AV1 config record (`av1C`) with the sequence header embedded as
-/// configOBUs. Fixed fields assume 8-bit 4:2:0 (the common case); compliant
-/// decoders read the embedded sequence header regardless.
+/// Best-effort `av1C` box with the sequence header embedded as configOBUs.
 fn build_av1c(sample: &[u8]) -> Option<Vec<u8>> {
-    let seq = find_seq_header_obu(sample)?;
-    // marker(1)|version(7)=1, profile 0 + level 0, then 8-bit/4:2:0 flags.
-    let mut b = vec![0x81u8, 0x00, 0x0C, 0x00];
-    b.extend_from_slice(seq);
-    Some(bx(b"av1C", &b))
+    rff_format::av1::config_record(sample).map(|r| bx(b"av1C", &r))
 }
 
 /// What a track contributes to the file: its samples + codec-specific entry.
@@ -797,20 +710,9 @@ fn build_dops(channels: u16, sample_rate: u32) -> Vec<u8> {
     bx(b"dOps", &b)
 }
 
-/// AAC sample-rate → 4-bit samplingFrequencyIndex (ISO 14496-3); 44.1 kHz default.
-fn aac_sf_index(rate: u32) -> u32 {
-    const RATES: [u32; 13] = [
-        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
-    ];
-    RATES.iter().position(|&r| r == rate).unwrap_or(4) as u32
-}
-
-/// AudioSpecificConfig for AAC-LC: objectType=2 (5b) + samplingFrequencyIndex (4b)
-/// + channelConfiguration (4b) + GASpecificConfig (3b, all zero) = 16 bits.
+/// AudioSpecificConfig for AAC-LC (shared with the Matroska muxer).
 fn build_asc(sample_rate: u32, channels: u16) -> Vec<u8> {
-    let bits =
-        (2u32 << 11) | (aac_sf_index(sample_rate) << 7) | ((channels.clamp(1, 7) as u32) << 3);
-    vec![(bits >> 8) as u8, (bits & 0xff) as u8]
+    rff_format::aac::audio_specific_config(sample_rate, channels)
 }
 
 /// `esds` box: ES_Descriptor → DecoderConfigDescriptor → DecoderSpecificInfo
