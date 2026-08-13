@@ -1,4 +1,4 @@
-//! In-house **FLAC encoder** — lossless, pure Rust, no FFI.
+﻿//! In-house **FLAC encoder** — lossless, pure Rust, no FFI.
 //!
 //! Ported from `rff-codec-flac` (built brick by brick; see that crate's
 //! `docs/codec-flac-encoder.md` history). The port keeps the *decisions*
@@ -21,8 +21,13 @@ const BLOCK_SIZE: usize = 4096;
 const LPC_PRECISION: u32 = 14;
 /// Highest LPC order searched — subset-compliant.
 pub(crate) const LPC_MAX_ORDER: usize = 12;
-/// Rice parameters searched (0..=14; 15 is the escape code).
-const RICE_KMAX: usize = 14;
+/// Rice parameters searched. Method 0 (4-bit params) covers k 0..=14; method
+/// 1 (Rice2, 5-bit params) extends to k 0..=30 — essential for high-entropy
+/// 24-bit residuals, where the optimal parameter sits well above 14.
+const RICE_KMAX: usize = 30;
+/// Largest parameter expressible in a method-0 (4-bit) partition. 15/31 are
+/// the escape codes and are never emitted.
+const RICE_KMAX_M0: usize = 14;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -234,7 +239,6 @@ impl Encoder {
         // Whole-stream output estimate: raw size is the ceiling for lossless.
         let raw = n * self.channels * (bps as usize / 8);
         let mut frames: Vec<u8> = Vec::with_capacity(raw / 2 + 4096);
-        let (mut min_bs, mut max_bs) = (u32::MAX, 0u32);
         let (mut min_fs, mut max_fs) = (u32::MAX, 0u32);
         let mut frame_number = 0u64;
         let mut start = 0usize;
@@ -243,8 +247,6 @@ impl Encoder {
             let bs = (n - start).min(BLOCK_SIZE);
             wins.ensure(bs);
             let frame = self.encode_frame(frame_number, start, bs, bps, &wins);
-            min_bs = min_bs.min(bs as u32);
-            max_bs = max_bs.max(bs as u32);
             min_fs = min_fs.min(frame.len() as u32);
             max_fs = max_fs.max(frame.len() as u32);
             frames.extend_from_slice(&frame);
@@ -253,15 +255,16 @@ impl Encoder {
             self.stats.frames += 1;
         }
         if frames.is_empty() {
-            min_bs = 0;
             min_fs = 0;
             max_fs = 0;
         }
 
-        // STREAMINFO (34 bytes).
+        // STREAMINFO (34 bytes). Block sizes are the NOMINAL blocking (the
+        // spec's min/max exclude the final short block, and requires >= 16 —
+        // a 5-sample stream still declares its nominal 4096, like libFLAC).
         let mut si = BitWriter::with_capacity(34);
-        si.write_bits(min_bs as u64, 16);
-        si.write_bits(max_bs as u64, 16);
+        si.write_bits(BLOCK_SIZE as u64, 16);
+        si.write_bits(BLOCK_SIZE as u64, 16);
         si.write_bits(min_fs as u64, 24);
         si.write_bits(max_fs as u64, 24);
         si.write_bits(self.sample_rate as u64, 20);
@@ -482,7 +485,10 @@ fn rice_sums_scalar(res: &[i32]) -> [u64; RICE_KMAX + 1] {
 #[target_feature(enable = "avx2")]
 unsafe fn rice_sums_avx2(res: &[i32]) -> [u64; RICE_KMAX + 1] {
     use std::arch::x86_64::*;
-    // 16 u64 accumulator lanes (k = 0..15; lane 15 is discarded).
+    // 16 u64 accumulator lanes for k 0..15; k 16..=30 is folded from lane 15
+    // afterwards by re-scanning IF any residual is big enough to need it
+    // (rare outside high-entropy 24-bit content), so the common path stays 4
+    // shift/add register pairs per sample.
     let sh0 = _mm256_setr_epi64x(0, 1, 2, 3);
     let sh1 = _mm256_setr_epi64x(4, 5, 6, 7);
     let sh2 = _mm256_setr_epi64x(8, 9, 10, 11);
@@ -491,9 +497,11 @@ unsafe fn rice_sums_avx2(res: &[i32]) -> [u64; RICE_KMAX + 1] {
     let mut a1 = _mm256_setzero_si256();
     let mut a2 = _mm256_setzero_si256();
     let mut a3 = _mm256_setzero_si256();
+    let mut or_acc = 0u32;
     for &v in res {
-        let u = zigzag(v) as i64;
-        let b = _mm256_set1_epi64x(u);
+        let u = zigzag(v);
+        or_acc |= u;
+        let b = _mm256_set1_epi64x(u as i64);
         a0 = _mm256_add_epi64(a0, _mm256_srlv_epi64(b, sh0));
         a1 = _mm256_add_epi64(a1, _mm256_srlv_epi64(b, sh1));
         a2 = _mm256_add_epi64(a2, _mm256_srlv_epi64(b, sh2));
@@ -505,29 +513,36 @@ unsafe fn rice_sums_avx2(res: &[i32]) -> [u64; RICE_KMAX + 1] {
     _mm256_storeu_si256(lanes.as_mut_ptr().add(8) as *mut __m256i, a2);
     _mm256_storeu_si256(lanes.as_mut_ptr().add(12) as *mut __m256i, a3);
     let mut sums = [0u64; RICE_KMAX + 1];
-    sums.copy_from_slice(&lanes[..RICE_KMAX + 1]);
+    sums[..16].copy_from_slice(&lanes);
+    // High-k tail: only when some residual exceeds 16 bits after folding.
+    if or_acc >> 16 != 0 {
+        for &v in res {
+            let u = zigzag(v);
+            for k in 16..=RICE_KMAX {
+                sums[k] += (u >> k) as u64;
+            }
+        }
+    }
     sums
 }
 
-/// Best Rice parameter (lowest k on ties, matching the original scan order)
-/// and its exact bit cost, from precomputed shifted sums.
+/// Best Rice parameter within `0..=kmax` (lowest k on ties) and its exact
+/// body bit cost, from precomputed shifted sums. The cost is convex in k
+/// (unary halves, suffix grows by cnt), so the scan stops at the first rise.
 #[inline]
-fn best_k_from_sums(sums: &[u64; RICE_KMAX + 1], cnt: u64) -> (u32, u64) {
+fn best_k_from_sums(sums: &[u64; RICE_KMAX + 1], cnt: u64, kmax: usize) -> (u32, u64) {
     let mut best_k = 0u32;
     let mut best = sums[0] + cnt;
-    for (k, &s) in sums.iter().enumerate().skip(1) {
+    for (k, &s) in sums.iter().enumerate().take(kmax + 1).skip(1) {
         let b = s + cnt * (1 + k as u64);
         if b < best {
             best = b;
             best_k = k as u32;
+        } else {
+            break; // convex: it only grows from here
         }
     }
     (best_k, best)
-}
-
-/// Best Rice parameter + exact cost for a residual slice (single partition).
-fn best_rice(res: &[i32]) -> (u32, u64) {
-    best_k_from_sums(&rice_sums(res), res.len() as u64)
 }
 
 /// Rice-code one residual: quotient in unary, then the low `k` bits. The
@@ -550,9 +565,11 @@ fn write_rice(bw: &mut BitWriter, v: i32, k: u32) {
     }
 }
 
-/// A residual coding plan: the chosen partition order + per-partition Rice
-/// parameters, and the residual-body bit cost (Σ 4-bit param + Rice codes).
+/// A residual coding plan: the coding method (0 = 4-bit Rice params, 1 =
+/// Rice2 5-bit params), the chosen partition order, per-partition parameters,
+/// and the residual-body bit cost (Σ param-field + Rice codes).
 struct ResidualPlan {
+    method: u32,
     partition_order: u32,
     ks: Vec<u32>,
     bits: u64,
@@ -610,25 +627,46 @@ fn plan_partitions(res: &[i32], bs: usize, p: usize) -> ResidualPlan {
     // level_sums[i] holds partitions at order (max_po - i).
 
     let mut best = ResidualPlan {
+        method: 0,
         partition_order: 0,
         ks: Vec::new(),
         bits: u64::MAX,
     };
-    // Match the original's search order (po ascending, strict <).
+    // Search po ascending (strict <, so lower orders win ties), costing both
+    // methods at each level: method 0 pays 4 bits/param but caps k at 14,
+    // Rice2 pays 5 bits/param for k up to 30.
     for po in 0..=max_po {
         let sums = &level_sums[(max_po - po) as usize];
         let psize = bs >> po;
         let n_part = 1usize << po;
-        let mut ks = Vec::with_capacity(n_part);
-        let mut bits = 0u64;
+        let mut ks0 = Vec::with_capacity(n_part);
+        let mut ks1 = Vec::with_capacity(n_part);
+        let mut bits0 = 0u64;
+        let mut bits1 = 0u64;
         for (part, s) in sums.iter().enumerate() {
             let cnt = if part == 0 { psize - p } else { psize } as u64;
-            let (k, kb) = best_k_from_sums(s, cnt);
-            ks.push(k);
-            bits += 4 + kb;
+            // One full-range scan; when the optimum already fits method 0's
+            // 4-bit field (the overwhelmingly common case), it IS method 0's
+            // optimum too and no second scan is needed.
+            let (k1, kb1) = best_k_from_sums(s, cnt, RICE_KMAX);
+            let (k0, kb0) = if k1 as usize <= RICE_KMAX_M0 {
+                (k1, kb1)
+            } else {
+                best_k_from_sums(s, cnt, RICE_KMAX_M0)
+            };
+            ks0.push(k0);
+            ks1.push(k1);
+            bits0 += 4 + kb0;
+            bits1 += 5 + kb1;
         }
+        let (method, ks, bits) = if bits1 < bits0 {
+            (1u32, ks1, bits1)
+        } else {
+            (0u32, ks0, bits0)
+        };
         if bits < best.bits {
             best = ResidualPlan {
+                method,
                 partition_order: po,
                 ks,
                 bits,
@@ -648,11 +686,12 @@ fn write_partitioned_residual(
 ) {
     let n_part = 1usize << plan.partition_order;
     let psize = bs >> plan.partition_order;
+    let param_bits = 4 + plan.method;
     let mut idx = 0usize;
     for part in 0..n_part {
         let cnt = if part == 0 { psize - p } else { psize };
         let k = plan.ks[part];
-        bw.write_bits(k as u64, 4);
+        bw.write_bits(k as u64, param_bits);
         for &r in &res[idx..idx + cnt] {
             write_rice(bw, r, k);
         }
@@ -1370,7 +1409,7 @@ fn write_subframe_from(
             for &s in &samples[..*order] {
                 bw.write_signed(s as i64, bps);
             }
-            bw.write_bits(0, 2); // residual method 0
+            bw.write_bits(plan.method as u64, 2);
             bw.write_bits(plan.partition_order as u64, 4);
             write_partitioned_residual(bw, res, samples.len(), *order, plan);
         }
@@ -1387,7 +1426,7 @@ fn write_subframe_from(
             for &q in &c.qlp {
                 bw.write_signed(q as i64, LPC_PRECISION); // coefficients, qlp[0] first
             }
-            bw.write_bits(0, 2); // residual method 0
+            bw.write_bits(c.plan.method as u64, 2);
             bw.write_bits(c.plan.partition_order as u64, 4);
             write_partitioned_residual(bw, &c.res, samples.len(), c.order, &c.plan);
         }
