@@ -108,6 +108,10 @@ pub struct OutputSpec {
     pub video_codec: Option<StreamCodec>,
     /// Audio codec for the output, if an audio stream is produced.
     pub audio_codec: Option<StreamCodec>,
+    /// Subtitle codec (`-c:s subrip|webvtt`). Text-subtitle packets share one
+    /// contract (plain text + ms timing), so this relabels the stream for the
+    /// muxer rather than re-encoding anything.
+    pub subtitle_codec: Option<CodecId>,
     /// Video filter graph (`-vf`), e.g. `scale=320:240,crop=...`. Applied to
     /// decoded video frames before re-encoding (transcode streams only).
     pub video_filters: Option<String>,
@@ -1127,6 +1131,19 @@ fn build_op(
         None => {
             let mut os = stream.clone();
             os.index = out_index;
+            // `-c:s`: text subtitles share one packet contract, so choosing a
+            // subtitle codec relabels the stream (SubRip ↔ WebVTT) in place.
+            if stream.media_type == MediaType::Subtitle {
+                if let Some(target) = output.subtitle_codec {
+                    if target.media_type() != MediaType::Subtitle {
+                        return Err(Error::unsupported(format!(
+                            "-c:s: `{}` is not a subtitle codec",
+                            target.name()
+                        )));
+                    }
+                    os.codec_id = target;
+                }
+            }
             let trim = Trim::from_spec(output);
             let tb = stream.time_base;
             let to_ticks = |s: f64| (s * tb.den as f64 / tb.num.max(1) as f64).round() as i64;

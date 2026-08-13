@@ -81,9 +81,87 @@ pub fn parse_cues(text: &str) -> Vec<Cue> {
     cues
 }
 
+// ---------------------------------------------------------------------------
+// ASS / SSA (Advanced SubStation Alpha)
+// ---------------------------------------------------------------------------
+
+/// Parse an ASS timestamp (`H:MM:SS.cc` — centiseconds) into milliseconds.
+pub fn parse_ass_timestamp(s: &str) -> Option<i64> {
+    let mut parts = s.trim().split(':');
+    let hours: i64 = parts.next()?.trim().parse().ok()?;
+    let mins: i64 = parts.next()?.trim().parse().ok()?;
+    let (secs, cents) = parts.next()?.trim().split_once('.')?;
+    let secs: i64 = secs.parse().ok()?;
+    let cents: i64 = cents.trim().parse().ok()?;
+    Some(((hours * 60 + mins) * 60 + secs) * 1000 + cents * 10)
+}
+
+/// Strip ASS markup from dialogue text: `{\override tags}` blocks are removed,
+/// `\N`/`\n` become newlines, `\h` a space. What remains is the plain text a
+/// SubRip/WebVTT cue carries.
+pub fn clean_ass_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_braces = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => in_braces = true,
+            '}' if in_braces => in_braces = false,
+            _ if in_braces => {}
+            '\\' => match chars.peek() {
+                Some('N') | Some('n') => {
+                    chars.next();
+                    out.push('\n');
+                }
+                Some('h') => {
+                    chars.next();
+                    out.push(' ');
+                }
+                _ => out.push('\\'),
+            },
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Split an ASS `Dialogue:` (or Matroska ASS block) payload of `n_meta`
+/// leading comma-separated fields from its text, returning the cleaned text.
+/// (`.ass` Dialogue lines have 9 fields before the text; Matroska blocks 8.)
+pub fn ass_dialogue_text(payload: &str, n_meta: usize) -> String {
+    let mut rest = payload;
+    for _ in 0..n_meta {
+        match rest.split_once(',') {
+            Some((_, r)) => rest = r,
+            None => break,
+        }
+    }
+    clean_ass_text(rest.trim_end())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ass_timestamps_are_centiseconds() {
+        assert_eq!(parse_ass_timestamp("0:00:01.50"), Some(1_500));
+        assert_eq!(parse_ass_timestamp("1:02:03.04"), Some(3_723_040));
+    }
+
+    #[test]
+    fn ass_text_strips_tags_and_breaks() {
+        assert_eq!(
+            clean_ass_text(r"{\an8\i1}Top{\i0} line\Nsecond\hline"),
+            "Top line\nsecond line"
+        );
+    }
+
+    #[test]
+    fn ass_dialogue_skips_meta_fields() {
+        let payload = r"0,0,Default,,0,0,0,,{\b1}Hello\NWorld";
+        assert_eq!(ass_dialogue_text(payload, 8), "Hello\nWorld");
+    }
 
     #[test]
     fn format_and_parse_roundtrip() {

@@ -53,6 +53,7 @@ default-members = [
     "crates/rff-io",
     "crates/rff-subtitle",
     "crates/rff-format-srt",
+    "crates/rff-format-ass",
     "crates/rff-format-webvtt",
     "crates/rff-filter",
     "crates/rff-resample",
@@ -124,6 +125,7 @@ rff-format-hls = { path = "crates/rff-format-hls", version = "0.1.0" }
 rff-io = { path = "crates/rff-io", version = "0.1.0" }
 rff-subtitle = { path = "crates/rff-subtitle", version = "0.1.0" }
 rff-format-srt = { path = "crates/rff-format-srt", version = "0.1.0" }
+rff-format-ass = { path = "crates/rff-format-ass", version = "0.1.0" }
 rff-format-webvtt = { path = "crates/rff-format-webvtt", version = "0.1.0" }
 rff-filter = { path = "crates/rff-filter", version = "0.1.0" }
 rff-resample = { path = "crates/rff-resample", version = "0.1.0" }

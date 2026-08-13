@@ -55,6 +55,7 @@ rff-format-ts.workspace = true
 rff-format-flv.workspace = true
 rff-format-hls.workspace = true
 rff-format-srt.workspace = true
+rff-format-ass.workspace = true
 rff-format-webvtt.workspace = true
 
 # TEMPORARY, opt-in only: Cisco openh264 (C/FFI). Off by default so the normal

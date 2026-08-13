@@ -69,6 +69,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut out_format: Option<String> = None;
     let mut video_codec: Option<CodecId> = None;
     let mut audio_codec: Option<CodecId> = None;
+    let mut subtitle_codec: Option<CodecId> = None;
     // Sample format pinned by the codec NAME (`-c:a pcm_s16le`) or by an
     // explicit `-sample_fmt`. Kept separate from the codec id, which is
     // format-agnostic by design.
@@ -159,6 +160,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                     &name,
                     &mut video_codec,
                     &mut audio_codec,
+                    &mut subtitle_codec,
                     &mut audio_sample_format,
                     &mut warnings,
                 );
@@ -170,6 +172,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                     &name,
                     &mut video_codec,
                     &mut audio_codec,
+                    &mut subtitle_codec,
                     &mut audio_sample_format,
                     &mut warnings,
                 );
@@ -181,6 +184,19 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                     &name,
                     &mut video_codec,
                     &mut audio_codec,
+                    &mut subtitle_codec,
+                    &mut audio_sample_format,
+                    &mut warnings,
+                );
+            }
+            "scodec" => {
+                let name = take_value(args, &mut i, arg)?;
+                apply_codec(
+                    Some("s"),
+                    &name,
+                    &mut video_codec,
+                    &mut audio_codec,
+                    &mut subtitle_codec,
                     &mut audio_sample_format,
                     &mut warnings,
                 );
@@ -439,6 +455,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             options: audio_opts,
             sample_format: audio_sample_format,
         }),
+        subtitle_codec,
         video_filters,
         filter_complex,
         max_video_frames,
@@ -528,11 +545,13 @@ fn parse_rate(value: &str) -> Result<(u32, u32), String> {
 
 /// Resolve a codec name to an id (treating `copy` as "no re-encode" → `None`)
 /// and assign it to the slot selected by the stream specifier.
+#[allow(clippy::too_many_arguments)]
 fn apply_codec(
     spec: Option<&str>,
     name: &str,
     video: &mut Option<CodecId>,
     audio: &mut Option<CodecId>,
+    subtitle: &mut Option<CodecId>,
     audio_format: &mut Option<rff_core::SampleFormat>,
     warnings: &mut Vec<String>,
 ) {
@@ -554,7 +573,10 @@ fn apply_codec(
                 *audio_format = pinned;
             }
         }
-        Some(s) if s.starts_with('s') => { /* subtitle codecs: not yet modeled */ }
+        Some(s) if s.starts_with('s') => match id.media_type() {
+            rff_core::MediaType::Subtitle => *subtitle = Some(id),
+            _ => warnings.push(format!("-c:s: `{name}` is not a subtitle codec (ignored)")),
+        },
         // No specifier: apply to whichever media type this codec is.
         None => match id.media_type() {
             rff_core::MediaType::Video => *video = Some(id),
@@ -564,6 +586,7 @@ fn apply_codec(
                     *audio_format = pinned;
                 }
             }
+            rff_core::MediaType::Subtitle => *subtitle = Some(id),
             _ => {}
         },
         _ => {}

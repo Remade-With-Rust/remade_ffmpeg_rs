@@ -174,6 +174,9 @@ struct MkvDemuxer {
     /// Indexed by stream index; `Some` for H.264 tracks whose CodecPrivate is
     /// an `avcC` — their blocks are AVCC and get normalised to Annex-B.
     avc: Vec<Option<AvcConfig>>,
+    /// Indexed by stream index; ASS/SSA subtitle tracks, whose block payloads
+    /// carry `ReadOrder,Layer,Style,…,Text` and get reduced to plain text.
+    ass: Vec<bool>,
     timestamp_scale: u64,
     /// Segment duration in `timestamp_scale` ticks (same unit as `time_base`).
     duration_ticks: Option<i64>,
@@ -188,6 +191,7 @@ impl MkvDemuxer {
             streams: Vec::new(),
             track_map: Vec::new(),
             avc: Vec::new(),
+            ass: Vec::new(),
             timestamp_scale: 1_000_000, // default: 1 ms
             duration_ticks: None,
             packets: VecDeque::new(),
@@ -343,6 +347,8 @@ impl MkvDemuxer {
         }
 
         let codec_id = map_codec(&codec);
+        let is_ass = matches!(codec.as_str(), "S_TEXT/ASS" | "S_TEXT/SSA");
+        self.ass.push(is_ass);
         let index = self.streams.len();
         let mut s = Stream::new(index, codec_id);
         s.media_type = match track_type {
@@ -460,6 +466,11 @@ impl MkvDemuxer {
                 }
                 avcc_to_annexb(raw, cfg.nal_len, &mut out);
                 out
+            }
+            // ASS blocks: `ReadOrder,Layer,Style,Name,ML,MR,MV,Effect,Text` —
+            // reduce to the plain text our subtitle contract carries.
+            None if self.ass.get(index).copied().unwrap_or(false) => {
+                rff_subtitle::ass_dialogue_text(&String::from_utf8_lossy(raw), 8).into_bytes()
             }
             None => raw.to_vec(),
         };
@@ -717,7 +728,9 @@ fn map_codec(codec: &str) -> CodecId {
         "A_FLAC" => CodecId::Flac,
         "A_MPEG/L3" => CodecId::Mp3,
         "A_PCM/INT/LIT" | "A_PCM/FLOAT/IEEE" => CodecId::Pcm,
-        "S_TEXT/UTF8" => CodecId::Subrip,
+        // ASS/SSA tracks are reduced to plain text at block level, so they
+        // surface as SubRip-contract cues.
+        "S_TEXT/UTF8" | "S_TEXT/ASS" | "S_TEXT/SSA" => CodecId::Subrip,
         "S_TEXT/WEBVTT" => CodecId::WebVtt,
         _ => CodecId::None,
     }

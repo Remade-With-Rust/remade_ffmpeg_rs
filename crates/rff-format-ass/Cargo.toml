@@ -1,6 +1,6 @@
 [package]
-name = "rff-format-mkv"
-description = "Remade FFmpeg (Rust): Matroska / WebM demuxer (EBML)."
+name = "rff-format-ass"
+description = "Remade FFmpeg (Rust): ASS/SSA (.ass) subtitle container (demux)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ rust-version.workspace = true
 authors.workspace = true
 homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 readme = "README.md"
-keywords = ["matroska", "mkv", "webm", "container", "demuxer"]
+keywords = ["ass", "ssa", "subtitle", "container", "captions"]
 categories = ["multimedia", "parser-implementations"]
 
 [dependencies]
