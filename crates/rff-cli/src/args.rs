@@ -103,7 +103,8 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     while i < args.len() {
         let arg = &args[i];
 
-        let Some(opt) = arg.strip_prefix('-') else {
+        // A bare `-` is stdout (FFmpeg's pipe spelling), not an option.
+        let Some(opt) = arg.strip_prefix('-').filter(|_| arg != "-") else {
             // A bare token is a positional argument: the output file.
             if output_path.is_some() {
                 warnings.push(format!(

@@ -21,14 +21,14 @@ licensed (CI-enforced by `cargo-deny`).
 |-------|:------:|:------:|----------------|--------------|
 | VP9 | ✅ | ✅ | in-house | decode **bit-exact** (315/315 libvpx vectors); encode **pixel-exact vs libvpx & ffmpeg** (RDO, golden/ALT-REF, two-pass) |
 | MP3 (MPEG-1/2 Layer III) | ✅ | ✅ | in-house | decode **bit-exact** vs FFmpeg; encode (CBR/VBR, joint stereo, block switching) |
-| AAC&#8209;LC | ✅ | — | in-house | validated · ⚖ |
+| AAC&#8209;LC | ✅ | ✅ | in-house (`rusty_aac`) | validated (ffmpeg decodes our `.m4a` at unity) · ⚖ |
 | PCM | ✅ | ✅ | in-house | validated |
-| AV1 / AVIF | ✅ | ✅ | rav1d / rav1e (pure Rust) | validated · **decode robustness:** rav1d's input validation `abort()`s on malformed AV1 under `debug_assertions` (debug builds); **release returns `Err`** (verified). We pre-validate the sample at our boundary, but sandbox the AVIF path if you decode untrusted input in debug/CI. |
-| AV2 | 🚧 | — | in-house | **in development** (decoder nearly complete) |
+| AV1 / AVIF | ✅ | ✅ (still-picture) | rav1d / rav1e forks (pure Rust) | validated · video-mode AV1 *encode* wiring is a known gap (the encoder exists; the adapter is still-image-only) · **decode robustness:** rav1d's input validation `abort()`s on malformed AV1 under `debug_assertions` (debug builds); **release returns `Err`** (verified). We pre-validate the sample at our boundary, but sandbox the AVIF path if you decode untrusted input in debug/CI. |
+| AV2 | ✅ | — | in-house (`rusty_av2d`) | basic (decode registered; encoder in the workshop) |
 | H.264 / AVC | ✅ | ✅ | rusty_h264 (pure Rust; opt-in SIMD asm) | validated · ⚖ |
-| Opus | ✅ | ✅ | opus-rs (pure Rust) | validated |
-| Vorbis | ✅ | — | lewton (pure Rust) | validated |
-| FLAC | ✅ | — | claxon (pure Rust) | validated |
+| Opus | ✅ | ✅ | rusty-opus (pure Rust) | validated (12/12 official decoder conformance) |
+| Vorbis | ✅ | ✅ | decode: lewton · encode: in-house `rusty_vorbis` | validated |
+| FLAC | ✅ | ✅ | decode: claxon · encode: in-house | validated (parity with ffmpeg `-compression_level 8` within 0.03%) |
 | PNG | ✅ | ✅ | png (pure Rust) | validated |
 | JPEG | ✅ | ✅ | in-house `rusty_jpeg` (pure Rust; vendored merge of jpeg-decoder + jpeg-encoder) | validated |
 | GIF | ✅ | ✅ | gif (pure Rust) | validated |
@@ -43,29 +43,62 @@ licensed (CI-enforced by `cargo-deny`).
 
 ## Containers / formats
 
-Demux **and** mux: `avi`, `mp4`, `mkv`, `mpegts`, `flv`, `ogg`, `wav`, `flac`,
-`avif`, `png`, `jpeg`, `gif`, `webp`, `jxl`, `srt` (SubRip), `webvtt`.
+Demux **and** mux: `avi`, `mp4`/`mov`/`m4a`, **`matroska` (mkv/mka)**,
+**`webm`** (restricted doctype, codec-checked), `mpegts`, `flv`, `ogg`, `wav`,
+`flac`, `mp3`, `y4m`, `ivf`, `avif`, `png`, `jpeg`, `gif`, `webp`, `jxl`,
+`srt` (SubRip), `webvtt`, **HLS** (`.m3u8` + TS segments: mux via the
+registry's path-muxer, demux by expanding the playlist — local or HTTP(S),
+master or media — into one TS stream).
 
-Output only: **HLS** (`.m3u8` playlist + MPEG-TS segments).
+Demux only: `ass`/`ssa` (Advanced SubStation Alpha, reduced to text cues).
+
+Mux only: **DASH** (`.mpd` static manifest + fMP4 init/media segments,
+`-seg_duration`).
+
+Subtitles ride a single text-cue packet contract, so `srt ↔ vtt ↔ ass-in` ↔
+Matroska (`S_TEXT/UTF8`, `S_TEXT/ASS` read-side) conversions are stream
+copies; `-c:s subrip|webvtt` relabels for the target container.
 
 ## Filters
 
 `-vf`: `scale`, `crop`, `hflip`, `vflip`, `transpose`, `pad`, `format`,
-`negate`, `grayscale`.
+`setrange`, `negate`, `grayscale`, `fps` (CFR duplicate/drop — same engine
+stage as `-r`).
+`-af`: `volume` (linear or dB), `atrim` (sample-accurate), `aresample`,
+`anull`.
 `-filter_complex`: `overlay` (multi-input compositing).
+
+Editing options with engine support: `-ss` / `-t` / `-to` (frame-accurate on
+transcode, keyframe-cut on `-c copy`, sample-accurate for audio), `-r`, `-s`,
+`-ar`, `-ac` (mono↔stereo), `-frames:v`, `-metadata` (Matroska `Title`).
 
 ## Streaming I/O
 
 | Capability | Status |
 |------------|--------|
 | HTTP input | ✅ dependency-free pure-std client |
-| HTTPS input | ✅ **opt-in** `--features https` (rustls + RustCrypto provider, pure Rust) |
-| HLS output | ✅ TS segmenter + playlist |
+| HTTPS input | ✅ **on by default** (rustls + RustCrypto provider, pure Rust; `--no-default-features` for a TLS-free build) |
+| Pipes | ✅ `-` / `pipe:` stdin and stdout, both directions |
+| UDP | ✅ `udp://` input (idle-timeout → EOF) and output (1316-byte TS datagrams) |
+| RTMP publish | ✅ `rtmp://host/app/key` output (FLV over the chunk protocol: handshake, AMF0 connect/createStream/publish) |
+| HLS output | ✅ TS segmenter + VOD playlist, `-hls_time` |
+| HLS input | ✅ `.m3u8` (master or media), local or HTTP(S) |
+| DASH output | ✅ static MPD + fMP4 segments, `-seg_duration` |
 
 ## Rate control
 
 `-b` (bitrate), `-crf`, `-qp`, `-preset` are plumbed to the encoders via
 `Encoder::configure` (applied today by the AVIF/rav1e encoder).
+
+## Hardware acceleration — a decision, not an omission
+
+There is **no hwaccel seam** (`-hwaccel`, VAAPI/NVENC/QSV/D3D11) and none is
+planned for launch. Every hardware path is a vendor C/C++ driver stack behind
+FFI, which breaks the project's 100%-Rust, memory-safe contract; the
+performance story here is CPU SIMD (hand-written AVX2/NEON kernels and
+`rusty_h264`'s NASM kernels) plus the codec-campaign work that keeps the
+pure-Rust encoders competitive. If a memory-safe GPU story emerges (e.g.
+wgpu-compute filters), it will be revisited as its own design.
 
 ## Planned / not yet implemented
 
@@ -74,12 +107,14 @@ near-term items and their current state:
 
 | Feature | Status |
 |---------|--------|
+| AV1 *video* encode wiring (multi-frame; the rav1e fork is ready) | **next up** — adapter is still-picture-only today |
+| HEVC/H.265 | **not implemented** (decode or encode) — licensing posture undecided |
 | `filter_complex` `concat` and arbitrary graphs | **planned** (only `overlay` today) |
-| DASH (`.mpd`) output | **planned** |
 | Two-pass rate control (execution) | `-pass` is **parsed but runs single-pass** (warns) |
-| `-hls_time` / `-hls_list_size` / live playlists | **planned** (segment length fixed ~4 s; VOD only) |
-| HTTPS in the default build | **intentional opt-in** — the pure-Rust TLS provider is pre-1.0 / unaudited |
-| `ffplay`, `libavdevice`, `libpostproc` | **out of scope** for launch |
+| HLS live/event playlists, fMP4 (`EXT-X-MAP`) input | **planned** (HLS is VOD + TS today; `-hls_list_size` warns) |
+| RTSP, MPEG-PS/ASF demux | **planned** (RTMP publish shipped; RTSP needs the RTP stack) |
+| Capture devices (`libavdevice`), `ffplay`, `libpostproc` | **out of scope** for launch |
+| Subtitle burn-in / `drawtext` | **planned** (needs a pure-Rust rasterizer; text subtitle *conversion* ships today) |
 
 ## Patents
 
@@ -109,10 +144,11 @@ not specific to this implementation.
   are administered by the Via LA (formerly MPEG LA) AVC pool. Some have expired;
   the pool is generally still treated as active. Encoding is typically
   higher-exposure than decoding.
-- **AAC** — we implement **AAC-LC decode only** (in-house). AAC-LC's core
-  patents are of the same ~1997–1999 vintage as MP3 and are largely expired; the
-  newer **HE-AAC** extensions (SBR/PS) are *not* implemented here. Decode-only of
-  the oldest profile is the lower-exposure corner of AAC.
+- **AAC** — we implement **AAC-LC** (in-house, decode *and* encode). AAC-LC's
+  core patents are of the same ~1997–1999 vintage as MP3 and are largely
+  expired; the newer **HE-AAC** extensions (SBR/PS) are *not* implemented here.
+  The oldest profile is the lower-exposure corner of AAC, but encode is
+  typically higher-exposure than decode — same posture question as H.264.
 
 **Project posture: ship and document (the FFmpeg model).** H.264 and AAC ship
 in the default build. The project grants **no patent license, express or
