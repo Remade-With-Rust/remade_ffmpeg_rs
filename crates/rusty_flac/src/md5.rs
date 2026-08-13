@@ -115,7 +115,16 @@ impl Md5 {
         }
         macro_rules! round2 {
             ($a:ident, $b:ident, $c:ident, $d:ident, $i:expr, $s:expr) => {
-                step!(($d & $b) | (!$d & $c), $a, $b, $c, $d, $i, (5 * $i + 1) % 16, $s);
+                step!(
+                    ($d & $b) | (!$d & $c),
+                    $a,
+                    $b,
+                    $c,
+                    $d,
+                    $i,
+                    (5 * $i + 1) % 16,
+                    $s
+                );
             };
         }
         macro_rules! round3 {

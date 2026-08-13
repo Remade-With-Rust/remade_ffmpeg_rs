@@ -1,4 +1,4 @@
-﻿//! In-house **FLAC encoder** — lossless, pure Rust, no FFI.
+//! In-house **FLAC encoder** — lossless, pure Rust, no FFI.
 //!
 //! Ported from `rff-codec-flac` (built brick by brick; see that crate's
 //! `docs/codec-flac-encoder.md` history). The port keeps the *decisions*
@@ -12,7 +12,7 @@
 //! stream from [`Encoder::finish`] — framing, STREAMINFO and MD5 included.
 
 use crate::bitio::BitWriter;
-use crate::crc::{crc8, crc16};
+use crate::crc::{crc16, crc8};
 
 /// Nominal samples-per-channel per FLAC frame. 4096 is FLAC's usual default and
 /// encodes as an explicit 16-bit block size (frame-header block-size code 7).
@@ -55,7 +55,9 @@ impl std::fmt::Display for EncodeError {
             EncodeError::NoChannels => write!(f, "flac: zero channels"),
             EncodeError::UnsupportedBps(b) => write!(f, "flac: unsupported bit depth {b}"),
             EncodeError::BadSampleRate(r) => write!(f, "flac: bad sample rate {r}"),
-            EncodeError::RaggedInput => write!(f, "flac: interleaved length not a channel multiple"),
+            EncodeError::RaggedInput => {
+                write!(f, "flac: interleaved length not a channel multiple")
+            }
         }
     }
 }
@@ -410,8 +412,7 @@ impl Encoder {
                 let subs = (0..self.channels)
                     .map(|c| {
                         let arm = ArmInput::prepare(&chans[c][start..start + bs], bps);
-                        let choice =
-                            analyze_subframe(&arm, max_lpc_order, wins, &mut self.stats);
+                        let choice = analyze_subframe(&arm, max_lpc_order, wins, &mut self.stats);
                         let ebps = arm.ebps;
                         (arm.into_samples(), ebps, choice)
                     })
@@ -610,8 +611,8 @@ unsafe fn rice_sums_avx2(res: &[i32]) -> [u64; RICE_KMAX + 1] {
         let top = (32 - or_acc.leading_zeros() as usize).min(RICE_KMAX);
         for &v in res {
             let u = zigzag(v);
-            for k in 16..=top {
-                sums[k] += (u >> k) as u64;
+            for (k, s) in sums.iter_mut().enumerate().take(top + 1).skip(16) {
+                *s += (u >> k) as u64;
             }
         }
     }
@@ -704,7 +705,11 @@ fn plan_partitions(res: &[i32], bs: usize, p: usize) -> ResidualPlan {
         sums.reserve(finest_parts);
         let mut idx = 0usize;
         for part in 0..finest_parts {
-            let cnt = if part == 0 { finest_size - p } else { finest_size };
+            let cnt = if part == 0 {
+                finest_size - p
+            } else {
+                finest_size
+            };
             sums.push(rice_sums(&res[idx..idx + cnt]));
             idx += cnt;
         }
@@ -1342,8 +1347,8 @@ unsafe fn fixed_sums_avx2(samples: &[i32]) -> [u64; 5] {
     let mut sums = [hsum(a0), hsum(a1), hsum(a2), hsum(a3), hsum(a4)];
 
     // Head (order-0 covers 0..4 + ramp-in of orders 1..3) and tail, scalar.
-    for j in 0..4.min(n) {
-        sums[0] += (samples[j] as i64).unsigned_abs();
+    for &v in &samples[..4.min(n)] {
+        sums[0] += (v as i64).unsigned_abs();
     }
     for j in 1..n.min(4) {
         let s = |k: usize| samples[j - k] as i64;
@@ -1378,7 +1383,12 @@ fn rice_bits_estimate(abs_sum: u64, cnt: u64) -> u64 {
     }
     let usum = abs_sum.saturating_mul(2); // zigzag(v) ∈ {2|v|, 2|v|−1}
     let mean = usum / cnt;
-    let k = if mean > 0 { 63 - mean.leading_zeros() } else { 0 }.min(RICE_KMAX as u32);
+    let k = if mean > 0 {
+        63 - mean.leading_zeros()
+    } else {
+        0
+    }
+    .min(RICE_KMAX as u32);
     // Check k−1, k, k+1 — the mean-derived parameter is within one of optimal.
     let mut best = u64::MAX;
     for kk in k.saturating_sub(1)..=(k + 1).min(RICE_KMAX as u32) {
@@ -1403,16 +1413,12 @@ fn fixed_residual(samples: &[i32], order: usize) -> Vec<i32> {
         }
         2 => {
             for i in 2..n {
-                res.push(
-                    samples[i] - 2 * samples[i - 1] + samples[i - 2],
-                );
+                res.push(samples[i] - 2 * samples[i - 1] + samples[i - 2]);
             }
         }
         3 => {
             for i in 3..n {
-                res.push(
-                    samples[i] - 3 * samples[i - 1] + 3 * samples[i - 2] - samples[i - 3],
-                );
+                res.push(samples[i] - 3 * samples[i - 1] + 3 * samples[i - 2] - samples[i - 3]);
             }
         }
         4 => {
@@ -1784,8 +1790,13 @@ fn decide_stereo(
         }
         for &arm in &mode_arms[m] {
             if choices[arm].is_none() {
-                choices[arm] =
-                    Some(realize_arm(&arms[arm], &ests[arm], max_lpc_order, wins, stats));
+                choices[arm] = Some(realize_arm(
+                    &arms[arm],
+                    &ests[arm],
+                    max_lpc_order,
+                    wins,
+                    stats,
+                ));
             }
         }
     }
@@ -1868,7 +1879,11 @@ mod tests {
         assert_eq!(chans[0], l);
         assert_eq!(chans[1], r);
         // It must actually compress (sine + constant).
-        assert!(stream.len() < 10_000 * 4 / 2, "no compression: {}", stream.len());
+        assert!(
+            stream.len() < 10_000 * 4 / 2,
+            "no compression: {}",
+            stream.len()
+        );
     }
 
     #[test]
@@ -1890,7 +1905,9 @@ mod tests {
         let mut x = 0i64;
         let s: Vec<i32> = (0..n)
             .map(|i| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let noise = ((x >> 33) & 0xFF) as i32 - 128;
                 ((i as f64 * 0.03).sin() * 12000.0) as i32 + noise
             })
@@ -1918,7 +1935,10 @@ mod tests {
         let (_, stats) = enc.finish_with_stats();
         assert!(stats.frames > 0);
         assert!(stats.sub_constant > 0, "constant channel not detected");
-        assert!(stats.sub_lpc + stats.sub_fixed > 0, "no predictive subframes");
+        assert!(
+            stats.sub_lpc + stats.sub_fixed > 0,
+            "no predictive subframes"
+        );
     }
 
     /// The AVX2 autocorrelation must match the scalar twin bit-for-bit

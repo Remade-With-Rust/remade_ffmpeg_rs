@@ -15,12 +15,9 @@ pub struct BitWriter {
 }
 
 impl BitWriter {
+    #[cfg(test)]
     pub fn new() -> Self {
-        BitWriter {
-            buf: Vec::new(),
-            acc: 0,
-            nbits: 0,
-        }
+        Self::with_capacity(0)
     }
 
     pub fn with_capacity(bytes: usize) -> Self {
@@ -35,7 +32,11 @@ impl BitWriter {
     #[inline]
     pub fn write_bits(&mut self, val: u64, n: u32) {
         debug_assert!(n <= 56);
-        let masked = if n >= 64 { val } else { val & ((1u64 << n) - 1) };
+        let masked = if n >= 64 {
+            val
+        } else {
+            val & ((1u64 << n) - 1)
+        };
         self.acc = (self.acc << n) | masked;
         self.nbits += n;
         while self.nbits >= 8 {

@@ -191,9 +191,9 @@ impl<'a> Decoder<'a> {
         }
 
         // --- subframes ---
-        for c in 0..nch {
-            let sub_bps = bps + if c < 2 && side_ch[c] { 1 } else { 0 };
-            let buf = &mut self.scratch[c];
+        for (c, buf) in self.scratch.iter_mut().take(nch).enumerate() {
+            let is_side = c < 2 && side_ch[c];
+            let sub_bps = bps + u32::from(is_side);
             // Size without re-zeroing what will be overwritten: shrink is
             // O(1), and growth only zero-fills the newly exposed tail once
             // per size change (block sizes are constant within a stream).
@@ -285,7 +285,7 @@ fn read_utf8(br: &mut BitReader) -> Option<u64> {
     if lead & 0x80 == 0 {
         return Some(lead as u64);
     }
-    let nconts = (lead as u8).leading_ones() as u32 - 1;
+    let nconts = (lead as u8).leading_ones() - 1;
     if nconts == 0 || nconts > 6 {
         return None;
     }
@@ -527,7 +527,9 @@ mod tests {
         let mut x = 7u64;
         let l: Vec<i32> = (0..n)
             .map(|i| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((i as f64 * 0.11).sin() * 9000.0) as i32 + ((x >> 40) & 0x3F) as i32 - 32
             })
             .collect();

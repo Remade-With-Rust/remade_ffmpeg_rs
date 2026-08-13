@@ -42,7 +42,9 @@ fn content(class: &str, n: usize, bps: u32, seed: u64) -> Vec<i32> {
             })
             .collect(),
         "noise" => (0..n).map(|_| rng.i32_in(bps)).collect(),
-        "quiet-noise" => (0..n).map(|_| rng.i32_in(bps.saturating_sub(9).max(2))).collect(),
+        "quiet-noise" => (0..n)
+            .map(|_| rng.i32_in(bps.saturating_sub(9).max(2)))
+            .collect(),
         "transients" => (0..n)
             .map(|i| {
                 let base = ((i as f64 * 0.01).sin() * full * 0.05) as i32;
@@ -139,7 +141,9 @@ fn content_type_matrix_roundtrips_everywhere() {
 #[test]
 fn awkward_lengths_roundtrip() {
     for &n in &[1usize, 2, 5, 4095, 4096, 4097, 8193] {
-        let s: Vec<i32> = (0..n).map(|i| ((i as f64 * 0.21).sin() * 7000.0) as i32).collect();
+        let s: Vec<i32> = (0..n)
+            .map(|i| ((i as f64 * 0.21).sin() * 7000.0) as i32)
+            .collect();
         let mut enc = rusty_flac::Encoder::new(32000, 1, 16).unwrap();
         enc.push_planar(&[&s]).unwrap();
         let stream = enc.finish();
@@ -154,7 +158,9 @@ fn awkward_lengths_roundtrip() {
 #[test]
 fn sample_rates_roundtrip() {
     for &rate in &[8_000u32, 22_050, 44_100, 48_000, 96_000, 192_000] {
-        let s: Vec<i32> = (0..5000).map(|i| ((i as f64 * 0.1).sin() * 5000.0) as i32).collect();
+        let s: Vec<i32> = (0..5000)
+            .map(|i| ((i as f64 * 0.1).sin() * 5000.0) as i32)
+            .collect();
         let mut enc = rusty_flac::Encoder::new(rate, 1, 16).unwrap();
         enc.push_planar(&[&s]).unwrap();
         let stream = enc.finish();

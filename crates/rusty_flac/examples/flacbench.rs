@@ -59,7 +59,12 @@ fn main() {
     };
 
     let (stream, stats) = encode_once(true);
-    println!("output: {} bytes ({} samples x {} ch)", stream.len(), n / channels as usize, channels);
+    println!(
+        "output: {} bytes ({} samples x {} ch)",
+        stream.len(),
+        n / channels as usize,
+        channels
+    );
     println!("stats: {:#?}", stats.unwrap());
 
     if do_decode {
