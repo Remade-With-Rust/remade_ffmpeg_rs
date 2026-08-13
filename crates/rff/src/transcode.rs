@@ -126,6 +126,24 @@ pub struct OutputSpec {
     /// it is encoding a 50-frame prefix silently encodes the whole clip, and any
     /// rate-vs-quality pairing computed against a prefix is then wrong.
     pub max_video_frames: Option<u64>,
+    /// Output trim window start, in seconds (`-ss`). Decoded frames (or copied
+    /// packets) before this point are dropped; timestamps are shifted so the
+    /// output starts at zero.
+    pub trim_start: Option<f64>,
+    /// Output trim window end, in seconds (`-to`, or `-ss` + `-t`). Exclusive.
+    pub trim_end: Option<f64>,
+    /// Constant output frame rate (`-r`), as `(num, den)` — e.g. `(30000, 1001)`.
+    /// Frames are duplicated/dropped to hit it (FFmpeg's `fps` filter).
+    pub frame_rate: Option<(u32, u32)>,
+    /// Target audio sample rate (`-ar`). The encoder's accepted-rate list still
+    /// wins if it cannot take this exact rate (nearest accepted is used).
+    pub audio_rate: Option<u32>,
+    /// Target audio channel count (`-ac`): 1↔2 downmix/upmix.
+    pub audio_channels: Option<u16>,
+    /// Audio filter chain (`-af` / `-filter:a`), e.g. `volume=-6dB,atrim=...`.
+    pub audio_filters: Option<String>,
+    /// Output metadata (`-metadata title=...`), handed to muxers that carry it.
+    pub metadata: Dictionary,
 }
 
 /// A complete, declarative transcoding job.
@@ -143,37 +161,175 @@ pub struct TranscodeReport {
     pub frames_decoded: u64,
 }
 
+/// Output trim window (`-ss` / `-t` / `-to`), in seconds.
+#[derive(Clone, Copy)]
+struct Trim {
+    start: f64,
+    end: Option<f64>,
+}
+
+impl Trim {
+    fn from_spec(o: &OutputSpec) -> Option<Trim> {
+        if o.trim_start.is_none() && o.trim_end.is_none() {
+            return None;
+        }
+        Some(Trim {
+            start: o.trim_start.unwrap_or(0.0).max(0.0),
+            end: o.trim_end,
+        })
+    }
+
+    fn keeps(&self, t: f64) -> bool {
+        t >= self.start - 1e-9 && self.end.map_or(true, |e| t < e - 1e-9)
+    }
+}
+
+/// CFR conversion state (`-r`): input frames are snapped onto a fixed
+/// `num/den` fps grid, duplicating the previous frame across gaps and dropping
+/// frames that land on an already-filled slot. Emitted frames carry their slot
+/// index as pts (time base `den/num`).
+struct FpsConv {
+    num: u32,
+    den: u32,
+    next_slot: i64,
+    last: Option<VideoFrame>,
+}
+
+impl FpsConv {
+    fn new(num: u32, den: u32) -> FpsConv {
+        FpsConv {
+            num: num.max(1),
+            den: den.max(1),
+            next_slot: 0,
+            last: None,
+        }
+    }
+
+    fn slot_time(&self, slot: i64) -> f64 {
+        slot as f64 * self.den as f64 / self.num as f64
+    }
+
+    /// Feed one input frame at time `t` (seconds); returns the frames due
+    /// strictly before `t`, each stamped with its slot pts.
+    fn push(&mut self, frame: VideoFrame, t: f64) -> Vec<VideoFrame> {
+        let mut out = Vec::new();
+        while let Some(last) = &self.last {
+            if self.slot_time(self.next_slot) < t - 1e-9 {
+                let mut f = last.clone();
+                f.pts = Some(self.next_slot);
+                out.push(f);
+                self.next_slot += 1;
+            } else {
+                break;
+            }
+        }
+        self.last = Some(frame);
+        out
+    }
+
+    /// End of stream: emit the held frame in its slot.
+    fn finish(&mut self) -> Option<VideoFrame> {
+        self.last.take().map(|mut f| {
+            f.pts = Some(self.next_slot);
+            self.next_slot += 1;
+            f
+        })
+    }
+}
+
 /// What to do with one input stream on its way to the output.
 enum StreamOp {
-    /// Media type we don't handle (e.g. subtitles): drop its packets.
+    /// Not selected (or a media type we can't route): drop its packets.
     Skip,
-    /// Remux packets unchanged into output stream `out_index`.
-    Copy { out_index: usize },
-    /// Decode, run the video filter graph, then re-encode into `out_index`.
-    Transcode {
-        decoder: Box<dyn Decoder>,
-        encoder: Box<dyn Encoder>,
-        filters: FilterChain,
-        /// `-filter_complex` overlay: a pre-decoded frame composited onto each
-        /// of this stream's frames at `(x, y)` (after `filters`). Video only.
-        overlay: Option<(VideoFrame, u32, u32)>,
-        /// Sample rate the encoder needs (0 = no audio resampling required).
-        target_rate: u32,
-        /// Sample format the output pins (`-c:a pcm_s16le`), if any.
-        target_sample_format: Option<SampleFormat>,
-        /// Lazily built once the first audio frame reveals the input rate.
-        resampler: Option<Resampler>,
-        /// Pixel formats the encoder accepts (`None` = anything).
-        accepted_formats: Option<Vec<PixelFormat>>,
-        /// Lazily built conversion into an accepted format.
-        pixel_converter: Option<FilterChain>,
-        /// Range of the frames reaching the encoder, for that conversion.
-        source_range: ColorRange,
-        out_index: usize,
-        /// `-frames:v` limit for this output, and how many we have sent.
-        max_video_frames: Option<u64>,
-        video_frames_sent: u64,
-    },
+    /// Remux packets unchanged into the output.
+    Copy(CopyOp),
+    /// Decode, filter, re-encode.
+    Transcode(Box<TranscodeOp>),
+}
+
+/// Stream-copy: forward packets, applying the trim window at packet level.
+/// Video cuts on the first keyframe inside the window (a copy can't split a
+/// GOP); timestamps shift so the output starts at zero.
+struct CopyOp {
+    out_index: usize,
+    is_video: bool,
+    /// Trim window in stream ticks (`None` = no trimming).
+    start_ticks: i64,
+    end_ticks: Option<i64>,
+    trimming: bool,
+    /// Video: set once the first in-window keyframe has passed.
+    started: bool,
+}
+
+impl CopyOp {
+    /// Apply trim/shift; `None` = drop the packet.
+    fn process(&mut self, mut packet: Packet) -> Option<Packet> {
+        if self.trimming {
+            let ts = packet.pts.or(packet.dts).unwrap_or(0);
+            if ts < self.start_ticks {
+                return None;
+            }
+            if let Some(end) = self.end_ticks {
+                if ts >= end {
+                    return None;
+                }
+            }
+            if self.is_video && !self.started {
+                if !packet.flags.keyframe {
+                    return None; // wait for a clean random-access point
+                }
+                self.started = true;
+            }
+            packet.pts = packet.pts.map(|p| p - self.start_ticks);
+            packet.dts = packet.dts.map(|d| d - self.start_ticks);
+        }
+        packet.stream_index = self.out_index;
+        Some(packet)
+    }
+}
+
+/// Decode → trim → fps → filters/overlay → audio conform → encode → mux.
+struct TranscodeOp {
+    decoder: Box<dyn Decoder>,
+    encoder: Box<dyn Encoder>,
+    filters: FilterChain,
+    /// `-filter_complex` overlay: a pre-decoded frame composited onto each
+    /// of this stream's frames at `(x, y)` (after `filters`). Video only.
+    overlay: Option<(VideoFrame, u32, u32)>,
+    /// The input stream's time base (frame pts are in these ticks).
+    in_time_base: rff_core::Rational,
+    is_video: bool,
+    /// Output trim window; pts are shifted by `shift_ticks` after it.
+    trim: Option<Trim>,
+    shift_ticks: i64,
+    /// Fallback clock for trimming audio whose frames carry no pts.
+    audio_clock_samples: u64,
+    /// `-r`: CFR duplicate/drop stage.
+    fps: Option<FpsConv>,
+    /// `-af`: the audio filter chain (volume/atrim/...).
+    audio_chain: rff_filter::AudioFilterChain,
+    /// `-ac`: mix to this many channels before everything else (0 = keep).
+    target_channels: u16,
+    /// Sample rate the encoder needs (0 = no audio resampling required).
+    target_rate: u32,
+    /// Sample format the output pins (`-c:a pcm_s16le`), if any.
+    target_sample_format: Option<SampleFormat>,
+    /// Lazily built once the first audio frame reveals the input rate.
+    resampler: Option<Resampler>,
+    /// Pixel formats the encoder accepts (`None` = anything).
+    accepted_formats: Option<Vec<PixelFormat>>,
+    /// Lazily built conversion into an accepted format.
+    pixel_converter: Option<FilterChain>,
+    /// Range of the frames reaching the encoder, for that conversion.
+    source_range: ColorRange,
+    out_index: usize,
+    /// `-frames:v` limit for this output, and how many we have sent.
+    max_video_frames: Option<u64>,
+    video_frames_sent: u64,
+    /// pts of video frames handed to the encoder, FIFO. Video encoders that
+    /// don't timestamp their packets (VP9, H.264) get these stamped on in
+    /// [`TranscodeOp::drain`] — without it every Matroska block lands at t=0.
+    pending_pts: std::collections::VecDeque<Option<i64>>,
 }
 
 /// Composite the `-filter_complex` overlay onto a video frame, if one is set.
@@ -356,6 +512,218 @@ fn conform_video(
     Ok(Frame::Video(chain.apply(vf)?))
 }
 
+/// Mix an audio frame to `target` channels (0 = keep). Stereo↔mono only: a
+/// downmix averages pairs, an upmix duplicates the channel.
+fn conform_channels(target: u16, frame: Frame) -> Result<Frame> {
+    if target == 0 {
+        return Ok(frame);
+    }
+    let Frame::Audio(af) = frame else {
+        return Ok(frame);
+    };
+    if af.channels == target {
+        return Ok(Frame::Audio(af));
+    }
+    let samples = audio_to_f32(&af)?;
+    let mixed: Vec<f32> = match (af.channels, target) {
+        (2, 1) => samples.chunks_exact(2).map(|p| 0.5 * (p[0] + p[1])).collect(),
+        (1, 2) => samples.iter().flat_map(|s| [*s, *s]).collect(),
+        (from, to) => {
+            return Err(Error::unsupported(format!(
+                "-ac: only 1<->2 channel mixing supported (input {from} ch, requested {to})"
+            )))
+        }
+    };
+    Ok(f32_frame(mixed, af.sample_rate, target, af.pts))
+}
+
+impl TranscodeOp {
+    /// A frame's start time in seconds (input timeline). Audio without pts
+    /// falls back to a running sample clock; video without pts cannot be
+    /// placed and errors — only called when trim/fps actually need the time.
+    fn frame_time(&self, frame: &Frame) -> Result<f64> {
+        let tb = self.in_time_base;
+        let tick = if tb.num > 0 && tb.den > 0 {
+            tb.num as f64 / tb.den as f64
+        } else {
+            0.001
+        };
+        match frame.pts() {
+            Some(p) => Ok(p as f64 * tick),
+            None => match frame {
+                Frame::Audio(af) => {
+                    Ok(self.audio_clock_samples as f64 / af.sample_rate.max(1) as f64)
+                }
+                Frame::Video(_) => Err(Error::unsupported(
+                    "-ss/-t/-to/-r need timestamps and this video stream has none",
+                )),
+            },
+        }
+    }
+
+    /// Decoded-frame entry point: trim window, timestamp shift, CFR stage,
+    /// then the per-frame pipeline in [`TranscodeOp::emit`].
+    fn handle_frame(
+        &mut self,
+        frame: Frame,
+        muxer: &mut dyn Muxer,
+        report: &mut TranscodeReport,
+    ) -> Result<()> {
+        report.frames_decoded += 1;
+        let needs_time = self.trim.is_some() || (self.is_video && self.fps.is_some());
+        let t = if needs_time {
+            Some(self.frame_time(&frame)?)
+        } else {
+            None
+        };
+        // The sample clock tracks ALL input audio, kept or dropped.
+        if let Frame::Audio(af) = &frame {
+            self.audio_clock_samples += af.samples as u64;
+        }
+        let mut frame = frame;
+        if let (Some(trim), Some(t)) = (self.trim, t) {
+            match frame {
+                // Audio frames can be arbitrarily long (a WAV decodes as one
+                // frame), so the window slices samples instead of keep/drop.
+                Frame::Audio(af) => {
+                    match rff_filter::trim_audio_frame(af, Some(t), Some(trim.start), trim.end)? {
+                        Some(af) => frame = Frame::Audio(af),
+                        None => return Ok(()),
+                    }
+                }
+                Frame::Video(_) => {
+                    if !trim.keeps(t) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        // Shift timestamps so the output timeline starts at zero.
+        if self.shift_ticks != 0 {
+            match &mut frame {
+                Frame::Video(v) => v.pts = v.pts.map(|p| p - self.shift_ticks),
+                Frame::Audio(a) => a.pts = a.pts.map(|p| p - self.shift_ticks),
+            }
+        }
+        match frame {
+            Frame::Video(v) if self.fps.is_some() => {
+                let t_out = t.expect("fps requires time") - self.trim.map_or(0.0, |w| w.start);
+                let mut fps = self.fps.take().expect("checked");
+                let due = fps.push(v, t_out);
+                self.fps = Some(fps);
+                for f in due {
+                    self.emit(Frame::Video(f), muxer, report)?;
+                }
+                Ok(())
+            }
+            other => self.emit(other, muxer, report),
+        }
+    }
+
+    /// Post-fps pipeline: `-frames:v` gate, filters, overlay, audio conforms,
+    /// encode, drain.
+    fn emit(
+        &mut self,
+        frame: Frame,
+        muxer: &mut dyn Muxer,
+        report: &mut TranscodeReport,
+    ) -> Result<()> {
+        if let Some(limit) = self.max_video_frames {
+            if matches!(frame, Frame::Video(_)) {
+                if self.video_frames_sent >= limit {
+                    return Ok(());
+                }
+                self.video_frames_sent += 1;
+            }
+        }
+        let frame = apply_filters(&mut self.filters, frame)?;
+        let frame = apply_overlay(&self.overlay, frame)?;
+        let frame = conform_channels(self.target_channels, frame)?;
+        let frame = match frame {
+            Frame::Audio(af) if !self.audio_chain.is_empty() => {
+                let tb = self.in_time_base;
+                let t = af
+                    .pts
+                    .map(|p| p as f64 * tb.num as f64 / tb.den.max(1) as f64);
+                match self.audio_chain.apply(af, t)? {
+                    Some(af) => Frame::Audio(af),
+                    None => return Ok(()), // atrim consumed the whole frame
+                }
+            }
+            other => other,
+        };
+        let frame = conform_audio(&mut self.resampler, self.target_rate, frame)?;
+        let frame = conform_sample_format(self.target_sample_format, frame)?;
+        let frame = conform_video(
+            &mut self.pixel_converter,
+            &self.accepted_formats,
+            self.source_range,
+            frame,
+        )?;
+        if self.is_video {
+            self.pending_pts.push_back(frame.pts());
+        }
+        self.encoder.send_frame(&frame)?;
+        self.drain(muxer, report)
+    }
+
+    /// Pull every ready packet out of the encoder and mux it. Video encoders
+    /// that don't timestamp their packets (VP9, H.264 emit `pts: None`) get the
+    /// corresponding source frame's pts stamped on, FIFO — without this every
+    /// Matroska block would land at t=0.
+    fn drain(&mut self, muxer: &mut dyn Muxer, report: &mut TranscodeReport) -> Result<()> {
+        loop {
+            match self.encoder.receive_packet() {
+                Ok(mut packet) => {
+                    if self.is_video {
+                        let queued = self.pending_pts.pop_front().flatten();
+                        if packet.pts.is_none() {
+                            packet.pts = queued;
+                        }
+                    }
+                    packet.stream_index = self.out_index;
+                    muxer.write_packet(&packet)?;
+                    report.packets_written += 1;
+                }
+                Err(Error::Again) | Err(Error::Eof) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// End of input: flush the decoder, the CFR stage's held frame, the
+    /// resampler's FIR tail, then the encoder.
+    fn finish(&mut self, muxer: &mut dyn Muxer, report: &mut TranscodeReport) -> Result<()> {
+        self.decoder.flush();
+        loop {
+            match self.decoder.receive_frame() {
+                Ok(frame) => self.handle_frame(frame, muxer, report)?,
+                Err(Error::Again) | Err(Error::Eof) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some(mut fps) = self.fps.take() {
+            let held = fps.finish();
+            self.fps = Some(fps);
+            if let Some(f) = held {
+                self.emit(Frame::Video(f), muxer, report)?;
+            }
+        }
+        if let Some(rs) = &mut self.resampler {
+            let tail = rs.finish();
+            if !tail.is_empty() {
+                let frame = f32_frame(tail, rs.out_rate(), rs.channels(), None);
+                let frame = conform_sample_format(self.target_sample_format, frame)?;
+                self.encoder.send_frame(&frame)?;
+                self.drain(muxer, report)?;
+            }
+        }
+        self.encoder.flush();
+        self.drain(muxer, report)
+    }
+}
+
 /// Nominal seconds per HLS segment before rolling over on a keyframe. (A
 /// `-hls_time` override is a planned follow-up.)
 const HLS_SEGMENT_SECONDS: f64 = 4.0;
@@ -481,7 +849,7 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
             .position(|s| s.media_type == MediaType::Video)
             .ok_or_else(|| Error::Option("filter_complex overlay: input #0 has no video".into()))?;
         match &mut per_input_ops[0][vidx] {
-            StreamOp::Transcode { overlay, .. } => *overlay = Some((over, x, y)),
+            StreamOp::Transcode(op) => op.overlay = Some((over, x, y)),
             _ => {
                 return Err(Error::unsupported(
                     "filter_complex overlay needs input #0's video re-encoded — pass -c:v",
@@ -525,6 +893,9 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
             engine.formats.open_muxer(&f, Box::new(out_file))?
         }
     };
+    if !output.metadata.is_empty() {
+        muxer.set_metadata(&output.metadata);
+    }
     muxer.write_header(&out_streams)?;
 
     let mut report = TranscodeReport::default();
@@ -623,20 +994,61 @@ fn build_op(
                 filters.set_source_color_range(source_range);
             }
             let (out_w, out_h) = filters.output_dims(stream.width, stream.height);
+            let is_video = stream.media_type == MediaType::Video;
+            let is_audio = stream.media_type == MediaType::Audio;
 
-            // If the encoder only accepts certain sample rates and the input
-            // isn't one of them, resample to the nearest accepted rate. The
-            // output stream then carries that target rate.
+            // Audio filter chain (`-af`); audio streams only.
+            let audio_chain = if is_audio {
+                rff_filter::AudioFilterChain::parse(output.audio_filters.as_deref().unwrap_or(""))?
+            } else {
+                rff_filter::AudioFilterChain::default()
+            };
+
+            // `-ac`: validate up front — only mono/stereo mixing exists.
+            let target_channels = match output.audio_channels {
+                Some(c) if is_audio => {
+                    if !(1..=2).contains(&c) {
+                        return Err(Error::unsupported(format!(
+                            "-ac {c}: only 1 or 2 channels supported"
+                        )));
+                    }
+                    c
+                }
+                _ => 0,
+            };
+
+            // Output sample rate: `-ar` / `aresample=` wins, else the input
+            // rate; either way the encoder's accepted-rate list has the last
+            // word (nearest accepted).
             let mut target_rate = 0;
             let mut out_rate = stream.sample_rate;
-            if stream.media_type == MediaType::Audio && stream.sample_rate > 0 {
-                if let Some(rates) = encoder.accepted_sample_rates() {
-                    if !rates.contains(&stream.sample_rate) {
-                        target_rate = nearest_rate(&rates, stream.sample_rate);
-                        out_rate = target_rate;
-                    }
+            if is_audio && stream.sample_rate > 0 {
+                let desired = output
+                    .audio_rate
+                    .or(audio_chain.resample_target())
+                    .unwrap_or(stream.sample_rate);
+                let desired = match encoder.accepted_sample_rates() {
+                    Some(rates) if !rates.contains(&desired) => nearest_rate(&rates, desired),
+                    _ => desired,
+                };
+                if desired != stream.sample_rate {
+                    target_rate = desired;
                 }
+                out_rate = desired;
             }
+
+            // Trim window and the tick shift that re-zeroes the output timeline.
+            let trim = Trim::from_spec(output);
+            let tb = stream.time_base;
+            let shift_ticks = trim
+                .map(|t| (t.start * tb.den as f64 / tb.num.max(1) as f64).round() as i64)
+                .unwrap_or(0);
+
+            // `-r`: CFR stage; the output stream ticks in 1/fps units.
+            let fps = match output.frame_rate {
+                Some((num, den)) if is_video => Some(FpsConv::new(num, den)),
+                _ => None,
+            };
 
             let mut accepted_formats = encoder.accepted_pixel_formats();
 
@@ -667,7 +1079,17 @@ fn build_op(
             // otherwise it is whatever we reconciled the source to above.
             os.color_range = filters.output_color_range().unwrap_or(source_range);
             os.sample_rate = out_rate;
-            os.channels = stream.channels;
+            os.channels = if target_channels > 0 {
+                target_channels
+            } else {
+                stream.channels
+            };
+            // A CFR conversion re-times the stream: pts become slot indices.
+            if let Some((num, den)) = output.frame_rate {
+                if is_video {
+                    os.time_base = rff_core::Rational::new(den as i32, num as i32);
+                }
+            }
             // A format pinned by the output codec NAME (`-c:a pcm_s16le`) wins:
             // it is an explicit request, and the muxer writes it into the
             // container header before any frame is seen. Otherwise compressed
@@ -683,11 +1105,19 @@ fn build_op(
                 os.time_base = rff_core::Rational::new(1, out_rate as i32);
             }
             Ok((
-                StreamOp::Transcode {
+                StreamOp::Transcode(Box::new(TranscodeOp {
                     decoder,
                     encoder,
                     filters,
                     overlay: None,
+                    in_time_base: stream.time_base,
+                    is_video,
+                    trim,
+                    shift_ticks,
+                    audio_clock_samples: 0,
+                    fps,
+                    audio_chain,
+                    target_channels,
                     target_rate,
                     target_sample_format,
                     resampler: None,
@@ -697,15 +1127,30 @@ fn build_op(
                     out_index,
                     max_video_frames: output.max_video_frames,
                     video_frames_sent: 0,
-                },
+                    pending_pts: std::collections::VecDeque::new(),
+                })),
                 os,
             ))
         }
-        // Stream copy: carry the same codec/packets through unchanged.
+        // Stream copy: carry the same codec/packets through unchanged (the trim
+        // window still applies, cutting video on keyframes).
         None => {
             let mut os = stream.clone();
             os.index = out_index;
-            Ok((StreamOp::Copy { out_index }, os))
+            let trim = Trim::from_spec(output);
+            let tb = stream.time_base;
+            let to_ticks = |s: f64| (s * tb.den as f64 / tb.num.max(1) as f64).round() as i64;
+            Ok((
+                StreamOp::Copy(CopyOp {
+                    out_index,
+                    is_video: stream.media_type == MediaType::Video,
+                    start_ticks: trim.map(|t| to_ticks(t.start)).unwrap_or(0),
+                    end_ticks: trim.and_then(|t| t.end).map(to_ticks),
+                    trimming: trim.is_some(),
+                    started: false,
+                }),
+                os,
+            ))
         }
     }
 }
@@ -781,50 +1226,18 @@ fn process_packet(
     };
     match op {
         StreamOp::Skip => Ok(()),
-        StreamOp::Copy { out_index } => {
-            let mut packet = packet;
-            packet.stream_index = *out_index;
-            muxer.write_packet(&packet)?;
-            report.packets_written += 1;
+        StreamOp::Copy(copy) => {
+            if let Some(packet) = copy.process(packet) {
+                muxer.write_packet(&packet)?;
+                report.packets_written += 1;
+            }
             Ok(())
         }
-        StreamOp::Transcode {
-            decoder,
-            encoder,
-            filters,
-            overlay,
-            target_rate,
-            target_sample_format,
-            resampler,
-            accepted_formats,
-            pixel_converter,
-            source_range,
-            out_index,
-            max_video_frames,
-            video_frames_sent,
-        } => {
-            decoder.send_packet(&packet)?;
+        StreamOp::Transcode(op) => {
+            op.decoder.send_packet(&packet)?;
             loop {
-                match decoder.receive_frame() {
-                    Ok(frame) => {
-                        report.frames_decoded += 1;
-                        if let Some(limit) = *max_video_frames {
-                            if matches!(frame, Frame::Video(_)) {
-                                if *video_frames_sent >= limit {
-                                    break;
-                                }
-                                *video_frames_sent += 1;
-                            }
-                        }
-                        let frame = apply_filters(filters, frame)?;
-                        let frame = apply_overlay(overlay, frame)?;
-                        let frame = conform_audio(resampler, *target_rate, frame)?;
-                        let frame = conform_sample_format(*target_sample_format, frame)?;
-                        let frame =
-                            conform_video(pixel_converter, accepted_formats, *source_range, frame)?;
-                        encoder.send_frame(&frame)?;
-                        drain_encoder(&mut **encoder, *out_index, muxer, report)?;
-                    }
+                match op.decoder.receive_frame() {
+                    Ok(frame) => op.handle_frame(frame, muxer, report)?,
                     Err(Error::Again) | Err(Error::Eof) => break,
                     Err(e) => return Err(e),
                 }
@@ -834,94 +1247,16 @@ fn process_packet(
     }
 }
 
-/// At end of input, flush each transcoded stream's decoder, then its encoder,
-/// writing out any frames/packets they were still buffering.
+/// At end of input, flush each transcoded stream's decoder, filter state, and
+/// encoder, writing out anything still buffered.
 fn flush_streams(
     ops: &mut [StreamOp],
     muxer: &mut dyn Muxer,
     report: &mut TranscodeReport,
 ) -> Result<()> {
     for op in ops.iter_mut() {
-        let StreamOp::Transcode {
-            decoder,
-            encoder,
-            filters,
-            overlay,
-            target_rate,
-            target_sample_format,
-            resampler,
-            accepted_formats,
-            pixel_converter,
-            source_range,
-            out_index,
-            max_video_frames,
-            video_frames_sent,
-        } = op
-        else {
-            continue;
-        };
-
-        decoder.flush();
-        loop {
-            match decoder.receive_frame() {
-                Ok(frame) => {
-                    report.frames_decoded += 1;
-                    // Honour `-frames:v` on the flush path too, or the tail of a
-                    // truncated encode would leak past the requested count.
-                    if let Some(limit) = *max_video_frames {
-                        if matches!(frame, Frame::Video(_)) {
-                            if *video_frames_sent >= limit {
-                                break;
-                            }
-                            *video_frames_sent += 1;
-                        }
-                    }
-                    let frame = apply_filters(filters, frame)?;
-                    let frame = apply_overlay(overlay, frame)?;
-                    let frame = conform_audio(resampler, *target_rate, frame)?;
-                    let frame = conform_sample_format(*target_sample_format, frame)?;
-                    let frame =
-                        conform_video(pixel_converter, accepted_formats, *source_range, frame)?;
-                    encoder.send_frame(&frame)?;
-                    drain_encoder(&mut **encoder, *out_index, muxer, report)?;
-                }
-                Err(Error::Again) | Err(Error::Eof) => break,
-                Err(e) => return Err(e),
-            }
-        }
-
-        // Flush the resampler's FIR tail so no samples are lost at end of stream.
-        if let Some(rs) = resampler {
-            let tail = rs.finish();
-            if !tail.is_empty() {
-                let frame = f32_frame(tail, rs.out_rate(), rs.channels(), None);
-                encoder.send_frame(&frame)?;
-                drain_encoder(&mut **encoder, *out_index, muxer, report)?;
-            }
-        }
-
-        encoder.flush();
-        drain_encoder(&mut **encoder, *out_index, muxer, report)?;
-    }
-    Ok(())
-}
-
-/// Pull every ready packet out of `encoder` and mux it into `out_index`.
-fn drain_encoder(
-    encoder: &mut dyn Encoder,
-    out_index: usize,
-    muxer: &mut dyn Muxer,
-    report: &mut TranscodeReport,
-) -> Result<()> {
-    loop {
-        match encoder.receive_packet() {
-            Ok(mut packet) => {
-                packet.stream_index = out_index;
-                muxer.write_packet(&packet)?;
-                report.packets_written += 1;
-            }
-            Err(Error::Again) | Err(Error::Eof) => break,
-            Err(e) => return Err(e),
+        if let StreamOp::Transcode(op) = op {
+            op.finish(muxer, report)?;
         }
     }
     Ok(())

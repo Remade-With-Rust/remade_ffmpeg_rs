@@ -9,6 +9,10 @@
 //! other layouts return [`Error::Unsupported`]. Each filter is a 1-in/1-out
 //! transform.
 
+mod audio;
+
+pub use audio::{trim_audio_frame, AudioFilterChain};
+
 use rff_core::{ColorRange, Error, PixelFormat, Result, VideoFrame};
 
 /// One frame transform. Implementors map a video frame to a new video frame.

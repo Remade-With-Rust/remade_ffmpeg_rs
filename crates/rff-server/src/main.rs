@@ -191,6 +191,7 @@ async fn transcode(
             maps: Vec::new(),
             overwrite: req.overwrite,
             max_video_frames: None,
+            ..Default::default()
         }],
     };
 

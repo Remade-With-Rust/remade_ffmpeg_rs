@@ -83,10 +83,19 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut shared_opts = Dictionary::new();
     let mut max_video_frames: Option<u64> = None;
     let mut video_filters: Option<String> = None;
+    let mut audio_filters: Option<String> = None;
     let mut filter_complex: Option<String> = None;
     let mut maps: Vec<MapSpec> = Vec::new();
     let mut overwrite = false;
     let mut output_path: Option<PathBuf> = None;
+    // Trim window: -ss (start), -t (duration), -to (absolute end).
+    let mut trim_start: Option<f64> = None;
+    let mut trim_duration: Option<f64> = None;
+    let mut trim_to: Option<f64> = None;
+    let mut frame_rate: Option<(u32, u32)> = None;
+    let mut audio_rate: Option<u32> = None;
+    let mut audio_channels: Option<u16> = None;
+    let mut metadata = Dictionary::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -185,18 +194,68 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                 }
             }
 
-            // Video filter graph: -vf / -filter:v.
+            // Video filter graph: -vf / -filter:v. Audio: -af / -filter:a.
             "vf" => video_filters = Some(take_value(args, &mut i, arg)?),
+            "af" => audio_filters = Some(take_value(args, &mut i, arg)?),
             // Multi-input filter graph: -filter_complex / -lavfi.
             "filter_complex" | "lavfi" => filter_complex = Some(take_value(args, &mut i, arg)?),
             "filter" => {
                 let value = take_value(args, &mut i, arg)?;
                 match spec {
                     Some(s) if s.starts_with('v') => video_filters = Some(value),
-                    Some(s) if s.starts_with('a') => {
-                        warnings.push("audio filters (-filter:a) are not supported yet".into())
-                    }
+                    Some(s) if s.starts_with('a') => audio_filters = Some(value),
                     _ => warnings.push(format!("ignoring filter spec `{value}`")),
+                }
+            }
+
+            // Trim window: -ss START, -t DURATION, -to END (`HH:MM:SS.mmm` or
+            // seconds). Applied to the output: decode-and-discard, so it is
+            // frame-accurate for transcodes and keyframe-cut for -c copy.
+            "ss" => trim_start = Some(parse_time(&take_value(args, &mut i, arg)?)?),
+            "t" => trim_duration = Some(parse_time(&take_value(args, &mut i, arg)?)?),
+            "to" => trim_to = Some(parse_time(&take_value(args, &mut i, arg)?)?),
+
+            // -r RATE: constant output frame rate (25, 29.97, 30000/1001).
+            "r" | "framerate" => frame_rate = Some(parse_rate(&take_value(args, &mut i, arg)?)?),
+
+            // -s WxH: shorthand for a trailing scale filter.
+            "s" | "video_size" => {
+                let value = take_value(args, &mut i, arg)?;
+                let (w, h) = value
+                    .split_once(['x', 'X'])
+                    .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+                    .ok_or_else(|| format!("-s: expected WxH, got `{value}`"))?;
+                let scale = format!("scale={w}:{h}");
+                video_filters = Some(match video_filters.take() {
+                    Some(chain) => format!("{chain},{scale}"),
+                    None => scale,
+                });
+            }
+
+            // -ar RATE / -ac CHANNELS: audio output rate and channel count.
+            "ar" => {
+                let value = take_value(args, &mut i, arg)?;
+                audio_rate = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("-ar: bad sample rate `{value}`"))?,
+                );
+            }
+            "ac" => {
+                let value = take_value(args, &mut i, arg)?;
+                audio_channels = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("-ac: bad channel count `{value}`"))?,
+                );
+            }
+
+            // -metadata key=value (repeatable).
+            "metadata" => {
+                let value = take_value(args, &mut i, arg)?;
+                match value.split_once('=') {
+                    Some((k, v)) => metadata.set(k.trim(), v),
+                    None => warnings.push(format!("-metadata: expected key=value, got `{value}`")),
                 }
             }
 
@@ -313,6 +372,42 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     if !audio_opts.is_empty() && audio_codec.is_none() {
         warnings.push("audio options given without -c:a; ignored".into());
     }
+    // Re-encode-only options on a stream-copy: say so instead of silence.
+    if audio_codec.is_none()
+        && (audio_filters.is_some() || audio_rate.is_some() || audio_channels.is_some())
+    {
+        warnings.push("-af/-ar/-ac need a re-encode; pass -c:a (ignored on stream copy)".into());
+    }
+
+    // `-vf fps=N` is the same CFR stage as `-r`: lift it out of the chain.
+    if let Some(vf) = &video_filters {
+        let mut kept: Vec<&str> = Vec::new();
+        for token in vf.split(',') {
+            match token.trim().strip_prefix("fps=") {
+                Some(rate) => match parse_rate(rate) {
+                    Ok(r) => frame_rate = Some(r),
+                    Err(e) => warnings.push(e),
+                },
+                None => kept.push(token),
+            }
+        }
+        if kept.len() != vf.split(',').count() {
+            let kept = kept.join(",");
+            video_filters = (!kept.trim().is_empty()).then_some(kept);
+        }
+    }
+    if frame_rate.is_some() && video_codec.is_none() {
+        warnings.push("-r/-vf fps= need a re-encode; pass -c:v (ignored on stream copy)".into());
+    }
+
+    // -ss/-t/-to resolve to an absolute [start, end) window; -to wins over -t
+    // only when both name the same bound (FFmpeg takes the earlier end).
+    let trim_end = match (trim_to, trim_duration) {
+        (Some(to), Some(t)) => Some(to.min(trim_start.unwrap_or(0.0) + t)),
+        (Some(to), None) => Some(to),
+        (None, Some(t)) => Some(trim_start.unwrap_or(0.0) + t),
+        (None, None) => None,
+    };
 
     let output = output_path.map(|path| OutputSpec {
         path,
@@ -332,6 +427,13 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         max_video_frames,
         maps,
         overwrite,
+        trim_start,
+        trim_end,
+        frame_rate,
+        audio_rate,
+        audio_channels,
+        audio_filters,
+        metadata,
     });
 
     let spec = TranscodeSpec {
@@ -353,6 +455,57 @@ fn take_value(args: &[String], i: &mut usize, opt: &str) -> Result<String, Strin
     args.get(*i)
         .cloned()
         .ok_or_else(|| format!("option `{opt}` requires an argument"))
+}
+
+/// Parse an FFmpeg time value: plain seconds (`12.5`) or `[HH:]MM:SS[.mmm]`.
+fn parse_time(value: &str) -> Result<f64, String> {
+    let value = value.trim();
+    let bad = || format!("bad time `{value}` (want seconds or [HH:]MM:SS[.mmm])");
+    if !value.contains(':') {
+        return value.parse::<f64>().map_err(|_| bad());
+    }
+    let parts: Vec<&str> = value.split(':').collect();
+    if parts.len() > 3 || parts.is_empty() {
+        return Err(bad());
+    }
+    let mut seconds = 0.0;
+    for p in &parts {
+        seconds = seconds * 60.0 + p.parse::<f64>().map_err(|_| bad())?;
+    }
+    Ok(seconds)
+}
+
+/// Parse a frame rate: integer (`25`), decimal (`29.97`), or fraction
+/// (`30000/1001`). Decimals become exact fractions over a power of ten.
+fn parse_rate(value: &str) -> Result<(u32, u32), String> {
+    let value = value.trim();
+    let bad = || format!("bad frame rate `{value}`");
+    if let Some((n, d)) = value.split_once('/') {
+        let (n, d) = (
+            n.trim().parse::<u32>().map_err(|_| bad())?,
+            d.trim().parse::<u32>().map_err(|_| bad())?,
+        );
+        if n == 0 || d == 0 {
+            return Err(bad());
+        }
+        return Ok((n, d));
+    }
+    if let Some((int, frac)) = value.split_once('.') {
+        let digits = frac.len().min(3) as u32;
+        let den = 10u32.pow(digits);
+        let int: u32 = int.parse().map_err(|_| bad())?;
+        let frac: u32 = frac[..digits as usize].parse().map_err(|_| bad())?;
+        let num = int * den + frac;
+        if num == 0 {
+            return Err(bad());
+        }
+        return Ok((num, den));
+    }
+    let n: u32 = value.parse().map_err(|_| bad())?;
+    if n == 0 {
+        return Err(bad());
+    }
+    Ok((n, 1))
 }
 
 /// Resolve a codec name to an id (treating `copy` as "no re-encode" → `None`)

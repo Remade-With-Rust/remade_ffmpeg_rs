@@ -93,6 +93,7 @@ fn transcode_sniffs_extensionless_input() {
             maps: Vec::new(),
             overwrite: true,
             max_video_frames: None,
+            ..Default::default()
         }],
     };
 

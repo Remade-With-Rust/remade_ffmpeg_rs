@@ -198,7 +198,12 @@ impl Encoder for Vp9Encoder {
 
     fn receive_packet(&mut self) -> Result<Packet> {
         let p = self.inner.next_packet().map_err(map_err)?;
-        Ok(Packet::from_data(0, p.data))
+        let mut packet = Packet::from_data(0, p.data);
+        // Muxers need the random-access flag (Matroska SimpleBlock keyframe
+        // bit, MP4 stss); dropping it made every seek land on a delta frame.
+        packet.flags.keyframe = p.keyframe;
+        packet.pts = p.pts;
+        Ok(packet)
     }
 
     fn flush(&mut self) {

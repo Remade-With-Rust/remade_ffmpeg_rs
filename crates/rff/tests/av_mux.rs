@@ -105,6 +105,7 @@ fn muxes_video_and_audio_into_one_avi() {
             maps: Vec::new(),
             overwrite: true,
             max_video_frames: None,
+            ..Default::default()
         }],
     };
     let report = rff::transcode::run(&engine, &spec).expect("a/v mux");
