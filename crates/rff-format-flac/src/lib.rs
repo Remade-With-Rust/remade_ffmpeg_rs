@@ -18,6 +18,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["flac"],
         demuxer: Some(|input| Box::new(FlacDemuxer::new(input))),
         muxer: Some(|output| Box::new(FlacMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_flac),
     });
 }

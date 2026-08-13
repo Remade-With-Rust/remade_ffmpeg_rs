@@ -33,6 +33,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["avi"],
         demuxer: Some(|input| Box::new(AviDemuxer::new(input))),
         muxer: Some(|output| Box::new(AviMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_avi),
     });
 }

@@ -116,6 +116,12 @@ pub trait Muxer: Send {
 pub type DemuxerFactory = fn(Input) -> Box<dyn Demuxer>;
 /// Factory opening a muxer over an output byte sink.
 pub type MuxerFactory = fn(Output) -> Box<dyn Muxer>;
+/// Factory opening a muxer that owns its own file set (HLS/DASH write a
+/// playlist/manifest plus many segment files, so a single byte sink cannot
+/// model them). Receives the output path and the format options
+/// (`-hls_time 6` → `{"hls_time": "6"}`).
+pub type PathMuxerFactory =
+    fn(&std::path::Path, &Dictionary) -> Result<Box<dyn Muxer>>;
 /// Content sniffer: scores how strongly a byte prefix looks like this format,
 /// `0` (no match) to `100` (certain) — mirrors FFmpeg's `AVInputFormat::read_probe`.
 pub type ProbeFn = fn(&[u8]) -> i32;
@@ -131,6 +137,9 @@ pub struct Format {
     pub demuxer: Option<DemuxerFactory>,
     /// Present if this format can be muxed (written).
     pub muxer: Option<MuxerFactory>,
+    /// Present for formats that mux into a *path* (playlist + segment files)
+    /// rather than one byte sink — HLS, DASH. Mutually exclusive with `muxer`.
+    pub muxer_path: Option<PathMuxerFactory>,
     /// Content sniffer for magic-byte detection (independent of the filename).
     pub probe: Option<ProbeFn>,
 }
@@ -140,7 +149,7 @@ impl Format {
         self.demuxer.is_some()
     }
     pub fn can_mux(&self) -> bool {
-        self.muxer.is_some()
+        self.muxer.is_some() || self.muxer_path.is_some()
     }
 }
 

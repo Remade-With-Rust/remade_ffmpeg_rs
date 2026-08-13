@@ -18,6 +18,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["ivf"],
         demuxer: Some(|input| Box::new(IvfDemuxer::new(input))),
         muxer: Some(|output| Box::new(IvfMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_ivf),
     });
 }

@@ -37,6 +37,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &[rusty_av2f::fourcc::EXTENSION],
         demuxer: Some(|input| Box::new(Av2fDemuxer::new(input))),
         muxer: Some(|output| Box::new(Av2fMuxer::new(output))),
+        muxer_path: None,
         probe: Some(rusty_av2f::probe),
     });
 }

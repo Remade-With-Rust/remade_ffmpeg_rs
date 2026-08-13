@@ -23,6 +23,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["jxl"],
         demuxer: Some(|input| Box::new(JxlDemuxer::new(input))),
         muxer: Some(|output| Box::new(JxlMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_jxl),
     });
 }

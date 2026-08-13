@@ -18,6 +18,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["jpg", "jpeg"],
         demuxer: Some(|input| Box::new(JpegDemuxer::new(input))),
         muxer: Some(|output| Box::new(JpegMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_jpeg),
     });
 }

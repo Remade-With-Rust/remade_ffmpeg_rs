@@ -11,16 +11,49 @@
 //! roll over once a segment has covered `target_duration` seconds, preferring a
 //! video keyframe boundary so each segment starts independently decodable.
 //!
-//! This is copy-friendly VOD output (`#EXT-X-ENDLIST`); live/event playlists,
-//! fMP4 segments, and DASH are the natural follow-ups.
+//! This is copy-friendly VOD output (`#EXT-X-ENDLIST`); live/event playlists
+//! and fMP4 segments are the natural follow-ups.
+//!
+//! **Input** is here too: [`open_input`] expands an `.m3u8` (local path or
+//! URL, master or media playlist) into one chained byte stream over its TS
+//! segments, which the MPEG-TS demuxer then reads like any other input.
+
+mod input;
 
 use std::fmt::Write as _;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use rff_core::{Error, MediaType, Packet, Rational, Result};
-use rff_format::{Muxer, Output, Stream};
+use rff_format::{Format, FormatRegistry, Muxer, Output, Stream};
 use rff_format_ts::TsMuxer;
+
+pub use input::open_input;
+
+/// Default seconds per segment when `-hls_time` is not given.
+const DEFAULT_SEGMENT_SECONDS: f64 = 4.0;
+
+/// Register HLS as a real registry format. Muxing goes through the path-based
+/// factory (a playlist plus N segment files is not one byte sink); demuxing is
+/// handled upstream by [`open_input`], which flattens the playlist into a TS
+/// stream before format resolution.
+pub fn register(registry: &mut FormatRegistry) {
+    registry.register(Format {
+        name: "hls",
+        long_name: "HTTP Live Streaming (m3u8 + MPEG-TS segments)",
+        extensions: &["m3u8"],
+        demuxer: None,
+        muxer: None,
+        muxer_path: Some(|path, options| {
+            let seconds = options
+                .get("hls_time")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(DEFAULT_SEGMENT_SECONDS);
+            Ok(Box::new(HlsSegmenter::new(path, seconds)?))
+        }),
+        probe: None,
+    });
+}
 
 /// Segments an output into MPEG-TS pieces and writes an `.m3u8` playlist.
 pub struct HlsSegmenter {

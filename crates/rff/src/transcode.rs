@@ -19,7 +19,6 @@
 //! is automatically resampled to a rate the target encoder accepts (FFmpeg's
 //! implicit `aresample`).
 
-use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -144,6 +143,9 @@ pub struct OutputSpec {
     pub audio_filters: Option<String>,
     /// Output metadata (`-metadata title=...`), handed to muxers that carry it.
     pub metadata: Dictionary,
+    /// Muxer options (`-hls_time 6` → `{"hls_time": "6"}`), for formats that
+    /// take them (HLS/DASH segmenting).
+    pub format_options: Dictionary,
 }
 
 /// A complete, declarative transcoding job.
@@ -724,10 +726,6 @@ impl TranscodeOp {
     }
 }
 
-/// Nominal seconds per HLS segment before rolling over on a keyframe. (A
-/// `-hls_time` override is a planned follow-up.)
-const HLS_SEGMENT_SECONDS: f64 = 4.0;
-
 /// Resolve and run a transcode job against `engine`.
 ///
 /// Resolution (formats, decoders, encoders) happens up front so failures are
@@ -858,40 +856,32 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
         }
     }
 
-    // --- pick the muxer: HLS fans packets across many segment files (so it is
-    // built with the playlist path, not a single writer); every other format
-    // writes one container. Confirm a non-HLS muxer exists before touching disk.
-    let is_hls = output.format.as_deref() == Some("hls")
-        || output.path.extension().and_then(|e| e.to_str()) == Some("m3u8");
-    let out_format = if is_hls {
-        None
-    } else {
-        Some(resolve_output_format(engine, output)?)
-    };
-    if let Some(f) = &out_format {
-        engine
-            .formats
-            .by_name(f)
-            .filter(|fmt| fmt.can_mux())
-            .ok_or_else(|| Error::MuxerNotFound(f.clone()))?;
-    }
+    // --- pick the muxer from the registry. Path-based formats (HLS/DASH: a
+    // playlist plus many segment files) are built with the output path; every
+    // other format writes one byte sink through rff-io (file, pipe, udp).
+    let out_format = resolve_output_format(engine, output)?;
+    let muxer_path_factory = engine
+        .formats
+        .by_name(&out_format)
+        .filter(|fmt| fmt.can_mux())
+        .ok_or_else(|| Error::MuxerNotFound(out_format.clone()))?
+        .muxer_path;
 
-    // --- refuse to clobber an existing file unless -y was given ---
-    if !output.overwrite && output.path.exists() {
+    // --- refuse to clobber an existing file unless -y was given (pipes and
+    // sockets have nothing to clobber) ---
+    let out_path_str = output.path.to_str().unwrap_or_default();
+    let is_sink_stream = rff_io::is_pipe(out_path_str) || rff_io::is_udp(out_path_str);
+    if !is_sink_stream && !output.overwrite && output.path.exists() {
         return Err(Error::Option(format!(
             "{} already exists (pass -y to overwrite)",
             output.path.display()
         )));
     }
-    let mut muxer: Box<dyn Muxer> = match out_format {
-        None => Box::new(rff_format_hls::HlsSegmenter::new(
-            &output.path,
-            HLS_SEGMENT_SECONDS,
-        )?),
-        Some(f) => {
-            let out_file = File::create(&output.path)?;
-            engine.formats.open_muxer(&f, Box::new(out_file))?
-        }
+    let mut muxer: Box<dyn Muxer> = match muxer_path_factory {
+        Some(factory) => factory(&output.path, &output.format_options)?,
+        None => engine
+            .formats
+            .open_muxer(&out_format, rff_io::create(out_path_str)?)?,
     };
     if !output.metadata.is_empty() {
         muxer.set_metadata(&output.metadata);
@@ -1287,7 +1277,12 @@ fn resolve_output_format(engine: &Engine, output: &OutputSpec) -> Result<String>
         .formats
         .by_extension(ext)
         .map(|f| f.name.to_string())
-        .ok_or_else(|| Error::MuxerNotFound(output.path.display().to_string()))
+        .ok_or_else(|| {
+            Error::MuxerNotFound(format!(
+                "{} (no format for this extension — pass -f)",
+                output.path.display()
+            ))
+        })
 }
 
 #[cfg(test)]

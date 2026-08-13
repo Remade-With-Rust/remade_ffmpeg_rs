@@ -19,6 +19,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["srt"],
         demuxer: Some(|input| Box::new(SrtDemuxer::new(input))),
         muxer: Some(|output| Box::new(SrtMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_srt),
     });
 }

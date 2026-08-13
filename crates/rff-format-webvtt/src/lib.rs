@@ -19,6 +19,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["vtt"],
         demuxer: Some(|input| Box::new(VttDemuxer::new(input))),
         muxer: Some(|output| Box::new(VttMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_vtt),
     });
 }

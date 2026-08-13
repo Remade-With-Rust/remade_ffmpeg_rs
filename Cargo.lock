@@ -5140,6 +5140,7 @@ dependencies = [
  "rff-core",
  "rff-format",
  "rff-format-ts",
+ "rff-io",
 ]
 
 [[package]]

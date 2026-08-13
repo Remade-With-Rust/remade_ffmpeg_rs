@@ -29,6 +29,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["avif"],
         demuxer: Some(|input| Box::new(AvifDemuxer::new(input))),
         muxer: Some(|output| Box::new(AvifMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_avif),
     });
 }

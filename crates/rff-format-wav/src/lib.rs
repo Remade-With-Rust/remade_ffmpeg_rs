@@ -19,6 +19,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["wav"],
         demuxer: Some(|input| Box::new(WavDemuxer::new(input))),
         muxer: Some(|output| Box::new(WavMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_wav),
     });
 }

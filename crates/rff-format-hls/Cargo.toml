@@ -16,3 +16,4 @@ categories = ["multimedia", "parser-implementations"]
 rff-core.workspace = true
 rff-format.workspace = true
 rff-format-ts.workspace = true
+rff-io.workspace = true

@@ -15,6 +15,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["gif"],
         demuxer: Some(|input| Box::new(GifDemuxer::new(input))),
         muxer: Some(|output| Box::new(GifMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_gif),
     });
 }

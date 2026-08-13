@@ -110,24 +110,51 @@ fn read_head(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
 
 /// Open a path-or-URL as a streaming reader and decide its container format.
 ///
-/// Local files keep the read-twice (sniff then open) path. For `http(s)://`
-/// URLs the stream is opened once, its head peeked for content sniffing, then
+/// Local files keep the read-twice (sniff then open) path. Streams (URLs,
+/// pipes, UDP) are opened once, their head peeked for content sniffing, then
 /// chained back in front so the demuxer sees the whole stream from byte 0.
-/// Shared by [`probe`] (ffprobe) and the transcode input path (ffmpeg).
+/// HLS playlists (`-f hls`, an `.m3u8` name, or `#EXTM3U` content) expand to
+/// one chained stream over their TS segments first. Shared by [`probe`]
+/// (ffprobe) and the transcode input path (ffmpeg).
 pub(crate) fn open_source(
     engine: &Engine,
     path: &str,
     forced: Option<&str>,
 ) -> Result<(String, Box<dyn Read + Send>)> {
-    if !rff_io::is_url(path) {
+    let stem = path.split(['?', '#']).next().unwrap_or(path);
+    if forced == Some("hls") || stem.to_ascii_lowercase().ends_with(".m3u8") {
+        let reader = rff_format_hls::open_input(path)?;
+        return sniff_stream(engine, reader, None, path);
+    }
+    if !rff_io::is_stream(path) {
         let format = detect_input_format(engine, Path::new(path), forced)?;
         return Ok((format, Box::new(std::fs::File::open(path)?)));
     }
+    let reader = rff_io::open(path)?;
+    sniff_stream(engine, reader, forced, path)
+}
 
-    let mut reader = rff_io::open(path)?;
+/// Peek a stream's head, pick its format (forced > content sniff > URL
+/// extension), and hand back head+rest chained. An `#EXTM3U` head re-opens the
+/// source as HLS input (possible for URLs/files; a pipe can't be re-read).
+fn sniff_stream(
+    engine: &Engine,
+    mut reader: Box<dyn Read + Send>,
+    forced: Option<&str>,
+    path: &str,
+) -> Result<(String, Box<dyn Read + Send>)> {
     let mut head = vec![0u8; 4096];
     let n = read_some(&mut reader, &mut head)?;
     head.truncate(n);
+    if forced.is_none() && head.starts_with(b"#EXTM3U") {
+        if rff_io::is_pipe(path) {
+            return Err(Error::unsupported(
+                "hls input from a pipe (the playlist's segments cannot be fetched relative to stdin)",
+            ));
+        }
+        let reader = rff_format_hls::open_input(path)?;
+        return sniff_stream(engine, reader, None, path);
+    }
     let format = match forced {
         Some(f) => f.to_string(),
         None => engine
@@ -135,7 +162,7 @@ pub(crate) fn open_source(
             .probe(&head)
             .map(|f| f.name.to_string())
             .or_else(|| url_extension_format(engine, path))
-            .ok_or_else(|| Error::DemuxerNotFound(path.to_string()))?,
+            .ok_or_else(|| Error::DemuxerNotFound(format!("{path} (pass -f)")))?,
     };
     let chained: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(head).chain(reader));
     Ok((format, chained))

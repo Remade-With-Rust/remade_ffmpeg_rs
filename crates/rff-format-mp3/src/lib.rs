@@ -23,6 +23,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["mp3"],
         demuxer: Some(|input| Box::new(Mp3Demuxer::new(input))),
         muxer: Some(|output| Box::new(Mp3Muxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_mp3),
     });
 }

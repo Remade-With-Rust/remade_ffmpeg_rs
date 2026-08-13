@@ -20,8 +20,9 @@ rustls-rustcrypto = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 
 [features]
-# Enable `https://` input via rustls + a RustCrypto crypto provider + the OS
-# trust store. Off by default so the standard build stays C-free, dependency-
-# free, and TLS-free. Plumbed through `rff` and `rff-cli` as their own `https`
-# feature: build the binaries with `cargo build -p rff-cli --features https`.
+# `https://` input via rustls + a RustCrypto crypto provider + the OS trust
+# store — pure Rust throughout, so it is ON by default: an ffmpeg that cannot
+# read an https URL fails the drop-in test. Opt out with
+# `--no-default-features` for a TLS-free build (plain `http://` stays).
+default = ["https"]
 https = ["dep:rustls", "dep:rustls-rustcrypto", "dep:rustls-native-certs"]

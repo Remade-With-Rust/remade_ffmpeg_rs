@@ -23,6 +23,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["flv"],
         demuxer: Some(|input| Box::new(FlvDemuxer::new(input))),
         muxer: Some(|output| Box::new(mux::FlvMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_flv),
     });
 }

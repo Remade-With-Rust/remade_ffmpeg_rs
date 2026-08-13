@@ -28,6 +28,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["ts", "m2ts", "mts"],
         demuxer: Some(|input| Box::new(TsDemuxer::new(input))),
         muxer: Some(|output| Box::new(mux::TsMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_ts),
     });
 }

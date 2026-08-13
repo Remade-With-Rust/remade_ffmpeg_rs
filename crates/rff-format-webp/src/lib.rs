@@ -16,6 +16,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["webp"],
         demuxer: Some(|input| Box::new(WebpDemuxer::new(input))),
         muxer: Some(|output| Box::new(WebpMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_webp),
     });
 }

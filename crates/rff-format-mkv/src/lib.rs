@@ -28,6 +28,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["mkv", "mka", "mks"],
         demuxer: Some(|input| Box::new(MkvDemuxer::new(input))),
         muxer: Some(|out| Box::new(MkvMuxer::new(out, false))),
+        muxer_path: None,
         probe: Some(probe_mkv),
     });
     registry.register(Format {
@@ -36,6 +37,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["webm"],
         demuxer: Some(|input| Box::new(MkvDemuxer::new(input))),
         muxer: Some(|out| Box::new(MkvMuxer::new(out, true))),
+        muxer_path: None,
         probe: None, // content-probing is matroska's job; webm is chosen by name
     });
 }

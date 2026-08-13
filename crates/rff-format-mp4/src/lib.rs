@@ -26,6 +26,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["mp4", "mov", "m4a", "m4v"],
         demuxer: Some(|input| Box::new(Mp4Demuxer::new(input))),
         muxer: Some(|output| Box::new(Mp4Muxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_mp4),
     });
 }

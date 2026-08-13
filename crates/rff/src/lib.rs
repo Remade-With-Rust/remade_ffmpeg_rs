@@ -98,6 +98,7 @@ fn register_builtin_formats(formats: &mut FormatRegistry) {
     rff_format_flv::register(formats);
     rff_format_srt::register(formats);
     rff_format_webvtt::register(formats);
+    rff_format_hls::register(formats);
 }
 
 /// The crate version, surfaced in the CLI/server banners.

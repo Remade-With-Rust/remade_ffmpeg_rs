@@ -21,6 +21,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["y4m"],
         demuxer: Some(|input| Box::new(Y4mDemuxer::new(input))),
         muxer: Some(|output| Box::new(Y4mMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_y4m),
     });
 }

@@ -21,6 +21,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["png"],
         demuxer: Some(|input| Box::new(PngDemuxer::new(input))),
         muxer: Some(|output| Box::new(PngMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_png),
     });
 }

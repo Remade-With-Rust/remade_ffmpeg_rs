@@ -96,6 +96,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut audio_rate: Option<u32> = None;
     let mut audio_channels: Option<u16> = None;
     let mut metadata = Dictionary::new();
+    let mut format_options = Dictionary::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -248,6 +249,17 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                         .parse()
                         .map_err(|_| format!("-ac: bad channel count `{value}`"))?,
                 );
+            }
+
+            // HLS segmenting: -hls_time SECONDS. (-hls_list_size shapes LIVE
+            // sliding-window playlists; our HLS output is VOD, so say so.)
+            "hls_time" => {
+                let value = take_value(args, &mut i, arg)?;
+                format_options.set("hls_time", value);
+            }
+            "hls_list_size" => {
+                let _ = take_value(args, &mut i, arg)?;
+                warnings.push("-hls_list_size: HLS output is a VOD playlist; ignored".into());
             }
 
             // -metadata key=value (repeatable).
@@ -434,6 +446,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         audio_channels,
         audio_filters,
         metadata,
+        format_options,
     });
 
     let spec = TranscodeSpec {

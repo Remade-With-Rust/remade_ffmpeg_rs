@@ -17,10 +17,14 @@
 //! error and the crate pulls in no TLS code at all.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 use rff_core::{Error, Result};
+
+mod udp;
+
+pub use udp::{UdpReader, UdpWriter};
 
 /// Maximum number of HTTP redirects to follow before giving up.
 const MAX_REDIRECTS: usize = 5;
@@ -41,18 +45,78 @@ pub fn is_url(path: &str) -> bool {
     path.starts_with("http://") || path.starts_with("https://")
 }
 
+/// Does `path` name standard input/output (`-`, `pipe:`, `pipe:0`, `pipe:1`)?
+pub fn is_pipe(path: &str) -> bool {
+    matches!(path, "-" | "pipe:" | "pipe:0" | "pipe:1")
+}
+
+/// Is `path` a `udp://` address?
+pub fn is_udp(path: &str) -> bool {
+    path.starts_with("udp://")
+}
+
+/// Anything [`open`] reads as a stream rather than a seekable local file —
+/// callers that sniff content must peek-and-chain instead of re-opening.
+pub fn is_stream(path: &str) -> bool {
+    is_url(path) || is_pipe(path) || is_udp(path)
+}
+
 /// Open a path-or-URL as a streaming byte source.
 ///
 /// * `http://…` → an HTTP/1.1 `GET` stream.
-/// * `https://…` → the same over TLS (requires the `https` feature; otherwise
-///   [`Error::Unsupported`]).
+/// * `https://…` → the same over TLS (on by default via the `https` feature).
+/// * `-` / `pipe:` / `pipe:0` → standard input.
+/// * `udp://[@]host:port` → bound UDP socket (MPEG-TS over UDP; an idle
+///   timeout ends the stream).
 /// * anything else → a local file.
 pub fn open(path: &str) -> Result<Box<dyn Read + Send>> {
-    if is_url(path) {
+    if is_pipe(path) {
+        Ok(Box::new(std::io::stdin()))
+    } else if is_udp(path) {
+        Ok(Box::new(UdpReader::bind(path)?))
+    } else if is_url(path) {
         fetch(path, MAX_REDIRECTS)
     } else {
         Ok(Box::new(std::fs::File::open(path)?))
     }
+}
+
+/// Open a path as a byte sink — the output counterpart of [`open`].
+///
+/// * `-` / `pipe:` / `pipe:1` → standard output.
+/// * `udp://host:port` → UDP datagrams (packed to 1316-byte payloads, the
+///    7×188 MPEG-TS convention).
+/// * anything else → a local file (created/truncated).
+pub fn create(path: &str) -> Result<Box<dyn Write + Send>> {
+    if is_pipe(path) {
+        Ok(Box::new(std::io::stdout()))
+    } else if is_udp(path) {
+        Ok(Box::new(UdpWriter::connect(path)?))
+    } else {
+        Ok(Box::new(std::fs::File::create(path)?))
+    }
+}
+
+/// Parse `udp://[@]host:port` into the address part (strips scheme and the
+/// listen-marker `@` that mirrors FFmpeg's syntax).
+pub(crate) fn udp_addr(path: &str) -> Result<&str> {
+    let rest = path
+        .strip_prefix("udp://")
+        .ok_or_else(|| Error::invalid(format!("not a udp:// URL: {path}")))?;
+    let rest = rest.split(['?', '/']).next().unwrap_or("");
+    let rest = rest.strip_prefix('@').unwrap_or(rest);
+    if rest.is_empty() {
+        return Err(Error::invalid("udp:// needs host:port"));
+    }
+    Ok(rest)
+}
+
+/// Bind a UDP socket for receiving on `addr` (used by [`UdpReader`]).
+pub(crate) fn udp_bind(addr: &str) -> Result<UdpSocket> {
+    // For receive, the given host:port IS the local address to listen on.
+    let socket = UdpSocket::bind(addr)
+        .map_err(|e| Error::invalid(format!("udp bind {addr}: {e}")))?;
+    Ok(socket)
 }
 
 /// A parsed HTTP(S) URL: scheme, authority, and request path.

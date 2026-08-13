@@ -24,6 +24,7 @@ pub fn register(registry: &mut FormatRegistry) {
         extensions: &["opus", "ogg"],
         demuxer: Some(|input| Box::new(OggDemuxer::new(input))),
         muxer: Some(|output| Box::new(OggMuxer::new(output))),
+        muxer_path: None,
         probe: Some(probe_ogg),
     });
 }
