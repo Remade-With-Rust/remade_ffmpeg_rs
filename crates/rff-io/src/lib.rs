@@ -22,8 +22,10 @@ use std::time::Duration;
 
 use rff_core::{Error, Result};
 
+mod rtmp;
 mod udp;
 
+pub use rtmp::RtmpPublisher;
 pub use udp::{UdpReader, UdpWriter};
 
 /// Maximum number of HTTP redirects to follow before giving up.
@@ -53,6 +55,11 @@ pub fn is_pipe(path: &str) -> bool {
 /// Is `path` a `udp://` address?
 pub fn is_udp(path: &str) -> bool {
     path.starts_with("udp://")
+}
+
+/// Is `path` an `rtmp://` publish target?
+pub fn is_rtmp(path: &str) -> bool {
+    path.starts_with("rtmp://")
 }
 
 /// Anything [`open`] reads as a stream rather than a seekable local file —
@@ -86,12 +93,15 @@ pub fn open(path: &str) -> Result<Box<dyn Read + Send>> {
 /// * `-` / `pipe:` / `pipe:1` → standard output.
 /// * `udp://host:port` → UDP datagrams (packed to 1316-byte payloads, the
 ///    7×188 MPEG-TS convention).
+/// * `rtmp://host/app/key` → an RTMP publish session (feed it FLV: `-f flv`).
 /// * anything else → a local file (created/truncated).
 pub fn create(path: &str) -> Result<Box<dyn Write + Send>> {
     if is_pipe(path) {
         Ok(Box::new(std::io::stdout()))
     } else if is_udp(path) {
         Ok(Box::new(UdpWriter::connect(path)?))
+    } else if is_rtmp(path) {
+        Ok(Box::new(RtmpPublisher::connect(path)?))
     } else {
         Ok(Box::new(std::fs::File::create(path)?))
     }

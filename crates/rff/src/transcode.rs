@@ -874,7 +874,9 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     // --- refuse to clobber an existing file unless -y was given (pipes and
     // sockets have nothing to clobber) ---
     let out_path_str = output.path.to_str().unwrap_or_default();
-    let is_sink_stream = rff_io::is_pipe(out_path_str) || rff_io::is_udp(out_path_str);
+    let is_sink_stream = rff_io::is_pipe(out_path_str)
+        || rff_io::is_udp(out_path_str)
+        || rff_io::is_rtmp(out_path_str);
     if !is_sink_stream && !output.overwrite && output.path.exists() {
         return Err(Error::Option(format!(
             "{} already exists (pass -y to overwrite)",
@@ -1280,10 +1282,19 @@ fn open_input(engine: &Engine, input: &InputSpec) -> Result<(String, Box<dyn Rea
     crate::probe::open_source(engine, path, input.format.as_deref())
 }
 
-/// Decide which container to mux an output as: explicit `-f`, else by extension.
+/// Decide which container to mux an output as: explicit `-f`, else by
+/// extension. An `rtmp://` target implies FLV — that is the payload RTMP
+/// carries (matching FFmpeg's default for rtmp outputs).
 fn resolve_output_format(engine: &Engine, output: &OutputSpec) -> Result<String> {
     if let Some(forced) = &output.format {
         return Ok(forced.clone());
+    }
+    if output
+        .path
+        .to_str()
+        .is_some_and(rff_io::is_rtmp)
+    {
+        return Ok("flv".to_string());
     }
     let ext = output
         .path
