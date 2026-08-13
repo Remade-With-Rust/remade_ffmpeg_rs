@@ -39,26 +39,62 @@ impl Decoder for FlacDecoder {
         let (info, chans) = rusty_flac::decode(&packet.data)
             .map_err(|e| Error::invalid(format!("flac decode: {e}")))?;
         let channels = info.channels.max(1) as usize;
-        // Normalize native integer samples to f32 in [-1, 1).
-        let scale = (1u64 << info.bits_per_sample.saturating_sub(1).max(1)) as f32;
-        let inv = 1.0 / scale;
-
         let total = chans.first().map_or(0, |c| c.len());
-        let mut bytes: Vec<u8> = Vec::with_capacity(total * channels * 4);
-        for i in 0..total {
-            for chan in &chans {
-                bytes.extend_from_slice(&(chan[i] as f32 * inv).to_le_bytes());
-            }
-        }
 
-        self.frame = Some(Frame::Audio(AudioFrame {
-            sample_rate: info.sample_rate,
-            channels: channels as u16,
-            format: SampleFormat::F32,
-            planes: vec![bytes],
-            samples: total,
-            pts: packet.pts,
-        }));
+        // ≤16-bit streams interleave straight to native s16 (no float detour);
+        // wider depths go to f32 (exact — 24-bit fits the mantissa).
+        let frame = if info.bits_per_sample <= 16 {
+            let shift = 16 - info.bits_per_sample; // sub-16-bit up-scales to the s16 grid
+            let mut bytes: Vec<u8> = Vec::with_capacity(total * channels * 2);
+            match channels {
+                1 => {
+                    for &v in &chans[0] {
+                        bytes.extend_from_slice(&(((v << shift) as i16).to_le_bytes()));
+                    }
+                }
+                2 => {
+                    let (l, r) = (&chans[0], &chans[1]);
+                    for i in 0..total {
+                        bytes.extend_from_slice(&(((l[i] << shift) as i16).to_le_bytes()));
+                        bytes.extend_from_slice(&(((r[i] << shift) as i16).to_le_bytes()));
+                    }
+                }
+                _ => {
+                    for i in 0..total {
+                        for chan in &chans {
+                            bytes.extend_from_slice(&(((chan[i] << shift) as i16).to_le_bytes()));
+                        }
+                    }
+                }
+            }
+            AudioFrame {
+                sample_rate: info.sample_rate,
+                channels: channels as u16,
+                format: SampleFormat::S16,
+                planes: vec![bytes],
+                samples: total,
+                pts: packet.pts,
+            }
+        } else {
+            // Normalize native integer samples to f32 in [-1, 1).
+            let scale = (1u64 << (info.bits_per_sample - 1)) as f32;
+            let inv = 1.0 / scale;
+            let mut bytes: Vec<u8> = Vec::with_capacity(total * channels * 4);
+            for i in 0..total {
+                for chan in &chans {
+                    bytes.extend_from_slice(&(chan[i] as f32 * inv).to_le_bytes());
+                }
+            }
+            AudioFrame {
+                sample_rate: info.sample_rate,
+                channels: channels as u16,
+                format: SampleFormat::F32,
+                planes: vec![bytes],
+                samples: total,
+                pts: packet.pts,
+            }
+        };
+        self.frame = Some(Frame::Audio(frame));
         Ok(())
     }
 

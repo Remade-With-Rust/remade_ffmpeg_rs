@@ -95,14 +95,16 @@ impl BitWriter {
 // ---------------------------------------------------------------------------
 // Reader
 // ---------------------------------------------------------------------------
-/// MSB-first bit reader over a byte slice. Reads past the end return `None`
-/// from `try_*` (the decoder surfaces that as a truncated-stream error).
+/// MSB-first bit reader over a byte slice, with a LEFT-ALIGNED 64-bit window
+/// refilled a word at a time. Reads past the end return `None` (the decoder
+/// surfaces that as a truncated-stream error).
 pub struct BitReader<'a> {
     data: &'a [u8],
     /// Next unread byte.
     pos: usize,
-    /// Bit window: the top `nbits` bits of `acc`'s low 57.. hold unread bits.
-    acc: u64,
+    /// The next unread bits, left-aligned (bit 63 is the next bit).
+    bitbuf: u64,
+    /// Valid bits in `bitbuf`.
     nbits: u32,
 }
 
@@ -111,7 +113,7 @@ impl<'a> BitReader<'a> {
         BitReader {
             data,
             pos: 0,
-            acc: 0,
+            bitbuf: 0,
             nbits: 0,
         }
     }
@@ -128,10 +130,23 @@ impl<'a> BitReader<'a> {
 
     #[inline]
     fn refill(&mut self) {
-        while self.nbits <= 56 && self.pos < self.data.len() {
-            self.acc = (self.acc << 8) | self.data[self.pos] as u64;
-            self.pos += 1;
-            self.nbits += 8;
+        if self.pos + 8 <= self.data.len() {
+            // Fast path: splice a big-endian word under the valid bits.
+            let w = u64::from_be_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
+            self.bitbuf |= w >> self.nbits;
+            let take_bytes = (63 - self.nbits) >> 3;
+            self.pos += take_bytes as usize;
+            self.nbits += take_bytes * 8;
+            // Zero the tail below the valid bits — the OR-refill above relies
+            // on it (when nbits % 8 != 0 the spliced word overhangs).
+            debug_assert!(self.nbits < 64);
+            self.bitbuf &= !((1u64 << (64 - self.nbits)) - 1);
+        } else {
+            while self.nbits <= 56 && self.pos < self.data.len() {
+                self.bitbuf |= (self.data[self.pos] as u64) << (56 - self.nbits);
+                self.pos += 1;
+                self.nbits += 8;
+            }
         }
     }
 
@@ -145,8 +160,12 @@ impl<'a> BitReader<'a> {
                 return None;
             }
         }
+        if n == 0 {
+            return Some(0);
+        }
+        let v = (self.bitbuf >> (64 - n)) as u32;
+        self.bitbuf <<= n;
         self.nbits -= n;
-        let v = (self.acc >> self.nbits) as u32 & (((1u64 << n) - 1) as u32);
         Some(v)
     }
 
@@ -170,22 +189,18 @@ impl<'a> BitReader<'a> {
                     return None;
                 }
             }
-            // Bits available: top `nbits` of acc's low bits.
-            let window = self.acc << (64 - self.nbits);
-            if window == 0 {
-                // All remaining bits are zero — consume and continue.
-                q += self.nbits;
-                self.nbits = 0;
-                continue;
-            }
+            let window = self.bitbuf;
             let lead = window.leading_zeros();
             if lead >= self.nbits {
+                // All valid bits are zero — consume and continue.
                 q += self.nbits;
+                self.bitbuf = 0;
                 self.nbits = 0;
                 continue;
             }
             q += lead;
-            self.nbits -= lead + 1; // consume the zeros and the 1
+            self.bitbuf <<= lead + 1; // consume the zeros and the 1
+            self.nbits -= lead + 1;
             return Some(q);
         }
     }
@@ -193,6 +208,7 @@ impl<'a> BitReader<'a> {
     /// Skip to the next byte boundary.
     pub fn align_to_byte(&mut self) {
         let drop = self.nbits % 8;
+        self.bitbuf <<= drop;
         self.nbits -= drop;
     }
 }

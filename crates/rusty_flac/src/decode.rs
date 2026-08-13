@@ -460,15 +460,44 @@ fn restore_fixed(buf: &mut [i32], order: usize) {
     }
 }
 
-/// Invert the LPC predictor in place.
+/// Invert the LPC predictor in place. The recurrence is inherently serial,
+/// but const-order specializations let the compiler keep the whole predictor
+/// state in registers for the common orders.
 fn restore_lpc(buf: &mut [i32], qlp: &[i32], shift: u32) {
-    let order = qlp.len();
-    for i in order..buf.len() {
-        let mut sum = 0i64;
-        for (j, &c) in qlp.iter().enumerate() {
-            sum += c as i64 * buf[i - 1 - j] as i64;
+    #[inline(always)]
+    fn run<const ORDER: usize>(buf: &mut [i32], qlp: &[i32], shift: u32) {
+        let mut coeffs = [0i32; 32];
+        coeffs[..ORDER].copy_from_slice(&qlp[..ORDER]);
+        for i in ORDER..buf.len() {
+            let mut sum = 0i64;
+            for j in 0..ORDER {
+                sum += coeffs[j] as i64 * buf[i - 1 - j] as i64;
+            }
+            buf[i] = buf[i].wrapping_add((sum >> shift) as i32);
         }
-        buf[i] = buf[i].wrapping_add((sum >> shift) as i32);
+    }
+    match qlp.len() {
+        1 => run::<1>(buf, qlp, shift),
+        2 => run::<2>(buf, qlp, shift),
+        3 => run::<3>(buf, qlp, shift),
+        4 => run::<4>(buf, qlp, shift),
+        5 => run::<5>(buf, qlp, shift),
+        6 => run::<6>(buf, qlp, shift),
+        7 => run::<7>(buf, qlp, shift),
+        8 => run::<8>(buf, qlp, shift),
+        9 => run::<9>(buf, qlp, shift),
+        10 => run::<10>(buf, qlp, shift),
+        11 => run::<11>(buf, qlp, shift),
+        12 => run::<12>(buf, qlp, shift),
+        order => {
+            for i in order..buf.len() {
+                let mut sum = 0i64;
+                for (j, &c) in qlp.iter().enumerate() {
+                    sum += c as i64 * buf[i - 1 - j] as i64;
+                }
+                buf[i] = buf[i].wrapping_add((sum >> shift) as i32);
+            }
+        }
     }
 }
 

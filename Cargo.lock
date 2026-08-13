@@ -5591,6 +5591,7 @@ name = "rusty_flac"
 version = "0.1.0"
 dependencies = [
  "claxon",
+ "rusty_alloc-api",
 ]
 
 [[package]]

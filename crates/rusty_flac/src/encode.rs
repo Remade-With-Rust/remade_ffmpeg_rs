@@ -312,14 +312,18 @@ impl Encoder {
                 }
                 (assignment, subs)
             } else {
+                let max_lpc_order = self.max_lpc_order;
+                let chans = std::mem::take(&mut self.chans);
                 let subs = (0..self.channels)
                     .map(|c| {
-                        let s = self.chans[c][start..start + bs].to_vec();
+                        let arm = ArmInput::prepare(&chans[c][start..start + bs], bps);
                         let choice =
-                            analyze_subframe(&s, bps, self.max_lpc_order, wins, &mut self.stats);
-                        (s, bps, choice)
+                            analyze_subframe(&arm, max_lpc_order, wins, &mut self.stats);
+                        let ebps = arm.ebps;
+                        (arm.into_samples(), ebps, choice)
                     })
                     .collect();
+                self.chans = chans;
                 ((self.channels as u64) - 1, subs)
             };
 
@@ -441,17 +445,6 @@ fn sample_size_code(bps: u32) -> u64 {
 // Residual coding — exact Rice costs via per-partition shifted sums
 // ---------------------------------------------------------------------------
 
-/// FLAC fixed polynomial predictor residual of a given order (0–4).
-fn fixed_residual(samples: &[i32], order: usize) -> Vec<i32> {
-    let mut r: Vec<i64> = samples.iter().map(|&s| s as i64).collect();
-    for _ in 0..order {
-        for i in (1..r.len()).rev() {
-            r[i] -= r[i - 1];
-        }
-    }
-    r[order..].iter().map(|&v| v as i32).collect()
-}
-
 /// Zigzag-fold a signed residual to the unsigned value FLAC Rice-codes.
 #[inline]
 fn zigzag(v: i32) -> u32 {
@@ -460,17 +453,59 @@ fn zigzag(v: i32) -> u32 {
 
 /// `sums[k] = Σ (zigzag(v) >> k)` over a residual slice, for k = 0..=14.
 /// The exact Rice bit cost at parameter k is `sums[k] + cnt·(1 + k)` — one
-/// pass yields every parameter's exact cost.
+/// pass yields every parameter's exact cost. Integer sums, so the AVX2 path
+/// is exact (gated by `rice_sums_avx2_matches_scalar`).
 #[inline]
 fn rice_sums(res: &[i32]) -> [u64; RICE_KMAX + 1] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by the runtime AVX2 check.
+            return unsafe { rice_sums_avx2(res) };
+        }
+    }
+    rice_sums_scalar(res)
+}
+
+fn rice_sums_scalar(res: &[i32]) -> [u64; RICE_KMAX + 1] {
     let mut sums = [0u64; RICE_KMAX + 1];
     for &v in res {
         let u = zigzag(v);
-        // Fixed-count inner loop: unrolled / vectorized by the compiler.
         for (k, s) in sums.iter_mut().enumerate() {
             *s += (u >> k) as u64;
         }
     }
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rice_sums_avx2(res: &[i32]) -> [u64; RICE_KMAX + 1] {
+    use std::arch::x86_64::*;
+    // 16 u64 accumulator lanes (k = 0..15; lane 15 is discarded).
+    let sh0 = _mm256_setr_epi64x(0, 1, 2, 3);
+    let sh1 = _mm256_setr_epi64x(4, 5, 6, 7);
+    let sh2 = _mm256_setr_epi64x(8, 9, 10, 11);
+    let sh3 = _mm256_setr_epi64x(12, 13, 14, 15);
+    let mut a0 = _mm256_setzero_si256();
+    let mut a1 = _mm256_setzero_si256();
+    let mut a2 = _mm256_setzero_si256();
+    let mut a3 = _mm256_setzero_si256();
+    for &v in res {
+        let u = zigzag(v) as i64;
+        let b = _mm256_set1_epi64x(u);
+        a0 = _mm256_add_epi64(a0, _mm256_srlv_epi64(b, sh0));
+        a1 = _mm256_add_epi64(a1, _mm256_srlv_epi64(b, sh1));
+        a2 = _mm256_add_epi64(a2, _mm256_srlv_epi64(b, sh2));
+        a3 = _mm256_add_epi64(a3, _mm256_srlv_epi64(b, sh3));
+    }
+    let mut lanes = [0u64; 16];
+    _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, a0);
+    _mm256_storeu_si256(lanes.as_mut_ptr().add(4) as *mut __m256i, a1);
+    _mm256_storeu_si256(lanes.as_mut_ptr().add(8) as *mut __m256i, a2);
+    _mm256_storeu_si256(lanes.as_mut_ptr().add(12) as *mut __m256i, a3);
+    let mut sums = [0u64; RICE_KMAX + 1];
+    sums.copy_from_slice(&lanes[..RICE_KMAX + 1]);
     sums
 }
 
@@ -495,14 +530,23 @@ fn best_rice(res: &[i32]) -> (u32, u64) {
     best_k_from_sums(&rice_sums(res), res.len() as u64)
 }
 
-/// Rice-code one residual: quotient in unary, then the low `k` bits.
+/// Rice-code one residual: quotient in unary, then the low `k` bits. The
+/// common case (short quotient) fuses unary + stop bit + low bits into one
+/// accumulator write.
 #[inline]
 fn write_rice(bw: &mut BitWriter, v: i32, k: u32) {
     let u = zigzag(v);
-    bw.write_zeros(u >> k);
-    bw.write_bits(1, 1);
-    if k > 0 {
-        bw.write_bits((u & ((1u32 << k) - 1)) as u64, k);
+    let q = u >> k;
+    let total = q + 1 + k;
+    if total <= 56 {
+        let low = (u as u64) & ((1u64 << k) - 1);
+        bw.write_bits((1u64 << k) | low, total);
+    } else {
+        bw.write_zeros(q);
+        bw.write_bits(1, 1);
+        if k > 0 {
+            bw.write_bits((u & ((1u32 << k) - 1)) as u64, k);
+        }
     }
 }
 
@@ -621,30 +665,97 @@ fn write_partitioned_residual(
 // ---------------------------------------------------------------------------
 
 /// Autocorrelation of the windowed samples, lags 0..=max_order.
+///
+/// The summation uses four striped accumulators reduced as
+/// `(a0+a1) + (a2+a3)` — the same order in the scalar twin and the AVX2
+/// kernel, so the two are bit-identical and the kernel is gated by direct
+/// comparison (`autocorr_avx2_matches_scalar`).
 fn autocorrelation(samples: &[i32], max_order: usize, win: &[f64]) -> Vec<f64> {
-    let n = samples.len();
-    let w: Vec<f64> = samples
-        .iter()
-        .zip(win)
-        .map(|(&s, &g)| s as f64 * g)
-        .collect();
-    let mut autoc = vec![0.0f64; max_order + 1];
+    thread_local! {
+        // Windowed-product scratch, reused across every subframe analysis on
+        // this thread (a fresh Vec per call was ~8 × 32 KB allocations per
+        // block).
+        static W_SCRATCH: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    W_SCRATCH.with(|cell| {
+        let mut w = cell.borrow_mut();
+        w.clear();
+        w.extend(samples.iter().zip(win).map(|(&s, &g)| s as f64 * g));
+        let mut autoc = vec![0.0f64; max_order + 1];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: guarded by the runtime AVX2 check.
+                unsafe { autocorr_avx2(&w, &mut autoc) };
+                return autoc;
+            }
+        }
+        autocorr_scalar(&w, &mut autoc);
+        autoc
+    })
+}
+
+/// Scalar twin of the AVX2 kernel: identical striping, identical reduction.
+fn autocorr_scalar(w: &[f64], autoc: &mut [f64]) {
+    let n = w.len();
     for (lag, a) in autoc.iter_mut().enumerate() {
-        let mut sum = 0.0;
-        for i in lag..n {
-            sum += w[i] * w[i - lag];
+        let m = n - lag;
+        let mut acc = [0.0f64; 4];
+        let chunks = m / 4;
+        for c in 0..chunks {
+            let i = c * 4;
+            acc[0] += w[lag + i] * w[i];
+            acc[1] += w[lag + i + 1] * w[i + 1];
+            acc[2] += w[lag + i + 2] * w[i + 2];
+            acc[3] += w[lag + i + 3] * w[i + 3];
+        }
+        let mut sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+        for i in chunks * 4..m {
+            sum += w[lag + i] * w[i];
         }
         *a = sum;
     }
-    autoc
 }
 
-/// Levinson-Durbin: (coefficients, residual energy) for every order 1..=max.
-/// Coefficients follow the FLAC convention: predicted = Σ c[j]·x[i-1-j].
-fn levinson(autoc: &[f64], max_order: usize) -> Vec<(Vec<f64>, f64)> {
-    let mut lpc = vec![0.0f64; max_order];
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn autocorr_avx2(w: &[f64], autoc: &mut [f64]) {
+    use std::arch::x86_64::*;
+    let n = w.len();
+    let p = w.as_ptr();
+    for (lag, a) in autoc.iter_mut().enumerate() {
+        let m = n - lag;
+        let chunks = m / 4;
+        let mut acc = _mm256_setzero_pd();
+        for c in 0..chunks {
+            let i = c * 4;
+            let x = _mm256_loadu_pd(p.add(lag + i));
+            let y = _mm256_loadu_pd(p.add(i));
+            // Plain mul+add (no FMA) so the scalar twin matches bit-for-bit.
+            acc = _mm256_add_pd(acc, _mm256_mul_pd(x, y));
+        }
+        // Reduce as (a0+a1) + (a2+a3), matching the scalar twin.
+        let lo = _mm256_castpd256_pd128(acc);
+        let hi = _mm256_extractf128_pd(acc, 1);
+        let a01 = _mm_add_pd(lo, _mm_unpackhi_pd(lo, lo));
+        let a23 = _mm_add_pd(hi, _mm_unpackhi_pd(hi, hi));
+        let mut sum = _mm_cvtsd_f64(a01) + _mm_cvtsd_f64(a23);
+        for i in chunks * 4..m {
+            sum += *p.add(lag + i) * *p.add(i);
+        }
+        *a = sum;
+    }
+}
+
+/// Levinson-Durbin, error-only pass: fills `errs[i]` with the residual energy
+/// after order i+1 and returns how many orders were reachable before the
+/// recursion exhausted numerically. No per-order coefficient allocation —
+/// [`levinson_coeffs`] re-derives the chosen order's coefficients on demand
+/// (O(order²), amortized to nothing next to the O(order·n) autocorrelation).
+fn levinson_errs(autoc: &[f64], max_order: usize, errs: &mut [f64; 32]) -> usize {
+    let mut lpc = [0.0f64; 32];
     let mut err = autoc[0];
-    let mut per_order = Vec::with_capacity(max_order);
+    let mut found = 0usize;
     for i in 0..max_order {
         if err <= 0.0 {
             break; // numerically exhausted; keep the orders found so far
@@ -664,11 +775,37 @@ fn levinson(autoc: &[f64], max_order: usize) -> Vec<(Vec<f64>, f64)> {
             lpc[i / 2] += r * lpc[i / 2];
         }
         err *= 1.0 - r * r;
-        // The recursion solves the AR model, so the PREDICTOR coefficients are
-        // the negation (libFLAC's `lp_coeff = -lpc`).
-        per_order.push((lpc[..=i].iter().map(|&c| -c).collect(), err));
+        errs[i] = err;
+        found = i + 1;
     }
-    per_order
+    found
+}
+
+/// Coefficients for one specific order, re-running the recursion. The
+/// PREDICTOR coefficients are the negation of the AR solution (libFLAC's
+/// `lp_coeff = -lpc`).
+fn levinson_coeffs(autoc: &[f64], order: usize) -> Vec<f64> {
+    let mut lpc = [0.0f64; 32];
+    let mut err = autoc[0];
+    for i in 0..order {
+        debug_assert!(err > 0.0, "caller checked reachability via levinson_errs");
+        let mut r = -autoc[i + 1];
+        for j in 0..i {
+            r -= lpc[j] * autoc[i - j];
+        }
+        r /= err;
+        lpc[i] = r;
+        for j in 0..(i / 2) {
+            let tmp = lpc[j];
+            lpc[j] = tmp + r * lpc[i - 1 - j];
+            lpc[i - 1 - j] += r * tmp;
+        }
+        if i & 1 == 1 {
+            lpc[i / 2] += r * lpc[i / 2];
+        }
+        err *= 1.0 - r * r;
+    }
+    lpc[..order].iter().map(|&c| -c).collect()
 }
 
 /// Quantize float LPC coefficients to `precision`-bit integers + a NON-negative
@@ -698,17 +835,50 @@ fn quantize_lpc(lpc: &[f64], precision: u32) -> Option<(Vec<i32>, i32)> {
 }
 
 /// LPC residual using the quantized coefficients — exact i64 arithmetic the
-/// decoder inverts, so it round-trips losslessly.
+/// decoder inverts, so it round-trips losslessly. Integer sums are
+/// order-independent, so the const-order specializations are exact.
 fn lpc_residual(samples: &[i32], qlp: &[i32], shift: i32, order: usize) -> Vec<i32> {
-    let mut res = Vec::with_capacity(samples.len() - order);
-    for i in order..samples.len() {
-        let mut sum: i64 = 0;
-        for j in 0..order {
-            sum += qlp[j] as i64 * samples[i - 1 - j] as i64;
+    #[inline(always)]
+    fn run<const ORDER: usize>(samples: &[i32], qlp: &[i32], shift: i32) -> Vec<i32> {
+        let mut res = Vec::with_capacity(samples.len() - ORDER);
+        // i32 coefficients so every product is a 32×32→64 widening multiply
+        // (the pattern LLVM lowers to pmuldq lanes).
+        let mut coeffs = [0i32; 32];
+        coeffs[..ORDER].copy_from_slice(&qlp[..ORDER]);
+        for i in ORDER..samples.len() {
+            let mut sum: i64 = 0;
+            for j in 0..ORDER {
+                sum += coeffs[j] as i64 * samples[i - 1 - j] as i64;
+            }
+            res.push(samples[i] - (sum >> shift) as i32);
         }
-        res.push(samples[i] - (sum >> shift) as i32);
+        res
     }
-    res
+    match order {
+        1 => run::<1>(samples, qlp, shift),
+        2 => run::<2>(samples, qlp, shift),
+        3 => run::<3>(samples, qlp, shift),
+        4 => run::<4>(samples, qlp, shift),
+        5 => run::<5>(samples, qlp, shift),
+        6 => run::<6>(samples, qlp, shift),
+        7 => run::<7>(samples, qlp, shift),
+        8 => run::<8>(samples, qlp, shift),
+        9 => run::<9>(samples, qlp, shift),
+        10 => run::<10>(samples, qlp, shift),
+        11 => run::<11>(samples, qlp, shift),
+        12 => run::<12>(samples, qlp, shift),
+        _ => {
+            let mut res = Vec::with_capacity(samples.len() - order);
+            for i in order..samples.len() {
+                let mut sum: i64 = 0;
+                for j in 0..order {
+                    sum += qlp[j] as i64 * samples[i - 1 - j] as i64;
+                }
+                res.push(samples[i] - (sum >> shift) as i32);
+            }
+            res
+        }
+    }
 }
 
 /// A complete LPC subframe candidate + its total bit cost.
@@ -721,60 +891,85 @@ struct LpcCandidate {
     bits: u64,
 }
 
-/// Build the best LPC subframe for a block, searching the cached apodization
-/// windows and keeping the smallest. None if too small / degenerate.
-fn try_lpc(
+/// An estimated (not yet realized) LPC candidate: chosen order + float
+/// coefficients + the Levinson bit estimate that ranked it.
+struct LpcEstimate {
+    order: usize,
+    coeffs: Vec<f64>,
+    est_bits: f64,
+}
+
+/// When two windows' estimates are within this relative margin, both are
+/// realized exactly and compared — outside it, only the estimated winner is.
+/// (The second window wins ~63% of subframes on real music, so it can never
+/// be dropped outright; this only prunes the clear-loser realizations.)
+const WINDOW_EST_MARGIN: f64 = 0.02;
+
+/// Realize the best LPC subframe from precomputed per-window estimates:
+/// realize the estimated winner exactly, and a runner-up only when its
+/// estimate is within [`WINDOW_EST_MARGIN`]. None if degenerate.
+fn realize_best_window(
     samples: &[i32],
     bps: u32,
-    max_lpc_order: usize,
-    wins: &WindowCache,
+    ests: &[Option<LpcEstimate>],
     stats: &mut EncodeStats,
 ) -> Option<LpcCandidate> {
-    let n = samples.len();
-    let max_order = max_lpc_order.min(n / 2);
-    if max_order < 1 {
-        return None;
-    }
-    debug_assert_eq!(wins.n, n, "window cache not sized for this block");
-    let mut best: Option<LpcCandidate> = None;
-    for (widx, win) in wins.w.iter().enumerate() {
-        if let Some(c) = lpc_candidate(samples, bps, max_order, win, stats) {
-            if best.as_ref().is_none_or(|b| c.bits < b.bits) {
-                if widx == 1 {
-                    stats.lpc_window_second_won += 1;
-                }
-                best = Some(c);
+    let best_est = ests
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| e.as_ref().map(|e| (i, e.est_bits)))
+        .min_by(|a, b| a.1.total_cmp(&b.1))?
+        .0;
+
+    let mut best: Option<(usize, LpcCandidate)> = None;
+    for (widx, est) in ests.iter().enumerate() {
+        let Some(est) = est else { continue };
+        if widx != best_est {
+            let winner = ests[best_est].as_ref().expect("winner exists").est_bits;
+            if est.est_bits > winner * (1.0 + WINDOW_EST_MARGIN) {
+                continue; // clear loser: skip the expensive realization
+            }
+        }
+        if let Some(c) = realize_lpc(samples, bps, est, stats) {
+            if best.as_ref().is_none_or(|(_, b)| c.bits < b.bits) {
+                best = Some((widx, c));
             }
         }
     }
-    best
+    let (widx, cand) = best?;
+    if widx == 1 {
+        stats.lpc_window_second_won += 1;
+    }
+    Some(cand)
 }
 
-/// One LPC candidate for a given apodization window.
-fn lpc_candidate(
+/// The cheap half of an LPC candidate: autocorrelation + Levinson + order
+/// selection from residual energy. No residual computed yet.
+fn lpc_estimate(
     samples: &[i32],
     bps: u32,
     max_order: usize,
     win: &[f64],
     stats: &mut EncodeStats,
-) -> Option<LpcCandidate> {
+) -> Option<LpcEstimate> {
     let n = samples.len();
     let autoc = autocorrelation(samples, max_order, win);
     if autoc[0] <= 0.0 {
         return None;
     }
-    let orders = levinson(&autoc, max_order);
-    if orders.is_empty() {
+    let mut errs = [0.0f64; 32];
+    let found = levinson_errs(&autoc, max_order, &mut errs);
+    if found == 0 {
         return None;
     }
-    if orders.len() < max_order {
+    if found < max_order {
         stats.lpc_levinson_exhausted += 1;
     }
     // Pick the order from the Levinson residual energy (header cost vs the
     // entropy of a residual with that variance).
     let mut best_idx = 0usize;
     let mut best_est = f64::INFINITY;
-    for (idx, (_, err)) in orders.iter().enumerate() {
+    for (idx, &err) in errs[..found].iter().enumerate() {
         let order = idx + 1;
         let var = err / n as f64;
         let bits_per = if var > 0.0 {
@@ -788,8 +983,24 @@ fn lpc_candidate(
             best_idx = idx;
         }
     }
-    let order = best_idx + 1;
-    let Some((qlp, shift)) = quantize_lpc(&orders[best_idx].0, LPC_PRECISION) else {
+    let coeffs = levinson_coeffs(&autoc, best_idx + 1);
+    Some(LpcEstimate {
+        order: best_idx + 1,
+        coeffs,
+        est_bits: best_est,
+    })
+}
+
+/// The expensive half: quantize, compute the exact residual, plan partitions.
+fn realize_lpc(
+    samples: &[i32],
+    bps: u32,
+    est: &LpcEstimate,
+    stats: &mut EncodeStats,
+) -> Option<LpcCandidate> {
+    let n = samples.len();
+    let order = est.order;
+    let Some((qlp, shift)) = quantize_lpc(&est.coeffs, LPC_PRECISION) else {
         stats.lpc_quantize_failed += 1;
         return None;
     };
@@ -812,26 +1023,128 @@ fn lpc_candidate(
 // Subframe selection
 // ---------------------------------------------------------------------------
 
-/// Best FIXED order (0–4) + its residual, by single-partition cost.
-fn best_fixed(samples: &[i32], bps: u32) -> (usize, Vec<i32>) {
+/// One-pass FIXED-order estimator: |residual| sums for orders 0..=4 via the
+/// direct difference formulas — no allocation, single sweep (the libFLAC
+/// order-selection method). Returns the chosen order and its |residual| sum.
+fn fixed_order_estimate(samples: &[i32]) -> (usize, u64) {
     let n = samples.len();
     let max_order = 4.min(n.saturating_sub(1));
-    let mut best = (0usize, u64::MAX, Vec::new());
-    for order in 0..=max_order {
-        let res = fixed_residual(samples, order);
-        let (_, rb) = best_rice(&res);
-        let cost = order as u64 * bps as u64 + rb;
-        if cost < best.1 {
-            best = (order, cost, res);
+    let mut sums = [0u64; 5];
+    sums[0] = samples.iter().map(|&v| (v as i64).unsigned_abs()).sum();
+    // Ramp-in: orders become defined at i >= order.
+    for i in 1..n.min(4) {
+        let s = |j: usize| samples[i - j] as i64;
+        sums[1] += (s(0) - s(1)).unsigned_abs();
+        if i >= 2 {
+            sums[2] += (s(0) - 2 * s(1) + s(2)).unsigned_abs();
+        }
+        if i >= 3 {
+            sums[3] += (s(0) - 3 * s(1) + 3 * s(2) - s(3)).unsigned_abs();
         }
     }
-    (best.0, best.2)
+    for i in 4..n {
+        let s0 = samples[i] as i64;
+        let s1 = samples[i - 1] as i64;
+        let s2 = samples[i - 2] as i64;
+        let s3 = samples[i - 3] as i64;
+        let s4 = samples[i - 4] as i64;
+        sums[1] += (s0 - s1).unsigned_abs();
+        sums[2] += (s0 - 2 * s1 + s2).unsigned_abs();
+        sums[3] += (s0 - 3 * s1 + 3 * s2 - s3).unsigned_abs();
+        sums[4] += (s0 - 4 * s1 + 6 * s2 - 4 * s3 + s4).unsigned_abs();
+    }
+    let mut best = 0usize;
+    for order in 1..=max_order {
+        if sums[order] < sums[best] {
+            best = order;
+        }
+    }
+    (best, sums[best])
+}
+
+/// Estimated single-partition Rice bit cost from a |residual| sum: pick the
+/// parameter from the folded mean and price `Σ(u>>k) ≈ (Σu)>>k` (error < cnt).
+fn rice_bits_estimate(abs_sum: u64, cnt: u64) -> u64 {
+    if cnt == 0 {
+        return 0;
+    }
+    let usum = abs_sum.saturating_mul(2); // zigzag(v) ∈ {2|v|, 2|v|−1}
+    let mean = usum / cnt;
+    let k = if mean > 0 { 63 - mean.leading_zeros() } else { 0 }.min(RICE_KMAX as u32);
+    // Check k−1, k, k+1 — the mean-derived parameter is within one of optimal.
+    let mut best = u64::MAX;
+    for kk in k.saturating_sub(1)..=(k + 1).min(RICE_KMAX as u32) {
+        let bits = cnt * (1 + kk as u64) + (usum >> kk);
+        best = best.min(bits);
+    }
+    best
+}
+
+/// The FIXED residual of one order via its direct formula — one vectorizable
+/// pass, i32 arithmetic (bounded: |sample| < 2^25, coefficient sum ≤ 16 ⇒
+/// |residual| < 2^30).
+fn fixed_residual(samples: &[i32], order: usize) -> Vec<i32> {
+    let n = samples.len();
+    let mut res = Vec::with_capacity(n - order);
+    match order {
+        0 => res.extend_from_slice(samples),
+        1 => {
+            for i in 1..n {
+                res.push(samples[i].wrapping_sub(samples[i - 1]));
+            }
+        }
+        2 => {
+            for i in 2..n {
+                res.push(
+                    samples[i] - 2 * samples[i - 1] + samples[i - 2],
+                );
+            }
+        }
+        3 => {
+            for i in 3..n {
+                res.push(
+                    samples[i] - 3 * samples[i - 1] + 3 * samples[i - 2] - samples[i - 3],
+                );
+            }
+        }
+        4 => {
+            for i in 4..n {
+                res.push(
+                    samples[i] - 4 * samples[i - 1] + 6 * samples[i - 2] - 4 * samples[i - 3]
+                        + samples[i - 4],
+                );
+            }
+        }
+        _ => unreachable!("fixed order 0..=4"),
+    }
+    res
 }
 
 /// The chosen subframe encoding for a channel + its bit cost.
 struct SubframeChoice {
     bits: u64,
+    /// Trailing zero bits shifted out of every sample of this subframe
+    /// (FLAC's wasted-bits field). The analysis ran on the SHIFTED samples at
+    /// `bps - wasted`; `bits` includes the unary wasted-count header cost.
+    wasted: u32,
     kind: SubframeKind,
+}
+
+/// Trailing zero bits common to every sample of the block (0 for all-zero
+/// input — that's the CONSTANT path). This is what ffmpeg/libFLAC strip on
+/// 16-bit-content-in-24-bit-container material, worth 8 bits/sample there.
+fn detect_wasted(samples: &[i32], bps: u32) -> u32 {
+    let mut acc = 0i32;
+    for &v in samples {
+        acc |= v;
+        if acc & 1 != 0 {
+            return 0; // early out: any odd sample kills the shift
+        }
+    }
+    if acc == 0 {
+        return 0;
+    }
+    (acc.trailing_zeros()).min(bps - 1)
 }
 
 enum SubframeKind {
@@ -845,51 +1158,186 @@ enum SubframeKind {
     Lpc(Box<LpcCandidate>),
 }
 
-/// Choose the cheapest subframe type (CONSTANT / LPC / FIXED / VERBATIM).
-fn analyze_subframe(
-    samples: &[i32],
-    bps: u32,
+/// The cheap phase of one arm's analysis: constant detection, LPC estimates
+/// for every window, the fixed-order estimate — everything short of residual
+/// realization. `est_bits` is the arm's estimated subframe cost, used for
+/// stereo-mode gating before any expensive realization happens.
+struct ArmEstimate {
+    constant: Option<i32>,
+    ests: Vec<Option<LpcEstimate>>,
+    est_bits: u64,
+}
+
+/// One arm's analysis input: samples with any wasted bits already shifted
+/// out, the effective bit depth, and the wasted count for the header.
+struct ArmInput<'a> {
+    samples: std::borrow::Cow<'a, [i32]>,
+    /// Effective coded depth: nominal bps − wasted.
+    ebps: u32,
+    wasted: u32,
+}
+
+impl<'a> ArmInput<'a> {
+    /// Detect trailing-zero (wasted) bits and shift them out.
+    fn prepare(samples: &'a [i32], bps: u32) -> ArmInput<'a> {
+        let wasted = detect_wasted(samples, bps);
+        if wasted == 0 {
+            ArmInput {
+                samples: std::borrow::Cow::Borrowed(samples),
+                ebps: bps,
+                wasted: 0,
+            }
+        } else {
+            ArmInput {
+                samples: std::borrow::Cow::Owned(samples.iter().map(|&v| v >> wasted).collect()),
+                ebps: bps - wasted,
+                wasted,
+            }
+        }
+    }
+
+    fn into_samples(self) -> Vec<i32> {
+        self.samples.into_owned()
+    }
+}
+
+fn estimate_arm(
+    arm: &ArmInput<'_>,
     max_lpc_order: usize,
     wins: &WindowCache,
     stats: &mut EncodeStats,
-) -> SubframeChoice {
+) -> ArmEstimate {
+    let samples: &[i32] = &arm.samples;
+    let bps = arm.ebps;
     let n = samples.len();
-
     if samples.iter().all(|&s| s == samples[0]) {
+        return ArmEstimate {
+            constant: Some(samples[0]),
+            ests: Vec::new(),
+            est_bits: 8 + arm.wasted as u64 + bps as u64,
+        };
+    }
+    let max_order = max_lpc_order.min(n / 2);
+    let ests: Vec<Option<LpcEstimate>> = if max_order >= 1 {
+        debug_assert_eq!(wins.n, n, "window cache not sized for this block");
+        wins.w
+            .iter()
+            .map(|win| lpc_estimate(samples, bps, max_order, win, stats))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let lpc_est = ests
+        .iter()
+        .flatten()
+        .map(|e| e.est_bits)
+        .fold(f64::INFINITY, f64::min);
+    let verbatim = 8 + n as u64 * bps as u64;
+    // The FIXED estimate is computed lazily in realize_arm — for arm RANKING
+    // the LPC estimate suffices (FIXED wins only degenerate content, and pure
+    // silence is already caught by the constant check above).
+    let est_bits = if lpc_est.is_finite() {
+        (lpc_est as u64).min(verbatim)
+    } else {
+        let (fx_order, fx_abs) = fixed_order_estimate(samples);
+        let fx_est = 8
+            + fx_order as u64 * bps as u64
+            + 6
+            + rice_bits_estimate(fx_abs, (n - fx_order) as u64);
+        fx_est.min(verbatim)
+    };
+    ArmEstimate {
+        constant: None,
+        ests,
+        est_bits: est_bits + arm.wasted as u64,
+    }
+}
+
+/// The expensive phase: realize the estimated LPC winner (and close runner-up
+/// windows), the estimate-gated FIXED plan, and pick the cheapest subframe.
+fn realize_arm(arm: &ArmInput<'_>, est: &ArmEstimate, stats: &mut EncodeStats) -> SubframeChoice {
+    let samples: &[i32] = &arm.samples;
+    let bps = arm.ebps;
+    // The wasted-bits header cost (unary count) rides on every kind's bits so
+    // stereo-mode comparisons stay honest.
+    let wb = arm.wasted as u64;
+    let n = samples.len();
+    if let Some(v) = est.constant {
         return SubframeChoice {
-            bits: 8 + bps as u64,
-            kind: SubframeKind::Constant(samples[0]),
+            bits: 8 + wb + bps as u64,
+            wasted: arm.wasted,
+            kind: SubframeKind::Constant(v),
         };
     }
 
-    let (fx_order, fx_res) = best_fixed(samples, bps);
-    let fx_plan = plan_partitions(&fx_res, n, fx_order);
-    let fixed_bits = 8 + fx_order as u64 * bps as u64 + 6 + fx_plan.bits;
+    let lpc = realize_best_window(samples, bps, &est.ests, stats);
+    let lpc_bits = lpc.as_ref().map_or(u64::MAX, |c| c.bits.saturating_add(wb));
 
-    let lpc = try_lpc(samples, bps, max_lpc_order, wins, stats);
-    let lpc_bits = lpc.as_ref().map_or(u64::MAX, |c| c.bits);
+    // FIXED: one-pass order estimate, then the exact residual + partition
+    // plan only when the estimate says FIXED could still beat the realized
+    // LPC candidate (a wide 10% margin — partitioning can undercut the
+    // single-partition estimate). LPC wins ~99.6% of real subframes, so this
+    // skips the second-most-expensive per-arm stage almost always.
+    let (fx_order, fx_abs) = fixed_order_estimate(samples);
+    let fx_est =
+        8 + fx_order as u64 * bps as u64 + 6 + rice_bits_estimate(fx_abs, (n - fx_order) as u64);
+    let fixed = if lpc.is_none() || fx_est <= lpc_bits.saturating_add(lpc_bits / 10) {
+        let fx_res = fixed_residual(samples, fx_order);
+        let fx_plan = plan_partitions(&fx_res, n, fx_order);
+        let fixed_bits = 8 + wb + fx_order as u64 * bps as u64 + 6 + fx_plan.bits;
+        Some((fx_res, fx_plan, fixed_bits))
+    } else {
+        None
+    };
+    let fixed_bits = fixed.as_ref().map_or(u64::MAX, |f| f.2);
 
-    let verbatim_bits = 8 + n as u64 * bps as u64;
+    let verbatim_bits = 8 + wb + n as u64 * bps as u64;
 
     if lpc_bits <= fixed_bits && lpc_bits <= verbatim_bits {
         SubframeChoice {
             bits: lpc_bits,
+            wasted: arm.wasted,
             kind: SubframeKind::Lpc(Box::new(lpc.unwrap())),
         }
-    } else if fixed_bits <= verbatim_bits {
-        SubframeChoice {
-            bits: fixed_bits,
-            kind: SubframeKind::Fixed {
-                order: fx_order,
-                res: fx_res,
-                plan: fx_plan,
-            },
+    } else if let Some((fx_res, fx_plan, fixed_bits)) = fixed {
+        if fixed_bits <= verbatim_bits {
+            SubframeChoice {
+                bits: fixed_bits,
+                wasted: arm.wasted,
+                kind: SubframeKind::Fixed {
+                    order: fx_order,
+                    res: fx_res,
+                    plan: fx_plan,
+                },
+            }
+        } else {
+            SubframeChoice {
+                bits: verbatim_bits,
+                wasted: arm.wasted,
+                kind: SubframeKind::Verbatim,
+            }
         }
     } else {
         SubframeChoice {
             bits: verbatim_bits,
+            wasted: arm.wasted,
             kind: SubframeKind::Verbatim,
         }
+    }
+}
+
+/// Write the shared subframe-header prefix: padding bit, 6-bit type, and the
+/// wasted-bits flag (+ unary count).
+fn write_subframe_header(bw: &mut BitWriter, type_code: u64, wasted: u32, stats: &mut EncodeStats) {
+    bw.write_bits(0, 1);
+    bw.write_bits(type_code, 6);
+    if wasted == 0 {
+        bw.write_bits(0, 1);
+    } else {
+        stats.sub_wasted_bits += 1;
+        bw.write_bits(1, 1);
+        bw.write_zeros(wasted - 1); // unary: (wasted-1) zeros then a 1
+        bw.write_bits(1, 1);
     }
 }
 
@@ -903,16 +1351,12 @@ fn write_subframe_from(
     match &choice.kind {
         SubframeKind::Constant(v) => {
             stats.sub_constant += 1;
-            bw.write_bits(0, 1);
-            bw.write_bits(0b000000, 6);
-            bw.write_bits(0, 1);
+            write_subframe_header(bw, 0b000000, choice.wasted, stats);
             bw.write_signed(*v as i64, bps);
         }
         SubframeKind::Verbatim => {
             stats.sub_verbatim += 1;
-            bw.write_bits(0, 1);
-            bw.write_bits(0b000001, 6);
-            bw.write_bits(0, 1);
+            write_subframe_header(bw, 0b000001, choice.wasted, stats);
             for &s in samples {
                 bw.write_signed(s as i64, bps);
             }
@@ -921,9 +1365,8 @@ fn write_subframe_from(
             stats.sub_fixed += 1;
             stats.fixed_orders[*order] += 1;
             stats.partition_orders[plan.partition_order as usize] += 1;
-            bw.write_bits(0, 1);
-            bw.write_bits(0b001000 | *order as u64, 6); // FIXED, order in low 3 bits
-            bw.write_bits(0, 1);
+            // FIXED, order in low 3 bits
+            write_subframe_header(bw, 0b001000 | *order as u64, choice.wasted, stats);
             for &s in &samples[..*order] {
                 bw.write_signed(s as i64, bps);
             }
@@ -934,9 +1377,8 @@ fn write_subframe_from(
         SubframeKind::Lpc(c) => {
             stats.sub_lpc += 1;
             stats.partition_orders[c.plan.partition_order as usize] += 1;
-            bw.write_bits(0, 1);
-            bw.write_bits(0b100000 | (c.order as u64 - 1), 6); // LPC, (order-1) in low 5 bits
-            bw.write_bits(0, 1);
+            // LPC, (order-1) in low 5 bits
+            write_subframe_header(bw, 0b100000 | (c.order as u64 - 1), choice.wasted, stats);
             for &s in &samples[..c.order] {
                 bw.write_signed(s as i64, bps); // warm-up
             }
@@ -952,8 +1394,31 @@ fn write_subframe_from(
     }
 }
 
+/// Choose the cheapest subframe type (CONSTANT / LPC / FIXED / VERBATIM) —
+/// the mono / multichannel path (stereo goes through [`decide_stereo`]'s
+/// two-phase arm gating instead).
+fn analyze_subframe(
+    arm: &ArmInput<'_>,
+    max_lpc_order: usize,
+    wins: &WindowCache,
+    stats: &mut EncodeStats,
+) -> SubframeChoice {
+    let est = estimate_arm(arm, max_lpc_order, wins, stats);
+    realize_arm(arm, &est, stats)
+}
+
+/// Stereo modes whose estimated cost is within this relative margin of the
+/// estimated best are realized exactly and compared; the rest are pruned
+/// before any residual work.
+const STEREO_EST_MARGIN_PCT: u64 = 1;
+
 /// Choose the cheapest of the four FLAC stereo modes for one block.
 /// side = L − R (needs bps+1 bits); mid = (L + R) >> 1 (bps).
+///
+/// Two-phase: every arm (L, R, mid, side) gets a cheap ESTIMATE (window
+/// autocorrelations + Levinson + fixed-order sums); only the arms belonging
+/// to estimate-competitive modes are REALIZED (residuals, exact Rice plans).
+/// The final mode decision uses exact realized costs.
 fn decide_stereo(
     l: &[i32],
     r: &[i32],
@@ -965,26 +1430,81 @@ fn decide_stereo(
     let side: Vec<i32> = l.iter().zip(r).map(|(&a, &b)| a - b).collect();
     let mid: Vec<i32> = l.iter().zip(r).map(|(&a, &b)| (a + b) >> 1).collect();
 
-    let cl = analyze_subframe(l, bps, max_lpc_order, wins, stats);
-    let cr = analyze_subframe(r, bps, max_lpc_order, wins, stats);
-    let cm = analyze_subframe(&mid, bps, max_lpc_order, wins, stats);
-    let cs = analyze_subframe(&side, bps + 1, max_lpc_order, wins, stats);
-
-    // independent / left-side / right-side / mid-side.
-    let costs = [
-        cl.bits + cr.bits,
-        cl.bits + cs.bits,
-        cs.bits + cr.bits,
-        cm.bits + cs.bits,
+    // Wasted-bits detection + shift per arm, then estimates for all four.
+    let arms = [
+        ArmInput::prepare(l, bps),
+        ArmInput::prepare(r, bps),
+        ArmInput::prepare(&mid, bps),
+        ArmInput::prepare(&side, bps + 1),
     ];
-    let mode = (0..4).min_by_key(|&i| costs[i]).unwrap();
+    let ests = [
+        estimate_arm(&arms[0], max_lpc_order, wins, stats),
+        estimate_arm(&arms[1], max_lpc_order, wins, stats),
+        estimate_arm(&arms[2], max_lpc_order, wins, stats),
+        estimate_arm(&arms[3], max_lpc_order, wins, stats),
+    ];
+    // Mode order: independent / left-side / right-side / mid-side.
+    let mode_arms: [[usize; 2]; 4] = [[0, 1], [0, 3], [3, 1], [2, 3]];
+    let est_costs: Vec<u64> = mode_arms
+        .iter()
+        .map(|&[a, b]| ests[a].est_bits + ests[b].est_bits)
+        .collect();
+    let best_est = *est_costs.iter().min().expect("4 modes");
+    let cutoff = best_est + best_est * STEREO_EST_MARGIN_PCT / 100;
+    let candidate: Vec<bool> = est_costs.iter().map(|&c| c <= cutoff).collect();
 
-    match mode {
-        0 => (1, vec![(l.to_vec(), bps, cl), (r.to_vec(), bps, cr)]),
-        1 => (8, vec![(l.to_vec(), bps, cl), (side, bps + 1, cs)]),
-        2 => (9, vec![(side, bps + 1, cs), (r.to_vec(), bps, cr)]),
-        _ => (10, vec![(mid, bps, cm), (side, bps + 1, cs)]),
+    // Phase 2: realize exactly the arms candidate modes need.
+    let mut choices: [Option<SubframeChoice>; 4] = [None, None, None, None];
+    for (m, &is_cand) in candidate.iter().enumerate() {
+        if !is_cand {
+            continue;
+        }
+        for &arm in &mode_arms[m] {
+            if choices[arm].is_none() {
+                choices[arm] = Some(realize_arm(&arms[arm], &ests[arm], stats));
+            }
+        }
     }
+
+    // Exact decision over the candidate modes (ties → lowest mode index,
+    // matching the original exhaustive search's ordering).
+    let mut mode = usize::MAX;
+    let mut best_bits = u64::MAX;
+    for (m, &is_cand) in candidate.iter().enumerate() {
+        if !is_cand {
+            continue;
+        }
+        let [a, b] = mode_arms[m];
+        let bits = choices[a].as_ref().expect("realized").bits
+            + choices[b].as_ref().expect("realized").bits;
+        if bits < best_bits {
+            best_bits = bits;
+            mode = m;
+        }
+    }
+    debug_assert!(mode < 4);
+
+    // Hand back the two chosen arms: their (possibly wasted-shifted) samples,
+    // effective bit depth, and choices.
+    let assignment = [1u64, 8, 9, 10][mode];
+    let [a, b] = mode_arms[mode];
+    let mut arms = arms;
+    let mut take_arm = |arm: usize, choices: &mut [Option<SubframeChoice>; 4]| {
+        let input = std::mem::replace(
+            &mut arms[arm],
+            ArmInput {
+                samples: std::borrow::Cow::Borrowed(&[]),
+                ebps: 0,
+                wasted: 0,
+            },
+        );
+        let ebps = input.ebps;
+        let choice = choices[arm].take().expect("chosen arm realized");
+        (input.into_samples(), ebps, choice)
+    };
+    let first = take_arm(a, &mut choices);
+    let second = take_arm(b, &mut choices);
+    (assignment, vec![first, second])
 }
 
 #[cfg(test)]
@@ -1075,6 +1595,101 @@ mod tests {
         assert!(stats.frames > 0);
         assert!(stats.sub_constant > 0, "constant channel not detected");
         assert!(stats.sub_lpc + stats.sub_fixed > 0, "no predictive subframes");
+    }
+
+    /// The AVX2 autocorrelation must match the scalar twin bit-for-bit
+    /// (identical striping and reduction order — no FMA, no reassociation).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn autocorr_avx2_matches_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut x = 3u64;
+        for n in [15usize, 64, 1000, 4096, 4097] {
+            let w: Vec<f64> = (0..n)
+                .map(|i| {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(99);
+                    ((x >> 33) as i32 as f64) * 1e-3 + (i as f64 * 0.13).sin() * 500.0
+                })
+                .collect();
+            let mut a = vec![0.0f64; 13];
+            let mut b = vec![0.0f64; 13];
+            autocorr_scalar(&w, &mut a);
+            unsafe { autocorr_avx2(&w, &mut b) };
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "lag {i} differs at n={n}");
+            }
+        }
+    }
+
+    /// 16-bit content stored in a 24-bit container (8 zero LSBs per sample)
+    /// must trigger the wasted-bits path: dramatically smaller than the naive
+    /// coding, still exactly lossless.
+    #[test]
+    fn wasted_bits_on_16_in_24_content() {
+        let n = 20_000;
+        let mut x = 5u64;
+        let s16: Vec<i32> = (0..n)
+            .map(|i| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(11);
+                ((i as f64 * 0.02).sin() * 9000.0) as i32 + ((x >> 40) & 0xFF) as i32 - 128
+            })
+            .collect();
+        let s24: Vec<i32> = s16.iter().map(|&v| v << 8).collect();
+
+        let encode = |data: &Vec<i32>, bps: u32| -> Vec<u8> {
+            let mut e = Encoder::new(48000, 1, bps).unwrap();
+            e.push_planar(&[data]).unwrap();
+            e.finish()
+        };
+        let native16 = encode(&s16, 16);
+        let in24 = encode(&s24, 24);
+
+        // Lossless round-trip of the 24-bit stream.
+        let (info, chans) = crate::decode::decode(&in24).unwrap();
+        assert_eq!(info.bits_per_sample, 24);
+        assert_eq!(chans[0], s24, "wasted-bits round-trip broke losslessness");
+
+        // The 24-bit container must cost within ~2% of the true 16-bit coding
+        // (8 zero LSBs are shifted out, not Rice-coded).
+        let ratio = in24.len() as f64 / native16.len() as f64;
+        assert!(
+            ratio < 1.02,
+            "wasted-bits not engaging: 24-bit container {} B vs 16-bit {} B ({ratio:.3}x)",
+            in24.len(),
+            native16.len()
+        );
+
+        // And the stats counter must show the path fired.
+        let mut e = Encoder::new(48000, 1, 24).unwrap();
+        e.push_planar(&[&s24]).unwrap();
+        let (_, stats) = e.finish_with_stats();
+        assert!(stats.sub_wasted_bits > 0, "wasted-bits counter never fired");
+    }
+
+    /// The AVX2 shifted-sum kernel is integer math — it must match the scalar
+    /// twin EXACTLY on every length (including the empty/short tails).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn rice_sums_avx2_matches_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut x = 11u64;
+        for n in [0usize, 1, 3, 16, 255, 4096] {
+            let res: Vec<i32> = (0..n)
+                .map(|_| {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(7);
+                    ((x >> 30) as i32) >> ((x >> 60) & 15) // wide dynamic range
+                })
+                .collect();
+            assert_eq!(
+                rice_sums_scalar(&res),
+                unsafe { rice_sums_avx2(&res) },
+                "n={n}"
+            );
+        }
     }
 
     #[test]
