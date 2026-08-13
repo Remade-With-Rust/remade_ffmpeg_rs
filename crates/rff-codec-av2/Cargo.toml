@@ -15,7 +15,7 @@ categories = ["multimedia", "multimedia::video"]
 [dependencies]
 rff-core.workspace = true
 rff-codec.workspace = true
-rusty_av2d = { version = "0.2.6", default-features = false, features = [
+rusty_av2d = { version = "0.2.7", default-features = false, features = [
     "bitdepth_8",
     "bitdepth_16",
 ] }

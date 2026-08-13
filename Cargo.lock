@@ -5549,9 +5549,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_av2d"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4e1791708dffe38ef240a5494d1d1e223f68b9a08b4c994eed3b45907d5c8ca"
+checksum = "90fafd4a3899b40a930740ba065a6addea003da6c3e44fd559d775640183998c"
 dependencies = [
  "assert_matches",
  "atomig",
