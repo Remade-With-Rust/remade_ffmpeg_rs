@@ -15,4 +15,4 @@ categories = ["multimedia", "multimedia::audio", "multimedia::encoding"]
 [dependencies]
 rff-core.workspace = true
 rff-codec.workspace = true
-claxon.workspace = true
+rusty_flac.workspace = true

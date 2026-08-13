@@ -54,11 +54,27 @@ fn chunks(buf: &[u8], mut p: usize) -> Vec<([u8; 4], Range<usize>)> {
     out
 }
 
-/// Map a WAVE `(format_tag, bits_per_sample)` to a [`SampleFormat`].
-fn sample_format(tag: u16, bits: u16) -> Option<SampleFormat> {
+/// How the demuxer delivers a WAVE `(format_tag, bits_per_sample)` layout.
+/// The engine's native sample formats are s16/f32; the other PCM layouts are
+/// repacked losslessly on read (24-bit ints fit f32's mantissa exactly, u8
+/// fits s16), so every standard PCM WAV decodes without an engine-wide
+/// sample-format addition.
+enum Delivery {
+    /// Pass the data chunk through untouched as this format.
+    Native(SampleFormat),
+    /// Unsigned 8-bit → s16 (exact, `(v-128) << 8`).
+    U8ToS16,
+    /// Signed 24-bit little-endian → f32 (exact, 24 bits < f32's mantissa).
+    S24ToF32,
+}
+
+/// Map a WAVE `(format_tag, bits_per_sample)` to a delivery plan.
+fn sample_format(tag: u16, bits: u16) -> Option<Delivery> {
     match (tag, bits) {
-        (1, 16) => Some(SampleFormat::S16),
-        (3, 32) => Some(SampleFormat::F32),
+        (1, 16) => Some(Delivery::Native(SampleFormat::S16)),
+        (3, 32) => Some(Delivery::Native(SampleFormat::F32)),
+        (1, 8) => Some(Delivery::U8ToS16),
+        (1, 24) => Some(Delivery::S24ToF32),
         _ => None,
     }
 }
@@ -103,21 +119,51 @@ impl Demuxer for WavDemuxer {
             return Err(Error::invalid("wav demux: short `fmt ` chunk"));
         }
         let f = &buf[fmt.start..];
-        let format_tag = rd_u16(f, 0);
+        let mut format_tag = rd_u16(f, 0);
         let channels = rd_u16(f, 2);
         let sample_rate = rd_u32(f, 4);
         let bits = rd_u16(f, 14);
-        let format = sample_format(format_tag, bits).ok_or_else(|| {
+        // WAVE_FORMAT_EXTENSIBLE: the real tag is the SubFormat GUID's first
+        // two bytes (fmt chunk offset 24), after cbSize(2) + valid-bits(2) +
+        // channel-mask(4).
+        if format_tag == 0xFFFE {
+            if fmt.len() < 26 {
+                return Err(Error::invalid("wav demux: short extensible `fmt ` chunk"));
+            }
+            format_tag = rd_u16(f, 24);
+        }
+        let delivery = sample_format(format_tag, bits).ok_or_else(|| {
             Error::unsupported(format!(
-                "wav demux: format tag {format_tag}, {bits}-bit (only s16/f32)"
+                "wav demux: format tag {format_tag}, {bits}-bit (pcm u8/s16/s24 or f32)"
             ))
         })?;
 
-        let data = top
+        let raw = top
             .iter()
             .find(|(id, _)| id == b"data")
-            .map(|(_, r)| buf[r.clone()].to_vec())
+            .map(|(_, r)| &buf[r.clone()])
             .ok_or_else(|| Error::invalid("wav demux: no `data` chunk"))?;
+        let (format, data) = match delivery {
+            Delivery::Native(fmt) => (fmt, raw.to_vec()),
+            Delivery::U8ToS16 => {
+                let mut out = Vec::with_capacity(raw.len() * 2);
+                for &b in raw {
+                    let v = ((b as i16) - 128) << 8;
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                (SampleFormat::S16, out)
+            }
+            Delivery::S24ToF32 => {
+                let n = raw.len() / 3;
+                let mut out = Vec::with_capacity(n * 4);
+                const SCALE: f32 = 1.0 / 8_388_608.0; // 2^-23: exact for 24-bit ints
+                for s in raw[..n * 3].chunks_exact(3) {
+                    let v = i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8; // sign-extend
+                    out.extend_from_slice(&(v as f32 * SCALE).to_le_bytes());
+                }
+                (SampleFormat::F32, out)
+            }
+        };
         self.sample = Some(data);
 
         let mut stream = Stream::new(0, CodecId::Pcm);
@@ -243,6 +289,84 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// Build a minimal WAV file around a fmt chunk + data chunk.
+    fn wav_file(fmt: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"WAVE");
+        put_chunk(&mut body, b"fmt ", fmt);
+        put_chunk(&mut body, b"data", data);
+        let mut file = Vec::new();
+        file.extend_from_slice(b"RIFF");
+        file.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        file.extend_from_slice(&body);
+        file
+    }
+
+    fn fmt_chunk(tag: u16, channels: u16, rate: u32, bits: u16) -> Vec<u8> {
+        let block_align = channels * (bits / 8);
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&tag.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&rate.to_le_bytes());
+        fmt.extend_from_slice(&(rate * block_align as u32).to_le_bytes());
+        fmt.extend_from_slice(&block_align.to_le_bytes());
+        fmt.extend_from_slice(&bits.to_le_bytes());
+        fmt
+    }
+
+    #[test]
+    fn s24_wav_delivers_exact_f32() {
+        // Extremes + sign cases: the f32 delivery must be exact.
+        let samples: [i32; 6] = [0, 1, -1, 8_388_607, -8_388_608, -4_242_424];
+        let mut data = Vec::new();
+        for &v in &samples {
+            data.extend_from_slice(&v.to_le_bytes()[..3]);
+        }
+        let file = wav_file(&fmt_chunk(1, 1, 48_000, 24), &data);
+
+        let mut dem = WavDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = dem.read_header().unwrap();
+        assert_eq!(streams[0].sample_format, Some(SampleFormat::F32));
+        let pkt = dem.read_packet().unwrap();
+        for (i, &v) in samples.iter().enumerate() {
+            let f = f32::from_le_bytes(pkt.data[i * 4..i * 4 + 4].try_into().unwrap());
+            let back = (f * 8_388_608.0).round() as i32;
+            assert_eq!(back, v, "sample {i} not exact");
+        }
+    }
+
+    #[test]
+    fn extensible_24bit_wav_parses() {
+        // WAVE_FORMAT_EXTENSIBLE (0xFFFE) with a PCM SubFormat GUID.
+        let mut fmt = fmt_chunk(0xFFFE, 2, 44_100, 24);
+        fmt.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        fmt.extend_from_slice(&24u16.to_le_bytes()); // valid bits
+        fmt.extend_from_slice(&3u32.to_le_bytes()); // channel mask
+        fmt.extend_from_slice(&1u16.to_le_bytes()); // SubFormat: PCM
+        fmt.extend_from_slice(&[0u8; 14]); // rest of GUID
+        let file = wav_file(&fmt, &[0u8; 6]);
+
+        let mut dem = WavDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = dem.read_header().unwrap();
+        assert_eq!(streams[0].sample_format, Some(SampleFormat::F32));
+        assert_eq!(streams[0].channels, 2);
+    }
+
+    #[test]
+    fn u8_wav_delivers_s16() {
+        let file = wav_file(&fmt_chunk(1, 1, 8_000, 8), &[0u8, 128, 255]);
+        let mut dem = WavDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = dem.read_header().unwrap();
+        assert_eq!(streams[0].sample_format, Some(SampleFormat::S16));
+        let pkt = dem.read_packet().unwrap();
+        let vals: Vec<i16> = pkt
+            .data
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(vals, vec![-32768, 0, 32512]);
     }
 
     #[test]
