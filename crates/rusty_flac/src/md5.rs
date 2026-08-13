@@ -5,16 +5,8 @@
 //! decoder can verify the audio survived intact (`flac -t`), independent of
 //! whether the bitstream itself parsed.
 
-/// Per-round left-rotation amounts.
-#[rustfmt::skip]
-const S: [u32; 64] = [
-    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
-    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-];
-
-/// Constants K[i] = floor(2^32 · |sin(i+1)|).
+/// Constants K[i] = floor(2^32 · |sin(i+1)|). (Rotation amounts are literal
+/// in the unrolled rounds.)
 #[rustfmt::skip]
 const K: [u32; 64] = [
     0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
@@ -101,30 +93,66 @@ impl Md5 {
     fn process(&mut self, block: &[u8; 64]) {
         let mut m = [0u32; 16];
         for (i, w) in m.iter_mut().enumerate() {
-            *w = u32::from_le_bytes([
-                block[i * 4],
-                block[i * 4 + 1],
-                block[i * 4 + 2],
-                block[i * 4 + 3],
-            ]);
+            *w = u32::from_le_bytes(block[i * 4..i * 4 + 4].try_into().unwrap());
         }
         let [mut a, mut b, mut c, mut d] = self.state;
-        for i in 0..64 {
-            let (f, g) = if i < 16 {
-                ((b & c) | (!b & d), i)
-            } else if i < 32 {
-                ((d & b) | (!d & c), (5 * i + 1) % 16)
-            } else if i < 48 {
-                (b ^ c ^ d, (3 * i + 5) % 16)
-            } else {
-                (c ^ (b | !d), (7 * i) % 16)
+
+        // Fully unrolled rounds: constant indices/rotations resolve at compile
+        // time (the branchy 0..64 loop cost ~30% more per block).
+        macro_rules! step {
+            ($f:expr, $a:ident, $b:ident, $c:ident, $d:ident, $i:expr, $g:expr, $s:expr) => {
+                let f = ($f)
+                    .wrapping_add($a)
+                    .wrapping_add(K[$i])
+                    .wrapping_add(m[$g]);
+                $a = $b.wrapping_add(f.rotate_left($s));
             };
-            let f = f.wrapping_add(a).wrapping_add(K[i]).wrapping_add(m[g]);
-            a = d;
-            d = c;
-            c = b;
-            b = b.wrapping_add(f.rotate_left(S[i]));
         }
+        macro_rules! round1 {
+            ($a:ident, $b:ident, $c:ident, $d:ident, $i:expr, $s:expr) => {
+                step!(($b & $c) | (!$b & $d), $a, $b, $c, $d, $i, $i, $s);
+            };
+        }
+        macro_rules! round2 {
+            ($a:ident, $b:ident, $c:ident, $d:ident, $i:expr, $s:expr) => {
+                step!(($d & $b) | (!$d & $c), $a, $b, $c, $d, $i, (5 * $i + 1) % 16, $s);
+            };
+        }
+        macro_rules! round3 {
+            ($a:ident, $b:ident, $c:ident, $d:ident, $i:expr, $s:expr) => {
+                step!($b ^ $c ^ $d, $a, $b, $c, $d, $i, (3 * $i + 5) % 16, $s);
+            };
+        }
+        macro_rules! round4 {
+            ($a:ident, $b:ident, $c:ident, $d:ident, $i:expr, $s:expr) => {
+                step!($c ^ ($b | !$d), $a, $b, $c, $d, $i, (7 * $i) % 16, $s);
+            };
+        }
+        macro_rules! quad {
+            ($round:ident, $base:expr, $s0:expr, $s1:expr, $s2:expr, $s3:expr) => {
+                $round!(a, b, c, d, $base, $s0);
+                $round!(d, a, b, c, $base + 1, $s1);
+                $round!(c, d, a, b, $base + 2, $s2);
+                $round!(b, c, d, a, $base + 3, $s3);
+            };
+        }
+        quad!(round1, 0, 7, 12, 17, 22);
+        quad!(round1, 4, 7, 12, 17, 22);
+        quad!(round1, 8, 7, 12, 17, 22);
+        quad!(round1, 12, 7, 12, 17, 22);
+        quad!(round2, 16, 5, 9, 14, 20);
+        quad!(round2, 20, 5, 9, 14, 20);
+        quad!(round2, 24, 5, 9, 14, 20);
+        quad!(round2, 28, 5, 9, 14, 20);
+        quad!(round3, 32, 4, 11, 16, 23);
+        quad!(round3, 36, 4, 11, 16, 23);
+        quad!(round3, 40, 4, 11, 16, 23);
+        quad!(round3, 44, 4, 11, 16, 23);
+        quad!(round4, 48, 6, 10, 15, 21);
+        quad!(round4, 52, 6, 10, 15, 21);
+        quad!(round4, 56, 6, 10, 15, 21);
+        quad!(round4, 60, 6, 10, 15, 21);
+
         self.state[0] = self.state[0].wrapping_add(a);
         self.state[1] = self.state[1].wrapping_add(b);
         self.state[2] = self.state[2].wrapping_add(c);

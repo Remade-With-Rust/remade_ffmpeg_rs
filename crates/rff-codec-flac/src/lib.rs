@@ -45,24 +45,27 @@ impl Decoder for FlacDecoder {
         // wider depths go to f32 (exact — 24-bit fits the mantissa).
         let frame = if info.bits_per_sample <= 16 {
             let shift = 16 - info.bits_per_sample; // sub-16-bit up-scales to the s16 grid
-            let mut bytes: Vec<u8> = Vec::with_capacity(total * channels * 2);
+            let mut bytes: Vec<u8> = vec![0u8; total * channels * 2];
             match channels {
                 1 => {
-                    for &v in &chans[0] {
-                        bytes.extend_from_slice(&(((v << shift) as i16).to_le_bytes()));
+                    for (out, &v) in bytes.chunks_exact_mut(2).zip(&chans[0]) {
+                        out.copy_from_slice(&((v << shift) as i16).to_le_bytes());
                     }
                 }
                 2 => {
                     let (l, r) = (&chans[0], &chans[1]);
-                    for i in 0..total {
-                        bytes.extend_from_slice(&(((l[i] << shift) as i16).to_le_bytes()));
-                        bytes.extend_from_slice(&(((r[i] << shift) as i16).to_le_bytes()));
+                    for (i, out) in bytes.chunks_exact_mut(4).enumerate() {
+                        // One packed 4-byte store per frame.
+                        let packed = ((l[i] << shift) as i16 as u16 as u32)
+                            | (((r[i] << shift) as i16 as u16 as u32) << 16);
+                        out.copy_from_slice(&packed.to_le_bytes());
                     }
                 }
                 _ => {
-                    for i in 0..total {
-                        for chan in &chans {
-                            bytes.extend_from_slice(&(((chan[i] << shift) as i16).to_le_bytes()));
+                    for (i, out) in bytes.chunks_exact_mut(channels * 2).enumerate() {
+                        for (c, chan) in chans.iter().enumerate() {
+                            out[c * 2..c * 2 + 2]
+                                .copy_from_slice(&((chan[i] << shift) as i16).to_le_bytes());
                         }
                     }
                 }
@@ -183,28 +186,21 @@ impl Encoder for FlacEncoder {
 
         let ch = self.channels;
         let n = a.samples;
-        let scratch = &mut self.scratch;
-        scratch.clear();
-        scratch.reserve(n * ch);
+        let enc = self.enc.as_mut().expect("encoder initialized above");
+        let map_err = |e: rusty_flac::EncodeError| Error::invalid(format!("flac encode: {e}"));
         match a.format {
-            SampleFormat::S16 => {
-                let d = &a.planes[0];
-                for i in 0..n * ch {
-                    let o = i * 2;
-                    scratch.push(i16::from_le_bytes([d[o], d[o + 1]]) as i32);
-                }
-            }
-            SampleFormat::F32 => {
-                let d = &a.planes[0];
-                let scale = (1i64 << 23) as f32;
-                for i in 0..n * ch {
-                    let o = i * 4;
-                    let s = f32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
-                    scratch.push(quantize(s, scale));
-                }
-            }
+            // The hot layouts stream straight from the packet bytes.
+            SampleFormat::S16 => enc
+                .push_s16le_bytes(&a.planes[0][..n * ch * 2])
+                .map_err(map_err),
+            SampleFormat::F32 => enc
+                .push_f32le_bytes(&a.planes[0][..n * ch * 4])
+                .map_err(map_err),
             SampleFormat::F32Planar => {
                 let scale = (1i64 << 23) as f32;
+                let scratch = &mut self.scratch;
+                scratch.clear();
+                scratch.reserve(n * ch);
                 for i in 0..n {
                     for c in 0..ch {
                         let d = &a.planes[c];
@@ -213,18 +209,12 @@ impl Encoder for FlacEncoder {
                         scratch.push(quantize(s, scale));
                     }
                 }
+                enc.push_interleaved(scratch).map_err(map_err)
             }
-            _ => {
-                return Err(Error::invalid(
-                    "flac encode: unsupported sample format (need S16/F32/F32Planar)",
-                ))
-            }
+            _ => Err(Error::invalid(
+                "flac encode: unsupported sample format (need S16/F32/F32Planar)",
+            )),
         }
-        self.enc
-            .as_mut()
-            .expect("encoder initialized above")
-            .push_interleaved(scratch)
-            .map_err(|e| Error::invalid(format!("flac encode: {e}")))
     }
 
     fn receive_packet(&mut self) -> Result<Packet> {

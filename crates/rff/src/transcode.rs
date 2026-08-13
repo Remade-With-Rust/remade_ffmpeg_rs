@@ -1095,6 +1095,11 @@ fn build_op(
             os.sample_format = target_sample_format
                 .or(stream.sample_format)
                 .or(Some(SampleFormat::F32));
+            // The muxer writes os.sample_format into the container header
+            // BEFORE any frame is seen, so every frame must be conformed to
+            // that committed format — decoders may legitimately emit either
+            // layout (the FLAC decoder emits native s16 for 16-bit streams).
+            let target_sample_format = target_sample_format.or(os.sample_format);
             // Audio encoders timestamp packets in per-channel samples, so the
             // output stream's time base is 1/sample_rate.
             if stream.media_type == MediaType::Audio && out_rate > 0 {

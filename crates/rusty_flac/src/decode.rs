@@ -194,7 +194,13 @@ impl<'a> Decoder<'a> {
         for c in 0..nch {
             let sub_bps = bps + if c < 2 && side_ch[c] { 1 } else { 0 };
             let buf = &mut self.scratch[c];
-            buf.clear();
+            // Size without re-zeroing what will be overwritten: shrink is
+            // O(1), and growth only zero-fills the newly exposed tail once
+            // per size change (block sizes are constant within a stream).
+            if buf.len() != bs {
+                buf.clear();
+                buf.resize(bs, 0);
+            }
             decode_subframe(&mut br, bs, sub_bps, buf)?;
         }
 
@@ -294,12 +300,15 @@ fn read_utf8(br: &mut BitReader) -> Option<u64> {
     Some(val)
 }
 
+/// Decode one subframe into `out` (pre-sized to the block length; every slot
+/// is written except explicit zero-runs, which are filled here).
 fn decode_subframe(
     br: &mut BitReader,
     bs: usize,
     bps: u32,
-    out: &mut Vec<i32>,
+    out: &mut [i32],
 ) -> Result<(), DecodeError> {
+    debug_assert_eq!(out.len(), bs);
     if br.read_bits(1).ok_or(DecodeError::Truncated)? != 0 {
         return Err(DecodeError::BadSubframe("padding bit"));
     }
@@ -314,15 +323,14 @@ fn decode_subframe(
     }
     let ebps = bps - wasted; // effective coded bit depth
 
-    out.reserve(bs);
     match ty {
         0b000000 => {
             let v = br.read_signed(ebps).ok_or(DecodeError::Truncated)?;
-            out.resize(bs, v);
+            out.fill(v);
         }
         0b000001 => {
-            for _ in 0..bs {
-                out.push(br.read_signed(ebps).ok_or(DecodeError::Truncated)?);
+            for slot in out.iter_mut() {
+                *slot = br.read_signed(ebps).ok_or(DecodeError::Truncated)?;
             }
         }
         0b001000..=0b001100 => {
@@ -330,8 +338,8 @@ fn decode_subframe(
             if order > bs {
                 return Err(DecodeError::BadSubframe("fixed order > blocksize"));
             }
-            for _ in 0..order {
-                out.push(br.read_signed(ebps).ok_or(DecodeError::Truncated)?);
+            for slot in out[..order].iter_mut() {
+                *slot = br.read_signed(ebps).ok_or(DecodeError::Truncated)?;
             }
             decode_residual(br, bs, order, out)?;
             restore_fixed(out, order);
@@ -341,8 +349,8 @@ fn decode_subframe(
             if order > bs {
                 return Err(DecodeError::BadSubframe("lpc order > blocksize"));
             }
-            for _ in 0..order {
-                out.push(br.read_signed(ebps).ok_or(DecodeError::Truncated)?);
+            for slot in out[..order].iter_mut() {
+                *slot = br.read_signed(ebps).ok_or(DecodeError::Truncated)?;
             }
             let prec = br.read_bits(4).ok_or(DecodeError::Truncated)? + 1;
             if prec > 15 {
@@ -372,11 +380,13 @@ fn decode_subframe(
 
 /// Partitioned Rice residual: appends `bs - order` residuals to `out`
 /// (which already holds the warm-up samples).
+/// Partitioned Rice residual: fills `out[order..]` (warm-ups already in
+/// `out[..order]`).
 fn decode_residual(
     br: &mut BitReader,
     bs: usize,
     order: usize,
-    out: &mut Vec<i32>,
+    out: &mut [i32],
 ) -> Result<(), DecodeError> {
     let method = br.read_bits(2).ok_or(DecodeError::Truncated)?;
     let (pbits, escape) = match method {
@@ -392,33 +402,29 @@ fn decode_residual(
     if bs % n_part != 0 || psize < order {
         return Err(DecodeError::BadSubframe("partition geometry"));
     }
+    let mut w = order;
     for part in 0..n_part {
         let cnt = if part == 0 { psize - order } else { psize };
         let param = br.read_bits(pbits).ok_or(DecodeError::Truncated)?;
         if param == escape {
             let raw = br.read_bits(5).ok_or(DecodeError::Truncated)?;
-            if raw == 0 {
-                for _ in 0..cnt {
-                    out.push(0);
+            if raw > 0 {
+                for slot in &mut out[w..w + cnt] {
+                    *slot = br.read_signed(raw).ok_or(DecodeError::Truncated)?;
                 }
             } else {
-                for _ in 0..cnt {
-                    out.push(br.read_signed(raw).ok_or(DecodeError::Truncated)?);
-                }
+                out[w..w + cnt].fill(0);
             }
+            w += cnt;
         } else {
-            for _ in 0..cnt {
-                let q = br.read_unary().ok_or(DecodeError::Truncated)?;
-                let low = if param > 0 {
-                    br.read_bits(param).ok_or(DecodeError::Truncated)?
-                } else {
-                    0
-                };
-                let u = ((q as u64) << param) as u32 | low;
-                out.push(((u >> 1) as i32) ^ -((u & 1) as i32)); // un-zigzag
+            for slot in &mut out[w..w + cnt] {
+                let u = br.read_rice(param).ok_or(DecodeError::Truncated)?;
+                *slot = ((u >> 1) as i32) ^ -((u & 1) as i32); // un-zigzag
             }
+            w += cnt;
         }
     }
+    debug_assert_eq!(w, bs);
     Ok(())
 }
 

@@ -67,16 +67,26 @@ fn transcode(engine: &Engine, input: &Path, output: &Path, codec: CodecId) {
     rff::transcode::run(engine, &spec).expect("transcode");
 }
 
+/// Read a WAV back as normalized f32, whatever PCM layout the pipeline chose
+/// (the FLAC decoder emits native s16 for 16-bit streams, f32 for wider).
 fn read_wav_f32(engine: &Engine, path: &Path) -> Vec<f32> {
     let mut dem = engine
         .formats
         .open_demuxer("wav", Box::new(fs::File::open(path).unwrap()))
         .unwrap();
-    let _ = dem.read_header().unwrap();
+    let streams = dem.read_header().unwrap();
     let data = dem.read_packet().unwrap().data;
-    data.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
+    match streams[0].sample_format.expect("wav sample format") {
+        SampleFormat::S16 => data
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect(),
+        SampleFormat::F32 => data
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        other => panic!("unexpected wav sample format {other:?}"),
+    }
 }
 
 #[test]

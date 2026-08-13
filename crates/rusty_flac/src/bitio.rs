@@ -211,6 +211,34 @@ impl<'a> BitReader<'a> {
         self.bitbuf <<= drop;
         self.nbits -= drop;
     }
+
+    /// Read one Rice code (unary quotient, then `k` low bits) with a single
+    /// refill on the hot path. `k <= 30`.
+    #[inline]
+    pub fn read_rice(&mut self, k: u32) -> Option<u32> {
+        if self.nbits < 48 {
+            self.refill();
+        }
+        let lead = self.bitbuf.leading_zeros();
+        // Fast path: the whole code sits in the valid window.
+        if lead + 1 + k <= self.nbits {
+            let q = lead;
+            let consumed = lead + 1;
+            let low = if k > 0 {
+                ((self.bitbuf << consumed) >> (64 - k)) as u32
+            } else {
+                0
+            };
+            self.bitbuf <<= consumed + k;
+            self.nbits -= consumed + k;
+            return Some(((q as u64) << k) as u32 | low);
+        }
+        // Slow path (long quotient / end of stream): compose from primitives.
+        // The u64 shift tolerates absurd quotients from malformed streams.
+        let q = self.read_unary()?;
+        let low = if k > 0 { self.read_bits(k)? } else { 0 };
+        Some(((q as u64) << k) as u32 | low)
+    }
 }
 
 #[cfg(test)]
