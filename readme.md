@@ -16,6 +16,8 @@
 > [security policy](SECURITY.md), the
 > [compatibility & patent matrix](docs/compatibility.md), and
 > [how to contribute](CONTRIBUTING.md).
+>
+> Access our most important <a href="https://claude.ai/code/artifact/67cb6256-2326-4dc7-8d65-545b0a70a30e">AI skills to building a new internet</a>.
 
 ---
 
