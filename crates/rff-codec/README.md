@@ -48,7 +48,7 @@ This crate is one layer of
 **[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)** — a
 ground-up, permissively-licensed Rust rebuild of FFmpeg: a drop-in
 `ffmpeg`/`ffprobe` CLI on pure-Rust codecs, with no copyleft. Most users want
-the [`rff`](https://crates.io/crates/rff) engine facade or the
+the [`remade-ffmpeg`](https://crates.io/crates/remade-ffmpeg) engine facade or the
 [`rff-cli`](https://crates.io/crates/rff-cli) binaries rather than this crate
 directly.
 

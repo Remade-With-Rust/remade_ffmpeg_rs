@@ -36,6 +36,11 @@ Rules for new code:
 
 ## Build gotcha
 
-The CLI executables are built by the `rff-cli` package, not `rff` (a
-library). `cargo build -p rff` never relinks the exe — always build/test
-with `-p rff-cli` and verify the binary mtime before trusting a CLI A/B.
+The CLI executables are built by the `rff-cli` package, not the engine
+facade (a library). `cargo build -p remade-ffmpeg` never relinks the exe —
+always build/test with `-p rff-cli` and verify the binary mtime before
+trusting a CLI A/B.
+
+Note the facade's package name is **`remade-ffmpeg`** (the short name `rff`
+is taken on crates.io by an unrelated crate), but its *library* is still
+`rff` — so code says `use rff::...` while cargo says `-p remade-ffmpeg`.

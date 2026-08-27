@@ -58,6 +58,7 @@ default-members = [
     "crates/rff-format-webvtt",
     "crates/rff-filter",
     "crates/rff-resample",
+    "crates/rff-targets",
     "crates/rff",
     "crates/rff-cli",
     "crates/rff-auth",
@@ -65,7 +66,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
@@ -74,65 +75,66 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Internal crates (path-linked; versions track the workspace).
-rff-core = { path = "crates/rff-core", version = "0.1.0" }
-rff-codec = { path = "crates/rff-codec", version = "0.1.0" }
-rff-format = { path = "crates/rff-format", version = "0.1.0" }
+rff-core = { path = "crates/rff-core", version = "0.2.0" }
+rff-codec = { path = "crates/rff-codec", version = "0.2.0" }
+rff-format = { path = "crates/rff-format", version = "0.2.0" }
+rff-targets = { path = "crates/rff-targets", version = "0.2.0" }
 rff-codec-h264 = { path = "crates/rff-codec-h264", version = "0.2.0" }
-rff-codec-opus = { path = "crates/rff-codec-opus", version = "0.1.0" }
-rff-codec-avif = { path = "crates/rff-codec-avif", version = "0.1.0" }
-rff-format-avi = { path = "crates/rff-format-avi", version = "0.1.0" }
-rff-format-avif = { path = "crates/rff-format-avif", version = "0.1.0" }
-rff-codec-png = { path = "crates/rff-codec-png", version = "0.1.0" }
-rff-format-png = { path = "crates/rff-format-png", version = "0.1.0" }
-rff-codec-jpeg = { path = "crates/rff-codec-jpeg", version = "0.1.0" }
-rff-format-jpeg = { path = "crates/rff-format-jpeg", version = "0.1.0" }
-rff-codec-gif = { path = "crates/rff-codec-gif", version = "0.1.0" }
-rff-format-gif = { path = "crates/rff-format-gif", version = "0.1.0" }
-rff-codec-webp = { path = "crates/rff-codec-webp", version = "0.2.0" }
-rff-format-webp = { path = "crates/rff-format-webp", version = "0.2.0" }
-rff-codec-pcm = { path = "crates/rff-codec-pcm", version = "0.1.0" }
-rff-codec-vorbis = { path = "crates/rff-codec-vorbis", version = "0.1.0" }
-rff-codec-flac = { path = "crates/rff-codec-flac", version = "0.1.0" }
-rff-codec-jxl = { path = "crates/rff-codec-jxl", version = "0.1.0" }
-rff-codec-aac = { path = "crates/rff-codec-aac", version = "0.1.0" }
-rff-codec-vp9 = { path = "crates/rff-codec-vp9", version = "0.1.0" }
-rff-codec-av2 = { path = "crates/rff-codec-av2", version = "0.1.0" }
-rff-codec-mp3 = { path = "crates/rff-codec-mp3", version = "0.1.0" }
+rff-codec-opus = { path = "crates/rff-codec-opus", version = "0.2.0" }
+rff-codec-avif = { path = "crates/rff-codec-avif", version = "0.2.0" }
+rff-format-avi = { path = "crates/rff-format-avi", version = "0.2.0" }
+rff-format-avif = { path = "crates/rff-format-avif", version = "0.2.0" }
+rff-codec-png = { path = "crates/rff-codec-png", version = "0.2.0" }
+rff-format-png = { path = "crates/rff-format-png", version = "0.2.0" }
+rff-codec-jpeg = { path = "crates/rff-codec-jpeg", version = "0.2.0" }
+rff-format-jpeg = { path = "crates/rff-format-jpeg", version = "0.2.0" }
+rff-codec-gif = { path = "crates/rff-codec-gif", version = "0.2.0" }
+rff-format-gif = { path = "crates/rff-format-gif", version = "0.2.0" }
+rff-codec-webp = { path = "crates/rff-codec-webp", version = "0.2.1" }
+rff-format-webp = { path = "crates/rff-format-webp", version = "0.2.1" }
+rff-codec-pcm = { path = "crates/rff-codec-pcm", version = "0.2.0" }
+rff-codec-vorbis = { path = "crates/rff-codec-vorbis", version = "0.2.0" }
+rff-codec-flac = { path = "crates/rff-codec-flac", version = "0.2.0" }
+rff-codec-jxl = { path = "crates/rff-codec-jxl", version = "0.2.0" }
+rff-codec-aac = { path = "crates/rff-codec-aac", version = "0.2.0" }
+rff-codec-vp9 = { path = "crates/rff-codec-vp9", version = "0.2.0" }
+rff-codec-av2 = { path = "crates/rff-codec-av2", version = "0.2.0" }
+rff-codec-mp3 = { path = "crates/rff-codec-mp3", version = "0.2.0" }
 # Standalone, publishable codec cores (the `rusty_h264` pattern: pure codec
 # crate + thin rff-codec-* adapter). Each carries its OWN version â€” they ship
 # to crates.io on their own cadence, decoupled from the workspace version and
 # from each other, so these no longer move in lockstep at 0.1.x.
-rusty_vp9 = { path = "crates/rusty_vp9", version = "0.1.0" }
+rusty_vp9 = { path = "crates/rusty_vp9", version = "0.1.1" }
 rusty_flac = { path = "crates/rusty_flac", version = "0.1.0" }
 rusty_mp3 = { path = "crates/rusty_mp3", version = "0.7.0" }
 rusty_aac = { path = "crates/rusty_aac", version = "0.5.0" }
-rusty_vorbis = { path = "crates/rusty_vorbis", version = "0.1.0" }
+rusty_vorbis = { path = "crates/rusty_vorbis", version = "0.1.1" }
 rusty_jpeg = { path = "crates/rusty_jpeg", version = "0.3" }
-rff-codec-rawvideo = { path = "crates/rff-codec-rawvideo", version = "0.1.0" }
+rff-codec-rawvideo = { path = "crates/rff-codec-rawvideo", version = "0.2.0" }
 # TEMPORARY C/FFI H.264 â€” deliberately NOT in default-members; opt-in only.
-rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.1.0" }
-rff-format-wav = { path = "crates/rff-format-wav", version = "0.1.0" }
-rff-format-ogg = { path = "crates/rff-format-ogg", version = "0.1.0" }
-rff-format-flac = { path = "crates/rff-format-flac", version = "0.1.0" }
-rff-format-mp3 = { path = "crates/rff-format-mp3", version = "0.1.0" }
-rff-format-y4m = { path = "crates/rff-format-y4m", version = "0.1.0" }
-rff-format-ivf = { path = "crates/rff-format-ivf", version = "0.1.0" }
-rff-format-av2f = { path = "crates/rff-format-av2f", version = "0.1.0" }
-rff-format-jxl = { path = "crates/rff-format-jxl", version = "0.1.0" }
-rff-format-mp4 = { path = "crates/rff-format-mp4", version = "0.1.0" }
-rff-format-mkv = { path = "crates/rff-format-mkv", version = "0.1.0" }
-rff-format-ts = { path = "crates/rff-format-ts", version = "0.1.0" }
-rff-format-flv = { path = "crates/rff-format-flv", version = "0.1.0" }
-rff-format-hls = { path = "crates/rff-format-hls", version = "0.1.0" }
-rff-io = { path = "crates/rff-io", version = "0.1.0" }
-rff-subtitle = { path = "crates/rff-subtitle", version = "0.1.0" }
-rff-format-srt = { path = "crates/rff-format-srt", version = "0.1.0" }
-rff-format-ass = { path = "crates/rff-format-ass", version = "0.1.0" }
-rff-format-webvtt = { path = "crates/rff-format-webvtt", version = "0.1.0" }
-rff-filter = { path = "crates/rff-filter", version = "0.1.0" }
-rff-resample = { path = "crates/rff-resample", version = "0.1.0" }
-rff = { path = "crates/rff", version = "0.1.0" }
-rff-auth = { path = "crates/rff-auth", version = "0.1.0" }
+rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.2.0" }
+rff-format-wav = { path = "crates/rff-format-wav", version = "0.2.0" }
+rff-format-ogg = { path = "crates/rff-format-ogg", version = "0.2.0" }
+rff-format-flac = { path = "crates/rff-format-flac", version = "0.2.0" }
+rff-format-mp3 = { path = "crates/rff-format-mp3", version = "0.2.0" }
+rff-format-y4m = { path = "crates/rff-format-y4m", version = "0.2.0" }
+rff-format-ivf = { path = "crates/rff-format-ivf", version = "0.2.0" }
+rff-format-av2f = { path = "crates/rff-format-av2f", version = "0.2.0" }
+rff-format-jxl = { path = "crates/rff-format-jxl", version = "0.2.0" }
+rff-format-mp4 = { path = "crates/rff-format-mp4", version = "0.2.0" }
+rff-format-mkv = { path = "crates/rff-format-mkv", version = "0.2.0" }
+rff-format-ts = { path = "crates/rff-format-ts", version = "0.2.0" }
+rff-format-flv = { path = "crates/rff-format-flv", version = "0.2.0" }
+rff-format-hls = { path = "crates/rff-format-hls", version = "0.2.0" }
+rff-io = { path = "crates/rff-io", version = "0.2.0" }
+rff-subtitle = { path = "crates/rff-subtitle", version = "0.2.0" }
+rff-format-srt = { path = "crates/rff-format-srt", version = "0.2.0" }
+rff-format-ass = { path = "crates/rff-format-ass", version = "0.2.0" }
+rff-format-webvtt = { path = "crates/rff-format-webvtt", version = "0.2.0" }
+rff-filter = { path = "crates/rff-filter", version = "0.2.0" }
+rff-resample = { path = "crates/rff-resample", version = "0.2.0" }
+rff = { path = "crates/rff", version = "0.2.0", package = "remade-ffmpeg" }
+rff-auth = { path = "crates/rff-auth", version = "0.2.0" }
 
 # Third-party (all permissive â€” MIT/Apache-2.0; CI-enforced by cargo-deny).
 # AV1 encode + decode come from our own rusty-av1-toolkit (BSD-2-Clause forks of
@@ -161,7 +163,7 @@ rusty_png = { path = "crates/rusty_png", version = "0.3.2", features = ["paralle
 gif = { path = "crates/rusty_gif", version = "0.1.0", package = "rusty_gif" }
 # webp: our own rusty_webp â€” a fork of image-rs/image-webp 0.2.4 (MIT/Apache),
 # carried forward in-tree. See crates/rusty_webp/NOTICE.md.
-rusty_webp = { path = "crates/rusty_webp", version = "0.1.0" }
+rusty_webp = { path = "crates/rusty_webp", version = "0.1.1" }
 # Opus comes from our own rusty-opus (BSD-3-Clause fork of the pure-Rust opus-rs
 # port of libopus 1.6 â€” no FFI). The fork's package is now named `rusty-opus`
 # (previously carried upstream's `opus-rs` name â€” renamed so the crate, Cargo.lock,
@@ -213,7 +215,7 @@ jxl-oxide = "0.12"
 # LIBRARY behind a default-on `global-alloc` feature. That would hard-error
 # against the declaration above, so `rff-codec-h264` pins it with
 # `default-features = false`. Do not remove that.
-rusty_alloc-api = "0.4"
+rusty_alloc-api = "1.1"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.0.2-alpha"
 rustls-native-certs = "0.8"

@@ -2,7 +2,7 @@
 # Fetch libvpx VP9 conformance vectors for the bit-exactness gate
 # (crates/rff/tests/vp9_conformance.rs). Then:
 #
-#   VP9_VECTORS_DIR=<dir> cargo test -p rff --test vp9_conformance --release \
+#   VP9_VECTORS_DIR=<dir> cargo test -p remade-ffmpeg --test vp9_conformance --release \
 #       -- --ignored --nocapture
 #
 # Usage: scripts/fetch-vp9-vectors.sh [dest-dir]   (default: ./vp9-vectors)

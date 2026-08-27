@@ -1,4 +1,12 @@
-# rff
+# remade-ffmpeg
+
+> Published as **`remade-ffmpeg`** — the short name `rff` on crates.io
+> belongs to an unrelated crate. The library is still `rff`, so the code
+> below is what you actually write:
+>
+> ```toml
+> remade-ffmpeg = "0.2"
+> ```
 
 [![Remade With Rust](https://img.shields.io/badge/Remade%20With-Rust-000?logo=rust&logoColor=fff)](https://github.com/remade-with-rust)
 [![By Mata Network](https://img.shields.io/badge/by-Mata%20Network-5b2be0)](https://www.mata.network)
@@ -61,7 +69,7 @@ This crate is one layer of
 **[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)** — a
 ground-up, permissively-licensed Rust rebuild of FFmpeg: a drop-in
 `ffmpeg`/`ffprobe` CLI on pure-Rust codecs, with no copyleft. Most users want
-the [`rff`](https://crates.io/crates/rff) engine facade or the
+the [`remade-ffmpeg`](https://crates.io/crates/remade-ffmpeg) engine facade or the
 [`rff-cli`](https://crates.io/crates/rff-cli) binaries rather than this crate
 directly.
 

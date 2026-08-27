@@ -1,7 +1,7 @@
 ﻿[package]
 name = "rff-codec-webp"
 description = "Remade FFmpeg (Rust): WebP still-image codec (VP8/VP8L)."
-version = "0.2.0" # rusty_webp backend: native-YUV + animated decode, LZ77/cache/predictor encoder
+version = "0.2.1" # 0.2.1: republished onto the 0.2.x rff-core/rff-codec line
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

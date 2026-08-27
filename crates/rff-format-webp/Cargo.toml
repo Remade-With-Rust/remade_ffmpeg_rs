@@ -1,7 +1,7 @@
 ﻿[package]
 name = "rff-format-webp"
 description = "Remade FFmpeg (Rust): WebP single-image container (file = codec stream)."
-version = "0.2.0" # rusty_webp probe: range labeling + animation time base
+version = "0.2.1" # 0.2.1: MuxCaps declaration for the conversion-target planner
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

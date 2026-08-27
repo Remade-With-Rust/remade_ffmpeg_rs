@@ -85,7 +85,7 @@ jobs:
       - name: Decode every vector, assert per-frame I420 MD5 is bit-exact
         env:
           VP9_VECTORS_DIR: ${{ github.workspace }}/vp9-vectors
-        run: cargo test -p rff --test vp9_conformance --release --locked -- --ignored --nocapture
+        run: cargo test -p remade-ffmpeg --test vp9_conformance --release --locked -- --ignored --nocapture
 
   # Untrusted-input robustness: mutated/truncated/random byte streams (seeded
   # from a real coded frame) must surface as `Err`, never panic. Deterministic

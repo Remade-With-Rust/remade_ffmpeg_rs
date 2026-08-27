@@ -195,7 +195,7 @@ both name pairs.
 To embed the engine in your own application, take the library instead:
 
 ```sh
-cargo add rff
+cargo add remade-ffmpeg
 ```
 
 From a source checkout: `cargo install --path crates/rff-cli`.

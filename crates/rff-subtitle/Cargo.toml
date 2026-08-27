@@ -5,7 +5,7 @@ description = "Remade FFmpeg (Rust): shared text-subtitle helpers (cue timing pa
 # version is immutable, so this crate carries an explicit patch bump to ship
 # it. Deliberately NOT `version.workspace = true` — the rest of the workspace
 # is still 0.1.0. Fold back into workspace inheritance at the next bump.
-version = "0.1.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

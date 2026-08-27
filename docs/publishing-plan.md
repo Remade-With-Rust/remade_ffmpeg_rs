@@ -1,6 +1,6 @@
 # Publishing plan — the `rff-*` family to crates.io
 
-**Goal.** Make `cargo add rff` and `cargo install rff-cli` work, so downstream
+**Goal.** Make `cargo add remade-ffmpeg` and `cargo install rff-cli` work, so downstream
 apps can embed the engine without a git dependency. (A git dep is not just
 inconvenient — it *blocks the consumer from publishing at all*, since crates.io
 rejects any crate whose dependency graph contains a git source.)
@@ -71,12 +71,32 @@ drop-in distribution), `Prometheus/crates/prom-trial/src/tools.rs` (now prefers
 `rff` and falls back to `ffmpeg`), `tools/quality/corpus_eval.sh`, and the root
 README's Install + Quick start sections.
 
-### 0.3 Name squatting check
+### 0.3 Name squatting check — ⚠️ PARTLY OVERTAKEN, 2026-08-27
 
-All target names are free on the index: `rff`, `rff-core`, `rff-codec`,
-`rff-format`, `rff-cli`, `rff-io`, `rff-server` verified unclaimed. Publishing
-`rff-core` early in the run claims the family prefix, which is the main reason
-not to sit on this.
+The original check found `rff`, `rff-core`, `rff-codec`, `rff-format`,
+`rff-cli`, `rff-io`, `rff-server` all unclaimed. That is **no longer true of
+the bare name**: `rff` on crates.io is now **owned by Andrew Stewart
+(`stewart`), at 0.3.0** — an unrelated crate. We never published it, and the
+window closed while the rest of the family went out.
+
+The `rff-*` prefix itself is safe: `rff-core`, `rff-codec`, `rff-format` and
+every `rff-format-*` / `rff-codec-*` published so far are owned by
+`Ttimmahlax`. `rff-cli`, `rff-server` and `rff-targets` are still free.
+
+**Resolution:** the facade crate is published as **`remade-ffmpeg`**, keeping
+`[lib] name = "rff"` so downstream code is unchanged — `use rff::...` still
+compiles, only the dependency line differs:
+
+```toml
+remade-ffmpeg = "0.2"
+```
+
+Alternatives checked and free at the time of the decision: `remade-ffmpeg`,
+`remade_ffmpeg`, `rff-engine`. (`rffmpeg` is taken by `nrbnlulu`.)
+
+**Lesson:** a name-availability check has a shelf life. Claim the flagship name
+first, not last — the publish order put `rff` in wave 4, behind 42 other
+crates, and that delay is exactly what cost it.
 
 ---
 
@@ -276,7 +296,7 @@ the 7 hours; under Path A it's a few minutes.
 1. **Verify a clean consumer.** In an empty directory outside the workspace:
    ```sh
    cargo new /tmp/rff-smoke && cd /tmp/rff-smoke
-   cargo add rff && cargo build
+   cargo add remade-ffmpeg && cargo build
    cargo install rff-cli && rff -codecs
    ```
    This is the only test that proves the published graph resolves — the
@@ -284,7 +304,7 @@ the 7 hours; under Path A it's a few minutes.
    missing version pin.
 2. **Update the root README `Install` section** — replace
    `cargo install --path crates/rff-cli` with `cargo install rff-cli`, and add
-   `cargo add rff` for the library path.
+   `cargo add remade-ffmpeg` for the library path.
 3. **Tag the release** `v0.1.0` and cut a GitHub Release; the README already
    promises prebuilt binaries there.
 4. **`docs.rs`** builds automatically, with **default features**. `rff`'s
