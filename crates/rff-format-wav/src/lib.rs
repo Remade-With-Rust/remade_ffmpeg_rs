@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::ops::Range;
 
 use rff_core::{CodecId, Error, Packet, Rational, Result, SampleFormat};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Muxer, Output, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 
 /// Register the WAV format into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {
@@ -21,6 +21,7 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|output| Box::new(WavMuxer::new(output))),
         muxer_path: None,
         probe: Some(probe_wav),
+        mux_caps: MuxCaps::single(&[CodecId::Pcm]),
     });
 }
 

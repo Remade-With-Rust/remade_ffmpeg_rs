@@ -1,5 +1,8 @@
 [package]
-name = "rff"
+# Published as `remade-ffmpeg`: the short name `rff` is owned by an
+# unrelated crate on crates.io. The library is still `rff`, so downstream
+# code reads `use rff::...` exactly as the docs and READMEs show.
+name = "remade-ffmpeg"
 description = "Remade FFmpeg (Rust): the engine facade — registers built-in codecs/formats and exposes the high-level transcode & probe API."
 version.workspace = true
 edition.workspace = true
@@ -12,10 +15,14 @@ readme = "README.md"
 keywords = ["ffmpeg", "transcode", "video", "audio", "codec"]
 categories = ["multimedia", "multimedia::encoding"]
 
+[lib]
+name = "rff"
+
 [dependencies]
 rff-core.workspace = true
 rff-codec.workspace = true
 rff-format.workspace = true
+rff-targets.workspace = true
 rff-filter.workspace = true
 rff-io.workspace = true
 rff-resample.workspace = true

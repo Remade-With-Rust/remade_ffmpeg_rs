@@ -11,7 +11,7 @@
 use std::io::{Read, Write};
 
 use rff_core::{CodecId, ColorRange, Error, Packet, PixelFormat, Rational, Result};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Muxer, Output, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 
 /// Register the y4m format into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {
@@ -23,6 +23,7 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|output| Box::new(Y4mMuxer::new(output))),
         muxer_path: None,
         probe: Some(probe_y4m),
+        mux_caps: MuxCaps::single(&[CodecId::RawVideo]),
     });
 }
 

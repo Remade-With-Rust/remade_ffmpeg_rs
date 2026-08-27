@@ -19,7 +19,7 @@
 use std::io::{Read, Write};
 
 use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Muxer, Output, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 
 /// Register the AVIF format into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {
@@ -31,6 +31,7 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|output| Box::new(AvifMuxer::new(output))),
         muxer_path: None,
         probe: Some(probe_avif),
+        mux_caps: MuxCaps::single(&[CodecId::Avif]).image(),
     });
 }
 

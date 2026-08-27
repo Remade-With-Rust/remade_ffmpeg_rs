@@ -13,7 +13,7 @@
 use std::io::{Read, Write};
 
 use rff_core::{CodecId, Error, Packet, Rational, Result, SampleFormat};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Muxer, Output, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 
 /// Register the MP3 format into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {
@@ -25,6 +25,7 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|output| Box::new(Mp3Muxer::new(output))),
         muxer_path: None,
         probe: Some(probe_mp3),
+        mux_caps: MuxCaps::single(&[CodecId::Mp3]),
     });
 }
 

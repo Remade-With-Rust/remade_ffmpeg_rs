@@ -8,7 +8,7 @@ use std::io::{Cursor, Read, Write};
 
 use jxl_oxide::JxlImage;
 use rff_core::{CodecId, Error, Packet, Rational, Result};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Muxer, Output, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 
 /// ISOBMFF-wrapped JPEG XL signature box.
 const CONTAINER_SIG: [u8; 12] = [
@@ -25,6 +25,7 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|output| Box::new(JxlMuxer::new(output))),
         muxer_path: None,
         probe: Some(probe_jxl),
+        mux_caps: MuxCaps::single(&[CodecId::Jxl]).image(),
     });
 }
 

@@ -8,7 +8,7 @@
 use std::io::{Read, Write};
 
 use rff_core::{CodecId, Error, Packet, Rational, Result};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Muxer, Output, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 
 /// The 8-byte PNG signature.
 const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
@@ -23,6 +23,7 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|output| Box::new(PngMuxer::new(output))),
         muxer_path: None,
         probe: Some(probe_png),
+        mux_caps: MuxCaps::single(&[CodecId::Png]).image(),
     });
 }
 

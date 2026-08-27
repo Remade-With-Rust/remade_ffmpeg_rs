@@ -59,6 +59,40 @@ Subtitles ride a single text-cue packet contract, so `srt ↔ vtt ↔ ass-in` �
 Matroska (`S_TEXT/UTF8`, `S_TEXT/ASS` read-side) conversions are stream
 copies; `-c:s subrip|webvtt` relabels for the target container.
 
+## Conversion targets
+
+`rffprobe -show_targets INPUT` (and `rff::targets` / the `rff-targets` crate)
+answers the other half of "what is this file?": every container this build can
+write for it, what happens to each stream (copy / re-encode / dropped), whether
+the result is byte-exact, lossless or lossy, and the command that produces it.
+`-of json` renders the same answer for a UI or an HTTP handler.
+
+The answer is derived from `MuxCaps` — a declaration each format crate carries
+next to its muxer — and from which codecs this build can encode and decode. Two
+standing gates keep it honest: `crates/rff/tests/mux_caps.rs` drives every
+declared `(format, codec)` pair through the real muxer, and
+`crates/rff/tests/targets_end_to_end.rs` transcodes every advertised target for
+a real input.
+
+> **Known gap:** `avi`, `mpegts`, `hls`, `flv`, `srt` and `webvtt` accept a
+> codec they cannot represent instead of refusing it — writing a zero fourcc
+> (AVI), a "private data" stream type (TS/HLS), an AAC/AVC tag regardless
+> (FLV), or the raw payload as cue text (SRT/VTT). `-show_targets` never
+> *offers* those combinations, but a hand-written `-c:v` still reaches them.
+> The `PERMISSIVE` list in `crates/rff/tests/mux_caps.rs` tracks exactly which
+> muxers still behave this way.
+>
+> **`mp4` and `dash` are fixed.** MP4 refused nothing and wrote a `\0\0\0\0`
+> sample entry for any codec it could not describe; readers then misparse the
+> track (FFmpeg falls back to `rawvideo` and rejects every frame). `codec_fourcc`
+> now returns `Option`, so the compiler forces the unmappable case to be handled,
+> and `write_header` rejects it before a byte is written — with an error that
+> names the codec and the way forward. The same check also closed a second
+> silent case: a video track written with **no `avcC`/`av1C`**, which opens
+> cleanly and decodes nothing (parameter sets in `extradata` are now recovered;
+> a track with none anywhere is refused). DASH shares the mapping, so `.mpd` and
+> `.mp4` can never disagree about what is legal.
+
 ## Filters
 
 `-vf`: `scale`, `crop`, `hflip`, `vflip`, `transpose`, `pad`, `format`,

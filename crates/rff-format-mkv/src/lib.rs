@@ -14,7 +14,7 @@ use std::io::Read;
 
 use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result, SampleFormat};
 use rff_format::avc::{avcc_to_annexb, parse_avcc, AvcConfig};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Stream};
 
 pub use mux::MkvMuxer;
 
@@ -30,6 +30,19 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|out| Box::new(MkvMuxer::new(out, false))),
         muxer_path: None,
         probe: Some(probe_mkv),
+        mux_caps: MuxCaps::container(&[
+            CodecId::Vp9,
+            CodecId::Avif,
+            CodecId::H264,
+            CodecId::Opus,
+            CodecId::Vorbis,
+            CodecId::Aac,
+            CodecId::Flac,
+            CodecId::Mp3,
+            CodecId::Pcm,
+            CodecId::Subrip,
+            CodecId::WebVtt,
+        ]),
     });
     registry.register(Format {
         name: "webm",
@@ -39,6 +52,13 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|out| Box::new(MkvMuxer::new(out, true))),
         muxer_path: None,
         probe: None, // content-probing is matroska's job; webm is chosen by name
+        mux_caps: MuxCaps::container(&[
+            CodecId::Vp9,
+            CodecId::Avif,
+            CodecId::Opus,
+            CodecId::Vorbis,
+            CodecId::WebVtt,
+        ]),
     });
 }
 

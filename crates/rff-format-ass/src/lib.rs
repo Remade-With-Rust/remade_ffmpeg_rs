@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::io::Read;
 
 use rff_core::{CodecId, Error, Packet, Rational, Result};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Stream};
 use rff_subtitle::{ass_dialogue_text, parse_ass_timestamp};
 
 /// Register the ASS/SSA demuxer.
@@ -27,6 +27,7 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: None,
         muxer_path: None,
         probe: Some(probe_ass),
+        mux_caps: MuxCaps::NONE,
     });
 }
 

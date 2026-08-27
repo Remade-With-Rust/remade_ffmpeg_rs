@@ -23,7 +23,7 @@ use std::io::Read;
 use std::ops::Range;
 
 use rff_core::{CodecId, Error, MediaType, Packet, PixelFormat, Rational, Result, SampleFormat};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Muxer, Output, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 
 /// Register the AVI format into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {
@@ -35,6 +35,7 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|output| Box::new(AviMuxer::new(output))),
         muxer_path: None,
         probe: Some(probe_avi),
+        mux_caps: MuxCaps::container(&[CodecId::H264, CodecId::Jpeg, CodecId::Avif, CodecId::RawVideo, CodecId::Pcm]),
     });
 }
 

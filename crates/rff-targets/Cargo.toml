@@ -1,0 +1,17 @@
+[package]
+name = "rff-targets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["ffmpeg", "transcode", "convert", "media", "formats"]
+categories = ["multimedia"]
+description = "Answers \"what can this media file be converted into?\" from the engine's own codec and container registries."
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
+rff-format.workspace = true

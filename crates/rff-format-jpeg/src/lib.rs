@@ -8,7 +8,7 @@
 use std::io::{Read, Write};
 
 use rff_core::{CodecId, Error, Packet, Rational, Result};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Muxer, Output, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 
 /// Register the JPEG format into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {
@@ -20,6 +20,7 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|output| Box::new(JpegMuxer::new(output))),
         muxer_path: None,
         probe: Some(probe_jpeg),
+        mux_caps: MuxCaps::single(&[CodecId::Jpeg]).image(),
     });
 }
 

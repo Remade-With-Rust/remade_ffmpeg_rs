@@ -24,8 +24,8 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use rff_core::{Error, MediaType, Packet, Rational, Result};
-use rff_format::{Format, FormatRegistry, Muxer, Output, Stream};
+use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result};
+use rff_format::{Format, FormatRegistry, MuxCaps, Muxer, Output, Stream};
 use rff_format_ts::TsMuxer;
 
 pub use input::open_input;
@@ -52,6 +52,7 @@ pub fn register(registry: &mut FormatRegistry) {
             Ok(Box::new(HlsSegmenter::new(path, seconds)?))
         }),
         probe: None,
+        mux_caps: MuxCaps::container(&[CodecId::H264, CodecId::Aac, CodecId::Mp3]),
     });
 }
 

@@ -14,18 +14,19 @@
 use std::io::{Read, Write};
 
 use rff_core::{CodecId, Error, Packet, Rational, Result, SampleFormat};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Muxer, Output, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 
 /// Register the Ogg format into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {
     registry.register(Format {
         name: "ogg",
         long_name: "Ogg (Opus / Vorbis)",
-        extensions: &["opus", "ogg"],
+        extensions: &["ogg", "opus"],
         demuxer: Some(|input| Box::new(OggDemuxer::new(input))),
         muxer: Some(|output| Box::new(OggMuxer::new(output))),
         muxer_path: None,
         probe: Some(probe_ogg),
+        mux_caps: MuxCaps::single(&[CodecId::Opus, CodecId::Vorbis]),
     });
 }
 

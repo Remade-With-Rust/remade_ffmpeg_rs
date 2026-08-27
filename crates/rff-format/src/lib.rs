@@ -126,6 +126,78 @@ pub type PathMuxerFactory =
 /// `0` (no match) to `100` (certain) — mirrors FFmpeg's `AVInputFormat::read_probe`.
 pub type ProbeFn = fn(&[u8]) -> i32;
 
+/// What a container's **muxer** will accept: the machine-readable half of the
+/// rules each muxer already enforces when it writes a header.
+///
+/// Muxers validate at run time, and a few historically wrote a zero codec tag
+/// rather than refusing an unmappable codec. Declaring the same rules here lets
+/// a caller answer "what can this file become?" *before* opening an encoder —
+/// which is what `rff-targets` is built on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuxCaps {
+    /// Every codec this muxer can write. Empty for demux-only formats.
+    pub codecs: &'static [CodecId],
+    /// Most streams the container holds; `None` when there is no fixed limit.
+    pub max_streams: Option<usize>,
+    /// True when the container holds exactly ONE picture, so extra frames are
+    /// refused or dropped (png, jpeg, gif, webp, avif, jxl, av2f).
+    pub still_image: bool,
+}
+
+impl MuxCaps {
+    /// A format that cannot be written at all (demux-only).
+    pub const NONE: MuxCaps = MuxCaps {
+        codecs: &[],
+        max_streams: Some(0),
+        still_image: false,
+    };
+
+    /// A container interleaving any number of streams (mp4, matroska, mpegts).
+    pub const fn container(codecs: &'static [CodecId]) -> MuxCaps {
+        MuxCaps {
+            codecs,
+            max_streams: None,
+            still_image: false,
+        }
+    }
+
+    /// A file holding exactly one elementary stream (wav, mp3, ivf, ogg).
+    pub const fn single(codecs: &'static [CodecId]) -> MuxCaps {
+        MuxCaps {
+            codecs,
+            max_streams: Some(1),
+            still_image: false,
+        }
+    }
+
+    /// Narrow a [`single`](MuxCaps::single) file to one picture (png, jpeg).
+    pub const fn image(self) -> MuxCaps {
+        MuxCaps {
+            codecs: self.codecs,
+            max_streams: self.max_streams,
+            still_image: true,
+        }
+    }
+
+    /// Can this muxer write `id`?
+    pub fn accepts(&self, id: CodecId) -> bool {
+        self.codecs.contains(&id)
+    }
+
+    /// Can this muxer carry any stream of `media` at all?
+    pub fn accepts_media(&self, media: MediaType) -> bool {
+        self.codecs.iter().any(|c| c.media_type() == media)
+    }
+
+    /// The codecs this muxer accepts for one media category.
+    pub fn codecs_for(&self, media: MediaType) -> impl Iterator<Item = CodecId> + '_ {
+        self.codecs
+            .iter()
+            .copied()
+            .filter(move |c| c.media_type() == media)
+    }
+}
+
 /// Static description of a container format and its read/write support.
 pub struct Format {
     /// Short name (`avi`, `mp4`, ...), as used by `ffmpeg -f <name>`.
@@ -142,6 +214,9 @@ pub struct Format {
     pub muxer_path: Option<PathMuxerFactory>,
     /// Content sniffer for magic-byte detection (independent of the filename).
     pub probe: Option<ProbeFn>,
+    /// What this format's muxer accepts. [`MuxCaps::NONE`] for demux-only
+    /// formats. Keep it in step with the muxer — `tests/mux_caps.rs` gates it.
+    pub mux_caps: MuxCaps,
 }
 
 impl Format {

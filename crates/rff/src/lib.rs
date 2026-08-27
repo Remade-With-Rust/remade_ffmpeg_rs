@@ -4,8 +4,8 @@
 //! the layered crates together:
 //! * re-exports the core vocabulary ([`core`], [`codec`], [`format`]),
 //! * builds an [`Engine`] with every built-in codec and container registered,
-//! * exposes the high-level [`transcode`] and [`probe`] APIs that the CLI and
-//!   the HTTP server are both thin wrappers over.
+//! * exposes the high-level [`transcode`], [`probe`] and [`targets`] APIs that
+//!   the CLI and the HTTP server are both thin wrappers over.
 //!
 //! "API first": the CLI (`ffmpeg`/`ffprobe`) and the server expose *this* API.
 //! There is no logic in those front-ends that isn't reachable programmatically.
@@ -15,6 +15,7 @@ pub use rff_core as core;
 pub use rff_format as format;
 
 pub mod probe;
+pub mod targets;
 pub mod transcode;
 
 use rff_codec::CodecRegistry;

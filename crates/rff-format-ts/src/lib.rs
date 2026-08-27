@@ -12,7 +12,7 @@ use std::io::Read;
 
 use rff_core::{CodecId, Error, Packet, Rational, Result};
 use rff_format::avc::{find_sps_annexb, sps_dimensions};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Stream};
 
 mod mux;
 pub use mux::TsMuxer;
@@ -30,6 +30,7 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|output| Box::new(mux::TsMuxer::new(output))),
         muxer_path: None,
         probe: Some(probe_ts),
+        mux_caps: MuxCaps::container(&[CodecId::H264, CodecId::Aac, CodecId::Mp3]),
     });
 }
 

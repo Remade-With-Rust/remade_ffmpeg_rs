@@ -6,7 +6,7 @@ use std::io::{Cursor, Read, Write};
 
 use rusty_webp::WebPDecoder;
 use rff_core::{CodecId, ColorRange, Error, Packet, Rational, Result};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Muxer, Output, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 
 /// Register the WebP format into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {
@@ -18,6 +18,7 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|output| Box::new(WebpMuxer::new(output))),
         muxer_path: None,
         probe: Some(probe_webp),
+        mux_caps: MuxCaps::single(&[CodecId::Webp]).image(),
     });
 }
 

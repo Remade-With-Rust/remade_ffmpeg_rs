@@ -26,7 +26,7 @@
 use std::io::Read;
 
 use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Muxer, Output, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 use rusty_av2f::{decode, encode, Config, Params, Subsampling};
 
 /// Register the AV2F format into a [`FormatRegistry`].
@@ -39,6 +39,7 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|output| Box::new(Av2fMuxer::new(output))),
         muxer_path: None,
         probe: Some(rusty_av2f::probe),
+        mux_caps: MuxCaps::single(&[CodecId::Av2]).image(),
     });
 }
 
