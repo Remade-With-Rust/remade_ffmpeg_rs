@@ -10,6 +10,23 @@ and `rusty_av2d`'s push/pull API. All codec logic — the decoder that is
 byte-identical to AOM's `avmdec` across a 45-clip conformance corpus — lives in
 `rusty_av2d`.
 
+> ### ⚠️ Decode robustness: sandbox untrusted AV2 in debug builds
+>
+> `rusty_av2d 0.2.8` performs an **unchecked subtraction** (`av2_gdf.rs:549`)
+> that trips Rust's arithmetic-overflow check, and aborts
+> (`STATUS_STACK_BUFFER_OVERRUN`) on malformed OBU input. An `abort()` is not a
+> panic, so `catch_unwind` cannot contain it — a hostile file takes the process
+> down.
+>
+> This affects **debug builds only**. Verified 2026-08-27 against a release
+> build: valid AV2 decodes **byte-identically to the reference**, and a fuzz
+> sweep over malformed input passes with AV2 included. A shipped release binary
+> therefore neither crashes on hostile AV2 nor mis-decodes valid AV2.
+>
+> Treat the unchecked arithmetic as a defect to fix upstream, not a property to
+> rely on: a wrap that is correct today is correct by accident, not by contract.
+> If you decode untrusted input in a debug or CI build, sandbox this path.
+
 ```rust
 let mut registry = rff_codec::CodecRegistry::new();
 rff_codec_av2::register(&mut registry);

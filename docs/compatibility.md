@@ -24,7 +24,7 @@ licensed (CI-enforced by `cargo-deny`).
 | AAC&#8209;LC | ✅ | ✅ | in-house (`rusty_aac`) | validated (ffmpeg decodes our `.m4a` at unity) · ⚖ |
 | PCM | ✅ | ✅ | in-house | validated |
 | AV1 / AVIF | ✅ | ✅ (still-picture) | rav1d / rav1e forks (pure Rust) | validated · video-mode AV1 *encode* wiring is a known gap (the encoder exists; the adapter is still-image-only) · **decode robustness:** rav1d's input validation `abort()`s on malformed AV1 under `debug_assertions` (debug builds); **release returns `Err`** (verified). We pre-validate the sample at our boundary, but sandbox the AVIF path if you decode untrusted input in debug/CI. |
-| AV2 | ✅ | — | in-house (`rusty_av2d`) | basic (decode registered; encoder in the workshop) |
+| AV2 | ✅ | — | in-house (`rusty_av2d`) | basic (decode registered; encoder in the workshop) · **decode robustness:** panics/aborts on malformed AV2 under `debug_assertions`; **release decodes byte-identically to the reference and survives the fuzz sweep** (verified) — see the note below |
 | H.264 / AVC | ✅ | ✅ | rusty_h264 (pure Rust; opt-in SIMD asm) | validated · ⚖ |
 | Opus | ✅ | ✅ | rusty-opus (pure Rust) | validated (12/12 official decoder conformance) |
 | Vorbis | ✅ | ✅ | decode: lewton · encode: in-house `rusty_vorbis` | validated |
@@ -40,6 +40,29 @@ licensed (CI-enforced by `cargo-deny`).
 > path (`--features h264-openh264`, Cisco openh264) exists only as a cross-check.
 >
 > ⚖ = patent-relevant — see [Patents](#patents).
+
+> **AV2 decode robustness** (`rff-codec-av2`, backed by `rusty_av2d 0.2.8`) —
+> the same shape as the rav1d note above, and measured the same way:
+>
+> * **Debug builds abort.** `rusty_av2d` performs an unchecked subtraction
+>   (`av2_gdf.rs:549`) that trips Rust's arithmetic-overflow check, and the
+>   fuzz sweep (`fuzz_robustness`) takes the process down with
+>   `STATUS_STACK_BUFFER_OVERRUN` on malformed OBU input. An `abort()` is not a
+>   panic, so `catch_unwind` cannot contain it.
+> * **Release builds are sound on both counts (verified 2026-08-27).** The
+>   overflow is a wrap the decoder actually intends: with checks off,
+>   `av2f_still` decodes **byte-identically to the reference** (4/4), and
+>   `fuzz_robustness` passes (2/2) with AV2 in the sweep.
+>
+> So a shipped release binary does not crash on hostile AV2, and its output on
+> valid AV2 is correct. **Sandbox the AV2 path if you decode untrusted input in
+> a debug or CI build**, and treat the unchecked arithmetic as a defect to fix
+> upstream in `rusty_av2d` rather than a property to rely on — a wrap that is
+> correct today is correct by accident, not by contract.
+>
+> AV2 is also **experimental end-to-end**: the `av2f` still-image container's
+> four-character codes are ours, not specified by AOM, so those files read back
+> here and nowhere else.
 
 ## Containers / formats
 
