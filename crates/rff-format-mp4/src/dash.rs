@@ -18,7 +18,7 @@ use rff_format::avc::{build_avcc_record, split_annexb};
 use rff_format::{Muxer, Stream};
 
 use super::fmp4::{self, FragSample};
-use super::{bx, codec_fourcc, pick_timescale, TrackOut};
+use super::{bx, mp4_fourcc, pick_timescale, TrackOut};
 
 /// One output stream's buffered samples + fragmenting state.
 struct DashTrack {
@@ -52,19 +52,13 @@ impl Muxer for DashMuxer {
             return Err(Error::invalid("dash mux: no streams"));
         }
         for s in streams {
-            if !matches!(
-                s.codec_id,
-                CodecId::H264 | CodecId::Aac | CodecId::Opus | CodecId::Avif
-            ) {
-                return Err(Error::unsupported(format!(
-                    "dash mux: codec `{}` (fMP4 carries h264/aac/opus/av1 here)",
-                    s.codec_id.name()
-                )));
-            }
+            // One source of truth with the plain MP4 muxer: same mapping, same
+            // refusal, so `.mpd` and `.mp4` never disagree about what is legal.
+            let fourcc = mp4_fourcc(s)?;
             self.tracks.push(DashTrack {
                 out: TrackOut {
                     stream: s.clone(),
-                    fourcc: codec_fourcc(s.codec_id),
+                    fourcc,
                     config: None,
                     samples: Vec::new(),
                 },

@@ -20,7 +20,7 @@ pub mod fmp4;
 use std::io::Read;
 
 use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, Muxer, Output, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
 
 /// Register the MP4 format into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {
@@ -32,6 +32,7 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|output| Box::new(Mp4Muxer::new(output))),
         muxer_path: None,
         probe: Some(probe_mp4),
+        mux_caps: MuxCaps::container(&[CodecId::H264, CodecId::Avif, CodecId::Aac, CodecId::Opus]),
     });
     registry.register(Format {
         name: "dash",
@@ -47,6 +48,7 @@ pub fn register(registry: &mut FormatRegistry) {
             Ok(Box::new(dash::DashMuxer::new(path, seconds)?))
         }),
         probe: None,
+        mux_caps: MuxCaps::container(&[CodecId::H264, CodecId::Avif, CodecId::Aac, CodecId::Opus]),
     });
 }
 
@@ -505,6 +507,13 @@ struct TrackOut {
 struct Mp4Muxer {
     out: Output,
     streams: Vec<Stream>,
+    /// Sample-entry fourcc per stream, resolved once in
+    /// [`write_header`](Muxer::write_header) and parallel to `streams`.
+    ///
+    /// Resolving here rather than at trailer time is the point: an unmappable
+    /// codec is rejected before a single byte is written, and by construction
+    /// there is no path that reaches the box writer without a real fourcc.
+    fourccs: Vec<[u8; 4]>,
     packets: Vec<(usize, Vec<u8>, bool, Option<i64>)>, // (stream, data, keyframe, pts)
 }
 
@@ -513,6 +522,7 @@ impl Mp4Muxer {
         Mp4Muxer {
             out,
             streams: Vec::new(),
+            fourccs: Vec::new(),
             packets: Vec::new(),
         }
     }
@@ -523,6 +533,12 @@ impl Muxer for Mp4Muxer {
         if streams.is_empty() {
             return Err(Error::invalid("mp4 mux: no streams"));
         }
+        // Refuse anything we cannot describe, rather than writing a file that
+        // only fails later, in someone else's player.
+        self.fourccs = streams
+            .iter()
+            .map(mp4_fourcc)
+            .collect::<Result<Vec<[u8; 4]>>>()?;
         self.streams = streams.to_vec();
         Ok(())
     }
@@ -542,9 +558,10 @@ impl Muxer for Mp4Muxer {
         let mut tracks: Vec<TrackOut> = self
             .streams
             .iter()
-            .map(|s| TrackOut {
+            .zip(&self.fourccs)
+            .map(|(s, fourcc)| TrackOut {
                 stream: s.clone(),
-                fourcc: codec_fourcc(s.codec_id),
+                fourcc: *fourcc,
                 config: None,
                 samples: Vec::new(),
             })
@@ -580,6 +597,49 @@ impl Muxer for Mp4Muxer {
                     track.config = build_av1c(data);
                 }
                 track.samples.push((data.clone(), *keyframe, *pts));
+            }
+        }
+
+        // --- every video track must carry its decoder config box ---
+        // A VisualSampleEntry without `avcC`/`av1C` is undecodable: the file
+        // looks well-formed, opens, and then produces nothing. Same silent
+        // class as the zero fourcc, so it gets the same treatment — recover if
+        // we can, refuse if we cannot.
+        for track in tracks.iter_mut() {
+            if track.config.is_some() || track.samples.is_empty() {
+                continue;
+            }
+            match track.stream.codec_id {
+                CodecId::H264 => {
+                    // The parameter sets may live in `extradata` (an avcC, as a
+                    // remux hands us) rather than in-band. Re-derive the box from
+                    // the SPS/PPS instead of copying the record verbatim: our
+                    // samples are written with 4-byte length prefixes, and a
+                    // copied record declaring a different `nal_len` would be a
+                    // corruption of its own.
+                    track.config = parse_avcc(&track.stream.extradata).and_then(|cfg| {
+                        let nals = split_annexb(&cfg.headers_annexb);
+                        let nal_type = |n: &&[u8]| n.first().map(|b| b & 0x1F);
+                        let sps = nals.iter().find(|n| nal_type(n) == Some(7))?;
+                        let pps = nals.iter().find(|n| nal_type(n) == Some(8))?;
+                        Some(build_avcc(sps, pps))
+                    });
+                    if track.config.is_none() {
+                        return Err(Error::invalid(
+                            "mp4 mux: the h264 stream carries no SPS/PPS, in-band or \
+                             in extradata, so its `avcC` cannot be built — the output \
+                             would open but decode nothing",
+                        ));
+                    }
+                }
+                CodecId::Avif => {
+                    return Err(Error::invalid(
+                        "mp4 mux: the av1 stream has no sequence header in its first \
+                         sample, so its `av1C` cannot be built — the output would \
+                         open but decode nothing",
+                    ));
+                }
+                _ => {}
             }
         }
 
@@ -708,14 +768,53 @@ fn sample_durations(
     }
 }
 
-fn codec_fourcc(id: CodecId) -> [u8; 4] {
+/// Our [`CodecId`] → the MP4 sample-entry fourcc, or `None` when this build has
+/// no MP4 mapping for the codec.
+///
+/// Returning `Option` is load-bearing. This used to fall back to a **zero
+/// fourcc**, which is not a valid sample entry: the muxer accepted (say) VP9,
+/// wrote a `\0\0\0\0` box, and produced a file every reader misparses — FFmpeg
+/// falls back to `rawvideo` and then rejects each frame. A file that silently
+/// fails to play is a far worse outcome than a conversion that refuses up
+/// front, so the type now forces every caller to handle the unmappable case.
+pub(crate) fn codec_fourcc(id: CodecId) -> Option<[u8; 4]> {
     match id {
-        CodecId::H264 => *b"avc1",
-        CodecId::Avif => *b"av01",
-        CodecId::Aac => *b"mp4a",
-        CodecId::Opus => *b"Opus",
-        _ => *b"\x00\x00\x00\x00",
+        CodecId::H264 => Some(*b"avc1"),
+        CodecId::Avif => Some(*b"av01"),
+        CodecId::Aac => Some(*b"mp4a"),
+        CodecId::Opus => Some(*b"Opus"),
+        _ => None,
     }
+}
+
+/// The fourcc for `stream`, or the error explaining what to do instead.
+///
+/// Keep the accepted set in step with this format's `MuxCaps` declaration in
+/// [`register`] — `crates/rff/tests/mux_caps.rs` gates that the two agree.
+pub(crate) fn mp4_fourcc(stream: &Stream) -> Result<[u8; 4]> {
+    if let Some(fourcc) = codec_fourcc(stream.codec_id) {
+        return Ok(fourcc);
+    }
+    let name = stream.codec_id.name();
+    Err(Error::unsupported(match stream.media_type {
+        MediaType::Subtitle => {
+            "mp4 mux: subtitle streams are not supported here (no `mov_text`); \
+             write Matroska (`.mkv`) instead, or extract the subtitles on their \
+             own with `-c:s subrip out.srt`"
+                .to_string()
+        }
+        MediaType::Video => format!(
+            "mp4 mux: video codec `{name}` has no MP4 mapping here (MP4 carries \
+             h264 or av1); re-encode with `-c:v h264`, or write `.mkv`/`.webm` \
+             to keep `{name}` as a stream copy"
+        ),
+        MediaType::Audio => format!(
+            "mp4 mux: audio codec `{name}` has no MP4 mapping here (MP4 carries \
+             aac or opus); re-encode with `-c:a aac`, or write `.mkv` to keep \
+             `{name}` as a stream copy"
+        ),
+        other => format!("mp4 mux: cannot carry a `{other}` stream (codec `{name}`)"),
+    }))
 }
 
 /// `dOps` (OpusSpecificBox): the MP4 mapping of `OpusHead` (big-endian fields).
@@ -1247,6 +1346,11 @@ mod tests {
         // Two tracks, three samples each at the same timestamps (0, 1, 2 s). The
         // mdat must alternate V0, A0, V1, A1, V2, A2 — not V0 V1 V2 A0 A1 A2.
         let tag = |k: u8| vec![0xAB, 0xCD, k, 0xEF];
+        // The AV1 track's first sample needs a real sequence-header OBU (type 1,
+        // size-field set) or the muxer rightly refuses to write a sample entry
+        // with no `av1C`. The tag bytes follow it, so the position checks below
+        // are unaffected.
+        let seq_header = [0x0Au8, 0x03, 0x00, 0x00, 0x00];
         let sink = SharedBuf(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
         {
             let mut mux = Mp4Muxer::new(Box::new(sink.clone()));
@@ -1263,7 +1367,12 @@ mod tests {
             mux.write_header(&[vs, as_]).unwrap();
             for (s, base) in [(0usize, 0u8), (1, 0x10)] {
                 for (n, &pts) in [0i64, 1000, 2000].iter().enumerate() {
-                    let mut p = Packet::from_data(s, tag(base + n as u8));
+                    let mut data = Vec::new();
+                    if s == 0 && n == 0 {
+                        data.extend_from_slice(&seq_header);
+                    }
+                    data.extend_from_slice(&tag(base + n as u8));
+                    let mut p = Packet::from_data(s, data);
                     p.pts = Some(pts);
                     p.flags.keyframe = true;
                     mux.write_packet(&p).unwrap();
@@ -1292,7 +1401,154 @@ mod tests {
         while let Ok(p) = dem.read_packet() {
             by_stream.entry(p.stream_index).or_default().push(p.data);
         }
-        assert_eq!(by_stream[&0], vec![tag(0), tag(1), tag(2)]);
+        // Sample 0 of the video track still carries the sequence header it was
+        // given: the muxer copies AV1 samples through untouched.
+        let mut first = seq_header.to_vec();
+        first.extend_from_slice(&tag(0));
+        assert_eq!(by_stream[&0], vec![first, tag(1), tag(2)]);
         assert_eq!(by_stream[&1], vec![tag(0x10), tag(0x11), tag(0x12)]);
+    }
+
+    // ---- silent-corruption regressions -----------------------------------
+    //
+    // The muxer used to accept ANY codec and write a zero fourcc for the ones
+    // it could not describe, producing a file that opens and then decodes
+    // nothing. These pin the refusal.
+
+    /// A stream plausible enough that only the codec check can reject it.
+    fn probe_stream(codec: CodecId) -> Stream {
+        let mut s = Stream::new(0, codec);
+        s.time_base = Rational::new(1, 1000);
+        match codec.media_type() {
+            MediaType::Video => {
+                s.width = 320;
+                s.height = 240;
+            }
+            MediaType::Audio => {
+                s.sample_rate = 48_000;
+                s.channels = 2;
+            }
+            _ => {}
+        }
+        s
+    }
+
+    #[test]
+    fn refuses_a_video_codec_it_cannot_describe() {
+        let mut mux = Mp4Muxer::new(Box::new(Vec::new()));
+        let err = mux
+            .write_header(&[probe_stream(CodecId::Vp9)])
+            .expect_err("vp9 has no MP4 sample entry here");
+        let msg = err.to_string();
+        assert!(msg.contains("vp9"), "the error must name the codec: {msg}");
+        // ...and point somewhere useful, rather than just saying no.
+        assert!(
+            msg.contains("-c:v h264") || msg.contains(".mkv"),
+            "the error should offer a way forward: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuses_an_audio_codec_it_cannot_describe() {
+        for codec in [CodecId::Mp3, CodecId::Flac, CodecId::Vorbis, CodecId::Pcm] {
+            let mut mux = Mp4Muxer::new(Box::new(Vec::new()));
+            let err = mux
+                .write_header(&[probe_stream(codec)])
+                .expect_err("no MP4 mapping here");
+            assert!(
+                err.to_string().contains(codec.name()),
+                "`{}` must be named in its own rejection",
+                codec.name()
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_subtitles_and_says_where_they_can_go() {
+        let mut mux = Mp4Muxer::new(Box::new(Vec::new()));
+        let err = mux
+            .write_header(&[probe_stream(CodecId::Subrip)])
+            .expect_err("no mov_text support here");
+        let msg = err.to_string();
+        assert!(msg.contains("subtitle"), "{msg}");
+        assert!(msg.contains(".mkv") || msg.contains("subrip"), "{msg}");
+    }
+
+    #[test]
+    fn accepts_exactly_the_codecs_it_can_describe() {
+        for codec in [CodecId::H264, CodecId::Avif, CodecId::Aac, CodecId::Opus] {
+            let mut mux = Mp4Muxer::new(Box::new(Vec::new()));
+            assert!(
+                mux.write_header(&[probe_stream(codec)]).is_ok(),
+                "`{}` is declared muxable and must be accepted",
+                codec.name()
+            );
+        }
+    }
+
+    #[test]
+    fn no_codec_maps_to_a_zero_fourcc() {
+        // The corruption was a *value*, not a branch: any mapping that returns
+        // all-zero bytes is an invalid sample entry, whatever produced it.
+        for codec in [
+            CodecId::H264,
+            CodecId::Avif,
+            CodecId::Aac,
+            CodecId::Opus,
+            CodecId::Vp9,
+            CodecId::Mp3,
+            CodecId::Flac,
+            CodecId::Pcm,
+            CodecId::Vorbis,
+            CodecId::Subrip,
+            CodecId::WebVtt,
+            CodecId::Png,
+            CodecId::RawVideo,
+        ] {
+            if let Some(fourcc) = codec_fourcc(codec) {
+                assert_ne!(
+                    fourcc, [0, 0, 0, 0],
+                    "`{}` maps to a zero fourcc",
+                    codec.name()
+                );
+                assert!(
+                    fourcc.iter().all(|b| b.is_ascii_graphic()),
+                    "`{}` maps to a non-printable fourcc {fourcc:?}",
+                    codec.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_h264_track_without_parameter_sets_is_refused_not_written() {
+        // A VisualSampleEntry with no `avcC` opens fine and decodes nothing.
+        let mut mux = Mp4Muxer::new(Box::new(Vec::new()));
+        let mut s = probe_stream(CodecId::H264);
+        s.extradata.clear();
+        mux.write_header(&[s]).unwrap();
+        // A slice NAL (type 1), so there is a sample but no SPS/PPS anywhere.
+        mux.write_packet(&Packet::from_data(0, vec![0, 0, 0, 1, 0x41, 0x9A, 0x00]))
+            .unwrap();
+        let err = mux.write_trailer().expect_err("no SPS/PPS to build avcC from");
+        assert!(err.to_string().contains("SPS/PPS"), "{err}");
+    }
+
+    #[test]
+    fn an_h264_track_recovers_its_avcc_from_extradata() {
+        // Parameter sets out-of-band (as a remux hands them over) are enough:
+        // the box is re-derived rather than the file being refused.
+        let sps = [0x67u8, 0x42, 0x00, 0x1E, 0xAB];
+        let pps = [0x68u8, 0xCE, 0x38, 0x80];
+        let mut mux = Mp4Muxer::new(Box::new(Vec::new()));
+        let mut s = probe_stream(CodecId::H264);
+        s.extradata = rff_format::avc::build_avcc_record(&sps, &pps);
+        mux.write_header(&[s]).unwrap();
+        mux.write_packet(&Packet::from_data(0, vec![0, 0, 0, 1, 0x41, 0x9A, 0x00]))
+            .unwrap();
+        assert!(
+            mux.write_trailer().is_ok(),
+            "extradata carries the parameter sets, so the file is writable"
+        );
     }
 }
