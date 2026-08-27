@@ -52,4 +52,4 @@ weezl = "0.1.10"
 # Project convention: encoder benches/examples run under rusty_alloc.
 # Direct version (not workspace-inherited) so the standalone GitHub repo
 # builds outside the remade_ffmpeg_rs workspace; same version either way.
-rusty_alloc-api = "0.4"
+rusty_alloc-api = "1.1"
