@@ -1,6 +1,11 @@
 [package]
 name = "rusty_jpeg"
 version = "0.3.2"
+# Vendored build copy. `rusty_jpeg` is published from its own repository
+# (github.com/Remade-With-Rust/rusty_jpeg), which crates.io names as its source;
+# two repositories publishing one crate name is what makes a version
+# cascade unorderable. Dependents here resolve it by version when published.
+publish = false
 edition = "2021"
 license = "(MIT OR Apache-2.0) AND IJG"
 repository = "https://github.com/Remade-With-Rust/rusty_jpeg"
