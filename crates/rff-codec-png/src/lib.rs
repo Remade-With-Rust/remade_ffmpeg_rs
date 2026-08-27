@@ -914,8 +914,16 @@ mod tests {
             // ~40 colours, big enough that the 120-byte PLTE is negligible
             // -> Indexed must win outright.
             ("palette", frame_from(400, 300, 3, |i, j| {
+                // `n` reaches 63 here (i/50 -> 0..7, j/40*8 -> 0..56), so the
+                // first two channels must wrap like the third already does —
+                // `n * 6` overflows u8 at n > 42 and panics in a debug build.
                 let n = ((i / 50) + (j / 40) * 8) as u8;
-                [n * 6, 255 - n * 5, n.wrapping_mul(17), 255]
+                [
+                    n.wrapping_mul(6),
+                    255u8.wrapping_sub(n.wrapping_mul(5)),
+                    n.wrapping_mul(17),
+                    255,
+                ]
             })),
             // Same content but TINY: here the incompressible PLTE costs more
             // than indexing saves, so auto-type must fall back rather than
