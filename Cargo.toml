@@ -215,7 +215,7 @@ jxl-oxide = "0.12"
 # LIBRARY behind a default-on `global-alloc` feature. That would hard-error
 # against the declaration above, so `rff-codec-h264` pins it with
 # `default-features = false`. Do not remove that.
-rusty_alloc-api = "1.1"
+rusty_alloc-api = "=1.1.4"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.0.2-alpha"
 rustls-native-certs = "0.8"
