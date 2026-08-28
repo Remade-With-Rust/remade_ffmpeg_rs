@@ -23,4 +23,9 @@ jobs:
   check:
     uses: Remade-With-Rust/.github/.github/workflows/portfolio-test.yml@main
     with:
+      # av-scenechange builds its assembly with nasm, and the GitHub runner
+      # image does not ship it. Without this the run dies in a build script
+      # before any code of ours is compiled, which reads like a broken
+      # dependency bump and is really a missing system tool.
+      apt-packages: nasm
       command: test
