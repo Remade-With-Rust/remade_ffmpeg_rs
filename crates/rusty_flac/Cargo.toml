@@ -36,4 +36,4 @@ claxon = "0.4"
 # Project convention: every encoder-carrying bench/example runs under
 # rusty_alloc (what ships) — a bench under the system allocator is not
 # comparable.
-rusty_alloc-api = "1.1"
+rusty_alloc-api = "=1.1.6"
