@@ -28,4 +28,8 @@ jobs:
       # before any code of ours is compiled, which reads like a broken
       # dependency bump and is really a missing system tool.
       apt-packages: nasm
+      # The same member this repository excludes from its own CI: rff-ui pulls
+      # glib-sys, and a headless runner has no GTK stack for it to build
+      # against. Everything else in the workspace is still tested.
+      exclude: rff-ui
       command: test
