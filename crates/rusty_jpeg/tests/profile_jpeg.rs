@@ -13,7 +13,6 @@
 
 use rusty_jpeg::decode::Decoder;
 use rusty_jpeg::encode::{Encoder, PlanarYcbcrImage, SamplingFactor};
-use std::io::Cursor;
 use std::time::Instant;
 
 /// How much high-frequency energy the synthetic source carries.
@@ -247,7 +246,7 @@ fn profile_decode() {
         let mpx = (w * h) as f64 / 1e6;
 
         let ms = best_of(N, || {
-            let mut d = Decoder::new(Cursor::new(&jpeg));
+            let mut d = Decoder::new(&jpeg[..]);
             std::hint::black_box(d.decode_planar().unwrap());
         });
         println!(
@@ -259,7 +258,7 @@ fn profile_decode() {
         );
 
         let ms = best_of(N, || {
-            let mut d = Decoder::new(Cursor::new(&jpeg));
+            let mut d = Decoder::new(&jpeg[..]);
             std::hint::black_box(d.decode().unwrap());
         });
         println!(
@@ -286,7 +285,7 @@ fn benchmark_source_is_not_trivially_compressible() {
         "benchmark content compresses {ratio:.1}x — too easy to be representative"
     );
     // And it must still be a valid JPEG.
-    let mut d = Decoder::new(Cursor::new(&jpeg));
+    let mut d = Decoder::new(&jpeg[..]);
     assert!(d.decode().is_ok());
 }
 
@@ -398,7 +397,7 @@ fn streaming_and_buffered_optimize_agree() {
     let buffer = encode_with(&y, &cb, &cr, w, h, false);
 
     for (name, jpeg) in [("streaming", &stream), ("buffered", &buffer)] {
-        let mut d = Decoder::new(Cursor::new(jpeg));
+        let mut d = Decoder::new(&jpeg[..]);
         let px = d
             .decode()
             .unwrap_or_else(|e| panic!("{name} did not decode: {e}"));
@@ -804,7 +803,7 @@ fn avx2_quantize_produces_byte_identical_files() {
                 density.name()
             );
             // And it must still decode.
-            let mut d = Decoder::new(Cursor::new(&avx2));
+            let mut d = Decoder::new(&avx2[..]);
             assert!(d.decode().is_ok(), "{w}x{h} {}", density.name());
         }
     }
@@ -829,7 +828,7 @@ fn decode_file() {
     const N: usize = 15;
 
     // Geometry first, so throughput can be reported per megapixel.
-    let mut d = Decoder::new(Cursor::new(&bytes));
+    let mut d = Decoder::new(&bytes[..]);
     let planar = d.decode_planar().expect("decode_planar");
     let (w, h) = (planar.width as usize, planar.height as usize);
     let mpx = (w * h) as f64 / 1e6;
@@ -840,7 +839,7 @@ fn decode_file() {
     );
 
     let ms = best_of(N, || {
-        let mut d = Decoder::new(Cursor::new(&bytes));
+        let mut d = Decoder::new(&bytes[..]);
         std::hint::black_box(d.decode_planar().unwrap());
     });
     println!(
@@ -849,7 +848,7 @@ fn decode_file() {
     );
 
     let ms_rgb = best_of(N, || {
-        let mut d = Decoder::new(Cursor::new(&bytes));
+        let mut d = Decoder::new(&bytes[..]);
         std::hint::black_box(d.decode().unwrap());
     });
     println!(
@@ -871,7 +870,6 @@ fn decode_file() {
 fn chroma_downsampling_averages_rather_than_decimates() {
     use rusty_jpeg::decode::Decoder;
     use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
-    use std::io::Cursor;
 
     const W: usize = 128;
     const H: usize = 128;
@@ -897,7 +895,7 @@ fn chroma_downsampling_averages_rather_than_decimates() {
     enc.encode(&rgb, W as u16, H as u16, ColorType::Rgb)
         .expect("encode");
 
-    let out = Decoder::new(Cursor::new(&jpg)).decode().expect("decode");
+    let out = Decoder::new(&jpg[..]).decode().expect("decode");
     let mse: f64 = rgb
         .iter()
         .zip(&out)
@@ -934,7 +932,6 @@ fn chroma_downsampling_averages_rather_than_decimates() {
 fn optimized_huffman_emits_one_interleaved_scan_that_round_trips() {
     use rusty_jpeg::decode::Decoder;
     use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
-    use std::io::Cursor;
 
     /// Components in the first SOS. >1 means interleaved.
     fn first_sos_components(d: &[u8]) -> usize {
@@ -984,7 +981,7 @@ fn optimized_huffman_emits_one_interleaved_scan_that_round_trips() {
             "{w}x{h}: optimized Huffman emitted a NON-INTERLEAVED scan"
         );
 
-        let out = Decoder::new(Cursor::new(&jpg))
+        let out = Decoder::new(&jpg[..])
             .decode()
             .expect("decode own optimized-Huffman output");
         assert_eq!(out.len(), w * h * 3, "{w}x{h}: wrong output size");
@@ -1016,7 +1013,6 @@ fn optimized_huffman_emits_one_interleaved_scan_that_round_trips() {
 fn trellis_reduces_size_without_collapsing_quality() {
     use rusty_jpeg::decode::Decoder;
     use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
-    use std::io::Cursor;
 
     const W: usize = 128;
     const H: usize = 128;
@@ -1040,7 +1036,7 @@ fn trellis_reduces_size_without_collapsing_quality() {
             enc.encode(&rgb, W as u16, H as u16, ColorType::Rgb)
                 .expect("encode");
         }
-        let out = Decoder::new(Cursor::new(&jpg)).decode().expect("decode");
+        let out = Decoder::new(&jpg[..]).decode().expect("decode");
         let mse: f64 = rgb
             .iter()
             .zip(&out)

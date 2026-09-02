@@ -210,8 +210,10 @@ impl Upsample for UpsamplerH1V2 {
     ) {
         let row_near = row as f32 / 2.0;
         // If row_near's fractional is 0.0 we want row_far to be the previous row and if it's 0.5 we
-        // want it to be the next row.
-        let row_far = (row_near + row_near.fract() * 3.0 - 0.25).min((input_height - 1) as f32);
+        // want it to be the next row. That fraction is 0.5 exactly when `row` is
+        // odd, which needs no `fract()` (a libm call, absent without `std`).
+        let row_frac = (row & 1) as f32 * 0.5;
+        let row_far = (row_near + row_frac * 3.0 - 0.25).min((input_height - 1) as f32);
 
         let input_near = &input[row_near as usize * row_stride..];
         let input_far = &input[row_far as usize * row_stride..];
@@ -238,8 +240,10 @@ impl Upsample for UpsamplerH2V2 {
     ) {
         let row_near = row as f32 / 2.0;
         // If row_near's fractional is 0.0 we want row_far to be the previous row and if it's 0.5 we
-        // want it to be the next row.
-        let row_far = (row_near + row_near.fract() * 3.0 - 0.25).min((input_height - 1) as f32);
+        // want it to be the next row. That fraction is 0.5 exactly when `row` is
+        // odd, which needs no `fract()` (a libm call, absent without `std`).
+        let row_frac = (row & 1) as f32 * 0.5;
+        let row_far = (row_near + row_frac * 3.0 - 0.25).min((input_height - 1) as f32);
 
         let input_near = &input[row_near as usize * row_stride..];
         let input_far = &input[row_far as usize * row_stride..];

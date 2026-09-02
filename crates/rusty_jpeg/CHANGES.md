@@ -4,6 +4,50 @@ Everything this fork does differently from upstream `jpeg-decoder` 0.3.2 and
 `jpeg-encoder` 0.7.0. Keep this current — it is what makes re-syncing with
 upstream possible.
 
+## 0.4.0
+
+The chip release: `no_std` + `alloc`, and the input/output shapes a camera
+pipeline on an ESP32-class part needs. Coded bytes are unchanged for every
+build. What is new is that the SIMD/scalar difference is now pinned:
+`tests/no_std_surface.rs` carries one golden row for the scalar kernels (every
+`no_std` build, `platform_independent`, and `std` without `simd`) and one for
+the x86-64 SIMD kernels, which round differently (the AVX2 forward DCT and the
+SSSE3 inverse DCT; ±1 LSB). A chip's bytes match the host's **scalar** build,
+and that is the build to use as its oracle.
+
+- **`no_std` + `alloc`** with `--no-default-features`; builds for
+  `riscv32imac-unknown-none-elf` and `riscv32imafc-unknown-none-elf` in CI.
+  `simd`, `rayon`, `profile` and `counters` now imply `std`. No `libm` is
+  needed: the decoder's output-size rounding and the upsampler's row fraction
+  were the only floats on the coding path and both are now exact integer
+  arithmetic (identical results — the float forms were exact too).
+- **`decode::Source`** replaces `std::io::Read` as the decoder's input bound.
+  With `std` every `Read` is a `Source` (nothing changes for existing
+  callers); without it `&[u8]` is. `Decoder::new(&bytes[..])` works on both.
+- **`decode::Error::UnexpectedEof`** is raised for truncated data on every
+  path — where it used to be `Io(UnexpectedEof)` — so a receiver can tell a
+  short frame from a corrupt one; `Error::Io` remains for genuine reader
+  errors and exists only with `std`.
+- **`encode::SliceWriter`**: a caller-owned output buffer with a cursor
+  (`written()`), the same on both sides of `std`; overflow is the new
+  `EncodingError::BufferTooSmall`. Without `std`, `&mut [u8]` is also a
+  `JfifWrite` sink with the same error.
+- **`encode::YuyvImage` and `ColorType::Yuyv`**: packed 4:2:2 `YUYV` input,
+  encoded without an RGB conversion; byte-identical to the planar 4:2:2 path
+  on the same samples. (Planar 4:2:0 was already `PlanarYcbcrImage`.)
+- **Fixed: optimized Huffman tables with a restart interval wrote a corrupt
+  stream** on the progressive path and on the per-component sequential path
+  (a sampling factor that cannot be interleaved). The statistics pass never
+  reset the DC predictor at restart markers, so the large "raw DC" categories
+  a restart produces had no code; in a release build that emitted zero-length
+  codes (the decoder fails with "failed to decode huffman code"), in a debug
+  build the `get_for_value` assert fired. Found by the golden test's
+  progressive + optimized + `DRI` row. The interleaved baseline path already
+  counted restarts correctly and is unchanged.
+- The `RUSTY_JPEG_TRELLIS_LAMBDA` / `RUSTY_JPEG_TRELLIS_MAG` knobs go through
+  a `std`-only shim and read as their defaults without `std`.
+- The examples declare `required-features = ["std"]`; they are host tools.
+
 ## 0.3.2
 
 Cleanup release. No behaviour change — output is byte-identical across default,

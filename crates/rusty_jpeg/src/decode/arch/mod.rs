@@ -1,12 +1,15 @@
 #![allow(unsafe_code)]
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+// The x86 kernels are selected by runtime feature detection, which needs `std`;
+// NEON and wasm simd128 are compile-time targets and need nothing.
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 mod avx2;
 mod neon;
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 mod ssse3;
 mod wasm;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
 use std::is_x86_feature_detected;
 
 /// Arch-specific implementation of YCbCr conversion. Returns the number of pixels that were
@@ -14,7 +17,7 @@ use std::is_x86_feature_detected;
 #[allow(clippy::type_complexity)]
 pub fn get_color_convert_line_ycbcr() -> Option<unsafe fn(&[u8], &[u8], &[u8], &mut [u8]) -> usize>
 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     #[allow(unsafe_code)]
     {
         if is_x86_feature_detected!("ssse3") {
@@ -38,7 +41,7 @@ pub fn get_color_convert_line_ycbcr() -> Option<unsafe fn(&[u8], &[u8], &[u8], &
 #[allow(clippy::type_complexity)]
 pub fn get_dequantize_and_idct_block_8x8(
 ) -> Option<unsafe fn(&[i16; 64], &[u16; 64], usize, &mut [u8])> {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     #[allow(unsafe_code)]
     {
         if is_x86_feature_detected!("ssse3") {
@@ -65,7 +68,7 @@ pub fn get_dequantize_and_idct_block_8x8(
 #[allow(clippy::type_complexity)]
 pub fn get_dequantize_and_idct_block_8x8_pair(
 ) -> Option<unsafe fn(&[i16; 64], &[i16; 64], &[u16; 64], usize, &mut [u8], usize)> {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     #[allow(unsafe_code)]
     {
         if is_x86_feature_detected!("avx2") {
@@ -76,7 +79,11 @@ pub fn get_dequantize_and_idct_block_8x8_pair(
     None
 }
 
-#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
 mod pair_tests {
     /// The AVX2 pair kernel must reproduce the SSSE3 kernel EXACTLY.
     ///

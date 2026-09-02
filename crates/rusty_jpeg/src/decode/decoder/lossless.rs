@@ -4,9 +4,12 @@ use crate::decode::huffman::HuffmanDecoder;
 use crate::decode::marker::Marker;
 use crate::decode::parser::Predictor;
 use crate::decode::parser::{Component, FrameInfo, ScanInfo};
-use std::io::Read;
+use crate::decode::Source;
+use alloc::borrow::ToOwned;
+use alloc::vec::Vec;
+use alloc::{format, vec};
 
-impl<R: Read> Decoder<R> {
+impl<R: Source> Decoder<R> {
     /// decode_scan_lossless
     pub fn decode_scan_lossless(
         &mut self,

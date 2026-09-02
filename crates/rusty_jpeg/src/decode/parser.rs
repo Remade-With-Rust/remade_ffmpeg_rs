@@ -2,12 +2,12 @@ use crate::decode::error::{Error, Result, UnsupportedFeature};
 use crate::decode::huffman::{HuffmanTable, HuffmanTableClass};
 use crate::decode::marker::Marker;
 use crate::decode::marker::Marker::*;
+use crate::decode::Source;
 use crate::decode::{read_u16_from_be, read_u8};
 use alloc::borrow::ToOwned;
 use alloc::vec::Vec;
 use alloc::{format, vec};
 use core::ops::Range;
-use std::io::{self, Read};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Dimensions {
@@ -123,16 +123,18 @@ impl FrameInfo {
 
         update_component_sizes(self.image_size, &mut self.components)?;
 
+        // `ceil(size * idct_size / 8)`, in integers: the product is below 2^24,
+        // so the float form this replaces was exact and this is identical.
         self.output_size = Dimensions {
-            width: (self.image_size.width as f32 * idct_size as f32 / 8.0).ceil() as u16,
-            height: (self.image_size.height as f32 * idct_size as f32 / 8.0).ceil() as u16,
+            width: (usize::from(self.image_size.width) * idct_size).div_ceil(8) as u16,
+            height: (usize::from(self.image_size.height) * idct_size).div_ceil(8) as u16,
         };
 
         Ok(())
     }
 }
 
-fn read_length<R: Read>(reader: &mut R, marker: Marker) -> Result<usize> {
+fn read_length<R: Source>(reader: &mut R, marker: Marker) -> Result<usize> {
     assert!(marker.has_length());
 
     // length is including itself.
@@ -148,19 +150,19 @@ fn read_length<R: Read>(reader: &mut R, marker: Marker) -> Result<usize> {
     Ok(length - 2)
 }
 
-fn skip_bytes<R: Read>(reader: &mut R, length: usize) -> Result<()> {
-    let length = length as u64;
-    let to_skip = &mut reader.by_ref().take(length);
-    let copied = io::copy(to_skip, &mut io::sink())?;
-    if copied < length {
-        Err(Error::Io(io::ErrorKind::UnexpectedEof.into()))
-    } else {
-        Ok(())
+fn skip_bytes<R: Source>(reader: &mut R, length: usize) -> Result<()> {
+    let mut scratch = [0u8; 256];
+    let mut left = length;
+    while left > 0 {
+        let n = left.min(scratch.len());
+        reader.read_exact(&mut scratch[..n])?;
+        left -= n;
     }
+    Ok(())
 }
 
 // Section B.2.2
-pub fn parse_sof<R: Read>(reader: &mut R, marker: Marker) -> Result<FrameInfo> {
+pub fn parse_sof<R: Source>(reader: &mut R, marker: Marker) -> Result<FrameInfo> {
     let length = read_length(reader, marker)?;
 
     if length <= 6 {
@@ -407,7 +409,7 @@ fn test_update_component_sizes() {
 }
 
 // Section B.2.3
-pub fn parse_sos<R: Read>(reader: &mut R, frame: &FrameInfo) -> Result<ScanInfo> {
+pub fn parse_sos<R: Source>(reader: &mut R, frame: &FrameInfo) -> Result<ScanInfo> {
     let length = read_length(reader, SOS)?;
     if 0 == length {
         return Err(Error::Format("zero length in SOS".to_owned()));
@@ -604,7 +606,7 @@ pub fn parse_sos<R: Read>(reader: &mut R, frame: &FrameInfo) -> Result<ScanInfo>
 }
 
 // Section B.2.4.1
-pub fn parse_dqt<R: Read>(reader: &mut R) -> Result<[Option<[u16; 64]>; 4]> {
+pub fn parse_dqt<R: Source>(reader: &mut R) -> Result<[Option<[u16; 64]>; 4]> {
     let mut length = read_length(reader, DQT)?;
     let mut tables = [None; 4];
 
@@ -663,7 +665,7 @@ pub fn parse_dqt<R: Read>(reader: &mut R) -> Result<[Option<[u16; 64]>; 4]> {
 
 // Section B.2.4.2
 #[allow(clippy::type_complexity)]
-pub fn parse_dht<R: Read>(
+pub fn parse_dht<R: Source>(
     reader: &mut R,
     is_baseline: Option<bool>,
 ) -> Result<(Vec<Option<HuffmanTable>>, Vec<Option<HuffmanTable>>)> {
@@ -733,18 +735,18 @@ pub fn parse_dht<R: Read>(
 }
 
 // Section B.2.4.4
-pub fn parse_dri<R: Read>(reader: &mut R) -> Result<u16> {
+pub fn parse_dri<R: Source>(reader: &mut R) -> Result<u16> {
     let length = read_length(reader, DRI)?;
 
     if length != 2 {
         return Err(Error::Format("DRI with invalid length".to_owned()));
     }
 
-    Ok(read_u16_from_be(reader)?)
+    read_u16_from_be(reader)
 }
 
 // Section B.2.4.5
-pub fn parse_com<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
+pub fn parse_com<R: Source>(reader: &mut R) -> Result<Vec<u8>> {
     let length = read_length(reader, COM)?;
     let mut buffer = vec![0u8; length];
 
@@ -754,7 +756,7 @@ pub fn parse_com<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
 }
 
 // Section B.2.4.6
-pub fn parse_app<R: Read>(reader: &mut R, marker: Marker) -> Result<Option<AppData>> {
+pub fn parse_app<R: Source>(reader: &mut R, marker: Marker) -> Result<Option<AppData>> {
     let length = read_length(reader, marker)?;
     let mut bytes_read = 0;
     let mut result = None;

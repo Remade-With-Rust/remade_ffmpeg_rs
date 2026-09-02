@@ -15,9 +15,9 @@
 //! and why this needed no tolerance and no requantisation of the constants.
 
 #[cfg(target_arch = "x86")]
-use std::arch::x86::*;
+use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
+use core::arch::x86_64::*;
 
 /// One IDCT pass over 8 rows, each holding two blocks' worth of coefficients.
 ///
@@ -201,12 +201,12 @@ pub unsafe fn dequantize_and_idct_block_8x8_pair(
 
         let mut buf = [0u8; 16];
         _mm_storeu_si128(buf.as_mut_ptr() as *mut _, _mm256_castsi256_si128(packed));
-        std::ptr::copy_nonoverlapping::<u8>(buf.as_ptr(), base, 8);
+        core::ptr::copy_nonoverlapping::<u8>(buf.as_ptr(), base, 8);
 
         _mm_storeu_si128(
             buf.as_mut_ptr() as *mut _,
             _mm256_extracti128_si256::<1>(packed),
         );
-        std::ptr::copy_nonoverlapping::<u8>(buf.as_ptr(), base.wrapping_add(output_offset_b), 8);
+        core::ptr::copy_nonoverlapping::<u8>(buf.as_ptr(), base.wrapping_add(output_offset_b), 8);
     }
 }

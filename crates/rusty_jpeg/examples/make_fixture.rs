@@ -99,7 +99,6 @@ fn main() {
         "{out}: {w}x{h} q{quality}, {} B, {ratio:.1}x compression",
         jpeg.len()
     );
-
 }
 
 // Primary allocator for this target: our rusty_alloc, the pure-Rust mimalloc

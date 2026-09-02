@@ -111,16 +111,58 @@ fn main() -> Result<(), rusty_jpeg::EncodingError> {
 Chroma subsampling (`SamplingFactor`), quantization tables
 (`QuantizationTableType`), progressive mode, optimized Huffman tables and
 trellis are set on the `Encoder` before `encode`. `PlanarYcbcrImage` accepts
-planar YUV input without a round trip through RGB.
+planar YUV input (4:4:4, 4:2:2, 4:2:0) and `YuyvImage` / `ColorType::Yuyv`
+packed 4:2:2 `YUYV` straight from a camera — neither takes a round trip
+through RGB, and at the matching `SamplingFactor` the chroma reaches the DCT
+untouched.
+
+## Without `std` — on a chip
+
+`default-features = false` makes the crate `no_std` + `alloc`, and it builds
+for `riscv32imac-unknown-none-elf` (ESP32-C6 class) and
+`riscv32imafc-unknown-none-elf` (ESP32-P4 class) in CI. What changes:
+
+- **The decoder reads a slice.** `Decoder::new(&bytes[..])` — any
+  `decode::Source`, which with `std` is every `std::io::Read`. `scale()` is
+  the important part on a chip: a 1600×1200 sensor JPEG decoded at 1/4 is a
+  400×300 picture for a fraction of the work, and the full-size picture is
+  never held.
+- **The encoder writes into your buffer.** `SliceWriter::new(&mut buf)` is a
+  sink with a cursor; `written()` says how much it holds, and outgrowing it is
+  `EncodingError::BufferTooSmall`, never a truncated file. A bare `&mut [u8]`
+  works too (it advances past what was written). A `Vec<u8>` still works.
+- **No libm.** The few floats on the coding path were replaced by exact
+  integer arithmetic, so a host and a chip code the same source to the same
+  bytes — **provided the host runs the scalar kernels** (`--no-default-features
+  --features std`, or `platform_independent`). The x86-64 SIMD kernels are not
+  bit-identical to their scalar twins (the AVX2 forward DCT and the SSSE3
+  inverse DCT round differently; a ±1 LSB matter), so a default host build is
+  not the oracle for a chip. `tests/no_std_surface.rs` pins both rows: the
+  scalar golden that `no_std` and `platform_independent` must share, and the
+  SIMD golden.
+- **No environment.** The `RUSTY_JPEG_*` knobs read as their defaults; the
+  configuration is what you set on the `Encoder`.
+- **No threads, no runtime CPU detection.** The synchronous worker and the
+  scalar kernels — the same code every other build gates its SIMD against.
+
+```rust
+use rusty_jpeg::encode::{ColorType, Encoder, SliceWriter};
+
+// `yuyv` is the camera's DMA buffer; `out` is the packetizer's.
+let mut sink = SliceWriter::new(&mut out);
+Encoder::new(&mut sink, 75).encode(&yuyv, 320, 240, ColorType::Yuyv)?;
+let jpeg = &out[..sink.written()];
+```
 
 ## Features
 
 | Feature | Default | Effect |
 |---|---|---|
-| `std` | yes | Standard library. |
-| `simd` | yes | AVX2/SSE4.1 kernels on x86; NEON on aarch64. |
-| `rayon` | **no** | Decoder threading. Off because it measured slower at every image size — fork-join costs more than intra-frame parallelism buys. |
+| `std` | yes | `std::io` sources and sinks, the file constructor, the decoder's worker thread, runtime CPU detection, the environment knobs. Off: `no_std` + `alloc`, see above. |
+| `simd` | yes | AVX2/SSE4.1 kernels on x86; NEON on aarch64. Implies `std`. Not bit-identical to the scalar kernels (±1 LSB); the scalar build is the oracle for a chip. |
+| `rayon` | **no** | Decoder threading. Off because it measured slower at every image size — fork-join costs more than intra-frame parallelism buys. Implies `std`. |
 | `platform_independent` | no | Drop arch-specific code, `forbid(unsafe_code)`. |
+| `profile`, `counters` | no | Host measurement instruments (`rdtsc`, 64-bit atomics). Imply `std`. |
 
 `Decoder::set_single_threaded(true)` selects the synchronous worker: ~38% less
 CPU than the threaded default, which remains faster in wall-clock on a

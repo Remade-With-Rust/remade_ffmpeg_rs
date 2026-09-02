@@ -105,6 +105,101 @@ impl<W: std::io::Write + ?Sized> JfifWrite for W {
     }
 }
 
+/// A caller-owned byte buffer as the sink, without `std`. The slice advances
+/// past what was written (the `std::io::Write for &mut [u8]` convention), so
+/// afterwards it is the unused tail and the byte count is what shrank away.
+/// Running out of room is [`EncodingError::BufferTooSmall`]; nothing is
+/// truncated silently. With `std` the same type goes through the blanket
+/// `std::io::Write` impl above and fails with `IoError(WriteZero)` — use
+/// [`SliceWriter`] for one behaviour on both.
+#[cfg(not(feature = "std"))]
+impl JfifWrite for &mut [u8] {
+    fn write_all(&mut self, buf: &[u8]) -> Result<(), EncodingError> {
+        if buf.len() > self.len() {
+            return Err(EncodingError::BufferTooSmall);
+        }
+        let (head, tail) = core::mem::take(self).split_at_mut(buf.len());
+        head.copy_from_slice(buf);
+        *self = tail;
+        Ok(())
+    }
+}
+
+/// A caller-owned output buffer with a write cursor: the encoder fills it, the
+/// caller reads back how much. No allocation, no copy of the finished stream.
+///
+/// This is the sink for a chip, where the packetizer already owns a buffer and
+/// the encoder should write into it rather than build a `Vec` and copy. It
+/// behaves the same with and without `std`: outgrowing the buffer is
+/// [`EncodingError::BufferTooSmall`], never a truncated file.
+///
+/// ```
+/// use rusty_jpeg::encode::{ColorType, Encoder, SliceWriter};
+/// let rgb = [0u8; 16 * 16 * 3];
+/// let mut out = [0u8; 4096];
+/// let mut sink = SliceWriter::new(&mut out);
+/// Encoder::new(&mut sink, 75).encode(&rgb, 16, 16, ColorType::Rgb).unwrap();
+/// let n = sink.written();
+/// assert!(out[..n].starts_with(&[0xFF, 0xD8]) && out[..n].ends_with(&[0xFF, 0xD9]));
+/// ```
+#[derive(Debug)]
+pub struct SliceWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> SliceWriter<'a> {
+    /// Write into `buf` from its start.
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        SliceWriter { buf, len: 0 }
+    }
+
+    /// Bytes written so far.
+    pub fn written(&self) -> usize {
+        self.len
+    }
+
+    /// Total bytes the buffer can hold.
+    pub fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// The bytes written so far.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    /// Give the buffer back, narrowed to the bytes written.
+    pub fn into_written(self) -> &'a mut [u8] {
+        let SliceWriter { buf, len } = self;
+        &mut buf[..len]
+    }
+}
+
+impl JfifWrite for SliceWriter<'_> {
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> Result<(), EncodingError> {
+        let end = self.len + buf.len();
+        if end > self.buf.len() {
+            return Err(EncodingError::BufferTooSmall);
+        }
+        self.buf[self.len..end].copy_from_slice(buf);
+        self.len = end;
+        Ok(())
+    }
+}
+
+// Without `std` the generic `&mut W` impl above covers this; with `std` the
+// blanket impl is over `std::io::Write`, which `SliceWriter` is not, so the
+// borrowed form is spelled out.
+#[cfg(feature = "std")]
+impl JfifWrite for &mut SliceWriter<'_> {
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> Result<(), EncodingError> {
+        (**self).write_all(buf)
+    }
+}
+
 pub(crate) struct JfifWriter<W: JfifWrite> {
     w: W,
     bit_buffer: usize,

@@ -23,9 +23,9 @@ mod writer;
 
 pub use encoder::{ColorType, Encoder, JpegColorType, SamplingFactor};
 pub use error::EncodingError;
-pub use image_buffer::{cmyk_to_ycck, rgb_to_ycbcr, ImageBuffer, PlanarYcbcrImage};
+pub use image_buffer::{cmyk_to_ycck, rgb_to_ycbcr, ImageBuffer, PlanarYcbcrImage, YuyvImage};
 pub use quantization::QuantizationTableType;
-pub use writer::{JfifWrite, PixelDensity, PixelDensityUnit};
+pub use writer::{JfifWrite, PixelDensity, PixelDensityUnit, SliceWriter};
 
 #[cfg(feature = "benchmark")]
 pub use fdct::fdct;
@@ -507,6 +507,46 @@ mod tests {
         };
 
         assert_eq!(icc, icc_out);
+    }
+
+    /// Optimized tables and restart intervals together: the statistics pass
+    /// must reset the DC predictor exactly where the scan writer does, or the
+    /// large DC categories at each restart get no code. Both scan layouts that
+    /// use the per-component statistics: progressive, and a sampling factor
+    /// that cannot be interleaved.
+    #[test]
+    fn optimized_tables_with_restart_intervals_round_trip() {
+        let (data, width, height) = create_test_img_rgb();
+        for (progressive, sampling) in [
+            (true, SamplingFactor::F_2_2),
+            (false, SamplingFactor::F_4_1),
+            (true, SamplingFactor::F_1_1),
+        ] {
+            let mut plain = Vec::new();
+            let mut encoder = Encoder::new(&mut plain, 75);
+            encoder.set_sampling_factor(sampling);
+            encoder.set_progressive(progressive);
+            encoder.set_restart_interval(4);
+            encoder
+                .encode(&data, width, height, ColorType::Rgb)
+                .unwrap();
+
+            let mut optimized = Vec::new();
+            let mut encoder = Encoder::new(&mut optimized, 75);
+            encoder.set_sampling_factor(sampling);
+            encoder.set_progressive(progressive);
+            encoder.set_restart_interval(4);
+            encoder.set_optimized_huffman_tables(true);
+            encoder
+                .encode(&data, width, height, ColorType::Rgb)
+                .unwrap();
+
+            // Huffman tables change the bytes, never the pixels.
+            let (a, _) = decode(&plain);
+            let (b, _) = decode(&optimized);
+            assert_eq!(a, b, "progressive={progressive} sampling={sampling:?}");
+            assert!(optimized.len() < plain.len(), "optimized tables save bytes");
+        }
     }
 
     #[test]

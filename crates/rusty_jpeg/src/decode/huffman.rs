@@ -1,10 +1,10 @@
 use crate::decode::error::{Error, Result};
 use crate::decode::marker::Marker;
 use crate::decode::parser::ScanInfo;
+use crate::decode::Source;
 use alloc::borrow::ToOwned;
 use alloc::vec;
 use alloc::vec::Vec;
-use std::io::Read;
 
 const LUT_BITS: u8 = 8;
 
@@ -26,7 +26,7 @@ impl HuffmanDecoder {
 
     // Section F.2.2.3
     // Figure F.16
-    pub fn decode<R: Read>(
+    pub fn decode<R: Source>(
         &mut self,
         reader: &mut crate::decode::Buffered<R>,
         table: &HuffmanTable,
@@ -61,7 +61,7 @@ impl HuffmanDecoder {
         }
     }
 
-    pub fn decode_fast_ac<R: Read>(
+    pub fn decode_fast_ac<R: Source>(
         &mut self,
         reader: &mut crate::decode::Buffered<R>,
         table: &HuffmanTable,
@@ -87,7 +87,7 @@ impl HuffmanDecoder {
     }
 
     #[inline]
-    pub fn get_bits<R: Read>(
+    pub fn get_bits<R: Source>(
         &mut self,
         reader: &mut crate::decode::Buffered<R>,
         count: u8,
@@ -103,7 +103,7 @@ impl HuffmanDecoder {
     }
 
     #[inline]
-    pub fn receive_extend<R: Read>(
+    pub fn receive_extend<R: Source>(
         &mut self,
         reader: &mut crate::decode::Buffered<R>,
         count: u8,
@@ -118,7 +118,7 @@ impl HuffmanDecoder {
         self.num_bits = 0;
     }
 
-    pub fn take_marker<R: Read>(
+    pub fn take_marker<R: Source>(
         &mut self,
         reader: &mut crate::decode::Buffered<R>,
     ) -> Result<Option<Marker>> {
@@ -141,7 +141,7 @@ impl HuffmanDecoder {
         self.num_bits -= count;
     }
 
-    fn read_bits<R: Read>(&mut self, reader: &mut crate::decode::Buffered<R>) -> Result<()> {
+    fn read_bits<R: Source>(&mut self, reader: &mut crate::decode::Buffered<R>) -> Result<()> {
         crate::prof::bump(crate::prof::Count::DecRefills, 1);
 
         // Bulk refill: absorb every byte the accumulator has room for in ONE
@@ -319,7 +319,7 @@ fn derive_huffman_codes(bits: &[u8; 16]) -> Result<(Vec<u16>, Vec<u8>)> {
         .iter()
         .enumerate()
         .fold(Vec::new(), |mut acc, (i, &value)| {
-            acc.extend(std::iter::repeat_n((i + 1) as u8, value as usize));
+            acc.extend(core::iter::repeat_n((i + 1) as u8, value as usize));
             acc
         });
 

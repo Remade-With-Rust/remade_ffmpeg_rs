@@ -41,11 +41,8 @@ use crate::encode::writer::{get_code, ZIGZAG};
 const DEFAULT_LAMBDA_SCALE: f32 = 0.10;
 
 pub(crate) fn lambda_scale() -> f32 {
-    use std::sync::OnceLock;
-    static V: OnceLock<f32> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RUSTY_JPEG_TRELLIS_LAMBDA")
-            .ok()
+    crate::cached_knob!(f32, {
+        crate::knob("RUSTY_JPEG_TRELLIS_LAMBDA")
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_LAMBDA_SCALE)
     })
@@ -231,10 +228,8 @@ pub(crate) fn truncate_rd(
 /// `RUSTY_JPEG_TRELLIS_MAG=0` disables magnitude lowering, keeping EOB
 /// truncation. Separable because the two were measured separately.
 fn magnitudes_enabled() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("RUSTY_JPEG_TRELLIS_MAG")
+    crate::cached_knob!(bool, {
+        crate::knob("RUSTY_JPEG_TRELLIS_MAG")
             .map(|v| v != "0")
             .unwrap_or(true)
     })

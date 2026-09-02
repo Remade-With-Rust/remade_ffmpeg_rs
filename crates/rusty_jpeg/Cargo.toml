@@ -1,11 +1,11 @@
 [package]
 name = "rusty_jpeg"
-version = "0.3.2"
 # Vendored build copy. `rusty_jpeg` is published from its own repository
 # (github.com/Remade-With-Rust/rusty_jpeg), which crates.io names as its source;
 # two repositories publishing one crate name is what makes a version
 # cascade unorderable. Dependents here resolve it by version when published.
 publish = false
+version = "0.4.0"
 edition = "2021"
 license = "(MIT OR Apache-2.0) AND IJG"
 repository = "https://github.com/Remade-With-Rust/rusty_jpeg"
@@ -30,24 +30,32 @@ rust-version = "1.85"
 # kept so the measurement is cheap to repeat (and in case a future worker design
 # changes the answer), but it must not be on by default.
 default = ["std", "simd"]
+# `std`: `std::io::Read`/`Write` sources and sinks, the file constructor, the
+# decoder's worker thread, runtime CPU detection and the `RUSTY_JPEG_*`
+# environment knobs. Without it the crate is `no_std` + `alloc`: the decoder
+# reads a `&[u8]` (any `decode::Source`), the encoder writes a `Vec<u8>`, a
+# `&mut [u8]` or an `encode::SliceWriter`, every knob reads as its default, and
+# no float math needs a libm — there is none left on either path.
 std = []
 # Encoder AVX2 kernels (FDCT + RGB->YCbCr). NOT default upstream, which is how
-# they sat dead in this tree for the whole life of the dependency.
+# they sat dead in this tree for the whole life of the dependency. Needs `std`
+# for runtime feature detection.
 simd = ["std"]
 # Decoder work-stealing threading.
-rayon = ["dep:rayon"]
+rayon = ["std", "dep:rayon"]
 # Decoder: drop all arch-specific code (forbids unsafe outright).
 platform_independent = []
 nightly_aarch64_neon = []
 # Exposes internal kernels for benchmarks/oracle A-B tests.
 benchmark = []
-# Feature-gated stage profiler; zero-cost when off.
-profile = []
+# Feature-gated stage profiler; zero-cost when off. A host instrument: 64-bit
+# atomics and the TSC, so it implies `std`.
+profile = ["std"]
 # Deterministic work counters (symbols, bits, flushes). SEPARATE from `profile`
 # on purpose: the counters fire hundreds of millions of times inside the entropy
 # coder, so enabling both makes the cycle buckets measure the instrument. Counts
 # from this build; cycles from a `profile` build; never the same binary.
-counters = []
+counters = ["std"]
 
 [dependencies]
 rayon = { version = "1.5.1", optional = true }
@@ -55,3 +63,24 @@ rayon = { version = "1.5.1", optional = true }
 [dev-dependencies]
 # global allocator for bench/example roots (see project convention)
 rusty_alloc-api.workspace = true
+
+# The examples are host tools (files, stdout, timers); they are not part of the
+# `no_std` surface, so a `--no-default-features` build skips them.
+[[example]]
+name = "corpus_sweep"
+required-features = ["std"]
+[[example]]
+name = "decode_bench"
+required-features = ["std"]
+[[example]]
+name = "fuzzprobe"
+required-features = ["std"]
+[[example]]
+name = "jpegquality"
+required-features = ["std"]
+[[example]]
+name = "make_fixture"
+required-features = ["std"]
+[[example]]
+name = "scanmode"
+required-features = ["std"]

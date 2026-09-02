@@ -1,8 +1,9 @@
 use alloc::boxed::Box;
 use alloc::fmt;
 use alloc::string::String;
+use core::error::Error as CoreError;
 use core::result;
-use std::error::Error as StdError;
+#[cfg(feature = "std")]
 use std::io::Error as IoError;
 
 use crate::decode::ColorTransform;
@@ -42,9 +43,14 @@ pub enum Error {
     /// The image makes use of a JPEG feature not (currently) supported by this library.
     Unsupported(UnsupportedFeature),
     /// An I/O error occurred while decoding the image.
+    #[cfg(feature = "std")]
     Io(IoError),
+    /// The data ended before the image did. Raised in place of an
+    /// `Io(UnexpectedEof)` on every path, with or without `std`, so a
+    /// receiver can tell a truncated frame from a corrupt one.
+    UnexpectedEof,
     /// An internal error occurred while decoding the image.
-    Internal(Box<dyn StdError + Send + Sync + 'static>), //TODO: not used, can be removed with the next version bump
+    Internal(Box<dyn CoreError + Send + Sync + 'static>), //TODO: not used, can be removed with the next version bump
 }
 
 impl fmt::Display for Error {
@@ -52,15 +58,18 @@ impl fmt::Display for Error {
         match *self {
             Error::Format(ref desc) => write!(f, "invalid JPEG format: {}", desc),
             Error::Unsupported(ref feat) => write!(f, "unsupported JPEG feature: {:?}", feat),
+            #[cfg(feature = "std")]
             Error::Io(ref err) => err.fmt(f),
+            Error::UnexpectedEof => write!(f, "unexpected end of JPEG data"),
             Error::Internal(ref err) => err.fmt(f),
         }
     }
 }
 
-impl StdError for Error {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+impl CoreError for Error {
+    fn source(&self) -> Option<&(dyn CoreError + 'static)> {
         match *self {
+            #[cfg(feature = "std")]
             Error::Io(ref err) => Some(err),
             Error::Internal(ref err) => Some(&**err),
             _ => None,
@@ -68,6 +77,7 @@ impl StdError for Error {
     }
 }
 
+#[cfg(feature = "std")]
 impl From<IoError> for Error {
     fn from(err: IoError) -> Error {
         Error::Io(err)

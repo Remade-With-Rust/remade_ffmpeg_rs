@@ -505,6 +505,111 @@ impl ImageBuffer for PlanarYcbcrImage<'_> {
     }
 }
 
+/// A borrowed **packed 4:2:2** `YUYV` (`YUY2`) image — the layout a camera
+/// sensor or a capture device hands over — fed to the encoder without an RGB
+/// conversion and without unpacking into planes first.
+///
+/// Every 4-byte group is `Y0 Cb Y1 Cr`: two luma samples sharing one chroma
+/// pair. Rows are `stride` bytes apart, at least [`row_bytes`](Self::row_bytes).
+///
+/// # Why it is lossless at 4:2:2
+///
+/// As with [`PlanarYcbcrImage`], each chroma sample is replicated across the
+/// two luma positions it covers, and the encoder's point-sampling takes every
+/// second one back — so at
+/// [`SamplingFactor::R_4_2_2`](super::SamplingFactor::R_4_2_2) chroma reaches
+/// the DCT exactly as the sensor produced it. At the encoder's default 4:2:0
+/// (quality below 90) it additionally keeps every second chroma *row*, which is
+/// the usual camera-pipeline choice. [`sampling_factor`](Self::sampling_factor)
+/// returns the lossless one.
+pub struct YuyvImage<'a> {
+    data: &'a [u8],
+    stride: usize,
+    width: u16,
+    height: u16,
+}
+
+impl<'a> YuyvImage<'a> {
+    /// Wrap a packed buffer. Returns `None` if a dimension is zero, `stride` is
+    /// shorter than a row, or `data` is too short for the geometry it claims.
+    pub fn new(data: &'a [u8], stride: usize, width: u16, height: u16) -> Option<YuyvImage<'a>> {
+        let (w, h) = (usize::from(width), usize::from(height));
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let row = Self::row_bytes(width);
+        if stride < row || data.len() < stride * (h - 1) + row {
+            return None;
+        }
+        Some(YuyvImage {
+            data,
+            stride,
+            width,
+            height,
+        })
+    }
+
+    /// Bytes one row of `width` pixels occupies when packed without padding:
+    /// `ceil(width / 2) * 4`.
+    pub const fn row_bytes(width: u16) -> usize {
+        (width as usize).div_ceil(2) * 4
+    }
+
+    /// The [`SamplingFactor`](super::SamplingFactor) at which this image
+    /// encodes with its chroma untouched: 4:2:2.
+    pub fn sampling_factor(&self) -> super::SamplingFactor {
+        super::SamplingFactor::R_4_2_2
+    }
+}
+
+impl ImageBuffer for YuyvImage<'_> {
+    fn get_jpeg_color_type(&self) -> JpegColorType {
+        JpegColorType::Ycbcr
+    }
+
+    fn width(&self) -> u16 {
+        self.width
+    }
+
+    fn height(&self) -> u16 {
+        self.height
+    }
+
+    fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
+        let w = usize::from(self.width);
+        let pairs = w.div_ceil(2);
+        let start = usize::from(y) * self.stride;
+        let row = &self.data[start..start + pairs * 4];
+
+        // Size each destination once and fill pairs, as the planar path does;
+        // an odd width then trims the padding pixel of the last pair.
+        let (luma, rest) = buffers.split_at_mut(1);
+        let (cb, cr) = rest.split_at_mut(1);
+        let (luma, cb, cr) = (&mut luma[0], &mut cb[0], &mut cr[0]);
+        let (ly, lcb, lcr) = (luma.len(), cb.len(), cr.len());
+        luma.resize(ly + pairs * 2, 0);
+        cb.resize(lcb + pairs * 2, 0);
+        cr.resize(lcr + pairs * 2, 0);
+        let it = row
+            .chunks_exact(4)
+            .zip(luma[ly..].chunks_exact_mut(2))
+            .zip(cb[lcb..].chunks_exact_mut(2))
+            .zip(cr[lcr..].chunks_exact_mut(2));
+        for (((g, y2), cb2), cr2) in it {
+            y2[0] = g[0];
+            y2[1] = g[2];
+            cb2[0] = g[1];
+            cb2[1] = g[1];
+            cr2[0] = g[3];
+            cr2[1] = g[3];
+        }
+        let excess = pairs * 2 - w;
+        luma.truncate(luma.len() - excess);
+        cb.truncate(cb.len() - excess);
+        cr.truncate(cr.len() - excess);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::encode::rgb_to_ycbcr;
@@ -618,6 +723,7 @@ mod tests {
 #[cfg(test)]
 mod planar_tests {
     use super::*;
+    use alloc::vec;
 
     /// The whole point of the planar path: replication here must cancel exactly
     /// against the encoder's point-sampling, so chroma reaches the DCT untouched.

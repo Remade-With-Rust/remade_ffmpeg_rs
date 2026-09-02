@@ -78,6 +78,13 @@ pub enum ColorType {
 
     /// YCCK (YCbCrK) with 4 bytes per pixel.
     Ycck,
+
+    /// Packed 4:2:2 `YUYV` (`YUY2`), 4 bytes per pixel *pair* (`Y0 Cb Y1 Cr`)
+    /// — what a camera sensor produces. An odd width carries one padding pixel
+    /// in its last pair, so a row is `ceil(width / 2) * 4` bytes. Encoded
+    /// without any RGB conversion; see [`YuyvImage`] for a strided buffer and
+    /// the sampling factor that keeps the chroma lossless.
+    Yuyv,
 }
 
 impl ColorType {
@@ -86,8 +93,17 @@ impl ColorType {
 
         match self {
             Luma => 1,
+            Yuyv => 2,
             Rgb | Bgr | Ycbcr => 3,
             Rgba | Bgra | Cmyk | CmykAsYcck | Ycck => 4,
+        }
+    }
+
+    /// Bytes one packed row of `width` pixels occupies.
+    pub(crate) fn row_bytes(self, width: u16) -> usize {
+        match self {
+            ColorType::Yuyv => YuyvImage::row_bytes(width),
+            _ => usize::from(width) * self.get_bytes_per_pixel(),
         }
     }
 }
@@ -499,7 +515,7 @@ impl<W: JfifWrite> Encoder<W> {
         height: u16,
         color_type: ColorType,
     ) -> Result<(), EncodingError> {
-        let required_data_len = width as usize * height as usize * color_type.get_bytes_per_pixel();
+        let required_data_len = color_type.row_bytes(width) * height as usize;
 
         if data.len() < required_data_len {
             return Err(EncodingError::BadImageData {
@@ -538,6 +554,13 @@ impl<W: JfifWrite> Encoder<W> {
                     ),
                     ColorType::Ycck => self
                         .encode_image_internal::<_, AVX2Operations>(YcckImage(data, width, height)),
+                    ColorType::Yuyv => {
+                        // Length was checked above, so `None` can only mean a zero dimension.
+                        let image =
+                            YuyvImage::new(data, YuyvImage::row_bytes(width), width, height)
+                                .ok_or(EncodingError::ZeroImageDimensions { width, height })?;
+                        self.encode_image_internal::<_, AVX2Operations>(image)
+                    }
                 };
             }
         }
@@ -552,6 +575,12 @@ impl<W: JfifWrite> Encoder<W> {
             ColorType::Cmyk => self.encode_image(CmykImage(data, width, height))?,
             ColorType::CmykAsYcck => self.encode_image(CmykAsYcckImage(data, width, height))?,
             ColorType::Ycck => self.encode_image(YcckImage(data, width, height))?,
+            ColorType::Yuyv => {
+                // Length was checked above, so `None` can only mean a zero dimension.
+                let image = YuyvImage::new(data, YuyvImage::row_bytes(width), width, height)
+                    .ok_or(EncodingError::ZeroImageDimensions { width, height })?;
+                self.encode_image(image)?
+            }
         }
 
         Ok(())
@@ -1539,11 +1568,21 @@ impl<W: JfifWrite> Encoder<W> {
                 if component.dc_huffman_table == table {
                     had_dc = true;
 
+                    // Mirror the scan writers: the DC predictor restarts at
+                    // every restart marker, i.e. before blocks R, 2R, 3R...
+                    // of the component. Counting without the reset never saw
+                    // the large "raw DC" categories a restart produces, so
+                    // those symbols had no code and the stream was corrupt
+                    // whenever optimized tables met a restart interval.
+                    let restart_interval = self.restart_interval.unwrap_or(0) as usize;
                     let mut prev_dc = 0;
 
                     debug_assert!(!blocks[i].is_empty());
 
-                    for block in &blocks[i] {
+                    for (n, block) in blocks[i].iter().enumerate() {
+                        if restart_interval > 0 && n > 0 && n % restart_interval == 0 {
+                            prev_dc = 0;
+                        }
                         let value = block[0];
                         let diff = value - prev_dc;
                         let num_bits = get_num_bits(diff);

@@ -11,14 +11,15 @@ use crate::decode::upsampler::Upsampler;
 use crate::decode::worker::{
     compute_image_parallel, PreferWorkerKind, RowData, Worker, WorkerScope,
 };
+use crate::decode::Source;
 use alloc::borrow::ToOwned;
+use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::{format, vec};
 use core::cmp;
 use core::mem;
 use core::ops::Range;
-use std::io::Read;
 
 pub const MAX_COMPONENTS: usize = 4;
 
@@ -247,7 +248,7 @@ impl PlanarImage {
     }
 }
 
-impl<R: Read> Decoder<R> {
+impl<R: Source> Decoder<R> {
     /// Creates a new `Decoder` using the reader `reader`.
     pub fn new(reader: R) -> Decoder<R> {
         Decoder {
@@ -430,12 +431,11 @@ impl<R: Read> Decoder<R> {
     ///
     /// ```no_run
     /// # use rusty_jpeg::decode::Decoder;
-    /// # use std::io::Cursor;
     /// # fn f(frames: Vec<Vec<u8>>) -> Result<(), rusty_jpeg::decode::Error> {
     /// let mut pool = Vec::new();
     /// for bytes in frames {
-    ///     let mut d = Decoder::new(Cursor::new(bytes));
-    ///     d.recycle_planes(std::mem::take(&mut pool));
+    ///     let mut d = Decoder::new(&bytes[..]);
+    ///     d.recycle_planes(core::mem::take(&mut pool));
     ///     let image = d.decode_planar()?;
     ///     // ... use `image` ...
     ///     pool = image.into_planes();
@@ -1456,7 +1456,7 @@ impl<R: Read> Decoder<R> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_block<R: Read>(
+fn decode_block<R: Source>(
     reader: &mut crate::decode::Buffered<R>,
     coefficients: &mut [i16; 64],
     huffman: &mut HuffmanDecoder,
@@ -1580,7 +1580,7 @@ fn decode_block<R: Read>(
     Ok(())
 }
 
-fn decode_block_successive_approximation<R: Read>(
+fn decode_block_successive_approximation<R: Source>(
     reader: &mut crate::decode::Buffered<R>,
     coefficients: &mut [i16; 64],
     huffman: &mut HuffmanDecoder,
@@ -1677,7 +1677,7 @@ fn decode_block_successive_approximation<R: Read>(
     Ok(())
 }
 
-fn refine_non_zeroes<R: Read>(
+fn refine_non_zeroes<R: Source>(
     reader: &mut crate::decode::Buffered<R>,
     coefficients: &mut [i16; 64],
     huffman: &mut HuffmanDecoder,

@@ -18,7 +18,6 @@
 //! a document-processing workload where progressive files are common.
 
 use rusty_jpeg::decode::Decoder;
-use std::io::Cursor;
 
 /// A real libjpeg progressive file: DHT(DC) x2, then `SOS ns=3 Ss=0 Se=0`
 /// naming AC table 0, which is not defined until after that scan.
@@ -26,7 +25,7 @@ const LIBJPEG_PROGRESSIVE: &[u8] = include_bytes!("fixtures/progressive_libjpeg.
 
 #[test]
 fn progressive_dc_scan_before_any_ac_table_does_not_panic() {
-    let img = Decoder::new(Cursor::new(LIBJPEG_PROGRESSIVE))
+    let img = Decoder::new(LIBJPEG_PROGRESSIVE)
         .decode()
         .expect("libjpeg progressive file must decode");
     assert_eq!(img.len(), 32 * 32 * 3, "unexpected decoded size");
@@ -44,7 +43,7 @@ fn progressive_dc_scan_before_any_ac_table_does_not_panic() {
 /// before, so it gets its own check.
 #[test]
 fn progressive_decodes_through_the_planar_path_too() {
-    let mut d = Decoder::new(Cursor::new(LIBJPEG_PROGRESSIVE));
+    let mut d = Decoder::new(LIBJPEG_PROGRESSIVE);
     d.set_single_threaded(true);
     let img = d.decode_planar().expect("planar progressive decode");
     assert_eq!(img.components.len(), 3);
@@ -64,7 +63,7 @@ fn missing_ac_table_on_an_ac_scan_is_an_error_not_a_panic() {
     for cut in (24..LIBJPEG_PROGRESSIVE.len()).step_by(7) {
         let data = &LIBJPEG_PROGRESSIVE[..cut];
         let res = std::panic::catch_unwind(|| {
-            let mut d = Decoder::new(Cursor::new(data));
+            let mut d = Decoder::new(data);
             d.set_single_threaded(true);
             d.decode().is_ok()
         });
@@ -115,7 +114,7 @@ fn oversized_progressive_frame_is_rejected_before_allocating() {
     }
     assert!(patched, "test fixture has no SOF2 to patch");
 
-    let mut d = Decoder::new(Cursor::new(&data));
+    let mut d = Decoder::new(&data[..]);
     d.set_single_threaded(true);
     // 64 MB: far above anything legitimate here, far below the ~8 GiB the
     // unpatched header would demand.

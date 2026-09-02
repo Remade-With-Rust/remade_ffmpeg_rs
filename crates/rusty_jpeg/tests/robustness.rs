@@ -16,7 +16,6 @@
 
 use rusty_jpeg::decode::Decoder;
 use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
-use std::io::Cursor;
 
 fn xorshift(s: &mut u64) -> u64 {
     *s ^= *s << 13;
@@ -127,7 +126,7 @@ fn malformed_input_never_panics() {
             // diverged before.
             let planar = i % 2 == 0;
             let res = std::panic::catch_unwind(|| {
-                let mut d = Decoder::new(Cursor::new(&data));
+                let mut d = Decoder::new(&data[..]);
                 d.set_single_threaded(true);
                 d.set_max_decoding_buffer_size(32 * 1024 * 1024);
                 if planar {
@@ -171,11 +170,9 @@ fn our_encoder_output_always_decodes() {
         ] {
             for &(w, h) in &[(1usize, 1usize), (8, 8), (17, 9), (64, 64), (127, 65)] {
                 let jpg = seed_jpeg(w, h, sampling, optimize);
-                let out = Decoder::new(Cursor::new(&jpg))
-                    .decode()
-                    .unwrap_or_else(|e| {
-                        panic!("{w}x{h} optimize={optimize} sampling={sampling:?}: {e}")
-                    });
+                let out = Decoder::new(&jpg[..]).decode().unwrap_or_else(|e| {
+                    panic!("{w}x{h} optimize={optimize} sampling={sampling:?}: {e}")
+                });
                 assert_eq!(
                     out.len(),
                     w * h * 3,

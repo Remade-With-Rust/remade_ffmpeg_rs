@@ -25,6 +25,13 @@ pub enum EncodingError {
 
     /// An io error occurred during writing (Should be used in no_std cases instead of IoError)
     Write(alloc::string::String),
+
+    /// The caller-owned output buffer filled up before the image was complete.
+    /// Raised by [`SliceWriter`](crate::encode::SliceWriter) and, without
+    /// `std`, by the `&mut [u8]` sink. Size the buffer for the worst case
+    /// (`width * height * 3 + 4096` holds any baseline JPEG this encoder
+    /// writes) or retry with a bigger one; the encoder is consumed either way.
+    BufferTooSmall,
 }
 
 #[cfg(feature = "std")]
@@ -60,6 +67,7 @@ impl Display for EncodingError {
             #[cfg(feature = "std")]
             IoError(err) => err.fmt(f),
             Write(err) => write!(f, "{}", err),
+            BufferTooSmall => write!(f, "Output buffer too small for the encoded image"),
         }
     }
 }

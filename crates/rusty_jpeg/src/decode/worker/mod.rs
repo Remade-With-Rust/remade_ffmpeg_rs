@@ -1,4 +1,5 @@
 mod immediate;
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 mod multithreaded;
 #[cfg(all(not(target_arch = "wasm32"), feature = "rayon"))]
 mod rayon;
@@ -9,6 +10,7 @@ use crate::decode::parser::{Component, Dimensions};
 use crate::decode::upsampler::Upsampler;
 
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
@@ -122,7 +124,7 @@ pub struct WorkerScope {
 enum WorkerScopeInner {
     #[cfg(all(not(target_arch = "wasm32"), feature = "rayon"))]
     Rayon(Box<rayon::Scoped>),
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     Multithreaded(multithreaded::MpscWorker),
     Immediate(immediate::ImmediateWorker),
 }
@@ -147,7 +149,7 @@ impl WorkerScope {
             #[cfg(all(not(target_arch = "wasm32"), feature = "rayon"))]
             PreferWorkerKind::Multithreaded => WorkerScopeInner::Rayon(Default::default()),
             #[allow(unreachable_patterns)]
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             PreferWorkerKind::Multithreaded => WorkerScopeInner::Multithreaded(Default::default()),
             _ => WorkerScopeInner::Immediate(Default::default()),
         });
@@ -155,7 +157,7 @@ impl WorkerScope {
         f(match &mut *inner {
             #[cfg(all(not(target_arch = "wasm32"), feature = "rayon"))]
             WorkerScopeInner::Rayon(worker) => worker.as_mut(),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             WorkerScopeInner::Multithreaded(worker) => worker,
             WorkerScopeInner::Immediate(worker) => worker,
         })

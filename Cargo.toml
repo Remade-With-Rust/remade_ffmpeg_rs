@@ -109,7 +109,7 @@ rusty_flac = { path = "crates/rusty_flac", version = "0.1.0" }
 rusty_mp3 = { path = "crates/rusty_mp3", version = "0.7.0" }
 rusty_aac = { path = "crates/rusty_aac", version = "0.5.0" }
 rusty_vorbis = { path = "crates/rusty_vorbis", version = "0.1.1" }
-rusty_jpeg = { path = "crates/rusty_jpeg", version = "0.3" }
+rusty_jpeg = { path = "crates/rusty_jpeg", version = "0.4" }
 rff-codec-rawvideo = { path = "crates/rff-codec-rawvideo", version = "0.2.0" }
 # TEMPORARY C/FFI H.264 â€” deliberately NOT in default-members; opt-in only.
 rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.2.0" }

@@ -5,7 +5,6 @@
 
 use rusty_jpeg::decode::Decoder;
 use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
-use std::io::Cursor;
 
 /// A deterministic image with real chroma detail (flat content would hide a
 /// chroma plane that was silently wrong).
@@ -39,7 +38,7 @@ fn plane_geometry_matches_the_declared_subsampling() {
         (SamplingFactor::R_4_2_0, (2, 2)),
     ] {
         let jpeg = encode(64, 48, sampling);
-        let planar = Decoder::new(Cursor::new(&jpeg))
+        let planar = Decoder::new(&jpeg[..])
             .decode_planar()
             .expect("decode_planar");
 
@@ -62,10 +61,8 @@ fn plane_geometry_matches_the_declared_subsampling() {
 /// Mean absolute error between `decode()`'s RGB and RGB rebuilt from the planes
 /// with nearest-neighbour chroma. `swap_chroma` is the control arm.
 fn reconstruction_error(jpeg: &[u8], w: usize, h: usize, swap_chroma: bool) -> f64 {
-    let rgb = Decoder::new(Cursor::new(jpeg)).decode().expect("decode");
-    let planar = Decoder::new(Cursor::new(jpeg))
-        .decode_planar()
-        .expect("decode_planar");
+    let rgb = Decoder::new(jpeg).decode().expect("decode");
+    let planar = Decoder::new(jpeg).decode_planar().expect("decode_planar");
     let (sh, sv) = planar.chroma_subsampling().unwrap();
 
     let yp = &planar.components[0];
@@ -135,7 +132,7 @@ fn grayscale_yields_a_single_plane() {
     Encoder::new(&mut out, 90)
         .encode(&gray, 32, 32, ColorType::Luma)
         .expect("encode");
-    let planar = Decoder::new(Cursor::new(&out))
+    let planar = Decoder::new(&out[..])
         .decode_planar()
         .expect("decode_planar");
     assert_eq!(planar.components.len(), 1);
@@ -145,9 +142,9 @@ fn grayscale_yields_a_single_plane() {
 #[test]
 fn planar_request_does_not_leak_into_a_later_decode() {
     let jpeg = encode(32, 32, SamplingFactor::R_4_2_0);
-    let mut d = Decoder::new(Cursor::new(&jpeg));
+    let mut d = Decoder::new(&jpeg[..]);
     assert!(d.decode_planar().is_ok());
-    let mut d2 = Decoder::new(Cursor::new(&jpeg));
+    let mut d2 = Decoder::new(&jpeg[..]);
     assert!(!d2.decode().unwrap().is_empty());
 }
 
@@ -161,11 +158,12 @@ fn planar_request_does_not_leak_into_a_later_decode() {
 /// the threaded path burned ~38% more CPU on one pinned core and left
 /// `reclaim_buffer` (implemented only by the immediate worker) dead, so every
 /// MCU row reallocated instead of recycling.
+#[cfg(feature = "std")]
 #[test]
 fn single_threaded_flag_selects_the_immediate_worker_on_baseline() {
     let jpeg = encode(64, 64, SamplingFactor::R_4_2_0);
 
-    let mut d = Decoder::new(Cursor::new(&jpeg));
+    let mut d = Decoder::new(&jpeg[..]);
     d.set_single_threaded(true);
     let st = d.decode().expect("decode st");
     assert!(
@@ -173,7 +171,7 @@ fn single_threaded_flag_selects_the_immediate_worker_on_baseline() {
         "set_single_threaded(true) did not select the immediate worker"
     );
 
-    let mut d = Decoder::new(Cursor::new(&jpeg));
+    let mut d = Decoder::new(&jpeg[..]);
     d.set_single_threaded(false);
     let mt = d.decode().expect("decode mt");
 
