@@ -5686,10 +5686,8 @@ dependencies = [
 [[package]]
 name = "rusty_jpeg"
 version = "0.4.0"
-dependencies = [
- "rayon",
- "rusty_alloc-api",
-]
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c0867b42b4af7cfcce3466505720f64edfa6ef1782cdca2f712cf5ca711807d"
 
 [[package]]
 name = "rusty_mp3"
