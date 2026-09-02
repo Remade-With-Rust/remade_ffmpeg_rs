@@ -1,8 +1,9 @@
-//! `rff-io` — byte sources for demuxers: local files and HTTP(S) streaming input.
+//! `rff-io` — byte sources for demuxers: local files, HTTP(S), UDP and RTP input.
 //!
 //! FFmpeg reads inputs through `libavformat`'s URL protocols (`file:`, `http:`,
 //! `https:`, ...). This crate is the equivalent seam: [`open`] turns a
 //! path-or-URL into a boxed `Read`, picking the local file or a network stream.
+//! `rtp://` is the one protocol that also decides its format: see [`rtp`].
 //!
 //! The HTTP client is a minimal HTTP/1.1 `GET` over [`std::net::TcpStream`] — no
 //! async runtime. Plain `http://` (redirects + chunked transfer-encoding) is
@@ -23,9 +24,11 @@ use std::time::Duration;
 use rff_core::{Error, Result};
 
 mod rtmp;
+pub mod rtp;
 mod udp;
 
 pub use rtmp::RtmpPublisher;
+pub use rtp::RtpReader;
 pub use udp::{UdpReader, UdpWriter};
 
 /// Maximum number of HTTP redirects to follow before giving up.
@@ -62,10 +65,15 @@ pub fn is_rtmp(path: &str) -> bool {
     path.starts_with("rtmp://")
 }
 
+/// Is `path` an `rtp://` receive address?
+pub fn is_rtp(path: &str) -> bool {
+    path.starts_with("rtp://")
+}
+
 /// Anything [`open`] reads as a stream rather than a seekable local file —
 /// callers that sniff content must peek-and-chain instead of re-opening.
 pub fn is_stream(path: &str) -> bool {
-    is_url(path) || is_pipe(path) || is_udp(path)
+    is_url(path) || is_pipe(path) || is_udp(path) || is_rtp(path)
 }
 
 /// Open a path-or-URL as a streaming byte source.
@@ -75,12 +83,17 @@ pub fn is_stream(path: &str) -> bool {
 /// * `-` / `pipe:` / `pipe:0` → standard input.
 /// * `udp://[@]host:port` → bound UDP socket (MPEG-TS over UDP; an idle
 ///   timeout ends the stream).
+/// * `rtp://[@]host:port` → bound UDP socket receiving RTP (H.264 or JPEG),
+///   served as the `rtp` format's frame records — open the demuxer named by
+///   [`RtpReader::format_name`] rather than sniffing.
 /// * anything else → a local file.
 pub fn open(path: &str) -> Result<Box<dyn Read + Send>> {
     if is_pipe(path) {
         Ok(Box::new(std::io::stdin()))
     } else if is_udp(path) {
         Ok(Box::new(UdpReader::bind(path)?))
+    } else if is_rtp(path) {
+        Ok(Box::new(RtpReader::bind(path)?))
     } else if is_url(path) {
         fetch(path, MAX_REDIRECTS)
     } else {

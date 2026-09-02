@@ -68,7 +68,7 @@ licensed (CI-enforced by `cargo-deny`).
 
 Demux **and** mux: `avi`, `mp4`/`mov`/`m4a`, **`matroska` (mkv/mka)**,
 **`webm`** (restricted doctype, codec-checked), `mpegts`, `flv`, `ogg`, `wav`,
-`flac`, `mp3`, `y4m`, `ivf`, `avif`, `png`, `jpeg`, `gif`, `webp`, `jxl`,
+`flac`, `mp3`, `y4m`, `ivf`, `avif`, `png`, `jpeg`, `mjpeg`, `mpjpeg`, `rtp`, `gif`, `webp`, `jxl`,
 `srt` (SubRip), `webvtt`, **HLS** (`.m3u8` + TS segments: mux via the
 registry's path-muxer, demux by expanding the playlist — local or HTTP(S),
 master or media — into one TS stream).
@@ -137,6 +137,8 @@ transcode, keyframe-cut on `-c copy`, sample-accurate for audio), `-r`, `-s`,
 | HTTPS input | ✅ **on by default** (rustls + RustCrypto provider, pure Rust; `--no-default-features` for a TLS-free build) |
 | Pipes | ✅ `-` / `pipe:` stdin and stdout, both directions |
 | UDP | ✅ `udp://` input (idle-timeout → EOF) and output (1316-byte TS datagrams) |
+| RTP | ✅ `rtp://` input: RFC 6184 H.264 and RFC 2435 JPEG depayloaders (single NAL / STAP-A / FU-A; in-band or `Q` quantisation tables, Annex K Huffman regenerated), frames timed on the 90 kHz RTP clock, loss reported per frame. `?pt=` pins the payload type, `?timeout=` the idle EOF. |
+| MJPEG over HTTP | ✅ `http://device/stream` (`multipart/x-mixed-replace`) demuxes as `mpjpeg`: `Content-Length` and `X-Timestamp` honoured, the JPEG marker grammar delimits parts without a length |
 | RTMP publish | ✅ `rtmp://host/app/key` output (FLV over the chunk protocol: handshake, AMF0 connect/createStream/publish) |
 | HLS output | ✅ TS segmenter + VOD playlist, `-hls_time` |
 | HLS input | ✅ `.m3u8` (master or media), local or HTTP(S) |

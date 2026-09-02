@@ -1,0 +1,25 @@
+[package]
+name = "rff-format-rtp"
+description = "Remade FFmpeg (Rust): timed H.264 / JPEG frames as received over rtp:// (RFC 6184, RFC 2435)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["rtp", "h264", "mjpeg", "streaming", "demuxer"]
+categories = ["multimedia", "multimedia::video", "network-programming"]
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true
+rff-format-mjpeg.workspace = true
+# The record framing (`rff_io::rtp::write_frame`) and the reader that emits it.
+rff-io.workspace = true
+
+[dev-dependencies]
+# The house codecs make the fixtures: a real SPS and a real baseline JPEG.
+rusty_jpeg.workspace = true
+rusty_h264 = { version = "0.12", default-features = false }

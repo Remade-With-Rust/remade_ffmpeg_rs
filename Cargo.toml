@@ -51,6 +51,8 @@ default-members = [
     "crates/rff-format-ts",
     "crates/rff-format-flv",
     "crates/rff-format-hls",
+    "crates/rff-format-mjpeg",
+    "crates/rff-format-rtp",
     "crates/rff-io",
     "crates/rff-subtitle",
     "crates/rff-format-srt",
@@ -126,6 +128,8 @@ rff-format-mkv = { path = "crates/rff-format-mkv", version = "0.2.0" }
 rff-format-ts = { path = "crates/rff-format-ts", version = "0.2.0" }
 rff-format-flv = { path = "crates/rff-format-flv", version = "0.2.0" }
 rff-format-hls = { path = "crates/rff-format-hls", version = "0.2.0" }
+rff-format-mjpeg = { path = "crates/rff-format-mjpeg", version = "0.2.0" }
+rff-format-rtp = { path = "crates/rff-format-rtp", version = "0.2.0" }
 rff-io = { path = "crates/rff-io", version = "0.2.0" }
 rff-subtitle = { path = "crates/rff-subtitle", version = "0.2.0" }
 rff-format-srt = { path = "crates/rff-format-srt", version = "0.2.0" }

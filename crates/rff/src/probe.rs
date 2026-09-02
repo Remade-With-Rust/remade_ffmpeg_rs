@@ -130,6 +130,15 @@ pub(crate) fn open_source(
         let format = detect_input_format(engine, Path::new(path), forced)?;
         return Ok((format, Box::new(std::fs::File::open(path)?)));
     }
+    // RTP has no container to sniff: the reader classifies the stream by its
+    // payload type on the first packet and names the format itself.
+    if rff_io::is_rtp(path) {
+        let reader = rff_io::RtpReader::bind(path)?;
+        let format = forced
+            .map(str::to_string)
+            .unwrap_or_else(|| reader.format_name().to_string());
+        return Ok((format, Box::new(reader)));
+    }
     let reader = rff_io::open(path)?;
     sniff_stream(engine, reader, forced, path)
 }
