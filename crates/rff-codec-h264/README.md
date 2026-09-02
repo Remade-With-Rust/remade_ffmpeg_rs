@@ -5,11 +5,12 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/LICENSE)
 
 The **H.264 / AVC** video codec adapter for **remade_ffmpeg_rs**, backed by
-[`rusty_h264`](https://crates.io/crates/rusty_h264) — pure Rust with vendored
-hand-written assembly, no C. Registers `h264` for both decode and encode.
+[`rusty_h264`](https://crates.io/crates/rusty_h264) — pure Rust end to end.
+Registers `h264` for both decode and encode.
 
-- **Pure Rust, no C/FFI** — the SIMD is vendored assembly assembled by `nasm`, not a C library.
-- **Default build needs `nasm`** on your `PATH` for the `h264-asm` feature. Use `--no-default-features` for the pure-Rust scalar path instead.
+- **Pure Rust, no C/FFI, no assembler** — `rusty_h264` 0.12's SIMD is portable Rust (SSE2/AVX2/NEON), on with the `asm` feature (`h264-asm` on the facade); `--no-default-features` is the scalar path.
+- **`-preset fast|medium|slow`** and **`-profile baseline|main|high`**. `-profile baseline` is Constrained Baseline with CAVLC, one reference, no B-frames, no lookahead and no scene cut — the configuration a `rusty_esp_video` device runs — so `rff -i in.y4m -c:v h264 -profile baseline -preset fast -g 30 -b:v 500k -qp 28 out.264` is the host oracle for a chip's stream. `-g`, `-b:v` and `-qp` map straight onto the encoder.
+- The default configuration runs `rusty_h264`'s lookahead (mb-tree over a GOP); the adapter turns its batched output into one packet per frame with the right `pts`. Baseline is unbuffered.
 - **Patent note:** H.264/AVC is patent-relevant. No patent licence is granted or implied; royalties are the responsibility of whoever distributes or commercially deploys a product incorporating it. See the [patents section](https://github.com/Remade-With-Rust/remade_ffmpeg_rs#patents).
 - A C/FFI alternative (Cisco openh264) exists in-tree as `rff-codec-openh264` but is **deliberately unpublished** and off by default — this crate is the pure-Rust path.
 

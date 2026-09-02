@@ -304,7 +304,8 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
 
             // Rate control / tuning (video by default; `:a` targets audio):
             // -crf / -qp / -q / -qscale (quality), -preset (speed<->quality), -pass (1|2),
-            // -cpu-used / -speed (VP9 speed preset 0 best..4 fastest).
+            // -cpu-used / -speed (VP9 speed preset 0 best..4 fastest),
+            // -profile (h264: baseline|main|high), -g (keyframe interval).
             // `-frames:v N` / `-frames N` — stop after N video frames. Needed for
             // any rate-vs-quality measurement over a clip prefix: without it a
             // harness silently encodes the whole input while scoring a prefix.
@@ -322,10 +323,11 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             // `-pred` is PNG's filter/prediction knob (none/sub/up/avg/paeth/
             // mixed), spelled as FFmpeg's PNG encoder spells it. It is video-only
             // by nature — there is no audio codec that takes it.
-            "crf" | "qp" | "preset" | "pass" | "q" | "qscale" | "cpu-used" | "speed" | "lag"
-            | "lag-in-frames" | "arnr-strength" | "dispatch-budget" | "jpeg_quality"
-            | "sampling" | "jpeg_sampling" | "progressive" | "optimize_huffman"
-            | "restart_interval" | "trellis" | "pred" | "png_auto_type" | "png_auto_config" => {
+            "crf" | "qp" | "preset" | "profile" | "g" | "pass" | "q" | "qscale" | "cpu-used"
+            | "speed" | "lag" | "lag-in-frames" | "arnr-strength" | "dispatch-budget"
+            | "jpeg_quality" | "sampling" | "jpeg_sampling" | "progressive"
+            | "optimize_huffman" | "restart_interval" | "trellis" | "pred" | "png_auto_type"
+            | "png_auto_config" => {
                 let value = take_value(args, &mut i, arg)?;
                 if base == "pass" && value != "1" {
                     warnings
