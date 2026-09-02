@@ -56,6 +56,17 @@ Two things the PR changed that downstreams must know: `default` now
 includes `std`, so the scalar arm is `--no-default-features --features std`;
 and `signal_probes_golden` is pinned only against the platform libm.
 
+What CI added to that pass (2026-09-02, three follow-up commits on the same
+PR): every std-only consumer of a workspace dependency declared with
+`default-features = false` must ask for `std` itself — the CLI's `common`
+dependency, the CLI's facade dependency and the decoder's dev-dependency on
+the encoder all built the `no_std` arm by inheritance and hit the
+`compile_error!` guard; and `mb16::SeqFastPath`, a process-global
+`AtomicBool` that `encode_all` set for its duration, is now a thread-local
+under `std` (each GOP worker sets its own) because one test's flag was
+visible to another's streaming encode. On the chip the static stays; the
+memory model below lists it.
+
 ### Upgrade 1 — borrowed-frame input
 
 **What:** an input type that borrows the caller's planes,
@@ -153,6 +164,31 @@ checks, and for a device that displays a peer's stream.
   depayloaders; Janus's `rusty_esp_video::rtp` already writes both, and
   `udp://` MPEG-TS is the only path `rff` can read from a device today.
 
+### Upgrade 8 — `libm` means every float, not just `sqrt`
+
+**Today.** `rusty_h264_common::fmath::{F64Ext, F32Ext}` exist so the
+encoder's `x.sqrt()` / `powf` / `log2` / `exp2` / `floor` / `round` compile
+without `std`. Without `std` every method goes to the `libm` crate. **With
+`std` and `libm` both on, only `sqrt` is routed to `libm`**; the rest of the
+`cfg(feature = "std")` impl forwards to the inherent methods, which are the
+platform's libm, and at the call sites the inherent method wins resolution
+anyway. So the promise the feature makes — a host and a chip make the same
+float-derived decisions bit for bit — holds for `sqrt` alone. The QVGA
+oracle in Janus was byte-identical between the two builds on one host, which
+is consistent with either reading and proves nothing across machines.
+
+**Needed.** Under `libm`, every `F64Ext`/`F32Ext` method forwards to
+`libm`, and the call sites reach the trait rather than the inherent method
+(qualified calls `F64Ext::log2(x)` where it matters, or a `fmath::f64` shim
+module the encoder imports). Gate: the encoder's float-decision probes
+(`signals`, `lookahead::scenecut`, the QP curves) hashed on x86_64 Linux,
+x86_64 Windows and `riscv32imac` with `libm`, three equal hashes; today the
+first two need not agree with the third.
+
+**Effect on the chip.** The S3 FPS row in Janus is measured against a host
+oracle; without this, a decision that differs by one ULP on the host is a
+different bitstream and the oracle cannot say whether the chip is wrong.
+
 ## rusty_jpeg
 
 ### State today
@@ -234,6 +270,7 @@ holding the full-size picture.
 | 10 | `rtp://` input | rff | days | Janus RTP readable without TS |
 | 11 | MJPEG-over-HTTP demuxer | rff | day | `rff -i http://device/stream` |
 | 12 | decoder `no_std` | rusty_h264 | days | later; the P4 and peer display |
+| 13 | `libm` on every float method under `std` | rusty_h264 | day | the host oracle for the S3 row is trustworthy across machines |
 
 Items 1–5 are one PR each on `rusty_h264` after #7 merges, in that order;
 6–8 are one `no-std` branch on `rusty_jpeg` in the shape #7 took (format-only
