@@ -247,19 +247,14 @@ struct Settings {
 }
 
 impl Settings {
-    /// The chip configuration for Constrained Baseline: what
-    /// `rusty_esp_video::h264::chip_config` sets, field for field, so the host
-    /// and the device agree. (`rusty_h264` will grow an `EncoderConfig::baseline`
-    /// constructor for exactly this; switch to it when it lands.)
+    /// The chip configuration for Constrained Baseline:
+    /// [`EncoderConfig::baseline`], the one constructor the host and the
+    /// device (`rusty_esp_video::h264::chip_config`) share, so an rff encode
+    /// with `-profile baseline -preset fast` is the byte-for-byte oracle for
+    /// a device stream. The geometry is kept; `-preset`, `-g`, `-b:v` and
+    /// `-qp` are applied on top afterwards.
     fn baseline(cfg: &mut EncoderConfig) {
-        cfg.profile = Profile::ConstrainedBaseline;
-        cfg.chroma = rusty_h264::ChromaFormat::Yuv420;
-        cfg.cabac = false;
-        cfg.transform_8x8 = false;
-        cfg.bframes = 0;
-        cfg.num_ref_frames = 1;
-        cfg.lookahead = 0;
-        cfg.scenecut = 0;
+        *cfg = EncoderConfig::baseline(cfg.width, cfg.height);
     }
 
     fn apply(&self, cfg: &mut EncoderConfig) {
@@ -605,6 +600,83 @@ mod tests {
             (cfg.bitrate, cfg.qp, cfg.preset),
             (500_000, 28, Preset::Fast)
         );
+    }
+
+    /// A frame with enough texture that every macroblock codes something.
+    fn textured_frame(w: u32, h: u32, t: i64) -> Frame {
+        let (wi, hi) = (w as usize, h as usize);
+        let mut y = vec![0u8; wi * hi];
+        for r in 0..hi {
+            for c in 0..wi {
+                y[r * wi + c] = ((c * 3 + r * 5 + (t as usize) * 11) ^ (r & 7) * 9) as u8;
+            }
+        }
+        let (cw, ch) = (wi / 2, hi / 2);
+        let u: Vec<u8> = (0..cw * ch)
+            .map(|i| (96 + (i * 7 + t as usize * 3) % 64) as u8)
+            .collect();
+        let v: Vec<u8> = (0..cw * ch)
+            .map(|i| (160 - (i * 5 + t as usize * 2) % 48) as u8)
+            .collect();
+        Frame::Video(VideoFrame {
+            width: w,
+            height: h,
+            format: PixelFormat::Yuv420p,
+            planes: vec![y, u, v],
+            strides: vec![wi, cw, cw],
+            pts: Some(t),
+        })
+    }
+
+    /// `-profile baseline -preset fast`: an rff encode is the chip
+    /// configuration byte for byte — the same bytes `rusty_h264` produces
+    /// from `EncoderConfig::baseline` directly. This is the host oracle a
+    /// device stream is compared against.
+    #[test]
+    fn baseline_encode_is_byte_identical_to_encoder_config_baseline() {
+        let (w, h) = (64u32, 48u32);
+        let frames: Vec<Frame> = (0..6).map(|t| textured_frame(w, h, t)).collect();
+
+        let mut opts = Dictionary::new();
+        opts.set("profile", "baseline");
+        opts.set("preset", "fast");
+        opts.set("g", "4");
+        opts.set("qp", "26");
+        let mut enc = H264Encoder::new();
+        enc.configure(&opts).unwrap();
+        let mut via_rff = Vec::new();
+        for f in &frames {
+            enc.send_frame(f).unwrap();
+            for p in drain(&mut enc) {
+                via_rff.extend_from_slice(&p.data);
+            }
+        }
+        enc.flush();
+        for p in drain(&mut enc) {
+            via_rff.extend_from_slice(&p.data);
+        }
+
+        let mut cfg = EncoderConfig::baseline(w as usize, h as usize);
+        cfg.gop_size = 4;
+        cfg.min_keyint = 4;
+        cfg.qp = 26;
+        let mut direct = RustyEncoder::new(cfg).unwrap();
+        let mut via_lib = Vec::new();
+        for f in &frames {
+            let Frame::Video(vf) = f else { unreachable!() };
+            let yuv = YuvFrame {
+                width: w as usize,
+                height: h as usize,
+                y: vf.planes[0].clone(),
+                u: vf.planes[1].clone(),
+                v: vf.planes[2].clone(),
+            };
+            via_lib.extend_from_slice(&direct.encode_planes(&yuv.as_planes()).unwrap());
+        }
+        via_lib.extend_from_slice(&direct.flush());
+
+        assert!(via_rff.len() > 6 * 8, "the stream has bytes");
+        assert_eq!(via_rff, via_lib, "rff baseline != EncoderConfig::baseline");
     }
 
     #[test]

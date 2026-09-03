@@ -25,11 +25,10 @@ rff-codec.workspace = true
 # process-wide) and takes the portable scalar kernels; this crate's `asm`
 # feature re-enables rusty_h264's portable Rust SIMD (no assembler, no C).
 #
-# 0.12 is the last crates.io release before rusty_h264's `no_std` pass; that
-# release adds a `std` feature that this row must then ask for explicitly
-# (`features = ["std"]`), because a workspace-style `default-features = false`
-# consumer otherwise builds the `no_std` arm and hits its `compile_error!`.
-rusty_h264 = { version = "0.12", default-features = false }
+# `std` is asked for explicitly: since 0.13 the crate is `no_std` + `alloc`
+# without it, and a `default-features = false` consumer would otherwise build
+# the chip arm and hit its `compile_error!`.
+rusty_h264 = { version = "0.13", default-features = false, features = ["std"] }
 
 [features]
 # Build the H.264 codec with rusty_h264's portable Rust SIMD kernels
