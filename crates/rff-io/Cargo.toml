@@ -1,6 +1,6 @@
 [package]
 name = "rff-io"
-description = "Remade FFmpeg (Rust): I/O sources — local files and HTTP(S) streaming input."
+description = "Remade FFmpeg (Rust): I/O sources — local files, HTTP(S), UDP and RTP (RFC 6184 H.264, RFC 2435 JPEG) input."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ rust-version.workspace = true
 authors.workspace = true
 homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 readme = "README.md"
-keywords = ["ffmpeg", "io", "http", "streaming", "multimedia"]
+keywords = ["ffmpeg", "io", "http", "rtp", "streaming"]
 categories = ["multimedia"]
 
 [dependencies]
@@ -18,6 +18,10 @@ rff-core.workspace = true
 rustls = { workspace = true, optional = true }
 rustls-rustcrypto = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Real baseline JPEGs for the RFC 2435 receiver's oracle test.
+rusty_jpeg.workspace = true
 
 [features]
 # `https://` input via rustls + a RustCrypto crypto provider + the OS trust

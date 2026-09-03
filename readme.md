@@ -129,7 +129,7 @@ safer.
 | AV1 encode (avif) | [`rusty_av1e`](https://github.com/Remade-With-Rust/rusty-av1-toolkit) | BSD-2-Clause | ✅ (our rav1e fork; pure-Rust, no asm) |
 | AV1 decode (avif) | [`rusty_av1d`](https://github.com/Remade-With-Rust/rusty-av1-toolkit) | BSD-2-Clause | ✅ (our rav1d fork; Rust port of dav1d) |
 | **AV2 decode** | **in-house** ([`rusty_av2d`](https://crates.io/crates/rusty_av2d)) | BSD-2-Clause | ✅ (byte-identical vs AVM across a 45-clip corpus; standalone crate) |
-| H.264 decode/encode | [`rusty_h264`](https://crates.io/crates/rusty_h264) | BSD-2-Clause | ✅ (vendored asm, no C; default needs `nasm`) |
+| H.264 decode/encode | [`rusty_h264`](https://crates.io/crates/rusty_h264) | BSD-2-Clause | ✅ (portable Rust SIMD, no C, no assembler) |
 | VP9 decode/encode | **in-house** ([`rusty_vp9`](https://crates.io/crates/rusty_vp9)) | Apache-2.0 | ✅ (bit-exact vs all 315 libvpx vectors; standalone crate) |
 | AAC decode/encode | **in-house** ([`rusty_aac`](https://crates.io/crates/rusty_aac)) | Apache-2.0 | ✅ (AAC-LC; frame-parallel encoder; standalone crate) |
 | MP3 decode/encode | **in-house** ([`rusty_mp3`](https://crates.io/crates/rusty_mp3)) | Apache-2.0 | ✅ (decoder bit-exact vs FFmpeg; standalone crate) |
@@ -175,8 +175,7 @@ safer.
 ## Install
 
 ```sh
-# Needs `nasm` for the default H.264 SIMD path (see Building from source for the
-# no-nasm alternative). Add `--features https` for https:// input.
+# Pure Rust, no build prerequisites. Add `--features https` for https:// input.
 cargo install rff-cli
 ```
 
@@ -265,25 +264,21 @@ dependency-free core (`rff-core`), codec/format abstraction layers
 
 ## Building from source
 
-> **⚠ Build prerequisite — `nasm`.** The **default** build enables `h264-asm`
-> (rusty_h264's hand-written SIMD kernels), which assembles with
-> [`nasm`](https://nasm.us). **Without `nasm` on your `PATH`, `cargo build`
-> fails.** Either install it first — `winget install NASM` (Windows) /
-> `brew install nasm` (macOS) / `apt install nasm` (Debian/Ubuntu) — **or** skip
-> the assembly entirely with `--no-default-features` for the pure-Rust scalar
-> H.264 path (no `nasm` needed).
+> The default build enables `h264-asm`: rusty_h264's SIMD kernels, which since
+> rusty_h264 0.10 are **portable Rust** (SSE2/AVX2 on x86-64, NEON on
+> aarch64) — no assembler, no C, nothing to install. `--no-default-features`
+> is the pure scalar H.264 path.
 
 ```sh
 git clone https://github.com/Remade-With-Rust/remade_ffmpeg_rs
 cd remade_ffmpeg_rs
-cargo build                          # default: needs nasm (h264-asm)
-cargo build --no-default-features    # pure-Rust scalar H.264 — no nasm
+cargo build                          # default: h264-asm (portable Rust SIMD)
+cargo build --no-default-features    # scalar H.264
 cargo build --features https         # add rustls TLS for https:// input
 cargo run -p rff-ui                  # build/run the Dioxus desktop UI on demand
 ```
 
-**Requirements:** Rust 1.85+ (stable), plus **`nasm`** for the default
-(`h264-asm`) build — see the callout above. The Dioxus UI additionally needs a
+**Requirements:** Rust 1.85+ (stable). The Dioxus UI additionally needs a
 system webview (WebView2 on Windows, WebKitGTK on Linux) and, for web/mobile
 targets, the `dx` CLI (`cargo install dioxus-cli`).
 

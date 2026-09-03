@@ -1,0 +1,21 @@
+[package]
+name = "rff-format-mjpeg"
+description = "Remade FFmpeg (Rust): Motion JPEG containers — raw concatenated JPEG streams (mjpeg) and MJPEG over HTTP, multipart/x-mixed-replace (mpjpeg)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["mjpeg", "mpjpeg", "multipart", "camera", "demuxer"]
+categories = ["multimedia", "multimedia::video", "parser-implementations"]
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true
+
+[dev-dependencies]
+# Real JPEG frames for the fixtures.
+rusty_jpeg.workspace = true

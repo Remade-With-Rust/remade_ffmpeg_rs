@@ -1,5 +1,0 @@
-target
-artifacts
-coverage
-# `corpus/` holds checked-in SEEDS (a progressive file this crate cannot
-# generate itself). Fuzzer-discovered inputs land in artifacts/.

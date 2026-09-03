@@ -4407,6 +4407,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
 name = "potential_utf"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4802,11 +4808,13 @@ dependencies = [
  "rff-format-ivf",
  "rff-format-jpeg",
  "rff-format-jxl",
+ "rff-format-mjpeg",
  "rff-format-mkv",
  "rff-format-mp3",
  "rff-format-mp4",
  "rff-format-ogg",
  "rff-format-png",
+ "rff-format-rtp",
  "rff-format-srt",
  "rff-format-ts",
  "rff-format-wav",
@@ -5180,6 +5188,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rff-format-mjpeg"
+version = "0.2.0"
+dependencies = [
+ "rff-core",
+ "rff-format",
+ "rusty_jpeg",
+]
+
+[[package]]
 name = "rff-format-mkv"
 version = "0.2.0"
 dependencies = [
@@ -5219,6 +5236,18 @@ dependencies = [
  "rff-core",
  "rff-format",
  "rusty_png",
+]
+
+[[package]]
+name = "rff-format-rtp"
+version = "0.2.0"
+dependencies = [
+ "rff-core",
+ "rff-format",
+ "rff-format-mjpeg",
+ "rff-io",
+ "rusty_h264",
+ "rusty_jpeg",
 ]
 
 [[package]]
@@ -5280,6 +5309,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-rustcrypto",
+ "rusty_jpeg",
 ]
 
 [[package]]
@@ -5614,9 +5644,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264"
-version = "0.8.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fbafa4757ced9c5c1d1185aa936bb040b00c456098874f209e04ed1c1c2d73b"
+checksum = "dbb2ab8d07183ba1d866da7406389d1cd1a0bfc4e3aaf233b6898999b22674c6"
 dependencies = [
  "rusty_h264-common",
  "rusty_h264-decoder",
@@ -5625,39 +5655,37 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264-accel"
-version = "0.8.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2094232cdd4a1048894111dd905bb756402d08436fa7e9513c39829fa21239a6"
-dependencies = [
- "cc",
-]
+checksum = "81a5597b3ad059aa698a012bcb81faf8cb2dc95679d11ab3a6e68903df8b2d39"
 
 [[package]]
 name = "rusty_h264-common"
-version = "0.8.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "421e458fcfcb2580232f212f99451f9075a03d00752a934ee27be6148a6765e3"
+checksum = "4ac00c7ea77d77ebdb9e6c546954d058e5c55d3fca07adc7994136628c217919"
 dependencies = [
  "bytemuck",
+ "once_cell",
+ "portable-atomic",
  "rusty_h264-accel",
  "wide",
 ]
 
 [[package]]
 name = "rusty_h264-decoder"
-version = "0.8.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6316ecba57a77d530fff4fab7be9cc3e0e107e381360ac9d2ffa0895b5b0947a"
+checksum = "fa508f74bc21a256f48625a5fa25cd678ec3a4382e0af7b65a7c7a25cb47fd8f"
 dependencies = [
- "rusty_h264-accel",
  "rusty_h264-common",
 ]
 
 [[package]]
 name = "rusty_h264-encoder"
-version = "0.8.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4fb69d8977d1d067d6d603df0614678c4a35ac1201fff38783c8847e429c879"
+checksum = "08396baa00207203cdb68e78b59eff9b10ad3895b505a12338667fdea3205da4"
 dependencies = [
  "rusty_h264-accel",
  "rusty_h264-common",
@@ -5665,11 +5693,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_jpeg"
-version = "0.3.2"
-dependencies = [
- "rayon",
- "rusty_alloc-api",
-]
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c0867b42b4af7cfcce3466505720f64edfa6ef1782cdca2f712cf5ca711807d"
 
 [[package]]
 name = "rusty_mp3"

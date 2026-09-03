@@ -35,7 +35,6 @@ default-members = [
     "crates/rusty_mp3",
     "crates/rusty_aac",
     "crates/rusty_vorbis",
-    "crates/rusty_jpeg",
     "crates/rusty_png",
     "crates/rff-codec-rawvideo",
     "crates/rff-format-wav",
@@ -51,6 +50,8 @@ default-members = [
     "crates/rff-format-ts",
     "crates/rff-format-flv",
     "crates/rff-format-hls",
+    "crates/rff-format-mjpeg",
+    "crates/rff-format-rtp",
     "crates/rff-io",
     "crates/rff-subtitle",
     "crates/rff-format-srt",
@@ -109,7 +110,9 @@ rusty_flac = { path = "crates/rusty_flac", version = "0.1.0" }
 rusty_mp3 = { path = "crates/rusty_mp3", version = "0.7.0" }
 rusty_aac = { path = "crates/rusty_aac", version = "0.5.0" }
 rusty_vorbis = { path = "crates/rusty_vorbis", version = "0.1.1" }
-rusty_jpeg = { path = "crates/rusty_jpeg", version = "0.3" }
+# jpeg: our own rusty_jpeg, from crates.io (the vendored copy is gone: one
+# repository publishes it — github.com/Remade-With-Rust/rusty_jpeg).
+rusty_jpeg = "0.4"
 rff-codec-rawvideo = { path = "crates/rff-codec-rawvideo", version = "0.2.0" }
 # TEMPORARY C/FFI H.264 â€” deliberately NOT in default-members; opt-in only.
 rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.2.0" }
@@ -126,6 +129,8 @@ rff-format-mkv = { path = "crates/rff-format-mkv", version = "0.2.0" }
 rff-format-ts = { path = "crates/rff-format-ts", version = "0.2.0" }
 rff-format-flv = { path = "crates/rff-format-flv", version = "0.2.0" }
 rff-format-hls = { path = "crates/rff-format-hls", version = "0.2.0" }
+rff-format-mjpeg = { path = "crates/rff-format-mjpeg", version = "0.2.0" }
+rff-format-rtp = { path = "crates/rff-format-rtp", version = "0.2.0" }
 rff-io = { path = "crates/rff-io", version = "0.2.0" }
 rff-subtitle = { path = "crates/rff-subtitle", version = "0.2.0" }
 rff-format-srt = { path = "crates/rff-format-srt", version = "0.2.0" }
@@ -153,9 +158,6 @@ rusty_av1d = { version = "1.2.0", default-features = false, features = ["bitdept
 # (MIT/Apache-2.0), carried forward in-tree. DEFLATE via miniz_oxide/fdeflate,
 # with an opt-in pure-Rust `zlib-rs` backend. See crates/rusty_png/NOTICE.md.
 rusty_png = { path = "crates/rusty_png", version = "0.3.2", features = ["parallel"] }
-# jpeg: our own rusty_jpeg â€” a vendored merge of jpeg-decoder 0.3.2 (MIT/Apache)
-# and jpeg-encoder 0.7.0 (MIT/Apache AND IJG), carried forward in-tree. See
-# crates/rusty_jpeg/NOTICE.md for attribution and the IJG obligations.
 # gif: our own rusty_gif — a performance fork of image-rs/image-gif 0.14.2
 # with the NeuQuant quantizer (color_quant 1.1.0) vendored in-tree. Kept under
 # the `gif` dependency name so rff-side imports are unchanged. See
