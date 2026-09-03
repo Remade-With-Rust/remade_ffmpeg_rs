@@ -36,7 +36,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ilammy/setup-nasm@v1
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --exclude rff-ui --locked
+      # `--no-fail-fast`: without it cargo stops at the first test binary that
+      # fails, so ONE broken crate hides every other crate's results. That is
+      # not hypothetical — a `rusty_av2d` overflow panic in `av2f_still` was
+      # masking the whole suite after it, `rff-io` included (issue #14).
+      - run: cargo test --workspace --exclude rff-ui --locked --no-fail-fast
 
   clippy:
     name: clippy (informational)
