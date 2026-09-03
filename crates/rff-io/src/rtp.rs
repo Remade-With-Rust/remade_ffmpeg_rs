@@ -105,9 +105,19 @@ pub struct RtpHeader {
 
 impl RtpHeader {
     /// Parse a packet; returns the header and the payload (CSRCs, a header
-    /// extension and trailing padding stripped). `None` if it is not RTP v2.
+    /// extension and trailing padding stripped). `None` if it is not RTP v2,
+    /// **RTCP included**: an RTCP packet is also version 2, and its packet
+    /// types 200..=204 (SR, RR, SDES, BYE, APP) read as payload types 72..=76
+    /// with the marker bit set, which is exactly why RFC 3551 reserves that
+    /// range and RFC 5761 §4 uses it to tell the two apart on a shared port.
+    /// A sender puts RTCP on `port + 1`, so a receiver on an odd port next to
+    /// someone else's stream sees their sender reports; without this they were
+    /// taken for a stream of "payload type 72" and the bind failed.
     pub fn parse(packet: &[u8]) -> Option<(RtpHeader, &[u8])> {
         if packet.len() < HEADER_LEN || packet[0] >> 6 != 2 {
+            return None;
+        }
+        if matches!(packet[1] & 0x7F, 72..=76) {
             return None;
         }
         let padding = packet[0] & 0x20 != 0;
@@ -853,6 +863,27 @@ mod tests {
         assert_eq!(got, &[0x65, 1, 2, 3]);
 
         assert!(RtpHeader::parse(&[0x40; 12]).is_none(), "RTP v1 is refused");
+        // An RTCP sender report: version 2, packet type 200. A sender aims RTCP
+        // at `port + 1`, so a receiver one port along from another stream gets
+        // these; they must read as "not RTP", not as payload type 72.
+        let mut sr = [0u8; 28];
+        sr[0] = 0x80;
+        sr[1] = 200;
+        sr[2..4].copy_from_slice(&6u16.to_be_bytes());
+        assert!(RtpHeader::parse(&sr).is_none(), "RTCP SR is not RTP");
+        for pt in [201u8, 202, 203, 204] {
+            let mut p = [0u8; 28];
+            p[0] = 0x80;
+            p[1] = pt;
+            assert!(RtpHeader::parse(&p).is_none(), "RTCP {pt} is not RTP");
+        }
+        // The boundaries of the reserved range stay RTP.
+        for pt in [71u8, 77] {
+            let mut p = [0u8; 16];
+            p[0] = 0x80;
+            p[1] = pt;
+            assert!(RtpHeader::parse(&p).is_some(), "PT {pt} is RTP");
+        }
         assert!(RtpHeader::parse(&[0x80; 5]).is_none(), "short");
     }
 

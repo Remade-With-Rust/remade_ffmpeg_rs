@@ -134,11 +134,31 @@ pub(crate) fn udp_addr(path: &str) -> Result<&str> {
     Ok(rest)
 }
 
-/// Bind a UDP socket for receiving on `addr` (used by [`UdpReader`]).
+/// Bind a UDP socket for receiving on `addr` (used by [`UdpReader`] and by
+/// `rtp::RtpReader`).
+///
+/// An **empty host** — what `udp://@:1234` and `rtp://@:5004` are once the
+/// listen-marker `@` is stripped — means *every interface*, and this function
+/// spells that `0.0.0.0` rather than leaving it to the resolver, because no
+/// resolver reads an empty host that way (issue #12, measured 2026-09-03):
+///
+/// * Windows: `getaddrinfo("")` returns the machine's **own interface
+///   addresses**, so `UdpSocket::bind(":5004")` binds whichever sorts first (a
+///   LAN address here) and silently receives nothing sent to any other
+///   interface — loopback included. Not an IPv6 question: nothing binds `[::]`.
+/// * Linux: an empty host does not resolve at all and the bind fails outright.
 pub(crate) fn udp_bind(addr: &str) -> Result<UdpSocket> {
     // For receive, the given host:port IS the local address to listen on.
-    let socket = UdpSocket::bind(addr)
-        .map_err(|e| Error::invalid(format!("udp bind {addr}: {e}")))?;
+    // Only a leading `:` followed by digits is the empty-host spelling; an
+    // unbracketed IPv6 literal also starts with `:` and must be left alone.
+    let bind_to = match addr.strip_prefix(':') {
+        Some(port) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("0.0.0.0:{port}")
+        }
+        _ => addr.to_string(),
+    };
+    let socket = UdpSocket::bind(&bind_to)
+        .map_err(|e| Error::invalid(format!("udp bind {bind_to}: {e}")))?;
     Ok(socket)
 }
 
@@ -437,6 +457,43 @@ impl<R: BufRead> Read for ChunkedReader<R> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// The documented "any interface" spelling (`udp://@:1234`, `rtp://@:5004`)
+    /// must bind the unspecified address and hear a datagram sent to loopback.
+    /// Handing the empty host to the resolver does not do that on any platform:
+    /// Windows binds one of the machine's own interfaces (and then misses
+    /// everything addressed elsewhere), Linux fails to resolve it. Issue #12.
+    #[test]
+    fn an_empty_host_binds_every_interface() {
+        let socket = udp_bind(":0").expect("the empty host binds");
+        let local = socket.local_addr().unwrap();
+        assert!(
+            local.ip().is_unspecified(),
+            "bound {local}, which is one interface, not all of them"
+        );
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.send_to(b"rff", ("127.0.0.1", local.port())).unwrap();
+        let mut buf = [0u8; 8];
+        let (n, _) = socket
+            .recv_from(&mut buf)
+            .expect("a loopback datagram reaches a wildcard bind");
+        assert_eq!(&buf[..n], b"rff");
+    }
+
+    /// The empty-host rewrite must not touch a real address, an unbracketed
+    /// IPv6 literal included (it starts with `:` too).
+    #[test]
+    fn a_spelled_out_host_is_bound_as_given() {
+        let socket = udp_bind("127.0.0.1:0").unwrap();
+        assert_eq!(socket.local_addr().unwrap().ip().to_string(), "127.0.0.1");
+        // `::1:0` splits at the LAST colon, so the host is the IPv6 literal
+        // `::1`: it starts with a colon and must survive the rewrite intact.
+        let socket = udp_bind("::1:0").unwrap();
+        assert_eq!(socket.local_addr().unwrap().ip().to_string(), "::1");
+    }
 
     #[test]
     fn is_url_distinguishes_schemes() {
