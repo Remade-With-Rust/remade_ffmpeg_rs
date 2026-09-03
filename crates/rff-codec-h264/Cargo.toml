@@ -28,7 +28,7 @@ rff-codec.workspace = true
 # `std` is asked for explicitly: since 0.13 the crate is `no_std` + `alloc`
 # without it, and a `default-features = false` consumer would otherwise build
 # the chip arm and hit its `compile_error!`.
-rusty_h264 = { version = "0.13", default-features = false, features = ["std"] }
+rusty_h264 = { version = "0.14", default-features = false, features = ["std"] }
 
 [features]
 # Build the H.264 codec with rusty_h264's portable Rust SIMD kernels

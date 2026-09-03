@@ -5644,9 +5644,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98b89364f2706b2dbbab51b6406c9a99aff44d21f48b34121e586cefa1b495c2"
+checksum = "dbb2ab8d07183ba1d866da7406389d1cd1a0bfc4e3aaf233b6898999b22674c6"
 dependencies = [
  "rusty_h264-common",
  "rusty_h264-decoder",
@@ -5655,15 +5655,15 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264-accel"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8b2d0dad9027aa78ca4d514be29295a08f1dc0435c38ccf9767a3a93d274736"
+checksum = "81a5597b3ad059aa698a012bcb81faf8cb2dc95679d11ab3a6e68903df8b2d39"
 
 [[package]]
 name = "rusty_h264-common"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21b7c945ad1c3f21424e93745ace51b60ab36c0e6ef221347e04f4978ea3b824"
+checksum = "4ac00c7ea77d77ebdb9e6c546954d058e5c55d3fca07adc7994136628c217919"
 dependencies = [
  "bytemuck",
  "once_cell",
@@ -5674,18 +5674,18 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264-decoder"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61b65705aea2bd25d0e9bac0942b8c1e7efbb92b4af7981bf135f17a71176668"
+checksum = "fa508f74bc21a256f48625a5fa25cd678ec3a4382e0af7b65a7c7a25cb47fd8f"
 dependencies = [
  "rusty_h264-common",
 ]
 
 [[package]]
 name = "rusty_h264-encoder"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4389a562b5a978ec7d3698193be6218979500993b13942606a59240aef9b1b8e"
+checksum = "08396baa00207203cdb68e78b59eff9b10ad3895b505a12338667fdea3205da4"
 dependencies = [
  "rusty_h264-accel",
  "rusty_h264-common",

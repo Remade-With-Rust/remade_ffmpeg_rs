@@ -22,4 +22,4 @@ rff-io.workspace = true
 [dev-dependencies]
 # The house codecs make the fixtures: a real SPS and a real baseline JPEG.
 rusty_jpeg.workspace = true
-rusty_h264 = { version = "0.13", default-features = false, features = ["std"] }
+rusty_h264 = { version = "0.14", default-features = false, features = ["std"] }
