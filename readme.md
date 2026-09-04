@@ -1,3 +1,9 @@
+### In The Wild with over 55,221 Active Installs Across Codecs
+> [RAG Converter](https://ragconverter.com) uses 4+ remade_ffmpeg_rs codecs in wasm.
+> It makes personal and work files AI-readable without them leaving the machine:
+> the whole conversion runs as WebAssembly in the browser tab, with nothing
+> uploaded and nothing to install.
+
 # remade_ffmpeg_rs
 
 [![Remade With Rust](https://img.shields.io/badge/Remade%20With-Rust-000?logo=rust&logoColor=fff)](https://github.com/remade-with-rust)
