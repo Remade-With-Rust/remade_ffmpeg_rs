@@ -167,7 +167,7 @@ near-term items and their current state:
 | Feature | Status |
 |---------|--------|
 | AV1 *video* encode wiring (multi-frame; the rav1e fork is ready) | **next up** — adapter is still-picture-only today |
-| HEVC/H.265 | **not implemented** (decode or encode) — licensing posture undecided |
+| HEVC/H.265 encode | **not implemented** — decode shipped 2026-09-05 (`rusty_h265`, 147/147 conformance); an encoder is a separate mission |
 | `filter_complex` `concat` and arbitrary graphs | **planned** (only `overlay` today) |
 | Two-pass rate control (execution) | `-pass` is **parsed but runs single-pass** (warns) |
 | HLS live/event playlists, fMP4 (`EXT-X-MAP`) input | **planned** (HLS is VOD + TS today; `-hls_list_size` warns) |

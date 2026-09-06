@@ -27,6 +27,7 @@ rff-filter.workspace = true
 rff-io.workspace = true
 rff-resample.workspace = true
 rff-codec-h264.workspace = true
+rff-codec-hevc.workspace = true
 rff-codec-opus.workspace = true
 rff-codec-avif.workspace = true
 rff-codec-png.workspace = true

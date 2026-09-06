@@ -839,6 +839,16 @@ impl Filter for FormatConv {
             | (PixelFormat::Yuv444p, PixelFormat::Rgb24) => yuv_planar_to_rgb(&src, self.spec),
             (PixelFormat::Yuv422p, PixelFormat::Yuv420p)
             | (PixelFormat::Yuv444p, PixelFormat::Yuv420p) => yuv_planar_to_420(&src),
+            // High-bit-depth Y'CbCr (HEVC Main 10, VP9 profile 2, ...) is
+            // narrowed to 8 bits first, then converted like any 8-bit frame.
+            (from, to) if from.bit_depth() > 8 && to.bit_depth() == 8 => {
+                let narrowed = narrow_to_8(&src)?;
+                if narrowed.format == to {
+                    Ok(narrowed)
+                } else {
+                    self.filter(narrowed)
+                }
+            }
             (from, to) => Err(Error::unsupported(format!(
                 "format: {} → {} not supported",
                 from.name(),
@@ -919,9 +929,9 @@ fn rgb_to_yuv420(src: &VideoFrame, bpp: usize, spec: ColorSpec) -> Result<VideoF
 /// Chroma subsampling `(horizontal, vertical)` of a planar 8-bit Y'CbCr format.
 fn planar_subsampling(format: PixelFormat) -> Option<(usize, usize)> {
     match format {
-        PixelFormat::Yuv444p => Some((1, 1)),
-        PixelFormat::Yuv422p => Some((2, 1)),
-        PixelFormat::Yuv420p => Some((2, 2)),
+        PixelFormat::Yuv444p | PixelFormat::Yuv444p10 | PixelFormat::Yuv444p12 => Some((1, 1)),
+        PixelFormat::Yuv422p | PixelFormat::Yuv422p10 | PixelFormat::Yuv422p12 => Some((2, 1)),
+        PixelFormat::Yuv420p | PixelFormat::Yuv420p10 | PixelFormat::Yuv420p12 => Some((2, 2)),
         _ => None,
     }
 }
@@ -975,12 +985,67 @@ fn yuv_planar_to_rgb(src: &VideoFrame, spec: ColorSpec) -> Result<VideoFrame> {
     })
 }
 
+/// Narrows a planar Y'CbCr frame with 10- or 12-bit samples (little-endian
+/// `u16`) to its 8-bit sibling, rounding rather than truncating.
+fn narrow_to_8(src: &VideoFrame) -> Result<VideoFrame> {
+    let (target, shift) = match src.format {
+        PixelFormat::Yuv420p10 => (PixelFormat::Yuv420p, 2),
+        PixelFormat::Yuv422p10 => (PixelFormat::Yuv422p, 2),
+        PixelFormat::Yuv444p10 => (PixelFormat::Yuv444p, 2),
+        PixelFormat::Yuv420p12 => (PixelFormat::Yuv420p, 4),
+        PixelFormat::Yuv422p12 => (PixelFormat::Yuv422p, 4),
+        PixelFormat::Yuv444p12 => (PixelFormat::Yuv444p, 4),
+        other => {
+            return Err(Error::unsupported(format!(
+                "format: {} cannot be narrowed to 8 bits",
+                other.name()
+            )))
+        }
+    };
+    let (sh, sv) = planar_subsampling(src.format).unwrap_or((1, 1));
+    let (w, h) = (src.width as usize, src.height as usize);
+    let round = 1u32 << (shift - 1);
+    let mut planes = Vec::with_capacity(3);
+    let mut strides = Vec::with_capacity(3);
+    for (i, plane) in src.planes.iter().enumerate().take(3) {
+        let (pw, ph) = if i == 0 { (w, h) } else { (w.div_ceil(sh), h.div_ceil(sv)) };
+        let stride = src.strides.get(i).copied().unwrap_or(pw * 2);
+        let mut out = Vec::with_capacity(pw * ph);
+        for y in 0..ph {
+            let row = plane.get(y * stride..y * stride + pw * 2).ok_or_else(|| {
+                Error::invalid("narrow_to_8: plane shorter than its declared geometry")
+            })?;
+            out.extend(row.chunks_exact(2).map(|c| {
+                let v = u16::from_le_bytes([c[0], c[1]]) as u32;
+                ((v + round) >> shift).min(255) as u8
+            }));
+        }
+        strides.push(pw);
+        planes.push(out);
+    }
+    Ok(VideoFrame {
+        width: src.width,
+        height: src.height,
+        format: target,
+        planes,
+        strides,
+        pts: src.pts,
+    })
+}
+
+
 /// Planar Y'CbCr → planar 4:2:0, **averaging** the chroma it drops.
 ///
 /// Averaging rather than point-sampling matters: dropping 3 of every 4 chroma
 /// samples without a low-pass aliases, and the artefacts land on exactly the
 /// saturated edges people look at.
 fn yuv_planar_to_420(src: &VideoFrame) -> Result<VideoFrame> {
+    if src.format.bit_depth() > 8 {
+        return Err(Error::unsupported(format!(
+            "format: {} must be narrowed to 8 bits first",
+            src.format.name()
+        )));
+    }
     let (sh, sv) = planar_subsampling(src.format).ok_or_else(|| {
         Error::unsupported(format!(
             "format: {} is not planar Y'CbCr",

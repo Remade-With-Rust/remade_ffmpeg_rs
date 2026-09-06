@@ -136,6 +136,7 @@ safer.
 | AV1 decode (avif) | [`rusty_av1d`](https://github.com/Remade-With-Rust/rusty-av1-toolkit) | BSD-2-Clause | ✅ (our rav1d fork; Rust port of dav1d) |
 | **AV2 decode** | **in-house** ([`rusty_av2d`](https://crates.io/crates/rusty_av2d)) | BSD-2-Clause | ✅ (byte-identical vs AVM across a 45-clip corpus; standalone crate) |
 | H.264 decode/encode | [`rusty_h264`](https://crates.io/crates/rusty_h264) | BSD-2-Clause | ✅ (portable Rust SIMD, no C, no assembler) |
+| **HEVC decode** | **in-house** ([`rusty_h265`](https://crates.io/crates/rusty_h265)) | Apache-2.0 | ✅ (147/147 JCT-VC conformance streams bit-exact; `forbid(unsafe_code)`, zero deps; standalone crate) |
 | VP9 decode/encode | **in-house** ([`rusty_vp9`](https://crates.io/crates/rusty_vp9)) | Apache-2.0 | ✅ (bit-exact vs all 315 libvpx vectors; standalone crate) |
 | AAC decode/encode | **in-house** ([`rusty_aac`](https://crates.io/crates/rusty_aac)) | Apache-2.0 | ✅ (AAC-LC; frame-parallel encoder; standalone crate) |
 | MP3 decode/encode | **in-house** ([`rusty_mp3`](https://crates.io/crates/rusty_mp3)) | Apache-2.0 | ✅ (decoder bit-exact vs FFmpeg; standalone crate) |
@@ -175,8 +176,8 @@ safer.
 | Container | **png** / **jpeg** / **gif** / **webp** / **jpegxl** | **demux + mux** |
 | Container | **wav** (RIFF/WAVE) / **ogg** (Opus/Vorbis) / **flac** | **demux + mux** |
 | Container | **avi** (Audio Video Interleaved) | **demux + mux** (RIFF/`hdrl`/`movi`/`idx1`) |
-| Container | **mp4** / **mov** (ISOBMFF) | **demux + mux** — sample tables; **A/V**: AV1 (`av01`/`av1C`) or H.264 (`avc1`/`avcC`) video + Opus audio (`dOps`); **AAC `esds` config (demux + mux)** so `rff -i in.wav out.m4a` writes a playable AAC MP4 |
-| Container | **matroska** / **webm** (EBML) | **demux** — track tree + Cluster/(Simple)Block packets; AV1/H.264 video + Opus/Vorbis/AAC/FLAC audio |
+| Container | **mp4** / **mov** (ISOBMFF) | **demux + mux** — sample tables; **A/V**: AV1 (`av01`/`av1C`), H.264 (`avc1`/`avcC`) or HEVC (`hvc1`/`hev1`/`hvcC`, demux) video + Opus audio (`dOps`); **AAC `esds` config (demux + mux)** so `rff -i in.wav out.m4a` writes a playable AAC MP4 |
+| Container | **matroska** / **webm** (EBML) | **demux** — track tree + Cluster/(Simple)Block packets; AV1/H.264/HEVC video + Opus/Vorbis/AAC/FLAC audio |
 
 ## Install
 

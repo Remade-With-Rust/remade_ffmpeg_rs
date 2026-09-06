@@ -269,14 +269,19 @@ fn parse_track(trak: &[u8], index: usize) -> Option<(Stream, Vec<SampleLoc>, Opt
         }
     }
 
-    // H.264: pull avcC (child of the avc1 entry, which begins 86 bytes in).
-    let avc = if codec_id == CodecId::H264 {
-        child_boxes(stsd.get(8 + 86..)?)
+    // H.264 / HEVC: pull the config record (a child of the visual sample
+    // entry, which begins 86 bytes in) — `avcC` or `hvcC`. Both yield the NAL
+    // length size and the Annex-B parameter sets.
+    let avc = match codec_id {
+        CodecId::H264 => child_boxes(stsd.get(8 + 86..)?)
             .iter()
             .find(|(t, _)| t == b"avcC")
-            .and_then(|(_, p)| parse_avcc(p))
-    } else {
-        None
+            .and_then(|(_, p)| parse_avcc(p)),
+        CodecId::Hevc => child_boxes(stsd.get(8 + 86..)?)
+            .iter()
+            .find(|(t, _)| t == b"hvcC")
+            .and_then(|(_, p)| rff_format::hvc::parse_hvcc(p)),
+        _ => None,
     };
 
     let samples = build_samples(&stbl, index, timescale)?;
@@ -318,6 +323,7 @@ fn parse_esds(esds: &[u8]) -> Option<Vec<u8>> {
 fn map_codec(fourcc: &[u8; 4]) -> CodecId {
     match fourcc {
         b"avc1" | b"avc3" => CodecId::H264,
+        b"hvc1" | b"hev1" => CodecId::Hevc,
         b"av01" => CodecId::Avif, // AV1 video — decoded by our rav1d-backed codec
         b"Opus" => CodecId::Opus,
         b"mp4a" => CodecId::Aac,

@@ -42,3 +42,6 @@ __pycache__/
 video-tests/results/
 video-tests/clips/
 video-tests/*/target/
+
+# HEVC conformance vectors + bench streams (scripts/fetch-hevc-vectors.sh)
+/hevc-vectors/

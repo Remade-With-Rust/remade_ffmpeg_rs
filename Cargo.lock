@@ -4783,6 +4783,7 @@ dependencies = [
  "rff-codec-flac",
  "rff-codec-gif",
  "rff-codec-h264",
+ "rff-codec-hevc",
  "rff-codec-jpeg",
  "rff-codec-jxl",
  "rff-codec-mp3",
@@ -4972,6 +4973,15 @@ dependencies = [
  "rff-codec",
  "rff-core",
  "rusty_h264",
+]
+
+[[package]]
+name = "rff-codec-hevc"
+version = "0.1.0"
+dependencies = [
+ "rff-codec",
+ "rff-core",
+ "rusty_h265",
 ]
 
 [[package]]
@@ -5690,6 +5700,18 @@ dependencies = [
  "rusty_h264-accel",
  "rusty_h264-common",
 ]
+
+[[package]]
+name = "rusty_h265"
+version = "0.1.0"
+dependencies = [
+ "rusty_alloc-api",
+ "rusty_h265-accel",
+]
+
+[[package]]
+name = "rusty_h265-accel"
+version = "0.1.0"
 
 [[package]]
 name = "rusty_jpeg"

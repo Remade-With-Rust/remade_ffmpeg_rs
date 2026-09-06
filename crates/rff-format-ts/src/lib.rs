@@ -53,6 +53,7 @@ fn probe_ts(d: &[u8]) -> i32 {
 fn codec_for(stream_type: u8) -> Option<CodecId> {
     match stream_type {
         0x1B => Some(CodecId::H264),       // AVC video
+        0x24 => Some(CodecId::Hevc),       // HEVC video
         0x0F => Some(CodecId::Aac),        // AAC ADTS audio
         0x03 | 0x04 => Some(CodecId::Mp3), // MPEG-1/2 audio (Layer III)
         _ => None,                         // MPEG-2 video, AC-3, ... not yet
@@ -253,14 +254,20 @@ impl TsDemuxer {
         }
     }
 
-    /// If stream `idx` is an H.264 stream still missing dimensions, scan one
-    /// Annex-B payload for an SPS and fill them in.
+    /// If stream `idx` is an H.264 or HEVC stream still missing dimensions,
+    /// scan one Annex-B payload for an SPS and fill them in. MPEG-TS carries
+    /// no geometry of its own, so this is the only source.
     fn fill_dims(streams: &mut [Stream], idx: usize, data: &[u8]) {
         let Some(s) = streams.get_mut(idx) else { return };
-        if s.codec_id != CodecId::H264 || s.width != 0 {
+        if s.width != 0 {
             return;
         }
-        if let Some((w, h)) = find_sps_annexb(data).and_then(sps_dimensions) {
+        let dims = match s.codec_id {
+            CodecId::H264 => find_sps_annexb(data).and_then(sps_dimensions),
+            CodecId::Hevc => rff_format::hvc::find_nal_annexb(data, 33).and_then(rff_format::hvc::sps_dimensions),
+            _ => return,
+        };
+        if let Some((w, h)) = dims {
             s.width = w;
             s.height = h;
         }
@@ -306,7 +313,7 @@ impl Demuxer for TsDemuxer {
         let need = |streams: &[Stream]| {
             streams
                 .iter()
-                .any(|s| s.codec_id == CodecId::H264 && s.width == 0)
+                .any(|s| matches!(s.codec_id, CodecId::H264 | CodecId::Hevc) && s.width == 0)
         };
         if need(&self.streams) {
             let mut scanned = 0;

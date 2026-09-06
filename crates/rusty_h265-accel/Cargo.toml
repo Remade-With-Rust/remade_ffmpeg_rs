@@ -1,0 +1,27 @@
+[package]
+name = "rusty_h265-accel"
+description = "SIMD kernels for the rusty_h265 HEVC decoder: the one crate allowed `unsafe`, behind a runtime-dispatched seam."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["hevc", "h265", "simd", "video", "codec"]
+categories = ["multimedia::video", "hardware-support"]
+
+[features]
+# The SIMD kernels. Default ON (plan §2.6: kernels are the primary path, the
+# scalar twin is the oracle and the fallback). `--no-default-features` builds a
+# crate with zero `unsafe` compiled in.
+default = ["simd"]
+simd = []
+# Always-on kernel call counters (otherwise `RH265_CENSUS=1` at runtime).
+census = []
+
+[dependencies]
+
+[lib]
+name = "rusty_h265_accel"

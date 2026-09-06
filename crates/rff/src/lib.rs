@@ -53,6 +53,7 @@ impl Default for Engine {
 /// here.
 fn register_builtin_codecs(codecs: &mut CodecRegistry) {
     rff_codec_h264::register(codecs);
+    rff_codec_hevc::register(codecs);
     rff_codec_opus::register(codecs);
     rff_codec_avif::register(codecs);
     rff_codec_png::register(codecs);

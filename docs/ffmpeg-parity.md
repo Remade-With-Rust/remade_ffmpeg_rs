@@ -40,7 +40,7 @@ device support) but defensible.
 |---|---|---|---|
 | 1 | **H.264 / AVC** | video | ✅ **decode + encode** — `rusty_h264`, default with SIMD asm (vendored openh264 BSD-2, needs `nasm`); `--no-default-features` for scalar pure Rust |
 | 2 | **AAC** | audio | ✅ in-house decoder, bit-exact vs FFmpeg (decode-only) |
-| 3 | **H.265 / HEVC** | video | ❌ not yet |
+| 3 | **H.265 / HEVC** | video | ✅ **decode** — in-house [`rusty_h265`](https://crates.io/crates/rusty_h265), **147/147 JCT-VC HEVC_v1 streams bit-exact** (every picture also matches its decoded-picture-hash SEI), Main / Main 10 / Main Still Picture; `#![forbid(unsafe_code)]`, zero dependencies. Encode not yet |
 | 4 | **MP3** | audio | ✅ in-house **decoder + encoder** — decode **bit-exact vs FFmpeg**; encode MPEG-1/2/2.5, CBR/VBR, joint stereo, block switching (`rusty_mp3`, standalone crate) |
 | 5 | **VP9** | video | ✅ in-house **decoder + encoder** — decode 315/315 libvpx conformance; encode **pixel-exact vs libvpx & ffmpeg** (RDO, golden/ALT-REF, two-pass) |
 | 6 | **JPEG** | image | ✅ decode + encode |
@@ -52,8 +52,8 @@ device support) but defensible.
 Beyond the top 10 we also cover GIF (enc+dec), Vorbis (dec), FLAC (dec), PCM
 (enc+dec), JPEG XL (dec).
 
-With H.264 now pure-Rust by default, **9 of the top 10** have a pure-Rust
-decoder (HEVC is the lone gap).
+With HEVC decode landed 2026-09-05, **all 10 of the top 10** have a pure-Rust
+decoder.
 
 ## In flight
 
@@ -80,7 +80,7 @@ AAC and VP9. `puremp3` stays a possible fast-start reference.
 
 ## Highest-impact next additions
 
-With H.264 and MP3 decode done, **HEVC** is the biggest remaining traffic-mover
-(the one top-10 gap). Just outside the top 10, **AC-3 / E-AC-3** (Dolby) and
-**MPEG-2** (DVD/broadcast legacy) are the next tier; an in-house **MP3 encoder**
-rounds out MP3.
+With H.264, MP3 and now **HEVC decode** done, the top 10 has no decode gap
+left. Just outside it, **AC-3 / E-AC-3** (Dolby) and **MPEG-2** (DVD/broadcast
+legacy) are the next tier. HEVC *encode* is the remaining HEVC half, and a
+separate mission with a separate patent conversation.

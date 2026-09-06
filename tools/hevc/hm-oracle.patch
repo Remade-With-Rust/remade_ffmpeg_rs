@@ -1,0 +1,128 @@
+diff --git a/cmake/CMakeBuild/cmake/modules/BBuildEnv.cmake b/cmake/CMakeBuild/cmake/modules/BBuildEnv.cmake
+index 07532ba..235d6ce 100644
+--- a/cmake/CMakeBuild/cmake/modules/BBuildEnv.cmake
++++ b/cmake/CMakeBuild/cmake/modules/BBuildEnv.cmake
+@@ -624,12 +624,12 @@ function( _bb_enable_warnings_helper warning_options_ )
+     #message( STATUS "processing ${_bb_v}" )
+     if( ${_bb_v} STREQUAL "warnings-as-errors" )
+       if( CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|AppleClang|Clang)$" )
+-        list( APPEND _bb_warning_options "-Werror" )
++        list( APPEND _bb_warning_options "" )
+       elseif( CMAKE_CXX_COMPILER_ID STREQUAL "Intel" )
+         if( MSVC )
+           list( APPEND _bb_warning_options "/WX" )
+         else()
+-          list( APPEND _bb_warning_options "-Werror" )
++          list( APPEND _bb_warning_options "" )
+         endif()          
+       elseif( CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" )
+         list( APPEND _bb_warning_options "/WX" )
+diff --git a/source/Lib/TLibCommon/TComDataCU.h b/source/Lib/TLibCommon/TComDataCU.h
+index f8752ef..86162a3 100644
+--- a/source/Lib/TLibCommon/TComDataCU.h
++++ b/source/Lib/TLibCommon/TComDataCU.h
+@@ -519,7 +519,7 @@ namespace RasterAddress
+    */
+   static inline Bool isEqualRowOrCol( Int addrA, Int addrB, Int numUnitsPerRow )
+   {
+-    return isEqualCol( addrA, addrB, numUnitsPerRow ) | isEqualRow( addrA, addrB, numUnitsPerRow );
++    return isEqualCol( addrA, addrB, numUnitsPerRow ) || isEqualRow( addrA, addrB, numUnitsPerRow );
+   }
+ 
+   /** Check whether one address points to the first column
+diff --git a/source/Lib/TLibCommon/TComLoopFilter.cpp b/source/Lib/TLibCommon/TComLoopFilter.cpp
+index fc8aecd..b0b61db 100644
+--- a/source/Lib/TLibCommon/TComLoopFilter.cpp
++++ b/source/Lib/TLibCommon/TComLoopFilter.cpp
+@@ -36,6 +36,8 @@
+ */
+ 
+ #include "TComLoopFilter.h"
++#include <cstdlib>
++#include <cstdio>
+ #include "TComSlice.h"
+ #include "TComMv.h"
+ #include "TComTU.h"
+@@ -550,6 +552,15 @@ Void TComLoopFilter::xGetBoundaryStrengthSingle ( TComDataCU* pCtu, DeblockEdgeD
+     }   // enf of "if( one of BCBP == 0 )"
+   }   // enf of "if( not Intra )"
+ 
++  if (getenv("HM_DBG_BS2"))
++  {
++    const UInt ras4 = g_auiZscanToRaster[uiAbsPartIdx4x4BlockWithinCtu];
++    fprintf(stderr, "bs2 poc=%d %c x=%d y=%d te=%d intraP=%d intraQ=%d cbfP=%d cbfQ=%d trP=%d trQ=%d bs=%d%c", pcSlice->getPOC(), edgeDir == EDGE_VER ? 'V' : 'H',
++            (int)(pCtu->getCUPelX() + g_auiRasterToPelX[ras4]), (int)(pCtu->getCUPelY() + g_auiRasterToPelY[ras4]),
++            (int)m_aapucBS[edgeDir][uiAbsPartIdx4x4BlockWithinCtu], (int)pcCUP->isIntra(uiPartP), (int)pcCUQ->isIntra(uiPartQ),
++            (int)pcCUP->getCbf(uiPartP, COMPONENT_Y, pcCUP->getTransformIdx(uiPartP)), (int)pcCUQ->getCbf(uiPartQ, COMPONENT_Y, pcCUQ->getTransformIdx(uiPartQ)),
++            (int)pcCUP->getTransformIdx(uiPartP), (int)pcCUQ->getTransformIdx(uiPartQ), (int)uiBs, 10);
++  }
+   m_aapucBS[edgeDir][uiAbsPartIdx4x4BlockWithinCtu] = uiBs;
+ }
+ 
+@@ -603,6 +614,12 @@ Void TComLoopFilter::xEdgeFilterLuma( TComDataCU* const pcCU, const UInt uiAbsZo
+   {
+     uiBsAbsIdx = xCalcBsIdx( pcCU, uiAbsZorderIdx, edgeDir, iEdge, iIdx);
+     uiBs = m_aapucBS[edgeDir][uiBsAbsIdx];
++    if ( uiBs && getenv("HM_DBG_BS") )
++    {
++      const UInt ras = g_auiZscanToRaster[uiBsAbsIdx];
++      fprintf(stderr, "bs poc=%d %c x=%d y=%d bs=%d%c", pcCU->getSlice()->getPOC(), edgeDir == EDGE_VER ? 'V' : 'H',
++              (int)(pcCU->getCUPelX() + g_auiRasterToPelX[ras]), (int)(pcCU->getCUPelY() + g_auiRasterToPelY[ras]), (int)uiBs, 10);
++    }
+     if ( uiBs )
+     {
+       iQP_Q = pcCU->getQP( uiBsAbsIdx );
+@@ -642,6 +659,12 @@ Void TComLoopFilter::xEdgeFilterLuma( TComDataCU* const pcCU, const UInt uiAbsZo
+         Int dp = dp0 + dp3;
+         Int dq = dq0 + dq3;
+         Int d =  d0 + d3;
++        if (getenv("HM_DBG_BS"))
++        {
++          const UInt ras2 = g_auiZscanToRaster[uiBsAbsIdx];
++          fprintf(stderr, "seg poc=%d %c x=%d y=%d bs=%d qpP=%d qpQ=%d tc=%d beta=%d d=%d dp=%d dq=%d%c", pcCU->getSlice()->getPOC(), edgeDir == EDGE_VER ? 'V' : 'H',
++                  (int)(pcCU->getCUPelX() + g_auiRasterToPelX[ras2]), (int)(pcCU->getCUPelY() + g_auiRasterToPelY[ras2]), (int)uiBs, iQP_P, iQP_Q, iTc, iBeta, d, dp, dq, 10);
++        }
+ 
+         if (bPCMFilter || ppsTransquantBypassEnabledFlag)
+         {
+@@ -662,6 +685,16 @@ Void TComLoopFilter::xEdgeFilterLuma( TComDataCU* const pcCU, const UInt uiAbsZo
+           Bool sw =  xUseStrongFiltering( iOffset, 2*d0, iBeta, iTc, piTmpSrc+iSrcStep*(iIdx*uiPelsInPart+iBlkIdx*4+0))
+           && xUseStrongFiltering( iOffset, 2*d3, iBeta, iTc, piTmpSrc+iSrcStep*(iIdx*uiPelsInPart+iBlkIdx*4+3));
+ 
++          if (getenv("HM_DBG_BS"))
++          {
++            const UInt ras3 = g_auiZscanToRaster[uiBsAbsIdx];
++            Pel* l0 = piTmpSrc+iSrcStep*(iIdx*uiPelsInPart+iBlkIdx*4+0);
++            Pel* l3 = piTmpSrc+iSrcStep*(iIdx*uiPelsInPart+iBlkIdx*4+3);
++            fprintf(stderr, "dec poc=%d %c x=%d y=%d sw=%d fp=%d fq=%d l0=%d,%d,%d,%d|%d,%d,%d,%d l3=%d,%d,%d,%d|%d,%d,%d,%d%c", pcCU->getSlice()->getPOC(), edgeDir == EDGE_VER ? 'V' : 'H',
++                    (int)(pcCU->getCUPelX() + g_auiRasterToPelX[ras3]), (int)(pcCU->getCUPelY() + g_auiRasterToPelY[ras3]), (int)sw, (int)bFilterP, (int)bFilterQ,
++                    l0[-4*iOffset], l0[-3*iOffset], l0[-2*iOffset], l0[-iOffset], l0[0], l0[iOffset], l0[2*iOffset], l0[3*iOffset],
++                    l3[-4*iOffset], l3[-3*iOffset], l3[-2*iOffset], l3[-iOffset], l3[0], l3[iOffset], l3[2*iOffset], l3[3*iOffset], 10);
++          }
+           for ( Int i = 0; i < DEBLOCK_SMALLEST_BLOCK/2; i++)
+           {
+             xPelFilterLuma( piTmpSrc+iSrcStep*(iIdx*uiPelsInPart+iBlkIdx*4+i), iOffset, iTc, sw, bPartPNoFilter, bPartQNoFilter, iThrCut, bFilterP, bFilterQ, bitDepthLuma);
+diff --git a/source/Lib/TLibDecoder/TDecGop.cpp b/source/Lib/TLibDecoder/TDecGop.cpp
+index 4982e43..9fa8ec3 100644
+--- a/source/Lib/TLibDecoder/TDecGop.cpp
++++ b/source/Lib/TLibDecoder/TDecGop.cpp
+@@ -36,6 +36,7 @@
+ */
+ 
+ #include "TDecGop.h"
++#include <cstdlib>
+ #include "TDecCAVLC.h"
+ #include "TDecSbac.h"
+ #include "TDecBinCoder.h"
+@@ -142,9 +143,9 @@ Void TDecGop::filterPicture(TComPic* pcPic)
+   // deblocking filter
+   Bool bLFCrossTileBoundary = pcSlice->getPPS()->getLoopFilterAcrossTilesEnabledFlag();
+   m_pcLoopFilter->setCfg(bLFCrossTileBoundary);
+-  m_pcLoopFilter->loopFilterPic( pcPic );
++  if (!getenv("HM_NO_DBK")) m_pcLoopFilter->loopFilterPic( pcPic );
+ 
+-  if( pcSlice->getSPS()->getUseSAO() )
++  if( pcSlice->getSPS()->getUseSAO() && !getenv("HM_NO_SAO") )
+   {
+     m_pcSAO->reconstructBlkSAOParams(pcPic, pcPic->getPicSym()->getSAOBlkParam());
+     m_pcSAO->SAOProcess(pcPic);

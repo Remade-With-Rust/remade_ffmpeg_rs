@@ -42,6 +42,8 @@ pub enum CodecId {
     None,
     /// H.264 / AVC video.
     H264,
+    /// H.265 / HEVC video. Decode only.
+    Hevc,
     /// Opus audio.
     Opus,
     /// AVIF still image (an AV1 intra frame in a HEIF box).
@@ -92,6 +94,7 @@ impl CodecId {
         match self {
             CodecId::None => "none",
             CodecId::H264 => "h264",
+            CodecId::Hevc => "hevc",
             CodecId::Opus => "opus",
             CodecId::Avif => "avif",
             CodecId::Png => "png",
@@ -116,7 +119,7 @@ impl CodecId {
     pub fn media_type(self) -> MediaType {
         match self {
             CodecId::None => MediaType::Data,
-            CodecId::H264 => MediaType::Video,
+            CodecId::H264 | CodecId::Hevc => MediaType::Video,
             CodecId::Opus => MediaType::Audio,
             // Image codecs carry pixel data; we model them as (single-frame) video.
             CodecId::Avif => MediaType::Video,
@@ -157,6 +160,7 @@ impl CodecId {
     pub fn from_name(name: &str) -> Option<CodecId> {
         match name {
             "h264" | "avc" | "libx264" => Some(CodecId::H264),
+            "hevc" | "h265" | "x265" | "libx265" => Some(CodecId::Hevc),
             "opus" | "libopus" => Some(CodecId::Opus),
             "avif" => Some(CodecId::Avif),
             "png" => Some(CodecId::Png),

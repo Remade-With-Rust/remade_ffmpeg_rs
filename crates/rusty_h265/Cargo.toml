@@ -1,0 +1,37 @@
+[package]
+name = "rusty_h265"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+authors = ["Mata Network <https://www.mata.network>"]
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+description = "Pure-Rust HEVC / H.265 video decoder, no C/FFI, written from the ITU-T H.265 spec and gated on the JCT-VC conformance suite."
+readme = "README.md"
+keywords = ["hevc", "h265", "video", "codec", "decoder"]
+categories = ["multimedia::video", "multimedia::encoding"]
+rust-version = "1.85"
+
+[features]
+# The SIMD kernels (plan §2.6: primary path, scalar twin as oracle).
+default = ["simd"]
+# Runs the bundled `rusty_h265` binary under our own allocator, which is what
+# `rff-cli` ships (CLAUDE.md: "an arm measured under the system allocator is not
+# comparable"). Off by default and behind an OPTIONAL dependency so the
+# published library stays dependency-free — a library must never hijack a
+# downstream binary's allocator choice. Every benchmark passes it.
+bench-alloc = ["dep:rusty_alloc-api"]
+simd = ["rusty_h265-accel/simd"]
+census = ["rusty_h265-accel/census"]
+
+[dependencies]
+# `default-features = false`: the ONLY route to the kernels is this crate's own
+# `simd` feature, so `--no-default-features` really is the scalar arm. Without
+# this, the accel crate's own default silently re-enabled them and the A/B
+# measured SIMD against SIMD.
+rusty_h265-accel = { workspace = true, default-features = false }
+rusty_alloc-api = { workspace = true, optional = true }
+
+[[bin]]
+name = "rusty_h265"
+path = "src/bin/rusty_h265.rs"

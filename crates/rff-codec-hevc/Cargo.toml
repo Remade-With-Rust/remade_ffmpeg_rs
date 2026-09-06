@@ -1,0 +1,18 @@
+[package]
+name = "rff-codec-hevc"
+description = "Remade FFmpeg (Rust): HEVC / H.265 video decoder — pure Rust via rusty_h265."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["hevc", "h265", "video", "codec", "decoder"]
+categories = ["multimedia", "multimedia::video"]
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
+rusty_h265.workspace = true

@@ -13,6 +13,7 @@
 pub mod aac;
 pub mod av1;
 pub mod avc;
+pub mod hvc;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};

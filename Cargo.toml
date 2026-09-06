@@ -10,6 +10,7 @@ default-members = [
     "crates/rff-codec",
     "crates/rff-format",
     "crates/rff-codec-h264",
+    "crates/rff-codec-hevc",
     "crates/rff-codec-opus",
     "crates/rff-codec-avif",
     "crates/rff-format-avi",
@@ -31,6 +32,8 @@ default-members = [
     "crates/rff-codec-av2",
     "crates/rff-codec-mp3",
     "crates/rusty_vp9",
+    "crates/rusty_h265",
+    "crates/rusty_h265-accel",
     "crates/rusty_flac",
     "crates/rusty_mp3",
     "crates/rusty_aac",
@@ -81,6 +84,7 @@ rff-codec = { path = "crates/rff-codec", version = "0.2.0" }
 rff-format = { path = "crates/rff-format", version = "0.2.0" }
 rff-targets = { path = "crates/rff-targets", version = "0.2.0" }
 rff-codec-h264 = { path = "crates/rff-codec-h264", version = "0.2.0" }
+rff-codec-hevc = { path = "crates/rff-codec-hevc", version = "0.1.0" }
 rff-codec-opus = { path = "crates/rff-codec-opus", version = "0.2.0" }
 rff-codec-avif = { path = "crates/rff-codec-avif", version = "0.2.0" }
 rff-format-avi = { path = "crates/rff-format-avi", version = "0.2.0" }
@@ -106,6 +110,8 @@ rff-codec-mp3 = { path = "crates/rff-codec-mp3", version = "0.2.0" }
 # to crates.io on their own cadence, decoupled from the workspace version and
 # from each other, so these no longer move in lockstep at 0.1.x.
 rusty_vp9 = { path = "crates/rusty_vp9", version = "0.1.1" }
+rusty_h265 = { path = "crates/rusty_h265", version = "0.1.0" }
+rusty_h265-accel = { path = "crates/rusty_h265-accel", version = "0.1.0", default-features = false }
 rusty_flac = { path = "crates/rusty_flac", version = "0.1.0" }
 rusty_mp3 = { path = "crates/rusty_mp3", version = "0.7.0" }
 rusty_aac = { path = "crates/rusty_aac", version = "0.5.0" }

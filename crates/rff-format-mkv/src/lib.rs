@@ -389,12 +389,15 @@ impl MkvDemuxer {
                 _ => None, // 24-bit int etc. — no rff layout yet
             };
         }
-        // H.264 is stored AVCC (CodecPrivate = avcC, length-prefixed blocks).
-        // Normalise to rff's Annex-B packet contract — same as rff-format-mp4 —
-        // so extradata stays empty and the SPS/PPS ride in keyframe packets.
-        let avc = (codec_id == CodecId::H264)
-            .then(|| parse_avcc(&codec_private))
-            .flatten();
+        // H.264 and HEVC are stored length-prefixed (CodecPrivate = `avcC` /
+        // `hvcC`). Normalise to rff's Annex-B packet contract — same as
+        // rff-format-mp4 — so extradata stays empty and the parameter sets
+        // ride in the keyframe packets.
+        let avc = match codec_id {
+            CodecId::H264 => parse_avcc(&codec_private),
+            CodecId::Hevc => rff_format::hvc::parse_hvcc(&codec_private),
+            _ => None,
+        };
         s.extradata = if avc.is_some() {
             Vec::new()
         } else if codec_id == CodecId::Vorbis {
@@ -742,6 +745,7 @@ fn map_codec(codec: &str) -> CodecId {
         "V_AV1" => CodecId::Avif, // our AV1 (rav1d) decoder
         "V_VP9" => CodecId::Vp9,
         "V_MPEG4/ISO/AVC" => CodecId::H264,
+        "V_MPEGH/ISO/HEVC" => CodecId::Hevc,
         "A_OPUS" => CodecId::Opus,
         "A_VORBIS" => CodecId::Vorbis,
         "A_AAC" => CodecId::Aac,
