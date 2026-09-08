@@ -1,9 +1,3 @@
-### In The Wild with over 55,221 Active Installs Across Codecs
-> [RAG Converter](https://ragconverter.com) uses 4+ remade_ffmpeg_rs codecs in wasm.
-> It makes personal and work files AI-readable without them leaving the machine:
-> the whole conversion runs as WebAssembly in the browser tab, with nothing
-> uploaded and nothing to install.
-
 ### In The Wild with 112,095 Active Installs
 
 FREE RAG Converter Online -- <a href="https://RAGconverter.com">RAGconverter.com</a>
