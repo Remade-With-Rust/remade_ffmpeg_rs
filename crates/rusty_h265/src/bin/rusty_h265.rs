@@ -18,26 +18,83 @@ use std::io::Write;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("usage: rusty_h265 <in.bit> <out.yuv> [--headers-only]");
+    // The two positional arguments are whatever is left after the flags, at
+    // whichever position they land.
+    //
+    // They used to be `args[1]` and `args[2]` outright. That works until a
+    // caller puts a flag first -- and one does: `conform.py --decoder "exe
+    // --isa sse41"` appends the input and output AFTER the decoder string, so
+    // the flag occupies the positional slots, the decoder tries to open
+    // `--isa` as a bitstream, and the suite reports 0/147. Which reads exactly
+    // like a decoder that has broken, on a change that touched no decoding.
+    let mut positional: Vec<&String> = Vec::new();
+    let mut skip_next = false;
+    for a in args.iter().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a == "--isa" {
+            skip_next = true; // `--isa <level>` takes a value
+            continue;
+        }
+        if a.starts_with("--") {
+            continue;
+        }
+        positional.push(a);
+    }
+    if positional.len() < 2 {
+        eprintln!("usage: rusty_h265 <in.bit> <out.yuv> [--headers-only] [--pipe] [--isa avx2|sse41|baseline]");
         std::process::exit(2);
     }
-    let data = match std::fs::read(&args[1]) {
+    let (in_path, out_path) = (positional[0].clone(), positional[1].clone());
+    let data = match std::fs::read(&in_path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("read {}: {e}", args[1]);
+            eprintln!("read {in_path}: {e}");
             std::process::exit(2);
         }
     };
     let headers_only = args.iter().any(|a| a == "--headers-only");
+    // `--pipe` writes the raw planar YUV to STDOUT, so a consumer can watch
+    // frames arrive as they are decoded. The stats line then goes to stderr --
+    // interleaved with the frame bytes it would corrupt the stream.
+    let pipe = args.iter().any(|a| a == "--pipe");
+    // `--isa sse41` caps the kernels for THIS process. The env var cannot do
+    // the job a paired A/B needs: both arms share an environment, so setting it
+    // there measures one configuration against itself.
+    if let Some(i) = args.iter().position(|a| a == "--isa") {
+        match args.get(i + 1).map(String::as_str) {
+            Some("sse41") => rusty_h265::accel::force_isa(rusty_h265::accel::Isa::Sse41),
+            Some("baseline") | Some("sse2") => rusty_h265::accel::force_isa(rusty_h265::accel::Isa::Baseline),
+            Some("avx2") | None => {}
+            Some(other) => {
+                eprintln!("--isa: expected avx2, sse41 or baseline, got {other:?}");
+                std::process::exit(2);
+            }
+        }
+    }
     let verify_sei = args.iter().any(|a| a == "--verify-sei");
     // `-` as the output path writes nothing: the decode-only arm, so a
     // measurement is not dominated by the YUV write (codec-measurement §4).
-    let mut out: Box<dyn Write> = if args[2] == "-" {
+    // `-` discards, so nothing needs serialising; `--pipe` and a real path do.
+    let serialize = pipe || out_path != "-";
+    let mut out: Box<dyn Write> = if pipe {
+        Box::new(std::io::BufWriter::with_capacity(1 << 20, std::io::stdout()))
+    } else if out_path == "-" {
         Box::new(std::io::sink())
     } else {
-        Box::new(std::io::BufWriter::new(std::fs::File::create(&args[2]).expect("create output")))
+        Box::new(std::io::BufWriter::new(std::fs::File::create(&out_path).expect("create output")))
     };
+    // Stage profiling is opt-in twice over: the `prof` feature must be built
+    // in, and the variable must be set. Neither the shipping binary nor an
+    // ordinary `--features prof` run pays anything until this line fires.
+    #[cfg(feature = "prof")]
+    let profiling = std::env::var_os("RH265_PROF").is_some();
+    #[cfg(feature = "prof")]
+    if profiling {
+        rusty_h265::prof::enable();
+    }
     let t0 = std::time::Instant::now();
     let mut dec = rusty_h265::Decoder::new();
     dec.headers_only = headers_only;
@@ -48,15 +105,15 @@ fn main() {
             dec.stats.errors += 1;
             first_err.get_or_insert_with(|| e.to_string());
         }
-        drain(&mut dec, &mut out);
+        drain(&mut dec, &mut out, serialize);
     }
     dec.flush();
-    let (w, h, bd) = drain(&mut dec, &mut out);
+    let (w, h, bd) = drain(&mut dec, &mut out, serialize);
     out.flush().expect("flush output");
     let ms = t0.elapsed().as_millis();
     let s = dec.stats;
     let first_sei = dec.sei_results.first().map_or("none", |r| if r.1 { "ok" } else { "bad" });
-    println!(
+    let line = format!(
         "frames={} errors={} decode_ms={} width={} height={} bit_depth={} pictures={} slices={} skipped_rasl={} generated_refs={} sei_checked={} sei_mismatch={} first_sei={} alloc={} isa={}",
         FRAMES.with(|f| f.get()),
         s.errors,
@@ -79,6 +136,35 @@ fn main() {
         if cfg!(feature = "bench-alloc") { "rusty" } else { "system" },
         rusty_h265::accel::describe().rsplit(": ").next().unwrap_or("?"),
     );
+    // Under `--pipe` stdout carries the frame bytes, so the stats go to stderr.
+    if pipe {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
+    #[cfg(feature = "prof")]
+    if profiling {
+        eprint!("{}", rusty_h265::prof::report(t0.elapsed().as_nanos() as u64));
+    }
+    if std::env::var_os("RH265_SAOBYTES").is_some() {
+        use std::sync::atomic::Ordering;
+        let (cp, pl, sp) = (
+            rusty_h265::filters::SAO_COPIED.load(Ordering::Relaxed),
+            rusty_h265::filters::SAO_PLANE.load(Ordering::Relaxed),
+            rusty_h265::filters::SAO_SPANS.load(Ordering::Relaxed),
+        );
+        eprintln!("SAO copy: {cp} of {pl} samples ({:.1}%) in {sp} spans, {:.0} samples/span", 100.0 * cp as f64 / pl as f64, cp as f64 / sp.max(1) as f64);
+    }
+    if std::env::var_os("RH265_POOL").is_some() {
+        use std::sync::atomic::Ordering;
+        let (h, m) = (rusty_h265::decoder::POOL_HIT.load(Ordering::Relaxed), rusty_h265::decoder::POOL_MISS.load(Ordering::Relaxed));
+        let (ok, sh, fu) = (
+            rusty_h265::decoder::RECL_OK.load(Ordering::Relaxed),
+            rusty_h265::decoder::RECL_SHARED.load(Ordering::Relaxed),
+            rusty_h265::decoder::RECL_FULL.load(Ordering::Relaxed),
+        );
+        eprintln!("picture pool: {h} reused, {m} fresh ({:.0}% hit); reclaim: {ok} ok, {sh} still shared, {fu} pool full", 100.0 * h as f64 / (h + m).max(1) as f64);
+    }
     if let Some(e) = first_err {
         eprintln!("first error: {e}");
     }
@@ -86,6 +172,18 @@ fn main() {
     // benchmark but a zero here is not deployed, whatever the call graph says.
     if std::env::var_os("RH265_CENSUS").is_some() {
         eprintln!("{}", rusty_h265::accel::describe());
+        // The per-bin, per-block and per-edge counters are gated on
+        // `census::ALWAYS`, a `cfg!(feature = "census")` CONST, because their
+        // runtime check -- a `OnceLock` read -- is itself the cost being
+        // measured on those paths. Without the feature they compile away and
+        // report ZERO, which reads exactly like "this path never runs": the
+        // false-refutation shape that a byte census exists to prevent. Say so
+        // loudly rather than let a zero be believed.
+        if !rusty_h265::accel::census::ALWAYS {
+            eprintln!(
+                "census WARNING: built without `--features census`. Counters on per-bin,                  per-block and per-edge paths are compile-time gated and will read 0 here.                  Rebuild with `--features census` before believing any zero below."
+            );
+        }
         for (name, v) in rusty_h265::accel::census::snapshot() {
             eprintln!("census {name} = {v}");
         }
@@ -107,13 +205,24 @@ thread_local! {
     static FRAMES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-fn drain(dec: &mut rusty_h265::Decoder, out: &mut impl Write) -> (usize, usize, u8) {
+/// Drain every picture the decoder has ready.
+///
+/// `serialize` is false for the discard output (`-`). Draining is real decoder
+/// work -- it runs the DPB's bumping process and releases pictures -- but
+/// SERIALISING each one into a `Vec` that is then written to `io::sink()` is
+/// not: it was 1.38 MB of memcpy per frame, 830 MB over a 600-frame clip, on
+/// the path every published timing measures. `ffmpeg -f null -` does not do it
+/// either, so leaving it in was measuring us doing strictly more work than the
+/// arm we compare against (codec-measurement §4).
+fn drain(dec: &mut rusty_h265::Decoder, out: &mut impl Write, serialize: bool) -> (usize, usize, u8) {
     let mut geom = (0, 0, 0);
     let mut buf = Vec::new();
     while let Ok(frame) = dec.next_frame() {
-        buf.clear();
-        frame.write_yuv(&mut buf);
-        out.write_all(&buf).expect("write output");
+        if serialize {
+            buf.clear();
+            frame.write_yuv(&mut buf);
+            out.write_all(&buf).expect("write output");
+        }
         geom = (frame.width, frame.height, frame.bit_depth());
         FRAMES.with(|f| f.set(f.get() + 1));
     }

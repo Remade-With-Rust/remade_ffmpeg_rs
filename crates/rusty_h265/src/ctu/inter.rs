@@ -5,11 +5,11 @@
 
 use super::{PartMode, SliceDecoder};
 use crate::cabac::*;
-use rusty_h265_accel as accel;
 use crate::error::{Error, Result};
 use crate::mcscratch::weighted_write;
+use crate::pic::{AvailAt, Motion, PicState, PRED_INTER, PRED_SKIP};
 use crate::slice::PredWeightTable;
-use crate::pic::{Motion, PicState, PRED_INTER, PRED_SKIP};
+use rusty_h265_accel as accel;
 
 /// A fixed-capacity candidate list.
 ///
@@ -83,6 +83,12 @@ impl PuMv {
     }
 }
 
+/// `l0CandIdx`/`l1CandIdx` of §8.5.3.2.3. Twelve entries is exact, not a
+/// bound: the loop runs to `numOrig * (numOrig - 1)` and entry requires
+/// `numOrig < MaxNumMergeCand <= 5`, so `numOrig <= 4` and the index stops at
+/// 11. Pairing them into one table of tuples was measured: +22 instructions
+/// for no guard change, because the two lookups share one bound and LLVM had
+/// already merged the check.
 const L0_CAND: [usize; 12] = [0, 1, 0, 2, 1, 2, 0, 3, 1, 3, 2, 3];
 const L1_CAND: [usize; 12] = [1, 0, 2, 0, 2, 1, 3, 0, 3, 1, 3, 2];
 
@@ -143,11 +149,19 @@ fn scale_mv(mv: [i32; 2], td: i32, tb: i32) -> [i32; 2] {
 /// which are `put_uni` and `put_bi` term for term. Detecting it routes the
 /// block to the cheaper kernel — and re-opens the full-pel fast path, which is
 /// gated on "no weighting" and was therefore closed for every P slice.
-fn neutral_weights(t: &PredWeightTable, pu: &PuMv, used: [bool; 2], c: usize) -> bool {
-    // Bring-up switch: `RH265_NO_NEUTRAL_WP=1` forces every weighted slice down
-    // the weighted path, so this gate can be A/B'd inside one binary.
+/// Bring-up switch: `RH265_NO_NEUTRAL_WP=1` forces every weighted slice down
+/// the weighted path, so the gate can be A/B'd inside one binary.
+///
+/// Read once per prediction unit by the caller, not once per COMPONENT inside
+/// `neutral_weights` -- a `OnceLock` read is an atomic load and a branch, and
+/// on a weighted slice this ran three times for every unit.
+fn neutral_wp_off() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *OFF.get_or_init(|| std::env::var_os("RH265_NO_NEUTRAL_WP").is_some()) {
+    *OFF.get_or_init(|| std::env::var_os("RH265_NO_NEUTRAL_WP").is_some())
+}
+
+fn neutral_weights(t: &PredWeightTable, pu: &PuMv, used: [bool; 2], c: usize, off: bool) -> bool {
+    if off {
         return false;
     }
     let denom = if c == 0 { t.luma_log2_weight_denom } else { t.chroma_log2_weight_denom };
@@ -159,7 +173,11 @@ fn neutral_weights(t: &PredWeightTable, pu: &PuMv, used: [bool; 2], c: usize) ->
         let idx = pu.ref_idx[l] as usize;
         let e = if l == 0 { t.l0.get(idx) } else { t.l1.get(idx) };
         let Some(e) = e else { return false };
-        let (w, o) = if c == 0 { (e.luma_weight, e.luma_offset) } else { (e.chroma_weight[c - 1], e.chroma_offset[c - 1]) };
+        let (w, o) = if c == 0 {
+            (e.luma_weight, e.luma_offset)
+        } else {
+            (e.chroma_weight[c - 1], e.chroma_offset[c - 1])
+        };
         if w != unit || o != 0 {
             return false;
         }
@@ -223,19 +241,8 @@ impl<'a> SliceDecoder<'a> {
 
     /// §7.3.8.6 prediction_unit() + §8.5.3 decoding: returns `merge_flag`.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn prediction_unit(
-        &mut self,
-        xcb: usize,
-        ycb: usize,
-        ncb: usize,
-        xp: usize,
-        yp: usize,
-        w: usize,
-        h: usize,
-        part_idx: usize,
-        depth: u8,
-        skip: bool,
-    ) -> Result<bool> {
+    pub(super) fn prediction_unit(&mut self, xcb: usize, ycb: usize, ncb: usize, xp: usize, yp: usize, w: usize, h: usize, part_idx: usize, depth: u8, skip: bool) -> Result<bool> {
+        crate::prof_scope!(crate::prof::Stage::Inter);
         let merge_idx = |s: &mut Self| -> usize {
             if s.sh.max_num_merge_cand <= 1 {
                 return 0;
@@ -243,11 +250,9 @@ impl<'a> SliceDecoder<'a> {
             if s.cab.decode(CTX_MERGE_IDX) == 0 {
                 return 0;
             }
-            let mut i = 1;
-            while i < (s.sh.max_num_merge_cand - 1) as usize && s.cab.bypass() == 1 {
-                i += 1;
-            }
-            i
+            // The `merge_idx` suffix is truncated unary over the remaining
+            // candidates (the first bin, above, is the context-coded one).
+            1 + s.cab.bypass_ones((s.sh.max_num_merge_cand - 2) as u32) as usize
         };
         let merge = skip || self.cab.decode(CTX_MERGE_FLAG) == 1;
         let pu = if merge {
@@ -349,26 +354,40 @@ impl<'a> SliceDecoder<'a> {
 
     /// §6.4.2 prediction block availability + "not intra".
     #[allow(clippy::too_many_arguments)]
-    fn pb_available(&self, xcb: usize, ycb: usize, ncb: usize, xp: usize, yp: usize, w: usize, h: usize, part_idx: usize, xn: i32, yn: i32) -> bool {
+    /// §6.4.2 prediction-block availability, returning the neighbour's 4x4
+    /// index when it is available.
+    ///
+    /// The index is what every caller wants next: `merge_motion` reads the
+    /// neighbour's motion at it, and `amvp` reads it TWICE (once in the
+    /// unscaled pass, once in the scaled one). Returning it retires a multiply
+    /// by the runtime stride per read -- five candidates per prediction block
+    /// in `merge_motion`, five positions read up to twice each in `amvp`.
+    #[allow(clippy::too_many_arguments)]
+    fn pb_avail(&self, ac: &AvailAt, xcb: usize, ycb: usize, ncb: usize, w: usize, h: usize, part_idx: usize, xn: i32, yn: i32) -> Option<usize> {
         if xn < 0 || yn < 0 || xn >= self.st.width as i32 || yn >= self.st.height as i32 {
-            return false;
+            return None;
         }
         let (xnu, ynu) = (xn as usize, yn as usize);
         let same_cb = xnu >= xcb && xnu < xcb + ncb && ynu >= ycb && ynu < ycb + ncb;
+        // The prediction block's own §6.4.1 half is hoisted by the caller: this
+        // is asked about five candidate neighbours of one block.
         let avail = if !same_cb {
-            self.st.available(xp as i32, yp as i32, xn, yn)
+            self.st.avail_n(ac, xn, yn)
         } else {
             !(w * 2 == ncb && h * 2 == ncb && part_idx == 1 && ycb + h <= ynu && xcb + w > xnu)
         };
         if !avail {
-            return false;
+            return None;
         }
-        let m = self.st.pred_mode[self.st.idx4(xnu, ynu)];
-        m == PRED_INTER || m == PRED_SKIP
+        let i = self.st.idx4(xnu, ynu);
+        let m = self.st.pred_mode[i];
+        (m == PRED_INTER || m == PRED_SKIP).then_some(i)
     }
 
-    fn motion_at(&self, x: i32, y: i32) -> PuMv {
-        PuMv::from_motion(&self.st.motion[self.st.idx4(x as usize, y as usize)])
+    /// The neighbour's motion at an index [`pb_avail`] already computed.
+    #[inline]
+    fn motion_at_idx(&self, i: usize) -> PuMv {
+        PuMv::from_motion(&self.st.motion[i])
     }
 
     /// §8.5.3.2.2–8.5.3.2.5: the merge candidate at `merge_idx`.
@@ -379,21 +398,28 @@ impl<'a> SliceDecoder<'a> {
         let pm = self.part_mode;
         let same_mer = |xn: i32, yn: i32| -> bool { (xp >> plevel) as i32 == xn >> plevel && (yp >> plevel) as i32 == yn >> plevel };
         let (xi, yi, wi, hi) = (xp as i32, yp as i32, w as i32, h as i32);
+        let ac = self.st.avail_at(xi, yi);
         // Five spatial-or-temporal candidates at most; six for headroom.
         let mut cands: Cands<PuMv, 6> = Cands::new();
         // A1
         let (xa1, ya1) = (xi - 1, yi + hi - 1);
         let vert_second = part_idx == 1 && matches!(pm, PartMode::PartNx2N | PartMode::PartnLx2N | PartMode::PartnRx2N);
-        let avail_a1 = !same_mer(xa1, ya1) && !vert_second && self.pb_available(xcb, ycb, ncb, xp, yp, w, h, part_idx, xa1, ya1);
-        let a1 = if avail_a1 { Some(self.motion_at(xa1, ya1)) } else { None };
+        let a1 = if !same_mer(xa1, ya1) && !vert_second {
+            self.pb_avail(&ac, xcb, ycb, ncb, w, h, part_idx, xa1, ya1).map(|i| self.motion_at_idx(i))
+        } else {
+            None
+        };
         if let Some(m) = a1 {
             cands.push(m);
         }
         // B1
         let (xb1, yb1) = (xi + wi - 1, yi - 1);
         let horz_second = part_idx == 1 && matches!(pm, PartMode::Part2NxN | PartMode::Part2NxnU | PartMode::Part2NxnD);
-        let avail_b1 = !same_mer(xb1, yb1) && !horz_second && self.pb_available(xcb, ycb, ncb, xp, yp, w, h, part_idx, xb1, yb1);
-        let b1 = if avail_b1 { Some(self.motion_at(xb1, yb1)) } else { None };
+        let b1 = if !same_mer(xb1, yb1) && !horz_second {
+            self.pb_avail(&ac, xcb, ycb, ncb, w, h, part_idx, xb1, yb1).map(|i| self.motion_at_idx(i))
+        } else {
+            None
+        };
         if let Some(m) = b1 {
             if !a1.is_some_and(|a| a.same(&m)) {
                 cands.push(m);
@@ -401,18 +427,18 @@ impl<'a> SliceDecoder<'a> {
         }
         // B0
         let (xb0, yb0) = (xi + wi, yi - 1);
-        let avail_b0 = !same_mer(xb0, yb0) && self.pb_available(xcb, ycb, ncb, xp, yp, w, h, part_idx, xb0, yb0);
-        if avail_b0 {
-            let m = self.motion_at(xb0, yb0);
+        let b0_i = if same_mer(xb0, yb0) { None } else { self.pb_avail(&ac, xcb, ycb, ncb, w, h, part_idx, xb0, yb0) };
+        if let Some(i) = b0_i {
+            let m = self.motion_at_idx(i);
             if !b1.is_some_and(|b| b.same(&m)) {
                 cands.push(m);
             }
         }
         // A0
         let (xa0, ya0) = (xi - 1, yi + hi);
-        let avail_a0 = !same_mer(xa0, ya0) && self.pb_available(xcb, ycb, ncb, xp, yp, w, h, part_idx, xa0, ya0);
-        if avail_a0 {
-            let m = self.motion_at(xa0, ya0);
+        let a0_i = if same_mer(xa0, ya0) { None } else { self.pb_avail(&ac, xcb, ycb, ncb, w, h, part_idx, xa0, ya0) };
+        if let Some(i) = a0_i {
+            let m = self.motion_at_idx(i);
             if !a1.is_some_and(|a| a.same(&m)) {
                 cands.push(m);
             }
@@ -421,9 +447,9 @@ impl<'a> SliceDecoder<'a> {
         // (availableFlagX are the post-pruning flags in §8.5.3.2.3).
         if cands.len() != 4 {
             let (xb2, yb2) = (xi - 1, yi - 1);
-            let avail_b2 = !same_mer(xb2, yb2) && self.pb_available(xcb, ycb, ncb, xp, yp, w, h, part_idx, xb2, yb2);
-            if avail_b2 {
-                let m = self.motion_at(xb2, yb2);
+            let b2_i = if same_mer(xb2, yb2) { None } else { self.pb_avail(&ac, xcb, ycb, ncb, w, h, part_idx, xb2, yb2) };
+            if let Some(i) = b2_i {
+                let m = self.motion_at_idx(i);
                 if !a1.is_some_and(|a| a.same(&m)) && !b1.is_some_and(|b| b.same(&m)) {
                     cands.push(m);
                 }
@@ -466,21 +492,37 @@ impl<'a> SliceDecoder<'a> {
                     let p0 = self.refs.l0[l0c.ref_idx[0] as usize].poc;
                     let p1 = self.refs.l1[l1c.ref_idx[1] as usize].poc;
                     if p0 != p1 || l0c.mv[0] != l1c.mv[1] {
-                        cands.push(PuMv { mv: [l0c.mv[0], l1c.mv[1]], ref_idx: [l0c.ref_idx[0], l1c.ref_idx[1]], flags: 3 });
+                        cands.push(PuMv {
+                            mv: [l0c.mv[0], l1c.mv[1]],
+                            ref_idx: [l0c.ref_idx[0], l1c.ref_idx[1]],
+                            flags: 3,
+                        });
                     }
                 }
                 comb_idx += 1;
             }
         }
         // zero candidates
-        let num_ref = if self.sh.slice_type.is_b() { self.refs.l0.len().min(self.refs.l1.len()) } else { self.refs.l0.len() };
+        let num_ref = if self.sh.slice_type.is_b() {
+            self.refs.l0.len().min(self.refs.l1.len())
+        } else {
+            self.refs.l0.len()
+        };
         let mut zero_idx = 0;
         while cands.len() < max {
             let r = if zero_idx < num_ref { zero_idx as i32 } else { 0 };
             if self.sh.slice_type.is_b() {
-                cands.push(PuMv { mv: [[0, 0]; 2], ref_idx: [r, r], flags: 3 });
+                cands.push(PuMv {
+                    mv: [[0, 0]; 2],
+                    ref_idx: [r, r],
+                    flags: 3,
+                });
             } else {
-                cands.push(PuMv { mv: [[0, 0]; 2], ref_idx: [r, -1], flags: 1 });
+                cands.push(PuMv {
+                    mv: [[0, 0]; 2],
+                    ref_idx: [r, -1],
+                    flags: 1,
+                });
             }
             zero_idx += 1;
         }
@@ -527,7 +569,13 @@ impl<'a> SliceDecoder<'a> {
         } else if m.pred_flags & 2 == 0 {
             (m.mv[0], m.ref_poc[0], m.ref_lt & 1 != 0)
         } else {
-            let n = if self.no_backward_pred { lx } else if self.sh.collocated_from_l0 { 1 } else { 0 };
+            let n = if self.no_backward_pred {
+                lx
+            } else if self.sh.collocated_from_l0 {
+                1
+            } else {
+                0
+            };
             (m.mv[n], m.ref_poc[n], m.ref_lt & (1 << n) != 0)
         };
         let target = if lx == 0 { &self.refs.l0[ref_idx as usize] } else { &self.refs.l1[ref_idx as usize] };
@@ -553,7 +601,11 @@ impl<'a> SliceDecoder<'a> {
         let (xi, yi, wi, hi) = (xp as i32, yp as i32, w as i32, h as i32);
         let a_pos = [(xi - 1, yi + hi), (xi - 1, yi + hi - 1)];
         let b_pos = [(xi + wi, yi - 1), (xi + wi - 1, yi - 1), (xi - 1, yi - 1)];
-        let avail = |p: (i32, i32)| self.pb_available(xcb, ycb, ncb, xp, yp, w, h, part_idx, p.0, p.1);
+        let ac = self.st.avail_at(xi, yi);
+        // Fetch each candidate's motion once. The two passes below (unscaled,
+        // then scaled) each re-derived it from coordinates, so an available
+        // position paid for `idx4` and a `PuMv::from_motion` twice.
+        let avail = |p: (i32, i32)| self.pb_avail(&ac, xcb, ycb, ncb, w, h, part_idx, p.0, p.1).map(|i| self.motion_at_idx(i));
         // same-picture match without scaling
         let direct = |m: &PuMv| -> Option<[i32; 2]> {
             if m.flags & (1 << lx) != 0 && list(lx)[m.ref_idx[lx] as usize].poc == target.poc {
@@ -580,24 +632,24 @@ impl<'a> SliceDecoder<'a> {
             }
             None
         };
-        let avail_a = [avail(a_pos[0]), avail(a_pos[1])];
-        let is_scaled = avail_a[0] || avail_a[1];
+        let cand_a = [avail(a_pos[0]), avail(a_pos[1])];
+        let is_scaled = cand_a[0].is_some() || cand_a[1].is_some();
         let mut mv_a = None;
-        for k in 0..2 {
-            if avail_a[k] && mv_a.is_none() {
-                mv_a = direct(&self.motion_at(a_pos[k].0, a_pos[k].1));
+        for m in cand_a.iter().flatten() {
+            if mv_a.is_none() {
+                mv_a = direct(m);
             }
         }
-        for k in 0..2 {
-            if avail_a[k] && mv_a.is_none() {
-                mv_a = scaled(&self.motion_at(a_pos[k].0, a_pos[k].1));
+        for m in cand_a.iter().flatten() {
+            if mv_a.is_none() {
+                mv_a = scaled(m);
             }
         }
-        let avail_b = [avail(b_pos[0]), avail(b_pos[1]), avail(b_pos[2])];
+        let cand_b = [avail(b_pos[0]), avail(b_pos[1]), avail(b_pos[2])];
         let mut mv_b = None;
-        for k in 0..3 {
-            if avail_b[k] && mv_b.is_none() {
-                mv_b = direct(&self.motion_at(b_pos[k].0, b_pos[k].1));
+        for m in cand_b.iter().flatten() {
+            if mv_b.is_none() {
+                mv_b = direct(m);
             }
         }
         if !is_scaled && mv_b.is_some() {
@@ -605,9 +657,9 @@ impl<'a> SliceDecoder<'a> {
         }
         if !is_scaled {
             mv_b = None;
-            for k in 0..3 {
-                if avail_b[k] && mv_b.is_none() {
-                    mv_b = scaled(&self.motion_at(b_pos[k].0, b_pos[k].1));
+            for m in cand_b.iter().flatten() {
+                if mv_b.is_none() {
+                    mv_b = scaled(m);
                 }
             }
         }
@@ -633,7 +685,10 @@ impl<'a> SliceDecoder<'a> {
 
     /// Records the PU's motion per 4×4 (for neighbours, deblocking and TMVP).
     fn store_motion(&mut self, xp: usize, yp: usize, w: usize, h: usize, pu: &PuMv) {
-        let mut m = Motion { pred_flags: pu.flags, ..Default::default() };
+        let mut m = Motion {
+            pred_flags: pu.flags,
+            ..Default::default()
+        };
         for l in 0..2 {
             if pu.flags & (1 << l) != 0 {
                 m.mv[l] = [pu.mv[l][0] as i16, pu.mv[l][1] as i16];
@@ -660,6 +715,7 @@ impl<'a> SliceDecoder<'a> {
     /// overwhelming majority of blocks), and copies an edge-extended footprint
     /// into scratch when it is not (§8.5.3.3.2's coordinate clipping).
     fn motion_compensate(&mut self, xp: usize, yp: usize, w: usize, h: usize, pu: &PuMv) -> Result<()> {
+        crate::prof_scope!(crate::prof::Stage::Mc);
         if self.ablate.mc {
             return Ok(());
         }
@@ -672,6 +728,15 @@ impl<'a> SliceDecoder<'a> {
         let pic = &mut self.pic;
 
         let weights = sh.pred_weight.as_ref();
+        // Each list's reference picture, resolved once for the whole unit. It
+        // was looked up three times per COMPONENT -- in the full-pel scan, in
+        // the interpolation loop, and again through the `refp` closure at the
+        // write -- each a bounds-checked index into the reference list.
+        let wp_off = weights.is_some() && neutral_wp_off();
+        let rp = [
+            (pu.flags & 1 != 0).then(|| &refs.l0[pu.ref_idx[0] as usize]),
+            (pu.flags & 2 != 0).then(|| &refs.l1[pu.ref_idx[1] as usize]),
+        ];
         for c in 0..3usize {
             let ss = if c == 0 { 0 } else { 1 };
             let (bw, bh) = (w >> ss, h >> ss);
@@ -684,6 +749,10 @@ impl<'a> SliceDecoder<'a> {
             let m = taps / 2 - 1;
             let (fw, fh) = (bw + taps - 1, bh + taps - 1);
 
+            // The fractional split is a property of the COMPONENT, not of the
+            // list: it was recomputed inside both per-list loops below.
+            let (frac_bits, frac_mask) = if c == 0 { (2u32, 3i32) } else { (3u32, 7i32) };
+
             // Geometry first, for every list, so the full-pel fast path below
             // can decide before any interpolation happens.
             let mut used = [false; 2];
@@ -694,7 +763,6 @@ impl<'a> SliceDecoder<'a> {
                 }
                 used[l] = true;
                 let mv = pu.mv[l];
-                let (frac_bits, frac_mask) = if c == 0 { (2u32, 3i32) } else { (3, 7) };
                 geo[l] = (
                     xb as i32 + (mv[0] >> frac_bits),
                     yb as i32 + (mv[1] >> frac_bits),
@@ -721,17 +789,14 @@ impl<'a> SliceDecoder<'a> {
             // is not weighting. Collapsing it here re-opens both the full-pel
             // fast path below and the default uni/bi writes.
             let weights = match weights {
-                Some(t) if neutral_weights(t, pu, used, c) => None,
+                Some(t) if neutral_weights(t, pu, used, c, wp_off) => None,
                 other => other,
             };
             let mut fp = [None; 2];
             if weights.is_none() && bit_depth <= 12 {
                 for l in 0..2usize {
-                    if !used[l] {
-                        continue;
-                    }
+                    let Some(r) = rp[l] else { continue };
                     let (xi, yi, fx, fy) = geo[l];
-                    let r = if l == 0 { &refs.l0[pu.ref_idx[0] as usize] } else { &refs.l1[pu.ref_idx[1] as usize] };
                     let p = &r.pic.planes[c];
                     if fx == 0 && fy == 0 && xi >= 0 && yi >= 0 && xi as usize + bw <= p.width && yi as usize + bh <= p.height {
                         fp[l] = Some((yi as usize * p.stride + xi as usize, p.stride));
@@ -740,30 +805,22 @@ impl<'a> SliceDecoder<'a> {
             }
 
             for l in 0..2usize {
-                if pu.flags & (1 << l) == 0 {
-                    continue;
-                }
                 if fp[l].is_some() {
                     continue; // resolved above; no filter, no scratch
                 }
-                let r = if l == 0 { &refs.l0[pu.ref_idx[0] as usize] } else { &refs.l1[pu.ref_idx[1] as usize] };
+                let Some(r) = rp[l] else { continue };
                 let plane = &r.pic.planes[c];
-                let mv = pu.mv[l];
-                let (frac_bits, frac_mask) = if c == 0 { (2u32, 3i32) } else { (3, 7) };
-                let xi = xb as i32 + (mv[0] >> frac_bits);
-                let yi = yb as i32 + (mv[1] >> frac_bits);
-                let fx = (mv[0] & frac_mask) as usize;
-                let fy = (mv[1] & frac_mask) as usize;
+                // `geo[l]` already holds this: the old shape recomputed the
+                // whole integer/fractional split -- two shifts, two masks and
+                // two adds -- and threw the first copy away.
+                let (xi, yi, fx, fy) = geo[l];
                 let (x0, y0) = (xi - m as i32, yi - m as i32);
 
-                let interior = x0 >= 0
-                    && y0 >= 0
-                    && (x0 as usize + fw) <= plane.width
-                    && (y0 as usize + fh) <= plane.height;
+                let interior = x0 >= 0 && y0 >= 0 && (x0 as usize + fw) <= plane.width && (y0 as usize + fh) <= plane.height;
                 let (src, stride): (&[u16], usize) = if interior {
                     (&plane.data[y0 as usize * plane.stride + x0 as usize..], plane.stride)
                 } else {
-                    if accel::census::enabled() {
+                    if accel::census::ALWAYS {
                         accel::census::bump(&accel::census::MC_EDGE_PAD, 1);
                     }
                     scratch.pad_footprint(plane, x0, y0, fw, fh);
@@ -777,14 +834,16 @@ impl<'a> SliceDecoder<'a> {
                 }
             }
 
+            // NOT a profiler scope. Timing the combine step directly needs a
+            // scope on ~2 M calls a clip, and at 545 ns of measured per-scope
+            // cost that is 1,067 ms of tax against a 436 ms reading -- the
+            // instrument would be 2.4x the quantity. Priced by census and
+            // arithmetic instead (codec-measurement §6).
             let plane = &mut pic.planes[c];
             let stride = plane.stride;
             let off = yb * stride + xb;
             let dst = &mut plane.data[off..];
-            let refp = |l: usize| -> &[u16] {
-                let r = if l == 0 { &refs.l0[pu.ref_idx[0] as usize] } else { &refs.l1[pu.ref_idx[1] as usize] };
-                &r.pic.planes[c].data
-            };
+            let refp = |l: usize| -> &[u16] { &rp[l].unwrap().pic.planes[c].data };
             match (used[0], used[1], weights) {
                 (true, false, None) | (false, true, None) => {
                     let l = if used[0] { 0 } else { 1 };

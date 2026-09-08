@@ -1,0 +1,27 @@
+[package]
+name = "hevc-duel"
+description = "Side-by-side live HEVC decoder comparison — a demo, not a benchmark."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+# A local demo. It shells out to whatever decoders you point it at, so it has
+# no business on the registry.
+publish = false
+
+[[bin]]
+name = "hevc-duel"
+path = "src/main.rs"
+
+[dependencies]
+# Frames reach the browser as JPEG. Encoding happens on a display thread that
+# samples the latest frame, never in the decode path being timed.
+rusty_jpeg.workspace = true
+
+# `GetProcessTimes` on each decoder child. CPU time is the one quantity that
+# survives real-time pacing: it accrues only while the process actually runs, so
+# it measures work rather than wall time or pipe buffering.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }

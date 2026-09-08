@@ -22,7 +22,7 @@
 //! For the dense case (`nz_w = nz_h = n`) this is exactly the old arithmetic,
 //! so the conformance suite gates both regimes at once.
 
-use crate::tables::{DCT32, DST4, LEVEL_SCALE};
+use crate::tables::{DCT32, DST4_PAD, LEVEL_SCALE};
 use rusty_h265_accel as accel;
 
 pub const COEFF_MIN: i32 = -32768;
@@ -62,14 +62,6 @@ pub fn dequant(coeffs: &mut [i32], n: usize, nz_w: usize, nz_h: usize, qp: i32, 
 /// Bring-up switch: `RH265_NO_DC_FAST=1` sends DC-only blocks down the general
 /// transform, so the collapse can be A/B'd inside one binary. Default OFF —
 /// the fast path ships.
-/// `RH265_NAIVE_IDCT=1` runs the naive `N²` sums instead of the butterfly.
-/// Diagnostic only; read once per block by `inverse_transform`.
-fn naive_idct() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("RH265_NAIVE_IDCT").is_some())
-}
-
 fn no_dc_fast() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var_os("RH265_NO_DC_FAST").is_some())
@@ -111,62 +103,57 @@ fn no_dc_fast() -> bool {
 /// read. That keeps the routine scratch-free, which matters: a per-call
 /// temporary here would be paid once per row and column of every transform
 /// block.
+/// The butterfly's partial sums, FLATTENED.
+///
+/// Written recursively this is three nested calls for a 32-point transform,
+/// each with its own prologue, slice reborrow and epilogue, for a descent whose
+/// only per-level state is derivable: level `d` has size `n >> d`, stride
+/// `s_in << d` and table step `32 / (n >> d)`. Only `nz` needs carrying,
+/// because it halves with a `div_ceil` and clamps to the level's size. So: walk
+/// down recording `nz`, do the 4-point base once, then unwind.
+///
+/// ## The instrument that got this wrong
+///
+/// Measured by STATIC instruction count -- the size of the emitted body -- this
+/// looks like a regression: 94 -> 117, and it was briefly reverted on that
+/// basis. The count is real and the inference was not. Turning a recursion into
+/// a loop grows the body BY CONSTRUCTION, because the callee's work moves
+/// inline; what executes loses three call prologues and epilogues.
+///
+/// Static size is a good proxy for a kernel's inner loop and a poor one for
+/// restructuring a call graph. The clock, at 31 pairs: **21/30 for flattened on
+/// all-intra (0.996x, z = -2.19)** and 14/21 on mainstream (1.000x, z = -1.53).
+/// Never slower, marginally faster where the transform is hottest.
 fn idct_sums(src: &[i32], s_in: usize, n: usize, nz: usize, out: &mut [i32]) {
-    // `32 / n` with n a power of two.
-    let step = 32 >> n.trailing_zeros();
-    let nz = nz.min(n);
-    if n == 4 {
-        out[..4].fill(0);
-        for k in 0..nz {
-            let c = src[k * s_in];
-            if c == 0 {
-                continue;
-            }
-            let row = &DCT32[k * step];
-            for j in 0..4 {
-                out[j] += c * row[j] as i32;
-            }
+    let levels = n.trailing_zeros() as usize - 2; // 4 -> 0, 8 -> 1, 16 -> 2, 32 -> 3
+    let mut nzs = [0usize; 4];
+    let mut z = nz.min(n);
+    let mut m = n;
+    for slot in nzs.iter_mut().take(levels + 1) {
+        *slot = z;
+        if m > 4 {
+            m /= 2;
+            z = z.div_ceil(2).min(m);
         }
-        return;
     }
-    let half = n / 2;
-    // Even coefficients, at twice the stride, are the (N/2)-point transform.
-    idct_sums(src, 2 * s_in, half, nz.div_ceil(2), &mut out[..half]);
 
-    // The odd part, accumulated COEFFICIENT-OUTER rather than output-outer.
-    //
-    // Written the other way round -- `for j { for k { odd += c * T[k][j] } }` --
-    // every one of the N²/4 inner steps reloads `src[k * s_in]`, recomputes the
-    // row address `k * step`, and re-tests `c != 0`, and it walks the table
-    // DOWN a column, which is a stride of 32 `i16`. None of that is the
-    // arithmetic; all of it is per-(j,k) instead of per-k.
-    //
-    // Interchanged, each coefficient is loaded once, its row address is formed
-    // once, the zero test skips a whole row instead of one product, and the
-    // inner loop is a contiguous scan of `T[k][..]` -- which is the shape a
-    // vector unit wants.
-    let mut odd = [0i32; 16];
-    let mut k = 1;
-    while k < nz {
-        let c = src[k * s_in];
-        if c != 0 {
-            let row = &DCT32[k * step];
-            for j in 0..half {
-                odd[j] += c * row[j] as i32;
-            }
-        }
-        k += 2;
-    }
-    for j in 0..half {
-        let even = out[j];
-        out[j] = even + odd[j];
-        out[n - 1 - j] = even - odd[j];
+    let tab = DCT32.as_flattened();
+    // The base: a 4-point transform of the deepest even sub-sequence.
+    accel::itx::accum(&mut out[..4], src, s_in << levels, tab, 8, 0, 1, nzs[levels], 4);
+    // Unwind. Each level adds its odd part and combines, in one fused pass.
+    for d in (0..levels).rev() {
+        let m = n >> d;
+        accel::itx::accum_butterfly(&mut out[..m], src, s_in << d, tab, 32 >> m.trailing_zeros(), nzs[d], m);
     }
 }
 
-/// The naive `N²` form. Kept as the oracle for [`idct_sums`], and reachable at
-/// runtime via `RH265_NAIVE_IDCT=1` so the butterfly can be A/B'd inside one
-/// binary.
+/// The naive `N²` form -- the permanent oracle for [`idct_sums`].
+///
+/// Test-only. It used to be reachable at runtime through `RH265_NAIVE_IDCT`,
+/// which meant a branch inside `idct_1d` on every 1-D transform, for a switch
+/// whose one job was a butterfly A/B that has long since been recorded.
+/// `butterfly_matches_naive` compares the two functions directly instead.
+#[cfg(test)]
 fn idct_sums_naive(src: &[i32], s_in: usize, n: usize, nz: usize, out: &mut [i32]) {
     let step = 32 >> n.trailing_zeros();
     for (j, o) in out[..n].iter_mut().enumerate() {
@@ -185,25 +172,31 @@ fn idct_sums_naive(src: &[i32], s_in: usize, n: usize, nz: usize, out: &mut [i32
 /// `dst` (stride `s_out`), reading `nz` inputs, `shift` with rounding, clipped
 /// to 16 bits when `clip` (the first stage).
 #[inline]
-fn idct_1d<const CLIP: bool>(src: &[i32], s_in: usize, dst: &mut [i32], s_out: usize, n: usize, nz: usize, shift: u32, naive: bool) {
+fn idct_1d<const CLIP: bool>(src: &[i32], s_in: usize, dst: &mut [i32], s_out: usize, n: usize, nz: usize, shift: u32) {
     // `i32`, not `i64`. The accumulator's worst case is 61,014,016 against an
     // `i32` ceiling of 2,147,483,647 -- 35x of headroom, asserted from the table
     // itself by `transform_accumulator_fits_i32`. The `i64` it replaced cost a
     // widening conversion per coefficient, double the register pressure, and
     // half the lanes of any vector form of the loop above.
+    // No runtime `naive` branch. It selected the naive N^2 sums for a one-off
+    // A/B of the butterfly, and cost a test per 1-D transform ever after --
+    // millions a picture. `butterfly_matches_naive` compares the two functions
+    // directly, which is where that comparison belongs.
     let mut sums = [0i32; 32];
-    if naive {
-        idct_sums_naive(src, s_in, n, nz, &mut sums[..n]);
+    idct_sums(src, s_in, n, nz, &mut sums[..n]);
+    // `CLIP` is a const generic: the first pass clips to the coefficient range
+    // and the second does not, and which one it is was a runtime bool tested
+    // once per OUTPUT SAMPLE.
+    if s_out == 1 {
+        // The row pass -- `n` transforms per block against the column pass's
+        // `nz_w`, so the contiguous case is the majority of the population.
+        accel::itx::shift_clip::<CLIP>(&mut dst[..n], &sums[..n], n, shift, COEFF_MIN, COEFF_MAX);
     } else {
-        idct_sums(src, s_in, n, nz, &mut sums[..n]);
-    }
-    let add = 1i32 << (shift - 1);
-    for i in 0..n {
-        let v = (sums[i] + add) >> shift;
-        // `CLIP` is a const generic: the first pass clips to the coefficient
-        // range and the second does not, and which one it is was a runtime bool
-        // tested once per OUTPUT SAMPLE.
-        dst[i * s_out] = if CLIP { v.clamp(COEFF_MIN, COEFF_MAX) } else { v };
+        let add = 1i32 << (shift - 1);
+        for i in 0..n {
+            let v = (sums[i] + add) >> shift;
+            dst[i * s_out] = if CLIP { v.clamp(COEFF_MIN, COEFF_MAX) } else { v };
+        }
     }
 }
 
@@ -216,21 +209,16 @@ fn idst_1d<const CLIP: bool>(src: &[i32], s_in: usize, dst: &mut [i32], s_out: u
     // Same interchange as the DCT: one load and one zero-test per coefficient
     // instead of per product, and a contiguous row scan. Row 1 carries a zero,
     // so a third of its products were already nothing.
-    let add = 1i32 << (shift - 1);
     let mut sum = [0i32; 4];
-    for k in 0..nz.min(4) {
-        let c = src[k * s_in];
-        if c == 0 {
-            continue;
-        }
-        let row = &DST4[k];
+    accel::itx::accum(&mut sum, src, s_in, DST4_PAD.as_flattened(), 1, 0, 1, nz.min(4), 4);
+    if s_out == 1 {
+        accel::itx::shift_clip::<CLIP>(&mut dst[..4], &sum, 4, shift, COEFF_MIN, COEFF_MAX);
+    } else {
+        let add = 1i32 << (shift - 1);
         for i in 0..4 {
-            sum[i] += c * row[i] as i32;
+            let v = (sum[i] + add) >> shift;
+            dst[i * s_out] = if CLIP { v.clamp(COEFF_MIN, COEFF_MAX) } else { v };
         }
-    }
-    for i in 0..4 {
-        let v = (sum[i] + add) >> shift;
-        dst[i * s_out] = if CLIP { v.clamp(COEFF_MIN, COEFF_MAX) } else { v };
     }
 }
 
@@ -264,21 +252,20 @@ pub fn inverse_transform(d: &mut [i32], tmp: &mut [i32], n: usize, nz_w: usize, 
         // taken to its limit: the DST is excluded because `DST4[0]` is
         // `[29, 55, 74, 84]`, not a constant.
         TransformKind::Dct if nz_w.max(1) == 1 && nz_h.max(1) == 1 && !no_dc_fast() => {
-            accel::census::arm(&accel::census::RT_TX_DC_ONLY);
+            if accel::census::ALWAYS {
+                accel::census::arm(&accel::census::RT_TX_DC_ONLY);
+            }
             let v1 = (((d[0] as i64 * 64 + 64) >> 7) as i32).clamp(COEFF_MIN, COEFF_MAX);
             let add = 1i64 << (bd_shift - 1);
             let out = ((v1 as i64 * 64 + add) >> bd_shift) as i32;
             d[..n * n].fill(out);
         }
         TransformKind::Dct | TransformKind::Dst => {
-            accel::census::arm(&accel::census::RT_TX_GENERAL);
+            if accel::census::ALWAYS {
+                accel::census::arm(&accel::census::RT_TX_GENERAL);
+            }
             let nz_w = nz_w.clamp(1, n);
             let nz_h = nz_h.clamp(1, n);
-            // Read ONCE per block, not once per 1-D transform. It used to sit
-            // inside `idct_1d`, which runs `nz_w + n` times per block and
-            // millions of times per picture, so a diagnostic switch was paying
-            // an atomic load on the hot path.
-            let naive = naive_idct();
             // Stage 1: columns. Only the first `nz_w` can hold anything; the
             // rest of the intermediate stays zero, which the row pass then
             // skips through `nz_w`.
@@ -286,7 +273,7 @@ pub fn inverse_transform(d: &mut [i32], tmp: &mut [i32], n: usize, nz_w: usize, 
                 if kind == TransformKind::Dst {
                     idst_1d::<true>(&d[x..], n, &mut tmp[x..], n, nz_h, 7);
                 } else {
-                    idct_1d::<true>(&d[x..], n, &mut tmp[x..], n, n, nz_h, 7, naive);
+                    idct_1d::<true>(&d[x..], n, &mut tmp[x..], n, n, nz_h, 7);
                 }
             }
             // Stage 2: rows, over the `nz_w` inputs each row can have.
@@ -294,7 +281,7 @@ pub fn inverse_transform(d: &mut [i32], tmp: &mut [i32], n: usize, nz_w: usize, 
                 if kind == TransformKind::Dst {
                     idst_1d::<false>(&tmp[y * n..], 1, &mut d[y * n..], 1, nz_w, bd_shift);
                 } else {
-                    idct_1d::<false>(&tmp[y * n..], 1, &mut d[y * n..], 1, n, nz_w, bd_shift, naive);
+                    idct_1d::<false>(&tmp[y * n..], 1, &mut d[y * n..], 1, n, nz_w, bd_shift);
                 }
             }
         }
@@ -324,7 +311,7 @@ mod tests {
     fn sparse_bounds_match_dense() {
         let mut tmp = vec![0i32; 32 * 32];
         let mut st = 0x1234_5678u32;
-        let mut rnd = |s: &mut u32| {
+        let rnd = |s: &mut u32| {
             *s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             ((*s >> 16) as i32 & 0x1ff) - 256
         };
@@ -427,7 +414,7 @@ mod tests {
     #[test]
     fn butterfly_matches_naive() {
         let mut st = 0x51ee_7a11u32;
-        let mut rnd = |s: &mut u32| {
+        let rnd = |s: &mut u32| {
             *s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             ((*s >> 8) as i32 % 65536) - 32768
         };
@@ -484,16 +471,9 @@ mod tests {
     /// hand-derived number, so regenerating `DCT32` cannot silently invalidate it.
     #[test]
     fn transform_accumulator_fits_i32() {
-        let worst_col = (0..32)
-            .map(|j| (0..32).map(|k| (DCT32[k][j] as i64).abs()).sum::<i64>())
-            .max()
-            .unwrap();
+        let worst_col = (0..32).map(|j| (0..32).map(|k| (DCT32[k][j] as i64).abs()).sum::<i64>()).max().unwrap();
         let worst = COEFF_MAX.max(-COEFF_MIN) as i64 * worst_col;
-        assert!(
-            worst <= i32::MAX as i64,
-            "accumulator needs i64: worst case {worst} against {}",
-            i32::MAX
-        );
+        assert!(worst <= i32::MAX as i64, "accumulator needs i64: worst case {worst} against {}", i32::MAX);
         // Record the margin, so a future table change that eats it fails here
         // rather than wrapping silently in the kernel.
         let headroom = i32::MAX as i64 / worst;

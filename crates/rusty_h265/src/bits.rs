@@ -28,12 +28,7 @@ pub struct BitReader<'a> {
 impl<'a> BitReader<'a> {
     /// Wraps an RBSP byte slice.
     pub fn new(data: &'a [u8]) -> Self {
-        let stop_pos = data
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, &b)| b != 0)
-            .map_or(0, |(bi, &b)| bi * 8 + (7 - b.trailing_zeros() as usize));
+        let stop_pos = data.iter().enumerate().rev().find(|(_, &b)| b != 0).map_or(0, |(bi, &b)| bi * 8 + (7 - b.trailing_zeros() as usize));
         Self { data, pos: 0, stop_pos }
     }
 

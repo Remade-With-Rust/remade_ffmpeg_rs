@@ -148,20 +148,37 @@ fn frame_to_rff(f: &rusty_h265::Frame) -> Frame {
     };
     let mut planes = Vec::with_capacity(3);
     let mut strides = Vec::with_capacity(3);
+    // A row at a time through a scratch, not a sample at a time into the output.
+    //
+    // Appending each narrowed sample straight to the plane `Vec` puts a capacity
+    // check and a length update on every one of them, which is what stops the
+    // u16 -> u8 narrowing from vectorising. Measured on the decoder's own
+    // serialiser (`Frame::write_yuv`, the same shape), that cost 5.4% of whole
+    // decode -- 15/15, z = 3.87 -- on a path no decoder benchmark covers,
+    // because they all decode to `-`.
+    let mut scratch: Vec<u8> = Vec::new();
     for (i, plane) in pic.planes.iter().enumerate() {
         let (x0, y0, w, h) = if i == 0 { (cx, cy, cw, ch) } else { (cx / sw, cy / sh, cw / sw, ch / sh) };
-        let mut out = Vec::with_capacity(w * h * if wide { 2 } else { 1 });
-        for y in y0..y0 + h {
-            let row = &plane.data[y * plane.stride + x0..y * plane.stride + x0 + w];
-            if wide {
-                for &v in row {
-                    out.extend_from_slice(&v.to_le_bytes());
+        let bpp = if wide { 2 } else { 1 };
+        let mut out = Vec::with_capacity(w * h * bpp);
+        if w > 0 && h > 0 {
+            scratch.clear();
+            scratch.resize(w * bpp, 0);
+            for y in y0..y0 + h {
+                let row = &plane.data[y * plane.stride + x0..y * plane.stride + x0 + w];
+                if wide {
+                    for (d, &v) in scratch.chunks_exact_mut(2).zip(row) {
+                        d.copy_from_slice(&v.to_le_bytes());
+                    }
+                } else {
+                    for (d, &v) in scratch.iter_mut().zip(row) {
+                        *d = v as u8;
+                    }
                 }
-            } else {
-                out.extend(row.iter().map(|&v| v as u8));
+                out.extend_from_slice(&scratch);
             }
         }
-        strides.push(w * if wide { 2 } else { 1 });
+        strides.push(w * bpp);
         planes.push(out);
     }
     let format = match (pic.chroma_format_idc, wide) {

@@ -27,6 +27,13 @@ fn scalar_gate() -> bool {
 // Scalar reference
 // ---------------------------------------------------------------------------
 
+/// `#[cold]`: the SIMD guard above it succeeds on every block of a conformant
+/// stream -- the `*_SCALAR` census counters read 0 across the corpus -- so this
+/// is the fallback for a shape the kernels decline, not a path decode takes.
+/// Inlined it padded the dispatcher, which IS on the hot path, with a body that
+/// never runs. Same reason `Cabac::refill_tail` is out of line.
+#[cold]
+#[inline(never)]
 fn put_uni_scalar(dst: &mut [u16], dst_stride: usize, src: &[i16], w: usize, h: usize, bit_depth: u8) {
     let shift = 14u32 - bit_depth as u32;
     let off = 1i32 << (shift - 1);
@@ -40,6 +47,13 @@ fn put_uni_scalar(dst: &mut [u16], dst_stride: usize, src: &[i16], w: usize, h: 
     }
 }
 
+/// `#[cold]`: the SIMD guard above it succeeds on every block of a conformant
+/// stream -- the `*_SCALAR` census counters read 0 across the corpus -- so this
+/// is the fallback for a shape the kernels decline, not a path decode takes.
+/// Inlined it padded the dispatcher, which IS on the hot path, with a body that
+/// never runs. Same reason `Cabac::refill_tail` is out of line.
+#[cold]
+#[inline(never)]
 fn put_bi_scalar(dst: &mut [u16], dst_stride: usize, a: &[i16], b: &[i16], w: usize, h: usize, bit_depth: u8) {
     let shift = 15u32 - bit_depth as u32;
     let off = 1i32 << (shift - 1);
@@ -53,6 +67,13 @@ fn put_bi_scalar(dst: &mut [u16], dst_stride: usize, a: &[i16], b: &[i16], w: us
     }
 }
 
+/// `#[cold]`: the SIMD guard above it succeeds on every block of a conformant
+/// stream -- the `*_SCALAR` census counters read 0 across the corpus -- so this
+/// is the fallback for a shape the kernels decline, not a path decode takes.
+/// Inlined it padded the dispatcher, which IS on the hot path, with a body that
+/// never runs. Same reason `Cabac::refill_tail` is out of line.
+#[cold]
+#[inline(never)]
 fn add_residual_scalar(dst: &mut [u16], dst_stride: usize, res: &[i32], w: usize, h: usize, max: i32) {
     for y in 0..h {
         let row = &mut dst[y * dst_stride..y * dst_stride + w];
@@ -80,7 +101,39 @@ fn add_residual_scalar(dst: &mut [u16], dst_stride: usize, res: &[i32], w: usize
 /// exactly, for any `k >= 1`; and the clamp is a no-op because `s` is already a
 /// sample. So an integer motion vector with no weighting needs neither kernel —
 /// it needs a rectangle copy.
+// NOT `#[cold]`, unlike its siblings: `copy_block` has no vector path at all
+// -- a per-row `copy_from_slice` is already the best primitive -- so this is
+// the ONLY path, taken on every full-pel uni-predicted block. Outlining it
+// took `copy_block` from 56 instructions to 1, which is the tell: the work
+// moved behind a jump instead of leaving the hot path.
 fn copy_block_scalar(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize) {
+    // The row width is dispatched to a CONSTANT before it is copied.
+    //
+    // `copy_from_slice` with a runtime length is an opaque `call memcpy`, and
+    // these rows are prediction-block widths: 4 to 64 samples, so 8 to 128
+    // BYTES. At that size the call is the whole cost -- and `copy_block` runs
+    // 71,413 times on a 20-second clip, once per full-pel uni-predicted block
+    // per component, each doing `h` of them. A constant length inlines to one
+    // to four vector load/store pairs instead.
+    macro_rules! rows {
+        ($k:literal) => {{
+            for y in 0..h {
+                let (d, s) = (y * dst_stride, y * src_stride);
+                if let (Some(a), Some(b)) = (dst[d..].first_chunk_mut::<$k>(), src[s..].first_chunk::<$k>()) {
+                    *a = *b;
+                }
+            }
+            return;
+        }};
+    }
+    match w {
+        4 => rows!(4),
+        8 => rows!(8),
+        16 => rows!(16),
+        32 => rows!(32),
+        64 => rows!(64),
+        _ => {}
+    }
     for y in 0..h {
         dst[y * dst_stride..y * dst_stride + w].copy_from_slice(&src[y * src_stride..y * src_stride + w]);
     }
@@ -96,6 +149,12 @@ fn copy_block_scalar(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride
 /// ```
 ///
 /// which is exactly what `pavgw` computes, in one instruction.
+/// `#[cold]`: the SIMD guard above it succeeds on every block of a conformant
+/// stream, so this is the fallback for a shape the kernels decline, not a path
+/// decode takes. Marked as a SET with its siblings: outlining ONE exit while
+/// others stay inlined buys the argument marshalling and none of the locality.
+#[cold]
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn avg_block_scalar(dst: &mut [u16], dst_stride: usize, a: &[u16], a_stride: usize, b: &[u16], b_stride: usize, w: usize, h: usize) {
     for y in 0..h {
@@ -120,6 +179,12 @@ fn avg_block_scalar(dst: &mut [u16], dst_stride: usize, a: &[u16], a_stride: usi
 /// Folding it removes a full pass over the block. The two remaining full-pel
 /// cases already collapse further: both lists full-pel is [`avg_block`], and
 /// uni-prediction is [`copy_block`].
+/// `#[cold]`: the SIMD guard above it succeeds on every block of a conformant
+/// stream, so this is the fallback for a shape the kernels decline, not a path
+/// decode takes. Marked as a SET with its siblings: outlining ONE exit while
+/// others stay inlined buys the argument marshalling and none of the locality.
+#[cold]
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn put_bi_fp_scalar(dst: &mut [u16], dst_stride: usize, s: &[u16], s_stride: usize, b: &[i16], w: usize, h: usize, bit_depth: u8) {
     let k = 14i32 - bit_depth as i32;
@@ -147,6 +212,12 @@ fn put_bi_fp_scalar(dst: &mut [u16], dst_stride: usize, s: &[u16], s_stride: usi
 /// which needs neither the fill nor the load — one pass instead of two, and the
 /// predicted block never reaches memory. The caller only skips the fill when a
 /// residual is known to follow, so the two stay in step.
+/// `#[cold]`: the SIMD guard above it succeeds on every block of a conformant
+/// stream, so this is the fallback for a shape the kernels decline, not a path
+/// decode takes. Marked as a SET with its siblings: outlining ONE exit while
+/// others stay inlined buys the argument marshalling and none of the locality.
+#[cold]
+#[inline(never)]
 fn add_residual_const_scalar(dst: &mut [u16], dst_stride: usize, dc: u16, res: &[i32], w: usize, h: usize, max: i32) {
     for y in 0..h {
         for x in 0..w {
@@ -164,6 +235,12 @@ fn add_residual_const_scalar(dst: &mut [u16], dst_stride: usize, dc: u16, res: &
 /// and `denom ≤ 7`, and the rounding term is at most `2^12`. Pairing `(x, 1)`
 /// against `(w, round)` therefore computes `x·w + round` exactly in one
 /// instruction, which is what makes this worth vectorising at all.
+/// `#[cold]`: the SIMD guard above it succeeds on every block of a conformant
+/// stream, so this is the fallback for a shape the kernels decline, not a path
+/// decode takes. Marked as a SET with its siblings: outlining ONE exit while
+/// others stay inlined buys the argument marshalling and none of the locality.
+#[cold]
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn weighted_uni_scalar(dst: &mut [u16], dst_stride: usize, src: &[i16], w: usize, h: usize, wt: i32, off: i32, log2wd: i32, max: i32) {
     for y in 0..h {
@@ -181,6 +258,12 @@ fn weighted_uni_scalar(dst: &mut [u16], dst_stride: usize, src: &[i16], w: usize
 ///
 /// Interleaving the two predictions puts `x` and `z` in adjacent lanes, so a
 /// single `pmaddwd` against `(w0, w1)` is the whole weighted sum.
+/// `#[cold]`: the SIMD guard above it succeeds on every block of a conformant
+/// stream, so this is the fallback for a shape the kernels decline, not a path
+/// decode takes. Marked as a SET with its siblings: outlining ONE exit while
+/// others stay inlined buys the argument marshalling and none of the locality.
+#[cold]
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn weighted_bi_scalar(dst: &mut [u16], dst_stride: usize, a: &[i16], b: &[i16], w: usize, h: usize, w0: i32, w1: i32, obias: i32, log2wd: i32, max: i32) {
     for y in 0..h {
@@ -202,6 +285,12 @@ fn weighted_bi_scalar(dst: &mut [u16], dst_stride: usize, a: &[i16], b: &[i16], 
 /// This is the Great Gate's decoder rule in one function: a population of
 /// streams served by a slow path is a missing kernel, and the population is
 /// what tells you it exists — the site looks cold from any single stream.
+/// `#[cold]`: the SIMD guard above it succeeds on every block of a conformant
+/// stream, so this is the fallback for a shape the kernels decline, not a path
+/// decode takes. Marked as a SET with its siblings: outlining ONE exit while
+/// others stay inlined buys the argument marshalling and none of the locality.
+#[cold]
+#[inline(never)]
 fn transform_skip_scalar(d: &mut [i32], n: usize, shift: u32) {
     let add = 1i32 << (shift - 1);
     for v in d[..n * n].iter_mut() {
@@ -248,6 +337,20 @@ mod x86 {
                 unsafe { _mm_storeu_si128(d.add(x) as *mut __m128i, v) };
             }
             let mut x = nvec * 8;
+            // A 4-wide step before the scalar tail.
+            //
+            // `nvec = w / 8`, so a 4-wide block skipped both vector loops and
+            // ran the scalar tail for every sample. In 4:2:0 the chroma block of
+            // an 8x8 luma PU is 4 wide, and the census puts 18.3% of
+            // pixel-kernel samples on intra-heavy content in blocks narrower
+            // than 8. `movq` moves exactly four `i16`.
+            if x + 4 <= w {
+                let v = unsafe { _mm_loadl_epi64(s.add(x) as *const __m128i) };
+                let v = _mm_sra_epi16(_mm_adds_epi16(v, off), sh);
+                let v = _mm_min_epi16(_mm_max_epi16(v, zero), maxv);
+                unsafe { _mm_storel_epi64(d.add(x) as *mut __m128i, v) };
+                x += 4;
+            }
             while x < w {
                 let v = unsafe { *s.add(x) } as i32;
                 let r = ((v + (1 << (shift - 1))) >> shift).clamp(0, (1 << bit_depth) - 1);
@@ -293,6 +396,14 @@ mod x86 {
                 unsafe { _mm_storeu_si128(d.add(x) as *mut __m128i, v) };
             }
             let mut x = nvec * 8;
+            if x + 4 <= w {
+                let va = unsafe { _mm_loadl_epi64(pa.add(x) as *const __m128i) };
+                let vb = unsafe { _mm_loadl_epi64(pb.add(x) as *const __m128i) };
+                let v = _mm_sra_epi16(_mm_adds_epi16(_mm_adds_epi16(va, vb), off), sh);
+                let v = _mm_min_epi16(_mm_max_epi16(v, zero), maxv);
+                unsafe { _mm_storel_epi64(d.add(x) as *mut __m128i, v) };
+                x += 4;
+            }
             while x < w {
                 let v = unsafe { *pa.add(x) } as i32 + unsafe { *pb.add(x) } as i32;
                 let r = ((v + (1 << (shift - 1))) >> shift).clamp(0, (1 << bit_depth) - 1);
@@ -338,6 +449,14 @@ mod x86 {
                 unsafe { _mm_storeu_si128(d.add(x) as *mut __m128i, v) };
             }
             let mut x = nvec * 8;
+            if x + 4 <= w {
+                // Four `i32` residuals narrow to `i16` and add to four samples.
+                let p = _mm_packs_epi32(unsafe { _mm_loadu_si128(r.add(x) as *const __m128i) }, _mm_setzero_si128());
+                let v = _mm_adds_epi16(unsafe { _mm_loadl_epi64(d.add(x) as *const __m128i) }, p);
+                let v = _mm_min_epi16(_mm_max_epi16(v, zero), maxv);
+                unsafe { _mm_storel_epi64(d.add(x) as *mut __m128i, v) };
+                x += 4;
+            }
             while x < w {
                 let v = unsafe { *d.add(x) } as i32 + unsafe { *r.add(x) };
                 unsafe { *d.add(x) = v.clamp(0, max) as u16 };
@@ -350,6 +469,17 @@ mod x86 {
     /// As [`put_uni_sse2`].
     #[target_feature(enable = "avx2")]
     pub unsafe fn put_uni_avx2(dst: *mut u16, dst_stride: usize, src: *const i16, w: usize, h: usize, bit_depth: u8) {
+        // Narrow blocks: ONE call for the whole block, not one per row.
+        //
+        // These kernels step 16 or 32 samples, so for `w < 16` every row fell
+        // through to the SSE2 kernel -- a separate call per row, each rebuilding
+        // all four broadcast constants. 31% of pixel-kernel samples on
+        // intra-heavy content are 8 wide.
+        if w < 16 {
+            // SAFETY: same footprint, one call instead of `h`.
+            return unsafe { put_uni_sse2(dst, dst_stride, src, w, h, bit_depth) };
+        }
+
         let shift = 14i32 - bit_depth as i32;
         let off = _mm256_set1_epi16((1i16) << (shift - 1));
         let maxv = _mm256_set1_epi16(((1i32 << bit_depth) - 1) as i16);
@@ -395,6 +525,17 @@ mod x86 {
     /// As [`put_bi_sse2`].
     #[target_feature(enable = "avx2")]
     pub unsafe fn put_bi_avx2(dst: *mut u16, dst_stride: usize, a: *const i16, b: *const i16, w: usize, h: usize, bit_depth: u8) {
+        // Narrow blocks: ONE call for the whole block, not one per row.
+        //
+        // These kernels step 16 or 32 samples, so for `w < 16` every row fell
+        // through to the SSE2 kernel -- a separate call per row, each rebuilding
+        // all four broadcast constants. 31% of pixel-kernel samples on
+        // intra-heavy content are 8 wide.
+        if w < 16 {
+            // SAFETY: same footprint, one call instead of `h`.
+            return unsafe { put_bi_sse2(dst, dst_stride, a, b, w, h, bit_depth) };
+        }
+
         let shift = 15i32 - bit_depth as i32;
         let off = _mm256_set1_epi16((1i16) << (shift - 1));
         let maxv = _mm256_set1_epi16(((1i32 << bit_depth) - 1) as i16);
@@ -410,8 +551,16 @@ mod x86 {
             let npair = w / 32;
             for i in 0..npair {
                 let x = i * 32;
-                let a = _mm256_adds_epi16(_mm256_adds_epi16(unsafe { _mm256_loadu_si256(pa.add(x) as *const __m256i) }, unsafe { _mm256_loadu_si256(pb.add(x) as *const __m256i) }), off);
-                let b = _mm256_adds_epi16(_mm256_adds_epi16(unsafe { _mm256_loadu_si256(pa.add(x + 16) as *const __m256i) }, unsafe { _mm256_loadu_si256(pb.add(x + 16) as *const __m256i) }), off);
+                let a = _mm256_adds_epi16(
+                    _mm256_adds_epi16(unsafe { _mm256_loadu_si256(pa.add(x) as *const __m256i) }, unsafe { _mm256_loadu_si256(pb.add(x) as *const __m256i) }),
+                    off,
+                );
+                let b = _mm256_adds_epi16(
+                    _mm256_adds_epi16(unsafe { _mm256_loadu_si256(pa.add(x + 16) as *const __m256i) }, unsafe {
+                        _mm256_loadu_si256(pb.add(x + 16) as *const __m256i)
+                    }),
+                    off,
+                );
                 let a = _mm256_min_epi16(_mm256_max_epi16(_mm256_sra_epi16(a, sh), zero), maxv);
                 let b = _mm256_min_epi16(_mm256_max_epi16(_mm256_sra_epi16(b, sh), zero), maxv);
                 unsafe {
@@ -439,6 +588,17 @@ mod x86 {
     /// As [`add_residual_sse2`].
     #[target_feature(enable = "avx2")]
     pub unsafe fn add_residual_avx2(dst: *mut u16, dst_stride: usize, res: *const i32, w: usize, h: usize, max: i32) {
+        // Narrow blocks: ONE call for the whole block, not one per row.
+        //
+        // These kernels step 16 or 32 samples, so for `w < 16` every row fell
+        // through to the SSE2 kernel -- a separate call per row, each rebuilding
+        // all four broadcast constants. 31% of pixel-kernel samples on
+        // intra-heavy content are 8 wide.
+        if w < 16 {
+            // SAFETY: same footprint, one call instead of `h`.
+            return unsafe { add_residual_sse2(dst, dst_stride, res, w, h, max) };
+        }
+
         let maxv = _mm256_set1_epi16(max as i16);
         let zero = _mm256_setzero_si256();
         for y in 0..h {
@@ -455,7 +615,9 @@ mod x86 {
                     0b11_01_10_00,
                 );
                 let pb = _mm256_permute4x64_epi64(
-                    _mm256_packs_epi32(unsafe { _mm256_loadu_si256(r.add(x + 16) as *const __m256i) }, unsafe { _mm256_loadu_si256(r.add(x + 24) as *const __m256i) }),
+                    _mm256_packs_epi32(unsafe { _mm256_loadu_si256(r.add(x + 16) as *const __m256i) }, unsafe {
+                        _mm256_loadu_si256(r.add(x + 24) as *const __m256i)
+                    }),
                     0b11_01_10_00,
                 );
                 let va = _mm256_adds_epi16(unsafe { _mm256_loadu_si256(d.add(x) as *const __m256i) }, pa);
@@ -506,6 +668,12 @@ mod x86 {
                 let vb = unsafe { _mm_loadu_si128(pb.add(x) as *const __m128i) };
                 unsafe { _mm_storeu_si128(d.add(x) as *mut __m128i, _mm_avg_epu16(va, vb)) };
                 x += 8;
+            }
+            if x + 4 <= w {
+                let va = unsafe { _mm_loadl_epi64(pa.add(x) as *const __m128i) };
+                let vb = unsafe { _mm_loadl_epi64(pb.add(x) as *const __m128i) };
+                unsafe { _mm_storel_epi64(d.add(x) as *mut __m128i, _mm_avg_epu16(va, vb)) };
+                x += 4;
             }
             while x < w {
                 unsafe { *d.add(x) = ((*pa.add(x) as u32 + *pb.add(x) as u32 + 1) >> 1) as u16 };
@@ -564,6 +732,28 @@ mod x86 {
                 unsafe { _mm256_storeu_si256(d.add(x) as *mut __m256i, v) };
             }
             let mut x = nvec * 16;
+            // Narrow blocks. `nvec = w / 16`, so everything under 16 samples
+            // wide fell to the SCALAR tail -- and the census puts 18.3% of
+            // pixel-kernel samples on intra-heavy content in blocks narrower
+            // than 8, with another 31% exactly 8 wide (4:2:0 chroma of an 8x8
+            // luma PU is 4 wide). 128- and 64-bit steps cover both.
+            let off8 = _mm_set1_epi16((1i16) << (shift - 1));
+            let max8 = _mm_set1_epi16(((1i32 << bit_depth) - 1) as i16);
+            let z8 = _mm_setzero_si128();
+            while x + 8 <= w {
+                let a = _mm_sll_epi16(unsafe { _mm_loadu_si128(ps.add(x) as *const __m128i) }, kv);
+                let v = _mm_adds_epi16(_mm_adds_epi16(a, unsafe { _mm_loadu_si128(pb.add(x) as *const __m128i) }), off8);
+                let v = _mm_min_epi16(_mm_max_epi16(_mm_sra_epi16(v, sh), z8), max8);
+                unsafe { _mm_storeu_si128(d.add(x) as *mut __m128i, v) };
+                x += 8;
+            }
+            if x + 4 <= w {
+                let a = _mm_sll_epi16(unsafe { _mm_loadl_epi64(ps.add(x) as *const __m128i) }, kv);
+                let v = _mm_adds_epi16(_mm_adds_epi16(a, unsafe { _mm_loadl_epi64(pb.add(x) as *const __m128i) }), off8);
+                let v = _mm_min_epi16(_mm_max_epi16(_mm_sra_epi16(v, sh), z8), max8);
+                unsafe { _mm_storel_epi64(d.add(x) as *mut __m128i, v) };
+                x += 4;
+            }
             while x < w {
                 let a = (unsafe { *ps.add(x) } as i32) << k;
                 let v = (a + unsafe { *pb.add(x) } as i32 + (1 << (shift - 1))) >> shift;
@@ -630,6 +820,26 @@ mod x86 {
                 unsafe { _mm256_storeu_si256(d.add(x) as *mut __m256i, v) };
             }
             let mut x = nvec * 16;
+            // Narrow blocks. `nvec = w / 16`, so everything under 16 samples
+            // wide fell to the SCALAR tail -- and the census puts 18.3% of
+            // pixel-kernel samples on intra-heavy content in blocks narrower
+            // than 8, with another 31% exactly 8 wide (4:2:0 chroma of an 8x8
+            // luma PU is 4 wide). 128- and 64-bit steps cover both.
+            let dc8 = _mm_set1_epi16(dc as i16);
+            let max8 = _mm_set1_epi16(max as i16);
+            let z8 = _mm_setzero_si128();
+            while x + 8 <= w {
+                let p = _mm_packs_epi32(unsafe { _mm_loadu_si128(r.add(x) as *const __m128i) }, unsafe { _mm_loadu_si128(r.add(x + 4) as *const __m128i) });
+                let v = _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(dc8, p), z8), max8);
+                unsafe { _mm_storeu_si128(d.add(x) as *mut __m128i, v) };
+                x += 8;
+            }
+            if x + 4 <= w {
+                let p = _mm_packs_epi32(unsafe { _mm_loadu_si128(r.add(x) as *const __m128i) }, z8);
+                let v = _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(dc8, p), z8), max8);
+                unsafe { _mm_storel_epi64(d.add(x) as *mut __m128i, v) };
+                x += 4;
+            }
             while x < w {
                 unsafe { *d.add(x) = (dc as i32 + *r.add(x)).clamp(0, max) as u16 };
                 x += 1;
@@ -693,6 +903,31 @@ mod x86 {
                 unsafe { _mm256_storeu_si256(d.add(x) as *mut __m256i, r) };
             }
             let mut x = nvec * 16;
+            // Narrow blocks. `nvec = w / 16`, so everything under 16 samples
+            // wide fell to the SCALAR tail -- and the census puts 18.3% of
+            // pixel-kernel samples on intra-heavy content in blocks narrower
+            // than 8, with another 31% exactly 8 wide (4:2:0 chroma of an 8x8
+            // luma PU is 4 wide). 128- and 64-bit steps cover both.
+            let wv8 = _mm_set1_epi32((wt & 0xffff) | (rnd << 16));
+            let ones8 = _mm_set1_epi16(1);
+            let off8 = _mm_set1_epi32(off);
+            let max8 = _mm_set1_epi16(max as i16);
+            let z8 = _mm_setzero_si128();
+            while x + 8 <= w {
+                let v = unsafe { _mm_loadu_si128(sp.add(x) as *const __m128i) };
+                let lo = _mm_add_epi32(_mm_sra_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(v, ones8), wv8), sh), off8);
+                let hi = _mm_add_epi32(_mm_sra_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(v, ones8), wv8), sh), off8);
+                let r = _mm_min_epi16(_mm_max_epi16(_mm_packs_epi32(lo, hi), z8), max8);
+                unsafe { _mm_storeu_si128(d.add(x) as *mut __m128i, r) };
+                x += 8;
+            }
+            if x + 4 <= w {
+                let v = unsafe { _mm_loadl_epi64(sp.add(x) as *const __m128i) };
+                let lo = _mm_add_epi32(_mm_sra_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(v, ones8), wv8), sh), off8);
+                let r = _mm_min_epi16(_mm_max_epi16(_mm_packs_epi32(lo, z8), z8), max8);
+                unsafe { _mm_storel_epi64(d.add(x) as *mut __m128i, r) };
+                x += 4;
+            }
             while x < w {
                 let v = unsafe { *sp.add(x) } as i32;
                 let r = if log2wd >= 1 { ((v * wt + rnd) >> log2wd) + off } else { v * wt + off };
@@ -727,6 +962,29 @@ mod x86 {
                 unsafe { _mm256_storeu_si256(d.add(x) as *mut __m256i, r) };
             }
             let mut x = nvec * 16;
+            // The one kernel the previous narrow-block pass missed: it stepped
+            // 16 and fell straight to scalar below that.
+            let wv8 = _mm_set1_epi32((w0 & 0xffff) | (w1 << 16));
+            let ov8 = _mm_set1_epi32(obias);
+            let max8 = _mm_set1_epi16(max as i16);
+            let z8 = _mm_setzero_si128();
+            while x + 8 <= w {
+                let va = unsafe { _mm_loadu_si128(pa.add(x) as *const __m128i) };
+                let vb = unsafe { _mm_loadu_si128(pb.add(x) as *const __m128i) };
+                let lo = _mm_sra_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(va, vb), wv8), ov8), sh);
+                let hi = _mm_sra_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(va, vb), wv8), ov8), sh);
+                let r = _mm_min_epi16(_mm_max_epi16(_mm_packs_epi32(lo, hi), z8), max8);
+                unsafe { _mm_storeu_si128(d.add(x) as *mut __m128i, r) };
+                x += 8;
+            }
+            if x + 4 <= w {
+                let va = unsafe { _mm_loadl_epi64(pa.add(x) as *const __m128i) };
+                let vb = unsafe { _mm_loadl_epi64(pb.add(x) as *const __m128i) };
+                let lo = _mm_sra_epi32(_mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(va, vb), wv8), ov8), sh);
+                let r = _mm_min_epi16(_mm_max_epi16(_mm_packs_epi32(lo, lo), z8), max8);
+                unsafe { _mm_storel_epi64(d.add(x) as *mut __m128i, r) };
+                x += 4;
+            }
             while x < w {
                 let v = unsafe { *pa.add(x) } as i32 * w0 + unsafe { *pb.add(x) } as i32 * w1 + obias;
                 unsafe { *d.add(x) = (v >> (log2wd + 1)).clamp(0, max) as u16 };
@@ -882,9 +1140,24 @@ mod arm {
 
 /// Uni-predicted block, default weighting (§8.5.3.3.4.2).
 pub fn put_uni(dst: &mut [u16], dst_stride: usize, src: &[i16], w: usize, h: usize, bit_depth: u8) {
+    if census::ALWAYS {
+        // Width class of the block, weighted by samples. The vector loops step
+        // 8 or 16 samples, so anything narrower falls to a scalar tail -- and
+        // 4:2:0 chroma of an 8x8 luma PU is 4 wide.
+        census::bump(
+            if w < 8 {
+                &census::PIX_W_LT8
+            } else if w < 16 {
+                &census::PIX_W_8
+            } else {
+                &census::PIX_W_GE16
+            },
+            (w * h) as u64,
+        );
+    }
     let ok = dst.len() >= dst_stride * (h - 1) + w && src.len() >= w * h;
     debug_assert!(ok);
-    if census::enabled() {
+    if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::PUT_UNI_SIMD } else { &census::PUT_UNI_SCALAR }, 1);
     }
@@ -906,9 +1179,24 @@ pub fn put_uni(dst: &mut [u16], dst_stride: usize, src: &[i16], w: usize, h: usi
 
 /// Bi-predicted block, default weighting (§8.5.3.3.4.2).
 pub fn put_bi(dst: &mut [u16], dst_stride: usize, a: &[i16], b: &[i16], w: usize, h: usize, bit_depth: u8) {
+    if census::ALWAYS {
+        // Width class of the block, weighted by samples. The vector loops step
+        // 8 or 16 samples, so anything narrower falls to a scalar tail -- and
+        // 4:2:0 chroma of an 8x8 luma PU is 4 wide.
+        census::bump(
+            if w < 8 {
+                &census::PIX_W_LT8
+            } else if w < 16 {
+                &census::PIX_W_8
+            } else {
+                &census::PIX_W_GE16
+            },
+            (w * h) as u64,
+        );
+    }
     let ok = dst.len() >= dst_stride * (h - 1) + w && a.len() >= w * h && b.len() >= w * h;
     debug_assert!(ok);
-    if census::enabled() {
+    if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::PUT_BI_SIMD } else { &census::PUT_BI_SCALAR }, 1);
     }
@@ -931,9 +1219,24 @@ pub fn put_bi(dst: &mut [u16], dst_stride: usize, a: &[i16], b: &[i16], w: usize
 /// Adds a transform block's residual into the picture, with the clip of
 /// §8.6.6.
 pub fn add_residual(dst: &mut [u16], dst_stride: usize, res: &[i32], w: usize, h: usize, max: i32) {
+    if census::ALWAYS {
+        // Width class of the block, weighted by samples. The vector loops step
+        // 8 or 16 samples, so anything narrower falls to a scalar tail -- and
+        // 4:2:0 chroma of an 8x8 luma PU is 4 wide.
+        census::bump(
+            if w < 8 {
+                &census::PIX_W_LT8
+            } else if w < 16 {
+                &census::PIX_W_8
+            } else {
+                &census::PIX_W_GE16
+            },
+            (w * h) as u64,
+        );
+    }
     let ok = dst.len() >= dst_stride * (h - 1) + w && res.len() >= w * h;
     debug_assert!(ok);
-    if census::enabled() {
+    if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::ADD_RESIDUAL_SIMD } else { &census::ADD_RESIDUAL_SCALAR }, 1);
         census::bump(&census::SAMPLES_ADD_RESIDUAL, (w * h) as u64);
@@ -957,7 +1260,7 @@ pub fn add_residual(dst: &mut [u16], dst_stride: usize, res: &[i32], w: usize, h
 /// Copy a `w x h` rectangle of samples — full-pel uni-prediction. See
 /// [`copy_block_scalar`] for why the two kernels it replaces compose to this.
 pub fn copy_block(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, w: usize, h: usize) {
-    if census::enabled() {
+    if census::ALWAYS {
         census::bump(&census::MC_FULLPEL_UNI, 1);
         census::bump(&census::SAMPLES_MC, (w * h) as u64);
     }
@@ -969,13 +1272,9 @@ pub fn copy_block(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: u
 /// Rounding average of two `w x h` rectangles — full-pel bi-prediction.
 #[allow(clippy::too_many_arguments)]
 pub fn avg_block(dst: &mut [u16], dst_stride: usize, a: &[u16], a_stride: usize, b: &[u16], b_stride: usize, w: usize, h: usize) {
-    let ok = w > 0
-        && h > 0
-        && dst.len() >= dst_stride * (h - 1) + w
-        && a.len() >= a_stride * (h - 1) + w
-        && b.len() >= b_stride * (h - 1) + w;
+    let ok = w > 0 && h > 0 && dst.len() >= dst_stride * (h - 1) + w && a.len() >= a_stride * (h - 1) + w && b.len() >= b_stride * (h - 1) + w;
     debug_assert!(ok);
-    if census::enabled() {
+    if census::ALWAYS {
         census::bump(&census::MC_FULLPEL_BI, 1);
         census::bump(&census::SAMPLES_MC, (w * h) as u64);
     }
@@ -996,7 +1295,7 @@ pub fn avg_block(dst: &mut [u16], dst_stride: usize, a: &[u16], a_stride: usize,
 pub fn put_bi_fp(dst: &mut [u16], dst_stride: usize, s: &[u16], s_stride: usize, b: &[i16], w: usize, h: usize, bit_depth: u8) {
     let ok = w > 0 && h > 0 && dst.len() >= dst_stride * (h - 1) + w && s.len() >= s_stride * (h - 1) + w && b.len() >= w * h;
     debug_assert!(ok);
-    if census::enabled() {
+    if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::PUT_BI_FP_SIMD } else { &census::PUT_BI_FP_SCALAR }, 1);
         census::bump(&census::SAMPLES_MC, (w * h) as u64);
@@ -1017,7 +1316,7 @@ pub fn put_bi_fp(dst: &mut [u16], dst_stride: usize, s: &[u16], s_stride: usize,
 pub fn add_residual_const(dst: &mut [u16], dst_stride: usize, dc: u16, res: &[i32], w: usize, h: usize, max: i32) {
     let ok = w > 0 && h > 0 && dst.len() >= dst_stride * (h - 1) + w && res.len() >= w * h;
     debug_assert!(ok);
-    if census::enabled() {
+    if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::ADD_RESIDUAL_DC_SIMD } else { &census::ADD_RESIDUAL_DC_SCALAR }, 1);
         census::bump(&census::SAMPLES_ADD_RESIDUAL, (w * h) as u64);
@@ -1043,9 +1342,9 @@ pub fn add_residual_const(dst: &mut [u16], dst_stride: usize, dc: u16, res: &[i3
 pub fn weighted_uni(dst: &mut [u16], dst_stride: usize, src: &[i16], w: usize, h: usize, wt: i32, off: i32, log2wd: i32, max: i32) {
     // The `pmaddwd` form needs both multiplicands inside `i16`; the spec bounds
     // them, but a stream that violated it must take the scalar twin, not wrap.
-    let fits = (-32768..=32767).contains(&wt) && log2wd >= 1 && log2wd < 30 && (1i32 << (log2wd - 1)) <= 32767;
+    let fits = (-32768..=32767).contains(&wt) && (1..30).contains(&log2wd) && (1i32 << (log2wd - 1)) <= 32767;
     let ok = w > 0 && h > 0 && dst.len() >= dst_stride * (h - 1) + w && src.len() >= w * h;
-    if census::enabled() {
+    if census::ALWAYS {
         // The predicate must match the dispatch below EXACTLY, switch
         // included, or the census reports an arm that never ran.
         let simd = cfg!(feature = "simd") && crate::isa() == crate::Isa::Avx2 && ok && fits && !scalar_gate();
@@ -1063,9 +1362,9 @@ pub fn weighted_uni(dst: &mut [u16], dst_stride: usize, src: &[i16], w: usize, h
 /// Explicit weighted prediction, bi. See [`weighted_bi_scalar`].
 #[allow(clippy::too_many_arguments)]
 pub fn weighted_bi(dst: &mut [u16], dst_stride: usize, a: &[i16], b: &[i16], w: usize, h: usize, w0: i32, w1: i32, obias: i32, log2wd: i32, max: i32) {
-    let fits = (-32768..=32767).contains(&w0) && (-32768..=32767).contains(&w1) && log2wd >= 0 && log2wd < 30;
+    let fits = (-32768..=32767).contains(&w0) && (-32768..=32767).contains(&w1) && (0..30).contains(&log2wd);
     let ok = w > 0 && h > 0 && dst.len() >= dst_stride * (h - 1) + w && a.len() >= w * h && b.len() >= w * h;
-    if census::enabled() {
+    if census::ALWAYS {
         // The predicate must match the dispatch below EXACTLY, switch
         // included, or the census reports an arm that never ran.
         let simd = cfg!(feature = "simd") && crate::isa() == crate::Isa::Avx2 && ok && fits && !scalar_gate();
@@ -1083,9 +1382,9 @@ pub fn weighted_bi(dst: &mut [u16], dst_stride: usize, a: &[i16], b: &[i16], w: 
 /// Transform skip. See [`transform_skip_scalar`] for why this path matters.
 pub fn transform_skip(d: &mut [i32], n: usize, shift: u32) {
     let count = n * n;
-    let ok = count > 0 && d.len() >= count && shift >= 1 && shift < 31;
+    let ok = count > 0 && d.len() >= count && (1..31).contains(&shift);
     debug_assert!(ok);
-    if census::enabled() {
+    if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok && !scalar_gate();
         census::bump(if simd { &census::TX_SKIP_SIMD } else { &census::TX_SKIP_SCALAR }, 1);
     }
@@ -1323,6 +1622,43 @@ mod tests {
                 transform_skip(&mut got, n, shift);
                 assert_eq!(want, got, "n={n} bd={bd}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod bench_combine {
+    //! Prices the combine step, to decide whether fusing it into the
+    //! interpolation's final pass is worth three kernel variants per ISA rung.
+    //!
+    //! Not a `#[bench]`: run it explicitly.
+    //!   cargo test --release -p rusty_h265-accel -- --ignored --nocapture combine
+    use std::time::Instant;
+
+    /// Sizes weighted the way the census says a real clip uses them: 93% of
+    /// motion-compensated samples are in blocks 16 or wider, and every luma
+    /// block brings two chroma blocks at half its dimensions.
+    const SIZES: [(usize, usize, u64); 4] = [(32, 32, 3), (16, 16, 6), (16, 8, 3), (8, 8, 6)];
+
+    #[test]
+    #[ignore = "timing, not correctness"]
+    fn combine_cost() {
+        let bd = 8u8;
+        for (w, h, weight) in SIZES {
+            let src = vec![1234i16; w * h];
+            let mut dst = vec![0u16; w * h * 2];
+            let iters = 200_000u64;
+            // Warm.
+            for _ in 0..1000 {
+                super::put_uni(&mut dst, w, &src, w, h, bd);
+            }
+            let t = Instant::now();
+            for _ in 0..iters {
+                super::put_uni(&mut dst, w, &src, w, h, bd);
+                std::hint::black_box(&dst);
+            }
+            let ns = t.elapsed().as_nanos() as f64 / iters as f64;
+            println!("put_uni {w:>2}x{h:<2} weight {weight}  {ns:7.1} ns/call  {:5.2} ns/sample", ns / (w * h) as f64);
         }
     }
 }

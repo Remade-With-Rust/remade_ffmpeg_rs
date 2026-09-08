@@ -84,6 +84,7 @@ OUTPUTS_PER_ITER = {
     "fir_v_avx2": 16,
     "fir_v_avx2_sym": 16,
     "luma_edge_sse2": 4,
+    "accum_avx2": 8,
     "put_uni_avx2": 16,
     "put_bi_avx2": 16,
     "add_residual_avx2": 16,

@@ -23,6 +23,14 @@ default = ["simd"]
 bench-alloc = ["dep:rusty_alloc-api"]
 simd = ["rusty_h265-accel/simd"]
 census = ["rusty_h265-accel/census"]
+# The per-bin CABAC trace (`RH265_CABAC_TRACE=1`). A debugging facility, so it
+# is a `cfg` and not a runtime flag: as a runtime flag it cost a load, a test
+# and a branch on every one of ~4 M context bins per 720p frame-set.
+cabac-trace = []
+# The stage profiler (`RH265_PROF=1`). A feature, not a runtime flag, for the
+# same reason as `cabac-trace`: a scope guard is a clock read, and the stages it
+# wraps run millions of times a clip. Compiled out, every scope is nothing.
+prof = []
 
 [dependencies]
 # `default-features = false`: the ONLY route to the kernels is this crate's own

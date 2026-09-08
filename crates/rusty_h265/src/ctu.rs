@@ -46,17 +46,36 @@ pub struct CtxStore {
 }
 
 /// `ScalingFactor` (§7.4.5) as raster N×N tables: `[sizeId][matrixId]`.
+///
+/// ONE flat block, not `Vec<Vec<Vec<u8>>>`. The nested shape allocated
+/// twenty-nine times per picture -- four outer, twenty-four inner, plus the
+/// prototype row `vec![...; 4]` clones -- to hold 8,160 bytes that are a pure
+/// function of the scaling list, and then made every lookup chase two pointers.
+/// The tables are `6 * (16 + 64 + 256 + 1024)` bytes end to end.
 pub struct ScalingFactors {
-    pub f: Vec<Vec<Vec<u8>>>,
+    f: Box<[u8; SF_TOTAL]>,
 }
 
+/// Start of each `sizeId`'s six matrices in the flat block.
+const SF_OFF: [usize; 5] = [0, 6 * 16, 6 * (16 + 64), 6 * (16 + 64 + 256), SF_TOTAL];
+const SF_TOTAL: usize = 6 * (16 + 64 + 256 + 1024);
+
 impl ScalingFactors {
+    /// The `n*n` raster table for one `(sizeId, matrixId)`.
+    #[inline]
+    pub fn get(&self, size_id: usize, matrix_id: usize) -> &[u8] {
+        let n = 16usize << (2 * size_id);
+        let a = SF_OFF[size_id] + matrix_id * n;
+        &self.f[a..a + n]
+    }
+
     pub fn new(sl: &ScalingList) -> Self {
-        let mut f = vec![vec![Vec::new(); 6]; 4];
+        let mut f = Box::new([16u8; SF_TOTAL]);
         for size_id in 0..4usize {
             let n = 4usize << size_id;
             for matrix_id in 0..6usize {
-                let mut t = vec![16u8; n * n];
+                let a = SF_OFF[size_id] + matrix_id * n * n;
+                let t = &mut f[a..a + n * n];
                 let list = &sl.lists[size_id][matrix_id];
                 match size_id {
                     0 => {
@@ -81,7 +100,6 @@ impl ScalingFactors {
                         t[0] = sl.dc[size_id - 2][matrix_id];
                     }
                 }
-                f[size_id][matrix_id] = t;
             }
         }
         ScalingFactors { f }
@@ -217,7 +235,7 @@ impl CtbDiv {
 
     pub(crate) fn new(d: usize) -> Self {
         debug_assert!(d > 0);
-        let m = ((1u128 << Self::S) + d as u128 - 1) / d as u128;
+        let m = (1u128 << Self::S).div_ceil(d as u128);
         CtbDiv { d, m: m as u64 }
     }
 
@@ -237,7 +255,22 @@ impl CtbDiv {
 }
 
 pub(crate) fn wrap_qp(v: i32, qp_bd_offset: i32) -> i32 {
-    ((v + 52 + 2 * qp_bd_offset) % (52 + qp_bd_offset)) - qp_bd_offset
+    // The `%` here is a signed division by a RUNTIME divisor -- `idivl`, tens
+    // of cycles -- and it ran on every coding unit, not just the ones that code
+    // a `cu_qp_delta`.
+    //
+    // It never needs one. `qPY_PRED` is in `-off..=51` and `CuQpDeltaVal` is
+    // range-checked to `-(26 + off/2)..=25 + off/2` before it gets here, so the
+    // dividend lands in `0..2m` and the modulo can wrap at most twice. The loop
+    // is exactly `t % m` for `t >= 0`; for `-m < t < 0` truncated `%` also
+    // leaves `t` alone, so the two agree there as well.
+    let m = 52 + qp_bd_offset;
+    let mut t = v + 52 + 2 * qp_bd_offset;
+    debug_assert!(t > -m && t < 2 * m, "wrap_qp dividend {t} outside -m..2m (m = {m})");
+    while t >= m {
+        t -= m;
+    }
+    t - qp_bd_offset
 }
 
 impl<'a> SliceDecoder<'a> {
@@ -403,6 +436,7 @@ impl<'a> SliceDecoder<'a> {
             segment_start = false;
 
             self.decode_ctu(rs, x0, y0)?;
+            self.st.ctb_done[rs] = true;
 
             // WPP storage after the second CTB of a row (§9.3.2.3 trigger).
             if wpp && (self.ctb_div.rem(rs) == 1 || (rs > 1 && self.tiles.tile_id[ts] != self.tiles.tile_id[self.tiles.rs_to_ts[rs - 2] as usize])) {
@@ -436,7 +470,9 @@ impl<'a> SliceDecoder<'a> {
                 if self.dbg_sub {
                     eprintln!(
                         "sub poc={} next_rs={rs} idx={} entry_start={start} natural={natural} nsub={}",
-                        self.poc, self.substream_idx, self.substreams.len()
+                        self.poc,
+                        self.substream_idx,
+                        self.substreams.len()
                     );
                 }
                 self.cab.reinit_at(start);
@@ -445,6 +481,9 @@ impl<'a> SliceDecoder<'a> {
     }
 
     fn decode_ctu(&mut self, rs: usize, x0: usize, y0: usize) -> Result<()> {
+        // Per CTU, so `parse` is everything the entropy and syntax layer does
+        // for this CTU MINUS the stages timed separately inside it.
+        crate::prof_scope!(crate::prof::Stage::Parse);
         self.st.ctb_slice[rs] = self.slice_idx;
         self.st.ctb_filter[rs] = CtbFilterParams {
             deblock_disabled: self.sh.deblocking_filter_disabled,
@@ -518,12 +557,11 @@ impl<'a> SliceDecoder<'a> {
             let bit_depth = if c == 0 { self.sps.bit_depth_luma } else { self.sps.bit_depth_chroma };
             let cmax = (1u32 << (bit_depth.min(10) - 5)) - 1;
             let mut abs = [0i32; 4];
+            // `sao_offset_abs` is truncated unary (§9.3.3.2), which is what
+            // `bypass_ones` decodes: one loop-invariant setup for the run
+            // instead of a fresh `scaled` shift and struct round-trip per bin.
             for a in abs.iter_mut() {
-                let mut v = 0;
-                while v < cmax && self.cab.bypass() == 1 {
-                    v += 1;
-                }
-                *a = v as i32;
+                *a = self.cab.bypass_ones(cmax) as i32;
             }
             let shift = bit_depth - bit_depth.min(10);
             if type_idx == 1 {
@@ -558,8 +596,9 @@ impl<'a> SliceDecoder<'a> {
         let split = if x0 + size <= w && y0 + size <= h && log2cb > min_cb {
             let xi = x0 as i32;
             let yi = y0 as i32;
-            let cond_l = self.st.available(xi, yi, xi - 1, yi) && self.st.ct_depth[self.st.idx4(x0 - 1, y0)] > depth;
-            let cond_a = self.st.available(xi, yi, xi, yi - 1) && self.st.ct_depth[self.st.idx4(x0, y0 - 1)] > depth;
+            let ac = self.st.avail_at(xi, yi);
+            let cond_l = matches!(self.st.avail_n_idx(&ac, xi - 1, yi), Some(i) if self.st.ct_depth[i] > depth);
+            let cond_a = matches!(self.st.avail_n_idx(&ac, xi, yi - 1), Some(i) if self.st.ct_depth[i] > depth);
             self.cab.decode(CTX_SPLIT_CU + cond_l as usize + cond_a as usize) == 1
         } else {
             log2cb > min_cb
@@ -581,15 +620,14 @@ impl<'a> SliceDecoder<'a> {
             let xi = x0 as i32;
             let yi = y0 as i32;
             let cur_ctb = self.st.ctb_of(x0, y0);
-            let qp_a = if self.st.available(xi, yi, xi - 1, yi) && self.st.ctb_of(x0 - 1, y0) == cur_ctb {
-                self.st.qp_y[self.st.idx4(x0 - 1, y0)] as i32
-            } else {
-                qp_prev
+            let ac = self.st.avail_at(xi, yi);
+            let qp_a = match self.st.avail_n_idx(&ac, xi - 1, yi) {
+                Some(i) if self.st.ctb_of(x0 - 1, y0) == cur_ctb => self.st.qp_y[i] as i32,
+                _ => qp_prev,
             };
-            let qp_b = if self.st.available(xi, yi, xi, yi - 1) && self.st.ctb_of(x0, y0 - 1) == cur_ctb {
-                self.st.qp_y[self.st.idx4(x0, y0 - 1)] as i32
-            } else {
-                qp_prev
+            let qp_b = match self.st.avail_n_idx(&ac, xi, yi - 1) {
+                Some(i) if self.st.ctb_of(x0, y0 - 1) == cur_ctb => self.st.qp_y[i] as i32,
+                _ => qp_prev,
             };
             self.qp_y_pred = (qp_a + qp_b + 1) >> 1;
         }
@@ -621,12 +659,20 @@ impl<'a> SliceDecoder<'a> {
             1 => (0b0100, 0b1000),
             _ => (0b0101, 0b1010),
         };
+        // Both walks start at the same 4x4 and the indexed form re-proved the
+        // bound on every element. Taking each as ONE subslice proves it once:
+        // the left column is a strided walk of that slice, the top row is a
+        // contiguous run of it.
         let w4 = self.st.w4;
-        for yy in (y >> 2)..((y + h) >> 2) {
-            self.st.edges[yy * w4 + (x >> 2)] |= bits;
+        let (x4, y4) = (x >> 2, y >> 2);
+        let base = y4 * w4 + x4;
+        let rows = ((y + h) >> 2) - y4;
+        let cols = ((x + w) >> 2) - x4;
+        for e in self.st.edges[base..].iter_mut().step_by(w4).take(rows) {
+            *e |= bits;
         }
-        for xx in (x >> 2)..((x + w) >> 2) {
-            self.st.edges[(y >> 2) * w4 + xx] |= bits_h;
+        for e in &mut self.st.edges[base..base + cols] {
+            *e |= bits_h;
         }
     }
 
@@ -643,8 +689,9 @@ impl<'a> SliceDecoder<'a> {
         let yi = y0 as i32;
         let mut skip = false;
         if !self.sh.slice_type.is_intra() {
-            let cond_l = self.st.available(xi, yi, xi - 1, yi) && self.st.pred_mode[self.st.idx4(x0 - 1, y0)] == PRED_SKIP;
-            let cond_a = self.st.available(xi, yi, xi, yi - 1) && self.st.pred_mode[self.st.idx4(x0, y0 - 1)] == PRED_SKIP;
+            let ac = self.st.avail_at(xi, yi);
+            let cond_l = matches!(self.st.avail_n_idx(&ac, xi - 1, yi), Some(i) if self.st.pred_mode[i] == PRED_SKIP);
+            let cond_a = matches!(self.st.avail_n_idx(&ac, xi, yi - 1), Some(i) if self.st.pred_mode[i] == PRED_SKIP);
             skip = self.cab.decode(CTX_CU_SKIP + cond_l as usize + cond_a as usize) == 1;
         }
         self.qp_y = wrap_qp(self.qp_y_pred + self.cu_qp_delta_val, self.sps.qp_bd_offset_y);
@@ -674,11 +721,7 @@ impl<'a> SliceDecoder<'a> {
         let mut pcm = false;
         let mut merge_2nx2n = false;
         if self.cu_intra {
-            if self.part_mode == PartMode::Part2Nx2N
-                && self.sps.pcm_enabled
-                && log2cb >= self.sps.log2_min_pcm_cb_size as usize
-                && log2cb <= self.sps.log2_max_pcm_cb_size as usize
-            {
+            if self.part_mode == PartMode::Part2Nx2N && self.sps.pcm_enabled && log2cb >= self.sps.log2_min_pcm_cb_size as usize && log2cb <= self.sps.log2_max_pcm_cb_size as usize {
                 pcm = self.cab.terminate();
             }
             if pcm {
@@ -712,7 +755,6 @@ impl<'a> SliceDecoder<'a> {
         self.dbg_cu(x0, y0, n);
         Ok(())
     }
-
 
     /// `RH265_DBG_CU=1`: one line per coding unit, in HM's `HM_DBG_CU` format.
     fn dbg_cu(&self, x0: usize, y0: usize, n: usize) {
@@ -782,13 +824,9 @@ impl<'a> SliceDecoder<'a> {
             let yp = y0 + (j >> 1) * pb;
             let cand = self.mpm_candidates(xp, yp);
             let mode = if prev[j] {
-                let idx = if self.cab.bypass() == 0 {
-                    0
-                } else if self.cab.bypass() == 0 {
-                    1
-                } else {
-                    2
-                };
+                // `mpm_idx` is truncated unary with cMax 2 -- the nested ifs
+                // were that binarisation written out, one `bypass()` per bin.
+                let idx = self.cab.bypass_ones(2) as usize;
                 cand[idx]
             } else {
                 let mut m = self.cab.bypass_bits(5) as u8;
@@ -828,11 +866,11 @@ impl<'a> SliceDecoder<'a> {
     fn mpm_candidates(&self, xp: usize, yp: usize) -> [u8; 3] {
         let xi = xp as i32;
         let yi = yp as i32;
+        let ac = self.st.avail_at(xi, yi);
         let cand = |xn: i32, yn: i32, above: bool| -> u8 {
-            if !self.st.available(xi, yi, xn, yn) {
+            let Some(i) = self.st.avail_n_idx(&ac, xn, yn) else {
                 return 1;
-            }
-            let i = self.st.idx4(xn as usize, yn as usize);
+            };
             if self.st.pred_mode[i] != PRED_INTRA {
                 return 1;
             }
@@ -863,6 +901,11 @@ impl<'a> SliceDecoder<'a> {
 
     // ---- PCM (§7.3.8.7) ----
 
+    /// `#[cold]`: PCM is a conformance corner, not a coding tool a real
+    /// encoder emits -- and inlined, its two sample loops put the whole
+    /// bit-reader and `Plane::set` into `coding_quadtree`.
+    #[cold]
+    #[inline(never)]
     fn pcm_samples(&mut self, x0: usize, y0: usize, n: usize) -> Result<()> {
         let start = self.cab.aligned_byte_pos();
         let data = &self.rbsp.data;
@@ -897,18 +940,18 @@ impl<'a> SliceDecoder<'a> {
     }
 
     /// k-th order Exp-Golomb, bypass coded (§9.3.3.6).
-    pub(super) fn eg_k(&mut self, mut k: u32) -> Result<u32> {
-        let mut v = 0u32;
-        while self.cab.bypass() == 1 {
-            v += 1 << k;
-            k += 1;
-            if k > 31 {
-                return Err(Error::invalid("EGk prefix too long"));
-            }
+    pub(super) fn eg_k(&mut self, k: u32) -> Result<u32> {
+        // The prefix is a run of 1-bins; `bypass_ones` decodes the whole run
+        // with one loop-invariant setup, and `sum(1<<(k0+j))` over the run is
+        // closed form rather than an add per bin.
+        let room = 32 - k;
+        let m = self.cab.bypass_ones(room);
+        if m == room {
+            return Err(Error::invalid("EGk prefix too long"));
         }
-        Ok(v + self.cab.bypass_bits(k))
+        let v = ((1u32 << m) - 1) << k;
+        Ok(v + self.cab.bypass_bits(k + m))
     }
-
 }
 
 #[cfg(test)]

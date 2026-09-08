@@ -176,9 +176,7 @@ fn parse_pred_weight_table(r: &mut BitReader, sps: &Sps, sh: &SliceHeader) -> Re
                         return Err(Error::invalid("delta_chroma_offset"));
                     }
                     // (7-56)
-                    let v = (wp_offset_half_c + d_off
-                        - ((wp_offset_half_c * e.chroma_weight[j]) >> t.chroma_log2_weight_denom))
-                        .clamp(-wp_offset_half_c, wp_offset_half_c - 1);
+                    let v = (wp_offset_half_c + d_off - ((wp_offset_half_c * e.chroma_weight[j]) >> t.chroma_log2_weight_denom)).clamp(-wp_offset_half_c, wp_offset_half_c - 1);
                     e.chroma_offset[j] = v << offset_shift_c;
                 }
             }
@@ -196,12 +194,7 @@ fn parse_pred_weight_table(r: &mut BitReader, sps: &Sps, sh: &SliceHeader) -> Re
 /// Parses a slice segment header. `prev` is the last independent slice
 /// segment header of the same picture (needed for dependent segments).
 /// The reader is left at the start of `slice_segment_data()`.
-pub fn parse_slice_header<'a>(
-    r: &mut BitReader,
-    nal: &NalHeader,
-    sps_by_pps: &dyn Fn(u8) -> Option<(&'a Sps, &'a Pps)>,
-    prev: Option<&SliceHeader>,
-) -> Result<SliceHeader> {
+pub fn parse_slice_header<'a>(r: &mut BitReader, nal: &NalHeader, sps_by_pps: &dyn Fn(u8) -> Option<(&'a Sps, &'a Pps)>, prev: Option<&SliceHeader>) -> Result<SliceHeader> {
     let first_slice_segment_in_pic = r.read_flag()?;
     let mut no_output_of_prior_pics = false;
     if nal.nal_type.is_irap() {
@@ -312,7 +305,11 @@ pub fn parse_slice_header<'a>(
                 let mut prev_cycle = 0u32;
                 for i in 0..total {
                     let (poc_lsb, used) = if i < sh.num_long_term_sps {
-                        let idx = if sps.lt_ref_pics.len() > 1 { r.read_bits(ceil_log2(sps.lt_ref_pics.len() as u32))? as usize } else { 0 };
+                        let idx = if sps.lt_ref_pics.len() > 1 {
+                            r.read_bits(ceil_log2(sps.lt_ref_pics.len() as u32))? as usize
+                        } else {
+                            0
+                        };
                         sps.lt_ref_pics[idx]
                     } else {
                         let lsb = r.read_bits(sps.log2_max_poc_lsb as u32)?;
@@ -328,7 +325,12 @@ pub fn parse_slice_header<'a>(
                         cycle += prev_cycle;
                     }
                     prev_cycle = cycle;
-                    sh.long_term.push(LongTermEntry { poc_lsb, used_by_curr_pic: used, delta_poc_msb_present, delta_poc_msb_cycle: cycle });
+                    sh.long_term.push(LongTermEntry {
+                        poc_lsb,
+                        used_by_curr_pic: used,
+                        delta_poc_msb_present,
+                        delta_poc_msb_cycle: cycle,
+                    });
                 }
             }
             if sps.temporal_mvp_enabled {

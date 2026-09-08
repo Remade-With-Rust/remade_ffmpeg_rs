@@ -36,10 +36,28 @@ pub mod filters;
 pub mod frame;
 pub mod intra;
 pub mod itx;
-pub mod md5;
 mod mcscratch;
+pub mod md5;
 pub mod nal;
 pub mod pic;
+#[cfg(feature = "prof")]
+pub mod prof;
+
+/// Time a stage, when built with the `prof` feature; expand to nothing
+/// otherwise.
+///
+/// Defined HERE rather than in `prof` itself: `#[macro_export]` publishes a
+/// macro from the module that defines it, so a macro defined inside a
+/// `#[cfg(feature = ...)]` module does not exist at all in the configurations
+/// that need it to expand to nothing. Every call site then fails to compile in
+/// exactly the build that ships.
+#[macro_export]
+macro_rules! prof_scope {
+    ($stage:expr) => {
+        #[cfg(feature = "prof")]
+        let _prof_guard = $crate::prof::Scope::new($stage);
+    };
+}
 pub mod ps;
 pub mod sei;
 pub mod slice;

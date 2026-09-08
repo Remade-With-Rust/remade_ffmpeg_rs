@@ -1,0 +1,183 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>hevc-duel</title>
+<style>
+  :root { color-scheme: dark; --bg:#0e1013; --panel:#171a1f; --line:#272c34; --fg:#e8eaed;
+          --dim:#8b95a3; --ok:#4ade80; --bad:#f87171; --acc:#7dd3fc; --warm:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  header { padding:13px 22px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0; letter-spacing:.02em; }
+  .meta { color:var(--dim); font-size:12px; font-variant-numeric:tabular-nums; }
+  button { font:600 13px/1 inherit; padding:9px 20px; border-radius:8px; cursor:pointer;
+           background:var(--acc); color:#07222e; border:0; }
+  button:disabled { background:#26303a; color:var(--dim); cursor:default; }
+  .verdict { padding:12px 22px; font-size:15px; font-variant-numeric:tabular-nums;
+             border-bottom:1px solid var(--line); }
+
+  /* Videos side by side on top; each column's readout directly beneath it. */
+  /* One column per arm, side by side, wrapping only when they get too narrow
+     to read. Two arms and three arms both want the same rule. */
+  .cols { display:grid; grid-template-columns:repeat(auto-fit,minmax(330px,1fr));
+          gap:20px; padding:18px 22px 26px; align-items:start; }
+  .col { min-width:0; }
+  .title { display:flex; justify-content:space-between; align-items:center; gap:10px;
+           padding:0 2px 9px; font-size:14px; }
+  .screen { background:#000; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .screen img { display:block; width:100%; aspect-ratio:16/9; object-fit:contain; background:#000; }
+  .seek { height:3px; background:var(--line); }
+  .seek > i { display:block; height:100%; background:var(--acc); width:0; }
+
+  .rows { margin-top:12px; border:1px solid var(--line); border-radius:10px;
+          background:var(--panel); overflow:hidden; }
+  .row { display:flex; justify-content:space-between; align-items:baseline; gap:12px;
+         padding:8px 14px; border-top:1px solid #1e222a; }
+  .row:first-child { border-top:0; }
+  .row .k { color:var(--dim); font-size:12.5px; }
+  .row .v { font-variant-numeric:tabular-nums; font-size:19px; letter-spacing:-.01em; }
+  .row.hero { padding:12px 14px; background:#12161c; }
+  .row.hero .k { color:var(--fg); font-size:13px; }
+  .row.hero .v { font-size:27px; }
+  .u { color:var(--dim); font-size:12px; margin-left:3px; font-variant-numeric:normal; }
+  .win { color:var(--ok); } .lose { color:var(--warm); }
+
+  .pill { font-size:11px; padding:2px 9px; border-radius:99px; border:1px solid var(--line);
+          color:var(--dim); font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .pill.run { color:var(--acc); border-color:#2b4a5c; }
+  .pill.done { color:var(--ok); border-color:#2c5138; }
+  .pill.err { color:var(--bad); border-color:#5c2b2b; }
+  footer { padding:15px 22px 30px; color:var(--dim); font-size:12px; border-top:1px solid var(--line); }
+  code { background:#0a0c0f; padding:1px 5px; border-radius:4px; color:var(--acc); font-size:12px; }
+</style>
+
+<header>
+  <h1>hevc-duel</h1>
+  <button id="play">▶ Play</button>
+  <span class="meta" id="src">…</span>
+</header>
+
+<div class="verdict" id="verdict">Press Play to decode the same clip in every decoder at once.</div>
+<div class="cols" id="cols"></div>
+
+<footer>
+  <b>A demo, not a benchmark.</b> Every decoder runs at once on this machine and
+  they contend for cores, cache and memory bandwidth, so these figures move with
+  system load. Published numbers come from <code>tools/bench/codec-bench.ps1</code> — one
+  arm at a time, pinned to one core at High priority, ABBA-interleaved, 21 pairs,
+  paired win rate with a z-score, work parity checked.
+  <br><br>
+  <b>The clip plays at its own frame rate</b>, so every pane shows the same picture
+  at the same moment and the run lasts as long as the video does. Speed therefore
+  cannot be read off the clock — it is measured as <b>CPU time</b>, sampled from
+  each decoder process, which accrues only while that process is actually running.
+  A decoder that spends 3 s of CPU delivering 20 s of video is running at
+  <b>6.7× real time</b>. Timing <code>read()</code> instead was tried and inverted
+  the answer: with the reader paced the decoder fills the pipe, so it measured
+  buffering rather than decoding.
+  <br><br>
+  What a table cannot show, and this can: every decoder emitting <b>the same
+  pixels</b>. Each frame is hashed as it arrives and compared across all arms — so
+  the scalar reference, the AVX2 kernels and ffmpeg agreeing is visible rather than
+  asserted.
+</footer>
+
+<script>
+const cols = document.getElementById('cols');
+const playBtn = document.getElementById('play');
+let built = false;
+
+const col = (i, a) => `<div class="col">
+  <div class="title"><span>${a.name}</span><span class="pill" id="p${i}">idle</span></div>
+  <div class="screen">
+    <img id="img${i}" src="/mjpeg/${i}" alt="">
+    <div class="seek"><i id="sk${i}"></i></div>
+  </div>
+  <div class="rows">
+    <div class="row hero"><span class="k">real-time headroom</span><span class="v" id="hd${i}">—</span></div>
+    <div class="row"><span class="k">CPU used</span><span class="v" id="cp${i}">—</span></div>
+    <div class="row"><span class="k">CPU per frame</span><span class="v" id="pf${i}">—</span></div>
+    <div class="row"><span class="k">duty cycle</span><span class="v" id="dt${i}">—</span></div>
+    <div class="row"><span class="k">frames decoded</span><span class="v" id="fr${i}">0</span></div>
+    <div class="row"><span class="k">playing at</span><span class="v" id="rt${i}">—</span></div>
+  </div>
+</div>`;
+
+const set = (id, html) => { const e = document.getElementById(id); if (e) e.innerHTML = html; };
+
+playBtn.onclick = async () => {
+  playBtn.disabled = true;
+  playBtn.textContent = '▶ Playing';
+  try { await fetch('/start'); } catch {}
+};
+
+async function tick() {
+  let s;
+  try { s = await (await fetch('/stats?' + Date.now())).json(); }
+  catch { setTimeout(tick, 500); return; }
+
+  if (!built) {
+    cols.innerHTML = s.arms.map((a, i) => col(i, a)).join('');
+    const secs = s.clip_frames && s.clip_fps ? s.clip_frames / s.clip_fps : 0;
+    const ratio = s.clip_frames ? (s.frame_bytes * s.clip_frames) / s.src_bytes : 0;
+    set('src', `${s.w}×${s.h}p${s.clip_fps} · ${secs.toFixed(0)} s clip · `
+      + `${(s.src_bytes/1048576).toFixed(2)} MiB encoded → ${((s.frame_bytes*s.clip_frames)/1048576).toFixed(0)} MiB decoded · `
+      + `${ratio.toFixed(0)}:1 · ${((s.src_bytes*8)/(secs*1e6)).toFixed(2)} Mbps`
+      + (s.paced ? '' : ' · UNPACED'));
+    built = true;
+  }
+
+  // Headroom = wall / CPU. Only CPU time survives real-time pacing, so this is
+  // the one speed figure on the page that means anything.
+  const heads = s.arms.map(a => a.cpu_ms > 0 ? a.ms / a.cpu_ms : 0);
+  const best = Math.max(...heads);
+  const clipFrames = s.clip_frames || 1;
+
+  s.arms.forEach((a, i) => {
+    const started = a.frames > 0;
+    set('hd' + i, started && a.cpu_ms > 0
+      ? `<span class="${heads[i] >= best ? 'win' : 'lose'}">${heads[i].toFixed(1)}×</span><span class="u">real time</span>`
+      : '—');
+    set('cp' + i, started ? `${(a.cpu_ms/1000).toFixed(2)}<span class="u">s of</span>${(a.ms/1000).toFixed(1)}<span class="u">s</span>` : '—');
+    set('pf' + i, started ? `${a.cpu_per_frame.toFixed(2)}<span class="u">ms</span>` : '—');
+    set('dt' + i, started ? `${(a.duty*100).toFixed(1)}<span class="u">%</span>` : '—');
+    set('fr' + i, `${a.frames}`);
+    set('rt' + i, started ? `${a.play_fps.toFixed(1)}<span class="u">fps</span>` : '—');
+    const sk = document.getElementById('sk' + i);
+    if (sk) sk.style.width = (100 * ((a.frames % clipFrames) / clipFrames)) + '%';
+    const p = document.getElementById('p' + i);
+    if (a.error)      { p.textContent = a.error.slice(0, 60); p.className = 'pill err'; }
+    else if (a.done)  { p.textContent = 'done'; p.className = 'pill done'; }
+    else if (started) { p.textContent = 'playing'; p.className = 'pill run'; }
+    else              { p.textContent = 'idle'; p.className = 'pill'; }
+  });
+
+  if (s.started && !s.running) { playBtn.disabled = false; playBtn.textContent = '▶ Play again'; }
+
+  // Fastest against slowest, so the line means the same thing for any number
+  // of arms. CPU time, because that is the only figure real-time pacing leaves
+  // intact.
+  const live = s.arms.filter(a => a.cpu_ms > 0);
+  let rel = '';
+  if (live.length >= 2) {
+    const lo = live.reduce((p, c) => c.cpu_ms < p.cpu_ms ? c : p);
+    const hi = live.reduce((p, c) => c.cpu_ms > p.cpu_ms ? c : p);
+    if (lo !== hi) {
+      rel = ` &nbsp;·&nbsp; <b>${lo.name}</b> used <b>${(hi.cpu_ms / lo.cpu_ms).toFixed(2)}×</b> less CPU than ${hi.name}`;
+    }
+  }
+  const px = s.compared
+    ? (s.first_mismatch < 0
+        ? `<span class="win">✓ pixel-identical on all ${s.agree} frames compared</span>`
+        : `<span style="color:var(--bad)">✗ first pixel mismatch at frame ${s.first_mismatch}</span>`)
+    : (s.running ? 'comparing…' : 'Press Play to decode the same clip in every decoder at once.');
+  set('verdict', px + rel);
+
+  setTimeout(tick, 250);
+}
+
+// Video arrives as multipart/x-mixed-replace, painted by the browser as parts
+// land — no polling floor, no per-frame request. Nothing for JS to drive.
+tick();
+</script>

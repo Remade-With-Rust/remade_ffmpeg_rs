@@ -25,9 +25,20 @@ pub enum Error {
 }
 
 impl Error {
+    /// `#[cold]` and out of line: `InvalidData` owns a `String`, so every
+    /// `Error::invalid("...")` inlines an allocation and a copy of the literal
+    /// at the call site. Those sites are bitstream-conformance checks that
+    /// never fire on a valid stream, and four of them sit inside
+    /// `residual_block`, the hottest function in the decoder. Every `&str`
+    /// literal shares one monomorphisation, so this is a single out-of-line
+    /// body for all of them -- and the enum's public shape is unchanged.
+    #[cold]
+    #[inline(never)]
     pub fn invalid(msg: impl Into<String>) -> Self {
         Error::InvalidData(msg.into())
     }
+    #[cold]
+    #[inline(never)]
     pub fn unsupported(msg: impl Into<String>) -> Self {
         Error::Unsupported(msg.into())
     }

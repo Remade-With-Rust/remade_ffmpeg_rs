@@ -70,9 +70,7 @@ pub fn luma_edge_scalar(data: &mut [u16], stride: usize, x: usize, y: usize, dir
         return;
     }
     let dsam = |k: usize, dpq: i32| -> bool {
-        dpq < (beta >> 2)
-            && (g(data, k, -4) - g(data, k, -1)).abs() + (g(data, k, 0) - g(data, k, 3)).abs() < (beta >> 3)
-            && (g(data, k, -1) - g(data, k, 0)).abs() < ((5 * tc + 1) >> 1)
+        dpq < (beta >> 2) && (g(data, k, -4) - g(data, k, -1)).abs() + (g(data, k, 0) - g(data, k, 3)).abs() < (beta >> 3) && (g(data, k, -1) - g(data, k, 0)).abs() < ((5 * tc + 1) >> 1)
     };
     let strong = dsam(0, 2 * dpq0) && dsam(3, 2 * dpq3);
     let dep = dp < ((beta + (beta >> 1)) >> 3);
@@ -354,18 +352,16 @@ pub fn luma_edge(data: &mut [u16], stride: usize, x: usize, y: usize, dir: usize
         let dpq0 = dp0 + dq0;
         let dpq3 = dp3 + dq3;
         if dpq0 + dpq3 >= beta {
-            if census::enabled() {
+            if census::ALWAYS {
                 census::arm(&census::RT_DEBLOCK_SKIP);
             }
             return;
         }
-        let dsam = |k: usize, dpq: i32| -> bool {
-            dpq < (beta >> 2) && (g(k, -4) - g(k, -1)).abs() + (g(k, 0) - g(k, 3)).abs() < (beta >> 3) && (g(k, -1) - g(k, 0)).abs() < ((5 * tc + 1) >> 1)
-        };
+        let dsam = |k: usize, dpq: i32| -> bool { dpq < (beta >> 2) && (g(k, -4) - g(k, -1)).abs() + (g(k, 0) - g(k, 3)).abs() < (beta >> 3) && (g(k, -1) - g(k, 0)).abs() < ((5 * tc + 1) >> 1) };
         let strong = dsam(0, 2 * dpq0) && dsam(3, 2 * dpq3);
         let dep = (dp0 + dp3) < ((beta + (beta >> 1)) >> 3);
         let deq = (dq0 + dq3) < ((beta + (beta >> 1)) >> 3);
-        if census::enabled() {
+        if census::ALWAYS {
             census::route(strong, &census::RT_DEBLOCK_STRONG, &census::RT_DEBLOCK_WEAK);
             census::bump(&census::DEBLOCK_LUMA_SIMD, 1);
         }
@@ -373,7 +369,7 @@ pub fn luma_edge(data: &mut [u16], stride: usize, x: usize, y: usize, dir: usize
         unsafe { x86::luma_edge_sse2(data.as_mut_ptr(), stride, x, y, dir, tc, no_p, no_q, max, strong, dep, deq) };
         return;
     }
-    if census::enabled() {
+    if census::ALWAYS {
         census::bump(&census::DEBLOCK_LUMA_SCALAR, 1);
     }
     luma_edge_scalar(data, stride, x, y, dir, beta, tc, no_p, no_q, max);
@@ -416,7 +412,11 @@ mod tests {
                                         0 => {
                                             // flat either side of the edge -> strong
                                             let across = if dir == 0 { px } else { py };
-                                            if across < 20 { 40 } else { 44 }
+                                            if across < 20 {
+                                                40
+                                            } else {
+                                                44
+                                            }
                                         }
                                         1 => ((px + py) * 3) as u16 & max as u16,
                                         2 => (60 + (lcg(&mut st) % 5)) as u16,

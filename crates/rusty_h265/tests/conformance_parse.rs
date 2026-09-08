@@ -10,7 +10,7 @@
 //!   the 100 %-conformant decoder's frame count for the stream.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn vectors_dir() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("HEVC_VECTORS") {
@@ -24,7 +24,7 @@ fn vectors_dir() -> Option<PathBuf> {
 }
 
 /// Minimal reader for the flat `probe.json` (no serde in this crate).
-fn load_probe(dir: &PathBuf) -> BTreeMap<String, (u32, u32, String, String, Option<u64>)> {
+fn load_probe(dir: &Path) -> BTreeMap<String, (u32, u32, String, String, Option<u64>)> {
     let text = std::fs::read_to_string(dir.join("probe.json")).expect("probe.json");
     let mut out = BTreeMap::new();
     // "NAME": { "frames": N, "height": H, "level": L, "pix_fmt": "..", "profile": "..", "width": W }
@@ -56,10 +56,7 @@ fn phase1_parse_and_dpb_dry_run() {
         // A missing corpus is a legitimate local skip, but in CI it is a green
         // build that verified nothing. `HEVC_REQUIRE_VECTORS=1` turns the skip
         // into a failure so a broken fetch cannot masquerade as a pass.
-        assert!(
-            std::env::var_os("HEVC_REQUIRE_VECTORS").is_none(),
-            "hevc-vectors/ is missing and HEVC_REQUIRE_VECTORS is set"
-        );
+        assert!(std::env::var_os("HEVC_REQUIRE_VECTORS").is_none(), "hevc-vectors/ is missing and HEVC_REQUIRE_VECTORS is set");
         eprintln!("hevc-vectors/ not present; skipping");
         return;
     };

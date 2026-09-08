@@ -34,6 +34,13 @@ use crate::census;
 pub const MAX_N: usize = 32;
 pub const REF_LEN: usize = 3 * MAX_N + 1;
 
+/// `#[cold]`: the SIMD guard above it succeeds on every block of a conformant
+/// stream -- the `*_SCALAR` census counters read 0 across the corpus -- so this
+/// is the fallback for a shape the kernels decline, not a path decode takes.
+/// Inlined it padded the dispatcher, which IS on the hot path, with a body that
+/// never runs. Same reason `Cabac::refill_tail` is out of line.
+#[cold]
+#[inline(never)]
 fn angular_scalar(dst: &mut [u16], dst_stride: usize, n: usize, refb: &[i16], off: usize, angle: i32) {
     for i in 0..n {
         let pos = (i as i32 + 1) * angle;
@@ -55,6 +62,13 @@ fn angular_scalar(dst: &mut [u16], dst_stride: usize, n: usize, refb: &[i16], of
     }
 }
 
+/// `#[cold]`: the SIMD guard above it succeeds on every block of a conformant
+/// stream -- the `*_SCALAR` census counters read 0 across the corpus -- so this
+/// is the fallback for a shape the kernels decline, not a path decode takes.
+/// Inlined it padded the dispatcher, which IS on the hot path, with a body that
+/// never runs. Same reason `Cabac::refill_tail` is out of line.
+#[cold]
+#[inline(never)]
 fn planar_scalar(dst: &mut [u16], dst_stride: usize, n: usize, left: &[i16], top: &[i16], log2n: u32) {
     let tn = top[n] as i32;
     let ln = left[n] as i32;
@@ -232,8 +246,13 @@ mod x86 {
             let c = _mm_set1_epi32((y as i32 + 1) * ln + n as i32);
             let w = _mm_set1_epi32((l & 0xffff) | (tn << 16));
             let row = unsafe { dst.add(y * dst_stride) };
-            let mut x = 0usize;
-            while x + 4 <= n {
+            // Two vectors per store, for the same reason the AVX2 twin pairs:
+            // four `i32` lanes only HALF-fill a 128-bit store, so one vector per
+            // trip paid a `packs` and a half-width `storel` for every four
+            // samples. Two fill the store exactly and pay that pair once for
+            // eight. `packs` does not cross lanes on 128-bit, so unlike the
+            // AVX2 version this needs no permute to put the halves in order.
+            let term = |x: usize| {
                 let rp = unsafe { _mm_loadu_si128(ramp.as_ptr().add(2 * x) as *const __m128i) };
                 let xterm = _mm_madd_epi16(rp, w);
                 // Zero-extend four `top` samples to `i32`, then `k * top` via
@@ -242,10 +261,21 @@ mod x86 {
                 let t = unsafe { _mm_loadl_epi64(top.add(x) as *const __m128i) };
                 let t32 = _mm_unpacklo_epi16(t, zero);
                 let yterm = _mm_madd_epi16(t32, k);
-                let v = _mm_sra_epi32(_mm_add_epi32(_mm_add_epi32(xterm, yterm), c), sh);
-                unsafe { _mm_storel_epi64(row.add(x) as *mut __m128i, _mm_packs_epi32(v, v)) };
-                x += 4;
+                _mm_sra_epi32(_mm_add_epi32(_mm_add_epi32(xterm, yterm), c), sh)
+            };
+            let nvec = n / 4;
+            for i in 0..nvec / 2 {
+                let x = i * 8;
+                let v0 = term(x);
+                let v1 = term(x + 4);
+                unsafe { _mm_storeu_si128(row.add(x) as *mut __m128i, _mm_packs_epi32(v0, v1)) };
             }
+            if nvec % 2 == 1 {
+                let x = (nvec - 1) * 4;
+                let v = term(x);
+                unsafe { _mm_storel_epi64(row.add(x) as *mut __m128i, _mm_packs_epi32(v, v)) };
+            }
+            let mut x = nvec * 4;
             while x < n {
                 let v = (n - 1 - x) as i32 * l + (x as i32 + 1) * tn + (n - 1 - y) as i32 * unsafe { *top.add(x) } as i32 + (y as i32 + 1) * ln + n as i32;
                 unsafe { *row.add(x) = (v >> (log2n + 1)) as u16 };
@@ -365,6 +395,12 @@ mod x86 {
     /// As [`planar_sse2`].
     #[target_feature(enable = "avx2")]
     pub unsafe fn planar_avx2(dst: *mut u16, dst_stride: usize, n: usize, left: *const i16, top: *const i16, log2n: u32) {
+        // This kernel steps eight `i32`; the SSE2 twin steps four and so covers
+        // `n == 4`, which this one would send to its scalar tail.
+        if n < 8 {
+            // SAFETY: same footprint, narrower step.
+            return unsafe { planar_sse2(dst, dst_stride, n, left, top, log2n) };
+        }
         let tn = unsafe { *top.add(n) } as i32;
         let ln = unsafe { *left.add(n) } as i32;
         let sh = _mm_cvtsi32_si128(log2n as i32 + 1);
@@ -436,6 +472,14 @@ mod x86 {
                 unsafe { _mm_storeu_si128(row.add(i * 8) as *mut __m128i, v) };
             }
             let mut x = nvec * 8;
+            // A 4-wide store before the scalar tail. `nvec = n / 8`, so a 4x4
+            // block wrote its whole row one sample at a time -- and 4x4 is
+            // 28.4% of intra samples on intra-heavy content
+            // (`INTRA_N_LT8` = 49,728,768).
+            if x + 4 <= n {
+                unsafe { _mm_storel_epi64(row.add(x) as *mut __m128i, v) };
+                x += 4;
+            }
             while x < n {
                 unsafe { *row.add(x) = dc };
                 x += 1;
@@ -497,8 +541,7 @@ mod x86 {
                 }
                 // SAFETY: both tiles lie inside the n x n block.
                 unsafe {
-                    tile8_sse2(dst.add(j0 * dst_stride + i0), dst_stride, strip.as_ptr(), 16);
-                    tile8_sse2(dst.add((j0 + 8) * dst_stride + i0), dst_stride, strip.as_ptr().add(8), 16);
+                    tile8x2_avx2(dst.add(j0 * dst_stride + i0), dst.add((j0 + 8) * dst_stride + i0), dst_stride, strip.as_ptr(), 16);
                 }
                 j0 += 16;
             }
@@ -549,6 +592,65 @@ mod x86 {
         ];
         for (k, v) in out.iter().enumerate() {
             unsafe { _mm_storeu_si128(dst.add(k * dst_stride) as *mut __m128i, *v) };
+        }
+    }
+
+    /// Transpose TWO horizontally-adjacent 8×8 `u16` tiles at once.
+    ///
+    /// `vpunpck*` on a 256-bit register works inside each 128-bit lane
+    /// independently, so one register set carries both tiles through the same
+    /// three-stage ladder `tile8_sse2` uses: the low lane transposes the left
+    /// tile while the high lane transposes the right one, with no lane
+    /// crossing anywhere. Only the stores differ -- the two results land at
+    /// unrelated addresses, so the high lane needs an explicit extract.
+    ///
+    /// Eight loads and twenty-four unpacks against sixteen and forty-eight for
+    /// the pair of SSE2 tiles this replaces.
+    ///
+    /// # Safety
+    /// `src` must have 8 rows of 16 samples at `src_stride`; `dst_a` and
+    /// `dst_b` must each have 8 rows of 8 at `dst_stride`.
+    #[target_feature(enable = "avx2")]
+    unsafe fn tile8x2_avx2(dst_a: *mut u16, dst_b: *mut u16, dst_stride: usize, src: *const u16, src_stride: usize) {
+        let mut r = [_mm256_setzero_si256(); 8];
+        for (k, slot) in r.iter_mut().enumerate() {
+            *slot = unsafe { _mm256_loadu_si256(src.add(k * src_stride) as *const __m256i) };
+        }
+        let a: [__m256i; 8] = [
+            _mm256_unpacklo_epi16(r[0], r[1]),
+            _mm256_unpackhi_epi16(r[0], r[1]),
+            _mm256_unpacklo_epi16(r[2], r[3]),
+            _mm256_unpackhi_epi16(r[2], r[3]),
+            _mm256_unpacklo_epi16(r[4], r[5]),
+            _mm256_unpackhi_epi16(r[4], r[5]),
+            _mm256_unpacklo_epi16(r[6], r[7]),
+            _mm256_unpackhi_epi16(r[6], r[7]),
+        ];
+        let b: [__m256i; 8] = [
+            _mm256_unpacklo_epi32(a[0], a[2]),
+            _mm256_unpackhi_epi32(a[0], a[2]),
+            _mm256_unpacklo_epi32(a[1], a[3]),
+            _mm256_unpackhi_epi32(a[1], a[3]),
+            _mm256_unpacklo_epi32(a[4], a[6]),
+            _mm256_unpackhi_epi32(a[4], a[6]),
+            _mm256_unpacklo_epi32(a[5], a[7]),
+            _mm256_unpackhi_epi32(a[5], a[7]),
+        ];
+        let out: [__m256i; 8] = [
+            _mm256_unpacklo_epi64(b[0], b[4]),
+            _mm256_unpackhi_epi64(b[0], b[4]),
+            _mm256_unpacklo_epi64(b[1], b[5]),
+            _mm256_unpackhi_epi64(b[1], b[5]),
+            _mm256_unpacklo_epi64(b[2], b[6]),
+            _mm256_unpackhi_epi64(b[2], b[6]),
+            _mm256_unpacklo_epi64(b[3], b[7]),
+            _mm256_unpackhi_epi64(b[3], b[7]),
+        ];
+        for (k, v) in out.iter().enumerate() {
+            unsafe {
+                _mm_storeu_si128(dst_a.add(k * dst_stride) as *mut __m128i, _mm256_castsi256_si128(*v));
+                _mm_storeu_si128(dst_b.add(k * dst_stride) as *mut __m128i, _mm256_extracti128_si256(*v, 1));
+            }
         }
     }
 
@@ -744,14 +846,17 @@ pub fn angular_i16_is_exact(max: i32) -> bool {
 }
 
 pub fn angular(dst: &mut [u16], dst_stride: usize, n: usize, refb: &[i16], off: usize, angle: i32, max: i32) {
+    if census::ALWAYS {
+        census::bump(if n < 8 { &census::INTRA_N_LT8 } else { &census::INTRA_N_GE8 }, (n * n) as u64);
+    }
     // The largest reference index this can touch is `off + n + (n*angle>>5) + 1`,
     // bounded by `off + 2n + 1`; the `+ 8` is the vector overread.
-    let ok = n >= 4 && n <= MAX_N && dst.len() >= dst_stride * (n - 1) + n && refb.len() >= off + 2 * n + 9 && angular_i16_is_exact(max);
+    let ok = (4..=MAX_N).contains(&n) && dst.len() >= dst_stride * (n - 1) + n && refb.len() >= off + 2 * n + 9 && angular_i16_is_exact(max);
     debug_assert!(
-        n < 4 || n > MAX_N || angular_i16_is_exact(max),
+        !(4..=MAX_N).contains(&n) || angular_i16_is_exact(max),
         "angular: max={max} exceeds the i16 headroom; the kernel would wrap"
     );
-    if census::enabled() {
+    if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::INTRA_ANGULAR_SIMD } else { &census::INTRA_ANGULAR_SCALAR }, 1);
         census::bump(&census::SAMPLES_INTRA, (n * n) as u64);
@@ -776,12 +881,12 @@ pub fn angular(dst: &mut [u16], dst_stride: usize, n: usize, refb: &[i16], off: 
 /// column: the same arithmetic as [`angular`] written **column-major**, so the
 /// caller needs no scratch block of its own.
 pub fn angular_t(dst: &mut [u16], dst_stride: usize, n: usize, refb: &[i16], off: usize, angle: i32, max: i32) {
-    let ok = n >= 4 && n <= MAX_N && dst.len() >= dst_stride * (n - 1) + n && refb.len() >= off + 2 * n + 9 && angular_i16_is_exact(max);
+    let ok = (4..=MAX_N).contains(&n) && dst.len() >= dst_stride * (n - 1) + n && refb.len() >= off + 2 * n + 9 && angular_i16_is_exact(max);
     debug_assert!(
-        n < 4 || n > MAX_N || angular_i16_is_exact(max),
+        !(4..=MAX_N).contains(&n) || angular_i16_is_exact(max),
         "angular_t: max={max} exceeds the i16 headroom; the kernel would wrap"
     );
-    if census::enabled() {
+    if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::INTRA_ANGULAR_SIMD } else { &census::INTRA_ANGULAR_SCALAR }, 1);
         census::bump(&census::SAMPLES_INTRA, (n * n) as u64);
@@ -799,9 +904,12 @@ pub fn angular_t(dst: &mut [u16], dst_stride: usize, n: usize, refb: &[i16], off
 
 /// Planar prediction (§8.4.4.2.5). `left` and `top` must hold `n + 1` samples.
 pub fn planar(dst: &mut [u16], dst_stride: usize, n: usize, left: &[i16], top: &[i16], log2n: u32) {
-    let ok = n >= 4 && n <= MAX_N && dst.len() >= dst_stride * (n - 1) + n && left.len() > n && top.len() > n;
+    if census::ALWAYS {
+        census::bump(if n < 8 { &census::INTRA_N_LT8 } else { &census::INTRA_N_GE8 }, (n * n) as u64);
+    }
+    let ok = (4..=MAX_N).contains(&n) && dst.len() >= dst_stride * (n - 1) + n && left.len() > n && top.len() > n;
     debug_assert!(ok);
-    if census::enabled() {
+    if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::INTRA_PLANAR_SIMD } else { &census::INTRA_PLANAR_SCALAR }, 1);
         census::bump(&census::SAMPLES_INTRA, (n * n) as u64);
@@ -820,9 +928,9 @@ pub fn planar(dst: &mut [u16], dst_stride: usize, n: usize, left: &[i16], top: &
 /// DC prediction's flat fill (§8.4.4.2.5); the three edge fix-ups stay with
 /// the caller, which owns the `c_idx` and size conditions.
 pub fn dc_fill(dst: &mut [u16], dst_stride: usize, n: usize, dc: u16) {
-    let ok = n >= 4 && n <= MAX_N && dst.len() >= dst_stride * (n - 1) + n;
+    let ok = (4..=MAX_N).contains(&n) && dst.len() >= dst_stride * (n - 1) + n;
     debug_assert!(ok);
-    if census::enabled() {
+    if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::INTRA_DC_SIMD } else { &census::INTRA_DC_SCALAR }, 1);
         census::bump(&census::SAMPLES_INTRA, (n * n) as u64);
@@ -840,7 +948,7 @@ pub fn dc_fill(dst: &mut [u16], dst_stride: usize, n: usize, dc: u16) {
 
 /// Transpose an `n × n` block of samples.
 pub fn transpose(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, n: usize) {
-    let ok = n >= 4 && n <= MAX_N && dst.len() >= dst_stride * (n - 1) + n && src.len() >= src_stride * (n - 1) + n;
+    let ok = (4..=MAX_N).contains(&n) && dst.len() >= dst_stride * (n - 1) + n && src.len() >= src_stride * (n - 1) + n;
     debug_assert!(ok);
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     if ok {
@@ -983,7 +1091,7 @@ mod tests {
     #[test]
     fn angular_is_exact_at_rext_bit_depths() {
         let mut st = 0x7a11_ceedu32;
-        let mut rnd = |s: &mut u32| {
+        let rnd = |s: &mut u32| {
             *s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             (*s >> 8) as i32
         };

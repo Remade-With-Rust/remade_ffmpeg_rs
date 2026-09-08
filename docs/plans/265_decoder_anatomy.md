@@ -38,6 +38,11 @@ Stream: `in_to_tree_720p_8bit.hevc`, 60 frames of 720p mainstream inter content.
 | intra prediction                          |       1.000× | 6/12  | 0.00 | **not resolvable** |
 | *remainder — parse, CABAC, orchestration* |              |       |      |             *~30%* |
 
+**Superseded for the transform (2026-09-06).** The 27.1% row was measured before
+the transform rewrite, which took **1.163×** whole-decode (17/17, z = 4.12) on
+this stream — see `rusty_hevc_kernels.md`. The stage map above is the map that
+*motivated* that work; re-measure before using it to pick the next target.
+
 **These are ablations, so they are upper bounds and they do not sum to 100%.**
 Turning a stage off removes its downstream effects too, and the stages overlap.
 Read them as "this stage costs at most X", not as a partition.
@@ -98,16 +103,15 @@ same toolchain and source give the same numbers every run.
 
 ### Motion compensation — 25.5% of decode
 
-| kernel              | instrs | SIMD | per output | notes                                                           |
-|---------------------|-------:|-----:|-----------:|-----------------------------------------------------------------|
-| `fir_h_avx2`        |     43 |   40 |      1.344 | horizontal FIR; **every load folded into a `vpmaddwd`**         |
-| `fir_v_avx2`        |     72 |   61 |      2.250 | vertical FIR, two output rows per pass (9 loads, not 16)        |
-| `fir_v_avx2_sym`    |     57 |   43 |  **1.781** | symmetric-tap fold, −21% instructions                           |
-| `copy_shift_avx2`   |      9 |    6 |  **0.281** | full-pel copy — the integer-MV path, which had no kernel at all |
-| `put_uni_avx2`      |     13 |   10 |      0.406 |                                                                 |
-| `put_bi_avx2`       |     17 |   14 |      0.531 |                                                                 |
-| `weighted_uni_avx2` |     18 |   15 |      1.125 | `pmaddwd`, weight and offset in one contraction                 |
-| `weighted_bi_avx2`  |     17 |   14 |      1.062 |                                                                 |
+| kernel              | instrs | SIMD | per output | |
+| `fir_h_avx2`        |     43 |   40 |      1.344 | horizontal FIR; **every load folded into a `vpmaddwd`** 
+| `fir_v_avx2`        |     72 |   61 |      2.250 | vertical FIR, 
+| `fir_v_avx2_sym`    |     57 |   43 |  **1.781** | symmetric-tap fold, −21% instructions 
+| `copy_shift_avx2`   |      9 |    6 |  **0.281** | full-pel copy — the integer-MV path
+| `put_uni_avx2`      |     13 |   10 |      0.406 |   |
+| `put_bi_avx2`       |     17 |   14 |      0.531 |      |
+| `weighted_uni_avx2` |     18 |   15 |      1.125 | `pmaddwd`, weight and offset in one contraction  
+| `weighted_bi_avx2`  |     17 |   14 |      1.062 |        |
 
 Route populations (mainstream): 2-D **175,979** calls, horizontal 38,456,
 vertical 36,956, full-pel 610. The 2-D path is 70% of MC, which is why the

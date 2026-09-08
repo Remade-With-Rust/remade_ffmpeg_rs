@@ -32,6 +32,13 @@ fn doff(d: (i32, i32), stride: usize) -> isize {
     d.1 as isize * stride as isize + d.0 as isize
 }
 
+/// `#[cold]`: the SIMD guard above it succeeds on every block of a conformant
+/// stream -- the `*_SCALAR` census counters read 0 across the corpus -- so this
+/// is the fallback for a shape the kernels decline, not a path decode takes.
+/// Inlined it padded the dispatcher, which IS on the hot path, with a body that
+/// never runs. Same reason `Cabac::refill_tail` is out of line.
+#[cold]
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn sao_band_scalar(dst: &mut [u16], src: &[u16], stride: usize, x0: usize, y0: usize, w: usize, h: usize, shift: u32, band: &[i16; 32], max: i32) {
     for y in y0..y0 + h {
@@ -46,6 +53,13 @@ fn sao_band_scalar(dst: &mut [u16], src: &[u16], stride: usize, x0: usize, y0: u
     }
 }
 
+/// `#[cold]`: the SIMD guard above it succeeds on every block of a conformant
+/// stream -- the `*_SCALAR` census counters read 0 across the corpus -- so this
+/// is the fallback for a shape the kernels decline, not a path decode takes.
+/// Inlined it padded the dispatcher, which IS on the hot path, with a body that
+/// never runs. Same reason `Cabac::refill_tail` is out of line.
+#[cold]
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn sao_edge_scalar(dst: &mut [u16], src: &[u16], stride: usize, x0: usize, y0: usize, w: usize, h: usize, da: (i32, i32), db: (i32, i32), offs: &[i16; 4], max: i32) {
     let table = edge_offsets(offs);
@@ -77,18 +91,8 @@ mod x86 {
         let sh = _mm_cvtsi32_si128(shift as i32);
         let maxv = _mm_set1_epi16(max as i16);
         let zero = _mm_setzero_si128();
-        let idx: [__m128i; 4] = [
-            _mm_set1_epi16(bands[0].0),
-            _mm_set1_epi16(bands[1].0),
-            _mm_set1_epi16(bands[2].0),
-            _mm_set1_epi16(bands[3].0),
-        ];
-        let val: [__m128i; 4] = [
-            _mm_set1_epi16(bands[0].1),
-            _mm_set1_epi16(bands[1].1),
-            _mm_set1_epi16(bands[2].1),
-            _mm_set1_epi16(bands[3].1),
-        ];
+        let idx: [__m128i; 4] = [_mm_set1_epi16(bands[0].0), _mm_set1_epi16(bands[1].0), _mm_set1_epi16(bands[2].0), _mm_set1_epi16(bands[3].0)];
+        let val: [__m128i; 4] = [_mm_set1_epi16(bands[0].1), _mm_set1_epi16(bands[1].1), _mm_set1_epi16(bands[2].1), _mm_set1_epi16(bands[3].1)];
         for y in 0..h {
             let s = unsafe { src.add(y * src_stride) };
             let d = unsafe { dst.add(y * dst_stride) };
@@ -135,6 +139,73 @@ mod x86 {
         }
     }
 
+    /// Band offset for the SSE4.1 rung: the four active bands are CONSECUTIVE
+    /// from `pos`, so `b - pos` indexes a `pshufb` table directly.
+    ///
+    /// The SSE2 twin has to spell that out as four `cmpeq`/`and`/`or` triples,
+    /// twelve instructions per vector, because `pshufb` is SSSE3 and
+    /// `pminuw` SSE4.1. This is the same identity `band_avx2` uses, at half the
+    /// width.
+    ///
+    /// # Safety
+    /// As [`band_sse2`].
+    #[target_feature(enable = "sse4.1")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn band_sse41(dst: *mut u16, dst_stride: usize, src: *const u16, src_stride: usize, w: usize, h: usize, shift: u32, pos: i16, offs: [i16; 4], max: i32) {
+        let sh = _mm_cvtsi32_si128(shift as i32);
+        let maxv = _mm_set1_epi16(max as i16);
+        let zero = _mm_setzero_si128();
+        let wrap = pos + 4 > 32;
+        let mut ent = [super::LUT_BIAS as i8; 16];
+        for (k, e) in ent.iter_mut().enumerate().take(4) {
+            *e = (offs[k] + super::LUT_BIAS) as i8;
+        }
+        let lut = unsafe { _mm_loadu_si128(ent.as_ptr() as *const __m128i) };
+        let posv = _mm_set1_epi16(pos);
+        let mask31 = _mm_set1_epi16(31);
+        let clamp = _mm_set1_epi16(15);
+        let hi = _mm_set1_epi16(-32768); // 0x8000: zero the odd bytes
+        let bias = _mm_set1_epi16(super::LUT_BIAS);
+        let nvec = w / 8;
+        for y in 0..h {
+            let s = unsafe { src.add(y * src_stride) };
+            let d = unsafe { dst.add(y * dst_stride) };
+            // Two vectors per trip, as in `band_sse2` and `band_avx2`: the
+            // body is seven instructions and the loop bookkeeping three, so
+            // pairing halves the bookkeeping's share. Written one-per-trip
+            // first, this kernel measured 3.125 instructions per output --
+            // WORSE than the SSE2 twin it replaces, which pairs.
+            let one = |x: usize| {
+                let v = unsafe { _mm_loadu_si128(s.add(x) as *const __m128i) };
+                let bnd = _mm_srl_epi16(v, sh);
+                // (b - pos) mod 32, then anything past the four active bands
+                // folded onto index 15, whose entry is the bias.
+                let d0 = _mm_sub_epi16(bnd, posv);
+                let dlt = if wrap { _mm_and_si128(d0, mask31) } else { d0 };
+                let idx = _mm_or_si128(_mm_min_epu16(dlt, clamp), hi);
+                let off = _mm_sub_epi16(_mm_shuffle_epi8(lut, idx), bias);
+                let r = _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(v, off), zero), maxv);
+                unsafe { _mm_storeu_si128(d.add(x) as *mut __m128i, r) };
+            };
+            for i in 0..nvec / 2 {
+                one(i * 16);
+                one(i * 16 + 8);
+            }
+            if nvec % 2 == 1 {
+                one((nvec - 1) * 8);
+            }
+            let mut x = nvec * 8;
+            while x < w {
+                let v = unsafe { *s.add(x) } as i32;
+                let bnd = (v >> shift) as i16;
+                let dl = if wrap { (bnd - pos) & 31 } else { bnd - pos };
+                let o = if (0..4).contains(&dl) { offs[dl as usize] as i32 } else { 0 };
+                unsafe { *d.add(x) = (v + o).clamp(0, max) as u16 };
+                x += 1;
+            }
+        }
+    }
+
     /// # Safety
     /// As [`band_sse2`], and the neighbour offsets must stay in bounds — the
     /// caller restricts this to the interior of a coding tree block.
@@ -144,13 +215,7 @@ mod x86 {
         let maxv = _mm_set1_epi16(max as i16);
         let zero = _mm_setzero_si128();
         let two = _mm_set1_epi16(2);
-        let cat: [__m128i; 5] = [
-            _mm_set1_epi16(0),
-            _mm_set1_epi16(1),
-            _mm_set1_epi16(2),
-            _mm_set1_epi16(3),
-            _mm_set1_epi16(4),
-        ];
+        let cat: [__m128i; 5] = [_mm_set1_epi16(0), _mm_set1_epi16(1), _mm_set1_epi16(2), _mm_set1_epi16(3), _mm_set1_epi16(4)];
         let val: [__m128i; 5] = [
             _mm_set1_epi16(table[0]),
             _mm_set1_epi16(table[1]),
@@ -197,6 +262,81 @@ mod x86 {
                 for k in 0..5 {
                     off = _mm_or_si128(off, _mm_and_si128(_mm_cmpeq_epi16(e, cat[k]), val[k]));
                 }
+                let r = _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(v, off), zero), maxv);
+                unsafe { _mm_storeu_si128(d.add(x) as *mut __m128i, r) };
+            }
+            let mut x = nvec * 8;
+            while x < w {
+                let p = unsafe { s.add(x) };
+                let v = unsafe { *p } as i32;
+                let a = unsafe { *p.offset(da) } as i32;
+                let b = unsafe { *p.offset(db) } as i32;
+                let e = (2 + (v - a).signum() + (v - b).signum()) as usize;
+                unsafe { *d.add(x) = (v + table[e] as i32).clamp(0, max) as u16 };
+                x += 1;
+            }
+        }
+    }
+
+    /// # Safety
+    /// As [`band_sse2`], and the neighbour offsets must stay in bounds — the
+    /// caller restricts this to the interior of a coding tree block.
+    #[target_feature(enable = "ssse3")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn edge_ssse3(dst: *mut u16, dst_stride: usize, src: *const u16, src_stride: usize, w: usize, h: usize, da: isize, db: isize, table: [i16; 5], max: i32) {
+        let maxv = _mm_set1_epi16(max as i16);
+        let zero = _mm_setzero_si128();
+        let two = _mm_set1_epi16(2);
+        // The five category offsets as BYTES in a `pshufb` table, biased so
+        // they are unsigned. `e | 0x8000` sets each odd byte's high bit, which
+        // makes `pshufb` zero that byte, so every `i16` receives `lut[e]` in
+        // its low half and nothing in its high half.
+        //
+        // The same identity `edge_avx2` uses. It replaces five
+        // `cmpeq`/`and`/`or` triples -- fifteen instructions per vector -- with
+        // an `or`, a `pshufb` and a `sub`. `sao_edge` already refuses the whole
+        // SIMD path unless `offsets_fit_lut` holds, so the byte table is always
+        // representable.
+        let mut ent = [super::LUT_BIAS as i8; 16];
+        for (k, e) in ent.iter_mut().enumerate().take(5) {
+            *e = (table[k] + super::LUT_BIAS) as i8;
+        }
+        let lut = unsafe { _mm_loadu_si128(ent.as_ptr() as *const __m128i) };
+        let hi = _mm_set1_epi16(-32768);
+        let bias = _mm_set1_epi16(super::LUT_BIAS);
+        for y in 0..h {
+            let s = unsafe { src.add(y * src_stride) };
+            let d = unsafe { dst.add(y * dst_stride) };
+            let nvec = w / 8;
+            // Two vectors per trip: same arithmetic, but the loop's own
+            // three instructions are paid once per two vectors.
+            for i in 0..nvec / 2 {
+                for half in 0..2usize {
+                    let x = i * 16 + half * 8;
+                    let p = unsafe { s.add(x) };
+                    let v = unsafe { _mm_loadu_si128(p as *const __m128i) };
+                    let a = unsafe { _mm_loadu_si128(p.offset(da) as *const __m128i) };
+                    let b = unsafe { _mm_loadu_si128(p.offset(db) as *const __m128i) };
+                    // sign(v − n) = cmpgt(n, v) − cmpgt(v, n), each being 0 or −1.
+                    let sa = _mm_sub_epi16(_mm_cmpgt_epi16(a, v), _mm_cmpgt_epi16(v, a));
+                    let sb = _mm_sub_epi16(_mm_cmpgt_epi16(b, v), _mm_cmpgt_epi16(v, b));
+                    let e = _mm_add_epi16(_mm_add_epi16(two, sa), sb);
+                    let off = _mm_sub_epi16(_mm_shuffle_epi8(lut, _mm_or_si128(e, hi)), bias);
+                    let r = _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(v, off), zero), maxv);
+                    unsafe { _mm_storeu_si128(d.add(x) as *mut __m128i, r) };
+                }
+            }
+            if nvec % 2 == 1 {
+                let x = (nvec - 1) * 8;
+                let p = unsafe { s.add(x) };
+                let v = unsafe { _mm_loadu_si128(p as *const __m128i) };
+                let a = unsafe { _mm_loadu_si128(p.offset(da) as *const __m128i) };
+                let b = unsafe { _mm_loadu_si128(p.offset(db) as *const __m128i) };
+                // sign(v − n) = cmpgt(n, v) − cmpgt(v, n), each being 0 or −1.
+                let sa = _mm_sub_epi16(_mm_cmpgt_epi16(a, v), _mm_cmpgt_epi16(v, a));
+                let sb = _mm_sub_epi16(_mm_cmpgt_epi16(b, v), _mm_cmpgt_epi16(v, b));
+                let e = _mm_add_epi16(_mm_add_epi16(two, sa), sb);
+                let off = _mm_sub_epi16(_mm_shuffle_epi8(lut, _mm_or_si128(e, hi)), bias);
                 let r = _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(v, off), zero), maxv);
                 unsafe { _mm_storeu_si128(d.add(x) as *mut __m128i, r) };
             }
@@ -317,15 +457,18 @@ mod x86 {
                 let r = _mm256_min_epi16(_mm256_max_epi16(_mm256_adds_epi16(v, off), zero), maxv);
                 unsafe { _mm256_storeu_si256(d.add(x) as *mut __m256i, r) };
             }
-            let x = nvec * 16;
-            if x < w {
-                let mut bands = [(-1i16, 0i16); 4];
-                for k in 0..4 {
-                    bands[k] = ((pos + k as i16) & 31, offs[k]);
-                }
-                // SAFETY: the rest of this row is in bounds.
-                unsafe { band_sse2(d.add(x), dst_stride, s.add(x), src_stride, w - x, 1, shift, bands, max) };
-            }
+        }
+        // The width remainder, ONCE for the whole block -- as in `edge_avx2`.
+        //
+        // `band_sse41`, not `band_sse2`: both finish correctly, but `band_sse2`
+        // takes the four active bands as `[(index, offset); 4]` while this
+        // kernel holds `(pos, offs)`, so calling it marshalled the array onto
+        // the stack with eight `movw`s and reloaded all seven vector constants
+        // afterwards. `band_sse41` takes exactly `(pos, offs)`.
+        let x = nvec * 16;
+        if x < w {
+            // SAFETY: the remaining columns of every row are in bounds.
+            unsafe { band_sse41(dst.add(x), dst_stride, src.add(x), src_stride, w - x, h, shift, pos, offs, max) };
         }
     }
 
@@ -380,11 +523,23 @@ mod x86 {
                 let r = _mm256_min_epi16(_mm256_max_epi16(_mm256_adds_epi16(v, off), zero), maxv);
                 unsafe { _mm256_storeu_si256(d.add(x) as *mut __m256i, r) };
             }
-            let x = nvec * 16;
-            if x < w {
-                // SAFETY: the rest of this row is in bounds.
-                unsafe { edge_sse2(d.add(x), dst_stride, s.add(x), src_stride, w - x, 1, da, db, table, max) };
-            }
+        }
+        // The width remainder, ONCE for the whole block.
+        //
+        // This used to sit inside the row loop with `h = 1`, so a block of
+        // height `h` made `h` calls, each re-deriving the kernel's constants
+        // and paying the call. The remaining columns are the same for every
+        // row and the callee already loops over `y`, so one call with the real
+        // height is the same work with the setup paid once.
+        //
+        // `edge_ssse3`, not `edge_sse2`: identical signature, but it selects
+        // the offset with one `pshufb` where the SSE2 kernel needs five
+        // `cmpeq`/`and`/`or` triples -- 2.812 instructions per output against
+        // 4.562. AVX2 implies SSSE3, so it is always available here.
+        let x = nvec * 16;
+        if x < w {
+            // SAFETY: the remaining columns of every row are in bounds.
+            unsafe { edge_ssse3(dst.add(x), dst_stride, src.add(x), src_stride, w - x, h, da, db, table, max) };
         }
     }
 }
@@ -532,7 +687,7 @@ pub fn sao_band(dst: &mut [u16], src: &[u16], stride: usize, x0: usize, y0: usiz
         dst.len() >= need && src.len() >= need
     };
     debug_assert!(ok);
-    if census::enabled() {
+    if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::SAO_BAND_SIMD } else { &census::SAO_BAND_SCALAR }, 1);
         census::bump(&census::SAMPLES_SAO, (w * h) as u64);
@@ -551,6 +706,7 @@ pub fn sao_band(dst: &mut [u16], src: &[u16], stride: usize, x0: usize, y0: usiz
             // SAFETY: the length check above covers every access.
             match crate::isa() {
                 crate::Isa::Avx2 => return unsafe { x86::band_avx2(dst.as_mut_ptr().add(o), stride, src.as_ptr().add(o), stride, w, h, shift, pos as i16, offs, max) },
+                crate::Isa::Sse41 => return unsafe { x86::band_sse41(dst.as_mut_ptr().add(o), stride, src.as_ptr().add(o), stride, w, h, shift, pos as i16, offs, max) },
                 _ => return unsafe { x86::band_sse2(dst.as_mut_ptr().add(o), stride, src.as_ptr().add(o), stride, w, h, shift, bands, max) },
             }
         }
@@ -580,7 +736,7 @@ pub fn sao_edge(dst: &mut [u16], src: &[u16], stride: usize, x0: usize, y0: usiz
         lo >= 0 && (hi as usize) < src.len() && (last as usize) < dst.len()
     };
     debug_assert!(ok);
-    if census::enabled() {
+    if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::SAO_EDGE_SIMD } else { &census::SAO_EDGE_SCALAR }, 1);
         census::bump(&census::SAMPLES_SAO, (w * h) as u64);
@@ -595,6 +751,10 @@ pub fn sao_edge(dst: &mut [u16], src: &[u16], stride: usize, x0: usize, y0: usiz
             // reads land inside `src`, and every write inside `dst`.
             match crate::isa() {
                 crate::Isa::Avx2 => return unsafe { x86::edge_avx2(dst.as_mut_ptr().add(o), stride, src.as_ptr().add(o), stride, w, h, oa, ob, table, max) },
+                // SSE4.1 implies SSSE3, which is what the `pshufb` offset
+                // table needs. The SSE2 twin has to spell the same selection
+                // out as five compare/mask/merge triples.
+                crate::Isa::Sse41 => return unsafe { x86::edge_ssse3(dst.as_mut_ptr().add(o), stride, src.as_ptr().add(o), stride, w, h, oa, ob, table, max) },
                 _ => return unsafe { x86::edge_sse2(dst.as_mut_ptr().add(o), stride, src.as_ptr().add(o), stride, w, h, oa, ob, table, max) },
             }
         }
@@ -633,6 +793,21 @@ mod tests {
                 sao_band_scalar(&mut a, &src, stride, 1, 1, w, h, shift, &band, max);
                 sao_band(&mut b, &src, stride, 1, 1, w, h, shift, pos as u8, &band, max);
                 assert_eq!(a, b, "band {w}x{h} bd={bd} pos={pos}");
+                // As in `edge_matches_scalar`: `sao_band` dispatches on the
+                // HOST's ISA, so the SSE4.1 rung is never executed by the line
+                // above on an AVX2 machine. Call it directly.
+                #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+                if std::is_x86_feature_detected!("sse4.1") {
+                    let mut offs = [0i16; 4];
+                    for (k, o) in offs.iter_mut().enumerate() {
+                        *o = band[(pos + k) & 31];
+                    }
+                    let mut c = src.clone();
+                    let o = stride + 1;
+                    // SAFETY: same footprint the dispatcher checks.
+                    unsafe { x86::band_sse41(c.as_mut_ptr().add(o), stride, src.as_ptr().add(o), stride, w, h, shift, pos as i16, offs, max) };
+                    assert_eq!(a, c, "band sse41 {w}x{h} bd={bd} pos={pos}");
+                }
             }
         }
     }
@@ -658,6 +833,28 @@ mod tests {
                     sao_edge_scalar(&mut a, &src, stride, 1, 1, w, h, da, db, &offs, max);
                     sao_edge(&mut b, &src, stride, 1, 1, w, h, da, db, &offs, max);
                     assert_eq!(a, b, "edge {w}x{h} bd={bd} dir={da:?}");
+                    // `sao_edge` dispatches on the HOST's ISA, so on an AVX2
+                    // box the SSE rungs would never be executed by the line
+                    // above. Call them directly, or a kernel ships having been
+                    // proven by nothing.
+                    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+                    {
+                        let table = edge_offsets(&offs);
+                        let (oa, ob) = (doff(da, stride), doff(db, stride));
+                        let o = stride + 1;
+                        for (name, f) in [
+                            ("sse2", x86::edge_sse2 as unsafe fn(*mut u16, usize, *const u16, usize, usize, usize, isize, isize, [i16; 5], i32)),
+                            ("ssse3", x86::edge_ssse3 as unsafe fn(*mut u16, usize, *const u16, usize, usize, usize, isize, isize, [i16; 5], i32)),
+                        ] {
+                            if name == "ssse3" && !std::is_x86_feature_detected!("ssse3") {
+                                continue;
+                            }
+                            let mut c = src.clone();
+                            // SAFETY: same footprint the dispatcher checks.
+                            unsafe { f(c.as_mut_ptr().add(o), stride, src.as_ptr().add(o), stride, w, h, oa, ob, table, max) };
+                            assert_eq!(a, c, "edge {name} {w}x{h} bd={bd} dir={da:?}");
+                        }
+                    }
                 }
             }
         }
@@ -727,9 +924,6 @@ mod tests {
                 assert_eq!(a, b, "band bd={bd} {w}x{h} pos={pos}");
             }
         }
-        assert!(
-            stressed > 0,
-            "no case exceeded the i8 table -- the test never reached the condition it exists to cover"
-        );
+        assert!(stressed > 0, "no case exceeded the i8 table -- the test never reached the condition it exists to cover");
     }
 }

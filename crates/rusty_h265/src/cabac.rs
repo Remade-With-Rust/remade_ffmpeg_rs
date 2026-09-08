@@ -7,6 +7,8 @@
 //! What is new is the context set: 157 models, three `initType`s, and the
 //! `initValue → (slope, offset)` mapping of §9.3.2.2.
 
+use rusty_h265_accel as accel;
+
 /// `rangeTabLps[pStateIdx][(ivlCurrRange >> 6) & 3]` (Table 9-46).
 #[rustfmt::skip]
 pub const RANGE_LPS: [[u8; 4]; 64] = [
@@ -71,6 +73,16 @@ pub const CTX_SIG_TS: usize = 125; // 2 (RExt transform-skip contexts, unused in
 pub const CTX_GT1: usize = 127; // 24 (luma 16, chroma 8)
 pub const CTX_GT2: usize = 151; // 6 (luma 4, chroma 2)
 pub const NUM_CTX: usize = 157;
+/// The context array's allocated length: `NUM_CTX` rounded up to a power of two.
+///
+/// The guard on `decode`'s index used to be `ctx_idx.min(NUM_CTX - 1)`, which
+/// emitted `cmp` + `mov imm` + `cmov` -- three instructions per context-coded
+/// bin, on the dependency chain that feeds the model load. Every call site is a
+/// constant base plus a bounded offset, so the guard has never actually clamped
+/// anything; it is there to prove the index in range. Padding the array to 256
+/// proves it with a single `and`, with no panic edge and no `unsafe`. The 99
+/// pad bytes are never read or written.
+pub const CTX_PAD: usize = 256;
 
 /// `initValue` per context for `initType` 0 (I), 1, 2 — Tables 9-5 … 9-37,
 /// transcribed from HM `ContextTables.h` (BSD-3), whose arrays are ordered
@@ -182,27 +194,42 @@ pub static INIT_VALUES: [[u8; NUM_CTX]; 3] = [
     ],
 ];
 
-/// Fused per-(quartile, packed-state) record: `lps | transMps<<8 | transLps<<16`.
+/// Fused per-(packed-state, quartile) record: `lps | transMps<<8 | transLps<<16`.
 /// A model is one byte `pStateIdx * 2 + valMps`; the state-0 MPS flip is folded in.
-const fn build_fused() -> [u32; 4 * 128] {
-    let mut t = [0u32; 4 * 128];
-    let mut q = 0;
-    while q < 4 {
-        let mut s = 0;
-        while s < 128 {
-            let lps = RANGE_LPS[s >> 1][q] as u32;
+///
+/// The layout is STATE-major and spans the whole 0..=255 byte domain, both
+/// deliberately — `decode` is 89% of all bins, so this table's shape is priced
+/// per bin:
+///
+///   * state-major puts a context's four quartile records in one aligned
+///     16-byte group, so the line a bin touches serves that context whatever
+///     `ivlCurrRange` happens to be. Quartile-major put them 512 B apart —
+///     four lines per context, three of them cold.
+///   * indexing the full byte retires the `& 127`. A model byte is
+///     `pStateIdx * 2 + valMps` with `pStateIdx < 64`, so it never exceeds 127
+///     and the mask was already a no-op on the value; it was there to prove the
+///     index in range. Mirroring the table into 128..=255 proves it instead,
+///     for free, and the mask leaves the per-bin path.
+const fn build_fused() -> [u32; 256 * 4] {
+    let mut t = [0u32; 256 * 4];
+    let mut s = 0;
+    while s < 256 {
+        let p = (s & 127) >> 1;
+        let mut q = 0;
+        while q < 4 {
+            let lps = RANGE_LPS[p][q] as u32;
             let mps = s as u8 & 1;
-            let tm = ((STATE_TRANS[s >> 1][1] << 1) | mps) as u32;
-            let new_mps = if s >> 1 == 0 { 1 - mps } else { mps };
-            let tl = ((STATE_TRANS[s >> 1][0] << 1) | new_mps) as u32;
-            t[q * 128 + s] = lps | (tm << 8) | (tl << 16);
-            s += 1;
+            let tm = ((STATE_TRANS[p][1] << 1) | mps) as u32;
+            let new_mps = if p == 0 { 1 - mps } else { mps };
+            let tl = ((STATE_TRANS[p][0] << 1) | new_mps) as u32;
+            t[s * 4 + q] = lps | (tm << 8) | (tl << 16);
+            q += 1;
         }
-        q += 1;
+        s += 1;
     }
     t
 }
-static FUSED: [u32; 4 * 128] = build_fused();
+static FUSED: [u32; 256 * 4] = build_fused();
 
 /// Bit position of the arithmetic offset inside [`Cabac::low`].
 const OFF: u32 = 41;
@@ -210,14 +237,14 @@ const REFILL_AT: i32 = 8;
 
 /// The context models alone (for WPP storage/sync, §9.3.2.3 / §9.3.2.4).
 #[derive(Clone)]
-pub struct Contexts(pub [u8; NUM_CTX]);
+pub struct Contexts(pub [u8; CTX_PAD]);
 
 impl Contexts {
     /// §9.3.2.2: initialise every model for `init_type` (0/1/2) and `SliceQpY`.
     pub fn init(init_type: usize, slice_qp: i32) -> Self {
         let q = slice_qp.clamp(0, 51);
-        let mut ctx = [0u8; NUM_CTX];
-        for (i, c) in ctx.iter_mut().enumerate() {
+        let mut ctx = [0u8; CTX_PAD];
+        for (i, c) in ctx.iter_mut().enumerate().take(NUM_CTX) {
             let init_value = INIT_VALUES[init_type][i] as i32;
             let slope_idx = init_value >> 4;
             let offset_idx = init_value & 15;
@@ -239,7 +266,9 @@ pub struct Cabac<'a> {
     cnt: i32,
     range: u32,
     pub ctx: Contexts,
+    #[cfg(feature = "cabac-trace")]
     trace: bool,
+    #[cfg(feature = "cabac-trace")]
     sym: u64,
 }
 
@@ -253,7 +282,9 @@ impl<'a> Cabac<'a> {
             cnt: 0,
             range: 510,
             ctx,
+            #[cfg(feature = "cabac-trace")]
             trace: std::env::var_os("RH265_CABAC_TRACE").is_some(),
+            #[cfg(feature = "cabac-trace")]
             sym: 0,
         };
         e.reinit_at(start);
@@ -284,14 +315,26 @@ impl<'a> Cabac<'a> {
         self.byte_pos
     }
 
+    /// The last four bytes, one at a time, for the handful of refills that run
+    /// off the end of the slice segment.
+    ///
+    /// `#[cold]` and out of line on purpose. `decode` is `#[inline(always)]`
+    /// and is inlined at ~50 call sites; with this arm inline, each of those
+    /// carried ~55 instructions of byte-at-a-time bounds-checked fallback that
+    /// runs a few times per slice. It never affected the hot path's speed, only
+    /// how much instruction cache the hot path was spread across.
+    #[cold]
+    #[inline(never)]
+    fn refill_tail(&self) -> u32 {
+        let b = |i: usize| self.data.get(self.byte_pos + i).copied().unwrap_or(0) as u32;
+        (b(0) << 24) | (b(1) << 16) | (b(2) << 8) | b(3)
+    }
+
     #[inline]
     fn refill(&mut self) {
         let v = match self.data.get(self.byte_pos..self.byte_pos + 4) {
             Some(c) => u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
-            None => {
-                let b = |i: usize| self.data.get(self.byte_pos + i).copied().unwrap_or(0) as u32;
-                (b(0) << 24) | (b(1) << 16) | (b(2) << 8) | b(3)
-            }
+            None => self.refill_tail(),
         };
         self.low |= (v as u64) << ((OFF as i32 - 32 - self.cnt) as u32);
         self.byte_pos += 4;
@@ -309,10 +352,21 @@ impl<'a> Cabac<'a> {
         }
     }
 
-    #[inline]
-    fn tr(&mut self, kind: &str) {
+    /// The bin trace, behind `cabac-trace` (off by default).
+    ///
+    /// This used to be a plain `if self.trace` on the per-bin path: a load, a
+    /// test and a branch on every one of the ~4 M context bins and ~0.5 M
+    /// bypass bins of a 720p stream, serving a debugging facility no shipping
+    /// decode reads. As a `cfg` it is exactly as useful and costs nothing.
+    ///
+    /// `low` is a parameter because the bypass runs below hold it in a
+    /// register rather than in the struct.
+    #[inline(always)]
+    #[allow(unused_variables)]
+    fn tr(&mut self, kind: &str, low: u64) {
+        #[cfg(feature = "cabac-trace")]
         if self.trace {
-            eprintln!("{} {} r={} o={}", self.sym, kind, self.range, self.low >> OFF);
+            eprintln!("{} {} r={} o={}", self.sym, kind, self.range, low >> OFF);
             self.sym += 1;
         }
     }
@@ -320,11 +374,17 @@ impl<'a> Cabac<'a> {
     /// Context-coded bin (§9.3.4.3.2).
     #[inline(always)]
     pub fn decode(&mut self, ctx_idx: usize) -> u32 {
-        self.tr("D");
-        let ctx_idx = ctx_idx.min(NUM_CTX - 1);
-        let s = (self.ctx.0[ctx_idx] & 127) as usize;
+        if accel::census::ALWAYS {
+            accel::census::bump(&accel::census::CABAC_CTX_BINS, 1);
+        }
+        self.tr("D", self.low);
+        // One `and`, not `cmp`/`mov`/`cmov` -- see `CTX_PAD`.
+        let ctx_idx = ctx_idx & (CTX_PAD - 1);
+        let s = self.ctx.0[ctx_idx] as usize;
         let q = ((self.range >> 6) & 3) as usize;
-        let e = FUSED[q * 128 + s];
+        // `s < 256` and `q < 4`, so this index is in range by construction:
+        // no mask on the value, no bounds check. See `build_fused`.
+        let e = FUSED[(s << 2) | q];
         let lps = e & 0xFF;
         debug_assert!(self.range >= 256);
         self.range -= lps;
@@ -339,42 +399,127 @@ impl<'a> Cabac<'a> {
         bin
     }
 
+    /// The compare-subtract half of a bypass bin, branchless.
+    ///
+    /// A bypass bin is an equiprobable coin flip, so the `if low >= scaled`
+    /// this replaces mispredicted about half the times it ran — 0.5 M bins on a
+    /// 720p stream, 15 M on intra-heavy content. Five dependent ALU ops beat a
+    /// coin-flip branch by a wide margin.
+    ///
+    /// `d = low - scaled` wraps negative exactly when the bin is 0; both
+    /// operands are below `2^51`, so bit 63 of the wrapped difference is the
+    /// sign and `m` is all-ones on 0, zero on 1. Adding `scaled & m` back
+    /// restores `low` in the 0 case.
+    #[inline(always)]
+    fn bypass_cmp(low: u64, scaled: u64) -> (u64, u32) {
+        let d = low.wrapping_sub(scaled);
+        let m = ((d as i64) >> 63) as u64;
+        (d.wrapping_add(scaled & m), (!m as u32) & 1)
+    }
+
     /// Bypass bin (§9.3.4.3.4).
     #[inline(always)]
     pub fn bypass(&mut self) -> u32 {
-        self.tr("B");
+        self.tr("B", self.low);
+        if accel::census::ALWAYS {
+            accel::census::bump(&accel::census::CABAC_BYPASS_BINS, 1);
+        }
         self.low <<= 1;
         self.cnt -= 1;
         if self.cnt < REFILL_AT {
             self.refill();
         }
-        let scaled = (self.range as u64) << OFF;
-        if self.low >= scaled {
-            self.low -= scaled;
-            1
-        } else {
-            0
-        }
+        let (low, bin) = Self::bypass_cmp(self.low, (self.range as u64) << OFF);
+        self.low = low;
+        bin
     }
 
     /// `n` bypass bins, MSB first (fixed-length binarisation).
+    ///
+    /// `ivlCurrRange` is invariant across bypass bins, so `scaled` is a
+    /// loop-invariant 64-bit shift that the old per-bin `bypass()` recomputed
+    /// every time; `low` and `cnt` likewise stay in registers for the run
+    /// instead of round-tripping through the struct once per bin.
     #[inline]
     pub fn bypass_bits(&mut self, n: u32) -> u32 {
-        if rusty_h265_accel::census::enabled() {
-            rusty_h265_accel::census::bump(&rusty_h265_accel::census::CABAC_BYPASS_CALLS, 1);
-            rusty_h265_accel::census::bump(&rusty_h265_accel::census::CABAC_BYPASS_BINS, n as u64);
+        if accel::census::ALWAYS {
+            accel::census::bump(&accel::census::CABAC_BYPASS_CALLS, 1);
+            accel::census::bump(&accel::census::CABAC_BYPASS_BINS, n as u64);
         }
-        let mut v = 0;
+        // The census reads 1.86 bins per call: `rice` and the last-position
+        // suffix width are 0 often enough that skipping the run setup pays.
+        if n == 0 {
+            return 0;
+        }
+        let scaled = (self.range as u64) << OFF;
+        let (mut low, mut cnt) = (self.low, self.cnt);
+        let mut v = 0u32;
         for _ in 0..n {
-            v = (v << 1) | self.bypass();
+            self.tr("B", low);
+            low <<= 1;
+            cnt -= 1;
+            if cnt < REFILL_AT {
+                self.low = low;
+                self.cnt = cnt;
+                self.refill();
+                low = self.low;
+                cnt = self.cnt;
+            }
+            let (l, bin) = Self::bypass_cmp(low, scaled);
+            low = l;
+            v = (v << 1) | bin;
         }
+        self.low = low;
+        self.cnt = cnt;
         v
+    }
+
+    /// Bypass bins until one decodes 0, or until `max` of them decode 1;
+    /// returns how many 1s. This is the unary prefix of
+    /// `coeff_abs_level_remaining` (§9.3.3.11) and of EGk, which between them
+    /// are most of the bypass population on coefficient-heavy content.
+    ///
+    /// Same loop-invariant treatment as [`bypass_bits`]. The compare stays a
+    /// branch here because it *is* the loop exit; unlike a fixed-length suffix
+    /// it is strongly biased toward falling out early.
+    #[inline]
+    pub fn bypass_ones(&mut self, max: u32) -> u32 {
+        let scaled = (self.range as u64) << OFF;
+        let (mut low, mut cnt) = (self.low, self.cnt);
+        let mut k = 0;
+        while k < max {
+            self.tr("B", low);
+            low <<= 1;
+            cnt -= 1;
+            if cnt < REFILL_AT {
+                self.low = low;
+                self.cnt = cnt;
+                self.refill();
+                low = self.low;
+                cnt = self.cnt;
+            }
+            if low < scaled {
+                break;
+            }
+            low -= scaled;
+            k += 1;
+        }
+        self.low = low;
+        self.cnt = cnt;
+        if accel::census::ALWAYS {
+            accel::census::bump(&accel::census::CABAC_BYPASS_CALLS, 1);
+            accel::census::bump(&accel::census::CABAC_BYPASS_BINS, (k + 1).min(max) as u64);
+        }
+        k
     }
 
     /// Terminate bin (§9.3.4.3.5). `true` = end of slice segment / substream / PCM.
     #[inline(always)]
     pub fn terminate(&mut self) -> bool {
-        self.tr("T");
+        if accel::census::ALWAYS {
+            accel::census::bump(&accel::census::CABAC_TERM_BINS, 1);
+        }
+        self.tr("T", self.low);
         self.range -= 2;
         if self.low >= (self.range as u64) << OFF {
             true

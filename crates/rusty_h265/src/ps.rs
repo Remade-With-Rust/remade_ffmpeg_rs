@@ -258,15 +258,13 @@ pub struct ScalingList {
 
 /// Table 7-6, intra (matrixId 0..2) for sizeId 1..3, in diagonal scan order.
 pub const DEFAULT_SCALING_INTRA: [u8; 64] = [
-    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 16, 17, 16, 17, 18, 17, 18, 18, 17, 18, 21, 19, 20,
-    21, 20, 19, 21, 24, 22, 22, 24, 24, 22, 22, 24, 25, 25, 27, 30, 27, 25, 25, 29, 31, 35, 35, 31,
-    29, 36, 41, 44, 41, 36, 47, 54, 54, 47, 65, 70, 65, 88, 88, 115,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 16, 17, 16, 17, 18, 17, 18, 18, 17, 18, 21, 19, 20, 21, 20, 19, 21, 24, 22, 22, 24, 24, 22, 22, 24, 25, 25, 27, 30, 27, 25, 25, 29, 31, 35, 35, 31, 29,
+    36, 41, 44, 41, 36, 47, 54, 54, 47, 65, 70, 65, 88, 88, 115,
 ];
 /// Table 7-6, inter (matrixId 3..5).
 pub const DEFAULT_SCALING_INTER: [u8; 64] = [
-    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17, 18, 18, 18, 18, 18, 18, 20, 20, 20,
-    20, 20, 20, 20, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 28, 28, 28, 28, 28,
-    28, 33, 33, 33, 33, 33, 41, 41, 41, 41, 54, 54, 54, 71, 71, 91,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 17, 17, 17, 17, 17, 18, 18, 18, 18, 18, 18, 20, 20, 20, 20, 20, 20, 20, 24, 24, 24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 28, 28, 28, 28, 28, 28,
+    33, 33, 33, 33, 33, 41, 41, 41, 41, 54, 54, 54, 71, 71, 91,
 ];
 
 impl Default for ScalingList {
@@ -956,7 +954,13 @@ impl TileLayout {
                 tid += 1;
             }
         }
-        Ok(TileLayout { col_bd, row_bd, rs_to_ts, ts_to_rs, tile_id })
+        Ok(TileLayout {
+            col_bd,
+            row_bd,
+            rs_to_ts,
+            ts_to_rs,
+            tile_id,
+        })
     }
 }
 
@@ -980,7 +984,7 @@ mod tests {
     fn st_rps_explicit_and_predicted() {
         // Explicit: num_neg=2 (deltas 1,2 used), num_pos=1 (delta 1 used)
         // ue(2)=011 ue(1)=010 | ue(0)=1 f=1 | ue(1)=010 f=1 | ue(0)=1 f=1
-        let bits = "011010" .to_string() + "11" + "0101" + "11";
+        let bits = "011010".to_string() + "11" + "0101" + "11";
         let bytes = bits_to_bytes(&bits);
         let mut r = BitReader::new(&bytes);
         let s0 = parse_st_ref_pic_set(&mut r, 0, &[], false).unwrap();
@@ -992,7 +996,7 @@ mod tests {
         let bits = "1".to_string() + "1" + "1" + "1111";
         let bytes = bits_to_bytes(&bits);
         let mut r = BitReader::new(&bytes);
-        let s1 = parse_st_ref_pic_set(&mut r, 1, &[s0.clone()], false).unwrap();
+        let s1 = parse_st_ref_pic_set(&mut r, 1, std::slice::from_ref(&s0), false).unwrap();
         // pos j=0: 1-1=0 -> dropped; deltaRps<0 -> -1; neg: -2, -4
         assert_eq!(s1.neg, vec![(-1, true), (-2, true), (-4, true)]);
         assert_eq!(s1.pos, Vec::<(i32, bool)>::new());
@@ -1010,18 +1014,22 @@ mod tests {
 
     #[test]
     fn tile_scan_is_a_permutation() {
-        let mut sps = Sps::default();
-        sps.pic_width_in_ctbs = 7;
-        sps.pic_height_in_ctbs = 5;
-        let mut pps = Pps::default();
-        pps.tiles_enabled = true;
-        pps.num_tile_columns = 3;
-        pps.num_tile_rows = 2;
-        pps.uniform_spacing = true;
+        let sps = Sps {
+            pic_width_in_ctbs: 7,
+            pic_height_in_ctbs: 5,
+            ..Default::default()
+        };
+        let pps = Pps {
+            tiles_enabled: true,
+            num_tile_columns: 3,
+            num_tile_rows: 2,
+            uniform_spacing: true,
+            ..Default::default()
+        };
         let t = TileLayout::new(&sps, &pps).unwrap();
         assert_eq!(t.col_bd, vec![0, 2, 4, 7]);
         assert_eq!(t.row_bd, vec![0, 2, 5]);
-        let mut seen = vec![false; 35];
+        let mut seen = [false; 35];
         for rs in 0..35 {
             let ts = t.rs_to_ts[rs] as usize;
             assert_eq!(t.ts_to_rs[ts], rs as u32);

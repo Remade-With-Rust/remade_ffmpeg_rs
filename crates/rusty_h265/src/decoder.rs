@@ -9,11 +9,11 @@ use std::sync::Arc;
 use crate::bits::BitReader;
 use crate::ctu::{Ablate, CtxStore, ScalingFactors, SliceDecoder, SliceInputs};
 use crate::error::{Error, Result};
-use crate::pic::PicState;
-use crate::sei::{self, PictureHash};
 use crate::frame::{Frame, Picture};
 use crate::nal::{split_annex_b, unescape, NalHeader, NalType, Rbsp};
+use crate::pic::PicState;
 use crate::ps::{parse_pps, parse_sps, parse_vps, Pps, Sps, TileLayout, Vps, PROFILE_MAIN, PROFILE_MAIN10, PROFILE_MAIN_STILL};
+use crate::sei::{self, PictureHash};
 use crate::slice::{parse_slice_header, SliceHeader};
 
 /// Reference marking of a DPB picture.
@@ -85,11 +85,6 @@ pub struct CurrentPicture {
     pub expected_hash: Option<PictureHash>,
     /// Scaling factors when scaling lists are enabled.
     pub scaling: Option<ScalingFactors>,
-    /// Reused deblocked-sample buffer for SAO (see `filters::sao`).
-    pub sao_scratch: Vec<u16>,
-    /// Deblocking boundary strengths, reused across pictures.
-    pub deblock_bs_v: Vec<u8>,
-    pub deblock_bs_h: Vec<u8>,
 }
 
 /// Decoder statistics (also printed by the harness binary).
@@ -107,6 +102,25 @@ pub struct Stats {
 
 /// A pure-Rust HEVC decoder. Push NAL units (or Annex-B chunks) in, pull
 /// [`Frame`]s out in output order.
+/// Diagnostic: how often the picture pool actually supplies a buffer.
+pub static POOL_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static POOL_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Why a buffer did or did not come back: reclaimed, still shared with the
+/// output queue, or dropped because the pool was already full.
+pub static RECL_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RECL_SHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RECL_FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Scratch the in-loop filters reuse across every picture.
+#[derive(Default)]
+pub struct FilterScratch {
+    /// Deblocked samples SAO reads while it writes filtered ones.
+    pub sao: Vec<u16>,
+    /// Boundary strengths, per 4x4, one map per direction.
+    pub bs_v: Vec<u8>,
+    pub bs_h: Vec<u8>,
+}
+
 pub struct Decoder {
     vps: Vec<Option<Arc<Vps>>>,
     sps: Vec<Option<Arc<Sps>>>,
@@ -126,6 +140,37 @@ pub struct Decoder {
     pending_pts: Option<i64>,
     /// A picture hash from a prefix SEI, for the next picture.
     pending_hash: Option<PictureHash>,
+    /// The sequence-invariant tables (`MinTbAddrZs`, the tile map), kept across
+    /// pictures. Rebuilt only when the SPS or the tile layout actually changes.
+    seq_tables: Option<crate::pic::SeqTables>,
+    /// The in-loop filters' working buffers, kept for the life of the decoder.
+    ///
+    /// These lived on `CurrentPicture`, so every picture allocated them from
+    /// nothing: the SAO scratch alone grows to a whole luma plane, 1.84 MB at
+    /// 720p, and had to be sized and zeroed again for each of the 600 pictures
+    /// in a clip. That also silently cancelled the narrowed SAO copy above it --
+    /// there is no point copying 32% of a plane into a buffer that was just
+    /// zeroed in full.
+    filter_scratch: FilterScratch,
+    /// The previous picture's per-4x4 maps, for the next one to reuse.
+    ///
+    /// Unlike a `Picture` this is never shared -- it belongs to the picture
+    /// being decoded and dies with it -- so one slot recycles every time,
+    /// where the picture pool can only catch the buffers the output queue has
+    /// already released.
+    state_pool: Option<PicState>,
+    /// Pictures the DPB has let go of but somebody else may still hold.
+    /// Swept just before the next picture is allocated -- see `reclaim`.
+    pic_parked: Vec<Arc<Picture>>,
+    /// Sample-plane buffers reclaimed from the DPB, for the next picture.
+    ///
+    /// A picture is 2.76 MB at 720p and one is built per picture: 1.66 GB of
+    /// allocate-and-zero over a 600-picture clip, measured at 3.2% of decode.
+    /// Reference pictures are `Arc`-shared with the output queue, so a buffer
+    /// comes back only when the last handle to it goes -- which `Arc::into_inner`
+    /// reports exactly. Bounded, because a decoder that leaks buffers into a
+    /// pool has just moved the allocation into a place nobody is watching.
+    pic_pool: Vec<Picture>,
     /// Verify every picture against its decoded-picture-hash SEI.
     pub verify_sei: bool,
     /// Stage ablation (ceiling probes); off unless the environment asks.
@@ -161,6 +206,11 @@ impl Decoder {
             skipping_picture: false,
             pending_pts: None,
             pending_hash: None,
+            seq_tables: None,
+            filter_scratch: FilterScratch::default(),
+            state_pool: None,
+            pic_parked: Vec::new(),
+            pic_pool: Vec::new(),
             verify_sei: false,
             ablate: Ablate::from_env(),
             sei_results: Vec::new(),
@@ -309,10 +359,21 @@ impl Decoder {
         if self.trace {
             eprintln!(
                 "  slice addr={} dep={} type={:?} qp={} sao={}{} dbk_off={} beta={} tc={} lf_slices={} entry={} tiles={} wpp={} dqp={} tqb={}",
-                sh.segment_address, sh.dependent_slice_segment as u8, sh.slice_type, sh.slice_qp, sh.sao_luma as u8, sh.sao_chroma as u8,
-                sh.deblocking_filter_disabled as u8, sh.beta_offset_div2, sh.tc_offset_div2, sh.loop_filter_across_slices_enabled as u8,
-                sh.entry_point_offsets.len(), cur.pps.tiles_enabled as u8, cur.pps.entropy_coding_sync_enabled as u8,
-                cur.pps.cu_qp_delta_enabled as u8, cur.pps.transquant_bypass_enabled as u8
+                sh.segment_address,
+                sh.dependent_slice_segment as u8,
+                sh.slice_type,
+                sh.slice_qp,
+                sh.sao_luma as u8,
+                sh.sao_chroma as u8,
+                sh.deblocking_filter_disabled as u8,
+                sh.beta_offset_div2,
+                sh.tc_offset_div2,
+                sh.loop_filter_across_slices_enabled as u8,
+                sh.entry_point_offsets.len(),
+                cur.pps.tiles_enabled as u8,
+                cur.pps.entropy_coding_sync_enabled as u8,
+                cur.pps.cu_qp_delta_enabled as u8,
+                cur.pps.transquant_bypass_enabled as u8
             );
         }
         if self.headers_only {
@@ -458,17 +519,22 @@ impl Decoder {
             let _ = sps_changed;
             let no_output_of_prior_pics = nt.is_cra() || sh.no_output_of_prior_pics;
             if no_output_of_prior_pics {
-                self.dpb.clear();
+                for e in self.dpb.drain(..).collect::<Vec<_>>() {
+                    self.reclaim(e);
+                }
             } else {
                 self.flush_dpb_output();
             }
         } else {
-            self.dpb.retain(|e| e.needed_for_output || e.mark != RefMark::Unused);
+            self.purge_dpb();
             loop {
                 let n_out = self.dpb.iter().filter(|e| e.needed_for_output).count();
                 let latency_hit = ord.max_latency_increase_plus1 != 0
-                    && self.dpb.iter().any(|e| e.needed_for_output && e.pic_latency >= ord.max_num_reorder_pics + ord.max_latency_increase_plus1 - 1);
-                let full = self.dpb.len() >= ord.max_dec_pic_buffering_minus1 as usize + 1;
+                    && self
+                        .dpb
+                        .iter()
+                        .any(|e| e.needed_for_output && e.pic_latency >= ord.max_num_reorder_pics + ord.max_latency_increase_plus1 - 1);
+                let full = self.dpb.len() > ord.max_dec_pic_buffering_minus1 as usize;
                 if n_out > ord.max_num_reorder_pics as usize || latency_hit || (full && n_out > 0) {
                     self.bump();
                 } else {
@@ -476,8 +542,8 @@ impl Decoder {
                 }
             }
             // A full DPB with nothing left to output: drop unreferenced pictures.
-            if self.dpb.len() >= ord.max_dec_pic_buffering_minus1 as usize + 1 {
-                self.dpb.retain(|e| e.needed_for_output || e.mark != RefMark::Unused);
+            if self.dpb.len() > ord.max_dec_pic_buffering_minus1 as usize {
+                self.purge_dpb();
             }
         }
 
@@ -485,11 +551,46 @@ impl Decoder {
         if self.trace {
             eprintln!(
                 "pic {:?} tid={} poc={} lsb={} out={} norasl={} noprior={} dpb={} refs={}",
-                nt, hdr.temporal_id, poc, sh.poc_lsb, output_flag, self.no_rasl_output_flag, sh.no_output_of_prior_pics, self.dpb.len(),
+                nt,
+                hdr.temporal_id,
+                poc,
+                sh.poc_lsb,
+                output_flag,
+                self.no_rasl_output_flag,
+                sh.no_output_of_prior_pics,
+                self.dpb.len(),
                 st_before.len() + st_after.len() + lt_curr.len()
             );
         }
-        let mut pic = Picture::new(sps.width as usize, sps.height as usize, sps.chroma_format_idc, sps.bit_depth_luma, sps.bit_depth_chroma);
+        // Per-picture setup: the frame buffers and every per-4x4 map. Timed
+        // because the first profile left ~22% of decode unaccounted for and
+        // this is the largest thing outside the CTU loop.
+        crate::prof_scope!(crate::prof::Stage::Dpb);
+        self.sweep_parked();
+        let mut pic = {
+            crate::prof_scope!(crate::prof::Stage::PicAlloc);
+            let (w, h) = (sps.width as usize, sps.height as usize);
+            // A pattern guard cannot take `p` by mutable reference, so the
+            // reuse attempt happens before the match.
+            let recycled = self.pic_pool.pop().filter(|_| true).and_then(|mut p| {
+                if p.reuse(w, h, sps.chroma_format_idc, sps.bit_depth_luma, sps.bit_depth_chroma) {
+                    Some(p)
+                } else {
+                    // The geometry changed mid-stream and this buffer is the
+                    // wrong shape: drop it rather than keep it, so a resolution
+                    // switch does not leave stale sizes in the pool forever.
+                    None
+                }
+            });
+            if std::env::var_os("RH265_POOL").is_some() {
+                use std::sync::atomic::Ordering;
+                if recycled.is_some() { POOL_HIT.fetch_add(1, Ordering::Relaxed) } else { POOL_MISS.fetch_add(1, Ordering::Relaxed) };
+            }
+            match recycled {
+                Some(p) => p,
+                None => Picture::new(w, h, sps.chroma_format_idc, sps.bit_depth_luma, sps.bit_depth_chroma),
+            }
+        };
         let (ow, oh) = sps.output_size();
         pic.crop = (
             (sps.sub_width_c as u32 * sps.conf_win[0]) as usize,
@@ -498,7 +599,33 @@ impl Decoder {
             oh as usize,
         );
         pic.poc = poc;
-        let state = PicState::new(&sps, &tiles);
+        // Sequence-invariant tables: reuse unless the SPS or tiles changed.
+        if !self.seq_tables.as_ref().is_some_and(|t| t.matches(&sps, &tiles)) {
+            self.seq_tables = Some(crate::pic::SeqTables::build(&sps, &tiles));
+        } else if std::env::var_os("RH265_SEQCHECK").is_some() {
+            // Diagnostic: rebuild anyway and report any field the key missed.
+            let fresh = crate::pic::SeqTables::build(&sps, &tiles);
+            let t = self.seq_tables.as_ref().unwrap();
+            if *fresh.zs != *t.zs {
+                eprintln!("SEQCHECK: zs differs on a cache HIT");
+            }
+            if *fresh.tile_id != *t.tile_id {
+                eprintln!("SEQCHECK: tile_id differs on a cache HIT");
+            }
+        }
+        let tables = self.seq_tables.as_ref().expect("just built");
+        // As in the picture pool: a pattern guard cannot borrow mutably, so
+        // the reuse attempt happens first.
+        let state = match self.state_pool.take() {
+            Some(mut st) => {
+                if st.reuse(&sps, tables) {
+                    st
+                } else {
+                    PicState::with_tables(&sps, tables)
+                }
+            }
+            None => PicState::with_tables(&sps, tables),
+        };
         let scaling = if sps.scaling_list_enabled {
             pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()).map(ScalingFactors::new)
         } else {
@@ -525,31 +652,153 @@ impl Decoder {
             slice_addr_rs: sh.segment_address as i32,
             expected_hash: self.pending_hash.take(),
             scaling,
-            sao_scratch: Vec::new(),
-            deblock_bs_v: Vec::new(),
-            deblock_bs_h: Vec::new(),
         });
         self.first_in_sequence = false;
         Ok(())
     }
 
     /// C.5.2.3: the current picture is done — store, mark, bump.
+    /// Take a dropped entry's buffer back for reuse, if this was the last
+    /// handle to it. `Arc::into_inner` returns `None` while the output queue or
+    /// another reference still holds the picture, which is exactly the test.
+    /// Queue a dropped entry's picture for reuse.
+    ///
+    /// Taking the buffer here and now recovers **41%** of them: at the moment
+    /// the DPB drops a reference the output queue usually still holds one, so
+    /// `Arc::into_inner` returns `None` and the buffer is lost -- measured 351
+    /// of 600 lost that way, and none to a full pool. The handle is therefore
+    /// PARKED instead, and retried once the caller has taken and dropped the
+    /// frame. Nothing here waits on the caller: a handle that is still shared
+    /// on the next sweep simply stays parked.
+    fn reclaim(&mut self, e: DpbEntry) {
+        const PARK: usize = 16;
+        if self.pic_parked.len() < PARK {
+            self.pic_parked.push(e.pic);
+        }
+    }
+
+    /// Drop every DPB entry that is neither referenced nor awaiting output,
+    /// reclaiming its picture buffer.
+    ///
+    /// In place. This was `dpb.drain(..).partition(..)`, which allocated TWO
+    /// fresh `Vec`s and memmoved every entry into one of them -- at both call
+    /// sites, every picture -- to remove on average less than one entry.
+    /// `memcpy_census.py` attributed six runtime-length `memmove` calls to it.
+    ///
+    /// `retain` cannot be used: its closure would have to call `reclaim`, which
+    /// needs `&mut self` while `retain` holds the vector. So this compacts by
+    /// hand -- kept entries keep their ORDER, which output order depends on --
+    /// and then pops the discarded tail, whose order does not matter.
+    fn purge_dpb(&mut self) {
+        let mut w = 0;
+        for i in 0..self.dpb.len() {
+            if self.dpb[i].needed_for_output || self.dpb[i].mark != RefMark::Unused {
+                self.dpb.swap(i, w);
+                w += 1;
+            }
+        }
+        while self.dpb.len() > w {
+            let gone = self.dpb.pop().expect("len > w");
+            self.reclaim(gone);
+        }
+    }
+
+    /// Take back every parked buffer nobody else is holding any more.
+    fn sweep_parked(&mut self) {
+        const KEEP: usize = 6;
+        let diag = std::env::var_os("RH265_POOL").is_some();
+        let mut i = 0;
+        while i < self.pic_parked.len() {
+            if self.pic_pool.len() >= KEEP {
+                if diag {
+                    RECL_FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                break;
+            }
+            // `try_unwrap`, not `into_inner`: both consume the handle, but
+            // `try_unwrap` hands it back in the `Err` arm, which is what lets a
+            // still-shared picture stay parked for the next sweep.
+            let a = self.pic_parked.swap_remove(i);
+            match std::sync::Arc::try_unwrap(a) {
+                Ok(p) => {
+                    if diag {
+                        RECL_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.pic_pool.push(p);
+                }
+                Err(a) => {
+                    if diag {
+                        RECL_SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    self.pic_parked.push(a);
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Zero every coding tree block that did not decode.
+    ///
+    /// `Picture::reuse` hands back a buffer still holding the previous picture,
+    /// so a block no slice reconstructed would otherwise show unrelated samples.
+    /// Runs before the in-loop filters, which read across block boundaries, so
+    /// what they see is byte-for-byte what the old whole-plane clear gave them.
+    /// On a complete picture -- every conformant stream -- this is a scan of
+    /// `ctb_w * ctb_h` bools and not one store.
+    fn clear_uncovered(cur: &mut CurrentPicture) {
+        let st = &cur.state;
+        if st.ctb_done.iter().all(|&d| d) {
+            return;
+        }
+        let ctb = 1usize << st.log2_ctb;
+        let (ctb_w, ctb_h) = (st.ctb_w, st.ctb_h);
+        let todo: Vec<usize> = (0..ctb_w * ctb_h).filter(|&i| !st.ctb_done[i]).collect();
+        // 4:2:0 halves both axes, 4:2:2 only the horizontal, 4:4:4 neither.
+        let (sw, sh) = match cur.pic.chroma_format_idc {
+            1 => (2, 2),
+            2 => (2, 1),
+            _ => (1, 1),
+        };
+        for rs in todo {
+            let (rx, ry) = (rs % ctb_w, rs / ctb_w);
+            for (c, plane) in cur.pic.planes.iter_mut().enumerate() {
+                if plane.width == 0 {
+                    continue;
+                }
+                let (bw, bh) = if c == 0 { (ctb, ctb) } else { (ctb / sw, ctb / sh) };
+                let (x0, y0) = (rx * bw, ry * bh);
+                if x0 >= plane.width || y0 >= plane.height {
+                    continue;
+                }
+                let w = (x0 + bw).min(plane.width) - x0;
+                for y in y0..(y0 + bh).min(plane.height) {
+                    let a = y * plane.stride + x0;
+                    plane.data[a..a + w].fill(0);
+                }
+            }
+        }
+    }
+
     fn finish_picture(&mut self) {
         let Some(mut cur) = self.cur.take() else { return };
         self.stats.pictures += 1;
+        Self::clear_uncovered(&mut cur);
         if !self.headers_only {
-            crate::filters::apply_in_loop_filters(&mut cur);
+            crate::filters::apply_in_loop_filters(&mut cur, &mut self.filter_scratch);
             // Compress the motion field to 16×16 for later TMVP (§8.5.3.2.9).
             let st = &cur.state;
             let w16 = st.width.div_ceil(16);
             let h16 = st.height.div_ceil(16);
-            let mut m16 = Vec::with_capacity(w16 * h16);
+            // Straight into the picture's own vector: a pooled picture still
+            // has this capacity from last time, so the per-picture
+            // `Vec::with_capacity` was an allocation the buffer already had.
+            cur.pic.motion16.clear();
+            cur.pic.motion16.reserve(w16 * h16);
             for y in 0..h16 {
                 for x in 0..w16 {
-                    m16.push(st.motion[st.idx4(x * 16, y * 16)]);
+                    cur.pic.motion16.push(st.motion[st.idx4(x * 16, y * 16)]);
                 }
             }
-            cur.pic.motion16 = m16;
             cur.pic.motion16_w = w16;
         }
         if self.verify_sei {
@@ -585,25 +834,23 @@ impl Decoder {
         loop {
             let n_out = self.dpb.iter().filter(|e| e.needed_for_output).count();
             let latency_hit = ord.max_latency_increase_plus1 != 0
-                && self.dpb.iter().any(|e| e.needed_for_output && e.pic_latency >= ord.max_num_reorder_pics + ord.max_latency_increase_plus1 - 1);
+                && self
+                    .dpb
+                    .iter()
+                    .any(|e| e.needed_for_output && e.pic_latency >= ord.max_num_reorder_pics + ord.max_latency_increase_plus1 - 1);
             if n_out > ord.max_num_reorder_pics as usize || latency_hit {
                 self.bump();
             } else {
                 break;
             }
         }
+        // The maps are not shared with anything; keep them for the next picture.
+        self.state_pool = Some(cur.state);
     }
 
     /// C.5.2.4 bumping: output the smallest-POC picture waiting for output.
     fn bump(&mut self) {
-        let Some(i) = self
-            .dpb
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.needed_for_output)
-            .min_by_key(|(_, e)| e.poc)
-            .map(|(i, _)| i)
-        else {
+        let Some(i) = self.dpb.iter().enumerate().filter(|(_, e)| e.needed_for_output).min_by_key(|(_, e)| e.poc).map(|(i, _)| i) else {
             return;
         };
         let e = &mut self.dpb[i];
@@ -612,9 +859,16 @@ impl Decoder {
             eprintln!("  output poc={}", e.poc);
         }
         let (_, _, w, h) = e.pic.crop;
-        self.output.push_back(Frame { picture: e.pic.clone(), poc: e.poc, pts: e.pts, width: w, height: h });
+        self.output.push_back(Frame {
+            picture: e.pic.clone(),
+            poc: e.poc,
+            pts: e.pts,
+            width: w,
+            height: h,
+        });
         if e.mark == RefMark::Unused {
-            self.dpb.remove(i);
+            let gone = self.dpb.remove(i);
+            self.reclaim(gone);
         }
     }
 
@@ -623,7 +877,9 @@ impl Decoder {
         while self.dpb.iter().any(|e| e.needed_for_output) {
             self.bump();
         }
-        self.dpb.clear();
+        for e in self.dpb.drain(..).collect::<Vec<_>>() {
+            self.reclaim(e);
+        }
     }
 
     /// The DPB contents (for tests and the harness).
@@ -727,12 +983,20 @@ fn build_ref_lists(dpb: &[DpbEntry], sh: &SliceHeader, cur: &CurrentPicture) -> 
     let st = |p: i32| -> Result<RefPic> {
         dpb.iter()
             .find(|e| e.mark == RefMark::ShortTerm && e.poc == p)
-            .map(|e| RefPic { pic: e.pic.clone(), poc: e.poc, is_long_term: false })
+            .map(|e| RefPic {
+                pic: e.pic.clone(),
+                poc: e.poc,
+                is_long_term: false,
+            })
             .ok_or_else(|| Error::invalid(format!("missing short-term reference POC {p}")))
     };
     let lt = |(p, msb): (i32, bool)| -> Result<RefPic> {
         find_ref(dpb, p, !msb, max_poc_lsb)
-            .map(|i| RefPic { pic: dpb[i].pic.clone(), poc: dpb[i].poc, is_long_term: true })
+            .map(|i| RefPic {
+                pic: dpb[i].pic.clone(),
+                poc: dpb[i].poc,
+                is_long_term: true,
+            })
             .ok_or_else(|| Error::invalid(format!("missing long-term reference POC {p}")))
     };
     let total = sh.num_pic_total_curr as usize;

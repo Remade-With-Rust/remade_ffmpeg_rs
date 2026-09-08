@@ -32,10 +32,7 @@ fn hevc_v1_conformance_bit_exact() {
         // A missing corpus is a legitimate local skip, but in CI it is a green
         // build that verified nothing. `HEVC_REQUIRE_VECTORS=1` turns the skip
         // into a failure so a broken fetch cannot masquerade as a pass.
-        assert!(
-            std::env::var_os("HEVC_REQUIRE_VECTORS").is_none(),
-            "hevc-vectors/ is missing and HEVC_REQUIRE_VECTORS is set"
-        );
+        assert!(std::env::var_os("HEVC_REQUIRE_VECTORS").is_none(), "hevc-vectors/ is missing and HEVC_REQUIRE_VECTORS is set");
         eprintln!("hevc-vectors/ not present; skipping");
         return;
     };
