@@ -172,7 +172,7 @@ fn expand_g(g: &[f32; 32]) -> [f32; 64] {
 /// `a`/`b` must each leave 32 floats in bounds of `fifo`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
-unsafe fn window_avx(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut [f32]) {
+unsafe fn window_avx(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut [f32; 32]) {
     use std::arch::x86_64::*;
     let mut acc = [unsafe { _mm256_setzero_ps() }; 4];
     for i in 0..8 {
@@ -197,7 +197,19 @@ unsafe fn window_avx(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut 
 /// The scalar windowing sum — the oracle the SIMD twin is gated against, and the
 /// fallback on machines without AVX.
 #[inline]
-fn window_scalar(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut [f32]) {
+/// One 32-sample output block of the polyphase window.
+///
+/// `out` is a fixed-size block, not a slice: as `&mut [f32]` the compiler cannot
+/// know it holds 32 elements, so each of the two accumulations per tap carried a
+/// bounds check -- 512 of them per call, in the stage that is ~30% of decode.
+///
+/// REFUTED, kept as a warning: masking the FIFO offsets with 960 instead of 1023
+/// looked equivalent -- `head` is 64-aligned, so `head + i * 128` has its low six
+/// bits clear -- and would have proven `a + 32 <= 1024`, removing the span checks.
+/// It is wrong for the SECOND offset: `+ 96` is not 64-aligned (96 mod 64 = 32), so
+/// the narrower mask clears a bit that carries signal. Caught immediately by the
+/// decode hash and two reconstruction tests.
+fn window_scalar(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut [f32; 32]) {
     out.fill(0.0);
     for i in 0..8 {
         let a = (head + i * 128) & 1023;
@@ -276,7 +288,9 @@ pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; G
         // Each `out[j]` still accumulates its 16 taps in the original order
         // (i ascending, the `a` term before the `b` term), so this is
         // bit-identical, not merely close.
-        let out = &mut pcm[v * 32..v * 32 + 32];
+        let out: &mut [f32; 32] = pcm[v * 32..]
+            .first_chunk_mut()
+            .expect("granule is 18 blocks of 32");
         if avx {
             // SAFETY: `avx` was resolved from runtime detection before the loop;
             // `head` is a multiple of 64 so both spans leave 32 floats in bounds.
