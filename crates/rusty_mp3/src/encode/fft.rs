@@ -76,7 +76,12 @@ pub fn fft(re: &mut [f32], im: &mut [f32]) {
             j ^= bit;
             bit >>= 1;
         }
+        // Mask by `n - 1`. `n` is a power of two (asserted above) and `j` is built
+        // from bits of `n >> 1` downward, so it is already below `n` and the mask is
+        // the identity -- but `x & (n - 1)` is provably `< n` to the compiler, and
+        // without it each swap bounds-checks both of its indices, twice over.
         j |= bit;
+        let j = j & (n - 1);
         if i < j {
             re.swap(i, j);
             im.swap(i, j);

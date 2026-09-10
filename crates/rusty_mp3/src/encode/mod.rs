@@ -356,6 +356,16 @@ impl Mp3Encode {
             let [m, s] = &mut ms;
             stereo::mid_side_into(&channels[0], &channels[1], m, s);
         }
+        // Bind the RAW channels into a fixed-size array too, exactly as `coded`
+        // below. `channels` is a `&[Vec<f32>]`, so every `channels[ch]` is a bounds
+        // check against a length the compiler cannot know, and the granule slice
+        // that follows is a second one -- paid per granule, per channel, in the
+        // attack scan and again in the filterbank loop.
+        let raw: [&[f32]; 2] = if nch == 2 {
+            [channels[0].as_slice(), channels[1].as_slice()]
+        } else {
+            [channels[0].as_slice(), channels[0].as_slice()]
+        };
         let coded: [&[f32]; 2] = if use_ms {
             [ms[0].as_slice(), ms[1].as_slice()]
         } else if nch == 2 {
@@ -378,7 +388,7 @@ impl Mp3Encode {
         let attacks: Vec<bool> = (0..granules)
             .map(|gr| {
                 (0..nch).any(|ch| {
-                    let g = &channels[ch][gr * GRANULE_LINES..(gr + 1) * GRANULE_LINES];
+                    let g = &raw[ch][gr * GRANULE_LINES..(gr + 1) * GRANULE_LINES];
                     psychoacoustic::detect_attack(g)
                 })
             })
@@ -407,7 +417,7 @@ impl Mp3Encode {
             // L/R<->M/S between adjacent frames (which mangled every switch boundary).
             let mut freqs: Vec<[f32; GRANULE_LINES]> = Vec::with_capacity(nch);
             for ch in 0..nch {
-                let gpcm = &channels[ch][gr * GRANULE_LINES..];
+                let gpcm = &raw[ch][gr * GRANULE_LINES..];
                 let sub = prof::time(&prof::FILTERBANK, || {
                     filterbank::analyze(gpcm, &mut self.analysis_fifo[ch])
                 });
