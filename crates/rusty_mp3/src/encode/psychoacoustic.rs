@@ -28,6 +28,19 @@ const N_FFT: usize = 1024;
 /// clips was the block-type decision (attack detector), not the threshold values.
 const SMR_OFFSET_DB: f32 = 3.0;
 
+/// Multiplier on the band-energy cap. 1.0 is the shipped behaviour; larger
+/// loosens the cap so the spread masker decides more bands; a very large value
+/// removes it entirely. Read once, like the other calibration knobs.
+fn thr_cap_scale() -> f32 {
+    static V: OnceLock<f32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MP3_THR_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0)
+    })
+}
+
 /// Calibration override for [`SMR_OFFSET_DB`], via `MP3_SMR_DB`.
 ///
 /// Read ONCE and cached: an env lookup inside the per-granule path would be
@@ -268,10 +281,36 @@ pub fn analyze(pcm: &[f32], sample_rate: u32) -> PsyResult {
             masker += energy[j] * row[j];
         }
         let ath = model.ath_base[i] * ath_scale;
+        // Census: which of the three terms actually decides this band's threshold.
+        // A masking model whose output is pinned to the band's own energy for most
+        // bands has no discriminating power left -- it is saying "you may put as
+        // much noise here as there is signal", i.e. every band may be dropped.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let m = masker * smr;
+            if m.max(ath) >= energy[i] {
+                crate::encode::prof::THR_CAPPED.fetch_add(1, Relaxed);
+            } else if ath > m {
+                crate::encode::prof::THR_ATH.fetch_add(1, Relaxed);
+            } else {
+                crate::encode::prof::THR_MASK.fetch_add(1, Relaxed);
+            }
+        }
         // Cap at the band's own energy: a band quantized to zero already produces
         // noise = its energy, so a higher threshold means the same thing (drop it)
         // while bounding the wild ATH values in the inaudible top bands.
-        thresholds[i] = (masker * smr).max(ath).min(energy[i]);
+        // The energy cap ("a band quantized to zero already makes noise equal to
+        // its own energy, so a higher threshold means the same thing") is sound as
+        // a CAP, but it binds on 37-48% of bands on real music -- and where it
+        // binds it sets threshold = energy, so the band's noise-to-mask ratio
+        // becomes 1/SNR, a signal-independent quantity. That flattens the masking
+        // SHAPE on nearly half the spectrum, and shape is the half of the model
+        // that demonstrably matters: ranking by noise-to-mask beats ranking by raw
+        // noise by +0.030 ODG, while a global level offset is inert because it
+        // cancels out of a ranking. `MP3_THR_CAP` scales the cap so its cost can
+        // be measured.
+        let cap = energy[i] * thr_cap_scale();
+        thresholds[i] = (masker * smr).max(ath).min(cap);
     }
 
     // Q4 — perceptual entropy: rough bit demand from the signal/threshold ratio.
