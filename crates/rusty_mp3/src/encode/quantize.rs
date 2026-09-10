@@ -165,6 +165,42 @@ impl Default for QuantizedGranule {
     }
 }
 
+/// `2^(0.75 · SF_MULT · s)` for every representable scalefactor `s`.
+///
+/// The per-band step is `2^(0.75·(base + SF_MULT·s))`, which factors exactly into
+/// a per-GRANULE `2^(0.75·base)` times a per-BAND term that depends only on the
+/// scalefactor — and `s` is an integer in `0..=MAX_SF`, so that term is a
+/// 16-entry table. `exp2` has no SIMD instruction and cannot be vectorized, so
+/// trading 22 of them per call for one plus 22 multiplies is the whole point.
+///
+/// Prometheus `perf002` pruned this factoring on 2026-07-08 as "byte-identical
+/// but not measurably faster". That measurement was taken while `level_from`
+/// still called libm `round` once per frequency line, which dominated the same
+/// loop; with that call gone the baseline moved, and a refutation expires when
+/// its baseline moves.
+fn sf_step_lut() -> &'static [f64; 16] {
+    static T: OnceLock<[f64; 16]> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [0f64; 16];
+        for (s, v) in t.iter_mut().enumerate() {
+            *v = 2f64.powf(0.75 * SF_MULT * s as f64);
+        }
+        t
+    })
+}
+
+/// `2^(-SF_MULT · s)` — the requantization mirror of [`sf_step_lut`].
+fn sf_inv_lut() -> &'static [f64; 16] {
+    static T: OnceLock<[f64; 16]> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [0f64; 16];
+        for (s, v) in t.iter_mut().enumerate() {
+            *v = 2f64.powf(-SF_MULT * s as f64);
+        }
+        t
+    })
+}
+
 /// Largest non-clipping quantized level. Above this the value would saturate at
 /// `MAX_LEVEL`, losing precision — so a gain that produces it is *too fine*.
 const MAX_UNCLIPPED: i32 = 8191;
@@ -214,9 +250,12 @@ fn quantize_with_sf(
 ) -> [i32; GRANULE_LINES] {
     let off = crate::tables::sfb_long_offsets(header.sample_rate);
     let base = -0.25 * (gain - 210) as f64;
+    // One `exp2` for the granule; the per-band factor is a table lookup.
+    let step_base = 2f64.powf(0.75 * base);
+    let sf_step = sf_step_lut();
     let mut coeffs = [0i32; GRANULE_LINES];
     for b in 0..22 {
-        let s = if b < 21 { sf[b] } else { 0 } as f64; // band 21 is uncoded
+        let s = if b < 21 { sf[b] } else { 0 }; // band 21 is uncoded
                                                        // step = scale_inv^(3/4): the per-band factor applied to the precomputed
                                                        // |freq|^(3/4), instead of re-powering |freq|·scale_inv per line.
                                                        //
@@ -230,7 +269,7 @@ fn quantize_with_sf(
                                                        // `2f64.powf(x)` sites as explicit `x.exp2()` left the emitted call
                                                        // counts identical (exp2=15/pow=10/powf=4 both ways) — the compiler
                                                        // already does it, so `powf→exp2` is a genuine no-op. Don't re-try it.
-        let step = 2f64.powf(0.75 * (base + SF_MULT * s));
+        let step = step_base * sf_step[s as usize];
         let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
         for i in lo..hi {
             let mag = level_from(xrp[i] * step);
@@ -278,7 +317,7 @@ fn band_noise_one(
     b: usize,
 ) -> f32 {
     let off = crate::tables::sfb_long_offsets(header.sample_rate);
-    let scale = 2f64.powf(0.25 * (gain - 210) as f64 - SF_MULT * sf_b as f64);
+    let scale = 2f64.powf(0.25 * (gain - 210) as f64) * sf_inv_lut()[sf_b as usize];
     let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
     let mut e = 0f64;
     for i in lo..hi {
@@ -300,10 +339,12 @@ fn band_noise(
 ) -> [f32; 21] {
     let off = crate::tables::sfb_long_offsets(header.sample_rate);
     let mut noise = [0f32; 21];
+    // Same factoring as `quantize_with_sf`: the granule term is one `exp2`, the
+    // per-band term is a table lookup on the integer scalefactor.
+    let scale_base = 2f64.powf(0.25 * (gain - 210) as f64);
+    let sf_inv = sf_inv_lut();
     for (b, n) in noise.iter_mut().enumerate() {
-        // perf002 (pruned — see `quantize_with_sf`): base-2 `powf` LUT gave no
-        // measurable speedup; LLVM already lowers `2f64.powf` to `exp2`.
-        let scale = 2f64.powf(0.25 * (gain - 210) as f64 - SF_MULT * sf[b] as f64);
+        let scale = scale_base * sf_inv[sf[b] as usize];
         let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
         let mut e = 0f64;
         for i in lo..hi {
