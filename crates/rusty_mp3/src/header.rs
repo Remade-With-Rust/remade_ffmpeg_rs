@@ -183,7 +183,13 @@ impl FrameHeader {
     /// `floor(samples_per_frame / 8 * bitrate / sample_rate) + padding`.
     pub fn frame_size(&self) -> usize {
         let spf = self.version.samples_per_frame();
-        let bytes = (spf / 8) * (self.bitrate_kbps as usize * 1000) / self.sample_rate as usize;
+        // `.max(1)`: the rate is validated non-zero at parse and set from a fixed
+        // table on encode, but the compiler cannot know that, so the division
+        // carried a divide-by-zero panic path -- in a function called for every
+        // frame from the muxer, the reservoir assembler and the rate loop. A `max`
+        // is a cmov; the branch and its panic block go.
+        let rate = (self.sample_rate as usize).max(1);
+        let bytes = (spf / 8) * (self.bitrate_kbps as usize * 1000) / rate;
         bytes + self.padding as usize
     }
 
