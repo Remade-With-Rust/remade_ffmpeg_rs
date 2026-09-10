@@ -65,6 +65,8 @@ ARMS = {
     "resv10": {"MP3_RESV_GAIN": "1.0"},
     "resv20": {"MP3_RESV_GAIN": "2.0"},
     "resv40": {"MP3_RESV_GAIN": "4.0"},
+    # Not an env config -- dispatched in encode(). The external oracle arm.
+    "lame": {},
 }
 
 
@@ -76,6 +78,11 @@ def run(cmd, env=None):
 
 
 def encode(src, rate, arm, out):
+    # `lame` is the external reference, not an arm of our encoder -- it is what
+    # makes the ladder a ranking rather than a self-comparison.
+    if arm == "lame":
+        return run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", src, "-c:a", "libmp3lame", "-b:a", f"{rate}k", out])
     return run([ENC, src, str(rate), out], ARMS[arm])
 
 

@@ -14,52 +14,56 @@ format is royalty-free everywhere.
 - **Encoder**: to our knowledge the **first pure-Rust MP3 encoder on
   crates.io** — existing options are FFI bindings to LAME. MPEG-1/2/2.5, CBR
   and VBR, mono/stereo/joint (mid/side) stereo, psychoacoustic model with
-  transient block switching, and a **bit reservoir** (default-on for MPEG-1 CBR
-  ≤ 256 kbps). Quality is **behind LAME by ~0.7 ODG at 192 kbps and ~1.1 at
-  128 kbps** on a three-clip corpus, and the gap is content-dependent — ~0.3 on
-  tonal material, 1.4–1.8 on transients. See [Quality](#quality). Known gaps:
-  the reservoir is disabled at 320 kbps and for MPEG-2/2.5 (fixed-frame path is
-  used there instead); the per-band distortion loop is effectively inert, so we
-  pick a global gain per granule where LAME shapes noise per band; and the
-  psychoacoustic model has no short-block thresholds.
+  transient block switching, per-band noise shaping, and a **bit reservoir**
+  (default-on for MPEG-1 CBR ≤ 256 kbps). Quality trails LAME by **0.08 ODG at
+  192 kbps and 0.23 at 128** on the music corpus below. See
+  [Quality](#quality). Known gaps: the reservoir is disabled at 320 kbps and for
+  MPEG-2/2.5 (fixed-frame path is used there instead); per-band shaping is
+  MPEG-1 only, because the LSF scalefactor scheme is unimplemented; and the
+  psychoacoustic model still has no short-block thresholds.
 
 ## Quality
 
-PEAQ ODG at matched **actual** bitrate, on a three-clip corpus — tonal guitar,
-dense piano, transient clicks. Per clip, because the mean hides the thing that
-matters:
+PEAQ ODG against LAME at matched bitrate, per clip and per rate, on three real
+CC0/PD music clips (24 s, 44.1 kHz mono). Positive = LAME ahead. Per clip,
+because a mean hides the thing that matters:
 
-| CBR 192 kbps | guitar | piano | clicks | mean |
-| ------------ | ------ | ----- | ------ | ---- |
-| LAME | +0.01 | +0.11 | −1.14 | −0.34 |
-| ours | −0.28 | −0.37 | −2.53 | −1.06 |
-| **gap** | **0.29** | **0.48** | **1.39** | **0.72** |
+| gap to LAME | 96k | 128k | 160k | 192k |
+| ----------- | --- | ---- | ---- | ---- |
+| guitar | +0.054 | +0.020 | **−0.034** | +0.030 |
+| piano | +0.564 | +0.322 | +0.134 | +0.096 |
+| vocal | +0.295 | +0.334 | +0.174 | +0.125 |
+| **mean** | **+0.304** | **+0.225** | **+0.091** | **+0.084** |
 
-| CBR 128 kbps | guitar | piano | clicks | mean |
-| ------------ | ------ | ----- | ------ | ---- |
-| LAME | −0.90 | +0.06 | −1.32 | −0.72 |
-| ours | −1.28 | −1.07 | −3.06 | −1.80 |
-| **gap** | **0.37** | **1.13** | **1.75** | **1.08** |
+ODG runs 0 (imperceptible) to −4 (very annoying). The gap narrows with bitrate,
+and on guitar at 160 kbps we are ahead. Regenerate with:
 
-ODG runs 0 (imperceptible) to −4 (very annoying).
+```sh
+python tools/quality/ladder.py --arms slack,lame --rates 96,128,160,192 --dirs corpus --only corp_long
+```
 
-**The gap is content-dependent, and transients are where we lose.** On tonal
-guitar we are ~0.3 ODG behind LAME; on percussive material we are 1.4–1.8
-behind. Two known causes, both structural rather than tuning: the per-band
-distortion loop keeps iteration 0 in effectively every granule, so we choose a
-global gain per granule where LAME shapes noise per band; and the
-psychoacoustic model produces no short-block masking thresholds, so the block
-type that exists to control pre-echo is the one with the weakest model behind
-it.
+**What changed.** The per-band distortion loop had never shaped a single
+band, on any content: it tested quantization noise (MDCT domain) against masking
+thresholds (unnormalized 1024-point FFT power), two scales that differ by ~49 dB.
+Every band therefore read as masked — 98.7% of them by more than six decades — so
+the loop exited on its first iteration in 100% of granules and the encoder shipped
+one global gain per granule where LAME shapes 71–77% of them. With the comparison
+corrected the encoder now shapes 67–71% of granules, and it also stopped throwing
+away the 63–89 bits per granule that a 1.5 dB gain step cannot place (LAME wastes
+5–7). Measured across 8 content classes at 4 bitrates that is +0.045 ODG, 29/32
+points better; on the real music above, +0.020.
 
-Sweeping the model's one masking constant across a 6× range moves tonal content
-by 0.002 ODG, which is the arithmetic confirming the above: the constant is not
-what is binding.
+*Earlier revisions quoted 0.72 ODG at 192k and 1.08 at 128k on a different
+three-clip corpus that included a synthetic transient clip, and attributed the
+loss to an inert distortion loop. The loop was not inert by design — it was
+comparing two different units. Those figures are not comparable to the table above
+because the corpus differs; the regeneration command is given so this one is.*
 
-*Earlier revisions of this README quoted a 0.29–0.46 ODG gap. That was measured
-on the guitar clip alone, which is our best content; the corpus numbers above
-supersede it. An earlier revision also claimed PEAQ parity with LAME, which
-predated measuring against it at matched bitrate.*
+**Still open:** the psychoacoustic model produces no short-block thresholds, so
+short blocks — the window type that exists to control pre-echo — quantize without
+a masking model behind them. Per-band shaping is MPEG-1 only. Full evidence,
+per-class tables and the measurement method are in
+[`docs/plans/mp3-gate-ledger.md`](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/docs/plans/mp3-gate-ledger.md).
 
 ## Decode
 
