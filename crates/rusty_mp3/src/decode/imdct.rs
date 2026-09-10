@@ -109,6 +109,11 @@ fn cos36_t() -> &'static [[f32; 24]; 18] {
 #[target_feature(enable = "avx")]
 unsafe fn imdct36_avx(lines: &[f32], out: &mut [f32; 24]) {
     use std::arch::x86_64::*;
+    // Same fix as the scalar twin: an unsized slice cannot carry its length, so
+    // each of the eighteen broadcasts paid a bounds check.
+    let Some(lines) = lines.first_chunk::<18>() else {
+        return;
+    };
     let ct = cos36_t();
     let mut acc = [unsafe { _mm256_setzero_ps() }; 3];
     for (k, row) in ct.iter().enumerate() {
