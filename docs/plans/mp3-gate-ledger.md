@@ -222,6 +222,36 @@ with its knob in place so it is a one-line re-test rather than a rediscovery.
 
 ---
 
+## Copy and allocation catalogue (codec-memory-copies pass)
+
+Priced from the emitted-assembly census (`tools/bench/copy_census.py`) and the
+allocation audit, so the next pass can skip this surface in one read.
+
+**Calibration first, because the obvious constant is wrong.** A 2,304-byte copy is
+L1-resident and moves far faster than the ~10 GB/s figure used for streaming main
+memory. Measured here: removing ~20 MB of copying per 24 s clip was worth ~0.3%,
+not the 1.6% that 10 GB/s predicted. **Price a copy at the bandwidth of the level
+it actually lives in** — every row below uses the empirical ~20 MB ≈ 0.3%.
+
+| site | traffic per 24 s clip | priced | verdict |
+|---|---:|---:|---|
+| `quantize::loops` — `InnerResult` clone per fitting probe | ~20 MB | ~0.3% | **FIXED** (reference swap), measured at the floor |
+| `BitWriter` growth — main data + side info | 7,258 reallocs / 800 frames | — | **FIXED**, counter −99.5% |
+| `assemble_stream` — whole-stream `md` and `out` | ~22 reallocs / file | ~0% | **FIXED** (free, one line each) |
+| `psychoacoustic::analyze` | ~30 MB | ~0.45% | pruned |
+| `Mp3Encode::analyze_frame` | ~12.5 MB | ~0.19% | pruned |
+| `shortblock::quantize_short*` | same by-value shape | ≤0.1% on most content | pruned — fires on 2.6% of granules (31.8% on speech) |
+| `decode::scalefactors::decode` — 61 sites | 8-byte copies | ≪0.1% | pruned — short runtime lengths, and decode already beats FFmpeg |
+
+Every pruned row is an order of magnitude below the ~0.5% bar this workspace uses,
+and the largest of them was *measured* at the floor after being fixed — which is
+the strongest possible evidence that its smaller siblings are not worth the churn.
+
+**Still open, deliberately not chased:** 12 allocations per frame survive, none of
+them reallocs. Those are per-frame owned buffers (packets, serialized side info) —
+one alloc, no copy — which is the shape this skill calls fine, as opposed to a
+scratch thrown away each frame.
+
 ## Instruments added
 
 | tool | what it answers |
@@ -229,6 +259,8 @@ with its knob in place so it is a one-line re-test rather than a rediscovery.
 | `examples/bscensus.rs` | reads ANY mp3 (ours, LAME's) and counts the encoder's decisions from the side info: block mix, % flat vs shaped granules, non-zero sfb, sf spread, scfsi/preflag/subblock_gain use, gain range, and payload utilisation |
 | `examples/encprof.rs` (extended) | outer-loop iterations, NMR histogram over coded bands, threshold-source split (cap / ATH / masker), the FFT-vs-MDCT domain ratio, accepted refine steps, `SF_OVERFLOW`, `VBR_Q` to drive the VBR quantizer, optional mp3 output |
 | `tools/quality/ladder.py` | the per-class × per-bitrate PEAQ ladder, arms as env configs, per-clip/per-rate tables with sign splits, CSV for the gate calculator |
+| `tools/bench/pinab.py` | **the one compliant timing harness** — pinned to a core at High priority, ABBA with the leading arm alternated, null arm first, each arm's own internal duration; REFUSES a verdict when the effect is under its own floor. Unpinned, a single arm's spread on this box was 2.01x; pinned, 1.04x |
+| `tools/bench/copy_census.py` | every `memcpy`/`memmove`/`memset` in the emitted assembly, attributed to its symbol, with constant lengths resolved — distinguishes a length that INLINES from a runtime one that is a real opaque call |
 
 `prof::note_nmr` buckets by comparison rather than `log10`: it runs once per band per
 granule on the shipping path, and a transcendental there would be the instrument
