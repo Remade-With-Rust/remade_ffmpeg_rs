@@ -46,13 +46,17 @@ pub fn reduce(gi: &GranuleSideInfo, lines: &mut [f32; GRANULE_LINES]) {
     let (cs, ca) = weights();
     for sb in 1..=boundaries {
         let base = sb * 18;
+        // The butterfly touches `base-8 ..= base+7` and nothing else. Indexing
+        // `lines` directly costs four bounds checks per butterfly -- two reads and
+        // two writes -- because nothing proves `base + i < 576`; slicing the window
+        // once per subband makes every index below constant-bounded.
+        let w = &mut lines[base - 8..base + 8];
         for i in 0..8 {
-            let lower = base - 1 - i;
-            let upper = base + i;
-            let a = lines[lower];
-            let b = lines[upper];
-            lines[lower] = a * cs[i] - b * ca[i];
-            lines[upper] = b * cs[i] + a * ca[i];
+            let (lower, upper) = (7 - i, 8 + i);
+            let a = w[lower];
+            let b = w[upper];
+            w[lower] = a * cs[i] - b * ca[i];
+            w[upper] = b * cs[i] + a * ca[i];
         }
     }
 }

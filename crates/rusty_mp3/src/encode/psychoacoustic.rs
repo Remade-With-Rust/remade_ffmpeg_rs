@@ -234,18 +234,23 @@ pub fn detect_attack(pcm: &[f32]) -> bool {
     if bs == 0 {
         return false;
     }
-    let energy = |b: usize| -> f32 {
-        pcm[b * bs..(b + 1) * bs].iter().map(|x| x * x).sum::<f32>() / bs as f32
-    };
+    // `chunks_exact` carries its own length, so the sub-block energies need no
+    // per-call range check on `pcm[b * bs..(b + 1) * bs]`.
+    let mut blocks = pcm[..n]
+        .chunks_exact(bs)
+        .map(|c| c.iter().map(|x| x * x).sum::<f32>() / bs as f32)
+        .take(BLOCKS);
     // **Quality fix:** seed the running baseline from the FIRST sub-block, not a
     // ~zero constant. The old `running = 1e-6` meant block 0's energy (any audible
     // signal) instantly exceeded `running·RATIO`, so a transient was "detected" in
     // essentially every non-silent granule — 95% short blocks on a ringtone, which
     // then quantize with flat scalefactors and bypass the psymodel. Now an attack is
     // a sub-block that genuinely SPIKES ≥RATIO× above the recent energy.
-    let mut running = energy(0).max(1e-9);
-    for b in 1..BLOCKS {
-        let e = energy(b);
+    let Some(first) = blocks.next() else {
+        return false;
+    };
+    let mut running = first.max(1e-9);
+    for e in blocks {
         if e > running * RATIO {
             return true;
         }
