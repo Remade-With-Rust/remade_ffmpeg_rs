@@ -268,9 +268,11 @@ pub fn analyze(pcm: &[f32], sample_rate: u32) -> PsyResult {
     // Q2 — windowed FFT power spectrum.
     let mut re = [0f32; N_FFT];
     let mut im = [0f32; N_FFT];
-    let navail = pcm.len().min(N_FFT);
-    for i in 0..navail {
-        re[i] = pcm[i] * win[i];
+    // Zip rather than index: the iterators stop at the shortest of the three,
+    // which IS `min(pcm.len(), N_FFT)`, so the bound is carried rather than
+    // re-checked per sample.
+    for ((r, &p), &w) in re.iter_mut().zip(pcm.iter()).zip(win.iter()) {
+        *r = p * w;
     }
     let mut power = [0f32; N_FFT / 2 + 1];
     fft::power_spectrum(&mut re, &mut im, &mut power);
@@ -279,7 +281,11 @@ pub fn analyze(pcm: &[f32], sample_rate: u32) -> PsyResult {
     let mut energy = [0f32; SFB_LONG];
     for b in 0..SFB_LONG {
         let mut e = 1e-12f32;
-        for &p in power.iter().take(model.bin_hi[b]).skip(model.bin_lo[b]) {
+        // A slice, not `take().skip()`: one range check instead of a per-element
+        // counter pair. The accumulation ORDER is unchanged -- `e` still starts at
+        // the floor and takes the bins in the same sequence -- which is what float
+        // addition cares about.
+        for &p in &power[model.bin_lo[b]..model.bin_hi[b]] {
             e += p;
         }
         energy[b] = e;
