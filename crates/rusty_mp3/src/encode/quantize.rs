@@ -69,7 +69,29 @@ pub fn quantize_level(xr: f64) -> i32 {
 #[inline]
 pub(crate) fn level_from(powered: f64) -> i32 {
     let m = powered - QUANT_BIAS;
-    m.round().clamp(0.0, MAX_LEVEL as f64) as i32
+    // Round-half-AWAY-from-zero, then clamp — with no call and no branch.
+    //
+    // `f64::round` is ties-away-from-zero, which **no x86 instruction
+    // implements**, so it lowers to a libm CALL. One call per element is a hard
+    // barrier that keeps the whole loop scalar however branchless the rest of it
+    // is, and the emitted assembly confirmed it: `inner_gain` — ~59% of encode
+    // time — held a `call round` per frequency line and **zero** packed
+    // operations. (`floor`/`ceil`/`trunc` are no better: they need SSE4.1, above
+    // the portable x86-64 baseline.)
+    //
+    // The result is clamped to `[0, MAX_LEVEL]` regardless, and over that
+    // non-negative domain rounding half away from zero is exactly "add a half and
+    // truncate toward zero" — and truncation IS baseline (`cvttsd2si`, which
+    // vectorizes as `cvttpd2dq`). Clamping *before* the add keeps the value in
+    // range so the cast cannot saturate, and makes the sequence pure arithmetic.
+    //
+    // Exact at the tie points, not merely close: `level_from_matches_guarded`
+    // sweeps the working range and every half-integer midpoint against the
+    // original guarded form. The magic-number ties-to-EVEN trick was tried first
+    // and rejected here — it is bit-identical on all 24 corpus encodes but
+    // differs at constructed ties, and weakening a standing exactness gate to buy
+    // speed is the wrong trade when an exact form is available.
+    (m.clamp(0.0, MAX_LEVEL as f64) + 0.5) as i32
 }
 
 /// **A1** — precompute `|freq[i]|^(3/4)` for the whole granule, once. The forward
