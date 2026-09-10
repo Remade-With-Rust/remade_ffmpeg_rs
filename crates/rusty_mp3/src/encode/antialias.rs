@@ -48,14 +48,19 @@ pub fn expand(gi: &GranuleSideInfo, lines: &mut [f32; GRANULE_LINES]) {
     let (cs, ca) = weights();
     for sb in 1..=boundaries {
         let base = sb * 18;
+        // Take the 16 lines straddling the subband boundary as one window: the
+        // butterfly touches `base-8 ..= base+7` and nothing more. Indexing `lines`
+        // directly costs four bounds checks per butterfly (two reads, two writes)
+        // because nothing proves `base + i < 576`; against a 16-element window
+        // every index below is a constant-bounded one and the checks go.
+        let w = &mut lines[base - 8..base + 8];
         for i in 0..8 {
-            let lower = base - 1 - i;
-            let upper = base + i;
-            let a = lines[lower];
-            let b = lines[upper];
+            let (lower, upper) = (7 - i, 8 + i);
+            let a = w[lower];
+            let b = w[upper];
             // Inverse of decode's [[cs,-ca],[ca,cs]] rotation (its transpose).
-            lines[lower] = a * cs[i] + b * ca[i];
-            lines[upper] = -a * ca[i] + b * cs[i];
+            w[lower] = a * cs[i] + b * ca[i];
+            w[upper] = -a * ca[i] + b * cs[i];
         }
     }
 }

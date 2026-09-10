@@ -177,7 +177,13 @@ impl Default for QuantizedGranule {
     }
 }
 
-/// `2^(0.75 · SF_MULT · s)` for every representable scalefactor `s`.
+/// `2^(0.75 · SF_MULT · s)`, indexed by the raw `u8` scalefactor.
+///
+/// Sized 256 rather than `MAX_SF + 1` on purpose: the index is a `u8` from a
+/// `[u8; 22]`, and nothing tells the compiler it is <= 15, so a 16-entry table
+/// costs a `cmp` and a branch-to-panic on EVERY band of every gain probe. A table
+/// covering the whole index type is provably in range, so the guard disappears.
+/// Only the first sixteen entries are ever read, so the rest never load.
 ///
 /// The per-band step is `2^(0.75·(base + SF_MULT·s))`, which factors exactly into
 /// a per-GRANULE `2^(0.75·base)` times a per-BAND term that depends only on the
@@ -190,10 +196,10 @@ impl Default for QuantizedGranule {
 /// still called libm `round` once per frequency line, which dominated the same
 /// loop; with that call gone the baseline moved, and a refutation expires when
 /// its baseline moves.
-fn sf_step_lut() -> &'static [f64; 16] {
-    static T: OnceLock<[f64; 16]> = OnceLock::new();
+fn sf_step_lut() -> &'static [f64; 256] {
+    static T: OnceLock<[f64; 256]> = OnceLock::new();
     T.get_or_init(|| {
-        let mut t = [0f64; 16];
+        let mut t = [0f64; 256];
         for (s, v) in t.iter_mut().enumerate() {
             *v = 2f64.powf(0.75 * SF_MULT * s as f64);
         }
@@ -202,10 +208,10 @@ fn sf_step_lut() -> &'static [f64; 16] {
 }
 
 /// `2^(-SF_MULT · s)` — the requantization mirror of [`sf_step_lut`].
-fn sf_inv_lut() -> &'static [f64; 16] {
-    static T: OnceLock<[f64; 16]> = OnceLock::new();
+fn sf_inv_lut() -> &'static [f64; 256] {
+    static T: OnceLock<[f64; 256]> = OnceLock::new();
     T.get_or_init(|| {
-        let mut t = [0f64; 16];
+        let mut t = [0f64; 256];
         for (s, v) in t.iter_mut().enumerate() {
             *v = 2f64.powf(-SF_MULT * s as f64);
         }
@@ -284,8 +290,14 @@ fn quantize_into(
     // One `exp2` for the granule; the per-band factor is a table lookup.
     let step_base = 2f64.powf(0.75 * base);
     let sf_step = sf_step_lut();
+    // Band 21 is uncoded, i.e. always scalefactor 0. Expressing that as
+    // `if b < 21 { sf[b] } else { 0 }` puts two compares and a branch INSIDE the
+    // band loop for a condition true 21 times out of 22; zeroing the entry once
+    // folds it out.
+    let mut sfx = *sf;
+    sfx[21] = 0;
     for b in 0..22 {
-        let s = if b < 21 { sf[b] } else { 0 }; // band 21 is uncoded
+        let s = sfx[b];
                                                        // step = scale_inv^(3/4): the per-band factor applied to the precomputed
                                                        // |freq|^(3/4), instead of re-powering |freq|·scale_inv per line.
                                                        //
