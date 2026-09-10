@@ -45,3 +45,8 @@ video-tests/*/target/
 
 # HEVC conformance vectors + bench streams (scripts/fetch-hevc-vectors.sh)
 /hevc-vectors/
+
+# Local-only cargo config (the path form of the rusty_json_turbo patch,
+# used to validate against an unpushed checkout). Never committed: a patch
+# the CI runner cannot resolve breaks every build there.
+/.cargo/config.toml

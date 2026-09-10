@@ -244,3 +244,24 @@ codegen-units = 1
 # loops never panic), so the cost is binary size, not throughput.
 panic = "unwind"
 
+# THE JSON SWAP (rusty_json_turbo). One table converts the WHOLE graph.
+#
+# `serde_json` here is the house fork, `Remade-With-Rust/rusty_json_turbo`: a
+# performance fork whose output is byte-identical to upstream's by contract,
+# gated per commit against upstream serde_json linked in the same process --
+# bytes, `Value`, error text with line and column, float bit patterns and
+# `StreamDeserializer` offsets. Its LIBRARY is still called `serde_json`, so
+# every `use serde_json::...` line in this repository is untouched.
+#
+# WHY A PATCH AND NOT A RENAMED DEPENDENCY. Writing
+# `serde_json = { package = "rusty_json_turbo", ... }` would convert only the
+# JSON this repository calls itself, leaving every third-party copy on
+# upstream -- and the two would then be DIFFERENT TYPES, so a `Value` handed
+# across that boundary would not compile. A patch converts every copy at once
+# and leaves exactly one `Value` in the graph.
+#
+# The patch target is a shim package inside the fork named `serde_json`, which
+# exists because `[patch]` matches on PACKAGE name and the fork's package is
+# `rusty_json_turbo`. See that repository's `crates/serde_json-shim/`.
+[patch.crates-io]
+serde_json = { git = "https://github.com/Remade-With-Rust/rusty_json_turbo", branch = "master" }
