@@ -96,6 +96,20 @@ impl BitWriter {
         BitWriter::default()
     }
 
+    /// A writer whose byte buffer is reserved for `bytes` up front.
+    ///
+    /// `write` appends a byte at a time, so a writer started empty reallocs its
+    /// way up -- about ten times per frame for the main-data buffer, and the
+    /// realloc traffic is invisible to a copy census because it happens inside
+    /// `Vec`. Every caller here knows its exact output size from the header.
+    pub fn with_capacity(bytes: usize) -> BitWriter {
+        BitWriter {
+            bytes: Vec::with_capacity(bytes),
+            nbits: 0,
+            cur: 0,
+        }
+    }
+
     /// Append the low `n` bits of `v`, MSB-first.
     pub fn write(&mut self, v: u32, n: u32) {
         for i in (0..n).rev() {
