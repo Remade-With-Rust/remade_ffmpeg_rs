@@ -208,7 +208,12 @@ impl PairTable {
         // A const table, not a OnceLock+Vec: that would trade the division for an
         // atomic load and a pointer chase, which is not obviously cheaper.
         let d = self.dim as usize;
-        let mut x = DIV_TAB[d][idx & 0xFF] as i32;
+        // The inner index is already masked; the OUTER one was not. `d` is
+        // `self.dim as usize` -- a `u8`, so 0..=255 to the compiler -- against a
+        // 17-row table, which is a bounds check on every decoded pair in the stage
+        // that is ~42% of decode. A mask will not do (16 is a legal dim, so `& 15`
+        // would fold it onto 0); `.min(16)` is a cmov and exact for every real dim.
+        let mut x = DIV_TAB[d.min(16)][idx & 0xFF] as i32;
         let mut y = (idx - x as usize * d) as i32;
         let maxc = self.dim as i32 - 1;
         if self.linbits > 0 && x == maxc {
