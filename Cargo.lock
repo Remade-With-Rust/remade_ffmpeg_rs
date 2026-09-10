@@ -5728,6 +5728,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c0867b42b4af7cfcce3466505720f64edfa6ef1782cdca2f712cf5ca711807d"
 
 [[package]]
+name = "rusty_json_turbo"
+version = "0.2.0"
+source = "git+https://github.com/Remade-With-Rust/rusty_json_turbo?branch=master#31fda0bc83498a0801860db67fd8b9ff22177d7d"
+dependencies = [
+ "itoa 1.0.18",
+ "memchr",
+ "rusty_json_turbo-accel",
+ "serde",
+ "serde_core",
+ "zmij",
+]
+
+[[package]]
+name = "rusty_json_turbo-accel"
+version = "0.2.0"
+source = "git+https://github.com/Remade-With-Rust/rusty_json_turbo?branch=master#31fda0bc83498a0801860db67fd8b9ff22177d7d"
+
+[[package]]
 name = "rusty_mp3"
 version = "0.7.0"
 dependencies = [
@@ -5924,15 +5942,10 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.150"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
+version = "1.0.151"
+source = "git+https://github.com/Remade-With-Rust/rusty_json_turbo?branch=master#31fda0bc83498a0801860db67fd8b9ff22177d7d"
 dependencies = [
- "itoa 1.0.18",
- "memchr",
- "serde",
- "serde_core",
- "zmij",
+ "rusty_json_turbo",
 ]
 
 [[package]]
