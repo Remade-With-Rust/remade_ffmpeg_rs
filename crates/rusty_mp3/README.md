@@ -287,6 +287,34 @@ a dense reference implementation instead of being assumed covered.
 cargo run -p rusty_mp3 --release --example decprof -- input.mp3
 ```
 
+## WebAssembly
+
+Both halves run on wasm, and **bit-exactly**: the same bitstream produces the same
+samples and the same encoded bytes as a native build.
+
+| target | decode | encode | notes |
+| ------ | ------ | ------ | ----- |
+| `wasm32-wasip1` | ✅ bit-exact | ✅ bit-exact | has a clock and threads; the stage profiler and the pipelined decoder both work |
+| `wasm32-unknown-unknown` | ✅ bit-exact | ✅ bit-exact | the browser: no clock, no threads (see below) |
+
+There is no `Instant` and no thread on `wasm32-unknown-unknown`. The stage
+profiler compiles out there rather than trapping, and `decode_pipelined` degrades
+to the serial path — it is a speed optimisation whose output is identical either
+way, so a browser caller gets the same samples, just on one thread. Nothing needs
+a feature flag and the crate has no wasm-specific dependencies; the module
+requires **zero host imports**.
+
+Verify it yourself — the check compares hashes across host, wasmtime and node:
+
+```sh
+bash tools/bench/wasm_check.sh
+```
+
+*Earlier releases compiled for `wasm32-unknown-unknown` and trapped on the first
+decoded frame, because the profiler called `Instant::now()` on every stage. A
+build check does not catch that; the gate above runs the codec on the target and
+compares output.*
+
 ## Part of Remade With Rust
 
 This crate is the standalone MP3 engine of
