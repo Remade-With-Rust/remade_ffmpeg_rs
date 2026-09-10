@@ -47,6 +47,78 @@ pub mod prof {
     // never improved past the rate-loop quantization) vs total long granules.
     pub static OUTER_KEPT0: AtomicU64 = AtomicU64::new(0);
     pub static OUTER_TOTAL: AtomicU64 = AtomicU64::new(0);
+    /// Outer-loop iterations actually executed. Each one runs a full inner rate
+    /// loop (a binary search of quantize + Huffman table selection), so when
+    /// `OUTER_KEPT0 == OUTER_TOTAL` this counter is the work the encoder did and
+    /// then discarded.
+    pub static OUTER_ITERS: AtomicU64 = AtomicU64::new(0);
+    /// Histogram of per-band noise-to-mask ratio at the rate loop's chosen gain,
+    /// bucketed by `log10(noise/threshold)`: index 0 is `< -6` decades (noise a
+    /// million times under the mask), index 7 is `>= 0` (noise AT or ABOVE the
+    /// mask, i.e. audible). The distortion loop only ever fires on bucket 7, so
+    /// this says whether it is silent because the coding is good or because the
+    /// thresholds are unreachable.
+    pub static NMR_HIST: [AtomicU64; 8] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    /// Times the pre-fix `MAX_SF` guard would have amplified a band the
+    /// bitstream cannot represent (bands 11..20 above 7), which the serializer
+    /// silently truncated. Non-zero here means the truncation bug was reachable
+    /// on this content, not merely latent.
+    pub static SF_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+    /// Scalefactor amplification steps accepted by the slack refinement -- the
+    /// per-band shaping the encoder actually bought with its leftover bits.
+    pub static REFINE_STEPS: AtomicU64 = AtomicU64::new(0);
+
+    /// Which term decided each band's masking threshold: the energy cap, the
+    /// absolute threshold of hearing, or the spread masker itself. Only the last
+    /// carries any masking information.
+    pub static THR_CAPPED: AtomicU64 = AtomicU64::new(0);
+    pub static THR_ATH: AtomicU64 = AtomicU64::new(0);
+    pub static THR_MASK: AtomicU64 = AtomicU64::new(0);
+
+    /// Sum of `1000 * log10(fft_energy / mdct_energy)` over granules, and the
+    /// granule count. The psymodel's thresholds are derived from an unnormalized
+    /// 1024-point FFT; the distortion loop's noise is squared error on MDCT
+    /// coefficients. If those two domains do not share a scale, every comparison
+    /// between them is off by this ratio -- so measure it instead of deriving it.
+    pub static DOMAIN_LOG_SUM: AtomicU64 = AtomicU64::new(0);
+    pub static DOMAIN_N: AtomicU64 = AtomicU64::new(0);
+
+    /// Fold one granule's FFT-vs-MDCT energy ratio in.
+    #[inline]
+    pub fn note_domain(fft_energy: f32, mdct_energy: f32) {
+        if fft_energy > 0.0 && mdct_energy > 0.0 {
+            let l = (fft_energy / mdct_energy).log10() * 1000.0;
+            DOMAIN_LOG_SUM.fetch_add(l.max(0.0) as u64, Ordering::Relaxed);
+            DOMAIN_N.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Fold one band's noise-to-mask ratio into [`NMR_HIST`].
+    ///
+    /// Bucketed by comparison rather than `log10`: this runs once per band per
+    /// granule on the shipping encode path, and a transcendental there would be
+    /// the instrument charging the thing it measures (~39k `log10` calls on a
+    /// 24 s clip). Seven predictable compares cost nothing.
+    #[inline]
+    pub fn note_nmr(nmr: f32) {
+        const EDGES: [f32; 7] = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0];
+        let mut d = 0;
+        while d < 7 && nmr >= EDGES[d] {
+            d += 1;
+        }
+        NMR_HIST[d].fetch_add(1, Ordering::Relaxed);
+    }
 
     /// Time `f` into `bucket` (nanoseconds, summed across calls).
     #[inline]
