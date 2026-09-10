@@ -53,6 +53,12 @@ pub fn analyze(pcm: &[f32], fifo: &mut [f32; 512]) -> [[f32; SUBBAND_LINES]; SUB
     let c = window();
     let m = matrix();
     let mut out = [[0f32; SUBBAND_LINES]; SUBBANDS];
+    // The granule is exactly `SUBBAND_LINES * 32` samples and callers pass an
+    // open-ended slice, so `pcm[v * 32 + t]` could not be proven in range and every
+    // one of the 576 FIFO pushes carried a bounds check.
+    let Some(pcm) = pcm.first_chunk::<{ SUBBAND_LINES * 32 }>() else {
+        return out;
+    };
 
     for v in 0..SUBBAND_LINES {
         // Shift the FIFO up by 32 and push the 32 new samples in, newest at X[0]
