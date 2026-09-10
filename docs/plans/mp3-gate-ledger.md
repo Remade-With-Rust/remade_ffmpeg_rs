@@ -33,6 +33,16 @@ sanctions synthesizing gap classes. **Known corpus gaps:** no real percussive
 recording; `stereo-wide` is scored on channel 0 only, because `peaq_run.py` takes
 one channel — a stereo verdict needs per-channel scoring averaged.
 
+> ⚠ **The synthetic set is valid for A/B deltas between our own arms, and NOT for
+> cross-encoder absolute ranking.** Scored against LAME it claims we are 0.54–2.17
+> ODG behind per class — while our decoded SNR is *higher* than LAME's on every one
+> of those classes (noise-like 19.9 vs 9.9 dB, speech-noisy 24.6 vs 15.2,
+> percussive 35.5 vs 29.6, music-tonal 59.9 vs 30.5 at 192 kbps). A 30 dB SNR
+> advantage reading as a 0.79 ODG loss on synthetic tonal content, where *real*
+> tonal content reads 0.28, is the metric failing on 2 s synthetic signals, not the
+> codec. Both arms of an A/B get identical treatment so the deltas survive; an
+> absolute ranking does not. **Take every vs-LAME number from the real clips.**
+
 ### Per-class truth table — does the corpus exercise the mechanism?
 
 Measured at 128 kbps with `encprof` (deterministic counters, one run):
