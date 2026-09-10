@@ -176,7 +176,15 @@ unsafe fn window_avx(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut 
     use std::arch::x86_64::*;
     let mut acc = [unsafe { _mm256_setzero_ps() }; 4];
     for i in 0..8 {
-        let a = (head + i * 128) & 1023;
+        // `a` is masked with 960, `b` with 1023, and the asymmetry is the point.
+        // `head` starts at 0 and advances by `(head + 1024 - 64) & 1023`, so it is
+        // always 64-aligned and `head + i * 128` has its low six bits clear -- the
+        // narrower mask is the identity for `a` AND proves `a <= 960`, hence
+        // `a + 32 <= 1024`, removing the span's bounds check. It is NOT valid for
+        // `b`: `+ 96` is not 64-aligned (96 mod 64 = 32), so masking bit 5 away
+        // there destroys signal. Tried; it moved the decode hash and failed two
+        // reconstruction tests.
+        let a = (head + i * 128) & 960;
         let b = (head + i * 128 + 96) & 1023;
         for (v, accv) in acc.iter_mut().enumerate() {
             unsafe {
@@ -212,7 +220,15 @@ unsafe fn window_avx(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut 
 fn window_scalar(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut [f32; 32]) {
     out.fill(0.0);
     for i in 0..8 {
-        let a = (head + i * 128) & 1023;
+        // `a` is masked with 960, `b` with 1023, and the asymmetry is the point.
+        // `head` starts at 0 and advances by `(head + 1024 - 64) & 1023`, so it is
+        // always 64-aligned and `head + i * 128` has its low six bits clear -- the
+        // narrower mask is the identity for `a` AND proves `a <= 960`, hence
+        // `a + 32 <= 1024`, removing the span's bounds check. It is NOT valid for
+        // `b`: `+ 96` is not 64-aligned (96 mod 64 = 32), so masking bit 5 away
+        // there destroys signal. Tried; it moved the decode hash and failed two
+        // reconstruction tests.
+        let a = (head + i * 128) & 960;
         let b = (head + i * 128 + 96) & 1023;
         let (fa, fb) = (&fifo[a..a + 32], &fifo[b..b + 32]);
         let (da, db) = (&d[i * 64..i * 64 + 32], &d[i * 64 + 32..i * 64 + 64]);
