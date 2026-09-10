@@ -32,6 +32,8 @@ pub mod synthesis;
 /// Same role as the encoder's: find the real decode hotspots before optimizing.
 pub mod prof {
     use std::sync::atomic::{AtomicU64, Ordering};
+    // No clock on the browser target -- see `time` below.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     use std::time::Instant;
 
     pub static HUFFMAN: AtomicU64 = AtomicU64::new(0);
@@ -70,12 +72,27 @@ pub mod prof {
         );
     }
 
+    /// Time `f` into `bucket` (nanoseconds, summed across calls).
+    ///
+    /// **There is no clock on `wasm32-unknown-unknown`.** `Instant::now()` traps
+    /// there, and this wrapper sits on EVERY stage, so the codec aborted on its
+    /// first frame in a browser while compiling cleanly and passing every test on
+    /// the host. WASI has a clock and keeps its timing; only the bare-wasm target
+    /// compiles it out and runs `f` unwrapped.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[inline]
     pub fn time<T>(bucket: &AtomicU64, f: impl FnOnce() -> T) -> T {
         let t = Instant::now();
         let r = f();
         bucket.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         r
+    }
+
+    /// Clock-free twin for the browser target: run the stage, record nothing.
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    #[inline]
+    pub fn time<T>(_bucket: &AtomicU64, f: impl FnOnce() -> T) -> T {
+        f()
     }
 
     pub fn dump() {

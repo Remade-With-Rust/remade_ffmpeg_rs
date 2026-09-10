@@ -187,6 +187,25 @@ impl Mp3Decoder {
 /// on each half, only on different threads. `std::thread` only — this crate has
 /// no dependencies and does not acquire one for this.
 pub fn decode_pipelined(bytes: &[u8]) -> Vec<DecodedAudio> {
+    // No threads on `wasm32-unknown-unknown`: spawning traps, so a browser caller
+    // reaching this function aborted the module. The two-stage split is a SPEED
+    // optimisation whose output is identical to the serial path -- that equality is
+    // a standing test (`pipelined_decode_matches_serial_exactly`) -- so where there
+    // is no thread to give it, degrade instead of failing.
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        let mut dec = Mp3Decoder::new();
+        dec.push(bytes);
+        dec.flush();
+        let mut out = Vec::new();
+        while let Ok(f) = dec.next_frame() {
+            out.push(f);
+        }
+        return out;
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
     use std::sync::mpsc::sync_channel;
 
     // Bounded so a fast entropy stage cannot buffer the whole file's spectra
@@ -250,6 +269,7 @@ pub fn decode_pipelined(bytes: &[u8]) -> Vec<DecodedAudio> {
         }
     });
     out
+    }
 }
 
 /// Configuration for [`Mp3Encoder`].
