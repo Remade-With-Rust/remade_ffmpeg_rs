@@ -128,10 +128,18 @@ unsafe fn imdct36_avx(lines: &[f32], out: &mut [f32; 24]) {
 /// The scalar twin — oracle and non-AVX fallback.
 #[inline]
 fn imdct36_scalar(lines: &[f32], out: &mut [f32; 24]) {
+    // Convert to a fixed-size reference ONCE. As a `&[f32]` the compiler cannot
+    // know the length, so each of the eighteen reads in the inner loop carried its
+    // own bounds check; every caller passes exactly eighteen lines.
+    let Some(lines) = lines.first_chunk::<18>() else {
+        return;
+    };
+    let cos36 = &kernels().cos36;
     for (j, &n) in IMDCT_N.iter().enumerate() {
+        let row = &cos36[n];
         let mut acc = 0f32;
         for k in 0..18 {
-            acc += lines[k] * kernels().cos36[n][k];
+            acc += lines[k] * row[k];
         }
         out[j] = acc;
     }

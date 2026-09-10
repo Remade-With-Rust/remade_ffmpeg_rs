@@ -189,8 +189,13 @@ fn best_pair_table(coeffs: &[i32; GRANULE_LINES], lo: usize, hi: usize) -> (u8, 
     // matching the reference: that element is uncoded, yet it still gates the
     // coverage prune — replicated here so the selection stays byte-identical.
     let peak = slice.iter().map(|c| c.unsigned_abs()).max().unwrap_or(0) as i32;
-    let mut hist = [[0u32; 16]; 16]; // counts of clamped (|x|,|y|) pairs
-    let mut cells: [(u8, u8); 256] = [(0, 0); 256]; // the populated pair cells
+    // FLAT histogram, indexed `ax * 16 + ay`, and cells holding that flat index.
+    // As a `[[u32; 16]; 16]` indexed by `a as usize` from a `u8`, the scoring loop
+    // below could not prove `a <= 15` -- the value is 0..=255 to the compiler -- so
+    // every cell it scored, for every candidate table, paid two bounds checks. A
+    // `u8` index into 256 entries is in range by construction.
+    let mut hist = [0u32; 256]; // counts of clamped (|x|,|y|) pairs
+    let mut cells: [u8; 256] = [0; 256]; // the populated pair cells, flat index
     let mut ncells = 0usize;
     let mut cmag = [0u32; 16]; // counts of clamped coordinate magnitudes
     let mut i = 0;
@@ -198,11 +203,12 @@ fn best_pair_table(coeffs: &[i32; GRANULE_LINES], lo: usize, hi: usize) -> (u8, 
         let (x, y) = (slice[i], slice[i + 1]);
         let ax = x.unsigned_abs().min(15) as usize;
         let ay = y.unsigned_abs().min(15) as usize;
-        if hist[ax][ay] == 0 {
-            cells[ncells] = (ax as u8, ay as u8);
+        let cell = ax * 16 + ay;
+        if hist[cell] == 0 {
+            cells[ncells & 255] = cell as u8;
             ncells += 1;
         }
-        hist[ax][ay] += 1;
+        hist[cell] += 1;
         cmag[ax] += 1;
         cmag[ay] += 1;
         i += 2;
@@ -231,13 +237,14 @@ fn best_pair_table(coeffs: &[i32; GRANULE_LINES], lo: usize, hi: usize) -> (u8, 
         let dim = t.dim as usize;
         let maxc = dim - 1;
         let mut codeword = 0usize;
-        for &(a, b) in &cells[..ncells] {
-            let (cx, cy) = ((a as usize).min(maxc), (b as usize).min(maxc));
+        for &cell in &cells[..ncells] {
+            let (a, b) = ((cell >> 4) as usize, (cell & 15) as usize);
+            let (cx, cy) = (a.min(maxc), b.min(maxc));
             let len = t
                 .book
                 .code_len(cx * dim + cy)
                 .map_or(usize::MAX / 4, |(_, l)| l as usize);
-            codeword += hist[a as usize][b as usize] as usize * len;
+            codeword += hist[cell as usize] as usize * len;
         }
         let escape = if t.linbits > 0 {
             t.linbits as usize * cum[maxc] as usize

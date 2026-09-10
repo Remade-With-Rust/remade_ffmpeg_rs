@@ -422,11 +422,15 @@ impl Mp3Encode {
             // (M,S)→(L,R) rotation, applied to the full granule spectrum.
             if use_ms && nch == 2 {
                 let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+                // Bind the two granules ONCE. Written as `l[0][i]`, each of the
+                // six accesses per line is two indexing operations -- a `Vec` index
+                // and a slice index -- neither of which the compiler can hoist out
+                // of the loop, for 576 lines.
                 let (l, r) = freqs.split_at_mut(1);
-                for i in 0..l[0].len() {
-                    let (lv, rv) = (l[0][i], r[0][i]);
-                    l[0][i] = (lv + rv) * inv_sqrt2;
-                    r[0][i] = (lv - rv) * inv_sqrt2;
+                for (lv, rv) in l[0].iter_mut().zip(r[0].iter_mut()) {
+                    let (a, b) = (*lv, *rv);
+                    *lv = (a + b) * inv_sqrt2;
+                    *rv = (a - b) * inv_sqrt2;
                 }
             }
             for ch in 0..nch {
