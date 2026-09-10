@@ -481,7 +481,9 @@ impl Mp3Encode {
         };
 
         let mut side = SideInfo::default();
-        let mut main = BitWriter::new();
+        // The main-data region is capacity-bounded by the header, so the writer
+        // never needs to grow.
+        let mut main = BitWriter::with_capacity(bitstream::region_capacity(&fheader));
         for (idx, (freq, psy, bt)) in fa.analyzed.iter().enumerate() {
             let (gr, ch) = (idx / nch, idx % nch);
             let bt = *bt;

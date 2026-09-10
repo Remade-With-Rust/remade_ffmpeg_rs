@@ -21,7 +21,8 @@ const SCFSI_GROUPS: [(usize, usize); 4] = [(0, 6), (6, 11), (11, 16), (16, 21)];
 /// `decode/sideinfo.rs`. Produces exactly `header.side_info_len()` bytes (every
 /// bit of the block is a defined field, so there is no padding). MPEG-1 only.
 pub fn serialize_side_info(header: &FrameHeader, si: &SideInfo) -> Vec<u8> {
-    let mut w = BitWriter::new();
+    // Exactly `side_info_len()` bytes, every time -- see the doc comment above.
+    let mut w = BitWriter::with_capacity(header.side_info_len());
     let nch = header.channel_mode.channels();
     let mpeg1 = matches!(header.version, MpegVersion::V1);
 
@@ -223,7 +224,10 @@ pub fn format(
 
     let hdr = header.to_bytes();
     let si_bytes = serialize_side_info(header, &si);
-    let mut out = hdr.to_vec();
+    // The frame's final size is fixed by the header; growing into it from four
+    // bytes costs several reallocs per frame for nothing.
+    let mut out = Vec::with_capacity(header.frame_size());
+    out.extend_from_slice(&hdr);
     if header.crc_protected {
         out.extend_from_slice(&crc16([hdr[2], hdr[3]], &si_bytes).to_be_bytes());
     }
@@ -262,7 +266,14 @@ pub fn assemble_stream(frames: &[(FrameHeader, SideInfo, Vec<u8>)]) -> Vec<u8> {
     // Build the continuous main-data stream, recording each frame's begin. When
     // banked slack would exceed 511, insert stuffing so the back-reference fits
     // (the standard reservoir cap — the wasted bytes are unreferenced ancillary).
-    let mut md = Vec::new();
+    // Reserve both whole-stream buffers up front. A `Vec` grown from empty by
+    // appending pays for its contents TWICE -- once for the append and again in
+    // realloc traffic, since doubling to N copies ~N bytes on the way -- and that
+    // second cost is invisible to a copy census because it happens inside `Vec`,
+    // in the allocator, not in this symbol. Both totals are known exactly here:
+    // the main-data stream is the sum of the region capacities already computed
+    // above, and the output is the sum of the frame sizes.
+    let mut md = Vec::with_capacity(caps.iter().sum::<usize>());
     let mut begins = Vec::with_capacity(frames.len());
     let mut p = 0usize; // P_n
     for (n, (_, _, data)) in frames.iter().enumerate() {
@@ -280,7 +291,7 @@ pub fn assemble_stream(frames: &[(FrameHeader, SideInfo, Vec<u8>)]) -> Vec<u8> {
         md.resize(p, 0); // pad the final region
     }
 
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(frames.iter().map(|(h, _, _)| h.frame_size()).sum());
     let mut p = 0usize;
     for (n, (header, side_info, _)) in frames.iter().enumerate() {
         let mut si = side_info.clone();
