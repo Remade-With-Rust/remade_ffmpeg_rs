@@ -128,6 +128,10 @@ impl HuffBook {
         let mut code = 0u32;
         for len in 1..=self.max_len {
             code = (code << 1) | r.read(1);
+            // NOT zipped, deliberately: zipping `lens` with `codes` here removes a
+            // bounds check in this COLD fallback and costs `decode_index` -- the hot
+            // caller it is inlined into -- six instructions. The cold path is not
+            // worth paying for in the stage that is ~42% of decode.
             for i in 0..self.codes.len() {
                 if self.lens[i] == len && self.codes[i] as u32 == code {
                     return Some(i);
@@ -144,9 +148,13 @@ impl HuffBook {
         if self.codes.is_empty() {
             return if idx == 0 { Some((0, 0)) } else { None };
         }
-        match self.codes.get(idx) {
-            Some(&c) => Some((c, self.lens[idx])),
-            None => None,
+        // Fetch BOTH through `get`. Indexing `lens[idx]` after a successful
+        // `codes.get(idx)` still carries its own bounds check -- the compiler
+        // cannot know the two vectors are the same length -- and this runs per
+        // cell per candidate table in the encoder's table search.
+        match (self.codes.get(idx), self.lens.get(idx)) {
+            (Some(&c), Some(&l)) => Some((c, l)),
+            _ => None,
         }
     }
 
