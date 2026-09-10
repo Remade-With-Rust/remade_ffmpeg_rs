@@ -113,7 +113,7 @@ rusty_vp9 = { path = "crates/rusty_vp9", version = "0.1.1" }
 rusty_h265 = { path = "crates/rusty_h265", version = "0.1.0" }
 rusty_h265-accel = { path = "crates/rusty_h265-accel", version = "0.1.0", default-features = false }
 rusty_flac = { path = "crates/rusty_flac", version = "0.1.0" }
-rusty_mp3 = { path = "crates/rusty_mp3", version = "0.7.0" }
+rusty_mp3 = { path = "crates/rusty_mp3", version = "0.8.0" }
 rusty_aac = { path = "crates/rusty_aac", version = "0.5.0" }
 rusty_vorbis = { path = "crates/rusty_vorbis", version = "0.1.1" }
 # jpeg: our own rusty_jpeg, from crates.io (the vendored copy is gone: one

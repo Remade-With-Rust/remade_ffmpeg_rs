@@ -5729,7 +5729,7 @@ checksum = "6c0867b42b4af7cfcce3466505720f64edfa6ef1782cdca2f712cf5ca711807d"
 
 [[package]]
 name = "rusty_mp3"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "rusty_alloc-api",
 ]
