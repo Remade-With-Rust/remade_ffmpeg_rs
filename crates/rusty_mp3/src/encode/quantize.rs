@@ -105,14 +105,26 @@ pub(crate) fn level_from(powered: f64) -> i32 {
 /// — two hardware `sqrt`s replace one libm `powf`, ~8× on this kernel at
 /// **byte-identical** quantizer output (1 ULP absorbed by integer rounding).
 ///
-/// **`perf003` (AVX2 xrpow) — PRUNED 2026-07-08.** An explicit AVX2 twin of this
-/// loop was *not* faster (kernel micro-bench 0.97×; encode-level within noise),
-/// so it was reverted. The deep reason is what makes perf001 so good: unlike
-/// `powf` (no SIMD), `sqrt` is SSE2-baseline, so this scalar loop **already
-/// auto-vectorizes** — perf001 captured the SIMD win *implicitly*. And `sqrt`
-/// throughput does not scale with vector width (256-bit `sqrtpd` ≈ two 128-bit),
-/// so hand-written AVX2 adds nothing. (The AAC "auto-vec can't reach AVX2"
-/// caveat applies to `powf`, not `sqrt`.) Recorded in the Prometheus ledger.
+/// **`perf003` (AVX2 xrpow) — PRUNED 2026-07-08, and its stated REASON was wrong
+/// (corrected 2026-09-10).** The prune stands; the explanation did not.
+///
+/// The old note claimed this loop "already auto-vectorizes" because `sqrt` is
+/// SSE2-baseline, so perf001 had captured the SIMD win implicitly. **It does not
+/// vectorize.** The emitted assembly contains `sqrtsd` here and **not one
+/// `sqrtpd` anywhere in the crate** — the loop is scalar, and a strength
+/// reduction to a baseline-SIMD op does not by itself make a loop wide.
+///
+/// The real reason not to vectorize it is SIZE, measured rather than argued. A
+/// doubling probe (compute `xrpow` twice, discard one — a stub probe is invalid
+/// because these values steer the gain search) puts its marginal cost at ~0.8%
+/// of encode on the min, against an arithmetic estimate of ~2.9%; the two
+/// dependent `sqrt`s per element make it latency-bound, and a doubling probe
+/// reads LOW on latency-bound code, so the truth is between. Halving that with
+/// 2-wide SSE2 buys ~1%, which is inside this box's noise floor — and that, not
+/// an imagined auto-vectorization, is why perf003 measured 0.97x.
+///
+/// Left as-is deliberately. Recorded so the next reader does not conclude from
+/// the old comment that `sqrt` loops in this crate are already wide.
 pub fn xrpow(freq: &[f32; GRANULE_LINES]) -> [f64; GRANULE_LINES] {
     let mut p = [0f64; GRANULE_LINES];
     if xrpow_use_powf() {

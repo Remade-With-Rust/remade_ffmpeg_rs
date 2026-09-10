@@ -41,6 +41,18 @@ fn thr_cap_scale() -> f32 {
     })
 }
 
+/// The signal-to-mask offset as a linear power ratio.
+///
+/// Both `10f32.powf` and [`smr_offset_db`] are constant for the whole encode, so
+/// computing this per granule was one `powf` per granule for a value that never
+/// changes (~1,790 of them on a 24 s clip). `powf` has no SIMD instruction and is
+/// among the most expensive scalar ops available; a constant deserves to be
+/// computed once.
+fn smr_linear() -> f32 {
+    static V: OnceLock<f32> = OnceLock::new();
+    *V.get_or_init(|| 10f32.powf(-smr_offset_db() / 10.0))
+}
+
 /// Calibration override for [`SMR_OFFSET_DB`], via `MP3_SMR_DB`.
 ///
 /// Read ONCE and cached: an env lookup inside the per-granule path would be
@@ -270,7 +282,7 @@ pub fn analyze(pcm: &[f32], sample_rate: u32) -> PsyResult {
 
     // Q3 — spread energy across Bark (cached matrix → a dot product, no powf),
     // lower by the SMR offset, floor at the ATH.
-    let smr = 10f32.powf(-smr_offset_db() / 10.0);
+    let smr = smr_linear();
     let total_energy: f32 = energy.iter().sum();
     let ath_scale = (total_energy / N_FFT as f32).max(1e-9) * 1e-3;
     let mut thresholds = [0f32; SFB_LONG];
