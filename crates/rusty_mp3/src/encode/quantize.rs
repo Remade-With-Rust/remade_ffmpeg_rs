@@ -150,6 +150,33 @@ const MAX_UNCLIPPED: i32 = 8191;
 const SF_MULT: f64 = 0.5;
 /// Largest scalefactor value (a 4-bit `slen` field caps it).
 const MAX_SF: u8 = 15;
+
+/// Largest scalefactor the bitstream can actually carry for band `b`.
+///
+/// `scalefac_compress` selects one `(slen1, slen2)` pair for the whole granule:
+/// `slen1` bits for bands 0..10, `slen2` for bands 11..20. The MPEG-1 table
+/// ([`crate::tables::SCALEFAC_COMPRESS_V1`]) tops out at `slen1 = 4` but only
+/// `slen2 = 3` — so the high group holds 0..7, not 0..15.
+///
+/// Amplifying past this does not fail loudly: `choose_compress` finds no
+/// covering entry, falls back to `(4, 3)`, and the serializer writes the value
+/// with 3 bits, silently truncating 8..15 down to 0..7. The decoder then
+/// requantizes that band with a scalefactor up to 16x too small and it comes
+/// back far too loud — one granule of near-full-scale garbage (measured: peak
+/// 1.92 against a source peaking at 1.30, max sample error 1.24).
+///
+/// It stayed dormant only because nothing shaped: the CBR loop was inert, and
+/// `loops_vbr` amplifies rarely enough that `prof::SF_OVERFLOW` counts 0 across
+/// the whole `-q:a` ladder on the music corpus. The moment the slack refinement
+/// started shaping, it corrupted a granule on the first clip.
+#[inline]
+fn max_sf(b: usize) -> u8 {
+    if b < 11 {
+        MAX_SF
+    } else {
+        7
+    }
+}
 /// Outer distortion-loop iteration cap.
 const MAX_OUTER: usize = 24;
 
@@ -189,6 +216,55 @@ fn quantize_with_sf(
         }
     }
     coeffs
+}
+
+/// Re-quantize ONE band in place, leaving every other line untouched.
+///
+/// Each band's levels depend only on `gain` and its own scalefactor, so when the
+/// refinement bumps band `b` the other twenty-one are already correct. Walking
+/// all 576 lines to recompute them is the "once per candidate" redundancy;
+/// byte-identical to a full [`quantize_with_sf`] because it runs the same
+/// arithmetic on the same inputs for the lines it does touch.
+fn quantize_band_in_place(
+    header: &FrameHeader,
+    freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
+    gain: i32,
+    sf_b: u8,
+    b: usize,
+    coeffs: &mut [i32; GRANULE_LINES],
+) {
+    let off = crate::tables::sfb_long_offsets(header.sample_rate);
+    let base = -0.25 * (gain - 210) as f64;
+    let s = if b < 21 { sf_b } else { 0 } as f64;
+    let step = 2f64.powf(0.75 * (base + SF_MULT * s));
+    let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
+    for i in lo..hi {
+        let mag = level_from(xrp[i] * step);
+        coeffs[i] = if freq[i] < 0.0 { -mag } else { mag };
+    }
+}
+
+/// Quantization-noise energy for ONE band -- the per-band half of [`band_noise`],
+/// so the refinement can update only the band it changed.
+fn band_noise_one(
+    header: &FrameHeader,
+    freq: &[f32; GRANULE_LINES],
+    coeffs: &[i32; GRANULE_LINES],
+    gain: i32,
+    sf_b: u8,
+    b: usize,
+) -> f32 {
+    let off = crate::tables::sfb_long_offsets(header.sample_rate);
+    let scale = 2f64.powf(0.25 * (gain - 210) as f64 - SF_MULT * sf_b as f64);
+    let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
+    let mut e = 0f64;
+    for i in lo..hi {
+        let xr = coeffs[i].signum() as f64 * requant_magnitude(coeffs[i]) * scale;
+        let d = freq[i] as f64 - xr;
+        e += d * d;
+    }
+    e as f32
 }
 
 /// Per-band quantization-noise energy: `Σ (freq − requantized)²` over each of the
@@ -238,6 +314,15 @@ fn choose_compress(sf: &[u8; 22]) -> (u16, usize) {
             return (idx as u16, 11 * slen1 as usize + 10 * slen2 as usize);
         }
     }
+    // No covering entry. The fallback below writes the high group with 3 bits,
+    // which TRUNCATES any value above 7 and hands the decoder a scalefactor up to
+    // 16x too small. Callers must clamp with `max_sf`, so reaching here is a bug
+    // in the caller, not a representable encoding choice.
+    debug_assert!(
+        false,
+        "scalefactors exceed the scalefac_compress table (need slen1>={need1}, slen2>={need2}); \
+         the caller must clamp each band with max_sf()"
+    );
     (15, 11 * 4 + 10 * 3)
 }
 
@@ -330,7 +415,37 @@ pub fn loops(
     let mut best_iter = 0usize;
     let xrp = xrpow(freq);
 
+    // Put the thresholds in the SAME domain as the noise before comparing them --
+    // the correction `loops_vbr` has carried since 0.6.0, which this path never
+    // got. `psy.thresholds` are unnormalized 1024-point FFT power; `band_noise`
+    // is squared error on MDCT coefficients. Measured on real music the two
+    // scales differ by 10^4.90 (~79,000x, 49 dB) and, being a units mismatch
+    // rather than a property of the signal, that ratio reads the same on every
+    // clip. Uncorrected, `n > psy.thresholds[b]` was false for EVERY band of
+    // EVERY granule: 98.7% of bands scored more than six decades under their
+    // mask, the outer loop broke on its first iteration in 100% of granules, and
+    // we shipped one global gain per granule where LAME shapes 71-77% of them.
+    let mdct_energy: f32 = freq.iter().map(|x| x * x).sum();
+    let domain_scale = if domain_correction() && psy.signal_energy > 1e-20 && mdct_energy > 1e-20 {
+        mdct_energy / psy.signal_energy
+    } else {
+        1.0
+    };
+
+    if shape_slack() {
+        return loops_slack(
+            header,
+            freq,
+            psy,
+            bit_budget,
+            block_type,
+            domain_scale,
+            &xrp,
+        );
+    }
+
     for outer in 0..MAX_OUTER {
+        super::prof::OUTER_ITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (compress, sf_bits) = choose_compress(&sf);
         let huff_budget = bit_budget.saturating_sub(sf_bits);
 
@@ -362,14 +477,21 @@ pub fn loops(
         // any band forces the rate loop to coarsen everything, so no shaping step ever
         // beats iter 0. Effective bit allocation needs a reservoir-aware RD redesign,
         // not a scoring tweak — see the OUTER_KEPT0 diagnostic.)
+        if outer == 0 {
+            super::prof::note_domain(psy.signal_energy, mdct_energy);
+        }
         let noise = band_noise(header, freq, &granule.coeffs, gain, &sf);
         let mut peak_nmr = f32::NEG_INFINITY;
         let mut worst: Option<usize> = None;
         let mut worst_nmr = f32::NEG_INFINITY;
         for (b, &n) in noise.iter().enumerate() {
-            let nmr = n / psy.thresholds[b].max(1e-20);
+            let thr = (psy.thresholds[b] * domain_scale).max(1e-20);
+            let nmr = n / thr;
+            if outer == 0 {
+                super::prof::note_nmr(nmr);
+            }
             peak_nmr = peak_nmr.max(nmr);
-            if n > psy.thresholds[b] && sf[b] < MAX_SF && nmr > worst_nmr {
+            if n > thr && sf[b] < max_sf(b) && nmr > worst_nmr && shaping_allowed(header) {
                 worst_nmr = nmr;
                 worst = Some(b);
             }
@@ -389,6 +511,216 @@ pub fn loops(
         super::prof::OUTER_KEPT0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     best.expect("at least one iteration runs").1
+}
+
+/// Whether this stream's scalefactors can carry per-band shaping at all.
+///
+/// `bitstream` serializes them with [`crate::tables::SCALEFAC_COMPRESS_V1`]
+/// unconditionally, but MPEG-2/2.5 (LSF) read `scalefac_compress` as a different,
+/// 9-bit four-group field — so a non-zero scalefactor written under the V1 layout
+/// is decoded as something else entirely. V2/V2.5 have always emitted flat
+/// scalefactors, which is why that never mattered; shaping only became reachable
+/// when the distortion loop started firing, and it took MPEG-2 round-trip SNR to
+/// 5.7 dB. Until the LSF scalefactor scheme is implemented, shape MPEG-1 only.
+#[inline]
+fn shaping_allowed(header: &FrameHeader) -> bool {
+    header.version == crate::header::MpegVersion::V1
+}
+
+/// Cap on refinement steps. Each one costs a quantize + Huffman table selection,
+/// and the budget test stops it long before this on real content (LAME's own
+/// streams shape 2.5-3.8 bands by ~2.5 scalefactor units).
+const MAX_REFINE: usize = 24;
+
+/// **Shape the granule by spending the bits the rate loop could not.**
+///
+/// The classic outer loop amplifies a band and then re-runs the rate loop, which
+/// raises `global_gain` — so one band gets 3 dB finer and the other twenty get
+/// 1.5 dB coarser. That is a minimax trade under a hard budget, it almost never
+/// improves the peak, and measured on the corpus it is worth about −0.01 ODG.
+///
+/// This does the opposite: it holds `global_gain` FIXED at what the rate loop
+/// chose and amplifies bands only while the result still fits the budget. No
+/// band ever gets coarser — each band's coefficients depend only on the gain and
+/// its own scalefactor — so every accepted step is a strict improvement rather
+/// than a trade, and it is paid for out of bits that were otherwise emitted as
+/// stuffing.
+///
+/// The slack is real and was measured from the bitstream: at 192 kbps we left
+/// **63-89 bits per granule** unspent where LAME left 5-7. A global gain is a
+/// 1.5 dB knob and cannot land on a bit budget exactly; per-band scalefactors are
+/// precisely the finer knob MPEG provides to spend the remainder, and we were
+/// using them in 0.0% of granules.
+#[allow(clippy::too_many_arguments)]
+fn loops_slack(
+    header: &FrameHeader,
+    freq: &[f32; GRANULE_LINES],
+    psy: &PsyResult,
+    bit_budget: usize,
+    block_type: BlockType,
+    domain_scale: f32,
+    xrp: &[f64; GRANULE_LINES],
+) -> QuantizedGranule {
+    let mut sf = [0u8; 22];
+
+    // Rate loop once, flat -- this is the gain every step below keeps.
+    let (mut compress, sf_bits) = choose_compress(&sf);
+    let (gain, inner) = inner_gain(
+        header,
+        freq,
+        xrp,
+        &sf,
+        bit_budget.saturating_sub(sf_bits),
+        block_type,
+    );
+    let (mut coeffs, mut side) = match inner {
+        Some(r) => (r.coeffs, r.side),
+        None => {
+            let c = quantize_with_sf(header, freq, xrp, gain, &sf);
+            let (s, _) = huff_cost(header, &c, block_type);
+            (c, s)
+        }
+    };
+
+    // Per-band noise, kept incrementally: a refinement step changes exactly one
+    // band, so recomputing all 21 every iteration is the classic once-per-candidate
+    // redundancy.
+    let mut noise = band_noise(header, freq, &coeffs, gain, &sf);
+    let off = crate::tables::sfb_long_offsets(header.sample_rate);
+
+    for _ in 0..MAX_REFINE {
+        if !shaping_allowed(header) {
+            break; // LSF: scalefactors must stay flat, see `shaping_allowed`
+        }
+        // Worst-masked band that can still be amplified.
+        //
+        // `audible_only` decides whether a band must actually be OVER its
+        // threshold to be worth refining. Spending the slack indiscriminately is
+        // free in bits -- they would be stuffing otherwise -- but it is not free
+        // perceptually: at 192 kbps this corpus is already transparent, so the
+        // refinement is then just moving noise between inaudible bands on the
+        // strength of a threshold ranking that has no headroom left to be right
+        // about.
+        let audible_only = shape_audible_only();
+        let pick = pick_rule();
+        let mut worst = None;
+        let mut worst_score = f32::NEG_INFINITY;
+        for (b, &n) in noise.iter().enumerate() {
+            let thr = (psy.thresholds[b] * domain_scale).max(1e-20);
+            // Candidate ranking signals for "which band gets the next bit". The
+            // psymodel-driven one is the default; the others exist to answer
+            // whether the model contributes anything to the decision at all -- if
+            // ranking by raw noise ties ranking by noise-to-mask, the masking
+            // curve is not informing the allocation.
+            let score = match pick {
+                Pick::Nmr => n / thr,
+                Pick::Noise => n,
+                Pick::Widest => n / (band_width(header, b) as f32),
+                Pick::LowFirst => -(b as f32),
+            };
+            if sf[b] < max_sf(b) && score > worst_score && (!audible_only || n > thr) {
+                worst_score = score;
+                worst = Some(b);
+            }
+        }
+        let Some(b) = worst else { break };
+
+        let mut trial = sf;
+        trial[b] += 1;
+        let (t_compress, t_sf_bits) = choose_compress(&trial);
+        // Only band `b` moves; `coeffs` holds the accepted state for the rest.
+        quantize_band_in_place(header, freq, xrp, gain, trial[b], b, &mut coeffs);
+        let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
+        let clipped = coeffs[lo..hi].iter().any(|&c| c.abs() > MAX_UNCLIPPED);
+        let (t_side, t_bits) = if clipped {
+            (side.clone(), usize::MAX)
+        } else {
+            huff_cost(header, &coeffs, block_type)
+        };
+        // A finer step means larger integers. Either saturation or running out of
+        // budget ends the refinement -- put band `b` back the way it was and stop.
+        if clipped || t_bits + t_sf_bits > bit_budget {
+            quantize_band_in_place(header, freq, xrp, gain, sf[b], b, &mut coeffs);
+            break;
+        }
+
+        noise[b] = band_noise_one(header, freq, &coeffs, gain, trial[b], b);
+        sf = trial;
+        side = t_side;
+        compress = t_compress;
+        super::prof::REFINE_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    side.global_gain = gain as u8;
+    side.scalefac_compress = compress;
+    let mut scalefactors = [0u8; 39];
+    scalefactors[..22].copy_from_slice(&sf);
+
+    use std::sync::atomic::Ordering::Relaxed;
+    super::prof::OUTER_TOTAL.fetch_add(1, Relaxed);
+    if sf.iter().all(|&v| v == 0) {
+        super::prof::OUTER_KEPT0.fetch_add(1, Relaxed);
+    }
+
+    QuantizedGranule {
+        coeffs,
+        side,
+        scalefactors,
+    }
+}
+
+/// Lines in long-block scalefactor band `b`.
+fn band_width(header: &FrameHeader, b: usize) -> usize {
+    let off = crate::tables::sfb_long_offsets(header.sample_rate);
+    (off[b + 1] as usize).min(GRANULE_LINES) - off[b] as usize
+}
+
+/// Candidate band-ranking signals for the refinement (great-gate P1 signal audit).
+#[derive(Clone, Copy, PartialEq)]
+enum Pick {
+    /// Noise-to-mask ratio -- the psychoacoustic ranking (default).
+    Nmr,
+    /// Raw quantization-noise energy; ignores the masking model entirely.
+    Noise,
+    /// Noise per line, so wide high bands do not win on width alone.
+    Widest,
+    /// Lowest frequency first -- a model-free ordering, the null hypothesis.
+    LowFirst,
+}
+
+fn pick_rule() -> Pick {
+    static V: std::sync::OnceLock<Pick> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("MP3_PICK").as_deref() {
+        Ok("noise") => Pick::Noise,
+        Ok("perline") => Pick::Widest,
+        Ok("lowfirst") => Pick::LowFirst,
+        _ => Pick::Nmr,
+    })
+}
+
+/// Whether refinement only targets bands whose noise is actually above the
+/// masking threshold (`MP3_SHAPE=audible`), rather than the worst-ranked band
+/// regardless. Read once.
+fn shape_audible_only() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MP3_SHAPE").as_deref() == Ok("audible"))
+}
+
+/// Which shaping strategy the CBR path uses. `slack` (the default) refines bands
+/// inside the rate loop's leftover bits at a fixed gain; `MP3_SHAPE=outer`
+/// restores the classic amplify-and-re-rate loop.
+fn shape_slack() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MP3_SHAPE").as_deref() != Ok("outer"))
+}
+
+/// Whether the CBR distortion loop rescales the psychoacoustic thresholds into
+/// the noise's domain before comparing. On (the default) is correct; `MP3_PSY_DOMAIN=0`
+/// restores the pre-fix behaviour, where the comparison was off by ~10^4.9 and the
+/// loop therefore never shaped a band. Kept as an A/B toggle, read once.
+fn domain_correction() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MP3_PSY_DOMAIN").as_deref() != Ok("0"))
 }
 
 /// Smallest gain whose flat-scalefactor quantization doesn't clip — the finest
@@ -513,7 +845,12 @@ pub fn loops_vbr(
             // "is this band over threshold?" test needs the scaled threshold.
             let thr = (psy.thresholds[b] * domain_scale).max(1e-20);
             let nmr = n / thr;
-            if n > thr && sf[b] < MAX_SF && nmr > worst_nmr {
+            if n > thr && nmr > worst_nmr && sf[b] >= max_sf(b) && sf[b] < MAX_SF {
+                // The pre-fix guard would have amplified here and the serializer
+                // would have truncated the value.
+                super::prof::SF_OVERFLOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if n > thr && sf[b] < max_sf(b) && nmr > worst_nmr {
                 worst_nmr = nmr;
                 worst = Some(b);
             }
@@ -799,5 +1136,51 @@ mod n4_tests {
         for &p in &[f64::from(0), 1e9, MAX_LEVEL as f64 + 5.0] {
             assert_eq!(level_from(p), guarded(p));
         }
+    }
+}
+
+#[cfg(test)]
+mod sf_range_tests {
+    use super::*;
+
+    /// Every scalefactor the loops can produce must be representable.
+    ///
+    /// `scalefac_compress` gives bands 11..20 only `slen2` bits, and the MPEG-1
+    /// table stops at `slen2 = 3` — so 7 is the ceiling there, not `MAX_SF`. The
+    /// old guard used `MAX_SF` for every band; `choose_compress` then found no
+    /// covering entry and the serializer truncated the value, which the decoder
+    /// read as a scalefactor up to 16x too small (one granule of near-full-scale
+    /// garbage). This pins the ceiling per band group.
+    #[test]
+    fn max_sf_is_representable_for_every_band() {
+        for b in 0..21 {
+            let mut sf = [0u8; 22];
+            sf[b] = max_sf(b);
+            let (idx, _bits) = choose_compress(&sf);
+            let (slen1, slen2) = crate::tables::SCALEFAC_COMPRESS_V1[idx as usize];
+            let slen = if b < 11 { slen1 } else { slen2 };
+            let representable = if slen == 0 { 0 } else { (1u16 << slen) - 1 };
+            assert!(
+                u16::from(sf[b]) <= representable,
+                "band {b}: sf {} needs more than slen {slen} ({representable} max)",
+                sf[b]
+            );
+        }
+    }
+
+    /// The high group really is the tighter one — a regression guard on the table
+    /// itself, so a future table edit cannot quietly widen the ceiling.
+    #[test]
+    fn high_band_ceiling_is_seven() {
+        assert_eq!(max_sf(0), 15);
+        assert_eq!(max_sf(10), 15);
+        assert_eq!(max_sf(11), 7);
+        assert_eq!(max_sf(20), 7);
+        let max_slen2 = crate::tables::SCALEFAC_COMPRESS_V1
+            .iter()
+            .map(|&(_, s2)| s2)
+            .max()
+            .unwrap();
+        assert_eq!(max_slen2, 3, "slen2 ceiling moved; revisit max_sf()");
     }
 }
