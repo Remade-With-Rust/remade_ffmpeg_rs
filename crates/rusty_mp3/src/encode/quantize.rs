@@ -260,12 +260,30 @@ fn quantize_with_sf(
     gain: i32,
     sf: &[u8; 22],
 ) -> [i32; GRANULE_LINES] {
+    let mut out = [0i32; GRANULE_LINES];
+    quantize_into(header, freq, xrp, gain, sf, &mut out);
+    out
+}
+
+/// [`quantize_with_sf`] writing through a caller-owned buffer.
+///
+/// The by-value form returns `[i32; 576]` — 2,304 bytes — and the rate loop calls
+/// it once per gain probe, so the return alone moved tens of megabytes per clip.
+/// Every line of `out` is written here (the band loop spans all 576), so the
+/// caller's buffer needs no pre-clear.
+fn quantize_into(
+    header: &FrameHeader,
+    freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
+    gain: i32,
+    sf: &[u8; 22],
+    out: &mut [i32; GRANULE_LINES],
+) {
     let off = crate::tables::sfb_long_offsets(header.sample_rate);
     let base = -0.25 * (gain - 210) as f64;
     // One `exp2` for the granule; the per-band factor is a table lookup.
     let step_base = 2f64.powf(0.75 * base);
     let sf_step = sf_step_lut();
-    let mut coeffs = [0i32; GRANULE_LINES];
     for b in 0..22 {
         let s = if b < 21 { sf[b] } else { 0 }; // band 21 is uncoded
                                                        // step = scale_inv^(3/4): the per-band factor applied to the precomputed
@@ -285,10 +303,9 @@ fn quantize_with_sf(
         let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
         for i in lo..hi {
             let mag = level_from(xrp[i] * step);
-            coeffs[i] = if freq[i] < 0.0 { -mag } else { mag };
+            out[i] = if freq[i] < 0.0 { -mag } else { mag };
         }
     }
-    coeffs
 }
 
 /// Re-quantize ONE band in place, leaving every other line untouched.
@@ -413,26 +430,6 @@ fn huff_cost(
     super::huffman::select(header, coeffs, block_type)
 }
 
-/// The winning gain's quantization + Huffman selection, captured *during* the
-/// rate-loop search so [`loops`] need not recompute it (Prometheus `perf004`,
-/// redundancy move #3 — "stop recomputing what you already computed").
-struct InnerResult {
-    gain: i32,
-    coeffs: [i32; GRANULE_LINES],
-    side: GranuleSideInfo,
-}
-
-/// Inner rate loop: smallest `global_gain` (finest, best quality) that neither
-/// clips nor exceeds `huff_budget`, for the given scalefactors.
-///
-/// Also returns the quantization + Huffman side-info at the winning gain when it
-/// was produced by the search (the common case): the binary search evaluates the
-/// leftmost gain that fits, and that gain's `quantize_with_sf` + `huff_cost`
-/// (table selection, the expensive part) are exactly what `loops` would redo.
-/// The leftmost-fits gain is the *last* fits-true evaluation, so caching the
-/// last one captures the winner. `None` only in the rare cases where the winner
-/// was never evaluated as fitting (e.g. nothing fit, so `gain` saturates to 255
-/// unchecked) — then `loops` quantizes fresh, byte-identically.
 fn inner_gain(
     header: &FrameHeader,
     freq: &[f32; GRANULE_LINES],
@@ -440,24 +437,37 @@ fn inner_gain(
     sf: &[u8; 22],
     huff_budget: usize,
     block_type: BlockType,
-) -> (i32, Option<InnerResult>) {
-    let mut cached: Option<InnerResult> = None;
+    out: &mut [i32; GRANULE_LINES],
+) -> (i32, Option<GranuleSideInfo>) {
+    // Two buffers, and the SWAP IS ON THE REFERENCES. `mem::swap` on the arrays
+    // themselves would move 2 x 2,304 bytes and make this worse than the copy it
+    // replaces; swapping `&mut` bindings exchanges two pointers.
+    //
+    // The search previously cloned the whole coefficient array into an
+    // `InnerResult` on every FITTING probe -- about half of the eight probes --
+    // and the by-value return moved it again. Now the winner is simply whichever
+    // buffer `best` points at, and exactly one copy happens, at the end.
+    let mut buf_a = [0i32; GRANULE_LINES];
+    let mut buf_b = [0i32; GRANULE_LINES];
+    let mut probe: &mut [i32; GRANULE_LINES] = &mut buf_a;
+    let mut best: &mut [i32; GRANULE_LINES] = &mut buf_b;
+
+    let mut best_side: Option<GranuleSideInfo> = None;
+    let mut best_gain = i32::MIN;
     let (mut lo, mut hi) = (0i32, 255i32);
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let coeffs = quantize_with_sf(header, freq, xrp, mid, sf);
+        quantize_into(header, freq, xrp, mid, sf, probe);
         // Short-circuit: the cheap no-clip scan first; only then the costly
-        // `huff_cost` (table selection). Cache the fitting result (the last such
-        // is the leftmost-fits winner).
-        let fits = coeffs.iter().all(|&c| c.abs() <= MAX_UNCLIPPED) && {
-            let (side, bits) = huff_cost(header, &coeffs, block_type);
+        // `huff_cost` (table selection). The last fitting probe is the
+        // leftmost-fits winner.
+        let fits = probe.iter().all(|&c| c.abs() <= MAX_UNCLIPPED) && {
+            let (side, bits) = huff_cost(header, probe, block_type);
             let fits = bits <= huff_budget;
             if fits {
-                cached = Some(InnerResult {
-                    gain: mid,
-                    coeffs,
-                    side,
-                });
+                std::mem::swap(&mut probe, &mut best);
+                best_side = Some(side);
+                best_gain = mid;
             }
             fits
         };
@@ -467,10 +477,15 @@ fn inner_gain(
             lo = mid + 1;
         }
     }
-    // Keep the cache only if it is the winning gain (the invariant above); a
-    // mismatch (winner never evaluated as fitting) falls back to a fresh quantize.
-    let cached = cached.filter(|c| c.gain == lo);
-    (lo, cached)
+    // Keep the result only if it is the winning gain (the invariant above); a
+    // mismatch (winner never evaluated as fitting) makes the caller quantize
+    // fresh, byte-identically.
+    if best_gain == lo {
+        out.copy_from_slice(best);
+        (lo, best_side)
+    } else {
+        (lo, None)
+    }
 }
 
 /// **C2 + Q6 — the two-loop quantizer.** The inner loop (`inner_gain`) hits the
@@ -524,15 +539,16 @@ pub fn loops(
         let (compress, sf_bits) = choose_compress(&sf);
         let huff_budget = bit_budget.saturating_sub(sf_bits);
 
-        let (gain, inner) = inner_gain(header, freq, &xrp, &sf, huff_budget, block_type);
+        let mut coeffs = [0i32; GRANULE_LINES];
+        let (gain, inner) =
+            inner_gain(header, freq, &xrp, &sf, huff_budget, block_type, &mut coeffs);
         // Reuse the quantization + Huffman selection the rate loop already did at
         // the winning gain (perf004); recompute only in the rare uncached case.
-        let (coeffs, mut side) = match inner {
-            Some(r) => (r.coeffs, r.side),
+        let mut side = match inner {
+            Some(side) => side,
             None => {
-                let coeffs = quantize_with_sf(header, freq, &xrp, gain, &sf);
-                let (side, _) = huff_cost(header, &coeffs, block_type);
-                (coeffs, side)
+                quantize_into(header, freq, &xrp, gain, &sf, &mut coeffs);
+                huff_cost(header, &coeffs, block_type).0
             }
         };
         side.global_gain = gain as u8;
@@ -640,6 +656,7 @@ fn loops_slack(
 
     // Rate loop once, flat -- this is the gain every step below keeps.
     let (mut compress, sf_bits) = choose_compress(&sf);
+    let mut coeffs = [0i32; GRANULE_LINES];
     let (gain, inner) = inner_gain(
         header,
         freq,
@@ -647,13 +664,13 @@ fn loops_slack(
         &sf,
         bit_budget.saturating_sub(sf_bits),
         block_type,
+        &mut coeffs,
     );
-    let (mut coeffs, mut side) = match inner {
-        Some(r) => (r.coeffs, r.side),
+    let mut side = match inner {
+        Some(side) => side,
         None => {
-            let c = quantize_with_sf(header, freq, xrp, gain, &sf);
-            let (s, _) = huff_cost(header, &c, block_type);
-            (c, s)
+            quantize_into(header, freq, xrp, gain, &sf, &mut coeffs);
+            huff_cost(header, &coeffs, block_type).0
         }
     };
 
