@@ -21,6 +21,14 @@
 
 use rusty_mp3::{Mp3Decoder, Mp3Encoder, Mp3EncoderConfig};
 
+// PROJECT CONVENTION: every example root that runs an encoder runs it under the
+// allocator we ship. This one was the exception, which also made it the only
+// wasm measurement not taken under `rusty_alloc` -- and `rusty_alloc` does work
+// on both wasm targets, verified by allocating through it under node on
+// `wasm32-unknown-unknown`, so there was never a reason to omit it.
+#[global_allocator]
+static GLOBAL_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
+
 /// FNV-1a over the raw sample bits — the same gate `decprof` prints, so the two
 /// numbers are directly comparable.
 fn fnv1a_f32(h: &mut u64, samples: &[f32]) {
