@@ -1,4 +1,4 @@
-### In The Wild with 112,095 Active Installs
+### In The Wild with 175,700 Active Installs
 
 <a href="https://mata.network">MATA Disco</a> is a sovereign distributed cloud and digital freedom toolkit enabling ownership and accessibility of data. remade_ffmpeg_rs powers all media across the Disco Party.
 
