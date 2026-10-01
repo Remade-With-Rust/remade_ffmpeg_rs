@@ -96,6 +96,7 @@ const ID_SAMPLING_FREQUENCY: u32 = 0xB5;
 const ID_CHANNELS: u32 = 0x9F;
 const ID_BIT_DEPTH: u32 = 0x6264;
 const ID_DEFAULT_DURATION: u32 = 0x23_E383;
+const ID_CODEC_DELAY: u32 = 0x56AA;
 const ID_CLUSTER: u32 = 0x1F43_B675;
 const ID_TIMESTAMP: u32 = 0xE7;
 const ID_SIMPLE_BLOCK: u32 = 0xA3;
@@ -342,6 +343,9 @@ struct MkvDemuxer {
     /// Indexed by stream index: the track's DefaultDuration in nanoseconds (0: none),
     /// which times the frames of a laced block.
     default_duration: Vec<u64>,
+    /// Indexed by stream index: the track's CodecDelay in nanoseconds (0: none), the
+    /// encoder's priming, which block timestamps include and packet timestamps don't.
+    codec_delay: Vec<u64>,
     /// The rest of a laced block's frames, returned before the walk goes on.
     laced: VecDeque<Packet>,
     timestamp_scale: u64,
@@ -371,6 +375,7 @@ impl MkvDemuxer {
             avc: Vec::new(),
             ass: Vec::new(),
             default_duration: Vec::new(),
+            codec_delay: Vec::new(),
             laced: VecDeque::new(),
             timestamp_scale: 1_000_000, // default: 1 ms
             duration_ticks: None,
@@ -619,6 +624,7 @@ impl MkvDemuxer {
         let (mut rate, mut channels) = (0u32, 0u16);
         let mut bit_depth = 0u64;
         let mut default_duration = 0u64;
+        let mut codec_delay = 0u64;
 
         let mut e = Ebml::new(data);
         while e.pos < data.len() {
@@ -633,6 +639,7 @@ impl MkvDemuxer {
                 ID_CODEC_ID => codec = String::from_utf8_lossy(e.read_bytes(len)).into_owned(),
                 ID_CODEC_PRIVATE => codec_private = e.read_bytes(len).to_vec(),
                 ID_DEFAULT_DURATION => default_duration = e.read_uint(len),
+                ID_CODEC_DELAY => codec_delay = e.read_uint(len),
                 ID_VIDEO => {
                     let mut v = Ebml::at(data, e.pos);
                     let ve = e.pos.saturating_add(len);
@@ -670,6 +677,7 @@ impl MkvDemuxer {
         let is_ass = matches!(codec.as_str(), "S_TEXT/ASS" | "S_TEXT/SSA");
         self.ass.push(is_ass);
         self.default_duration.push(default_duration);
+        self.codec_delay.push(codec_delay);
         let index = self.streams.len();
         let mut s = Stream::new(index, codec_id);
         s.media_type = match track_type {
@@ -772,7 +780,12 @@ impl MkvDemuxer {
             (u128::from(default) * count as u128 / u128::from(self.timestamp_scale.max(1)))
                 .min(i64::MAX as u128) as i64
         };
-        let mut pts = Some(cluster_ts.wrapping_add(rel));
+        // As matroskadec, the CodecDelay comes off every timestamp (ffmpeg's muxer adds it
+        // on), rounded to the nearest tick: an AAC or Opus stream's first packet is negative.
+        let delay = self.codec_delay.get(index).copied().unwrap_or(0);
+        let scale = u128::from(self.timestamp_scale.max(1));
+        let delay = ((2 * u128::from(delay) + scale) / (2 * scale)).min(i64::MAX as u128) as i64;
+        let mut pts = Some(cluster_ts.wrapping_add(rel).saturating_sub(delay));
         let mut packets = Vec::with_capacity(laces.len());
         for (n, raw) in laces.into_iter().enumerate() {
             let n = n as i64;
@@ -1264,6 +1277,35 @@ mod tests {
                 (3, 20, Some(1133), 17),
             ]
         );
+    }
+
+    #[test]
+    fn codec_delay_comes_off_every_timestamp() {
+        // Opus pre-skip: 312 samples at 48 kHz, 6.5 ms, which rounds to 7.
+        let file = audio_file(
+            "A_OPUS",
+            &el(ID_CODEC_DELAY, &6_500_000u32.to_be_bytes()),
+            &[
+                el(ID_SIMPLE_BLOCK, &track1_block(0, 0x80, &frame(1, 3))),
+                el(ID_SIMPLE_BLOCK, &track1_block(20, 0x80, &frame(2, 3))),
+            ],
+        );
+        let pts: Vec<_> = demux_all(file).iter().map(|p| p.pts).collect();
+        assert_eq!(pts, [Some(993), Some(1013)]);
+
+        // AAC priming, 1024 samples at 48 kHz (21.33 ms): laced frames follow the first.
+        let entry = [
+            el(ID_DEFAULT_DURATION, &21_333_333u32.to_be_bytes()),
+            el(ID_CODEC_DELAY, &21_333_333u32.to_be_bytes()),
+        ]
+        .concat();
+        let file = audio_file(
+            "A_AAC",
+            &entry,
+            &[el(ID_SIMPLE_BLOCK, &track1_block(0, 0x82, &xiph_laced()))],
+        );
+        let pts: Vec<_> = demux_all(file).iter().map(|p| p.pts).collect();
+        assert_eq!(pts, [Some(979), Some(1000), Some(1021)]);
     }
 
     #[test]
