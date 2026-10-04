@@ -9,32 +9,18 @@
 //! This is what broadcast and low-bitrate streaming actually use, so a decoder
 //! that mishandles it mishandles the majority of real AAC in the wild.
 //!
-//! # What is implemented here, and what is not
+//! # What is implemented
 //!
-//! **Implemented, exactly:** the signalling. Both forms — *explicit hierarchical*
-//! (`audioObjectType` 5 or 29) and *explicit backward-compatible* (the `0x2B7`
-//! sync extension after the `GASpecificConfig`) — plus detection of SBR payload
-//! in the `fill_element`, and the **output sample rate**, which for HE-AAC is
-//! twice the core rate.
+//! The full reconstruction: signalling in
+//! both explicit forms (hierarchical `audioObjectType` 5/29 and the `0x2B7`
+//! backward-compatible sync extension) and implicitly (SBR found in the fill
+//! elements); dual-rate and downsampled SBR; and HE-AAC v2 Parametric Stereo
+//! with 10/20/34 bands and IPD/OPD. Verified sample-exact (≤1 LSB) against
+//! FFmpeg and the ISO/IEC 14496-26 reference outputs.
 //!
-//! **NOT implemented:** the SBR reconstruction itself. See [`SbrSupport`]. The
-//! blocker is not design effort — it is that the tool is defined by large
-//! normative tables (the 640-tap QMF prototype filter, ISO/IEC 14496-3
-//! Table 4.A.87, and the SBR envelope/noise Huffman codebooks). Those must be
-//! transcribed from the specification or a reference implementation. Writing
-//! *approximations* of them would produce a decoder that is subtly wrong
-//! everywhere while appearing to work, which is strictly worse than not having
-//! it — the same reason `decode` refuses `gain_control_data` rather than
-//! guessing at it.
-//!
-//! # Why the signalling alone is worth having
-//!
-//! Without it an HE-AAC stream is not merely "missing its high band" — it is
-//! **silently played at the wrong speed**. The config announces a 24 kHz core for
-//! 48 kHz output; a decoder that reports 24 kHz hands the player half-rate audio.
-//! With this module the core decodes correctly, the caller learns the true output
-//! rate, and [`SbrSupport`] says plainly that the high band is absent instead of
-//! pretending otherwise.
+//! **Not reconstructed:** the *low-delay* SBR of ER AAC-ELD, which runs on a
+//! different (complex low-delay) filterbank — the ELD core is decoded and
+//! output at the core rate, and [`SbrSupport::CoreOnly`] says so.
 
 pub(crate) mod dec;
 pub(crate) mod ps;
@@ -61,20 +47,20 @@ const SYNC_EXT_PS: u32 = 0x548;
 const EXT_SBR_DATA: u32 = 13;
 const EXT_SBR_DATA_CRC: u32 = 14;
 
-/// How much of an SBR stream this build can actually reconstruct.
+/// How much of an SBR stream this build reconstructs.
 ///
-/// Returned rather than inferred so callers never have to guess, and so the
+/// Returned rather than inferred so callers never have to guess, and so any
 /// limitation is visible at the API surface instead of buried in a doc comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SbrSupport {
-    /// No SBR in this stream; plain AAC-LC decoding is complete and exact.
+    /// No SBR signalled in the configuration (implicit SBR found in the
+    /// stream is still decoded in full).
     NotPresent,
-    /// SBR is present. The **core is decoded correctly** and the output sample
-    /// rate is reported correctly, but the replicated high band is not
-    /// reconstructed — the result is band-limited to the core's Nyquist.
-    ///
-    /// This is the standard "core-only" fallback, and it is audio rather than
-    /// silence or an error. It is not conformant HE-AAC decoding.
+    /// SBR (and PS, when signalled) is fully reconstructed.
+    Full,
+    /// Low-delay SBR (ER AAC-ELD): the core is decoded and output at the core
+    /// rate; the replicated high band is not reconstructed.
     CoreOnly,
 }
 
@@ -96,10 +82,10 @@ pub struct SbrConfig {
 impl SbrConfig {
     /// What this build can do with the stream.
     pub fn support(&self) -> SbrSupport {
-        if self.sbr_present {
-            SbrSupport::CoreOnly
-        } else {
-            SbrSupport::NotPresent
+        match (self.sbr_present, self.core_object_type) {
+            (false, _) => SbrSupport::NotPresent,
+            (true, crate::config::aot::ER_AAC_ELD) => SbrSupport::CoreOnly,
+            (true, _) => SbrSupport::Full,
         }
     }
 }
@@ -116,7 +102,11 @@ pub fn parse_sbr_config(data: &[u8]) -> Result<SbrConfig> {
         sbr_present: c.sbr,
         ps_present: c.ps,
         core_sample_rate: c.sample_rate,
-        output_sample_rate: if c.sbr { c.ext_sample_rate } else { c.sample_rate },
+        output_sample_rate: if c.sbr && c.object_type != crate::config::aot::ER_AAC_ELD {
+            c.ext_sample_rate
+        } else {
+            c.sample_rate
+        },
         core_object_type: c.object_type,
     })
 }
@@ -173,7 +163,7 @@ mod tests {
         assert_eq!(s.output_sample_rate, 44100, "extension rate is the OUTPUT rate");
         assert_eq!(s.core_sample_rate, 22050, "core runs at half");
         assert_eq!(s.core_object_type, AOT_AAC_LC);
-        assert_eq!(s.support(), SbrSupport::CoreOnly);
+        assert_eq!(s.support(), SbrSupport::Full);
     }
 
     /// **Explicit hierarchical HE-AAC v2** — AOT 29 also implies PS.
@@ -280,7 +270,7 @@ mod tests {
             Some(44100),
             "HE-AAC must report the DOUBLED output rate"
         );
-        assert_eq!(dec.sbr_support(), SbrSupport::CoreOnly);
+        assert_eq!(dec.sbr_support(), SbrSupport::Full);
         let s = dec.sbr_config().expect("sbr config");
         assert_eq!(s.core_sample_rate, 22050, "core decodes at half rate");
 

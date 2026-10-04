@@ -514,9 +514,9 @@ impl Decoder {
                 }
             }
         }
-        if sx.eld() && self.sbr_state == Some(true) {
-            self.decode_eld_sbr(r)?;
-        }
+        // An ELD frame with low-delay SBR carries the LD-SBR payload after the
+        // channel elements. It is not reconstructed (it needs the complex
+        // low-delay filterbank); the core is output at the core rate.
         self.spectral_to_sample();
         self.locked = true;
         Ok(())
@@ -744,10 +744,6 @@ impl Decoder {
         }
     }
 
-    fn decode_eld_sbr(&mut self, _r: &mut BitReader) -> Result<()> {
-        crate::sbr::dec::decode_eld_sbr(self, _r)
-    }
-
     fn frame_samples(&self) -> usize {
         self.syntax.frame_len
     }
@@ -757,7 +753,7 @@ impl Decoder {
     fn spectral_to_sample(&mut self) {
         let sx = self.syntax;
         let n = self.frame_samples();
-        let sbr_on = self.sbr_state == Some(true);
+        let sbr_on = self.sbr_active();
         for ty in (0..4usize).rev() {
             for id in 0..16usize {
                 let Some(el) = self.elements[ty][id].as_ref() else { continue };
@@ -925,10 +921,15 @@ impl Decoder {
         }
     }
 
+    /// SBR is reconstructed for this stream (ELD's low-delay SBR is not).
+    pub(crate) fn sbr_active(&self) -> bool {
+        self.sbr_state == Some(true) && !self.syntax.eld()
+    }
+
     /// Output samples per channel for this frame (doubled by dual-rate SBR).
     pub(crate) fn output_len(&self) -> usize {
         let n = self.frame_samples();
-        if self.sbr_state == Some(true) && self.sbr_ext_rate() > self.cfg.sample_rate {
+        if self.sbr_active() && self.sbr_ext_rate() > self.cfg.sample_rate {
             2 * n
         } else {
             n

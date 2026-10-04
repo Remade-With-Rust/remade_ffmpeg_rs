@@ -4750,7 +4750,7 @@ mod multichannel {
 mod rung_a6 {
     use super::*;
 
-    fn noise_signal(sr: u32, frames: usize) -> Vec<f32> {
+    fn noise_signal(_sr: u32, frames: usize) -> Vec<f32> {
         let mut seed = 0xA6A6_1234u32;
         (0..frames * FRAME_LEN)
             .map(|_| {

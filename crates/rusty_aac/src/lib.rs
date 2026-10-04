@@ -252,7 +252,8 @@ impl AacDecoder {
             sbr_present: stream.sbr,
             ps_present: stream.ps,
             core_sample_rate: stream.sample_rate,
-            output_sample_rate: if stream.sbr {
+            // ELD's low-delay SBR is not reconstructed: output stays at the core rate.
+            output_sample_rate: if stream.sbr && stream.object_type != config::aot::ER_AAC_ELD {
                 stream.ext_sample_rate
             } else {
                 stream.sample_rate

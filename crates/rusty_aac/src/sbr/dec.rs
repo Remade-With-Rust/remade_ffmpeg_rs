@@ -1574,10 +1574,6 @@ pub(crate) fn apply(dec: &mut Decoder, el: &mut Element, ty: u8, n: usize) {
     }
 }
 
-/// ELD low-delay SBR payload.
-pub(crate) fn decode_eld_sbr(_dec: &mut Decoder, _r: &mut BitReader) -> Result<()> {
-    Err(crate::Error::unsupported("aac: ELD low-delay SBR not yet supported"))
-}
 
 #[cfg(test)]
 mod tests {
