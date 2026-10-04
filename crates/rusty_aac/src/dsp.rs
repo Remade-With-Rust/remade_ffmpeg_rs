@@ -674,17 +674,77 @@ impl Pow2Dct4 {
         Pow2Dct4 { l, pre, post, fft: Radix2Fft::new(m, -1.0) }
     }
 
+    /// Pre-rotation: `v[p] = (x[2p] + i·x[L-1-2p])·e^{-iθ_p}`. Written over
+    /// `chunks_exact` / `rchunks_exact` views (the even entries from the front,
+    /// the odd ones mirrored from the back) so there is no index arithmetic or
+    /// bounds check per element and LLVM vectorises the stride-2 and reversed
+    /// accesses.
+    #[inline(always)]
+    fn rotate_in(&self, x: &[f32], v: &mut [[f32; 2]]) {
+        let x = &x[..self.l];
+        for (((vp, a), b), &[c, s]) in v.iter_mut().zip(x.chunks_exact(2)).zip(x.rchunks_exact(2)).zip(&self.pre) {
+            let (yr, yi) = (a[0], b[1]);
+            *vp = [yr * c + yi * s, yi * c - yr * s];
+        }
+    }
+
     /// The unscaled DCT-IV: `out[m] = Σ x[k]·cos(π/L·(m+½)(k+½))`, using
     /// `scratch` (at least L/2 entries) for the FFT.
     pub(crate) fn dct4(&self, x: &[f32], out: &mut [f32], scratch: &mut [[f32; 2]]) {
-        let (l, m) = (self.l, self.l / 2);
+        let m = self.l / 2;
         let v = &mut scratch[..m];
+        self.rotate_in(x, v);
+        self.fft.run(v);
+        // out[2q] comes from v[q]; out[2q+1] = out[L-1-2p] from v[p], p = m-1-q.
+        let post = v.iter().zip(&self.post);
+        for ((o, (&[vr, vi], &[c, s])), (&[ur, ui], &[uc, us])) in
+            out[..self.l].chunks_exact_mut(2).zip(post.clone()).zip(post.rev())
+        {
+            o[0] = vr * c + vi * s;
+            o[1] = ur * us - ui * uc;
+        }
+    }
+
+    /// As [`imdct_half`]: `out[k] = -(D·X)[L-1-k]·gain/L`.
+    fn imdct_half(&self, spec: &[f32], out: &mut [f32], gain: f32) {
+        let m = self.l / 2;
+        // A stack scratch sized to the call: zero-filling a worst-case 1024-entry
+        // array cost 8 KB of memset per short window, whose need is 512 bytes.
+        match m {
+            0..=64 => self.imdct_half_in(spec, out, gain, &mut [[0f32; 2]; 64]),
+            65..=512 => self.imdct_half_in(spec, out, gain, &mut [[0f32; 2]; 512]),
+            _ => self.imdct_half_in(spec, out, gain, &mut [[0f32; 2]; 1024]),
+        }
+    }
+
+    #[inline(always)]
+    fn imdct_half_in(&self, spec: &[f32], out: &mut [f32], gain: f32, buf: &mut [[f32; 2]]) {
+        let m = self.l / 2;
+        let v = &mut buf[..m];
+        self.rotate_in(spec, v);
+        self.fft.run(v);
+        let scale = gain / self.l as f32;
+        // out[2q] = -(D·X)[L-1-2q]·s from v[q]; out[2q+1] = -(D·X)[2p]·s, p = m-1-q.
+        let post = v.iter().zip(&self.post);
+        for ((o, (&[vr, vi], &[c, s])), (&[ur, ui], &[uc, us])) in
+            out[..self.l].chunks_exact_mut(2).zip(post.clone()).zip(post.rev())
+        {
+            o[0] = -(vr * s - vi * c) * scale;
+            o[1] = -(ur * uc + ui * us) * scale;
+        }
+    }
+
+    /// The pre-restructure indexed forms, kept as the bit-exact oracle.
+    #[cfg(test)]
+    fn dct4_reference(&self, x: &[f32], out: &mut [f32]) {
+        let (l, m) = (self.l, self.l / 2);
+        let mut v = vec![[0f32; 2]; m];
         for (p, vp) in v.iter_mut().enumerate() {
             let (yr, yi) = (x[2 * p], x[l - 1 - 2 * p]);
             let [c, s] = self.pre[p];
             *vp = [yr * c + yi * s, yi * c - yr * s];
         }
-        self.fft.run(v);
+        self.fft.run_scalar(&mut v);
         for (p, &[vr, vi]) in v.iter().enumerate() {
             let [c, s] = self.post[p];
             out[2 * p] = vr * c + vi * s;
@@ -692,18 +752,16 @@ impl Pow2Dct4 {
         }
     }
 
-    /// As [`imdct_half`]: `out[k] = -(D·X)[L-1-k]·gain/L`.
-    fn imdct_half(&self, spec: &[f32], out: &mut [f32], gain: f32) {
+    #[cfg(test)]
+    fn imdct_half_reference(&self, spec: &[f32], out: &mut [f32], gain: f32) {
         let (l, m) = (self.l, self.l / 2);
-        let mut buf = [[0f32; 2]; 1024];
-        debug_assert!(m <= buf.len());
-        let v = &mut buf[..m];
+        let mut v = vec![[0f32; 2]; m];
         for (p, vp) in v.iter_mut().enumerate() {
             let (yr, yi) = (spec[2 * p], spec[l - 1 - 2 * p]);
             let [c, s] = self.pre[p];
             *vp = [yr * c + yi * s, yi * c - yr * s];
         }
-        self.fft.run(v);
+        self.fft.run_scalar(&mut v);
         let scale = gain / l as f32;
         for (p, &[vr, vi]) in v.iter().enumerate() {
             let [c, s] = self.post[p];
@@ -980,6 +1038,29 @@ mod fft_twin {
 }
 
 #[cfg(test)]
+mod dct4_twin {
+    use super::*;
+
+    /// The restructured rotations (and the FFT twin under them) must equal the
+    /// original indexed forms bit for bit.
+    #[test]
+    fn dct4_and_imdct_half_match_reference() {
+        for bits in 4..=11 {
+            let l = 1usize << bits;
+            let plan = pow2_dct4(l).unwrap();
+            let x: Vec<f32> = (0..l).map(|i| ((i as f32 * 0.37).sin() * 12345.0) + i as f32).collect();
+            let (mut got, mut want) = (vec![0f32; l], vec![0f32; l]);
+            plan.dct4(&x, &mut got, &mut vec![[0f32; 2]; l / 2]);
+            plan.dct4_reference(&x, &mut want);
+            assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "dct4 l={l}");
+            plan.imdct_half(&x, &mut got, 0.37);
+            plan.imdct_half_reference(&x, &mut want, 0.37);
+            assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "imdct_half l={l}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod kernel_price {
     use super::*;
 
@@ -1001,6 +1082,21 @@ mod kernel_price {
                 best = best.min(t.elapsed().as_secs_f64() / iters as f64);
             }
             eprintln!("Radix2Fft::run n={n:4}: {:8.1} ns/call", best * 1e9);
+        }
+        for len in [64usize, 512] {
+            let (src0, src1): (Vec<f32>, Vec<f32>) = ((0..len).map(|i| i as f32).collect(), (0..len).map(|i| -(i as f32)).collect());
+            let win: Vec<f32> = (0..2 * len).map(|i| (i as f32 * 0.01).sin()).collect();
+            let mut dst = vec![0f32; 2 * len];
+            let iters = 4_000_000 / len;
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let t = std::time::Instant::now();
+                for _ in 0..iters {
+                    crate::decode::synth::fmul_window(std::hint::black_box(&mut dst), &src0, &src1, &win, len);
+                }
+                best = best.min(t.elapsed().as_secs_f64() / iters as f64);
+            }
+            eprintln!("fmul_window len={len:4}: {:8.1} ns/call", best * 1e9);
         }
         for l in [64usize, 512, 1024] {
             let plan = pow2_dct4(l).unwrap();

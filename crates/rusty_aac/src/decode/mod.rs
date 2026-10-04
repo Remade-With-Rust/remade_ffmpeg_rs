@@ -16,7 +16,7 @@
 
 pub(crate) mod channel;
 pub mod layout;
-mod synth;
+pub(crate) mod synth;
 pub(crate) mod tools;
 
 pub(crate) use channel::TNS_MAX_LONG;
