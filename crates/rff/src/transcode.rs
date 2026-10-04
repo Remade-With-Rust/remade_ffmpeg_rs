@@ -449,9 +449,26 @@ fn audio_to_f32(af: &AudioFrame) -> Result<Vec<f32>> {
     }
 }
 
+/// `f32` samples as little-endian bytes, in one sized pass. The
+/// `iter().flat_map(to_le_bytes).collect()` this replaces is the pattern LLVM
+/// handles worst -- an iterator of tiny arrays flattened into a growing `Vec`.
+fn f32_le_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = vec![0u8; samples.len() * 4];
+    for (d, s) in bytes.chunks_exact_mut(4).zip(samples) {
+        d.copy_from_slice(&s.to_le_bytes());
+    }
+    bytes
+}
+
+/// The usual f32 -> s16 rule: round to nearest, then clamp. Truncation would
+/// bias every sample toward zero.
+fn f32_to_s16(s: f32) -> i16 {
+    (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16
+}
+
 /// Wrap interleaved `f32` samples as an `f32` [`AudioFrame`].
 fn f32_frame(samples: Vec<f32>, rate: u32, channels: u16, pts: Option<i64>) -> Frame {
-    let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let bytes = f32_le_bytes(&samples);
     Frame::Audio(AudioFrame {
         sample_rate: rate,
         channels,
@@ -476,25 +493,39 @@ fn conform_sample_format(target: Option<SampleFormat>, frame: Frame) -> Result<F
     if af.format == target {
         return Ok(Frame::Audio(af));
     }
-    let samples = audio_to_f32(&af)?;
-    let planes = match target {
-        SampleFormat::F32 => vec![samples.iter().flat_map(|s| s.to_le_bytes()).collect()],
-        SampleFormat::S16 => vec![samples
-            .iter()
-            .flat_map(|s| {
-                // Round-to-nearest and clamp, matching the usual f32->s16 rule:
-                // truncation would bias every sample toward zero.
-                let v = (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
-                v.to_le_bytes()
-            })
-            .collect()],
-        other => {
+    // Bytes to bytes in ONE pass. This used to decode the whole plane into a
+    // `Vec<f32>` and then re-encode it through `flat_map(..).collect()` -- an
+    // extra full-frame copy (a WAV's worth, when the frame is a whole file) and
+    // the iterator shape LLVM vectorises worst. The arithmetic per sample is
+    // the same expression, so the output is byte-identical.
+    let src = &af.planes[0];
+    let plane = match (af.format, target) {
+        (SampleFormat::F32, SampleFormat::S16) => {
+            let mut out = vec![0u8; src.len() / 4 * 2];
+            for (d, b) in out.chunks_exact_mut(2).zip(src.chunks_exact(4)) {
+                let s = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                d.copy_from_slice(&f32_to_s16(s).to_le_bytes());
+            }
+            out
+        }
+        (SampleFormat::S16, SampleFormat::F32) => {
+            let mut out = vec![0u8; src.len() / 2 * 4];
+            for (d, b) in out.chunks_exact_mut(4).zip(src.chunks_exact(2)) {
+                let s = i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0;
+                d.copy_from_slice(&s.to_le_bytes());
+            }
+            out
+        }
+        _ => {
+            // Not a supported pair: report the source format first, as before.
+            audio_to_f32(&af)?;
             return Err(Error::unsupported(format!(
                 "sample format conversion to `{}` (only interleaved s16/f32)",
-                other.name()
-            )))
+                target.name()
+            )));
         }
     };
+    let planes = vec![plane];
     Ok(Frame::Audio(AudioFrame {
         sample_rate: af.sample_rate,
         channels: af.channels,

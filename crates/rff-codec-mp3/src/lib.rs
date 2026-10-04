@@ -73,9 +73,13 @@ impl Decoder for Mp3Decoder {
     fn receive_frame(&mut self) -> Result<Frame> {
         let audio = self.inner.next_frame().map_err(map_err)?;
         let channels = audio.channels.max(1);
-        let mut bytes = Vec::with_capacity(audio.samples.len() * 4);
-        for s in &audio.samples {
-            bytes.extend_from_slice(&s.to_le_bytes());
+        // One sized pass into an exact-length plane. The per-sample
+        // `extend_from_slice` this replaces re-checked capacity on every
+        // sample, which kept the loop scalar; with the length fixed up front it
+        // is a plain lane-wise copy (on little-endian, byte-for-byte a memcpy).
+        let mut bytes = vec![0u8; audio.samples.len() * 4];
+        for (d, s) in bytes.chunks_exact_mut(4).zip(&audio.samples) {
+            d.copy_from_slice(&s.to_le_bytes());
         }
         Ok(Frame::Audio(AudioFrame {
             sample_rate: audio.sample_rate,

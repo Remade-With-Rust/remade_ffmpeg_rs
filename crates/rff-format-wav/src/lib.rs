@@ -252,14 +252,26 @@ impl Muxer for WavMuxer {
         fmt.extend_from_slice(&block_align.to_le_bytes());
         fmt.extend_from_slice(&bits.to_le_bytes());
 
-        let mut body = Vec::new();
-        body.extend_from_slice(b"WAVE");
-        put_chunk(&mut body, b"fmt ", &fmt);
-        put_chunk(&mut body, b"data", &self.data);
+        // Everything up to the sample bytes is a few dozen bytes: build that,
+        // then write the buffered samples straight from `self.data`. The trailer
+        // used to assemble the whole file into a second `Vec` first -- a copy of
+        // every sample (72 MB on a 7-minute stereo track) just to call one
+        // `write_all`. Same bytes, same order.
+        let mut head = Vec::with_capacity(4 + 8 + fmt.len() + 8);
+        head.extend_from_slice(b"WAVE");
+        put_chunk(&mut head, b"fmt ", &fmt);
+        let pad = self.data.len() % 2;
+        let body_len = head.len() + 8 + self.data.len() + pad;
+        head.extend_from_slice(b"data");
+        head.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
 
         self.out.write_all(b"RIFF")?;
-        self.out.write_all(&(body.len() as u32).to_le_bytes())?;
-        self.out.write_all(&body)?;
+        self.out.write_all(&(body_len as u32).to_le_bytes())?;
+        self.out.write_all(&head)?;
+        self.out.write_all(&self.data)?;
+        if pad == 1 {
+            self.out.write_all(&[0])?;
+        }
         self.out.flush()?;
         Ok(())
     }
