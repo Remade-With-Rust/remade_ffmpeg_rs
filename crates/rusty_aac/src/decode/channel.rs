@@ -535,6 +535,8 @@ pub fn decode_ics(
     }
 
     // Dequantisation; PNS bands from the reference generator.
+    let _prof = crate::prof::scope(crate::prof::Stage::DecDequant);
+    let pow43 = crate::dsp::pow43_table();
     cd.coeffs.iter_mut().for_each(|c| *c = 0.0);
     let mut wbase = 0usize;
     for g in 0..info.num_window_groups {
@@ -566,8 +568,9 @@ pub fn decode_ics(
             let gain = crate::dsp::sf_gain(cd.sfo[idx]);
             for w in 0..glen {
                 let base = (wbase + w) * 128;
-                for i in s..e {
-                    cd.coeffs[base + i] = crate::dsp::dequant(quant[base + i]) * gain;
+                let (out, q) = (&mut cd.coeffs[base + s..base + e], &quant[base + s..base + e]);
+                for (c, &q) in out.iter_mut().zip(q) {
+                    *c = crate::dsp::dequant_with(pow43, q) * gain;
                 }
             }
         }

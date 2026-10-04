@@ -18,6 +18,34 @@ use std::sync::OnceLock;
 /// Inverse quantization of a spectral coefficient (ISO 14496-3 §10.3):
 /// `x = sign(q) · |q|^(4/3)`. The scalefactor gain is applied separately.
 pub fn dequant(q: i32) -> f32 {
+    // `|q|^(4/3)` for every magnitude a legal stream can produce (escape codes
+    // reach 8191, pulses add up to 15), precomputed with the same f64 `powf` and
+    // stored as f32. `(±m) as f32 == ±(m as f32)`, so the lookup is bit-identical
+    // to evaluating the formula — which was a libm call per coefficient and ~40%
+    // of LC decode. Larger (corrupt-stream) magnitudes take the formula.
+    dequant_with(pow43_table(), q)
+}
+
+/// The `|q|^(4/3)` table, for callers that hoist it out of a coefficient loop.
+pub fn pow43_table() -> &'static [f32] {
+    static POW43: OnceLock<Vec<f32>> = OnceLock::new();
+    POW43.get_or_init(|| (0..POW43_LEN).map(|i| dequant_formula(i as i32)).collect())
+}
+
+/// [`dequant`] against an already-fetched [`pow43_table`].
+#[inline(always)]
+pub fn dequant_with(t: &[f32], q: i32) -> f32 {
+    match t.get(q.unsigned_abs() as usize) {
+        Some(&m) => if q < 0 { -m } else { m },
+        None => dequant_formula(q),
+    }
+}
+
+/// Magnitudes covered by the `dequant` table.
+const POW43_LEN: usize = 8192 + 16;
+
+/// The defining formula (the table's source and oracle).
+fn dequant_formula(q: i32) -> f32 {
     let m = (q.unsigned_abs() as f64).powf(4.0 / 3.0);
     (q.signum() as f64 * m) as f32
 }
@@ -1033,6 +1061,21 @@ mod fft_twin {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dequant_table {
+    /// The table lookup must equal the formula bit for bit, on both sides of the
+    /// table boundary.
+    #[test]
+    fn dequant_table_matches_formula() {
+        for q in -9000i32..=9000 {
+            assert_eq!(super::dequant(q).to_bits(), super::dequant_formula(q).to_bits(), "q={q}");
+        }
+        for q in [i32::MIN + 1, -100_000, 100_000, i32::MAX] {
+            assert_eq!(super::dequant(q).to_bits(), super::dequant_formula(q).to_bits(), "q={q}");
         }
     }
 }

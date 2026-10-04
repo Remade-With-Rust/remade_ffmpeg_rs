@@ -22,6 +22,7 @@ pub enum Stage {
     EncQuant,
     EncCodebook,
     DecIcs,
+    DecDequant,
     DecTools,
     DecImdct,
     DecSbrAnalysis,
@@ -31,7 +32,7 @@ pub enum Stage {
 }
 
 /// Stage names, indexed by [`Stage`].
-pub const STAGES: [&str; 14] = [
+pub const STAGES: [&str; 15] = [
     "enc mdct (analyze_long/short)",
     "enc psy (perceptual offsets)",
     "enc tns analysis",
@@ -39,7 +40,8 @@ pub const STAGES: [&str; 14] = [
     "enc rate-loop estimate",
     "enc quantize (code_core)",
     "enc codebook select",
-    "dec ics (huffman + dequant)",
+    "dec ics (huffman + side info)",
+    "dec dequant (|q|^4/3 x gain, pns)",
     "dec tools (ms/is/pred/ltp/tns)",
     "dec imdct + window",
     "dec sbr qmf analysis",
