@@ -7,7 +7,7 @@
 //! Short blocks store three sets (one per window) and never share.
 
 use crate::bitio::BitReader;
-use crate::frame::{BlockType, SideInfo};
+use crate::frame::{BlockType, GranuleSideInfo, SideInfo};
 use crate::header::{FrameHeader, MpegVersion};
 use crate::tables;
 
@@ -96,7 +96,13 @@ pub fn decode(
         } else {
             0
         };
-        let (slen, nr) = tables::lsf_scale_params(gi.scalefac_compress, blocktype);
+        // The intensity-coded right channel reads its scalefactors (which double
+        // as panning positions) with its own scheme.
+        let (slen, nr) = if is_intensity_right(header, ch) {
+            tables::lsf_scale_params_intensity(gi.scalefac_compress, blocktype)
+        } else {
+            tables::lsf_scale_params(gi.scalefac_compress, blocktype)
+        };
         if is_short {
             // Groups fill (sfb, window) linearly, sfb-major (idx = 3·sfb + window) —
             // proven bit-identical to minimp3.
@@ -141,6 +147,66 @@ pub fn decode(
 
     *bit_pos = r.bit_pos();
     sf
+}
+
+/// Is this the intensity-coded right channel of an MPEG-2/2.5 joint-stereo pair?
+pub fn is_intensity_right(header: &FrameHeader, ch: usize) -> bool {
+    ch == 1
+        && !matches!(header.version, MpegVersion::V1)
+        && matches!(
+            header.channel_mode,
+            crate::frame::ChannelMode::JointStereo {
+                intensity_stereo: true,
+                ..
+            }
+        )
+}
+
+/// The ILLEGAL intensity position per band for the MPEG-2 right channel: the
+/// largest value its scalefactor field can hold, `2^slen - 1` (ISO 13818-3
+/// 2.4.3.2; minimp3 marks exactly this). A band read with `slen == 0` has no
+/// illegal value and reads 0xFF here. Laid out like [`ScaleFactors`], so the
+/// stereo stage can index it the same way it indexes the positions.
+pub fn lsf_intensity_illegal(gi: &GranuleSideInfo) -> ScaleFactors {
+    let is_short = gi.window_switching && gi.block_type == BlockType::Short;
+    let blocktype = match (is_short, gi.mixed_block) {
+        (false, _) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+    };
+    let (slen, nr) = tables::lsf_scale_params_intensity(gi.scalefac_compress, blocktype);
+    let mut out = ScaleFactors {
+        long: [0xFF; crate::frame::SFB_LONG],
+        short: [[0xFF; crate::frame::SFB_SHORT]; 3],
+    };
+    let (long_vals, first_short) = match blocktype {
+        0 => (usize::MAX, 0),
+        1 => (0, 0),
+        _ => (6, 3),
+    };
+    let mut idx = 0usize;
+    for g in 0..4 {
+        let max = if slen[g] == 0 {
+            0xFF
+        } else {
+            ((1u32 << slen[g]) - 1) as u8
+        };
+        for _ in 0..nr[g] {
+            if idx < long_vals {
+                if idx < crate::frame::SFB_LONG {
+                    out.long[idx] = max;
+                }
+            } else {
+                let j = idx - long_vals;
+                let (sfb, w) = (first_short + j / 3, j % 3);
+                if sfb < crate::frame::SFB_SHORT {
+                    out.short[w][sfb] = max;
+                }
+            }
+            idx += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]

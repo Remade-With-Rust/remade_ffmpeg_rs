@@ -41,11 +41,16 @@ fn is_table_v1() -> &'static [[f32; 7]; 2] {
 /// bit of the right channel's `scalefac_compress`) picks a step of 2^-1/4 or
 /// 2^-1/2; an odd `is_pos` attenuates the LEFT channel, an even one the RIGHT,
 /// by `step^((is_pos+1)/2)`. `[scale][0|1][is_pos]`.
-fn is_table_lsf() -> &'static [[[f32; 16]; 2]; 2] {
-    static T: OnceLock<[[[f32; 16]; 2]; 2]> = OnceLock::new();
+///
+/// 32 positions, not 16: the right channel's position fields are up to FIVE bits
+/// wide (`int_scalefac_compress < 180` gives slen 4/5/5), so positions reach 30
+/// legally. FFmpeg's table stops at 16 and treats 16..=31 as "not intensity",
+/// which is where it parts from minimp3 and the spec on ISO l3-test45/46.
+fn is_table_lsf() -> &'static [[[f32; 32]; 2]; 2] {
+    static T: OnceLock<[[[f32; 32]; 2]; 2]> = OnceLock::new();
     T.get_or_init(|| {
-        let mut t = [[[0f32; 16]; 2]; 2];
-        for i in 0..16 {
+        let mut t = [[[0f32; 32]; 2]; 2];
+        for i in 0..32 {
             for (j, tj) in t.iter_mut().enumerate() {
                 let e = -((j as i32 + 1) * ((i as i32 + 1) >> 1));
                 let f = 2f64.powf(e as f64 / 4.0) as f32;
@@ -113,16 +118,36 @@ pub fn process(
         (true, false) => (0, 0),
         (true, true) => (if lsf { 6 } else { 8 }, 3),
     };
+    // Two MPEG-2 rules, each measured load-bearing on ISO l3-test45 / l3-test46
+    // (both PASS at 1 LSB only with BOTH; drop the illegal-position rule and they
+    // read 25.4 / 14.1 dB, drop the top-band rule and 37.7 / 35.4 dB):
+    //
+    //  * ILLEGAL positions: the largest value a band's position field can hold,
+    //    2^slen - 1, means "not intensity" (ISO 13818-3; minimp3). FFmpeg does
+    //    not apply this.
+    //  * the TOP band (no position of its own) takes the band below's position
+    //    only if that band is itself intensity-coded; otherwise the default
+    //    centre position (3 for MPEG-1, 0 for MPEG-2) -- minimp3's rule. FFmpeg
+    //    always copies band 20 / 11.
+    let lim = if lsf {
+        super::scalefactors::lsf_intensity_illegal(g1)
+    } else {
+        ScaleFactors {
+            long: [0xFF; 22],
+            short: [[0xFF; 13]; 3],
+        }
+    };
     // `None` = an illegal position: the band is not intensity-coded.
-    let pan = |sf: u8| -> Option<(f32, f32)> {
+    let pan = |sf: u8, illegal: u8| -> Option<(f32, f32)> {
         if lsf {
             let t = &is_table_lsf()[(g1.scalefac_compress & 1) as usize];
-            (sf < 16).then(|| (t[0][sf as usize], t[1][sf as usize]))
+            (sf < 32 && sf != illegal).then(|| (t[0][sf as usize], t[1][sf as usize]))
         } else {
             let t = is_table_v1();
             (sf < 7).then(|| (t[0][sf as usize], t[1][sf as usize]))
         }
     };
+    let default_pos: u8 = if lsf { 0 } else { 3 };
 
     // Short bands (reordered layout: band `i`, window `w`, line `f` lives at
     // `3·start + w + 3f`). The last band has no scalefactor and reuses band 11's.
@@ -138,7 +163,22 @@ pub fn process(
             if !nz_short[w] {
                 if lines.clone().any(|j| r[j] != 0.0) {
                     nz_short[w] = true;
-                } else if let Some((v1, v2)) = pan(sf_right.short[w][sfi]) {
+                } else if let Some((v1, v2)) = {
+                    // The top band has no position of its own.
+                    let (pos, ill) = if i == 12 {
+                        let prev_nz = (0..(so[12] - so[11]) as usize)
+                            .map(|f| 3 * so[11] as usize + w + 3 * f)
+                            .any(|j| j < GRANULE_LINES && r[j] != 0.0);
+                        if prev_nz {
+                            (default_pos, 0xFF)
+                        } else {
+                            (sf_right.short[w][11], lim.short[w][11])
+                        }
+                    } else {
+                        (sf_right.short[w][sfi], lim.short[w][sfi])
+                    };
+                    pan(pos, ill)
+                } {
                     for j in lines {
                         let x = l[j];
                         l[j] = x * v1;
@@ -159,7 +199,21 @@ pub fn process(
         if !nz {
             if r[lines.clone()].iter().any(|&v| v != 0.0) {
                 nz = true;
-            } else if let Some((v1, v2)) = pan(sf_right.long[if i == 21 { 20 } else { i }]) {
+            } else if let Some((v1, v2)) = {
+                let (pos, ill) = if i == 21 {
+                    let a = (lo[20] as usize).min(GRANULE_LINES);
+                    let b = (lo[21] as usize).min(GRANULE_LINES);
+                    if r[a..b].iter().any(|&v| v != 0.0) {
+                        (default_pos, 0xFF)
+                    } else {
+                        (sf_right.long[20], lim.long[20])
+                    }
+                } else {
+                    let k = if i == 21 { 20 } else { i };
+                    (sf_right.long[k], lim.long[k])
+                };
+                pan(pos, ill)
+            } {
                 for j in lines {
                     let x = l[j];
                     l[j] = x * v1;

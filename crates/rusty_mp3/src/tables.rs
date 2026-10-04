@@ -244,6 +244,27 @@ pub fn lsf_scale_params(scalefac_compress: u16, blocktype: usize) -> ([u8; 4], [
     )
 }
 
+/// LSF scalefactor bit-lengths and group counts for the INTENSITY-coded right
+/// channel (ISO 13818-3 2.4.3.2): `int_scalefac_compress = scalefac_compress >> 1`
+/// picks blocknumber 3..5; the low bit is `intensity_scale`, used by the panning,
+/// not here. `blocktype`: 0=long, 1=short, 2=mixed.
+pub fn lsf_scale_params_intensity(scalefac_compress: u16, blocktype: usize) -> ([u8; 4], [u8; 4]) {
+    let isc = (scalefac_compress >> 1) as u32;
+    let (slen, blocknumber) = if isc < 180 {
+        ([isc / 36, (isc % 36) / 6, (isc % 36) % 6, 0], 3)
+    } else if isc < 244 {
+        let s = isc - 180;
+        ([(s % 64) >> 4, (s % 16) >> 2, s % 4, 0], 4)
+    } else {
+        let s = isc - 244;
+        ([s / 3, s % 3, 0, 0], 5)
+    };
+    (
+        [slen[0] as u8, slen[1] as u8, slen[2] as u8, slen[3] as u8],
+        NR_OF_SFB_BLOCK[blocknumber][blocktype],
+    )
+}
+
 // ---- synthesis filterbank (to port) ------------------------------------------
 
 // The 512-tap polyphase synthesis window `D[i]` (ISO 11172-3 Table 3-B.3) is the

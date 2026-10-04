@@ -77,7 +77,17 @@ pub fn parse(header: &FrameHeader, bytes: &[u8]) -> Result<SideInfo> {
             } else {
                 // LSF carries no preflag bit — it's DERIVED: the pretab applies when
                 // the scalefactor scheme's blocknumber is 2 (scalefac_compress ≥ 500).
-                g.preflag = g.scalefac_compress >= 500;
+                // Never on the intensity-coded right channel: its scalefactor_compress
+                // indexes a different scheme (blocknumbers 3..5), which has no pretab.
+                let is_right = ch == 1
+                    && matches!(
+                        header.channel_mode,
+                        crate::frame::ChannelMode::JointStereo {
+                            intensity_stereo: true,
+                            ..
+                        }
+                    );
+                g.preflag = !is_right && g.scalefac_compress >= 500;
             }
             g.scalefac_scale = r.read_bool();
             g.count1table_select = r.read_bool();

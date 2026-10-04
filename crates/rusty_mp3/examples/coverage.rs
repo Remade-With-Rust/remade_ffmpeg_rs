@@ -164,13 +164,21 @@ fn granule(
     bump(t, format!("dec.block.{block}"), 1);
     if std::env::var_os("COVERAGE_GRANULES").is_some() {
         println!(
-            "  granule gr={gr} ch={ch} block={block} mixflag={} sbg={:?} preflag={} sfs={} gain={}",
+            "  granule gr={gr} ch={ch} block={block} mixflag={} sbg={:?} preflag={} sfs={} gain={} sfc={}",
             gi.mixed_block as u8,
             gi.subblock_gain,
             gi.preflag as u8,
             gi.scalefac_scale as u8,
-            gi.global_gain
+            gi.global_gain,
+            gi.scalefac_compress
         );
+        if ch == 1 && scalefactors::is_intensity_right(h, ch) {
+            let lim = scalefactors::lsf_intensity_illegal(gi);
+            println!(
+                "    is_pos long {:?}\n    illegal    {:?}",
+                sf.long, lim.long
+            );
+        }
     }
     if gi.preflag {
         bump(t, "dec.preflag", 1);

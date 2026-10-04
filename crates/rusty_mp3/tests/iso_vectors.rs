@@ -44,6 +44,12 @@ const MUST_PASS: &[(&str, &str)] = &[
     ("M2L3_bitrate_22_all", "MPEG-2 22.05 kHz, every bitrate"),
     ("M2L3_bitrate_24_all", "MPEG-2 24 kHz, every bitrate"),
     ("M2L3_compl24", "MPEG-2 compliance"),
+    ("M2L3_noise", "MPEG-2 noise, intensity stereo"),
+    (
+        "l3-test45",
+        "MPEG-2 INTENSITY: 5-bit positions, illegal positions, top-band rule",
+    ),
+    ("l3-test46", "MPEG-2 intensity + M/S"),
 ];
 
 fn decode(bytes: &[u8]) -> (Vec<i32>, usize) {
