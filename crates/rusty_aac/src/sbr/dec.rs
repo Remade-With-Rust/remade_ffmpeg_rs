@@ -1540,8 +1540,10 @@ pub(crate) fn apply(dec: &mut Decoder, el: &mut Element, ty: u8, n: usize) {
         let yp = sbr.data[ch].ypos;
         {
             let d = &mut sbr.data[ch];
+            let _prof = crate::prof::scope(crate::prof::Stage::DecSbrAnalysis);
             qmf_analysis(&el.ch[ch].output[..n], &mut d.ana_hist, &mut d.w[yp], nts);
         }
+        let prof_hf = crate::prof::scope(crate::prof::Stage::DecSbrHf);
         sbr.lf_gen(&mut wk, ch, yp, nts);
         sbr.data[ch].ypos ^= 1;
         if sbr.start {
@@ -1558,11 +1560,13 @@ pub(crate) fn apply(dec: &mut Decoder, el: &mut Element, ty: u8, n: usize) {
             }
         }
         xs.push(sbr.x_gen(&wk, ch, nts));
+        drop(prof_hf);
     }
     if ps_on {
         let top = sbr.kx[1] + sbr.m[1];
         let mut x1 = xs[0].clone();
         if let Some(ps) = sbr.ps.as_mut().filter(|p| p.started()) {
+            let _prof = crate::prof::scope(crate::prof::Stage::DecPs);
             ps.apply(&mut xs[0], &mut x1, top);
         }
         xs.truncate(1);
@@ -1570,6 +1574,7 @@ pub(crate) fn apply(dec: &mut Decoder, el: &mut Element, ty: u8, n: usize) {
     }
     let outn = if downsampled { n } else { 2 * n };
     for (ch, x) in xs.iter().enumerate() {
+        let _prof = crate::prof::scope(crate::prof::Stage::DecSbrSynthesis);
         qmf_synthesis(&mut el.ch[ch].output[..outn], x, &mut sbr.data[ch].syn_v, nts, downsampled);
     }
 }

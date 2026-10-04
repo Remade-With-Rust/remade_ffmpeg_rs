@@ -20,6 +20,8 @@ simd-avx512 = ["simd"]
 # Dev/analysis only — it is the verdict instrument for the Great Gate campaign
 # (`docs/finished/codec-aac-great-gate.md`), not part of the shipped codec surface.
 lab = []
+# Stage profiler + SIMD-arm census (`src/prof.rs`). Measurement only; zero cost off.
+profile = []
 
 [dependencies]
 
@@ -49,3 +51,7 @@ required-features = ["lab"]
 [[example]]
 name = "aacenc"
 required-features = ["lab"]
+
+[[example]]
+name = "aacprof"
+required-features = ["profile", "lab"]

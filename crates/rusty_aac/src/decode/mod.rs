@@ -878,6 +878,7 @@ impl Decoder {
     }
 
     fn synthesize(&mut self, sce: &mut Sce) {
+        let _prof = crate::prof::scope(crate::prof::Stage::DecImdct);
         let sx = self.syntax;
         let n = sx.frame_len;
         match sx.aot {

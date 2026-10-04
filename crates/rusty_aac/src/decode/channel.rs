@@ -370,6 +370,7 @@ pub fn decode_ics(
     common_window: bool,
     rng: &mut u32,
 ) -> Result<()> {
+    let _prof = crate::prof::scope(crate::prof::Stage::DecIcs);
     let global_gain = r.read_bits(8)? as i32;
     if !common_window {
         parse_ics_info(r, sx, ics)?;

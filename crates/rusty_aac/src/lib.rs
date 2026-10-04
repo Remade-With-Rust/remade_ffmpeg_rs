@@ -39,6 +39,8 @@ mod ics;
 /// LATM/LOAS transport (ISO 14496-3 §1.7) — the MPEG-TS / broadcast carriage
 /// format, alongside ADTS (`.aac`) and MP4 `esds`.
 pub mod latm;
+/// Stage profiler + SIMD-arm census (feature `profile`; no-ops without it).
+pub mod prof;
 /// The quality lab (feature `lab`): deterministic corpus, the NMR metric, and the
 /// bitrate-ladder runner. This is the verdict instrument for the Great Gate
 /// campaign — see `docs/finished/codec-aac-great-gate.md`.

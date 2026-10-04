@@ -10,6 +10,7 @@ use crate::tables_ext::AAC_PRED_SFB_MAX;
 /// M/S (§4.6.8.1). Bands where either channel is noise or intensity are left
 /// alone: M/S on a PNS band signals noise correlation, not a rotation.
 pub fn apply_ms(ics: &Ics, ms_mask: &[bool], c0: &mut ChannelData, c1: &mut ChannelData) {
+    let _prof = crate::prof::scope(crate::prof::Stage::DecTools);
     let info = &ics.info;
     let max_sfb = info.max_sfb as usize;
     let mut wbase = 0usize;
@@ -35,6 +36,7 @@ pub fn apply_ms(ics: &Ics, ms_mask: &[bool], c0: &mut ChannelData, c1: &mut Chan
 /// Intensity stereo (§4.6.8.2.3): `R = ±2^(-pos/4)·L` on the right channel's
 /// intensity bands; the sign flips for INTENSITY_HCB2 and again under M/S.
 pub fn apply_is(ics1: &Ics, ms_present: bool, ms_mask: &[bool], c0: &ChannelData, c1: &mut ChannelData) {
+    let _prof = crate::prof::scope(crate::prof::Stage::DecTools);
     let info = &ics1.info;
     let max_sfb = info.max_sfb as usize;
     let mut wbase = 0usize;
@@ -64,6 +66,7 @@ pub fn apply_is(ics1: &Ics, ms_present: bool, ms_mask: &[bool], c0: &ChannelData
 /// TNS (§4.6.9.3). `decode = true` runs the all-pole synthesis filter; `false`
 /// the moving-average analysis filter LTP applies to its prediction.
 pub fn apply_tns(coef: &mut [f32], tns: &Tns, ics: &Ics, decode: bool) {
+    let _prof = crate::prof::scope(crate::prof::Stage::DecTools);
     let info = &ics.info;
     let mmm = (ics.tns_max_bands as usize).min(info.max_sfb as usize);
     if mmm == 0 {
@@ -180,6 +183,7 @@ fn predict(ps: &mut PredState, coef: &mut f32, output_enable: bool) {
 
 /// AAC-Main frequency-domain prediction for one channel.
 pub fn apply_prediction(ics: &Ics, sf_index: u8, coeffs: &mut [f32], ps: &mut [PredState], initialized: &mut bool) {
+    let _prof = crate::prof::scope(crate::prof::Stage::DecTools);
     if !*initialized {
         ps.iter_mut().for_each(|p| *p = PredState::default());
         *initialized = true;

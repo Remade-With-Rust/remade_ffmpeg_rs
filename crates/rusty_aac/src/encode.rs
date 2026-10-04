@@ -23,6 +23,7 @@
 
 #![allow(dead_code)]
 
+use crate::prof::{self, Kernel, Stage};
 use crate::codebook::{Codebook, CODEBOOKS, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB};
 use crate::ics::{IcsInfo, WindowSequence};
 use crate::swb::swb_offsets;
@@ -286,6 +287,7 @@ const SPEC_SCALE: f32 = 32768.0;
 /// scaled so the decoder's `imdct · window · (1/32768) + overlap-add` reconstructs
 /// the input (TDAC). `win` is the 2048-length window (sine or KBD).
 pub fn analyze_long(prev: &[f32; FRAME_LEN], cur: &[f32; FRAME_LEN], win: &[f32]) -> Vec<f32> {
+    let _prof = prof::scope(Stage::EncMdct);
     let mut windowed = vec![0f32; LONG_N];
     for n in 0..FRAME_LEN {
         windowed[n] = prev[n] * win[n] * SPEC_SCALE;
@@ -300,6 +302,7 @@ pub fn analyze_long(prev: &[f32; FRAME_LEN], cur: &[f32; FRAME_LEN], win: &[f32]
 /// uncovered [0,448)/[1600,2048) regions are bridged by the LongStart/LongStop
 /// neighbours — which is why EightShort must sit between transition blocks.
 pub fn analyze_short(prev: &[f32; FRAME_LEN], cur: &[f32; FRAME_LEN], sw: &[f32]) -> Vec<f32> {
+    let _prof = prof::scope(Stage::EncMdct);
     let mut buf = [0f32; LONG_N];
     buf[..FRAME_LEN].copy_from_slice(prev);
     buf[FRAME_LEN..].copy_from_slice(cur);
@@ -630,6 +633,7 @@ fn perceptual_offsets(
     sample_rate: u32,
     tonality_smr: bool,
 ) -> Vec<i32> {
+    let _prof = prof::scope(Stage::EncPsy);
     let num_swb = swb.len() - 1;
     let mut energy = vec![0.0f64; num_swb];
     for sfb in 0..num_swb {
@@ -842,6 +846,7 @@ struct Xpow {
 
 impl Xpow {
     fn new(spec: &[f32]) -> Xpow {
+        let _prof = prof::scope(Stage::EncXpow);
         let mut pow = vec![0f64; spec.len()];
         let mut sign = vec![0i32; spec.len()];
         #[cfg(all(feature = "simd", target_arch = "x86_64"))]
@@ -849,9 +854,11 @@ impl Xpow {
             if has_avx2() {
                 // SAFETY: runtime AVX2 check; `pow`/`sign` are `spec.len()` long.
                 unsafe { xpow_avx2(spec, &mut pow, &mut sign) };
+                prof::count(Kernel::Xpow, true, spec.len());
                 return Xpow { pow, sign };
             }
         }
+        prof::count(Kernel::Xpow, false, spec.len());
         for (i, &x) in spec.iter().enumerate() {
             // |x|^0.75 = |x|^½·|x|^¼ = √|x|·√√|x| — two sqrts vectorize; `powf` doesn't.
             // (For x=0, pow=0 so the sign is irrelevant — the quant is 0 either way.)
@@ -1005,8 +1012,10 @@ fn has_avx512() -> bool {
 
 /// Quantize one band into `out`: `out[k] = sign[k]·min(round(pow[k]·scale), MAX_QUANT)`.
 /// This is the encoder's hottest kernel — the rate loop runs it ~11× per frame — so it
-/// has an AVX2 path. `pow·scale ≥ 0`, so `floor(v+0.5)` equals `round(v)`, making the
-/// vector path **bit-exact** with the scalar reference (verified by every gate test).
+/// has an AVX2 path. AVX2 has no round-half-away-from-zero, so the twins use
+/// `floor(v + HALF_DOWN)` with `HALF_DOWN` the double just below ½: for `v ≥ 0` that
+/// equals `round(v)` exactly. (`floor(v + 0.5)` does NOT — at the double just below ½
+/// the sum rounds up to 1.0 — which `quantize_simd_matches_scalar` pins.)
 fn quantize_band(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) {
     // SAFETY (all SIMD branches): entered only when the ISA is detected at runtime; the
     // three slices share a length and vector bodies touch full lane-chunks, the remainder
@@ -1014,15 +1023,23 @@ fn quantize_band(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) {
     #[cfg(all(feature = "simd-avx512", target_arch = "x86_64"))]
     if has_avx512() {
         unsafe { quantize_band_avx512(pow, sign, scale, out) };
+        prof::count(Kernel::Quantize, true, out.len());
         return;
     }
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     if has_avx2() {
         unsafe { quantize_band_avx2(pow, sign, scale, out) };
+        prof::count(Kernel::Quantize, true, out.len());
         return;
     }
+    prof::count(Kernel::Quantize, false, out.len());
     quantize_band_scalar(pow, sign, scale, out);
 }
+
+/// The largest double below ½ (`0.5 − 2⁻⁵⁴`). Adding it then flooring rounds half
+/// away from zero for non-negative input without the 0.49999999999999994 overshoot.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+const HALF_DOWN: f64 = 0.499_999_999_999_999_94;
 
 fn quantize_band_scalar(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) {
     for k in 0..out.len() {
@@ -1032,20 +1049,20 @@ fn quantize_band_scalar(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) 
 }
 
 /// AVX2 quantize — four coefficients per iteration. Bit-exact with the scalar path
-/// (`floor(v+0.5) == round(v)` for `v ≥ 0`, and the clamp is applied before the
-/// f64→i32 narrowing so nothing overflows).
+/// (`floor(v + HALF_DOWN) == round(v)` for `v ≥ 0`, and the clamp is applied before
+/// the f64→i32 narrowing so nothing overflows).
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn quantize_band_avx2(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) {
     use std::arch::x86_64::*;
     let n = out.len();
     let vscale = _mm256_set1_pd(scale);
-    let vhalf = _mm256_set1_pd(0.5);
+    let vhalf = _mm256_set1_pd(HALF_DOWN);
     let vmax = _mm256_set1_pd(MAX_QUANT as f64);
     let mut i = 0;
     while i + 4 <= n {
         let v = _mm256_mul_pd(_mm256_loadu_pd(pow.as_ptr().add(i)), vscale);
-        let r = _mm256_floor_pd(_mm256_add_pd(v, vhalf)); // = round(v), v ≥ 0
+        let r = _mm256_floor_pd(_mm256_add_pd(v, vhalf)); // = round(v) for v ≥ 0
         let qabs = _mm256_cvttpd_epi32(_mm256_min_pd(r, vmax)); // clamp then f64→i32
         let s = _mm_loadu_si128(sign.as_ptr().add(i) as *const __m128i);
         _mm_storeu_si128(
@@ -1062,8 +1079,8 @@ unsafe fn quantize_band_avx2(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i
 }
 
 /// AVX-512 quantize — eight coefficients per iteration (2× the AVX2 width). Bit-exact:
-/// for the quantizer's always-nonnegative input, `trunc(min(v+0.5, MAX+0.5))` equals
-/// `min(round(v), MAX)`, so a single truncating narrow does round+clamp in one step.
+/// for the quantizer's always-nonnegative input, `trunc(min(v+HALF_DOWN, MAX+0.5))`
+/// equals `min(round(v), MAX)`, so a single truncating narrow does round+clamp.
 /// Runtime-gated above AVX2; on AVX2-only hosts this path never runs (untested there —
 /// the math mirrors the AVX2 kernel exactly, and its tail is the shared scalar reference).
 #[cfg(all(feature = "simd-avx512", target_arch = "x86_64"))]
@@ -1072,7 +1089,7 @@ unsafe fn quantize_band_avx512(pow: &[f64], sign: &[i32], scale: f64, out: &mut 
     use std::arch::x86_64::*;
     let n = out.len();
     let vscale = _mm512_set1_pd(scale);
-    let vhalf = _mm512_set1_pd(0.5);
+    let vhalf = _mm512_set1_pd(HALF_DOWN);
     let vmaxph = _mm512_set1_pd(MAX_QUANT as f64 + 0.5); // clamp v+0.5 so trunc yields MAX
     let mut i = 0;
     while i + 8 <= n {
@@ -1120,6 +1137,7 @@ unsafe fn xpow_avx2(spec: &[f32], pow: &mut [f64], sign: &mut [i32]) {
         let s = (spec[i].abs() as f64).sqrt();
         pow[i] = s * s.sqrt();
         sign[i] = if spec[i] < 0.0 { -1 } else { 1 };
+        i += 1;
     }
 }
 
@@ -1185,11 +1203,14 @@ fn code_core(xp: &Xpow, swb: &[u16], sf: &[i32], quant: &mut [i32]) -> (Vec<u8>,
     let num_swb = swb.len() - 1;
     work::bump_quant_bands((swb.len() - 1) as u64);
     let scale = scale_table();
+    let prof_q = prof::scope(Stage::EncQuant);
     for sfb in 0..num_swb {
         let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
         let sc = scale[sf[sfb].clamp(0, 255) as usize];
         quantize_band(&xp.pow[s..e], &xp.sign[s..e], sc, &mut quant[s..e]);
     }
+    drop(prof_q);
+    let _prof_cb = prof::scope(Stage::EncCodebook);
     let mut max_sfb = 0usize;
     for sfb in 0..num_swb {
         let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
@@ -1239,6 +1260,7 @@ fn min_base(xp: &Xpow, swb: &[u16], offsets: &[i32]) -> i32 {
 /// coefficient from the `coef_bits` table — no codebook search. Monotone in `base`,
 /// so it seeds the search; the exact refinement corrects it.
 fn estimate_bits(xp: &Xpow, swb: &[u16], offsets: &[i32], base: i32) -> usize {
+    let _prof = prof::scope(Stage::EncEstimate);
     let scale = scale_table();
     let ct = coef_bits();
     let num_swb = swb.len() - 1;
@@ -1726,6 +1748,7 @@ pub(crate) fn tns_analyze_long(
     fs_index: u8,
     max_sfb: usize,
 ) -> Option<TnsEnc> {
+    let _prof = prof::scope(Stage::EncTns);
     let num_swb = swb.len() - 1;
     let tns_max = crate::decode::TNS_MAX_LONG[fs_index as usize] as usize;
     let mmm = tns_max.min(max_sfb);
@@ -2087,6 +2110,7 @@ fn code_frame_short(xp: &Xpow, swb: &[u16], sf: &[i32], groups: &[u8]) -> (Vec<u
     let num_swb = swb.len() - 1;
     work::bump_quant_bands(((swb.len() - 1) * 8) as u64);
     let scale = scale_table();
+    let prof_q = prof::scope(Stage::EncQuant);
     let mut quant = vec![0i32; FRAME_LEN];
     for (g, (w0, nwin)) in group_windows(groups).enumerate() {
         for win in w0..w0 + nwin {
@@ -2103,6 +2127,8 @@ fn code_frame_short(xp: &Xpow, swb: &[u16], sf: &[i32], groups: &[u8]) -> (Vec<u
             }
         }
     }
+    drop(prof_q);
+    let _prof_cb = prof::scope(Stage::EncCodebook);
     let mut max_sfb = 0usize;
     for sfb in 0..num_swb {
         let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
@@ -2183,6 +2209,7 @@ fn min_base_short(xp: &Xpow) -> i32 {
 /// grouping) is a genuine prerequisite for A1, exactly as the original plan said.
 /// Do not enable `short_block_psy` before grouping exists.
 fn perceptual_offsets_short(spec: &[f32], swb: &[u16], sample_rate: u32, tonality_smr: bool) -> Vec<i32> {
+    let _prof = prof::scope(Stage::EncPsy);
     let num_swb = swb.len() - 1;
     let mut energy = vec![0.0f64; num_swb];
     let mut noise_scale = vec![0.0f64; num_swb];
@@ -2232,6 +2259,7 @@ fn perceptual_offsets_short_grouped(
     tonality_smr: bool,
     groups: &[u8],
 ) -> Vec<i32> {
+    let _prof = prof::scope(Stage::EncPsy);
     let num_swb = swb.len() - 1;
     let mut raw = Vec::with_capacity(groups.len() * num_swb);
     let mut energy = Vec::with_capacity(groups.len() * num_swb);
@@ -3905,6 +3933,74 @@ mod tests {
     /// the AVX2/scalar `min(round(v), MAX)`. The intrinsics can't run on a non-AVX-512
     /// host, but the identity they rely on — for the quantizer's always-nonnegative
     /// input — is checkable in scalar, so the untested path's *math* is pinned here.
+    /// The quantize twins must equal the scalar oracle exactly — including at the
+    /// adversarial rounding points (the double just below each `k + 0.5`, where
+    /// `v + 0.5` rounds UP in f64 and a naive `floor(v + 0.5)` overshoots), at the
+    /// `MAX_QUANT` clamp, and with tails that are not a multiple of the lane width.
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[test]
+    fn quantize_simd_matches_scalar() {
+        let below = |x: f64| f64::from_bits(x.to_bits() - 1);
+        let mut vals = vec![0.0f64, 0.25, 0.5, below(0.5), 1.5, below(1.5), 2.5, below(2.5), 1e-300];
+        vals.extend([8190.5, below(8190.5), 8191.0, 8191.5, 8192.0, 1e9, 4503599627370495.5]);
+        let mut seed = 0x9e37_79b9u32;
+        for _ in 0..4000 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let k = (seed >> 20) as f64;
+            vals.push(match seed & 3 {
+                0 => below(k + 0.5),
+                1 => k + 0.5,
+                2 => (seed as f64) / 1000.0,
+                _ => k * 1.000_000_1,
+            });
+        }
+        for n in [1usize, 3, 4, 5, 7, 8, 9, 31, vals.len()] {
+            let pow = &vals[..n];
+            let sign: Vec<i32> = (0..n).map(|i| if i % 3 == 0 { -1 } else { 1 }).collect();
+            let mut want = vec![0i32; n];
+            quantize_band_scalar(pow, &sign, 1.0, &mut want);
+            if has_avx2() {
+                let mut got = vec![0i32; n];
+                // SAFETY: AVX2 detected; all slices are `n` long.
+                unsafe { quantize_band_avx2(pow, &sign, 1.0, &mut got) };
+                for i in 0..n {
+                    assert_eq!(got[i], want[i], "avx2 v={:e} (bits {:x})", pow[i], pow[i].to_bits());
+                }
+            }
+            #[cfg(feature = "simd-avx512")]
+            if has_avx512() {
+                let mut got = vec![0i32; n];
+                // SAFETY: AVX-512F detected; all slices are `n` long.
+                unsafe { quantize_band_avx512(pow, &sign, 1.0, &mut got) };
+                for i in 0..n {
+                    assert_eq!(got[i], want[i], "avx512 v={:e}", pow[i]);
+                }
+            }
+        }
+    }
+
+    /// `xpow_avx2` must handle a length that is not a multiple of its 4 lanes
+    /// (its scalar tail once never advanced, an infinite loop masked only because
+    /// every caller passes 1024 coefficients), and match the scalar formula.
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[test]
+    fn xpow_avx2_matches_scalar_with_tail() {
+        if !has_avx2() {
+            return;
+        }
+        for n in [0usize, 1, 3, 4, 5, 7, 129, 1023, 1024] {
+            let spec: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.77).sin() * 3000.0) - 0.5).collect();
+            let (mut pow, mut sign) = (vec![0f64; n], vec![0i32; n]);
+            // SAFETY: AVX2 detected above; the outputs are `n` long.
+            unsafe { xpow_avx2(&spec, &mut pow, &mut sign) };
+            for i in 0..n {
+                let s = (spec[i].abs() as f64).sqrt();
+                assert_eq!(pow[i], s * s.sqrt(), "pow[{i}] n={n}");
+                assert_eq!(sign[i], if spec[i] < 0.0 { -1 } else { 1 }, "sign[{i}] n={n}");
+            }
+        }
+    }
+
     #[test]
     fn avx512_trunc_identity_matches_round_clamp() {
         for &v in &[
