@@ -296,12 +296,24 @@ impl Mp3Decode {
         frame_main_data: &[u8],
     ) -> Result<Vec<f32>> {
         let channels = header.channel_mode.channels();
-        let work = self.decode_frame_entropy(header, side_info_bytes, frame_main_data)?;
-        let mut pcm = Vec::with_capacity(work.len() * GRANULE_LINES * channels);
-        for mut g in work {
-            self.transform
-                .granule_to_pcm(&g.side, &mut g.spectrum, channels, &mut pcm);
-        }
+        let mut pcm = Vec::with_capacity(header.version.granules() * GRANULE_LINES * channels);
+        // Each granule goes from the entropy stage straight into the transform
+        // stage, by reference. The serial path used to collect the frame's
+        // granules into a `Vec<GranuleWork>` first -- an allocation per frame,
+        // and every granule's spectrum (4.6 KB) copied in and copied out again.
+        // The two stages own disjoint state, so running them per granule rather
+        // than per frame changes nothing they compute.
+        let Mp3Decode {
+            reservoir,
+            transform,
+        } = self;
+        entropy(
+            reservoir,
+            header,
+            side_info_bytes,
+            frame_main_data,
+            |side, spectrum| transform.granule_to_pcm(side, spectrum, channels, &mut pcm),
+        )?;
         Ok(pcm)
     }
 
@@ -316,68 +328,88 @@ impl Mp3Decode {
         side_info_bytes: &[u8],
         frame_main_data: &[u8],
     ) -> Result<Vec<GranuleWork>> {
-        let channels = header.channel_mode.channels();
-        let granules = header.version.granules();
-
-        // 1. Side information → the per-granule decode recipe.
-        let si: SideInfo = sideinfo::parse(header, side_info_bytes)?;
-
-        // 2. Reassemble main data across the reservoir boundary.
-        let main = self.reservoir.assemble(si.main_data_begin, frame_main_data);
-
-        let mut out = Vec::with_capacity(granules);
-        let mut bit_pos = 0usize;
-        // Granule 0's scalefactors are retained per channel for granule 1 `scfsi`
-        // reuse.
-        let mut scalefac: [[scalefactors::ScaleFactors; 2]; 2] = Default::default();
-        for gr in 0..granules {
-            let mut spectrum = GranuleSpectrum::default();
-            for ch in 0..channels {
-                let gi = &si.granules[gr][ch];
-                // Block-type census: which IMDCT path this granule/channel takes.
-                {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    let short =
-                        gi.window_switching && gi.block_type == crate::frame::BlockType::Short;
-                    match (short, gi.mixed_block) {
-                        (true, true) => prof::N_MIXED.fetch_add(1, Relaxed),
-                        (true, false) => prof::N_SHORT.fetch_add(1, Relaxed),
-                        _ => prof::N_LONG.fetch_add(1, Relaxed),
-                    };
-                }
-                // part2 (scalefactors) + part3 (Huffman) share one bit budget.
-                let part2_3_start = bit_pos;
-                let prev = if gr == 1 {
-                    Some(scalefac[0][ch].clone())
-                } else {
-                    None
-                };
-                let sf = prof::time(&prof::SCALEFAC, || {
-                    scalefactors::decode(&main, &mut bit_pos, header, &si, gr, ch, prev.as_ref())
-                });
-                scalefac[gr][ch] = sf.clone();
-                let part2_3_end = part2_3_start + gi.part2_3_length as usize;
-                let (coeffs, nz) = prof::time(&prof::HUFFMAN, || {
-                    huffman::decode(&main, &mut bit_pos, part2_3_end, header, gi)
-                });
-                prof::time(&prof::REQUANT, || {
-                    requantize::apply(header, gi, &sf, &coeffs, nz, &mut spectrum.lines[ch])
-                });
-                spectrum.nonzero[ch] = nz;
-            }
-
-            // 7. Joint-stereo (MS / intensity) across the two channels.
-            prof::time(&prof::STEREO, || {
-                stereo::process(header, &si.granules[gr], &scalefac[gr][1], &mut spectrum)
-            });
-
-            out.push(GranuleWork {
-                side: [si.granules[gr][0].clone(), si.granules[gr][1].clone()],
-                spectrum,
-            });
-        }
+        // The pipelined decoder hands granules to another thread, so it needs
+        // them OWNED; this is the one place they are collected.
+        let mut out = Vec::with_capacity(header.version.granules());
+        entropy(
+            &mut self.reservoir,
+            header,
+            side_info_bytes,
+            frame_main_data,
+            |side, spectrum| {
+                out.push(GranuleWork {
+                    side: side.clone(),
+                    spectrum: spectrum.clone(),
+                })
+            },
+        )?;
         Ok(out)
     }
+}
+
+/// The entropy stage over one frame, handing each finished granule to
+/// `granule` by reference (its side info and its spectrum, ready for the
+/// transform stage). A free function over the reservoir alone, so a caller can
+/// lend it the reservoir while holding the transform state for `granule`.
+fn entropy(
+    reservoir: &mut reservoir::Reservoir,
+    header: &FrameHeader,
+    side_info_bytes: &[u8],
+    frame_main_data: &[u8],
+    mut granule: impl FnMut(&[GranuleSideInfo; 2], &mut GranuleSpectrum),
+) -> Result<()> {
+    let channels = header.channel_mode.channels();
+    let granules = header.version.granules();
+
+    // 1. Side information → the per-granule decode recipe.
+    let si: SideInfo = sideinfo::parse(header, side_info_bytes)?;
+
+    // 2. Reassemble main data across the reservoir boundary.
+    let main = reservoir.assemble(si.main_data_begin, frame_main_data);
+
+    let mut bit_pos = 0usize;
+    // Granule 0's scalefactors are retained per channel for granule 1 `scfsi`
+    // reuse.
+    let mut scalefac: [[scalefactors::ScaleFactors; 2]; 2] = Default::default();
+    for gr in 0..granules {
+        let mut spectrum = GranuleSpectrum::default();
+        for ch in 0..channels {
+            let gi = &si.granules[gr][ch];
+            // Block-type census: which IMDCT path this granule/channel takes.
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                let short = gi.window_switching && gi.block_type == crate::frame::BlockType::Short;
+                match (short, gi.mixed_block) {
+                    (true, true) => prof::N_MIXED.fetch_add(1, Relaxed),
+                    (true, false) => prof::N_SHORT.fetch_add(1, Relaxed),
+                    _ => prof::N_LONG.fetch_add(1, Relaxed),
+                };
+            }
+            // part2 (scalefactors) + part3 (Huffman) share one bit budget.
+            let part2_3_start = bit_pos;
+            let prev = (gr == 1).then(|| &scalefac[0][ch]);
+            let sf = prof::time(&prof::SCALEFAC, || {
+                scalefactors::decode(main, &mut bit_pos, header, &si, gr, ch, prev)
+            });
+            let part2_3_end = part2_3_start + gi.part2_3_length as usize;
+            let (coeffs, nz) = prof::time(&prof::HUFFMAN, || {
+                huffman::decode(main, &mut bit_pos, part2_3_end, header, gi)
+            });
+            prof::time(&prof::REQUANT, || {
+                requantize::apply(header, gi, &sf, &coeffs, nz, &mut spectrum.lines[ch])
+            });
+            spectrum.nonzero[ch] = nz;
+            scalefac[gr][ch] = sf;
+        }
+
+        // 7. Joint-stereo (MS / intensity) across the two channels.
+        prof::time(&prof::STEREO, || {
+            stereo::process(header, &si.granules[gr], &scalefac[gr][1], &mut spectrum)
+        });
+
+        granule(&si.granules[gr], &mut spectrum);
+    }
+    Ok(())
 }
 
 /// Entry used by the public decoder once the bricks are in place.

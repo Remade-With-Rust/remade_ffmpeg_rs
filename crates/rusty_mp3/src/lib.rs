@@ -160,10 +160,12 @@ impl Mp3Decoder {
                 pos += 1;
                 continue;
             }
-            let side_info = self.buf[si_start..main_start].to_vec();
-            let main_data = self.buf[main_start..pos + frame_size].to_vec();
+            // The decoder reads both parts straight out of the sync buffer (it
+            // used to copy each into its own `Vec` first, two per frame).
+            let side_info = &self.buf[si_start..main_start];
+            let main_data = &self.buf[main_start..pos + frame_size];
 
-            if let Ok(pcm) = self.state.decode_frame(&header, &side_info, &main_data) {
+            if let Ok(pcm) = self.state.decode_frame(&header, side_info, main_data) {
                 let channels = header.channel_mode.channels().max(1);
                 self.queue.push_back(DecodedAudio {
                     sample_rate: header.sample_rate,
