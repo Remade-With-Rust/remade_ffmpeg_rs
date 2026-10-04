@@ -55,7 +55,7 @@ cd "$work"
 cargo generate-lockfile -q
 echo "== closure"; cargo tree -e normal,dev --prefix none | sort -u
 echo "== cargo audit (H-09)"; cargo audit --deny warnings -q && echo "audit: clean"
-echo "== cargo deny (H-08)"; cargo deny check 2>&1 | grep -E "ok$|error" | tail -3
+echo "== cargo deny (H-08)"; cargo deny --color never check 2>&1 | tail -6   # exit status is cargo-deny's (pipefail); never grep a verdict
 echo "== cargo vet (H-10)"; cargo vet --locked 2>&1 | tail -2
 echo "== SBOM (H-12)"; mkdir -p "$out"
 cargo cyclonedx -q -f json --spec-version 1.5 --no-build-deps --override-filename "$name.cdx"

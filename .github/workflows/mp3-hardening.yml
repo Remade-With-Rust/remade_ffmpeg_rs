@@ -109,9 +109,9 @@ jobs:
             for t in ${spec#*:}; do
               mkdir -p "$dir/work/$t"
               if [ "$secs" -gt 0 ]; then
-                (cd "$dir" && cargo +nightly fuzz run -O $t work/$t corpus/$t -- -max_total_time=$secs -rss_limit_mb=2048 -timeout=10)
+                (cd "$dir" && cargo +nightly fuzz run -O --target x86_64-unknown-linux-gnu $t work/$t corpus/$t -- -max_total_time=$secs -rss_limit_mb=2048 -timeout=10)
               else
-                (cd "$dir" && cargo +nightly fuzz run -O $t work/$t corpus/$t -- -runs=0)
+                (cd "$dir" && cargo +nightly fuzz run -O --target x86_64-unknown-linux-gnu $t work/$t corpus/$t -- -runs=0)
               fi
             done
           done
