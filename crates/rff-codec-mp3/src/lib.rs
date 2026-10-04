@@ -152,60 +152,50 @@ impl Encoder for Mp3Encoder {
             return Ok(());
         };
         let in_ch = af.channels.max(1);
-        let data = &af.planes[0];
         // The PCM/WAV demuxer path delivers S16 (not F32), so we MUST honor
         // `af.format` here — reading s16 bytes with an f32 stride yields
         // denormal garbage (a silent encode). The unit tests only ever fed F32,
         // which is why this once slipped; `s16_input_encodes_to_audible_output`
         // below guards it.
-        match af.format {
-            SampleFormat::F32 => {
-                let mut pcm = Vec::with_capacity(af.samples * in_ch as usize);
-                for s in 0..af.samples {
-                    for c in 0..in_ch as usize {
-                        let off = (s * in_ch as usize + c) * 4;
-                        pcm.push(if off + 4 <= data.len() {
-                            f32::from_le_bytes([
-                                data[off],
-                                data[off + 1],
-                                data[off + 2],
-                                data[off + 3],
-                            ])
-                        } else {
-                            0.0
-                        });
-                    }
-                }
-                let sr = af.sample_rate;
-                self.inner()
-                    .push_pcm_f32(&pcm, in_ch, sr)
-                    .map_err(map_err)?;
-            }
-            SampleFormat::S16 => {
-                let mut pcm = Vec::with_capacity(af.samples * in_ch as usize);
-                for s in 0..af.samples {
-                    for c in 0..in_ch as usize {
-                        let off = (s * in_ch as usize + c) * 2;
-                        pcm.push(if off + 2 <= data.len() {
-                            i16::from_le_bytes([data[off], data[off + 1]])
-                        } else {
-                            0
-                        });
-                    }
-                }
-                let sr = af.sample_rate;
-                self.inner()
-                    .push_pcm_s16(&pcm, in_ch, sr)
-                    .map_err(map_err)?;
-            }
+        let bps = match af.format {
+            SampleFormat::F32 => 4,
+            SampleFormat::S16 => 2,
             other => {
                 return Err(Error::unsupported(format!(
                     "mp3 encode: sample format `{}` (need interleaved s16/f32)",
                     other.name()
                 )))
             }
+        };
+        // The plane goes to the encoder AS BYTES: it converts and deinterleaves
+        // in one pass into its own frame buffer. This used to decode the whole
+        // plane into a `Vec<f32>` / `Vec<i16>` first (and the s16 entry point
+        // then made a second, `f32`, copy) -- on a WAV, which arrives as ONE
+        // frame, that was two or three file-sized temporaries.
+        let need = af.samples * in_ch as usize * bps;
+        let data = &af.planes[0];
+        let padded;
+        let plane: &[u8] = if data.len() >= need {
+            &data[..need]
+        } else {
+            // A short plane: whole samples as-is, missing ones as silence --
+            // what the per-sample bounds check used to produce. Rare, so the
+            // copy lives only here.
+            let whole = data.len() / bps * bps;
+            padded = {
+                let mut v = data[..whole].to_vec();
+                v.resize(need, 0);
+                v
+            };
+            &padded
+        };
+        let sr = af.sample_rate;
+        let inner = self.inner();
+        match bps {
+            4 => inner.push_pcm_f32le(plane, in_ch, sr),
+            _ => inner.push_pcm_s16le(plane, in_ch, sr),
         }
-        Ok(())
+        .map_err(map_err)
     }
 
     fn receive_packet(&mut self) -> Result<Packet> {

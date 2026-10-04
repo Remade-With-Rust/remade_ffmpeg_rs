@@ -446,6 +446,68 @@ impl Mp3Encoder {
         channels: u16,
         sample_rate: u32,
     ) -> Result<()> {
+        let in_ch = (channels as usize).max(1);
+        self.push_with(interleaved.len() / in_ch, channels, sample_rate, |i| {
+            interleaved[i]
+        })
+    }
+
+    /// Push interleaved signed-16-bit PCM. Converts `i16 / 32768.0` — the same
+    /// convention the decoder uses — then follows
+    /// [`push_pcm_f32`](Mp3Encoder::push_pcm_f32).
+    pub fn push_pcm_s16(
+        &mut self,
+        interleaved: &[i16],
+        channels: u16,
+        sample_rate: u32,
+    ) -> Result<()> {
+        let in_ch = (channels as usize).max(1);
+        self.push_with(interleaved.len() / in_ch, channels, sample_rate, |i| {
+            interleaved[i] as f32 / 32768.0
+        })
+    }
+
+    /// Push interleaved **little-endian s16 bytes** — the layout a WAV `data`
+    /// chunk or an FFmpeg-style `AudioFrame` plane already has. Same samples as
+    /// [`push_pcm_s16`](Mp3Encoder::push_pcm_s16) on the decoded values, without
+    /// the caller materialising an `i16` (and then an `f32`) copy of the input
+    /// first. A trailing partial sample is ignored.
+    pub fn push_pcm_s16le(&mut self, bytes: &[u8], channels: u16, sample_rate: u32) -> Result<()> {
+        let in_ch = (channels as usize).max(1);
+        self.push_with(bytes.len() / 2 / in_ch, channels, sample_rate, |i| {
+            i16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]) as f32 / 32768.0
+        })
+    }
+
+    /// Push interleaved **little-endian f32 bytes**; the byte-level twin of
+    /// [`push_pcm_f32`](Mp3Encoder::push_pcm_f32), as
+    /// [`push_pcm_s16le`](Mp3Encoder::push_pcm_s16le) is of `push_pcm_s16`.
+    pub fn push_pcm_f32le(&mut self, bytes: &[u8], channels: u16, sample_rate: u32) -> Result<()> {
+        let in_ch = (channels as usize).max(1);
+        self.push_with(bytes.len() / 4 / in_ch, channels, sample_rate, |i| {
+            let b = &bytes[4 * i..4 * i + 4];
+            f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        })
+    }
+
+    /// The one push path: `samples` per-channel sample instants, interleaved
+    /// sample `i` read through `get`. Converts and deinterleaves STRAIGHT into
+    /// the per-channel staging buffers, one frame at a time, encoding each frame
+    /// as it fills — so the staging never holds more than one frame, whatever
+    /// the caller hands over.
+    ///
+    /// It used to stage the whole push first. A demuxer that delivers a whole
+    /// file as one frame (WAV does) therefore cost a file-sized `f32` copy per
+    /// channel, grown by `push` with no reservation (each regrowth moving
+    /// everything so far), and the s16 entry point added an `f32` copy of the
+    /// whole input on top. Same samples, same order, same frames: byte-identical.
+    fn push_with(
+        &mut self,
+        samples: usize,
+        channels: u16,
+        sample_rate: u32,
+        get: impl Fn(usize) -> f32,
+    ) -> Result<()> {
         if self.header.is_none() {
             self.header = Some(encoder_header(sample_rate, channels, self.cbr_kbps)?);
             // 3R1 reservoir RD — DEFAULT ON for CBR ≤ 256 kbps (2026-07-08). Measured
@@ -481,32 +543,30 @@ impl Mp3Encoder {
             // and causal is streaming-friendly (no full-file PCM buffer). See tune-quality.
             self.resv_lookahead = std::env::var("MP3_RESV_LOOKAHEAD").is_ok_and(|v| v != "0");
         }
-        let nch = self.header.as_ref().unwrap().channel_mode.channels();
+        let header = self.header.as_ref().unwrap();
+        let nch = header.channel_mode.channels();
+        let spf = header.version.samples_per_frame();
         let in_ch = (channels as usize).max(1);
-        // Deinterleave to per-channel f32; if the input has fewer channels than
-        // output, replicate.
-        let samples = interleaved.len() / in_ch;
-        for s in 0..samples {
+        let mut s = 0;
+        while s < samples {
+            if self.pcm[0].len() >= spf {
+                self.drain_frames();
+            }
+            let n = (spf - self.pcm[0].len()).min(samples - s);
+            // Deinterleave to per-channel f32; if the input has fewer channels
+            // than the output, replicate the last one.
             for c in 0..nch {
                 let ic = c.min(in_ch - 1);
-                self.pcm[c].push(interleaved[s * in_ch + ic]);
+                let dst = &mut self.pcm[c];
+                dst.reserve(spf.saturating_sub(dst.len()));
+                dst.extend((s..s + n).map(|k| get(k * in_ch + ic)));
             }
+            s += n;
         }
-        self.drain_frames();
+        if self.pcm[0].len() >= spf {
+            self.drain_frames();
+        }
         Ok(())
-    }
-
-    /// Push interleaved signed-16-bit PCM. Converts `i16 / 32768.0` — the same
-    /// convention the decoder uses — then follows
-    /// [`push_pcm_f32`](Mp3Encoder::push_pcm_f32).
-    pub fn push_pcm_s16(
-        &mut self,
-        interleaved: &[i16],
-        channels: u16,
-        sample_rate: u32,
-    ) -> Result<()> {
-        let f32s: Vec<f32> = interleaved.iter().map(|&s| s as f32 / 32768.0).collect();
-        self.push_pcm_f32(&f32s, channels, sample_rate)
     }
 
     /// Pull the next encoded MP3 packet (one frame, or the prepended Xing/Info
@@ -585,21 +645,28 @@ impl Mp3Encoder {
         // the same `[off..off+spf]` samples in the same order.
         let mut off = 0usize;
         while self.pcm[0].len() - off >= spf && (nch == 1 || self.pcm[1].len() - off >= spf) {
-            let block: Vec<Vec<f32>> = (0..nch)
-                .map(|c| self.pcm[c][off..off + spf].to_vec())
-                .collect();
+            // The frame is BORROWED from the staging buffers: the encoder only
+            // reads it. (It used to be copied into a fresh `Vec<Vec<f32>>` per
+            // frame -- three allocations and a frame of copying, every frame.)
+            let block: [&[f32]; 2] = [
+                &self.pcm[0][off..off + spf],
+                &self.pcm[nch - 1][off..off + spf],
+            ];
+            let block = &block[..nch];
             if self.reservoir && self.resv_lookahead {
-                // Lookahead: buffer PCM; analyse-all + allocate + assemble at flush.
-                self.resv_frames_pcm.push((header.clone(), block));
+                // Lookahead: buffer PCM; analyse-all + allocate + assemble at
+                // flush. This path must OWN the frame, so it alone copies.
+                let owned = block.iter().map(|c| c.to_vec()).collect();
+                self.resv_frames_pcm.push((header.clone(), owned));
                 self.total_frames += 1;
                 self.total_bytes += header.frame_size();
             } else if self.reservoir {
                 // Causal: encode now, bank the raw frame; assemble (B8) at flush.
                 self.state
-                    .encode_frame_reservoir(&header, &block, self.resv_gain);
+                    .encode_frame_reservoir(&header, block, self.resv_gain);
                 self.total_frames += 1;
                 self.total_bytes += header.frame_size();
-            } else if let Ok(bytes) = self.state.encode_frame(&header, &block, self.quality) {
+            } else if let Ok(bytes) = self.state.encode_frame(&header, block, self.quality) {
                 self.total_frames += 1;
                 self.total_bytes += bytes.len();
                 self.queue.push_back(bytes);
@@ -641,6 +708,71 @@ mod tests {
             mp3.extend_from_slice(&p);
         }
         mp3
+    }
+
+    /// Every push entry point, and every way of slicing the input across pushes,
+    /// must produce the SAME bitstream: the byte-level `push_pcm_*le` twins equal
+    /// their typed counterparts, and the frame-at-a-time staging (which encodes
+    /// mid-push as each frame fills) equals one whole push. Chunk sizes are odd
+    /// and straddle frame boundaries, including a chunk smaller than a sample
+    /// frame's worth of channels. Stereo and an MPEG-2 rate (576-sample frames).
+    #[test]
+    fn push_entry_points_and_chunkings_are_byte_identical() {
+        fn drain(mut enc: Mp3Encoder) -> Vec<u8> {
+            enc.finish();
+            let mut mp3 = Vec::new();
+            while let Ok(p) = enc.next_packet() {
+                mp3.extend_from_slice(&p);
+            }
+            mp3
+        }
+        for &(sr, kbps) in &[(44_100u32, 192u32), (22_050, 64)] {
+            let n = 7 * 1152 + 333; // per channel; not a whole number of frames
+            let s16: Vec<i16> = (0..2 * n)
+                .map(|i| {
+                    let t = (i / 2) as f32 / sr as f32;
+                    let f = if i % 2 == 0 { 440.0 } else { 660.0 };
+                    ((2.0 * std::f32::consts::PI * f * t).sin() * 12000.0) as i16
+                })
+                .collect();
+            let f32s: Vec<f32> = s16.iter().map(|&s| s as f32 / 32768.0).collect();
+            let s16le: Vec<u8> = s16.iter().flat_map(|s| s.to_le_bytes()).collect();
+            let f32le: Vec<u8> = f32s.iter().flat_map(|s| s.to_le_bytes()).collect();
+            let cfg = || Mp3EncoderConfig {
+                bitrate_kbps: kbps,
+                vbr_quality: None,
+            };
+
+            let mut enc = Mp3Encoder::new(cfg());
+            enc.push_pcm_s16(&s16, 2, sr).unwrap();
+            let reference = drain(enc);
+            assert!(reference.len() > 1000);
+
+            let mut enc = Mp3Encoder::new(cfg());
+            enc.push_pcm_s16le(&s16le, 2, sr).unwrap();
+            assert_eq!(drain(enc), reference, "s16le whole @ {sr}");
+
+            let mut enc = Mp3Encoder::new(cfg());
+            enc.push_pcm_f32(&f32s, 2, sr).unwrap();
+            assert_eq!(drain(enc), reference, "f32 whole @ {sr}");
+
+            let mut enc = Mp3Encoder::new(cfg());
+            enc.push_pcm_f32le(&f32le, 2, sr).unwrap();
+            assert_eq!(drain(enc), reference, "f32le whole @ {sr}");
+
+            for chunk in [1usize, 37, 1151, 1153, 2304, 5000] {
+                let mut enc = Mp3Encoder::new(cfg());
+                for c in s16.chunks(2 * chunk) {
+                    enc.push_pcm_s16(c, 2, sr).unwrap();
+                }
+                assert_eq!(drain(enc), reference, "s16 chunks of {chunk} @ {sr}");
+                let mut enc = Mp3Encoder::new(cfg());
+                for c in f32le.chunks(8 * chunk) {
+                    enc.push_pcm_f32le(c, 2, sr).unwrap();
+                }
+                assert_eq!(drain(enc), reference, "f32le chunks of {chunk} @ {sr}");
+            }
+        }
     }
 
     /// The native S16 path (`push_pcm_s16`) must produce audible output — the

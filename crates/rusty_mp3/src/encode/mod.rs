@@ -263,10 +263,10 @@ impl Mp3Encode {
     /// `quality` selects the rate mode: `None` is CBR (the header's bitrate);
     /// `Some(target_nmr)` is **VBR** — each granule quantizes to that quality and
     /// the frame's bitrate is picked to fit the result.
-    pub fn encode_frame(
+    pub fn encode_frame<C: AsRef<[f32]>>(
         &mut self,
         header: &FrameHeader,
-        channels: &[Vec<f32>],
+        channels: &[C],
         quality: Option<f32>,
     ) -> Result<Vec<u8>> {
         // B7 (streaming, reservoir-free): the frame's whole region is its own budget.
@@ -284,10 +284,10 @@ impl Mp3Encode {
     /// **3R1** — encode a CBR frame into the reservoir buffer: the causal PE-weighted
     /// budget lets a demanding frame borrow banked bits, an easy one bank them. The raw
     /// frame is stored for B8 assembly at [`finish_reservoir`](Self::finish_reservoir). `gain` is the knob.
-    pub fn encode_frame_reservoir(
+    pub fn encode_frame_reservoir<C: AsRef<[f32]>>(
         &mut self,
         header: &FrameHeader,
-        channels: &[Vec<f32>],
+        channels: &[C],
         gain: f32,
     ) {
         let base = bitstream::region_capacity(header) * 8;
@@ -320,10 +320,10 @@ impl Mp3Encode {
     /// budget chosen by `budget_fn(frame_pe)` — the seam that lets B7 pass a flat
     /// per-region budget and 3R1 pass a reservoir-weighted one. Returns the (possibly
     /// M/S) header, side info, raw main data, and the frame's total perceptual entropy.
-    fn encode_frame_raw(
+    fn encode_frame_raw<C: AsRef<[f32]>>(
         &mut self,
         header: &FrameHeader,
-        channels: &[Vec<f32>],
+        channels: &[C],
         quality: Option<f32>,
         budget_fn: impl FnOnce(f32) -> usize,
     ) -> (FrameHeader, SideInfo, Vec<u8>, f32) {
@@ -349,24 +349,30 @@ impl Mp3Encode {
     /// principle* (force-M/S beat it by up to +0.07 ODG) but oscillates the mode every
     /// frame → triggers the switching bug. OPT-IN until that bug is root-caused; a robust
     /// version needs hysteresis to keep switches blocky. `lr`/`ms` force a fixed mode.
-    fn decide_stereo(&self, channels: &[Vec<f32>], granules: usize, sample_rate: u32) -> bool {
+    fn decide_stereo<C: AsRef<[f32]>>(
+        &self,
+        channels: &[C],
+        granules: usize,
+        sample_rate: u32,
+    ) -> bool {
+        let (l, r) = (channels[0].as_ref(), channels[1].as_ref());
         match std::env::var("MP3_STEREO").as_deref() {
             Ok("lr") => return false,
             Ok("ms") => return true,
             Ok("pe") => {
-                let ms = stereo::mid_side(&channels[0], &channels[1]);
+                let ms = stereo::mid_side(l, r);
                 let (mut pe_lr, mut pe_ms) = (0f32, 0f32);
                 let pe = |pcm: &[f32]| psychoacoustic::analyze(pcm, sample_rate).perceptual_entropy;
                 for gr in 0..granules {
                     let s = gr * GRANULE_LINES;
-                    pe_lr += pe(&channels[0][s..]) + pe(&channels[1][s..]);
+                    pe_lr += pe(&l[s..]) + pe(&r[s..]);
                     pe_ms += pe(&ms[0][s..]) + pe(&ms[1][s..]);
                 }
                 return pe_ms < pe_lr;
             }
             _ => {}
         }
-        stereo::prefer_mid_side(&channels[0], &channels[1])
+        stereo::prefer_mid_side(l, r)
     }
 
     /// Analyse one frame (M/S decision, block-switch FSM, filterbank → MDCT → psymodel
@@ -374,7 +380,11 @@ impl Mp3Encode {
     /// once. Splitting this from [`quantize_frame`] lets the 3R1 lookahead path analyse
     /// every frame first (to know the global perceptual-entropy distribution) and only
     /// then choose per-frame budgets.
-    fn analyze_frame(&mut self, header: &FrameHeader, channels: &[Vec<f32>]) -> FrameAnalysis {
+    fn analyze_frame<C: AsRef<[f32]>>(
+        &mut self,
+        header: &FrameHeader,
+        channels: &[C],
+    ) -> FrameAnalysis {
         let nch = header.channel_mode.channels();
         let granules = header.version.granules();
 
@@ -387,24 +397,22 @@ impl Mp3Encode {
         let mut ms = std::mem::take(&mut self.ms_scratch);
         if use_ms {
             let [m, s] = &mut ms;
-            stereo::mid_side_into(&channels[0], &channels[1], m, s);
+            stereo::mid_side_into(channels[0].as_ref(), channels[1].as_ref(), m, s);
         }
         // Bind the RAW channels into a fixed-size array too, exactly as `coded`
-        // below. `channels` is a `&[Vec<f32>]`, so every `channels[ch]` is a bounds
+        // below. `channels` is a slice, so every `channels[ch]` is a bounds
         // check against a length the compiler cannot know, and the granule slice
         // that follows is a second one -- paid per granule, per channel, in the
         // attack scan and again in the filterbank loop.
         let raw: [&[f32]; 2] = if nch == 2 {
-            [channels[0].as_slice(), channels[1].as_slice()]
+            [channels[0].as_ref(), channels[1].as_ref()]
         } else {
-            [channels[0].as_slice(), channels[0].as_slice()]
+            [channels[0].as_ref(), channels[0].as_ref()]
         };
         let coded: [&[f32]; 2] = if use_ms {
             [ms[0].as_slice(), ms[1].as_slice()]
-        } else if nch == 2 {
-            [channels[0].as_slice(), channels[1].as_slice()]
         } else {
-            [channels[0].as_slice(), channels[0].as_slice()]
+            raw
         };
         let mut fheader = header.clone();
         if use_ms {
