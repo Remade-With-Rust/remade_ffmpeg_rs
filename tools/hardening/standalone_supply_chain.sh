@@ -32,10 +32,19 @@ PY="$(command -v python3 || command -v python)"
 "$PY" - "$root/Cargo.toml" "$work/Cargo.toml" <<'PY'
 import re, sys
 root = open(sys.argv[1], encoding="utf-8-sig").read()
-deps = {}
-for m in re.finditer(r'^([A-Za-z0-9_-]+)\s*=\s*(.+)$', root.split("[workspace.dependencies]")[1].split("\n[")[0], re.M):
-    deps[m.group(1)] = m.group(2).strip()
+def table(name):
+    if f"[{name}]" not in root:
+        return {}
+    body = root.split(f"[{name}]")[1].split("\n[")[0]
+    return {m.group(1): m.group(2).strip()
+            for m in re.finditer(r'^([A-Za-z0-9_-]+)\s*=\s*(.+?)\s*$', body, re.M)}
+deps, pkg = table("workspace.dependencies"), table("workspace.package")
 man = open(sys.argv[2], encoding="utf-8").read()
+head, sep, rest = man.partition("\n[dependencies]")
+# [package] fields inherited from [workspace.package] (an edition dropped here would
+# silently fall back to 2015).
+head = re.sub(r'^([A-Za-z0-9_-]+)\.workspace\s*=\s*true\s*$',
+              lambda m: f"{m.group(1)} = {pkg[m.group(1)]}", head, flags=re.M)
 def sub(m):
     spec = deps[m.group(1)]
     if spec.startswith('"'):
@@ -45,9 +54,8 @@ def sub(m):
         return m.group(0)
     ver = v.group(1)
     return f'{m.group(1)} = "{ver if ver.startswith("=") else "=" + ver}"'
-man = re.sub(r'^([A-Za-z0-9_-]+)\.workspace\s*=\s*true\s*$', sub, man, flags=re.M)
-man = re.sub(r'^(version|edition|license|repository|rust-version|authors)\.workspace\s*=\s*true\s*$', '', man, flags=re.M)
-open(sys.argv[2], "w", encoding="utf-8").write(man + "\n[workspace]\n")
+rest = re.sub(r'^([A-Za-z0-9_-]+)\.workspace\s*=\s*true\s*$', sub, rest, flags=re.M)
+open(sys.argv[2], "w", encoding="utf-8").write(head + sep + rest + "\n[workspace]\n")
 PY
 
 cp "$root/deny.toml" "$work/"
@@ -56,7 +64,13 @@ cargo generate-lockfile -q
 echo "== closure"; cargo tree -e normal,dev --prefix none | sort -u
 echo "== cargo audit (H-09)"; cargo audit --deny warnings -q && echo "audit: clean"
 echo "== cargo deny (H-08)"; cargo deny --color never check 2>&1 | tail -6   # exit status is cargo-deny's (pipefail); never grep a verdict
-echo "== cargo vet (H-10)"; cargo vet --locked 2>&1 | tail -2
+echo "== cargo vet (H-10)"
+if [ -n "${VET_UPDATE:-}" ]; then
+  # First run / store maintenance: fetch imports, then write the store back to the crate.
+  cargo vet 2>&1 | tail -40 || true
+  cp supply-chain/*.toml supply-chain/imports.lock "$crate_dir/supply-chain/" 2>/dev/null || true
+fi
+cargo vet --locked 2>&1 | tail -2
 echo "== SBOM (H-12)"; mkdir -p "$out"
 cargo cyclonedx -q -f json --spec-version 1.5 --no-build-deps --override-filename "$name.cdx"
 cp "$name.cdx.json" "$out/" && echo "sbom: $out/$name.cdx.json"

@@ -63,10 +63,13 @@ jobs:
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.19.9,cargo-vet@0.10.2,cargo-cyclonedx@0.5.9
       - run: bash tools/hardening/standalone_supply_chain.sh crates/rusty_mp3 "$RUNNER_TEMP/sbom"
+      - run: bash tools/hardening/standalone_supply_chain.sh crates/rff-codec-mp3 "$RUNNER_TEMP/sbom"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: rusty_mp3-sbom
-          path: ${{ runner.temp }}/sbom/rusty_mp3.cdx.json
+          name: mp3-sbom
+          path: |
+            ${{ runner.temp }}/sbom/rusty_mp3.cdx.json
+            ${{ runner.temp }}/sbom/rff-codec-mp3.cdx.json
 
   conformance:
     name: ISO 11172-4 / 13818-4 differential (16 vectors)
