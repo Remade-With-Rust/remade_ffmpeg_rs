@@ -9,8 +9,12 @@ dependencies, no C, no FFI, Apache-2.0. MP3's patents expired in 2017 — the
 format is royalty-free everywhere.
 
 - **Decoder**: full MPEG-1/2/2.5 Layer III — bit reservoir, all stereo modes
-  (including mid/side and intensity), alias reduction, hybrid IMDCT, polyphase
-  synthesis. **Bit-exact against FFmpeg** on our conformance corpus.
+  (including mid/side and both MPEG-1 and MPEG-2 intensity stereo), mixed
+  blocks, alias reduction, hybrid IMDCT, polyphase synthesis. **Passes all 16
+  ISO 11172-4 / 13818-4 Layer III conformance vectors** and is **bit-exact
+  against FFmpeg on 678/678 corpus streams**. One deliberate exception: on
+  MPEG-2 intensity stereo with illegal or top-band positions we follow the spec
+  (and the ISO reference output), where FFmpeg does not.
 - **Encoder**: to our knowledge the **first pure-Rust MP3 encoder on
   crates.io** — existing options are FFI bindings to LAME. MPEG-1/2/2.5, CBR
   and VBR, mono/stereo/joint (mid/side) stereo, psychoacoustic model with
@@ -21,6 +25,51 @@ format is royalty-free everywhere.
   MPEG-2/2.5 (fixed-frame path is used there instead); per-band shaping is
   MPEG-1 only, because the LSF scalefactor scheme is unimplemented; and the
   psychoacoustic model still has no short-block thresholds.
+
+## What's new in 0.9.0
+
+**Decoder conformance.** Five defects, found by running the official ISO
+vectors. Our FFmpeg-matched corpus could not reach them because LAME never
+emits the features involved:
+
+- **Intensity stereo**, both forms: MPEG-1 (tan law, illegal position 7) and
+  MPEG-2 (the 32-entry tables, illegal positions, per-window bounds on short
+  blocks, M/S only below the bound). Fixes `l3-he_mode`, `l3-test45` and
+  `l3-test46`.
+- **Mixed blocks**, two defects: the long part used the wrong band limit on LSF
+  streams, and the IMDCT applied the short window to the two long subbands.
+- **count1 overread**: a final quad that runs past `part2_3_length` is now
+  dropped, as FFmpeg does, unless it fills the granule to line 576.
+
+ISO gate: **16/16** on x86_64 and on aarch64, on both the SIMD and the scalar
+paths. Decode stays bit-exact with FFmpeg on all 678 corpus streams.
+
+**MPEG-2 intensity stereo vs FFmpeg.** On positions that are illegal for their
+band, or in the top band, the ISO reference PCM (`l3-test45/46`) and FFmpeg
+disagree. We match the reference. This is the one place our output differs from
+FFmpeg's.
+
+**Short-block noise shaping (encoder).** Short blocks used to quantize every
+(band, window) at one gain with flat scalefactors. They are now shaped against
+the long-block thresholds mapped onto the short grid: **+0.0052 ODG mean, 31
+better / 5 worse / 8 tied (sign z = +4.3)**, largest on mixed speech/music
+(+0.028). The speed cost is below measurement resolution.
+`MP3_SHORT_SHAPE=0` reproduces the pre-shaping encoder byte for byte.
+
+**SIMD on every arch we ship.**
+
+| change | effect |
+| ------ | ------ |
+| NEON twins of the three decode kernels (IMDCT-36, matrixing, windowing) | aarch64 was scalar; on x86 the same kernels are worth **1.60×** decode |
+| one `#[target_feature]` entry per granule, so the decode kernels inline | 68 → 2 feature crossings per granule-channel |
+| circular analysis FIFO + AVX/NEON analysis filterbank | encode **1.18–1.25×** |
+| AVX/NEON quantizer inner loop | encode **1.08–1.10×** |
+
+Every kernel is **bit-identical** to its scalar twin (separate mul+add, never
+FMA). Each encoder change was byte-identical to its predecessor on 72/72 corpus
+encodes, and decode hashes match across arms on 720/720 streams. NEON was
+verified under qemu-aarch64; speed on real ARM hardware has not been measured.
+`MP3_ISA=scalar` forces the scalar path.
 
 ## Quality
 
@@ -59,9 +108,10 @@ loss to an inert distortion loop. The loop was not inert by design — it was
 comparing two different units. Those figures are not comparable to the table above
 because the corpus differs; the regeneration command is given so this one is.*
 
-**Still open:** the psychoacoustic model produces no short-block thresholds, so
-short blocks — the window type that exists to control pre-echo — quantize without
-a masking model behind them. Per-band shaping is MPEG-1 only. Full evidence,
+**Still open:** the psychoacoustic model produces no short-block thresholds.
+Since 0.9.0 short blocks are shaped, but against long-block thresholds mapped onto
+the short grid rather than a real short-block masking model. Per-band shaping is
+MPEG-1 only. Full evidence,
 per-class tables and the measurement method are in
 [`docs/plans/mp3-gate-ledger.md`](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/docs/plans/mp3-gate-ledger.md).
 
@@ -236,7 +286,7 @@ every sample, 17% of its own runtime, work FFmpeg never did. A CLI-to-CLI
 comparison with those in place read 1.20× *behind* — it was measuring the output
 path, not the codec.
 
-### Decode — 0.5.0 (SIMD)### Decode — 0.5.0 (SIMD)
+### Decode — 0.5.0 (SIMD)
 
 Two AVX kernels in the synthesis filterbank, both **bit-identical** to their
 scalar twins (each output owns a lane and accumulates in the original order;
