@@ -16,7 +16,10 @@ What it enforces:
 * **The arm's own internal duration**, parsed from its output, so process launch
   is excluded (it inflates the shorter arm by a larger fraction).
 
-    python tools/bench/pinab.py <armA.exe> <armB.exe> <input.wav> [kbps] [rounds]
+    python tools/bench/pinab.py <armA> <armB> <input.wav> [kbps] [rounds]
+
+An arm is an executable path, or `KEY=VAL[,KEY=VAL]:path` to run the same
+binary with an env knob set -- e.g. `MP3_SHORT_SHAPE=0:target/.../encprof.exe`.
 """
 import os
 import re
@@ -31,10 +34,25 @@ PIN_CPU = int(os.environ.get("PIN_CPU", "4"))
 DUR = re.compile(r"total ([\d.]+) ms")
 
 
-def run(exe, args):
+def split_arm(arm):
+    """An arm is `path` or `KEY=VAL[,KEY=VAL...]:path` -- the env form lets two
+    arms be the SAME binary with one knob flipped, which is the cleanest A/B there
+    is (nothing but the knob differs). Windows drive letters (`F:\`) are not
+    mistaken for the separator: the env part must contain `=`."""
+    head, sep, tail = arm.partition(":")
+    if sep and "=" in head and not os.path.exists(arm):
+        env = dict(kv.split("=", 1) for kv in head.split(","))
+        return tail, env
+    return arm, {}
+
+
+def run(arm, args):
     """One pinned, High-priority run; returns the arm's self-reported ms."""
+    exe, extra = split_arm(arm)
+    env = dict(os.environ)
+    env.update(extra)
     p = subprocess.Popen([exe] + args, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True)
+                         stderr=subprocess.STDOUT, text=True, env=env)
     try:
         h = psutil.Process(p.pid)
         h.cpu_affinity([PIN_CPU])

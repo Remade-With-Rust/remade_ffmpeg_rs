@@ -162,6 +162,47 @@ round-trip SNR to **5.7 dB**. `shaping_allowed()` restricts shaping to MPEG-1 un
 the LSF scalefactor scheme exists. **Missing arm** (great-gate §3 category 1) —
 build the arm before gating it.
 
+### G4 — short-block noise shaping: `shortblock::quantize_short_slack` (✅ gated, default ON)
+
+**Unit** short granule · **arms** shaped (default) / `MP3_SHORT_SHAPE=0` · **fallback**
+`MP3_SHORT_SHAPE=0`, proven **byte-identical** to the pre-change encoder with `cmp`
+on all three real clips.
+
+The short path quantized every (band, window) at one global gain with FLAT
+scalefactors -- the shape the long path had before G1, and slack for the same reason.
+This holds the gain fixed and raises the worst-masked (band, window) scalefactor
+while the granule still fits (bands 0..5 cap at 15, 6..11 at 7). Thresholds are the
+long bands mapped onto the short grid by minimum; only the ranking uses them.
+
+**Verdict** (external PEAQ, `noshort` vs `slack`, 8 synthetic classes + 3 real
+24 s clips x 96/128/160/192): **+0.0052 ODG mean, 31 better / 5 worse / 8 tied,
+sign z = +4.3**. Wins sit where short blocks fire: mixed-speech-music +0.028 (all
+rates positive), stereo-wide +0.016, speech-clean +0.008 (all rates positive); real
+music ±0.000 (2.6% short). **Worst point −0.0010** (guitar @160k).
+
+**Speed:** below instrument resolution on the heaviest short-block content
+(speech, 31.8% short): 0.991x min / 1.010x median, z = −1.00, null floor 2.2%
+(`pinab.py`, 16 pairs). Work: one Huffman table selection per accepted step.
+
+**Conformance:** 16/16 shaped streams decode identically in FFmpeg and in our
+decoder; 18/18 format-matrix cells.
+
+### Refuted on COUNTS before any PEAQ (2026-10-03)
+
+The three long-block tools LAME uses and we did not. Each was priced by a
+deterministic counter on the three real clips at 128/192 kbps, and each is dead on
+arithmetic -- recorded so they are not rebuilt:
+
+| lever | what it would serve | measured | verdict |
+|---|---|---|---|
+| `scalefac_scale` (doubles every band's range) | refinement steps whose preferred band sat at its `max_sf` cap | **0-63 of 2,279-4,302 steps (≤1.6%)**; vocal 0 | pruned |
+| lossless `preflag` (pretab absorbs the high bands) | shaped granules with ALL of bands 11..20 ≥ pretab | **0 granules** | pruned |
+| `scfsi` (granule 1 reuses granule 0's groups) | granule-1 groups equal to granule 0's and non-zero, re-coded | **0.1 bits/granule** (100-190 bits per 24 s clip) | pruned |
+
+Counters: `prof::CAP_BLOCK_LO/HI`, `prof::PREFLAG_OK` (encprof), and the `scfsi`
+line in `bscensus`. A preflag used as free high-band SHAPING (not lossless) and an
+scfsi-steered granule 1 are different, RD-changing levers and remain untested.
+
 ---
 
 ## P1 signal audit — what the psychoacoustic model contributes
@@ -275,7 +316,9 @@ charging the thing it measures.
    by the level/shape law above, unlike the global one that was refuted twice).
 2. **The percussive/speech short-block inversion** (5.2% vs 31.8%) -- still open.
    The speech-clean unspent-bits finding is closed (see above).
-3. **Short-block thresholds** — `psychoacoustic::analyze` still hardwires
+3. **Short-block thresholds** — G4 shapes short blocks on long thresholds mapped
+   to the short grid; a real short-block psymodel would sharpen its ranking, and
+   `subblock_gain` only makes sense on top of one. `psychoacoustic::analyze` still hardwires
    `block_type: Long` and emits no short-block grid; `detect_attack`'s `RATIO = 10`
    is coupled to that and cannot be tuned until it exists.
 4. **A real percussive clip** and per-channel stereo PEAQ, to close the corpus gaps.

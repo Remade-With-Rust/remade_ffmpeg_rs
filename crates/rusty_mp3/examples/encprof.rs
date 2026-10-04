@@ -99,6 +99,16 @@ fn main() {
     println!("  SF OVERFLOW (pre-fix guard would have truncated): {ovf}");
     let rs = prof::REFINE_STEPS.load(Relaxed);
     println!("  refine steps accepted: {rs}");
+    println!(
+        "  short-block refine steps accepted: {}",
+        prof::SHORT_REFINE_STEPS.load(Relaxed)
+    );
+    println!(
+        "  cap-blocked refinement steps: low {} high {}   preflag-eligible granules: {}",
+        prof::CAP_BLOCK_LO.load(Relaxed),
+        prof::CAP_BLOCK_HI.load(Relaxed),
+        prof::PREFLAG_OK.load(Relaxed)
+    );
     let it = prof::OUTER_ITERS.load(Relaxed);
     println!(
         "  outer iterations: {it} total, {:.1} per long granule -- {} of them discarded",
@@ -132,7 +142,14 @@ fn main() {
     let hist: Vec<u64> = prof::NMR_HIST.iter().map(|a| a.load(Relaxed)).collect();
     let hsum: u64 = hist.iter().sum();
     let labels = [
-        "<1e-6", "1e-6", "1e-5", "1e-4", "1e-3", "1e-2", "0.1-1", ">=1 AUDIBLE",
+        "<1e-6",
+        "1e-6",
+        "1e-5",
+        "1e-4",
+        "1e-3",
+        "1e-2",
+        "0.1-1",
+        ">=1 AUDIBLE",
     ];
     println!("  NMR distribution over {hsum} coded bands (noise / masking threshold):");
     for (l, n) in labels.iter().zip(&hist) {

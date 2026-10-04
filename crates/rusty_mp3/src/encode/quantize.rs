@@ -298,19 +298,19 @@ fn quantize_into(
     sfx[21] = 0;
     for b in 0..22 {
         let s = sfx[b];
-                                                       // step = scale_inv^(3/4): the per-band factor applied to the precomputed
-                                                       // |freq|^(3/4), instead of re-powering |freq|·scale_inv per line.
-                                                       //
-                                                       // Prometheus `perf002` (PRUNED 2026-07-08): factoring this into
-                                                       // `2^(0.75·base)·LUT[sf]` (per-band `powf`→LUT) was byte-identical but NOT
-                                                       // measurably faster (delta within run-to-run noise). Unlike xrpow's
-                                                       // `powf(0.75)` (arbitrary exponent → a real libm call → 8×), `2f64.powf(y)`
-                                                       // is base-2 and LLVM already lowers it to a fast `exp2` — so a LUT saves
-                                                       // nothing. Reverted; recorded in the Prometheus ledger.
-                                                       // VERIFIED 2026-07-08 at the asm level: rewriting these four base-2
-                                                       // `2f64.powf(x)` sites as explicit `x.exp2()` left the emitted call
-                                                       // counts identical (exp2=15/pow=10/powf=4 both ways) — the compiler
-                                                       // already does it, so `powf→exp2` is a genuine no-op. Don't re-try it.
+        // step = scale_inv^(3/4): the per-band factor applied to the precomputed
+        // |freq|^(3/4), instead of re-powering |freq|·scale_inv per line.
+        //
+        // Prometheus `perf002` (PRUNED 2026-07-08): factoring this into
+        // `2^(0.75·base)·LUT[sf]` (per-band `powf`→LUT) was byte-identical but NOT
+        // measurably faster (delta within run-to-run noise). Unlike xrpow's
+        // `powf(0.75)` (arbitrary exponent → a real libm call → 8×), `2f64.powf(y)`
+        // is base-2 and LLVM already lowers it to a fast `exp2` — so a LUT saves
+        // nothing. Reverted; recorded in the Prometheus ledger.
+        // VERIFIED 2026-07-08 at the asm level: rewriting these four base-2
+        // `2f64.powf(x)` sites as explicit `x.exp2()` left the emitted call
+        // counts identical (exp2=15/pow=10/powf=4 both ways) — the compiler
+        // already does it, so `powf→exp2` is a genuine no-op. Don't re-try it.
         let step = step_base * sf_step[s as usize];
         let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
         for i in lo..hi {
@@ -552,8 +552,15 @@ pub fn loops(
         let huff_budget = bit_budget.saturating_sub(sf_bits);
 
         let mut coeffs = [0i32; GRANULE_LINES];
-        let (gain, inner) =
-            inner_gain(header, freq, &xrp, &sf, huff_budget, block_type, &mut coeffs);
+        let (gain, inner) = inner_gain(
+            header,
+            freq,
+            &xrp,
+            &sf,
+            huff_budget,
+            block_type,
+            &mut coeffs,
+        );
         // Reuse the quantization + Huffman selection the rate loop already did at
         // the winning gain (perf004); recompute only in the rare uncached case.
         let mut side = match inner {
@@ -727,6 +734,29 @@ fn loops_slack(
                 worst = Some(b);
             }
         }
+        // Census: would the ranking have preferred a band that is already capped?
+        {
+            let mut any_best = None;
+            let mut any_score = f32::NEG_INFINITY;
+            for (bb, &n) in noise.iter().enumerate() {
+                let thr = (psy.thresholds[bb] * domain_scale).max(1e-20);
+                let sc = n / thr;
+                if sc > any_score && (!audible_only || n > thr) {
+                    any_score = sc;
+                    any_best = Some(bb);
+                }
+            }
+            if let Some(bb) = any_best {
+                if sf[bb] >= max_sf(bb) {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    if bb < 11 {
+                        super::prof::CAP_BLOCK_LO.fetch_add(1, Relaxed);
+                    } else {
+                        super::prof::CAP_BLOCK_HI.fetch_add(1, Relaxed);
+                    }
+                }
+            }
+        }
         let Some(b) = worst else { break };
 
         let mut trial = sf;
@@ -764,6 +794,8 @@ fn loops_slack(
     super::prof::OUTER_TOTAL.fetch_add(1, Relaxed);
     if sf.iter().all(|&v| v == 0) {
         super::prof::OUTER_KEPT0.fetch_add(1, Relaxed);
+    } else if (11..21).all(|b| sf[b] >= crate::tables::PRETAB[b]) {
+        super::prof::PREFLAG_OK.fetch_add(1, Relaxed);
     }
 
     QuantizedGranule {
@@ -914,8 +946,12 @@ pub fn loops_vbr(
         N.fetch_add(1, Relaxed);
         SUM_LO.fetch_add(lo.max(0) as u64, Relaxed);
         SUM_FLOOR.fetch_add(floor.max(0) as u64, Relaxed);
-        if floor > lo { CLAMPED.fetch_add(1, Relaxed); }
-        if lo >= 255 { SATURATED.fetch_add(1, Relaxed); }
+        if floor > lo {
+            CLAMPED.fetch_add(1, Relaxed);
+        }
+        if lo >= 255 {
+            SATURATED.fetch_add(1, Relaxed);
+        }
         let n = N.load(Relaxed);
         if n % 2000 == 0 {
             // What does the NMR actually read at the extremes?

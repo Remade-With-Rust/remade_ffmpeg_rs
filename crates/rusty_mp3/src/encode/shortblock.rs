@@ -98,6 +98,193 @@ pub fn quantize_short(
     }
 }
 
+/// Largest short scalefactor for band `b` under the MPEG-1 table: `slen1 <= 4`
+/// covers bands 0..=5, but `slen2 <= 3` covers 6..=11 (the same ceiling the long
+/// path learned the hard way -- see `quantize::max_sf`).
+#[inline]
+fn max_sf_short(b: usize) -> u8 {
+    if b < 6 {
+        15
+    } else {
+        7
+    }
+}
+
+/// Smallest `scalefac_compress` covering the short scalefactors, and its cost:
+/// each slen is paid for 6 bands x 3 windows.
+fn choose_compress_short(sf: &[[u8; 12]; 3]) -> (u16, usize) {
+    let max_in = |r: std::ops::Range<usize>| {
+        sf.iter()
+            .flat_map(|w| w[r.clone()].iter().copied())
+            .max()
+            .unwrap_or(0)
+    };
+    let bits = |v: u8| {
+        if v == 0 {
+            0
+        } else {
+            8 - v.leading_zeros() as u8
+        }
+    };
+    let (need1, need2) = (bits(max_in(0..6)), bits(max_in(6..12)));
+    for (idx, &(s1, s2)) in tables::SCALEFAC_COMPRESS_V1.iter().enumerate() {
+        if s1 >= need1 && s2 >= need2 {
+            return (idx as u16, 18 * s1 as usize + 18 * s2 as usize);
+        }
+    }
+    debug_assert!(
+        false,
+        "short scalefactors exceed the table; clamp with max_sf_short"
+    );
+    (15, 18 * 4 + 18 * 3)
+}
+
+/// Re-quantize one (band, window) run in bitstream order at `gain` with
+/// scalefactor `s`: the forward of the decoder's short requantization
+/// (`2^(0.25·gain − 0.5·sf)`, `subblock_gain = 0`).
+#[allow(clippy::too_many_arguments)]
+fn quantize_run(
+    freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
+    gain: i32,
+    s: u8,
+    lo: usize,
+    hi: usize,
+    coeffs: &mut [i32; GRANULE_LINES],
+) {
+    let step = 2f64.powf(0.75 * (-0.25 * (gain - 210) as f64 + 0.5 * s as f64));
+    for i in lo..hi {
+        let mag = super::quantize::level_from(xrp[i] * step);
+        coeffs[i] = if freq[i] < 0.0 { -mag } else { mag };
+    }
+}
+
+/// Noise energy of one (band, window) run at `gain` with scalefactor `s`.
+fn run_noise(
+    freq: &[f32; GRANULE_LINES],
+    coeffs: &[i32; GRANULE_LINES],
+    gain: i32,
+    s: u8,
+    lo: usize,
+    hi: usize,
+) -> f32 {
+    let scale = 2f64.powf(0.25 * (gain - 210) as f64 - 0.5 * s as f64);
+    let mut e = 0f64;
+    for i in lo..hi {
+        let xr = coeffs[i].signum() as f64 * super::quantize::requant_magnitude(coeffs[i]) * scale;
+        let d = freq[i] as f64 - xr;
+        e += d * d;
+    }
+    e as f32
+}
+
+/// Whether short-block shaping is on (`MP3_SHORT_SHAPE=0` restores the flat,
+/// byte-identical pre-shaping encoder). Read once.
+fn short_shape_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("MP3_SHORT_SHAPE").as_deref() != Ok("0"))
+}
+
+/// **Short-block noise shaping: spend the bits the rate loop could not.**
+///
+/// The short path quantized every (band, window) at one global gain with flat
+/// scalefactors -- exactly the shape the LONG path had before G1, and for the
+/// same reason it leaves slack: a gain step is ~1.5 dB and cannot land on a bit
+/// budget. This holds that gain FIXED and raises the scalefactor of the
+/// worst-masked (band, window) while the granule still fits, so no run ever gets
+/// coarser and every accepted step is a strict improvement paid for from bits that
+/// were otherwise stuffing.
+///
+/// Thresholds are the long-band ones mapped onto the short grid by MINIMUM (see
+/// [`short_thresholds`]) -- the conservative proxy for the short-block psymodel
+/// this encoder does not have yet. Only the RANKING uses them, so their absolute
+/// level cancels (the level/shape law in `docs/plans/mp3-gate-ledger.md`).
+/// MPEG-1 only, like long-block shaping: the LSF scalefactor writer does not exist.
+pub fn quantize_short_slack(
+    header: &FrameHeader,
+    freq_bitstream: &[f32; GRANULE_LINES],
+    bit_budget: usize,
+    long_thresholds: &[f32; crate::frame::SFB_LONG],
+    signal_energy: f32,
+) -> QuantizedGranule {
+    let mut q = quantize_short(header, freq_bitstream, bit_budget);
+    if !short_shape_enabled() || header.version != crate::header::MpegVersion::V1 {
+        return q;
+    }
+    let gain = q.side.global_gain as i32;
+    let xrp = super::quantize::xrpow(freq_bitstream);
+    let off = tables::sfb_short_offsets(header.sample_rate);
+    let mdct_energy: f32 = freq_bitstream.iter().map(|x| x * x).sum();
+    let domain = if signal_energy > 1e-20 && mdct_energy > 1e-20 {
+        mdct_energy / signal_energy
+    } else {
+        1.0
+    };
+    let thr = short_thresholds(header.sample_rate, long_thresholds);
+    // Bitstream order: band b, window w occupies [3·off[b] + w·width, +width).
+    let run = |b: usize, w: usize| {
+        let width = (off[b + 1] - off[b]) as usize;
+        let lo = (3 * off[b] as usize + w * width).min(GRANULE_LINES);
+        (lo, (lo + width).min(GRANULE_LINES))
+    };
+    let mut sf = [[0u8; 12]; 3];
+    let mut noise = [[0f32; 12]; 3];
+    for (w, nw) in noise.iter_mut().enumerate() {
+        for (b, n) in nw.iter_mut().enumerate() {
+            let (lo, hi) = run(b, w);
+            *n = run_noise(freq_bitstream, &q.coeffs, gain, 0, lo, hi);
+        }
+    }
+    let mut coeffs = q.coeffs;
+    let (mut side, mut compress) = (q.side.clone(), 0u16);
+    for _ in 0..36 {
+        let mut pick = None;
+        let mut worst = f32::NEG_INFINITY;
+        for w in 0..3 {
+            for b in 0..12 {
+                let score = noise[w][b] / (thr[b] * domain).max(1e-20);
+                if sf[w][b] < max_sf_short(b) && score > worst {
+                    worst = score;
+                    pick = Some((w, b));
+                }
+            }
+        }
+        let Some((w, b)) = pick else { break };
+        let mut trial = sf;
+        trial[w][b] += 1;
+        let (t_compress, t_sf_bits) = choose_compress_short(&trial);
+        let (lo, hi) = run(b, w);
+        quantize_run(freq_bitstream, &xrp, gain, trial[w][b], lo, hi, &mut coeffs);
+        let clipped = coeffs[lo..hi].iter().any(|&c| c.abs() > MAX_UNCLIPPED);
+        let fit = if clipped {
+            None
+        } else {
+            let (t_side, t_bits) = super::huffman::select(header, &coeffs, BlockType::Short);
+            (t_bits + t_sf_bits <= bit_budget).then_some(t_side)
+        };
+        let Some(t_side) = fit else {
+            quantize_run(freq_bitstream, &xrp, gain, sf[w][b], lo, hi, &mut coeffs);
+            break;
+        };
+        noise[w][b] = run_noise(freq_bitstream, &coeffs, gain, trial[w][b], lo, hi);
+        sf = trial;
+        side = t_side;
+        compress = t_compress;
+        super::prof::SHORT_REFINE_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    side.global_gain = gain as u8;
+    side.scalefac_compress = compress;
+    q.coeffs = coeffs;
+    q.side = side;
+    // Layout shared with the caller: scalefactors[3·band + window].
+    for (w, sw) in sf.iter().enumerate() {
+        for (b, &v) in sw.iter().enumerate() {
+            q.scalefactors[3 * b + w] = v;
+        }
+    }
+    q
+}
+
 /// **Q5 block-type FSM.** Given the previous granule's window type and this
 /// frame's per-granule attack flags, choose valid window types that bracket every
 /// attack with the required transition windows. Produces sequences like
@@ -285,9 +472,8 @@ fn short_band_noise(
         );
         let mut e = 0f64;
         for i in lo..hi {
-            let xr = coeffs[i].signum() as f64
-                * super::quantize::requant_magnitude(coeffs[i])
-                * scale;
+            let xr =
+                coeffs[i].signum() as f64 * super::quantize::requant_magnitude(coeffs[i]) * scale;
             let d = freq_bs[i] as f64 - xr;
             e += d * d;
         }

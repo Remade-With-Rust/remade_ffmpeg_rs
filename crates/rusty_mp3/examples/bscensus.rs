@@ -74,6 +74,10 @@ struct Census {
     avail_sum: usize,
     bytes: usize,
     secs: f64,
+    /// Granule-1 scfsi groups that EQUAL granule 0 and are non-zero but were
+    /// coded anyway, and the scalefactor bits that reuse would have saved.
+    scfsi_missed_groups: usize,
+    scfsi_missed_bits: usize,
 }
 
 impl Census {
@@ -212,6 +216,12 @@ impl Census {
             );
         }
         println!(
+            "  scfsi  : {} granule-1 groups equal to granule 0 and non-zero but re-coded, {} bits ({:.1}/granule)",
+            self.scfsi_missed_groups,
+            self.scfsi_missed_bits,
+            self.scfsi_missed_bits as f64 / u
+        );
+        println!(
             "  payload: {:.1}% of carried main-data bits spent ({} of {}), {} bits/granule unspent",
             100.0 * self.part23_sum as f64 / self.avail_sum.max(1) as f64,
             self.part23_sum,
@@ -299,6 +309,32 @@ fn fold_frame(c: &mut Census, header: &FrameHeader, si: &SideInfo, main: &[u8]) 
             }
             if gr == 1 && si.scfsi[ch].iter().any(|&b| b) {
                 c.scfsi_units += 1;
+            }
+            // scfsi opportunity: long blocks in both granules, a group equal to
+            // granule 0's and not all zero (all-zero costs nothing either way).
+            if gr == 1 && header.version == rusty_mp3::header::MpegVersion::V1 {
+                let g0 = &si.granules[0][ch];
+                let both_long = !(gi.window_switching && gi.block_type == BlockType::Short)
+                    && !(g0.window_switching && g0.block_type == BlockType::Short);
+                if both_long {
+                    let (s1, s2) =
+                        rusty_mp3::tables::SCALEFAC_COMPRESS_V1[gi.scalefac_compress as usize & 15];
+                    for (g, (lo, hi)) in [(0usize, 6usize), (6, 11), (11, 16), (16, 21)]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if si.scfsi[ch][g] {
+                            continue;
+                        }
+                        let eq = scalefac[0][ch].long[lo..hi] == sf.long[lo..hi];
+                        let nz = sf.long[lo..hi].iter().any(|&v| v != 0);
+                        if eq && nz {
+                            c.scfsi_missed_groups += 1;
+                            let slen = if lo < 11 { s1 } else { s2 } as usize;
+                            c.scfsi_missed_bits += slen * (hi - lo);
+                        }
+                    }
+                }
             }
             c.unit(gi, &sf);
         }

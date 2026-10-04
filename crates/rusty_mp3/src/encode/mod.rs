@@ -81,6 +81,18 @@ pub mod prof {
     /// per-band shaping the encoder actually bought with its leftover bits.
     pub static REFINE_STEPS: AtomicU64 = AtomicU64::new(0);
 
+    /// Refinement steps where the band the ranking wanted most was already at its
+    /// scalefactor ceiling (`max_sf`), split low (0..=10, cap 15) / high (11..=20,
+    /// cap 7). The demand `scalefac_scale` (doubles every band's range) and
+    /// `preflag` (adds the pretab to the high bands) could serve.
+    pub static CAP_BLOCK_LO: AtomicU64 = AtomicU64::new(0);
+    pub static CAP_BLOCK_HI: AtomicU64 = AtomicU64::new(0);
+    /// Shaped long granules whose high bands ALL sit at or above the pretab after
+    /// refinement -- i.e. `preflag` could be set losslessly, freeing scalefactor bits.
+    pub static PREFLAG_OK: AtomicU64 = AtomicU64::new(0);
+    /// Scalefactor steps accepted by short-block shaping (`quantize_short_slack`).
+    pub static SHORT_REFINE_STEPS: AtomicU64 = AtomicU64::new(0);
+
     /// Which term decided each band's masking threshold: the energy cap, the
     /// absolute threshold of hearing, or the spread masker itself. Only the last
     /// carries any masking information.
@@ -523,7 +535,13 @@ impl Mp3Encode {
                     let fbs = shortblock::reorder_subband_to_bitstream(fheader.sample_rate, freq);
                     // `per_gran` already encodes the mode: CBR's frame budget or
                     // VBR's target-rate budget. Short blocks need no special case.
-                    shortblock::quantize_short(&fheader, &fbs, per_gran)
+                    shortblock::quantize_short_slack(
+                        &fheader,
+                        &fbs,
+                        per_gran,
+                        &psy.thresholds,
+                        psy.signal_energy,
+                    )
                 } else {
                     prof::N_LONG.fetch_add(1, Relaxed);
                     quantize::loops(&fheader, freq, psy, per_gran, bt)
@@ -534,6 +552,13 @@ impl Mp3Encode {
             let mut sfac = ScaleFactors::default();
             if bt != BlockType::Short {
                 sfac.long.copy_from_slice(&quant.scalefactors[..22]);
+            } else {
+                // Short layout: scalefactors[3·band + window].
+                for b in 0..12 {
+                    for w in 0..3 {
+                        sfac.short[w][b] = quant.scalefactors[3 * b + w];
+                    }
+                }
             }
             let part2_3_start = main.bit_len();
             prof::time(&prof::HUFF, || {

@@ -40,6 +40,8 @@ ARMS = {
     "outer": {"MP3_SHAPE": "outer"},
     "audible": {"MP3_SHAPE": "audible"},
     "slack": {},
+    # Short-block shaping off: the pre-shaping short path, byte-identical to it.
+    "noshort": {"MP3_SHORT_SHAPE": "0"},
     # Psychoacoustic level sweep. `SMR_OFFSET_DB` was swept 3->18 before and read
     # inert (0.002 ODG) -- but that sweep ran through the broken domain comparison,
     # where a few dB of offset was nothing against a 49 dB scale error. It is a
