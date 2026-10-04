@@ -1,0 +1,102 @@
+
+# cargo-vet audits file
+
+[audits]
+
+[[trusted.libc]]
+criteria = "safe-to-deploy"
+user-id = 55123
+start = "2024-08-15"
+end = "2027-10-04"
+notes = "rust-lang/libc; the rust-lang-owner account is trusted by mozilla and bytecode-alliance (imported)."
+
+[[trusted.libc]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:rust-lang/libc"
+start = "2026-10-02"
+end = "2027-10-04"
+notes = "rust-lang/libc released via crates.io trusted publishing from the rust-lang/libc repository; earlier releases by rust-lang-owner, trusted by mozilla and bytecode-alliance (imported)."
+
+[[trusted.rusty_alloc]]
+criteria = "safe-to-deploy"
+user-id = 427321 # farmer_timmm (Ttimmahlax)
+start = "2026-08-06"
+end = "2027-10-04"
+notes = "First-party: the crates.io owner of rusty_mp3 itself (Remade-With-Rust / Mata Network). rusty_alloc and rusty_alloc-api are our own allocator crates, dev-dependencies only."
+
+[[trusted.rusty_alloc-api]]
+criteria = "safe-to-deploy"
+user-id = 427321 # farmer_timmm (Ttimmahlax)
+start = "2026-08-06"
+end = "2027-10-04"
+notes = "First-party: the crates.io owner of rusty_mp3 itself (Remade-With-Rust / Mata Network). rusty_alloc and rusty_alloc-api are our own allocator crates, dev-dependencies only."
+
+[[trusted.windows-sys]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-11-15"
+end = "2027-10-04"
+notes = "Microsoft's windows-rs maintainer; trusted by zcash, mozilla and bytecode-alliance (imported). Generated FFI bindings."
+
+[[trusted.windows-targets]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2022-09-09"
+end = "2027-10-04"
+notes = "Microsoft's windows-rs maintainer; trusted by zcash, mozilla and bytecode-alliance (imported). windows-sys/windows-targets are generated FFI bindings."
+
+[[trusted.windows_aarch64_gnullvm]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2022-09-01"
+end = "2027-10-04"
+notes = "Microsoft's windows-rs maintainer; trusted by zcash, mozilla and bytecode-alliance (imported). windows-sys/windows-targets are generated FFI bindings."
+
+[[trusted.windows_aarch64_msvc]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-11-05"
+end = "2027-10-04"
+notes = "Microsoft's windows-rs maintainer; trusted by zcash, mozilla and bytecode-alliance (imported). Generated FFI bindings."
+
+[[trusted.windows_i686_gnu]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-10-28"
+end = "2027-10-04"
+notes = "Microsoft's windows-rs maintainer; trusted by zcash, mozilla and bytecode-alliance (imported). Generated FFI bindings."
+
+[[trusted.windows_i686_gnullvm]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2024-04-02"
+end = "2027-10-04"
+notes = "Microsoft's windows-rs maintainer; trusted by zcash, mozilla and bytecode-alliance (imported). windows-sys/windows-targets are generated FFI bindings."
+
+[[trusted.windows_i686_msvc]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-10-27"
+end = "2027-10-04"
+notes = "Microsoft's windows-rs maintainer; trusted by zcash, mozilla and bytecode-alliance (imported). Generated FFI bindings."
+
+[[trusted.windows_x86_64_gnu]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-10-28"
+end = "2027-10-04"
+notes = "Microsoft's windows-rs maintainer; trusted by zcash, mozilla and bytecode-alliance (imported). Generated FFI bindings."
+
+[[trusted.windows_x86_64_gnullvm]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2022-09-01"
+end = "2027-10-04"
+notes = "Microsoft's windows-rs maintainer; trusted by zcash, mozilla and bytecode-alliance (imported). windows-sys/windows-targets are generated FFI bindings."
+
+[[trusted.windows_x86_64_msvc]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-10-27"
+end = "2027-10-04"
+notes = "Microsoft's windows-rs maintainer; trusted by zcash, mozilla and bytecode-alliance (imported). Generated FFI bindings."
