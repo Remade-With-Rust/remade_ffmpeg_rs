@@ -44,6 +44,7 @@ mod phases {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use std::sync::OnceLock;
 
+    pub static OPEN: AtomicU64 = AtomicU64::new(0);
     pub static DEMUX: AtomicU64 = AtomicU64::new(0);
     pub static DECODE: AtomicU64 = AtomicU64::new(0);
     pub static CONFORM: AtomicU64 = AtomicU64::new(0);
@@ -71,6 +72,7 @@ mod phases {
         eprintln!("--- rff phases (total {:.1} ms) ---", total_ns / 1e6);
         let mut sum = 0u64;
         for (name, acc) in [
+            ("open", &OPEN),
             ("demux", &DEMUX),
             ("decode", &DECODE),
             ("conform", &CONFORM),
@@ -870,12 +872,19 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     };
 
     // --- open every input demuxer and read its streams ---
+    // (`open` is a phase of its own: a container read whole at open -- WAV, the
+    // MP3 demuxer -- does all of its I/O here, before the first packet.)
+    let t_start = phases::on().then(std::time::Instant::now);
     let mut demuxers: Vec<Box<dyn rff_format::Demuxer>> = Vec::new();
     let mut input_streams: Vec<Vec<Stream>> = Vec::new();
     for input in &spec.inputs {
-        let (in_format, reader) = open_input(engine, input)?;
-        let mut demuxer = engine.formats.open_demuxer(&in_format, reader)?;
-        input_streams.push(demuxer.read_header()?);
+        let (demuxer, streams) = phases::time(&phases::OPEN, || -> Result<_> {
+            let (in_format, reader) = open_input(engine, input)?;
+            let mut demuxer = engine.formats.open_demuxer(&in_format, reader)?;
+            let streams = demuxer.read_header()?;
+            Ok((demuxer, streams))
+        })?;
+        input_streams.push(streams);
         demuxers.push(demuxer);
     }
 
@@ -999,7 +1008,6 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     muxer.write_header(&out_streams)?;
 
     let mut report = TranscodeReport::default();
-    let t_loop = phases::on().then(std::time::Instant::now);
 
     // --- drive each input through its plan into the shared muxer ---
     for (demuxer, ops) in demuxers.iter_mut().zip(per_input_ops.iter_mut()) {
@@ -1013,7 +1021,7 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
         flush_streams(ops, &mut *muxer, &mut report)?;
     }
     phases::time(&phases::MUX, || muxer.write_trailer())?;
-    if let Some(t) = t_loop {
+    if let Some(t) = t_start {
         phases::report(t.elapsed());
     }
 
