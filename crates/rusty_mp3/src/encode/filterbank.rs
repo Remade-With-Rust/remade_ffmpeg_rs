@@ -60,22 +60,37 @@ pub fn analyze(pcm: &[f32], fifo: &mut [f32; 512]) -> [[f32; SUBBAND_LINES]; SUB
         return out;
     };
 
+    // The FIFO is addressed CIRCULARLY rather than shifted -- the encoder twin of
+    // the decoder's synthesis FIFO (decode/synthesis.rs, D2). Logical `X[L]`
+    // (0 = newest) lives at physical `(head + L) & 511`, so "shift up by 32" is a
+    // subtraction on `head` instead of a 480-float `copy_within` on every pass
+    // (8,640 float moves per granule per channel). `head` stays a multiple of 32
+    // and 512 is a multiple of 32, so every 32-long run below is contiguous and
+    // never wraps mid-run. Byte-identical: same products, same order per output.
+    let mut head = 0usize;
     for v in 0..SUBBAND_LINES {
-        // Shift the FIFO up by 32 and push the 32 new samples in, newest at X[0]
+        // Shift up by 32 and push the 32 new samples in, newest at X[0]
         // (ISO: X[i]=X[i-32]; then X[31]..X[0] take this pass's samples in order).
-        fifo.copy_within(0..512 - 32, 32);
+        head = (head + 512 - 32) & 511;
+        let new: &mut [f32; 32] = (&mut fifo[head..head + 32])
+            .try_into()
+            .expect("32-aligned run");
         for t in 0..32 {
-            fifo[31 - t] = pcm[v * 32 + t];
+            new[31 - t] = pcm[v * 32 + t];
         }
 
-        // Window + fold 512 → 64: Y[i] = Σ_{j=0..7} C[i+64j]·X[i+64j].
+        // Window + fold 512 → 64: Y[i] = Σ_{j=0..7} C[i+64j]·X[i+64j], each output
+        // accumulating its eight taps in j order (0.0 + p0 == p0, so starting the
+        // accumulator at zero is exact).
         let mut y = [0f32; 64];
-        for (i, yi) in y.iter_mut().enumerate() {
-            let mut acc = 0f32;
+        for (h, yh) in y.chunks_exact_mut(32).enumerate() {
             for j in 0..8 {
-                acc += c[i + 64 * j] * fifo[i + 64 * j];
+                let at = (head + 32 * h + 64 * j) & 511;
+                let (cs, xs) = (&c[32 * h + 64 * j..][..32], &fifo[at..at + 32]);
+                for i in 0..32 {
+                    yh[i] += cs[i] * xs[i];
+                }
             }
-            *yi = acc;
         }
 
         // Matrix 64 → 32: S[k] = Σ_{i=0..63} M[k][i]·Y[i].
@@ -87,6 +102,9 @@ pub fn analyze(pcm: &[f32], fifo: &mut [f32; 512]) -> [[f32; SUBBAND_LINES]; SUB
             out[k][v] = acc;
         }
     }
+    // Restore the canonical layout (`X[L]` at physical `L`) the caller's state is
+    // defined in: 18 passes moved `head` by 576 ≡ 64 (mod 512), to 448.
+    fifo.rotate_left(head);
     out
 }
 
