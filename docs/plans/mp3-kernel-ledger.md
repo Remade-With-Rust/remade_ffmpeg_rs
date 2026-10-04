@@ -133,7 +133,12 @@ function with ~0 packed ops has no vectorized inner loop either.
 2. ~~**Encoder filterbank (19.4% of encode).**~~ DONE: brick 2a (circular FIFO,
    below resolution, byte-identical) + brick 2b (AVX/NEON fold + matrix, encode
    1.18-1.25x).
-3. **Encoder quantize (50% of encode).** `rusty_aac` already ships an AVX2
+3. ~~**Encoder quantize (50% of encode).**~~ DONE (brick 3): `quantize_lines_avx` /
+   `quantize_lines_neon`, the 22-band loop inside one `#[target_feature]` call;
+   whole encode **1.08-1.10x** (stereo @192k 1.097x min / 1.083x med, floor 0.3%;
+   mono @128k 1.102x med), 72/72 byte-identical, oracle incl. rounding seams /
+   saturation / `-0.0` passes on x86 and aarch64, poison (drop the +0.5) fails both.
+   Original entry:  `rusty_aac` already ships an AVX2
    quantize/xpow kernel (`codec-vectorize-kernel` 2026-07-03): a cross-crate form-2
    case -- port before writing. Named reason: the f64->i32 round+clamp with a sign
    is above what the cost model accepts at the SSE2 baseline.

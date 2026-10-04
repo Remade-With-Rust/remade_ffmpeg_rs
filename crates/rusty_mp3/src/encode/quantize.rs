@@ -296,6 +296,7 @@ fn quantize_into(
     // folds it out.
     let mut sfx = *sf;
     sfx[21] = 0;
+    let mut steps = [0f64; 22];
     for b in 0..22 {
         let s = sfx[b];
         // step = scale_inv^(3/4): the per-band factor applied to the precomputed
@@ -311,13 +312,160 @@ fn quantize_into(
         // `2f64.powf(x)` sites as explicit `x.exp2()` left the emitted call
         // counts identical (exp2=15/pow=10/powf=4 both ways) — the compiler
         // already does it, so `powf→exp2` is a genuine no-op. Don't re-try it.
-        let step = step_base * sf_step[s as usize];
+        steps[b] = step_base * sf_step[s as usize];
+    }
+    let simd = crate::decode::isa::use_simd();
+    if simd {
+        // SAFETY: `use_simd()` checked the ISA; `off` spans exactly 0..576.
+        unsafe { quantize_lines_simd(off, &steps, freq, xrp, out) };
+    } else {
+        quantize_lines_scalar(off, &steps, freq, xrp, out);
+    }
+    // Kernel-reach census, once per call (never per line).
+    super::prof::QUANT_CALLS[simd as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The per-line quantizer for all 22 bands: `sign(freq)·level_from(xrp·step[b])`.
+/// The scalar ORACLE for [`quantize_lines_simd`].
+#[inline]
+fn quantize_lines_scalar(
+    off: &[u16; 23],
+    steps: &[f64; 22],
+    freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
+    out: &mut [i32; GRANULE_LINES],
+) {
+    for b in 0..22 {
+        let step = steps[b];
         let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
         for i in lo..hi {
             let mag = level_from(xrp[i] * step);
             out[i] = if freq[i] < 0.0 { -mag } else { mag };
         }
     }
+}
+
+/// AVX twin of [`quantize_lines_scalar`], four lines per step. BIT-identical:
+/// the same f64 multiply, `level_from`'s exact sequence (subtract the bias, clamp
+/// to `[0, MAX_LEVEL]`, add one half, truncate -- `max_pd`/`min_pd` equal
+/// `f64::clamp` on these finite non-NaN inputs, and `cvttpd2dq` is the same
+/// truncation as `as i32`), and the sign applied as `(m ^ mask) - mask` where
+/// `mask` is `freq < 0.0` (so `-0.0` keeps its magnitude, as the scalar does).
+/// The rate loop calls this ~8x per granule; the 22-band loop lives INSIDE the
+/// `#[target_feature]` function, so each call crosses that boundary once.
+///
+/// # Safety
+/// AVX must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn quantize_lines_avx(
+    off: &[u16; 23],
+    steps: &[f64; 22],
+    freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
+    out: &mut [i32; GRANULE_LINES],
+) {
+    use std::arch::x86_64::*;
+    let (bias, zero, max, half) = (
+        _mm256_set1_pd(QUANT_BIAS),
+        _mm256_setzero_pd(),
+        _mm256_set1_pd(MAX_LEVEL as f64),
+        _mm256_set1_pd(0.5),
+    );
+    let fzero = _mm_setzero_ps();
+    for b in 0..22 {
+        let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
+        let vstep = _mm256_set1_pd(steps[b]);
+        let mut i = lo;
+        while i + 4 <= hi {
+            unsafe {
+                let p = _mm256_mul_pd(_mm256_loadu_pd(xrp.as_ptr().add(i)), vstep);
+                let m = _mm256_sub_pd(p, bias);
+                let c = _mm256_min_pd(_mm256_max_pd(m, zero), max);
+                let mag = _mm256_cvttpd_epi32(_mm256_add_pd(c, half));
+                let neg = _mm_castps_si128(_mm_cmplt_ps(_mm_loadu_ps(freq.as_ptr().add(i)), fzero));
+                let q = _mm_sub_epi32(_mm_xor_si128(mag, neg), neg);
+                _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, q);
+            }
+            i += 4;
+        }
+        let step = steps[b];
+        while i < hi {
+            let mag = level_from(xrp[i] * step);
+            out[i] = if freq[i] < 0.0 { -mag } else { mag };
+            i += 1;
+        }
+    }
+}
+
+/// NEON twin of [`quantize_lines_scalar`], two lines per step (f64x2). Same
+/// sequence: `vmaxq`/`vminq` clamp, `+0.5`, `vcvtq_s64_f64` truncation, narrowed to
+/// i32 (in range after the clamp), sign via `(m ^ mask) - mask`. BIT-identical.
+///
+/// # Safety
+/// NEON is baseline on AArch64; `off` must span 0..576.
+#[cfg(target_arch = "aarch64")]
+unsafe fn quantize_lines_neon(
+    off: &[u16; 23],
+    steps: &[f64; 22],
+    freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
+    out: &mut [i32; GRANULE_LINES],
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let (bias, zero, max, half) = (
+            vdupq_n_f64(QUANT_BIAS),
+            vdupq_n_f64(0.0),
+            vdupq_n_f64(MAX_LEVEL as f64),
+            vdupq_n_f64(0.5),
+        );
+        for b in 0..22 {
+            let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
+            let vstep = vdupq_n_f64(steps[b]);
+            let mut i = lo;
+            while i + 2 <= hi {
+                let p = vmulq_f64(vld1q_f64(xrp.as_ptr().add(i)), vstep);
+                let c = vminq_f64(vmaxq_f64(vsubq_f64(p, bias), zero), max);
+                let mag = vmovn_s64(vcvtq_s64_f64(vaddq_f64(c, half)));
+                let neg =
+                    vreinterpret_s32_u32(vclt_f32(vld1_f32(freq.as_ptr().add(i)), vdup_n_f32(0.0)));
+                let q = vsub_s32(veor_s32(mag, neg), neg);
+                vst1_s32(out.as_mut_ptr().add(i), q);
+                i += 2;
+            }
+            let step = steps[b];
+            while i < hi {
+                let mag = level_from(xrp[i] * step);
+                out[i] = if freq[i] < 0.0 { -mag } else { mag };
+                i += 1;
+            }
+        }
+    }
+}
+
+/// This arch's quantizer twin (AVX / NEON / scalar).
+///
+/// # Safety
+/// Caller checked [`crate::decode::isa::simd_available`].
+#[inline]
+unsafe fn quantize_lines_simd(
+    off: &[u16; 23],
+    steps: &[f64; 22],
+    freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
+    out: &mut [i32; GRANULE_LINES],
+) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        quantize_lines_avx(off, steps, freq, xrp, out)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        quantize_lines_neon(off, steps, freq, xrp, out)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    quantize_lines_scalar(off, steps, freq, xrp, out)
 }
 
 /// Re-quantize ONE band in place, leaving every other line untouched.
@@ -1250,6 +1398,55 @@ mod n4_tests {
     /// C gate: the branchless `level_from` must equal the original guarded form
     /// for every input, including the boundaries (≤0, the rounding seam, and the
     /// saturation knee) — a wide dense sweep plus the exact lattice midpoints.
+    /// The SIMD quantizer must be BIT-identical to the scalar oracle -- including
+    /// at the rounding seams (exact half-integer + bias), past saturation, at zero
+    /// and below the bias, and for `-0.0` frequencies (which keep a positive sign).
+    #[test]
+    fn quantize_lines_simd_matches_scalar() {
+        if !crate::decode::isa::simd_available() {
+            eprintln!("no SIMD twin on this host - scalar path only, gate skipped");
+            return;
+        }
+        let mut st = 0x6C07_8965u32;
+        let mut r = move || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            st
+        };
+        for &rate in &[44100u32, 32000, 22050, 8000] {
+            let off = crate::tables::sfb_long_offsets(rate);
+            for trial in 0..64 {
+                let mut freq = [0f32; GRANULE_LINES];
+                let mut xrp = [0f64; GRANULE_LINES];
+                for i in 0..GRANULE_LINES {
+                    let k = r();
+                    freq[i] = match k % 7 {
+                        0 => -0.0,
+                        1 => 0.0,
+                        _ => ((k >> 3) as f32 / 2.0e8) - 10.0,
+                    };
+                    xrp[i] = match (k >> 8) % 5 {
+                        0 => (k % 9000) as f64 + 0.5 + QUANT_BIAS, // a rounding seam
+                        1 => 1.0e9,                                // past saturation
+                        2 => 0.0,
+                        _ => (k >> 4) as f64 / 1.0e5,
+                    };
+                }
+                let mut steps = [0f64; 22];
+                for s in steps.iter_mut() {
+                    *s = [1.0, 0.5, 2.0, 0.123_456_7][(r() % 4) as usize];
+                }
+                let (mut a, mut b) = ([0i32; GRANULE_LINES], [0i32; GRANULE_LINES]);
+                quantize_lines_scalar(off, &steps, &freq, &xrp, &mut a);
+                // SAFETY: gated on simd_available(); off spans 0..576.
+                unsafe { quantize_lines_simd(off, &steps, &freq, &xrp, &mut b) };
+                assert_eq!(
+                    a, b,
+                    "quantizer SIMD/scalar mismatch at rate {rate} trial {trial}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn level_from_matches_guarded() {
         // The reference: the pre-optimisation guarded implementation.
