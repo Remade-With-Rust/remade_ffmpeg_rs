@@ -8,9 +8,9 @@
 //! - **Decoder**: the MPEG-4 AAC family short of USAC — LC, Main (prediction),
 //!   LTP, HE-AAC v1 (SBR) and v2 (Parametric Stereo), ER AAC-LC/LTP, AAC-LD and
 //!   AAC-ELD; 1024/960-sample frames, mono to 7.1 and PCE layouts, coupling
-//!   channels. Sample-exact (≤1 LSB) against FFmpeg on 79 of the 83 non-USAC
-//!   ISO/IEC 14496-26 conformance streams, the rest within documented
-//!   deviations. Entry point: [`AacDecoder`] (ADTS framing and raw MP4 access
+//!   channels. Sample-exact (≤1 LSB) against FFmpeg on every non-USAC
+//!   ISO/IEC 14496-26 conformance stream (two up to documented FFmpeg
+//!   deviations). Entry point: [`AacDecoder`] (ADTS framing and raw MP4 access
 //!   units alike), [`latm::LatmDecoder`] for LOAS, or the lower-level
 //!   [`decode::Decoder`] driven by a full [`config::StreamConfig`].
 //! - **Encoder**: psychoacoustic Bark-scale masking model, two-phase bitrate

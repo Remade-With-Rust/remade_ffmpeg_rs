@@ -10,10 +10,10 @@ and **AAC-LC encoder**. Zero dependencies, no C, no FFI, Apache-2.0.
 - **Decoder** — the whole MPEG-4 AAC family short of USAC: AAC-LC, Main
   (prediction), LTP, **HE-AAC v1 (SBR) and v2 (Parametric Stereo)**, ER AAC-LC/
   LTP, AAC-LD and AAC-ELD, 1024- and 960-sample frames, every sampling rate,
-  mono to 7.1 plus PCE layouts and coupling channels. **79 of the 83
-  non-USAC ISO/IEC 14496-26 conformance streams decode sample-exact (≤1 LSB)
-  against FFmpeg**, and the rest within a documented deviation — see
-  [Conformance](#conformance).
+  mono to 7.1 plus PCE layouts and coupling channels. **Every non-USAC
+  ISO/IEC 14496-26 conformance stream decodes sample-exact (≤1 LSB) against
+  FFmpeg** — 81 of 83 outright, the other two exact except where FFmpeg itself
+  deviates — see [Conformance](#conformance).
 - **Encoder** — to our knowledge the **first pure-Rust AAC encoder on
   crates.io** (the alternatives, `fdk-aac` and libxaac bindings, are C FFI).
   Psychoacoustic Bark-scale masking model, **level-invariant transient
@@ -153,13 +153,12 @@ reference PCM is checked as a second oracle where FATE ships it.
 
 | verdict | streams | meaning |
 | --- | --- | --- |
-| **EXACT** | **79** | peak difference ≤ 1 LSB vs FFmpeg |
+| **EXACT** | **81** | peak difference ≤ 1 LSB vs FFmpeg |
 | KNOWN | 2 | exact except where FFmpeg deviates: it ignores a CRC-valid PCE height extension (we honour it), and it emits an uninitialised channel for a stereo config carrying one SCE (we emit silence) |
-| NEAR | 2 | 5.1 streams with a coupling channel: ≥ 97 dB SNR, 2 LSB peak |
 | not AAC | 8 | xHE-AAC / USAC (ISO/IEC 23003-3) — a separate codec, refused cleanly |
 
 By object type: AAC-LC 55, HE-AAC v1 6, HE-AAC v2 15, Main 2, LTP 1, ER AAC-LD 1,
-ER AAC-ELD 3 — all EXACT except the four noted above. The census harness is
+ER AAC-ELD 3 — all EXACT except the two KNOWN above. The census harness is
 `examples/aacconf.rs`.
 
 ## Decode

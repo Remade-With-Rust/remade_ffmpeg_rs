@@ -215,6 +215,22 @@ pub fn parse_ics_info(r: &mut BitReader, sx: &Syntax, ics: &mut Ics) -> Result<(
     Ok(())
 }
 
+/// Dequantised TNS reflection coefficients `sin(c / iqfac)` (ISO 14496-3
+/// §4.6.9.3), indexed by the raw two's-complement code, for
+/// [coef_compress·2 + coef_res]: 3-bit, 4-bit, compressed 3-bit, compressed
+/// 4-bit. These are the 8-digit values the reference decoders tabulate (not
+/// correctly-rounded sines): matching them keeps the recursive TNS filter
+/// sample-exact.
+const TNS_PARCOR: [&[f32]; 4] = [
+    &[0.0, 0.43388373, 0.78183150, 0.97492790, -0.98480773, -0.86602539, -0.64278758, -0.34202015],
+    &[
+        0.0, 0.20791170, 0.40673664, 0.58778524, 0.74314481, 0.86602539, 0.95105654, 0.99452192, -0.99573416,
+        -0.96182561, -0.89516330, -0.79801720, -0.67369562, -0.52643216, -0.36124167, -0.18374951,
+    ],
+    &[0.0, 0.43388373, -0.64278758, -0.34202015],
+    &[0.0, 0.20791170, 0.40673664, 0.58778524, -0.67369562, -0.52643216, -0.36124167, -0.18374951],
+];
+
 /// One TNS filter: band span, order, direction, LPC (lpc[0] = 1).
 #[derive(Clone, Default)]
 pub struct TnsFilter {
@@ -246,7 +262,6 @@ fn parcor_to_lpc(parcor: &[f32]) -> Vec<f32> {
 }
 
 pub fn parse_tns(r: &mut BitReader, sx: &Syntax, info: &IcsInfo) -> Result<Tns> {
-    use std::f32::consts::PI;
     let short = info.window_sequence == WindowSequence::EightShort;
     let max_order = if short {
         7
@@ -273,18 +288,10 @@ pub fn parse_tns(r: &mut BitReader, sx: &Syntax, info: &IcsInfo) -> Result<Tns> 
                 let coef_compress = r.read_bits(1)?;
                 let res_bits = 3 + coef_res;
                 let coef_bits = res_bits - coef_compress;
-                let iqfac = ((1i32 << (res_bits - 1)) as f32 - 0.5) / (PI / 2.0);
-                let iqfac_m = ((1i32 << (res_bits - 1)) as f32 + 0.5) / (PI / 2.0);
+                let table = TNS_PARCOR[2 * coef_compress as usize + coef_res as usize];
                 let mut parcor = vec![0f32; order];
                 for p in parcor.iter_mut() {
-                    let raw = r.read_bits(coef_bits)? as i32;
-                    let c = if raw & (1 << (coef_bits - 1)) != 0 {
-                        raw - (1 << coef_bits)
-                    } else {
-                        raw
-                    };
-                    let t = if c >= 0 { c as f32 / iqfac } else { c as f32 / iqfac_m };
-                    *p = t.sin();
+                    *p = table[r.read_bits(coef_bits)? as usize];
                 }
                 lpc = parcor_to_lpc(&parcor);
             }
