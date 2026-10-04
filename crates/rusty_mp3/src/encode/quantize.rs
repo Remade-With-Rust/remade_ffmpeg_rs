@@ -378,6 +378,7 @@ unsafe fn quantize_lines_avx(
         let vstep = _mm256_set1_pd(steps[b]);
         let mut i = lo;
         while i + 4 <= hi {
+            // SAFETY: the loop guard `i + 4 <= hi` with `hi <= GRANULE_LINES` keeps all four lanes inside `xrp`, `freq` and `out` (each `[_; 576]`), whatever `off` holds.
             unsafe {
                 let p = _mm256_mul_pd(_mm256_loadu_pd(xrp.as_ptr().add(i)), vstep);
                 let m = _mm256_sub_pd(p, bias);
@@ -403,7 +404,8 @@ unsafe fn quantize_lines_avx(
 /// i32 (in range after the clamp), sign via `(m ^ mask) - mask`. BIT-identical.
 ///
 /// # Safety
-/// NEON is baseline on AArch64; `off` must span 0..576.
+/// NEON is baseline on AArch64; every access is bounded inside (`hi` is capped at
+/// `GRANULE_LINES`), whatever `off` holds.
 #[cfg(target_arch = "aarch64")]
 unsafe fn quantize_lines_neon(
     off: &[u16; 23],
@@ -413,6 +415,7 @@ unsafe fn quantize_lines_neon(
     out: &mut [i32; GRANULE_LINES],
 ) {
     use std::arch::aarch64::*;
+    // SAFETY: NEON is baseline on AArch64; every load/store is guarded by `i + 2 <= hi` with `hi <= GRANULE_LINES`, inside `xrp`, `freq` and `out` (each `[_; 576]`), whatever `off` holds.
     unsafe {
         let (bias, zero, max, half) = (
             vdupq_n_f64(QUANT_BIAS),
@@ -457,10 +460,12 @@ unsafe fn quantize_lines_simd(
     out: &mut [i32; GRANULE_LINES],
 ) {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
     unsafe {
         quantize_lines_avx(off, steps, freq, xrp, out)
     }
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
     unsafe {
         quantize_lines_neon(off, steps, freq, xrp, out)
     }

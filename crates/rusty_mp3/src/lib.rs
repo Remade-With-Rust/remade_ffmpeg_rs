@@ -545,6 +545,7 @@ impl Mp3Encoder {
             // ⚠ MPEG-1 (V1) ONLY: the assembler hardcodes the 9-bit `main_data_begin`
             // (MAX_BEGIN=511); MPEG-2/2.5 use an 8-bit field (max 255) + 1 granule/frame,
             // so the reservoir would corrupt LSF streams. V2/2.5 keep the fixed path.
+            // Cannot fail: the statement above this comment block assigned `Some`.
             let is_v1 = self.header.as_ref().unwrap().version == crate::header::MpegVersion::V1;
             self.reservoir = self.quality.is_none()
                 && is_v1
@@ -565,6 +566,8 @@ impl Mp3Encoder {
             // and causal is streaming-friendly (no full-file PCM buffer). See tune-quality.
             self.resv_lookahead = std::env::var("MP3_RESV_LOOKAHEAD").is_ok_and(|v| v != "0");
         }
+        // Cannot fail: the block above either found `Some` or assigned it (an
+        // unsupported rate returns `Err` from `encoder_header` before this).
         let header = self.header.as_ref().unwrap();
         let nch = header.channel_mode.channels();
         let spf = header.version.samples_per_frame();

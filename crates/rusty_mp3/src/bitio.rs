@@ -55,6 +55,8 @@ impl<'a> BitReader<'a> {
         let bit_off = (self.pos & 7) as u32;
         let word = match self.data.get(byte_idx..byte_idx + 8) {
             // Fast path: eight bytes are in bounds, one unaligned load.
+            // Cannot fail: `get(byte_idx..byte_idx + 8)` returned a slice of
+            // exactly 8 bytes, so the conversion to `[u8; 8]` always succeeds.
             Some(w) => u64::from_be_bytes(w.try_into().unwrap()),
             // Tail: zero-fill past the end, as the bitwise loop did. `byte_idx`
             // may be entirely past `data`, so clamp the start before slicing —
