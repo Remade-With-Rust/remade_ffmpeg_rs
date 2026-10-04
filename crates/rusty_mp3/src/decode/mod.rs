@@ -296,7 +296,7 @@ impl Mp3Decode {
 
             // 7. Joint-stereo (MS / intensity) across the two channels.
             prof::time(&prof::STEREO, || {
-                stereo::process(header, &si.granules[gr], &mut spectrum)
+                stereo::process(header, &si.granules[gr], &scalefac[gr][1], &mut spectrum)
             });
 
             out.push(GranuleWork {

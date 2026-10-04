@@ -30,6 +30,10 @@ const MUST_PASS: &[(&str, &str)] = &[
     ("l3-he_44khz", "44.1 kHz long/short"),
     ("l3-he_48khz", "48 kHz long/short"),
     ("l3-hecommon", "stereo, common side info"),
+    (
+        "l3-he_mode",
+        "MPEG-1 INTENSITY stereo, mode switching, dual mono",
+    ),
     ("l3-si", "scfsi, preflag, scalefac_scale"),
     (
         "l3-si_block",
