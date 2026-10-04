@@ -209,10 +209,9 @@ pub fn apply_prediction(ics: &Ics, sf_index: u8, coeffs: &mut [f32], ps: &mut [P
 /// `coupling_channel_element` side info (§4.4.2.5).
 #[derive(Clone, Default)]
 pub struct Coupling {
-    /// 0 = before TNS, 1 = between TNS and IMDCT, 2 = after IMDCT (independent).
+    /// [`BEFORE_TNS`], [`BETWEEN_TNS_AND_IMDCT`] or [`AFTER_IMDCT`] (independent).
     pub point: u8,
-    pub num_coupled: usize,
-    /// (element type, element tag, ch_select)
+    /// (element type, element tag, ch_select), one per coupled element.
     pub targets: Vec<(u8, u8, u8)>,
     /// gains[index][band] (band 0 only for independent coupling).
     pub gains: Vec<Vec<f32>>,

@@ -38,6 +38,7 @@
 
 pub(crate) mod dec;
 pub(crate) mod ps;
+mod qmf;
 mod tables;
 
 use crate::Result;

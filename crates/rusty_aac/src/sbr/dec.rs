@@ -9,10 +9,11 @@
 //! two-frame `Y` toggle, the envelope-adjustment offset of 2) is the standard's,
 //! so frame boundaries line up with other conforming decoders.
 
+use super::qmf::{qmf_analysis, qmf_synthesis, QmfSynthState};
 use super::tables::{
     HUFF_ENV_1_5DB_F, HUFF_ENV_1_5DB_T, HUFF_ENV_3_0DB_F, HUFF_ENV_3_0DB_T, HUFF_ENV_BAL_1_5DB_F,
     HUFF_ENV_BAL_1_5DB_T, HUFF_ENV_BAL_3_0DB_F, HUFF_ENV_BAL_3_0DB_T, HUFF_NOISE_3_0DB_T,
-    HUFF_NOISE_BAL_3_0DB_T, NOISE_TABLE, QMF_WINDOW, SBR_OFFSET,
+    HUFF_NOISE_BAL_3_0DB_T, NOISE_TABLE, SBR_OFFSET,
 };
 use crate::bits::BitReader;
 use crate::decode::layout::{TYPE_CCE, TYPE_CPE, TYPE_SCE};
@@ -113,115 +114,6 @@ fn books() -> &'static Books {
 }
 
 // ---------------------------------------------------------------------------
-// QMF banks (§4.6.18.4).
-// ---------------------------------------------------------------------------
-
-struct QmfTables {
-    /// Analysis kernel 2·exp(iπ(k+½)(2n−½)/64), row-major [k][n], k<32, n<64.
-    ana: Vec<(f64, f64)>,
-    /// Synthesis kernel exp(iπ(k+½)(2n−255)/128)/64, row-major [n][k], n<128, k<64.
-    syn: Vec<(f64, f64)>,
-    /// Downsampled synthesis kernel exp(iπ(k+½)(2n−127.5)/64)/64, [n][k], n<64, k<32
-    /// (the full bank's kernel at half rate: (4n−255)/128 = (2n−127.5)/64,
-    /// with the same 1/64 since the subband samples are scaled alike).
-    syn_ds: Vec<(f64, f64)>,
-}
-
-fn qmf() -> &'static QmfTables {
-    static Q: OnceLock<QmfTables> = OnceLock::new();
-    Q.get_or_init(|| {
-        use std::f64::consts::PI;
-        let kernel = |rows: usize, cols: usize, f: &dyn Fn(usize, usize) -> (f64, f64)| {
-            let mut v = Vec::with_capacity(rows * cols);
-            for a in 0..rows {
-                for b in 0..cols {
-                    v.push(f(a, b));
-                }
-            }
-            v
-        };
-        let ana = kernel(32, 64, &|k, n| {
-            let a = PI * (k as f64 + 0.5) * (2.0 * n as f64 - 0.5) / 64.0;
-            (2.0 * a.cos(), 2.0 * a.sin())
-        });
-        let syn = kernel(128, 64, &|n, k| {
-            let a = PI * (k as f64 + 0.5) * (2.0 * n as f64 - 255.0) / 128.0;
-            (a.cos() / 64.0, a.sin() / 64.0)
-        });
-        let syn_ds = kernel(64, 32, &|n, k| {
-            let a = PI * (k as f64 + 0.5) * (2.0 * n as f64 - 127.5) / 64.0;
-            (a.cos() / 64.0, a.sin() / 64.0)
-        });
-        QmfTables { ana, syn, syn_ds }
-    })
-}
-
-/// QMF analysis of `2·nts` slots of 32 samples. `hist` keeps the last 288
-/// input samples (time order); the core output is lifted to ±32768 scale.
-fn qmf_analysis(input: &[f32], hist: &mut [f64], w: &mut [[Cpx; 32]; 32], nts: usize) {
-    let t = qmf();
-    let ns = 64 * nts;
-    let mut buf = vec![0f64; 288 + ns];
-    buf[..288].copy_from_slice(hist);
-    for (b, &s) in buf[288..].iter_mut().zip(&input[..ns]) {
-        *b = s as f64 * 32768.0;
-    }
-    let mut u = [0f64; 64];
-    for (l, slot) in w.iter_mut().enumerate().take(2 * nts) {
-        // x[n] newest first: x[n] = buf[end-1-n]; z(n) = x(n)·c(2n); u = Σ_j z(n+64j).
-        let end = 320 + 32 * l;
-        u.iter_mut().for_each(|v| *v = 0.0);
-        for n in 0..320 {
-            u[n & 63] += buf[end - 1 - n] * QMF_WINDOW[2 * n] as f64;
-        }
-        for (k, out) in slot.iter_mut().enumerate() {
-            let row = &t.ana[k * 64..(k + 1) * 64];
-            let (mut re, mut im) = (0f64, 0f64);
-            for (un, &(c, s)) in u.iter().zip(row) {
-                re += un * c;
-                im += un * s;
-            }
-            *out = [re as f32, im as f32];
-        }
-    }
-    hist.copy_from_slice(&buf[ns..]);
-}
-
-/// 64-band (or downsampled 32-band) QMF synthesis of `2·nts` slots. `v` is
-/// the 1280- (640-) sample FIFO, newest first.
-fn qmf_synthesis(out: &mut [f32], xs: &[[Cpx; 64]], v: &mut [f64], nts: usize, ds: bool) {
-    let t = qmf();
-    let bands = if ds { 32 } else { 64 };
-    let vlen = 2 * bands;
-    let total = 10 * vlen;
-    for (l, slot) in xs.iter().enumerate().take(2 * nts) {
-        v.copy_within(0..total - vlen, vlen);
-        for n in 0..vlen {
-            let row = if ds { &t.syn_ds[n * 32..n * 32 + 32] } else { &t.syn[n * 64..n * 64 + 64] };
-            let mut acc = 0f64;
-            for (x, &(c, s)) in slot.iter().zip(row) {
-                acc += x[0] as f64 * c - x[1] as f64 * s;
-            }
-            v[n] = acc;
-        }
-        // g[2b·i + j] = v[2·vlen·i + j], g[2b·i + b + j] = v[2·vlen·i + 3b + j];
-        // out[j] = Σ g·c over the ten blocks (c decimated by 2 when downsampled).
-        let step = if ds { 2 } else { 1 };
-        for (j, o) in out[l * bands..(l + 1) * bands].iter_mut().enumerate() {
-            let mut acc = 0f64;
-            for i in 0..5 {
-                let ga = v[2 * vlen * i + j];
-                let gb = v[2 * vlen * i + 3 * bands + j];
-                let ca = QMF_WINDOW[step * (2 * bands * i + j)] as f64;
-                let cb = QMF_WINDOW[step * (2 * bands * i + bands + j)] as f64;
-                acc += ga * ca + gb * cb;
-            }
-            *o = (acc / 32768.0) as f32;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // State.
 // ---------------------------------------------------------------------------
 
@@ -247,11 +139,11 @@ pub(crate) struct SbrChannel {
     bs_add_harmonic: [bool; 48],
     s_indexmapped: [[bool; 48]; 8],
     bw_array: [f32; 5],
-    ana_hist: Vec<f64>,
+    ana_hist: Vec<f32>,
     w: Vec<[[Cpx; 32]; 32]>,
     ypos: usize,
     y: Vec<Vec<[Cpx; 64]>>,
-    syn_v: Vec<f64>,
+    syn_v: QmfSynthState,
     g_temp: Vec<[f32; 48]>,
     q_temp: Vec<[f32; 48]>,
     f_indexnoise: usize,
@@ -284,7 +176,7 @@ impl SbrChannel {
             w: vec![[[[0.0; 2]; 32]; 32]; 2],
             ypos: 0,
             y: vec![vec![[[0.0; 2]; 64]; 38]; 2],
-            syn_v: vec![0.0; 1280],
+            syn_v: QmfSynthState::new(),
             g_temp: vec![[0.0; 48]; 42],
             q_temp: vec![[0.0; 48]; 42],
             f_indexnoise: 0,
@@ -1690,45 +1582,6 @@ pub(crate) fn decode_eld_sbr(_dec: &mut Decoder, _r: &mut BitReader) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Analysis then synthesis with nothing in between is a 2x upsampler with
-    /// unity gain (after the filterbank delay).
-    #[test]
-    fn qmf_round_trip_is_a_unity_upsampler() {
-        let mut hist = vec![0f64; 288];
-        let mut w = [[[0f32; 2]; 32]; 32];
-        let mut v = vec![0f64; 1280];
-        let mut out_all = Vec::new();
-        let f = 1000.0 / 22050.0;
-        for frame in 0..6 {
-            let input: Vec<f32> = (0..1024)
-                .map(|i| (0.5 * (2.0 * std::f64::consts::PI * f * (frame * 1024 + i) as f64).sin()) as f32)
-                .collect();
-            qmf_analysis(&input, &mut hist, &mut w, 16);
-            let mut xs = vec![[[0f32; 2]; 64]; 38];
-            for (l, s) in w.iter().enumerate() {
-                xs[l][..32].copy_from_slice(s);
-            }
-            let mut out = vec![0f32; 2048];
-            qmf_synthesis(&mut out, &xs, &mut v, 16, false);
-            out_all.extend_from_slice(&out);
-        }
-        // Expect 0.5·sin at half the normalized frequency, some delay later.
-        let tail = &out_all[4096..];
-        let peak = tail.iter().fold(0f32, |a, &b| a.max(b.abs()));
-        assert!((peak - 0.5).abs() < 0.01, "peak {peak}");
-        let mut ds_v = vec![0f64; 640];
-        let mut out = vec![0f32; 1024];
-        let mut xs = vec![[[0f32; 2]; 64]; 38];
-        for (l, s) in w.iter().enumerate() {
-            xs[l][..32].copy_from_slice(s);
-        }
-        for _ in 0..4 {
-            qmf_synthesis(&mut out, &xs, &mut ds_v, 16, true);
-        }
-        let peak = out.iter().fold(0f32, |a, &b| a.max(b.abs()));
-        assert!((peak - 0.5).abs() < 0.01, "downsampled peak {peak}");
-    }
 
     #[test]
     fn sbr_books_are_prefix_complete() {

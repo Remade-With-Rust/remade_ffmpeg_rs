@@ -4,8 +4,9 @@
 //! they're written straight from the spec and checked by the MDCT↔IMDCT
 //! perfect-reconstruction (TDAC) property.
 //!
-//! The IMDCT here is a direct O(N²) evaluation — correct and clear; it can be
-//! swapped for an FFT-based fast path later without changing results.
+//! The direct O(N²) transforms are kept as oracles; the decoder runs the fast
+//! paths (an f32 radix-2 DCT-IV for power-of-two lengths, the mixed-radix plan
+//! for 960/480/120).
 
 // These primitives are exercised by the tests now and wired into the decode
 // path in the spectral/synthesis stages; allow until then.
@@ -429,6 +430,9 @@ fn dct4_plan(l: usize) -> &'static Dct4Plan {
 /// result (the decoder passes 1/32768 to land in float [-1, 1]).
 pub fn imdct_half(spec: &[f32], out: &mut [f32], gain: f64) {
     let l = spec.len();
+    if let Some(plan) = pow2_dct4(l) {
+        return plan.imdct_half(spec, out, gain as f32);
+    }
     let plan = dct4_plan(l);
     let z = plan.run(|i| spec[i] as f64);
     // z = 2·D·X; the spec IMDCT is (2/N)·Fᵀ·D·X with N = 2L, so scale by 1/(2L)·…
@@ -437,6 +441,137 @@ pub fn imdct_half(spec: &[f32], out: &mut [f32], gain: f64) {
     for k in 0..l {
         out[k] = (-z[l - 1 - k] * scale) as f32;
     }
+}
+
+/// An in-place iterative radix-2 complex FFT in f32: `sign` -1 computes
+/// `Σ x·e^{-2πi jk/n}`, +1 the unscaled inverse.
+pub(crate) struct Radix2Fft {
+    n: usize,
+    rev: Vec<u16>,
+    tw: Vec<[f32; 2]>,
+}
+
+impl Radix2Fft {
+    pub(crate) fn new(n: usize, sign: f64) -> Radix2Fft {
+        assert!(n.is_power_of_two() && n >= 2);
+        let bits = n.trailing_zeros();
+        let rev = (0..n).map(|i| ((i as u32).reverse_bits() >> (32 - bits)) as u16).collect();
+        let tw = (0..n / 2)
+            .map(|t| {
+                let a = sign * 2.0 * PI * t as f64 / n as f64;
+                [a.cos() as f32, a.sin() as f32]
+            })
+            .collect();
+        Radix2Fft { n, rev, tw }
+    }
+
+    pub(crate) fn run(&self, buf: &mut [[f32; 2]]) {
+        let n = self.n;
+        let buf = &mut buf[..n];
+        for i in 0..n {
+            let j = self.rev[i] as usize;
+            if i < j {
+                buf.swap(i, j);
+            }
+        }
+        // First stage: twiddle-free butterflies.
+        for pair in buf.chunks_exact_mut(2) {
+            let (a, b) = (pair[0], pair[1]);
+            pair[0] = [a[0] + b[0], a[1] + b[1]];
+            pair[1] = [a[0] - b[0], a[1] - b[1]];
+        }
+        let mut len = 4;
+        while len <= n {
+            let half = len / 2;
+            let step = n / len;
+            for block in buf.chunks_exact_mut(len) {
+                let (lo, hi) = block.split_at_mut(half);
+                for (j, (a, b)) in lo.iter_mut().zip(hi.iter_mut()).enumerate() {
+                    let w = self.tw[j * step];
+                    let t = [b[0] * w[0] - b[1] * w[1], b[0] * w[1] + b[1] * w[0]];
+                    let x = *a;
+                    *a = [x[0] + t[0], x[1] + t[1]];
+                    *b = [x[0] - t[0], x[1] - t[1]];
+                }
+            }
+            len *= 2;
+        }
+    }
+}
+
+/// The DCT-IV core for power-of-two lengths in f32: pre-rotation, an `L/2`-point
+/// FFT, post-rotation — the same factorisation as [`Dct4Plan`], allocation-free.
+pub(crate) struct Pow2Dct4 {
+    l: usize,
+    pre: Vec<[f32; 2]>,
+    post: Vec<[f32; 2]>,
+    fft: Radix2Fft,
+}
+
+impl Pow2Dct4 {
+    fn new(l: usize) -> Pow2Dct4 {
+        let m = l / 2;
+        let pre = (0..m)
+            .map(|p| {
+                let th = PI * (4.0 * p as f64 + 1.0) / (4.0 * l as f64);
+                [th.cos() as f32, th.sin() as f32]
+            })
+            .collect();
+        let post = (0..m)
+            .map(|p| {
+                let ph = PI * p as f64 / l as f64;
+                [ph.cos() as f32, ph.sin() as f32]
+            })
+            .collect();
+        Pow2Dct4 { l, pre, post, fft: Radix2Fft::new(m, -1.0) }
+    }
+
+    /// The unscaled DCT-IV: `out[m] = Σ x[k]·cos(π/L·(m+½)(k+½))`, using
+    /// `scratch` (at least L/2 entries) for the FFT.
+    pub(crate) fn dct4(&self, x: &[f32], out: &mut [f32], scratch: &mut [[f32; 2]]) {
+        let (l, m) = (self.l, self.l / 2);
+        let v = &mut scratch[..m];
+        for (p, vp) in v.iter_mut().enumerate() {
+            let (yr, yi) = (x[2 * p], x[l - 1 - 2 * p]);
+            let [c, s] = self.pre[p];
+            *vp = [yr * c + yi * s, yi * c - yr * s];
+        }
+        self.fft.run(v);
+        for (p, &[vr, vi]) in v.iter().enumerate() {
+            let [c, s] = self.post[p];
+            out[2 * p] = vr * c + vi * s;
+            out[l - 1 - 2 * p] = vr * s - vi * c;
+        }
+    }
+
+    /// As [`imdct_half`]: `out[k] = -(D·X)[L-1-k]·gain/L`.
+    fn imdct_half(&self, spec: &[f32], out: &mut [f32], gain: f32) {
+        let (l, m) = (self.l, self.l / 2);
+        let mut buf = [[0f32; 2]; 1024];
+        debug_assert!(m <= buf.len());
+        let v = &mut buf[..m];
+        for (p, vp) in v.iter_mut().enumerate() {
+            let (yr, yi) = (spec[2 * p], spec[l - 1 - 2 * p]);
+            let [c, s] = self.pre[p];
+            *vp = [yr * c + yi * s, yi * c - yr * s];
+        }
+        self.fft.run(v);
+        let scale = gain / l as f32;
+        for (p, &[vr, vi]) in v.iter().enumerate() {
+            let [c, s] = self.post[p];
+            out[l - 1 - 2 * p] = -(vr * c + vi * s) * scale;
+            out[2 * p] = -(vr * s - vi * c) * scale;
+        }
+    }
+}
+
+/// The cached power-of-two DCT-IV plan for `l` (16..=2048), if `l` qualifies.
+pub(crate) fn pow2_dct4(l: usize) -> Option<&'static Pow2Dct4> {
+    static PLANS: [OnceLock<Pow2Dct4>; 12] = [const { OnceLock::new() }; 12];
+    if !l.is_power_of_two() || !(16..=2048).contains(&l) {
+        return None;
+    }
+    Some(PLANS[l.trailing_zeros() as usize].get_or_init(|| Pow2Dct4::new(l)))
 }
 
 /// Forward MDCT with the same normalisation as [`mdct`] (`2·Σ`), any 2/3/5 size.

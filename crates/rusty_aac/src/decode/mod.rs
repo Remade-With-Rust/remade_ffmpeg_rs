@@ -650,7 +650,6 @@ impl Decoder {
         }
         el.coup = Coupling {
             point,
-            num_coupled,
             targets,
             gains,
         };
