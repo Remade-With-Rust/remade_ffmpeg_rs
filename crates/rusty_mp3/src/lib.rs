@@ -286,6 +286,26 @@ pub fn decode_pipelined(bytes: &[u8]) -> Vec<DecodedAudio> {
     }
 }
 
+/// The largest input magnitude the encoder accepts: 8x (+18 dB over) full scale.
+/// Ordinary PCM, f32 overs included, is far inside it and passes through
+/// untouched. Beyond it, input is clamped -- the rate loop was measured to fit
+/// up to 4096x full scale and to fail by 65536x, which used to surface as a
+/// panic in the reservoir assembly on hostile PCM (integer-valued "f32" samples,
+/// random bit patterns).
+pub const MAX_INPUT_AMPLITUDE: f32 = 8.0;
+
+/// Admit one input sample: NaN becomes silence, everything else (infinities
+/// included) is clamped to [`MAX_INPUT_AMPLITUDE`]. The identity on every
+/// finite sample within range, so valid input encodes byte-for-byte as before.
+#[inline]
+fn sanitize_sample(v: f32) -> f32 {
+    if v.is_nan() {
+        0.0
+    } else {
+        v.clamp(-MAX_INPUT_AMPLITUDE, MAX_INPUT_AMPLITUDE)
+    }
+}
+
 /// Configuration for [`Mp3Encoder`].
 #[derive(Debug, Clone, Default)]
 pub struct Mp3EncoderConfig {
@@ -561,7 +581,7 @@ impl Mp3Encoder {
                 let ic = c.min(in_ch - 1);
                 let dst = &mut self.pcm[c];
                 dst.reserve(spf.saturating_sub(dst.len()));
-                dst.extend((s..s + n).map(|k| get(k * in_ch + ic)));
+                dst.extend((s..s + n).map(|k| sanitize_sample(get(k * in_ch + ic))));
             }
             s += n;
         }
@@ -713,6 +733,57 @@ mod tests {
             mp3.extend_from_slice(&p);
         }
         mp3
+    }
+
+    /// Hostile PCM -- NaN, infinities, integer-valued "f32" samples, random bit
+    /// patterns -- must encode without panicking at every MPEG-1 rate and CBR
+    /// bitrate (the reservoir path, where out-of-range input used to panic in the
+    /// stream assembly), and in-range samples must be untouched by the input
+    /// sanitizer.
+    #[test]
+    fn hostile_pcm_never_panics() {
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for kind in 0..4 {
+            for &sr in &[32_000u32, 44_100, 48_000] {
+                for &kbps in &[32u32, 128, 192] {
+                    let pcm: Vec<f32> = (0..2 * 4 * 1152)
+                        .map(|_| match kind {
+                            0 => f32::from_bits(rnd() as u32),
+                            1 => [f32::NAN, f32::INFINITY, f32::NEG_INFINITY][(rnd() % 3) as usize],
+                            2 => (rnd() as i32) as f32,
+                            _ => 65_536.0 * if rnd() & 1 == 0 { 1.0 } else { -1.0 },
+                        })
+                        .collect();
+                    let mut enc = Mp3Encoder::new(Mp3EncoderConfig {
+                        bitrate_kbps: kbps,
+                        vbr_quality: None,
+                    });
+                    enc.push_pcm_f32(&pcm, 2, sr).unwrap();
+                    enc.finish();
+                    let mut bytes = 0;
+                    while let Ok(p) = enc.next_packet() {
+                        bytes += p.len();
+                    }
+                    assert!(bytes > 0, "kind {kind} @ {sr}/{kbps}k produced nothing");
+                }
+            }
+        }
+        for v in [0.0f32, -0.0, 1.0, -1.0, 0.5, 7.999, -8.0, f32::MIN_POSITIVE] {
+            assert_eq!(
+                sanitize_sample(v).to_bits(),
+                v.to_bits(),
+                "{v} must pass through"
+            );
+        }
+        assert_eq!(sanitize_sample(f32::NAN), 0.0);
+        assert_eq!(sanitize_sample(f32::INFINITY), MAX_INPUT_AMPLITUDE);
+        assert_eq!(sanitize_sample(-1e9), -MAX_INPUT_AMPLITUDE);
     }
 
     /// Every push entry point, and every way of slicing the input across pushes,

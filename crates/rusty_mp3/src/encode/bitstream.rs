@@ -337,9 +337,19 @@ fn reservoir_layout(
         if p > md.len() + MAX_BEGIN {
             md.resize(p - MAX_BEGIN, 0); // stuffing → begin == MAX_BEGIN
         }
-        let begin = p
-            .checked_sub(md.len())
-            .expect("frame data outran cumulative capacity (needs rate control)");
+        let begin = match p.checked_sub(md.len()) {
+            Some(begin) => begin,
+            // The banked data outran the capacity behind it. The rate loop does
+            // not let that happen for any input the push boundary admits
+            // (finite, |x| <= MAX_INPUT_AMPLITUDE: measured clean up to 4096x
+            // full scale, i.e. a 512x margin). This used to `expect` -- a panic
+            // reachable from hostile PCM. If it ever happens, drop the overflow
+            // instead: the preceding frame is damaged, the stream stays valid.
+            None => {
+                md.truncate(p);
+                0
+            }
+        };
         begins.push(begin);
         md.extend_from_slice(data);
         p += caps[n];
@@ -583,6 +593,40 @@ mod tests {
             frames += 1;
         }
         assert_eq!(frames, 2, "both assembled frames must decode");
+    }
+
+    /// Data that outruns the cumulative capacity (which the rate loop never
+    /// produces for admitted input) must degrade, not panic: every frame is still
+    /// emitted at its fixed size and the stream still decodes frame for frame.
+    #[test]
+    fn reservoir_overflow_degrades_instead_of_panicking() {
+        use crate::frame::GranuleSideInfo;
+        let header = hdr(ChannelMode::Mono);
+        let cap = region_capacity(&header);
+        let mut si = SideInfo::default();
+        for gr in 0..2 {
+            si.granules[gr][0] = GranuleSideInfo::default();
+        }
+        // Three frames each carrying far more than any reservoir could bank.
+        let frames: Vec<_> = (0..3u8)
+            .map(|i| (header.clone(), si.clone(), vec![0x50 + i; 3 * cap + 600]))
+            .collect();
+        let stream = assemble_stream(&frames);
+        assert_eq!(stream.len(), frames.len() * header.frame_size());
+        let split = assemble_frames(&frames);
+        assert_eq!(
+            split.concat(),
+            stream,
+            "both assemblers agree on overflow too"
+        );
+        let mut dec = crate::Mp3Decoder::default();
+        dec.push(&stream);
+        dec.flush();
+        let mut n = 0;
+        while dec.next_frame().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 3);
     }
 
     #[test]
