@@ -35,7 +35,7 @@ type Cpx = [f32; 2];
 // Huffman decoding of the SBR codebooks.
 // ---------------------------------------------------------------------------
 
-struct SbrBook {
+pub(super) struct SbrBook {
     /// (code, len, value), in canonical order.
     entries: Vec<(u32, u8, i32)>,
     /// Index into `entries` + 1 (0 = longer than the table), by the next bits.
@@ -45,7 +45,7 @@ struct SbrBook {
 const SBR_LUT_BITS: u32 = 9;
 
 impl SbrBook {
-    fn new(tab: &(&[(u8, u8)], i32)) -> SbrBook {
+    pub(super) fn new(tab: &(&[(u8, u8)], i32)) -> SbrBook {
         let (syms, off) = *tab;
         let mut acc: u64 = 0;
         let mut entries = Vec::with_capacity(syms.len());
@@ -65,7 +65,7 @@ impl SbrBook {
         SbrBook { entries, lut }
     }
 
-    fn decode(&self, r: &mut BitReader) -> Result<i32> {
+    pub(super) fn decode(&self, r: &mut BitReader) -> Result<i32> {
         let i = self.lut[r.peek_bits(SBR_LUT_BITS) as usize];
         if i != 0 {
             let (_, l, v) = self.entries[i as usize - 1];
