@@ -54,6 +54,101 @@ impl Windows {
 /// through the half window `win` (`2·len` samples), writing `2·len` outputs.
 #[inline]
 pub fn fmul_window(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f32], len: usize) {
+    let (dst, src0, src1, win) = (&mut dst[..2 * len], &src0[..len], &src1[..len], &win[..2 * len]);
+    // The mirrored halves defeat the auto-vectoriser (reversed writes into two
+    // halves of one buffer), so the overlap window has explicit twins: SSE on
+    // x86-64 (baseline, no detection) and NEON on aarch64, four samples per op
+    // with a lane reversal for the mirrored streams. Same products and sums per
+    // sample as the scalar path, so bit-identical (`fmul_window_matches_reference`).
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    {
+        crate::prof::count(crate::prof::Kernel::FmulWindow, true, len);
+        // SAFETY: SSE2 is baseline on x86-64; the slices are re-bounded above to
+        // exactly the lengths `fmul_window_sse` reads and writes.
+        unsafe { fmul_window_sse(dst, src0, src1, win, len) };
+        return;
+    }
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    {
+        crate::prof::count(crate::prof::Kernel::FmulWindow, true, len);
+        // SAFETY: NEON is baseline on aarch64; bounds as above.
+        unsafe { fmul_window_neon(dst, src0, src1, win, len) };
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        crate::prof::count(crate::prof::Kernel::FmulWindow, false, len);
+        fmul_window_scalar(dst, src0, src1, win, len, 0);
+    }
+}
+
+/// The scalar body for outputs `t >= from` (the SIMD twins' tail).
+#[inline(always)]
+fn fmul_window_scalar(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f32], len: usize, from: usize) {
+    for t in from..len {
+        let jj = 2 * len - 1 - t;
+        let (s0, s1) = (src0[t], src1[len - 1 - t]);
+        let (wi, wj) = (win[t], win[jj]);
+        dst[t] = s0 * wj - s1 * wi;
+        dst[jj] = s0 * wi + s1 * wj;
+    }
+}
+
+/// SSE twin of [`fmul_window`].
+///
+/// # Safety
+/// `dst.len() == win.len() == 2·len`, `src0.len() == src1.len() == len`. A trip
+/// at `t` (`t + 4 <= len`) touches `src0/win/dst[t..t+4]`,
+/// `src1[len-4-t..len-t]` and `win/dst[2len-4-t..2len-t]`.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+unsafe fn fmul_window_sse(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f32], len: usize) {
+    use std::arch::x86_64::*;
+    let (d, s0p, s1p, w) = (dst.as_mut_ptr(), src0.as_ptr(), src1.as_ptr(), win.as_ptr());
+    let mut t = 0;
+    while t + 4 <= len {
+        let s0 = _mm_loadu_ps(s0p.add(t));
+        let wi = _mm_loadu_ps(w.add(t));
+        let s1 = _mm_shuffle_ps::<0x1B>(_mm_loadu_ps(s1p.add(len - 4 - t)), _mm_loadu_ps(s1p.add(len - 4 - t)));
+        let wj = _mm_shuffle_ps::<0x1B>(_mm_loadu_ps(w.add(2 * len - 4 - t)), _mm_loadu_ps(w.add(2 * len - 4 - t)));
+        _mm_storeu_ps(d.add(t), _mm_sub_ps(_mm_mul_ps(s0, wj), _mm_mul_ps(s1, wi)));
+        let hi = _mm_add_ps(_mm_mul_ps(s0, wi), _mm_mul_ps(s1, wj));
+        _mm_storeu_ps(d.add(2 * len - 4 - t), _mm_shuffle_ps::<0x1B>(hi, hi));
+        t += 4;
+    }
+    fmul_window_scalar(dst, src0, src1, win, len, t);
+}
+
+/// NEON twin of [`fmul_window`].
+///
+/// # Safety
+/// As for `fmul_window_sse`.
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[target_feature(enable = "neon")]
+unsafe fn fmul_window_neon(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f32], len: usize) {
+    use std::arch::aarch64::*;
+    #[inline(always)]
+    unsafe fn rev4(v: float32x4_t) -> float32x4_t {
+        let r = vrev64q_f32(v);
+        vextq_f32::<2>(r, r)
+    }
+    let (d, s0p, s1p, w) = (dst.as_mut_ptr(), src0.as_ptr(), src1.as_ptr(), win.as_ptr());
+    let mut t = 0;
+    while t + 4 <= len {
+        let s0 = vld1q_f32(s0p.add(t));
+        let wi = vld1q_f32(w.add(t));
+        let s1 = rev4(vld1q_f32(s1p.add(len - 4 - t)));
+        let wj = rev4(vld1q_f32(w.add(2 * len - 4 - t)));
+        vst1q_f32(d.add(t), vsubq_f32(vmulq_f32(s0, wj), vmulq_f32(s1, wi)));
+        let hi = vaddq_f32(vmulq_f32(s0, wi), vmulq_f32(s1, wj));
+        vst1q_f32(d.add(2 * len - 4 - t), rev4(hi));
+        t += 4;
+    }
+    fmul_window_scalar(dst, src0, src1, win, len, t);
+}
+
+/// The indexed form `fmul_window` replaced, kept as the bit-exact oracle.
+#[cfg(test)]
+fn fmul_window_reference(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f32], len: usize) {
     for t in 0..len {
         let jj = 2 * len - 1 - t;
         let s0 = src0[t];
@@ -62,6 +157,22 @@ pub fn fmul_window(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f32], len
         let wj = win[jj];
         dst[t] = s0 * wj - s1 * wi;
         dst[jj] = s0 * wi + s1 * wj;
+    }
+}
+
+#[cfg(test)]
+mod fmul_window_twin {
+    #[test]
+    fn fmul_window_matches_reference() {
+        for len in [1usize, 2, 3, 7, 32, 60, 64, 120, 128, 240, 480, 512] {
+            let src0: Vec<f32> = (0..len).map(|i| (i as f32 * 0.7).sin() * 1000.0).collect();
+            let src1: Vec<f32> = (0..len).map(|i| (i as f32 * 1.3).cos() * 900.0).collect();
+            let win: Vec<f32> = (0..2 * len).map(|i| (i as f32 * 0.01).sin()).collect();
+            let (mut got, mut want) = (vec![0f32; 2 * len], vec![0f32; 2 * len]);
+            super::fmul_window(&mut got, &src0, &src1, &win, len);
+            super::fmul_window_reference(&mut want, &src0, &src1, &win, len);
+            assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "len={len}");
+        }
     }
 }
 
