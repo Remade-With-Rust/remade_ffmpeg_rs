@@ -24,6 +24,8 @@
 
 mod bits;
 mod codebook;
+/// The full `AudioSpecificConfig` (GA/ELD/PCE/SBR/PS) — what a stream is.
+pub mod config;
 pub mod decode;
 mod dsp;
 pub mod encode;
@@ -44,6 +46,7 @@ pub mod lab;
 pub mod sbr;
 mod swb;
 mod tables;
+mod tables_ext;
 
 pub use bits::BitReader;
 pub use encode::{
@@ -202,9 +205,13 @@ impl DecodedAudio {
 #[derive(Default)]
 pub struct AacDecoder {
     config: Option<AudioSpecificConfig>,
+    stream: Option<config::StreamConfig>,
     decoder: Option<decode::Decoder>,
     /// HE-AAC parameters, when built via [`AacDecoder::with_config_bytes`].
     sbr: Option<sbr::SbrConfig>,
+    /// (object type, rate, channel configuration) of the ADTS stream decoded so
+    /// far: a change mid-stream rebuilds the decoder, as a real stream switch must.
+    adts_key: Option<(u8, u32, u16)>,
 }
 
 impl AacDecoder {
@@ -217,34 +224,52 @@ impl AacDecoder {
     /// (the MP4 `esds` payload) — required for bare raw access units.
     pub fn with_config(cfg: AudioSpecificConfig) -> AacDecoder {
         AacDecoder {
+            stream: Some(config::StreamConfig::lc(
+                cfg.object_type,
+                cfg.sample_rate,
+                cfg.channels as u8,
+            )),
             config: Some(cfg),
-            decoder: None,
-            sbr: None,
+            ..Default::default()
         }
     }
 
     /// A decoder configured from the **raw** `AudioSpecificConfig` bytes.
     ///
     /// Prefer this over [`with_config`](Self::with_config) whenever the raw bytes
-    /// are available (they always are — `esds`, `StreamMuxConfig`), because HE-AAC
-    /// signalling lives in fields the plain [`AudioSpecificConfig`] does not
-    /// carry. An HE-AAC stream configured through the plain path reports its
-    /// **core** rate, and a player that believes it plays the audio at half
-    /// speed.
+    /// are available (they always are — `esds`, `StreamMuxConfig`): HE-AAC
+    /// signalling, PCE channel layouts, the 960-sample frame flag and the
+    /// LD/ELD parameters all live in fields the plain [`AudioSpecificConfig`]
+    /// does not carry.
     pub fn with_config_bytes(data: &[u8]) -> Result<AacDecoder> {
-        let sbr = sbr::parse_sbr_config(data)?;
-        let mut cfg = parse_audio_specific_config(data)?;
-        // The core decodes at the core rate whatever the config's first field
-        // said; for hierarchical HE-AAC that field was the extension rate.
-        if sbr.sbr_present {
-            cfg.sample_rate = sbr.core_sample_rate;
-            cfg.object_type = sbr.core_object_type;
-        }
-        Ok(AacDecoder {
-            config: Some(cfg),
+        let stream = config::parse(data)?;
+        Ok(AacDecoder::with_stream_config(stream))
+    }
+
+    /// A decoder for an already-parsed [`config::StreamConfig`].
+    pub fn with_stream_config(stream: config::StreamConfig) -> AacDecoder {
+        let sbr = sbr::SbrConfig {
+            sbr_present: stream.sbr,
+            ps_present: stream.ps,
+            core_sample_rate: stream.sample_rate,
+            output_sample_rate: if stream.sbr {
+                stream.ext_sample_rate
+            } else {
+                stream.sample_rate
+            },
+            core_object_type: stream.object_type,
+        };
+        AacDecoder {
+            config: Some(AudioSpecificConfig {
+                object_type: stream.object_type,
+                sample_rate: stream.sample_rate,
+                channels: stream.channels() as u16,
+            }),
+            stream: Some(stream),
             decoder: None,
             sbr: Some(sbr),
-        })
+            adts_key: None,
+        }
     }
 
     /// HE-AAC parameters, when the decoder was built from raw config bytes.
@@ -253,10 +278,6 @@ impl AacDecoder {
     }
 
     /// How much of this stream can actually be reconstructed.
-    ///
-    /// [`SbrSupport::CoreOnly`](sbr::SbrSupport::CoreOnly) means the output is
-    /// real audio, correct in rate and channels, but band-limited to the core's
-    /// Nyquist because the SBR high band is not reconstructed.
     pub fn sbr_support(&self) -> sbr::SbrSupport {
         match self.sbr {
             Some(s) => s.support(),
@@ -264,54 +285,95 @@ impl AacDecoder {
         }
     }
 
-    /// The stream's **output** sample rate.
-    ///
-    /// For HE-AAC this is twice the rate the `raw_data_block`s are coded at.
-    /// Returns `None` until the configuration is known.
+    /// The stream's **output** sample rate (twice the coded rate for dual-rate
+    /// HE-AAC). Returns `None` until the configuration is known.
     pub fn output_sample_rate(&self) -> Option<u32> {
+        if let Some(d) = &self.decoder {
+            return Some(d.output_sample_rate());
+        }
         match self.sbr {
             Some(s) if s.sbr_present => Some(s.output_sample_rate),
             _ => self.config.map(|c| c.sample_rate),
         }
     }
 
-    /// Lazily build the stateful decoder once rate/channels are known.
     fn ensure_decoder(&mut self) -> Result<&mut decode::Decoder> {
         if self.decoder.is_none() {
-            let cfg = self
-                .config
+            let stream = self
+                .stream
+                .clone()
                 .ok_or_else(|| Error::invalid("aac: stream parameters unknown"))?;
-            self.decoder = Some(decode::Decoder::new(cfg.sample_rate));
+            self.decoder = Some(decode::Decoder::with_stream_config(stream)?);
         }
         Ok(self.decoder.as_mut().unwrap())
     }
 
     /// Decode one packet (an ADTS frame or a bare raw access unit) into PCM.
     ///
-    /// ADTS framing, if present, is stripped (and configures the decoder on
-    /// first use). Returns [`Error::Again`] for an empty packet (nothing to
-    /// decode — feed the next one).
+    /// ADTS framing, if present, is stripped (and configures the decoder; a
+    /// header change mid-stream reconfigures it). An ADTS frame carrying several
+    /// raw data blocks decodes to all of them. Returns [`Error::Again`] for an
+    /// empty packet (nothing to decode — feed the next one).
     pub fn decode(&mut self, packet: &[u8], pts: Option<i64>) -> Result<DecodedAudio> {
-        // Strip ADTS framing if present; MP4 delivers bare access units.
-        let mut data = packet;
-        if is_adts(data) {
-            let header = parse_adts(data)?;
-            if self.config.is_none() {
+        if !is_adts(packet) {
+            if packet.is_empty() {
+                return Err(Error::Again);
+            }
+            return self.ensure_decoder()?.decode(packet, pts);
+        }
+        let header = parse_adts(packet)?;
+        let key = (header.object_type, header.sample_rate, header.channels);
+        if self.adts_key != Some(key) {
+            let reconfigure = self.adts_key.is_some() || self.stream.is_none();
+            self.adts_key = Some(key);
+            if reconfigure {
                 self.config = Some(AudioSpecificConfig {
                     object_type: header.object_type,
                     sample_rate: header.sample_rate,
                     channels: header.channels,
                 });
+                self.stream = Some(config::StreamConfig::lc(
+                    header.object_type,
+                    header.sample_rate,
+                    header.channels as u8,
+                ));
+                self.decoder = None;
             }
-            data = data
-                .get(header.header_len..header.frame_length.min(data.len()))
-                .unwrap_or(&[]);
         }
-        if data.is_empty() {
-            return Err(Error::Again);
+        let end = header.frame_length.min(packet.len());
+        let blocks = adts_raw_blocks(packet) as usize;
+        let protected = header.header_len == 9;
+        if blocks == 0 {
+            let data = packet.get(header.header_len..end).unwrap_or(&[]);
+            if data.is_empty() {
+                return Err(Error::Again);
+            }
+            return self.ensure_decoder()?.decode(data, pts);
         }
-        self.ensure_decoder()?.decode(data, pts)
+        // Several raw_data_blocks: with protection the header carries their
+        // positions (and each block a CRC); without, they simply follow each
+        // other, each byte-aligned.
+        let mut pos = if protected { 7 + 2 * blocks + 2 } else { 7 };
+        let mut out: Option<DecodedAudio> = None;
+        for _ in 0..=blocks {
+            let data = packet.get(pos..end).unwrap_or(&[]);
+            if data.is_empty() {
+                break;
+            }
+            let (frame, used) = self.ensure_decoder()?.decode_block(data, pts)?;
+            pos += used + if protected { 2 } else { 0 };
+            match out.as_mut() {
+                Some(o) => o.samples.extend_from_slice(&frame.samples),
+                None => out = Some(frame),
+            }
+        }
+        out.ok_or(Error::Again)
     }
+}
+
+/// `number_of_raw_data_blocks_in_frame` of an ADTS header (0 = one block).
+pub fn adts_raw_blocks(data: &[u8]) -> u8 {
+    data.get(6).map(|b| b & 0x03).unwrap_or(0)
 }
 
 #[cfg(test)]

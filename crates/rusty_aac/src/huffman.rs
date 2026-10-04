@@ -20,7 +20,13 @@ pub struct HuffBook {
     codes: &'static [u32],
     lens: &'static [u8],
     max_len: u8,
+    /// Primary lookup table over the next `LUT_BITS` bits: `sym << 8 | len`, or 0
+    /// for "longer code, take the scan". Built on first use.
+    lut: std::sync::OnceLock<Vec<u32>>,
 }
+
+/// Width of the primary lookup (2^11 entries, 8 KiB per book).
+const LUT_BITS: u32 = 11;
 
 impl HuffBook {
     pub const fn new(codes: &'static [u32], lens: &'static [u8]) -> HuffBook {
@@ -36,6 +42,7 @@ impl HuffBook {
             codes,
             lens,
             max_len: max,
+            lut: std::sync::OnceLock::new(),
         }
     }
 
@@ -48,8 +55,39 @@ impl HuffBook {
         (self.codes[i], self.lens[i])
     }
 
-    /// Decode the next codeword, returning its symbol index.
+    fn build_lut(&self) -> Vec<u32> {
+        let bits = LUT_BITS.min(self.max_len as u32);
+        let mut lut = vec![0u32; 1 << bits];
+        for (i, (&c, &l)) in self.codes.iter().zip(self.lens).enumerate() {
+            let l = l as u32;
+            if l == 0 || l > bits {
+                continue;
+            }
+            let base = (c << (bits - l)) as usize;
+            for e in lut.iter_mut().skip(base).take(1 << (bits - l)) {
+                *e = ((i as u32) << 8) | l;
+            }
+        }
+        lut
+    }
+
+    /// Decode the next codeword, returning its symbol index. One table lookup
+    /// for codes up to `LUT_BITS` long; the scan below (the original decoder,
+    /// kept as the oracle) for the rare longer ones.
+    #[inline]
     pub fn decode(&self, r: &mut BitReader) -> Result<u16> {
+        let lut = self.lut.get_or_init(|| self.build_lut());
+        let bits = LUT_BITS.min(self.max_len as u32);
+        let e = lut[r.peek_bits(bits) as usize];
+        if e != 0 {
+            r.skip((e & 0xFF) as usize)?;
+            return Ok((e >> 8) as u16);
+        }
+        self.decode_scan(r)
+    }
+
+    /// The bit-serial scan decoder (test oracle and long-code fallback).
+    pub fn decode_scan(&self, r: &mut BitReader) -> Result<u16> {
         let mut code = 0u32;
         for len in 1..=self.max_len {
             code = (code << 1) | r.read_bit()?;
@@ -105,6 +143,33 @@ mod tests {
         let mut r = BitReader::new(&[0x5B, 0x80]);
         let got: Vec<u16> = (0..5).map(|_| book.decode(&mut r).unwrap()).collect();
         assert_eq!(got, vec![0, 1, 2, 3, 0]);
+    }
+
+    /// The table decoder must agree with the scan on every codeword of every
+    /// spectral and scalefactor book, followed by arbitrary bits.
+    #[test]
+    fn lut_matches_scan_on_every_book() {
+        let mut books: Vec<&HuffBook> = vec![&crate::tables::SCALEFACTOR_BOOK];
+        for cb in 1..=11u8 {
+            books.push(crate::tables::spectral_book(cb));
+        }
+        for book in books {
+            for i in 0..book.count() {
+                let (code, len) = book.code(i);
+                // codeword, then a tail of alternating bits, MSB-first into bytes.
+                let mut bitsv: Vec<u8> = (0..len).rev().map(|b| ((code >> b) & 1) as u8).collect();
+                bitsv.extend((0..23).map(|k| (k % 3 == 0) as u8));
+                let mut bytes = vec![0u8; bitsv.len().div_ceil(8) + 1];
+                for (k, &b) in bitsv.iter().enumerate() {
+                    bytes[k / 8] |= b << (7 - k % 8);
+                }
+                let mut a = BitReader::new(&bytes);
+                let mut b = BitReader::new(&bytes);
+                assert_eq!(book.decode(&mut a).unwrap(), i as u16);
+                assert_eq!(book.decode_scan(&mut b).unwrap(), i as u16);
+                assert_eq!(a.position(), b.position());
+            }
+        }
     }
 
     #[test]

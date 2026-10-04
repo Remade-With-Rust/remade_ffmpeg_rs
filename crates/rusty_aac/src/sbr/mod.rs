@@ -36,8 +36,9 @@
 //! rate, and [`SbrSupport`] says plainly that the high band is absent instead of
 //! pretending otherwise.
 
-use crate::bits::BitReader;
-use crate::{Error, Result};
+pub(crate) mod dec;
+
+use crate::Result;
 
 /// `audioObjectType` values that name an SBR-bearing configuration.
 pub const AOT_SBR: u8 = 5;
@@ -100,113 +101,21 @@ impl SbrConfig {
     }
 }
 
-/// Read a (possibly escaped) 5-bit `audioObjectType`.
-fn read_aot(r: &mut BitReader) -> Result<u8> {
-    let ot = r.read_bits(5)? as u8;
-    if ot == 31 {
-        Ok((32 + r.read_bits(6)?) as u8)
-    } else {
-        Ok(ot)
-    }
-}
-
-/// Read a `samplingFrequencyIndex`, honouring the 0x0F escape.
-fn read_sampling_frequency(r: &mut BitReader) -> Result<u32> {
-    let idx = r.read_bits(4)? as u8;
-    let rate = if idx == 0x0F {
-        r.read_bits(24)?
-    } else {
-        crate::sample_rate_for_index(idx)
-    };
-    if rate == 0 {
-        return Err(Error::invalid("sbr: reserved sampling frequency index"));
-    }
-    Ok(rate)
-}
-
-/// Parse an `AudioSpecificConfig` for HE-AAC signalling.
+/// Parse an `AudioSpecificConfig` for HE-AAC signalling (a view over
+/// [`crate::config::parse`], which handles both explicit forms and the field
+/// order: in the hierarchical AOT 5/29 form the FIRST rate is the core rate and
+/// the extension rate follows `channelConfiguration`).
 ///
-/// Handles both forms the standard defines, because real streams use both:
-///
-/// * **Explicit hierarchical** — `audioObjectType` is 5 (SBR) or 29 (PS), and the
-///   extension rate and true core object type follow immediately. A legacy AAC-LC
-///   decoder cannot read these at all.
-/// * **Explicit backward-compatible** — `audioObjectType` is 2 (AAC-LC), and a
-///   `0x2B7` sync extension *after* the `GASpecificConfig` announces SBR. Legacy
-///   decoders skip the extension and decode the core, which is precisely the
-///   point.
-///
-/// A stream with neither yields `sbr_present = false`.
+/// A stream with neither form yields `sbr_present = false`.
 pub fn parse_sbr_config(data: &[u8]) -> Result<SbrConfig> {
-    let mut r = BitReader::new(data);
-    let mut aot = read_aot(&mut r)?;
-    let core_rate_first = read_sampling_frequency(&mut r)?;
-    let _channels = r.read_bits(4)?;
-
-    let mut cfg = SbrConfig {
-        core_sample_rate: core_rate_first,
-        output_sample_rate: core_rate_first,
-        core_object_type: aot,
-        ..Default::default()
-    };
-
-    let hierarchical = aot == AOT_SBR || aot == AOT_PS;
-    if hierarchical {
-        cfg.sbr_present = true;
-        cfg.ps_present = aot == AOT_PS;
-        // In this form the rate read above is the EXTENSION (output) rate, and
-        // the core rate follows the inner object type. Getting these the wrong
-        // way round is the classic half-speed/double-speed HE-AAC bug.
-        cfg.output_sample_rate = core_rate_first;
-        aot = read_aot(&mut r)?;
-        cfg.core_object_type = aot;
-        if aot == AOT_ER_BSAC {
-            let _ext_channels = r.read_bits(4)?;
-        }
-        // The core rate is not restated; for every real HE-AAC stream it is half
-        // the extension rate.
-        cfg.core_sample_rate = core_rate_first / 2;
-    }
-
-    // GASpecificConfig (AAC-LC): three flags.
-    if aot == AOT_AAC_LC {
-        let frame_length_flag = r.read_bool()?;
-        if frame_length_flag {
-            return Err(Error::unsupported("sbr: 960-sample frames not supported"));
-        }
-        if r.read_bool()? {
-            return Err(Error::unsupported("sbr: core-coder delay not supported"));
-        }
-        let _extension_flag = r.read_bool()?;
-    }
-
-    // Backward-compatible signalling: only meaningful when the hierarchical form
-    // was NOT used.
-    if !hierarchical && r.bits_left() >= 16 {
-        let sync = r.read_bits(11)?;
-        if sync == SYNC_EXT_SBR {
-            let ext_aot = read_aot(&mut r)?;
-            if ext_aot == AOT_SBR {
-                let sbr_present = r.read_bool()?;
-                if sbr_present {
-                    cfg.sbr_present = true;
-                    cfg.output_sample_rate = read_sampling_frequency(&mut r)?;
-                    if r.bits_left() >= 12 {
-                        let sync2 = r.read_bits(11)?;
-                        if sync2 == SYNC_EXT_PS {
-                            cfg.ps_present = r.read_bool()?;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // A stream signalling SBR but no explicit output rate implies doubling.
-    if cfg.sbr_present && cfg.output_sample_rate == cfg.core_sample_rate {
-        cfg.output_sample_rate = cfg.core_sample_rate * 2;
-    }
-    Ok(cfg)
+    let c = crate::config::parse(data)?;
+    Ok(SbrConfig {
+        sbr_present: c.sbr,
+        ps_present: c.ps,
+        core_sample_rate: c.sample_rate,
+        output_sample_rate: if c.sbr { c.ext_sample_rate } else { c.sample_rate },
+        core_object_type: c.object_type,
+    })
 }
 
 /// Does this `fill_element` payload carry SBR data?
@@ -248,8 +157,9 @@ mod tests {
     fn explicit_hierarchical_he_aac_v1() {
         let mut w = BitWriter::new();
         w.write(AOT_SBR as u32, 5);
-        w.write(4, 4); // extension sfIndex = 44100
+        w.write(7, 4); // core sfIndex = 22050
         w.write(2, 4); // channels
+        w.write(4, 4); // extension sfIndex = 44100
         w.write(AOT_AAC_LC as u32, 5); // core object type
         w.write(0, 3); // GASpecificConfig
         let bytes = w.into_bytes();
@@ -268,8 +178,9 @@ mod tests {
     fn explicit_hierarchical_he_aac_v2() {
         let mut w = BitWriter::new();
         w.write(AOT_PS as u32, 5);
-        w.write(3, 4); // 48000 output
+        w.write(6, 4); // 24000 core
         w.write(2, 4);
+        w.write(3, 4); // 48000 output
         w.write(AOT_AAC_LC as u32, 5);
         w.write(0, 3);
         let s = parse_sbr_config(&w.into_bytes()).unwrap();
@@ -353,8 +264,9 @@ mod tests {
         // Explicit hierarchical HE-AAC v1: 44100 output, 22050 core.
         let mut w = BitWriter::new();
         w.write(AOT_SBR as u32, 5);
-        w.write(4, 4); // extension sfIndex = 44100
+        w.write(7, 4); // core sfIndex = 22050
         w.write(1, 4); // mono
+        w.write(4, 4); // extension sfIndex = 44100
         w.write(AOT_AAC_LC as u32, 5);
         w.write(0, 3);
         let asc = w.into_bytes();

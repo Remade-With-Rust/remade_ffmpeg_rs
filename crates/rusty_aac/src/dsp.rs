@@ -228,6 +228,232 @@ pub fn mdct_fast(x: &[f32]) -> Vec<f32> {
     out
 }
 
+/// Fast IMDCT (O(N log N)) — numerically matches the direct [`imdct`] (kept as the
+/// scalar oracle). `N/2` coefficients → `N` time samples.
+///
+/// Derivation: the MDCT factors as `C = D·F`, where `F` is the TDAC fold
+/// (`N → L = N/2`, the `fold` closure in [`mdct_fast`]) and `D` is the `L`-point
+/// DCT-IV. The spec IMDCT is `(2/N)·Cᵀ = (2/N)·Fᵀ·D` (DCT-IV is symmetric), so it is
+/// the SAME pre-rotation / `N/4`-point FFT / post-rotation core run on the
+/// coefficients (which yields `2·D·X`), followed by the transpose of the fold — an
+/// unfold that writes every output sample exactly once.
+pub fn imdct_fast(spec: &[f32]) -> Vec<f32> {
+    let l = spec.len();
+    let n = l * 2;
+    if n < 8 {
+        return imdct(spec);
+    }
+    let m = n / 4;
+    let owned;
+    let tw = match mdct_twiddles(n) {
+        Some(t) => t,
+        None => {
+            owned = MdctTwiddles::build(n);
+            &owned
+        }
+    };
+    let (mut re, mut im) = (vec![0f64; m], vec![0f64; m]);
+    for p in 0..m {
+        let (yr, yi) = (spec[2 * p] as f64, spec[l - 1 - 2 * p] as f64);
+        re[p] = yr * tw.pre_c[p] + yi * tw.pre_s[p];
+        im[p] = yi * tw.pre_c[p] - yr * tw.pre_s[p];
+    }
+    fft(&mut re, &mut im, &tw.fft_c, &tw.fft_s);
+    // z = D·X (the core produces 2·D·X; the ×2 and the spec's 2/N fold into 1/N).
+    let scale = 1.0 / n as f64;
+    let mut z = vec![0f64; l];
+    for p in 0..m {
+        let (vr, vi) = (re[p], im[p]);
+        z[2 * p] = 2.0 * (vr * tw.post_c[p] + vi * tw.post_s[p]) * scale;
+        z[l - 1 - 2 * p] = 2.0 * (vr * tw.post_s[p] - vi * tw.post_c[p]) * scale;
+    }
+    // Unfold = Fᵀ: the fold read y[mm] from these x positions, so scatter back.
+    let (l2, l32) = (l / 2, 3 * l / 2);
+    let mut out = vec![0f32; n];
+    for (mm, &v) in z.iter().enumerate() {
+        if mm < l2 {
+            out[l32 - 1 - mm] = -v as f32;
+            out[mm + l32] = -v as f32;
+        } else {
+            out[mm - l2] = v as f32;
+            out[l32 - 1 - mm] = -v as f32;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Mixed-radix (2/3/5) transforms for the non-power-of-two frame lengths
+// (960/120 for GA, 480 for LD/ELD) — and the half-length IMDCT the decoder's
+// synthesis works in.
+// ---------------------------------------------------------------------------
+
+/// A complex FFT plan for any size whose prime factors are 2, 3 and 5.
+struct MixedFft {
+    n: usize,
+    /// e^{-2πi t/n}, t in 0..n.
+    w: Vec<(f64, f64)>,
+}
+
+impl MixedFft {
+    fn new(n: usize) -> MixedFft {
+        let w = (0..n)
+            .map(|t| {
+                let a = -2.0 * PI * t as f64 / n as f64;
+                (a.cos(), a.sin())
+            })
+            .collect();
+        MixedFft { n, w }
+    }
+
+    fn radix(n: usize) -> usize {
+        if n % 4 == 0 {
+            4
+        } else if n % 2 == 0 {
+            2
+        } else if n % 3 == 0 {
+            3
+        } else if n % 5 == 0 {
+            5
+        } else {
+            n // prime remainder: direct DFT
+        }
+    }
+
+    /// out[k] = Σ_j x[off + j·stride] · e^{-2πi jk/n}, recursive decimation in time.
+    fn rec(&self, x: &[(f64, f64)], off: usize, stride: usize, n: usize, out: &mut [(f64, f64)]) {
+        if n == 1 {
+            out[0] = x[off];
+            return;
+        }
+        let r = Self::radix(n);
+        let m = n / r;
+        for j1 in 0..r {
+            self.rec(x, off + j1 * stride, stride * r, m, &mut out[j1 * m..(j1 + 1) * m]);
+        }
+        let step = self.n / n; // W_n^x = W_N^(x·step)
+        let mut t = [(0f64, 0f64); 5];
+        let mut tmp = vec![(0f64, 0f64); if r > 5 { r } else { 0 }];
+        for k1 in 0..m {
+            let buf: &mut [(f64, f64)] = if r <= 5 { &mut t[..r] } else { &mut tmp[..] };
+            for (j1, b) in buf.iter_mut().enumerate() {
+                let (wr, wi) = self.w[(j1 * k1 * step) % self.n];
+                let (vr, vi) = out[j1 * m + k1];
+                *b = (vr * wr - vi * wi, vr * wi + vi * wr);
+            }
+            for k2 in 0..r {
+                let (mut sr, mut si) = (0f64, 0f64);
+                for (j1, &(br, bi)) in buf.iter().enumerate() {
+                    let (wr, wi) = self.w[((j1 * k2) % r) * (self.n / r)];
+                    sr += br * wr - bi * wi;
+                    si += br * wi + bi * wr;
+                }
+                out[k1 + m * k2] = (sr, si);
+            }
+        }
+    }
+
+    fn forward(&self, x: &[(f64, f64)]) -> Vec<(f64, f64)> {
+        let mut out = vec![(0f64, 0f64); self.n];
+        self.rec(x, 0, 1, self.n, &mut out);
+        out
+    }
+}
+
+/// Twiddles + FFT for an `L`-coefficient DCT-IV core (the MDCT/IMDCT engine).
+struct Dct4Plan {
+    l: usize,
+    pre: Vec<(f64, f64)>,
+    post: Vec<(f64, f64)>,
+    fft: MixedFft,
+}
+
+impl Dct4Plan {
+    fn new(l: usize) -> Dct4Plan {
+        let m = l / 2;
+        let pre = (0..m)
+            .map(|p| {
+                let th = PI * (4.0 * p as f64 + 1.0) / (4.0 * l as f64);
+                (th.cos(), th.sin())
+            })
+            .collect();
+        let post = (0..m)
+            .map(|p| {
+                let ph = PI * p as f64 / l as f64;
+                (ph.cos(), ph.sin())
+            })
+            .collect();
+        Dct4Plan {
+            l,
+            pre,
+            post,
+            fft: MixedFft::new(m),
+        }
+    }
+
+    /// Returns `2·D·y` (D = the L-point DCT-IV), exactly the core `mdct_fast` uses.
+    fn run(&self, y: impl Fn(usize) -> f64) -> Vec<f64> {
+        let (l, m) = (self.l, self.l / 2);
+        let v: Vec<(f64, f64)> = (0..m)
+            .map(|p| {
+                let (yr, yi) = (y(2 * p), y(l - 1 - 2 * p));
+                let (c, s) = self.pre[p];
+                (yr * c + yi * s, yi * c - yr * s)
+            })
+            .collect();
+        let f = self.fft.forward(&v);
+        let mut z = vec![0f64; l];
+        for p in 0..m {
+            let (vr, vi) = f[p];
+            let (c, s) = self.post[p];
+            z[2 * p] = 2.0 * (vr * c + vi * s);
+            z[l - 1 - 2 * p] = 2.0 * (vr * s - vi * c);
+        }
+        z
+    }
+}
+
+fn dct4_plan(l: usize) -> &'static Dct4Plan {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static PLANS: OnceLock<Mutex<HashMap<usize, &'static Dct4Plan>>> = OnceLock::new();
+    let map = PLANS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+    *g.entry(l).or_insert_with(|| Box::leak(Box::new(Dct4Plan::new(l))))
+}
+
+/// Half-length IMDCT for any even `L` with 2/3/5 factors: `L` coefficients →
+/// the MIDDLE `L` samples of the `2L`-sample spec IMDCT (with the spec's `2/N`
+/// scale), i.e. samples `L/2 .. 3L/2`. This is the buffer FFmpeg's synthesis
+/// windows from; the outer quarters follow by TDAC symmetry. `gain` scales the
+/// result (the decoder passes 1/32768 to land in float [-1, 1]).
+pub fn imdct_half(spec: &[f32], out: &mut [f32], gain: f64) {
+    let l = spec.len();
+    let plan = dct4_plan(l);
+    let z = plan.run(|i| spec[i] as f64);
+    // z = 2·D·X; the spec IMDCT is (2/N)·Fᵀ·D·X with N = 2L, so scale by 1/(2L)·…
+    // middle[k] = −(D·X)[L−1−k]·(2/N)·…  — see `imdct_fast`'s unfold.
+    let scale = gain / (2 * l) as f64;
+    for k in 0..l {
+        out[k] = (-z[l - 1 - k] * scale) as f32;
+    }
+}
+
+/// Forward MDCT with the same normalisation as [`mdct`] (`2·Σ`), any 2/3/5 size.
+pub fn mdct_any(x: &[f32]) -> Vec<f32> {
+    let n = x.len();
+    let (l, l2, l32) = (n / 2, n / 4, 3 * n / 4);
+    let plan = dct4_plan(l);
+    let fold = |mm: usize| -> f64 {
+        if mm < l2 {
+            -(x[l32 - 1 - mm] as f64) - (x[mm + l32] as f64)
+        } else {
+            (x[mm - l2] as f64) - (x[l32 - 1 - mm] as f64)
+        }
+    };
+    plan.run(fold).iter().map(|&v| v as f32).collect()
+}
+
 /// AAC sine analysis/synthesis window: `w[n] = sin(π/N·(n+½))`.
 pub fn sine_window(n: usize) -> Vec<f32> {
     (0..n)
@@ -298,6 +524,67 @@ mod tests {
                         b[k]
                     );
                 }
+            }
+        }
+    }
+
+    /// The fast IMDCT must match the direct O(N²) oracle at every size the codecs
+    /// use (2048/256 AAC-LC, 1920/240 for 960-frame and 1024/960 for LD/ELD once
+    /// they exist fall back to the oracle until they get their own core), on
+    /// broadband input at the decoder's ~16-bit scale.
+    #[test]
+    fn imdct_fast_matches_direct() {
+        for &l in &[16usize, 128, 1024] {
+            let x: Vec<f32> = (0..l)
+                .map(|k| {
+                    let k = k as f64;
+                    (8000.0 * (k * 0.37).sin() * (-k / l as f64).exp() + 300.0 * (k * 1.9).cos())
+                        as f32
+                })
+                .collect();
+            let (a, b) = (imdct(&x), imdct_fast(&x));
+            let peak = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+            for i in 0..2 * l {
+                assert!(
+                    (a[i] - b[i]).abs() <= 1e-4 * peak.max(1.0),
+                    "l={l} i={i}: {} vs {}",
+                    a[i],
+                    b[i]
+                );
+            }
+        }
+    }
+
+    /// The half IMDCT must equal the middle half of the direct oracle for every
+    /// frame length the decoder uses, power-of-two or not.
+    #[test]
+    fn imdct_half_matches_middle_of_direct() {
+        for &l in &[1024usize, 960, 512, 480, 128, 120] {
+            let x: Vec<f32> = (0..l)
+                .map(|k| (5000.0 * ((k as f64) * 0.61).sin() / (1.0 + k as f64 * 0.01)) as f32)
+                .collect();
+            let full = imdct(&x);
+            let mut half = vec![0f32; l];
+            imdct_half(&x, &mut half, 1.0);
+            let peak = full.iter().fold(0f32, |m, v| m.max(v.abs()));
+            for k in 0..l {
+                assert!(
+                    (full[l / 2 + k] - half[k]).abs() <= 1e-4 * peak.max(1.0),
+                    "l={l} k={k}: {} vs {}",
+                    full[l / 2 + k],
+                    half[k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mdct_any_matches_direct() {
+        for &n in &[1920usize, 240, 2048] {
+            let x: Vec<f32> = (0..n).map(|i| ((i as f64 * 0.013).sin() * 0.7) as f32).collect();
+            let (a, b) = (mdct(&x), mdct_any(&x));
+            for k in 0..n / 2 {
+                assert!((a[k] - b[k]).abs() < 2e-3, "n={n} k={k}: {} vs {}", a[k], b[k]);
             }
         }
     }
