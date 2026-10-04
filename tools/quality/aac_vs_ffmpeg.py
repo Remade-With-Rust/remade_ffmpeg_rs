@@ -217,7 +217,9 @@ def main():
     for j in jobs:
         pairs.append((j["ref"], j["ours"]))
         pairs.append((j["ref"], j["ff"]))
-    workers = max(1, min(mp.cpu_count() - 2, 16))
+    # PEAQ_WORKERS caps the pool: each worker is a full numpy PEAQ process, and
+    # on a memory-starved host 16 of them fail to spawn.
+    workers = int(os.environ.get("PEAQ_WORKERS") or max(1, min(mp.cpu_count() - 2, 16)))
     print(f"# PEAQ pool: {workers} workers")
     with mp.Pool(workers) as pool:
         odgs = pool.starmap(peaq, pairs)

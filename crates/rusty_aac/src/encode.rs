@@ -493,6 +493,9 @@ const SMR_FLAT: f64 = 0.0158; // 10^(-18/10)
 pub(crate) struct PsyCfg {
     /// Arm A1 — psy model on short blocks (else flat scalefactors).
     pub short_block_psy: bool,
+    /// Arm 1a — real window grouping on short blocks, with the short-block psy
+    /// model run per group and centred across groups.
+    pub window_grouping: bool,
     /// Arm A2 — tonality-adaptive SMR (else flat 18 dB).
     pub tonality_smr: bool,
     /// Arm A3 — emit TNS on long blocks.
@@ -1957,10 +1960,11 @@ fn assign_sequences(transient: &[bool]) -> Vec<WindowSequence> {
 /// Cheapest codebook (and its bit cost) for one SFB across all short windows of a
 /// single group, matched to how the decoder reads it (per-SFB codebook, per-window
 /// coefficients).
-fn best_codebook_short(quant: &[i32], swb: &[u16], sfb: usize, nwin: usize) -> (u8, usize) {
+fn best_codebook_short(quant: &[i32], swb: &[u16], sfb: usize, win0: usize, nwin: usize) -> (u8, usize) {
     let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+    let wins = win0..win0 + nwin;
     let mut maxq = 0u32;
-    for win in 0..nwin {
+    for win in wins.clone() {
         let base = win * SHORT_HALF;
         for &q in &quant[base + s..base + e] {
             maxq = maxq.max(q.unsigned_abs());
@@ -1978,7 +1982,7 @@ fn best_codebook_short(quant: &[i32], swb: &[u16], sfb: usize, nwin: usize) -> (
         }
         let mut bits = 0usize;
         let mut ok = true;
-        'windows: for win in 0..nwin {
+        'windows: for win in wins.clone() {
             let base = win * SHORT_HALF;
             let mut i = s;
             while i < e {
@@ -1998,6 +2002,59 @@ fn best_codebook_short(quant: &[i32], swb: &[u16], sfb: usize, nwin: usize) -> (
     }
     best
 }
+
+/// `(first window, window count)` of each group, from the group lengths.
+fn group_windows(groups: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
+    groups.iter().scan(0usize, |w0, &len| {
+        let r = (*w0, len as usize);
+        *w0 += len as usize;
+        Some(r)
+    })
+}
+
+/// Per-group scalefactors (`groups.len() × num_swb`) flattened to the coded
+/// order the bitstream carries (`groups.len() × max_sfb`).
+fn flatten_short_sf(sf: &[i32], num_swb: usize, max_sfb: usize, ngroups: usize) -> Vec<i32> {
+    (0..ngroups)
+        .flat_map(|g| sf[g * num_swb..g * num_swb + max_sfb].iter().copied())
+        .collect()
+}
+
+/// **Arm 1a — window grouping.** Split the eight short windows into runs of
+/// similar energy: a new group starts where a window's energy differs from its
+/// group's running mean by more than [`GROUP_SPLIT`]. A quiet pre-attack stretch
+/// then has scalefactors of its own instead of sharing the attack's. `specs` are
+/// the channels that share the `ics_info` (both channels of a common-window CPE).
+fn short_groups(specs: &[&[f32]]) -> Vec<u8> {
+    let mut e = [0f64; 8];
+    for spec in specs {
+        for (w, ew) in e.iter_mut().enumerate() {
+            *ew += spec[w * SHORT_HALF..(w + 1) * SHORT_HALF]
+                .iter()
+                .map(|&x| (x as f64) * (x as f64))
+                .sum::<f64>();
+        }
+    }
+    let floor = e.iter().sum::<f64>() * 1e-6 + 1e-9;
+    let mut groups = Vec::with_capacity(8);
+    let (mut len, mut sum) = (1u8, e[0]);
+    for &ew in &e[1..] {
+        let ratio = (ew + floor) / (sum / len as f64 + floor);
+        if !(1.0 / GROUP_SPLIT..=GROUP_SPLIT).contains(&ratio) {
+            groups.push(len);
+            len = 1;
+            sum = ew;
+        } else {
+            len += 1;
+            sum += ew;
+        }
+    }
+    groups.push(len);
+    groups
+}
+
+/// Energy ratio (window vs its group's mean) that starts a new group: 6 dB.
+const GROUP_SPLIT: f64 = 4.0;
 
 /// Bits for short-block section_data (3-bit run-length increments, esc = 7).
 fn section_bits_short(cbs: &[u8]) -> usize {
@@ -2025,23 +2082,25 @@ fn section_bits_short(cbs: &[u8]) -> usize {
 /// Quantize all eight short windows with a per-SFB scalefactor (one group; flat
 /// this brick), pick per-SFB codebooks, and return (codebooks, body bits, max_sfb,
 /// window-major quantized spectrum).
-fn code_frame_short(xp: &Xpow, swb: &[u16], sf: &[i32]) -> (Vec<u8>, usize, usize, Vec<i32>) {
+fn code_frame_short(xp: &Xpow, swb: &[u16], sf: &[i32], groups: &[u8]) -> (Vec<u8>, usize, usize, Vec<i32>, Vec<i32>) {
     work::bump_code_frame();
     let num_swb = swb.len() - 1;
     work::bump_quant_bands(((swb.len() - 1) * 8) as u64);
     let scale = scale_table();
     let mut quant = vec![0i32; FRAME_LEN];
-    for win in 0..8 {
-        let base = win * SHORT_HALF;
-        for sfb in 0..num_swb {
-            let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
-            let sc = scale[sf[sfb].clamp(0, 255) as usize];
-            quantize_band(
-                &xp.pow[base + s..base + e],
-                &xp.sign[base + s..base + e],
-                sc,
-                &mut quant[base + s..base + e],
-            );
+    for (g, (w0, nwin)) in group_windows(groups).enumerate() {
+        for win in w0..w0 + nwin {
+            let base = win * SHORT_HALF;
+            for sfb in 0..num_swb {
+                let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+                let sc = scale[sf[g * num_swb + sfb].clamp(0, 255) as usize];
+                quantize_band(
+                    &xp.pow[base + s..base + e],
+                    &xp.sign[base + s..base + e],
+                    sc,
+                    &mut quant[base + s..base + e],
+                );
+            }
         }
     }
     let mut max_sfb = 0usize;
@@ -2054,17 +2113,23 @@ fn code_frame_short(xp: &Xpow, swb: &[u16], sf: &[i32]) -> (Vec<u8>, usize, usiz
             max_sfb = sfb + 1;
         }
     }
-    let mut cbs = Vec::with_capacity(max_sfb);
+    let mut cbs = Vec::with_capacity(groups.len() * max_sfb);
     let mut spec_bits = 0usize;
-    for sfb in 0..max_sfb {
-        let (cb, bits) = best_codebook_short(&quant, swb, sfb, 8);
-        cbs.push(cb);
-        spec_bits += bits;
+    let mut section_bits = 0usize;
+    for (w0, nwin) in group_windows(groups) {
+        let start = cbs.len();
+        for sfb in 0..max_sfb {
+            let (cb, bits) = best_codebook_short(&quant, swb, sfb, w0, nwin);
+            cbs.push(cb);
+            spec_bits += bits;
+        }
+        section_bits += section_bits_short(&cbs[start..]);
     }
-    let gg = global_gain(&cbs, sf);
+    let sf_flat = flatten_short_sf(sf, num_swb, max_sfb, groups.len());
+    let gg = global_gain(&cbs, &sf_flat);
     // global_gain(8) + ics_info(short ~18) + 3 flags + sections + scalefactors + spectrum.
-    let body = 8 + 18 + 3 + section_bits_short(&cbs) + scalefactor_bits(&cbs, sf, gg) + spec_bits;
-    (cbs, body, max_sfb, quant)
+    let body = 8 + 18 + 3 + section_bits + scalefactor_bits(&cbs, &sf_flat, gg) + spec_bits;
+    (cbs, body, max_sfb, quant, sf_flat)
 }
 
 /// The smallest flat scalefactor that avoids clamping the loudest short coefficient
@@ -2150,14 +2215,85 @@ fn perceptual_offsets_short(spec: &[f32], swb: &[u16], sample_rate: u32, tonalit
 
 /// Rate loop for a short block: smallest common base (≥ no-clamp floor) whose body
 /// fits `target_bits`. `offsets` is arm A1's per-band shape (all zeros reproduces
+/// **Arms A1 + 1a — the short-block psy model per window group.**
+///
+/// [`perceptual_offsets_short`] sums band energy across all eight windows, which
+/// hands quiet pre-attack windows a mask sized by the attack (its measured
+/// refutation). Here each group gets its own masking threshold, and the offsets
+/// are centred **across** groups: a quiet group therefore sits below the attack
+/// group and is coded with finer steps, which is the pre-echo protection the
+/// short block exists for. Offsets are clamped to ±30 so any two coded
+/// scalefactors stay within the bitstream's ±60 delta. Returns
+/// `groups.len() × num_swb` offsets, group-major.
+fn perceptual_offsets_short_grouped(
+    spec: &[f32],
+    swb: &[u16],
+    sample_rate: u32,
+    tonality_smr: bool,
+    groups: &[u8],
+) -> Vec<i32> {
+    let num_swb = swb.len() - 1;
+    let mut raw = Vec::with_capacity(groups.len() * num_swb);
+    let mut energy = Vec::with_capacity(groups.len() * num_swb);
+    for (w0, nwin) in group_windows(groups) {
+        let sub = &spec[w0 * SHORT_HALF..(w0 + nwin) * SHORT_HALF];
+        let mut e_band = vec![0.0f64; num_swb];
+        let mut noise_scale = vec![0.0f64; num_swb];
+        for sfb in 0..num_swb {
+            let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+            for win in 0..nwin {
+                let base = win * SHORT_HALF;
+                for &x in &sub[base + s..base + e] {
+                    e_band[sfb] += (x as f64) * (x as f64);
+                    noise_scale[sfb] += (x.abs() as f64).sqrt();
+                }
+            }
+        }
+        let e_masked: Vec<f64> = e_band.iter().map(|&e| e + 1e-3).collect();
+        let ton = tonality_smr.then(|| band_tonality(sub, swb, nwin, SHORT_HALF));
+        let thr = masking_from_energy(&e_masked, swb, sample_rate, SHORT_HALF, ton.as_deref());
+        for sfb in 0..num_swb {
+            raw.push((thr[sfb] / (noise_scale[sfb] + 1e-6)).log2() / 0.375);
+        }
+        energy.extend_from_slice(&e_band);
+    }
+    let etot: f64 = energy.iter().sum::<f64>() + 1e-9;
+    let center: f64 = raw.iter().zip(&energy).map(|(r, e)| r * e).sum::<f64>() / etot;
+    raw.iter()
+        .map(|&r| ((r - center).round() as i32).clamp(-30, 30))
+        .collect()
+}
+
+/// Short-block scalefactor offsets for the configured arms: grouped psy (1a),
+/// single-group psy (A1), or flat. Returns `groups.len() × num_swb` values.
+fn short_offsets(spec: &[f32], swb: &[u16], sample_rate: u32, psy: PsyCfg, groups: &[u8]) -> Vec<i32> {
+    if psy.window_grouping {
+        perceptual_offsets_short_grouped(spec, swb, sample_rate, psy.tonality_smr, groups)
+    } else if psy.short_block_psy {
+        perceptual_offsets_short(spec, swb, sample_rate, psy.tonality_smr)
+    } else {
+        vec![0i32; groups.len() * (swb.len() - 1)]
+    }
+}
+
+/// The window grouping for a short frame whose `ics_info` the `specs` share:
+/// real groups under arm 1a, else one group of eight.
+fn short_grouping(specs: &[&[f32]], psy: PsyCfg) -> Vec<u8> {
+    if psy.window_grouping {
+        short_groups(specs)
+    } else {
+        vec![8]
+    }
+}
+
 /// the flat-scalefactor behavior byte-identically).
-fn rate_loop_short(xp: &Xpow, swb: &[u16], offsets: &[i32], target_bits: usize) -> i32 {
+fn rate_loop_short(xp: &Xpow, swb: &[u16], offsets: &[i32], target_bits: usize, groups: &[u8]) -> i32 {
     let mut lo = min_base_short(xp);
     let mut hi = 255i32;
     while lo < hi {
         let mid = (lo + hi) / 2;
         let sf = scalefactors(offsets, mid);
-        if code_frame_short(xp, swb, &sf).1 <= target_bits {
+        if code_frame_short(xp, swb, &sf, groups).1 <= target_bits {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -2187,28 +2323,39 @@ fn write_sections_short(w: &mut BitWriter, cbs: &[u8]) {
     }
 }
 
-/// short_block spectral_data: per SFB, per window (one group), coefficient tuples.
-fn write_spectrum_short(w: &mut BitWriter, quant: &[i32], cbs: &[u8], swb: &[u16]) {
-    for (sfb, &cb) in cbs.iter().enumerate() {
-        if cb == ZERO_HCB {
-            continue;
-        }
-        let dim = CODEBOOKS[cb as usize].dim as usize;
-        let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
-        for win in 0..8 {
-            let base = win * SHORT_HALF;
-            let mut i = s;
-            while i + dim <= e {
-                spectral_emit(cb as usize, &quant[base + i..base + i + dim], w);
-                i += dim;
+/// short_block spectral_data: per group, per SFB, per window of the group,
+/// coefficient tuples (the grouped-interleaved order the decoder reads).
+fn write_spectrum_short(w: &mut BitWriter, quant: &[i32], cbs: &[u8], swb: &[u16], groups: &[u8], max_sfb: usize) {
+    for (g, (w0, nwin)) in group_windows(groups).enumerate() {
+        for sfb in 0..max_sfb {
+            let cb = cbs[g * max_sfb + sfb];
+            if cb == ZERO_HCB {
+                continue;
+            }
+            let dim = CODEBOOKS[cb as usize].dim as usize;
+            let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+            for win in w0..w0 + nwin {
+                let base = win * SHORT_HALF;
+                let mut i = s;
+                while i + dim <= e {
+                    spectral_emit(cb as usize, &quant[base + i..base + i + dim], w);
+                    i += dim;
+                }
             }
         }
     }
 }
 
-/// Encode one channel as an EightShort single_channel_element (one group of 8
-/// windows). Scalefactors are flat unless arm A1 (`psy.short_block_psy`) supplies
-/// a per-band shape.
+/// short_block section_data for every window group (runs never cross a group).
+fn write_sections_short_grouped(w: &mut BitWriter, cbs: &[u8], ngroups: usize, max_sfb: usize) {
+    for g in 0..ngroups {
+        write_sections_short(w, &cbs[g * max_sfb..(g + 1) * max_sfb]);
+    }
+}
+
+/// Encode one channel as an EightShort single_channel_element. One group of 8
+/// windows with flat scalefactors unless arm A1 (`psy.short_block_psy`) supplies a
+/// per-band shape, or arm 1a (`psy.window_grouping`) real groups shaped per group.
 #[allow(clippy::too_many_arguments)]
 fn encode_channel_element_short(
     w: &mut BitWriter,
@@ -2221,17 +2368,12 @@ fn encode_channel_element_short(
     psy: PsyCfg,
 ) {
     let xp = Xpow::new(spec);
-    // Arm A1: a real per-band mask, or the flat fallback (all-zero offsets
-    // reproduce the shipped behavior byte-identically).
-    let offsets = if psy.short_block_psy {
-        perceptual_offsets_short(spec, swb, sample_rate, psy.tonality_smr)
-    } else {
-        vec![0i32; swb.len() - 1]
-    };
-    let base = rate_loop_short(&xp, swb, &offsets, target_bits);
+    let groups = short_grouping(&[spec], psy);
+    let offsets = short_offsets(spec, swb, sample_rate, psy, &groups);
+    let base = rate_loop_short(&xp, swb, &offsets, target_bits, &groups);
     let sf = scalefactors(&offsets, base);
-    let (cbs, _, max_sfb, quant) = code_frame_short(&xp, swb, &sf);
-    let gg = global_gain(&cbs, &sf);
+    let (cbs, _, max_sfb, quant, sf_flat) = code_frame_short(&xp, swb, &sf, &groups);
+    let gg = global_gain(&cbs, &sf_flat);
 
     w.write(ID_SCE, 3);
     w.write(tag, 4);
@@ -2241,17 +2383,17 @@ fn encode_channel_element_short(
         window_shape_kbd: cur_kbd,
         max_sfb: max_sfb as u8,
         num_windows: 8,
-        num_window_groups: 1,
-        window_group_length: vec![8],
+        num_window_groups: groups.len(),
+        window_group_length: groups.clone(),
         num_swb: swb.len() - 1,
     };
     encode_ics_info(w, &info);
-    write_sections_short(w, &cbs);
-    write_scalefactors(w, &cbs, &sf, gg);
+    write_sections_short_grouped(w, &cbs, groups.len(), max_sfb);
+    write_scalefactors(w, &cbs, &sf_flat, gg);
     w.write(0, 1); // pulse_data_present
     w.write(0, 1); // tns_data_present
     w.write(0, 1); // gain_control_data_present
-    write_spectrum_short(w, &quant, &cbs, swb);
+    write_spectrum_short(w, &quant, &cbs, swb, &groups, max_sfb);
 }
 
 // ---------------------------------------------------------------------------
@@ -2269,36 +2411,39 @@ fn mid_side(
     swb: &[u16],
     is_short: bool,
     is_veto: &[bool],
+    groups: &[u8],
 ) -> (Vec<f32>, Vec<f32>, Vec<bool>) {
     let num_swb = swb.len() - 1;
-    let nwin = if is_short { 8 } else { 1 };
     let wlen = if is_short { SHORT_HALF } else { FRAME_LEN };
+    let groups: &[u8] = if is_short { groups } else { &[1] };
     let mut ch0 = l.to_vec();
     let mut ch1 = r.to_vec();
-    let mut ms = vec![false; num_swb];
-    for sfb in 0..num_swb {
-        let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
-        let (mut el, mut er, mut em, mut es) = (0.0f64, 0.0, 0.0, 0.0);
-        for win in 0..nwin {
-            let base = win * wlen;
-            for i in s..e {
-                let (lv, rv) = (l[base + i] as f64, r[base + i] as f64);
-                let (m, sd) = ((lv + rv) * 0.5, (lv - rv) * 0.5);
-                el += lv * lv;
-                er += rv * rv;
-                em += m * m;
-                es += sd * sd;
-            }
-        }
-        // A band claimed by intensity stereo (arm A7) must stay L/R.
-        if em * es < el * er && !is_veto.get(sfb).copied().unwrap_or(false) {
-            ms[sfb] = true;
-            for win in 0..nwin {
+    let mut ms = vec![false; groups.len() * num_swb];
+    for (g, (w0, nwin)) in group_windows(groups).enumerate() {
+        for sfb in 0..num_swb {
+            let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+            let (mut el, mut er, mut em, mut es) = (0.0f64, 0.0, 0.0, 0.0);
+            for win in w0..w0 + nwin {
                 let base = win * wlen;
                 for i in s..e {
-                    let (lv, rv) = (l[base + i], r[base + i]);
-                    ch0[base + i] = (lv + rv) * 0.5;
-                    ch1[base + i] = (lv - rv) * 0.5;
+                    let (lv, rv) = (l[base + i] as f64, r[base + i] as f64);
+                    let (m, sd) = ((lv + rv) * 0.5, (lv - rv) * 0.5);
+                    el += lv * lv;
+                    er += rv * rv;
+                    em += m * m;
+                    es += sd * sd;
+                }
+            }
+            // A band claimed by intensity stereo (arm A7) must stay L/R.
+            if em * es < el * er && !is_veto.get(sfb).copied().unwrap_or(false) {
+                ms[g * num_swb + sfb] = true;
+                for win in w0..w0 + nwin {
+                    let base = win * wlen;
+                    for i in s..e {
+                        let (lv, rv) = (l[base + i], r[base + i]);
+                        ch0[base + i] = (lv + rv) * 0.5;
+                        ch1[base + i] = (lv - rv) * 0.5;
+                    }
                 }
             }
         }
@@ -2315,17 +2460,14 @@ fn quantize_channel(
     sample_rate: u32,
     target_bits: usize,
     psy: PsyCfg,
+    groups: &[u8],
 ) -> (Vec<i32>, Vec<i32>) {
     let xp = Xpow::new(spec);
     if is_short {
-        let offsets = if psy.short_block_psy {
-            perceptual_offsets_short(spec, swb, sample_rate, psy.tonality_smr)
-        } else {
-            vec![0i32; swb.len() - 1]
-        };
-        let base = rate_loop_short(&xp, swb, &offsets, target_bits);
+        let offsets = short_offsets(spec, swb, sample_rate, psy, groups);
+        let base = rate_loop_short(&xp, swb, &offsets, target_bits, groups);
         let sf = scalefactors(&offsets, base);
-        let (_, _, _, quant) = code_frame_short(&xp, swb, &sf);
+        let (_, _, _, quant, _) = code_frame_short(&xp, swb, &sf, groups);
         (sf, quant)
     } else {
         let offsets = perceptual_offsets(spec, swb, sample_rate, psy.tonality_smr);
@@ -2358,18 +2500,21 @@ fn joint_max_sfb(q0: &[i32], q1: &[i32], swb: &[u16], is_short: bool) -> usize {
     m
 }
 
-/// Per-SFB codebooks for one channel over `0..max_sfb`.
-fn codebooks(quant: &[i32], swb: &[u16], is_short: bool, max_sfb: usize) -> Vec<u8> {
-    (0..max_sfb)
-        .map(|sfb| {
-            if is_short {
-                best_codebook_short(quant, swb, sfb, 8).0
-            } else {
+/// Per-SFB codebooks for one channel over `0..max_sfb` (for every window group of
+/// a short frame, group-major).
+fn codebooks(quant: &[i32], swb: &[u16], is_short: bool, max_sfb: usize, groups: &[u8]) -> Vec<u8> {
+    if is_short {
+        group_windows(groups)
+            .flat_map(|(w0, nwin)| (0..max_sfb).map(move |sfb| best_codebook_short(quant, swb, sfb, w0, nwin).0))
+            .collect()
+    } else {
+        (0..max_sfb)
+            .map(|sfb| {
                 let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
                 best_codebook_for_band(quant, s, e).0
-            }
-        })
-        .collect()
+            })
+            .collect()
+    }
 }
 
 /// ms_mask_present (2 bits) + the per-SFB mask when mixed.
@@ -2396,11 +2541,20 @@ fn write_channel_data(
     quant: &[i32],
     swb: &[u16],
     is_short: bool,
+    groups: &[u8],
+    max_sfb: usize,
 ) {
+    let sf_flat;
+    let sf = if is_short {
+        sf_flat = flatten_short_sf(sf, swb.len() - 1, max_sfb, groups.len());
+        &sf_flat[..]
+    } else {
+        sf
+    };
     let gg = global_gain(cbs, sf);
     w.write(gg as u32, 8);
     if is_short {
-        write_sections_short(w, cbs);
+        write_sections_short_grouped(w, cbs, groups.len(), max_sfb);
     } else {
         write_sections(w, cbs);
     }
@@ -2409,7 +2563,7 @@ fn write_channel_data(
     w.write(0, 1); // tns_data_present
     w.write(0, 1); // gain_control_data_present
     if is_short {
-        write_spectrum_short(w, quant, cbs, swb);
+        write_spectrum_short(w, quant, cbs, swb, groups, max_sfb);
     } else {
         write_spectrum(w, quant, cbs, swb);
     }
@@ -2452,6 +2606,7 @@ fn write_channel_data(
 ///
 /// This is a strict generalisation: for two channels of equal demand it lands on
 /// the same place the independent loops did.
+#[allow(clippy::too_many_arguments)]
 fn pair_body_bits(
     xp0: &Xpow,
     off0: &[i32],
@@ -2461,11 +2616,12 @@ fn pair_body_bits(
     base: i32,
     is_short: bool,
     quant: &mut [i32],
+    groups: &[u8],
 ) -> usize {
     let (b0, b1) = if is_short {
         (
-            code_frame_short(xp0, swb, &scalefactors(off0, base)).1,
-            code_frame_short(xp1, swb, &scalefactors(off1, base)).1,
+            code_frame_short(xp0, swb, &scalefactors(off0, base), groups).1,
+            code_frame_short(xp1, swb, &scalefactors(off1, base), groups).1,
         )
     } else {
         (
@@ -2486,6 +2642,7 @@ fn joint_rate_loop(
     swb: &[u16],
     target_total: usize,
     is_short: bool,
+    groups: &[u8],
 ) -> i32 {
     let lo0 = if is_short { min_base_short(xp0) } else { min_base(xp0, swb, off0) };
     let lo1 = if is_short { min_base_short(xp1) } else { min_base(xp1, swb, off1) };
@@ -2494,7 +2651,7 @@ fn joint_rate_loop(
     let mut quant = vec![0i32; xp0.len().max(xp1.len())];
     while lo < hi {
         let mid = (lo + hi) / 2;
-        if pair_body_bits(xp0, off0, xp1, off1, swb, mid, is_short, &mut quant) <= target_total {
+        if pair_body_bits(xp0, off0, xp1, off1, swb, mid, is_short, &mut quant, groups) <= target_total {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -2626,7 +2783,9 @@ fn encode_cpe(
         vec![None; swb.len() - 1]
     };
     let is_veto: Vec<bool> = is_bands.iter().map(|b| b.is_some()).collect();
-    let (ch0, ch1, ms_full) = mid_side(spec_l, spec_r, swb, is_short, &is_veto);
+    // Both channels share the ics_info, hence one grouping decided on both.
+    let groups = if is_short { short_grouping(&[spec_l, spec_r], psy) } else { vec![1] };
+    let (ch0, ch1, ms_full) = mid_side(spec_l, spec_r, swb, is_short, &is_veto, &groups);
     // Arm A13 ROUTING GATE.
     //
     // The joint loop is a large win when the pair is CORRELATED and a loss when
@@ -2660,38 +2819,34 @@ fn encode_cpe(
     let (sf0, quant0, sf1, quant1) = if psy.stereo_bit_split && joint_ok {
         let off = |spec: &[f32]| -> Vec<i32> {
             if is_short {
-                if psy.short_block_psy {
-                    perceptual_offsets_short(spec, swb, sample_rate, psy.tonality_smr)
-                } else {
-                    vec![0i32; swb.len() - 1]
-                }
+                short_offsets(spec, swb, sample_rate, psy, &groups)
             } else {
                 perceptual_offsets(spec, swb, sample_rate, psy.tonality_smr)
             }
         };
         let (o0, o1) = (off(&ch0), off(&ch1));
         let (xp0, xp1) = (Xpow::new(&ch0), Xpow::new(&ch1));
-        let base = joint_rate_loop(&xp0, &o0, &xp1, &o1, swb, target_bits * 2, is_short);
+        let base = joint_rate_loop(&xp0, &o0, &xp1, &o1, swb, target_bits * 2, is_short, &groups);
         let (s0, s1) = (scalefactors(&o0, base), scalefactors(&o1, base));
         let q0 = if is_short {
-            code_frame_short(&xp0, swb, &s0).3
+            code_frame_short(&xp0, swb, &s0, &groups).3
         } else {
             code_frame(&xp0, swb, &s0).3
         };
         let q1 = if is_short {
-            code_frame_short(&xp1, swb, &s1).3
+            code_frame_short(&xp1, swb, &s1, &groups).3
         } else {
             code_frame(&xp1, swb, &s1).3
         };
         (s0, q0, s1, q1)
     } else {
-        let (a, b) = quantize_channel(&ch0, swb, is_short, sample_rate, target_bits, psy);
-        let (c, d) = quantize_channel(&ch1, swb, is_short, sample_rate, target_bits, psy);
+        let (a, b) = quantize_channel(&ch0, swb, is_short, sample_rate, target_bits, psy, &groups);
+        let (c, d) = quantize_channel(&ch1, swb, is_short, sample_rate, target_bits, psy, &groups);
         (a, b, c, d)
     };
     let max_sfb = joint_max_sfb(&quant0, &quant1, swb, is_short);
-    let cbs0 = codebooks(&quant0, swb, is_short, max_sfb);
-    let mut cbs1 = codebooks(&quant1, swb, is_short, max_sfb);
+    let cbs0 = codebooks(&quant0, swb, is_short, max_sfb, &groups);
+    let mut cbs1 = codebooks(&quant1, swb, is_short, max_sfb, &groups);
     let mut sf1 = sf1;
     let mut ms_full = ms_full;
 
@@ -2714,14 +2869,19 @@ fn encode_cpe(
         window_shape_kbd: cur_kbd,
         max_sfb: max_sfb as u8,
         num_windows: if is_short { 8 } else { 1 },
-        num_window_groups: 1,
-        window_group_length: vec![if is_short { 8 } else { 1 }],
+        num_window_groups: groups.len(),
+        window_group_length: groups.clone(),
         num_swb: swb.len() - 1,
     };
     encode_ics_info(w, &info);
-    write_ms_used(w, &ms_full[..max_sfb]);
-    write_channel_data(w, &cbs0, &sf0, &quant0, swb, is_short);
-    write_channel_data(w, &cbs1, &sf1, &quant1, swb, is_short);
+    // ms_used is per group, per band below max_sfb, in group order.
+    let num_swb = swb.len() - 1;
+    let ms_coded: Vec<bool> = (0..groups.len())
+        .flat_map(|g| ms_full[g * num_swb..g * num_swb + max_sfb].iter().copied())
+        .collect();
+    write_ms_used(w, &ms_coded);
+    write_channel_data(w, &cbs0, &sf0, &quant0, swb, is_short, &groups, max_sfb);
+    write_channel_data(w, &cbs1, &sf1, &quant1, swb, is_short, &groups, max_sfb);
 }
 
 // ---------------------------------------------------------------------------
@@ -2771,6 +2931,11 @@ pub struct AacEncoderConfig {
     /// **Arm A1, Rung 1** — run the psychoacoustic model on short blocks instead
     /// of coding them with flat scalefactors. Default `false` (byte-identical).
     pub short_block_psy: bool,
+    /// **Arm 1a, Rung 1** — split each short-block frame into window groups of
+    /// similar energy and shape scalefactors per group (the short-block psy model
+    /// run per group, centred jointly so a quiet pre-attack group is coded finer
+    /// than the attack). Default `false` (byte-identical).
+    pub window_grouping: bool,
     /// **Arm A2, Rung 2** — make the signal-to-mask ratio a function of band
     /// tonality instead of a flat 18 dB. Default `false` (byte-identical).
     pub tonality_smr: bool,
@@ -2798,6 +2963,7 @@ impl Default for AacEncoderConfig {
             window_shape: WindowShape::Sine,
             shape_tonality_pct: 0.5,
             short_block_psy: false,
+            window_grouping: false,
             tonality_smr: false,
             tns: false,
             // DEFAULT ON — measured wins vs the previous default, PEAQ ODG:
@@ -2837,6 +3003,7 @@ pub struct AacEncoder {
     window_shape: WindowShape,
     shape_tonality_pct: f32,
     short_block_psy: bool,
+    window_grouping: bool,
     tonality_smr: bool,
     tns: bool,
     relative_transients: bool,
@@ -2864,6 +3031,7 @@ impl AacEncoder {
             window_shape: config.window_shape,
             shape_tonality_pct: config.shape_tonality_pct,
             short_block_psy: config.short_block_psy,
+            window_grouping: config.window_grouping,
             tonality_smr: config.tonality_smr,
             tns: config.tns,
             relative_transients: config.relative_transients,
@@ -2995,6 +3163,7 @@ impl AacEncoder {
         let short_win: &[f32] = if cur_kbd { kbd_s } else { sine_s };
         let psy = PsyCfg {
             short_block_psy: self.short_block_psy,
+            window_grouping: self.window_grouping,
             tonality_smr: self.tonality_smr,
             tns: self.tns,
             pns: self.pns,
@@ -4433,6 +4602,68 @@ mod rung123 {
         }
         let snr = 10.0 * (den / num.max(1e-30)).log10();
         assert!(snr > 8.0, "A1: reconstruction SNR {snr:.1} dB too low");
+    }
+
+    /// **Arm 1a** — window grouping splits at energy jumps and leaves a steady
+    /// frame as one group.
+    #[test]
+    fn a1a_short_groups_split_at_the_attack() {
+        let mut spec = vec![0.0f32; FRAME_LEN];
+        for (i, v) in spec.iter_mut().enumerate() {
+            let win = i / SHORT_HALF;
+            *v = if win < 5 { 1.0 } else { 40.0 } * if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        assert_eq!(short_groups(&[&spec]), vec![5, 3]);
+        let steady = vec![3.0f32; FRAME_LEN];
+        assert_eq!(short_groups(&[&steady]), vec![8]);
+        // Groups always tile the eight windows.
+        let mut ramp = vec![0.0f32; FRAME_LEN];
+        for (i, v) in ramp.iter_mut().enumerate() {
+            *v = 4f32.powi((i / SHORT_HALF) as i32);
+        }
+        let g = short_groups(&[&ramp]);
+        assert_eq!(g.iter().map(|&x| x as usize).sum::<usize>(), 8);
+        assert!(g.len() > 1);
+    }
+
+    /// **Arm 1a** — end to end, mono and stereo: the arm changes the bitstream on
+    /// transient content and the result still decodes to a sane reconstruction.
+    #[test]
+    fn a1a_window_grouping_changes_and_round_trips() {
+        let sr = 44100u32;
+        let pcm = transient_signal(sr, 12);
+        let cfg = AacEncoderConfig {
+            window_grouping: true,
+            ..Default::default()
+        };
+        let off = encode(&pcm, 1, sr, AacEncoderConfig::default());
+        let on = encode(&pcm, 1, sr, cfg);
+        assert_ne!(off, on, "1a must change the bitstream on transient content");
+        let dec = decode_mono(&on, sr);
+        assert!(dec.iter().all(|v| v.is_finite()), "1a: non-finite output");
+        let lag = FRAME_LEN;
+        let cmp = pcm.len() - 2 * FRAME_LEN;
+        let (mut num, mut den) = (0f64, 0f64);
+        for i in 0..cmp {
+            let (o, d) = (pcm[i] as f64, dec[i + lag] as f64);
+            num += (o - d) * (o - d);
+            den += o * o;
+        }
+        let snr = 10.0 * (den / num.max(1e-30)).log10();
+        assert!(snr > 8.0, "1a: reconstruction SNR {snr:.1} dB too low");
+
+        // Stereo: a shared grouping and per-group M/S through the CPE path.
+        let st: Vec<f32> = pcm.iter().flat_map(|&v| [v, 0.6 * v]).collect();
+        let packets = encode(&st, 2, sr, cfg);
+        let mut d = crate::decode::Decoder::new(sr);
+        let mut frames = 0usize;
+        for p in &packets {
+            let a = d.decode(p, None).expect("1a stereo decodes");
+            assert_eq!(a.channels, 2);
+            assert!(a.samples.iter().all(|v| v.is_finite()));
+            frames += a.frames();
+        }
+        assert!(frames >= pcm.len(), "1a stereo: short decode");
     }
 
     /// **Arm A2** — the SMR must actually vary with tonality. A pure tone and

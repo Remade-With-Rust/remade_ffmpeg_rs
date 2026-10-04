@@ -9,7 +9,7 @@
 //!     in.wav out.aac 128000 [arm ...]
 //! ```
 //!
-//! Arms: `a1` short-block psy, `a2` tonality SMR, `a3` TNS, `a6` PNS,
+//! Arms: `a1` short-block psy, `grp` window grouping (arm 1a), `a2` tonality SMR, `a3` TNS, `a6` PNS,
 //! `a7` intensity stereo, `a9` level-invariant transients, `a13` demand-based
 //! stereo bit split, `kbd`/`autoshape` window shape. With no arms it is byte-identical to the shipped defaults.
 
@@ -46,6 +46,7 @@ fn main() {
     if on("a7") { cfg.intensity = true; }
     if on("a9") { cfg.relative_transients = true; }
     if on("a13") { cfg.stereo_bit_split = true; }
+    if on("grp") { cfg.window_grouping = true; }
     if on("noa9") { cfg.relative_transients = false; }
     if on("noa13") { cfg.stereo_bit_split = false; }
     if on("kbd") { cfg.window_shape = WindowShape::Kbd; }
