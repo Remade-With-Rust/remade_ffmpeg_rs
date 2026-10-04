@@ -54,10 +54,11 @@ pub const STAGES: [&str; 14] = [
 pub enum Kernel {
     Quantize,
     Xpow,
+    Fft,
 }
 
 /// Kernel names, indexed by [`Kernel`].
-pub const KERNELS: [&str; 2] = ["quantize_band", "xpow"];
+pub const KERNELS: [&str; 3] = ["quantize_band", "xpow", "radix2 fft"];
 
 #[cfg(feature = "profile")]
 mod imp {

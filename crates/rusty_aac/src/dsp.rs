@@ -445,10 +445,22 @@ pub fn imdct_half(spec: &[f32], out: &mut [f32], gain: f64) {
 
 /// An in-place iterative radix-2 complex FFT in f32: `sign` -1 computes
 /// `Σ x·e^{-2πi jk/n}`, +1 the unscaled inverse.
+///
+/// It carries every IMDCT and both SBR QMF banks (~46% of HE-AAC decode CPU), so
+/// the butterfly stages have SIMD twins: AVX on x86-64 (runtime-detected, four
+/// butterflies per 256-bit op) and NEON on aarch64 (baseline, two per op). Both
+/// perform exactly the scalar products and sums (no FMA), so all three paths are
+/// **bit-identical** (`fft_simd_matches_scalar`).
 pub(crate) struct Radix2Fft {
     n: usize,
     rev: Vec<u16>,
-    tw: Vec<[f32; 2]>,
+    /// Per-stage twiddles laid out contiguously: the stage with half-length `h`
+    /// (h = 2, 4, ..., n/2) holds `w[j·n/(2h)]` for `j < h` at offset `h - 2`, so a
+    /// vector of butterflies loads its twiddles in one go.
+    stw: Vec<[f32; 2]>,
+    /// The AVX twin is usable (detected once, when the plan is built).
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    avx: bool,
 }
 
 impl Radix2Fft {
@@ -456,45 +468,181 @@ impl Radix2Fft {
         assert!(n.is_power_of_two() && n >= 2);
         let bits = n.trailing_zeros();
         let rev = (0..n).map(|i| ((i as u32).reverse_bits() >> (32 - bits)) as u16).collect();
-        let tw = (0..n / 2)
+        let tw: Vec<[f32; 2]> = (0..n / 2)
             .map(|t| {
                 let a = sign * 2.0 * PI * t as f64 / n as f64;
                 [a.cos() as f32, a.sin() as f32]
             })
             .collect();
-        Radix2Fft { n, rev, tw }
+        let mut stw = Vec::with_capacity(n.saturating_sub(2));
+        let mut half = 2;
+        while half < n {
+            let step = n / (2 * half);
+            stw.extend((0..half).map(|j| tw[j * step]));
+            half *= 2;
+        }
+        Radix2Fft {
+            n,
+            rev,
+            stw,
+            #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+            avx: std::is_x86_feature_detected!("avx"),
+        }
     }
 
     pub(crate) fn run(&self, buf: &mut [[f32; 2]]) {
-        let n = self.n;
-        let buf = &mut buf[..n];
-        for i in 0..n {
+        let buf = &mut buf[..self.n];
+        #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+        if self.avx {
+            crate::prof::count(crate::prof::Kernel::Fft, true, self.n);
+            // SAFETY: AVX detected at construction; `buf` is exactly `n` long and
+            // `stw` holds every stage's twiddles (see `run_avx`).
+            unsafe { self.run_avx(buf) };
+            return;
+        }
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        {
+            crate::prof::count(crate::prof::Kernel::Fft, true, self.n);
+            // SAFETY: NEON is baseline on aarch64; same bounds as `run_avx`.
+            unsafe { self.run_neon(buf) };
+            return;
+        }
+        #[allow(unreachable_code)]
+        {
+            crate::prof::count(crate::prof::Kernel::Fft, false, self.n);
+            self.run_scalar(buf);
+        }
+    }
+
+    /// Bit-reversal permutation plus the twiddle-free first stage (shared by
+    /// every path).
+    #[inline(always)]
+    fn permute_and_first_stage(&self, buf: &mut [[f32; 2]]) {
+        for i in 0..self.n {
             let j = self.rev[i] as usize;
             if i < j {
                 buf.swap(i, j);
             }
         }
-        // First stage: twiddle-free butterflies.
         for pair in buf.chunks_exact_mut(2) {
             let (a, b) = (pair[0], pair[1]);
             pair[0] = [a[0] + b[0], a[1] + b[1]];
             pair[1] = [a[0] - b[0], a[1] - b[1]];
         }
-        let mut len = 4;
-        while len <= n {
-            let half = len / 2;
-            let step = n / len;
-            for block in buf.chunks_exact_mut(len) {
-                let (lo, hi) = block.split_at_mut(half);
-                for (j, (a, b)) in lo.iter_mut().zip(hi.iter_mut()).enumerate() {
-                    let w = self.tw[j * step];
-                    let t = [b[0] * w[0] - b[1] * w[1], b[0] * w[1] + b[1] * w[0]];
-                    let x = *a;
-                    *a = [x[0] + t[0], x[1] + t[1]];
-                    *b = [x[0] - t[0], x[1] - t[1]];
+    }
+
+    /// One radix-2 stage of half-length `half`, scalar.
+    #[inline(always)]
+    fn stage_scalar(&self, buf: &mut [[f32; 2]], half: usize) {
+        let w = &self.stw[half - 2..2 * half - 2];
+        for block in buf.chunks_exact_mut(2 * half) {
+            let (lo, hi) = block.split_at_mut(half);
+            for ((a, b), w) in lo.iter_mut().zip(hi.iter_mut()).zip(w) {
+                let t = [b[0] * w[0] - b[1] * w[1], b[0] * w[1] + b[1] * w[0]];
+                let x = *a;
+                *a = [x[0] + t[0], x[1] + t[1]];
+                *b = [x[0] - t[0], x[1] - t[1]];
+            }
+        }
+    }
+
+    /// The scalar reference (and the fallback on CPUs without the twin ISA).
+    pub(crate) fn run_scalar(&self, buf: &mut [[f32; 2]]) {
+        let buf = &mut buf[..self.n];
+        self.permute_and_first_stage(buf);
+        let mut half = 2;
+        while half < self.n {
+            self.stage_scalar(buf, half);
+            half *= 2;
+        }
+    }
+
+    /// AVX twin: stages with `half >= 4` run four butterflies per 256-bit op; the
+    /// complex multiply is `b·Re(w) -/+ swap(b)·Im(w)` via `addsub`, the same two
+    /// products and one sum per lane as the scalar path (bit-identical).
+    ///
+    /// # Safety
+    /// AVX must be available, and `buf.len() == self.n`. Each vector touches
+    /// `buf[s + j .. s + j + 4]` and `buf[s + j + half .. +4]` with
+    /// `s + 2·half <= n` and `j + 4 <= half`, and twiddles `stw[half - 2 + j .. +4]`
+    /// with `2·half - 2 <= stw.len() = n - 2`.
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx")]
+    unsafe fn run_avx(&self, buf: &mut [[f32; 2]]) {
+        use std::arch::x86_64::*;
+        let n = self.n;
+        self.permute_and_first_stage(buf);
+        let p = buf.as_mut_ptr() as *mut f32;
+        let mut half = 2;
+        while half < n {
+            if half < 4 {
+                self.stage_scalar(buf, half);
+            } else {
+                let wbase = self.stw.as_ptr().add(half - 2) as *const f32;
+                let mut s = 0;
+                while s < n {
+                    let mut j = 0;
+                    while j < half {
+                        let pa = p.add(2 * (s + j));
+                        let pb = p.add(2 * (s + j + half));
+                        let a = _mm256_loadu_ps(pa);
+                        let b = _mm256_loadu_ps(pb);
+                        let w = _mm256_loadu_ps(wbase.add(2 * j));
+                        let wr = _mm256_moveldup_ps(w);
+                        let wi = _mm256_movehdup_ps(w);
+                        let bs = _mm256_permute_ps::<0b10_11_00_01>(b);
+                        let t = _mm256_addsub_ps(_mm256_mul_ps(b, wr), _mm256_mul_ps(bs, wi));
+                        _mm256_storeu_ps(pa, _mm256_add_ps(a, t));
+                        _mm256_storeu_ps(pb, _mm256_sub_ps(a, t));
+                        j += 4;
+                    }
+                    s += 2 * half;
                 }
             }
-            len *= 2;
+            half *= 2;
+        }
+    }
+
+    /// NEON twin: two butterflies per 128-bit op from `half >= 2`; the even-lane
+    /// sign of the complex multiply is applied by flipping the sign bit (exact),
+    /// so the sums match the scalar path bit for bit.
+    ///
+    /// # Safety
+    /// `buf.len() == self.n`; bounds as for `run_avx` with two-wide vectors.
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn run_neon(&self, buf: &mut [[f32; 2]]) {
+        use std::arch::aarch64::*;
+        let n = self.n;
+        self.permute_and_first_stage(buf);
+        let p = buf.as_mut_ptr() as *mut f32;
+        let mask = [0x8000_0000u32, 0, 0x8000_0000, 0];
+        let neg_even = vld1q_u32(mask.as_ptr());
+        let mut half = 2;
+        while half < n {
+            let wbase = self.stw.as_ptr().add(half - 2) as *const f32;
+            let mut s = 0;
+            while s < n {
+                let mut j = 0;
+                while j < half {
+                    let pa = p.add(2 * (s + j));
+                    let pb = p.add(2 * (s + j + half));
+                    let a = vld1q_f32(pa);
+                    let b = vld1q_f32(pb);
+                    let w = vld1q_f32(wbase.add(2 * j));
+                    let wr = vtrn1q_f32(w, w);
+                    let wi = vtrn2q_f32(w, w);
+                    let x = vmulq_f32(b, wr);
+                    let y = vmulq_f32(vrev64q_f32(b), wi);
+                    let y = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(y), neg_even));
+                    let t = vaddq_f32(x, y);
+                    vst1q_f32(pa, vaddq_f32(a, t));
+                    vst1q_f32(pb, vsubq_f32(a, t));
+                    j += 2;
+                }
+                s += 2 * half;
+            }
+            half *= 2;
         }
     }
 }
@@ -796,6 +944,78 @@ mod tests {
                 out[i],
                 signal[i]
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fft_twin {
+    use super::*;
+
+    /// The FFT SIMD twin (AVX / NEON, whichever this build dispatches to) must
+    /// equal the scalar reference bit for bit at every size the codec uses.
+    #[test]
+    fn fft_simd_matches_scalar() {
+        for bits in 1..=10 {
+            let n = 1usize << bits;
+            for sign in [-1.0, 1.0] {
+                let fft = Radix2Fft::new(n, sign);
+                let mut seed = 0x1234_5678u32 ^ n as u32;
+                let mut r = || {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 65536.0
+                };
+                let input: Vec<[f32; 2]> = (0..n).map(|_| [r(), r()]).collect();
+                let (mut want, mut got) = (input.clone(), input.clone());
+                fft.run_scalar(&mut want);
+                fft.run(&mut got);
+                for k in 0..n {
+                    for c in 0..2 {
+                        assert_eq!(got[k][c].to_bits(), want[k][c].to_bits(), "n={n} sign={sign} k={k}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod kernel_price {
+    use super::*;
+
+    /// Per-call cost of the transform kernels, to price a SIMD twin against the
+    /// stage it lives in. `cargo test --release -- --ignored --nocapture kernel_price`
+    #[test]
+    #[ignore]
+    fn kernel_price() {
+        for n in [32usize, 64, 512] {
+            let fft = Radix2Fft::new(n, -1.0);
+            let mut buf: Vec<[f32; 2]> = (0..n).map(|i| [(i as f32).sin(), (i as f32).cos()]).collect();
+            let iters = 2_000_000 / n;
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let t = std::time::Instant::now();
+                for _ in 0..iters {
+                    fft.run(std::hint::black_box(&mut buf));
+                }
+                best = best.min(t.elapsed().as_secs_f64() / iters as f64);
+            }
+            eprintln!("Radix2Fft::run n={n:4}: {:8.1} ns/call", best * 1e9);
+        }
+        for l in [64usize, 512, 1024] {
+            let plan = pow2_dct4(l).unwrap();
+            let x: Vec<f32> = (0..l).map(|i| (i as f32 * 0.3).sin()).collect();
+            let mut out = vec![0f32; l];
+            let iters = 2_000_000 / l;
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let t = std::time::Instant::now();
+                for _ in 0..iters {
+                    plan.imdct_half(std::hint::black_box(&x), &mut out, 1.0);
+                }
+                best = best.min(t.elapsed().as_secs_f64() / iters as f64);
+            }
+            eprintln!("Pow2Dct4::imdct_half l={l:4}: {:8.1} ns/call (incl. FFT l/2)", best * 1e9);
         }
     }
 }
