@@ -78,7 +78,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Cache VP9 test vectors
         id: vectors
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: vp9-vectors
           # Re-fetch only when the vector list changes.
