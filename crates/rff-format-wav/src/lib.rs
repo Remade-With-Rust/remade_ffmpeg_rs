@@ -98,57 +98,127 @@ impl WavDemuxer {
     }
 }
 
+/// The `fmt ` chunk fields the demuxer needs.
+struct WavFmt {
+    channels: u16,
+    sample_rate: u32,
+    delivery: Delivery,
+}
+
+/// Parse the `fmt ` chunk at `buf[fmt]`.
+fn parse_fmt(buf: &[u8], fmt: Range<usize>) -> Result<WavFmt> {
+    if fmt.len() < 16 {
+        return Err(Error::invalid("wav demux: short `fmt ` chunk"));
+    }
+    let f = &buf[fmt.start..];
+    let mut format_tag = rd_u16(f, 0);
+    let channels = rd_u16(f, 2);
+    let sample_rate = rd_u32(f, 4);
+    let bits = rd_u16(f, 14);
+    // WAVE_FORMAT_EXTENSIBLE: the real tag is the SubFormat GUID's first
+    // two bytes (fmt chunk offset 24), after cbSize(2) + valid-bits(2) +
+    // channel-mask(4).
+    if format_tag == 0xFFFE {
+        if fmt.len() < 26 {
+            return Err(Error::invalid("wav demux: short extensible `fmt ` chunk"));
+        }
+        format_tag = rd_u16(f, 24);
+    }
+    let delivery = sample_format(format_tag, bits).ok_or_else(|| {
+        Error::unsupported(format!(
+            "wav demux: format tag {format_tag}, {bits}-bit (pcm u8/s16/s24 or f32)"
+        ))
+    })?;
+    Ok(WavFmt {
+        channels,
+        sample_rate,
+        delivery,
+    })
+}
+
+/// How much of the file is read before the `data` chunk is located. Every
+/// ordinary WAV's chunk headers sit well inside it.
+const HEAD_BYTES: u64 = 64 * 1024;
+
+/// Read a WAV, returning its `fmt ` fields and the `data` chunk's bytes.
+///
+/// The common layout (`fmt ` before `data`, both headers inside the first
+/// [`HEAD_BYTES`]) is read so the data lands in its own `Vec` from the start:
+/// the prefix's tail seeds it and the rest of the stream is read straight into
+/// it. This used to read the whole file into one buffer and then `to_vec()` the
+/// data chunk out -- a second file-sized allocation and a copy of every sample,
+/// with both alive at once. Any other layout takes that whole-buffer walk
+/// (minus the copy). Both yield `buf[start..min(start + size, len)]` for the
+/// FIRST `data` chunk and the FIRST `fmt ` chunk, as before.
+fn read_wav(input: &mut Input) -> Result<(WavFmt, Vec<u8>)> {
+    let mut head = Vec::new();
+    input.by_ref().take(HEAD_BYTES).read_to_end(&mut head)?;
+    if probe_wav(&head) != 0 {
+        // A chunk in this walk is one the whole-file walk sees identically:
+        // the walk stops at the first chunk that runs past the prefix, so
+        // everything listed before that is complete.
+        let top = chunks(&head, 12);
+        let fmt = top.iter().position(|(id, _)| id == b"fmt ");
+        let data = top.iter().position(|(id, _)| id == b"data");
+        if let (Some(f), Some(d)) = (fmt, data) {
+            if f < d {
+                let fmt = parse_fmt(&head, top[f].1.clone())?;
+                let start = top[d].1.start;
+                let declared = rd_u32(&head, start - 4) as usize;
+                // The declared size is a hint, not a promise (streamed WAVs
+                // write 0xFFFFFFFF), so cap what it may reserve.
+                let mut samples = Vec::with_capacity(declared.min(1 << 28));
+                samples.extend_from_slice(&head[start..]);
+                input.read_to_end(&mut samples)?;
+                samples.truncate(declared);
+                return Ok((fmt, samples));
+            }
+        }
+    }
+
+    // Any other layout: the whole file in memory, walked as before.
+    let mut buf = head;
+    input.read_to_end(&mut buf)?;
+    if probe_wav(&buf) == 0 {
+        return Err(Error::invalid("wav demux: not a RIFF/WAVE file"));
+    }
+    let top = chunks(&buf, 12); // skip "RIFF" + size + "WAVE"
+    let fmt = top
+        .iter()
+        .find(|(id, _)| id == b"fmt ")
+        .map(|(_, r)| r.clone())
+        .ok_or_else(|| Error::invalid("wav demux: no `fmt ` chunk"))?;
+    let fmt = parse_fmt(&buf, fmt)?;
+    let data = top
+        .iter()
+        .find(|(id, _)| id == b"data")
+        .map(|(_, r)| r.clone())
+        .ok_or_else(|| Error::invalid("wav demux: no `data` chunk"))?;
+    // Keep the data chunk in place rather than copying it out.
+    buf.truncate(data.end);
+    buf.drain(..data.start);
+    Ok((fmt, buf))
+}
+
 impl Demuxer for WavDemuxer {
     fn read_header(&mut self) -> Result<Vec<Stream>> {
         let mut input = self
             .input
             .take()
             .ok_or_else(|| Error::invalid("wav demux: header already read"))?;
-        let mut buf = Vec::new();
-        input.read_to_end(&mut buf)?;
-        if probe_wav(&buf) == 0 {
-            return Err(Error::invalid("wav demux: not a RIFF/WAVE file"));
-        }
-
-        let top = chunks(&buf, 12); // skip "RIFF" + size + "WAVE"
-        let fmt = top
-            .iter()
-            .find(|(id, _)| id == b"fmt ")
-            .map(|(_, r)| r.clone())
-            .ok_or_else(|| Error::invalid("wav demux: no `fmt ` chunk"))?;
-        if fmt.len() < 16 {
-            return Err(Error::invalid("wav demux: short `fmt ` chunk"));
-        }
-        let f = &buf[fmt.start..];
-        let mut format_tag = rd_u16(f, 0);
-        let channels = rd_u16(f, 2);
-        let sample_rate = rd_u32(f, 4);
-        let bits = rd_u16(f, 14);
-        // WAVE_FORMAT_EXTENSIBLE: the real tag is the SubFormat GUID's first
-        // two bytes (fmt chunk offset 24), after cbSize(2) + valid-bits(2) +
-        // channel-mask(4).
-        if format_tag == 0xFFFE {
-            if fmt.len() < 26 {
-                return Err(Error::invalid("wav demux: short extensible `fmt ` chunk"));
-            }
-            format_tag = rd_u16(f, 24);
-        }
-        let delivery = sample_format(format_tag, bits).ok_or_else(|| {
-            Error::unsupported(format!(
-                "wav demux: format tag {format_tag}, {bits}-bit (pcm u8/s16/s24 or f32)"
-            ))
-        })?;
-
-        let raw = top
-            .iter()
-            .find(|(id, _)| id == b"data")
-            .map(|(_, r)| &buf[r.clone()])
-            .ok_or_else(|| Error::invalid("wav demux: no `data` chunk"))?;
+        let (
+            WavFmt {
+                channels,
+                sample_rate,
+                delivery,
+            },
+            raw,
+        ) = read_wav(&mut input)?;
         let (format, data) = match delivery {
-            Delivery::Native(fmt) => (fmt, raw.to_vec()),
+            Delivery::Native(fmt) => (fmt, raw),
             Delivery::U8ToS16 => {
                 let mut out = Vec::with_capacity(raw.len() * 2);
-                for &b in raw {
+                for &b in &raw {
                     let v = ((b as i16) - 128) << 8;
                     out.extend_from_slice(&v.to_le_bytes());
                 }
@@ -365,6 +435,122 @@ mod tests {
         let streams = dem.read_header().unwrap();
         assert_eq!(streams[0].sample_format, Some(SampleFormat::F32));
         assert_eq!(streams[0].channels, 2);
+    }
+
+    /// The prefix-read demuxer must return exactly what the old whole-buffer
+    /// walk did -- first `fmt `, first `data`, `data = file[start..min(start +
+    /// size, len)]` -- on every layout, including the ones that must take the
+    /// fallback (fmt after data, chunks pushing `data` past the prefix, a
+    /// header straddling it) and the ones where the declared size lies
+    /// (truncated, streamed 0xFFFFFFFF, trailing chunks, two data chunks).
+    #[test]
+    fn demux_matches_whole_buffer_walk_on_every_layout() {
+        /// The old algorithm, verbatim in effect: the oracle.
+        fn reference(file: &[u8]) -> (u16, u32, Vec<u8>) {
+            let top = chunks(file, 12);
+            let fmt = top.iter().find(|(id, _)| id == b"fmt ").unwrap().1.clone();
+            let data = top.iter().find(|(id, _)| id == b"data").unwrap().1.clone();
+            let f = &file[fmt.start..];
+            (rd_u16(f, 2), rd_u32(f, 4), file[data].to_vec())
+        }
+        /// RIFF/WAVE from `(id, payload, declared size override)`.
+        fn riff(parts: &[(&[u8; 4], Vec<u8>, Option<u32>)]) -> Vec<u8> {
+            let mut body = b"WAVE".to_vec();
+            for (id, payload, declared) in parts {
+                body.extend_from_slice(*id);
+                let size = declared.unwrap_or(payload.len() as u32);
+                body.extend_from_slice(&size.to_le_bytes());
+                body.extend_from_slice(payload);
+                if payload.len() % 2 == 1 {
+                    body.push(0);
+                }
+            }
+            let mut file = b"RIFF".to_vec();
+            file.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            file.extend_from_slice(&body);
+            file
+        }
+        let fmt = fmt_chunk(1, 2, 44_100, 16);
+        let pcm = |n: usize| (0..n).map(|i| (i * 7 + 3) as u8).collect::<Vec<u8>>();
+        let mut layouts: Vec<(String, Vec<u8>)> = vec![
+            (
+                "plain".into(),
+                riff(&[(b"fmt ", fmt.clone(), None), (b"data", pcm(1000), None)]),
+            ),
+            (
+                "fmt after data".into(),
+                riff(&[(b"data", pcm(1000), None), (b"fmt ", fmt.clone(), None)]),
+            ),
+            (
+                "big LIST first".into(),
+                riff(&[
+                    (b"LIST", pcm(70_000), None),
+                    (b"fmt ", fmt.clone(), None),
+                    (b"data", pcm(4000), None),
+                ]),
+            ),
+            (
+                "odd junk".into(),
+                riff(&[
+                    (b"fmt ", fmt.clone(), None),
+                    (b"junk", pcm(3), None),
+                    (b"data", pcm(1000), None),
+                ]),
+            ),
+            (
+                "truncated".into(),
+                riff(&[
+                    (b"fmt ", fmt.clone(), None),
+                    (b"data", pcm(1200), Some(5000)),
+                ]),
+            ),
+            (
+                "streamed size".into(),
+                riff(&[
+                    (b"fmt ", fmt.clone(), None),
+                    (b"data", pcm(1200), Some(u32::MAX)),
+                ]),
+            ),
+            (
+                "trailing LIST".into(),
+                riff(&[
+                    (b"fmt ", fmt.clone(), None),
+                    (b"data", pcm(800), None),
+                    (b"LIST", pcm(100), None),
+                ]),
+            ),
+            (
+                "two data".into(),
+                riff(&[
+                    (b"fmt ", fmt.clone(), None),
+                    (b"data", pcm(400), None),
+                    (b"data", pcm(900), None),
+                ]),
+            ),
+            (
+                "data past prefix".into(),
+                riff(&[(b"fmt ", fmt.clone(), None), (b"data", pcm(300_000), None)]),
+            ),
+        ];
+        // A data header landing on, across and just after the 64 KiB prefix edge.
+        for pad in (HEAD_BYTES as usize - 60)..(HEAD_BYTES as usize - 30) {
+            layouts.push((
+                format!("edge pad {pad}"),
+                riff(&[
+                    (b"fmt ", fmt.clone(), None),
+                    (b"LIST", pcm(pad), None),
+                    (b"data", pcm(500), None),
+                ]),
+            ));
+        }
+        for (name, file) in layouts {
+            let (ch, rate, want) = reference(&file);
+            let mut dem = WavDemuxer::new(Box::new(Cursor::new(file)));
+            let streams = dem.read_header().unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(streams[0].channels, ch, "{name}");
+            assert_eq!(streams[0].sample_rate, rate, "{name}");
+            assert_eq!(dem.read_packet().unwrap().data, want, "{name}");
+        }
     }
 
     #[test]
