@@ -77,6 +77,17 @@ pub struct Mp3Decoder {
     eof: bool,
 }
 
+/// `MP3_CENSUS=1`: print the kernel-reach census when a decoder is dropped, so the
+/// SHIPPING binary (the rff CLI, any embedding application) can prove which
+/// kernel arms its decode actually took -- not only this crate's examples.
+impl Drop for Mp3Decoder {
+    fn drop(&mut self) {
+        if std::env::var_os("MP3_CENSUS").is_some() {
+            eprintln!("rusty_mp3 {}", decode::prof::kernel_census());
+        }
+    }
+}
+
 impl Mp3Decoder {
     pub fn new() -> Mp3Decoder {
         Mp3Decoder::default()
@@ -206,69 +217,70 @@ pub fn decode_pipelined(bytes: &[u8]) -> Vec<DecodedAudio> {
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     {
-    use std::sync::mpsc::sync_channel;
+        use std::sync::mpsc::sync_channel;
 
-    // Bounded so a fast entropy stage cannot buffer the whole file's spectra
-    // into memory ahead of the transform stage; this is the pipeline depth.
-    let (tx, rx) = sync_channel::<(FrameHeader, Vec<decode::GranuleWork>)>(32);
-    let mut out: Vec<DecodedAudio> = Vec::new();
+        // Bounded so a fast entropy stage cannot buffer the whole file's spectra
+        // into memory ahead of the transform stage; this is the pipeline depth.
+        let (tx, rx) = sync_channel::<(FrameHeader, Vec<decode::GranuleWork>)>(32);
+        let mut out: Vec<DecodedAudio> = Vec::new();
 
-    std::thread::scope(|scope| {
-        scope.spawn(move || {
-            let mut state = Mp3Decode::new();
-            let mut pos = 0usize;
-            while pos + 4 <= bytes.len() {
-                if bytes[pos] != 0xFF || bytes[pos + 1] & 0xE0 != 0xE0 {
-                    pos += 1;
-                    continue;
-                }
-                let hb = [bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]];
-                let Ok(header) = FrameHeader::parse(hb) else {
-                    pos += 1;
-                    continue;
-                };
-                let frame_size = header.frame_size();
-                if frame_size < 4 || pos + frame_size > bytes.len() {
-                    if frame_size < 4 {
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let mut state = Mp3Decode::new();
+                let mut pos = 0usize;
+                while pos + 4 <= bytes.len() {
+                    if bytes[pos] != 0xFF || bytes[pos + 1] & 0xE0 != 0xE0 {
                         pos += 1;
                         continue;
                     }
-                    break; // trailing partial frame
-                }
-                let crc = if header.crc_protected { 2 } else { 0 };
-                let si_start = pos + 4 + crc;
-                let main_start = si_start + header.side_info_len();
-                if main_start > pos + frame_size {
-                    pos += 1;
-                    continue;
-                }
-                let side = &bytes[si_start..main_start];
-                let main = &bytes[main_start..pos + frame_size];
-                if let Ok(work) = state.decode_frame_entropy(&header, side, main) {
-                    if tx.send((header, work)).is_err() {
-                        break; // receiver gone
+                    let hb = [bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]];
+                    let Ok(header) = FrameHeader::parse(hb) else {
+                        pos += 1;
+                        continue;
+                    };
+                    let frame_size = header.frame_size();
+                    if frame_size < 4 || pos + frame_size > bytes.len() {
+                        if frame_size < 4 {
+                            pos += 1;
+                            continue;
+                        }
+                        break; // trailing partial frame
                     }
+                    let crc = if header.crc_protected { 2 } else { 0 };
+                    let si_start = pos + 4 + crc;
+                    let main_start = si_start + header.side_info_len();
+                    if main_start > pos + frame_size {
+                        pos += 1;
+                        continue;
+                    }
+                    let side = &bytes[si_start..main_start];
+                    let main = &bytes[main_start..pos + frame_size];
+                    if let Ok(work) = state.decode_frame_entropy(&header, side, main) {
+                        if tx.send((header, work)).is_err() {
+                            break; // receiver gone
+                        }
+                    }
+                    pos += frame_size;
                 }
-                pos += frame_size;
+            });
+
+            // Transform stage runs on this thread, owning the overlap and the FIFO.
+            let mut tstate = decode::TransformState::new();
+            for (header, work) in rx {
+                let channels = header.channel_mode.channels().max(1);
+                let mut pcm =
+                    Vec::with_capacity(work.len() * crate::frame::GRANULE_LINES * channels);
+                for mut g in work {
+                    tstate.granule_to_pcm(&g.side, &mut g.spectrum, channels, &mut pcm);
+                }
+                out.push(DecodedAudio {
+                    sample_rate: header.sample_rate,
+                    channels: channels as u16,
+                    samples: pcm,
+                });
             }
         });
-
-        // Transform stage runs on this thread, owning the overlap and the FIFO.
-        let mut tstate = decode::TransformState::new();
-        for (header, work) in rx {
-            let channels = header.channel_mode.channels().max(1);
-            let mut pcm = Vec::with_capacity(work.len() * crate::frame::GRANULE_LINES * channels);
-            for mut g in work {
-                tstate.granule_to_pcm(&g.side, &mut g.spectrum, channels, &mut pcm);
-            }
-            out.push(DecodedAudio {
-                sample_rate: header.sample_rate,
-                channels: channels as u16,
-                samples: pcm,
-            });
-        }
-    });
-    out
+        out
     }
 }
 
@@ -302,7 +314,9 @@ pub fn vbr_quality_index(q: f32) -> f32 {
     //
     // The ladder tracks LAME's own V0..V9 average rates, so `-q:a N` lands near
     // where users expect it to.
-    const KBPS: [f32; 10] = [245.0, 225.0, 190.0, 175.0, 165.0, 130.0, 115.0, 100.0, 85.0, 65.0];
+    const KBPS: [f32; 10] = [
+        245.0, 225.0, 190.0, 175.0, 165.0, 130.0, 115.0, 100.0, 85.0, 65.0,
+    ];
     let q = q.clamp(0.0, 9.0);
     let lo = q.floor() as usize;
     let hi = (lo + 1).min(9);
@@ -1015,7 +1029,11 @@ mod tests {
             .flat_map(|f| f.samples)
             .collect();
 
-        assert_eq!(serial.len(), piped.len(), "pipelined produced a different sample count");
+        assert_eq!(
+            serial.len(),
+            piped.len(),
+            "pipelined produced a different sample count"
+        );
         assert!(!serial.is_empty(), "decoded nothing");
         for (i, (a, b)) in serial.iter().zip(piped.iter()).enumerate() {
             assert_eq!(a.to_bits(), b.to_bits(), "pipelined diverged at sample {i}");
@@ -1032,7 +1050,10 @@ mod tests {
                 lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 let t = i as f32 / sr as f32;
                 let tone = (0..6)
-                    .map(|k| (1.0 / (k + 1) as f32) * (2.0 * std::f32::consts::PI * 220.0 * (k + 1) as f32 * t).sin())
+                    .map(|k| {
+                        (1.0 / (k + 1) as f32)
+                            * (2.0 * std::f32::consts::PI * 220.0 * (k + 1) as f32 * t).sin()
+                    })
                     .sum::<f32>();
                 (0.25 * tone + 0.02 * ((lcg >> 9) as f32 / (1 << 23) as f32 - 0.5)).clamp(-1.0, 1.0)
             })
@@ -1051,10 +1072,7 @@ mod tests {
                 // CONFORMANCE: every emitted frame must physically contain its
                 // own main data. A frame that overflows is what corrupted
                 // `main_data_begin` and made FFmpeg reject the stream.
-                assert!(
-                    !p.is_empty(),
-                    "q={q}: empty packet"
-                );
+                assert!(!p.is_empty(), "q={q}: empty packet");
                 mp3.extend_from_slice(&p);
             }
             assert!(mp3.len() > 1000, "q={q}: implausibly small output");
@@ -1070,10 +1088,7 @@ mod tests {
         );
         // ORDERED: higher q (lower quality) must never cost MORE bits.
         for w in sizes.windows(2) {
-            assert!(
-                w[1] <= w[0],
-                "VBR ladder not monotonic: {sizes:?}"
-            );
+            assert!(w[1] <= w[0], "VBR ladder not monotonic: {sizes:?}");
         }
     }
 

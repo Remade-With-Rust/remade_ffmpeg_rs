@@ -239,18 +239,12 @@ fn window_scalar(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut [f32
     }
 }
 
-/// Resolve the windowing kernel ONCE per call rather than per pass — a feature
-/// check inside the 18-pass loop is overhead added to take a measurement.
-#[inline]
+/// Raw AVX detection, for the oracle tests (they must run the kernel whatever
+/// `MP3_ISA` says). The shipping path asks [`super::isa::use_avx`], resolved
+/// once per call rather than per pass.
+#[cfg(test)]
 fn have_avx() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("avx")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
+    super::isa::avx_available()
 }
 
 /// Run the synthesis filterbank for one channel's granule (subband-major `time`),
@@ -274,7 +268,15 @@ pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; G
     let mut head = 0usize;
     // Resolved once per call, not per pass (codec-measurement: the A/B switch
     // itself is measurement overhead if it sits in the hot loop).
-    let avx = have_avx();
+    let avx = super::isa::use_avx();
+    super::prof::kernel_tally(
+        if avx {
+            &super::prof::K_SYNTH_AVX
+        } else {
+            &super::prof::K_SYNTH_SCALAR
+        },
+        SUBBAND_LINES as u64,
+    );
 
     for v in 0..SUBBAND_LINES {
         // Gather this pass's 32 subband samples.
@@ -287,9 +289,13 @@ pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; G
         let vv = if avx {
             // SAFETY: `avx` came from runtime detection above.
             #[cfg(target_arch = "x86_64")]
-            { unsafe { matrixing_avx(&s) } }
+            {
+                unsafe { matrixing_avx(&s) }
+            }
             #[cfg(not(target_arch = "x86_64"))]
-            { matrixing_fast(&s) }
+            {
+                matrixing_fast(&s)
+            }
         } else {
             matrixing_fast(&s)
         };

@@ -55,6 +55,40 @@ pub mod prof {
     /// they exercise BOTH IMDCT paths within one granule.
     pub static N_MIXED: AtomicU64 = AtomicU64::new(0);
 
+    /// KERNEL REACH census, tallied once per granule (never per element, so the
+    /// tap cannot become the thing measured). Units: long subbands through the
+    /// 36-point IMDCT, and synthesis passes (18 per granule per channel, each one
+    /// matrixing + windowing call). Every arm counts, so "the fast arm ran" comes
+    /// with "the slow arm did not" (codec-vectorize-kernel REACHABILITY.md).
+    pub static K_IMDCT_AVX: AtomicU64 = AtomicU64::new(0);
+    pub static K_IMDCT_SCALAR: AtomicU64 = AtomicU64::new(0);
+    pub static K_SYNTH_AVX: AtomicU64 = AtomicU64::new(0);
+    pub static K_SYNTH_SCALAR: AtomicU64 = AtomicU64::new(0);
+
+    /// Add `n` units to a kernel-arm counter.
+    #[inline]
+    pub fn kernel_tally(c: &AtomicU64, n: u64) {
+        c.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// One line: how much of the decode reached each kernel arm.
+    pub fn kernel_census() -> String {
+        let pct = |a: u64, b: u64| 100.0 * a as f64 / (a + b).max(1) as f64;
+        let (ia, is) = (
+            K_IMDCT_AVX.load(Ordering::Relaxed),
+            K_IMDCT_SCALAR.load(Ordering::Relaxed),
+        );
+        let (sa, ss) = (
+            K_SYNTH_AVX.load(Ordering::Relaxed),
+            K_SYNTH_SCALAR.load(Ordering::Relaxed),
+        );
+        format!(
+            "kernel census: imdct36 avx {ia} scalar {is} ({:.2}% avx) | synthesis avx {sa} scalar {ss} ({:.2}% avx)",
+            pct(ia, is),
+            pct(sa, ss)
+        )
+    }
+
     /// Print the block-type census and reset it.
     pub fn census() {
         let (l, s, m) = (
@@ -118,6 +152,38 @@ pub mod prof {
                 100.0 * ns as f64 / total.max(1) as f64
             );
         }
+    }
+}
+
+/// Which instruction set the decode kernels may use.
+///
+/// `MP3_ISA=scalar` forces every kernel onto its scalar twin, read ONCE per
+/// process. It exists for two measurements no build flag can give cleanly: the
+/// ISA-rung A/B (the value of every vector kernel at once, same binary both
+/// arms) and the scalar-arm census (proof that the slow arm is not also what
+/// production runs). Both arms are bit-identical by construction, so flipping it
+/// changes speed only.
+pub mod isa {
+    /// AVX present on this CPU (raw detection, ignores the override).
+    #[inline]
+    pub fn avx_available() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
+    /// Whether the shipping path takes the AVX kernels: detected AND not forced off.
+    #[inline]
+    pub fn use_avx() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            avx_available() && !matches!(std::env::var("MP3_ISA").as_deref(), Ok("scalar"))
+        })
     }
 }
 

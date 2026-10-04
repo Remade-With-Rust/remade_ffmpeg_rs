@@ -73,7 +73,9 @@ fn kernels() -> &'static Kernels {
 
 /// The 18 of the 36 long-block outputs that are actually computed; the other 18
 /// are exact mirrors of these (see the symmetries in `hybrid`).
-const IMDCT_N: [usize; 18] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 18, 19, 20, 21, 22, 23, 24, 25, 26];
+const IMDCT_N: [usize; 18] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+];
 
 /// `cos36` transposed and compacted to `[k][j]`, `j` indexing [`IMDCT_N`], padded
 /// from 18 to 24 columns so it covers exactly three 8-wide lanes.
@@ -150,16 +152,11 @@ fn imdct36_scalar(lines: &[f32], out: &mut [f32; 24]) {
     }
 }
 
-#[inline]
+/// Raw AVX detection, for the oracle tests (they must run the kernel whatever
+/// `MP3_ISA` says). The shipping path asks [`super::isa::use_avx`].
+#[cfg(test)]
 fn have_avx() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("avx")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
+    super::isa::avx_available()
 }
 
 /// Run the hybrid IMDCT for one channel's granule. `overlap` holds the previous
@@ -173,8 +170,22 @@ pub fn hybrid(
     let t = kernels();
     let mut out = [0f32; GRANULE_LINES];
     // Resolved once per granule, not per subband.
-    let avx = have_avx();
+    let avx = super::isa::use_avx();
     let is_short = gi.window_switching && gi.block_type == BlockType::Short;
+    // Census: how many subbands of this granule take the 36-point (kernel) path.
+    let long_subbands = match (is_short, gi.mixed_block) {
+        (false, _) => SUBBANDS as u64,
+        (true, true) => 2,
+        (true, false) => 0,
+    };
+    super::prof::kernel_tally(
+        if avx {
+            &super::prof::K_IMDCT_AVX
+        } else {
+            &super::prof::K_IMDCT_SCALAR
+        },
+        long_subbands,
+    );
 
     for sb in 0..SUBBANDS {
         let base = sb * SUBBAND_LINES;
@@ -385,7 +396,10 @@ mod tests {
                     fast, dense,
                     "block_type={bt:?} mixed={mixed} granule={g}: half-work IMDCT diverged from dense"
                 );
-                assert_eq!(ov_a, ov_b, "overlap diverged: block_type={bt:?} mixed={mixed}");
+                assert_eq!(
+                    ov_a, ov_b,
+                    "overlap diverged: block_type={bt:?} mixed={mixed}"
+                );
             }
         }
     }
@@ -413,7 +427,11 @@ mod tests {
                 imdct36_avx(&lines, &mut b)
             };
             // Only the 18 real outputs; columns 18..24 are padding.
-            assert_eq!(a[..18], b[..18], "IMDCT SIMD/scalar mismatch on trial {trial}");
+            assert_eq!(
+                a[..18],
+                b[..18],
+                "IMDCT SIMD/scalar mismatch on trial {trial}"
+            );
         }
     }
 
@@ -427,7 +445,11 @@ mod tests {
         let t = kernels();
         for n in 0..9 {
             for k in 0..18 {
-                assert_eq!(t.cos36[17 - n][k], -t.cos36[n][k], "cos36 antisym n={n} k={k}");
+                assert_eq!(
+                    t.cos36[17 - n][k],
+                    -t.cos36[n][k],
+                    "cos36 antisym n={n} k={k}"
+                );
             }
         }
         for n in 18..27 {
@@ -437,7 +459,11 @@ mod tests {
         }
         for n in 0..3 {
             for k in 0..6 {
-                assert_eq!(t.cos12[5 - n][k], -t.cos12[n][k], "cos12 antisym n={n} k={k}");
+                assert_eq!(
+                    t.cos12[5 - n][k],
+                    -t.cos12[n][k],
+                    "cos12 antisym n={n} k={k}"
+                );
             }
         }
         for n in 6..9 {
