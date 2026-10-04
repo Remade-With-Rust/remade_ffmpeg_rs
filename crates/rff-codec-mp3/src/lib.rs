@@ -8,7 +8,7 @@
 //! traits by delegating to [`rusty_mp3::Mp3Decoder`]/[`rusty_mp3::Mp3Encoder`],
 //! and everything ffmpeg-CLI-shaped stays here: `Dictionary` option parsing
 //! (`-b:a`, `-q:a`), `AudioFrame` ↔ PCM conversion honoring `af.format`, and
-//! rusty_mp3 → rff error mapping.
+//! `rusty_mp3` → rff error mapping.
 
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
 use rff_core::{
@@ -97,6 +97,12 @@ impl Decoder for Mp3Decoder {
 }
 
 /// Parse an FFmpeg-style bitrate string ("128k", "192000") into kbps.
+///
+/// The option string is user input. Rust's float-to-int `as` SATURATES (NaN and
+/// negatives give 0, huge values `u32::MAX`), so no string can produce undefined
+/// behaviour, and 0 means "default" downstream; the encoder snaps every other
+/// value to the nearest legal bitrate.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn parse_bitrate(s: &str) -> Option<u32> {
     let s = s.trim();
     if let Some(n) = s.strip_suffix(['k', 'K']) {
@@ -225,11 +231,12 @@ impl Encoder for Mp3Encoder {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // test signal synthesis
 mod tests {
     use super::*;
 
     /// Encode interleaved **S16** mono — the sample format the WAV/PCM demuxer
-    /// actually delivers (the rusty_mp3 native tests otherwise feed f32 slices).
+    /// actually delivers (the `rusty_mp3` native tests otherwise feed f32 slices).
     fn encode_mono_s16(input: &[i16], sample_rate: u32) -> Vec<u8> {
         let bytes: Vec<u8> = input.iter().flat_map(|s| s.to_le_bytes()).collect();
         let mut enc = Mp3Encoder::default();
