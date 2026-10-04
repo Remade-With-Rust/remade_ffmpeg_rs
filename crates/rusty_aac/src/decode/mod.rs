@@ -117,7 +117,6 @@ pub struct Decoder {
     ps_state: Option<bool>,
     locked: bool,
     buf: Vec<f32>,
-    pub(crate) sbr_ctx: Option<Box<crate::sbr::dec::SbrDecoderCtx>>,
     /// No layout known (raw access units with no config, or an ADTS
     /// `channel_configuration` of 0 without a PCE): the first frame's elements
     /// define it, in arrival order.
@@ -181,7 +180,6 @@ impl Decoder {
             ps_state: if cfg.ps { Some(true) } else { None },
             locked: false,
             buf: vec![0.0; 2048],
-            sbr_ctx: None,
             discovery: if cfg.channel_config == 0 && cfg.pce.is_none() { Some(Vec::new()) } else { None },
             cfg,
         };
@@ -681,7 +679,7 @@ impl Decoder {
                         return Ok(cnt);
                     }
                     self.sbr_state = Some(true);
-                    if self.ps_state.is_none() && self.oc.channels() == 1 {
+                    if self.ps_state.is_none() && self.oc.channels() == 1 && self.cfg.object_type == aot::AAC_LC {
                         self.ps_state = Some(true);
                         let map = self.oc.map.clone();
                         self.output_configure(map);
@@ -917,10 +915,21 @@ impl Decoder {
         }
     }
 
+    /// The SBR output rate: the signalled extension rate, or twice the core
+    /// rate when SBR was found implicitly. Equal to the core rate for
+    /// downsampled SBR.
+    pub(crate) fn sbr_ext_rate(&self) -> u32 {
+        if self.cfg.sbr || self.cfg.ext_rate_signalled {
+            self.cfg.ext_sample_rate
+        } else {
+            2 * self.cfg.sample_rate
+        }
+    }
+
     /// Output samples per channel for this frame (doubled by dual-rate SBR).
     pub(crate) fn output_len(&self) -> usize {
         let n = self.frame_samples();
-        if self.sbr_state == Some(true) && self.sbr_ctx.as_ref().map(|c| c.dual_rate()).unwrap_or(false) {
+        if self.sbr_state == Some(true) && self.sbr_ext_rate() > self.cfg.sample_rate {
             2 * n
         } else {
             n

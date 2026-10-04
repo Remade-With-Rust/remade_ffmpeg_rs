@@ -37,6 +37,8 @@
 //! pretending otherwise.
 
 pub(crate) mod dec;
+pub(crate) mod ps;
+mod tables;
 
 use crate::Result;
 

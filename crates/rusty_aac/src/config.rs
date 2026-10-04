@@ -266,6 +266,10 @@ pub struct StreamConfig {
     pub ps: bool,
     /// Output rate after SBR (equals `sample_rate` when there is no SBR).
     pub ext_sample_rate: u32,
+    /// An extension rate was signalled even though SBR presence stays
+    /// implicit (a sync extension naming the core rate). If SBR then appears
+    /// it runs downsampled, at this rate.
+    pub ext_rate_signalled: bool,
     pub eld: Option<EldConfig>,
 }
 
@@ -290,6 +294,7 @@ impl StreamConfig {
             sbr_explicitly_absent: false,
             ps: false,
             ext_sample_rate: sample_rate,
+            ext_rate_signalled: false,
             eld: None,
         }
     }
@@ -421,28 +426,38 @@ pub fn parse_from_opts(
     }
 
     // Backward-compatible SBR/PS signalling after the core config.
-    if sync_extension && ext_aot != aot::SBR && r.bits_left() >= 16 {
-        let sync = r.read_bits(11)?;
-        if sync == 0x2B7 {
-            let e = read_aot(r)?;
-            if e == aot::SBR {
-                let present = r.read_bool()?;
-                if present {
-                    c.sbr = true;
-                    let (_, ext_rate) = read_rate(r)?;
-                    c.ext_sample_rate = ext_rate;
-                    if r.bits_left() >= 12 && r.read_bits(11)? == 0x548 {
-                        c.ps = r.read_bool()?;
-                    }
+    // The sync word may follow padding, so it is searched bit by bit.
+    // (Hierarchical signalling with an extension rate equal to the core rate
+    // is downsampled SBR: the output stays at the core rate.)
+    while sync_extension && ext_aot != aot::SBR && r.bits_left() > 15 {
+        if r.peek_bits(11) != 0x2B7 {
+            r.skip(1)?;
+            continue;
+        }
+        r.skip(11)?;
+        let e = read_aot(r)?;
+        if e == aot::SBR {
+            if r.read_bool()? {
+                let (_, ext_rate) = read_rate(r)?;
+                if ext_rate == c.sample_rate {
+                    // No distinct rate: SBR presence stays implicit.
+                    c.ext_sample_rate = c.sample_rate;
+                    c.ext_rate_signalled = true;
                 } else {
-                    c.sbr_explicitly_absent = true;
+                    c.sbr = true;
+                    c.ext_sample_rate = ext_rate;
                 }
+            } else {
+                c.sbr_explicitly_absent = true;
             }
         }
+        if r.bits_left() > 11 && r.read_bits(11)? == 0x548 {
+            c.ps = r.read_bool()?;
+        }
+        break;
     }
-    if c.sbr && c.ext_sample_rate == c.sample_rate && c.eld.is_none() {
-        // SBR with no distinct extension rate still runs dual-rate.
-        c.ext_sample_rate = c.sample_rate * 2;
+    if c.sbr_explicitly_absent {
+        c.ps = false;
     }
     if let Some(e) = &c.eld {
         if e.ld_sbr {
