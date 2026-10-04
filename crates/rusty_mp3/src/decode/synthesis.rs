@@ -136,6 +136,55 @@ unsafe fn matrixing_avx(s: &[f32; SUBBANDS]) -> [f32; 64] {
     expand_g(&g)
 }
 
+/// NEON twin of [`matrixing_avx`], 4 of the 32 `G[m]` per lane. Each 4-lane
+/// group starts on an even `m`, so the even/odd input split is the fixed lane
+/// pattern `[plus, minus, plus, minus]`. Separate `vmulq` + `vaddq` keep it
+/// bit-identical to `matrixing_fast` (pinned by `matrixing_simd_matches_scalar`,
+/// run under qemu-aarch64).
+///
+/// # Safety
+/// NEON is baseline on AArch64; all accesses are into fixed-size arrays.
+#[cfg(target_arch = "aarch64")]
+unsafe fn matrixing_neon(s: &[f32; SUBBANDS]) -> [f32; 64] {
+    use std::arch::aarch64::*;
+    let ct = half_dct_t();
+    let mut acc = [unsafe { vdupq_n_f32(0.0) }; 8];
+    for k in 0..16 {
+        let (p, m) = (s[k] + s[31 - k], s[k] - s[31 - k]);
+        let pm = [p, m, p, m];
+        unsafe {
+            let src = vld1q_f32(pm.as_ptr());
+            for (v, accv) in acc.iter_mut().enumerate() {
+                let c = vld1q_f32(ct[k].as_ptr().add(v * 4));
+                *accv = vaddq_f32(*accv, vmulq_f32(c, src));
+            }
+        }
+    }
+    let mut g = [0f32; 32];
+    for (v, accv) in acc.iter().enumerate() {
+        unsafe { vst1q_f32(g.as_mut_ptr().add(v * 4), *accv) };
+    }
+    expand_g(&g)
+}
+
+/// This arch's SIMD matrixing (AVX / NEON / scalar).
+///
+/// # Safety
+/// Caller must have checked [`super::isa::simd_available`].
+#[inline]
+unsafe fn matrixing_simd(s: &[f32; SUBBANDS]) -> [f32; 64] {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        matrixing_avx(s)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        matrixing_neon(s)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    matrixing_fast(s)
+}
+
 /// Map the 32 distinct DCT outputs onto the 64 `V` values by sign and index
 /// (`V[16]` is identically zero). Shared by the scalar and AVX matrixing.
 #[inline]
@@ -202,6 +251,55 @@ unsafe fn window_avx(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut 
     }
 }
 
+/// NEON twin of [`window_avx`]: 4 outputs per lane, 8 accumulators, the same tap
+/// order (i ascending, `a` before `b`) with separate `vmulq` + `vaddq`. Pinned by
+/// `window_simd_matches_scalar` under qemu-aarch64.
+///
+/// # Safety
+/// `head` must be a multiple of 64 (as `polyphase` guarantees), so both 32-float
+/// spans stay inside `fifo`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn window_neon(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut [f32; 32]) {
+    use std::arch::aarch64::*;
+    let mut acc = [unsafe { vdupq_n_f32(0.0) }; 8];
+    for i in 0..8 {
+        let a = (head + i * 128) & 960;
+        let b = (head + i * 128 + 96) & 1023;
+        for (v, accv) in acc.iter_mut().enumerate() {
+            unsafe {
+                let fa = vld1q_f32(fifo.as_ptr().add(a + v * 4));
+                let da = vld1q_f32(d.as_ptr().add(i * 64 + v * 4));
+                *accv = vaddq_f32(*accv, vmulq_f32(fa, da));
+                let fb = vld1q_f32(fifo.as_ptr().add(b + v * 4));
+                let db = vld1q_f32(d.as_ptr().add(i * 64 + 32 + v * 4));
+                *accv = vaddq_f32(*accv, vmulq_f32(fb, db));
+            }
+        }
+    }
+    for (v, accv) in acc.iter().enumerate() {
+        unsafe { vst1q_f32(out.as_mut_ptr().add(v * 4), *accv) };
+    }
+}
+
+/// This arch's SIMD windowing (AVX / NEON / scalar).
+///
+/// # Safety
+/// Caller must have checked [`super::isa::simd_available`], and `head` must be a
+/// multiple of 64.
+#[inline]
+unsafe fn window_simd(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut [f32; 32]) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        window_avx(fifo, d, head, out)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        window_neon(fifo, d, head, out)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    window_scalar(fifo, d, head, out)
+}
+
 /// The scalar windowing sum — the oracle the SIMD twin is gated against, and the
 /// fallback on machines without AVX.
 #[inline]
@@ -239,12 +337,12 @@ fn window_scalar(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut [f32
     }
 }
 
-/// Raw AVX detection, for the oracle tests (they must run the kernel whatever
-/// `MP3_ISA` says). The shipping path asks [`super::isa::use_avx`], resolved
+/// Raw SIMD availability, for the oracle tests (they must run the kernel whatever
+/// `MP3_ISA` says). The shipping path asks [`super::isa::use_simd`], resolved
 /// once per call rather than per pass.
 #[cfg(test)]
-fn have_avx() -> bool {
-    super::isa::avx_available()
+fn have_simd() -> bool {
+    super::isa::simd_available()
 }
 
 /// Run the synthesis filterbank for one channel's granule (subband-major `time`),
@@ -268,10 +366,10 @@ pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; G
     let mut head = 0usize;
     // Resolved once per call, not per pass (codec-measurement: the A/B switch
     // itself is measurement overhead if it sits in the hot loop).
-    let avx = super::isa::use_avx();
+    let simd = super::isa::use_simd();
     super::prof::kernel_tally(
-        if avx {
-            &super::prof::K_SYNTH_AVX
+        if simd {
+            &super::prof::K_SYNTH_SIMD
         } else {
             &super::prof::K_SYNTH_SCALAR
         },
@@ -286,16 +384,9 @@ pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; G
         }
         // Advance V by 64 and matrix the new 64 values into the front.
         head = (head + 1024 - 64) & 1023;
-        let vv = if avx {
-            // SAFETY: `avx` came from runtime detection above.
-            #[cfg(target_arch = "x86_64")]
-            {
-                unsafe { matrixing_avx(&s) }
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                matrixing_fast(&s)
-            }
+        let vv = if simd {
+            // SAFETY: `simd` came from `use_simd()` above.
+            unsafe { matrixing_simd(&s) }
         } else {
             matrixing_fast(&s)
         };
@@ -313,13 +404,10 @@ pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; G
         let out: &mut [f32; 32] = pcm[v * 32..]
             .first_chunk_mut()
             .expect("granule is 18 blocks of 32");
-        if avx {
-            // SAFETY: `avx` was resolved from runtime detection before the loop;
+        if simd {
+            // SAFETY: `simd` was resolved from `use_simd()` before the loop;
             // `head` is a multiple of 64 so both spans leave 32 floats in bounds.
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                window_avx(fifo, d, head, out)
-            };
+            unsafe { window_simd(fifo, d, head, out) };
         } else {
             window_scalar(fifo, d, head, out);
         }
@@ -341,8 +429,8 @@ mod tests {
     /// be a horizontal sum and would NOT be bit-identical.)
     #[test]
     fn matrixing_simd_matches_scalar() {
-        if !have_avx() {
-            eprintln!("AVX unavailable on this host - scalar path only, gate skipped");
+        if !have_simd() {
+            eprintln!("no SIMD twin on this host - scalar path only, gate skipped");
             return;
         }
         let mut st = 0x3C6E_F372u32;
@@ -356,8 +444,8 @@ mod tests {
                 *v = rng();
             }
             let a = matrixing_fast(&s);
-            #[cfg(target_arch = "x86_64")]
-            let b = unsafe { matrixing_avx(&s) };
+            // SAFETY: gated on `have_simd()` above.
+            let b = unsafe { matrixing_simd(&s) };
             assert_eq!(a, b, "matrixing SIMD/scalar mismatch on trial {trial}");
         }
     }
@@ -372,8 +460,8 @@ mod tests {
     /// covered, with random FIFO contents.
     #[test]
     fn window_simd_matches_scalar() {
-        if !have_avx() {
-            eprintln!("AVX unavailable on this host - scalar path only, gate skipped");
+        if !have_simd() {
+            eprintln!("no SIMD twin on this host - scalar path only, gate skipped");
             return;
         }
         let mut st = 0x7F4A_7C15u32;
@@ -390,10 +478,8 @@ mod tests {
             let mut a = [0f32; 32];
             let mut b = [0f32; 32];
             window_scalar(&fifo, d, head, &mut a);
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                window_avx(&fifo, d, head, &mut b)
-            };
+            // SAFETY: gated on `have_simd()`; `head` steps by 64.
+            unsafe { window_simd(&fifo, d, head, &mut b) };
             assert_eq!(a, b, "SIMD/scalar mismatch at head={head}");
         }
     }

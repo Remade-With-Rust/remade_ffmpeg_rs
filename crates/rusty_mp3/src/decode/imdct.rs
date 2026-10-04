@@ -132,7 +132,57 @@ unsafe fn imdct36_avx(lines: &[f32], out: &mut [f32; 24]) {
     }
 }
 
-/// The scalar twin — oracle and non-AVX fallback.
+/// NEON twin of [`imdct36_avx`]: 4 outputs per lane, 6 accumulators. Bit-identical
+/// for the same reason -- each output owns a lane and accumulates its 18 terms in
+/// the original `k` order with SEPARATE `vmulq` + `vaddq` (never `vfmaq`, which
+/// rounds once where the scalar rounds twice). Pinned by `imdct_simd_matches_scalar`,
+/// which runs under qemu-aarch64 (`tools/bench/arm_qemu_test.sh`).
+///
+/// # Safety
+/// NEON is baseline on AArch64; the only obligation is the caller's slice length,
+/// checked here by `first_chunk`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn imdct36_neon(lines: &[f32], out: &mut [f32; 24]) {
+    use std::arch::aarch64::*;
+    let Some(lines) = lines.first_chunk::<18>() else {
+        return;
+    };
+    let ct = cos36_t();
+    let mut acc = [unsafe { vdupq_n_f32(0.0) }; 6];
+    for (k, row) in ct.iter().enumerate() {
+        unsafe {
+            let x = vdupq_n_f32(lines[k]);
+            for (v, accv) in acc.iter_mut().enumerate() {
+                let c = vld1q_f32(row.as_ptr().add(v * 4));
+                *accv = vaddq_f32(*accv, vmulq_f32(c, x));
+            }
+        }
+    }
+    for (v, accv) in acc.iter().enumerate() {
+        unsafe { vst1q_f32(out.as_mut_ptr().add(v * 4), *accv) };
+    }
+}
+
+/// This arch's SIMD twin (AVX on x86_64, NEON on aarch64, scalar elsewhere).
+///
+/// # Safety
+/// The caller must have checked [`super::isa::simd_available`] (the shipping path
+/// asks `use_simd`, which implies it): on x86_64 this executes AVX instructions.
+#[inline]
+unsafe fn imdct36_simd(lines: &[f32], out: &mut [f32; 24]) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        imdct36_avx(lines, out)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        imdct36_neon(lines, out)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    imdct36_scalar(lines, out)
+}
+
+/// The scalar twin — oracle and non-SIMD fallback.
 #[inline]
 fn imdct36_scalar(lines: &[f32], out: &mut [f32; 24]) {
     // Convert to a fixed-size reference ONCE. As a `&[f32]` the compiler cannot
@@ -152,11 +202,11 @@ fn imdct36_scalar(lines: &[f32], out: &mut [f32; 24]) {
     }
 }
 
-/// Raw AVX detection, for the oracle tests (they must run the kernel whatever
-/// `MP3_ISA` says). The shipping path asks [`super::isa::use_avx`].
+/// Raw SIMD availability, for the oracle tests (they must run the kernel whatever
+/// `MP3_ISA` says). The shipping path asks [`super::isa::use_simd`].
 #[cfg(test)]
-fn have_avx() -> bool {
-    super::isa::avx_available()
+fn have_simd() -> bool {
+    super::isa::simd_available()
 }
 
 /// Run the hybrid IMDCT for one channel's granule. `overlap` holds the previous
@@ -170,7 +220,7 @@ pub fn hybrid(
     let t = kernels();
     let mut out = [0f32; GRANULE_LINES];
     // Resolved once per granule, not per subband.
-    let avx = super::isa::use_avx();
+    let simd = super::isa::use_simd();
     let is_short = gi.window_switching && gi.block_type == BlockType::Short;
     // Census: how many subbands of this granule take the 36-point (kernel) path.
     let long_subbands = match (is_short, gi.mixed_block) {
@@ -179,8 +229,8 @@ pub fn hybrid(
         (true, false) => 0,
     };
     super::prof::kernel_tally(
-        if avx {
-            &super::prof::K_IMDCT_AVX
+        if simd {
+            &super::prof::K_IMDCT_SIMD
         } else {
             &super::prof::K_IMDCT_SCALAR
         },
@@ -249,12 +299,9 @@ pub fn hybrid(
             // as the lane, so each still accumulates over `k` in the original
             // order and the result is bit-identical (not merely close).
             let mut dp = [0f32; 24];
-            if avx {
-                // SAFETY: `avx` came from runtime detection before the loop.
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    imdct36_avx(&lines[base..base + 18], &mut dp)
-                };
+            if simd {
+                // SAFETY: `simd` came from `use_simd()` before the loop.
+                unsafe { imdct36_simd(&lines[base..base + 18], &mut dp) };
             } else {
                 imdct36_scalar(&lines[base..base + 18], &mut dp);
             }
@@ -409,8 +456,8 @@ mod tests {
     /// never reassociated, so this is `assert_eq!`, not a tolerance.
     #[test]
     fn imdct_simd_matches_scalar() {
-        if !have_avx() {
-            eprintln!("AVX unavailable on this host - scalar path only, gate skipped");
+        if !have_simd() {
+            eprintln!("no SIMD twin on this host - scalar path only, gate skipped");
             return;
         }
         let mut st = 0x1F35_3D9Bu32;
@@ -422,10 +469,8 @@ mod tests {
             let lines: Vec<f32> = (0..18).map(|_| rng()).collect();
             let (mut a, mut b) = ([0f32; 24], [0f32; 24]);
             imdct36_scalar(&lines, &mut a);
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                imdct36_avx(&lines, &mut b)
-            };
+            // SAFETY: gated on `have_simd()` above.
+            unsafe { imdct36_simd(&lines, &mut b) };
             // Only the 18 real outputs; columns 18..24 are padding.
             assert_eq!(
                 a[..18],

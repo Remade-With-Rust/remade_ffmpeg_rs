@@ -70,14 +70,18 @@ price of the per-arch gap below.
 |---|---|---|
 | x86_64 with AVX | all three | measured above |
 | x86_64 without AVX | scalar twins | same code path as `MP3_ISA=scalar` |
-| aarch64 (Apple Silicon, Graviton, ARM phones) | **none** -- no NEON sibling | `cargo check` clean on `aarch64-unknown-linux-gnu` and `aarch64-apple-darwin`; NOT run (no ARM host). Decodes at the scalar rung, ~1.6x slower than x86 AVX |
+| aarch64 (Apple Silicon, Graviton, ARM phones) | **NEON twins of all three** (2026-10-03, brick 1) | run under qemu-aarch64 from WSL (`tools/bench/arm_qemu_test.sh`): 97/97 lib tests, the three oracle tests EXECUTE NEON (poison: fused `vfmaq` fails all three), ISO gate 16/16 on NEON and on `MP3_ISA=scalar`. Inline into their callers (NEON is baseline: no `#[target_feature]` boundary). Speed on real ARM hardware NOT measured |
 | wasm32-unknown-unknown / wasip1 | scalar twins | `tools/bench/wasm_check.sh` PASSES -- bit-exact with the host |
 
 ---
 
 ## Findings
 
-1. **REACHABILITY form 3 (one-arch twin) -- priced.** No kernel has an aarch64
+1. **REACHABILITY form 3 (one-arch twin) -- priced, then FIXED by brick 1** (NEON
+   twins; see the per-arch table). Found on the way: the test module did not
+   COMPILE on aarch64 (`b` bound only under `cfg(x86_64)`), so every ARM CI leg
+   failed before running a test -- "test the fallback path".
+   Original entry: No kernel has an aarch64
    sibling. The ISA-rung A/B says what that costs: every ARM build decodes ~1.6x
    slower than it would with NEON twins of the same three loops. All three are
    lane-per-output f32 dot products, so a `float32x4_t` mirror is mechanical;

@@ -60,9 +60,9 @@ pub mod prof {
     /// 36-point IMDCT, and synthesis passes (18 per granule per channel, each one
     /// matrixing + windowing call). Every arm counts, so "the fast arm ran" comes
     /// with "the slow arm did not" (codec-vectorize-kernel REACHABILITY.md).
-    pub static K_IMDCT_AVX: AtomicU64 = AtomicU64::new(0);
+    pub static K_IMDCT_SIMD: AtomicU64 = AtomicU64::new(0);
     pub static K_IMDCT_SCALAR: AtomicU64 = AtomicU64::new(0);
-    pub static K_SYNTH_AVX: AtomicU64 = AtomicU64::new(0);
+    pub static K_SYNTH_SIMD: AtomicU64 = AtomicU64::new(0);
     pub static K_SYNTH_SCALAR: AtomicU64 = AtomicU64::new(0);
 
     /// Add `n` units to a kernel-arm counter.
@@ -75,15 +75,15 @@ pub mod prof {
     pub fn kernel_census() -> String {
         let pct = |a: u64, b: u64| 100.0 * a as f64 / (a + b).max(1) as f64;
         let (ia, is) = (
-            K_IMDCT_AVX.load(Ordering::Relaxed),
+            K_IMDCT_SIMD.load(Ordering::Relaxed),
             K_IMDCT_SCALAR.load(Ordering::Relaxed),
         );
         let (sa, ss) = (
-            K_SYNTH_AVX.load(Ordering::Relaxed),
+            K_SYNTH_SIMD.load(Ordering::Relaxed),
             K_SYNTH_SCALAR.load(Ordering::Relaxed),
         );
         format!(
-            "kernel census: imdct36 avx {ia} scalar {is} ({:.2}% avx) | synthesis avx {sa} scalar {ss} ({:.2}% avx)",
+            "kernel census: imdct36 simd {ia} scalar {is} ({:.2}% simd) | synthesis simd {sa} scalar {ss} ({:.2}% simd)",
             pct(ia, is),
             pct(sa, ss)
         )
@@ -164,25 +164,31 @@ pub mod prof {
 /// production runs). Both arms are bit-identical by construction, so flipping it
 /// changes speed only.
 pub mod isa {
-    /// AVX present on this CPU (raw detection, ignores the override).
+    /// A SIMD twin exists AND can run on this CPU (raw, ignores the override):
+    /// AVX by runtime detection on x86_64; NEON on aarch64, where it is baseline
+    /// (every AArch64 core has it, so there is nothing to detect); none elsewhere.
     #[inline]
-    pub fn avx_available() -> bool {
+    pub fn simd_available() -> bool {
         #[cfg(target_arch = "x86_64")]
         {
             std::arch::is_x86_feature_detected!("avx")
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            true
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             false
         }
     }
 
-    /// Whether the shipping path takes the AVX kernels: detected AND not forced off.
+    /// Whether the shipping path takes the SIMD kernels: available AND not forced off.
     #[inline]
-    pub fn use_avx() -> bool {
+    pub fn use_simd() -> bool {
         static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *V.get_or_init(|| {
-            avx_available() && !matches!(std::env::var("MP3_ISA").as_deref(), Ok("scalar"))
+            simd_available() && !matches!(std::env::var("MP3_ISA").as_deref(), Ok("scalar"))
         })
     }
 }
