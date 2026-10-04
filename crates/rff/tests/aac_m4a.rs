@@ -56,7 +56,11 @@ fn transcode(engine: &Engine, input: &Path, output: &Path, codec: CodecId) {
             audio_codec: Some(StreamCodec {
                 codec,
                 options: Dictionary::new(),
-                sample_format: None,
+                // Pin S16 for the PCM decode-back, as `-c:a pcm_s16le` does: left
+                // unset, the writer keeps the decoder's native f32 and emits a
+                // 32-bit float WAV — which `read_wav_s16` would read as twice as
+                // many samples at a nonsense level (the old "2x long/hot" note).
+                sample_format: (codec == CodecId::Pcm).then_some(SampleFormat::S16),
             }),
             video_filters: None,
             filter_complex: None,
@@ -133,30 +137,37 @@ fn aac_m4a_roundtrips_through_our_stack() {
         "MP4 is missing the esds (AAC config) box"
     );
 
-    // Our own MP4 demux + AAC decode reconstructs stereo audio at the right rate.
-    // NOTE: the decode-*back* currently runs ~2× long/hot — a pre-existing bug in
-    // the AAC-in-MP4 read path (MP4 demux / engine), NOT the encoder+muxer this brick
-    // built: ffmpeg decodes the very same file at exactly unity (see the ignored
-    // `aac_m4a_decodes_in_ffmpeg`), and the codec round-trips at unity directly
-    // (aac `stereo_direct_decode_amplitude`). So assert the audio is present and
-    // well-formed, and leave the read-path level/length to that follow-up.
+    // Our own MP4 demux + AAC decode reconstructs stereo audio at the right rate,
+    // length and level. (The decode-back once read as ~2x long and hot: that was
+    // this test reading a float WAV as s16 — see `transcode` — not the codec.)
     let hb = fs::read(&back).unwrap();
     let ch = u16::from_le_bytes([hb[22], hb[23]]);
     let rate = u32::from_le_bytes([hb[24], hb[25], hb[26], hb[27]]);
     let out = read_wav_s16(&back);
-    let out_rms = rms(&out);
+    let input: Vec<i16> = pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    let (in_rms, out_rms) = (rms(&input), rms(&out));
     eprintln!(
-        "back.wav ch={ch} rate={rate} samples={} rms={out_rms:.0}",
-        out.len()
+        "back.wav ch={ch} rate={rate} samples={} (in {}) rms={out_rms:.0} (in {in_rms:.0})",
+        out.len(),
+        input.len()
     );
     assert_eq!(
         (ch, rate),
         (2, sr),
         "decode-back lost the stereo/rate config"
     );
+    // Length: the input plus at most a few frames of codec delay/padding.
     assert!(
-        !out.is_empty() && out_rms > 1000.0,
-        "round-trip produced no audible audio"
+        out.len() >= input.len() && out.len() <= input.len() + 2 * 3 * 1024,
+        "decode-back length {} vs input {}",
+        out.len(),
+        input.len()
+    );
+    // Level: within 1 dB of the input.
+    let ratio = out_rms / in_rms;
+    assert!(
+        (0.89..=1.12).contains(&ratio),
+        "decode-back level ratio {ratio:.3} (out rms {out_rms:.0}, in {in_rms:.0})"
     );
 
     for p in [wav, m4a, back] {
