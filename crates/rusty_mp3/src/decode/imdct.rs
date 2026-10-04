@@ -217,8 +217,6 @@ pub fn hybrid(
     lines: &[f32; GRANULE_LINES],
     overlap: &mut [f32; GRANULE_LINES],
 ) -> [f32; GRANULE_LINES] {
-    let t = kernels();
-    let mut out = [0f32; GRANULE_LINES];
     // Resolved once per granule, not per subband.
     let simd = super::isa::use_simd();
     let is_short = gi.window_switching && gi.block_type == BlockType::Short;
@@ -236,6 +234,47 @@ pub fn hybrid(
         },
         long_subbands,
     );
+    // The `#[target_feature]` boundary sits HERE, once per granule, not inside the
+    // subband loop: a target-feature function cannot inline into a caller that
+    // lacks the feature, so calling `imdct36_avx` from the plain body paid a real
+    // call per long subband (32 per granule). Entering an AVX-compiled copy of the
+    // whole body lets the kernel inline (codec-vectorize-kernel: put the LOOP
+    // inside the `#[target_feature]` function). NEON is baseline, so aarch64 never
+    // had the boundary.
+    #[cfg(target_arch = "x86_64")]
+    if simd {
+        // SAFETY: on x86_64 `use_simd()` is true only when AVX was detected.
+        return unsafe { hybrid_avx(gi, lines, overlap) };
+    }
+    hybrid_impl(gi, lines, overlap, simd)
+}
+
+/// [`hybrid_impl`] compiled with AVX enabled, so the kernel calls inside inline.
+///
+/// # Safety
+/// AVX must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn hybrid_avx(
+    gi: &GranuleSideInfo,
+    lines: &[f32; GRANULE_LINES],
+    overlap: &mut [f32; GRANULE_LINES],
+) -> [f32; GRANULE_LINES] {
+    hybrid_impl(gi, lines, overlap, true)
+}
+
+/// The hybrid IMDCT body; `simd` selects the kernel twin (callers pass a value
+/// from `use_simd()`, and on x86_64 only `hybrid_avx` passes `true`).
+#[inline(always)]
+fn hybrid_impl(
+    gi: &GranuleSideInfo,
+    lines: &[f32; GRANULE_LINES],
+    overlap: &mut [f32; GRANULE_LINES],
+    simd: bool,
+) -> [f32; GRANULE_LINES] {
+    let t = kernels();
+    let mut out = [0f32; GRANULE_LINES];
+    let is_short = gi.window_switching && gi.block_type == BlockType::Short;
 
     for sb in 0..SUBBANDS {
         let base = sb * SUBBAND_LINES;

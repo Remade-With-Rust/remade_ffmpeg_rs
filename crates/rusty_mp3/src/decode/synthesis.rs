@@ -348,6 +348,48 @@ fn have_simd() -> bool {
 /// Run the synthesis filterbank for one channel's granule (subband-major `time`),
 /// returning 576 PCM samples. `fifo` is the persistent `V[]` state.
 pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; GRANULE_LINES] {
+    // Resolved once per call, not per pass (codec-measurement: the A/B switch
+    // itself is measurement overhead if it sits in the hot loop).
+    let simd = super::isa::use_simd();
+    super::prof::kernel_tally(
+        if simd {
+            &super::prof::K_SYNTH_SIMD
+        } else {
+            &super::prof::K_SYNTH_SCALAR
+        },
+        SUBBAND_LINES as u64,
+    );
+    // One `#[target_feature]` boundary per granule rather than two per pass: the
+    // AVX entry compiles the whole body with AVX, so `matrixing_avx` and
+    // `window_avx` inline instead of being called 36 times (see `imdct::hybrid`).
+    #[cfg(target_arch = "x86_64")]
+    if simd {
+        // SAFETY: on x86_64 `use_simd()` is true only when AVX was detected.
+        return unsafe { polyphase_avx(time, fifo) };
+    }
+    polyphase_impl(time, fifo, simd)
+}
+
+/// [`polyphase_impl`] compiled with AVX enabled, so the kernel calls inside inline.
+///
+/// # Safety
+/// AVX must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn polyphase_avx(
+    time: &[f32; GRANULE_LINES],
+    fifo: &mut [f32; 1024],
+) -> [f32; GRANULE_LINES] {
+    polyphase_impl(time, fifo, true)
+}
+
+/// The synthesis body; `simd` selects the kernel twins.
+#[inline(always)]
+fn polyphase_impl(
+    time: &[f32; GRANULE_LINES],
+    fifo: &mut [f32; 1024],
+    simd: bool,
+) -> [f32; GRANULE_LINES] {
     let d = &SYNTH_D;
     let mut pcm = [0f32; GRANULE_LINES];
 
@@ -364,17 +406,6 @@ pub fn polyphase(time: &[f32; GRANULE_LINES], fifo: &mut [f32; 1024]) -> [f32; G
     // 32 — so each 32-long run sits inside one 32-aligned block and never wraps
     // mid-run.
     let mut head = 0usize;
-    // Resolved once per call, not per pass (codec-measurement: the A/B switch
-    // itself is measurement overhead if it sits in the hot loop).
-    let simd = super::isa::use_simd();
-    super::prof::kernel_tally(
-        if simd {
-            &super::prof::K_SYNTH_SIMD
-        } else {
-            &super::prof::K_SYNTH_SCALAR
-        },
-        SUBBAND_LINES as u64,
-    );
 
     for v in 0..SUBBAND_LINES {
         // Gather this pass's 32 subband samples.

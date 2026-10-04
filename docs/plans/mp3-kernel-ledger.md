@@ -142,5 +142,10 @@ function with ~0 packed ops has no vectorized inner loop either.
    quantize/xpow kernel (`codec-vectorize-kernel` 2026-07-03): a cross-crate form-2
    case -- port before writing. Named reason: the f64->i32 round+clamp with a sign
    is above what the cost model accepts at the SSE2 baseline.
-4. **Dispatch-site hoist** (finding 3) -- one `#[target_feature]` boundary per
-   granule instead of 32-68 calls.
+4. ~~**Dispatch-site hoist** (finding 3)~~ DONE (brick 4): `hybrid_avx` /
+   `polyphase_avx` compile each body with AVX, so the three decode kernels inline
+   (no separate symbols left); target-feature crossings 68 -> 2 per granule-channel;
+   `polyphase_avx` scalar float ops 110 -> 32 as the surround vectorizes too.
+   720/720 decode hashes identical. Clock +4.1% min / +5.9% median, 27/40, z=+2.21,
+   on a box 40-45% loaded by two neighbouring builds -- marginal, consistent with
+   the 2-5% prediction; kept on the counter.
