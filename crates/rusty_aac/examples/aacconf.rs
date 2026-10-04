@@ -114,7 +114,10 @@ fn extradata(f: &str) -> Result<Vec<u8>, String> {
         }
         if inside {
             let l = line.trim_start();
-            if l.len() > 10 && l.as_bytes()[8] == b':' && l[..8].bytes().all(|b| b.is_ascii_hexdigit()) {
+            if l.len() > 10
+                && l.as_bytes()[8] == b':'
+                && l[..8].bytes().all(|b| b.is_ascii_hexdigit())
+            {
                 for grp in l[10..].split(' ').take(8) {
                     let g = grp.trim();
                     if g.is_empty() || !g.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -153,7 +156,9 @@ fn packets(f: &str) -> Result<Vec<Vec<u8>>, String> {
     )?;
     let data = run(
         "ffmpeg",
-        &["-v", "error", "-i", f, "-map", "0:a:0", "-c", "copy", "-f", "data", "-"],
+        &[
+            "-v", "error", "-i", f, "-map", "0:a:0", "-c", "copy", "-f", "data", "-",
+        ],
     )?;
     let mut out = Vec::new();
     let mut pos = 0usize;
@@ -163,7 +168,11 @@ fn packets(f: &str) -> Result<Vec<Vec<u8>>, String> {
             Err(_) => continue,
         };
         if pos + n > data.len() {
-            return Err(format!("packet sizes overrun payload ({} > {})", pos + n, data.len()));
+            return Err(format!(
+                "packet sizes overrun payload ({} > {})",
+                pos + n,
+                data.len()
+            ));
         }
         out.push(data[pos..pos + n].to_vec());
         pos += n;
@@ -210,7 +219,12 @@ fn decode_ours(p: &Probe, asc: &[u8], pkts: &[Vec<u8>]) -> Result<Decoded, Strin
                     Some(seg) if seg.1 == a.channels as u32 && seg.2 == a.sample_rate => {
                         seg.3.extend_from_slice(&a.samples)
                     }
-                    _ => d.segments.push((start, a.channels as u32, a.sample_rate, a.samples.clone())),
+                    _ => d.segments.push((
+                        start,
+                        a.channels as u32,
+                        a.sample_rate,
+                        a.samples.clone(),
+                    )),
                 }
             }
             d.frames += n;
@@ -323,7 +337,11 @@ fn score(ours: &[i32], refr: &[i32], ch: usize) -> Option<Score> {
             n += 1;
         }
     }
-    let snr = if se == 0.0 { 999.0 } else { 10.0 * (sn / se).log10() };
+    let snr = if se == 0.0 {
+        999.0
+    } else {
+        10.0 * (sn / se).log10()
+    };
     Some(Score {
         lag,
         max,
@@ -353,7 +371,11 @@ fn chan_matrix(ours: &[i32], refr: &[i32], ch: usize, lag: i64) -> String {
                 se += (a - b) * (a - b);
                 sn += b * b;
             }
-            let snr = if se == 0.0 { 999.0 } else { 10.0 * (sn / se).log10() };
+            let snr = if se == 0.0 {
+                999.0
+            } else {
+                10.0 * (sn / se).log10()
+            };
             if snr > best.0 {
                 best = (snr, j);
             }
@@ -427,7 +449,11 @@ fn verdict(s: &Option<Score>) -> String {
 
 fn read_s16(p: &Path) -> Option<Vec<i32>> {
     let b = fs::read(p).ok()?;
-    Some(b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as i32).collect())
+    Some(
+        b.chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]) as i32)
+            .collect(),
+    )
 }
 
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -529,145 +555,199 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
     macro_rules! outln {
         ($($t:tt)*) => {{ out.push_str(&format!($($t)*)); out.push('\n'); }};
     }
-        let fs_ = f.to_string_lossy().into_owned();
-        let p = match probe(&fs_) {
-            Ok(p) => p,
-            Err(e) => {
-                outln!("{name:<36} PROBE-ERR {e}");
-                return (out, ' ');
-            }
-        };
-        let asc = extradata(&fs_).unwrap_or_default();
-        let pkts = match packets(&fs_) {
-            Ok(p) => p,
-            Err(e) => {
-                outln!("{name:<36} {:<11} DEMUX-ERR {e}", p.profile);
-                return (out, 'F');
-            }
-        };
-        let ours = decode_ours(&p, &asc, &pkts);
-        let refa = run(
-            "ffmpeg",
-            &["-v", "error", "-flags", "+bitexact", "-i", &fs_, "-map", "0:a:0", "-f", "s16le", "-"],
-        )
-        .ok()
-        .map(|b| {
-            b.chunks_exact(2)
-                .map(|c| i16::from_le_bytes([c[0], c[1]]) as i32)
-                .collect::<Vec<i32>>()
-        });
-        // FATE keeps the ISO-order output as `<stem>.s16` and FFmpeg's output order
-        // (the one we emit) as `<stem>_reorder.s16` where they differ.
-        let stem = f.with_extension("");
-        let refb = read_s16(Path::new(&format!("{}_reorder.s16", stem.to_string_lossy())))
-            .or_else(|| {
-                // `_ep0` streams: FATE's reference is the one without the suffix.
-                let s = stem.to_string_lossy();
-                let t = s.trim_end_matches("_ep0");
-                if t.len() != s.len() {
-                    read_s16(Path::new(&format!("{t}.s16")))
-                } else {
-                    None
-                }
-            })
-            .or_else(|| read_s16(&f.with_extension("s16")));
-        let (status, va, vb) = match &ours {
-            Err(e) => (format!("ERR {e}"), "-".to_string(), "-".to_string()),
-            Ok(d) if d.pcm.is_empty() => (
-                format!("ERR {}", d.first_err.clone().unwrap_or_else(|| "no output".into())),
-                "-".into(),
-                "-".into(),
-            ),
-            Ok(d) => {
-                let o: Vec<i32> = d.pcm.iter().map(|&x| to_s16(x)).collect();
-                if let Ok(dir) = std::env::var("AACCONF_DUMP") {
-                    let bytes: Vec<u8> = o.iter().flat_map(|&v| (v as i16).to_le_bytes()).collect();
-                    let _ = fs::write(Path::new(&dir).join(format!("{}.s16", name.replace('/', "_"))), bytes);
-                }
-                let ch = d.channels.max(1) as usize;
-                let sa = if d.channels == p.channels {
-                    refa.as_ref().and_then(|r| score(&o, r, ch))
-                } else {
-                    None
-                };
-                let sb = if d.channels == p.channels {
-                    refb.as_ref().and_then(|r| score(&o, r, ch))
-                } else {
-                    None
-                };
-                let mut st = format!("{}Hz/{}", d.rate, d.channels);
-                if d.errors > 0 {
-                    st.push_str(&format!(" e{}", d.errors));
-                }
-                let known = KNOWN.iter().find(|k| name.ends_with(k.stream) && k.perm.len() == ch);
-                let sa = match (known, refa.as_ref()) {
-                    (Some(k), Some(r)) if d.channels == p.channels => {
-                        let (ko, kr) = apply_known(k, &o, r, ch);
-                        score(&ko, &kr, ch)
-                    }
-                    _ => sa,
-                };
-                if std::env::var("AACCONF_DEBUG").is_ok() { eprintln!("dbg {name} known={} refa={:?} sa={}", known.is_some(), refa.as_ref().map(|r| r.len()), sa.is_some()); }
-                let mut va = verdict(&sa);
-                // Configuration changes mid-stream: score each later segment against
-                // FFmpeg forced to that segment's layout (a matching layout passes
-                // through its resampler unchanged).
-                for (start, sch, srate, spcm) in &d.segments {
-                    let ac = sch.to_string();
-                    let ar = srate.to_string();
-                    let r = run(
-                        "ffmpeg",
-                        &["-v", "error", "-flags", "+bitexact", "-i", &fs_, "-map", "0:a:0", "-ac", &ac, "-ar", &ar, "-f", "s16le", "-"],
-                    )
-                    .ok()
-                    .map(|b| b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as i32).collect::<Vec<i32>>());
-                    let so: Vec<i32> = spcm.iter().map(|&x| to_s16(x)).collect();
-                    let c = *sch as usize;
-                    let tail = r.map(|r| r.get(start * c..).map(|t| t.to_vec()).unwrap_or_default());
-                    let sc = tail.as_ref().and_then(|t| score(&so, t, c));
-                    let v = verdict(&sc);
-                    va = if v.starts_with("EXACT") && va.starts_with("EXACT") {
-                        format!("{va} +seg@{start} {c}ch EXACT")
-                    } else {
-                        format!("FAIL seg@{start} {c}ch: {v} | first: {va}")
-                    };
-                }
-                if known.is_some() && va.starts_with("EXACT") {
-                    va = va.replacen("EXACT", "KNOWN", 1);
-                }
-                if verbose && va.starts_with("FAIL") && ch > 1 {
-                    if let (Some(r), Some(sc)) = (refa.as_ref(), sa.as_ref()) {
-                        va.push_str(&chan_matrix(&o, r, ch, sc.lag));
-                    }
-                }
-                if d.channels != p.channels || d.rate != p.rate {
-                    va = format!("MISMATCH want {}Hz/{}", p.rate, p.channels);
-                }
-                (st, va, verdict(&sb))
-            }
-        };
-        let cat = if va.starts_with("EXACT") {
-            'E'
-        } else if va.starts_with("KNOWN") {
-            'K'
-        } else if va.starts_with("NEAR") {
-            'N'
+    let fs_ = f.to_string_lossy().into_owned();
+    let p = match probe(&fs_) {
+        Ok(p) => p,
+        Err(e) => {
+            outln!("{name:<36} PROBE-ERR {e}");
+            return (out, ' ');
+        }
+    };
+    let asc = extradata(&fs_).unwrap_or_default();
+    let pkts = match packets(&fs_) {
+        Ok(p) => p,
+        Err(e) => {
+            outln!("{name:<36} {:<11} DEMUX-ERR {e}", p.profile);
+            return (out, 'F');
+        }
+    };
+    let ours = decode_ours(&p, &asc, &pkts);
+    let refa = run(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-flags",
+            "+bitexact",
+            "-i",
+            &fs_,
+            "-map",
+            "0:a:0",
+            "-f",
+            "s16le",
+            "-",
+        ],
+    )
+    .ok()
+    .map(|b| {
+        b.chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]) as i32)
+            .collect::<Vec<i32>>()
+    });
+    // FATE keeps the ISO-order output as `<stem>.s16` and FFmpeg's output order
+    // (the one we emit) as `<stem>_reorder.s16` where they differ.
+    let stem = f.with_extension("");
+    let refb = read_s16(Path::new(&format!(
+        "{}_reorder.s16",
+        stem.to_string_lossy()
+    )))
+    .or_else(|| {
+        // `_ep0` streams: FATE's reference is the one without the suffix.
+        let s = stem.to_string_lossy();
+        let t = s.trim_end_matches("_ep0");
+        if t.len() != s.len() {
+            read_s16(Path::new(&format!("{t}.s16")))
         } else {
-            'F'
-        };
-        outln!(
-            "{name:<36} {:<11} {:>12} | {status:<14} | {va:<58} | {vb}",
-            p.profile,
-            format!("{}/{}", p.rate, p.channels)
-        );
-        if verbose {
-            if let Ok(d) = &ours {
-                if let Some(e) = &d.first_err {
-                    outln!("    first error: {e}  (asc {:02x?}, {} packets)", asc, pkts.len());
+            None
+        }
+    })
+    .or_else(|| read_s16(&f.with_extension("s16")));
+    let (status, va, vb) = match &ours {
+        Err(e) => (format!("ERR {e}"), "-".to_string(), "-".to_string()),
+        Ok(d) if d.pcm.is_empty() => (
+            format!(
+                "ERR {}",
+                d.first_err.clone().unwrap_or_else(|| "no output".into())
+            ),
+            "-".into(),
+            "-".into(),
+        ),
+        Ok(d) => {
+            let o: Vec<i32> = d.pcm.iter().map(|&x| to_s16(x)).collect();
+            if let Ok(dir) = std::env::var("AACCONF_DUMP") {
+                let bytes: Vec<u8> = o.iter().flat_map(|&v| (v as i16).to_le_bytes()).collect();
+                let _ = fs::write(
+                    Path::new(&dir).join(format!("{}.s16", name.replace('/', "_"))),
+                    bytes,
+                );
+            }
+            let ch = d.channels.max(1) as usize;
+            let sa = if d.channels == p.channels {
+                refa.as_ref().and_then(|r| score(&o, r, ch))
+            } else {
+                None
+            };
+            let sb = if d.channels == p.channels {
+                refb.as_ref().and_then(|r| score(&o, r, ch))
+            } else {
+                None
+            };
+            let mut st = format!("{}Hz/{}", d.rate, d.channels);
+            if d.errors > 0 {
+                st.push_str(&format!(" e{}", d.errors));
+            }
+            let known = KNOWN
+                .iter()
+                .find(|k| name.ends_with(k.stream) && k.perm.len() == ch);
+            let sa = match (known, refa.as_ref()) {
+                (Some(k), Some(r)) if d.channels == p.channels => {
+                    let (ko, kr) = apply_known(k, &o, r, ch);
+                    score(&ko, &kr, ch)
                 }
+                _ => sa,
+            };
+            if std::env::var("AACCONF_DEBUG").is_ok() {
+                eprintln!(
+                    "dbg {name} known={} refa={:?} sa={}",
+                    known.is_some(),
+                    refa.as_ref().map(|r| r.len()),
+                    sa.is_some()
+                );
+            }
+            let mut va = verdict(&sa);
+            // Configuration changes mid-stream: score each later segment against
+            // FFmpeg forced to that segment's layout (a matching layout passes
+            // through its resampler unchanged).
+            for (start, sch, srate, spcm) in &d.segments {
+                let ac = sch.to_string();
+                let ar = srate.to_string();
+                let r = run(
+                    "ffmpeg",
+                    &[
+                        "-v",
+                        "error",
+                        "-flags",
+                        "+bitexact",
+                        "-i",
+                        &fs_,
+                        "-map",
+                        "0:a:0",
+                        "-ac",
+                        &ac,
+                        "-ar",
+                        &ar,
+                        "-f",
+                        "s16le",
+                        "-",
+                    ],
+                )
+                .ok()
+                .map(|b| {
+                    b.chunks_exact(2)
+                        .map(|c| i16::from_le_bytes([c[0], c[1]]) as i32)
+                        .collect::<Vec<i32>>()
+                });
+                let so: Vec<i32> = spcm.iter().map(|&x| to_s16(x)).collect();
+                let c = *sch as usize;
+                let tail = r.map(|r| r.get(start * c..).map(|t| t.to_vec()).unwrap_or_default());
+                let sc = tail.as_ref().and_then(|t| score(&so, t, c));
+                let v = verdict(&sc);
+                va = if v.starts_with("EXACT") && va.starts_with("EXACT") {
+                    format!("{va} +seg@{start} {c}ch EXACT")
+                } else {
+                    format!("FAIL seg@{start} {c}ch: {v} | first: {va}")
+                };
+            }
+            if known.is_some() && va.starts_with("EXACT") {
+                va = va.replacen("EXACT", "KNOWN", 1);
+            }
+            if verbose && va.starts_with("FAIL") && ch > 1 {
+                if let (Some(r), Some(sc)) = (refa.as_ref(), sa.as_ref()) {
+                    va.push_str(&chan_matrix(&o, r, ch, sc.lag));
+                }
+            }
+            if d.channels != p.channels || d.rate != p.rate {
+                va = format!("MISMATCH want {}Hz/{}", p.rate, p.channels);
+            }
+            (st, va, verdict(&sb))
+        }
+    };
+    let cat = if va.starts_with("EXACT") {
+        'E'
+    } else if va.starts_with("KNOWN") {
+        'K'
+    } else if va.starts_with("NEAR") {
+        'N'
+    } else {
+        'F'
+    };
+    outln!(
+        "{name:<36} {:<11} {:>12} | {status:<14} | {va:<58} | {vb}",
+        p.profile,
+        format!("{}/{}", p.rate, p.channels)
+    );
+    if verbose {
+        if let Ok(d) = &ours {
+            if let Some(e) = &d.first_err {
+                outln!(
+                    "    first error: {e}  (asc {:02x?}, {} packets)",
+                    asc,
+                    pkts.len()
+                );
             }
         }
-        (out, cat)
+    }
+    (out, cat)
 }
 
 fn main() {
@@ -697,14 +777,26 @@ fn main() {
     let names: Vec<(PathBuf, String)> = files
         .into_iter()
         .map(|f| {
-            let name = f.strip_prefix(dir).unwrap_or(&f).to_string_lossy().replace('\\', "/");
+            let name = f
+                .strip_prefix(dir)
+                .unwrap_or(&f)
+                .to_string_lossy()
+                .replace('\\', "/");
             (f, name)
         })
-        .filter(|(_, n)| filter.as_ref().map(|fl| n.contains(fl.as_str())).unwrap_or(true))
+        .filter(|(_, n)| {
+            filter
+                .as_ref()
+                .map(|fl| n.contains(fl.as_str()))
+                .unwrap_or(true)
+        })
         .collect();
     let results = std::sync::Mutex::new(vec![None; names.len()]);
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8);
     std::thread::scope(|sc| {
         for _ in 0..workers {
             sc.spawn(|| loop {

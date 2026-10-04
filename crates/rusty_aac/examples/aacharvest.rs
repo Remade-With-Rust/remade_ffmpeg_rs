@@ -77,7 +77,9 @@ fn arm_config(arm: &str, bitrate: u32) -> AacEncoderConfig {
 /// Stable, name-keyed train/holdout split (great-gate §4 rule 4: the branch fit
 /// and every leaf fit must share ONE split, and it must not move between rungs).
 fn split_of(name: &str) -> &'static str {
-    let h = name.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+    let h = name
+        .bytes()
+        .fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
     if h % 2 == 0 {
         "train"
     } else {
@@ -91,7 +93,8 @@ fn measure_quality(sig: &corpus::Signal, cfg: AacEncoderConfig) -> (u64, Vec<f32
     let adts = ladder::encode_adts_with(sig, cfg);
     let (evals, _bands) = work::take();
     let decoded = ladder::decode_mono(&adts);
-    let per_frame = rusty_aac::lab::quality::per_frame_audible(&sig.mono(), &decoded, sig.sample_rate);
+    let per_frame =
+        rusty_aac::lab::quality::per_frame_audible(&sig.mono(), &decoded, sig.sample_rate);
     (evals, per_frame)
 }
 
@@ -112,7 +115,11 @@ fn main() {
     let bitrates: Vec<u32> = args
         .windows(2)
         .find(|w| w[0] == "--bitrates")
-        .map(|w| w[1].split(',').filter_map(|s| s.trim().parse().ok()).collect())
+        .map(|w| {
+            w[1].split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect()
+        })
         .unwrap_or_else(|| vec![64_000, 96_000, 128_000]);
 
     // ---- method line, to stderr so it never contaminates the CSV -------------
@@ -151,7 +158,11 @@ fn main() {
     let (w2, _) = measure_quality(&probe, cfg0);
     eprintln!(
         "#   WORK NULL      : {w1} vs {w2} -> {}",
-        if w1 == w2 { "DETERMINISTIC" } else { "NON-DETERMINISTIC (counter void)" }
+        if w1 == w2 {
+            "DETERMINISTIC"
+        } else {
+            "NON-DETERMINISTIC (counter void)"
+        }
     );
     eprintln!("#");
 

@@ -35,7 +35,13 @@ pub fn apply_ms(ics: &Ics, ms_mask: &[bool], c0: &mut ChannelData, c1: &mut Chan
 
 /// Intensity stereo (§4.6.8.2.3): `R = ±2^(-pos/4)·L` on the right channel's
 /// intensity bands; the sign flips for INTENSITY_HCB2 and again under M/S.
-pub fn apply_is(ics1: &Ics, ms_present: bool, ms_mask: &[bool], c0: &ChannelData, c1: &mut ChannelData) {
+pub fn apply_is(
+    ics1: &Ics,
+    ms_present: bool,
+    ms_mask: &[bool],
+    c0: &ChannelData,
+    c1: &mut ChannelData,
+) {
     let _prof = crate::prof::scope(crate::prof::Stage::DecTools);
     let info = &ics1.info;
     let max_sfb = info.max_sfb as usize;
@@ -165,8 +171,16 @@ fn predict(ps: &mut PredState, coef: &mut f32, output_enable: bool) {
     let a = 0.953125f32;
     let alpha = 0.90625f32;
     let (r0, r1, cor0, cor1, var0, var1) = (ps.r0, ps.r1, ps.cor0, ps.cor1, ps.var0, ps.var1);
-    let k1 = if var0 > 1.0 { cor0 * flt16_even(a / var0) } else { 0.0 };
-    let k2 = if var1 > 1.0 { cor1 * flt16_even(a / var1) } else { 0.0 };
+    let k1 = if var0 > 1.0 {
+        cor0 * flt16_even(a / var0)
+    } else {
+        0.0
+    };
+    let k2 = if var1 > 1.0 {
+        cor1 * flt16_even(a / var1)
+    } else {
+        0.0
+    };
     let pv = flt16_round(k1 * r0 + k2 * r1);
     if output_enable {
         *coef += pv;
@@ -182,7 +196,13 @@ fn predict(ps: &mut PredState, coef: &mut f32, output_enable: bool) {
 }
 
 /// AAC-Main frequency-domain prediction for one channel.
-pub fn apply_prediction(ics: &Ics, sf_index: u8, coeffs: &mut [f32], ps: &mut [PredState], initialized: &mut bool) {
+pub fn apply_prediction(
+    ics: &Ics,
+    sf_index: u8,
+    coeffs: &mut [f32],
+    ps: &mut [PredState],
+    initialized: &mut bool,
+) {
     let _prof = crate::prof::scope(crate::prof::Stage::DecTools);
     if !*initialized {
         ps.iter_mut().for_each(|p| *p = PredState::default());
@@ -226,7 +246,12 @@ pub const BETWEEN_TNS_AND_IMDCT: u8 = 1;
 pub const AFTER_IMDCT: u8 = 3;
 
 /// Dependent coupling: add the CCE's scaled spectrum into a target channel.
-pub fn apply_dependent_coupling(cce_ics: &Ics, cce: &ChannelData, gains: &[f32], target: &mut [f32]) {
+pub fn apply_dependent_coupling(
+    cce_ics: &Ics,
+    cce: &ChannelData,
+    gains: &[f32],
+    target: &mut [f32],
+) {
     let info = &cce_ics.info;
     let max_sfb = info.max_sfb as usize;
     let mut wbase = 0usize;

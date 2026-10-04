@@ -301,7 +301,10 @@ impl StreamConfig {
 
     /// Is this an error-resilient (ER) object type, i.e. `er_raw_data_block`?
     pub fn is_er(&self) -> bool {
-        matches!(self.object_type, 17 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 39)
+        matches!(
+            self.object_type,
+            17 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 39
+        )
     }
 
     /// Channels described by the configuration (0 if unknown).
@@ -328,7 +331,11 @@ pub fn channels_for_config(cc: u8) -> usize {
 
 fn read_aot(r: &mut BitReader) -> Result<u8> {
     let ot = r.read_bits(5)? as u8;
-    Ok(if ot == 31 { 32 + r.read_bits(6)? as u8 } else { ot })
+    Ok(if ot == 31 {
+        32 + r.read_bits(6)? as u8
+    } else {
+        ot
+    })
 }
 
 fn read_rate(r: &mut BitReader) -> Result<(u8, u32)> {
@@ -342,7 +349,9 @@ fn read_rate(r: &mut BitReader) -> Result<(u8, u32)> {
     } else if (idx as usize) < SAMPLE_RATES.len() {
         Ok((idx, SAMPLE_RATES[idx as usize]))
     } else {
-        Err(Error::invalid("aac config: reserved sampling frequency index"))
+        Err(Error::invalid(
+            "aac config: reserved sampling frequency index",
+        ))
     }
 }
 
@@ -416,7 +425,10 @@ pub fn parse_from_opts(
         }
     }
 
-    if matches!(object_type, 17 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 39) {
+    if matches!(
+        object_type,
+        17 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 39
+    ) {
         c.ep_config = r.read_bits(2)? as u8;
         if c.ep_config >= 2 {
             return Err(Error::unsupported(
@@ -462,7 +474,11 @@ pub fn parse_from_opts(
     if let Some(e) = &c.eld {
         if e.ld_sbr {
             c.sbr = true;
-            c.ext_sample_rate = if e.ld_sbr_dual_rate { c.sample_rate * 2 } else { c.sample_rate };
+            c.ext_sample_rate = if e.ld_sbr_dual_rate {
+                c.sample_rate * 2
+            } else {
+                c.sample_rate
+            };
         }
     }
     Ok(c)
@@ -543,7 +559,10 @@ mod tests {
     #[test]
     fn plain_lc_stereo_44100() {
         let c = parse(&[0x12, 0x10]).unwrap();
-        assert_eq!((c.object_type, c.sample_rate, c.channel_config), (2, 44100, 2));
+        assert_eq!(
+            (c.object_type, c.sample_rate, c.channel_config),
+            (2, 44100, 2)
+        );
         assert_eq!(c.frame_length, 1024);
         assert!(!c.sbr && !c.ps);
     }
@@ -575,7 +594,10 @@ mod tests {
     /// A PCE inside the config (channelConfiguration 0) — FATE `al07_96`.
     #[test]
     fn pce_in_config_al07() {
-        let c = parse(&[0x10, 0x00, 0x04, 0x08, 0x05, 0x02, 0x01, 0x08, 0x80, 0x00, 0x00]).unwrap();
+        let c = parse(&[
+            0x10, 0x00, 0x04, 0x08, 0x05, 0x02, 0x01, 0x08, 0x80, 0x00, 0x00,
+        ])
+        .unwrap();
         assert_eq!(c.channel_config, 0);
         let p = c.pce.as_ref().unwrap();
         assert_eq!(c.channels(), 6, "{p:?}");

@@ -25,6 +25,7 @@
 pub(crate) mod dec;
 pub(crate) mod ps;
 mod qmf;
+#[rustfmt::skip] // generated data
 mod tables;
 
 use crate::Result;
@@ -160,7 +161,10 @@ mod tests {
         let s = parse_sbr_config(&bytes).unwrap();
         assert!(s.sbr_present, "AOT 5 must signal SBR");
         assert!(!s.ps_present);
-        assert_eq!(s.output_sample_rate, 44100, "extension rate is the OUTPUT rate");
+        assert_eq!(
+            s.output_sample_rate, 44100,
+            "extension rate is the OUTPUT rate"
+        );
         assert_eq!(s.core_sample_rate, 22050, "core runs at half");
         assert_eq!(s.core_object_type, AOT_AAC_LC);
         assert_eq!(s.support(), SbrSupport::Full);

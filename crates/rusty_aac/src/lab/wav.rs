@@ -55,7 +55,10 @@ pub fn read(path: impl AsRef<Path>) -> io::Result<Wav> {
     let mut d = Vec::new();
     std::fs::File::open(path.as_ref())?.read_to_end(&mut d)?;
     if d.len() < 44 || &d[0..4] != b"RIFF" || &d[8..12] != b"WAVE" {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a RIFF/WAVE file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a RIFF/WAVE file",
+        ));
     }
     let (mut tag, mut channels, mut sample_rate, mut bits) = (1u16, 1u16, 44100u32, 16u16);
     let mut data: &[u8] = &[];

@@ -44,7 +44,11 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| ladder::DEFAULT_BITRATES.to_vec());
 
     println!("rusty_aac quality ladder — allocator: rusty_alloc (project default)");
-    println!("corpus: {} classes, {} operating points\n", corpus::Class::all().len(), bitrates.len());
+    println!(
+        "corpus: {} classes, {} operating points\n",
+        corpus::Class::all().len(),
+        bitrates.len()
+    );
 
     // ---- the null arm, before anything is believed -------------------------
     print!("null arm (encode twice, require byte-identical) ... ");
@@ -62,7 +66,10 @@ fn main() -> ExitCode {
     }
 
     // ---- the ladder ---------------------------------------------------------
-    println!("\n{:<20} {:>7} {:>10} {:>9} {:>9} {:>8}", "clip", "target", "measured", "audible%", "meanNMR", "frames");
+    println!(
+        "\n{:<20} {:>7} {:>10} {:>9} {:>9} {:>8}",
+        "clip", "target", "measured", "audible%", "meanNMR", "frames"
+    );
     println!("{}", "-".repeat(68));
 
     let mut worst_rate_err = 0f64;
@@ -156,9 +163,15 @@ fn main() -> ExitCode {
             }
         }
         let n = cells.max(1) as f64;
-        println!("\nmean Δaudible%:  kbd {:+.3}   auto {:+.3}", sum_kbd / n, sum_auto / n);
-        println!("kbd per-cell sign: {kbd_wins} better, {kbd_losses} worse, {} tied",
-                 cells - kbd_wins - kbd_losses);
+        println!(
+            "\nmean Δaudible%:  kbd {:+.3}   auto {:+.3}",
+            sum_kbd / n,
+            sum_auto / n
+        );
+        println!(
+            "kbd per-cell sign: {kbd_wins} better, {kbd_losses} worse, {} tied",
+            cells - kbd_wins - kbd_losses
+        );
         println!(
             "\nREAD THIS AS A SIGN TABLE, NOT A MEAN. A tool that wins on some content and\n\
              loses on other is a DISPATCH signal, not a mean-loss to discard. Banking any\n\
@@ -170,9 +183,7 @@ fn main() -> ExitCode {
     // ---- Rungs 1-3: per-class sign table ------------------------------------
     if args.iter().any(|a| a == "--rungs") {
         println!("\nRungs 1-3 — per-class Δaudible% vs the shipped encoder (NEGATIVE = better).");
-        println!(
-            "Exit criterion is WORST CLASS <= 0, verified per class, never on average.\n"
-        );
+        println!("Exit criterion is WORST CLASS <= 0, verified per class, never on average.\n");
         let arms: [(&str, fn(u32) -> AacEncoderConfig); 5] = [
             ("A6 PNS", |b| AacEncoderConfig {
                 bitrate_bps: b,
@@ -247,7 +258,11 @@ fn main() -> ExitCode {
                 name,
                 sums[i] / n,
                 worst[i],
-                if worst[i] <= 0.0 { "PASSES worst-class" } else { "FAILS worst-class" }
+                if worst[i] <= 0.0 {
+                    "PASSES worst-class"
+                } else {
+                    "FAILS worst-class"
+                }
             );
         }
         println!(

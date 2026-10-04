@@ -146,7 +146,9 @@ mod tests {
     /// alignment, including reads that touch the last byte.
     #[test]
     fn fast_read_matches_bit_loop() {
-        let data: Vec<u8> = (0..37u32).map(|i| (i.wrapping_mul(97) ^ 0x5A) as u8).collect();
+        let data: Vec<u8> = (0..37u32)
+            .map(|i| (i.wrapping_mul(97) ^ 0x5A) as u8)
+            .collect();
         let mut seed = 12345u32;
         let mut a = BitReader::new(&data);
         let mut b = BitReader::new(&data);

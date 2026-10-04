@@ -5,7 +5,9 @@
 //! sample-identical across decoders rather than merely energy-equal.
 
 use crate::bits::BitReader;
-use crate::codebook::{decode_tuple, CODEBOOKS, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, ZERO_HCB};
+use crate::codebook::{
+    decode_tuple, CODEBOOKS, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, ZERO_HCB,
+};
 use crate::config::aot;
 use crate::ics::{IcsInfo, WindowSequence};
 use crate::swb::swb_offsets;
@@ -37,7 +39,10 @@ impl Syntax {
         self.aot == aot::ER_AAC_ELD
     }
     pub fn er(&self) -> bool {
-        matches!(self.aot, aot::ER_AAC_LC | aot::ER_AAC_LTP | aot::ER_AAC_LD | aot::ER_AAC_ELD)
+        matches!(
+            self.aot,
+            aot::ER_AAC_LC | aot::ER_AAC_LTP | aot::ER_AAC_LD | aot::ER_AAC_ELD
+        )
     }
     pub fn low_delay(&self) -> bool {
         matches!(self.aot, aot::ER_AAC_LD | aot::ER_AAC_ELD)
@@ -50,7 +55,9 @@ impl Syntax {
             (false, 960) => SWB_OFFSET_960[i],
             (false, _) => Some(swb_offsets(true, self.sf_index)),
         };
-        t.ok_or_else(|| Error::unsupported("aac: no scalefactor-band table for this low-delay rate"))
+        t.ok_or_else(|| {
+            Error::unsupported("aac: no scalefactor-band table for this low-delay rate")
+        })
     }
     fn short_swb(&self) -> &'static [u16] {
         if self.frame_len == 960 {
@@ -144,7 +151,9 @@ pub fn parse_ics_info(r: &mut BitReader, sx: &Syntax, ics: &mut Ics) -> Result<(
         ics.info.window_sequence = seq_from_bits(r.read_bits(2)?);
         if sx.aot == aot::ER_AAC_LD && ics.info.window_sequence != WindowSequence::OnlyLong {
             ics.info.window_sequence = WindowSequence::OnlyLong;
-            return Err(Error::invalid("aac: AAC-LD is only defined for ONLY_LONG_SEQUENCE"));
+            return Err(Error::invalid(
+                "aac: AAC-LD is only defined for ONLY_LONG_SEQUENCE",
+            ));
         }
         ics.prev_kbd = ics.info.window_shape_kbd;
         ics.info.window_shape_kbd = r.read_bool()?;
@@ -210,7 +219,9 @@ pub fn parse_ics_info(r: &mut BitReader, sx: &Syntax, ics: &mut Ics) -> Result<(
     ics.info.num_swb = ics.swb.len() - 1;
     if ics.info.max_sfb as usize > ics.info.num_swb {
         ics.info.max_sfb = 0;
-        return Err(Error::invalid("aac: max_sfb exceeds the number of scalefactor bands"));
+        return Err(Error::invalid(
+            "aac: max_sfb exceeds the number of scalefactor bands",
+        ));
     }
     Ok(())
 }
@@ -222,13 +233,45 @@ pub fn parse_ics_info(r: &mut BitReader, sx: &Syntax, ics: &mut Ics) -> Result<(
 /// correctly-rounded sines): matching them keeps the recursive TNS filter
 /// sample-exact.
 const TNS_PARCOR: [&[f32]; 4] = [
-    &[0.0, 0.43388373, 0.78183150, 0.97492790, -0.98480773, -0.86602539, -0.64278758, -0.34202015],
     &[
-        0.0, 0.20791170, 0.40673664, 0.58778524, 0.74314481, 0.86602539, 0.95105654, 0.99452192, -0.99573416,
-        -0.96182561, -0.89516330, -0.79801720, -0.67369562, -0.52643216, -0.36124167, -0.18374951,
+        0.0,
+        0.43388373,
+        0.78183150,
+        0.97492790,
+        -0.98480773,
+        -0.86602539,
+        -0.64278758,
+        -0.34202015,
+    ],
+    &[
+        0.0,
+        0.20791170,
+        0.40673664,
+        0.58778524,
+        0.74314481,
+        0.86602539,
+        0.95105654,
+        0.99452192,
+        -0.99573416,
+        -0.96182561,
+        -0.89516330,
+        -0.79801720,
+        -0.67369562,
+        -0.52643216,
+        -0.36124167,
+        -0.18374951,
     ],
     &[0.0, 0.43388373, -0.64278758, -0.34202015],
-    &[0.0, 0.20791170, 0.40673664, 0.58778524, -0.67369562, -0.52643216, -0.36124167, -0.18374951],
+    &[
+        0.0,
+        0.20791170,
+        0.40673664,
+        0.58778524,
+        -0.67369562,
+        -0.52643216,
+        -0.36124167,
+        -0.18374951,
+    ],
 ];
 
 /// One TNS filter: band span, order, direction, LPC (lpc[0] = 1).
@@ -445,7 +488,9 @@ pub fn decode_ics(
     cd.tns = Tns::default();
     if !sx.eld() && r.read_bool()? {
         if short {
-            return Err(Error::invalid("aac: pulse tool not allowed in eight short sequence"));
+            return Err(Error::invalid(
+                "aac: pulse tool not allowed in eight short sequence",
+            ));
         }
         let n = r.read_bits(2)? as usize + 1;
         let start = r.read_bits(6)? as usize;
@@ -569,7 +614,10 @@ pub fn decode_ics(
             let gain = crate::dsp::sf_gain(cd.sfo[idx]);
             for w in 0..glen {
                 let base = (wbase + w) * 128;
-                let (out, q) = (&mut cd.coeffs[base + s..base + e], &quant[base + s..base + e]);
+                let (out, q) = (
+                    &mut cd.coeffs[base + s..base + e],
+                    &quant[base + s..base + e],
+                );
                 for (c, &q) in out.iter_mut().zip(q) {
                     *c = crate::dsp::dequant_with(pow43, q) * gain;
                 }

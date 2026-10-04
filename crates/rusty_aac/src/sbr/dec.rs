@@ -60,7 +60,9 @@ impl SbrBook {
             if l as u32 <= SBR_LUT_BITS {
                 let span = 1usize << (SBR_LUT_BITS - l as u32);
                 let base = (c as usize) << (SBR_LUT_BITS - l as u32);
-                lut[base..base + span].iter_mut().for_each(|e| *e = i as u16 + 1);
+                lut[base..base + span]
+                    .iter_mut()
+                    .for_each(|e| *e = i as u16 + 1);
             }
         }
         SbrBook { entries, lut }
@@ -403,7 +405,11 @@ impl SbrChannelState {
                 vk0c[k] = vk0c[k - 1] + vk0[k - 1];
             }
             if two_regions {
-                let invwarp = if sp.alter_scale != 0 { 0.769_230_77f32 } else { 1.0 };
+                let invwarp = if sp.alter_scale != 0 {
+                    0.769_230_77f32
+                } else {
+                    1.0
+                };
                 let num_bands_1 = lrintf(half_bands * invwarp * (k2 as f32 / k1 as f32).log2()) * 2;
                 if num_bands_1 <= 0 {
                     return false;
@@ -505,7 +511,8 @@ impl SbrChannelState {
 
     fn make_f_tablelim(&mut self) {
         if self.bs_limiter_bands > 0 {
-            let warped = [1.327_151_8f32, 1.185_092_8, 1.119_871_6][self.bs_limiter_bands as usize - 1];
+            let warped =
+                [1.327_151_8f32, 1.185_092_8, 1.119_871_6][self.bs_limiter_bands as usize - 1];
             let np = self.num_patches;
             let mut borders = [0usize; 7];
             borders[0] = self.kx[1];
@@ -566,7 +573,10 @@ impl SbrChannelState {
         for k in 1..=self.n[0] {
             self.f_tablelow[k] = self.f_tablehigh[2 * k - odd];
         }
-        let nq = lrintf(self.spectrum.noise_bands as f32 * (self.k[2] as f32 / self.kx[1] as f32).log2()).max(1);
+        let nq = lrintf(
+            self.spectrum.noise_bands as f32 * (self.k[2] as f32 / self.kx[1] as f32).log2(),
+        )
+        .max(1);
         if nq > 5 {
             self.n_q = 1;
             return false;
@@ -858,7 +868,11 @@ impl SbrChannelState {
         let delta = if coupled { 2 } else { 1 };
         let n_q = self.n_q;
         let d = &mut self.data[ch];
-        let (t_huff, f_huff) = if coupled { (&b.noise_bal_t, &b.bal_3_0_f) } else { (&b.noise_t, &b.env_3_0_f) };
+        let (t_huff, f_huff) = if coupled {
+            (&b.noise_bal_t, &b.bal_3_0_f)
+        } else {
+            (&b.noise_t, &b.env_3_0_f)
+        };
         for i in 0..d.bs_num_noise {
             if d.bs_df_noise[i] {
                 for j in 0..n_q {
@@ -896,7 +910,13 @@ impl SbrChannelState {
     }
 
     /// `sbr_data()`; Ok(false) = invalid data (SBR turns off).
-    fn read_data(&mut self, r: &mut BitReader, id_aac: u8, nts: usize, ps_allowed: bool) -> Result<bool> {
+    fn read_data(
+        &mut self,
+        r: &mut BitReader,
+        id_aac: u8,
+        nts: usize,
+        ps_allowed: bool,
+    ) -> Result<bool> {
         self.id_aac = id_aac;
         self.ready_for_dequant = true;
         if id_aac == TYPE_SCE || id_aac == TYPE_CCE {
@@ -963,7 +983,9 @@ impl SbrChannelState {
                 bits_left -= 2;
                 let id = r.read_bits(2)?;
                 if id == 2 && ps_allowed {
-                    let ps = self.ps.get_or_insert_with(|| Box::new(super::ps::PsState::new()));
+                    let ps = self
+                        .ps
+                        .get_or_insert_with(|| Box::new(super::ps::PsState::new()));
                     bits_left -= ps.read_data(r, bits_left as usize, 2 * nts)? as i64;
                 } else {
                     r.skip(bits_left as usize)?;
@@ -980,7 +1002,16 @@ impl SbrChannelState {
     /// `sbr_extension_data()` from a fill element payload (after its 4-bit
     /// extension type): `bits` payload bits, `crc` = EXT_SBR_DATA_CRC.
     #[allow(clippy::too_many_arguments)]
-    fn decode_extension(&mut self, payload: &[u8], bits: usize, crc: bool, id_aac: u8, nts: usize, ps_allowed: bool, rate: u32) {
+    fn decode_extension(
+        &mut self,
+        payload: &[u8],
+        bits: usize,
+        crc: bool,
+        id_aac: u8,
+        nts: usize,
+        ps_allowed: bool,
+        rate: u32,
+    ) {
         if self.sample_rate == 0 {
             self.sample_rate = rate;
         }
@@ -1023,7 +1054,11 @@ fn exp2i(x: i32) -> f32 {
 /// 2^(q/2) for the 1.5 dB resolution: the odd half-step is √2, applied in double.
 #[inline]
 fn exp2_half(q: i32, base: i32) -> f32 {
-    let odd = if q & 1 == 1 { std::f64::consts::SQRT_2 } else { 1.0 };
+    let odd = if q & 1 == 1 {
+        std::f64::consts::SQRT_2
+    } else {
+        1.0
+    };
     (exp2i((q >> 1) + base) as f64 * odd) as f32
 }
 
@@ -1066,7 +1101,11 @@ impl SbrChannelState {
                 for e in 1..=d.bs_num_env {
                     for k in 0..n[d.bs_freq_res[e] as usize] {
                         let q = d.env_facs_q[e][k];
-                        let v = if d.bs_amp_res { exp2i(q + 6) } else { exp2_half(q, 6) };
+                        let v = if d.bs_amp_res {
+                            exp2i(q + 6)
+                        } else {
+                            exp2_half(q, 6)
+                        };
                         d.env_facs[e][k] = if v > 1e20 { 1.0 } else { v };
                     }
                 }
@@ -1114,7 +1153,12 @@ impl Work {
 }
 
 /// Covariance-method LPC of order 2 per low band (§4.6.18.6.2).
-fn hf_inverse_filter(x_low: &[[Cpx; 40]], k0: usize, alpha0: &mut [Cpx; 64], alpha1: &mut [Cpx; 64]) {
+fn hf_inverse_filter(
+    x_low: &[[Cpx; 40]],
+    k0: usize,
+    alpha0: &mut [Cpx; 64],
+    alpha1: &mut [Cpx; 64],
+) {
     for k in 0..k0 {
         let x = &x_low[k];
         let (mut r0, mut r1, mut i1, mut r2, mut i2) = (0f32, 0f32, 0f32, 0f32, 0f32);
@@ -1126,11 +1170,20 @@ fn hf_inverse_filter(x_low: &[[Cpx; 40]], k0: usize, alpha0: &mut [Cpx; 64], alp
             i2 += x[i][0] * x[i + 2][1] - x[i][1] * x[i + 2][0];
         }
         // phi(i, j) over the window, in the standard's notation.
-        let phi01 = [r2 + x[0][0] * x[2][0] + x[0][1] * x[2][1], i2 + x[0][0] * x[2][1] - x[0][1] * x[2][0]];
+        let phi01 = [
+            r2 + x[0][0] * x[2][0] + x[0][1] * x[2][1],
+            i2 + x[0][0] * x[2][1] - x[0][1] * x[2][0],
+        ];
         let phi22 = r0 + x[0][0] * x[0][0] + x[0][1] * x[0][1];
         let phi11 = r0 + x[38][0] * x[38][0] + x[38][1] * x[38][1];
-        let phi12 = [r1 + x[0][0] * x[1][0] + x[0][1] * x[1][1], i1 + x[0][0] * x[1][1] - x[0][1] * x[1][0]];
-        let phi00 = [r1 + x[38][0] * x[39][0] + x[38][1] * x[39][1], i1 + x[38][0] * x[39][1] - x[38][1] * x[39][0]];
+        let phi12 = [
+            r1 + x[0][0] * x[1][0] + x[0][1] * x[1][1],
+            i1 + x[0][0] * x[1][1] - x[0][1] * x[1][0],
+        ];
+        let phi00 = [
+            r1 + x[38][0] * x[39][0] + x[38][1] * x[39][1],
+            i1 + x[38][0] * x[39][1] - x[38][1] * x[39][0],
+        ];
 
         let dk = phi22 * phi11 - (phi12[0] * phi12[0] + phi12[1] * phi12[1]) / 1.000_001;
         let a1 = if dk == 0.0 {
@@ -1237,8 +1290,14 @@ impl SbrChannelState {
                 let xh = &mut wk.x_high[k];
                 for i in start + ENV_ADJ..end + ENV_ADJ {
                     xh[i] = [
-                        xl[i - 2][0] * al[0] - xl[i - 2][1] * al[1] + xl[i - 1][0] * al[2] - xl[i - 1][1] * al[3] + xl[i][0],
-                        xl[i - 2][1] * al[0] + xl[i - 2][0] * al[1] + xl[i - 1][1] * al[2] + xl[i - 1][0] * al[3] + xl[i][1],
+                        xl[i - 2][0] * al[0] - xl[i - 2][1] * al[1] + xl[i - 1][0] * al[2]
+                            - xl[i - 1][1] * al[3]
+                            + xl[i][0],
+                        xl[i - 2][1] * al[0]
+                            + xl[i - 2][0] * al[1]
+                            + xl[i - 1][1] * al[2]
+                            + xl[i - 1][0] * al[3]
+                            + xl[i][1],
                     ];
                 }
                 k += 1;
@@ -1261,7 +1320,11 @@ impl SbrChannelState {
         for e in 0..d.bs_num_env {
             let res = d.bs_freq_res[e + 1] as usize;
             let ilim = self.n[res];
-            let table: &[usize] = if res == 1 { &self.f_tablehigh } else { &self.f_tablelow };
+            let table: &[usize] = if res == 1 {
+                &self.f_tablehigh
+            } else {
+                &self.f_tablelow
+            };
             if kx != table[0] {
                 return false;
             }
@@ -1279,8 +1342,8 @@ impl SbrChannelState {
             if d.bs_add_harmonic_flag {
                 for i in 0..self.n[1] {
                     let mid = (self.f_tablehigh[i] + self.f_tablehigh[i + 1]) >> 1;
-                    d.s_indexmapped[e + 1][mid - kx] =
-                        d.bs_add_harmonic[i] && (e as i32 >= e_a[1] || d.s_indexmapped[0][mid - kx]);
+                    d.s_indexmapped[e + 1][mid - kx] = d.bs_add_harmonic[i]
+                        && (e as i32 >= e_a[1] || d.s_indexmapped[0][mid - kx]);
                 }
             }
             for i in 0..ilim {
@@ -1308,7 +1371,11 @@ impl SbrChannelState {
             } else {
                 let env_size = 2 * (d.t_env[e + 1] - d.t_env[e]);
                 let res = d.bs_freq_res[e + 1] as usize;
-                let table: &[usize] = if res == 1 { &self.f_tablehigh } else { &self.f_tablelow };
+                let table: &[usize] = if res == 1 {
+                    &self.f_tablehigh
+                } else {
+                    &self.f_tablelow
+                };
                 for p in 0..self.n[res] {
                     let den = (env_size * (table[p + 1] - table[p])) as f32;
                     let mut sum = 0f32;
@@ -1351,8 +1418,9 @@ impl SbrChannelState {
                     s0 += wk.e_origmapped[e][m];
                     s1 += wk.e_curr[e][m];
                 }
-                let gain_max =
-                    (LIMGAIN[self.bs_limiter_gains] * ((f32::EPSILON + s0) / (f32::EPSILON + s1)).sqrt()).min(100_000.0);
+                let gain_max = (LIMGAIN[self.bs_limiter_gains]
+                    * ((f32::EPSILON + s0) / (f32::EPSILON + s1)).sqrt())
+                .min(100_000.0);
                 for m in lo..hi {
                     let q_m_max = wk.q_m[e][m] * gain_max / wk.gain[e][m];
                     wk.q_m[e][m] = wk.q_m[e][m].min(q_m_max);
@@ -1361,10 +1429,18 @@ impl SbrChannelState {
                 let (mut s0, mut s1) = (0f32, 0f32);
                 for m in lo..hi {
                     s0 += wk.e_origmapped[e][m];
-                    let noise = if delta && wk.s_m[e][m] == 0.0 { wk.q_m[e][m] * wk.q_m[e][m] } else { 0.0 };
-                    s1 += wk.e_curr[e][m] * wk.gain[e][m] * wk.gain[e][m] + wk.s_m[e][m] * wk.s_m[e][m] + noise;
+                    let noise = if delta && wk.s_m[e][m] == 0.0 {
+                        wk.q_m[e][m] * wk.q_m[e][m]
+                    } else {
+                        0.0
+                    };
+                    s1 += wk.e_curr[e][m] * wk.gain[e][m] * wk.gain[e][m]
+                        + wk.s_m[e][m] * wk.s_m[e][m]
+                        + noise;
                 }
-                let boost = ((f32::EPSILON + s0) / (f32::EPSILON + s1)).sqrt().min(1.584_893_2);
+                let boost = ((f32::EPSILON + s0) / (f32::EPSILON + s1))
+                    .sqrt()
+                    .min(1.584_893_2);
                 for m in lo..hi {
                     wk.gain[e][m] *= boost;
                     wk.q_m[e][m] *= boost;
@@ -1375,7 +1451,13 @@ impl SbrChannelState {
     }
 
     fn hf_assemble(&mut self, wk: &Work, ch: usize) {
-        const H_SMOOTH: [f32; 5] = [0.333_333_33, 0.301_502_83, 0.218_169_5, 0.115_163_83, 0.031_830_5];
+        const H_SMOOTH: [f32; 5] = [
+            0.333_333_33,
+            0.301_502_83,
+            0.218_169_5,
+            0.115_163_83,
+            0.031_830_5,
+        ];
         let h_sl = if self.bs_smoothing_mode { 0 } else { 4 };
         let kx = self.kx[1];
         let m_max = self.m[1];
@@ -1512,7 +1594,9 @@ pub(crate) fn apply(dec: &mut Decoder, el: &mut Element, ty: u8, n: usize) {
     let core_rate = dec.stream_config().sample_rate;
     let ext_rate = dec.sbr_ext_rate();
     let ps_on = dec.ps_on();
-    let sbr = el.sbr.get_or_insert_with(|| Box::new(SbrChannelState::new(ty)));
+    let sbr = el
+        .sbr
+        .get_or_insert_with(|| Box::new(SbrChannelState::new(ty)));
     if let Some((payload, bits, crc)) = el.sbr_payload.take() {
         sbr.decode_extension(&payload, bits, crc, ty, nts, ps_on, 2 * core_rate);
     }
@@ -1575,10 +1659,15 @@ pub(crate) fn apply(dec: &mut Decoder, el: &mut Element, ty: u8, n: usize) {
     let outn = if downsampled { n } else { 2 * n };
     for (ch, x) in xs.iter().enumerate() {
         let _prof = crate::prof::scope(crate::prof::Stage::DecSbrSynthesis);
-        qmf_synthesis(&mut el.ch[ch].output[..outn], x, &mut sbr.data[ch].syn_v, nts, downsampled);
+        qmf_synthesis(
+            &mut el.ch[ch].output[..outn],
+            x,
+            &mut sbr.data[ch].syn_v,
+            nts,
+            downsampled,
+        );
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1587,7 +1676,18 @@ mod tests {
     #[test]
     fn sbr_books_are_prefix_complete() {
         let b = books();
-        for book in [&b.env_1_5_t, &b.env_1_5_f, &b.bal_1_5_t, &b.bal_1_5_f, &b.env_3_0_t, &b.env_3_0_f, &b.bal_3_0_t, &b.bal_3_0_f, &b.noise_t, &b.noise_bal_t] {
+        for book in [
+            &b.env_1_5_t,
+            &b.env_1_5_f,
+            &b.bal_1_5_t,
+            &b.bal_1_5_f,
+            &b.env_3_0_t,
+            &b.env_3_0_f,
+            &b.bal_3_0_t,
+            &b.bal_3_0_f,
+            &b.noise_t,
+            &b.noise_bal_t,
+        ] {
             let kraft: f64 = book.entries.iter().map(|e| 0.5f64.powi(e.1 as i32)).sum();
             assert!((kraft - 1.0).abs() < 1e-9, "kraft {kraft}");
         }

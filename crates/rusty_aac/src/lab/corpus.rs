@@ -218,7 +218,8 @@ impl Resonator {
 /// were completely different — caught by `stereo_wide_is_decorrelated`. RMS
 /// normalization makes the mix weights mean what they say.
 fn rms_normalize(pcm: &mut [f32]) {
-    let ms: f64 = pcm.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / pcm.len().max(1) as f64;
+    let ms: f64 =
+        pcm.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / pcm.len().max(1) as f64;
     let rms = ms.sqrt() as f32;
     if rms > 1e-9 {
         for x in pcm.iter_mut() {
@@ -291,7 +292,9 @@ fn music_core(n: usize, seed: u32) -> Vec<f32> {
     let mut out = vec![0f32; n];
     // A note every 0.25 s; each is a decaying harmonic stack.
     let note_len = SR as usize / 4;
-    let base = [220.0f32, 261.63, 329.63, 392.0, 440.0, 329.63, 261.63, 196.0];
+    let base = [
+        220.0f32, 261.63, 329.63, 392.0, 440.0, 329.63, 261.63, 196.0,
+    ];
     // Seeded transposition (±5 semitones) and a seeded note order.
     let transpose = 2f32.powf(rng.next() * 5.0 / 12.0);
     let mut order: Vec<usize> = (0..base.len()).collect();
@@ -499,7 +502,10 @@ pub fn corpus() -> Vec<Signal> {
 
 /// Look up one signal by class name.
 pub fn by_name(name: &str) -> Option<Signal> {
-    Class::all().into_iter().find(|c| c.name() == name).map(signal)
+    Class::all()
+        .into_iter()
+        .find(|c| c.name() == name)
+        .map(signal)
 }
 
 #[cfg(test)]
@@ -536,7 +542,8 @@ mod tests {
         // QuietDynamic: the two halves must differ by ~40 dB, or it cannot judge A4/A5.
         let q = signal(Class::QuietDynamic);
         let half = LEN / 2;
-        let rms = |s: &[f32]| (s.iter().map(|&x| (x * x) as f64).sum::<f64>() / s.len() as f64).sqrt();
+        let rms =
+            |s: &[f32]| (s.iter().map(|&x| (x * x) as f64).sum::<f64>() / s.len() as f64).sqrt();
         let lo = rms(&q.pcm[..half]);
         let hi = rms(&q.pcm[half + 4410..]);
         let db = 20.0 * (hi / lo.max(1e-12)).log10();
@@ -596,4 +603,3 @@ mod tests {
         );
     }
 }
-

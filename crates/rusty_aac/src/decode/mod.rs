@@ -138,7 +138,12 @@ impl Decoder {
             frame_len: cfg.frame_length,
         };
         match cfg.object_type {
-            aot::AAC_MAIN | aot::AAC_LC | aot::AAC_SSR | aot::AAC_LTP | aot::ER_AAC_LC | aot::ER_AAC_LTP => {}
+            aot::AAC_MAIN
+            | aot::AAC_LC
+            | aot::AAC_SSR
+            | aot::AAC_LTP
+            | aot::ER_AAC_LC
+            | aot::ER_AAC_LTP => {}
             aot::ER_AAC_LD => {
                 if !(3..=7).contains(&cfg.sf_index) {
                     return Err(Error::invalid("aac: invalid low-delay sampling rate"));
@@ -146,10 +151,15 @@ impl Decoder {
             }
             aot::ER_AAC_ELD => {}
             o => {
-                return Err(Error::unsupported(format!("aac: object type {o} not supported")));
+                return Err(Error::unsupported(format!(
+                    "aac: object type {o} not supported"
+                )));
             }
         }
-        if cfg.section_data_resilience || cfg.scalefactor_data_resilience || cfg.spectral_data_resilience {
+        if cfg.section_data_resilience
+            || cfg.scalefactor_data_resilience
+            || cfg.spectral_data_resilience
+        {
             return Err(Error::unsupported(
                 "aac: error-resilience data tools (HCR/RVLC/VCB11) are not supported",
             ));
@@ -180,7 +190,11 @@ impl Decoder {
             ps_state: if cfg.ps { Some(true) } else { None },
             locked: false,
             buf: vec![0.0; 2048],
-            discovery: if cfg.channel_config == 0 && cfg.pce.is_none() { Some(Vec::new()) } else { None },
+            discovery: if cfg.channel_config == 0 && cfg.pce.is_none() {
+                Some(Vec::new())
+            } else {
+                None
+            },
             cfg,
         };
         d.configure_initial()?;
@@ -203,7 +217,11 @@ impl Decoder {
         };
         // A mono program carrying SBR may carry implicit PS: FFmpeg outputs it
         // as stereo, and so do we.
-        let mono = map.iter().map(|t| 1 + (t.syn_ele == TYPE_CPE) as usize * (t.pos != 5) as usize).sum::<usize>() <= 1;
+        let mono = map
+            .iter()
+            .map(|t| 1 + (t.syn_ele == TYPE_CPE) as usize * (t.pos != 5) as usize)
+            .sum::<usize>()
+            <= 1;
         if !mono {
             self.ps_state = Some(false);
         } else if self.sbr_state == Some(true) && self.ps_state.is_none() {
@@ -218,17 +236,35 @@ impl Decoder {
     fn discovered_layout(rows: Vec<Tag>) -> Vec<Tag> {
         for cc in [1u8, 2, 3, 4, 5, 6, 7] {
             if let Some(std_rows) = layout::default_layout(cc, false) {
-                if std_rows.len() == rows.len() && std_rows.iter().zip(&rows).all(|(a, b)| a.syn_ele == b.syn_ele) {
+                if std_rows.len() == rows.len()
+                    && std_rows
+                        .iter()
+                        .zip(&rows)
+                        .all(|(a, b)| a.syn_ele == b.syn_ele)
+                {
                     return std_rows
                         .iter()
                         .zip(&rows)
-                        .map(|(a, b)| Tag { syn_ele: b.syn_ele, id: b.id, pos: a.pos })
+                        .map(|(a, b)| Tag {
+                            syn_ele: b.syn_ele,
+                            id: b.id,
+                            pos: a.pos,
+                        })
                         .collect();
                 }
             }
         }
         rows.into_iter()
-            .map(|r| Tag { pos: if r.syn_ele == TYPE_LFE { layout::POS_LFE } else if r.syn_ele == TYPE_CCE { layout::POS_CC } else { layout::POS_FRONT }, ..r })
+            .map(|r| Tag {
+                pos: if r.syn_ele == TYPE_LFE {
+                    layout::POS_LFE
+                } else if r.syn_ele == TYPE_CCE {
+                    layout::POS_CC
+                } else {
+                    layout::POS_FRONT
+                },
+                ..r
+            })
             .collect()
     }
 
@@ -273,7 +309,11 @@ impl Decoder {
             let t = ty as usize;
             if self.oc.tag_to_instance[t][tag as usize].is_none() {
                 let iid = rows.iter().filter(|r| r.syn_ele == ty).count() as u8;
-                rows.push(Tag { syn_ele: ty, id: tag, pos: layout::POS_FRONT });
+                rows.push(Tag {
+                    syn_ele: ty,
+                    id: tag,
+                    pos: layout::POS_FRONT,
+                });
                 self.oc.tag_to_instance[t][tag as usize] = Some(iid);
                 if self.elements[t][iid as usize].is_none() {
                     self.elements[t][iid as usize] = Some(Box::new(Element::new()));
@@ -295,8 +335,16 @@ impl Decoder {
         if self.tags_mapped == 0 && ty == TYPE_SCE && self.chan_config == 2 {
             // Stereo configuration carrying SCEs: two front SCEs.
             self.output_configure(vec![
-                Tag { syn_ele: TYPE_SCE, id: 0, pos: layout::POS_FRONT },
-                Tag { syn_ele: TYPE_SCE, id: 1, pos: layout::POS_FRONT },
+                Tag {
+                    syn_ele: TYPE_SCE,
+                    id: 0,
+                    pos: layout::POS_FRONT,
+                },
+                Tag {
+                    syn_ele: TYPE_SCE,
+                    id: 1,
+                    pos: layout::POS_FRONT,
+                },
             ]);
             if self.sbr_state == Some(true) {
                 self.ps_state = None;
@@ -304,9 +352,8 @@ impl Decoder {
         }
         let cc = self.chan_config;
         let tm = self.tags_mapped;
-        let tags_per = |c: u8| -> usize {
-            [0, 1, 1, 2, 3, 3, 4, 5, 0, 0, 0, 5, 5, 16, 5, 0][c as usize & 15]
-        };
+        let tags_per =
+            |c: u8| -> usize { [0, 1, 1, 2, 3, 3, 4, 5, 0, 0, 0, 5, 5, 16, 5, 0][c as usize & 15] };
         let hit = |s: &mut Self, t: usize, i: usize| -> Option<(usize, usize)> {
             s.tags_mapped += 1;
             s.instance(t as u8, i as u8)
@@ -327,7 +374,12 @@ impl Decoder {
         if level <= 0 && tm > 2 && ((ty == TYPE_CPE && tag < 3) || (ty == TYPE_LFE && tag < 1)) {
             return hit(self, ty as usize, tag as usize);
         }
-        if level <= 1 && tm > 3 && ((ty == TYPE_CPE && tag < 8) || (ty == TYPE_SCE && tag < 6) || (ty == TYPE_LFE && tag < 2)) {
+        if level <= 1
+            && tm > 3
+            && ((ty == TYPE_CPE && tag < 8)
+                || (ty == TYPE_SCE && tag < 6)
+                || (ty == TYPE_LFE && tag < 2))
+        {
             return hit(self, ty as usize, tag as usize);
         }
         if level <= 2 && tm == 3 && ty == TYPE_CPE {
@@ -422,7 +474,8 @@ impl Decoder {
                     let sce = &mut el.ch[0];
                     decode_ics(r, &sx, &mut sce.ics, &mut sce.data, false, rng)?;
                     if sx.aot == aot::AAC_MAIN {
-                        let (ics, data, pred, init) = (&sce.ics, &mut sce.data, &mut sce.pred, &mut sce.pred_init);
+                        let (ics, data, pred, init) =
+                            (&sce.ics, &mut sce.data, &mut sce.pred, &mut sce.pred_init);
                         tools::apply_prediction(ics, sx.sf_index, &mut data.coeffs, pred, init);
                     }
                     audio_found = true;
@@ -444,7 +497,8 @@ impl Decoder {
                     r.skip(8 * count)?;
                 }
                 ID_PCE => {
-                    let p = crate::config::Pce::parse_after_tag(r, elem_id as u8, payload_alignment)?;
+                    let p =
+                        crate::config::Pce::parse_after_tag(r, elem_id as u8, payload_alignment)?;
                     if !pce_found {
                         self.output_configure(layout::pce_layout(&p));
                         self.chan_config = 0;
@@ -568,7 +622,8 @@ impl Decoder {
             }
             if sx.aot == aot::AAC_MAIN {
                 for c in el.ch.iter_mut() {
-                    let (ics, data, pred, init) = (&c.ics, &mut c.data, &mut c.pred, &mut c.pred_init);
+                    let (ics, data, pred, init) =
+                        (&c.ics, &mut c.data, &mut c.pred, &mut c.pred_init);
                     tools::apply_prediction(ics, sx.sf_index, &mut data.coeffs, pred, init);
                 }
             }
@@ -579,7 +634,13 @@ impl Decoder {
             }
         }
         let [c0, c1] = &mut el.ch;
-        tools::apply_is(&c1.ics, el.ms_present != 0, &el.ms_mask, &c0.data, &mut c1.data);
+        tools::apply_is(
+            &c1.ics,
+            el.ms_present != 0,
+            &el.ms_mask,
+            &c0.data,
+            &mut c1.data,
+        );
         Ok(())
     }
 
@@ -608,7 +669,8 @@ impl Decoder {
         }
         point += (r.read_bool()? || (point >> 1) != 0) as u8;
         let sign = r.read_bool()?;
-        let scale = [1.090_507_7f32, 1.189_207_1, std::f32::consts::SQRT_2, 2.0][r.read_bits(2)? as usize];
+        let scale =
+            [1.090_507_7f32, 1.189_207_1, std::f32::consts::SQRT_2, 2.0][r.read_bits(2)? as usize];
         decode_ics(r, &sx, &mut el.ch[0].ics, &mut el.ch[0].data, false, rng)?;
         let info = el.ch[0].ics.info.clone();
         let max_sfb = info.max_sfb as usize;
@@ -618,8 +680,16 @@ impl Decoder {
             let mut gain = 0i32;
             let mut gain_cache = 1.0f32;
             if c > 0 {
-                cge = if point == tools::AFTER_IMDCT { true } else { r.read_bool()? };
-                gain = if cge { SCALEFACTOR_BOOK.decode(r)? as i32 - 60 } else { 0 };
+                cge = if point == tools::AFTER_IMDCT {
+                    true
+                } else {
+                    r.read_bool()?
+                };
+                gain = if cge {
+                    SCALEFACTOR_BOOK.decode(r)? as i32 - 60
+                } else {
+                    0
+                };
                 gain_cache = scale.powf(-(gain as f32));
             }
             if point == tools::AFTER_IMDCT {
@@ -657,7 +727,12 @@ impl Decoder {
     }
 
     /// `extension_payload` inside a fill element. Returns bytes consumed.
-    fn decode_extension_payload(&mut self, r: &mut BitReader, cnt: usize, prev: Option<((usize, usize), u8)>) -> Result<usize> {
+    fn decode_extension_payload(
+        &mut self,
+        r: &mut BitReader,
+        cnt: usize,
+        prev: Option<((usize, usize), u8)>,
+    ) -> Result<usize> {
         let start = r.position();
         let ext = r.read_bits(4)?;
         match ext {
@@ -678,7 +753,10 @@ impl Decoder {
                         return Ok(cnt);
                     }
                     self.sbr_state = Some(true);
-                    if self.ps_state.is_none() && self.oc.channels() == 1 && self.cfg.object_type == aot::AAC_LC {
+                    if self.ps_state.is_none()
+                        && self.oc.channels() == 1
+                        && self.cfg.object_type == aot::AAC_LC
+                    {
                         self.ps_state = Some(true);
                         let map = self.oc.map.clone();
                         self.output_configure(map);
@@ -756,7 +834,9 @@ impl Decoder {
         let sbr_on = self.sbr_active();
         for ty in (0..4usize).rev() {
             for id in 0..16usize {
-                let Some(el) = self.elements[ty][id].as_ref() else { continue };
+                let Some(el) = self.elements[ty][id].as_ref() else {
+                    continue;
+                };
                 if !el.present {
                     let el = self.elements[ty][id].as_mut().unwrap();
                     for c in el.ch.iter_mut() {
@@ -808,7 +888,9 @@ impl Decoder {
 
     fn apply_coupling(&mut self, ty: usize, id: usize, point: u8) {
         for i in 0..16 {
-            let Some(cce) = self.elements[TYPE_CCE as usize][i].as_ref() else { continue };
+            let Some(cce) = self.elements[TYPE_CCE as usize][i].as_ref() else {
+                continue;
+            };
             if cce.coup.point != point || cce.coup.targets.is_empty() {
                 continue;
             }
@@ -835,14 +917,21 @@ impl Decoder {
     }
 
     fn couple(cce: &Element, index: usize, point: u8, target: &mut Sce) {
-        let Some(gains) = cce.coup.gains.get(index) else { return };
+        let Some(gains) = cce.coup.gains.get(index) else {
+            return;
+        };
         if point == tools::AFTER_IMDCT {
             let g = gains[0];
             for (d, s) in target.output.iter_mut().zip(cce.ch[0].output.iter()) {
                 *d += g * s;
             }
         } else {
-            tools::apply_dependent_coupling(&cce.ch[0].ics, &cce.ch[0].data, gains, &mut target.data.coeffs);
+            tools::apply_dependent_coupling(
+                &cce.ch[0].ics,
+                &cce.ch[0].data,
+                gains,
+                &mut target.data.coeffs,
+            );
         }
     }
 
@@ -884,7 +973,16 @@ impl Decoder {
         match sx.aot {
             aot::ER_AAC_LD => {
                 let (ld_sine, lo) = (self.ld_sine.clone(), self.ld_low_overlap.clone());
-                synth::imdct_and_window_ld(&ld_sine, &lo, n, &sce.data.coeffs, sce.ics.prev_kbd, &mut self.buf, &mut sce.saved, &mut sce.output);
+                synth::imdct_and_window_ld(
+                    &ld_sine,
+                    &lo,
+                    n,
+                    &sce.data.coeffs,
+                    sce.ics.prev_kbd,
+                    &mut self.buf,
+                    &mut sce.saved,
+                    &mut sce.output,
+                );
             }
             aot::ER_AAC_ELD => {
                 let window: &[f32] = if n == 480 {
@@ -892,7 +990,14 @@ impl Decoder {
                 } else {
                     &crate::tables_ext::ELD_WINDOW_512
                 };
-                synth::imdct_and_window_eld(window, n, &mut sce.data.coeffs, &mut self.buf, &mut sce.saved, &mut sce.output);
+                synth::imdct_and_window_eld(
+                    window,
+                    n,
+                    &mut sce.data.coeffs,
+                    &mut self.buf,
+                    &mut sce.saved,
+                    &mut sce.output,
+                );
             }
             _ => {
                 let si = synth::SynthIn {
@@ -902,10 +1007,25 @@ impl Decoder {
                     kbd: sce.ics.info.window_shape_kbd,
                     prev_kbd: sce.ics.prev_kbd,
                 };
-                synth::imdct_and_window(&self.windows, n, &si, &mut self.buf, &mut sce.saved, &mut sce.output);
+                synth::imdct_and_window(
+                    &self.windows,
+                    n,
+                    &si,
+                    &mut self.buf,
+                    &mut sce.saved,
+                    &mut sce.output,
+                );
                 if sx.aot == aot::AAC_LTP {
                     let (seq, kbd) = (sce.ics.info.window_sequence, sce.ics.info.window_shape_kbd);
-                    synth::ltp_update(&self.windows, seq, kbd, &self.buf, &sce.saved, &sce.output, &mut sce.ltp_state);
+                    synth::ltp_update(
+                        &self.windows,
+                        seq,
+                        kbd,
+                        &self.buf,
+                        &sce.saved,
+                        &sce.output,
+                        &mut sce.ltp_state,
+                    );
                 }
             }
         }
@@ -972,4 +1092,3 @@ impl Decoder {
         }
     }
 }
-

@@ -32,5 +32,5 @@ pub mod wav;
 pub use corpus::{corpus, Class, Signal};
 pub use ladder::{null_arm, point, run, Point};
 pub use quality::{track_nmr, NmrReport};
-pub use wav::Wav;
 pub use signals::{AacSignals, FrameSignals};
+pub use wav::Wav;

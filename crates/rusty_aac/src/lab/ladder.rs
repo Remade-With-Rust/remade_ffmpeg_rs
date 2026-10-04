@@ -13,7 +13,7 @@
 
 use super::corpus::{self, Class, Signal};
 use super::quality::{track_nmr, NmrReport};
-use crate::{AacEncoder, AacEncoderConfig, AacDecoder, AdtsHeader};
+use crate::{AacDecoder, AacEncoder, AacEncoderConfig, AdtsHeader};
 
 /// The default operating points — four, per the corpus law. Chosen to straddle
 /// the region where AAC tools change sign: 64k (where PNS/intensity earn their

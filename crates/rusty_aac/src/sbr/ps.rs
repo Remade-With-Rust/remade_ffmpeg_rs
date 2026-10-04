@@ -35,74 +35,311 @@ const SHORT_DELAY_BAND: [usize; 2] = [42, 62];
 
 /// Hybrid sub-subband to stereo parameter band (Tables 8.48/8.49).
 const K_TO_I_20: [u8; 71] = [
-    1, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 14, 15, 15, 15, 16, 16, 16, 16, 17, 17, 17, 17, 17, 18, 18,
-    18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19,
-    19, 19, 19, 19, 19, 19, 19, 19, 19, 19,
+    1, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 14, 15, 15, 15, 16, 16, 16, 16, 17, 17,
+    17, 17, 17, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19,
+    19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19,
 ];
 const K_TO_I_34: [u8; 91] = [
-    0, 1, 2, 3, 4, 5, 6, 6, 7, 2, 1, 0, 10, 10, 4, 5, 6, 7, 8, 9, 10, 11, 12, 9, 14, 11, 12, 13, 14, 15, 16, 13, 16, 17,
-    18, 19, 20, 21, 22, 22, 23, 23, 24, 24, 25, 25, 26, 26, 27, 27, 27, 28, 28, 28, 29, 29, 29, 30, 30, 30, 31, 31, 31,
-    31, 32, 32, 32, 32, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+    0, 1, 2, 3, 4, 5, 6, 6, 7, 2, 1, 0, 10, 10, 4, 5, 6, 7, 8, 9, 10, 11, 12, 9, 14, 11, 12, 13,
+    14, 15, 16, 13, 16, 17, 18, 19, 20, 21, 22, 22, 23, 23, 24, 24, 25, 25, 26, 26, 27, 27, 27, 28,
+    28, 28, 29, 29, 29, 30, 30, 30, 31, 31, 31, 31, 32, 32, 32, 32, 33, 33, 33, 33, 33, 33, 33, 33,
+    33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
 ];
 
 // PS Huffman codebooks (Tables 8.B.*) as (symbol, length) in canonical order;
 // value = symbol + offset.
 const HUFF_IID_DF1: (&[(u8, u8)], i32) = (
     &[
-        (28, 4), (32, 4), (29, 3), (31, 3), (27, 5), (33, 5), (26, 6), (34, 6), (25, 7), (35, 7), (24, 8), (36, 8),
-        (37, 9), (40, 11), (19, 12), (41, 12), (22, 10), (38, 10), (9, 17), (51, 17), (11, 17), (49, 17), (13, 16),
-        (47, 16), (16, 14), (18, 13), (42, 13), (44, 14), (12, 17), (48, 17), (4, 18), (5, 18), (2, 18), (3, 18),
-        (15, 15), (21, 11), (39, 11), (45, 15), (8, 18), (52, 18), (6, 18), (7, 18), (55, 18), (56, 18), (53, 18),
-        (54, 18), (17, 14), (43, 14), (59, 18), (60, 18), (57, 18), (58, 18), (0, 18), (1, 18), (10, 18), (50, 18),
-        (14, 16), (46, 16), (20, 12), (23, 10), (30, 1),
+        (28, 4),
+        (32, 4),
+        (29, 3),
+        (31, 3),
+        (27, 5),
+        (33, 5),
+        (26, 6),
+        (34, 6),
+        (25, 7),
+        (35, 7),
+        (24, 8),
+        (36, 8),
+        (37, 9),
+        (40, 11),
+        (19, 12),
+        (41, 12),
+        (22, 10),
+        (38, 10),
+        (9, 17),
+        (51, 17),
+        (11, 17),
+        (49, 17),
+        (13, 16),
+        (47, 16),
+        (16, 14),
+        (18, 13),
+        (42, 13),
+        (44, 14),
+        (12, 17),
+        (48, 17),
+        (4, 18),
+        (5, 18),
+        (2, 18),
+        (3, 18),
+        (15, 15),
+        (21, 11),
+        (39, 11),
+        (45, 15),
+        (8, 18),
+        (52, 18),
+        (6, 18),
+        (7, 18),
+        (55, 18),
+        (56, 18),
+        (53, 18),
+        (54, 18),
+        (17, 14),
+        (43, 14),
+        (59, 18),
+        (60, 18),
+        (57, 18),
+        (58, 18),
+        (0, 18),
+        (1, 18),
+        (10, 18),
+        (50, 18),
+        (14, 16),
+        (46, 16),
+        (20, 12),
+        (23, 10),
+        (30, 1),
     ],
     -30,
 );
 const HUFF_IID_DT1: (&[(u8, u8)], i32) = (
     &[
-        (31, 2), (26, 7), (34, 7), (27, 6), (33, 6), (35, 8), (24, 9), (36, 9), (39, 11), (41, 12), (9, 15), (10, 15),
-        (48, 15), (49, 15), (17, 13), (23, 10), (37, 10), (43, 13), (11, 15), (12, 15), (4, 16), (56, 16), (2, 16),
-        (3, 16), (59, 16), (60, 16), (57, 16), (58, 16), (0, 16), (1, 16), (5, 16), (55, 16), (6, 16), (54, 16),
-        (13, 15), (15, 14), (20, 12), (40, 12), (22, 11), (38, 11), (45, 14), (47, 15), (7, 16), (53, 16), (18, 13),
-        (42, 13), (16, 14), (44, 14), (8, 16), (52, 16), (14, 15), (46, 15), (50, 16), (51, 16), (19, 13), (21, 12),
-        (25, 9), (28, 5), (32, 5), (29, 3), (30, 1),
+        (31, 2),
+        (26, 7),
+        (34, 7),
+        (27, 6),
+        (33, 6),
+        (35, 8),
+        (24, 9),
+        (36, 9),
+        (39, 11),
+        (41, 12),
+        (9, 15),
+        (10, 15),
+        (48, 15),
+        (49, 15),
+        (17, 13),
+        (23, 10),
+        (37, 10),
+        (43, 13),
+        (11, 15),
+        (12, 15),
+        (4, 16),
+        (56, 16),
+        (2, 16),
+        (3, 16),
+        (59, 16),
+        (60, 16),
+        (57, 16),
+        (58, 16),
+        (0, 16),
+        (1, 16),
+        (5, 16),
+        (55, 16),
+        (6, 16),
+        (54, 16),
+        (13, 15),
+        (15, 14),
+        (20, 12),
+        (40, 12),
+        (22, 11),
+        (38, 11),
+        (45, 14),
+        (47, 15),
+        (7, 16),
+        (53, 16),
+        (18, 13),
+        (42, 13),
+        (16, 14),
+        (44, 14),
+        (8, 16),
+        (52, 16),
+        (14, 15),
+        (46, 15),
+        (50, 16),
+        (51, 16),
+        (19, 13),
+        (21, 12),
+        (25, 9),
+        (28, 5),
+        (32, 5),
+        (29, 3),
+        (30, 1),
     ],
     -30,
 );
 const HUFF_IID_DF0: (&[(u8, u8)], i32) = (
     &[
-        (14, 1), (15, 3), (13, 3), (16, 4), (12, 4), (17, 5), (11, 5), (10, 6), (18, 6), (19, 6), (9, 7), (20, 8),
-        (8, 9), (7, 10), (21, 11), (22, 13), (6, 13), (23, 14), (24, 14), (5, 15), (25, 15), (4, 16), (3, 17), (0, 17),
-        (1, 17), (2, 17), (26, 17), (27, 18), (28, 18),
+        (14, 1),
+        (15, 3),
+        (13, 3),
+        (16, 4),
+        (12, 4),
+        (17, 5),
+        (11, 5),
+        (10, 6),
+        (18, 6),
+        (19, 6),
+        (9, 7),
+        (20, 8),
+        (8, 9),
+        (7, 10),
+        (21, 11),
+        (22, 13),
+        (6, 13),
+        (23, 14),
+        (24, 14),
+        (5, 15),
+        (25, 15),
+        (4, 16),
+        (3, 17),
+        (0, 17),
+        (1, 17),
+        (2, 17),
+        (26, 17),
+        (27, 18),
+        (28, 18),
     ],
     -14,
 );
 const HUFF_IID_DT0: (&[(u8, u8)], i32) = (
     &[
-        (14, 1), (13, 2), (15, 3), (12, 4), (16, 5), (11, 6), (17, 7), (10, 8), (18, 9), (9, 10), (19, 11), (8, 12),
-        (20, 13), (21, 14), (7, 15), (22, 17), (6, 17), (23, 19), (0, 19), (1, 19), (2, 19), (3, 20), (4, 20), (5, 20),
-        (24, 20), (25, 20), (26, 20), (27, 20), (28, 20),
+        (14, 1),
+        (13, 2),
+        (15, 3),
+        (12, 4),
+        (16, 5),
+        (11, 6),
+        (17, 7),
+        (10, 8),
+        (18, 9),
+        (9, 10),
+        (19, 11),
+        (8, 12),
+        (20, 13),
+        (21, 14),
+        (7, 15),
+        (22, 17),
+        (6, 17),
+        (23, 19),
+        (0, 19),
+        (1, 19),
+        (2, 19),
+        (3, 20),
+        (4, 20),
+        (5, 20),
+        (24, 20),
+        (25, 20),
+        (26, 20),
+        (27, 20),
+        (28, 20),
     ],
     -14,
 );
 const HUFF_ICC_DF: (&[(u8, u8)], i32) = (
     &[
-        (7, 1), (8, 2), (6, 3), (9, 4), (5, 5), (10, 6), (4, 7), (11, 8), (12, 9), (3, 10), (13, 11), (2, 12), (14, 13),
-        (1, 14), (0, 14),
+        (7, 1),
+        (8, 2),
+        (6, 3),
+        (9, 4),
+        (5, 5),
+        (10, 6),
+        (4, 7),
+        (11, 8),
+        (12, 9),
+        (3, 10),
+        (13, 11),
+        (2, 12),
+        (14, 13),
+        (1, 14),
+        (0, 14),
     ],
     -7,
 );
 const HUFF_ICC_DT: (&[(u8, u8)], i32) = (
     &[
-        (7, 1), (8, 2), (6, 3), (9, 4), (5, 5), (10, 6), (4, 7), (11, 8), (3, 9), (12, 10), (2, 11), (13, 12), (1, 13),
-        (0, 14), (14, 14),
+        (7, 1),
+        (8, 2),
+        (6, 3),
+        (9, 4),
+        (5, 5),
+        (10, 6),
+        (4, 7),
+        (11, 8),
+        (3, 9),
+        (12, 10),
+        (2, 11),
+        (13, 12),
+        (1, 13),
+        (0, 14),
+        (14, 14),
     ],
     -7,
 );
-const HUFF_IPD_DF: (&[(u8, u8)], i32) = (&[(1, 3), (4, 4), (5, 4), (3, 4), (6, 4), (2, 4), (7, 4), (0, 1)], 0);
-const HUFF_IPD_DT: (&[(u8, u8)], i32) = (&[(5, 4), (4, 5), (3, 5), (2, 4), (6, 4), (1, 3), (7, 3), (0, 1)], 0);
-const HUFF_OPD_DF: (&[(u8, u8)], i32) = (&[(7, 3), (1, 3), (3, 4), (6, 4), (2, 4), (5, 5), (4, 5), (0, 1)], 0);
-const HUFF_OPD_DT: (&[(u8, u8)], i32) = (&[(5, 4), (2, 4), (6, 4), (4, 5), (3, 5), (1, 3), (7, 3), (0, 1)], 0);
+const HUFF_IPD_DF: (&[(u8, u8)], i32) = (
+    &[
+        (1, 3),
+        (4, 4),
+        (5, 4),
+        (3, 4),
+        (6, 4),
+        (2, 4),
+        (7, 4),
+        (0, 1),
+    ],
+    0,
+);
+const HUFF_IPD_DT: (&[(u8, u8)], i32) = (
+    &[
+        (5, 4),
+        (4, 5),
+        (3, 5),
+        (2, 4),
+        (6, 4),
+        (1, 3),
+        (7, 3),
+        (0, 1),
+    ],
+    0,
+);
+const HUFF_OPD_DF: (&[(u8, u8)], i32) = (
+    &[
+        (7, 3),
+        (1, 3),
+        (3, 4),
+        (6, 4),
+        (2, 4),
+        (5, 5),
+        (4, 5),
+        (0, 1),
+    ],
+    0,
+);
+const HUFF_OPD_DT: (&[(u8, u8)], i32) = (
+    &[
+        (5, 4),
+        (2, 4),
+        (6, 4),
+        (4, 5),
+        (3, 5),
+        (1, 3),
+        (7, 3),
+        (0, 1),
+    ],
+    0,
+);
 
 struct PsBooks {
     iid_df: [SbrBook; 2], // [iid_quant]
@@ -152,7 +389,10 @@ fn filters_from_proto(proto: &[f32; 7], bands: usize) -> Vec<[Cpx; 8]> {
             let mut f = [[0f32; 2]; 8];
             for (n, &p) in proto.iter().enumerate() {
                 let theta = 2.0 * PI * (q as f64 + 0.5) * (n as f64 - 6.0) / bands as f64;
-                f[n] = [(p as f64 * theta.cos()) as f32, (p as f64 * -theta.sin()) as f32];
+                f[n] = [
+                    (p as f64 * theta.cos()) as f32,
+                    (p as f64 * -theta.sin()) as f32,
+                ];
             }
             f
         })
@@ -179,14 +419,52 @@ fn tables() -> &'static PsTables {
             }
         }
         let iid_par_dequant: [f32; 46] = [
-            0.05623413251903, 0.12589254117942, 0.19952623149689, 0.31622776601684, 0.44668359215096,
-            0.63095734448019, 0.79432823472428, 1.0, 1.25892541179417, 1.58489319246111, 2.23872113856834,
-            3.16227766016838, 5.01187233627272, 7.94328234724282, 17.7827941003892, 0.00316227766017, 0.00562341325190,
-            0.01, 0.01778279410039, 0.03162277660168, 0.05623413251903, 0.07943282347243, 0.11220184543020,
-            0.15848931924611, 0.22387211385683, 0.31622776601684, 0.39810717055350, 0.50118723362727, 0.63095734448019,
-            0.79432823472428, 1.0, 1.25892541179417, 1.58489319246111, 1.99526231496888, 2.51188643150958,
-            3.16227766016838, 4.46683592150963, 6.30957344480193, 8.91250938133745, 12.5892541179417, 17.7827941003892,
-            31.6227766016838, 56.2341325190349, 100.0, 177.827941003892, 316.227766016837,
+            0.05623413251903,
+            0.12589254117942,
+            0.19952623149689,
+            0.31622776601684,
+            0.44668359215096,
+            0.63095734448019,
+            0.79432823472428,
+            1.0,
+            1.25892541179417,
+            1.58489319246111,
+            2.23872113856834,
+            3.16227766016838,
+            5.01187233627272,
+            7.94328234724282,
+            17.7827941003892,
+            0.00316227766017,
+            0.00562341325190,
+            0.01,
+            0.01778279410039,
+            0.03162277660168,
+            0.05623413251903,
+            0.07943282347243,
+            0.11220184543020,
+            0.15848931924611,
+            0.22387211385683,
+            0.31622776601684,
+            0.39810717055350,
+            0.50118723362727,
+            0.63095734448019,
+            0.79432823472428,
+            1.0,
+            1.25892541179417,
+            1.58489319246111,
+            1.99526231496888,
+            2.51188643150958,
+            3.16227766016838,
+            4.46683592150963,
+            6.30957344480193,
+            8.91250938133745,
+            12.5892541179417,
+            17.7827941003892,
+            31.6227766016838,
+            56.2341325190349,
+            100.0,
+            177.827941003892,
+            316.227766016837,
         ];
         let icc_invq: [f32; 8] = [1.0, 0.937, 0.84118, 0.60092, 0.36764, 0.0, -0.589, -1.0];
         let acos_icc_invq: [f32; 8] = [
@@ -209,7 +487,12 @@ fn tables() -> &'static PsTables {
                 // Mixing procedure R_A (ICC modes 0-2).
                 let alpha = 0.5f32 * acos_icc_invq[icc];
                 let beta = alpha * (c1 - c2) * std::f32::consts::FRAC_1_SQRT_2;
-                ha[iid][icc] = [c2 * (beta + alpha).cos(), c1 * (beta - alpha).cos(), c2 * (beta + alpha).sin(), c1 * (beta - alpha).sin()];
+                ha[iid][icc] = [
+                    c2 * (beta + alpha).cos(),
+                    c1 * (beta - alpha).cos(),
+                    c2 * (beta + alpha).sin(),
+                    c1 * (beta - alpha).sin(),
+                ];
                 // Mixing procedure R_B (ICC modes 3-5).
                 let rho = icc_invq[icc].max(0.05);
                 let mut alpha = 0.5f32 * (2.0 * c * rho).atan2(c * c - 1.0);
@@ -219,7 +502,12 @@ fn tables() -> &'static PsTables {
                 if alpha < 0.0 {
                     alpha = (alpha as f64 + PI / 2.0) as f32;
                 }
-                let (ac, as_, gc, gs) = (alpha.cos() as f64, alpha.sin() as f64, gamma.cos() as f64, gamma.sin() as f64);
+                let (ac, as_, gc, gs) = (
+                    alpha.cos() as f64,
+                    alpha.sin() as f64,
+                    gamma.cos() as f64,
+                    gamma.sin() as f64,
+                );
                 hb[iid][icc] = [
                     (SQRT_2 * ac * gc) as f32,
                     (SQRT_2 * as_ * gc) as f32,
@@ -230,8 +518,8 @@ fn tables() -> &'static PsTables {
         }
         let f_center_20: [i8; 10] = [-3, -1, 1, 3, 5, 7, 10, 14, 18, 22];
         let f_center_34: [i8; 32] = [
-            2, 6, 10, 14, 18, 22, 26, 30, 34, -10, -6, -2, 51, 57, 15, 21, 27, 33, 39, 45, 54, 66, 78, 42, 102, 66, 78,
-            90, 102, 114, 126, 90,
+            2, 6, 10, 14, 18, 22, 26, 30, 34, -10, -6, -2, 51, 57, 15, 21, 27, 33, 39, 45, 54, 66,
+            78, 42, 102, 66, 78, 90, 102, 114, 126, 90,
         ];
         let links: [f32; 3] = [0.43, 0.75, 0.347];
         let gain = 0.39f32;
@@ -261,19 +549,51 @@ fn tables() -> &'static PsTables {
             ha,
             hb,
             f20_0_8: filters_from_proto(
-                &[0.00746082949812, 0.02270420949825, 0.04546865930473, 0.07266113929591, 0.09885108575264, 0.11793710567217, 0.125],
+                &[
+                    0.00746082949812,
+                    0.02270420949825,
+                    0.04546865930473,
+                    0.07266113929591,
+                    0.09885108575264,
+                    0.11793710567217,
+                    0.125,
+                ],
                 8,
             ),
             f34_0_12: filters_from_proto(
-                &[0.04081179924692, 0.03812810994926, 0.05144908135699, 0.06399831151592, 0.07428313801106, 0.08100347892914, 0.08333333333333],
+                &[
+                    0.04081179924692,
+                    0.03812810994926,
+                    0.05144908135699,
+                    0.06399831151592,
+                    0.07428313801106,
+                    0.08100347892914,
+                    0.08333333333333,
+                ],
                 12,
             ),
             f34_1_8: filters_from_proto(
-                &[0.01565675600122, 0.03752716391991, 0.05417891378782, 0.08417044116767, 0.10307344158036, 0.12222452249753, 0.125],
+                &[
+                    0.01565675600122,
+                    0.03752716391991,
+                    0.05417891378782,
+                    0.08417044116767,
+                    0.10307344158036,
+                    0.12222452249753,
+                    0.125,
+                ],
                 8,
             ),
             f34_2_4: filters_from_proto(
-                &[-0.05908211155639, -0.04871498374946, 0.0, 0.07778723915851, 0.16486303567403, 0.23279856662996, 0.25],
+                &[
+                    -0.05908211155639,
+                    -0.04871498374946,
+                    0.0,
+                    0.07778723915851,
+                    0.16486303567403,
+                    0.23279856662996,
+                    0.25,
+                ],
                 4,
             ),
             q_fract_allpass,
@@ -283,7 +603,15 @@ fn tables() -> &'static PsTables {
 }
 
 /// Real 2-band split filter (center tap 0.5, odd taps only).
-const G1_Q2: [f32; 7] = [0.0, 0.01899487526049, 0.0, -0.07293139167538, 0.0, 0.30596630545168, 0.5];
+const G1_Q2: [f32; 7] = [
+    0.0,
+    0.01899487526049,
+    0.0,
+    -0.07293139167538,
+    0.0,
+    0.30596630545168,
+    0.5,
+];
 
 // ---------------------------------------------------------------------------
 // State.
@@ -388,18 +716,33 @@ impl PsState {
     }
 
     /// Delta-decode one envelope of a parameter; Ok(false) on an illegal value.
-    fn read_par(&mut self, r: &mut BitReader, p: Par, book: &SbrBook, e: usize, dt: bool) -> Result<bool> {
+    fn read_par(
+        &mut self,
+        r: &mut BitReader,
+        p: Par,
+        book: &SbrBook,
+        e: usize,
+        dt: bool,
+    ) -> Result<bool> {
         let (num, mask) = match p {
             Par::Iid => (self.nr_iid_par, 0),
             Par::Icc => (self.nr_icc_par, 0),
             Par::Ipd | Par::Opd => (self.nr_ipdopd_par, 7),
         };
         let limit = 7 + 8 * self.iid_quant as i32;
-        let e_prev = if e > 0 { e - 1 } else { self.num_env_old.saturating_sub(1) };
+        let e_prev = if e > 0 {
+            e - 1
+        } else {
+            self.num_env_old.saturating_sub(1)
+        };
         let mut acc = 0i32;
         for b in 0..num {
             let delta = book.decode(r)?;
-            let mut val = if dt { self.par(p)[e_prev][b] as i32 + delta } else { acc + delta };
+            let mut val = if dt {
+                self.par(p)[e_prev][b] as i32 + delta
+            } else {
+                acc + delta
+            };
             if mask != 0 {
                 val &= mask;
             }
@@ -439,7 +782,12 @@ impl PsState {
 
     /// Parse `ps_data()` within `bits_left` bits; returns the bits consumed
     /// (all of `bits_left` on error, which also disables PS until the next header).
-    pub(crate) fn read_data(&mut self, r: &mut BitReader, bits_left: usize, slots: usize) -> Result<usize> {
+    pub(crate) fn read_data(
+        &mut self,
+        r: &mut BitReader,
+        bits_left: usize,
+        slots: usize,
+    ) -> Result<usize> {
         self.slots = slots;
         let start = r.position();
         match self.read_data_inner(r) {
@@ -539,7 +887,11 @@ impl PsState {
         // A last border before the frame end gets a repeated envelope.
         let n = self.num_env;
         if n == 0 || self.border_position[n] < self.slots as i32 - 1 {
-            let source = if n > 0 { n as i64 - 1 } else { self.num_env_old as i64 - 1 };
+            let source = if n > 0 {
+                n as i64 - 1
+            } else {
+                self.num_env_old as i64 - 1
+            };
             if source >= 0 && source as usize != n {
                 let s = source as usize;
                 if self.enable_iid {
@@ -554,11 +906,19 @@ impl PsState {
                 }
             }
             let limit = 7 + 8 * self.iid_quant as i32;
-            if self.enable_iid && self.iid_par[n][..self.nr_iid_par].iter().any(|&v| (v as i32).abs() > limit) {
+            if self.enable_iid
+                && self.iid_par[n][..self.nr_iid_par]
+                    .iter()
+                    .any(|&v| (v as i32).abs() > limit)
+            {
                 return Ok(false);
             }
             // (The reference bounds this check by the IID band count.)
-            if self.enable_icc && self.icc_par[n][..self.nr_iid_par].iter().any(|&v| !(0..=7).contains(&v)) {
+            if self.enable_icc
+                && self.icc_par[n][..self.nr_iid_par]
+                    .iter()
+                    .any(|&v| !(0..=7).contains(&v))
+            {
                 return Ok(false);
             }
             self.num_env += 1;
@@ -567,7 +927,8 @@ impl PsState {
 
         self.is34bands_old = self.is34bands;
         if self.enable_iid || self.enable_icc {
-            self.is34bands = (self.enable_iid && self.nr_iid_par == 34) || (self.enable_icc && self.nr_icc_par == 34);
+            self.is34bands = (self.enable_iid && self.nr_iid_par == 34)
+                || (self.enable_icc && self.nr_icc_par == 34);
         }
         if !self.enable_ipdopd {
             self.ipd_par = [[0; MAX_PAR]; MAX_ENV];
@@ -610,9 +971,15 @@ impl PsState {
             }
         }
         if is34 {
-            for (band, (filter, base)) in [(&t.f34_0_12, 0usize), (&t.f34_1_8, 12), (&t.f34_2_4, 20), (&t.f34_2_4, 24), (&t.f34_2_4, 28)]
-                .into_iter()
-                .enumerate()
+            for (band, (filter, base)) in [
+                (&t.f34_0_12, 0usize),
+                (&t.f34_1_8, 12),
+                (&t.f34_2_4, 20),
+                (&t.f34_2_4, 24),
+                (&t.f34_2_4, 28),
+            ]
+            .into_iter()
+            .enumerate()
             {
                 for n in 0..len {
                     let x = &self.in_buf[band][n..n + 13];
@@ -650,7 +1017,11 @@ impl PsState {
                         re_op += G1_Q2[j + 1] * (x[j + 1][0] + x[12 - j - 1][0]);
                         im_op += G1_Q2[j + 1] * (x[j + 1][1] + x[12 - j - 1][1]);
                     }
-                    let (a, b) = if reverse { (base + 1, base) } else { (base, base + 1) };
+                    let (a, b) = if reverse {
+                        (base + 1, base)
+                    } else {
+                        (base, base + 1)
+                    };
                     out[a][n] = [re_in + re_op, im_in + im_op];
                     out[b][n] = [re_in - re_op, im_in - im_op];
                 }
@@ -720,8 +1091,12 @@ impl PsState {
             self.peak_decay_nrg = [0.0; 34];
             self.power_smooth = [0.0; 34];
             self.peak_decay_diff_smooth = [0.0; 34];
-            self.delay.iter_mut().for_each(|d| *d = [[0.0; 2]; QMF_SLOTS + MAX_DELAY]);
-            self.ap_delay.iter_mut().for_each(|d| *d = [[[0.0; 2]; QMF_SLOTS + MAX_AP_DELAY]; AP_LINKS]);
+            self.delay
+                .iter_mut()
+                .for_each(|d| *d = [[0.0; 2]; QMF_SLOTS + MAX_DELAY]);
+            self.ap_delay
+                .iter_mut()
+                .for_each(|d| *d = [[[0.0; 2]; QMF_SLOTS + MAX_AP_DELAY]; AP_LINKS]);
         }
         let mut power = [[0f32; 32]; 34];
         for k in 0..NR_BANDS[i34] {
@@ -736,10 +1111,14 @@ impl PsState {
                 let decayed = PEAK_DECAY * self.peak_decay_nrg[i];
                 self.peak_decay_nrg[i] = decayed.max(power[i][n]);
                 self.power_smooth[i] += A_SMOOTH * (power[i][n] - self.power_smooth[i]);
-                self.peak_decay_diff_smooth[i] +=
-                    A_SMOOTH * (self.peak_decay_nrg[i] - power[i][n] - self.peak_decay_diff_smooth[i]);
+                self.peak_decay_diff_smooth[i] += A_SMOOTH
+                    * (self.peak_decay_nrg[i] - power[i][n] - self.peak_decay_diff_smooth[i]);
                 let denom = TRANSIENT_IMPACT * self.peak_decay_diff_smooth[i];
-                gain[i][n] = if denom > self.power_smooth[i] { self.power_smooth[i] / denom } else { 1.0 };
+                gain[i][n] = if denom > self.power_smooth[i] {
+                    self.power_smooth[i] / denom
+                } else {
+                    1.0
+                };
             }
         }
         for k in 0..NR_BANDS[i34] {
@@ -793,7 +1172,9 @@ impl PsState {
 // ---------------------------------------------------------------------------
 
 fn map_idx_10_to_20(out: &mut [i8; MAX_PAR], par: &[i8; MAX_PAR], full: bool) {
-    let top = if full { 9 } else {
+    let top = if full {
+        9
+    } else {
         out[10] = 0;
         4
     };
@@ -1010,8 +1391,18 @@ impl PsState {
                     self.ipd_hist[b] = (ipd_idx & 0x3f) as i8;
                     let adj_re = opd_re * ipd_re + opd_im * ipd_im;
                     let adj_im = opd_im * ipd_re - opd_re * ipd_im;
-                    let im = [hh[0] * opd_im, hh[1] * adj_im, hh[2] * opd_im, hh[3] * adj_im];
-                    hh = [hh[0] * opd_re, hh[1] * adj_re, hh[2] * opd_re, hh[3] * adj_re];
+                    let im = [
+                        hh[0] * opd_im,
+                        hh[1] * adj_im,
+                        hh[2] * opd_im,
+                        hh[3] * adj_im,
+                    ];
+                    hh = [
+                        hh[0] * opd_re,
+                        hh[1] * adj_re,
+                        hh[2] * opd_re,
+                        hh[3] * adj_re,
+                    ];
                     for (j, v) in im.into_iter().enumerate() {
                         self.h[j][1][e + 1][b] = v;
                     }
@@ -1023,16 +1414,33 @@ impl PsState {
             let start = self.border_position[e];
             let stop = self.border_position[e + 1];
             let len = (stop - start).max(0) as usize;
-            let width = 1.0f32 / if stop - start != 0 { (stop - start) as f32 } else { 1.0 };
+            let width = 1.0f32
+                / if stop - start != 0 {
+                    (stop - start) as f32
+                } else {
+                    1.0
+                };
             for k in 0..NR_BANDS[i34] {
                 let b = k_to_i[k] as usize;
-                let mut h0 = [self.h[0][0][e][b], self.h[1][0][e][b], self.h[2][0][e][b], self.h[3][0][e][b]];
+                let mut h0 = [
+                    self.h[0][0][e][b],
+                    self.h[1][0][e][b],
+                    self.h[2][0][e][b],
+                    self.h[3][0][e][b],
+                ];
                 let mut h1 = [0f32; 4];
-                let step0: [f32; 4] = std::array::from_fn(|j| (self.h[j][0][e + 1][b] - h0[j]) * width);
+                let step0: [f32; 4] =
+                    std::array::from_fn(|j| (self.h[j][0][e + 1][b] - h0[j]) * width);
                 let mut step1 = [0f32; 4];
                 if ipdopd {
                     let neg = (is34 && (9..=13).contains(&k)) || (!is34 && k <= 1);
-                    h1 = std::array::from_fn(|j| if neg { -self.h[j][1][e][b] } else { self.h[j][1][e][b] });
+                    h1 = std::array::from_fn(|j| {
+                        if neg {
+                            -self.h[j][1][e][b]
+                        } else {
+                            self.h[j][1][e][b]
+                        }
+                    });
                     step1 = std::array::from_fn(|j| (self.h[j][1][e + 1][b] - h1[j]) * width);
                 }
                 if len == 0 {
@@ -1075,7 +1483,12 @@ impl PsState {
         for d in self.delay.iter_mut().take(NR_BANDS[i34]).skip(top) {
             *d = [[0.0; 2]; QMF_SLOTS + MAX_DELAY];
         }
-        for d in self.ap_delay.iter_mut().take(NR_ALLPASS_BANDS[i34]).skip(top) {
+        for d in self
+            .ap_delay
+            .iter_mut()
+            .take(NR_ALLPASS_BANDS[i34])
+            .skip(top)
+        {
             *d = [[[0.0; 2]; QMF_SLOTS + MAX_AP_DELAY]; AP_LINKS];
         }
         let mut lbuf = vec![[[0f32; 2]; 32]; MAX_SSB];

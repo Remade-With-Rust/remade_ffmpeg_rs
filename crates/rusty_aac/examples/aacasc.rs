@@ -3,7 +3,9 @@
 static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 fn main() {
     let hex: String = std::env::args().skip(1).collect::<Vec<_>>().join("");
-    let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect();
+    let bytes: Vec<u8> = (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
     let c = rusty_aac::config::parse(&bytes).expect("parse");
     println!("{c:#?}");
     if let Some(p) = &c.pce {

@@ -23,9 +23,9 @@
 
 #![allow(dead_code)]
 
-use crate::prof::{self, Kernel, Stage};
 use crate::codebook::{Codebook, CODEBOOKS, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB};
 use crate::ics::{IcsInfo, WindowSequence};
+use crate::prof::{self, Kernel, Stage};
 use crate::swb::swb_offsets;
 use crate::tables::spectral_book;
 use crate::{AdtsHeader, AudioSpecificConfig, Error, Result};
@@ -607,7 +607,9 @@ pub(crate) fn band_tonality(spec: &[f32], swb: &[u16], nwin: usize, wlen: usize)
         for w in 0..nwin {
             let base = w * wlen;
             for k in s..e {
-                let Some(&x) = spec.get(base + k) else { continue };
+                let Some(&x) = spec.get(base + k) else {
+                    continue;
+                };
                 // Floored well below any audible coefficient so a single exact
                 // zero cannot drag the geometric mean to 0 and fake a pure tone.
                 let p = ((x as f64) * (x as f64)).max(1e-10);
@@ -627,12 +629,7 @@ pub(crate) fn band_tonality(spec: &[f32], swb: &[u16], nwin: usize, wlen: usize)
     out
 }
 
-fn perceptual_offsets(
-    spec: &[f32],
-    swb: &[u16],
-    sample_rate: u32,
-    tonality_smr: bool,
-) -> Vec<i32> {
+fn perceptual_offsets(spec: &[f32], swb: &[u16], sample_rate: u32, tonality_smr: bool) -> Vec<i32> {
     let _prof = prof::scope(Stage::EncPsy);
     let num_swb = swb.len() - 1;
     let mut energy = vec![0.0f64; num_swb];
@@ -763,12 +760,7 @@ pub(crate) fn element_plan(channels: usize) -> Option<Vec<Elem>> {
         // config 5 — 5.0: C, L/R, Ls/Rs.
         5 => vec![Elem::Sce(2), Elem::Cpe(0, 1), Elem::Cpe(3, 4)],
         // config 6 — 5.1: C, L/R, Ls/Rs, LFE.
-        6 => vec![
-            Elem::Sce(2),
-            Elem::Cpe(0, 1),
-            Elem::Cpe(4, 5),
-            Elem::Lfe(3),
-        ],
+        6 => vec![Elem::Sce(2), Elem::Cpe(0, 1), Elem::Cpe(4, 5), Elem::Lfe(3)],
         _ => return None,
     })
 }
@@ -1436,8 +1428,10 @@ fn pns_bands(
             .sum();
     }
     let total: f64 = energies.iter().sum::<f64>() + 1e-9;
-    let frame_tonality =
-        (0..num_swb).map(|i| energies[i] * tonality[i] as f64).sum::<f64>() / total;
+    let frame_tonality = (0..num_swb)
+        .map(|i| energies[i] * tonality[i] as f64)
+        .sum::<f64>()
+        / total;
 
     // **The band-level trap, measured.** A near-EMPTY band has a flat spectrum,
     // so its spectral flatness measure reads as maximally *noise-like* — SFM
@@ -1600,7 +1594,6 @@ fn encode_channel_element(
     w.write(0, 1); // gain_control_data_present
     write_spectrum(w, &quant, &cbs, swb);
 }
-
 
 // ---------------------------------------------------------------------------
 // Arm A3 (Rung 3) — Temporal Noise Shaping.
@@ -1983,7 +1976,13 @@ fn assign_sequences(transient: &[bool]) -> Vec<WindowSequence> {
 /// Cheapest codebook (and its bit cost) for one SFB across all short windows of a
 /// single group, matched to how the decoder reads it (per-SFB codebook, per-window
 /// coefficients).
-fn best_codebook_short(quant: &[i32], swb: &[u16], sfb: usize, win0: usize, nwin: usize) -> (u8, usize) {
+fn best_codebook_short(
+    quant: &[i32],
+    swb: &[u16],
+    sfb: usize,
+    win0: usize,
+    nwin: usize,
+) -> (u8, usize) {
     let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
     let wins = win0..win0 + nwin;
     let mut maxq = 0u32;
@@ -2105,7 +2104,12 @@ fn section_bits_short(cbs: &[u8]) -> usize {
 /// Quantize all eight short windows with a per-SFB scalefactor (one group; flat
 /// this brick), pick per-SFB codebooks, and return (codebooks, body bits, max_sfb,
 /// window-major quantized spectrum).
-fn code_frame_short(xp: &Xpow, swb: &[u16], sf: &[i32], groups: &[u8]) -> (Vec<u8>, usize, usize, Vec<i32>, Vec<i32>) {
+fn code_frame_short(
+    xp: &Xpow,
+    swb: &[u16],
+    sf: &[i32],
+    groups: &[u8],
+) -> (Vec<u8>, usize, usize, Vec<i32>, Vec<i32>) {
     work::bump_code_frame();
     let num_swb = swb.len() - 1;
     work::bump_quant_bands(((swb.len() - 1) * 8) as u64);
@@ -2208,7 +2212,12 @@ fn min_base_short(xp: &Xpow) -> i32 {
 /// available with one group is shaping in the *wrong domain*. Arm 1a (window
 /// grouping) is a genuine prerequisite for A1, exactly as the original plan said.
 /// Do not enable `short_block_psy` before grouping exists.
-fn perceptual_offsets_short(spec: &[f32], swb: &[u16], sample_rate: u32, tonality_smr: bool) -> Vec<i32> {
+fn perceptual_offsets_short(
+    spec: &[f32],
+    swb: &[u16],
+    sample_rate: u32,
+    tonality_smr: bool,
+) -> Vec<i32> {
     let _prof = prof::scope(Stage::EncPsy);
     let num_swb = swb.len() - 1;
     let mut energy = vec![0.0f64; num_swb];
@@ -2218,7 +2227,9 @@ fn perceptual_offsets_short(spec: &[f32], swb: &[u16], sample_rate: u32, tonalit
         for win in 0..8 {
             let base = win * SHORT_HALF;
             for k in s..e {
-                let Some(&x) = spec.get(base + k) else { continue };
+                let Some(&x) = spec.get(base + k) else {
+                    continue;
+                };
                 energy[sfb] += (x as f64) * (x as f64);
                 noise_scale[sfb] += (x.abs() as f64).sqrt();
             }
@@ -2294,7 +2305,13 @@ fn perceptual_offsets_short_grouped(
 
 /// Short-block scalefactor offsets for the configured arms: grouped psy (1a),
 /// single-group psy (A1), or flat. Returns `groups.len() × num_swb` values.
-fn short_offsets(spec: &[f32], swb: &[u16], sample_rate: u32, psy: PsyCfg, groups: &[u8]) -> Vec<i32> {
+fn short_offsets(
+    spec: &[f32],
+    swb: &[u16],
+    sample_rate: u32,
+    psy: PsyCfg,
+    groups: &[u8],
+) -> Vec<i32> {
     if psy.window_grouping {
         perceptual_offsets_short_grouped(spec, swb, sample_rate, psy.tonality_smr, groups)
     } else if psy.short_block_psy {
@@ -2315,7 +2332,13 @@ fn short_grouping(specs: &[&[f32]], psy: PsyCfg) -> Vec<u8> {
 }
 
 /// the flat-scalefactor behavior byte-identically).
-fn rate_loop_short(xp: &Xpow, swb: &[u16], offsets: &[i32], target_bits: usize, groups: &[u8]) -> i32 {
+fn rate_loop_short(
+    xp: &Xpow,
+    swb: &[u16],
+    offsets: &[i32],
+    target_bits: usize,
+    groups: &[u8],
+) -> i32 {
     let mut lo = min_base_short(xp);
     let mut hi = 255i32;
     while lo < hi {
@@ -2353,7 +2376,14 @@ fn write_sections_short(w: &mut BitWriter, cbs: &[u8]) {
 
 /// short_block spectral_data: per group, per SFB, per window of the group,
 /// coefficient tuples (the grouped-interleaved order the decoder reads).
-fn write_spectrum_short(w: &mut BitWriter, quant: &[i32], cbs: &[u8], swb: &[u16], groups: &[u8], max_sfb: usize) {
+fn write_spectrum_short(
+    w: &mut BitWriter,
+    quant: &[i32],
+    cbs: &[u8],
+    swb: &[u16],
+    groups: &[u8],
+    max_sfb: usize,
+) {
     for (g, (w0, nwin)) in group_windows(groups).enumerate() {
         for sfb in 0..max_sfb {
             let cb = cbs[g * max_sfb + sfb];
@@ -2533,7 +2563,9 @@ fn joint_max_sfb(q0: &[i32], q1: &[i32], swb: &[u16], is_short: bool) -> usize {
 fn codebooks(quant: &[i32], swb: &[u16], is_short: bool, max_sfb: usize, groups: &[u8]) -> Vec<u8> {
     if is_short {
         group_windows(groups)
-            .flat_map(|(w0, nwin)| (0..max_sfb).map(move |sfb| best_codebook_short(quant, swb, sfb, w0, nwin).0))
+            .flat_map(|(w0, nwin)| {
+                (0..max_sfb).map(move |sfb| best_codebook_short(quant, swb, sfb, w0, nwin).0)
+            })
             .collect()
     } else {
         (0..max_sfb)
@@ -2672,14 +2704,24 @@ fn joint_rate_loop(
     is_short: bool,
     groups: &[u8],
 ) -> i32 {
-    let lo0 = if is_short { min_base_short(xp0) } else { min_base(xp0, swb, off0) };
-    let lo1 = if is_short { min_base_short(xp1) } else { min_base(xp1, swb, off1) };
+    let lo0 = if is_short {
+        min_base_short(xp0)
+    } else {
+        min_base(xp0, swb, off0)
+    };
+    let lo1 = if is_short {
+        min_base_short(xp1)
+    } else {
+        min_base(xp1, swb, off1)
+    };
     let mut lo = lo0.max(lo1);
     let mut hi = 255i32;
     let mut quant = vec![0i32; xp0.len().max(xp1.len())];
     while lo < hi {
         let mid = (lo + hi) / 2;
-        if pair_body_bits(xp0, off0, xp1, off1, swb, mid, is_short, &mut quant, groups) <= target_total {
+        if pair_body_bits(xp0, off0, xp1, off1, swb, mid, is_short, &mut quant, groups)
+            <= target_total
+        {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -2812,7 +2854,11 @@ fn encode_cpe(
     };
     let is_veto: Vec<bool> = is_bands.iter().map(|b| b.is_some()).collect();
     // Both channels share the ics_info, hence one grouping decided on both.
-    let groups = if is_short { short_grouping(&[spec_l, spec_r], psy) } else { vec![1] };
+    let groups = if is_short {
+        short_grouping(&[spec_l, spec_r], psy)
+    } else {
+        vec![1]
+    };
     let (ch0, ch1, ms_full) = mid_side(spec_l, spec_r, swb, is_short, &is_veto, &groups);
     // Arm A13 ROUTING GATE.
     //
@@ -2854,7 +2900,16 @@ fn encode_cpe(
         };
         let (o0, o1) = (off(&ch0), off(&ch1));
         let (xp0, xp1) = (Xpow::new(&ch0), Xpow::new(&ch1));
-        let base = joint_rate_loop(&xp0, &o0, &xp1, &o1, swb, target_bits * 2, is_short, &groups);
+        let base = joint_rate_loop(
+            &xp0,
+            &o0,
+            &xp1,
+            &o1,
+            swb,
+            target_bits * 2,
+            is_short,
+            &groups,
+        );
         let (s0, s1) = (scalefactors(&o0, base), scalefactors(&o1, base));
         let q0 = if is_short {
             code_frame_short(&xp0, swb, &s0, &groups).3
@@ -3213,18 +3268,40 @@ impl AacEncoder {
                         let sl = analyze_short(&p0, &c0, short_win);
                         let sr_ = analyze_short(&p1, &c1, short_win);
                         encode_cpe(
-                            &mut rdb, tag, &sl, &sr_, swb_s, seq, self.sample_rate, per_channel,
-                            cur_kbd, psy,
+                            &mut rdb,
+                            tag,
+                            &sl,
+                            &sr_,
+                            swb_s,
+                            seq,
+                            self.sample_rate,
+                            per_channel,
+                            cur_kbd,
+                            psy,
                         );
                     } else {
                         let win = long_window(
-                            seq, prev_kbd, cur_kbd, &self.win, &self.win_kbd, sine_s, kbd_s,
+                            seq,
+                            prev_kbd,
+                            cur_kbd,
+                            &self.win,
+                            &self.win_kbd,
+                            sine_s,
+                            kbd_s,
                         );
                         let sl = analyze_long(&p0, &c0, &win);
                         let sr_ = analyze_long(&p1, &c1, &win);
                         encode_cpe(
-                            &mut rdb, tag, &sl, &sr_, swb, seq, self.sample_rate, per_channel,
-                            cur_kbd, psy,
+                            &mut rdb,
+                            tag,
+                            &sl,
+                            &sr_,
+                            swb,
+                            seq,
+                            self.sample_rate,
+                            per_channel,
+                            cur_kbd,
+                            psy,
                         );
                     }
                 }
@@ -3245,7 +3322,13 @@ impl AacEncoder {
                         );
                     } else {
                         let win = long_window(
-                            seq, prev_kbd, cur_kbd, &self.win, &self.win_kbd, sine_s, kbd_s,
+                            seq,
+                            prev_kbd,
+                            cur_kbd,
+                            &self.win,
+                            &self.win_kbd,
+                            sine_s,
+                            kbd_s,
                         );
                         let spec = analyze_long(&p, &c, &win);
                         encode_channel_element(
@@ -3303,7 +3386,8 @@ impl AacEncoder {
                 let pct = |v: &[f32], q: f32| -> f32 {
                     let mut s = v.to_vec();
                     s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    let i = ((s.len().saturating_sub(1)) as f32 * q.clamp(0.0, 1.0)).round() as usize;
+                    let i =
+                        ((s.len().saturating_sub(1)) as f32 * q.clamp(0.0, 1.0)).round() as usize;
                     s.get(i).copied().unwrap_or(f32::INFINITY)
                 };
                 let ton_thresh = pct(&ton, self.shape_tonality_pct);
@@ -3398,7 +3482,17 @@ impl AacEncoder {
             &plan[..],
         );
         let frame = |b: usize| {
-            self.encode_frame(b, swb, swb_s, sine_s, kbd_s, seqs, shapes, per_channel, plan)
+            self.encode_frame(
+                b,
+                swb,
+                swb_s,
+                sine_s,
+                kbd_s,
+                seqs,
+                shapes,
+                per_channel,
+                plan,
+            )
         };
 
         let nthreads = std::thread::available_parallelism()
@@ -3624,7 +3718,11 @@ mod tests {
             let spec = if seq == EightShort {
                 analyze_short(&prev, &cur, &sine_s)
             } else {
-                analyze_long(&prev, &cur, &long_window(seq, false, false, &sine_l, &kbd_l_t, &sine_s, &kbd_s_t))
+                analyze_long(
+                    &prev,
+                    &cur,
+                    &long_window(seq, false, false, &sine_l, &kbd_l_t, &sine_s, &kbd_s_t),
+                )
             };
             specs.push((seq, spec));
             prev = cur;
@@ -3941,8 +4039,26 @@ mod tests {
     #[test]
     fn quantize_simd_matches_scalar() {
         let below = |x: f64| f64::from_bits(x.to_bits() - 1);
-        let mut vals = vec![0.0f64, 0.25, 0.5, below(0.5), 1.5, below(1.5), 2.5, below(2.5), 1e-300];
-        vals.extend([8190.5, below(8190.5), 8191.0, 8191.5, 8192.0, 1e9, 4503599627370495.5]);
+        let mut vals = vec![
+            0.0f64,
+            0.25,
+            0.5,
+            below(0.5),
+            1.5,
+            below(1.5),
+            2.5,
+            below(2.5),
+            1e-300,
+        ];
+        vals.extend([
+            8190.5,
+            below(8190.5),
+            8191.0,
+            8191.5,
+            8192.0,
+            1e9,
+            4503599627370495.5,
+        ]);
         let mut seed = 0x9e37_79b9u32;
         for _ in 0..4000 {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -3964,7 +4080,13 @@ mod tests {
                 // SAFETY: AVX2 detected; all slices are `n` long.
                 unsafe { quantize_band_avx2(pow, &sign, 1.0, &mut got) };
                 for i in 0..n {
-                    assert_eq!(got[i], want[i], "avx2 v={:e} (bits {:x})", pow[i], pow[i].to_bits());
+                    assert_eq!(
+                        got[i],
+                        want[i],
+                        "avx2 v={:e} (bits {:x})",
+                        pow[i],
+                        pow[i].to_bits()
+                    );
                 }
             }
             #[cfg(feature = "simd-avx512")]
@@ -3989,14 +4111,20 @@ mod tests {
             return;
         }
         for n in [0usize, 1, 3, 4, 5, 7, 129, 1023, 1024] {
-            let spec: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.77).sin() * 3000.0) - 0.5).collect();
+            let spec: Vec<f32> = (0..n)
+                .map(|i| ((i as f32 * 0.77).sin() * 3000.0) - 0.5)
+                .collect();
             let (mut pow, mut sign) = (vec![0f64; n], vec![0i32; n]);
             // SAFETY: AVX2 detected above; the outputs are `n` long.
             unsafe { xpow_avx2(&spec, &mut pow, &mut sign) };
             for i in 0..n {
                 let s = (spec[i].abs() as f64).sqrt();
                 assert_eq!(pow[i], s * s.sqrt(), "pow[{i}] n={n}");
-                assert_eq!(sign[i], if spec[i] < 0.0 { -1 } else { 1 }, "sign[{i}] n={n}");
+                assert_eq!(
+                    sign[i],
+                    if spec[i] < 0.0 { -1 } else { 1 },
+                    "sign[{i}] n={n}"
+                );
             }
         }
     }
@@ -4165,7 +4293,10 @@ mod tests {
         }
 
         for &kbps in &[64_000u32, 128_000] {
-            let mut enc = AacEncoder::new(AacEncoderConfig { bitrate_bps: kbps, ..Default::default() });
+            let mut enc = AacEncoder::new(AacEncoderConfig {
+                bitrate_bps: kbps,
+                ..Default::default()
+            });
             enc.push_pcm(&interleaved, 1, sr).unwrap();
             let adts = encode_to_adts(&mut enc);
 
@@ -4442,8 +4573,24 @@ mod rung0 {
 
         for (a, b) in [(false, false), (false, true), (true, false), (true, true)] {
             // Frame 1 has shape `a`; frame 2 has shape `b` and sees `a` as prev.
-            let w1 = long_window(WindowSequence::OnlyLong, a, a, &sine_l, &kbd_l, &sine_s, &kbd_s);
-            let w2 = long_window(WindowSequence::OnlyLong, a, b, &sine_l, &kbd_l, &sine_s, &kbd_s);
+            let w1 = long_window(
+                WindowSequence::OnlyLong,
+                a,
+                a,
+                &sine_l,
+                &kbd_l,
+                &sine_s,
+                &kbd_s,
+            );
+            let w2 = long_window(
+                WindowSequence::OnlyLong,
+                a,
+                b,
+                &sine_l,
+                &kbd_l,
+                &sine_s,
+                &kbd_s,
+            );
             for n in 0..FRAME_LEN {
                 let sum = w1[FRAME_LEN + n] * w1[FRAME_LEN + n] + w2[n] * w2[n];
                 assert!(
@@ -4887,7 +5034,15 @@ mod rung123 {
     fn a3_tns_actually_engages() {
         let sr = 44100u32;
         let pcm = transient_signal(sr, 14);
-        let off = encode(&pcm, 1, sr, AacEncoderConfig { bitrate_bps: 128_000, ..Default::default() });
+        let off = encode(
+            &pcm,
+            1,
+            sr,
+            AacEncoderConfig {
+                bitrate_bps: 128_000,
+                ..Default::default()
+            },
+        );
         let on = encode(
             &pcm,
             1,
@@ -4905,7 +5060,6 @@ mod rung123 {
         );
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Multichannel conformance — the tests that would have caught the original bug.
@@ -5000,16 +5154,14 @@ mod multichannel {
         assert_eq!(element_plan(1).unwrap(), vec![Elem::Sce(0)]);
         assert_eq!(element_plan(2).unwrap(), vec![Elem::Cpe(0, 1)]);
         // 3.0: centre first, then the front pair.
-        assert_eq!(element_plan(3).unwrap(), vec![Elem::Sce(2), Elem::Cpe(0, 1)]);
+        assert_eq!(
+            element_plan(3).unwrap(),
+            vec![Elem::Sce(2), Elem::Cpe(0, 1)]
+        );
         // 5.1: C, L/R, Ls/Rs, LFE — with LFE taken from interleave slot 3.
         assert_eq!(
             element_plan(6).unwrap(),
-            vec![
-                Elem::Sce(2),
-                Elem::Cpe(0, 1),
-                Elem::Cpe(4, 5),
-                Elem::Lfe(3)
-            ]
+            vec![Elem::Sce(2), Elem::Cpe(0, 1), Elem::Cpe(4, 5), Elem::Lfe(3)]
         );
         // No channel_configuration exists for these.
         assert!(element_plan(0).is_none());
@@ -5104,7 +5256,14 @@ mod rung_a6 {
         let sr = 44100;
         let pcm = noise_signal(sr, 8);
         let a = encode(&pcm, sr, AacEncoderConfig::default());
-        let b = encode(&pcm, sr, AacEncoderConfig { pns: false, ..Default::default() });
+        let b = encode(
+            &pcm,
+            sr,
+            AacEncoderConfig {
+                pns: false,
+                ..Default::default()
+            },
+        );
         assert_eq!(a, b);
     }
 
@@ -5115,8 +5274,23 @@ mod rung_a6 {
     fn a6_fires_on_noise_and_round_trips() {
         let sr = 44100;
         let pcm = noise_signal(sr, 10);
-        let off = encode(&pcm, sr, AacEncoderConfig { bitrate_bps: 96_000, ..Default::default() });
-        let on = encode(&pcm, sr, AacEncoderConfig { bitrate_bps: 96_000, pns: true, ..Default::default() });
+        let off = encode(
+            &pcm,
+            sr,
+            AacEncoderConfig {
+                bitrate_bps: 96_000,
+                ..Default::default()
+            },
+        );
+        let on = encode(
+            &pcm,
+            sr,
+            AacEncoderConfig {
+                bitrate_bps: 96_000,
+                pns: true,
+                ..Default::default()
+            },
+        );
         assert_ne!(off, on, "A6 must fire on broadband noise");
 
         let mut dec = crate::decode::Decoder::new(sr);
@@ -5148,8 +5322,23 @@ mod rung_a6 {
                 0.4 * (2.0 * std::f32::consts::PI * 6000.0 * t).sin()
             })
             .collect();
-        let off = encode(&pcm, sr, AacEncoderConfig { bitrate_bps: 96_000, ..Default::default() });
-        let on = encode(&pcm, sr, AacEncoderConfig { bitrate_bps: 96_000, pns: true, ..Default::default() });
+        let off = encode(
+            &pcm,
+            sr,
+            AacEncoderConfig {
+                bitrate_bps: 96_000,
+                ..Default::default()
+            },
+        );
+        let on = encode(
+            &pcm,
+            sr,
+            AacEncoderConfig {
+                bitrate_bps: 96_000,
+                pns: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(
             off, on,
             "A6 fired on a pure 6 kHz tone - the tonality guard is not working"
@@ -5161,7 +5350,16 @@ mod rung_a6 {
     fn a6_yields_to_tns() {
         let sr = 44100;
         let pcm = noise_signal(sr, 10);
-        let both = encode(&pcm, sr, AacEncoderConfig { bitrate_bps: 128_000, pns: true, tns: true, ..Default::default() });
+        let both = encode(
+            &pcm,
+            sr,
+            AacEncoderConfig {
+                bitrate_bps: 128_000,
+                pns: true,
+                tns: true,
+                ..Default::default()
+            },
+        );
         let mut dec = crate::decode::Decoder::new(sr);
         for p in &both {
             let a = dec.decode(p, None).expect("combined stream must decode");
@@ -5207,7 +5405,14 @@ mod rung_a7 {
         let sr = 44100;
         let pcm = correlated_stereo(sr, 8, 0.7);
         let a = encode(&pcm, sr, AacEncoderConfig::default());
-        let b = encode(&pcm, sr, AacEncoderConfig { intensity: false, ..Default::default() });
+        let b = encode(
+            &pcm,
+            sr,
+            AacEncoderConfig {
+                intensity: false,
+                ..Default::default()
+            },
+        );
         assert_eq!(a, b);
     }
 
@@ -5217,8 +5422,23 @@ mod rung_a7 {
     fn a7_fires_and_round_trips() {
         let sr = 44100;
         let pcm = correlated_stereo(sr, 10, 0.7);
-        let off = encode(&pcm, sr, AacEncoderConfig { bitrate_bps: 96_000, ..Default::default() });
-        let on = encode(&pcm, sr, AacEncoderConfig { bitrate_bps: 96_000, intensity: true, ..Default::default() });
+        let off = encode(
+            &pcm,
+            sr,
+            AacEncoderConfig {
+                bitrate_bps: 96_000,
+                ..Default::default()
+            },
+        );
+        let on = encode(
+            &pcm,
+            sr,
+            AacEncoderConfig {
+                bitrate_bps: 96_000,
+                intensity: true,
+                ..Default::default()
+            },
+        );
         assert_ne!(off, on, "A7 must fire on a correlated high band");
 
         let mut dec = crate::decode::Decoder::new(sr);
@@ -5257,8 +5477,23 @@ mod rung_a7 {
             pcm.push(0.3 * (((s1 >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0));
             pcm.push(0.3 * (((s2 >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0));
         }
-        let off = encode(&pcm, sr, AacEncoderConfig { bitrate_bps: 128_000, ..Default::default() });
-        let on = encode(&pcm, sr, AacEncoderConfig { bitrate_bps: 128_000, intensity: true, ..Default::default() });
+        let off = encode(
+            &pcm,
+            sr,
+            AacEncoderConfig {
+                bitrate_bps: 128_000,
+                ..Default::default()
+            },
+        );
+        let on = encode(
+            &pcm,
+            sr,
+            AacEncoderConfig {
+                bitrate_bps: 128_000,
+                intensity: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(
             off, on,
             "A7 fired on fully decorrelated channels - the correlation gate is not working"

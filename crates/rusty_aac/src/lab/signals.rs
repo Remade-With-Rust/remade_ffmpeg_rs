@@ -184,8 +184,8 @@ impl AacSignals {
             };
 
             // --- loudness ---
-            let ms: f64 = cur.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>()
-                / FRAME_LEN as f64;
+            let ms: f64 =
+                cur.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / FRAME_LEN as f64;
             let peak = cur.iter().fold(0f32, |a, &x| a.max(x.abs()));
 
             frames.push(FrameSignals {
@@ -400,11 +400,24 @@ mod truth_table {
             assert!(s.frames.len() > 20, "{}: too few frames", c.name());
             for f in &s.frames {
                 assert!(f.attack_max.is_finite(), "{}: attack NaN", c.name());
-                assert!(f.tonality_mean.is_finite() && (0.0..=1.0).contains(&f.tonality_mean),
-                    "{}: tonality out of range: {}", c.name(), f.tonality_mean);
-                assert!(f.lpc_gain.is_finite() && f.lpc_gain >= 1.0,
-                    "{}: bad lpc_gain {}", c.name(), f.lpc_gain);
-                assert!(f.pe.is_finite() && f.pe >= 0.0, "{}: bad pe {}", c.name(), f.pe);
+                assert!(
+                    f.tonality_mean.is_finite() && (0.0..=1.0).contains(&f.tonality_mean),
+                    "{}: tonality out of range: {}",
+                    c.name(),
+                    f.tonality_mean
+                );
+                assert!(
+                    f.lpc_gain.is_finite() && f.lpc_gain >= 1.0,
+                    "{}: bad lpc_gain {}",
+                    c.name(),
+                    f.lpc_gain
+                );
+                assert!(
+                    f.pe.is_finite() && f.pe >= 0.0,
+                    "{}: bad pe {}",
+                    c.name(),
+                    f.pe
+                );
                 assert!(f.rolloff_hz.is_finite(), "{}: bad rolloff", c.name());
             }
         }
@@ -467,7 +480,10 @@ mod truth_table {
         );
         // And it must be an ABSOLUTE reading, not a normalized one: the quiet half
         // has to actually read as quiet.
-        assert!(lo < -40.0, "quiet half should read well below -40 dBFS, got {lo:.1}");
+        assert!(
+            lo < -40.0,
+            "quiet half should read well below -40 dBFS, got {lo:.1}"
+        );
     }
 
     /// **A7/A10 axis.** Inter-channel correlation must exist for stereo and mark

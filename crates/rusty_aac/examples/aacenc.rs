@@ -39,18 +39,42 @@ fn main() {
         bitrate_bps: bitrate,
         ..Default::default()
     };
-    if on("a1") { cfg.short_block_psy = true; }
-    if on("a2") { cfg.tonality_smr = true; }
-    if on("a3") { cfg.tns = true; }
-    if on("a6") { cfg.pns = true; }
-    if on("a7") { cfg.intensity = true; }
-    if on("a9") { cfg.relative_transients = true; }
-    if on("a13") { cfg.stereo_bit_split = true; }
-    if on("grp") { cfg.window_grouping = true; }
-    if on("noa9") { cfg.relative_transients = false; }
-    if on("noa13") { cfg.stereo_bit_split = false; }
-    if on("kbd") { cfg.window_shape = WindowShape::Kbd; }
-    if on("autoshape") { cfg.window_shape = WindowShape::Auto; }
+    if on("a1") {
+        cfg.short_block_psy = true;
+    }
+    if on("a2") {
+        cfg.tonality_smr = true;
+    }
+    if on("a3") {
+        cfg.tns = true;
+    }
+    if on("a6") {
+        cfg.pns = true;
+    }
+    if on("a7") {
+        cfg.intensity = true;
+    }
+    if on("a9") {
+        cfg.relative_transients = true;
+    }
+    if on("a13") {
+        cfg.stereo_bit_split = true;
+    }
+    if on("grp") {
+        cfg.window_grouping = true;
+    }
+    if on("noa9") {
+        cfg.relative_transients = false;
+    }
+    if on("noa13") {
+        cfg.stereo_bit_split = false;
+    }
+    if on("kbd") {
+        cfg.window_shape = WindowShape::Kbd;
+    }
+    if on("autoshape") {
+        cfg.window_shape = WindowShape::Auto;
+    }
 
     let w = wav::read(src).expect("read wav");
     let mut enc = AacEncoder::new(cfg);

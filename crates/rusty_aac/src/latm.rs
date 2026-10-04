@@ -26,8 +26,8 @@
 //! refused rather than mis-parsed.
 
 use crate::bits::BitReader;
-use crate::encode::BitWriter;
 use crate::config::StreamConfig;
+use crate::encode::BitWriter;
 use crate::{AacDecoder, AudioSpecificConfig, DecodedAudio, Error, Result};
 
 /// The 11-bit LOAS sync pattern.
@@ -50,9 +50,7 @@ pub struct LoasFrame {
 
 /// Does `data` start with a LOAS `audioSyncStream` header?
 pub fn is_loas(data: &[u8]) -> bool {
-    data.len() >= LOAS_HEADER_LEN
-        && data[0] == 0x56
-        && (data[1] & 0xE0) == 0xE0
+    data.len() >= LOAS_HEADER_LEN && data[0] == 0x56 && (data[1] & 0xE0) == 0xE0
 }
 
 /// Byte offset of the next LOAS syncword, for resynchronising a damaged stream.
@@ -91,7 +89,11 @@ struct MuxConfig {
 /// (the reference decoder's coverage; multiple programs/layers are refused).
 fn read_stream_mux_config(r: &mut BitReader) -> Result<MuxConfig> {
     let audio_mux_version = r.read_bool()?;
-    let version_a = if audio_mux_version { r.read_bool()? } else { false };
+    let version_a = if audio_mux_version {
+        r.read_bool()?
+    } else {
+        false
+    };
     if version_a {
         return Err(Error::unsupported("latm: audioMuxVersionA = 1 is reserved"));
     }
@@ -420,7 +422,9 @@ mod tests {
         let mut rd = LatmReader::new();
         let a = rd.parse(&first).expect("first frame");
         assert_eq!(a.au, au);
-        let b = rd.parse(&second).expect("second frame must reuse the config");
+        let b = rd
+            .parse(&second)
+            .expect("second frame must reuse the config");
         assert_eq!(b.au, au);
         assert_eq!(b.config.sample_rate, 44100);
 

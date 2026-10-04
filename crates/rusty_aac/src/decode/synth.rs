@@ -54,7 +54,12 @@ impl Windows {
 /// through the half window `win` (`2·len` samples), writing `2·len` outputs.
 #[inline]
 pub fn fmul_window(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f32], len: usize) {
-    let (dst, src0, src1, win) = (&mut dst[..2 * len], &src0[..len], &src1[..len], &win[..2 * len]);
+    let (dst, src0, src1, win) = (
+        &mut dst[..2 * len],
+        &src0[..len],
+        &src1[..len],
+        &win[..2 * len],
+    );
     // The mirrored halves defeat the auto-vectoriser (reversed writes into two
     // halves of one buffer), so the overlap window has explicit twins: SSE on
     // x86-64 (baseline, no detection) and NEON on aarch64, four samples per op
@@ -84,7 +89,14 @@ pub fn fmul_window(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f32], len
 
 /// The scalar body for outputs `t >= from` (the SIMD twins' tail).
 #[inline(always)]
-fn fmul_window_scalar(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f32], len: usize, from: usize) {
+fn fmul_window_scalar(
+    dst: &mut [f32],
+    src0: &[f32],
+    src1: &[f32],
+    win: &[f32],
+    len: usize,
+    from: usize,
+) {
     for t in from..len {
         let jj = 2 * len - 1 - t;
         let (s0, s1) = (src0[t], src1[len - 1 - t]);
@@ -108,8 +120,14 @@ unsafe fn fmul_window_sse(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f3
     while t + 4 <= len {
         let s0 = _mm_loadu_ps(s0p.add(t));
         let wi = _mm_loadu_ps(w.add(t));
-        let s1 = _mm_shuffle_ps::<0x1B>(_mm_loadu_ps(s1p.add(len - 4 - t)), _mm_loadu_ps(s1p.add(len - 4 - t)));
-        let wj = _mm_shuffle_ps::<0x1B>(_mm_loadu_ps(w.add(2 * len - 4 - t)), _mm_loadu_ps(w.add(2 * len - 4 - t)));
+        let s1 = _mm_shuffle_ps::<0x1B>(
+            _mm_loadu_ps(s1p.add(len - 4 - t)),
+            _mm_loadu_ps(s1p.add(len - 4 - t)),
+        );
+        let wj = _mm_shuffle_ps::<0x1B>(
+            _mm_loadu_ps(w.add(2 * len - 4 - t)),
+            _mm_loadu_ps(w.add(2 * len - 4 - t)),
+        );
         _mm_storeu_ps(d.add(t), _mm_sub_ps(_mm_mul_ps(s0, wj), _mm_mul_ps(s1, wi)));
         let hi = _mm_add_ps(_mm_mul_ps(s0, wi), _mm_mul_ps(s1, wj));
         _mm_storeu_ps(d.add(2 * len - 4 - t), _mm_shuffle_ps::<0x1B>(hi, hi));
@@ -171,7 +189,12 @@ mod fmul_window_twin {
             let (mut got, mut want) = (vec![0f32; 2 * len], vec![0f32; 2 * len]);
             super::fmul_window(&mut got, &src0, &src1, &win, len);
             super::fmul_window_reference(&mut want, &src0, &src1, &win, len);
-            assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "len={len}");
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "len={len}"
+            );
         }
     }
 }
@@ -211,7 +234,11 @@ pub fn imdct_and_window(
         for i in 0..8 {
             // Coefficients are laid out at a stride of 128 per window even when
             // the short transform is 120 long.
-            dsp::imdct_half(&s.coeffs[i * 128..i * 128 + sh], &mut buf[i * sh..(i + 1) * sh], OUT_NORM);
+            dsp::imdct_half(
+                &s.coeffs[i * 128..i * 128 + sh],
+                &mut buf[i * sh..(i + 1) * sh],
+                OUT_NORM,
+            );
         }
     } else {
         dsp::imdct_half(&s.coeffs[..l], &mut buf[..l], OUT_NORM);
@@ -231,7 +258,10 @@ pub fn imdct_and_window(
                 let (src0, src1) = (buf[a..a + hs].to_vec(), buf[b..b + hs].to_vec());
                 fmul_window(&mut out[ov + k * sh..], &src0, &src1, swin, hs);
             }
-            let (src0, src1) = (buf[3 * sh + hs..4 * sh].to_vec(), buf[4 * sh..4 * sh + hs].to_vec());
+            let (src0, src1) = (
+                buf[3 * sh + hs..4 * sh].to_vec(),
+                buf[4 * sh..4 * sh + hs].to_vec(),
+            );
             fmul_window(&mut temp, &src0, &src1, swin, hs);
             out[ov + 4 * sh..ov + 4 * sh + hs].copy_from_slice(&temp[..hs]);
         } else {
@@ -286,7 +316,14 @@ pub fn imdct_and_window_ld(
 /// ER AAC-ELD low-delay synthesis (frame length `n` = 512/480): an IMDCT of the
 /// shuffled spectrum, then the 4n-tap low-delay window over three frames of
 /// history. `saved` holds `3n` samples.
-pub fn imdct_and_window_eld(window: &[f32], n: usize, coeffs: &mut [f32], buf: &mut [f32], saved: &mut [f32], out: &mut [f32]) {
+pub fn imdct_and_window_eld(
+    window: &[f32],
+    n: usize,
+    coeffs: &mut [f32],
+    buf: &mut [f32],
+    saved: &mut [f32],
+    out: &mut [f32],
+) {
     let n2 = n / 2;
     let n4 = n / 4;
     let mut i = 0;
@@ -359,7 +396,15 @@ pub fn ltp_analysis(w: &Windows, s: &SynthIn, input: &mut [f32]) -> Vec<f32> {
 }
 
 /// The LTP history update after synthesis (`saved_ltp` derivation + shift).
-pub fn ltp_update(w: &Windows, seq: WindowSequence, kbd: bool, buf: &[f32], saved: &[f32], output: &[f32], ltp_state: &mut [f32]) {
+pub fn ltp_update(
+    w: &Windows,
+    seq: WindowSequence,
+    kbd: bool,
+    buf: &[f32],
+    saved: &[f32],
+    output: &[f32],
+    ltp_state: &mut [f32],
+) {
     let lwin = w.long(kbd);
     let swin = w.short(kbd);
     let mut saved_ltp = [0f32; 1024];

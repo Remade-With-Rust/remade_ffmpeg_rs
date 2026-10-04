@@ -36,7 +36,13 @@ pub fn pow43_table() -> &'static [f32] {
 #[inline(always)]
 pub fn dequant_with(t: &[f32], q: i32) -> f32 {
     match t.get(q.unsigned_abs() as usize) {
-        Some(&m) => if q < 0 { -m } else { m },
+        Some(&m) => {
+            if q < 0 {
+                -m
+            } else {
+                m
+            }
+        }
         None => dequant_formula(q),
     }
 }
@@ -358,7 +364,13 @@ impl MixedFft {
         let r = Self::radix(n);
         let m = n / r;
         for j1 in 0..r {
-            self.rec(x, off + j1 * stride, stride * r, m, &mut out[j1 * m..(j1 + 1) * m]);
+            self.rec(
+                x,
+                off + j1 * stride,
+                stride * r,
+                m,
+                &mut out[j1 * m..(j1 + 1) * m],
+            );
         }
         let step = self.n / n; // W_n^x = W_N^(x·step)
         let mut t = [(0f64, 0f64); 5];
@@ -448,7 +460,8 @@ fn dct4_plan(l: usize) -> &'static Dct4Plan {
     static PLANS: OnceLock<Mutex<HashMap<usize, &'static Dct4Plan>>> = OnceLock::new();
     let map = PLANS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
-    *g.entry(l).or_insert_with(|| Box::leak(Box::new(Dct4Plan::new(l))))
+    *g.entry(l)
+        .or_insert_with(|| Box::leak(Box::new(Dct4Plan::new(l))))
 }
 
 /// Half-length IMDCT for any even `L` with 2/3/5 factors: `L` coefficients →
@@ -495,7 +508,9 @@ impl Radix2Fft {
     pub(crate) fn new(n: usize, sign: f64) -> Radix2Fft {
         assert!(n.is_power_of_two() && n >= 2);
         let bits = n.trailing_zeros();
-        let rev = (0..n).map(|i| ((i as u32).reverse_bits() >> (32 - bits)) as u16).collect();
+        let rev = (0..n)
+            .map(|i| ((i as u32).reverse_bits() >> (32 - bits)) as u16)
+            .collect();
         let tw: Vec<[f32; 2]> = (0..n / 2)
             .map(|t| {
                 let a = sign * 2.0 * PI * t as f64 / n as f64;
@@ -699,7 +714,12 @@ impl Pow2Dct4 {
                 [ph.cos() as f32, ph.sin() as f32]
             })
             .collect();
-        Pow2Dct4 { l, pre, post, fft: Radix2Fft::new(m, -1.0) }
+        Pow2Dct4 {
+            l,
+            pre,
+            post,
+            fft: Radix2Fft::new(m, -1.0),
+        }
     }
 
     /// Pre-rotation: `v[p] = (x[2p] + i·x[L-1-2p])·e^{-iθ_p}`. Written over
@@ -710,7 +730,12 @@ impl Pow2Dct4 {
     #[inline(always)]
     fn rotate_in(&self, x: &[f32], v: &mut [[f32; 2]]) {
         let x = &x[..self.l];
-        for (((vp, a), b), &[c, s]) in v.iter_mut().zip(x.chunks_exact(2)).zip(x.rchunks_exact(2)).zip(&self.pre) {
+        for (((vp, a), b), &[c, s]) in v
+            .iter_mut()
+            .zip(x.chunks_exact(2))
+            .zip(x.rchunks_exact(2))
+            .zip(&self.pre)
+        {
             let (yr, yi) = (a[0], b[1]);
             *vp = [yr * c + yi * s, yi * c - yr * s];
         }
@@ -725,8 +750,10 @@ impl Pow2Dct4 {
         self.fft.run(v);
         // out[2q] comes from v[q]; out[2q+1] = out[L-1-2p] from v[p], p = m-1-q.
         let post = v.iter().zip(&self.post);
-        for ((o, (&[vr, vi], &[c, s])), (&[ur, ui], &[uc, us])) in
-            out[..self.l].chunks_exact_mut(2).zip(post.clone()).zip(post.rev())
+        for ((o, (&[vr, vi], &[c, s])), (&[ur, ui], &[uc, us])) in out[..self.l]
+            .chunks_exact_mut(2)
+            .zip(post.clone())
+            .zip(post.rev())
         {
             o[0] = vr * c + vi * s;
             o[1] = ur * us - ui * uc;
@@ -754,8 +781,10 @@ impl Pow2Dct4 {
         let scale = gain / self.l as f32;
         // out[2q] = -(D·X)[L-1-2q]·s from v[q]; out[2q+1] = -(D·X)[2p]·s, p = m-1-q.
         let post = v.iter().zip(&self.post);
-        for ((o, (&[vr, vi], &[c, s])), (&[ur, ui], &[uc, us])) in
-            out[..self.l].chunks_exact_mut(2).zip(post.clone()).zip(post.rev())
+        for ((o, (&[vr, vi], &[c, s])), (&[ur, ui], &[uc, us])) in out[..self.l]
+            .chunks_exact_mut(2)
+            .zip(post.clone())
+            .zip(post.rev())
         {
             o[0] = -(vr * s - vi * c) * scale;
             o[1] = -(ur * uc + ui * us) * scale;
@@ -950,10 +979,17 @@ mod tests {
     #[test]
     fn mdct_any_matches_direct() {
         for &n in &[1920usize, 240, 2048] {
-            let x: Vec<f32> = (0..n).map(|i| ((i as f64 * 0.013).sin() * 0.7) as f32).collect();
+            let x: Vec<f32> = (0..n)
+                .map(|i| ((i as f64 * 0.013).sin() * 0.7) as f32)
+                .collect();
             let (a, b) = (mdct(&x), mdct_any(&x));
             for k in 0..n / 2 {
-                assert!((a[k] - b[k]).abs() < 2e-3, "n={n} k={k}: {} vs {}", a[k], b[k]);
+                assert!(
+                    (a[k] - b[k]).abs() < 2e-3,
+                    "n={n} k={k}: {} vs {}",
+                    a[k],
+                    b[k]
+                );
             }
         }
     }
@@ -1057,7 +1093,11 @@ mod fft_twin {
                 fft.run(&mut got);
                 for k in 0..n {
                     for c in 0..2 {
-                        assert_eq!(got[k][c].to_bits(), want[k][c].to_bits(), "n={n} sign={sign} k={k}");
+                        assert_eq!(
+                            got[k][c].to_bits(),
+                            want[k][c].to_bits(),
+                            "n={n} sign={sign} k={k}"
+                        );
                     }
                 }
             }
@@ -1072,10 +1112,18 @@ mod dequant_table {
     #[test]
     fn dequant_table_matches_formula() {
         for q in -9000i32..=9000 {
-            assert_eq!(super::dequant(q).to_bits(), super::dequant_formula(q).to_bits(), "q={q}");
+            assert_eq!(
+                super::dequant(q).to_bits(),
+                super::dequant_formula(q).to_bits(),
+                "q={q}"
+            );
         }
         for q in [i32::MIN + 1, -100_000, 100_000, i32::MAX] {
-            assert_eq!(super::dequant(q).to_bits(), super::dequant_formula(q).to_bits(), "q={q}");
+            assert_eq!(
+                super::dequant(q).to_bits(),
+                super::dequant_formula(q).to_bits(),
+                "q={q}"
+            );
         }
     }
 }
@@ -1091,14 +1139,26 @@ mod dct4_twin {
         for bits in 4..=11 {
             let l = 1usize << bits;
             let plan = pow2_dct4(l).unwrap();
-            let x: Vec<f32> = (0..l).map(|i| ((i as f32 * 0.37).sin() * 12345.0) + i as f32).collect();
+            let x: Vec<f32> = (0..l)
+                .map(|i| ((i as f32 * 0.37).sin() * 12345.0) + i as f32)
+                .collect();
             let (mut got, mut want) = (vec![0f32; l], vec![0f32; l]);
             plan.dct4(&x, &mut got, &mut vec![[0f32; 2]; l / 2]);
             plan.dct4_reference(&x, &mut want);
-            assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "dct4 l={l}");
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "dct4 l={l}"
+            );
             plan.imdct_half(&x, &mut got, 0.37);
             plan.imdct_half_reference(&x, &mut want, 0.37);
-            assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "imdct_half l={l}");
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "imdct_half l={l}"
+            );
         }
     }
 }
@@ -1114,7 +1174,9 @@ mod kernel_price {
     fn kernel_price() {
         for n in [32usize, 64, 512] {
             let fft = Radix2Fft::new(n, -1.0);
-            let mut buf: Vec<[f32; 2]> = (0..n).map(|i| [(i as f32).sin(), (i as f32).cos()]).collect();
+            let mut buf: Vec<[f32; 2]> = (0..n)
+                .map(|i| [(i as f32).sin(), (i as f32).cos()])
+                .collect();
             let iters = 2_000_000 / n;
             let mut best = f64::MAX;
             for _ in 0..7 {
@@ -1127,7 +1189,10 @@ mod kernel_price {
             eprintln!("Radix2Fft::run n={n:4}: {:8.1} ns/call", best * 1e9);
         }
         for len in [64usize, 512] {
-            let (src0, src1): (Vec<f32>, Vec<f32>) = ((0..len).map(|i| i as f32).collect(), (0..len).map(|i| -(i as f32)).collect());
+            let (src0, src1): (Vec<f32>, Vec<f32>) = (
+                (0..len).map(|i| i as f32).collect(),
+                (0..len).map(|i| -(i as f32)).collect(),
+            );
             let win: Vec<f32> = (0..2 * len).map(|i| (i as f32 * 0.01).sin()).collect();
             let mut dst = vec![0f32; 2 * len];
             let iters = 4_000_000 / len;
@@ -1135,7 +1200,13 @@ mod kernel_price {
             for _ in 0..7 {
                 let t = std::time::Instant::now();
                 for _ in 0..iters {
-                    crate::decode::synth::fmul_window(std::hint::black_box(&mut dst), &src0, &src1, &win, len);
+                    crate::decode::synth::fmul_window(
+                        std::hint::black_box(&mut dst),
+                        &src0,
+                        &src1,
+                        &win,
+                        len,
+                    );
                 }
                 best = best.min(t.elapsed().as_secs_f64() / iters as f64);
             }
@@ -1154,7 +1225,10 @@ mod kernel_price {
                 }
                 best = best.min(t.elapsed().as_secs_f64() / iters as f64);
             }
-            eprintln!("Pow2Dct4::imdct_half l={l:4}: {:8.1} ns/call (incl. FFT l/2)", best * 1e9);
+            eprintln!(
+                "Pow2Dct4::imdct_half l={l:4}: {:8.1} ns/call (incl. FFT l/2)",
+                best * 1e9
+            );
         }
     }
 }

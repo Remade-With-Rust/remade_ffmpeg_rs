@@ -39,7 +39,9 @@ fn plans() -> &'static Plans {
         Plans {
             fft64: Radix2Fft::new(64, 1.0),
             dct64: pow2_dct4(64).expect("64 is a power of two"),
-            ana_pre: (0..64).map(|n| tw(PI * (2.0 * n as f64 - 0.5) / 128.0, 1.0)).collect(),
+            ana_pre: (0..64)
+                .map(|n| tw(PI * (2.0 * n as f64 - 0.5) / 128.0, 1.0))
+                .collect(),
             ana_post: (0..32).map(|k| tw(-PI * k as f64 / 128.0, 2.0)).collect(),
             ana_win: (0..320).map(|q| QMF_WINDOW[2 * (319 - q)]).collect(),
             ds_win: (0..320).map(|m| QMF_WINDOW[2 * m]).collect(),
@@ -91,7 +93,13 @@ pub(super) fn qmf_analysis(input: &[f32], hist: &mut [f32], w: &mut [[Cpx; 32]; 
 /// `s1 = DCT-IV((−1)^k·Im X)`, `v[i] = (s1[63−i] − s0[i])/64` and
 /// `v[127−i] = (s1[63−i] + s0[i])/64`. The downsampled bank is the same kernel
 /// at half rate with the upper 32 bands empty: its `v` is every other sample.
-pub(super) fn qmf_synthesis(out: &mut [f32], xs: &[[Cpx; 64]], v: &mut QmfSynthState, nts: usize, ds: bool) {
+pub(super) fn qmf_synthesis(
+    out: &mut [f32],
+    xs: &[[Cpx; 64]],
+    v: &mut QmfSynthState,
+    nts: usize,
+    ds: bool,
+) {
     let p = plans();
     let bands = if ds { 32 } else { 64 };
     let vlen = 2 * bands;
@@ -136,7 +144,10 @@ pub(super) fn qmf_synthesis(out: &mut [f32], xs: &[[Cpx; 64]], v: &mut QmfSynthS
         o.iter_mut().for_each(|x| *x = 0.0);
         for i in 0..5 {
             let (va, wa) = (&vb[2 * vlen * i..][..bands], &win[2 * bands * i..][..bands]);
-            let (vb2, wb) = (&vb[2 * vlen * i + 3 * bands..][..bands], &win[2 * bands * i + bands..][..bands]);
+            let (vb2, wb) = (
+                &vb[2 * vlen * i + 3 * bands..][..bands],
+                &win[2 * bands * i + bands..][..bands],
+            );
             for j in 0..bands {
                 o[j] += va[j] * wa[j];
                 o[j] += vb2[j] * wb[j];
@@ -156,7 +167,10 @@ pub(super) struct QmfSynthState {
 impl QmfSynthState {
     pub(super) fn new() -> QmfSynthState {
         let len = 1280 + 32 * 128;
-        QmfSynthState { buf: vec![0.0; len], off: len - 1280 }
+        QmfSynthState {
+            buf: vec![0.0; len],
+            off: len - 1280,
+        }
     }
 }
 
@@ -215,7 +229,8 @@ mod tests {
                 let mut acc = 0f64;
                 for i in 0..5 {
                     acc += v[2 * vlen * i + j] * QMF_WINDOW[step * (2 * bands * i + j)] as f64;
-                    acc += v[2 * vlen * i + 3 * bands + j] * QMF_WINDOW[step * (2 * bands * i + bands + j)] as f64;
+                    acc += v[2 * vlen * i + 3 * bands + j]
+                        * QMF_WINDOW[step * (2 * bands * i + bands + j)] as f64;
                 }
                 *o = (acc / 32768.0) as f32;
             }
@@ -258,12 +273,18 @@ mod tests {
             let (mut of, mut od) = (vec![0f32; 2048], vec![0f32; 2048]);
             qmf_synthesis(&mut of, &xs, &mut sf, 16, false);
             synthesis_direct(&mut od, &xs, &mut sd, 16, false);
-            let e = of.iter().zip(&od).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            let e = of
+                .iter()
+                .zip(&od)
+                .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
             assert!(e < 2e-5, "synthesis error {e}");
             let (mut of, mut od) = (vec![0f32; 1024], vec![0f32; 1024]);
             qmf_synthesis(&mut of, &xs, &mut dsf, 16, true);
             synthesis_direct(&mut od, &xs, &mut dsd, 16, true);
-            let e = of.iter().zip(&od).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            let e = of
+                .iter()
+                .zip(&od)
+                .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
             assert!(e < 2e-5, "downsampled synthesis error {e}");
         }
         // Subband samples are at ±32768·(window gain) scale.
@@ -299,7 +320,9 @@ mod tests {
         let peak = up[4096..].iter().fold(0f32, |a, &b| a.max(b.abs()));
         assert!((peak - 0.5).abs() < 0.01, "peak {peak}");
         // The downsampled bank reconstructs the input (delayed) near-perfectly.
-        let input: Vec<f32> = (0..6 * 1024).map(|i| (0.5 * (2.0 * PI * f * i as f64).sin()) as f32).collect();
+        let input: Vec<f32> = (0..6 * 1024)
+            .map(|i| (0.5 * (2.0 * PI * f * i as f64).sin()) as f32)
+            .collect();
         let best = (0..600)
             .map(|d| {
                 let (mut s, mut e) = (0f64, 0f64);

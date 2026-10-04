@@ -101,7 +101,13 @@ mod imp {
             .map(|i| (STAGES[i], NS[i].swap(0, Relaxed), CALLS[i].swap(0, Relaxed)))
             .collect();
         let kernels = (0..KERNELS.len())
-            .map(|i| (KERNELS[i], SIMD[i].swap(0, Relaxed), SCALAR[i].swap(0, Relaxed)))
+            .map(|i| {
+                (
+                    KERNELS[i],
+                    SIMD[i].swap(0, Relaxed),
+                    SCALAR[i].swap(0, Relaxed),
+                )
+            })
             .collect();
         (stages, kernels)
     }

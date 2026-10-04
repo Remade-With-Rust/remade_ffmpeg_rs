@@ -15,7 +15,9 @@ fn main() {
     let mut frames = Vec::new();
     let mut pos = 0;
     while pos + 7 <= data.len() {
-        let Ok(h) = parse_adts(&data[pos..]) else { break };
+        let Ok(h) = parse_adts(&data[pos..]) else {
+            break;
+        };
         let len = h.frame_length as usize;
         if len == 0 || pos + len > data.len() {
             break;

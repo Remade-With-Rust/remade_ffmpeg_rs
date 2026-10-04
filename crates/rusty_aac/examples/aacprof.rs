@@ -16,7 +16,9 @@ static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (mode, files) = args.split_first().expect("usage: aacprof enc|dec <files...>");
+    let (mode, files) = args
+        .split_first()
+        .expect("usage: aacprof enc|dec <files...>");
     let _ = prof::take();
     let t = std::time::Instant::now();
     match mode.as_str() {
@@ -24,7 +26,8 @@ fn main() {
             for f in files {
                 let w = rusty_aac::lab::wav::read(f).expect("read wav");
                 let mut enc = AacEncoder::new(AacEncoderConfig::default());
-                enc.push_pcm(&w.samples, w.channels, w.sample_rate).expect("push");
+                enc.push_pcm(&w.samples, w.channels, w.sample_rate)
+                    .expect("push");
                 enc.finish();
                 while enc.next_packet().is_ok() {}
             }
@@ -35,7 +38,9 @@ fn main() {
                 let mut dec = AacDecoder::new();
                 let mut pos = 0;
                 while pos + 7 <= data.len() {
-                    let Ok(h) = parse_adts(&data[pos..]) else { break };
+                    let Ok(h) = parse_adts(&data[pos..]) else {
+                        break;
+                    };
                     let len = h.frame_length;
                     if len == 0 || pos + len > data.len() {
                         break;
@@ -50,7 +55,10 @@ fn main() {
     let wall = t.elapsed().as_secs_f64() * 1e3;
     let (stages, kernels) = prof::take();
     let total: u64 = stages.iter().map(|s| s.1).sum();
-    println!("# {mode}: wall {wall:.1} ms, instrumented stage CPU {:.1} ms", total as f64 / 1e6);
+    println!(
+        "# {mode}: wall {wall:.1} ms, instrumented stage CPU {:.1} ms",
+        total as f64 / 1e6
+    );
     for (name, ns, calls) in stages.iter().filter(|s| s.2 > 0) {
         println!(
             "  {name:34} {:9.2} ms  {:5.1}%  {calls:>9} calls",

@@ -88,13 +88,25 @@ pub fn default_layout(cc: u8, strict_71_wide: bool) -> Option<Vec<Tag>> {
 pub fn pce_layout(p: &Pce) -> Vec<Tag> {
     let mut rows = Vec::new();
     for e in &p.front {
-        rows.push(t(if e.is_cpe { TYPE_CPE } else { TYPE_SCE }, e.tag, POS_FRONT));
+        rows.push(t(
+            if e.is_cpe { TYPE_CPE } else { TYPE_SCE },
+            e.tag,
+            POS_FRONT,
+        ));
     }
     for e in &p.side {
-        rows.push(t(if e.is_cpe { TYPE_CPE } else { TYPE_SCE }, e.tag, POS_SIDE));
+        rows.push(t(
+            if e.is_cpe { TYPE_CPE } else { TYPE_SCE },
+            e.tag,
+            POS_SIDE,
+        ));
     }
     for e in &p.back {
-        rows.push(t(if e.is_cpe { TYPE_CPE } else { TYPE_SCE }, e.tag, POS_BACK));
+        rows.push(t(
+            if e.is_cpe { TYPE_CPE } else { TYPE_SCE },
+            e.tag,
+            POS_BACK,
+        ));
     }
     for &tag in &p.lfe {
         rows.push(t(TYPE_LFE, tag, POS_LFE));
@@ -137,7 +149,11 @@ fn height_extension(c: &[u8], n: usize) -> Option<Vec<u8>> {
     for &b in &c[..1 + hbytes] {
         crc ^= b;
         for _ in 0..8 {
-            crc = if crc & 0x80 != 0 { (crc << 1) ^ 0x07 } else { crc << 1 };
+            crc = if crc & 0x80 != 0 {
+                (crc << 1) ^ 0x07
+            } else {
+                crc << 1
+            };
         }
     }
     if crc != c[1 + hbytes] {
@@ -280,7 +296,15 @@ fn count_paired_channels(map: &[Tag], pos: u8, current: usize) -> i32 {
     n
 }
 
-fn assign_pair(e2c: &mut [E2c], map: &[Tag], off: usize, left: u64, right: u64, pos: u8, layout: &mut u64) -> usize {
+fn assign_pair(
+    e2c: &mut [E2c],
+    map: &[Tag],
+    off: usize,
+    left: u64,
+    right: u64,
+    pos: u8,
+    layout: &mut u64,
+) -> usize {
     if map[off].syn_ele == TYPE_CPE {
         e2c[off] = E2c {
             av_position: left | right,
@@ -316,7 +340,14 @@ fn assign_pair(e2c: &mut [E2c], map: &[Tag], off: usize, left: u64, right: u64, 
 }
 
 /// Returns Err(()) for FFmpeg's "-1" (layout cannot be sniffed).
-fn assign_channels(e2c: &mut [E2c], map: &[Tag], layout: &mut u64, layer: usize, pos: u8, current: &mut usize) -> Result<(), ()> {
+fn assign_channels(
+    e2c: &mut [E2c],
+    map: &[Tag],
+    layout: &mut u64,
+    layer: usize,
+    pos: u8,
+    current: &mut usize,
+) -> Result<(), ()> {
     let mut i = *current;
     let mut nb = count_paired_channels(map, pos, i);
     if !(0..=5).contains(&nb) {
@@ -521,15 +552,25 @@ mod tests {
 
     #[test]
     fn config3_is_fl_fr_fc() {
-        assert_eq!(order(3), vec![(TYPE_CPE, 0, 0), (TYPE_CPE, 0, 1), (TYPE_SCE, 0, 0)]);
+        assert_eq!(
+            order(3),
+            vec![(TYPE_CPE, 0, 0), (TYPE_CPE, 0, 1), (TYPE_SCE, 0, 0)]
+        );
     }
 
     /// FATE `al22_chCfg0PCE_44`: the PCE comment `ac 04 2f` is a valid height
     /// extension (CRC 0x2f) putting the third front pair in the TOP layer.
     #[test]
     fn pce_height_extension_with_valid_crc() {
-        assert_eq!(height_extension(&[0xAC, 0x04, 0x2F], 4), Some(vec![0, 0, 1, 0]));
-        assert_eq!(height_extension(&[0xAC, 0x04, 0x2E], 4), None, "bad CRC ignored");
+        assert_eq!(
+            height_extension(&[0xAC, 0x04, 0x2F], 4),
+            Some(vec![0, 0, 1, 0])
+        );
+        assert_eq!(
+            height_extension(&[0xAC, 0x04, 0x2E], 4),
+            None,
+            "bad CRC ignored"
+        );
         assert_eq!(height_extension(b"Encoded by", 4), None);
     }
 
