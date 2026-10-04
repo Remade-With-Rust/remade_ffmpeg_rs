@@ -645,6 +645,10 @@ mod tests {
     /// `(table, cost)` as the per-table reference — across small values (the common
     /// case), escape-range values, all-zero regions, and odd region lengths.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn best_pair_table_hist_matches_ref() {
         let mut st = 0x517C_C1EFu32;
         let mut rng = || {

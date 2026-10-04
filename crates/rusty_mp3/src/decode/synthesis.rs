@@ -573,6 +573,10 @@ mod tests {
     /// many random subband inputs. A bug in the index/sign map shows up as a large
     /// error here, long before it could reach the FFmpeg-conformance check.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn fast_matrixing_matches_dense() {
         let mut st = 0x1234_9ABCu32;
         let mut rng = || {

@@ -39,15 +39,27 @@ The two obligations, and how each is discharged:
 
 `src/lab/` (the opt-in `lab` feature) mentions `unsafe` only in documentation.
 
+Outside the library: `examples/allocaudit.rs` (a dev instrument, never shipped)
+implements `GlobalAlloc` as a counting shim that forwards every call unchanged to
+the project allocator; it carries its own SAFETY comments.
+
+`cargo geiger --all-features` baseline (2026-10-04): unsafe functions 20/20,
+expressions 572/609 (each intrinsic call counts), impls 0/1 (the example's
+shim, not in the library build), zero dependencies. The count must not grow
+without a row above (H-11).
+
 ## Verification
 
 - Oracle tests run on x86_64 natively and on AArch64 under qemu
   (`tools/bench/arm_qemu_test.sh`); poisoning a NEON twin with a fused
   `vfmaq` fails all three decode oracles.
-- Miri: the library's test suite under `cargo +nightly miri test --lib`
-  (Miri reports no SIMD on its target, so it exercises the scalar twins and all
-  safe code; the intrinsic kernels are covered by the oracle tests and the
-  bounds argument above).
+- Miri: `MIRIFLAGS=-Zmiri-deterministic-floats cargo +nightly miri test --lib`
+  -> 86 passed, 0 failed, 21 ignored (18 end-to-end tests too slow to interpret,
+  3 manual profiling runs), 2026-10-04. Miri's ISA probe reports no SIMD on its
+  target (verified: `simd_available() == false` under Miri, `true` natively), so
+  it exercises the scalar twins and all safe code; the intrinsic kernels are
+  covered by the oracle tests and the bounds argument above.
+- Sanitizers on the lib suite: ASan + LeakSanitizer, TSan, MSan -- all clean.
 - Byte identity of the whole pipeline across arms: 720/720 decode hashes,
   `MP3_ISA=scalar` vs default (docs: `docs/plans/mp3-kernel-ledger.md`).
 

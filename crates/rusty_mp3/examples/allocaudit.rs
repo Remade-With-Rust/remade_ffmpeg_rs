@@ -88,12 +88,16 @@ fn tally_size(size: usize) {
 /// tallies are ours.
 struct Counting;
 
+// SAFETY: every method forwards the caller's arguments unchanged to the project
+// allocator, which upholds the `GlobalAlloc` contract; the counters are relaxed
+// atomics that never allocate, so the shim adds no obligation of its own.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         N_ALLOC.fetch_add(1, Relaxed);
         BYTES.fetch_add(l.size(), Relaxed);
         grow_live(l.size());
         tally_size(l.size());
+        // SAFETY: forwards this method's own contract unchanged (see the impl).
         unsafe { rusty_alloc_api::RustyAlloc.alloc(l) }
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
@@ -101,6 +105,7 @@ unsafe impl GlobalAlloc for Counting {
         BYTES.fetch_add(l.size(), Relaxed);
         grow_live(l.size());
         tally_size(l.size());
+        // SAFETY: forwards this method's own contract unchanged (see the impl).
         unsafe { rusty_alloc_api::RustyAlloc.alloc_zeroed(l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
@@ -112,11 +117,13 @@ unsafe impl GlobalAlloc for Counting {
         } else {
             LIVE.fetch_sub(l.size() - new, Relaxed);
         }
+        // SAFETY: forwards this method's own contract unchanged (see the impl).
         unsafe { rusty_alloc_api::RustyAlloc.realloc(p, l, new) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         N_FREE.fetch_add(1, Relaxed);
         LIVE.fetch_sub(l.size(), Relaxed);
+        // SAFETY: forwards this method's own contract unchanged (see the impl).
         unsafe { rusty_alloc_api::RustyAlloc.dealloc(p, l) }
     }
 }

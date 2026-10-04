@@ -705,6 +705,10 @@ mod profile_tests {
     /// AND actually borrow (some frame's `main_data_begin > 0`): with energy varying
     /// frame-to-frame, easy frames bank slack that demanding ones reach back into.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn reservoir_stream_is_frame_aligned_and_borrows() {
         let header = cbr_header();
         let fsize = header.frame_size();
@@ -747,6 +751,10 @@ mod profile_tests {
     /// **3R1 lookahead** — the two-pass path must emit a frame-aligned, sync-valid stream,
     /// AND at gain=0 be byte-identical to the causal path (both flat: budget = base).
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn lookahead_stream_valid_and_flat_matches_causal() {
         let header = cbr_header();
         let fsize = header.frame_size();

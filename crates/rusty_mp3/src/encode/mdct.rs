@@ -247,6 +247,10 @@ mod tests {
     /// The whole analysis front-end (L1 ∘ L2) composed with the decoder back-end:
     /// PCM → analyze → forward MDCT → IMDCT → synthesis → PCM must reconstruct.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn full_analysis_chain_reconstructs_pcm() {
         use crate::decode::synthesis;
         use crate::encode::filterbank;

@@ -777,6 +777,10 @@ mod tests {
     /// stream assembly), and in-range samples must be untouched by the input
     /// sanitizer.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn hostile_pcm_never_panics() {
         let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
         let mut rnd = move || {
@@ -829,6 +833,10 @@ mod tests {
     /// and straddle frame boundaries, including a chunk smaller than a sample
     /// frame's worth of channels. Stereo and an MPEG-2 rate (576-sample frames).
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn push_entry_points_and_chunkings_are_byte_identical() {
         fn drain(mut enc: Mp3Encoder) -> Vec<u8> {
             enc.finish();
@@ -891,6 +899,10 @@ mod tests {
     /// stream-level counterpart of the adapter's `s16_input_encodes_to_audible_output`
     /// regression (which guards the rff `af.format` byte-reinterpretation path).
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn s16_push_encodes_to_audible_output() {
         let sr = 44100u32;
         let n = sr as usize; // 1 s
@@ -976,6 +988,10 @@ mod tests {
 
     /// **R1 — stereo.** Two different tones in L and R survive independently.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn encode_decode_stereo() {
         let sr = 44100u32;
         let frames = 16;
@@ -1034,6 +1050,10 @@ mod tests {
     /// round-trips through our decoder. FFmpeg validates the band tables out of band
     /// (`MP3_ENC_DIR`); all six rates decode to >69 dB there.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn encode_decode_mpeg2() {
         let dump_dir = std::env::var("MP3_ENC_DIR").ok();
         for &sr in &[22050u32, 24000, 16000, 12000, 11025, 8000] {
@@ -1070,6 +1090,10 @@ mod tests {
     /// burst, repeating) drives the encoder into short blocks; the stream must
     /// carry window-switched frames and still reconstruct.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn block_switching_on_transients() {
         let sr = 44100u32;
         let frames = 20;
@@ -1141,6 +1165,10 @@ mod tests {
     /// encode → our decoder above a per-signal floor. With `MP3_ENC_DIR` set, the
     /// `.mp3`s are dumped for the out-of-band FFmpeg/LAME cross-check.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn conformance_corpus_round_trips() {
         let sr = 44100u32;
         let frames = 14;
@@ -1232,6 +1260,10 @@ mod tests {
     /// A threading change that merely produced "close" audio would be a silent
     /// corruption, so this compares bit patterns, not a tolerance.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn pipelined_decode_matches_serial_exactly() {
         // Encode a couple of seconds of real-ish content so the stream spans many
         // frames and exercises the reservoir across frame boundaries.
@@ -1284,6 +1316,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn vbr_ladder_is_live_conformant_and_ordered() {
         let sr = 44_100u32;
         let n = 8 * 1152;
@@ -1336,6 +1372,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn vbr_varies_bitrate_and_round_trips() {
         let sr = 44100u32;
         let pi2 = 2.0 * std::f32::consts::PI;
@@ -1405,6 +1445,10 @@ mod tests {
     /// **R1+ — mid/side joint stereo.** Correlated channels (L ≈ R, slightly
     /// panned) trigger M/S; the stream must still reconstruct L and R.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn encode_decode_joint_stereo() {
         let sr = 44100u32;
         let n = 16 * 1152;
@@ -1469,6 +1513,10 @@ mod tests {
     /// the noise floor, and the `.mp3` decodes in FFmpeg (checked out-of-band; see
     /// docs/mp3-encoder-plan.md).
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn encode_decode_pipeline_multitone() {
         let sr = 44100u32;
         let n = 16 * 1152;

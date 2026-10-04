@@ -514,6 +514,10 @@ mod tests {
     /// same number of bits — under several trailing-bit contexts (so escapes and
     /// the buffer boundary are exercised). This is the bit-exact gate for the LUT.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn lut_matches_linear_for_every_codeword() {
         fn check(book: &HuffBook) {
             for (i, &len) in book.lens.iter().enumerate() {
