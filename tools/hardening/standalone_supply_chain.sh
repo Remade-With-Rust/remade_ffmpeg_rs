@@ -28,7 +28,8 @@ trap 'rm -rf "$work"' EXIT
 ( cd "$crate_dir" && tar cf - --exclude=./target --exclude=./fuzz --exclude=./lab-results . ) | ( cd "$work" && tar xf - )
 
 # Resolve `foo.workspace = true` against the root manifest's [workspace.dependencies].
-python - "$root/Cargo.toml" "$work/Cargo.toml" <<'PY'
+PY="$(command -v python3 || command -v python)"
+"$PY" - "$root/Cargo.toml" "$work/Cargo.toml" <<'PY'
 import re, sys
 root = open(sys.argv[1], encoding="utf-8-sig").read()
 deps = {}
