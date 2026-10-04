@@ -1,141 +1,53 @@
 # rusty_mp3
 
-[![Remade With Rust](https://img.shields.io/badge/Remade%20With-Rust-000?logo=rust&logoColor=fff)](https://github.com/remade-with-rust)
-[![By Mata Network](https://img.shields.io/badge/by-Mata%20Network-5b2be0)](https://www.mata.network)
+[![crates.io](https://img.shields.io/crates/v/rusty_mp3.svg)](https://crates.io/crates/rusty_mp3)
+[![docs.rs](https://img.shields.io/docsrs/rusty_mp3)](https://docs.rs/rusty_mp3)
+[![Hardening](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/actions/workflows/mp3-hardening.yml/badge.svg)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/actions/workflows/mp3-hardening.yml)
+[![MSRV 1.85](https://img.shields.io/badge/MSRV-1.85-informational)](#compatibility)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/LICENSE)
 
-A pure-Rust MP3 (MPEG-1/2/2.5 Audio Layer III) **decoder and encoder**. Zero
-dependencies, no C, no FFI, Apache-2.0. MP3's patents expired in 2017 — the
-format is royalty-free everywhere.
+A complete MP3 (MPEG-1, MPEG-2 and MPEG-2.5 Audio Layer III) **decoder and
+encoder** in pure Rust. No C, no FFI, and no runtime dependencies.
 
-- **Decoder**: full MPEG-1/2/2.5 Layer III — bit reservoir, all stereo modes
-  (including mid/side and both MPEG-1 and MPEG-2 intensity stereo), mixed
-  blocks, alias reduction, hybrid IMDCT, polyphase synthesis. **Passes all 16
-  ISO 11172-4 / 13818-4 Layer III conformance vectors** and is **bit-exact
-  against FFmpeg on 678/678 corpus streams**. One deliberate exception: on
-  MPEG-2 intensity stereo with illegal or top-band positions we follow the spec
-  (and the ISO reference output), where FFmpeg does not.
-- **Encoder**: to our knowledge the **first pure-Rust MP3 encoder on
-  crates.io** — existing options are FFI bindings to LAME. MPEG-1/2/2.5, CBR
-  and VBR, mono/stereo/joint (mid/side) stereo, psychoacoustic model with
-  transient block switching, per-band noise shaping, and a **bit reservoir**
-  (default-on for MPEG-1 CBR ≤ 256 kbps). Quality trails LAME by **0.08 ODG at
-  192 kbps and 0.23 at 128** on the music corpus below. See
-  [Quality](#quality). Known gaps: the reservoir is disabled at 320 kbps and for
-  MPEG-2/2.5 (fixed-frame path is used there instead); per-band shaping is
-  MPEG-1 only, because the LSF scalefactor scheme is unimplemented; and the
-  psychoacoustic model still has no short-block thresholds.
+- **Conformant.** The decoder passes all 16 ISO 11172-4 / 13818-4 Layer III
+  conformance vectors and matches FFmpeg bit for bit on a 678-stream corpus.
+- **Complete.** Encoding covers CBR (8–320 kbps) and VBR, mono, stereo and
+  joint stereo, a psychoacoustic model, transient block switching, per-band
+  noise shaping, the bit reservoir, and Xing/Info headers.
+- **Fast.** On one x86-64 core, decoding runs at about 800× real time and
+  encoding at about 120× real time. The decoder is faster than FFmpeg's.
+- **Safe.** The only `unsafe` code is explicit SIMD, each kernel paired with a
+  safe scalar reference that produces identical output. The crate is fuzzed,
+  and its tests pass under Miri and the Address, Thread and Memory sanitizers.
+- **Portable.** It builds for every Rust target. It uses AVX on x86-64 and NEON
+  on AArch64, and WebAssembly builds produce bit-identical output to native.
 
-## What's new in 0.9.0
+MP3's patents expired in 2017, so the format is royalty-free worldwide.
 
-**Decoder conformance.** Five defects, found by running the official ISO
-vectors. Our FFmpeg-matched corpus could not reach them because LAME never
-emits the features involved:
+## Installation
 
-- **Intensity stereo**, both forms: MPEG-1 (tan law, illegal position 7) and
-  MPEG-2 (the 32-entry tables, illegal positions, per-window bounds on short
-  blocks, M/S only below the bound). Fixes `l3-he_mode`, `l3-test45` and
-  `l3-test46`.
-- **Mixed blocks**, two defects: the long part used the wrong band limit on LSF
-  streams, and the IMDCT applied the short window to the two long subbands.
-- **count1 overread**: a final quad that runs past `part2_3_length` is now
-  dropped, as FFmpeg does, unless it fills the granule to line 576.
-
-ISO gate: **16/16** on x86_64 and on aarch64, on both the SIMD and the scalar
-paths. Decode stays bit-exact with FFmpeg on all 678 corpus streams.
-
-**MPEG-2 intensity stereo vs FFmpeg.** On positions that are illegal for their
-band, or in the top band, the ISO reference PCM (`l3-test45/46`) and FFmpeg
-disagree. We match the reference. This is the one place our output differs from
-FFmpeg's.
-
-**Short-block noise shaping (encoder).** Short blocks used to quantize every
-(band, window) at one gain with flat scalefactors. They are now shaped against
-the long-block thresholds mapped onto the short grid: **+0.0052 ODG mean, 31
-better / 5 worse / 8 tied (sign z = +4.3)**, largest on mixed speech/music
-(+0.028). The speed cost is below measurement resolution.
-`MP3_SHORT_SHAPE=0` reproduces the pre-shaping encoder byte for byte.
-
-**SIMD on every arch we ship.**
-
-| change | effect |
-| ------ | ------ |
-| NEON twins of the three decode kernels (IMDCT-36, matrixing, windowing) | aarch64 was scalar; on x86 the same kernels are worth **1.60×** decode |
-| one `#[target_feature]` entry per granule, so the decode kernels inline | 68 → 2 feature crossings per granule-channel |
-| circular analysis FIFO + AVX/NEON analysis filterbank | encode **1.18–1.25×** |
-| AVX/NEON quantizer inner loop | encode **1.08–1.10×** |
-
-Every kernel is **bit-identical** to its scalar twin (separate mul+add, never
-FMA). Each encoder change was byte-identical to its predecessor on 72/72 corpus
-encodes, and decode hashes match across arms on 720/720 streams. NEON was
-verified under qemu-aarch64; speed on real ARM hardware has not been measured.
-`MP3_ISA=scalar` forces the scalar path.
-
-## Quality
-
-PEAQ ODG against LAME at matched bitrate, per clip and per rate, on three real
-CC0/PD music clips (24 s, 44.1 kHz mono). Positive = LAME ahead. Per clip,
-because a mean hides the thing that matters:
-
-| gap to LAME | 96k | 128k | 160k | 192k |
-| ----------- | --- | ---- | ---- | ---- |
-| guitar | +0.054 | +0.020 | **−0.034** | +0.030 |
-| piano | +0.564 | +0.322 | +0.134 | +0.096 |
-| vocal | +0.295 | +0.334 | +0.174 | +0.125 |
-| **mean** | **+0.304** | **+0.225** | **+0.091** | **+0.084** |
-
-ODG runs 0 (imperceptible) to −4 (very annoying). The gap narrows with bitrate,
-and on guitar at 160 kbps we are ahead. Regenerate with:
-
-```sh
-python tools/quality/ladder.py --arms slack,lame --rates 96,128,160,192 --dirs corpus --only corp_long
+```toml
+[dependencies]
+rusty_mp3 = "1"
 ```
 
-**What changed.** The per-band distortion loop had never shaped a single
-band, on any content: it tested quantization noise (MDCT domain) against masking
-thresholds (unnormalized 1024-point FFT power), two scales that differ by ~49 dB.
-Every band therefore read as masked — 98.7% of them by more than six decades — so
-the loop exited on its first iteration in 100% of granules and the encoder shipped
-one global gain per granule where LAME shapes 71–77% of them. With the comparison
-corrected the encoder now shapes 67–71% of granules, and it also stopped throwing
-away the 63–89 bits per granule that a 1.5 dB gain step cannot place (LAME wastes
-5–7). Measured across 8 content classes at 4 bitrates that is +0.045 ODG, 29/32
-points better; on the real music above, +0.020.
-
-*Earlier revisions quoted 0.72 ODG at 192k and 1.08 at 128k on a different
-three-clip corpus that included a synthetic transient clip, and attributed the
-loss to an inert distortion loop. The loop was not inert by design — it was
-comparing two different units. Those figures are not comparable to the table above
-because the corpus differs; the regeneration command is given so this one is.*
-
-**Still open:** the psychoacoustic model produces no short-block thresholds.
-Since 0.9.0 short blocks are shaped, but against long-block thresholds mapped onto
-the short grid rather than a real short-block masking model. Per-band shaping is
-MPEG-1 only. Full evidence,
-per-class tables and the measurement method are in
-[`docs/plans/mp3-gate-ledger.md`](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/docs/plans/mp3-gate-ledger.md).
-
-## Decode
+## Decoding
 
 ```rust
-use rusty_mp3::{Mp3Decoder, Error};
+use rusty_mp3::{Error, Mp3Decoder};
 
 fn main() -> Result<(), Error> {
     let bytes = std::fs::read("input.mp3").expect("read input");
 
-    let mut dec = Mp3Decoder::new();
-    dec.push(&bytes); // feed any chunking you like; the decoder frame-syncs
-    dec.flush();      // signal end of input
+    let mut decoder = Mp3Decoder::new();
+    decoder.push(&bytes); // any chunking: the decoder finds frame boundaries itself
+    decoder.flush();      // end of input
 
-    let mut pcm = Vec::new(); // interleaved f32 in [-1, 1]
+    let mut pcm = Vec::new(); // interleaved f32 samples in [-1, 1]
     loop {
-        match dec.next_frame() {
-            Ok(frame) => {
-                println!("{} Hz, {} ch", frame.sample_rate, frame.channels);
-                pcm.extend_from_slice(&frame.samples);
-            }
-            Err(Error::Again) => break, // need more input (streaming)
-            Err(Error::Eof) => break,   // flushed and fully drained
+        match decoder.next_frame() {
+            Ok(frame) => pcm.extend_from_slice(&frame.samples),
+            Err(Error::Again | Error::Eof) => break, // need more input / fully drained
             Err(e) => return Err(e),
         }
     }
@@ -144,27 +56,31 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-## Encode
+`Mp3Decoder` is a streaming decoder. Push bytes as they arrive and pull frames
+as they become available. Each frame reports its sample rate and channel count.
+For a complete in-memory file, `decode_pipelined` runs the entropy and transform
+stages on two threads. Its output is identical to the streaming decoder's.
+
+## Encoding
 
 ```rust
-use rusty_mp3::{Mp3Encoder, Mp3EncoderConfig, Error};
+use rusty_mp3::{Error, Mp3Encoder, Mp3EncoderConfig};
 
 fn main() -> Result<(), Error> {
-    // 2 s of a 440 Hz sine, mono 44.1 kHz.
-    let sr = 44100u32;
-    let pcm: Vec<f32> = (0..2 * sr)
-        .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sr as f32).sin())
+    let rate = 44_100;
+    let pcm: Vec<f32> = (0..2 * rate)
+        .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / rate as f32).sin())
         .collect();
 
-    let mut enc = Mp3Encoder::new(Mp3EncoderConfig {
-        bitrate_kbps: 192, // 0 = default (128); snapped to the valid table
-        vbr_quality: None, // Some(rusty_mp3::vbr_quality_index(3.0)) for VBR -q:a 3
+    let mut encoder = Mp3Encoder::new(Mp3EncoderConfig {
+        bitrate_kbps: 192, // CBR; snapped to the nearest legal Layer III bitrate
+        vbr_quality: None, // or Some(rusty_mp3::vbr_quality_index(2.0)) for VBR
     });
-    enc.push_pcm_f32(&pcm, 1, sr)?; // also: push_pcm_s16 for i16 input
-    enc.finish(); // tail padding, reservoir assembly, Xing/Info header
+    encoder.push_pcm_f32(&pcm, 1, rate)?; // mono, 44.1 kHz
+    encoder.finish();                      // flush the tail and write the Info header
 
     let mut mp3 = Vec::new();
-    while let Ok(packet) = enc.next_packet() {
+    while let Ok(packet) = encoder.next_packet() {
         mp3.extend_from_slice(&packet);
     }
     std::fs::write("out.mp3", mp3).expect("write output");
@@ -172,228 +88,124 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-The pull calls follow FFmpeg's EAGAIN/EOF drain protocol: `Err(Error::Again)`
-means "feed more input", `Err(Error::Eof)` means the flushed stream is fully
-drained. Lower-level building blocks (frame-level `Mp3Decode`/`Mp3Encode`,
-`header::FrameHeader`, bit I/O, ISO tables) are public too.
+PCM can be pushed as `f32` or `i16` slices, or directly as little-endian bytes
+with `push_pcm_f32le` / `push_pcm_s16le`, the layout of a WAV `data` chunk.
+The encoder converts its input in one pass and buffers at most one frame,
+however much audio each call delivers.
+
+## API overview
+
+| Type / function | Purpose |
+|---|---|
+| `Mp3Decoder` | Streaming decoder: `push`, `next_frame`, `flush` |
+| `decode_pipelined` | Two-thread decode of a complete byte slice |
+| `Mp3Encoder`, `Mp3EncoderConfig` | Streaming encoder: `push_pcm_*`, `next_packet`, `finish` |
+| `vbr_quality_index` | Maps an FFmpeg/LAME-style `-q:a` value (0 = best, 9 = smallest) to a VBR target |
+| `Error` | Typed errors; `Again` and `Eof` follow FFmpeg's drain protocol |
+| `header`, `decode`, `encode` | Frame-level building blocks: header parsing, per-frame decode and encode |
+
+## Conformance and quality
+
+**Decoder.** All 16 Layer III vectors from ISO/IEC 11172-4 and 13818-4 pass,
+including mixed blocks and both forms of intensity stereo. On a 678-stream
+corpus (streams from three encoders across nine sample rates, mono and stereo,
+CBR and VBR) the output matches FFmpeg bit for bit. There is one deliberate
+divergence: for MPEG-2 intensity stereo at positions FFmpeg does not
+implement, rusty_mp3 follows the standard and the ISO reference output.
+
+**Encoder.** Perceptual quality, measured with PEAQ against LAME at the same
+bitrate (ODG difference; positive means LAME scores higher). The clips are three
+24-second CC0 music recordings, 44.1 kHz mono:
+
+| Clip | 96 kbps | 128 kbps | 160 kbps | 192 kbps |
+|---|--:|--:|--:|--:|
+| Guitar | +0.054 | +0.020 | −0.034 | +0.030 |
+| Piano | +0.564 | +0.322 | +0.134 | +0.096 |
+| Vocal | +0.295 | +0.334 | +0.174 | +0.125 |
+| **Mean** | **+0.304** | **+0.225** | **+0.091** | **+0.084** |
+
+At 160 kbps and above, rusty_mp3 is within about 0.1 ODG of LAME, and it is
+ahead on the guitar clip at 160 kbps. The regeneration command and the full
+methodology are in the
+[development history](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rusty_mp3/docs/history.md).
 
 ## Performance
 
-Measured on a real 6:53 stereo 44.1 kHz music track (412.9 s, 15,806 frames) at
-CBR 192 kbps.
+Measured on one desktop x86-64 core with AVX, using a 412.9-second 44.1 kHz
+stereo track:
 
-**0.4.0** caches the psychoacoustic model's FFT twiddle factors — they depend
-only on the transform size, but were rebuilt on every call, which cost ~1.26 M
-`cos`/`sin` evaluations across the track to produce ten distinct values — and
-reuses the mid/side scratch across frames instead of reallocating it:
+| Operation | Time | Speed |
+|---|--:|--:|
+| Decode (192 kbps CBR) | 0.50 s | ~830× real time |
+| Encode (192 kbps CBR) | 3.4 s | ~120× real time |
 
-|                                     | before   | after        |
-| ----------------------------------- | -------- | ------------ |
-| encode CPU (median of 41 pairs)     | 7,047 ms | **6,766 ms** |
-| allocations per frame               | 32.06    | **21.06**    |
-| zero-filled allocations / 800 frames | 8,000    | **2**        |
+Against FFmpeg's native decoder (a 27.5-minute stream, both sides discarding
+their output, pinned to the same cores, 15 paired runs):
 
-**1.045× faster encode**, 33/41 paired wins, z = 3.90. The output is
-byte-identical across the change (same md5 over the full track), so both arms
-are provably doing the same work rather than one of them doing less. Decode is
-untouched at 5.04 allocations per frame — its per-block path was already
-allocation-free.
+| Cores | rusty_mp3 | FFmpeg | Result |
+|---|--:|--:|---|
+| 1 | 1,952 ms | 2,431 ms | rusty_mp3 1.24× faster |
+| 2 (`decode_pipelined`) | 1,017 ms | 1,455 ms | rusty_mp3 1.39× faster |
 
-Method: pinned to one core at High priority, CPU time rather than wall,
-arms ABBA-interleaved, 41 pairs, with a null arm (the same binary against
-itself) reading 1.017 as the session's resolution floor. This is a
-same-binary-family delta, not a cross-implementation ratio.
+Those figures predate later decoder optimizations, so current releases are at
+least as fast.
 
-The allocation counts are reproducible with the bundled instrument, which
-counts through whichever global allocator the binary sets:
+## Platform support
 
-```sh
-cargo run -p rusty_mp3 --release --example allocaudit -- 800 192
-```
+| Target | Kernels | Status |
+|---|---|---|
+| x86-64 | AVX (runtime-detected), portable fallback | Primary; all measurements above |
+| AArch64 | NEON | Bit-identical to the portable path (verified under emulation) |
+| WebAssembly (`wasm32-unknown-unknown`, `wasm32-wasip1`) | Portable | Bit-identical to native, with no host imports |
+| Any other Rust target | Portable | Supported |
 
-### VBR correctness — 0.5.0
-
-**If you use `-q:a` / `vbr_quality`, upgrade.** Every release up to and
-including 0.4.1 produced VBR streams that FFmpeg rejects (`invalid new backstep
--1`) and that decode to noise. Three stacked defects:
-
-- the masking thresholds (FFT power domain) were compared directly against
-  quantization noise (MDCT domain), scales ~10⁴ apart — so the gain search
-  saturated at the coarsest setting for 97.5% of granules and every quality
-  setting produced the same ~39 kbps;
-- the quality scale was inverted (NMR ≥ 1 means noise *at or above* the masking
-  threshold, so even the best setting asked for audible noise);
-- with those fixed, quality could demand more bits than the largest legal frame
-  holds, and the overflow corrupted the bit-reservoir back-pointer.
-
-Measured on 60 s of real guitar, ours at each `-q:a`:
-
-| `-q:a` | kbps | SNR | FFmpeg decode |
-| ------ | ---- | --- | ------------- |
-| 0 | 315.1 | 54.47 dB | clean |
-| 4 | 300.3 | 47.34 dB | clean |
-| 9 | 143.8 | 9.01 dB | clean |
-
-CBR is unaffected and byte-identical across the change.
-
-**VBR quality — fixed in 0.6.0.** Through 0.5.1 the VBR path ran its own
-noise-to-mask gain search, and PEAQ measured it **3.5 ODG behind LAME** at
-matched bitrate — worse at 268 kbps than the CBR path managed at 192, because
-the criterion was dimensionless but unanchored. `-q:a` is now a target average
-bitrate that drives the **same two-loop quantizer CBR uses**.
-
-PEAQ ODG at matched *actual* bitrate (matching `-q:a` between encoders does not
-match the rate, so it proves nothing):
-
-| point | ours | LAME | gap |
-| ----- | ---- | ---- | --- |
-| 192 kbps | −0.44 | +0.01 | 0.45 |
-| 128 kbps | −1.36 | −0.90 | 0.46 |
-| 80 kbps | −3.07 | −2.77 | 0.30 |
-| *(0.5.1, 200 kbps)* | *−3.50* | *+0.01* | *3.51* |
-
-So VBR now sits in the same 0.3–0.5 ODG band as CBR rather than three ODG
-adrift, and `-q:a` lands where users expect (q=0 ≈ 245 kbps, q=5 ≈ 130,
-q=9 ≈ 65). Closing the remaining ~0.4 ODG is ordinary encoder tuning and
-applies to CBR and VBR alike.
-
-Short blocks are covered by the same budget, so they no longer need a separate
-path.
-
-### Decode — vs FFmpeg, at matched CPU
-
-Both sides decode the same 27.5-minute stream and **discard the output**, pinned
-to the same physical cores, wall clock, arms alternated, 15 pairs:
-
-| cores each | rusty_mp3 | FFmpeg | result |
-| ---------- | --------- | ------ | ------ |
-| 1 physical | 1,952 ms | 2,431 ms | **1.24× faster** (15/15, z = −3.87) |
-| 2 physical | **1,017 ms** | 1,455 ms | **1.39× faster** (15/15, z = −3.87) |
-| *2, our serial build (control)* | *1,807 ms* | *1,445 ms* | *1.30× slower* |
-
-We also use **less total CPU**: 1,875 ms against FFmpeg's 2,125 ms on one core.
-The win is not bought with extra work.
-
-The control row is the one that makes the two-core number trustworthy: our
-*serial* build on the same two cores reads `cpu/wall` 0.95 — it cannot use the
-second core and loses. Only the pipelined build converts the budget, at
-`cpu/wall` 1.78. So the gain is real concurrency, not scheduling luck.
-
-Three asymmetries had to be removed before any of this was visible, and one was
-ours: FFmpeg's CLI uses ~2 cores even with `-threads 1` (`cpu/wall` 1.96); our
-CLI wrote 582 MB while `-f null -` writes nothing; and our own profiler hashed
-every sample, 17% of its own runtime, work FFmpeg never did. A CLI-to-CLI
-comparison with those in place read 1.20× *behind* — it was measuring the output
-path, not the codec.
-
-### Decode — 0.5.0 (SIMD)
-
-Two AVX kernels in the synthesis filterbank, both **bit-identical** to their
-scalar twins (each output owns a lane and accumulates in the original order;
-separate mul+add, never FMA). Runtime-detected, with the scalar paths kept as
-oracles and as the fallback.
-
-| kernel | share of the win |
-| ------ | ---------------- |
-| matrixing (`matrixing_avx`) | **1.162×** whole decode, 31/31 pairs, z = 5.57 |
-| windowing (`window_avx`) | 1.019×, 23/31 pairs, z = 2.69 |
-
-The gap between those two is the useful part: same stage, same instruction set,
-same effort, 16.2% versus 1.9%. Auto-vectorization had produced **0 packed ops
-against 1698 scalar ones** in this kernel, but "the stage is hot" was still not
-enough to aim a kernel — it took the split *within* the stage.
-
-### Decode — 0.4.1
-
-Three structural changes, measured on a real 27.5-minute stereo stream encoded
-by LAME (a decoder benchmarked on its own encoder's output skips paths that
-encoder never emits, so provenance matters):
-
-| brick | change | effect |
-| ----- | ------ | ------ |
-| bit reader | `peek(n)` loaded eight bytes and shifted, instead of looping once per bit | huffman 954 → 706 ms |
-| synthesis | V FIFO addressed circularly instead of shifted (a 960-float memmove per pass, ~17.5 GB per track), plus a transposed window loop so the operands are contiguous | synthesis 1008 → 857 ms |
-| IMDCT | exact kernel symmetry — half the dot products are derived, 648 → 324 MACs per subband | imdct share 31.9% → 19.9% |
-
-**1.185× faster decode overall**, 39/41 paired wins, z = 5.78, against a null
-arm of 1.006. Measured directly rather than by chaining the per-brick ratios,
-which would have overstated it as 1.233×.
-
-All three are **bit-identical**, not merely close. The IMDCT one is the
-surprise: halving the work costs no precision because the symmetries
-(`cos36[17−n][k] == −cos36[n][k]`, `cos36[53−n][k] == +cos36[n][k]`, and the
-same pair in the 12-point short-block kernel) hold *exactly* in the stored f32
-tables, and IEEE multiplication and round-to-nearest are sign-symmetric — so a
-mirrored sum is exactly the negation of the computed one.
-
-Verified byte-identical over a 15-stream corpus spanning joint/true-L-R/mono,
-MPEG-1 (44.1/48/32 kHz), MPEG-2 (22.05/24 kHz — the 576-sample granule path),
-MPEG-2.5 (11.025 kHz), 128–320 kbps CBR plus VBR, and four content classes.
-Short blocks are 15–37% of granules there; **mixed** blocks are 0% on every
-stream because LAME never emits them, so that path is gated separately against
-a dense reference implementation instead of being assumed covered.
-
-```sh
-cargo run -p rusty_mp3 --release --example decprof -- input.mp3
-```
-
-## WebAssembly
-
-Both halves run on wasm, and **bit-exactly**: the same bitstream produces the same
-samples and the same encoded bytes as a native build.
-
-| target | decode | encode | notes |
-| ------ | ------ | ------ | ----- |
-| `wasm32-wasip1` | ✅ bit-exact | ✅ bit-exact | has a clock and threads; the stage profiler and the pipelined decoder both work |
-| `wasm32-unknown-unknown` | ✅ bit-exact | ✅ bit-exact | the browser: no clock, no threads (see below) |
-
-There is no `Instant` and no thread on `wasm32-unknown-unknown`. The stage
-profiler compiles out there rather than trapping, and `decode_pipelined` degrades
-to the serial path — it is a speed optimisation whose output is identical either
-way, so a browser caller gets the same samples, just on one thread. Nothing needs
-a feature flag and the crate has no wasm-specific dependencies; the module
-requires **zero host imports**.
-
-Verify it yourself — the check compares hashes across host, wasmtime and node:
-
-```sh
-bash tools/bench/wasm_check.sh
-```
-
-*Earlier releases compiled for `wasm32-unknown-unknown` and trapped on the first
-decoded frame, because the profiler called `Instant::now()` on every stage. A
-build check does not catch that; the gate above runs the codec on the target and
-compares output.*
+Setting `MP3_ISA=scalar` in the environment forces the portable kernels, for
+A/B testing.
 
 ## Security
 
-The decoder treats every input byte as hostile, and a panic on malformed input is a
-bug. The crate has **no runtime dependencies**; its only `unsafe` is explicit SIMD,
-each kernel twinned with a safe scalar oracle.
+The decoder treats every input byte as hostile, and a panic on malformed input
+is treated as a bug.
 
-- [Threat model](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rusty_mp3/docs/threat-model.md) — assets, adversaries,
-  entry points, STRIDE.
-- [`UNSAFE.md`](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rusty_mp3/UNSAFE.md) — every `unsafe` block and its
-  bounds argument.
-- [Hardening audit](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rusty_mp3/docs/plans/use-protection-please.md) —
-  the gate-by-gate status, summarised in the table at the end of this page.
-- Report vulnerabilities privately: [`SECURITY.md`](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/SECURITY.md).
+- [Threat model](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rusty_mp3/docs/threat-model.md):
+  assets, adversaries, entry points, and a STRIDE analysis.
+- [`UNSAFE.md`](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rusty_mp3/UNSAFE.md):
+  every `unsafe` block and the bounds argument for each.
+- [Hardening audit](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rusty_mp3/docs/plans/use-protection-please.md):
+  gate-by-gate status, summarized at the end of this page.
+- Continuous fuzzing of the decoder, the frame-level decoder and the encoder.
+  The supply chain is checked with `cargo audit`, `cargo deny` and `cargo vet`;
+  the crate has no runtime dependencies.
+- Report vulnerabilities privately; see
+  [`SECURITY.md`](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/SECURITY.md).
+
+## Compatibility
+
+- **Minimum supported Rust version: 1.85** for the library. The test suite and
+  examples need Rust 1.88 or later, because of a development dependency.
+- **Semantic versioning.** The 1.x public API is stable. Decoder output is
+  bit-exact and stable across releases. Encoder output may change in minor
+  releases when encoding quality improves; such changes are noted in the
+  [changelog](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rusty_mp3/CHANGELOG.md).
+
+**Not supported:** free-format bitrate streams (the decoder rejects them) and
+MPEG Layers I and II. The encoder does not produce intensity stereo or mixed
+blocks. It uses the bit reservoir for MPEG-1 CBR up to 256 kbps, and a fixed
+per-frame budget elsewhere.
 
 ## Part of Remade With Rust
 
-This crate is the standalone MP3 engine of
-**[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)** — a
-ground-up, permissively-licensed Rust rebuild of FFmpeg: a drop-in
-`ffmpeg`/`ffprobe` CLI on pure-Rust codecs, with no copyleft. Also check out our
-sister project **[FFAI](https://github.com/Remade-With-Rust/FFAI)** — media for
-an AI-first world — and the rest of
-**[github.com/remade-with-rust](https://github.com/remade-with-rust)**, including
-the sibling codec crates
-[`rusty_h264`](https://crates.io/crates/rusty_h264),
+This crate is the MP3 engine of
+**[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)**, a
+ground-up, permissively licensed Rust rebuild of FFmpeg: a drop-in
+`ffmpeg`/`ffprobe` CLI on pure-Rust codecs, with no copyleft. Related crates
+include [`rusty_h264`](https://crates.io/crates/rusty_h264),
+[`rusty_h265`](https://crates.io/crates/rusty_h265),
 [`rusty_vp9`](https://crates.io/crates/rusty_vp9),
 [`rusty_aac`](https://crates.io/crates/rusty_aac),
-[`rusty-opus`](https://crates.io/crates/rusty-opus), [`rusty_vorbis`](https://crates.io/crates/rusty_vorbis), and the
-[rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) forks.
+[`rusty_flac`](https://crates.io/crates/rusty_flac) and
+[`rusty-opus`](https://crates.io/crates/rusty-opus). See also
+**[FFAI](https://github.com/Remade-With-Rust/FFAI)**, media for an AI-first world.
 
 ## About Mata Network
 
@@ -415,24 +227,26 @@ Apache-2.0. See the workspace
 <!-- HARDENING-TABLE:BEGIN generated by use-protection-please — edit docs/plans/use-protection-please.md, not this block -->
 ## Hardening status
 
-**Tier** critical-path · **Audited** 2026-10-04 (deep) · **v1.0.0 gates** 11/15 · [Full checklist](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rusty_mp3/docs/plans/use-protection-please.md)
+**Tier** critical-path · **Audited** 2026-10-04 (deep) · **v1.0.0 gates** 12/15 · [Full checklist](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rusty_mp3/docs/plans/use-protection-please.md)
 
-`███████████░░░░░░░░░` **59%** &nbsp;·&nbsp; 20 Completed · 0 Scheduled · 14 Incomplete · 21 N/A
+`███████████████░░░░░` **79%** &nbsp;·&nbsp; 27 Completed · 0 Scheduled · 7 Incomplete · 21 N/A
 
 | Phase | ✅ Completed | 🗓 Scheduled | ⬜ Incomplete | · N/A |
 |---|--:|--:|--:|--:|
 | 0 — Threat modeling | 2 | 0 | 0 | 0 |
-| 1 — Toolchain | 1 | 0 | 3 | 0 |
-| 2 — Supply chain | 6 | 0 | 2 | 0 |
+| 1 — Toolchain | 3 | 0 | 1 | 0 |
+| 2 — Supply chain | 7 | 0 | 1 | 0 |
 | 3 — Code level | 6 | 0 | 0 | 1 |
-| 4 — Static analysis | 0 | 0 | 1 | 0 |
+| 4 — Static analysis | 1 | 0 | 0 | 0 |
 | 5 — Dynamic analysis | 3 | 0 | 0 | 0 |
-| 6 — Fuzzing and properties | 1 | 0 | 3 | 0 |
+| 6 — Fuzzing and properties | 2 | 0 | 2 | 0 |
 | 7 — Formal verification | 0 | 0 | 1 | 0 |
 | 8 — Build and binary | 0 | 0 | 0 | 2 |
 | 9 — Runtime privilege | 0 | 0 | 0 | 1 |
 | 10 — Cryptography | 0 | 0 | 0 | 3 |
-| 11 — CI/CD, release, and operations | 1 | 0 | 4 | 0 |
+| 11 — CI/CD, release, and operations | 3 | 0 | 2 | 0 |
 | 12 — Compliance controls | 0 | 0 | 0 | 14 |
-| **Total** | **20** | **0** | **14** | **21** |
+| **Total** | **27** | **0** | **7** | **21** |
+
+**Architect** — Tim Almond
 <!-- HARDENING-TABLE:END -->

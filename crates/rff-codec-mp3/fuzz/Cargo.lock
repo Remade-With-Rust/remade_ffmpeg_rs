@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-mp3"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_mp3"
-version = "0.9.0"
+version = "1.0.0"
 
 [[package]]
 name = "shlex"

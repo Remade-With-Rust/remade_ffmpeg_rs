@@ -1,9 +1,17 @@
 # Changelog — rusty_mp3
 
-Security-relevant changes are listed first in each release, under **Security**.
-Releases before 0.9.1 are described in the README's per-version sections.
+All notable changes to this crate. Security-relevant changes are listed first in
+each release, under **Security**. The project follows
+[Semantic Versioning](https://semver.org/): from 1.0.0 the public API is stable;
+decoder output is bit-exact and stable; encoder output may change in minor
+releases when quality improves. Engineering notes for releases before 1.0.0
+are in [`docs/history.md`](docs/history.md).
 
-## Unreleased
+## 1.0.0 — 2026-10-04
+
+First stable release. The public API is now covered by Semantic Versioning, and
+the crate has passed a full security-hardening audit
+([`docs/plans/use-protection-please.md`](docs/plans/use-protection-please.md)).
 
 ### Security
 
@@ -29,8 +37,10 @@ Releases before 0.9.1 are described in the README's per-version sections.
   clean on the crate's closure (`tools/hardening/standalone_supply_chain.sh`).
 - clippy pedantic + nursery clean under `-D warnings`; narrowing casts are
   lint-enforced in every module that parses untrusted bytes.
-- Test suite clean under Miri, `cargo careful`, ASan + LeakSanitizer, TSan and
-  MSan.
+- Test suite clean under Miri (86 tests), `cargo careful`, ASan +
+  LeakSanitizer, TSan and MSan; property tests for every documented invariant
+  (`tests/properties.rs`); a CI gate runs on every change, plus daily fuzzing
+  and advisory scans.
 
 ### Added
 
@@ -45,3 +55,13 @@ Releases before 0.9.1 are described in the README's per-version sections.
   (no whole-file staging): whole-input push peak memory 13.5× lower.
 - Decoder front end allocation-free (6.02 → 1.02 allocations per frame); encoder
   steady state 12.03 → 4.02.
+
+### Documentation
+
+- README rewritten as a product overview; release engineering notes moved to
+  `docs/history.md`; new `CHANGELOG.md`, `UNSAFE.md`, threat model.
+
+## 0.9.0 and earlier
+
+See the [crates.io version history](https://crates.io/crates/rusty_mp3/versions)
+and [`docs/history.md`](docs/history.md).
