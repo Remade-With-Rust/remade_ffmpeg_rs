@@ -53,7 +53,7 @@ fn is_table_lsf() -> &'static [[[f32; 32]; 2]; 2] {
         for i in 0..32 {
             for (j, tj) in t.iter_mut().enumerate() {
                 let e = -((j as i32 + 1) * ((i as i32 + 1) >> 1));
-                let f = 2f64.powf(e as f64 / 4.0) as f32;
+                let f = 2f64.powf(f64::from(e) / 4.0) as f32;
                 let k = i & 1;
                 tj[k ^ 1][i] = f;
                 tj[k][i] = 1.0;
@@ -90,12 +90,12 @@ pub fn process(
     sf_right: &ScaleFactors,
     spectrum: &mut GranuleSpectrum,
 ) {
-    let (ms, intensity) = match header.channel_mode {
-        ChannelMode::JointStereo {
-            ms_stereo,
-            intensity_stereo,
-        } => (ms_stereo, intensity_stereo),
-        _ => return, // plain stereo / mono: nothing to undo
+    let ChannelMode::JointStereo {
+        ms_stereo: ms,
+        intensity_stereo: intensity,
+    } = header.channel_mode
+    else {
+        return; // plain stereo / mono: nothing to undo
     };
     let (a, b) = spectrum.lines.split_at_mut(1);
     let (l, r) = (&mut a[0], &mut b[0]);

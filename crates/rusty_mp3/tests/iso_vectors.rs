@@ -107,7 +107,7 @@ fn iso_layer3_vectors_decode_within_one_lsb() {
             .unwrap_or_else(|e| panic!("{stem}.pcm: {e}"));
         let refs: Vec<i32> = pcm
             .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
+            .map(|b| i32::from(i16::from_le_bytes([b[0], b[1]])))
             .collect();
         let (ours, ch) = decode(&bit);
         let e = max_error(&ours, &refs, ch);

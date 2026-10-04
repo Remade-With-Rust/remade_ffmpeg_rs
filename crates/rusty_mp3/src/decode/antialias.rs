@@ -35,11 +35,7 @@ pub fn reduce(gi: &GranuleSideInfo, lines: &mut [f32; GRANULE_LINES]) {
     // Subband boundaries to butterfly: none for pure short, 1 for the long part
     // of a mixed block, all 31 for long blocks.
     let boundaries = if is_short {
-        if gi.mixed_block {
-            1
-        } else {
-            0
-        }
+        usize::from(gi.mixed_block)
     } else {
         31
     };

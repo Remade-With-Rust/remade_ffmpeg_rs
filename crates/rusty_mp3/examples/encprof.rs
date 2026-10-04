@@ -30,7 +30,7 @@ fn read_wav(path: &str) -> (Vec<f32>, u32, u16) {
             let body = &d[i + 8..(i + 8 + sz).min(d.len())];
             let pcm = if bits == 16 {
                 body.chunks_exact(2)
-                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                    .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0)
                     .collect()
             } else {
                 body.chunks_exact(4)
@@ -45,6 +45,7 @@ fn read_wav(path: &str) -> (Vec<f32>, u32, u16) {
 }
 
 fn main() {
+    use std::sync::atomic::Ordering::Relaxed;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(path) = args.first() else {
         eprintln!("usage: encprof <input.wav> [kbps]");
@@ -75,13 +76,12 @@ fn main() {
     if let Some(out) = args.get(2) {
         std::fs::write(out, &mp3).expect("write output mp3");
     }
-    let secs = pcm.len() as f64 / ch.max(1) as f64 / rate as f64;
+    let secs = pcm.len() as f64 / f64::from(ch.max(1)) / f64::from(rate);
     println!(
         "{path}: {ch} ch @ {rate} Hz, {secs:.1} s -> {bytes} bytes ({:.1} kbps)",
         bytes as f64 * 8.0 / secs / 1000.0
     );
 
-    use std::sync::atomic::Ordering::Relaxed;
     let (nl, ns) = (prof::N_LONG.load(Relaxed), prof::N_SHORT.load(Relaxed));
     let (k0, ot) = (
         prof::OUTER_KEPT0.load(Relaxed),

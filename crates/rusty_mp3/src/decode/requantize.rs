@@ -21,7 +21,7 @@ use super::scalefactors::ScaleFactors;
 /// re-checking the `OnceLock` and making a call 576× per granule.
 fn pow43_table() -> &'static [f64] {
     static T: OnceLock<Vec<f64>> = OnceLock::new();
-    T.get_or_init(|| (0..8207).map(|i| (i as f64).powf(4.0 / 3.0)).collect())
+    T.get_or_init(|| (0..8207).map(|i| f64::from(i).powf(4.0 / 3.0)).collect())
 }
 
 /// Dequantize one line: `sign(c)·|c|^(4/3)·scale`. Branchless — for `c == 0`,
@@ -29,7 +29,7 @@ fn pow43_table() -> &'static [f64] {
 /// (which kept the per-line loop from vectorizing). `pow` is the hoisted table.
 #[inline]
 fn dequant(c: i32, pow: &[f64], scale: f64) -> f32 {
-    (c.signum() as f64 * pow[c.unsigned_abs() as usize] * scale) as f32
+    (f64::from(c.signum()) * pow[c.unsigned_abs() as usize] * scale) as f32
 }
 
 /// Dequantize `coeffs` into `out` (576 lines), applying gains, scalefactors, and
@@ -51,7 +51,7 @@ pub fn apply(
         "rzero invariant broken: non-zero coefficient at or above nz={nz}"
     );
     let pow = pow43_table(); // hoisted once per granule, not per line
-    let gain = gi.global_gain as i32 - 210;
+    let gain = i32::from(gi.global_gain) - 210;
     let sf_mult = if gi.scalefac_scale { 1.0f64 } else { 0.5 };
     let is_short = gi.window_switching && gi.block_type == BlockType::Short;
 
@@ -65,23 +65,7 @@ pub fn apply(
     // stage dequantized all 576 lines on every granule. On real music the rzero
     // boundary typically sits well below 576, so this also skips those bands'
     // per-band `2f64.powf(exp)` entirely.
-    if !is_short {
-        // Long block: each band scales a contiguous run of lines.
-        let off = tables::sfb_long_offsets(header.sample_rate);
-        for sfb in 0..22 {
-            let start = off[sfb] as usize;
-            if start >= nz {
-                break; // rzero: this band and every band above it is all zeros
-            }
-            let end = (off[sfb + 1] as usize).min(GRANULE_LINES).min(nz);
-            let pre = if gi.preflag { tables::PRETAB[sfb] } else { 0 } as f64;
-            let exp = 0.25 * gain as f64 - sf_mult * (sf.long[sfb] as f64 + pre);
-            let scale = 2f64.powf(exp);
-            for i in start..end {
-                out[i] = dequant(coeffs[i], pow, scale);
-            }
-        }
-    } else {
+    if is_short {
         // Short block: dequant per (band, window) and reorder into subband order.
         //
         // A MIXED block codes its lowest two subbands LONG: the first `long_end`
@@ -103,8 +87,8 @@ pub fn apply(
                     break;
                 }
                 let end = (off[sfb + 1] as usize).min(nz);
-                let pre = if gi.preflag { tables::PRETAB[sfb] } else { 0 } as f64;
-                let exp = 0.25 * gain as f64 - sf_mult * (sf.long[sfb] as f64 + pre);
+                let pre = f64::from(if gi.preflag { tables::PRETAB[sfb] } else { 0 });
+                let exp = 0.25 * f64::from(gain) - sf_mult * (f64::from(sf.long[sfb]) + pre);
                 let scale = 2f64.powf(exp);
                 for i in start..end {
                     out[i] = dequant(coeffs[i], pow, scale);
@@ -122,8 +106,8 @@ pub fn apply(
                 break; // rzero, in bitstream order
             }
             for window in 0..3 {
-                let gain_w = gain - 8 * gi.subblock_gain[window] as i32;
-                let exp = 0.25 * gain_w as f64 - sf_mult * (sf.short[window][sfb] as f64);
+                let gain_w = gain - 8 * i32::from(gi.subblock_gain[window]);
+                let exp = 0.25 * f64::from(gain_w) - sf_mult * f64::from(sf.short[window][sfb]);
                 let scale = 2f64.powf(exp);
                 for f in 0..width {
                     let src = start * 3 + window * width + f;
@@ -135,6 +119,22 @@ pub fn apply(
                         out[dst] = dequant(coeffs[src], pow, scale);
                     }
                 }
+            }
+        }
+    } else {
+        // Long block: each band scales a contiguous run of lines.
+        let off = tables::sfb_long_offsets(header.sample_rate);
+        for sfb in 0..22 {
+            let start = off[sfb] as usize;
+            if start >= nz {
+                break; // rzero: this band and every band above it is all zeros
+            }
+            let end = (off[sfb + 1] as usize).min(GRANULE_LINES).min(nz);
+            let pre = f64::from(if gi.preflag { tables::PRETAB[sfb] } else { 0 });
+            let exp = 0.25 * f64::from(gain) - sf_mult * (f64::from(sf.long[sfb]) + pre);
+            let scale = 2f64.powf(exp);
+            for i in start..end {
+                out[i] = dequant(coeffs[i], pow, scale);
             }
         }
     }

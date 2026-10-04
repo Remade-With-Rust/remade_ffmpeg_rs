@@ -181,7 +181,7 @@ unsafe fn imdct36_simd(lines: &[f32], out: &mut [f32; 24]) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
     unsafe {
-        imdct36_avx(lines, out)
+        imdct36_avx(lines, out);
     }
     #[cfg(target_arch = "aarch64")]
     // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
@@ -275,6 +275,9 @@ unsafe fn hybrid_avx(
 
 /// The hybrid IMDCT body; `simd` selects the kernel twin (callers pass a value
 /// from `use_simd()`, and on x86_64 only `hybrid_avx` passes `true`).
+// Load-bearing: the body must inline INTO the `#[target_feature]` entry so the
+// kernels inline with it (docs/plans/mp3-kernel-ledger.md, brick 4).
+#[allow(clippy::inline_always)]
 #[inline(always)]
 fn hybrid_impl(
     gi: &GranuleSideInfo,
@@ -483,7 +486,7 @@ mod tests {
             let (mut ov_a, mut ov_b) = ([0f32; GRANULE_LINES], [0f32; GRANULE_LINES]);
             for g in 0..4 {
                 let mut lines = [0f32; GRANULE_LINES];
-                for l in lines.iter_mut() {
+                for l in &mut lines {
                     *l = rng();
                 }
                 let fast = hybrid(&gi, &lines, &mut ov_a);

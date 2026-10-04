@@ -38,3 +38,56 @@ required-features = ["lab"]
 [dev-dependencies]
 # global allocator for bench/example roots (see project convention)
 rusty_alloc-api.workspace = true
+
+# Lint policy (use-protection-please H-15): clippy pedantic + nursery, with an
+# allow list where EVERY entry states why the lint conflicts with what this crate
+# is. Anything not listed here is a finding to fix, not to silence.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Codec semantics -- applying these would change output:
+# `a * b + c` -> `mul_add` is a fused multiply-add: ONE rounding where the scalar
+# oracles, the SIMD twins and the reference decoders round twice. Bit-exactness
+# (ISO 16/16, FFmpeg 678/678, SIMD == scalar) depends on NOT doing it.
+suboptimal_flops = "allow"
+imprecise_flops = "allow"
+# ISO/IEC 11172-3 and 13818-3 tables are transcribed with the standard's digits;
+# the stored value is the nearest f32 either way, and the literal stays auditable
+# against the spec.
+excessive_precision = "allow"
+unreadable_literal = "allow"
+# Exact float equality IS the contract in the oracle and bit-exactness tests.
+float_cmp = "allow"
+float_cmp_const = "allow"
+# Integer -> float conversion in DSP formulas is the intended float semantics
+# (sample counts, table indices and levels are far below 2^24).
+cast_precision_loss = "allow"
+# Spec notation: the ISO pseudo-code's single-letter names (x, y, s, k, n...)
+# and index loops are kept so the code reads against the standard; the index
+# loops are also performance-pinned (see docs/plans/mp3-kernel-ledger.md).
+many_single_char_names = "allow"
+similar_names = "allow"
+needless_range_loop = "allow"
+# Narrowing casts: the DSP and the encoder are built on values bounded by
+# construction (bit widths, clamps to MAX_LEVEL and table sizes, sample counts),
+# so these are allowed crate-wide. The modules that parse UNTRUSTED bytes --
+# header, bitio, decode::{sideinfo, scalefactors, reservoir, huffman} -- re-enable
+# all three with `#![warn(...)]` and narrow only through masked/typed helpers or
+# a statement-level allow that states the bound (H-17).
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+# API promises not adopted: making a public fn `const` is a semver commitment.
+missing_const_for_fn = "allow"
+# Style-only, nursery: long first doc paragraphs carry the measurement history
+# that justifies each design decision.
+too_long_first_doc_paragraph = "allow"
+# Style-only: the frame/granule pipelines are written top to bottom against the
+# standard's section order; splitting them to a line budget obscures that.
+too_many_lines = "allow"
+# Nursery, with known false positives: its own `--fix` produced a use-after-move
+# in this crate (2026-10-04). Clones are reviewed by hand instead.
+redundant_clone = "allow"
+# Style-only, nursery: `match`/`if let` reads more plainly than `map_or_else`
+# closures, and in the hot paths a closure can hide the branch from review.
+option_if_let_else = "allow"

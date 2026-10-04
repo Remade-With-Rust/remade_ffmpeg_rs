@@ -20,6 +20,7 @@ const SCFSI_GROUPS: [(usize, usize); 4] = [(0, 6), (6, 11), (11, 16), (16, 21)];
 /// **B5** — serialize the side-information block, the exact inverse of
 /// `decode/sideinfo.rs`. Produces exactly `header.side_info_len()` bytes (every
 /// bit of the block is a defined field, so there is no padding). MPEG-1 only.
+#[must_use]
 pub fn serialize_side_info(header: &FrameHeader, si: &SideInfo) -> Vec<u8> {
     // Exactly `side_info_len()` bytes, every time -- see the doc comment above.
     let mut w = BitWriter::with_capacity(header.side_info_len());
@@ -27,26 +28,26 @@ pub fn serialize_side_info(header: &FrameHeader, si: &SideInfo) -> Vec<u8> {
     let mpeg1 = matches!(header.version, MpegVersion::V1);
 
     if mpeg1 {
-        w.write(si.main_data_begin as u32, 9);
+        w.write(u32::from(si.main_data_begin), 9);
         w.write(0, if nch == 1 { 5 } else { 3 }); // private bits
         for ch in 0..nch {
             for band in 0..4 {
-                w.write(si.scfsi[ch][band] as u32, 1);
+                w.write(u32::from(si.scfsi[ch][band]), 1);
             }
         }
     } else {
-        w.write(si.main_data_begin as u32, 8);
+        w.write(u32::from(si.main_data_begin), 8);
         w.write(0, if nch == 1 { 1 } else { 2 });
     }
 
     for gr in 0..header.version.granules() {
         for ch in 0..nch {
             let g = &si.granules[gr][ch];
-            w.write(g.part2_3_length as u32, 12);
-            w.write(g.big_values as u32, 9);
-            w.write(g.global_gain as u32, 8);
-            w.write(g.scalefac_compress as u32, if mpeg1 { 4 } else { 9 });
-            w.write(g.window_switching as u32, 1);
+            w.write(u32::from(g.part2_3_length), 12);
+            w.write(u32::from(g.big_values), 9);
+            w.write(u32::from(g.global_gain), 8);
+            w.write(u32::from(g.scalefac_compress), if mpeg1 { 4 } else { 9 });
+            w.write(u32::from(g.window_switching), 1);
             if g.window_switching {
                 let bt = match g.block_type {
                     BlockType::Start => 1,
@@ -56,25 +57,25 @@ pub fn serialize_side_info(header: &FrameHeader, si: &SideInfo) -> Vec<u8> {
                     BlockType::Long => 0,
                 };
                 w.write(bt, 2);
-                w.write(g.mixed_block as u32, 1);
+                w.write(u32::from(g.mixed_block), 1);
                 for t in g.table_select.iter().take(2) {
-                    w.write(*t as u32, 5);
+                    w.write(u32::from(*t), 5);
                 }
                 for sg in &g.subblock_gain {
-                    w.write(*sg as u32, 3);
+                    w.write(u32::from(*sg), 3);
                 }
             } else {
                 for t in &g.table_select {
-                    w.write(*t as u32, 5);
+                    w.write(u32::from(*t), 5);
                 }
-                w.write(g.region0_count as u32, 4);
-                w.write(g.region1_count as u32, 3);
+                w.write(u32::from(g.region0_count), 4);
+                w.write(u32::from(g.region1_count), 3);
             }
             if mpeg1 {
-                w.write(g.preflag as u32, 1);
+                w.write(u32::from(g.preflag), 1);
             }
-            w.write(g.scalefac_scale as u32, 1);
-            w.write(g.count1table_select as u32, 1);
+            w.write(u32::from(g.scalefac_scale), 1);
+            w.write(u32::from(g.count1table_select), 1);
         }
     }
     w.finish()
@@ -98,13 +99,13 @@ pub fn serialize_scalefactors(
     }
     let gi = &si.granules[gr][ch];
     let (slen1, slen2) = tables::SCALEFAC_COMPRESS_V1[gi.scalefac_compress as usize & 0xF];
-    let (s1, s2) = (slen1 as u32, slen2 as u32);
+    let (s1, s2) = (u32::from(slen1), u32::from(slen2));
 
     if gi.window_switching && gi.block_type == BlockType::Short {
         // Band-major: for each sfb, its three windows (the decode-side gotcha).
         let start = if gi.mixed_block {
             for b in 0..8 {
-                w.write(sf.long[b] as u32, s1);
+                w.write(u32::from(sf.long[b]), s1);
             }
             3
         } else {
@@ -113,7 +114,7 @@ pub fn serialize_scalefactors(
         for sfb in start..12 {
             let slen = if sfb < 6 { s1 } else { s2 };
             for window in 0..3 {
-                w.write(sf.short[window][sfb] as u32, slen);
+                w.write(u32::from(sf.short[window][sfb]), slen);
             }
         }
     } else {
@@ -124,7 +125,7 @@ pub fn serialize_scalefactors(
                 if gr == 1 && si.scfsi[ch][g] {
                     continue;
                 }
-                w.write(sf.long[b] as u32, slen);
+                w.write(u32::from(sf.long[b]), slen);
             }
         }
     }
@@ -139,6 +140,7 @@ pub fn serialize_scalefactors(
 ///
 /// `frame_count` and `byte_count` describe the whole file *including* this frame.
 /// `vbr` selects the `Xing` tag (variable bitrate) over `Info` (constant).
+#[must_use]
 pub fn info_frame(header: &FrameHeader, frame_count: u32, byte_count: u32, vbr: bool) -> Vec<u8> {
     let mut out = header.to_bytes().to_vec();
     if header.crc_protected {
@@ -159,8 +161,9 @@ pub fn info_frame(header: &FrameHeader, frame_count: u32, byte_count: u32, vbr: 
 
 /// Smallest MPEG-1 bitrate (kbps) whose frame can hold `main_data_bytes`, capped
 /// at 320. Lets VBR size each frame to its content.
+#[must_use]
 pub fn smallest_bitrate_for(header: &FrameHeader, main_data_bytes: usize) -> u32 {
-    for &br in tables::BITRATE_V1_L3[1..15].iter() {
+    for &br in &tables::BITRATE_V1_L3[1..15] {
         let mut h = header.clone();
         h.bitrate_kbps = br;
         if region_capacity(&h) >= main_data_bytes {
@@ -180,6 +183,7 @@ pub struct EncReservoir {
 }
 
 /// Physical main-data capacity of a frame (bytes after header/CRC/side-info).
+#[must_use]
 pub fn region_capacity(header: &FrameHeader) -> usize {
     let crc = if header.crc_protected { 2 } else { 0 };
     header
@@ -202,7 +206,7 @@ fn crc16(header_tail: [u8; 2], side_info: &[u8]) -> u16 {
     let mut crc = 0xFFFFu16;
     for &byte in header_tail.iter().chain(side_info) {
         for i in (0..8).rev() {
-            let bit = ((byte >> i) & 1) as u16;
+            let bit = u16::from((byte >> i) & 1);
             let msb = crc >> 15;
             crc <<= 1;
             if (msb ^ bit) & 1 == 1 {
@@ -258,6 +262,7 @@ pub fn format(
 /// Each item is `(header, side_info, main_data)`; `side_info.main_data_begin` is
 /// overwritten. Requires the cumulative data never to outrun cumulative capacity
 /// (the rate loop's job) and `main_data_begin ≤ 511`.
+#[must_use]
 pub fn assemble_stream(frames: &[(FrameHeader, SideInfo, Vec<u8>)]) -> Vec<u8> {
     let (md, begins, caps) = reservoir_layout(frames);
     let mut out = Vec::with_capacity(frames.iter().map(|(h, _, _)| h.frame_size()).sum());
@@ -337,18 +342,17 @@ fn reservoir_layout(
         if p > md.len() + MAX_BEGIN {
             md.resize(p - MAX_BEGIN, 0); // stuffing → begin == MAX_BEGIN
         }
-        let begin = match p.checked_sub(md.len()) {
-            Some(begin) => begin,
+        let begin = if let Some(begin) = p.checked_sub(md.len()) {
+            begin
+        } else {
             // The banked data outran the capacity behind it. The rate loop does
             // not let that happen for any input the push boundary admits
             // (finite, |x| <= MAX_INPUT_AMPLITUDE: measured clean up to 4096x
             // full scale, i.e. a 512x margin). This used to `expect` -- a panic
             // reachable from hostile PCM. If it ever happens, drop the overflow
             // instead: the preceding frame is damaged, the stream stays valid.
-            None => {
-                md.truncate(p);
-                0
-            }
+            md.truncate(p);
+            0
         };
         begins.push(begin);
         md.extend_from_slice(data);

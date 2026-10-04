@@ -6,6 +6,7 @@
 //! means it can't silently drift from the build the way a separate doc would.
 
 use core::fmt;
+use std::fmt::Write as _;
 
 /// Which floor of the house a brick belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,14 +26,15 @@ pub enum Phase {
 }
 
 impl Phase {
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Phase::Foundation => "Foundation",
-            Phase::Analysis => "Analysis",
-            Phase::Coding => "Coding",
-            Phase::Controller => "Controller",
-            Phase::Quality => "Quality",
-            Phase::Roof => "Roof",
+            Self::Foundation => "Foundation",
+            Self::Analysis => "Analysis",
+            Self::Coding => "Coding",
+            Self::Controller => "Controller",
+            Self::Quality => "Quality",
+            Self::Roof => "Roof",
         }
     }
 }
@@ -53,13 +55,14 @@ pub enum Class {
 }
 
 impl Class {
+    #[must_use]
     pub fn tag(self) -> &'static str {
         match self {
-            Class::Gen => "[GEN]",
-            Class::Tbl => "[TBL]",
-            Class::Alg => "[ALG]",
-            Class::Glue => "[GLUE]",
-            Class::Done => "[done]",
+            Self::Gen => "[GEN]",
+            Self::Tbl => "[TBL]",
+            Self::Alg => "[ALG]",
+            Self::Glue => "[GLUE]",
+            Self::Done => "[done]",
         }
     }
 }
@@ -82,21 +85,23 @@ pub enum Verify {
 }
 
 impl Verify {
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Verify::Reuse => "reuse",
-            Verify::RoundTrip => "round-trip",
-            Verify::Tdac => "tdac",
-            Verify::Reference => "reference",
-            Verify::External => "external",
-            Verify::Metric => "metric",
+            Self::Reuse => "reuse",
+            Self::RoundTrip => "round-trip",
+            Self::Tdac => "tdac",
+            Self::Reference => "reference",
+            Self::External => "external",
+            Self::Metric => "metric",
         }
     }
 
     /// True for the deterministic, provable bricks; false for the experimental
     /// quality bricks where there is no single right answer.
+    #[must_use]
     pub fn is_conformance(self) -> bool {
-        !matches!(self, Verify::Metric)
+        !matches!(self, Self::Metric)
     }
 }
 
@@ -114,20 +119,22 @@ pub enum Status {
 }
 
 impl Status {
+    #[must_use]
     pub fn symbol(self) -> &'static str {
         match self {
-            Status::Todo => "·",
-            Status::Stub => "◐",
-            Status::Impl => "●",
-            Status::Verified => "✓",
+            Self::Todo => "·",
+            Self::Stub => "◐",
+            Self::Impl => "●",
+            Self::Verified => "✓",
         }
     }
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Status::Todo => "todo",
-            Status::Stub => "stub",
-            Status::Impl => "impl",
-            Status::Verified => "verified",
+            Self::Todo => "todo",
+            Self::Stub => "stub",
+            Self::Impl => "impl",
+            Self::Verified => "verified",
         }
     }
 }
@@ -150,11 +157,12 @@ pub enum Accel {
 }
 
 impl Accel {
+    #[must_use]
     pub fn tag(self) -> &'static str {
         match self {
-            Accel::Scalar => "safe",
-            Accel::Hybrid => "hybrid",
-            Accel::Simd => "SIMD",
+            Self::Scalar => "safe",
+            Self::Hybrid => "hybrid",
+            Self::Simd => "SIMD",
         }
     }
 }
@@ -167,6 +175,7 @@ impl Accel {
 ///   of thousands of MACs per granule and are the classic asm hotspots in LAME.
 /// * **Hybrid** — `C2`/`Q6` (the rate/distortion loops: iterative + serial, but
 ///   their per-call requantize vectorises) and `R1` (per-line M/S stereo).
+#[must_use]
 pub fn accel(id: &str) -> Accel {
     match id {
         "L1" | "L2" | "Q2" => Accel::Simd,
@@ -516,11 +525,13 @@ const fn b(
 }
 
 /// Look up a brick by its id (`"N4"`).
+#[must_use]
 pub fn by_id(id: &str) -> Option<&'static Brick> {
     BRICKS.iter().find(|b| b.id.eq_ignore_ascii_case(id))
 }
 
 /// `[todo, stub, impl, verified]` counts.
+#[must_use]
 pub fn counts() -> [usize; 4] {
     let mut c = [0usize; 4];
     for brick in BRICKS {
@@ -535,6 +546,7 @@ pub fn counts() -> [usize; 4] {
 }
 
 /// The next brick to lay: first one in execution order not yet built.
+#[must_use]
 pub fn next_unbuilt() -> Option<&'static Brick> {
     BRICKS
         .iter()
@@ -542,30 +554,33 @@ pub fn next_unbuilt() -> Option<&'static Brick> {
 }
 
 /// Render the whole manifest as a status table (used by the `mp3lab` CLI).
+#[must_use]
 pub fn table() -> String {
     let mut s = String::new();
     let mut last = None;
     for brick in BRICKS {
         if last != Some(brick.phase) {
-            s.push_str(&format!("\n── {} ──\n", brick.phase.name()));
+            let _ = write!(s, "\n── {} ──\n", brick.phase.name());
             last = Some(brick.phase);
         }
-        s.push_str(&format!("{brick}\n"));
+        let _ = writeln!(s, "{brick}");
     }
     let [todo, stub, imp, ver] = counts();
-    s.push_str(&format!(
+    let _ = write!(
+        s,
         "\n{} bricks — {ver} verified ✓ · {imp} impl ● · {stub} stub ◐ · {todo} todo ·\n",
         BRICKS.len()
-    ));
+    );
     let simd = BRICKS.iter().filter(|b| accel(b.id) == Accel::Simd).count();
     let hybrid = BRICKS
         .iter()
         .filter(|b| accel(b.id) == Accel::Hybrid)
         .count();
-    s.push_str(&format!(
-        "accel — {simd} SIMD · {hybrid} hybrid · {} safe scalar Rust\n",
+    let _ = writeln!(
+        s,
+        "accel — {simd} SIMD · {hybrid} hybrid · {} safe scalar Rust",
         BRICKS.len() - simd - hybrid
-    ));
+    );
     s
 }
 

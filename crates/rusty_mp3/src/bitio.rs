@@ -4,6 +4,14 @@
 //! most-significant-bit-first, decoupled from frame boundaries by the bit
 //! reservoir — so the reader operates over a reassembled buffer, not a raw frame.
 
+// Parses untrusted bytes: narrowing casts are lint-enforced here (see the crate
+// lint policy in Cargo.toml) -- every one is masked, typed, or states its bound.
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 /// Most-significant-bit-first reader. Tracks a bit position so the Huffman and
 /// scalefactor stages can be byte-misaligned freely.
 pub struct BitReader<'a> {
@@ -13,11 +21,13 @@ pub struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
-    pub fn new(data: &'a [u8]) -> BitReader<'a> {
+    #[must_use]
+    pub fn new(data: &'a [u8]) -> Self {
         BitReader { data, pos: 0 }
     }
 
     /// Current bit position (used to enforce `part2_3_length` boundaries).
+    #[must_use]
     pub fn bit_pos(&self) -> usize {
         self.pos
     }
@@ -35,6 +45,20 @@ impl<'a> BitReader<'a> {
         v
     }
 
+    /// [`read`](Self::read) a field of at most 8 bits as a `u8`. The bitstream's
+    /// fields have fixed widths, so the narrowing is lossless; doing it here, under
+    /// a mask, keeps every parser free of bare `as u8` casts on read values.
+    pub fn read_u8(&mut self, n: u32) -> u8 {
+        debug_assert!(n <= 8, "read_u8 of a {n}-bit field");
+        (self.read(n) & 0xFF) as u8
+    }
+
+    /// [`read`](Self::read) a field of at most 16 bits as a `u16` (see [`read_u8`](Self::read_u8)).
+    pub fn read_u16(&mut self, n: u32) -> u16 {
+        debug_assert!(n <= 16, "read_u16 of a {n}-bit field");
+        (self.read(n) & 0xFFFF) as u16
+    }
+
     /// Look at the next `n` bits (0..=32) MSB-first without consuming them, zero-
     /// padding past the end of the buffer (matching [`read`](Self::read)). The Huffman LUT
     /// peeks `max_len` bits, then [`skip`](Self::skip)s the matched codeword.
@@ -47,29 +71,39 @@ impl<'a> BitReader<'a> {
     /// the end of `data` the window zero-fills, matching the old loop's
     /// `unwrap_or(0)`. Byte-for-byte the same bits — `peek_matches_bitwise_reference`
     /// pins it against the original implementation.
+    ///
+    /// # Panics
+    /// Never: the one `unwrap` converts a slice already proven 8 bytes long.
+    #[must_use]
     pub fn peek(&self, n: u32) -> u32 {
         if n == 0 {
             return 0; // `>> 64` would overflow; the old loop returned 0 here.
         }
         let byte_idx = self.pos >> 3;
+        #[allow(clippy::cast_possible_truncation)] // `pos & 7` is 0..=7
         let bit_off = (self.pos & 7) as u32;
-        let word = match self.data.get(byte_idx..byte_idx + 8) {
-            // Fast path: eight bytes are in bounds, one unaligned load.
-            // Cannot fail: `get(byte_idx..byte_idx + 8)` returned a slice of
-            // exactly 8 bytes, so the conversion to `[u8; 8]` always succeeds.
-            Some(w) => u64::from_be_bytes(w.try_into().unwrap()),
+        // Fast path: eight bytes are in bounds, one unaligned load. Spelled as
+        // `get(i..i + 8)` + `try_into` on purpose: the `first_chunk` form measured
+        // +4 instructions here and +33 in `huffman::decode` (which inlines this)
+        // on 2026-10-04.
+        let word = if let Some(w) = self.data.get(byte_idx..byte_idx + 8) {
+            // Cannot fail: `get(byte_idx..byte_idx + 8)` returned exactly 8 bytes.
+            u64::from_be_bytes(w.try_into().unwrap())
+        } else {
             // Tail: zero-fill past the end, as the bitwise loop did. `byte_idx`
             // may be entirely past `data`, so clamp the start before slicing —
             // `data[byte_idx..byte_idx]` still panics when byte_idx > len.
-            None => {
-                let start = byte_idx.min(self.data.len());
-                let take = (self.data.len() - start).min(8);
-                let mut buf = [0u8; 8];
-                buf[..take].copy_from_slice(&self.data[start..start + take]);
-                u64::from_be_bytes(buf)
-            }
+            let start = byte_idx.min(self.data.len());
+            let take = (self.data.len() - start).min(8);
+            let mut buf = [0u8; 8];
+            buf[..take].copy_from_slice(&self.data[start..start + take]);
+            u64::from_be_bytes(buf)
         };
-        ((word << bit_off) >> (64 - n)) as u32
+        // `>> (64 - n)` leaves at most `n <= 32` significant bits (the doc's
+        // contract; `n == 0` returned above), so the narrowing is exact.
+        #[allow(clippy::cast_possible_truncation)]
+        let bits = ((word << bit_off) >> (64 - n)) as u32;
+        bits
     }
 
     /// Advance the bit cursor by `n` bits (after a [`peek`](Self::peek)).
@@ -94,8 +128,9 @@ pub struct BitWriter {
 }
 
 impl BitWriter {
-    pub fn new() -> BitWriter {
-        BitWriter::default()
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// A writer whose byte buffer is reserved for `bytes` up front.
@@ -104,8 +139,9 @@ impl BitWriter {
     /// way up -- about ten times per frame for the main-data buffer, and the
     /// realloc traffic is invisible to a copy census because it happens inside
     /// `Vec`. Every caller here knows its exact output size from the header.
-    pub fn with_capacity(bytes: usize) -> BitWriter {
-        BitWriter {
+    #[must_use]
+    pub fn with_capacity(bytes: usize) -> Self {
+        Self {
             bytes: Vec::with_capacity(bytes),
             nbits: 0,
             cur: 0,
@@ -127,11 +163,13 @@ impl BitWriter {
     }
 
     /// Bits written so far.
+    #[must_use]
     pub fn bit_len(&self) -> usize {
         self.bytes.len() * 8 + self.nbits as usize
     }
 
     /// Flush the final partial byte (zero-padded) and return the buffer.
+    #[must_use]
     pub fn finish(mut self) -> Vec<u8> {
         if self.nbits > 0 {
             self.cur <<= 8 - self.nbits;
@@ -150,12 +188,10 @@ mod peek_tests {
     /// in the tree as the correctness reference).
     fn peek_bitwise(data: &[u8], pos: usize, n: u32) -> u32 {
         let mut v = 0u32;
-        let mut p = pos;
-        for _ in 0..n {
+        for p in pos..pos + n as usize {
             let byte = data.get(p >> 3).copied().unwrap_or(0);
             let bit = (byte >> (7 - (p & 7))) & 1;
-            v = (v << 1) | bit as u32;
-            p += 1;
+            v = (v << 1) | u32::from(bit);
         }
         v
     }

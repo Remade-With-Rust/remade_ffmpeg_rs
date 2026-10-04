@@ -25,9 +25,9 @@ use super::quantize::QuantizedGranule;
 /// Bits to code one coordinate's escape+sign under a pair table, or `None` if the
 /// value is out of the table's range (no escape big enough).
 fn coord_bits(t: &PairTable, v: i32) -> Option<usize> {
-    let maxc = t.dim as i32 - 1;
+    let maxc = i32::from(t.dim) - 1;
     let a = v.abs();
-    let sign = if v != 0 { 1 } else { 0 };
+    let sign = usize::from(v != 0);
     if t.linbits == 0 {
         if a > maxc {
             None
@@ -51,7 +51,7 @@ fn pair_bits(t: &PairTable, x: i32, y: i32) -> Option<usize> {
     if t.dim == 0 {
         return if x == 0 && y == 0 { Some(0) } else { None };
     }
-    let maxc = t.dim as i32 - 1;
+    let maxc = i32::from(t.dim) - 1;
     let cx = x.abs().min(maxc) as usize;
     let cy = y.abs().min(maxc) as usize;
     let idx = cx * t.dim as usize + cy;
@@ -65,23 +65,23 @@ fn pair_emit(t: &PairTable, x: i32, y: i32, w: &mut BitWriter) {
     if t.dim == 0 {
         return;
     }
-    let maxc = t.dim as i32 - 1;
+    let maxc = i32::from(t.dim) - 1;
     let cx = x.abs().min(maxc) as usize;
     let cy = y.abs().min(maxc) as usize;
     let idx = cx * t.dim as usize + cy;
     let (code, len) = t.book.code_len(idx).expect("pair index in book");
-    w.write(code as u32, len as u32);
+    w.write(u32::from(code), u32::from(len));
     if t.linbits > 0 && x.abs() >= maxc {
-        w.write((x.abs() - maxc) as u32, t.linbits as u32);
+        w.write((x.abs() - maxc) as u32, u32::from(t.linbits));
     }
     if x != 0 {
-        w.write((x < 0) as u32, 1);
+        w.write(u32::from(x < 0), 1);
     }
     if t.linbits > 0 && y.abs() >= maxc {
-        w.write((y.abs() - maxc) as u32, t.linbits as u32);
+        w.write((y.abs() - maxc) as u32, u32::from(t.linbits));
     }
     if y != 0 {
-        w.write((y < 0) as u32, 1);
+        w.write(u32::from(y < 0), 1);
     }
 }
 
@@ -102,10 +102,10 @@ fn quad_emit(q: &QuadTable, v: i32, w: i32, x: i32, y: i32, wr: &mut BitWriter) 
         .book
         .code_len(quad_index(v, w, x, y))
         .expect("quad index 0..15");
-    wr.write(code as u32, len as u32);
+    wr.write(u32::from(code), u32::from(len));
     for &c in &[v, w, x, y] {
         if c != 0 {
-            wr.write((c < 0) as u32, 1);
+            wr.write(u32::from(c < 0), 1);
         }
     }
 }
@@ -154,7 +154,7 @@ fn pair_table_max(t: &PairTable) -> i32 {
     if t.dim == 0 {
         return 0; // the empty table codes only (0, 0)
     }
-    let maxc = t.dim as i32 - 1;
+    let maxc = i32::from(t.dim) - 1;
     if t.linbits == 0 {
         maxc
     } else {
@@ -295,13 +295,9 @@ fn choose_regions(sfb: &[u16; 23], big_end: usize) -> (u8, u8) {
     }
     let third = big_end / 3;
     let two_third = 2 * big_end / 3;
-    let i1 = (1..=22)
-        .filter(|&i| sfb[i] as usize <= third)
-        .next_back()
-        .unwrap_or(1);
+    let i1 = (1..=22).rfind(|&i| sfb[i] as usize <= third).unwrap_or(1);
     let i2 = (i1..=22)
-        .filter(|&i| sfb[i] as usize <= two_third)
-        .next_back()
+        .rfind(|&i| sfb[i] as usize <= two_third)
         .unwrap_or(i1);
     ((i1 - 1).min(15) as u8, (i2 - i1).min(7) as u8)
 }
@@ -310,6 +306,7 @@ fn choose_regions(sfb: &[u16; 23], big_end: usize) -> (u8, u8) {
 /// `block_type`. Long blocks split into three region-count-derived regions; window-
 /// switched blocks (short/start/stop) use the decoder's fixed `(36, bv2)` split.
 /// Fills the Huffman side-info so [`encode`] and the decoder agree on the layout.
+#[must_use]
 pub fn select(
     header: &FrameHeader,
     coeffs: &[i32; GRANULE_LINES],
@@ -372,6 +369,7 @@ pub fn select(
 /// Pair-table selection for the window-switched fixed `(36, bv2)` region split
 /// (used by short, start, and stop blocks), with the two regions' total bits.
 /// Region 2 is empty.
+#[must_use]
 pub fn windowed_table_select(coeffs: &[i32; GRANULE_LINES], bv2: usize) -> ([u8; 3], usize) {
     let r1 = 36.min(bv2);
     let (t0, c0) = best_pair_table(coeffs, 0, r1);
@@ -380,6 +378,7 @@ pub fn windowed_table_select(coeffs: &[i32; GRANULE_LINES], bv2: usize) -> ([u8;
 }
 
 /// Huffman bit cost of a short-block coefficient set (counted, not emitted).
+#[must_use]
 pub fn cost_short(header: &FrameHeader, coeffs: &[i32; GRANULE_LINES]) -> usize {
     select(header, coeffs, BlockType::Short).1
 }
@@ -507,11 +506,11 @@ mod tests {
     }
 
     /// Select tables, encode, decode back — coefficients must survive exactly.
-    fn round_trip(coeffs: [i32; GRANULE_LINES]) {
+    fn round_trip(coeffs: &[i32; GRANULE_LINES]) {
         let header = hdr();
-        let (side, _) = select(&header, &coeffs, BlockType::Long);
+        let (side, _) = select(&header, coeffs, BlockType::Long);
         let quant = QuantizedGranule {
-            coeffs,
+            coeffs: *coeffs,
             side: side.clone(),
             scalefactors: [0; 39],
         };
@@ -522,7 +521,7 @@ mod tests {
         let mut pos = 0;
         let (out, _nz) = crate::decode::huffman::decode(&bits, &mut pos, hlen, &header, &side);
         assert_eq!(pos, hlen, "decoder must consume exactly the emitted bits");
-        assert_eq!(out, coeffs, "spectrum must round-trip exactly");
+        assert_eq!(out, *coeffs, "spectrum must round-trip exactly");
     }
 
     #[test]
@@ -532,7 +531,7 @@ mod tests {
         for (i, v) in c.iter_mut().take(40).enumerate() {
             *v = [(-1), 0, 1, 1, 0, -1, 0, 1][i % 8];
         }
-        round_trip(c);
+        round_trip(&c);
     }
 
     #[test]
@@ -544,7 +543,7 @@ mod tests {
         for (i, v) in c.iter_mut().take(80).skip(seed.len()).enumerate() {
             *v = [0, 1, -1, 0, 1, 0, -1, 0][i % 8];
         }
-        round_trip(c);
+        round_trip(&c);
     }
 
     #[test]
@@ -557,12 +556,12 @@ mod tests {
         c[3] = -15;
         c[4] = 1;
         c[5] = -1;
-        round_trip(c);
+        round_trip(&c);
     }
 
     #[test]
     fn round_trip_all_zero() {
-        round_trip([0i32; GRANULE_LINES]);
+        round_trip(&[0i32; GRANULE_LINES]);
     }
 
     #[test]
@@ -575,25 +574,25 @@ mod tests {
             let r = (s >> 24) as i32; // 0..255
             *v = (r % 11) - 5; // -5..5
         }
-        round_trip(c);
+        round_trip(&c);
     }
 
     /// A2 + C invariant: `select`'s returned bit cost and the standalone `cost`
     /// must both equal what `encode` actually writes, for every layout the rate
     /// loop might probe — so the redundancy-eliminated path stays bit-exact.
-    fn assert_cost_matches(coeffs: [i32; GRANULE_LINES]) {
+    fn assert_cost_matches(coeffs: &[i32; GRANULE_LINES]) {
         let header = hdr();
         for bt in [BlockType::Long, BlockType::Short] {
-            let (side, sel_cost) = select(&header, &coeffs, bt);
+            let (side, sel_cost) = select(&header, coeffs, bt);
             let q = QuantizedGranule {
-                coeffs,
+                coeffs: *coeffs,
                 side: side.clone(),
                 scalefactors: [0; 39],
             };
             let mut w = BitWriter::new();
             let emitted = encode(&q, &header, &mut w);
             assert_eq!(
-                cost(&side, &coeffs, &header),
+                cost(&side, coeffs, &header),
                 emitted,
                 "cost vs encode ({bt:?})"
             );
@@ -609,7 +608,7 @@ mod tests {
             s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             *v = ((s >> 23) as i32 % 21) - 10; // -10..10, exercises pairs+escapes+count1
         }
-        assert_cost_matches(dense);
+        assert_cost_matches(&dense);
 
         let mut esc = [0i32; GRANULE_LINES];
         esc[0] = 700;
@@ -617,9 +616,9 @@ mod tests {
         esc[2] = 40;
         esc[3] = -1;
         esc[4] = 1;
-        assert_cost_matches(esc);
+        assert_cost_matches(&esc);
 
-        assert_cost_matches([0i32; GRANULE_LINES]);
+        assert_cost_matches(&[0i32; GRANULE_LINES]);
     }
 
     /// Reference: the pre-C per-table `estimate_bits` search the histogram replaces.

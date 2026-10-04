@@ -276,6 +276,10 @@ unsafe fn matrix_simd(mt: &[[f32; SUBBANDS]; 64], y: &[f32; 64]) -> [f32; SUBBAN
 
 /// Analyze one granule of mono PCM (`pcm[0..576]`) into subband samples
 /// `[subband][line]`, advancing the channel's filterbank FIFO `X[]`.
+///
+/// # Panics
+/// Never: the one `expect` takes a 32-float run of the 512-float FIFO at a
+/// `head` that is always a multiple of 32, so the run is always 32 long.
 pub fn analyze(pcm: &[f32], fifo: &mut [f32; 512]) -> [[f32; SUBBAND_LINES]; SUBBANDS] {
     let c = window();
     let m = matrix();
@@ -284,7 +288,7 @@ pub fn analyze(pcm: &[f32], fifo: &mut [f32; 512]) -> [[f32; SUBBAND_LINES]; SUB
     // Resolved once per granule (codec-measurement: a dispatch read inside the
     // pass loop is overhead added to take a measurement).
     let simd = crate::decode::isa::use_simd();
-    super::prof::FB_PASSES[simd as usize]
+    super::prof::FB_PASSES[usize::from(simd)]
         .fetch_add(SUBBAND_LINES as u64, std::sync::atomic::Ordering::Relaxed);
     // The granule is exactly `SUBBAND_LINES * 32` samples and callers pass an
     // open-ended slice, so `pcm[v * 32 + t]` could not be proven in range and every
@@ -372,8 +376,8 @@ mod tests {
             let mut sig = 0f64;
             let mut err = 0f64;
             for i in delay..n {
-                let r = input[i - delay] as f64;
-                let o = output[i] as f64;
+                let r = f64::from(input[i - delay]);
+                let o = f64::from(output[i]);
                 sig += r * r;
                 err += (r - o) * (r - o);
             }
@@ -409,7 +413,9 @@ mod tests {
         }
         let mut r = rng(0x2545_F491);
         let mut fifo = [0f32; 512];
-        fifo.iter_mut().for_each(|x| *x = r());
+        for x in &mut fifo {
+            *x = r();
+        }
         let c = window();
         for head in (0..512).step_by(32) {
             let a = fold_scalar(c, &fifo, head);
@@ -429,7 +435,9 @@ mod tests {
         let mut r = rng(0x9E37_79B9);
         for trial in 0..128 {
             let mut y = [0f32; 64];
-            y.iter_mut().for_each(|x| *x = r());
+            for x in &mut y {
+                *x = r();
+            }
             let a = matrix_scalar(matrix(), &y);
             // SAFETY: gated on simd_available().
             let b = unsafe { matrix_simd(matrix_t(), &y) };

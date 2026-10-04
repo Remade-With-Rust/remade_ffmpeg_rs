@@ -5,6 +5,14 @@
 //! frames. The reservoir holds that tail so each frame's main data can be
 //! reassembled into one contiguous bitstream for the Huffman/scalefactor stages.
 
+// Parses untrusted bytes: narrowing casts are lint-enforced here (see the crate
+// lint policy in Cargo.toml) -- every one is masked, typed, or states its bound.
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 /// Rolling buffer of recent main-data bytes.
 #[derive(Default)]
 pub struct Reservoir {

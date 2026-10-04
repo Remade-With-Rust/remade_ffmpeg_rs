@@ -28,7 +28,7 @@ struct Twiddles {
 }
 
 impl Twiddles {
-    fn build(n: usize) -> Twiddles {
+    fn build(n: usize) -> Self {
         let mut re = vec![0f32; n.saturating_sub(1)];
         let mut im = vec![0f32; n.saturating_sub(1)];
         let mut len = 2usize;
@@ -47,7 +47,7 @@ impl Twiddles {
             }
             len <<= 1;
         }
-        Twiddles { n, re, im }
+        Self { n, re, im }
     }
 }
 
@@ -63,6 +63,9 @@ thread_local! {
 
 /// In-place complex FFT. `re`/`im` are the real/imaginary parts; `re.len()` must
 /// be a power of two and equal to `im.len()`. Forward transform (`exp(-i2πkn/N)`).
+///
+/// # Panics
+/// If `re.len()` is not a power of two, or differs from `im.len()`.
 pub fn fft(re: &mut [f32], im: &mut [f32]) {
     let n = re.len();
     assert!(n.is_power_of_two(), "FFT length must be a power of two");

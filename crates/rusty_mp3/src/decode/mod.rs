@@ -168,6 +168,7 @@ pub mod isa {
     /// AVX by runtime detection on x86_64; NEON on aarch64, where it is baseline
     /// (every AArch64 core has it, so there is nothing to detect); none elsewhere.
     #[inline]
+    #[must_use]
     pub fn simd_available() -> bool {
         #[cfg(target_arch = "x86_64")]
         {
@@ -209,7 +210,7 @@ pub struct TransformState {
 
 impl Default for TransformState {
     fn default() -> Self {
-        TransformState {
+        Self {
             imdct_overlap: [[0.0; GRANULE_LINES]; 2],
             synth_fifo: [[0.0; 1024]; 2],
         }
@@ -217,8 +218,9 @@ impl Default for TransformState {
 }
 
 impl TransformState {
-    pub fn new() -> TransformState {
-        TransformState::default()
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Stage 2 for one granule: alias reduction → hybrid IMDCT → polyphase
@@ -235,7 +237,7 @@ impl TransformState {
         let mut chan_pcm = [[0f32; GRANULE_LINES]; 2];
         for ch in 0..channels {
             prof::time(&prof::ANTIALIAS, || {
-                antialias::reduce(&gi[ch], &mut spectrum.lines[ch])
+                antialias::reduce(&gi[ch], &mut spectrum.lines[ch]);
             });
             let time = prof::time(&prof::IMDCT, || {
                 imdct::hybrid(&gi[ch], &spectrum.lines[ch], &mut self.imdct_overlap[ch])
@@ -259,6 +261,7 @@ pub struct GranuleWork {
 }
 
 /// Persistent decoder state across frames.
+#[derive(Default)]
 pub struct Mp3Decode {
     /// Carries leftover main-data bytes between frames (`main_data_begin`).
     reservoir: reservoir::Reservoir,
@@ -266,18 +269,10 @@ pub struct Mp3Decode {
     transform: TransformState,
 }
 
-impl Default for Mp3Decode {
-    fn default() -> Self {
-        Mp3Decode {
-            reservoir: reservoir::Reservoir::default(),
-            transform: TransformState::default(),
-        }
-    }
-}
-
 impl Mp3Decode {
-    pub fn new() -> Mp3Decode {
-        Mp3Decode::default()
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Decode one frame's side-info + main-data into interleaved PCM samples.
@@ -289,6 +284,10 @@ impl Mp3Decode {
     ///
     /// Thin wrapper over the two stages, so the serial path and the pipelined
     /// path run exactly the same code.
+    ///
+    /// # Errors
+    /// Whatever [`decode_frame_entropy`](Self::decode_frame_entropy) returns:
+    /// a malformed side-information block.
     pub fn decode_frame(
         &mut self,
         header: &FrameHeader,
@@ -303,7 +302,7 @@ impl Mp3Decode {
         // and every granule's spectrum (4.6 KB) copied in and copied out again.
         // The two stages own disjoint state, so running them per granule rather
         // than per frame changes nothing they compute.
-        let Mp3Decode {
+        let Self {
             reservoir,
             transform,
         } = self;
@@ -322,6 +321,10 @@ impl Mp3Decode {
     ///
     /// Touches only the bit reservoir, never the IMDCT overlap or synthesis FIFO,
     /// which is what makes it safe to run on its own thread ahead of stage 2.
+    ///
+    /// # Errors
+    /// [`Error::InvalidData`](crate::Error::InvalidData) when the side information
+    /// is malformed (see [`sideinfo::parse`]).
     pub fn decode_frame_entropy(
         &mut self,
         header: &FrameHeader,
@@ -340,7 +343,7 @@ impl Mp3Decode {
                 out.push(GranuleWork {
                     side: side.clone(),
                     spectrum: spectrum.clone(),
-                })
+                });
             },
         )?;
         Ok(out)
@@ -396,7 +399,7 @@ fn entropy(
                 huffman::decode(main, &mut bit_pos, part2_3_end, header, gi)
             });
             prof::time(&prof::REQUANT, || {
-                requantize::apply(header, gi, &sf, &coeffs, nz, &mut spectrum.lines[ch])
+                requantize::apply(header, gi, &sf, &coeffs, nz, &mut spectrum.lines[ch]);
             });
             spectrum.nonzero[ch] = nz;
             scalefac[gr][ch] = sf;
@@ -404,7 +407,7 @@ fn entropy(
 
         // 7. Joint-stereo (MS / intensity) across the two channels.
         prof::time(&prof::STEREO, || {
-            stereo::process(header, &si.granules[gr], &scalefac[gr][1], &mut spectrum)
+            stereo::process(header, &si.granules[gr], &scalefac[gr][1], &mut spectrum);
         });
 
         granule(&si.granules[gr], &mut spectrum);
@@ -413,6 +416,9 @@ fn entropy(
 }
 
 /// Entry used by the public decoder once the bricks are in place.
+///
+/// # Errors
+/// Always [`Error::Unimplemented`](crate::Error::Unimplemented).
 pub fn decode_frame_stub() -> Result<()> {
     Err(Error::Unimplemented("mp3 decode: pipeline not yet built"))
 }

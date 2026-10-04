@@ -248,7 +248,7 @@ unsafe fn window_avx(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut 
         // `b`: `+ 96` is not 64-aligned (96 mod 64 = 32), so masking bit 5 away
         // there destroys signal. Tried; it moved the decode hash and failed two
         // reconstruction tests.
-        let a = (head + i * 128) & 960;
+        let a = (head + i * 128) & 0x3C0; // 960
         let b = (head + i * 128 + 96) & 1023;
         for (v, accv) in acc.iter_mut().enumerate() {
             // SAFETY: `head` is masked to a multiple of 64 above, so `a <= 960` and `b` is 32 mod 64 with `b <= 992`: both 32-float spans (`+ v * 8 + 8 <= + 32`) end inside `fifo` (1024). `d` offsets reach `7 * 64 + 32 + 24 + 8 = 512`, its length.
@@ -284,7 +284,7 @@ unsafe fn window_neon(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut
     #[allow(unused_unsafe)]
     let mut acc = [unsafe { vdupq_n_f32(0.0) }; 8];
     for i in 0..8 {
-        let a = (head + i * 128) & 960;
+        let a = (head + i * 128) & 0x3C0; // 960
         let b = (head + i * 128 + 96) & 1023;
         for (v, accv) in acc.iter_mut().enumerate() {
             // SAFETY: `head` is masked to a multiple of 64 above, so `a <= 960` and `b <= 992`: both 32-float spans (`+ v * 4 + 4 <= + 32`) end inside `fifo` (1024). `d` offsets reach `7 * 64 + 32 + 28 + 4 = 512`, its length.
@@ -314,7 +314,7 @@ unsafe fn window_simd(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut
     #[cfg(target_arch = "x86_64")]
     // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
     unsafe {
-        window_avx(fifo, d, head, out)
+        window_avx(fifo, d, head, out);
     }
     #[cfg(target_arch = "aarch64")]
     // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
@@ -351,7 +351,7 @@ fn window_scalar(fifo: &[f32; 1024], d: &[f32; 512], head: usize, out: &mut [f32
         // `b`: `+ 96` is not 64-aligned (96 mod 64 = 32), so masking bit 5 away
         // there destroys signal. Tried; it moved the decode hash and failed two
         // reconstruction tests.
-        let a = (head + i * 128) & 960;
+        let a = (head + i * 128) & 0x3C0; // 960
         let b = (head + i * 128 + 96) & 1023;
         let (fa, fb) = (&fifo[a..a + 32], &fifo[b..b + 32]);
         let (da, db) = (&d[i * 64..i * 64 + 32], &d[i * 64 + 32..i * 64 + 64]);
@@ -409,6 +409,9 @@ unsafe fn polyphase_avx(
 }
 
 /// The synthesis body; `simd` selects the kernel twins.
+// Load-bearing: the body must inline INTO the `#[target_feature]` entry so the
+// kernels inline with it (docs/plans/mp3-kernel-ledger.md, brick 4).
+#[allow(clippy::inline_always)]
 #[inline(always)]
 fn polyphase_impl(
     time: &[f32; GRANULE_LINES],
@@ -496,7 +499,7 @@ mod tests {
         };
         for trial in 0..64 {
             let mut s = [0f32; SUBBANDS];
-            for v in s.iter_mut() {
+            for v in &mut s {
                 *v = rng();
             }
             let a = matrixing_fast(&s);
@@ -526,7 +529,7 @@ mod tests {
             (st >> 8) as f32 / (1u32 << 24) as f32 - 0.5
         };
         let mut fifo = [0f32; 1024];
-        for f in fifo.iter_mut() {
+        for f in &mut fifo {
             *f = rng();
         }
         let d = &SYNTH_D;
@@ -579,7 +582,7 @@ mod tests {
         let mut worst = 0f32;
         for _ in 0..2000 {
             let mut s = [0f32; SUBBANDS];
-            for sv in s.iter_mut() {
+            for sv in &mut s {
                 *sv = rng() * 100.0;
             }
             let dense = matrixing_dense(&s);

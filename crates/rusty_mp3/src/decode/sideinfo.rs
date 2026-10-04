@@ -10,6 +10,14 @@
 //! they're derived later by the Huffman stage — so this parser only reads the
 //! bits that are actually present.
 
+// Parses untrusted bytes: narrowing casts are lint-enforced here (see the crate
+// lint policy in Cargo.toml) -- every one is masked, typed, or states its bound.
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::{Error, Result};
 
 use crate::bitio::BitReader;
@@ -17,6 +25,10 @@ use crate::frame::{BlockType, SideInfo};
 use crate::header::{FrameHeader, MpegVersion};
 
 /// Parse the side-information block into a [`SideInfo`].
+///
+/// # Errors
+/// [`Error::InvalidData`](crate::Error::InvalidData) when a granule sets
+/// window switching with the reserved `block_type` 0.
 pub fn parse(header: &FrameHeader, bytes: &[u8]) -> Result<SideInfo> {
     let mut r = BitReader::new(bytes);
     let mut si = SideInfo::default();
@@ -24,7 +36,7 @@ pub fn parse(header: &FrameHeader, bytes: &[u8]) -> Result<SideInfo> {
     let mpeg1 = matches!(header.version, MpegVersion::V1);
 
     if mpeg1 {
-        si.main_data_begin = r.read(9) as u16;
+        si.main_data_begin = r.read_u16(9);
         r.read(if nch == 1 { 5 } else { 3 }); // private bits
         for ch in 0..nch {
             for band in 0..4 {
@@ -32,17 +44,17 @@ pub fn parse(header: &FrameHeader, bytes: &[u8]) -> Result<SideInfo> {
             }
         }
     } else {
-        si.main_data_begin = r.read(8) as u16;
+        si.main_data_begin = r.read_u16(8);
         r.read(if nch == 1 { 1 } else { 2 }); // private bits
     }
 
     for gr in 0..header.version.granules() {
         for ch in 0..nch {
             let g = &mut si.granules[gr][ch];
-            g.part2_3_length = r.read(12) as u16;
-            g.big_values = r.read(9) as u16;
-            g.global_gain = r.read(8) as u8;
-            g.scalefac_compress = r.read(if mpeg1 { 4 } else { 9 }) as u16;
+            g.part2_3_length = r.read_u16(12);
+            g.big_values = r.read_u16(9);
+            g.global_gain = r.read_u8(8);
+            g.scalefac_compress = r.read_u16(if mpeg1 { 4 } else { 9 });
             g.window_switching = r.read_bool();
             if g.window_switching {
                 g.block_type = match r.read(2) {
@@ -58,19 +70,19 @@ pub fn parse(header: &FrameHeader, bytes: &[u8]) -> Result<SideInfo> {
                 };
                 g.mixed_block = r.read_bool();
                 for t in g.table_select.iter_mut().take(2) {
-                    *t = r.read(5) as u8;
+                    *t = r.read_u8(5);
                 }
-                for sg in g.subblock_gain.iter_mut() {
-                    *sg = r.read(3) as u8;
+                for sg in &mut g.subblock_gain {
+                    *sg = r.read_u8(3);
                 }
                 // region0/region1_count are implied for switched blocks.
             } else {
                 g.block_type = BlockType::Long;
-                for t in g.table_select.iter_mut() {
-                    *t = r.read(5) as u8;
+                for t in &mut g.table_select {
+                    *t = r.read_u8(5);
                 }
-                g.region0_count = r.read(4) as u8;
-                g.region1_count = r.read(3) as u8;
+                g.region0_count = r.read_u8(4);
+                g.region1_count = r.read_u8(3);
             }
             if mpeg1 {
                 g.preflag = r.read_bool();

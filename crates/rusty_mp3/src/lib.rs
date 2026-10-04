@@ -89,8 +89,9 @@ impl Drop for Mp3Decoder {
 }
 
 impl Mp3Decoder {
-    pub fn new() -> Mp3Decoder {
-        Mp3Decoder::default()
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Feed more compressed bytes; any whole frames they complete are decoded
@@ -102,6 +103,10 @@ impl Mp3Decoder {
 
     /// Pull the next decoded frame. `Err(Again)` = feed more input;
     /// `Err(Eof)` = flushed and fully drained.
+    ///
+    /// # Errors
+    /// [`Error::Again`] when more input is needed; [`Error::Eof`] once
+    /// [`flush`](Self::flush) was called and every frame has been drained.
     pub fn next_frame(&mut self) -> Result<DecodedAudio> {
         if let Some(frame) = self.queue.pop_front() {
             return Ok(frame);
@@ -136,12 +141,9 @@ impl Mp3Decoder {
                 self.buf[pos + 2],
                 self.buf[pos + 3],
             ];
-            let header = match FrameHeader::parse(hb) {
-                Ok(h) => h,
-                Err(_) => {
-                    pos += 1;
-                    continue;
-                }
+            let Ok(header) = FrameHeader::parse(hb) else {
+                pos += 1;
+                continue;
             };
             let frame_size = header.frame_size();
             if frame_size < 4 {
@@ -199,6 +201,7 @@ impl Mp3Decoder {
 /// Output is identical to the serial path: the same code runs in the same order
 /// on each half, only on different threads. `std::thread` only — this crate has
 /// no dependencies and does not acquire one for this.
+#[must_use]
 pub fn decode_pipelined(bytes: &[u8]) -> Vec<DecodedAudio> {
     // No threads on `wasm32-unknown-unknown`: spawning traps, so a browser caller
     // reaching this function aborted the module. The two-stage split is a SPEED
@@ -307,7 +310,7 @@ fn sanitize_sample(v: f32) -> f32 {
 }
 
 /// Configuration for [`Mp3Encoder`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Mp3EncoderConfig {
     /// CBR target in kbps, snapped to the nearest valid Layer III value for the
     /// MPEG version ([`snap_bitrate`]). `0` ⇒ default (128 for MPEG-1, 64 for
@@ -324,6 +327,7 @@ pub struct Mp3EncoderConfig {
 
 /// Map an ffmpeg/LAME-style VBR quality index (`-q:a`, 0 = best … 9 = smallest)
 /// to the peak-NMR target [`Mp3EncoderConfig::vbr_quality`] expects.
+#[must_use]
 pub fn vbr_quality_index(q: f32) -> f32 {
     // Returns a TARGET AVERAGE BITRATE in kbps, not a noise-to-mask ratio.
     //
@@ -387,6 +391,7 @@ pub struct Mp3Encoder {
 
 /// Snap a requested bitrate (kbps) to the nearest valid Layer III value for the
 /// MPEG version (the V1 and V2/2.5 bitrate tables differ).
+#[must_use]
 pub fn snap_bitrate(version: header::MpegVersion, kbps: u32) -> u32 {
     let v1 = [
         32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
@@ -405,6 +410,9 @@ pub fn snap_bitrate(version: header::MpegVersion, kbps: u32) -> u32 {
 
 /// Build the frame header from the input's sample rate, channel count, and the
 /// configured CBR bitrate (VBR overrides the bitrate per frame later).
+///
+/// # Errors
+/// [`Error::Unsupported`] for a sample rate outside the nine MPEG Layer III rates.
 pub fn encoder_header(sample_rate: u32, channels: u16, cbr_kbps: u32) -> Result<FrameHeader> {
     let version = match sample_rate {
         32000 | 44100 | 48000 => header::MpegVersion::V1,
@@ -449,11 +457,12 @@ pub fn encoder_header(sample_rate: u32, channels: u16, cbr_kbps: u32) -> Result<
 }
 
 impl Mp3Encoder {
-    pub fn new(config: Mp3EncoderConfig) -> Mp3Encoder {
-        Mp3Encoder {
+    #[must_use]
+    pub fn new(config: Mp3EncoderConfig) -> Self {
+        Self {
             cbr_kbps: config.bitrate_kbps,
             quality: config.vbr_quality,
-            ..Mp3Encoder::default()
+            ..Self::default()
         }
     }
 
@@ -462,6 +471,10 @@ impl Mp3Encoder {
     /// if a later push carries fewer channels than the header, the last input
     /// channel is replicated. `interleaved.len()` should be a multiple of
     /// `channels` (a trailing partial sample is ignored).
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] when the FIRST push carries a sample rate outside
+    /// the nine MPEG Layer III rates (it fixes the stream header).
     pub fn push_pcm_f32(
         &mut self,
         interleaved: &[f32],
@@ -477,6 +490,10 @@ impl Mp3Encoder {
     /// Push interleaved signed-16-bit PCM. Converts `i16 / 32768.0` — the same
     /// convention the decoder uses — then follows
     /// [`push_pcm_f32`](Mp3Encoder::push_pcm_f32).
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] when the FIRST push carries a sample rate outside
+    /// the nine MPEG Layer III rates (it fixes the stream header).
     pub fn push_pcm_s16(
         &mut self,
         interleaved: &[i16],
@@ -485,7 +502,7 @@ impl Mp3Encoder {
     ) -> Result<()> {
         let in_ch = (channels as usize).max(1);
         self.push_with(interleaved.len() / in_ch, channels, sample_rate, |i| {
-            interleaved[i] as f32 / 32768.0
+            f32::from(interleaved[i]) / 32768.0
         })
     }
 
@@ -494,16 +511,24 @@ impl Mp3Encoder {
     /// [`push_pcm_s16`](Mp3Encoder::push_pcm_s16) on the decoded values, without
     /// the caller materialising an `i16` (and then an `f32`) copy of the input
     /// first. A trailing partial sample is ignored.
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] when the FIRST push carries a sample rate outside
+    /// the nine MPEG Layer III rates (it fixes the stream header).
     pub fn push_pcm_s16le(&mut self, bytes: &[u8], channels: u16, sample_rate: u32) -> Result<()> {
         let in_ch = (channels as usize).max(1);
         self.push_with(bytes.len() / 2 / in_ch, channels, sample_rate, |i| {
-            i16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]) as f32 / 32768.0
+            f32::from(i16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])) / 32768.0
         })
     }
 
     /// Push interleaved **little-endian f32 bytes**; the byte-level twin of
     /// [`push_pcm_f32`](Mp3Encoder::push_pcm_f32), as
     /// [`push_pcm_s16le`](Mp3Encoder::push_pcm_s16le) is of `push_pcm_s16`.
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] when the FIRST push carries a sample rate outside
+    /// the nine MPEG Layer III rates (it fixes the stream header).
     pub fn push_pcm_f32le(&mut self, bytes: &[u8], channels: u16, sample_rate: u32) -> Result<()> {
         let in_ch = (channels as usize).max(1);
         self.push_with(bytes.len() / 4 / in_ch, channels, sample_rate, |i| {
@@ -597,6 +622,10 @@ impl Mp3Encoder {
     /// Pull the next encoded MP3 packet (one frame, or the prepended Xing/Info
     /// frame after [`finish`](Mp3Encoder::finish)). `Err(Again)` = feed more
     /// PCM; `Err(Eof)` = finished and fully drained.
+    ///
+    /// # Errors
+    /// [`Error::Again`] when more PCM is needed; [`Error::Eof`] once
+    /// [`finish`](Self::finish) was called and every packet has been drained.
     pub fn next_packet(&mut self) -> Result<Vec<u8>> {
         if let Some(p) = self.queue.pop_front() {
             return Ok(p);
@@ -645,11 +674,15 @@ impl Mp3Encoder {
             // include the Info frame itself). Streaming consumers that drain before
             // finish won't get it first — that case wants two-pass.
             if self.total_frames > 0 {
-                let fsize = header.frame_size() as u32;
+                // The Info header's counters are 32-bit by format: saturate rather
+                // than wrap on a > 4 GiB stream.
+                let fsize = u32::try_from(header.frame_size()).unwrap_or(u32::MAX);
                 let info = encode::bitstream::info_frame(
                     &header,
-                    self.total_frames + 1,
-                    self.total_bytes as u32 + fsize,
+                    self.total_frames.saturating_add(1),
+                    u32::try_from(self.total_bytes)
+                        .unwrap_or(u32::MAX)
+                        .saturating_add(fsize),
                     self.quality.is_some(),
                 );
                 self.queue.push_front(info);
@@ -686,16 +719,16 @@ impl Mp3Encoder {
                 // flush. This path must OWN the frame, so it alone copies.
                 let owned = block.iter().map(|c| c.to_vec()).collect();
                 self.resv_frames_pcm.push((header.clone(), owned));
-                self.total_frames += 1;
+                self.total_frames = self.total_frames.saturating_add(1);
                 self.total_bytes += header.frame_size();
             } else if self.reservoir {
                 // Causal: encode now, bank the raw frame; assemble (B8) at flush.
                 self.state
                     .encode_frame_reservoir(&header, block, self.resv_gain);
-                self.total_frames += 1;
+                self.total_frames = self.total_frames.saturating_add(1);
                 self.total_bytes += header.frame_size();
             } else if let Ok(bytes) = self.state.encode_frame(&header, block, self.quality) {
-                self.total_frames += 1;
+                self.total_frames = self.total_frames.saturating_add(1);
                 self.total_bytes += bytes.len();
                 self.queue.push_back(bytes);
             }
@@ -814,7 +847,7 @@ mod tests {
                     ((2.0 * std::f32::consts::PI * f * t).sin() * 12000.0) as i16
                 })
                 .collect();
-            let f32s: Vec<f32> = s16.iter().map(|&s| s as f32 / 32768.0).collect();
+            let f32s: Vec<f32> = s16.iter().map(|&s| f32::from(s) / 32768.0).collect();
             let s16le: Vec<u8> = s16.iter().flat_map(|s| s.to_le_bytes()).collect();
             let f32le: Vec<u8> = f32s.iter().flat_map(|s| s.to_le_bytes()).collect();
             let cfg = || Mp3EncoderConfig {
@@ -867,7 +900,7 @@ mod tests {
                 (0.5 * (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 32767.0) as i16
             })
             .collect();
-        let out = decode_mono(encode_mono_s16(&s16, sr));
+        let out = decode_mono(&encode_mono_s16(&s16, sr));
         let rms = (out.iter().map(|x| x * x).sum::<f32>() / out.len().max(1) as f32).sqrt();
         assert!(
             rms > 0.1,
@@ -879,7 +912,7 @@ mod tests {
     /// decode it while the per-stage profiler runs. `cargo test -p rusty_mp3
     /// --release profile_decode -- --ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "manual profiling run (prints the decode stage profile)"]
     fn profile_decode() {
         let sr = 44100u32;
         let n = 10 * sr as usize;
@@ -902,14 +935,14 @@ mod tests {
             .collect();
         let mp3 = encode_mono(&input, sr);
         eprintln!("[profile] decoding {} KB of mp3 (~10 s)", mp3.len() / 1024);
-        let out = decode_mono(mp3);
+        let out = decode_mono(&mp3);
         eprintln!("[profile] {} PCM samples out", out.len());
         crate::decode::prof::dump();
     }
 
-    fn decode_mono(mp3: Vec<u8>) -> Vec<f32> {
+    fn decode_mono(mp3: &[u8]) -> Vec<f32> {
         let mut dec = Mp3Decoder::default();
-        dec.push(&mp3);
+        dec.push(mp3);
         dec.flush();
         let mut out = Vec::new();
         while let Ok(af) = dec.next_frame() {
@@ -928,9 +961,9 @@ mod tests {
             let mut n = 0;
             let mut i = skip;
             while i + delay < out.len() && i < reference.len() {
-                let r = reference[i] as f64;
+                let r = f64::from(reference[i]);
                 sig += r * r;
-                err += (r - out[i + delay] as f64).powi(2);
+                err += (r - f64::from(out[i + delay])).powi(2);
                 n += 1;
                 i += 1;
             }
@@ -1022,7 +1055,7 @@ mod tests {
             );
             assert_eq!(h.sample_rate, sr);
 
-            let out = decode_mono(mp3);
+            let out = decode_mono(&mp3);
             assert!(out.len() > n / 2);
             let snr = best_snr(&input, &out);
             eprintln!("[R5] MPEG-2 {sr} Hz round-trip SNR {snr:.1} dB");
@@ -1065,8 +1098,7 @@ mod tests {
         // fields — simplest to detect by decoding and checking the stream carries
         // short blocks via the side-info parser.
         let si_len = header::FrameHeader::parse([mp3[0], mp3[1], mp3[2], mp3[3]])
-            .map(|h| h.side_info_len())
-            .unwrap_or(17);
+            .map_or(17, |h| h.side_info_len());
         let mut switched = 0;
         let mut pos = 0;
         while pos + 4 <= mp3.len() {
@@ -1099,7 +1131,7 @@ mod tests {
         dec.push(&mp3);
         dec.flush();
         let mut decoded = 0;
-        while let Ok(_) = dec.next_frame() {
+        while dec.next_frame().is_ok() {
             decoded += 1;
         }
         assert!(decoded >= frames, "all frames must decode, got {decoded}");
@@ -1166,7 +1198,7 @@ mod tests {
             if let Some(dir) = &dump_dir {
                 std::fs::write(format!("{dir}/{name}.mp3"), &mp3).expect("dump");
             }
-            let out = decode_mono(mp3);
+            let out = decode_mono(&mp3);
             assert!(out.len() > n / 2, "{name}: too few samples");
             let snr = best_snr(sig, &out);
             eprintln!("[R4] {name:<12} SNR {snr:.1} dB (floor {floor})");
@@ -1364,7 +1396,7 @@ mod tests {
         dec.push(&mp3);
         dec.flush();
         let mut frames = 0;
-        while let Ok(_) = dec.next_frame() {
+        while dec.next_frame().is_ok() {
             frames += 1;
         }
         assert!(frames >= 20, "expected all frames to decode, got {frames}");
@@ -1458,7 +1490,7 @@ mod tests {
             std::fs::write(path, &mp3).expect("write MP3_ENC_OUT");
         }
 
-        let out = decode_mono(mp3);
+        let out = decode_mono(&mp3);
         assert!(out.len() > n / 2, "decoder produced too few samples");
 
         let snr = best_snr(&input, &out);
@@ -1521,7 +1553,7 @@ mod tests {
         } else {
             d[data..]
                 .chunks_exact(2)
-                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+                .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0)
                 .collect()
         };
         // Channel count from the fmt chunk (offset +2..+4); pcm is interleaved as read.
@@ -1554,7 +1586,7 @@ mod tests {
         };
         let n = rate as usize * 2;
         let mut pcm = vec![0f32; n];
-        let mut s = 0x1234_5u32;
+        let mut s = 0x0001_2345u32;
         for (i, v) in pcm.iter_mut().enumerate() {
             s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             let noise = (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5;

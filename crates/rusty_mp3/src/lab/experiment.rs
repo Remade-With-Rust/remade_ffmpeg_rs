@@ -6,6 +6,7 @@
 //! `lab-results/<brick>-<variant>.json` so results accumulate and diff over time.
 
 use super::{bricks, metrics::Metrics, quantizer, signals, variant};
+use std::fmt::Write as _;
 
 /// CLI overrides applied on top of a variant's preset (the "modify on the fly"
 /// path — no recompile). Unset fields keep the preset value.
@@ -38,6 +39,9 @@ pub struct Report {
 ///
 /// Returns `Err` (not a panic) when the brick is not yet runnable, so the CLI can
 /// report status instead of crashing on a `todo!()`.
+///
+/// # Errors
+/// A message when `brick_id` is unknown or the brick is not runnable yet.
 pub fn run(brick_id: &str, variant_name: &str, ov: Overrides) -> Result<Report, String> {
     let brick = bricks::by_id(brick_id)
         .ok_or_else(|| format!("unknown brick '{brick_id}' (try `mp3lab bricks`)"))?;
@@ -47,7 +51,7 @@ pub fn run(brick_id: &str, variant_name: &str, ov: Overrides) -> Result<Report, 
         other => Err(format!(
             "brick {other} is not runnable yet (status: {}). Next buildable: {}",
             brick.status.name(),
-            bricks::next_unbuilt().map(|b| b.id).unwrap_or("—"),
+            bricks::next_unbuilt().map_or("—", |b| b.id),
         )),
     }
 }
@@ -89,19 +93,21 @@ fn run_quantizer(variant_name: &str, ov: Overrides) -> Result<Report, String> {
 
 impl Report {
     /// Pretty console table.
+    #[must_use]
     pub fn to_text(&self) -> String {
         let mut s = format!(
             "experiment: {} / {}\nparams: {}\n\n",
             self.brick, self.variant, self.params
         );
         for r in &self.rows {
-            s.push_str(&format!("  {:<18} {}\n", r.signal, r.metrics.summary()));
+            let _ = writeln!(s, "  {:<18} {}", r.signal, r.metrics.summary());
         }
-        s.push_str(&format!("  {:<18} {}\n", "── mean ──", self.mean.summary()));
+        let _ = writeln!(s, "  {:<18} {}", "── mean ──", self.mean.summary());
         s
     }
 
     /// Stable JSON for the results log (hand-rolled — the crate has no serde).
+    #[must_use]
     pub fn to_json(&self) -> String {
         let rows: Vec<String> = self
             .rows

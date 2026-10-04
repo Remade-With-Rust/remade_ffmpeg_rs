@@ -31,6 +31,7 @@ pub fn mid_side_into(left: &[f32], right: &[f32], mid: &mut Vec<f32>, side: &mut
 }
 
 /// Mid/side transform of a frame's two channels: returns `[mid, side]`.
+#[must_use]
 pub fn mid_side(left: &[f32], right: &[f32]) -> Vec<Vec<f32>> {
     let (mut mid, mut side) = (Vec::new(), Vec::new());
     mid_side_into(left, right, &mut mid, &mut side);
@@ -42,13 +43,14 @@ pub fn mid_side(left: &[f32], right: &[f32]) -> Vec<Vec<f32>> {
 /// small (cheap to code), so switch when the side energy is well below the mid.
 /// Superseded by the perceptual-entropy cost test in `Mp3State::decide_stereo`
 /// (this was too conservative); retained for the `MP3_STEREO=energy` A/B path.
+#[must_use]
 pub fn prefer_mid_side(left: &[f32], right: &[f32]) -> bool {
     let mut mid_e = 0f64;
     let mut side_e = 0f64;
     let n = left.len().min(right.len());
     for i in 0..n {
-        let m = (left[i] + right[i]) as f64;
-        let s = (left[i] - right[i]) as f64;
+        let m = f64::from(left[i] + right[i]);
+        let s = f64::from(left[i] - right[i]);
         mid_e += m * m;
         side_e += s * s;
     }

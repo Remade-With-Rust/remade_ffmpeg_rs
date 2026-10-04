@@ -216,7 +216,7 @@ pub struct Mp3Encode {
 
 impl Default for Mp3Encode {
     fn default() -> Self {
-        Mp3Encode {
+        Self {
             analysis_fifo: [[0.0; 512]; 2],
             mdct_overlap: [[0.0; GRANULE_LINES]; 2],
             reservoir: bitstream::EncReservoir::default(),
@@ -261,16 +261,17 @@ fn reservoir_budget(pe: f32, pe_avg: f32, base: usize, bank: usize, gain: f32) -
     if pe_avg <= 0.0 || gain <= 0.0 {
         return base;
     }
-    let demand = (pe / pe_avg - 1.0) as f64; // >0 harder than average
-    let extra = (demand * gain as f64 * base as f64) as i64;
+    let demand = f64::from(pe / pe_avg - 1.0); // >0 harder than average
+    let extra = (demand * f64::from(gain) * base as f64) as i64;
     // draw at most the available bank; give back at most 30% of base (don't starve).
     let extra = extra.clamp(-(base as i64) * 3 / 10, bank.min(RESV_MAX_BANK) as i64);
     ((base as i64) + extra).max(base as i64 / 2) as usize
 }
 
 impl Mp3Encode {
-    pub fn new() -> Mp3Encode {
-        Mp3Encode::default()
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Encode one frame from per-channel PCM (`channels[ch]` holds this frame's
@@ -284,6 +285,10 @@ impl Mp3Encode {
     /// `quality` selects the rate mode: `None` is CBR (the header's bitrate);
     /// `Some(target_nmr)` is **VBR** — each granule quantizes to that quality and
     /// the frame's bitrate is picked to fit the result.
+    ///
+    /// # Errors
+    /// None today -- the frame always encodes; the `Result` keeps the signature
+    /// stable for callers.
     pub fn encode_frame<C: AsRef<[f32]>>(
         &mut self,
         header: &FrameHeader,
@@ -360,7 +365,7 @@ impl Mp3Encode {
     ) -> (FrameHeader, SideInfo, Vec<u8>, f32) {
         let fa = self.analyze_frame(header, channels);
         let budget = budget_fn(fa.frame_pe);
-        let (fheader, side, main_data) = self.quantize_frame(&fa, budget, quality);
+        let (fheader, side, main_data) = Self::quantize_frame(&fa, budget, quality);
         (fheader, side, main_data, fa.frame_pe)
     }
 
@@ -380,12 +385,7 @@ impl Mp3Encode {
     /// principle* (force-M/S beat it by up to +0.07 ODG) but oscillates the mode every
     /// frame → triggers the switching bug. OPT-IN until that bug is root-caused; a robust
     /// version needs hysteresis to keep switches blocky. `lr`/`ms` force a fixed mode.
-    fn decide_stereo<C: AsRef<[f32]>>(
-        &self,
-        channels: &[C],
-        granules: usize,
-        sample_rate: u32,
-    ) -> bool {
+    fn decide_stereo<C: AsRef<[f32]>>(channels: &[C], granules: usize, sample_rate: u32) -> bool {
         let (l, r) = (channels[0].as_ref(), channels[1].as_ref());
         match stereo_override() {
             Some(StereoOverride::Lr) => return false,
@@ -419,7 +419,7 @@ impl Mp3Encode {
         let nch = header.channel_mode.channels();
         let granules = header.version.granules();
 
-        let use_ms = nch == 2 && self.decide_stereo(channels, granules, header.sample_rate);
+        let use_ms = nch == 2 && Self::decide_stereo(channels, granules, header.sample_rate);
         // The psymodel below is the only consumer of the CODED domain. For L/R that
         // IS `channels`, so borrow it; for M/S, fill scratch that persists across
         // frames. Neither branch allocates in steady state — the L/R branch used to
@@ -544,7 +544,6 @@ impl Mp3Encode {
     /// bitstream — the stateless (given the analysis) half of the encode. `quality`
     /// `Some` selects VBR (targets a quality, ignores the budget).
     fn quantize_frame(
-        &self,
         fa: &FrameAnalysis,
         frame_budget: usize,
         quality: Option<f32>,
@@ -596,15 +595,15 @@ impl Mp3Encode {
 
             side.granules[gr][ch] = quant.side.clone();
             let mut sfac = ScaleFactors::default();
-            if bt != BlockType::Short {
-                sfac.long.copy_from_slice(&quant.scalefactors[..22]);
-            } else {
+            if bt == BlockType::Short {
                 // Short layout: scalefactors[3·band + window].
                 for b in 0..12 {
                     for w in 0..3 {
                         sfac.short[w][b] = quant.scalefactors[3 * b + w];
                     }
                 }
+            } else {
+                sfac.long.copy_from_slice(&quant.scalefactors[..22]);
             }
             let part2_3_start = main.bit_len();
             prof::time(&prof::HUFF, || {
@@ -629,7 +628,7 @@ impl Mp3Encode {
             capped.bitrate_kbps = 320;
             let ceiling = bitstream::region_capacity(&capped);
             if main_data.len() > ceiling {
-                let (mut h, s, d) = self.quantize_frame(fa, ceiling * 8, None);
+                let (mut h, s, d) = Self::quantize_frame(fa, ceiling * 8, None);
                 h.bitrate_kbps = bitstream::smallest_bitrate_for(&h, d.len());
                 return (h, s, d);
             }
@@ -665,7 +664,7 @@ impl Mp3Encode {
         for fa in &analyses {
             let base = bitstream::region_capacity(&fa.fheader) * 8;
             let budget = reservoir_budget(fa.frame_pe, pe_mean, base, bank, gain);
-            let (fheader, side, main_data) = self.quantize_frame(fa, budget, None);
+            let (fheader, side, main_data) = Self::quantize_frame(fa, budget, None);
             let used = main_data.len() * 8;
             bank = (bank + base).saturating_sub(used).min(RESV_MAX_BANK);
             out.push((fheader, side, main_data));
@@ -686,6 +685,7 @@ mod profile_tests {
     use super::*;
     use crate::frame::ChannelMode;
     use crate::header::{FrameHeader, MpegVersion};
+    use std::sync::atomic::Ordering::Relaxed;
 
     fn cbr_header() -> FrameHeader {
         FrameHeader {
@@ -735,7 +735,7 @@ mod profile_tests {
             assert_eq!(h[0], 0xFF, "frame {f} lost sync (byte 0)");
             assert_eq!(h[1], 0xFB, "frame {f} bad version/layer (byte 1)");
             // main_data_begin = first 9 bits of side info (bytes 4..6, no CRC).
-            let mdb = ((h[4] as u16) << 1) | (h[5] >> 7) as u16;
+            let mdb = (u16::from(h[4]) << 1) | u16::from(h[5] >> 7);
             borrowed |= mdb > 0;
         }
         assert!(
@@ -802,7 +802,7 @@ mod profile_tests {
     /// attack detector / short-block shaping, not Floor-1 psymodel tuning.
     /// `cargo test -p rff-codec-mp3 block_mix_real_clip -- --ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "needs MP3_BLOCK_CLIP pointing at a real WAV"]
     fn block_mix_real_clip() {
         let Ok(path) = std::env::var("MP3_BLOCK_CLIP") else {
             eprintln!("set MP3_BLOCK_CLIP=<f32le mono wav> to run");
@@ -834,7 +834,6 @@ mod profile_tests {
                 enc.encode_frame(&header, &[ch.to_vec()], None).unwrap();
             }
         }
-        use std::sync::atomic::Ordering::Relaxed;
         let (nl, ns) = (prof::N_LONG.load(Relaxed), prof::N_SHORT.load(Relaxed));
         let (k0, ot) = (
             prof::OUTER_KEPT0.load(Relaxed),
@@ -848,7 +847,7 @@ mod profile_tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "manual profiling run (prints the encode stage profile)"]
     fn profile_encode_dense() {
         let header = FrameHeader {
             version: MpegVersion::V1,

@@ -13,7 +13,7 @@
 //!   decoded under it), both count1 tables, the escape (`linbits`) magnitudes, and
 //!   the highest scalefactor band that carries a non-zero line, per block type;
 //! * **decision** — block types, mixed blocks, `scfsi` bands, preflag,
-//!   scalefac_scale, subblock gain, the six MPEG-2 scalefactor schemes, and the
+//!   `scalefac_scale`, subblock gain, the six MPEG-2 scalefactor schemes, and the
 //!   intensity-stereo positions.
 //!
 //! The aggregate report lists every cell that NO input reached. A path no input
@@ -128,17 +128,17 @@ fn regions(gi: &GranuleSideInfo, rate: u32, bv2: usize) -> (usize, usize) {
 /// `scalefac_compress` for ordinary channels, three more for the intensity-coded
 /// right channel, which halves the field and uses a different partition.
 fn lsf_scheme(sfc: u16, is_right: bool) -> usize {
-    if !is_right {
-        match sfc {
-            0..=399 => 0,
-            400..=499 => 1,
-            _ => 2,
-        }
-    } else {
+    if is_right {
         match sfc >> 1 {
             0..=179 => 3,
             180..=243 => 4,
             _ => 5,
+        }
+    } else {
+        match sfc {
+            0..=399 => 0,
+            400..=499 => 1,
+            _ => 2,
         }
     }
 }
@@ -165,10 +165,10 @@ fn granule(
     if std::env::var_os("COVERAGE_GRANULES").is_some() {
         println!(
             "  granule gr={gr} ch={ch} block={block} mixflag={} sbg={:?} preflag={} sfs={} gain={} sfc={}",
-            gi.mixed_block as u8,
+            u8::from(gi.mixed_block),
             gi.subblock_gain,
-            gi.preflag as u8,
-            gi.scalefac_scale as u8,
+            u8::from(gi.preflag),
+            u8::from(gi.scalefac_scale),
             gi.global_gain,
             gi.scalefac_compress
         );
@@ -244,11 +244,7 @@ fn granule(
         _ => "2063-8206",
     };
     bump(t, format!("info.peak_level.{bucket}"), 1);
-    let nz_end = coeffs
-        .iter()
-        .rposition(|&v| v != 0)
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    let nz_end = coeffs.iter().rposition(|&v| v != 0).map_or(0, |i| i + 1);
     if nz_end > bv2 {
         bump(
             t,
@@ -345,7 +341,7 @@ fn census(bytes: &[u8], t: &mut Tally) -> (u64, u64) {
         let v = match h.version {
             MpegVersion::V1 => "V1",
             MpegVersion::V2 => "V2",
-            _ => "V2.5",
+            MpegVersion::V2_5 => "V2.5",
         };
         bump(t, format!("fmt.version.{v}"), 1);
         bump(t, format!("fmt.rate.{}", h.sample_rate), 1);
@@ -395,10 +391,10 @@ fn census(bytes: &[u8], t: &mut Tally) -> (u64, u64) {
                 } else {
                     None
                 };
-                let sf = scalefactors::decode(&main, &mut bit, &h, &si, gr, ch, prev.as_ref());
+                let sf = scalefactors::decode(main, &mut bit, &h, &si, gr, ch, prev.as_ref());
                 kept[gr][ch] = sf.clone();
                 let end = start + gi.part2_3_length as usize;
-                let (coeffs, _) = huffman::decode(&main, &mut bit, end, &h, gi);
+                let (coeffs, _) = huffman::decode(main, &mut bit, end, &h, gi);
                 bit = end;
                 if gi.part2_3_length > 0 {
                     granule(t, &h, &si, gr, ch, &coeffs, &sf);
@@ -427,7 +423,7 @@ fn score(bytes: &[u8], reference: &[u8]) -> String {
     }
     let refs: Vec<i32> = reference
         .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
+        .map(|b| i32::from(i16::from_le_bytes([b[0], b[1]])))
         .collect();
     if ours.is_empty() || refs.is_empty() {
         return format!(
@@ -458,8 +454,8 @@ fn score(bytes: &[u8], reference: &[u8]) -> String {
         for i in 0..n {
             let e = ours[a0 + i] - refs[b0 + i];
             maxe = maxe.max(e.abs());
-            err += (e as f64).powi(2);
-            sig += (refs[b0 + i] as f64).powi(2);
+            err += f64::from(e).powi(2);
+            sig += f64::from(refs[b0 + i]).powi(2);
         }
         let snr = if err == 0.0 {
             f64::INFINITY

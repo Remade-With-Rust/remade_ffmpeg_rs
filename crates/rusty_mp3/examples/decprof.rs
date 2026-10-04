@@ -66,13 +66,16 @@ fn main() {
         };
         for f in frames {
             FRAMES.fetch_add(1, Relaxed);
-            SAMPLES.fetch_add((f.samples.len() / f.channels.max(1) as usize) as u64, Relaxed);
+            SAMPLES.fetch_add(
+                (f.samples.len() / f.channels.max(1) as usize) as u64,
+                Relaxed,
+            );
             // FNV-1a over the raw PCM bits: the decode byte-identity gate. A
             // decoder change that claims to be output-preserving must not move it.
             if !nohash {
                 for s in &f.samples {
                     for b in s.to_bits().to_le_bytes() {
-                        h ^= b as u64;
+                        h ^= u64::from(b);
                         h = h.wrapping_mul(0x0000_0100_0000_01b3);
                     }
                 }

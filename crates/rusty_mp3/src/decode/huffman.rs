@@ -11,6 +11,14 @@
 //! gated by Kraft/prefix-free validation. A table is two parallel arrays —
 //! `codes[i]`/`lens[i]` in (x·dim + y) raster order — matched MSB-first.
 
+// Parses untrusted bytes: narrowing casts are lint-enforced here (see the crate
+// lint policy in Cargo.toml) -- every one is masked, typed, or states its bound.
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use std::sync::OnceLock;
 
 use crate::bitio::BitReader;
@@ -27,6 +35,7 @@ const LUT_BITS_CAP: u8 = 12;
 
 /// `DIV_TAB[d][i] == i / d` for `d <= 16`, `i < 256` — the pair tables' whole
 /// index range. Built at compile time so the hot path never divides.
+#[allow(clippy::cast_possible_truncation)] // `i / d` with i < 256, d >= 1: fits u8
 const DIV_TAB: [[u8; 256]; 17] = {
     let mut t = [[0u8; 256]; 17];
     let mut d = 1;
@@ -62,7 +71,8 @@ pub struct HuffBook {
 }
 
 impl HuffBook {
-    pub const fn new(codes: &'static [u16], lens: &'static [u8]) -> HuffBook {
+    #[must_use]
+    pub const fn new(codes: &'static [u16], lens: &'static [u8]) -> Self {
         let mut max = 0u8;
         let mut i = 0;
         while i < lens.len() {
@@ -76,7 +86,7 @@ impl HuffBook {
         } else {
             LUT_BITS_CAP
         };
-        HuffBook {
+        Self {
             codes,
             lens,
             max_len: max,
@@ -89,15 +99,17 @@ impl HuffBook {
     /// codeword's `(symbol, length)`, or stays an escape if it heads a longer
     /// codeword. Prefix-freeness guarantees no short code overwrites a long one's
     /// prefix region, so escapes are exactly the long-code / invalid prefixes.
+    // `i` indexes a codebook (at most 256 codes), so `i as u16` is exact.
+    #[allow(clippy::cast_possible_truncation)]
     fn lut(&self) -> &[LutSlot] {
         self.lut.get_or_init(|| {
-            let bits = self.lut_bits as u32;
+            let bits = u32::from(self.lut_bits);
             let mut t = vec![LutSlot { sym: 0, len: 0 }; 1usize << bits];
             for (i, (&code, &len)) in self.codes.iter().zip(self.lens.iter()).enumerate() {
-                if len == 0 || len as u32 > bits {
+                if len == 0 || u32::from(len) > bits {
                     continue; // empty slot / resolved by the linear fallback
                 }
-                let shift = bits - len as u32;
+                let shift = bits - u32::from(len);
                 let start = (code as usize) << shift;
                 for slot in &mut t[start..start + (1usize << shift)] {
                     *slot = LutSlot { sym: i as u16, len };
@@ -114,9 +126,9 @@ impl HuffBook {
         if self.codes.is_empty() {
             return Some(0); // the empty book (table 0) codes a constant 0 pair.
         }
-        let slot = self.lut()[r.peek(self.lut_bits as u32) as usize];
+        let slot = self.lut()[r.peek(u32::from(self.lut_bits)) as usize];
         if slot.len != 0 {
-            r.skip(slot.len as u32);
+            r.skip(u32::from(slot.len));
             return Some(slot.sym as usize);
         }
         self.decode_linear(r)
@@ -133,7 +145,7 @@ impl HuffBook {
             // caller it is inlined into -- six instructions. The cold path is not
             // worth paying for in the stage that is ~42% of decode.
             for i in 0..self.codes.len() {
-                if self.lens[i] == len && self.codes[i] as u32 == code {
+                if self.lens[i] == len && u32::from(self.codes[i]) == code {
                     return Some(i);
                 }
             }
@@ -160,7 +172,7 @@ impl HuffBook {
 
     #[cfg(test)]
     pub fn kraft_sum(&self) -> f64 {
-        self.lens.iter().map(|&l| 2f64.powi(-(l as i32))).sum()
+        self.lens.iter().map(|&l| 2f64.powi(-i32::from(l))).sum()
     }
 
     #[cfg(test)]
@@ -173,7 +185,7 @@ impl HuffBook {
                 } else {
                     (self.codes[b], self.codes[a], lb, la)
                 };
-                if (long as u32 >> (ll - ls)) == short as u32 {
+                if (u32::from(long) >> (ll - ls)) == u32::from(short) {
                     return false; // `short` is a prefix of `long`
                 }
             }
@@ -192,13 +204,20 @@ pub struct PairTable {
 impl PairTable {
     /// Decode one (x, y) pair: Huffman index → coordinates, linbits escape on the
     /// max coordinate, then a sign bit for each non-zero coordinate.
+    // `idx - x * d` is the remainder `y < d <= 16`, and a linbits escape reads at
+    // most 13 bits (the static codebooks' maximum; the stream only selects among
+    // them), so every narrowing below is exact.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn read(&self, r: &mut BitReader) -> (i32, i32) {
         if self.dim == 0 {
             return (0, 0);
         }
-        let idx = match self.book.decode_index(r) {
-            Some(i) => i,
-            None => return (0, 0),
+        let Some(idx) = self.book.decode_index(r) else {
+            return (0, 0);
         };
         // **D7** — `idx / dim` and `idx % dim` used to run PER CODEWORD. Integer
         // division is 20-40 cycles on x86 and a few minutes of audio carries tens
@@ -213,17 +232,17 @@ impl PairTable {
         // 17-row table, which is a bounds check on every decoded pair in the stage
         // that is ~42% of decode. A mask will not do (16 is a legal dim, so `& 15`
         // would fold it onto 0); `.min(16)` is a cmov and exact for every real dim.
-        let mut x = DIV_TAB[d.min(16)][idx & 0xFF] as i32;
+        let mut x = i32::from(DIV_TAB[d.min(16)][idx & 0xFF]);
         let mut y = (idx - x as usize * d) as i32;
-        let maxc = self.dim as i32 - 1;
+        let maxc = i32::from(self.dim) - 1;
         if self.linbits > 0 && x == maxc {
-            x += r.read(self.linbits as u32) as i32;
+            x += r.read(u32::from(self.linbits)) as i32;
         }
         if x != 0 && r.read(1) == 1 {
             x = -x;
         }
         if self.linbits > 0 && y == maxc {
-            y += r.read(self.linbits as u32) as i32;
+            y += r.read(u32::from(self.linbits)) as i32;
         }
         if y != 0 && r.read(1) == 1 {
             y = -y;
@@ -243,17 +262,17 @@ impl QuadTable {
     fn read(&self, r: &mut BitReader) -> (i32, i32, i32, i32) {
         let idx = self.book.decode_index(r).unwrap_or(0);
         let mut q = [
-            ((idx >> 3) & 1) as i32,
-            ((idx >> 2) & 1) as i32,
-            ((idx >> 1) & 1) as i32,
-            (idx & 1) as i32,
+            i32::from(idx & 8 != 0),
+            i32::from(idx & 4 != 0),
+            i32::from(idx & 2 != 0),
+            i32::from(idx & 1 != 0),
         ];
-        for v in q.iter_mut() {
+        for v in &mut q {
             if *v != 0 && r.read(1) == 1 {
                 *v = -*v;
             }
         }
-        (q[0], q[1], q[2], q[3])
+        q.into()
     }
 }
 
@@ -504,7 +523,7 @@ mod tests {
                 let code = book.codes[i];
                 for &filler in &[0u32, 0xFFFF_FFFF, 0xAAAA_AAAA, 0x5555_5555] {
                     let mut w = crate::bitio::BitWriter::new();
-                    w.write(code as u32, len as u32);
+                    w.write(u32::from(code), u32::from(len));
                     w.write(filler, 24); // plenty of trailing bits to peek into
                     let bits = w.finish();
 
@@ -524,7 +543,7 @@ mod tests {
                 }
             }
         }
-        for t in PAIR_TABLES.iter() {
+        for t in &PAIR_TABLES {
             if t.dim != 0 {
                 check(&t.book);
             }

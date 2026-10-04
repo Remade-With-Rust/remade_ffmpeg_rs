@@ -144,8 +144,8 @@ fn snap() -> Snap {
 }
 
 impl Snap {
-    fn since(self, base: Snap) -> Snap {
-        Snap {
+    fn since(self, base: Self) -> Self {
+        Self {
             alloc: self.alloc - base.alloc,
             zeroed: self.zeroed - base.zeroed,
             realloc: self.realloc - base.realloc,
@@ -187,7 +187,7 @@ fn make_pcm(frames: usize) -> Vec<f32> {
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
-        h ^= b as u64;
+        h ^= u64::from(b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
