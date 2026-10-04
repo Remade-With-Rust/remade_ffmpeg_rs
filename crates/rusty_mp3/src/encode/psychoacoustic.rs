@@ -196,24 +196,21 @@ impl BandModel {
     }
 }
 
-/// Cached band model for a sample rate (leaked once per rate — at most the ~8 valid
-/// rates ever, ~2 KB each). A thread-local keeps the common same-rate path lock-free.
-fn band_model(sample_rate: u32) -> &'static BandModel {
-    use std::cell::RefCell;
-    thread_local! {
-        static CACHE: RefCell<Option<(u32, &'static BandModel)>> = const { RefCell::new(None) };
-    }
-    CACHE.with(|cell| {
-        let mut c = cell.borrow_mut();
-        if let Some((sr, m)) = *c {
-            if sr == sample_rate {
-                return m;
-            }
-        }
-        let m: &'static BandModel = Box::leak(Box::new(BandModel::new(sample_rate)));
-        *c = Some((sample_rate, m));
-        m
-    })
+/// The nine MPEG Layer III sample rates -- every rate the encoder accepts.
+const MPEG_RATES: [u32; 9] = [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000];
+
+/// The band model for one of the nine MPEG rates, built once per process and
+/// shared by every thread; `None` for any other rate.
+///
+/// It used to be a one-slot thread-local holding a `Box::leak`ed model, which
+/// leaked a fresh ~2.4 KB model on EVERY change of rate, on every thread (its doc
+/// claimed "once per rate"): a host encoding streams of alternating rates grew
+/// without bound. Found by the `encode` fuzz target under LeakSanitizer. A static
+/// table of nine cells cannot grow and leaks nothing.
+fn cached_band_model(sample_rate: u32) -> Option<&'static BandModel> {
+    static MODELS: [OnceLock<BandModel>; 9] = [const { OnceLock::new() }; 9];
+    let i = MPEG_RATES.iter().position(|&r| r == sample_rate)?;
+    Some(MODELS[i].get_or_init(|| BandModel::new(sample_rate)))
 }
 
 /// Detect a transient/attack in a granule's PCM: a sub-block whose energy jumps
@@ -263,7 +260,16 @@ pub fn detect_attack(pcm: &[f32]) -> bool {
 pub fn analyze(pcm: &[f32], sample_rate: u32) -> PsyResult {
     let sfb = tables::sfb_long_offsets(sample_rate);
     let win = hann();
-    let model = band_model(sample_rate); // signal-independent geometry, cached
+    // Signal-independent geometry: cached for the MPEG rates, built on the spot
+    // (never leaked) for any other rate a direct caller passes.
+    let uncached;
+    let model: &BandModel = match cached_band_model(sample_rate) {
+        Some(m) => m,
+        None => {
+            uncached = BandModel::new(sample_rate);
+            &uncached
+        }
+    };
 
     // Q2 — windowed FFT power spectrum.
     let mut re = [0f32; N_FFT];
@@ -353,6 +359,28 @@ pub fn analyze(pcm: &[f32], sample_rate: u32) -> PsyResult {
 
 #[cfg(test)]
 mod tests {
+
+    /// The band-model cache must not grow with rate changes: one model per MPEG
+    /// rate, the SAME allocation however often the rate alternates and from any
+    /// thread (the old one-slot thread-local leaked a new model per change).
+    #[test]
+    fn band_model_cache_is_one_shared_model_per_rate() {
+        let first = cached_band_model(44_100).unwrap() as *const BandModel;
+        for _ in 0..100 {
+            let _ = cached_band_model(48_000).unwrap();
+            assert!(std::ptr::eq(first, cached_band_model(44_100).unwrap()));
+        }
+        let from_thread =
+            std::thread::spawn(|| cached_band_model(44_100).unwrap() as *const BandModel as usize)
+                .join()
+                .unwrap();
+        assert_eq!(from_thread, first as usize);
+        assert!(cached_band_model(7_999).is_none());
+        // An uncached rate still analyses (built on the spot, then dropped).
+        let psy = analyze(&[0.25f32; 1152], 7_999);
+        assert!(psy.perceptual_entropy.is_finite());
+    }
+
     use super::*;
 
     #[test]
