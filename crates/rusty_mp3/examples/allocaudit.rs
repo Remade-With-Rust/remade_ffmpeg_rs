@@ -42,6 +42,48 @@ fn grow_live(by: usize) {
     PEAK.fetch_max(now, Relaxed);
 }
 
+/// `ALLOCAUDIT_SIZES=1`: a histogram of request sizes, so each per-frame
+/// allocation can be attributed to its source by its size. Fixed slots of
+/// atomics with linear probing -- an allocator cannot allocate.
+const SLOTS: usize = 512;
+static SIZE_KEY: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+static SIZE_N: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+static SIZES_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `ALLOCAUDIT_TRACE=<bytes>`: print ONE backtrace for the first streamed-encode
+/// allocation of exactly that size -- the histogram says how many, this says
+/// who. Capturing allocates, so a latch makes the capture's own allocations
+/// (and every later match) skip. Build in the dev profile for symbols.
+static TRACE_SIZE: AtomicUsize = AtomicUsize::new(usize::MAX);
+static TRACE_LATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn tally_size(size: usize) {
+    if !SIZES_ON.load(Relaxed) {
+        return;
+    }
+    if size == TRACE_SIZE.load(Relaxed) && !TRACE_LATCH.swap(true, Relaxed) {
+        eprintln!(
+            "allocation of {size} B:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
+    let key = size + 1; // 0 marks an empty slot
+    let mut i = (size.wrapping_mul(0x9E37_79B9)) % SLOTS;
+    for _ in 0..SLOTS {
+        match SIZE_KEY[i].compare_exchange(0, key, Relaxed, Relaxed) {
+            Ok(_) => {
+                SIZE_N[i].fetch_add(1, Relaxed);
+                return;
+            }
+            Err(k) if k == key => {
+                SIZE_N[i].fetch_add(1, Relaxed);
+                return;
+            }
+            Err(_) => i = (i + 1) % SLOTS,
+        }
+    }
+}
+
 /// Counting shim over the project allocator. Delegates everything; only the
 /// tallies are ours.
 struct Counting;
@@ -51,12 +93,14 @@ unsafe impl GlobalAlloc for Counting {
         N_ALLOC.fetch_add(1, Relaxed);
         BYTES.fetch_add(l.size(), Relaxed);
         grow_live(l.size());
+        tally_size(l.size());
         unsafe { rusty_alloc_api::RustyAlloc.alloc(l) }
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
         N_ZEROED.fetch_add(1, Relaxed);
         BYTES.fetch_add(l.size(), Relaxed);
         grow_live(l.size());
+        tally_size(l.size());
         unsafe { rusty_alloc_api::RustyAlloc.alloc_zeroed(l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
@@ -163,6 +207,14 @@ fn main() {
     });
     let mut mp3: Vec<u8> = Vec::with_capacity(frames * 1024);
 
+    let sizes = std::env::var_os("ALLOCAUDIT_SIZES").is_some();
+    if let Some(n) = std::env::var("ALLOCAUDIT_TRACE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        TRACE_SIZE.store(n, Relaxed);
+    }
+    SIZES_ON.store(sizes || TRACE_SIZE.load(Relaxed) != usize::MAX, Relaxed);
     let t0 = snap();
     for f in 0..frames {
         let s = f * SPF * CH as usize;
@@ -177,6 +229,7 @@ fn main() {
         mp3.extend_from_slice(&p);
     }
     let enc_stats = snap().since(t0);
+    SIZES_ON.store(false, Relaxed);
 
     // ---- DECODE the stream we just produced ----
     let mut dec = Mp3Decoder::new();
@@ -260,4 +313,23 @@ fn main() {
         whole_moved / 1024,
         whole_peak / 1024,
     );
+    if sizes {
+        let mut rows: Vec<(usize, usize)> = (0..SLOTS)
+            .filter_map(|i| {
+                let k = SIZE_KEY[i].load(Relaxed);
+                (k != 0).then(|| (k - 1, SIZE_N[i].load(Relaxed)))
+            })
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        println!(
+            "
+  streamed-encode allocation sizes (bytes x count, per frame):"
+        );
+        for (size, n) in rows.iter().take(16) {
+            println!(
+                "    {size:>8} B  x {n:>7}   {:.2}/frame",
+                *n as f64 / ef as f64
+            );
+        }
+    }
 }
