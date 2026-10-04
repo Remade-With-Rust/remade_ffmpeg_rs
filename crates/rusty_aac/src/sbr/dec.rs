@@ -964,7 +964,7 @@ impl SbrChannelState {
                 let id = r.read_bits(2)?;
                 if id == 2 && ps_allowed {
                     let ps = self.ps.get_or_insert_with(|| Box::new(super::ps::PsState::new()));
-                    bits_left -= ps.read_data(r, bits_left as usize)? as i64;
+                    bits_left -= ps.read_data(r, bits_left as usize, 2 * nts)? as i64;
                 } else {
                     r.skip(bits_left as usize)?;
                     bits_left = 0;

@@ -19,6 +19,7 @@ const MAX_SSB: usize = 91;
 const AP_LINKS: usize = 3;
 const MAX_DELAY: usize = 14;
 const MAX_AP_DELAY: usize = 5;
+/// The most QMF slots in a frame (1024-sample frames; 960 gives 30).
 const QMF_SLOTS: usize = 32;
 
 const NUM_ENV_TAB: [[usize; 4]; 2] = [[0, 1, 2, 4], [1, 2, 3, 4]];
@@ -309,6 +310,8 @@ pub(crate) struct PsState {
     opd_par: [[i8; MAX_PAR]; MAX_ENV],
     is34bands: bool,
     is34bands_old: bool,
+    /// QMF slots per frame: 32, or 30 for 960-sample frames.
+    slots: usize,
     // processing state
     in_buf: Vec<[Cpx; 44]>,
     delay: Vec<[Cpx; QMF_SLOTS + MAX_DELAY]>,
@@ -344,6 +347,7 @@ impl PsState {
             opd_par: [[0; MAX_PAR]; MAX_ENV],
             is34bands: false,
             is34bands_old: false,
+            slots: QMF_SLOTS,
             in_buf: vec![[[0.0; 2]; 44]; 5],
             delay: vec![[[0.0; 2]; QMF_SLOTS + MAX_DELAY]; MAX_SSB],
             ap_delay: vec![[[[0.0; 2]; QMF_SLOTS + MAX_AP_DELAY]; AP_LINKS]; 50],
@@ -435,7 +439,8 @@ impl PsState {
 
     /// Parse `ps_data()` within `bits_left` bits; returns the bits consumed
     /// (all of `bits_left` on error, which also disables PS until the next header).
-    pub(crate) fn read_data(&mut self, r: &mut BitReader, bits_left: usize) -> Result<usize> {
+    pub(crate) fn read_data(&mut self, r: &mut BitReader, bits_left: usize, slots: usize) -> Result<usize> {
+        self.slots = slots;
         let start = r.position();
         match self.read_data_inner(r) {
             Ok(true) if r.position() - start <= bits_left => Ok(r.position() - start),
@@ -489,7 +494,7 @@ impl PsState {
         } else {
             let log2 = [0, 0, 1, 1, 2][self.num_env];
             for e in 1..=self.num_env {
-                self.border_position[e] = ((e * QMF_SLOTS) >> log2) as i32 - 1;
+                self.border_position[e] = ((e * self.slots) >> log2) as i32 - 1;
             }
         }
         if self.enable_iid {
@@ -533,7 +538,7 @@ impl PsState {
 
         // A last border before the frame end gets a repeated envelope.
         let n = self.num_env;
-        if n == 0 || self.border_position[n] < QMF_SLOTS as i32 - 1 {
+        if n == 0 || self.border_position[n] < self.slots as i32 - 1 {
             let source = if n > 0 { n as i64 - 1 } else { self.num_env_old as i64 - 1 };
             if source >= 0 && source as usize != n {
                 let s = source as usize;
@@ -557,7 +562,7 @@ impl PsState {
                 return Ok(false);
             }
             self.num_env += 1;
-            self.border_position[self.num_env] = QMF_SLOTS as i32 - 1;
+            self.border_position[self.num_env] = self.slots as i32 - 1;
         }
 
         self.is34bands_old = self.is34bands;
@@ -598,8 +603,9 @@ fn hybrid_filter(x: &[Cpx], filter: &[Cpx; 8]) -> Cpx {
 impl PsState {
     fn hybrid_analysis(&mut self, out: &mut [[Cpx; 32]], l: &[[Cpx; 64]], is34: bool) {
         let t = tables();
+        let len = self.slots;
         for i in 0..5 {
-            for (j, slot) in l.iter().enumerate().take(38) {
+            for (j, slot) in l.iter().enumerate().take(len + 6) {
                 self.in_buf[i][j + 6] = slot[i];
             }
         }
@@ -608,7 +614,7 @@ impl PsState {
                 .into_iter()
                 .enumerate()
             {
-                for n in 0..32 {
+                for n in 0..len {
                     let x = &self.in_buf[band][n..n + 13];
                     for (q, f) in filter.iter().enumerate() {
                         out[base + q][n] = hybrid_filter(x, f);
@@ -616,12 +622,12 @@ impl PsState {
                 }
             }
             for (i, row) in out.iter_mut().enumerate().take(91).skip(32) {
-                for n in 0..32 {
+                for n in 0..len {
                     row[n] = l[n][i - 27];
                 }
             }
         } else {
-            for n in 0..32 {
+            for n in 0..len {
                 let x = &self.in_buf[0][n..n + 13];
                 let mut tmp = [[0f32; 2]; 8];
                 for (q, f) in t.f20_0_8.iter().enumerate() {
@@ -635,7 +641,7 @@ impl PsState {
                 out[5][n] = [tmp[3][0] + tmp[4][0], tmp[3][1] + tmp[4][1]];
             }
             for (band, base, reverse) in [(1usize, 6usize, true), (2, 8, false)] {
-                for n in 0..32 {
+                for n in 0..len {
                     let x = &self.in_buf[band][n..n + 13];
                     let re_in = G1_Q2[6] * x[6][0];
                     let im_in = G1_Q2[6] * x[6][1];
@@ -650,20 +656,20 @@ impl PsState {
                 }
             }
             for (i, row) in out.iter_mut().enumerate().take(71).skip(10) {
-                for n in 0..32 {
+                for n in 0..len {
                     row[n] = l[n][i - 7];
                 }
             }
         }
         for row in self.in_buf.iter_mut() {
-            row.copy_within(32..38, 0);
+            row.copy_within(len..len + 6, 0);
         }
     }
 }
 
-fn hybrid_synthesis(out: &mut [[Cpx; 64]], inp: &[[Cpx; 32]], is34: bool) {
+fn hybrid_synthesis(out: &mut [[Cpx; 64]], inp: &[[Cpx; 32]], is34: bool, len: usize) {
     let add = |a: Cpx, b: Cpx| [a[0] + b[0], a[1] + b[1]];
-    for n in 0..32 {
+    for n in 0..len {
         let o = &mut out[n];
         if is34 {
             let sum = |range: std::ops::Range<usize>| {
@@ -707,6 +713,7 @@ impl PsState {
         const PEAK_DECAY: f32 = 0.765_928_3;
         const AP_A: [f32; 3] = [0.651_439_04, 0.564_718_1, 0.489_541_66];
         let t = tables();
+        let len = self.slots;
         let i34 = is34 as usize;
         let k_to_i: &[u8] = if is34 { &K_TO_I_34 } else { &K_TO_I_20 };
         if is34 != self.is34bands_old {
@@ -719,13 +726,13 @@ impl PsState {
         let mut power = [[0f32; 32]; 34];
         for k in 0..NR_BANDS[i34] {
             let p = &mut power[k_to_i[k] as usize];
-            for n in 0..32 {
+            for n in 0..len {
                 p[n] += s[k][n][0] * s[k][n][0] + s[k][n][1] * s[k][n][1];
             }
         }
         let mut gain = [[0f32; 32]; 34];
         for i in 0..NR_PAR_BANDS[i34] {
-            for n in 0..32 {
+            for n in 0..len {
                 let decayed = PEAK_DECAY * self.peak_decay_nrg[i];
                 self.peak_decay_nrg[i] = decayed.max(power[i][n]);
                 self.power_smooth[i] += A_SMOOTH * (power[i][n] - self.power_smooth[i]);
@@ -737,21 +744,21 @@ impl PsState {
         }
         for k in 0..NR_BANDS[i34] {
             let d = &mut self.delay[k];
-            d.copy_within(32..32 + MAX_DELAY, 0);
-            d[MAX_DELAY..].copy_from_slice(&s[k]);
+            d.copy_within(len..len + MAX_DELAY, 0);
+            d[MAX_DELAY..MAX_DELAY + len].copy_from_slice(&s[k][..len]);
         }
         for k in 0..NR_ALLPASS_BANDS[i34] {
             let g = &gain[k_to_i[k] as usize];
             let slope = (1.0f32 - 0.05 * (k as i32 - DECAY_CUTOFF[i34]) as f32).clamp(0.0, 1.0);
             let ap = &mut self.ap_delay[k];
             for link in ap.iter_mut() {
-                link.copy_within(32..32 + MAX_AP_DELAY, 0);
+                link.copy_within(len..len + MAX_AP_DELAY, 0);
             }
             let ag = [AP_A[0] * slope, AP_A[1] * slope, AP_A[2] * slope];
             let phi = t.phi_fract[i34][k];
             let q = &t.q_fract_allpass[i34][k];
             let dl = &self.delay[k];
-            for n in 0..32 {
+            for n in 0..len {
                 let x = dl[MAX_DELAY - 2 + n];
                 let mut in_re = x[0] * phi[0] - x[1] * phi[1];
                 let mut in_im = x[0] * phi[1] + x[1] * phi[0];
@@ -773,7 +780,7 @@ impl PsState {
             let g = &gain[k_to_i[k] as usize];
             // Fixed delay: 14 slots below the short-delay band, 1 above it.
             let lag = if k < SHORT_DELAY_BAND[i34] { 14 } else { 1 };
-            for n in 0..32 {
+            for n in 0..len {
                 let x = self.delay[k][MAX_DELAY - lag + n];
                 out[k][n] = [x[0] * g[n], x[1] * g[n]];
             }
@@ -1076,7 +1083,7 @@ impl PsState {
         self.hybrid_analysis(&mut lbuf, l, is34);
         self.decorrelation(&mut rbuf, &lbuf, is34);
         self.stereo_processing(&mut lbuf, &mut rbuf, is34);
-        hybrid_synthesis(l, &lbuf, is34);
-        hybrid_synthesis(r, &rbuf, is34);
+        hybrid_synthesis(l, &lbuf, is34, self.slots);
+        hybrid_synthesis(r, &rbuf, is34, self.slots);
     }
 }
