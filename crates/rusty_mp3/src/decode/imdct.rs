@@ -208,10 +208,19 @@ pub fn hybrid(
                 }
             }
         } else {
-            let wt = match gi.block_type {
-                BlockType::Start => 1,
-                BlockType::Stop => 3,
-                _ => 0,
+            // The mixed flag is not exclusive to short blocks: on ANY
+            // window-switching block its two lowest subbands use the NORMAL window
+            // (ISO 11172-3 2.4.2.7; FFmpeg `win_idx = switch_point && j < 2 ? 0 :
+            // block_type`). A Start/Stop block with the flag set put its start/stop
+            // window on subbands 0..1 -- ISO l3-si_block, all error in subband 0-1.
+            let wt = if gi.mixed_block && sb < 2 {
+                0
+            } else {
+                match gi.block_type {
+                    BlockType::Start => 1,
+                    BlockType::Stop => 3,
+                    _ => 0,
+                }
             };
             // **D3** — half the dot products are free. The kernel has two exact
             // symmetries, and they hold BIT-EXACTLY in the stored f32 tables
@@ -301,10 +310,14 @@ mod tests {
                     }
                 }
             } else {
-                let wt = match gi.block_type {
-                    BlockType::Start => 1,
-                    BlockType::Stop => 3,
-                    _ => 0,
+                let wt = if gi.mixed_block && sb < 2 {
+                    0
+                } else {
+                    match gi.block_type {
+                        BlockType::Start => 1,
+                        BlockType::Stop => 3,
+                        _ => 0,
+                    }
                 };
                 for n in 0..36 {
                     let mut acc = 0f32;
@@ -348,6 +361,9 @@ mod tests {
             (BlockType::Stop, false),
             (BlockType::Short, false),
             (BlockType::Short, true), // the population the corpus cannot reach
+            // The mixed flag on a Start/Stop block (ISO l3-si_block carries both).
+            (BlockType::Start, true),
+            (BlockType::Stop, true),
         ] {
             let gi = GranuleSideInfo {
                 window_switching: bt != BlockType::Long,

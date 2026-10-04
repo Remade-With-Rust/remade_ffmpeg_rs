@@ -100,13 +100,26 @@ pub fn decode(
         if is_short {
             // Groups fill (sfb, window) linearly, sfb-major (idx = 3·sfb + window) —
             // proven bit-identical to minimp3.
+            //
+            // MIXED (blocktype 2): the first 6 values are the LONG bands 0..6, and
+            // the short triplets then start at short band 3 (ISO 13818-3, and
+            // minimp3's mixed sfb table). Filling short bands from 0 here would put
+            // the long-part scalefactors on short bands 0..1 and shift every short
+            // band after them by two.
+            let long_vals = if gi.mixed_block { 6 } else { 0 };
+            let first_short = if gi.mixed_block { 3 } else { 0 };
             let mut idx = 0usize;
             for g in 0..4 {
                 for _ in 0..nr[g] {
                     let v = r.read(slen[g] as u32) as u8;
-                    let (sfb, window) = (idx / 3, idx % 3);
-                    if sfb < crate::frame::SFB_SHORT {
-                        sf.short[window][sfb] = v;
+                    if idx < long_vals {
+                        sf.long[idx] = v;
+                    } else {
+                        let j = idx - long_vals;
+                        let (sfb, window) = (first_short + j / 3, j % 3);
+                        if sfb < crate::frame::SFB_SHORT {
+                            sf.short[window][sfb] = v;
+                        }
                     }
                     idx += 1;
                 }

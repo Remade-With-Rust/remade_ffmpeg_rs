@@ -11,7 +11,7 @@
 use std::sync::OnceLock;
 
 use crate::frame::{BlockType, GranuleSideInfo, GRANULE_LINES};
-use crate::header::FrameHeader;
+use crate::header::{FrameHeader, MpegVersion};
 use crate::tables;
 
 use super::scalefactors::ScaleFactors;
@@ -83,9 +83,39 @@ pub fn apply(
         }
     } else {
         // Short block: dequant per (band, window) and reorder into subband order.
-        // brick: mixed blocks (long bands 0..2 then short) are not yet special-cased.
+        //
+        // A MIXED block codes its lowest two subbands LONG: the first `long_end`
+        // long scalefactor bands (8 for MPEG-1, 6 for MPEG-2/2.5 -- FFmpeg's
+        // `switch_point` rule) take the long gain, long scalefactors and pretab,
+        // with no subblock gain and no reorder; the short bands then start at 3.
+        // Treating those lines as short applied a subblock gain and a reorder to
+        // long data: ISO l3-si_block decoded 19/126 granules wrong.
+        let first_short = if gi.mixed_block {
+            let long_end = if header.version == MpegVersion::V1 {
+                8
+            } else {
+                6
+            };
+            let off = tables::sfb_long_offsets(header.sample_rate);
+            for sfb in 0..long_end {
+                let start = off[sfb] as usize;
+                if start >= nz {
+                    break;
+                }
+                let end = (off[sfb + 1] as usize).min(nz);
+                let pre = if gi.preflag { tables::PRETAB[sfb] } else { 0 } as f64;
+                let exp = 0.25 * gain as f64 - sf_mult * (sf.long[sfb] as f64 + pre);
+                let scale = 2f64.powf(exp);
+                for i in start..end {
+                    out[i] = dequant(coeffs[i], pow, scale);
+                }
+            }
+            3
+        } else {
+            0
+        };
         let off = tables::sfb_short_offsets(header.sample_rate);
-        for sfb in 0..13 {
+        for sfb in first_short..13 {
             let start = off[sfb] as usize;
             let width = (off[sfb + 1] - off[sfb]) as usize;
             if start * 3 >= nz {
