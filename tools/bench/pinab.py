@@ -37,7 +37,11 @@ import psutil
 
 # Avoid CPU 0: it takes the interrupt load.
 PIN_CPU = int(os.environ.get("PIN_CPU", "4"))
-DUR = re.compile(r"total ([\d.]+) ms")
+# The arm's duration. `PINAB_DUR` overrides the pattern to A/B ONE phase of a
+# multi-phase report -- e.g. `PINAB_DUR='conform +([\d.]+) ms'` against the
+# rff CLI's RFF_PHASES table -- when a change touches only that phase and the
+# others would just add their noise to the total.
+DUR = re.compile(os.environ.get("PINAB_DUR", r"total ([\d.]+) ms"))
 
 
 def split_arm(arm):

@@ -7,6 +7,7 @@
 #
 # Encode: WAV -> MP3 over s16 and f32 input, stereo and mono, MPEG-1/2/2.5
 # rates, CBR 128/192, CBR 320 (no reservoir), VBR, and the lookahead reservoir.
+# Conform: WAV s16 <-> f32 (the shared sample-format conversion).
 # Decode: MP3 -> WAV (s16 and f32 output) on every MP3 the encode half wrote,
 # plus any LAME/shine streams in corpus/dl. Every pair must `cmp` identical.
 set -euo pipefail
@@ -42,6 +43,10 @@ for w in "${inputs[@]}"; do
   done
   run_pair "$stem enc lookahead" "MP3_RESV_LOOKAHEAD=1" -i "$w" -c:a mp3 -b:a 128k -f mp3
 done
+
+# The shared sample-format conform, both directions (s16 -> f32, f32 -> s16).
+run_pair "conform s16->f32" "" -i "$root/corpus/corp_st_mus_guitar.wav" -c:a pcm_f32le -f wav
+run_pair "conform f32->s16" "" -i "$tmp/st_f32.wav" -c:a pcm_s16le -f wav
 
 for m in "$tmp"/*.mp3 "$root"/corpus/dl/*.mp3; do
   [ -f "$m" ] || continue
