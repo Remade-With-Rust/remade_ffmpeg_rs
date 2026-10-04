@@ -309,7 +309,7 @@ impl Decoder {
         let tags_per = |c: u8| -> usize {
             [0, 1, 1, 2, 3, 3, 4, 5, 0, 0, 0, 5, 5, 16, 5, 0][c as usize & 15]
         };
-        let mut hit = |s: &mut Self, t: usize, i: usize| -> Option<(usize, usize)> {
+        let hit = |s: &mut Self, t: usize, i: usize| -> Option<(usize, usize)> {
             s.tags_mapped += 1;
             s.instance(t as u8, i as u8)
         };

@@ -189,11 +189,9 @@ pub fn imdct_and_window_eld(window: &[f32], n: usize, coeffs: &mut [f32], buf: &
         i += 2;
     }
     dsp::imdct_half(&coeffs[..n], &mut buf[..n], OUT_NORM);
-    let mut i = 0;
-    while i < n {
-        buf[i] = -2.0 * buf[i];
-        buf[i + 1] = 2.0 * buf[i + 1];
-        i += 2;
+    // Even outputs change sign (the float reference's (USE_FIXED + 1) factor is 1).
+    for v in buf[..n].iter_mut().step_by(2) {
+        *v = -*v;
     }
     for i in n4..n2 {
         out[i - n4] = buf[n2 - 1 - i] * window[i - n4]

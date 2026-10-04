@@ -46,12 +46,12 @@ pub const AOT_SBR: u8 = 5;
 pub const AOT_AAC_LC: u8 = 2;
 /// HE-AAC v2 (SBR + Parametric Stereo).
 pub const AOT_PS: u8 = 29;
-/// ER-BSAC, the one object type that carries `extensionChannelConfiguration`.
-const AOT_ER_BSAC: u8 = 22;
 
 /// `syncExtensionType` marking backward-compatible SBR signalling.
+#[cfg(test)]
 const SYNC_EXT_SBR: u32 = 0x2B7;
 /// `syncExtensionType` marking backward-compatible PS signalling.
+#[cfg(test)]
 const SYNC_EXT_PS: u32 = 0x548;
 
 /// `extension_type` values inside a `fill_element` payload.

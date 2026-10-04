@@ -362,6 +362,18 @@ pub fn parse(data: &[u8]) -> Result<StreamConfig> {
 /// Parse from a reader positioned at an `AudioSpecificConfig` (e.g. inside a LATM
 /// `StreamMuxConfig`). `align_base` is the bit position the config starts at.
 pub fn parse_from(r: &mut BitReader, align_base: usize) -> Result<StreamConfig> {
+    parse_from_opts(r, align_base, true)
+}
+
+/// As [`parse_from`], choosing whether to look for the backward-compatible
+/// SBR/PS sync extension after the core config. A config embedded in a LATM
+/// `StreamMuxConfig` (audioMuxVersion 0) is followed directly by mux fields, so
+/// probing there would read them as a sync word; the reference does not probe.
+pub fn parse_from_opts(
+    r: &mut BitReader,
+    align_base: usize,
+    sync_extension: bool,
+) -> Result<StreamConfig> {
     let mut object_type = read_aot(r)?;
     let (sf_index, sample_rate) = read_rate(r)?;
     let channel_config = r.read_bits(4)? as u8;
@@ -409,7 +421,7 @@ pub fn parse_from(r: &mut BitReader, align_base: usize) -> Result<StreamConfig> 
     }
 
     // Backward-compatible SBR/PS signalling after the core config.
-    if ext_aot != aot::SBR && r.bits_left() >= 16 {
+    if sync_extension && ext_aot != aot::SBR && r.bits_left() >= 16 {
         let sync = r.read_bits(11)?;
         if sync == 0x2B7 {
             let e = read_aot(r)?;

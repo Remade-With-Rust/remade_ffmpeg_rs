@@ -26,8 +26,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use rusty_aac::latm::{find_sync, LatmReader};
-use rusty_aac::{AacDecoder, AudioSpecificConfig};
+use rusty_aac::latm::{find_sync, LatmDecoder};
+use rusty_aac::AacDecoder;
 
 #[global_allocator]
 static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
@@ -180,6 +180,9 @@ struct Decoded {
     pcm: Vec<f32>,
     errors: usize,
     first_err: Option<String>,
+    /// Later configuration segments: (start frame, channels, rate, pcm).
+    segments: Vec<(usize, u32, u32, Vec<f32>)>,
+    frames: usize,
 }
 
 fn decode_ours(p: &Probe, asc: &[u8], pkts: &[Vec<u8>]) -> Result<Decoded, String> {
@@ -189,6 +192,8 @@ fn decode_ours(p: &Probe, asc: &[u8], pkts: &[Vec<u8>]) -> Result<Decoded, Strin
         pcm: Vec::new(),
         errors: 0,
         first_err: None,
+        segments: Vec::new(),
+        frames: 0,
     };
     let push = |d: &mut Decoded, r: rusty_aac::Result<rusty_aac::DecodedAudio>| match r {
         Ok(a) => {
@@ -196,9 +201,19 @@ fn decode_ours(p: &Probe, asc: &[u8], pkts: &[Vec<u8>]) -> Result<Decoded, Strin
                 d.channels = a.channels as u32;
                 d.rate = a.sample_rate;
             }
-            if a.channels as u32 == d.channels {
+            let n = a.frames();
+            if a.channels as u32 == d.channels && d.segments.is_empty() {
                 d.pcm.extend_from_slice(&a.samples);
+            } else {
+                let start = d.frames;
+                match d.segments.last_mut() {
+                    Some(seg) if seg.1 == a.channels as u32 && seg.2 == a.sample_rate => {
+                        seg.3.extend_from_slice(&a.samples)
+                    }
+                    _ => d.segments.push((start, a.channels as u32, a.sample_rate, a.samples.clone())),
+                }
             }
+            d.frames += n;
         }
         Err(rusty_aac::Error::Again) => {}
         Err(e) => {
@@ -209,20 +224,20 @@ fn decode_ours(p: &Probe, asc: &[u8], pkts: &[Vec<u8>]) -> Result<Decoded, Strin
         }
     };
     if p.codec == "aac_latm" {
-        let mut reader = LatmReader::new();
-        let mut dec: Option<AacDecoder> = None;
+        let mut dec = LatmDecoder::new();
         for pk in pkts {
-            let start = find_sync(pk).unwrap_or(0);
-            match reader.parse(&pk[start..]) {
-                Ok(fr) => {
-                    if dec.is_none() {
-                        let cfg: AudioSpecificConfig = fr.config;
-                        dec = Some(AacDecoder::with_config(cfg));
+            let mut off = find_sync(pk).unwrap_or(0);
+            while off < pk.len() {
+                match dec.decode(&pk[off..], None) {
+                    Ok((a, used)) => {
+                        push(&mut d, Ok(a));
+                        off += used.max(1);
                     }
-                    let r = dec.as_mut().unwrap().decode(&fr.au, None);
-                    push(&mut d, r);
+                    Err(e) => {
+                        push(&mut d, Err(e));
+                        break;
+                    }
                 }
-                Err(e) => push(&mut d, Err(e)),
             }
         }
     } else {
@@ -317,6 +332,77 @@ fn score(ours: &[i32], refr: &[i32], ch: usize) -> Option<Score> {
         len_ours: fo,
         len_ref: fr,
     })
+}
+
+/// For a multichannel FAIL: which reference channel each of ours matches best
+/// (SNR at the given lag) — a permutation here is a channel-order fault.
+fn chan_matrix(ours: &[i32], refr: &[i32], ch: usize, lag: i64) -> String {
+    let (fo, fr) = (ours.len() / ch, refr.len() / ch);
+    let mut out = String::new();
+    for i in 0..ch {
+        let mut best = (f64::MIN, 0usize);
+        for j in 0..ch {
+            let (mut se, mut sn) = (0f64, 0f64);
+            for t in 0..fr {
+                let u = t as i64 + lag;
+                if u < 0 || u as usize >= fo {
+                    continue;
+                }
+                let a = ours[u as usize * ch + i] as f64;
+                let b = refr[t * ch + j] as f64;
+                se += (a - b) * (a - b);
+                sn += b * b;
+            }
+            let snr = if se == 0.0 { 999.0 } else { 10.0 * (sn / se).log10() };
+            if snr > best.0 {
+                best = (snr, j);
+            }
+        }
+        out.push_str(&format!(" ours{i}->ref{}({:.0}dB)", best.1, best.0));
+    }
+    out
+}
+
+/// Streams where FFmpeg 8.1.2 itself deviates, each with the reason and the
+/// mapping under which our output must still be sample-exact.
+/// `perm[i]` = the FFmpeg channel that our channel `i` must equal; channels with
+/// `None` are excluded (FFmpeg's content there is not decoded audio).
+struct Known {
+    stream: &'static str,
+    perm: &'static [Option<usize>],
+    reason: &'static str,
+}
+
+const KNOWN: &[Known] = &[
+    Known {
+        stream: "al22_chCfg0PCE_44.mp4",
+        perm: &[Some(6), Some(7), Some(2), Some(3), Some(4), Some(5), Some(0), Some(1)],
+        reason: "PCE height extension (CRC-valid) puts the 3rd front pair on top; FFmpeg 8.1.2 ignores heights and swaps it with the FLC/FRC pair",
+    },
+    Known {
+        stream: "aac-sce-in-stereo.mp4",
+        perm: &[Some(0), None],
+        reason: "stereo config carrying one SCE: FFmpeg 8.1.2 leaves channel 2 as an uninitialised buffer (no relation to any decoded signal); we emit silence",
+    },
+];
+
+fn apply_known(k: &Known, ours: &[i32], refr: &[i32], ch: usize) -> (Vec<i32>, Vec<i32>) {
+    let n = (ours.len() / ch).max(refr.len() / ch);
+    let mut o = vec![0i32; ours.len()];
+    let mut r = vec![0i32; refr.len()];
+    for t in 0..n {
+        for (i, m) in k.perm.iter().enumerate() {
+            if let Some(j) = m {
+                if t * ch + i < ours.len() {
+                    o[t * ch + i] = ours[t * ch + i];
+                }
+                if t * ch + j < refr.len() && t * ch + i < r.len() {
+                    r[t * ch + i] = refr[t * ch + j];
+                }
+            }
+        }
+    }
+    (o, r)
 }
 
 fn verdict(s: &Option<Score>) -> String {
@@ -474,12 +560,17 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
         // (the one we emit) as `<stem>_reorder.s16` where they differ.
         let stem = f.with_extension("");
         let refb = read_s16(Path::new(&format!("{}_reorder.s16", stem.to_string_lossy())))
-            .or_else(|| read_s16(&f.with_extension("s16")))
             .or_else(|| {
-                // Some FATE refs drop the `_ep0` (error-protection) suffix.
+                // `_ep0` streams: FATE's reference is the one without the suffix.
                 let s = stem.to_string_lossy();
-                read_s16(Path::new(&format!("{}.s16", s.trim_end_matches("_ep0"))))
-            });
+                let t = s.trim_end_matches("_ep0");
+                if t.len() != s.len() {
+                    read_s16(Path::new(&format!("{t}.s16")))
+                } else {
+                    None
+                }
+            })
+            .or_else(|| read_s16(&f.with_extension("s16")));
         let (status, va, vb) = match &ours {
             Err(e) => (format!("ERR {e}"), "-".to_string(), "-".to_string()),
             Ok(d) if d.pcm.is_empty() => (
@@ -489,6 +580,10 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
             ),
             Ok(d) => {
                 let o: Vec<i32> = d.pcm.iter().map(|&x| to_s16(x)).collect();
+                if let Ok(dir) = std::env::var("AACCONF_DUMP") {
+                    let bytes: Vec<u8> = o.iter().flat_map(|&v| (v as i16).to_le_bytes()).collect();
+                    let _ = fs::write(Path::new(&dir).join(format!("{}.s16", name.replace('/', "_"))), bytes);
+                }
                 let ch = d.channels.max(1) as usize;
                 let sa = if d.channels == p.channels {
                     refa.as_ref().and_then(|r| score(&o, r, ch))
@@ -504,7 +599,47 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
                 if d.errors > 0 {
                     st.push_str(&format!(" e{}", d.errors));
                 }
+                let known = KNOWN.iter().find(|k| name.ends_with(k.stream) && k.perm.len() == ch);
+                let sa = match (known, refa.as_ref()) {
+                    (Some(k), Some(r)) if d.channels == p.channels => {
+                        let (ko, kr) = apply_known(k, &o, r, ch);
+                        score(&ko, &kr, ch)
+                    }
+                    _ => sa,
+                };
+                if std::env::var("AACCONF_DEBUG").is_ok() { eprintln!("dbg {name} known={} refa={:?} sa={}", known.is_some(), refa.as_ref().map(|r| r.len()), sa.is_some()); }
                 let mut va = verdict(&sa);
+                // Configuration changes mid-stream: score each later segment against
+                // FFmpeg forced to that segment's layout (a matching layout passes
+                // through its resampler unchanged).
+                for (start, sch, srate, spcm) in &d.segments {
+                    let ac = sch.to_string();
+                    let ar = srate.to_string();
+                    let r = run(
+                        "ffmpeg",
+                        &["-v", "error", "-flags", "+bitexact", "-i", &fs_, "-map", "0:a:0", "-ac", &ac, "-ar", &ar, "-f", "s16le", "-"],
+                    )
+                    .ok()
+                    .map(|b| b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as i32).collect::<Vec<i32>>());
+                    let so: Vec<i32> = spcm.iter().map(|&x| to_s16(x)).collect();
+                    let c = *sch as usize;
+                    let tail = r.map(|r| r.get(start * c..).map(|t| t.to_vec()).unwrap_or_default());
+                    let sc = tail.as_ref().and_then(|t| score(&so, t, c));
+                    let v = verdict(&sc);
+                    va = if v.starts_with("EXACT") && va.starts_with("EXACT") {
+                        format!("{va} +seg@{start} {c}ch EXACT")
+                    } else {
+                        format!("FAIL seg@{start} {c}ch: {v} | first: {va}")
+                    };
+                }
+                if known.is_some() && va.starts_with("EXACT") {
+                    va = va.replacen("EXACT", "KNOWN", 1);
+                }
+                if verbose && va.starts_with("FAIL") && ch > 1 {
+                    if let (Some(r), Some(sc)) = (refa.as_ref(), sa.as_ref()) {
+                        va.push_str(&chan_matrix(&o, r, ch, sc.lag));
+                    }
+                }
                 if d.channels != p.channels || d.rate != p.rate {
                     va = format!("MISMATCH want {}Hz/{}", p.rate, p.channels);
                 }
@@ -513,6 +648,8 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
         };
         let cat = if va.starts_with("EXACT") {
             'E'
+        } else if va.starts_with("KNOWN") {
+            'K'
         } else if va.starts_with("NEAR") {
             'N'
         } else {
@@ -580,16 +717,20 @@ fn main() {
             });
         }
     });
-    let (mut exact, mut near, mut fail, mut total) = (0, 0, 0, 0);
+    let (mut exact, mut near, mut fail, mut total, mut known) = (0, 0, 0, 0, 0);
     for (text, cat) in results.into_inner().unwrap().into_iter().flatten() {
         print!("{text}");
         match cat {
             'E' => exact += 1,
+            'K' => known += 1,
             'N' => near += 1,
             'F' => fail += 1,
             _ => continue,
         }
         total += 1;
     }
-    println!("\n# {total} streams: {exact} EXACT, {near} NEAR, {fail} FAIL/ERR (vs FFmpeg)");
+    println!("\n# {total} streams: {exact} EXACT, {known} KNOWN (exact under a documented FFmpeg deviation), {near} NEAR, {fail} FAIL/ERR");
+    for k in KNOWN {
+        println!("#   KNOWN {}: {}", k.stream, k.reason);
+    }
 }

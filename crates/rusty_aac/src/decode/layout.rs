@@ -103,37 +103,56 @@ pub fn pce_layout(p: &Pce) -> Vec<Tag> {
         rows.push(t(TYPE_CCE, tag, POS_CC));
     }
     let (nf, ns, nb) = (p.front.len(), p.side.len(), p.back.len());
-    let c = &p.comment;
-    if c.len() >= 2 + (nf * 2 + ns * 2 + nb * 2 + 7) / 8 && c.first() == Some(&0xAC) {
-        // Height extension: 2 bits per front/side/back element.
-        let mut heights = Vec::new();
-        let mut bitpos = 8usize;
-        let mut invalid = false;
-        for _ in 0..nf + ns + nb {
-            let byte = c[bitpos / 8];
-            let h = (byte >> (6 - (bitpos % 8))) & 3;
-            invalid |= h > 2;
-            heights.push(h);
-            bitpos += 2;
-        }
-        if !invalid {
-            let positional = &rows[..nf + ns + nb];
-            let rest = rows[nf + ns + nb..].to_vec();
-            let mut out = Vec::new();
-            for layer in 0..3u8 {
-                for (i, r) in positional.iter().enumerate() {
-                    if heights[i] == layer {
-                        out.push(*r);
-                    }
-                }
-                if layer == 0 {
-                    out.extend_from_slice(&rest);
+    if let Some(heights) = height_extension(&p.comment, nf + ns + nb) {
+        let positional = &rows[..nf + ns + nb];
+        let rest = rows[nf + ns + nb..].to_vec();
+        let mut out = Vec::new();
+        for layer in 0..3u8 {
+            for (i, r) in positional.iter().enumerate() {
+                if heights[i] == layer {
+                    out.push(*r);
                 }
             }
-            return out;
+            if layer == 0 {
+                out.extend_from_slice(&rest);
+            }
         }
+        return out;
     }
     rows
+}
+
+/// The PCE height extension carried in the comment field (ISO 14496-3, PCE
+/// `height_extension_element`): sync byte 0xAC, 2 bits of height per
+/// front/side/back element (0 normal, 1 top, 2 bottom), byte alignment, then a
+/// CRC-8 (x^8+x^2+x+1, init 0xFF) over the sync byte and the height bytes. The
+/// heights are honoured only when the CRC verifies — a comment that merely
+/// starts with 0xAC must not move speakers.
+fn height_extension(c: &[u8], n: usize) -> Option<Vec<u8>> {
+    let hbytes = (2 * n).div_ceil(8);
+    if n == 0 || c.len() < 2 + hbytes || c[0] != 0xAC {
+        return None;
+    }
+    let mut crc = 0xFFu8;
+    for &b in &c[..1 + hbytes] {
+        crc ^= b;
+        for _ in 0..8 {
+            crc = if crc & 0x80 != 0 { (crc << 1) ^ 0x07 } else { crc << 1 };
+        }
+    }
+    if crc != c[1 + hbytes] {
+        return None;
+    }
+    let mut heights = Vec::with_capacity(n);
+    for i in 0..n {
+        let byte = c[1 + i / 4];
+        let h = (byte >> (6 - 2 * (i % 4))) & 3;
+        if h > 2 {
+            return None;
+        }
+        heights.push(h);
+    }
+    Some(heights)
 }
 
 // AVChannel numbers (bit index in the channel mask).
@@ -503,6 +522,15 @@ mod tests {
     #[test]
     fn config3_is_fl_fr_fc() {
         assert_eq!(order(3), vec![(TYPE_CPE, 0, 0), (TYPE_CPE, 0, 1), (TYPE_SCE, 0, 0)]);
+    }
+
+    /// FATE `al22_chCfg0PCE_44`: the PCE comment `ac 04 2f` is a valid height
+    /// extension (CRC 0x2f) putting the third front pair in the TOP layer.
+    #[test]
+    fn pce_height_extension_with_valid_crc() {
+        assert_eq!(height_extension(&[0xAC, 0x04, 0x2F], 4), Some(vec![0, 0, 1, 0]));
+        assert_eq!(height_extension(&[0xAC, 0x04, 0x2E], 4), None, "bad CRC ignored");
+        assert_eq!(height_extension(b"Encoded by", 4), None);
     }
 
     #[test]

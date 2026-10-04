@@ -33,8 +33,6 @@ pub(crate) const SWB_OFFSET_480: [Option<&[u16]>; 13] = [None, None, None, Some(
 pub(crate) const TNS_MAX_BANDS_512: [u8; 13] = [0, 0, 0, 31, 32, 37, 31, 31, 0, 0, 0, 0, 0];
 pub(crate) const TNS_MAX_BANDS_480: [u8; 13] = [0, 0, 0, 31, 32, 37, 30, 30, 0, 0, 0, 0, 0];
 pub(crate) const AAC_PRED_SFB_MAX: [u8; 13] = [33, 33, 38, 40, 40, 40, 41, 41, 37, 37, 37, 34, 34];
-pub(crate) const AAC_NUM_SWB_960: [u8; 13] = [40, 40, 46, 49, 49, 49, 46, 46, 42, 42, 42, 40, 40];
-pub(crate) const AAC_NUM_SWB_128: [u8; 13] = [12, 12, 12, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15];
 pub(crate) const LTP_COEF: [f32; 8] = [0.570829, 0.696616, 0.813004, 0.911304, 0.984900, 1.067894, 1.194601, 1.369533];
 pub(crate) const ELD_WINDOW_512: [f32; 1920] = [
     0.00338834, 0.00567745, 0.00847677, 0.01172641, 0.01532555, 0.01917664,

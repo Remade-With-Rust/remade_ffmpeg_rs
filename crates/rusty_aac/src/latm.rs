@@ -19,16 +19,16 @@
 //!
 //! # Scope
 //!
-//! This implements the profile broadcast actually uses and that every encoder
-//! emits: `audioMuxVersion = 0`, `allStreamsSameTimeFraming = 1`,
-//! `numSubFrames = 0`, `numProgram = 0`, `numLayer = 0`, `frameLengthType = 0`.
-//! Anything else is rejected with a clear error rather than mis-parsed — the
-//! same policy `decode` applies to `gain_control_data`. Multiple programs and
-//! layers are a genuine gap, not something silently mishandled.
+//! `audioMuxVersion` 0 and 1, every AAC `frameLengthType` (0 byte-counted, 1
+//! fixed), other-data and CRC fields, and mid-stream configuration changes (see
+//! [`LatmDecoder`]). A single program and layer, which is what broadcast uses
+//! and what the reference decoder supports; multiple programs/layers are
+//! refused rather than mis-parsed.
 
 use crate::bits::BitReader;
 use crate::encode::BitWriter;
-use crate::{AudioSpecificConfig, Error, Result};
+use crate::config::StreamConfig;
+use crate::{AacDecoder, AudioSpecificConfig, DecodedAudio, Error, Result};
 
 /// The 11-bit LOAS sync pattern.
 const LOAS_SYNC: u32 = 0x2B7;
@@ -38,8 +38,10 @@ pub const LOAS_HEADER_LEN: usize = 3;
 /// One parsed LOAS frame.
 #[derive(Debug, Clone)]
 pub struct LoasFrame {
-    /// Stream parameters from the embedded `AudioSpecificConfig`.
+    /// Stream parameters from the embedded `AudioSpecificConfig` (simple view).
     pub config: AudioSpecificConfig,
+    /// The full configuration (SBR/PS signalling, PCE, frame length, ...).
+    pub stream: StreamConfig,
     /// The raw access unit (a `raw_data_block`), ready for `decode::Decoder`.
     pub au: Vec<u8>,
     /// Total bytes consumed, so a caller can walk a stream.
@@ -58,99 +60,104 @@ pub fn find_sync(data: &[u8]) -> Option<usize> {
     (0..data.len().saturating_sub(LOAS_HEADER_LEN)).find(|&i| is_loas(&data[i..]))
 }
 
-/// Parse an `AudioSpecificConfig` from a **bit position** (LATM embeds it
-/// unaligned, so the byte-oriented `parse_audio_specific_config` cannot be used).
-///
-/// Returns the config and the number of bits it occupied — the caller needs the
-/// length because `StreamMuxConfig` records it for `audioMuxVersion == 1`.
-fn read_asc(r: &mut BitReader) -> Result<(AudioSpecificConfig, usize)> {
-    let start = r.bits_left();
-    let mut object_type = r.read_bits(5)? as u8;
-    if object_type == 31 {
-        object_type = 32 + r.read_bits(6)? as u8;
+/// `LatmGetValue()`: a 2-bit byte count then that many + 1 bytes.
+fn latm_get_value(r: &mut BitReader) -> Result<u32> {
+    let n = r.read_bits(2)?;
+    let mut v = 0u32;
+    for _ in 0..=n {
+        v = (v << 8) | r.read_bits(8)?;
     }
-    let sf_index = r.read_bits(4)? as u8;
-    let sample_rate = if sf_index == 0x0F {
-        r.read_bits(24)?
-    } else {
-        crate::sample_rate_for_index(sf_index)
-    };
-    if sample_rate == 0 {
-        return Err(Error::invalid("latm: unknown sample rate index"));
-    }
-    let channels = r.read_bits(4)? as u16;
-    // GASpecificConfig for AAC-LC: three flags, all zero for the plain case.
-    let frame_length_flag = r.read_bool()?;
-    if frame_length_flag {
-        return Err(Error::unsupported("latm: 960-sample frames not supported"));
-    }
-    if r.read_bool()? {
-        return Err(Error::unsupported("latm: core-coder delay not supported"));
-    }
-    let extension_flag = r.read_bool()?;
-    if extension_flag {
-        return Err(Error::unsupported("latm: AAC extension flag not supported"));
-    }
-    Ok((
-        AudioSpecificConfig {
-            object_type,
-            sample_rate,
-            channels,
-        },
-        start - r.bits_left(),
-    ))
+    Ok(v)
 }
 
-/// Parse `StreamMuxConfig`, returning the embedded stream parameters.
-fn read_stream_mux_config(r: &mut BitReader) -> Result<AudioSpecificConfig> {
+/// The simple three-field view of a full stream configuration.
+fn simple_view(c: &StreamConfig) -> AudioSpecificConfig {
+    AudioSpecificConfig {
+        object_type: c.object_type,
+        sample_rate: c.sample_rate,
+        channels: c.channels() as u16,
+    }
+}
+
+/// Mux state carried between frames by `useSameStreamMux`.
+#[derive(Debug, Clone)]
+struct MuxConfig {
+    stream: StreamConfig,
+    frame_length_type: u32,
+    frame_length: usize,
+}
+
+/// Parse `StreamMuxConfig`: audioMuxVersion 0 and 1, one program and layer
+/// (the reference decoder's coverage; multiple programs/layers are refused).
+fn read_stream_mux_config(r: &mut BitReader) -> Result<MuxConfig> {
     let audio_mux_version = r.read_bool()?;
-    let audio_mux_version_a = if audio_mux_version { r.read_bool()? } else { false };
-    if audio_mux_version_a {
-        return Err(Error::unsupported("latm: audioMuxVersionA not supported"));
+    let version_a = if audio_mux_version { r.read_bool()? } else { false };
+    if version_a {
+        return Err(Error::unsupported("latm: audioMuxVersionA = 1 is reserved"));
     }
     if audio_mux_version {
-        // taraBufferFullness, an escaped value we do not consume correctly for
-        // any stream we would then decode — refuse rather than desynchronise.
-        return Err(Error::unsupported("latm: audioMuxVersion 1 not supported"));
+        let _tara_buffer_fullness = latm_get_value(r)?;
     }
-    if !r.read_bool()? {
-        return Err(Error::unsupported(
-            "latm: allStreamsSameTimeFraming = 0 not supported",
-        ));
+    let _all_streams_same_time_framing = r.read_bool()?;
+    let _num_sub_frames = r.read_bits(6)?;
+    if r.read_bits(4)? != 0 {
+        return Err(Error::unsupported("latm: multiple programs not supported"));
     }
-    let num_sub_frames = r.read_bits(6)?;
-    let num_program = r.read_bits(4)?;
-    let num_layer = r.read_bits(3)?;
-    if num_sub_frames != 0 || num_program != 0 || num_layer != 0 {
-        return Err(Error::unsupported(
-            "latm: multiple subframes/programs/layers not supported",
-        ));
+    if r.read_bits(3)? != 0 {
+        return Err(Error::unsupported("latm: multiple layers not supported"));
     }
-    let (cfg, _bits) = read_asc(r)?;
+    let stream = if !audio_mux_version {
+        let start = r.position();
+        crate::config::parse_from_opts(r, start, false)?
+    } else {
+        // Bound the config to ascLen bits so the sync-extension probe cannot run
+        // past it, then consume exactly ascLen (fill bits included).
+        let asc_len = latm_get_value(r)? as usize;
+        let n = asc_len.min(r.bits_left());
+        let mut bytes = Vec::with_capacity(n.div_ceil(8));
+        let mut left = n;
+        while left >= 8 {
+            bytes.push(r.read_bits(8)? as u8);
+            left -= 8;
+        }
+        if left > 0 {
+            bytes.push((r.read_bits(left as u32)? << (8 - left)) as u8);
+        }
+        let mut sub = BitReader::new(&bytes);
+        crate::config::parse_from_opts(&mut sub, 0, true)?
+    };
     let frame_length_type = r.read_bits(3)?;
+    let mut frame_length = 0usize;
     match frame_length_type {
         0 => {
             let _latm_buffer_fullness = r.read_bits(8)?;
         }
-        _ => {
-            return Err(Error::unsupported(
-                "latm: only frameLengthType 0 (variable, byte-counted) is supported",
-            ))
-        }
+        1 => frame_length = r.read_bits(9)? as usize,
+        3..=5 => r.skip(6)?,
+        6 | 7 => r.skip(1)?,
+        _ => return Err(Error::invalid("latm: reserved frameLengthType")),
     }
-    let other_data_present = r.read_bool()?;
-    if other_data_present {
-        // otherDataLenBits, escaped in 8-bit chunks.
-        let mut more = true;
-        while more {
-            let _ = r.read_bits(8)?;
-            more = r.read_bool()?;
+    if r.read_bool()? {
+        if audio_mux_version {
+            let _other_data_len_bits = latm_get_value(r)?;
+        } else {
+            loop {
+                let esc = r.read_bool()?;
+                r.skip(8)?;
+                if !esc {
+                    break;
+                }
+            }
         }
     }
     if r.read_bool()? {
         let _crc = r.read_bits(8)?; // crcCheckSum
     }
-    Ok(cfg)
+    Ok(MuxConfig {
+        stream,
+        frame_length_type,
+        frame_length,
+    })
 }
 
 /// Parse one LOAS frame starting at `data[0]`.
@@ -171,7 +178,7 @@ pub fn parse_loas_frame(data: &[u8]) -> Result<LoasFrame> {
 /// of frames in any real capture, which is why this type exists.
 #[derive(Debug, Default, Clone)]
 pub struct LatmReader {
-    config: Option<AudioSpecificConfig>,
+    mux: Option<MuxConfig>,
 }
 
 impl LatmReader {
@@ -181,7 +188,12 @@ impl LatmReader {
 
     /// The most recently seen stream configuration, if any.
     pub fn config(&self) -> Option<AudioSpecificConfig> {
-        self.config
+        self.mux.as_ref().map(|m| simple_view(&m.stream))
+    }
+
+    /// The most recently seen FULL stream configuration (SBR/PS, PCE, ...).
+    pub fn stream_config(&self) -> Option<&StreamConfig> {
+        self.mux.as_ref().map(|m| &m.stream)
     }
 
     /// Parse one LOAS frame, remembering its `StreamMuxConfig` for later frames.
@@ -197,26 +209,41 @@ impl LatmReader {
         if data.len() < frame_length {
             return Err(Error::Again);
         }
+        let mut r = BitReader::new(&data[..frame_length]);
+        r.skip(24)?;
 
         // AudioMuxElement(muxConfigPresent = 1)
         let use_same = r.read_bool()?;
-        let cfg = if use_same {
-            self.config
-                .ok_or_else(|| Error::invalid("latm: useSameStreamMux before any config"))?
-        } else {
-            let c = read_stream_mux_config(&mut r)?;
-            self.config = Some(c);
-            c
-        };
+        if !use_same {
+            self.mux = Some(read_stream_mux_config(&mut r)?);
+        }
+        let mux = self
+            .mux
+            .clone()
+            .ok_or_else(|| Error::invalid("latm: useSameStreamMux before any config"))?;
 
-        // PayloadLengthInfo for frameLengthType 0: 8-bit values, 255 continues.
-        let mut au_len = 0usize;
-        loop {
-            let v = r.read_bits(8)? as usize;
-            au_len += v;
-            if v != 255 {
-                break;
+        // PayloadLengthInfo
+        let au_len = match mux.frame_length_type {
+            0 => {
+                let mut n = 0usize;
+                loop {
+                    let v = r.read_bits(8)? as usize;
+                    n += v;
+                    if v != 255 {
+                        break;
+                    }
+                }
+                n
             }
+            1 => mux.frame_length,
+            3 | 5 | 7 => {
+                r.skip(2)?;
+                0
+            }
+            _ => 0,
+        };
+        if au_len * 8 > r.bits_left() {
+            return Err(Error::invalid("latm: incomplete frame"));
         }
 
         // PayloadMux — au_len bytes, still bit-aligned to the reader position.
@@ -226,10 +253,44 @@ impl LatmReader {
         }
 
         Ok(LoasFrame {
-            config: cfg,
+            config: simple_view(&mux.stream),
+            stream: mux.stream,
             au,
             frame_length,
         })
+    }
+}
+
+/// LOAS in, PCM out: a [`LatmReader`] driving an [`AacDecoder`], rebuilt
+/// whenever the stream's configuration changes mid-stream (a broadcast service
+/// switching from stereo to 5.1, say).
+#[derive(Default)]
+pub struct LatmDecoder {
+    reader: LatmReader,
+    dec: Option<(StreamConfig, AacDecoder)>,
+}
+
+impl LatmDecoder {
+    pub fn new() -> LatmDecoder {
+        LatmDecoder::default()
+    }
+
+    /// Decode the LOAS frame at the start of `data`; returns the PCM and the
+    /// number of bytes consumed.
+    pub fn decode(&mut self, data: &[u8], pts: Option<i64>) -> Result<(DecodedAudio, usize)> {
+        let frame = self.reader.parse(data)?;
+        let rebuild = match &self.dec {
+            Some((cfg, _)) => *cfg != frame.stream,
+            None => true,
+        };
+        if rebuild {
+            self.dec = Some((
+                frame.stream.clone(),
+                AacDecoder::with_stream_config(frame.stream.clone()),
+            ));
+        }
+        let out = self.dec.as_mut().unwrap().1.decode(&frame.au, pts)?;
+        Ok((out, frame.frame_length))
     }
 }
 
