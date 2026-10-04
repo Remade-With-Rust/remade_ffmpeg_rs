@@ -34,6 +34,67 @@ use rff_resample::Resampler;
 
 use crate::Engine;
 
+/// `RFF_PHASES=1`: wall time per phase of the transcode loop, on stderr at the
+/// end of [`run`] -- the outside-the-codec view (demux, decode, the conform
+/// chain, encode, mux) that a codec's own stage profiler cannot see. A gap
+/// between a codec's core throughput and the CLI's is plumbing, and this is
+/// what locates it (codec-memory-copies step 0). Off by default: one cached
+/// flag test per call, and `Instant` is never touched unless it is set.
+mod phases {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    pub static DEMUX: AtomicU64 = AtomicU64::new(0);
+    pub static DECODE: AtomicU64 = AtomicU64::new(0);
+    pub static CONFORM: AtomicU64 = AtomicU64::new(0);
+    pub static ENCODE: AtomicU64 = AtomicU64::new(0);
+    pub static MUX: AtomicU64 = AtomicU64::new(0);
+
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("RFF_PHASES").is_some())
+    }
+
+    /// Run `f`, charging its wall time to `acc` when phases are on.
+    pub fn time<T>(acc: &AtomicU64, f: impl FnOnce() -> T) -> T {
+        if !on() {
+            return f();
+        }
+        let t = std::time::Instant::now();
+        let r = f();
+        acc.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        r
+    }
+
+    pub fn report(total: std::time::Duration) {
+        let total_ns = total.as_nanos().max(1) as f64;
+        eprintln!("--- rff phases (total {:.1} ms) ---", total_ns / 1e6);
+        let mut sum = 0u64;
+        for (name, acc) in [
+            ("demux", &DEMUX),
+            ("decode", &DECODE),
+            ("conform", &CONFORM),
+            ("encode", &ENCODE),
+            ("mux", &MUX),
+        ] {
+            let ns = acc.swap(0, Relaxed);
+            sum += ns;
+            eprintln!(
+                "  {name:<8} {:>9.1} ms  {:>5.1}%",
+                ns as f64 / 1e6,
+                100.0 * ns as f64 / total_ns
+            );
+        }
+        let rest = total_ns - sum as f64;
+        eprintln!(
+            "  {:<8} {:>9.1} ms  {:>5.1}%",
+            "other",
+            rest / 1e6,
+            100.0 * rest / total_ns
+        );
+    }
+}
+
 /// Codecs whose decoded output is inherently full-range (they decode to RGB, or
 /// are defined on 0-255 samples). JPEG is the canonical case: the standard has
 /// no limited-range mode, which is why FFmpeg calls its pixel formats `yuvj*`.
@@ -532,7 +593,10 @@ fn conform_channels(target: u16, frame: Frame) -> Result<Frame> {
     }
     let samples = audio_to_f32(&af)?;
     let mixed: Vec<f32> = match (af.channels, target) {
-        (2, 1) => samples.chunks_exact(2).map(|p| 0.5 * (p[0] + p[1])).collect(),
+        (2, 1) => samples
+            .chunks_exact(2)
+            .map(|p| 0.5 * (p[0] + p[1]))
+            .collect(),
         (1, 2) => samples.iter().flat_map(|s| [*s, *s]).collect(),
         (from, to) => {
             return Err(Error::unsupported(format!(
@@ -642,6 +706,19 @@ impl TranscodeOp {
                 self.video_frames_sent += 1;
             }
         }
+        let Some(frame) = phases::time(&phases::CONFORM, || self.conform(frame))? else {
+            return Ok(()); // atrim consumed the whole frame
+        };
+        if self.is_video {
+            self.pending_pts.push_back(frame.pts());
+        }
+        phases::time(&phases::ENCODE, || self.encoder.send_frame(&frame))?;
+        self.drain(muxer, report)
+    }
+
+    /// The per-frame conform chain between decode and encode: filters, overlay,
+    /// channel/rate/sample-format/pixel conforms. `None` = atrim dropped it.
+    fn conform(&mut self, frame: Frame) -> Result<Option<Frame>> {
         let frame = apply_filters(&mut self.filters, frame)?;
         let frame = apply_overlay(&self.overlay, frame)?;
         let frame = conform_channels(self.target_channels, frame)?;
@@ -653,7 +730,7 @@ impl TranscodeOp {
                     .map(|p| p as f64 * tb.num as f64 / tb.den.max(1) as f64);
                 match self.audio_chain.apply(af, t)? {
                     Some(af) => Frame::Audio(af),
-                    None => return Ok(()), // atrim consumed the whole frame
+                    None => return Ok(None),
                 }
             }
             other => other,
@@ -666,11 +743,7 @@ impl TranscodeOp {
             self.source_range,
             frame,
         )?;
-        if self.is_video {
-            self.pending_pts.push_back(frame.pts());
-        }
-        self.encoder.send_frame(&frame)?;
-        self.drain(muxer, report)
+        Ok(Some(frame))
     }
 
     /// Pull every ready packet out of the encoder and mux it. Video encoders
@@ -679,7 +752,7 @@ impl TranscodeOp {
     /// Matroska block would land at t=0.
     fn drain(&mut self, muxer: &mut dyn Muxer, report: &mut TranscodeReport) -> Result<()> {
         loop {
-            match self.encoder.receive_packet() {
+            match phases::time(&phases::ENCODE, || self.encoder.receive_packet()) {
                 Ok(mut packet) => {
                     if self.is_video {
                         let queued = self.pending_pts.pop_front().flatten();
@@ -688,7 +761,7 @@ impl TranscodeOp {
                         }
                     }
                     packet.stream_index = self.out_index;
-                    muxer.write_packet(&packet)?;
+                    phases::time(&phases::MUX, || muxer.write_packet(&packet))?;
                     report.packets_written += 1;
                 }
                 Err(Error::Again) | Err(Error::Eof) => break,
@@ -703,7 +776,7 @@ impl TranscodeOp {
     fn finish(&mut self, muxer: &mut dyn Muxer, report: &mut TranscodeReport) -> Result<()> {
         self.decoder.flush();
         loop {
-            match self.decoder.receive_frame() {
+            match phases::time(&phases::DECODE, || self.decoder.receive_frame()) {
                 Ok(frame) => self.handle_frame(frame, muxer, report)?,
                 Err(Error::Again) | Err(Error::Eof) => break,
                 Err(e) => return Err(e),
@@ -725,7 +798,7 @@ impl TranscodeOp {
                 self.drain(muxer, report)?;
             }
         }
-        self.encoder.flush();
+        phases::time(&phases::ENCODE, || self.encoder.flush());
         self.drain(muxer, report)
     }
 }
@@ -895,11 +968,12 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     muxer.write_header(&out_streams)?;
 
     let mut report = TranscodeReport::default();
+    let t_loop = phases::on().then(std::time::Instant::now);
 
     // --- drive each input through its plan into the shared muxer ---
     for (demuxer, ops) in demuxers.iter_mut().zip(per_input_ops.iter_mut()) {
         loop {
-            match demuxer.read_packet() {
+            match phases::time(&phases::DEMUX, || demuxer.read_packet()) {
                 Ok(packet) => process_packet(packet, ops, &mut *muxer, &mut report)?,
                 Err(Error::Eof) => break,
                 Err(e) => return Err(e),
@@ -907,7 +981,10 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
         }
         flush_streams(ops, &mut *muxer, &mut report)?;
     }
-    muxer.write_trailer()?;
+    phases::time(&phases::MUX, || muxer.write_trailer())?;
+    if let Some(t) = t_loop {
+        phases::report(t.elapsed());
+    }
 
     Ok(report)
 }
@@ -1248,9 +1325,9 @@ fn process_packet(
             Ok(())
         }
         StreamOp::Transcode(op) => {
-            op.decoder.send_packet(&packet)?;
+            phases::time(&phases::DECODE, || op.decoder.send_packet(&packet))?;
             loop {
-                match op.decoder.receive_frame() {
+                match phases::time(&phases::DECODE, || op.decoder.receive_frame()) {
                     Ok(frame) => op.handle_frame(frame, muxer, report)?,
                     Err(Error::Again) | Err(Error::Eof) => break,
                     Err(e) => return Err(e),
@@ -1294,11 +1371,7 @@ fn resolve_output_format(engine: &Engine, output: &OutputSpec) -> Result<String>
     if let Some(forced) = &output.format {
         return Ok(forced.clone());
     }
-    if output
-        .path
-        .to_str()
-        .is_some_and(rff_io::is_rtmp)
-    {
+    if output.path.to_str().is_some_and(rff_io::is_rtmp) {
         return Ok("flv".to_string());
     }
     let ext = output
@@ -1333,7 +1406,9 @@ mod sample_format_tests {
     fn pinned_format_converts_f32_to_s16() {
         let src = [0.0f32, 0.5, -0.5, 1.0, -1.0];
         let out = conform_sample_format(Some(SampleFormat::S16), f32_af(&src)).unwrap();
-        let Frame::Audio(af) = out else { unreachable!() };
+        let Frame::Audio(af) = out else {
+            unreachable!()
+        };
         assert_eq!(af.format, SampleFormat::S16);
         assert_eq!(af.planes[0].len(), src.len() * 2, "s16 is 2 bytes/sample");
         let got: Vec<i16> = af.planes[0]
@@ -1354,8 +1429,7 @@ mod sample_format_tests {
             unreachable!()
         };
         assert_eq!(a.format, SampleFormat::F32);
-        let Frame::Audio(b) =
-            conform_sample_format(Some(SampleFormat::F32), f32_af(&src)).unwrap()
+        let Frame::Audio(b) = conform_sample_format(Some(SampleFormat::F32), f32_af(&src)).unwrap()
         else {
             unreachable!()
         };

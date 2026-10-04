@@ -30,6 +30,17 @@ static N_ZEROED: AtomicUsize = AtomicUsize::new(0);
 static N_REALLOC: AtomicUsize = AtomicUsize::new(0);
 static N_FREE: AtomicUsize = AtomicUsize::new(0);
 static BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Bytes a `realloc` had to carry over (the OLD size) -- an upper bound on what
+/// a growing `Vec` copies, since an in-place grow moves nothing.
+static MOVED: AtomicUsize = AtomicUsize::new(0);
+/// Live heap bytes, and their high-water mark (reset per phase).
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn grow_live(by: usize) {
+    let now = LIVE.fetch_add(by, Relaxed) + by;
+    PEAK.fetch_max(now, Relaxed);
+}
 
 /// Counting shim over the project allocator. Delegates everything; only the
 /// tallies are ours.
@@ -39,20 +50,29 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         N_ALLOC.fetch_add(1, Relaxed);
         BYTES.fetch_add(l.size(), Relaxed);
+        grow_live(l.size());
         unsafe { rusty_alloc_api::RustyAlloc.alloc(l) }
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
         N_ZEROED.fetch_add(1, Relaxed);
         BYTES.fetch_add(l.size(), Relaxed);
+        grow_live(l.size());
         unsafe { rusty_alloc_api::RustyAlloc.alloc_zeroed(l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
         N_REALLOC.fetch_add(1, Relaxed);
         BYTES.fetch_add(new.saturating_sub(l.size()), Relaxed);
+        MOVED.fetch_add(l.size(), Relaxed);
+        if new >= l.size() {
+            grow_live(new - l.size());
+        } else {
+            LIVE.fetch_sub(l.size() - new, Relaxed);
+        }
         unsafe { rusty_alloc_api::RustyAlloc.realloc(p, l, new) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         N_FREE.fetch_add(1, Relaxed);
+        LIVE.fetch_sub(l.size(), Relaxed);
         unsafe { rusty_alloc_api::RustyAlloc.dealloc(p, l) }
     }
 }
@@ -170,6 +190,29 @@ fn main() {
     }
     let dec_stats = snap().since(t1);
 
+    // ---- ENCODE the same input pushed WHOLE, as s16 -- the CLI's shape: a WAV
+    // demuxes to ONE frame, so the adapter hands the encoder the entire file in a
+    // single push. Streaming one frame at a time (above) never shows what that
+    // costs; this does. Same samples as the streamed pass, quantised to s16.
+    let s16: Vec<i16> = pcm.iter().map(|&x| (x * 32767.0) as i16).collect();
+    let mut enc2 = Mp3Encoder::new(Mp3EncoderConfig {
+        bitrate_kbps: kbps,
+        vbr_quality: None,
+    });
+    let mut mp3_whole: Vec<u8> = Vec::with_capacity(frames * 1024);
+    let (moved0, live0) = (MOVED.load(Relaxed), LIVE.load(Relaxed));
+    PEAK.store(live0, Relaxed);
+    let t2 = snap();
+    enc2.push_pcm_s16(&s16, CH, SR).unwrap();
+    enc2.finish();
+    while let Ok(p) = enc2.next_packet() {
+        mp3_whole.extend_from_slice(&p);
+    }
+    let whole_stats = snap().since(t2);
+    let whole_moved = MOVED.load(Relaxed) - moved0;
+    let whole_peak = PEAK.load(Relaxed) - live0;
+    let whole_hash = fnv1a(&mp3_whole);
+
     // Snapshot everything BEFORE printing: println! allocates.
     let (ef, df) = (frames.max(1), frames.max(1));
     let mp3_len = mp3.len();
@@ -206,5 +249,15 @@ fn main() {
         "  zeroed share of encode allocations: {:.1}%  \
          (the vec![0f32; n] pattern — zero-fill paid, then overwritten)",
         100.0 * enc_stats.zeroed as f64 / enc_stats.total().max(1) as f64
+    );
+    println!(
+        "\n  encode, whole input in ONE s16 push (the CLI/WAV shape):\n    \
+         {} allocs ({:.2}/frame), {} KiB requested, {} KiB carried by realloc, \
+         peak live +{} KiB\n    bitstream fnv1a: {whole_hash:#018x}",
+        whole_stats.total(),
+        whole_stats.total() as f64 / ef as f64,
+        whole_stats.bytes / 1024,
+        whole_moved / 1024,
+        whole_peak / 1024,
     );
 }
