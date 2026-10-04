@@ -232,6 +232,27 @@ impl Default for Mp3Encode {
 /// B8 back-reference cap (`main_data_begin` is 9 bits): the most a frame can borrow.
 const RESV_MAX_BANK: usize = 511 * 8;
 
+/// `MP3_STEREO` -- the joint-stereo decision override (see `decide_stereo`).
+#[derive(Clone, Copy)]
+enum StereoOverride {
+    Lr,
+    Ms,
+    Pe,
+}
+
+/// Read once, like every other knob. It was read from the environment on every
+/// frame -- an allocation per frame (the lookup's key and value buffers), the
+/// last unexplained one in the encoder's steady state.
+fn stereo_override() -> Option<StereoOverride> {
+    static V: std::sync::OnceLock<Option<StereoOverride>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("MP3_STEREO").as_deref() {
+        Ok("lr") => Some(StereoOverride::Lr),
+        Ok("ms") => Some(StereoOverride::Ms),
+        Ok("pe") => Some(StereoOverride::Pe),
+        _ => None,
+    })
+}
+
 /// **3R1** causal per-frame main-data budget: a frame `pe/pe_avg` above the running
 /// average draws extra bits from the bank (capped by what's physically available),
 /// an easier one banks — sum-preserving around the CBR `base`, so the average bitrate
@@ -315,6 +336,16 @@ impl Mp3Encode {
         bitstream::assemble_stream(&frames)
     }
 
+    /// [`finish_reservoir`](Self::finish_reservoir), one packet per frame: the
+    /// stream-level encoder emits frames as packets, and assembling them
+    /// directly saves cutting one contiguous stream back up with a copy apiece.
+    pub(crate) fn finish_reservoir_frames(&mut self) -> Vec<Vec<u8>> {
+        let frames = std::mem::take(&mut self.resv_frames);
+        self.resv_bank = 0;
+        self.resv_pe_avg = 0.0;
+        bitstream::assemble_frames(&frames)
+    }
+
     /// Analyse every granule×channel of a frame (advancing the filterbank/MDCT state)
     /// and its perceptual entropy, then quantise all of them to a frame main-data
     /// budget chosen by `budget_fn(frame_pe)` — the seam that lets B7 pass a flat
@@ -356,10 +387,10 @@ impl Mp3Encode {
         sample_rate: u32,
     ) -> bool {
         let (l, r) = (channels[0].as_ref(), channels[1].as_ref());
-        match std::env::var("MP3_STEREO").as_deref() {
-            Ok("lr") => return false,
-            Ok("ms") => return true,
-            Ok("pe") => {
+        match stereo_override() {
+            Some(StereoOverride::Lr) => return false,
+            Some(StereoOverride::Ms) => return true,
+            Some(StereoOverride::Pe) => {
                 let ms = stereo::mid_side(l, r);
                 let (mut pe_lr, mut pe_ms) = (0f32, 0f32);
                 let pe = |pcm: &[f32]| psychoacoustic::analyze(pcm, sample_rate).perceptual_entropy;
@@ -370,7 +401,7 @@ impl Mp3Encode {
                 }
                 return pe_ms < pe_lr;
             }
-            _ => {}
+            None => {}
         }
         stereo::prefer_mid_side(l, r)
     }
@@ -426,16 +457,16 @@ impl Mp3Encode {
         // transforms), NOT on `coded`: if attacks tracked the M/S choice, a per-frame
         // M/S flip would make the block-type window oscillate too, and rapid block-type
         // churn breaks MDCT time-domain aliasing cancellation across frames.
-        let attacks: Vec<bool> = (0..granules)
-            .map(|gr| {
-                (0..nch).any(|ch| {
-                    let g = &raw[ch][gr * GRANULE_LINES..(gr + 1) * GRANULE_LINES];
-                    psychoacoustic::detect_attack(g)
-                })
-            })
-            .collect();
+        // At most two granules a frame: fixed arrays, not two `Vec`s a frame.
+        let mut attacks = [false; 2];
+        for (gr, attack) in attacks.iter_mut().enumerate().take(granules) {
+            *attack = (0..nch).any(|ch| {
+                let g = &raw[ch][gr * GRANULE_LINES..(gr + 1) * GRANULE_LINES];
+                psychoacoustic::detect_attack(g)
+            });
+        }
         let (block_types, new_prev) =
-            shortblock::decide_block_types(self.prev_block_type, &attacks);
+            shortblock::decide_block_types_pair(self.prev_block_type, &attacks[..granules]);
         self.prev_block_type = new_prev;
 
         let n_units = granules * nch;
@@ -456,34 +487,14 @@ impl Mp3Encode {
             // decoder — but, unlike rotating in the PCM domain before the lapped
             // transform, it does NOT corrupt the overlap when the mode switches
             // L/R<->M/S between adjacent frames (which mangled every switch boundary).
-            let mut freqs: Vec<[f32; GRANULE_LINES]> = Vec::with_capacity(nch);
-            for ch in 0..nch {
-                let gpcm = &raw[ch][gr * GRANULE_LINES..];
-                let sub = prof::time(&prof::FILTERBANK, || {
-                    filterbank::analyze(gpcm, &mut self.analysis_fifo[ch])
-                });
-                let freq = prof::time(&prof::MDCT, || {
-                    let mut freq = mdct::forward(&sub, bt, &mut self.mdct_overlap[ch]);
-                    antialias::expand(&block, &mut freq);
-                    freq
-                });
-                freqs.push(freq);
-            }
-            // Spectral M/S: M=(L+R)/√2, S=(L−R)/√2 — the inverse of the decoder's
-            // (M,S)→(L,R) rotation, applied to the full granule spectrum.
-            if use_ms && nch == 2 {
-                let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
-                // Bind the two granules ONCE. Written as `l[0][i]`, each of the
-                // six accesses per line is two indexing operations -- a `Vec` index
-                // and a slice index -- neither of which the compiler can hoist out
-                // of the loop, for 576 lines.
-                let (l, r) = freqs.split_at_mut(1);
-                for (lv, rv) in l[0].iter_mut().zip(r[0].iter_mut()) {
-                    let (a, b) = (*lv, *rv);
-                    *lv = (a + b) * inv_sqrt2;
-                    *rv = (a - b) * inv_sqrt2;
-                }
-            }
+            //
+            // Each channel's spectrum goes STRAIGHT into its `analyzed` slot, and
+            // the M/S rotation happens there. It used to be collected into a
+            // `freqs` Vec first and then copied into `analyzed` -- an allocation
+            // per granule and every spectrum copied twice. The psymodel reads
+            // only the PCM, never the spectrum, so running it first changes
+            // nothing it computes; `frame_pe` still accumulates in channel order.
+            let first = analyzed.len();
             for ch in 0..nch {
                 // Psymodel on the CODED domain (M/S or L/R): stateless and frame-local,
                 // so it follows the mode without the lapped-overlap constraint.
@@ -494,7 +505,29 @@ impl Mp3Encode {
                     psy.thresholds = [f32::MAX; crate::frame::SFB_LONG];
                 }
                 frame_pe += psy.perceptual_entropy;
-                analyzed.push((freqs[ch], psy, bt)); // [f32; N] is Copy
+                let gpcm = &raw[ch][gr * GRANULE_LINES..];
+                let sub = prof::time(&prof::FILTERBANK, || {
+                    filterbank::analyze(gpcm, &mut self.analysis_fifo[ch])
+                });
+                let freq = prof::time(&prof::MDCT, || {
+                    let mut freq = mdct::forward(&sub, bt, &mut self.mdct_overlap[ch]);
+                    antialias::expand(&block, &mut freq);
+                    freq
+                });
+                analyzed.push((freq, psy, bt));
+            }
+            // Spectral M/S: M=(L+R)/√2, S=(L−R)/√2 — the inverse of the decoder's
+            // (M,S)→(L,R) rotation, applied to the full granule spectrum.
+            if use_ms && nch == 2 {
+                let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+                // Bind the two spectra ONCE, so the 576-line loop indexes two
+                // plain arrays rather than re-indexing the `Vec` per access.
+                let (l, r) = analyzed[first..].split_at_mut(1);
+                for (lv, rv) in l[0].0.iter_mut().zip(r[0].0.iter_mut()) {
+                    let (a, b) = (*lv, *rv);
+                    *lv = (a + b) * inv_sqrt2;
+                    *rv = (a - b) * inv_sqrt2;
+                }
             }
         }
         // `coded`'s last use is inside the loop, so the borrow of `ms` has ended

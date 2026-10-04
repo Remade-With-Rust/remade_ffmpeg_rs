@@ -296,6 +296,20 @@ pub fn decide_block_types(prev: BlockType, attacks: &[bool]) -> (Vec<BlockType>,
         // MPEG-2 (single granule) not yet block-switched.
         return (vec![BlockType::Long; attacks.len()], BlockType::Long);
     }
+    let (types, new_prev) = decide_block_types_pair(prev, attacks);
+    (types.to_vec(), new_prev)
+}
+
+/// [`decide_block_types`] without the `Vec`: the encoder calls this once per
+/// frame, and a frame has at most two granules. For a single-granule (MPEG-2)
+/// frame only `[0]` is meaningful, and it is `Long`, as above.
+pub(crate) fn decide_block_types_pair(
+    prev: BlockType,
+    attacks: &[bool],
+) -> ([BlockType; 2], BlockType) {
+    if attacks.len() != 2 {
+        return ([BlockType::Long; 2], BlockType::Long);
+    }
     let any = attacks[0] || attacks[1];
     let types = if prev == BlockType::Short {
         // Inside a short run: continue or wind down with a STOP.
@@ -311,7 +325,7 @@ pub fn decide_block_types(prev: BlockType, attacks: &[bool]) -> (Vec<BlockType>,
         [BlockType::Long, BlockType::Long]
     };
     let new_prev = types[1];
-    (types.to_vec(), new_prev)
+    (types, new_prev)
 }
 
 #[cfg(test)]

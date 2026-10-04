@@ -259,6 +259,63 @@ pub fn format(
 /// overwritten. Requires the cumulative data never to outrun cumulative capacity
 /// (the rate loop's job) and `main_data_begin ≤ 511`.
 pub fn assemble_stream(frames: &[(FrameHeader, SideInfo, Vec<u8>)]) -> Vec<u8> {
+    let (md, begins, caps) = reservoir_layout(frames);
+    let mut out = Vec::with_capacity(frames.iter().map(|(h, _, _)| h.frame_size()).sum());
+    let mut p = 0usize;
+    for (n, (header, side_info, _)) in frames.iter().enumerate() {
+        write_reservoir_frame(&mut out, header, side_info, begins[n], &md[p..p + caps[n]]);
+        p += caps[n];
+    }
+    out
+}
+
+/// [`assemble_stream`], one `Vec` per frame -- the same bytes, cut at the frame
+/// boundaries during assembly rather than by copying them out afterwards.
+pub(crate) fn assemble_frames(frames: &[(FrameHeader, SideInfo, Vec<u8>)]) -> Vec<Vec<u8>> {
+    let (md, begins, caps) = reservoir_layout(frames);
+    let mut out = Vec::with_capacity(frames.len());
+    let mut p = 0usize;
+    for (n, (header, side_info, _)) in frames.iter().enumerate() {
+        let mut frame = Vec::with_capacity(header.frame_size());
+        write_reservoir_frame(
+            &mut frame,
+            header,
+            side_info,
+            begins[n],
+            &md[p..p + caps[n]],
+        );
+        out.push(frame);
+        p += caps[n];
+    }
+    out
+}
+
+/// Append one assembled frame: header, CRC, side info with its back-reference,
+/// and the frame's physical main-data region.
+fn write_reservoir_frame(
+    out: &mut Vec<u8>,
+    header: &FrameHeader,
+    side_info: &SideInfo,
+    begin: usize,
+    region: &[u8],
+) {
+    let mut si = side_info.clone();
+    si.main_data_begin = begin as u16;
+    let hdr = header.to_bytes();
+    let si_bytes = serialize_side_info(header, &si);
+    out.extend_from_slice(&hdr);
+    if header.crc_protected {
+        out.extend_from_slice(&crc16([hdr[2], hdr[3]], &si_bytes).to_be_bytes());
+    }
+    out.extend_from_slice(&si_bytes);
+    out.extend_from_slice(region);
+}
+
+/// The continuous main-data stream `MD`, each frame's `main_data_begin`, and
+/// each frame's region capacity -- the layout half of [`assemble_stream`].
+fn reservoir_layout(
+    frames: &[(FrameHeader, SideInfo, Vec<u8>)],
+) -> (Vec<u8>, Vec<usize>, Vec<usize>) {
     const MAX_BEGIN: usize = 511; // the 9-bit main_data_begin field
 
     let caps: Vec<usize> = frames.iter().map(|(h, _, _)| region_capacity(h)).collect();
@@ -290,23 +347,7 @@ pub fn assemble_stream(frames: &[(FrameHeader, SideInfo, Vec<u8>)]) -> Vec<u8> {
     if md.len() < p {
         md.resize(p, 0); // pad the final region
     }
-
-    let mut out = Vec::with_capacity(frames.iter().map(|(h, _, _)| h.frame_size()).sum());
-    let mut p = 0usize;
-    for (n, (header, side_info, _)) in frames.iter().enumerate() {
-        let mut si = side_info.clone();
-        si.main_data_begin = begins[n] as u16;
-        let hdr = header.to_bytes();
-        let si_bytes = serialize_side_info(header, &si);
-        out.extend_from_slice(&hdr);
-        if header.crc_protected {
-            out.extend_from_slice(&crc16([hdr[2], hdr[3]], &si_bytes).to_be_bytes());
-        }
-        out.extend_from_slice(&si_bytes);
-        out.extend_from_slice(&md[p..p + caps[n]]);
-        p += caps[n];
-    }
-    out
+    (md, begins, caps)
 }
 
 #[cfg(test)]

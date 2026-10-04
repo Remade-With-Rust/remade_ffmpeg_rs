@@ -603,16 +603,19 @@ impl Mp3Encoder {
             // 3R1: all frames are banked — assemble the reservoir stream now and split
             // it back into fixed-size frame packets (B8 output is frame_size-aligned).
             if self.reservoir {
-                let fsize = header.frame_size();
-                let stream = if self.resv_lookahead {
+                if self.resv_lookahead {
+                    let fsize = header.frame_size();
                     let frames = std::mem::take(&mut self.resv_frames_pcm);
-                    self.state
-                        .encode_reservoir_lookahead(&frames, self.resv_gain)
+                    let stream = self
+                        .state
+                        .encode_reservoir_lookahead(&frames, self.resv_gain);
+                    for chunk in stream.chunks(fsize) {
+                        self.queue.push_back(chunk.to_vec());
+                    }
                 } else {
-                    self.state.finish_reservoir()
-                };
-                for chunk in stream.chunks(fsize) {
-                    self.queue.push_back(chunk.to_vec());
+                    // Assembled one packet per frame, so nothing is cut back out
+                    // of a contiguous stream with a copy apiece.
+                    self.queue.extend(self.state.finish_reservoir_frames());
                 }
             }
             // Prepend the Xing/Info header now that the totals are known (counts
