@@ -370,7 +370,7 @@ pub fn decode_ics(
     common_window: bool,
     rng: &mut u32,
 ) -> Result<()> {
-    let _prof = crate::prof::scope(crate::prof::Stage::DecIcs);
+    let prof_ics = crate::prof::scope(crate::prof::Stage::DecIcs);
     let global_gain = r.read_bits(8)? as i32;
     if !common_window {
         parse_ics_info(r, sx, ics)?;
@@ -535,6 +535,7 @@ pub fn decode_ics(
     }
 
     // Dequantisation; PNS bands from the reference generator.
+    drop(prof_ics); // the stages must not nest, or shares double-count
     let _prof = crate::prof::scope(crate::prof::Stage::DecDequant);
     let pow43 = crate::dsp::pow43_table();
     cd.coeffs.iter_mut().for_each(|c| *c = 0.0);
