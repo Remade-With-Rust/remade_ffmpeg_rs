@@ -331,6 +331,7 @@ pub fn decode(
     } else {
         &QUAD_A
     };
+    let count1_start = i;
     while i + 3 < GRANULE_LINES && r.bit_pos() < part2_3_end {
         let (v, w, x, y) = quad.read(&mut r);
         out[i] = v;
@@ -338,6 +339,21 @@ pub fn decode(
         out[i + 2] = x;
         out[i + 3] = y;
         i += 4;
+    }
+    // A quad whose codeword ENDS past part2_3_end was not coded by the encoder:
+    // some encoders (shine, measured) size part2_3_length so that the last quad
+    // straddles the budget, and the bits it reads belong to the next granule.
+    // FFmpeg and minimp3 both drop it ("overread" in mpegaudiodec); keeping it put
+    // up to four spurious +-1 lines at the top of the count1 region and disagreed
+    // with FFmpeg by up to 861 LSB on 119 of 162 shine streams.
+    //
+    // Only when the loop stopped on the BIT budget: a quad that fills the spectrum
+    // to line 576 is kept even if it overran, because FFmpeg's loop exits on the
+    // line limit before it ever re-tests the position (`while s_index <= 572`).
+    // Dropping that one too left 10 shine streams still disagreeing.
+    if i > count1_start && i + 3 < GRANULE_LINES && r.bit_pos() > part2_3_end {
+        i -= 4;
+        out[i..i + 4].fill(0);
     }
 
     let nonzero = i.min(GRANULE_LINES);
@@ -420,6 +436,58 @@ mod tests {
         let bits = pack(&[(0b0101, 4), (1, 1), (0, 1)]);
         let mut r = BitReader::new(&bits);
         assert_eq!(QUAD_B.read(&mut r), (-1, 0, 1, 0));
+    }
+
+    fn mono_44k() -> FrameHeader {
+        FrameHeader {
+            version: crate::header::MpegVersion::V1,
+            crc_protected: false,
+            bitrate_kbps: 128,
+            sample_rate: 44100,
+            padding: false,
+            channel_mode: crate::frame::ChannelMode::Mono,
+            copyright: false,
+            original: false,
+            emphasis: 0,
+        }
+    }
+
+    /// count1 table B codes quad index i as the 4 bits of 15-i, so the zero quad
+    /// is `1111` and (1,0,0,0) is `0111` plus one sign bit.
+    const ZERO_QUAD: (u32, u32) = (0b1111, 4);
+
+    #[test]
+    fn count1_quad_straddling_the_budget_is_dropped() {
+        // Budget 6 bits: the zero quad ends at bit 4, then a (-1,0,0,0) quad starts
+        // inside the budget and ENDS at bit 9 -- past it. FFmpeg and minimp3 drop it.
+        let bits = pack(&[ZERO_QUAD, (0b0111, 4), (1, 1), ZERO_QUAD, ZERO_QUAD]);
+        let gi = GranuleSideInfo {
+            count1table_select: true,
+            ..Default::default()
+        };
+        let mut pos = 0;
+        let (out, nz) = decode(&bits, &mut pos, 6, &mono_44k(), &gi);
+        assert_eq!(out[4], 0, "the straddling quad must not be decoded");
+        assert_eq!(nz, 4);
+        assert_eq!(pos, 6, "the cursor still ends at the granule's budget");
+    }
+
+    #[test]
+    fn count1_quad_reaching_line_576_is_kept_even_if_it_overruns() {
+        // 143 zero quads fill lines 0..572; the 144th starts at bit 572, inside a
+        // 574-bit budget, and ends at 577. The loop stops on the LINE limit, which
+        // FFmpeg tests before the bit position, so this quad is kept.
+        let mut toks = vec![ZERO_QUAD; 143];
+        toks.extend([(0b0111, 4), (0, 1)]);
+        let bits = pack(&toks);
+        let gi = GranuleSideInfo {
+            count1table_select: true,
+            ..Default::default()
+        };
+        let mut pos = 0;
+        let (out, nz) = decode(&bits, &mut pos, 574, &mono_44k(), &gi);
+        assert_eq!(out[572], 1, "a quad that completes the spectrum is kept");
+        assert_eq!(nz, 576);
     }
 
     /// The LUT decode must be bit-identical to the reference linear scan: for
