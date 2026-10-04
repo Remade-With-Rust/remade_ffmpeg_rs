@@ -1,11 +1,11 @@
-//! In-house **AAC-LC encoder** (see `docs/codec-aac-encoder.md` for the brick
+//! In-house **AAC-LC encoder** (see `docs/finished/codec-aac-encoder.md` for the brick
 //! ledger). Bricks 1–7 are complete: encode-side primitives inverting the decoder
 //! (bit writer, spectral-codebook encoder, header/config serializers), the forward
 //! filterbank, the quantizer + rate loop, a Bark-spreading psychoacoustic model,
 //! block switching, M/S stereo, and container/CLI integration.
 //!
 //! **What this encoder does NOT yet do** — the arms tracked by
-//! `docs/codec-aac-great-gate.md`. Naming them here keeps a fit from being run
+//! `docs/finished/codec-aac-great-gate.md`. Naming them here keeps a fit from being run
 //! against a mis-documented encoder:
 //!
 //! * The psy model drives **long blocks only**; short blocks code with flat
@@ -2729,7 +2729,7 @@ fn encode_cpe(
 // access units (add ADTS or MP4 framing around them as needed).
 // ---------------------------------------------------------------------------
 
-/// Window-shape policy — **arm A8, Rung 0** of `docs/codec-aac-great-gate.md`.
+/// Window-shape policy — **arm A8, Rung 0** of `docs/finished/codec-aac-great-gate.md`.
 ///
 /// `window_shape` is a *free syntax element*: one bit already carried in every
 /// `ics_info`, costing nothing to set either way, with both shapes implemented on

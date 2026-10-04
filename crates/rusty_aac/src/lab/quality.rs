@@ -17,7 +17,7 @@
 //! 1. **Compare relatively.** Ours-vs-anchor at matched bitrate; the shared bias
 //!    largely cancels. An absolute NMR figure means little.
 //! 2. **NMR is the screen, PEAQ is the verdict.** A self-metric provably flatters
-//!    the encoder it came from. No rung in `docs/codec-aac-great-gate.md` is
+//!    the encoder it came from. No rung in `docs/finished/codec-aac-great-gate.md` is
 //!    banked on NMR alone — it exists to make the inner loop fast, and the ladder
 //!    (`super::ladder`) carries the external-oracle column beside it.
 //!

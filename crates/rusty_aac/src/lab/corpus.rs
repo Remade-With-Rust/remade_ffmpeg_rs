@@ -1,5 +1,5 @@
 //! The deterministic AAC content corpus — one signal per content class from
-//! `docs/codec-aac-great-gate.md` §1.1.
+//! `docs/finished/codec-aac-great-gate.md` §1.1.
 //!
 //! Every signal is generated from a formula or a seeded LCG: no binary fixtures,
 //! no wall clock, no `rand`. Identical bytes on every machine and every run, which

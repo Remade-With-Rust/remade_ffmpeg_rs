@@ -1,5 +1,5 @@
 //! `aacquality` — the AAC quality-ladder driver (P0 of the Great Gate campaign,
-//! `docs/codec-aac-great-gate.md`).
+//! `docs/finished/codec-aac-great-gate.md`).
 //!
 //! Runs the deterministic 8-class corpus through the encoder at four operating
 //! points, decodes each stream, and prints the per-clip × per-bitrate NMR table

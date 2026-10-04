@@ -1,12 +1,12 @@
 [package]
 name = "rusty_aac"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 authors = ["Mata Network <https://www.mata.network>"]
 homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
-description = "Pure-Rust AAC-LC decoder + encoder, no C/FFI. ~5x faster than FFmpeg's native AAC encoder and beats it on mono music at 128k+ (PEAQ-measured). Level-invariant transient detection, joint stereo rate loop, ADTS/MP4/LATM-LOAS, 5.1 layouts, HE-AAC signalling."
+description = "Pure-Rust AAC decoder (LC, Main, LTP, HE-AAC v1/v2 SBR+PS, ER LD/ELD; sample-exact vs FFmpeg on the ISO conformance suite) and AAC-LC encoder (~5x faster than FFmpeg's native encoder, PEAQ-measured). No C/FFI. ADTS/MP4/LATM-LOAS, 7.1 + PCE layouts."
 readme = "README.md"
 keywords = ["aac", "audio", "codec", "decoder", "encoder"]
 categories = ["multimedia::audio", "multimedia::encoding"]
@@ -18,7 +18,7 @@ simd = []
 simd-avx512 = ["simd"]
 # The quality lab: deterministic corpus + NMR metric + bitrate-ladder runner.
 # Dev/analysis only — it is the verdict instrument for the Great Gate campaign
-# (`docs/codec-aac-great-gate.md`), not part of the shipped codec surface.
+# (`docs/finished/codec-aac-great-gate.md`), not part of the shipped codec surface.
 lab = []
 
 [dependencies]

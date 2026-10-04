@@ -4,12 +4,16 @@
 [![By Mata Network](https://img.shields.io/badge/by-Mata%20Network-5b2be0)](https://www.mata.network)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/LICENSE)
 
-A pure-Rust **AAC-LC decoder and encoder**. Zero dependencies, no C, no FFI,
-Apache-2.0.
+A pure-Rust **AAC decoder** (LC, Main, LTP, HE-AAC v1/v2, ER LC/LTP/LD/ELD)
+and **AAC-LC encoder**. Zero dependencies, no C, no FFI, Apache-2.0.
 
-- **Decoder** — complete AAC-LC: long/short/transition windows with grouped
-  scalefactors, all spectral Huffman codebooks, M/S and intensity stereo, PNS,
-  TNS. Verified against FFmpeg: bit-exact on deterministic features.
+- **Decoder** — the whole MPEG-4 AAC family short of USAC: AAC-LC, Main
+  (prediction), LTP, **HE-AAC v1 (SBR) and v2 (Parametric Stereo)**, ER AAC-LC/
+  LTP, AAC-LD and AAC-ELD, 1024- and 960-sample frames, every sampling rate,
+  mono to 7.1 plus PCE layouts and coupling channels. **79 of the 83
+  non-USAC ISO/IEC 14496-26 conformance streams decode sample-exact (≤1 LSB)
+  against FFmpeg**, and the rest within a documented deviation — see
+  [Conformance](#conformance).
 - **Encoder** — to our knowledge the **first pure-Rust AAC encoder on
   crates.io** (the alternatives, `fdk-aac` and libxaac bindings, are C FFI).
   Psychoacoustic Bark-scale masking model, **level-invariant transient
@@ -18,8 +22,9 @@ Apache-2.0.
   N/4-FFT MDCT and AVX2 (opt-in AVX-512) quantize kernels.
 - **Transport** — ADTS, MP4 `esds`, and **LATM/LOAS** (the MPEG-TS / broadcast
   carriage format).
-- **HE-AAC signalling** — SBR/PS configurations are recognised and the core is
-  decoded at the correct **output** rate (see [HE-AAC](#he-aac-sbr--ps)).
+- **Full configuration support** — the complete `AudioSpecificConfig`
+  (`GASpecificConfig`, PCE, ELD, error-resilience flags, all three SBR/PS
+  signalling forms) in the `config` module.
 - `--no-default-features` turns off the runtime-detected SIMD kernels and gives
   a **100%-safe scalar build** (every `unsafe` block in the crate is
   feature-gated SIMD).
@@ -119,7 +124,7 @@ The 0.5.0 quality work cost no measurable speed.
   on noise-like content. The encoder still has no bit reservoir, no VBR mode and
   no absolute-threshold-of-hearing term; those are the next levers, tracked with
   per-class evidence in
-  [`docs/codec-aac-quality-plan.md`](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/docs/codec-aac-quality-plan.md).
+  [`docs/finished/codec-aac-quality-plan.md`](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/docs/finished/codec-aac-quality-plan.md).
 - **Rate caveat**: at the 64 k target we emit ~89% of FFmpeg's actual bitrate and
   at 192 k ~107%, so neither extreme is a perfectly clean like-for-like.
 - FFmpeg's native AAC encoder is not the strongest AAC encoder in existence
@@ -128,16 +133,34 @@ The 0.5.0 quality work cost no measurable speed.
 
 ## Patents
 
-AAC-LC is the oldest, largely-expired, lowest-risk corner of the AAC family —
-this crate implements **only AAC-LC coding tools**. It does not implement SBR,
-Parametric Stereo or xHE-AAC, which carry much younger patents; the HE-AAC
-support here is limited to *reading the configuration* and decoding the AAC-LC
-core, with no SBR reconstruction. The code is independently written and
-Apache-2.0-licensed, but **no patent license is granted or implied** by the
-copyright license. If you distribute products commercially, consult IP counsel
+The **encoder** implements only AAC-LC coding tools — the oldest corner of the
+AAC family. The **decoder** implements the wider family, including SBR and
+Parametric Stereo (HE-AAC v1/v2) and the error-resilient / low-delay object
+types, whose patents are considerably younger than AAC-LC's. It does not
+implement xHE-AAC (USAC). The code is independently written from ISO/IEC
+14496-3 and Apache-2.0-licensed, but **no patent license is granted or implied**
+by the copyright license. If you distribute products commercially, consult IP counsel
 about your own position; see the main repo's
 [patent notes](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/docs/compatibility.md#patents).
 This is engineering context, not legal advice.
+
+## Conformance
+
+Every stream in the FFmpeg FATE copy of the **ISO/IEC 14496-26** AAC
+conformance suite (plus FATE's own AAC streams) is decoded by this crate and by
+FFmpeg 8.1.2 (`-flags +bitexact`) and compared sample by sample; the ISO
+reference PCM is checked as a second oracle where FATE ships it.
+
+| verdict | streams | meaning |
+| --- | --- | --- |
+| **EXACT** | **79** | peak difference ≤ 1 LSB vs FFmpeg |
+| KNOWN | 2 | exact except where FFmpeg deviates: it ignores a CRC-valid PCE height extension (we honour it), and it emits an uninitialised channel for a stereo config carrying one SCE (we emit silence) |
+| NEAR | 2 | 5.1 streams with a coupling channel: ≥ 97 dB SNR, 2 LSB peak |
+| not AAC | 8 | xHE-AAC / USAC (ISO/IEC 23003-3) — a separate codec, refused cleanly |
+
+By object type: AAC-LC 55, HE-AAC v1 6, HE-AAC v2 15, Main 2, LTP 1, ER AAC-LD 1,
+ER AAC-ELD 3 — all EXACT except the four noted above. The census harness is
+`examples/aacconf.rs`.
 
 ## Decode
 
@@ -206,36 +229,44 @@ fn main() -> Result<(), Error> {
 
 ## Channel layouts
 
-Mono through 5.1 (`channel_configuration` 1–6) are supported and emitted with the
-**ISO-correct element sequence** — a 5.1 stream is `SCE, CPE, CPE, LFE` with the
-channel reordering AAC requires, not six single-channel elements. Interleaved PCM
-is taken in the standard order (`FL, FR, FC, LFE, BL, BR`) and returned in it.
-Seven or more channels need a `program_config_element`, which is not implemented,
-and are **rejected** rather than mis-encoded.
+**Decoding** handles every `channel_configuration` (1–7, 11–14),
+`program_config_element` layouts (including the CRC-checked height extension),
+coupling channel elements, and mid-stream configuration changes; output is in
+the standard interleaved order (`FL, FR, FC, LFE, BL, BR, …`).
+
+**Encoding** covers mono through 5.1 (`channel_configuration` 1–6), emitted with
+the **ISO-correct element sequence** — a 5.1 stream is `SCE, CPE, CPE, LFE` with
+the channel reordering AAC requires, not six single-channel elements.
+Interleaved PCM is taken in the standard order. Seven or more channels need a
+`program_config_element` on the encode side, which is not implemented, and are
+**rejected** rather than mis-encoded.
 
 ## LATM / LOAS
 
 ```rust
-use rusty_aac::latm::{LatmReader, write_loas_frame};
+use rusty_aac::latm::LatmDecoder;
 
-// Parsing an MPEG-TS / broadcast stream. Use `LatmReader`, not the stateless
-// helper: real streams send the StreamMuxConfig once and then set
-// `useSameStreamMux` for long runs of frames.
-let mut reader = LatmReader::new();
-// let frame = reader.parse(&loas_bytes)?;   // -> config + raw access unit
+// Decoding an MPEG-TS / broadcast LOAS stream end to end: `LatmDecoder`
+// carries the StreamMuxConfig across `useSameStreamMux` frames and rebuilds the
+// decoder when the configuration changes mid-stream (stereo -> 5.1, say).
+let mut dec = LatmDecoder::new();
+// let (pcm, used) = dec.decode(&loas_bytes, None)?;
+// Transport only: `LatmReader::parse` -> full config + raw access unit.
 ```
 
 ## HE-AAC (SBR / PS)
 
-HE-AAC signalling is parsed in all three forms real streams use — explicit
-hierarchical (`audioObjectType` 5/29), explicit backward-compatible (the `0x2B7`
-sync extension), and implicit (SBR payload in the fill element).
+HE-AAC is decoded in full: **SBR** (dual-rate and downsampled, with the QMF
+banks on FFTs) and **Parametric Stereo** (10/20/34 bands, IPD/OPD), with
+signalling in all three forms real streams use — explicit hierarchical
+(`audioObjectType` 5/29), explicit backward-compatible (the `0x2B7` sync
+extension), and implicit (SBR payload in the fill element; a mono stream is
+output as stereo, as other decoders do, in case PS appears).
 
-**The SBR high band is not reconstructed.** What this buys you is that an HE-AAC
-stream decodes its AAC-LC core correctly and reports the true **output** sample
-rate (twice the core rate) — without that, an HE-AAC stream plays at half speed.
-`AacDecoder::sbr_support()` returns `SbrSupport::CoreOnly` so this is visible at
-the API rather than discovered later.
+The one exception is the *low-delay* SBR of AAC-ELD, which needs a different
+filterbank: such a stream decodes its ELD core at the core rate, and
+`AacDecoder::sbr_support()` reports `SbrSupport::CoreOnly` rather than leaving
+it to be discovered.
 
 ```rust
 let dec = rusty_aac::AacDecoder::with_config_bytes(&esds_payload)?;

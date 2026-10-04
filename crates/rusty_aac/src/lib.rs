@@ -1,14 +1,18 @@
-//! Pure-Rust **AAC-LC decoder + encoder**, no C and no FFI.
+//! Pure-Rust **AAC decoder** (LC, Main, LTP, HE-AAC v1/v2, ER LC/LTP/LD/ELD)
+//! **+ AAC-LC encoder**, no C and no FFI.
 //!
 //! Extracted from (and the engine of) the
 //! [`remade_ffmpeg_rs`](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)
 //! project. The crate has **zero dependencies**.
 //!
-//! - **Decoder**: complete AAC-LC — long/short/transition windows with grouped
-//!   scalefactors, all spectral Huffman codebooks, M/S and intensity stereo,
-//!   PNS, TNS — verified against FFmpeg (bit-exact on deterministic features).
-//!   Entry point: [`AacDecoder`] (handles ADTS framing and raw MP4 access
-//!   units alike) or the lower-level [`decode::Decoder`].
+//! - **Decoder**: the MPEG-4 AAC family short of USAC — LC, Main (prediction),
+//!   LTP, HE-AAC v1 (SBR) and v2 (Parametric Stereo), ER AAC-LC/LTP, AAC-LD and
+//!   AAC-ELD; 1024/960-sample frames, mono to 7.1 and PCE layouts, coupling
+//!   channels. Sample-exact (≤1 LSB) against FFmpeg on 79 of the 83 non-USAC
+//!   ISO/IEC 14496-26 conformance streams, the rest within documented
+//!   deviations. Entry point: [`AacDecoder`] (ADTS framing and raw MP4 access
+//!   units alike), [`latm::LatmDecoder`] for LOAS, or the lower-level
+//!   [`decode::Decoder`] driven by a full [`config::StreamConfig`].
 //! - **Encoder**: psychoacoustic Bark-scale masking model, two-phase bitrate
 //!   rate loop, transient-driven block switching, per-SFB M/S stereo, and a
 //!   frame-parallel `encode_stream` (~450× realtime). Entry point:
@@ -37,12 +41,11 @@ mod ics;
 pub mod latm;
 /// The quality lab (feature `lab`): deterministic corpus, the NMR metric, and the
 /// bitrate-ladder runner. This is the verdict instrument for the Great Gate
-/// campaign — see `docs/codec-aac-great-gate.md`.
+/// campaign — see `docs/finished/codec-aac-great-gate.md`.
 #[cfg(feature = "lab")]
 pub mod lab;
-/// HE-AAC (SBR / Parametric Stereo) signalling and capability reporting — the
-/// broadcast and low-bitrate-streaming configuration. See the module docs for
-/// exactly which parts are implemented.
+/// HE-AAC (SBR / Parametric Stereo): signalling, capability reporting, and the
+/// reconstruction itself. See the module docs for exactly what is implemented.
 pub mod sbr;
 mod swb;
 mod tables;
