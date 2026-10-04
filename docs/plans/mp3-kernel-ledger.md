@@ -30,7 +30,15 @@ counts every arm, tallied once per granule.
 | `synthesis::matrixing_avx` | `granule_to_pcm` → `synthesis::polyphase` | 18 passes | once per granule | `matrixing_simd_matches_scalar` (64 trials) | x86_64 only |
 | `synthesis::window_avx` | `polyphase` | 18 passes | once per granule | `window_simd_matches_scalar` (every legal `head`) | x86_64 only |
 
-All three are BIT-identical by construction (output index = lane, original
+**Encoder (added 2026-10-03, brick 2b):** `filterbank::fold_avx` / `fold_neon`
+(window + fold 512 -> 64) and `filterbank::matrix_avx` / `matrix_neon` (64 -> 32,
+over a transposed table), reached from `filterbank::analyze`, dispatched once
+per granule, oracle tests `fold_simd_matches_scalar` (every legal `head`) and
+`matrix_simd_matches_scalar`; census `encode::prof::FB_PASSES`. Filterbank stage
+39.4 -> 5.8 ms, **whole encode 1.251x min / 1.178x median, 20/20, z=+4.47**;
+72/72 encodes byte-identical; NEON twins pass under qemu, FMA poison fails both.
+
+All three decode kernels are BIT-identical by construction (output index = lane, original
 accumulation order, separate mul+add, no FMA).
 
 ### Reach — measured on the shipping binary
@@ -121,10 +129,10 @@ function with ~0 packed ops has no vectorized inner loop either.
 
 ### Ranked candidates (Step 0 still applies -- name the reason, price the stage)
 
-1. **NEON twins of the three decode kernels** -- value already measured (~1.6x
-   decode on ARM); mechanical, bit-identical.
-2. **Encoder filterbank (19.4% of encode).** Sibling-path parity: the DECODER's
-   synthesis matrixing + windowing are AVX; the encoder's analysis twin is scalar.
+1. ~~**NEON twins of the three decode kernels**~~ DONE (brick 1).
+2. ~~**Encoder filterbank (19.4% of encode).**~~ DONE: brick 2a (circular FIFO,
+   below resolution, byte-identical) + brick 2b (AVX/NEON fold + matrix, encode
+   1.18-1.25x).
 3. **Encoder quantize (50% of encode).** `rusty_aac` already ships an AVX2
    quantize/xpow kernel (`codec-vectorize-kernel` 2026-07-03): a cross-crate form-2
    case -- port before writing. Named reason: the f64->i32 round+clamp with a sign

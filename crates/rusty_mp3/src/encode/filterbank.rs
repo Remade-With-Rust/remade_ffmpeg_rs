@@ -47,12 +47,218 @@ fn matrix() -> &'static [[f32; 64]; SUBBANDS] {
     })
 }
 
+/// `M` transposed, `[i][k]`: the lane-per-output layout the SIMD matrix twins
+/// read, so each of the 32 outputs accumulates in its own lane with no
+/// horizontal reduction -- written as 32 dot products the compiler leaves it
+/// scalar (66 scalar / 2 packed float ops in the emitted asm).
+fn matrix_t() -> &'static [[f32; SUBBANDS]; 64] {
+    static T: OnceLock<[[f32; SUBBANDS]; 64]> = OnceLock::new();
+    T.get_or_init(|| {
+        let m = matrix();
+        let mut t = [[0f32; SUBBANDS]; 64];
+        for (k, row) in m.iter().enumerate() {
+            for (i, &v) in row.iter().enumerate() {
+                t[i][k] = v;
+            }
+        }
+        t
+    })
+}
+
+/// Window + fold 512 → 64: `Y[i] = Σ_{j=0..7} C[i+64j]·X[i+64j]`, each output
+/// accumulating its eight taps in `j` order (`0.0 + p0 == p0`, so starting at
+/// zero is exact). The scalar ORACLE for [`fold_simd`]. `head` must be a
+/// multiple of 32 so every 32-run is contiguous inside the circular FIFO.
+#[inline]
+fn fold_scalar(c: &[f32; 512], fifo: &[f32; 512], head: usize) -> [f32; 64] {
+    let mut y = [0f32; 64];
+    for (h, yh) in y.chunks_exact_mut(32).enumerate() {
+        for j in 0..8 {
+            let at = (head + 32 * h + 64 * j) & 511;
+            let (cs, xs) = (&c[32 * h + 64 * j..][..32], &fifo[at..at + 32]);
+            for i in 0..32 {
+                yh[i] += cs[i] * xs[i];
+            }
+        }
+    }
+    y
+}
+
+/// Matrix 64 → 32: `S[k] = Σ_{i=0..63} M[k][i]·Y[i]`. The scalar ORACLE for
+/// [`matrix_simd`].
+#[inline]
+fn matrix_scalar(m: &[[f32; 64]; SUBBANDS], y: &[f32; 64]) -> [f32; SUBBANDS] {
+    let mut s = [0f32; SUBBANDS];
+    for k in 0..SUBBANDS {
+        let mut acc = 0f32;
+        for i in 0..64 {
+            acc += m[k][i] * y[i];
+        }
+        s[k] = acc;
+    }
+    s
+}
+
+/// AVX twin of [`fold_scalar`]: output index = lane, eight accumulators, taps in
+/// the original `j` order, separate mul + add (no FMA) -- bit-identical.
+///
+/// # Safety
+/// AVX must be available; `head % 32 == 0`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn fold_avx(c: &[f32; 512], fifo: &[f32; 512], head: usize) -> [f32; 64] {
+    use std::arch::x86_64::*;
+    let mut acc = [unsafe { _mm256_setzero_ps() }; 8];
+    for j in 0..8 {
+        for h in 0..2 {
+            // `at` is a multiple of 32 below 512, so `at + 32 <= 512`.
+            let at = (head + 32 * h + 64 * j) & 511;
+            for q in 0..4 {
+                unsafe {
+                    let cv = _mm256_loadu_ps(c.as_ptr().add(32 * h + 64 * j + 8 * q));
+                    let xv = _mm256_loadu_ps(fifo.as_ptr().add(at + 8 * q));
+                    let a = &mut acc[4 * h + q];
+                    *a = _mm256_add_ps(*a, _mm256_mul_ps(cv, xv));
+                }
+            }
+        }
+    }
+    let mut y = [0f32; 64];
+    for (v, a) in acc.iter().enumerate() {
+        unsafe { _mm256_storeu_ps(y.as_mut_ptr().add(8 * v), *a) };
+    }
+    y
+}
+
+/// AVX twin of [`matrix_scalar`] over the transposed matrix: `k` = lane, `i`
+/// ascending, separate mul + add -- bit-identical.
+///
+/// # Safety
+/// AVX must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn matrix_avx(mt: &[[f32; SUBBANDS]; 64], y: &[f32; 64]) -> [f32; SUBBANDS] {
+    use std::arch::x86_64::*;
+    let mut acc = [unsafe { _mm256_setzero_ps() }; 4];
+    for (i, row) in mt.iter().enumerate() {
+        unsafe {
+            let x = _mm256_set1_ps(y[i]);
+            for (v, a) in acc.iter_mut().enumerate() {
+                *a = _mm256_add_ps(
+                    *a,
+                    _mm256_mul_ps(_mm256_loadu_ps(row.as_ptr().add(8 * v)), x),
+                );
+            }
+        }
+    }
+    let mut s = [0f32; SUBBANDS];
+    for (v, a) in acc.iter().enumerate() {
+        unsafe { _mm256_storeu_ps(s.as_mut_ptr().add(8 * v), *a) };
+    }
+    s
+}
+
+/// NEON twin of [`fold_scalar`] (4 lanes, 16 accumulators; separate `vmulq` +
+/// `vaddq`, never `vfmaq`) -- bit-identical.
+///
+/// # Safety
+/// `head % 32 == 0`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn fold_neon(c: &[f32; 512], fifo: &[f32; 512], head: usize) -> [f32; 64] {
+    use std::arch::aarch64::*;
+    let mut acc = [unsafe { vdupq_n_f32(0.0) }; 16];
+    for j in 0..8 {
+        for h in 0..2 {
+            let at = (head + 32 * h + 64 * j) & 511;
+            for q in 0..8 {
+                unsafe {
+                    let cv = vld1q_f32(c.as_ptr().add(32 * h + 64 * j + 4 * q));
+                    let xv = vld1q_f32(fifo.as_ptr().add(at + 4 * q));
+                    let a = &mut acc[8 * h + q];
+                    *a = vaddq_f32(*a, vmulq_f32(cv, xv));
+                }
+            }
+        }
+    }
+    let mut y = [0f32; 64];
+    for (v, a) in acc.iter().enumerate() {
+        unsafe { vst1q_f32(y.as_mut_ptr().add(4 * v), *a) };
+    }
+    y
+}
+
+/// NEON twin of [`matrix_scalar`] (4 lanes, 8 accumulators) -- bit-identical.
+///
+/// # Safety
+/// NEON is baseline on AArch64; fixed-size arrays only.
+#[cfg(target_arch = "aarch64")]
+unsafe fn matrix_neon(mt: &[[f32; SUBBANDS]; 64], y: &[f32; 64]) -> [f32; SUBBANDS] {
+    use std::arch::aarch64::*;
+    let mut acc = [unsafe { vdupq_n_f32(0.0) }; 8];
+    for (i, row) in mt.iter().enumerate() {
+        unsafe {
+            let x = vdupq_n_f32(y[i]);
+            for (v, a) in acc.iter_mut().enumerate() {
+                *a = vaddq_f32(*a, vmulq_f32(vld1q_f32(row.as_ptr().add(4 * v)), x));
+            }
+        }
+    }
+    let mut s = [0f32; SUBBANDS];
+    for (v, a) in acc.iter().enumerate() {
+        unsafe { vst1q_f32(s.as_mut_ptr().add(4 * v), *a) };
+    }
+    s
+}
+
+/// This arch's fold twin (AVX / NEON / scalar).
+///
+/// # Safety
+/// Caller checked [`crate::decode::isa::simd_available`]; `head % 32 == 0`.
+#[inline]
+unsafe fn fold_simd(c: &[f32; 512], fifo: &[f32; 512], head: usize) -> [f32; 64] {
+    debug_assert_eq!(head % 32, 0);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        fold_avx(c, fifo, head)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        fold_neon(c, fifo, head)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    fold_scalar(c, fifo, head)
+}
+
+/// This arch's matrix twin (AVX / NEON / scalar).
+///
+/// # Safety
+/// Caller checked [`crate::decode::isa::simd_available`].
+#[inline]
+unsafe fn matrix_simd(mt: &[[f32; SUBBANDS]; 64], y: &[f32; 64]) -> [f32; SUBBANDS] {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        matrix_avx(mt, y)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        matrix_neon(mt, y)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    matrix_scalar(matrix(), y)
+}
+
 /// Analyze one granule of mono PCM (`pcm[0..576]`) into subband samples
 /// `[subband][line]`, advancing the channel's filterbank FIFO `X[]`.
 pub fn analyze(pcm: &[f32], fifo: &mut [f32; 512]) -> [[f32; SUBBAND_LINES]; SUBBANDS] {
     let c = window();
     let m = matrix();
+    let mt = matrix_t();
     let mut out = [[0f32; SUBBAND_LINES]; SUBBANDS];
+    // Resolved once per granule (codec-measurement: a dispatch read inside the
+    // pass loop is overhead added to take a measurement).
+    let simd = crate::decode::isa::use_simd();
+    super::prof::FB_PASSES[simd as usize]
+        .fetch_add(SUBBAND_LINES as u64, std::sync::atomic::Ordering::Relaxed);
     // The granule is exactly `SUBBAND_LINES * 32` samples and callers pass an
     // open-ended slice, so `pcm[v * 32 + t]` could not be proven in range and every
     // one of the 576 FIFO pushes carried a bounds check.
@@ -79,27 +285,15 @@ pub fn analyze(pcm: &[f32], fifo: &mut [f32; 512]) -> [[f32; SUBBAND_LINES]; SUB
             new[31 - t] = pcm[v * 32 + t];
         }
 
-        // Window + fold 512 → 64: Y[i] = Σ_{j=0..7} C[i+64j]·X[i+64j], each output
-        // accumulating its eight taps in j order (0.0 + p0 == p0, so starting the
-        // accumulator at zero is exact).
-        let mut y = [0f32; 64];
-        for (h, yh) in y.chunks_exact_mut(32).enumerate() {
-            for j in 0..8 {
-                let at = (head + 32 * h + 64 * j) & 511;
-                let (cs, xs) = (&c[32 * h + 64 * j..][..32], &fifo[at..at + 32]);
-                for i in 0..32 {
-                    yh[i] += cs[i] * xs[i];
-                }
-            }
-        }
-
-        // Matrix 64 → 32: S[k] = Σ_{i=0..63} M[k][i]·Y[i].
+        // Window + fold 512 → 64, then matrix 64 → 32.
+        let s = if simd {
+            // SAFETY: `simd` came from `use_simd()`; `head` is a multiple of 32.
+            unsafe { matrix_simd(mt, &fold_simd(c, fifo, head)) }
+        } else {
+            matrix_scalar(m, &fold_scalar(c, fifo, head))
+        };
         for k in 0..SUBBANDS {
-            let mut acc = 0f32;
-            for i in 0..64 {
-                acc += m[k][i] * y[i];
-            }
-            out[k][v] = acc;
+            out[k][v] = s[k];
         }
     }
     // Restore the canonical layout (`X[L]` at physical `L`) the caller's state is
@@ -168,6 +362,52 @@ mod tests {
             best_snr > 70.0,
             "analysis/synthesis SNR too low: {best_snr:.1} dB"
         );
+    }
+
+    fn rng(seed: u32) -> impl FnMut() -> f32 {
+        let mut st = seed;
+        move || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (st >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        }
+    }
+
+    /// The SIMD fold must be BIT-identical to the scalar oracle at every legal
+    /// `head` (all multiples of 32, so the circular wrap is covered).
+    #[test]
+    fn fold_simd_matches_scalar() {
+        if !crate::decode::isa::simd_available() {
+            eprintln!("no SIMD twin on this host - scalar path only, gate skipped");
+            return;
+        }
+        let mut r = rng(0x2545_F491);
+        let mut fifo = [0f32; 512];
+        fifo.iter_mut().for_each(|x| *x = r());
+        let c = window();
+        for head in (0..512).step_by(32) {
+            let a = fold_scalar(c, &fifo, head);
+            // SAFETY: gated on simd_available(); head is a multiple of 32.
+            let b = unsafe { fold_simd(c, &fifo, head) };
+            assert_eq!(a, b, "fold SIMD/scalar mismatch at head={head}");
+        }
+    }
+
+    /// The SIMD matrix (over the transposed table) must be BIT-identical too.
+    #[test]
+    fn matrix_simd_matches_scalar() {
+        if !crate::decode::isa::simd_available() {
+            eprintln!("no SIMD twin on this host - scalar path only, gate skipped");
+            return;
+        }
+        let mut r = rng(0x9E37_79B9);
+        for trial in 0..128 {
+            let mut y = [0f32; 64];
+            y.iter_mut().for_each(|x| *x = r());
+            let a = matrix_scalar(matrix(), &y);
+            // SAFETY: gated on simd_available().
+            let b = unsafe { matrix_simd(matrix_t(), &y) };
+            assert_eq!(a, b, "matrix SIMD/scalar mismatch on trial {trial}");
+        }
     }
 
     #[test]

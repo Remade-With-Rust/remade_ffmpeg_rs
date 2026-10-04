@@ -92,6 +92,9 @@ pub mod prof {
     pub static PREFLAG_OK: AtomicU64 = AtomicU64::new(0);
     /// Scalefactor steps accepted by short-block shaping (`quantize_short_slack`).
     pub static SHORT_REFINE_STEPS: AtomicU64 = AtomicU64::new(0);
+    /// Analysis-filterbank passes by kernel arm, `[scalar, simd]` -- the encoder's
+    /// kernel-reach census (18 per granule per channel), tallied once per granule.
+    pub static FB_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
     /// Which term decided each band's masking threshold: the energy cap, the
     /// absolute threshold of hearing, or the spread masker itself. Only the last

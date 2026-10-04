@@ -100,6 +100,11 @@ fn main() {
     let rs = prof::REFINE_STEPS.load(Relaxed);
     println!("  refine steps accepted: {rs}");
     println!(
+        "  kernel census: filterbank passes simd {} scalar {}",
+        prof::FB_PASSES[1].load(Relaxed),
+        prof::FB_PASSES[0].load(Relaxed)
+    );
+    println!(
         "  short-block refine steps accepted: {}",
         prof::SHORT_REFINE_STEPS.load(Relaxed)
     );
