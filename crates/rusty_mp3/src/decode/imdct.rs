@@ -117,8 +117,11 @@ unsafe fn imdct36_avx(lines: &[f32], out: &mut [f32; 24]) {
         return;
     };
     let ct = cos36_t();
+    // SAFETY: a register constant -- no memory access; the ISA is this fn's contract. Redundant from Rust 1.86 (safe target-feature calls), required at the crate's MSRV (1.85).
+    #[allow(unused_unsafe)]
     let mut acc = [unsafe { _mm256_setzero_ps() }; 3];
     for (k, row) in ct.iter().enumerate() {
+        // SAFETY: `row` is `[f32; 24]` (`cos36_t`); `v * 8 + 8 <= 24` for `v < 3`. AVX per this fn's contract.
         unsafe {
             let x = _mm256_set1_ps(lines[k]);
             for (v, accv) in acc.iter_mut().enumerate() {
@@ -128,6 +131,7 @@ unsafe fn imdct36_avx(lines: &[f32], out: &mut [f32; 24]) {
         }
     }
     for (v, accv) in acc.iter().enumerate() {
+        // SAFETY: `out` is `[f32; 24]`; `v * 8 + 8 <= 24` for `v < 3`.
         unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(v * 8), *accv) };
     }
 }
@@ -148,8 +152,11 @@ unsafe fn imdct36_neon(lines: &[f32], out: &mut [f32; 24]) {
         return;
     };
     let ct = cos36_t();
+    // SAFETY: a register constant -- no memory access; the ISA is this fn's contract. Redundant from Rust 1.86 (safe target-feature calls), required at the crate's MSRV (1.85).
+    #[allow(unused_unsafe)]
     let mut acc = [unsafe { vdupq_n_f32(0.0) }; 6];
     for (k, row) in ct.iter().enumerate() {
+        // SAFETY: `row` is `[f32; 24]` (`cos36_t`); `v * 4 + 4 <= 24` for `v < 6`.
         unsafe {
             let x = vdupq_n_f32(lines[k]);
             for (v, accv) in acc.iter_mut().enumerate() {
@@ -159,6 +166,7 @@ unsafe fn imdct36_neon(lines: &[f32], out: &mut [f32; 24]) {
         }
     }
     for (v, accv) in acc.iter().enumerate() {
+        // SAFETY: `out` is `[f32; 24]`; `v * 4 + 4 <= 24` for `v < 6`.
         unsafe { vst1q_f32(out.as_mut_ptr().add(v * 4), *accv) };
     }
 }
@@ -171,10 +179,12 @@ unsafe fn imdct36_neon(lines: &[f32], out: &mut [f32; 24]) {
 #[inline]
 unsafe fn imdct36_simd(lines: &[f32], out: &mut [f32; 24]) {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
     unsafe {
-        imdct36_avx(lines, out)
+        imdct36_avx(lines, out);
     }
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
     unsafe {
         imdct36_neon(lines, out)
     }
@@ -265,6 +275,9 @@ unsafe fn hybrid_avx(
 
 /// The hybrid IMDCT body; `simd` selects the kernel twin (callers pass a value
 /// from `use_simd()`, and on x86_64 only `hybrid_avx` passes `true`).
+// Load-bearing: the body must inline INTO the `#[target_feature]` entry so the
+// kernels inline with it (docs/plans/mp3-kernel-ledger.md, brick 4).
+#[allow(clippy::inline_always)]
 #[inline(always)]
 fn hybrid_impl(
     gi: &GranuleSideInfo,
@@ -473,7 +486,7 @@ mod tests {
             let (mut ov_a, mut ov_b) = ([0f32; GRANULE_LINES], [0f32; GRANULE_LINES]);
             for g in 0..4 {
                 let mut lines = [0f32; GRANULE_LINES];
-                for l in lines.iter_mut() {
+                for l in &mut lines {
                     *l = rng();
                 }
                 let fast = hybrid(&gi, &lines, &mut ov_a);

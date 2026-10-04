@@ -1,17 +1,25 @@
 # rff-codec-mp3
 
-[![Remade With Rust](https://img.shields.io/badge/Remade%20With-Rust-000?logo=rust&logoColor=fff)](https://github.com/remade-with-rust)
-[![By Mata Network](https://img.shields.io/badge/by-Mata%20Network-5b2be0)](https://www.mata.network)
+[![crates.io](https://img.shields.io/crates/v/rff-codec-mp3.svg)](https://crates.io/crates/rff-codec-mp3)
+[![docs.rs](https://img.shields.io/docsrs/rff-codec-mp3)](https://docs.rs/rff-codec-mp3)
+[![Hardening](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/actions/workflows/mp3-hardening.yml/badge.svg)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/actions/workflows/mp3-hardening.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/LICENSE)
 
-The **MP3** (MPEG-1/2/2.5 Layer III) codec adapter for **remade_ffmpeg_rs**,
-backed by the in-house pure-Rust [`rusty_mp3`](https://crates.io/crates/rusty_mp3)
-crate — no C, no FFI. Registers `mp3` for both decode and encode.
+The MP3 codec for **[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)**.
+It registers `mp3` for decoding and encoding in the engine's codec registry,
+backed by the pure-Rust [`rusty_mp3`](https://crates.io/crates/rusty_mp3) codec.
+No C, no FFI, and no `unsafe` code in this crate.
 
-- **Decoder: bit-exact against FFmpeg** on our conformance corpus — full MPEG-1/2/2.5 Layer III, bit reservoir, all stereo modes, alias reduction, hybrid IMDCT, polyphase synthesis.
-- **Encoder** — MPEG-1/2/2.5, CBR and VBR, mono/stereo/joint (mid/side) stereo, psychoacoustic model with transient block switching, and a **bit reservoir** (default-on for MPEG-1 CBR ≤ 256 kbps) that puts it at **PEAQ parity with LAME across 96–256 kbps** on the content we've measured.
-- Known gap: the reservoir is disabled at 320 kbps and for MPEG-2/2.5.
-- MP3's patents expired in 2017 — the format is royalty-free everywhere.
+- **Decoding** of MPEG-1, MPEG-2 and MPEG-2.5 Layer III. It passes all 16 ISO
+  conformance vectors and matches FFmpeg bit for bit on a 678-stream corpus.
+- **Encoding** at CBR or VBR, mono, stereo or joint stereo, configured with the
+  usual FFmpeg options: `-b:a 192k` for a bitrate, `-q:a 0`–`9` for VBR quality.
+- **Input formats:** interleaved `s16` and `f32` frames are encoded directly,
+  without intermediate copies. Decoded frames are interleaved `f32`.
+
+Most applications use this crate through the
+[`remade-ffmpeg`](https://crates.io/crates/remade-ffmpeg) engine or the `rff`
+command-line tools rather than directly.
 
 ## Usage
 
@@ -23,36 +31,43 @@ fn main() -> Result<(), Error> {
     let mut codecs = CodecRegistry::new();
     rff_codec_mp3::register(&mut codecs);
 
-    // Now reachable by id or by FFmpeg-style name.
     let _decoder = codecs.find_decoder(CodecId::Mp3)?;
-    let codec = codecs.by_id(CodecId::Mp3).expect("just registered");
-    println!("{} — decode: {}, encode: {}", codec.long_name, codec.can_decode(), codec.can_encode());
+    let _encoder = codecs.find_encoder(CodecId::Mp3)?;
+    let codec = codecs.by_id(CodecId::Mp3).expect("registered");
+    println!("{}: decode {}, encode {}", codec.long_name, codec.can_decode(), codec.can_encode());
     Ok(())
 }
 ```
 
+The decoder and encoder implement the engine's `Decoder` and `Encoder` traits,
+including FFmpeg's `Again` / `Eof` drain protocol.
+
+## Robustness
+
+- Packet bytes are treated as hostile; frame sync, parsing and decoding are done
+  by `rusty_mp3`, whose decoder is fuzzed and conformance-tested.
+- A frame's sample count is checked against its buffer: a frame that claims more
+  samples than it carries is clamped to what it holds, and a frame with no
+  sample buffer is rejected.
+- This crate is `#![forbid(unsafe_code)]`, has its own fuzz targets, and is
+  covered by the same hardening audit as the codec
+  ([threat model](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rff-codec-mp3/docs/threat-model.md),
+  [audit](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rff-codec-mp3/docs/plans/use-protection-please.md)).
+- Report vulnerabilities privately; see
+  [`SECURITY.md`](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/SECURITY.md).
+
+## Compatibility
+
+Version 1.x of this crate depends on `rusty_mp3` 1.x. Its public API is the
+`register` function plus the re-export of `rusty_mp3`.
+
 ## Part of Remade With Rust
 
 This crate is one layer of
-**[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)** — a
-ground-up, permissively-licensed Rust rebuild of FFmpeg: a drop-in
-`ffmpeg`/`ffprobe` CLI on pure-Rust codecs, with no copyleft. Most users want
-the [`remade-ffmpeg`](https://crates.io/crates/remade-ffmpeg) engine facade or the
-[`rff-cli`](https://crates.io/crates/rff-cli) binaries rather than this crate
-directly.
-
-Also check out our sister project
-**[FFAI](https://github.com/Remade-With-Rust/FFAI)** — media for an AI-first
-world — and the rest of
-**[github.com/remade-with-rust](https://github.com/remade-with-rust)**, including
-the standalone codec crates
-[`rusty_h264`](https://crates.io/crates/rusty_h264),
-[`rusty_vp9`](https://crates.io/crates/rusty_vp9),
-[`rusty_mp3`](https://crates.io/crates/rusty_mp3),
-[`rusty_aac`](https://crates.io/crates/rusty_aac),
-[`rusty-opus`](https://crates.io/crates/rusty-opus),
-[`rusty_vorbis`](https://crates.io/crates/rusty_vorbis), and the
-[rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) forks.
+**[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)**, a
+ground-up, permissively licensed Rust rebuild of FFmpeg: a drop-in
+`ffmpeg`/`ffprobe` CLI on pure-Rust codecs, with no copyleft. See also
+**[FFAI](https://github.com/Remade-With-Rust/FFAI)**, media for an AI-first world.
 
 ## About Mata Network
 
@@ -68,3 +83,32 @@ permissively-licensed building blocks that work depends on.
 
 Apache-2.0. See the workspace
 [LICENSE](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/LICENSE).
+
+---
+
+<!-- HARDENING-TABLE:BEGIN generated by use-protection-please — edit docs/plans/use-protection-please.md, not this block -->
+## Hardening status
+
+**Tier** critical-path · **Audited** 2026-10-04 (deep) · **v1.0.0 gates** 13/15 · [Full checklist](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rff-codec-mp3/docs/plans/use-protection-please.md)
+
+`██████████████████░░` **91%** &nbsp;·&nbsp; 30 Completed · 0 Scheduled · 3 Incomplete · 22 N/A
+
+| Phase | ✅ Completed | 🗓 Scheduled | ⬜ Incomplete | · N/A |
+|---|--:|--:|--:|--:|
+| 0 — Threat modeling | 2 | 0 | 0 | 0 |
+| 1 — Toolchain | 3 | 0 | 1 | 0 |
+| 2 — Supply chain | 8 | 0 | 0 | 0 |
+| 3 — Code level | 6 | 0 | 0 | 1 |
+| 4 — Static analysis | 1 | 0 | 0 | 0 |
+| 5 — Dynamic analysis | 3 | 0 | 0 | 0 |
+| 6 — Fuzzing and properties | 3 | 0 | 1 | 0 |
+| 7 — Formal verification | 0 | 0 | 0 | 1 |
+| 8 — Build and binary | 0 | 0 | 0 | 2 |
+| 9 — Runtime privilege | 0 | 0 | 0 | 1 |
+| 10 — Cryptography | 0 | 0 | 0 | 3 |
+| 11 — CI/CD, release, and operations | 4 | 0 | 1 | 0 |
+| 12 — Compliance controls | 0 | 0 | 0 | 14 |
+| **Total** | **30** | **0** | **3** | **22** |
+
+**Architect** — Tim Almond — accountable for this unit's security design; rendered
+<!-- HARDENING-TABLE:END -->

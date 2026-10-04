@@ -103,17 +103,24 @@ fn matrix_scalar(m: &[[f32; 64]; SUBBANDS], y: &[f32; 64]) -> [f32; SUBBANDS] {
 /// the original `j` order, separate mul + add (no FMA) -- bit-identical.
 ///
 /// # Safety
-/// AVX must be available; `head % 32 == 0`.
+/// AVX must be available. All memory bounds are established inside (fixed-size
+/// arrays; `head` is masked to a multiple of 32).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn fold_avx(c: &[f32; 512], fifo: &[f32; 512], head: usize) -> [f32; 64] {
     use std::arch::x86_64::*;
+    // `analyze` only ever passes a multiple of 32; masking makes the bounds below
+    // hold for ANY `head`, so the kernel's soundness is local (one `and`).
+    let head = head & !31;
+    // SAFETY: a register constant -- no memory access; the ISA is this fn's contract. Redundant from Rust 1.86 (safe target-feature calls), required at the crate's MSRV (1.85).
+    #[allow(unused_unsafe)]
     let mut acc = [unsafe { _mm256_setzero_ps() }; 8];
     for j in 0..8 {
         for h in 0..2 {
             // `at` is a multiple of 32 below 512, so `at + 32 <= 512`.
             let at = (head + 32 * h + 64 * j) & 511;
             for q in 0..4 {
+                // SAFETY: `c` offsets reach `32 + 448 + 24 + 8 = 512`, its length; `head` is masked to a multiple of 32 above, so `at` is a multiple of 32 below 512 and `at + 8 * q + 8 <= at + 32 <= 512`.
                 unsafe {
                     let cv = _mm256_loadu_ps(c.as_ptr().add(32 * h + 64 * j + 8 * q));
                     let xv = _mm256_loadu_ps(fifo.as_ptr().add(at + 8 * q));
@@ -125,6 +132,7 @@ unsafe fn fold_avx(c: &[f32; 512], fifo: &[f32; 512], head: usize) -> [f32; 64] 
     }
     let mut y = [0f32; 64];
     for (v, a) in acc.iter().enumerate() {
+        // SAFETY: `y` is `[f32; 64]`; `8 * v + 8 <= 64` for `v < 8`.
         unsafe { _mm256_storeu_ps(y.as_mut_ptr().add(8 * v), *a) };
     }
     y
@@ -139,8 +147,11 @@ unsafe fn fold_avx(c: &[f32; 512], fifo: &[f32; 512], head: usize) -> [f32; 64] 
 #[target_feature(enable = "avx")]
 unsafe fn matrix_avx(mt: &[[f32; SUBBANDS]; 64], y: &[f32; 64]) -> [f32; SUBBANDS] {
     use std::arch::x86_64::*;
+    // SAFETY: a register constant -- no memory access; the ISA is this fn's contract. Redundant from Rust 1.86 (safe target-feature calls), required at the crate's MSRV (1.85).
+    #[allow(unused_unsafe)]
     let mut acc = [unsafe { _mm256_setzero_ps() }; 4];
     for (i, row) in mt.iter().enumerate() {
+        // SAFETY: `row` is `[f32; 32]`; `8 * v + 8 <= 32` for `v < 4`.
         unsafe {
             let x = _mm256_set1_ps(y[i]);
             for (v, a) in acc.iter_mut().enumerate() {
@@ -153,6 +164,7 @@ unsafe fn matrix_avx(mt: &[[f32; SUBBANDS]; 64], y: &[f32; 64]) -> [f32; SUBBAND
     }
     let mut s = [0f32; SUBBANDS];
     for (v, a) in acc.iter().enumerate() {
+        // SAFETY: `s` is `[f32; 32]`; `8 * v + 8 <= 32` for `v < 4`.
         unsafe { _mm256_storeu_ps(s.as_mut_ptr().add(8 * v), *a) };
     }
     s
@@ -162,15 +174,21 @@ unsafe fn matrix_avx(mt: &[[f32; SUBBANDS]; 64], y: &[f32; 64]) -> [f32; SUBBAND
 /// `vaddq`, never `vfmaq`) -- bit-identical.
 ///
 /// # Safety
-/// `head % 32 == 0`.
+/// NEON is baseline on AArch64; all memory bounds are established inside
+/// (fixed-size arrays; `head` is masked to a multiple of 32).
 #[cfg(target_arch = "aarch64")]
 unsafe fn fold_neon(c: &[f32; 512], fifo: &[f32; 512], head: usize) -> [f32; 64] {
     use std::arch::aarch64::*;
+    // See `fold_avx`: masking makes the spans' bounds independent of the caller.
+    let head = head & !31;
+    // SAFETY: a register constant -- no memory access; the ISA is this fn's contract. Redundant from Rust 1.86 (safe target-feature calls), required at the crate's MSRV (1.85).
+    #[allow(unused_unsafe)]
     let mut acc = [unsafe { vdupq_n_f32(0.0) }; 16];
     for j in 0..8 {
         for h in 0..2 {
             let at = (head + 32 * h + 64 * j) & 511;
             for q in 0..8 {
+                // SAFETY: `c` offsets reach `32 + 448 + 28 + 4 = 512`, its length; `head` is masked to a multiple of 32 above, so `at` is a multiple of 32 below 512 and `at + 4 * q + 4 <= at + 32 <= 512`.
                 unsafe {
                     let cv = vld1q_f32(c.as_ptr().add(32 * h + 64 * j + 4 * q));
                     let xv = vld1q_f32(fifo.as_ptr().add(at + 4 * q));
@@ -182,6 +200,7 @@ unsafe fn fold_neon(c: &[f32; 512], fifo: &[f32; 512], head: usize) -> [f32; 64]
     }
     let mut y = [0f32; 64];
     for (v, a) in acc.iter().enumerate() {
+        // SAFETY: `y` is `[f32; 64]`; `4 * v + 4 <= 64` for `v < 16`.
         unsafe { vst1q_f32(y.as_mut_ptr().add(4 * v), *a) };
     }
     y
@@ -194,8 +213,11 @@ unsafe fn fold_neon(c: &[f32; 512], fifo: &[f32; 512], head: usize) -> [f32; 64]
 #[cfg(target_arch = "aarch64")]
 unsafe fn matrix_neon(mt: &[[f32; SUBBANDS]; 64], y: &[f32; 64]) -> [f32; SUBBANDS] {
     use std::arch::aarch64::*;
+    // SAFETY: a register constant -- no memory access; the ISA is this fn's contract. Redundant from Rust 1.86 (safe target-feature calls), required at the crate's MSRV (1.85).
+    #[allow(unused_unsafe)]
     let mut acc = [unsafe { vdupq_n_f32(0.0) }; 8];
     for (i, row) in mt.iter().enumerate() {
+        // SAFETY: `row` is `[f32; 32]`; `4 * v + 4 <= 32` for `v < 8`.
         unsafe {
             let x = vdupq_n_f32(y[i]);
             for (v, a) in acc.iter_mut().enumerate() {
@@ -205,6 +227,7 @@ unsafe fn matrix_neon(mt: &[[f32; SUBBANDS]; 64], y: &[f32; 64]) -> [f32; SUBBAN
     }
     let mut s = [0f32; SUBBANDS];
     for (v, a) in acc.iter().enumerate() {
+        // SAFETY: `s` is `[f32; 32]`; `4 * v + 4 <= 32` for `v < 8`.
         unsafe { vst1q_f32(s.as_mut_ptr().add(4 * v), *a) };
     }
     s
@@ -218,10 +241,12 @@ unsafe fn matrix_neon(mt: &[[f32; SUBBANDS]; 64], y: &[f32; 64]) -> [f32; SUBBAN
 unsafe fn fold_simd(c: &[f32; 512], fifo: &[f32; 512], head: usize) -> [f32; 64] {
     debug_assert_eq!(head % 32, 0);
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
     unsafe {
         fold_avx(c, fifo, head)
     }
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
     unsafe {
         fold_neon(c, fifo, head)
     }
@@ -236,10 +261,12 @@ unsafe fn fold_simd(c: &[f32; 512], fifo: &[f32; 512], head: usize) -> [f32; 64]
 #[inline]
 unsafe fn matrix_simd(mt: &[[f32; SUBBANDS]; 64], y: &[f32; 64]) -> [f32; SUBBANDS] {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
     unsafe {
         matrix_avx(mt, y)
     }
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
     unsafe {
         matrix_neon(mt, y)
     }
@@ -249,6 +276,10 @@ unsafe fn matrix_simd(mt: &[[f32; SUBBANDS]; 64], y: &[f32; 64]) -> [f32; SUBBAN
 
 /// Analyze one granule of mono PCM (`pcm[0..576]`) into subband samples
 /// `[subband][line]`, advancing the channel's filterbank FIFO `X[]`.
+///
+/// # Panics
+/// Never: the one `expect` takes a 32-float run of the 512-float FIFO at a
+/// `head` that is always a multiple of 32, so the run is always 32 long.
 pub fn analyze(pcm: &[f32], fifo: &mut [f32; 512]) -> [[f32; SUBBAND_LINES]; SUBBANDS] {
     let c = window();
     let m = matrix();
@@ -257,7 +288,7 @@ pub fn analyze(pcm: &[f32], fifo: &mut [f32; 512]) -> [[f32; SUBBAND_LINES]; SUB
     // Resolved once per granule (codec-measurement: a dispatch read inside the
     // pass loop is overhead added to take a measurement).
     let simd = crate::decode::isa::use_simd();
-    super::prof::FB_PASSES[simd as usize]
+    super::prof::FB_PASSES[usize::from(simd)]
         .fetch_add(SUBBAND_LINES as u64, std::sync::atomic::Ordering::Relaxed);
     // The granule is exactly `SUBBAND_LINES * 32` samples and callers pass an
     // open-ended slice, so `pcm[v * 32 + t]` could not be proven in range and every
@@ -345,8 +376,8 @@ mod tests {
             let mut sig = 0f64;
             let mut err = 0f64;
             for i in delay..n {
-                let r = input[i - delay] as f64;
-                let o = output[i] as f64;
+                let r = f64::from(input[i - delay]);
+                let o = f64::from(output[i]);
                 sig += r * r;
                 err += (r - o) * (r - o);
             }
@@ -382,7 +413,9 @@ mod tests {
         }
         let mut r = rng(0x2545_F491);
         let mut fifo = [0f32; 512];
-        fifo.iter_mut().for_each(|x| *x = r());
+        for x in &mut fifo {
+            *x = r();
+        }
         let c = window();
         for head in (0..512).step_by(32) {
             let a = fold_scalar(c, &fifo, head);
@@ -402,7 +435,9 @@ mod tests {
         let mut r = rng(0x9E37_79B9);
         for trial in 0..128 {
             let mut y = [0f32; 64];
-            y.iter_mut().for_each(|x| *x = r());
+            for x in &mut y {
+                *x = r();
+            }
             let a = matrix_scalar(matrix(), &y);
             // SAFETY: gated on simd_available().
             let b = unsafe { matrix_simd(matrix_t(), &y) };

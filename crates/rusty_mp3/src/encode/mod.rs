@@ -216,7 +216,7 @@ pub struct Mp3Encode {
 
 impl Default for Mp3Encode {
     fn default() -> Self {
-        Mp3Encode {
+        Self {
             analysis_fifo: [[0.0; 512]; 2],
             mdct_overlap: [[0.0; GRANULE_LINES]; 2],
             reservoir: bitstream::EncReservoir::default(),
@@ -232,6 +232,27 @@ impl Default for Mp3Encode {
 /// B8 back-reference cap (`main_data_begin` is 9 bits): the most a frame can borrow.
 const RESV_MAX_BANK: usize = 511 * 8;
 
+/// `MP3_STEREO` -- the joint-stereo decision override (see `decide_stereo`).
+#[derive(Clone, Copy)]
+enum StereoOverride {
+    Lr,
+    Ms,
+    Pe,
+}
+
+/// Read once, like every other knob. It was read from the environment on every
+/// frame -- an allocation per frame (the lookup's key and value buffers), the
+/// last unexplained one in the encoder's steady state.
+fn stereo_override() -> Option<StereoOverride> {
+    static V: std::sync::OnceLock<Option<StereoOverride>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("MP3_STEREO").as_deref() {
+        Ok("lr") => Some(StereoOverride::Lr),
+        Ok("ms") => Some(StereoOverride::Ms),
+        Ok("pe") => Some(StereoOverride::Pe),
+        _ => None,
+    })
+}
+
 /// **3R1** causal per-frame main-data budget: a frame `pe/pe_avg` above the running
 /// average draws extra bits from the bank (capped by what's physically available),
 /// an easier one banks — sum-preserving around the CBR `base`, so the average bitrate
@@ -240,16 +261,17 @@ fn reservoir_budget(pe: f32, pe_avg: f32, base: usize, bank: usize, gain: f32) -
     if pe_avg <= 0.0 || gain <= 0.0 {
         return base;
     }
-    let demand = (pe / pe_avg - 1.0) as f64; // >0 harder than average
-    let extra = (demand * gain as f64 * base as f64) as i64;
+    let demand = f64::from(pe / pe_avg - 1.0); // >0 harder than average
+    let extra = (demand * f64::from(gain) * base as f64) as i64;
     // draw at most the available bank; give back at most 30% of base (don't starve).
     let extra = extra.clamp(-(base as i64) * 3 / 10, bank.min(RESV_MAX_BANK) as i64);
     ((base as i64) + extra).max(base as i64 / 2) as usize
 }
 
 impl Mp3Encode {
-    pub fn new() -> Mp3Encode {
-        Mp3Encode::default()
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Encode one frame from per-channel PCM (`channels[ch]` holds this frame's
@@ -263,10 +285,14 @@ impl Mp3Encode {
     /// `quality` selects the rate mode: `None` is CBR (the header's bitrate);
     /// `Some(target_nmr)` is **VBR** — each granule quantizes to that quality and
     /// the frame's bitrate is picked to fit the result.
-    pub fn encode_frame(
+    ///
+    /// # Errors
+    /// None today -- the frame always encodes; the `Result` keeps the signature
+    /// stable for callers.
+    pub fn encode_frame<C: AsRef<[f32]>>(
         &mut self,
         header: &FrameHeader,
-        channels: &[Vec<f32>],
+        channels: &[C],
         quality: Option<f32>,
     ) -> Result<Vec<u8>> {
         // B7 (streaming, reservoir-free): the frame's whole region is its own budget.
@@ -284,10 +310,10 @@ impl Mp3Encode {
     /// **3R1** — encode a CBR frame into the reservoir buffer: the causal PE-weighted
     /// budget lets a demanding frame borrow banked bits, an easy one bank them. The raw
     /// frame is stored for B8 assembly at [`finish_reservoir`](Self::finish_reservoir). `gain` is the knob.
-    pub fn encode_frame_reservoir(
+    pub fn encode_frame_reservoir<C: AsRef<[f32]>>(
         &mut self,
         header: &FrameHeader,
-        channels: &[Vec<f32>],
+        channels: &[C],
         gain: f32,
     ) {
         let base = bitstream::region_capacity(header) * 8;
@@ -315,21 +341,31 @@ impl Mp3Encode {
         bitstream::assemble_stream(&frames)
     }
 
+    /// [`finish_reservoir`](Self::finish_reservoir), one packet per frame: the
+    /// stream-level encoder emits frames as packets, and assembling them
+    /// directly saves cutting one contiguous stream back up with a copy apiece.
+    pub(crate) fn finish_reservoir_frames(&mut self) -> Vec<Vec<u8>> {
+        let frames = std::mem::take(&mut self.resv_frames);
+        self.resv_bank = 0;
+        self.resv_pe_avg = 0.0;
+        bitstream::assemble_frames(&frames)
+    }
+
     /// Analyse every granule×channel of a frame (advancing the filterbank/MDCT state)
     /// and its perceptual entropy, then quantise all of them to a frame main-data
     /// budget chosen by `budget_fn(frame_pe)` — the seam that lets B7 pass a flat
     /// per-region budget and 3R1 pass a reservoir-weighted one. Returns the (possibly
     /// M/S) header, side info, raw main data, and the frame's total perceptual entropy.
-    fn encode_frame_raw(
+    fn encode_frame_raw<C: AsRef<[f32]>>(
         &mut self,
         header: &FrameHeader,
-        channels: &[Vec<f32>],
+        channels: &[C],
         quality: Option<f32>,
         budget_fn: impl FnOnce(f32) -> usize,
     ) -> (FrameHeader, SideInfo, Vec<u8>, f32) {
         let fa = self.analyze_frame(header, channels);
         let budget = budget_fn(fa.frame_pe);
-        let (fheader, side, main_data) = self.quantize_frame(&fa, budget, quality);
+        let (fheader, side, main_data) = Self::quantize_frame(&fa, budget, quality);
         (fheader, side, main_data, fa.frame_pe)
     }
 
@@ -349,24 +385,25 @@ impl Mp3Encode {
     /// principle* (force-M/S beat it by up to +0.07 ODG) but oscillates the mode every
     /// frame → triggers the switching bug. OPT-IN until that bug is root-caused; a robust
     /// version needs hysteresis to keep switches blocky. `lr`/`ms` force a fixed mode.
-    fn decide_stereo(&self, channels: &[Vec<f32>], granules: usize, sample_rate: u32) -> bool {
-        match std::env::var("MP3_STEREO").as_deref() {
-            Ok("lr") => return false,
-            Ok("ms") => return true,
-            Ok("pe") => {
-                let ms = stereo::mid_side(&channels[0], &channels[1]);
+    fn decide_stereo<C: AsRef<[f32]>>(channels: &[C], granules: usize, sample_rate: u32) -> bool {
+        let (l, r) = (channels[0].as_ref(), channels[1].as_ref());
+        match stereo_override() {
+            Some(StereoOverride::Lr) => return false,
+            Some(StereoOverride::Ms) => return true,
+            Some(StereoOverride::Pe) => {
+                let ms = stereo::mid_side(l, r);
                 let (mut pe_lr, mut pe_ms) = (0f32, 0f32);
                 let pe = |pcm: &[f32]| psychoacoustic::analyze(pcm, sample_rate).perceptual_entropy;
                 for gr in 0..granules {
                     let s = gr * GRANULE_LINES;
-                    pe_lr += pe(&channels[0][s..]) + pe(&channels[1][s..]);
+                    pe_lr += pe(&l[s..]) + pe(&r[s..]);
                     pe_ms += pe(&ms[0][s..]) + pe(&ms[1][s..]);
                 }
                 return pe_ms < pe_lr;
             }
-            _ => {}
+            None => {}
         }
-        stereo::prefer_mid_side(&channels[0], &channels[1])
+        stereo::prefer_mid_side(l, r)
     }
 
     /// Analyse one frame (M/S decision, block-switch FSM, filterbank → MDCT → psymodel
@@ -374,11 +411,15 @@ impl Mp3Encode {
     /// once. Splitting this from [`quantize_frame`] lets the 3R1 lookahead path analyse
     /// every frame first (to know the global perceptual-entropy distribution) and only
     /// then choose per-frame budgets.
-    fn analyze_frame(&mut self, header: &FrameHeader, channels: &[Vec<f32>]) -> FrameAnalysis {
+    fn analyze_frame<C: AsRef<[f32]>>(
+        &mut self,
+        header: &FrameHeader,
+        channels: &[C],
+    ) -> FrameAnalysis {
         let nch = header.channel_mode.channels();
         let granules = header.version.granules();
 
-        let use_ms = nch == 2 && self.decide_stereo(channels, granules, header.sample_rate);
+        let use_ms = nch == 2 && Self::decide_stereo(channels, granules, header.sample_rate);
         // The psymodel below is the only consumer of the CODED domain. For L/R that
         // IS `channels`, so borrow it; for M/S, fill scratch that persists across
         // frames. Neither branch allocates in steady state — the L/R branch used to
@@ -387,24 +428,22 @@ impl Mp3Encode {
         let mut ms = std::mem::take(&mut self.ms_scratch);
         if use_ms {
             let [m, s] = &mut ms;
-            stereo::mid_side_into(&channels[0], &channels[1], m, s);
+            stereo::mid_side_into(channels[0].as_ref(), channels[1].as_ref(), m, s);
         }
         // Bind the RAW channels into a fixed-size array too, exactly as `coded`
-        // below. `channels` is a `&[Vec<f32>]`, so every `channels[ch]` is a bounds
+        // below. `channels` is a slice, so every `channels[ch]` is a bounds
         // check against a length the compiler cannot know, and the granule slice
         // that follows is a second one -- paid per granule, per channel, in the
         // attack scan and again in the filterbank loop.
         let raw: [&[f32]; 2] = if nch == 2 {
-            [channels[0].as_slice(), channels[1].as_slice()]
+            [channels[0].as_ref(), channels[1].as_ref()]
         } else {
-            [channels[0].as_slice(), channels[0].as_slice()]
+            [channels[0].as_ref(), channels[0].as_ref()]
         };
         let coded: [&[f32]; 2] = if use_ms {
             [ms[0].as_slice(), ms[1].as_slice()]
-        } else if nch == 2 {
-            [channels[0].as_slice(), channels[1].as_slice()]
         } else {
-            [channels[0].as_slice(), channels[0].as_slice()]
+            raw
         };
         let mut fheader = header.clone();
         if use_ms {
@@ -418,16 +457,16 @@ impl Mp3Encode {
         // transforms), NOT on `coded`: if attacks tracked the M/S choice, a per-frame
         // M/S flip would make the block-type window oscillate too, and rapid block-type
         // churn breaks MDCT time-domain aliasing cancellation across frames.
-        let attacks: Vec<bool> = (0..granules)
-            .map(|gr| {
-                (0..nch).any(|ch| {
-                    let g = &raw[ch][gr * GRANULE_LINES..(gr + 1) * GRANULE_LINES];
-                    psychoacoustic::detect_attack(g)
-                })
-            })
-            .collect();
+        // At most two granules a frame: fixed arrays, not two `Vec`s a frame.
+        let mut attacks = [false; 2];
+        for (gr, attack) in attacks.iter_mut().enumerate().take(granules) {
+            *attack = (0..nch).any(|ch| {
+                let g = &raw[ch][gr * GRANULE_LINES..(gr + 1) * GRANULE_LINES];
+                psychoacoustic::detect_attack(g)
+            });
+        }
         let (block_types, new_prev) =
-            shortblock::decide_block_types(self.prev_block_type, &attacks);
+            shortblock::decide_block_types_pair(self.prev_block_type, &attacks[..granules]);
         self.prev_block_type = new_prev;
 
         let n_units = granules * nch;
@@ -448,34 +487,14 @@ impl Mp3Encode {
             // decoder — but, unlike rotating in the PCM domain before the lapped
             // transform, it does NOT corrupt the overlap when the mode switches
             // L/R<->M/S between adjacent frames (which mangled every switch boundary).
-            let mut freqs: Vec<[f32; GRANULE_LINES]> = Vec::with_capacity(nch);
-            for ch in 0..nch {
-                let gpcm = &raw[ch][gr * GRANULE_LINES..];
-                let sub = prof::time(&prof::FILTERBANK, || {
-                    filterbank::analyze(gpcm, &mut self.analysis_fifo[ch])
-                });
-                let freq = prof::time(&prof::MDCT, || {
-                    let mut freq = mdct::forward(&sub, bt, &mut self.mdct_overlap[ch]);
-                    antialias::expand(&block, &mut freq);
-                    freq
-                });
-                freqs.push(freq);
-            }
-            // Spectral M/S: M=(L+R)/√2, S=(L−R)/√2 — the inverse of the decoder's
-            // (M,S)→(L,R) rotation, applied to the full granule spectrum.
-            if use_ms && nch == 2 {
-                let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
-                // Bind the two granules ONCE. Written as `l[0][i]`, each of the
-                // six accesses per line is two indexing operations -- a `Vec` index
-                // and a slice index -- neither of which the compiler can hoist out
-                // of the loop, for 576 lines.
-                let (l, r) = freqs.split_at_mut(1);
-                for (lv, rv) in l[0].iter_mut().zip(r[0].iter_mut()) {
-                    let (a, b) = (*lv, *rv);
-                    *lv = (a + b) * inv_sqrt2;
-                    *rv = (a - b) * inv_sqrt2;
-                }
-            }
+            //
+            // Each channel's spectrum goes STRAIGHT into its `analyzed` slot, and
+            // the M/S rotation happens there. It used to be collected into a
+            // `freqs` Vec first and then copied into `analyzed` -- an allocation
+            // per granule and every spectrum copied twice. The psymodel reads
+            // only the PCM, never the spectrum, so running it first changes
+            // nothing it computes; `frame_pe` still accumulates in channel order.
+            let first = analyzed.len();
             for ch in 0..nch {
                 // Psymodel on the CODED domain (M/S or L/R): stateless and frame-local,
                 // so it follows the mode without the lapped-overlap constraint.
@@ -486,7 +505,29 @@ impl Mp3Encode {
                     psy.thresholds = [f32::MAX; crate::frame::SFB_LONG];
                 }
                 frame_pe += psy.perceptual_entropy;
-                analyzed.push((freqs[ch], psy, bt)); // [f32; N] is Copy
+                let gpcm = &raw[ch][gr * GRANULE_LINES..];
+                let sub = prof::time(&prof::FILTERBANK, || {
+                    filterbank::analyze(gpcm, &mut self.analysis_fifo[ch])
+                });
+                let freq = prof::time(&prof::MDCT, || {
+                    let mut freq = mdct::forward(&sub, bt, &mut self.mdct_overlap[ch]);
+                    antialias::expand(&block, &mut freq);
+                    freq
+                });
+                analyzed.push((freq, psy, bt));
+            }
+            // Spectral M/S: M=(L+R)/√2, S=(L−R)/√2 — the inverse of the decoder's
+            // (M,S)→(L,R) rotation, applied to the full granule spectrum.
+            if use_ms && nch == 2 {
+                let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+                // Bind the two spectra ONCE, so the 576-line loop indexes two
+                // plain arrays rather than re-indexing the `Vec` per access.
+                let (l, r) = analyzed[first..].split_at_mut(1);
+                for (lv, rv) in l[0].0.iter_mut().zip(r[0].0.iter_mut()) {
+                    let (a, b) = (*lv, *rv);
+                    *lv = (a + b) * inv_sqrt2;
+                    *rv = (a - b) * inv_sqrt2;
+                }
             }
         }
         // `coded`'s last use is inside the loop, so the borrow of `ms` has ended
@@ -503,7 +544,6 @@ impl Mp3Encode {
     /// bitstream — the stateless (given the analysis) half of the encode. `quality`
     /// `Some` selects VBR (targets a quality, ignores the budget).
     fn quantize_frame(
-        &self,
         fa: &FrameAnalysis,
         frame_budget: usize,
         quality: Option<f32>,
@@ -555,15 +595,15 @@ impl Mp3Encode {
 
             side.granules[gr][ch] = quant.side.clone();
             let mut sfac = ScaleFactors::default();
-            if bt != BlockType::Short {
-                sfac.long.copy_from_slice(&quant.scalefactors[..22]);
-            } else {
+            if bt == BlockType::Short {
                 // Short layout: scalefactors[3·band + window].
                 for b in 0..12 {
                     for w in 0..3 {
                         sfac.short[w][b] = quant.scalefactors[3 * b + w];
                     }
                 }
+            } else {
+                sfac.long.copy_from_slice(&quant.scalefactors[..22]);
             }
             let part2_3_start = main.bit_len();
             prof::time(&prof::HUFF, || {
@@ -588,7 +628,7 @@ impl Mp3Encode {
             capped.bitrate_kbps = 320;
             let ceiling = bitstream::region_capacity(&capped);
             if main_data.len() > ceiling {
-                let (mut h, s, d) = self.quantize_frame(fa, ceiling * 8, None);
+                let (mut h, s, d) = Self::quantize_frame(fa, ceiling * 8, None);
                 h.bitrate_kbps = bitstream::smallest_bitrate_for(&h, d.len());
                 return (h, s, d);
             }
@@ -624,7 +664,7 @@ impl Mp3Encode {
         for fa in &analyses {
             let base = bitstream::region_capacity(&fa.fheader) * 8;
             let budget = reservoir_budget(fa.frame_pe, pe_mean, base, bank, gain);
-            let (fheader, side, main_data) = self.quantize_frame(fa, budget, None);
+            let (fheader, side, main_data) = Self::quantize_frame(fa, budget, None);
             let used = main_data.len() * 8;
             bank = (bank + base).saturating_sub(used).min(RESV_MAX_BANK);
             out.push((fheader, side, main_data));
@@ -645,6 +685,7 @@ mod profile_tests {
     use super::*;
     use crate::frame::ChannelMode;
     use crate::header::{FrameHeader, MpegVersion};
+    use std::sync::atomic::Ordering::Relaxed;
 
     fn cbr_header() -> FrameHeader {
         FrameHeader {
@@ -664,6 +705,10 @@ mod profile_tests {
     /// AND actually borrow (some frame's `main_data_begin > 0`): with energy varying
     /// frame-to-frame, easy frames bank slack that demanding ones reach back into.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn reservoir_stream_is_frame_aligned_and_borrows() {
         let header = cbr_header();
         let fsize = header.frame_size();
@@ -694,7 +739,7 @@ mod profile_tests {
             assert_eq!(h[0], 0xFF, "frame {f} lost sync (byte 0)");
             assert_eq!(h[1], 0xFB, "frame {f} bad version/layer (byte 1)");
             // main_data_begin = first 9 bits of side info (bytes 4..6, no CRC).
-            let mdb = ((h[4] as u16) << 1) | (h[5] >> 7) as u16;
+            let mdb = (u16::from(h[4]) << 1) | u16::from(h[5] >> 7);
             borrowed |= mdb > 0;
         }
         assert!(
@@ -706,6 +751,10 @@ mod profile_tests {
     /// **3R1 lookahead** — the two-pass path must emit a frame-aligned, sync-valid stream,
     /// AND at gain=0 be byte-identical to the causal path (both flat: budget = base).
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn lookahead_stream_valid_and_flat_matches_causal() {
         let header = cbr_header();
         let fsize = header.frame_size();
@@ -761,7 +810,7 @@ mod profile_tests {
     /// attack detector / short-block shaping, not Floor-1 psymodel tuning.
     /// `cargo test -p rff-codec-mp3 block_mix_real_clip -- --ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "needs MP3_BLOCK_CLIP pointing at a real WAV"]
     fn block_mix_real_clip() {
         let Ok(path) = std::env::var("MP3_BLOCK_CLIP") else {
             eprintln!("set MP3_BLOCK_CLIP=<f32le mono wav> to run");
@@ -793,7 +842,6 @@ mod profile_tests {
                 enc.encode_frame(&header, &[ch.to_vec()], None).unwrap();
             }
         }
-        use std::sync::atomic::Ordering::Relaxed;
         let (nl, ns) = (prof::N_LONG.load(Relaxed), prof::N_SHORT.load(Relaxed));
         let (k0, ot) = (
             prof::OUTER_KEPT0.load(Relaxed),
@@ -807,7 +855,7 @@ mod profile_tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "manual profiling run (prints the encode stage profile)"]
     fn profile_encode_dense() {
         let header = FrameHeader {
             version: MpegVersion::V1,

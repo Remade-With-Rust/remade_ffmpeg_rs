@@ -1,7 +1,7 @@
 [package]
 name = "rff-codec-mp3"
 description = "MP3 (MPEG-1/2 Audio Layer III) codec adapter for remade_ffmpeg_rs, backed by the pure-Rust rusty_mp3 crate"
-version = "0.2.2"
+version = "1.0.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -22,3 +22,11 @@ rusty_mp3.workspace = true
 # `rusty_mp3` now (as do the `mp3lab`/`mp3quality` examples).
 lab = ["rusty_mp3/lab"]
 prometheus-telemetry = ["rusty_mp3/prometheus-telemetry"]
+
+# Lint policy (use-protection-please H-15): the same as rusty_mp3 -- clippy pedantic
+# + nursery, every allow with its reason.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Style-only, nursery: `match`/`if let` reads more plainly than `map_or_else`.
+option_if_let_else = "allow"

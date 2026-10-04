@@ -6,6 +6,14 @@
 //! `scfsi` flags let granule 1 reuse granule 0's scalefactors per band group.
 //! Short blocks store three sets (one per window) and never share.
 
+// Parses untrusted bytes: narrowing casts are lint-enforced here (see the crate
+// lint policy in Cargo.toml) -- every one is masked, typed, or states its bound.
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::bitio::BitReader;
 use crate::frame::{BlockType, GranuleSideInfo, SideInfo};
 use crate::header::{FrameHeader, MpegVersion};
@@ -42,7 +50,7 @@ pub fn decode(
 
     if matches!(header.version, MpegVersion::V1) {
         let (slen1, slen2) = tables::SCALEFAC_COMPRESS_V1[gi.scalefac_compress as usize & 0xF];
-        let (s1, s2) = (slen1 as u32, slen2 as u32);
+        let (s1, s2) = (u32::from(slen1), u32::from(slen2));
 
         if gi.window_switching && gi.block_type == BlockType::Short {
             // Short scalefactors are stored band-major (each band's three windows
@@ -51,7 +59,7 @@ pub fn decode(
             let start = if gi.mixed_block {
                 // Mixed: long bands 0..8 (slen1), then short bands 3..12.
                 for b in 0..8 {
-                    sf.long[b] = r.read(s1) as u8;
+                    sf.long[b] = r.read_u8(s1);
                 }
                 3
             } else {
@@ -60,7 +68,7 @@ pub fn decode(
             for sfb in start..12 {
                 let slen = if sfb < 6 { s1 } else { s2 };
                 for window in 0..3 {
-                    sf.short[window][sfb] = r.read(slen) as u8;
+                    sf.short[window][sfb] = r.read_u8(slen);
                 }
             }
         } else {
@@ -71,7 +79,7 @@ pub fn decode(
                     if gr == 1 && si.scfsi[ch][g] {
                         sf.long[b] = prev.map_or(0, |p| p.long[b]);
                     } else {
-                        sf.long[b] = r.read(slen) as u8;
+                        sf.long[b] = r.read_u8(slen);
                     }
                 }
             }
@@ -117,7 +125,7 @@ pub fn decode(
             let mut idx = 0usize;
             for g in 0..4 {
                 for _ in 0..nr[g] {
-                    let v = r.read(slen[g] as u32) as u8;
+                    let v = r.read_u8(u32::from(slen[g]));
                     if idx < long_vals {
                         sf.long[idx] = v;
                     } else {
@@ -135,7 +143,7 @@ pub fn decode(
             let mut sfb = 0usize;
             for g in 0..4 {
                 for _ in 0..nr[g] {
-                    let v = r.read(slen[g] as u32) as u8;
+                    let v = r.read_u8(u32::from(slen[g]));
                     if sfb < crate::frame::SFB_LONG {
                         sf.long[sfb] = v;
                     }
@@ -150,6 +158,7 @@ pub fn decode(
 }
 
 /// Is this the intensity-coded right channel of an MPEG-2/2.5 joint-stereo pair?
+#[must_use]
 pub fn is_intensity_right(header: &FrameHeader, ch: usize) -> bool {
     ch == 1
         && !matches!(header.version, MpegVersion::V1)
@@ -167,6 +176,7 @@ pub fn is_intensity_right(header: &FrameHeader, ch: usize) -> bool {
 /// 2.4.3.2; minimp3 marks exactly this). A band read with `slen == 0` has no
 /// illegal value and reads 0xFF here. Laid out like [`ScaleFactors`], so the
 /// stereo stage can index it the same way it indexes the positions.
+#[must_use]
 pub fn lsf_intensity_illegal(gi: &GranuleSideInfo) -> ScaleFactors {
     let is_short = gi.window_switching && gi.block_type == BlockType::Short;
     let blocktype = match (is_short, gi.mixed_block) {
@@ -189,7 +199,7 @@ pub fn lsf_intensity_illegal(gi: &GranuleSideInfo) -> ScaleFactors {
         let max = if slen[g] == 0 {
             0xFF
         } else {
-            ((1u32 << slen[g]) - 1) as u8
+            (((1u32 << slen[g]) - 1) & 0xFF) as u8
         };
         for _ in 0..nr[g] {
             if idx < long_vals {
@@ -210,6 +220,7 @@ pub fn lsf_intensity_illegal(gi: &GranuleSideInfo) -> ScaleFactors {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)] // test fixtures: small known values
 mod tests {
     use super::*;
     use crate::bitio::BitWriter;

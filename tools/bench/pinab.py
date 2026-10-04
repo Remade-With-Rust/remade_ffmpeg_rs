@@ -20,6 +20,12 @@ What it enforces:
 
 An arm is an executable path, or `KEY=VAL[,KEY=VAL]:path` to run the same
 binary with an env knob set -- e.g. `MP3_SHORT_SHAPE=0:target/.../encprof.exe`.
+
+Any other command line (the rff CLI, say) goes after `--`, verbatim, with the
+round count from `ROUNDS` (default 12). The arm still has to print
+`total <ms> ms`; `RFF_PHASES=1` makes the CLI do that:
+
+    ROUNDS=16 python tools/bench/pinab.py RFF_PHASES=1:base/rff.exe         RFF_PHASES=1:target/release/rff.exe -- -y -i long.wav -c:a mp3 out.mp3
 """
 import os
 import re
@@ -31,7 +37,11 @@ import psutil
 
 # Avoid CPU 0: it takes the interrupt load.
 PIN_CPU = int(os.environ.get("PIN_CPU", "4"))
-DUR = re.compile(r"total ([\d.]+) ms")
+# The arm's duration. `PINAB_DUR` overrides the pattern to A/B ONE phase of a
+# multi-phase report -- e.g. `PINAB_DUR='conform +([\d.]+) ms'` against the
+# rff CLI's RFF_PHASES table -- when a change touches only that phase and the
+# others would just add their noise to the total.
+DUR = re.compile(os.environ.get("PINAB_DUR", r"total ([\d.]+) ms"))
 
 
 def split_arm(arm):
@@ -89,10 +99,15 @@ def report(name_a, name_b, res, label):
 
 
 def main():
-    arm_a, arm_b, inp = sys.argv[1], sys.argv[2], sys.argv[3]
-    kbps = sys.argv[4] if len(sys.argv) > 4 else "192"
-    rounds = int(sys.argv[5]) if len(sys.argv) > 5 else 12
-    args = [os.path.abspath(inp), kbps]
+    arm_a, arm_b = sys.argv[1], sys.argv[2]
+    if len(sys.argv) > 3 and sys.argv[3] == "--":
+        args = sys.argv[4:]
+        rounds = int(os.environ.get("ROUNDS", "12"))
+    else:
+        inp = sys.argv[3]
+        kbps = sys.argv[4] if len(sys.argv) > 4 else "192"
+        rounds = int(sys.argv[5]) if len(sys.argv) > 5 else 12
+        args = [os.path.abspath(inp), kbps]
 
     print(f"method: pinned to CPU {PIN_CPU}, High priority, arms ABBA with the "
           f"leading arm alternated, {rounds} pairs, each arm's own internal "

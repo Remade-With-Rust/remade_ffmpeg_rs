@@ -34,6 +34,69 @@ use rff_resample::Resampler;
 
 use crate::Engine;
 
+/// `RFF_PHASES=1`: wall time per phase of the transcode loop, on stderr at the
+/// end of [`run`] -- the outside-the-codec view (demux, decode, the conform
+/// chain, encode, mux) that a codec's own stage profiler cannot see. A gap
+/// between a codec's core throughput and the CLI's is plumbing, and this is
+/// what locates it (codec-memory-copies step 0). Off by default: one cached
+/// flag test per call, and `Instant` is never touched unless it is set.
+mod phases {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+
+    pub static OPEN: AtomicU64 = AtomicU64::new(0);
+    pub static DEMUX: AtomicU64 = AtomicU64::new(0);
+    pub static DECODE: AtomicU64 = AtomicU64::new(0);
+    pub static CONFORM: AtomicU64 = AtomicU64::new(0);
+    pub static ENCODE: AtomicU64 = AtomicU64::new(0);
+    pub static MUX: AtomicU64 = AtomicU64::new(0);
+
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("RFF_PHASES").is_some())
+    }
+
+    /// Run `f`, charging its wall time to `acc` when phases are on.
+    pub fn time<T>(acc: &AtomicU64, f: impl FnOnce() -> T) -> T {
+        if !on() {
+            return f();
+        }
+        let t = std::time::Instant::now();
+        let r = f();
+        acc.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        r
+    }
+
+    pub fn report(total: std::time::Duration) {
+        let total_ns = total.as_nanos().max(1) as f64;
+        eprintln!("--- rff phases (total {:.1} ms) ---", total_ns / 1e6);
+        let mut sum = 0u64;
+        for (name, acc) in [
+            ("open", &OPEN),
+            ("demux", &DEMUX),
+            ("decode", &DECODE),
+            ("conform", &CONFORM),
+            ("encode", &ENCODE),
+            ("mux", &MUX),
+        ] {
+            let ns = acc.swap(0, Relaxed);
+            sum += ns;
+            eprintln!(
+                "  {name:<8} {:>9.1} ms  {:>5.1}%",
+                ns as f64 / 1e6,
+                100.0 * ns as f64 / total_ns
+            );
+        }
+        let rest = total_ns - sum as f64;
+        eprintln!(
+            "  {:<8} {:>9.1} ms  {:>5.1}%",
+            "other",
+            rest / 1e6,
+            100.0 * rest / total_ns
+        );
+    }
+}
+
 /// Codecs whose decoded output is inherently full-range (they decode to RGB, or
 /// are defined on 0-255 samples). JPEG is the canonical case: the standard has
 /// no limited-range mode, which is why FFmpeg calls its pixel formats `yuvj*`.
@@ -388,9 +451,26 @@ fn audio_to_f32(af: &AudioFrame) -> Result<Vec<f32>> {
     }
 }
 
+/// `f32` samples as little-endian bytes, in one sized pass. The
+/// `iter().flat_map(to_le_bytes).collect()` this replaces is the pattern LLVM
+/// handles worst -- an iterator of tiny arrays flattened into a growing `Vec`.
+fn f32_le_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = vec![0u8; samples.len() * 4];
+    for (d, s) in bytes.chunks_exact_mut(4).zip(samples) {
+        d.copy_from_slice(&s.to_le_bytes());
+    }
+    bytes
+}
+
+/// The usual f32 -> s16 rule: round to nearest, then clamp. Truncation would
+/// bias every sample toward zero.
+fn f32_to_s16(s: f32) -> i16 {
+    (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16
+}
+
 /// Wrap interleaved `f32` samples as an `f32` [`AudioFrame`].
 fn f32_frame(samples: Vec<f32>, rate: u32, channels: u16, pts: Option<i64>) -> Frame {
-    let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let bytes = f32_le_bytes(&samples);
     Frame::Audio(AudioFrame {
         sample_rate: rate,
         channels,
@@ -415,25 +495,39 @@ fn conform_sample_format(target: Option<SampleFormat>, frame: Frame) -> Result<F
     if af.format == target {
         return Ok(Frame::Audio(af));
     }
-    let samples = audio_to_f32(&af)?;
-    let planes = match target {
-        SampleFormat::F32 => vec![samples.iter().flat_map(|s| s.to_le_bytes()).collect()],
-        SampleFormat::S16 => vec![samples
-            .iter()
-            .flat_map(|s| {
-                // Round-to-nearest and clamp, matching the usual f32->s16 rule:
-                // truncation would bias every sample toward zero.
-                let v = (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
-                v.to_le_bytes()
-            })
-            .collect()],
-        other => {
+    // Bytes to bytes in ONE pass. This used to decode the whole plane into a
+    // `Vec<f32>` and then re-encode it through `flat_map(..).collect()` -- an
+    // extra full-frame copy (a WAV's worth, when the frame is a whole file) and
+    // the iterator shape LLVM vectorises worst. The arithmetic per sample is
+    // the same expression, so the output is byte-identical.
+    let src = &af.planes[0];
+    let plane = match (af.format, target) {
+        (SampleFormat::F32, SampleFormat::S16) => {
+            let mut out = vec![0u8; src.len() / 4 * 2];
+            for (d, b) in out.chunks_exact_mut(2).zip(src.chunks_exact(4)) {
+                let s = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                d.copy_from_slice(&f32_to_s16(s).to_le_bytes());
+            }
+            out
+        }
+        (SampleFormat::S16, SampleFormat::F32) => {
+            let mut out = vec![0u8; src.len() / 2 * 4];
+            for (d, b) in out.chunks_exact_mut(4).zip(src.chunks_exact(2)) {
+                let s = i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0;
+                d.copy_from_slice(&s.to_le_bytes());
+            }
+            out
+        }
+        _ => {
+            // Not a supported pair: report the source format first, as before.
+            audio_to_f32(&af)?;
             return Err(Error::unsupported(format!(
                 "sample format conversion to `{}` (only interleaved s16/f32)",
-                other.name()
-            )))
+                target.name()
+            )));
         }
     };
+    let planes = vec![plane];
     Ok(Frame::Audio(AudioFrame {
         sample_rate: af.sample_rate,
         channels: af.channels,
@@ -532,7 +626,10 @@ fn conform_channels(target: u16, frame: Frame) -> Result<Frame> {
     }
     let samples = audio_to_f32(&af)?;
     let mixed: Vec<f32> = match (af.channels, target) {
-        (2, 1) => samples.chunks_exact(2).map(|p| 0.5 * (p[0] + p[1])).collect(),
+        (2, 1) => samples
+            .chunks_exact(2)
+            .map(|p| 0.5 * (p[0] + p[1]))
+            .collect(),
         (1, 2) => samples.iter().flat_map(|s| [*s, *s]).collect(),
         (from, to) => {
             return Err(Error::unsupported(format!(
@@ -642,6 +739,19 @@ impl TranscodeOp {
                 self.video_frames_sent += 1;
             }
         }
+        let Some(frame) = phases::time(&phases::CONFORM, || self.conform(frame))? else {
+            return Ok(()); // atrim consumed the whole frame
+        };
+        if self.is_video {
+            self.pending_pts.push_back(frame.pts());
+        }
+        phases::time(&phases::ENCODE, || self.encoder.send_frame(&frame))?;
+        self.drain(muxer, report)
+    }
+
+    /// The per-frame conform chain between decode and encode: filters, overlay,
+    /// channel/rate/sample-format/pixel conforms. `None` = atrim dropped it.
+    fn conform(&mut self, frame: Frame) -> Result<Option<Frame>> {
         let frame = apply_filters(&mut self.filters, frame)?;
         let frame = apply_overlay(&self.overlay, frame)?;
         let frame = conform_channels(self.target_channels, frame)?;
@@ -653,7 +763,7 @@ impl TranscodeOp {
                     .map(|p| p as f64 * tb.num as f64 / tb.den.max(1) as f64);
                 match self.audio_chain.apply(af, t)? {
                     Some(af) => Frame::Audio(af),
-                    None => return Ok(()), // atrim consumed the whole frame
+                    None => return Ok(None),
                 }
             }
             other => other,
@@ -666,11 +776,7 @@ impl TranscodeOp {
             self.source_range,
             frame,
         )?;
-        if self.is_video {
-            self.pending_pts.push_back(frame.pts());
-        }
-        self.encoder.send_frame(&frame)?;
-        self.drain(muxer, report)
+        Ok(Some(frame))
     }
 
     /// Pull every ready packet out of the encoder and mux it. Video encoders
@@ -679,7 +785,7 @@ impl TranscodeOp {
     /// Matroska block would land at t=0.
     fn drain(&mut self, muxer: &mut dyn Muxer, report: &mut TranscodeReport) -> Result<()> {
         loop {
-            match self.encoder.receive_packet() {
+            match phases::time(&phases::ENCODE, || self.encoder.receive_packet()) {
                 Ok(mut packet) => {
                     if self.is_video {
                         let queued = self.pending_pts.pop_front().flatten();
@@ -688,7 +794,7 @@ impl TranscodeOp {
                         }
                     }
                     packet.stream_index = self.out_index;
-                    muxer.write_packet(&packet)?;
+                    phases::time(&phases::MUX, || muxer.write_packet(&packet))?;
                     report.packets_written += 1;
                 }
                 Err(Error::Again) | Err(Error::Eof) => break,
@@ -703,7 +809,7 @@ impl TranscodeOp {
     fn finish(&mut self, muxer: &mut dyn Muxer, report: &mut TranscodeReport) -> Result<()> {
         self.decoder.flush();
         loop {
-            match self.decoder.receive_frame() {
+            match phases::time(&phases::DECODE, || self.decoder.receive_frame()) {
                 Ok(frame) => self.handle_frame(frame, muxer, report)?,
                 Err(Error::Again) | Err(Error::Eof) => break,
                 Err(e) => return Err(e),
@@ -725,7 +831,7 @@ impl TranscodeOp {
                 self.drain(muxer, report)?;
             }
         }
-        self.encoder.flush();
+        phases::time(&phases::ENCODE, || self.encoder.flush());
         self.drain(muxer, report)
     }
 }
@@ -766,12 +872,19 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     };
 
     // --- open every input demuxer and read its streams ---
+    // (`open` is a phase of its own: a container read whole at open -- WAV, the
+    // MP3 demuxer -- does all of its I/O here, before the first packet.)
+    let t_start = phases::on().then(std::time::Instant::now);
     let mut demuxers: Vec<Box<dyn rff_format::Demuxer>> = Vec::new();
     let mut input_streams: Vec<Vec<Stream>> = Vec::new();
     for input in &spec.inputs {
-        let (in_format, reader) = open_input(engine, input)?;
-        let mut demuxer = engine.formats.open_demuxer(&in_format, reader)?;
-        input_streams.push(demuxer.read_header()?);
+        let (demuxer, streams) = phases::time(&phases::OPEN, || -> Result<_> {
+            let (in_format, reader) = open_input(engine, input)?;
+            let mut demuxer = engine.formats.open_demuxer(&in_format, reader)?;
+            let streams = demuxer.read_header()?;
+            Ok((demuxer, streams))
+        })?;
+        input_streams.push(streams);
         demuxers.push(demuxer);
     }
 
@@ -899,7 +1012,7 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     // --- drive each input through its plan into the shared muxer ---
     for (demuxer, ops) in demuxers.iter_mut().zip(per_input_ops.iter_mut()) {
         loop {
-            match demuxer.read_packet() {
+            match phases::time(&phases::DEMUX, || demuxer.read_packet()) {
                 Ok(packet) => process_packet(packet, ops, &mut *muxer, &mut report)?,
                 Err(Error::Eof) => break,
                 Err(e) => return Err(e),
@@ -907,7 +1020,10 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
         }
         flush_streams(ops, &mut *muxer, &mut report)?;
     }
-    muxer.write_trailer()?;
+    phases::time(&phases::MUX, || muxer.write_trailer())?;
+    if let Some(t) = t_start {
+        phases::report(t.elapsed());
+    }
 
     Ok(report)
 }
@@ -1248,9 +1364,9 @@ fn process_packet(
             Ok(())
         }
         StreamOp::Transcode(op) => {
-            op.decoder.send_packet(&packet)?;
+            phases::time(&phases::DECODE, || op.decoder.send_packet(&packet))?;
             loop {
-                match op.decoder.receive_frame() {
+                match phases::time(&phases::DECODE, || op.decoder.receive_frame()) {
                     Ok(frame) => op.handle_frame(frame, muxer, report)?,
                     Err(Error::Again) | Err(Error::Eof) => break,
                     Err(e) => return Err(e),
@@ -1294,11 +1410,7 @@ fn resolve_output_format(engine: &Engine, output: &OutputSpec) -> Result<String>
     if let Some(forced) = &output.format {
         return Ok(forced.clone());
     }
-    if output
-        .path
-        .to_str()
-        .is_some_and(rff_io::is_rtmp)
-    {
+    if output.path.to_str().is_some_and(rff_io::is_rtmp) {
         return Ok("flv".to_string());
     }
     let ext = output
@@ -1333,7 +1445,9 @@ mod sample_format_tests {
     fn pinned_format_converts_f32_to_s16() {
         let src = [0.0f32, 0.5, -0.5, 1.0, -1.0];
         let out = conform_sample_format(Some(SampleFormat::S16), f32_af(&src)).unwrap();
-        let Frame::Audio(af) = out else { unreachable!() };
+        let Frame::Audio(af) = out else {
+            unreachable!()
+        };
         assert_eq!(af.format, SampleFormat::S16);
         assert_eq!(af.planes[0].len(), src.len() * 2, "s16 is 2 bytes/sample");
         let got: Vec<i16> = af.planes[0]
@@ -1354,8 +1468,7 @@ mod sample_format_tests {
             unreachable!()
         };
         assert_eq!(a.format, SampleFormat::F32);
-        let Frame::Audio(b) =
-            conform_sample_format(Some(SampleFormat::F32), f32_af(&src)).unwrap()
+        let Frame::Audio(b) = conform_sample_format(Some(SampleFormat::F32), f32_af(&src)).unwrap()
         else {
             unreachable!()
         };

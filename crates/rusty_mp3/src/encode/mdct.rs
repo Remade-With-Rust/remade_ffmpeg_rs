@@ -116,10 +116,8 @@ pub fn forward(
 
         // The 36-sample lapped frame: previous granule (older) then current.
         let mut u = [0f32; 36];
-        for n in 0..18 {
-            u[n] = overlap[base + n];
-            u[18 + n] = cur[n];
-        }
+        u[..18].copy_from_slice(&overlap[base..base + 18]);
+        u[18..].copy_from_slice(&cur[..18]);
 
         if is_short {
             // Three 12-point MDCTs at offsets 6, 12, 18 within the frame; line k of
@@ -173,7 +171,7 @@ mod tests {
     fn subbands(g: usize) -> [[f32; SUBBAND_LINES]; SUBBANDS] {
         let mut s = (g as u32).wrapping_mul(2_654_435_761).wrapping_add(1);
         let mut out = [[0f32; SUBBAND_LINES]; SUBBANDS];
-        for row in out.iter_mut() {
+        for row in &mut out {
             for v in row.iter_mut() {
                 s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 *v = ((s >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0;
@@ -221,14 +219,14 @@ mod tests {
     fn long_blocks_reconstruct_exactly() {
         // Steady-state long blocks: out[g] == subbands[g-1] (one-granule lap delay).
         let errs = reconstruct(&[BlockType::Long; 6]);
-        let worst = errs.iter().skip(1).cloned().fold(0.0, f32::max);
+        let worst = errs.iter().skip(1).copied().fold(0.0, f32::max);
         assert!(worst < 1e-5, "long-block TDAC error {worst}");
     }
 
     #[test]
     fn short_blocks_reconstruct_exactly() {
         let errs = reconstruct(&[BlockType::Short; 6]);
-        let worst = errs.iter().skip(1).cloned().fold(0.0, f32::max);
+        let worst = errs.iter().skip(1).copied().fold(0.0, f32::max);
         assert!(worst < 1e-5, "short-block TDAC error {worst}");
     }
 
@@ -242,13 +240,17 @@ mod tests {
         let errs = reconstruct(&seq);
         // errs[i] is the reconstruction of granule i (out[i+1] vs subbands[i]).
         // Every interior granule (1..=6) is bracketed by settled neighbours.
-        let worst = errs.iter().skip(1).cloned().fold(0.0, f32::max);
+        let worst = errs.iter().skip(1).copied().fold(0.0, f32::max);
         assert!(worst < 1e-5, "transition TDAC error {worst}");
     }
 
     /// The whole analysis front-end (L1 ∘ L2) composed with the decoder back-end:
     /// PCM → analyze → forward MDCT → IMDCT → synthesis → PCM must reconstruct.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "end-to-end / exhaustive: too slow to interpret under Miri (> 5 min)"
+    )]
     fn full_analysis_chain_reconstructs_pcm() {
         use crate::decode::synthesis;
         use crate::encode::filterbank;
@@ -279,8 +281,8 @@ mod tests {
             let mut sig = 0f64;
             let mut err = 0f64;
             for i in delay..n {
-                let r = input[i - delay] as f64;
-                let o = output[i] as f64;
+                let r = f64::from(input[i - delay]);
+                let o = f64::from(output[i]);
                 sig += r * r;
                 err += (r - o) * (r - o);
             }

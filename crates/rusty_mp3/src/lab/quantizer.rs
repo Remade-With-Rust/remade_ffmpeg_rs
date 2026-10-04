@@ -66,6 +66,7 @@ pub static VARIANTS: &[Preset<QuantCfg>] = &[
 ];
 
 /// Forward quantize one frequency line to an integer level.
+#[must_use]
 pub fn quantize(cfg: QuantCfg, xr: f32) -> i32 {
     let m = (xr.abs() / cfg.step).powf(0.75) - cfg.bias;
     if m <= 0.0 {
@@ -77,11 +78,13 @@ pub fn quantize(cfg: QuantCfg, xr: f32) -> i32 {
 
 /// Inverse: reconstruct the line from its level (sign carried separately, as in
 /// the real bitstream).
+#[must_use]
 pub fn requantize(cfg: QuantCfg, level: i32, sign: f32) -> f32 {
     sign * (level as f32).powf(4.0 / 3.0) * cfg.step
 }
 
 /// Round-trip a whole signal through the quantizer and score it.
+#[must_use]
 pub fn eval(cfg: QuantCfg, sig: &Signal) -> Metrics {
     let out: Vec<f32> = sig
         .pcm

@@ -45,7 +45,7 @@ fn read_wav(path: &str) -> (Vec<f32>, u32) {
         }
         (1, 16) => {
             for fr in data.chunks_exact(2 * c) {
-                out.push(i16::from_le_bytes([fr[0], fr[1]]) as f32 / 32768.0);
+                out.push(f32::from(i16::from_le_bytes([fr[0], fr[1]])) / 32768.0);
             }
         }
         _ => panic!("{path}: unsupported WAV (tag {tag}, {bits}-bit)"),

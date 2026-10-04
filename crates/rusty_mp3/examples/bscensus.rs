@@ -81,8 +81,8 @@ struct Census {
 }
 
 impl Census {
-    fn new() -> Census {
-        Census {
+    fn new() -> Self {
+        Self {
             gain_min: u8::MAX,
             ..Default::default()
         }
@@ -135,11 +135,10 @@ impl Census {
             self.sbg_nonzero += 1;
         }
 
-        if self.nominal > 0 {
-            // Bucket 8 is "at or ABOVE the nominal share" -- a granule can only
-            // land there by borrowing banked bits through the reservoir, so its
-            // share is the direct measure of whether donation is happening.
-            let eighths = gi.part2_3_length as usize * 8 / self.nominal;
+        // Bucket 8 is "at or ABOVE the nominal share" -- a granule can only land
+        // there by borrowing banked bits through the reservoir, so its share is
+        // the direct measure of whether donation is happening.
+        if let Some(eighths) = (gi.part2_3_length as usize * 8).checked_div(self.nominal) {
             self.part23_hist[eighths.min(8)] += 1;
             if gi.part2_3_length as usize > self.nominal {
                 self.over_nominal += 1;
@@ -271,11 +270,11 @@ fn census(bytes: &[u8]) -> Census {
 
         c.frames += 1;
         c.bytes += frame_size;
-        c.secs += header.version.samples_per_frame() as f64 / header.sample_rate as f64;
+        c.secs += header.version.samples_per_frame() as f64 / f64::from(header.sample_rate);
         let avail = (frame_size - 4 - crc - header.side_info_len()) * 8;
         c.avail_sum += avail;
         c.nominal = avail / (header.version.granules() * header.channel_mode.channels()).max(1);
-        fold_frame(&mut c, &header, &si, &main);
+        fold_frame(&mut c, &header, &si, main);
 
         pos += frame_size;
     }
@@ -314,8 +313,10 @@ fn fold_frame(c: &mut Census, header: &FrameHeader, si: &SideInfo, main: &[u8]) 
             // granule 0's and not all zero (all-zero costs nothing either way).
             if gr == 1 && header.version == rusty_mp3::header::MpegVersion::V1 {
                 let g0 = &si.granules[0][ch];
-                let both_long = !(gi.window_switching && gi.block_type == BlockType::Short)
-                    && !(g0.window_switching && g0.block_type == BlockType::Short);
+                let short = |g: &rusty_mp3::frame::GranuleSideInfo| {
+                    g.window_switching && g.block_type == BlockType::Short
+                };
+                let both_long = !short(gi) && !short(g0);
                 if both_long {
                     let (s1, s2) =
                         rusty_mp3::tables::SCALEFAC_COMPRESS_V1[gi.scalefac_compress as usize & 15];

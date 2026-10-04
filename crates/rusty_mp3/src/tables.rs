@@ -123,6 +123,7 @@ pub const SFB_OFFSET_SHORT_V25_8000: [u16; 14] =
     [0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166, 192];
 
 /// Long-block scalefactor-band offsets for a sample rate (MPEG-1 + MPEG-2 LSF).
+#[must_use]
 pub fn sfb_long_offsets(sample_rate: u32) -> &'static [u16; 23] {
     match sample_rate {
         48000 => &SFB_OFFSET_LONG_V1[1],
@@ -139,6 +140,7 @@ pub fn sfb_long_offsets(sample_rate: u32) -> &'static [u16; 23] {
 }
 
 /// Short-block scalefactor-band offsets for a sample rate (MPEG-1 + MPEG-2 LSF).
+#[must_use]
 pub fn sfb_short_offsets(sample_rate: u32) -> &'static [u16; 14] {
     match sample_rate {
         48000 => &SFB_OFFSET_SHORT_V1[1],
@@ -158,35 +160,6 @@ pub fn sfb_short_offsets(sample_rate: u32) -> &'static [u16; 14] {
 pub const PRETAB: [u8; 22] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 3, 2, 0,
 ];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sfb_offsets_monotonic_and_complete() {
-        for row in &SFB_OFFSET_LONG_V1 {
-            assert_eq!(row[0], 0);
-            assert_eq!(
-                *row.last().unwrap(),
-                576,
-                "long bands must cover all 576 lines"
-            );
-            assert!(
-                row.windows(2).all(|w| w[0] < w[1]),
-                "long sfb strictly increasing"
-            );
-        }
-        for row in &SFB_OFFSET_SHORT_V1 {
-            assert_eq!(row[0], 0);
-            assert_eq!(*row.last().unwrap(), 192, "short window spans 576/3 lines");
-            assert!(
-                row.windows(2).all(|w| w[0] < w[1]),
-                "short sfb strictly increasing"
-            );
-        }
-    }
-}
 
 // ---- requantization (to port) ------------------------------------------------
 
@@ -221,10 +194,11 @@ pub const NR_OF_SFB_BLOCK: [[[u8; 4]; 3]; 6] = [
 
 /// LSF scalefactor bit-lengths `slen[4]` and per-group band counts `nr[4]`, derived
 /// from `scalefac_compress` and the block type. Non-intensity (left channel / no
-/// intensity stereo — the right channel of an i_stereo pair uses a different table,
+/// intensity stereo — the right channel of an `i_stereo` pair uses a different table,
 /// not emitted by this encoder yet). `blocktype`: 0=long, 1=short, 2=mixed.
+#[must_use]
 pub fn lsf_scale_params(scalefac_compress: u16, blocktype: usize) -> ([u8; 4], [u8; 4]) {
-    let sfc = scalefac_compress as u32;
+    let sfc = u32::from(scalefac_compress);
     let (slen, blocknumber) = if sfc < 400 {
         (
             [(sfc >> 4) / 5, (sfc >> 4) % 5, (sfc % 16) >> 2, sfc % 4],
@@ -248,8 +222,9 @@ pub fn lsf_scale_params(scalefac_compress: u16, blocktype: usize) -> ([u8; 4], [
 /// channel (ISO 13818-3 2.4.3.2): `int_scalefac_compress = scalefac_compress >> 1`
 /// picks blocknumber 3..5; the low bit is `intensity_scale`, used by the panning,
 /// not here. `blocktype`: 0=long, 1=short, 2=mixed.
+#[must_use]
 pub fn lsf_scale_params_intensity(scalefac_compress: u16, blocktype: usize) -> ([u8; 4], [u8; 4]) {
-    let isc = (scalefac_compress >> 1) as u32;
+    let isc = u32::from(scalefac_compress >> 1);
     let (slen, blocknumber) = if isc < 180 {
         ([isc / 36, (isc % 36) / 6, (isc % 36) % 6, 0], 3)
     } else if isc < 244 {
@@ -263,6 +238,35 @@ pub fn lsf_scale_params_intensity(scalefac_compress: u16, blocktype: usize) -> (
         [slen[0] as u8, slen[1] as u8, slen[2] as u8, slen[3] as u8],
         NR_OF_SFB_BLOCK[blocknumber][blocktype],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sfb_offsets_monotonic_and_complete() {
+        for row in &SFB_OFFSET_LONG_V1 {
+            assert_eq!(row[0], 0);
+            assert_eq!(
+                *row.last().unwrap(),
+                576,
+                "long bands must cover all 576 lines"
+            );
+            assert!(
+                row.windows(2).all(|w| w[0] < w[1]),
+                "long sfb strictly increasing"
+            );
+        }
+        for row in &SFB_OFFSET_SHORT_V1 {
+            assert_eq!(row[0], 0);
+            assert_eq!(*row.last().unwrap(), 192, "short window spans 576/3 lines");
+            assert!(
+                row.windows(2).all(|w| w[0] < w[1]),
+                "short sfb strictly increasing"
+            );
+        }
+    }
 }
 
 // ---- synthesis filterbank (to port) ------------------------------------------

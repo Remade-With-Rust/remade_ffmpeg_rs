@@ -8,7 +8,9 @@
 //! traits by delegating to [`rusty_mp3::Mp3Decoder`]/[`rusty_mp3::Mp3Encoder`],
 //! and everything ffmpeg-CLI-shaped stays here: `Dictionary` option parsing
 //! (`-b:a`, `-q:a`), `AudioFrame` ↔ PCM conversion honoring `af.format`, and
-//! rusty_mp3 → rff error mapping.
+//! `rusty_mp3` → rff error mapping.
+
+#![forbid(unsafe_code)]
 
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
 use rff_core::{
@@ -73,9 +75,13 @@ impl Decoder for Mp3Decoder {
     fn receive_frame(&mut self) -> Result<Frame> {
         let audio = self.inner.next_frame().map_err(map_err)?;
         let channels = audio.channels.max(1);
-        let mut bytes = Vec::with_capacity(audio.samples.len() * 4);
-        for s in &audio.samples {
-            bytes.extend_from_slice(&s.to_le_bytes());
+        // One sized pass into an exact-length plane. The per-sample
+        // `extend_from_slice` this replaces re-checked capacity on every
+        // sample, which kept the loop scalar; with the length fixed up front it
+        // is a plain lane-wise copy (on little-endian, byte-for-byte a memcpy).
+        let mut bytes = vec![0u8; audio.samples.len() * 4];
+        for (d, s) in bytes.chunks_exact_mut(4).zip(&audio.samples) {
+            d.copy_from_slice(&s.to_le_bytes());
         }
         Ok(Frame::Audio(AudioFrame {
             sample_rate: audio.sample_rate,
@@ -93,6 +99,12 @@ impl Decoder for Mp3Decoder {
 }
 
 /// Parse an FFmpeg-style bitrate string ("128k", "192000") into kbps.
+///
+/// The option string is user input. Rust's float-to-int `as` SATURATES (NaN and
+/// negatives give 0, huge values `u32::MAX`), so no string can produce undefined
+/// behaviour, and 0 means "default" downstream; the encoder snaps every other
+/// value to the nearest legal bitrate.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn parse_bitrate(s: &str) -> Option<u32> {
     let s = s.trim();
     if let Some(n) = s.strip_suffix(['k', 'K']) {
@@ -127,6 +139,7 @@ impl Mp3Encoder {
                 vbr_quality: self.quality,
             }));
         }
+        // Cannot fail: the branch above assigned `Some` when it was `None`.
         self.inner.as_mut().unwrap()
     }
 }
@@ -152,60 +165,47 @@ impl Encoder for Mp3Encoder {
             return Ok(());
         };
         let in_ch = af.channels.max(1);
-        let data = &af.planes[0];
         // The PCM/WAV demuxer path delivers S16 (not F32), so we MUST honor
         // `af.format` here — reading s16 bytes with an f32 stride yields
         // denormal garbage (a silent encode). The unit tests only ever fed F32,
         // which is why this once slipped; `s16_input_encodes_to_audible_output`
         // below guards it.
-        match af.format {
-            SampleFormat::F32 => {
-                let mut pcm = Vec::with_capacity(af.samples * in_ch as usize);
-                for s in 0..af.samples {
-                    for c in 0..in_ch as usize {
-                        let off = (s * in_ch as usize + c) * 4;
-                        pcm.push(if off + 4 <= data.len() {
-                            f32::from_le_bytes([
-                                data[off],
-                                data[off + 1],
-                                data[off + 2],
-                                data[off + 3],
-                            ])
-                        } else {
-                            0.0
-                        });
-                    }
-                }
-                let sr = af.sample_rate;
-                self.inner()
-                    .push_pcm_f32(&pcm, in_ch, sr)
-                    .map_err(map_err)?;
-            }
-            SampleFormat::S16 => {
-                let mut pcm = Vec::with_capacity(af.samples * in_ch as usize);
-                for s in 0..af.samples {
-                    for c in 0..in_ch as usize {
-                        let off = (s * in_ch as usize + c) * 2;
-                        pcm.push(if off + 2 <= data.len() {
-                            i16::from_le_bytes([data[off], data[off + 1]])
-                        } else {
-                            0
-                        });
-                    }
-                }
-                let sr = af.sample_rate;
-                self.inner()
-                    .push_pcm_s16(&pcm, in_ch, sr)
-                    .map_err(map_err)?;
-            }
+        let bps = match af.format {
+            SampleFormat::F32 => 4,
+            SampleFormat::S16 => 2,
             other => {
                 return Err(Error::unsupported(format!(
                     "mp3 encode: sample format `{}` (need interleaved s16/f32)",
                     other.name()
                 )))
             }
+        };
+        // The plane goes to the encoder AS BYTES: it converts and deinterleaves
+        // in one pass into its own frame buffer. This used to decode the whole
+        // plane into a `Vec<f32>` / `Vec<i16>` first (and the s16 entry point
+        // then made a second, `f32`, copy) -- on a WAV, which arrives as ONE
+        // frame, that was two or three file-sized temporaries.
+        //
+        // `af.samples` is a CLAIM made by whoever built the frame; the plane is
+        // the authority. Only the whole sample frames the plane actually holds
+        // are encoded. (A short plane used to be padded with silence up to the
+        // claim, so one frame with an inflated `samples` could force an
+        // arbitrarily large allocation -- and an empty `planes` panicked.)
+        let Some(data) = af.planes.first() else {
+            return Err(Error::invalid(
+                "mp3 encode: audio frame has no sample plane",
+            ));
+        };
+        let frame_bytes = usize::from(in_ch) * bps;
+        let frames = af.samples.min(data.len() / frame_bytes);
+        let plane = &data[..frames * frame_bytes];
+        let sr = af.sample_rate;
+        let inner = self.inner();
+        match bps {
+            4 => inner.push_pcm_f32le(plane, in_ch, sr),
+            _ => inner.push_pcm_s16le(plane, in_ch, sr),
         }
-        Ok(())
+        .map_err(map_err)
     }
 
     fn receive_packet(&mut self) -> Result<Packet> {
@@ -231,11 +231,12 @@ impl Encoder for Mp3Encoder {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // test signal synthesis
 mod tests {
     use super::*;
 
     /// Encode interleaved **S16** mono — the sample format the WAV/PCM demuxer
-    /// actually delivers (the rusty_mp3 native tests otherwise feed f32 slices).
+    /// actually delivers (the `rusty_mp3` native tests otherwise feed f32 slices).
     fn encode_mono_s16(input: &[i16], sample_rate: u32) -> Vec<u8> {
         let bytes: Vec<u8> = input.iter().flat_map(|s| s.to_le_bytes()).collect();
         let mut enc = Mp3Encoder::default();
@@ -275,6 +276,7 @@ mod tests {
     /// SILENT MP3 that every decoder reproduces as silence. Feed S16, require
     /// audible output. (Brick tests all fed F32, so this class of bug slipped.)
     #[test]
+    #[cfg_attr(miri, ignore = "runs real encodes: too slow to interpret under Miri")]
     fn s16_input_encodes_to_audible_output() {
         let sr = 44100u32;
         let n = sr as usize; // 1 s
@@ -290,6 +292,139 @@ mod tests {
             rms > 0.1,
             "S16 input produced near-silent output (rms={rms}); encoder ignored af.format"
         );
+    }
+
+    /// A frame's `samples` is a claim: an empty `planes` must be an error, not a
+    /// panic, and an inflated count must neither allocate to it nor encode more
+    /// than the plane holds (it used to pad with silence up to the claim).
+    #[test]
+    #[cfg_attr(miri, ignore = "runs real encodes: too slow to interpret under Miri")]
+    fn hostile_frame_shapes_are_errors_or_bounded() {
+        let mut enc = Mp3Encoder::default();
+        let empty = Frame::Audio(AudioFrame {
+            sample_rate: 44_100,
+            channels: 2,
+            format: SampleFormat::S16,
+            planes: vec![],
+            samples: 1152,
+            pts: None,
+        });
+        assert!(enc.send_frame(&empty).is_err());
+
+        let claim = |samples: usize| {
+            let mut enc = Mp3Encoder::default();
+            enc.send_frame(&Frame::Audio(AudioFrame {
+                sample_rate: 44_100,
+                channels: 1,
+                format: SampleFormat::S16,
+                planes: vec![vec![0x11; 2 * 4608]],
+                samples,
+                pts: None,
+            }))
+            .unwrap();
+            enc.flush();
+            let mut n = 0;
+            while let Ok(p) = enc.receive_packet() {
+                n += p.data.len();
+            }
+            n
+        };
+        // A claim of 2^40 samples over a 4608-sample plane encodes exactly what
+        // the honest claim does.
+        assert_eq!(claim(1 << 40), claim(4608));
+    }
+
+    /// Property: random frame shapes -- every sample format, 0..=8 channels,
+    /// valid and invalid rates, planes shorter or longer than claimed -- never
+    /// panic, whatever `send_frame` returns.
+    #[test]
+    #[cfg_attr(miri, ignore = "runs real encodes: too slow to interpret under Miri")]
+    fn random_frame_shapes_never_panic() {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let formats = [
+            SampleFormat::S16,
+            SampleFormat::F32,
+            SampleFormat::F32Planar,
+        ];
+        let rates = [44_100u32, 22_050, 8_000, 48_000, 0, 7, 96_000];
+        for _ in 0..300 {
+            let mut enc = Mp3Encoder::default();
+            let plane: Vec<u8> = (0..(rnd() % 20_000)).map(|_| rnd() as u8).collect();
+            let frame = Frame::Audio(AudioFrame {
+                sample_rate: rates[(rnd() % 7) as usize],
+                channels: (rnd() % 9) as u16,
+                format: formats[(rnd() % 3) as usize],
+                planes: if rnd() % 10 == 0 { vec![] } else { vec![plane] },
+                samples: if rnd() % 3 == 0 {
+                    (rnd() % (1 << 40)) as usize
+                } else {
+                    (rnd() % 6000) as usize
+                },
+                pts: None,
+            });
+            let _ = enc.send_frame(&frame);
+            enc.flush();
+            while enc.receive_packet().is_ok() {}
+        }
+    }
+
+    /// Option strings are user input: known forms parse, and hostile ones
+    /// saturate instead of panicking (the documented float-to-int behaviour).
+    #[test]
+    fn bitrate_options_parse_or_saturate() {
+        assert_eq!(parse_bitrate("128k"), Some(128));
+        assert_eq!(parse_bitrate("192000"), Some(192));
+        assert_eq!(parse_bitrate("0.32M"), Some(320));
+        assert_eq!(parse_bitrate("-5k"), Some(0));
+        assert_eq!(parse_bitrate("nank"), Some(0));
+        assert_eq!(parse_bitrate("1e30k"), Some(u32::MAX));
+        for s in ["", "k", "M", "abc", "  12 K ", "99999999999999999999", "∞k"] {
+            let _ = parse_bitrate(s);
+        }
+    }
+
+    /// Differential: the adapter's decoded plane is exactly `rusty_mp3`'s PCM
+    /// as little-endian f32 bytes -- on a real stream and on mutated copies.
+    #[test]
+    #[cfg_attr(miri, ignore = "runs real encodes: too slow to interpret under Miri")]
+    fn adapter_decode_matches_rusty_mp3() {
+        let sr = 44_100u32;
+        let s16: Vec<i16> = (0..sr as usize)
+            .map(|i| ((i as f32 * 0.07).sin() * 9000.0) as i16)
+            .collect();
+        let base = encode_mono_s16(&s16, sr);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for case in 0..20 {
+            let mut mp3 = base.clone();
+            for _ in 0..case {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let i = (seed % mp3.len() as u64) as usize;
+                mp3[i] ^= 1 << (seed % 8);
+            }
+            let ours = decode_mono(mp3.clone());
+            let mut reference = rusty_mp3::Mp3Decoder::new();
+            reference.push(&mp3);
+            reference.flush();
+            let mut want = Vec::new();
+            while let Ok(f) = reference.next_frame() {
+                want.extend_from_slice(&f.samples);
+            }
+            assert_eq!(ours.len(), want.len(), "case {case}");
+            assert!(
+                ours.iter()
+                    .zip(&want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "case {case}"
+            );
+        }
     }
 
     #[test]

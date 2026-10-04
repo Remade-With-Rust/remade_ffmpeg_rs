@@ -5,26 +5,44 @@
 //! frames. The reservoir holds that tail so each frame's main data can be
 //! reassembled into one contiguous bitstream for the Huffman/scalefactor stages.
 
+// Parses untrusted bytes: narrowing casts are lint-enforced here (see the crate
+// lint policy in Cargo.toml) -- every one is masked, typed, or states its bound.
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 /// Rolling buffer of recent main-data bytes.
 #[derive(Default)]
 pub struct Reservoir {
-    /// Bytes available from previous frames (the most this needs is 511).
+    /// The previous frame's ASSEMBLED main data, in full. Its last 512 bytes
+    /// (or all of it, if shorter) are the reservoir the next frame may reach
+    /// back into; the buffer doubles as that frame's assembly space.
     buf: Vec<u8>,
 }
 
+/// How far back a frame may reach (`main_data_begin` is at most 511).
+const RESERVOIR_BYTES: usize = 512;
+
 impl Reservoir {
     /// Reassemble this frame's main data: take `main_data_begin` bytes from the
-    /// reservoir tail, append the current frame's main data, and refresh the
-    /// reservoir for the next frame.
-    pub fn assemble(&mut self, main_data_begin: u16, frame_main_data: &[u8]) -> Vec<u8> {
-        let begin = main_data_begin as usize;
-        let mut out = Vec::with_capacity(begin + frame_main_data.len());
-        let tail = self.buf.len().saturating_sub(begin);
-        out.extend_from_slice(&self.buf[tail..]);
-        out.extend_from_slice(frame_main_data);
-        // Keep the last ~511 bytes for the next frame's back-reference.
-        self.buf = out.iter().rev().take(512).rev().copied().collect();
-        out
+    /// reservoir tail, append the current frame's main data, and keep the result
+    /// as the reservoir for the next frame.
+    ///
+    /// Assembled IN PLACE: slide the bytes this frame borrows (at most 511) to
+    /// the front of the one buffer, append, and lend it out. It used to build a
+    /// fresh `Vec` per frame and then a second one for the carried-over tail
+    /// (`rev().take(512).rev().collect()`) -- two allocations and two copies a
+    /// frame. The bytes are the same: the reservoir is still "the last 512 of
+    /// the previous assembly", and a frame still gets `min(begin, available)` of
+    /// them.
+    pub fn assemble(&mut self, main_data_begin: u16, frame_main_data: &[u8]) -> &[u8] {
+        let available = self.buf.len().min(RESERVOIR_BYTES);
+        let take = available.min(main_data_begin as usize);
+        self.buf.drain(..self.buf.len() - take);
+        self.buf.extend_from_slice(frame_main_data);
+        &self.buf
     }
 
     /// Drop carried-over state (seek / discontinuity).

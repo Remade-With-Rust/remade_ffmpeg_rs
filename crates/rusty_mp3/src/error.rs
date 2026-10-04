@@ -36,23 +36,23 @@ pub enum Error {
 impl Error {
     /// Convenience constructor for `InvalidData`.
     pub fn invalid(msg: impl Into<String>) -> Self {
-        Error::InvalidData(msg.into())
+        Self::InvalidData(msg.into())
     }
 
     /// Convenience constructor for `Unsupported`.
     pub fn unsupported(msg: impl Into<String>) -> Self {
-        Error::Unsupported(msg.into())
+        Self::Unsupported(msg.into())
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Unimplemented(what) => write!(f, "not yet implemented: {what}"),
-            Error::Eof => write!(f, "end of stream"),
-            Error::Again => write!(f, "more input required"),
-            Error::InvalidData(msg) => write!(f, "invalid data: {msg}"),
-            Error::Unsupported(msg) => write!(f, "unsupported: {msg}"),
+            Self::Unimplemented(what) => write!(f, "not yet implemented: {what}"),
+            Self::Eof => write!(f, "end of stream"),
+            Self::Again => write!(f, "more input required"),
+            Self::InvalidData(msg) => write!(f, "invalid data: {msg}"),
+            Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
         }
     }
 }

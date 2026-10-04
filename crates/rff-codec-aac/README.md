@@ -4,14 +4,14 @@
 [![By Mata Network](https://img.shields.io/badge/by-Mata%20Network-5b2be0)](https://www.mata.network)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/LICENSE)
 
-The **AAC-LC** codec adapter for **remade_ffmpeg_rs**, backed by the in-house
+The **AAC** codec adapter for **remade_ffmpeg_rs**, backed by the in-house
 pure-Rust [`rusty_aac`](https://crates.io/crates/rusty_aac) crate — no C, no
 FFI. Registers `aac` for both decode and encode.
 
-- **Decoder** with the full AAC-LC feature set — short blocks, M/S and intensity stereo, PNS, TNS — **bit-exact against FFmpeg**.
+- **Decoder** for the MPEG-4 AAC family short of USAC — AAC-LC, Main, LTP, **HE-AAC v1 (SBR) and v2 (Parametric Stereo)**, ER AAC-LC/LTP, AAC-LD and AAC-ELD, mono to 7.1 and PCE layouts. **Every non-USAC ISO/IEC 14496-26 conformance stream decodes sample-exact (≤1 LSB) against FFmpeg** (81 outright, 2 exact except where FFmpeg itself deviates).
 - **Encoder** with a Bark-scale psychoacoustic model, bitrate rate control, transient block switching, M/S stereo and MP4 `esds` config. **FFmpeg decodes our output at unity.**
 - **~450× realtime — roughly 6× faster than FFmpeg's own AAC encoder** (FFmpeg's is single-threaded), via frame-parallel encoding, an N/4-point-FFT MDCT, a two-phase rate loop, cached psychoacoustic tables and AVX2 (+ opt-in AVX-512) quantize kernels. Single-thread it still edges FFmpeg (~1.15×).
-- **Patent note:** AAC is patent-relevant. This is the largely-expired AAC-LC corner (no HE-AAC); no patent licence is granted or implied. See the [patents section](https://github.com/Remade-With-Rust/remade_ffmpeg_rs#patents).
+- **Patent note:** AAC is patent-relevant. The encoder is AAC-LC only; the decoder also implements SBR and Parametric Stereo (HE-AAC), whose patents are younger. No patent licence is granted or implied. See the [patents section](https://github.com/Remade-With-Rust/remade_ffmpeg_rs#patents).
 
 ## Usage
 

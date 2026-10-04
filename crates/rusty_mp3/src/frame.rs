@@ -33,9 +33,10 @@ pub enum ChannelMode {
 
 impl ChannelMode {
     /// Number of coded channels (mono → 1, everything else → 2).
+    #[must_use]
     pub fn channels(self) -> usize {
         match self {
-            ChannelMode::Mono => 1,
+            Self::Mono => 1,
             _ => 2,
         }
     }
@@ -54,6 +55,7 @@ pub enum BlockType {
 
 /// Per-granule, per-channel side information — the recipe for reconstructing one
 /// granule's spectrum from the Huffman-coded main data.
+#[allow(clippy::struct_excessive_bools)] // mirrors the bitstream's one-bit flags
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GranuleSideInfo {
     /// Bits of main data for this granule/channel (scalefactors + Huffman).
@@ -113,7 +115,7 @@ pub struct GranuleSpectrum {
 
 impl Default for GranuleSpectrum {
     fn default() -> Self {
-        GranuleSpectrum {
+        Self {
             lines: [[0.0; GRANULE_LINES]; 2],
             nonzero: [0; 2],
         }

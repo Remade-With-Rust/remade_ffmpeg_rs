@@ -1,0 +1,23 @@
+# Dependency-update PRs, merged by a human after review (use-protection-please
+# H-14). Scoped to the dependencies of the audited MP3 crates: rusty_mp3 has no
+# runtime dependencies (its only dev-dependency is our allocator API); the
+# adapter adds thiserror through rff-core. Widen
+# `allow` as further crates are audited.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+    allow:
+      - dependency-name: "rusty_alloc-api"   # rusty_mp3 dev-dependency
+      - dependency-name: "thiserror"         # rff-codec-mp3, via rff-core
+    labels: ["dependencies", "mp3"]
+
+  # The pinned actions in the hardening workflow.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2

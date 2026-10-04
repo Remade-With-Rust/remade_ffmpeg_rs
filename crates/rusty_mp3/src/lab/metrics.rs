@@ -18,7 +18,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub const ZERO: Metrics = Metrics {
+    pub const ZERO: Self = Self {
         n: 0,
         max_abs_err: 0.0,
         rmse: 0.0,
@@ -26,7 +26,8 @@ impl Metrics {
     };
 
     /// Compare `output` to `reference` over their common length.
-    pub fn compare(reference: &[f32], output: &[f32]) -> Metrics {
+    #[must_use]
+    pub fn compare(reference: &[f32], output: &[f32]) -> Self {
         let n = reference.len().min(output.len());
         let mut max = 0.0f32;
         let mut sumsq = 0.0f64;
@@ -35,7 +36,7 @@ impl Metrics {
             if e > max {
                 max = e;
             }
-            sumsq += (e as f64) * (e as f64);
+            sumsq += f64::from(e) * f64::from(e);
         }
         let rmse = if n > 0 {
             (sumsq / n as f64).sqrt() as f32
@@ -43,11 +44,11 @@ impl Metrics {
             0.0
         };
         let psnr_db = if rmse > 0.0 {
-            (20.0 * (1.0 / rmse as f64).log10()) as f32
+            (20.0 * (1.0 / f64::from(rmse)).log10()) as f32
         } else {
             f32::INFINITY
         };
-        Metrics {
+        Self {
             n,
             max_abs_err: max,
             rmse,
@@ -56,9 +57,10 @@ impl Metrics {
     }
 
     /// Per-sample-weighted mean of several metric rows (for a corpus summary).
-    pub fn mean(rows: &[Metrics]) -> Metrics {
+    #[must_use]
+    pub fn mean(rows: &[Self]) -> Self {
         if rows.is_empty() {
-            return Metrics::ZERO;
+            return Self::ZERO;
         }
         let mut max = 0.0f32;
         let mut sumsq = 0.0f64;
@@ -67,7 +69,7 @@ impl Metrics {
             if m.max_abs_err > max {
                 max = m.max_abs_err;
             }
-            sumsq += (m.rmse as f64) * (m.rmse as f64) * m.n as f64;
+            sumsq += f64::from(m.rmse) * f64::from(m.rmse) * m.n as f64;
             n += m.n;
         }
         let rmse = if n > 0 {
@@ -76,11 +78,11 @@ impl Metrics {
             0.0
         };
         let psnr_db = if rmse > 0.0 {
-            (20.0 * (1.0 / rmse as f64).log10()) as f32
+            (20.0 * (1.0 / f64::from(rmse)).log10()) as f32
         } else {
             f32::INFINITY
         };
-        Metrics {
+        Self {
             n,
             max_abs_err: max,
             rmse,
@@ -89,6 +91,7 @@ impl Metrics {
     }
 
     /// PSNR as a JSON number, or `null` when infinite (bit-exact).
+    #[must_use]
     pub fn psnr_json(&self) -> String {
         if self.psnr_db.is_finite() {
             format!("{:.3}", self.psnr_db)
@@ -98,6 +101,7 @@ impl Metrics {
     }
 
     /// Compact one-line summary.
+    #[must_use]
     pub fn summary(&self) -> String {
         let psnr = if self.psnr_db.is_finite() {
             format!("{:.2} dB", self.psnr_db)

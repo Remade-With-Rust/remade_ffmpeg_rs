@@ -36,6 +36,7 @@ fn sig(name: &str, pcm: Vec<f32>) -> Signal {
 }
 
 /// Pure tone at `freq` Hz, amplitude 0.5 — the easy masking case.
+#[must_use]
 pub fn tone(freq: f32) -> Signal {
     let pcm = (0..LEN)
         .map(|i| 0.5 * (2.0 * PI * freq * i as f32 / SR as f32).sin())
@@ -44,6 +45,7 @@ pub fn tone(freq: f32) -> Signal {
 }
 
 /// Two simultaneous tones — exercises inter-tone masking.
+#[must_use]
 pub fn two_tones(f1: f32, f2: f32) -> Signal {
     let pcm = (0..LEN)
         .map(|i| {
@@ -55,6 +57,7 @@ pub fn two_tones(f1: f32, f2: f32) -> Signal {
 }
 
 /// Linear sweep across the band — every scalefactor band sees energy.
+#[must_use]
 pub fn sweep(f0: f32, f1: f32) -> Signal {
     let mut phase = 0.0f32;
     let mut pcm = Vec::with_capacity(LEN);
@@ -68,6 +71,7 @@ pub fn sweep(f0: f32, f1: f32) -> Signal {
 }
 
 /// Broadband white noise — the worst case for the rate loop (no maskers).
+#[must_use]
 pub fn white(seed: u32) -> Signal {
     let mut s = seed;
     let pcm = (0..LEN).map(|_| 0.4 * lcg(&mut s)).collect();
@@ -75,6 +79,7 @@ pub fn white(seed: u32) -> Signal {
 }
 
 /// Silence then a hard burst — the pre-echo / block-switch torture test.
+#[must_use]
 pub fn transient() -> Signal {
     let mut s = 0x1234_5678u32;
     let pcm = (0..LEN)
@@ -92,11 +97,13 @@ pub fn transient() -> Signal {
 }
 
 /// DC / near-zero — degenerate edge case for the quantizer and reservoir.
+#[must_use]
 pub fn dc() -> Signal {
     sig("dc", vec![0.3; LEN])
 }
 
 /// The standard corpus: one of each kind, fixed order.
+#[must_use]
 pub fn corpus() -> Vec<Signal> {
     vec![
         tone(1000.0),
@@ -109,6 +116,7 @@ pub fn corpus() -> Vec<Signal> {
 }
 
 /// Look up a corpus signal by name (for `--signal` filtering).
+#[must_use]
 pub fn by_name(name: &str) -> Option<Signal> {
     corpus().into_iter().find(|s| s.name == name)
 }

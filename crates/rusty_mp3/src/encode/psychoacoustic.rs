@@ -133,16 +133,19 @@ pub mod prometheus {
 
     /// Terhardt absolute threshold of hearing (dB SPL) at each frequency (Hz).
     /// The canonical C1 discovery target: a 1-variable perceptual curve.
+    #[must_use]
     pub fn sample_ath(freqs_hz: &[f32]) -> Vec<f32> {
         freqs_hz.iter().map(|&f| super::ath_db(f)).collect()
     }
 
     /// Schroeder spreading function (dB) at each Bark distance `dz`.
+    #[must_use]
     pub fn sample_spreading(dz: &[f32]) -> Vec<f32> {
         dz.iter().map(|&d| super::spreading_db(d)).collect()
     }
 
     /// Bark-scale value at each frequency (Hz).
+    #[must_use]
     pub fn sample_bark(freqs_hz: &[f32]) -> Vec<f32> {
         freqs_hz.iter().map(|&f| super::bark(f)).collect()
     }
@@ -167,7 +170,7 @@ struct BandModel {
 impl BandModel {
     /// Build the band model for `sample_rate` — each value computed by the exact
     /// same f32 formula the Q3 loop used inline, so the result is bit-identical.
-    fn new(sample_rate: u32) -> BandModel {
+    fn new(sample_rate: u32) -> Self {
         let sfb = tables::sfb_long_offsets(sample_rate);
         let bin_per_line = N_FFT as f32 / 1152.0;
         let mut bin_lo = [0usize; SFB_LONG];
@@ -175,9 +178,10 @@ impl BandModel {
         let mut center_bark = [0f32; SFB_LONG];
         let mut ath_base = [0f32; SFB_LONG];
         for b in 0..SFB_LONG {
-            bin_lo[b] = (sfb[b] as f32 * bin_per_line).round() as usize;
-            bin_hi[b] = ((sfb[b + 1] as f32 * bin_per_line).round() as usize).min(N_FFT / 2 + 1);
-            let center_line = (sfb[b] as f32 + sfb[b + 1] as f32) * 0.5;
+            bin_lo[b] = (f32::from(sfb[b]) * bin_per_line).round() as usize;
+            bin_hi[b] =
+                ((f32::from(sfb[b + 1]) * bin_per_line).round() as usize).min(N_FFT / 2 + 1);
+            let center_line = (f32::from(sfb[b]) + f32::from(sfb[b + 1])) * 0.5;
             center_bark[b] = bark(center_line * sample_rate as f32 / 1152.0);
             ath_base[b] = 10f32.powf(ath_db(center_line * sample_rate as f32 / 1152.0) / 10.0);
         }
@@ -187,7 +191,7 @@ impl BandModel {
                 spread[i][j] = 10f32.powf(spreading_db(center_bark[i] - center_bark[j]) / 10.0);
             }
         }
-        BandModel {
+        Self {
             bin_lo,
             bin_hi,
             spread,
@@ -196,24 +200,21 @@ impl BandModel {
     }
 }
 
-/// Cached band model for a sample rate (leaked once per rate — at most the ~8 valid
-/// rates ever, ~2 KB each). A thread-local keeps the common same-rate path lock-free.
-fn band_model(sample_rate: u32) -> &'static BandModel {
-    use std::cell::RefCell;
-    thread_local! {
-        static CACHE: RefCell<Option<(u32, &'static BandModel)>> = const { RefCell::new(None) };
-    }
-    CACHE.with(|cell| {
-        let mut c = cell.borrow_mut();
-        if let Some((sr, m)) = *c {
-            if sr == sample_rate {
-                return m;
-            }
-        }
-        let m: &'static BandModel = Box::leak(Box::new(BandModel::new(sample_rate)));
-        *c = Some((sample_rate, m));
-        m
-    })
+/// The nine MPEG Layer III sample rates -- every rate the encoder accepts.
+const MPEG_RATES: [u32; 9] = [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000];
+
+/// The band model for one of the nine MPEG rates, built once per process and
+/// shared by every thread; `None` for any other rate.
+///
+/// It used to be a one-slot thread-local holding a `Box::leak`ed model, which
+/// leaked a fresh ~2.4 KB model on EVERY change of rate, on every thread (its doc
+/// claimed "once per rate"): a host encoding streams of alternating rates grew
+/// without bound. Found by the `encode` fuzz target under LeakSanitizer. A static
+/// table of nine cells cannot grow and leaks nothing.
+fn cached_band_model(sample_rate: u32) -> Option<&'static BandModel> {
+    static MODELS: [OnceLock<BandModel>; 9] = [const { OnceLock::new() }; 9];
+    let i = MPEG_RATES.iter().position(|&r| r == sample_rate)?;
+    Some(MODELS[i].get_or_init(|| BandModel::new(sample_rate)))
 }
 
 /// Detect a transient/attack in a granule's PCM: a sub-block whose energy jumps
@@ -221,6 +222,7 @@ fn band_model(sample_rate: u32) -> &'static BandModel {
 /// pre-echo a long window would smear before the attack is confined to one short
 /// window. (Brick **Q5** — the block-type trigger; the FSM that turns it into a
 /// valid Long/Start/Short/Stop sequence lives in `shortblock`.)
+#[must_use]
 pub fn detect_attack(pcm: &[f32]) -> bool {
     const BLOCKS: usize = 8;
     // RATIO=10 is corpus-tuned (PEAQ, 2026-07-08): lowering it adds short blocks but
@@ -263,7 +265,15 @@ pub fn detect_attack(pcm: &[f32]) -> bool {
 pub fn analyze(pcm: &[f32], sample_rate: u32) -> PsyResult {
     let sfb = tables::sfb_long_offsets(sample_rate);
     let win = hann();
-    let model = band_model(sample_rate); // signal-independent geometry, cached
+    // Signal-independent geometry: cached for the MPEG rates, built on the spot
+    // (never leaked) for any other rate a direct caller passes.
+    let uncached;
+    let model: &BandModel = if let Some(m) = cached_band_model(sample_rate) {
+        m
+    } else {
+        uncached = BandModel::new(sample_rate);
+        &uncached
+    };
 
     // Q2 — windowed FFT power spectrum.
     let mut re = [0f32; N_FFT];
@@ -339,7 +349,7 @@ pub fn analyze(pcm: &[f32], sample_rate: u32) -> PsyResult {
     // Q4 — perceptual entropy: rough bit demand from the signal/threshold ratio.
     let mut pe = 0f32;
     for b in 0..SFB_LONG {
-        let lines = (sfb[b + 1] - sfb[b]) as f32;
+        let lines = f32::from(sfb[b + 1] - sfb[b]);
         pe += lines * (1.0 + energy[b] / thresholds[b]).log2().max(0.0);
     }
 
@@ -353,6 +363,29 @@ pub fn analyze(pcm: &[f32], sample_rate: u32) -> PsyResult {
 
 #[cfg(test)]
 mod tests {
+
+    /// The band-model cache must not grow with rate changes: one model per MPEG
+    /// rate, the SAME allocation however often the rate alternates and from any
+    /// thread (the old one-slot thread-local leaked a new model per change).
+    #[test]
+    fn band_model_cache_is_one_shared_model_per_rate() {
+        let first = std::ptr::from_ref::<BandModel>(cached_band_model(44_100).unwrap());
+        for _ in 0..100 {
+            let _ = cached_band_model(48_000).unwrap();
+            assert!(std::ptr::eq(first, cached_band_model(44_100).unwrap()));
+        }
+        let from_thread = std::thread::spawn(|| {
+            std::ptr::from_ref::<BandModel>(cached_band_model(44_100).unwrap()) as usize
+        })
+        .join()
+        .unwrap();
+        assert_eq!(from_thread, first as usize);
+        assert!(cached_band_model(7_999).is_none());
+        // An uncached rate still analyses (built on the spot, then dropped).
+        let psy = analyze(&[0.25f32; 1152], 7_999);
+        assert!(psy.perceptual_entropy.is_finite());
+    }
+
     use super::*;
 
     #[test]
@@ -392,11 +425,12 @@ mod tests {
             let bin_per_line = N_FFT as f32 / 1152.0;
             let mut cb = [0f32; SFB_LONG];
             for b in 0..SFB_LONG {
-                let lo = (sfb[b] as f32 * bin_per_line).round() as usize;
-                let hi = ((sfb[b + 1] as f32 * bin_per_line).round() as usize).min(N_FFT / 2 + 1);
+                let lo = (f32::from(sfb[b]) * bin_per_line).round() as usize;
+                let hi =
+                    ((f32::from(sfb[b + 1]) * bin_per_line).round() as usize).min(N_FFT / 2 + 1);
                 assert_eq!(m.bin_lo[b], lo, "bin_lo b{b} sr{sr}");
                 assert_eq!(m.bin_hi[b], hi, "bin_hi b{b} sr{sr}");
-                let center_line = (sfb[b] as f32 + sfb[b + 1] as f32) * 0.5;
+                let center_line = (f32::from(sfb[b]) + f32::from(sfb[b + 1])) * 0.5;
                 cb[b] = bark(center_line * sr as f32 / 1152.0);
                 let ath = 10f32.powf(ath_db(center_line * sr as f32 / 1152.0) / 10.0);
                 assert_eq!(m.ath_base[b], ath, "ath_base b{b} sr{sr}");
@@ -432,8 +466,8 @@ mod tests {
             fft::power_spectrum(&mut re, &mut im, &mut p);
             let mut m = 0f32;
             for b in 0..SFB_LONG {
-                let lo = (sfb[b] as f32 * N_FFT as f32 / 1152.0).round() as usize;
-                let hi = ((sfb[b + 1] as f32 * N_FFT as f32 / 1152.0).round() as usize)
+                let lo = (f32::from(sfb[b]) * N_FFT as f32 / 1152.0).round() as usize;
+                let hi = ((f32::from(sfb[b + 1]) * N_FFT as f32 / 1152.0).round() as usize)
                     .min(N_FFT / 2 + 1);
                 let e: f32 = p[lo..hi].iter().sum();
                 m = m.max(e);

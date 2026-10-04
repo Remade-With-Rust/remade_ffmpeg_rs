@@ -23,6 +23,7 @@ const MAX_UNCLIPPED: i32 = 8191;
 /// Reorder a short-block spectrum from the MDCT's subband-interleaved order into
 /// the bitstream's `(sfb, window, freq)` order — the forward of the decoder's
 /// requantize reorder (`out[dst] = coeffs[src]`).
+#[must_use]
 pub fn reorder_subband_to_bitstream(
     sample_rate: u32,
     subband: &[f32; GRANULE_LINES],
@@ -55,7 +56,7 @@ fn quantize_uniform(
     gain: i32,
 ) -> [i32; GRANULE_LINES] {
     // step = scale_inv^(3/4), scale_inv = 2^(-0.25·(gain−210)).
-    let step = 2f64.powf(0.75 * -0.25 * (gain - 210) as f64);
+    let step = 2f64.powf(0.75 * -0.25 * f64::from(gain - 210));
     let mut coeffs = [0i32; GRANULE_LINES];
     for (i, &x) in freq.iter().enumerate() {
         let mag = super::quantize::level_from(xrp[i] * step);
@@ -67,6 +68,7 @@ fn quantize_uniform(
 /// **Q5 short quantizer** — quantize a short-block granule (already reordered to
 /// bitstream order) to fit `bit_budget`, with flat per-window scalefactors. Picks
 /// the smallest non-clipping `global_gain` whose Huffman cost fits.
+#[must_use]
 pub fn quantize_short(
     header: &FrameHeader,
     freq_bitstream: &[f32; GRANULE_LINES],
@@ -152,7 +154,7 @@ fn quantize_run(
     hi: usize,
     coeffs: &mut [i32; GRANULE_LINES],
 ) {
-    let step = 2f64.powf(0.75 * (-0.25 * (gain - 210) as f64 + 0.5 * s as f64));
+    let step = 2f64.powf(0.75 * (-0.25 * f64::from(gain - 210) + 0.5 * f64::from(s)));
     for i in lo..hi {
         let mag = super::quantize::level_from(xrp[i] * step);
         coeffs[i] = if freq[i] < 0.0 { -mag } else { mag };
@@ -168,11 +170,12 @@ fn run_noise(
     lo: usize,
     hi: usize,
 ) -> f32 {
-    let scale = 2f64.powf(0.25 * (gain - 210) as f64 - 0.5 * s as f64);
+    let scale = 2f64.powf(0.25 * f64::from(gain - 210) - 0.5 * f64::from(s));
     let mut e = 0f64;
     for i in lo..hi {
-        let xr = coeffs[i].signum() as f64 * super::quantize::requant_magnitude(coeffs[i]) * scale;
-        let d = freq[i] as f64 - xr;
+        let xr =
+            f64::from(coeffs[i].signum()) * super::quantize::requant_magnitude(coeffs[i]) * scale;
+        let d = f64::from(freq[i]) - xr;
         e += d * d;
     }
     e as f32
@@ -211,7 +214,7 @@ pub fn quantize_short_slack(
     if !short_shape_enabled() || header.version != crate::header::MpegVersion::V1 {
         return q;
     }
-    let gain = q.side.global_gain as i32;
+    let gain = i32::from(q.side.global_gain);
     let xrp = super::quantize::xrpow(freq_bitstream);
     let off = tables::sfb_short_offsets(header.sample_rate);
     let mdct_energy: f32 = freq_bitstream.iter().map(|x| x * x).sum();
@@ -291,10 +294,25 @@ pub fn quantize_short_slack(
 /// `LONG…LONG | START, SHORT | (SHORT, SHORT)* | STOP, LONG` — a `START` always
 /// precedes a `SHORT` and a `STOP` always follows it, the constraint the decoder's
 /// overlapping windows require. MPEG-1 (2 granules per frame).
+#[must_use]
 pub fn decide_block_types(prev: BlockType, attacks: &[bool]) -> (Vec<BlockType>, BlockType) {
     if attacks.len() != 2 {
         // MPEG-2 (single granule) not yet block-switched.
         return (vec![BlockType::Long; attacks.len()], BlockType::Long);
+    }
+    let (types, new_prev) = decide_block_types_pair(prev, attacks);
+    (types.to_vec(), new_prev)
+}
+
+/// [`decide_block_types`] without the `Vec`: the encoder calls this once per
+/// frame, and a frame has at most two granules. For a single-granule (MPEG-2)
+/// frame only `[0]` is meaningful, and it is `Long`, as above.
+pub(crate) fn decide_block_types_pair(
+    prev: BlockType,
+    attacks: &[bool],
+) -> ([BlockType; 2], BlockType) {
+    if attacks.len() != 2 {
+        return ([BlockType::Long; 2], BlockType::Long);
     }
     let any = attacks[0] || attacks[1];
     let types = if prev == BlockType::Short {
@@ -311,110 +329,7 @@ pub fn decide_block_types(prev: BlockType, attacks: &[bool]) -> (Vec<BlockType>,
         [BlockType::Long, BlockType::Long]
     };
     let new_prev = types[1];
-    (types.to_vec(), new_prev)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::decode::scalefactors::ScaleFactors;
-    use crate::frame::{ChannelMode, SideInfo};
-    use crate::header::MpegVersion;
-
-    fn hdr() -> FrameHeader {
-        FrameHeader {
-            version: MpegVersion::V1,
-            crc_protected: false,
-            bitrate_kbps: 128,
-            sample_rate: 44100,
-            padding: false,
-            channel_mode: ChannelMode::Mono,
-            copyright: false,
-            original: true,
-            emphasis: 0,
-        }
-    }
-
-    #[test]
-    fn short_coefficients_round_trip_through_decoder() {
-        // A short-block spectrum (subband order) → reorder → short quantize →
-        // Huffman → decoder Huffman + reorder-requantize must recover it.
-        let header = hdr();
-        let mut s = 0xABCD_1234u32;
-        let mut freq = [0f32; GRANULE_LINES];
-        for (i, v) in freq.iter_mut().enumerate() {
-            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            // taper high lines so there's an rzero tail (realistic short block)
-            let taper = 1.0 - (i as f32 / GRANULE_LINES as f32);
-            *v = ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 8.0 * taper;
-        }
-
-        let freq_bs = reorder_subband_to_bitstream(header.sample_rate, &freq);
-        let quant = quantize_short(&header, &freq_bs, 100_000);
-
-        // Emit the Huffman spectrum, then decode it back.
-        let mut w = crate::bitio::BitWriter::new();
-        let hbits = super::super::huffman::encode(&quant, &header, &mut w);
-        let bits = w.finish();
-
-        let mut gi = quant.side.clone();
-        gi.part2_3_length = hbits as u16;
-        let mut pos = 0;
-        let (coeffs, nz) = crate::decode::huffman::decode(&bits, &mut pos, hbits, &header, &gi);
-        assert_eq!(
-            coeffs, quant.coeffs,
-            "short Huffman must round-trip exactly"
-        );
-
-        // Requantize (with the decoder's short reorder) → subband order.
-        let mut si = SideInfo::default();
-        si.granules[0][0] = gi.clone();
-        let mut out = [0f32; GRANULE_LINES];
-        crate::decode::requantize::apply(
-            &header,
-            &gi,
-            &ScaleFactors::default(),
-            &coeffs,
-            nz,
-            &mut out,
-        );
-
-        // out (subband order) ≈ freq (subband order), to quantization error.
-        let mut sig = 0f64;
-        let mut err = 0f64;
-        for i in 0..GRANULE_LINES {
-            sig += (freq[i] as f64).powi(2);
-            err += ((freq[i] - out[i]) as f64).powi(2);
-        }
-        let snr = 10.0 * (sig / err).log10();
-        eprintln!("[Q5] short-block coefficient round-trip SNR {snr:.1} dB");
-        assert!(snr > 40.0, "short-block coding SNR too low: {snr:.1} dB");
-    }
-
-    #[test]
-    fn reorder_inverts_the_decoder_mapping() {
-        // Forward reorder then the decoder's src/dst mapping must return the
-        // original subband-order spectrum.
-        let subband: [f32; GRANULE_LINES] = std::array::from_fn(|i| (i as f32 * 0.013).sin());
-        let bitstream = reorder_subband_to_bitstream(44100, &subband);
-
-        let off = tables::sfb_short_offsets(44100);
-        let mut recovered = [0f32; GRANULE_LINES];
-        for sfb in 0..13 {
-            let start = off[sfb] as usize;
-            let width = (off[sfb + 1] - off[sfb]) as usize;
-            for window in 0..3 {
-                for f in 0..width {
-                    let src = start * 3 + window * width + f;
-                    let dst = start * 3 + window + f * 3;
-                    recovered[dst] = bitstream[src]; // decoder's placement
-                }
-            }
-        }
-        for i in 0..GRANULE_LINES {
-            assert!((recovered[i] - subband[i]).abs() < 1e-9, "line {i}");
-        }
-    }
+    (types, new_prev)
 }
 
 /// Map the LONG-block masking thresholds onto the short-block band grid.
@@ -463,7 +378,7 @@ fn short_band_noise(
     gain: i32,
 ) -> [f32; 13] {
     let off = crate::tables::sfb_short_offsets(sample_rate);
-    let scale = 2f64.powf(0.25 * (gain - 210) as f64);
+    let scale = 2f64.powf(0.25 * f64::from(gain - 210));
     let mut noise = [0f32; 13];
     for (b, n) in noise.iter_mut().enumerate() {
         let (lo, hi) = (
@@ -472,9 +387,10 @@ fn short_band_noise(
         );
         let mut e = 0f64;
         for i in lo..hi {
-            let xr =
-                coeffs[i].signum() as f64 * super::quantize::requant_magnitude(coeffs[i]) * scale;
-            let d = freq_bs[i] as f64 - xr;
+            let xr = f64::from(coeffs[i].signum())
+                * super::quantize::requant_magnitude(coeffs[i])
+                * scale;
+            let d = f64::from(freq_bs[i]) - xr;
             e += d * d;
         }
         *n = e as f32;
@@ -493,6 +409,7 @@ fn short_band_noise(
 /// Mirrors `quantize::loops_vbr`: same search shape, and the same domain
 /// rescaling, because the thresholds live in the FFT power domain while the
 /// noise is measured in the MDCT domain.
+#[must_use]
 pub fn quantize_short_vbr(
     header: &FrameHeader,
     freq_bitstream: &[f32; GRANULE_LINES],
@@ -549,5 +466,106 @@ pub fn quantize_short_vbr(
         coeffs,
         side,
         scalefactors: [0; 39],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::scalefactors::ScaleFactors;
+    use crate::frame::ChannelMode;
+    use crate::header::MpegVersion;
+
+    fn hdr() -> FrameHeader {
+        FrameHeader {
+            version: MpegVersion::V1,
+            crc_protected: false,
+            bitrate_kbps: 128,
+            sample_rate: 44100,
+            padding: false,
+            channel_mode: ChannelMode::Mono,
+            copyright: false,
+            original: true,
+            emphasis: 0,
+        }
+    }
+
+    #[test]
+    fn short_coefficients_round_trip_through_decoder() {
+        // A short-block spectrum (subband order) → reorder → short quantize →
+        // Huffman → decoder Huffman + reorder-requantize must recover it.
+        let header = hdr();
+        let mut s = 0xABCD_1234u32;
+        let mut freq = [0f32; GRANULE_LINES];
+        for (i, v) in freq.iter_mut().enumerate() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            // taper high lines so there's an rzero tail (realistic short block)
+            let taper = 1.0 - (i as f32 / GRANULE_LINES as f32);
+            *v = ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 8.0 * taper;
+        }
+
+        let freq_bs = reorder_subband_to_bitstream(header.sample_rate, &freq);
+        let quant = quantize_short(&header, &freq_bs, 100_000);
+
+        // Emit the Huffman spectrum, then decode it back.
+        let mut w = crate::bitio::BitWriter::new();
+        let hbits = super::super::huffman::encode(&quant, &header, &mut w);
+        let bits = w.finish();
+
+        let mut gi = quant.side.clone();
+        gi.part2_3_length = hbits as u16;
+        let mut pos = 0;
+        let (coeffs, nz) = crate::decode::huffman::decode(&bits, &mut pos, hbits, &header, &gi);
+        assert_eq!(
+            coeffs, quant.coeffs,
+            "short Huffman must round-trip exactly"
+        );
+
+        // Requantize (with the decoder's short reorder) → subband order.
+        let mut out = [0f32; GRANULE_LINES];
+        crate::decode::requantize::apply(
+            &header,
+            &gi,
+            &ScaleFactors::default(),
+            &coeffs,
+            nz,
+            &mut out,
+        );
+
+        // out (subband order) ≈ freq (subband order), to quantization error.
+        let mut sig = 0f64;
+        let mut err = 0f64;
+        for i in 0..GRANULE_LINES {
+            sig += f64::from(freq[i]).powi(2);
+            err += f64::from(freq[i] - out[i]).powi(2);
+        }
+        let snr = 10.0 * (sig / err).log10();
+        eprintln!("[Q5] short-block coefficient round-trip SNR {snr:.1} dB");
+        assert!(snr > 40.0, "short-block coding SNR too low: {snr:.1} dB");
+    }
+
+    #[test]
+    fn reorder_inverts_the_decoder_mapping() {
+        // Forward reorder then the decoder's src/dst mapping must return the
+        // original subband-order spectrum.
+        let subband: [f32; GRANULE_LINES] = std::array::from_fn(|i| (i as f32 * 0.013).sin());
+        let bitstream = reorder_subband_to_bitstream(44100, &subband);
+
+        let off = tables::sfb_short_offsets(44100);
+        let mut recovered = [0f32; GRANULE_LINES];
+        for sfb in 0..13 {
+            let start = off[sfb] as usize;
+            let width = (off[sfb + 1] - off[sfb]) as usize;
+            for window in 0..3 {
+                for f in 0..width {
+                    let src = start * 3 + window * width + f;
+                    let dst = start * 3 + window + f * 3;
+                    recovered[dst] = bitstream[src]; // decoder's placement
+                }
+            }
+        }
+        for i in 0..GRANULE_LINES {
+            assert!((recovered[i] - subband[i]).abs() < 1e-9, "line {i}");
+        }
     }
 }
