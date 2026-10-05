@@ -58,6 +58,13 @@ impl<'a> BitReader<'a> {
     #[inline]
     fn peek_window(&self) -> u64 {
         let byte = self.pos / 8;
+        // A full window is one constant-length load; only the last seven bytes
+        // of the data take the zero-padded copy (a runtime-length copy is a real
+        // `memcpy` call, which every Huffman peek used to pay).
+        if let Some(w) = self.data.get(byte..byte + 8) {
+            let w: [u8; 8] = w.try_into().expect("an 8-byte slice");
+            return u64::from_be_bytes(w) << (self.pos % 8);
+        }
         let mut buf = [0u8; 8];
         let end = (byte + 8).min(self.data.len());
         if byte < end {
