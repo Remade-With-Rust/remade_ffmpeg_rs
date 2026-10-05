@@ -30,6 +30,9 @@ struct Plans {
     ana_win: Vec<f32>,
     /// The decimated window c(2m) for the downsampled synthesis.
     ds_win: Vec<f32>,
+    /// AVX detected once, for the synthesis window's 8-wide twin.
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    avx: bool,
 }
 
 fn plans() -> &'static Plans {
@@ -45,6 +48,8 @@ fn plans() -> &'static Plans {
             ana_post: (0..32).map(|k| tw(-PI * k as f64 / 128.0, 2.0)).collect(),
             ana_win: (0..320).map(|q| QMF_WINDOW[2 * (319 - q)]).collect(),
             ds_win: (0..320).map(|m| QMF_WINDOW[2 * m]).collect(),
+            #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+            avx: std::is_x86_feature_detected!("avx"),
         }
     })
 }
@@ -140,6 +145,7 @@ pub(super) fn qmf_synthesis(
         // g[2b·i + j] = v[2·vlen·i + j], g[2b·i + b + j] = v[2·vlen·i + 3b + j];
         // out[j] = Σ g·c over the ten blocks.
         qmf_window(
+            p,
             &mut out[l * bands..(l + 1) * bands],
             &v.buf[off..off + span],
             &win[..10 * bands],
@@ -151,13 +157,20 @@ pub(super) fn qmf_synthesis(
 /// over the five block pairs of `vb` (`o.len()` bands, `vb.len() == 20·bands`,
 /// `win.len() == 10·bands`), summed in that order from 0.
 #[inline]
-fn qmf_window(o: &mut [f32], vb: &[f32], win: &[f32]) {
+fn qmf_window(p: &Plans, o: &mut [f32], vb: &[f32], win: &[f32]) {
     let bands = o.len();
     let (vb, win) = (&vb[..20 * bands], &win[..10 * bands]);
     // A running `o[j] +=` reloads and re-stores every column for each of the
     // ten terms; the twins hold eight columns in two registers across all of
     // them, same products and same add order per column, so bit-identical
     // (`qmf_window_matches_scalar`).
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    if bands % 8 == 0 && p.avx {
+        crate::prof::count(crate::prof::Kernel::QmfWindow, true, bands);
+        // SAFETY: AVX detected in `plans()`; bounds as for the SSE twin below.
+        unsafe { qmf_window_avx(o, vb, win) };
+        return;
+    }
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     if bands % 8 == 0 {
         crate::prof::count(crate::prof::Kernel::QmfWindow, true, bands);
@@ -231,6 +244,30 @@ unsafe fn qmf_window_sse(o: &mut [f32], vb: &[f32], win: &[f32]) {
     }
 }
 
+/// AVX twin of [`qmf_window`]: one 8-column register per trip, and VEX folds
+/// the unaligned window operand into the multiply. Safety contract as
+/// [`qmf_window_sse`], plus AVX must be available.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx")]
+unsafe fn qmf_window_avx(o: &mut [f32], vb: &[f32], win: &[f32]) {
+    use std::arch::x86_64::*;
+    let b = o.len();
+    let (op, v, w) = (o.as_mut_ptr(), vb.as_ptr(), win.as_ptr());
+    let scale = _mm256_set1_ps(1.0 / 32768.0);
+    let mut j = 0;
+    while j < b {
+        let mut a = _mm256_setzero_ps();
+        for i in 0..5 {
+            let (va, wa) = (v.add(4 * b * i + j), w.add(2 * b * i + j));
+            let (vc, wc) = (v.add(4 * b * i + 3 * b + j), w.add(2 * b * i + b + j));
+            a = _mm256_add_ps(a, _mm256_mul_ps(_mm256_loadu_ps(va), _mm256_loadu_ps(wa)));
+            a = _mm256_add_ps(a, _mm256_mul_ps(_mm256_loadu_ps(vc), _mm256_loadu_ps(wc)));
+        }
+        _mm256_storeu_ps(op.add(j), _mm256_mul_ps(a, scale));
+        j += 8;
+    }
+}
+
 /// NEON twin of [`qmf_window`]; safety contract as [`qmf_window_sse`].
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
 unsafe fn qmf_window_neon(o: &mut [f32], vb: &[f32], win: &[f32]) {
@@ -289,10 +326,17 @@ mod tests {
                 let vb: Vec<f32> = (0..20 * bands).map(|_| rnd() * 30000.0).collect();
                 let win: Vec<f32> = (0..10 * bands).map(|_| rnd()).collect();
                 let (mut a, mut b) = (vec![0f32; bands], vec![0f32; bands]);
-                qmf_window(&mut a, &vb, &win);
+                qmf_window(plans(), &mut a, &vb, &win);
                 qmf_window_scalar(&mut b, &vb, &win);
                 let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
                 assert_eq!(bits(&a), bits(&b), "bands {bands}");
+                // The dispatcher prefers AVX; hold the SSE twin to the oracle too.
+                #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+                {
+                    // SAFETY: SSE is baseline; lengths are exactly 20·b / 10·b.
+                    unsafe { qmf_window_sse(&mut a, &vb, &win) };
+                    assert_eq!(bits(&a), bits(&b), "sse bands {bands}");
+                }
             }
         }
     }
