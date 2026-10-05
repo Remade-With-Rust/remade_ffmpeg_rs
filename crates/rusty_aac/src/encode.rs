@@ -800,6 +800,25 @@ pub(crate) fn element_plan(channels: usize) -> Option<Vec<Elem>> {
 
 const MAX_QUANT: i32 = 8191;
 
+/// The per-channel ICS body budget's ceiling: the 6144-bit decoder input buffer
+/// per channel (ISO 14496-3 §4.5.3) less the element (7) and frame (59) overhead.
+const MAX_CHANNEL_BITS: usize = 6144 - 7 - 59;
+
+/// Input samples are clamped to ±8× full scale (NaN becomes silence) at the push
+/// boundary. Real audio is untouched; hostile values (±Inf, 1e30) would otherwise
+/// drive every band to maximal escape codes and a block no rate decision can
+/// shrink below the decoder buffer.
+pub const MAX_INPUT_AMPLITUDE: f32 = 8.0;
+
+#[inline]
+fn sanitize(x: f32) -> f32 {
+    if x.is_nan() {
+        0.0
+    } else {
+        x.clamp(-MAX_INPUT_AMPLITUDE, MAX_INPUT_AMPLITUDE)
+    }
+}
+
 /// Quantize one coefficient at global gain `gg` (the tests' reference).
 #[cfg(test)]
 fn quantize(x: f32, gg: i32) -> i32 {
@@ -3228,7 +3247,9 @@ impl AacEncoder {
 
     /// Buffer interleaved `f32` PCM in [-1, 1] (`interleaved.len()` must be a
     /// multiple of `channels`). The first push fixes the stream's channel count
-    /// and sample rate.
+    /// and sample rate. Samples beyond ±[`MAX_INPUT_AMPLITUDE`] are clamped and
+    /// NaN becomes silence, so no input can push a block past the decoder
+    /// buffer.
     ///
     /// # Errors
     ///
@@ -3243,11 +3264,17 @@ impl AacEncoder {
         // channel buffer by doubling (a realloc + copy of everything so far, ~log2
         // of the stream per channel). Mono is a straight slice copy.
         if ch == 1 {
-            self.chans[0].extend_from_slice(&interleaved[..n]);
+            self.chans[0].extend(interleaved[..n].iter().map(|&x| sanitize(x)));
         } else {
             for (c, dst) in self.chans.iter_mut().enumerate().take(ch) {
                 dst.reserve(n);
-                dst.extend(interleaved[..n * ch].iter().skip(c).step_by(ch).copied());
+                dst.extend(
+                    interleaved[..n * ch]
+                        .iter()
+                        .skip(c)
+                        .step_by(ch)
+                        .map(|&x| sanitize(x)),
+                );
             }
         }
         Ok(())
@@ -3262,7 +3289,7 @@ impl AacEncoder {
     pub fn push_pcm_planar(&mut self, planes: &[&[f32]], sample_rate: u32) -> Result<()> {
         self.init(planes.len() as u16, sample_rate)?;
         for (c, plane) in planes.iter().enumerate().take(self.channels) {
-            self.chans[c].extend_from_slice(plane);
+            self.chans[c].extend(plane.iter().map(|&x| sanitize(x)));
         }
         Ok(())
     }
@@ -3527,7 +3554,12 @@ impl AacEncoder {
         // Per-channel ICS-body budget from the target bitrate (minus framing).
         let frame_budget = (self.bitrate as usize * FRAME_LEN / self.sample_rate.max(1) as usize)
             .saturating_sub(59); // ADTS header (56) + END (3)
-        let per_channel = (frame_budget / self.channels.max(1)).saturating_sub(7); // element overhead
+                                 // Never above the decoder input buffer (ISO 14496-3 §4.5.3: 6144 bits per
+                                 // channel) less the element and framing overhead: an absurd bitrate must
+                                 // not yield a block a conforming decoder cannot hold.
+        let per_channel = (frame_budget / self.channels.max(1))
+            .saturating_sub(7) // element overhead
+            .min(MAX_CHANNEL_BITS);
 
         // The ISO element sequence for this channel count (validated at init, so
         // the unwrap cannot fire here).
