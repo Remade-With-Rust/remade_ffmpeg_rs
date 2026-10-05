@@ -1130,6 +1130,8 @@ impl SbrChannelState {
 #[derive(Clone)]
 struct Work {
     x_low: Vec<[Cpx; 40]>,
+    /// Rows of `x_low` at and above this are all zero (see `lf_gen`).
+    x_low_rows: usize,
     x_high: Vec<[Cpx; 40]>,
     alpha0: [Cpx; 64],
     alpha1: [Cpx; 64],
@@ -1146,6 +1148,7 @@ impl Work {
     fn new() -> Work {
         Work {
             x_low: vec![[[0.0; 2]; 40]; 32],
+            x_low_rows: 0,
             x_high: vec![[[0.0; 2]; 40]; 64],
             alpha0: [[0.0; 2]; 64],
             alpha1: [[0.0; 2]; 64],
@@ -1261,9 +1264,24 @@ impl SbrChannelState {
     fn lf_gen(&self, wk: &mut Work, ch: usize, buf_idx: usize, nts: usize) {
         let d = &self.data[ch];
         let i_f = 2 * nts;
-        for row in wk.x_low.iter_mut() {
-            *row = [[0.0; 2]; 40];
+        // Every element gets exactly one write, data or zero: in each row the
+        // spans the copies below leave alone are zeroed, and rows past both
+        // crossovers only if an earlier call left data there (`x_low_rows`).
+        // A blanket zero fill of all 32x40 first was ~10 KB of memset per
+        // channel per frame, most of it overwritten at once.
+        let (kx0, kx1) = (self.kx[0], self.kx[1]);
+        let live = kx0.max(kx1);
+        let rows = live.max(wk.x_low_rows).min(wk.x_low.len());
+        for (k, row) in wk.x_low[..rows].iter_mut().enumerate() {
+            if k >= kx0 {
+                row[..HF_GEN].fill([0.0; 2]);
+            }
+            if k >= kx1 {
+                row[HF_GEN..i_f + HF_GEN].fill([0.0; 2]);
+            }
+            row[i_f + HF_GEN..].fill([0.0; 2]);
         }
+        wk.x_low_rows = live;
         for k in 0..self.kx[1] {
             for i in HF_GEN..i_f + HF_GEN {
                 wk.x_low[k][i] = d.w[buf_idx][i - HF_GEN][k];
