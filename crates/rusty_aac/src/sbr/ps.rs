@@ -647,6 +647,8 @@ pub(crate) struct PsState {
     /// The hybrid-domain left/right matrices, kept across frames (see `apply`).
     lbuf: Vec<[Cpx; 32]>,
     rbuf: Vec<[Cpx; 32]>,
+    /// Decorrelation's per-parameter-band transient gains (see `decorrelation`).
+    gain: Vec<[f32; 32]>,
     peak_decay_nrg: [f32; 34],
     power_smooth: [f32; 34],
     peak_decay_diff_smooth: [f32; 34],
@@ -684,6 +686,7 @@ impl PsState {
             ap_delay: vec![[[[0.0; 2]; QMF_SLOTS + MAX_AP_DELAY]; AP_LINKS]; 50],
             lbuf: vec![[[0.0; 2]; 32]; MAX_SSB],
             rbuf: vec![[[0.0; 2]; 32]; MAX_SSB],
+            gain: vec![[0.0; 32]; 34],
             peak_decay_nrg: [0.0; 34],
             power_smooth: [0.0; 34],
             peak_decay_diff_smooth: [0.0; 34],
@@ -1110,7 +1113,9 @@ impl PsState {
                 p[n] += s[k][n][0] * s[k][n][0] + s[k][n][1] * s[k][n][1];
             }
         }
-        let mut gain = [[0f32; 32]; 34];
+        // Persistent, not a zeroed stack array per call: every cell read below
+        // (rows < NR_PAR_BANDS, slots < len) is written first.
+        let mut gain = std::mem::take(&mut self.gain);
         for i in 0..NR_PAR_BANDS[i34] {
             for n in 0..len {
                 let decayed = PEAK_DECAY * self.peak_decay_nrg[i];
@@ -1169,6 +1174,7 @@ impl PsState {
                 out[k][n] = [x[0] * g[n], x[1] * g[n]];
             }
         }
+        self.gain = gain;
     }
 }
 
