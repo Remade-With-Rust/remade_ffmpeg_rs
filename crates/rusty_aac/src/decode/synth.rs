@@ -244,7 +244,10 @@ pub fn imdct_and_window(
         dsp::imdct_half(&s.coeffs[..l], &mut buf[..l], OUT_NORM);
     }
 
-    let mut temp = vec![0f32; sh];
+    // Short-window scratch: a stack array (sh <= 128), not a zeroed heap `vec!`
+    // per call - and only the eight-short path writes and reads it.
+    let mut temp = [0f32; 128];
+    let temp = &mut temp[..sh];
     if is_long_end(s.prev_seq)
         && matches!(s.seq, WindowSequence::OnlyLong | WindowSequence::LongStart)
     {
@@ -253,16 +256,26 @@ pub fn imdct_and_window(
         out[..ov].copy_from_slice(&saved[..ov]);
         if s.seq == WindowSequence::EightShort {
             fmul_window(&mut out[ov..], &saved[ov..], &buf[..], swin_prev, hs);
+            // The sources are read straight from `buf`: the destinations
+            // (`out`, `temp`, `saved`) never alias it, so the per-window
+            // `.to_vec()` copies were pure overhead.
             for k in 1..4 {
                 let (a, b) = ((k - 1) * sh + hs, k * sh);
-                let (src0, src1) = (buf[a..a + hs].to_vec(), buf[b..b + hs].to_vec());
-                fmul_window(&mut out[ov + k * sh..], &src0, &src1, swin, hs);
+                fmul_window(
+                    &mut out[ov + k * sh..],
+                    &buf[a..a + hs],
+                    &buf[b..b + hs],
+                    swin,
+                    hs,
+                );
             }
-            let (src0, src1) = (
-                buf[3 * sh + hs..4 * sh].to_vec(),
-                buf[4 * sh..4 * sh + hs].to_vec(),
+            fmul_window(
+                temp,
+                &buf[3 * sh + hs..4 * sh],
+                &buf[4 * sh..4 * sh + hs],
+                swin,
+                hs,
             );
-            fmul_window(&mut temp, &src0, &src1, swin, hs);
             out[ov + 4 * sh..ov + 4 * sh + hs].copy_from_slice(&temp[..hs]);
         } else {
             fmul_window(&mut out[ov..], &saved[ov..], &buf[..], swin_prev, hs);
@@ -275,8 +288,13 @@ pub fn imdct_and_window(
             saved[..hs].copy_from_slice(&temp[hs..sh]);
             for k in 0..3 {
                 let (a, b) = ((4 + k) * sh + hs, (5 + k) * sh);
-                let (src0, src1) = (buf[a..a + hs].to_vec(), buf[b..b + hs].to_vec());
-                fmul_window(&mut saved[hs + k * sh..], &src0, &src1, swin, hs);
+                fmul_window(
+                    &mut saved[hs + k * sh..],
+                    &buf[a..a + hs],
+                    &buf[b..b + hs],
+                    swin,
+                    hs,
+                );
             }
             saved[ov..ov + hs].copy_from_slice(&buf[7 * sh + hs..8 * sh]);
         }
