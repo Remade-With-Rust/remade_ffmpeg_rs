@@ -1518,19 +1518,20 @@ impl SbrChannelState {
             let transient = e as i32 == e_a[0] || e as i32 == e_a[1];
             let s_m = &wk.s_m[e];
             for i in 2 * d.t_env[e]..2 * d.t_env[e + 1] {
-                let mut g_filt = [0f32; 48];
-                let mut q_filt = [0f32; 48];
-                if h_sl > 0 && !transient {
+                let (mut g_sm, mut q_sm) = ([0f32; 48], [0f32; 48]);
+                // Unsmoothed, the filtered gains ARE history rows: borrow them
+                // rather than copy them out (two memcpy calls per slot).
+                let (g_filt, q_filt): (&[f32; 48], &[f32; 48]) = if h_sl > 0 && !transient {
                     for m in 0..m_max {
                         for (j, h) in H_SMOOTH.iter().enumerate() {
-                            g_filt[m] += d.g_temp[i + h_sl - j][m] * h;
-                            q_filt[m] += d.q_temp[i + h_sl - j][m] * h;
+                            g_sm[m] += d.g_temp[i + h_sl - j][m] * h;
+                            q_sm[m] += d.q_temp[i + h_sl - j][m] * h;
                         }
                     }
+                    (&g_sm, &q_sm)
                 } else {
-                    g_filt[..m_max].copy_from_slice(&d.g_temp[i + h_sl][..m_max]);
-                    q_filt[..m_max].copy_from_slice(&d.q_temp[i][..m_max]);
-                }
+                    (&d.g_temp[i + h_sl], &d.q_temp[i])
+                };
                 let y = &mut d.y[ypos][i];
                 for m in 0..m_max {
                     let xh = wk.x_high[kx + m][i + ENV_ADJ];
