@@ -839,25 +839,37 @@ struct Xpow {
 impl Xpow {
     fn new(spec: &[f32]) -> Xpow {
         let _prof = prof::scope(Stage::EncXpow);
-        let mut pow = vec![0f64; spec.len()];
-        let mut sign = vec![0i32; spec.len()];
+        // Both arrays are built straight into fresh capacity: every element is
+        // computed, so the zero fill of a `vec![0; n]` (two per channel per
+        // frame, 12 KB) was pure overhead.
+        let n = spec.len();
         #[cfg(all(feature = "simd", target_arch = "x86_64"))]
         {
             if has_avx2() {
-                // SAFETY: runtime AVX2 check; `pow`/`sign` are `spec.len()` long.
-                unsafe { xpow_avx2(spec, &mut pow, &mut sign) };
-                prof::count(Kernel::Xpow, true, spec.len());
+                let (mut pow, mut sign) = (Vec::with_capacity(n), Vec::with_capacity(n));
+                // SAFETY: runtime AVX2 check; both buffers have capacity `n`, the
+                // twin writes all `n` elements of each, and only then is the
+                // length set.
+                unsafe {
+                    xpow_avx2_raw(spec, pow.as_mut_ptr(), sign.as_mut_ptr());
+                    pow.set_len(n);
+                    sign.set_len(n);
+                }
+                prof::count(Kernel::Xpow, true, n);
                 return Xpow { pow, sign };
             }
         }
-        prof::count(Kernel::Xpow, false, spec.len());
-        for (i, &x) in spec.iter().enumerate() {
-            // |x|^0.75 = |x|^½·|x|^¼ = √|x|·√√|x| — two sqrts vectorize; `powf` doesn't.
-            // (For x=0, pow=0 so the sign is irrelevant — the quant is 0 either way.)
-            let s = (x.abs() as f64).sqrt();
-            pow[i] = s * s.sqrt();
-            sign[i] = if x < 0.0 { -1 } else { 1 };
-        }
+        prof::count(Kernel::Xpow, false, n);
+        // |x|^0.75 = |x|^½·|x|^¼ = √|x|·√√|x| — two sqrts vectorize; `powf` doesn't.
+        // (For x=0, pow=0 so the sign is irrelevant — the quant is 0 either way.)
+        let pow = spec
+            .iter()
+            .map(|&x| {
+                let s = (x.abs() as f64).sqrt();
+                s * s.sqrt()
+            })
+            .collect();
+        let sign = spec.iter().map(|&x| if x < 0.0 { -1 } else { 1 }).collect();
         Xpow { pow, sign }
     }
 
@@ -1106,7 +1118,21 @@ unsafe fn quantize_band_avx512(pow: &[f64], sign: &[i32], scale: f64, out: &mut 
 /// `sign[i] = ±1` from the sign bit — four coefficients per iteration.
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
+#[cfg(test)]
 unsafe fn xpow_avx2(spec: &[f32], pow: &mut [f64], sign: &mut [i32]) {
+    assert!(pow.len() >= spec.len() && sign.len() >= spec.len());
+    xpow_avx2_raw(spec, pow.as_mut_ptr(), sign.as_mut_ptr());
+}
+
+/// [`xpow_avx2`] through raw pointers, so `Xpow::new` can fill uninitialised
+/// capacity.
+///
+/// # Safety
+/// AVX2 must be available, and `pow` / `sign` must be valid for `spec.len()`
+/// writes; every one of those elements is written.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn xpow_avx2_raw(spec: &[f32], pow: *mut f64, sign: *mut i32) {
     use std::arch::x86_64::*;
     let n = spec.len();
     let absmask = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7fff_ffff_ffff_ffffu64 as i64));
@@ -1116,19 +1142,16 @@ unsafe fn xpow_avx2(spec: &[f32], pow: &mut [f64], sign: &mut [i32]) {
         let x = _mm256_cvtps_pd(_mm_loadu_ps(spec.as_ptr().add(i))); // 4 f32 → 4 f64
         let a = _mm256_and_pd(x, absmask); // |x|
         let s = _mm256_sqrt_pd(a); // |x|^½
-        _mm256_storeu_pd(pow.as_mut_ptr().add(i), _mm256_mul_pd(s, _mm256_sqrt_pd(s)));
+        _mm256_storeu_pd(pow.add(i), _mm256_mul_pd(s, _mm256_sqrt_pd(s)));
         // ±1.0 carrying x's sign bit → i32 (x=0 gives +1; harmless, pow is 0).
         let signed = _mm256_or_pd(one, _mm256_andnot_pd(absmask, x));
-        _mm_storeu_si128(
-            sign.as_mut_ptr().add(i) as *mut __m128i,
-            _mm256_cvttpd_epi32(signed),
-        );
+        _mm_storeu_si128(sign.add(i) as *mut __m128i, _mm256_cvttpd_epi32(signed));
         i += 4;
     }
     while i < n {
         let s = (spec[i].abs() as f64).sqrt();
-        pow[i] = s * s.sqrt();
-        sign[i] = if spec[i] < 0.0 { -1 } else { 1 };
+        pow.add(i).write(s * s.sqrt());
+        sign.add(i).write(if spec[i] < 0.0 { -1 } else { 1 });
         i += 1;
     }
 }
