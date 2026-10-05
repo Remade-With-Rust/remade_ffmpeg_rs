@@ -209,6 +209,51 @@ unsafe fn split_slot_avx(slot: &[Cpx], xr: &mut [f32; 64], xi: &mut [f32; 64]) {
     }
 }
 
+/// The synthesis butterfly: `v[i] = (s1[63−i] − s0[i])/64` and
+/// `v[127−i] = (s1[63−i] + s0[i])/64`.
+#[inline]
+fn dct_post(p: &Plans, s0: &[f32; 64], s1: &[f32; 64], v: &mut [f32; 128]) {
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    if p.avx {
+        // SAFETY: AVX detected in `plans()`; fixed-size arrays.
+        unsafe { dct_post_avx(s0, s1, v) };
+        return;
+    }
+    let _ = p;
+    dct_post_scalar(s0, s1, v);
+}
+
+/// The scalar oracle of [`dct_post`].
+fn dct_post_scalar(s0: &[f32; 64], s1: &[f32; 64], v: &mut [f32; 128]) {
+    for i in 0..64 {
+        v[i] = (s1[63 - i] - s0[i]) * (1.0 / 64.0);
+        v[127 - i] = (s1[63 - i] + s0[i]) * (1.0 / 64.0);
+    }
+}
+
+/// AVX twin of [`dct_post`]: eight `i` per trip, `s1` read reversed and the
+/// mirrored half stored reversed; same differences, sums and scale, so
+/// bit-identical (`dct_post_matches_scalar`).
+///
+/// # Safety
+/// AVX must be available.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx")]
+unsafe fn dct_post_avx(s0: &[f32; 64], s1: &[f32; 64], v: &mut [f32; 128]) {
+    use std::arch::x86_64::*;
+    let rev = |x: __m256| _mm256_permute_ps::<0x1B>(_mm256_permute2f128_ps::<0x01>(x, x));
+    let (p0, p1, vp) = (s0.as_ptr(), s1.as_ptr(), v.as_mut_ptr());
+    let c = _mm256_set1_ps(1.0 / 64.0);
+    let mut i = 0;
+    while i < 64 {
+        let a = _mm256_loadu_ps(p0.add(i));
+        let b = rev(_mm256_loadu_ps(p1.add(56 - i))); // lane k: s1[63 − i − k]
+        _mm256_storeu_ps(vp.add(i), _mm256_mul_ps(_mm256_sub_ps(b, a), c));
+        _mm256_storeu_ps(vp.add(120 - i), rev(_mm256_mul_ps(_mm256_add_ps(b, a), c)));
+        i += 8;
+    }
+}
+
 /// 64-band (or downsampled 32-band) QMF synthesis of `2·nts` slots. `v` is a
 /// FIFO of 20 blocks of `vlen` samples (newest first) with a moving offset,
 /// so a slot costs no shift: the window reads ten blocks from `off`.
@@ -246,10 +291,7 @@ pub(super) fn qmf_synthesis(
         split_slot(p, &slot[..bands], &mut xr, &mut xi);
         p.dct64.dct4(&xr, &mut s0, &mut scratch);
         p.dct64.dct4(&xi, &mut s1, &mut scratch);
-        for i in 0..64 {
-            v64[i] = (s1[63 - i] - s0[i]) * (1.0 / 64.0);
-            v64[127 - i] = (s1[63 - i] + s0[i]) * (1.0 / 64.0);
-        }
+        dct_post(p, &s0, &s1, &mut v64);
         let dst = &mut v.buf[off..off + vlen];
         if ds {
             for (n, d) in dst.iter_mut().enumerate() {
@@ -466,6 +508,24 @@ mod tests {
             let bits = |x: &[f32; 64]| x.map(f32::to_bits);
             assert_eq!(bits(&ar), bits(&br), "re bands {bands}");
             assert_eq!(bits(&ai), bits(&bi), "im bands {bands}");
+        }
+    }
+
+    #[test]
+    fn dct_post_matches_scalar() {
+        let p = plans();
+        let mut seed = 0x1234_5679u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 23) as f32 * 2.0 - 1.0
+        };
+        for _ in 0..100 {
+            let s0: [f32; 64] = std::array::from_fn(|_| rnd() * 1e4);
+            let s1: [f32; 64] = std::array::from_fn(|_| rnd() * 1e4);
+            let (mut a, mut b) = ([0f32; 128], [0f32; 128]);
+            dct_post(p, &s0, &s1, &mut a);
+            dct_post_scalar(&s0, &s1, &mut b);
+            assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits));
         }
     }
 
