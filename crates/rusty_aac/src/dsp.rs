@@ -13,6 +13,7 @@
 #![allow(dead_code)]
 
 use std::f64::consts::PI;
+use std::mem::MaybeUninit;
 use std::sync::OnceLock;
 
 /// Inverse quantization of a spectral coefficient (ISO 14496-3 §10.3):
@@ -789,6 +790,34 @@ impl Pow2Dct4 {
         }
     }
 
+    /// [`Self::rotate_in`] into scratch that need not be initialised: writes
+    /// `v[..L/2]` and returns it as initialised, so callers skip a zero fill
+    /// whose every element this overwrites. A separate body on purpose: routing
+    /// `dct4` (the QMF synthesis, ~96K calls on HE v1) through this form cost
+    /// HE v1 +1.66M / HE v2 +0.84M while LC saved 970K.
+    #[inline(always)]
+    fn rotate_in_uninit<'a>(
+        &self,
+        x: &[f32],
+        v: &'a mut [MaybeUninit<[f32; 2]>],
+    ) -> &'a mut [[f32; 2]] {
+        let m = self.l / 2;
+        let v = &mut v[..m];
+        let x = &x[..self.l];
+        for (((vp, a), b), &[c, s]) in v
+            .iter_mut()
+            .zip(x.chunks_exact(2))
+            .zip(x.rchunks_exact(2))
+            .zip(&self.pre)
+        {
+            let (yr, yi) = (a[0], b[1]);
+            vp.write([yr * c + yi * s, yi * c - yr * s]);
+        }
+        // SAFETY: `pre` has `m` entries and `x` gives `m` pairs, so the loop
+        // wrote every element of `v`.
+        unsafe { &mut *(v as *mut [MaybeUninit<[f32; 2]>] as *mut [[f32; 2]]) }
+    }
+
     /// The unscaled DCT-IV: `out[m] = Σ x[k]·cos(π/L·(m+½)(k+½))`, using
     /// `scratch` (at least L/2 entries) for the FFT.
     pub(crate) fn dct4(&self, x: &[f32], out: &mut [f32], scratch: &mut [[f32; 2]]) {
@@ -810,21 +839,23 @@ impl Pow2Dct4 {
 
     /// As [`imdct_half`]: `out[k] = -(D·X)[L-1-k]·gain/L`.
     fn imdct_half(&self, spec: &[f32], out: &mut [f32], gain: f32) {
-        let m = self.l / 2;
-        // A stack scratch sized to the call: zero-filling a worst-case 1024-entry
-        // array cost 8 KB of memset per short window, whose need is 512 bytes.
-        match m {
-            0..=64 => self.imdct_half_in(spec, out, gain, &mut [[0f32; 2]; 64]),
-            65..=512 => self.imdct_half_in(spec, out, gain, &mut [[0f32; 2]; 512]),
-            _ => self.imdct_half_in(spec, out, gain, &mut [[0f32; 2]; 1024]),
-        }
+        // Stack scratch, left uninitialised: `rotate_in_uninit` writes all of
+        // `buf[..L/2]` before anything reads it, so a zero fill (once ~4K Ir per
+        // call) was pure waste. 1024 covers every plan (`pow2_dct4` builds
+        // L <= 2048); a longer one would panic on the slice, not misbehave.
+        let mut buf = [MaybeUninit::<[f32; 2]>::uninit(); 1024];
+        self.imdct_half_in(spec, out, gain, &mut buf);
     }
 
     #[inline(always)]
-    fn imdct_half_in(&self, spec: &[f32], out: &mut [f32], gain: f32, buf: &mut [[f32; 2]]) {
-        let m = self.l / 2;
-        let v = &mut buf[..m];
-        self.rotate_in(spec, v);
+    fn imdct_half_in(
+        &self,
+        spec: &[f32],
+        out: &mut [f32],
+        gain: f32,
+        buf: &mut [MaybeUninit<[f32; 2]>],
+    ) {
+        let v = self.rotate_in_uninit(spec, buf);
         self.fft.run(v);
         let scale = gain / self.l as f32;
         // out[2q] = -(D·X)[L-1-2q]·s from v[q]; out[2q+1] = -(D·X)[2p]·s, p = m-1-q.
