@@ -70,24 +70,85 @@ pub(super) fn qmf_analysis(input: &[f32], hist: &mut [f32], w: &mut [[Cpx; 32]; 
         *b = s * 32768.0;
     }
     let mut a = [[0f32; 2]; 64];
-    let mut t = [0f32; 320];
     for (l, slot) in w.iter_mut().enumerate().take(2 * nts) {
-        // With x[n] newest first (x[n] = seg[319−n]), z(n) = x(n)·c(2n) is the
-        // time-ordered segment times the reversed window; u(n) = Σ_j z(n+64j).
-        let seg = &buf[32 * l..32 * l + 320];
-        for ((tq, &x), &c) in t.iter_mut().zip(seg).zip(&p.ana_win) {
-            *tq = x * c;
-        }
-        for n in 0..64 {
-            let u = t[319 - n] + t[255 - n] + t[191 - n] + t[127 - n] + t[63 - n];
-            a[n] = [u * p.ana_pre[n][0], u * p.ana_pre[n][1]];
-        }
+        ana_fold(p, &buf[32 * l..32 * l + 320], &mut a);
         p.fft64.run(&mut a);
         for (k, out) in slot.iter_mut().enumerate() {
             *out = cmul(a[k], p.ana_post[k]);
         }
     }
     hist.copy_from_slice(&buf[ns..ns + 288]);
+}
+
+/// The analysis front end for one slot: window the 320-sample segment, fold it
+/// to 64 and apply the pre-twiddle, `a[n] = u(n)·ana_pre[n]`.
+#[inline]
+fn ana_fold(p: &Plans, seg: &[f32], a: &mut [Cpx; 64]) {
+    let seg = &seg[..320];
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    if p.avx {
+        // SAFETY: AVX detected in `plans()`; `seg`, `ana_win` (320) and
+        // `ana_pre` (64) are exactly the lengths `ana_fold_avx` reads.
+        unsafe { ana_fold_avx(p, seg, a) };
+        return;
+    }
+    ana_fold_scalar(p, seg, a);
+}
+
+/// The scalar oracle of [`ana_fold`].
+fn ana_fold_scalar(p: &Plans, seg: &[f32], a: &mut [Cpx; 64]) {
+    // With x[n] newest first (x[n] = seg[319−n]), z(n) = x(n)·c(2n) is the
+    // time-ordered segment times the reversed window; u(n) = Σ_j z(n+64j).
+    let mut t = [0f32; 320];
+    for ((tq, &x), &c) in t.iter_mut().zip(seg).zip(&p.ana_win) {
+        *tq = x * c;
+    }
+    for n in 0..64 {
+        let u = t[319 - n] + t[255 - n] + t[191 - n] + t[127 - n] + t[63 - n];
+        a[n] = [u * p.ana_pre[n][0], u * p.ana_pre[n][1]];
+    }
+}
+
+/// AVX twin of [`ana_fold`]. With `m = 63 − n` the fold is the forward sum
+/// `t[256+m] + t[192+m] + t[128+m] + t[64+m] + t[m]` (the scalar's order), the
+/// window product fused in; eight `m` per trip, then one lane reversal puts
+/// them in `n` order and each `u` is doubled into its complex pair for the
+/// pre-twiddle product. Same products and sums, so bit-identical
+/// (`ana_fold_matches_scalar`).
+///
+/// # Safety
+/// AVX must be available; `seg.len() >= 320`, `p.ana_win.len() == 320`,
+/// `p.ana_pre.len() == 64`.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx")]
+unsafe fn ana_fold_avx(p: &Plans, seg: &[f32], a: &mut [Cpx; 64]) {
+    use std::arch::x86_64::*;
+    let (s, w) = (seg.as_ptr(), p.ana_win.as_ptr());
+    let (pre, ap) = (p.ana_pre.as_ptr() as *const f32, a.as_mut_ptr() as *mut f32);
+    let tz = |k: usize| _mm256_mul_ps(_mm256_loadu_ps(s.add(k)), _mm256_loadu_ps(w.add(k)));
+    let mut m = 0;
+    while m < 64 {
+        let mut u = tz(256 + m);
+        u = _mm256_add_ps(u, tz(192 + m));
+        u = _mm256_add_ps(u, tz(128 + m));
+        u = _mm256_add_ps(u, tz(64 + m));
+        u = _mm256_add_ps(u, tz(m));
+        // Lane k holds u(63 − m − k); reverse so lane k is u(n0 + k).
+        let r = _mm256_permute_ps::<0x1B>(_mm256_permute2f128_ps::<0x01>(u, u));
+        let (lo, hi) = (_mm256_unpacklo_ps(r, r), _mm256_unpackhi_ps(r, r));
+        let n0 = 56 - m;
+        let d0 = _mm256_permute2f128_ps::<0x20>(lo, hi);
+        let d1 = _mm256_permute2f128_ps::<0x31>(lo, hi);
+        _mm256_storeu_ps(
+            ap.add(2 * n0),
+            _mm256_mul_ps(d0, _mm256_loadu_ps(pre.add(2 * n0))),
+        );
+        _mm256_storeu_ps(
+            ap.add(2 * n0 + 8),
+            _mm256_mul_ps(d1, _mm256_loadu_ps(pre.add(2 * n0 + 8))),
+        );
+        m += 8;
+    }
 }
 
 /// 64-band (or downsampled 32-band) QMF synthesis of `2·nts` slots. `v` is a
@@ -313,6 +374,24 @@ impl QmfSynthState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ana_fold_matches_scalar() {
+        let mut seed = 0x2545_f491u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 23) as f32 * 2.0 - 1.0
+        };
+        let p = plans();
+        for _ in 0..200 {
+            let seg: Vec<f32> = (0..320).map(|_| rnd() * 32768.0).collect();
+            let (mut a, mut b) = ([[0f32; 2]; 64], [[0f32; 2]; 64]);
+            ana_fold(p, &seg, &mut a);
+            ana_fold_scalar(p, &seg, &mut b);
+            let bits = |x: &[Cpx; 64]| x.iter().flatten().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&a), bits(&b));
+        }
+    }
 
     #[test]
     fn qmf_window_matches_scalar() {
