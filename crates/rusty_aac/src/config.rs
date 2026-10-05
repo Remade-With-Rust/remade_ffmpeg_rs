@@ -42,13 +42,14 @@ pub const SAMPLE_RATES: [u32; 13] = [
 
 /// The table index a decoder uses for a rate (ISO 14496-3 Table 4.82): exact rates
 /// map to themselves, an escaped non-standard rate to the nearest table set.
+#[must_use]
 pub fn sf_index_for_any_rate(rate: u32) -> u8 {
-    if let Some(i) = SAMPLE_RATES.iter().position(|&r| r == rate) {
-        return i as u8;
-    }
     const EDGES: [u32; 11] = [
         92017, 75132, 55426, 46009, 37566, 27713, 23004, 18783, 13856, 11502, 9391,
     ];
+    if let Some(i) = SAMPLE_RATES.iter().position(|&r| r == rate) {
+        return i as u8;
+    }
     EDGES.iter().position(|&e| rate >= e).unwrap_or(11) as u8
 }
 
@@ -91,6 +92,7 @@ pub struct Pce {
 
 impl Pce {
     /// Total output channels the program describes.
+    #[must_use]
     pub fn channels(&self) -> usize {
         let pairs = |v: &[PceElement]| v.iter().map(|e| 1 + usize::from(e.is_cpe)).sum::<usize>();
         pairs(&self.front) + pairs(&self.side) + pairs(&self.back) + self.lfe.len()
@@ -98,6 +100,10 @@ impl Pce {
 
     /// Parse a PCE. `align_base` is the bit position `byte_alignment()` is
     /// relative to (the start of the enclosing config or access unit).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] if the element is truncated or malformed.
     pub fn parse(r: &mut BitReader, align_base: usize) -> Result<Self> {
         let tag = r.read_bits(4)? as u8;
         Self::parse_after_tag(r, tag, align_base)
@@ -105,6 +111,10 @@ impl Pce {
 
     /// Parse a PCE whose `element_instance_tag` was already read (the in-band
     /// form, where the tag rides in the `raw_data_block` element header).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] if the element is truncated or malformed.
     pub fn parse_after_tag(r: &mut BitReader, tag: u8, align_base: usize) -> Result<Self> {
         let mut p = Self {
             element_instance_tag: tag,
@@ -183,6 +193,10 @@ pub struct SbrHeader {
 
 impl SbrHeader {
     /// Parse `sbr_header()`; absent optional groups take their spec defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] if the header is truncated.
     pub fn parse(r: &mut BitReader) -> Result<Self> {
         let mut h = Self {
             bs_amp_res: r.read_bits(1)? as u8,
@@ -209,6 +223,7 @@ impl SbrHeader {
     }
 
     /// Defaults the spec assigns when `bs_header_extra_1/2` are 0.
+    #[must_use]
     pub fn defaults() -> Self {
         Self {
             bs_amp_res: 1,
@@ -276,6 +291,7 @@ pub struct StreamConfig {
 impl StreamConfig {
     /// A plain AAC-LC configuration (what an ADTS header or the simple
     /// `AudioSpecificConfig` describes).
+    #[must_use]
     pub fn lc(object_type: u8, sample_rate: u32, channel_config: u8) -> Self {
         Self {
             object_type,
@@ -300,6 +316,7 @@ impl StreamConfig {
     }
 
     /// Is this an error-resilient (ER) object type, i.e. `er_raw_data_block`?
+    #[must_use]
     pub fn is_er(&self) -> bool {
         matches!(
             self.object_type,
@@ -308,6 +325,7 @@ impl StreamConfig {
     }
 
     /// Channels described by the configuration (0 if unknown).
+    #[must_use]
     pub fn channels(&self) -> usize {
         if let Some(p) = &self.pce {
             return p.channels();
@@ -318,6 +336,7 @@ impl StreamConfig {
 
 /// Output channel count of a `channelConfiguration` (ISO Table 1.19, plus the
 /// 23003-3 additions 11-14).
+#[must_use]
 pub fn channels_for_config(cc: u8) -> usize {
     match cc {
         1..=6 => cc as usize,
@@ -368,6 +387,12 @@ fn sbr_elements_for_config(cc: u8) -> usize {
 }
 
 /// Parse a complete `AudioSpecificConfig` from its raw bytes.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidData`] for a truncated or malformed config and
+/// [`Error::Unsupported`] for an object type or layout outside the decoded family
+/// (e.g. USAC).
 pub fn parse(data: &[u8]) -> Result<StreamConfig> {
     let mut r = BitReader::new(data);
     parse_from(&mut r, 0)
@@ -375,6 +400,10 @@ pub fn parse(data: &[u8]) -> Result<StreamConfig> {
 
 /// Parse from a reader positioned at an `AudioSpecificConfig` (e.g. inside a LATM
 /// `StreamMuxConfig`). `align_base` is the bit position the config starts at.
+///
+/// # Errors
+///
+/// As [`parse`].
 pub fn parse_from(r: &mut BitReader, align_base: usize) -> Result<StreamConfig> {
     parse_from_opts(r, align_base, true)
 }
@@ -383,6 +412,10 @@ pub fn parse_from(r: &mut BitReader, align_base: usize) -> Result<StreamConfig> 
 /// SBR/PS sync extension after the core config. A config embedded in a LATM
 /// `StreamMuxConfig` (audioMuxVersion 0) is followed directly by mux fields, so
 /// probing there would read them as a sync word; the reference does not probe.
+///
+/// # Errors
+///
+/// As [`parse`].
 pub fn parse_from_opts(
     r: &mut BitReader,
     align_base: usize,
@@ -567,10 +600,10 @@ mod tests {
         assert!(!c.sbr && !c.ps);
     }
 
-    /// The real HE-AAC v2 config from the FATE CT_DecoderCheck corpus
+    /// The real HE-AAC v2 config from the FATE `CT_DecoderCheck` corpus
     /// (`eb 8a 08 00`): AOT 29, CORE 22050 Hz, mono, extension 44100 Hz, core
     /// AOT 2. The previous parser read 44100 as the output and halved it to
-    /// 11025 for the core — and then parsed the GASpecificConfig 4 bits early.
+    /// 11025 for the core — and then parsed the `GASpecificConfig` 4 bits early.
     #[test]
     fn hierarchical_ps_core_rate_comes_first() {
         let c = parse(&[0xEB, 0x8A, 0x08, 0x00]).unwrap();

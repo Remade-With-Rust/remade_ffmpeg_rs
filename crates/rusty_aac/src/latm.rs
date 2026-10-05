@@ -49,11 +49,13 @@ pub struct LoasFrame {
 }
 
 /// Does `data` start with a LOAS `audioSyncStream` header?
+#[must_use]
 pub fn is_loas(data: &[u8]) -> bool {
     data.len() >= LOAS_HEADER_LEN && data[0] == 0x56 && (data[1] & 0xE0) == 0xE0
 }
 
 /// Byte offset of the next LOAS syncword, for resynchronising a damaged stream.
+#[must_use]
 pub fn find_sync(data: &[u8]) -> Option<usize> {
     (0..data.len().saturating_sub(LOAS_HEADER_LEN)).find(|&i| is_loas(&data[i..]))
 }
@@ -168,6 +170,12 @@ fn read_stream_mux_config(r: &mut BitReader) -> Result<MuxConfig> {
 /// `StreamMuxConfig` is expected unless `useSameStreamMux` says to reuse the
 /// previous one — which this function cannot do, since it is stateless. Callers
 /// walking a stream should use [`LatmReader`], which carries that state.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidData`] for a malformed or truncated frame and
+/// [`Error::Unsupported`] for multi-program/multi-layer muxes and reserved
+/// versions.
 pub fn parse_loas_frame(data: &[u8]) -> Result<LoasFrame> {
     LatmReader::new().parse(data)
 }
@@ -184,21 +192,28 @@ pub struct LatmReader {
 }
 
 impl LatmReader {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// The most recently seen stream configuration, if any.
+    #[must_use]
     pub fn config(&self) -> Option<AudioSpecificConfig> {
         self.mux.as_ref().map(|m| simple_view(&m.stream))
     }
 
     /// The most recently seen FULL stream configuration (SBR/PS, PCE, ...).
+    #[must_use]
     pub fn stream_config(&self) -> Option<&StreamConfig> {
         self.mux.as_ref().map(|m| &m.stream)
     }
 
     /// Parse one LOAS frame, remembering its `StreamMuxConfig` for later frames.
+    ///
+    /// # Errors
+    ///
+    /// As [`parse_loas_frame`].
     pub fn parse(&mut self, data: &[u8]) -> Result<LoasFrame> {
         if !is_loas(data) {
             return Err(Error::invalid("latm: no audioSyncStream syncword"));
@@ -273,12 +288,21 @@ pub struct LatmDecoder {
 }
 
 impl LatmDecoder {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Decode the LOAS frame at the start of `data`; returns the PCM and the
     /// number of bytes consumed.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`parse_loas_frame`] or of the AAC decode.
+    ///
+    /// # Panics
+    ///
+    /// Never: the decoder slot is filled just before it is used.
     pub fn decode(&mut self, data: &[u8], pts: Option<i64>) -> Result<(DecodedAudio, usize)> {
         let frame = self.reader.parse(data)?;
         let rebuild = match &self.dec {
@@ -301,6 +325,7 @@ impl LatmDecoder {
 /// Every frame gets its own config (`useSameStreamMux = 0`). That costs ~3 bytes
 /// per frame versus the minimum, and buys random access: a receiver can start
 /// decoding at any frame, which is what broadcast actually needs.
+#[must_use]
 pub fn write_loas_frame(cfg: &AudioSpecificConfig, au: &[u8]) -> Vec<u8> {
     let mut w = BitWriter::new();
     // --- AudioMuxElement(muxConfigPresent = 1) ---
@@ -320,12 +345,11 @@ pub fn write_loas_frame(cfg: &AudioSpecificConfig, au: &[u8]) -> Vec<u8> {
     } else {
         w.write(u32::from(cfg.object_type), 5);
     }
-    match crate::sf_index_for_rate(cfg.sample_rate) {
-        Some(i) => w.write(u32::from(i), 4),
-        None => {
-            w.write(0x0F, 4);
-            w.write(cfg.sample_rate, 24);
-        }
+    if let Some(i) = crate::sf_index_for_rate(cfg.sample_rate) {
+        w.write(u32::from(i), 4);
+    } else {
+        w.write(0x0F, 4);
+        w.write(cfg.sample_rate, 24);
     }
     w.write(u32::from(cfg.channels), 4);
     // GASpecificConfig: frameLengthFlag, dependsOnCoreCoder, extensionFlag.
@@ -387,7 +411,7 @@ mod tests {
         assert_eq!(got.frame_length, frame.len());
     }
 
-    /// The 255-escape in PayloadLengthInfo must handle lengths either side of the
+    /// The 255-escape in `PayloadLengthInfo` must handle lengths either side of the
     /// boundary — an off-by-one there truncates or over-reads every large frame.
     #[test]
     fn payload_length_escape_is_exact() {

@@ -21,6 +21,9 @@ use rusty_aac::lab::{corpus, ladder, signals::AacSignals};
 use rusty_aac::{AacEncoderConfig, WindowShape};
 use std::process::ExitCode;
 
+/// One measured arm: its label and the configuration it encodes with at a bitrate.
+type Arm = (&'static str, fn(u32) -> AacEncoderConfig);
+
 // Primary allocator for this target: our rusty_alloc, the pure-Rust mimalloc
 // remake. PROJECT CONVENTION (`CLAUDE.md`) — every encoder-carrying binary,
 // bench and example runs under it, because it is what ships. Examples are a
@@ -33,15 +36,14 @@ static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let show_signals = args.iter().any(|a| a == "--signals");
-    let bitrates: Vec<u32> = args
-        .windows(2)
-        .find(|w| w[0] == "--bitrates")
-        .map(|w| {
+    let bitrates: Vec<u32> = args.windows(2).find(|w| w[0] == "--bitrates").map_or_else(
+        || ladder::DEFAULT_BITRATES.to_vec(),
+        |w| {
             w[1].split(',')
                 .filter_map(|s| s.trim().parse().ok())
                 .collect()
-        })
-        .unwrap_or_else(|| ladder::DEFAULT_BITRATES.to_vec());
+        },
+    );
 
     println!("rusty_aac quality ladder — allocator: rusty_alloc (project default)");
     println!(
@@ -184,7 +186,7 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "--rungs") {
         println!("\nRungs 1-3 — per-class Δaudible% vs the shipped encoder (NEGATIVE = better).");
         println!("Exit criterion is WORST CLASS <= 0, verified per class, never on average.\n");
-        let arms: [(&str, fn(u32) -> AacEncoderConfig); 5] = [
+        let arms: [Arm; 5] = [
             ("A6 PNS", |b| AacEncoderConfig {
                 bitrate_bps: b,
                 pns: true,

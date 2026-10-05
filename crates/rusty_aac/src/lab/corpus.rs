@@ -27,7 +27,7 @@
 
 use core::f32::consts::PI;
 
-/// Sample rate for the whole corpus. 44.1 kHz keeps us on the fs_index the
+/// Sample rate for the whole corpus. 44.1 kHz keeps us on the `fs_index` the
 /// encoder's SWB tables are best exercised at, and matches the MP3/Opus ladders.
 pub const SR: u32 = 44_100;
 
@@ -66,6 +66,7 @@ pub enum Class {
 impl Class {
     /// Stable short name — also the clip key for train/holdout splits, so a split
     /// stays put across rungs (great-gate §4 rule 4).
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Self::SpeechClean => "speech-clean",
@@ -80,11 +81,13 @@ impl Class {
     }
 
     /// True for the two classes synthesized to close a corpus gap.
+    #[must_use]
     pub fn is_gap(self) -> bool {
         matches!(self, Self::QuietDynamic | Self::MixedSpeechMusic)
     }
 
     /// The campaign arms this class is the decisive evidence for.
+    #[must_use]
     pub fn stresses(self) -> &'static [&'static str] {
         match self {
             Self::SpeechClean => &["A3", "A2"],
@@ -99,6 +102,7 @@ impl Class {
     }
 
     /// Every class, in fixed order.
+    #[must_use]
     pub fn all() -> [Self; 8] {
         [
             Self::SpeechClean,
@@ -123,16 +127,19 @@ pub struct Signal {
 }
 
 impl Signal {
+    #[must_use]
     pub fn name(&self) -> &'static str {
         self.class.name()
     }
 
     /// Samples per channel.
+    #[must_use]
     pub fn frames(&self) -> usize {
         self.pcm.len() / self.channels.max(1) as usize
     }
 
     /// De-interleave into one plane per channel.
+    #[must_use]
     pub fn planes(&self) -> Vec<Vec<f32>> {
         let ch = self.channels.max(1) as usize;
         (0..ch)
@@ -141,6 +148,7 @@ impl Signal {
     }
 
     /// Channel 0 as mono — what the NMR metric scores.
+    #[must_use]
     pub fn mono(&self) -> Vec<f32> {
         if self.channels <= 1 {
             self.pcm.clone()
@@ -266,15 +274,12 @@ fn speech_core(n: usize, seed: u32) -> Vec<f32> {
         let f0 = 115.0 + 25.0 * (2.0 * PI * 0.7 * t).sin();
         phase += f0 / SR as f32;
         let excite = match syl {
-            0 | 1 => {
+            0 | 1
                 // Voiced: a narrow glottal pulse once per period.
-                if phase >= 1.0 {
+                if phase >= 1.0 => {
                     phase -= 1.0;
                     1.0
-                } else {
-                    0.0
                 }
-            }
             2 => 0.08 * rng.next(), // unvoiced fricative
             _ => 0.0,               // pause — the silence the reservoir should exploit
         };
@@ -400,6 +405,7 @@ fn mono(class: Class, mut pcm: Vec<f32>, peak: f32) -> Signal {
 }
 
 /// Build one class's signal.
+#[must_use]
 pub fn signal(class: Class) -> Signal {
     match class {
         Class::SpeechClean => mono(class, speech_core(LEN, 0x5EED_0001), 0.7),
@@ -436,12 +442,11 @@ pub fn signal(class: Class) -> Signal {
             rms_normalize(&mut l_src);
             rms_normalize(&mut r_src);
             rms_normalize(&mut centre);
-            const W_MUSIC: f32 = 1.00;
-            const W_CENTRE: f32 = 0.45;
+            let (w_music, w_centre) = (1.00f32, 0.45f32);
             let mut pcm = Vec::with_capacity(LEN * 2);
             for i in 0..LEN {
-                pcm.push(l_src[i] * W_MUSIC + centre[i] * W_CENTRE);
-                pcm.push(r_src[i] * W_MUSIC + centre[i] * W_CENTRE);
+                pcm.push(l_src[i] * w_music + centre[i] * w_centre);
+                pcm.push(r_src[i] * w_music + centre[i] * w_centre);
             }
             normalize(&mut pcm, 0.7);
             Signal {

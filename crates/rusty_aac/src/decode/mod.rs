@@ -125,12 +125,23 @@ pub struct Decoder {
 
 impl Decoder {
     /// A plain AAC-LC decoder at `sample_rate` (layout learned from the stream).
+    ///
+    /// # Panics
+    ///
+    /// Never: an unsupported `sample_rate` falls back to 44.1 kHz, and that
+    /// AAC-LC stereo configuration is always accepted.
+    #[must_use]
     pub fn new(sample_rate: u32) -> Self {
         Self::with_stream_config(StreamConfig::lc(2, sample_rate, 0))
             .unwrap_or_else(|_| Self::with_stream_config(StreamConfig::lc(2, 44100, 0)).unwrap())
     }
 
     /// A decoder for a fully parsed configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] or [`Error::InvalidData`] for a configuration
+    /// this decoder cannot run.
     pub fn with_stream_config(cfg: StreamConfig) -> Result<Self> {
         let syntax = Syntax {
             aot: cfg.object_type,
@@ -202,6 +213,7 @@ impl Decoder {
     }
 
     /// The configuration this decoder runs.
+    #[must_use]
     pub fn stream_config(&self) -> &StreamConfig {
         &self.cfg
     }
@@ -285,11 +297,13 @@ impl Decoder {
     }
 
     /// Whether an SBR fill payload has been seen (implicit HE-AAC signalling).
+    #[must_use]
     pub fn saw_sbr(&self) -> bool {
         self.saw_sbr
     }
 
     /// The output channel count of the current configuration.
+    #[must_use]
     pub fn channels(&self) -> usize {
         self.oc.channels()
     }
@@ -420,12 +434,22 @@ impl Decoder {
     }
 
     /// Decode one access unit (`raw_data_block` or `er_raw_data_block`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] for a malformed access unit and
+    /// [`Error::Unsupported`] for a syntax element this decoder does not implement.
+    /// The decoder stays usable: feed the next access unit.
     pub fn decode(&mut self, au: &[u8], pts: Option<i64>) -> Result<DecodedAudio> {
         Ok(self.decode_block(au, pts)?.0)
     }
 
     /// Decode one block and report how many bytes it occupied (byte-aligned
     /// after its `ID_END`), for containers that pack several per frame.
+    ///
+    /// # Errors
+    ///
+    /// As [`decode`](Self::decode).
     pub fn decode_block(&mut self, au: &[u8], pts: Option<i64>) -> Result<(DecodedAudio, usize)> {
         let mut r = BitReader::new(au);
         if self.cfg.is_er() {
@@ -558,14 +582,13 @@ impl Decoder {
             if !sx.eld() {
                 r.skip(4)?;
             }
-            match row.syn_ele {
-                TYPE_CPE => self.decode_cpe(r, at)?,
-                _ => {
-                    let rng = &mut self.rng;
-                    let el = self.elements[at.0][at.1].as_mut().unwrap();
-                    let sce = &mut el.ch[0];
-                    decode_ics(r, &sx, &mut sce.ics, &mut sce.data, false, rng)?;
-                }
+            if row.syn_ele == TYPE_CPE {
+                self.decode_cpe(r, at)?;
+            } else {
+                let rng = &mut self.rng;
+                let el = self.elements[at.0][at.1].as_mut().unwrap();
+                let sce = &mut el.ch[0];
+                decode_ics(r, &sx, &mut sce.ics, &mut sce.data, false, rng)?;
             }
         }
         // An ELD frame with low-delay SBR carries the LD-SBR payload after the
@@ -943,7 +966,7 @@ impl Decoder {
         }
     }
 
-    fn apply_ltp(&mut self, sce: &mut Sce) {
+    fn apply_ltp(&self, sce: &mut Sce) {
         if sce.ics.info.window_sequence == WindowSequence::EightShort {
             return;
         }
@@ -1068,6 +1091,7 @@ impl Decoder {
     }
 
     /// The current output sample rate.
+    #[must_use]
     pub fn output_sample_rate(&self) -> u32 {
         if self.output_len() > self.frame_samples() {
             self.cfg.sample_rate * 2
@@ -1085,8 +1109,7 @@ impl Decoder {
             .map(|&(ty, iid, sub)| {
                 self.elements[ty as usize][iid as usize]
                     .as_ref()
-                    .map(|e| &e.ch[sub as usize].output[..n])
-                    .unwrap_or(&[])
+                    .map_or(&[][..], |e| &e.ch[sub as usize].output[..n])
             })
             .collect();
         for i in 0..n {

@@ -1,5 +1,5 @@
 //! `aacconf` — the decoder CONFORMANCE census: every stream in a corpus directory,
-//! decoded by rusty_aac and scored against two independent references.
+//! decoded by `rusty_aac` and scored against two independent references.
 //!
 //! ```text
 //! cargo run -p rusty_aac --release --example aacconf -- <corpus_dir> [--gen] [--filter S] [-v]
@@ -22,6 +22,7 @@
 //! Verdicts, per reference: `EXACT` max |diff| <= 1 LSB (s16), `NEAR` SNR >= 70 dB,
 //! `FAIL` otherwise; `ERR <msg>` when the decoder refused the stream.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -85,7 +86,7 @@ fn probe(f: &str) -> Result<Probe, String> {
     })
 }
 
-/// The stream's extradata (the AudioSpecificConfig for MP4/3GP), from
+/// The stream's extradata (the `AudioSpecificConfig` for MP4/3GP), from
 /// `ffprobe -show_data`'s hexdump.
 fn extradata(f: &str) -> Result<Vec<u8>, String> {
     let o = run(
@@ -380,7 +381,7 @@ fn chan_matrix(ours: &[i32], refr: &[i32], ch: usize, lag: i64) -> String {
                 best = (snr, j);
             }
         }
-        out.push_str(&format!(" ours{i}->ref{}({:.0}dB)", best.1, best.0));
+        let _ = write!(out, " ours{i}->ref{}({:.0}dB)", best.1, best.0);
     }
     out
 }
@@ -427,7 +428,7 @@ fn apply_known(k: &Known, ours: &[i32], refr: &[i32], ch: usize) -> (Vec<i32>, V
     (o, r)
 }
 
-fn verdict(s: &Option<Score>) -> String {
+fn verdict(s: Option<&Score>) -> String {
     match s {
         None => "-".into(),
         Some(s) if s.n == 0 => "NO-OVERLAP".into(),
@@ -644,7 +645,7 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
             };
             let mut st = format!("{}Hz/{}", d.rate, d.channels);
             if d.errors > 0 {
-                st.push_str(&format!(" e{}", d.errors));
+                let _ = write!(st, " e{}", d.errors);
             }
             let known = KNOWN
                 .iter()
@@ -664,7 +665,7 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
                     sa.is_some()
                 );
             }
-            let mut va = verdict(&sa);
+            let mut va = verdict(sa.as_ref());
             // Configuration changes mid-stream: score each later segment against
             // FFmpeg forced to that segment's layout (a matching layout passes
             // through its resampler unchanged).
@@ -701,7 +702,7 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
                 let c = *sch as usize;
                 let tail = r.map(|r| r.get(start * c..).map(<[i32]>::to_vec).unwrap_or_default());
                 let sc = tail.as_ref().and_then(|t| score(&so, t, c));
-                let v = verdict(&sc);
+                let v = verdict(sc.as_ref());
                 va = if v.starts_with("EXACT") && va.starts_with("EXACT") {
                     format!("{va} +seg@{start} {c}ch EXACT")
                 } else {
@@ -719,7 +720,7 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
             if d.channels != p.channels || d.rate != p.rate {
                 va = format!("MISMATCH want {}Hz/{}", p.rate, p.channels);
             }
-            (st, va, verdict(&sb))
+            (st, va, verdict(sb.as_ref()))
         }
     };
     let cat = if va.starts_with("EXACT") {
@@ -784,18 +785,12 @@ fn main() {
                 .replace('\\', "/");
             (f, name)
         })
-        .filter(|(_, n)| {
-            filter
-                .as_ref()
-                .map(|fl| n.contains(fl.as_str()))
-                .unwrap_or(true)
-        })
+        .filter(|(_, n)| filter.as_ref().is_none_or(|fl| n.contains(fl.as_str())))
         .collect();
     let results = std::sync::Mutex::new(vec![None; names.len()]);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let workers = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(4)
+        .map_or(4, std::num::NonZero::get)
         .min(8);
     std::thread::scope(|sc| {
         for _ in 0..workers {

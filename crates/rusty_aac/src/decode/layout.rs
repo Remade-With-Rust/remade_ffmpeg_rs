@@ -39,6 +39,7 @@ const fn t(syn_ele: u8, id: u8, pos: u8) -> Tag {
 }
 
 /// Element rows per `channelConfiguration` (ISO Table 1.19 / 23003-3).
+#[must_use]
 pub fn default_layout(cc: u8, strict_71_wide: bool) -> Option<Vec<Tag>> {
     let (s, c, l) = (TYPE_SCE, TYPE_CPE, TYPE_LFE);
     let (f, b, si, lf) = (POS_FRONT, POS_BACK, POS_SIDE, POS_LFE);
@@ -85,6 +86,7 @@ pub fn default_layout(cc: u8, strict_71_wide: bool) -> Option<Vec<Tag>> {
 /// The rows a PCE describes, in bitstream order (front, side, back, LFE, CC),
 /// rearranged by height layer when the comment carries the 0xAC height
 /// extension.
+#[must_use]
 pub fn pce_layout(p: &Pce) -> Vec<Tag> {
     let mut rows = Vec::new();
     for e in &p.front {
@@ -492,6 +494,7 @@ pub struct OutputConfig {
 impl OutputConfig {
     /// `ff_aac_output_configure`: allocate elements and fix the output order.
     /// `ps` = an SCE carries Parametric Stereo (two outputs per mono element).
+    #[must_use]
     pub fn configure(mut map: Vec<Tag>, ps: bool) -> Self {
         let mut oc = Self::default();
         let mut id_map = [[0u8; 16]; 4];
@@ -520,6 +523,7 @@ impl OutputConfig {
         oc
     }
 
+    #[must_use]
     pub fn channels(&self) -> usize {
         self.outputs.len()
     }

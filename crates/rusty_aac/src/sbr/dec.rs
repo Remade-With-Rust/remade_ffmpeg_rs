@@ -21,9 +21,9 @@ use crate::decode::{Decoder, Element};
 use crate::Result;
 use std::sync::OnceLock;
 
-/// t_HFAdj: the envelope adjuster runs two slots behind the HF generator.
+/// `t_HFAdj`: the envelope adjuster runs two slots behind the HF generator.
 const ENV_ADJ: usize = 2;
-/// t_HFGen: slots of the previous frame kept in X_low.
+/// `t_HFGen`: slots of the previous frame kept in `X_low`.
 const HF_GEN: usize = 8;
 const NOISE_FLOOR_OFFSET: i32 = 6;
 
@@ -121,7 +121,7 @@ fn books() -> &'static Books {
 
 /// Per-channel SBR data and filterbank state.
 #[derive(Clone)]
-pub(crate) struct SbrChannel {
+pub struct SbrChannel {
     bs_num_env: usize,
     bs_freq_res: [u8; 7],
     t_env: [usize; 7],
@@ -209,7 +209,7 @@ const SPECTRUM_UNSET: Spectrum = Spectrum {
 
 /// Element-level SBR state.
 #[derive(Clone)]
-pub(crate) struct SbrChannelState {
+pub struct SbrChannelState {
     /// The SBR rate (twice the core rate); 0 until the first SBR payload.
     sample_rate: u32,
     start: bool,
@@ -487,7 +487,7 @@ impl SbrChannelState {
                 sb = self.f_master[i as usize];
                 odd = (sb + k0) & 1;
                 i -= 1;
-                if !(sb > k0 - 1 + msb - odd) || i < 0 {
+                if (sb <= k0 - 1 + msb - odd) || i < 0 {
                     break;
                 }
             }
@@ -994,7 +994,7 @@ impl SbrChannelState {
                     let ps = self
                         .ps
                         .get_or_insert_with(|| Box::new(super::ps::PsState::new()));
-                    bits_left -= ps.read_data(r, bits_left as usize, 2 * nts)? as i64;
+                    bits_left -= ps.read_data(r, bits_left as usize, 2 * nts) as i64;
                 } else {
                     r.skip(bits_left as usize)?;
                     bits_left = 0;
@@ -1008,7 +1008,7 @@ impl SbrChannelState {
     }
 
     /// `sbr_extension_data()` from a fill element payload (after its 4-bit
-    /// extension type): `bits` payload bits, `crc` = EXT_SBR_DATA_CRC.
+    /// extension type): `bits` payload bits, `crc` = `EXT_SBR_DATA_CRC`.
     #[allow(clippy::too_many_arguments)]
     fn decode_extension(
         &mut self,
@@ -1260,7 +1260,7 @@ impl SbrChannelState {
         }
     }
 
-    /// X_low: this frame's slots for bands < kx', plus 8 slots of the previous
+    /// `X_low`: this frame's slots for bands < kx', plus 8 slots of the previous
     /// frame for bands < kx (the previous frame's crossover).
     fn lf_gen(&self, wk: &mut Work, ch: usize, buf_idx: usize, nts: usize) {
         let d = &self.data[ch];
@@ -1583,7 +1583,7 @@ impl SbrChannelState {
         d.f_indexsine = indexsine;
     }
 
-    /// The synthesis input X[38][64]: low band from X_low, high band from the
+    /// The synthesis input X[38][64]: low band from `X_low`, high band from the
     /// adjusted Y of this frame and (for the first slots) the previous one.
     fn x_gen(&self, wk: &Work, ch: usize, nts: usize, x: &mut [[Cpx; 64]]) {
         let d = &self.data[ch];
@@ -1632,7 +1632,7 @@ impl SbrChannelState {
 /// Apply SBR (and PS) to an element after the core synthesis. `n` is the
 /// core frame length; the element's outputs are replaced with the SBR rate
 /// output (2n samples, or n when downsampled).
-pub(crate) fn apply(dec: &mut Decoder, el: &mut Element, ty: u8, n: usize) {
+pub fn apply(dec: &Decoder, el: &mut Element, ty: u8, n: usize) {
     let nts = n / 64;
     let core_rate = dec.stream_config().sample_rate;
     let ext_rate = dec.sbr_ext_rate();

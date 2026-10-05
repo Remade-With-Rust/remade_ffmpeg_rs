@@ -242,12 +242,11 @@ pub fn mdct_fast(x: &[f32]) -> Vec<f32> {
     }
     let (l, m) = (n / 2, n / 4);
     let owned;
-    let tw = match mdct_twiddles(n) {
-        Some(t) => t,
-        None => {
-            owned = MdctTwiddles::build(n);
-            &owned
-        }
+    let tw = if let Some(t) = mdct_twiddles(n) {
+        t
+    } else {
+        owned = MdctTwiddles::build(n);
+        &owned
     };
     // TDAC fold x[0..N] → y[mm] (computed on the fly), for the two indices each p needs.
     let (l2, l32) = (l / 2, 3 * l / 2);
@@ -305,12 +304,11 @@ pub fn imdct_fast(spec: &[f32]) -> Vec<f32> {
     }
     let m = n / 4;
     let owned;
-    let tw = match mdct_twiddles(n) {
-        Some(t) => t,
-        None => {
-            owned = MdctTwiddles::build(n);
-            &owned
-        }
+    let tw = if let Some(t) = mdct_twiddles(n) {
+        t
+    } else {
+        owned = MdctTwiddles::build(n);
+        &owned
     };
     let (mut re, mut im) = (vec![0f64; m], vec![0f64; m]);
     for p in 0..m {
@@ -380,7 +378,7 @@ impl MixedFft {
         }
     }
 
-    /// out[k] = Σ_j x[off + j·stride] · e^{-2πi jk/n}, recursive decimation in time.
+    /// out[k] = `Σ_j` x[off + j·stride] · e^{-2πi jk/n}, recursive decimation in time.
     fn rec(&self, x: &[(f64, f64)], off: usize, stride: usize, n: usize, out: &mut [(f64, f64)]) {
         if n == 1 {
             out[0] = x[off];
@@ -487,7 +485,7 @@ fn dct4_plan(l: usize) -> &'static Dct4Plan {
     let mut g = map
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *g.entry(l)
+    g.entry(l)
         .or_insert_with(|| Box::leak(Box::new(Dct4Plan::new(l))))
 }
 
@@ -519,7 +517,7 @@ pub fn imdct_half(spec: &[f32], out: &mut [f32], gain: f64) {
 /// butterflies per 256-bit op) and NEON on aarch64 (baseline, two per op). Both
 /// perform exactly the scalar products and sums (no FMA), so all three paths are
 /// **bit-identical** (`fft_simd_matches_scalar`).
-pub(crate) struct Radix2Fft {
+pub struct Radix2Fft {
     n: usize,
     /// The bit-reversal permutation as its swaps (`i < rev(i)` only), so the
     /// permutation costs no compare per element.
@@ -788,7 +786,7 @@ impl Radix2Fft {
 
 /// The DCT-IV core for power-of-two lengths in f32: pre-rotation, an `L/2`-point
 /// FFT, post-rotation — the same factorisation as [`Dct4Plan`], allocation-free.
-pub(crate) struct Pow2Dct4 {
+pub struct Pow2Dct4 {
     l: usize,
     pre: Vec<[f32; 2]>,
     post: Vec<[f32; 2]>,
@@ -862,7 +860,7 @@ impl Pow2Dct4 {
         }
         // SAFETY: `pre` has `m` entries and `x` gives `m` pairs, so the loop
         // wrote every element of `v`.
-        unsafe { &mut *(v as *mut [MaybeUninit<[f32; 2]>] as *mut [[f32; 2]]) }
+        unsafe { &mut *(std::ptr::from_mut::<[MaybeUninit<[f32; 2]>]>(v) as *mut [[f32; 2]]) }
     }
 
     /// The unscaled DCT-IV: `out[m] = Σ x[k]·cos(π/L·(m+½)(k+½))`, using
@@ -955,7 +953,7 @@ impl Pow2Dct4 {
 }
 
 /// The cached power-of-two DCT-IV plan for `l` (16..=2048), if `l` qualifies.
-pub(crate) fn pow2_dct4(l: usize) -> Option<&'static Pow2Dct4> {
+pub fn pow2_dct4(l: usize) -> Option<&'static Pow2Dct4> {
     static PLANS: [OnceLock<Pow2Dct4>; 12] = [const { OnceLock::new() }; 12];
     if !l.is_power_of_two() || !(16..=2048).contains(&l) {
         return None;
@@ -1332,7 +1330,7 @@ mod kernel_price {
     /// Per-call cost of the transform kernels, to price a SIMD twin against the
     /// stage it lives in. `cargo test --release -- --ignored --nocapture kernel_price`
     #[test]
-    #[ignore]
+    #[ignore = "manual microbenchmark: prints per-call timings"]
     fn kernel_price() {
         for n in [32usize, 64, 512] {
             let fft = Radix2Fft::new(n, -1.0);

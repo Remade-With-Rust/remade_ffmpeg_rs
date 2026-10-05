@@ -10,16 +10,22 @@ pub struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
+    #[must_use]
     pub fn new(data: &'a [u8]) -> Self {
         BitReader { data, pos: 0 }
     }
 
     /// Total bits remaining.
+    #[must_use]
     pub fn bits_left(&self) -> usize {
         (self.data.len() * 8).saturating_sub(self.pos)
     }
 
     /// Read a single bit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] when no bits remain.
     pub fn read_bit(&mut self) -> Result<u32> {
         let byte = self.pos / 8;
         if byte >= self.data.len() {
@@ -37,6 +43,10 @@ impl<'a> BitReader<'a> {
     /// a loop over single bits. A read that would cross the end of the data is an
     /// error, exactly as the bit loop it replaces (kept as `read_bits_slow`, the
     /// test oracle).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] if `n > 32` or fewer than `n` bits remain.
     #[inline]
     pub fn read_bits(&mut self, n: u32) -> Result<u32> {
         if n > 32 {
@@ -76,6 +86,7 @@ impl<'a> BitReader<'a> {
     /// Look at the next `n` (<= 32) bits without consuming them; bits past the end
     /// read as zero (for table-driven Huffman decoding).
     #[inline]
+    #[must_use]
     pub fn peek_bits(&self, n: u32) -> u32 {
         if n == 0 {
             return 0;
@@ -84,6 +95,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Absolute bit position from the start of the data.
+    #[must_use]
     pub fn position(&self) -> usize {
         self.pos
     }
@@ -103,11 +115,19 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read one bit as a bool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] when no bits remain.
     pub fn read_bool(&mut self) -> Result<bool> {
         Ok(self.read_bit()? != 0)
     }
 
     /// Skip `n` bits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] if fewer than `n` bits remain; the position is then unchanged.
     pub fn skip(&mut self, n: usize) -> Result<()> {
         if self.pos + n > self.data.len() * 8 {
             return Err(Error::invalid("aac: skip past end of data"));

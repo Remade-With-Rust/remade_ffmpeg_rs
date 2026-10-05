@@ -82,6 +82,7 @@ pub struct SbrConfig {
 
 impl SbrConfig {
     /// What this build can do with the stream.
+    #[must_use]
     pub fn support(&self) -> SbrSupport {
         match (self.sbr_present, self.core_object_type) {
             (false, _) => SbrSupport::NotPresent,
@@ -97,6 +98,10 @@ impl SbrConfig {
 /// the extension rate follows `channelConfiguration`).
 ///
 /// A stream with neither form yields `sbr_present = false`.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidData`] for a truncated or malformed config.
 pub fn parse_sbr_config(data: &[u8]) -> Result<SbrConfig> {
     let c = crate::config::parse(data)?;
     Ok(SbrConfig {
@@ -118,6 +123,7 @@ pub fn parse_sbr_config(data: &[u8]) -> Result<SbrConfig> {
 /// are the `extension_type`. Used for *implicit* SBR signalling, where nothing in
 /// the config says SBR but the fill elements carry it anyway — a shape MPEG-TS
 /// broadcast genuinely produces.
+#[must_use]
 pub fn fil_payload_is_sbr(payload: &[u8]) -> bool {
     if payload.is_empty() {
         return false;

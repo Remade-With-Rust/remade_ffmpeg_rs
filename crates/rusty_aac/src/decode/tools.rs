@@ -34,7 +34,7 @@ pub fn apply_ms(ics: &Ics, ms_mask: &[bool], c0: &mut ChannelData, c1: &mut Chan
 }
 
 /// Intensity stereo (§4.6.8.2.3): `R = ±2^(-pos/4)·L` on the right channel's
-/// intensity bands; the sign flips for INTENSITY_HCB2 and again under M/S.
+/// intensity bands; the sign flips for `INTENSITY_HCB2` and again under M/S.
 pub fn apply_is(
     ics1: &Ics,
     ms_present: bool,
@@ -205,7 +205,7 @@ pub fn apply_prediction(
 ) {
     let _prof = crate::prof::scope(crate::prof::Stage::DecTools);
     if !*initialized {
-        ps.iter_mut().for_each(|p| *p = PredState::default());
+        ps.fill(PredState::default());
         *initialized = true;
     }
     if ics.info.window_sequence != WindowSequence::EightShort {
@@ -226,7 +226,7 @@ pub fn apply_prediction(
             }
         }
     } else {
-        ps.iter_mut().for_each(|p| *p = PredState::default());
+        ps.fill(PredState::default());
     }
 }
 
@@ -235,7 +235,7 @@ pub fn apply_prediction(
 pub struct Coupling {
     /// [`BEFORE_TNS`], [`BETWEEN_TNS_AND_IMDCT`] or [`AFTER_IMDCT`] (independent).
     pub point: u8,
-    /// (element type, element tag, ch_select), one per coupled element.
+    /// (element type, element tag, `ch_select`), one per coupled element.
     pub targets: Vec<(u8, u8, u8)>,
     /// gains[index][band] (band 0 only for independent coupling).
     pub gains: Vec<Vec<f32>>,

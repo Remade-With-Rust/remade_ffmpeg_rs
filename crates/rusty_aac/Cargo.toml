@@ -101,6 +101,25 @@ too_many_lines = "allow"
 # Nursery, with known false positives: its own `--fix` produced a use-after-move
 # in this crate (2026-10-04). Clones are reviewed by hand instead.
 redundant_clone = "allow"
+# Every `#[inline(always)]` in the crate is an instruction-count-measured
+# decision (callgrind ledgers in the commit history); removing one has been
+# measured to cost, never to help.
+inline_always = "allow"
+# Config and state structs mirror the bitstream's own flag fields
+# (ISO/IEC 14496-3 syntax) and the encoder's public tool switches; an enum per
+# flag would obscure the spec mapping.
+struct_excessive_bools = "allow"
+# Every pointer cast it flags feeds an UNALIGNED intrinsic (`loadu`/`storeu`,
+# `vld1q`/`vst1q`), which has no alignment requirement.
+cast_ptr_alignment = "allow"
+# Style-only: branches are ordered as in the ISO pseudo-code (and common case
+# first), and lookup `match`es transcribe the standard's tables one row per arm;
+# reordering or merging them would obscure the spec mapping.
+if_not_else = "allow"
+match_same_arms = "allow"
+# Style-only, nursery: `let x; if c { x = .. } else { x = .. }` is kept where it
+# mirrors the spec's conditional assignments.
+useless_let_if_seq = "allow"
 # Style-only, nursery: `match`/`if let` reads more plainly than `map_or_else`
 # closures, and in the hot paths a closure can hide the branch from review.
 option_if_let_else = "allow"

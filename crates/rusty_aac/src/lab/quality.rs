@@ -51,6 +51,7 @@ pub struct NmrReport {
 impl NmrReport {
     /// A single scalar for ranking: the audible percentage, tie-broken by mean.
     /// Lower is better.
+    #[must_use]
     pub fn score(&self) -> f32 {
         self.pct_audible + self.mean_nmr_db * 1e-3
     }
@@ -293,9 +294,9 @@ mod tests {
     /// the failure mode that silently invalidates a whole ladder.
     #[test]
     fn alignment_recovers_injected_delay() {
+        const D: usize = 2048;
         let s = corpus::signal(corpus::Class::MusicTonal);
         let m = s.mono();
-        const D: usize = 2048;
         let mut shifted = vec![0f32; D];
         shifted.extend_from_slice(&m);
         let r = track_nmr(&m, &shifted, s.sample_rate);

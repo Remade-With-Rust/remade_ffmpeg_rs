@@ -29,7 +29,7 @@ pub struct Codebook {
     pub esc: bool,
 }
 
-/// Codebook properties indexed by codebook number 0..=11 (0 = ZERO_HCB).
+/// Codebook properties indexed by codebook number 0..=11 (0 = `ZERO_HCB`).
 pub const CODEBOOKS: [Codebook; 12] = [
     Codebook {
         dim: 0,
@@ -114,6 +114,10 @@ pub const INTENSITY_HCB: u8 = 15;
 
 /// Decode one codeword from `book` for codebook `cb` into `out[..cb.dim]`,
 /// returning quantized (signed) coefficients.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "measured: passing the 4-byte Codebook by value cost +0.7% encode / +1.4% decode instructions in the inlined hot loops"
+)]
 pub fn decode_tuple(
     cb: &Codebook,
     book: &HuffBook,
@@ -127,6 +131,10 @@ pub fn decode_tuple(
 /// Turn a decoded codebook `idx` into quantized coefficients, reading any sign
 /// and escape bits that follow the codeword. Split out so it can be tested
 /// directly with explicit indices.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "measured: passing the 4-byte Codebook by value cost +0.7% encode / +1.4% decode instructions in the inlined hot loops"
+)]
 pub fn apply_index(cb: &Codebook, idx: u16, r: &mut BitReader, out: &mut [i32]) -> Result<()> {
     let dim = cb.dim as usize;
     let modulo = if cb.unsigned {
@@ -188,6 +196,10 @@ pub fn tuple_table(cbn: u8) -> &'static [[i8; 4]] {
 
 /// Sign bits (unsigned books) and escape values (book 11) that follow a codeword.
 #[inline]
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "measured: passing the 4-byte Codebook by value cost +0.7% encode / +1.4% decode instructions in the inlined hot loops"
+)]
 pub fn finish_tuple(cb: &Codebook, r: &mut BitReader, out: &mut [i32]) -> Result<()> {
     let dim = cb.dim as usize;
     // Unsigned books: one sign bit per non-zero magnitude, in order.

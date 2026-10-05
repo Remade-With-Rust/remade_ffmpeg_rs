@@ -68,12 +68,14 @@ pub const SAMPLE_RATES: [u32; 13] = [
 
 /// Map a 4-bit sampling-frequency index to a rate (0 for the reserved/escape
 /// values 13-15, which require an explicit 24-bit rate).
+#[must_use]
 pub fn sample_rate_for_index(idx: u8) -> u32 {
     SAMPLE_RATES.get(idx as usize).copied().unwrap_or(0)
 }
 
 /// Map a sampling rate to its 4-bit index, or None if non-standard (the encoder
 /// then uses the 0x0F + explicit-24-bit-rate escape).
+#[must_use]
 pub fn sf_index_for_rate(rate: u32) -> Option<u8> {
     SAMPLE_RATES
         .iter()
@@ -96,6 +98,10 @@ pub struct AudioSpecificConfig {
 }
 
 /// Parse an `AudioSpecificConfig` from its raw bytes (the `esds`/`stsd` config).
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidData`] for a truncated or malformed config.
 pub fn parse_audio_specific_config(data: &[u8]) -> Result<AudioSpecificConfig> {
     let mut r = BitReader::new(data);
     let object_type = read_object_type(&mut r)?;
@@ -144,11 +150,17 @@ pub struct AdtsHeader {
 }
 
 /// True if `data` begins with an ADTS syncword (0xFFF, layer 00).
+#[must_use]
 pub fn is_adts(data: &[u8]) -> bool {
     data.len() >= 2 && data[0] == 0xFF && (data[1] & 0xF6) == 0xF0
 }
 
 /// Parse an ADTS header from the start of `data`.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidData`] if `data` does not start with a valid ADTS
+/// header.
 pub fn parse_adts(data: &[u8]) -> Result<AdtsHeader> {
     if !is_adts(data) || data.len() < 7 {
         return Err(Error::invalid("aac: not an ADTS frame"));
@@ -195,6 +207,7 @@ pub struct DecodedAudio {
 
 impl DecodedAudio {
     /// Number of PCM frames (samples per channel).
+    #[must_use]
     pub fn frames(&self) -> usize {
         self.samples.len() / self.channels.max(1) as usize
     }
@@ -222,12 +235,14 @@ pub struct AacDecoder {
 
 impl AacDecoder {
     /// A decoder that learns its parameters from the stream (ADTS headers).
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// A decoder pre-configured from an out-of-band [`AudioSpecificConfig`]
     /// (the MP4 `esds` payload) — required for bare raw access units.
+    #[must_use]
     pub fn with_config(cfg: AudioSpecificConfig) -> Self {
         Self {
             stream: Some(config::StreamConfig::lc(
@@ -247,12 +262,18 @@ impl AacDecoder {
     /// signalling, PCE channel layouts, the 960-sample frame flag and the
     /// LD/ELD parameters all live in fields the plain [`AudioSpecificConfig`]
     /// does not carry.
+    ///
+    /// # Errors
+    ///
+    /// As [`config::parse`], plus [`Error::Unsupported`] for a configuration
+    /// the decoder cannot run.
     pub fn with_config_bytes(data: &[u8]) -> Result<Self> {
         let stream = config::parse(data)?;
         Ok(Self::with_stream_config(stream))
     }
 
     /// A decoder for an already-parsed [`config::StreamConfig`].
+    #[must_use]
     pub fn with_stream_config(stream: config::StreamConfig) -> Self {
         let sbr = sbr::SbrConfig {
             sbr_present: stream.sbr,
@@ -280,11 +301,13 @@ impl AacDecoder {
     }
 
     /// HE-AAC parameters, when the decoder was built from raw config bytes.
+    #[must_use]
     pub fn sbr_config(&self) -> Option<sbr::SbrConfig> {
         self.sbr
     }
 
     /// How much of this stream can actually be reconstructed.
+    #[must_use]
     pub fn sbr_support(&self) -> sbr::SbrSupport {
         match self.sbr {
             Some(s) => s.support(),
@@ -294,6 +317,7 @@ impl AacDecoder {
 
     /// The stream's **output** sample rate (twice the coded rate for dual-rate
     /// HE-AAC). Returns `None` until the configuration is known.
+    #[must_use]
     pub fn output_sample_rate(&self) -> Option<u32> {
         if let Some(d) = &self.decoder {
             return Some(d.output_sample_rate());
@@ -321,6 +345,12 @@ impl AacDecoder {
     /// header change mid-stream reconfigures it). An ADTS frame carrying several
     /// raw data blocks decodes to all of them. Returns [`Error::Again`] for an
     /// empty packet (nothing to decode — feed the next one).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Again`] for an empty packet; [`Error::InvalidData`] for a malformed
+    /// one and [`Error::Unsupported`] for unimplemented syntax. A failed packet
+    /// leaves the decoder usable.
     pub fn decode(&mut self, packet: &[u8], pts: Option<i64>) -> Result<DecodedAudio> {
         if !is_adts(packet) {
             if packet.is_empty() {
@@ -379,8 +409,9 @@ impl AacDecoder {
 }
 
 /// `number_of_raw_data_blocks_in_frame` of an ADTS header (0 = one block).
+#[must_use]
 pub fn adts_raw_blocks(data: &[u8]) -> u8 {
-    data.get(6).map(|b| b & 0x03).unwrap_or(0)
+    data.get(6).map_or(0, |b| b & 0x03)
 }
 
 #[cfg(test)]

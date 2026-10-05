@@ -110,17 +110,15 @@ fn main() {
     let arm = args
         .windows(2)
         .find(|w| w[0] == "--arm")
-        .map(|w| w[1].clone())
-        .unwrap_or_else(|| "a2".to_string());
-    let bitrates: Vec<u32> = args
-        .windows(2)
-        .find(|w| w[0] == "--bitrates")
-        .map(|w| {
+        .map_or_else(|| "a2".to_string(), |w| w[1].clone());
+    let bitrates: Vec<u32> = args.windows(2).find(|w| w[0] == "--bitrates").map_or_else(
+        || vec![64_000, 96_000, 128_000],
+        |w| {
             w[1].split(',')
                 .filter_map(|s| s.trim().parse().ok())
                 .collect()
-        })
-        .unwrap_or_else(|| vec![64_000, 96_000, 128_000]);
+        },
+    );
 
     // ---- method line, to stderr so it never contaminates the CSV -------------
     eprintln!("# aacharvest method line (codec-measurement)");
@@ -224,7 +222,7 @@ fn main() {
                     split,
                     dwork,
                     dms,
-                    if fs.shipped_transient { 1 } else { 0 },
+                    i32::from(fs.shipped_transient),
                     b / 1000,
                     fs.tonality_mean,
                     fs.attack_max,

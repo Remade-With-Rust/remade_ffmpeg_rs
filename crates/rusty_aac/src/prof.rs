@@ -92,6 +92,7 @@ mod imp {
     }
 
     #[inline]
+    #[must_use]
     pub fn scope(s: Stage) -> Scope {
         Scope(s as usize, Instant::now())
     }
@@ -102,8 +103,12 @@ mod imp {
         t[k as usize].fetch_add(elems as u64, Relaxed);
     }
 
+    /// One profile row: a name and two counters.
+    pub type Row = (&'static str, u64, u64);
+
     /// Read and clear: per stage (name, ns, calls), per kernel (name, simd, scalar).
-    pub fn take() -> (Vec<(&'static str, u64, u64)>, Vec<(&'static str, u64, u64)>) {
+    #[must_use]
+    pub fn take() -> (Vec<Row>, Vec<Row>) {
         let stages = (0..STAGES.len())
             .map(|i| (STAGES[i], NS[i].swap(0, Relaxed), CALLS[i].swap(0, Relaxed)))
             .collect();

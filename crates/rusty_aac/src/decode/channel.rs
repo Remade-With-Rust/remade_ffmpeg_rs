@@ -1,4 +1,4 @@
-//! One `individual_channel_stream` (ISO 14496-3 §4.4.2.7): ics_info (with Main
+//! One `individual_channel_stream` (ISO 14496-3 §4.4.2.7): `ics_info` (with Main
 //! prediction / LTP side info and SSR gain control), section data,
 //! scalefactors, pulse data, TNS, spectral data — and its dequantisation,
 //! including PNS noise from the reference decoder's generator so noise bands are
@@ -17,8 +17,8 @@ use crate::tables_ext::{
 use crate::{Error, Result};
 
 /// Max TNS-affected band per sampling-frequency index (ISO Table 4.A.45/46).
-pub(crate) const TNS_MAX_LONG: [u8; 13] = [31, 31, 34, 40, 42, 51, 46, 46, 42, 42, 42, 39, 39];
-pub(crate) const TNS_MAX_SHORT: [u8; 13] = [9, 9, 10, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14];
+pub const TNS_MAX_LONG: [u8; 13] = [31, 31, 34, 40, 42, 51, 46, 46, 42, 42, 42, 39, 39];
+pub const TNS_MAX_SHORT: [u8; 13] = [9, 9, 10, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14];
 
 pub const MAX_LTP_LONG_SFB: usize = 40;
 pub const MAX_PREDICTORS: usize = 672;
@@ -59,7 +59,8 @@ impl Syntax {
     }
     fn short_swb(&self) -> &'static [u16] {
         if self.frame_len == 960 {
-            SWB_OFFSET_120[self.sf_index as usize].unwrap_or(swb_offsets(false, self.sf_index))
+            SWB_OFFSET_120[self.sf_index as usize]
+                .unwrap_or_else(|| swb_offsets(false, self.sf_index))
         } else {
             swb_offsets(false, self.sf_index)
         }
@@ -230,7 +231,7 @@ pub fn parse_ics_info(r: &mut BitReader, sx: &Syntax, ics: &mut Ics) -> Result<(
 
 /// Dequantised TNS reflection coefficients `sin(c / iqfac)` (ISO 14496-3
 /// §4.6.9.3), indexed by the raw two's-complement code, for
-/// [coef_compress·2 + coef_res]: 3-bit, 4-bit, compressed 3-bit, compressed
+/// [`coef_compress·2` + `coef_res`]: 3-bit, 4-bit, compressed 3-bit, compressed
 /// 4-bit. These are the 8-digit values the reference decoders tabulate (not
 /// correctly-rounded sines): matching them keeps the recursive TNS filter
 /// sample-exact.
@@ -410,7 +411,7 @@ struct Pulse {
     n: usize,
 }
 
-/// `individual_channel_stream()` from global_gain to dequantised spectrum.
+/// `individual_channel_stream()` from `global_gain` to dequantised spectrum.
 pub fn decode_ics(
     r: &mut BitReader,
     sx: &Syntax,

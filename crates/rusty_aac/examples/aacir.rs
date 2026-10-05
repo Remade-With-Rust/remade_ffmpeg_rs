@@ -9,7 +9,7 @@
 //! ```
 //!
 //! `.aus` carries streams ADTS cannot (ER AAC-LD/ELD, ...): `u32le` ASC length,
-//! the AudioSpecificConfig, then `u32le` length + access unit until EOF.
+//! the `AudioSpecificConfig`, then `u32le` length + access unit until EOF.
 
 use rusty_aac::{parse_adts, AacDecoder};
 
@@ -27,7 +27,10 @@ fn main() {
     };
     for f in std::env::args().skip(1) {
         let data = std::fs::read(&f).expect("read aac");
-        if f.ends_with(".aus") {
+        if std::path::Path::new(&f)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("aus"))
+        {
             let word = |p: usize| u32::from_le_bytes(data[p..p + 4].try_into().unwrap()) as usize;
             let asc_len = word(0);
             let mut dec = AacDecoder::with_config_bytes(&data[4..4 + asc_len]).expect("asc");

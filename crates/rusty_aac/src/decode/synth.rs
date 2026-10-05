@@ -178,27 +178,6 @@ fn fmul_window_reference(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f32
     }
 }
 
-#[cfg(test)]
-mod fmul_window_twin {
-    #[test]
-    fn fmul_window_matches_reference() {
-        for len in [1usize, 2, 3, 7, 32, 60, 64, 120, 128, 240, 480, 512] {
-            let src0: Vec<f32> = (0..len).map(|i| (i as f32 * 0.7).sin() * 1000.0).collect();
-            let src1: Vec<f32> = (0..len).map(|i| (i as f32 * 1.3).cos() * 900.0).collect();
-            let win: Vec<f32> = (0..2 * len).map(|i| (i as f32 * 0.01).sin()).collect();
-            let (mut got, mut want) = (vec![0f32; 2 * len], vec![0f32; 2 * len]);
-            super::fmul_window(&mut got, &src0, &src1, &win, len);
-            super::fmul_window_reference(&mut want, &src0, &src1, &win, len);
-            assert!(
-                got.iter()
-                    .zip(&want)
-                    .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "len={len}"
-            );
-        }
-    }
-}
-
 fn is_long_end(s: WindowSequence) -> bool {
     matches!(s, WindowSequence::OnlyLong | WindowSequence::LongStop)
 }
@@ -254,8 +233,8 @@ pub fn imdct_and_window(
         fmul_window(out, saved, buf, lwin_prev, l / 2);
     } else {
         out[..ov].copy_from_slice(&saved[..ov]);
+        fmul_window(&mut out[ov..], &saved[ov..], buf, swin_prev, hs);
         if s.seq == WindowSequence::EightShort {
-            fmul_window(&mut out[ov..], &saved[ov..], &buf[..], swin_prev, hs);
             // The sources are read straight from `buf`: the destinations
             // (`out`, `temp`, `saved`) never alias it, so the per-window
             // `.to_vec()` copies were pure overhead.
@@ -278,7 +257,6 @@ pub fn imdct_and_window(
             );
             out[ov + 4 * sh..ov + 4 * sh + hs].copy_from_slice(&temp[..hs]);
         } else {
-            fmul_window(&mut out[ov..], &saved[ov..], &buf[..], swin_prev, hs);
             out[ov + sh..ov + sh + ov].copy_from_slice(&buf[hs..hs + ov]);
         }
     }
@@ -308,6 +286,10 @@ pub fn imdct_and_window(
 
 /// ER AAC-LD synthesis (frame length `n` = 512/480, long windows only). With the
 /// KBD flag set, LD uses its LOW-OVERLAP window instead.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the two windows, the frame and the three state buffers are all distinct borrows of the decoder"
+)]
 pub fn imdct_and_window_ld(
     long_sine: &[f32],
     short_sine_lo: &[f32],
@@ -452,4 +434,25 @@ pub fn ltp_update(
     ltp_state.copy_within(1024..2048, 0);
     ltp_state[1024..2048].copy_from_slice(&output[..1024]);
     ltp_state[2048..3072].copy_from_slice(&saved_ltp);
+}
+
+#[cfg(test)]
+mod fmul_window_twin {
+    #[test]
+    fn fmul_window_matches_reference() {
+        for len in [1usize, 2, 3, 7, 32, 60, 64, 120, 128, 240, 480, 512] {
+            let src0: Vec<f32> = (0..len).map(|i| (i as f32 * 0.7).sin() * 1000.0).collect();
+            let src1: Vec<f32> = (0..len).map(|i| (i as f32 * 1.3).cos() * 900.0).collect();
+            let win: Vec<f32> = (0..2 * len).map(|i| (i as f32 * 0.01).sin()).collect();
+            let (mut got, mut want) = (vec![0f32; 2 * len], vec![0f32; 2 * len]);
+            super::fmul_window(&mut got, &src0, &src1, &win, len);
+            super::fmul_window_reference(&mut want, &src0, &src1, &win, len);
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "len={len}"
+            );
+        }
+    }
 }

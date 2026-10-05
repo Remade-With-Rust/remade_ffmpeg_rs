@@ -96,6 +96,7 @@ pub struct AacSignals {
 impl AacSignals {
     /// Analyze a clip. `planes` is one slice per channel; only channel 0 drives
     /// the mono signals, with `xcorr` filled when a second channel is present.
+    #[must_use]
     pub fn analyze(planes: &[&[f32]], sample_rate: u32) -> Self {
         let fs_index = crate::sf_index_for_rate(sample_rate).unwrap_or(4);
         let swb = swb_offsets(true, fs_index);

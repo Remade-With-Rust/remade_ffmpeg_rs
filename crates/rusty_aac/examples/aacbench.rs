@@ -18,7 +18,7 @@ fn main() {
         let Ok(h) = parse_adts(&data[pos..]) else {
             break;
         };
-        let len = h.frame_length as usize;
+        let len = h.frame_length;
         if len == 0 || pos + len > data.len() {
             break;
         }

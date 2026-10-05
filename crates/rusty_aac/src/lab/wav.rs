@@ -25,11 +25,13 @@ pub struct Wav {
 
 impl Wav {
     /// Samples per channel.
+    #[must_use]
     pub fn frames(&self) -> usize {
         self.samples.len() / self.channels.max(1) as usize
     }
 
     /// Channel 0 as mono.
+    #[must_use]
     pub fn mono(&self) -> Vec<f32> {
         if self.channels <= 1 {
             self.samples.clone()
@@ -51,6 +53,11 @@ fn u16le(b: &[u8]) -> u16 {
 }
 
 /// Read a RIFF/WAVE file (PCM s16 or IEEE f32).
+///
+/// # Errors
+///
+/// Any I/O error, or `InvalidData` for a file that is not PCM s16 / IEEE f32
+/// RIFF/WAVE.
 pub fn read(path: impl AsRef<Path>) -> io::Result<Wav> {
     let mut d = Vec::new();
     std::fs::File::open(path.as_ref())?.read_to_end(&mut d)?;
@@ -118,6 +125,10 @@ pub fn read(path: impl AsRef<Path>) -> io::Result<Wav> {
 /// Clamped, not wrapped: a sample above full scale becomes full scale rather
 /// than wrapping to the opposite polarity, which would inject a click the
 /// external scorer would then charge to the encoder.
+///
+/// # Errors
+///
+/// Any I/O error from creating or writing the file.
 pub fn write_s16(
     path: impl AsRef<Path>,
     samples: &[f32],

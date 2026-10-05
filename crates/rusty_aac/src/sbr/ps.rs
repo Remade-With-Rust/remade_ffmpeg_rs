@@ -532,7 +532,7 @@ fn tables() -> &'static PsTables {
                 } else {
                     f_center_34.get(k).map(|&v| f64::from(v) / 24.0)
                 }
-                .unwrap_or(k as f64 - f64::from(base));
+                .unwrap_or_else(|| k as f64 - f64::from(base));
                 let mut q = [[0f32; 2]; 3];
                 for (m, &l) in links.iter().enumerate() {
                     let theta = -PI * f64::from(l) * f_center;
@@ -618,7 +618,7 @@ const G1_Q2: [f32; 7] = [
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub(crate) struct PsState {
+pub struct PsState {
     start: bool,
     enable_iid: bool,
     iid_quant: usize,
@@ -790,16 +790,11 @@ impl PsState {
 
     /// Parse `ps_data()` within `bits_left` bits; returns the bits consumed
     /// (all of `bits_left` on error, which also disables PS until the next header).
-    pub(crate) fn read_data(
-        &mut self,
-        r: &mut BitReader,
-        bits_left: usize,
-        slots: usize,
-    ) -> Result<usize> {
+    pub(crate) fn read_data(&mut self, r: &mut BitReader, bits_left: usize, slots: usize) -> usize {
         self.slots = slots;
         let start = r.position();
         match self.read_data_inner(r) {
-            Ok(true) if r.position() - start <= bits_left => Ok(r.position() - start),
+            Ok(true) if r.position() - start <= bits_left => r.position() - start,
             _ => {
                 self.start = false;
                 self.iid_par = [[0; MAX_PAR]; MAX_ENV];
@@ -807,7 +802,7 @@ impl PsState {
                 self.ipd_par = [[0; MAX_PAR]; MAX_ENV];
                 self.opd_par = [[0; MAX_PAR]; MAX_ENV];
                 r.set_position(start + bits_left);
-                Ok(bits_left)
+                bits_left
             }
         }
     }

@@ -42,6 +42,7 @@ pub struct BitWriter {
 }
 
 impl BitWriter {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
@@ -68,11 +69,13 @@ impl BitWriter {
     }
 
     /// Total bits written so far.
+    #[must_use]
     pub fn bit_len(&self) -> usize {
         self.buf.len() * 8 + self.nbits as usize
     }
 
     /// Pad to a byte boundary with zero bits and return the bytes.
+    #[must_use]
     pub fn into_bytes(mut self) -> Vec<u8> {
         if self.nbits != 0 {
             self.cur <<= 8 - self.nbits;
@@ -94,6 +97,10 @@ impl Default for BitWriter {
 
 /// Pack a `dim`-tuple of quantized coefficients into codebook `cb`'s base-`modulo`
 /// Huffman index, or None if the tuple isn't representable by that codebook.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "measured: passing the 4-byte Codebook by value cost +0.7% encode / +1.4% decode instructions in the inlined hot loops"
+)]
 fn tuple_index(cb: &Codebook, tuple: &[i32]) -> Option<u32> {
     let dim = cb.dim as usize;
     let lav = u32::from(cb.lav);
@@ -120,6 +127,7 @@ fn tuple_index(cb: &Codebook, tuple: &[i32]) -> Option<u32> {
 }
 
 /// Bits to code `tuple` with codebook `cb_num`, or None if unrepresentable.
+#[must_use]
 pub fn spectral_bits(cb_num: usize, tuple: &[i32]) -> Option<usize> {
     let cb = &CODEBOOKS[cb_num];
     let idx = tuple_index(cb, tuple)?;
@@ -141,6 +149,11 @@ pub fn spectral_bits(cb_num: usize, tuple: &[i32]) -> Option<usize> {
 
 /// Emit `tuple` with codebook `cb_num`: codeword, then sign bits (unsigned books),
 /// then escape sequences (book 11). Caller ensures `spectral_bits` is Some.
+///
+/// # Panics
+///
+/// If `cb_num` is not a spectral codebook or `tuple` is not representable in it
+/// (the caller's contract).
 pub fn spectral_emit(cb_num: usize, tuple: &[i32], w: &mut BitWriter) {
     let cb = &CODEBOOKS[cb_num];
     let dim = cb.dim as usize;
@@ -165,14 +178,14 @@ pub fn spectral_emit(cb_num: usize, tuple: &[i32], w: &mut BitWriter) {
 
 /// Escape length for magnitude `m` (≥ 16): `2N+5` bits, `2^(N+4) ≤ m < 2^(N+5)`.
 fn escape_bits(m: u32) -> usize {
-    let n = (31 - m.leading_zeros()) - 4;
+    let n = m.ilog2() - 4;
     2 * n as usize + 5
 }
 
 /// Escape sequence (ISO §4.6.3.3): N leading 1-bits, a 0, then N+4 bits of
 /// `m - 2^(N+4)`.
 fn emit_escape(m: u32, w: &mut BitWriter) {
-    let n = (31 - m.leading_zeros()) - 4;
+    let n = m.ilog2() - 4;
     for _ in 0..n {
         w.write_bool(true);
     }
@@ -186,7 +199,8 @@ fn emit_escape(m: u32, w: &mut BitWriter) {
 // ---------------------------------------------------------------------------
 
 /// The `AudioSpecificConfig` bytes for an AAC-LC stream — the MP4 `esds`
-/// DecoderSpecificInfo the muxer needs (2 bytes for standard rates).
+/// `DecoderSpecificInfo` the muxer needs (2 bytes for standard rates).
+#[must_use]
 pub fn audio_specific_config_bytes(sample_rate: u32, channels: u16) -> Vec<u8> {
     write_audio_specific_config(&AudioSpecificConfig {
         object_type: 2, // AAC-LC
@@ -197,6 +211,7 @@ pub fn audio_specific_config_bytes(sample_rate: u32, channels: u16) -> Vec<u8> {
 
 /// Serialize an `AudioSpecificConfig` (ISO §1.6.2.1) — the `esds`/`stsd` config
 /// bytes the MP4 muxer needs. Inverse of `parse_audio_specific_config`.
+#[must_use]
 pub fn write_audio_specific_config(cfg: &AudioSpecificConfig) -> Vec<u8> {
     let mut w = BitWriter::new();
     if cfg.object_type >= 31 {
@@ -205,12 +220,11 @@ pub fn write_audio_specific_config(cfg: &AudioSpecificConfig) -> Vec<u8> {
     } else {
         w.write(u32::from(cfg.object_type), 5);
     }
-    match crate::sf_index_for_rate(cfg.sample_rate) {
-        Some(i) => w.write(u32::from(i), 4),
-        None => {
-            w.write(0x0F, 4);
-            w.write(cfg.sample_rate, 24);
-        }
+    if let Some(i) = crate::sf_index_for_rate(cfg.sample_rate) {
+        w.write(u32::from(i), 4);
+    } else {
+        w.write(0x0F, 4);
+        w.write(cfg.sample_rate, 24);
     }
     w.write(u32::from(cfg.channels), 4);
     w.into_bytes()
@@ -218,6 +232,11 @@ pub fn write_audio_specific_config(cfg: &AudioSpecificConfig) -> Vec<u8> {
 
 /// Serialize a 7-byte ADTS frame header (no CRC) — inverse of `parse_adts`.
 /// `hdr.frame_length` must include this 7-byte header.
+///
+/// # Panics
+///
+/// If `hdr.sample_rate` is not one of the thirteen standard AAC rates.
+#[must_use]
 pub fn write_adts_header(hdr: &AdtsHeader) -> Vec<u8> {
     let sf = crate::sf_index_for_rate(hdr.sample_rate).expect("standard rate for ADTS");
     let mut w = BitWriter::new();
@@ -278,7 +297,7 @@ pub const FRAME_LEN: usize = 1024;
 pub const LONG_N: usize = 2048;
 const SHORT_N: usize = 256;
 const SHORT_HALF: usize = 128;
-/// 1 / OUTPUT_NORM: the decoder scales its output by 1/32768, so the encoder
+/// 1 / `OUTPUT_NORM`: the decoder scales its output by 1/32768, so the encoder
 /// scales the spectrum up by 32768 to land in the AAC coefficient domain.
 const SPEC_SCALE: f32 = 32768.0;
 
@@ -286,6 +305,7 @@ const SPEC_SCALE: f32 = 32768.0;
 /// (previous frame's 1024 ++ current 1024) and forward-MDCT to 1024 coefficients,
 /// scaled so the decoder's `imdct · window · (1/32768) + overlap-add` reconstructs
 /// the input (TDAC). `win` is the 2048-length window (sine or KBD).
+#[must_use]
 pub fn analyze_long(prev: &[f32; FRAME_LEN], cur: &[f32; FRAME_LEN], win: &[f32]) -> Vec<f32> {
     let _prof = prof::scope(Stage::EncMdct);
     // Written into fresh capacity: both halves are fully computed, so the zero
@@ -305,7 +325,8 @@ pub fn analyze_long(prev: &[f32; FRAME_LEN], cur: &[f32; FRAME_LEN], win: &[f32]
 /// [448, 1600) of the prev++cur 2048 buffer, each windowed + MDCT'd to 128 coeffs,
 /// laid out window-major (the exact inverse of the decoder's `short_frame`). The
 /// uncovered [0,448)/[1600,2048) regions are bridged by the LongStart/LongStop
-/// neighbours — which is why EightShort must sit between transition blocks.
+/// neighbours — which is why `EightShort` must sit between transition blocks.
+#[must_use]
 pub fn analyze_short(prev: &[f32; FRAME_LEN], cur: &[f32; FRAME_LEN], sw: &[f32]) -> Vec<f32> {
     let _prof = prof::scope(Stage::EncMdct);
     let mut buf = [0f32; LONG_N];
@@ -430,7 +451,7 @@ fn spreading(dz: f64) -> f64 {
 }
 
 /// The Bark-spreading matrix `S[i·n+j] = spreading(bark[i]-bark[j])` for one band
-/// geometry — fixed per (sample_rate, band count), so it's built once and cached,
+/// geometry — fixed per (`sample_rate`, band count), so it's built once and cached,
 /// turning each frame's masking into a matrix-vector product (no runtime powf).
 /// `n_coeffs` is the number of spectral coefficients the band table spans — 1024
 /// for a long block, 128 for one short window. It sets the coefficient→Hz
@@ -448,7 +469,7 @@ fn spreading_matrix(swb: &[u16], sample_rate: u32, n_coeffs: usize) -> Arc<Vec<f
     let num_swb = swb.len() - 1;
     let bark: Vec<f64> = (0..num_swb)
         .map(|sfb| {
-            let center = (f64::from(swb[sfb]) + f64::from(swb[sfb + 1])) / 2.0;
+            let center = f64::midpoint(f64::from(swb[sfb]), f64::from(swb[sfb + 1]));
             // n_coeffs coefficients span 0..sr/2.
             hz_to_bark(center * f64::from(sample_rate) * 0.5 / n_coeffs as f64)
         })
@@ -546,7 +567,7 @@ fn masking_from_energy(
             let smr = match tonality {
                 None => SMR_FLAT,
                 Some(t) => {
-                    let center = (f64::from(swb[i]) + f64::from(swb[i + 1])) / 2.0;
+                    let center = f64::midpoint(f64::from(swb[i]), f64::from(swb[i + 1]));
                     let bark = hz_to_bark(center * f64::from(sample_rate) * 0.5 / n_coeffs as f64);
                     smr_for(f64::from(t[i]), bark)
                 }
@@ -731,11 +752,11 @@ const ESC_HCB: u8 = 11;
 /// One channel element to emit, naming its source channels **in input order**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Elem {
-    /// single_channel_element carrying input channel `.0`.
+    /// `single_channel_element` carrying input channel `.0`.
     Sce(usize),
-    /// channel_pair_element carrying input channels `.0` (left) and `.1` (right).
+    /// `channel_pair_element` carrying input channels `.0` (left) and `.1` (right).
     Cpe(usize, usize),
-    /// lfe_channel_element carrying input channel `.0`. Long blocks only.
+    /// `lfe_channel_element` carrying input channel `.0`. Long blocks only.
     Lfe(usize),
 }
 
@@ -751,7 +772,7 @@ impl Elem {
 }
 
 /// The element sequence for `channels`, with source indices in the **standard
-/// interleave order** the caller pushes (WAVE_FORMAT_EXTENSIBLE / FFmpeg order:
+/// interleave order** the caller pushes (`WAVE_FORMAT_EXTENSIBLE` / FFmpeg order:
 /// FL, FR, FC, LFE, BL, BR).
 ///
 /// The reordering is the substance here. AAC orders a 5.1 stream
@@ -759,7 +780,7 @@ impl Elem {
 /// them in arrival order would put the centre channel in the left speaker.
 ///
 /// Returns `None` for channel counts with no defined `channel_configuration`
-/// (0, or > 6): those need a program_config_element, which we do not yet write.
+/// (0, or > 6): those need a `program_config_element`, which we do not yet write.
 pub(crate) fn element_plan(channels: usize) -> Option<Vec<Elem>> {
     Some(match channels {
         // config 1 — mono.
@@ -920,12 +941,11 @@ fn best_codebook_for_band(quant: &[i32], s: usize, e: usize) -> (u8, usize) {
         let mut ok = true;
         let mut i = s;
         while i < e {
-            match spectral_bits(cb as usize, &quant[i..i + dim]) {
-                Some(b) => bits += b,
-                None => {
-                    ok = false;
-                    break;
-                }
+            if let Some(b) = spectral_bits(cb as usize, &quant[i..i + dim]) {
+                bits += b;
+            } else {
+                ok = false;
+                break;
             }
             i += dim;
         }
@@ -936,7 +956,7 @@ fn best_codebook_for_band(quant: &[i32], s: usize, e: usize) -> (u8, usize) {
     best
 }
 
-/// Bits for section_data given per-SFB codebooks (adjacent equal cbs merge into
+/// Bits for `section_data` given per-SFB codebooks (adjacent equal cbs merge into
 /// one 4-bit codebook + 5-bit run-length increments).
 fn section_bits(cbs: &[u8]) -> usize {
     let esc = 31usize;
@@ -966,7 +986,7 @@ fn scalefactors(offsets: &[i32], base: i32) -> Vec<i32> {
     offsets.iter().map(|&o| (base + o).clamp(0, 255)).collect()
 }
 
-/// global_gain = the first coded band's scalefactor (the differential reference);
+/// `global_gain` = the first coded band's scalefactor (the differential reference);
 /// 100 for a silent frame with no coded bands.
 fn global_gain(cbs: &[u8], sf: &[i32]) -> i32 {
     // Only a REGULAR band seeds the differential chain. A PNS band's `sf` is a
@@ -975,8 +995,7 @@ fn global_gain(cbs: &[u8], sf: &[i32]) -> i32 {
     // scalefactor that follows.
     cbs.iter()
         .position(|&cb| cb != ZERO_HCB && cb < NOISE_HCB)
-        .map(|sfb| sf[sfb])
-        .unwrap_or(100)
+        .map_or(100, |sfb| sf[sfb])
 }
 
 /// Bits to code the per-band scalefactors as `SCALEFACTOR_BOOK` deltas from a
@@ -990,7 +1009,8 @@ fn scalefactor_bits(cbs: &[u8], sf: &[i32], gg: i32) -> usize {
     for (sfb, &cb) in cbs.iter().enumerate() {
         if cb == ZERO_HCB {
             continue;
-        } else if cb >= crate::codebook::INTENSITY_HCB2 {
+        }
+        if cb >= crate::codebook::INTENSITY_HCB2 {
             let d = (sf[sfb] - is_pos).clamp(-60, 60);
             bits += crate::tables::SCALEFACTOR_BOOK.code((d + 60) as usize).1 as usize;
             is_pos += d;
@@ -1102,6 +1122,10 @@ unsafe fn quantize_band_avx2(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i
 /// the math mirrors the AVX2 kernel exactly, and its tail is the shared scalar reference).
 #[cfg(all(feature = "simd-avx512", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx2")]
+#[allow(
+    clippy::incompatible_msrv,
+    reason = "the opt-in `simd-avx512` feature needs Rust 1.89 (stable AVX-512 intrinsics);               the crate's 1.85 MSRV holds for every other feature set (README)"
+)]
 unsafe fn quantize_band_avx512(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) {
     use std::arch::x86_64::*;
     let n = out.len();
@@ -1224,7 +1248,7 @@ mod work {
 
 /// Shared coder body: quantize the frame into the caller-owned `quant` (per-band
 /// scalefactors `sf`, which cover the whole spectrum so no pre-zeroing is needed),
-/// pick per-band codebooks, and return (codebooks, ICS body bits, max_sfb). Splitting
+/// pick per-band codebooks, and return (codebooks, ICS body bits, `max_sfb`). Splitting
 /// this out lets the rate loop reuse one buffer instead of allocating per candidate.
 fn code_core(xp: &Xpow, swb: &[u16], sf: &[i32], quant: &mut [i32]) -> (Vec<u8>, usize, usize) {
     work::bump_code_frame();
@@ -1350,7 +1374,7 @@ fn rate_loop(xp: &Xpow, swb: &[u16], offsets: &[i32], target_bits: usize) -> i32
     base
 }
 
-/// section_data (single group, long block): 4-bit codebook + 5-bit run-length
+/// `section_data` (single group, long block): 4-bit codebook + 5-bit run-length
 /// increments (esc = 31 continues the run).
 fn write_sections(w: &mut BitWriter, cbs: &[u8]) {
     let esc = 31u32;
@@ -1372,7 +1396,7 @@ fn write_sections(w: &mut BitWriter, cbs: &[u8]) {
     }
 }
 
-/// scale_factor_data: each coded band's scalefactor as a `SCALEFACTOR_BOOK` delta
+/// `scale_factor_data`: each coded band's scalefactor as a `SCALEFACTOR_BOOK` delta
 /// from a running accumulator seeded at `gg` (matching the decoder).
 fn write_scalefactors(w: &mut BitWriter, cbs: &[u8], sf: &[i32], gg: i32) {
     // THREE independent accumulators, exactly as `decode::read_scalefactors`
@@ -1386,7 +1410,8 @@ fn write_scalefactors(w: &mut BitWriter, cbs: &[u8], sf: &[i32], gg: i32) {
     for (sfb, &cb) in cbs.iter().enumerate() {
         if cb == ZERO_HCB {
             continue;
-        } else if cb >= crate::codebook::INTENSITY_HCB2 {
+        }
+        if cb >= crate::codebook::INTENSITY_HCB2 {
             let d = (sf[sfb] - is_pos).clamp(-60, 60);
             let (code, len) = crate::tables::SCALEFACTOR_BOOK.code((d + 60) as usize);
             w.write(code, u32::from(len));
@@ -1498,7 +1523,7 @@ fn pns_bands(
     out
 }
 
-/// spectral_data: per regular SFB, code coefficient tuples with the band's book.
+/// `spectral_data`: per regular SFB, code coefficient tuples with the band's book.
 fn write_spectrum(w: &mut BitWriter, quant: &[i32], cbs: &[u8], swb: &[u16]) {
     for (sfb, &cb) in cbs.iter().enumerate() {
         // ZERO, NOISE (PNS) and intensity bands carry no spectral data — their
@@ -1516,8 +1541,8 @@ fn write_spectrum(w: &mut BitWriter, quant: &[i32], cbs: &[u8], swb: &[u16]) {
     }
 }
 
-/// Encode one channel as a single_channel_element for a long or transition block
-/// (`seq` ∈ {OnlyLong, LongStart, LongStop}): psy offsets → rate loop over the
+/// Encode one channel as a `single_channel_element` for a long or transition block
+/// (`seq` ∈ {`OnlyLong`, `LongStart`, LongStop}): psy offsets → rate loop over the
 /// common base → per-band scalefactors → coded ICS.
 #[allow(clippy::too_many_arguments)]
 fn encode_channel_element(
@@ -1872,7 +1897,7 @@ pub(crate) fn write_tns_long(w: &mut BitWriter, tns: &TnsEnc) {
 
 /// Flag each 1024-sample frame that contains a transient: a 128-sample sub-block
 /// whose energy leaps above the recent running average (an attack). Frame 0 is
-/// never flagged — nothing precedes it to open a LongStart transition from.
+/// never flagged — nothing precedes it to open a `LongStart` transition from.
 ///
 /// `pub(crate)` so [`crate::lab::signals`] can record what the *shipping*
 /// detector decides alongside the campaign's replacement signal — the
@@ -1979,7 +2004,7 @@ pub(crate) fn detect_transients_relative(chan: &[f32], nframes: usize) -> Vec<bo
 /// short run is bracketed by LongStart/LongStop; runs a single frame apart are
 /// merged (a lone gap can't be both a stop and a start).
 fn assign_sequences(transient: &[bool]) -> Vec<WindowSequence> {
-    use WindowSequence::*;
+    use WindowSequence::{EightShort, LongStart, LongStop, OnlyLong};
     let n = transient.len();
     let mut short = transient.to_vec();
     for i in 1..n.saturating_sub(1) {
@@ -2044,12 +2069,11 @@ fn best_codebook_short(
             let base = win * SHORT_HALF;
             let mut i = s;
             while i < e {
-                match spectral_bits(cb as usize, &quant[base + i..base + i + dim]) {
-                    Some(b) => bits += b,
-                    None => {
-                        ok = false;
-                        break 'windows;
-                    }
+                if let Some(b) = spectral_bits(cb as usize, &quant[base + i..base + i + dim]) {
+                    bits += b;
+                } else {
+                    ok = false;
+                    break 'windows;
                 }
                 i += dim;
             }
@@ -2114,7 +2138,7 @@ fn short_groups(specs: &[&[f32]]) -> Vec<u8> {
 /// Energy ratio (window vs its group's mean) that starts a new group: 6 dB.
 const GROUP_SPLIT: f64 = 4.0;
 
-/// Bits for short-block section_data (3-bit run-length increments, esc = 7).
+/// Bits for short-block `section_data` (3-bit run-length increments, esc = 7).
 fn section_bits_short(cbs: &[u8]) -> usize {
     let esc = 7usize;
     let mut bits = 0usize;
@@ -2138,7 +2162,7 @@ fn section_bits_short(cbs: &[u8]) -> usize {
 }
 
 /// Quantize all eight short windows with a per-SFB scalefactor (one group; flat
-/// this brick), pick per-SFB codebooks, and return (codebooks, body bits, max_sfb,
+/// this brick), pick per-SFB codebooks, and return (codebooks, body bits, `max_sfb`,
 /// window-major quantized spectrum).
 fn code_frame_short(
     xp: &Xpow,
@@ -2212,7 +2236,7 @@ fn min_base_short(xp: &Xpow) -> i32 {
 
 /// **Arm A1 — the short-block psychoacoustic model.**
 ///
-/// Per-SFB scalefactor offsets for an EightShort frame. The band energies are
+/// Per-SFB scalefactor offsets for an `EightShort` frame. The band energies are
 /// summed **across the eight windows** of the group, because with one window group
 /// a scalefactor covers band `b` of all eight windows — so the mask must be
 /// computed over exactly the coefficients that scalefactor governs.
@@ -2389,7 +2413,7 @@ fn rate_loop_short(
     lo
 }
 
-/// short_block section_data (4-bit codebook + 3-bit run increments, esc = 7).
+/// `short_block` `section_data` (4-bit codebook + 3-bit run increments, esc = 7).
 fn write_sections_short(w: &mut BitWriter, cbs: &[u8]) {
     let esc = 7u32;
     let mut k = 0usize;
@@ -2410,7 +2434,7 @@ fn write_sections_short(w: &mut BitWriter, cbs: &[u8]) {
     }
 }
 
-/// short_block spectral_data: per group, per SFB, per window of the group,
+/// `short_block` `spectral_data`: per group, per SFB, per window of the group,
 /// coefficient tuples (the grouped-interleaved order the decoder reads).
 fn write_spectrum_short(
     w: &mut BitWriter,
@@ -2440,14 +2464,14 @@ fn write_spectrum_short(
     }
 }
 
-/// short_block section_data for every window group (runs never cross a group).
+/// `short_block` `section_data` for every window group (runs never cross a group).
 fn write_sections_short_grouped(w: &mut BitWriter, cbs: &[u8], ngroups: usize, max_sfb: usize) {
     for g in 0..ngroups {
         write_sections_short(w, &cbs[g * max_sfb..(g + 1) * max_sfb]);
     }
 }
 
-/// Encode one channel as an EightShort single_channel_element. One group of 8
+/// Encode one channel as an `EightShort` `single_channel_element`. One group of 8
 /// windows with flat scalefactors unless arm A1 (`psy.short_block_psy`) supplies a
 /// per-band shape, or arm 1a (`psy.window_grouping`) real groups shaped per group.
 #[allow(clippy::too_many_arguments)]
@@ -2498,7 +2522,7 @@ fn encode_channel_element_short(
 /// Per-SFB M/S decision + mixed spectra. M/S wins when `E_M·E_S < E_L·E_R` (the
 /// correlation criterion — raw energy always halves under the ½ scaling, so the
 /// *product* is what predicts bit savings). Returns (ch0 = M or L, ch1 = S or R,
-/// per-SFB ms_used).
+/// per-SFB `ms_used`).
 fn mid_side(
     l: &[f32],
     r: &[f32],
@@ -2613,7 +2637,7 @@ fn codebooks(quant: &[i32], swb: &[u16], is_short: bool, max_sfb: usize, groups:
     }
 }
 
-/// ms_mask_present (2 bits) + the per-SFB mask when mixed.
+/// `ms_mask_present` (2 bits) + the per-SFB mask when mixed.
 fn write_ms_used(w: &mut BitWriter, ms_used: &[bool]) {
     if ms_used.iter().all(|&b| !b) {
         w.write(0, 2);
@@ -2627,9 +2651,13 @@ fn write_ms_used(w: &mut BitWriter, ms_used: &[bool]) {
     }
 }
 
-/// One channel's individual_channel_stream body inside a common-window CPE:
-/// global_gain, section_data, scale_factor_data, the three flag bits, spectral_data
-/// (no ics_info — it is shared).
+/// One channel's `individual_channel_stream` body inside a common-window CPE:
+/// `global_gain`, `section_data`, `scale_factor_data`, the three flag bits, `spectral_data`
+/// (no `ics_info` — it is shared).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one argument per syntax element the bitstream writes; a struct would only rename them"
+)]
 fn write_channel_data(
     w: &mut BitWriter,
     cbs: &[u8],
@@ -2866,7 +2894,7 @@ fn intensity_decision(
     out
 }
 
-/// Encode a stereo pair as a common-window channel_pair_element with per-SFB M/S.
+/// Encode a stereo pair as a common-window `channel_pair_element` with per-SFB M/S.
 #[allow(clippy::too_many_arguments)]
 fn encode_cpe(
     w: &mut BitWriter,
@@ -3134,13 +3162,14 @@ pub struct AacEncoder {
     win_kbd: Vec<f32>,
     chans: Vec<Vec<f32>>,
     initialized: bool,
-    /// Encoded raw access units (raw_data_block, no ADTS) awaiting `next_packet`,
+    /// Encoded raw access units (`raw_data_block`, no ADTS) awaiting `next_packet`,
     /// each with its sample-domain PTS. Filled on `finish`.
     queue: VecDeque<(Vec<u8>, i64)>,
     flushed: bool,
 }
 
 impl AacEncoder {
+    #[must_use]
     pub fn new(config: AacEncoderConfig) -> Self {
         Self {
             sample_rate: 0,
@@ -3167,11 +3196,13 @@ impl AacEncoder {
     }
 
     /// The stream's sample rate (0 until the first PCM is pushed).
+    #[must_use]
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
 
     /// The stream's channel count (0 until the first PCM is pushed).
+    #[must_use]
     pub fn channels(&self) -> u16 {
         self.channels as u16
     }
@@ -3209,6 +3240,12 @@ impl AacEncoder {
     /// Buffer interleaved `f32` PCM in [-1, 1] (`interleaved.len()` must be a
     /// multiple of `channels`). The first push fixes the stream's channel count
     /// and sample rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] for more than six channels,
+    /// [`Error::InvalidData`] for a non-standard sample rate, and
+    /// [`Error::InvalidData`] if `channels` differs from the first push.
     pub fn push_pcm(&mut self, interleaved: &[f32], channels: u16, sample_rate: u32) -> Result<()> {
         self.init(channels, sample_rate)?;
         let ch = self.channels;
@@ -3229,6 +3266,10 @@ impl AacEncoder {
 
     /// Buffer planar `f32` PCM, one slice per channel (`planes.len()` is the
     /// channel count; all planes the same length).
+    ///
+    /// # Errors
+    ///
+    /// As [`push_pcm`](Self::push_pcm).
     pub fn push_pcm_planar(&mut self, planes: &[&[f32]], sample_rate: u32) -> Result<()> {
         self.init(planes.len() as u16, sample_rate)?;
         for (c, plane) in planes.iter().enumerate().take(self.channels) {
@@ -3237,7 +3278,7 @@ impl AacEncoder {
         Ok(())
     }
 
-    /// Encode all buffered samples into per-frame raw access units (raw_data_block,
+    /// Encode all buffered samples into per-frame raw access units (`raw_data_block`,
     /// no ADTS) with sample-domain PTS. A trailing all-zero block flushes the MDCT
     /// overlap so the final audio block decodes. Containers add their own framing
     /// (ADTS header for `.aac`, `esds` + raw samples for MP4).
@@ -3588,6 +3629,11 @@ impl AacEncoder {
     /// Retrieve the next encoded access unit. Returns [`Error::Again`] before
     /// [`finish`](AacEncoder::finish) has been called, and [`Error::Eof`] once
     /// fully drained.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Again`] until [`finish`](AacEncoder::finish) is called, then
+    /// [`Error::Eof`] once every packet has been returned.
     pub fn next_packet(&mut self) -> Result<EncodedPacket> {
         if let Some((data, pts)) = self.queue.pop_front() {
             return Ok(EncodedPacket {
@@ -3742,8 +3788,8 @@ mod tests {
         }
     }
 
-    /// The block-switching sequence OnlyLong → LongStart → EightShort → LongStop →
-    /// OnlyLong must reconstruct through the decoder's synthesis math (TDAC across
+    /// The block-switching sequence `OnlyLong` → `LongStart` → `EightShort` → `LongStop` →
+    /// `OnlyLong` must reconstruct through the decoder's synthesis math (TDAC across
     /// the transition windows) — the decisive check that the short filterbank and
     /// transition windows are exact inverses.
     #[test]
@@ -3860,7 +3906,7 @@ mod tests {
         assert!(!flags[0] && !flags[4], "steady frames must not be flagged");
     }
 
-    /// End-to-end: a signal with a sharp attack must actually emit EightShort
+    /// End-to-end: a signal with a sharp attack must actually emit `EightShort`
     /// blocks and still decode cleanly through our decoder.
     #[test]
     fn transient_encodes_short_and_decodes() {
@@ -5143,7 +5189,7 @@ mod multichannel {
         out
     }
 
-    /// Read the sequence of element ids from a raw_data_block, skipping each
+    /// Read the sequence of element ids from a `raw_data_block`, skipping each
     /// element's payload by decoding it.
     fn element_ids(packet: &[u8], sr: u32) -> Vec<u32> {
         // Walk ids by re-decoding: the decoder is the only thing that knows each
@@ -5474,7 +5520,7 @@ mod rung_a7 {
         assert_eq!(a, b);
     }
 
-    /// Fires on a scaled-copy pair and still decodes. A wrong is_pos sign or a
+    /// Fires on a scaled-copy pair and still decodes. A wrong `is_pos` sign or a
     /// desynchronized intensity accumulator shows up here immediately.
     #[test]
     fn a7_fires_and_round_trips() {

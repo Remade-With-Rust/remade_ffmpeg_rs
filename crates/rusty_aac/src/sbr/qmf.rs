@@ -366,7 +366,7 @@ fn qmf_window(p: &Plans, o: &mut [f32], vb: &[f32], win: &[f32]) {
 fn qmf_window_scalar(o: &mut [f32], vb: &[f32], win: &[f32]) {
     let bands = o.len();
     let vlen = 2 * bands;
-    o.iter_mut().for_each(|x| *x = 0.0);
+    o.fill(0.0);
     for i in 0..5 {
         let (va, wa) = (&vb[2 * vlen * i..][..bands], &win[2 * bands * i..][..bands]);
         let (vb2, wb) = (
@@ -378,7 +378,9 @@ fn qmf_window_scalar(o: &mut [f32], vb: &[f32], win: &[f32]) {
             o[j] += vb2[j] * wb[j];
         }
     }
-    o.iter_mut().for_each(|x| *x *= 1.0 / 32768.0);
+    for x in o.iter_mut() {
+        *x *= 1.0 / 32768.0;
+    }
 }
 
 /// SSE twin of [`qmf_window`].

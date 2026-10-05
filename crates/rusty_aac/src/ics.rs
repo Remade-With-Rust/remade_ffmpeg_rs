@@ -49,7 +49,7 @@ pub struct IcsInfo {
     /// Window shape for this block: false = sine, true = KBD.
     pub window_shape_kbd: bool,
     pub max_sfb: u8,
-    /// Number of transform windows (8 for EIGHT_SHORT, else 1).
+    /// Number of transform windows (8 for `EIGHT_SHORT`, else 1).
     pub num_windows: usize,
     /// Number of window groups.
     pub num_window_groups: usize,
