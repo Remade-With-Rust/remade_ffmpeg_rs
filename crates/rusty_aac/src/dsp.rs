@@ -59,6 +59,18 @@ fn dequant_formula(q: i32) -> f32 {
 /// Scalefactor gain `2^(0.25·(sf − 100))`, the per-band multiplier applied to
 /// dequantized coefficients.
 pub fn sf_gain(sf: i32) -> f32 {
+    // Regular scalefactors span 0..=255: tabulated with the same formula (a libm
+    // `pow` per band otherwise); anything else takes the formula.
+    static T: OnceLock<[f32; 256]> = OnceLock::new();
+    let t = T.get_or_init(|| std::array::from_fn(|i| sf_gain_formula(i as i32)));
+    match t.get(sf as usize) {
+        Some(&g) if sf >= 0 => g,
+        _ => sf_gain_formula(sf),
+    }
+}
+
+/// The defining formula (the table's source and oracle).
+fn sf_gain_formula(sf: i32) -> f32 {
     2f64.powf(0.25 * (sf as f64 - 100.0)) as f32
 }
 
@@ -1101,6 +1113,20 @@ mod fft_twin {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sf_gain_table {
+    #[test]
+    fn sf_gain_table_matches_formula() {
+        for sf in -300..600 {
+            assert_eq!(
+                super::sf_gain(sf).to_bits(),
+                super::sf_gain_formula(sf).to_bits(),
+                "sf={sf}"
+            );
         }
     }
 }
