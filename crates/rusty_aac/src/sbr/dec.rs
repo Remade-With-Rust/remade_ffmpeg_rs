@@ -243,6 +243,8 @@ pub(crate) struct SbrChannelState {
     /// Processing scratch kept across frames: every read in a call hits a value
     /// written earlier in that call, so it never needs re-zeroing.
     wk: Option<Box<Work>>,
+    /// The synthesis inputs X[38][64] per output channel, reused across frames.
+    xs: Option<Box<[Vec<[Cpx; 64]>; 2]>>,
 }
 
 impl SbrChannelState {
@@ -279,6 +281,7 @@ impl SbrChannelState {
             data: [SbrChannel::new(), SbrChannel::new()],
             ps: None,
             wk: None,
+            xs: None,
         };
         s.turnoff();
         s
@@ -1561,11 +1564,26 @@ impl SbrChannelState {
 
     /// The synthesis input X[38][64]: low band from X_low, high band from the
     /// adjusted Y of this frame and (for the first slots) the previous one.
-    fn x_gen(&self, wk: &Work, ch: usize, nts: usize) -> Vec<[Cpx; 64]> {
+    fn x_gen(&self, wk: &Work, ch: usize, nts: usize, x: &mut [[Cpx; 64]]) {
         let d = &self.data[ch];
         let i_f = 2 * nts;
         let i_temp = (2 * d.t_env_num_env_old).saturating_sub(i_f);
-        let mut x = vec![[[0f32; 2]; 64]; 38];
+        // Zero exactly the entries the copies below leave alone (every element
+        // gets one value, data or zero): above kx0+m0 in the carried-over
+        // slots, above kx1+m1 in this frame's slots, above kx1 in the lookahead.
+        let hi0 = (self.kx[0] + self.m[0]).min(64);
+        let hi1 = (self.kx[1] + self.m[1]).min(64);
+        let i_f_c = i_f.min(38);
+        for (i, row) in x.iter_mut().enumerate().take(38) {
+            let from = if i < i_temp {
+                hi0
+            } else if i < i_f_c {
+                hi1
+            } else {
+                self.kx[1]
+            };
+            row[from..].fill([0.0; 2]);
+        }
         let (y0, y1) = (&d.y[1 - d.ypos], &d.y[d.ypos]);
         for k in 0..self.kx[0] {
             for i in 0..i_temp {
@@ -1587,7 +1605,6 @@ impl SbrChannelState {
                 x[i][k] = y1[i][k];
             }
         }
-        x
     }
 }
 
@@ -1624,7 +1641,10 @@ pub(crate) fn apply(dec: &mut Decoder, el: &mut Element, ty: u8, n: usize) {
         sbr.ready_for_dequant = false;
     }
     let mut wk = sbr.wk.take().unwrap_or_else(|| Box::new(Work::new()));
-    let mut xs: Vec<Vec<[Cpx; 64]>> = Vec::with_capacity(2);
+    let mut xs = sbr
+        .xs
+        .take()
+        .unwrap_or_else(|| Box::new([vec![[[0f32; 2]; 64]; 38], vec![[[0f32; 2]; 64]; 38]]));
     for ch in 0..nch {
         let yp = sbr.data[ch].ypos;
         {
@@ -1648,22 +1668,28 @@ pub(crate) fn apply(dec: &mut Decoder, el: &mut Element, ty: u8, n: usize) {
                 }
             }
         }
-        xs.push(sbr.x_gen(&wk, ch, nts));
+        sbr.x_gen(&wk, ch, nts, &mut xs[ch]);
         drop(prof_hf);
     }
     sbr.wk = Some(wk);
+    let mut out_ch = nch;
     if ps_on {
+        // PS writes every band of every synthesized slot of the right channel
+        // without reading it, so it needs the left channel copied only when PS
+        // has not started.
         let top = sbr.kx[1] + sbr.m[1];
-        let mut x1 = xs[0].clone();
-        if let Some(ps) = sbr.ps.as_mut().filter(|p| p.started()) {
-            let _prof = crate::prof::scope(crate::prof::Stage::DecPs);
-            ps.apply(&mut xs[0], &mut x1, top);
+        let [x0, x1] = &mut *xs;
+        match sbr.ps.as_mut().filter(|p| p.started()) {
+            Some(ps) => {
+                let _prof = crate::prof::scope(crate::prof::Stage::DecPs);
+                ps.apply(x0, x1, top);
+            }
+            None => x1.copy_from_slice(x0),
         }
-        xs.truncate(1);
-        xs.push(x1);
+        out_ch = 2;
     }
     let outn = if downsampled { n } else { 2 * n };
-    for (ch, x) in xs.iter().enumerate() {
+    for (ch, x) in xs.iter().enumerate().take(out_ch) {
         let _prof = crate::prof::scope(crate::prof::Stage::DecSbrSynthesis);
         qmf_synthesis(
             &mut el.ch[ch].output[..outn],
@@ -1673,6 +1699,7 @@ pub(crate) fn apply(dec: &mut Decoder, el: &mut Element, ty: u8, n: usize) {
             downsampled,
         );
     }
+    sbr.xs = Some(xs);
 }
 
 #[cfg(test)]
