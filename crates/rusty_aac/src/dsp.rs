@@ -506,7 +506,9 @@ pub fn imdct_half(spec: &[f32], out: &mut [f32], gain: f64) {
 /// **bit-identical** (`fft_simd_matches_scalar`).
 pub(crate) struct Radix2Fft {
     n: usize,
-    rev: Vec<u16>,
+    /// The bit-reversal permutation as its swaps (`i < rev(i)` only), so the
+    /// permutation costs no compare per element.
+    swaps: Vec<(u16, u16)>,
     /// Per-stage twiddles laid out contiguously: the stage with half-length `h`
     /// (h = 2, 4, ..., n/2) holds `w[j·n/(2h)]` for `j < h` at offset `h - 2`, so a
     /// vector of butterflies loads its twiddles in one go.
@@ -520,8 +522,11 @@ impl Radix2Fft {
     pub(crate) fn new(n: usize, sign: f64) -> Radix2Fft {
         assert!(n.is_power_of_two() && n >= 2);
         let bits = n.trailing_zeros();
-        let rev = (0..n)
-            .map(|i| ((i as u32).reverse_bits() >> (32 - bits)) as u16)
+        let swaps = (0..n)
+            .filter_map(|i| {
+                let j = ((i as u32).reverse_bits() >> (32 - bits)) as usize;
+                (i < j).then_some((i as u16, j as u16))
+            })
             .collect();
         let tw: Vec<[f32; 2]> = (0..n / 2)
             .map(|t| {
@@ -538,7 +543,7 @@ impl Radix2Fft {
         }
         Radix2Fft {
             n,
-            rev,
+            swaps,
             stw,
             #[cfg(all(feature = "simd", target_arch = "x86_64"))]
             avx: std::is_x86_feature_detected!("avx"),
@@ -573,11 +578,8 @@ impl Radix2Fft {
     /// every path).
     #[inline(always)]
     fn permute_and_first_stage(&self, buf: &mut [[f32; 2]]) {
-        for i in 0..self.n {
-            let j = self.rev[i] as usize;
-            if i < j {
-                buf.swap(i, j);
-            }
+        for &(i, j) in &self.swaps {
+            buf.swap(i as usize, j as usize);
         }
         for pair in buf.chunks_exact_mut(2) {
             let (a, b) = (pair[0], pair[1]);
