@@ -31,6 +31,30 @@ and **AAC-LC encoder**. Zero dependencies, no C, no FFI, Apache-2.0.
 
 ---
 
+## What's new in 1.0.1
+
+A decode-speed release: fifteen kernel changes, each proven by instruction count
+(callgrind, same binary per arm) and **bit-identical** to 1.0.0 — the output
+checksum of every decoded sample is unchanged, and the ISO conformance census is
+the same 81 EXACT + 2 KNOWN.
+
+| instructions per decode | 1.0.0 | 1.0.1 | |
+|---|---:|---:|---:|
+| AAC-LC | 64.4 M | 53.9 M | **−16%** |
+| HE-AAC v1 (SBR) | 884.8 M | 619.6 M | **−30%** |
+| HE-AAC v2 (SBR + PS) | 204.8 M | 158.7 M | **−23%** |
+
+- Two-level Huffman table (no bit-serial scan for long codes) and tabulated
+  spectral tuples.
+- Per-frame scratch kept across frames (ICS, SBR, QMF synthesis input) instead
+  of zeroed allocations; the IMDCT's stack scratch is no longer zero-filled.
+- FFT: bit reversal as a precomputed swap list; the first two radix-2 stages
+  now run in the AVX twin.
+- SBR QMF banks: AVX twins for the analysis window/fold/pre-twiddle and the
+  synthesis slot split, butterfly and window (SSE/NEON twins for the window).
+
+These are instruction counts, not wall-clock times; no API changes.
+
 ## What's new in 1.0.0
 
 1.0.0 is the decoder release, and the stable API.
