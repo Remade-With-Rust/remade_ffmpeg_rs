@@ -419,6 +419,29 @@ pub fn adts_raw_blocks(data: &[u8]) -> u8 {
 mod tests {
     use super::*;
 
+    /// Fuzz finding (2026-10-04): a fill element with `count = 15` and an escape
+    /// byte of 0 computed `esc as usize - 1` and underflowed — a panic in any
+    /// build with overflow checks (this test profile has them on). Must decode
+    /// to an `Ok` or a typed error.
+    #[test]
+    fn fill_element_zero_escape_does_not_underflow() {
+        // ID_FIL (110), count 15 (1111), esc_count 0, then 14 zero fill bytes
+        // and ID_END (111); zero-padded to a byte boundary.
+        let mut bits = String::from("110111100000000");
+        bits.push_str(&"0".repeat(14 * 8));
+        bits.push_str("111");
+        while bits.len() % 8 != 0 {
+            bits.push('0');
+        }
+        let au: Vec<u8> = bits
+            .as_bytes()
+            .chunks(8)
+            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 2).unwrap())
+            .collect();
+        let mut dec = AacDecoder::with_config_bytes(&[0x12, 0x10]).unwrap();
+        let _ = dec.decode(&au, None);
+    }
+
     #[test]
     fn asc_stereo_44100_aac_lc() {
         // object_type=2 (00010), sf_index=4 (0100)=44100, channels=2 (0010).

@@ -540,7 +540,11 @@ impl Decoder {
                 }
                 ID_FIL => {
                     if elem_id == 15 {
-                        elem_id += r.read_bits(8)? as usize - 1;
+                        // `cnt = 15 + esc_count - 1` (ISO 14496-3 §4.4.2.7). Add
+                        // first: `esc as usize - 1` underflowed for esc = 0, a
+                        // panic in any build with overflow checks.
+                        elem_id += r.read_bits(8)? as usize;
+                        elem_id -= 1;
                     }
                     if r.bits_left() < 8 * elem_id {
                         return Err(Error::invalid("aac: fill element overruns the frame"));
