@@ -377,6 +377,9 @@ pub struct ChannelData {
     pub tns: Tns,
     /// Spectral coefficients, windows at a stride of 128.
     pub coeffs: Vec<f32>,
+    /// Quantized-integer scratch, reused across frames. Never needs clearing:
+    /// the dequantiser reads exactly the bands the spectral decode wrote.
+    pub quant: Vec<i32>,
 }
 
 impl Default for ChannelData {
@@ -386,6 +389,7 @@ impl Default for ChannelData {
             sfo: [0; 128],
             tns: Tns::default(),
             coeffs: vec![0.0; 1024],
+            quant: vec![0; 1024],
         }
     }
 }
@@ -528,7 +532,9 @@ pub fn decode_ics(
 
     // spectral_data (integers first, so pulses stay exact)
     let swb = ics.swb;
-    let mut quant = vec![0i32; 1024];
+    // Taken for the call (a failed frame just reallocates it next time).
+    let mut quant = std::mem::take(&mut cd.quant);
+    quant.resize(1024, 0);
     let mut wbase = 0usize;
     let mut tuple = [0i32; 4];
     for g in 0..info.num_window_groups {
@@ -628,5 +634,6 @@ pub fn decode_ics(
         }
         wbase += glen;
     }
+    cd.quant = quant;
     Ok(())
 }
