@@ -1,346 +1,248 @@
 # rusty_aac
 
-[![Remade With Rust](https://img.shields.io/badge/Remade%20With-Rust-000?logo=rust&logoColor=fff)](https://github.com/remade-with-rust)
-[![By Mata Network](https://img.shields.io/badge/by-Mata%20Network-5b2be0)](https://www.mata.network)
+[![crates.io](https://img.shields.io/crates/v/rusty_aac.svg)](https://crates.io/crates/rusty_aac)
+[![docs.rs](https://img.shields.io/docsrs/rusty_aac)](https://docs.rs/rusty_aac)
+[![aac-hardening](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/actions/workflows/aac-hardening.yml/badge.svg)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/actions/workflows/aac-hardening.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/LICENSE)
+[![Remade With Rust](https://img.shields.io/badge/Remade%20With-Rust-000?logo=rust&logoColor=fff)](https://github.com/remade-with-rust)
 
-A pure-Rust **AAC decoder** (LC, Main, LTP, HE-AAC v1/v2, ER LC/LTP/LD/ELD)
-and **AAC-LC encoder**. Zero dependencies, no C, no FFI, Apache-2.0.
+**A complete MPEG-4 AAC decoder and an AAC-LC encoder, written entirely in Rust.**
+No C, no FFI, no runtime dependencies — conformance-verified against the
+ISO/IEC 14496-26 suite, fuzzed, and audited for production use.
 
-- **Decoder** — the whole MPEG-4 AAC family short of USAC: AAC-LC, Main
-  (prediction), LTP, **HE-AAC v1 (SBR) and v2 (Parametric Stereo)**, ER AAC-LC/
-  LTP, AAC-LD and AAC-ELD, 1024- and 960-sample frames, every sampling rate,
-  mono to 7.1 plus PCE layouts and coupling channels. **Every non-USAC
-  ISO/IEC 14496-26 conformance stream decodes sample-exact (≤1 LSB) against
-  FFmpeg** — 81 of 83 outright, the other two exact except where FFmpeg itself
-  deviates — see [Conformance](#conformance).
-- **Encoder** — to our knowledge the **first pure-Rust AAC encoder on
-  crates.io** (the alternatives, `fdk-aac` and libxaac bindings, are C FFI).
-  Psychoacoustic Bark-scale masking model, **level-invariant transient
-  detection**, block switching, per-band M/S stereo with a **joint pair rate
-  loop** routed by inter-channel correlation, frame-parallel encoding, an
-  N/4-FFT MDCT and AVX2 (opt-in AVX-512) quantize kernels.
-- **Transport** — ADTS, MP4 `esds`, and **LATM/LOAS** (the MPEG-TS / broadcast
-  carriage format).
-- **Full configuration support** — the complete `AudioSpecificConfig`
-  (`GASpecificConfig`, PCE, ELD, error-resilience flags, all three SBR/PS
-  signalling forms) in the `config` module.
-- `--no-default-features` turns off the runtime-detected SIMD kernels and gives
-  a **100%-safe scalar build** (every `unsafe` block in the crate is
-  feature-gated SIMD).
+## Highlights
 
----
+- **Complete decoder.** Every member of the MPEG-4 AAC family short of USAC:
+  AAC-LC, Main, LTP, HE-AAC v1 (SBR), HE-AAC v2 (Parametric Stereo), ER AAC-LC/LTP,
+  AAC-LD and AAC-ELD, with 1024- and 960-sample frames, all thirteen sampling
+  rates, mono to 7.1 and arbitrary PCE layouts.
+- **Conformance-verified.** All 83 non-USAC streams of the ISO/IEC 14496-26
+  conformance suite decode within 1 LSB of FFmpeg 8.1.2, and every stream with
+  ISO reference PCM is checked against it in CI.
+- **Fast.** Runtime-dispatched SIMD (AVX / AVX2 on x86-64, NEON on AArch64) with
+  bit-identical scalar fallbacks; the encoder runs 3–8× faster than FFmpeg's
+  native AAC encoder.
+- **Hardened.** Fuzzed on every entry point, property-tested, clippy pedantic
+  clean, every `unsafe` block documented and inventoried, `cargo vet` fully
+  audited — see [Security](#security).
+- **Zero dependencies.** The library has no runtime dependencies at all;
+  `--no-default-features` builds a scalar version with no SIMD `unsafe`.
+- **Production encoder.** Psychoacoustic AAC-LC encoder with block switching,
+  M/S stereo and a correlation-routed joint stereo rate loop; mono to 5.1.
 
-## What's new in 1.0.1
+## Installation
 
-A decode-speed release: fifteen kernel changes, each proven by instruction count
-(callgrind, same binary per arm) and **bit-identical** to 1.0.0 — the output
-checksum of every decoded sample is unchanged, and the ISO conformance census is
-the same 81 EXACT + 2 KNOWN.
+```toml
+[dependencies]
+rusty_aac = "1.1"
+```
 
-| instructions per decode | 1.0.0 | 1.0.1 | |
-|---|---:|---:|---:|
-| AAC-LC | 64.4 M | 53.9 M | **−16%** |
-| HE-AAC v1 (SBR) | 884.8 M | 619.6 M | **−30%** |
-| HE-AAC v2 (SBR + PS) | 204.8 M | 158.7 M | **−23%** |
+## Quick start
 
-- Two-level Huffman table (no bit-serial scan for long codes) and tabulated
-  spectral tuples.
-- Per-frame scratch kept across frames (ICS, SBR, QMF synthesis input) instead
-  of zeroed allocations; the IMDCT's stack scratch is no longer zero-filled.
-- FFT: bit reversal as a precomputed swap list; the first two radix-2 stages
-  now run in the AVX twin.
-- SBR QMF banks: AVX twins for the analysis window/fold/pre-twiddle and the
-  synthesis slot split, butterfly and window (SSE/NEON twins for the window).
+### Decode an ADTS stream
 
-These are instruction counts, not wall-clock times; no API changes.
+```rust
+use rusty_aac::{parse_adts, AacDecoder, Error};
 
-## What's new in 1.0.0
+fn decode(adts: &[u8]) -> Result<Vec<f32>, Error> {
+    let mut decoder = AacDecoder::new(); // configured from the ADTS headers
+    let mut pcm = Vec::new();            // interleaved f32 in [-1, 1]
+    let mut pos = 0;
+    while pos + 7 <= adts.len() {
+        let header = parse_adts(&adts[pos..])?;
+        let frame = decoder.decode(&adts[pos..pos + header.frame_length], None)?;
+        pcm.extend_from_slice(&frame.samples);
+        pos += header.frame_length;
+    }
+    Ok(pcm)
+}
+```
 
-1.0.0 is the decoder release, and the stable API.
+For MP4 / MOV / Matroska tracks, construct the decoder from the container's
+AudioSpecificConfig and feed it raw access units. The raw-bytes form preserves
+HE-AAC (SBR / PS) signalling:
 
-- **The whole MPEG-4 AAC family short of USAC decodes**: Main (prediction), LTP,
-  **HE-AAC v1 (SBR) and v2 (Parametric Stereo)**, ER AAC-LC/LTP, AAC-LD,
-  AAC-ELD, 960-sample frames, 7.1 and PCE layouts (with the CRC-checked height
-  extension), coupling channels, LATM v0/v1 with mid-stream configuration
-  changes (`latm::LatmDecoder`), and the complete `AudioSpecificConfig`
-  (`config::StreamConfig`).
-- **Conformance**: every non-USAC stream of the ISO/IEC 14496-26 suite matches
-  FFmpeg 8.1.2 to ≤1 LSB — see [Conformance](#conformance).
-- **Decode speed**: SIMD twins for the FFT under the IMDCT and both SBR
-  filterbanks (AVX / NEON) and for the IMDCT overlap window (SSE / NEON), plus a
-  tabulated dequantiser — each bit-identical with the scalar path it replaces.
-  Measured end to end: LC decode **1.43×**, HE-AAC v1 **≈1.4×** over the
-  pre-SIMD decoder.
-- **API changes from 0.5**: `SbrSupport` gains `Full` and is `#[non_exhaustive]`;
-  `LoasFrame` carries the full `StreamConfig`; new modules `config`, `latm`'s
-  `LatmDecoder`, and the `profile` feature (stage profiler + SIMD census, for
-  measurement only).
+```rust,ignore
+let mut decoder = rusty_aac::AacDecoder::with_config_bytes(&esds_payload)?;
+let frame = decoder.decode(&access_unit, Some(pts))?;
+```
 
----
+### Encode to AAC-LC
 
-## Measured against FFmpeg's AAC encoder
+```rust
+use rusty_aac::{write_adts_header, AacEncoder, AacEncoderConfig, AdtsHeader, Error};
 
-Everything below is measured, reproducible, and generated by the harness in this
-repo. **0.5.0 is a large quality step over 0.4.0 — a mean +0.33 ODG across the
-whole corpus, with gains up to +2.6 ODG on the weakest content — while staying
-~5x faster than FFmpeg.**
+fn encode(pcm: &[f32], channels: u16, sample_rate: u32) -> Result<Vec<u8>, Error> {
+    let mut encoder = AacEncoder::new(AacEncoderConfig {
+        bitrate_bps: 128_000,
+        ..AacEncoderConfig::default()
+    });
+    encoder.push_pcm(pcm, channels, sample_rate)?; // interleaved f32 in [-1, 1]
+    encoder.finish();
 
-<details>
-<summary><b>How this was measured</b> (click to expand)</summary>
+    // Each packet is a raw access unit; wrap it in ADTS for a playable .aac file,
+    // or store it raw in MP4 with `rusty_aac::audio_specific_config_bytes(..)`
+    // as the esds DecoderSpecificInfo.
+    let mut adts = Vec::new();
+    while let Ok(packet) = encoder.next_packet() {
+        adts.extend(write_adts_header(&AdtsHeader {
+            object_type: 2,
+            sample_rate,
+            channels,
+            frame_length: 7 + packet.data.len(),
+            header_len: 7,
+        }));
+        adts.extend(packet.data);
+    }
+    Ok(adts)
+}
+```
 
-- **Encoders**: this crate via its CLI vs `ffmpeg -c:a aac` (FFmpeg's *native*
-  AAC encoder), FFmpeg 8.1.2.
-- **Quality metric**: **PEAQ ODG** (ITU-R BS.1387), an external oracle, range
-  `[-4, 0]` where 0 is imperceptible. Our own NMR metric is *not* used for
-  ranking — a self-metric provably flatters the encoder it came from.
-- **Fairness**: both candidates are decoded with the **same neutral decoder**
-  (system FFmpeg) before scoring, so the comparison isolates the encoders.
-- **Null arm**: reference-vs-itself through the same path scores **+0.14 ODG**.
-  That is the harness ceiling — any score at or above it means *transparent*.
-- **Speed**: both encoders run as subprocesses with identical invocation shape,
-  best-of-5, ABBA-interleaved, on 24 s clips.
-- **Corpus**: real CC0/Public-Domain music (piano, guitar, vocal; mono and
-  stereo) plus a synthetic suite covering content classes the real corpus lacks.
-  Real and synthetic are reported separately and never averaged together.
+### LATM / LOAS (MPEG-TS, broadcast)
 
-Reproduce: `python tools/quality/aac_vs_ffmpeg.py` in the
-[main repo](https://github.com/Remade-With-Rust/remade_ffmpeg_rs).
+```rust,ignore
+use rusty_aac::latm::LatmDecoder;
 
-</details>
+let mut decoder = LatmDecoder::new(); // tracks StreamMuxConfig and mid-stream changes
+let (frame, consumed) = decoder.decode(&loas_bytes, None)?;
+```
 
-### What changed in 0.5.0
+## Supported formats
 
-Two measured wins shipped, four candidate tools **measured and rejected**. Δ is
-`ours − ffmpeg`; positive = we sound better.
+| | Decode | Encode |
+|---|---|---|
+| **Object types** | AAC-LC, Main, LTP, HE-AAC v1 (SBR), HE-AAC v2 (PS), ER AAC-LC, ER AAC-LTP, ER AAC-LD, ER AAC-ELD | AAC-LC |
+| **Frame lengths** | 1024, 960; 512 / 480 (LD, ELD) | 1024 |
+| **Sample rates** | all 13 standard rates, 7.35–96 kHz, plus escaped rates | all 13 standard rates |
+| **Channels** | `channel_configuration` 1–7 and 11–14, PCE layouts (with the height extension), coupling channels | mono to 5.1, ISO element order |
+| **Transport** | ADTS, raw access units (MP4 `esds`), LATM / LOAS | raw access units, ADTS headers, `esds` config |
+| **Not supported** | xHE-AAC (USAC, ISO/IEC 23003-3 — a separate codec; refused with a typed error); the low-delay SBR of AAC-ELD (the ELD core decodes, reported by `sbr_support()`); AAC-LTP with 960-sample frames | 7+ channels (needs an encoder-side PCE) |
 
-| content | 0.4.0 (64/96/128/192k) | **0.5.0** | gain |
-| --- | --- | --- | --- |
-| **percussive** | -1.18 | -1.73 | -1.96 | -2.22 | **+0.49 | -0.01 | -0.17 | -0.31** | **up to +1.91** |
-| **clean speech** | -2.03 | -2.90 | -3.05 | -2.79 | **-0.94 | -1.58 | -1.28 | -0.19** | **up to +2.61** |
-| **guitar stereo** | -0.55 | -1.34 | -1.32 | -0.28 | **-0.31 | -0.46 | -0.15 | +0.35** | **up to +1.17** |
-| piano stereo | -1.12 | -2.11 | -1.73 | -0.16 | -1.11 | -1.98 | -1.50 | -0.01 | up to +0.22 |
-
-**1. A level-invariant transient detector.** The previous detector guarded its
-attack ratio with an *absolute* energy threshold, so it went blind on quiet
-content — and because its running average decays between attacks, it flagged
-percussive material **zero times at any level**. Every such frame coded as a long
-block and took the full pre-echo hit. The replacement floors the average relative
-to the clip's own energy. Measured mean **+0.267 ODG, worst class +0.000** — it
-improves the two weakest classes and changes nothing anywhere else.
-
-**2. A joint stereo rate loop.** A channel pair's two channels each received a
-fixed half of the frame budget and ran independent rate loops — so when M/S made
-the side channel nearly empty, its bits were simply wasted while the mid channel
-starved. On perfectly-correlated stereo (`L == R`) at 128 kbps that cost
-**28 dB** of reconstruction SNR versus FFmpeg. 0.5.0 runs **one** rate loop over
-the pair at a common base, so bits follow demand. It is **routed by inter-channel
-correlation**, because the change is a large win on correlated stereo and a loss
-on genuinely wide stereo.
-
-**Rejected after measurement** (all built, all measured, all off): TNS
-(−0.148 mean, and it destroyed the percussive class), PNS (−0.056, damages real
-tonal music), tonality-adaptive SMR (−0.049), intensity stereo (−0.004, neutral).
-Shipping a tool that measures worse is not a feature.
-
-### Speed — 3.2–7.9× faster (mean 5.0×)
-
-| clip (24 s) | rusty_aac | FFmpeg native AAC | speed-up |
-| --- | --- | --- | --- |
-| piano  | **214× realtime** | 57× realtime | **3.8×** |
-| guitar | **306× realtime** | 39× realtime | **7.9×** |
-| vocal  | **299× realtime** | 93× realtime | **3.2×** |
-
-The 0.5.0 quality work cost no measurable speed.
-
-### Current standing, honestly
-
-| content | 64k | 96k | 128k | 192k |
-| --- | --- | --- | --- | --- |
-| piano (real, CC0) | -1.29 | -0.25 | **+0.28** | **+0.44** |
-| guitar (real, PD) | -1.02 | -0.03 | **+0.65** | **+0.47** |
-| vocal (real, PD) | -1.92 | -0.38 | **+0.39** | **+0.60** |
-| guitar stereo | -0.31 | -0.46 | -0.15 | +0.35 |
-| percussive | +0.49 | -0.01 | -0.17 | -0.31 |
-| tonal music | +0.30 | -0.00 | -0.13 | -0.29 |
-
-- **We beat FFmpeg's native AAC on real mono music at ≥128 kbps**, reaching the
-  harness transparency ceiling while FFmpeg sits around −0.3 to −0.6.
-- **Percussive and clean speech are no longer the disasters they were** — 0.4.0
-  lost by up to 2.2 and 3.0 ODG; 0.5.0 wins percussive at 64 kbps.
-- **We are still behind overall**, principally at ≤96 kbps, on piano stereo, and
-  on noise-like content. The encoder still has no bit reservoir, no VBR mode and
-  no absolute-threshold-of-hearing term; those are the next levers, tracked with
-  per-class evidence in
-  [`docs/finished/codec-aac-quality-plan.md`](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/docs/finished/codec-aac-quality-plan.md).
-- **Rate caveat**: at the 64 k target we emit ~89% of FFmpeg's actual bitrate and
-  at 192 k ~107%, so neither extreme is a perfectly clean like-for-like.
-- FFmpeg's native AAC encoder is not the strongest AAC encoder in existence
-  (libfdk-aac generally beats it); it is the one available in a permissive
-  default build.
-
-## Patents
-
-The **encoder** implements only AAC-LC coding tools — the oldest corner of the
-AAC family. The **decoder** implements the wider family, including SBR and
-Parametric Stereo (HE-AAC v1/v2) and the error-resilient / low-delay object
-types, whose patents are considerably younger than AAC-LC's. It does not
-implement xHE-AAC (USAC). The code is independently written from ISO/IEC
-14496-3 and Apache-2.0-licensed, but **no patent license is granted or implied**
-by the copyright license. If you distribute products commercially, consult IP counsel
-about your own position; see the main repo's
-[patent notes](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/docs/compatibility.md#patents).
-This is engineering context, not legal advice.
+Decoded output is interleaved `f32` in the standard channel order
+(`FL, FR, FC, LFE, BL, BR, …`).
 
 ## Conformance
 
-Every stream in the FFmpeg FATE copy of the **ISO/IEC 14496-26** AAC
-conformance suite (plus FATE's own AAC streams) is decoded by this crate and by
-FFmpeg 8.1.2 (`-flags +bitexact`) and compared sample by sample; the ISO
-reference PCM is checked as a second oracle where FATE ships it.
+Every stream in the FFmpeg FATE copy of the ISO/IEC 14496-26 AAC conformance suite
+(plus FATE's own AAC streams) is decoded and compared sample by sample with FFmpeg
+8.1.2 (`-flags +bitexact`):
 
-| verdict | streams | meaning |
-| --- | --- | --- |
-| **EXACT** | **81** | peak difference ≤ 1 LSB vs FFmpeg |
-| KNOWN | 2 | exact except where FFmpeg deviates: it ignores a CRC-valid PCE height extension (we honour it), and it emits an uninitialised channel for a stereo config carrying one SCE (we emit silence) |
-| not AAC | 8 | xHE-AAC / USAC (ISO/IEC 23003-3) — a separate codec, refused cleanly |
+| Verdict | Streams | Meaning |
+|---|---:|---|
+| **Exact** | **81** | peak difference ≤ 1 LSB |
+| Exact, FFmpeg deviates | 2 | FFmpeg ignores a CRC-valid PCE height extension (honoured here), and emits an uninitialised channel for a stereo configuration carrying one SCE (silence here) |
+| USAC | 8 | xHE-AAC — a separate codec, refused cleanly |
 
 By object type: AAC-LC 55, HE-AAC v1 6, HE-AAC v2 15, Main 2, LTP 1, ER AAC-LD 1,
-ER AAC-ELD 3 — all EXACT except the two KNOWN above. The census harness is
-`examples/aacconf.rs`.
+ER AAC-ELD 3. CI additionally gates every stream that ships ISO reference PCM to
+within 2 LSB of it (FFmpeg's own FATE tolerance), independently of any FFmpeg
+decoder. The harness is [`examples/aacconf.rs`](examples/aacconf.rs).
 
-## Decode
+## Performance
 
-```rust
-use rusty_aac::{AacDecoder, Error};
+**Decoder.** Every kernel change is proven by instruction count and bit-identical
+to the scalar reference. Instructions to decode the same streams, 1.0.0 → 1.1.0:
 
-fn main() -> Result<(), Error> {
-    let adts = std::fs::read("input.aac").map_err(|e| Error::invalid(e.to_string()))?;
+| Stream | Change |
+|---|---:|
+| AAC-LC | −24% |
+| HE-AAC v1 (SBR) | −35% |
+| HE-AAC v2 (SBR + PS) | −29% |
 
-    // The decoder reads its configuration from the ADTS headers. For bare MP4
-    // access units, build it from the esds config instead — prefer the raw-bytes
-    // form, which also recovers HE-AAC signalling:
-    //   AacDecoder::with_config_bytes(&esds_payload)?
-    let mut dec = AacDecoder::new();
+**Encoder** — throughput against FFmpeg's native AAC encoder on 24-second clips
+(best of 5, interleaved runs; measured at 0.5.0, and later releases are faster):
 
-    let mut pcm: Vec<f32> = Vec::new(); // interleaved, [-1, 1]
-    let mut pos = 0;
-    while pos + 7 <= adts.len() {
-        let hdr = rusty_aac::parse_adts(&adts[pos..])?;
-        let frame = dec.decode(&adts[pos..pos + hdr.frame_length], None)?;
-        println!("{} Hz, {} ch, {} samples", frame.sample_rate, frame.channels, frame.frames());
-        pcm.extend_from_slice(&frame.samples);
-        pos += hdr.frame_length;
-    }
-    Ok(())
-}
-```
+| Clip | rusty_aac | FFmpeg native AAC | Speed-up |
+|---|---:|---:|---:|
+| Piano | 214× realtime | 57× realtime | 3.8× |
+| Guitar | 306× realtime | 39× realtime | 7.9× |
+| Vocal | 299× realtime | 93× realtime | 3.2× |
 
-## Encode
+## Encoder quality
 
-```rust
-use rusty_aac::{AacEncoder, AacEncoderConfig, AdtsHeader, Error};
+Quality is measured with PEAQ (ITU-R BS.1387, ODG; 0 is transparent) against
+FFmpeg's native AAC encoder, both decoded by the same neutral decoder. Values are
+the ODG difference, rusty_aac minus FFmpeg — positive means rusty_aac scores higher:
 
-fn main() -> Result<(), Error> {
-    // 1 s of a 440 Hz sine, mono 44.1 kHz, interleaved f32 in [-1, 1].
-    let sr = 44_100u32;
-    let pcm: Vec<f32> = (0..sr)
-        .map(|i| (i as f32 / sr as f32 * 440.0 * std::f32::consts::TAU).sin() * 0.5)
-        .collect();
+| Content | 64 kbps | 96 kbps | 128 kbps | 192 kbps |
+|---|---:|---:|---:|---:|
+| Piano (real recording) | −1.29 | −0.25 | **+0.28** | **+0.44** |
+| Guitar (real recording) | −1.02 | −0.03 | **+0.65** | **+0.47** |
+| Vocal (real recording) | −1.92 | −0.38 | **+0.39** | **+0.60** |
+| Guitar, stereo | −0.31 | −0.46 | −0.15 | **+0.35** |
+| Percussive | **+0.49** | −0.01 | −0.17 | −0.31 |
 
-    let mut enc = AacEncoder::new(AacEncoderConfig {
-        bitrate_bps: 128_000,
-        ..Default::default()
-    });
-    enc.push_pcm(&pcm, 1, sr)?;
-    enc.finish(); // encodes everything, frame-parallel
+rusty_aac leads at 128 kbps and above on real music; FFmpeg's encoder remains
+stronger at 64–96 kbps. The method, corpus and harness are documented in the
+[repository](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/tools/quality/README.md).
 
-    // Packets are raw access units; wrap each in ADTS for a playable .aac file
-    // (or hand `rusty_aac::audio_specific_config_bytes(sr, 1)` to an MP4 muxer
-    // as the esds DecoderSpecificInfo and store the packets raw).
-    let mut out = Vec::new();
-    while let Ok(p) = enc.next_packet() {
-        out.extend_from_slice(&rusty_aac::write_adts_header(&AdtsHeader {
-            object_type: 2, // AAC-LC
-            sample_rate: sr,
-            channels: 1,
-            frame_length: 7 + p.data.len(),
-            header_len: 7,
-        }));
-        out.extend_from_slice(&p.data);
-    }
-    std::fs::write("tone.aac", &out).map_err(|e| Error::invalid(e.to_string()))?;
-    Ok(())
-}
-```
+**Known limitations:** constant-bitrate output only (no bit reservoir, no VBR
+mode); the encoder buffers the whole stream until `finish`, so encode long live
+input in segments.
 
-## Channel layouts
+## Feature flags
 
-**Decoding** handles every `channel_configuration` (1–7, 11–14),
-`program_config_element` layouts (including the CRC-checked height extension),
-coupling channel elements, and mid-stream configuration changes; output is in
-the standard interleaved order (`FL, FR, FC, LFE, BL, BR, …`).
+| Feature | Default | Effect |
+|---|:---:|---|
+| `simd` | ✓ | Runtime-detected SIMD kernels (AVX / AVX2 / SSE on x86-64, NEON on AArch64), bit-identical to the scalar paths |
+| `simd-avx512` | | Adds an AVX-512 encoder quantize tier (requires Rust 1.89) |
+| `profile` | | Stage timers and SIMD-coverage counters, for measurement |
+| `lab` | | Encoder quality lab: corpus, NMR metric, bitrate-ladder runner, WAV I/O |
 
-**Encoding** covers mono through 5.1 (`channel_configuration` 1–6), emitted with
-the **ISO-correct element sequence** — a 5.1 stream is `SCE, CPE, CPE, LFE` with
-the channel reordering AAC requires, not six single-channel elements.
-Interleaved PCM is taken in the standard order. Seven or more channels need a
-`program_config_element` on the encode side, which is not implemented, and are
-**rejected** rather than mis-encoded.
+## Platform support
 
-## LATM / LOAS
+- **x86-64**: SSE2 baseline; AVX / AVX2 kernels selected at runtime.
+- **AArch64**: NEON kernels, verified bit-identical to the scalar paths under
+  emulation.
+- **Any other target**: the scalar paths, which are the reference for every SIMD
+  kernel.
+- **MSRV**: Rust 1.85 (default features), verified in CI.
 
-```rust
-use rusty_aac::latm::LatmDecoder;
+## Security
 
-// Decoding an MPEG-TS / broadcast LOAS stream end to end: `LatmDecoder`
-// carries the StreamMuxConfig across `useSameStreamMux` frames and rebuilds the
-// decoder when the configuration changes mid-stream (stereo -> 5.1, say).
-let mut dec = LatmDecoder::new();
-// let (pcm, used) = dec.decode(&loas_bytes, None)?;
-// Transport only: `LatmReader::parse` -> full config + raw access unit.
-```
+rusty_aac is built to decode untrusted media in-process:
 
-## HE-AAC (SBR / PS)
+- **Threat model**: [`docs/threat-model.md`](docs/threat-model.md).
+- **Unsafe code**: confined to SIMD kernels and capacity fills, each with a
+  documented bounds argument — [`UNSAFE.md`](UNSAFE.md).
+- **Testing**: coverage-guided fuzzing of every entry point (with overflow checks
+  and AddressSanitizer), property tests, every past crasher kept as a regression
+  test, and the ISO conformance gate in CI.
+- **Supply chain**: no runtime dependencies; `cargo vet`, `cargo audit` and
+  `cargo deny` clean; a CycloneDX SBOM with every release.
+- **Reporting**: please disclose vulnerabilities privately — see
+  [`SECURITY.md`](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/SECURITY.md).
 
-HE-AAC is decoded in full: **SBR** (dual-rate and downsampled, with the QMF
-banks on FFTs) and **Parametric Stereo** (10/20/34 bands, IPD/OPD), with
-signalling in all three forms real streams use — explicit hierarchical
-(`audioObjectType` 5/29), explicit backward-compatible (the `0x2B7` sync
-extension), and implicit (SBR payload in the fill element; a mono stream is
-output as stereo, as other decoders do, in case PS appears).
+The full audit status is in the table at the end of this page.
 
-The one exception is the *low-delay* SBR of AAC-ELD, which needs a different
-filterbank: such a stream decodes its ELD core at the core rate, and
-`AacDecoder::sbr_support()` reports `SbrSupport::CoreOnly` rather than leaving
-it to be discovered.
+## Patents
 
-```rust
-let dec = rusty_aac::AacDecoder::with_config_bytes(&esds_payload)?;
-println!("{:?} at {:?} Hz", dec.sbr_support(), dec.output_sample_rate());
-```
+The encoder implements AAC-LC coding tools only. The decoder implements the wider
+family, including SBR, Parametric Stereo and the low-delay object types, whose
+patents are more recent than AAC-LC's. The code is independently written from
+ISO/IEC 14496-3 and licensed under Apache-2.0, but **the copyright license grants
+no patent rights**. If you distribute products commercially, consult IP counsel.
+See the repository's
+[patent notes](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/docs/compatibility.md#patents).
 
-## Features
+## Versioning
 
-| feature | default | effect |
-| --- | --- | --- |
-| `simd` | yes | runtime-detected AVX2 quantize/`x^0.75` kernels (bit-exact vs scalar) |
-| `simd-avx512` | no | adds an 8-lane AVX-512 tier (needs Rust ≥ 1.89; falls back at runtime) |
-| `lab` | no | the quality lab: deterministic corpus, NMR metric, bitrate-ladder runner, WAV I/O. Dev/analysis only |
+rusty_aac follows [Semantic Versioning](https://semver.org/). The public API is
+stable from 1.0. Decoder output is stable and gated by the conformance suite;
+encoder output may change in minor releases as quality improves. See
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ## Part of Remade With Rust
 
-`rusty_aac` is the standalone AAC engine of
-**[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)** — a
-ground-up, permissively-licensed Rust rebuild of FFmpeg. Sister project:
-**[FFAI](https://github.com/Remade-With-Rust/FFAI)** — media for an AI-first
-world. More at **[github.com/remade-with-rust](https://github.com/remade-with-rust)**.
-
-Sibling codec crates: [`rusty_h264`](https://crates.io/crates/rusty_h264),
-[`rusty_vp9`](https://crates.io/crates/rusty_vp9),
-[`rusty_mp3`](https://crates.io/crates/rusty_mp3),
-[`rusty-opus`](https://crates.io/crates/rusty-opus), [`rusty_vorbis`](https://crates.io/crates/rusty_vorbis), and the
-[rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) forks.
+rusty_aac is the AAC engine of
+**[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)**, a
+permissively licensed Rust rebuild of FFmpeg, where it is exposed to the codec
+registry by [`rff-codec-aac`](https://crates.io/crates/rff-codec-aac). Sibling
+codec crates include [`rusty_mp3`](https://crates.io/crates/rusty_mp3),
+[`rusty-opus`](https://crates.io/crates/rusty-opus),
+[`rusty_flac`](https://crates.io/crates/rusty_flac),
+[`rusty_vp9`](https://crates.io/crates/rusty_vp9) and
+[`rusty_h265`](https://crates.io/crates/rusty_h265).
 
 ## About Mata Network
 

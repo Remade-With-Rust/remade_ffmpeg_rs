@@ -12,6 +12,11 @@
 
 #![forbid(unsafe_code)]
 
+/// The README's example, compiled as a doctest so it cannot go stale.
+#[doc = include_str!("../README.md")]
+#[cfg(doctest)]
+pub struct ReadmeDoctests;
+
 use std::collections::VecDeque;
 
 use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder, Encoder};

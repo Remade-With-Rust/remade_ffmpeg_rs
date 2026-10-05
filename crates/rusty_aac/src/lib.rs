@@ -61,6 +61,11 @@ pub use encode::{
 };
 pub use error::{Error, Result};
 
+/// The README's examples, compiled as doctests so they cannot go stale.
+#[doc = include_str!("../README.md")]
+#[cfg(doctest)]
+pub struct ReadmeDoctests;
+
 /// AAC sample-rate table, indexed by `samplingFrequencyIndex` (ISO 14496-3).
 pub const SAMPLE_RATES: [u32; 13] = [
     96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
