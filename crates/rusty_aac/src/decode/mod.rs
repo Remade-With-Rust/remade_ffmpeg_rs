@@ -132,6 +132,7 @@ impl Decoder {
     /// AAC-LC stereo configuration is always accepted.
     #[must_use]
     pub fn new(sample_rate: u32) -> Self {
+        // Cannot fail: AAC-LC stereo at 44.1 kHz is always a supported configuration.
         Self::with_stream_config(StreamConfig::lc(2, sample_rate, 0))
             .unwrap_or_else(|_| Self::with_stream_config(StreamConfig::lc(2, 44100, 0)).unwrap())
     }
@@ -342,6 +343,7 @@ impl Decoder {
         }
         if self.tags_mapped == 0 && ty == TYPE_CPE && self.chan_config == 1 {
             // Mono configuration carrying a CPE: decode as stereo.
+            // Cannot fail: channel configuration 2 always has a default layout.
             self.output_configure(layout::default_layout(2, false).unwrap());
             self.chan_config = 2;
             self.ps_state = Some(false);
@@ -430,6 +432,7 @@ impl Decoder {
     }
 
     fn el(&mut self, at: (usize, usize)) -> &mut Element {
+        // Cannot fail: `at` comes from `get_che`, which returns only allocated slots (`instance`).
         self.elements[at.0][at.1].as_mut().unwrap()
     }
 
@@ -488,12 +491,16 @@ impl Decoder {
                     self.get_che(elem_type as u8, elem_id as u8)
                         .ok_or_else(|| Error::invalid("aac: channel element is not allocated"))?,
                 );
+                // Cannot fail: `at` was set on the line above.
                 self.el(at.unwrap()).present = true;
             }
             match elem_type {
                 ID_SCE | ID_LFE => {
+                    // Cannot fail: SCE/LFE are below ID_DSE, so `at` was set above.
                     let at = at.unwrap();
                     let rng = &mut self.rng;
+                    // Cannot fail: `at` comes from `get_che`, which returns only allocated slots (`instance`).
+                    // Cannot fail: `at` comes from `get_che`, which returns only allocated slots (`instance`).
                     let el = self.elements[at.0][at.1].as_mut().unwrap();
                     let sce = &mut el.ch[0];
                     decode_ics(r, &sx, &mut sce.ics, &mut sce.data, false, rng)?;
@@ -505,9 +512,11 @@ impl Decoder {
                     audio_found = true;
                 }
                 ID_CPE => {
+                    // Cannot fail: CPE is below ID_DSE, so `at` was set above.
                     self.decode_cpe(r, at.unwrap())?;
                     audio_found = true;
                 }
+                // Cannot fail: CCE is below ID_DSE, so `at` was set above.
                 ID_CCE => self.decode_cce(r, at.unwrap())?,
                 ID_DSE => {
                     let align = r.read_bool()?;
@@ -545,6 +554,7 @@ impl Decoder {
                 _ => unreachable!(),
             }
             if elem_type < ID_DSE {
+                // Cannot fail: guarded by `elem_type < ID_DSE`, the same condition that set `at`.
                 prev = Some((at.unwrap(), elem_type as u8));
             }
             if r.bits_left() < 3 {
@@ -586,6 +596,8 @@ impl Decoder {
                 self.decode_cpe(r, at)?;
             } else {
                 let rng = &mut self.rng;
+                // Cannot fail: `at` comes from `get_che`, which returns only allocated slots (`instance`).
+                // Cannot fail: `at` comes from `get_che`, which returns only allocated slots (`instance`).
                 let el = self.elements[at.0][at.1].as_mut().unwrap();
                 let sce = &mut el.ch[0];
                 decode_ics(r, &sx, &mut sce.ics, &mut sce.data, false, rng)?;
@@ -602,6 +614,8 @@ impl Decoder {
     fn decode_cpe(&mut self, r: &mut BitReader, at: (usize, usize)) -> Result<()> {
         let sx = self.syntax;
         let rng = &mut self.rng;
+        // Cannot fail: `at` comes from `get_che`, which returns only allocated slots (`instance`).
+        // Cannot fail: `at` comes from `get_che`, which returns only allocated slots (`instance`).
         let el = self.elements[at.0][at.1].as_mut().unwrap();
         let common_window = sx.eld() || r.read_bool()?;
         el.common_window = common_window;
@@ -678,6 +692,8 @@ impl Decoder {
     fn decode_cce(&mut self, r: &mut BitReader, at: (usize, usize)) -> Result<()> {
         let sx = self.syntax;
         let rng = &mut self.rng;
+        // Cannot fail: `at` comes from `get_che`, which returns only allocated slots (`instance`).
+        // Cannot fail: `at` comes from `get_che`, which returns only allocated slots (`instance`).
         let el = self.elements[at.0][at.1].as_mut().unwrap();
         let mut point = 2 * r.read_bit()? as u8;
         let num_coupled = r.read_bits(3)? as usize;
@@ -869,6 +885,7 @@ impl Decoder {
                     continue;
                 };
                 if !el.present {
+                    // Cannot fail: the `let Some(el) = ... else { continue }` above checked this slot.
                     let el = self.elements[ty][id].as_mut().unwrap();
                     for c in &mut el.ch {
                         c.output.iter_mut().for_each(|v| *v = 0.0);
@@ -879,6 +896,7 @@ impl Decoder {
                 if ty <= TYPE_CPE as usize {
                     self.apply_coupling(ty, id, tools::BEFORE_TNS);
                 }
+                // Cannot fail: the slot was checked above and every take is restored before the next.
                 let mut el = self.elements[ty][id].take().unwrap();
                 if sx.aot == aot::AAC_LTP && el.ch[0].ics.predictor_present {
                     let nch = if ty == TYPE_CPE as usize { 2 } else { 1 };
@@ -898,6 +916,7 @@ impl Decoder {
                 if ty <= TYPE_CPE as usize {
                     self.apply_coupling(ty, id, tools::BETWEEN_TNS_AND_IMDCT);
                 }
+                // Cannot fail: the slot was checked above and every take is restored before the next.
                 let mut el = self.elements[ty][id].take().unwrap();
                 if !is_cce || el.coup.point == tools::AFTER_IMDCT {
                     let nch = if ty == TYPE_CPE as usize { 2 } else { 1 };
@@ -912,6 +931,7 @@ impl Decoder {
                 if ty <= TYPE_CCE as usize {
                     self.apply_coupling(ty, id, tools::AFTER_IMDCT);
                 }
+                // Cannot fail: the element was restored to its slot just above.
                 self.elements[ty][id].as_mut().unwrap().present = false;
             }
         }
@@ -929,6 +949,7 @@ impl Decoder {
             let mut index = 0usize;
             for &(t, eid, sel) in &cce.coup.targets {
                 if t as usize == ty && eid as usize == id {
+                    // Cannot fail: coupling runs only on a present element, which occupies this slot.
                     let target = self.elements[ty][id].as_mut().unwrap();
                     if sel != 1 {
                         Self::couple(&cce, index, point, &mut target.ch[0]);

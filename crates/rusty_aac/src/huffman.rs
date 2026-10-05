@@ -9,8 +9,6 @@
 //! spectral coefficients. O(maxlen·count) per codeword — codebooks are small,
 //! so it is plenty fast and trivially verifiable.
 
-#![allow(dead_code)]
-
 use crate::{Error, Result};
 
 use crate::bits::BitReader;
@@ -58,6 +56,7 @@ impl HuffBook {
         }
     }
 
+    #[cfg(test)]
     pub fn count(&self) -> usize {
         self.codes.len()
     }

@@ -315,6 +315,7 @@ impl LatmDecoder {
                 AacDecoder::with_stream_config(frame.stream.clone()),
             ));
         }
+        // Cannot fail: `self.dec` was filled just above when absent.
         let out = self.dec.as_mut().unwrap().1.decode(&frame.au, pts)?;
         Ok((out, frame.frame_length))
     }

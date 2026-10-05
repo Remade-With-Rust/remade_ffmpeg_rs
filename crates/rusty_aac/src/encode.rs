@@ -21,8 +21,6 @@
 //! * Window shape is hardcoded sine (arm A8) and the transient detector uses an
 //!   absolute energy ratio (arm A9).
 
-#![allow(dead_code)]
-
 use crate::codebook::{Codebook, CODEBOOKS, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB};
 use crate::ics::{IcsInfo, WindowSequence};
 use crate::prof::{self, Kernel, Stage};
@@ -491,6 +489,7 @@ fn spreading_matrix(swb: &[u16], sample_rate: u32, n_coeffs: usize) -> Arc<Vec<f
 /// `pub(crate)` so [`crate::lab::quality`] can score coding noise against the
 /// encoder's own mask (the NMR metric), in the same band geometry and energy
 /// domain the encoder allocates in.
+#[cfg(any(test, feature = "lab"))]
 pub(crate) fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32) -> Vec<f64> {
     let num_swb = swb.len() - 1;
     let mut energy = vec![0.0f64; num_swb];
@@ -799,31 +798,10 @@ pub(crate) fn element_plan(channels: usize) -> Option<Vec<Elem>> {
     })
 }
 
-/// Inverse of [`element_plan`]'s ordering: for each **output** slot in standard
-/// interleave order, which decoded element-order channel supplies it.
-///
-/// The decoder emits channels in element order (AAC order); this maps them back
-/// so a 5.1 decode interleaves as FL, FR, FC, LFE, BL, BR like every other
-/// decoder in the workspace.
-pub(crate) fn aac_to_interleave_order(channels: usize) -> Option<Vec<usize>> {
-    Some(match channels {
-        1 => vec![0],
-        2 => vec![0, 1],
-        // AAC order C,L,R -> interleave L,R,C
-        3 => vec![1, 2, 0],
-        // AAC order C,L,R,Cs -> interleave L,R,C,Cs
-        4 => vec![1, 2, 0, 3],
-        // AAC order C,L,R,Ls,Rs -> interleave L,R,C,Ls,Rs
-        5 => vec![1, 2, 0, 3, 4],
-        // AAC order C,L,R,Ls,Rs,LFE -> interleave L,R,C,LFE,Ls,Rs
-        6 => vec![1, 2, 0, 5, 3, 4],
-        _ => return None,
-    })
-}
-
 const MAX_QUANT: i32 = 8191;
 
-/// Quantize one coefficient at global gain `gg` (used by tests / the noise metric).
+/// Quantize one coefficient at global gain `gg` (the tests' reference).
+#[cfg(test)]
 fn quantize(x: f32, gg: i32) -> i32 {
     if x == 0.0 {
         return 0;
@@ -1054,17 +1032,21 @@ fn has_avx512() -> bool {
 /// equals `round(v)` exactly. (`floor(v + 0.5)` does NOT — at the double just below ½
 /// the sum rounds up to 1.0 — which `quantize_simd_matches_scalar` pins.)
 fn quantize_band(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) {
-    // SAFETY (all SIMD branches): entered only when the ISA is detected at runtime; the
-    // three slices share a length and vector bodies touch full lane-chunks, the remainder
-    // falling to the scalar tail. Every path is bit-exact with the scalar reference.
+    // The twins read `pow`/`sign` for every index of `out`; re-slicing here makes
+    // that bound local (a short input panics instead of reading past its end).
+    let (pow, sign) = (&pow[..out.len()], &sign[..out.len()]);
     #[cfg(all(feature = "simd-avx512", target_arch = "x86_64"))]
     if has_avx512() {
+        // SAFETY: AVX-512F + AVX2 detected at runtime; the three slices have the
+        // same length (re-sliced above), which is all `quantize_band_avx512` needs.
         unsafe { quantize_band_avx512(pow, sign, scale, out) };
         prof::count(Kernel::Quantize, true, out.len());
         return;
     }
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     if has_avx2() {
+        // SAFETY: AVX2 detected at runtime; the three slices have the same length
+        // (re-sliced above), which is all `quantize_band_avx2` needs.
         unsafe { quantize_band_avx2(pow, sign, scale, out) };
         prof::count(Kernel::Quantize, true, out.len());
         return;
@@ -1088,6 +1070,12 @@ fn quantize_band_scalar(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) 
 /// AVX2 quantize — four coefficients per iteration. Bit-exact with the scalar path
 /// (`floor(v + HALF_DOWN) == round(v)` for `v ≥ 0`, and the clamp is applied before
 /// the f64→i32 narrowing so nothing overflows).
+///
+/// # Safety
+///
+/// AVX2 must be available, and `pow.len()` and `sign.len()` must be at least
+/// `out.len()`: the vector body reads `pow[i..i + 4]` / `sign[i..i + 4]` and
+/// writes `out[i..i + 4]` for `i + 4 <= out.len()`; the tail is safe indexing.
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn quantize_band_avx2(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) {
@@ -1120,11 +1108,17 @@ unsafe fn quantize_band_avx2(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i
 /// equals `min(round(v), MAX)`, so a single truncating narrow does round+clamp.
 /// Runtime-gated above AVX2; on AVX2-only hosts this path never runs (untested there —
 /// the math mirrors the AVX2 kernel exactly, and its tail is the shared scalar reference).
+///
+/// # Safety
+///
+/// AVX-512F and AVX2 must be available, and `pow.len()` and `sign.len()` must be
+/// at least `out.len()`: eight lanes per trip for `i + 8 <= out.len()`, then
+/// the safe scalar tail.
 #[cfg(all(feature = "simd-avx512", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f,avx2")]
 #[allow(
     clippy::incompatible_msrv,
-    reason = "the opt-in `simd-avx512` feature needs Rust 1.89 (stable AVX-512 intrinsics);               the crate's 1.85 MSRV holds for every other feature set (README)"
+    reason = "the opt-in `simd-avx512` feature needs Rust 1.89 (stable AVX-512 intrinsics); the crate's 1.85 MSRV holds for every other feature set (README)"
 )]
 unsafe fn quantize_band_avx512(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) {
     use std::arch::x86_64::*;
@@ -1153,6 +1147,10 @@ unsafe fn quantize_band_avx512(pow: &[f64], sign: &[i32], scale: f64, out: &mut 
 
 /// AVX2 `Xpow` builder: `pow[i] = |x|^0.75` via `√|x|·√√|x|` (two vector sqrts), and
 /// `sign[i] = ±1` from the sign bit — four coefficients per iteration.
+///
+/// # Safety
+///
+/// AVX2 must be available (the lengths are asserted).
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[cfg(test)]
@@ -1679,10 +1677,6 @@ pub(crate) struct TnsEnc {
     pub order: usize,
     /// Quantized PARCOR indices (4-bit two's complement, `coef_res = 1`).
     pub idx: Vec<i32>,
-    /// The de-quantized PARCOR values the decoder will reconstruct — the encoder
-    /// must filter with *these*, not with the unquantized ones, or encoder and
-    /// decoder run different filters.
-    pub parcor: Vec<f32>,
 }
 
 /// Coefficient resolution we emit: `coef_res = 1` (4-bit), `coef_compress = 0`.
@@ -1865,12 +1859,7 @@ pub(crate) fn tns_analyze_long(
         spec[p] = y;
     }
 
-    Some(TnsEnc {
-        length,
-        order,
-        idx,
-        parcor,
-    })
+    Some(TnsEnc { length, order, idx })
 }
 
 /// Emit `tns_data` for a long block (`n_filt` 2 bits, `length` 6, `order` 5).

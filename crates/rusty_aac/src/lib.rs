@@ -336,6 +336,7 @@ impl AacDecoder {
                 .ok_or_else(|| Error::invalid("aac: stream parameters unknown"))?;
             self.decoder = Some(decode::Decoder::with_stream_config(stream)?);
         }
+        // Cannot fail: `self.decoder` was filled just above when absent.
         Ok(self.decoder.as_mut().unwrap())
     }
 

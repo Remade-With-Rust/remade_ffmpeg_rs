@@ -424,6 +424,7 @@ impl SbrChannelState {
                 }
                 let nb1 = num_bands_1 as usize;
                 let mut vk1 = make_bands(k1, k2, nb1);
+                // Cannot fail: `num_bands_1 > 0` was checked above, so `vk1` is non-empty.
                 let vdk1_min = *vk1.iter().min().unwrap();
                 if vdk1_min < vdk0_max {
                     vk1.sort_unstable();

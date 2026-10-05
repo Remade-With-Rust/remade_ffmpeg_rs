@@ -8,8 +8,6 @@
 //! tests rather than silently mis-decoding. All twelve are complete prefix
 //! codes (Kraft = 1).
 
-#![allow(dead_code)]
-
 use crate::huffman::HuffBook;
 
 static CODES1: &[u32] = &[

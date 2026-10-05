@@ -477,16 +477,18 @@ impl Dct4Plan {
     }
 }
 
-fn dct4_plan(l: usize) -> &'static Dct4Plan {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    static PLANS: OnceLock<Mutex<HashMap<usize, &'static Dct4Plan>>> = OnceLock::new();
-    let map = PLANS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut g = map
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    g.entry(l)
-        .or_insert_with(|| Box::leak(Box::new(Dct4Plan::new(l))))
+/// Run `f` with the mixed-radix DCT-IV plan for length `l`. The lengths the
+/// codec uses (960/120-sample frames, 480 for LD/ELD, and their halves) are
+/// cached for the life of the process in a fixed table; any other length is
+/// built for the call and dropped. (A map of leaked plans keyed by any `l`
+/// would grow without bound if a caller ever fed it unbounded lengths.)
+fn with_dct4_plan<R>(l: usize, f: impl FnOnce(&Dct4Plan) -> R) -> R {
+    const CACHED: [usize; 6] = [60, 120, 240, 480, 960, 1920];
+    static PLANS: [OnceLock<Dct4Plan>; CACHED.len()] = [const { OnceLock::new() }; CACHED.len()];
+    match CACHED.iter().position(|&c| c == l) {
+        Some(i) => f(PLANS[i].get_or_init(|| Dct4Plan::new(l))),
+        None => f(&Dct4Plan::new(l)),
+    }
 }
 
 /// Half-length IMDCT for any even `L` with 2/3/5 factors: `L` coefficients →
@@ -499,8 +501,7 @@ pub fn imdct_half(spec: &[f32], out: &mut [f32], gain: f64) {
     if let Some(plan) = pow2_dct4(l) {
         return plan.imdct_half(spec, out, gain as f32);
     }
-    let plan = dct4_plan(l);
-    let z = plan.run(|i| f64::from(spec[i]));
+    let z = with_dct4_plan(l, |plan| plan.run(|i| f64::from(spec[i])));
     // z = 2·D·X; the spec IMDCT is (2/N)·Fᵀ·D·X with N = 2L, so scale by 1/(2L)·…
     // middle[k] = −(D·X)[L−1−k]·(2/N)·…  — see `imdct_fast`'s unfold.
     let scale = gain / (2 * l) as f64;
@@ -605,6 +606,7 @@ impl Radix2Fft {
             unsafe { self.run_neon(buf, permuted) };
             return;
         }
+        // On SIMD targets a twin above returns first; this is the scalar fallback.
         #[allow(unreachable_code)]
         {
             crate::prof::count(crate::prof::Kernel::Fft, false, self.n);
@@ -965,7 +967,6 @@ pub fn pow2_dct4(l: usize) -> Option<&'static Pow2Dct4> {
 pub fn mdct_any(x: &[f32]) -> Vec<f32> {
     let n = x.len();
     let (l, l2, l32) = (n / 2, n / 4, 3 * n / 4);
-    let plan = dct4_plan(l);
     let fold = |mm: usize| -> f64 {
         if mm < l2 {
             -f64::from(x[l32 - 1 - mm]) - f64::from(x[mm + l32])
@@ -973,7 +974,10 @@ pub fn mdct_any(x: &[f32]) -> Vec<f32> {
             f64::from(x[mm - l2]) - f64::from(x[l32 - 1 - mm])
         }
     };
-    plan.run(fold).iter().map(|&v| v as f32).collect()
+    with_dct4_plan(l, |plan| plan.run(fold))
+        .iter()
+        .map(|&v| v as f32)
+        .collect()
 }
 
 /// AAC sine analysis/synthesis window: `w[n] = sin(π/N·(n+½))`.

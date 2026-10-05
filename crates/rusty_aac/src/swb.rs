@@ -5,8 +5,6 @@
 //! windows, 128 for one short window). `num_swb = table.len() - 1`. Tables are
 //! shared across several sampling rates per the spec's grouping.
 
-#![allow(dead_code)]
-
 // ---- Long-window (1024) offsets ------------------------------------------
 
 const LONG_96: &[u16] = &[

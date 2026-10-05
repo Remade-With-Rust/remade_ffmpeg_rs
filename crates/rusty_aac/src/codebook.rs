@@ -9,11 +9,10 @@
 //! transcribed separately; the decode here is what turns a correct lookup into
 //! correct coefficients, and is verified with synthetic codebooks.
 
-#![allow(dead_code)]
-
 use crate::{Error, Result};
 
 use crate::bits::BitReader;
+#[cfg(test)]
 use crate::huffman::HuffBook;
 
 /// Properties of one spectral Huffman codebook.
@@ -107,7 +106,6 @@ pub const CODEBOOKS: [Codebook; 12] = [
 
 /// First codebook number for intensity stereo (14, 15) and the special markers.
 pub const ZERO_HCB: u8 = 0;
-pub const ESC_HCB: u8 = 11;
 pub const NOISE_HCB: u8 = 13;
 pub const INTENSITY_HCB2: u8 = 14;
 pub const INTENSITY_HCB: u8 = 15;
@@ -118,6 +116,7 @@ pub const INTENSITY_HCB: u8 = 15;
     clippy::trivially_copy_pass_by_ref,
     reason = "measured: passing the 4-byte Codebook by value cost +0.7% encode / +1.4% decode instructions in the inlined hot loops"
 )]
+#[cfg(test)]
 pub fn decode_tuple(
     cb: &Codebook,
     book: &HuffBook,
@@ -135,6 +134,7 @@ pub fn decode_tuple(
     clippy::trivially_copy_pass_by_ref,
     reason = "measured: passing the 4-byte Codebook by value cost +0.7% encode / +1.4% decode instructions in the inlined hot loops"
 )]
+#[cfg(test)]
 pub fn apply_index(cb: &Codebook, idx: u16, r: &mut BitReader, out: &mut [i32]) -> Result<()> {
     let dim = cb.dim as usize;
     let modulo = if cb.unsigned {

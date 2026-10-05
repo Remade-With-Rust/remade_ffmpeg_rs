@@ -1,11 +1,12 @@
 //! `ics_info` — per-channel window/grouping configuration (ISO 14496-3
 //! §4.4.2.1) and the derived short-window grouping.
 
-#![allow(dead_code)]
-
+#[cfg(test)]
 use crate::{Error, Result};
 
+#[cfg(test)]
 use crate::bits::BitReader;
+#[cfg(test)]
 use crate::swb::swb_offsets;
 
 /// AAC window sequence (transform block structure).
@@ -18,6 +19,7 @@ pub enum WindowSequence {
 }
 
 impl WindowSequence {
+    #[cfg(test)]
     fn from_bits(v: u32) -> Self {
         match v {
             0 => Self::OnlyLong,
@@ -60,6 +62,7 @@ pub struct IcsInfo {
 }
 
 /// Parse `ics_info` from the bitstream for sampling-frequency index `fs_index`.
+#[cfg(test)]
 pub fn parse_ics_info(r: &mut BitReader, fs_index: u8) -> Result<IcsInfo> {
     let _ics_reserved = r.read_bit()?;
     let window_sequence = WindowSequence::from_bits(r.read_bits(2)?);
@@ -88,6 +91,7 @@ pub fn parse_ics_info(r: &mut BitReader, fs_index: u8) -> Result<IcsInfo> {
             let mut groups = vec![1u8];
             for i in 0..7 {
                 if (sfg >> (6 - i)) & 1 == 1 {
+                    // Cannot fail: `groups` starts with one entry.
                     *groups.last_mut().unwrap() += 1;
                 } else {
                     groups.push(1);

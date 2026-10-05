@@ -72,6 +72,7 @@ impl<'a> BitReader<'a> {
         // of the data take the zero-padded copy (a runtime-length copy is a real
         // `memcpy` call, which every Huffman peek used to pay).
         if let Some(w) = self.data.get(byte..byte + 8) {
+            // Cannot fail: `get(byte..byte + 8)` returned exactly eight bytes.
             let w: [u8; 8] = w.try_into().expect("an 8-byte slice");
             return u64::from_be_bytes(w) << (self.pos % 8);
         }

@@ -358,6 +358,7 @@ fn qmf_window(p: &Plans, o: &mut [f32], vb: &[f32], win: &[f32]) {
         unsafe { qmf_window_neon(o, vb, win) };
         return;
     }
+    let _ = p; // only the x86-64 twins consult the detected ISA
     crate::prof::count(crate::prof::Kernel::QmfWindow, false, bands);
     qmf_window_scalar(o, vb, win);
 }
@@ -419,8 +420,11 @@ unsafe fn qmf_window_sse(o: &mut [f32], vb: &[f32], win: &[f32]) {
 }
 
 /// AVX twin of [`qmf_window`]: one 8-column register per trip, and VEX folds
-/// the unaligned window operand into the multiply. Safety contract as
-/// [`qmf_window_sse`], plus AVX must be available.
+/// the unaligned window operand into the multiply.
+///
+/// # Safety
+///
+/// As [`qmf_window_sse`], and AVX must be available.
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
 unsafe fn qmf_window_avx(o: &mut [f32], vb: &[f32], win: &[f32]) {
@@ -442,7 +446,11 @@ unsafe fn qmf_window_avx(o: &mut [f32], vb: &[f32], win: &[f32]) {
     }
 }
 
-/// NEON twin of [`qmf_window`]; safety contract as [`qmf_window_sse`].
+/// NEON twin of [`qmf_window`].
+///
+/// # Safety
+///
+/// As [`qmf_window_sse`] (NEON is baseline on aarch64).
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
 unsafe fn qmf_window_neon(o: &mut [f32], vb: &[f32], win: &[f32]) {
     use std::arch::aarch64::*;

@@ -170,6 +170,7 @@ pub fn parse_ics_info(r: &mut BitReader, sx: &Syntax, ics: &mut Ics) -> Result<(
         let groups = &mut ics.info.window_group_length;
         for _ in 0..7 {
             if r.read_bool()? {
+                // Cannot fail: `groups` was given its first entry just above.
                 *groups.last_mut().unwrap() += 1;
             } else {
                 groups.push(1);

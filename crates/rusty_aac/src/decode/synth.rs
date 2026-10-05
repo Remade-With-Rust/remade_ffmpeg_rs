@@ -80,6 +80,7 @@ pub fn fmul_window(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f32], len
         unsafe { fmul_window_neon(dst, src0, src1, win, len) };
         return;
     }
+    // On SIMD targets a twin above returns first; this is the scalar fallback.
     #[allow(unreachable_code)]
     {
         crate::prof::count(crate::prof::Kernel::FmulWindow, false, len);
@@ -144,6 +145,11 @@ unsafe fn fmul_window_sse(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f3
 #[target_feature(enable = "neon")]
 unsafe fn fmul_window_neon(dst: &mut [f32], src0: &[f32], src1: &[f32], win: &[f32], len: usize) {
     use std::arch::aarch64::*;
+    /// Reverse the four lanes.
+    ///
+    /// # Safety
+    ///
+    /// NEON must be available (baseline on aarch64); register-only, no memory.
     #[inline(always)]
     unsafe fn rev4(v: float32x4_t) -> float32x4_t {
         let r = vrev64q_f32(v);
