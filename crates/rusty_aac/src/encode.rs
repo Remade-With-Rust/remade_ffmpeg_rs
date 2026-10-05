@@ -3222,6 +3222,17 @@ impl AacEncoder {
     /// no ADTS) with sample-domain PTS. A trailing all-zero block flushes the MDCT
     /// overlap so the final audio block decodes. Containers add their own framing
     /// (ADTS header for `.aac`, `esds` + raw samples for MP4).
+    /// Block `b` of channel `ch`, borrowed straight from the buffered input when
+    /// it lies wholly inside it; only a block running past the end is built
+    /// (zero-padded). Every frame used to copy four 4 KB blocks this way.
+    fn block_cow(&self, ch: usize, b: usize) -> std::borrow::Cow<'_, [f32; FRAME_LEN]> {
+        let s = b * FRAME_LEN;
+        match self.chans[ch].get(s..s + FRAME_LEN) {
+            Some(x) => std::borrow::Cow::Borrowed(x.try_into().expect("FRAME_LEN samples")),
+            None => std::borrow::Cow::Owned(self.block(ch, b)),
+        }
+    }
+
     /// One block's samples for channel `ch` (zero-padded past the buffered input).
     fn block(&self, ch: usize, b: usize) -> [f32; FRAME_LEN] {
         let mut cur = [0f32; FRAME_LEN];
@@ -3251,11 +3262,11 @@ impl AacEncoder {
         per_channel: usize,
         plan: &[Elem],
     ) -> (Vec<u8>, i64) {
-        let prev = |ch: usize| -> [f32; FRAME_LEN] {
+        let prev = |ch: usize| -> std::borrow::Cow<'_, [f32; FRAME_LEN]> {
             if b == 0 {
-                [0f32; FRAME_LEN]
+                std::borrow::Cow::Owned([0f32; FRAME_LEN])
             } else {
-                self.block(ch, b - 1)
+                self.block_cow(ch, b - 1)
             }
         };
         // Arm A8. The shape of frame b-1 owns this frame's LEFT overlap half, so
@@ -3286,7 +3297,8 @@ impl AacEncoder {
             let tag = ei as u32;
             match *elem {
                 Elem::Cpe(l, r) => {
-                    let (p0, c0, p1, c1) = (prev(l), self.block(l, b), prev(r), self.block(r, b));
+                    let (p0, c0, p1, c1) =
+                        (prev(l), self.block_cow(l, b), prev(r), self.block_cow(r, b));
                     if seq == WindowSequence::EightShort {
                         let sl = analyze_short(&p0, &c0, short_win);
                         let sr_ = analyze_short(&p1, &c1, short_win);
@@ -3329,7 +3341,7 @@ impl AacEncoder {
                     }
                 }
                 Elem::Sce(ch) | Elem::Lfe(ch) => {
-                    let (p, c) = (prev(ch), self.block(ch, b));
+                    let (p, c) = (prev(ch), self.block_cow(ch, b));
                     let id = elem.id();
                     if seq == WindowSequence::EightShort {
                         let spec = analyze_short(&p, &c, short_win);
@@ -3402,7 +3414,7 @@ impl AacEncoder {
                 // One reading per frame, from channel 0 (a CPE shares one window,
                 // so the decision cannot be per-channel).
                 let ton: Vec<f32> = (0..nblocks)
-                    .map(|b| time_tonality(&self.block(0, b)))
+                    .map(|b| time_tonality(&self.block_cow(0, b)[..]))
                     .collect();
                 let atk = frame_attack_ratios(&self.chans[0], nblocks);
 
