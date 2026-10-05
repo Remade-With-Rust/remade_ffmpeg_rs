@@ -622,7 +622,8 @@ impl Radix2Fft {
     /// AVX must be available, and `buf.len() == self.n`. Each vector touches
     /// `buf[s + j .. s + j + 4]` and `buf[s + j + half .. +4]` with
     /// `s + 2·half <= n` and `j + 4 <= half`, and twiddles `stw[half - 2 + j .. +4]`
-    /// with `2·half - 2 <= stw.len() = n - 2`.
+    /// with `2·half - 2 <= stw.len() = n - 2`. The `half == 2` stage reads and
+    /// writes `buf[s..s+4]` for `s + 4 <= n` and the twiddles `stw[0..2]`.
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     #[target_feature(enable = "avx")]
     unsafe fn run_avx(&self, buf: &mut [[f32; 2]]) {
@@ -632,8 +633,23 @@ impl Radix2Fft {
         let p = buf.as_mut_ptr() as *mut f32;
         let mut half = 2;
         while half < n {
-            if half < 4 {
-                self.stage_scalar(buf, half);
+            if half == 2 {
+                // Two butterflies per 128-bit op; both twiddles are the same in
+                // every block, so the twiddle vector is loaded once.
+                let w = _mm_loadu_ps(self.stw.as_ptr() as *const f32);
+                let (wr, wi) = (_mm_moveldup_ps(w), _mm_movehdup_ps(w));
+                let mut s = 0;
+                while s < n {
+                    let pa = p.add(2 * s);
+                    let pb = p.add(2 * s + 4);
+                    let a = _mm_loadu_ps(pa);
+                    let b = _mm_loadu_ps(pb);
+                    let bs = _mm_permute_ps::<0b10_11_00_01>(b);
+                    let t = _mm_addsub_ps(_mm_mul_ps(b, wr), _mm_mul_ps(bs, wi));
+                    _mm_storeu_ps(pa, _mm_add_ps(a, t));
+                    _mm_storeu_ps(pb, _mm_sub_ps(a, t));
+                    s += 4;
+                }
             } else {
                 let wbase = self.stw.as_ptr().add(half - 2) as *const f32;
                 let mut s = 0;
