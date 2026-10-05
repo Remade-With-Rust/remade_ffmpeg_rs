@@ -3205,9 +3205,15 @@ impl AacEncoder {
         self.init(channels, sample_rate)?;
         let ch = self.channels;
         let n = interleaved.len() / ch;
-        for i in 0..n {
-            for c in 0..ch {
-                self.chans[c].push(interleaved[i * ch + c]);
+        // Reserve once, then one pass per channel: a per-sample push grew each
+        // channel buffer by doubling (a realloc + copy of everything so far, ~log2
+        // of the stream per channel). Mono is a straight slice copy.
+        if ch == 1 {
+            self.chans[0].extend_from_slice(&interleaved[..n]);
+        } else {
+            for (c, dst) in self.chans.iter_mut().enumerate().take(ch) {
+                dst.reserve(n);
+                dst.extend(interleaved[..n * ch].iter().skip(c).step_by(ch).copied());
             }
         }
         Ok(())
