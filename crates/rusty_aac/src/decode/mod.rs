@@ -972,10 +972,12 @@ impl Decoder {
         let n = sx.frame_len;
         match sx.aot {
             aot::ER_AAC_LD => {
-                let (ld_sine, lo) = (self.ld_sine.clone(), self.ld_low_overlap.clone());
+                // Disjoint field borrows: cloning both windows (two Vec copies
+                // per channel per frame) only dodged borrowing `self.buf`.
+                let (ld_sine, lo) = (&self.ld_sine, &self.ld_low_overlap);
                 synth::imdct_and_window_ld(
-                    &ld_sine,
-                    &lo,
+                    ld_sine,
+                    lo,
                     n,
                     &sce.data.coeffs,
                     sce.ics.prev_kbd,
