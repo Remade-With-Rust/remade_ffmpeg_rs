@@ -275,12 +275,16 @@ pub fn mdct_fast(x: &[f32]) -> Vec<f32> {
     }
     fft(&mut re, &mut im, &tw.fft_c, &tw.fft_s);
     // Post-rotate W = V·e^{-iπp/L}; X[2p]=Re(W), X[L-1-2p]=-Im(W); output scaled ×2.
-    let mut out = vec![0f32; l];
+    let mut out = Vec::<f32>::with_capacity(l);
+    let op = out.spare_capacity_mut();
     for p in 0..m {
         let (vr, vi) = (re[p], im[p]);
-        out[2 * p] = (2.0 * (vr * tw.post_c[p] + vi * tw.post_s[p])) as f32;
-        out[l - 1 - 2 * p] = (2.0 * (vr * tw.post_s[p] - vi * tw.post_c[p])) as f32;
+        op[2 * p].write((2.0 * (vr * tw.post_c[p] + vi * tw.post_s[p])) as f32);
+        op[l - 1 - 2 * p].write((2.0 * (vr * tw.post_s[p] - vi * tw.post_c[p])) as f32);
     }
+    // SAFETY: L = 2M; 2p covers the even indices and L-1-2p the odd ones, so
+    // the loop wrote all `l` elements.
+    unsafe { out.set_len(l) };
     out
 }
 
