@@ -259,11 +259,19 @@ pub fn mdct_fast(x: &[f32]) -> Vec<f32> {
         }
     };
     // Pack + pre-rotate into M complex: v[p] = (y[2p] + i·y[L-1-2p])·e^{-iπ(4p+1)/4L}.
-    let (mut re, mut im) = (vec![0f64; m], vec![0f64; m]);
+    // Every element is computed, so the FFT buffers are filled from fresh
+    // capacity rather than zero-filled and overwritten.
+    let (mut re, mut im) = (Vec::<f64>::with_capacity(m), Vec::<f64>::with_capacity(m));
+    let (rp, ip) = (re.spare_capacity_mut(), im.spare_capacity_mut());
     for p in 0..m {
         let (yr, yi) = (fold(2 * p), fold(l - 1 - 2 * p));
-        re[p] = yr * tw.pre_c[p] + yi * tw.pre_s[p];
-        im[p] = yi * tw.pre_c[p] - yr * tw.pre_s[p];
+        rp[p].write(yr * tw.pre_c[p] + yi * tw.pre_s[p]);
+        ip[p].write(yi * tw.pre_c[p] - yr * tw.pre_s[p]);
+    }
+    // SAFETY: the loop wrote all `m` elements of both buffers.
+    unsafe {
+        re.set_len(m);
+        im.set_len(m);
     }
     fft(&mut re, &mut im, &tw.fft_c, &tw.fft_s);
     // Post-rotate W = V·e^{-iπp/L}; X[2p]=Re(W), X[L-1-2p]=-Im(W); output scaled ×2.
