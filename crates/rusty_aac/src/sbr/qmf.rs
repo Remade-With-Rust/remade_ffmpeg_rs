@@ -72,7 +72,7 @@ pub(super) fn qmf_analysis(input: &[f32], hist: &mut [f32], w: &mut [[Cpx; 32]; 
     let mut a = [[0f32; 2]; 64];
     for (l, slot) in w.iter_mut().enumerate().take(2 * nts) {
         ana_fold(p, &buf[32 * l..32 * l + 320], &mut a);
-        p.fft64.run(&mut a);
+        p.fft64.run_bitrev(&mut a);
         for (k, out) in slot.iter_mut().enumerate() {
             *out = cmul(a[k], p.ana_post[k]);
         }
@@ -81,7 +81,8 @@ pub(super) fn qmf_analysis(input: &[f32], hist: &mut [f32], w: &mut [[Cpx; 32]; 
 }
 
 /// The analysis front end for one slot: window the 320-sample segment, fold it
-/// to 64 and apply the pre-twiddle, `a[n] = u(n)·ana_pre[n]`.
+/// to 64 and apply the pre-twiddle, `a[rev(n)] = u(n)·ana_pre[n]` — written in
+/// the FFT's bit-reversed order, so `run_bitrev` needs no permutation pass.
 #[inline]
 fn ana_fold(p: &Plans, seg: &[f32], a: &mut [Cpx; 64]) {
     let seg = &seg[..320];
@@ -103,9 +104,10 @@ fn ana_fold_scalar(p: &Plans, seg: &[f32], a: &mut [Cpx; 64]) {
     for ((tq, &x), &c) in t.iter_mut().zip(seg).zip(&p.ana_win) {
         *tq = x * c;
     }
+    let rev = p.fft64.bitrev();
     for n in 0..64 {
         let u = t[319 - n] + t[255 - n] + t[191 - n] + t[127 - n] + t[63 - n];
-        a[n] = [u * p.ana_pre[n][0], u * p.ana_pre[n][1]];
+        a[rev[n] as usize] = [u * p.ana_pre[n][0], u * p.ana_pre[n][1]];
     }
 }
 
@@ -125,6 +127,7 @@ unsafe fn ana_fold_avx(p: &Plans, seg: &[f32], a: &mut [Cpx; 64]) {
     use std::arch::x86_64::*;
     let (s, w) = (seg.as_ptr(), p.ana_win.as_ptr());
     let (pre, ap) = (p.ana_pre.as_ptr() as *const f32, a.as_mut_ptr() as *mut f32);
+    let rev = p.fft64.bitrev();
     let tz = |k: usize| _mm256_mul_ps(_mm256_loadu_ps(s.add(k)), _mm256_loadu_ps(w.add(k)));
     let mut m = 0;
     while m < 64 {
@@ -139,14 +142,18 @@ unsafe fn ana_fold_avx(p: &Plans, seg: &[f32], a: &mut [Cpx; 64]) {
         let n0 = 56 - m;
         let d0 = _mm256_permute2f128_ps::<0x20>(lo, hi);
         let d1 = _mm256_permute2f128_ps::<0x31>(lo, hi);
-        _mm256_storeu_ps(
-            ap.add(2 * n0),
-            _mm256_mul_ps(d0, _mm256_loadu_ps(pre.add(2 * n0))),
-        );
-        _mm256_storeu_ps(
-            ap.add(2 * n0 + 8),
-            _mm256_mul_ps(d1, _mm256_loadu_ps(pre.add(2 * n0 + 8))),
-        );
+        let e0 = _mm256_mul_ps(d0, _mm256_loadu_ps(pre.add(2 * n0)));
+        let e1 = _mm256_mul_ps(d1, _mm256_loadu_ps(pre.add(2 * n0 + 8)));
+        // Each complex value to its bit-reversed slot, 64 bits at a time.
+        for (h, e) in [(0, e0), (4, e1)] {
+            let lo = _mm_castps_pd(_mm256_castps256_ps128(e));
+            let hi = _mm_castps_pd(_mm256_extractf128_ps::<1>(e));
+            let slot = |q: usize| ap.add(2 * rev[n0 + h + q] as usize) as *mut f64;
+            _mm_storel_pd(slot(0), lo);
+            _mm_storeh_pd(slot(1), lo);
+            _mm_storel_pd(slot(2), hi);
+            _mm_storeh_pd(slot(3), hi);
+        }
         m += 8;
     }
 }

@@ -510,6 +510,10 @@ pub(crate) struct Radix2Fft {
     /// The bit-reversal permutation as its swaps (`i < rev(i)` only), so the
     /// permutation costs no compare per element.
     swaps: Vec<(u16, u16)>,
+    /// `rev[i]`: where input `i` sits after the permutation. A producer that
+    /// writes its element `i` to `rev[i]` hands [`Radix2Fft::run_bitrev`] the
+    /// permuted order directly, and the swap pass (a pure data move) vanishes.
+    rev: Vec<u16>,
     /// Per-stage twiddles laid out contiguously: the stage with half-length `h`
     /// (h = 2, 4, ..., n/2) holds `w[j·n/(2h)]` for `j < h` at offset `h - 2`, so a
     /// vector of butterflies loads its twiddles in one go.
@@ -523,9 +527,12 @@ impl Radix2Fft {
     pub(crate) fn new(n: usize, sign: f64) -> Radix2Fft {
         assert!(n.is_power_of_two() && n >= 2);
         let bits = n.trailing_zeros();
+        let rev: Vec<u16> = (0..n)
+            .map(|i| ((i as u32).reverse_bits() >> (32 - bits)) as u16)
+            .collect();
         let swaps = (0..n)
             .filter_map(|i| {
-                let j = ((i as u32).reverse_bits() >> (32 - bits)) as usize;
+                let j = rev[i] as usize;
                 (i < j).then_some((i as u16, j as u16))
             })
             .collect();
@@ -545,6 +552,7 @@ impl Radix2Fft {
         Radix2Fft {
             n,
             swaps,
+            rev,
             stw,
             #[cfg(all(feature = "simd", target_arch = "x86_64"))]
             avx: std::is_x86_feature_detected!("avx"),
@@ -552,35 +560,54 @@ impl Radix2Fft {
     }
 
     pub(crate) fn run(&self, buf: &mut [[f32; 2]]) {
+        self.run_from(buf, false);
+    }
+
+    /// [`Self::run`] on input already in bit-reversed order (element `i` at
+    /// `bitrev()[i]`): the same transform without the permutation pass.
+    pub(crate) fn run_bitrev(&self, buf: &mut [[f32; 2]]) {
+        self.run_from(buf, true);
+    }
+
+    /// The bit-reversal table: input `i` belongs at `bitrev()[i]`.
+    #[inline]
+    pub(crate) fn bitrev(&self) -> &[u16] {
+        &self.rev
+    }
+
+    #[inline]
+    fn run_from(&self, buf: &mut [[f32; 2]], permuted: bool) {
         let buf = &mut buf[..self.n];
         #[cfg(all(feature = "simd", target_arch = "x86_64"))]
         if self.avx {
             crate::prof::count(crate::prof::Kernel::Fft, true, self.n);
             // SAFETY: AVX detected at construction; `buf` is exactly `n` long and
             // `stw` holds every stage's twiddles (see `run_avx`).
-            unsafe { self.run_avx(buf) };
+            unsafe { self.run_avx(buf, permuted) };
             return;
         }
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         {
             crate::prof::count(crate::prof::Kernel::Fft, true, self.n);
             // SAFETY: NEON is baseline on aarch64; same bounds as `run_avx`.
-            unsafe { self.run_neon(buf) };
+            unsafe { self.run_neon(buf, permuted) };
             return;
         }
         #[allow(unreachable_code)]
         {
             crate::prof::count(crate::prof::Kernel::Fft, false, self.n);
-            self.run_scalar(buf);
+            self.run_scalar_from(buf, permuted);
         }
     }
 
-    /// Bit-reversal permutation plus the twiddle-free first stage (shared by
-    /// every path).
+    /// Bit-reversal permutation (unless the input is already `permuted`) plus
+    /// the twiddle-free first stage (shared by every path).
     #[inline(always)]
-    fn permute_and_first_stage(&self, buf: &mut [[f32; 2]]) {
-        for &(i, j) in &self.swaps {
-            buf.swap(i as usize, j as usize);
+    fn permute_and_first_stage(&self, buf: &mut [[f32; 2]], permuted: bool) {
+        if !permuted {
+            for &(i, j) in &self.swaps {
+                buf.swap(i as usize, j as usize);
+            }
         }
         for pair in buf.chunks_exact_mut(2) {
             let (a, b) = (pair[0], pair[1]);
@@ -606,8 +633,12 @@ impl Radix2Fft {
 
     /// The scalar reference (and the fallback on CPUs without the twin ISA).
     pub(crate) fn run_scalar(&self, buf: &mut [[f32; 2]]) {
+        self.run_scalar_from(buf, false);
+    }
+
+    fn run_scalar_from(&self, buf: &mut [[f32; 2]], permuted: bool) {
         let buf = &mut buf[..self.n];
-        self.permute_and_first_stage(buf);
+        self.permute_and_first_stage(buf, permuted);
         let mut half = 2;
         while half < self.n {
             self.stage_scalar(buf, half);
@@ -627,13 +658,15 @@ impl Radix2Fft {
     /// writes `buf[s..s+4]` for `s + 4 <= n` and the twiddles `stw[0..2]`.
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     #[target_feature(enable = "avx")]
-    unsafe fn run_avx(&self, buf: &mut [[f32; 2]]) {
+    unsafe fn run_avx(&self, buf: &mut [[f32; 2]], permuted: bool) {
         use std::arch::x86_64::*;
         let n = self.n;
         let p = buf.as_mut_ptr() as *mut f32;
         if n >= 4 {
-            for &(i, j) in &self.swaps {
-                buf.swap(i as usize, j as usize);
+            if !permuted {
+                for &(i, j) in &self.swaps {
+                    buf.swap(i as usize, j as usize);
+                }
             }
             // First stage, four points per op: swapping the two complex values
             // of each 128-bit lane gives y = [a1, a0, ...]; x + y is a0 + a1 in
@@ -648,7 +681,7 @@ impl Radix2Fft {
                 s += 4;
             }
         } else {
-            self.permute_and_first_stage(buf);
+            self.permute_and_first_stage(buf, permuted);
         }
         let mut half = 2;
         while half < n {
@@ -703,10 +736,10 @@ impl Radix2Fft {
     /// `buf.len() == self.n`; bounds as for `run_avx` with two-wide vectors.
     #[cfg(all(feature = "simd", target_arch = "aarch64"))]
     #[target_feature(enable = "neon")]
-    unsafe fn run_neon(&self, buf: &mut [[f32; 2]]) {
+    unsafe fn run_neon(&self, buf: &mut [[f32; 2]], permuted: bool) {
         use std::arch::aarch64::*;
         let n = self.n;
-        self.permute_and_first_stage(buf);
+        self.permute_and_first_stage(buf, permuted);
         let p = buf.as_mut_ptr() as *mut f32;
         let mask = [0x8000_0000u32, 0, 0x8000_0000, 0];
         let neg_even = vld1q_u32(mask.as_ptr());
@@ -1155,6 +1188,28 @@ mod fft_twin {
 
     /// The FFT SIMD twin (AVX / NEON, whichever this build dispatches to) must
     /// equal the scalar reference bit for bit at every size the codec uses.
+    #[test]
+    fn run_bitrev_matches_run() {
+        let mut seed = 0x0bad_5eedu32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 23) as f32 * 2.0 - 1.0
+        };
+        for n in [4usize, 8, 32, 64, 512] {
+            let fft = Radix2Fft::new(n, 1.0);
+            let x: Vec<[f32; 2]> = (0..n).map(|_| [rnd(), rnd()]).collect();
+            let mut want = x.clone();
+            fft.run(&mut want);
+            let mut got = vec![[0f32; 2]; n];
+            for (i, &v) in x.iter().enumerate() {
+                got[fft.bitrev()[i] as usize] = v;
+            }
+            fft.run_bitrev(&mut got);
+            let bits = |b: &[[f32; 2]]| b.iter().flatten().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&want), "n {n}");
+        }
+    }
+
     #[test]
     fn fft_simd_matches_scalar() {
         for bits in 1..=10 {
