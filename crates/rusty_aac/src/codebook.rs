@@ -152,6 +152,44 @@ pub fn apply_index(cb: &Codebook, idx: u16, r: &mut BitReader, out: &mut [i32]) 
         };
     }
 
+    finish_tuple(cb, r, out)
+}
+
+/// The unpacked tuple for every codebook index of spectral book `cbn` (1..=11):
+/// `dim` coefficients before sign and escape bits, so the decoder looks a tuple
+/// up instead of dividing it out of the index digit by digit.
+pub fn tuple_table(cbn: u8) -> &'static [[i8; 4]] {
+    static T: [std::sync::OnceLock<Vec<[i8; 4]>>; 12] = [const { std::sync::OnceLock::new() }; 12];
+    T[cbn as usize].get_or_init(|| {
+        let cb = &CODEBOOKS[cbn as usize];
+        let modulo = if cb.unsigned {
+            cb.lav as u32 + 1
+        } else {
+            2 * cb.lav as u32 + 1
+        };
+        let n = modulo.pow(cb.dim as u32);
+        (0..n)
+            .map(|idx| {
+                let (mut v, mut t) = (idx, [0i8; 4]);
+                for d in (0..cb.dim as usize).rev() {
+                    let digit = (v % modulo) as i32;
+                    v /= modulo;
+                    t[d] = if cb.unsigned {
+                        digit
+                    } else {
+                        digit - cb.lav as i32
+                    } as i8;
+                }
+                t
+            })
+            .collect()
+    })
+}
+
+/// Sign bits (unsigned books) and escape values (book 11) that follow a codeword.
+#[inline]
+pub fn finish_tuple(cb: &Codebook, r: &mut BitReader, out: &mut [i32]) -> Result<()> {
+    let dim = cb.dim as usize;
     // Unsigned books: one sign bit per non-zero magnitude, in order.
     if cb.unsigned {
         for o in out.iter_mut().take(dim) {
@@ -192,6 +230,27 @@ fn read_escape(r: &mut BitReader) -> Result<i32> {
 mod tests {
     use super::*;
     use crate::tables::spectral_book;
+
+    /// The tuple table equals `apply_index` (the digit-by-digit oracle) for every
+    /// index of every book. With an all-zero reader the sign bits read positive
+    /// and a book-11 escape decodes back to 16, so the outputs must match exactly.
+    #[test]
+    fn tuple_table_matches_apply_index() {
+        for cbn in 1..=11u8 {
+            let cb = &CODEBOOKS[cbn as usize];
+            let tab = tuple_table(cbn);
+            assert_eq!(tab.len(), spectral_book(cbn).count(), "book {cbn}");
+            for (idx, t) in tab.iter().enumerate() {
+                let zeros = [0u8; 8];
+                let mut r = BitReader::new(&zeros);
+                let mut want = [0i32; 4];
+                apply_index(cb, idx as u16, &mut r, &mut want).unwrap();
+                for d in 0..cb.dim as usize {
+                    assert_eq!(t[d] as i32, want[d], "book {cbn} idx {idx}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn signed_pair_offsets_by_lav() {

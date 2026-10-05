@@ -5,9 +5,7 @@
 //! sample-identical across decoders rather than merely energy-equal.
 
 use crate::bits::BitReader;
-use crate::codebook::{
-    decode_tuple, CODEBOOKS, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, ZERO_HCB,
-};
+use crate::codebook::{CODEBOOKS, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, ZERO_HCB};
 use crate::config::aot;
 use crate::ics::{IcsInfo, WindowSequence};
 use crate::swb::swb_offsets;
@@ -545,12 +543,17 @@ pub fn decode_ics(
                 .get(cb as usize)
                 .ok_or_else(|| Error::invalid("aac: bad spectral codebook"))?;
             let book = spectral_book(cb);
+            let tab = crate::codebook::tuple_table(cb);
             let dim = meta.dim as usize;
             for w in 0..glen {
                 let base = (wbase + w) * 128;
                 let mut i = s;
                 while i + dim <= e {
-                    decode_tuple(meta, book, r, &mut tuple)?;
+                    let t = tab[book.decode(r)? as usize];
+                    for (o, &v) in tuple.iter_mut().zip(&t) {
+                        *o = v as i32;
+                    }
+                    crate::codebook::finish_tuple(meta, r, &mut tuple)?;
                     quant[base + i..base + i + dim].copy_from_slice(&tuple[..dim]);
                     i += dim;
                 }
