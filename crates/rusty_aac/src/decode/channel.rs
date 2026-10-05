@@ -592,14 +592,33 @@ pub fn decode_ics(
     drop(prof_ics); // the stages must not nest, or shares double-count
     let _prof = crate::prof::scope(crate::prof::Stage::DecDequant);
     let pow43 = crate::dsp::pow43_table();
-    cd.coeffs.iter_mut().for_each(|c| *c = 0.0);
+    // Every coefficient gets exactly one write: coded bands are dequantised or
+    // noise-filled below, and only the uncoded spans - zero / intensity bands
+    // and each window's tail above swb[max_sfb] - are zeroed. (Zeroing all
+    // 1024 first, then overwriting the coded bands, was a 4 KB memset per
+    // channel per frame.)
+    let win_len = if info.num_windows == 8 {
+        128
+    } else {
+        cd.coeffs.len()
+    };
+    let top = swb[max_sfb] as usize;
     let mut wbase = 0usize;
     for g in 0..info.num_window_groups {
         let glen = info.window_group_length[g] as usize;
+        for w in 0..glen {
+            let base = (wbase + w) * 128;
+            cd.coeffs[base + top..base + win_len].fill(0.0);
+        }
         for sfb in 0..max_sfb {
             let idx = g * max_sfb + sfb;
             let cb = cd.band_type[idx];
             if cb == ZERO_HCB || cb >= INTENSITY_HCB2 {
+                let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+                for w in 0..glen {
+                    let base = (wbase + w) * 128;
+                    cd.coeffs[base + s..base + e].fill(0.0);
+                }
                 continue;
             }
             let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
