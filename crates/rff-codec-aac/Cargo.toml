@@ -27,3 +27,9 @@ simd-avx512 = ["rusty_aac/simd-avx512"]
 rff-core.workspace = true
 rff-codec.workspace = true
 rusty_aac.workspace = true
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Style-only, nursery: `match`/`if let` reads more plainly than `map_or_else`.
+option_if_let_else = "allow"

@@ -1,0 +1,68 @@
+# cargo-fuzz harness for rusty_aac's untrusted-input entry points (H-26).
+# Detached from the parent workspace (its own empty [workspace] table) so
+# libfuzzer-sys never enters the normal build or the cargo-deny graph.
+# libFuzzer needs clang's sanitizer runtime, so run on Linux/macOS (WSL works):
+#
+#   cargo +nightly fuzz run decode_adts      # AacDecoder on ADTS / raw packets
+#   cargo +nightly fuzz run decode_config    # any AudioSpecificConfig + access units
+#   cargo +nightly fuzz run latm             # LOAS / LATM decoder
+#   cargo +nightly fuzz run parsers          # ASC / ADTS / SBR-config parsers
+#   cargo +nightly fuzz run encode           # encoder on hostile PCM + config
+#   cargo +nightly fuzz run decode_adts -- -max_total_time=600   # bounded run
+#
+# Seeds: corpus/<target>/ (excerpts of real streams; regenerate with seed.py).
+[package]
+name = "rusty_aac-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rusty_aac = { path = ".." }
+
+[[bin]]
+name = "decode_adts"
+path = "fuzz_targets/decode_adts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_config"
+path = "fuzz_targets/decode_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "latm"
+path = "fuzz_targets/latm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parsers"
+path = "fuzz_targets/parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode"
+path = "fuzz_targets/encode.rs"
+test = false
+doc = false
+bench = false
+
+# Overflow checks on: an arithmetic overflow on hostile input is a finding too.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+
+# Detach from the parent workspace.
+[workspace]
