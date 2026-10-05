@@ -151,6 +151,64 @@ unsafe fn ana_fold_avx(p: &Plans, seg: &[f32], a: &mut [Cpx; 64]) {
     }
 }
 
+/// Split a synthesis slot into `xr[k] = Re X[k]` and `xi[k] = (−1)^k·Im X[k]`
+/// for `k < slot.len()`; the rest of `xr`/`xi` is left as is.
+#[inline]
+fn split_slot(p: &Plans, slot: &[Cpx], xr: &mut [f32; 64], xi: &mut [f32; 64]) {
+    let bands = slot.len().min(64);
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    if p.avx && bands % 8 == 0 {
+        // SAFETY: AVX detected in `plans()`; `bands <= 64` complex values are
+        // read and `bands` floats written to each 64-float output.
+        unsafe { split_slot_avx(&slot[..bands], xr, xi) };
+        return;
+    }
+    let _ = p;
+    split_slot_scalar(&slot[..bands], xr, xi);
+}
+
+/// The scalar oracle of [`split_slot`].
+fn split_slot_scalar(slot: &[Cpx], xr: &mut [f32; 64], xi: &mut [f32; 64]) {
+    for (k, x) in slot.iter().enumerate() {
+        xr[k] = x[0];
+        xi[k] = if k & 1 == 1 { -x[1] } else { x[1] };
+    }
+}
+
+/// AVX twin of [`split_slot`]: eight complex values per trip, deinterleaved by
+/// a cross-lane exchange and two in-lane shuffles; the odd-`k` negation is a
+/// sign-bit XOR, exactly the scalar's `-x`.
+///
+/// # Safety
+/// AVX must be available; `slot.len() % 8 == 0` and `slot.len() <= 64`.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx")]
+unsafe fn split_slot_avx(slot: &[Cpx], xr: &mut [f32; 64], xi: &mut [f32; 64]) {
+    use std::arch::x86_64::*;
+    let (src, rp, ip) = (
+        slot.as_ptr() as *const f32,
+        xr.as_mut_ptr(),
+        xi.as_mut_ptr(),
+    );
+    let odd = _mm256_setr_ps(0.0, -0.0, 0.0, -0.0, 0.0, -0.0, 0.0, -0.0);
+    let mut k = 0;
+    while k < slot.len() {
+        let (a, b) = (
+            _mm256_loadu_ps(src.add(2 * k)),
+            _mm256_loadu_ps(src.add(2 * k + 8)),
+        );
+        // [c0 c1 | c4 c5] and [c2 c3 | c6 c7]: the shuffles then yield k order.
+        let lo = _mm256_permute2f128_ps::<0x20>(a, b);
+        let hi = _mm256_permute2f128_ps::<0x31>(a, b);
+        _mm256_storeu_ps(rp.add(k), _mm256_shuffle_ps::<0x88>(lo, hi));
+        _mm256_storeu_ps(
+            ip.add(k),
+            _mm256_xor_ps(_mm256_shuffle_ps::<0xDD>(lo, hi), odd),
+        );
+        k += 8;
+    }
+}
+
 /// 64-band (or downsampled 32-band) QMF synthesis of `2·nts` slots. `v` is a
 /// FIFO of 20 blocks of `vlen` samples (newest first) with a moving offset,
 /// so a slot costs no shift: the window reads ten blocks from `off`.
@@ -185,10 +243,7 @@ pub(super) fn qmf_synthesis(
         }
         v.off -= vlen;
         let off = v.off;
-        for k in 0..bands {
-            xr[k] = slot[k][0];
-            xi[k] = if k & 1 == 1 { -slot[k][1] } else { slot[k][1] };
-        }
+        split_slot(p, &slot[..bands], &mut xr, &mut xi);
         p.dct64.dct4(&xr, &mut s0, &mut scratch);
         p.dct64.dct4(&xi, &mut s1, &mut scratch);
         for i in 0..64 {
@@ -390,6 +445,27 @@ mod tests {
             ana_fold_scalar(p, &seg, &mut b);
             let bits = |x: &[Cpx; 64]| x.iter().flatten().map(|v| v.to_bits()).collect::<Vec<_>>();
             assert_eq!(bits(&a), bits(&b));
+        }
+    }
+
+    #[test]
+    fn split_slot_matches_scalar() {
+        let p = plans();
+        let mut seed = 0x6c07_8965u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 23) as f32 * 2.0 - 1.0
+        };
+        for bands in [32usize, 64] {
+            let mut slot: Vec<Cpx> = (0..bands).map(|_| [rnd(), rnd()]).collect();
+            slot[1][1] = 0.0; // the sign flip of +0 must give -0
+            slot[3][1] = -0.0;
+            let (mut ar, mut ai, mut br, mut bi) = ([7f32; 64], [7f32; 64], [7f32; 64], [7f32; 64]);
+            split_slot(p, &slot, &mut ar, &mut ai);
+            split_slot_scalar(&slot, &mut br, &mut bi);
+            let bits = |x: &[f32; 64]| x.map(f32::to_bits);
+            assert_eq!(bits(&ar), bits(&br), "re bands {bands}");
+            assert_eq!(bits(&ai), bits(&bi), "im bands {bands}");
         }
     }
 
