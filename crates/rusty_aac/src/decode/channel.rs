@@ -525,13 +525,13 @@ pub fn decode_ics(
     }
     let tns_present = r.read_bool()?;
     if tns_present && !sx.er() {
-        cd.tns = parse_tns(r, sx, &info)?;
+        cd.tns = parse_tns(r, sx, info)?;
     }
     if !sx.eld() && r.read_bool()? {
         skip_gain_control(r, info.window_sequence)?;
     }
     if tns_present && sx.er() {
-        cd.tns = parse_tns(r, sx, &info)?;
+        cd.tns = parse_tns(r, sx, info)?;
     }
 
     // spectral_data (integers first, so pulses stay exact)
