@@ -563,18 +563,36 @@ const GATE_EXEMPT: &[(&str, &str)] = &[(
     "switches from stereo to 5.1 mid-stream; the reference holds only the 5.1 segment",
 )];
 
-/// The `--gate` verdict for one stream: `None` passes, `Some(reason)` fails.
-fn gate_verdict(name: &str, status: &str, va: &str, vb: &str) -> Option<String> {
+/// One stream's `--gate` outcome.
+#[derive(Clone)]
+enum Gate {
+    /// Not counted: USAC (refused by design) or a documented exemption.
+    Skip,
+    /// The installed FFmpeg could not probe or demux it — untestable here.
+    Untested(String),
+    /// Decoded; `true` when an ISO reference was compared within tolerance.
+    Pass(bool),
+    Fail(String),
+}
+
+/// Fewest decoded non-USAC streams, and ISO-reference comparisons, a passing
+/// `--gate` run must contain — so a corpus that failed to download, or an FFmpeg
+/// that demuxes nothing, cannot pass vacuously.
+const GATE_MIN_DECODED: usize = 40;
+const GATE_MIN_REFERENCED: usize = 10;
+
+/// The `--gate` verdict for one decoded stream.
+fn gate_verdict(name: &str, status: &str, va: &str, vb: &str) -> Gate {
     // USAC (xHE-AAC) is a separate codec this crate refuses by design.
     let usac = name.starts_with("usac/") || status.contains("USAC (xHE-AAC)");
     if usac || GATE_EXEMPT.iter().any(|(n, _)| *n == name) {
-        return None;
+        return Gate::Skip;
     }
     if status.starts_with("ERR") || va.starts_with("ERR") {
-        return Some(format!("decode error: {va}"));
+        return Gate::Fail(format!("decode error: {va}"));
     }
     if vb.trim() == "-" {
-        return None;
+        return Gate::Pass(false);
     }
     let max = vb
         .split("max=")
@@ -582,14 +600,14 @@ fn gate_verdict(name: &str, status: &str, va: &str, vb: &str) -> Option<String> 
         .and_then(|t| t.split_whitespace().next())
         .and_then(|t| t.parse::<i32>().ok());
     match max {
-        Some(m) if m <= 2 => None,
-        _ => Some(format!("vs ISO reference: {}", vb.trim())),
+        Some(m) if m <= 2 => Gate::Pass(true),
+        _ => Gate::Fail(format!("vs ISO reference: {}", vb.trim())),
     }
 }
 
 /// One stream's census line(s), its category ('E'/'N'/'F', ' ' = skipped) and
-/// its `--gate` failure, if any.
-fn process(f: &Path, name: &str, verbose: bool) -> (String, char, Option<String>) {
+/// its `--gate` outcome.
+fn process(f: &Path, name: &str, verbose: bool) -> (String, char, Gate) {
     let mut out = String::new();
     macro_rules! outln {
         ($($t:tt)*) => {{ out.push_str(&format!($($t)*)); out.push('\n'); }};
@@ -599,8 +617,7 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char, Option<String>
         Ok(p) => p,
         Err(e) => {
             outln!("{name:<36} PROBE-ERR {e}");
-            let gate = (!name.starts_with("usac/")).then(|| format!("probe error: {e}"));
-            return (out, ' ', gate);
+            return (out, ' ', Gate::Untested(format!("probe error: {e}")));
         }
     };
     let asc = extradata(&fs_).unwrap_or_default();
@@ -608,8 +625,7 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char, Option<String>
         Ok(p) => p,
         Err(e) => {
             outln!("{name:<36} {:<11} DEMUX-ERR {e}", p.profile);
-            let gate = (!name.starts_with("usac/")).then(|| format!("demux error: {e}"));
-            return (out, 'F', gate);
+            return (out, 'F', Gate::Untested(format!("demux error: {e}")));
         }
     };
     let ours = decode_ours(&p, &asc, &pkts);
@@ -847,7 +863,8 @@ fn main() {
         }
     });
     let (mut exact, mut near, mut fail, mut total, mut known) = (0, 0, 0, 0, 0);
-    let mut gate_fails = Vec::new();
+    let (mut gate_fails, mut untested) = (Vec::new(), Vec::new());
+    let (mut decoded, mut referenced) = (0usize, 0usize);
     for (i, (text, cat, g)) in results
         .into_inner()
         .unwrap()
@@ -856,8 +873,14 @@ fn main() {
         .filter_map(|(i, r)| r.map(|r| (i, r)))
     {
         print!("{text}");
-        if let Some(reason) = g {
-            gate_fails.push(format!("{}: {reason}", names[i].1));
+        match g {
+            Gate::Fail(reason) => gate_fails.push(format!("{}: {reason}", names[i].1)),
+            Gate::Untested(why) => untested.push(format!("{}: {why}", names[i].1)),
+            Gate::Pass(r) => {
+                decoded += 1;
+                referenced += usize::from(r);
+            }
+            Gate::Skip => {}
         }
         match cat {
             'E' => exact += 1,
@@ -876,9 +899,18 @@ fn main() {
         for (n, why) in GATE_EXEMPT {
             println!("#   GATE-EXEMPT {n}: {why}");
         }
+        for u in &untested {
+            println!("#   UNTESTED {u} (the installed FFmpeg cannot demux it)");
+        }
+        println!("# gate coverage: {decoded} non-USAC streams decoded, {referenced} compared with ISO reference PCM");
+        if decoded < GATE_MIN_DECODED || referenced < GATE_MIN_REFERENCED {
+            gate_fails.push(format!(
+                "coverage below the minimum ({GATE_MIN_DECODED} decoded, {GATE_MIN_REFERENCED} referenced)"
+            ));
+        }
         if gate_fails.is_empty() {
             println!(
-                "# gate: PASS (every non-USAC stream decodes; every ISO reference within 2 LSB)"
+                "# gate: PASS (every decodable non-USAC stream decodes; every ISO reference within 2 LSB)"
             );
         } else {
             for f in &gate_fails {
