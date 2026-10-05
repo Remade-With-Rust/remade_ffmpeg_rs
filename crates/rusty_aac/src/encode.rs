@@ -288,11 +288,16 @@ const SPEC_SCALE: f32 = 32768.0;
 /// the input (TDAC). `win` is the 2048-length window (sine or KBD).
 pub fn analyze_long(prev: &[f32; FRAME_LEN], cur: &[f32; FRAME_LEN], win: &[f32]) -> Vec<f32> {
     let _prof = prof::scope(Stage::EncMdct);
-    let mut windowed = vec![0f32; LONG_N];
+    // Written into fresh capacity: both halves are fully computed, so the zero
+    // fill of a `vec![0f32; LONG_N]` was overhead.
+    let mut windowed = Vec::<f32>::with_capacity(LONG_N);
+    let w = windowed.spare_capacity_mut();
     for n in 0..FRAME_LEN {
-        windowed[n] = prev[n] * win[n] * SPEC_SCALE;
-        windowed[FRAME_LEN + n] = cur[n] * win[FRAME_LEN + n] * SPEC_SCALE;
+        w[n].write(prev[n] * win[n] * SPEC_SCALE);
+        w[FRAME_LEN + n].write(cur[n] * win[FRAME_LEN + n] * SPEC_SCALE);
     }
+    // SAFETY: LONG_N = 2·FRAME_LEN and the loop wrote both halves in full.
+    unsafe { windowed.set_len(LONG_N) };
     crate::dsp::mdct_fast(&windowed)
 }
 
