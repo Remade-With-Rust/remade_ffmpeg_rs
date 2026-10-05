@@ -59,14 +59,16 @@ fn cmul(a: Cpx, b: Cpx) -> Cpx {
     [a[0] * b[0] - a[1] * b[1], a[0] * b[1] + a[1] * b[0]]
 }
 
-/// QMF analysis of `2·nts` slots of 32 samples. `hist` keeps the last 288
-/// input samples (time order); the core output is lifted to ±32768 scale.
-pub(super) fn qmf_analysis(input: &[f32], hist: &mut [f32], w: &mut [[Cpx; 32]; 32], nts: usize) {
+/// QMF analysis of `2·nts` slots of 32 samples; the core output is lifted to
+/// ±32768 scale. `buf` (`288 + 1024` samples, kept by the caller across
+/// frames) holds the last 288 input samples at its front, in time order: the
+/// new samples land right after them, and one shift carries the history to
+/// the next call — no zeroed stack buffer, no history copy in and out.
+pub(super) fn qmf_analysis(input: &[f32], buf: &mut [f32], w: &mut [[Cpx; 32]; 32], nts: usize) {
     let p = plans();
     let ns = 64 * nts;
-    let mut buf = [0f32; 288 + 1024];
-    buf[..288].copy_from_slice(hist);
-    for (b, &s) in buf[288..288 + ns].iter_mut().zip(&input[..ns]) {
+    let buf = &mut buf[..288 + ns];
+    for (b, &s) in buf[288..].iter_mut().zip(&input[..ns]) {
         *b = s * 32768.0;
     }
     let mut a = [[0f32; 2]; 64];
@@ -77,7 +79,7 @@ pub(super) fn qmf_analysis(input: &[f32], hist: &mut [f32], w: &mut [[Cpx; 32]; 
             *out = cmul(a[k], p.ana_post[k]);
         }
     }
-    hist.copy_from_slice(&buf[ns..ns + 288]);
+    buf.copy_within(ns..ns + 288, 0);
 }
 
 /// The analysis front end for one slot: window the 320-sample segment, fold it
@@ -634,7 +636,7 @@ mod tests {
 
     #[test]
     fn fast_banks_match_the_direct_definitions() {
-        let (mut hf, mut hd) = (vec![0f32; 288], vec![0f64; 288]);
+        let (mut hf, mut hd) = (vec![0f32; 288 + 1024], vec![0f64; 288]);
         let (mut wf, mut wd) = ([[[0f32; 2]; 32]; 32], [[[0f32; 2]; 32]; 32]);
         let mut sf = QmfSynthState::new();
         let mut sd = vec![0f64; 1280];
@@ -680,7 +682,7 @@ mod tests {
     /// upsampler (64-band) or a unity-gain identity (32-band downsampled).
     #[test]
     fn qmf_round_trip_is_unity_gain() {
-        let mut hist = vec![0f32; 288];
+        let mut hist = vec![0f32; 288 + 1024];
         let mut w = [[[0f32; 2]; 32]; 32];
         let mut v = QmfSynthState::new();
         let mut ds = QmfSynthState::new();

@@ -141,7 +141,8 @@ pub(crate) struct SbrChannel {
     bs_add_harmonic: [bool; 48],
     s_indexmapped: [[bool; 48]; 8],
     bw_array: [f32; 5],
-    ana_hist: Vec<f32>,
+    /// QMF analysis input: 288 history samples, then room for a frame.
+    ana_buf: Vec<f32>,
     w: Vec<[[Cpx; 32]; 32]>,
     ypos: usize,
     y: Vec<Vec<[Cpx; 64]>>,
@@ -174,7 +175,7 @@ impl SbrChannel {
             bs_add_harmonic: [false; 48],
             s_indexmapped: [[false; 48]; 8],
             bw_array: [0.0; 5],
-            ana_hist: vec![0.0; 288],
+            ana_buf: vec![0.0; 288 + 1024],
             w: vec![[[[0.0; 2]; 32]; 32]; 2],
             ypos: 0,
             y: vec![vec![[[0.0; 2]; 64]; 38]; 2],
@@ -1668,7 +1669,7 @@ pub(crate) fn apply(dec: &mut Decoder, el: &mut Element, ty: u8, n: usize) {
         {
             let d = &mut sbr.data[ch];
             let _prof = crate::prof::scope(crate::prof::Stage::DecSbrAnalysis);
-            qmf_analysis(&el.ch[ch].output[..n], &mut d.ana_hist, &mut d.w[yp], nts);
+            qmf_analysis(&el.ch[ch].output[..n], &mut d.ana_buf, &mut d.w[yp], nts);
         }
         let prof_hf = crate::prof::scope(crate::prof::Stage::DecSbrHf);
         sbr.lf_gen(&mut wk, ch, yp, nts);
