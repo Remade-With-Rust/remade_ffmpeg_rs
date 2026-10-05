@@ -139,21 +139,120 @@ pub(super) fn qmf_synthesis(
         }
         // g[2b·i + j] = v[2·vlen·i + j], g[2b·i + b + j] = v[2·vlen·i + 3b + j];
         // out[j] = Σ g·c over the ten blocks.
-        let vb = &v.buf[off..off + span];
-        let o = &mut out[l * bands..(l + 1) * bands];
-        o.iter_mut().for_each(|x| *x = 0.0);
-        for i in 0..5 {
-            let (va, wa) = (&vb[2 * vlen * i..][..bands], &win[2 * bands * i..][..bands]);
-            let (vb2, wb) = (
-                &vb[2 * vlen * i + 3 * bands..][..bands],
-                &win[2 * bands * i + bands..][..bands],
-            );
-            for j in 0..bands {
-                o[j] += va[j] * wa[j];
-                o[j] += vb2[j] * wb[j];
-            }
+        qmf_window(
+            &mut out[l * bands..(l + 1) * bands],
+            &v.buf[off..off + span],
+            &win[..10 * bands],
+        );
+    }
+}
+
+/// The synthesis window: `o[j] = (Σ_i va_i[j]·wa_i[j] + vb_i[j]·wb_i[j])/32768`
+/// over the five block pairs of `vb` (`o.len()` bands, `vb.len() == 20·bands`,
+/// `win.len() == 10·bands`), summed in that order from 0.
+#[inline]
+fn qmf_window(o: &mut [f32], vb: &[f32], win: &[f32]) {
+    let bands = o.len();
+    let (vb, win) = (&vb[..20 * bands], &win[..10 * bands]);
+    // A running `o[j] +=` reloads and re-stores every column for each of the
+    // ten terms; the twins hold eight columns in two registers across all of
+    // them, same products and same add order per column, so bit-identical
+    // (`qmf_window_matches_scalar`).
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    if bands % 8 == 0 {
+        crate::prof::count(crate::prof::Kernel::QmfWindow, true, bands);
+        // SAFETY: SSE is baseline on x86-64; `vb`/`win` are re-bounded above
+        // to the 20·bands / 10·bands that `qmf_window_sse` reads.
+        unsafe { qmf_window_sse(o, vb, win) };
+        return;
+    }
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    if bands % 8 == 0 {
+        crate::prof::count(crate::prof::Kernel::QmfWindow, true, bands);
+        // SAFETY: NEON is baseline on aarch64; bounds as above.
+        unsafe { qmf_window_neon(o, vb, win) };
+        return;
+    }
+    crate::prof::count(crate::prof::Kernel::QmfWindow, false, bands);
+    qmf_window_scalar(o, vb, win);
+}
+
+/// The scalar oracle of [`qmf_window`].
+fn qmf_window_scalar(o: &mut [f32], vb: &[f32], win: &[f32]) {
+    let bands = o.len();
+    let vlen = 2 * bands;
+    o.iter_mut().for_each(|x| *x = 0.0);
+    for i in 0..5 {
+        let (va, wa) = (&vb[2 * vlen * i..][..bands], &win[2 * bands * i..][..bands]);
+        let (vb2, wb) = (
+            &vb[2 * vlen * i + 3 * bands..][..bands],
+            &win[2 * bands * i + bands..][..bands],
+        );
+        for j in 0..bands {
+            o[j] += va[j] * wa[j];
+            o[j] += vb2[j] * wb[j];
         }
-        o.iter_mut().for_each(|x| *x *= 1.0 / 32768.0);
+    }
+    o.iter_mut().for_each(|x| *x *= 1.0 / 32768.0);
+}
+
+/// SSE twin of [`qmf_window`].
+///
+/// # Safety
+/// `o.len() % 8 == 0`, `vb.len() >= 20·o.len()`, `win.len() >= 10·o.len()`: the
+/// trip for columns `j..j+8` reads `vb[4b·i + j..][..8]`, `vb[4b·i + 3b + j..][..8]`,
+/// `win[2b·i + j..][..8]` and `win[2b·i + b + j..][..8]` for `i < 5`.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+unsafe fn qmf_window_sse(o: &mut [f32], vb: &[f32], win: &[f32]) {
+    use std::arch::x86_64::*;
+    let b = o.len();
+    let (op, v, w) = (o.as_mut_ptr(), vb.as_ptr(), win.as_ptr());
+    let scale = _mm_set1_ps(1.0 / 32768.0);
+    let mut j = 0;
+    while j < b {
+        let (mut a0, mut a1) = (_mm_setzero_ps(), _mm_setzero_ps());
+        for i in 0..5 {
+            let (va, wa) = (v.add(4 * b * i + j), w.add(2 * b * i + j));
+            let (vc, wc) = (v.add(4 * b * i + 3 * b + j), w.add(2 * b * i + b + j));
+            a0 = _mm_add_ps(a0, _mm_mul_ps(_mm_loadu_ps(va), _mm_loadu_ps(wa)));
+            a1 = _mm_add_ps(
+                a1,
+                _mm_mul_ps(_mm_loadu_ps(va.add(4)), _mm_loadu_ps(wa.add(4))),
+            );
+            a0 = _mm_add_ps(a0, _mm_mul_ps(_mm_loadu_ps(vc), _mm_loadu_ps(wc)));
+            a1 = _mm_add_ps(
+                a1,
+                _mm_mul_ps(_mm_loadu_ps(vc.add(4)), _mm_loadu_ps(wc.add(4))),
+            );
+        }
+        _mm_storeu_ps(op.add(j), _mm_mul_ps(a0, scale));
+        _mm_storeu_ps(op.add(j + 4), _mm_mul_ps(a1, scale));
+        j += 8;
+    }
+}
+
+/// NEON twin of [`qmf_window`]; safety contract as [`qmf_window_sse`].
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+unsafe fn qmf_window_neon(o: &mut [f32], vb: &[f32], win: &[f32]) {
+    use std::arch::aarch64::*;
+    let b = o.len();
+    let (op, v, w) = (o.as_mut_ptr(), vb.as_ptr(), win.as_ptr());
+    let scale = vdupq_n_f32(1.0 / 32768.0);
+    let mut j = 0;
+    while j < b {
+        let (mut a0, mut a1) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+        for i in 0..5 {
+            let (va, wa) = (v.add(4 * b * i + j), w.add(2 * b * i + j));
+            let (vc, wc) = (v.add(4 * b * i + 3 * b + j), w.add(2 * b * i + b + j));
+            // Separate multiply and add (never vfmaq): the scalar rounds twice.
+            a0 = vaddq_f32(a0, vmulq_f32(vld1q_f32(va), vld1q_f32(wa)));
+            a1 = vaddq_f32(a1, vmulq_f32(vld1q_f32(va.add(4)), vld1q_f32(wa.add(4))));
+            a0 = vaddq_f32(a0, vmulq_f32(vld1q_f32(vc), vld1q_f32(wc)));
+            a1 = vaddq_f32(a1, vmulq_f32(vld1q_f32(vc.add(4)), vld1q_f32(wc.add(4))));
+        }
+        vst1q_f32(op.add(j), vmulq_f32(a0, scale));
+        vst1q_f32(op.add(j + 4), vmulq_f32(a1, scale));
+        j += 8;
     }
 }
 
@@ -177,6 +276,26 @@ impl QmfSynthState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qmf_window_matches_scalar() {
+        let mut seed = 0x9e37_79b9u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 23) as f32 * 2.0 - 1.0
+        };
+        for bands in [32usize, 64] {
+            for _ in 0..50 {
+                let vb: Vec<f32> = (0..20 * bands).map(|_| rnd() * 30000.0).collect();
+                let win: Vec<f32> = (0..10 * bands).map(|_| rnd()).collect();
+                let (mut a, mut b) = (vec![0f32; bands], vec![0f32; bands]);
+                qmf_window(&mut a, &vb, &win);
+                qmf_window_scalar(&mut b, &vb, &win);
+                let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&a), bits(&b), "bands {bands}");
+            }
+        }
+    }
 
     /// The standard's direct analysis (oracle).
     fn analysis_direct(input: &[f32], hist: &mut [f64], w: &mut [[Cpx; 32]; 32], nts: usize) {

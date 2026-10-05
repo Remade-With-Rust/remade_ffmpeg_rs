@@ -58,10 +58,17 @@ pub enum Kernel {
     Xpow,
     Fft,
     FmulWindow,
+    QmfWindow,
 }
 
 /// Kernel names, indexed by [`Kernel`].
-pub const KERNELS: [&str; 4] = ["quantize_band", "xpow", "radix2 fft", "fmul_window"];
+pub const KERNELS: [&str; 5] = [
+    "quantize_band",
+    "xpow",
+    "radix2 fft",
+    "fmul_window",
+    "qmf_window",
+];
 
 #[cfg(feature = "profile")]
 mod imp {
