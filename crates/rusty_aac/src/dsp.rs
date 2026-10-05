@@ -629,8 +629,26 @@ impl Radix2Fft {
     unsafe fn run_avx(&self, buf: &mut [[f32; 2]]) {
         use std::arch::x86_64::*;
         let n = self.n;
-        self.permute_and_first_stage(buf);
         let p = buf.as_mut_ptr() as *mut f32;
+        if n >= 4 {
+            for &(i, j) in &self.swaps {
+                buf.swap(i as usize, j as usize);
+            }
+            // First stage, four points per op: swapping the two complex values
+            // of each 128-bit lane gives y = [a1, a0, ...]; x + y is a0 + a1 in
+            // the even slot and y - x is a0 - a1 in the odd one - the scalar's
+            // exact sums.
+            let mut s = 0;
+            while s < n {
+                let x = _mm256_loadu_ps(p.add(2 * s));
+                let y = _mm256_castpd_ps(_mm256_permute_pd::<0b0101>(_mm256_castps_pd(x)));
+                let r = _mm256_blend_ps::<0b1100_1100>(_mm256_add_ps(x, y), _mm256_sub_ps(y, x));
+                _mm256_storeu_ps(p.add(2 * s), r);
+                s += 4;
+            }
+        } else {
+            self.permute_and_first_stage(buf);
+        }
         let mut half = 2;
         while half < n {
             if half == 2 {
