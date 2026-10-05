@@ -4,6 +4,13 @@
 //! including PNS noise from the reference decoder's generator so noise bands are
 //! sample-identical across decoders rather than merely energy-equal.
 
+// Untrusted input: narrowing casts are lint-enforced here (H-17).
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::bits::BitReader;
 use crate::codebook::{CODEBOOKS, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, ZERO_HCB};
 use crate::config::aot;
@@ -166,7 +173,7 @@ pub fn parse_ics_info(r: &mut BitReader, sx: &Syntax, ics: &mut Ics) -> Result<(
     groups.push(1);
     ics.predictor_present = false;
     if ics.info.window_sequence == WindowSequence::EightShort {
-        ics.info.max_sfb = r.read_bits(4)? as u8;
+        ics.info.max_sfb = r.read_u8(4)?;
         let groups = &mut ics.info.window_group_length;
         for _ in 0..7 {
             if r.read_bool()? {
@@ -181,7 +188,7 @@ pub fn parse_ics_info(r: &mut BitReader, sx: &Syntax, ics: &mut Ics) -> Result<(
         ics.swb = sx.short_swb();
         ics.tns_max_bands = TNS_MAX_SHORT[sx.sf_index as usize];
     } else {
-        ics.info.max_sfb = r.read_bits(6)? as u8;
+        ics.info.max_sfb = r.read_u8(6)?;
         ics.info.num_windows = 1;
         ics.swb = sx.long_swb()?;
         let i = sx.sf_index as usize;
@@ -197,7 +204,7 @@ pub fn parse_ics_info(r: &mut BitReader, sx: &Syntax, ics: &mut Ics) -> Result<(
         if ics.predictor_present {
             if sx.aot == aot::AAC_MAIN {
                 if r.read_bool()? {
-                    ics.predictor_reset_group = r.read_bits(5)? as u8;
+                    ics.predictor_reset_group = r.read_u8(5)?;
                     if ics.predictor_reset_group == 0 || ics.predictor_reset_group > 30 {
                         return Err(Error::invalid("aac: invalid predictor reset group"));
                     }
@@ -408,7 +415,7 @@ pub fn lcg_random(prev: u32) -> u32 {
 
 struct Pulse {
     pos: [usize; 4],
-    amp: [u32; 4],
+    amp: [i32; 4],
     n: usize,
 }
 
@@ -422,7 +429,7 @@ pub fn decode_ics(
     rng: &mut u32,
 ) -> Result<()> {
     let prof_ics = crate::prof::scope(crate::prof::Stage::DecIcs);
-    let global_gain = r.read_bits(8)? as i32;
+    let global_gain = r.read_i32(8)?;
     if !common_window {
         parse_ics_info(r, sx, ics)?;
     }
@@ -437,7 +444,7 @@ pub fn decode_ics(
     for g in 0..info.num_window_groups {
         let mut k = 0usize;
         while k < max_sfb {
-            let cb = r.read_bits(4)? as u8;
+            let cb = r.read_u8(4)?;
             if cb == 12 {
                 return Err(Error::invalid("aac: invalid band type 12"));
             }
@@ -474,7 +481,7 @@ pub fn decode_ics(
                 NOISE_HCB => {
                     if noise_flag {
                         noise_flag = false;
-                        off1 += r.read_bits(9)? as i32 - 256;
+                        off1 += r.read_i32(9)? - 256;
                     } else {
                         off1 += i32::from(SCALEFACTOR_BOOK.decode(r)?) - 60;
                     }
@@ -515,13 +522,13 @@ pub fn decode_ics(
         if p.pos[0] >= limit {
             return Err(Error::invalid("aac: pulse data corrupt"));
         }
-        p.amp[0] = r.read_bits(4)?;
+        p.amp[0] = r.read_i32(4)?;
         for i in 1..n {
             p.pos[i] = r.read_bits(5)? as usize + p.pos[i - 1];
             if p.pos[i] >= limit {
                 return Err(Error::invalid("aac: pulse data corrupt"));
             }
-            p.amp[i] = r.read_bits(4)?;
+            p.amp[i] = r.read_i32(4)?;
         }
         pulse = Some(p);
     }
@@ -587,9 +594,9 @@ pub fn decode_ics(
                 continue;
             }
             if quant[k] > 0 {
-                quant[k] += p.amp[i] as i32;
+                quant[k] += p.amp[i];
             } else {
-                quant[k] -= p.amp[i] as i32;
+                quant[k] -= p.amp[i];
             }
         }
     }
@@ -635,7 +642,12 @@ pub fn decode_ics(
                     let band = &mut cd.coeffs[base + s..base + e];
                     for v in band.iter_mut() {
                         *rng = lcg_random(*rng);
-                        *v = *rng as i32 as f32;
+                        #[allow(
+                            clippy::cast_possible_wrap,
+                            reason = "the reference generator reinterprets its u32 state as signed"
+                        )]
+                        let signed = *rng as i32;
+                        *v = signed as f32;
                     }
                     let energy: f32 = band.iter().map(|v| v * v).sum();
                     let scale = g_amp / energy.sqrt();

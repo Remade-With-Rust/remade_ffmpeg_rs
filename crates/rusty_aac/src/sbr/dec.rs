@@ -21,6 +21,36 @@ use crate::decode::{Decoder, Element};
 use crate::Result;
 use std::sync::OnceLock;
 
+/// A syntax-bounded count or position (envelope borders <= 38, band and
+/// envelope counts <= 64, bit budgets within one frame) as `i64`.
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "syntax-bounded values are far below 2^63"
+)]
+const fn sx64(v: usize) -> i64 {
+    v as i64
+}
+
+/// A syntax-bounded count or position as `i32` (see [`sx64`]).
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    reason = "syntax-bounded values are far below 2^31"
+)]
+const fn sx32(v: usize) -> i32 {
+    v as i32
+}
+
+/// A value the caller has made non-negative, as `usize`.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "callers clamp or check `v >= 0`; magnitudes are syntax-bounded"
+)]
+const fn ux(v: i64) -> usize {
+    v as usize
+}
+
 /// `t_HFAdj`: the envelope adjuster runs two slots behind the HF generator.
 const ENV_ADJ: usize = 2;
 /// `t_HFGen`: slots of the previous frame kept in `X_low`.
@@ -68,6 +98,11 @@ impl SbrBook {
         Self { entries, lut }
     }
 
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     pub(super) fn decode(&self, r: &mut BitReader) -> Result<i32> {
         let i = self.lut[r.peek_bits(SBR_LUT_BITS) as usize];
         if i != 0 {
@@ -618,6 +653,11 @@ impl SbrChannelState {
 // ---------------------------------------------------------------------------
 
 impl SbrChannelState {
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn read_header(&mut self, r: &mut BitReader) -> Result<()> {
         self.start = true;
         self.ready_for_dequant = false;
@@ -625,18 +665,18 @@ impl SbrChannelState {
         let old_lim = self.bs_limiter_bands;
         self.bs_amp_res_header = r.read_bool()?;
         let mut sp = Spectrum {
-            start_freq: r.read_bits(4)? as i32,
-            stop_freq: r.read_bits(4)? as i32,
-            xover_band: r.read_bits(3)? as i32,
+            start_freq: r.read_i32(4)?,
+            stop_freq: r.read_i32(4)?,
+            xover_band: r.read_i32(3)?,
             ..old
         };
         r.skip(2)?;
         let extra1 = r.read_bool()?;
         let extra2 = r.read_bool()?;
         if extra1 {
-            sp.freq_scale = r.read_bits(2)? as i32;
-            sp.alter_scale = r.read_bits(1)? as i32;
-            sp.noise_bands = r.read_bits(2)? as i32;
+            sp.freq_scale = r.read_i32(2)?;
+            sp.alter_scale = r.read_i32(1)?;
+            sp.noise_bands = r.read_i32(2)?;
         } else {
             sp.freq_scale = 2;
             sp.alter_scale = 1;
@@ -647,7 +687,7 @@ impl SbrChannelState {
             self.reset = true;
         }
         if extra2 {
-            self.bs_limiter_bands = r.read_bits(2)? as i32;
+            self.bs_limiter_bands = r.read_i32(2)?;
             self.bs_limiter_gains = r.read_bits(2)? as usize;
             self.bs_interpol_freq = r.read_bool()?;
             self.bs_smoothing_mode = r.read_bool()?;
@@ -663,6 +703,11 @@ impl SbrChannelState {
         Ok(())
     }
 
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn read_grid(&mut self, r: &mut BitReader, ch: usize, num_time_slots: usize) -> Result<bool> {
         const CEIL_LOG2: [u32; 6] = [0, 1, 2, 2, 3, 3];
         let d = &mut self.data[ch];
@@ -675,7 +720,7 @@ impl SbrChannelState {
         let class = r.read_bits(2)?;
         // Relative borders count back from the trailing border; an underflow
         // is caught by the monotonicity check below.
-        let mut t_env = d.t_env.map(|v| v as i64);
+        let mut t_env = d.t_env.map(sx64);
         let n = match class {
             FIXFIX => {
                 let n = 1usize << r.read_bits(2)?;
@@ -686,12 +731,12 @@ impl SbrChannelState {
                     d.bs_amp_res = false;
                 }
                 t_env[0] = 0;
-                t_env[n] = abs_bord_trail as i64;
-                let step = ((abs_bord_trail + (n >> 1)) / n) as i64;
+                t_env[n] = sx64(abs_bord_trail);
+                let step = sx64((abs_bord_trail + (n >> 1)) / n);
                 for i in 0..n - 1 {
                     t_env[i + 1] = t_env[i] + step;
                 }
-                d.bs_freq_res[1] = r.read_bits(1)? as u8;
+                d.bs_freq_res[1] = r.read_u8(1)?;
                 for i in 1..n {
                     d.bs_freq_res[i + 1] = d.bs_freq_res[1];
                 }
@@ -702,13 +747,13 @@ impl SbrChannelState {
                 let num_rel_trail = r.read_bits(2)? as usize;
                 let n = num_rel_trail + 1;
                 t_env[0] = 0;
-                t_env[n] = abs_bord_trail as i64;
+                t_env[n] = sx64(abs_bord_trail);
                 for i in 0..num_rel_trail {
                     t_env[n - 1 - i] = t_env[n - i] - 2 * i64::from(r.read_bits(2)?) - 2;
                 }
                 bs_pointer = r.read_bits(CEIL_LOG2[n])? as usize;
                 for i in 0..n {
-                    d.bs_freq_res[n - i] = r.read_bits(1)? as u8;
+                    d.bs_freq_res[n - i] = r.read_u8(1)?;
                 }
                 n
             }
@@ -716,13 +761,13 @@ impl SbrChannelState {
                 t_env[0] = i64::from(r.read_bits(2)?);
                 let num_rel_lead = r.read_bits(2)? as usize;
                 let n = num_rel_lead + 1;
-                t_env[n] = abs_bord_trail as i64;
+                t_env[n] = sx64(abs_bord_trail);
                 for i in 0..num_rel_lead {
                     t_env[i + 1] = t_env[i] + 2 * i64::from(r.read_bits(2)?) + 2;
                 }
                 bs_pointer = r.read_bits(CEIL_LOG2[n])? as usize;
                 for i in 0..n {
-                    d.bs_freq_res[i + 1] = r.read_bits(1)? as u8;
+                    d.bs_freq_res[i + 1] = r.read_u8(1)?;
                 }
                 n
             }
@@ -735,7 +780,7 @@ impl SbrChannelState {
                 if n > 5 {
                     return Ok(false);
                 }
-                t_env[n] = abs_bord_trail as i64;
+                t_env[n] = sx64(abs_bord_trail);
                 for i in 0..num_rel_lead {
                     t_env[i + 1] = t_env[i] + 2 * i64::from(r.read_bits(2)?) + 2;
                 }
@@ -744,7 +789,7 @@ impl SbrChannelState {
                 }
                 bs_pointer = r.read_bits(CEIL_LOG2[n])? as usize;
                 for i in 0..n {
-                    d.bs_freq_res[i + 1] = r.read_bits(1)? as u8;
+                    d.bs_freq_res[i + 1] = r.read_u8(1)?;
                 }
                 n
             }
@@ -758,7 +803,7 @@ impl SbrChannelState {
             }
         }
         for (dst, &src) in d.t_env.iter_mut().zip(&t_env) {
-            *dst = src.max(0) as usize;
+            *dst = ux(src.max(0));
         }
         d.bs_num_env = n;
         d.bs_num_noise = usize::from(n > 1) + 1;
@@ -778,12 +823,12 @@ impl SbrChannelState {
             };
             d.t_q[1] = d.t_env[idx];
         }
-        d.e_a[0] = -i32::from(d.e_a[1] != bs_num_env_old as i32);
+        d.e_a[0] = -i32::from(d.e_a[1] != sx32(bs_num_env_old));
         d.e_a[1] = -1;
         if class & 1 == 1 && bs_pointer != 0 {
-            d.e_a[1] = (n + 1 - bs_pointer) as i32;
+            d.e_a[1] = sx32(n + 1 - bs_pointer);
         } else if class == VARFIX && bs_pointer > 1 {
-            d.e_a[1] = bs_pointer as i32 - 1;
+            d.e_a[1] = sx32(bs_pointer) - 1;
         }
         Ok(true)
     }
@@ -802,6 +847,11 @@ impl SbrChannelState {
         dst.e_a[1] = src.e_a[1];
     }
 
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn read_dtdf(&mut self, r: &mut BitReader, ch: usize) -> Result<()> {
         let d = &mut self.data[ch];
         for i in 0..d.bs_num_env {
@@ -813,16 +863,26 @@ impl SbrChannelState {
         Ok(())
     }
 
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn read_invf(&mut self, r: &mut BitReader, ch: usize) -> Result<()> {
         let n_q = self.n_q;
         let d = &mut self.data[ch];
         d.bs_invf_mode[1] = d.bs_invf_mode[0];
         for i in 0..n_q {
-            d.bs_invf_mode[0][i] = r.read_bits(2)? as u8;
+            d.bs_invf_mode[0][i] = r.read_u8(2)?;
         }
         Ok(())
     }
 
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn read_envelope(&mut self, r: &mut BitReader, ch: usize) -> Result<bool> {
         let b = books();
         let coupled = self.bs_coupling && ch == 1;
@@ -857,7 +917,7 @@ impl SbrChannelState {
                     d.env_facs_q[i + 1][j] = v;
                 }
             } else {
-                d.env_facs_q[i + 1][0] = delta * r.read_bits(bits)? as i32;
+                d.env_facs_q[i + 1][0] = delta * r.read_i32(bits)?;
                 for j in 1..n[res] {
                     let v = d.env_facs_q[i + 1][j - 1] + delta * f_huff.decode(r)?;
                     if !(0..=127).contains(&v) {
@@ -871,6 +931,11 @@ impl SbrChannelState {
         Ok(true)
     }
 
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn read_noise(&mut self, r: &mut BitReader, ch: usize) -> Result<bool> {
         let b = books();
         let coupled = self.bs_coupling && ch == 1;
@@ -892,7 +957,7 @@ impl SbrChannelState {
                     d.noise_facs_q[i + 1][j] = v;
                 }
             } else {
-                d.noise_facs_q[i + 1][0] = delta * r.read_bits(5)? as i32;
+                d.noise_facs_q[i + 1][0] = delta * r.read_i32(5)?;
                 for j in 1..n_q {
                     let v = d.noise_facs_q[i + 1][j - 1] + delta * f_huff.decode(r)?;
                     if !(0..=30).contains(&v) {
@@ -906,6 +971,11 @@ impl SbrChannelState {
         Ok(true)
     }
 
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn read_harmonics(&mut self, r: &mut BitReader, ch: usize) -> Result<()> {
         let n1 = self.n[1];
         let d = &mut self.data[ch];
@@ -919,6 +989,11 @@ impl SbrChannelState {
     }
 
     /// `sbr_data()`; Ok(false) = invalid data (SBR turns off).
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn read_data(
         &mut self,
         r: &mut BitReader,
@@ -995,14 +1070,14 @@ impl SbrChannelState {
                     let ps = self
                         .ps
                         .get_or_insert_with(|| Box::new(super::ps::PsState::new()));
-                    bits_left -= ps.read_data(r, bits_left as usize, 2 * nts) as i64;
+                    bits_left -= sx64(ps.read_data(r, ux(bits_left), 2 * nts));
                 } else {
-                    r.skip(bits_left as usize)?;
+                    r.skip(ux(bits_left))?;
                     bits_left = 0;
                 }
             }
             if bits_left > 0 {
-                r.skip(bits_left as usize)?;
+                r.skip(ux(bits_left))?;
             }
         }
         Ok(true)

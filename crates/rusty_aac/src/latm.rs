@@ -25,6 +25,13 @@
 //! and what the reference decoder supports; multiple programs/layers are
 //! refused rather than mis-parsed.
 
+// Untrusted input: narrowing casts are lint-enforced here (H-17).
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::bits::BitReader;
 use crate::config::StreamConfig;
 use crate::encode::BitWriter;
@@ -75,7 +82,7 @@ fn simple_view(c: &StreamConfig) -> AudioSpecificConfig {
     AudioSpecificConfig {
         object_type: c.object_type,
         sample_rate: c.sample_rate,
-        channels: c.channels() as u16,
+        channels: u16::try_from(c.channels()).unwrap_or(u16::MAX),
     }
 }
 
@@ -121,11 +128,12 @@ fn read_stream_mux_config(r: &mut BitReader) -> Result<MuxConfig> {
         let mut bytes = Vec::with_capacity(n.div_ceil(8));
         let mut left = n;
         while left >= 8 {
-            bytes.push(r.read_bits(8)? as u8);
+            bytes.push(r.read_u8(8)?);
             left -= 8;
         }
         if left > 0 {
-            bytes.push((r.read_bits(left as u32)? << (8 - left)) as u8);
+            // `left` < 8 here, so the shifted value fills one byte exactly.
+            bytes.push(r.read_u8(u32::try_from(left).unwrap_or(7))? << (8 - left));
         }
         let mut sub = BitReader::new(&bytes);
         crate::config::parse_from_opts(&mut sub, 0, true)?
@@ -266,7 +274,7 @@ impl LatmReader {
         // PayloadMux — au_len bytes, still bit-aligned to the reader position.
         let mut au = Vec::with_capacity(au_len);
         for _ in 0..au_len {
-            au.push(r.read_bits(8)? as u8);
+            au.push(r.read_u8(8)?);
         }
 
         Ok(LoasFrame {
@@ -367,7 +375,7 @@ pub fn write_loas_frame(cfg: &AudioSpecificConfig, au: &[u8]) -> Vec<u8> {
         w.write(255, 8);
         remaining -= 255;
     }
-    w.write(remaining as u32, 8);
+    w.write(u32::try_from(remaining).unwrap_or(254), 8); // < 255 after the loop
 
     // --- PayloadMux ---
     for &b in au {
@@ -378,15 +386,15 @@ pub fn write_loas_frame(cfg: &AudioSpecificConfig, au: &[u8]) -> Vec<u8> {
 
     // --- audioSyncStream wrapper ---
     let mut out = Vec::with_capacity(LOAS_HEADER_LEN + body.len());
-    let hdr = (LOAS_SYNC << 13) | (body.len() as u32 & 0x1FFF);
-    out.push((hdr >> 16) as u8);
-    out.push((hdr >> 8) as u8);
-    out.push(hdr as u8);
+    let len13 = u32::try_from(body.len() & 0x1FFF).unwrap_or(0x1FFF);
+    let [_, b0, b1, b2] = ((LOAS_SYNC << 13) | len13).to_be_bytes();
+    out.extend_from_slice(&[b0, b1, b2]);
     out.extend_from_slice(&body);
     out
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation, reason = "test stream builders")]
 mod tests {
     use super::*;
 

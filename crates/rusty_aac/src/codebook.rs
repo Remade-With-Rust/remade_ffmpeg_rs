@@ -9,6 +9,13 @@
 //! transcribed separately; the decode here is what turns a correct lookup into
 //! correct coefficients, and is verified with synthetic codebooks.
 
+// Untrusted input: narrowing casts are lint-enforced here (H-17).
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::{Error, Result};
 
 use crate::bits::BitReader;
@@ -135,6 +142,10 @@ pub fn decode_tuple(
     reason = "measured: passing the 4-byte Codebook by value cost +0.7% encode / +1.4% decode instructions in the inlined hot loops"
 )]
 #[cfg(test)]
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "test oracle: digits are below the codebook modulus (<= 17)"
+)]
 pub fn apply_index(cb: &Codebook, idx: u16, r: &mut BitReader, out: &mut [i32]) -> Result<()> {
     let dim = cb.dim as usize;
     let modulo = if cb.unsigned {
@@ -180,13 +191,23 @@ pub fn tuple_table(cbn: u8) -> &'static [[i8; 4]] {
             .map(|idx| {
                 let (mut v, mut t) = (idx, [0i8; 4]);
                 for d in (0..cb.dim as usize).rev() {
+                    #[allow(
+                        clippy::cast_possible_wrap,
+                        reason = "a digit below the codebook modulus (<= 17)"
+                    )]
                     let digit = (v % modulo) as i32;
                     v /= modulo;
-                    t[d] = if cb.unsigned {
+                    let signed = if cb.unsigned {
                         digit
                     } else {
                         digit - i32::from(cb.lav)
-                    } as i8;
+                    };
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "a tuple digit lies within [-16, 16]"
+                    )]
+                    let narrow = signed as i8;
+                    t[d] = narrow;
                 }
                 t
             })
@@ -235,10 +256,16 @@ fn read_escape(r: &mut BitReader) -> Result<i32> {
     }
     let bits = n + 4;
     let word = r.read_bits(bits)?;
-    Ok(((1u32 << bits) + word) as i32)
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "bits <= 28 (n <= 24 above), so the value is below 2^29"
+    )]
+    let value = ((1u32 << bits) + word) as i32;
+    Ok(value)
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation, reason = "test data generators")]
 mod tests {
     use super::*;
     use crate::tables::spectral_book;

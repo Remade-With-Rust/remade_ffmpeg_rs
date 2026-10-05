@@ -69,11 +69,11 @@ pub fn parse_ics_info(r: &mut BitReader, fs_index: u8) -> Result<IcsInfo> {
     let window_shape_kbd = r.read_bool()?;
 
     let (max_sfb, scale_factor_grouping) = if window_sequence.is_short() {
-        let max_sfb = r.read_bits(4)? as u8;
+        let max_sfb = r.read_u8(4)?;
         let sfg = r.read_bits(7)?;
         (max_sfb, Some(sfg))
     } else {
-        let max_sfb = r.read_bits(6)? as u8;
+        let max_sfb = r.read_u8(6)?;
         let predictor_data_present = r.read_bool()?;
         if predictor_data_present {
             // AAC-LC has no prediction; a set bit means a non-LC stream.

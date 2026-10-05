@@ -105,13 +105,13 @@ pub struct AudioSpecificConfig {
 pub fn parse_audio_specific_config(data: &[u8]) -> Result<AudioSpecificConfig> {
     let mut r = BitReader::new(data);
     let object_type = read_object_type(&mut r)?;
-    let sf_index = r.read_bits(4)? as u8;
+    let sf_index = r.read_u8(4)?;
     let sample_rate = if sf_index == 0x0F {
         r.read_bits(24)?
     } else {
         sample_rate_for_index(sf_index)
     };
-    let channels = r.read_bits(4)? as u16;
+    let channels = r.read_u16(4)?;
     if sample_rate == 0 {
         return Err(Error::invalid("aac: invalid sampling frequency in config"));
     }
@@ -124,7 +124,7 @@ pub fn parse_audio_specific_config(data: &[u8]) -> Result<AudioSpecificConfig> {
 
 /// Read the (possibly escaped) 5-bit Audio Object Type.
 fn read_object_type(r: &mut BitReader) -> Result<u8> {
-    let ot = r.read_bits(5)? as u8;
+    let ot = r.read_u8(5)?;
     if ot == 31 {
         Ok((32 + r.read_bits(6)?) as u8)
     } else {
@@ -170,10 +170,10 @@ pub fn parse_adts(data: &[u8]) -> Result<AdtsHeader> {
     r.skip(1)?; // MPEG version
     r.skip(2)?; // layer (00)
     let protection_absent = r.read_bool()?;
-    let profile = r.read_bits(2)? as u8; // object_type - 1
-    let sf_index = r.read_bits(4)? as u8;
+    let profile = r.read_u8(2)?; // object_type - 1
+    let sf_index = r.read_u8(4)?;
     r.skip(1)?; // private
-    let channel_config = r.read_bits(3)? as u16;
+    let channel_config = r.read_u16(3)?;
     r.skip(4)?; // original/home/copyright id+start
     let frame_length = r.read_bits(13)? as usize;
     // remaining: buffer_fullness(11) + num_raw_data_blocks(2) — not needed here.

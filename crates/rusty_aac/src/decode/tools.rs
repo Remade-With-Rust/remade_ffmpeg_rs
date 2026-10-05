@@ -75,7 +75,8 @@ pub fn apply_tns(coef: &mut [f32], tns: &Tns, ics: &Ics, decode: bool) {
     let _prof = crate::prof::scope(crate::prof::Stage::DecTools);
     let info = &ics.info;
     let mmm = (ics.tns_max_bands as usize).min(info.max_sfb as usize);
-    if mmm == 0 {
+    // TNS data is only meaningful against the window layout it was parsed for.
+    if mmm == 0 || tns.windows.len() != info.num_windows {
         return;
     }
     for (w, filters) in tns.windows.iter().enumerate() {

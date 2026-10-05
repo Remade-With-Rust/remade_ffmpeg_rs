@@ -11,6 +11,13 @@
 //! streams (indexed configurations). Matching that model exactly is what makes
 //! multichannel output sample-for-sample comparable with FFmpeg.
 
+// Untrusted input: narrowing casts are lint-enforced here (H-17).
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::config::Pce;
 
 pub const TYPE_SCE: u8 = 0;

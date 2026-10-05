@@ -9,6 +9,13 @@
 //! spectral coefficients. O(maxlen·count) per codeword — codebooks are small,
 //! so it is plenty fast and trivially verifiable.
 
+// Untrusted input: narrowing casts are lint-enforced here (H-17).
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::{Error, Result};
 
 use crate::bits::BitReader;
@@ -79,7 +86,12 @@ impl HuffBook {
             if l <= bits {
                 let base = (c << (bits - l)) as usize;
                 for e in prim.iter_mut().skip(base).take(1 << (bits - l)) {
-                    *e = ((i as u32) << 8) | l;
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "a symbol index (< 289 entries) fits in u32"
+                    )]
+                    let v = ((i as u32) << 8) | l;
+                    *e = v;
                 }
             } else {
                 let p = (c >> (l - bits)) as usize;
@@ -89,7 +101,12 @@ impl HuffBook {
         let mut sub = Vec::new();
         for (p, &sb) in deepest.iter().enumerate() {
             if sb > 0 {
-                prim[p] = SUB | ((sub.len() as u32) << 5) | sb;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "the sub-table holds at most 2^16 entries"
+                )]
+                let v = SUB | ((sub.len() as u32) << 5) | sb;
+                prim[p] = v;
                 sub.resize(sub.len() + (1 << sb), 0);
             }
         }
@@ -103,7 +120,12 @@ impl HuffBook {
             let tail = l - bits; // bits of this code below the primary prefix
             let base = off + ((c & ((1 << tail) - 1)) << (sb - tail)) as usize;
             for x in sub.iter_mut().skip(base).take(1 << (sb - tail)) {
-                *x = ((i as u32) << 8) | l;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "a symbol index (< 289 entries) fits in u32"
+                )]
+                let v = ((i as u32) << 8) | l;
+                *x = v;
             }
         }
         Lut { prim, sub, bits }
@@ -124,7 +146,12 @@ impl HuffBook {
         }
         if e != 0 {
             r.skip((e & 0xFF) as usize)?;
-            return Ok((e >> 8) as u16);
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "entries store a symbol index (< 289) above the length byte"
+            )]
+            let v = (e >> 8) as u16;
+            return Ok(v);
         }
         self.decode_scan(r)
     }
@@ -136,7 +163,12 @@ impl HuffBook {
             code = (code << 1) | r.read_bit()?;
             for i in 0..self.codes.len() {
                 if self.lens[i] == len && self.codes[i] == code {
-                    return Ok(i as u16);
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "a symbol index (< 289 entries) fits in u16"
+                    )]
+                    let v = i as u16;
+                    return Ok(v);
                 }
             }
         }
@@ -171,6 +203,7 @@ impl HuffBook {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation, reason = "test data generators")]
 mod tests {
     use super::*;
 

@@ -11,6 +11,36 @@ use crate::Result;
 use std::f64::consts::{PI, SQRT_2};
 use std::sync::OnceLock;
 
+/// A syntax-bounded count or position (envelope borders <= 38, band and
+/// envelope counts <= 64, bit budgets within one frame) as `i64`.
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "syntax-bounded values are far below 2^63"
+)]
+const fn sx64(v: usize) -> i64 {
+    v as i64
+}
+
+/// A syntax-bounded count or position as `i32` (see [`sx64`]).
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    reason = "syntax-bounded values are far below 2^31"
+)]
+const fn sx32(v: usize) -> i32 {
+    v as i32
+}
+
+/// A value the caller has made non-negative, as `usize`.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "callers clamp or check `v >= 0`; magnitudes are syntax-bounded"
+)]
+const fn ux(v: i64) -> usize {
+    v as usize
+}
+
 type Cpx = [f32; 2];
 
 const MAX_ENV: usize = 5;
@@ -724,6 +754,11 @@ impl PsState {
     }
 
     /// Delta-decode one envelope of a parameter; Ok(false) on an illegal value.
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn read_par(
         &mut self,
         r: &mut BitReader,
@@ -737,7 +772,7 @@ impl PsState {
             Par::Icc => (self.nr_icc_par, 0),
             Par::Ipd | Par::Opd => (self.nr_ipdopd_par, 7),
         };
-        let limit = 7 + 8 * self.iid_quant as i32;
+        let limit = 7 + 8 * sx32(self.iid_quant);
         let e_prev = if e > 0 {
             e - 1
         } else {
@@ -760,8 +795,14 @@ impl PsState {
                 Par::Icc => !(0..=7).contains(&val),
                 _ => false,
             };
-            // The stored value is an int8 in the reference.
-            self.par(p)[e][b] = val as i8;
+            // The stored value is an int8 in the reference decoder, so an
+            // out-of-range value wraps exactly as it does there.
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "matches the reference decoder's int8 storage"
+            )]
+            let stored = val as i8;
+            self.par(p)[e][b] = stored;
             if bad {
                 return Ok(false);
             }
@@ -769,6 +810,11 @@ impl PsState {
         Ok(true)
     }
 
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn read_extension(&mut self, r: &mut BitReader, id: u32) -> Result<usize> {
         if id != 0 {
             return Ok(0);
@@ -790,6 +836,11 @@ impl PsState {
 
     /// Parse `ps_data()` within `bits_left` bits; returns the bits consumed
     /// (all of `bits_left` on error, which also disables PS until the next header).
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     pub(crate) fn read_data(&mut self, r: &mut BitReader, bits_left: usize, slots: usize) -> usize {
         self.slots = slots;
         let start = r.position();
@@ -807,6 +858,11 @@ impl PsState {
         }
     }
 
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn read_data_inner(&mut self, r: &mut BitReader) -> Result<bool> {
         let bk = books();
         let header = r.read_bool()?;
@@ -837,7 +893,7 @@ impl PsState {
         self.border_position[0] = -1;
         if frame_class {
             for e in 1..=self.num_env {
-                self.border_position[e] = r.read_bits(5)? as i32;
+                self.border_position[e] = r.read_i32(5)?;
                 if self.border_position[e] < self.border_position[e - 1] {
                     return Ok(false);
                 }
@@ -845,7 +901,7 @@ impl PsState {
         } else {
             let log2 = [0, 0, 1, 1, 2][self.num_env];
             for e in 1..=self.num_env {
-                self.border_position[e] = ((e * self.slots) >> log2) as i32 - 1;
+                self.border_position[e] = sx32((e * self.slots) >> log2) - 1;
             }
         }
         if self.enable_iid {
@@ -879,24 +935,24 @@ impl PsState {
             cnt *= 8;
             while cnt > 7 {
                 let id = r.read_bits(2)?;
-                cnt -= 2 + self.read_extension(r, id)? as i64;
+                cnt -= 2 + sx64(self.read_extension(r, id)?);
             }
             if cnt < 0 {
                 return Ok(false);
             }
-            r.skip(cnt as usize)?;
+            r.skip(ux(cnt))?;
         }
 
         // A last border before the frame end gets a repeated envelope.
         let n = self.num_env;
-        if n == 0 || self.border_position[n] < self.slots as i32 - 1 {
+        if n == 0 || self.border_position[n] < sx32(self.slots) - 1 {
             let source = if n > 0 {
-                n as i64 - 1
+                sx64(n) - 1
             } else {
-                self.num_env_old as i64 - 1
+                sx64(self.num_env_old) - 1
             };
-            if source >= 0 && source as usize != n {
-                let s = source as usize;
+            if source >= 0 && ux(source) != n {
+                let s = ux(source);
                 if self.enable_iid {
                     self.iid_par[n] = self.iid_par[s];
                 }
@@ -908,7 +964,7 @@ impl PsState {
                     self.opd_par[n] = self.opd_par[s];
                 }
             }
-            let limit = 7 + 8 * self.iid_quant as i32;
+            let limit = 7 + 8 * sx32(self.iid_quant);
             if self.enable_iid
                 && self.iid_par[n][..self.nr_iid_par]
                     .iter()
@@ -925,7 +981,7 @@ impl PsState {
                 return Ok(false);
             }
             self.num_env += 1;
-            self.border_position[self.num_env] = self.slots as i32 - 1;
+            self.border_position[self.num_env] = sx32(self.slots) - 1;
         }
 
         self.is34bands_old = self.is34bands;

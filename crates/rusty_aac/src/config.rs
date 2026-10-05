@@ -14,6 +14,13 @@
 //! other way round decodes the core at the wrong rate and parses the
 //! `GASpecificConfig` four bits early.
 
+// Untrusted input: narrowing casts are lint-enforced here (H-17).
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::bits::BitReader;
 use crate::{Error, Result};
 
@@ -48,9 +55,19 @@ pub fn sf_index_for_any_rate(rate: u32) -> u8 {
         92017, 75132, 55426, 46009, 37566, 27713, 23004, 18783, 13856, 11502, 9391,
     ];
     if let Some(i) = SAMPLE_RATES.iter().position(|&r| r == rate) {
-        return i as u8;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "an index into the 13-entry rate table"
+        )]
+        let idx = i as u8;
+        return idx;
     }
-    EDGES.iter().position(|&e| rate >= e).unwrap_or(11) as u8
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "an index into the 11-entry edge table, or 11"
+    )]
+    let idx = EDGES.iter().position(|&e| rate >= e).unwrap_or(11) as u8;
+    idx
 }
 
 /// One element slot of a program configuration: an SCE/CPE/LFE/CCE/DSE tag.
@@ -105,7 +122,7 @@ impl Pce {
     ///
     /// Returns [`Error::InvalidData`] if the element is truncated or malformed.
     pub fn parse(r: &mut BitReader, align_base: usize) -> Result<Self> {
-        let tag = r.read_bits(4)? as u8;
+        let tag = r.read_u8(4)?;
         Self::parse_after_tag(r, tag, align_base)
     }
 
@@ -118,8 +135,8 @@ impl Pce {
     pub fn parse_after_tag(r: &mut BitReader, tag: u8, align_base: usize) -> Result<Self> {
         let mut p = Self {
             element_instance_tag: tag,
-            object_type: r.read_bits(2)? as u8,
-            sf_index: r.read_bits(4)? as u8,
+            object_type: r.read_u8(2)?,
+            sf_index: r.read_u8(4)?,
             ..Default::default()
         };
         let nf = r.read_bits(4)? as usize;
@@ -129,13 +146,13 @@ impl Pce {
         let na = r.read_bits(3)? as usize;
         let nc = r.read_bits(4)? as usize;
         if r.read_bool()? {
-            p.mono_mixdown = Some(r.read_bits(4)? as u8);
+            p.mono_mixdown = Some(r.read_u8(4)?);
         }
         if r.read_bool()? {
-            p.stereo_mixdown = Some(r.read_bits(4)? as u8);
+            p.stereo_mixdown = Some(r.read_u8(4)?);
         }
         if r.read_bool()? {
-            let idx = r.read_bits(2)? as u8;
+            let idx = r.read_u8(2)?;
             p.matrix_mixdown = Some((idx, r.read_bool()?));
         }
         let list = |r: &mut BitReader, n: usize| -> Result<Vec<PceElement>> {
@@ -143,7 +160,7 @@ impl Pce {
                 .map(|_| {
                     Ok(PceElement {
                         is_cpe: r.read_bool()?,
-                        tag: r.read_bits(4)? as u8,
+                        tag: r.read_u8(4)?,
                     })
                 })
                 .collect()
@@ -152,14 +169,14 @@ impl Pce {
         p.side = list(r, ns)?;
         p.back = list(r, nb)?;
         for _ in 0..nl {
-            p.lfe.push(r.read_bits(4)? as u8);
+            p.lfe.push(r.read_u8(4)?);
         }
         for _ in 0..na {
-            p.assoc_data.push(r.read_bits(4)? as u8);
+            p.assoc_data.push(r.read_u8(4)?);
         }
         for _ in 0..nc {
             let ind = r.read_bool()?;
-            p.cc.push((ind, r.read_bits(4)? as u8));
+            p.cc.push((ind, r.read_u8(4)?));
         }
         // byte_alignment() relative to the enclosing structure's start.
         let used = r.position() - align_base;
@@ -168,7 +185,7 @@ impl Pce {
         }
         let n = r.read_bits(8)? as usize;
         for _ in 0..n {
-            p.comment.push(r.read_bits(8)? as u8);
+            p.comment.push(r.read_u8(8)?);
         }
         Ok(p)
     }
@@ -199,25 +216,25 @@ impl SbrHeader {
     /// Returns [`Error::InvalidData`] if the header is truncated.
     pub fn parse(r: &mut BitReader) -> Result<Self> {
         let mut h = Self {
-            bs_amp_res: r.read_bits(1)? as u8,
-            bs_start_freq: r.read_bits(4)? as u8,
-            bs_stop_freq: r.read_bits(4)? as u8,
-            bs_xover_band: r.read_bits(3)? as u8,
+            bs_amp_res: r.read_u8(1)?,
+            bs_start_freq: r.read_u8(4)?,
+            bs_stop_freq: r.read_u8(4)?,
+            bs_xover_band: r.read_u8(3)?,
             ..Self::defaults()
         };
         let _reserved = r.read_bits(2)?;
         let extra1 = r.read_bool()?;
         let extra2 = r.read_bool()?;
         if extra1 {
-            h.bs_freq_scale = r.read_bits(2)? as u8;
-            h.bs_alter_scale = r.read_bits(1)? as u8;
-            h.bs_noise_bands = r.read_bits(2)? as u8;
+            h.bs_freq_scale = r.read_u8(2)?;
+            h.bs_alter_scale = r.read_u8(1)?;
+            h.bs_noise_bands = r.read_u8(2)?;
         }
         if extra2 {
-            h.bs_limiter_bands = r.read_bits(2)? as u8;
-            h.bs_limiter_gains = r.read_bits(2)? as u8;
-            h.bs_interpol_freq = r.read_bits(1)? as u8;
-            h.bs_smoothing_mode = r.read_bits(1)? as u8;
+            h.bs_limiter_bands = r.read_u8(2)?;
+            h.bs_limiter_gains = r.read_u8(2)?;
+            h.bs_interpol_freq = r.read_u8(1)?;
+            h.bs_smoothing_mode = r.read_u8(1)?;
         }
         Ok(h)
     }
@@ -349,16 +366,12 @@ pub fn channels_for_config(cc: u8) -> usize {
 }
 
 fn read_aot(r: &mut BitReader) -> Result<u8> {
-    let ot = r.read_bits(5)? as u8;
-    Ok(if ot == 31 {
-        32 + r.read_bits(6)? as u8
-    } else {
-        ot
-    })
+    let ot = r.read_u8(5)?;
+    Ok(if ot == 31 { 32 + r.read_u8(6)? } else { ot })
 }
 
 fn read_rate(r: &mut BitReader) -> Result<(u8, u32)> {
-    let idx = r.read_bits(4)? as u8;
+    let idx = r.read_u8(4)?;
     if idx == 0x0F {
         let rate = r.read_bits(24)?;
         if rate == 0 {
@@ -423,7 +436,7 @@ pub fn parse_from_opts(
 ) -> Result<StreamConfig> {
     let mut object_type = read_aot(r)?;
     let (sf_index, sample_rate) = read_rate(r)?;
-    let channel_config = r.read_bits(4)? as u8;
+    let channel_config = r.read_u8(4)?;
     let mut c = StreamConfig::lc(object_type, sample_rate, channel_config);
     c.sf_index = sf_index;
 
@@ -462,7 +475,7 @@ pub fn parse_from_opts(
         object_type,
         17 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 39
     ) {
-        c.ep_config = r.read_bits(2)? as u8;
+        c.ep_config = r.read_u8(2)?;
         if c.ep_config >= 2 {
             return Err(Error::unsupported(
                 "aac config: ErrorProtectionSpecificConfig (epConfig 2/3) not supported",
@@ -527,7 +540,7 @@ fn ga_specific_config(r: &mut BitReader, c: &mut StreamConfig, align_base: usize
     };
     c.depends_on_core_coder = r.read_bool()?;
     if c.depends_on_core_coder {
-        c.core_coder_delay = r.read_bits(14)? as u16;
+        c.core_coder_delay = r.read_u16(14)?;
     }
     let extension_flag = r.read_bool()?;
     if c.channel_config == 0 {

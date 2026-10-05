@@ -106,6 +106,9 @@ pub struct Decoder {
     ld_sine: Vec<f32>,
     ld_low_overlap: Vec<f32>,
     elements: Vec<Vec<Option<Box<Element>>>>,
+    /// The previous block failed part-way (its elements may still be marked
+    /// present with half-updated state); see `decode_block`.
+    partial: bool,
     oc: OutputConfig,
     /// The configuration's `channelConfiguration` (0 = PCE-routed).
     chan_config: u8,
@@ -176,6 +179,13 @@ impl Decoder {
                 "aac: error-resilience data tools (HCR/RVLC/VCB11) are not supported",
             ));
         }
+        // The LTP history and its state update are built on 1024-sample frames;
+        // a 960-sample LTP stream used to reach them and index past the frame.
+        if cfg.object_type == aot::AAC_LTP && cfg.frame_length != 1024 {
+            return Err(Error::unsupported(
+                "aac: AAC-LTP with 960-sample frames is not supported",
+            ));
+        }
         let fl = match cfg.object_type {
             aot::ER_AAC_LD | aot::ER_AAC_ELD => cfg.frame_length,
             _ => cfg.frame_length,
@@ -186,6 +196,7 @@ impl Decoder {
             ld_sine: crate::dsp::sine_window(2 * fl)[..fl].to_vec(),
             ld_low_overlap: crate::dsp::sine_window(2 * (fl / 4))[..fl / 4].to_vec(),
             syntax,
+            partial: false,
             elements: (0..4).map(|_| (0..16).map(|_| None).collect()).collect(),
             oc: OutputConfig::default(),
             chan_config: cfg.channel_config,
@@ -455,14 +466,33 @@ impl Decoder {
     /// As [`decode`](Self::decode).
     pub fn decode_block(&mut self, au: &[u8], pts: Option<i64>) -> Result<(DecodedAudio, usize)> {
         let mut r = BitReader::new(au);
+        // Only elements parsed in THIS block may be rendered. A block that
+        // fails part-way leaves its elements marked present with half-updated
+        // state (e.g. a new long-window ICS beside the previous frame's
+        // eight-window TNS); without this, a later block that does not carry
+        // them rendered that mix and indexed past the spectrum (fuzz finding).
+        // A successful block ends with every flag cleared already, so the walk
+        // runs only after a failure.
+        if self.partial {
+            for el in self.elements.iter_mut().flatten().flatten() {
+                el.present = false;
+            }
+        }
+        self.partial = true;
         if self.cfg.is_er() {
             self.decode_er_frame(&mut r)?;
         } else {
             self.decode_ga_frame(&mut r)?;
         }
+        self.partial = false;
         Ok((self.collect_output(pts), r.position().div_ceil(8)))
     }
 
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn decode_ga_frame(&mut self, r: &mut BitReader) -> Result<()> {
         self.tags_mapped = 0;
         let mut presence = [[0u8; 16]; 4];
@@ -472,11 +502,13 @@ impl Decoder {
         let payload_alignment = r.position();
         let sx = self.syntax;
         loop {
-            let elem_type = r.read_bits(3)?;
+            let elem_type8 = r.read_u8(3)?;
+            let elem_type = u32::from(elem_type8);
             if elem_type == ID_END {
                 break;
             }
-            let mut elem_id = r.read_bits(4)? as usize;
+            let elem_id8 = r.read_u8(4)?;
+            let mut elem_id = usize::from(elem_id8);
             if self.oc.channels() == 0 && elem_type != ID_PCE && self.discovery.is_none() {
                 return Err(Error::invalid("aac: channel element before any layout"));
             }
@@ -488,7 +520,7 @@ impl Decoder {
                 }
                 *p += 1;
                 at = Some(
-                    self.get_che(elem_type as u8, elem_id as u8)
+                    self.get_che(elem_type8, elem_id8)
                         .ok_or_else(|| Error::invalid("aac: channel element is not allocated"))?,
                 );
                 // Cannot fail: `at` was set on the line above.
@@ -530,8 +562,7 @@ impl Decoder {
                     r.skip(8 * count)?;
                 }
                 ID_PCE => {
-                    let p =
-                        crate::config::Pce::parse_after_tag(r, elem_id as u8, payload_alignment)?;
+                    let p = crate::config::Pce::parse_after_tag(r, elem_id8, payload_alignment)?;
                     if !pce_found {
                         self.output_configure(layout::pce_layout(&p));
                         self.chan_config = 0;
@@ -559,7 +590,7 @@ impl Decoder {
             }
             if elem_type < ID_DSE {
                 // Cannot fail: guarded by `elem_type < ID_DSE`, the same condition that set `at`.
-                prev = Some((at.unwrap(), elem_type as u8));
+                prev = Some((at.unwrap(), elem_type8));
             }
             if r.bits_left() < 3 {
                 return Err(Error::invalid("aac: frame ends before ID_END"));
@@ -582,6 +613,11 @@ impl Decoder {
         Ok(())
     }
 
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn decode_er_frame(&mut self, r: &mut BitReader) -> Result<()> {
         self.tags_mapped = 0;
         let cc = self.chan_config;
@@ -615,6 +651,11 @@ impl Decoder {
         Ok(())
     }
 
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn decode_cpe(&mut self, r: &mut BitReader, at: (usize, usize)) -> Result<()> {
         let sx = self.syntax;
         let rng = &mut self.rng;
@@ -644,7 +685,7 @@ impl Decoder {
                     decode_ltp(r, &mut el.ch[1].ics.ltp, m)?;
                 }
             }
-            let msp = r.read_bits(2)? as u8;
+            let msp = r.read_u8(2)?;
             if msp == 3 {
                 return Err(Error::invalid("aac: ms_mask_present = 3 is reserved"));
             }
@@ -693,22 +734,27 @@ impl Decoder {
         Ok(())
     }
 
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn decode_cce(&mut self, r: &mut BitReader, at: (usize, usize)) -> Result<()> {
         let sx = self.syntax;
         let rng = &mut self.rng;
         // Cannot fail: `at` comes from `get_che`, which returns only allocated slots (`instance`).
         // Cannot fail: `at` comes from `get_che`, which returns only allocated slots (`instance`).
         let el = self.elements[at.0][at.1].as_mut().unwrap();
-        let mut point = 2 * r.read_bit()? as u8;
+        let mut point = 2 * r.read_u8(1)?;
         let num_coupled = r.read_bits(3)? as usize;
         let mut num_gain = 0usize;
         let mut targets = Vec::new();
         for _ in 0..=num_coupled {
             num_gain += 1;
             let is_cpe = r.read_bool()?;
-            let id = r.read_bits(4)? as u8;
+            let id = r.read_u8(4)?;
             let ch_select = if is_cpe {
-                let s = r.read_bits(2)? as u8;
+                let s = r.read_u8(2)?;
                 if s == 3 {
                     num_gain += 1;
                 }
@@ -778,6 +824,11 @@ impl Decoder {
     }
 
     /// `extension_payload` inside a fill element. Returns bytes consumed.
+    #[warn(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn decode_extension_payload(
         &mut self,
         r: &mut BitReader,
@@ -818,11 +869,12 @@ impl Decoder {
                 let mut payload = Vec::with_capacity(cnt);
                 let mut left = bits;
                 while left >= 8 {
-                    payload.push(r.read_bits(8)? as u8);
+                    payload.push(r.read_u8(8)?);
                     left -= 8;
                 }
                 if left > 0 {
-                    payload.push((r.read_bits(left as u32)? << (8 - left)) as u8);
+                    // `left` < 8 here, so the shifted value fills one byte exactly.
+                    payload.push(r.read_u8(u32::try_from(left).unwrap_or(7))? << (8 - left));
                 }
                 let el = self.el(at);
                 el.sbr_payload = Some((payload, bits, ext == EXT_SBR_DATA_CRC));

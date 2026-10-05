@@ -1,5 +1,12 @@
 //! MSB-first bit reader for AAC bitstreams.
 
+// Untrusted input: narrowing casts are lint-enforced here (H-17).
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::{Error, Result};
 
 /// Reads bits most-significant-first from a byte slice (the order AAC uses).
@@ -60,7 +67,12 @@ impl<'a> BitReader<'a> {
         }
         let v = self.peek_window();
         self.pos += n as usize;
-        Ok((v >> (64 - n)) as u32)
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a 64-bit window shifted right by 64 - n (n <= 32) fits in u32"
+        )]
+        let out = (v >> (64 - n)) as u32;
+        Ok(out)
     }
 
     /// The 64 bits starting at the current position, left-aligned; bytes past the
@@ -92,7 +104,12 @@ impl<'a> BitReader<'a> {
         if n == 0 {
             return 0;
         }
-        (self.peek_window() >> (64 - n)) as u32
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a 64-bit window shifted right by 64 - n (n <= 32) fits in u32"
+        )]
+        let out = (self.peek_window() >> (64 - n)) as u32;
+        out
     }
 
     /// Absolute bit position from the start of the data.
@@ -113,6 +130,49 @@ impl<'a> BitReader<'a> {
             v = (v << 1) | self.read_bit()?;
         }
         Ok(v)
+    }
+
+    /// Read `n` (<= 8) bits as a `u8`: the value fits by construction.
+    ///
+    /// # Errors
+    ///
+    /// As [`read_bits`](Self::read_bits).
+    #[inline]
+    pub fn read_u8(&mut self, n: u32) -> Result<u8> {
+        debug_assert!(n <= 8);
+        // An `n`-bit read is below 2^n <= 256; the mask makes that local.
+        Ok((self.read_bits(n)? & 0xFF) as u8)
+    }
+
+    /// Read `n` (<= 16) bits as a `u16`: the value fits by construction.
+    ///
+    /// # Errors
+    ///
+    /// As [`read_bits`](Self::read_bits).
+    #[inline]
+    pub fn read_u16(&mut self, n: u32) -> Result<u16> {
+        debug_assert!(n <= 16);
+        // An `n`-bit read is below 2^n <= 65536; the mask makes that local.
+        Ok((self.read_bits(n)? & 0xFFFF) as u16)
+    }
+
+    /// Read `n` (<= 31) bits as a non-negative `i32`: the value fits by
+    /// construction.
+    ///
+    /// # Errors
+    ///
+    /// As [`read_bits`](Self::read_bits).
+    #[inline]
+    pub fn read_i32(&mut self, n: u32) -> Result<i32> {
+        debug_assert!(n <= 31);
+        // An `n`-bit read is below 2^n <= 2^31; the mask makes that local.
+        let v = self.read_bits(n)? & 0x7FFF_FFFF;
+        #[allow(
+            clippy::cast_possible_wrap,
+            reason = "masked to 31 bits, so the value is below 2^31"
+        )]
+        let out = v as i32;
+        Ok(out)
     }
 
     /// Read one bit as a bool.
@@ -146,6 +206,7 @@ impl<'a> BitReader<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation, reason = "test data generators")]
 mod tests {
     use super::*;
 
