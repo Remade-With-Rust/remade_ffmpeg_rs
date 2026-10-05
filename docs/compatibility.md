@@ -21,7 +21,7 @@ licensed (CI-enforced by `cargo-deny`).
 |-------|:------:|:------:|----------------|--------------|
 | VP9 | ✅ | ✅ | in-house | decode **bit-exact** (315/315 libvpx vectors); encode **pixel-exact vs libvpx & ffmpeg** (RDO, golden/ALT-REF, two-pass) |
 | MP3 (MPEG-1/2 Layer III) | ✅ | ✅ | in-house | decode **bit-exact** vs FFmpeg; encode (CBR/VBR, joint stereo, block switching) |
-| AAC&#8209;LC | ✅ | ✅ | in-house (`rusty_aac`) | validated (ffmpeg decodes our `.m4a` at unity) · ⚖ |
+| AAC (LC, Main, LTP, HE-AAC v1/v2, ER LD/ELD; encode LC) | ✅ | ✅ (LC) | in-house (`rusty_aac`) | decode: all 83 non-USAC ISO/IEC 14496-26 streams within 1 LSB of FFmpeg; encode validated (ffmpeg decodes our `.m4a` at unity) · ⚖ |
 | PCM | ✅ | ✅ | in-house | validated |
 | AV1 / AVIF | ✅ | ✅ (still-picture) | rav1d / rav1e forks (pure Rust) | validated · video-mode AV1 *encode* wiring is a known gap (the encoder exists; the adapter is still-image-only) · **decode robustness:** rav1d's input validation `abort()`s on malformed AV1 under `debug_assertions` (debug builds); **release returns `Err`** (verified). We pre-validate the sample at our boundary, but sandbox the AVIF path if you decode untrusted input in debug/CI. |
 | AV2 | ✅ | — | in-house (`rusty_av2d`) | basic (decode registered; encoder in the workshop) · **decode robustness:** panics/aborts on malformed AV2 under `debug_assertions`; **release decodes byte-identically to the reference and survives the fuzz sweep** (verified) — see the note below |
@@ -203,11 +203,14 @@ not specific to this implementation.
   are administered by the Via LA (formerly MPEG LA) AVC pool. Some have expired;
   the pool is generally still treated as active. Encoding is typically
   higher-exposure than decoding.
-- **AAC** — we implement **AAC-LC** (in-house, decode *and* encode). AAC-LC's
-  core patents are of the same ~1997–1999 vintage as MP3 and are largely
-  expired; the newer **HE-AAC** extensions (SBR/PS) are *not* implemented here.
-  The oldest profile is the lower-exposure corner of AAC, but encode is
-  typically higher-exposure than decode — same posture question as H.264.
+- **AAC** — `rusty_aac` (in-house) **encodes AAC-LC** and **decodes the wider
+  MPEG-4 AAC family**: AAC-LC, Main, LTP, the **HE-AAC** extensions (SBR in v1,
+  Parametric Stereo in v2) and the error-resilient / low-delay object types
+  (ER AAC-LD, ER AAC-ELD). AAC-LC's core patents are of the same ~1997–1999
+  vintage as MP3 and are largely expired; the HE-AAC and low-delay tools are
+  more recent and should be assumed patent-relevant. xHE-AAC (USAC) is not
+  implemented. Encode is typically higher-exposure than decode — same posture
+  question as H.264.
 
 **Project posture: ship and document (the FFmpeg model).** H.264 and AAC ship
 in the default build. The project grants **no patent license, express or
