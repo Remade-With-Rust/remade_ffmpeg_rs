@@ -1313,8 +1313,9 @@ impl SbrChannelState {
                 let bw = d.bw_array[g];
                 let (a0, a1) = (wk.alpha0[p], wk.alpha1[p]);
                 let al = [a1[0] * bw * bw, a1[1] * bw * bw, a0[0] * bw, a0[1] * bw];
-                let xl = wk.x_low[p];
-                let xh = &mut wk.x_high[k];
+                // Borrowed, not copied: `let xl = wk.x_low[p]` moved a 320-byte
+                // row per patched band through memcpy just to read it.
+                let (xl, xh) = (&wk.x_low[p], &mut wk.x_high[k]);
                 for i in start + ENV_ADJ..end + ENV_ADJ {
                     xh[i] = [
                         xl[i - 2][0] * al[0] - xl[i - 2][1] * al[1] + xl[i - 1][0] * al[2]
