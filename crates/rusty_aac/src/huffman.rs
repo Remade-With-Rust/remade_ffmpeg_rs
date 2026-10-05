@@ -20,10 +20,22 @@ pub struct HuffBook {
     codes: &'static [u32],
     lens: &'static [u8],
     max_len: u8,
-    /// Primary lookup table over the next `LUT_BITS` bits: `sym << 8 | len`, or 0
-    /// for "longer code, take the scan". Built on first use.
-    lut: std::sync::OnceLock<Vec<u32>>,
+    /// Two-level lookup, built on first use (see [`Lut`]).
+    lut: std::sync::OnceLock<Lut>,
 }
+
+/// Two-level decode table. `prim` is indexed by the next `bits` bits: an entry
+/// is `sym << 8 | len` for a code that fits, `SUB | offset << 5 | subbits` when
+/// longer codes share that prefix (then `sub[offset + next subbits bits]` holds
+/// `sym << 8 | len`), or 0 for an invalid prefix.
+struct Lut {
+    prim: Vec<u32>,
+    sub: Vec<u32>,
+    bits: u32,
+}
+
+/// Marks a primary entry that points into the second-level table.
+const SUB: u32 = 1 << 31;
 
 /// Width of the primary lookup (2^11 entries, 8 KiB per book).
 const LUT_BITS: u32 = 11;
@@ -55,20 +67,47 @@ impl HuffBook {
         (self.codes[i], self.lens[i])
     }
 
-    fn build_lut(&self) -> Vec<u32> {
+    fn build_lut(&self) -> Lut {
         let bits = LUT_BITS.min(self.max_len as u32);
-        let mut lut = vec![0u32; 1 << bits];
+        let mut prim = vec![0u32; 1 << bits];
+        // Longest code under each primary prefix that overflows the table.
+        let mut deepest = vec![0u32; 1 << bits];
         for (i, (&c, &l)) in self.codes.iter().zip(self.lens).enumerate() {
             let l = l as u32;
-            if l == 0 || l > bits {
+            if l == 0 {
                 continue;
             }
-            let base = (c << (bits - l)) as usize;
-            for e in lut.iter_mut().skip(base).take(1 << (bits - l)) {
-                *e = ((i as u32) << 8) | l;
+            if l <= bits {
+                let base = (c << (bits - l)) as usize;
+                for e in prim.iter_mut().skip(base).take(1 << (bits - l)) {
+                    *e = ((i as u32) << 8) | l;
+                }
+            } else {
+                let p = (c >> (l - bits)) as usize;
+                deepest[p] = deepest[p].max(l - bits);
             }
         }
-        lut
+        let mut sub = Vec::new();
+        for (p, &sb) in deepest.iter().enumerate() {
+            if sb > 0 {
+                prim[p] = SUB | ((sub.len() as u32) << 5) | sb;
+                sub.resize(sub.len() + (1 << sb), 0);
+            }
+        }
+        for (i, (&c, &l)) in self.codes.iter().zip(self.lens).enumerate() {
+            let l = l as u32;
+            if l <= bits {
+                continue;
+            }
+            let e = prim[(c >> (l - bits)) as usize];
+            let (off, sb) = (((e & !SUB) >> 5) as usize, e & 31);
+            let tail = l - bits; // bits of this code below the primary prefix
+            let base = off + ((c & ((1 << tail) - 1)) << (sb - tail)) as usize;
+            for x in sub.iter_mut().skip(base).take(1 << (sb - tail)) {
+                *x = ((i as u32) << 8) | l;
+            }
+        }
+        Lut { prim, sub, bits }
     }
 
     /// Decode the next codeword, returning its symbol index. One table lookup
@@ -77,8 +116,13 @@ impl HuffBook {
     #[inline]
     pub fn decode(&self, r: &mut BitReader) -> Result<u16> {
         let lut = self.lut.get_or_init(|| self.build_lut());
-        let bits = LUT_BITS.min(self.max_len as u32);
-        let e = lut[r.peek_bits(bits) as usize];
+        let mut e = lut.prim[r.peek_bits(lut.bits) as usize];
+        if e & SUB != 0 {
+            // A long code: index the second level with the bits after the prefix.
+            let sb = e & 31;
+            let idx = r.peek_bits(lut.bits + sb) & ((1 << sb) - 1);
+            e = lut.sub[((e & !SUB) >> 5) as usize + idx as usize];
+        }
         if e != 0 {
             r.skip((e & 0xFF) as usize)?;
             return Ok((e >> 8) as u16);
