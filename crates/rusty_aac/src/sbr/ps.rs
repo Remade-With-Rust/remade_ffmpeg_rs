@@ -644,6 +644,9 @@ pub(crate) struct PsState {
     in_buf: Vec<[Cpx; 44]>,
     delay: Vec<[Cpx; QMF_SLOTS + MAX_DELAY]>,
     ap_delay: Vec<[[Cpx; QMF_SLOTS + MAX_AP_DELAY]; AP_LINKS]>,
+    /// The hybrid-domain left/right matrices, kept across frames (see `apply`).
+    lbuf: Vec<[Cpx; 32]>,
+    rbuf: Vec<[Cpx; 32]>,
     peak_decay_nrg: [f32; 34],
     power_smooth: [f32; 34],
     peak_decay_diff_smooth: [f32; 34],
@@ -679,6 +682,8 @@ impl PsState {
             in_buf: vec![[[0.0; 2]; 44]; 5],
             delay: vec![[[0.0; 2]; QMF_SLOTS + MAX_DELAY]; MAX_SSB],
             ap_delay: vec![[[[0.0; 2]; QMF_SLOTS + MAX_AP_DELAY]; AP_LINKS]; 50],
+            lbuf: vec![[[0.0; 2]; 32]; MAX_SSB],
+            rbuf: vec![[[0.0; 2]; 32]; MAX_SSB],
             peak_decay_nrg: [0.0; 34],
             power_smooth: [0.0; 34],
             peak_decay_diff_smooth: [0.0; 34],
@@ -1491,12 +1496,26 @@ impl PsState {
         {
             *d = [[[0.0; 2]; QMF_SLOTS + MAX_AP_DELAY]; AP_LINKS];
         }
-        let mut lbuf = vec![[[0f32; 2]; 32]; MAX_SSB];
-        let mut rbuf = vec![[[0f32; 2]; 32]; MAX_SSB];
+        // The matrices persist instead of two zeroed 23 KB `vec!`s per frame:
+        // hybrid analysis writes every row < NR_BANDS and slot < `slots` of
+        // `lbuf`, decorrelation the same of `rbuf`, and every later read is of
+        // those cells. Stereo processing addresses slots by envelope border,
+        // so the slots no producer writes are re-zeroed - exactly what a fresh
+        // buffer held.
+        let (mut lbuf, mut rbuf) = (
+            std::mem::take(&mut self.lbuf),
+            std::mem::take(&mut self.rbuf),
+        );
+        if self.slots < 32 {
+            for row in lbuf.iter_mut().chain(rbuf.iter_mut()) {
+                row[self.slots..].fill([0.0; 2]);
+            }
+        }
         self.hybrid_analysis(&mut lbuf, l, is34);
         self.decorrelation(&mut rbuf, &lbuf, is34);
         self.stereo_processing(&mut lbuf, &mut rbuf, is34);
         hybrid_synthesis(l, &lbuf, is34, self.slots);
         hybrid_synthesis(r, &rbuf, is34, self.slots);
+        (self.lbuf, self.rbuf) = (lbuf, rbuf);
     }
 }
