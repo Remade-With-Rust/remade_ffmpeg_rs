@@ -27,7 +27,7 @@ fn main() {
     }
     let (src, dst) = (&a[0], &a[1]);
     let bitrate: u32 = a[2].parse().expect("bitrate");
-    let arms: Vec<&str> = a[3..].iter().map(|s| s.as_str()).collect();
+    let arms: Vec<&str> = a[3..].iter().map(std::string::String::as_str).collect();
     let on = |k: &str| arms.iter().any(|x| *x == k);
 
     // ADDITIVE from the shipped defaults. Listing every field explicitly would

@@ -184,8 +184,8 @@ pub struct LatmReader {
 }
 
 impl LatmReader {
-    pub fn new() -> LatmReader {
-        LatmReader::default()
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// The most recently seen stream configuration, if any.
@@ -273,8 +273,8 @@ pub struct LatmDecoder {
 }
 
 impl LatmDecoder {
-    pub fn new() -> LatmDecoder {
-        LatmDecoder::default()
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Decode the LOAS frame at the start of `data`; returns the PCM and the
@@ -316,18 +316,18 @@ pub fn write_loas_frame(cfg: &AudioSpecificConfig, au: &[u8]) -> Vec<u8> {
     // --- AudioSpecificConfig, bit-packed (NOT byte aligned here) ---
     if cfg.object_type >= 31 {
         w.write(31, 5);
-        w.write((cfg.object_type - 32) as u32, 6);
+        w.write(u32::from(cfg.object_type - 32), 6);
     } else {
-        w.write(cfg.object_type as u32, 5);
+        w.write(u32::from(cfg.object_type), 5);
     }
     match crate::sf_index_for_rate(cfg.sample_rate) {
-        Some(i) => w.write(i as u32, 4),
+        Some(i) => w.write(u32::from(i), 4),
         None => {
             w.write(0x0F, 4);
             w.write(cfg.sample_rate, 24);
         }
     }
-    w.write(cfg.channels as u32, 4);
+    w.write(u32::from(cfg.channels), 4);
     // GASpecificConfig: frameLengthFlag, dependsOnCoreCoder, extensionFlag.
     w.write(0, 3);
 
@@ -346,7 +346,7 @@ pub fn write_loas_frame(cfg: &AudioSpecificConfig, au: &[u8]) -> Vec<u8> {
 
     // --- PayloadMux ---
     for &b in au {
-        w.write(b as u32, 8);
+        w.write(u32::from(b), 8);
     }
 
     let body = w.into_bytes();
@@ -412,7 +412,7 @@ mod tests {
         w.write_bool(true); // useSameStreamMux
         w.write(au.len() as u32, 8); // PayloadLengthInfo (< 255)
         for &b in &au {
-            w.write(b as u32, 8);
+            w.write(u32::from(b), 8);
         }
         let body = w.into_bytes();
         let hdr = (LOAS_SYNC << 13) | (body.len() as u32 & 0x1FFF);

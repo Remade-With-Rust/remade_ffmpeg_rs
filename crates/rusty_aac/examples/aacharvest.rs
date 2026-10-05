@@ -79,7 +79,7 @@ fn arm_config(arm: &str, bitrate: u32) -> AacEncoderConfig {
 fn split_of(name: &str) -> &'static str {
     let h = name
         .bytes()
-        .fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+        .fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(b)));
     if h % 2 == 0 {
         "train"
     } else {
@@ -173,7 +173,7 @@ fn main() {
 
     for sig in corpus::corpus() {
         let planes = sig.planes();
-        let refs: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
+        let refs: Vec<&[f32]> = planes.iter().map(std::vec::Vec::as_slice).collect();
         let signals = AacSignals::analyze(&refs, sig.sample_rate);
         let split = split_of(sig.name());
 

@@ -140,8 +140,8 @@ pub struct PredState {
 }
 
 impl Default for PredState {
-    fn default() -> PredState {
-        PredState {
+    fn default() -> Self {
+        Self {
             r0: 0.0,
             r1: 0.0,
             cor0: 0.0,

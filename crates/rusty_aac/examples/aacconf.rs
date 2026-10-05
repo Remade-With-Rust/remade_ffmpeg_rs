@@ -207,21 +207,21 @@ fn decode_ours(p: &Probe, asc: &[u8], pkts: &[Vec<u8>]) -> Result<Decoded, Strin
     let push = |d: &mut Decoded, r: rusty_aac::Result<rusty_aac::DecodedAudio>| match r {
         Ok(a) => {
             if d.channels == 0 {
-                d.channels = a.channels as u32;
+                d.channels = u32::from(a.channels);
                 d.rate = a.sample_rate;
             }
             let n = a.frames();
-            if a.channels as u32 == d.channels && d.segments.is_empty() {
+            if u32::from(a.channels) == d.channels && d.segments.is_empty() {
                 d.pcm.extend_from_slice(&a.samples);
             } else {
                 let start = d.frames;
                 match d.segments.last_mut() {
-                    Some(seg) if seg.1 == a.channels as u32 && seg.2 == a.sample_rate => {
-                        seg.3.extend_from_slice(&a.samples)
+                    Some(seg) if seg.1 == u32::from(a.channels) && seg.2 == a.sample_rate => {
+                        seg.3.extend_from_slice(&a.samples);
                     }
                     _ => d.segments.push((
                         start,
-                        a.channels as u32,
+                        u32::from(a.channels),
                         a.sample_rate,
                         a.samples.clone(),
                     )),
@@ -295,7 +295,7 @@ fn score(ours: &[i32], refr: &[i32], ch: usize) -> Option<Score> {
     let mut best_e = -1f64;
     let mut s = 0;
     while s + win <= fr {
-        let e: f64 = (s..s + win).map(|i| (refr[i * ch] as f64).abs()).sum();
+        let e: f64 = (s..s + win).map(|i| f64::from(refr[i * ch]).abs()).sum();
         if e > best_e {
             best_e = e;
             start = s;
@@ -310,7 +310,7 @@ fn score(ours: &[i32], refr: &[i32], ch: usize) -> Option<Score> {
             if j < 0 || j as usize >= fo {
                 continue;
             }
-            acc += (ours[j as usize * ch] - refr[i * ch]).abs() as f64;
+            acc += f64::from((ours[j as usize * ch] - refr[i * ch]).abs());
             cnt += 1;
         }
         if cnt > win / 4 {
@@ -332,8 +332,8 @@ fn score(ours: &[i32], refr: &[i32], ch: usize) -> Option<Score> {
             let b = refr[i * ch + c];
             let e = (a - b).abs();
             max = max.max(e);
-            se += (e as f64) * (e as f64);
-            sn += (b as f64) * (b as f64);
+            se += f64::from(e) * f64::from(e);
+            sn += f64::from(b) * f64::from(b);
             n += 1;
         }
     }
@@ -366,8 +366,8 @@ fn chan_matrix(ours: &[i32], refr: &[i32], ch: usize, lag: i64) -> String {
                 if u < 0 || u as usize >= fo {
                     continue;
                 }
-                let a = ours[u as usize * ch + i] as f64;
-                let b = refr[t * ch + j] as f64;
+                let a = f64::from(ours[u as usize * ch + i]);
+                let b = f64::from(refr[t * ch + j]);
                 se += (a - b) * (a - b);
                 sn += b * b;
             }
@@ -451,7 +451,7 @@ fn read_s16(p: &Path) -> Option<Vec<i32>> {
     let b = fs::read(p).ok()?;
     Some(
         b.chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]) as i32)
+            .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])))
             .collect(),
     )
 }
@@ -540,9 +540,9 @@ fn generate(dir: &Path) {
             "-c:a".into(),
             "aac".into(),
         ];
-        args.extend(opts.iter().map(|s| s.to_string()));
+        args.extend(opts.iter().map(std::string::ToString::to_string));
         args.push(out.to_string_lossy().into_owned());
-        let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let a: Vec<&str> = args.iter().map(std::string::String::as_str).collect();
         if let Err(e) = run("ffmpeg", &a) {
             eprintln!("gen {name}: {e}");
         }
@@ -591,7 +591,7 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
     .ok()
     .map(|b| {
         b.chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]) as i32)
+            .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])))
             .collect::<Vec<i32>>()
     });
     // FATE keeps the ISO-order output as `<stem>.s16` and FFmpeg's output order
@@ -660,7 +660,7 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
                 eprintln!(
                     "dbg {name} known={} refa={:?} sa={}",
                     known.is_some(),
-                    refa.as_ref().map(|r| r.len()),
+                    refa.as_ref().map(std::vec::Vec::len),
                     sa.is_some()
                 );
             }
@@ -694,12 +694,12 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
                 .ok()
                 .map(|b| {
                     b.chunks_exact(2)
-                        .map(|c| i16::from_le_bytes([c[0], c[1]]) as i32)
+                        .map(|c| i32::from(i16::from_le_bytes([c[0], c[1]])))
                         .collect::<Vec<i32>>()
                 });
                 let so: Vec<i32> = spcm.iter().map(|&x| to_s16(x)).collect();
                 let c = *sch as usize;
-                let tail = r.map(|r| r.get(start * c..).map(|t| t.to_vec()).unwrap_or_default());
+                let tail = r.map(|r| r.get(start * c..).map(<[i32]>::to_vec).unwrap_or_default());
                 let sc = tail.as_ref().and_then(|t| score(&so, t, c));
                 let v = verdict(&sc);
                 va = if v.starts_with("EXACT") && va.starts_with("EXACT") {
@@ -794,7 +794,7 @@ fn main() {
     let results = std::sync::Mutex::new(vec![None; names.len()]);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(std::num::NonZero::get)
         .unwrap_or(4)
         .min(8);
     std::thread::scope(|sc| {

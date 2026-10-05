@@ -18,26 +18,26 @@ pub enum WindowSequence {
 }
 
 impl WindowSequence {
-    fn from_bits(v: u32) -> WindowSequence {
+    fn from_bits(v: u32) -> Self {
         match v {
-            0 => WindowSequence::OnlyLong,
-            1 => WindowSequence::LongStart,
-            2 => WindowSequence::EightShort,
-            _ => WindowSequence::LongStop,
+            0 => Self::OnlyLong,
+            1 => Self::LongStart,
+            2 => Self::EightShort,
+            _ => Self::LongStop,
         }
     }
 
     pub fn is_short(self) -> bool {
-        self == WindowSequence::EightShort
+        self == Self::EightShort
     }
 
     /// The 2-bit window-sequence code (the encode side of `from_bits`).
     pub fn to_bits(self) -> u32 {
         match self {
-            WindowSequence::OnlyLong => 0,
-            WindowSequence::LongStart => 1,
-            WindowSequence::EightShort => 2,
-            WindowSequence::LongStop => 3,
+            Self::OnlyLong => 0,
+            Self::LongStart => 1,
+            Self::EightShort => 2,
+            Self::LongStop => 3,
         }
     }
 }

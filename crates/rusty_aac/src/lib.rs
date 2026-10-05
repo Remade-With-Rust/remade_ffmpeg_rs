@@ -222,14 +222,14 @@ pub struct AacDecoder {
 
 impl AacDecoder {
     /// A decoder that learns its parameters from the stream (ADTS headers).
-    pub fn new() -> AacDecoder {
-        AacDecoder::default()
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// A decoder pre-configured from an out-of-band [`AudioSpecificConfig`]
     /// (the MP4 `esds` payload) — required for bare raw access units.
-    pub fn with_config(cfg: AudioSpecificConfig) -> AacDecoder {
-        AacDecoder {
+    pub fn with_config(cfg: AudioSpecificConfig) -> Self {
+        Self {
             stream: Some(config::StreamConfig::lc(
                 cfg.object_type,
                 cfg.sample_rate,
@@ -247,13 +247,13 @@ impl AacDecoder {
     /// signalling, PCE channel layouts, the 960-sample frame flag and the
     /// LD/ELD parameters all live in fields the plain [`AudioSpecificConfig`]
     /// does not carry.
-    pub fn with_config_bytes(data: &[u8]) -> Result<AacDecoder> {
+    pub fn with_config_bytes(data: &[u8]) -> Result<Self> {
         let stream = config::parse(data)?;
-        Ok(AacDecoder::with_stream_config(stream))
+        Ok(Self::with_stream_config(stream))
     }
 
     /// A decoder for an already-parsed [`config::StreamConfig`].
-    pub fn with_stream_config(stream: config::StreamConfig) -> AacDecoder {
+    pub fn with_stream_config(stream: config::StreamConfig) -> Self {
         let sbr = sbr::SbrConfig {
             sbr_present: stream.sbr,
             ps_present: stream.ps,
@@ -266,7 +266,7 @@ impl AacDecoder {
             },
             core_object_type: stream.object_type,
         };
-        AacDecoder {
+        Self {
             config: Some(AudioSpecificConfig {
                 object_type: stream.object_type,
                 sample_rate: stream.sample_rate,
@@ -445,7 +445,7 @@ mod tests {
         let n = 4096usize;
         let pcm: Vec<f32> = (0..n)
             .map(|i| {
-                ((i as f64 * 2.0 * std::f64::consts::PI * 440.0 / sr as f64).sin() * 0.5) as f32
+                ((i as f64 * 2.0 * std::f64::consts::PI * 440.0 / f64::from(sr)).sin() * 0.5) as f32
             })
             .collect();
         let mut enc = AacEncoder::new(AacEncoderConfig::default());

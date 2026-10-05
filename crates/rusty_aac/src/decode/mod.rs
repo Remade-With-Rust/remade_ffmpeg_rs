@@ -56,8 +56,8 @@ pub(crate) struct Sce {
 }
 
 impl Sce {
-    fn new() -> Sce {
-        Sce {
+    fn new() -> Self {
+        Self {
             ics: Ics::default(),
             data: ChannelData::default(),
             saved: vec![0.0; 1536],
@@ -84,8 +84,8 @@ pub(crate) struct Element {
 }
 
 impl Element {
-    fn new() -> Element {
-        Element {
+    fn new() -> Self {
+        Self {
             ch: [Sce::new(), Sce::new()],
             coup: Coupling::default(),
             present: false,
@@ -125,13 +125,13 @@ pub struct Decoder {
 
 impl Decoder {
     /// A plain AAC-LC decoder at `sample_rate` (layout learned from the stream).
-    pub fn new(sample_rate: u32) -> Decoder {
-        Decoder::with_stream_config(StreamConfig::lc(2, sample_rate, 0))
-            .unwrap_or_else(|_| Decoder::with_stream_config(StreamConfig::lc(2, 44100, 0)).unwrap())
+    pub fn new(sample_rate: u32) -> Self {
+        Self::with_stream_config(StreamConfig::lc(2, sample_rate, 0))
+            .unwrap_or_else(|_| Self::with_stream_config(StreamConfig::lc(2, 44100, 0)).unwrap())
     }
 
     /// A decoder for a fully parsed configuration.
-    pub fn with_stream_config(cfg: StreamConfig) -> Result<Decoder> {
+    pub fn with_stream_config(cfg: StreamConfig) -> Result<Self> {
         let syntax = Syntax {
             aot: cfg.object_type,
             sf_index: cfg.sf_index,
@@ -169,7 +169,7 @@ impl Decoder {
             _ => cfg.frame_length,
         };
         let win_len = if fl <= 512 { 1024 } else { fl };
-        let mut d = Decoder {
+        let mut d = Self {
             windows: synth::Windows::new(win_len),
             ld_sine: crate::dsp::sine_window(2 * fl)[..fl].to_vec(),
             ld_low_overlap: crate::dsp::sine_window(2 * (fl / 4))[..fl / 4].to_vec(),
@@ -219,7 +219,7 @@ impl Decoder {
         // as stereo, and so do we.
         let mono = map
             .iter()
-            .map(|t| 1 + (t.syn_ele == TYPE_CPE) as usize * (t.pos != 5) as usize)
+            .map(|t| 1 + usize::from(t.syn_ele == TYPE_CPE) * usize::from(t.pos != 5))
             .sum::<usize>()
             <= 1;
         if !mono {
@@ -403,7 +403,7 @@ impl Decoder {
             }
         }
         if level <= 7 {
-            if tm == (cc != 2) as usize && ty == TYPE_CPE {
+            if tm == usize::from(cc != 2) && ty == TYPE_CPE {
                 return hit(self, TYPE_CPE as usize, 0);
             } else if tm == 1 && cc == 2 && ty == TYPE_SCE {
                 return hit(self, TYPE_SCE as usize, 1);
@@ -629,14 +629,14 @@ impl Decoder {
                 tools::apply_ms(&c0.ics, &el.ms_mask, &mut c0.data, &mut c1.data);
             }
             if sx.aot == aot::AAC_MAIN {
-                for c in el.ch.iter_mut() {
+                for c in &mut el.ch {
                     let (ics, data, pred, init) =
                         (&c.ics, &mut c.data, &mut c.pred, &mut c.pred_init);
                     tools::apply_prediction(ics, sx.sf_index, &mut data.coeffs, pred, init);
                 }
             }
         } else if sx.aot == aot::AAC_MAIN {
-            for c in el.ch.iter_mut() {
+            for c in &mut el.ch {
                 let (ics, data, pred, init) = (&c.ics, &mut c.data, &mut c.pred, &mut c.pred_init);
                 tools::apply_prediction(ics, sx.sf_index, &mut data.coeffs, pred, init);
             }
@@ -675,7 +675,7 @@ impl Decoder {
             };
             targets.push((if is_cpe { TYPE_CPE } else { TYPE_SCE }, id, ch_select));
         }
-        point += (r.read_bool()? || (point >> 1) != 0) as u8;
+        point += u8::from(r.read_bool()? || (point >> 1) != 0);
         let sign = r.read_bool()?;
         let scale =
             [1.090_507_7f32, 1.189_207_1, std::f32::consts::SQRT_2, 2.0][r.read_bits(2)? as usize];
@@ -694,7 +694,7 @@ impl Decoder {
                     r.read_bool()?
                 };
                 gain = if cge {
-                    SCALEFACTOR_BOOK.decode(r)? as i32 - 60
+                    i32::from(SCALEFACTOR_BOOK.decode(r)?) - 60
                 } else {
                     0
                 };
@@ -708,7 +708,7 @@ impl Decoder {
                         let idx = g * max_sfb + sfb;
                         if el.ch[0].data.band_type[idx] != 0 {
                             if !cge {
-                                let mut t = SCALEFACTOR_BOOK.decode(r)? as i32 - 60;
+                                let mut t = i32::from(SCALEFACTOR_BOOK.decode(r)?) - 60;
                                 if t != 0 {
                                     let mut s = 1.0f32;
                                     gain += t;
@@ -847,7 +847,7 @@ impl Decoder {
                 };
                 if !el.present {
                     let el = self.elements[ty][id].as_mut().unwrap();
-                    for c in el.ch.iter_mut() {
+                    for c in &mut el.ch {
                         c.output.iter_mut().for_each(|v| *v = 0.0);
                     }
                     continue;
@@ -865,7 +865,7 @@ impl Decoder {
                         }
                     }
                 }
-                for c in el.ch.iter_mut() {
+                for c in &mut el.ch {
                     if c.data.tns.present {
                         let (data, ics) = (&mut c.data, &c.ics);
                         tools::apply_tns(&mut data.coeffs, &data.tns, ics, true);
@@ -918,7 +918,7 @@ impl Decoder {
                         index += 1;
                     }
                 } else {
-                    index += 1 + (sel == 3) as usize;
+                    index += 1 + usize::from(sel == 3);
                 }
             }
         }

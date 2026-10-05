@@ -46,26 +46,26 @@ pub(super) struct SbrBook {
 const SBR_LUT_BITS: u32 = 9;
 
 impl SbrBook {
-    pub(super) fn new(tab: &(&[(u8, u8)], i32)) -> SbrBook {
+    pub(super) fn new(tab: &(&[(u8, u8)], i32)) -> Self {
         let (syms, off) = *tab;
         let mut acc: u64 = 0;
         let mut entries = Vec::with_capacity(syms.len());
         for &(s, l) in syms {
-            let code = (acc >> (32 - l as u32)) as u32;
-            entries.push((code, l, s as i32 + off));
-            acc += 1u64 << (32 - l as u32);
+            let code = (acc >> (32 - u32::from(l))) as u32;
+            entries.push((code, l, i32::from(s) + off));
+            acc += 1u64 << (32 - u32::from(l));
         }
         let mut lut = vec![0u16; 1 << SBR_LUT_BITS];
         for (i, &(c, l, _)) in entries.iter().enumerate() {
-            if l as u32 <= SBR_LUT_BITS {
-                let span = 1usize << (SBR_LUT_BITS - l as u32);
-                let base = (c as usize) << (SBR_LUT_BITS - l as u32);
+            if u32::from(l) <= SBR_LUT_BITS {
+                let span = 1usize << (SBR_LUT_BITS - u32::from(l));
+                let base = (c as usize) << (SBR_LUT_BITS - u32::from(l));
                 lut[base..base + span]
                     .iter_mut()
                     .for_each(|e| *e = i as u16 + 1);
             }
         }
-        SbrBook { entries, lut }
+        Self { entries, lut }
     }
 
     pub(super) fn decode(&self, r: &mut BitReader) -> Result<i32> {
@@ -77,7 +77,7 @@ impl SbrBook {
         }
         let peek = r.peek_bits(24);
         for &(c, l, v) in &self.entries {
-            if l as u32 > SBR_LUT_BITS && (peek >> (24 - l as u32)) == c {
+            if u32::from(l) > SBR_LUT_BITS && (peek >> (24 - u32::from(l))) == c {
                 r.skip(l as usize)?;
                 return Ok(v);
             }
@@ -154,8 +154,8 @@ pub(crate) struct SbrChannel {
 }
 
 impl SbrChannel {
-    fn new() -> SbrChannel {
-        SbrChannel {
+    fn new() -> Self {
+        Self {
             bs_num_env: 0,
             bs_freq_res: [0; 7],
             t_env: [0; 7],
@@ -249,8 +249,8 @@ pub(crate) struct SbrChannelState {
 }
 
 impl SbrChannelState {
-    pub(crate) fn new(id_aac: u8) -> SbrChannelState {
-        let mut s = SbrChannelState {
+    pub(crate) fn new(id_aac: u8) -> Self {
+        let mut s = Self {
             sample_rate: 0,
             start: false,
             reset: false,
@@ -345,7 +345,7 @@ impl SbrChannelState {
         };
         let start_min = (((temp << 7) + (sr >> 1)) / sr) as i32;
         let stop_min = (((temp << 8) + (sr >> 1)) / sr) as i32;
-        let k0 = start_min + SBR_OFFSET[row][sp.start_freq as usize] as i32;
+        let k0 = start_min + i32::from(SBR_OFFSET[row][sp.start_freq as usize]);
         let k2 = match sp.stop_freq {
             0..=13 => {
                 let mut dk = make_bands(stop_min, 64, 13);
@@ -383,7 +383,7 @@ impl SbrChannelState {
             let k2diff = k2 - k0 - n_master as i32 * dk;
             if k2diff < 0 {
                 self.f_master[1] -= 1;
-                self.f_master[2] -= (k2diff < -1) as i32;
+                self.f_master[2] -= i32::from(k2diff < -1);
             } else if k2diff != 0 {
                 self.f_master[n_master] += 1;
             }
@@ -477,11 +477,11 @@ impl SbrChannelState {
         };
         loop {
             let mut odd;
-            if k as i64 == last_k && msb as i64 == last_msb {
+            if k as i64 == last_k && i64::from(msb) == last_msb {
                 return false;
             }
             last_k = k as i64;
-            last_msb = msb as i64;
+            last_msb = i64::from(msb);
             let mut i = k as i64;
             loop {
                 sb = self.f_master[i as usize];
@@ -703,7 +703,7 @@ impl SbrChannelState {
                 t_env[0] = 0;
                 t_env[n] = abs_bord_trail as i64;
                 for i in 0..num_rel_trail {
-                    t_env[n - 1 - i] = t_env[n - i] - 2 * r.read_bits(2)? as i64 - 2;
+                    t_env[n - 1 - i] = t_env[n - i] - 2 * i64::from(r.read_bits(2)?) - 2;
                 }
                 bs_pointer = r.read_bits(CEIL_LOG2[n])? as usize;
                 for i in 0..n {
@@ -712,12 +712,12 @@ impl SbrChannelState {
                 n
             }
             VARFIX => {
-                t_env[0] = r.read_bits(2)? as i64;
+                t_env[0] = i64::from(r.read_bits(2)?);
                 let num_rel_lead = r.read_bits(2)? as usize;
                 let n = num_rel_lead + 1;
                 t_env[n] = abs_bord_trail as i64;
                 for i in 0..num_rel_lead {
-                    t_env[i + 1] = t_env[i] + 2 * r.read_bits(2)? as i64 + 2;
+                    t_env[i + 1] = t_env[i] + 2 * i64::from(r.read_bits(2)?) + 2;
                 }
                 bs_pointer = r.read_bits(CEIL_LOG2[n])? as usize;
                 for i in 0..n {
@@ -726,7 +726,7 @@ impl SbrChannelState {
                 n
             }
             _ => {
-                t_env[0] = r.read_bits(2)? as i64;
+                t_env[0] = i64::from(r.read_bits(2)?);
                 abs_bord_trail += r.read_bits(2)? as usize;
                 let num_rel_lead = r.read_bits(2)? as usize;
                 let num_rel_trail = r.read_bits(2)? as usize;
@@ -736,10 +736,10 @@ impl SbrChannelState {
                 }
                 t_env[n] = abs_bord_trail as i64;
                 for i in 0..num_rel_lead {
-                    t_env[i + 1] = t_env[i] + 2 * r.read_bits(2)? as i64 + 2;
+                    t_env[i + 1] = t_env[i] + 2 * i64::from(r.read_bits(2)?) + 2;
                 }
                 for i in 0..num_rel_trail {
-                    t_env[n - 1 - i] = t_env[n - i] - 2 * r.read_bits(2)? as i64 - 2;
+                    t_env[n - 1 - i] = t_env[n - i] - 2 * i64::from(r.read_bits(2)?) - 2;
                 }
                 bs_pointer = r.read_bits(CEIL_LOG2[n])? as usize;
                 for i in 0..n {
@@ -760,7 +760,7 @@ impl SbrChannelState {
             *dst = src.max(0) as usize;
         }
         d.bs_num_env = n;
-        d.bs_num_noise = (n > 1) as usize + 1;
+        d.bs_num_noise = usize::from(n > 1) + 1;
         d.t_q[0] = d.t_env[0];
         d.t_q[d.bs_num_noise] = d.t_env[n];
         if d.bs_num_noise > 1 {
@@ -777,7 +777,7 @@ impl SbrChannelState {
             };
             d.t_q[1] = d.t_env[idx];
         }
-        d.e_a[0] = -((d.e_a[1] != bs_num_env_old as i32) as i32);
+        d.e_a[0] = -i32::from(d.e_a[1] != bs_num_env_old as i32);
         d.e_a[1] = -1;
         if class & 1 == 1 && bs_pointer != 0 {
             d.e_a[1] = (n + 1 - bs_pointer) as i32;
@@ -791,7 +791,7 @@ impl SbrChannelState {
         let [src, dst] = &mut self.data;
         dst.bs_freq_res[0] = dst.bs_freq_res[dst.bs_num_env];
         dst.t_env_num_env_old = dst.t_env[dst.bs_num_env];
-        dst.e_a[0] = -((dst.e_a[1] != dst.bs_num_env as i32) as i32);
+        dst.e_a[0] = -i32::from(dst.e_a[1] != dst.bs_num_env as i32);
         dst.bs_freq_res[1..].copy_from_slice(&src.bs_freq_res[1..]);
         dst.t_env = src.t_env;
         dst.t_q = src.t_q;
@@ -982,9 +982,9 @@ impl SbrChannelState {
         }
         if r.read_bool()? {
             // bs_extended_data: sbr_extension() elements (PS is id 2).
-            let mut cnt = r.read_bits(4)? as i64;
+            let mut cnt = i64::from(r.read_bits(4)?);
             if cnt == 15 {
-                cnt += r.read_bits(8)? as i64;
+                cnt += i64::from(r.read_bits(8)?);
             }
             let mut bits_left = cnt * 8;
             while bits_left > 7 {
@@ -1067,7 +1067,7 @@ fn exp2_half(q: i32, base: i32) -> f32 {
     } else {
         1.0
     };
-    (exp2i((q >> 1) + base) as f64 * odd) as f32
+    (f64::from(exp2i((q >> 1) + base)) * odd) as f32
 }
 
 impl SbrChannelState {
@@ -1104,7 +1104,7 @@ impl SbrChannelState {
                 }
             }
         } else {
-            let nch = (id_aac == TYPE_CPE) as usize + 1;
+            let nch = usize::from(id_aac == TYPE_CPE) + 1;
             for d in self.data.iter_mut().take(nch) {
                 for e in 1..=d.bs_num_env {
                     for k in 0..n[d.bs_freq_res[e] as usize] {
@@ -1146,8 +1146,8 @@ struct Work {
 }
 
 impl Work {
-    fn new() -> Work {
-        Work {
+    fn new() -> Self {
+        Self {
             x_low: vec![[[0.0; 2]; 40]; 32],
             x_low_rows: 0,
             x_high: vec![[[0.0; 2]; 40]; 64],
@@ -1361,7 +1361,7 @@ impl SbrChannelState {
                     wk.e_origmapped[e][m - kx] = d.env_facs[e + 1][i];
                 }
             }
-            let k = (d.bs_num_noise > 1 && d.t_env[e] >= d.t_q[1]) as usize;
+            let k = usize::from(d.bs_num_noise > 1 && d.t_env[e] >= d.t_q[1]);
             for i in 0..self.n_q {
                 for m in self.f_tablenoise[i]..self.f_tablenoise[i + 1] {
                     wk.q_mapped[e][m - kx] = d.noise_facs[k + 1][i];
@@ -1426,14 +1426,14 @@ impl SbrChannelState {
         let kx = self.kx[1];
         for e in 0..d.bs_num_env {
             let delta = !(e as i32 == d.e_a[1] || e as i32 == d.e_a[0]);
-            let deltaf = delta as u8 as f32;
+            let deltaf = f32::from(u8::from(delta));
             for k in 0..self.n_lim {
                 let (lo, hi) = (self.f_tablelim[k] - kx, self.f_tablelim[k + 1] - kx);
                 for m in lo..hi {
                     let (eo, qm, ec) = (wk.e_origmapped[e][m], wk.q_mapped[e][m], wk.e_curr[e][m]);
                     let temp = eo / (1.0 + qm);
                     wk.q_m[e][m] = (temp * qm).sqrt();
-                    wk.s_m[e][m] = (temp * d.s_indexmapped[e + 1][m] as u8 as f32).sqrt();
+                    wk.s_m[e][m] = (temp * f32::from(u8::from(d.s_indexmapped[e + 1][m]))).sqrt();
                     let g = if !wk.s_mapped[e][m] {
                         (eo / ((1.0 + ec) * (1.0 + qm * deltaf))).sqrt()
                     } else {
@@ -1742,7 +1742,11 @@ mod tests {
             &b.noise_t,
             &b.noise_bal_t,
         ] {
-            let kraft: f64 = book.entries.iter().map(|e| 0.5f64.powi(e.1 as i32)).sum();
+            let kraft: f64 = book
+                .entries
+                .iter()
+                .map(|e| 0.5f64.powi(i32::from(e.1)))
+                .sum();
             assert!((kraft - 1.0).abs() < 1e-9, "kraft {kraft}");
         }
     }

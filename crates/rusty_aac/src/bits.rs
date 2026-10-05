@@ -10,7 +10,7 @@ pub struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
-    pub fn new(data: &'a [u8]) -> BitReader<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
         BitReader { data, pos: 0 }
     }
 
@@ -28,7 +28,7 @@ impl<'a> BitReader<'a> {
         let shift = 7 - (self.pos % 8);
         let bit = (self.data[byte] >> shift) & 1;
         self.pos += 1;
-        Ok(bit as u32)
+        Ok(u32::from(bit))
     }
 
     /// Read `n` bits (0..=32) into a `u32`, MSB-first.

@@ -75,8 +75,8 @@ pub struct Ltp {
 }
 
 impl Default for Ltp {
-    fn default() -> Ltp {
-        Ltp {
+    fn default() -> Self {
+        Self {
             present: false,
             lag: 0,
             coef: 0.0,
@@ -100,8 +100,8 @@ pub struct Ics {
 }
 
 impl Default for Ics {
-    fn default() -> Ics {
-        Ics {
+    fn default() -> Self {
+        Self {
             info: IcsInfo {
                 window_sequence: WindowSequence::OnlyLong,
                 window_shape_kbd: false,
@@ -335,7 +335,7 @@ pub fn parse_tns(r: &mut BitReader, sx: &Syntax, info: &IcsInfo) -> Result<Tns> 
                 let coef_bits = res_bits - coef_compress;
                 let table = TNS_PARCOR[2 * coef_compress as usize + coef_res as usize];
                 let mut parcor = vec![0f32; order];
-                for p in parcor.iter_mut() {
+                for p in &mut parcor {
                     *p = table[r.read_bits(coef_bits)? as usize];
                 }
                 lpc = parcor_to_lpc(&parcor);
@@ -387,8 +387,8 @@ pub struct ChannelData {
 }
 
 impl Default for ChannelData {
-    fn default() -> ChannelData {
-        ChannelData {
+    fn default() -> Self {
+        Self {
             band_type: [0; 128],
             sfo: [0; 128],
             tns: Tns::default(),
@@ -466,7 +466,7 @@ pub fn decode_ics(
             match cd.band_type[idx] {
                 ZERO_HCB => cd.sfo[idx] = 0,
                 INTENSITY_HCB | INTENSITY_HCB2 => {
-                    off2 += SCALEFACTOR_BOOK.decode(r)? as i32 - 60;
+                    off2 += i32::from(SCALEFACTOR_BOOK.decode(r)?) - 60;
                     cd.sfo[idx] = off2.clamp(-155, 100);
                 }
                 NOISE_HCB => {
@@ -474,12 +474,12 @@ pub fn decode_ics(
                         noise_flag = false;
                         off1 += r.read_bits(9)? as i32 - 256;
                     } else {
-                        off1 += SCALEFACTOR_BOOK.decode(r)? as i32 - 60;
+                        off1 += i32::from(SCALEFACTOR_BOOK.decode(r)?) - 60;
                     }
                     cd.sfo[idx] = off1.clamp(-100, 155);
                 }
                 _ => {
-                    off0 += SCALEFACTOR_BOOK.decode(r)? as i32 - 60;
+                    off0 += i32::from(SCALEFACTOR_BOOK.decode(r)?) - 60;
                     if !(0..=255).contains(&off0) {
                         return Err(Error::invalid("aac: scalefactor out of range"));
                     }
@@ -561,7 +561,7 @@ pub fn decode_ics(
                 while i + dim <= e {
                     let t = tab[book.decode(r)? as usize];
                     for (o, &v) in tuple.iter_mut().zip(&t) {
-                        *o = v as i32;
+                        *o = i32::from(v);
                     }
                     crate::codebook::finish_tuple(meta, r, &mut tuple)?;
                     quant[base + i..base + i + dim].copy_from_slice(&tuple[..dim]);

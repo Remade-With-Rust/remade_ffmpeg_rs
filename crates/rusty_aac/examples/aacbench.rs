@@ -40,7 +40,7 @@ fn main() {
         }
         best = best.min(t.elapsed().as_secs_f64());
     }
-    let secs = samples as f64 / rate.max(1) as f64;
+    let secs = samples as f64 / f64::from(rate.max(1));
     println!(
         "{path}: {} frames, {samples} samples @ {rate} Hz x{channels}: best {:.2} ms ({:.1}x realtime)",
         frames.len(),

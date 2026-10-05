@@ -92,21 +92,21 @@ pub struct Pce {
 impl Pce {
     /// Total output channels the program describes.
     pub fn channels(&self) -> usize {
-        let pairs = |v: &[PceElement]| v.iter().map(|e| 1 + e.is_cpe as usize).sum::<usize>();
+        let pairs = |v: &[PceElement]| v.iter().map(|e| 1 + usize::from(e.is_cpe)).sum::<usize>();
         pairs(&self.front) + pairs(&self.side) + pairs(&self.back) + self.lfe.len()
     }
 
     /// Parse a PCE. `align_base` is the bit position `byte_alignment()` is
     /// relative to (the start of the enclosing config or access unit).
-    pub fn parse(r: &mut BitReader, align_base: usize) -> Result<Pce> {
+    pub fn parse(r: &mut BitReader, align_base: usize) -> Result<Self> {
         let tag = r.read_bits(4)? as u8;
-        Pce::parse_after_tag(r, tag, align_base)
+        Self::parse_after_tag(r, tag, align_base)
     }
 
     /// Parse a PCE whose `element_instance_tag` was already read (the in-band
     /// form, where the tag rides in the `raw_data_block` element header).
-    pub fn parse_after_tag(r: &mut BitReader, tag: u8, align_base: usize) -> Result<Pce> {
-        let mut p = Pce {
+    pub fn parse_after_tag(r: &mut BitReader, tag: u8, align_base: usize) -> Result<Self> {
+        let mut p = Self {
             element_instance_tag: tag,
             object_type: r.read_bits(2)? as u8,
             sf_index: r.read_bits(4)? as u8,
@@ -183,13 +183,13 @@ pub struct SbrHeader {
 
 impl SbrHeader {
     /// Parse `sbr_header()`; absent optional groups take their spec defaults.
-    pub fn parse(r: &mut BitReader) -> Result<SbrHeader> {
-        let mut h = SbrHeader {
+    pub fn parse(r: &mut BitReader) -> Result<Self> {
+        let mut h = Self {
             bs_amp_res: r.read_bits(1)? as u8,
             bs_start_freq: r.read_bits(4)? as u8,
             bs_stop_freq: r.read_bits(4)? as u8,
             bs_xover_band: r.read_bits(3)? as u8,
-            ..SbrHeader::defaults()
+            ..Self::defaults()
         };
         let _reserved = r.read_bits(2)?;
         let extra1 = r.read_bool()?;
@@ -209,8 +209,8 @@ impl SbrHeader {
     }
 
     /// Defaults the spec assigns when `bs_header_extra_1/2` are 0.
-    pub fn defaults() -> SbrHeader {
-        SbrHeader {
+    pub fn defaults() -> Self {
+        Self {
             bs_amp_res: 1,
             bs_freq_scale: 2,
             bs_alter_scale: 1,
@@ -276,8 +276,8 @@ pub struct StreamConfig {
 impl StreamConfig {
     /// A plain AAC-LC configuration (what an ADTS header or the simple
     /// `AudioSpecificConfig` describes).
-    pub fn lc(object_type: u8, sample_rate: u32, channel_config: u8) -> StreamConfig {
-        StreamConfig {
+    pub fn lc(object_type: u8, sample_rate: u32, channel_config: u8) -> Self {
+        Self {
             object_type,
             sf_index: sf_index_for_any_rate(sample_rate),
             sample_rate,

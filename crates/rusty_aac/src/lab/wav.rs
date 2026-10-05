@@ -89,7 +89,7 @@ pub fn read(path: impl AsRef<Path>) -> io::Result<Wav> {
     let samples: Vec<f32> = match (tag, bits) {
         (1, 16) => data
             .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+            .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0)
             .collect(),
         (1, 32) => data
             .chunks_exact(4)
@@ -133,7 +133,7 @@ pub fn write_s16(
     out.extend_from_slice(&1u16.to_le_bytes()); // PCM
     out.extend_from_slice(&channels.to_le_bytes());
     out.extend_from_slice(&sample_rate.to_le_bytes());
-    let byte_rate = sample_rate * channels as u32 * 2;
+    let byte_rate = sample_rate * u32::from(channels) * 2;
     out.extend_from_slice(&byte_rate.to_le_bytes());
     out.extend_from_slice(&(channels * 2).to_le_bytes()); // block align
     out.extend_from_slice(&16u16.to_le_bytes()); // bits

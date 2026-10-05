@@ -122,7 +122,7 @@ pub fn fil_payload_is_sbr(payload: &[u8]) -> bool {
     if payload.is_empty() {
         return false;
     }
-    let ext = (payload[0] >> 4) as u32;
+    let ext = u32::from(payload[0] >> 4);
     ext == EXT_SBR_DATA || ext == EXT_SBR_DATA_CRC
 }
 
@@ -150,11 +150,11 @@ mod tests {
     #[test]
     fn explicit_hierarchical_he_aac_v1() {
         let mut w = BitWriter::new();
-        w.write(AOT_SBR as u32, 5);
+        w.write(u32::from(AOT_SBR), 5);
         w.write(7, 4); // core sfIndex = 22050
         w.write(2, 4); // channels
         w.write(4, 4); // extension sfIndex = 44100
-        w.write(AOT_AAC_LC as u32, 5); // core object type
+        w.write(u32::from(AOT_AAC_LC), 5); // core object type
         w.write(0, 3); // GASpecificConfig
         let bytes = w.into_bytes();
 
@@ -174,11 +174,11 @@ mod tests {
     #[test]
     fn explicit_hierarchical_he_aac_v2() {
         let mut w = BitWriter::new();
-        w.write(AOT_PS as u32, 5);
+        w.write(u32::from(AOT_PS), 5);
         w.write(6, 4); // 24000 core
         w.write(2, 4);
         w.write(3, 4); // 48000 output
-        w.write(AOT_AAC_LC as u32, 5);
+        w.write(u32::from(AOT_AAC_LC), 5);
         w.write(0, 3);
         let s = parse_sbr_config(&w.into_bytes()).unwrap();
         assert!(s.sbr_present && s.ps_present, "AOT 29 implies SBR + PS");
@@ -191,12 +191,12 @@ mod tests {
     #[test]
     fn backward_compatible_signalling() {
         let mut w = BitWriter::new();
-        w.write(AOT_AAC_LC as u32, 5);
+        w.write(u32::from(AOT_AAC_LC), 5);
         w.write(6, 4); // core sfIndex = 24000
         w.write(2, 4);
         w.write(0, 3); // GASpecificConfig
         w.write(SYNC_EXT_SBR, 11);
-        w.write(AOT_SBR as u32, 5);
+        w.write(u32::from(AOT_SBR), 5);
         w.write_bool(true); // sbrPresentFlag
         w.write(3, 4); // extension sfIndex = 48000
         let s = parse_sbr_config(&w.into_bytes()).unwrap();
@@ -210,12 +210,12 @@ mod tests {
     #[test]
     fn backward_compatible_ps_signalling() {
         let mut w = BitWriter::new();
-        w.write(AOT_AAC_LC as u32, 5);
+        w.write(u32::from(AOT_AAC_LC), 5);
         w.write(6, 4); // 24000 core
         w.write(2, 4);
         w.write(0, 3);
         w.write(SYNC_EXT_SBR, 11);
-        w.write(AOT_SBR as u32, 5);
+        w.write(u32::from(AOT_SBR), 5);
         w.write_bool(true);
         w.write(3, 4); // 48000
         w.write(SYNC_EXT_PS, 11);
@@ -229,12 +229,12 @@ mod tests {
     #[test]
     fn sbr_without_explicit_rate_doubles() {
         let mut w = BitWriter::new();
-        w.write(AOT_AAC_LC as u32, 5);
+        w.write(u32::from(AOT_AAC_LC), 5);
         w.write(6, 4); // 24000
         w.write(1, 4);
         w.write(0, 3);
         w.write(SYNC_EXT_SBR, 11);
-        w.write(AOT_SBR as u32, 5);
+        w.write(u32::from(AOT_SBR), 5);
         w.write_bool(false); // sbrPresentFlag = 0
         let s = parse_sbr_config(&w.into_bytes()).unwrap();
         assert!(!s.sbr_present, "an explicit 0 must not turn SBR on");
@@ -260,11 +260,11 @@ mod tests {
     fn decoder_reports_he_aac_output_rate() {
         // Explicit hierarchical HE-AAC v1: 44100 output, 22050 core.
         let mut w = BitWriter::new();
-        w.write(AOT_SBR as u32, 5);
+        w.write(u32::from(AOT_SBR), 5);
         w.write(7, 4); // core sfIndex = 22050
         w.write(1, 4); // mono
         w.write(4, 4); // extension sfIndex = 44100
-        w.write(AOT_AAC_LC as u32, 5);
+        w.write(u32::from(AOT_AAC_LC), 5);
         w.write(0, 3);
         let asc = w.into_bytes();
 

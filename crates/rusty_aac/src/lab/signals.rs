@@ -96,7 +96,7 @@ pub struct AacSignals {
 impl AacSignals {
     /// Analyze a clip. `planes` is one slice per channel; only channel 0 drives
     /// the mono signals, with `xcorr` filled when a second channel is present.
-    pub fn analyze(planes: &[&[f32]], sample_rate: u32) -> AacSignals {
+    pub fn analyze(planes: &[&[f32]], sample_rate: u32) -> Self {
         let fs_index = crate::sf_index_for_rate(sample_rate).unwrap_or(4);
         let swb = swb_offsets(true, fs_index);
         let nbands = swb.len() - 1;
@@ -117,7 +117,7 @@ impl AacSignals {
             let mut acc = 0f64;
             let mut cnt = 0u64;
             for c in ch0.chunks_exact(128) {
-                acc += c.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+                acc += c.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>();
                 cnt += 1;
             }
             acc / cnt.max(1) as f64
@@ -141,7 +141,7 @@ impl AacSignals {
             for (sb, slot) in attack_ratio.iter_mut().enumerate() {
                 let e: f64 = cur[sb * 128..(sb + 1) * 128]
                     .iter()
-                    .map(|&x| (x as f64) * (x as f64))
+                    .map(|&x| f64::from(x) * f64::from(x))
                     .sum();
                 // Always defined, and scale-invariant: both `e` and the floor
                 // scale with the clip's level, so a 40 dB gain change leaves the
@@ -170,10 +170,10 @@ impl AacSignals {
                 let (s, e) = (swb[b] as usize, swb[b + 1] as usize);
                 let energy: f64 = spec[s..e.min(spec.len())]
                     .iter()
-                    .map(|&x| (x as f64) * (x as f64))
+                    .map(|&x| f64::from(x) * f64::from(x))
                     .sum();
                 etot += energy;
-                twsum += energy * tonality[b] as f64;
+                twsum += energy * f64::from(tonality[b]);
                 let nlines = (e - s) as f64;
                 pe += nlines * (1.0 + energy / thr[b].max(1e-20)).log2();
             }
@@ -184,8 +184,11 @@ impl AacSignals {
             };
 
             // --- loudness ---
-            let ms: f64 =
-                cur.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / FRAME_LEN as f64;
+            let ms: f64 = cur
+                .iter()
+                .map(|&x| f64::from(x) * f64::from(x))
+                .sum::<f64>()
+                / FRAME_LEN as f64;
             let peak = cur.iter().fold(0f32, |a, &x| a.max(x.abs()));
 
             frames.push(FrameSignals {
@@ -213,7 +216,7 @@ impl AacSignals {
             });
         }
 
-        AacSignals {
+        Self {
             sample_rate,
             frames,
         }
@@ -273,7 +276,7 @@ fn band_tonality(spec: &[f32], swb: &[u16]) -> Vec<f32> {
         for &x in &spec[s..e] {
             // Floor well below any audible coefficient so a single exact zero
             // cannot drive the geometric mean to 0 and fake a "pure tone".
-            let p = ((x as f64) * (x as f64)).max(1e-10);
+            let p = (f64::from(x) * f64::from(x)).max(1e-10);
             log_sum += p.ln();
             lin_sum += p;
         }
@@ -300,7 +303,7 @@ fn spectral_lpc_gain(spec: &[f32], order: usize) -> f32 {
     for (lag, slot) in r.iter_mut().enumerate() {
         let mut acc = 0f64;
         for i in 0..n - lag {
-            acc += spec[i] as f64 * spec[i + lag] as f64;
+            acc += f64::from(spec[i]) * f64::from(spec[i + lag]);
         }
         *slot = acc;
     }
@@ -335,14 +338,14 @@ fn spectral_lpc_gain(spec: &[f32], order: usize) -> f32 {
 
 /// Frequency below which `frac` of the spectrum's energy lies.
 fn rolloff(spec: &[f32], sample_rate: u32, frac: f32) -> f32 {
-    let total: f64 = spec.iter().map(|&x| (x as f64) * (x as f64)).sum();
+    let total: f64 = spec.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
     if total <= 1e-12 {
         return 0.0;
     }
-    let target = total * frac as f64;
+    let target = total * f64::from(frac);
     let mut acc = 0f64;
     for (i, &x) in spec.iter().enumerate() {
-        acc += (x as f64) * (x as f64);
+        acc += f64::from(x) * f64::from(x);
         if acc >= target {
             // Coefficient i covers [i, i+1) × (sr/2) / 1024.
             return (i as f32 + 0.5) * (sample_rate as f32 * 0.5) / spec.len() as f32;
@@ -363,7 +366,7 @@ fn band_xcorr(l: &[f32], r: &[f32], swb: &[u16]) -> Vec<f32> {
         }
         let (mut dot, mut nl, mut nr) = (0f64, 0f64, 0f64);
         for k in s..e {
-            let (a, c) = (l[k] as f64, r[k] as f64);
+            let (a, c) = (f64::from(l[k]), f64::from(r[k]));
             dot += a * c;
             nl += a * a;
             nr += c * c;
@@ -388,7 +391,7 @@ mod truth_table {
     fn analyze(class: Class) -> AacSignals {
         let s = corpus::signal(class);
         let planes = s.planes();
-        let refs: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
+        let refs: Vec<&[f32]> = planes.iter().map(std::vec::Vec::as_slice).collect();
         AacSignals::analyze(&refs, s.sample_rate)
     }
 

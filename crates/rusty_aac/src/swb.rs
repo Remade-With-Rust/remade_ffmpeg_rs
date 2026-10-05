@@ -75,16 +75,16 @@ pub fn swb_offsets(long: bool, fs_index: u8) -> &'static [u16] {
             3 | 4 => LONG_48,
             5 => LONG_32,
             6 | 7 => LONG_24,
-            8 | 9 | 10 => LONG_16,
+            8..=10 => LONG_16,
             _ => LONG_8,
         }
     } else {
         match fs_index {
             0 | 1 => SHORT_96,
             2 => SHORT_64,
-            3 | 4 | 5 => SHORT_48,
+            3..=5 => SHORT_48,
             6 | 7 => SHORT_24,
-            8 | 9 | 10 => SHORT_16,
+            8..=10 => SHORT_16,
             _ => SHORT_8,
         }
     }

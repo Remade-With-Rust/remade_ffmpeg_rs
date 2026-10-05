@@ -53,8 +53,8 @@ const POW43_LEN: usize = 8192 + 16;
 
 /// The defining formula (the table's source and oracle).
 fn dequant_formula(q: i32) -> f32 {
-    let m = (q.unsigned_abs() as f64).powf(4.0 / 3.0);
-    (q.signum() as f64 * m) as f32
+    let m = f64::from(q.unsigned_abs()).powf(4.0 / 3.0);
+    (f64::from(q.signum()) * m) as f32
 }
 
 /// Scalefactor gain `2^(0.25·(sf − 100))`, the per-band multiplier applied to
@@ -72,7 +72,7 @@ pub fn sf_gain(sf: i32) -> f32 {
 
 /// The defining formula (the table's source and oracle).
 fn sf_gain_formula(sf: i32) -> f32 {
-    2f64.powf(0.25 * (sf as f64 - 100.0)) as f32
+    2f64.powf(0.25 * (f64::from(sf) - 100.0)) as f32
 }
 
 /// IMDCT (ISO 14496-3 §4.6.11.2): `N/2` spectral coefficients → `N` time
@@ -91,7 +91,7 @@ pub fn imdct(spec: &[f32]) -> Vec<f32> {
         let mut acc = 0f64;
         let a = w * (i as f64 + n0);
         for (k, &s) in spec.iter().enumerate() {
-            acc += s as f64 * (a * (k as f64 + 0.5)).cos();
+            acc += f64::from(s) * (a * (k as f64 + 0.5)).cos();
         }
         *o = (scale * acc) as f32;
     }
@@ -116,7 +116,7 @@ pub fn mdct(time: &[f32]) -> Vec<f32> {
     for (k, o) in out.iter_mut().enumerate() {
         let mut acc = 0f64;
         for (i, &t) in time.iter().enumerate() {
-            acc += t as f64 * (w * (i as f64 + n0) * (k as f64 + 0.5)).cos();
+            acc += f64::from(t) * (w * (i as f64 + n0) * (k as f64 + 0.5)).cos();
         }
         *o = (2.0 * acc) as f32;
     }
@@ -179,7 +179,7 @@ struct MdctTwiddles {
 }
 
 impl MdctTwiddles {
-    fn build(n: usize) -> MdctTwiddles {
+    fn build(n: usize) -> Self {
         // N/4-FFT MDCT: fold N→L=N/2, an M=N/4 complex FFT, pre/post rotations
         // (derived + verified against the direct oracle — see mdct_fast).
         let l = n / 2;
@@ -207,7 +207,7 @@ impl MdctTwiddles {
             }
             len <<= 1;
         }
-        MdctTwiddles {
+        Self {
             pre_c,
             pre_s,
             post_c,
@@ -253,9 +253,9 @@ pub fn mdct_fast(x: &[f32]) -> Vec<f32> {
     let (l2, l32) = (l / 2, 3 * l / 2);
     let fold = |mm: usize| -> f64 {
         if mm < l2 {
-            -(x[l32 - 1 - mm] as f64) - (x[mm + l32] as f64)
+            -f64::from(x[l32 - 1 - mm]) - f64::from(x[mm + l32])
         } else {
-            (x[mm - l2] as f64) - (x[l32 - 1 - mm] as f64)
+            f64::from(x[mm - l2]) - f64::from(x[l32 - 1 - mm])
         }
     };
     // Pack + pre-rotate into M complex: v[p] = (y[2p] + i·y[L-1-2p])·e^{-iπ(4p+1)/4L}.
@@ -314,7 +314,7 @@ pub fn imdct_fast(spec: &[f32]) -> Vec<f32> {
     };
     let (mut re, mut im) = (vec![0f64; m], vec![0f64; m]);
     for p in 0..m {
-        let (yr, yi) = (spec[2 * p] as f64, spec[l - 1 - 2 * p] as f64);
+        let (yr, yi) = (f64::from(spec[2 * p]), f64::from(spec[l - 1 - 2 * p]));
         re[p] = yr * tw.pre_c[p] + yi * tw.pre_s[p];
         im[p] = yi * tw.pre_c[p] - yr * tw.pre_s[p];
     }
@@ -356,14 +356,14 @@ struct MixedFft {
 }
 
 impl MixedFft {
-    fn new(n: usize) -> MixedFft {
+    fn new(n: usize) -> Self {
         let w = (0..n)
             .map(|t| {
                 let a = -2.0 * PI * t as f64 / n as f64;
                 (a.cos(), a.sin())
             })
             .collect();
-        MixedFft { n, w }
+        Self { n, w }
     }
 
     fn radix(n: usize) -> usize {
@@ -435,7 +435,7 @@ struct Dct4Plan {
 }
 
 impl Dct4Plan {
-    fn new(l: usize) -> Dct4Plan {
+    fn new(l: usize) -> Self {
         let m = l / 2;
         let pre = (0..m)
             .map(|p| {
@@ -449,7 +449,7 @@ impl Dct4Plan {
                 (ph.cos(), ph.sin())
             })
             .collect();
-        Dct4Plan {
+        Self {
             l,
             pre,
             post,
@@ -484,7 +484,9 @@ fn dct4_plan(l: usize) -> &'static Dct4Plan {
     use std::sync::Mutex;
     static PLANS: OnceLock<Mutex<HashMap<usize, &'static Dct4Plan>>> = OnceLock::new();
     let map = PLANS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     *g.entry(l)
         .or_insert_with(|| Box::leak(Box::new(Dct4Plan::new(l))))
 }
@@ -500,7 +502,7 @@ pub fn imdct_half(spec: &[f32], out: &mut [f32], gain: f64) {
         return plan.imdct_half(spec, out, gain as f32);
     }
     let plan = dct4_plan(l);
-    let z = plan.run(|i| spec[i] as f64);
+    let z = plan.run(|i| f64::from(spec[i]));
     // z = 2·D·X; the spec IMDCT is (2/N)·Fᵀ·D·X with N = 2L, so scale by 1/(2L)·…
     // middle[k] = −(D·X)[L−1−k]·(2/N)·…  — see `imdct_fast`'s unfold.
     let scale = gain / (2 * l) as f64;
@@ -536,7 +538,7 @@ pub(crate) struct Radix2Fft {
 }
 
 impl Radix2Fft {
-    pub(crate) fn new(n: usize, sign: f64) -> Radix2Fft {
+    pub(crate) fn new(n: usize, sign: f64) -> Self {
         assert!(n.is_power_of_two() && n >= 2);
         let bits = n.trailing_zeros();
         let rev: Vec<u16> = (0..n)
@@ -561,7 +563,7 @@ impl Radix2Fft {
             stw.extend((0..half).map(|j| tw[j * step]));
             half *= 2;
         }
-        Radix2Fft {
+        Self {
             n,
             swaps,
             rev,
@@ -673,7 +675,7 @@ impl Radix2Fft {
     unsafe fn run_avx(&self, buf: &mut [[f32; 2]], permuted: bool) {
         use std::arch::x86_64::*;
         let n = self.n;
-        let p = buf.as_mut_ptr() as *mut f32;
+        let p = buf.as_mut_ptr().cast::<f32>();
         if n >= 4 {
             if !permuted {
                 for &(i, j) in &self.swaps {
@@ -700,7 +702,7 @@ impl Radix2Fft {
             if half == 2 {
                 // Two butterflies per 128-bit op; both twiddles are the same in
                 // every block, so the twiddle vector is loaded once.
-                let w = _mm_loadu_ps(self.stw.as_ptr() as *const f32);
+                let w = _mm_loadu_ps(self.stw.as_ptr().cast::<f32>());
                 let (wr, wi) = (_mm_moveldup_ps(w), _mm_movehdup_ps(w));
                 let mut s = 0;
                 while s < n {
@@ -715,7 +717,7 @@ impl Radix2Fft {
                     s += 4;
                 }
             } else {
-                let wbase = self.stw.as_ptr().add(half - 2) as *const f32;
+                let wbase = self.stw.as_ptr().add(half - 2).cast::<f32>();
                 let mut s = 0;
                 while s < n {
                     let mut j = 0;
@@ -794,7 +796,7 @@ pub(crate) struct Pow2Dct4 {
 }
 
 impl Pow2Dct4 {
-    fn new(l: usize) -> Pow2Dct4 {
+    fn new(l: usize) -> Self {
         let m = l / 2;
         let pre = (0..m)
             .map(|p| {
@@ -808,7 +810,7 @@ impl Pow2Dct4 {
                 [ph.cos() as f32, ph.sin() as f32]
             })
             .collect();
-        Pow2Dct4 {
+        Self {
             l,
             pre,
             post,
@@ -968,9 +970,9 @@ pub fn mdct_any(x: &[f32]) -> Vec<f32> {
     let plan = dct4_plan(l);
     let fold = |mm: usize| -> f64 {
         if mm < l2 {
-            -(x[l32 - 1 - mm] as f64) - (x[mm + l32] as f64)
+            -f64::from(x[l32 - 1 - mm]) - f64::from(x[mm + l32])
         } else {
-            (x[mm - l2] as f64) - (x[l32 - 1 - mm] as f64)
+            f64::from(x[mm - l2]) - f64::from(x[l32 - 1 - mm])
         }
     };
     plan.run(fold).iter().map(|&v| v as f32).collect()
@@ -989,7 +991,7 @@ fn bessel_i0(x: f64) -> f64 {
     let mut term = 1.0;
     let half_x = x / 2.0;
     for k in 1..50 {
-        term *= (half_x / k as f64).powi(2);
+        term *= (half_x / f64::from(k)).powi(2);
         sum += term;
         if term < 1e-12 * sum {
             break;

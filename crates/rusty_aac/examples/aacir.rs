@@ -22,7 +22,7 @@ fn main() {
         frames += 1;
         samples += samples_out.len() as u64;
         for v in samples_out {
-            sum = (sum ^ v.to_bits() as u64).wrapping_mul(0x100_0000_01b3);
+            sum = (sum ^ u64::from(v.to_bits())).wrapping_mul(0x100_0000_01b3);
         }
     };
     for f in std::env::args().skip(1) {

@@ -390,8 +390,8 @@ fn filters_from_proto(proto: &[f32; 7], bands: usize) -> Vec<[Cpx; 8]> {
             for (n, &p) in proto.iter().enumerate() {
                 let theta = 2.0 * PI * (q as f64 + 0.5) * (n as f64 - 6.0) / bands as f64;
                 f[n] = [
-                    (p as f64 * theta.cos()) as f32,
-                    (p as f64 * -theta.sin()) as f32,
+                    (f64::from(p) * theta.cos()) as f32,
+                    (f64::from(p) * -theta.sin()) as f32,
                 ];
             }
             f
@@ -412,9 +412,9 @@ fn tables() -> &'static PsTables {
                 for pd2 in 0..8 {
                     let re: f32 = 0.25 * ipdopd_cos[pd0] + 0.5 * ipdopd_cos[pd1] + ipdopd_cos[pd2];
                     let im: f32 = 0.25 * ipdopd_sin[pd0] + 0.5 * ipdopd_sin[pd1] + ipdopd_sin[pd2];
-                    let mag = 1.0 / (im as f64).hypot(re as f64);
-                    pd_re_smooth[pd0 * 64 + pd1 * 8 + pd2] = (re as f64 * mag) as f32;
-                    pd_im_smooth[pd0 * 64 + pd1 * 8 + pd2] = (im as f64 * mag) as f32;
+                    let mag = 1.0 / f64::from(im).hypot(f64::from(re));
+                    pd_re_smooth[pd0 * 64 + pd1 * 8 + pd2] = (f64::from(re) * mag) as f32;
+                    pd_im_smooth[pd0 * 64 + pd1 * 8 + pd2] = (f64::from(im) * mag) as f32;
                 }
             }
         }
@@ -500,13 +500,13 @@ fn tables() -> &'static PsTables {
                 let mu = (1.0 + (4.0 * rho * rho - 4.0) / (mu * mu)).sqrt();
                 let gamma = ((1.0 - mu) / (1.0 + mu)).sqrt().atan();
                 if alpha < 0.0 {
-                    alpha = (alpha as f64 + PI / 2.0) as f32;
+                    alpha = (f64::from(alpha) + PI / 2.0) as f32;
                 }
                 let (ac, as_, gc, gs) = (
-                    alpha.cos() as f64,
-                    alpha.sin() as f64,
-                    gamma.cos() as f64,
-                    gamma.sin() as f64,
+                    f64::from(alpha.cos()),
+                    f64::from(alpha.sin()),
+                    f64::from(gamma.cos()),
+                    f64::from(gamma.sin()),
                 );
                 hb[iid][icc] = [
                     (SQRT_2 * ac * gc) as f32,
@@ -528,18 +528,18 @@ fn tables() -> &'static PsTables {
         for (is34, (n, base)) in [(30usize, 6.5f32), (50, 26.5)].into_iter().enumerate() {
             for k in 0..n {
                 let f_center = if is34 == 0 {
-                    f_center_20.get(k).map(|&v| v as f64 * 0.125)
+                    f_center_20.get(k).map(|&v| f64::from(v) * 0.125)
                 } else {
-                    f_center_34.get(k).map(|&v| v as f64 / 24.0)
+                    f_center_34.get(k).map(|&v| f64::from(v) / 24.0)
                 }
-                .unwrap_or(k as f64 - base as f64);
+                .unwrap_or(k as f64 - f64::from(base));
                 let mut q = [[0f32; 2]; 3];
                 for (m, &l) in links.iter().enumerate() {
-                    let theta = -PI * l as f64 * f_center;
+                    let theta = -PI * f64::from(l) * f_center;
                     q[m] = [theta.cos() as f32, theta.sin() as f32];
                 }
                 q_fract_allpass[is34].push(q);
-                let theta = -PI * gain as f64 * f_center;
+                let theta = -PI * f64::from(gain) * f_center;
                 phi_fract[is34].push([theta.cos() as f32, theta.sin() as f32]);
             }
         }
@@ -659,8 +659,8 @@ pub(crate) struct PsState {
 }
 
 impl PsState {
-    pub(crate) fn new() -> PsState {
-        PsState {
+    pub(crate) fn new() -> Self {
+        Self {
             start: false,
             enable_iid: false,
             iid_quant: 0,
@@ -747,7 +747,7 @@ impl PsState {
         for b in 0..num {
             let delta = book.decode(r)?;
             let mut val = if dt {
-                self.par(p)[e_prev][b] as i32 + delta
+                i32::from(self.par(p)[e_prev][b]) + delta
             } else {
                 acc + delta
             };
@@ -823,7 +823,7 @@ impl PsState {
                     return Ok(false);
                 }
                 self.nr_iid_par = NR_IIDICC_PAR[mode];
-                self.iid_quant = (mode > 2) as usize;
+                self.iid_quant = usize::from(mode > 2);
                 self.nr_ipdopd_par = NR_IPDOPD_PAR[mode];
             }
             self.enable_icc = r.read_bool()?;
@@ -838,7 +838,7 @@ impl PsState {
         }
         let frame_class = r.read_bool()?;
         self.num_env_old = self.num_env;
-        self.num_env = NUM_ENV_TAB[frame_class as usize][r.read_bits(2)? as usize];
+        self.num_env = NUM_ENV_TAB[usize::from(frame_class)][r.read_bits(2)? as usize];
         self.border_position[0] = -1;
         if frame_class {
             for e in 1..=self.num_env {
@@ -877,9 +877,9 @@ impl PsState {
             self.icc_par = [[0; MAX_PAR]; MAX_ENV];
         }
         if self.enable_ext {
-            let mut cnt = r.read_bits(4)? as i64;
+            let mut cnt = i64::from(r.read_bits(4)?);
             if cnt == 15 {
-                cnt += r.read_bits(8)? as i64;
+                cnt += i64::from(r.read_bits(8)?);
             }
             cnt *= 8;
             while cnt > 7 {
@@ -917,7 +917,7 @@ impl PsState {
             if self.enable_iid
                 && self.iid_par[n][..self.nr_iid_par]
                     .iter()
-                    .any(|&v| (v as i32).abs() > limit)
+                    .any(|&v| i32::from(v).abs() > limit)
             {
                 return Ok(false);
             }
@@ -1040,7 +1040,7 @@ impl PsState {
                 }
             }
         }
-        for row in self.in_buf.iter_mut() {
+        for row in &mut self.in_buf {
             row.copy_within(len..len + 6, 0);
         }
     }
@@ -1093,7 +1093,7 @@ impl PsState {
         const AP_A: [f32; 3] = [0.651_439_04, 0.564_718_1, 0.489_541_66];
         let t = tables();
         let len = self.slots;
-        let i34 = is34 as usize;
+        let i34 = usize::from(is34);
         let k_to_i: &[u8] = if is34 { &K_TO_I_34 } else { &K_TO_I_20 };
         if is34 != self.is34bands_old {
             self.peak_decay_nrg = [0.0; 34];
@@ -1196,7 +1196,7 @@ fn map_idx_10_to_20(out: &mut [i8; MAX_PAR], par: &[i8; MAX_PAR], full: bool) {
 }
 
 fn map_idx_34_to_20(out: &mut [i8; MAX_PAR], p: &[i8; MAX_PAR], full: bool) {
-    let p = p.map(|v| v as i32);
+    let p = p.map(i32::from);
     let o = |v: i32| v as i8;
     out[0] = o((2 * p[0] + p[1]) / 3);
     out[1] = o((p[1] + 2 * p[2]) / 3);
@@ -1263,10 +1263,10 @@ fn map_idx_20_to_34(out: &mut [i8; MAX_PAR], p: &[i8; MAX_PAR], full: bool) {
     out[7] = p[4];
     out[6] = p[4];
     out[5] = p[3];
-    out[4] = ((p[2] as i32 + p[3] as i32) / 2) as i8;
+    out[4] = ((i32::from(p[2]) + i32::from(p[3])) / 2) as i8;
     out[3] = p[2];
     out[2] = p[1];
-    out[1] = ((p[0] as i32 + p[1] as i32) / 2) as i8;
+    out[1] = ((i32::from(p[0]) + i32::from(p[1])) / 2) as i8;
     out[0] = p[0];
 }
 
@@ -1352,12 +1352,12 @@ fn remap(par: &ParRows, num_par: usize, num_env: usize, full: bool, is34: bool) 
 impl PsState {
     fn stereo_processing(&mut self, l: &mut [[Cpx; 32]], r: &mut [[Cpx; 32]], is34: bool) {
         let t = tables();
-        let i34 = is34 as usize;
+        let i34 = usize::from(is34);
         let k_to_i: &[u8] = if is34 { &K_TO_I_34 } else { &K_TO_I_20 };
         let lut = if self.icc_mode < 3 { &t.ha } else { &t.hb };
         let ne_old = self.num_env_old;
         if ne_old != 0 {
-            for h in self.h.iter_mut() {
+            for h in &mut self.h {
                 for part in h.iter_mut() {
                     part[0] = part[ne_old];
                 }
@@ -1374,7 +1374,7 @@ impl PsState {
             (self.ipd_par, self.opd_par)
         };
         if is34 != self.is34bands_old {
-            for h in self.h.iter_mut() {
+            for h in &mut self.h {
                 for part in h.iter_mut() {
                     if is34 {
                         map_val_20_to_34(&mut part[0]);
@@ -1390,7 +1390,7 @@ impl PsState {
         let ipdopd = self.enable_ipdopd;
         for e in 0..self.num_env {
             for b in 0..NR_PAR_BANDS[i34] {
-                let row = (iid[e][b] as i32 + 7 + 23 * self.iid_quant as i32) as usize;
+                let row = (i32::from(iid[e][b]) + 7 + 23 * self.iid_quant as i32) as usize;
                 let mut hh = lut[row][icc[e][b] as usize];
                 if ipdopd && b < NR_IPDOPD_BANDS[i34] {
                     // Phase parameters are smoothed over the last three values.
@@ -1489,7 +1489,7 @@ impl PsState {
     /// `top` is the highest QMF band carrying signal.
     pub(crate) fn apply(&mut self, l: &mut [[Cpx; 64]], r: &mut [[Cpx; 64]], top: usize) {
         let is34 = self.is34bands;
-        let i34 = is34 as usize;
+        let i34 = usize::from(is34);
         let top = (top + NR_BANDS[i34]).saturating_sub(64);
         for d in self.delay.iter_mut().take(NR_BANDS[i34]).skip(top) {
             *d = [[0.0; 2]; QMF_SLOTS + MAX_DELAY];

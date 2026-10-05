@@ -36,7 +36,7 @@ fn main() {
         packets += 1;
         bytes += p.data.len() as u64;
         for &b in &p.data {
-            sum = (sum ^ b as u64).wrapping_mul(0x100_0000_01b3);
+            sum = (sum ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
         }
     }
     println!("anchors packets {packets} bytes {bytes} checksum {sum:016x}");

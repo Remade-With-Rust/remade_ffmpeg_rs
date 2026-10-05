@@ -25,9 +25,9 @@ pub struct Windows {
 }
 
 impl Windows {
-    pub fn new(frame_len: usize) -> Windows {
+    pub fn new(frame_len: usize) -> Self {
         let short = frame_len / 8;
-        Windows {
+        Self {
             long_sine: dsp::sine_window(2 * frame_len)[..frame_len].to_vec(),
             long_kbd: dsp::kbd_window(2 * frame_len, 4.0)[..frame_len].to_vec(),
             short_sine: dsp::sine_window(2 * short)[..short].to_vec(),

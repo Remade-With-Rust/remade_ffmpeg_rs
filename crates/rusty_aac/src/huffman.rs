@@ -41,7 +41,7 @@ const SUB: u32 = 1 << 31;
 const LUT_BITS: u32 = 11;
 
 impl HuffBook {
-    pub const fn new(codes: &'static [u32], lens: &'static [u8]) -> HuffBook {
+    pub const fn new(codes: &'static [u32], lens: &'static [u8]) -> Self {
         let mut max = 0u8;
         let mut i = 0;
         while i < lens.len() {
@@ -50,7 +50,7 @@ impl HuffBook {
             }
             i += 1;
         }
-        HuffBook {
+        Self {
             codes,
             lens,
             max_len: max,
@@ -68,12 +68,12 @@ impl HuffBook {
     }
 
     fn build_lut(&self) -> Lut {
-        let bits = LUT_BITS.min(self.max_len as u32);
+        let bits = LUT_BITS.min(u32::from(self.max_len));
         let mut prim = vec![0u32; 1 << bits];
         // Longest code under each primary prefix that overflows the table.
         let mut deepest = vec![0u32; 1 << bits];
         for (i, (&c, &l)) in self.codes.iter().zip(self.lens).enumerate() {
-            let l = l as u32;
+            let l = u32::from(l);
             if l == 0 {
                 continue;
             }
@@ -95,7 +95,7 @@ impl HuffBook {
             }
         }
         for (i, (&c, &l)) in self.codes.iter().zip(self.lens).enumerate() {
-            let l = l as u32;
+            let l = u32::from(l);
             if l <= bits {
                 continue;
             }
@@ -147,7 +147,7 @@ impl HuffBook {
     /// Kraft sum Σ 2^-len — 1.0 for a complete code, slightly less if incomplete.
     #[cfg(test)]
     pub fn kraft_sum(&self) -> f64 {
-        self.lens.iter().map(|&l| 2f64.powi(-(l as i32))).sum()
+        self.lens.iter().map(|&l| 2f64.powi(-i32::from(l))).sum()
     }
 
     /// True if no codeword is a prefix of another.
@@ -202,7 +202,7 @@ mod tests {
                 let (code, len) = book.code(i);
                 // codeword, then a tail of alternating bits, MSB-first into bytes.
                 let mut bitsv: Vec<u8> = (0..len).rev().map(|b| ((code >> b) & 1) as u8).collect();
-                bitsv.extend((0..23).map(|k| (k % 3 == 0) as u8));
+                bitsv.extend((0..23).map(|k| u8::from(k % 3 == 0)));
                 let mut bytes = vec![0u8; bitsv.len().div_ceil(8) + 1];
                 for (k, &b) in bitsv.iter().enumerate() {
                     bytes[k / 8] |= b << (7 - k % 8);

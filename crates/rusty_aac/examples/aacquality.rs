@@ -101,7 +101,7 @@ fn main() -> ExitCode {
         println!("{}", "-".repeat(80));
         for sig in corpus::corpus() {
             let planes = sig.planes();
-            let refs: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
+            let refs: Vec<&[f32]> = planes.iter().map(std::vec::Vec::as_slice).collect();
             let s = AacSignals::analyze(&refs, sig.sample_rate);
             println!(
                 "{:<20} {:>9.2} {:>9.3} {:>9.2} {:>10.1} {:>9.0} {:>8.0}k",
@@ -149,8 +149,8 @@ fn main() -> ExitCode {
                 } else if dk > 0.01 {
                     kbd_losses += 1;
                 }
-                sum_kbd += dk as f64;
-                sum_auto += da as f64;
+                sum_kbd += f64::from(dk);
+                sum_auto += f64::from(da);
                 cells += 1;
                 println!(
                     "{:<20} {:>6}k {:>11.2} {:>+11.2} {:>+11.2}",
@@ -162,7 +162,7 @@ fn main() -> ExitCode {
                 );
             }
         }
-        let n = cells.max(1) as f64;
+        let n = f64::from(cells.max(1));
         println!(
             "\nmean Δaudible%:  kbd {:+.3}   auto {:+.3}",
             sum_kbd / n,
@@ -212,8 +212,8 @@ fn main() -> ExitCode {
             }),
         ];
         print!("{:<20} {:>7} {:>10}", "clip", "target", "base aud%");
-        for (n, _) in arms.iter() {
-            print!(" {:>12}", n);
+        for (n, _) in &arms {
+            print!(" {n:>12}");
         }
         println!();
         println!("{}", "-".repeat(102));
@@ -235,7 +235,7 @@ fn main() -> ExitCode {
                     let p = ladder::point_with(&sig, mk(b));
                     d[i] = p.nmr.pct_audible - base.nmr.pct_audible;
                     worst[i] = worst[i].max(d[i]);
-                    sums[i] += d[i] as f64;
+                    sums[i] += f64::from(d[i]);
                 }
                 cells += 1;
                 print!(
@@ -244,13 +244,13 @@ fn main() -> ExitCode {
                     b / 1000,
                     base.nmr.pct_audible
                 );
-                for v in d.iter() {
-                    print!(" {:>+12.2}", v);
+                for v in &d {
+                    print!(" {v:>+12.2}");
                 }
                 println!();
             }
         }
-        let n = cells.max(1) as f64;
+        let n = f64::from(cells.max(1));
         println!("\n{:<16} {:>12} {:>12}", "arm", "mean Δ", "WORST Δ");
         for (i, (name, _)) in arms.iter().enumerate() {
             println!(

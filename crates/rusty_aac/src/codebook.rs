@@ -130,13 +130,13 @@ pub fn decode_tuple(
 pub fn apply_index(cb: &Codebook, idx: u16, r: &mut BitReader, out: &mut [i32]) -> Result<()> {
     let dim = cb.dim as usize;
     let modulo = if cb.unsigned {
-        cb.lav as u32 + 1
+        u32::from(cb.lav) + 1
     } else {
-        2 * cb.lav as u32 + 1
+        2 * u32::from(cb.lav) + 1
     };
 
     // Unpack the Huffman index into `dim` base-`modulo` digits (MSB first).
-    let mut v = idx as u32;
+    let mut v = u32::from(idx);
     let mut digits = [0u32; 4];
     for d in (0..dim).rev() {
         digits[d] = v % modulo;
@@ -148,7 +148,7 @@ pub fn apply_index(cb: &Codebook, idx: u16, r: &mut BitReader, out: &mut [i32]) 
         out[i] = if cb.unsigned {
             digits[i] as i32
         } else {
-            digits[i] as i32 - cb.lav as i32
+            digits[i] as i32 - i32::from(cb.lav)
         };
     }
 
@@ -163,11 +163,11 @@ pub fn tuple_table(cbn: u8) -> &'static [[i8; 4]] {
     T[cbn as usize].get_or_init(|| {
         let cb = &CODEBOOKS[cbn as usize];
         let modulo = if cb.unsigned {
-            cb.lav as u32 + 1
+            u32::from(cb.lav) + 1
         } else {
-            2 * cb.lav as u32 + 1
+            2 * u32::from(cb.lav) + 1
         };
-        let n = modulo.pow(cb.dim as u32);
+        let n = modulo.pow(u32::from(cb.dim));
         (0..n)
             .map(|idx| {
                 let (mut v, mut t) = (idx, [0i8; 4]);
@@ -177,7 +177,7 @@ pub fn tuple_table(cbn: u8) -> &'static [[i8; 4]] {
                     t[d] = if cb.unsigned {
                         digit
                     } else {
-                        digit - cb.lav as i32
+                        digit - i32::from(cb.lav)
                     } as i8;
                 }
                 t
@@ -202,7 +202,7 @@ pub fn finish_tuple(cb: &Codebook, r: &mut BitReader, out: &mut [i32]) -> Result
     // Book 11: any magnitude equal to lav (16) is replaced by an escape value.
     if cb.esc {
         for o in out.iter_mut().take(dim) {
-            if o.unsigned_abs() == cb.lav as u32 {
+            if o.unsigned_abs() == u32::from(cb.lav) {
                 let mag = read_escape(r)?;
                 *o = if *o < 0 { -mag } else { mag };
             }
@@ -246,7 +246,7 @@ mod tests {
                 let mut want = [0i32; 4];
                 apply_index(cb, idx as u16, &mut r, &mut want).unwrap();
                 for d in 0..cb.dim as usize {
-                    assert_eq!(t[d] as i32, want[d], "book {cbn} idx {idx}");
+                    assert_eq!(i32::from(t[d]), want[d], "book {cbn} idx {idx}");
                 }
             }
         }

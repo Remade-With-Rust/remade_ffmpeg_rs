@@ -43,9 +43,11 @@ fn plans() -> &'static Plans {
             fft64: Radix2Fft::new(64, 1.0),
             dct64: pow2_dct4(64).expect("64 is a power of two"),
             ana_pre: (0..64)
-                .map(|n| tw(PI * (2.0 * n as f64 - 0.5) / 128.0, 1.0))
+                .map(|n| tw(PI * (2.0 * f64::from(n) - 0.5) / 128.0, 1.0))
                 .collect(),
-            ana_post: (0..32).map(|k| tw(-PI * k as f64 / 128.0, 2.0)).collect(),
+            ana_post: (0..32)
+                .map(|k| tw(-PI * f64::from(k) / 128.0, 2.0))
+                .collect(),
             ana_win: (0..320).map(|q| QMF_WINDOW[2 * (319 - q)]).collect(),
             ds_win: (0..320).map(|m| QMF_WINDOW[2 * m]).collect(),
             #[cfg(all(feature = "simd", target_arch = "x86_64"))]
@@ -128,7 +130,10 @@ fn ana_fold_scalar(p: &Plans, seg: &[f32], a: &mut [Cpx; 64]) {
 unsafe fn ana_fold_avx(p: &Plans, seg: &[f32], a: &mut [Cpx; 64]) {
     use std::arch::x86_64::*;
     let (s, w) = (seg.as_ptr(), p.ana_win.as_ptr());
-    let (pre, ap) = (p.ana_pre.as_ptr() as *const f32, a.as_mut_ptr() as *mut f32);
+    let (pre, ap) = (
+        p.ana_pre.as_ptr().cast::<f32>(),
+        a.as_mut_ptr().cast::<f32>(),
+    );
     let rev = p.fft64.bitrev();
     let tz = |k: usize| _mm256_mul_ps(_mm256_loadu_ps(s.add(k)), _mm256_loadu_ps(w.add(k)));
     let mut m = 0;
@@ -150,7 +155,7 @@ unsafe fn ana_fold_avx(p: &Plans, seg: &[f32], a: &mut [Cpx; 64]) {
         for (h, e) in [(0, e0), (4, e1)] {
             let lo = _mm_castps_pd(_mm256_castps256_ps128(e));
             let hi = _mm_castps_pd(_mm256_extractf128_ps::<1>(e));
-            let slot = |q: usize| ap.add(2 * rev[n0 + h + q] as usize) as *mut f64;
+            let slot = |q: usize| ap.add(2 * rev[n0 + h + q] as usize).cast::<f64>();
             _mm_storel_pd(slot(0), lo);
             _mm_storeh_pd(slot(1), lo);
             _mm_storel_pd(slot(2), hi);
@@ -195,7 +200,7 @@ fn split_slot_scalar(slot: &[Cpx], xr: &mut [f32; 64], xi: &mut [f32; 64]) {
 unsafe fn split_slot_avx(slot: &[Cpx], xr: &mut [f32; 64], xi: &mut [f32; 64]) {
     use std::arch::x86_64::*;
     let (src, rp, ip) = (
-        slot.as_ptr() as *const f32,
+        slot.as_ptr().cast::<f32>(),
         xr.as_mut_ptr(),
         xi.as_mut_ptr(),
     );
@@ -468,9 +473,9 @@ pub(super) struct QmfSynthState {
 }
 
 impl QmfSynthState {
-    pub(super) fn new() -> QmfSynthState {
+    pub(super) fn new() -> Self {
         let len = 1280 + 32 * 128;
-        QmfSynthState {
+        Self {
             buf: vec![0.0; len],
             off: len - 1280,
         }
@@ -571,13 +576,13 @@ mod tests {
         let mut buf = vec![0f64; 288 + ns];
         buf[..288].copy_from_slice(hist);
         for (b, &s) in buf[288..].iter_mut().zip(&input[..ns]) {
-            *b = s as f64 * 32768.0;
+            *b = f64::from(s) * 32768.0;
         }
         for (l, slot) in w.iter_mut().enumerate().take(2 * nts) {
             let end = 320 + 32 * l;
             let mut u = [0f64; 64];
             for n in 0..320 {
-                u[n & 63] += buf[end - 1 - n] * QMF_WINDOW[2 * n] as f64;
+                u[n & 63] += buf[end - 1 - n] * f64::from(QMF_WINDOW[2 * n]);
             }
             for (k, out) in slot.iter_mut().enumerate() {
                 let (mut re, mut im) = (0f64, 0f64);
@@ -607,7 +612,7 @@ mod tests {
                     } else {
                         PI * (k as f64 + 0.5) * (2.0 * n as f64 - 255.0) / 128.0
                     };
-                    acc += (x[0] as f64 * a.cos() - x[1] as f64 * a.sin()) / 64.0;
+                    acc += (f64::from(x[0]) * a.cos() - f64::from(x[1]) * a.sin()) / 64.0;
                 }
                 v[n] = acc;
             }
@@ -615,9 +620,9 @@ mod tests {
             for (j, o) in out[l * bands..(l + 1) * bands].iter_mut().enumerate() {
                 let mut acc = 0f64;
                 for i in 0..5 {
-                    acc += v[2 * vlen * i + j] * QMF_WINDOW[step * (2 * bands * i + j)] as f64;
+                    acc += v[2 * vlen * i + j] * f64::from(QMF_WINDOW[step * (2 * bands * i + j)]);
                     acc += v[2 * vlen * i + 3 * bands + j]
-                        * QMF_WINDOW[step * (2 * bands * i + bands + j)] as f64;
+                        * f64::from(QMF_WINDOW[step * (2 * bands * i + bands + j)]);
                 }
                 *o = (acc / 32768.0) as f32;
             }
@@ -690,7 +695,7 @@ mod tests {
         let f = 1000.0 / 22050.0;
         for frame in 0..6 {
             let input: Vec<f32> = (0..1024)
-                .map(|i| (0.5 * (2.0 * PI * f * (frame * 1024 + i) as f64).sin()) as f32)
+                .map(|i| (0.5 * (2.0 * PI * f * f64::from(frame * 1024 + i)).sin()) as f32)
                 .collect();
             qmf_analysis(&input, &mut hist, &mut w, 16);
             let mut xs = vec![[[0f32; 2]; 64]; 38];
@@ -708,15 +713,15 @@ mod tests {
         assert!((peak - 0.5).abs() < 0.01, "peak {peak}");
         // The downsampled bank reconstructs the input (delayed) near-perfectly.
         let input: Vec<f32> = (0..6 * 1024)
-            .map(|i| (0.5 * (2.0 * PI * f * i as f64).sin()) as f32)
+            .map(|i| (0.5 * (2.0 * PI * f * f64::from(i)).sin()) as f32)
             .collect();
         let best = (0..600)
             .map(|d| {
                 let (mut s, mut e) = (0f64, 0f64);
                 for t in 2048..6 * 1024 {
-                    let r = input[t - d] as f64;
+                    let r = f64::from(input[t - d]);
                     s += r * r;
-                    e += (same[t] as f64 - r).powi(2);
+                    e += (f64::from(same[t]) - r).powi(2);
                 }
                 10.0 * (s / e).log10()
             })

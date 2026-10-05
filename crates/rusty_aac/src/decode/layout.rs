@@ -146,7 +146,7 @@ fn height_extension(c: &[u8], n: usize) -> Option<Vec<u8>> {
         return None;
     }
     let mut crc = 0xFFu8;
-    for &b in &c[..1 + hbytes] {
+    for &b in &c[..=hbytes] {
         crc ^= b;
         for _ in 0..8 {
             crc = if crc & 0x80 != 0 {
@@ -492,8 +492,8 @@ pub struct OutputConfig {
 impl OutputConfig {
     /// `ff_aac_output_configure`: allocate elements and fix the output order.
     /// `ps` = an SCE carries Parametric Stereo (two outputs per mono element).
-    pub fn configure(mut map: Vec<Tag>, ps: bool) -> OutputConfig {
-        let mut oc = OutputConfig::default();
+    pub fn configure(mut map: Vec<Tag>, ps: bool) -> Self {
+        let mut oc = Self::default();
         let mut id_map = [[0u8; 16]; 4];
         let mut counts = [0u8; 4];
         for r in &map {

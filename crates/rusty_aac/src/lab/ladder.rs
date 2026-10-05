@@ -36,7 +36,7 @@ impl Point {
     /// changes this materially has changed the operating point, and its quality
     /// delta is not a like-for-like comparison.
     pub fn rate_error(&self) -> f64 {
-        self.measured_bps / self.target_bps.max(1) as f64 - 1.0
+        self.measured_bps / f64::from(self.target_bps.max(1)) - 1.0
     }
 }
 
@@ -113,7 +113,7 @@ pub fn point_with(sig: &Signal, config: AacEncoderConfig) -> Point {
     let bitrate = config.bitrate_bps;
     let adts = encode_adts_with(sig, config);
     let decoded = decode_mono(&adts);
-    let secs = sig.frames() as f64 / sig.sample_rate as f64;
+    let secs = sig.frames() as f64 / f64::from(sig.sample_rate);
     let measured_bps = (adts.len() * 8) as f64 / secs.max(1e-9);
     let nmr = track_nmr(&sig.mono(), &decoded, sig.sample_rate);
     Point {
@@ -246,7 +246,7 @@ mod tests {
             for &b in &DEFAULT_BITRATES {
                 let p = point(&sig, b);
                 assert!(
-                    p.measured_bps <= b as f64 * 1.15,
+                    p.measured_bps <= f64::from(b) * 1.15,
                     "{} @ {}k: overshot to {:.0} bps",
                     sig.name(),
                     b / 1000,
