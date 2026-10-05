@@ -15,6 +15,13 @@
 //! a non-zero lag must be explainable (an edit list trimming priming samples),
 //! never silently absorbed.
 //!
+//! `--gate` turns the census into a CI gate that does not depend on the installed
+//! FFmpeg's DECODER (FFmpeg is still used to demux): it exits 1 unless every
+//! non-USAC stream decodes, and every stream with an ISO/FATE reference `.s16` is
+//! within 2 LSB of it — the tolerance FFmpeg's own FATE suite uses for these
+//! streams (`CMP = oneoff`, fuzz 2). Exemptions are listed in `GATE_EXEMPT`, each
+//! with its reason.
+//!
 //! `--gen` first synthesises the cells the FATE corpus does not cover (every
 //! sampling rate, every channel configuration, each LC tool switched on and off)
 //! with FFmpeg's encoder into `<corpus_dir>/gen/`.
@@ -550,8 +557,39 @@ fn generate(dir: &Path) {
     }
 }
 
-/// One stream's census line(s) and its category ('E'/'N'/'F', ' ' = skipped).
-fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
+/// Streams whose FATE reference cannot be compared sample for sample, with why.
+const GATE_EXEMPT: &[(&str, &str)] = &[(
+    "latm_stereo_to_51.ts",
+    "switches from stereo to 5.1 mid-stream; the reference holds only the 5.1 segment",
+)];
+
+/// The `--gate` verdict for one stream: `None` passes, `Some(reason)` fails.
+fn gate_verdict(name: &str, status: &str, va: &str, vb: &str) -> Option<String> {
+    // USAC (xHE-AAC) is a separate codec this crate refuses by design.
+    let usac = name.starts_with("usac/") || status.contains("USAC (xHE-AAC)");
+    if usac || GATE_EXEMPT.iter().any(|(n, _)| *n == name) {
+        return None;
+    }
+    if status.starts_with("ERR") || va.starts_with("ERR") {
+        return Some(format!("decode error: {va}"));
+    }
+    if vb.trim() == "-" {
+        return None;
+    }
+    let max = vb
+        .split("max=")
+        .nth(1)
+        .and_then(|t| t.split_whitespace().next())
+        .and_then(|t| t.parse::<i32>().ok());
+    match max {
+        Some(m) if m <= 2 => None,
+        _ => Some(format!("vs ISO reference: {}", vb.trim())),
+    }
+}
+
+/// One stream's census line(s), its category ('E'/'N'/'F', ' ' = skipped) and
+/// its `--gate` failure, if any.
+fn process(f: &Path, name: &str, verbose: bool) -> (String, char, Option<String>) {
     let mut out = String::new();
     macro_rules! outln {
         ($($t:tt)*) => {{ out.push_str(&format!($($t)*)); out.push('\n'); }};
@@ -561,7 +599,8 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
         Ok(p) => p,
         Err(e) => {
             outln!("{name:<36} PROBE-ERR {e}");
-            return (out, ' ');
+            let gate = (!name.starts_with("usac/")).then(|| format!("probe error: {e}"));
+            return (out, ' ', gate);
         }
     };
     let asc = extradata(&fs_).unwrap_or_default();
@@ -569,7 +608,8 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
         Ok(p) => p,
         Err(e) => {
             outln!("{name:<36} {:<11} DEMUX-ERR {e}", p.profile);
-            return (out, 'F');
+            let gate = (!name.starts_with("usac/")).then(|| format!("demux error: {e}"));
+            return (out, 'F', gate);
         }
     };
     let ours = decode_ours(&p, &asc, &pkts);
@@ -748,7 +788,8 @@ fn process(f: &Path, name: &str, verbose: bool) -> (String, char) {
             }
         }
     }
-    (out, cat)
+    let gate = gate_verdict(name, &status, &va, &vb);
+    (out, cat, gate)
 }
 
 fn main() {
@@ -759,6 +800,7 @@ fn main() {
     };
     let dir = Path::new(dir);
     let verbose = args.iter().any(|a| a == "-v");
+    let gate = args.iter().any(|a| a == "--gate");
     let filter = args
         .windows(2)
         .find(|w| w[0] == "--filter")
@@ -805,8 +847,18 @@ fn main() {
         }
     });
     let (mut exact, mut near, mut fail, mut total, mut known) = (0, 0, 0, 0, 0);
-    for (text, cat) in results.into_inner().unwrap().into_iter().flatten() {
+    let mut gate_fails = Vec::new();
+    for (i, (text, cat, g)) in results
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.map(|r| (i, r)))
+    {
         print!("{text}");
+        if let Some(reason) = g {
+            gate_fails.push(format!("{}: {reason}", names[i].1));
+        }
         match cat {
             'E' => exact += 1,
             'K' => known += 1,
@@ -819,5 +871,20 @@ fn main() {
     println!("\n# {total} streams: {exact} EXACT, {known} KNOWN (exact under a documented FFmpeg deviation), {near} NEAR, {fail} FAIL/ERR");
     for k in KNOWN {
         println!("#   KNOWN {}: {}", k.stream, k.reason);
+    }
+    if gate {
+        for (n, why) in GATE_EXEMPT {
+            println!("#   GATE-EXEMPT {n}: {why}");
+        }
+        if gate_fails.is_empty() {
+            println!(
+                "# gate: PASS (every non-USAC stream decodes; every ISO reference within 2 LSB)"
+            );
+        } else {
+            for f in &gate_fails {
+                println!("# gate FAIL {f}");
+            }
+            std::process::exit(1);
+        }
     }
 }

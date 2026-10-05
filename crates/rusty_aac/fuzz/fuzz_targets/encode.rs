@@ -1,7 +1,8 @@
 //! The encoder on hostile PCM and configuration: any f32 bit pattern (NaN, Inf,
 //! subnormals, huge), any channel count, standard and non-standard rates, every
 //! encoder switch, interleaved or planar, in fuzzer-chosen chunks. Must never
-//! panic; every packet must be drainable after `finish`.
+//! panic; every packet must be drainable after `finish` and fit the decoder
+//! input buffer.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use rusty_aac::{AacEncoder, AacEncoderConfig, WindowShape};
@@ -48,5 +49,9 @@ fuzz_target!(|data: &[u8]| {
         };
     }
     enc.finish();
-    while enc.next_packet().is_ok() {}
+    // Every block fits the decoder input buffer: 6144 bits per channel.
+    let limit = 768 * usize::from(channels.clamp(1, 6));
+    while let Ok(p) = enc.next_packet() {
+        assert!(p.data.len() <= limit, "{} B block for {channels} ch", p.data.len());
+    }
 });

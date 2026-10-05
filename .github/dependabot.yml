@@ -1,5 +1,6 @@
 # Dependency-update PRs, merged by a human after review (use-protection-please
-# H-14). Scoped to the dependencies of the audited MP3 crates: rusty_mp3 has no
+# H-14). Scoped to the dependencies of the audited MP3 and AAC crates:
+# rusty_mp3 and rusty_aac have no
 # runtime dependencies (its only dev-dependency is our allocator API); the
 # adapter adds thiserror through rff-core. Widen
 # `allow` as further crates are audited.
