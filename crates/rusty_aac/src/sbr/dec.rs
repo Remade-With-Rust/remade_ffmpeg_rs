@@ -240,6 +240,9 @@ pub(crate) struct SbrChannelState {
     patch_start_subband: [usize; 6],
     data: [SbrChannel; 2],
     ps: Option<Box<super::ps::PsState>>,
+    /// Processing scratch kept across frames: every read in a call hits a value
+    /// written earlier in that call, so it never needs re-zeroing.
+    wk: Option<Box<Work>>,
 }
 
 impl SbrChannelState {
@@ -275,6 +278,7 @@ impl SbrChannelState {
             patch_start_subband: [0; 6],
             data: [SbrChannel::new(), SbrChannel::new()],
             ps: None,
+            wk: None,
         };
         s.turnoff();
         s
@@ -1120,6 +1124,7 @@ impl SbrChannelState {
 }
 
 /// Scratch shared by one element's processing.
+#[derive(Clone)]
 struct Work {
     x_low: Vec<[Cpx; 40]>,
     x_high: Vec<[Cpx; 40]>,
@@ -1618,7 +1623,7 @@ pub(crate) fn apply(dec: &mut Decoder, el: &mut Element, ty: u8, n: usize) {
         sbr.dequant(ty);
         sbr.ready_for_dequant = false;
     }
-    let mut wk = Work::new();
+    let mut wk = sbr.wk.take().unwrap_or_else(|| Box::new(Work::new()));
     let mut xs: Vec<Vec<[Cpx; 64]>> = Vec::with_capacity(2);
     for ch in 0..nch {
         let yp = sbr.data[ch].ypos;
@@ -1646,6 +1651,7 @@ pub(crate) fn apply(dec: &mut Decoder, el: &mut Element, ty: u8, n: usize) {
         xs.push(sbr.x_gen(&wk, ch, nts));
         drop(prof_hf);
     }
+    sbr.wk = Some(wk);
     if ps_on {
         let top = sbr.kx[1] + sbr.m[1];
         let mut x1 = xs[0].clone();
