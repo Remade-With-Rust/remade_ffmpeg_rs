@@ -586,7 +586,15 @@ impl Decoder {
         if common_window {
             parse_ics_info(r, &sx, &mut el.ch[0].ics)?;
             let kbd1 = el.ch[1].ics.info.window_shape_kbd;
+            // Channel 1 takes channel 0's ICS, its grouping copied into the
+            // Vec channel 1 already owns (a plain clone allocated a new one
+            // and freed the old every CPE frame).
+            let g0 = std::mem::take(&mut el.ch[0].ics.info.window_group_length);
+            let mut g1 = std::mem::take(&mut el.ch[1].ics.info.window_group_length);
+            g1.clone_from(&g0);
             el.ch[1].ics = el.ch[0].ics.clone();
+            el.ch[0].ics.info.window_group_length = g0;
+            el.ch[1].ics.info.window_group_length = g1;
             el.ch[1].ics.prev_kbd = kbd1;
             if el.ch[1].ics.predictor_present && sx.aot != aot::AAC_MAIN {
                 el.ch[1].ics.ltp.present = r.read_bool()?;

@@ -156,12 +156,17 @@ pub fn parse_ics_info(r: &mut BitReader, sx: &Syntax, ics: &mut Ics) -> Result<(
         ics.prev_kbd = ics.info.window_shape_kbd;
         ics.info.window_shape_kbd = r.read_bool()?;
     }
+    // The grouping is rebuilt in the Vec the ICS already owns (capacity <= 8
+    // after the first short block): a fresh `vec!` per channel per frame was
+    // an allocation plus a free.
     ics.info.num_window_groups = 1;
-    ics.info.window_group_length = vec![1];
+    let groups = &mut ics.info.window_group_length;
+    groups.clear();
+    groups.push(1);
     ics.predictor_present = false;
     if ics.info.window_sequence == WindowSequence::EightShort {
         ics.info.max_sfb = r.read_bits(4)? as u8;
-        let mut groups = vec![1u8];
+        let groups = &mut ics.info.window_group_length;
         for _ in 0..7 {
             if r.read_bool()? {
                 *groups.last_mut().unwrap() += 1;
@@ -169,8 +174,7 @@ pub fn parse_ics_info(r: &mut BitReader, sx: &Syntax, ics: &mut Ics) -> Result<(
                 groups.push(1);
             }
         }
-        ics.info.num_window_groups = groups.len();
-        ics.info.window_group_length = groups;
+        ics.info.num_window_groups = ics.info.window_group_length.len();
         ics.info.num_windows = 8;
         ics.swb = sx.short_swb();
         ics.tns_max_bands = TNS_MAX_SHORT[sx.sf_index as usize];
@@ -420,7 +424,7 @@ pub fn decode_ics(
     if !common_window {
         parse_ics_info(r, sx, ics)?;
     }
-    let info = ics.info.clone();
+    let info = &ics.info;
     let max_sfb = info.max_sfb as usize;
     let short = info.window_sequence == WindowSequence::EightShort;
 
