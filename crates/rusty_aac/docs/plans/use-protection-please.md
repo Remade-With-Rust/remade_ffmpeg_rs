@@ -48,7 +48,7 @@ Evidence; excluded from the totals).
 |---|---|---|---|---|
 | H-03 | Toolchain pinned (`rust-toolchain.toml`) | Completed | repo-root `rust-toolchain.toml`: `channel = "1.95.0"`, components rustfmt + clippy; MSRV 1.85 verified with `cargo +1.85.0 build -p rusty_aac --lib --locked` (2026-10-04) and in CI (`msrv` job) | |
 | H-04 | Committed `.cargo/config.toml` hardening defaults | Completed | repo `.cargo/config.toml` (shared with rusty_mp3, verified there): Linux targets force frame pointers + `-z relro -z now` + `-z noexecstack`; Windows MSVC linker defaults ASLR / high-entropy VA / DEP | |
-| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Incomplete | no `overflow-checks` in the release profile. Compensating controls: every fuzz target builds with `overflow-checks = true` + debug assertions (the campaign found and fixed one overflow, c647ee9); narrowing casts lint-enforced in all parsers (H-17). Same decision as rusty_mp3 — **proposed waiver** below, pending the Architect | |
+| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Incomplete | no `overflow-checks` in the release profile. Compensating controls: every fuzz target builds with `overflow-checks = true` + debug assertions (the campaign found and fixed one overflow, c647ee9); narrowing casts lint-enforced in all parsers (H-17). Same decision as rusty_mp3 — **waived** (see Waivers; Tim Almond, 2026-10-04, expires 2027-04-05) | waiver expires 2027-04-05 |
 | H-06 | Security toolchain available to CI and developers | Completed | `.github/workflows/aac-hardening.yml` installs the toolchain pinned by version (cargo-audit 0.22.2, cargo-deny 0.19.9, cargo-vet 0.10.2, cargo-cyclonedx 0.5.9, cargo-fuzz 0.13.2) via `taiki-e/install-action`; every action pinned to a commit SHA; read-only token | |
 
 ### Phase 2 — Supply chain
@@ -95,7 +95,7 @@ Evidence; excluded from the totals).
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
 | H-26 | ★ Fuzz target per public parser, decoder, or message handler | Completed | `fuzz/`: `decode_adts` (AacDecoder, ADTS or raw packets), `decode_config` (any AudioSpecificConfig + access units: PCE, SBR/PS, ER LD/ELD, 960, Main, LTP), `latm` (LatmDecoder + LOAS parser), `parsers` (ASC / StreamConfig / SBR config / ADTS), `encode` (both push entry points, every switch, block-size bound). 34 seeds (`fuzz/seed.py`) from ISO/IEC 14496-26, our fixtures, FFmpeg-muxed LOAS and real music. Campaigns 2026-10-04 found 3 panics (fixed) | |
-| H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | campaigns 2026-10-04: first (4 + 10 min, 5 targets) found the three panics, all fixed with regression tests; daily scheduled fuzzing in `.github/workflows/aac-hardening.yml` carries the corpus between runs. 30 days cannot exist on day one — **proposed waiver** below | |
+| H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | campaigns 2026-10-04: first (4 + 10 min, 5 targets) found the three panics, all fixed with regression tests; daily scheduled fuzzing in `.github/workflows/aac-hardening.yml` carries the corpus between runs. 30 days cannot exist on day one — **waived** until 2026-11-05 (Tim Almond, 2026-10-04) | waiver expires 2026-11-05 |
 | H-28 | Property tests cover the documented invariants | Completed | `tests/properties.rs`, dependency-free seeded properties (the vetted dev closure stays 14/14): P1 decoder never panics (bytes, mutated frames, random configs), P2 ADTS header round trip, P3 ASC round trip, P4 encode→decode preserves rate/channels/duration (1–6 ch), P5 push-shape invariance, P6 hostile PCM within the decoder buffer (found ee55ad9, poison-checked), P7 LOAS ≡ raw | |
 | H-29 | Mutation and/or differential testing on critical modules | Completed | differential in CI: the `conformance` job fetches the FATE `aac/` suite and runs `aacconf --gate` — every non-USAC stream decodes, every ISO reference `.s16` within 2 LSB (FFmpeg's own FATE tolerance); local census vs FFmpeg 8.1.2: 81 EXACT + 2 documented deviations; poison-checked. Property P7 is a LOAS-vs-raw differential; the adapter has an rusty_aac-vs-adapter differential | |
 
@@ -134,7 +134,7 @@ Evidence; excluded from the totals).
 | H-38 | Releases signed, attested, and changelogged for security | Incomplete | release tags are SSH-signed (`tag.gpgsign`); commits are not, and no allowed-signers file publishes the key, so `git tag -v` cannot verify; `CHANGELOG.md` lists security changes first | |
 | H-39 | ★ `SECURITY.md` with a coordinated disclosure process | Completed | repo-root `SECURITY.md`: private GitHub advisory channel, 5-business-day acknowledgement, agreed disclosure timeline, scope (decoders in scope); linked from the README | |
 | H-40 | Advisory monitoring and scheduled re-audit | Completed | owner: Tim Almond; quarterly re-audit (next 2027-01-04, also in the header); advisory monitoring = daily scheduled `cargo audit` on the crate closure in `.github/workflows/aac-hardening.yml`, plus Dependabot | |
-| H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Incomplete | register and proposed waivers below — awaiting the Architect's acceptance | |
+| H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Completed | register below: every risk has an owner, an acceptance (Tim Almond, 2026-10-04) and a review date; both waivers are time-bounded | |
 
 ### Phase 12 — Compliance controls
 
@@ -167,8 +167,8 @@ project lead has committed to.
 
 | # | Gates | Work | Owner | Target | Notes |
 |---|---|---|---|---|---|
-| 1 | H-27 | Daily CI fuzzing accrues 30 days; retire the waiver | | | automatic once the job has run 30 days clean |
-| 2 | H-05 | Revisit overflow checks (cheaper per-module checking, or accept the cost) | | | as rusty_mp3 |
+| 1 | H-27 | Daily CI fuzzing accrues 30 days; retire the waiver | Tim Almond | 2026-11-05 | automatic once the job has run 30 days clean |
+| 2 | H-05 | Revisit overflow checks (cheaper per-module checking, or accept the cost) | Tim Almond | 2027-04-05 | as rusty_mp3 |
 | 3 | H-38 | Sign release commits; publish an allowed-signers file so `git tag -v` verifies | | | needs a signing key policy (shared with rusty_mp3) |
 | 4 | H-30 | Kani harnesses for the SIMD kernels' bounds | | | not v1.0-blocking |
 
@@ -180,10 +180,10 @@ Every open risk carries an owner, an acceptance, and a review date (H-41).
 
 | ID | Risk | Likelihood | Impact | Mitigation status | Accepted by | Review date |
 |---|---|---|---|---|---|---|
-| R-001 | A panic on a hostile stream not yet reached by fuzzing (DoS of the host) | Low | Medium | coverage-guided campaigns over 5 targets found and fixed 3 panics; every input-path `unwrap` justified (R3); continuous fuzzing accruing (H-27) | | 2027-01-04 |
-| R-002 | Arithmetic wrap in release builds (overflow checks off) yields wrong PCM rather than a panic | Low | Low | overflow-checked fuzzing; lint-enforced cast discipline in every parser (H-17) | | 2027-01-04 |
-| R-003 | SIMD kernel out-of-bounds access | Very low | High | dispatch-site bounds, fixed-size operands, oracle tests on x86-64 + AArch64 (qemu); no Kani proof (H-30) | | 2027-01-04 |
-| R-004 | The encoder buffers the whole stream until `finish` — memory grows with the PCM pushed | Medium (by design) | Medium | documented in the threat model; callers encoding unbounded live input must chunk into separate encoders | | 2027-01-04 |
+| R-001 | A panic on a hostile stream not yet reached by fuzzing (DoS of the host) | Low | Medium | coverage-guided campaigns over 5 targets found and fixed 3 panics; every input-path `unwrap` justified (R3); continuous fuzzing accruing (H-27) | Tim Almond, 2026-10-04 | 2027-01-04 |
+| R-002 | Arithmetic wrap in release builds (overflow checks off) yields wrong PCM rather than a panic | Low | Low | overflow-checked fuzzing; lint-enforced cast discipline in every parser (H-17) | Tim Almond, 2026-10-04 | 2027-01-04 |
+| R-003 | SIMD kernel out-of-bounds access | Very low | High | dispatch-site bounds, fixed-size operands, oracle tests on x86-64 + AArch64 (qemu); no Kani proof (H-30) | Tim Almond, 2026-10-04 | 2027-01-04 |
+| R-004 | The encoder buffers the whole stream until `finish` — memory grows with the PCM pushed | Medium (by design) | Medium | documented in the threat model; callers encoding unbounded live input must chunk into separate encoders | Tim Almond, 2026-10-04 | 2027-01-04 |
 
 ---
 
@@ -193,8 +193,8 @@ Time-bounded only. An expired waiver is an `Incomplete` gate, not a `Completed` 
 
 | Gate | Reason | Granted by | Expires |
 |---|---|---|---|
-| H-05 | *(proposed)* Release overflow checks off, as in rusty_mp3, for the decode/encode cost. Compensating controls: overflow-checked fuzzing, lint-enforced cast discipline in every parser. | | |
-| H-27 | *(proposed)* 30 days of continuous fuzzing cannot exist on day one. Daily scheduled fuzzing in CI accrues it; 0 open crashers at grant. | | |
+| H-05 | Release overflow checks off, as in rusty_mp3, for the decode/encode cost. Compensating controls: overflow-checked fuzzing, lint-enforced cast discipline in every parser. | Tim Almond, 2026-10-04 | 2027-04-05 |
+| H-27 | 30 days of continuous fuzzing cannot exist on day one. Daily scheduled fuzzing in CI accrues it; 0 open crashers at grant. | Tim Almond, 2026-10-04 | 2026-11-05 |
 
 ---
 

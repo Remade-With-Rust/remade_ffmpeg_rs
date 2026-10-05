@@ -3723,6 +3723,7 @@ mod tests {
     /// back through the REAL decoder — must match exactly (codeword + sign + escape),
     /// and the written bit count must equal `spectral_bits`.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn spectral_encode_roundtrips_through_decoder() {
         for cb_num in 1..=11usize {
             let cb = &CODEBOOKS[cb_num];
@@ -3769,6 +3770,7 @@ mod tests {
     /// Forward MDCT → decoder synthesis (imdct·window·overlap-add) reconstructs the
     /// signal (delayed one frame) — proves the window + overlap + 32768 scaling.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn long_filterbank_reconstructs_via_decoder_math() {
         let win = crate::dsp::sine_window(LONG_N);
         let nblocks = 6usize;
@@ -3814,6 +3816,7 @@ mod tests {
     /// the transition windows) — the decisive check that the short filterbank and
     /// transition windows are exact inverses.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn short_block_sequence_reconstructs_via_decoder_math() {
         use WindowSequence::*;
         let sine_l = crate::dsp::sine_window(LONG_N);
@@ -3930,6 +3933,7 @@ mod tests {
     /// End-to-end: a signal with a sharp attack must actually emit `EightShort`
     /// blocks and still decode cleanly through our decoder.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn transient_encodes_short_and_decodes() {
         let sr = 44100u32;
         let nframes = 5;
@@ -3999,6 +4003,7 @@ mod tests {
     /// Stereo with L = R (fully correlated) must pick M/S and reconstruct the two
     /// channels identically — the CPE + mid/side round-trip.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn stereo_ms_roundtrips_mono_content() {
         let sr = 44100u32;
         let n = 8192usize;
@@ -4047,6 +4052,7 @@ mod tests {
     /// the raw AUs directly (no container/engine) and check per-channel amplitude
     /// (≈0.283 RMS for a 0.4-amp sine) and frame count (~input + a little priming).
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn stereo_direct_decode_amplitude() {
         let sr = 44100u32;
         let n = sr as usize; // 1 s
@@ -4349,6 +4355,7 @@ mod tests {
     /// The whole-pipeline gate: encode a 440 Hz tone, decode through the real
     /// decoder, and confirm a recognizable 440 Hz tone with preserved energy.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn encodes_and_decodes_recognizable_tone() {
         let sr = 44100u32;
         let n = 44100usize; // 1 s
@@ -4395,6 +4402,7 @@ mod tests {
     /// The rate loop must keep a dense signal within (roughly) the target bitrate
     /// and still produce decodable audio.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn rate_loop_respects_bitrate() {
         let sr = 44100u32;
         let secs = 2usize;
@@ -4660,6 +4668,7 @@ mod rung0 {
     /// The whole encoded stream is byte-identical under the default config and an
     /// explicit `Sine` — i.e. the default really is the neutral arm.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn default_config_is_the_sine_arm() {
         let pcm: Vec<f32> = (0..8 * FRAME_LEN)
             .map(|i| {
@@ -4729,6 +4738,7 @@ mod rung0 {
     /// Encode then decode under each arm. A prev/cur shape mismatch would show up
     /// here as gross reconstruction error, not a subtle quality delta.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn every_arm_round_trips() {
         let sr = 44100u32;
         let n = 12 * FRAME_LEN;
@@ -4899,6 +4909,7 @@ mod rung123 {
     /// **Every arm's OFF state is byte-identical with the shipped encoder.**
     /// This is law 7's neutral end, proven by `cmp` rather than argued.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn every_arm_off_is_byte_identical() {
         let sr = 44100u32;
         let sigs = [transient_signal(sr, 10), tonal_signal(sr, 10)];
@@ -4936,6 +4947,7 @@ mod rung123 {
     /// **Arm A1** — short-block psy must change the bitstream on transient
     /// content (where short blocks actually occur) and still decode.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn a1_short_block_psy_changes_and_round_trips() {
         let sr = 44100u32;
         let pcm = transient_signal(sr, 12);
@@ -4997,6 +5009,7 @@ mod rung123 {
     /// **Arm 1a** — end to end, mono and stereo: the arm changes the bitstream on
     /// transient content and the result still decodes to a sane reconstruction.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn a1a_window_grouping_changes_and_round_trips() {
         let sr = 44100u32;
         let pcm = transient_signal(sr, 12);
@@ -5061,6 +5074,7 @@ mod rung123 {
     /// **Arm A2** — end to end: the bitstream changes on tonal content and still
     /// decodes.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn a2_changes_and_round_trips() {
         let sr = 44100u32;
         let pcm = tonal_signal(sr, 10);
@@ -5086,6 +5100,7 @@ mod rung123 {
     /// diverges. So this test demands the TNS arm reconstruct *at least as well*
     /// as the un-filtered arm, not merely "not crash".
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn a3_tns_inverts_exactly() {
         let sr = 44100u32;
         let pcm = transient_signal(sr, 14);
@@ -5156,6 +5171,7 @@ mod rung123 {
     /// **Arm A3** — TNS must actually engage on transient content (otherwise the
     /// round-trip test above passes vacuously).
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn a3_tns_actually_engages() {
         let sr = 44100u32;
         let pcm = transient_signal(sr, 14);
@@ -5246,6 +5262,7 @@ mod multichannel {
     /// Every supported channel count produces a stream our decoder accepts with
     /// the right channel count.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn supported_channel_counts_round_trip() {
         let sr = 44100u32;
         for nch in 1..=6usize {
@@ -5263,6 +5280,7 @@ mod multichannel {
     /// with an SCE too — but so did all six of its elements, which is what made it
     /// non-conformant.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn element_sequence_matches_iso_table() {
         let sr = 44100u32;
         for (nch, want_first) in [(1usize, ID_SCE), (2, ID_CPE), (3, ID_SCE), (6, ID_SCE)] {
@@ -5297,6 +5315,7 @@ mod multichannel {
     /// The decoder's reorder must be the exact inverse of the encoder's plan:
     /// what goes into interleave slot `k` must come back out of slot `k`.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn channel_order_survives_the_round_trip() {
         let sr = 44100u32;
         for nch in [1usize, 2, 3, 5, 6] {
@@ -5377,6 +5396,7 @@ mod rung_a6 {
 
     /// OFF is byte-identical with the shipped encoder.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn a6_off_is_byte_identical() {
         let sr = 44100;
         let pcm = noise_signal(sr, 8);
@@ -5396,6 +5416,7 @@ mod rung_a6 {
     /// scalefactor chain (the classic PNS bug) shows up here as a decode error or
     /// non-finite output, not as a subtle quality shift.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn a6_fires_on_noise_and_round_trips() {
         let sr = 44100;
         let pcm = noise_signal(sr, 10);
@@ -5439,6 +5460,7 @@ mod rung_a6 {
     /// PNS must NOT fire on a pure tone: it is the anti-class, and substituting a
     /// harmonic band with noise is audibly destructive.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn a6_declines_on_tonal_content() {
         let sr = 44100;
         let pcm: Vec<f32> = (0..10 * FRAME_LEN)
@@ -5472,6 +5494,7 @@ mod rung_a6 {
 
     /// PNS and TNS must not both apply to one element (the energy domain differs).
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn a6_yields_to_tns() {
         let sr = 44100;
         let pcm = noise_signal(sr, 10);
@@ -5526,6 +5549,7 @@ mod rung_a7 {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn a7_off_is_byte_identical() {
         let sr = 44100;
         let pcm = correlated_stereo(sr, 8, 0.7);
@@ -5544,6 +5568,7 @@ mod rung_a7 {
     /// Fires on a scaled-copy pair and still decodes. A wrong `is_pos` sign or a
     /// desynchronized intensity accumulator shows up here immediately.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn a7_fires_and_round_trips() {
         let sr = 44100;
         let pcm = correlated_stereo(sr, 10, 0.7);
@@ -5590,6 +5615,7 @@ mod rung_a7 {
     /// Must DECLINE on a decorrelated pair — the anti-class. Collapsing a wide
     /// image to a scaled copy is the failure mode this gate exists to prevent.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn a7_declines_on_wide_stereo() {
         let sr = 44100;
         let n = 8 * FRAME_LEN;

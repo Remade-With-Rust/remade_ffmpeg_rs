@@ -6,7 +6,7 @@ each release, under **Security**. The project follows
 decoder output is stable (gated against the ISO/IEC 14496-26 conformance suite);
 encoder output may change in minor releases when quality improves.
 
-## 1.1.0 — 2026-10-05
+## 1.1.0 — 2026-10-04
 
 A security-hardening and performance release. The crate has passed a full
 hardening audit ([`docs/plans/use-protection-please.md`](docs/plans/use-protection-please.md)).

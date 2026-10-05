@@ -224,6 +224,7 @@ mod tests {
     /// The table decoder must agree with the scan on every codeword of every
     /// spectral and scalefactor book, followed by arbitrary bits.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn lut_matches_scan_on_every_book() {
         let mut books: Vec<&HuffBook> = vec![&crate::tables::SCALEFACTOR_BOOK];
         for cb in 1..=11u8 {

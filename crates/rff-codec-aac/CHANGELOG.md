@@ -4,7 +4,7 @@ All notable changes to this crate. Security-relevant changes are listed first in
 each release, under **Security**. The project follows
 [Semantic Versioning](https://semver.org/).
 
-## 1.1.0 — 2026-10-05
+## 1.1.0 — 2026-10-04
 
 Requires `rusty_aac` 1.1.0, and inherits its security fixes and speed-ups.
 

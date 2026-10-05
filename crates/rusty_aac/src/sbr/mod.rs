@@ -294,6 +294,7 @@ mod tests {
     /// A real AAC-LC stream still round-trips through the new config path — the
     /// HE-AAC work must not disturb the overwhelmingly common case.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn plain_aac_still_decodes_through_the_new_path() {
         use crate::{AacEncoder, AacEncoderConfig};
         let sr = 44100u32;

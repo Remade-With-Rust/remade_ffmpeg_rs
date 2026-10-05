@@ -500,6 +500,7 @@ mod tests {
     /// interleaved PCM (encoder round-trip; the full-pipeline gates live in
     /// `encode`'s tests).
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn adts_stream_decodes_via_stream_decoder() {
         let sr = 44100u32;
         let n = 4096usize;

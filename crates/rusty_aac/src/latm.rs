@@ -509,6 +509,7 @@ mod tests {
     /// above prove the framing; this proves the framing carries a decodable
     /// stream, which is the only claim that matters for MPEG-TS carriage.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn real_aac_survives_loas_carriage() {
         use crate::{AacEncoder, AacEncoderConfig};
         let sr = 44100u32;

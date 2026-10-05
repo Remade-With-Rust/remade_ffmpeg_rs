@@ -650,6 +650,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn fast_banks_match_the_direct_definitions() {
         let (mut hf, mut hd) = (vec![0f32; 288 + 1024], vec![0f64; 288]);
         let (mut wf, mut wd) = ([[[0f32; 2]; 32]; 32], [[[0f32; 2]; 32]; 32]);
@@ -696,6 +697,7 @@ mod tests {
     /// Analysis then synthesis with nothing in between is a unity-gain 2x
     /// upsampler (64-band) or a unity-gain identity (32-band downsampled).
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn qmf_round_trip_is_unity_gain() {
         let mut hist = vec![0f32; 288 + 1024];
         let mut w = [[[0f32; 2]; 32]; 32];

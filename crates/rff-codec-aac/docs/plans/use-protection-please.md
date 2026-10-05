@@ -50,7 +50,7 @@ Evidence; excluded from the totals).
 |---|---|---|---|---|
 | H-03 | Toolchain pinned (`rust-toolchain.toml`) | Completed | repo `rust-toolchain.toml`: channel 1.95.0, rustfmt + clippy | |
 | H-04 | Committed `.cargo/config.toml` hardening defaults | Completed | repo `.cargo/config.toml` (frame pointers, full RELRO, noexecstack on Linux; Windows linker defaults verified) — see rusty_aac's audit | |
-| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Incomplete | no `overflow-checks` in the release profile; shares rusty_aac's **proposed waiver** (same profile, same compensating controls), pending the Architect | |
+| H-05 | ★ Release profile hardened (overflow-checks, LTO, panic policy) | Incomplete | no `overflow-checks` in the release profile; shares rusty_aac's waiver (same profile, same compensating controls; Tim Almond, 2026-10-04, expires 2027-04-05) | waiver expires 2027-04-05 |
 | H-06 | Security toolchain available to CI and developers | Completed | `.github/workflows/aac-hardening.yml`: pinned security toolchain, SHA-pinned actions, read-only token | |
 
 ### Phase 2 — Supply chain
@@ -97,7 +97,7 @@ Evidence; excluded from the totals).
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
 | H-26 | ★ Fuzz target per public parser, decoder, or message handler | Completed | `fuzz/`: `decode_packets` (Decoder trait, packets split anywhere, frame self-consistency asserted), `encode_frames` (Encoder trait, any frame shape, claim, option), seeded from the rusty_aac corpora | |
-| H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | covered by the daily CI fuzzing session with rusty_aac's targets; 30 days cannot exist on day one — shares rusty_aac's **proposed waiver** | |
+| H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | covered by the daily CI fuzzing session with rusty_aac's targets; 30 days cannot exist on day one — shares rusty_aac's waiver (Tim Almond, 2026-10-04, expires 2026-11-05) | waiver expires 2026-11-05 |
 | H-28 | Property tests cover the documented invariants | Completed | properties: random frame shapes never panic (200 cases), hostile frame shapes are errors or bounded (poison-checked), `b` saturates | |
 | H-29 | Mutation and/or differential testing on critical modules | Completed | differential test: the adapter's decoded plane equals rusty_aac's PCM bit for bit on a real stream and 20 mutated copies (`adapter_decode_matches_rusty_aac`); rusty_aac's ISO gate runs in CI | |
 
@@ -136,7 +136,7 @@ Evidence; excluded from the totals).
 | H-38 | Releases signed, attested, and changelogged for security | Incomplete | release tags SSH-signed; commits unsigned and no allowed-signers file; CHANGELOG.md calls out the security fix | |
 | H-39 | ★ `SECURITY.md` with a coordinated disclosure process | Completed | repo-root `SECURITY.md`: private advisory channel, 5-business-day acknowledgement, coordinated disclosure; linked from README | |
 | H-40 | Advisory monitoring and scheduled re-audit | Completed | owner: Tim Almond; quarterly re-audit (next 2027-01-04); daily scheduled advisory scan in `.github/workflows/aac-hardening.yml` | |
-| H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Incomplete | register below — awaiting the Architect's acceptance | |
+| H-41 | ★ Residual risks listed and accepted; waivers time-bounded | Completed | register below: every risk has an owner, an acceptance (Tim Almond, 2026-10-04) and a review date; both waivers are time-bounded | |
 
 ### Phase 12 — Compliance controls
 
@@ -169,8 +169,8 @@ minutes and unblock the outcome gates behind them.
 
 | # | Gates | Work | Owner | Target | Notes |
 |---|---|---|---|---|---|
-| 1 | H-27 | Daily CI fuzzing accrues 30 days; retire the waiver | | | automatic once the job has run 30 days clean |
-| 2 | H-05 | Revisit overflow checks with rusty_aac | | | |
+| 1 | H-27 | Daily CI fuzzing accrues 30 days; retire the waiver | Tim Almond | 2026-11-05 | automatic once the job has run 30 days clean |
+| 2 | H-05 | Revisit overflow checks with rusty_aac | Tim Almond | 2027-04-05 | |
 | 3 | H-38 | Sign release tags/commits | | | needs a signing key policy |
 
 ---
@@ -181,8 +181,8 @@ Every open risk carries an owner, an acceptance, and a review date (H-41).
 
 | ID | Risk | Likelihood | Impact | Mitigation status | Accepted by | Review date |
 |---|---|---|---|---|---|---|
-| R-001 | A frame shape not yet reached by fuzzing panics the encoder path (DoS) | Low | Medium | adapter fuzz targets + 200-case property; continuous fuzzing accruing (H-27) | | 2027-01-04 |
-| R-002 | Codec-level risks inherited from rusty_aac (see its register) | Low | Medium | tracked and accepted in rusty_aac's plan | | 2027-01-04 |
+| R-001 | A frame shape not yet reached by fuzzing panics the encoder path (DoS) | Low | Medium | adapter fuzz targets + 200-case property; continuous fuzzing accruing (H-27) | Tim Almond, 2026-10-04 | 2027-01-04 |
+| R-002 | Codec-level risks inherited from rusty_aac (see its register) | Low | Medium | tracked and accepted in rusty_aac's plan | Tim Almond, 2026-10-04 | 2027-01-04 |
 
 ---
 
@@ -192,8 +192,8 @@ Time-bounded only. An expired waiver is an `Incomplete` gate, not a `Completed` 
 
 | Gate | Reason | Granted by | Expires |
 |---|---|---|---|
-| H-05 | *(proposed)* Shares rusty_aac's waiver: same release profile, same compensating controls. | | |
-| H-27 | *(proposed)* 30 days of continuous fuzzing cannot exist on day one; daily CI fuzzing accrues it. | | |
+| H-05 | Shares rusty_aac's waiver: same release profile, same compensating controls. | Tim Almond, 2026-10-04 | 2027-04-05 |
+| H-27 | 30 days of continuous fuzzing cannot exist on day one; daily CI fuzzing accrues it. | Tim Almond, 2026-10-04 | 2026-11-05 |
 
 ---
 

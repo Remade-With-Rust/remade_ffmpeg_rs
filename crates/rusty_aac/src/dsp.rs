@@ -1030,6 +1030,7 @@ mod tests {
     /// The fast FFT-based MDCT must match the direct O(N²) oracle at both block
     /// sizes, on raw and encoder-scaled (×32768) input.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn mdct_fast_matches_direct() {
         for &n in &[256usize, 2048] {
             for &scale in &[1.0f32, 32768.0] {
@@ -1059,6 +1060,7 @@ mod tests {
     /// they exist fall back to the oracle until they get their own core), on
     /// broadband input at the decoder's ~16-bit scale.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn imdct_fast_matches_direct() {
         for &l in &[16usize, 128, 1024] {
             let x: Vec<f32> = (0..l)
@@ -1084,6 +1086,7 @@ mod tests {
     /// The half IMDCT must equal the middle half of the direct oracle for every
     /// frame length the decoder uses, power-of-two or not.
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn imdct_half_matches_middle_of_direct() {
         for &l in &[1024usize, 960, 512, 480, 128, 120] {
             let x: Vec<f32> = (0..l)
@@ -1105,6 +1108,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn mdct_any_matches_direct() {
         for &n in &[1920usize, 240, 2048] {
             let x: Vec<f32> = (0..n)
