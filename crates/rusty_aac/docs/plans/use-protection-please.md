@@ -86,16 +86,16 @@ Evidence; excluded from the totals).
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-23 | ★ Tests pass under Miri | Incomplete | not yet run | |
-| H-24 | Critical paths pass the sanitizers (ASan/MSan/TSan) | Incomplete | the fuzz campaign runs under ASan + LeakSanitizer; the lib suite under ASan/TSan/MSan not yet run | |
-| H-25 | `cargo careful test` green | Incomplete | not yet run | |
+| H-23 | ★ Tests pass under Miri | Completed | `MIRIFLAGS=-Zmiri-deterministic-floats cargo +nightly miri test -p rusty_aac --lib` (WSL, 2026-10-04): **85 passed, 0 failed**, 41 ignored = 36 tests measured over 2 minutes each under the interpreter (every lib test was first run alone under Miri: 90 pass, 36 over the limit, 0 fail) marked `cfg_attr(miri, ignore = reason)` — real encodes, O(N²) direct-transform oracles, the exhaustive Huffman sweep, whole-stream decodes — plus 5 manual-only. Miri reports no SIMD, so the scalar twins and all safe code run | |
+| H-24 | Critical paths pass the sanitizers (ASan/MSan/TSan) | Completed | lib suites of rusty_aac + rff-codec-aac under all three sanitizers (WSL, nightly, `-Zbuild-std`, 2026-10-04): ASan + LeakSanitizer 127 passed / 0 reports; TSan 127 / 0 data races (covers the frame-parallel encoder); MSan (origin tracking) 127 / 0 uninitialised reads — including the class-2 capacity fills. Every fuzz campaign also runs under ASan + LSan | |
+| H-25 | `cargo careful test` green | Completed | `cargo +nightly careful test --release -p rusty_aac -p rff-codec-aac --lib` → 127 passed, 0 failed (2026-10-04; LTO off for the careful build — its sysroot carries no bitcode) | |
 
 ### Phase 6 — Fuzzing and properties
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
 | H-26 | ★ Fuzz target per public parser, decoder, or message handler | Completed | `fuzz/`: `decode_adts` (AacDecoder, ADTS or raw packets), `decode_config` (any AudioSpecificConfig + access units: PCE, SBR/PS, ER LD/ELD, 960, Main, LTP), `latm` (LatmDecoder + LOAS parser), `parsers` (ASC / StreamConfig / SBR config / ADTS), `encode` (both push entry points, every switch, block-size bound). 34 seeds (`fuzz/seed.py`) from ISO/IEC 14496-26, our fixtures, FFmpeg-muxed LOAS and real music. Campaigns 2026-10-04 found 3 panics (fixed) | |
-| H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | campaigns 2026-10-04: first (4 + 10 min, 5 targets) found the three panics, all fixed with regression tests; daily scheduled fuzzing in `.github/workflows/aac-hardening.yml` carries the corpus between runs. 30 days cannot exist on day one — **waived** until 2026-11-05 (Tim Almond, 2026-10-04) | waiver expires 2026-11-05 |
+| H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | campaigns 2026-10-04 (ASan + overflow checks): 4- and 10-minute passes over 5 targets (parsers alone 55M execs) found the three panics, all fixed with regression tests; a 20-minute pass on the fixed build — decode_adts 116k, decode_config 547k, latm 523k, encode 157k execs — **0 crashes**. Daily scheduled fuzzing in `.github/workflows/aac-hardening.yml` carries the corpus between runs. **Waived** until 2026-11-05 (Tim Almond, 2026-10-04) | waiver expires 2026-11-05 |
 | H-28 | Property tests cover the documented invariants | Completed | `tests/properties.rs`, dependency-free seeded properties (the vetted dev closure stays 14/14): P1 decoder never panics (bytes, mutated frames, random configs), P2 ADTS header round trip, P3 ASC round trip, P4 encode→decode preserves rate/channels/duration (1–6 ch), P5 push-shape invariance, P6 hostile PCM within the decoder buffer (found ee55ad9, poison-checked), P7 LOAS ≡ raw | |
 | H-29 | Mutation and/or differential testing on critical modules | Completed | differential in CI: the `conformance` job fetches the FATE `aac/` suite and runs `aacconf --gate` — every non-USAC stream decodes, every ISO reference `.s16` within 2 LSB (FFmpeg's own FATE tolerance); local census vs FFmpeg 8.1.2: 81 EXACT + 2 documented deviations; poison-checked. Property P7 is a LOAS-vs-raw differential; the adapter has an rusty_aac-vs-adapter differential | |
 

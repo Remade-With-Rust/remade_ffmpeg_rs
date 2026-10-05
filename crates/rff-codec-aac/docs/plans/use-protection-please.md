@@ -88,16 +88,16 @@ Evidence; excluded from the totals).
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-23 | ★ Tests pass under Miri | Incomplete | not yet run | |
-| H-24 | Critical paths pass the sanitizers (ASan/MSan/TSan) | Incomplete | fuzz targets run under ASan; the lib suite under ASan/TSan/MSan not yet run | |
-| H-25 | `cargo careful test` green | Incomplete | not yet run | |
+| H-23 | ★ Tests pass under Miri | Completed | `MIRIFLAGS=-Zmiri-deterministic-floats cargo +nightly miri test -p rff-codec-aac --lib` → 3 passed, 0 failed, 3 ignored (the real-encode tests, `cfg_attr(miri, ignore = reason)`) (2026-10-04) | |
+| H-24 | Critical paths pass the sanitizers (ASan/MSan/TSan) | Completed | lib tests under ASan + LSan, TSan, MSan (`-Zbuild-std`, with rusty_aac's suite): 127 passed each, 0 reports (2026-10-04); fuzz targets run under ASan | |
+| H-25 | `cargo careful test` green | Completed | `cargo +nightly careful test --release -p rusty_aac -p rff-codec-aac --lib` → 127 passed (2026-10-04) | |
 
 ### Phase 6 — Fuzzing and properties
 
 | ID | Gate | Status | Evidence | Target |
 |---|---|---|---|---|
-| H-26 | ★ Fuzz target per public parser, decoder, or message handler | Completed | `fuzz/`: `decode_packets` (Decoder trait, packets split anywhere, frame self-consistency asserted), `encode_frames` (Encoder trait, any frame shape, claim, option), seeded from the rusty_aac corpora | |
-| H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | covered by the daily CI fuzzing session with rusty_aac's targets; 30 days cannot exist on day one — shares rusty_aac's waiver (Tim Almond, 2026-10-04, expires 2026-11-05) | waiver expires 2026-11-05 |
+| H-26 | ★ Fuzz target per public parser, decoder, or message handler | Completed | `fuzz/`: `decode_packets` (Decoder trait, packets split anywhere, frame self-consistency asserted), `encode_frames` (Encoder trait, any frame shape, claim, plane count, option), seeded from the rusty_aac corpora; campaign 2026-10-04: 132k + 38k execs under ASan + overflow checks, 0 crashes | |
+| H-27 | ★ Continuous fuzzing with no open crashes | Incomplete | first campaign 2026-10-04: 132k + 38k execs, 0 crashes; covered daily by the CI fuzzing session with rusty_aac's targets. 30 days cannot exist on day one — **waived** until 2026-11-05 (Tim Almond, 2026-10-04) | waiver expires 2026-11-05 |
 | H-28 | Property tests cover the documented invariants | Completed | properties: random frame shapes never panic (200 cases), hostile frame shapes are errors or bounded (poison-checked), `b` saturates | |
 | H-29 | Mutation and/or differential testing on critical modules | Completed | differential test: the adapter's decoded plane equals rusty_aac's PCM bit for bit on a real stream and 20 mutated copies (`adapter_decode_matches_rusty_aac`); rusty_aac's ISO gate runs in CI | |
 
