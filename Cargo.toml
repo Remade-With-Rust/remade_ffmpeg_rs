@@ -83,9 +83,9 @@ rff-core = { path = "crates/rff-core", version = "0.2.0" }
 rff-codec = { path = "crates/rff-codec", version = "0.2.0" }
 rff-format = { path = "crates/rff-format", version = "0.2.0" }
 rff-targets = { path = "crates/rff-targets", version = "0.2.0" }
-rff-codec-h264 = { path = "crates/rff-codec-h264", version = "0.2.0" }
-rff-codec-hevc = { path = "crates/rff-codec-hevc", version = "0.1.0" }
-rff-codec-opus = { path = "crates/rff-codec-opus", version = "0.2.0" }
+rff-codec-h264 = { path = "crates/rff-codec-h264", version = "0.3.0" }
+rff-codec-hevc = { path = "crates/rff-codec-hevc", version = "0.2.0" }
+rff-codec-opus = { path = "crates/rff-codec-opus", version = "0.3.0" }
 rff-codec-avif = { path = "crates/rff-codec-avif", version = "0.2.0" }
 rff-format-avi = { path = "crates/rff-format-avi", version = "0.2.0" }
 rff-format-avif = { path = "crates/rff-format-avif", version = "0.2.0" }
