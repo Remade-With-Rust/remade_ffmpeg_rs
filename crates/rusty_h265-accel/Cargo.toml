@@ -1,7 +1,7 @@
 [package]
 name = "rusty_h265-accel"
 description = "SIMD kernels for the rusty_h265 HEVC decoder: the one crate allowed `unsafe`, behind a runtime-dispatched seam."
-version = "0.1.0"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

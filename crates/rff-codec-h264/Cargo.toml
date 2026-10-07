@@ -6,7 +6,7 @@ description = "Remade FFmpeg (Rust): H.264 / AVC video codec — pure Rust via r
 # move (portable Rust SIMD instead of nasm, the lookahead encoder, and the
 # `-preset` / `-profile` options that reproduce a device's Baseline stream)
 # is released by release-plz from here.
-version = "0.2.0"
+version = "0.2.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

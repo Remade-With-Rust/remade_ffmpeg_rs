@@ -1,6 +1,6 @@
 [package]
 name = "rusty_flac"
-version = "0.1.0"
+version = "0.2.0"
 # Vendored build copy. `rusty_flac` is published from its own repository
 # (github.com/Remade-With-Rust/rusty_flac), which crates.io names as its source;
 # two repositories publishing one crate name is what makes a version
@@ -27,8 +27,29 @@ include = [
 # NOTE: fields are direct (not workspace-inherited) so the standalone GitHub
 # repo builds outside the remade_ffmpeg_rs workspace; same values either way.
 
+[features]
+default = ["std"]
+# `std`: per-thread scratch buffers, runtime AVX2 detection, the
+# RUSTY_FLAC_TIMING stage print. Without it the crate is `no_std` + `alloc`
+# and needs `libm` for its floating-point math.
+std = []
+# Pure-Rust libm for cos / log2 / exp2 / round. Required without `std`; with
+# `std` it makes the encoder's decisions bit-identical between a host and a
+# chip built the same way (the libm functions are deterministic, the platform
+# libm is not guaranteed to be).
+libm = ["dep:libm"]
+
 [dependencies]
-# none — pure Rust, self-contained.
+# The only dependency, and optional: pure Rust, no_std, zero deps of its own.
+libm = { version = "0.2", optional = true, default-features = false }
+
+[[example]]
+name = "flacbench"
+required-features = ["std"]
+
+[[example]]
+name = "corpus_size"
+required-features = ["std"]
 
 [dev-dependencies]
 # claxon is the independent decode oracle for the encoder's lossless gate.

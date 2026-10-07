@@ -4,6 +4,8 @@
 //! `write_bits(v, n)` costs O(bytes emitted), not O(n) single-bit steps.
 //! The reader mirrors it: a 64-bit window refilled 4 bytes at a time.
 
+use alloc::vec::Vec;
+
 // ---------------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------------
@@ -28,6 +30,14 @@ impl BitWriter {
         }
     }
 
+    /// Reset to empty while keeping the allocated buffer, so one writer can be
+    /// reused across many frames without reallocating per frame.
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.acc = 0;
+        self.nbits = 0;
+    }
+
     /// Write the low `n` bits of `val`, most-significant bit first. `n <= 56`.
     #[inline]
     pub fn write_bits(&mut self, val: u64, n: u32) {
@@ -43,6 +53,27 @@ impl BitWriter {
             self.nbits -= 8;
             self.buf.push((self.acc >> self.nbits) as u8);
         }
+    }
+
+    /// Longest field [`BitWriter::write_bits_short`] takes.
+    pub const SHORT: u32 = 24;
+
+    /// [`BitWriter::write_bits`] for `1 <= n <= 24`, in 32-bit arithmetic:
+    /// fewer than 8 bits are pending between calls, so they and the new field
+    /// fit a u32 — on a 32-bit core that is single-instruction shifts and ors
+    /// instead of 64-bit sequences. Only the pending low bits of `acc` are
+    /// ever read again, so keeping just its low word is exact.
+    #[inline]
+    pub fn write_bits_short(&mut self, val: u32, n: u32) {
+        debug_assert!((1..=Self::SHORT).contains(&n) && self.nbits < 8);
+        let acc = ((self.acc as u32) << n) | (val & ((1u32 << n) - 1));
+        let mut nbits = self.nbits + n;
+        while nbits >= 8 {
+            nbits -= 8;
+            self.buf.push((acc >> nbits) as u8);
+        }
+        self.acc = acc as u64;
+        self.nbits = nbits;
     }
 
     /// Write `val` as an `n`-bit two's-complement signed field. `n <= 56`.
@@ -244,6 +275,28 @@ impl<'a> BitReader<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// The 32-bit short path writes exactly the bits the 64-bit path does,
+    /// interleaved with long writes and at every pending-bit offset.
+    #[test]
+    fn write_bits_short_matches_write_bits() {
+        let mut x = 3u64;
+        let (mut a, mut b) = (BitWriter::new(), BitWriter::new());
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let n = ((x >> 59) as u32 % 24) + 1;
+            let v = (x >> 20) as u32;
+            if (x >> 7) & 3 == 0 {
+                let m = ((x >> 40) as u32 % 56) + 1;
+                a.write_bits(x >> 3, m);
+                b.write_bits(x >> 3, m);
+            } else {
+                a.write_bits(v as u64, n);
+                b.write_bits_short(v, n);
+            }
+        }
+        assert_eq!(a.into_bytes(), b.into_bytes());
+    }
+
     use super::*;
 
     #[test]

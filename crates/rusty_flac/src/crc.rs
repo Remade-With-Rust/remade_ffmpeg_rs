@@ -65,6 +65,7 @@ pub fn crc16(data: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     /// Bitwise reference implementations (the pre-table originals).
     fn crc8_ref(data: &[u8]) -> u8 {

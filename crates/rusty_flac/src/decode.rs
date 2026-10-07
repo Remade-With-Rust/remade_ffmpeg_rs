@@ -5,6 +5,9 @@
 //! Rice2 partitions with escape codes), CRC-8 header and CRC-16 frame
 //! verification, and 4/8/12/16/20/24/32-bit sample sizes.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::bitio::BitReader;
 use crate::crc::{crc16, crc8};
 
@@ -38,8 +41,8 @@ pub enum DecodeError {
     Inconsistent(&'static str),
 }
 
-impl std::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             DecodeError::NotFlac => write!(f, "flac: not a FLAC stream"),
             DecodeError::Truncated => write!(f, "flac: truncated stream"),
@@ -51,7 +54,7 @@ impl std::fmt::Display for DecodeError {
     }
 }
 
-impl std::error::Error for DecodeError {}
+impl core::error::Error for DecodeError {}
 
 /// Streaming FLAC decoder over a complete in-memory stream.
 pub struct Decoder<'a> {
