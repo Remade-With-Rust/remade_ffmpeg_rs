@@ -6,16 +6,21 @@ version = "0.2.190"
 when = "2026-10-02"
 trusted-publisher = "github:rust-lang/libc"
 
+[[publisher.portable-atomic]]
+version = "1.15.0"
+when = "2026-08-09"
+trusted-publisher = "github:taiki-e/portable-atomic"
+
 [[publisher.rusty_alloc]]
-version = "1.1.6"
-when = "2026-08-28"
+version = "2.2.5"
+when = "2026-10-08"
 user-id = 427321
 user-login = "Ttimmahlax"
 user-name = "farmer_timmm"
 
 [[publisher.rusty_alloc-api]]
-version = "1.1.6"
-when = "2026-08-28"
+version = "2.2.5"
+when = "2026-10-08"
 user-id = 427321
 user-login = "Ttimmahlax"
 user-name = "farmer_timmm"
@@ -99,13 +104,13 @@ who = "Mark Hammond <mhammond@skippinet.com.au>"
 criteria = "safe-to-deploy"
 version = "0.1.1"
 notes = "A microsoft crate allowing unsafe calls to windows apis."
-aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
 
 [[audits.mozilla.audits.windows-link]]
 who = "Erich Gubler <erichdongubler@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.1.1 -> 0.2.0"
-aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
 
 [[audits.zcash.audits.windows-link]]
 who = "Jack Grigg <jack@electriccoin.co>"
