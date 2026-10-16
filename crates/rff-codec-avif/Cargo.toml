@@ -30,4 +30,11 @@ rusty_av1d.workspace = true
 # (same lesson as rusty_png's forced-serial DEFLATE).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rusty_av1e = { workspace = true, features = ["asm", "threading"] }
+
+# rusty_av1d's asm, x86_64 only for now: the published rusty_av1d 1.2.0 package
+# excludes every `*.h`, but its aarch64/arm `.S` sources (refmvs, filmgrain)
+# `#include "src/arm/asm-offsets.h"` — so `asm` fails to build on every ARM
+# target (Apple Silicon, Linux arm64, Windows ARM64). ARM falls back to the
+# pure-Rust kernels until a rusty_av1d release ships the header (issue #14).
+[target.'cfg(target_arch = "x86_64")'.dependencies]
 rusty_av1d = { workspace = true, features = ["asm"] }

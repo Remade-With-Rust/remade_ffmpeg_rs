@@ -10,22 +10,26 @@ and `rusty_av2d`'s push/pull API. All codec logic — the decoder that is
 byte-identical to AOM's `avmdec` across a 45-clip conformance corpus — lives in
 `rusty_av2d`.
 
-> ### ⚠️ Decode robustness: sandbox untrusted AV2 in debug builds
+> ### Decode robustness in debug builds
 >
-> `rusty_av2d 0.2.8` performs an **unchecked subtraction** (`av2_gdf.rs:549`)
-> that trips Rust's arithmetic-overflow check, and aborts
-> (`STATUS_STACK_BUFFER_OVERRUN`) on malformed OBU input. An `abort()` is not a
-> panic, so `catch_unwind` cannot contain it — a hostile file takes the process
-> down.
+> Two separate `rusty_av2d` (≤ 0.2.11) behaviours used to bite **debug builds
+> only**; release builds were never affected. Both are handled in this crate:
 >
-> This affects **debug builds only**. Verified 2026-08-27 against a release
-> build: valid AV2 decodes **byte-identically to the reference**, and a fuzz
-> sweep over malformed input passes with AV2 included. A shipped release binary
-> therefore neither crashes on hostile AV2 nor mis-decodes valid AV2.
->
-> Treat the unchecked arithmetic as a defect to fix upstream, not a property to
-> rely on: a wrap that is correct today is correct by accident, not by contract.
-> If you decode untrusted input in a debug or CI build, sandbox this path.
+> * **Empty packet → process abort.** `rusty_av2d`'s input validation calls
+>   `abort()` under `debug_assertions` when handed zero bytes
+>   (`STATUS_STACK_BUFFER_OVERRUN` on Windows). An abort is not a panic, so
+>   `catch_unwind` cannot contain it. This adapter now rejects empty or
+>   oversized packets with `Error::InvalidData` **before** they reach the
+>   engine, in every build — the same guard the AVIF adapter has for rav1d.
+> * **`av2_gdf.rs:549` overflow → ordinary panic.** The GDF stripe base is
+>   computed as `(i_min - 1)` in `usize`, which underflows on the first stripe
+>   of every GDF frame (valid input included) and panics under overflow checks.
+>   Release wraps to exactly the intended address — `av2f_still` decodes
+>   byte-identically to the reference there. This workspace disables overflow
+>   checks for `rusty_av2d` in its dev profile until the upstream
+>   add-before-subtract fix is published. A downstream **debug** build that
+>   decodes GDF content needs the same `[profile.dev.package.rusty_av2d]
+>   overflow-checks = false` override, or a release build.
 
 ```rust
 let mut registry = rff_codec::CodecRegistry::new();

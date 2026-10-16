@@ -265,3 +265,15 @@ panic = "unwind"
 # `rusty_json_turbo`. See that repository's `crates/serde_json-shim/`.
 [patch.crates-io]
 serde_json = { git = "https://github.com/Remade-With-Rust/rusty_json_turbo", branch = "master" }
+
+# rusty_av2d <= 0.2.11 computes the GDF stripe base as `origin + (i_min - 1) *
+# stride + (j_min - 1)` in usize (av2_gdf.rs:549), which underflows on the first
+# stripe/column of every GDF frame — valid input included — and so panics under
+# debug overflow checks. Release wraps to exactly the intended address (the C
+# reference's negative offset), and av2f_still is byte-identical there. Match
+# release semantics for this one dependency in dev/test builds until the
+# upstream fix (add-before-subtract) is published, then delete this block.
+# Tracked in issue #14.
+[profile.dev.package.rusty_av2d]
+overflow-checks = false
+
