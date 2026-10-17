@@ -109,8 +109,25 @@ fn fuzz_decoders_no_panic() {
 
     let msg = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let msg_hook = msg.clone();
+    let cur_hook = cur.clone();
     panic::set_hook(Box::new(move |info| {
-        *msg_hook.lock().unwrap() = info.to_string();
+        // Also print it: a panic that cannot unwind (a debug `unsafe`
+        // precondition check, or one crossing an `extern "C"` frame) aborts
+        // right after this hook, so a silent hook left only a bare SIGABRT on
+        // CI with no decoder or seed to reproduce (issue #34). Any panic fails
+        // the test anyway, so this costs nothing on a passing run.
+        let (id, cs) = cur_hook
+            .try_lock()
+            .map(|c| *c)
+            .unwrap_or((CodecId::Opus, 0));
+        let thread = std::thread::current();
+        eprintln!(
+            "\n!!! PANIC on thread {:?} (decoder {id:?}, case_seed=0x{cs:016x}): {info}",
+            thread.name().unwrap_or("<unnamed>")
+        );
+        if let Ok(mut m) = msg_hook.lock() {
+            *m = info.to_string();
+        }
     }));
 
     let seed = 0xFACE_B00C_1234_5678u64;
