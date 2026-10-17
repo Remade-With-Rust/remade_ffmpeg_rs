@@ -6,6 +6,13 @@ each release, under **Security**. The project follows
 decoder output is stable (gated against the ISO/IEC 14496-26 conformance suite);
 encoder output may change in minor releases when quality improves.
 
+## [1.1.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v1.1.0...rusty_aac-v1.1.1) - 2026-10-17
+
+### Other
+
+- rusty_alloc-api 2.2.5; rff-cli and rff-server 0.3.0
+- *(rff-codec-aac)* H-37/H-12 evidenced by CI run 37272275669 and the 1.1.0 release
+
 ## 1.1.0 — 2026-10-04
 
 A security-hardening and performance release. The crate has passed a full

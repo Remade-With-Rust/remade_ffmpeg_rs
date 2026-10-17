@@ -4,6 +4,12 @@ All notable changes to this crate. Security-relevant changes are listed first in
 each release, under **Security**. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-mp3-v1.0.0...rff-codec-mp3-v1.0.1) - 2026-10-17
+
+### Other
+
+- rusty_alloc-api 2.2.5; rff-cli and rff-server 0.3.0
+
 ## 1.0.0 — 2026-10-04
 
 First stable release, depending on `rusty_mp3` 1.x.
