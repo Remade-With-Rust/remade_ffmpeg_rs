@@ -46,8 +46,8 @@ pub fn probe(engine: &Engine, path: impl AsRef<Path>) -> Result<MediaInfo> {
     let path_str = path
         .to_str()
         .ok_or_else(|| Error::Option("input path is not valid UTF-8".into()))?;
-    let (format_name, reader) = open_source(engine, path_str, None)?;
-    let mut demuxer = engine.formats.open_demuxer(&format_name, reader)?;
+    let (format_name, source) = open_source(engine, path_str, None)?;
+    let mut demuxer = source.open_demuxer(engine, &format_name)?;
 
     let streams = demuxer.read_header()?;
     let streams = streams
@@ -108,9 +108,33 @@ fn read_head(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Open a path-or-URL as a streaming reader and decide its container format.
+/// An opened input. A local file stays seekable, so demuxers that can (MP4)
+/// read only their index and fetch payload on demand; everything else is a
+/// one-way byte stream.
+pub(crate) enum Source {
+    File(rff_format::SeekInput),
+    Stream(Box<dyn Read + Send>),
+}
+
+impl Source {
+    /// Open the demuxer for `format` over this source — the seek-aware one for
+    /// a file, when the format registered one.
+    pub(crate) fn open_demuxer(
+        self,
+        engine: &Engine,
+        format: &str,
+    ) -> Result<Box<dyn rff_format::Demuxer>> {
+        match self {
+            Source::File(file) => engine.formats.open_demuxer_seekable(format, file),
+            Source::Stream(stream) => engine.formats.open_demuxer(format, stream),
+        }
+    }
+}
+
+/// Open a path-or-URL as a [`Source`] and decide its container format.
 ///
-/// Local files keep the read-twice (sniff then open) path. Streams (URLs,
+/// Local files keep the read-twice (sniff then open) path and are opened
+/// buffered and seekable. Streams (URLs,
 /// pipes, UDP) are opened once, their head peeked for content sniffing, then
 /// chained back in front so the demuxer sees the whole stream from byte 0.
 /// HLS playlists (`-f hls`, an `.m3u8` name, or `#EXTM3U` content) expand to
@@ -120,7 +144,7 @@ pub(crate) fn open_source(
     engine: &Engine,
     path: &str,
     forced: Option<&str>,
-) -> Result<(String, Box<dyn Read + Send>)> {
+) -> Result<(String, Source)> {
     let stem = path.split(['?', '#']).next().unwrap_or(path);
     if forced == Some("hls") || stem.to_ascii_lowercase().ends_with(".m3u8") {
         let reader = rff_format_hls::open_input(path)?;
@@ -128,7 +152,8 @@ pub(crate) fn open_source(
     }
     if !rff_io::is_stream(path) {
         let format = detect_input_format(engine, Path::new(path), forced)?;
-        return Ok((format, Box::new(std::fs::File::open(path)?)));
+        let file = std::io::BufReader::new(std::fs::File::open(path)?);
+        return Ok((format, Source::File(Box::new(file))));
     }
     // RTP has no container to sniff: the reader classifies the stream by its
     // payload type on the first packet and names the format itself.
@@ -137,7 +162,7 @@ pub(crate) fn open_source(
         let format = forced
             .map(str::to_string)
             .unwrap_or_else(|| reader.format_name().to_string());
-        return Ok((format, Box::new(reader)));
+        return Ok((format, Source::Stream(Box::new(reader))));
     }
     let reader = rff_io::open(path)?;
     sniff_stream(engine, reader, forced, path)
@@ -151,7 +176,7 @@ fn sniff_stream(
     mut reader: Box<dyn Read + Send>,
     forced: Option<&str>,
     path: &str,
-) -> Result<(String, Box<dyn Read + Send>)> {
+) -> Result<(String, Source)> {
     let mut head = vec![0u8; 4096];
     let n = read_some(&mut reader, &mut head)?;
     head.truncate(n);
@@ -174,7 +199,7 @@ fn sniff_stream(
             .ok_or_else(|| Error::DemuxerNotFound(format!("{path} (pass -f)")))?,
     };
     let chained: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(head).chain(reader));
-    Ok((format, chained))
+    Ok((format, Source::Stream(chained)))
 }
 
 /// Read up to `buf.len()` bytes, tolerating short reads (network streams arrive

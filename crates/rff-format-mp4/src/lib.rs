@@ -6,6 +6,13 @@
 //! (sync samples). We reconstruct, per sample, its `(file offset, size, pts,
 //! keyframe)` and yield them as packets in file order.
 //!
+//! Over a seekable input (a local file — see
+//! [`FormatRegistry::open_demuxer_seekable`]) the demuxer walks the top-level
+//! box headers, seeks past `mdat`, reads only `moov`, and then fetches each
+//! sample by offset, so opening a file costs memory proportional to its index,
+//! wherever `moov` sits. A non-seekable stream (pipe, socket) can't reach a
+//! trailing `moov` without passing the media first, so it is buffered whole.
+//!
 //! Codec mapping: `avc1`/`avc3` → H.264, `av01` → AV1 (our `avif` decoder),
 //! `mp4a` → AAC (labelled; no decoder yet). H.264 samples are stored length-
 //! prefixed (AVCC); we convert them to Annex-B and prepend the `avcC` SPS/PPS on
@@ -17,10 +24,13 @@
 pub mod dash;
 pub mod fmp4;
 
-use std::io::Read;
+use std::borrow::Cow;
+use std::io::{BufReader, ErrorKind, Read, Seek, SeekFrom};
 
 use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
+use rff_format::{
+    Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, ReadSeek, SeekInput, Stream,
+};
 
 /// Register the MP4 format into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {
@@ -34,6 +44,9 @@ pub fn register(registry: &mut FormatRegistry) {
         probe: Some(probe_mp4),
         mux_caps: MuxCaps::container(&[CodecId::H264, CodecId::Avif, CodecId::Aac, CodecId::Opus]),
     });
+    // With a seekable source (a local file) read only `moov` and fetch each
+    // sample on demand; the plain factory above is the pipe/stream fallback.
+    registry.register_seekable_demuxer("mp4", |input| Box::new(Mp4Demuxer::new_seekable(input)));
     registry.register(Format {
         name: "dash",
         long_name: "DASH (static MPD + fMP4 segments)",
@@ -98,7 +111,9 @@ fn child_boxes(buf: &[u8]) -> Vec<([u8; 4], &[u8])> {
         } else {
             (i + 8, i + size32)
         };
-        if end > buf.len() || end <= i {
+        // A declared size smaller than its own header (1..7, or a largesize
+        // under 16) is malformed: stop rather than slice `start > end`.
+        if end > buf.len() || end <= i || start > end {
             break;
         }
         out.push((typ, &buf[start..end]));
@@ -126,9 +141,26 @@ struct SampleLoc {
 
 use rff_format::avc::{avcc_to_annexb, parse_avcc, split_annexb, AvcConfig};
 
+/// Where sample bytes come from once the header is parsed.
+enum Source {
+    /// Not yet opened: a plain stream (pipe, socket) or a seekable file.
+    Stream(Input),
+    Seekable(SeekInput),
+    /// Stream fallback: a non-seekable input can't jump to `moov` at the end
+    /// of the file and back, so it is buffered whole and sliced per sample.
+    Buffered(Vec<u8>),
+    /// Seekable: only `moov` was read; each sample is fetched by offset.
+    /// `cur` is the reader's position, so contiguous samples need no seek.
+    Random {
+        reader: BufReader<SeekInput>,
+        cur: u64,
+    },
+    /// Header already taken (or failed).
+    Done,
+}
+
 struct Mp4Demuxer {
-    input: Option<Input>,
-    buf: Vec<u8>,
+    src: Source,
     samples: Vec<SampleLoc>,
     /// Indexed by stream_index; `Some` for H.264 tracks needing conversion.
     avc: Vec<Option<AvcConfig>>,
@@ -137,28 +169,26 @@ struct Mp4Demuxer {
 
 impl Mp4Demuxer {
     fn new(input: Input) -> Mp4Demuxer {
+        Mp4Demuxer::with_source(Source::Stream(input))
+    }
+
+    /// Open over a seekable input: `read_header` reads only the box headers
+    /// and `moov`, so memory and I/O scale with the index, not the media.
+    fn new_seekable(input: SeekInput) -> Mp4Demuxer {
+        Mp4Demuxer::with_source(Source::Seekable(input))
+    }
+
+    fn with_source(src: Source) -> Mp4Demuxer {
         Mp4Demuxer {
-            input: Some(input),
-            buf: Vec::new(),
+            src,
             samples: Vec::new(),
             avc: Vec::new(),
             pos: 0,
         }
     }
-}
 
-impl Demuxer for Mp4Demuxer {
-    fn read_header(&mut self) -> Result<Vec<Stream>> {
-        let mut input = self
-            .input
-            .take()
-            .ok_or_else(|| Error::invalid("mp4 demux: header already read"))?;
-        input.read_to_end(&mut self.buf)?;
-        let buf = std::mem::take(&mut self.buf);
-
-        let top = child_boxes(&buf);
-        let moov = find(&top, b"moov").ok_or_else(|| Error::invalid("mp4 demux: no `moov`"))?;
-
+    /// Build streams + the file-ordered sample table from a `moov` payload.
+    fn parse_moov(&mut self, moov: &[u8]) -> Result<Vec<Stream>> {
         let mut streams = Vec::new();
         for (typ, trak) in child_boxes(moov) {
             if &typ != b"trak" {
@@ -173,11 +203,80 @@ impl Demuxer for Mp4Demuxer {
         if streams.is_empty() {
             return Err(Error::unsupported("mp4 demux: no usable tracks"));
         }
-
         // Yield samples in file order (natural interleave).
         self.samples.sort_by_key(|s| s.offset);
-        self.buf = buf;
         Ok(streams)
+    }
+}
+
+/// Walk the top-level boxes of a seekable file by header alone — seeking past
+/// `mdat` and everything else — and return the `moov` payload. Box framing
+/// matches [`child_boxes`]: 64-bit `largesize`, `size == 0` meaning "to end of
+/// file", and a box that is malformed or overruns the file ends the walk.
+fn read_moov(input: &mut dyn ReadSeek) -> Result<Vec<u8>> {
+    let file_len = input.seek(SeekFrom::End(0))?;
+    let mut pos = 0u64;
+    while pos.saturating_add(8) <= file_len {
+        input.seek(SeekFrom::Start(pos))?;
+        let mut hdr = [0u8; 16];
+        input.read_exact(&mut hdr[..8])?;
+        let size32 = be32(&hdr, 0) as u64;
+        let typ = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        let (header_len, size) = match size32 {
+            1 => {
+                if pos.saturating_add(16) > file_len {
+                    break;
+                }
+                input.read_exact(&mut hdr[8..16])?;
+                (16, be64(&hdr, 8))
+            }
+            0 => (8, file_len - pos),
+            n => (8, n),
+        };
+        let end = match pos.checked_add(size) {
+            Some(end) if size >= header_len && end <= file_len => end,
+            _ => break,
+        };
+        if &typ == b"moov" {
+            let len = size - header_len;
+            let mut moov = Vec::new();
+            input.take(len).read_to_end(&mut moov)?;
+            if moov.len() as u64 != len {
+                return Err(Error::invalid("mp4 demux: truncated `moov`"));
+            }
+            return Ok(moov);
+        }
+        pos = end;
+    }
+    Err(Error::invalid("mp4 demux: no `moov`"))
+}
+
+impl Demuxer for Mp4Demuxer {
+    fn read_header(&mut self) -> Result<Vec<Stream>> {
+        match std::mem::replace(&mut self.src, Source::Done) {
+            Source::Stream(mut input) => {
+                let mut buf = Vec::new();
+                input.read_to_end(&mut buf)?;
+                let top = child_boxes(&buf);
+                let moov =
+                    find(&top, b"moov").ok_or_else(|| Error::invalid("mp4 demux: no `moov`"))?;
+                let streams = self.parse_moov(moov)?;
+                self.src = Source::Buffered(buf);
+                Ok(streams)
+            }
+            Source::Seekable(mut input) => {
+                let moov = read_moov(&mut input)?;
+                let streams = self.parse_moov(&moov)?;
+                // The reader's position is wherever the moov walk left it;
+                // start from an unknown position so the first sample seeks.
+                self.src = Source::Random {
+                    reader: BufReader::with_capacity(64 * 1024, input),
+                    cur: u64::MAX,
+                };
+                Ok(streams)
+            }
+            _ => Err(Error::invalid("mp4 demux: header already read")),
+        }
     }
 
     fn read_packet(&mut self) -> Result<Packet> {
@@ -186,10 +285,35 @@ impl Demuxer for Mp4Demuxer {
             None => return Err(Error::Eof),
         };
         self.pos += 1;
-        let raw = self
-            .buf
-            .get(loc.offset..loc.offset + loc.size)
-            .ok_or_else(|| Error::invalid("mp4 demux: sample out of range"))?;
+        let out_of_range = || Error::invalid("mp4 demux: sample out of range");
+        let raw: Cow<[u8]> = match &mut self.src {
+            Source::Buffered(buf) => Cow::Borrowed(
+                buf.get(loc.offset..loc.offset.checked_add(loc.size).ok_or_else(out_of_range)?)
+                    .ok_or_else(out_of_range)?,
+            ),
+            Source::Random { reader, cur } => {
+                let off = loc.offset as u64;
+                if *cur != off {
+                    reader.seek(SeekFrom::Start(off))?;
+                }
+                // Read what is there, never a declared size up front: a
+                // corrupt `stsz` must not become a giant allocation.
+                let mut data = Vec::new();
+                let got = reader.take(loc.size as u64).read_to_end(&mut data);
+                *cur = match got {
+                    Ok(n) => off + n as u64,
+                    Err(_) => u64::MAX,
+                };
+                match got {
+                    Ok(n) if n == loc.size => {}
+                    Ok(_) => return Err(out_of_range()),
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(out_of_range()),
+                    Err(e) => return Err(e.into()),
+                }
+                Cow::Owned(data)
+            }
+            _ => return Err(Error::invalid("mp4 demux: header not read")),
+        };
 
         // H.264: convert AVCC length-prefixed NALs to Annex-B, prepending the
         // SPS/PPS on keyframes so the decoder is self-contained.
@@ -199,10 +323,11 @@ impl Demuxer for Mp4Demuxer {
                 if loc.keyframe {
                     out.extend_from_slice(&cfg.headers_annexb);
                 }
-                avcc_to_annexb(raw, cfg.nal_len, &mut out);
+                avcc_to_annexb(&raw, cfg.nal_len, &mut out);
                 out
             }
-            None => raw.to_vec(),
+            // A sample read from a seekable file is moved, not copied.
+            None => raw.into_owned(),
         };
 
         let mut packet = Packet::from_data(loc.stream_index, data);
@@ -803,12 +928,10 @@ pub(crate) fn mp4_fourcc(stream: &Stream) -> Result<[u8; 4]> {
     }
     let name = stream.codec_id.name();
     Err(Error::unsupported(match stream.media_type {
-        MediaType::Subtitle => {
-            "mp4 mux: subtitle streams are not supported here (no `mov_text`); \
+        MediaType::Subtitle => "mp4 mux: subtitle streams are not supported here (no `mov_text`); \
              write Matroska (`.mkv`) instead, or extract the subtitles on their \
              own with `-c:s subrip out.srt`"
-                .to_string()
-        }
+            .to_string(),
         MediaType::Video => format!(
             "mp4 mux: video codec `{name}` has no MP4 mapping here (MP4 carries \
              h264 or av1); re-encode with `-c:v h264`, or write `.mkv`/`.webm` \
@@ -1513,7 +1636,8 @@ mod tests {
         ] {
             if let Some(fourcc) = codec_fourcc(codec) {
                 assert_ne!(
-                    fourcc, [0, 0, 0, 0],
+                    fourcc,
+                    [0, 0, 0, 0],
                     "`{}` maps to a zero fourcc",
                     codec.name()
                 );
@@ -1536,7 +1660,9 @@ mod tests {
         // A slice NAL (type 1), so there is a sample but no SPS/PPS anywhere.
         mux.write_packet(&Packet::from_data(0, vec![0, 0, 0, 1, 0x41, 0x9A, 0x00]))
             .unwrap();
-        let err = mux.write_trailer().expect_err("no SPS/PPS to build avcC from");
+        let err = mux
+            .write_trailer()
+            .expect_err("no SPS/PPS to build avcC from");
         assert!(err.to_string().contains("SPS/PPS"), "{err}");
     }
 
@@ -1556,5 +1682,166 @@ mod tests {
             mux.write_trailer().is_ok(),
             "extradata carries the parameter sets, so the file is writable"
         );
+    }
+
+    // ---- seekable input (issue #26) ----------------------------------------
+
+    /// An H.264 + Opus file of `frames` samples per track, each video sample
+    /// `frame_bytes` long and distinct, written by our muxer (`moov` last, the
+    /// ffmpeg-default layout that forced whole-file buffering).
+    fn mux_av(frames: usize, frame_bytes: usize) -> Vec<u8> {
+        let sink = SharedBuf(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        {
+            let mut mux = Mp4Muxer::new(Box::new(sink.clone()));
+            let mut vs = Stream::new(0, CodecId::H264);
+            vs.media_type = MediaType::Video;
+            vs.width = 16;
+            vs.height = 16;
+            vs.time_base = Rational::new(1, 1000);
+            let mut as_ = Stream::new(1, CodecId::Opus);
+            as_.media_type = MediaType::Audio;
+            as_.channels = 2;
+            as_.sample_rate = 48_000;
+            as_.time_base = Rational::new(1, 1000);
+            mux.write_header(&[vs, as_]).unwrap();
+            for i in 0..frames {
+                let key = i % 30 == 0;
+                let mut v = Vec::new();
+                if key {
+                    for nal in [&[0x67u8, 0x42, 0, 0x1E, 0xAA][..], &[0x68, 0xCE, 0xBB]] {
+                        v.extend_from_slice(&[0, 0, 0, 1]);
+                        v.extend_from_slice(nal);
+                    }
+                }
+                v.extend_from_slice(&[0, 0, 0, 1, if key { 0x65 } else { 0x41 }]);
+                v.extend((0..frame_bytes).map(|j| (i * 7 + j) as u8 | 1));
+                let mut vp = Packet::from_data(0, v);
+                vp.pts = Some(i as i64 * 40);
+                vp.flags.keyframe = key;
+                mux.write_packet(&vp).unwrap();
+                let mut ap = Packet::from_data(1, vec![0xFC, i as u8, (i >> 8) as u8]);
+                ap.pts = Some(i as i64 * 40);
+                ap.flags.keyframe = true;
+                mux.write_packet(&ap).unwrap();
+            }
+            mux.write_trailer().unwrap();
+        }
+        let file = sink.0.lock().unwrap().clone();
+        file
+    }
+
+    #[test]
+    fn a_box_smaller_than_its_header_ends_the_walk() {
+        // size 4 < 8-byte header: used to slice `buf[8..4]` and panic.
+        assert!(child_boxes(&[0, 0, 0, 4, b'f', b'r', b'e', b'e']).is_empty());
+    }
+
+    fn drain(dem: &mut Mp4Demuxer) -> Vec<(usize, Option<i64>, bool, Vec<u8>)> {
+        let mut out = Vec::new();
+        loop {
+            match dem.read_packet() {
+                Ok(p) => out.push((p.stream_index, p.pts, p.flags.keyframe, p.data)),
+                Err(Error::Eof) => return out,
+                Err(e) => panic!("read_packet: {e}"),
+            }
+        }
+    }
+
+    /// Counts the bytes actually read through it (seeks are free).
+    struct Counting {
+        inner: Cursor<Vec<u8>>,
+        read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+    impl Seek for Counting {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn seekable_and_streamed_inputs_demux_identically() {
+        let file = mux_av(90, 300);
+        let mut streamed = Mp4Demuxer::new(Box::new(Cursor::new(file.clone())));
+        let mut seekable = Mp4Demuxer::new_seekable(Box::new(Cursor::new(file)));
+        let (a, b) = (
+            streamed.read_header().unwrap(),
+            seekable.read_header().unwrap(),
+        );
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        let (pa, pb) = (drain(&mut streamed), drain(&mut seekable));
+        assert_eq!(pa.len(), 180);
+        assert_eq!(pa, pb);
+    }
+
+    #[test]
+    fn seekable_header_reads_only_box_headers_and_moov() {
+        // ~4 MiB of media; moov is a few KiB.
+        let file = mux_av(400, 10_000);
+        let total = file.len() as u64;
+        let read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut dem = Mp4Demuxer::new_seekable(Box::new(Counting {
+            inner: Cursor::new(file),
+            read: read.clone(),
+        }));
+        dem.read_header().unwrap();
+        let header_bytes = read.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            header_bytes < 64 * 1024,
+            "read_header read {header_bytes} of {total} bytes"
+        );
+        // Every sample still arrives, each fetched on demand.
+        assert_eq!(drain(&mut dem).len(), 800);
+    }
+
+    #[test]
+    fn opening_through_the_registry_picks_the_seekable_demuxer() {
+        let mut registry = FormatRegistry::new();
+        register(&mut registry);
+        let file = mux_av(5, 20);
+        let read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut big = file.clone();
+        big.extend(std::iter::repeat_n(0u8, 1 << 20)); // trailing junk past moov
+        let input: SeekInput = Box::new(Counting {
+            inner: Cursor::new(big),
+            read: read.clone(),
+        });
+        let mut dem = registry.open_demuxer_seekable("mp4", input).unwrap();
+        assert_eq!(dem.read_header().unwrap().len(), 2);
+        assert!(read.load(std::sync::atomic::Ordering::Relaxed) < 64 * 1024);
+    }
+
+    #[test]
+    fn malformed_top_level_boxes_error_without_panicking() {
+        let file = mux_av(3, 10);
+        let mut cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0, 0, 0, 4, b'f', b't', b'y', b'p'], // size < header
+            vec![0, 0, 0, 1, b'm', b'o', b'o', b'v', 0, 0, 0, 0, 0, 0, 0, 3], // largesize < 16
+            vec![0xFF, 0xFF, 0xFF, 0xFF, b'm', b'd', b'a', b't'], // overruns the file
+            file[..file.len() - 10].to_vec(),         // moov truncated
+        ];
+        // size == 0 ("to end of file") on a lone moov with garbage inside.
+        cases.push([&[0u8, 0, 0, 0][..], b"moov", &[1, 2, 3]].concat());
+        for case in cases {
+            for seekable in [false, true] {
+                let mut dem = if seekable {
+                    Mp4Demuxer::new_seekable(Box::new(Cursor::new(case.clone())))
+                } else {
+                    Mp4Demuxer::new(Box::new(Cursor::new(case.clone())))
+                };
+                if dem.read_header().is_ok() {
+                    // Whatever parsed must still drain to an end.
+                    while dem.read_packet().is_ok() {}
+                }
+            }
+        }
     }
 }
