@@ -1,16 +1,22 @@
 //! FLAC codec adapter over our in-house [`rusty_flac`] (pure Rust, no FFI):
 //! lossless encoder + decoder, both ours end to end.
 //!
-//! FLAC is self-describing (its `STREAMINFO` carries sample rate / channels /
-//! bit depth), so — like the image codecs — a packet is the whole `.flac`
-//! stream and no [`configure`](rff_codec::Decoder::configure) is needed. The
-//! whole stream decodes to one interleaved `f32` [`AudioFrame`] (samples
-//! normalized from FLAC's native bit depth).
+//! The decoder takes two packet shapes:
+//!
+//! - **One FLAC frame per packet** (what the FLAC and Matroska demuxers emit):
+//!   [`configure`](rff_codec::Decoder::configure) must supply the stream's
+//!   STREAMINFO via `extradata` (`fLaC` + metadata blocks, or the bare
+//!   34-byte block). Each packet decodes to one [`AudioFrame`].
+//! - **A whole `.flac` stream** (starting `fLaC`, as the encoder emits it),
+//!   which decodes to one [`AudioFrame`] and needs no configuration.
+//!
+//! Either way samples come out interleaved: native s16 for <=16-bit streams,
+//! f32 normalized from the native depth for wider ones.
 
-use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
-use rff_core::{
-    AudioFrame, Dictionary, Error, Frame, MediaType, Packet, Result, SampleFormat,
-};
+use std::collections::VecDeque;
+
+use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder, Encoder};
+use rff_core::{AudioFrame, Dictionary, Error, Frame, MediaType, Packet, Result, SampleFormat};
 
 /// Register the FLAC codec into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
@@ -30,79 +36,145 @@ pub fn register(registry: &mut CodecRegistry) {
 
 #[derive(Default)]
 struct FlacDecoder {
-    frame: Option<Frame>,
+    frames: VecDeque<Frame>,
     eof: bool,
+    /// Synthetic stream prefix for frame packets: `fLaC` + the stream's
+    /// STREAMINFO as the only (last) metadata block, from `extradata`.
+    prefix: Vec<u8>,
+    /// `prefix` + the current frame packet, reused between packets.
+    scratch: Vec<u8>,
+}
+
+/// Find STREAMINFO in codec extradata: `fLaC` + metadata blocks (what the
+/// FLAC and Matroska demuxers hand over), or a bare 34-byte block.
+fn streaminfo_block(extradata: &[u8]) -> Option<&[u8]> {
+    if extradata.len() == 34 {
+        return Some(extradata);
+    }
+    let mut rest = extradata.strip_prefix(b"fLaC")?;
+    while rest.len() >= 4 {
+        let (hdr, body) = rest.split_at(4);
+        let len = ((hdr[1] as usize) << 16) | ((hdr[2] as usize) << 8) | hdr[3] as usize;
+        if hdr[0] & 0x7F == 0 && len >= 34 && body.len() >= 34 {
+            return Some(&body[..34]);
+        }
+        if hdr[0] & 0x80 != 0 || body.len() < len {
+            return None;
+        }
+        rest = &body[len..];
+    }
+    None
+}
+
+/// Interleave planar native-depth samples into one [`AudioFrame`].
+fn audio_frame(info: &rusty_flac::StreamInfo, chans: &[Vec<i32>], pts: Option<i64>) -> AudioFrame {
+    let channels = info.channels.max(1) as usize;
+    let total = chans.first().map_or(0, |c| c.len());
+
+    // ≤16-bit streams interleave straight to native s16 (no float detour);
+    // wider depths go to f32 (exact — 24-bit fits the mantissa).
+    if info.bits_per_sample <= 16 {
+        let shift = 16 - info.bits_per_sample; // sub-16-bit up-scales to the s16 grid
+        let mut bytes: Vec<u8> = vec![0u8; total * channels * 2];
+        match channels {
+            1 => {
+                for (out, &v) in bytes.chunks_exact_mut(2).zip(&chans[0]) {
+                    out.copy_from_slice(&((v << shift) as i16).to_le_bytes());
+                }
+            }
+            2 => {
+                let (l, r) = (&chans[0], &chans[1]);
+                for (i, out) in bytes.chunks_exact_mut(4).enumerate() {
+                    // One packed 4-byte store per frame.
+                    let packed = ((l[i] << shift) as i16 as u16 as u32)
+                        | (((r[i] << shift) as i16 as u16 as u32) << 16);
+                    out.copy_from_slice(&packed.to_le_bytes());
+                }
+            }
+            _ => {
+                for (i, out) in bytes.chunks_exact_mut(channels * 2).enumerate() {
+                    for (c, chan) in chans.iter().enumerate() {
+                        out[c * 2..c * 2 + 2]
+                            .copy_from_slice(&((chan[i] << shift) as i16).to_le_bytes());
+                    }
+                }
+            }
+        }
+        AudioFrame {
+            sample_rate: info.sample_rate,
+            channels: channels as u16,
+            format: SampleFormat::S16,
+            planes: vec![bytes],
+            samples: total,
+            pts,
+        }
+    } else {
+        // Normalize native integer samples to f32 in [-1, 1).
+        let scale = (1u64 << (info.bits_per_sample - 1)) as f32;
+        let inv = 1.0 / scale;
+        let mut bytes: Vec<u8> = Vec::with_capacity(total * channels * 4);
+        for i in 0..total {
+            for chan in chans {
+                bytes.extend_from_slice(&(chan[i] as f32 * inv).to_le_bytes());
+            }
+        }
+        AudioFrame {
+            sample_rate: info.sample_rate,
+            channels: channels as u16,
+            format: SampleFormat::F32,
+            planes: vec![bytes],
+            samples: total,
+            pts,
+        }
+    }
 }
 
 impl Decoder for FlacDecoder {
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        let (info, chans) = rusty_flac::decode(&packet.data)
-            .map_err(|e| Error::invalid(format!("flac decode: {e}")))?;
-        let channels = info.channels.max(1) as usize;
-        let total = chans.first().map_or(0, |c| c.len());
+    fn configure(&mut self, params: &CodecParams) -> Result<()> {
+        if let Some(si) = streaminfo_block(&params.extradata) {
+            self.prefix.clear();
+            self.prefix.extend_from_slice(b"fLaC");
+            self.prefix.extend_from_slice(&[0x80, 0, 0, 34]);
+            self.prefix.extend_from_slice(si);
+        }
+        Ok(())
+    }
 
-        // ≤16-bit streams interleave straight to native s16 (no float detour);
-        // wider depths go to f32 (exact — 24-bit fits the mantissa).
-        let frame = if info.bits_per_sample <= 16 {
-            let shift = 16 - info.bits_per_sample; // sub-16-bit up-scales to the s16 grid
-            let mut bytes: Vec<u8> = vec![0u8; total * channels * 2];
-            match channels {
-                1 => {
-                    for (out, &v) in bytes.chunks_exact_mut(2).zip(&chans[0]) {
-                        out.copy_from_slice(&((v << shift) as i16).to_le_bytes());
-                    }
-                }
-                2 => {
-                    let (l, r) = (&chans[0], &chans[1]);
-                    for (i, out) in bytes.chunks_exact_mut(4).enumerate() {
-                        // One packed 4-byte store per frame.
-                        let packed = ((l[i] << shift) as i16 as u16 as u32)
-                            | (((r[i] << shift) as i16 as u16 as u32) << 16);
-                        out.copy_from_slice(&packed.to_le_bytes());
-                    }
-                }
-                _ => {
-                    for (i, out) in bytes.chunks_exact_mut(channels * 2).enumerate() {
-                        for (c, chan) in chans.iter().enumerate() {
-                            out[c * 2..c * 2 + 2]
-                                .copy_from_slice(&((chan[i] << shift) as i16).to_le_bytes());
-                        }
-                    }
-                }
-            }
-            AudioFrame {
-                sample_rate: info.sample_rate,
-                channels: channels as u16,
-                format: SampleFormat::S16,
-                planes: vec![bytes],
-                samples: total,
-                pts: packet.pts,
-            }
-        } else {
-            // Normalize native integer samples to f32 in [-1, 1).
-            let scale = (1u64 << (info.bits_per_sample - 1)) as f32;
-            let inv = 1.0 / scale;
-            let mut bytes: Vec<u8> = Vec::with_capacity(total * channels * 4);
-            for i in 0..total {
-                for chan in &chans {
-                    bytes.extend_from_slice(&(chan[i] as f32 * inv).to_le_bytes());
-                }
-            }
-            AudioFrame {
-                sample_rate: info.sample_rate,
-                channels: channels as u16,
-                format: SampleFormat::F32,
-                planes: vec![bytes],
-                samples: total,
-                pts: packet.pts,
-            }
-        };
-        self.frame = Some(Frame::Audio(frame));
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        let map_err = |e: rusty_flac::DecodeError| Error::invalid(format!("flac decode: {e}"));
+        if packet.data.starts_with(b"fLaC") {
+            // A whole `.flac` stream in one packet (the encoder's output).
+            let (info, chans) = rusty_flac::decode(&packet.data).map_err(map_err)?;
+            self.frames
+                .push_back(Frame::Audio(audio_frame(&info, &chans, packet.pts)));
+            return Ok(());
+        }
+        // Frame packet(s), as the FLAC / Matroska demuxers emit them: decode
+        // them behind the stream's STREAMINFO.
+        if self.prefix.is_empty() {
+            return Err(Error::invalid(
+                "flac decode: frame packet without STREAMINFO (extradata)",
+            ));
+        }
+        self.scratch.clear();
+        self.scratch.extend_from_slice(&self.prefix);
+        self.scratch.extend_from_slice(&packet.data);
+        let mut dec = rusty_flac::Decoder::new(&self.scratch).map_err(map_err)?;
+        let info = dec.streaminfo().clone();
+        let mut chans: Vec<Vec<i32>> = vec![Vec::new(); info.channels as usize];
+        if dec.next_frame(&mut chans).map_err(map_err)?.is_none() {
+            return Ok(()); // empty packet
+        }
+        // Further frames in the same packet decode too; bytes after the last
+        // frame that don't parse as one (e.g. a trailing tag) are ignored.
+        while let Ok(Some(_)) = dec.next_frame(&mut chans) {}
+        self.frames
+            .push_back(Frame::Audio(audio_frame(&info, &chans, packet.pts)));
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(frame) = self.frame.take() {
+        if let Some(frame) = self.frames.pop_front() {
             return Ok(frame);
         }
         if self.eof {
@@ -287,5 +359,157 @@ mod tests {
             assert_eq!(chans[0][i], l);
             assert_eq!(chans[1][i], r);
         }
+    }
+
+    /// Split a `.flac` stream into (`fLaC` + metadata, frames) the way the
+    /// demuxer does: a frame ends at a sync code where the CRC-16 residue of
+    /// the bytes since the frame start is zero.
+    fn split_frames(stream: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let mut pos = 4;
+        loop {
+            let last = stream[pos] & 0x80 != 0;
+            let len = u32::from_be_bytes([0, stream[pos + 1], stream[pos + 2], stream[pos + 3]]);
+            pos += 4 + len as usize;
+            if last {
+                break;
+            }
+        }
+        let header = stream[..pos].to_vec();
+        let crc16 = |data: &[u8]| {
+            data.iter().fold(0u16, |mut c, &b| {
+                c ^= (b as u16) << 8;
+                for _ in 0..8 {
+                    c = if c & 0x8000 != 0 {
+                        (c << 1) ^ 0x8005
+                    } else {
+                        c << 1
+                    };
+                }
+                c
+            })
+        };
+        let mut frames = Vec::new();
+        let mut start = pos;
+        for p in pos + 10..stream.len() {
+            if stream[p] == 0xFF
+                && stream.get(p + 1).is_some_and(|&b| b & 0xFE == 0xF8)
+                && crc16(&stream[start..p]) == 0
+            {
+                frames.push(stream[start..p].to_vec());
+                start = p;
+            }
+        }
+        frames.push(stream[start..].to_vec());
+        (header, frames)
+    }
+
+    fn params(extradata: Vec<u8>) -> CodecParams {
+        CodecParams {
+            codec_id: rff_core::CodecId::Flac,
+            width: 0,
+            height: 0,
+            pixel_format: None,
+            sample_rate: 0,
+            channels: 0,
+            sample_format: None,
+            extradata,
+        }
+    }
+
+    fn audio(frame: Frame) -> AudioFrame {
+        match frame {
+            Frame::Audio(a) => a,
+            Frame::Video(_) => panic!("expected audio"),
+        }
+    }
+
+    /// Per-frame packets decode to exactly the PCM of the whole-stream decode.
+    #[test]
+    fn frame_packets_decode_identically_to_the_whole_stream() {
+        let n = 23_456usize;
+        let sig = |i: usize, k: i64| ((i as f64 * 0.031 * k as f64).sin() * 30000.0) as i64;
+        for (rate, channels, bps) in [(44_100, 2u32, 16u32), (48_000, 1, 24), (22_050, 3, 8)] {
+            let planes: Vec<Vec<i32>> = (0..channels as i64)
+                .map(|c| {
+                    (0..n)
+                        .map(|i| {
+                            (sig(i, c + 1) >> (16 - bps.min(16))) as i32 * (1 << (bps.max(16) - 16))
+                        })
+                        .collect()
+                })
+                .collect();
+            let refs: Vec<&[i32]> = planes.iter().map(|p| p.as_slice()).collect();
+            let mut enc = rusty_flac::Encoder::new(rate, channels, bps).unwrap();
+            enc.push_planar(&refs).unwrap();
+            let stream = enc.finish();
+
+            let mut whole = FlacDecoder::default();
+            whole
+                .send_packet(&Packet::from_data(0, stream.clone()))
+                .unwrap();
+            let want = audio(whole.receive_frame().unwrap());
+
+            let (header, frames) = split_frames(&stream);
+            assert!(frames.len() > 3);
+            for extradata in [header.clone(), header[8..42].to_vec()] {
+                let mut dec = FlacDecoder::default();
+                dec.configure(&params(extradata)).unwrap();
+                let mut got = Vec::new();
+                let mut samples = 0;
+                for (i, f) in frames.iter().enumerate() {
+                    let mut p = Packet::from_data(0, f.clone());
+                    p.pts = Some(i as i64);
+                    dec.send_packet(&p).unwrap();
+                    let a = audio(dec.receive_frame().unwrap());
+                    assert_eq!(a.pts, Some(i as i64));
+                    assert_eq!(
+                        (a.format, a.sample_rate, a.channels),
+                        (want.format, want.sample_rate, want.channels)
+                    );
+                    samples += a.samples;
+                    got.extend_from_slice(&a.planes[0]);
+                    assert!(matches!(dec.receive_frame(), Err(Error::Again)));
+                }
+                assert_eq!(samples, want.samples);
+                assert_eq!(got, want.planes[0], "{rate} Hz {channels} ch {bps}-bit");
+            }
+        }
+    }
+
+    #[test]
+    fn frame_packets_need_streaminfo_and_reject_corruption() {
+        let mut enc = rusty_flac::Encoder::new(44_100, 1, 16).unwrap();
+        enc.push_planar(&[&(0..9000)
+            .map(|i| (i * 37 % 2001) - 1000)
+            .collect::<Vec<i32>>()])
+            .unwrap();
+        let stream = enc.finish();
+        let (header, frames) = split_frames(&stream);
+        let mut dec = FlacDecoder::default();
+        assert!(dec
+            .send_packet(&Packet::from_data(0, frames[0].clone()))
+            .is_err());
+        dec.configure(&params(header)).unwrap();
+        let mut bad = frames[0].clone();
+        let mid = bad.len() / 2;
+        bad[mid] ^= 0x40;
+        assert!(dec.send_packet(&Packet::from_data(0, bad)).is_err());
+        assert!(dec
+            .send_packet(&Packet::from_data(0, b"junk".to_vec()))
+            .is_err());
+        // An empty packet yields nothing; a frame with a trailing tag decodes.
+        dec.send_packet(&Packet::new(0)).unwrap();
+        assert!(matches!(dec.receive_frame(), Err(Error::Again)));
+        let mut tagged = frames.last().unwrap().clone();
+        tagged.extend_from_slice(b"TAG trailing id3v1-ish bytes");
+        dec.send_packet(&Packet::from_data(0, tagged)).unwrap();
+        assert!(dec.receive_frame().is_ok());
+        // Garbage extradata leaves the decoder unconfigured, not panicking.
+        let mut dec = FlacDecoder::default();
+        dec.configure(&params(b"fLaC\x01\xff\xff\xff".to_vec()))
+            .unwrap();
+        assert!(dec
+            .send_packet(&Packet::from_data(0, frames[0].clone()))
+            .is_err());
     }
 }
