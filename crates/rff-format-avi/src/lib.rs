@@ -13,13 +13,16 @@
 //!     "idx1"               (optional) legacy index — not needed to demux
 //! ```
 //!
+//! The demuxer streams from a plain `Read` (pipes work): opening a file reads
+//! only up to `movi`, and each packet is read on demand, so memory is bounded
+//! by the header and the largest packet — never the file size.
+//!
 //! Status: **demuxer implemented** (reads headers and yields packets); the
 //! muxer is still scaffolded. Note: AVI carries codecs we don't decode yet
 //! (e.g. H.264), so a full transcode out of an AVI waits on those codec bodies
 //! — but probing and stream-copy remuxing work today.
 
-use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{self, BufReader, Read};
 use std::ops::Range;
 
 use rff_core::{CodecId, Error, MediaType, Packet, PixelFormat, Rational, Result, SampleFormat};
@@ -91,19 +94,6 @@ fn riff_chunks(buf: &[u8], mut p: usize, end: usize) -> Vec<([u8; 4], Range<usiz
     out
 }
 
-/// Find a `LIST` chunk of the given list type, returning its data range
-/// (including the 4-byte list type at the front).
-fn find_list(
-    chunks: &[([u8; 4], Range<usize>)],
-    buf: &[u8],
-    list_type: &[u8; 4],
-) -> Option<Range<usize>> {
-    chunks
-        .iter()
-        .find(|(id, r)| id == b"LIST" && r.len() >= 4 && &buf[r.start..r.start + 4] == list_type)
-        .map(|(_, r)| r.clone())
-}
-
 /// Map a video codec fourcc (from `strf`/`strh`) to a [`CodecId`].
 fn map_video_fourcc(mut f: [u8; 4]) -> CodecId {
     f.make_ascii_uppercase();
@@ -131,38 +121,193 @@ fn pcm_format(tag: u16, bits: u16) -> Option<SampleFormat> {
 // Demuxer
 // ===========================================================================
 
+/// Largest `hdrl` list we buffer. Real headers are a few KiB (OpenDML super
+/// indexes push that to tens of KiB); anything near this is corrupt, and the
+/// cap keeps a hostile size field from turning into a giant read.
+const MAX_HEADER_LIST: u64 = 16 << 20;
+
+/// Streams an AVI from a plain [`Read`] — nothing seeks, so pipes work.
+///
+/// [`read_header`](Demuxer::read_header) reads up to the `movi` list: the
+/// `hdrl` list is buffered (it is small and parsed as a whole) and every other
+/// top-level chunk is skipped without being kept.
+/// [`read_packet`](Demuxer::read_packet) then reads one `movi` chunk at a
+/// time, so peak memory is the largest packet, not the file. Nothing after
+/// `movi` (`idx1`, OpenDML `RIFF AVIX` extensions) is read: packets carry no
+/// index-derived flags or timestamps.
 struct AviDemuxer {
-    input: Option<Input>,
-    /// Packets pre-extracted from `movi` during `read_header`.
-    packets: VecDeque<Packet>,
+    reader: BufReader<Input>,
+    header_read: bool,
+    /// Bytes left in the `movi` list body. `None` before the header, when the
+    /// file has no `movi`, and once the walk is over.
+    movi_left: Option<u64>,
+    /// The `rec ` interleave group being walked, if any.
+    rec: Option<RecGroup>,
+}
+
+/// An open `LIST rec ` group inside `movi`.
+struct RecGroup {
+    /// Bytes left in the group body.
+    left: u64,
+    /// The group's declared size is odd: a pad byte follows its body.
+    odd: bool,
+}
+
+/// Outcome of reading one child chunk of a list.
+enum Step {
+    Packet(Packet),
+    /// A chunk that is not a packet (`ix##`, `JUNK`, a nested list) was skipped.
+    Skipped,
+    /// The list (or the input) ended.
+    End,
 }
 
 impl AviDemuxer {
     fn new(input: Input) -> AviDemuxer {
         AviDemuxer {
-            input: Some(input),
-            packets: VecDeque::new(),
+            reader: BufReader::new(input),
+            header_read: false,
+            movi_left: None,
+            rec: None,
+        }
+    }
+
+    /// Stop the `movi` walk: every later `read_packet` is `Eof`.
+    fn finish(&mut self) {
+        self.movi_left = None;
+        self.rec = None;
+    }
+
+    /// The next packet from `movi`, or `None` once it (or the input) ends.
+    ///
+    /// Every iteration either consumes at least an 8-byte chunk header or
+    /// returns, so a malformed file cannot spin.
+    fn next_packet(&mut self) -> io::Result<Option<Packet>> {
+        let r = &mut self.reader;
+        loop {
+            let Some(mut movi_left) = self.movi_left else {
+                return Ok(None);
+            };
+
+            if let Some(mut rec) = self.rec.take() {
+                match read_child(r, &mut rec.left)? {
+                    Step::Packet(p) => {
+                        self.rec = Some(rec);
+                        return Ok(Some(p));
+                    }
+                    Step::Skipped => self.rec = Some(rec),
+                    Step::End => {
+                        // Resume `movi` where the group ends, then its pad.
+                        if !skip(r, rec.left)? {
+                            return Ok(None);
+                        }
+                        if rec.odd && movi_left > 0 {
+                            movi_left -= 1;
+                            self.movi_left = Some(movi_left);
+                            if !skip(r, 1)? {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if movi_left < 8 {
+                return Ok(None);
+            }
+            let Some((id, size)) = read_chunk_header(r)? else {
+                return Ok(None);
+            };
+            movi_left -= 8;
+            if size > movi_left {
+                return Ok(None); // overruns `movi`: the walk ends here
+            }
+            if &id == b"LIST" && size >= 4 {
+                // Interleave group: its children are the real data chunks.
+                let mut list_type = [0u8; 4];
+                if !read_full(r, &mut list_type)? {
+                    return Ok(None);
+                }
+                movi_left -= size;
+                self.movi_left = Some(movi_left);
+                if &list_type == b"rec " {
+                    self.rec = Some(RecGroup {
+                        left: size - 4,
+                        odd: size & 1 == 1,
+                    });
+                    continue;
+                }
+                // Any other list is not data.
+                if !skip(r, size - 4)? || !skip_pad(r, size, &mut movi_left)? {
+                    return Ok(None);
+                }
+                self.movi_left = Some(movi_left);
+                continue;
+            }
+            let step = finish_child(r, id, size, &mut movi_left)?;
+            self.movi_left = Some(movi_left);
+            match step {
+                Step::Packet(p) => return Ok(Some(p)),
+                Step::Skipped => {}
+                Step::End => return Ok(None),
+            }
         }
     }
 }
 
 impl Demuxer for AviDemuxer {
     fn read_header(&mut self) -> Result<Vec<Stream>> {
-        let mut input = self
-            .input
-            .take()
-            .ok_or_else(|| Error::invalid("avi demux: header already read"))?;
-        let mut buf = Vec::new();
-        input.read_to_end(&mut buf)?;
+        if self.header_read {
+            return Err(Error::invalid("avi demux: header already read"));
+        }
+        self.header_read = true;
+        let r = &mut self.reader;
 
-        if buf.len() < 12 || &buf[0..4] != b"RIFF" || &buf[8..12] != b"AVI " {
+        let mut riff = [0u8; 12];
+        if !read_full(r, &mut riff)? || &riff[0..4] != b"RIFF" || &riff[8..12] != b"AVI " {
             return Err(Error::invalid("avi demux: not a RIFF/AVI file"));
         }
 
-        let top = riff_chunks(&buf, 12, buf.len());
-        let hdrl = find_list(&top, &buf, b"hdrl")
-            .ok_or_else(|| Error::invalid("avi demux: no `hdrl` list"))?;
-        let hdrl_children = riff_chunks(&buf, hdrl.start + 4, hdrl.end);
+        // Walk the top level up to `movi` (the RIFF size is not trusted),
+        // keeping the first `hdrl` body and skipping everything else. A chunk
+        // cut short by the end of input ends the walk.
+        let mut hdrl: Option<Vec<u8>> = None;
+        while let Some((id, size)) = read_chunk_header(r)? {
+            if &id == b"LIST" && size >= 4 {
+                let mut list_type = [0u8; 4];
+                if !read_full(r, &mut list_type)? {
+                    break;
+                }
+                let body = size - 4;
+                if &list_type == b"movi" {
+                    self.movi_left = Some(body);
+                    break;
+                }
+                if &list_type == b"hdrl" && hdrl.is_none() {
+                    if body > MAX_HEADER_LIST {
+                        return Err(Error::invalid("avi demux: `hdrl` list too large"));
+                    }
+                    match read_body(r, body)? {
+                        Some(b) => hdrl = Some(b),
+                        None => break,
+                    }
+                } else if !skip(r, body)? {
+                    break;
+                }
+            } else if !skip(r, size)? {
+                break;
+            }
+            if size & 1 == 1 && !skip(r, 1)? {
+                break;
+            }
+        }
+
+        let Some(buf) = hdrl else {
+            self.finish();
+            return Err(Error::invalid("avi demux: no `hdrl` list before `movi`"));
+        };
+        let hdrl_children = riff_chunks(&buf, 0, buf.len());
 
         // Main header gives the frame size shared by the video stream(s).
         let (frame_w, frame_h) = match find(&hdrl_children, b"avih") {
@@ -183,20 +328,25 @@ impl Demuxer for AviDemuxer {
             }
         }
 
-        // Pre-extract every data chunk in `movi` into a packet.
-        if let Some(movi) = find_list(&top, &buf, b"movi") {
-            collect_movi_packets(&buf, movi, &mut self.packets);
-        }
-
         Ok(streams)
     }
 
     fn read_packet(&mut self) -> Result<Packet> {
-        self.packets.pop_front().ok_or(Error::Eof)
+        match self.next_packet() {
+            Ok(Some(p)) => Ok(p),
+            Ok(None) => {
+                self.finish();
+                Err(Error::Eof)
+            }
+            Err(e) => {
+                self.finish();
+                Err(e.into())
+            }
+        }
     }
 }
 
-fn find<'a>(chunks: &[([u8; 4], Range<usize>)], id: &[u8; 4]) -> Option<Range<usize>> {
+fn find(chunks: &[([u8; 4], Range<usize>)], id: &[u8; 4]) -> Option<Range<usize>> {
     chunks.iter().find(|(i, _)| i == id).map(|(_, r)| r.clone())
 }
 
@@ -257,29 +407,91 @@ fn parse_strl(
     Some(stream)
 }
 
-/// Walk a `movi` list (data range includes the leading `movi` 4cc) and turn
-/// every data chunk into a packet, descending into `rec ` interleave groups.
-fn collect_movi_packets(buf: &[u8], movi: Range<usize>, out: &mut VecDeque<Packet>) {
-    for (id, r) in riff_chunks(buf, movi.start + 4, movi.end) {
-        if id == *b"LIST" && r.len() >= 4 && &buf[r.start..r.start + 4] == b"rec " {
-            // Interleave group: its children are the real data chunks.
-            for (cid, cr) in riff_chunks(buf, r.start + 4, r.end) {
-                push_data_chunk(buf, cid, cr, out);
-            }
-        } else {
-            push_data_chunk(buf, id, r, out);
-        }
+// ===========================================================================
+// Streaming RIFF helpers
+// ===========================================================================
+
+/// `read_exact` that reports end of input as `Ok(false)`.
+fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
+    match r.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
-/// Append a `##xx` data chunk as a packet; the first two ASCII digits of the
-/// chunk id are the stream index. Non-data chunks (e.g. `ix##`, `JUNK`) skip.
-fn push_data_chunk(buf: &[u8], id: [u8; 4], data: Range<usize>, out: &mut VecDeque<Packet>) {
-    if !id[0].is_ascii_digit() || !id[1].is_ascii_digit() {
-        return;
+/// Read a chunk header `[4cc id][u32 LE size]`; `None` at end of input.
+fn read_chunk_header<R: Read>(r: &mut R) -> io::Result<Option<([u8; 4], u64)>> {
+    let mut h = [0u8; 8];
+    if !read_full(r, &mut h)? {
+        return Ok(None);
     }
-    let stream_index = ((id[0] - b'0') * 10 + (id[1] - b'0')) as usize;
-    out.push_back(Packet::from_data(stream_index, buf[data].to_vec()));
+    let id = [h[0], h[1], h[2], h[3]];
+    let size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as u64;
+    Ok(Some((id, size)))
+}
+
+/// Discard `n` bytes; `false` if the input ended first.
+fn skip<R: Read>(r: &mut R, n: u64) -> io::Result<bool> {
+    Ok(io::copy(&mut r.by_ref().take(n), &mut io::sink())? == n)
+}
+
+/// Read exactly `n` bytes, allocating only as data actually arrives (a lying
+/// size field cannot force a large allocation); `None` if the input ended.
+fn read_body<R: Read>(r: &mut R, n: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut v = Vec::new();
+    r.by_ref().take(n).read_to_end(&mut v)?;
+    Ok((v.len() as u64 == n).then_some(v))
+}
+
+/// Consume the word-alignment pad byte after an odd-sized chunk — but only if
+/// the enclosing list still covers it. Otherwise the parent resumes where the
+/// chunk's data ended, exactly as the slice walker [`riff_chunks`] does.
+fn skip_pad<R: Read>(r: &mut R, size: u64, left: &mut u64) -> io::Result<bool> {
+    if size & 1 == 1 && *left > 0 {
+        *left -= 1;
+        return skip(r, 1);
+    }
+    Ok(true)
+}
+
+/// Read the next child of a list that has `left` body bytes remaining. Lists
+/// nested here (inside a `rec ` group) are skipped like any non-data chunk.
+fn read_child<R: Read>(r: &mut R, left: &mut u64) -> io::Result<Step> {
+    if *left < 8 {
+        return Ok(Step::End);
+    }
+    let Some((id, size)) = read_chunk_header(r)? else {
+        return Ok(Step::End);
+    };
+    *left -= 8;
+    if size > *left {
+        return Ok(Step::End); // overruns the list: it ends here
+    }
+    finish_child(r, id, size, left)
+}
+
+/// With a child's header read (and `size <= *left` checked), turn a `##xx`
+/// data chunk into a packet — the first two ASCII digits of the id are the
+/// stream index — or skip any other chunk (`ix##`, `JUNK`, ...), then consume
+/// its pad byte. A chunk cut short by the end of input is dropped (`End`).
+fn finish_child<R: Read>(r: &mut R, id: [u8; 4], size: u64, left: &mut u64) -> io::Result<Step> {
+    *left -= size;
+    let step = if id[0].is_ascii_digit() && id[1].is_ascii_digit() {
+        let Some(data) = read_body(r, size)? else {
+            return Ok(Step::End);
+        };
+        let stream_index = ((id[0] - b'0') * 10 + (id[1] - b'0')) as usize;
+        Step::Packet(Packet::from_data(stream_index, data))
+    } else {
+        if !skip(r, size)? {
+            return Ok(Step::End);
+        }
+        Step::Skipped
+    };
+    // A pad byte missing at end of input just makes the next read end.
+    skip_pad(r, size, left)?;
+    Ok(step)
 }
 
 // ===========================================================================
@@ -547,6 +759,9 @@ fn strf(s: &Stream) -> Result<Vec<u8>> {
         }
     }
 }
+
+#[cfg(test)]
+mod stream_tests;
 
 #[cfg(test)]
 mod tests {
