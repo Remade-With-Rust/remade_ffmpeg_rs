@@ -5524,9 +5524,9 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rusty-opus"
-version = "1.0.0"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6f45b2cc805b83960083f25b77df0c678cae5ac89a3138e6994aed8c62e2cba"
+checksum = "46604e6809c06441da1cfdde1f0cc25a4f2bf42c7d005aa387c2875c02d78762"
 
 [[package]]
 name = "rusty_aac"
@@ -5537,9 +5537,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_alloc"
-version = "2.2.5"
+version = "2.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c12ed1752127ac2fabc5bc5aed934055f4be5f093885d830a66686bff4cd7668"
+checksum = "318c1ca44267aa30e631ed57f8c1db3e25991374bdadc35d97db11b65faba496"
 dependencies = [
  "libc",
  "portable-atomic",
@@ -5548,9 +5548,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_alloc-api"
-version = "2.2.5"
+version = "2.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a68d299fc4818e1b26164556504f28240de294ea709c519ec465add9238f30f7"
+checksum = "613568557b57208dff4fa2cdb1ada1bc98339d3cc3ab9533edd712c4946165b4"
 dependencies = [
  "rusty_alloc",
 ]
@@ -5615,9 +5615,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_av2d"
-version = "0.2.12"
+version = "0.2.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "126043dec89da9d72fd6b4d45d9948e337933f88bc7aeca8e98fb81f0aea6a64"
+checksum = "d22d70328494c17935eb0408bc9afef06890b6a9b4a23b414647b614ca02d9fa"
 dependencies = [
  "assert_matches",
  "atomig",
@@ -5636,9 +5636,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_av2f"
-version = "0.2.0"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d73ba33bdce3e99a7b6952daf848eda737756e5db66bb3be91471660944a1922"
+checksum = "5d0759292494abff44394742849f17ebcde329ed647e140ba301442efba14641"
 
 [[package]]
 name = "rusty_flac"
@@ -5720,14 +5720,14 @@ version = "0.6.1"
 
 [[package]]
 name = "rusty_jpeg"
-version = "0.4.0"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c0867b42b4af7cfcce3466505720f64edfa6ef1782cdca2f712cf5ca711807d"
+checksum = "f3794e723ee5f142ba039039aa701e42263851a0f3921116ec0d389adede2211"
 
 [[package]]
 name = "rusty_json_turbo"
-version = "0.2.0"
-source = "git+https://github.com/Remade-With-Rust/rusty_json_turbo?branch=master#b32e30c2a67584119248ba01b1164a596b6dc713"
+version = "0.3.2"
+source = "git+https://github.com/Remade-With-Rust/rusty_json_turbo?branch=master#d33e58019d8f04ffb561689252fac2f3e0cdfd43"
 dependencies = [
  "itoa 1.0.18",
  "memchr",
@@ -5739,8 +5739,8 @@ dependencies = [
 
 [[package]]
 name = "rusty_json_turbo-accel"
-version = "0.2.0"
-source = "git+https://github.com/Remade-With-Rust/rusty_json_turbo?branch=master#b32e30c2a67584119248ba01b1164a596b6dc713"
+version = "0.3.2"
+source = "git+https://github.com/Remade-With-Rust/rusty_json_turbo?branch=master#d33e58019d8f04ffb561689252fac2f3e0cdfd43"
 
 [[package]]
 name = "rusty_mp3"
@@ -5940,7 +5940,7 @@ dependencies = [
 [[package]]
 name = "serde_json"
 version = "1.0.151"
-source = "git+https://github.com/Remade-With-Rust/rusty_json_turbo?branch=master#b32e30c2a67584119248ba01b1164a596b6dc713"
+source = "git+https://github.com/Remade-With-Rust/rusty_json_turbo?branch=master#d33e58019d8f04ffb561689252fac2f3e0cdfd43"
 dependencies = [
  "rusty_json_turbo",
 ]
