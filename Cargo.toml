@@ -159,7 +159,7 @@ rff-auth = { path = "crates/rff-auth", version = "0.2.2" }
 # The registry versions are toolkit MAIN (the merged no-asm fix + the
 # prom_av1e content-dispatch tier), ahead of the old b471be0 branch pin.
 rusty_av1e = { version = "0.8.0", default-features = false }
-rusty_av1d = { version = "1.2.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+rusty_av1d = { version = "1.2.1", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 # png: our own rusty_png â€” a performance fork of image-rs/image-png 0.17.16
 # (MIT/Apache-2.0), carried forward in-tree. DEFLATE via miniz_oxide/fdeflate,
 # with an opt-in pure-Rust `zlib-rs` backend. See crates/rusty_png/NOTICE.md.
@@ -265,15 +265,3 @@ panic = "unwind"
 # `rusty_json_turbo`. See that repository's `crates/serde_json-shim/`.
 [patch.crates-io]
 serde_json = { git = "https://github.com/Remade-With-Rust/rusty_json_turbo", branch = "master" }
-
-# rusty_av2d <= 0.2.11 computes the GDF stripe base as `origin + (i_min - 1) *
-# stride + (j_min - 1)` in usize (av2_gdf.rs:549), which underflows on the first
-# stripe/column of every GDF frame — valid input included — and so panics under
-# debug overflow checks. Release wraps to exactly the intended address (the C
-# reference's negative offset), and av2f_still is byte-identical there. Match
-# release semantics for this one dependency in dev/test builds until the
-# upstream fix (add-before-subtract) is published, then delete this block.
-# Tracked in issue #14.
-[profile.dev.package.rusty_av2d]
-overflow-checks = false
-

@@ -13,7 +13,8 @@ byte-identical to AOM's `avmdec` across a 45-clip conformance corpus — lives i
 > ### Decode robustness in debug builds
 >
 > Two separate `rusty_av2d` (≤ 0.2.11) behaviours used to bite **debug builds
-> only**; release builds were never affected. Both are handled in this crate:
+> only**; release builds were never affected. Both are fixed — this crate
+> requires `rusty_av2d` ≥ 0.2.12:
 >
 > * **Empty packet → process abort.** `rusty_av2d`'s input validation calls
 >   `abort()` under `debug_assertions` when handed zero bytes
@@ -25,11 +26,10 @@ byte-identical to AOM's `avmdec` across a 45-clip conformance corpus — lives i
 >   computed as `(i_min - 1)` in `usize`, which underflows on the first stripe
 >   of every GDF frame (valid input included) and panics under overflow checks.
 >   Release wraps to exactly the intended address — `av2f_still` decodes
->   byte-identically to the reference there. This workspace disables overflow
->   checks for `rusty_av2d` in its dev profile until the upstream
->   add-before-subtract fix is published. A downstream **debug** build that
->   decodes GDF content needs the same `[profile.dev.package.rusty_av2d]
->   overflow-checks = false` override, or a release build.
+>   byte-identically to the reference there. **Fixed upstream in
+>   `rusty_av2d` 0.2.12** (add before subtracting — the same address in every
+>   build), so debug builds decode GDF content with overflow checks on and
+>   need no override.
 
 ```rust
 let mut registry = rff_codec::CodecRegistry::new();
