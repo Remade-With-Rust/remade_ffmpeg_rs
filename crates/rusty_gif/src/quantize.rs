@@ -45,9 +45,15 @@ enum Policy {
     /// Content-routed defaults (see `route_auto`); what ships.
     Auto,
     Upstream,
-    Kmeans { iters: usize },
-    Unique { cap: u32 },
-    Budget { pixels: usize },
+    Kmeans {
+        iters: usize,
+    },
+    Unique {
+        cap: u32,
+    },
+    Budget {
+        pixels: usize,
+    },
 }
 
 /// Above this many unique colors the k-means assignment step (cost ∝
@@ -188,7 +194,11 @@ pub(crate) fn quantize_frame(
         }
         Route::UniqueStream { cap } => {
             let mut stream: Vec<u8> = Vec::with_capacity(
-                colors.iter().map(|&(_, c)| c.min(cap) as usize).sum::<usize>() * 4,
+                colors
+                    .iter()
+                    .map(|&(_, c)| c.min(cap) as usize)
+                    .sum::<usize>()
+                    * 4,
             );
             for &(k, count) in &colors {
                 let bytes = k.to_le_bytes();
@@ -214,7 +224,10 @@ pub(crate) fn quantize_frame(
     #[cfg(debug_assertions)]
     {
         let palette_len = frame.palette.as_ref().map_or(0, |p| p.len());
-        debug_assert!(palette_len > 0 && palette_len <= 256 * 3, "palette out of range");
+        debug_assert!(
+            palette_len > 0 && palette_len <= 256 * 3,
+            "palette out of range"
+        );
         debug_assert_eq!(frame.buffer.len(), pixels.len() / 4, "index buffer size");
     }
     frame
@@ -298,14 +311,20 @@ mod tests {
     /// losslessly through palette+indices.
     #[test]
     fn exact_route_fires_and_is_lossless() {
-        let colors: Vec<(u8, u8, u8)> = (0..64u16).map(|i| (i as u8, (i * 2) as u8, 255 - i as u8)).collect();
+        let colors: Vec<(u8, u8, u8)> = (0..64u16)
+            .map(|i| (i as u8, (i * 2) as u8, 255 - i as u8))
+            .collect();
         let px = rgba(&colors, 16); // 1024 px, 64 unique
         let frame = quantize_frame(32, 32, &px, 1, None);
         let pal = frame.palette.as_ref().unwrap();
         assert_eq!(pal.len(), 64 * 3);
         for (i, p) in px.chunks_exact(4).enumerate() {
             let idx = frame.buffer[i] as usize;
-            assert_eq!(&pal[idx * 3..idx * 3 + 3], &p[..3], "pixel {i} not lossless");
+            assert_eq!(
+                &pal[idx * 3..idx * 3 + 3],
+                &p[..3],
+                "pixel {i} not lossless"
+            );
         }
     }
 
@@ -315,17 +334,35 @@ mod tests {
     #[test]
     fn auto_route_boundaries() {
         assert_eq!(route_auto(257, 100_000, 1), Route::Histogram { iters: 3 });
-        assert_eq!(route_auto(32_768, 100_000, 1), Route::Histogram { iters: 3 });
-        assert_eq!(route_auto(32_769, 100_000, 1), Route::Histogram { iters: 2 });
-        assert_eq!(route_auto(49_152, 100_000, 1), Route::Histogram { iters: 2 });
-        assert_eq!(route_auto(49_153, 100_000, 1), Route::Histogram { iters: 1 });
-        assert_eq!(route_auto(65_536, 100_000, 1), Route::Histogram { iters: 1 });
+        assert_eq!(
+            route_auto(32_768, 100_000, 1),
+            Route::Histogram { iters: 3 }
+        );
+        assert_eq!(
+            route_auto(32_769, 100_000, 1),
+            Route::Histogram { iters: 2 }
+        );
+        assert_eq!(
+            route_auto(49_152, 100_000, 1),
+            Route::Histogram { iters: 2 }
+        );
+        assert_eq!(
+            route_auto(49_153, 100_000, 1),
+            Route::Histogram { iters: 1 }
+        );
+        assert_eq!(
+            route_auto(65_536, 100_000, 1),
+            Route::Histogram { iters: 1 }
+        );
         // High diversity → budget-sampled NeuQuant, samplefac from pixel count.
         assert_eq!(
             route_auto(65_537, 2_073_600, 1),
             Route::PixelStream { samplefac: 17 }
         );
-        assert_eq!(route_auto(65_537, 100_000, 1), Route::PixelStream { samplefac: 1 });
+        assert_eq!(
+            route_auto(65_537, 100_000, 1),
+            Route::PixelStream { samplefac: 1 }
+        );
     }
 
     /// Every auto arm must actually execute end-to-end (not just be
@@ -338,8 +375,9 @@ mod tests {
         assert_eq!(f.palette.as_ref().unwrap().len(), 2 * 3);
 
         // Histogram (k-means): ~1k unique colors.
-        let colors: Vec<(u8, u8, u8)> =
-            (0..1024u32).map(|i| ((i % 256) as u8, (i / 4) as u8, 77)).collect();
+        let colors: Vec<(u8, u8, u8)> = (0..1024u32)
+            .map(|i| ((i % 256) as u8, (i / 4) as u8, 77))
+            .collect();
         let px = rgba(&colors, 1);
         let f = quantize_frame(32, 32, &px, 1, None);
         assert!(f.palette.as_ref().unwrap().len() <= 256 * 3);
@@ -349,7 +387,12 @@ mod tests {
         let mut px = Vec::with_capacity(66_000 * 4);
         for i in 0..66_000u32 {
             // Distinct RGB per pixel.
-            px.extend_from_slice(&[(i & 0xFF) as u8, ((i >> 8) & 0xFF) as u8, ((i >> 16) as u8) | 0x40, 0xFF]);
+            px.extend_from_slice(&[
+                (i & 0xFF) as u8,
+                ((i >> 8) & 0xFF) as u8,
+                ((i >> 16) as u8) | 0x40,
+                0xFF,
+            ]);
         }
         let f = quantize_frame(300, 220, &px, 1, None);
         assert!(f.palette.as_ref().unwrap().len() <= 256 * 3);
@@ -360,7 +403,9 @@ mod tests {
     /// pixel to an in-range palette index.
     #[test]
     fn unique_stream_route_fires() {
-        let colors: Vec<(u8, u8, u8)> = (0..512u16).map(|i| ((i / 2) as u8, (i % 256) as u8, (i / 3) as u8)).collect();
+        let colors: Vec<(u8, u8, u8)> = (0..512u16)
+            .map(|i| ((i / 2) as u8, (i % 256) as u8, (i / 3) as u8))
+            .collect();
         let px = rgba(&colors, 2); // 1024 px, >256 unique
         let frame = quantize_frame(32, 32, &px, 1, None);
         let pal_len = frame.palette.as_ref().unwrap().len() / 3;

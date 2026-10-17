@@ -1,0 +1,143 @@
+//! The pre-#26 WAV demuxer (data chunk read whole, delivered as one packet),
+//! kept test-only as the equivalence oracle for the streaming one: the
+//! concatenated payload of the streaming demuxer's packets must equal this
+//! one's single packet on every layout.
+
+use std::io::Read;
+use std::ops::Range;
+
+use rff_core::{CodecId, Error, Packet, Rational, Result, SampleFormat};
+use rff_format::{Demuxer, Input, Stream};
+
+use super::{parse_fmt, probe_wav, rd_u32, Delivery, WavFmt};
+
+/// Walk RIFF sub-chunks in `buf[start..]`, returning `(id, data_range)` pairs.
+pub(crate) fn chunks(buf: &[u8], mut p: usize) -> Vec<([u8; 4], Range<usize>)> {
+    let mut out = Vec::new();
+    while p + 8 <= buf.len() {
+        let id = [buf[p], buf[p + 1], buf[p + 2], buf[p + 3]];
+        let size = rd_u32(buf, p + 4) as usize;
+        let start = p + 8;
+        let end = (start + size).min(buf.len());
+        out.push((id, start..end));
+        p = end + (size & 1); // pad to even
+    }
+    out
+}
+
+/// How much of the file was read before the `data` chunk was located.
+pub(crate) const HEAD_BYTES: u64 = 64 * 1024;
+
+fn read_wav(input: &mut Input) -> Result<(WavFmt, Vec<u8>)> {
+    let mut head = Vec::new();
+    input.by_ref().take(HEAD_BYTES).read_to_end(&mut head)?;
+    if probe_wav(&head) != 0 {
+        let top = chunks(&head, 12);
+        let fmt = top.iter().position(|(id, _)| id == b"fmt ");
+        let data = top.iter().position(|(id, _)| id == b"data");
+        if let (Some(f), Some(d)) = (fmt, data) {
+            if f < d {
+                let fmt = parse_fmt(&head[top[f].1.clone()])?;
+                let start = top[d].1.start;
+                let declared = rd_u32(&head, start - 4) as usize;
+                let mut samples = Vec::with_capacity(declared.min(1 << 28));
+                samples.extend_from_slice(&head[start..]);
+                input.read_to_end(&mut samples)?;
+                samples.truncate(declared);
+                return Ok((fmt, samples));
+            }
+        }
+    }
+
+    let mut buf = head;
+    input.read_to_end(&mut buf)?;
+    if probe_wav(&buf) == 0 {
+        return Err(Error::invalid("wav demux: not a RIFF/WAVE file"));
+    }
+    let top = chunks(&buf, 12);
+    let fmt = top
+        .iter()
+        .find(|(id, _)| id == b"fmt ")
+        .map(|(_, r)| r.clone())
+        .ok_or_else(|| Error::invalid("wav demux: no `fmt ` chunk"))?;
+    let fmt = parse_fmt(&buf[fmt])?;
+    let data = top
+        .iter()
+        .find(|(id, _)| id == b"data")
+        .map(|(_, r)| r.clone())
+        .ok_or_else(|| Error::invalid("wav demux: no `data` chunk"))?;
+    buf.truncate(data.end);
+    buf.drain(..data.start);
+    Ok((fmt, buf))
+}
+
+pub(crate) struct LegacyWavDemuxer {
+    input: Option<Input>,
+    sample: Option<Vec<u8>>,
+}
+
+impl LegacyWavDemuxer {
+    pub(crate) fn new(input: Input) -> LegacyWavDemuxer {
+        LegacyWavDemuxer {
+            input: Some(input),
+            sample: None,
+        }
+    }
+}
+
+impl Demuxer for LegacyWavDemuxer {
+    fn read_header(&mut self) -> Result<Vec<Stream>> {
+        let mut input = self
+            .input
+            .take()
+            .ok_or_else(|| Error::invalid("wav demux: header already read"))?;
+        let (
+            WavFmt {
+                channels,
+                sample_rate,
+                delivery,
+            },
+            raw,
+        ) = read_wav(&mut input)?;
+        let (format, data) = match delivery {
+            Delivery::Native(fmt) => (fmt, raw),
+            Delivery::U8ToS16 => {
+                let mut out = Vec::with_capacity(raw.len() * 2);
+                for &b in &raw {
+                    let v = ((b as i16) - 128) << 8;
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                (SampleFormat::S16, out)
+            }
+            Delivery::S24ToF32 => {
+                let n = raw.len() / 3;
+                let mut out = Vec::with_capacity(n * 4);
+                const SCALE: f32 = 1.0 / 8_388_608.0;
+                for s in raw[..n * 3].chunks_exact(3) {
+                    let v = i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8;
+                    out.extend_from_slice(&(v as f32 * SCALE).to_le_bytes());
+                }
+                (SampleFormat::F32, out)
+            }
+        };
+        self.sample = Some(data);
+
+        let mut stream = Stream::new(0, CodecId::Pcm);
+        stream.sample_rate = sample_rate;
+        stream.channels = channels;
+        stream.sample_format = Some(format);
+        stream.time_base = Rational::new(1, sample_rate.max(1) as i32);
+        Ok(vec![stream])
+    }
+
+    fn read_packet(&mut self) -> Result<Packet> {
+        match self.sample.take() {
+            Some(data) => {
+                let mut packet = Packet::from_data(0, data);
+                packet.pts = Some(0);
+                Ok(packet)
+            }
+            None => Err(Error::Eof),
+        }
+    }
+}

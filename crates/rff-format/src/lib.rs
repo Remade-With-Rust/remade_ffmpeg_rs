@@ -16,7 +16,7 @@ pub mod avc;
 pub mod hvc;
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 
 use rff_core::{
     CodecId, ColorRange, Dictionary, Error, MediaType, Packet, PixelFormat, Rational, Result,
@@ -83,6 +83,18 @@ impl Stream {
 /// A byte source a demuxer reads from. (`Box<dyn Read + Send>` keeps the trait
 /// object-safe and lets inputs be files, network streams, or in-memory buffers.)
 pub type Input = Box<dyn Read + Send>;
+
+/// A byte source that can also seek — what a local file or an in-memory buffer
+/// offers and a pipe or socket does not. Blanket-implemented for every
+/// `Read + Seek` type.
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+/// A seekable [`Input`]. Formats whose index can sit anywhere in the file (MP4's
+/// `moov`) use it to read only that index and fetch each payload on demand,
+/// instead of buffering the whole file. It upcasts to [`Input`] for formats
+/// that only stream.
+pub type SeekInput = Box<dyn ReadSeek + Send>;
 /// A byte sink a muxer writes to.
 pub type Output = Box<dyn Write + Send>;
 
@@ -115,14 +127,16 @@ pub trait Muxer: Send {
 
 /// Factory opening a demuxer over an input byte source.
 pub type DemuxerFactory = fn(Input) -> Box<dyn Demuxer>;
+/// Factory opening a demuxer over a [`SeekInput`] — registered alongside the
+/// format's [`DemuxerFactory`] by formats that read less when they can seek.
+pub type SeekableDemuxerFactory = fn(SeekInput) -> Box<dyn Demuxer>;
 /// Factory opening a muxer over an output byte sink.
 pub type MuxerFactory = fn(Output) -> Box<dyn Muxer>;
 /// Factory opening a muxer that owns its own file set (HLS/DASH write a
 /// playlist/manifest plus many segment files, so a single byte sink cannot
 /// model them). Receives the output path and the format options
 /// (`-hls_time 6` → `{"hls_time": "6"}`).
-pub type PathMuxerFactory =
-    fn(&std::path::Path, &Dictionary) -> Result<Box<dyn Muxer>>;
+pub type PathMuxerFactory = fn(&std::path::Path, &Dictionary) -> Result<Box<dyn Muxer>>;
 /// Content sniffer: scores how strongly a byte prefix looks like this format,
 /// `0` (no match) to `100` (certain) — mirrors FFmpeg's `AVInputFormat::read_probe`.
 pub type ProbeFn = fn(&[u8]) -> i32;
@@ -233,6 +247,9 @@ impl Format {
 #[derive(Default)]
 pub struct FormatRegistry {
     by_name: HashMap<&'static str, Format>,
+    /// Seek-aware demuxer factories, keyed by format name (see
+    /// [`register_seekable_demuxer`](Self::register_seekable_demuxer)).
+    seekable: HashMap<&'static str, SeekableDemuxerFactory>,
 }
 
 impl FormatRegistry {
@@ -242,6 +259,18 @@ impl FormatRegistry {
 
     pub fn register(&mut self, format: Format) {
         self.by_name.insert(format.name, format);
+    }
+
+    /// Give the format named `name` a demuxer that takes a [`SeekInput`]. Used
+    /// by [`open_demuxer_seekable`](Self::open_demuxer_seekable) when the caller
+    /// has a seekable source; the plain [`Format::demuxer`] still serves pipes
+    /// and sockets.
+    pub fn register_seekable_demuxer(
+        &mut self,
+        name: &'static str,
+        factory: SeekableDemuxerFactory,
+    ) {
+        self.seekable.insert(name, factory);
     }
 
     pub fn by_name(&self, name: &str) -> Option<&Format> {
@@ -279,6 +308,20 @@ impl FormatRegistry {
             .ok_or_else(|| Error::DemuxerNotFound(name.to_string()))
     }
 
+    /// Open a demuxer over a seekable input: the format's seek-aware demuxer if
+    /// it registered one, otherwise its plain streaming demuxer (a seekable
+    /// source is still a byte stream). Callers that hold a file should prefer
+    /// this — it is what lets MP4 read only `moov` instead of the whole file.
+    pub fn open_demuxer_seekable(&self, name: &str, input: SeekInput) -> Result<Box<dyn Demuxer>> {
+        if !self.by_name.get(name).is_some_and(Format::can_demux) {
+            return Err(Error::DemuxerNotFound(name.to_string()));
+        }
+        match self.seekable.get(name) {
+            Some(factory) => Ok(factory(input)),
+            None => self.open_demuxer(name, input),
+        }
+    }
+
     /// Open a muxer for the format named `name`.
     pub fn open_muxer(&self, name: &str, output: Output) -> Result<Box<dyn Muxer>> {
         self.by_name
@@ -298,5 +341,69 @@ impl FormatRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.by_name.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Reports which factory built it via the stream count.
+    struct Tagged(usize);
+    impl Demuxer for Tagged {
+        fn read_header(&mut self) -> Result<Vec<Stream>> {
+            Ok((0..self.0).map(|i| Stream::new(i, CodecId::None)).collect())
+        }
+        fn read_packet(&mut self) -> Result<rff_core::Packet> {
+            Err(Error::Eof)
+        }
+    }
+
+    fn format(name: &'static str) -> Format {
+        Format {
+            name,
+            long_name: name,
+            extensions: &[],
+            demuxer: Some(|_| Box::new(Tagged(1))),
+            muxer: None,
+            muxer_path: None,
+            probe: None,
+            mux_caps: MuxCaps::NONE,
+        }
+    }
+
+    fn streams(mut d: Box<dyn Demuxer>) -> usize {
+        d.read_header().unwrap().len()
+    }
+
+    #[test]
+    fn seekable_open_prefers_the_seekable_factory_and_falls_back() {
+        let mut r = FormatRegistry::new();
+        r.register(format("plain"));
+        r.register(format("seeky"));
+        r.register_seekable_demuxer("seeky", |_| Box::new(Tagged(2)));
+        let input = || -> SeekInput { Box::new(Cursor::new(vec![0u8; 4])) };
+        assert_eq!(
+            streams(r.open_demuxer_seekable("seeky", input()).unwrap()),
+            2
+        );
+        // No seekable factory: the streaming one serves the seekable input.
+        assert_eq!(
+            streams(r.open_demuxer_seekable("plain", input()).unwrap()),
+            1
+        );
+        // A plain stream open never takes the seekable path.
+        assert_eq!(
+            streams(
+                r.open_demuxer("seeky", Box::new(Cursor::new(vec![])))
+                    .unwrap()
+            ),
+            1
+        );
+        assert!(matches!(
+            r.open_demuxer_seekable("missing", input()),
+            Err(Error::DemuxerNotFound(_))
+        ));
     }
 }

@@ -327,7 +327,9 @@ pub fn luma_edge(data: &mut [u16], stride: usize, x: usize, y: usize, dir: usize
     // The segment's whole footprint, so the kernel's loads and stores need no
     // further checks. Vertical edges touch `x-4 ..= x+3` on rows `y ..= y+3`;
     // horizontal edges touch column `x ..= x+3` on rows `y-4 ..= y+3`.
-    let ok = x >= 4 && x + 4 <= stride && (y + 4) * stride <= data.len() && (dir == 0 || y >= 4);
+    // (`x >= 4` is a vertical-edge condition only: a horizontal edge at x = 0
+    // -- every picture's left column -- is legal and its footprint starts at x.)
+    let ok = x + 4 <= stride && (y + 4) * stride <= data.len() && if dir == 0 { x >= 4 } else { y >= 4 };
     debug_assert!(ok, "deblock bounds: dir={dir} x={x} y={y} stride={stride} len={}", data.len());
 
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]

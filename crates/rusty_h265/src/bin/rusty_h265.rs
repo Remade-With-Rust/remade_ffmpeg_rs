@@ -153,7 +153,11 @@ fn main() {
             rusty_h265::filters::SAO_PLANE.load(Ordering::Relaxed),
             rusty_h265::filters::SAO_SPANS.load(Ordering::Relaxed),
         );
-        eprintln!("SAO copy: {cp} of {pl} samples ({:.1}%) in {sp} spans, {:.0} samples/span", 100.0 * cp as f64 / pl as f64, cp as f64 / sp.max(1) as f64);
+        eprintln!(
+            "SAO copy: {cp} of {pl} samples ({:.1}%) in {sp} spans, {:.0} samples/span",
+            100.0 * cp as f64 / pl as f64,
+            cp as f64 / sp.max(1) as f64
+        );
     }
     if std::env::var_os("RH265_POOL").is_some() {
         use std::sync::atomic::Ordering;
@@ -163,7 +167,10 @@ fn main() {
             rusty_h265::decoder::RECL_SHARED.load(Ordering::Relaxed),
             rusty_h265::decoder::RECL_FULL.load(Ordering::Relaxed),
         );
-        eprintln!("picture pool: {h} reused, {m} fresh ({:.0}% hit); reclaim: {ok} ok, {sh} still shared, {fu} pool full", 100.0 * h as f64 / (h + m).max(1) as f64);
+        eprintln!(
+            "picture pool: {h} reused, {m} fresh ({:.0}% hit); reclaim: {ok} ok, {sh} still shared, {fu} pool full",
+            100.0 * h as f64 / (h + m).max(1) as f64
+        );
     }
     if let Some(e) = first_err {
         eprintln!("first error: {e}");

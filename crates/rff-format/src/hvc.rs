@@ -42,7 +42,10 @@ pub fn parse_hvcc(hvcc: &[u8]) -> Option<AvcConfig> {
     if headers.is_empty() {
         return None;
     }
-    Some(AvcConfig { nal_len, headers_annexb: headers })
+    Some(AvcConfig {
+        nal_len,
+        headers_annexb: headers,
+    })
 }
 
 /// The SPS fields an `hvcC` record has to repeat.
@@ -67,7 +70,11 @@ pub struct SpsInfo {
 /// NAL header, emulation prevention still in place).
 pub fn sps_info(nal: &[u8]) -> Option<SpsInfo> {
     // Strip the NAL header when present (nal_unit_type 33).
-    let payload = if !nal.is_empty() && (nal[0] >> 1) & 0x3f == 33 { nal.get(2..)? } else { nal };
+    let payload = if !nal.is_empty() && (nal[0] >> 1) & 0x3f == 33 {
+        nal.get(2..)?
+    } else {
+        nal
+    };
     let rbsp = unescape(payload);
     let mut r = Bits::new(&rbsp);
     r.bits(4)?; // sps_video_parameter_set_id
@@ -162,7 +169,7 @@ pub fn build_hvcc_record(vps: &[u8], sps: &[u8], pps: &[u8]) -> Option<Vec<u8>> 
     out.push(0xf8 | (info.bit_depth_luma - 8));
     out.push(0xf8 | (info.bit_depth_chroma - 8));
     out.extend_from_slice(&[0, 0]); // avgFrameRate = 0 (unspecified)
-    // constantFrameRate=0, numTemporalLayers, temporalIdNested, lengthSizeMinusOne=3
+                                    // constantFrameRate=0, numTemporalLayers, temporalIdNested, lengthSizeMinusOne=3
     out.push((info.max_sub_layers << 3) | ((info.temporal_id_nesting as u8) << 2) | 3);
     let arrays: [(u8, &[u8]); 3] = [(32, vps), (33, sps), (34, pps)];
     let present = arrays.iter().filter(|(_, n)| !n.is_empty()).count();

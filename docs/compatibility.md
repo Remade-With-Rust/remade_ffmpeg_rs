@@ -24,11 +24,11 @@ licensed (CI-enforced by `cargo-deny`).
 | AAC (LC, Main, LTP, HE-AAC v1/v2, ER LD/ELD; encode LC) | ✅ | ✅ (LC) | in-house (`rusty_aac`) | decode: all 83 non-USAC ISO/IEC 14496-26 streams within 1 LSB of FFmpeg; encode validated (ffmpeg decodes our `.m4a` at unity) · ⚖ |
 | PCM | ✅ | ✅ | in-house | validated |
 | AV1 / AVIF | ✅ | ✅ (still-picture) | rav1d / rav1e forks (pure Rust) | validated · video-mode AV1 *encode* wiring is a known gap (the encoder exists; the adapter is still-image-only) · **decode robustness:** rav1d's input validation `abort()`s on malformed AV1 under `debug_assertions` (debug builds); **release returns `Err`** (verified). We pre-validate the sample at our boundary, but sandbox the AVIF path if you decode untrusted input in debug/CI. |
-| AV2 | ✅ | — | in-house (`rusty_av2d`) | basic (decode registered; encoder in the workshop) · **decode robustness:** panics/aborts on malformed AV2 under `debug_assertions`; **release decodes byte-identically to the reference and survives the fuzz sweep** (verified) — see the note below |
+| AV2 | ✅ | — | in-house (`rusty_av2d`) | basic (decode registered; encoder in the workshop) · **decode robustness:** empty packets are rejected at our boundary in every build; the upstream GDF `usize` underflow is fixed in `rusty_av2d` 0.2.12; debug and release both decode byte-identically to the reference and survive the fuzz sweep (verified) — see the note below |
 | H.264 / AVC | ✅ | ✅ | rusty_h264 (pure Rust; opt-in SIMD asm) | validated · ⚖ |
 | Opus | ✅ | ✅ | rusty-opus (pure Rust) | validated (12/12 official decoder conformance) |
 | Vorbis | ✅ | ✅ | decode: lewton · encode: in-house `rusty_vorbis` | validated |
-| FLAC | ✅ | ✅ | decode: claxon · encode: in-house | validated (parity with ffmpeg `-compression_level 8` within 0.03%) |
+| FLAC | ✅ | ✅ | in-house `rusty_flac` (decode + encode; one packet per frame) | validated (parity with ffmpeg `-compression_level 8` within 0.03%) |
 | PNG | ✅ | ✅ | png (pure Rust) | validated |
 | JPEG | ✅ | ✅ | in-house `rusty_jpeg` (pure Rust; vendored merge of jpeg-decoder + jpeg-encoder) | validated |
 | GIF | ✅ | ✅ | gif (pure Rust) | validated |
@@ -41,24 +41,29 @@ licensed (CI-enforced by `cargo-deny`).
 >
 > ⚖ = patent-relevant — see [Patents](#patents).
 
-> **AV2 decode robustness** (`rff-codec-av2`, backed by `rusty_av2d 0.2.8`) —
-> the same shape as the rav1d note above, and measured the same way:
+> **AV2 decode robustness** (`rff-codec-av2`) — `rusty_av2d` ≤ 0.2.11 had two
+> **separate** debug-only behaviours, which an earlier revision of this note
+> conflated into one (issue #14). Both are fixed:
 >
-> * **Debug builds abort.** `rusty_av2d` performs an unchecked subtraction
->   (`av2_gdf.rs:549`) that trips Rust's arithmetic-overflow check, and the
->   fuzz sweep (`fuzz_robustness`) takes the process down with
->   `STATUS_STACK_BUFFER_OVERRUN` on malformed OBU input. An `abort()` is not a
->   panic, so `catch_unwind` cannot contain it.
-> * **Release builds are sound on both counts (verified 2026-08-27).** The
->   overflow is a wrap the decoder actually intends: with checks off,
->   `av2f_still` decodes **byte-identically to the reference** (4/4), and
->   `fuzz_robustness` passes (2/2) with AV2 in the sweep.
+> * **Empty packet → `abort()`.** `rusty_av2d`'s `validate_input!` aborts the
+>   process under `debug_assertions` when handed zero bytes
+>   (`STATUS_STACK_BUFFER_OVERRUN` on Windows) — this, not the subtraction
+>   below, is what killed `fuzz_robustness`. An abort is not a panic, so
+>   `catch_unwind` cannot contain it. **Fixed at our boundary:** the adapter
+>   rejects empty/oversized packets with `Err` before the engine sees them, in
+>   every build, exactly as the AVIF adapter does for rav1d.
+> * **`av2_gdf.rs:549` → catchable panic.** The GDF stripe base is computed
+>   with `(i_min - 1)` in `usize`, which underflows on the first stripe of every
+>   GDF frame — valid input included — and so panics under overflow checks
+>   (`av2f_still` in a debug build). Release wraps to exactly the address the C
+>   reference's negative offset yields: `av2f_still` decodes **byte-identically
+>   to the reference** (4/4) and `fuzz_robustness` passes with AV2 in the sweep.
+>   **Fixed upstream in `rusty_av2d` 0.2.12** (add before subtracting), which
+>   `rff-codec-av2` now requires: debug builds decode GDF content with
+>   overflow checks on, no override needed.
 >
-> So a shipped release binary does not crash on hostile AV2, and its output on
-> valid AV2 is correct. **Sandbox the AV2 path if you decode untrusted input in
-> a debug or CI build**, and treat the unchecked arithmetic as a defect to fix
-> upstream in `rusty_av2d` rather than a property to rely on — a wrap that is
-> correct today is correct by accident, not by contract.
+> So a shipped release binary neither crashes on hostile AV2 nor mis-decodes
+> valid AV2, and neither does a debug build of this workspace.
 >
 > AV2 is also **experimental end-to-end**: the `av2f` still-image container's
 > four-character codes are ours, not specified by AOM, so those files read back

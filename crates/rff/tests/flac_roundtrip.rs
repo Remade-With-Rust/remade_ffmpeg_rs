@@ -75,7 +75,11 @@ fn read_wav_f32(engine: &Engine, path: &Path) -> Vec<f32> {
         .open_demuxer("wav", Box::new(fs::File::open(path).unwrap()))
         .unwrap();
     let streams = dem.read_header().unwrap();
-    let data = dem.read_packet().unwrap().data;
+    // The WAV demuxer streams the data chunk in blocks: concatenate them all.
+    let mut data = Vec::new();
+    while let Ok(p) = dem.read_packet() {
+        data.extend_from_slice(&p.data);
+    }
     match streams[0].sample_format.expect("wav sample format") {
         SampleFormat::S16 => data
             .chunks_exact(2)

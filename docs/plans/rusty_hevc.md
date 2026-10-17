@@ -11,6 +11,14 @@ what order it lands. The encoder is a later mission (§7).
 
 Re-check §1 before use: it is a snapshot.
 
+/goal lets push crates version update X.0.0 and publish. remarkable fix lets do another round of optimizations with /codec-memory-copies deployment. Identify any unnecessary memory copies, list them, and resolve them.
+
+unreal development. next up we are looking go after v1.0.0 when we finish
+
+lets start working on /use-protection-please
+
+Once we finish this to more than 85%, lets update all of our readme crates/github to sound professional, like a commercial ready tool, rather than a train of thought for development. Update versions to v1.0.0, and deploy to crates/github.
+
 ---
 
 ## 0. Mission and promise

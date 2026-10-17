@@ -161,7 +161,11 @@ fn flv_bytes() -> Vec<u8> {
     let mut v = b"FLV\x01\x05\x00\x00\x00\x09".to_vec();
     v.extend_from_slice(&0u32.to_be_bytes()); // PreviousTagSize0
     for (tag_type, ts, data) in [
-        (18u8, 0u32, vec![0x02, 0, 3, b'm' as u8, b'd' as u8, b'x' as u8]),
+        (
+            18u8,
+            0u32,
+            vec![0x02, 0, 3, b'm' as u8, b'd' as u8, b'x' as u8],
+        ),
         (9, 40, vec![0x17, 0x00, 1, 2, 3, 4, 5]),
         (8, 60, vec![0xAF, 0x01, 9, 9]),
     ] {

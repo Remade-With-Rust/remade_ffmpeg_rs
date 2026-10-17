@@ -174,9 +174,9 @@ fn code_magnitude<S: BitSink>(
         return 1;
     }
     sink.put(1, prob2); // TWO+
-    // Everything below the pivot codes with STATIC Pareto/CAT probs — a
-    // different population than the model pivot; tag it node 3 so the
-    // harvest can keep them apart (band/ctx are not meaningful here).
+                        // Everything below the pivot codes with STATIC Pareto/CAT probs — a
+                        // different population than the model pivot; tag it node 3 so the
+                        // harvest can keep them apart (band/ctx are not meaningful here).
     #[cfg(feature = "prometheus-telemetry")]
     crate::telemetry::set_site(3, 0, 0, 0);
     let p = &PARETO8_FULL[prob2 as usize - 1];

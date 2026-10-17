@@ -584,7 +584,11 @@ impl Decoder {
             });
             if std::env::var_os("RH265_POOL").is_some() {
                 use std::sync::atomic::Ordering;
-                if recycled.is_some() { POOL_HIT.fetch_add(1, Ordering::Relaxed) } else { POOL_MISS.fetch_add(1, Ordering::Relaxed) };
+                if recycled.is_some() {
+                    POOL_HIT.fetch_add(1, Ordering::Relaxed)
+                } else {
+                    POOL_MISS.fetch_add(1, Ordering::Relaxed)
+                };
             }
             match recycled {
                 Some(p) => p,
@@ -780,7 +784,9 @@ impl Decoder {
     }
 
     fn finish_picture(&mut self) {
-        let Some(mut cur) = self.cur.take() else { return };
+        let Some(mut cur) = self.cur.take() else {
+            return;
+        };
         self.stats.pictures += 1;
         Self::clear_uncovered(&mut cur);
         if !self.headers_only {

@@ -76,7 +76,20 @@ pub enum Stage {
 }
 
 pub const N: usize = 12;
-const NAMES: [&str; N] = ["parse", "intra", "inter", "transform", "deblock", "sao", "dpb", "  |- mc", "  |- combine", "  |- pad", "  |- sao copy", "  |- pic alloc"];
+const NAMES: [&str; N] = [
+    "parse",
+    "intra",
+    "inter",
+    "transform",
+    "deblock",
+    "sao",
+    "dpb",
+    "  |- mc",
+    "  |- combine",
+    "  |- pad",
+    "  |- sao copy",
+    "  |- pic alloc",
+];
 /// Which stages run INSIDE `Parse`. `Parse` wraps a whole CTU, so its raw total
 /// includes prediction and transform; reporting all six as if they were
 /// siblings sums to 124% and prints a residue of zero, which is what the first
@@ -139,7 +152,10 @@ pub struct Scope {
 impl Scope {
     #[inline(always)]
     fn start_raw() -> Scope {
-        Scope { t: std::time::Instant::now(), stage: 0 }
+        Scope {
+            t: std::time::Instant::now(),
+            stage: 0,
+        }
     }
 
     #[inline(always)]
@@ -153,7 +169,10 @@ impl Scope {
     #[inline(always)]
     pub fn new(stage: Stage) -> Option<Scope> {
         if enabled() {
-            Some(Scope { t: std::time::Instant::now(), stage: stage as usize })
+            Some(Scope {
+                t: std::time::Instant::now(),
+                stage: stage as usize,
+            })
         } else {
             None
         }

@@ -90,6 +90,15 @@ impl Decoder for Av2Decoder {
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         let pts = packet.pts;
+
+        // Pre-validate rusty_av2d's own `sz > 0 && sz <= usize::MAX/2` input check: on a
+        // failed check its `validate_input!` calls `debug_abort()` → `process::abort()`
+        // under `debug_assertions` — an uncatchable crash (`catch_unwind` can't contain an
+        // abort). An empty packet from a truncated/hostile file trips it, so reject it here
+        // and fail gracefully in EVERY build, as the AVIF adapter does for rusty_av1d.
+        if packet.data.is_empty() || packet.data.len() > usize::MAX / 2 {
+            return Err(Error::InvalidData("av2: empty or oversized packet".into()));
+        }
         let data = packet.data.clone().into_boxed_slice();
 
         // Finish any partially-consumed previous packet before offering a new
@@ -277,5 +286,21 @@ mod fuzz_smoke {
             dec.flush();
             let _ = dec.receive_frame();
         }
+    }
+
+    /// An empty packet (a truncated sample) must be a clean `Err`, not reach
+    /// rusty_av2d's input check — which `abort()`s the process in debug builds,
+    /// out of `catch_unwind`'s reach. `random_bytes_never_panic` above never
+    /// sends zero bytes, so this case needs its own test (issue #14).
+    #[test]
+    fn empty_packet_is_an_error_not_an_abort() {
+        let mut dec = Av2Decoder::new();
+        let pkt = Packet {
+            data: Vec::new(),
+            ..Default::default()
+        };
+        assert!(matches!(dec.send_packet(&pkt), Err(Error::InvalidData(_))));
+        // The decoder stays usable afterwards.
+        assert!(dec.receive_frame().is_err());
     }
 }

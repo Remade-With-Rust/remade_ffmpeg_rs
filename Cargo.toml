@@ -70,7 +70,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
@@ -81,13 +81,13 @@ rust-version = "1.85"
 # Internal crates (path-linked; versions track the workspace).
 rff-core = { path = "crates/rff-core", version = "0.2.2" }
 rff-codec = { path = "crates/rff-codec", version = "0.2.2" }
-rff-format = { path = "crates/rff-format", version = "0.2.2" }
+rff-format = { path = "crates/rff-format", version = "0.2.3" }
 rff-targets = { path = "crates/rff-targets", version = "0.2.2" }
 rff-codec-h264 = { path = "crates/rff-codec-h264", version = "0.3.0" }
 rff-codec-hevc = { path = "crates/rff-codec-hevc", version = "0.2.0" }
 rff-codec-opus = { path = "crates/rff-codec-opus", version = "0.3.0" }
-rff-codec-avif = { path = "crates/rff-codec-avif", version = "0.2.2" }
-rff-format-avi = { path = "crates/rff-format-avi", version = "0.2.2" }
+rff-codec-avif = { path = "crates/rff-codec-avif", version = "0.2.3" }
+rff-format-avi = { path = "crates/rff-format-avi", version = "0.2.3" }
 rff-format-avif = { path = "crates/rff-format-avif", version = "0.2.2" }
 rff-codec-png = { path = "crates/rff-codec-png", version = "0.2.2" }
 rff-format-png = { path = "crates/rff-format-png", version = "0.2.2" }
@@ -99,19 +99,19 @@ rff-codec-webp = { path = "crates/rff-codec-webp", version = "0.2.1" }
 rff-format-webp = { path = "crates/rff-format-webp", version = "0.2.1" }
 rff-codec-pcm = { path = "crates/rff-codec-pcm", version = "0.2.2" }
 rff-codec-vorbis = { path = "crates/rff-codec-vorbis", version = "0.2.2" }
-rff-codec-flac = { path = "crates/rff-codec-flac", version = "0.2.2" }
+rff-codec-flac = { path = "crates/rff-codec-flac", version = "0.2.3" }
 rff-codec-jxl = { path = "crates/rff-codec-jxl", version = "0.2.2" }
 rff-codec-aac = { path = "crates/rff-codec-aac", version = "1.1.0" }
 rff-codec-vp9 = { path = "crates/rff-codec-vp9", version = "0.2.2" }
-rff-codec-av2 = { path = "crates/rff-codec-av2", version = "0.2.2" }
+rff-codec-av2 = { path = "crates/rff-codec-av2", version = "0.2.3" }
 rff-codec-mp3 = { path = "crates/rff-codec-mp3", version = "1.0.0" }
 # Standalone, publishable codec cores (the `rusty_h264` pattern: pure codec
 # crate + thin rff-codec-* adapter). Each carries its OWN version â€” they ship
 # to crates.io on their own cadence, decoupled from the workspace version and
 # from each other, so these no longer move in lockstep at 0.1.x.
 rusty_vp9 = { path = "crates/rusty_vp9", version = "0.1.2" }
-rusty_h265 = { path = "crates/rusty_h265", version = "0.6.0" }
-rusty_h265-accel = { path = "crates/rusty_h265-accel", version = "0.6.0", default-features = false }
+rusty_h265 = { path = "crates/rusty_h265", version = "0.6.1" }
+rusty_h265-accel = { path = "crates/rusty_h265-accel", version = "0.6.1", default-features = false }
 rusty_flac = { path = "crates/rusty_flac", version = "0.2.0" }
 rusty_mp3 = { path = "crates/rusty_mp3", version = "1.0.0" }
 rusty_aac = { path = "crates/rusty_aac", version = "1.1.0" }
@@ -122,16 +122,16 @@ rusty_jpeg = "0.4"
 rff-codec-rawvideo = { path = "crates/rff-codec-rawvideo", version = "0.2.2" }
 # TEMPORARY C/FFI H.264 â€” deliberately NOT in default-members; opt-in only.
 rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.2.2" }
-rff-format-wav = { path = "crates/rff-format-wav", version = "0.2.2" }
-rff-format-ogg = { path = "crates/rff-format-ogg", version = "0.2.2" }
-rff-format-flac = { path = "crates/rff-format-flac", version = "0.2.2" }
-rff-format-mp3 = { path = "crates/rff-format-mp3", version = "0.2.2" }
-rff-format-y4m = { path = "crates/rff-format-y4m", version = "0.2.2" }
-rff-format-ivf = { path = "crates/rff-format-ivf", version = "0.2.2" }
+rff-format-wav = { path = "crates/rff-format-wav", version = "0.2.3" }
+rff-format-ogg = { path = "crates/rff-format-ogg", version = "0.2.3" }
+rff-format-flac = { path = "crates/rff-format-flac", version = "0.2.3" }
+rff-format-mp3 = { path = "crates/rff-format-mp3", version = "0.2.3" }
+rff-format-y4m = { path = "crates/rff-format-y4m", version = "0.2.3" }
+rff-format-ivf = { path = "crates/rff-format-ivf", version = "0.2.3" }
 rff-format-av2f = { path = "crates/rff-format-av2f", version = "0.2.2" }
 rff-format-jxl = { path = "crates/rff-format-jxl", version = "0.2.2" }
-rff-format-mp4 = { path = "crates/rff-format-mp4", version = "0.2.2" }
-rff-format-mkv = { path = "crates/rff-format-mkv", version = "0.2.2" }
+rff-format-mp4 = { path = "crates/rff-format-mp4", version = "0.2.3" }
+rff-format-mkv = { path = "crates/rff-format-mkv", version = "0.2.3" }
 rff-format-ts = { path = "crates/rff-format-ts", version = "0.2.2" }
 rff-format-flv = { path = "crates/rff-format-flv", version = "0.2.2" }
 rff-format-hls = { path = "crates/rff-format-hls", version = "0.2.2" }
@@ -144,7 +144,7 @@ rff-format-ass = { path = "crates/rff-format-ass", version = "0.2.2" }
 rff-format-webvtt = { path = "crates/rff-format-webvtt", version = "0.2.2" }
 rff-filter = { path = "crates/rff-filter", version = "0.2.2" }
 rff-resample = { path = "crates/rff-resample", version = "0.2.2" }
-rff = { path = "crates/rff", version = "0.2.2", package = "remade-ffmpeg" }
+rff = { path = "crates/rff", version = "0.2.3", package = "remade-ffmpeg" }
 rff-auth = { path = "crates/rff-auth", version = "0.2.2" }
 
 # Third-party (all permissive â€” MIT/Apache-2.0; CI-enforced by cargo-deny).
@@ -159,7 +159,7 @@ rff-auth = { path = "crates/rff-auth", version = "0.2.2" }
 # The registry versions are toolkit MAIN (the merged no-asm fix + the
 # prom_av1e content-dispatch tier), ahead of the old b471be0 branch pin.
 rusty_av1e = { version = "0.8.0", default-features = false }
-rusty_av1d = { version = "1.2.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+rusty_av1d = { version = "1.2.1", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 # png: our own rusty_png â€” a performance fork of image-rs/image-png 0.17.16
 # (MIT/Apache-2.0), carried forward in-tree. DEFLATE via miniz_oxide/fdeflate,
 # with an opt-in pure-Rust `zlib-rs` backend. See crates/rusty_png/NOTICE.md.

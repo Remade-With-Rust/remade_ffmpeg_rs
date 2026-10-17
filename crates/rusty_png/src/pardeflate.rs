@@ -252,7 +252,8 @@ mod tests {
         let z = compress_parallel(data, stride, 6, threads).expect("compress");
         let mut d = flate2::read::ZlibDecoder::new(&z[..]);
         let mut back = Vec::new();
-        d.read_to_end(&mut back).expect("the stream must be valid zlib");
+        d.read_to_end(&mut back)
+            .expect("the stream must be valid zlib");
         assert_eq!(back, data, "threads={threads}: round-trip mismatch");
     }
 
@@ -278,10 +279,22 @@ mod tests {
     #[test]
     fn small_inputs_stay_serial() {
         assert_eq!(block_count(1024, 8), 1);
-        assert_eq!(block_count(PAR_MIN_BLOCK, 8), 1, "one block's worth is not splittable");
+        assert_eq!(
+            block_count(PAR_MIN_BLOCK, 8),
+            1,
+            "one block's worth is not splittable"
+        );
         assert_eq!(block_count(2 * PAR_MIN_BLOCK, 8), 2);
-        assert_eq!(block_count(64 * PAR_MIN_BLOCK, 8), 8, "capped by the thread budget");
-        assert_eq!(block_count(64 * PAR_MIN_BLOCK, 1), 1, "single thread never splits");
+        assert_eq!(
+            block_count(64 * PAR_MIN_BLOCK, 8),
+            8,
+            "capped by the thread budget"
+        );
+        assert_eq!(
+            block_count(64 * PAR_MIN_BLOCK, 1),
+            1,
+            "single thread never splits"
+        );
     }
 }
 
@@ -339,7 +352,10 @@ mod encoder_integration {
             // Sanity: it really did take the parallel branch on an input this
             // size, so a silently-serial fallback cannot pass as a success.
             let blocks = super::block_count((w * ch + 1) * h, threads);
-            assert!(blocks > 1, "threads={threads}: expected a split, got {blocks}");
+            assert!(
+                blocks > 1,
+                "threads={threads}: expected a split, got {blocks}"
+            );
         }
     }
 }

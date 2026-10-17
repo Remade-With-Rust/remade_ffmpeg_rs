@@ -1,0 +1,5 @@
+# The decoder is written to a wider line budget than rustfmt's 100-column
+# default -- long intrinsic expressions and tap tables read worse when wrapped.
+# 196 is the longest line in the tree; 200 makes the existing style the style,
+# so `cargo fmt --check` gates real drift instead of reformatting everything.
+max_width = 200

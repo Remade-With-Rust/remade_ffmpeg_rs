@@ -19,7 +19,6 @@
 //! is automatically resampled to a rate the target encoder accepts (FFmpeg's
 //! implicit `aresample`).
 
-use std::io::Read;
 use std::path::PathBuf;
 
 use rff_codec::{CodecParams, Decoder, Encoder};
@@ -872,15 +871,16 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     };
 
     // --- open every input demuxer and read its streams ---
-    // (`open` is a phase of its own: a container read whole at open -- WAV, the
-    // MP3 demuxer -- does all of its I/O here, before the first packet.)
+    // (`open` is a phase of its own: demuxers read only their headers here and
+    // stream packets after; MP4 from a pipe, which must buffer to reach a
+    // trailing `moov`, is the one that still does all of its I/O at open.)
     let t_start = phases::on().then(std::time::Instant::now);
     let mut demuxers: Vec<Box<dyn rff_format::Demuxer>> = Vec::new();
     let mut input_streams: Vec<Vec<Stream>> = Vec::new();
     for input in &spec.inputs {
         let (demuxer, streams) = phases::time(&phases::OPEN, || -> Result<_> {
-            let (in_format, reader) = open_input(engine, input)?;
-            let mut demuxer = engine.formats.open_demuxer(&in_format, reader)?;
+            let (in_format, source) = open_input(engine, input)?;
+            let mut demuxer = source.open_demuxer(engine, &in_format)?;
             let streams = demuxer.read_header()?;
             Ok((demuxer, streams))
         })?;
@@ -1392,10 +1392,10 @@ fn flush_streams(
     Ok(())
 }
 
-/// Open an input as a streaming reader and decide its container format —
-/// local file or `http://` URL. Delegates to the shared [`crate::probe`] opener
-/// so ffmpeg and ffprobe resolve inputs identically.
-fn open_input(engine: &Engine, input: &InputSpec) -> Result<(String, Box<dyn Read + Send>)> {
+/// Open an input and decide its container format — local file (seekable) or
+/// `http://` URL. Delegates to the shared [`crate::probe`] opener so ffmpeg and
+/// ffprobe resolve inputs identically.
+fn open_input(engine: &Engine, input: &InputSpec) -> Result<(String, crate::probe::Source)> {
     let path = input
         .path
         .to_str()

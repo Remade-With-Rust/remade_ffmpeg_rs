@@ -19,7 +19,10 @@ use rff::transcode::{InputSpec, OutputSpec, StreamCodec, TranscodeSpec};
 use rff::Engine;
 
 fn tmp(name: &str, ext: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("rff_mp4corrupt_{}_{name}.{ext}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "rff_mp4corrupt_{}_{name}.{ext}",
+        std::process::id()
+    ))
 }
 
 fn write_wav(engine: &Engine, path: &Path) {
@@ -51,7 +54,12 @@ fn write_wav(engine: &Engine, path: &Path) {
     mux.write_trailer().unwrap();
 }
 
-fn convert(engine: &Engine, input: &Path, out: &Path, audio: Option<CodecId>) -> rff::core::Result<()> {
+fn convert(
+    engine: &Engine,
+    input: &Path,
+    out: &Path,
+    audio: Option<CodecId>,
+) -> rff::core::Result<()> {
     let spec = TranscodeSpec {
         inputs: vec![InputSpec {
             path: input.to_path_buf(),
@@ -147,11 +155,18 @@ fn no_mp4_this_engine_writes_carries_a_zero_fourcc() {
         let out = tmp(&format!("scan_{}", codec.name()), "mp4");
         let _ = fs::remove_file(&out);
         convert(&engine, &wav, &out, Some(codec)).unwrap_or_else(|e| {
-            panic!("{} is declared muxable into mp4 but failed: {e}", codec.name())
+            panic!(
+                "{} is declared muxable into mp4 but failed: {e}",
+                codec.name()
+            )
         });
         let file = fs::read(&out).unwrap();
         let fourccs = sample_entry_fourccs(&file);
-        assert!(!fourccs.is_empty(), "{}: no sample entry at all", codec.name());
+        assert!(
+            !fourccs.is_empty(),
+            "{}: no sample entry at all",
+            codec.name()
+        );
         for fourcc in fourccs {
             assert_ne!(
                 &fourcc,

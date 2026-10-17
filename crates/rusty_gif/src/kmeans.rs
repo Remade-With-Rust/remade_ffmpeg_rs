@@ -47,7 +47,11 @@ struct Box_ {
 /// widest channel at the weighted median until `k` boxes exist.
 fn median_cut(points: &mut [WPoint], k: usize) -> Vec<[f64; 4]> {
     let total: u64 = points.iter().map(|p| p.w).sum();
-    let mut boxes = vec![Box_ { lo: 0, hi: points.len(), weight: total }];
+    let mut boxes = vec![Box_ {
+        lo: 0,
+        hi: points.len(),
+        weight: total,
+    }];
 
     while boxes.len() < k {
         // Heaviest splittable box (≥2 points).
@@ -101,7 +105,11 @@ fn median_cut(points: &mut [WPoint], k: usize) -> Vec<[f64; 4]> {
         let hi_old = boxes[bi].hi;
         boxes[bi].hi = mid;
         boxes[bi].weight = left_w;
-        boxes.push(Box_ { lo: mid, hi: hi_old, weight: right_w });
+        boxes.push(Box_ {
+            lo: mid,
+            hi: hi_old,
+            weight: right_w,
+        });
     }
 
     boxes
@@ -173,7 +181,9 @@ pub(crate) fn palette_kmeans(points_in: &[WPoint], k: usize, iters: usize) -> Km
                     .max_by_key(|(pi, p)| {
                         let c = centers[assign[*pi] as usize];
                         let pc = p.c.map(|v| v as f64);
-                        let d = (0..4).map(|ch| (c[ch] - pc[ch]) * (c[ch] - pc[ch])).sum::<f64>();
+                        let d = (0..4)
+                            .map(|ch| (c[ch] - pc[ch]) * (c[ch] - pc[ch]))
+                            .sum::<f64>();
                         (d * p.w as f64) as i64
                     })
                     .expect("nonempty points");
@@ -218,7 +228,10 @@ pub(crate) fn palette_kmeans(points_in: &[WPoint], k: usize, iters: usize) -> Km
             .expect("kmeans: point lost during palette build");
     }
 
-    KmPalette { colors, assignment: out_assign }
+    KmPalette {
+        colors,
+        assignment: out_assign,
+    }
 }
 
 #[cfg(test)]
@@ -250,15 +263,27 @@ mod tests {
         // One massive flat color + a spray of rare colors: the flat color
         // must map to itself exactly (this is the graphics-content case
         // where unweighted training failed).
-        let mut pts = vec![WPoint { c: [40, 90, 200, 255], w: 1_000_000 }];
+        let mut pts = vec![WPoint {
+            c: [40, 90, 200, 255],
+            w: 1_000_000,
+        }];
         for i in 0..1000u32 {
             pts.push(WPoint {
-                c: [(i % 256) as i32, (i / 4 % 256) as i32, (i / 16 % 256) as i32, 255],
+                c: [
+                    (i % 256) as i32,
+                    (i / 4 % 256) as i32,
+                    (i / 16 % 256) as i32,
+                    255,
+                ],
                 w: 1,
             });
         }
         let pal = palette_kmeans(&pts, 256, 3);
         let got = pal.colors[pal.assignment[0] as usize].map(|v| v as i32);
-        assert_eq!(got, [40, 90, 200, 255], "heavy flat color not preserved exactly");
+        assert_eq!(
+            got,
+            [40, 90, 200, 255],
+            "heavy flat color not preserved exactly"
+        );
     }
 }

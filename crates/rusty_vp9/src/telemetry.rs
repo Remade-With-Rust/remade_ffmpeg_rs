@@ -97,8 +97,10 @@ pub fn take() -> Vec<CoefBin> {
 /// emit/cost path (a thread-local store).
 #[inline]
 pub(crate) fn set_site(node: u8, band: u8, ctx: u8, tx: u8) {
-    let packed =
-        (node as u16 & 0x7) | ((band as u16 & 0x7) << 3) | ((ctx as u16 & 0x7) << 6) | ((tx as u16 & 0x3) << 9);
+    let packed = (node as u16 & 0x7)
+        | ((band as u16 & 0x7) << 3)
+        | ((ctx as u16 & 0x7) << 6)
+        | ((tx as u16 & 0x3) << 9);
     TAP.with(|t| t.borrow_mut().site = packed);
 }
 
