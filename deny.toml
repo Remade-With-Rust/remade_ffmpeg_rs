@@ -70,11 +70,13 @@ ignore = [
 ]
 
 [sources]
-# Every crate must come from crates.io. The whole lock resolves there today (701
-# registry entries, zero git sources), so this costs nothing -- it makes an
-# unvetted registry or a git dependency a hard failure instead of a silent drift
-# (use-protection-please H-08/H-13).
+# Every crate must come from crates.io, with ONE deliberate exception: the
+# workspace `[patch.crates-io]` swaps `serde_json` for the house fork
+# (Remade-With-Rust/rusty_json_turbo, see the root Cargo.toml), which resolves
+# from git. That exact repository is allowed and nothing else -- any other git
+# dependency, or an unvetted registry, stays a hard failure instead of a silent
+# drift (use-protection-please H-08/H-13).
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = ["https://github.com/Remade-With-Rust/rusty_json_turbo"]
