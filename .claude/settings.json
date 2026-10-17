@@ -35,5 +35,18 @@
       "Read(//c/Users/talmo/.claude/skills//**)",
       "Bash(grep -n \"^pub \\\\|^///\" Prometheus/crates/prom-trial/src/lib.rs)"
     ]
+  },
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/sweep-targets.sh\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
   }
 }
