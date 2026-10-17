@@ -682,11 +682,14 @@ fn offsets_fit_lut(offs: &[i16]) -> bool {
 }
 
 pub fn sao_band(dst: &mut [u16], src: &[u16], stride: usize, x0: usize, y0: usize, w: usize, h: usize, shift: u32, pos: u8, band: &[i16; 32], max: i32) {
-    let ok = w > 0 && h > 0 && offsets_fit_lut(band) && {
+    let in_bounds = w > 0 && h > 0 && {
         let need = (y0 + h - 1) * stride + x0 + w;
         dst.len() >= need && src.len() >= need
     };
-    debug_assert!(ok);
+    debug_assert!(in_bounds);
+    // Offsets too large for the i8 LUT (RExt magnitudes) route to the scalar
+    // twin by design, so they are part of the gate but not of the assertion.
+    let ok = in_bounds && offsets_fit_lut(band);
     if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::SAO_BAND_SIMD } else { &census::SAO_BAND_SCALAR }, 1);
@@ -728,14 +731,16 @@ pub fn sao_band(dst: &mut [u16], src: &[u16], stride: usize, x0: usize, y0: usiz
 #[allow(clippy::too_many_arguments)]
 pub fn sao_edge(dst: &mut [u16], src: &[u16], stride: usize, x0: usize, y0: usize, w: usize, h: usize, da: (i32, i32), db: (i32, i32), offs: &[i16; 4], max: i32) {
     let (oa, ob) = (doff(da, stride), doff(db, stride));
-    let ok = w > 0 && h > 0 && offsets_fit_lut(offs) && {
+    let in_bounds = w > 0 && h > 0 && {
         let first = (y0 * stride + x0) as isize;
         let last = ((y0 + h - 1) * stride + x0 + w - 1) as isize;
         let lo = first + oa.min(ob).min(0);
         let hi = last + oa.max(ob).max(0);
         lo >= 0 && (hi as usize) < src.len() && (last as usize) < dst.len()
     };
-    debug_assert!(ok);
+    debug_assert!(in_bounds);
+    // As in `sao_band`: offsets that don't fit the LUT take the scalar twin.
+    let ok = in_bounds && offsets_fit_lut(offs);
     if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::SAO_EDGE_SIMD } else { &census::SAO_EDGE_SCALAR }, 1);

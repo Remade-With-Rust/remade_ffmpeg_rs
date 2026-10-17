@@ -261,12 +261,13 @@ pub(crate) fn wrap_qp(v: i32, qp_bd_offset: i32) -> i32 {
     //
     // It never needs one. `qPY_PRED` is in `-off..=51` and `CuQpDeltaVal` is
     // range-checked to `-(26 + off/2)..=25 + off/2` before it gets here, so the
-    // dividend lands in `0..2m` and the modulo can wrap at most twice. The loop
-    // is exactly `t % m` for `t >= 0`; for `-m < t < 0` truncated `%` also
-    // leaves `t` alone, so the two agree there as well.
+    // dividend lands in `26 + off/2 ..= 128 + 5*off/2` -- inside `0..3m` (it
+    // DOES exceed `2m`: qPY_PRED 42 + delta 25 at 8-bit gives t = 119 > 104,
+    // as conformance streams do) -- and the modulo wraps at most twice. The
+    // loop is exactly `t % m` for every `t >= 0`.
     let m = 52 + qp_bd_offset;
     let mut t = v + 52 + 2 * qp_bd_offset;
-    debug_assert!(t > -m && t < 2 * m, "wrap_qp dividend {t} outside -m..2m (m = {m})");
+    debug_assert!(t >= 0 && t < 3 * m, "wrap_qp dividend {t} outside 0..3m (m = {m})");
     while t >= m {
         t -= m;
     }
