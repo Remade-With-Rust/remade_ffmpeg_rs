@@ -1293,8 +1293,9 @@ impl FrameEncoder {
                 .unwrap_or(500.0),
             subpel_fast: false,
             motion_fast: std::env::var("VP9_MOTION_FAST").is_ok(),
-            subpel_bilinear: std::env::var("VP9_SUBPEL_BILINEAR").is_ok()
-                || std::env::var("VP9_SUBPEL_8TAP").is_err() && false, // set by presets
+            // Bilinear subpel is otherwise chosen by the presets. (The former
+            // `|| VP9_SUBPEL_8TAP.is_err() && false` arm was always false.)
+            subpel_bilinear: std::env::var("VP9_SUBPEL_BILINEAR").is_ok(),
             subpel_tree: std::env::var("VP9_SUBPEL_TREE").is_ok(),
             subpel_diag: std::env::var("VP9_SUBPEL_DIAG").is_ok(),
             hp_mv: std::env::var("VP9_NO_HP_MV").is_err(),
