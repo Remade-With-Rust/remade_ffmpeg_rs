@@ -2,8 +2,8 @@
 # cargo-vet imports lock
 
 [[publisher.libc]]
-version = "0.2.190"
-when = "2026-10-02"
+version = "0.2.191"
+when = "2026-10-16"
 trusted-publisher = "github:rust-lang/libc"
 
 [[publisher.portable-atomic]]
@@ -12,8 +12,8 @@ when = "2026-08-09"
 trusted-publisher = "github:taiki-e/portable-atomic"
 
 [[publisher.rusty_alloc]]
-version = "2.2.5"
-when = "2026-10-08"
+version = "2.2.6"
+when = "2026-10-09"
 user-id = 427321
 user-login = "Ttimmahlax"
 user-name = "farmer_timmm"
