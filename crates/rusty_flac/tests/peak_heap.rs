@@ -13,13 +13,30 @@
 //! `RUSTY_FLAC_PEAK_DUMP=1` also prints the allocations live at the peak.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 struct Counting;
 
-static CUR: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
+// Signed: only the measuring thread is counted (see MEASURING), and inside a
+// window it may free a block it allocated before the window started.
+static CUR: AtomicIsize = AtomicIsize::new(0);
+static PEAK: AtomicIsize = AtomicIsize::new(0);
 static LOCK: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Set by `peak_of` on the thread doing the encode. The allocator counts
+    /// only that thread: libtest's harness thread allocates concurrently (more
+    /// so on a loaded CI runner), and counting it made the first, smallest
+    /// row exceed its ceiling by ~600 B on some runs (issue #29).
+    /// `const`-initialised, so reading it never allocates (no recursion into
+    /// the allocator); `try_with` keeps it safe during thread teardown.
+    static MEASURING: Cell<bool> = const { Cell::new(false) };
+}
+
+fn measured() -> bool {
+    MEASURING.try_with(Cell::get).unwrap_or(false)
+}
 
 /// Live-allocation table (ptr, size) and its snapshot at the peak. Only
 /// consulted when tracing is on; sized well above the encoder's live set.
@@ -45,18 +62,20 @@ fn unlock() {
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = System.alloc(l);
-        if !p.is_null() {
+        if !p.is_null() && measured() {
             on_alloc(p as usize, l.size());
         }
         p
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        on_free(p as usize, l.size());
+        if measured() {
+            on_free(p as usize, l.size());
+        }
         System.dealloc(p, l)
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
         let q = System.realloc(p, l, new);
-        if !q.is_null() {
+        if !q.is_null() && measured() {
             // Counted as alloc-new then free-old: that is the moment both
             // exist on a heap that cannot grow in place (the conservative
             // reading, and what a first-fit embedded heap does).
@@ -70,7 +89,7 @@ unsafe impl GlobalAlloc for Counting {
 #[allow(static_mut_refs)]
 fn on_alloc(p: usize, size: usize) {
     lock();
-    let cur = CUR.load(Ordering::Relaxed) + size;
+    let cur = CUR.load(Ordering::Relaxed) + size as isize;
     CUR.store(cur, Ordering::Relaxed);
     let tracing = TRACE.load(Ordering::Relaxed);
     // SAFETY: under LOCK.
@@ -93,7 +112,10 @@ fn on_alloc(p: usize, size: usize) {
 #[allow(static_mut_refs)]
 fn on_free(p: usize, size: usize) {
     lock();
-    CUR.store(CUR.load(Ordering::Relaxed) - size, Ordering::Relaxed);
+    CUR.store(
+        CUR.load(Ordering::Relaxed) - size as isize,
+        Ordering::Relaxed,
+    );
     if TRACE.load(Ordering::Relaxed) {
         // SAFETY: under LOCK.
         unsafe {
@@ -147,11 +169,13 @@ fn content(class: &str, n: usize, seed: u64) -> Vec<u8> {
 fn peak_of(pcm: &[u8], level: u32) -> (usize, usize) {
     let base = CUR.load(Ordering::Relaxed);
     PEAK.store(base, Ordering::Relaxed);
+    MEASURING.with(|m| m.set(true));
     let mut enc = rusty_flac::Encoder::new(16000, 1, 16).unwrap();
     enc.set_compression_level(level);
     enc.push_s16le_bytes(pcm).unwrap();
     let out = enc.finish();
-    let peak = PEAK.load(Ordering::Relaxed) - base;
+    MEASURING.with(|m| m.set(false));
+    let peak = (PEAK.load(Ordering::Relaxed) - base) as usize;
     (peak, out.len())
 }
 
