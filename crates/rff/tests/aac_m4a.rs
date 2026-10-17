@@ -144,7 +144,10 @@ fn aac_m4a_roundtrips_through_our_stack() {
     let ch = u16::from_le_bytes([hb[22], hb[23]]);
     let rate = u32::from_le_bytes([hb[24], hb[25], hb[26], hb[27]]);
     let out = read_wav_s16(&back);
-    let input: Vec<i16> = pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    let input: Vec<i16> = pcm
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect();
     let (in_rms, out_rms) = (rms(&input), rms(&out));
     eprintln!(
         "back.wav ch={ch} rate={rate} samples={} (in {}) rms={out_rms:.0} (in {in_rms:.0})",

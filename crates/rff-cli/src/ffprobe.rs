@@ -110,13 +110,19 @@ fn print_targets(input: &str, plan: &rff::targets::Plan) {
         println!("  Stream #0:{}: {}: {}", s.index, s.media_type, s.codec_id);
     }
 
-    println!("
-Convert to ({} targets):", plan.targets.len());
+    println!(
+        "
+Convert to ({} targets):",
+        plan.targets.len()
+    );
     let mut kind = None;
     for t in &plan.targets {
         if kind != Some(t.kind) {
-            println!("
-  {}", t.kind);
+            println!(
+                "
+  {}",
+                t.kind
+            );
             kind = Some(t.kind);
         }
         println!(

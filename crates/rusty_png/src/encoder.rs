@@ -582,11 +582,7 @@ pub(crate) fn write_chunk<W: Write>(w: W, name: chunk::ChunkType, data: &[u8]) -
 
 /// [`write_chunk`] with an `io::Result`, so it can be called from a `Write`
 /// impl without a detour through [`EncodingError`] and back.
-fn write_chunk_io<W: Write>(
-    mut w: W,
-    name: chunk::ChunkType,
-    data: &[u8],
-) -> std::io::Result<()> {
+fn write_chunk_io<W: Write>(mut w: W, name: chunk::ChunkType, data: &[u8]) -> std::io::Result<()> {
     w.write_be(data.len() as u32)?;
     w.write_all(&name.0)?;
     w.write_all(data)?;
@@ -861,7 +857,14 @@ impl<W: Write> Writer<W> {
                 for line in data.chunks(in_len) {
                     let filter_type = {
                         crate::prof_scope!(crate::prof::ENC_FILTER);
-                        filter(filter_method, adaptive_method, bpp, prev, line, &mut current)
+                        filter(
+                            filter_method,
+                            adaptive_method,
+                            bpp,
+                            prev,
+                            line,
+                            &mut current,
+                        )
                     };
                     filtered.push(filter_type as u8);
                     filtered.extend_from_slice(&current);
@@ -887,7 +890,14 @@ impl<W: Write> Writer<W> {
                 for line in data.chunks(in_len) {
                     let filter_type = {
                         crate::prof_scope!(crate::prof::ENC_FILTER);
-                        filter(filter_method, adaptive_method, bpp, prev, line, &mut current)
+                        filter(
+                            filter_method,
+                            adaptive_method,
+                            bpp,
+                            prev,
+                            line,
+                            &mut current,
+                        )
                     };
                     {
                         crate::prof_scope!(crate::prof::ENC_DEFLATE);

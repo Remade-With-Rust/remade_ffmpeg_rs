@@ -24,10 +24,10 @@ use rff_format::avc::{build_avcc_record, split_annexb};
 use rff_format::{Muxer, Output, Stream};
 
 use crate::{
-    ID_AUDIO, ID_BIT_DEPTH, ID_BLOCK, ID_BLOCK_DURATION, ID_BLOCK_GROUP, ID_CHANNELS,
-    ID_CLUSTER, ID_CODEC_ID, ID_CODEC_PRIVATE, ID_CUES, ID_DURATION, ID_INFO, ID_PIXEL_HEIGHT,
-    ID_PIXEL_WIDTH, ID_SAMPLING_FREQUENCY, ID_SEGMENT, ID_SIMPLE_BLOCK, ID_TIMESTAMP,
-    ID_TIMESTAMP_SCALE, ID_TRACKS, ID_TRACK_ENTRY, ID_TRACK_NUMBER, ID_TRACK_TYPE, ID_VIDEO,
+    ID_AUDIO, ID_BIT_DEPTH, ID_BLOCK, ID_BLOCK_DURATION, ID_BLOCK_GROUP, ID_CHANNELS, ID_CLUSTER,
+    ID_CODEC_ID, ID_CODEC_PRIVATE, ID_CUES, ID_DURATION, ID_INFO, ID_PIXEL_HEIGHT, ID_PIXEL_WIDTH,
+    ID_SAMPLING_FREQUENCY, ID_SEGMENT, ID_SIMPLE_BLOCK, ID_TIMESTAMP, ID_TIMESTAMP_SCALE,
+    ID_TRACKS, ID_TRACK_ENTRY, ID_TRACK_NUMBER, ID_TRACK_TYPE, ID_VIDEO,
 };
 
 // ---- EBML element IDs used only by the muxer ------------------------------
@@ -462,7 +462,11 @@ impl Muxer for MkvMuxer {
         put_uint(&mut ebml, ID_EBML_READ_VERSION, 1);
         put_uint(&mut ebml, ID_EBML_MAX_ID_LENGTH, 4);
         put_uint(&mut ebml, ID_EBML_MAX_SIZE_LENGTH, 8);
-        put_string(&mut ebml, ID_DOCTYPE, if self.webm { "webm" } else { "matroska" });
+        put_string(
+            &mut ebml,
+            ID_DOCTYPE,
+            if self.webm { "webm" } else { "matroska" },
+        );
         put_uint(&mut ebml, ID_DOCTYPE_VERSION, 4);
         put_uint(&mut ebml, ID_DOCTYPE_READ_VERSION, 2);
         put_elem(&mut file, ID_EBML, &ebml);
@@ -482,8 +486,16 @@ impl Muxer for MkvMuxer {
         if let Some(title) = &self.title {
             put_string(&mut info, ID_TITLE, title);
         }
-        put_string(&mut info, ID_MUXING_APP, concat!("rff ", env!("CARGO_PKG_VERSION")));
-        put_string(&mut info, ID_WRITING_APP, concat!("rff ", env!("CARGO_PKG_VERSION")));
+        put_string(
+            &mut info,
+            ID_MUXING_APP,
+            concat!("rff ", env!("CARGO_PKG_VERSION")),
+        );
+        put_string(
+            &mut info,
+            ID_WRITING_APP,
+            concat!("rff ", env!("CARGO_PKG_VERSION")),
+        );
         let mut info_elem = Vec::new();
         put_elem(&mut info_elem, ID_INFO, &info);
 

@@ -12,7 +12,9 @@ use std::io::Cursor;
 
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
 use rff_core::{Dictionary, Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
-use rusty_png::{AdaptiveFilterType, BitDepth, ColorType, Compression, FilterType, Transformations};
+use rusty_png::{
+    AdaptiveFilterType, BitDepth, ColorType, Compression, FilterType, Transformations,
+};
 
 /// Register the PNG codec into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
@@ -266,7 +268,6 @@ fn indexed_bit_depth(n: usize) -> BitDepth {
         _ => BitDepth::Eight,
     }
 }
-
 
 /// Fixed-capacity, open-addressed colour table: 1024 slots, `u32` key,
 /// `u8` value, multiply-shift hash.
@@ -688,7 +689,13 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
             for p in packed.chunks_exact(channels) {
                 g.push(p[0]);
             }
-            (ColorType::Grayscale, BitDepth::Eight, Cow::Owned(g), None, None)
+            (
+                ColorType::Grayscale,
+                BitDepth::Eight,
+                Cow::Owned(g),
+                None,
+                None,
+            )
         }
         ColourKind::GrayAlpha => {
             let mut g = Vec::with_capacity(w * h * 2);
@@ -696,7 +703,13 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
                 g.push(p[0]);
                 g.push(if channels == 4 { p[3] } else { 255 });
             }
-            (ColorType::GrayscaleAlpha, BitDepth::Eight, Cow::Owned(g), None, None)
+            (
+                ColorType::GrayscaleAlpha,
+                BitDepth::Eight,
+                Cow::Owned(g),
+                None,
+                None,
+            )
         }
         ColourKind::Indexed {
             palette,
@@ -709,7 +722,13 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
             // 113.6 ms on a 5.35 MPx diagram, on top of the scan's own 109.2 ms.
             let body = pack_indices(&indices, w, h, depth);
             let flat: Vec<u8> = palette.iter().flat_map(|c| c.iter().copied()).collect();
-            (ColorType::Indexed, depth, Cow::Owned(body), Some(flat), trns)
+            (
+                ColorType::Indexed,
+                depth,
+                Cow::Owned(body),
+                Some(flat),
+                trns,
+            )
         }
         // Borrow, not take: on this path the body IS `packed`, and `emit` only
         // ever reads it. The previous `mem::take` existed to move a Vec out;
@@ -736,9 +755,7 @@ fn encode_png(vf: &VideoFrame, settings: PngSettings) -> Result<Vec<u8>> {
     // is the worst case and adds well under 1 KB of block headers at these
     // sizes, so this reserves exactly once.
     let indexed_used = matches!(out_color, ColorType::Indexed);
-    let out = emit(
-        vf, settings, out_color, out_depth, &body, palette, trns,
-    )?;
+    let out = emit(vf, settings, out_color, out_depth, &body, palette, trns)?;
 
     // A palette is not free: PLTE is 3 bytes per entry of essentially
     // incompressible data. On a real image that is nothing against a multi-KB
@@ -879,7 +896,11 @@ mod tests {
     fn sixteen_bit_reduction_matches_ffmpeg() {
         // endpoints
         assert_eq!(sample16_to_8(0x00, 0x00), 0);
-        assert_eq!(sample16_to_8(0xFF, 0xFF), 255, "0xFFFF must clamp to 255, not overflow");
+        assert_eq!(
+            sample16_to_8(0xFF, 0xFF),
+            255,
+            "0xFFFF must clamp to 255, not overflow"
+        );
         // the rounding boundary: 0x7F80 is exactly .5 at the high byte
         assert_eq!(sample16_to_8(0x7F, 0x7F), 0x7F);
         assert_eq!(sample16_to_8(0x7F, 0x80), 0x80);
@@ -903,44 +924,71 @@ mod tests {
     fn auto_type_is_lossless_and_smaller() {
         let cases: Vec<(&str, VideoFrame)> = vec![
             // pure gray -> Grayscale
-            ("gray", frame_from(64, 40, 3, |i, j| {
-                let v = ((i * 4 + j) % 256) as u8;
-                [v, v, v, 255]
-            })),
+            (
+                "gray",
+                frame_from(64, 40, 3, |i, j| {
+                    let v = ((i * 4 + j) % 256) as u8;
+                    [v, v, v, 255]
+                }),
+            ),
             // two colours -> Indexed at 1 bit per pixel
-            ("bilevel", frame_from(64, 40, 3, |i, j| {
-                if (i / 3 + j / 5) % 2 == 0 { [10, 200, 30, 255] } else { [250, 5, 90, 255] }
-            })),
+            (
+                "bilevel",
+                frame_from(64, 40, 3, |i, j| {
+                    if (i / 3 + j / 5) % 2 == 0 {
+                        [10, 200, 30, 255]
+                    } else {
+                        [250, 5, 90, 255]
+                    }
+                }),
+            ),
             // ~40 colours, big enough that the 120-byte PLTE is negligible
             // -> Indexed must win outright.
-            ("palette", frame_from(400, 300, 3, |i, j| {
-                // `n` reaches 63 here (i/50 -> 0..7, j/40*8 -> 0..56), so the
-                // first two channels must wrap like the third already does —
-                // `n * 6` overflows u8 at n > 42 and panics in a debug build.
-                let n = ((i / 50) + (j / 40) * 8) as u8;
-                [
-                    n.wrapping_mul(6),
-                    255u8.wrapping_sub(n.wrapping_mul(5)),
-                    n.wrapping_mul(17),
-                    255,
-                ]
-            })),
+            (
+                "palette",
+                frame_from(400, 300, 3, |i, j| {
+                    // `n` reaches 63 here (i/50 -> 0..7, j/40*8 -> 0..56), so the
+                    // first two channels must wrap like the third already does —
+                    // `n * 6` overflows u8 at n > 42 and panics in a debug build.
+                    let n = ((i / 50) + (j / 40) * 8) as u8;
+                    [
+                        n.wrapping_mul(6),
+                        255u8.wrapping_sub(n.wrapping_mul(5)),
+                        n.wrapping_mul(17),
+                        255,
+                    ]
+                }),
+            ),
             // Same content but TINY: here the incompressible PLTE costs more
             // than indexing saves, so auto-type must fall back rather than
             // inflate the file. Measured before the guard: 252 B vs 188 B.
-            ("palette_tiny", frame_from(64, 40, 3, |i, j| {
-                let n = ((i / 8) + (j / 8) * 8) as u8;
-                [n * 6, 255 - n * 5, n.wrapping_mul(17), 255]
-            })),
+            (
+                "palette_tiny",
+                frame_from(64, 40, 3, |i, j| {
+                    let n = ((i / 8) + (j / 8) * 8) as u8;
+                    [n * 6, 255 - n * 5, n.wrapping_mul(17), 255]
+                }),
+            ),
             // gray with varying alpha -> GrayscaleAlpha
-            ("gray_alpha", frame_from(64, 40, 4, |i, j| {
-                let v = ((i + j) % 256) as u8;
-                [v, v, v, ((i * 3) % 256) as u8]
-            })),
+            (
+                "gray_alpha",
+                frame_from(64, 40, 4, |i, j| {
+                    let v = ((i + j) % 256) as u8;
+                    [v, v, v, ((i * 3) % 256) as u8]
+                }),
+            ),
             // photographic-ish -> must stay TrueColour
-            ("truecolour", frame_from(64, 40, 3, |i, j| {
-                [(i * 7 % 256) as u8, (j * 13 % 256) as u8, ((i * j) % 256) as u8, 255]
-            })),
+            (
+                "truecolour",
+                frame_from(64, 40, 3, |i, j| {
+                    [
+                        (i * 7 % 256) as u8,
+                        (j * 13 % 256) as u8,
+                        ((i * j) % 256) as u8,
+                        255,
+                    ]
+                }),
+            ),
         ];
 
         for (name, vf) in cases {

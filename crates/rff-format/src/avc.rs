@@ -178,7 +178,11 @@ pub fn sps_dimensions(nal: &[u8]) -> Option<(u32, u32)> {
     if r.bit()? == 1 {
         // frame_cropping: units depend on the chroma sampling (Table 6-1).
         let (left, right, top, bottom) = (r.ue()?, r.ue()?, r.ue()?, r.ue()?);
-        let chroma_array_type = if separate_colour_plane { 0 } else { chroma_format_idc };
+        let chroma_array_type = if separate_colour_plane {
+            0
+        } else {
+            chroma_format_idc
+        };
         let (sub_w, sub_h) = match chroma_array_type {
             1 => (2, 2), // 4:2:0
             2 => (2, 1), // 4:2:2
@@ -328,7 +332,9 @@ mod tests {
 
     #[test]
     fn finds_sps_between_start_codes() {
-        let data = [0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1, 0x67, 0xAA, 0, 0, 1, 0x68];
+        let data = [
+            0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1, 0x67, 0xAA, 0, 0, 1, 0x68,
+        ];
         assert_eq!(find_sps_annexb(&data), Some(&[0x67u8, 0xAA][..]));
         // SPS as the last NAL.
         let data = [0, 0, 1, 0x67, 0xAA, 0xBB];
@@ -349,7 +355,9 @@ mod tests {
     #[test]
     fn sps_dimensions_baseline_176x144() {
         // Baseline QCIF SPS (no cropping, no High-profile fields).
-        let sps = [0x67, 0x42, 0xC0, 0x0D, 0x8C, 0x8D, 0x41, 0x62, 0x64, 0x0A, 0x60, 0x80];
+        let sps = [
+            0x67, 0x42, 0xC0, 0x0D, 0x8C, 0x8D, 0x41, 0x62, 0x64, 0x0A, 0x60, 0x80,
+        ];
         assert_eq!(sps_dimensions(&sps), Some((176, 144)));
     }
 }

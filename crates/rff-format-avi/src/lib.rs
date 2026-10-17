@@ -38,7 +38,13 @@ pub fn register(registry: &mut FormatRegistry) {
         muxer: Some(|output| Box::new(AviMuxer::new(output))),
         muxer_path: None,
         probe: Some(probe_avi),
-        mux_caps: MuxCaps::container(&[CodecId::H264, CodecId::Jpeg, CodecId::Avif, CodecId::RawVideo, CodecId::Pcm]),
+        mux_caps: MuxCaps::container(&[
+            CodecId::H264,
+            CodecId::Jpeg,
+            CodecId::Avif,
+            CodecId::RawVideo,
+            CodecId::Pcm,
+        ]),
     });
 }
 
@@ -730,23 +736,26 @@ fn strf(s: &Stream) -> Result<Vec<u8>> {
             // means BI_RGB, and readers then interpret planar-YUV packets as
             // packed BGR of a different size — silent corruption. Planar YUV
             // carries its own fourcc and true bits-per-pixel instead.
-            let (fourcc, bit_count, frame_bytes): ([u8; 4], u16, u32) =
-                if s.codec_id == CodecId::RawVideo {
-                    let (cw, ch) = (s.width.div_ceil(2), s.height.div_ceil(2));
-                    match s.pixel_format {
-                        Some(PixelFormat::Yuv420p) => (*b"I420", 12, s.width * s.height + 2 * cw * ch),
-                        Some(PixelFormat::Yuv422p) => (*b"Y42B", 16, s.width * s.height + 2 * cw * s.height),
-                        Some(PixelFormat::Yuv444p) => (*b"444P", 24, 3 * s.width * s.height),
-                        other => {
-                            return Err(Error::unsupported(format!(
-                                "avi mux: rawvideo pixel format {:?} has no AVI mapping",
-                                other
-                            )))
-                        }
+            let (fourcc, bit_count, frame_bytes): ([u8; 4], u16, u32) = if s.codec_id
+                == CodecId::RawVideo
+            {
+                let (cw, ch) = (s.width.div_ceil(2), s.height.div_ceil(2));
+                match s.pixel_format {
+                    Some(PixelFormat::Yuv420p) => (*b"I420", 12, s.width * s.height + 2 * cw * ch),
+                    Some(PixelFormat::Yuv422p) => {
+                        (*b"Y42B", 16, s.width * s.height + 2 * cw * s.height)
                     }
-                } else {
-                    (codec_to_fourcc(s.codec_id), 24, s.width * s.height * 3)
-                };
+                    Some(PixelFormat::Yuv444p) => (*b"444P", 24, 3 * s.width * s.height),
+                    other => {
+                        return Err(Error::unsupported(format!(
+                            "avi mux: rawvideo pixel format {:?} has no AVI mapping",
+                            other
+                        )))
+                    }
+                }
+            } else {
+                (codec_to_fourcc(s.codec_id), 24, s.width * s.height * 3)
+            };
             let mut b = vec![0u8; 40]; // BITMAPINFOHEADER
             put_u32(&mut b, 0, 40); // biSize
             put_u32(&mut b, 4, s.width); // biWidth

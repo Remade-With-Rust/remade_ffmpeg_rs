@@ -1,4 +1,4 @@
-﻿//! WebP still-image codec, backed by the pure-Rust [`rusty_webp`].
+//! WebP still-image codec, backed by the pure-Rust [`rusty_webp`].
 //!
 //! Decode handles both VP8 (lossy) and VP8L (lossless), yielding packed
 //! [`Rgb24`](PixelFormat::Rgb24) or [`Rgba`](PixelFormat::Rgba). Encode is
@@ -7,9 +7,9 @@
 
 use std::io::Cursor;
 
-use rusty_webp::{ColorType, WebPDecoder, WebPEncoder};
 use rff_codec::{Codec, CodecRegistry, Decoder, Encoder};
 use rff_core::{Error, Frame, MediaType, Packet, PixelFormat, Result, VideoFrame};
+use rusty_webp::{ColorType, WebPDecoder, WebPEncoder};
 
 /// Register the WebP codec into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
@@ -99,14 +99,16 @@ fn decode_webp(data: &[u8]) -> Result<std::collections::VecDeque<Frame>> {
             .read_yuv420()
             .map_err(|e| Error::invalid(format!("webp decode: {e}")))?
         {
-            return Ok(std::collections::VecDeque::from([Frame::Video(VideoFrame {
-                width: w,
-                height: h,
-                format: PixelFormat::Yuv420p,
-                strides: vec![yuv.y_stride, yuv.uv_stride, yuv.uv_stride],
-                planes: vec![yuv.y, yuv.u, yuv.v],
-                pts: None,
-            })]));
+            return Ok(std::collections::VecDeque::from([Frame::Video(
+                VideoFrame {
+                    width: w,
+                    height: h,
+                    format: PixelFormat::Yuv420p,
+                    strides: vec![yuv.y_stride, yuv.uv_stride, yuv.uv_stride],
+                    planes: vec![yuv.y, yuv.u, yuv.v],
+                    pts: None,
+                },
+            )]));
         }
     }
 
@@ -122,14 +124,16 @@ fn decode_webp(data: &[u8]) -> Result<std::collections::VecDeque<Frame>> {
     } else {
         (PixelFormat::Rgb24, w as usize * 3)
     };
-    Ok(std::collections::VecDeque::from([Frame::Video(VideoFrame {
-        width: w,
-        height: h,
-        format,
-        planes: vec![buf],
-        strides: vec![stride],
-        pts: None,
-    })]))
+    Ok(std::collections::VecDeque::from([Frame::Video(
+        VideoFrame {
+            width: w,
+            height: h,
+            format,
+            planes: vec![buf],
+            strides: vec![stride],
+            pts: None,
+        },
+    )]))
 }
 
 #[derive(Default)]

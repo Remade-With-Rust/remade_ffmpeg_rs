@@ -69,7 +69,10 @@ fn child_cpu_us(child: &Child) -> u64 {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::GetProcessTimes;
-    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
     let (mut c, mut e, mut k, mut u) = (zero, zero, zero, zero);
     // SAFETY: the handle is owned by `child` and outlives the call; all four
     // FILETIME outputs are valid, writable and distinct.
@@ -159,9 +162,17 @@ fn run_arm(arm: Arc<Arm>, frame_len: usize, repeat: usize, pace_ns: u64) {
 /// One pass over the clip. Returns the arm's cumulative CPU microseconds, or
 /// `None` if it failed. `cpu_base` carries CPU across passes, because each pass
 /// is a new process whose own counter starts at zero.
-fn run_once(arm: &Arc<Arm>, frame_len: usize, t0: Instant, pace_ns: u64, cpu_base: u64) -> Option<u64> {
+fn run_once(
+    arm: &Arc<Arm>,
+    frame_len: usize,
+    t0: Instant,
+    pace_ns: u64,
+    cpu_base: u64,
+) -> Option<u64> {
     let mut cmd = Command::new(&arm.argv[0]);
-    cmd.args(&arm.argv[1..]).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(&arm.argv[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -191,7 +202,8 @@ fn run_once(arm: &Arc<Arm>, frame_len: usize, t0: Instant, pace_ns: u64, cpu_bas
         arm.hashes.lock().unwrap().push(h);
         arm.latest.lock().unwrap().copy_from_slice_or_set(&buf);
         let n = arm.frames.fetch_add(1, Ordering::Relaxed) + 1;
-        arm.elapsed_us.store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        arm.elapsed_us
+            .store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Sample the child's CPU a few times a second rather than per frame: it
         // is a syscall, and the value is tick-quantised anyway.
         if n % 8 == 0 {
@@ -215,7 +227,11 @@ fn run_once(arm: &Arc<Arm>, frame_len: usize, t0: Instant, pace_ns: u64, cpu_bas
     }
     let _ = child.wait();
     if arm.frames.load(Ordering::Relaxed) == 0 {
-        *arm.failed.lock().unwrap() = Some(if err.is_empty() { "no frames".into() } else { err });
+        *arm.failed.lock().unwrap() = Some(if err.is_empty() {
+            "no frames".into()
+        } else {
+            err
+        });
         return None;
     }
     Some(cpu_base + final_cpu)
@@ -248,7 +264,8 @@ fn yuv_to_rgb_half(yuv: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
         for i in 0..ow {
             let r0 = yp + (2 * j) * w + 2 * i;
             let r1 = r0 + w;
-            let y = (yuv[r0] as i32 + yuv[r0 + 1] as i32 + yuv[r1] as i32 + yuv[r1 + 1] as i32 + 2) >> 2;
+            let y = (yuv[r0] as i32 + yuv[r0 + 1] as i32 + yuv[r1] as i32 + yuv[r1 + 1] as i32 + 2)
+                >> 2;
             let u = yuv[up + j * cw + i] as i32 - 128;
             let v = yuv[vp + j * cw + i] as i32 - 128;
             let c = (y - 16) * 298;
@@ -277,7 +294,15 @@ fn run_encoder(arm: Arc<Arm>, w: usize, h: usize, period: Duration) {
         let (rgb, ow, oh) = yuv_to_rgb_half(&yuv, w, h);
         let mut out = Vec::with_capacity(64 << 10);
         let enc = rusty_jpeg::encode::Encoder::new(&mut out, 72);
-        if enc.encode(&rgb, ow as u16, oh as u16, rusty_jpeg::encode::ColorType::Rgb).is_ok() {
+        if enc
+            .encode(
+                &rgb,
+                ow as u16,
+                oh as u16,
+                rusty_jpeg::encode::ColorType::Rgb,
+            )
+            .is_ok()
+        {
             *arm.jpeg.lock().unwrap() = Arc::new(out);
             arm.jpeg_gen.fetch_add(1, Ordering::Release);
         }
@@ -300,26 +325,52 @@ fn esc(s: &str) -> String {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let val = |k: &str| -> Option<String> { a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).cloned() };
+    let val = |k: &str| -> Option<String> {
+        a.iter()
+            .position(|x| x == k)
+            .and_then(|i| a.get(i + 1))
+            .cloned()
+    };
     let Some(stream) = val("--stream") else {
         eprintln!("usage: hevc-duel --stream S.hevc --arm \"name|exe|arg|arg\" --arm \"...\" [--clip-fps 30] [--port 8099]");
         std::process::exit(2);
     };
     let port: u16 = val("--port").and_then(|p| p.parse().ok()).unwrap_or(8099);
     let repeat: usize = val("--repeat").and_then(|p| p.parse().ok()).unwrap_or(1);
-    let clip_fps: f64 = val("--clip-fps").and_then(|p| p.parse().ok()).unwrap_or(30.0);
+    let clip_fps: f64 = val("--clip-fps")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(30.0);
     // Real time by default: the clip plays at its own rate. `--free` lets both
     // arms run flat out instead, which is quicker to watch but is not playback.
     let free = a.iter().any(|x| x == "--free");
-    let pace_ns: u64 = if free || clip_fps <= 0.0 { 0 } else { (1e9 / clip_fps) as u64 };
+    let pace_ns: u64 = if free || clip_fps <= 0.0 {
+        0
+    } else {
+        (1e9 / clip_fps) as u64
+    };
 
     let probe = Command::new("ffprobe")
-        .args(["-v", "error", "-f", "hevc", "-count_frames", "-show_entries", "stream=width,height,nb_read_frames", "-of", "csv=p=0", &stream])
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "hevc",
+            "-count_frames",
+            "-show_entries",
+            "stream=width,height,nb_read_frames",
+            "-of",
+            "csv=p=0",
+            &stream,
+        ])
         .output()
         .expect("ffprobe (needed for frame geometry)");
     let dims = String::from_utf8_lossy(&probe.stdout).trim().to_string();
     let (w, h, clip_frames): (usize, usize, usize) = match dims.split(',').collect::<Vec<_>>()[..] {
-        [x, y, n] => (x.trim().parse().unwrap(), y.trim().parse().unwrap(), n.trim().parse().unwrap_or(0)),
+        [x, y, n] => (
+            x.trim().parse().unwrap(),
+            y.trim().parse().unwrap(),
+            n.trim().parse().unwrap_or(0),
+        ),
         _ => panic!("ffprobe returned {dims:?} for {stream}"),
     };
     let frame_len: usize = w * h + 2 * (w.div_ceil(2) * h.div_ceil(2));
@@ -331,14 +382,18 @@ fn main() {
         .filter(|(_, x)| x.as_str() == "--arm")
         .filter_map(|(i, _)| a.get(i + 1))
         .map(|spec| {
-            let mut parts: Vec<String> = spec.split('|').map(|p| p.replace("{S}", &stream)).collect();
+            let mut parts: Vec<String> =
+                spec.split('|').map(|p| p.replace("{S}", &stream)).collect();
             let name = parts.remove(0);
             Arc::new(Arm::new(name, parts))
         })
         .collect();
     assert!(arms.len() >= 2, "need at least two --arm specs");
 
-    println!("hevc-duel: {stream}  {w}x{h}  {clip_frames} frames ({:.1}s at {clip_fps} fps)", clip_frames as f64 / clip_fps);
+    println!(
+        "hevc-duel: {stream}  {w}x{h}  {clip_frames} frames ({:.1}s at {clip_fps} fps)",
+        clip_frames as f64 / clip_fps
+    );
     for arm in &arms {
         println!("  arm: {:<22} {}", arm.name, arm.argv.join(" "));
     }
@@ -371,12 +426,20 @@ fn main() {
                         std::thread::spawn(move || run_arm(a2, frame_len, repeat, pace_ns));
                     }
                 }
-                let body: &[u8] = if busy { b"{\"started\":false}" } else { b"{\"started\":true}" };
+                let body: &[u8] = if busy {
+                    b"{\"started\":false}"
+                } else {
+                    b"{\"started\":true}"
+                };
                 send(s, "200 OK", "application/json", body);
                 return;
             }
 
-            if let Some(idx) = path.strip_prefix("/mjpeg/").and_then(|p| p.split('?').next()).and_then(|p| p.parse::<usize>().ok()) {
+            if let Some(idx) = path
+                .strip_prefix("/mjpeg/")
+                .and_then(|p| p.split('?').next())
+                .and_then(|p| p.parse::<usize>().ok())
+            {
                 let Some(arm) = arms.get(idx) else {
                     send(s, "404 Not Found", "text/plain", b"no such arm");
                     return;
@@ -397,15 +460,24 @@ fn main() {
                     if img.is_empty() {
                         continue;
                     }
-                    let part = format!("--f\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", img.len());
-                    if s.write_all(part.as_bytes()).is_err() || s.write_all(&img).is_err() || s.write_all(b"\r\n").is_err() {
+                    let part = format!(
+                        "--f\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                        img.len()
+                    );
+                    if s.write_all(part.as_bytes()).is_err()
+                        || s.write_all(&img).is_err()
+                        || s.write_all(b"\r\n").is_err()
+                    {
                         return; // the tab closed; not an error
                     }
                 }
             }
 
             if path.starts_with("/stats") {
-                let hs: Vec<Vec<u64>> = arms.iter().map(|x| x.hashes.lock().unwrap().clone()).collect();
+                let hs: Vec<Vec<u64>> = arms
+                    .iter()
+                    .map(|x| x.hashes.lock().unwrap().clone())
+                    .collect();
                 let common = hs.iter().map(|v| v.len()).min().unwrap_or(0);
                 let (mut agree, mut first_bad) = (0usize, -1i64);
                 for k in 0..common {

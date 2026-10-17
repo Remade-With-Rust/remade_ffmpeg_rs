@@ -311,7 +311,12 @@ fn clamp8(v: i16) -> i16 {
 
 /// Normal-filter macroblock-edge core on centred (value − 128) lanes.
 /// Taps ordered [p3, p2, p1, p0, q0, q1, q2, q3]; writes p2..q2.
-fn mb_edge_core<const N: usize>(hev_threshold: u8, interior_limit: u8, edge_limit: u8, t: &mut [[i16; N]; 8]) {
+fn mb_edge_core<const N: usize>(
+    hev_threshold: u8,
+    interior_limit: u8,
+    edge_limit: u8,
+    t: &mut [[i16; N]; 8],
+) {
     let il = i16::from(interior_limit);
     let el = i16::from(edge_limit);
     let hev_t = i16::from(hev_threshold);
@@ -367,7 +372,12 @@ fn mb_edge_core<const N: usize>(hev_threshold: u8, interior_limit: u8, edge_limi
 }
 
 /// Normal-filter subblock-edge core on centred lanes; writes p1..q1.
-fn sb_edge_core<const N: usize>(hev_threshold: u8, interior_limit: u8, edge_limit: u8, t: &mut [[i16; N]; 8]) {
+fn sb_edge_core<const N: usize>(
+    hev_threshold: u8,
+    interior_limit: u8,
+    edge_limit: u8,
+    t: &mut [[i16; N]; 8],
+) {
     let il = i16::from(interior_limit);
     let el = i16::from(edge_limit);
     let hev_t = i16::from(hev_threshold);
@@ -421,7 +431,14 @@ fn load_rows<const N: usize>(pixels: &[u8], point: usize, stride: usize) -> [[i1
 }
 
 #[inline(always)]
-fn store_rows<const N: usize>(pixels: &mut [u8], point: usize, stride: usize, t: &[[i16; N]; 8], from: usize, to: usize) {
+fn store_rows<const N: usize>(
+    pixels: &mut [u8],
+    point: usize,
+    stride: usize,
+    t: &[[i16; N]; 8],
+    from: usize,
+    to: usize,
+) {
     for k in from..to {
         let base = point + k * stride - 4 * stride;
         for i in 0..N {
@@ -445,7 +462,14 @@ fn load_cols<const N: usize>(pixels: &[u8], base: usize, stride: usize) -> [[i16
 }
 
 #[inline(always)]
-fn store_cols<const N: usize>(pixels: &mut [u8], base: usize, stride: usize, t: &[[i16; N]; 8], from: usize, to: usize) {
+fn store_cols<const N: usize>(
+    pixels: &mut [u8],
+    base: usize,
+    stride: usize,
+    t: &[[i16; N]; 8],
+    from: usize,
+    to: usize,
+) {
     for i in 0..N {
         let row = base + i * stride;
         for k in from..to {
@@ -519,7 +543,9 @@ mod batch_tests {
     use super::*;
 
     fn lcg(state: &mut u64) -> u8 {
-        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (*state >> 33) as u8
     }
 
@@ -560,7 +586,14 @@ mod batch_tests {
                 macroblock_filter_horizontal(hev_t, il, el, &mut a[o..][..8]);
             }
             let mut b = base.clone();
-            macroblock_filter_horizontal_batch::<16>(hev_t, il, el, &mut b, 8 * stride + 8 - 4, stride);
+            macroblock_filter_horizontal_batch::<16>(
+                hev_t,
+                il,
+                el,
+                &mut b,
+                8 * stride + 8 - 4,
+                stride,
+            );
             assert_eq!(a, b, "mb horizontal mismatch");
 
             let mut a = base.clone();
@@ -569,7 +602,14 @@ mod batch_tests {
                 subblock_filter_horizontal(hev_t, il, el, &mut a[o..][..8]);
             }
             let mut b = base.clone();
-            subblock_filter_horizontal_batch::<16>(hev_t, il, el, &mut b, 8 * stride + 8 - 4, stride);
+            subblock_filter_horizontal_batch::<16>(
+                hev_t,
+                il,
+                el,
+                &mut b,
+                8 * stride + 8 - 4,
+                stride,
+            );
             assert_eq!(a, b, "sb horizontal mismatch");
         }
     }

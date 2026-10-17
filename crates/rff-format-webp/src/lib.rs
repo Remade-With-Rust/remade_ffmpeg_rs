@@ -1,12 +1,12 @@
-﻿//! WebP single-image container. A WebP file (RIFF/`WEBP`) is its own codec
+//! WebP single-image container. A WebP file (RIFF/`WEBP`) is its own codec
 //! stream, so the demuxer hands the whole file to the [`webp`](rff-codec-webp)
 //! codec as one packet; dimensions are read from the header via `image-webp`.
 
 use std::io::{Cursor, Read, Write};
 
-use rusty_webp::WebPDecoder;
 use rff_core::{CodecId, ColorRange, Error, Packet, Rational, Result};
 use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
+use rusty_webp::WebPDecoder;
 
 /// Register the WebP format into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {

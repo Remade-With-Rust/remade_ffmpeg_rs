@@ -136,8 +136,7 @@ pub type MuxerFactory = fn(Output) -> Box<dyn Muxer>;
 /// playlist/manifest plus many segment files, so a single byte sink cannot
 /// model them). Receives the output path and the format options
 /// (`-hls_time 6` → `{"hls_time": "6"}`).
-pub type PathMuxerFactory =
-    fn(&std::path::Path, &Dictionary) -> Result<Box<dyn Muxer>>;
+pub type PathMuxerFactory = fn(&std::path::Path, &Dictionary) -> Result<Box<dyn Muxer>>;
 /// Content sniffer: scores how strongly a byte prefix looks like this format,
 /// `0` (no match) to `100` (certain) — mirrors FFmpeg's `AVInputFormat::read_probe`.
 pub type ProbeFn = fn(&[u8]) -> i32;

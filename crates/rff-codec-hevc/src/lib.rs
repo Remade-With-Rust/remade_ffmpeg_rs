@@ -158,7 +158,11 @@ fn frame_to_rff(f: &rusty_h265::Frame) -> Frame {
     // because they all decode to `-`.
     let mut scratch: Vec<u8> = Vec::new();
     for (i, plane) in pic.planes.iter().enumerate() {
-        let (x0, y0, w, h) = if i == 0 { (cx, cy, cw, ch) } else { (cx / sw, cy / sh, cw / sw, ch / sh) };
+        let (x0, y0, w, h) = if i == 0 {
+            (cx, cy, cw, ch)
+        } else {
+            (cx / sw, cy / sh, cw / sw, ch / sh)
+        };
         let bpp = if wide { 2 } else { 1 };
         let mut out = Vec::with_capacity(w * h * bpp);
         if w > 0 && h > 0 {

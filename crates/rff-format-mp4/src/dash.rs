@@ -99,8 +99,8 @@ impl Muxer for DashMuxer {
             sample
         } else {
             if track.out.stream.codec_id == CodecId::Avif && track.out.config.is_none() {
-                track.out.config = rff_format::av1::config_record(&packet.data)
-                    .map(|r| bx(b"av1C", &r));
+                track.out.config =
+                    rff_format::av1::config_record(&packet.data).map(|r| bx(b"av1C", &r));
             }
             packet.data.clone()
         };
@@ -166,8 +166,14 @@ impl Muxer for DashMuxer {
             let mime = fmp4::mime_type(s.media_type);
             let codecs = fmp4::codec_string(&track.out);
             let mut rep = String::new();
-            let _ = writeln!(rep, "    <AdaptationSet mimeType=\"{mime}\" segmentAlignment=\"true\">");
-            let _ = write!(rep, "      <Representation id=\"{id}\" codecs=\"{codecs}\" bandwidth=\"200000\"");
+            let _ = writeln!(
+                rep,
+                "    <AdaptationSet mimeType=\"{mime}\" segmentAlignment=\"true\">"
+            );
+            let _ = write!(
+                rep,
+                "      <Representation id=\"{id}\" codecs=\"{codecs}\" bandwidth=\"200000\""
+            );
             if is_video && s.width > 0 {
                 let _ = write!(rep, " width=\"{}\" height=\"{}\"", s.width, s.height);
             }

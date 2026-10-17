@@ -1008,7 +1008,11 @@ fn narrow_to_8(src: &VideoFrame) -> Result<VideoFrame> {
     let mut planes = Vec::with_capacity(3);
     let mut strides = Vec::with_capacity(3);
     for (i, plane) in src.planes.iter().enumerate().take(3) {
-        let (pw, ph) = if i == 0 { (w, h) } else { (w.div_ceil(sh), h.div_ceil(sv)) };
+        let (pw, ph) = if i == 0 {
+            (w, h)
+        } else {
+            (w.div_ceil(sh), h.div_ceil(sv))
+        };
         let stride = src.strides.get(i).copied().unwrap_or(pw * 2);
         let mut out = Vec::with_capacity(pw * ph);
         for y in 0..ph {
@@ -1032,7 +1036,6 @@ fn narrow_to_8(src: &VideoFrame) -> Result<VideoFrame> {
         pts: src.pts,
     })
 }
-
 
 /// Planar Y'CbCr → planar 4:2:0, **averaging** the chroma it drops.
 ///

@@ -96,9 +96,9 @@ mod detect {
         // drawn from it is wrong in the confident direction. The real scalar
         // build is `--no-default-features`.
         let cap = match std::env::var("RH265_ISA").as_deref() {
-            Ok("scalar") => panic!(
-                "RH265_ISA=scalar does not select the scalar kernels -- level 0 is the SSE2 rung.                  Build with --no-default-features for a genuinely scalar decoder."
-            ),
+            Ok("scalar") => {
+                panic!("RH265_ISA=scalar does not select the scalar kernels -- level 0 is the SSE2 rung.                  Build with --no-default-features for a genuinely scalar decoder.")
+            }
             Ok("baseline") | Ok("sse2") => 0,
             Ok("sse41") => 1,
             _ => 2,

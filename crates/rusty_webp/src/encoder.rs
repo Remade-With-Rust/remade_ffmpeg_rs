@@ -341,10 +341,7 @@ impl DistMapper {
     }
 
     fn code(&self, dist: usize) -> u32 {
-        self.map
-            .get(&dist)
-            .copied()
-            .unwrap_or(dist as u32 + 120)
+        self.map.get(&dist).copied().unwrap_or(dist as u32 + 120)
     }
 }
 
@@ -512,7 +509,11 @@ struct Hists {
 /// Walk the tokens as the decoder will see them, maintaining the cache model,
 /// and count every symbol that would be written.
 fn histogram(toks: &[Tok], px: &[u32], cache_bits: u8) -> Hists {
-    let cache_size = if cache_bits > 0 { 1usize << cache_bits } else { 0 };
+    let cache_size = if cache_bits > 0 {
+        1usize << cache_bits
+    } else {
+        0
+    };
     let mut h = Hists {
         green: vec![0; 256 + 24 + cache_size],
         red: vec![0; 256],
@@ -629,12 +630,7 @@ fn predict(mode: u8, l: [u8; 4], t: [u8; 4], tr: [u8; 4], tl: [u8; 4]) -> [u8; 4
             }
         }
         12 => per(&|i| casf(i16::from(l[i]), i16::from(t[i]), i16::from(tl[i]))),
-        _ => per(&|i| {
-            cash(
-                (i16::from(l[i]) + i16::from(t[i])) / 2,
-                i16::from(tl[i]),
-            )
-        }),
+        _ => per(&|i| cash((i16::from(l[i]) + i16::from(t[i])) / 2, i16::from(tl[i]))),
     }
 }
 
@@ -647,21 +643,34 @@ fn residual_cost(r: u8) -> u32 {
 /// Neighbours of pixel (x, y≥1, x≥1) as the decoder reconstructs them. TR at
 /// the row end wraps to the current row's first pixel (already decoded), as
 /// in the decoder's `i - width*4 + 4` addressing.
-fn neighbours(pixels: &[u8], width: usize, x: usize, y: usize) -> ([u8; 4], [u8; 4], [u8; 4], [u8; 4]) {
+fn neighbours(
+    pixels: &[u8],
+    width: usize,
+    x: usize,
+    y: usize,
+) -> ([u8; 4], [u8; 4], [u8; 4], [u8; 4]) {
     let at = |xx: usize, yy: usize| -> [u8; 4] {
         pixels[(yy * width + xx) * 4..][..4].try_into().unwrap()
     };
     let l = at(x - 1, y);
     let t = at(x, y - 1);
     let tl = at(x - 1, y - 1);
-    let tr = if x + 1 < width { at(x + 1, y - 1) } else { at(0, y) };
+    let tr = if x + 1 < width {
+        at(x + 1, y - 1)
+    } else {
+        at(0, y)
+    };
     (l, t, tr, tl)
 }
 
 /// Choose one predictor per 16×16 tile (summed wrap-distance of residuals),
 /// then produce the residual image plus the predictor sub-image (mode in the
 /// green channel, as the decoder reads it).
-fn predictor_select(pixels: &[u8], width: usize, height: usize) -> (Vec<u8>, Vec<u32>, usize, usize) {
+fn predictor_select(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+) -> (Vec<u8>, Vec<u32>, usize, usize) {
     let bw = width.div_ceil(1 << PRED_BITS);
     let bh = height.div_ceil(1 << PRED_BITS);
     let mut modes = vec![2u8; bw * bh];
@@ -751,16 +760,18 @@ fn write_backref_stream<W: Write>(
         }
     }
     let (cache_bits, _, mut h) = best.expect("candidate list is non-empty");
-    let cache_size = if cache_bits > 0 { 1usize << cache_bits } else { 0 };
+    let cache_size = if cache_bits > 0 {
+        1usize << cache_bits
+    } else {
+        0
+    };
 
     // The simple-tree format stores 8-bit symbols only. A green tree whose
     // single used symbol is a length/cache code (≥ 256) cannot take that
     // form; keeping an unused literal alive forces the general format.
     // (Unreachable in practice — the first token is always a literal — but
     // cheap insurance beats a corrupt file.)
-    if h.green[256..].iter().any(|&c| c > 0)
-        && h.green.iter().filter(|&&c| c > 0).count() == 1
-    {
+    if h.green[256..].iter().any(|&c| c > 0) && h.green.iter().filter(|&&c| c > 0).count() == 1 {
         h.green[0] = 1;
     }
 
@@ -1006,8 +1017,7 @@ fn encode_frame<W: Write>(
         }
         // Small images take the search unconditionally: its cost is
         // negligible there and it still buys ~10% on small screen art.
-        let run_heavy =
-            sampled > 0 && repeats * 4 >= sampled && pixels.len() / 4 > (1 << 18);
+        let run_heavy = sampled > 0 && repeats * 4 >= sampled && pixels.len() / 4 > (1 << 18);
 
         let residuals = if params.use_predictor_transform && !run_heavy {
             // Per-tile predictor transform: present=1, type=00 (predictor),
@@ -1432,7 +1442,10 @@ mod tests {
         let mut out = vec![0; w * h * if decoder.has_alpha() { 4 } else { 3 }];
         decoder.read_image(&mut out).unwrap();
         if !decoder.has_alpha() {
-            out = out.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+            out = out
+                .chunks_exact(3)
+                .flat_map(|p| [p[0], p[1], p[2], 255])
+                .collect();
         }
         out
     }
@@ -1454,7 +1467,9 @@ mod tests {
             .chunks_exact(4)
             .flat_map(|p| [p[0], p[1], p[2]])
             .collect();
-        encoder.encode(&rgb, 256, 256, crate::ColorType::Rgb8).unwrap();
+        encoder
+            .encode(&rgb, 256, 256, crate::ColorType::Rgb8)
+            .unwrap();
         assert_eq!(img_opaque, decode_rgba(&output, 256, 256));
 
         let mut output = Vec::new();

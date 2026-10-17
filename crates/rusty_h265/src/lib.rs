@@ -95,7 +95,9 @@ mod silent_zero_guards {
         let mut out = Vec::new();
         let mut stack = vec![root.join("rusty_h265"), root.join("rusty_h265-accel")];
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for e in entries.flatten() {
                 let p = e.path();
                 if p.is_dir() {
