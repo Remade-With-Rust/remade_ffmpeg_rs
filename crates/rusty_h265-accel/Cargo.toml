@@ -2,6 +2,11 @@
 name = "rusty_h265-accel"
 description = "SIMD kernels for the rusty_h265 HEVC decoder: the one crate allowed `unsafe`, behind a runtime-dispatched seam."
 version = "0.6.1"
+# Vendored build copy. `rusty_h265-accel` is published from its own repository
+# (github.com/Remade-With-Rust/rusty_h265), which crates.io names as its source;
+# two repositories publishing one crate name is what makes a version
+# cascade unorderable. Dependents here resolve it by version when published.
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

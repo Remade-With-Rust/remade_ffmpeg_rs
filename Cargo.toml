@@ -171,7 +171,7 @@ rusty_png = { path = "crates/rusty_png", version = "0.3.2", features = ["paralle
 gif = { path = "crates/rusty_gif", version = "0.1.0", package = "rusty_gif" }
 # webp: our own rusty_webp â€” a fork of image-rs/image-webp 0.2.4 (MIT/Apache),
 # carried forward in-tree. See crates/rusty_webp/NOTICE.md.
-rusty_webp = { path = "crates/rusty_webp", version = "0.1.1" }
+rusty_webp = { path = "crates/rusty_webp", version = "0.1.2" }
 # Opus comes from our own rusty-opus (BSD-3-Clause fork of the pure-Rust opus-rs
 # port of libopus 1.6 â€” no FFI). The fork's package is now named `rusty-opus`
 # (previously carried upstream's `opus-rs` name â€” renamed so the crate, Cargo.lock,
