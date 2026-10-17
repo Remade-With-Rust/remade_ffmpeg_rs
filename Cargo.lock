@@ -5351,7 +5351,7 @@ version = "0.2.3"
 
 [[package]]
 name = "rff-targets"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rff-codec",
  "rff-core",
