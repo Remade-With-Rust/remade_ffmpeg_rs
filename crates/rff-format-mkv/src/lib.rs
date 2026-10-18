@@ -13,6 +13,7 @@
 
 mod mux;
 
+use std::collections::VecDeque;
 use std::io::{self, BufReader, Read};
 
 use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result, SampleFormat};
@@ -94,6 +95,7 @@ const ID_AUDIO: u32 = 0xE1;
 const ID_SAMPLING_FREQUENCY: u32 = 0xB5;
 const ID_CHANNELS: u32 = 0x9F;
 const ID_BIT_DEPTH: u32 = 0x6264;
+const ID_DEFAULT_DURATION: u32 = 0x23_E383;
 const ID_CLUSTER: u32 = 0x1F43_B675;
 const ID_TIMESTAMP: u32 = 0xE7;
 const ID_SIMPLE_BLOCK: u32 = 0xA3;
@@ -337,6 +339,11 @@ struct MkvDemuxer {
     /// Indexed by stream index; ASS/SSA subtitle tracks, whose block payloads
     /// carry `ReadOrder,Layer,Style,…,Text` and get reduced to plain text.
     ass: Vec<bool>,
+    /// Indexed by stream index: the track's DefaultDuration in nanoseconds (0: none),
+    /// which times the frames of a laced block.
+    default_duration: Vec<u64>,
+    /// The rest of a laced block's frames, returned before the walk goes on.
+    laced: VecDeque<Packet>,
     timestamp_scale: u64,
     /// Segment duration in `timestamp_scale` ticks (same unit as `time_base`).
     duration_ticks: Option<i64>,
@@ -363,6 +370,8 @@ impl MkvDemuxer {
             track_map: Vec::new(),
             avc: Vec::new(),
             ass: Vec::new(),
+            default_duration: Vec::new(),
+            laced: VecDeque::new(),
             timestamp_scale: 1_000_000, // default: 1 ms
             duration_ticks: None,
             seg_end: None,
@@ -469,6 +478,9 @@ impl MkvDemuxer {
 
     /// Walk Cluster children until a block yields a packet. `None` = done.
     fn next_packet(&mut self) -> Result<Option<Packet>> {
+        if let Some(p) = self.laced.pop_front() {
+            return Ok(Some(p));
+        }
         loop {
             if self.done {
                 return Ok(None);
@@ -537,13 +549,15 @@ impl MkvDemuxer {
                 }
                 ID_SIMPLE_BLOCK if h.size <= MAX_BLOCK => {
                     let block = self.src.body(h.size)?;
-                    if let Some(p) = self.parse_block(&block, ts, 0) {
+                    self.laced.extend(self.parse_block(&block, ts, 0));
+                    if let Some(p) = self.laced.pop_front() {
                         return Ok(Some(p));
                     }
                 }
                 ID_BLOCK_GROUP if h.size <= MAX_BLOCK => {
                     let group = self.src.body(h.size)?;
-                    if let Some(p) = self.parse_block_group(&group, ts) {
+                    self.laced.extend(self.parse_block_group(&group, ts));
+                    if let Some(p) = self.laced.pop_front() {
                         return Ok(Some(p));
                     }
                 }
@@ -604,6 +618,7 @@ impl MkvDemuxer {
         let (mut width, mut height) = (0u32, 0u32);
         let (mut rate, mut channels) = (0u32, 0u16);
         let mut bit_depth = 0u64;
+        let mut default_duration = 0u64;
 
         let mut e = Ebml::new(data);
         while e.pos < data.len() {
@@ -617,6 +632,7 @@ impl MkvDemuxer {
                 ID_TRACK_TYPE => track_type = e.read_uint(len),
                 ID_CODEC_ID => codec = String::from_utf8_lossy(e.read_bytes(len)).into_owned(),
                 ID_CODEC_PRIVATE => codec_private = e.read_bytes(len).to_vec(),
+                ID_DEFAULT_DURATION => default_duration = e.read_uint(len),
                 ID_VIDEO => {
                     let mut v = Ebml::at(data, e.pos);
                     let ve = e.pos.saturating_add(len);
@@ -653,6 +669,7 @@ impl MkvDemuxer {
         let codec_id = map_codec(&codec);
         let is_ass = matches!(codec.as_str(), "S_TEXT/ASS" | "S_TEXT/SSA");
         self.ass.push(is_ass);
+        self.default_duration.push(default_duration);
         let index = self.streams.len();
         let mut s = Stream::new(index, codec_id);
         s.media_type = match track_type {
@@ -701,7 +718,7 @@ impl MkvDemuxer {
 
     /// A BlockGroup body. BlockDuration may come before or after the Block:
     /// collect both, then emit (subtitle cues need their duration).
-    fn parse_block_group(&self, group: &[u8], cluster_ts: i64) -> Option<Packet> {
+    fn parse_block_group(&self, group: &[u8], cluster_ts: i64) -> Vec<Packet> {
         let mut g = Ebml::new(group);
         let mut block: Option<&[u8]> = None;
         let mut duration = 0i64;
@@ -714,16 +731,22 @@ impl MkvDemuxer {
                 _ => g.skip(gsz as usize),
             }
         }
-        self.parse_block(block?, cluster_ts, duration)
+        match block {
+            Some(block) => self.parse_block(block, cluster_ts, duration),
+            None => Vec::new(),
+        }
     }
 
     /// Parse a (Simple)Block body: track vint, int16 relative timestamp, flags,
-    /// then the frame payload (no-lacing only for now).
-    fn parse_block(&self, block: &[u8], cluster_ts: i64, duration: i64) -> Option<Packet> {
+    /// then the frame payload, split into its frames when the block is laced.
+    /// `duration` is the BlockGroup's BlockDuration (0 when absent).
+    fn parse_block(&self, block: &[u8], cluster_ts: i64, duration: i64) -> Vec<Packet> {
         let mut b = Ebml::new(block);
-        let (track_num, _) = b.read_size()?;
+        let Some((track_num, _)) = b.read_size() else {
+            return Vec::new();
+        };
         if b.pos + 3 > block.len() {
-            return None;
+            return Vec::new();
         }
         let rel = i16::from_be_bytes([block[b.pos], block[b.pos + 1]]) as i64;
         b.pos += 2;
@@ -731,35 +754,134 @@ impl MkvDemuxer {
         b.pos += 1;
         let lacing = (flags >> 1) & 0x03;
         let keyframe = flags & 0x80 != 0;
-        let &(_, index) = self.track_map.iter().find(|(n, _)| *n == track_num)?;
-        if lacing != 0 {
-            return None; // laced blocks unsupported for now (rare for video/Opus)
-        }
-        let raw = &block[b.pos..];
-        // H.264: AVCC → Annex-B, prepending SPS/PPS on keyframes so the
-        // decoder is self-contained (mirrors the MP4 demuxer).
-        let data = match self.avc.get(index).and_then(|a| a.as_ref()) {
-            Some(cfg) => {
-                let mut out = Vec::with_capacity(cfg.headers_annexb.len() + raw.len() + 16);
-                if keyframe {
-                    out.extend_from_slice(&cfg.headers_annexb);
-                }
-                avcc_to_annexb(raw, cfg.nal_len, &mut out);
-                out
-            }
-            // ASS blocks: `ReadOrder,Layer,Style,Name,ML,MR,MV,Effect,Text` —
-            // reduce to the plain text our subtitle contract carries.
-            None if self.ass.get(index).copied().unwrap_or(false) => {
-                rff_subtitle::ass_dialogue_text(&String::from_utf8_lossy(raw), 8).into_bytes()
-            }
-            None => raw.to_vec(),
+        let Some(&(_, index)) = self.track_map.iter().find(|(n, _)| *n == track_num) else {
+            return Vec::new();
         };
-        let mut packet = Packet::from_data(index, data);
-        packet.pts = Some(cluster_ts.wrapping_add(rel));
-        packet.duration = duration.max(0);
-        packet.flags.keyframe = keyframe;
-        Some(packet)
+        // A block whose lace sizes don't add up is dropped, as FFmpeg drops it.
+        let Some(laces) = split_laces(&block[b.pos..], lacing) else {
+            return Vec::new();
+        };
+        // As matroskadec: a block without a BlockDuration lasts DefaultDuration per frame,
+        // the duration is shared out between the frames, and each frame's timestamp follows
+        // the previous one's; after a frame of zero duration the rest have none.
+        let count = laces.len() as i64;
+        let block_duration = if duration > 0 {
+            duration
+        } else {
+            let default = self.default_duration.get(index).copied().unwrap_or(0);
+            (u128::from(default) * count as u128 / u128::from(self.timestamp_scale.max(1)))
+                .min(i64::MAX as u128) as i64
+        };
+        let mut pts = Some(cluster_ts.wrapping_add(rel));
+        let mut packets = Vec::with_capacity(laces.len());
+        for (n, raw) in laces.into_iter().enumerate() {
+            let n = n as i64;
+            let lace_duration = block_duration.saturating_mul(n + 1) / count
+                - block_duration.saturating_mul(n) / count;
+            // H.264: AVCC → Annex-B, prepending SPS/PPS on keyframes so the
+            // decoder is self-contained (mirrors the MP4 demuxer).
+            let data = match self.avc.get(index).and_then(|a| a.as_ref()) {
+                Some(cfg) => {
+                    let mut out = Vec::with_capacity(cfg.headers_annexb.len() + raw.len() + 16);
+                    if keyframe {
+                        out.extend_from_slice(&cfg.headers_annexb);
+                    }
+                    avcc_to_annexb(raw, cfg.nal_len, &mut out);
+                    out
+                }
+                // ASS blocks: `ReadOrder,Layer,Style,Name,ML,MR,MV,Effect,Text` —
+                // reduce to the plain text our subtitle contract carries.
+                None if self.ass.get(index).copied().unwrap_or(false) => {
+                    rff_subtitle::ass_dialogue_text(&String::from_utf8_lossy(raw), 8).into_bytes()
+                }
+                None => raw.to_vec(),
+            };
+            let mut packet = Packet::from_data(index, data);
+            packet.pts = pts;
+            packet.duration = lace_duration.max(0);
+            packet.flags.keyframe = keyframe;
+            packets.push(packet);
+            pts = match pts {
+                Some(t) if lace_duration != 0 => Some(t.saturating_add(lace_duration)),
+                _ => None,
+            };
+        }
+        packets
     }
+}
+
+/// Splits a block payload (after the flags byte) into its frames per the block's lacing
+/// (Matroska "Block Lacing"; FFmpeg's `matroska_parse_laces`): 0 none, 1 Xiph, 2 fixed
+/// size, 3 EBML. `None` if the lace sizes don't fit the payload.
+fn split_laces(data: &[u8], lacing: u8) -> Option<Vec<&[u8]>> {
+    if lacing == 0 {
+        return Some(vec![data]);
+    }
+    let count = *data.first()? as usize + 1;
+    let mut pos = 1usize;
+    // The sizes of all frames but the last, which gets what the others leave.
+    let mut sizes = Vec::with_capacity(count);
+    let total = match lacing {
+        1 => {
+            for _ in 0..count - 1 {
+                let mut size = 0usize;
+                loop {
+                    let byte = *data.get(pos)?;
+                    pos += 1;
+                    size += byte as usize;
+                    if byte != 0xFF {
+                        break;
+                    }
+                }
+                sizes.push(size);
+            }
+            sizes.iter().sum()
+        }
+        2 => {
+            let rest = data.len() - pos;
+            if rest % count != 0 {
+                return None;
+            }
+            sizes.resize(count - 1, rest / count);
+            rest / count * (count - 1)
+        }
+        _ => {
+            // EBML: the first size as an unsigned vint, then signed differences. ffmpeg
+            // reads them with ebml_read_num, which takes an all-ones value at face value
+            // (only element sizes treat it as "unknown"), and reads the first size even
+            // for a single frame, which then gets the payload less that size.
+            let mut e = Ebml::at(data, pos);
+            let (first, _) = e.read_size()?;
+            if first > i32::MAX as u64 {
+                return None;
+            }
+            let mut size = first as i64;
+            let mut total = first as usize;
+            if count > 1 {
+                sizes.push(size as usize);
+            }
+            for _ in 1..count.saturating_sub(1) {
+                let start = e.pos;
+                let (raw, _) = e.read_size()?;
+                let width = (e.pos - start) as u32;
+                size += raw as i64 - ((1i64 << (7 * width - 1)) - 1);
+                if !(0..=i32::MAX as i64).contains(&size) {
+                    return None;
+                }
+                sizes.push(size as usize);
+                total = total.checked_add(size as usize)?;
+            }
+            pos = e.pos;
+            total
+        }
+    };
+    sizes.push((data.len() - pos).checked_sub(total)?);
+    let mut frames = Vec::with_capacity(count);
+    for size in sizes {
+        frames.push(data.get(pos..pos + size)?);
+        pos += size;
+    }
+    Some(frames)
 }
 
 /// Convert a Xiph-laced Vorbis CodecPrivate (count-1, lace sizes, packets) to
@@ -979,6 +1101,215 @@ mod tests {
         assert_eq!(p.data, b"Hello, Matroska!");
         assert_eq!(p.pts, Some(500));
         assert_eq!(p.duration, 1200);
+    }
+
+    // ---- laced blocks (hand-built: the muxer never laces) ---------------------
+
+    /// An EBML element with an 8-byte size.
+    fn el(id: u32, body: &[u8]) -> Vec<u8> {
+        let mut out: Vec<u8> = id
+            .to_be_bytes()
+            .into_iter()
+            .skip_while(|&b| b == 0)
+            .collect();
+        out.push(0x01);
+        out.extend_from_slice(&(body.len() as u64).to_be_bytes()[1..]);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A file with one audio track (number 1, 1 ms ticks) and one Cluster at 1000 ms:
+    /// `entry` holds extra TrackEntry children, `blocks` the Cluster's blocks.
+    fn audio_file(codec: &str, entry: &[u8], blocks: &[Vec<u8>]) -> Vec<u8> {
+        let mut track = [
+            el(ID_TRACK_NUMBER, &[1]),
+            el(ID_TRACK_TYPE, &[2]),
+            el(ID_CODEC_ID, codec.as_bytes()),
+        ]
+        .concat();
+        track.extend_from_slice(entry);
+        let mut cluster = el(ID_TIMESTAMP, &1000u16.to_be_bytes());
+        for b in blocks {
+            cluster.extend_from_slice(b);
+        }
+        let segment = [
+            el(
+                ID_INFO,
+                &el(ID_TIMESTAMP_SCALE, &1_000_000u32.to_be_bytes()),
+            ),
+            el(ID_TRACKS, &el(ID_TRACK_ENTRY, &track)),
+            el(ID_CLUSTER, &cluster),
+        ]
+        .concat();
+        [
+            el(0x1A45_DFA3, &el(0x4282, b"matroska")),
+            el(ID_SEGMENT, &segment),
+        ]
+        .concat()
+    }
+
+    /// A Block body on track 1: relative timestamp, flags (lacing bits included), payload.
+    fn track1_block(rel: i16, flags: u8, payload: &[u8]) -> Vec<u8> {
+        [&[0x81][..], &rel.to_be_bytes(), &[flags], payload].concat()
+    }
+
+    fn demux_all(file: Vec<u8>) -> Vec<Packet> {
+        let mut dem = MkvDemuxer::new(Box::new(Cursor::new(file)));
+        dem.read_header().unwrap();
+        std::iter::from_fn(|| dem.read_packet().ok()).collect()
+    }
+
+    /// Frame `n` of a test: `len` bytes of `n`.
+    fn frame(n: u8, len: usize) -> Vec<u8> {
+        vec![n; len]
+    }
+
+    /// Xiph lacing: 2 more frames, sizes 300 (255 + 45) and 7, the last one the rest.
+    fn xiph_laced() -> Vec<u8> {
+        [
+            &[2, 255, 45, 7][..],
+            &frame(1, 300),
+            &frame(2, 7),
+            &frame(3, 20),
+        ]
+        .concat()
+    }
+
+    /// EBML lacing: 3 more frames, first size 100, then differences -10 and +40.
+    fn ebml_laced() -> Vec<u8> {
+        let sizes = [3, 0x80 | 100, 0x80 | (63 - 10), 0x80 | (63 + 40)];
+        [
+            &sizes[..],
+            &frame(4, 100),
+            &frame(5, 90),
+            &frame(6, 130),
+            &frame(7, 5),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn laced_blocks_split_into_frames_timed_by_default_duration() {
+        // 1024 samples at 48 kHz per frame, as mkvmerge writes it for AAC.
+        let entry = el(ID_DEFAULT_DURATION, &21_333_333u32.to_be_bytes());
+        let fixed = [&[1][..], &frame(8, 16), &frame(9, 16)].concat();
+        let file = audio_file(
+            "A_AAC",
+            &entry,
+            &[
+                el(ID_SIMPLE_BLOCK, &track1_block(0, 0x82, &xiph_laced())),
+                el(ID_SIMPLE_BLOCK, &track1_block(64, 0x06, &ebml_laced())),
+                el(ID_SIMPLE_BLOCK, &track1_block(149, 0x84, &fixed)),
+                el(ID_SIMPLE_BLOCK, &track1_block(192, 0x80, &frame(10, 3))),
+            ],
+        );
+        let packets = demux_all(file);
+        let got: Vec<_> = packets
+            .iter()
+            .map(|p| (p.data[0], p.data.len(), p.pts, p.duration, p.flags.keyframe))
+            .collect();
+        // As ffmpeg: the block lasts DefaultDuration per frame (3 frames: 63 ms, 4: 85 ms),
+        // shared out between the frames, each starting where the previous one ends; every
+        // frame carries the block's keyframe flag.
+        assert_eq!(
+            got,
+            [
+                (1, 300, Some(1000), 21, true),
+                (2, 7, Some(1021), 21, true),
+                (3, 20, Some(1042), 21, true),
+                (4, 100, Some(1064), 21, false),
+                (5, 90, Some(1085), 21, false),
+                (6, 130, Some(1106), 21, false),
+                (7, 5, Some(1127), 22, false),
+                (8, 16, Some(1149), 21, true),
+                (9, 16, Some(1170), 21, true),
+                (10, 3, Some(1192), 21, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn laced_blocks_without_a_default_duration_time_only_their_first_frame() {
+        let group = el(
+            ID_BLOCK_GROUP,
+            &[
+                el(ID_BLOCK, &track1_block(100, 0x02, &xiph_laced())),
+                el(ID_BLOCK_DURATION, &[50]),
+            ]
+            .concat(),
+        );
+        let file = audio_file(
+            "A_AAC",
+            &[],
+            &[
+                el(ID_SIMPLE_BLOCK, &track1_block(0, 0x86, &ebml_laced())),
+                group,
+            ],
+        );
+        let got: Vec<_> = demux_all(file)
+            .iter()
+            .map(|p| (p.data[0], p.data.len(), p.pts, p.duration))
+            .collect();
+        // ffmpeg leaves the rest without a timestamp (its generic layer guesses them later);
+        // a BlockDuration is shared out like a DefaultDuration.
+        assert_eq!(
+            got,
+            [
+                (4, 100, Some(1000), 0),
+                (5, 90, None, 0),
+                (6, 130, None, 0),
+                (7, 5, None, 0),
+                (1, 300, Some(1100), 16),
+                (2, 7, Some(1116), 17),
+                (3, 20, Some(1133), 17),
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_laces_drop_their_block() {
+        // (lacing, payload after the flags byte)
+        let bad: [(u8, &[u8]); 6] = [
+            (1, &[2, 255, 255, 10, 0, 0, 0]), // Xiph sizes past the end
+            (2, &[2, 0, 0, 0, 0]),            // fixed: 4 bytes in 3 frames
+            (3, &[2, 0x85, 0x80, 0, 0, 0]),   // EBML: 5 - 63 is negative
+            (3, &[1, 0x40, 0x10, 0, 0, 0]),   // EBML: first frame larger than the block
+            (3, &[1, 0x00, 0, 0]),            // EBML: invalid vint
+            (1, &[]),                         // no lace count
+        ];
+        let mut blocks: Vec<_> = bad
+            .iter()
+            .map(|&(lacing, payload)| {
+                el(
+                    ID_SIMPLE_BLOCK,
+                    &track1_block(0, 0x80 | lacing << 1, payload),
+                )
+            })
+            .collect();
+        blocks.push(el(ID_SIMPLE_BLOCK, &track1_block(5, 0x80, &frame(42, 4))));
+        let packets = demux_all(audio_file("A_AAC", &[], &blocks));
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            (&packets[0].data[..], packets[0].pts),
+            (&frame(42, 4)[..], Some(1005))
+        );
+    }
+
+    #[test]
+    fn lace_sizes_follow_ffmpeg_at_the_edges() {
+        // A single frame in Xiph lacing is the whole rest.
+        assert_eq!(split_laces(&[0, 1, 2, 3], 1), Some(vec![&[1u8, 2, 3][..]]));
+        // A single EBML-laced frame still has its size read, and gets the rest less it.
+        assert_eq!(
+            split_laces(&[0, 0x81, 7, 8, 9], 3),
+            Some(vec![&[7u8, 8][..]])
+        );
+        // An all-ones EBML lace size is a size (127), not "unknown".
+        let data = [&[1, 0xFF][..], &frame(1, 127), &frame(2, 3)].concat();
+        let frames = split_laces(&data, 3).unwrap();
+        assert_eq!((frames[0].len(), frames[1].len()), (127, 3));
+        // Empty frames are allowed, including the last.
+        assert_eq!(split_laces(&[1, 0], 1), Some(vec![&[][..], &[][..]]));
     }
 
     #[test]
