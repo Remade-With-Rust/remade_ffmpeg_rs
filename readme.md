@@ -148,7 +148,7 @@ safer.
 | WebP encode/decode | **in-house** ([`rusty_webp`](https://crates.io/crates/rusty_webp)) | MIT OR Apache-2.0 | ✅ (performance/feature fork of `image-rs/image-webp`; standalone crate) |
 | Opus encode/decode | [`rusty-opus`](https://crates.io/crates/rusty-opus) (our `opus-rs` fork) | BSD-3-Clause | ✅ (AVX2 SILK + frame-parallel; pure Rust, no C/FFI) |
 | Vorbis decode | [`lewton`](https://crates.io/crates/lewton) | MIT/Apache-2.0 | ✅ |
-| Vorbis encode | **in-house** ([`rusty_vorbis`](https://crates.io/crates/rusty_vorbis)) | Apache-2.0 | ✅ (first permissive Rust Vorbis encoder; standalone crate) |
+| Vorbis encode + decode | **in-house** ([`rusty_vorbis`](https://crates.io/crates/rusty_vorbis)) | Apache-2.0 | ✅ (first permissive Rust Vorbis encoder; standalone decoder matches FFmpeg, ~1.5x faster than symphonia — the CLI adapter still decodes via lewton until it is switched over) |
 | FLAC decode | [`claxon`](https://crates.io/crates/claxon) | Apache-2.0 | ✅ |
 | FLAC encode | **in-house** (`rff-codec-flac`) | Apache-2.0 | ✅ (lossless, no dep) |
 | JPEG XL decode | [`jxl-oxide`](https://crates.io/crates/jxl-oxide) | MIT/Apache-2.0 | ✅ |

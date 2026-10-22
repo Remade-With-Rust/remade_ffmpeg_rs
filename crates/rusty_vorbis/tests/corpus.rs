@@ -124,3 +124,44 @@ fn corpus_matches_lewton_and_ffmpeg() {
         println!("{}", gate(&p, true));
     }
 }
+
+/// The planar API (`decode` + `channel`) yields exactly the interleaved API's
+/// samples, packet by packet, and `packet_frames` predicts every count.
+#[test]
+fn planar_api_matches_interleaved() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_none_or(|x| x != "ogg") {
+            continue;
+        }
+        let pk = ogg::read_packets(&std::fs::read(&p).unwrap());
+        let (h0, h1, h2) = (&pk[0].data, &pk[1].data, &pk[2].data);
+        let mut a = rusty_vorbis::decode::Decoder::new(h0, h1, h2).unwrap();
+        let mut b = rusty_vorbis::decode::Decoder::new(h0, h1, h2).unwrap();
+        let ch = a.channels();
+        let mut buf = vec![0.0f32; a.max_frames_per_packet() * ch];
+        for (i, q) in pk[3..].iter().enumerate() {
+            let predicted = if i == 0 {
+                0
+            } else {
+                a.packet_frames(&q.data).unwrap()
+            };
+            let n = a.decode_interleaved(&q.data, &mut buf).unwrap();
+            let m = b.decode(&q.data).unwrap();
+            assert_eq!(
+                (n, m),
+                (predicted, predicted),
+                "{}: packet {i}",
+                p.display()
+            );
+            for c in 0..ch {
+                let plane = b.channel(c);
+                assert_eq!(plane.len(), n);
+                for f in 0..n {
+                    assert_eq!(plane[f].to_bits(), buf[f * ch + c].to_bits());
+                }
+            }
+        }
+    }
+}

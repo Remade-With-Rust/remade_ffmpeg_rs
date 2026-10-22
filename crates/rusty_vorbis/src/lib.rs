@@ -1,17 +1,27 @@
-//! Pure-Rust **Ogg Vorbis I encoder**, no C and no FFI.
+//! Pure-Rust **Vorbis I encoder and decoder**, no C and no FFI.
 //!
 //! Extracted from (and the engine of) the
 //! [`remade_ffmpeg_rs`](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)
 //! project. The crate has **zero dependencies**. To our knowledge this is the
-//! first pure-Rust, permissively-licensed Vorbis *encoder* — decoding is
-//! intentionally out of scope (use [`lewton`](https://crates.io/crates/lewton)).
+//! first pure-Rust, permissively-licensed Vorbis *encoder*; it also ships a
+//! fast pure-Rust **decoder** ([`decode::Decoder`]).
 //!
-//! Built brick by brick like the FLAC / MP3 / AAC encoders, validated against
-//! the lewton decoder oracle + ffmpeg: window → forward MDCT ([`mdct`]) → a
-//! Bark-scale masking-threshold floor ([`psy`] + [`floor`]) → forward channel
-//! coupling + point stereo → rate-distortion residue VQ ([`frame`]), emitting
-//! an embedded libvorbis setup header ([`setup`]). Quality is driven by the
-//! Vorbis-style `-q` knob (see [`quality01_from_vorbis_q`]).
+//! **Decoder** ([`decode`]): packet level and Ogg-agnostic — build it from the
+//! three header packets, then feed audio packets; output is `f32`,
+//! interleaved into a caller buffer or planar, in Vorbis channel order, with
+//! no per-packet allocation. Full Vorbis I coverage (floor 0/1, residue
+//! 0/1/2, lookup types 1/2, submaps, coupling, block switching, up to 255
+//! channels). Gated against FFmpeg 8.1 and lewton 0.10.2 (max |diff| vs
+//! FFmpeg <= 3e-8 on the libvorbis corpus) and measured ~1.4-1.6x faster than
+//! symphonia 0.5.5 and ~2.4-3.1x faster than lewton, single-threaded.
+//!
+//! **Encoder**: built brick by brick like the FLAC / MP3 / AAC encoders,
+//! validated against the lewton decoder oracle + ffmpeg: window → forward MDCT
+//! ([`mdct`]) → a Bark-scale masking-threshold floor ([`psy`] + [`floor`]) →
+//! forward channel coupling + point stereo → rate-distortion residue VQ
+//! ([`frame`]), emitting an embedded libvorbis setup header ([`setup`]).
+//! Quality is driven by the Vorbis-style `-q` knob (see
+//! [`quality01_from_vorbis_q`]).
 //!
 //! - This module: the LSB-first bit writer, the three header writers, the
 //!   streaming [`VorbisEncoder`] (buffers input, emits headers, then encodes
@@ -21,8 +31,10 @@
 //!   floor/residue/mapping/mode configs.
 //!
 //! The `simd` feature (default) enables the runtime-detected AVX2 residue-VQ
-//! distance kernel on x86_64 — bit-exact vs the scalar path;
-//! `--no-default-features` gives a 100%-safe scalar build.
+//! distance kernel on x86_64 (encoder) and the AVX / NEON FFT twins
+//! (decoder IMDCT) — each bit-exact vs its scalar path;
+//! `--no-default-features` gives a 100%-safe scalar build. The `profile`
+//! feature adds the decoder's stage profiler ([`decode::prof`]).
 
 #![allow(dead_code)]
 
