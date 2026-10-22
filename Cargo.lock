@@ -5770,6 +5770,10 @@ dependencies = [
 [[package]]
 name = "rusty_vorbis"
 version = "0.1.1"
+dependencies = [
+ "lewton",
+ "rusty_alloc-api",
+]
 
 [[package]]
 name = "rusty_vp9"

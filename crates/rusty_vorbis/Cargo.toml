@@ -6,14 +6,24 @@ license = "Apache-2.0"
 repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 authors = ["Mata Network <https://www.mata.network>"]
 homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
-description = "The first pure-Rust Ogg Vorbis encoder — psychoacoustic floor fit, channel coupling, RD residue VQ. Zero dependencies, no C/FFI; ffmpeg- and lewton-validated output."
+description = "Pure-Rust Vorbis encoder (psychoacoustic floor fit, channel coupling, RD residue VQ) and fast Vorbis decoder (FFmpeg-matched, faster than symphonia). Zero dependencies, no C/FFI."
 readme = "README.md"
-keywords = ["vorbis", "ogg", "audio", "codec", "encoder"]
+keywords = ["vorbis", "ogg", "audio", "encoder", "decoder"]
 categories = ["multimedia::audio", "multimedia::encoding"]
 rust-version = "1.85"
 
 [features]
 default = ["simd"]
 simd = []
+# Decoder stage profiler (`decode::prof`). Measurement only; zero cost off.
+profile = []
 
 [dependencies]
+
+# Test/bench roots only — the library stays zero-dependency. lewton is the
+# decoder oracle the in-house decoder is gated against; rusty_alloc-api is the
+# project's shipping allocator, set as `#[global_allocator]` in example/bench
+# roots only (never in the library — see the workspace CLAUDE.md).
+[dev-dependencies]
+lewton.workspace = true
+rusty_alloc-api.workspace = true
