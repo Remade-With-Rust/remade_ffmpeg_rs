@@ -98,7 +98,15 @@ fn render_point(x0: u32, y0: u32, x1: u32, y1: u32, x: u32) -> u32 {
 }
 
 /// Multiply `spec[x0..min(x1, len)]` by the inverse-dB curve of the line from
-/// `(x0, y0)` to `(x1, y1)` (lewton's `render_line`; `y` in 0..=255).
+/// `(x0, y0)` to `(x1, y1)` — lewton's `render_line` (`y` in 0..=255), bit for
+/// bit, but rendered as constant-gain runs.
+///
+/// lewton's Bresenham keeps `err` in `[0, adx)`, so after `k` steps it has
+/// taken `floor(k·ady/adx)` extra steps: `y(k) = y0 + k·base + sign·floor(k·ady/adx)`.
+/// For a shallow segment (`base == 0`, nearly every floor-1 segment) `y`
+/// changes only at `k_c = ceil(c·adx/ady)`, so the curve is `|dy| + 1` runs of
+/// one gain each — a vectorisable multiply per run instead of a
+/// data-dependent branch per bin. Steep segments keep the per-bin walk.
 #[inline]
 fn render_line_mul(x0: usize, y0: i32, x1: usize, y1: i32, spec: &mut [f32]) {
     let end = x1.min(spec.len());
@@ -108,11 +116,39 @@ fn render_line_mul(x0: usize, y0: i32, x1: usize, y1: i32, spec: &mut [f32]) {
     let dy = y1 - y0;
     let adx = (x1 - x0) as i32;
     let base = dy / adx;
-    let sy = base + if dy < 0 { -1 } else { 1 };
+    let sign = if dy < 0 { -1 } else { 1 };
     let ady = dy.abs() - base.abs() * adx;
+    let seg = &mut spec[x0..end];
+    if base == 0 {
+        let gain = |y: i32| FLOOR1_INV_DB[(y & 255) as usize];
+        if ady == 0 {
+            let g = gain(y0);
+            for s in seg.iter_mut() {
+                *s *= g;
+            }
+            return;
+        }
+        let (adx, ady) = (adx as usize, ady as usize);
+        let mut y = y0;
+        let mut k = 0usize;
+        let mut c = 1usize;
+        loop {
+            let stop = ((c * adx).div_ceil(ady)).min(seg.len());
+            let g = gain(y);
+            for s in &mut seg[k..stop] {
+                *s *= g;
+            }
+            if stop == seg.len() {
+                return;
+            }
+            k = stop;
+            y += sign;
+            c += 1;
+        }
+    }
+    let sy = base + sign;
     let mut y = y0;
     let mut err = 0i32;
-    let seg = &mut spec[x0..end];
     seg[0] *= FLOOR1_INV_DB[(y & 255) as usize];
     for s in &mut seg[1..] {
         err += ady;
