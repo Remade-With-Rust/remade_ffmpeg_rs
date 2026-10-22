@@ -6,7 +6,8 @@
 //! stream's `extradata`; [`configure`](rff_codec::Decoder::configure) parses the
 //! identification + setup headers, and each audio packet then decodes to an
 //! interleaved `f32` [`AudioFrame`] — float, like FFmpeg's native Vorbis
-//! decoder (`fltp`), not quantised to 16 bits.
+//! decoder (`fltp`), not quantised to 16 bits. Channels come out in FFmpeg's
+//! (WAV) order, not Vorbis's: see [`ffmpeg_channel_map`].
 //!
 //! Decode is backed by lewton. Encode is the in-house pure-Rust Vorbis **encoder**
 //! ([`rusty_vorbis`], see `docs/codec-vorbis-encoder.md`) — masking-driven floor,
@@ -65,10 +66,43 @@ fn unpack_headers(data: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+/// Vorbis → FFmpeg channel order: output channel `i` takes Vorbis channel
+/// `map[i]`. Vorbis orders 3–8 channels with the centre second and the LFE
+/// last (spec §4.3.9); FFmpeg/WAV put the centre third and the LFE fourth.
+/// This is libavcodec's `ff_vorbis_channel_layout_offsets`, applied the way
+/// `vorbisdec.c` does (`channel_ptrs[offsets[i]] = plane i`). 1, 2 and 4
+/// channels are identical in both orders; beyond 8 Vorbis leaves the order
+/// application-defined and FFmpeg keeps it as is.
+fn ffmpeg_channel_map(channels: usize) -> Vec<usize> {
+    let map: &[usize] = match channels {
+        3 => &[0, 2, 1],
+        5 => &[0, 2, 1, 3, 4],
+        6 => &[0, 2, 1, 5, 3, 4],
+        7 => &[0, 2, 1, 6, 5, 3, 4],
+        8 => &[0, 2, 1, 7, 5, 6, 3, 4],
+        _ => return (0..channels).collect(),
+    };
+    map.to_vec()
+}
+
+/// Interleave lewton's planar output into little-endian f32 bytes, output
+/// channel `i` taking plane `map[i]`.
+fn interleave(pcm: &[Vec<f32>], map: &[usize], samples: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(samples * map.len() * 4);
+    for i in 0..samples {
+        for &c in map {
+            out.extend_from_slice(&pcm[c][i].to_le_bytes());
+        }
+    }
+    out
+}
+
 struct State {
     ident: IdentHeader,
     setup: SetupHeader,
     pwr: PreviousWindowRight,
+    /// Output channel order (see [`ffmpeg_channel_map`]).
+    map: Vec<usize>,
     channels: u16,
     sample_rate: u32,
 }
@@ -98,6 +132,7 @@ impl Decoder for VorbisDecoder {
         .map_err(|e| Error::invalid(format!("vorbis setup header: {e:?}")))?;
 
         self.state = Some(State {
+            map: ffmpeg_channel_map(ident.audio_channels as usize),
             channels: ident.audio_channels as u16,
             sample_rate: ident.audio_sample_rate,
             ident,
@@ -120,15 +155,10 @@ impl Decoder for VorbisDecoder {
             return Ok(()); // some packets carry no output samples
         }
 
-        // lewton returns planar per-channel f32; interleave.
-        let channels = pcm.len();
+        // lewton returns planar per-channel f32 in Vorbis channel order;
+        // interleave in FFmpeg's.
         let samples = pcm[0].len();
-        let mut interleaved = Vec::with_capacity(samples * channels * 4);
-        for i in 0..samples {
-            for ch in &pcm {
-                interleaved.extend_from_slice(&ch[i].to_le_bytes());
-            }
-        }
+        let interleaved = interleave(&pcm, &st.map, samples);
         self.queue.push_back(Frame::Audio(AudioFrame {
             sample_rate: st.sample_rate,
             channels: st.channels,
@@ -350,6 +380,41 @@ mod tests {
             }
         }
         assert!(off_grid > 1000, "only {off_grid} samples off the s16 grid");
+    }
+
+    /// FFmpeg order for every channel count Vorbis defines (checked against
+    /// libavcodec's `ff_vorbis_channel_layout_offsets` and an FFmpeg 8.1 decode
+    /// of a 5.1 file with a distinct tone per channel).
+    #[test]
+    fn channel_map_matches_ffmpeg() {
+        assert_eq!(ffmpeg_channel_map(1), [0]);
+        assert_eq!(ffmpeg_channel_map(2), [0, 1]);
+        assert_eq!(ffmpeg_channel_map(3), [0, 2, 1]);
+        assert_eq!(ffmpeg_channel_map(4), [0, 1, 2, 3]);
+        assert_eq!(ffmpeg_channel_map(5), [0, 2, 1, 3, 4]);
+        assert_eq!(ffmpeg_channel_map(6), [0, 2, 1, 5, 3, 4]);
+        assert_eq!(ffmpeg_channel_map(7), [0, 2, 1, 6, 5, 3, 4]);
+        assert_eq!(ffmpeg_channel_map(8), [0, 2, 1, 7, 5, 6, 3, 4]);
+        assert_eq!(ffmpeg_channel_map(9), (0..9).collect::<Vec<_>>());
+        for n in 1..=8 {
+            let mut m = ffmpeg_channel_map(n);
+            m.sort_unstable();
+            assert_eq!(m, (0..n).collect::<Vec<_>>(), "{n}ch map is a permutation");
+        }
+    }
+
+    /// 5.1: Vorbis FL FC FR RL RR LFE → FFmpeg FL FR FC LFE BL BR.
+    #[test]
+    fn interleave_reorders_5_1_to_ffmpeg_order() {
+        // Plane k holds the constant k (FL=0, FC=1, FR=2, RL=3, RR=4, LFE=5).
+        let pcm: Vec<Vec<f32>> = (0..6).map(|k| vec![k as f32; 2]).collect();
+        let bytes = interleave(&pcm, &ffmpeg_channel_map(6), 2);
+        let got: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let frame = [0.0, 2.0, 1.0, 5.0, 3.0, 4.0]; // FL FR FC LFE BL BR
+        assert_eq!(got, [frame, frame].concat());
     }
 
     #[test]
