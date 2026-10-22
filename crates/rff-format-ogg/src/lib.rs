@@ -223,7 +223,10 @@ fn identify(first: &[u8]) -> Option<Mapping> {
         Some(Mapping {
             codec_id: CodecId::Opus,
             channels: first[9] as u16,
-            sample_rate: u32::from_le_bytes([first[12], first[13], first[14], first[15]]),
+            // OpusHead's rate field is the encoder's *input* rate, for
+            // information only: Ogg Opus decodes, and counts granules and
+            // pre-skip, at 48 kHz — as FFmpeg reports it.
+            sample_rate: 48_000,
             sample_format: SampleFormat::F32,
             headers: 2,
         })
@@ -994,6 +997,18 @@ mod tests {
                 (b"ddd".to_vec(), Some(5000), true),
             ]
         );
+    }
+
+    /// OpusHead's rate field is the encoder's input rate; Ogg Opus is 48 kHz.
+    #[test]
+    fn opus_stream_is_48k_whatever_the_input_rate() {
+        let mut file = raw_page(0x02, 1, 0, &[19], &opus_head(2, 44_100));
+        file.extend(raw_page(0, 1, 1, &[10, 3], b"OpusTags..abc"));
+        let mut dem = OggDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = dem.read_header().unwrap();
+        assert_eq!(streams[0].sample_rate, 48_000);
+        assert_eq!(streams[0].time_base, Rational::new(1, 48_000));
+        assert_eq!(streams[0].extradata, opus_head(2, 44_100));
     }
 
     #[test]

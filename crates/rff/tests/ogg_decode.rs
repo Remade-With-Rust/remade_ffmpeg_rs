@@ -11,6 +11,9 @@
 //! - `vorbis_one_page.ogg`: 0.3 s mono — all audio on one (EOS) page, where
 //!   FFmpeg ends (blocksize_0 + first blocksize) / 4 samples short of the
 //!   granule.
+//! - `opus_stereo_96000.ogg`: 2 s, 48 kHz, 64 kb/s, pre-skip 312.
+//! - `opus_stereo_59259.opus`: 1.23456 s — not a multiple of 20 ms.
+//! - `opus_one_page.opus`: 0.1 s mono, all audio on the EOS page.
 
 use std::path::PathBuf;
 
@@ -212,4 +215,32 @@ fn vorbis_single_page_matches_ffmpeg() {
     // Granule 13,230; FFmpeg outputs 13,102 (= 13,230 - (256 + 256) / 4).
     assert_eq!(d.frames(), 13_102);
     assert_rms(&d, &[0.08895936]);
+}
+
+/// Ogg Opus: libopus's 312-sample pre-skip comes off the front and the final
+/// granule (96,312) trims the back, so 2 s decodes to exactly 96,000 frames
+/// (it was 96,960). FFmpeg reports Ogg Opus at 48 kHz.
+#[test]
+fn opus_pre_skip_and_end_trim() {
+    let d = decode("opus_stereo_96000.ogg");
+    assert_eq!(d.codec, CodecId::Opus);
+    assert_eq!(d.sample_rate, 48_000);
+    assert_eq!(d.frames(), 96_000);
+    assert_rms(&d, &[0.088061477, 0.08893406]);
+}
+
+/// 1.23456 s: 59,571 granule - 312 pre-skip = 59,259 frames, as in FFmpeg.
+#[test]
+fn opus_odd_length_matches_ffmpeg() {
+    let d = decode("opus_stereo_59259.opus");
+    assert_eq!(d.frames(), 59_259);
+    assert_rms(&d, &[0.088196083, 0.088469157]);
+}
+
+/// All audio on the EOS page: FFmpeg still ends at granule - pre-skip.
+#[test]
+fn opus_single_page_matches_ffmpeg() {
+    let d = decode("opus_one_page.opus");
+    assert_eq!(d.frames(), 4_800); // granule 5,112 - 312
+    assert_rms(&d, &[0.088420073]);
 }

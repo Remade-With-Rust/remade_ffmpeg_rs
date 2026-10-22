@@ -9,6 +9,12 @@
 //!
 //! Frames may arrive as interleaved `s16` or `f32`; both are accepted (decoded
 //! output is `f32`).
+//!
+//! When the stream's `OpusHead` (RFC 7845) arrives as extradata — as from the
+//! Ogg demuxer — the decoder honours it the way FFmpeg does: the pre-skip is
+//! dropped from the start, the output gain is applied, the last packet is
+//! trimmed to the final granule position ([`Packet::end_position`]).
+//! Multichannel (mapping family ≠ 0) streams are refused as unsupported.
 
 use std::collections::VecDeque;
 
@@ -21,6 +27,8 @@ use rusty_opus::{Application, OpusDecoder, OpusEncoder};
 const FRAME_MS: usize = 20;
 /// Opus supports only these sample rates.
 const RATES: [u32; 5] = [8000, 12000, 16000, 24000, 48000];
+/// The longest Opus packet: 120 ms (RFC 6716 §3.2.5).
+const MAX_PACKET_MS: usize = 120;
 
 /// Register the Opus codec into a [`CodecRegistry`].
 pub fn register(registry: &mut CodecRegistry) {
@@ -66,13 +74,75 @@ fn frame_to_f32(af: &AudioFrame) -> Result<Vec<f32>> {
 // Decoder
 // ---------------------------------------------------------------------------
 
+/// The fields of an `OpusHead` identification header (RFC 7845 §5.1) that
+/// change what the decoder outputs.
+#[derive(Debug, Clone, PartialEq)]
+struct OpusHead {
+    channels: u16,
+    /// Samples (at 48 kHz) to drop from the start of the decoded stream.
+    pre_skip: u16,
+    /// Output gain, Q7.8 dB.
+    gain_q8: i16,
+    mapping_family: u8,
+}
+
+impl OpusHead {
+    /// Parse an `OpusHead`; `None` if `data` is not one.
+    fn parse(data: &[u8]) -> Option<OpusHead> {
+        if data.len() < 19 || &data[0..8] != b"OpusHead" {
+            return None;
+        }
+        Some(OpusHead {
+            channels: data[9] as u16,
+            pre_skip: u16::from_le_bytes([data[10], data[11]]),
+            gain_q8: i16::from_le_bytes([data[16], data[17]]),
+            mapping_family: data[18],
+        })
+    }
+}
+
 #[derive(Default)]
 struct OpusDec {
     dec: Option<OpusDecoder>,
     sample_rate: u32,
     channels: u16,
+    /// Linear output gain from `OpusHead` (1.0 = none).
+    gain: f32,
+    /// Pre-skip samples still to drop from the start of the output.
+    skip: usize,
+    /// Stream position (granule units) after the last packet decoded: the
+    /// last page granule seen plus the samples since — FFmpeg's view, which
+    /// decides how much of the final packet it keeps.
+    position: i64,
     queue: VecDeque<Frame>,
     eof: bool,
+}
+
+/// `(start, end)`: the slice of a packet's `decoded` samples FFmpeg keeps,
+/// given the pre-skip still pending and the stream `position` before the
+/// packet. Mirrors `oggparseopus.c` (end trimming: the overrun past the final
+/// granule, capped at the packet) and `decode.c` (the start skip first, which
+/// swallows any frame it covers whole; the end padding only when it fits in
+/// what is left). Advances `skip` past what this packet consumed.
+fn keep_range(skip: &mut usize, position: i64, packet: &Packet, decoded: usize) -> (usize, usize) {
+    let pad = match packet.end_position {
+        Some(end) if packet.flags.end_of_stream => position
+            .saturating_add(decoded as i64)
+            .saturating_sub(end)
+            .clamp(0, decoded as i64) as usize,
+        _ => 0,
+    };
+    if *skip >= decoded {
+        *skip -= decoded;
+        return (0, 0);
+    }
+    let start = std::mem::take(skip);
+    let end = if pad > 0 && pad <= decoded - start {
+        decoded - pad
+    } else {
+        decoded
+    };
+    (start, end)
 }
 
 impl Decoder for OpusDec {
@@ -84,11 +154,30 @@ impl Decoder for OpusDec {
             params.sample_rate
         };
         check_rate(rate)?;
-        let channels = params.channels.max(1);
-        self.dec = Some(
-            OpusDecoder::new(rate as i32, channels as usize)
-                .map_err(|e| Error::invalid(format!("opus decode init: {e}")))?,
-        );
+        let head = OpusHead::parse(&params.extradata);
+        let channels = match &head {
+            Some(h) if h.channels > 0 => h.channels,
+            _ => params.channels.max(1),
+        };
+        // Mapping family 1+ (surround, ambisonics) packs several Opus streams
+        // per packet; only the single-stream family 0 is decoded here.
+        if let Some(family @ 1..) = head.as_ref().map(|h| h.mapping_family) {
+            return Err(Error::unsupported(format!(
+                "opus decode: channel mapping family {family} (multichannel Opus)"
+            )));
+        }
+        let dec = OpusDecoder::new(rate as i32, channels as usize)
+            .map_err(|e| Error::invalid(format!("opus decode init: {e}")))?;
+        // Pre-skip (like granules) counts 48 kHz samples.
+        self.skip = head
+            .as_ref()
+            .map_or(0, |h| (h.pre_skip as u64 * rate as u64 / 48_000) as usize);
+        // FFmpeg: gain = 10^(Q7.8 dB / 20).
+        self.gain = head.as_ref().map_or(1.0, |h| {
+            10f64.powf(h.gain_q8 as f64 / (20.0 * 256.0)) as f32
+        });
+        self.position = 0;
+        self.dec = Some(dec);
         self.sample_rate = rate;
         self.channels = channels;
         Ok(())
@@ -96,27 +185,35 @@ impl Decoder for OpusDec {
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         let channels = self.channels as usize;
-        // opus-rs wants the exact per-channel frame size and a buffer to match.
-        // Our encoder emits 20 ms frames, so decode at that size.
-        let frame_size = self.sample_rate as usize / 1000 * FRAME_MS;
+        // The decode size is a capacity: room for the longest packet.
+        let frame_size = self.sample_rate as usize / 1000 * MAX_PACKET_MS;
         let dec = self
             .dec
             .as_mut()
             .ok_or_else(|| Error::invalid("opus decode: not configured"))?;
 
         let mut out = vec![0f32; frame_size * channels];
-        let samples = dec
+        let decoded = dec
             .decode(&packet.data, frame_size, &mut out)
             .map_err(|e| Error::invalid(format!("opus decode: {e}")))?;
-        out.truncate(samples * channels);
+        let (start, end) = keep_range(&mut self.skip, self.position, packet, decoded);
+        self.position = packet
+            .end_position
+            .unwrap_or(self.position.saturating_add(decoded as i64));
+        if start == end {
+            return Ok(());
+        }
 
-        let bytes: Vec<u8> = out.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut bytes = Vec::with_capacity((end - start) * channels * 4);
+        for &s in &out[start * channels..end * channels] {
+            bytes.extend_from_slice(&(s * self.gain).to_le_bytes());
+        }
         self.queue.push_back(Frame::Audio(AudioFrame {
             sample_rate: self.sample_rate,
             channels: self.channels,
             format: SampleFormat::F32,
             planes: vec![bytes],
-            samples,
+            samples: end - start,
             pts: packet.pts,
         }));
         Ok(())
@@ -454,5 +551,161 @@ mod tests {
         assert!(decoded >= frame * 8, "decoded too few samples: {decoded}");
         let rms = (energy / decoded.max(1) as f64).sqrt();
         assert!(rms > 0.02, "decoded audio is silent: rms {rms:.4}");
+    }
+
+    /// An `OpusHead` with the given channel count, pre-skip, gain and family.
+    fn head(channels: u8, pre_skip: u16, gain_q8: i16, family: u8) -> Vec<u8> {
+        let mut v = b"OpusHead".to_vec();
+        v.push(1);
+        v.push(channels);
+        v.extend_from_slice(&pre_skip.to_le_bytes());
+        v.extend_from_slice(&48_000u32.to_le_bytes());
+        v.extend_from_slice(&gain_q8.to_le_bytes());
+        v.push(family);
+        if family != 0 {
+            v.extend_from_slice(&[4, 2, 0, 4, 1, 2, 3, 5]); // 5.1 tables
+        }
+        v
+    }
+
+    /// `n` 20 ms stereo packets of a tone, from the serial encoder.
+    fn encoded(n: usize) -> Vec<Packet> {
+        let mut enc = OpusEnc::default();
+        enc.parallel = false;
+        let samples: Vec<f32> = (0..960 * n * 2)
+            .map(|i| ((i / 2) as f32 * 0.05).sin() * 0.3)
+            .collect();
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            sample_rate: 48_000,
+            channels: 2,
+            format: SampleFormat::F32,
+            planes: vec![samples.iter().flat_map(|s| s.to_le_bytes()).collect()],
+            samples: 960 * n,
+            pts: Some(0),
+        }))
+        .unwrap();
+        enc.flush();
+        let mut packets = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+        assert_eq!(packets.len(), n);
+        packets
+    }
+
+    /// Decode `packets` with `extradata`; returns the interleaved output.
+    fn decode(extradata: Vec<u8>, packets: &[Packet]) -> Vec<f32> {
+        let mut dec = OpusDec::default();
+        dec.configure(&CodecParams {
+            sample_rate: 48_000,
+            channels: 2,
+            extradata,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut out = Vec::new();
+        for p in packets {
+            dec.send_packet(p).unwrap();
+            while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+                assert_eq!(af.planes[0].len(), af.samples * 2 * 4);
+                out.extend(
+                    af.planes[0]
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                );
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn opus_head_parses() {
+        let h = OpusHead::parse(&head(2, 312, -256, 0)).unwrap();
+        assert_eq!(
+            h,
+            OpusHead {
+                channels: 2,
+                pre_skip: 312,
+                gain_q8: -256,
+                mapping_family: 0,
+            }
+        );
+        assert_eq!(OpusHead::parse(b"OpusTags........."), None);
+        assert_eq!(OpusHead::parse(&head(2, 312, 0, 0)[..18]), None);
+    }
+
+    #[test]
+    fn keep_range_mirrors_ffmpeg() {
+        let mut p = Packet::from_data(0, Vec::new());
+        // Pre-skip spanning packets: whole frames swallowed, then a cut.
+        let mut skip = 1000;
+        assert_eq!(keep_range(&mut skip, 0, &p, 960), (0, 0));
+        assert_eq!(skip, 40);
+        assert_eq!(keep_range(&mut skip, 960, &p, 960), (40, 960));
+        assert_eq!(skip, 0);
+        // End trim: only the end-of-stream packet, by its overrun.
+        p.end_position = Some(5000);
+        assert_eq!(keep_range(&mut skip, 4800, &p, 960), (0, 960));
+        p.flags.end_of_stream = true;
+        assert_eq!(keep_range(&mut skip, 4800, &p, 960), (0, 200));
+        assert_eq!(keep_range(&mut skip, 3000, &p, 960), (0, 960), "no overrun");
+        assert_eq!(keep_range(&mut skip, 6000, &p, 960), (0, 0), "capped: all");
+        // Skip and padding on one packet: padding must fit what's left.
+        let mut skip = 100;
+        assert_eq!(keep_range(&mut skip, 4800, &p, 960), (100, 200));
+        let mut skip = 900;
+        assert_eq!(keep_range(&mut skip, 4800, &p, 960), (900, 960));
+    }
+
+    /// Pre-skip comes off the front, the final granule trims the back: a
+    /// 2 s stream with libopus's 312-sample pre-skip decodes to exactly 2 s.
+    #[test]
+    fn pre_skip_and_final_granule_trim_the_stream() {
+        let mut packets = encoded(10);
+        let raw = decode(head(2, 0, 0, 0), &packets);
+        assert_eq!(raw.len(), 960 * 10 * 2);
+        // Pages of 4 packets; the last page's granule ends 500 samples early.
+        let granule_end = 960 * 10 - 500;
+        for (i, p) in packets.iter_mut().enumerate() {
+            if i == 9 {
+                p.end_position = Some(granule_end);
+                p.flags.end_of_stream = true;
+            } else if i % 4 == 3 {
+                p.end_position = Some(960 * (i as i64 + 1));
+            }
+        }
+        let got = decode(head(2, 312, 0, 0), &packets);
+        let want = &raw[312 * 2..granule_end as usize * 2];
+        assert_eq!(got.len(), want.len());
+        assert_eq!(got, want);
+    }
+
+    /// OpusHead output gain is applied as FFmpeg does: 10^(Q7.8 dB / 20).
+    #[test]
+    fn output_gain_is_applied() {
+        let packets = encoded(3);
+        let raw = decode(head(2, 0, 0, 0), &packets);
+        let loud = decode(head(2, 0, 6 * 256, 0), &packets); // +6 dB
+        let g = 10f64.powf(6.0 / 20.0) as f32;
+        assert_eq!(loud.len(), raw.len());
+        for (a, b) in raw.iter().zip(&loud) {
+            assert_eq!(a * g, *b);
+        }
+    }
+
+    /// Multistream (surround) packets are not decoded: refuse them clearly
+    /// rather than misread them as one stream.
+    #[test]
+    fn multichannel_mapping_is_refused() {
+        let mut dec = OpusDec::default();
+        let err = dec
+            .configure(&CodecParams {
+                sample_rate: 48_000,
+                channels: 6,
+                extradata: head(6, 312, 0, 1),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err}");
     }
 }
