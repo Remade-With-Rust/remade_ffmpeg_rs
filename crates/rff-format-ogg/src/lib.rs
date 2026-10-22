@@ -212,7 +212,8 @@ fn identify(first: &[u8]) -> Option<Mapping> {
             codec_id: CodecId::Vorbis,
             channels: first[11] as u16,
             sample_rate: u32::from_le_bytes([first[12], first[13], first[14], first[15]]),
-            sample_format: SampleFormat::S16,
+            // The Vorbis decoder emits float, as FFmpeg's does.
+            sample_format: SampleFormat::F32,
             headers: 3,
         })
     } else {
@@ -1076,6 +1077,8 @@ mod tests {
         assert_eq!(streams[0].codec_id, CodecId::Vorbis);
         assert_eq!(streams[0].channels, 2);
         assert_eq!(streams[0].sample_rate, 44_100);
+        // The Vorbis decoder emits float, like FFmpeg's: advertise that.
+        assert_eq!(streams[0].sample_format, Some(SampleFormat::F32));
         // The three setup headers are packed into extradata for the decoder.
         assert!(!streams[0].extradata.is_empty());
         // Only the audio packets are yielded.

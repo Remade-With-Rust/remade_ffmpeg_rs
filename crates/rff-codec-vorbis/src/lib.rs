@@ -5,7 +5,8 @@
 //! any audio. The Ogg demuxer hands those to us packed (length-prefixed) as the
 //! stream's `extradata`; [`configure`](rff_codec::Decoder::configure) parses the
 //! identification + setup headers, and each audio packet then decodes to an
-//! interleaved `s16` [`AudioFrame`].
+//! interleaved `f32` [`AudioFrame`] — float, like FFmpeg's native Vorbis
+//! decoder (`fltp`), not quantised to 16 bits.
 //!
 //! Decode is backed by lewton. Encode is the in-house pure-Rust Vorbis **encoder**
 //! ([`rusty_vorbis`], see `docs/codec-vorbis-encoder.md`) — masking-driven floor,
@@ -16,7 +17,7 @@
 
 use std::collections::VecDeque;
 
-use lewton::audio::{read_audio_packet, PreviousWindowRight};
+use lewton::audio::{read_audio_packet_generic, PreviousWindowRight};
 use lewton::header::{read_header_ident, read_header_setup, IdentHeader, SetupHeader};
 use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder, Encoder};
 use rff_core::{AudioFrame, Dictionary, Error, Frame, MediaType, Packet, Result, SampleFormat};
@@ -112,16 +113,17 @@ impl Decoder for VorbisDecoder {
             .as_mut()
             .ok_or_else(|| Error::invalid("vorbis decode: not configured"))?;
 
-        let pcm: Vec<Vec<i16>> = read_audio_packet(&st.ident, &st.setup, &packet.data, &mut st.pwr)
-            .map_err(|e| Error::invalid(format!("vorbis decode: {e:?}")))?;
+        let pcm: Vec<Vec<f32>> =
+            read_audio_packet_generic(&st.ident, &st.setup, &packet.data, &mut st.pwr)
+                .map_err(|e| Error::invalid(format!("vorbis decode: {e:?}")))?;
         if pcm.is_empty() || pcm[0].is_empty() {
             return Ok(()); // some packets carry no output samples
         }
 
-        // lewton returns planar per-channel i16; interleave to s16.
+        // lewton returns planar per-channel f32; interleave.
         let channels = pcm.len();
         let samples = pcm[0].len();
-        let mut interleaved = Vec::with_capacity(samples * channels * 2);
+        let mut interleaved = Vec::with_capacity(samples * channels * 4);
         for i in 0..samples {
             for ch in &pcm {
                 interleaved.extend_from_slice(&ch[i].to_le_bytes());
@@ -130,7 +132,7 @@ impl Decoder for VorbisDecoder {
         self.queue.push_back(Frame::Audio(AudioFrame {
             sample_rate: st.sample_rate,
             channels: st.channels,
-            format: SampleFormat::S16,
+            format: SampleFormat::F32,
             planes: vec![interleaved],
             samples,
             pts: packet.pts,
@@ -277,6 +279,77 @@ mod tests {
     fn configure_rejects_missing_headers() {
         let mut dec = VorbisDecoder::default();
         assert!(dec.configure(&CodecParams::default()).is_err());
+    }
+
+    /// Encode `n` frames of a stereo tone with the in-house encoder; returns the
+    /// packed extradata and the audio packets.
+    fn encoded_tone(n: usize) -> (Vec<u8>, Vec<Packet>) {
+        let mut enc = VorbisEncoder::new();
+        let mut plane = Vec::with_capacity(n * 2 * 4);
+        for i in 0..n {
+            for f in [0.02f32, 0.031] {
+                plane.extend_from_slice(&(0.4 * (f * i as f32).sin()).to_le_bytes());
+            }
+        }
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            sample_rate: 44_100,
+            channels: 2,
+            format: SampleFormat::F32,
+            planes: vec![plane],
+            samples: n,
+            pts: Some(0),
+        }))
+        .unwrap();
+        enc.flush();
+        let mut packets = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+        // The first three packets are the setup headers.
+        let audio = packets.split_off(3);
+        (enc.extradata(), audio)
+    }
+
+    fn decode_all(extradata: &[u8], packets: &[Packet]) -> Vec<AudioFrame> {
+        let mut dec = VorbisDecoder::default();
+        dec.configure(&CodecParams {
+            extradata: extradata.to_vec(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut out = Vec::new();
+        for p in packets {
+            dec.send_packet(p).unwrap();
+            while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+                out.push(af);
+            }
+        }
+        dec.flush();
+        while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+            out.push(af);
+        }
+        out
+    }
+
+    /// Output is float, as FFmpeg's decoder's is: not quantised to 16 bits.
+    #[test]
+    fn decodes_to_unquantised_f32() {
+        let (extradata, packets) = encoded_tone(8192);
+        let frames = decode_all(&extradata, &packets);
+        assert!(!frames.is_empty());
+        let mut off_grid = 0usize;
+        for af in &frames {
+            assert_eq!(af.format, SampleFormat::F32);
+            assert_eq!(af.planes[0].len(), af.samples * af.channels as usize * 4);
+            for b in af.planes[0].chunks_exact(4) {
+                let s = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                assert!(s.is_finite() && s.abs() <= 1.5, "{s}");
+                if (s * 32768.0).fract() != 0.0 {
+                    off_grid += 1;
+                }
+            }
+        }
+        assert!(off_grid > 1000, "only {off_grid} samples off the s16 grid");
     }
 
     #[test]
