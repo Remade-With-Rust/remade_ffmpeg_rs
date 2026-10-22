@@ -8,6 +8,10 @@ use crate::rational::Rational;
 pub struct PacketFlags {
     /// This packet begins a keyframe (random-access point).
     pub keyframe: bool,
+    /// The last packet of its logical stream (Ogg: the final packet of the
+    /// end-of-stream page). Audio decoders trim this packet's output so the
+    /// stream ends at its [`Packet::end_position`], as FFmpeg does.
+    pub end_of_stream: bool,
 }
 
 /// A compressed packet belonging to a single stream.
@@ -21,6 +25,13 @@ pub struct Packet {
     pub dts: Option<i64>,
     /// Duration of this packet, in `time_base` units (0 if unknown).
     pub duration: i64,
+    /// Where the stream's decoded output ENDS once this packet is decoded, in
+    /// `time_base` units, when the container records it — Ogg's granule
+    /// position, which sits on the last packet completing each page (`None`
+    /// on the others, and in containers without one). Unlike `pts` it marks an
+    /// end, not a start: decoders count samples from it to trim end padding
+    /// off the [`end_of_stream`](PacketFlags::end_of_stream) packet.
+    pub end_position: Option<i64>,
     /// The stream time base these timestamps are expressed in.
     pub time_base: Rational,
     /// The compressed payload.

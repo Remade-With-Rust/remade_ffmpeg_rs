@@ -18,7 +18,11 @@
 //! whole-buffer parser it replaced, page CRCs are not verified and reading
 //! stops at the first position that is not a complete `OggS` page header.
 //! Packets carry no timestamps (as before) and no duration is declared — the
-//! last page's granule position would need the end of the stream.
+//! last page's granule position would need the end of the stream. What each
+//! packet does carry is the page's granule position, on the last packet
+//! completing that page ([`Packet::end_position`]), and an end-of-stream flag
+//! on the final packet of the EOS page: decoders trim the stream's end padding
+//! from those, as FFmpeg and libvorbis do.
 //!
 //! The muxer writes one packet per page (`OpusHead`, `OpusTags`, then audio).
 
@@ -79,6 +83,9 @@ const FLAG_EOS: u8 = 0x04;
 /// One Ogg page, as read off the wire.
 struct Page {
     header_type: u8,
+    /// Absolute granule position: the stream position once the last packet
+    /// completing on this page is decoded; `-1` when no packet completes here.
+    granule: i64,
     serial: u32,
     /// The segment (lacing) table.
     laces: Vec<u8>,
@@ -100,15 +107,25 @@ impl Page {
     /// stream's packet carried over from earlier pages) and calling `emit` for
     /// every packet that completes on this page. A lace of 255 continues the
     /// packet; anything shorter ends it. A body cut short by end of input is
-    /// clamped, so the packets it truncates are emitted short.
-    fn split(&self, partial: &mut Vec<u8>, mut emit: impl FnMut(Vec<u8>)) {
+    /// clamped, so the packets it truncates are emitted short. Packets come
+    /// out as stream-0 [`Packet`]s; the last one completing on the page carries
+    /// the page's granule position and, on an EOS page, the end-of-stream flag.
+    fn split(&self, partial: &mut Vec<u8>, mut emit: impl FnMut(Packet)) {
+        let last = self.laces.iter().rposition(|&l| l < 255);
         let mut data = 0usize;
-        for &lace in &self.laces {
+        for (i, &lace) in self.laces.iter().enumerate() {
             let end = (data + lace as usize).min(self.body.len());
             partial.extend_from_slice(&self.body[data..end]);
             data = end;
             if lace < 255 {
-                emit(std::mem::take(partial));
+                let mut packet = Packet::from_data(0, std::mem::take(partial));
+                if Some(i) == last {
+                    // -1 = "no packet completes here"; never on a page that
+                    // completes one, but a hostile file may say so anyway.
+                    packet.end_position = (self.granule >= 0).then_some(self.granule);
+                    packet.flags.end_of_stream = self.is_eos();
+                }
+                emit(packet);
             }
         }
     }
@@ -180,6 +197,9 @@ impl PageReader {
         }
         Ok(Some(Page {
             header_type: hdr[5],
+            granule: i64::from_le_bytes([
+                hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13],
+            ]),
             serial: u32::from_le_bytes([hdr[14], hdr[15], hdr[16], hdr[17]]),
             laces,
             body,
@@ -309,7 +329,9 @@ struct OggDemuxer {
     input: Option<Input>,
     pages: Option<PageReader>,
     target: Option<Target>,
-    queue: VecDeque<Vec<u8>>,
+    queue: VecDeque<Packet>,
+    /// The exposed stream's time base (1 / sample rate): granule units.
+    time_base: Rational,
 }
 
 impl OggDemuxer {
@@ -319,6 +341,7 @@ impl OggDemuxer {
             pages: None,
             target: None,
             queue: VecDeque::new(),
+            time_base: Rational::new(1, 1000),
         }
     }
 }
@@ -338,7 +361,7 @@ impl Demuxer for OggDemuxer {
         let mut any_packet = false;
         // The chosen stream, its packets so far, and its carried-over packet.
         let mut chosen: Option<(u32, Mapping)> = None;
-        let mut got: Vec<Vec<u8>> = Vec::new();
+        let mut got: Vec<Packet> = Vec::new();
         let mut partial: Vec<u8> = Vec::new();
         let mut ended = false;
         let mut first = true;
@@ -383,7 +406,7 @@ impl Demuxer for OggDemuxer {
             let Some(head) = packets.next() else {
                 continue;
             };
-            match identify(&head) {
+            match identify(&head.data) {
                 Some(m) => {
                     chosen = Some((page.serial, m));
                     got.push(head);
@@ -410,10 +433,10 @@ impl Demuxer for OggDemuxer {
                 if got.len() < 3 {
                     return Err(Error::invalid("ogg demux: Vorbis is missing setup headers"));
                 }
-                let three: Vec<&[u8]> = got.iter().take(3).map(|p| p.as_slice()).collect();
+                let three: Vec<&[u8]> = got.iter().take(3).map(|p| p.data.as_slice()).collect();
                 pack_headers(&three)
             }
-            _ => got[0].clone(),
+            _ => got[0].data.clone(),
         };
         let consumed = got.len().min(m.headers);
         self.queue = got.drain(consumed..).collect();
@@ -437,13 +460,15 @@ impl Demuxer for OggDemuxer {
         stream.sample_format = Some(m.sample_format);
         stream.extradata = extradata;
         stream.time_base = Rational::new(1, stream.sample_rate.max(1) as i32);
+        self.time_base = stream.time_base;
         Ok(vec![stream])
     }
 
     fn read_packet(&mut self) -> Result<Packet> {
         loop {
-            if let Some(data) = self.queue.pop_front() {
-                return Ok(Packet::from_data(0, data));
+            if let Some(mut packet) = self.queue.pop_front() {
+                packet.time_base = self.time_base;
+                return Ok(packet);
             }
             let (Some(pages), Some(t)) = (self.pages.as_mut(), self.target.as_mut()) else {
                 return Err(Error::Eof);
@@ -477,7 +502,7 @@ impl Demuxer for OggDemuxer {
             page.split(partial, |p| {
                 if *verify {
                     *verify = false;
-                    match identify(&p) {
+                    match identify(&p.data) {
                         Some(m) if m.codec_id == *codec_id => *skip = m.headers - 1,
                         _ => {
                             // Different codec: drop this link, await another.
@@ -931,6 +956,43 @@ mod tests {
         assert_eq!(
             packets,
             vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+        );
+    }
+
+    #[test]
+    fn granule_and_eos_ride_on_the_packet_completing_the_page() {
+        let with_granule = |mut page: Vec<u8>, granule: i64| {
+            page[6..14].copy_from_slice(&granule.to_le_bytes());
+            page[22..26].copy_from_slice(&[0; 4]);
+            let crc = ogg_crc32(&page);
+            page[22..26].copy_from_slice(&crc.to_le_bytes());
+            page
+        };
+        let c: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let mut file = raw_page(0x02, 5, 0, &[19], &head_opus());
+        file.extend(raw_page(0, 5, 1, &[10], b"OpusTags.."));
+        file.extend(with_granule(raw_page(0, 5, 2, &[1, 2], b"abb"), 1920));
+        // `c` starts on a page where nothing completes (granule -1)...
+        file.extend(with_granule(raw_page(0, 5, 3, &[255], &c[..255]), -1));
+        // ...and ends on the EOS page, ahead of `d`.
+        let body = [&c[255..], b"ddd"].concat();
+        file.extend(with_granule(raw_page(0x05, 5, 4, &[45, 3], &body), 5000));
+
+        let mut dem = OggDemuxer::new(Box::new(Cursor::new(file)));
+        dem.read_header().unwrap();
+        let mut got = Vec::new();
+        while let Ok(p) = dem.read_packet() {
+            assert_eq!(p.time_base, Rational::new(1, 48_000));
+            got.push((p.data, p.end_position, p.flags.end_of_stream));
+        }
+        assert_eq!(
+            got,
+            vec![
+                (b"a".to_vec(), None, false),
+                (b"bb".to_vec(), Some(1920), false),
+                (c, None, false),
+                (b"ddd".to_vec(), Some(5000), true),
+            ]
         );
     }
 
