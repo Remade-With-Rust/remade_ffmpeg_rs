@@ -4,6 +4,13 @@ All notable changes to this crate. Security-relevant changes are listed first in
 each release, under **Security**. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-aac-v1.1.1...rff-codec-aac-v1.1.2) - 2026-10-22
+
+### Other
+
+- *(vet)* refresh mp3/aac imports for the 0.2.4 release and rusty_alloc-api 2.2.6
+- Merge pull request #36 from Remade-With-Rust/ci/vet-imports
+
 ## [1.1.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-aac-v1.1.0...rff-codec-aac-v1.1.1) - 2026-10-17
 
 ### Other
