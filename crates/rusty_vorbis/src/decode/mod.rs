@@ -49,6 +49,7 @@ mod bits;
 mod floor;
 mod header;
 mod imdct;
+pub mod prof;
 mod residue;
 
 pub use header::{CommentHeader, IdentHeader};
@@ -303,7 +304,9 @@ impl Decoder {
             }
         }
         let frames = self.decode(packet)?;
+        let t0 = prof::now();
         self.interleave_into(frames, out);
+        prof::add(prof::INTERLEAVE, t0);
         Ok(frames)
     }
 
@@ -335,6 +338,7 @@ impl Decoder {
     }
 
     fn decode_core(&mut self, packet: &[u8]) -> Result<usize> {
+        let mut tp = prof::now();
         let mut br = BitReader::new(packet);
         let (mode, n, lws, rws, rwe, left_slope) = self.read_packet_header(&mut br)?;
         let n2 = n / 2;
@@ -392,9 +396,11 @@ impl Decoder {
             }
         }
 
+        tp = prof::add(prof::FLOOR_DECODE, tp);
         // 2. Residues, decoded straight into the spectra.
         let spectra = &mut self.spectra[..ch * n2];
         spectra.fill(0.0);
+        tp = prof::add(prof::OTHER, tp);
         {
             let setup = &self.setup;
             let mapping = &setup.mappings[mapping_idx];
@@ -422,6 +428,7 @@ impl Decoder {
                             iv,
                             &mut self.classes,
                         );
+                        tp = prof::add(prof::RESIDUE, tp);
                         if r.is_ok() {
                             // De-interleave into the submap's channels.
                             if nv == 1 {
@@ -442,6 +449,7 @@ impl Decoder {
                                 }
                             }
                         }
+                        tp = prof::add(prof::DEINTERLEAVE, tp);
                         r
                     }
                 } else if chans.len() == ch {
@@ -474,6 +482,7 @@ impl Decoder {
                     }
                     r
                 };
+                tp = prof::add(prof::RESIDUE, tp);
                 if bad.is_err() {
                     return Err(Error::invalid("vorbis: undecodable residue"));
                 }
@@ -508,6 +517,7 @@ impl Decoder {
             }
         }
 
+        tp = prof::add(prof::COUPLING, tp);
         // 4. Floor curves, IMDCT, overlap-add.
         let blockflag = self.setup.modes[mode].blockflag as usize;
         let half = self.bs[1] / 2;
@@ -538,7 +548,9 @@ impl Decoder {
                         }
                         _ => {}
                     }
+                    tp = prof::add(prof::FLOOR_SYNTH, tp);
                     self.dct[blockflag].run(spec, t, &mut self.fft_scratch);
+                    tp = prof::add(prof::IMDCT, tp);
                 }
             }
             // Unfold y[lws..rwe] of the IMDCT into `blk`.
@@ -560,7 +572,9 @@ impl Decoder {
                 pcm[plen..].copy_from_slice(&blk[plen..out_len]);
             }
             prev[..new_prev_len].copy_from_slice(&blk[rws - lws..rwe - lws]);
+            tp = prof::add(prof::OLA, tp);
         }
+        let _ = tp;
         let frames = if self.has_prev { out_len } else { 0 };
         self.has_prev = true;
         self.prev_len = new_prev_len;
