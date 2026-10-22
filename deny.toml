@@ -48,7 +48,7 @@ yanked = "deny"
 # known security issue and no drop-in replacement under our control.
 # Acknowledge it explicitly; revisit if the upstreams migrate off it.
 #
-# The five below ALL originate from `rustls-rustcrypto 0.0.2-alpha` — the pure-Rust
+# The six below ALL originate from `rustls-rustcrypto 0.0.2-alpha` — the pure-Rust
 # (ring-free) crypto provider behind the *opt-in, experimental* HTTPS input stack.
 # It is present only under `--all-features` (never in the default build), is the
 # LATEST published version, and pins the affected transitive crates, so there is no
@@ -58,6 +58,11 @@ yanked = "deny"
 #     attacker-probed RSA operations when fetching HTTPS media).
 #   * RUSTSEC-2026-0049/0098/0099/0104 — `rustls-webpki 0.102` cert-path bugs (CRL
 #     matching, URI/wildcard name constraints, a reachable panic in CRL parsing).
+#   * RUSTSEC-2026-0382 — distrusted emSign intermediates accepted in cert paths.
+#     Fixed in 0.103.16, which the lock now pins (that is the copy `rustls` uses
+#     to verify certificates). The 0.102.8 copy is only `rustls-rustcrypto`'s,
+#     and it uses nothing from it but the `alg_id` constants -- never path
+#     building -- so the vulnerable code is linked but not reachable.
 # Accepted ONLY for the experimental HTTPS feature. TRACK: update/replace
 # `rustls-rustcrypto` (or swap the crypto provider) to clear these.
 ignore = [
@@ -67,6 +72,7 @@ ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0382",
 ]
 
 [sources]
