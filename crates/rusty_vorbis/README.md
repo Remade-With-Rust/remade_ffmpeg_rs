@@ -94,8 +94,12 @@ fn decode(headers: [&[u8]; 3], packets: &[Vec<u8>]) -> rusty_vorbis::Result<Vec<
 }
 ```
 
-- **Semantics** match lewton and FFmpeg: the first audio packet yields 0
-  frames, every later one the overlapped half between the window centres.
+- **Semantics** match lewton (and FFmpeg's totals): the first audio packet
+  yields 0 frames, every later one the samples its window completes — which
+  is `prev_blocksize/4 + blocksize/4` except that a long block followed by a
+  short one returns its `(long - short)/4` tail one packet early. For end
+  trimming against a granule, count with `packet_blocksize` (the granule
+  convention), not with the per-packet output.
   Channels come out in **Vorbis order** (e.g. 5.1 is FL C FR RL RR LFE), not
   WAV/FFmpeg order — reorder in your adapter if needed.
 - **Robust**: malformed packets return `Err` and leave the decoder state
