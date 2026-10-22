@@ -59,10 +59,36 @@ mod imp {
             .collect()
     }
 
+    /// Event counters (deterministic work census).
+    pub const EVENTS: [&str; 6] = [
+        "residue codewords",
+        "  of which long (>1 table level)",
+        "classwords",
+        "residue partitions decoded",
+        "floor-1 codewords",
+        "residue VQ scalars added",
+    ];
+    static EV: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+    #[inline(always)]
+    pub fn count(ev: usize, n: u64) {
+        EV[ev].fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// `(name, count)` per event.
+    pub fn events() -> Vec<(&'static str, u64)> {
+        (0..EVENTS.len())
+            .map(|i| (EVENTS[i], EV[i].load(Ordering::Relaxed)))
+            .collect()
+    }
+
     pub fn reset() {
         for i in 0..NAMES.len() {
             CYC[i].store(0, Ordering::Relaxed);
             CALLS[i].store(0, Ordering::Relaxed);
+        }
+        for e in &EV {
+            e.store(0, Ordering::Relaxed);
         }
     }
 }
@@ -77,12 +103,14 @@ mod imp {
     pub fn add(_stage: usize, t0: u64) -> u64 {
         t0
     }
+    #[inline(always)]
+    pub fn count(_ev: usize, _n: u64) {}
 }
 
-pub(crate) use imp::{add, now};
+pub(crate) use imp::{add, count, now};
 
 #[cfg(feature = "profile")]
-pub use imp::{reset, snapshot};
+pub use imp::{events, reset, snapshot};
 
 pub(crate) const FLOOR_DECODE: usize = 0;
 pub(crate) const RESIDUE: usize = 1;
@@ -93,3 +121,10 @@ pub(crate) const IMDCT: usize = 5;
 pub(crate) const OLA: usize = 6;
 pub(crate) const INTERLEAVE: usize = 7;
 pub(crate) const OTHER: usize = 8;
+
+pub(crate) const EV_CODEWORDS: usize = 0;
+pub(crate) const EV_LONG: usize = 1;
+pub(crate) const EV_CLASSWORDS: usize = 2;
+pub(crate) const EV_PARTITIONS: usize = 3;
+pub(crate) const EV_FLOOR_CODEWORDS: usize = 4;
+pub(crate) const EV_SCALARS: usize = 5;

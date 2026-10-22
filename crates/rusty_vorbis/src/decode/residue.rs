@@ -10,12 +10,18 @@
 
 use super::bits::BitReader;
 use super::header::{Codebook, Residue};
+use super::prof;
 
 /// The packet is undecodable (classbook with zero dimensions).
 pub(crate) struct BadPacket;
 
 /// Add one partition of format 1/2 VQ vectors into `v[..]` starting at 0.
 /// Returns `true` on end of packet.
+///
+/// Fast path (the only one libvorbis streams take): `D` is the book's
+/// dimension and divides `psize`, so the partition is exactly `psize / D`
+/// fixed-size vectors — no per-vector bounds or spill checks — and the bit
+/// reader is a local copy that stays in registers for the whole partition.
 #[inline(always)]
 fn partition_12<const D: usize>(
     book: &Codebook,
@@ -23,10 +29,34 @@ fn partition_12<const D: usize>(
     v: &mut [f32],
     psize: usize,
 ) -> bool {
-    let dim = if D == 0 { book.dim } else { D };
+    if D != 0 && psize % D == 0 && psize <= v.len() {
+        let mut r = *br;
+        let vq = &book.vq[..];
+        let mut eop = false;
+        for dst in v[..psize].chunks_exact_mut(D) {
+            let e = book.decode(&mut r) as usize;
+            prof::count(prof::EV_CODEWORDS, 1);
+            prof::count(prof::EV_SCALARS, D as u64);
+            if r.eop() {
+                eop = true;
+                break;
+            }
+            let row: &[f32; D] = vq[e * D..e * D + D].try_into().unwrap();
+            for (d, s) in dst.iter_mut().zip(row) {
+                *d += *s;
+            }
+        }
+        *br = r;
+        return eop;
+    }
+    // General form (lewton semantics): the last vector may spill past the
+    // partition into the rest of the channel vector, or end the partition.
+    let dim = book.dim;
     let mut i = 0;
     while i < psize {
         let e = book.decode(br);
+        prof::count(prof::EV_CODEWORDS, 1);
+        prof::count(prof::EV_SCALARS, dim as u64);
         if br.eop() {
             return true;
         }
@@ -116,6 +146,7 @@ pub(crate) fn decode_inner(
                         break 'done;
                     }
                     let mut temp = classbook.decode(br);
+                    prof::count(prof::EV_CLASSWORDS, 1);
                     if br.eop() {
                         break 'done;
                     }
@@ -145,6 +176,7 @@ pub(crate) fn decode_inner(
                         break 'done;
                     }
                     let v = &mut out[j * size + offs..(j + 1) * size];
+                    prof::count(prof::EV_PARTITIONS, 1);
                     if partition(kind, book, br, v, psize) {
                         break 'done;
                     }

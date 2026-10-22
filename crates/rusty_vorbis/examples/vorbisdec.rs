@@ -62,6 +62,10 @@ fn main() {
                 cyc
             );
         }
+        println!("work census (last pass):");
+        for (name, n) in rusty_vorbis::decode::prof::events() {
+            println!("  {name:<34} {n:>12}");
+        }
     }
 }
 

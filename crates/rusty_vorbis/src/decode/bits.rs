@@ -16,7 +16,10 @@
 //! negative, and the caller checks [`BitReader::eop`] after the read. Values
 //! decoded from padding are discarded by every caller.
 
-/// The LSb-first packet bit reader. See the module docs.
+/// The LSb-first packet bit reader. See the module docs. `Copy`, and no
+/// method takes it by address on a cold path, so a hot loop can work on a
+/// local copy that LLVM keeps entirely in registers.
+#[derive(Clone, Copy)]
 pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     /// Next byte of `data` to load into `buf`.
@@ -64,17 +67,9 @@ impl<'a> BitReader<'a> {
     }
 
     /// The last few bytes of the packet, then zero padding forever.
-    #[cold]
-    #[inline(never)]
+    #[inline(always)]
     fn refill_tail(&mut self) {
-        while self.cnt <= 56 {
-            let b = self.data.get(self.pos).copied().unwrap_or(0);
-            self.buf |= u64::from(b) << self.cnt;
-            if self.pos < self.data.len() {
-                self.pos += 1;
-            }
-            self.cnt += 8;
-        }
+        (self.pos, self.buf, self.cnt) = refill_tail(self.data, self.pos, self.buf, self.cnt);
     }
 
     /// The window: bit 0 is the next stream bit; at least 32 bits are valid
@@ -144,6 +139,22 @@ impl<'a> BitReader<'a> {
     pub(crate) fn bits_consumed(&self) -> usize {
         ((self.data.len() as isize).saturating_mul(8) - self.left) as usize
     }
+}
+
+/// Cold tail refill, by value (taking the reader by address here would pin
+/// every caller's reader in memory).
+#[cold]
+#[inline(never)]
+fn refill_tail(data: &[u8], mut pos: usize, mut buf: u64, mut cnt: u32) -> (usize, u64, u32) {
+    while cnt <= 56 {
+        let b = data.get(pos).copied().unwrap_or(0);
+        buf |= u64::from(b) << cnt;
+        if pos < data.len() {
+            pos += 1;
+        }
+        cnt += 8;
+    }
+    (pos, buf, cnt)
 }
 
 #[cfg(test)]

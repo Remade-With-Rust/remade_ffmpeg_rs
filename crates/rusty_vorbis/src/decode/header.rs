@@ -230,24 +230,28 @@ impl Codebook {
     pub fn decode(&self, br: &mut BitReader) -> u32 {
         br.ensure32();
         let w = br.window();
-        let e = self.table[(w & ((1u64 << self.fast_bits) - 1)) as usize];
-        if e & 63 != 0 {
-            br.consume(e & 63);
-            return e >> 6;
+        let mut e = self.table[(w & ((1u64 << self.fast_bits) - 1)) as usize];
+        if e & 63 == 0 {
+            e = self.decode_long(w, e);
         }
-        self.decode_long(br, w, e)
+        br.consume(e & 63);
+        e >> 6
     }
 
+    /// Walk the sub-tables for a code longer than the first level; returns the
+    /// leaf word. Takes the window by value so the caller's reader can stay in
+    /// registers.
+    #[cold]
     #[inline(never)]
-    fn decode_long(&self, br: &mut BitReader, w: u64, mut e: u32) -> u32 {
+    fn decode_long(&self, w: u64, mut e: u32) -> u32 {
+        super::prof::count(super::prof::EV_LONG, 1);
         let mut shift = self.fast_bits;
         loop {
             let sub = (e >> 6) & 31;
             let base = (e >> 11) as usize;
             e = self.table[base + ((w >> shift) & ((1u64 << sub) - 1)) as usize];
             if e & 63 != 0 {
-                br.consume(e & 63);
-                return e >> 6;
+                return e;
             }
             shift += sub;
         }
