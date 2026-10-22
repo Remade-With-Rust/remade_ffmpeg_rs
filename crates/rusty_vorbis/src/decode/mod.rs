@@ -15,13 +15,17 @@
 //! # Ok(()) }
 //! ```
 //!
-//! **Output semantics** (identical to lewton and FFmpeg): the first audio
-//! packet after construction (or [`Decoder::reset`]) yields **0** frames — it
-//! only primes the overlap — and every later packet yields the overlapped half
-//! between the previous and the current window centres
-//! (`prev_blocksize/4 + cur_blocksize/4` for a well-formed stream). Trimming the
-//! stream's end (and any leading skip) by granule position is the container's
-//! job. Samples are `f32`, nominally in [-1, 1], unclipped.
+//! **Output semantics** (identical to lewton): the first audio packet after
+//! construction (or [`Decoder::reset`]) yields **0** frames — it only primes
+//! the overlap — and every later packet yields the samples its window
+//! completes, from its left to its right window start. That is the
+//! granule-position duration `prev_blocksize/4 + cur_blocksize/4` (FFmpeg's
+//! per-packet split) except around a long block followed by a short one,
+//! whose fully-overlapped `(long - short)/4` tail comes out one packet early
+//! (see [`Decoder::packet_frames`] and [`Decoder::packet_blocksize`]); the
+//! total is the same. Trimming the stream's end (and any leading skip) by
+//! granule position is the container's job. Samples are `f32`, nominally in
+//! [-1, 1], unclipped.
 //!
 //! **Channel order** is Vorbis native order (Vorbis I §4.3.9), *not*
 //! FFmpeg/WAV order: 1 mono; 2 L R; 3 L C R; 4 FL FR RL RR; 5 FL C FR RL RR;
@@ -210,12 +214,28 @@ impl Decoder {
         self.pcm_frames = 0;
     }
 
-    /// Frames the packet would add to the window sequence (`prev/4 + cur/4`
-    /// style), from its header bits only — without decoding. Note the first
+    /// Frames [`Self::decode`] returns for the packet (when it is not the
+    /// first), from its header bits only — without decoding. Note the first
     /// packet after construction / [`Self::reset`] still yields 0.
+    ///
+    /// This is the span between the packet's left and right window starts, so
+    /// it is not always the packet's granule duration
+    /// (`prev_blocksize/4 + blocksize/4`, see [`Self::packet_blocksize`]): a
+    /// long block followed by a short one returns its `(long - short) / 4`
+    /// fully-overlapped tail early, and the following packet that much less.
+    /// The running totals agree after every packet that ends on a window centre.
     pub fn packet_frames(&self, packet: &[u8]) -> Result<usize> {
         let (_, _, lws, rws, _) = self.packet_layout(packet)?;
         Ok(rws - lws)
+    }
+
+    /// The packet's block size (`blocksize_0` or `blocksize_1`, per its mode),
+    /// from its header bits only. A container's granule positions count each
+    /// packet as `prev_blocksize/4 + blocksize/4` frames (Vorbis I §A.2,
+    /// FFmpeg's parser), which is what end trimming against a granule needs.
+    pub fn packet_blocksize(&self, packet: &[u8]) -> Result<usize> {
+        let (_, n, ..) = self.packet_layout(packet)?;
+        Ok(n)
     }
 
     /// Parse the packet type, mode and window flags:
