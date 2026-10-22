@@ -1,7 +1,7 @@
 [package]
 name = "rff-codec-opus"
 description = "Remade FFmpeg (Rust): Opus audio codec."
-version = "0.3.1"
+version = "0.3.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
