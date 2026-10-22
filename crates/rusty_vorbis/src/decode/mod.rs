@@ -33,6 +33,13 @@
 //! [`crate::Error::InvalidData`] and leave the decoder state unchanged; hostile
 //! headers are rejected or bounded (see `header`).
 //!
+//! **Where this decoder deliberately differs from lewton 0.10.2** (all found
+//! by the synthetic-stream gate; none is reachable from a libvorbis stream):
+//! lewton's fast IMDCT is wrong at block sizes 64 and 128 (its own slow IMDCT
+//! agrees with ours); lewton swaps the magnitude/angle roles of a coupling
+//! step whose magnitude channel number is above the angle's; lewton reads only
+//! 7 of the 8 residue cascade books. We follow the spec (and FFmpeg) in each.
+//!
 //! Correctness is gated against lewton 0.10.2 and FFmpeg 8.1 (libvorbis
 //! streams, q-1..q10, 1-8 channels, 8-96 kHz): sample-exact frame counts and a
 //! max abs difference around 1e-7 (float operation order differs, so the gate
@@ -586,6 +593,66 @@ fn unfold(t: &[f32], n: usize, a: usize, b: usize, dst: &mut [f32]) {
     if s < e {
         for (d, &v) in dst[s - a..e - a].iter_mut().zip(&t[s - n34..e - n34]) {
             *d = -v;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// lewton's `inverse_mdct_slow` (f64 here): DCT-IV of the first n/2, unfolded.
+    fn imdct_slow(coeffs: &[f32]) -> Vec<f64> {
+        let n = coeffs.len() * 2;
+        let l = n / 2;
+        let t: Vec<f64> = (0..l)
+            .map(|i| {
+                (0..l)
+                    .map(|j| {
+                        f64::from(coeffs[j])
+                            * (std::f64::consts::PI / l as f64
+                                * (i as f64 + 0.5)
+                                * (j as f64 + 0.5))
+                                .cos()
+                    })
+                    .sum()
+            })
+            .collect();
+        let (n4, n34) = (n / 4, 3 * n / 4);
+        (0..n)
+            .map(|i| {
+                if i < n4 {
+                    t[n4 + i]
+                } else if i < n34 {
+                    -t[n34 - 1 - i]
+                } else {
+                    -t[i - n34]
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn imdct_unfold_matches_slow_for_all_vorbis_sizes() {
+        for bits in 6..=13 {
+            let n = 1usize << bits;
+            let coeffs: Vec<f32> = (0..n / 2)
+                .map(|i| ((i * 7919 % 1009) as f32 / 504.0 - 1.0) * 0.3)
+                .collect();
+            let want = imdct_slow(&coeffs);
+            let dct = Dct4::new(n / 2);
+            let mut t = vec![0.0; n / 2];
+            let mut scratch = vec![[0.0; 2]; n / 4];
+            dct.run(&coeffs, &mut t, &mut scratch);
+            let mut got = vec![0.0; n];
+            unfold(&t, n, 0, n, &mut got);
+            let peak = want.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+            for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (f64::from(g) - w).abs() <= 2e-6 * peak,
+                    "n={n} i={i}: {g} vs {w}"
+                );
+            }
         }
     }
 }

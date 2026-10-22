@@ -1031,4 +1031,85 @@ mod tests {
         assert_eq!((fb, t.len()), (1, 2));
         assert!(build_table(&[0, 0], &mut b).unwrap().1.is_empty());
     }
+
+    /// Random complete codes (with unused entries sprinkled in): a random
+    /// entry sequence written MSb-first-per-codeword into an LSb-first stream
+    /// decodes back exactly, consuming exactly the written bits.
+    #[test]
+    fn random_codes_roundtrip() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for case in 0..400 {
+            let used = 2 + next(300) as usize;
+            let maxlen = 2 + next(30) as u8;
+            let mut leaves = vec![1u8, 1u8];
+            while leaves.len() < used {
+                let i = next(leaves.len() as u64) as usize;
+                if leaves[i] >= maxlen {
+                    if leaves.iter().all(|&l| l >= maxlen) {
+                        break;
+                    }
+                    continue;
+                }
+                leaves[i] += 1;
+                let l = leaves[i];
+                leaves.push(l);
+            }
+            for i in (1..leaves.len()).rev() {
+                let j = next(i as u64 + 1) as usize;
+                leaves.swap(i, j);
+            }
+            for _ in 0..next(5) {
+                let at = next(leaves.len() as u64 + 1) as usize;
+                leaves.insert(at, 0);
+            }
+            let mut budget = Budget {
+                entries: MAX_TOTAL_ENTRIES,
+                vq: MAX_TOTAL_VQ,
+                table: MAX_TOTAL_TABLE,
+            };
+            let (fast_bits, table) = build_table(&leaves, &mut budget).unwrap();
+            let book = Codebook {
+                dim: 1,
+                entries: leaves.len() as u32,
+                fast_bits,
+                table,
+                vq: Vec::new(),
+                has_vq: false,
+            };
+            let natural = make_words(&leaves).unwrap();
+            let used_idx: Vec<usize> = (0..leaves.len()).filter(|&i| leaves[i] > 0).collect();
+            let seq: Vec<usize> = (0..200)
+                .map(|_| used_idx[next(used_idx.len() as u64) as usize])
+                .collect();
+            let mut w = crate::BitWriter::new();
+            for &e in &seq {
+                let l = u32::from(leaves[e]);
+                let r = natural[e].reverse_bits() >> (32 - l);
+                // BitWriter takes <= 32 bits LSb-first: write in two halves.
+                if l > 16 {
+                    w.write(r & 0xffff, 16);
+                    w.write(r >> 16, l - 16);
+                } else {
+                    w.write(r, l);
+                }
+            }
+            let total = w.bit_len();
+            let bytes = w.into_bytes();
+            let mut br = BitReader::new(&bytes);
+            for (k, &e) in seq.iter().enumerate() {
+                assert_eq!(
+                    book.decode(&mut br) as usize,
+                    e,
+                    "case {case} symbol {k} lens {leaves:?}"
+                );
+            }
+            assert_eq!(br.bits_consumed(), total);
+        }
+    }
 }
