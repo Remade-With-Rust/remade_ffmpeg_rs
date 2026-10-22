@@ -17,3 +17,11 @@ default = ["simd"]
 simd = []
 
 [dependencies]
+
+# Test/bench roots only — the library stays zero-dependency. lewton is the
+# decoder oracle the in-house decoder is gated against; rusty_alloc-api is the
+# project's shipping allocator, set as `#[global_allocator]` in example/bench
+# roots only (never in the library — see the workspace CLAUDE.md).
+[dev-dependencies]
+lewton.workspace = true
+rusty_alloc-api.workspace = true

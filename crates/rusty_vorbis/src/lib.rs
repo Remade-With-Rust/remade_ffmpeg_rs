@@ -26,6 +26,7 @@
 
 #![allow(dead_code)]
 
+pub mod decode;
 mod error;
 pub mod floor;
 pub mod frame;
