@@ -11,7 +11,9 @@ permissively-licensed Vorbis encoder in Rust*. No C, no FFI.
 - **Decoder** — matches FFmpeg 8.1's native decoder: `f32` output in FFmpeg/WAV
   channel order, the stream end trimmed to the final page's granule position,
   identical frame counts and a max abs difference around 2e-7 (1–8 channels,
-  q0–q10, 8–96 kHz). ~1.5× faster than symphonia.
+  q0–q10, 8–96 kHz). Ogg demux + decode to `f32` through the rff engine runs
+  ~1.6× faster than symphonia 0.5.5 (10-minute stereo q5 file, in-process,
+  pinned) and the `rff` CLI decodes it ~2.3× faster than it did with lewton.
 
 - **Encoder** — window → N/4-FFT MDCT → Bark-scale masking floor → channel coupling + point stereo → rate-distortion residue VQ, emitting an embedded libvorbis setup header. Driven with `-q:a 0–9`.
 - **FFmpeg decodes our output**, validated packet-exact against `lewton` and libvorbis.
