@@ -327,10 +327,12 @@ impl Decoder {
                 }
             }
             _ => {
-                for c in 0..ch {
-                    let src = &self.pcm[c * half..c * half + frames];
-                    for (o, &s) in out[c..].iter_mut().step_by(ch).zip(src) {
-                        *o = s;
+                // Frame-major: `ch` sequential read streams, one contiguous
+                // write pass.
+                let pcm = &self.pcm;
+                for (f, o) in out.chunks_exact_mut(ch).enumerate() {
+                    for (c, d) in o.iter_mut().enumerate() {
+                        *d = pcm[c * half + f];
                     }
                 }
             }
@@ -441,10 +443,11 @@ impl Decoder {
                                     spectra[c1 * n2 + k] = pair[1];
                                 }
                             } else {
-                                for (j, &c) in chans.iter().enumerate() {
-                                    let dst = &mut spectra[c as usize * n2..(c as usize + 1) * n2];
-                                    for (d, &v) in dst.iter_mut().zip(iv[j..].iter().step_by(nv)) {
-                                        *d = v;
+                                // Frame-major: one contiguous read pass, `nv`
+                                // sequential write streams.
+                                for (k, frame) in iv.chunks_exact(nv).enumerate() {
+                                    for (&c, &v) in chans.iter().zip(frame) {
+                                        spectra[c as usize * n2 + k] = v;
                                     }
                                 }
                             }
