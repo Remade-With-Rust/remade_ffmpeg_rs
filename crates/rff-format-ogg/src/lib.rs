@@ -266,7 +266,7 @@ fn write_page(out: &mut Vec<u8>, header_type: u8, granule: u64, seq: u32, packet
     let crc_at = out.len();
     out.extend_from_slice(&[0, 0, 0, 0]); // CRC placeholder
     out.push(num_segments as u8);
-    out.extend(std::iter::repeat(255).take(full));
+    out.extend(std::iter::repeat_n(255, full));
     out.push(last);
     out.extend_from_slice(packet);
 

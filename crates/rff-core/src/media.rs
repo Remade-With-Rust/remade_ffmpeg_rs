@@ -35,10 +35,11 @@ impl fmt::Display for MediaType {
 ///
 /// Marked `#[non_exhaustive]`: we add codecs over time, and external matchers
 /// must handle the open-ended set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum CodecId {
     /// Sentinel for "no/unknown codec".
+    #[default]
     None,
     /// H.264 / AVC video.
     H264,
@@ -79,12 +80,6 @@ pub enum CodecId {
     Subrip,
     /// WebVTT subtitle (`.vtt`): plain-text cues with `HH:MM:SS.mmm` timing.
     WebVtt,
-}
-
-impl Default for CodecId {
-    fn default() -> Self {
-        CodecId::None
-    }
 }
 
 impl CodecId {

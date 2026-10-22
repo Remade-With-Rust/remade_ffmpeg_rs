@@ -365,7 +365,7 @@ impl OpusEnc {
         let rem = self.buffer.len() % frame_samples;
         if rem != 0 {
             self.buffer
-                .extend(std::iter::repeat(0.0).take(frame_samples - rem));
+                .extend(std::iter::repeat_n(0.0, frame_samples - rem));
         }
         let app = if self.voip {
             Application::Voip
@@ -474,7 +474,7 @@ impl Encoder for OpusEnc {
                 let rem = self.buffer.len() % frame_samples;
                 if rem != 0 {
                     self.buffer
-                        .extend(std::iter::repeat(0.0).take(frame_samples - rem));
+                        .extend(std::iter::repeat_n(0.0, frame_samples - rem));
                 }
                 let _ = self.drain_frames();
             }
@@ -495,7 +495,7 @@ mod tests {
         let frame = rate as usize / 1000 * FRAME_MS; // 960
         let mut samples = Vec::new();
         for i in 0..frame * 10 {
-            samples.push(((i as f32 * 0.05).sin() * 0.3) as f32);
+            samples.push((i as f32 * 0.05).sin() * 0.3);
         }
         let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
@@ -570,8 +570,10 @@ mod tests {
 
     /// `n` 20 ms stereo packets of a tone, from the serial encoder.
     fn encoded(n: usize) -> Vec<Packet> {
-        let mut enc = OpusEnc::default();
-        enc.parallel = false;
+        let mut enc = OpusEnc {
+            parallel: false,
+            ..Default::default()
+        };
         let samples: Vec<f32> = (0..960 * n * 2)
             .map(|i| ((i / 2) as f32 * 0.05).sin() * 0.3)
             .collect();

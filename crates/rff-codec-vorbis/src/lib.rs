@@ -91,10 +91,12 @@ fn ffmpeg_channel_map(channels: usize) -> Vec<usize> {
 /// Interleave lewton's planar output into little-endian f32 bytes, output
 /// channel `i` taking plane `map[i]`.
 fn interleave(pcm: &[Vec<f32>], map: &[usize], samples: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(samples * map.len() * 4);
-    for i in 0..samples {
-        for &c in map {
-            out.extend_from_slice(&pcm[c][i].to_le_bytes());
+    let planes: Vec<&[f32]> = map.iter().map(|&c| &pcm[c][..samples]).collect();
+    let mut out = vec![0u8; samples * planes.len() * 4];
+    for (k, plane) in planes.iter().enumerate() {
+        let frames = out.chunks_exact_mut(planes.len() * 4);
+        for (frame, s) in frames.zip(plane.iter()) {
+            frame[k * 4..k * 4 + 4].copy_from_slice(&s.to_le_bytes());
         }
     }
     out
