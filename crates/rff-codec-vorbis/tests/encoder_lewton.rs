@@ -523,9 +523,9 @@ fn dump_lewton_decode() {
     // Write interleaved s16 stereo wav.
     let nsamp = dec[0].len().min(dec[1].len());
     let mut body = Vec::with_capacity(nsamp * 4);
-    for i in 0..nsamp {
-        for c in 0..2 {
-            let v = (dec[c][i] * 32768.0).clamp(-32768.0, 32767.0) as i16;
+    for (l, r) in dec[0].iter().zip(&dec[1]).take(nsamp) {
+        for s in [l, r] {
+            let v = (s * 32768.0).clamp(-32768.0, 32767.0) as i16;
             body.extend_from_slice(&v.to_le_bytes());
         }
     }

@@ -5,7 +5,12 @@
 //! any audio. The Ogg demuxer hands those to us packed (length-prefixed) as the
 //! stream's `extradata`; [`configure`](rff_codec::Decoder::configure) parses the
 //! identification + setup headers, and each audio packet then decodes to an
-//! interleaved `s16` [`AudioFrame`].
+//! interleaved `f32` [`AudioFrame`] — float, like FFmpeg's native Vorbis
+//! decoder (`fltp`), not quantised to 16 bits. Channels come out in FFmpeg's
+//! (WAV) order, not Vorbis's: see [`ffmpeg_channel_map`]. The stream's last
+//! packet is trimmed so the output ends at the final page's granule position
+//! (see [`Packet::end_position`]), dropping the encoder's end padding as
+//! FFmpeg, libvorbis and lewton's own Ogg reader do.
 //!
 //! Decode is backed by lewton. Encode is the in-house pure-Rust Vorbis **encoder**
 //! ([`rusty_vorbis`], see `docs/codec-vorbis-encoder.md`) — masking-driven floor,
@@ -16,7 +21,7 @@
 
 use std::collections::VecDeque;
 
-use lewton::audio::{read_audio_packet, PreviousWindowRight};
+use lewton::audio::{get_decoded_sample_count, read_audio_packet_generic, PreviousWindowRight};
 use lewton::header::{read_header_ident, read_header_setup, IdentHeader, SetupHeader};
 use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder, Encoder};
 use rff_core::{AudioFrame, Dictionary, Error, Frame, MediaType, Packet, Result, SampleFormat};
@@ -64,10 +69,89 @@ fn unpack_headers(data: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+/// Vorbis → FFmpeg channel order: output channel `i` takes Vorbis channel
+/// `map[i]`. Vorbis orders 3–8 channels with the centre second and the LFE
+/// last (spec §4.3.9); FFmpeg/WAV put the centre third and the LFE fourth.
+/// This is libavcodec's `ff_vorbis_channel_layout_offsets`, applied the way
+/// `vorbisdec.c` does (`channel_ptrs[offsets[i]] = plane i`). 1, 2 and 4
+/// channels are identical in both orders; beyond 8 Vorbis leaves the order
+/// application-defined and FFmpeg keeps it as is.
+fn ffmpeg_channel_map(channels: usize) -> Vec<usize> {
+    let map: &[usize] = match channels {
+        3 => &[0, 2, 1],
+        5 => &[0, 2, 1, 3, 4],
+        6 => &[0, 2, 1, 5, 3, 4],
+        7 => &[0, 2, 1, 6, 5, 3, 4],
+        8 => &[0, 2, 1, 7, 5, 6, 3, 4],
+        _ => return (0..channels).collect(),
+    };
+    map.to_vec()
+}
+
+/// Interleave lewton's planar output into little-endian f32 bytes, output
+/// channel `i` taking plane `map[i]`.
+fn interleave(pcm: &[Vec<f32>], map: &[usize], samples: usize) -> Vec<u8> {
+    let planes: Vec<&[f32]> = map.iter().map(|&c| &pcm[c][..samples]).collect();
+    let mut out = vec![0u8; samples * planes.len() * 4];
+    for (k, plane) in planes.iter().enumerate() {
+        let frames = out.chunks_exact_mut(planes.len() * 4);
+        for (frame, s) in frames.zip(plane.iter()) {
+            frame[k * 4..k * 4 + 4].copy_from_slice(&s.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// How many of a packet's `decoded` samples to keep, given the stream
+/// `position` before it. Only the stream's last packet is cut, by however far
+/// it would run past the final granule — FFmpeg's Ogg end trimming
+/// (`oggparsevorbis.c` + `decode.c`), which for an ordinary multi-page file is
+/// also lewton's `OggStreamReader` logic. As in FFmpeg, padding longer than the
+/// packet itself is not applied at all.
+fn end_trim(position: i64, packet: &Packet, decoded: usize) -> usize {
+    match packet.end_position {
+        Some(end) if packet.flags.end_of_stream => {
+            let excess = position.saturating_add(decoded as i64).saturating_sub(end);
+            if excess > 0 && excess <= decoded as i64 {
+                decoded - excess as usize
+            } else {
+                decoded
+            }
+        }
+        _ => decoded,
+    }
+}
+
+/// The duration FFmpeg's Vorbis parser credits the stream's first audio
+/// packet with: `(blocksize_0 + its blocksize) / 4`, although it decodes to
+/// no samples. It only matters when no page granule precedes the final page
+/// (all the audio on one page): FFmpeg then counts the stream from 0 with
+/// these durations, so its output ends this many samples short of the granule.
+fn first_packet_duration(ident: &IdentHeader, setup: &SetupHeader, packet: &[u8]) -> i64 {
+    let bs0 = 1i64 << ident.blocksize_0;
+    let bs1 = 1i64 << ident.blocksize_1;
+    // A short block (no previous window) "decodes" to exactly bs0 / 2; every
+    // long-block window shape gives something else (bs1 > bs0).
+    match get_decoded_sample_count(ident, setup, packet) {
+        Ok(n) if n as i64 == bs0 / 2 => (bs0 + bs0) / 4,
+        Ok(_) => (bs0 + bs1) / 4,
+        Err(_) => 0,
+    }
+}
+
 struct State {
     ident: IdentHeader,
     setup: SetupHeader,
     pwr: PreviousWindowRight,
+    /// Output channel order (see [`ffmpeg_channel_map`]).
+    map: Vec<usize>,
+    /// Stream position (granule units = samples) after the last packet
+    /// decoded: the last page granule seen plus the samples since. Before any
+    /// granule it is FFmpeg's assumption — counted from 0 with its parser's
+    /// durations (see [`first_packet_duration`]).
+    position: i64,
+    /// No audio packet has been decoded yet.
+    first: bool,
     channels: u16,
     sample_rate: u32,
 }
@@ -97,6 +181,9 @@ impl Decoder for VorbisDecoder {
         .map_err(|e| Error::invalid(format!("vorbis setup header: {e:?}")))?;
 
         self.state = Some(State {
+            map: ffmpeg_channel_map(ident.audio_channels as usize),
+            position: 0,
+            first: true,
             channels: ident.audio_channels as u16,
             sample_rate: ident.audio_sample_rate,
             ident,
@@ -112,25 +199,31 @@ impl Decoder for VorbisDecoder {
             .as_mut()
             .ok_or_else(|| Error::invalid("vorbis decode: not configured"))?;
 
-        let pcm: Vec<Vec<i16>> = read_audio_packet(&st.ident, &st.setup, &packet.data, &mut st.pwr)
-            .map_err(|e| Error::invalid(format!("vorbis decode: {e:?}")))?;
-        if pcm.is_empty() || pcm[0].is_empty() {
+        let pcm: Vec<Vec<f32>> =
+            read_audio_packet_generic(&st.ident, &st.setup, &packet.data, &mut st.pwr)
+                .map_err(|e| Error::invalid(format!("vorbis decode: {e:?}")))?;
+        let decoded = pcm.first().map_or(0, Vec::len);
+        let advance = if st.first {
+            st.first = false;
+            first_packet_duration(&st.ident, &st.setup, &packet.data)
+        } else {
+            decoded as i64
+        };
+        let samples = end_trim(st.position, packet, decoded);
+        st.position = packet
+            .end_position
+            .unwrap_or(st.position.saturating_add(advance));
+        if samples == 0 {
             return Ok(()); // some packets carry no output samples
         }
 
-        // lewton returns planar per-channel i16; interleave to s16.
-        let channels = pcm.len();
-        let samples = pcm[0].len();
-        let mut interleaved = Vec::with_capacity(samples * channels * 2);
-        for i in 0..samples {
-            for ch in &pcm {
-                interleaved.extend_from_slice(&ch[i].to_le_bytes());
-            }
-        }
+        // lewton returns planar per-channel f32 in Vorbis channel order;
+        // interleave in FFmpeg's.
+        let interleaved = interleave(&pcm, &st.map, samples);
         self.queue.push_back(Frame::Audio(AudioFrame {
             sample_rate: st.sample_rate,
             channels: st.channels,
-            format: SampleFormat::S16,
+            format: SampleFormat::F32,
             planes: vec![interleaved],
             samples,
             pts: packet.pts,
@@ -277,6 +370,216 @@ mod tests {
     fn configure_rejects_missing_headers() {
         let mut dec = VorbisDecoder::default();
         assert!(dec.configure(&CodecParams::default()).is_err());
+    }
+
+    /// Encode `n` frames of a stereo tone with the in-house encoder; returns the
+    /// packed extradata and the audio packets.
+    fn encoded_tone(n: usize) -> (Vec<u8>, Vec<Packet>) {
+        let mut enc = VorbisEncoder::new();
+        let mut plane = Vec::with_capacity(n * 2 * 4);
+        for i in 0..n {
+            for f in [0.02f32, 0.031] {
+                plane.extend_from_slice(&(0.4 * (f * i as f32).sin()).to_le_bytes());
+            }
+        }
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            sample_rate: 44_100,
+            channels: 2,
+            format: SampleFormat::F32,
+            planes: vec![plane],
+            samples: n,
+            pts: Some(0),
+        }))
+        .unwrap();
+        enc.flush();
+        let mut packets = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            packets.push(p);
+        }
+        // The first three packets are the setup headers.
+        let audio = packets.split_off(3);
+        (enc.extradata(), audio)
+    }
+
+    fn decode_all(extradata: &[u8], packets: &[Packet]) -> Vec<AudioFrame> {
+        let mut dec = VorbisDecoder::default();
+        dec.configure(&CodecParams {
+            extradata: extradata.to_vec(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut out = Vec::new();
+        for p in packets {
+            dec.send_packet(p).unwrap();
+            while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+                out.push(af);
+            }
+        }
+        dec.flush();
+        while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+            out.push(af);
+        }
+        out
+    }
+
+    /// Output is float, as FFmpeg's decoder's is: not quantised to 16 bits.
+    #[test]
+    fn decodes_to_unquantised_f32() {
+        let (extradata, packets) = encoded_tone(8192);
+        let frames = decode_all(&extradata, &packets);
+        assert!(!frames.is_empty());
+        let mut off_grid = 0usize;
+        for af in &frames {
+            assert_eq!(af.format, SampleFormat::F32);
+            assert_eq!(af.planes[0].len(), af.samples * af.channels as usize * 4);
+            for b in af.planes[0].chunks_exact(4) {
+                let s = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                assert!(s.is_finite() && s.abs() <= 1.5, "{s}");
+                if (s * 32768.0).fract() != 0.0 {
+                    off_grid += 1;
+                }
+            }
+        }
+        assert!(off_grid > 1000, "only {off_grid} samples off the s16 grid");
+    }
+
+    /// FFmpeg order for every channel count Vorbis defines (checked against
+    /// libavcodec's `ff_vorbis_channel_layout_offsets` and an FFmpeg 8.1 decode
+    /// of a 5.1 file with a distinct tone per channel).
+    #[test]
+    fn channel_map_matches_ffmpeg() {
+        assert_eq!(ffmpeg_channel_map(1), [0]);
+        assert_eq!(ffmpeg_channel_map(2), [0, 1]);
+        assert_eq!(ffmpeg_channel_map(3), [0, 2, 1]);
+        assert_eq!(ffmpeg_channel_map(4), [0, 1, 2, 3]);
+        assert_eq!(ffmpeg_channel_map(5), [0, 2, 1, 3, 4]);
+        assert_eq!(ffmpeg_channel_map(6), [0, 2, 1, 5, 3, 4]);
+        assert_eq!(ffmpeg_channel_map(7), [0, 2, 1, 6, 5, 3, 4]);
+        assert_eq!(ffmpeg_channel_map(8), [0, 2, 1, 7, 5, 6, 3, 4]);
+        assert_eq!(ffmpeg_channel_map(9), (0..9).collect::<Vec<_>>());
+        for n in 1..=8 {
+            let mut m = ffmpeg_channel_map(n);
+            m.sort_unstable();
+            assert_eq!(m, (0..n).collect::<Vec<_>>(), "{n}ch map is a permutation");
+        }
+    }
+
+    /// 5.1: Vorbis FL FC FR RL RR LFE → FFmpeg FL FR FC LFE BL BR.
+    #[test]
+    fn interleave_reorders_5_1_to_ffmpeg_order() {
+        // Plane k holds the constant k (FL=0, FC=1, FR=2, RL=3, RR=4, LFE=5).
+        let pcm: Vec<Vec<f32>> = (0..6).map(|k| vec![k as f32; 2]).collect();
+        let bytes = interleave(&pcm, &ffmpeg_channel_map(6), 2);
+        let got: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let frame = [0.0, 2.0, 1.0, 5.0, 3.0, 4.0]; // FL FR FC LFE BL BR
+        assert_eq!(got, [frame, frame].concat());
+    }
+
+    #[test]
+    fn end_trim_cuts_only_the_final_packet() {
+        let mut p = Packet::from_data(0, Vec::new());
+        // Mid-stream: never cut.
+        assert_eq!(end_trim(1000, &p, 512), 512);
+        p.end_position = Some(1200);
+        assert_eq!(end_trim(1000, &p, 512), 512);
+        // Final packet: cut back to the granule.
+        p.flags.end_of_stream = true;
+        assert_eq!(end_trim(1000, &p, 512), 200);
+        assert_eq!(end_trim(1000, &p, 100), 100, "never extends");
+        assert_eq!(end_trim(1200, &p, 512), 0, "padding == packet: all of it");
+        // Padding longer than the packet: FFmpeg's decode.c ignores it.
+        assert_eq!(end_trim(1300, &p, 512), 512);
+        // No granule on the final packet: nothing to trim to.
+        p.end_position = None;
+        assert_eq!(end_trim(1000, &p, 512), 512);
+    }
+
+    /// Lay `packets` out as Ogg would: every `per_page`-th packet (and the
+    /// last) completes a page and carries the granule after it; the last is
+    /// end-of-stream with `final_granule`.
+    fn paginate(packets: &mut [Packet], sizes: &[usize], per_page: usize, final_granule: i64) {
+        let mut granule = 0i64;
+        let n = packets.len();
+        for (i, (p, &size)) in packets.iter_mut().zip(sizes).enumerate() {
+            granule += size as i64;
+            if i + 1 == n {
+                p.end_position = Some(final_granule);
+                p.flags.end_of_stream = true;
+            } else if (i + 1) % per_page == 0 {
+                p.end_position = Some(granule);
+            }
+        }
+    }
+
+    #[test]
+    fn final_packet_is_trimmed_to_the_last_granule() {
+        let (extradata, mut packets) = encoded_tone(10_000);
+        let untrimmed = decode_all(&extradata, &packets);
+        // Per-packet decoded sizes (the first packet yields none).
+        let mut dec = VorbisDecoder::default();
+        dec.configure(&CodecParams {
+            extradata: extradata.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut sizes = Vec::new();
+        for p in &packets {
+            dec.send_packet(p).unwrap();
+            let mut n = 0;
+            while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+                n += af.samples;
+            }
+            sizes.push(n);
+        }
+        let total: usize = sizes.iter().sum();
+        assert_eq!(total, untrimmed.iter().map(|f| f.samples).sum::<usize>());
+        let last = *sizes.last().unwrap();
+        assert!(last > 100 && total > 4096, "last {last} total {total}");
+
+        // Multi-page: output stops exactly at the final granule.
+        let want = total - 100;
+        paginate(&mut packets, &sizes, 4, want as i64);
+        let frames = decode_all(&extradata, &packets);
+        let got: usize = frames.iter().map(|f| f.samples).sum();
+        assert_eq!(got, want);
+        // The kept samples are the untrimmed ones, unchanged.
+        let flat = |fs: &[AudioFrame]| {
+            fs.iter()
+                .flat_map(|f| f.planes[0].clone())
+                .collect::<Vec<u8>>()
+        };
+        assert_eq!(flat(&frames)[..], flat(&untrimmed)[..want * 2 * 4]);
+
+        // One page (only the last packet has a granule): FFmpeg counts from 0
+        // crediting the first packet with (bs0 + its blocksize) / 4 samples it
+        // never outputs, so it ends that much short of the granule.
+        for p in packets.iter_mut() {
+            p.end_position = None;
+        }
+        packets.last_mut().unwrap().end_position = Some(want as i64);
+        let st = {
+            let mut d = VorbisDecoder::default();
+            d.configure(&CodecParams {
+                extradata: extradata.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            d.state.unwrap()
+        };
+        let phantom = first_packet_duration(&st.ident, &st.setup, &packets[0].data);
+        let (bs0, bs1) = (1i64 << st.ident.blocksize_0, 1i64 << st.ident.blocksize_1);
+        assert!(
+            phantom == bs0 / 2 || phantom == (bs0 + bs1) / 4,
+            "{phantom}"
+        );
+        let got: usize = decode_all(&extradata, &packets)
+            .iter()
+            .map(|f| f.samples)
+            .sum();
+        assert_eq!(got as i64, want as i64 - phantom);
     }
 
     #[test]
