@@ -437,10 +437,16 @@ impl Decoder {
                                 let c = chans[0] as usize;
                                 spectra[c * n2..(c + 1) * n2].copy_from_slice(iv);
                             } else if nv == 2 {
+                                // `chans` is ascending, so c0 < c1: two disjoint
+                                // channel slices, zipped (vectorisable).
                                 let (c0, c1) = (chans[0] as usize, chans[1] as usize);
-                                for (k, pair) in iv.chunks_exact(2).enumerate() {
-                                    spectra[c0 * n2 + k] = pair[0];
-                                    spectra[c1 * n2 + k] = pair[1];
+                                let (lo, hi) = spectra.split_at_mut(c1 * n2);
+                                let s0 = &mut lo[c0 * n2..(c0 + 1) * n2];
+                                for ((a, b), pair) in
+                                    s0.iter_mut().zip(&mut hi[..n2]).zip(iv.chunks_exact(2))
+                                {
+                                    *a = pair[0];
+                                    *b = pair[1];
                                 }
                             } else {
                                 // Frame-major: one contiguous read pass, `nv`
