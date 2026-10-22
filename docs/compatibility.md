@@ -27,7 +27,7 @@ licensed (CI-enforced by `cargo-deny`).
 | AV2 | ✅ | — | in-house (`rusty_av2d`) | basic (decode registered; encoder in the workshop) · **decode robustness:** empty packets are rejected at our boundary in every build; the upstream GDF `usize` underflow is fixed in `rusty_av2d` 0.2.12; debug and release both decode byte-identically to the reference and survive the fuzz sweep (verified) — see the note below |
 | H.264 / AVC | ✅ | ✅ | rusty_h264 (pure Rust; opt-in SIMD asm) | validated · ⚖ |
 | Opus | ✅ | ✅ | rusty-opus (pure Rust) | validated (12/12 official decoder conformance) |
-| Vorbis | ✅ | ✅ | decode: lewton · encode: in-house `rusty_vorbis` | validated |
+| Vorbis | ✅ | ✅ | decode + encode: in-house `rusty_vorbis` | validated |
 | FLAC | ✅ | ✅ | in-house `rusty_flac` (decode + encode; one packet per frame) | validated (parity with ffmpeg `-compression_level 8` within 0.03%) |
 | PNG | ✅ | ✅ | png (pure Rust) | validated |
 | JPEG | ✅ | ✅ | in-house `rusty_jpeg` (pure Rust; vendored merge of jpeg-decoder + jpeg-encoder) | validated |

@@ -4,10 +4,14 @@
 [![By Mata Network](https://img.shields.io/badge/by-Mata%20Network-5b2be0)](https://www.mata.network)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/LICENSE)
 
-The **Vorbis** codec adapter for **remade_ffmpeg_rs** — decode via the pure-Rust
-[`lewton`](https://crates.io/crates/lewton), encode via our in-house
-[`rusty_vorbis`](https://crates.io/crates/rusty_vorbis), *the first
+The **Vorbis** codec adapter for **remade_ffmpeg_rs** — decode and encode via
+our in-house [`rusty_vorbis`](https://crates.io/crates/rusty_vorbis), *the first
 permissively-licensed Vorbis encoder in Rust*. No C, no FFI.
+
+- **Decoder** — matches FFmpeg 8.1's native decoder: `f32` output in FFmpeg/WAV
+  channel order, the stream end trimmed to the final page's granule position,
+  identical frame counts and a max abs difference around 2e-7 (1–8 channels,
+  q0–q10, 8–96 kHz). ~1.5× faster than symphonia.
 
 - **Encoder** — window → N/4-FFT MDCT → Bark-scale masking floor → channel coupling + point stereo → rate-distortion residue VQ, emitting an embedded libvorbis setup header. Driven with `-q:a 0–9`.
 - **FFmpeg decodes our output**, validated packet-exact against `lewton` and libvorbis.

@@ -11,6 +11,10 @@
 //! - `vorbis_one_page.ogg`: 0.3 s mono — all audio on one (EOS) page, where
 //!   FFmpeg ends (blocksize_0 + first blocksize) / 4 samples short of the
 //!   granule.
+//! - `vorbis_early_tail_2400.ogg`: 0.05 s mono at 48 kHz, q0, `-page_duration
+//!   20000` — a page ends on a long block that a short one follows, so the
+//!   decoder's output runs `(2048 - 256) / 4` samples ahead of the granule
+//!   there; the end trim must still stop at FFmpeg's 2,400.
 //! - `opus_stereo_96000.ogg`: 2 s, 48 kHz, 64 kb/s, pre-skip 312.
 //! - `opus_stereo_59259.opus`: 1.23456 s — not a multiple of 20 ms.
 //! - `opus_one_page.opus`: 0.1 s mono, all audio on the EOS page.
@@ -158,7 +162,11 @@ fn vorbis_multi_page_ends_at_the_final_granule() {
 }
 
 /// The same packets through lewton's own Ogg reader, which trims the stream
-/// end itself: the engine's demuxer + adapter must agree sample for sample.
+/// end itself: the engine's demuxer + adapter must give the same samples.
+/// The adapter decodes with the in-house `rusty_vorbis` decoder, whose float
+/// operation order differs from lewton's, so the samples agree to within
+/// float rounding (max abs difference ~1e-7), not bit for bit; the sample
+/// count — the demuxer's end trim — must match exactly.
 #[test]
 fn vorbis_matches_lewtons_own_ogg_reader() {
     let d = decode("vorbis_stereo_43972.ogg");
@@ -170,7 +178,14 @@ fn vorbis_matches_lewtons_own_ogg_reader() {
             want.extend(pcm.iter().map(|ch| ch[i]));
         }
     }
-    assert_eq!(d.samples, want);
+    assert_eq!(d.samples.len(), want.len(), "sample count");
+    let max_diff = d
+        .samples
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_diff <= 1e-6, "max abs diff vs lewton {max_diff:e}");
 }
 
 /// 5.1: FFmpeg order is FL FR FC LFE BL BR, Vorbis's is FL FC FR RL RR LFE.
@@ -220,6 +235,13 @@ fn vorbis_single_page_matches_ffmpeg() {
 /// Ogg Opus: libopus's 312-sample pre-skip comes off the front and the final
 /// granule (96,312) trims the back, so 2 s decodes to exactly 96,000 frames
 /// (it was 96,960). FFmpeg reports Ogg Opus at 48 kHz.
+#[test]
+fn vorbis_end_trim_after_an_early_long_block_tail() {
+    let d = decode("vorbis_early_tail_2400.ogg");
+    assert_eq!(d.frames(), 2_400, "FFmpeg decodes 2,400 frames");
+    assert_rms(&d, &[0.177820907]);
+}
+
 #[test]
 fn opus_pre_skip_and_end_trim() {
     let d = decode("opus_stereo_96000.ogg");
