@@ -22,6 +22,7 @@ pub enum Stage {
     EncQuant,
     EncCodebook,
     DecIcs,
+    DecSpectral,
     DecDequant,
     DecTools,
     DecImdct,
@@ -29,10 +30,11 @@ pub enum Stage {
     DecSbrHf,
     DecSbrSynthesis,
     DecPs,
+    DecOutput,
 }
 
 /// Stage names, indexed by [`Stage`].
-pub const STAGES: [&str; 15] = [
+pub const STAGES: [&str; 17] = [
     "enc mdct (analyze_long/short)",
     "enc psy (perceptual offsets)",
     "enc tns analysis",
@@ -40,7 +42,8 @@ pub const STAGES: [&str; 15] = [
     "enc rate-loop estimate",
     "enc quantize (code_core)",
     "enc codebook select",
-    "dec ics (huffman + side info)",
+    "dec ics side info (section/sf/tns)",
+    "dec spectral huffman",
     "dec dequant (|q|^4/3 x gain, pns)",
     "dec tools (ms/is/pred/ltp/tns)",
     "dec imdct + window",
@@ -48,6 +51,7 @@ pub const STAGES: [&str; 15] = [
     "dec sbr hf gen + adjust",
     "dec sbr qmf synthesis",
     "dec ps",
+    "dec output (interleave)",
 ];
 
 /// Kernels with (or eligible for) a SIMD twin.
@@ -70,9 +74,33 @@ pub const KERNELS: [&str; 5] = [
     "qmf_window",
 ];
 
+/// Deterministic workload counters (what the stream asks the decoder to do).
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub enum Counter {
+    ChannelFrames,
+    ShortFrames,
+    Codewords,
+    CodedCoeffs,
+    PnsCoeffs,
+    ZeroCoeffs,
+    TnsChannels,
+}
+
+/// Counter names, indexed by [`Counter`].
+pub const COUNTERS: [&str; 7] = [
+    "channel frames",
+    "eight-short channel frames",
+    "spectral codewords",
+    "huffman-coded coeffs",
+    "pns noise coeffs",
+    "zero/intensity coeffs",
+    "tns-active channel frames",
+];
+
 #[cfg(feature = "profile")]
 mod imp {
-    use super::{Kernel, Stage, KERNELS, STAGES};
+    use super::{Counter, Kernel, Stage, COUNTERS, KERNELS, STAGES};
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use std::time::Instant;
 
@@ -80,6 +108,20 @@ mod imp {
     static CALLS: [AtomicU64; STAGES.len()] = [const { AtomicU64::new(0) }; STAGES.len()];
     static SIMD: [AtomicU64; KERNELS.len()] = [const { AtomicU64::new(0) }; KERNELS.len()];
     static SCALAR: [AtomicU64; KERNELS.len()] = [const { AtomicU64::new(0) }; KERNELS.len()];
+    static COUNT: [AtomicU64; COUNTERS.len()] = [const { AtomicU64::new(0) }; COUNTERS.len()];
+
+    #[inline]
+    pub fn bump(c: Counter, n: usize) {
+        COUNT[c as usize].fetch_add(n as u64, Relaxed);
+    }
+
+    /// Read and clear the workload counters.
+    #[must_use]
+    pub fn take_counters() -> Vec<(&'static str, u64)> {
+        (0..COUNTERS.len())
+            .map(|i| (COUNTERS[i], COUNT[i].swap(0, Relaxed)))
+            .collect()
+    }
 
     /// Times its stage until dropped.
     pub struct Scope(usize, Instant);
@@ -127,9 +169,12 @@ mod imp {
 
 #[cfg(not(feature = "profile"))]
 mod imp {
-    use super::{Kernel, Stage};
+    use super::{Counter, Kernel, Stage};
 
     pub struct Scope;
+
+    #[inline(always)]
+    pub fn bump(_: Counter, _: usize) {}
 
     #[inline(always)]
     pub fn scope(_: Stage) -> Scope {

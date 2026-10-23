@@ -1178,6 +1178,7 @@ impl Decoder {
     }
 
     fn collect_output(&self, pts: Option<i64>) -> DecodedAudio {
+        let _prof = crate::prof::scope(crate::prof::Stage::DecOutput);
         let n = self.output_len();
         let outs = &self.oc.outputs;
         let mut samples = Vec::with_capacity(n * outs.len());

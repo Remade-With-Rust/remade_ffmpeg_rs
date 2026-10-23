@@ -544,6 +544,14 @@ pub fn decode_ics(
     }
 
     // spectral_data (integers first, so pulses stay exact)
+    drop(prof_ics); // the stages must not nest, or shares double-count
+    let prof_spec = crate::prof::scope(crate::prof::Stage::DecSpectral);
+    crate::prof::bump(crate::prof::Counter::ChannelFrames, 1);
+    crate::prof::bump(crate::prof::Counter::ShortFrames, usize::from(short));
+    crate::prof::bump(
+        crate::prof::Counter::TnsChannels,
+        usize::from(cd.tns.present),
+    );
     let swb = ics.swb;
     // Taken for the call (a failed frame just reallocates it next time).
     let mut quant = std::mem::take(&mut cd.quant);
@@ -564,6 +572,8 @@ pub fn decode_ics(
             let book = spectral_book(cb);
             let tab = crate::codebook::tuple_table(cb);
             let dim = meta.dim as usize;
+            crate::prof::bump(crate::prof::Counter::Codewords, glen * (e - s) / dim);
+            crate::prof::bump(crate::prof::Counter::CodedCoeffs, glen * (e - s));
             for w in 0..glen {
                 let base = (wbase + w) * 128;
                 let mut i = s;
@@ -602,7 +612,7 @@ pub fn decode_ics(
     }
 
     // Dequantisation; PNS bands from the reference generator.
-    drop(prof_ics); // the stages must not nest, or shares double-count
+    drop(prof_spec); // the stages must not nest, or shares double-count
     let _prof = crate::prof::scope(crate::prof::Stage::DecDequant);
     let pow43 = crate::dsp::pow43_table();
     // Every coefficient gets exactly one write: coded bands are dequantised or
@@ -628,6 +638,7 @@ pub fn decode_ics(
             let cb = cd.band_type[idx];
             if cb == ZERO_HCB || cb >= INTENSITY_HCB2 {
                 let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+                crate::prof::bump(crate::prof::Counter::ZeroCoeffs, glen * (e - s));
                 for w in 0..glen {
                     let base = (wbase + w) * 128;
                     cd.coeffs[base + s..base + e].fill(0.0);
@@ -636,6 +647,7 @@ pub fn decode_ics(
             }
             let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
             if cb == NOISE_HCB {
+                crate::prof::bump(crate::prof::Counter::PnsCoeffs, glen * (e - s));
                 let g_amp = 2f32.powf(0.25 * cd.sfo[idx] as f32);
                 for w in 0..glen {
                     let base = (wbase + w) * 128;
