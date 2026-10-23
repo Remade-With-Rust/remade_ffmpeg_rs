@@ -3,7 +3,7 @@ name = "rff-targets"
 # 0.2.4: published from a buildable commit. Its only earlier commit (96c0e87,
 # which created it) cannot package, and release-plz re-packages a crate at the
 # last commit that touched it — so that commit failed every release-plz run.
-version = "0.2.6"
+version = "0.2.7"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
