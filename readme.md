@@ -31,13 +31,6 @@ FREE RAG Converter Online -- <a href="https://RAGconverter.com">RAGconverter.com
 
 ## The headline
 
-<!-- Lead with the number. This is why someone clicks the repo. -->
-
-> **Pre-1.0, measured honestly.** Where a number is benchmarked we report it as
-> measured — flattering or not. We lead on what's structurally true today
-> (safety, correctness, license); raw speed is younger than FFmpeg's and we say
-> so. We will not ship a benchmark we can't reproduce.
-
 | Dimension | FFmpeg (C) | **remade_ffmpeg_rs (Rust) — today** | Goal |
 |---|:---:|:---:|:---:|
 | Memory-safety CVEs (core path) | many, historically | **0 — safe Rust** | structural |
@@ -52,41 +45,9 @@ FREE RAG Converter Online -- <a href="https://RAGconverter.com">RAGconverter.com
 | PNG encode | 1.0× | **0.94–1.05× per core** on public CLIC photographs, **0.86–0.91×** on video frames — encode-only from raw, matched filter *and* size, at 0.2–0.3% *smaller* · **2.11–3.06× faster** wall-clock (block-parallel) | → per-core parity on video frames |
 | License + embedding | LGPL/GPL · C FFI | **Apache-2.0 · pure Rust · no FFI** | — |
 
-> **⚡ Performance spotlight — Opus: `libopus` quality at ~1.6× its per-core encode speed.**
-> Measured three ways against both C `libopus` and FFmpeg's own native encoder — **18 content
-> classes × 5 bitrates** on PEAQ ODG at matched *actual* bitrate, and pinned single-thread CPU
-> time per coding path. Quality lands at **parity with `libopus`** (mean −0.015 ODG) while
-> beating FFmpeg's native Opus encoder on **18/18 classes** (+1.5 ODG). Speed: **1.50× faster
-> than `libopus` on CELT speech, 1.60× on stereo music** (and **3.0×** FFmpeg's native encoder
-> there), within **4%** on the SILK path.
-> Opus uses our own **[rusty-opus](https://github.com/Remade-With-Rust/rusty-opus)** —
-> a pure-Rust fork of `opus-rs` with **three byte-identical AVX2 SILK kernels** (LPC
-> short-prediction, warped-autocorrelation, and the flagship cross-state NSQ shaping filter,
-> whose 4 delayed-decision states run as **i64 lanes** of one register over a **persistent SoA**
-> transposed once per subframe). But the biggest recent win was **structural, and the profiler
-> found it**: a full-transcode profile showed the *codec* was fast (~240× realtime) while the
-> encoder **wrapper burned ~5× the codec's own time** — it buffered the whole stream, then
-> pulled each 20 ms frame off the **front** of that buffer, an **O(n²)** memmove per frame. A
-> cursor-and-single-drain fix cut single-thread encode **4.7×** (full transcode 3.4×) and
-> flipped us from *behind* `libopus` to **ahead** of it.
-
-> **⚡ Performance spotlight — MP3 decode: faster than FFmpeg per core, and the old number was measuring the wrong thing.**
-> Five **bit-identical** decode bricks (O(1) word-load bit reader · circular synthesis FIFO with a contiguous
-> window loop · an exact-kernel-symmetry IMDCT then vectorised with the OUTPUT index as the lane · AVX matrixing ·
-> a division-free Huffman pair decode) plus a **two-stage pipeline** that splits entropy from transform along a
-> state boundary — the bit reservoir belongs to one half, the IMDCT overlap and synthesis FIFO to the other, and
-> nothing is shared — so the threaded path is **bit-identical to the serial one**, gated on bit patterns rather
-> than a tolerance.
-> Matched to the same physical cores with both sides decoding and discarding: **1.24× faster on one core**
-> (1,952 vs 2,431 ms, 15/15, z = −3.87) and **1.39× on two** (1,017 vs 1,455 ms), at **lower total CPU**.
-> The honest part: a CLI-to-CLI comparison had this at **1.20× BEHIND**, and three asymmetries explain the flip —
-> FFmpeg's CLI uses ~2 cores even with `-threads 1` (`cpu/wall` 1.96), our CLI wrote 582 MB where `-f null -`
-> writes nothing, and **our own profiler hashed every output sample**, 17% of its own runtime, work FFmpeg never
-> did. The bricks did not close a gap to parity; they went past it and the output path hid it.
-
 ---
 
-## What is this?
+## What is remade ffmpeg? Why did we make it?
 
 `remade_ffmpeg_rs` rebuilds FFmpeg's pipeline — demux → decode → filter →
 encode → mux — as a set of small, composable Rust crates. The goal is that
@@ -109,7 +70,7 @@ We build the core to production grade and open-source it so the community can
 extend it. No copyleft. No surprises. Just the tools we rely on, made faster and
 safer.
 
-→ More projects: **[github.com/remade-with-rust](https://github.com/remade-with-rust)**
+→ More projects: **[remadewithrust.com](https://remadewithrust.com)** and **[github.com/remade-with-rust](https://github.com/remade-with-rust)** 
 
 <!-- /ORG BOILERPLATE -->
 
