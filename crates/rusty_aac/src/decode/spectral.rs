@@ -173,6 +173,45 @@ fn escapes(r: &mut BitReader, out: &mut [i32]) -> Result<()> {
     Ok(())
 }
 
+/// One tuple through the fast table (or the generic path), as integers.
+#[inline(always)]
+fn tuple<const DIM: usize>(
+    cbn: u8,
+    cb: Codebook,
+    lut: &[u32; 1 << FAST_BITS],
+    r: &mut BitReader,
+) -> Result<[i32; DIM]> {
+    let mut o = [0i32; DIM];
+    let w = r.peek_bits(FAST_BITS);
+    let e = lut[(w & ((1 << FAST_BITS) - 1)) as usize];
+    if e & KIND_MASK == KIND_FULL {
+        r.skip((e & 31) as usize)?;
+        if DIM == 4 {
+            for (k, v) in o.iter_mut().enumerate() {
+                #[allow(clippy::cast_possible_wrap, reason = "nibble sign extension")]
+                let x = ((e << (20 - 4 * k)) as i32) >> 28;
+                *v = x;
+            }
+        } else {
+            for (k, v) in o.iter_mut().enumerate() {
+                #[allow(clippy::cast_possible_wrap, reason = "byte sign extension")]
+                let x = ((e << (16 - 8 * k)) as i32) >> 24;
+                *v = x;
+            }
+            if e & ESC != 0 {
+                escapes(r, &mut o)?;
+            }
+        }
+    } else {
+        slow_tuple(cbn, cb, r, e, &mut o)?;
+    }
+    Ok(o)
+}
+
+fn lut_of(fb: &FastBook) -> &[u32; 1 << FAST_BITS] {
+    fb.lut[..].try_into().expect("a full window table")
+}
+
 /// Decode `out.len() / DIM` tuples of spectral book `cbn` into `out`.
 #[inline(always)]
 pub fn decode_run<const DIM: usize>(
@@ -181,31 +220,64 @@ pub fn decode_run<const DIM: usize>(
     r: &mut BitReader,
     out: &mut [i32],
 ) -> Result<()> {
-    let cb = &CODEBOOKS[cbn as usize];
-    let lut: &[u32; 1 << FAST_BITS] = fb.lut[..].try_into().expect("a full window table");
+    let cb = CODEBOOKS[cbn as usize];
+    let lut = lut_of(fb);
     for o in out.chunks_exact_mut(DIM) {
-        let w = r.peek_bits(FAST_BITS);
-        let e = lut[(w & ((1 << FAST_BITS) - 1)) as usize];
-        if e & KIND_MASK == KIND_FULL {
-            r.skip((e & 31) as usize)?;
-            if DIM == 4 {
-                for (k, v) in o.iter_mut().enumerate() {
-                    #[allow(clippy::cast_possible_wrap, reason = "nibble sign extension")]
-                    let x = ((e << (20 - 4 * k)) as i32) >> 28;
-                    *v = x;
-                }
-            } else {
-                for (k, v) in o.iter_mut().enumerate() {
-                    #[allow(clippy::cast_possible_wrap, reason = "byte sign extension")]
-                    let x = ((e << (16 - 8 * k)) as i32) >> 24;
-                    *v = x;
-                }
-                if e & ESC != 0 {
-                    escapes(r, o)?;
-                }
-            }
+        o.copy_from_slice(&tuple::<DIM>(cbn, cb, lut, r)?);
+    }
+    Ok(())
+}
+
+/// `|q|^(4/3)` for the magnitudes a non-escaped tuple can hold (0..=16, padded
+/// to 32 so the index needs no bounds check), copied from
+/// [`crate::dsp::pow43_table`] - the very values `dequant_with` reads.
+pub struct SmallPow43([f32; 32]);
+
+impl SmallPow43 {
+    pub fn get() -> &'static Self {
+        static T: OnceLock<SmallPow43> = OnceLock::new();
+        T.get_or_init(|| {
+            let t = crate::dsp::pow43_table();
+            Self(std::array::from_fn(|i| t[i]))
+        })
+    }
+
+    /// Exactly `dsp::dequant_with(pow43, q)`: a table value with `q`'s sign.
+    /// Setting the sign bit of a non-negative value IS its negation, so the
+    /// branch on the sign (a misprediction per random sign) becomes an OR.
+    #[inline(always)]
+    fn dequant(&self, pow43: &[f32], q: i32) -> f32 {
+        let a = q.unsigned_abs();
+        if a < 32 {
+            #[allow(clippy::cast_sign_loss, reason = "isolating the sign bit")]
+            let sign = (q as u32) & 0x8000_0000;
+            f32::from_bits(self.0[a as usize].to_bits() | sign)
         } else {
-            slow_tuple(cbn, *cb, r, e, o)?;
+            crate::dsp::dequant_with(pow43, q)
+        }
+    }
+}
+
+/// [`decode_run`] fused with the dequantiser: writes `dequant(q) * gain`
+/// straight into the coefficients - the same two operations, on the same
+/// values, as the separate pass over the integer scratch it replaces, so the
+/// floats are bit-identical (`fused_dequant_matches_two_pass`).
+#[inline(always)]
+pub fn decode_run_dequant<const DIM: usize>(
+    cbn: u8,
+    fb: &FastBook,
+    r: &mut BitReader,
+    out: &mut [f32],
+    gain: f32,
+    small: &SmallPow43,
+    pow43: &[f32],
+) -> Result<()> {
+    let cb = CODEBOOKS[cbn as usize];
+    let lut = lut_of(fb);
+    for o in out.chunks_exact_mut(DIM) {
+        let t = tuple::<DIM>(cbn, cb, lut, r)?;
+        for (c, &q) in o.iter_mut().zip(&t) {
+            *c = small.dequant(pow43, q) * gain;
         }
     }
     Ok(())
@@ -255,12 +327,79 @@ mod tests {
                     let mut want = [0i32; 4];
                     let rb = crate::codebook::decode_tuple(&cb, book, &mut b, &mut want);
                     assert_eq!(ra.is_ok(), rb.is_ok(), "book {cbn} sym {sym}");
+                    if ra.is_err() {
+                        continue; // e.g. a runaway escape: both refuse
+                    }
                     assert_eq!(
                         got[..dim],
                         want[..dim],
                         "book {cbn} sym {sym} tail {tail:x}"
                     );
                     assert_eq!(a.position(), b.position(), "book {cbn} sym {sym}");
+                }
+            }
+        }
+    }
+
+    /// The fused decode+dequant writes, bit for bit, what the two-pass form
+    /// (integers, then `dequant_with(q) * gain`) writes - on every book, over a
+    /// stream of every codeword with varied sign/escape tails, and at gains
+    /// spanning the scalefactor range.
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret")]
+    fn fused_dequant_matches_two_pass() {
+        let pow43 = crate::dsp::pow43_table();
+        let small = SmallPow43::get();
+        for cbn in 1..=11u8 {
+            let cb = CODEBOOKS[cbn as usize];
+            let dim = cb.dim as usize;
+            let book = spectral_book(cbn);
+            let fb = fast_book(cbn);
+            // Every codeword, each followed by 12 pseudo-random bits.
+            let mut bits: Vec<u8> = Vec::new();
+            let mut seed = 0x1234_5678u32;
+            for sym in 0..tuple_table(cbn).len() {
+                let (code, len) = book.code(sym);
+                bits.extend((0..len).rev().map(|b| ((code >> b) & 1) as u8));
+                for _ in 0..12 {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    bits.push((seed >> 31) as u8);
+                }
+            }
+            let mut bytes = vec![0u8; bits.len().div_ceil(8) + 8];
+            for (k, &b) in bits.iter().enumerate() {
+                bytes[k / 8] |= b << (7 - k % 8);
+            }
+            for sf in [0, 37, 100, 163, 255] {
+                let gain = crate::dsp::sf_gain(sf);
+                let (mut a, mut b) = (BitReader::new(&bytes), BitReader::new(&bytes));
+                // Decode until the first error (the random tails desynchronise
+                // the stream, which is fine: both paths must agree throughout).
+                for _ in 0..4 * tuple_table(cbn).len() {
+                    let (mut f, mut q) = ([0f32; 4], [0i32; 4]);
+                    let ra = if dim == 4 {
+                        decode_run_dequant::<4>(cbn, fb, &mut a, &mut f[..4], gain, small, pow43)
+                    } else {
+                        decode_run_dequant::<2>(cbn, fb, &mut a, &mut f[..2], gain, small, pow43)
+                    };
+                    let rb = if dim == 4 {
+                        decode_run::<4>(cbn, fb, &mut b, &mut q[..4])
+                    } else {
+                        decode_run::<2>(cbn, fb, &mut b, &mut q[..2])
+                    };
+                    assert_eq!(ra.is_ok(), rb.is_ok());
+                    if ra.is_err() {
+                        break;
+                    }
+                    for k in 0..dim {
+                        let want = crate::dsp::dequant_with(pow43, q[k]) * gain;
+                        assert_eq!(
+                            f[k].to_bits(),
+                            want.to_bits(),
+                            "book {cbn} sf {sf} q {}",
+                            q[k]
+                        );
+                    }
                 }
             }
         }

@@ -556,6 +556,14 @@ pub fn decode_ics(
     // Taken for the call (a failed frame just reallocates it next time).
     let mut quant = std::mem::take(&mut cd.quant);
     quant.resize(1024, 0);
+    // Without pulses (which edit the integers before dequantisation) a coded
+    // band is dequantised as it is decoded, straight into the coefficients:
+    // the same `dequant_with(q) * gain` on the same integers, minus a pass over
+    // the integer scratch. `fused[idx]` marks the bands done that way.
+    let fuse = pulse.is_none();
+    let mut fused = [false; 128];
+    let pow43 = crate::dsp::pow43_table();
+    let small = super::spectral::SmallPow43::get();
     let mut wbase = 0usize;
     for g in 0..info.num_window_groups {
         let glen = info.window_group_length[g] as usize;
@@ -574,6 +582,25 @@ pub fn decode_ics(
             crate::prof::bump(crate::prof::Counter::CodedCoeffs, glen * (e - s));
             // Whole tuples only (band widths are multiples of 4 in every table).
             let n = (e - s) / dim * dim;
+            if fuse && n == e - s {
+                let idx = g * max_sfb + sfb;
+                fused[idx] = true;
+                let gain = crate::dsp::sf_gain(cd.sfo[idx]);
+                for w in 0..glen {
+                    let base = (wbase + w) * 128;
+                    let out = &mut cd.coeffs[base + s..base + e];
+                    if dim == 4 {
+                        super::spectral::decode_run_dequant::<4>(
+                            cb, fb, r, out, gain, small, pow43,
+                        )?;
+                    } else {
+                        super::spectral::decode_run_dequant::<2>(
+                            cb, fb, r, out, gain, small, pow43,
+                        )?;
+                    }
+                }
+                continue;
+            }
             for w in 0..glen {
                 let base = (wbase + w) * 128;
                 let out = &mut quant[base + s..base + s + n];
@@ -610,7 +637,6 @@ pub fn decode_ics(
     // Dequantisation; PNS bands from the reference generator.
     drop(prof_spec); // the stages must not nest, or shares double-count
     let _prof = crate::prof::scope(crate::prof::Stage::DecDequant);
-    let pow43 = crate::dsp::pow43_table();
     // Every coefficient gets exactly one write: coded bands are dequantised or
     // noise-filled below, and only the uncoded spans - zero / intensity bands
     // and each window's tail above swb[max_sfb] - are zeroed. (Zeroing all
@@ -663,6 +689,9 @@ pub fn decode_ics(
                         *v *= scale;
                     }
                 }
+                continue;
+            }
+            if fused[idx] {
                 continue;
             }
             let gain = crate::dsp::sf_gain(cd.sfo[idx]);
