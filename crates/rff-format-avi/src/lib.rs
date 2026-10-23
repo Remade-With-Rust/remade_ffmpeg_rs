@@ -17,16 +17,24 @@
 //! only up to `movi`, and each packet is read on demand, so memory is bounded
 //! by the header and the largest packet — never the file size.
 //!
-//! Status: **demuxer implemented** (reads headers and yields packets); the
-//! muxer is still scaffolded. Note: AVI carries codecs we don't decode yet
-//! (e.g. H.264), so a full transcode out of an AVI waits on those codec bodies
-//! — but probing and stream-copy remuxing work today.
+//! The muxer streams too when its output can seek (a local file): it writes
+//! the header with zero totals, each packet's chunk as it arrives, then
+//! `idx1`, and seeks back to patch the sizes and frame counts, keeping only
+//! the index (16 bytes a packet) in memory. Over a pipe it buffers `movi`
+//! until the trailer; both paths write the same bytes. Files are plain AVI
+//! 1.0 (no OpenDML), so the 32-bit sizes cannot describe a file past 4 GiB.
+//!
+//! Note: AVI carries codecs we don't decode yet (e.g. H.264), so a full
+//! transcode out of an AVI waits on those codec bodies — but probing and
+//! stream-copy remuxing work today.
 
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 
 use rff_core::{CodecId, Error, MediaType, Packet, PixelFormat, Rational, Result, SampleFormat};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
+use rff_format::{
+    Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, SeekOutput, Stream,
+};
 
 /// Register the AVI format into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {
@@ -46,6 +54,9 @@ pub fn register(registry: &mut FormatRegistry) {
             CodecId::Pcm,
         ]),
     });
+    // Files stream `movi` and patch the header's totals at the end (#28);
+    // pipes keep the buffered muxer above.
+    registry.register_seekable_muxer("avi", |output| Box::new(AviMuxer::new_seekable(output)));
 }
 
 /// Sniff AVI: a RIFF file whose form type is `AVI `.
@@ -562,22 +573,61 @@ fn chunk_id(stream_index: usize, suffix: &[u8; 2]) -> [u8; 4] {
 // Muxer
 // ===========================================================================
 
-/// Writes streams + packets as an AVI file. The sink only needs to be `Write`:
-/// everything is buffered and assembled in [`write_trailer`], because the AVI
-/// headers carry totals (frame counts, the index) only known once all packets
-/// are in.
+/// Where the `movi` data chunks go.
+enum Sink {
+    /// A pipe or socket: the header (written first) carries totals only known
+    /// at the end and cannot be patched in, so `movi` is held until the
+    /// trailer.
+    Buffered { out: Output, movi: Vec<u8> },
+    /// A seekable output (#28): the header goes out first with zero totals,
+    /// each packet's chunk streams straight through, and the trailer appends
+    /// `idx1`, then seeks back to `start` (where the header begins) to rewrite
+    /// the header with the real sizes and counts.
+    Seekable { out: SeekOutput, start: u64 },
+}
+
+/// Writes streams + packets as an AVI file:
+/// `RIFF AVI { LIST hdrl, LIST movi { ##dc / ##wb ... }, idx1 }`. The header
+/// carries totals (RIFF/`movi` sizes, frame counts) only known once all
+/// packets are in; both sinks write the same bytes, but only the seekable one
+/// streams -- it keeps just the `idx1` entries (16 bytes a packet) and a
+/// count per stream.
 struct AviMuxer {
-    out: Output,
+    sink: Sink,
     streams: Vec<Stream>,
-    packets: Vec<Packet>,
+    /// Each stream's `strf` body, built (and validated) at `write_header`.
+    strfs: Vec<Vec<u8>>,
+    /// Packets written per entry of `streams` (matched by `Stream::index`).
+    counts: Vec<u64>,
+    /// Bytes of data chunks in `movi` so far (headers, payloads, padding).
+    movi_len: u64,
+    /// The `idx1` entries so far.
+    idx1: Vec<u8>,
 }
 
 impl AviMuxer {
     fn new(output: Output) -> AviMuxer {
-        AviMuxer {
+        AviMuxer::with_sink(Sink::Buffered {
             out: output,
+            movi: Vec::new(),
+        })
+    }
+
+    fn new_seekable(output: SeekOutput) -> AviMuxer {
+        AviMuxer::with_sink(Sink::Seekable {
+            out: output,
+            start: 0,
+        })
+    }
+
+    fn with_sink(sink: Sink) -> AviMuxer {
+        AviMuxer {
+            sink,
             streams: Vec::new(),
-            packets: Vec::new(),
+            strfs: Vec::new(),
+            counts: Vec::new(),
+            movi_len: 0,
+            idx1: Vec::new(),
         }
     }
 
@@ -589,95 +639,6 @@ impl AviMuxer {
         }
     }
 
-    fn packet_count(&self, stream_index: usize) -> u32 {
-        self.packets
-            .iter()
-            .filter(|p| p.stream_index == stream_index)
-            .count() as u32
-    }
-}
-
-impl Muxer for AviMuxer {
-    fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
-        if streams.is_empty() {
-            return Err(Error::invalid("avi mux: no streams"));
-        }
-        self.streams = streams.to_vec();
-        Ok(())
-    }
-
-    fn write_packet(&mut self, packet: &Packet) -> Result<()> {
-        self.packets.push(packet.clone());
-        Ok(())
-    }
-
-    fn write_trailer(&mut self) -> Result<()> {
-        let primary_video = self
-            .streams
-            .iter()
-            .find(|s| s.media_type == MediaType::Video);
-        let (vw, vh) = primary_video.map_or((0, 0), |s| (s.width, s.height));
-        let micros_per_frame = primary_video.map_or(0, |s| {
-            let tb = s.time_base;
-            if tb.den != 0 && tb.num > 0 {
-                (tb.num as i64 * 1_000_000 / tb.den as i64) as u32
-            } else {
-                0
-            }
-        });
-        let total_frames = primary_video.map_or(0, |s| self.packet_count(s.index));
-
-        // --- hdrl: avih + one strl (strh + strf) per stream ---
-        let mut hdrl = Vec::new();
-        put_chunk(
-            &mut hdrl,
-            b"avih",
-            &self.avih(micros_per_frame, total_frames, vw, vh),
-        );
-        for s in &self.streams {
-            let length = self.packet_count(s.index);
-            let mut strl = Vec::new();
-            put_chunk(&mut strl, b"strh", &strh(s, length));
-            put_chunk(&mut strl, b"strf", &strf(s)?);
-            put_list(&mut hdrl, b"strl", &strl);
-        }
-
-        // --- movi: data chunks, recording index entries as we go ---
-        let mut movi = Vec::new();
-        let mut idx1 = Vec::new();
-        for p in &self.packets {
-            let id = chunk_id(p.stream_index, &self.suffix_for(p.stream_index));
-            // idx1 offsets are relative to the `movi` 4cc; the first chunk
-            // sits 4 bytes past it.
-            let offset = 4 + movi.len();
-            put_chunk(&mut movi, &id, &p.data);
-
-            let flags: u32 = if p.is_keyframe() { 0x10 } else { 0 }; // AVIIF_KEYFRAME
-            idx1.extend_from_slice(&id);
-            idx1.extend_from_slice(&flags.to_le_bytes());
-            idx1.extend_from_slice(&(offset as u32).to_le_bytes());
-            idx1.extend_from_slice(&(p.data.len() as u32).to_le_bytes());
-        }
-
-        // --- assemble RIFF "AVI " ---
-        let mut body = Vec::new();
-        body.extend_from_slice(b"AVI ");
-        put_list(&mut body, b"hdrl", &hdrl);
-        put_list(&mut body, b"movi", &movi);
-        put_chunk(&mut body, b"idx1", &idx1);
-
-        let mut file = Vec::with_capacity(body.len() + 8);
-        file.extend_from_slice(b"RIFF");
-        file.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        file.extend_from_slice(&body);
-
-        self.out.write_all(&file)?;
-        self.out.flush()?;
-        Ok(())
-    }
-}
-
-impl AviMuxer {
     /// MainAVIHeader (56 bytes).
     fn avih(&self, micros_per_frame: u32, total_frames: u32, width: u32, height: u32) -> Vec<u8> {
         let mut a = vec![0u8; 56];
@@ -688,6 +649,147 @@ impl AviMuxer {
         put_u32(&mut a, 32, width);
         put_u32(&mut a, 36, height);
         a
+    }
+
+    /// Everything before the first data chunk -- `RIFF` size `AVI `, `LIST
+    /// hdrl`, and the `LIST movi` header -- for the packets written so far.
+    /// Its length depends only on the streams, so the seekable path can
+    /// overwrite the zero-totals copy it wrote first in place. The 32-bit
+    /// sizes and counts wrap past 4 GiB, as they always have (no OpenDML).
+    fn header(&self) -> Vec<u8> {
+        let primary_video = self
+            .streams
+            .iter()
+            .position(|s| s.media_type == MediaType::Video);
+        let (vw, vh, micros_per_frame, total_frames) = match primary_video {
+            Some(i) => {
+                let s = &self.streams[i];
+                let tb = s.time_base;
+                let micros = if tb.den != 0 && tb.num > 0 {
+                    (tb.num as i64 * 1_000_000 / tb.den as i64) as u32
+                } else {
+                    0
+                };
+                (s.width, s.height, micros, self.counts[i] as u32)
+            }
+            None => (0, 0, 0, 0),
+        };
+
+        // --- hdrl: avih + one strl (strh + strf) per stream ---
+        let mut hdrl = Vec::new();
+        put_chunk(
+            &mut hdrl,
+            b"avih",
+            &self.avih(micros_per_frame, total_frames, vw, vh),
+        );
+        for ((s, strf), &count) in self.streams.iter().zip(&self.strfs).zip(&self.counts) {
+            let mut strl = Vec::new();
+            put_chunk(&mut strl, b"strh", &strh(s, count as u32));
+            put_chunk(&mut strl, b"strf", strf);
+            put_list(&mut hdrl, b"strl", &strl);
+        }
+
+        let mut h = Vec::new();
+        h.extend_from_slice(b"RIFF");
+        h.extend_from_slice(&[0; 4]); // RIFF size, below
+        h.extend_from_slice(b"AVI ");
+        put_list(&mut h, b"hdrl", &hdrl);
+        // `LIST movi`: the data chunks are each padded to even, so the list
+        // needs no pad byte of its own.
+        h.extend_from_slice(b"LIST");
+        h.extend_from_slice(&((4 + self.movi_len) as u32).to_le_bytes());
+        h.extend_from_slice(b"movi");
+        // The RIFF body runs to the end of `idx1`.
+        let riff = (h.len() - 8) as u64 + self.movi_len + 8 + self.idx1.len() as u64;
+        put_u32(&mut h, 4, riff as u32);
+        h
+    }
+
+    /// The `idx1` chunk header.
+    fn idx1_header(&self) -> [u8; 8] {
+        let mut h = *b"idx1\0\0\0\0";
+        put_u32(&mut h, 4, self.idx1.len() as u32);
+        h
+    }
+}
+
+impl Muxer for AviMuxer {
+    fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
+        if streams.is_empty() {
+            return Err(Error::invalid("avi mux: no streams"));
+        }
+        self.strfs = streams.iter().map(strf).collect::<Result<_>>()?;
+        self.streams = streams.to_vec();
+        self.counts = vec![0; streams.len()];
+        let header = self.header();
+        if let Sink::Seekable { out, start } = &mut self.sink {
+            *start = out.stream_position()?;
+            out.write_all(&header)?;
+        }
+        Ok(())
+    }
+
+    fn write_packet(&mut self, packet: &Packet) -> Result<()> {
+        let stream_index = packet.stream_index;
+        let id = chunk_id(stream_index, &self.suffix_for(stream_index));
+        let data = &packet.data;
+        let len = data.len() as u32;
+        let pad: &[u8] = if data.len() % 2 == 1 { &[0] } else { &[] };
+        let mut head = [0u8; 8];
+        head[..4].copy_from_slice(&id);
+        put_u32(&mut head, 4, len);
+        match &mut self.sink {
+            Sink::Buffered { movi, .. } => {
+                movi.extend_from_slice(&head);
+                movi.extend_from_slice(data);
+                movi.extend_from_slice(pad);
+            }
+            Sink::Seekable { out, .. } => {
+                out.write_all(&head)?;
+                out.write_all(data)?;
+                out.write_all(pad)?;
+            }
+        }
+
+        // idx1 offsets are relative to the `movi` 4cc; the first chunk sits
+        // 4 bytes past it.
+        let offset = (4 + self.movi_len) as u32;
+        let flags: u32 = if packet.is_keyframe() { 0x10 } else { 0 }; // AVIIF_KEYFRAME
+        self.idx1.extend_from_slice(&id);
+        self.idx1.extend_from_slice(&flags.to_le_bytes());
+        self.idx1.extend_from_slice(&offset.to_le_bytes());
+        self.idx1.extend_from_slice(&len.to_le_bytes());
+        self.movi_len += (head.len() + data.len() + pad.len()) as u64;
+        for (s, count) in self.streams.iter().zip(&mut self.counts) {
+            if s.index == stream_index {
+                *count += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_trailer(&mut self) -> Result<()> {
+        let header = self.header();
+        let idx1_header = self.idx1_header();
+        match &mut self.sink {
+            Sink::Buffered { out, movi } => {
+                out.write_all(&header)?;
+                out.write_all(movi)?;
+                out.write_all(&idx1_header)?;
+                out.write_all(&self.idx1)?;
+                out.flush()?;
+            }
+            Sink::Seekable { out, start } => {
+                out.write_all(&idx1_header)?;
+                out.write_all(&self.idx1)?;
+                let end = out.stream_position()?;
+                out.seek(SeekFrom::Start(*start))?;
+                out.write_all(&header)?;
+                out.seek(SeekFrom::Start(end))?;
+                out.flush()?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -769,6 +871,8 @@ fn strf(s: &Stream) -> Result<Vec<u8>> {
     }
 }
 
+#[cfg(test)]
+mod mux_tests;
 #[cfg(test)]
 mod stream_tests;
 
