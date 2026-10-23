@@ -98,6 +98,19 @@ pub type SeekInput = Box<dyn ReadSeek + Send>;
 /// A byte sink a muxer writes to.
 pub type Output = Box<dyn Write + Send>;
 
+/// A byte sink that can also seek -- a local file, an in-memory buffer; not a
+/// pipe or socket. Blanket-implemented for every `Write + Seek` type.
+pub trait WriteSeek: Write + Seek {}
+impl<T: Write + Seek> WriteSeek for T {}
+
+/// A seekable [`Output`]. Containers whose header records sizes or an index
+/// that is only known at the end (MP4 `mdat`/`moov`, Matroska Segment/Cues,
+/// AVI `movi`/`idx1`, WAV `RIFF`/`data`) use it to stream the payload as it
+/// arrives and patch the header afterwards, instead of holding the whole
+/// output in memory until the trailer (#28). It upcasts to [`Output`] for
+/// muxers that only stream.
+pub type SeekOutput = Box<dyn WriteSeek + Send>;
+
 /// Reads a container format: parses the header into [`Stream`]s, then yields
 /// [`Packet`]s until the input is exhausted.
 pub trait Demuxer: Send {
@@ -132,6 +145,9 @@ pub type DemuxerFactory = fn(Input) -> Box<dyn Demuxer>;
 pub type SeekableDemuxerFactory = fn(SeekInput) -> Box<dyn Demuxer>;
 /// Factory opening a muxer over an output byte sink.
 pub type MuxerFactory = fn(Output) -> Box<dyn Muxer>;
+/// Factory opening a muxer over a [`SeekOutput`] -- registered alongside the
+/// format's [`MuxerFactory`] by formats that can stream when they can seek.
+pub type SeekableMuxerFactory = fn(SeekOutput) -> Box<dyn Muxer>;
 /// Factory opening a muxer that owns its own file set (HLS/DASH write a
 /// playlist/manifest plus many segment files, so a single byte sink cannot
 /// model them). Receives the output path and the format options
@@ -250,6 +266,9 @@ pub struct FormatRegistry {
     /// Seek-aware demuxer factories, keyed by format name (see
     /// [`register_seekable_demuxer`](Self::register_seekable_demuxer)).
     seekable: HashMap<&'static str, SeekableDemuxerFactory>,
+    /// Seek-aware muxer factories, keyed by format name (see
+    /// [`register_seekable_muxer`](Self::register_seekable_muxer)).
+    seekable_muxers: HashMap<&'static str, SeekableMuxerFactory>,
 }
 
 impl FormatRegistry {
@@ -319,6 +338,28 @@ impl FormatRegistry {
         match self.seekable.get(name) {
             Some(factory) => Ok(factory(input)),
             None => self.open_demuxer(name, input),
+        }
+    }
+
+    /// Give the format named `name` a muxer that takes a [`SeekOutput`]. Used
+    /// by [`open_muxer_seekable`](Self::open_muxer_seekable) when the caller
+    /// writes to something seekable; the plain [`Format::muxer`] still serves
+    /// pipes and sockets.
+    pub fn register_seekable_muxer(&mut self, name: &'static str, factory: SeekableMuxerFactory) {
+        self.seekable_muxers.insert(name, factory);
+    }
+
+    /// Open a muxer over a seekable output: the format's seek-aware muxer if it
+    /// registered one, otherwise its plain muxer (a seekable sink is still a
+    /// byte sink). Callers writing a file should prefer this -- it is what lets
+    /// MP4/Matroska/AVI/WAV stream instead of buffering the whole output.
+    pub fn open_muxer_seekable(&self, name: &str, output: SeekOutput) -> Result<Box<dyn Muxer>> {
+        if !self.by_name.get(name).is_some_and(|f| f.muxer.is_some()) {
+            return Err(Error::MuxerNotFound(name.to_string()));
+        }
+        match self.seekable_muxers.get(name) {
+            Some(factory) => Ok(factory(output)),
+            None => self.open_muxer(name, output),
         }
     }
 
@@ -404,6 +445,51 @@ mod tests {
         assert!(matches!(
             r.open_demuxer_seekable("missing", input()),
             Err(Error::DemuxerNotFound(_))
+        ));
+    }
+
+    /// Reports which factory built it through the error `write_trailer` returns.
+    struct TaggedMux(&'static str);
+    impl Muxer for TaggedMux {
+        fn write_header(&mut self, _: &[Stream]) -> Result<()> {
+            Ok(())
+        }
+        fn write_packet(&mut self, _: &rff_core::Packet) -> Result<()> {
+            Ok(())
+        }
+        fn write_trailer(&mut self) -> Result<()> {
+            Err(Error::invalid(self.0))
+        }
+    }
+
+    fn tag(mut m: Box<dyn Muxer>) -> String {
+        m.write_trailer().unwrap_err().to_string()
+    }
+
+    #[test]
+    fn seekable_muxer_open_prefers_the_seekable_factory_and_falls_back() {
+        let mut r = FormatRegistry::new();
+        let with_muxer = |name| Format {
+            muxer: Some(|_| Box::new(TaggedMux("plain"))),
+            ..format(name)
+        };
+        r.register(with_muxer("plain"));
+        r.register(with_muxer("seeky"));
+        r.register(format("demux_only"));
+        r.register_seekable_muxer("seeky", |_| Box::new(TaggedMux("seekable")));
+        let output = || -> SeekOutput { Box::new(Cursor::new(Vec::new())) };
+        assert!(tag(r.open_muxer_seekable("seeky", output()).unwrap()).contains("seekable"));
+        // No seekable factory: the plain one serves the seekable output.
+        assert!(tag(r.open_muxer_seekable("plain", output()).unwrap()).contains("plain"));
+        // A plain open never takes the seekable path.
+        assert!(tag(r.open_muxer("seeky", Box::new(Vec::new())).unwrap()).contains("plain"));
+        assert!(matches!(
+            r.open_muxer_seekable("demux_only", output()),
+            Err(Error::MuxerNotFound(_))
+        ));
+        assert!(matches!(
+            r.open_muxer_seekable("missing", output()),
+            Err(Error::MuxerNotFound(_))
         ));
     }
 }

@@ -998,9 +998,17 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     }
     let mut muxer: Box<dyn Muxer> = match muxer_path_factory {
         Some(factory) => factory(&output.path, &output.format_options)?,
-        None => engine
-            .formats
-            .open_muxer(&out_format, rff_io::create(out_path_str)?)?,
+        // A local file is seekable: muxers that can stream and patch their
+        // header afterwards take that path (#28); pipes and network sinks
+        // keep the plain one.
+        None => match rff_io::create_seekable(out_path_str)? {
+            Some(file) => engine
+                .formats
+                .open_muxer_seekable(&out_format, Box::new(file))?,
+            None => engine
+                .formats
+                .open_muxer(&out_format, rff_io::create(out_path_str)?)?,
+        },
     };
     if !output.metadata.is_empty() {
         muxer.set_metadata(&output.metadata);
