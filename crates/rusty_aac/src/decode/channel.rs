@@ -16,7 +16,7 @@ use crate::codebook::{CODEBOOKS, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, ZERO_
 use crate::config::aot;
 use crate::ics::{IcsInfo, WindowSequence};
 use crate::swb::swb_offsets;
-use crate::tables::{spectral_book, SCALEFACTOR_BOOK};
+use crate::tables::SCALEFACTOR_BOOK;
 use crate::tables_ext::{
     AAC_PRED_SFB_MAX, SWB_OFFSET_120, SWB_OFFSET_480, SWB_OFFSET_512, SWB_OFFSET_960,
     TNS_MAX_BANDS_480, TNS_MAX_BANDS_512,
@@ -557,7 +557,6 @@ pub fn decode_ics(
     let mut quant = std::mem::take(&mut cd.quant);
     quant.resize(1024, 0);
     let mut wbase = 0usize;
-    let mut tuple = [0i32; 4];
     for g in 0..info.num_window_groups {
         let glen = info.window_group_length[g] as usize;
         for sfb in 0..max_sfb {
@@ -569,22 +568,19 @@ pub fn decode_ics(
             let meta = CODEBOOKS
                 .get(cb as usize)
                 .ok_or_else(|| Error::invalid("aac: bad spectral codebook"))?;
-            let book = spectral_book(cb);
-            let tab = crate::codebook::tuple_table(cb);
+            let fb = super::spectral::fast_book(cb);
             let dim = meta.dim as usize;
             crate::prof::bump(crate::prof::Counter::Codewords, glen * (e - s) / dim);
             crate::prof::bump(crate::prof::Counter::CodedCoeffs, glen * (e - s));
+            // Whole tuples only (band widths are multiples of 4 in every table).
+            let n = (e - s) / dim * dim;
             for w in 0..glen {
                 let base = (wbase + w) * 128;
-                let mut i = s;
-                while i + dim <= e {
-                    let t = tab[book.decode(r)? as usize];
-                    for (o, &v) in tuple.iter_mut().zip(&t) {
-                        *o = i32::from(v);
-                    }
-                    crate::codebook::finish_tuple(meta, r, &mut tuple)?;
-                    quant[base + i..base + i + dim].copy_from_slice(&tuple[..dim]);
-                    i += dim;
+                let out = &mut quant[base + s..base + s + n];
+                if dim == 4 {
+                    super::spectral::decode_run::<4>(cb, fb, r, out)?;
+                } else {
+                    super::spectral::decode_run::<2>(cb, fb, r, out)?;
                 }
             }
         }

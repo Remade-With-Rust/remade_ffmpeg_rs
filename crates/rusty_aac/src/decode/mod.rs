@@ -16,6 +16,7 @@
 
 pub(crate) mod channel;
 pub mod layout;
+pub(crate) mod spectral;
 pub(crate) mod synth;
 pub(crate) mod tools;
 

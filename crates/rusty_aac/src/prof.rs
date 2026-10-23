@@ -85,10 +85,12 @@ pub enum Counter {
     PnsCoeffs,
     ZeroCoeffs,
     TnsChannels,
+    SlowTuples,
+    EscTuples,
 }
 
 /// Counter names, indexed by [`Counter`].
-pub const COUNTERS: [&str; 7] = [
+pub const COUNTERS: [&str; 9] = [
     "channel frames",
     "eight-short channel frames",
     "spectral codewords",
@@ -96,6 +98,8 @@ pub const COUNTERS: [&str; 7] = [
     "pns noise coeffs",
     "zero/intensity coeffs",
     "tns-active channel frames",
+    "spectral tuples via generic path",
+    "book-11 tuples with escapes",
 ];
 
 #[cfg(feature = "profile")]
