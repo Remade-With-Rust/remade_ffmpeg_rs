@@ -8,8 +8,8 @@
 //! file costs memory proportional to its headers. `read_packet` then walks the
 //! Clusters incrementally — known- or unknown-size — turning each
 //! (Simple)Block into a [`Packet`]; peak memory is one block, not the file.
-//! The muxer (in [`mux`]) writes the inverse: SeekHead + Info + Tracks +
-//! Clusters + Cues.
+//! The muxers (in [`mux`]) write the inverse: SeekHead + Info + Tracks +
+//! Clusters + Cues -- streamed on a seekable output, buffered otherwise.
 
 mod mux;
 
@@ -19,7 +19,7 @@ use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result, SampleFormat
 use rff_format::avc::{avcc_to_annexb, parse_avcc, AvcConfig};
 use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Stream};
 
-pub use mux::MkvMuxer;
+pub use mux::{MkvMuxer, MkvStreamingMuxer};
 
 /// Register the Matroska and WebM formats (demux + mux). WebM is a separate
 /// registry entry so `out.webm` gets the restricted doctype and codec checks;
@@ -63,6 +63,12 @@ pub fn register(registry: &mut FormatRegistry) {
             CodecId::WebVtt,
         ]),
     });
+    // Seekable outputs (local files) stream; the plain factories above keep
+    // serving pipes and sockets with the in-memory layout.
+    registry.register_seekable_muxer("matroska", |out| {
+        Box::new(MkvStreamingMuxer::new(out, false))
+    });
+    registry.register_seekable_muxer("webm", |out| Box::new(MkvStreamingMuxer::new(out, true)));
 }
 
 /// The EBML magic (`\x1A\x45\xDF\xA3`) starts every Matroska/WebM file.
@@ -79,7 +85,7 @@ const ID_EBML_HEADER: u32 = 0x1A45_DFA3;
 const ID_SEGMENT: u32 = 0x1853_8067;
 const ID_SEEK_HEAD: u32 = 0x114D_9B74;
 const ID_INFO: u32 = 0x1549_A966;
-const ID_TIMESTAMP_SCALE: u32 = 0x2AD7_B1;
+const ID_TIMESTAMP_SCALE: u32 = 0x2AD7B1;
 const ID_DURATION: u32 = 0x4489;
 const ID_TRACKS: u32 = 0x1654_AE6B;
 const ID_TRACK_ENTRY: u32 = 0xAE;
@@ -806,6 +812,26 @@ impl Demuxer for MkvDemuxer {
             self.read_header()?;
         }
         self.next_packet()?.ok_or(Error::Eof)
+    }
+}
+
+fn map_codec(codec: &str) -> CodecId {
+    match codec {
+        "V_AV1" => CodecId::Avif, // our AV1 (rav1d) decoder
+        "V_VP9" => CodecId::Vp9,
+        "V_MPEG4/ISO/AVC" => CodecId::H264,
+        "V_MPEGH/ISO/HEVC" => CodecId::Hevc,
+        "A_OPUS" => CodecId::Opus,
+        "A_VORBIS" => CodecId::Vorbis,
+        "A_AAC" => CodecId::Aac,
+        "A_FLAC" => CodecId::Flac,
+        "A_MPEG/L3" => CodecId::Mp3,
+        "A_PCM/INT/LIT" | "A_PCM/FLOAT/IEEE" => CodecId::Pcm,
+        // ASS/SSA tracks are reduced to plain text at block level, so they
+        // surface as SubRip-contract cues.
+        "S_TEXT/UTF8" | "S_TEXT/ASS" | "S_TEXT/SSA" => CodecId::Subrip,
+        "S_TEXT/WEBVTT" => CodecId::WebVtt,
+        _ => CodecId::None,
     }
 }
 
@@ -1665,25 +1691,5 @@ mod tests {
             f.extend_from_slice(&g);
             bounded(f);
         }
-    }
-}
-
-fn map_codec(codec: &str) -> CodecId {
-    match codec {
-        "V_AV1" => CodecId::Avif, // our AV1 (rav1d) decoder
-        "V_VP9" => CodecId::Vp9,
-        "V_MPEG4/ISO/AVC" => CodecId::H264,
-        "V_MPEGH/ISO/HEVC" => CodecId::Hevc,
-        "A_OPUS" => CodecId::Opus,
-        "A_VORBIS" => CodecId::Vorbis,
-        "A_AAC" => CodecId::Aac,
-        "A_FLAC" => CodecId::Flac,
-        "A_MPEG/L3" => CodecId::Mp3,
-        "A_PCM/INT/LIT" | "A_PCM/FLOAT/IEEE" => CodecId::Pcm,
-        // ASS/SSA tracks are reduced to plain text at block level, so they
-        // surface as SubRip-contract cues.
-        "S_TEXT/UTF8" | "S_TEXT/ASS" | "S_TEXT/SSA" => CodecId::Subrip,
-        "S_TEXT/WEBVTT" => CodecId::WebVtt,
-        _ => CodecId::None,
     }
 }
