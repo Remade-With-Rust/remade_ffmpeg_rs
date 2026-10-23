@@ -1182,18 +1182,46 @@ impl Decoder {
         let _prof = crate::prof::scope(crate::prof::Stage::DecOutput);
         let n = self.output_len();
         let outs = &self.oc.outputs;
-        let mut samples = Vec::with_capacity(n * outs.len());
-        let chans: Vec<&[f32]> = outs
-            .iter()
-            .map(|&(ty, iid, sub)| {
-                self.elements[ty as usize][iid as usize]
-                    .as_ref()
-                    .map_or(&[][..], |e| &e.ch[sub as usize].output[..n])
-            })
-            .collect();
-        for i in 0..n {
-            for c in &chans {
-                samples.push(c.get(i).copied().unwrap_or(0.0));
+        let nch = outs.len();
+        // A missing element is silence: the zero fill stands for it.
+        let mut samples = vec![0f32; n * nch];
+        let chan = |&(ty, iid, sub): &(u8, u8, u8)| -> Option<&[f32]> {
+            self.elements[ty as usize][iid as usize]
+                .as_ref()
+                .map(|e| &e.ch[sub as usize].output[..n])
+        };
+        // Whole-slice interleaves (no per-sample push / capacity check), with
+        // the common layouts spelled out so they vectorise.
+        match outs.as_slice() {
+            [a] => {
+                if let Some(a) = chan(a) {
+                    samples.copy_from_slice(a);
+                }
+            }
+            [a, b] => {
+                if let (Some(a), Some(b)) = (chan(a), chan(b)) {
+                    for ((d, &l), &r) in samples.chunks_exact_mut(2).zip(a).zip(b) {
+                        d[0] = l;
+                        d[1] = r;
+                    }
+                } else {
+                    for (c, o) in outs.iter().enumerate() {
+                        if let Some(src) = chan(o) {
+                            for (d, &v) in samples[c..].iter_mut().step_by(nch).zip(src) {
+                                *d = v;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                for (c, o) in outs.iter().enumerate() {
+                    if let Some(src) = chan(o) {
+                        for (d, &v) in samples[c..].iter_mut().step_by(nch).zip(src) {
+                            *d = v;
+                        }
+                    }
+                }
             }
         }
         DecodedAudio {
