@@ -173,19 +173,83 @@ fn escapes(r: &mut BitReader, out: &mut [i32]) -> Result<()> {
     Ok(())
 }
 
+/// A 64-bit bit cache over the reader's bytes for one run of tuples: the next
+/// bits sit left-aligned in `buf`, so a table index is a shift of a register
+/// rather than a fresh unaligned load per codeword, and a reload happens only
+/// when fewer than [`FAST_BITS`] valid bits remain (every ~5-8 codewords).
+/// The generic path still runs on the `BitReader`: the position is handed
+/// over and taken back around it.
+struct Cache<'a> {
+    data: &'a [u8],
+    /// Bit position of `buf`'s first bit.
+    pos: usize,
+    buf: u64,
+    /// Valid (in-data or zero-padded) bits in `buf`.
+    valid: u32,
+    /// `8 * data.len()`: consuming past it is an error, as `BitReader::skip`.
+    limit: usize,
+}
+
+impl<'a> Cache<'a> {
+    #[inline(always)]
+    fn new(r: &BitReader<'a>) -> Self {
+        let data = r.data();
+        let pos = r.position();
+        let mut c = Self {
+            data,
+            pos,
+            buf: 0,
+            valid: 0,
+            limit: data.len() * 8,
+        };
+        c.load();
+        c
+    }
+
+    #[inline(always)]
+    fn load(&mut self) {
+        self.buf = BitReader::window_at(self.data, self.pos);
+        self.valid = 64 - (self.pos % 8) as u32;
+    }
+
+    #[inline(always)]
+    fn consume(&mut self, n: u32) -> Result<()> {
+        self.buf <<= n;
+        self.valid -= n;
+        self.pos += n as usize;
+        if self.pos > self.limit {
+            return Err(crate::Error::invalid("aac: skip past end of data"));
+        }
+        Ok(())
+    }
+
+    /// Hand the position to the generic reader, run `f`, take it back.
+    #[inline(always)]
+    fn via_reader<T>(&mut self, f: impl FnOnce(&mut BitReader<'a>) -> Result<T>) -> Result<T> {
+        let mut r = BitReader::new(self.data);
+        r.set_position(self.pos);
+        let out = f(&mut r)?;
+        self.pos = r.position();
+        self.load();
+        Ok(out)
+    }
+}
+
 /// One tuple through the fast table (or the generic path), as integers.
 #[inline(always)]
 fn tuple<const DIM: usize>(
     cbn: u8,
     cb: Codebook,
     lut: &[u32; 1 << FAST_BITS],
-    r: &mut BitReader,
+    c: &mut Cache<'_>,
 ) -> Result<[i32; DIM]> {
     let mut o = [0i32; DIM];
-    let w = r.peek_bits(FAST_BITS);
-    let e = lut[(w & ((1 << FAST_BITS) - 1)) as usize];
+    if c.valid < FAST_BITS {
+        c.load();
+    }
+    let e = lut[(c.buf >> (64 - FAST_BITS)) as usize];
     if e & KIND_MASK == KIND_FULL {
-        r.skip((e & 31) as usize)?;
+        c.consume(e & 31)?;
         if DIM == 4 {
             for (k, v) in o.iter_mut().enumerate() {
                 #[allow(clippy::cast_possible_wrap, reason = "nibble sign extension")]
@@ -199,11 +263,11 @@ fn tuple<const DIM: usize>(
                 *v = x;
             }
             if e & ESC != 0 {
-                escapes(r, &mut o)?;
+                c.via_reader(|r| escapes(r, &mut o))?;
             }
         }
     } else {
-        slow_tuple(cbn, cb, r, e, &mut o)?;
+        c.via_reader(|r| slow_tuple(cbn, cb, r, e, &mut o))?;
     }
     Ok(o)
 }
@@ -222,9 +286,11 @@ pub fn decode_run<const DIM: usize>(
 ) -> Result<()> {
     let cb = CODEBOOKS[cbn as usize];
     let lut = lut_of(fb);
+    let mut c = Cache::new(r);
     for o in out.chunks_exact_mut(DIM) {
-        o.copy_from_slice(&tuple::<DIM>(cbn, cb, lut, r)?);
+        o.copy_from_slice(&tuple::<DIM>(cbn, cb, lut, &mut c)?);
     }
+    r.set_position(c.pos);
     Ok(())
 }
 
@@ -274,12 +340,14 @@ pub fn decode_run_dequant<const DIM: usize>(
 ) -> Result<()> {
     let cb = CODEBOOKS[cbn as usize];
     let lut = lut_of(fb);
+    let mut c = Cache::new(r);
     for o in out.chunks_exact_mut(DIM) {
-        let t = tuple::<DIM>(cbn, cb, lut, r)?;
-        for (c, &q) in o.iter_mut().zip(&t) {
-            *c = small.dequant(pow43, q) * gain;
+        let t = tuple::<DIM>(cbn, cb, lut, &mut c)?;
+        for (x, &q) in o.iter_mut().zip(&t) {
+            *x = small.dequant(pow43, q) * gain;
         }
     }
+    r.set_position(c.pos);
     Ok(())
 }
 
