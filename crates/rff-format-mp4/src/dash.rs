@@ -56,12 +56,7 @@ impl Muxer for DashMuxer {
             // refusal, so `.mpd` and `.mp4` never disagree about what is legal.
             let fourcc = mp4_fourcc(s)?;
             self.tracks.push(DashTrack {
-                out: TrackOut {
-                    stream: s.clone(),
-                    fourcc,
-                    config: None,
-                    samples: Vec::new(),
-                },
+                out: TrackOut::new(s, fourcc),
                 timescale: pick_timescale(s),
                 samples: Vec::new(),
             });
@@ -116,8 +111,8 @@ impl Muxer for DashMuxer {
 
         for (id, track) in self.tracks.iter_mut().enumerate() {
             let ts = track.timescale.max(1);
-            let durations =
-                super::sample_durations(&track.samples, ts, track.out.stream.media_type);
+            let pts: Vec<Option<i64>> = track.samples.iter().map(|(_, _, p)| *p).collect();
+            let durations = super::sample_durations(&pts, ts, track.out.stream.media_type);
             let is_video = track.out.stream.media_type == MediaType::Video;
 
             // --- init segment ---
