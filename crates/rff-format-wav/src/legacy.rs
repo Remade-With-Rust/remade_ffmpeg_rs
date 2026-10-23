@@ -141,3 +141,89 @@ impl Demuxer for LegacyWavDemuxer {
         }
     }
 }
+
+/// The pre-#28 WAV muxer (every sample buffered, the file assembled in
+/// `write_trailer`), kept test-only as the byte-identity oracle for both
+/// muxer paths: the buffered one (pipes) and the streaming one (seekable
+/// outputs) must write exactly these bytes.
+pub(crate) struct LegacyWavMuxer {
+    out: rff_format::Output,
+    channels: u16,
+    sample_rate: u32,
+    format: SampleFormat,
+    data: Vec<u8>,
+}
+
+impl LegacyWavMuxer {
+    pub(crate) fn new(out: rff_format::Output) -> LegacyWavMuxer {
+        LegacyWavMuxer {
+            out,
+            channels: 0,
+            sample_rate: 0,
+            format: SampleFormat::S16,
+            data: Vec::new(),
+        }
+    }
+}
+
+impl rff_format::Muxer for LegacyWavMuxer {
+    fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
+        let s = streams
+            .first()
+            .filter(|s| s.codec_id == CodecId::Pcm)
+            .ok_or_else(|| Error::unsupported("wav mux: needs a single `pcm` stream"))?;
+        self.channels = s.channels.max(1);
+        self.sample_rate = s.sample_rate.max(1);
+        self.format = s
+            .sample_format
+            .ok_or_else(|| Error::invalid("wav mux: stream is missing a sample format"))?;
+        Ok(())
+    }
+
+    fn write_packet(&mut self, packet: &Packet) -> Result<()> {
+        self.data.extend_from_slice(&packet.data);
+        Ok(())
+    }
+
+    fn write_trailer(&mut self) -> Result<()> {
+        use std::io::Write;
+        let (tag, bits): (u16, u16) = match self.format {
+            SampleFormat::S16 => (1, 16),
+            SampleFormat::F32 => (3, 32),
+            other => {
+                return Err(Error::unsupported(format!(
+                    "wav mux: sample format `{}` (only s16/f32)",
+                    other.name()
+                )))
+            }
+        };
+        let block_align = self.channels * (bits / 8);
+        let byte_rate = self.sample_rate * block_align as u32;
+
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&tag.to_le_bytes());
+        fmt.extend_from_slice(&self.channels.to_le_bytes());
+        fmt.extend_from_slice(&self.sample_rate.to_le_bytes());
+        fmt.extend_from_slice(&byte_rate.to_le_bytes());
+        fmt.extend_from_slice(&block_align.to_le_bytes());
+        fmt.extend_from_slice(&bits.to_le_bytes());
+
+        let mut head = Vec::with_capacity(4 + 8 + fmt.len() + 8);
+        head.extend_from_slice(b"WAVE");
+        super::put_chunk(&mut head, b"fmt ", &fmt);
+        let pad = self.data.len() % 2;
+        let body_len = head.len() + 8 + self.data.len() + pad;
+        head.extend_from_slice(b"data");
+        head.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
+
+        self.out.write_all(b"RIFF")?;
+        self.out.write_all(&(body_len as u32).to_le_bytes())?;
+        self.out.write_all(&head)?;
+        self.out.write_all(&self.data)?;
+        if pad == 1 {
+            self.out.write_all(&[0])?;
+        }
+        self.out.flush()?;
+        Ok(())
+    }
+}
