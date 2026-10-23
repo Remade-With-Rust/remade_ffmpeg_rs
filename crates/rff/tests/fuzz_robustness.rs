@@ -198,6 +198,9 @@ fn report(findings: Vec<Finding>) {
             f.target, f.seed, f.hex
         );
     }
+    // The capture hook installed above also swallows this panic's message, so print
+    // the findings first or the failure shows nothing.
+    eprintln!("{msg}");
     panic!("{msg}");
 }
 

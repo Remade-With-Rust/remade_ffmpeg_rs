@@ -571,7 +571,9 @@ fn child_boxes(buf: &[u8]) -> Vec<([u8; 4], &[u8])> {
         } else {
             (i + 8, i + size32)
         };
-        if box_end > buf.len() || box_end <= i {
+        // A size below the header's own (2-7, or a 64-bit size under 16) ends the box
+        // before its payload starts: stop there, as FFmpeg's mov_read_default does.
+        if box_end > buf.len() || box_end < payload_start {
             break;
         }
         out.push((typ, &buf[payload_start..box_end]));
@@ -747,6 +749,30 @@ mod tests {
             payload.extend_from_slice(*c);
         }
         bx(b"ftyp", &payload)
+    }
+
+    #[test]
+    fn a_box_smaller_than_its_header_ends_the_walk() {
+        let free = [0, 0, 0, 8, b'f', b'r', b'e', b'e'];
+        for size in 2u32..8 {
+            let buf = [&size.to_be_bytes()[..], b"meta", &free].concat();
+            assert!(child_boxes(&buf).is_empty(), "size {size}");
+        }
+        for large in [2u64, 8, 15] {
+            let buf = [
+                &1u32.to_be_bytes()[..],
+                b"meta",
+                &large.to_be_bytes(),
+                &free,
+            ]
+            .concat();
+            assert!(child_boxes(&buf).is_empty(), "largesize {large}");
+        }
+        // Through the demuxer: an error, not a panic.
+        let ftyp = [&[0, 0, 0, 16][..], b"ftypavif", &[0, 0, 0, 0]].concat();
+        let buf = [&ftyp[..], &[0, 0, 0, 7], b"meta", &[0; 16]].concat();
+        let mut dem = AvifDemuxer::new(Box::new(Cursor::new(buf)));
+        assert!(dem.read_header().is_err());
     }
 
     #[test]
