@@ -4,7 +4,6 @@
 //! layered on these; HLS-fMP4 could be too.
 
 use rff_core::MediaType;
-use rff_format::Stream;
 
 use super::{bx, fbx, pu32, TrackOut};
 
@@ -22,7 +21,7 @@ pub(crate) fn init_segment(track: &TrackOut, track_id: u32, timescale: u32) -> V
     let ftyp = bx(b"ftyp", b"iso6\x00\x00\x02\x00iso6dashcmfc");
 
     // trak with empty stbl tables (fragments carry all samples).
-    let trak = super::build_trak(track, track_id, timescale, &[], 0, 0, &[], &[]);
+    let trak = super::build_trak(track, track_id, timescale, &[], 0, 0);
 
     let mut moov_body = super::build_mvhd(1000, 0, track_id + 1);
     moov_body.extend_from_slice(&trak);
@@ -120,7 +119,6 @@ pub fn media_segment(
 
 /// The RFC 6381 `codecs=` string for a track, used by the DASH manifest.
 pub(crate) fn codec_string(track: &TrackOut) -> String {
-    let s: &Stream = &track.stream;
     match &track.fourcc {
         b"avc1" => {
             // avc1.PPCCLL from the avcC record (profile, compat, level).
