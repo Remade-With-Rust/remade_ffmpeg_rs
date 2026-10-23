@@ -108,6 +108,19 @@ pub fn open(path: &str) -> Result<Box<dyn Read + Send>> {
 ///    7×188 MPEG-TS convention).
 /// * `rtmp://host/app/key` → an RTMP publish session (feed it FLV: `-f flv`).
 /// * anything else → a local file (created/truncated).
+/// Open `path` for writing as a seekable, buffered file, or `None` when it is
+/// not a local file (stdout pipe, `udp://`, `rtmp://`) -- callers then fall
+/// back to [`create`]. Muxers that patch headers after streaming the payload
+/// need the seek; the buffer keeps their many small writes off the syscall
+/// path (`BufWriter` flushes before every seek).
+pub fn create_seekable(path: &str) -> Result<Option<std::io::BufWriter<std::fs::File>>> {
+    if is_pipe(path) || is_udp(path) || is_rtmp(path) {
+        return Ok(None);
+    }
+    let file = std::fs::File::create(path)?;
+    Ok(Some(std::io::BufWriter::with_capacity(1 << 20, file)))
+}
+
 pub fn create(path: &str) -> Result<Box<dyn Write + Send>> {
     if is_pipe(path) {
         Ok(Box::new(std::io::stdout()))

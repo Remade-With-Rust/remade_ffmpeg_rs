@@ -7,10 +7,12 @@
 //! The codec parameters (sample rate, channels, sample format) ride on the
 //! [`Stream`].
 
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 
 use rff_core::{CodecId, Error, Packet, Rational, Result, SampleFormat};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
+use rff_format::{
+    Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, SeekOutput, Stream,
+};
 
 /// Register the WAV format into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {
@@ -24,6 +26,9 @@ pub fn register(registry: &mut FormatRegistry) {
         probe: Some(probe_wav),
         mux_caps: MuxCaps::single(&[CodecId::Pcm]),
     });
+    // Files stream the samples and patch the header's sizes at the end (#28);
+    // pipes keep the buffered muxer above.
+    registry.register_seekable_muxer("wav", |output| Box::new(WavMuxer::new_seekable(output)));
 }
 
 /// Sniff WAV: a RIFF file whose form type is `WAVE`.
@@ -362,23 +367,91 @@ impl Demuxer for WavDemuxer {
 // Muxer
 // ---------------------------------------------------------------------------
 
+/// Bytes before the samples: `RIFF` + size + `WAVE`, a 16-byte `fmt ` chunk,
+/// and the `data` chunk header.
+const HEADER_LEN: usize = 44;
+
+/// A RIFF size field. Sizes past 4 GiB cannot be stated in 32 bits, so they
+/// are written as 0xFFFFFFFF -- the "length unknown" marker FFmpeg's reader
+/// and ours take as "to the end of the file" -- rather than modulo 2^32,
+/// which made readers stop early and drop the rest of the audio.
+fn size32(n: u64) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Where the samples go.
+enum Sink {
+    /// A pipe or socket: the header's sizes are only known at the end and
+    /// cannot be patched in, so the samples are held until the trailer.
+    Buffered { out: Output, data: Vec<u8> },
+    /// A seekable output (#28): the header goes out first with zero sizes,
+    /// the samples stream straight through, and the trailer seeks back to
+    /// `start` (where the header begins) to rewrite it with the real sizes.
+    Seekable { out: SeekOutput, start: u64 },
+}
+
+/// WAV muxer. Both sinks write the same bytes; only the seekable one runs in
+/// constant memory.
 struct WavMuxer {
-    out: Output,
+    sink: Sink,
     channels: u16,
     sample_rate: u32,
-    format: SampleFormat,
-    data: Vec<u8>,
+    /// WAVE format tag and bits per sample: `(1, 16)` s16, `(3, 32)` f32.
+    tag: u16,
+    bits: u16,
+    /// Sample bytes written so far.
+    data_len: u64,
 }
 
 impl WavMuxer {
     fn new(out: Output) -> WavMuxer {
-        WavMuxer {
+        WavMuxer::with_sink(Sink::Buffered {
             out,
+            data: Vec::new(),
+        })
+    }
+
+    fn new_seekable(out: SeekOutput) -> WavMuxer {
+        WavMuxer::with_sink(Sink::Seekable { out, start: 0 })
+    }
+
+    fn with_sink(sink: Sink) -> WavMuxer {
+        WavMuxer {
+            sink,
             channels: 0,
             sample_rate: 0,
-            format: SampleFormat::S16,
-            data: Vec::new(),
+            tag: 1,
+            bits: 16,
+            data_len: 0,
         }
+    }
+
+    /// The header for `data_len` sample bytes (the `data` chunk, and so the
+    /// RIFF body, is padded to an even length).
+    fn header(&self) -> [u8; HEADER_LEN] {
+        let block_align = self.channels.wrapping_mul(self.bits / 8);
+        let byte_rate = self.sample_rate.wrapping_mul(block_align as u32);
+        let pad = self.data_len % 2;
+        let mut h = [0u8; HEADER_LEN];
+        let mut at = 0;
+        let mut put = |bytes: &[u8]| {
+            h[at..at + bytes.len()].copy_from_slice(bytes);
+            at += bytes.len();
+        };
+        put(b"RIFF");
+        put(&size32(HEADER_LEN as u64 - 8 + self.data_len + pad).to_le_bytes());
+        put(b"WAVE");
+        put(b"fmt ");
+        put(&16u32.to_le_bytes());
+        put(&self.tag.to_le_bytes());
+        put(&self.channels.to_le_bytes());
+        put(&self.sample_rate.to_le_bytes());
+        put(&byte_rate.to_le_bytes());
+        put(&block_align.to_le_bytes());
+        put(&self.bits.to_le_bytes());
+        put(b"data");
+        put(&size32(self.data_len).to_le_bytes());
+        h
     }
 }
 
@@ -388,21 +461,10 @@ impl Muxer for WavMuxer {
             .first()
             .filter(|s| s.codec_id == CodecId::Pcm)
             .ok_or_else(|| Error::unsupported("wav mux: needs a single `pcm` stream"))?;
-        self.channels = s.channels.max(1);
-        self.sample_rate = s.sample_rate.max(1);
-        self.format = s
+        let format = s
             .sample_format
             .ok_or_else(|| Error::invalid("wav mux: stream is missing a sample format"))?;
-        Ok(())
-    }
-
-    fn write_packet(&mut self, packet: &Packet) -> Result<()> {
-        self.data.extend_from_slice(&packet.data);
-        Ok(())
-    }
-
-    fn write_trailer(&mut self) -> Result<()> {
-        let (tag, bits): (u16, u16) = match self.format {
+        (self.tag, self.bits) = match format {
             SampleFormat::S16 => (1, 16),
             SampleFormat::F32 => (3, 32),
             other => {
@@ -412,42 +474,49 @@ impl Muxer for WavMuxer {
                 )))
             }
         };
-        let block_align = self.channels * (bits / 8);
-        let byte_rate = self.sample_rate * block_align as u32;
-
-        let mut fmt = Vec::new();
-        fmt.extend_from_slice(&tag.to_le_bytes());
-        fmt.extend_from_slice(&self.channels.to_le_bytes());
-        fmt.extend_from_slice(&self.sample_rate.to_le_bytes());
-        fmt.extend_from_slice(&byte_rate.to_le_bytes());
-        fmt.extend_from_slice(&block_align.to_le_bytes());
-        fmt.extend_from_slice(&bits.to_le_bytes());
-
-        // Everything up to the sample bytes is a few dozen bytes: build that,
-        // then write the buffered samples straight from `self.data`. The trailer
-        // used to assemble the whole file into a second `Vec` first -- a copy of
-        // every sample (72 MB on a 7-minute stereo track) just to call one
-        // `write_all`. Same bytes, same order.
-        let mut head = Vec::with_capacity(4 + 8 + fmt.len() + 8);
-        head.extend_from_slice(b"WAVE");
-        put_chunk(&mut head, b"fmt ", &fmt);
-        let pad = self.data.len() % 2;
-        let body_len = head.len() + 8 + self.data.len() + pad;
-        head.extend_from_slice(b"data");
-        head.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
-
-        self.out.write_all(b"RIFF")?;
-        self.out.write_all(&(body_len as u32).to_le_bytes())?;
-        self.out.write_all(&head)?;
-        self.out.write_all(&self.data)?;
-        if pad == 1 {
-            self.out.write_all(&[0])?;
+        self.channels = s.channels.max(1);
+        self.sample_rate = s.sample_rate.max(1);
+        let header = self.header();
+        if let Sink::Seekable { out, start } = &mut self.sink {
+            *start = out.stream_position()?;
+            out.write_all(&header)?;
         }
-        self.out.flush()?;
+        Ok(())
+    }
+
+    fn write_packet(&mut self, packet: &Packet) -> Result<()> {
+        match &mut self.sink {
+            Sink::Buffered { data, .. } => data.extend_from_slice(&packet.data),
+            Sink::Seekable { out, .. } => out.write_all(&packet.data)?,
+        }
+        self.data_len += packet.data.len() as u64;
+        Ok(())
+    }
+
+    fn write_trailer(&mut self) -> Result<()> {
+        let header = self.header();
+        let pad: &[u8] = if self.data_len % 2 == 1 { &[0] } else { &[] };
+        match &mut self.sink {
+            Sink::Buffered { out, data } => {
+                out.write_all(&header)?;
+                out.write_all(data)?;
+                out.write_all(pad)?;
+                out.flush()?;
+            }
+            Sink::Seekable { out, start } => {
+                out.write_all(pad)?;
+                let end = out.stream_position()?;
+                out.seek(SeekFrom::Start(*start))?;
+                out.write_all(&header)?;
+                out.seek(SeekFrom::Start(end))?;
+                out.flush()?;
+            }
+        }
         Ok(())
     }
 }
 
+#[cfg(test)]
 fn put_chunk(out: &mut Vec<u8>, id: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(id);
     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -1032,5 +1101,219 @@ mod tests {
         // Reading packets before the header is just end-of-stream.
         let mut dem = WavDemuxer::new(Box::new(Cursor::new(good)));
         assert!(matches!(dem.read_packet(), Err(Error::Eof)));
+    }
+
+    // ---- streaming mux (issue #28): byte identity, sizes past 4 GiB ----
+
+    use std::collections::BTreeMap;
+    use std::io::{Seek, SeekFrom};
+
+    /// A seekable `Cursor<Vec<u8>>` sink whose bytes outlive the muxer.
+    #[derive(Clone)]
+    struct SharedCursor(Arc<Mutex<Cursor<Vec<u8>>>>);
+    impl Write for SharedCursor {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Seek for SharedCursor {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.0.lock().unwrap().seek(pos)
+        }
+    }
+
+    fn pcm_stream(format: SampleFormat, channels: u16, rate: u32) -> Stream {
+        let mut s = Stream::new(0, CodecId::Pcm);
+        s.channels = channels;
+        s.sample_rate = rate;
+        s.sample_format = Some(format);
+        s
+    }
+
+    fn drive_mux(mut m: Box<dyn Muxer>, s: &Stream, packets: &[Packet]) -> Result<()> {
+        m.write_header(std::slice::from_ref(s))?;
+        for p in packets {
+            m.write_packet(p)?;
+        }
+        m.write_trailer()
+    }
+
+    fn mux_legacy(s: &Stream, packets: &[Packet]) -> Result<Vec<u8>> {
+        let sink = SharedBuf(Arc::new(Mutex::new(Vec::new())));
+        let m = legacy::LegacyWavMuxer::new(Box::new(sink.clone()));
+        drive_mux(Box::new(m), s, packets)?;
+        let out = sink.0.lock().unwrap().clone();
+        Ok(out)
+    }
+
+    fn registry() -> FormatRegistry {
+        let mut reg = FormatRegistry::new();
+        register(&mut reg);
+        reg
+    }
+
+    /// The registered plain factory, over a non-seekable sink (a pipe).
+    fn mux_plain(s: &Stream, packets: &[Packet]) -> Result<Vec<u8>> {
+        let sink = SharedBuf(Arc::new(Mutex::new(Vec::new())));
+        let m = registry().open_muxer("wav", Box::new(sink.clone()))?;
+        drive_mux(m, s, packets)?;
+        let out = sink.0.lock().unwrap().clone();
+        Ok(out)
+    }
+
+    /// The registered seekable factory, over a `Cursor<Vec<u8>>` already
+    /// holding `prefix` (the header patch must land where the muxer began).
+    /// Returns the bytes after the prefix.
+    fn mux_seekable(s: &Stream, packets: &[Packet], prefix: &[u8]) -> Result<Vec<u8>> {
+        let mut cur = Cursor::new(prefix.to_vec());
+        cur.seek(SeekFrom::End(0)).unwrap();
+        let sink = SharedCursor(Arc::new(Mutex::new(cur)));
+        let m = registry().open_muxer_seekable("wav", Box::new(sink.clone()))?;
+        drive_mux(m, s, packets)?;
+        let cur = sink.0.lock().unwrap();
+        assert_eq!(cur.position(), cur.get_ref().len() as u64, "not at the end");
+        assert_eq!(&cur.get_ref()[..prefix.len()], prefix, "prefix clobbered");
+        Ok(cur.get_ref()[prefix.len()..].to_vec())
+    }
+
+    /// Both muxer paths write exactly the legacy (whole-file) muxer's bytes:
+    /// s16/f32, mono to 8 channels, odd and empty packets, no packets.
+    #[test]
+    fn both_mux_paths_are_byte_identical_to_the_legacy_muxer() {
+        let streams = [
+            pcm_stream(SampleFormat::S16, 1, 22_050),
+            pcm_stream(SampleFormat::S16, 2, 44_100),
+            pcm_stream(SampleFormat::F32, 2, 48_000),
+            pcm_stream(SampleFormat::F32, 6, 96_000),
+            pcm_stream(SampleFormat::S16, 8, 48_000),
+            pcm_stream(SampleFormat::S16, 0, 0), // clamped to 1 ch / 1 Hz
+        ];
+        let sizes: [&[usize]; 5] = [
+            &[],
+            &[0],
+            &[4096 * 4, 4096 * 4, 1000],
+            &[3, 0, 8, 5, 1],
+            &[100_001, 77, 65_536],
+        ];
+        for s in &streams {
+            for sz in sizes {
+                let packets: Vec<Packet> = sz
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| Packet::from_data(0, pcm(n + i)[i..].to_vec()))
+                    .collect();
+                let name = format!("{:?} {}ch {:?}", s.sample_format, s.channels, sz);
+                let want = mux_legacy(s, &packets).unwrap();
+                assert!(mux_plain(s, &packets).unwrap() == want, "{name}: plain");
+                assert!(
+                    mux_seekable(s, &packets, &[]).unwrap() == want,
+                    "{name}: seekable"
+                );
+                assert!(
+                    mux_seekable(s, &packets, b"xyz").unwrap() == want,
+                    "{name}: seekable after a prefix"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_sample_format_fails_at_header() {
+        let s = pcm_stream(SampleFormat::F32Planar, 2, 44_100);
+        assert!(mux_legacy(&s, &[]).is_err()); // the legacy muxer: at the trailer
+        let reg = registry();
+        let mut m = reg.open_muxer("wav", Box::new(Vec::new())).unwrap();
+        assert!(m.write_header(std::slice::from_ref(&s)).is_err());
+        let cur: SeekOutput = Box::new(Cursor::new(Vec::new()));
+        let mut m = reg.open_muxer_seekable("wav", cur).unwrap();
+        assert!(m.write_header(std::slice::from_ref(&s)).is_err());
+        let mut no_format = s.clone();
+        no_format.sample_format = None;
+        assert!(m.write_header(&[no_format]).is_err());
+    }
+
+    /// `(position, length, small writes by offset)` of a [`Sparse`] sink.
+    type SparseState = (u64, u64, BTreeMap<u64, Vec<u8>>);
+
+    /// A seekable sink that keeps the bytes of small writes only and just
+    /// advances over big ones, so a >4 GiB file can be "written" in a test.
+    #[derive(Clone, Default)]
+    struct Sparse(Arc<Mutex<SparseState>>);
+    impl Write for Sparse {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut g = self.0.lock().unwrap();
+            let (pos, len, kept) = &mut *g;
+            if buf.len() <= 64 {
+                kept.insert(*pos, buf.to_vec());
+            }
+            *pos += buf.len() as u64;
+            *len = (*len).max(*pos);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Seek for Sparse {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            let mut g = self.0.lock().unwrap();
+            g.0 = match to {
+                SeekFrom::Start(p) => p,
+                SeekFrom::End(d) => (g.1 as i64 + d) as u64,
+                SeekFrom::Current(d) => (g.0 as i64 + d) as u64,
+            };
+            Ok(g.0)
+        }
+    }
+
+    /// Stream `data_len` sample bytes through the seekable muxer into a
+    /// sparse sink; returns `(final header, file length, final position)`.
+    fn mux_sparse(data_len: u64) -> (Vec<u8>, u64, u64) {
+        let s = pcm_stream(SampleFormat::S16, 2, 48_000);
+        let sink = Sparse::default();
+        let mut m = registry()
+            .open_muxer_seekable("wav", Box::new(sink.clone()))
+            .unwrap();
+        m.write_header(std::slice::from_ref(&s)).unwrap();
+        let big = Packet::from_data(0, vec![0; 64 << 20]);
+        let mut left = data_len;
+        while left >= big.data.len() as u64 {
+            m.write_packet(&big).unwrap();
+            left -= big.data.len() as u64;
+        }
+        m.write_packet(&Packet::from_data(0, vec![0; left as usize]))
+            .unwrap();
+        m.write_trailer().unwrap();
+        let g = sink.0.lock().unwrap();
+        // The last write at offset 0 is the rewritten header.
+        (g.2[&0].clone(), g.1, g.0)
+    }
+
+    /// Up to 4 GiB the sizes are exact; past it, a size that does not fit in
+    /// 32 bits is written as 0xFFFFFFFF ("to end of file"), not modulo 2^32.
+    #[test]
+    fn sizes_near_and_past_4_gib() {
+        // Everything fits: RIFF = 36 + data (even).
+        let data = u32::MAX as u64 - 37;
+        let (h, len, pos) = mux_sparse(data);
+        assert_eq!((len, pos), (44 + data, 44 + data));
+        assert_eq!(rd_u32(&h, 4), (36 + data) as u32);
+        assert_eq!(rd_u32(&h, 40), data as u32);
+        // Odd data that fits; the padded RIFF body does not.
+        let data = u32::MAX as u64 - 36;
+        let (h, len, _) = mux_sparse(data);
+        assert_eq!(len, 44 + data + 1);
+        assert_eq!(rd_u32(&h, 4), u32::MAX);
+        assert_eq!(rd_u32(&h, 40), data as u32);
+        // Past 4 GiB of samples: both sizes unknown.
+        let data = (1u64 << 32) + 4;
+        let (h, len, pos) = mux_sparse(data);
+        assert_eq!((len, pos), (44 + data, 44 + data));
+        assert_eq!(rd_u32(&h, 4), u32::MAX);
+        assert_eq!(rd_u32(&h, 40), u32::MAX);
+        assert_eq!(&h[36..40], b"data");
     }
 }
