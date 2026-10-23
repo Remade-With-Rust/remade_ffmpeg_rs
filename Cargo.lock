@@ -5721,9 +5721,9 @@ version = "0.6.1"
 
 [[package]]
 name = "rusty_jpeg"
-version = "0.4.5"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "740eda0448903338b3b4a02d4536103cfa4ac9eb97909f34fcac893f3ad1b9b6"
+checksum = "03629dcbe762841b2de7fb581d03555b6dc21e7b844d87caaf909310a7a08fea"
 
 [[package]]
 name = "rusty_json_turbo"
