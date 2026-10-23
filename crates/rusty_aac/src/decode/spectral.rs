@@ -209,7 +209,12 @@ impl<'a> Cache<'a> {
     #[inline(always)]
     fn load(&mut self) {
         self.buf = BitReader::window_at(self.data, self.pos);
-        self.valid = 64 - (self.pos % 8) as u32;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a bit offset within a byte (< 8)"
+        )]
+        let skew = (self.pos % 8) as u32;
+        self.valid = 64 - skew;
     }
 
     #[inline(always)]
