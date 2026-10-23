@@ -87,10 +87,11 @@ pub enum Counter {
     TnsChannels,
     SlowTuples,
     EscTuples,
+    SymTuples,
 }
 
 /// Counter names, indexed by [`Counter`].
-pub const COUNTERS: [&str; 9] = [
+pub const COUNTERS: [&str; 10] = [
     "channel frames",
     "eight-short channel frames",
     "spectral codewords",
@@ -100,6 +101,7 @@ pub const COUNTERS: [&str; 9] = [
     "tns-active channel frames",
     "spectral tuples via generic path",
     "book-11 tuples with escapes",
+    "  of the generic: codeword fits, signs do not",
 ];
 
 #[cfg(feature = "profile")]
@@ -112,19 +114,28 @@ mod imp {
     static CALLS: [AtomicU64; STAGES.len()] = [const { AtomicU64::new(0) }; STAGES.len()];
     static SIMD: [AtomicU64; KERNELS.len()] = [const { AtomicU64::new(0) }; KERNELS.len()];
     static SCALAR: [AtomicU64; KERNELS.len()] = [const { AtomicU64::new(0) }; KERNELS.len()];
-    static COUNT: [AtomicU64; COUNTERS.len()] = [const { AtomicU64::new(0) }; COUNTERS.len()];
+    // Per-thread plain cells, not atomics: some counters bump per band, and a
+    // `lock xadd` per band was itself a measurable share of the spectral stage
+    // in the profile build. The decoder runs on the caller's thread, so
+    // `take_counters` on that thread sees everything.
+    thread_local! {
+        static COUNT: [std::cell::Cell<u64>; COUNTERS.len()] =
+            const { [const { std::cell::Cell::new(0) }; COUNTERS.len()] };
+    }
 
     #[inline]
     pub fn bump(c: Counter, n: usize) {
-        COUNT[c as usize].fetch_add(n as u64, Relaxed);
+        COUNT.with(|t| t[c as usize].set(t[c as usize].get() + n as u64));
     }
 
-    /// Read and clear the workload counters.
+    /// Read and clear this thread's workload counters.
     #[must_use]
     pub fn take_counters() -> Vec<(&'static str, u64)> {
-        (0..COUNTERS.len())
-            .map(|i| (COUNTERS[i], COUNT[i].swap(0, Relaxed)))
-            .collect()
+        COUNT.with(|t| {
+            (0..COUNTERS.len())
+                .map(|i| (COUNTERS[i], t[i].replace(0)))
+                .collect()
+        })
     }
 
     /// Times its stage until dropped.

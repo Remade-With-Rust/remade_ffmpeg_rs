@@ -136,6 +136,7 @@ fn slow_tuple(cbn: u8, cb: Codebook, r: &mut BitReader, e: u32, out: &mut [i32])
     crate::prof::bump(crate::prof::Counter::SlowTuples, 1);
     let tab = tuple_table(cbn);
     let sym = if e & KIND_MASK == KIND_SYM {
+        crate::prof::bump(crate::prof::Counter::SymTuples, 1);
         r.skip((e & 31) as usize)?;
         (e >> 8) as usize
     } else {
