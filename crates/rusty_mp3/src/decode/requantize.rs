@@ -19,7 +19,7 @@ use super::scalefactors::ScaleFactors;
 /// `|n|^(4/3)` table for the `0..=8206` Huffman magnitudes (linbits reach 8206).
 /// Returned by reference so the per-line loop indexes it directly instead of
 /// re-checking the `OnceLock` and making a call 576× per granule.
-fn pow43_table() -> &'static [f64] {
+pub(crate) fn pow43_table() -> &'static [f64] {
     static T: OnceLock<Vec<f64>> = OnceLock::new();
     T.get_or_init(|| (0..8207).map(|i| f64::from(i).powf(4.0 / 3.0)).collect())
 }
@@ -38,7 +38,7 @@ const Q_MAX: i32 = 64;
 /// `q / 4` for the integer `q` that [`band_scale`] forms. Each entry is the same
 /// `powf` on the same f64 argument the per-band call evaluated, so one libm call
 /// per band per granule (22 per long granule and channel) becomes a load.
-fn pow2_quarter_table() -> &'static [f64] {
+pub(crate) fn pow2_quarter_table() -> &'static [f64] {
     static T: OnceLock<Vec<f64>> = OnceLock::new();
     T.get_or_init(|| {
         (Q_MIN..=Q_MAX)
@@ -51,7 +51,7 @@ fn pow2_quarter_table() -> &'static [f64] {
 /// the scalefactor (plus pretab) and `sf_mult` is 0.5, or 1.0 with
 /// `scalefac_scale`. Returns exactly what `2f64.powf(exp)` returns.
 #[inline]
-fn band_scale(pow2q: &[f64], gain: i32, scalefac_scale: bool, sf: i32) -> f64 {
+pub(crate) fn band_scale(pow2q: &[f64], gain: i32, scalefac_scale: bool, sf: i32) -> f64 {
     let q = gain - if scalefac_scale { 4 * sf } else { 2 * sf };
     match pow2q.get((q - Q_MIN) as usize) {
         Some(&s) => s,
@@ -65,7 +65,7 @@ fn band_scale(pow2q: &[f64], gain: i32, scalefac_scale: bool, sf: i32) -> f64 {
 /// `sign(0)=0` and `pow[0]=0`, so the product is `0.0`, identical to a guard
 /// (which kept the per-line loop from vectorizing). `pow` is the hoisted table.
 #[inline]
-fn dequant(c: i32, pow: &[f64], scale: f64) -> f32 {
+pub(crate) fn dequant(c: i32, pow: &[f64], scale: f64) -> f32 {
     (f64::from(c.signum()) * pow[c.unsigned_abs() as usize] * scale) as f32
 }
 

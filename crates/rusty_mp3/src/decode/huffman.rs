@@ -26,6 +26,8 @@ use crate::frame::{BlockType, GranuleSideInfo, GRANULE_LINES};
 use crate::header::FrameHeader;
 use crate::tables;
 
+use super::scalefactors::ScaleFactors;
+
 use super::codebooks::{PAIR_TABLES, QUAD_A, QUAD_B};
 
 /// Root LUT width cap. Codewords up to this length resolve in one table lookup;
@@ -333,6 +335,115 @@ pub fn decode(
     gi: &GranuleSideInfo,
 ) -> ([i32; GRANULE_LINES], usize) {
     let mut out = [0i32; GRANULE_LINES];
+    let nz = decode_into(
+        main,
+        bit_pos,
+        part2_3_end,
+        header,
+        gi,
+        &mut IntSink(&mut out),
+    );
+    (out, nz)
+}
+
+/// **D16** — [`decode`] fused with the long-block requantizer: each decoded
+/// value goes straight to its dequantized line, `out[i] = dequant(c, pow43,
+/// scale(band(i)))` -- the expression and the band scale
+/// [`super::requantize::apply`] uses for a non-short block -- so the
+/// coefficient array, its zero-fill and the second pass over it disappear, and
+/// the dequant arithmetic runs in the shadow of the latency-bound bit chain.
+/// Lines at and above the returned rzero count are +0.0, as `apply` leaves them.
+/// For short blocks (which reorder) use `decode` + `apply`. Pinned by
+/// `fused_dequant_matches_two_pass`.
+pub fn decode_dequant_long(
+    main: &[u8],
+    bit_pos: &mut usize,
+    part2_3_end: usize,
+    header: &FrameHeader,
+    gi: &GranuleSideInfo,
+    sf: &ScaleFactors,
+    out: &mut [f32; GRANULE_LINES],
+) -> usize {
+    out.fill(0.0);
+    let pow2q = super::requantize::pow2_quarter_table();
+    let gain = i32::from(gi.global_gain) - 210;
+    let mut scales = [0f64; 22];
+    for (b, s) in scales.iter_mut().enumerate() {
+        let pre = i32::from(if gi.preflag { tables::PRETAB[b] } else { 0 });
+        *s = super::requantize::band_scale(
+            pow2q,
+            gain,
+            gi.scalefac_scale,
+            i32::from(sf.long[b]) + pre,
+        );
+    }
+    let off = tables::sfb_long_offsets(header.sample_rate);
+    let mut sink = DeqSink {
+        out,
+        pow: super::requantize::pow43_table(),
+        scales,
+        off,
+        band: 0,
+        band_end: off[1] as usize,
+    };
+    decode_into(main, bit_pos, part2_3_end, header, gi, &mut sink)
+}
+
+/// Where decoded values go: coefficients ([`IntSink`]) or dequantized lines
+/// ([`DeqSink`]). Monomorphised, so the integer path is the code it was.
+trait LineSink {
+    fn put(&mut self, i: usize, v: i32);
+    /// Zero `i..i + 4` again (the dropped straddling quad).
+    fn clear4(&mut self, i: usize);
+}
+
+struct IntSink<'a>(&'a mut [i32; GRANULE_LINES]);
+
+impl LineSink for IntSink<'_> {
+    #[inline]
+    fn put(&mut self, i: usize, v: i32) {
+        self.0[i] = v;
+    }
+    fn clear4(&mut self, i: usize) {
+        self.0[i..i + 4].fill(0);
+    }
+}
+
+struct DeqSink<'a> {
+    out: &'a mut [f32; GRANULE_LINES],
+    pow: &'static [f64],
+    scales: [f64; 22],
+    off: &'static [u16; 23],
+    /// The scalefactor band of the last line written, and its end. Lines arrive
+    /// in increasing order, so the band only ever moves up.
+    band: usize,
+    band_end: usize,
+}
+
+impl LineSink for DeqSink<'_> {
+    #[inline]
+    fn put(&mut self, i: usize, v: i32) {
+        while i >= self.band_end && self.band < 21 {
+            self.band += 1;
+            self.band_end = self.off[self.band + 1] as usize;
+        }
+        self.out[i] = super::requantize::dequant(v, self.pow, self.scales[self.band]);
+    }
+    fn clear4(&mut self, i: usize) {
+        self.out[i..i + 4].fill(0.0);
+    }
+}
+
+/// The decode body shared by both sinks; returns the rzero count.
+#[inline]
+fn decode_into<S: LineSink>(
+    main: &[u8],
+    bit_pos: &mut usize,
+    part2_3_end: usize,
+    header: &FrameHeader,
+    gi: &GranuleSideInfo,
+    out: &mut S,
+) -> usize {
     let mut r = BitCache::new(main, *bit_pos);
 
     let sfb_long = tables::sfb_long_offsets(header.sample_rate);
@@ -350,7 +461,7 @@ pub fn decode(
             &mut r,
             &fast.pairs[t],
             PAIR_TABLES[t],
-            &mut out,
+            out,
             &mut i,
             end,
             part2_3_end,
@@ -372,21 +483,21 @@ pub fn decode(
         r.consume(u32::from(e & 0xF));
         let e = i32::from(e);
         // Four 2-bit two's-complement values above the 4-bit length.
-        out[i] = (e << 26) >> 30;
-        out[i + 1] = (e << 24) >> 30;
-        out[i + 2] = (e << 22) >> 30;
-        out[i + 3] = (e << 20) >> 30;
+        out.put(i, (e << 26) >> 30);
+        out.put(i + 1, (e << 24) >> 30);
+        out.put(i + 2, (e << 22) >> 30);
+        out.put(i + 3, (e << 20) >> 30);
         i += 4;
     }
     // The straddling-quad rule of the reference (see `decode_reference`).
     if i > count1_start && i + 3 < GRANULE_LINES && r.pos > part2_3_end {
         i -= 4;
-        out[i..i + 4].fill(0);
+        out.clear4(i);
     }
 
     let nonzero = i.min(GRANULE_LINES);
     *bit_pos = part2_3_end;
-    (out, nonzero)
+    nonzero
 }
 
 /// Pair-LUT entry layout (`u16`): bits 0..5 = bits to consume, bits 5..10 = x,
@@ -519,11 +630,11 @@ fn build_quad(q: &QuadTable) -> Box<[u16]> {
 // A linbits field is at most 13 bits, so `take(linbits) as i32` is exact.
 #[allow(clippy::cast_possible_wrap)]
 #[inline]
-fn decode_pairs(
+fn decode_pairs<S: LineSink>(
     r: &mut BitCache,
     fast: &FastPair,
     table: &PairTable,
-    out: &mut [i32; GRANULE_LINES],
+    out: &mut S,
     i: &mut usize,
     end: usize,
     part2_3_end: usize,
@@ -576,8 +687,8 @@ fn decode_pairs(
             r.seek(br.bit_pos());
             xy
         };
-        out[*i] = x;
-        out[*i + 1] = y;
+        out.put(*i, x);
+        out.put(*i + 1, y);
         *i += 2;
     }
 }
@@ -920,6 +1031,75 @@ mod tests {
             region_bounds(&gi, tables::sfb_long_offsets(22050), 200, 22050).0,
             tables::sfb_long_offsets(22050)[8] as usize
         );
+    }
+
+    /// D16 gate: the fused long-block decode+dequant equals `decode` followed
+    /// by `requantize::apply`, as f32 bit patterns, with the same rzero count
+    /// and cursor -- every long-window block type (mixed flag too), all gains,
+    /// scalefactors, preflag and `scalefac_scale`, at every sample rate.
+    #[test]
+    #[cfg_attr(miri, ignore = "randomised sweep: too slow to interpret under Miri")]
+    fn fused_dequant_matches_two_pass() {
+        let mut s = 0xD1B5_4A32_D192_ED03u64;
+        let mut rnd = move |n: u64| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s % n
+        };
+        let rates = [44100, 48000, 32000, 22050, 24000, 16000, 11025, 12000, 8000];
+        let blocks = [BlockType::Long, BlockType::Start, BlockType::Stop];
+        let mut hdr = mono_44k();
+        let mut coded = 0usize;
+        for trial in 0..20_000u32 {
+            hdr.sample_rate = rates[rnd(rates.len() as u64) as usize];
+            let bt = blocks[rnd(3) as usize];
+            let gi = GranuleSideInfo {
+                big_values: rnd(320) as u16,
+                global_gain: rnd(256) as u8,
+                table_select: [rnd(32) as u8, rnd(32) as u8, rnd(32) as u8],
+                region0_count: rnd(16) as u8,
+                region1_count: rnd(8) as u8,
+                count1table_select: rnd(2) == 1,
+                window_switching: bt != BlockType::Long,
+                block_type: bt,
+                mixed_block: bt != BlockType::Long && rnd(2) == 1,
+                preflag: rnd(2) == 1,
+                scalefac_scale: rnd(2) == 1,
+                ..Default::default()
+            };
+            let mut sf = ScaleFactors::default();
+            for v in &mut sf.long {
+                *v = rnd(16) as u8;
+            }
+            let len = rnd(520) as usize;
+            let main: Vec<u8> = (0..len)
+                .map(|_| match trial % 4 {
+                    0 => (rnd(256) & rnd(256) & rnd(256)) as u8,
+                    1 => 0xFF,
+                    _ => rnd(256) as u8,
+                })
+                .collect();
+            let start = rnd(80) as usize;
+            let end = start + rnd(4200) as usize;
+            let (mut pa, mut pb) = (start, start);
+            let mut got = [1f32; GRANULE_LINES];
+            let na = decode_dequant_long(&main, &mut pa, end, &hdr, &gi, &sf, &mut got);
+            let (coeffs, nb) = decode(&main, &mut pb, end, &hdr, &gi);
+            let mut want = [0f32; GRANULE_LINES];
+            crate::decode::requantize::apply(&hdr, &gi, &sf, &coeffs, nb, &mut want);
+            assert_eq!(na, nb, "rzero count, trial {trial}");
+            assert_eq!(pa, pb, "cursor, trial {trial}");
+            for i in 0..GRANULE_LINES {
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[i].to_bits(),
+                    "line {i}, trial {trial}"
+                );
+            }
+            coded += na;
+        }
+        assert!(coded > 500_000, "{coded} coded lines");
     }
 
     /// D9 gate: the table decode must equal the reference decode -- the same 576

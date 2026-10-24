@@ -436,12 +436,30 @@ fn entropy(
                 scalefactors::decode(main, &mut bit_pos, header, &si, gr, ch, prev)
             });
             let part2_3_end = part2_3_start + gi.part2_3_length as usize;
-            let (coeffs, nz) = prof::time(&prof::HUFFMAN, || {
-                huffman::decode(main, &mut bit_pos, part2_3_end, header, gi)
-            });
-            prof::time(&prof::REQUANT, || {
-                requantize::apply(header, gi, &sf, &coeffs, nz, &mut spectrum.lines[ch]);
-            });
+            let short = gi.window_switching && gi.block_type == crate::frame::BlockType::Short;
+            let nz = if short {
+                // Short blocks reorder while they requantize: two passes.
+                let (coeffs, nz) = prof::time(&prof::HUFFMAN, || {
+                    huffman::decode(main, &mut bit_pos, part2_3_end, header, gi)
+                });
+                prof::time(&prof::REQUANT, || {
+                    requantize::apply(header, gi, &sf, &coeffs, nz, &mut spectrum.lines[ch]);
+                });
+                nz
+            } else {
+                // D16: Huffman and requantize fused (timed as Huffman).
+                prof::time(&prof::HUFFMAN, || {
+                    huffman::decode_dequant_long(
+                        main,
+                        &mut bit_pos,
+                        part2_3_end,
+                        header,
+                        gi,
+                        &sf,
+                        &mut spectrum.lines[ch],
+                    )
+                })
+            };
             spectrum.nonzero[ch] = nz;
             scalefac[gr][ch] = sf;
         }
