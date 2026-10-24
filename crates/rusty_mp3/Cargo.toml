@@ -1,6 +1,6 @@
 [package]
 name = "rusty_mp3"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
@@ -18,6 +18,10 @@ exclude = ["lab-results/"]
 [dependencies]
 
 [features]
+# Decode stage clock (`decode::prof::time` / `dump`): two `Instant::now()` per
+# stage per granule and channel. Off by default -- it sat on the shipping path.
+# `cargo run --release --example decprof --features profile -- <file.mp3>`.
+profile = []
 # The MP3 encoder experiment harness (brick registry, corpus, metrics, variant
 # sweeps). Opt-in — zero weight on the default build.
 lab = []

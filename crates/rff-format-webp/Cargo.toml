@@ -1,7 +1,7 @@
 [package]
 name = "rff-format-webp"
 description = "Remade FFmpeg (Rust): WebP single-image container (file = codec stream)."
-version = "0.2.4"
+version = "0.2.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
