@@ -59,12 +59,19 @@ fn main() {
         "# {mode}: wall {wall:.1} ms, instrumented stage CPU {:.1} ms",
         total as f64 / 1e6
     );
+    println!(
+        "  (unscoped residue: wall - stages = {:.1} ms; stage shares below are of the instrumented total)",
+        wall - total as f64 / 1e6
+    );
     for (name, ns, calls) in stages.iter().filter(|s| s.2 > 0) {
         println!(
             "  {name:34} {:9.2} ms  {:5.1}%  {calls:>9} calls",
             *ns as f64 / 1e6,
             100.0 * *ns as f64 / total.max(1) as f64
         );
+    }
+    for (name, n) in prof::take_counters().iter().filter(|c| c.1 > 0) {
+        println!("  count  {name:30} {n:>12}");
     }
     for (name, simd, scalar) in kernels.iter().filter(|k| k.1 + k.2 > 0) {
         println!(

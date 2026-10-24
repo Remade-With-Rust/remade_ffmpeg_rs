@@ -95,14 +95,14 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rff-codec"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "rff-core",
 ]
 
 [[package]]
 name = "rff-codec-mp3"
-version = "1.0.0"
+version = "1.0.3"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -121,14 +121,14 @@ dependencies = [
 
 [[package]]
 name = "rff-core"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "rusty_mp3"
-version = "1.0.0"
+version = "1.0.2"
 
 [[package]]
 name = "shlex"
