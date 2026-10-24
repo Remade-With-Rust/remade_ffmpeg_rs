@@ -1,7 +1,10 @@
 //! `decprof` — decoder stage profile + deterministic work census on a REAL stream.
 //!
 //! ```text
-//!   cargo run -p rusty_mp3 --release --example decprof -- input.mp3
+//!   cargo run -p rusty_mp3 --release --example decprof --features profile -- input.mp3
+//!
+//! (Without `profile` the census and the PCM hash still run; the stage clock
+//! is compiled out of the decoder, so no stage shares are printed.)
 //! ```
 //!
 //! Why this exists alongside the in-crate `profile_decode_stages` test: that test

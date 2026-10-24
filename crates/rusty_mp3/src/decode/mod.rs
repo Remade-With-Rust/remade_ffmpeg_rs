@@ -28,12 +28,22 @@ pub mod stereo;
 pub mod synth_window;
 pub mod synthesis;
 
-/// Lightweight decode-stage profiler (near-zero cost; read via [`prof::dump`]).
-/// Same role as the encoder's: find the real decode hotspots before optimizing.
+/// Decode-stage profiler, read via [`prof::dump`]. Same role as the encoder's:
+/// find the real decode hotspots before optimizing.
+///
+/// The stage CLOCK is behind the `profile` cargo feature. It used to run on every
+/// build: two `Instant::now()` per stage per granule and channel, ~52 clock reads
+/// per stereo frame on the shipping path, which is real time on a decoder doing a
+/// frame in a few microseconds. Without the feature [`time`] is a plain call. The
+/// deterministic censuses (block types, kernel reach) stay on: they cost a
+/// handful of relaxed adds per frame and back `MP3_CENSUS`.
 pub mod prof {
     use std::sync::atomic::{AtomicU64, Ordering};
     // No clock on the browser target -- see `time` below.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "profile",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     use std::time::Instant;
 
     pub static HUFFMAN: AtomicU64 = AtomicU64::new(0);
@@ -113,7 +123,10 @@ pub mod prof {
     /// first frame in a browser while compiling cleanly and passing every test on
     /// the host. WASI has a clock and keeps its timing; only the bare-wasm target
     /// compiles it out and runs `f` unwrapped.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "profile",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[inline]
     pub fn time<T>(bucket: &AtomicU64, f: impl FnOnce() -> T) -> T {
         let t = Instant::now();
@@ -122,14 +135,30 @@ pub mod prof {
         r
     }
 
-    /// Clock-free twin for the browser target: run the stage, record nothing.
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    /// Clock-free twin (no `profile` feature, or the browser target): run the
+    /// stage, record nothing.
+    #[cfg(not(all(
+        feature = "profile",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    )))]
     #[inline]
     pub fn time<T>(_bucket: &AtomicU64, f: impl FnOnce() -> T) -> T {
         f()
     }
 
+    /// Whether this build records stage times (see the module docs).
+    pub const TIMED: bool = cfg!(all(
+        feature = "profile",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ));
+
     pub fn dump() {
+        if !TIMED {
+            eprintln!(
+                "--- decode stage profile: not recorded (build with `--features profile`) ---"
+            );
+            return;
+        }
         let stages = [
             ("huffman", &HUFFMAN),
             ("scalefactors", &SCALEFAC),
