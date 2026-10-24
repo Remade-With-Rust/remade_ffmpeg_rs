@@ -22,6 +22,7 @@ pub mod bitstream;
 pub mod fft;
 pub mod filterbank;
 pub mod huffman;
+pub mod lametag;
 pub mod mdct;
 pub mod psychoacoustic;
 pub mod quantize;
@@ -228,6 +229,10 @@ impl Default for Mp3Encode {
         }
     }
 }
+
+/// Largest `part2_3_length` (12-bit field): the most bits one granule of one
+/// channel can carry.
+const MAX_GRANULE_BITS: usize = 4095;
 
 /// B8 back-reference cap (`main_data_begin` is 9 bits): the most a frame can borrow.
 const RESV_MAX_BANK: usize = 511 * 8;
@@ -446,9 +451,19 @@ impl Mp3Encode {
             raw
         };
         let mut fheader = header.clone();
-        if use_ms {
+        // Every stereo frame is signalled JOINT stereo, with mode_extension
+        // carrying this frame's M/S choice (L/R frames: `00`, which decodes
+        // exactly as plain stereo). Switching the channel-mode field itself
+        // between stereo and joint stereo made consecutive frames' headers
+        // differ, and FFmpeg's demuxer only syncs on two consecutive frames
+        // whose headers agree outside the bitrate/padding/mode-extension bits:
+        // a stream whose first two frames disagreed was rejected outright
+        // ("Failed to find two consecutive MPEG audio frames", issue #69), and
+        // a longer one has everything before its first agreeing pair skipped
+        // as junk (`mp3_read_header`). LAME's joint mode signals it this way.
+        if nch == 2 {
             fheader.channel_mode = crate::frame::ChannelMode::JointStereo {
-                ms_stereo: true,
+                ms_stereo: use_ms,
                 intensity_stereo: false,
             };
         }
@@ -565,7 +580,13 @@ impl Mp3Encode {
                 bitstream::region_capacity(&h) * 8 / n_units
             }
             None => frame_budget / n_units,
-        };
+        }
+        // `part2_3_length` is a 12-bit field: a granule can never carry more
+        // than 4095 bits. Uncapped, a large-frame/few-unit configuration (mono
+        // 320 kbps at 32 kHz, mono >= 128 kbps at 16 kHz) budgeted ~4500-5700 bits
+        // per granule, the length wrapped when serialized, and the stream decoded
+        // to noise. Every budget under the cap is untouched.
+        .min(MAX_GRANULE_BITS);
 
         let mut side = SideInfo::default();
         // The main-data region is capacity-bounded by the header, so the writer

@@ -359,8 +359,19 @@ pub fn vbr_quality_index(q: f32) -> f32 {
 /// [`push_pcm_s16`](Mp3Encoder::push_pcm_s16) (the first push fixes the header
 /// from the sample rate + channel count), drain with
 /// [`next_packet`](Mp3Encoder::next_packet), and call
-/// [`finish`](Mp3Encoder::finish) at end of input (tail padding, reservoir
-/// assembly, Xing/Info header).
+/// [`finish`](Mp3Encoder::finish) at end of input (flush frames, reservoir
+/// assembly, the final Xing/Info tag).
+///
+/// **Gapless output.** The first packet is a LAME-style Info (CBR) / Xing (VBR)
+/// tag frame recording the encoder delay ([`encode::lametag::ENCODER_DELAY`])
+/// and the end padding, so FFmpeg and other LAME-tag-aware players decode the
+/// stream to exactly the input's length. Its counts are only known at
+/// [`finish`](Mp3Encoder::finish): if the tag packet is still queued then, it is
+/// completed in place (drain after `finish` and the bytes are final). A caller
+/// that drained it earlier -- streaming to a file as packets arrive -- writes
+/// [`lame_tag_frame`](Mp3Encoder::lame_tag_frame) over the stream's first frame
+/// once finished (it is the same length), as with LAME's
+/// `lame_get_lametag_frame`.
 #[derive(Default)]
 pub struct Mp3Encoder {
     state: Mp3Encode,
@@ -368,9 +379,23 @@ pub struct Mp3Encoder {
     /// Accumulated samples per channel awaiting a full frame.
     pcm: [Vec<f32>; 2],
     queue: VecDeque<Vec<u8>>,
-    /// Audio frames emitted and their total byte length (for the Info header).
-    total_frames: u32,
-    total_bytes: usize,
+    /// Per-channel input samples pushed (the length the tag makes gapless).
+    input_samples: u64,
+    /// Zero samples primed ahead of a very short input on top of the codec
+    /// delay ([`encode::lametag::extra_priming`]).
+    extra_priming: usize,
+    /// Totals over the audio frames emitted (the tag's counts, TOC and CRC).
+    tag_stats: Option<encode::lametag::TagStats>,
+    /// The tag frame's header, fixed with the stream header.
+    tag_header: Option<FrameHeader>,
+    /// The placeholder tag frame, until the first audio frame is queued
+    /// behind it.
+    tag_placeholder: Option<Vec<u8>>,
+    /// Packets handed out by `next_packet` (0 => the tag placeholder is still
+    /// at the front of the queue).
+    packets_out: u64,
+    /// The completed tag frame, once `finish` has run.
+    lame_tag: Option<Vec<u8>>,
     /// CBR target (kbps); 0 ⇒ default 128.
     cbr_kbps: u32,
     /// VBR quality target (peak NMR). `Some` ⇒ VBR, `None` ⇒ CBR.
@@ -556,7 +581,19 @@ impl Mp3Encoder {
         get: impl Fn(usize) -> f32,
     ) -> Result<()> {
         if self.header.is_none() {
-            self.header = Some(encoder_header(sample_rate, channels, self.cbr_kbps)?);
+            let header = encoder_header(sample_rate, channels, self.cbr_kbps)?;
+            // The tag frame leads the stream. Its counts are only known at
+            // `finish`, so it is queued -- with the first audio frame, not
+            // before: the buffered reservoir path queues nothing until
+            // `finish`, where the tag is then completed in place -- as a
+            // placeholder of the final length.
+            let tag_header = encode::lametag::tag_header(&header);
+            let stats = encode::lametag::TagStats::new(tag_header.frame_size());
+            let info = self.tag_info(&header, 0);
+            self.tag_placeholder = Some(encode::lametag::tag_frame(&tag_header, &stats, &info));
+            self.tag_stats = Some(stats);
+            self.tag_header = Some(tag_header);
+            self.header = Some(header);
             // 3R1 reservoir RD — DEFAULT ON for CBR ≤ 256 kbps (2026-07-08). Measured
             // vs LAME on real music (guitar/piano, PEAQ): the bit reservoir closes the
             // whole quality gap — e.g. guitar@128k −0.59→+0.04 (LAME +0.06), piano@128k
@@ -597,6 +634,7 @@ impl Mp3Encoder {
         let nch = header.channel_mode.channels();
         let spf = header.version.samples_per_frame();
         let in_ch = (channels as usize).max(1);
+        self.input_samples += samples as u64;
         let mut s = 0;
         while s < samples {
             if self.pcm[0].len() >= spf {
@@ -619,15 +657,16 @@ impl Mp3Encoder {
         Ok(())
     }
 
-    /// Pull the next encoded MP3 packet (one frame, or the prepended Xing/Info
-    /// frame after [`finish`](Mp3Encoder::finish)). `Err(Again)` = feed more
-    /// PCM; `Err(Eof)` = finished and fully drained.
+    /// Pull the next encoded MP3 packet: one frame (the first is the Info/Xing
+    /// tag frame -- see the type docs). `Err(Again)` = feed more PCM;
+    /// `Err(Eof)` = finished and fully drained.
     ///
     /// # Errors
     /// [`Error::Again`] when more PCM is needed; [`Error::Eof`] once
     /// [`finish`](Self::finish) was called and every packet has been drained.
     pub fn next_packet(&mut self) -> Result<Vec<u8>> {
         if let Some(p) = self.queue.pop_front() {
+            self.packets_out += 1;
             return Ok(p);
         }
         if self.eof {
@@ -637,58 +676,107 @@ impl Mp3Encoder {
         }
     }
 
-    /// End of input: pad the PCM tail to a whole frame, assemble the bit
-    /// reservoir stream (CBR V1), and prepend the Xing/Info header. After this,
+    /// End of input: encode flush frames until every input sample has passed
+    /// through the codec delay, assemble the bit reservoir stream (CBR V1), and
+    /// complete the Info/Xing tag (see the type docs). After this,
     /// [`next_packet`](Mp3Encoder::next_packet) drains to `Err(Eof)`.
+    ///
+    /// `n` input samples per channel become
+    /// [`frames_for(n)`](encode::lametag::frames_for) audio frames -- at least
+    /// two, so even a one-sample input, or an empty one after a push fixed the
+    /// format, is a stream FFmpeg accepts. With no push at all the format is
+    /// unknown and nothing is emitted. Calling `finish` again does nothing.
     pub fn finish(&mut self) {
-        // Pad each channel's tail to a whole frame and encode it.
+        if self.eof {
+            return;
+        }
         if let Some(header) = self.header.clone() {
             let nch = header.channel_mode.channels();
             let spf = header.version.samples_per_frame();
-            if (0..nch).any(|c| !self.pcm[c].is_empty()) {
+            // An input shorter than a frame is still all in the staging
+            // buffers: prime it if FFmpeg's trimming needs that (MPEG-2/2.5).
+            if self.input_samples < spf as u64 {
+                self.extra_priming = encode::lametag::extra_priming(self.input_samples, spf);
                 for c in 0..nch {
-                    let padded = self.pcm[c].len().div_ceil(spf) * spf;
-                    self.pcm[c].resize(padded, 0.0);
+                    let pcm = &mut self.pcm[c];
+                    pcm.splice(0..0, std::iter::repeat_n(0.0, self.extra_priming));
                 }
-                self.drain_frames();
             }
+            let delay = encode::lametag::ENCODER_DELAY + self.extra_priming;
+            // Zero-pad the tail out to the frame count that carries the input
+            // plus the encoder and decoder delays, and encode it.
+            let total = encode::lametag::frames_for(self.input_samples, delay, spf) * spf as u64;
+            let flush = (total - self.input_samples) as usize - self.extra_priming;
+            for c in 0..nch {
+                let len = self.pcm[c].len() + flush;
+                self.pcm[c].resize(len, 0.0);
+            }
+            self.drain_frames();
             // 3R1: all frames are banked — assemble the reservoir stream now and split
             // it back into fixed-size frame packets (B8 output is frame_size-aligned).
             if self.reservoir {
-                if self.resv_lookahead {
+                let assembled: Vec<Vec<u8>> = if self.resv_lookahead {
                     let fsize = header.frame_size();
                     let frames = std::mem::take(&mut self.resv_frames_pcm);
                     let stream = self
                         .state
                         .encode_reservoir_lookahead(&frames, self.resv_gain);
-                    for chunk in stream.chunks(fsize) {
-                        self.queue.push_back(chunk.to_vec());
-                    }
+                    stream.chunks(fsize).map(<[u8]>::to_vec).collect()
                 } else {
                     // Assembled one packet per frame, so nothing is cut back out
                     // of a contiguous stream with a copy apiece.
-                    self.queue.extend(self.state.finish_reservoir_frames());
+                    self.state.finish_reservoir_frames()
+                };
+                for frame in assembled {
+                    self.emit(frame);
                 }
             }
-            // Prepend the Xing/Info header now that the totals are known (counts
-            // include the Info frame itself). Streaming consumers that drain before
-            // finish won't get it first — that case wants two-pass.
-            if self.total_frames > 0 {
-                // The Info header's counters are 32-bit by format: saturate rather
-                // than wrap on a > 4 GiB stream.
-                let fsize = u32::try_from(header.frame_size()).unwrap_or(u32::MAX);
-                let info = encode::bitstream::info_frame(
-                    &header,
-                    self.total_frames.saturating_add(1),
-                    u32::try_from(self.total_bytes)
-                        .unwrap_or(u32::MAX)
-                        .saturating_add(fsize),
-                    self.quality.is_some(),
-                );
-                self.queue.push_front(info);
+            // Complete the tag now that the totals are known: in place if the
+            // placeholder is still queued, and kept for `lame_tag_frame`.
+            let info = self.tag_info(&header, self.input_samples);
+            if let (Some(tag_header), Some(stats)) = (&self.tag_header, &self.tag_stats) {
+                let tag = encode::lametag::tag_frame(tag_header, stats, &info);
+                if self.packets_out == 0 {
+                    if let Some(front) = self.queue.front_mut() {
+                        front.clone_from(&tag);
+                    }
+                }
+                self.lame_tag = Some(tag);
             }
         }
         self.eof = true;
+    }
+
+    /// The completed Info/Xing tag frame, once [`finish`](Self::finish) has
+    /// run (`None` before, or when nothing was pushed). It is the same length
+    /// as the stream's first packet: a caller that wrote packets out as they
+    /// came overwrites that first frame with these bytes to make the file
+    /// gapless and seekable. A caller that drained only after `finish` already
+    /// received it as the first packet.
+    #[must_use]
+    pub fn lame_tag_frame(&self) -> Option<&[u8]> {
+        self.lame_tag.as_deref()
+    }
+
+    /// The LAME extension's fields for `input` samples per channel.
+    fn tag_info(&self, header: &FrameHeader, input: u64) -> encode::lametag::TagInfo {
+        let spf = header.version.samples_per_frame();
+        let delay = encode::lametag::ENCODER_DELAY + self.extra_priming;
+        encode::lametag::TagInfo {
+            vbr: self.quality.is_some(),
+            delay,
+            padding: encode::lametag::padding_for(input, delay, spf) as usize,
+        }
+    }
+
+    /// Queue one finished audio frame (behind the tag placeholder, for the
+    /// first), accounting it in the tag's totals.
+    fn emit(&mut self, frame: Vec<u8>) {
+        if let Some(stats) = self.tag_stats.as_mut() {
+            stats.add_frame(&frame);
+        }
+        self.queue.extend(self.tag_placeholder.take());
+        self.queue.push_back(frame);
     }
 
     /// Emit a frame for each full 1152-sample-per-channel block accumulated.
@@ -719,17 +807,16 @@ impl Mp3Encoder {
                 // flush. This path must OWN the frame, so it alone copies.
                 let owned = block.iter().map(|c| c.to_vec()).collect();
                 self.resv_frames_pcm.push((header.clone(), owned));
-                self.total_frames = self.total_frames.saturating_add(1);
-                self.total_bytes += header.frame_size();
             } else if self.reservoir {
                 // Causal: encode now, bank the raw frame; assemble (B8) at flush.
                 self.state
                     .encode_frame_reservoir(&header, block, self.resv_gain);
-                self.total_frames = self.total_frames.saturating_add(1);
-                self.total_bytes += header.frame_size();
             } else if let Ok(bytes) = self.state.encode_frame(&header, block, self.quality) {
-                self.total_frames = self.total_frames.saturating_add(1);
-                self.total_bytes += bytes.len();
+                // Not `emit`: `block` still borrows the staging buffers.
+                if let Some(stats) = self.tag_stats.as_mut() {
+                    stats.add_frame(&bytes);
+                }
+                self.queue.extend(self.tag_placeholder.take());
                 self.queue.push_back(bytes);
             }
             off += spf;
