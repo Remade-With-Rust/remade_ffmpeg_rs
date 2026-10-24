@@ -4910,7 +4910,7 @@ dependencies = [
 
 [[package]]
 name = "rff-cli"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "remade-ffmpeg",
  "rff-core",
@@ -4926,7 +4926,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-aac"
-version = "1.1.5"
+version = "1.1.6"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5008,7 +5008,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-mp3"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5332,7 +5332,7 @@ version = "0.4.0"
 
 [[package]]
 name = "rff-server"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "axum",
  "remade-ffmpeg",
@@ -5745,7 +5745,7 @@ source = "git+https://github.com/Remade-With-Rust/rusty_json_turbo?branch=master
 
 [[package]]
 name = "rusty_mp3"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "rusty_alloc-api",
 ]
