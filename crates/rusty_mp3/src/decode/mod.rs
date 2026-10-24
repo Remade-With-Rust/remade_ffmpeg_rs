@@ -279,9 +279,9 @@ impl TransformState {
             let t1 = stage1(1, self);
             let start = pcm.len();
             pcm.resize(start + 2 * GRANULE_LINES, 0.0);
-            let out: &mut [f32; 2 * GRANULE_LINES] = (&mut pcm[start..])
-                .try_into()
-                .expect("resized by exactly one stereo granule");
+            let Some(out) = pcm[start..].first_chunk_mut::<{ 2 * GRANULE_LINES }>() else {
+                return; // unreachable: just resized by exactly one stereo granule
+            };
             let [f0, f1] = &mut self.synth_fifo;
             prof::time(&prof::SYNTH, || {
                 synthesis::polyphase_stereo([&t0, &t1], [f0, f1], out);

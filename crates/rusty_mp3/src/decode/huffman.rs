@@ -563,7 +563,11 @@ fn apply_signs<const N: usize>(mags: [i32; N], signs: u32, s: u32) -> [i32; N] {
 
 // Codebook indices are < 256 and values <= 15 in magnitude, so every narrowing
 // below is exact (signed values are stored as 5-bit two's complement).
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 fn build_pair(t: &PairTable) -> FastPair {
     if t.dim == 0 || t.book.codes.is_empty() {
         return FastPair {
@@ -1039,6 +1043,8 @@ mod tests {
     /// scalefactors, preflag and `scalefac_scale`, at every sample rate.
     #[test]
     #[cfg_attr(miri, ignore = "randomised sweep: too slow to interpret under Miri")]
+    // Test-only: `rnd(n)` is below `n`, which fits every target type.
+    #[allow(clippy::cast_possible_truncation)]
     fn fused_dequant_matches_two_pass() {
         let mut s = 0xD1B5_4A32_D192_ED03u64;
         let mut rnd = move |n: u64| {
@@ -1109,6 +1115,8 @@ mod tests {
     /// end anywhere, including inside a codeword.
     #[test]
     #[cfg_attr(miri, ignore = "randomised sweep: too slow to interpret under Miri")]
+    // Test-only: `rnd(n)` is below `n`, which fits every target type.
+    #[allow(clippy::cast_possible_truncation)]
     fn fast_decode_matches_reference() {
         let mut s = 0x9E37_79B9_7F4A_7C15u64;
         let mut rnd = move |n: u64| {
