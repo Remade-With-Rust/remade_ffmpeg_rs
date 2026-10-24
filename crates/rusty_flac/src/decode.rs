@@ -471,10 +471,8 @@ fn decode_residual(
             }
             w += cnt;
         } else {
-            for slot in &mut out[w..w + cnt] {
-                let u = br.read_rice(param).ok_or(DecodeError::Truncated)?;
-                *slot = ((u >> 1) as i32) ^ -((u & 1) as i32); // un-zigzag
-            }
+            br.read_rice_signed_run(param, &mut out[w..w + cnt])
+                .ok_or(DecodeError::Truncated)?;
             w += cnt;
         }
     }

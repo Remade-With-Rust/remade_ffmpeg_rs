@@ -272,6 +272,90 @@ impl<'a> BitReader<'a> {
         let low = if k > 0 { self.read_bits(k)? } else { 0 };
         Some(((q as u64) << k) as u32 | low)
     }
+
+    /// Fill `out` with Rice codes of parameter `k` (`k <= 30`), un-zigzagged
+    /// to signed residuals — exactly `read_rice` + un-zigzag per slot, but
+    /// with the window held in registers for the whole run. `None` = the
+    /// stream ended mid-run (`out` is then partly written).
+    #[inline]
+    pub fn read_rice_signed_run(&mut self, k: u32, out: &mut [i32]) -> Option<()> {
+        debug_assert!(k <= 30);
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        if std::arch::is_x86_feature_detected!("bmi2")
+            && std::arch::is_x86_feature_detected!("lzcnt")
+        {
+            // SAFETY: the CPU supports the features the twin was compiled for.
+            return unsafe { self.rice_run_bmi2(k, out) };
+        }
+        self.rice_run(k, out)
+    }
+
+    /// [`BitReader::read_rice_signed_run`] compiled for BMI2 + LZCNT: a
+    /// one-instruction `leading_zeros` and flag-free variable shifts, which
+    /// is the whole per-code dependency chain. Same body, same output.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[target_feature(enable = "bmi1,bmi2,lzcnt")]
+    unsafe fn rice_run_bmi2(&mut self, k: u32, out: &mut [i32]) -> Option<()> {
+        self.rice_run(k, out)
+    }
+
+    #[inline(always)]
+    fn rice_run(&mut self, k: u32, out: &mut [i32]) -> Option<()> {
+        let mut i = 0;
+        loop {
+            i += self.rice_run_fast(k, &mut out[i..]);
+            if i == out.len() {
+                return Some(());
+            }
+            // A code longer than the window, or the last bytes of the
+            // stream: one code through the general path, then resume.
+            let u = self.read_rice(k)?;
+            out[i] = ((u >> 1) as i32) ^ -((u & 1) as i32);
+            i += 1;
+        }
+    }
+
+    /// The register-resident inner loop. Decodes codes while each one fits
+    /// the window and an 8-byte refill is in bounds; returns how many slots
+    /// of `out` it filled (the rest are left to the general path).
+    #[inline(always)]
+    fn rice_run_fast(&mut self, k: u32, out: &mut [i32]) -> usize {
+        let data = self.data;
+        let (mut pos, mut buf, mut n) = (self.pos, self.bitbuf, self.nbits);
+        let low_mask = (1u32 << k) - 1;
+        let mut i = 0;
+        while i < out.len() {
+            if n < 32 {
+                // Splice the next big-endian word under the valid bits. The
+                // bits it ORs in below the window are the stream's own next
+                // bits, so a later refill ORs identical values (idempotent).
+                let Some(w) = data.get(pos..pos + 8) else {
+                    break;
+                };
+                buf |= u64::from_be_bytes(w.try_into().unwrap()) >> n;
+                let take = (63 - n) >> 3;
+                pos += take as usize;
+                n += take << 3;
+            }
+            let lead = buf.leading_zeros();
+            let len = lead + 1 + k;
+            if len > n {
+                break; // long quotient (or a zero window): general path
+            }
+            // Bring the terminating 1 to bit 63; it and the k low bits are
+            // the top k+1 bits (k <= 30, so no shift reaches 64).
+            let low = ((buf << lead) >> (63 - k)) as u32 & low_mask;
+            buf <<= len; // len <= n <= 63
+            n -= len;
+            let u = (lead << k) | low;
+            out[i] = ((u >> 1) as i32) ^ -((u & 1) as i32);
+            i += 1;
+        }
+        self.pos = pos;
+        self.bitbuf = buf;
+        self.nbits = n;
+        i
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +457,90 @@ mod tests {
         let mut br = BitReader::new(&bytes);
         assert_eq!(br.read_bits(8), Some(0xFF));
         assert_eq!(br.read_bits(1), None);
+    }
+
+    /// Per-code `read_rice` + un-zigzag: the oracle for the run decoder.
+    fn rice_oracle(br: &mut BitReader, k: u32, n: usize) -> Option<Vec<i32>> {
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            let u = br.read_rice(k)?;
+            v.push(((u >> 1) as i32) ^ -((u & 1) as i32));
+        }
+        Some(v)
+    }
+
+    /// Random Rice streams (incl. quotients longer than the window, every
+    /// k, runs that end exactly at / past the end of the data, unaligned
+    /// starts): the run decoder — both the generic body and, when the CPU
+    /// has it, the BMI2 twin — matches the per-code oracle, including where
+    /// it stops and what it reports at a truncation.
+    #[test]
+    fn rice_run_matches_per_code_oracle() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for k in 0..=30u32 {
+            for trial in 0..6 {
+                let mut bw = BitWriter::new();
+                let lead_bits = (rnd() % 8) as u32;
+                bw.write_bits(rnd() & 0xFF, lead_bits);
+                let n = 1 + (rnd() % 700) as usize;
+                for _ in 0..n {
+                    let r = rnd();
+                    let q = match r % 50 {
+                        0 => 30 + (r >> 8) % 140, // long quotient: general path
+                        1..=8 => (r >> 8) % 12,
+                        _ => (r >> 8) % 3,
+                    } as u32;
+                    bw.write_zeros(q);
+                    bw.write_bits(1, 1);
+                    if k > 0 {
+                        bw.write_bits(r >> 20, k);
+                    }
+                }
+                let bytes = bw.into_bytes();
+                // Whole run, a run that reads past the end, and a cut stream.
+                for (len, want) in [
+                    (bytes.len(), n),
+                    (bytes.len(), n + 3),
+                    (bytes.len() * 2 / 3, n),
+                ] {
+                    let data = &bytes[..len];
+                    let mut a = BitReader::new(data);
+                    let mut b = BitReader::new(data);
+                    a.read_bits(lead_bits);
+                    b.read_bits(lead_bits);
+                    let want_v = rice_oracle(&mut a, k, want);
+                    let mut got = alloc::vec![0i32; want];
+                    let got_r = b.read_rice_signed_run(k, &mut got);
+                    assert_eq!(
+                        got_r.is_some(),
+                        want_v.is_some(),
+                        "k={k} t={trial} len={len}"
+                    );
+                    if let Some(w) = want_v {
+                        assert_eq!(got, w, "k={k} t={trial}");
+                        assert_eq!(
+                            a.read_bits(5),
+                            b.read_bits(5),
+                            "k={k}: reader state after run"
+                        );
+                    }
+                    // The generic body on its own (the BMI2 twin's oracle).
+                    let mut c = BitReader::new(data);
+                    c.read_bits(lead_bits);
+                    let mut gen = alloc::vec![0i32; want];
+                    assert_eq!(c.rice_run(k, &mut gen).is_some(), got_r.is_some());
+                    if got_r.is_some() {
+                        assert_eq!(gen, got);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
