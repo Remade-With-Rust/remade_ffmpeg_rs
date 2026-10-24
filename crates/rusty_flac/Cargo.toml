@@ -1,6 +1,6 @@
 [package]
 name = "rusty_flac"
-version = "0.2.0"
+version = "0.2.2"
 # Vendored build copy. `rusty_flac` is published from its own repository
 # (github.com/Remade-With-Rust/rusty_flac), which crates.io names as its source;
 # two repositories publishing one crate name is what makes a version
