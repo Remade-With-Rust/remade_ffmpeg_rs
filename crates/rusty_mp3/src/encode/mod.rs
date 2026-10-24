@@ -229,6 +229,10 @@ impl Default for Mp3Encode {
     }
 }
 
+/// Largest `part2_3_length` (12-bit field): the most bits one granule of one
+/// channel can carry.
+const MAX_GRANULE_BITS: usize = 4095;
+
 /// B8 back-reference cap (`main_data_begin` is 9 bits): the most a frame can borrow.
 const RESV_MAX_BANK: usize = 511 * 8;
 
@@ -565,7 +569,13 @@ impl Mp3Encode {
                 bitstream::region_capacity(&h) * 8 / n_units
             }
             None => frame_budget / n_units,
-        };
+        }
+        // `part2_3_length` is a 12-bit field: a granule can never carry more
+        // than 4095 bits. Uncapped, a large-frame/few-unit configuration (mono
+        // 320 kbps at 32 kHz, mono >= 128 kbps at 16 kHz) budgeted ~4500-5700 bits
+        // per granule, the length wrapped when serialized, and the stream decoded
+        // to noise. Every budget under the cap is untouched.
+        .min(MAX_GRANULE_BITS);
 
         let mut side = SideInfo::default();
         // The main-data region is capacity-bounded by the header, so the writer
