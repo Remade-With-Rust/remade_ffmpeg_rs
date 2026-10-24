@@ -4,6 +4,12 @@ All notable changes to this crate. Security-relevant changes are listed first in
 each release, under **Security**. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.4](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-mp3-v1.0.3...rff-codec-mp3-v1.0.4) - 2026-10-24
+
+### Fixed
+
+- *(deps)* tokio 1.54.1 for RUSTSEC-2026-0386; refresh mp3/aac vet imports for the 0.3.1 release
+
 ## [1.0.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-mp3-v1.0.2...rff-codec-mp3-v1.0.3) - 2026-10-23
 
 ### Other
