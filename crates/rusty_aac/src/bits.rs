@@ -112,6 +112,31 @@ impl<'a> BitReader<'a> {
         out
     }
 
+    /// The whole byte slice being read (for decoders that keep their own bit
+    /// cache over it and hand the position back with `set_position`).
+    #[inline]
+    pub(crate) fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// The 64 bits starting at bit `pos` of `data`, left-aligned; bytes past
+    /// the end read as zero (the free form of `peek_window`).
+    #[inline(always)]
+    pub(crate) fn window_at(data: &[u8], pos: usize) -> u64 {
+        let byte = pos / 8;
+        if let Some(w) = data.get(byte..byte + 8) {
+            // Cannot fail: `get(byte..byte + 8)` returned exactly eight bytes.
+            let w: [u8; 8] = w.try_into().expect("an 8-byte slice");
+            return u64::from_be_bytes(w) << (pos % 8);
+        }
+        let mut buf = [0u8; 8];
+        let end = (byte + 8).min(data.len());
+        if byte < end {
+            buf[..end - byte].copy_from_slice(&data[byte..end]);
+        }
+        u64::from_be_bytes(buf) << (pos % 8)
+    }
+
     /// Absolute bit position from the start of the data.
     #[must_use]
     pub fn position(&self) -> usize {
