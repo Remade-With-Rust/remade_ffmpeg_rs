@@ -791,8 +791,84 @@ fn restore_fixed(buf: &mut [i32], order: usize) {
 
 /// Invert the LPC predictor in place. The recurrence is inherently serial,
 /// but const-order specializations let the compiler keep the whole predictor
-/// state in registers for the common orders.
+/// state in registers for the common orders. On x86-64 with AVX2, orders
+/// 5..=12 go to [`restore_lpc_avx2`].
 fn restore_lpc(buf: &mut [i32], qlp: &[i32], shift: u32) {
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    if (5..=12).contains(&qlp.len()) && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the CPU supports the feature the kernel was compiled for.
+        return unsafe { restore_lpc_avx2(buf, qlp, shift) };
+    }
+    restore_lpc_scalar(buf, qlp, shift)
+}
+
+/// LPC restore for orders 5..=12 with the taps split by age.
+///
+/// The scalar loop issues `order` 64-bit multiplies per sample (one port),
+/// and its newest-sample term is also the recurrence, so the loop sits at
+/// both bounds at once. Here the four newest samples ride in general
+/// registers (four scalar multiplies, the newest added last), and the taps
+/// of lags 5..=12 run on a register-resident 8 x i32 window of older
+/// samples: two `vpmuldq` (signed 32 x 32 -> 64, even and odd lanes) and a
+/// horizontal add. The window takes in a sample four iterations after it
+/// was produced, so the vector side has that long to finish and stays off
+/// the recurrence; it is never re-read from `buf`, so there is no
+/// store-to-load forwarding hazard. Coefficients past `order` are zero.
+///
+/// Exact: every product and the sum are exact in i64 (|qlp| < 2^15,
+/// |sample| < 2^32, at most 12 taps), so the order of the adds cannot change
+/// the result; `restore_lpc_matches_reference` checks it bit for bit.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn restore_lpc_avx2(buf: &mut [i32], qlp: &[i32], shift: u32) {
+    use core::arch::x86_64::*;
+    let order = qlp.len();
+    debug_assert!((5..=12).contains(&order) && buf.len() >= order);
+    let c = |j: usize| qlp.get(j).map_or(0i64, |&v| v as i64);
+    let (c0, c1, c2, c3) = (c(0), c(1), c(2), c(3));
+    // Window lane j holds the sample of lag 5 + j (lane 0 the most recent);
+    // `vpmuldq` reads the low dword of each qword, so the even lanes'
+    // coefficients sit in `ce` and the odd lanes' (after a 32-bit shift of
+    // the window) in `co`.
+    let ce = _mm256_set_epi64x(c(10), c(8), c(6), c(4));
+    let co = _mm256_set_epi64x(c(11), c(9), c(7), c(5));
+    let up = _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6);
+    let mut init = [0i32; 8];
+    for (j, w) in init.iter_mut().enumerate() {
+        // lag 5 + j relative to the first restored sample `order`
+        if let Some(k) = order.checked_sub(5 + j) {
+            *w = buf[k];
+        }
+    }
+    // SAFETY: `init` is 8 readable i32s.
+    let mut win = unsafe { _mm256_loadu_si256(init.as_ptr() as *const __m256i) };
+    let (mut h0, mut h1, mut h2, mut h3) = (
+        buf[order - 1] as i64,
+        buf[order - 2] as i64,
+        buf[order - 3] as i64,
+        buf[order - 4] as i64,
+    );
+    for slot in &mut buf[order..] {
+        let p = _mm256_add_epi64(
+            _mm256_mul_epi32(win, ce),
+            _mm256_mul_epi32(_mm256_srli_epi64::<32>(win), co),
+        );
+        let t = _mm_add_epi64(_mm256_castsi256_si128(p), _mm256_extracti128_si256::<1>(p));
+        let old = _mm_cvtsi128_si64(_mm_add_epi64(t, _mm_unpackhi_epi64(t, t)));
+        let sum = old + c3 * h3 + c2 * h2 + c1 * h1 + c0 * h0;
+        let x = slot.wrapping_add((sum >> shift) as i32);
+        *slot = x;
+        // Next sample's window: lags shift by one, the lag-4 sample enters.
+        win = _mm256_blend_epi32::<1>(
+            _mm256_permutevar8x32_epi32(win, up),
+            _mm256_set1_epi32(h3 as i32),
+        );
+        (h3, h2, h1, h0) = (h2, h1, h0, x as i64);
+    }
+}
+
+/// The portable LPC restore (and the AVX2 kernel's fallback).
+fn restore_lpc_scalar(buf: &mut [i32], qlp: &[i32], shift: u32) {
     #[inline(always)]
     fn run<const ORDER: usize>(buf: &mut [i32], qlp: &[i32], shift: u32) {
         let mut coeffs = [0i32; 32];
@@ -1116,6 +1192,65 @@ mod tests {
         bad[40] ^= 0x10;
         assert!(fd.decode_frame_interleaved(&bad, &mut got).is_err());
         assert!(StreamInfo::parse(&stream[8..20]).is_err());
+    }
+
+    /// The textbook LPC restore (every tap reloaded): the oracle for the
+    /// const-order loops and the AVX2 kernel.
+    fn restore_lpc_ref(buf: &mut [i32], qlp: &[i32], shift: u32) {
+        for i in qlp.len()..buf.len() {
+            let mut sum = 0i64;
+            for (j, &c) in qlp.iter().enumerate() {
+                sum += c as i64 * buf[i - 1 - j] as i64;
+            }
+            buf[i] = buf[i].wrapping_add((sum >> shift) as i32);
+        }
+    }
+
+    /// Every order 1..=32, every shift, lengths from exactly `order` up,
+    /// extreme coefficients (+-2^14) and full-range (wrapping) samples: the
+    /// dispatching restore (AVX2 for 5..=12 where the CPU has it) and the
+    /// scalar loops both match the oracle exactly.
+    #[test]
+    fn restore_lpc_matches_reference() {
+        let mut x = 0x0123_4567_89AB_CDEFu64;
+        let mut rnd = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 32) as u32
+        };
+        for order in 1..=32usize {
+            for shift in 0..16u32 {
+                let extreme = shift % 5 == 0;
+                let qlp: Vec<i32> = (0..order)
+                    .map(|_| {
+                        if extreme {
+                            [-16384, 16383][(rnd() & 1) as usize]
+                        } else {
+                            rnd() as i32 >> 18
+                        }
+                    })
+                    .collect();
+                let n = order + (rnd() % 300) as usize;
+                let buf: Vec<i32> = (0..n)
+                    .map(|_| {
+                        if extreme {
+                            rnd() as i32
+                        } else {
+                            rnd() as i32 >> 15
+                        }
+                    })
+                    .collect();
+                let mut want = buf.clone();
+                restore_lpc_ref(&mut want, &qlp, shift);
+                let mut a = buf.clone();
+                restore_lpc(&mut a, &qlp, shift);
+                assert_eq!(a, want, "dispatch order={order} shift={shift}");
+                let mut b = buf;
+                restore_lpc_scalar(&mut b, &qlp, shift);
+                assert_eq!(b, want, "scalar order={order} shift={shift}");
+            }
+        }
     }
 
     #[test]
