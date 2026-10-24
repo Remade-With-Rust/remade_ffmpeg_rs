@@ -450,9 +450,19 @@ impl Mp3Encode {
             raw
         };
         let mut fheader = header.clone();
-        if use_ms {
+        // Every stereo frame is signalled JOINT stereo, with mode_extension
+        // carrying this frame's M/S choice (L/R frames: `00`, which decodes
+        // exactly as plain stereo). Switching the channel-mode field itself
+        // between stereo and joint stereo made consecutive frames' headers
+        // differ, and FFmpeg's demuxer only syncs on two consecutive frames
+        // whose headers agree outside the bitrate/padding/mode-extension bits:
+        // a stream whose first two frames disagreed was rejected outright
+        // ("Failed to find two consecutive MPEG audio frames", issue #69), and
+        // a longer one has everything before its first agreeing pair skipped
+        // as junk (`mp3_read_header`). LAME's joint mode signals it this way.
+        if nch == 2 {
             fheader.channel_mode = crate::frame::ChannelMode::JointStereo {
-                ms_stereo: true,
+                ms_stereo: use_ms,
                 intensity_stereo: false,
             };
         }
