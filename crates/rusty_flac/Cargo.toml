@@ -1,6 +1,6 @@
 [package]
 name = "rusty_flac"
-version = "0.2.0"
+version = "0.2.2"
 # Vendored build copy. `rusty_flac` is published from its own repository
 # (github.com/Remade-With-Rust/rusty_flac), which crates.io names as its source;
 # two repositories publishing one crate name is what makes a version
@@ -38,6 +38,9 @@ std = []
 # chip built the same way (the libm functions are deterministic, the platform
 # libm is not guaranteed to be).
 libm = ["dep:libm"]
+# `profile`: the decode stage profiler (`rusty_flac::profile`), measurement
+# only and never in a shipped build. Off, every scope is a zero-sized no-op.
+profile = ["std"]
 
 [dependencies]
 # The only dependency, and optional: pure Rust, no_std, zero deps of its own.
