@@ -55,19 +55,8 @@ fn main() {
     let t0 = std::time::Instant::now();
     for _ in 0..repeats {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let frames: Vec<rusty_mp3::DecodedAudio> = if pipelined {
-            rusty_mp3::decode_pipelined(&bytes)
-        } else {
-            let mut dec = Mp3Decoder::new();
-            dec.push(&bytes);
-            dec.flush();
-            let mut v = Vec::new();
-            while let Ok(f) = dec.next_frame() {
-                v.push(f);
-            }
-            v
-        };
-        for f in frames {
+        // Count and hash one decoded frame, then drop it.
+        let mut eat = |f: rusty_mp3::DecodedAudio| {
             FRAMES.fetch_add(1, Relaxed);
             SAMPLES.fetch_add(
                 (f.samples.len() / f.channels.max(1) as usize) as u64,
@@ -82,6 +71,28 @@ fn main() {
                         h = h.wrapping_mul(0x0000_0100_0000_01b3);
                     }
                 }
+            }
+        };
+        if pipelined {
+            for f in rusty_mp3::decode_pipelined(&bytes) {
+                eat(f);
+            }
+        } else {
+            // Streamed: push 1 KiB at a time and drain as we go, so each frame's
+            // PCM is freed before the next is decoded. Collecting the whole file's
+            // frames first (~200 MB for ten minutes of stereo) made every output
+            // write a fresh page, and those faults landed inside the synthesis
+            // scope -- inflating it ~1.7x against an in-memory streaming decode.
+            let mut dec = Mp3Decoder::new();
+            for chunk in bytes.chunks(1024) {
+                dec.push(chunk);
+                while let Ok(f) = dec.next_frame() {
+                    eat(f);
+                }
+            }
+            dec.flush();
+            while let Ok(f) = dec.next_frame() {
+                eat(f);
             }
         }
         pcm_hash = h;
