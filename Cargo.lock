@@ -5643,7 +5643,7 @@ checksum = "5d0759292494abff44394742849f17ebcde329ed647e140ba301442efba14641"
 
 [[package]]
 name = "rusty_flac"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "claxon",
  "libm",

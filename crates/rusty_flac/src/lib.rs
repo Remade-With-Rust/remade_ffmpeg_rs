@@ -35,7 +35,15 @@ mod decode;
 mod encode;
 mod math;
 mod md5;
+mod prof;
 mod window_table;
 
-pub use decode::{decode, DecodeError, Decoder, StreamInfo};
+pub use decode::{decode, DecodeError, Decoder, FrameDecoder, Sample, StreamInfo};
 pub use encode::{EncodeError, EncodeStats, Encoder};
+
+/// Decode stage profiler (the `profile` feature; measurement only).
+#[cfg(feature = "profile")]
+#[doc(hidden)]
+pub mod profile {
+    pub use crate::prof::{reset, snapshot, CTR_NAMES, STAGE_NAMES};
+}
