@@ -16,14 +16,14 @@ user-login = "dtolnay"
 user-name = "David Tolnay"
 
 [[publisher.rff-codec]]
-version = "0.4.0"
+version = "0.4.1"
 when = "2026-10-24"
 user-id = 427321
 user-login = "Ttimmahlax"
 user-name = "farmer_timmm"
 
 [[publisher.rff-core]]
-version = "0.4.0"
+version = "0.4.1"
 when = "2026-10-24"
 user-id = 427321
 user-login = "Ttimmahlax"

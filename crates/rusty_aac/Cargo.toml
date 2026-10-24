@@ -12,6 +12,12 @@ keywords = ["aac", "audio", "codec", "decoder", "encoder"]
 categories = ["multimedia::audio", "multimedia::encoding"]
 rust-version = "1.85"
 
+# `supply-chain/` (the cargo-vet store for this crate's CI gate) is not part of
+# the published crate: shipping it made every imports refresh change the
+# package, so release-plz cut a new version, which the gate then had to vet
+# again -- a release loop.
+exclude = ["supply-chain/"]
+
 [features]
 default = ["simd"]
 simd = []
