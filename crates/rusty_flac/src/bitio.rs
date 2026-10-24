@@ -323,9 +323,14 @@ impl<'a> BitReader<'a> {
         let data = self.data;
         let (mut pos, mut buf, mut n) = (self.pos, self.bitbuf, self.nbits);
         let low_mask = (1u32 << k) - 1;
+        // For small k (16-bit material), refill only when a code with a
+        // quotient of up to 12 might not fit: fewer and more regularly
+        // spaced refills than "below 32 bits", so the branch mispredicts
+        // less. Larger k keeps 32 (measured: k + 13 there was slower).
+        let refill_below = if k <= 12 { k + 13 } else { 32 };
         let mut i = 0;
         while i < out.len() {
-            if n < 32 {
+            if n < refill_below {
                 // Splice the next big-endian word under the valid bits. The
                 // bits it ORs in below the window are the stream's own next
                 // bits, so a later refill ORs identical values (idempotent).
