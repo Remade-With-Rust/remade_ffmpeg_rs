@@ -38,6 +38,9 @@ std = []
 # chip built the same way (the libm functions are deterministic, the platform
 # libm is not guaranteed to be).
 libm = ["dep:libm"]
+# `profile`: the decode stage profiler (`rusty_flac::profile`), measurement
+# only and never in a shipped build. Off, every scope is a zero-sized no-op.
+profile = ["std"]
 
 [dependencies]
 # The only dependency, and optional: pure Rust, no_std, zero deps of its own.

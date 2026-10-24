@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 
 use crate::bitio::BitReader;
 use crate::crc::{crc16, crc8};
+use crate::prof::{self, Ctr, Stage};
 
 /// Parsed STREAMINFO.
 #[derive(Debug, Clone, Default)]
@@ -123,7 +124,10 @@ impl<'a> Decoder<'a> {
         if self.pos >= self.data.len() {
             return Ok(None);
         }
+        let _frame_scope = prof::scope(Stage::Frame);
+        prof::count(Ctr::Frames, 1);
         let frame_start = self.pos;
+        let hdr_scope = prof::scope(Stage::Header);
         let mut br = BitReader::new(&self.data[frame_start..]);
 
         // --- frame header ---
@@ -192,6 +196,16 @@ impl<'a> Decoder<'a> {
         if nch != self.info.channels as usize {
             return Err(DecodeError::Inconsistent("frame channels"));
         }
+        drop(hdr_scope);
+        prof::count(
+            match ch_assign {
+                8 => Ctr::LeftSide,
+                9 => Ctr::SideRight,
+                10 => Ctr::MidSide,
+                _ => Ctr::Independent,
+            },
+            1,
+        );
 
         // --- subframes ---
         for (c, buf) in self.scratch.iter_mut().take(nch).enumerate() {
@@ -208,15 +222,19 @@ impl<'a> Decoder<'a> {
         }
 
         // --- footer ---
+        let crc_scope = prof::scope(Stage::Crc16);
         br.align_to_byte();
         let frame_len = br.byte_pos();
         let fcrc = br.read_bits(16).ok_or(DecodeError::Truncated)? as u16;
+        prof::count(Ctr::CrcBytes, frame_len as u64);
         if crc16(&self.data[frame_start..frame_start + frame_len]) != fcrc {
             return Err(DecodeError::BadFrameCrc);
         }
         self.pos = frame_start + frame_len + 2;
+        drop(crc_scope);
 
         // --- stereo reconstruction into out ---
+        let decorr_scope = prof::scope(Stage::Decorr);
         match ch_assign {
             8 => {
                 // left/side: R = L - side
@@ -246,6 +264,8 @@ impl<'a> Decoder<'a> {
             }
             _ => {}
         }
+        drop(decorr_scope);
+        let _out_scope = prof::scope(Stage::Output);
         for (o, s) in out.iter_mut().zip(&self.scratch) {
             o.extend_from_slice(s);
         }
@@ -312,6 +332,8 @@ fn decode_subframe(
     out: &mut [i32],
 ) -> Result<(), DecodeError> {
     debug_assert_eq!(out.len(), bs);
+    prof::count(Ctr::Subframes, 1);
+    let hdr_scope = prof::scope(Stage::SubHeader);
     if br.read_bits(1).ok_or(DecodeError::Truncated)? != 0 {
         return Err(DecodeError::BadSubframe("padding bit"));
     }
@@ -328,10 +350,16 @@ fn decode_subframe(
 
     match ty {
         0b000000 => {
+            drop(hdr_scope);
+            let _s = prof::scope(Stage::Misc);
+            prof::count(Ctr::Constant, 1);
             let v = br.read_signed(ebps).ok_or(DecodeError::Truncated)?;
             out.fill(v);
         }
         0b000001 => {
+            drop(hdr_scope);
+            let _s = prof::scope(Stage::Misc);
+            prof::count(Ctr::Verbatim, 1);
             for slot in out.iter_mut() {
                 *slot = br.read_signed(ebps).ok_or(DecodeError::Truncated)?;
             }
@@ -344,7 +372,10 @@ fn decode_subframe(
             for slot in out[..order].iter_mut() {
                 *slot = br.read_signed(ebps).ok_or(DecodeError::Truncated)?;
             }
+            drop(hdr_scope);
+            prof::count(Ctr::FixedSub, 1);
             decode_residual(br, bs, order, out)?;
+            let _s = prof::scope(Stage::Fixed);
             restore_fixed(out, order);
         }
         0b100000..=0b111111 => {
@@ -367,13 +398,29 @@ fn decode_subframe(
             for q in qlp.iter_mut().take(order) {
                 *q = br.read_signed(prec).ok_or(DecodeError::Truncated)?;
             }
+            drop(hdr_scope);
+            prof::count(Ctr::LpcSub, 1);
+            prof::count(Ctr::LpcOrderSum, order as u64);
+            prof::count(Ctr::LpcHighOrder, u64::from(order > 12));
+            // Accumulator bound: |sum| < 2^(ebps-1) * 2^(prec-1) * order.
+            let acc_bits = ebps + prec + (usize::BITS - (order - 1).leading_zeros());
+            prof::count(
+                if acc_bits <= 32 {
+                    Ctr::LpcSamples32
+                } else {
+                    Ctr::LpcSamples64
+                },
+                (bs - order) as u64,
+            );
             decode_residual(br, bs, order, out)?;
+            let _s = prof::scope(Stage::Lpc);
             restore_lpc(out, &qlp[..order], shift as u32);
         }
         _ => return Err(DecodeError::BadSubframe("reserved type")),
     }
 
     if wasted > 0 {
+        let _s = prof::scope(Stage::Misc);
         for v in out.iter_mut() {
             *v <<= wasted;
         }
@@ -391,6 +438,8 @@ fn decode_residual(
     order: usize,
     out: &mut [i32],
 ) -> Result<(), DecodeError> {
+    let _s = prof::scope(Stage::Residual);
+    prof::count(Ctr::Residuals, (bs - order) as u64);
     let method = br.read_bits(2).ok_or(DecodeError::Truncated)?;
     let (pbits, escape) = match method {
         0 => (4u32, 15u32),
@@ -409,7 +458,9 @@ fn decode_residual(
     for part in 0..n_part {
         let cnt = if part == 0 { psize - order } else { psize };
         let param = br.read_bits(pbits).ok_or(DecodeError::Truncated)?;
+        prof::count(Ctr::Partitions, 1);
         if param == escape {
+            prof::count(Ctr::EscapePartitions, 1);
             let raw = br.read_bits(5).ok_or(DecodeError::Truncated)?;
             if raw > 0 {
                 for slot in &mut out[w..w + cnt] {

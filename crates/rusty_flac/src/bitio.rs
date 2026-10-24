@@ -267,6 +267,7 @@ impl<'a> BitReader<'a> {
         }
         // Slow path (long quotient / end of stream): compose from primitives.
         // The u64 shift tolerates absurd quotients from malformed streams.
+        crate::prof::count(crate::prof::Ctr::RiceSlow, 1);
         let q = self.read_unary()?;
         let low = if k > 0 { self.read_bits(k)? } else { 0 };
         Some(((q as u64) << k) as u32 | low)
