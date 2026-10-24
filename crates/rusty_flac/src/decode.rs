@@ -121,10 +121,60 @@ impl<'a> Decoder<'a> {
     /// channel's samples are APPENDED). Returns the frame's block size, or
     /// `None` at end of stream.
     pub fn next_frame(&mut self, out: &mut [Vec<i32>]) -> Result<Option<usize>, DecodeError> {
+        let _frame_scope = prof::scope(Stage::Frame);
+        let Some((bs, ch_assign)) = self.decode_frame()? else {
+            return Ok(None);
+        };
+        // --- stereo reconstruction into out ---
+        let decorr_scope = prof::scope(Stage::Decorr);
+        if let [a, b] = &mut self.scratch[..] {
+            decorrelate(ch_assign, &mut a[..bs], &mut b[..bs]);
+        }
+        drop(decorr_scope);
+        let _out_scope = prof::scope(Stage::Output);
+        for (o, s) in out.iter_mut().zip(&self.scratch) {
+            o.extend_from_slice(&s[..bs]);
+        }
+        Ok(Some(bs))
+    }
+
+    /// Decode the next frame and APPEND it to `out` interleaved (frame by
+    /// frame, channels in stream order), converted to `S`:
+    ///
+    /// - `i32`: the native-width sample values (what [`Decoder::next_frame`]
+    ///   gives, interleaved);
+    /// - `f32`: normalised to [-1, 1) as `sample / 2^(bits_per_sample - 1)`
+    ///   (exact for up to 24-bit streams);
+    /// - `i16`: streams of at most 16 bits, scaled up to the 16-bit grid
+    ///   (`sample << (16 - bits_per_sample)`); a wider stream is an
+    ///   [`DecodeError::Inconsistent`] error before anything is decoded.
+    ///
+    /// Stereo decorrelation, interleaving and the conversion are one pass
+    /// over the decoded channels, so this is the cheapest way to interleaved
+    /// PCM. Returns the frame's block size, or `None` at end of stream; on an
+    /// error `out` is left as it was.
+    pub fn next_frame_interleaved<S: Sample>(
+        &mut self,
+        out: &mut Vec<S>,
+    ) -> Result<Option<usize>, DecodeError> {
+        let _frame_scope = prof::scope(Stage::Frame);
+        let scale = S::scale(self.info.bits_per_sample)?;
+        let Some((bs, ch_assign)) = self.decode_frame()? else {
+            return Ok(None);
+        };
+        let _out_scope = prof::scope(Stage::Output);
+        write_interleaved(&self.scratch, bs, ch_assign, scale, out);
+        Ok(Some(bs))
+    }
+
+    /// Parse and decode the next frame into `scratch` (coded channel
+    /// domain: a stereo pair is still in its coded assignment), verifying
+    /// both CRCs. Returns `(block size, channel assignment)`, or `None` at
+    /// end of stream. `pos` advances only past a frame that decoded cleanly.
+    fn decode_frame(&mut self) -> Result<Option<(usize, u32)>, DecodeError> {
         if self.pos >= self.data.len() {
             return Ok(None);
         }
-        let _frame_scope = prof::scope(Stage::Frame);
         prof::count(Ctr::Frames, 1);
         let frame_start = self.pos;
         let hdr_scope = prof::scope(Stage::Header);
@@ -232,18 +282,141 @@ impl<'a> Decoder<'a> {
         }
         self.pos = frame_start + frame_len + 2;
         drop(crc_scope);
+        Ok(Some((bs, ch_assign)))
+    }
+}
 
-        // --- stereo reconstruction into out ---
-        let decorr_scope = prof::scope(Stage::Decorr);
-        if let [a, b] = &mut self.scratch[..] {
-            decorrelate(ch_assign, &mut a[..bs], &mut b[..bs]);
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for i32 {}
+    impl Sealed for f32 {}
+    impl Sealed for i16 {}
+}
+
+/// Per-stream conversion parameters for a [`Sample`] type.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct Scale {
+    /// `1 / 2^(bps - 1)` (f32 output).
+    inv: f32,
+    /// `16 - bps` (i16 output).
+    up: u32,
+}
+
+/// Output sample types for [`Decoder::next_frame_interleaved`]: `i32`
+/// (native width), `f32` (normalised) and `i16` (streams of at most 16
+/// bits). Sealed: the conversions belong to this crate.
+pub trait Sample: Copy + Default + sealed::Sealed {
+    #[doc(hidden)]
+    fn scale(bits_per_sample: u32) -> Result<Scale, DecodeError>;
+    #[doc(hidden)]
+    fn from_native(v: i32, s: Scale) -> Self;
+}
+
+fn base_scale(bps: u32) -> Scale {
+    Scale {
+        inv: 1.0 / (1u64 << (bps.clamp(1, 32) - 1)) as f32,
+        up: 16u32.saturating_sub(bps),
+    }
+}
+
+impl Sample for i32 {
+    fn scale(bps: u32) -> Result<Scale, DecodeError> {
+        Ok(base_scale(bps))
+    }
+    #[inline(always)]
+    fn from_native(v: i32, _: Scale) -> i32 {
+        v
+    }
+}
+
+impl Sample for f32 {
+    fn scale(bps: u32) -> Result<Scale, DecodeError> {
+        Ok(base_scale(bps))
+    }
+    #[inline(always)]
+    fn from_native(v: i32, s: Scale) -> f32 {
+        v as f32 * s.inv
+    }
+}
+
+impl Sample for i16 {
+    fn scale(bps: u32) -> Result<Scale, DecodeError> {
+        if bps > 16 {
+            return Err(DecodeError::Inconsistent(
+                "i16 output needs a stream of at most 16 bits per sample",
+            ));
         }
-        drop(decorr_scope);
-        let _out_scope = prof::scope(Stage::Output);
-        for (o, s) in out.iter_mut().zip(&self.scratch) {
-            o.extend_from_slice(s);
+        Ok(base_scale(bps))
+    }
+    #[inline(always)]
+    fn from_native(v: i32, s: Scale) -> i16 {
+        (v << s.up) as i16
+    }
+}
+
+/// Decorrelate (stereo), interleave and convert one decoded block from the
+/// coded-channel scratch onto the end of `out`, in one pass.
+fn write_interleaved<S: Sample>(
+    chans: &[Vec<i32>],
+    bs: usize,
+    ch_assign: u32,
+    scale: Scale,
+    out: &mut Vec<S>,
+) {
+    let nch = chans.len();
+    let start = out.len();
+    // The fill is the block's size (cache-resident when the caller reuses
+    // `out` per frame); every slot is then overwritten.
+    out.resize(start + bs * nch, S::default());
+    let dst = &mut out[start..];
+    let cv = |v: i32| S::from_native(v, scale);
+    match chans {
+        [m] => {
+            for (d, &v) in dst.iter_mut().zip(&m[..bs]) {
+                *d = cv(v);
+            }
         }
-        Ok(Some(bs))
+        [a, b] => {
+            let pairs = dst.chunks_exact_mut(2).zip(a[..bs].iter().zip(&b[..bs]));
+            match ch_assign {
+                8 => {
+                    // left/side: R = L - side
+                    for (d, (&l, &s)) in pairs {
+                        d[0] = cv(l);
+                        d[1] = cv(l.wrapping_sub(s));
+                    }
+                }
+                9 => {
+                    // side/right: L = side + R
+                    for (d, (&s, &r)) in pairs {
+                        d[0] = cv(s.wrapping_add(r));
+                        d[1] = cv(r);
+                    }
+                }
+                10 => {
+                    // mid/side (the exact i32 form: see `decorrelate`)
+                    for (d, (&m, &s)) in pairs {
+                        let r = m.wrapping_sub(s >> 1);
+                        d[0] = cv(r.wrapping_add(s));
+                        d[1] = cv(r);
+                    }
+                }
+                _ => {
+                    for (d, (&l, &r)) in pairs {
+                        d[0] = cv(l);
+                        d[1] = cv(r);
+                    }
+                }
+            }
+        }
+        _ => {
+            for (c, ch) in chans.iter().enumerate() {
+                for (d, &v) in dst[c..].iter_mut().step_by(nch).zip(&ch[..bs]) {
+                    *d = cv(v);
+                }
+            }
+        }
     }
 }
 
@@ -765,6 +938,73 @@ mod tests {
             decorrelate_ref(ch_assign, &mut a, &mut b);
             assert_eq!((a1, b1), (a, b), "ch_assign={ch_assign}");
         }
+    }
+
+    /// `next_frame_interleaved` (i32 / f32 / i16) equals the planar
+    /// `next_frame` output interleaved and converted by hand, frame by frame,
+    /// for mono, stereo (the encoder picks every assignment over this
+    /// signal) and 6 channels, 16- and 8-bit; i16 refuses a 24-bit stream.
+    #[test]
+    fn interleaved_matches_planar() {
+        let (l, r) = test_signal(40_000);
+        let streams: Vec<(Vec<u8>, u32)> = [1usize, 2, 6]
+            .iter()
+            .flat_map(|&ch| [16u32, 8].into_iter().map(move |bps| (ch, bps)))
+            .map(|(ch, bps)| {
+                let shift = 16 - bps;
+                let chans: Vec<Vec<i32>> = (0..ch)
+                    .map(|c| {
+                        let src = if c % 2 == 0 { &l } else { &r };
+                        src.iter().map(|&v| (v >> shift) + c as i32).collect()
+                    })
+                    .collect();
+                let refs: Vec<&[i32]> = chans.iter().map(|c| c.as_slice()).collect();
+                let mut enc = Encoder::new(44100, ch as u32, bps).unwrap();
+                enc.push_planar(&refs).unwrap();
+                (enc.finish(), bps)
+            })
+            .collect();
+        for (stream, bps) in &streams {
+            let mut planar = Decoder::new(stream).unwrap();
+            let mut di = Decoder::new(stream).unwrap();
+            let mut df = Decoder::new(stream).unwrap();
+            let mut ds = Decoder::new(stream).unwrap();
+            let nch = planar.streaminfo().channels as usize;
+            let inv = 1.0 / (1u64 << (bps - 1)) as f32;
+            let (mut oi, mut of, mut os) = (Vec::new(), Vec::new(), Vec::new());
+            loop {
+                let mut chans = vec![Vec::new(); nch];
+                let n = planar.next_frame(&mut chans).unwrap();
+                oi.clear();
+                of.clear();
+                os.clear();
+                assert_eq!(di.next_frame_interleaved::<i32>(&mut oi).unwrap(), n);
+                assert_eq!(df.next_frame_interleaved::<f32>(&mut of).unwrap(), n);
+                assert_eq!(ds.next_frame_interleaved::<i16>(&mut os).unwrap(), n);
+                let Some(n) = n else { break };
+                for i in 0..n {
+                    for c in 0..nch {
+                        let v = chans[c][i];
+                        assert_eq!(oi[i * nch + c], v);
+                        assert_eq!(of[i * nch + c].to_bits(), (v as f32 * inv).to_bits());
+                        assert_eq!(os[i * nch + c], (v << (16 - bps)) as i16);
+                    }
+                }
+            }
+        }
+        // i16 refuses wider streams without consuming a frame.
+        let mut enc = Encoder::new(48000, 1, 24).unwrap();
+        enc.push_planar(&[&l[..1000]]).unwrap();
+        let stream = enc.finish();
+        let mut d = Decoder::new(&stream).unwrap();
+        let mut o16: Vec<i16> = Vec::new();
+        assert!(d.next_frame_interleaved::<i16>(&mut o16).is_err());
+        let mut o32: Vec<i32> = Vec::new();
+        assert_eq!(
+            d.next_frame_interleaved::<i32>(&mut o32).unwrap(),
+            Some(1000)
+        );
+        assert_eq!(o32, l[..1000]);
     }
 
     #[test]

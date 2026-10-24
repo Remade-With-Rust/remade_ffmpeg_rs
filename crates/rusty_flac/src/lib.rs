@@ -38,7 +38,7 @@ mod md5;
 mod prof;
 mod window_table;
 
-pub use decode::{decode, DecodeError, Decoder, StreamInfo};
+pub use decode::{decode, DecodeError, Decoder, Sample, StreamInfo};
 pub use encode::{EncodeError, EncodeStats, Encoder};
 
 /// Decode stage profiler (the `profile` feature; measurement only).
