@@ -18,6 +18,10 @@ exclude = ["lab-results/"]
 [dependencies]
 
 [features]
+# Decode stage clock (`decode::prof::time` / `dump`): two `Instant::now()` per
+# stage per granule and channel. Off by default -- it sat on the shipping path.
+# `cargo run --release --example decprof --features profile -- <file.mp3>`.
+profile = []
 # The MP3 encoder experiment harness (brick registry, corpus, metrics, variant
 # sweeps). Opt-in — zero weight on the default build.
 lab = []
