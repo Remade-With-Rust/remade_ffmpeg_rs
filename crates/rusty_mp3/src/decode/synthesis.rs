@@ -477,9 +477,237 @@ fn polyphase_impl(
     pcm
 }
 
+/// **D12** — the synthesis filterbank for BOTH channels of a stereo granule at
+/// once, writing interleaved PCM (`out[2 * n + ch]`).
+///
+/// Per channel this is exactly [`polyphase`]: the same passes, the same
+/// matrixing and windowing sums in the same order. What changes is that the
+/// two channels' passes run side by side in one AVX kernel, so each step keeps
+/// eight independent accumulators live instead of four (the 16-deep add chains
+/// were the bound), the shared cosine and window rows are loaded once for both
+/// channels, and the interleave is two register shuffles per eight samples
+/// instead of a separate pass over the granule. Pinned by
+/// `polyphase_stereo_matches_two_mono_passes`.
+pub fn polyphase_stereo(
+    time: [&[f32; GRANULE_LINES]; 2],
+    fifo: [&mut [f32; 1024]; 2],
+    out: &mut [f32; 2 * GRANULE_LINES],
+) {
+    let simd = super::isa::use_simd();
+    #[cfg(target_arch = "x86_64")]
+    if simd {
+        super::prof::kernel_tally(&super::prof::K_SYNTH_SIMD, 2 * SUBBAND_LINES as u64);
+        // SAFETY: on x86_64 `use_simd()` is true only when AVX was detected.
+        unsafe { polyphase_stereo_avx(time, fifo, out) };
+        return;
+    }
+    // Elsewhere: two mono passes and an interleave (NEON keeps its kernels).
+    let [f0, f1] = fifo;
+    let a = polyphase(time[0], f0);
+    let b = polyphase(time[1], f1);
+    for ((o, &l), &r) in out.chunks_exact_mut(2).zip(&a).zip(&b) {
+        o[0] = l;
+        o[1] = r;
+    }
+}
+
+/// The AVX body of [`polyphase_stereo`].
+///
+/// # Safety
+/// AVX must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn polyphase_stereo_avx(
+    time: [&[f32; GRANULE_LINES]; 2],
+    fifo: [&mut [f32; 1024]; 2],
+    out: &mut [f32; 2 * GRANULE_LINES],
+) {
+    let [f0, f1] = fifo;
+    let d = &SYNTH_D;
+    // See `polyphase_impl` (D2): circular FIFO, both channels advance together.
+    let mut head = 0usize;
+    for v in 0..SUBBAND_LINES {
+        let mut s0 = [0f32; SUBBANDS];
+        let mut s1 = [0f32; SUBBANDS];
+        for k in 0..SUBBANDS {
+            s0[k] = time[0][k * SUBBAND_LINES + v];
+            s1[k] = time[1][k * SUBBAND_LINES + v];
+        }
+        head = (head + 1024 - 64) & 1023;
+        // SAFETY: AVX per this fn's contract.
+        let (v0, v1) = unsafe { matrixing2_avx(&s0, &s1) };
+        f0[head..head + 64].copy_from_slice(&v0);
+        f1[head..head + 64].copy_from_slice(&v1);
+        let o: &mut [f32; 64] = out[v * 64..]
+            .first_chunk_mut()
+            .expect("granule is 18 blocks of 2 x 32");
+        // SAFETY: AVX per this fn's contract; `head` is a multiple of 64.
+        unsafe { window2_avx(f0, f1, d, head, o) };
+    }
+    f0.rotate_left(head);
+    f1.rotate_left(head);
+}
+
+/// [`matrixing_avx`] for two channels in one pass: per channel the identical
+/// lane-wise sums (same `k` order, separate mul and add), with the cosine rows
+/// loaded once for both.
+///
+/// # Safety
+/// Caller must have verified AVX is available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn matrixing2_avx(s0: &[f32; SUBBANDS], s1: &[f32; SUBBANDS]) -> ([f32; 64], [f32; 64]) {
+    use std::arch::x86_64::*;
+    let ct = half_dct_t();
+    let (mut p0, mut m0, mut p1, mut m1) = ([0f32; 16], [0f32; 16], [0f32; 16], [0f32; 16]);
+    for k in 0..16 {
+        p0[k] = s0[k] + s0[31 - k];
+        m0[k] = s0[k] - s0[31 - k];
+        p1[k] = s1[k] + s1[31 - k];
+        m1[k] = s1[k] - s1[31 - k];
+    }
+    // SAFETY: a register constant -- no memory access; the ISA is this fn's contract. Redundant from Rust 1.86 (safe target-feature calls), required at the crate's MSRV (1.85).
+    #[allow(unused_unsafe)]
+    let (mut a0, mut a1) = unsafe { ([_mm256_setzero_ps(); 4], [_mm256_setzero_ps(); 4]) };
+    for k in 0..16 {
+        // SAFETY: `ct[k]` is `[f32; 32]` (`half_dct_t`); `v * 8 + 8 <= 32` for `v < 4`.
+        unsafe {
+            // Even lanes take the sum-folded input, odd lanes the difference.
+            let x0 = _mm256_blend_ps(_mm256_set1_ps(p0[k]), _mm256_set1_ps(m0[k]), 0xAA);
+            let x1 = _mm256_blend_ps(_mm256_set1_ps(p1[k]), _mm256_set1_ps(m1[k]), 0xAA);
+            for v in 0..4 {
+                let c = _mm256_loadu_ps(ct[k].as_ptr().add(v * 8));
+                a0[v] = _mm256_add_ps(a0[v], _mm256_mul_ps(c, x0));
+                a1[v] = _mm256_add_ps(a1[v], _mm256_mul_ps(c, x1));
+            }
+        }
+    }
+    let (mut g0, mut g1) = ([0f32; 32], [0f32; 32]);
+    for v in 0..4 {
+        // SAFETY: `g0`/`g1` are `[f32; 32]`; `v * 8 + 8 <= 32` for `v < 4`.
+        unsafe {
+            _mm256_storeu_ps(g0.as_mut_ptr().add(v * 8), a0[v]);
+            _mm256_storeu_ps(g1.as_mut_ptr().add(v * 8), a1[v]);
+        }
+    }
+    (expand_g(&g0), expand_g(&g1))
+}
+
+/// [`window_avx`] for two channels, writing the 2 x 32 outputs interleaved:
+/// per channel the identical 16-tap sums (`i` ascending, `a` before `b`,
+/// separate mul and add), with the window rows loaded once for both.
+///
+/// # Safety
+/// Caller must have verified AVX is available. Bounds are local, as in
+/// [`window_avx`] (`head` is masked to a multiple of 64).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn window2_avx(
+    f0: &[f32; 1024],
+    f1: &[f32; 1024],
+    d: &[f32; 512],
+    head: usize,
+    out: &mut [f32; 64],
+) {
+    use std::arch::x86_64::*;
+    let head = head & !63;
+    // SAFETY: a register constant -- no memory access; the ISA is this fn's contract. Redundant from Rust 1.86 (safe target-feature calls), required at the crate's MSRV (1.85).
+    #[allow(unused_unsafe)]
+    let (mut a0, mut a1) = unsafe { ([_mm256_setzero_ps(); 4], [_mm256_setzero_ps(); 4]) };
+    for i in 0..8 {
+        // The offsets and masks of `window_avx` (`a <= 960`, `b <= 992`).
+        let a = (head + i * 128) & 0x3C0;
+        let b = (head + i * 128 + 96) & 1023;
+        for v in 0..4 {
+            // SAFETY: as in `window_avx`: both 32-float spans end inside each FIFO (1024), and the `d` offsets reach at most 512, its length.
+            unsafe {
+                let da = _mm256_loadu_ps(d.as_ptr().add(i * 64 + v * 8));
+                let db = _mm256_loadu_ps(d.as_ptr().add(i * 64 + 32 + v * 8));
+                let fa0 = _mm256_loadu_ps(f0.as_ptr().add(a + v * 8));
+                let fa1 = _mm256_loadu_ps(f1.as_ptr().add(a + v * 8));
+                a0[v] = _mm256_add_ps(a0[v], _mm256_mul_ps(fa0, da));
+                a1[v] = _mm256_add_ps(a1[v], _mm256_mul_ps(fa1, da));
+                let fb0 = _mm256_loadu_ps(f0.as_ptr().add(b + v * 8));
+                let fb1 = _mm256_loadu_ps(f1.as_ptr().add(b + v * 8));
+                a0[v] = _mm256_add_ps(a0[v], _mm256_mul_ps(fb0, db));
+                a1[v] = _mm256_add_ps(a1[v], _mm256_mul_ps(fb1, db));
+            }
+        }
+    }
+    for v in 0..4 {
+        // Interleave L/R: [l0 r0 l1 r1 .. l7 r7] for this lane group of eight.
+        // SAFETY: `out` is `[f32; 64]`; `v * 16 + 16 <= 64` for `v < 4`.
+        unsafe {
+            let lo = _mm256_unpacklo_ps(a0[v], a1[v]);
+            let hi = _mm256_unpackhi_ps(a0[v], a1[v]);
+            _mm256_storeu_ps(
+                out.as_mut_ptr().add(v * 16),
+                _mm256_permute2f128_ps(lo, hi, 0x20),
+            );
+            _mm256_storeu_ps(
+                out.as_mut_ptr().add(v * 16 + 8),
+                _mm256_permute2f128_ps(lo, hi, 0x31),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **D12 gate.** The two-channel synthesis is BIT-identical to two mono
+    /// passes on the scalar oracle, interleaved -- over consecutive granules (the
+    /// FIFOs carry), with signed zeros and silent subbands in the input.
+    #[test]
+    fn polyphase_stereo_matches_two_mono_passes() {
+        let mut st = 0x6A09_E667u32;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        let (mut fa0, mut fa1) = ([0f32; 1024], [0f32; 1024]);
+        let (mut fb0, mut fb1) = ([0f32; 1024], [0f32; 1024]);
+        for g in 0..40 {
+            let mut t = [[0f32; GRANULE_LINES]; 2];
+            for (c, tc) in t.iter_mut().enumerate() {
+                for (i, x) in tc.iter_mut().enumerate() {
+                    let r = next();
+                    *x = if (i / 18 + c + g) % 7 == 0 || r % 11 == 0 {
+                        if r & 1 == 0 {
+                            0.0
+                        } else {
+                            -0.0
+                        }
+                    } else {
+                        (r >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+                    };
+                }
+            }
+            let mut got = [0f32; 2 * GRANULE_LINES];
+            polyphase_stereo([&t[0], &t[1]], [&mut fa0, &mut fa1], &mut got);
+            let l = polyphase_impl(&t[0], &mut fb0, false);
+            let r = polyphase_impl(&t[1], &mut fb1, false);
+            for n in 0..GRANULE_LINES {
+                assert_eq!(got[2 * n].to_bits(), l[n].to_bits(), "L[{n}] granule {g}");
+                assert_eq!(
+                    got[2 * n + 1].to_bits(),
+                    r[n].to_bits(),
+                    "R[{n}] granule {g}"
+                );
+            }
+            assert!(fa0
+                .iter()
+                .zip(&fb0)
+                .all(|(x, y)| x.to_bits() == y.to_bits()));
+            assert!(fa1
+                .iter()
+                .zip(&fb1)
+                .all(|(x, y)| x.to_bits() == y.to_bits()));
+        }
+    }
 
     /// **D5 gate.** The AVX matrixing must be BIT-identical to the scalar
     /// `matrixing_fast`. It can be, because `m` is the lane: each of the 32
