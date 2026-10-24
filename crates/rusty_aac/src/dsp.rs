@@ -851,6 +851,31 @@ impl Pow2Dct4 {
         let m = self.l / 2;
         let v = &mut v[..m];
         let x = &x[..self.l];
+        #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+        if m % 4 == 0 {
+            // SAFETY: SSE is baseline on x86-64; `x` is exactly `l = 2m` long,
+            // `v` and `pre` exactly `m`, and `m` is a multiple of 4 (see
+            // `rotate_in_sse`). The loop writes every element of `v`.
+            unsafe {
+                self.rotate_in_sse(x, v);
+                return &mut *(std::ptr::from_mut::<[MaybeUninit<[f32; 2]>]>(v)
+                    as *mut [[f32; 2]]);
+            }
+        }
+        self.rotate_in_uninit_scalar(x, v)
+    }
+
+    /// The scalar body of [`Self::rotate_in_uninit`] (the oracle for the SSE
+    /// twin, and the path on other targets).
+    #[inline(always)]
+    fn rotate_in_uninit_scalar<'a>(
+        &self,
+        x: &[f32],
+        v: &'a mut [MaybeUninit<[f32; 2]>],
+    ) -> &'a mut [[f32; 2]] {
+        let m = self.l / 2;
+        let v = &mut v[..m];
+        let x = &x[..self.l];
         for (((vp, a), b), &[c, s]) in v
             .iter_mut()
             .zip(x.chunks_exact(2))
@@ -905,6 +930,20 @@ impl Pow2Dct4 {
         let v = self.rotate_in_uninit(spec, buf);
         self.fft.run(v);
         let scale = gain / self.l as f32;
+        #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+        if (self.l / 2) % 4 == 0 {
+            // SAFETY: SSE is baseline on x86-64; `v` and `post` hold `m`
+            // entries, `out` at least `l = 2m`, `m % 4 == 0` (see `post_sse`).
+            unsafe { self.post_sse(v, &mut out[..self.l], scale) };
+            return;
+        }
+        self.post_scalar(v, out, scale);
+    }
+
+    /// The post-rotation + scale of [`Self::imdct_half_in`], scalar (the
+    /// oracle for the SSE twin, and the path on other targets).
+    #[inline(always)]
+    fn post_scalar(&self, v: &[[f32; 2]], out: &mut [f32], scale: f32) {
         // out[2q] = -(D·X)[L-1-2q]·s from v[q]; out[2q+1] = -(D·X)[2p]·s, p = m-1-q.
         let post = v.iter().zip(&self.post);
         for ((o, (&[vr, vi], &[c, s])), (&[ur, ui], &[uc, us])) in out[..self.l]
@@ -914,6 +953,90 @@ impl Pow2Dct4 {
         {
             o[0] = -(vr * s - vi * c) * scale;
             o[1] = -(ur * uc + ui * us) * scale;
+        }
+    }
+
+    /// SSE twin of [`Self::rotate_in_uninit_scalar`], four `v` per trip: the
+    /// same two products and one sum/difference per lane, no FMA, so it is
+    /// bit-identical (`imdct_rotations_sse_match_scalar`).
+    ///
+    /// # Safety
+    /// `x.len() == 2·v.len() == 2·self.pre.len()`, `v.len() % 4 == 0`. A trip
+    /// at `p` reads `x[2p..2p+8]`, `x[l-8-2p..l-2p]`, `pre[p..p+4]` and writes
+    /// `v[p..p+4]`.
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[inline(always)]
+    unsafe fn rotate_in_sse(&self, x: &[f32], v: &mut [MaybeUninit<[f32; 2]>]) {
+        use std::arch::x86_64::*;
+        let (l, m) = (self.l, self.l / 2);
+        debug_assert!(x.len() == l && v.len() == m && self.pre.len() == m && m % 4 == 0);
+        let xp = x.as_ptr();
+        let pp = self.pre.as_ptr().cast::<f32>();
+        let vp = v.as_mut_ptr().cast::<f32>();
+        let mut p = 0;
+        while p < m {
+            let a = _mm_loadu_ps(xp.add(2 * p));
+            let b = _mm_loadu_ps(xp.add(2 * p + 4));
+            let yr = _mm_shuffle_ps::<0b10_00_10_00>(a, b); // x[2p], x[2p+2], ...
+            let c = _mm_loadu_ps(xp.add(l - 8 - 2 * p));
+            let d = _mm_loadu_ps(xp.add(l - 4 - 2 * p));
+            let yi = _mm_shuffle_ps::<0b01_11_01_11>(d, c); // x[l-1-2p], x[l-3-2p], ...
+            let p0 = _mm_loadu_ps(pp.add(2 * p));
+            let p1 = _mm_loadu_ps(pp.add(2 * p + 4));
+            let cs = _mm_shuffle_ps::<0b10_00_10_00>(p0, p1);
+            let sn = _mm_shuffle_ps::<0b11_01_11_01>(p0, p1);
+            let re = _mm_add_ps(_mm_mul_ps(yr, cs), _mm_mul_ps(yi, sn));
+            let im = _mm_sub_ps(_mm_mul_ps(yi, cs), _mm_mul_ps(yr, sn));
+            _mm_storeu_ps(vp.add(2 * p), _mm_unpacklo_ps(re, im));
+            _mm_storeu_ps(vp.add(2 * p + 4), _mm_unpackhi_ps(re, im));
+            p += 4;
+        }
+    }
+
+    /// SSE twin of [`Self::post_scalar`], four `q` per trip (bit-identical:
+    /// same products, sums, sign flips and scale per lane).
+    ///
+    /// # Safety
+    /// `v.len() == self.post.len() == m`, `out.len() == 2m`, `m % 4 == 0`. A
+    /// trip at `q` reads `v/post[q..q+4]` and `v/post[m-4-q..m-q]` and writes
+    /// `out[2q..2q+8]`.
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[inline(always)]
+    unsafe fn post_sse(&self, v: &[[f32; 2]], out: &mut [f32], scale: f32) {
+        use std::arch::x86_64::*;
+        let m = self.l / 2;
+        debug_assert!(v.len() == m && self.post.len() == m && out.len() == 2 * m && m % 4 == 0);
+        let vp = v.as_ptr().cast::<f32>();
+        let pp = self.post.as_ptr().cast::<f32>();
+        let op = out.as_mut_ptr();
+        let neg = _mm_set1_ps(-0.0);
+        let sc = _mm_set1_ps(scale);
+        let mut q = 0;
+        while q < m {
+            let v0 = _mm_loadu_ps(vp.add(2 * q));
+            let v1 = _mm_loadu_ps(vp.add(2 * q + 4));
+            let vr = _mm_shuffle_ps::<0b10_00_10_00>(v0, v1);
+            let vi = _mm_shuffle_ps::<0b11_01_11_01>(v0, v1);
+            let p0 = _mm_loadu_ps(pp.add(2 * q));
+            let p1 = _mm_loadu_ps(pp.add(2 * q + 4));
+            let c = _mm_shuffle_ps::<0b10_00_10_00>(p0, p1);
+            let s = _mm_shuffle_ps::<0b11_01_11_01>(p0, p1);
+            // Mirrored entries m-1-q, m-2-q, m-3-q, m-4-q.
+            let u0 = _mm_loadu_ps(vp.add(2 * (m - 4 - q)));
+            let u1 = _mm_loadu_ps(vp.add(2 * (m - 2 - q)));
+            let ur = _mm_shuffle_ps::<0b00_10_00_10>(u1, u0);
+            let ui = _mm_shuffle_ps::<0b01_11_01_11>(u1, u0);
+            let w0 = _mm_loadu_ps(pp.add(2 * (m - 4 - q)));
+            let w1 = _mm_loadu_ps(pp.add(2 * (m - 2 - q)));
+            let uc = _mm_shuffle_ps::<0b00_10_00_10>(w1, w0);
+            let us = _mm_shuffle_ps::<0b01_11_01_11>(w1, w0);
+            let t = _mm_sub_ps(_mm_mul_ps(vr, s), _mm_mul_ps(vi, c));
+            let a = _mm_mul_ps(_mm_xor_ps(t, neg), sc);
+            let u = _mm_add_ps(_mm_mul_ps(ur, uc), _mm_mul_ps(ui, us));
+            let b = _mm_mul_ps(_mm_xor_ps(u, neg), sc);
+            _mm_storeu_ps(op.add(2 * q), _mm_unpacklo_ps(a, b));
+            _mm_storeu_ps(op.add(2 * q + 4), _mm_unpackhi_ps(a, b));
+            q += 4;
         }
     }
 
@@ -1327,6 +1450,56 @@ mod dct4_twin {
                     .all(|(a, b)| a.to_bits() == b.to_bits()),
                 "imdct_half l={l}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod imdct_rotation_twins {
+    use super::*;
+
+    /// The SSE pre- and post-rotations equal their scalar bodies bit for bit,
+    /// on every plan size and on wide-ranging pseudo-random data.
+    #[test]
+    fn imdct_rotations_sse_match_scalar() {
+        let mut seed = 0x2545_f491u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let e = (seed >> 24) as i32 - 128;
+            (seed as i32 as f32) * 2f32.powi(e / 8 - 31)
+        };
+        for bits in 4..=11 {
+            let l = 1usize << bits;
+            let m = l / 2;
+            let plan = pow2_dct4(l).unwrap();
+            for _ in 0..8 {
+                let x: Vec<f32> = (0..l).map(|_| rnd()).collect();
+                let mut a = vec![MaybeUninit::<[f32; 2]>::uninit(); m];
+                let mut b = vec![MaybeUninit::<[f32; 2]>::uninit(); m];
+                let va = plan.rotate_in_uninit(&x, &mut a).to_vec();
+                let vb = plan.rotate_in_uninit_scalar(&x, &mut b).to_vec();
+                assert!(
+                    va.iter()
+                        .flatten()
+                        .zip(vb.iter().flatten())
+                        .all(|(p, q)| p.to_bits() == q.to_bits()),
+                    "rotate_in l={l}"
+                );
+                let scale = rnd().abs() + 1e-3;
+                let (mut oa, mut ob) = (vec![0f32; l], vec![0f32; l]);
+                #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+                // SAFETY: SSE is baseline; `va` holds m entries, `oa` 2m, m % 4 == 0.
+                unsafe {
+                    plan.post_sse(&va, &mut oa, scale);
+                }
+                #[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
+                plan.post_scalar(&va, &mut oa, scale);
+                plan.post_scalar(&va, &mut ob, scale);
+                assert!(
+                    oa.iter().zip(&ob).all(|(p, q)| p.to_bits() == q.to_bits()),
+                    "post l={l}"
+                );
+            }
         }
     }
 }
