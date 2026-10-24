@@ -7,6 +7,20 @@ decoder output is bit-exact and stable; encoder output may change in minor
 releases when quality improves. Engineering notes for releases before 1.0.0
 are in [`docs/history.md`](docs/history.md).
 
+## [1.0.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_mp3-v1.0.2...rusty_mp3-v1.0.3) - 2026-10-24
+
+### Other
+
+- clippy -D warnings clean for the new decode paths
+- fuse long-block requantization into the Huffman decode
+- do the long-block IMDCT window, mirror and overlap-add in registers
+- expand the synthesis matrixing in registers, straight into the FIFO
+- decprof streams its decode instead of collecting every frame
+- run stereo synthesis for both channels at once, written interleaved
+- requantize band scales from an exact 2^(q/4) table
+- put the decode stage clock behind a `profile` feature
+- decode Huffman pairs/quads through one flat table + 64-bit bit cache
+
 ## [1.0.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_mp3-v1.0.1...rusty_mp3-v1.0.2) - 2026-10-22
 
 ### Other

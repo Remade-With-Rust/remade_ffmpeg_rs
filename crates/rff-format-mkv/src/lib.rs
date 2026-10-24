@@ -106,6 +106,7 @@ const ID_SIMPLE_BLOCK: u32 = 0xA3;
 const ID_BLOCK_GROUP: u32 = 0xA0;
 const ID_BLOCK: u32 = 0xA1;
 const ID_BLOCK_DURATION: u32 = 0x9B;
+const ID_DISCARD_PADDING: u32 = 0x75A2;
 const ID_CUES: u32 = 0x1C53_BB6B;
 const ID_ATTACHMENTS: u32 = 0x1941_A469;
 const ID_CHAPTERS: u32 = 0x1043_A770;
@@ -200,6 +201,19 @@ impl<'a> Ebml<'a> {
         }
         self.pos = self.pos.saturating_add(len);
         v
+    }
+
+    /// Big-endian two's-complement signed integer of `len` (at most 8
+    /// meaningful) bytes, as EBML stores signed elements.
+    fn read_int(&mut self, len: usize) -> i64 {
+        let v = self.read_uint(len);
+        match len.min(8) {
+            0 => 0,
+            n => {
+                let shift = 64 - 8 * n as u32;
+                ((v << shift) as i64) >> shift
+            }
+        }
     }
 
     fn read_float(&mut self, len: usize) -> f64 {
@@ -705,22 +719,31 @@ impl MkvDemuxer {
         self.streams.push(s);
     }
 
-    /// A BlockGroup body. BlockDuration may come before or after the Block:
-    /// collect both, then emit (subtitle cues need their duration).
+    /// A BlockGroup body. BlockDuration and DiscardPadding may come before or
+    /// after the Block: collect them all, then emit (subtitle cues need their
+    /// duration, a stream's last audio block its padding).
     fn parse_block_group(&self, group: &[u8], cluster_ts: i64) -> Option<Packet> {
         let mut g = Ebml::new(group);
         let mut block: Option<&[u8]> = None;
         let mut duration = 0i64;
+        let mut discard_ns = 0i64;
         while g.pos < group.len() {
             let Some(gid) = g.read_id() else { break };
             let Some((gsz, _)) = g.read_size() else { break };
             match gid {
                 ID_BLOCK => block = Some(g.read_bytes(gsz as usize)),
                 ID_BLOCK_DURATION => duration = g.read_uint(gsz as usize) as i64,
+                ID_DISCARD_PADDING => discard_ns = g.read_int(gsz as usize),
                 _ => g.skip(gsz as usize),
             }
         }
-        self.parse_block(block?, cluster_ts, duration)
+        let mut packet = self.parse_block(block?, cluster_ts, duration)?;
+        let rate = self
+            .streams
+            .get(packet.stream_index)
+            .map_or(0, |s| s.sample_rate);
+        packet.discard_padding = discard_samples(discard_ns, rate);
+        Some(packet)
     }
 
     /// Parse a (Simple)Block body: track vint, int16 relative timestamp, flags,
@@ -766,6 +789,18 @@ impl MkvDemuxer {
         packet.flags.keyframe = keyframe;
         Some(packet)
     }
+}
+
+/// A BlockGroup's `DiscardPadding` (signed nanoseconds of audio to drop from
+/// the end of the block) as samples at `rate`, rounded to nearest the way
+/// FFmpeg's `matroskadec.c` rescales it. Zero or negative padding (which
+/// FFmpeg's decoder ignores), or an unknown rate, means none.
+fn discard_samples(ns: i64, rate: u32) -> u32 {
+    if ns <= 0 || rate == 0 {
+        return 0;
+    }
+    let samples = (ns as u128 * rate as u128 + 500_000_000) / 1_000_000_000;
+    u32::try_from(samples).unwrap_or(u32::MAX)
 }
 
 /// Convert a Xiph-laced Vorbis CodecPrivate (count-1, lace sizes, packets) to
@@ -1691,5 +1726,120 @@ mod tests {
             f.extend_from_slice(&g);
             bounded(f);
         }
+    }
+
+    #[test]
+    fn signed_ints_sign_extend() {
+        let mut e = Ebml::new(&[0x7F, 0xFF, 0x8C, 0xD2, 0xE1, 0x00, 0x8C, 0xD2, 0xE1]);
+        assert_eq!(e.read_int(1), 127);
+        assert_eq!(e.read_int(1), -1);
+        assert_eq!(e.read_int(3), -7_548_191); // 0x8CD2E1 has the sign bit set
+        assert_eq!(e.read_int(4), 9_229_025); // ...so writers lead with 0x00
+        assert_eq!(Ebml::new(&[]).read_int(0), 0);
+    }
+
+    /// A 44.1 kHz audio track whose BlockGroups carry DiscardPadding (signed
+    /// ns) before and after the Block.
+    fn fx_discard_padding() -> Vec<u8> {
+        let mut seg = Vec::new();
+        let mut audio = Vec::new();
+        elem(
+            &mut audio,
+            ID_SAMPLING_FREQUENCY,
+            &44_100.0f64.to_be_bytes(),
+        );
+        uint(&mut audio, ID_CHANNELS, 2);
+        let mut ael = Vec::new();
+        elem(&mut ael, ID_AUDIO, &audio);
+        elem(
+            &mut seg,
+            ID_TRACKS,
+            &track_entry(1, 2, "A_VORBIS", &[], &ael),
+        );
+        let mut c = Vec::new();
+        uint(&mut c, ID_TIMESTAMP, 0);
+        elem(&mut c, ID_SIMPLE_BLOCK, &block(1, 0, 0x80, b"a"));
+        // 407 samples at 44.1 kHz as FFmpeg's muxer writes it: 9,229,025 ns.
+        let mut g = Vec::new();
+        elem(&mut g, ID_DISCARD_PADDING, &9_229_025i64.to_be_bytes()[4..]);
+        elem(&mut g, ID_BLOCK, &block(1, 23, 0, b"b"));
+        elem(&mut c, ID_BLOCK_GROUP, &g);
+        // Negative padding (FFmpeg's decoder ignores it), Block first.
+        let mut g = Vec::new();
+        elem(&mut g, ID_BLOCK, &block(1, 46, 0, b"c"));
+        elem(
+            &mut g,
+            ID_DISCARD_PADDING,
+            &(-5_000_000i64).to_be_bytes()[5..],
+        );
+        elem(&mut c, ID_BLOCK_GROUP, &g);
+        elem(&mut seg, ID_CLUSTER, &c);
+        let mut file = ebml_header();
+        elem(&mut file, ID_SEGMENT, &seg);
+        file
+    }
+
+    fn demux_all(file: Vec<u8>) -> (Vec<Stream>, Vec<Packet>) {
+        let mut dem = MkvDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = dem.read_header().unwrap();
+        let mut packets = Vec::new();
+        while let Ok(p) = dem.read_packet() {
+            packets.push(p);
+        }
+        (streams, packets)
+    }
+
+    #[test]
+    fn discard_padding_becomes_samples_at_the_track_rate() {
+        let (_, packets) = demux_all(fx_discard_padding());
+        let got: Vec<_> = packets
+            .iter()
+            .map(|p| (p.data.clone(), p.pts, p.discard_padding))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (b"a".to_vec(), Some(0), 0),
+                (b"b".to_vec(), Some(23), 407),
+                (b"c".to_vec(), Some(46), 0),
+            ]
+        );
+        assert_eq!(discard_samples(6_500_000, 48_000), 312); // Opus pre-skip size
+        assert_eq!(discard_samples(1, 48_000), 0);
+        assert_eq!(discard_samples(10_417, 48_000), 1); // rounds to nearest
+        assert_eq!(discard_samples(1_000_000_000, 0), 0); // no rate: no samples
+        assert_eq!(discard_samples(i64::MAX, 384_000), u32::MAX);
+    }
+
+    /// The muxer writes a packet's padding back as DiscardPadding (in a
+    /// BlockGroup, as FFmpeg does) and the demuxer recovers the same count,
+    /// so `-c copy` between Matroska files keeps the trim.
+    #[test]
+    fn discard_padding_survives_mux_demux() {
+        let mut a = Stream::new(0, CodecId::Opus);
+        a.sample_rate = 48_000;
+        a.channels = 2;
+        a.time_base = Rational::new(1, 48_000);
+        let mut packets = vec![pkt(0, 0, true, &[1; 30]), pkt(0, 960, true, &[2; 31])];
+        packets.push(pkt(0, 1920, true, &[3; 32]));
+        packets[2].discard_padding = 648;
+        for webm in [false, true] {
+            let file = mux_streams(webm, &[a.clone()], &packets).unwrap();
+            let (_, got) = demux_all(file);
+            let got: Vec<_> = got
+                .iter()
+                .map(|p| (p.data.clone(), p.discard_padding))
+                .collect();
+            assert_eq!(
+                got,
+                vec![(vec![1; 30], 0), (vec![2; 31], 0), (vec![3; 32], 648)]
+            );
+        }
+        // 44.1 kHz: 9,229,025 ns, whose top bit forces a leading zero byte.
+        a.sample_rate = 44_100;
+        a.time_base = Rational::new(1, 44_100);
+        packets[2].discard_padding = 407;
+        let (_, got) = demux_all(mux_streams(false, &[a], &packets).unwrap());
+        assert_eq!(got[2].discard_padding, 407);
     }
 }

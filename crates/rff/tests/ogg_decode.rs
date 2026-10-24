@@ -18,6 +18,10 @@
 //! - `opus_stereo_96000.ogg`: 2 s, 48 kHz, 64 kb/s, pre-skip 312.
 //! - `opus_stereo_59259.opus`: 1.23456 s — not a multiple of 20 ms.
 //! - `opus_one_page.opus`: 0.1 s mono, all audio on the EOS page.
+//!
+//! The damaged-page cases (issue #59) flip one payload byte of a mid-file
+//! page in memory; their expected values are FFmpeg 8.1's decode of the same
+//! damaged bytes, which drops the page ("CRC mismatch!") and goes on.
 
 use std::path::PathBuf;
 
@@ -59,8 +63,29 @@ impl Decoded {
 
 /// Demux + decode a fixture through the engine's registries.
 fn decode(name: &str) -> Decoded {
+    decode_bytes(std::fs::read(testdata(name)).expect("fixture"))
+}
+
+/// A fixture with one payload bit flipped in the middle of the body of the
+/// page with sequence number `seq`, so that page fails its CRC.
+fn damaged(name: &str, seq: u32) -> Vec<u8> {
+    let mut file = std::fs::read(testdata(name)).expect("fixture");
+    let mut at = 0;
+    while file[at..].starts_with(b"OggS") {
+        let nsegs = file[at + 26] as usize;
+        let body_at = at + 27 + nsegs;
+        let body: usize = file[at + 27..body_at].iter().map(|&l| l as usize).sum();
+        if u32::from_le_bytes(file[at + 18..at + 22].try_into().unwrap()) == seq {
+            file[body_at + body / 2] ^= 0x01;
+            return file;
+        }
+        at = body_at + body;
+    }
+    panic!("{name}: no page {seq}");
+}
+
+fn decode_bytes(file: Vec<u8>) -> Decoded {
     let engine = Engine::new();
-    let file = std::fs::read(testdata(name)).expect("fixture");
     let mut dem = engine
         .formats
         .open_demuxer("ogg", Box::new(std::io::Cursor::new(file)))
@@ -265,4 +290,36 @@ fn opus_single_page_matches_ffmpeg() {
     let d = decode("opus_one_page.opus");
     assert_eq!(d.frames(), 4_800); // granule 5,112 - 312
     assert_rms(&d, &[0.088420073]);
+}
+
+/// A flipped byte in page 5 of 10: FFmpeg drops the page's five packets and
+/// decodes the rest; so must we, with no burst of noise where it was.
+#[test]
+fn vorbis_damaged_page_is_dropped_like_ffmpeg() {
+    let d = decode_bytes(damaged("vorbis_stereo_43972.ogg", 5));
+    assert_eq!(d.frames(), 38_852, "FFmpeg decodes 38,852 frames");
+    assert_rms(&d, &[0.089206119, 0.08941548]);
+    // The splice where the page was (two blocks overlapped that were never
+    // neighbours) peaks at 0.16708 in FFmpeg's decode too; unchecked, the
+    // corrupt page decoded to a 0.216 burst.
+    let peak = d.samples.iter().fold(0f32, |m, s| m.max(s.abs()));
+    assert!((peak - 0.167_075_8).abs() < 1e-6, "peak {peak}");
+}
+
+/// Opus, the first audio page lost: the pre-skip comes off the next one and
+/// the final granule still trims the end (96,000 - 48,000 frames).
+#[test]
+fn opus_damaged_first_audio_page() {
+    let d = decode_bytes(damaged("opus_stereo_96000.ogg", 2));
+    assert_eq!(d.frames(), 48_000);
+    assert_rms(&d, &[0.086382628, 0.086827187]);
+}
+
+/// Opus, the page before the EOS page lost: FFmpeg's position no longer
+/// reaches the final granule, so it keeps the last packet whole (48,648).
+#[test]
+fn opus_damaged_last_full_page() {
+    let d = decode_bytes(damaged("opus_stereo_96000.ogg", 3));
+    assert_eq!(d.frames(), 48_648);
+    assert_rms(&d, &[0.087359089, 0.088309663]);
 }

@@ -212,6 +212,115 @@ fn imdct36_scalar(lines: &[f32], out: &mut [f32; 24]) {
     }
 }
 
+/// **D15** lane order for the AVX long-block path: vector A = outputs
+/// `n = 0..8`, vector B = `n = 18..26`, vector C = `[n = 8, n = 26]` (the rest
+/// padding). With the mirrored halves of the 36-point output being `n` reversed
+/// (`17 - n`, `53 - n`), this order lets the mirror be a register reverse.
+const IMDCT_N_AVX: [usize; 18] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 18, 19, 20, 21, 22, 23, 24, 25, 8, 26,
+];
+
+/// `cos36` transposed to `[k][lane]` in [`IMDCT_N_AVX`] order, padded to 24.
+fn cos36_t_avx() -> &'static [[f32; 24]; 18] {
+    static T: OnceLock<[[f32; 24]; 18]> = OnceLock::new();
+    T.get_or_init(|| {
+        let c = &kernels().cos36;
+        let mut t = [[0f32; 24]; 18];
+        for (j, &n) in IMDCT_N_AVX.iter().enumerate() {
+            for k in 0..18 {
+                t[k][j] = c[n][k];
+            }
+        }
+        t
+    })
+}
+
+/// **D15** — one long subband, end to end in AVX registers: the 18 dot
+/// products ([`imdct36_avx`]'s sums, lane-reordered), the window and its two
+/// mirrors, the overlap-add, the new overlap and the frequency inversion.
+///
+/// Every value is produced by the operations the scalar body uses, in the same
+/// order: `samp[n] = acc * w[n]`, `samp[17 - n] = (-acc) * w[17 - n]` (the
+/// negation is a sign-bit XOR, then the same multiply), `samp[53 - n] =
+/// acc * w[53 - n]`, `out = samp + overlap`, and `-out` on odd samples of odd
+/// subbands. The scalar form wrote `samp` one float at a time and then read it
+/// back in vector-sized loads (the overlap-add vectorises), which the core
+/// cannot forward from single-float stores; a ceiling probe with the mirror and
+/// window stubbed out read 1.17x of the whole decode. Pinned by
+/// `hybrid_matches_reference_bitwise`.
+///
+/// # Safety
+/// Caller must have verified AVX is available. `base + 18 <= 576`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn long_subband_avx(
+    lines: &[f32; 18],
+    win: &[f32; 36],
+    overlap: &mut [f32; 18],
+    out: &mut [f32; 18],
+    odd: bool,
+) {
+    use std::arch::x86_64::*;
+    let ct = cos36_t_avx();
+    // SAFETY: AVX per this fn's contract; every load/store below is inside a
+    // fixed-size array (`ct` rows are 24, `win` 36, `overlap`/`out` 18: the
+    // 8-float spans start at 0 or 10, and 10 + 8 = 18).
+    unsafe {
+        let mut acc = [_mm256_setzero_ps(); 3];
+        for (k, row) in ct.iter().enumerate() {
+            let x = _mm256_set1_ps(lines[k]);
+            for (v, accv) in acc.iter_mut().enumerate() {
+                let c = _mm256_loadu_ps(row.as_ptr().add(v * 8));
+                *accv = _mm256_add_ps(*accv, _mm256_mul_ps(c, x));
+            }
+        }
+        let [a, b, c] = acc;
+        let sign = _mm256_set1_ps(-0.0);
+        let rev = |x: __m256| {
+            let r = _mm256_permute_ps(x, 0x1B);
+            _mm256_permute2f128_ps(r, r, 0x01)
+        };
+        let w = win.as_ptr();
+        let mut cc = [0f32; 8];
+        _mm256_storeu_ps(cc.as_mut_ptr(), c);
+        let (acc8, acc26) = (cc[0], cc[1]);
+        // First half: samp[0..8] = A * w, samp[8] = acc8 * w8,
+        // samp[9] = (-acc8) * w9, samp[10..18] = (-rev A) * w[10..18].
+        let s_lo = _mm256_mul_ps(a, _mm256_loadu_ps(w));
+        let s_hi = _mm256_mul_ps(_mm256_xor_ps(rev(a), sign), _mm256_loadu_ps(w.add(10)));
+        let s8 = acc8 * win[8];
+        let s9 = -acc8 * win[9];
+        // Second half (the next overlap): samp[18..26] = B * w, samp[26] =
+        // acc26 * w26, samp[27] = acc26 * w27, samp[28..36] = rev B * w.
+        let t_lo = _mm256_mul_ps(b, _mm256_loadu_ps(w.add(18)));
+        let t_hi = _mm256_mul_ps(rev(b), _mm256_loadu_ps(w.add(28)));
+        let t8 = acc26 * win[26];
+        let t9 = acc26 * win[27];
+        // Overlap-add, then the inversion of odd samples on odd subbands.
+        let ov = overlap.as_mut_ptr();
+        let o = out.as_mut_ptr();
+        let mut o_lo = _mm256_add_ps(s_lo, _mm256_loadu_ps(ov));
+        let mut o_hi = _mm256_add_ps(s_hi, _mm256_loadu_ps(ov.add(10)));
+        let o8 = s8 + overlap[8];
+        let mut o9 = s9 + overlap[9];
+        if odd {
+            // Lanes 1, 3, 5, 7: samples 1..7 and (from 10) 11..17.
+            let odd_sign = _mm256_setr_ps(0.0, -0.0, 0.0, -0.0, 0.0, -0.0, 0.0, -0.0);
+            o_lo = _mm256_xor_ps(o_lo, odd_sign);
+            o_hi = _mm256_xor_ps(o_hi, odd_sign);
+            o9 = -o9;
+        }
+        _mm256_storeu_ps(o, o_lo);
+        _mm256_storeu_ps(o.add(10), o_hi);
+        out[8] = o8;
+        out[9] = o9;
+        _mm256_storeu_ps(ov, t_lo);
+        _mm256_storeu_ps(ov.add(10), t_hi);
+        overlap[8] = t8;
+        overlap[9] = t9;
+    }
+}
+
 /// Raw SIMD availability, for the oracle tests (they must run the kernel whatever
 /// `MP3_ISA` says). The shipping path asks [`super::isa::use_simd`].
 #[cfg(test)]
@@ -350,6 +459,17 @@ fn hybrid_impl(
             // **D6** — those 18 dot products now run 8-wide with the OUTPUT index
             // as the lane, so each still accumulates over `k` in the original
             // order and the result is bit-identical (not merely close).
+            #[cfg(target_arch = "x86_64")]
+            if simd {
+                let l: &[f32; 18] = lines[base..base + 18].try_into().expect("18 lines");
+                let ov: &mut [f32; 18] = (&mut overlap[base..base + 18])
+                    .try_into()
+                    .expect("18 lines");
+                let o: &mut [f32; 18] = (&mut out[base..base + 18]).try_into().expect("18 lines");
+                // SAFETY: `simd` came from `use_simd()`, which on x86_64 means AVX.
+                unsafe { long_subband_avx(l, &t.win[wt], ov, o, sb & 1 == 1) };
+                continue;
+            }
             let mut dp = [0f32; 24];
             if simd {
                 // SAFETY: `simd` came from `use_simd()` before the loop.
@@ -389,6 +509,189 @@ fn hybrid_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-D15 hybrid IMDCT body, verbatim, on the scalar kernel (scalar
+    /// mirror, window and overlap-add). The oracle `hybrid` is gated against
+    /// BIT-wise, signed zeros included.
+    #[allow(clippy::needless_range_loop)]
+    fn hybrid_reference(
+        gi: &GranuleSideInfo,
+        lines: &[f32; GRANULE_LINES],
+        overlap: &mut [f32; GRANULE_LINES],
+    ) -> [f32; GRANULE_LINES] {
+        let simd = false;
+        let t = kernels();
+        let mut out = [0f32; GRANULE_LINES];
+        let is_short = gi.window_switching && gi.block_type == BlockType::Short;
+
+        for sb in 0..SUBBANDS {
+            let base = sb * SUBBAND_LINES;
+            let mut samp = [0f32; 36];
+            // Mixed blocks keep the lowest two subbands long.
+            let short_here = is_short && !(gi.mixed_block && sb < 2);
+
+            if short_here {
+                for w in 0..3 {
+                    let mut y = [0f32; 12];
+                    // The 12-point kernel carries the same two exact symmetries:
+                    // cos12[5−n][k] == −cos12[n][k] and cos12[17−n][k] == +cos12[n][k].
+                    for n in 0..3 {
+                        let mut acc = 0f32;
+                        for k in 0..6 {
+                            acc += lines[base + w + 3 * k] * t.cos12[n][k];
+                        }
+                        y[n] = acc * t.win_short[n];
+                        y[5 - n] = -acc * t.win_short[5 - n];
+                    }
+                    for n in 6..9 {
+                        let mut acc = 0f32;
+                        for k in 0..6 {
+                            acc += lines[base + w + 3 * k] * t.cos12[n][k];
+                        }
+                        y[n] = acc * t.win_short[n];
+                        y[17 - n] = acc * t.win_short[17 - n];
+                    }
+                    for n in 0..12 {
+                        samp[6 + w * 6 + n] += y[n];
+                    }
+                }
+            } else {
+                // The mixed flag is not exclusive to short blocks: on ANY
+                // window-switching block its two lowest subbands use the NORMAL window
+                // (ISO 11172-3 2.4.2.7; FFmpeg `win_idx = switch_point && j < 2 ? 0 :
+                // block_type`). A Start/Stop block with the flag set put its start/stop
+                // window on subbands 0..1 -- ISO l3-si_block, all error in subband 0-1.
+                let wt = if gi.mixed_block && sb < 2 {
+                    0
+                } else {
+                    match gi.block_type {
+                        BlockType::Start => 1,
+                        BlockType::Stop => 3,
+                        _ => 0,
+                    }
+                };
+                // **D3** — half the dot products are free. The kernel has two exact
+                // symmetries, and they hold BIT-EXACTLY in the stored f32 tables
+                // (pinned by `imdct_kernel_symmetries_are_bit_exact`):
+                //
+                //   cos36[17−n][k] == −cos36[n][k]   (first half, antisymmetric)
+                //   cos36[53−n][k] == +cos36[n][k]   (second half, symmetric)
+                //
+                // Because IEEE multiplication and round-to-nearest-even are both
+                // sign-symmetric, `Σ lines[k]·(−c[k])` is EXACTLY `−Σ lines[k]·c[k]`.
+                // So the mirrored output is bit-identical to computing its own dot
+                // product, not an approximation of it — 36×18 MACs become 18×18.
+                //
+                // **D6** — those 18 dot products now run 8-wide with the OUTPUT index
+                // as the lane, so each still accumulates over `k` in the original
+                // order and the result is bit-identical (not merely close).
+                let mut dp = [0f32; 24];
+                if simd {
+                    // SAFETY: `simd` came from `use_simd()` before the loop.
+                    unsafe { imdct36_simd(&lines[base..base + 18], &mut dp) };
+                } else {
+                    imdct36_scalar(&lines[base..base + 18], &mut dp);
+                }
+                for (j, &n) in IMDCT_N.iter().enumerate() {
+                    let acc = dp[j];
+                    if n < 9 {
+                        samp[n] = acc * t.win[wt][n];
+                        samp[17 - n] = -acc * t.win[wt][17 - n];
+                    } else {
+                        samp[n] = acc * t.win[wt][n];
+                        samp[53 - n] = acc * t.win[wt][53 - n];
+                    }
+                }
+            }
+
+            // Overlap-add: first half with the saved tail, second half becomes tail.
+            for n in 0..18 {
+                out[base + n] = samp[n] + overlap[base + n];
+                overlap[base + n] = samp[n + 18];
+            }
+            // Frequency inversion: negate odd samples of odd subbands.
+            if sb & 1 == 1 {
+                let mut i = 1;
+                while i < 18 {
+                    out[base + i] = -out[base + i];
+                    i += 2;
+                }
+            }
+        }
+        out
+    }
+
+    /// D15 gate: the shipping hybrid IMDCT against the verbatim pre-D15 body,
+    /// as BIT patterns -- `assert_eq!` on floats would accept a -0.0 for a
+    /// +0.0. Every block type (mixed flags included), silent subbands, signed
+    /// zeros, both arms (SIMD and scalar), and 48 granules in sequence so the
+    /// overlap carries.
+    #[test]
+    fn hybrid_matches_reference_bitwise() {
+        let mut st = 0x7F4A_7C15u32;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        let cases = [
+            (BlockType::Long, false),
+            (BlockType::Start, false),
+            (BlockType::Stop, false),
+            (BlockType::Short, false),
+            (BlockType::Short, true),
+            (BlockType::Start, true),
+            (BlockType::Stop, true),
+        ];
+        for simd in [true, false] {
+            if simd && !have_simd() {
+                continue;
+            }
+            for &(bt, mixed) in &cases {
+                let gi = GranuleSideInfo {
+                    window_switching: bt != BlockType::Long,
+                    block_type: bt,
+                    mixed_block: mixed,
+                    ..Default::default()
+                };
+                let (mut ov_a, mut ov_b) = ([0f32; GRANULE_LINES], [0f32; GRANULE_LINES]);
+                for g in 0..48 {
+                    let top = (next() % 33) as usize;
+                    let mut lines = [0f32; GRANULE_LINES];
+                    for (i, l) in lines.iter_mut().enumerate() {
+                        let r = next();
+                        let sb = i / SUBBAND_LINES;
+                        *l = if sb >= top || (sb * 7 + g) % 5 == 0 {
+                            if r & 1 == 0 {
+                                0.0
+                            } else {
+                                -0.0
+                            }
+                        } else if r % 9 == 0 {
+                            -0.0
+                        } else {
+                            (r >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+                        };
+                    }
+                    let a = hybrid_impl(&gi, &lines, &mut ov_a, simd);
+                    let b = hybrid_reference(&gi, &lines, &mut ov_b);
+                    for i in 0..GRANULE_LINES {
+                        assert_eq!(
+                            a[i].to_bits(),
+                            b[i].to_bits(),
+                            "out[{i}] simd={simd} {bt:?} mixed={mixed} granule {g}"
+                        );
+                        assert_eq!(
+                            ov_a[i].to_bits(),
+                            ov_b[i].to_bits(),
+                            "overlap[{i}] simd={simd} {bt:?} mixed={mixed} granule {g}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// The pre-D3 dense IMDCT, verbatim: every one of the 36 (or 3x12) outputs
     /// computed as its own full dot product. Kept as the oracle the half-work

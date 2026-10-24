@@ -84,21 +84,43 @@ fn fuzz_decoders_no_panic() {
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
     // Watchdog: name + abort on a decoder that infinite-loops within one call.
+    //
+    // A call over 4 s is only reported: a debug build on a loaded macOS CI
+    // runner gets there on one fixed input without looping (the AV1/AV2 path
+    // on a large random packet), which made this test abort about half the
+    // time (#34). A call over 20 s is a hang and still aborts. Both messages
+    // go to the raw stderr handle: libtest captures `eprintln!` from threads
+    // the test spawns, and `abort` discards that capture, which is why the
+    // failure used to show only a bare SIGABRT with no decoder or seed.
+    use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
+    const WARN_TICKS: u32 = 8; // 4 s at 500 ms
+    const ABORT_TICKS: u32 = 40; // 20 s
     let cur = std::sync::Arc::new(std::sync::Mutex::new((CodecId::Opus, 0u64)));
     let cur_wd = cur.clone();
     std::thread::spawn(move || {
-        let (mut last, mut stalls) = (0u64, 0);
+        let (mut last, mut stalls) = (0u64, 0u32);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
             let hb = HEARTBEAT.load(Ordering::Relaxed);
             if hb == last {
                 stalls += 1;
-                if stalls >= 8 {
-                    let (id, cs) = *cur_wd.lock().unwrap();
-                    eprintln!("\n!!! HANG: decoder {id:?} looped >4s on case_seed=0x{cs:016x}");
-                    std::process::abort();
+                if stalls == WARN_TICKS || stalls >= ABORT_TICKS {
+                    let (id, cs) = cur_wd.lock().map(|c| *c).unwrap_or((CodecId::Opus, 0));
+                    let what = if stalls >= ABORT_TICKS {
+                        "HANG"
+                    } else {
+                        "SLOW"
+                    };
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "\n!!! {what}: decoder {id:?} running >{}s on case_seed=0x{cs:016x}",
+                        stalls / 2
+                    );
+                    if stalls >= ABORT_TICKS {
+                        std::process::abort();
+                    }
                 }
             } else {
                 stalls = 0;
@@ -121,7 +143,9 @@ fn fuzz_decoders_no_panic() {
             .map(|c| *c)
             .unwrap_or((CodecId::Opus, 0));
         let thread = std::thread::current();
-        eprintln!(
+        // Raw stderr, not `eprintln!`: see the watchdog comment above.
+        let _ = writeln!(
+            std::io::stderr(),
             "\n!!! PANIC on thread {:?} (decoder {id:?}, case_seed=0x{cs:016x}): {info}",
             thread.name().unwrap_or("<unnamed>")
         );

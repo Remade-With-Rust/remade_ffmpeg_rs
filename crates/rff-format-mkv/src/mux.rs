@@ -37,9 +37,10 @@ use rff_format::{Muxer, Output, SeekOutput, Stream};
 
 use crate::{
     ID_AUDIO, ID_BIT_DEPTH, ID_BLOCK, ID_BLOCK_DURATION, ID_BLOCK_GROUP, ID_CHANNELS, ID_CLUSTER,
-    ID_CODEC_ID, ID_CODEC_PRIVATE, ID_CUES, ID_DURATION, ID_INFO, ID_PIXEL_HEIGHT, ID_PIXEL_WIDTH,
-    ID_SAMPLING_FREQUENCY, ID_SEGMENT, ID_SIMPLE_BLOCK, ID_TIMESTAMP, ID_TIMESTAMP_SCALE,
-    ID_TRACKS, ID_TRACK_ENTRY, ID_TRACK_NUMBER, ID_TRACK_TYPE, ID_VIDEO,
+    ID_CODEC_ID, ID_CODEC_PRIVATE, ID_CUES, ID_DISCARD_PADDING, ID_DURATION, ID_INFO,
+    ID_PIXEL_HEIGHT, ID_PIXEL_WIDTH, ID_SAMPLING_FREQUENCY, ID_SEGMENT, ID_SIMPLE_BLOCK,
+    ID_TIMESTAMP, ID_TIMESTAMP_SCALE, ID_TRACKS, ID_TRACK_ENTRY, ID_TRACK_NUMBER, ID_TRACK_TYPE,
+    ID_VIDEO,
 };
 
 // ---- EBML element IDs used only by the muxer ------------------------------
@@ -104,6 +105,16 @@ fn uint_body(v: u64) -> Vec<u8> {
 
 fn put_uint(out: &mut Vec<u8>, id: u32, v: u64) {
     put_elem(out, id, &uint_body(v));
+}
+
+/// Signed element (big-endian two's complement, minimal length) for a
+/// non-negative value: a leading zero byte keeps the sign bit clear.
+fn put_positive_int(out: &mut Vec<u8>, id: u32, v: u64) {
+    let mut body = uint_body(v);
+    if body[0] & 0x80 != 0 {
+        body.insert(0, 0);
+    }
+    put_elem(out, id, &body);
 }
 
 /// Unsigned element padded to exactly 8 bytes — used where the value is patched
@@ -235,6 +246,9 @@ struct BufBlock {
     ts_ms: i64,
     duration_ms: i64,
     keyframe: bool,
+    /// Matroska `DiscardPadding` in ns (0 = none): the packet's
+    /// [`Packet::discard_padding`] samples at the track's rate.
+    discard_ns: u64,
     data: Vec<u8>,
 }
 
@@ -472,9 +486,12 @@ fn starts_cluster(cluster_ts: Option<i64>, ts_ms: i64, video_keyframe: bool) -> 
 }
 
 /// Serialize one block around its payload: the bytes before the frame data
-/// and the bytes after it (a BlockGroup's BlockDuration). Subtitles need a
-/// duration, so they get BlockGroup { Block, BlockDuration }; everything else
-/// is a SimpleBlock carrying the keyframe flag.
+/// and the bytes after it (a BlockGroup's BlockDuration / DiscardPadding).
+/// Subtitles need a duration, so they get BlockGroup { Block, BlockDuration };
+/// an audio block with end padding (a stream's last, from an encoder or a
+/// Matroska/WebM source) gets BlockGroup { Block, DiscardPadding }, as
+/// FFmpeg's muxer writes it; everything else is a SimpleBlock carrying the
+/// keyframe flag.
 fn block_parts(b: &BufBlock, rel: i16, is_sub: bool) -> (Vec<u8>, Vec<u8>) {
     // Block header: track vint + relative i16 + flags.
     let mut hdr = Vec::with_capacity(4);
@@ -483,9 +500,14 @@ fn block_parts(b: &BufBlock, rel: i16, is_sub: bool) -> (Vec<u8>, Vec<u8>) {
     let block_len = (hdr.len() + 1 + b.data.len()) as u64;
     let mut head = Vec::with_capacity(32);
     let mut tail = Vec::new();
-    if is_sub {
+    if is_sub || b.discard_ns > 0 {
         hdr.push(0x00);
-        put_uint(&mut tail, ID_BLOCK_DURATION, b.duration_ms.max(0) as u64);
+        if is_sub {
+            put_uint(&mut tail, ID_BLOCK_DURATION, b.duration_ms.max(0) as u64);
+        }
+        if b.discard_ns > 0 {
+            put_positive_int(&mut tail, ID_DISCARD_PADDING, b.discard_ns);
+        }
         let group_len = id_len(ID_BLOCK) + size_len(block_len) + block_len + tail.len() as u64;
         put_id(&mut head, ID_BLOCK_GROUP);
         put_size(&mut head, group_len);
@@ -585,12 +607,20 @@ fn prepare_block(tracks: &mut [TrackPlan], packet: &Packet) -> Result<Option<Buf
 
     let tb = plan.stream.time_base;
     let audio = plan.stream.media_type == MediaType::Audio;
+    let rate = plan.stream.sample_rate as u64;
+    // Samples → ns, rounded to nearest (FFmpeg's matroskaenc rescale); the
+    // demuxer's rounding back recovers the sample count exactly.
+    let discard_ns = match packet.discard_padding as u64 {
+        pad if audio && pad > 0 && rate > 0 => (pad * 1_000_000_000 + rate / 2) / rate,
+        _ => 0,
+    };
     Ok(Some(BufBlock {
         track: idx,
         ts_ms: to_ms(tb, packet.pts.or(packet.dts).unwrap_or(0)),
         duration_ms: to_ms(tb, packet.duration.max(0)),
         // Audio frames are all random-access; trust the flag on video.
         keyframe: audio || packet.flags.keyframe,
+        discard_ns,
         data,
     }))
 }
@@ -1695,6 +1725,7 @@ mod tests {
             ts_ms: 0,
             duration_ms: 40,
             keyframe: true,
+            discard_ns: 0,
             data: vec![0u8; 512 << 20],
         };
         for _ in 0..10 {
