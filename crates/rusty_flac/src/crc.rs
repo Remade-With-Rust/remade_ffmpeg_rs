@@ -54,8 +54,47 @@ pub fn crc8(data: &[u8]) -> u8 {
     crc
 }
 
+/// Slice-by-8 tables: `CRC16_SLICE[k][x]` is the CRC of byte `x` followed by
+/// `k` zero bytes, so eight message bytes fold in with eight independent
+/// lookups instead of a serial chain of eight.
+static CRC16_SLICE: [[u16; 256]; 8] = {
+    let mut t = [[0u16; 256]; 8];
+    t[0] = CRC16_TABLE;
+    let mut k = 1;
+    while k < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let prev = t[k - 1][i];
+            t[k][i] = (prev << 8) ^ CRC16_TABLE[(prev >> 8) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
+/// CRC-16 of `data`. The decoder runs every frame byte through it, so it is
+/// slice-by-8 (one serial table step per 8 bytes, not per byte);
+/// [`crc16_bytewise`] is the oracle.
 pub fn crc16(data: &[u8]) -> u16 {
+    let t = &CRC16_SLICE;
     let mut crc = 0u16;
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        crc = t[7][(c[0] ^ (crc >> 8) as u8) as usize]
+            ^ t[6][(c[1] ^ crc as u8) as usize]
+            ^ t[5][c[2] as usize]
+            ^ t[4][c[3] as usize]
+            ^ t[3][c[4] as usize]
+            ^ t[2][c[5] as usize]
+            ^ t[1][c[6] as usize]
+            ^ t[0][c[7] as usize];
+    }
+    crc16_bytewise(crc, chunks.remainder())
+}
+
+/// Byte-at-a-time CRC-16 continuing from `crc` (the table-driven original).
+fn crc16_bytewise(mut crc: u16, data: &[u8]) -> u16 {
     for &b in data {
         crc = (crc << 8) ^ CRC16_TABLE[((crc >> 8) ^ b as u16) as usize];
     }
@@ -109,5 +148,31 @@ mod tests {
                 "crc16 len={len}"
             );
         }
+    }
+
+    /// Slice-by-8 agrees with the bytewise oracle at every length / tail and
+    /// on random bytes (incl. the 0xFF / 0x00 extremes).
+    #[test]
+    fn crc16_slice_by_8_matches_bytewise() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let data: Vec<u8> = (0..3000)
+            .map(|i| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                match i % 97 {
+                    0..=5 => 0xFF,
+                    6..=9 => 0,
+                    _ => (x >> 56) as u8,
+                }
+            })
+            .collect();
+        for len in 0..200 {
+            assert_eq!(
+                crc16(&data[..len]),
+                crc16_bytewise(0, &data[..len]),
+                "len={len}"
+            );
+            assert_eq!(crc16(&data[..len]), crc16_ref(&data[..len]), "len={len}");
+        }
+        assert_eq!(crc16(&data), crc16_bytewise(0, &data));
     }
 }
