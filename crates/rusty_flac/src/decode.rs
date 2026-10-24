@@ -235,34 +235,8 @@ impl<'a> Decoder<'a> {
 
         // --- stereo reconstruction into out ---
         let decorr_scope = prof::scope(Stage::Decorr);
-        match ch_assign {
-            8 => {
-                // left/side: R = L - side
-                let (l, s) = self.scratch.split_at_mut(1);
-                for i in 0..bs {
-                    let lv = l[0][i];
-                    let sv = s[0][i];
-                    s[0][i] = lv.wrapping_sub(sv);
-                }
-            }
-            9 => {
-                // side/right: L = side + R
-                let (s, r) = self.scratch.split_at_mut(1);
-                for i in 0..bs {
-                    s[0][i] = s[0][i].wrapping_add(r[0][i]);
-                }
-            }
-            10 => {
-                // mid/side: mid = (L+R)>>1 was stored; reconstruct exactly.
-                let (m, s) = self.scratch.split_at_mut(1);
-                for i in 0..bs {
-                    let mid = ((m[0][i] as i64) << 1) | ((s[0][i] as i64) & 1);
-                    let side = s[0][i] as i64;
-                    m[0][i] = ((mid + side) >> 1) as i32;
-                    s[0][i] = ((mid - side) >> 1) as i32;
-                }
-            }
-            _ => {}
+        if let [a, b] = &mut self.scratch[..] {
+            decorrelate(ch_assign, &mut a[..bs], &mut b[..bs]);
         }
         drop(decorr_scope);
         let _out_scope = prof::scope(Stage::Output);
@@ -270,6 +244,42 @@ impl<'a> Decoder<'a> {
             o.extend_from_slice(s);
         }
         Ok(Some(bs))
+    }
+}
+
+/// Undo a stereo channel assignment in place: `a`/`b` hold the coded
+/// channel pair (left/side, side/right, mid/side) and come out as
+/// left/right. Independent channels (`ch_assign` 0..=7) are untouched.
+///
+/// Mid/side in `i32`: with `mid = 2m + (s & 1)`, exactly
+/// `(mid + s) >> 1 == m + (s >> 1) + (s & 1)` and
+/// `(mid - s) >> 1 == m - (s >> 1)`, so `R = m - (s >> 1)` and `L = R + s`,
+/// wrapping, equal the `i64` textbook form truncated to 32 bits for every
+/// input (`decorrelate_ref` in the tests). That keeps the lanes 32-bit, so
+/// the loops vectorize 4-wide.
+fn decorrelate(ch_assign: u32, a: &mut [i32], b: &mut [i32]) {
+    match ch_assign {
+        8 => {
+            // left/side: R = L - side
+            for (l, s) in a.iter().zip(b.iter_mut()) {
+                *s = l.wrapping_sub(*s);
+            }
+        }
+        9 => {
+            // side/right: L = side + R
+            for (s, r) in a.iter_mut().zip(b.iter()) {
+                *s = s.wrapping_add(*r);
+            }
+        }
+        10 => {
+            // mid/side
+            for (m, s) in a.iter_mut().zip(b.iter_mut()) {
+                let r = m.wrapping_sub(*s >> 1);
+                *m = r.wrapping_add(*s);
+                *s = r;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -692,6 +702,68 @@ mod tests {
                 restore_fixed_ref(&mut b, order);
                 assert_eq!(a, b, "order={order} trial={trial}");
             }
+        }
+    }
+
+    /// The original stereo reconstruction (mid/side through `i64`): the
+    /// oracle for the 32-bit `decorrelate`.
+    fn decorrelate_ref(ch_assign: u32, a: &mut [i32], b: &mut [i32]) {
+        for i in 0..a.len() {
+            match ch_assign {
+                8 => b[i] = a[i].wrapping_sub(b[i]),
+                9 => a[i] = a[i].wrapping_add(b[i]),
+                10 => {
+                    let mid = ((a[i] as i64) << 1) | ((b[i] as i64) & 1);
+                    let side = b[i] as i64;
+                    a[i] = ((mid + side) >> 1) as i32;
+                    b[i] = ((mid - side) >> 1) as i32;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Every assignment over random, extreme (i32::MIN / MAX / -1 / 0) and
+    /// small values: identical to the `i64` oracle.
+    #[test]
+    fn decorrelate_matches_reference() {
+        let mut x = 0x5555_AAAA_1234_5678u64;
+        let mut rnd = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 32) as u32
+        };
+        let edge = [
+            i32::MIN,
+            i32::MIN + 1,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            i32::MAX - 1,
+            i32::MAX,
+        ];
+        for ch_assign in [0u32, 1, 8, 9, 10] {
+            let mut a: Vec<i32> = Vec::new();
+            let mut b: Vec<i32> = Vec::new();
+            for &p in &edge {
+                for &q in &edge {
+                    a.push(p);
+                    b.push(q);
+                }
+            }
+            for i in 0..5000 {
+                let (p, q) = (rnd() as i32, rnd() as i32);
+                let sh = if i % 2 == 0 { 0 } else { 15 };
+                a.push(p >> sh);
+                b.push(q >> sh);
+            }
+            let (mut a1, mut b1) = (a.clone(), b.clone());
+            decorrelate(ch_assign, &mut a1, &mut b1);
+            decorrelate_ref(ch_assign, &mut a, &mut b);
+            assert_eq!((a1, b1), (a, b), "ch_assign={ch_assign}");
         }
     }
 
