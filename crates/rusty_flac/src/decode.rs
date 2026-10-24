@@ -62,9 +62,89 @@ pub struct Decoder<'a> {
     data: &'a [u8],
     /// Byte offset of the next frame's first byte.
     pos: usize,
+    core: FrameDecoder,
+}
+
+/// Decodes FLAC frames handed over one at a time — e.g. the packets a
+/// demuxer cuts — given the stream's STREAMINFO. It owns its per-channel
+/// scratch, so one `FrameDecoder` serves a whole stream without
+/// re-allocating, and nothing needs the `fLaC` header in front of a frame.
+/// Same checks as [`Decoder`]: header CRC-8, frame CRC-16, channel count.
+pub struct FrameDecoder {
     info: StreamInfo,
     /// Scratch: per-channel decode buffers (channel-assignment domain).
     scratch: Vec<Vec<i32>>,
+}
+
+impl StreamInfo {
+    /// Parse a STREAMINFO metadata block body (its 34 bytes, without the
+    /// 4-byte block header). Longer input is fine; shorter is
+    /// [`DecodeError::Truncated`].
+    pub fn parse(block: &[u8]) -> Result<StreamInfo, DecodeError> {
+        if block.len() < 34 {
+            return Err(DecodeError::Truncated);
+        }
+        Ok(parse_streaminfo(&block[..34]))
+    }
+}
+
+impl FrameDecoder {
+    /// A decoder for frames of the stream `info` describes (1..=8 channels).
+    pub fn new(info: StreamInfo) -> Result<FrameDecoder, DecodeError> {
+        if info.channels == 0 || info.channels > 8 {
+            return Err(DecodeError::Inconsistent("channels"));
+        }
+        let scratch = vec![Vec::new(); info.channels as usize];
+        Ok(FrameDecoder { info, scratch })
+    }
+
+    pub fn streaminfo(&self) -> &StreamInfo {
+        &self.info
+    }
+
+    /// Decode the frame at the start of `data` into `out` (planar, APPENDED
+    /// per channel, as [`Decoder::next_frame`]). Returns `(block size, bytes
+    /// the frame occupied)`; bytes after it are not looked at.
+    pub fn decode_frame(
+        &mut self,
+        data: &[u8],
+        out: &mut [Vec<i32>],
+    ) -> Result<(usize, usize), DecodeError> {
+        let _frame_scope = prof::scope(Stage::Frame);
+        let (bs, ch_assign, used) = self.decode_coded(data)?;
+        self.emit_planar(bs, ch_assign, out);
+        Ok((bs, used))
+    }
+
+    /// Decode the frame at the start of `data` and APPEND it to `out`
+    /// interleaved and converted to `S`, as
+    /// [`Decoder::next_frame_interleaved`]. Returns `(block size, bytes the
+    /// frame occupied)`; on an error `out` is left as it was.
+    pub fn decode_frame_interleaved<S: Sample>(
+        &mut self,
+        data: &[u8],
+        out: &mut Vec<S>,
+    ) -> Result<(usize, usize), DecodeError> {
+        let _frame_scope = prof::scope(Stage::Frame);
+        let scale = S::scale(self.info.bits_per_sample)?;
+        let (bs, ch_assign, used) = self.decode_coded(data)?;
+        let _out_scope = prof::scope(Stage::Output);
+        write_interleaved(&self.scratch, bs, ch_assign, scale, out);
+        Ok((bs, used))
+    }
+
+    /// Stereo reconstruction in the scratch, then append it to `out`.
+    fn emit_planar(&mut self, bs: usize, ch_assign: u32, out: &mut [Vec<i32>]) {
+        let decorr_scope = prof::scope(Stage::Decorr);
+        if let [a, b] = &mut self.scratch[..] {
+            decorrelate(ch_assign, &mut a[..bs], &mut b[..bs]);
+        }
+        drop(decorr_scope);
+        let _out_scope = prof::scope(Stage::Output);
+        for (o, s) in out.iter_mut().zip(&self.scratch) {
+            o.extend_from_slice(&s[..bs]);
+        }
+    }
 }
 
 impl<'a> Decoder<'a> {
@@ -101,20 +181,12 @@ impl<'a> Decoder<'a> {
             }
         }
         let info = info.ok_or(DecodeError::NotFlac)?;
-        if info.channels == 0 || info.channels > 8 {
-            return Err(DecodeError::Inconsistent("channels"));
-        }
-        let scratch = vec![Vec::new(); info.channels as usize];
-        Ok(Decoder {
-            data,
-            pos,
-            info,
-            scratch,
-        })
+        let core = FrameDecoder::new(info)?;
+        Ok(Decoder { data, pos, core })
     }
 
     pub fn streaminfo(&self) -> &StreamInfo {
-        &self.info
+        &self.core.info
     }
 
     /// Decode the next frame into `out` (planar, one Vec per channel; each
@@ -125,16 +197,7 @@ impl<'a> Decoder<'a> {
         let Some((bs, ch_assign)) = self.decode_frame()? else {
             return Ok(None);
         };
-        // --- stereo reconstruction into out ---
-        let decorr_scope = prof::scope(Stage::Decorr);
-        if let [a, b] = &mut self.scratch[..] {
-            decorrelate(ch_assign, &mut a[..bs], &mut b[..bs]);
-        }
-        drop(decorr_scope);
-        let _out_scope = prof::scope(Stage::Output);
-        for (o, s) in out.iter_mut().zip(&self.scratch) {
-            o.extend_from_slice(&s[..bs]);
-        }
+        self.core.emit_planar(bs, ch_assign, out);
         Ok(Some(bs))
     }
 
@@ -158,27 +221,37 @@ impl<'a> Decoder<'a> {
         out: &mut Vec<S>,
     ) -> Result<Option<usize>, DecodeError> {
         let _frame_scope = prof::scope(Stage::Frame);
-        let scale = S::scale(self.info.bits_per_sample)?;
+        let scale = S::scale(self.core.info.bits_per_sample)?;
         let Some((bs, ch_assign)) = self.decode_frame()? else {
             return Ok(None);
         };
         let _out_scope = prof::scope(Stage::Output);
-        write_interleaved(&self.scratch, bs, ch_assign, scale, out);
+        write_interleaved(&self.core.scratch, bs, ch_assign, scale, out);
         Ok(Some(bs))
     }
 
-    /// Parse and decode the next frame into `scratch` (coded channel
-    /// domain: a stereo pair is still in its coded assignment), verifying
-    /// both CRCs. Returns `(block size, channel assignment)`, or `None` at
-    /// end of stream. `pos` advances only past a frame that decoded cleanly.
+    /// Decode the next frame into the core's scratch (coded channel
+    /// domain). Returns `(block size, channel assignment)`, or `None` at end
+    /// of stream. `pos` advances only past a frame that decoded cleanly.
     fn decode_frame(&mut self) -> Result<Option<(usize, u32)>, DecodeError> {
         if self.pos >= self.data.len() {
             return Ok(None);
         }
+        let (bs, ch_assign, used) = self.core.decode_coded(&self.data[self.pos..])?;
+        self.pos += used;
+        Ok(Some((bs, ch_assign)))
+    }
+}
+
+impl FrameDecoder {
+    /// Parse and decode the frame at the start of `data` into `scratch`
+    /// (coded channel domain: a stereo pair is still in its coded
+    /// assignment), verifying both CRCs. Returns `(block size, channel
+    /// assignment, bytes the frame occupied)`.
+    fn decode_coded(&mut self, data: &[u8]) -> Result<(usize, u32, usize), DecodeError> {
         prof::count(Ctr::Frames, 1);
-        let frame_start = self.pos;
         let hdr_scope = prof::scope(Stage::Header);
-        let mut br = BitReader::new(&self.data[frame_start..]);
+        let mut br = BitReader::new(data);
 
         // --- frame header ---
         let sync = br.read_bits(14).ok_or(DecodeError::Truncated)?;
@@ -231,7 +304,7 @@ impl<'a> Decoder<'a> {
         debug_assert!(br.is_byte_aligned());
         let hdr_len = br.byte_pos();
         let hcrc = br.read_bits(8).ok_or(DecodeError::Truncated)? as u8;
-        if crc8(&self.data[frame_start..frame_start + hdr_len]) != hcrc {
+        if crc8(&data[..hdr_len]) != hcrc {
             return Err(DecodeError::BadFrameHeader("crc8"));
         }
 
@@ -277,12 +350,11 @@ impl<'a> Decoder<'a> {
         let frame_len = br.byte_pos();
         let fcrc = br.read_bits(16).ok_or(DecodeError::Truncated)? as u16;
         prof::count(Ctr::CrcBytes, frame_len as u64);
-        if crc16(&self.data[frame_start..frame_start + frame_len]) != fcrc {
+        if crc16(&data[..frame_len]) != fcrc {
             return Err(DecodeError::BadFrameCrc);
         }
-        self.pos = frame_start + frame_len + 2;
         drop(crc_scope);
-        Ok(Some((bs, ch_assign)))
+        Ok((bs, ch_assign, frame_len + 2))
     }
 }
 
@@ -1005,6 +1077,45 @@ mod tests {
             Some(1000)
         );
         assert_eq!(o32, l[..1000]);
+    }
+
+    /// A `FrameDecoder` fed the frames one at a time (cut by the byte
+    /// counts it reports, from a STREAMINFO parsed with `StreamInfo::parse`)
+    /// produces exactly what `Decoder` does over the whole stream, planar
+    /// and interleaved, and rejects a corrupted frame.
+    #[test]
+    fn frame_decoder_matches_stream_decoder() {
+        let (l, r) = test_signal(25_000);
+        let mut enc = Encoder::new(44100, 2, 16).unwrap();
+        enc.push_planar(&[&l, &r]).unwrap();
+        let stream = enc.finish();
+        let mut whole = Decoder::new(&stream).unwrap();
+        let mut want: Vec<i32> = Vec::new();
+        while whole.next_frame_interleaved(&mut want).unwrap().is_some() {}
+        // STREAMINFO body sits after "fLaC" + the 4-byte block header.
+        let info = StreamInfo::parse(&stream[8..]).unwrap();
+        let first = Decoder::new(&stream).unwrap().pos;
+        let mut fd = FrameDecoder::new(info.clone()).unwrap();
+        let mut planar = vec![Vec::new(); 2];
+        let mut got: Vec<i32> = Vec::new();
+        let mut at = first;
+        while at < stream.len() {
+            let (bs, used) = fd
+                .decode_frame_interleaved(&stream[at..], &mut got)
+                .unwrap();
+            let mut fd2 = FrameDecoder::new(info.clone()).unwrap();
+            let (bs2, used2) = fd2
+                .decode_frame(&stream[at..at + used], &mut planar)
+                .unwrap();
+            assert_eq!((bs, used), (bs2, used2));
+            at += used;
+        }
+        assert_eq!(got, want);
+        assert_eq!(planar, [l, r]);
+        let mut bad = stream[first..].to_vec();
+        bad[40] ^= 0x10;
+        assert!(fd.decode_frame_interleaved(&bad, &mut got).is_err());
+        assert!(StreamInfo::parse(&stream[8..20]).is_err());
     }
 
     #[test]
