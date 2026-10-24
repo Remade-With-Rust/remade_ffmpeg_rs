@@ -6,6 +6,12 @@ each release, under **Security**. The project follows
 decoder output is stable (gated against the ISO/IEC 14496-26 conformance suite);
 encoder output may change in minor releases when quality improves.
 
+## [2.0.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v2.0.0...rusty_aac-v2.0.1) - 2026-10-24
+
+### Fixed
+
+- *(ci)* stop the vet-import release loop: exclude supply-chain/ from the published mp3/aac crates
+
 ## [2.0.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v1.1.2...rusty_aac-v2.0.0) - 2026-10-24
 
 ### Other

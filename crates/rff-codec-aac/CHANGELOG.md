@@ -4,6 +4,12 @@ All notable changes to this crate. Security-relevant changes are listed first in
 each release, under **Security**. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.7](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-aac-v1.1.6...rff-codec-aac-v1.1.7) - 2026-10-24
+
+### Fixed
+
+- *(ci)* stop the vet-import release loop: exclude supply-chain/ from the published mp3/aac crates
+
 ## [1.1.6](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-aac-v1.1.5...rff-codec-aac-v1.1.6) - 2026-10-24
 
 ### Other
