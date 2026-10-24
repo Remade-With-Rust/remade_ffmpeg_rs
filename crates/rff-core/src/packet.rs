@@ -32,6 +32,15 @@ pub struct Packet {
     /// end, not a start: decoders count samples from it to trim end padding
     /// off the [`end_of_stream`](PacketFlags::end_of_stream) packet.
     pub end_position: Option<i64>,
+    /// Samples (per channel, at the stream's sample rate) to drop from the
+    /// END of this packet's decoded output; 0 = none. The container's record
+    /// of the encoder's end padding on a stream's last packet — Matroska's
+    /// `DiscardPadding`, FFmpeg's `AV_PKT_DATA_SKIP_SAMPLES` end field — for
+    /// containers whose timestamps are too coarse to carry it as an
+    /// [`end_position`](Self::end_position). As in FFmpeg, audio decoders drop
+    /// that many samples when it fits in what the packet decodes to and
+    /// ignore it otherwise.
+    pub discard_padding: u32,
     /// The stream time base these timestamps are expressed in.
     pub time_base: Rational,
     /// The compressed payload.
