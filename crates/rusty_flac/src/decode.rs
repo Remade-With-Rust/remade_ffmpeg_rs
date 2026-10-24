@@ -482,36 +482,52 @@ fn decode_residual(
 
 /// Invert the fixed polynomial predictors in place (samples after warm-up are
 /// residuals on entry, samples on exit).
+///
+/// The predictor state (the last `order` samples) rides in registers, so a
+/// sample's only dependency on the one before it is a scaled add — not a
+/// store-to-load round trip through `buf`. Wrapping `i32` arithmetic is
+/// exact mod 2^32 in any order, so this equals the textbook form bit for
+/// bit (`restore_fixed_ref` in the tests).
 fn restore_fixed(buf: &mut [i32], order: usize) {
+    let (warm, rest) = buf.split_at_mut(order);
     match order {
         0 => {}
         1 => {
-            for i in 1..buf.len() {
-                buf[i] = buf[i].wrapping_add(buf[i - 1]);
+            let mut p1 = warm[0];
+            for x in rest {
+                p1 = x.wrapping_add(p1);
+                *x = p1;
             }
         }
         2 => {
-            for i in 2..buf.len() {
-                buf[i] = buf[i]
-                    .wrapping_add(buf[i - 1].wrapping_mul(2))
-                    .wrapping_sub(buf[i - 2]);
+            let (mut p2, mut p1) = (warm[0], warm[1]);
+            for x in rest {
+                let v = x.wrapping_add(p1.wrapping_mul(2)).wrapping_sub(p2);
+                *x = v;
+                (p2, p1) = (p1, v);
             }
         }
         3 => {
-            for i in 3..buf.len() {
-                buf[i] = buf[i]
-                    .wrapping_add(buf[i - 1].wrapping_mul(3))
-                    .wrapping_sub(buf[i - 2].wrapping_mul(3))
-                    .wrapping_add(buf[i - 3]);
+            let (mut p3, mut p2, mut p1) = (warm[0], warm[1], warm[2]);
+            for x in rest {
+                let v = x
+                    .wrapping_add(p3)
+                    .wrapping_sub(p2.wrapping_mul(3))
+                    .wrapping_add(p1.wrapping_mul(3));
+                *x = v;
+                (p3, p2, p1) = (p2, p1, v);
             }
         }
         4 => {
-            for i in 4..buf.len() {
-                buf[i] = buf[i]
-                    .wrapping_add(buf[i - 1].wrapping_mul(4))
-                    .wrapping_sub(buf[i - 2].wrapping_mul(6))
-                    .wrapping_add(buf[i - 3].wrapping_mul(4))
-                    .wrapping_sub(buf[i - 4]);
+            let (mut p4, mut p3, mut p2, mut p1) = (warm[0], warm[1], warm[2], warm[3]);
+            for x in rest {
+                let v = x
+                    .wrapping_sub(p4)
+                    .wrapping_add(p3.wrapping_mul(4))
+                    .wrapping_sub(p2.wrapping_mul(6))
+                    .wrapping_add(p1.wrapping_mul(4));
+                *x = v;
+                (p4, p3, p2, p1) = (p3, p2, p1, v);
             }
         }
         _ => unreachable!(),
@@ -623,6 +639,60 @@ mod tests {
             c = (c + 1) % ch;
         }
         assert_eq!(ours, theirs);
+    }
+
+    /// The original fixed restore (every sample reloaded from `buf`): the
+    /// oracle for the register-carried loops.
+    fn restore_fixed_ref(buf: &mut [i32], order: usize) {
+        for i in order..buf.len() {
+            let p = |k: usize| buf[i - k];
+            let pred = match order {
+                0 => 0,
+                1 => p(1),
+                2 => p(1).wrapping_mul(2).wrapping_sub(p(2)),
+                3 => p(1)
+                    .wrapping_mul(3)
+                    .wrapping_sub(p(2).wrapping_mul(3))
+                    .wrapping_add(p(3)),
+                _ => p(1)
+                    .wrapping_mul(4)
+                    .wrapping_sub(p(2).wrapping_mul(6))
+                    .wrapping_add(p(3).wrapping_mul(4))
+                    .wrapping_sub(p(4)),
+            };
+            buf[i] = buf[i].wrapping_add(pred);
+        }
+    }
+
+    /// Orders 0..=4, lengths from exactly `order` up, small and wrapping
+    /// (full-range) values: the register-carried restore matches the oracle.
+    #[test]
+    fn restore_fixed_matches_reference() {
+        let mut x = 0xDEAD_BEEF_0BAD_F00Du64;
+        let mut rnd = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 32) as u32
+        };
+        for order in 0..=4usize {
+            for trial in 0..40 {
+                let n = order + (rnd() % 200) as usize;
+                let buf: Vec<i32> = (0..n)
+                    .map(|_| {
+                        if trial % 3 == 0 {
+                            rnd() as i32
+                        } else {
+                            rnd() as i32 >> 16
+                        }
+                    })
+                    .collect();
+                let (mut a, mut b) = (buf.clone(), buf);
+                restore_fixed(&mut a, order);
+                restore_fixed_ref(&mut b, order);
+                assert_eq!(a, b, "order={order} trial={trial}");
+            }
+        }
     }
 
     #[test]
