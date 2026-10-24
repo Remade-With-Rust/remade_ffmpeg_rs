@@ -13,7 +13,7 @@ encoder** in pure Rust. No C, no FFI, and no runtime dependencies.
   conformance vectors and matches FFmpeg bit for bit on a 678-stream corpus.
 - **Complete.** Encoding covers CBR (8–320 kbps) and VBR, mono, stereo and
   joint stereo, a psychoacoustic model, transient block switching, per-band
-  noise shaping, the bit reservoir, and Xing/Info headers.
+  noise shaping, the bit reservoir, and gapless LAME-style Info/Xing tags.
 - **Fast.** On one x86-64 core, decoding runs at about 800× real time and
   encoding at about 120× real time. The decoder is faster than FFmpeg's.
 - **Safe.** The only `unsafe` code is explicit SIMD, each kernel paired with a
@@ -77,7 +77,7 @@ fn main() -> Result<(), Error> {
         vbr_quality: None, // or Some(rusty_mp3::vbr_quality_index(2.0)) for VBR
     });
     encoder.push_pcm_f32(&pcm, 1, rate)?; // mono, 44.1 kHz
-    encoder.finish();                      // flush the tail and write the Info header
+    encoder.finish();                      // flush the tail and complete the Info tag
 
     let mut mp3 = Vec::new();
     while let Ok(packet) = encoder.next_packet() {

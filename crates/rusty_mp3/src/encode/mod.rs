@@ -22,6 +22,7 @@ pub mod bitstream;
 pub mod fft;
 pub mod filterbank;
 pub mod huffman;
+pub mod lametag;
 pub mod mdct;
 pub mod psychoacoustic;
 pub mod quantize;
