@@ -7,6 +7,12 @@ decoder output is bit-exact and stable; encoder output may change in minor
 releases when quality improves. Engineering notes for releases before 1.0.0
 are in [`docs/history.md`](docs/history.md).
 
+## [1.0.4](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_mp3-v1.0.3...rusty_mp3-v1.0.4) - 2026-10-24
+
+### Fixed
+
+- *(ci)* stop the vet-import release loop: exclude supply-chain/ from the published mp3/aac crates
+
 ## [1.0.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_mp3-v1.0.2...rusty_mp3-v1.0.3) - 2026-10-24
 
 ### Other
