@@ -129,6 +129,11 @@ struct Mp3Encoder {
     /// VBR quality target (peak NMR). `Some` ⇒ VBR, `None` ⇒ CBR.
     quality: Option<f32>,
     eof: bool,
+    /// A packet went out before `flush` -- so the leading Info/Xing tag frame
+    /// left as a placeholder, and the completed one follows the audio.
+    streamed: bool,
+    /// That trailing tag packet has been handed out.
+    tag_sent: bool,
 }
 
 impl Mp3Encoder {
@@ -209,14 +214,30 @@ impl Encoder for Mp3Encoder {
     }
 
     fn receive_packet(&mut self) -> Result<Packet> {
-        // The inner encoder owns the packet queue (including the Xing/Info
-        // frame push-fronted at finish) — pull straight through, mapping the
+        // The inner encoder owns the packet queue -- its first packet is the
+        // Info/Xing tag frame -- so pull straight through, mapping the
         // Again/Eof drain protocol variant for variant.
+        //
+        // If packets were pulled before `flush`, that first one left as a
+        // placeholder (its counts and end padding are only known at the end),
+        // so the COMPLETED tag frame follows the audio as one last packet. The
+        // mp3 muxer writes it back over the placeholder on a seekable output
+        // (and drops it on a pipe); the file is then gapless.
         match self.inner.as_mut() {
-            Some(inner) => inner
-                .next_packet()
-                .map(|bytes| Packet::from_data(0, bytes))
-                .map_err(map_err),
+            Some(inner) => match inner.next_packet() {
+                Ok(bytes) => {
+                    self.streamed |= !self.eof;
+                    Ok(Packet::from_data(0, bytes))
+                }
+                Err(rusty_mp3::Error::Eof) if self.streamed && !self.tag_sent => {
+                    self.tag_sent = true;
+                    match inner.lame_tag_frame() {
+                        Some(tag) => Ok(Packet::from_data(0, tag.to_vec())),
+                        None => Err(Error::Eof),
+                    }
+                }
+                Err(e) => Err(map_err(e)),
+            },
             None if self.eof => Err(Error::Eof),
             None => Err(Error::Again),
         }
@@ -425,6 +446,65 @@ mod tests {
                 "case {case}"
             );
         }
+    }
+
+    /// Pull packets the way the transcoder does -- after every `send_frame`,
+    /// then after `flush` -- and return them.
+    fn streamed_packets(options: &[(&str, &str)], frames: usize) -> Vec<Vec<u8>> {
+        let mut enc = Mp3Encoder::default();
+        let mut dict = Dictionary::new();
+        for (k, v) in options {
+            dict.set(*k, *v);
+        }
+        enc.configure(&dict).unwrap();
+        let s16: Vec<u8> = (0..1152 * 2)
+            .flat_map(|i| (((i as f32 * 0.05).sin() * 8000.0) as i16).to_le_bytes())
+            .collect();
+        let mut out = Vec::new();
+        for _ in 0..frames {
+            enc.send_frame(&Frame::Audio(AudioFrame {
+                sample_rate: 44_100,
+                channels: 1,
+                format: SampleFormat::S16,
+                planes: vec![s16.clone()],
+                samples: 1152 * 2,
+                pts: None,
+            }))
+            .unwrap();
+            while let Ok(p) = enc.receive_packet() {
+                out.push(p.data);
+            }
+        }
+        enc.flush();
+        while let Ok(p) = enc.receive_packet() {
+            out.push(p.data);
+        }
+        out
+    }
+
+    fn is_tag(frame: &[u8]) -> bool {
+        // MPEG-1 mono: header (4) + side info (17), then the tag.
+        frame.len() > 25 && matches!(&frame[21..25], b"Info" | b"Xing")
+    }
+
+    /// A stream whose packets left before `flush` (VBR emits frames as they
+    /// are encoded) ends with the COMPLETED tag frame, the length of the
+    /// placeholder it began with, for the mp3 muxer to write back over it. The
+    /// buffered CBR path emits nothing before `flush`, so its leading tag is
+    /// already complete and none follows.
+    #[test]
+    #[cfg_attr(miri, ignore = "runs real encodes: too slow to interpret under Miri")]
+    fn streamed_encode_ends_with_the_completed_tag() {
+        let vbr = streamed_packets(&[("q", "2")], 4);
+        let (first, last) = (&vbr[0], &vbr[vbr.len() - 1]);
+        assert!(is_tag(first) && is_tag(last));
+        assert_eq!(first.len(), last.len());
+        assert_ne!(first, last, "the placeholder's counts are filled in");
+        assert_eq!(vbr.iter().filter(|p| is_tag(p)).count(), 2);
+
+        let cbr = streamed_packets(&[("b", "128k")], 4);
+        assert!(is_tag(&cbr[0]));
+        assert_eq!(cbr.iter().filter(|p| is_tag(p)).count(), 1);
     }
 
     #[test]
