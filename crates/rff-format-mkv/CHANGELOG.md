@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mkv-v0.4.3...rff-format-mkv-v0.4.4) - 2026-10-28
+
+### Fixed
+
+- *(mp4,mkv)* write B-frame timing as FFmpeg does ([#60](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/60))
+
 ## [0.4.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mkv-v0.3.1...rff-format-mkv-v0.4.0) - 2026-10-24
 
 ### Fixed
