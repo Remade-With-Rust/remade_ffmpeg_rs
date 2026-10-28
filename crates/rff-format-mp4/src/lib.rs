@@ -146,6 +146,9 @@ struct SampleLoc {
     size: usize,
     dts: i64,
     pts: i64,
+    /// The sample's `stts` delta, which FFmpeg's mov demuxer reports as the
+    /// packet duration.
+    duration: i64,
     keyframe: bool,
 }
 
@@ -371,6 +374,7 @@ impl Demuxer for Mp4Demuxer {
         let mut packet = Packet::from_data(loc.stream_index, data);
         packet.dts = Some(loc.dts);
         packet.pts = Some(loc.pts);
+        packet.duration = loc.duration;
         packet.flags.keyframe = loc.keyframe;
         Ok(packet)
     }
@@ -847,6 +851,7 @@ fn build_samples(
                 size,
                 dts: 0,
                 pts: 0,
+                duration: 0,
                 keyframe: false,
             });
             off += size;
@@ -868,6 +873,7 @@ fn build_samples(
                 break 'stts;
             }
             samples[s].dts = dts;
+            samples[s].duration = delta;
             dts = dts.saturating_add(delta);
             s += 1;
         }
@@ -1034,10 +1040,11 @@ struct TrackOut {
     sizes: Vec<u32>,
     /// `stss`: the 1-based numbers of the sync samples.
     sync: Vec<u32>,
-    /// Packet PTS per sample. `stts` is derived from them at the trailer:
-    /// [`sample_durations`] looks at the whole track to choose between real
-    /// PTS deltas and a nominal rate.
+    /// Packet PTS and DTS per sample. `stts`, `ctts` and the edit list are
+    /// derived from them at the trailer, by [`timing_plan`], which looks at the
+    /// whole track.
     pts: Vec<Option<i64>>,
+    dts: Vec<Option<i64>>,
     /// `stco`/`co64` + `stsc`: `(file offset, sample count)` per chunk, a
     /// chunk being a run of this track's samples stored back to back.
     chunks: Vec<(u64, u32)>,
@@ -1052,6 +1059,7 @@ impl TrackOut {
             sizes: Vec::new(),
             sync: Vec::new(),
             pts: Vec::new(),
+            dts: Vec::new(),
             chunks: Vec::new(),
         }
     }
@@ -1091,8 +1099,14 @@ impl TrackOut {
         }
     }
 
-    /// Index one sample (`stsz`, `stss`, the PTS behind `stts`).
-    fn push_sample(&mut self, size: usize, keyframe: bool, pts: Option<i64>) -> Result<()> {
+    /// Index one sample (`stsz`, `stss`, the timestamps behind `stts`/`ctts`).
+    fn push_sample(
+        &mut self,
+        size: usize,
+        keyframe: bool,
+        pts: Option<i64>,
+        dts: Option<i64>,
+    ) -> Result<()> {
         let size = u32::try_from(size)
             .map_err(|_| Error::invalid("mp4 mux: a sample over 4 GiB cannot be indexed"))?;
         self.sizes.push(size);
@@ -1100,6 +1114,7 @@ impl TrackOut {
             self.sync.push(self.sizes.len() as u32);
         }
         self.pts.push(pts);
+        self.dts.push(dts);
         Ok(())
     }
 
@@ -1173,33 +1188,114 @@ fn require_configs(tracks: &mut [TrackOut]) -> Result<()> {
     Ok(())
 }
 
-/// Per track: the media timescale and per-sample durations (packet PTS
-/// deltas, nominal fallback otherwise).
-fn timing_plans(tracks: &[TrackOut]) -> Vec<(u32, Vec<u32>)> {
-    tracks
+/// One track's timing, in its media timescale.
+struct TimingPlan {
+    timescale: u32,
+    /// `stts`: per-sample decode durations.
+    durations: Vec<u32>,
+    /// `ctts`: per-sample composition offsets (pts - dts); empty when every
+    /// offset is 0, which writes no `ctts`.
+    offsets: Vec<i64>,
+    /// The edit list's `media_time`: where presentation starts on the decode
+    /// timeline (a B-frame stream's reorder delay). 0 writes no edit list.
+    start: i64,
+    /// Presentation length, from `start` to the end of the last frame shown.
+    presentation: u64,
+}
+
+/// A track's `stts`/`ctts`/`elst`, as FFmpeg's movenc derives them: `stts`
+/// from decode times, `ctts` from pts - dts, and an edit list that starts
+/// presentation at the first pts when that is not the first dts.
+///
+/// Decode times are the packets' DTS when every packet has one and they never
+/// go backwards. Otherwise (Matroska, say, which stores no DTS) they are
+/// derived as FFmpeg's demux layer derives them: the sorted PTS, delayed by
+/// the reorder depth so that no sample decodes after it is shown. In-order
+/// PTS give back exactly those PTS, so a stream without reordering is timed
+/// as before: real PTS deltas, or a nominal rate when PTS are missing.
+fn timing_plan(t: &TrackOut) -> TimingPlan {
+    let timescale = pick_timescale(&t.stream);
+    let media = t.stream.media_type;
+    let Some(dts) = decode_times(&t.pts, &t.dts) else {
+        let durations = sample_durations(&t.pts, timescale, media);
+        let presentation = durations.iter().map(|&d| d as u64).sum();
+        return TimingPlan {
+            timescale,
+            durations,
+            offsets: Vec::new(),
+            start: 0,
+            presentation,
+        };
+    };
+    let durations = sample_durations(
+        &dts.iter().map(|&d| Some(d)).collect::<Vec<_>>(),
+        timescale,
+        media,
+    );
+    // `decode_times` only returns timestamps when every PTS is present.
+    let pts: Vec<i64> = t.pts.iter().map(|p| p.unwrap_or(0)).collect();
+    let mut offsets: Vec<i64> = pts.iter().zip(&dts).map(|(p, d)| p - d).collect();
+    let first_shown = pts.iter().min().copied().unwrap_or(0);
+    let start = (first_shown - dts[0]).max(0);
+    // The last frame shown ends at its composition time plus its duration.
+    let mut decode_at = 0i64;
+    let mut end = 0i64;
+    for (off, &dur) in offsets.iter().zip(&durations) {
+        end = end.max(decode_at + off + i64::from(dur));
+        decode_at += i64::from(dur);
+    }
+    let presentation = (end - start).max(0) as u64;
+    if offsets.iter().all(|&o| o == 0) {
+        offsets.clear();
+    }
+    TimingPlan {
+        timescale,
+        durations,
+        offsets,
+        start,
+        presentation,
+    }
+}
+
+/// Decode timestamps for a track, or `None` when there are too few samples
+/// or PTS are missing (see [`timing_plan`]).
+fn decode_times(pts: &[Option<i64>], dts: &[Option<i64>]) -> Option<Vec<i64>> {
+    let pts: Vec<i64> = pts.iter().copied().collect::<Option<_>>()?;
+    let usable =
+        |d: &[i64]| d.len() >= 2 && d.windows(2).all(|w| w[1] >= w[0]) && d[d.len() - 1] > d[0];
+    if let Some(dts) = dts.iter().copied().collect::<Option<Vec<i64>>>() {
+        if usable(&dts) {
+            return Some(dts);
+        }
+    }
+    let mut sorted = pts.clone();
+    sorted.sort_unstable();
+    let delay = sorted
         .iter()
-        .map(|t| {
-            let ts = pick_timescale(&t.stream);
-            (ts, sample_durations(&t.pts, ts, t.stream.media_type))
-        })
-        .collect()
+        .zip(&pts)
+        .map(|(s, p)| s - p)
+        .max()
+        .unwrap_or(0)
+        .max(0);
+    let dts: Vec<i64> = sorted.iter().map(|s| s - delay).collect();
+    usable(&dts).then_some(dts)
 }
 
 /// The `moov` box: `mvhd` plus one `trak` per track, from the sample tables.
-fn build_moov(tracks: &[TrackOut], plans: &[(u32, Vec<u32>)]) -> Vec<u8> {
+fn build_moov(tracks: &[TrackOut], plans: &[TimingPlan]) -> Vec<u8> {
     let movie_timescale = 1000u32;
     let mut traks = Vec::new();
     let mut max_movie_dur = 0u32;
     for (t, track) in tracks.iter().enumerate() {
-        let (timescale, durations) = &plans[t];
-        let media_dur: u64 = durations.iter().map(|&d| d as u64).sum();
-        let movie_dur = (media_dur * movie_timescale as u64 / (*timescale).max(1) as u64) as u32;
+        let plan = &plans[t];
+        let media_dur: u64 = plan.durations.iter().map(|&d| d as u64).sum();
+        let movie_dur =
+            (plan.presentation * movie_timescale as u64 / plan.timescale.max(1) as u64) as u32;
         max_movie_dur = max_movie_dur.max(movie_dur);
         traks.push(build_trak(
             track,
             (t + 1) as u32,
-            *timescale,
-            durations,
+            plan,
             media_dur as u32,
             movie_dur,
         ));
@@ -1210,6 +1306,9 @@ fn build_moov(tracks: &[TrackOut], plans: &[(u32, Vec<u32>)]) -> Vec<u8> {
     }
     bx(b"moov", &moov_body)
 }
+
+/// A buffered packet: (stream, data, keyframe, pts, dts).
+type BufPacket = (usize, Vec<u8>, bool, Option<i64>, Option<i64>);
 
 /// The non-seekable MP4 muxer (pipes, sockets). An MP4 that is not
 /// fragmented needs its `moov` written after the media is known, and without a
@@ -1222,7 +1321,7 @@ struct Mp4Muxer {
     /// is rejected before a single byte is written, and by construction there
     /// is no path that reaches the box writer without a real fourcc.
     tracks: Vec<TrackOut>,
-    packets: Vec<(usize, Vec<u8>, bool, Option<i64>)>, // (stream, data, keyframe, pts)
+    packets: Vec<BufPacket>,
 }
 
 impl Mp4Muxer {
@@ -1247,6 +1346,7 @@ impl Muxer for Mp4Muxer {
             packet.data.clone(),
             packet.is_keyframe(),
             packet.pts,
+            packet.dts,
         ));
         Ok(())
     }
@@ -1256,27 +1356,27 @@ impl Muxer for Mp4Muxer {
         // --- Per-track: gather samples (H.264 → AVCC + avcC; else as-is) ---
         let mut data: Vec<Vec<Vec<u8>>> = vec![Vec::new(); tracks.len()];
         let mut scratch = Vec::new();
-        for (idx, bytes, keyframe, pts) in std::mem::take(&mut self.packets) {
+        for (idx, bytes, keyframe, pts, dts) in std::mem::take(&mut self.packets) {
             let Some(track) = tracks.get_mut(idx) else {
                 continue;
             };
             let sample = track.sample_bytes(&bytes, &mut scratch);
-            track.push_sample(sample.len(), keyframe, pts)?;
+            track.push_sample(sample.len(), keyframe, pts, dts)?;
             data[idx].push(sample.to_vec());
         }
         require_configs(tracks)?;
-        let plans = timing_plans(tracks);
+        let plans: Vec<TimingPlan> = tracks.iter().map(timing_plan).collect();
 
-        // --- interleave: order every sample by start time across all tracks ---
-        // start time = cumulative duration / timescale (seconds). A *stable* sort
+        // --- interleave: order every sample by decode time across all tracks ---
+        // decode time = cumulative duration / timescale (seconds). A *stable* sort
         // keeps each track's samples in order; ties fall back to track order.
         let mut entries: Vec<(f64, usize, usize)> = Vec::new(); // (start_s, track, local)
         for (t, samples) in data.iter().enumerate() {
-            let ts = plans[t].0.max(1) as f64;
+            let ts = plans[t].timescale.max(1) as f64;
             let mut acc = 0i64;
             for i in 0..samples.len() {
                 entries.push((acc as f64 / ts, t, i));
-                acc += plans[t].1[i] as i64;
+                acc += plans[t].durations[i] as i64;
             }
         }
         entries.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -1412,7 +1512,7 @@ impl Muxer for Mp4StreamMuxer {
             return Ok(());
         };
         let sample = track.sample_bytes(&packet.data, &mut self.scratch);
-        track.push_sample(sample.len(), packet.is_keyframe(), packet.pts)?;
+        track.push_sample(sample.len(), packet.is_keyframe(), packet.pts, packet.dts)?;
         track.place(self.pos, self.last_track == Some(t));
         self.out.write_all(sample)?;
         self.pos += sample.len() as u64;
@@ -1428,7 +1528,7 @@ impl Muxer for Mp4StreamMuxer {
             .mdat_slot
             .ok_or_else(|| Error::invalid("mp4 mux: trailer before header"))?;
         require_configs(&mut self.tracks)?;
-        let plans = timing_plans(&self.tracks);
+        let plans: Vec<TimingPlan> = self.tracks.iter().map(timing_plan).collect();
         let moov = build_moov(&self.tracks, &plans);
         let mdat_end = self.pos;
         self.out.write_all(&moov)?;
@@ -1588,8 +1688,7 @@ fn build_mvhd(timescale: u32, duration: u32, next_track_id: u32) -> Vec<u8> {
 fn build_trak(
     track: &TrackOut,
     track_id: u32,
-    timescale: u32,
-    durations: &[u32],
+    plan: &TimingPlan,
     media_duration: u32,
     movie_duration: u32,
 ) -> Vec<u8> {
@@ -1617,7 +1716,7 @@ fn build_trak(
     let mut md = Vec::new();
     pu32(&mut md, 0);
     pu32(&mut md, 0);
-    pu32(&mut md, timescale);
+    pu32(&mut md, plan.timescale);
     pu32(&mut md, media_duration);
     pu16(&mut md, 0x55C4); // language 'und'
     pu16(&mut md, 0);
@@ -1648,14 +1747,26 @@ fn build_trak(
     let dref = fbx(b"dref", 0, 0, &dref_b);
     let dinf = bx(b"dinf", &dref);
 
-    let stbl = build_stbl(track, durations);
+    let stbl = build_stbl(track, plan);
     let minf = bx(b"minf", &[media_header, dinf, stbl].concat());
 
     let mdia = bx(b"mdia", &[mdhd, hdlr, minf].concat());
-    bx(b"trak", &[tkhd, mdia].concat())
+    // edts/elst: one edit that starts presentation `plan.start` into the
+    // media, so a B-frame stream's reorder delay is not shown as a gap.
+    let edts = if plan.start > 0 {
+        let mut el = Vec::new();
+        pu32(&mut el, 1); // entry_count
+        pu32(&mut el, movie_duration); // segment_duration (movie timescale)
+        pu32(&mut el, plan.start.min(i64::from(i32::MAX)) as u32); // media_time
+        pu32(&mut el, 0x0001_0000); // media_rate 1.0
+        bx(b"edts", &fbx(b"elst", 0, 0, &el))
+    } else {
+        Vec::new()
+    };
+    bx(b"trak", &[tkhd, edts, mdia].concat())
 }
 
-fn build_stbl(track: &TrackOut, durations: &[u32]) -> Vec<u8> {
+fn build_stbl(track: &TrackOut, plan: &TimingPlan) -> Vec<u8> {
     let s = &track.stream;
     let (sizes, chunks) = (&track.sizes, &track.chunks);
     let n = sizes.len() as u32;
@@ -1713,7 +1824,7 @@ fn build_stbl(track: &TrackOut, durations: &[u32]) -> Vec<u8> {
 
     // stts: run-length-encode consecutive equal per-sample durations.
     let mut runs: Vec<(u32, u32)> = Vec::new(); // (count, delta)
-    for &d in durations {
+    for &d in &plan.durations {
         match runs.last_mut() {
             Some((count, delta)) if *delta == d => *count += 1,
             _ => runs.push((1, d)),
@@ -1726,6 +1837,31 @@ fn build_stbl(track: &TrackOut, durations: &[u32]) -> Vec<u8> {
         pu32(&mut stts_b, *delta);
     }
     let stts = fbx(b"stts", 0, 0, &stts_b);
+
+    // ctts: run-length-encoded composition offsets, version 1 (signed) only
+    // when one is negative, as FFmpeg writes them.
+    let ctts = if plan.offsets.is_empty() {
+        Vec::new()
+    } else {
+        let mut runs: Vec<(u32, i64)> = Vec::new(); // (count, offset)
+        for &o in &plan.offsets {
+            match runs.last_mut() {
+                Some((count, off)) if *off == o => *count += 1,
+                _ => runs.push((1, o)),
+            }
+        }
+        let signed = runs.iter().any(|&(_, o)| o < 0);
+        let mut b = Vec::new();
+        pu32(&mut b, runs.len() as u32);
+        for (count, off) in &runs {
+            pu32(&mut b, *count);
+            pu32(
+                &mut b,
+                (*off).clamp(i64::from(i32::MIN), i64::from(u32::MAX)) as u32,
+            );
+        }
+        fbx(b"ctts", u8::from(signed), 0, &b)
+    };
 
     // stsc: run-length over per-chunk sample counts (1-based first_chunk).
     let mut stsc_runs: Vec<(u32, u32)> = Vec::new();
@@ -1776,7 +1912,10 @@ fn build_stbl(track: &TrackOut, durations: &[u32]) -> Vec<u8> {
     }
     let stss = fbx(b"stss", 0, 0, &stss_b);
 
-    bx(b"stbl", &[stsd, stts, stsc, stsz, stco, stss].concat())
+    bx(
+        b"stbl",
+        &[stsd, stts, ctts, stsc, stsz, stco, stss].concat(),
+    )
 }
 
 #[cfg(test)]
@@ -2918,5 +3057,77 @@ mod tests {
         assert_eq!((big_n, small_n), (N, N));
         let last = dem.samples.iter().map(|l| l.offset as u64).max().unwrap();
         assert!(last > u32::MAX as u64);
+    }
+
+    /// A video track at 1/1000 holding `samples` as `(pts, dts)`.
+    fn timed_track(samples: &[(i64, Option<i64>)]) -> TrackOut {
+        let mut s = Stream::new(0, CodecId::H264);
+        s.media_type = MediaType::Video;
+        s.time_base = Rational::new(1, 1000);
+        let mut t = TrackOut::new(&s, *b"avc1");
+        for &(pts, dts) in samples {
+            t.push_sample(1, false, Some(pts), dts).unwrap();
+        }
+        t
+    }
+
+    /// #60: B-frame packets with DTS get `stts` from the DTS, `ctts` from
+    /// pts - dts, and an edit list that hides the reorder delay -- not a
+    /// nominal 1/30 s per frame from out-of-order PTS.
+    #[test]
+    fn b_frames_with_dts_get_ctts_and_an_edit_list() {
+        let t = timed_track(&[
+            (0, Some(-80)),
+            (160, Some(-40)),
+            (80, Some(0)),
+            (40, Some(40)),
+            (120, Some(80)),
+        ]);
+        let plan = timing_plan(&t);
+        assert_eq!(plan.durations, [40; 5]);
+        assert_eq!(plan.offsets, [80, 200, 80, 0, 40]);
+        assert_eq!(plan.start, 80);
+        assert_eq!(plan.presentation, 200);
+    }
+
+    /// #60: without DTS (a Matroska source), decode times are the sorted PTS
+    /// delayed by the reorder depth, as FFmpeg derives them.
+    #[test]
+    fn b_frames_without_dts_derive_decode_times_from_pts() {
+        let t = timed_track(&[(0, None), (80, None), (40, None), (160, None), (120, None)]);
+        let plan = timing_plan(&t);
+        // dts = -40, 0, 40, 80, 120
+        assert_eq!(plan.durations, [40; 5]);
+        assert_eq!(plan.offsets, [40, 80, 0, 80, 0]);
+        assert_eq!(plan.start, 40);
+        assert_eq!(plan.presentation, 200);
+    }
+
+    /// In-order PTS are timed exactly as before: PTS deltas, no `ctts`, no
+    /// edit list.
+    #[test]
+    fn in_order_pts_write_no_ctts_or_edit_list() {
+        let t = timed_track(&[(0, Some(0)), (40, Some(40)), (80, Some(80))]);
+        let plan = timing_plan(&t);
+        assert_eq!(plan.durations, [40; 3]);
+        assert!(plan.offsets.is_empty());
+        assert_eq!(plan.start, 0);
+        let t = timed_track(&[(0, None), (40, None), (80, None)]);
+        assert_eq!(timing_plan(&t).durations, [40; 3]);
+        assert!(timing_plan(&t).offsets.is_empty());
+    }
+
+    /// The boxes the plan turns into: `ctts` in `stbl`, `edts/elst` in `trak`.
+    #[test]
+    fn b_frame_plan_writes_ctts_and_elst_boxes() {
+        let t = timed_track(&[(0, None), (80, None), (40, None), (160, None), (120, None)]);
+        let plan = timing_plan(&t);
+        let trak = build_trak(&t, 1, &plan, 200, 200);
+        let has = |name: &[u8]| trak.windows(4).any(|w| w == name);
+        assert!(has(b"ctts") && has(b"edts") && has(b"elst"));
+        let t = timed_track(&[(0, None), (40, None), (80, None)]);
+        let trak = build_trak(&t, 1, &timing_plan(&t), 120, 120);
+        let has = |name: &[u8]| trak.windows(4).any(|w| w == name);
+        assert!(!has(b"ctts") && !has(b"edts"));
     }
 }

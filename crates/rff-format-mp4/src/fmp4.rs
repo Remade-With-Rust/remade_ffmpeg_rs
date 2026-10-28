@@ -21,7 +21,14 @@ pub(crate) fn init_segment(track: &TrackOut, track_id: u32, timescale: u32) -> V
     let ftyp = bx(b"ftyp", b"iso6\x00\x00\x02\x00iso6dashcmfc");
 
     // trak with empty stbl tables (fragments carry all samples).
-    let trak = super::build_trak(track, track_id, timescale, &[], 0, 0);
+    let empty = super::TimingPlan {
+        timescale,
+        durations: Vec::new(),
+        offsets: Vec::new(),
+        start: 0,
+        presentation: 0,
+    };
+    let trak = super::build_trak(track, track_id, &empty, 0, 0);
 
     let mut moov_body = super::build_mvhd(1000, 0, track_id + 1);
     moov_body.extend_from_slice(&trak);

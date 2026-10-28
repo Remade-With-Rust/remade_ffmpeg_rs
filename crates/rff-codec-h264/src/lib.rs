@@ -824,7 +824,7 @@ mod tests {
         let mut y = vec![0u8; wi * hi];
         for r in 0..hi {
             for c in 0..wi {
-                y[r * wi + c] = ((c * 3 + r * 5 + (t as usize) * 11) ^ (r & 7) * 9) as u8;
+                y[r * wi + c] = ((c * 3 + r * 5 + (t as usize) * 11) ^ ((r & 7) * 9)) as u8;
             }
         }
         let (cw, ch) = (wi / 2, hi / 2);
