@@ -134,12 +134,23 @@ fn split_access_units(stream: &[u8]) -> Vec<&[u8]> {
 // Decoder
 // ---------------------------------------------------------------------------
 
+/// The most pictures an H.264 decoded picture buffer holds (A.3.1, item h).
+const MAX_DPB_FRAMES: usize = 16;
+
 struct H264Decoder {
     inner: RustyDecoder,
     /// Out-of-band SPS/PPS (from `extradata`), prepended to the first packet if
     /// it is itself Annex-B. AVCC `avcC` extradata is handled by the demuxer.
     extradata: Vec<u8>,
     started: bool,
+    /// Decoded pictures not yet output, each with its `PicOrderCnt` and the pts
+    /// of the packet that carried it. `rusty_h264` returns pictures in decode
+    /// order; they leave here in display order.
+    reorder: Vec<(i32, Frame)>,
+    /// How many pictures `reorder` holds before the lowest POC goes out: the
+    /// DPB size the active SPS's level allows (MaxDpbFrames). No conforming
+    /// stream reorders a picture past more pictures than that.
+    dpb_frames: usize,
     queue: VecDeque<Frame>,
     eof: bool,
 }
@@ -150,8 +161,24 @@ impl H264Decoder {
             inner: RustyDecoder::new(),
             extradata: Vec::new(),
             started: false,
+            reorder: Vec::new(),
+            dpb_frames: MAX_DPB_FRAMES,
             queue: VecDeque::new(),
             eof: false,
+        }
+    }
+
+    /// Output every buffered picture, in POC order: at an IDR (which starts a
+    /// new POC sequence) and at end of stream.
+    fn drain(&mut self) {
+        self.reorder.sort_by_key(|(poc, _)| *poc);
+        self.queue.extend(self.reorder.drain(..).map(|(_, f)| f));
+    }
+
+    /// Output the buffered picture with the lowest POC.
+    fn bump(&mut self) {
+        if let Some(i) = (0..self.reorder.len()).min_by_key(|&i| self.reorder[i].0) {
+            self.queue.push_back(self.reorder.remove(i).1);
         }
     }
 }
@@ -178,24 +205,49 @@ impl Decoder for H264Decoder {
             &packet.data
         };
 
-        // Defense in depth: the decoder eats attacker-controlled bytes. It is fuzzed to
-        // never panic, but a bug here must never take down the host app — so catch any
-        // unwind, reset the decoder, and surface a decode error instead of crashing.
-        let inner = &mut self.inner;
-        let frames = match catch_unwind(AssertUnwindSafe(|| inner.decode_stream(data))) {
-            Ok(Ok(frames)) => frames,
-            Ok(Err(e)) => return Err(map_err(e)),
-            Err(_) => {
-                self.inner = RustyDecoder::new();
-                self.started = false;
-                return Err(Error::InvalidData(
-                    "rusty_h264: decoder panicked on malformed input (recovered)".into(),
-                ));
+        // One unit per coded slice, as `decode_stream` feeds `decode` (the
+        // decoder assembles a multi-slice picture across calls). `decode`
+        // returns pictures in decode order, so they are reordered here by POC
+        // with each packet's pts carried along: `decode_stream` only sorts
+        // within one call, which for one packet per access unit is nothing.
+        for au in split_access_units(data) {
+            if au_has_idr(au) {
+                self.drain();
             }
-        };
+            if let Some(n) = nal_units(au)
+                .filter(|nal| nal.first().is_some_and(|b| b & 0x1f == 7))
+                .find_map(|nal| sps_max_dpb_frames(&unescape(&nal[1..])))
+            {
+                self.dpb_frames = n;
+            }
 
-        for yuv in frames {
-            self.queue.push_back(yuv_to_frame(yuv, packet.pts));
+            // Defense in depth: the decoder eats attacker-controlled bytes. It is fuzzed
+            // to never panic, but a bug here must never take down the host app — so catch
+            // any unwind, reset the decoder, and surface a decode error instead.
+            let inner = &mut self.inner;
+            let decoded = catch_unwind(AssertUnwindSafe(|| {
+                inner
+                    .decode(au)
+                    .map(|picture| picture.map(|yuv| (inner.last_poc(), yuv)))
+            }));
+            let picture = match decoded {
+                Ok(Ok(picture)) => picture,
+                Ok(Err(e)) => return Err(map_err(e)),
+                Err(_) => {
+                    self.inner = RustyDecoder::new();
+                    self.started = false;
+                    self.drain();
+                    return Err(Error::InvalidData(
+                        "rusty_h264: decoder panicked on malformed input (recovered)".into(),
+                    ));
+                }
+            };
+            if let Some((poc, yuv)) = picture {
+                self.reorder.push((poc, yuv_to_frame(yuv, packet.pts)));
+                while self.reorder.len() > self.dpb_frames {
+                    self.bump();
+                }
+            }
         }
         Ok(())
     }
@@ -212,8 +264,172 @@ impl Decoder for H264Decoder {
     }
 
     fn flush(&mut self) {
+        self.drain();
         self.eof = true;
     }
+}
+
+/// The NAL units of an Annex-B buffer, each without its start code.
+fn nal_units(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while let Some(w) = data.get(i..i + 3) {
+        if w == [0, 0, 1] {
+            starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let ends: Vec<usize> = starts
+        .iter()
+        .skip(1)
+        .map(|&s| s - 3)
+        .chain([data.len()])
+        .collect();
+    starts
+        .into_iter()
+        .zip(ends)
+        .map(move |(s, e)| &data[s..e.max(s)])
+}
+
+/// Remove emulation-prevention bytes (`00 00 03` -> `00 00`) from a NAL payload.
+fn unescape(nal: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nal.len());
+    let mut zeros = 0;
+    for &b in nal {
+        if zeros >= 2 && b == 3 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        out.push(b);
+    }
+    out
+}
+
+/// A big-endian bit reader over an RBSP, with Exp-Golomb codes.
+struct Bits<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl Bits<'_> {
+    fn bit(&mut self) -> Option<u32> {
+        let byte = *self.data.get(self.pos / 8)?;
+        self.pos += 1;
+        Some(u32::from(byte >> (7 - (self.pos - 1) % 8)) & 1)
+    }
+
+    fn bits(&mut self, n: u32) -> Option<u32> {
+        (0..n).try_fold(0, |v, _| Some(v << 1 | self.bit()?))
+    }
+
+    fn ue(&mut self) -> Option<u32> {
+        let mut zeros = 0;
+        while self.bit()? == 0 {
+            zeros += 1;
+            if zeros > 31 {
+                return None;
+            }
+        }
+        Some(((1u64 << zeros) - 1 + u64::from(self.bits(zeros)?)) as u32)
+    }
+
+    fn se(&mut self) -> Option<i32> {
+        let k = self.ue()?;
+        Some(if k % 2 == 1 {
+            (k / 2 + 1) as i32
+        } else {
+            -((k / 2) as i32)
+        })
+    }
+}
+
+/// MaxDpbFrames for an SPS RBSP (after the NAL header byte):
+/// `min(MaxDpbMbs / (PicWidthInMbs * FrameHeightInMbs), 16)` with MaxDpbMbs
+/// from the level (Table A-1). A picture larger than its level allows, or an
+/// unknown level, gets the maximum of 16.
+fn sps_max_dpb_frames(rbsp: &[u8]) -> Option<usize> {
+    let mut r = Bits { data: rbsp, pos: 0 };
+    let profile_idc = r.bits(8)?;
+    let constraint_set3 = r.bits(8)? & 0x10 != 0;
+    let level_idc = r.bits(8)?;
+    r.ue()?; // seq_parameter_set_id
+    if matches!(
+        profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
+        let chroma_format_idc = r.ue()?;
+        if chroma_format_idc == 3 {
+            r.bit()?; // separate_colour_plane_flag
+        }
+        r.ue()?; // bit_depth_luma_minus8
+        r.ue()?; // bit_depth_chroma_minus8
+        r.bit()?; // qpprime_y_zero_transform_bypass_flag
+        if r.bit()? == 1 {
+            // seq_scaling_matrix_present_flag: skip each list that is present.
+            for i in 0..if chroma_format_idc == 3 { 12 } else { 8 } {
+                if r.bit()? == 1 {
+                    let (mut last, mut next) = (8i32, 8i32);
+                    for _ in 0..if i < 6 { 16 } else { 64 } {
+                        if next != 0 {
+                            next = (i64::from(last) + i64::from(r.se()?)).rem_euclid(256) as i32;
+                        }
+                        if next != 0 {
+                            last = next;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    r.ue()?; // log2_max_frame_num_minus4
+    match r.ue()? {
+        0 => {
+            r.ue()?; // log2_max_pic_order_cnt_lsb_minus4
+        }
+        1 => {
+            r.bit()?; // delta_pic_order_always_zero_flag
+            r.se()?; // offset_for_non_ref_pic
+            r.se()?; // offset_for_top_to_bottom_field
+            for _ in 0..r.ue()?.min(255) {
+                r.se()?; // offset_for_ref_frame
+            }
+        }
+        _ => {}
+    }
+    r.ue()?; // max_num_ref_frames
+    r.bit()?; // gaps_in_frame_num_value_allowed_flag
+    let width_mbs = r.ue()? as usize + 1;
+    let height_map_units = r.ue()? as usize + 1;
+    let frame_mbs_only = r.bit()? == 1;
+    let frame_mbs = width_mbs
+        .saturating_mul(height_map_units)
+        .saturating_mul(if frame_mbs_only { 1 } else { 2 });
+    // Level 1b: level_idc 9, or 11 with constraint_set3 in Baseline/Main/Extended.
+    let level_1b = level_idc == 9
+        || (level_idc == 11 && constraint_set3 && matches!(profile_idc, 66 | 77 | 88));
+    let max_dpb_mbs: usize = match level_idc {
+        _ if level_1b => 396,
+        10 => 396,
+        11 => 900,
+        12 | 13 | 20 => 2376,
+        21 => 4752,
+        22 | 30 => 8100,
+        31 => 18000,
+        32 => 20480,
+        40 | 41 => 32768,
+        42 => 34816,
+        50 => 110400,
+        51 | 52 => 184320,
+        60..=62 => 696320,
+        _ => return Some(MAX_DPB_FRAMES),
+    };
+    Some(match max_dpb_mbs / frame_mbs {
+        0 => MAX_DPB_FRAMES,
+        n => n.min(MAX_DPB_FRAMES),
+    })
 }
 
 /// Map a `rusty_h264` [`YuvFrame`] (tight I420 planes) to an rff [`VideoFrame`].
@@ -720,6 +936,106 @@ mod tests {
             "P slice, then the trailing SPS stays attached"
         );
         assert_eq!(split_access_units(b"junk"), vec![&b"junk"[..]]);
+    }
+
+    /// x264 `-bf 3 -b-pyramid normal -g 12`, 176x144, 24 frames (two IDR GOPs),
+    /// level 1.1, so MaxDpbFrames is 900 / 99 = 9: fewer than a GOP holds.
+    /// Made with `ffmpeg -f lavfi -i testsrc2=size=176x144:rate=24 -frames:v 24
+    /// -c:v libx264 -preset medium -crf 38 -bf 3 -b-pyramid normal -g 12
+    /// -keyint_min 12 -sc_threshold 0 -pix_fmt yuv420p -f h264`.
+    const BFRAMES: &[u8] = include_bytes!("../tests/data/bframes_176x144.h264");
+
+    /// FNV-1a of each picture ffmpeg decodes from [`BFRAMES`], in display order
+    /// (`ffmpeg -i bframes_176x144.h264 -f rawvideo -pix_fmt yuv420p -`).
+    const BFRAMES_DISPLAY: [u64; 24] = [
+        0x15e29badd4eb8e08,
+        0x72640f215a155445,
+        0x7f580929a7eef9d1,
+        0x0a8262f42b2f6b70,
+        0xf1e465e9834c894c,
+        0x91357b6fd4332930,
+        0x7f6628047705acdc,
+        0xfaa17a10be9a607f,
+        0x08ac87e85c1a5cec,
+        0x9f033116b8255cdf,
+        0x0cf43d259bb28793,
+        0xa5c9eecb4f7ee06d,
+        0x65d656843a43c28c,
+        0x463d32b3ca767158,
+        0x456a585faf00718b,
+        0xacc19d4449f32e2e,
+        0xe44da1e1fa26c7d8,
+        0x257e7d4cf472e14a,
+        0xbde9630f2e843b5f,
+        0x313ace733a793c54,
+        0x244f359922302dab,
+        0xa5842b6a0ad889f9,
+        0x735a9b902015b3dd,
+        0xdaf2b558bf05b79f,
+    ];
+
+    /// 64-bit FNV-1a over a picture's tightly packed Y, U and V planes.
+    fn fingerprint(frame: &Frame) -> u64 {
+        let Frame::Video(v) = frame else {
+            panic!("not a video frame")
+        };
+        v.planes
+            .iter()
+            .flatten()
+            .fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+            })
+    }
+
+    #[test]
+    fn pictures_come_out_in_display_order_with_their_packets_pts() {
+        let aus = split_access_units(BFRAMES);
+        assert_eq!(aus.len(), 24);
+        // The picture each access unit decodes to, in decode order.
+        let mut core = RustyDecoder::new();
+        let decode_order: Vec<u64> = aus
+            .iter()
+            .map(|au| fingerprint(&yuv_to_frame(core.decode(au).unwrap().unwrap(), None)))
+            .collect();
+        assert_ne!(decode_order, BFRAMES_DISPLAY, "the stream reorders");
+
+        // One access unit per packet, as a demuxer hands them over, stamped with
+        // its decode index.
+        let mut dec = H264Decoder::new();
+        let mut out = Vec::new();
+        for (k, au) in aus.iter().enumerate() {
+            if k == 12 {
+                // Before the second IDR: 12 pictures decoded, the level's 9 held.
+                assert_eq!(dec.dpb_frames, 9);
+                assert_eq!(out.len(), 3);
+            }
+            let mut packet = Packet::from_data(0, au.to_vec());
+            packet.pts = Some(k as i64);
+            dec.send_packet(&packet).unwrap();
+            while let Ok(frame) = dec.receive_frame() {
+                out.push(frame);
+            }
+        }
+        dec.flush();
+        while let Ok(frame) = dec.receive_frame() {
+            out.push(frame);
+        }
+
+        let got: Vec<u64> = out.iter().map(fingerprint).collect();
+        assert_eq!(got, BFRAMES_DISPLAY, "ffmpeg's display order");
+        // Every picture keeps the pts of the packet that carried it.
+        let pts: Vec<Option<i64>> = out
+            .iter()
+            .map(|f| match f {
+                Frame::Video(v) => v.pts,
+                _ => None,
+            })
+            .collect();
+        let carried: Vec<Option<i64>> = got
+            .iter()
+            .map(|h| decode_order.iter().position(|d| d == h).map(|k| k as i64))
+            .collect();
+        assert_eq!(pts, carried);
     }
 
     #[test]
