@@ -11,13 +11,23 @@ use super::{bx, fbx, pu32, TrackOut};
 pub struct FragSample {
     pub data: Vec<u8>,
     pub keyframe: bool,
-    /// Duration in the track's timescale.
+    /// Decode duration in the track's timescale.
     pub duration: u32,
+    /// Composition offset (pts - dts) in the track's timescale.
+    pub composition_offset: i64,
 }
 
 /// Build the init segment for one track: `ftyp` (iso6/dash) + `moov` whose
 /// sample tables are empty and whose `mvex/trex` declares fragment defaults.
-pub(crate) fn init_segment(track: &TrackOut, track_id: u32, timescale: u32) -> Vec<u8> {
+///
+/// `start` is where presentation starts on the track's decode timeline
+/// ([`TimingPlan::start`](super::TimingPlan)): a B-frame stream's reorder
+/// delay, an audio track's priming. When it is not 0 the `trak` carries an
+/// edit list with that `media_time` and a segment duration of 0 -- the rest
+/// of the media, whose length the init segment doesn't know. That is what
+/// FFmpeg's DASH muxer writes (movenc with `delay_moov`), rather than
+/// negative composition offsets.
+pub(crate) fn init_segment(track: &TrackOut, track_id: u32, timescale: u32, start: i64) -> Vec<u8> {
     let ftyp = bx(b"ftyp", b"iso6\x00\x00\x02\x00iso6dashcmfc");
 
     // trak with empty stbl tables (fragments carry all samples).
@@ -25,7 +35,7 @@ pub(crate) fn init_segment(track: &TrackOut, track_id: u32, timescale: u32) -> V
         timescale,
         durations: Vec::new(),
         offsets: Vec::new(),
-        start: 0,
+        start,
         presentation: 0,
     };
     let trak = super::build_trak(track, track_id, &empty, 0, 0);
@@ -58,13 +68,26 @@ fn sample_flags(keyframe: bool) -> u32 {
     }
 }
 
+/// `trun` flags: data offset, then each sample's duration, size and flags.
+const TRUN_DATA_OFFSET_DURATION_SIZE_FLAGS: u32 = 0x00_0701;
+/// `trun` flag: each sample's composition time offset.
+const TRUN_SAMPLE_CTS: u32 = 0x00_0800;
+
 /// Build one media segment: `moof` (mfhd + traf{tfhd,tfdt,trun}) + `mdat`.
-/// `base_time` is the segment's first sample time in the track timescale.
+/// `base_time` is the segment's first sample decode time in the track
+/// timescale.
+///
+/// With `composition_offsets` (a track whose frames are reordered, some pts
+/// differing from its dts) every `trun` entry carries its sample's
+/// composition offset -- in each fragment of the track, as FFmpeg does --
+/// in a version 1 `trun` (signed offsets) when one is negative, else
+/// version 0.
 pub fn media_segment(
     sequence: u32,
     track_id: u32,
     base_time: u64,
     samples: &[FragSample],
+    composition_offsets: bool,
 ) -> Vec<u8> {
     let mut mfhd = Vec::new();
     pu32(&mut mfhd, sequence);
@@ -80,7 +103,7 @@ pub fn media_segment(
     tfdt.extend_from_slice(&base_time.to_be_bytes());
     let tfdt = fbx(b"tfdt", 1, 0, &tfdt);
 
-    // trun: data-offset + per-sample duration/size/flags.
+    // trun: data-offset + per-sample duration/size/flags[/composition offset].
     let mut trun = Vec::new();
     pu32(&mut trun, samples.len() as u32);
     pu32(&mut trun, 0); // data_offset placeholder (patched below)
@@ -88,8 +111,24 @@ pub fn media_segment(
         pu32(&mut trun, s.duration);
         pu32(&mut trun, s.data.len() as u32);
         pu32(&mut trun, sample_flags(s.keyframe));
+        if composition_offsets {
+            // The same 32 bits read unsigned (version 0) or signed (1).
+            let cts = s
+                .composition_offset
+                .clamp(i64::from(i32::MIN), i64::from(u32::MAX));
+            pu32(&mut trun, cts as u32);
+        }
     }
-    let trun = fbx(b"trun", 0, 0x000701, &trun);
+    let (version, flags) = if composition_offsets {
+        let signed = samples.iter().any(|s| s.composition_offset < 0);
+        (
+            u8::from(signed),
+            TRUN_DATA_OFFSET_DURATION_SIZE_FLAGS | TRUN_SAMPLE_CTS,
+        )
+    } else {
+        (0, TRUN_DATA_OFFSET_DURATION_SIZE_FLAGS)
+    };
+    let trun = fbx(b"trun", version, flags, &trun);
 
     let traf = bx(b"traf", &[tfhd, tfdt, trun].concat());
     let mut moof = bx(b"moof", &[mfhd, traf].concat());
@@ -163,14 +202,16 @@ mod tests {
                 data: vec![0xAA; 10],
                 keyframe: true,
                 duration: 100,
+                composition_offset: 0,
             },
             FragSample {
                 data: vec![0xBB; 4],
                 keyframe: false,
                 duration: 100,
+                composition_offset: 0,
             },
         ];
-        let seg = media_segment(1, 1, 0, &samples);
+        let seg = media_segment(1, 1, 0, &samples, false);
         // moof is the first box; mdat follows it.
         let moof_size = u32::from_be_bytes(seg[0..4].try_into().unwrap()) as usize;
         assert_eq!(&seg[4..8], b"moof");
@@ -186,5 +227,64 @@ mod tests {
         let off_pos = pos + 4 + 4 + 4;
         let got = u32::from_be_bytes(seg[off_pos..off_pos + 4].try_into().unwrap());
         assert_eq!(got as usize, moof_size + 8);
+    }
+
+    fn sample(composition_offset: i64) -> FragSample {
+        FragSample {
+            data: vec![0xCC; 3],
+            keyframe: false,
+            duration: 40,
+            composition_offset,
+        }
+    }
+
+    /// A segment's `trun`: (version, flags, the words after the flags).
+    fn trun(seg: &[u8]) -> (u8, u32, Vec<u32>) {
+        let pos = seg.windows(4).position(|w| w == b"trun").unwrap();
+        let size = u32::from_be_bytes(seg[pos - 4..pos].try_into().unwrap()) as usize;
+        let body = &seg[pos + 4..pos - 4 + size];
+        let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
+        let words = body[4..]
+            .chunks_exact(4)
+            .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
+            .collect();
+        (body[0], flags, words)
+    }
+
+    /// #88: composition offsets go in each `trun` entry, signed (version 1)
+    /// only when one is negative; without them the layout is unchanged.
+    #[test]
+    fn composition_offsets_go_in_the_trun() {
+        let (version, flags, w) = trun(&media_segment(1, 1, 0, &[sample(80), sample(0)], true));
+        assert_eq!((version, flags), (0, 0xF01));
+        // sample_count, data_offset, then duration/size/flags/offset each.
+        assert_eq!(&w[2..], [40, 3, 0x0101_0000, 80, 40, 3, 0x0101_0000, 0]);
+        let (version, flags, w) = trun(&media_segment(1, 1, 0, &[sample(40), sample(-40)], true));
+        assert_eq!((version, flags), (1, 0xF01));
+        assert_eq!(w[9] as i32, -40);
+        let (version, flags, w) = trun(&media_segment(1, 1, 0, &[sample(0)], false));
+        assert_eq!((version, flags, w.len()), (0, 0x701, 2 + 3));
+    }
+
+    /// #88: the init segment's edit list starts presentation `start` into
+    /// the media, for the rest of it (segment duration 0), as FFmpeg's DASH
+    /// muxer writes it; no edit list when presentation starts at 0.
+    #[test]
+    fn init_segment_edit_list_skips_the_presentation_delay() {
+        let mut s = rff_format::Stream::new(0, rff_core::CodecId::H264);
+        s.media_type = MediaType::Video;
+        let track = TrackOut::new(&s, *b"avc1");
+        let init = init_segment(&track, 1, 12_800, 1024);
+        let pos = init.windows(4).position(|w| w == b"elst").unwrap();
+        let word = |k: usize| {
+            u32::from_be_bytes(init[pos + 4 + 4 * k..pos + 8 + 4 * k].try_into().unwrap())
+        };
+        // version/flags, entry_count, segment_duration, media_time, rate.
+        assert_eq!(
+            [word(0), word(1), word(2), word(3), word(4)],
+            [0, 1, 0, 1024, 0x0001_0000]
+        );
+        let init = init_segment(&track, 1, 12_800, 0);
+        assert!(!init.windows(4).any(|w| w == b"edts"));
     }
 }
