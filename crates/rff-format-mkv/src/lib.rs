@@ -93,9 +93,11 @@ const ID_TRACK_NUMBER: u32 = 0xD7;
 const ID_TRACK_TYPE: u32 = 0x83;
 const ID_CODEC_ID: u32 = 0x86;
 const ID_CODEC_PRIVATE: u32 = 0x63A2;
+const ID_DEFAULT_DURATION: u32 = 0x23E383;
 const ID_VIDEO: u32 = 0xE0;
 const ID_PIXEL_WIDTH: u32 = 0xB0;
 const ID_PIXEL_HEIGHT: u32 = 0xBA;
+const ID_FRAME_RATE: u32 = 0x2383E3;
 const ID_AUDIO: u32 = 0xE1;
 const ID_SAMPLING_FREQUENCY: u32 = 0xB5;
 const ID_CHANNELS: u32 = 0x9F;
@@ -357,6 +359,9 @@ struct MkvDemuxer {
     /// Indexed by stream index; ASS/SSA subtitle tracks, whose block payloads
     /// carry `ReadOrder,Layer,Style,…,Text` and get reduced to plain text.
     ass: Vec<bool>,
+    /// Indexed by stream index; the track's DefaultDuration in nanoseconds
+    /// (0 = none), which a block without its own BlockDuration lasts.
+    default_duration_ns: Vec<u64>,
     timestamp_scale: u64,
     /// Segment duration in `timestamp_scale` ticks (same unit as `time_base`).
     duration_ticks: Option<i64>,
@@ -383,6 +388,7 @@ impl MkvDemuxer {
             track_map: Vec::new(),
             avc: Vec::new(),
             ass: Vec::new(),
+            default_duration_ns: Vec::new(),
             timestamp_scale: 1_000_000, // default: 1 ms
             duration_ticks: None,
             seg_end: None,
@@ -555,15 +561,23 @@ impl MkvDemuxer {
                         c.ts = v;
                     }
                 }
-                ID_SIMPLE_BLOCK if h.size <= MAX_BLOCK => {
-                    let block = self.src.body(h.size)?;
-                    if let Some(p) = self.parse_block(&block, ts, 0) {
-                        return Ok(Some(p));
+                ID_SIMPLE_BLOCK | ID_BLOCK_GROUP if h.size <= MAX_BLOCK => {
+                    let body = self.src.body(h.size)?;
+                    if (body.len() as u64) < h.size {
+                        // Input ended inside the (Simple)Block or BlockGroup.
+                        // matroskadec drops such a block (`ebml_read_binary`
+                        // fails a short read; a cut BlockGroup fails its
+                        // nest), so the partial last frame of a truncated
+                        // file is never decoded. The input is exhausted.
+                        self.done = true;
+                        continue;
                     }
-                }
-                ID_BLOCK_GROUP if h.size <= MAX_BLOCK => {
-                    let group = self.src.body(h.size)?;
-                    if let Some(p) = self.parse_block_group(&group, ts) {
+                    let packet = if h.id == ID_SIMPLE_BLOCK {
+                        self.parse_block(&body, ts, 0)
+                    } else {
+                        self.parse_block_group(&body, ts)
+                    };
+                    if let Some(p) = packet {
                         return Ok(Some(p));
                     }
                 }
@@ -624,6 +638,8 @@ impl MkvDemuxer {
         let (mut width, mut height) = (0u32, 0u32);
         let (mut rate, mut channels) = (0u32, 0u16);
         let mut bit_depth = 0u64;
+        let mut default_duration_ns = 0u64;
+        let mut frame_rate = 0.0f64;
 
         let mut e = Ebml::new(data);
         while e.pos < data.len() {
@@ -637,6 +653,7 @@ impl MkvDemuxer {
                 ID_TRACK_TYPE => track_type = e.read_uint(len),
                 ID_CODEC_ID => codec = String::from_utf8_lossy(e.read_bytes(len)).into_owned(),
                 ID_CODEC_PRIVATE => codec_private = e.read_bytes(len).to_vec(),
+                ID_DEFAULT_DURATION => default_duration_ns = e.read_uint(len),
                 ID_VIDEO => {
                     let mut v = Ebml::at(data, e.pos);
                     let ve = e.pos.saturating_add(len);
@@ -646,6 +663,7 @@ impl MkvDemuxer {
                         match vid {
                             ID_PIXEL_WIDTH => width = v.read_uint(vsz as usize) as u32,
                             ID_PIXEL_HEIGHT => height = v.read_uint(vsz as usize) as u32,
+                            ID_FRAME_RATE => frame_rate = v.read_float(vsz as usize),
                             _ => v.skip(vsz as usize),
                         }
                     }
@@ -673,6 +691,15 @@ impl MkvDemuxer {
         let codec_id = map_codec(&codec);
         let is_ass = matches!(codec.as_str(), "S_TEXT/ASS" | "S_TEXT/SSA");
         self.ass.push(is_ass);
+        // A video track without DefaultDuration but with the (deprecated)
+        // FrameRate gets one derived from it, as matroskadec does.
+        if default_duration_ns == 0 && track_type == 1 && frame_rate > 0.0 {
+            let ns = 1e9 / frame_rate;
+            if ns < u64::MAX as f64 {
+                default_duration_ns = ns as u64;
+            }
+        }
+        self.default_duration_ns.push(default_duration_ns);
         let index = self.streams.len();
         let mut s = Stream::new(index, codec_id);
         s.media_type = match track_type {
@@ -785,9 +812,24 @@ impl MkvDemuxer {
         };
         let mut packet = Packet::from_data(index, data);
         packet.pts = Some(cluster_ts.wrapping_add(rel));
-        packet.duration = duration.max(0);
+        packet.duration = match duration.max(0) {
+            // No (or a zero) BlockDuration: the track's DefaultDuration, in
+            // Segment ticks, as matroskadec's `matroska_parse_block` does
+            // (`default_duration * laces / time_scale`, one lace here).
+            0 => self.default_duration_ticks(index),
+            d => d,
+        };
         packet.flags.keyframe = keyframe;
         Some(packet)
+    }
+
+    /// Stream `index`'s DefaultDuration in `timestamp_scale` ticks (the
+    /// packet time base), truncated like matroskadec's integer division;
+    /// 0 when the track has none.
+    fn default_duration_ticks(&self, index: usize) -> i64 {
+        let ns = self.default_duration_ns.get(index).copied().unwrap_or(0);
+        let ticks = ns / self.timestamp_scale.max(1);
+        i64::try_from(ticks).unwrap_or(i64::MAX)
     }
 }
 
@@ -1446,7 +1488,9 @@ mod tests {
     }
 
     /// `(case, packet-line count, fnv of the fingerprint)` recorded from the
-    /// pre-streaming (whole-file buffered) demuxer.
+    /// pre-streaming (whole-file buffered) demuxer — except that truncated
+    /// cases cut inside a block now end one packet earlier: a cut-off final
+    /// block is dropped, as matroskadec does (#89).
     const GOLDENS: &[(&str, usize, u64)] = &[
         ("vp9_opus", 240, 0x96842ed96f2e9d29),
         ("h264", 60, 0xbda95d370f6a1c36),
@@ -1458,12 +1502,12 @@ mod tests {
         ("subs_pcm-1", 132, 0x86965869a4a8cce6),
         ("h264-37", 60, 0xbda95d370f6a1c36),
         ("subs_pcm-37", 132, 0x86965869a4a8cce6),
-        ("h264-500", 58, 0x417368a5665708f2),
-        ("subs_pcm-500", 131, 0x11b3aba76bfd6b79),
-        ("h264-2000", 53, 0x46d8ad95299d739e),
-        ("subs_pcm-2000", 125, 0x7ebec31897b551c3),
-        ("h264-9000", 26, 0x82efca5dd86e42d1),
-        ("subs_pcm-9000", 96, 0xe54efbb2a507a4f9),
+        ("h264-500", 57, 0x944197e69bcc220c),
+        ("subs_pcm-500", 130, 0x10e6b244a52f13e1),
+        ("h264-2000", 52, 0x0db854153e912db1),
+        ("subs_pcm-2000", 124, 0x0495861d89070666),
+        ("h264-9000", 25, 0x3d86012f2d1caf9b),
+        ("subs_pcm-9000", 95, 0x3fdcb669f509617a),
         ("ass@7", 0, 0xb88f458891534654),
         ("ass@68", 0, 0xb88f458891534654),
         ("ass@129", 0, 0xb88f458891534654),
@@ -1471,35 +1515,35 @@ mod tests {
         ("ass@251", 0, 0x4ebbedf20cdfd5d0),
         ("ass@312", 0, 0x7602000005937fb4),
         ("ass@373", 0, 0x372ea377fd90c6a2),
-        ("ass@434", 1, 0x77f3fa8608a82be8),
-        ("ass@495", 2, 0xb9002d93649ef0d3),
-        ("ass@556", 3, 0x8561e8a38db8e3c7),
+        ("ass@434", 0, 0x372ea377fd90c6a2),
+        ("ass@495", 1, 0xece803c11dc71d57),
+        ("ass@556", 2, 0x642e9560534b9b49),
         ("ass@617", 3, 0x20df468e3a3d3675),
-        ("ass@678", 4, 0x371bc2ff3b87d922),
+        ("ass@678", 3, 0x20df468e3a3d3675),
         ("ass@739", 4, 0xc3afca0a9bc477cf),
-        ("ass@800", 5, 0xe9fe7a222f2c3334),
+        ("ass@800", 4, 0xc3afca0a9bc477cf),
         ("unknown_tail@7", 0, 0xb88f458891534654),
         ("unknown_tail@68", 0, 0xb88f458891534654),
         ("unknown_tail@129", 0, 0x19e5d80fc8c27d2f),
         ("unknown_tail@190", 0, 0xe16a82a06e5f72c7),
         ("unknown_tail@251", 0, 0x794321a15a45a76a),
         ("unknown_tail@312", 0, 0x1a3e72b070089f79),
-        ("unknown_tail@373", 1, 0xbe5de860616bcfe8),
-        ("unknown_tail@434", 1, 0xbe5de860616bcfe8),
-        ("unknown_tail@495", 1, 0xbe5de860616bcfe8),
-        ("unknown_tail@556", 1, 0xbe5de860616bcfe8),
-        ("unknown_tail@617", 1, 0xbe5de860616bcfe8),
-        ("unknown_tail@678", 2, 0x501963effcb0005e),
-        ("unknown_tail@739", 2, 0x25d078defe7f1968),
-        ("unknown_tail@800", 3, 0x1c434549715436a5),
-        ("unknown_tail@861", 3, 0x1c434549715436a5),
+        ("unknown_tail@373", 0, 0x1a3e72b070089f79),
+        ("unknown_tail@434", 0, 0x1a3e72b070089f79),
+        ("unknown_tail@495", 0, 0x1a3e72b070089f79),
+        ("unknown_tail@556", 0, 0x1a3e72b070089f79),
+        ("unknown_tail@617", 0, 0x1a3e72b070089f79),
+        ("unknown_tail@678", 1, 0xe9af22a16a8307bd),
+        ("unknown_tail@739", 1, 0xe9af22a16a8307bd),
+        ("unknown_tail@800", 2, 0x769b56f7dc4d42ae),
+        ("unknown_tail@861", 2, 0x769b56f7dc4d42ae),
         ("unknown_tail@922", 3, 0xb0138b7ec7bd1d1f),
-        ("unknown_tail@983", 4, 0x84ce6bf5667e7746),
-        ("unknown_tail@1044", 4, 0x84ce6bf5667e7746),
-        ("unknown_tail@1105", 4, 0x84ce6bf5667e7746),
-        ("unknown_tail@1166", 5, 0x9593526d20d414c5),
-        ("unknown_tail@1227", 5, 0x7dcecbffea06f04e),
-        ("unknown_tail@1288", 6, 0x72a1fc073c99894c),
+        ("unknown_tail@983", 3, 0xb0138b7ec7bd1d1f),
+        ("unknown_tail@1044", 3, 0xb0138b7ec7bd1d1f),
+        ("unknown_tail@1105", 3, 0xb0138b7ec7bd1d1f),
+        ("unknown_tail@1166", 4, 0x86f6fb2e149851b4),
+        ("unknown_tail@1227", 4, 0x86f6fb2e149851b4),
+        ("unknown_tail@1288", 5, 0xf6378f88235849f0),
     ];
 
     #[test]
@@ -1841,5 +1885,151 @@ mod tests {
         packets[2].discard_padding = 407;
         let (_, got) = demux_all(mux_streams(false, &[a], &packets).unwrap());
         assert_eq!(got[2].discard_padding, 407);
+    }
+
+    /// One video track (`track_extra` appended to its TrackEntry, after a
+    /// 320x240 Video element) at `scale` ns per tick, and one Cluster of
+    /// `blocks` (already-built Cluster children) at timestamp 0.
+    fn fx_video_track(
+        scale: u64,
+        video_extra: &[u8],
+        track_extra: &[u8],
+        blocks: &[u8],
+    ) -> Vec<u8> {
+        let mut seg = Vec::new();
+        let mut info = Vec::new();
+        uint(&mut info, ID_TIMESTAMP_SCALE, scale);
+        elem(&mut seg, ID_INFO, &info);
+        let mut video = Vec::new();
+        uint(&mut video, ID_PIXEL_WIDTH, 320);
+        uint(&mut video, ID_PIXEL_HEIGHT, 240);
+        video.extend_from_slice(video_extra);
+        let mut extra = Vec::new();
+        elem(&mut extra, ID_VIDEO, &video);
+        extra.extend_from_slice(track_extra);
+        elem(
+            &mut seg,
+            ID_TRACKS,
+            &track_entry(1, 1, "V_VP9", &[], &extra),
+        );
+        let mut c = Vec::new();
+        uint(&mut c, ID_TIMESTAMP, 0);
+        c.extend_from_slice(blocks);
+        elem(&mut seg, ID_CLUSTER, &c);
+        let mut file = ebml_header();
+        elem(&mut file, ID_SEGMENT, &seg);
+        file
+    }
+
+    /// #86: blocks without a BlockDuration last the track's DefaultDuration
+    /// (in Segment ticks, truncated); a BlockDuration, when present, wins.
+    #[test]
+    fn default_duration_fills_packet_durations() {
+        let mut blocks = Vec::new();
+        elem(&mut blocks, ID_SIMPLE_BLOCK, &block(1, 0, 0x80, b"k"));
+        elem(&mut blocks, ID_SIMPLE_BLOCK, &block(1, 40, 0x00, b"p"));
+        let mut g = Vec::new();
+        elem(&mut g, ID_BLOCK, &block(1, 80, 0, b"g"));
+        uint(&mut g, ID_BLOCK_DURATION, 7);
+        elem(&mut blocks, ID_BLOCK_GROUP, &g);
+        let mut g = Vec::new(); // a BlockGroup with no BlockDuration
+        elem(&mut g, ID_BLOCK, &block(1, 120, 0, b"h"));
+        elem(&mut blocks, ID_BLOCK_GROUP, &g);
+        let durations =
+            |file: Vec<u8>| -> Vec<i64> { demux_all(file).1.iter().map(|p| p.duration).collect() };
+
+        // 25 fps at the default 1 ms tick.
+        let mut dd = Vec::new();
+        uint(&mut dd, ID_DEFAULT_DURATION, 40_000_000);
+        let f = fx_video_track(1_000_000, &[], &dd, &blocks);
+        assert_eq!(durations(f), vec![40, 40, 7, 40]);
+
+        // 29.97 fps (33,366,667 ns) truncates to 33 ticks of 1 ms, and to
+        // 333 ticks of 0.1 ms (the block timestamps are just ticks too).
+        let mut dd = Vec::new();
+        uint(&mut dd, ID_DEFAULT_DURATION, 33_366_667);
+        let f = fx_video_track(1_000_000, &[], &dd, &blocks);
+        assert_eq!(durations(f), vec![33, 33, 7, 33]);
+        let f = fx_video_track(100_000, &[], &dd, &blocks);
+        assert_eq!(durations(f), vec![333, 333, 7, 333]);
+
+        // No DefaultDuration: the (deprecated) Video FrameRate stands in for
+        // it, as in matroskadec; with neither, durations stay unknown.
+        let mut fr = Vec::new();
+        elem(&mut fr, ID_FRAME_RATE, &25.0f64.to_be_bytes());
+        let f = fx_video_track(1_000_000, &fr, &[], &blocks);
+        assert_eq!(durations(f), vec![40, 40, 7, 40]);
+        let f = fx_video_track(1_000_000, &[], &[], &blocks);
+        assert_eq!(durations(f), vec![0, 0, 7, 0]);
+    }
+
+    /// #86 end to end: a 25 fps track relying on DefaultDuration, copied
+    /// through the muxer, keeps its full length (the Segment Duration is the
+    /// last frame's end, 8,000 ms, not its start, 7,960 ms).
+    #[test]
+    fn default_duration_survives_a_copy_remux() {
+        let mut blocks = Vec::new();
+        for i in 0..200i16 {
+            let key = if i % 50 == 0 { 0x80 } else { 0x00 };
+            elem(
+                &mut blocks,
+                ID_SIMPLE_BLOCK,
+                &block(1, i * 40, key, &[i as u8 | 1; 9]),
+            );
+        }
+        let mut dd = Vec::new();
+        uint(&mut dd, ID_DEFAULT_DURATION, 40_000_000);
+        let (streams, packets) = demux_all(fx_video_track(1_000_000, &[], &dd, &blocks));
+        assert_eq!(packets.len(), 200);
+        assert!(packets.iter().all(|p| p.duration == 40));
+        let copy = mux_streams(false, &streams, &packets).unwrap();
+        let (streams, _) = demux_all(copy);
+        assert_eq!(streams[0].duration, Some(8_000));
+    }
+
+    /// #89: a file cut inside its last (Simple)Block or BlockGroup yields
+    /// only the complete blocks before it, as matroskadec does — the cut-off
+    /// frame is never handed to a decoder (a Vorbis decoder would turn it
+    /// into one extra block of audio).
+    #[test]
+    fn truncated_final_block_is_dropped() {
+        let file = fx_vorbis();
+        let (_, full) = demux_all(file.clone());
+        assert_eq!(full.len(), 100);
+        let last = full.last().unwrap().data.clone();
+        let at = file
+            .windows(last.len())
+            .rposition(|w| w == &last[..])
+            .expect("last payload in the file");
+        // Cut anywhere inside the last block's payload (or right after its
+        // header): 99 whole packets, never a partial 100th.
+        for cut in [at, at + 1, at + last.len() / 2, at + last.len() - 1] {
+            let (_, got) = demux_all(file[..cut].to_vec());
+            assert_eq!(got.len(), 99, "cut at {cut}");
+            for (g, f) in got.iter().zip(&full) {
+                assert_eq!(g.data, f.data, "cut at {cut}");
+            }
+        }
+        // Intact up to the last byte: all 100.
+        assert_eq!(demux_all(file[..at + last.len()].to_vec()).1.len(), 100);
+
+        // A BlockGroup whose Block is complete but whose DiscardPadding was
+        // cut off is dropped too (matroskadec fails the whole group).
+        let f = fx_discard_padding();
+        let pad = (-5_000_000i64).to_be_bytes();
+        let at = f
+            .windows(3)
+            .position(|w| w == &pad[5..])
+            .expect("padding in the fixture");
+        let data = |file: &[u8]| -> Vec<Vec<u8>> {
+            demux_all(file.to_vec())
+                .1
+                .into_iter()
+                .map(|p| p.data)
+                .collect()
+        };
+        // "c"'s Block precedes the cut; its group is incomplete all the same.
+        assert_eq!(data(&f[..at + 1]), vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(data(&f).len(), 3);
     }
 }
