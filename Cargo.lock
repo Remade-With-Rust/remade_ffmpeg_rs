@@ -4910,7 +4910,7 @@ dependencies = [
 
 [[package]]
 name = "rff-cli"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "remade-ffmpeg",
  "rff-core",
@@ -5332,7 +5332,7 @@ version = "0.4.5"
 
 [[package]]
 name = "rff-server"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "axum",
  "remade-ffmpeg",
