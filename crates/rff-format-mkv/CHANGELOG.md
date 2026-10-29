@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mkv-v0.4.4...rff-format-mkv-v0.4.5) - 2026-10-29
+
+### Fixed
+
+- *(mkv)* DefaultDuration packet durations; drop a truncated final block
+
 ## [0.4.4](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mkv-v0.4.3...rff-format-mkv-v0.4.4) - 2026-10-28
 
 ### Fixed
