@@ -1197,7 +1197,8 @@ struct TimingPlan {
     /// offset is 0, which writes no `ctts`.
     offsets: Vec<i64>,
     /// The edit list's `media_time`: where presentation starts on the decode
-    /// timeline (a B-frame stream's reorder delay). 0 writes no edit list.
+    /// timeline (a B-frame stream's reorder delay, an audio track's encoder
+    /// priming timed before 0). 0 writes no edit list.
     start: i64,
     /// Presentation length, from `start` to the end of the last frame shown.
     presentation: u64,
@@ -1205,7 +1206,8 @@ struct TimingPlan {
 
 /// A track's `stts`/`ctts`/`elst`, as FFmpeg's movenc derives them: `stts`
 /// from decode times, `ctts` from pts - dts, and an edit list that starts
-/// presentation at the first pts when that is not the first dts.
+/// presentation at the first pts (or at 0, when packets are timed before it)
+/// when that is not the first dts. The fragmented muxers (DASH) share it.
 ///
 /// Decode times are the packets' DTS when every packet has one and they never
 /// go backwards. Otherwise (Matroska, say, which stores no DTS) they are
@@ -1235,7 +1237,12 @@ fn timing_plan(t: &TrackOut) -> TimingPlan {
     // `decode_times` only returns timestamps when every PTS is present.
     let pts: Vec<i64> = t.pts.iter().map(|p| p.unwrap_or(0)).collect();
     let mut offsets: Vec<i64> = pts.iter().zip(&dts).map(|(p, d)| p - d).collect();
-    let first_shown = pts.iter().min().copied().unwrap_or(0);
+    // Presentation starts at the first frame shown, or at time 0 when frames
+    // are timed before it: those are decoded but not shown, which is how a
+    // remux carries AAC's encoder priming (the first packet at -1024, from the
+    // source's own edit list). That is movenc's rule: media_time = -start_dts
+    // when the first pts is not positive.
+    let first_shown = pts.iter().min().copied().unwrap_or(0).max(0);
     let start = (first_shown - dts[0]).max(0);
     // The last frame shown ends at its composition time plus its duration.
     let mut decode_at = 0i64;
@@ -3129,5 +3136,78 @@ mod tests {
         let trak = build_trak(&t, 1, &timing_plan(&t), 120, 120);
         let has = |name: &[u8]| trak.windows(4).any(|w| w == name);
         assert!(!has(b"ctts") && !has(b"edts"));
+    }
+
+    /// #87: an AAC remux hands over the priming frame timed before 0 (the
+    /// source's edit list, applied by the demuxer). The plan starts
+    /// presentation at 0 -- an edit list skipping the priming, as movenc
+    /// writes it -- instead of showing it and making the track 1024 longer.
+    #[test]
+    fn audio_priming_timed_before_zero_gets_an_edit_list() {
+        let t = aac_track(&[-1024, 0, 1024, 2048]);
+        let plan = timing_plan(&t);
+        assert_eq!(plan.durations, [1024; 4]);
+        assert!(plan.offsets.is_empty());
+        assert_eq!(plan.start, 1024);
+        assert_eq!(plan.presentation, 3 * 1024);
+        // An audio track that starts at 0 (a fresh encode) is left alone.
+        let plan = timing_plan(&aac_track(&[0, 1024, 2048]));
+        assert_eq!((plan.start, plan.presentation), (0, 3 * 1024));
+        // Video frames timed before 0 are cut the same way (movenc's rule:
+        // media_time = -first dts when the first pts is not positive).
+        let t = timed_track(&[(-80, Some(-80)), (-40, Some(-40)), (0, Some(0))]);
+        assert_eq!(timing_plan(&t).start, 80);
+    }
+
+    /// An AAC track at 1/48000 with one packet (pts = dts) per entry.
+    fn aac_track(pts: &[i64]) -> TrackOut {
+        let mut s = Stream::new(0, CodecId::Aac);
+        s.media_type = MediaType::Audio;
+        s.sample_rate = 48_000;
+        s.channels = 1;
+        s.time_base = Rational::new(1, 48_000);
+        let mut t = TrackOut::new(&s, *b"mp4a");
+        for &p in pts {
+            t.push_sample(1, true, Some(p), Some(p)).unwrap();
+        }
+        t
+    }
+
+    /// #87 end to end: muxing the packets our demuxer hands over for an AAC
+    /// track with priming, then demuxing the result, gives the same
+    /// timestamps back -- the edit list survives the remux.
+    #[test]
+    fn aac_priming_survives_a_remux() {
+        let pts_in = [-1024i64, 0, 1024, 2048, 3072];
+        let sink = SharedBuf(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        {
+            let mut mux = Mp4Muxer::new(Box::new(sink.clone()));
+            let mut s = Stream::new(0, CodecId::Aac);
+            s.media_type = MediaType::Audio;
+            s.sample_rate = 48_000;
+            s.channels = 1;
+            s.time_base = Rational::new(1, 48_000);
+            mux.write_header(&[s]).unwrap();
+            for (i, &p) in pts_in.iter().enumerate() {
+                let mut pkt = Packet::from_data(0, vec![i as u8; 8]);
+                pkt.pts = Some(p);
+                pkt.dts = Some(p);
+                pkt.flags.keyframe = true;
+                mux.write_packet(&pkt).unwrap();
+            }
+            mux.write_trailer().unwrap();
+        }
+        let file = sink.0.lock().unwrap().clone();
+        let elst = file.windows(4).position(|w| w == b"elst").expect("elst");
+        // version/flags, entry_count 1, segment_duration (ms), media_time.
+        let field = |k: usize| be32(&file, elst + 4 + 4 * k);
+        assert_eq!((field(1), field(2), field(3)), (1, 85, 1024));
+        let got: Vec<(u8, i64, i64)> = timed_packets(file, 0);
+        let want: Vec<(u8, i64, i64)> = pts_in
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| (i as u8, p, p))
+            .collect();
+        assert_eq!(got, want);
     }
 }
