@@ -13,8 +13,6 @@ pub struct FragSample {
     pub keyframe: bool,
     /// Decode duration in the track's timescale.
     pub duration: u32,
-    /// Composition offset (pts - dts) in the track's timescale.
-    pub composition_offset: i64,
 }
 
 /// Build the init segment for one track: `ftyp` (iso6/dash) + `moov` whose
@@ -76,19 +74,36 @@ const TRUN_SAMPLE_CTS: u32 = 0x00_0800;
 /// Build one media segment: `moof` (mfhd + traf{tfhd,tfdt,trun}) + `mdat`.
 /// `base_time` is the segment's first sample decode time in the track
 /// timescale.
-///
-/// With `composition_offsets` (a track whose frames are reordered, some pts
-/// differing from its dts) every `trun` entry carries its sample's
-/// composition offset -- in each fragment of the track, as FFmpeg does --
-/// in a version 1 `trun` (signed offsets) when one is negative, else
-/// version 0.
 pub fn media_segment(
     sequence: u32,
     track_id: u32,
     base_time: u64,
     samples: &[FragSample],
-    composition_offsets: bool,
 ) -> Vec<u8> {
+    media_segment_with_offsets(sequence, track_id, base_time, samples, None)
+}
+
+/// [`media_segment`] for a track whose frames are reordered (some pts
+/// differing from its dts): `composition_offsets` holds each sample's
+/// composition offset (pts - dts, in the track's timescale; a missing entry
+/// is 0). With `Some` every `trun` entry carries its sample's offset -- in
+/// each fragment of the track, as FFmpeg does -- in a version 1 `trun`
+/// (signed offsets) when one is negative, else version 0. With `None` it is
+/// [`media_segment`].
+pub fn media_segment_with_offsets(
+    sequence: u32,
+    track_id: u32,
+    base_time: u64,
+    samples: &[FragSample],
+    composition_offsets: Option<&[i64]>,
+) -> Vec<u8> {
+    let offset = |i: usize| {
+        composition_offsets
+            .and_then(|o| o.get(i))
+            .copied()
+            .unwrap_or(0)
+    };
+
     let mut mfhd = Vec::new();
     pu32(&mut mfhd, sequence);
     let mfhd = fbx(b"mfhd", 0, 0, &mfhd);
@@ -107,20 +122,18 @@ pub fn media_segment(
     let mut trun = Vec::new();
     pu32(&mut trun, samples.len() as u32);
     pu32(&mut trun, 0); // data_offset placeholder (patched below)
-    for s in samples {
+    for (i, s) in samples.iter().enumerate() {
         pu32(&mut trun, s.duration);
         pu32(&mut trun, s.data.len() as u32);
         pu32(&mut trun, sample_flags(s.keyframe));
-        if composition_offsets {
+        if composition_offsets.is_some() {
             // The same 32 bits read unsigned (version 0) or signed (1).
-            let cts = s
-                .composition_offset
-                .clamp(i64::from(i32::MIN), i64::from(u32::MAX));
+            let cts = offset(i).clamp(i64::from(i32::MIN), i64::from(u32::MAX));
             pu32(&mut trun, cts as u32);
         }
     }
-    let (version, flags) = if composition_offsets {
-        let signed = samples.iter().any(|s| s.composition_offset < 0);
+    let (version, flags) = if composition_offsets.is_some() {
+        let signed = (0..samples.len()).any(|i| offset(i) < 0);
         (
             u8::from(signed),
             TRUN_DATA_OFFSET_DURATION_SIZE_FLAGS | TRUN_SAMPLE_CTS,
@@ -202,16 +215,14 @@ mod tests {
                 data: vec![0xAA; 10],
                 keyframe: true,
                 duration: 100,
-                composition_offset: 0,
             },
             FragSample {
                 data: vec![0xBB; 4],
                 keyframe: false,
                 duration: 100,
-                composition_offset: 0,
             },
         ];
-        let seg = media_segment(1, 1, 0, &samples, false);
+        let seg = media_segment(1, 1, 0, &samples);
         // moof is the first box; mdat follows it.
         let moof_size = u32::from_be_bytes(seg[0..4].try_into().unwrap()) as usize;
         assert_eq!(&seg[4..8], b"moof");
@@ -229,13 +240,17 @@ mod tests {
         assert_eq!(got as usize, moof_size + 8);
     }
 
-    fn sample(composition_offset: i64) -> FragSample {
+    fn sample() -> FragSample {
         FragSample {
             data: vec![0xCC; 3],
             keyframe: false,
             duration: 40,
-            composition_offset,
         }
+    }
+
+    fn with_offsets(offsets: &[i64]) -> Vec<u8> {
+        let samples: Vec<_> = offsets.iter().map(|_| sample()).collect();
+        media_segment_with_offsets(1, 1, 0, &samples, Some(offsets))
     }
 
     /// A segment's `trun`: (version, flags, the words after the flags).
@@ -255,14 +270,14 @@ mod tests {
     /// only when one is negative; without them the layout is unchanged.
     #[test]
     fn composition_offsets_go_in_the_trun() {
-        let (version, flags, w) = trun(&media_segment(1, 1, 0, &[sample(80), sample(0)], true));
+        let (version, flags, w) = trun(&with_offsets(&[80, 0]));
         assert_eq!((version, flags), (0, 0xF01));
         // sample_count, data_offset, then duration/size/flags/offset each.
         assert_eq!(&w[2..], [40, 3, 0x0101_0000, 80, 40, 3, 0x0101_0000, 0]);
-        let (version, flags, w) = trun(&media_segment(1, 1, 0, &[sample(40), sample(-40)], true));
+        let (version, flags, w) = trun(&with_offsets(&[40, -40]));
         assert_eq!((version, flags), (1, 0xF01));
         assert_eq!(w[9] as i32, -40);
-        let (version, flags, w) = trun(&media_segment(1, 1, 0, &[sample(0)], false));
+        let (version, flags, w) = trun(&media_segment(1, 1, 0, &[sample()]));
         assert_eq!((version, flags, w.len()), (0, 0x701, 2 + 3));
     }
 

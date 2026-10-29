@@ -140,7 +140,6 @@ impl Muxer for DashMuxer {
                     data: data.clone(),
                     keyframe: *keyframe,
                     duration: durations[i],
-                    composition_offset: plan.offsets.get(i).copied().unwrap_or(0),
                 });
                 current_ticks += durations[i] as i64;
             }
@@ -151,14 +150,19 @@ impl Muxer for DashMuxer {
             // --- media segments + exact timeline ---
             let mut timeline = Vec::new(); // (start_ticks, dur_ticks)
             let mut base_time = 0u64;
+            let mut first = 0usize; // track index of the fragment's first sample
             for (n, frag) in fragments.iter().enumerate() {
                 let name = format!("chunk-stream{id}-{:05}.m4s", n + 1);
-                let seg = fmp4::media_segment(
+                // This fragment's slice of the track's composition offsets.
+                let offsets = (!plan.offsets.is_empty())
+                    .then(|| &plan.offsets[first.min(plan.offsets.len())..]);
+                first += frag.len();
+                let seg = fmp4::media_segment_with_offsets(
                     n as u32 + 1,
                     id as u32 + 1,
                     base_time,
                     frag,
-                    !plan.offsets.is_empty(),
+                    offsets,
                 );
                 fs::write(self.dir.join(&name), seg)?;
                 let dur: u64 = frag.iter().map(|s| s.duration as u64).sum();
