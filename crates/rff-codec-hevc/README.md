@@ -13,6 +13,11 @@ Registers `hevc` for decode.
 - **Bit-exact**: `rusty_h265` decodes all 147 streams of the JCT-VC HEVC_v1
   conformance suite bit-exactly, and every picture matches its
   decoded-picture-hash SEI.
+- **Fast**: built on `rusty_h265` 0.7, which decodes single-threaded at
+  **1.37× FFmpeg's speed** on weighted prediction, at parity on 10-bit and
+  deblocking-heavy content, and at 0.80–0.86× on mainstream 8-bit inter
+  (FFmpeg 8.1.2 `-threads 1`, pinned core, paired verdicts). That is
+  1.23–1.50× faster than `rusty_h265` 0.6, with identical output.
 - **Scope: HEVC version 1** — Main, Main 10 and Main Still Picture, 4:2:0,
   8 and 10 bit. That is what phones, cameras, broadcast and Blu-ray produce.
   Range extensions, screen content coding and the layered profiles are refused
