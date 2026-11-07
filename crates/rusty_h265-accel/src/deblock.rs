@@ -185,9 +185,16 @@ mod x86 {
 
     /// # Safety
     /// The caller has bounds-checked every access the segment makes.
+    /// Lane 0 and lane 3 of a four-lane `i32` vector -- lines 0 and 3 of the
+    /// segment, which are the ones §8.7.2.5.3 reads for its decisions.
+    #[inline(always)]
+    unsafe fn lanes03(v: __m128i) -> (i32, i32) {
+        unsafe { (_mm_cvtsi128_si32(v), _mm_cvtsi128_si32(_mm_shuffle_epi32(v, 0xFF))) }
+    }
+
     #[target_feature(enable = "sse2")]
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn luma_edge_sse2(data: *mut u16, stride: usize, x: usize, y: usize, dir: usize, tc: i32, no_p: bool, no_q: bool, max: i32, strong: bool, dep: bool, deq: bool) {
+    pub unsafe fn luma_edge_sse2(data: *mut u16, stride: usize, x: usize, y: usize, dir: usize, beta: i32, tc: i32, no_p: bool, no_q: bool, max: i32) {
         let base = unsafe { data.add(y * stride + x) };
         let z = _mm_setzero_si128();
         let mut t = [z; 8];
@@ -227,6 +234,36 @@ mod x86 {
 
         let (p3, p2, p1, p0) = (t[0], t[1], t[2], t[3]);
         let (q0, q1, q2, q3) = (t[4], t[5], t[6], t[7]);
+
+        // The segment decisions (§8.7.2.5.3), from the vectors just loaded.
+        //
+        // They used to be derived scalar in the dispatcher -- twelve to twenty
+        // indexed loads with runtime strides, before this kernel loaded the
+        // same samples again -- and only then was the kernel called. Here the
+        // second-derivative and flatness terms are four-lane ops on the taps
+        // already in registers, and lines 0 and 3 are two lane extractions.
+        // Same integer arithmetic, same tests, bit-identical decisions.
+        let dp = unsafe { abs32(_mm_sub_epi32(_mm_add_epi32(p2, p0), _mm_slli_epi32(p1, 1))) };
+        let dq = unsafe { abs32(_mm_sub_epi32(_mm_add_epi32(q2, q0), _mm_slli_epi32(q1, 1))) };
+        let (dp0, dp3) = unsafe { lanes03(dp) };
+        let (dq0, dq3) = unsafe { lanes03(dq) };
+        let (dpq0, dpq3) = (dp0 + dq0, dp3 + dq3);
+        if dpq0 + dpq3 >= beta {
+            return;
+        }
+        let flat = unsafe { _mm_add_epi32(abs32(_mm_sub_epi32(p3, p0)), abs32(_mm_sub_epi32(q0, q3))) };
+        let step = unsafe { abs32(_mm_sub_epi32(p0, q0)) };
+        let (flat0, flat3) = unsafe { lanes03(flat) };
+        let (step0, step3) = unsafe { lanes03(step) };
+        let dsam = |dpq: i32, fl: i32, st: i32| dpq < (beta >> 2) && fl < (beta >> 3) && st < ((5 * tc + 1) >> 1);
+        let strong = dsam(2 * dpq0, flat0, step0) && dsam(2 * dpq3, flat3, step3);
+        let side = (beta + (beta >> 1)) >> 3;
+        let dep = dp0 + dp3 < side;
+        let deq = dq0 + dq3 < side;
+        if census::ALWAYS {
+            census::route(strong, &census::RT_DEBLOCK_STRONG, &census::RT_DEBLOCK_WEAK);
+        }
+
         let mut o = t; // unwritten taps keep their original value
 
         if strong {
@@ -334,41 +371,15 @@ pub fn luma_edge(data: &mut [u16], stride: usize, x: usize, y: usize, dir: usize
 
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     if ok && !scalar_deblock() && crate::isa() != crate::Isa::Scalar {
-        // The decisions are per SEGMENT and they gate the early-out, so they
-        // stay scalar; only the per-line filtering is vectorised.
-        let (line_step, tap_step): (isize, isize) = if dir == 0 { (stride as isize, 1) } else { (1, stride as isize) };
-        let origin = (y * stride + x) as isize;
-        // `ok` above proves the segment's entire footprint is in bounds, and
-        // this closure is evaluated ~16 times on EVERY segment -- including the
-        // 39% that early-out and do nothing else. Bounds-checking each of them
-        // is the dominant remaining cost on that path.
-        //
-        // SAFETY: every `(k, i)` used below lies inside the footprint `ok`
-        // checked: `k` in 0..4 and `i` in -4..=3, which is exactly the range the
-        // check covers for either direction.
-        let g = |k: usize, i: i32| unsafe { *data.get_unchecked((origin + k as isize * line_step + i as isize * tap_step) as usize) } as i32;
-        let dp0 = (g(0, -3) - 2 * g(0, -2) + g(0, -1)).abs();
-        let dp3 = (g(3, -3) - 2 * g(3, -2) + g(3, -1)).abs();
-        let dq0 = (g(0, 2) - 2 * g(0, 1) + g(0, 0)).abs();
-        let dq3 = (g(3, 2) - 2 * g(3, 1) + g(3, 0)).abs();
-        let dpq0 = dp0 + dq0;
-        let dpq3 = dp3 + dq3;
-        if dpq0 + dpq3 >= beta {
-            if census::ALWAYS {
-                census::arm(&census::RT_DEBLOCK_SKIP);
-            }
-            return;
-        }
-        let dsam = |k: usize, dpq: i32| -> bool { dpq < (beta >> 2) && (g(k, -4) - g(k, -1)).abs() + (g(k, 0) - g(k, 3)).abs() < (beta >> 3) && (g(k, -1) - g(k, 0)).abs() < ((5 * tc + 1) >> 1) };
-        let strong = dsam(0, 2 * dpq0) && dsam(3, 2 * dpq3);
-        let dep = (dp0 + dp3) < ((beta + (beta >> 1)) >> 3);
-        let deq = (dq0 + dq3) < ((beta + (beta >> 1)) >> 3);
         if census::ALWAYS {
-            census::route(strong, &census::RT_DEBLOCK_STRONG, &census::RT_DEBLOCK_WEAK);
             census::bump(&census::DEBLOCK_LUMA_SIMD, 1);
         }
+        // The decisions live inside the kernel now, derived from the vectors
+        // it loads anyway. (`RT_DEBLOCK_SKIP` is the kernel's early-out and is
+        // no longer counted separately; `RT_DEBLOCK_STRONG + RT_DEBLOCK_WEAK`
+        // against `DEBLOCK_LUMA_SIMD` gives the same population.)
         // SAFETY: `ok` above covers every load and store the kernel makes.
-        unsafe { x86::luma_edge_sse2(data.as_mut_ptr(), stride, x, y, dir, tc, no_p, no_q, max, strong, dep, deq) };
+        unsafe { x86::luma_edge_sse2(data.as_mut_ptr(), stride, x, y, dir, beta, tc, no_p, no_q, max) };
         return;
     }
     if census::ALWAYS {

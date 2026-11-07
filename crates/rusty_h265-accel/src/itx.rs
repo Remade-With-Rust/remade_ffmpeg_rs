@@ -42,6 +42,72 @@ use std::arch::x86_64::*;
 
 use crate::census;
 
+/// Coefficient range after scaling and between the two transform passes
+/// (§8.6.4.2: `coeffMin`/`coeffMax` at `extended_precision_processing_flag = 0`).
+pub const COEFF_MIN: i32 = -32768;
+pub const COEFF_MAX: i32 = 32767;
+
+/// The 4-point DCT (`DCT32[8k][0..4]`), the 4x4 DST (§8.6.4.2) and the
+/// 8-point DCT (`DCT32[4k][0..8]`), as `i32` for the broadcast kernels.
+/// Pinned to the decoder's `DCT32` by `small_transform_tables_match_dct32`.
+pub const DCT4: [[i32; 4]; 4] = [[64, 64, 64, 64], [83, 36, -36, -83], [64, -64, -64, 64], [36, -83, 83, -36]];
+pub const DST4: [[i32; 4]; 4] = [[29, 55, 74, 84], [74, 74, 0, -74], [84, -29, -74, 55], [55, -84, 74, -29]];
+pub const DCT8: [[i32; 8]; 8] = [
+    [64, 64, 64, 64, 64, 64, 64, 64],
+    [89, 75, 50, 18, -18, -50, -75, -89],
+    [83, 36, -36, -83, -83, -36, 36, 83],
+    [75, -18, -89, -50, 50, 89, 18, -75],
+    [64, -64, -64, 64, 64, -64, -64, 64],
+    [50, -89, 18, 75, -75, -18, 89, -50],
+    [36, -83, 83, -36, -36, 83, -83, 36],
+    [18, -50, 75, -89, 89, -75, 50, -18],
+];
+
+/// Both passes of an `n x n` inverse DCT, or the 4x4 DST when `dst`, in one
+/// kernel call. Returns `false` when no kernel applies, and the caller runs
+/// its scalar twin -- the oracle, kept in `rusty_h265::itx`.
+///
+/// `tab` is the flat 32x32 DCT table and `dst_tab` the flat padded 4x32 DST
+/// table; the kernel reads `tab[k * tstep * 32 + j]` exactly as `accum` does.
+#[allow(clippy::too_many_arguments)]
+pub fn idct_block(d: &mut [i32], tmp: &mut [i32], n: usize, nz_w: usize, nz_h: usize, bd_shift: u32, dst: bool, tab: &[i16], dst_tab: &[i16]) -> bool {
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    {
+        let ok = matches!(n, 4 | 8 | 16 | 32)
+            && d.len() >= n * n
+            && tmp.len() >= n * n
+            && (1..=n).contains(&nz_w)
+            && (1..=n).contains(&nz_h)
+            && (1..32).contains(&bd_shift)
+            && tab.len() >= 32 * 32
+            && dst_tab.len() >= 4 * 32
+            && (!dst || n == 4);
+        if ok && kernel_isa() >= crate::Isa::Avx2 {
+            if census::ALWAYS {
+                census::bump(&census::ITX_FUSED_SIMD, 1);
+            }
+            // SAFETY: `ok` proves every load and store: both buffers hold the
+            // block, the live counts are inside it, and the tables are the
+            // full 32-row DCT and 4-row padded DST.
+            unsafe {
+                let (dp, tp, t, dt) = (d.as_mut_ptr(), tmp.as_mut_ptr(), tab.as_ptr(), dst_tab.as_ptr());
+                match (n, dst) {
+                    // The two small sizes take the broadcast-row kernels; the
+                    // butterfly block kernel below serves 16 and 32.
+                    (4, true) => x86::idct4_avx2::<true>(dp, bd_shift),
+                    (4, false) => x86::idct4_avx2::<false>(dp, bd_shift),
+                    (8, _) => x86::idct8_avx2(dp, nz_w, nz_h, bd_shift, &DCT8),
+                    (16, _) => x86::idct_block_avx2::<16, false>(dp, tp, nz_w, nz_h, bd_shift, t, dt),
+                    _ => x86::idct_block_avx2::<32, false>(dp, tp, nz_w, nz_h, bd_shift, t, dt),
+                }
+            }
+            return true;
+        }
+    }
+    let _ = (d, tmp, n, nz_w, nz_h, bd_shift, dst, tab, dst_tab);
+    false
+}
+
 /// Scalar twin -- the oracle, and the path on any non-AVX2 machine.
 ///
 /// `tab` is a flat table of 32-wide `i16` rows; coefficient `k` uses row
@@ -208,6 +274,264 @@ mod x86 {
         while i + 8 <= n {
             one(i);
             i += 8;
+        }
+    }
+
+    /// The flattened partial butterfly for ONE `N`-point 1-D transform, with
+    /// `nzs` precomputed by the caller. Same calls, same order and same
+    /// arithmetic as `rusty_h265::itx::idct_sums`, so the result is
+    /// bit-identical to it; what differs is that this is inlined into a
+    /// `#[target_feature]` caller that holds the whole block, so the per-call
+    /// dispatch, bounds proof and `OnceLock` read of the four `accum` /
+    /// `accum_butterfly` entry points are paid once per BLOCK instead of once
+    /// per 1-D transform (23 M of them on a 20 s 720p clip, 53 per block).
+    ///
+    /// # Safety
+    /// `out` holds `N` writable `i32`; `src[k * s_in]` is readable for every
+    /// `k < nzs[0]`; `tab` is the flat 32x32 DCT table.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn idct_sums_avx2<const N: usize>(out: *mut i32, src: *const i32, s_in: usize, tab: *const i16, nzs: &[usize; 4]) {
+        unsafe {
+            match N {
+                4 => accum_avx2::<4>(out, src, s_in, tab, 8, 0, 1, nzs[0]),
+                8 => {
+                    accum_avx2::<4>(out, src, s_in << 1, tab, 8, 0, 1, nzs[1]);
+                    accum_butterfly_avx2::<4>(out, src, s_in, tab, 4, nzs[0]);
+                }
+                16 => {
+                    accum_avx2::<4>(out, src, s_in << 2, tab, 8, 0, 1, nzs[2]);
+                    accum_butterfly_avx2::<4>(out, src, s_in << 1, tab, 4, nzs[1]);
+                    accum_butterfly_avx2::<8>(out, src, s_in, tab, 2, nzs[0]);
+                }
+                _ => {
+                    accum_avx2::<4>(out, src, s_in << 3, tab, 8, 0, 1, nzs[3]);
+                    accum_butterfly_avx2::<4>(out, src, s_in << 2, tab, 4, nzs[2]);
+                    accum_butterfly_avx2::<8>(out, src, s_in << 1, tab, 2, nzs[1]);
+                    accum_butterfly_avx2::<16>(out, src, s_in, tab, 1, nzs[0]);
+                }
+            }
+        }
+    }
+
+    /// `nz` per butterfly level, exactly as `idct_sums` derives it: level `d`
+    /// has size `n >> d`, and the live count halves with a `div_ceil` and
+    /// clamps to the level's size.
+    #[inline(always)]
+    fn level_nzs(n: usize, nz: usize) -> [usize; 4] {
+        let levels = n.trailing_zeros() as usize - 2;
+        let mut nzs = [0usize; 4];
+        let mut z = nz.min(n);
+        let mut m = n;
+        for slot in nzs.iter_mut().take(levels + 1) {
+            *slot = z;
+            if m > 4 {
+                m /= 2;
+                z = z.div_ceil(2).min(m);
+            }
+        }
+        nzs
+    }
+
+    /// Both passes of an `N x N` inverse DCT (or the 4x4 DST when `DST`) in one
+    /// kernel call.
+    ///
+    /// Stage 1 runs the `nz_w` live columns, clipping to the coefficient range
+    /// into `tmp`; stage 2 runs every row over its `nz_w` live inputs into `d`.
+    /// The arithmetic is the scalar path's, operation for operation -- only the
+    /// call structure moved: `nzs` is derived once per block rather than once
+    /// per 1-D transform (it is the same for every column, and again for every
+    /// row), the sums never leave this frame, and the shift/clip of each 1-D
+    /// result is a vector op on the sums rather than a dispatched kernel.
+    ///
+    /// # Safety
+    /// `d` and `tmp` each hold `N * N` `i32`; `tab` is the flat 32x32 DCT
+    /// table and `dst_tab` the flat 4x32 padded DST table; `nz_w, nz_h` in
+    /// `1..=N`; `bd_shift` in `1..=31`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn idct_block_avx2<const N: usize, const DST: bool>(d: *mut i32, tmp: *mut i32, nz_w: usize, nz_h: usize, bd_shift: u32, tab: *const i16, dst_tab: *const i16) {
+        let mut sums = [0i32; 32];
+        let sp = sums.as_mut_ptr();
+        // Stage 1: columns, clipped to 16 bits.
+        let nzs1 = level_nzs(N, nz_h);
+        let add7 = _mm256_set1_epi32(64);
+        let lo = _mm256_set1_epi32(super::COEFF_MIN);
+        let hi = _mm256_set1_epi32(super::COEFF_MAX);
+        for x in 0..nz_w {
+            unsafe {
+                if DST {
+                    accum_avx2::<4>(sp, d.add(x), N, dst_tab, 1, 0, 1, nz_h.min(4));
+                } else {
+                    idct_sums_avx2::<N>(sp, d.add(x), N, tab, &nzs1);
+                }
+            }
+            if N == 4 {
+                let v = unsafe { _mm_loadu_si128(sp as *const __m128i) };
+                let r = _mm_srai_epi32(_mm_add_epi32(v, _mm_set1_epi32(64)), 7);
+                let r = _mm_min_epi32(_mm_max_epi32(r, _mm_set1_epi32(super::COEFF_MIN)), _mm_set1_epi32(super::COEFF_MAX));
+                unsafe { _mm_storeu_si128(sp as *mut __m128i, r) };
+            } else {
+                let mut i = 0;
+                while i < N {
+                    let v = unsafe { _mm256_loadu_si256(sp.add(i) as *const __m256i) };
+                    let r = _mm256_srai_epi32(_mm256_add_epi32(v, add7), 7);
+                    let r = _mm256_min_epi32(_mm256_max_epi32(r, lo), hi);
+                    unsafe { _mm256_storeu_si256(sp.add(i) as *mut __m256i, r) };
+                    i += 8;
+                }
+            }
+            // The column is strided in `tmp`; N scalar stores.
+            for i in 0..N {
+                unsafe { *tmp.add(i * N + x) = *sp.add(i) };
+            }
+        }
+        // Stage 2: rows, over the `nz_w` live inputs, no clip.
+        let nzs2 = level_nzs(N, nz_w);
+        let addb = _mm256_set1_epi32(1i32 << (bd_shift - 1));
+        let shb = _mm_cvtsi32_si128(bd_shift as i32);
+        for y in 0..N {
+            let row = unsafe { tmp.add(y * N) };
+            let out = unsafe { d.add(y * N) };
+            unsafe {
+                if DST {
+                    accum_avx2::<4>(sp, row, 1, dst_tab, 1, 0, 1, nz_w.min(4));
+                } else {
+                    idct_sums_avx2::<N>(sp, row, 1, tab, &nzs2);
+                }
+            }
+            if N == 4 {
+                let v = unsafe { _mm_loadu_si128(sp as *const __m128i) };
+                let r = _mm_sra_epi32(_mm_add_epi32(v, _mm_set1_epi32(1i32 << (bd_shift - 1))), shb);
+                unsafe { _mm_storeu_si128(out as *mut __m128i, r) };
+            } else {
+                let mut i = 0;
+                while i < N {
+                    let v = unsafe { _mm256_loadu_si256(sp.add(i) as *const __m256i) };
+                    let r = _mm256_sra_epi32(_mm256_add_epi32(v, addb), shb);
+                    unsafe { _mm256_storeu_si256(out.add(i) as *mut __m256i, r) };
+                    i += 8;
+                }
+            }
+        }
+    }
+
+    /// 4x4 inverse transform, both passes in registers.
+    ///
+    /// The butterfly kernels vectorise along the OUTPUT of one 1-D transform,
+    /// which for a 4-point transform is half a register, eight times per block.
+    /// Vectorising across the block's other dimension instead gives:
+    ///
+    /// ```text
+    ///   stage 1   tmp[j] (a row over x) = clip( Σ_k T[k][j] · d[k] )     broadcast table, row vector
+    ///   stage 2   out[y] (a row over j) =       Σ_k tmp[y][k] · T[k]     broadcast sample, table row
+    /// ```
+    ///
+    /// -- no transpose, no scratch, no per-1-D call, every coefficient loaded
+    /// once. Integer sums are exact in any order, so this is bit-identical to
+    /// the scalar twin. `t` is the 4-point DCT or the DST.
+    ///
+    /// # Safety
+    /// `d` holds 16 `i32`; `nz_w, nz_h` in `1..=4`; `bd_shift` in `1..=31`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn idct4_avx2<const DST: bool>(d: *mut i32, bd_shift: u32) {
+        // Every one of the sixteen coefficients is read: a 4x4 block is one
+        // scan sub-block, so the parser cleared ALL of it (`scan_bbox` of a
+        // 4x4 is the block), and a zero row contributes nothing. That is what
+        // lets this be straight-line code with no `nz` bound and no loop --
+        // the bounded-loop form measured 280 instructions a block, this ~100.
+        let r0 = unsafe { _mm_loadu_si128(d as *const __m128i) };
+        let r1 = unsafe { _mm_loadu_si128(d.add(4) as *const __m128i) };
+        let r2 = unsafe { _mm_loadu_si128(d.add(8) as *const __m128i) };
+        let r3 = unsafe { _mm_loadu_si128(d.add(12) as *const __m128i) };
+        let c = |v: i32| _mm_set1_epi32(v);
+        let mul = |a: __m128i, v: i32| _mm_mullo_epi32(a, c(v));
+        // Stage 1: tmp[j] (a row over x) = Σ_k T[k][j] · r_k.
+        let (t0, t1, t2, t3) = if DST {
+            // DST4 rows [29,55,74,84] [74,74,0,-74] [84,-29,-74,55] [55,-84,74,-29].
+            (
+                _mm_add_epi32(_mm_add_epi32(mul(r0, 29), mul(r1, 74)), _mm_add_epi32(mul(r2, 84), mul(r3, 55))),
+                _mm_add_epi32(_mm_add_epi32(mul(r0, 55), mul(r1, 74)), _mm_sub_epi32(mul(r3, -84), mul(r2, 29))),
+                _mm_add_epi32(_mm_sub_epi32(mul(r0, 74), mul(r2, 74)), mul(r3, 74)),
+                _mm_add_epi32(_mm_sub_epi32(mul(r0, 84), mul(r1, 74)), _mm_sub_epi32(mul(r2, 55), mul(r3, 29))),
+            )
+        } else {
+            // Even part from rows 0 and 2 (64·(r0 ± r2), a shift), odd part
+            // from rows 1 and 3 -- the 4-point butterfly.
+            let e0 = _mm_slli_epi32(_mm_add_epi32(r0, r2), 6);
+            let e1 = _mm_slli_epi32(_mm_sub_epi32(r0, r2), 6);
+            let o0 = _mm_add_epi32(mul(r1, 83), mul(r3, 36));
+            let o1 = _mm_sub_epi32(mul(r1, 36), mul(r3, 83));
+            (_mm_add_epi32(e0, o0), _mm_add_epi32(e1, o1), _mm_sub_epi32(e1, o1), _mm_sub_epi32(e0, o0))
+        };
+        let add7 = c(64);
+        let lo = c(super::COEFF_MIN);
+        let hi = c(super::COEFF_MAX);
+        let clip = |v: __m128i| _mm_min_epi32(_mm_max_epi32(_mm_srai_epi32(_mm_add_epi32(v, add7), 7), lo), hi);
+        let tmp = [clip(t0), clip(t1), clip(t2), clip(t3)];
+        // Stage 2: out[y] (a row over j) = Σ_k tmp[y][k] · T[k].
+        let (k0, k1, k2, k3) = if DST {
+            (
+                _mm_setr_epi32(29, 55, 74, 84),
+                _mm_setr_epi32(74, 74, 0, -74),
+                _mm_setr_epi32(84, -29, -74, 55),
+                _mm_setr_epi32(55, -84, 74, -29),
+            )
+        } else {
+            (
+                _mm_setr_epi32(64, 64, 64, 64),
+                _mm_setr_epi32(83, 36, -36, -83),
+                _mm_setr_epi32(64, -64, -64, 64),
+                _mm_setr_epi32(36, -83, 83, -36),
+            )
+        };
+        let addb = c(1i32 << (bd_shift - 1));
+        let shb = _mm_cvtsi32_si128(bd_shift as i32);
+        for (y, &ty) in tmp.iter().enumerate() {
+            let acc = _mm_add_epi32(
+                _mm_add_epi32(_mm_mullo_epi32(_mm_shuffle_epi32(ty, 0x00), k0), _mm_mullo_epi32(_mm_shuffle_epi32(ty, 0x55), k1)),
+                _mm_add_epi32(_mm_mullo_epi32(_mm_shuffle_epi32(ty, 0xAA), k2), _mm_mullo_epi32(_mm_shuffle_epi32(ty, 0xFF), k3)),
+            );
+            unsafe { _mm_storeu_si128(d.add(y * 4) as *mut __m128i, _mm_sra_epi32(_mm_add_epi32(acc, addb), shb)) };
+        }
+    }
+
+    /// 8x8 inverse DCT, both passes in registers. Same scheme as
+    /// [`idct4_avx2`] at a full `ymm` per row.
+    ///
+    /// # Safety
+    /// `d` holds 64 `i32`; `nz_w, nz_h` in `1..=8`; `bd_shift` in `1..=31`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn idct8_avx2(d: *mut i32, nz_w: usize, nz_h: usize, bd_shift: u32, t: &[[i32; 8]; 8]) {
+        let zero = _mm256_setzero_si256();
+        let mut rows = [zero; 8];
+        for (k, r) in rows.iter_mut().enumerate().take(nz_h) {
+            *r = unsafe { _mm256_loadu_si256(d.add(k * 8) as *const __m256i) };
+        }
+        let add7 = _mm256_set1_epi32(64);
+        let lo = _mm256_set1_epi32(super::COEFF_MIN);
+        let hi = _mm256_set1_epi32(super::COEFF_MAX);
+        let mut tmp = [zero; 8];
+        for (j, o) in tmp.iter_mut().enumerate() {
+            let mut acc = zero;
+            for k in 0..nz_h {
+                acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(_mm256_set1_epi32(t[k][j]), rows[k]));
+            }
+            *o = _mm256_min_epi32(_mm256_max_epi32(_mm256_srai_epi32(_mm256_add_epi32(acc, add7), 7), lo), hi);
+        }
+        let addb = _mm256_set1_epi32(1i32 << (bd_shift - 1));
+        let shb = _mm_cvtsi32_si128(bd_shift as i32);
+        let mut trow = [zero; 8];
+        for (k, r) in trow.iter_mut().enumerate().take(nz_w) {
+            *r = unsafe { _mm256_loadu_si256(t[k].as_ptr() as *const __m256i) };
+        }
+        for (y, &ty) in tmp.iter().enumerate() {
+            let mut acc = zero;
+            for k in 0..nz_w {
+                // Lane `k` of `tmp[y]` broadcast to all eight lanes.
+                let b = _mm256_permutevar8x32_epi32(ty, _mm256_set1_epi32(k as i32));
+                acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(b, trow[k]));
+            }
+            unsafe { _mm256_storeu_si256(d.add(y * 8) as *mut __m256i, _mm256_sra_epi32(_mm256_add_epi32(acc, addb), shb)) };
         }
     }
 

@@ -6,7 +6,7 @@
 use super::{PartMode, SliceDecoder};
 use crate::cabac::*;
 use crate::error::{Error, Result};
-use crate::mcscratch::weighted_write;
+use crate::mcscratch::{weighted_write, McScratch};
 use crate::pic::{AvailAt, Motion, PicState, PRED_INTER, PRED_SKIP};
 use crate::slice::PredWeightTable;
 use rusty_h265_accel as accel;
@@ -231,10 +231,14 @@ impl<'a> SliceDecoder<'a> {
         };
         let mut merge = false;
         for (i, &(x, y, w, hh)) in parts[..np].iter().enumerate() {
-            if i > 0 {
-                self.mark_edges(x, y, w, hh, 1);
-            }
             merge = self.prediction_unit(x0, y0, n, x, y, w, hh, i, depth, false)?;
+            if i > 0 {
+                // The internal prediction block edges, once this partition's
+                // motion is stored. Not transform block edges (§8.7.2.3); a
+                // transform unit that shares one overwrites it with the cbf
+                // rule later, which is what the old edge bitmap resolved to.
+                self.bs_edges(x, y, w, hh, x != x0, y != y0, false);
+            }
         }
         Ok(merge && self.part_mode == PartMode::Part2Nx2N)
     }
@@ -380,7 +384,7 @@ impl<'a> SliceDecoder<'a> {
             return None;
         }
         let i = self.st.idx4(xnu, ynu);
-        let m = self.st.pred_mode[i];
+        let m = self.st.cell[i].pred_mode;
         (m == PRED_INTER || m == PRED_SKIP).then_some(i)
     }
 
@@ -804,18 +808,20 @@ impl<'a> SliceDecoder<'a> {
                 }
             }
 
-            for l in 0..2usize {
-                if fp[l].is_some() {
-                    continue; // resolved above; no filter, no scratch
-                }
-                let Some(r) = rp[l] else { continue };
+            // One list's interpolation, into `pred` or -- when `out` says so --
+            // straight into the picture with the default weighting fused into
+            // the kernel's final pass (`accel::mc::Out`). The footprint is the
+            // reference plane itself when it is inside the picture, and the
+            // edge-extended copy in `pad` otherwise.
+            let McScratch { pred, tmp, pad } = scratch;
+            let interp = |l: usize, dst_pred: &mut [i16], pad: &mut Vec<u16>, tmp: &mut Vec<i16>, out: accel::mc::Out<'_>| {
+                let r = rp[l].expect("list resolved");
                 let plane = &r.pic.planes[c];
                 // `geo[l]` already holds this: the old shape recomputed the
                 // whole integer/fractional split -- two shifts, two masks and
                 // two adds -- and threw the first copy away.
                 let (xi, yi, fx, fy) = geo[l];
                 let (x0, y0) = (xi - m as i32, yi - m as i32);
-
                 let interior = x0 >= 0 && y0 >= 0 && (x0 as usize + fw) <= plane.width && (y0 as usize + fh) <= plane.height;
                 let (src, stride): (&[u16], usize) = if interior {
                     (&plane.data[y0 as usize * plane.stride + x0 as usize..], plane.stride)
@@ -823,16 +829,15 @@ impl<'a> SliceDecoder<'a> {
                     if accel::census::ALWAYS {
                         accel::census::bump(&accel::census::MC_EDGE_PAD, 1);
                     }
-                    scratch.pad_footprint(plane, x0, y0, fw, fh);
-                    (&scratch.pad[..], fw)
+                    crate::mcscratch::pad_footprint(pad, plane, x0, y0, fw, fh);
+                    (&pad[..], fw)
                 };
-                let pred = &mut scratch.pred[l];
                 if c == 0 {
-                    accel::mc::interp_luma(src, stride, fx, fy, bw, bh, bit_depth, pred, &mut scratch.tmp);
+                    accel::mc::interp_luma(src, stride, fx, fy, bw, bh, bit_depth, dst_pred, tmp, out);
                 } else {
-                    accel::mc::interp_chroma(src, stride, fx, fy, bw, bh, bit_depth, pred, &mut scratch.tmp);
+                    accel::mc::interp_chroma(src, stride, fx, fy, bw, bh, bit_depth, dst_pred, tmp, out);
                 }
-            }
+            };
 
             // NOT a profiler scope. Timing the combine step directly needs a
             // scope on ~2 M calls a clip, and at 545 ns of measured per-scope
@@ -844,27 +849,46 @@ impl<'a> SliceDecoder<'a> {
             let off = yb * stride + xb;
             let dst = &mut plane.data[off..];
             let refp = |l: usize| -> &[u16] { &rp[l].unwrap().pic.planes[c].data };
+            let (p0, p1) = pred.split_at_mut(1);
+            let (p0, p1) = (&mut p0[0], &mut p1[0]);
             match (used[0], used[1], weights) {
                 (true, false, None) | (false, true, None) => {
                     let l = if used[0] { 0 } else { 1 };
                     match fp[l] {
                         Some((o, ss2)) => accel::pixel::copy_block(dst, stride, &refp(l)[o..], ss2, bw, bh),
-                        None => accel::pixel::put_uni(dst, stride, &scratch.pred[l], bw, bh, bit_depth),
+                        // `put_uni`, fused into the final filter pass.
+                        None => interp(l, p0, pad, tmp, accel::mc::Out::Uni { pic: dst, stride }),
                     }
                 }
                 (true, true, None) => match (fp[0], fp[1]) {
                     (Some((o0, s0)), Some((o1, s1))) => accel::pixel::avg_block(dst, stride, &refp(0)[o0..], s0, &refp(1)[o1..], s1, bw, bh),
-                    (Some((o0, s0)), None) => accel::pixel::put_bi_fp(dst, stride, &refp(0)[o0..], s0, &scratch.pred[1], bw, bh, bit_depth),
-                    (None, Some((o1, s1))) => accel::pixel::put_bi_fp(dst, stride, &refp(1)[o1..], s1, &scratch.pred[0], bw, bh, bit_depth),
-                    (None, None) => accel::pixel::put_bi(dst, stride, &scratch.pred[0], &scratch.pred[1], bw, bh, bit_depth),
+                    (Some((o0, s0)), None) => {
+                        interp(1, p1, pad, tmp, accel::mc::Out::Pred);
+                        accel::pixel::put_bi_fp(dst, stride, &refp(0)[o0..], s0, p1, bw, bh, bit_depth);
+                    }
+                    (None, Some((o1, s1))) => {
+                        interp(0, p0, pad, tmp, accel::mc::Out::Pred);
+                        accel::pixel::put_bi_fp(dst, stride, &refp(1)[o1..], s1, p0, bw, bh, bit_depth);
+                    }
+                    (None, None) => {
+                        // List 0 to the intermediate; list 1's final pass adds
+                        // it and writes the picture -- `put_bi` fused.
+                        interp(0, p0, pad, tmp, accel::mc::Out::Pred);
+                        interp(1, p1, pad, tmp, accel::mc::Out::Bi { pic: dst, stride, other: p0 });
+                    }
                 },
                 // Explicit weighted prediction (§8.5.3.3.4.3) — rare enough
                 // that it stays scalar; the census counter records how rare.
                 (_, _, Some(t)) => {
+                    for l in 0..2usize {
+                        if used[l] && fp[l].is_none() {
+                            interp(l, if l == 0 { &mut *p0 } else { &mut *p1 }, pad, tmp, accel::mc::Out::Pred);
+                        }
+                    }
                     let denom = if c == 0 { t.luma_log2_weight_denom } else { t.chroma_log2_weight_denom };
                     let e0 = used[0].then(|| &t.l0[pu.ref_idx[0] as usize]);
                     let e1 = used[1].then(|| &t.l1[pu.ref_idx[1] as usize]);
-                    weighted_write(dst, stride, &scratch.pred, used, e0, e1, denom, c, bw, bh, bit_depth);
+                    weighted_write(dst, stride, pred, used, e0, e1, denom, c, bw, bh, bit_depth);
                 }
                 (false, false, None) => {}
             }

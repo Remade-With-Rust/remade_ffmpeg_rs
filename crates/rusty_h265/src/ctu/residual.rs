@@ -77,9 +77,8 @@ impl<'a> SliceDecoder<'a> {
             self.qp_y = wrap_qp(self.qp_y_pred + delta, self.sps.qp_bd_offset_y);
             self.set_cu_qp();
         }
-        self.mark_edges(x0, y0, n, n, 0);
         // Luma
-        let luma_mode = self.st.intra_mode[self.st.idx4(x0, y0)];
+        let luma_mode = self.st.cell[self.st.idx4(x0, y0)].intra_mode;
         let mut dc_luma = None;
         if self.cu_intra {
             dc_luma = self.intra_predict(0, x0, y0, n, luma_mode, cbf_luma);
@@ -87,8 +86,11 @@ impl<'a> SliceDecoder<'a> {
         if cbf_luma {
             self.residual_block(x0, y0, log2, 0, luma_mode, dc_luma)?;
             let w4 = self.st.w4;
-            PicState::fill4(&mut self.st.nz, w4, x0, y0, n, n, 1);
+            PicState::fill4_with(&mut self.st.cell, w4, x0, y0, n, n, |c| c.nz = 1);
         }
+        // This transform block's edges, now that its `nz` is known. The sides
+        // on the coding block boundary belong to `coding_unit`.
+        self.bs_edges(x0, y0, n, n, x0 != self.cu_x, y0 != self.cu_y, true);
         // Chroma (4:2:0)
         let (xc, yc, log2c, do_chroma) = if log2 > 2 {
             (x0 / 2, y0 / 2, log2 - 1, true)
@@ -126,14 +128,76 @@ impl<'a> SliceDecoder<'a> {
         let xl = (xb << ss) as i32;
         let yl = (yb << ss) as i32;
         let constrained = self.pps.constrained_intra_pred;
-        // Reused across blocks; only the availability flags are cleared.
         let refs = &mut self.iref;
-        refs.reset(n);
         // The reference-sample gather asks about up to 4n + 1 neighbours of
         // one block, so the current-block half of §6.4.1 is hoisted hardest
         // here.
         let ac = self.st.avail_at(xl, yl);
-        let avail = |st: &PicState, xn: i32, yn: i32| -> bool { st.avail_n(&ac, xn, yn) && (!constrained || st.pred_mode[st.idx4(xn as usize, yn as usize)] == PRED_INTRA) };
+        let bit_depth = if c == 0 { self.sps.bit_depth_luma } else { self.sps.bit_depth_chroma };
+        if !constrained {
+            // FIVE availability answers, not one per run.
+            //
+            // §6.4.1 is derived per 4x4, but the 4n + 1 reference samples fall
+            // into five groups -- left, below-left, corner, above, above-right
+            // -- and each group lies inside ONE block of the current block's
+            // own size, aligned to it. A whole aligned block is either before
+            // or after the current one in z-scan, sits in one coding tree block
+            // (so one slice and one tile), and is fully decoded if it is
+            // before: its availability is uniform, and one test answers for
+            // every run in it. The only non-uniform case is the picture edge,
+            // where the below-left and above-right groups can be cut short --
+            // the samples past the edge are unavailable and `substitute_spans`
+            // fills them exactly as the per-sample rule does.
+            //
+            // On the all-intra stream the per-run form asked 60.8 M times --
+            // nine per block, 2.8 G instructions -- for answers that came in
+            // five.
+            let st = &*self.st;
+            let plane = &self.pic.planes[c];
+            let nl = (n << ss) as i32;
+            let a_left = st.avail_n(&ac, xl - 1, yl);
+            let a_bl = st.avail_n(&ac, xl - 1, yl + nl);
+            let a_top = st.avail_n(&ac, xl, yl - 1);
+            let a_tr = st.avail_n(&ac, xl + nl, yl - 1);
+            let a_corner = st.avail_n(&ac, xl - 1, yl - 1);
+            let bl_count = if a_bl { n.min(plane.height - (yb + n)) } else { 0 };
+            let tr_count = if a_tr { n.min(plane.width - (xb + n)) } else { 0 };
+            if a_left {
+                for j in 0..n {
+                    refs.left[j] = plane.get(xb - 1, yb + j);
+                }
+            }
+            for j in n..n + bl_count {
+                refs.left[j] = plane.get(xb - 1, yb + j);
+            }
+            if a_top || tr_count > 0 {
+                let row = &plane.data[(yb - 1) * plane.stride..];
+                if a_top {
+                    refs.top[..n].copy_from_slice(&row[xb..xb + n]);
+                }
+                refs.top[n..n + tr_count].copy_from_slice(&row[xb + n..xb + n + tr_count]);
+            }
+            if a_corner {
+                refs.corner = plane.get(xb - 1, yb - 1);
+            }
+            let all_avail = a_left && a_corner && a_top && bl_count == n && tr_count == n;
+            if accel::census::ALWAYS {
+                accel::census::route(all_avail, &accel::census::RT_INTRA_ALL_AVAIL, &accel::census::RT_INTRA_SUBSTITUTED);
+            }
+            if !all_avail {
+                refs.substitute_spans(n, bit_depth, a_left, bl_count, a_corner, a_top, tr_count);
+            }
+            let plane = &mut self.pic.planes[c];
+            let stride = plane.stride;
+            let off = yb * stride + xb;
+            return intra::predict(refs, n, mode, c, bit_depth, self.sps.strong_intra_smoothing_enabled, &mut plane.data[off..], stride, residual_follows);
+        }
+        // Constrained intra prediction: availability also depends on each
+        // neighbour's prediction mode, which is not uniform over a block, so
+        // this keeps the per-run derivation. It is also the oracle for the
+        // span form above (`span_substitution_matches_per_sample`).
+        refs.reset(n);
+        let avail = |st: &PicState, xn: i32, yn: i32| -> bool { st.avail_n(&ac, xn, yn) && st.cell[st.idx4(xn as usize, yn as usize)].pred_mode == PRED_INTRA };
         // Every reference sample present? The gather derives this per run for
         // free, and it lets `substitute` return immediately.
         let mut all_avail = true;
@@ -221,7 +285,6 @@ impl<'a> SliceDecoder<'a> {
                 all_avail = false;
             }
         }
-        let bit_depth = if c == 0 { self.sps.bit_depth_luma } else { self.sps.bit_depth_chroma };
         // Route: every reference present (the picture interior), or some
         // missing and §8.4.4.2.2 substitution needed (edges, slice and tile
         // boundaries, constrained intra).
@@ -353,6 +416,47 @@ impl<'a> SliceDecoder<'a> {
         // are a bitmap, and clearing a register beats clearing 64 bytes on
         // every one of 3.0 M transform blocks. Bit `xs * 8 + ys`.
         let mut csbf = 0u64;
+        // Scaling (§8.6.3) is applied HERE, at the one write of each coded
+        // coefficient, rather than by a second pass over the live rectangle
+        // after the parse. A zero scales to zero, so skipping the rest of the
+        // block is exact; and the parser is the only place that knows which
+        // positions are non-zero without testing every one of them. On the
+        // 20 s 720p clip the separate pass was 239 M instructions, 600 per block.
+        //
+        // `None` is transquant bypass, where the levels ARE the residual.
+        let dq = if self.cu_transquant_bypass {
+            None
+        } else {
+            let sps = self.sps;
+            let bit_depth = if c_idx == 0 { sps.bit_depth_luma } else { sps.bit_depth_chroma };
+            let qp = if c_idx == 0 {
+                self.qp_y + sps.qp_bd_offset_y
+            } else {
+                let off = if c_idx == 1 {
+                    self.pps.cb_qp_offset + self.sh.cb_qp_offset
+                } else {
+                    self.pps.cr_qp_offset + self.sh.cr_qp_offset
+                };
+                let qpi = (self.qp_y + off).clamp(-sps.qp_bd_offset_c, 57);
+                let qpc = if qpi < 0 { qpi } else { CHROMA_QP_420[qpi as usize] as i32 };
+                qpc + sps.qp_bd_offset_c
+            };
+            let m: Option<&[u8]> = match self.scaling {
+                Some(sf) if !(transform_skip && n > 4) => {
+                    let size_id = log2 - 2;
+                    let matrix_id = if self.cu_intra { 0 } else { 3 } + c_idx;
+                    Some(sf.get(size_id, matrix_id))
+                }
+                _ => None,
+            };
+            // Route: a signalled scaling list, or the flat default.
+            if accel::census::ALWAYS {
+                accel::census::route(m.is_some(), &accel::census::RT_TX_SCALED, &accel::census::RT_TX_FLAT);
+            }
+            let bd_shift = bit_depth as i32 + log2 as i32 - 5;
+            let scale = crate::tables::LEVEL_SCALE[(qp % 6) as usize] << (qp / 6);
+            Some((scale as i64, bd_shift, 1i64 << (bd_shift - 1), m))
+        };
         // The non-zero rectangle actually written, which bounds the work the
         // inverse transform has to do (see `itx`'s module docs).
         let (mut nz_w, mut nz_h) = (0usize, 0usize);
@@ -529,7 +633,15 @@ impl<'a> SliceDecoder<'a> {
                 let yc = (ys << 2) + yp;
                 nz_w = nz_w.max(xc + 1);
                 nz_h = nz_h.max(yc + 1);
-                co[yc * n + xc] = v.clamp(-32768, 32767);
+                let idx = yc * n + xc;
+                let level = v.clamp(-32768, 32767);
+                co[idx] = match dq {
+                    None => level,
+                    Some((scale, bd_shift, add, m)) => {
+                        let f = m.map_or(16, |t| t[idx] as i64);
+                        (((level as i64 * f * scale) + add) >> bd_shift).clamp(itx::COEFF_MIN as i64, itx::COEFF_MAX as i64) as i32
+                    }
+                };
             }
         }
         self.reconstruct_residual(x0, y0, log2, c_idx, transform_skip, nz_w, nz_h, dc)
@@ -572,39 +684,7 @@ impl<'a> SliceDecoder<'a> {
         } else {
             TransformKind::Dct
         };
-        if kind != TransformKind::Bypass {
-            let qp = if c_idx == 0 {
-                self.qp_y + sps.qp_bd_offset_y
-            } else {
-                let off = if c_idx == 1 {
-                    self.pps.cb_qp_offset + self.sh.cb_qp_offset
-                } else {
-                    self.pps.cr_qp_offset + self.sh.cr_qp_offset
-                };
-                let qpi = (self.qp_y + off).clamp(-sps.qp_bd_offset_c, 57);
-                let qpc = if qpi < 0 { qpi } else { CHROMA_QP_420[qpi as usize] as i32 };
-                qpc + sps.qp_bd_offset_c
-            };
-            let m: Option<&[u8]> = match self.scaling {
-                Some(sf) if !(transform_skip && n > 4) => {
-                    let size_id = log2 - 2;
-                    let matrix_id = if self.cu_intra { 0 } else { 3 } + c_idx;
-                    Some(sf.get(size_id, matrix_id))
-                }
-                _ => None,
-            };
-            // Route: a signalled scaling list, or the flat default.
-            //
-            // `ALWAYS`, not `route`: `route` calls `enabled()`, whose `OnceLock`
-            // read is an atomic load plus a branch, and this site runs on every
-            // transform block -- 3.0 M of them on intra-heavy content. Per-block
-            // and finer sites are compile-time; per-picture ones keep the
-            // runtime switch.
-            if accel::census::ALWAYS {
-                accel::census::route(m.is_some(), &accel::census::RT_TX_SCALED, &accel::census::RT_TX_FLAT);
-            }
-            itx::dequant(&mut self.coeffs[..nn], n, nz_w.clamp(1, n), nz_h.clamp(1, n), qp, bit_depth, m);
-        }
+        // Scaling already happened at the coefficient write in `residual_block`.
         if accel::census::ALWAYS {
             use accel::census as cx;
             // Route: which inverse transform the block needs.

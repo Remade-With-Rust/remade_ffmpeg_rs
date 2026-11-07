@@ -114,6 +114,10 @@ mod detect {
         have.min(cap).min(if forced == u8::MAX { u8::MAX } else { forced })
     }
 
+    /// `#[inline]`: this was a real call -- 6.6 M of them on a 20 s clip, 14
+    /// instructions each -- from every pixel, SAO and intra dispatcher, for a
+    /// relaxed byte load and a three-way match.
+    #[inline]
     pub fn isa() -> Isa {
         // Detected once; afterwards a relaxed byte load. Callers hoist this
         // above their loops regardless (see the module docs).
@@ -121,15 +125,21 @@ mod detect {
             0 => Isa::Baseline,
             1 => Isa::Sse41,
             2 => Isa::Avx2,
-            _ => {
-                let v = probe();
-                CACHE.store(v, Ordering::Relaxed);
-                match v {
-                    2 => Isa::Avx2,
-                    1 => Isa::Sse41,
-                    _ => Isa::Baseline,
-                }
-            }
+            _ => first_probe(),
+        }
+    }
+
+    /// The one-time detection, out of line so the inlined fast path carries
+    /// only the load and the match.
+    #[cold]
+    #[inline(never)]
+    fn first_probe() -> Isa {
+        let v = probe();
+        CACHE.store(v, Ordering::Relaxed);
+        match v {
+            2 => Isa::Avx2,
+            1 => Isa::Sse41,
+            _ => Isa::Baseline,
         }
     }
 }
@@ -283,7 +293,6 @@ pub mod census {
         ITX_ACCUM_SCALAR,
         DEBLOCK_LUMA_SIMD,
         DEBLOCK_LUMA_SCALAR,
-        RT_DEBLOCK_SKIP,
         RT_DEBLOCK_STRONG,
         RT_DEBLOCK_WEAK,
         CABAC_BYPASS_CALLS,

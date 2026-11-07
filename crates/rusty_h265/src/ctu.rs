@@ -15,7 +15,7 @@ use crate::decoder::{RefLists, RefPic};
 use crate::error::{Error, Result};
 use crate::frame::Picture;
 use crate::nal::Rbsp;
-use crate::pic::{CtbFilterParams, PicState, SaoParams, PRED_INTER, PRED_INTRA, PRED_SKIP};
+use crate::pic::{CtbFilterParams, PicState, SaoParams, PRED_INTER, PRED_INTRA, PRED_NONE, PRED_SKIP};
 use crate::ps::{Pps, ScalingList, Sps, TileLayout};
 use crate::slice::{SliceHeader, SliceType};
 use crate::tables::{DIAG_4X4, DIAG_8X8};
@@ -598,8 +598,8 @@ impl<'a> SliceDecoder<'a> {
             let xi = x0 as i32;
             let yi = y0 as i32;
             let ac = self.st.avail_at(xi, yi);
-            let cond_l = matches!(self.st.avail_n_idx(&ac, xi - 1, yi), Some(i) if self.st.ct_depth[i] > depth);
-            let cond_a = matches!(self.st.avail_n_idx(&ac, xi, yi - 1), Some(i) if self.st.ct_depth[i] > depth);
+            let cond_l = matches!(self.st.avail_n_idx(&ac, xi - 1, yi), Some(i) if self.st.cell[i].ct_depth > depth);
+            let cond_a = matches!(self.st.avail_n_idx(&ac, xi, yi - 1), Some(i) if self.st.cell[i].ct_depth > depth);
             self.cab.decode(CTX_SPLIT_CU + cond_l as usize + cond_a as usize) == 1
         } else {
             log2cb > min_cb
@@ -623,11 +623,11 @@ impl<'a> SliceDecoder<'a> {
             let cur_ctb = self.st.ctb_of(x0, y0);
             let ac = self.st.avail_at(xi, yi);
             let qp_a = match self.st.avail_n_idx(&ac, xi - 1, yi) {
-                Some(i) if self.st.ctb_of(x0 - 1, y0) == cur_ctb => self.st.qp_y[i] as i32,
+                Some(i) if self.st.ctb_of(x0 - 1, y0) == cur_ctb => self.st.cell[i].qp_y as i32,
                 _ => qp_prev,
             };
             let qp_b = match self.st.avail_n_idx(&ac, xi, yi - 1) {
-                Some(i) if self.st.ctb_of(x0, y0 - 1) == cur_ctb => self.st.qp_y[i] as i32,
+                Some(i) if self.st.ctb_of(x0, y0 - 1) == cur_ctb => self.st.cell[i].qp_y as i32,
                 _ => qp_prev,
             };
             self.qp_y_pred = (qp_a + qp_b + 1) >> 1;
@@ -645,35 +645,54 @@ impl<'a> SliceDecoder<'a> {
         }
     }
 
+    /// Re-writes the coding unit's `QpY` after a `cu_qp_delta`.
     fn set_cu_qp(&mut self) {
         let w4 = self.st.w4;
-        PicState::fill4(&mut self.st.qp_y, w4, self.cu_x, self.cu_y, self.cu_size, self.cu_size, self.qp_y as i8);
+        let qp = self.qp_y as i8;
+        PicState::fill4_with(&mut self.st.cell, w4, self.cu_x, self.cu_y, self.cu_size, self.cu_size, |c| c.qp_y = qp);
     }
 
-    /// Marks edges on the left and top sides of a block: `kind` 0 = transform
-    /// block edge (bit0/1), 1 = prediction block edge (bit2/3), 2 = coding
-    /// block edge (both). An internal PU edge is *not* a transform edge
-    /// (§8.7.2.3): the cbf rule of the boundary strength must not see it.
-    fn mark_edges(&mut self, x: usize, y: usize, w: usize, h: usize, kind: u8) {
-        let (bits, bits_h) = match kind {
-            0 => (0b0001, 0b0010),
-            1 => (0b0100, 0b1000),
-            _ => (0b0101, 0b1010),
-        };
-        // Both walks start at the same 4x4 and the indexed form re-proved the
-        // bound on every element. Taking each as ONE subslice proves it once:
-        // the left column is a strided walk of that slice, the top row is a
-        // contiguous run of it.
-        let w4 = self.st.w4;
-        let (x4, y4) = (x >> 2, y >> 2);
-        let base = y4 * w4 + x4;
-        let rows = ((y + h) >> 2) - y4;
-        let cols = ((x + w) >> 2) - x4;
-        for e in self.st.edges[base..].iter_mut().step_by(w4).take(rows) {
-            *e |= bits;
+    /// §8.7.2.4 boundary strengths for the `left` and/or `top` edge of the
+    /// block at (x, y), size w x h, written into the per-4x4 maps.
+    ///
+    /// Called by the owner of each edge once both sides are known: a prediction
+    /// unit after its motion is stored, a transform unit after its luma `nz`
+    /// is set, the coding unit for its own boundary at the end. `tu_edge` says
+    /// whether the cbf rule applies (§8.7.2.3: an internal prediction block
+    /// edge is not a transform block edge). Only the 8x8 grid is filtered, so
+    /// edges off it are skipped here exactly as the old scan skipped them.
+    fn bs_edges(&mut self, x: usize, y: usize, w: usize, h: usize, left: bool, top: bool, tu_edge: bool) {
+        if self.sh.deblocking_filter_disabled {
+            return;
         }
-        for e in &mut self.st.edges[base..base + cols] {
-            *e |= bits_h;
+        let st = &mut *self.st;
+        let w4 = st.w4;
+        let cq = st.ctb_of(x, y);
+        let lfs = self.sh.loop_filter_across_slices_enabled;
+        if left && x > 0 && x % 8 == 0 {
+            let cp = st.ctb_of(x - 1, y);
+            if crate::filters::edge_allowed(st, self.pps, cp, cq, lfs) {
+                let mut q = st.idx4(x, y);
+                for _ in 0..(h >> 2) {
+                    let p = q - 1;
+                    if st.cell[p].pred_mode != crate::pic::PRED_NONE {
+                        st.bs_v[q] = crate::filters::boundary_strength(st, p, q, tu_edge);
+                    }
+                    q += w4;
+                }
+            }
+        }
+        if top && y > 0 && y % 8 == 0 {
+            let cp = st.ctb_of(x, y - 1);
+            if crate::filters::edge_allowed(st, self.pps, cp, cq, lfs) {
+                let q0 = st.idx4(x, y);
+                for q in q0..q0 + (w >> 2) {
+                    let p = q - w4;
+                    if st.cell[p].pred_mode != crate::pic::PRED_NONE {
+                        st.bs_h[q] = crate::filters::boundary_strength(st, p, q, tu_edge);
+                    }
+                }
+            }
         }
     }
 
@@ -691,22 +710,36 @@ impl<'a> SliceDecoder<'a> {
         let mut skip = false;
         if !self.sh.slice_type.is_intra() {
             let ac = self.st.avail_at(xi, yi);
-            let cond_l = matches!(self.st.avail_n_idx(&ac, xi - 1, yi), Some(i) if self.st.pred_mode[i] == PRED_SKIP);
-            let cond_a = matches!(self.st.avail_n_idx(&ac, xi, yi - 1), Some(i) if self.st.pred_mode[i] == PRED_SKIP);
+            let cond_l = matches!(self.st.avail_n_idx(&ac, xi - 1, yi), Some(i) if self.st.cell[i].pred_mode == PRED_SKIP);
+            let cond_a = matches!(self.st.avail_n_idx(&ac, xi, yi - 1), Some(i) if self.st.cell[i].pred_mode == PRED_SKIP);
             skip = self.cab.decode(CTX_CU_SKIP + cond_l as usize + cond_a as usize) == 1;
         }
         self.qp_y = wrap_qp(self.qp_y_pred + self.cu_qp_delta_val, self.sps.qp_bd_offset_y);
-        PicState::fill4(&mut self.st.ct_depth, w4, x0, y0, n, n, depth);
-        self.set_cu_qp();
-        PicState::fill4(&mut self.st.filter_bypass, w4, x0, y0, n, n, self.cu_transquant_bypass as u8);
-        self.mark_edges(x0, y0, n, n, 2);
+        // The coding unit's record, written ONCE over its area as soon as the
+        // prediction mode is known: depth, QP, bypass, mode, a default intra
+        // mode and `nz = 0`. The five separate map fills this replaces ran
+        // 3.2 M times on a 20 s 720p clip (494 M instructions) plus 0.8 M
+        // `set_cu_qp` fills, over the same rectangle each time.
+        let base = crate::pic::Cell {
+            pred_mode: PRED_NONE,
+            intra_mode: 1,
+            qp_y: self.qp_y as i8,
+            ct_depth: depth,
+            filter_bypass: self.cu_transquant_bypass as u8,
+            nz: 0,
+            _pad: [0; 2],
+        };
+        if self.cu_transquant_bypass {
+            self.st.any_bypass = true;
+        }
 
         if skip {
-            PicState::fill4(&mut self.st.pred_mode, w4, x0, y0, n, n, PRED_SKIP);
-            PicState::fill4(&mut self.st.intra_mode, w4, x0, y0, n, n, 1);
+            PicState::fill4(&mut self.st.cell, w4, x0, y0, n, n, crate::pic::Cell { pred_mode: PRED_SKIP, ..base });
             self.cu_intra = false;
             self.part_mode = PartMode::Part2Nx2N;
             self.prediction_unit(x0, y0, n, x0, y0, n, n, 0, depth, true)?;
+            // The coding block boundary is a transform block boundary.
+            self.bs_edges(x0, y0, n, n, true, true, true);
             self.last_cu_qp = self.qp_y;
             self.dbg_cu(x0, y0, n);
             return Ok(());
@@ -717,7 +750,18 @@ impl<'a> SliceDecoder<'a> {
         if !self.cu_intra || log2cb == min_cb {
             self.part_mode = self.parse_part_mode(log2cb)?;
         }
-        PicState::fill4(&mut self.st.pred_mode, w4, x0, y0, n, n, if self.cu_intra { PRED_INTRA } else { PRED_INTER });
+        PicState::fill4(
+            &mut self.st.cell,
+            w4,
+            x0,
+            y0,
+            n,
+            n,
+            crate::pic::Cell {
+                pred_mode: if self.cu_intra { PRED_INTRA } else { PRED_INTER },
+                ..base
+            },
+        );
         self.intra_split = self.cu_intra && self.part_mode == PartMode::PartNxN;
         let mut pcm = false;
         let mut merge_2nx2n = false;
@@ -726,9 +770,9 @@ impl<'a> SliceDecoder<'a> {
                 pcm = self.cab.terminate();
             }
             if pcm {
-                PicState::fill4(&mut self.st.intra_mode, w4, x0, y0, n, n, 1);
                 if self.sps.pcm_loop_filter_disabled {
-                    PicState::fill4(&mut self.st.filter_bypass, w4, x0, y0, n, n, 1);
+                    PicState::fill4_with(&mut self.st.cell, w4, x0, y0, n, n, |c| c.filter_bypass = 1);
+                    self.st.any_bypass = true;
                 }
                 self.pcm_samples(x0, y0, n)?;
             } else {
@@ -736,7 +780,6 @@ impl<'a> SliceDecoder<'a> {
             }
         } else {
             merge_2nx2n = self.inter_prediction_units(x0, y0, n, depth)?;
-            PicState::fill4(&mut self.st.intra_mode, w4, x0, y0, n, n, 1);
         }
         if !pcm {
             let mut rqt_root_cbf = true;
@@ -752,6 +795,11 @@ impl<'a> SliceDecoder<'a> {
                 self.transform_tree(x0, y0, x0, y0, log2cb, 0, 0, true, true)?;
             }
         }
+        // The coding block boundary, after every prediction and transform
+        // unit inside it has written its motion and `nz`. Transform units skip
+        // the sides they share with this boundary, so each segment is derived
+        // exactly once.
+        self.bs_edges(x0, y0, n, n, true, true, true);
         self.last_cu_qp = self.qp_y;
         self.dbg_cu(x0, y0, n);
         Ok(())
@@ -765,7 +813,7 @@ impl<'a> SliceDecoder<'a> {
         let i = self.st.idx4(x0, y0);
         let part = self.part_mode as u8;
         if self.cu_intra {
-            eprintln!("cu poc={} x={x0} y={y0} w={n} intra qp={} part={part} mode={}", self.poc, self.qp_y, self.st.intra_mode[i]);
+            eprintln!("cu poc={} x={x0} y={y0} w={n} intra qp={} part={part} mode={}", self.poc, self.qp_y, self.st.cell[i].intra_mode);
         } else {
             let m = self.st.motion[i];
             eprintln!(
@@ -840,16 +888,14 @@ impl<'a> SliceDecoder<'a> {
                 }
                 m
             };
-            PicState::fill4(&mut self.st.intra_mode, w4, xp, yp, pb, pb, mode);
+            PicState::fill4_with(&mut self.st.cell, w4, xp, yp, pb, pb, |c| c.intra_mode = mode);
         }
-        if parts == 4 {
-            // PU edges of the NxN split.
-            self.mark_edges(x0 + pb, y0, pb, n, 1);
-            self.mark_edges(x0, y0 + pb, n, pb, 1);
-        }
+        // The NxN split's internal prediction block edges coincide with its
+        // transform block edges (an intra NxN coding unit always splits its
+        // transform tree), so the transform units derive them; nothing to do.
         // intra_chroma_pred_mode (once for 4:2:0)
         let icpm = if self.cab.decode(CTX_INTRA_CHROMA_PRED_MODE) == 0 { 4 } else { self.cab.bypass_bits(2) as u8 };
-        let luma0 = self.st.intra_mode[self.st.idx4(x0, y0)];
+        let luma0 = self.st.cell[self.st.idx4(x0, y0)].intra_mode;
         self.intra_chroma_mode = match icpm {
             4 => luma0,
             _ => {
@@ -872,13 +918,13 @@ impl<'a> SliceDecoder<'a> {
             let Some(i) = self.st.avail_n_idx(&ac, xn, yn) else {
                 return 1;
             };
-            if self.st.pred_mode[i] != PRED_INTRA {
+            if self.st.cell[i].pred_mode != PRED_INTRA {
                 return 1;
             }
             if above && yn < ((yi >> self.st.log2_ctb) << self.st.log2_ctb) {
                 return 1;
             }
-            self.st.intra_mode[i]
+            self.st.cell[i].intra_mode
         };
         let a = cand(xi - 1, yi, false);
         let b = cand(xi, yi - 1, true);

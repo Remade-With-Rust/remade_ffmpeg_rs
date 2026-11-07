@@ -116,9 +116,6 @@ pub static RECL_FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub struct FilterScratch {
     /// Deblocked samples SAO reads while it writes filtered ones.
     pub sao: Vec<u16>,
-    /// Boundary strengths, per 4x4, one map per direction.
-    pub bs_v: Vec<u8>,
-    pub bs_h: Vec<u8>,
 }
 
 pub struct Decoder {

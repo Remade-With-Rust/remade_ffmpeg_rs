@@ -132,6 +132,57 @@ impl RefSamples {
         }
     }
 
+    /// §8.4.4.2.2 over SPANS: the five reference groups' availability, with
+    /// the below-left and above-right groups possibly cut short by the picture
+    /// edge (`bl_count` / `tr_count` available samples of `n`).
+    ///
+    /// The per-sample rule searches up the left column then along the top row
+    /// for the first available sample, and then every unavailable sample
+    /// copies its predecessor in that order. Over spans that is: the
+    /// unavailable tail of the below-left group takes the last available
+    /// sample below it, or the first available sample of the search when it
+    /// has none; an unavailable left group takes `left[n]`; an unavailable
+    /// corner takes `left[0]`; an unavailable top group takes the corner; and
+    /// the unavailable tail of the above-right group takes the sample before
+    /// it. Each step reads values the previous step already settled, which is
+    /// exactly the per-sample propagation order. Pinned to [`substitute`] by
+    /// `span_substitution_matches_per_sample`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn substitute_spans(&mut self, n: usize, bit_depth: u8, a_left: bool, bl_count: usize, a_corner: bool, a_top: bool, tr_count: usize) {
+        let n2 = 2 * n;
+        if bl_count < n {
+            let v = if bl_count > 0 {
+                self.left[n + bl_count - 1]
+            } else if a_left {
+                self.left[n - 1]
+            } else if a_corner {
+                self.corner
+            } else if a_top {
+                self.top[0]
+            } else if tr_count > 0 {
+                self.top[n]
+            } else {
+                1u16 << (bit_depth - 1)
+            };
+            self.left[n + bl_count..n2].fill(v);
+        }
+        if !a_left {
+            let v = self.left[n];
+            self.left[..n].fill(v);
+        }
+        if !a_corner {
+            self.corner = self.left[0];
+        }
+        if !a_top {
+            let v = self.corner;
+            self.top[..n].fill(v);
+        }
+        if tr_count < n {
+            let v = self.top[n + tr_count - 1];
+            self.top[n + tr_count..n2].fill(v);
+        }
+    }
+
     /// §8.4.4.2.3: filtering of neighbouring samples (luma only in 4:2:0).
     fn filter(&mut self, n: usize, mode: u8, bit_depth: u8, strong_intra_smoothing: bool) {
         if mode == MODE_DC || n == 4 {
@@ -415,6 +466,48 @@ pub fn predict(refs: &mut RefSamples, n: usize, mode: u8, c_idx: usize, bit_dept
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The span form against the per-sample form, over every combination of
+    /// the five groups and every edge cut of the two that can be cut.
+    #[test]
+    fn span_substitution_matches_per_sample() {
+        let mut st = 0x5ab5_7a17u32;
+        let mut rnd = || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (st >> 8) as u16 & 1023
+        };
+        for &n in &[4usize, 8, 16, 32] {
+            for flags in 0..32u32 {
+                let (a_left, a_bl, a_corner, a_top, a_tr) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0, flags & 8 != 0, flags & 16 != 0);
+                for bl_cut in [0usize, 2, n] {
+                    for tr_cut in [0usize, 2, n] {
+                        let bl_count = if a_bl { n - bl_cut.min(n - 1) } else { 0 };
+                        let tr_count = if a_tr { n - tr_cut.min(n - 1) } else { 0 };
+                        let mut a = RefSamples::new();
+                        for i in 0..2 * n {
+                            a.left[i] = rnd();
+                            a.top[i] = rnd();
+                        }
+                        a.corner = rnd();
+                        let mut b = RefSamples::new();
+                        b.left = a.left;
+                        b.top = a.top;
+                        b.corner = a.corner;
+                        for i in 0..2 * n {
+                            a.left_avail[i] = if i < n { a_left } else { i < n + bl_count };
+                            a.top_avail[i] = if i < n { a_top } else { i < n + tr_count };
+                        }
+                        a.corner_avail = a_corner;
+                        a.substitute(n, 10, false);
+                        b.substitute_spans(n, 10, a_left, bl_count, a_corner, a_top, tr_count);
+                        assert_eq!(a.left[..2 * n], b.left[..2 * n], "left n={n} flags={flags:05b} bl={bl_count} tr={tr_count}");
+                        assert_eq!(a.top[..2 * n], b.top[..2 * n], "top n={n} flags={flags:05b} bl={bl_count} tr={tr_count}");
+                        assert_eq!(a.corner, b.corner, "corner n={n} flags={flags:05b}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn substitution_fills_from_first_available() {
