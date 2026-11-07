@@ -36,15 +36,14 @@ pub fn apply_in_loop_filters(cur: &mut CurrentPicture, scratch: &mut crate::deco
     }
     let any_deblock = cur.state.ctb_filter.iter().any(|f| !f.deblock_disabled);
     if any_deblock {
-        let (bs_v, bs_h) = (&mut scratch.bs_v, &mut scratch.bs_h);
-        deblock(&mut cur.pic.planes, &cur.state, &sps, &pps, bs_v, bs_h);
+        deblock(&mut cur.pic.planes, &cur.state, &sps, &pps);
     }
     let any_sao = sps.sao_enabled && cur.state.ctb_filter.iter().any(|f| f.sao_luma || f.sao_chroma);
     if any_sao && std::env::var_os("RH265_NO_SAO").is_none() {
         // Whether any coding unit in this picture forbids loop filtering
         // (PCM with `pcm_loop_filter_disabled_flag`, or transquant bypass).
         // Almost never true, and knowing it removes a lookup per sample.
-        let has_bypass = cur.state.filter_bypass.iter().any(|&b| b != 0);
+        let has_bypass = cur.state.any_bypass;
         // Route: a picture-level capability gate. Any transquant-bypass or
         // PCM-loop-filter-disabled sample anywhere forces the whole picture
         // onto the per-sample scalar path. One-sided: there is no counter for
@@ -61,11 +60,11 @@ pub fn apply_in_loop_filters(cur: &mut CurrentPicture, scratch: &mut crate::deco
 /// §8.7.2.4 boundary strength for the edge between the 4×4 blocks `p` and `q`
 /// (indices into the per-4×4 maps); `tu_edge` says the edge is a transform
 /// block edge.
-fn boundary_strength(st: &PicState, p: usize, q: usize, tu_edge: bool) -> u8 {
-    if st.pred_mode[p] == PRED_INTRA || st.pred_mode[q] == PRED_INTRA {
+pub(crate) fn boundary_strength(st: &PicState, p: usize, q: usize, tu_edge: bool) -> u8 {
+    if st.cell[p].pred_mode == PRED_INTRA || st.cell[q].pred_mode == PRED_INTRA {
         return 2;
     }
-    if tu_edge && (st.nz[p] != 0 || st.nz[q] != 0) {
+    if tu_edge && (st.cell[p].nz != 0 || st.cell[q].nz != 0) {
         return 1;
     }
     let mp = &st.motion[p];
@@ -133,71 +132,28 @@ fn across_ctb(st: &PicState, pps: &Pps, cp: usize, cq: usize, lf_across_slices: 
 /// same `ctb_of` twice, read `ctb_filter` twice and tested `deblock_disabled`
 /// twice per block.
 #[inline]
-fn edge_allowed(st: &PicState, pps: &Pps, cp: usize, cq: usize, lf_across_slices: bool) -> bool {
+pub(crate) fn edge_allowed(st: &PicState, pps: &Pps, cp: usize, cq: usize, lf_across_slices: bool) -> bool {
     cp == cq || across_ctb(st, pps, cp, cq, lf_across_slices)
 }
 
-fn deblock(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, bs_v: &mut Vec<u8>, bs_h: &mut Vec<u8>) {
+/// `#[inline(never)]`: deblocking and SAO are the two largest bodies in the
+/// decoder and used to share one frame, so a change to one re-rolled the
+/// other's register allocation -- an edit confined to the SAO ring measured
+/// +0.45% on a stream that never runs SAO. Separate symbols, separate dice.
+#[inline(never)]
+fn deblock(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps) {
     crate::prof_scope!(crate::prof::Stage::Deblock);
     let w4 = st.w4;
     let h4 = st.h4;
     let bd_y = sps.bit_depth_luma;
     let bd_c = sps.bit_depth_chroma;
-    // bS per 4×4 for its left edge (vertical) and top edge (horizontal); 0 = none.
+    // The boundary strengths were derived during the parse, by the coding,
+    // prediction and transform units that own each edge (`SliceDecoder::
+    // bs_edges`). The per-picture scan that re-derived them from the per-4x4
+    // maps -- every 4x4 block of the frame, five map loads each, 1.1 G
+    // instructions on a 20 s 720p clip -- is gone with the `edges` bitmap it
+    // read.
     //
-    // Reused across pictures rather than allocated per picture: at 720p these
-    // are 56 KB each, so a fresh pair per picture is 115 KB of `calloc` and
-    // memset that the loop below overwrites anyway. `resize` keeps the
-    // clearing, which IS needed — the loop only writes entries whose edge is
-    // marked, and reads every entry.
-    bs_v.clear();
-    bs_h.clear();
-    bs_v.resize(w4 * h4, 0);
-    bs_h.resize(w4 * h4, 0);
-    // Row slices, not `[y4 * w4 + x4]`.
-    //
-    // This walks every 4x4 block of the picture -- 57,600 a frame at 720p --
-    // and each iteration indexed five separate `Vec`s at the same computed
-    // offset, so each carried its own bounds check against its own length.
-    // Reborrowing one row of each per `y4` proves all of them once: every
-    // index below is `x4 < w4` against a slice that is `w4` long. The
-    // above-neighbour is the previous row's slice, which is where the `y4 > 0`
-    // test already put it.
-    for y4 in 0..h4 {
-        let row = y4 * w4;
-        let edges = &st.edges[row..row + w4];
-        let modes = &st.pred_mode[row..row + w4];
-        let above = if y4 > 0 { &st.pred_mode[row - w4..row] } else { modes };
-        let bv = &mut bs_v[row..row + w4];
-        let bh = &mut bs_h[row..row + w4];
-        for x4 in 0..w4 {
-            let e = edges[x4];
-            if modes[x4] == 0 {
-                continue;
-            }
-            // Decide BOTH directions' eligibility first, then derive the q
-            // block's CTB once for whichever of them survives -- `ctb_of`, the
-            // `ctb_filter` lookup and the `deblock_disabled` test are the same
-            // for the two edges of one 4x4 block, and were computed twice.
-            let ve = x4 > 0 && x4 % 2 == 0 && e & 0b0101 != 0 && modes[x4 - 1] != 0;
-            let he = y4 > 0 && y4 % 2 == 0 && e & 0b1010 != 0 && above[x4] != 0;
-            if !(ve || he) {
-                continue;
-            }
-            let cq = st.ctb_of(x4 * 4, y4 * 4);
-            let fq = &st.ctb_filter[cq];
-            if fq.deblock_disabled {
-                continue;
-            }
-            let lfs = fq.lf_across_slices;
-            if ve && edge_allowed(st, pps, st.ctb_of(x4 * 4 - 1, y4 * 4), cq, lfs) {
-                bv[x4] = boundary_strength(st, row + x4 - 1, row + x4, e & 1 != 0);
-            }
-            if he && edge_allowed(st, pps, st.ctb_of(x4 * 4, y4 * 4 - 1), cq, lfs) {
-                bh[x4] = boundary_strength(st, row + x4 - w4, row + x4, e & 2 != 0);
-            }
-        }
-    }
     // One strided pass per direction, luma and chroma together.
     //
     // The scan, not the filtering, was the cost here. Deblocking measured 13.3%
@@ -218,7 +174,7 @@ fn deblock(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, bs_v: &
     // 4x fewer iterations -- with the order within each plane unchanged, and
     // luma and chroma are different planes so interleaving them cannot interact.
     for dir in 0..2 {
-        let bs = if dir == 0 { &*bs_v } else { &*bs_h };
+        let bs = if dir == 0 { &st.bs_v[..] } else { &st.bs_h[..] };
         // Vertical edges live on even columns, horizontal edges on even rows.
         let (ys, ystep, xs, xstep) = if dir == 0 { (0, 1, 2, 2) } else { (2, 2, 0, 1) };
         let mut y4 = ys;
@@ -231,19 +187,30 @@ fn deblock(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, bs_v: &
             // rows) so the same setup serves half as many reads, against a
             // loop body large enough that five more live slice pointers cost
             // real registers.
+            let row_bs = &bs[y4 * w4..y4 * w4 + w4];
             let mut x4 = xs;
             while x4 < w4 {
-                let i = y4 * w4 + x4;
-                let b = bs[i];
+                // Eight strengths at a time while they are all zero. Most of
+                // the map is: edges live on the 8x8 grid and most grid
+                // positions have no edge or `bS == 0`, and this walk visited
+                // every position one byte at a time -- 34.6 M visits a clip
+                // for 4 M filtered segments. `xstep` is 1 or 2 and 8 is a
+                // multiple of both, so the parity of `x4` survives the jump.
+                if x4 + 8 <= w4 && u64::from_ne_bytes(row_bs[x4..x4 + 8].try_into().unwrap()) == 0 {
+                    x4 += 8;
+                    continue;
+                }
+                let b = row_bs[x4];
                 if b == 0 {
                     x4 += xstep;
                     continue;
                 }
+                let i = y4 * w4 + x4;
                 let p = if dir == 0 { i - 1 } else { i - w4 };
                 let f = &st.ctb_filter[st.ctb_of(x4 * 4, y4 * 4)];
-                let qp = (st.qp_y[p] as i32 + st.qp_y[i] as i32 + 1) >> 1;
-                let no_p = st.filter_bypass[p] != 0;
-                let no_q = st.filter_bypass[i] != 0;
+                let qp = (st.cell[p].qp_y as i32 + st.cell[i].qp_y as i32 + 1) >> 1;
+                let no_p = st.cell[p].filter_bypass != 0;
+                let no_q = st.cell[i].filter_bypass != 0;
 
                 let qb = (qp + ((f.beta_offset_div2 as i32) << 1)).clamp(0, 51);
                 let beta = (BETA_TABLE[qb as usize] as i32) << (bd_y - 8);
@@ -357,6 +324,11 @@ fn scalar_sao() -> bool {
     *F.get_or_init(|| std::env::var_os("RH265_SCALAR_SAO").is_some())
 }
 
+/// Diagnostic: how much of each plane the narrowed SAO copy actually touches.
+pub static SAO_COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SAO_PLANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SAO_SPANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// §8.7.3 sample adaptive offset over the deblocked picture.
 ///
 /// The shape here is the same lesson as motion compensation: the per-sample
@@ -372,11 +344,7 @@ fn scalar_sao() -> bool {
 /// - **Neighbour availability.** Only samples on the one-sample ring at the
 ///   edge of a coding tree block can have an unusable neighbour. The interior
 ///   — which is all but `4·cs` of `cs²` samples — needs no check whatsoever.
-/// Diagnostic: how much of each plane the narrowed SAO copy actually touches.
-pub static SAO_COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static SAO_PLANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static SAO_SPANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
+#[inline(never)]
 fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &mut Vec<u16>, has_bypass: bool) {
     crate::prof_scope!(crate::prof::Stage::Sao);
     // Hoisted once per picture: the kernels take a whole rectangle, so they are
@@ -538,7 +506,7 @@ fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &m
                     }
                     for y in y0..y1 {
                         for x in x0..x1 {
-                            if has_bypass && st.filter_bypass[st.idx4(x << ss, y << ss)] != 0 {
+                            if has_bypass && st.cell[st.idx4(x << ss, y << ss)].filter_bypass != 0 {
                                 continue;
                             }
                             let v = src[y * pstride + x] as i32;
@@ -560,6 +528,70 @@ fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &m
                     _ => ((1, -1), (-1, 1)),
                 };
                 let offs = prm.offset;
+                // Which of the eight neighbouring coding tree blocks may this
+                // one read across? §8.7.3.2 is a property of the CTB PAIR --
+                // same slice or the right `lf_across_slices` flag, same tile or
+                // `loop_filter_across_tiles` -- so it is derived once per
+                // neighbour here, not once per ring sample. Measured on the 20 s
+                // 720p clip that was 16.6 M `sao_neighbour_usable` calls (two per
+                // ring sample, 640 M instructions) against 8 per CTB.
+                //
+                // A neighbour outside the picture is recorded as usable: the
+                // picture boundary is a separate rule (no offset at all) and
+                // is applied by the `inside` test or by trimming the rectangle.
+                let lfs = fq.lf_across_slices;
+                let (xl, yl) = (x0 << ss, y0 << ss);
+                let mut usable = [true; 9];
+                let mut all_usable = true;
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let (nrx, nry) = (rx as i32 + dx, ry as i32 + dy);
+                        let exists = nrx >= 0 && nry >= 0 && (nrx as usize) < st.ctb_w && (nry as usize) < st.ctb_h;
+                        let u = !exists || sao_neighbour_usable(st, pps, lfs, xl, yl, (nrx as usize) << st.log2_ctb, (nry as usize) << st.log2_ctb);
+                        usable[((dy + 1) * 3 + (dx + 1)) as usize] = u;
+                        all_usable &= u;
+                    }
+                }
+                if use_kernel && all_usable {
+                    // Every neighbour a sample can have is in this CTB or a
+                    // usable one, so the only unusable neighbours are outside
+                    // the picture. Trim the rectangle by one sample on each side
+                    // the edge pattern reaches past, and the kernel takes the
+                    // whole block -- the ring included. On single-slice content
+                    // without tiles this is every edge-offset CTB.
+                    let tl = (da.0 < 0 || db.0 < 0) && x0 == 0;
+                    let tr = (da.0 > 0 || db.0 > 0) && x1 == pw;
+                    let tt = (da.1 < 0 || db.1 < 0) && y0 == 0;
+                    let tb = (da.1 > 0 || db.1 > 0) && y1 == ph;
+                    let (kx0, kx1) = (x0 + tl as usize, x1 - tr as usize);
+                    let (ky0, ky1) = (y0 + tt as usize, y1 - tb as usize);
+                    if kx0 < kx1 && ky0 < ky1 {
+                        accel::sao::sao_edge(&mut dst.data, src, pstride, kx0, ky0, kx1 - kx0, ky1 - ky0, da, db, &offs, max);
+                    }
+                    continue;
+                }
+                // Which neighbouring CTB a sample at (nx, ny) falls in, as an
+                // index into `usable`.
+                let nb = |nx: i32, ny: i32| -> usize {
+                    let cx = if nx < x0 as i32 {
+                        0
+                    } else if nx >= x1 as i32 {
+                        2
+                    } else {
+                        1
+                    };
+                    let cy = if ny < y0 as i32 {
+                        0
+                    } else if ny >= y1 as i32 {
+                        2
+                    } else {
+                        1
+                    };
+                    cy * 3 + cx
+                };
                 // Interior: every neighbour of every sample here is inside
                 // this same coding tree block, so it is always usable.
                 let ix0 = x0 + 1;
@@ -586,7 +618,7 @@ fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &m
                         let arow = (y as i32 + da.1) as usize * pstride;
                         let brow = (y as i32 + db.1) as usize * pstride;
                         for x in ix0..ix1 {
-                            if has_bypass && st.filter_bypass[st.idx4(x << ss, y << ss)] != 0 {
+                            if has_bypass && st.cell[st.idx4(x << ss, y << ss)].filter_bypass != 0 {
                                 continue;
                             }
                             let v = src[row + x] as i32;
@@ -610,14 +642,11 @@ fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &m
                             x = ix1;
                             continue;
                         }
-                        if !(has_bypass && st.filter_bypass[st.idx4(x << ss, y << ss)] != 0) {
+                        if !(has_bypass && st.cell[st.idx4(x << ss, y << ss)].filter_bypass != 0) {
                             let (ax, ay) = (x as i32 + da.0, y as i32 + da.1);
                             let (bx, by) = (x as i32 + db.0, y as i32 + db.1);
                             let inside = ax >= 0 && ay >= 0 && bx >= 0 && by >= 0 && ax < pw as i32 && ay < ph as i32 && bx < pw as i32 && by < ph as i32;
-                            if inside
-                                && sao_neighbour_usable(st, pps, fq.lf_across_slices, x << ss, y << ss, (ax as usize) << ss, (ay as usize) << ss)
-                                && sao_neighbour_usable(st, pps, fq.lf_across_slices, x << ss, y << ss, (bx as usize) << ss, (by as usize) << ss)
-                            {
+                            if inside && usable[nb(ax, ay)] && usable[nb(bx, by)] {
                                 let v = src[y * pstride + x] as i32;
                                 let a = src[ay as usize * pstride + ax as usize] as i32;
                                 let b = src[by as usize * pstride + bx as usize] as i32;

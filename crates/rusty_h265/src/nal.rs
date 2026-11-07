@@ -251,20 +251,45 @@ pub fn unescape(ebsp: &[u8]) -> Rbsp {
     let mut epb_pos = Vec::new();
     let mut zeros = 0usize;
     let mut i = 0;
-    while i < ebsp.len() {
-        let b = ebsp[i];
-        if zeros >= 2 && b == 0x03 {
-            // §7.4.2: every `00 00 03` carries an emulation_prevention_three_byte
-            // (a conforming encoder never produces `00 00 03 xx` with xx > 3
-            // any other way, and `cabac_zero_words` end a NAL in `00 00 03`).
-            epb_pos.push(i);
-            zeros = 0;
-            i += 1;
-            continue;
+    let len = ebsp.len();
+    while i < len {
+        // An emulation prevention byte can only follow two zero bytes, so a
+        // word with no zero byte in it can be copied whole. The byte loop
+        // below ran on every byte of every NAL -- 20 instructions each, 60 M
+        // on a 20 s clip -- to find the ~0.4% of positions that are zero.
+        if zeros == 0 {
+            let mut j = i;
+            while let Some(w) = ebsp.get(j..j + 8) {
+                let x = u64::from_le_bytes(w.try_into().unwrap());
+                if (x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080) != 0 {
+                    break;
+                }
+                j += 8;
+            }
+            if j > i {
+                out.extend_from_slice(&ebsp[i..j]);
+                i = j;
+                continue;
+            }
         }
-        out.push(b);
-        zeros = if b == 0 { zeros + 1 } else { 0 };
-        i += 1;
+        // Up to one word's worth of bytes, one at a time: this word holds a
+        // zero, or a zero run is carried in from the previous one.
+        let end = (i + 8).min(len);
+        while i < end {
+            let b = ebsp[i];
+            if zeros >= 2 && b == 0x03 {
+                // §7.4.2: every `00 00 03` carries an emulation_prevention_three_byte
+                // (a conforming encoder never produces `00 00 03 xx` with xx > 3
+                // any other way, and `cabac_zero_words` end a NAL in `00 00 03`).
+                epb_pos.push(i);
+                zeros = 0;
+                i += 1;
+                continue;
+            }
+            out.push(b);
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+            i += 1;
+        }
     }
     Rbsp { data: out, epb_pos }
 }
@@ -289,6 +314,22 @@ pub fn split_annex_b(stream: &[u8]) -> Vec<&[u8]> {
     let mut prev: Option<usize> = None;
     let mut i = 0;
     while let Some(w) = stream.get(i..i + 3) {
+        // A start code begins with a zero byte, so a word holding none can be
+        // stepped over whole (see `unescape`).
+        if w[0] != 0 {
+            let mut j = i;
+            while let Some(q) = stream.get(j..j + 8) {
+                let x = u64::from_le_bytes(q.try_into().unwrap());
+                if (x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080) != 0 {
+                    break;
+                }
+                j += 8;
+            }
+            if j > i {
+                i = j;
+                continue;
+            }
+        }
         if w[0] == 0 && w[1] == 0 && w[2] == 1 {
             if let Some(s) = prev {
                 let mut end = i;

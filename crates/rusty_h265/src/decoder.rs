@@ -116,9 +116,6 @@ pub static RECL_FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub struct FilterScratch {
     /// Deblocked samples SAO reads while it writes filtered ones.
     pub sao: Vec<u16>,
-    /// Boundary strengths, per 4x4, one map per direction.
-    pub bs_v: Vec<u8>,
-    pub bs_h: Vec<u8>,
 }
 
 pub struct Decoder {
@@ -519,7 +516,7 @@ impl Decoder {
             let _ = sps_changed;
             let no_output_of_prior_pics = nt.is_cra() || sh.no_output_of_prior_pics;
             if no_output_of_prior_pics {
-                for e in self.dpb.drain(..).collect::<Vec<_>>() {
+                for e in std::mem::take(&mut self.dpb) {
                     self.reclaim(e);
                 }
             } else {
@@ -572,7 +569,9 @@ impl Decoder {
             let (w, h) = (sps.width as usize, sps.height as usize);
             // A pattern guard cannot take `p` by mutable reference, so the
             // reuse attempt happens before the match.
-            let recycled = self.pic_pool.pop().filter(|_| true).and_then(|mut p| {
+            // `Option::filter` lends `&p`; `reuse` needs `&mut p`.
+            #[allow(clippy::manual_filter)]
+            let recycled = self.pic_pool.pop().and_then(|mut p| {
                 if p.reuse(w, h, sps.chroma_format_idc, sps.bit_depth_luma, sps.bit_depth_chroma) {
                     Some(p)
                 } else {
@@ -883,7 +882,7 @@ impl Decoder {
         while self.dpb.iter().any(|e| e.needed_for_output) {
             self.bump();
         }
-        for e in self.dpb.drain(..).collect::<Vec<_>>() {
+        for e in std::mem::take(&mut self.dpb) {
             self.reclaim(e);
         }
     }

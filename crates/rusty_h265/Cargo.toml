@@ -1,6 +1,6 @@
 [package]
 name = "rusty_h265"
-version = "0.6.1"
+version = "0.7.0"
 # Vendored build copy. `rusty_h265` is published from its own repository
 # (github.com/Remade-With-Rust/rusty_h265), which crates.io names as its source;
 # two repositories publishing one crate name is what makes a version

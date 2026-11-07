@@ -34,64 +34,89 @@ impl McScratch {
             pad: vec![0; (MAX_PB + MAX_MARGIN) * (MAX_PB + MAX_MARGIN)],
         }
     }
+}
 
-    /// Copies the `fw × fh` footprint at (`x0`, `y0`) out of `plane` into
-    /// `pad`, extending the edge sample where the footprint leaves the
-    /// picture. Rows are split into a left run, an interior copy and a right
-    /// run, so the clamp costs three decisions per row rather than one per
-    /// sample.
-    pub fn pad_footprint(&mut self, plane: &Plane, x0: i32, y0: i32, fw: usize, fh: usize) {
-        crate::prof_scope!(crate::prof::Stage::Pad);
-        // `pad` is built at the largest footprint HEVC can ask for -- a 64x64
-        // prediction block plus the 7-tap margin, which is exactly
-        // `(64 + 7) * (64 + 7)` -- so this can only ever be a no-op. It is a
-        // `debug_assert` rather than a runtime resize so the release path does
-        // not carry a compare and a call to `Vec::resize` it can never take.
-        // `scratch_holds_the_largest_block` is the test that keeps it true.
-        debug_assert!(self.pad.len() >= fw * fh, "pad footprint {fw}x{fh} exceeds the scratch");
-        let pw = plane.width as i32;
-        let ph = plane.height as i32;
-        let left = (-x0).clamp(0, fw as i32) as usize;
-        let right = ((x0 + fw as i32) - pw).clamp(0, fw as i32) as usize;
-        let mid = fw - left - right;
-        // Rows above the picture all clamp to row 0, and rows below all clamp
-        // to the last one -- so a footprint hanging off an edge asked for the
-        // SAME output row several times over, rebuilding it each time: a clamp,
-        // a copy and up to two fills per repeat. Building it once and
-        // replicating is strictly less work, and blocks at a picture edge are
-        // 12% of motion compensation (`MC_EDGE_PAD` = 31,137 a clip).
-        // The source column range is the same for every row, so it is resolved
-        // once rather than per row.
-        let sx_mid = (x0 + left as i32) as usize;
-        let sx_all = x0.clamp(0, pw - 1) as usize;
-        let last = plane.width - 1;
-        let mut prev_sy = usize::MAX;
-        for y in 0..fh {
-            let sy = (y0 + y as i32).clamp(0, ph - 1) as usize;
-            if sy == prev_sy {
-                // `copy_within` on the flat buffer: the previous row is already
-                // exactly what this one would be.
-                let (a, b) = ((y - 1) * fw, y * fw);
-                self.pad.copy_within(a..a + fw, b);
-                continue;
-            }
-            prev_sy = sy;
-            let rb = sy * plane.stride;
-            let row = &plane.data[rb..rb + plane.width];
-            let out = &mut self.pad[y * fw..y * fw + fw];
-            if mid > 0 {
-                out[left..left + mid].copy_from_slice(&row[sx_mid..sx_mid + mid]);
-                if left > 0 {
-                    out[..left].fill(row[0]);
-                }
-                if right > 0 {
-                    out[left + mid..].fill(row[last]);
-                }
-            } else {
-                // The whole footprint is off one side: one edge sample.
-                out.fill(row[sx_all]);
-            }
+/// Copies the `fw × fh` footprint at (`x0`, `y0`) out of `plane` into `pad`
+/// (see [`McScratch::pad`]). A free function over the buffer rather than a
+/// method, so a caller holding the scratch's other fields by `&mut` can call
+/// it.
+pub(crate) fn pad_footprint(pad: &mut [u16], plane: &Plane, x0: i32, y0: i32, fw: usize, fh: usize) {
+    crate::prof_scope!(crate::prof::Stage::Pad);
+    // `pad` is built at the largest footprint HEVC can ask for -- a 64x64
+    // prediction block plus the 7-tap margin, which is exactly
+    // `(64 + 7) * (64 + 7)` -- so this can only ever be a no-op. It is a
+    // `debug_assert` rather than a runtime resize so the release path does
+    // not carry a compare and a call to `Vec::resize` it can never take.
+    // `scratch_holds_the_largest_block` is the test that keeps it true.
+    debug_assert!(pad.len() >= fw * fh, "pad footprint {fw}x{fh} exceeds the scratch");
+    let pw = plane.width as i32;
+    let ph = plane.height as i32;
+    let left = (-x0).clamp(0, fw as i32) as usize;
+    let right = ((x0 + fw as i32) - pw).clamp(0, fw as i32) as usize;
+    let mid = fw - left - right;
+    // Rows above the picture all clamp to row 0, and rows below all clamp
+    // to the last one -- so a footprint hanging off an edge asked for the
+    // SAME output row several times over, rebuilding it each time: a clamp,
+    // a copy and up to two fills per repeat. Building it once and
+    // replicating is strictly less work, and blocks at a picture edge are
+    // 12% of motion compensation (`MC_EDGE_PAD` = 31,137 a clip).
+    // The source column range is the same for every row, so it is resolved
+    // once rather than per row.
+    let sx_mid = (x0 + left as i32) as usize;
+    let sx_all = x0.clamp(0, pw - 1) as usize;
+    let last = plane.width - 1;
+    let mut prev_sy = usize::MAX;
+    for y in 0..fh {
+        let sy = (y0 + y as i32).clamp(0, ph - 1) as usize;
+        if sy == prev_sy {
+            // The previous row is already exactly what this one would be.
+            let (prev, cur) = pad.split_at_mut(y * fw);
+            copy_run(&mut cur[..fw], &prev[(y - 1) * fw..y * fw]);
+            continue;
         }
+        prev_sy = sy;
+        let rb = sy * plane.stride;
+        let row = &plane.data[rb..rb + plane.width];
+        let out = &mut pad[y * fw..y * fw + fw];
+        if mid > 0 {
+            copy_run(&mut out[left..left + mid], &row[sx_mid..sx_mid + mid]);
+            if left > 0 {
+                out[..left].fill(row[0]);
+            }
+            if right > 0 {
+                out[left + mid..].fill(row[last]);
+            }
+        } else {
+            // The whole footprint is off one side: one edge sample.
+            out.fill(row[sx_all]);
+        }
+    }
+}
+
+/// Copies `src` into `dst` (equal lengths) in eight-sample chunks, the last
+/// one overlapping the one before it.
+///
+/// `copy_from_slice` with a RUNTIME length is a `memcpy` CALL, and these runs
+/// are footprint rows of 11 to 71 samples -- 5.9 M calls on a 20 s clip, one
+/// per padded row. A constant-length copy is one or two vector moves, and
+/// re-copying the overlap is exact because it writes the same bytes. Runs
+/// shorter than a chunk (an almost entirely off-picture footprint) keep the
+/// call.
+#[inline]
+fn copy_run(dst: &mut [u16], src: &[u16]) {
+    let n = dst.len();
+    debug_assert_eq!(n, src.len());
+    if n < 8 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let mut i = 0;
+    while i + 8 <= n {
+        dst[i..i + 8].copy_from_slice(&src[i..i + 8]);
+        i += 8;
+    }
+    if i < n {
+        dst[n - 8..n].copy_from_slice(&src[n - 8..n]);
     }
 }
 
@@ -157,7 +182,7 @@ mod tests {
         for y0 in -9i32..14 {
             for x0 in -9i32..22 {
                 for &(fw, fh) in &[(11usize, 11usize), (5, 7), (1, 1), (12, 3)] {
-                    s.pad_footprint(&p, x0, y0, fw, fh);
+                    pad_footprint(&mut s.pad, &p, x0, y0, fw, fh);
                     for y in 0..fh {
                         for x in 0..fw {
                             let sx = (x0 + x as i32).clamp(0, p.width as i32 - 1) as usize;

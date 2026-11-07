@@ -266,6 +266,12 @@ pub fn inverse_transform(d: &mut [i32], tmp: &mut [i32], n: usize, nz_w: usize, 
             }
             let nz_w = nz_w.clamp(1, n);
             let nz_h = nz_h.clamp(1, n);
+            // One kernel call for the whole block, both passes inside the
+            // feature boundary; the loops below are its scalar twin and the
+            // oracle (`block_kernel_matches_scalar`).
+            if accel::itx::idct_block(d, tmp, n, nz_w, nz_h, bd_shift, kind == TransformKind::Dst, DCT32.as_flattened(), DST4_PAD.as_flattened()) {
+                return;
+            }
             // Stage 1: columns. Only the first `nz_w` can hold anything; the
             // rest of the intermediate stays zero, which the row pass then
             // skips through `nz_w`.
@@ -291,6 +297,98 @@ pub fn inverse_transform(d: &mut [i32], tmp: &mut [i32], n: usize, nz_w: usize, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The accel crate's small `i32` tables are copies of rows of `DCT32` and
+    /// of `DST4`; they must not drift.
+    #[test]
+    fn small_transform_tables_match_dct32() {
+        for k in 0..4 {
+            for j in 0..4 {
+                assert_eq!(accel::itx::DCT4[k][j], DCT32[8 * k][j] as i32, "DCT4[{k}][{j}]");
+                assert_eq!(accel::itx::DST4[k][j], crate::tables::DST4[k][j] as i32, "DST4[{k}][{j}]");
+            }
+        }
+        for k in 0..8 {
+            for j in 0..8 {
+                assert_eq!(accel::itx::DCT8[k][j], DCT32[4 * k][j] as i32, "DCT8[{k}][{j}]");
+            }
+        }
+    }
+
+    /// The block kernels against the scalar two-pass oracle, every size, every
+    /// live rectangle, both kinds, both bit depths -- bit for bit.
+    #[test]
+    fn block_kernel_matches_scalar() {
+        let mut st = 0x7a11_b10cu32;
+        let mut rnd = || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((st >> 8) as i32 % 65536) - 32768
+        };
+        let mut tmp = vec![0i32; 32 * 32];
+        for &n in &[4usize, 8, 16, 32] {
+            for &kind in &[TransformKind::Dct, TransformKind::Dst] {
+                if kind == TransformKind::Dst && n != 4 {
+                    continue;
+                }
+                for &bd in &[8u8, 10] {
+                    for nz_w in 1..=n {
+                        for nz_h in [1usize, 2, n / 2, n] {
+                            let nz_h = nz_h.clamp(1, n);
+                            let mut d = vec![0i32; n * n];
+                            for y in 0..nz_h {
+                                for x in 0..nz_w {
+                                    d[y * n + x] = rnd();
+                                }
+                            }
+                            // Stale data past the live rectangle must not matter
+                            // -- for 8 and up. A 4x4 block is one scan
+                            // sub-block, so the parser clears all of it, and
+                            // the 4x4 kernel relies on that (it reads every
+                            // row); the oracle's input honours the same
+                            // contract.
+                            if n > 4 {
+                                for v in d.iter_mut().skip(nz_h * n) {
+                                    *v = rnd();
+                                }
+                            }
+                            for y in 0..nz_h {
+                                for x in nz_w..n {
+                                    d[y * n + x] = 0;
+                                }
+                            }
+                            let bd_shift = 20 - bd as u32;
+                            let mut want = d.clone();
+                            scalar_two_pass(&mut want, &mut tmp, n, nz_w, nz_h, bd_shift, kind);
+                            let mut got = d.clone();
+                            if !accel::itx::idct_block(&mut got, &mut tmp, n, nz_w, nz_h, bd_shift, kind == TransformKind::Dst, DCT32.as_flattened(), DST4_PAD.as_flattened()) {
+                                continue; // no kernel on this machine
+                            }
+                            assert_eq!(want, got, "n={n} {kind:?} bd={bd} nz=({nz_w},{nz_h})");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The scalar two-pass transform, exactly as `inverse_transform` runs it
+    /// when no kernel applies.
+    fn scalar_two_pass(d: &mut [i32], tmp: &mut [i32], n: usize, nz_w: usize, nz_h: usize, bd_shift: u32, kind: TransformKind) {
+        for x in 0..nz_w {
+            if kind == TransformKind::Dst {
+                idst_1d::<true>(&d[x..], n, &mut tmp[x..], n, nz_h, 7);
+            } else {
+                idct_1d::<true>(&d[x..], n, &mut tmp[x..], n, n, nz_h, 7);
+            }
+        }
+        for y in 0..n {
+            if kind == TransformKind::Dst {
+                idst_1d::<false>(&tmp[y * n..], 1, &mut d[y * n..], 1, nz_w, bd_shift);
+            } else {
+                idct_1d::<false>(&tmp[y * n..], 1, &mut d[y * n..], 1, n, nz_w, bd_shift);
+            }
+        }
+    }
 
     #[test]
     fn dc_only_block_is_flat() {

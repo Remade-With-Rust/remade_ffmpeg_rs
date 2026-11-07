@@ -2310,3 +2310,53 @@ being a performance question. Worth pricing; not worth assuming.
 Every one of those has its scalar twin in the tree as the oracle, and both intra and
 SAO carry an env switch (`RH265_SCALAR_INTRA`, `RH265_SCALAR_SAO`) so the A/B can be
 re-run inside one binary whenever the surrounding shares move.
+
+## The instruction-count campaign — nine veins, 2026-11-06/07
+
+Every number here is a callgrind instruction count (Ir) of the shipping
+configuration — rusty_alloc, AVX2 — built natively under WSL from the same
+sources; same-binary re-runs differ by ~20 K on 5 G. The gate for every row is
+the 147-stream JCT-VC md5 suite plus the kernels' `*_matches_scalar` oracles;
+all rows are bit-exact.
+
+| state (cumulative)                                        | 20 s 720p x265 inter | all-intra `ipred_x24` | `dblk_heavy` |
+|-----------------------------------------------------------|---------------------:|----------------------:|-------------:|
+| baseline                                                  |             25.162 G |              42.237 G |      5.251 G |
+| SAO: whole-CTB kernel when all eight neighbours usable, eight per-CTB flags for the ring, overlapping last vector instead of scalar tails | 22.987 (−8.6%) | 38.676 (−8.4%) | 5.275 |
+| transform: one block kernel per size (both passes inside the feature boundary) | 20.178 (−12.2%) | 32.686 (−15.5%) | 5.203 |
+| transform: dequant at the coefficient write; unrolled 4x4 and broadcast-row 8x8 kernels; deblock/SAO outlined | 19.986 (−1.0%) | 32.261 (−1.3%) | 5.201 |
+| deblocking: boundary strength derived at parse time, `edges` map and both frame scans removed | 18.602 (−6.9%) | 31.631 (−2.0%) | 4.403 (−15.3%) |
+| intra: five block-level availability answers, span gather, span substitution | 18.461 (−0.8%) | 28.235 (−10.7%) | 4.387 |
+| deblocking: zero-run skip in the filter walk, decisions computed inside the kernel from the loaded taps | 17.986 (−2.6%) | 27.762 (−1.7%) | 4.095 (−6.7%) |
+| glue: `isa()` inlined, horizontal tail once per block, constant-width pad copies, word-at-a-time NAL unescape/split | 17.576 (−2.3%) | 27.330 (−1.6%) | 4.062 |
+| MC: `put_uni`/`put_bi` fused into the final filter pass (`mc::Out`) | 17.064 (−2.9%) | 27.330 | 3.910 (−3.7%) |
+| per-4x4 maps packed into one `Cell` record, one fill per coding unit, `any_bypass` flag | **16.614 (−34.0%)** | **26.733 (−36.7%)** | **3.869 (−26.3%)** |
+
+On top of that, the same sources built with `-C target-cpu=x86-64-v3` count
+−3.4% (inter) and −4.5% (intra) fewer instructions; `tools/build-v3.ps1` is
+the artifact. A profile-guided build (`-Cprofile-generate`, the five bench
+streams as training set, `-Cprofile-use`) counts −8.0% (inter) and −13.5%
+(intra) — an upper bound, since the training set is the test set, and not a
+shipping configuration until a representative corpus trains it. Priced and not built: the SAO border-line save (needs the ring
+back; the plane-swap alternative moves 100% of the plane against the band
+copy's ~40%), write-on-decode for the motion map (loses on intra content),
+the dual-plane chroma interpolation and 8-bit sample planes.
+
+Instruments added for this campaign: the WSL callgrind workflow (mini
+workspace, because cargo hangs on the 9p mount), `cgcalls.py` (self Ir, calls,
+edges), `cglines.py` (top source lines), `cgranges.py` (Ir per named source
+range), `cgdiff.py` (per-function diff between two runs).
+
+### Wall clock confirms the count — 2026-11-07
+
+`tools/bench/codec-bench.ps1`, pinned core, self-reported decode time, ABBA,
+both binaries under rusty_alloc. Campaign build against the pre-campaign build
+(306a9ca): 1.37x on the x265 clip, 1.39x on `in_to_tree_720p_8bit`, 1.50x on
+`ipred_x24` (11/11 pairs each); 1.296x / 1.358x / 1.233x / 1.291x on the
+8-bit / 10-bit / `dblk_heavy` / `wp_x10` set (20-21/21 pairs). Against
+FFmpeg 8.1.2 `hevc -threads 1`: 0.82x on the x265 clip and on `ipred_x24`
+(15/15), 0.80x 8-bit, parity on 10-bit and `dblk_heavy` (not verdicts),
+**1.37x faster on `wp_x10`** (20/21, z = 4.15); null arm 1.023x. One ffmpeg
+run collided with a background conformance gate: every millisecond moved, the
+ratios did not (0.80 / 0.99 / 1.02 / 1.37 against the clean 0.80 / 0.94 / 1.02
+/ 1.37), which is the case for paired ratios over per-arm medians.
