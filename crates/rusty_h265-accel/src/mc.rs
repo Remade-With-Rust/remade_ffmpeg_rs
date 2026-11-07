@@ -309,6 +309,133 @@ mod x86 {
         }
     }
 
+    /// Horizontal FIR over TWO 8-wide planes at once -- the chroma pair.
+    ///
+    /// Every operation the horizontal filter uses (`pmaddwd`, the 32-bit
+    /// unpacks, `packssdw`) works inside a 128-bit lane, so a 256-bit vector
+    /// whose low lane is a Cb row and whose high lane is the Cr row filters
+    /// both with the instruction count of one. An 8-wide block was the SSE2
+    /// tail's two four-wide groups per row, per plane; here it is one vector
+    /// step per row for the pair. Row `y` of the output is the joint row
+    /// `[Cb 0..8 | Cr 0..8]` at `dst + 16 * y`, which is exactly what
+    /// [`fir_v_avx2_dual8`] reads.
+    ///
+    /// # Safety
+    /// `sa`/`sb` must each have `stride * (h - 1) + 8 + N - 1` readable `u16`
+    /// at their stride; `dst` needs `16 * h` writable `i16`.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fir_h_avx2_dual8<const N: usize>(sa: *const u16, stra: usize, sb: *const u16, strb: usize, t: &[i16; N], h: usize, shift: u32, dst: *mut i16) {
+        let np = N / 2;
+        let mut taps = [_mm256_setzero_si256(); 4];
+        for k in 0..np {
+            taps[k] = _mm256_set1_epi32(pair(t, k));
+        }
+        let sh = _mm_cvtsi32_si128(shift as i32);
+        for y in 0..h {
+            let ra = unsafe { sa.add(y * stra) };
+            let rb = unsafe { sb.add(y * strb) };
+            let mut even = _mm256_setzero_si256();
+            let mut odd = _mm256_setzero_si256();
+            for k in 0..np {
+                let e = unsafe { _mm256_loadu2_m128i(rb.add(2 * k) as *const __m128i, ra.add(2 * k) as *const __m128i) };
+                even = _mm256_add_epi32(even, _mm256_madd_epi16(e, taps[k]));
+                let o = unsafe { _mm256_loadu2_m128i(rb.add(2 * k + 1) as *const __m128i, ra.add(2 * k + 1) as *const __m128i) };
+                odd = _mm256_add_epi32(odd, _mm256_madd_epi16(o, taps[k]));
+            }
+            even = _mm256_sra_epi32(even, sh);
+            odd = _mm256_sra_epi32(odd, sh);
+            let lo = _mm256_unpacklo_epi32(even, odd);
+            let hi = _mm256_unpackhi_epi32(even, odd);
+            unsafe { _mm256_storeu_si256(dst.add(16 * y) as *mut __m256i, _mm256_packs_epi32(lo, hi)) };
+        }
+    }
+
+    /// The vertical pass over the joint rows [`fir_h_avx2_dual8`] wrote, both
+    /// planes in one vector, each lane written to its own plane.
+    ///
+    /// The vertical arithmetic is lane-local for the same reason as the
+    /// horizontal (16-bit unpacks, `pmaddwd`, `packssdw`), so this is the
+    /// 16-wide loop of [`fir_v_avx2`] at stride 16 with a split write: the low
+    /// lane goes to plane A, the high lane to plane B.
+    ///
+    /// # Safety
+    /// `src` must have `16 * (h + N - 1)` readable `i16`. For `M == 0`,
+    /// `da`/`db` need `8 * h` writable `i16`; otherwise `oa`/`ob` must be
+    /// proven for an 8 x `h` block (as by `resolve_out`) with equal `shift`
+    /// and `max`.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fir_v_avx2_dual8<const N: usize, const M: u8>(src: *const i16, t: &[i16; N], h: usize, shift: u32, da: *mut i16, db: *mut i16, oa: &OutPtr, ob: &OutPtr) {
+        let np = N / 2;
+        let mut taps = [_mm256_setzero_si256(); 4];
+        for k in 0..np {
+            taps[k] = _mm256_set1_epi32(pair(t, k));
+        }
+        let sh = _mm_cvtsi32_si128(shift as i32);
+        // Two output rows per pass, sharing the `N - 1` overlapping loads.
+        let mut y = 0usize;
+        while y + 2 <= h {
+            let mut r = [_mm256_setzero_si256(); 9];
+            for (k, slot) in r.iter_mut().enumerate().take(N + 1) {
+                *slot = unsafe { _mm256_loadu_si256(src.add((y + k) * 16) as *const __m256i) };
+            }
+            let mut lo0 = _mm256_setzero_si256();
+            let mut hi0 = _mm256_setzero_si256();
+            let mut lo1 = _mm256_setzero_si256();
+            let mut hi1 = _mm256_setzero_si256();
+            for k in 0..np {
+                let (a, b, c) = (r[2 * k], r[2 * k + 1], r[2 * k + 2]);
+                lo0 = _mm256_add_epi32(lo0, _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), taps[k]));
+                hi0 = _mm256_add_epi32(hi0, _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), taps[k]));
+                lo1 = _mm256_add_epi32(lo1, _mm256_madd_epi16(_mm256_unpacklo_epi16(b, c), taps[k]));
+                hi1 = _mm256_add_epi32(hi1, _mm256_madd_epi16(_mm256_unpackhi_epi16(b, c), taps[k]));
+            }
+            unsafe {
+                emit_dual8::<M>(_mm256_packs_epi32(_mm256_sra_epi32(lo0, sh), _mm256_sra_epi32(hi0, sh)), da, db, oa, ob, y);
+                emit_dual8::<M>(_mm256_packs_epi32(_mm256_sra_epi32(lo1, sh), _mm256_sra_epi32(hi1, sh)), da, db, oa, ob, y + 1);
+            }
+            y += 2;
+        }
+        if y < h {
+            let mut lo = _mm256_setzero_si256();
+            let mut hi = _mm256_setzero_si256();
+            for k in 0..np {
+                let a = unsafe { _mm256_loadu_si256(src.add((y + 2 * k) * 16) as *const __m256i) };
+                let b = unsafe { _mm256_loadu_si256(src.add((y + 2 * k + 1) * 16) as *const __m256i) };
+                lo = _mm256_add_epi32(lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), taps[k]));
+                hi = _mm256_add_epi32(hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), taps[k]));
+            }
+            unsafe { emit_dual8::<M>(_mm256_packs_epi32(_mm256_sra_epi32(lo, sh), _mm256_sra_epi32(hi, sh)), da, db, oa, ob, y) };
+        }
+    }
+
+    /// Row `y` of the pair: the low lane of `p` is plane A's eight results,
+    /// the high lane plane B's -- the arithmetic of [`emit256`], split.
+    #[inline(always)]
+    unsafe fn emit_dual8<const M: u8>(p: __m256i, da: *mut i16, db: *mut i16, oa: &OutPtr, ob: &OutPtr, y: usize) {
+        unsafe {
+            if M == 0 {
+                _mm_storeu_si128(da.add(8 * y) as *mut __m128i, _mm256_castsi256_si128(p));
+                _mm_storeu_si128(db.add(8 * y) as *mut __m128i, _mm256_extracti128_si256::<1>(p));
+                return;
+            }
+            let off = _mm256_set1_epi16(1i16 << (oa.shift - 1));
+            let maxv = _mm256_set1_epi16(oa.max as i16);
+            let sh = _mm_cvtsi32_si128(oa.shift);
+            let v = if M == 2 {
+                let other = _mm256_loadu2_m128i(ob.other.add(y * ob.other_stride) as *const __m128i, oa.other.add(y * oa.other_stride) as *const __m128i);
+                _mm256_adds_epi16(p, other)
+            } else {
+                p
+            };
+            let v = _mm256_sra_epi16(_mm256_adds_epi16(v, off), sh);
+            let v = _mm256_min_epi16(_mm256_max_epi16(v, _mm256_setzero_si256()), maxv);
+            _mm_storeu_si128(oa.pic.add(y * oa.stride) as *mut __m128i, _mm256_castsi256_si128(v));
+            _mm_storeu_si128(ob.pic.add(y * ob.stride) as *mut __m128i, _mm256_extracti128_si256::<1>(v));
+        }
+    }
+
     /// Two taps packed into the halves of an `i32`, broadcast — the multiplier
     /// for one `pmaddwd`. `t[2k]` lands in the low `i16` lane, `t[2k+1]` in the
     /// high one, matching the operand order `pmaddwd` pairs them in.
@@ -1555,6 +1682,44 @@ fn full_pel(p: McPlan, src: &[u16], stride: usize, m: usize, w: usize, h: usize,
     copy_shift(p, &src[m * stride + m..], stride, w, h, shift3, dst, w);
 }
 
+/// The 2-D arm for an 8-wide PAIR of planes in one pass (see
+/// [`x86::fir_h_avx2_dual8`]). Returns false -- having written nothing --
+/// when it cannot take the pair, and the caller filters the planes one by one.
+#[allow(clippy::too_many_arguments)]
+fn dual8_2d<const N: usize>(p: McPlan, src: &[(&[u16], usize)], th: &[i16; N], tv: &[i16; N], h: usize, shift1: u32, dst: &mut [&mut [i16]], tmp: &mut [i16], mo: &[(u8, Fused)]) -> bool {
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    {
+        let rows = h + N - 1;
+        let [(sa, ta), (sb, tb)] = src else { return false };
+        let [da, db] = dst else { return false };
+        let [(ma, oa), (mb, ob)] = mo else { return false };
+        let fits = |s: &[u16], st: usize| s.len() >= st * (rows - 1) + 8 + N - 1;
+        if p.isa != crate::Isa::Avx2 || ma != mb || !fits(sa, *ta) || !fits(sb, *tb) || tmp.len() < 16 * rows || da.len() < 8 * h || db.len() < 8 * h {
+            return false;
+        }
+        if *ma != 0 && (oa.shift != ob.shift || oa.max != ob.max) {
+            return false;
+        }
+        // SAFETY: every length the kernels read or write is checked above;
+        // the fused pointers were proven for an 8 x h block by `resolve_out`.
+        unsafe {
+            x86::fir_h_avx2_dual8::<N>(sa.as_ptr(), *ta, sb.as_ptr(), *tb, th, rows, shift1, tmp.as_mut_ptr());
+            let (pa, pb) = (da.as_mut_ptr(), db.as_mut_ptr());
+            match ma {
+                0 => x86::fir_v_avx2_dual8::<N, 0>(tmp.as_ptr(), tv, h, 6, pa, pb, oa, ob),
+                1 => x86::fir_v_avx2_dual8::<N, 1>(tmp.as_ptr(), tv, h, 6, pa, pb, oa, ob),
+                _ => x86::fir_v_avx2_dual8::<N, 2>(tmp.as_ptr(), tv, h, 6, pa, pb, oa, ob),
+            }
+        }
+        return true;
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (p, src, th, tv, h, shift1, dst, tmp, mo);
+        false
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn interp<const N: usize, const NF: usize, const P: usize>(
     src: [(&[u16], usize); P],
@@ -1566,7 +1731,7 @@ fn interp<const N: usize, const NF: usize, const P: usize>(
     taps: &[[i16; N]; NF],
     spans: &[(usize, usize); NF],
     syms: &[bool; NF],
-    dst: [&mut [i16]; P],
+    mut dst: [&mut [i16]; P],
     tmp: &mut [i16],
     mut out: [Out<'_>; P],
 ) {
@@ -1708,7 +1873,10 @@ fn interp<const N: usize, const NF: usize, const P: usize>(
             // Planes one after the other through the shared `tmp`: each
             // plane's vertical pass consumes the scratch before the next
             // plane's horizontal pass overwrites it.
-            if lo == 0 {
+            if P == 2 && w == 8 && lo == 0 && dual8_2d::<N>(p, &src, &taps[fx], t, h, shift1, &mut dst, tmp, &mo) {
+                // Both planes, one vector each step: an 8-wide chroma pair.
+                done = [true; P];
+            } else if lo == 0 {
                 for k in 0..P {
                     let (sk, st) = src[k];
                     fir_h::<N>(p, sk, st, &taps[fx], w, rows, shift1, tmp, w, 0, &Fused::NONE);
