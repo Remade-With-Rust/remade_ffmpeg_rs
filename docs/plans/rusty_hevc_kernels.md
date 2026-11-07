@@ -2388,3 +2388,25 @@ reverted.
 Still open: the same lane trick for the H-only / V-only arms and 4-wide
 chroma; `pad_footprint` (575 M Ir, 287 K calls on the x265 clip); 8-bit `u8`
 planes.
+
+### Vein 15 (edge padding) — 2026-11-07
+
+`pad_footprint` was 575 M Ir (3.5%) on the x265 clip once vein 11 moved it out
+of line: 287 K edge footprints, 5.4 M padded rows at ~90 instructions a row.
+91% of those rows overflow horizontally, so replicating rows above/below the
+picture was never the cost (a three-band restructure measured +30 M and was
+reverted).
+
+| state (cumulative)                                                    | 20 s 720p x265 inter | `dblk_heavy` |
+|-----------------------------------------------------------------------|---------------------:|-------------:|
+| after vein 11                                                         |             16.078 G |      3.786 G |
+| row kernel: left splat, span copy, right splat in 8-sample SSE2 stores (each may overrun into what is written next; `PAD_SLACK`) | 15.932 (−0.91%) | 3.740 (−1.20%) |
+| `pad_footprint2`: the Cb/Cr pair in one row loop                      |   15.911 (−0.13%)    | 3.734 (−0.18%) |
+| 16-sample AVX2 stores for the one-plane (luma) pad                    | **15.862 (−0.31%)**  | **3.720 (−0.36%)** |
+
+Vein 15 total: −1.35% inter, −1.74% `dblk_heavy`. The AVX2 store measured
++17 M when it also served chroma (rows too short for the wider store); only
+after the pair moved to `pad_footprint2` did it win on luma alone.
+
+Both veins together, from 0.7.0: **16.614 G -> 15.862 G (−4.53%)** inter,
+**3.869 G -> 3.720 G (−3.85%)** `dblk_heavy`; intra (`ipred_x24`) unchanged.
