@@ -12,8 +12,8 @@ when = "2026-08-09"
 trusted-publisher = "github:taiki-e/portable-atomic"
 
 [[publisher.rusty_alloc]]
-version = "2.2.6"
-when = "2026-10-09"
+version = "2.2.7"
+when = "2026-10-24"
 user-id = 427321
 user-login = "Ttimmahlax"
 user-name = "farmer_timmm"

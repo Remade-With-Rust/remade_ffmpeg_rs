@@ -48,7 +48,7 @@ yanked = "deny"
 # known security issue and no drop-in replacement under our control.
 # Acknowledge it explicitly; revisit if the upstreams migrate off it.
 #
-# The six below ALL originate from `rustls-rustcrypto 0.0.2-alpha` — the pure-Rust
+# The seven below ALL originate from `rustls-rustcrypto 0.0.2-alpha` — the pure-Rust
 # (ring-free) crypto provider behind the *opt-in, experimental* HTTPS input stack.
 # It is present only under `--all-features` (never in the default build), is the
 # LATEST published version, and pins the affected transitive crates, so there is no
@@ -63,6 +63,15 @@ yanked = "deny"
 #     to verify certificates). The 0.102.8 copy is only `rustls-rustcrypto`'s,
 #     and it uses nothing from it but the `alg_id` constants -- never path
 #     building -- so the vulnerable code is linked but not reachable.
+#   * RUSTSEC-2026-0387 -- crypto-bigint 0.5.5 timing variability in operations
+#     meant to be constant-time. Reached via p256/ecdsa/elliptic-curve from
+#     rustls-rustcrypto, which pins it (no fixed 0.5.x exists). Unlike the
+#     webpki ones this IS reachable in principle: P-256 ECDHE in a TLS
+#     handshake runs on an ephemeral secret, so a network timing attacker could
+#     in theory probe it. Accepted on the same terms as RSA "Marvin" above:
+#     opt-in experimental HTTPS input only, ephemeral keys, no long-term secret
+#     handled; never in the default build or the published binaries' default
+#     features. TRACK with the provider replacement.
 # Accepted ONLY for the experimental HTTPS feature. TRACK: update/replace
 # `rustls-rustcrypto` (or swap the crypto provider) to clear these.
 ignore = [
@@ -73,6 +82,7 @@ ignore = [
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
     "RUSTSEC-2026-0382",
+    "RUSTSEC-2026-0387",
 ]
 
 [sources]

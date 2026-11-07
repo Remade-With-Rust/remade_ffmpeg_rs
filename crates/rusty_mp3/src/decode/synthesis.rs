@@ -108,7 +108,7 @@ fn half_dct_t() -> &'static [[f32; 32]; 16] {
 /// Caller must have verified AVX is available.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
-unsafe fn matrixing_avx(s: &[f32; SUBBANDS]) -> [f32; 64] {
+unsafe fn matrixing_avx(s: &[f32; SUBBANDS], dst: &mut [f32; 64]) {
     use std::arch::x86_64::*;
     let ct = half_dct_t();
     let mut plus = [0f32; 16];
@@ -132,12 +132,64 @@ unsafe fn matrixing_avx(s: &[f32; SUBBANDS]) -> [f32; 64] {
             }
         }
     }
-    let mut g = [0f32; 32];
-    for (v, accv) in acc.iter().enumerate() {
-        // SAFETY: `g` is `[f32; 32]`; `v * 8 + 8 <= 32` for `v < 4`.
-        unsafe { _mm256_storeu_ps(g.as_mut_ptr().add(v * 8), *accv) };
+    // SAFETY: AVX per this fn's contract.
+    unsafe { expand_g_avx(&acc, dst) };
+}
+
+/// **D14** — [`expand_g`] in registers: the 32 `G[m]` (four accumulators,
+/// `G[8v..8v + 8]` in `acc[v]`) become the 64 `V` values by reversal, a
+/// one-lane shift and sign flips, stored as eight full vectors.
+///
+/// Pure data movement: every output is one `G[m]`, `-G[m]` (an XOR of the sign
+/// bit -- exactly what f32 negation is) or the `+0.0` of `V[16]`, the same as
+/// the scalar map. What it replaces cost far more than its 64 moves: the scalar
+/// map stored `V` one float at a time, and the next readers (the by-value
+/// return, the FIFO copy, the window's loads of the newest slot) read it back
+/// eight floats at a time, which the core cannot forward from eight separate
+/// stores -- each such load waited for the stores to retire. Measured as a
+/// ceiling probe (map stubbed out) it was ~25% of the whole decode.
+/// Pinned by `expand_g_avx_matches_scalar`.
+///
+/// # Safety
+/// Caller must have verified AVX is available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn expand_g_avx(acc: &[std::arch::x86_64::__m256; 4], dst: &mut [f32; 64]) {
+    use std::arch::x86_64::*;
+    // SAFETY: register-only operations; AVX per this fn's contract. The stores
+    // write `dst[8t..8t + 8]` for `t < 8`, inside the `[f32; 64]`.
+    unsafe {
+        let sign = _mm256_set1_ps(-0.0);
+        let zero = _mm256_setzero_ps();
+        // Reverse eight lanes: within each 128-bit half, then swap the halves.
+        let rev = |x: __m256| {
+            let r = _mm256_permute_ps(x, 0x1B);
+            _mm256_permute2f128_ps(r, r, 0x01)
+        };
+        // `[p7, x0, x1, .. x6]`: x moved up one lane, p's top lane shifted in.
+        let shift1 = |x: __m256, p: __m256| {
+            let t = _mm256_permute2f128_ps(x, p, 0x03); // [p.hi, x.lo]
+            let rx = _mm256_permute_ps(x, 0x93); // per half [x3, x0, x1, x2]
+            let rt = _mm256_permute_ps(t, 0x93); // per half lane 0 = t[3]
+            _mm256_blend_ps(rx, rt, 0x11)
+        };
+        // N[v] = -reverse(G[8v..8v + 8]).
+        let n: [__m256; 4] = [
+            _mm256_xor_ps(rev(acc[0]), sign),
+            _mm256_xor_ps(rev(acc[1]), sign),
+            _mm256_xor_ps(rev(acc[2]), sign),
+            _mm256_xor_ps(rev(acc[3]), sign),
+        ];
+        let d = dst.as_mut_ptr();
+        _mm256_storeu_ps(d, acc[2]); // V[0..8]   = G[16..24]
+        _mm256_storeu_ps(d.add(8), acc[3]); // V[8..16]  = G[24..32]
+        _mm256_storeu_ps(d.add(16), shift1(n[3], zero)); // [+0, -G31 .. -G25]
+        _mm256_storeu_ps(d.add(24), shift1(n[2], n[3])); // [-G24 .. -G17]
+        _mm256_storeu_ps(d.add(32), shift1(n[1], n[2])); // [-G16 .. -G9]
+        _mm256_storeu_ps(d.add(40), shift1(n[0], n[1])); // [-G8 .. -G1]
+        _mm256_storeu_ps(d.add(48), _mm256_xor_ps(acc[0], sign)); // -G[0..8]
+        _mm256_storeu_ps(d.add(56), _mm256_xor_ps(acc[1], sign)); // -G[8..16]
     }
-    expand_g(&g)
 }
 
 /// NEON twin of [`matrixing_avx`], 4 of the 32 `G[m]` per lane. Each 4-lane
@@ -180,19 +232,21 @@ unsafe fn matrixing_neon(s: &[f32; SUBBANDS]) -> [f32; 64] {
 /// # Safety
 /// Caller must have checked [`super::isa::simd_available`].
 #[inline]
-unsafe fn matrixing_simd(s: &[f32; SUBBANDS]) -> [f32; 64] {
+unsafe fn matrixing_simd(s: &[f32; SUBBANDS], dst: &mut [f32; 64]) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
     unsafe {
-        matrixing_avx(s)
+        matrixing_avx(s, dst);
     }
     #[cfg(target_arch = "aarch64")]
     // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
     unsafe {
-        matrixing_neon(s)
+        *dst = matrixing_neon(s);
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    matrixing_fast(s)
+    {
+        *dst = matrixing_fast(s);
+    }
 }
 
 /// Map the 32 distinct DCT outputs onto the 64 `V` values by sign and index
@@ -443,13 +497,15 @@ fn polyphase_impl(
         }
         // Advance V by 64 and matrix the new 64 values into the front.
         head = (head + 1024 - 64) & 1023;
-        let vv = if simd {
+        let slot: &mut [f32; 64] = (&mut fifo[head..head + 64])
+            .try_into()
+            .expect("head is a multiple of 64 below 1024");
+        if simd {
             // SAFETY: `simd` came from `use_simd()` above.
-            unsafe { matrixing_simd(&s) }
+            unsafe { matrixing_simd(&s, slot) };
         } else {
-            matrixing_fast(&s)
-        };
-        fifo[head..head + 64].copy_from_slice(&vv);
+            *slot = matrixing_fast(&s);
+        }
         // Build U from V, window with D, sum 16 taps → one PCM sample per j.
         //
         // `i` outer, `j` inner: each of the four operands is then a CONTIGUOUS
@@ -477,9 +533,286 @@ fn polyphase_impl(
     pcm
 }
 
+/// **D12** — the synthesis filterbank for BOTH channels of a stereo granule at
+/// once, writing interleaved PCM (`out[2 * n + ch]`).
+///
+/// Per channel this is exactly [`polyphase`]: the same passes, the same
+/// matrixing and windowing sums in the same order. What changes is that the
+/// two channels' passes run side by side in one AVX kernel, so each step keeps
+/// eight independent accumulators live instead of four (the 16-deep add chains
+/// were the bound), the shared cosine and window rows are loaded once for both
+/// channels, and the interleave is two register shuffles per eight samples
+/// instead of a separate pass over the granule. Pinned by
+/// `polyphase_stereo_matches_two_mono_passes`.
+pub fn polyphase_stereo(
+    time: [&[f32; GRANULE_LINES]; 2],
+    fifo: [&mut [f32; 1024]; 2],
+    out: &mut [f32; 2 * GRANULE_LINES],
+) {
+    let simd = super::isa::use_simd();
+    #[cfg(target_arch = "x86_64")]
+    if simd {
+        super::prof::kernel_tally(&super::prof::K_SYNTH_SIMD, 2 * SUBBAND_LINES as u64);
+        // SAFETY: on x86_64 `use_simd()` is true only when AVX was detected.
+        unsafe { polyphase_stereo_avx(time, fifo, out) };
+        return;
+    }
+    // Elsewhere: two mono passes and an interleave (NEON keeps its kernels).
+    let [f0, f1] = fifo;
+    let a = polyphase(time[0], f0);
+    let b = polyphase(time[1], f1);
+    for ((o, &l), &r) in out.chunks_exact_mut(2).zip(&a).zip(&b) {
+        o[0] = l;
+        o[1] = r;
+    }
+}
+
+/// The AVX body of [`polyphase_stereo`].
+///
+/// # Safety
+/// AVX must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn polyphase_stereo_avx(
+    time: [&[f32; GRANULE_LINES]; 2],
+    fifo: [&mut [f32; 1024]; 2],
+    out: &mut [f32; 2 * GRANULE_LINES],
+) {
+    let [f0, f1] = fifo;
+    let d = &SYNTH_D;
+    // See `polyphase_impl` (D2): circular FIFO, both channels advance together.
+    let mut head = 0usize;
+    for v in 0..SUBBAND_LINES {
+        let mut s0 = [0f32; SUBBANDS];
+        let mut s1 = [0f32; SUBBANDS];
+        for k in 0..SUBBANDS {
+            s0[k] = time[0][k * SUBBAND_LINES + v];
+            s1[k] = time[1][k * SUBBAND_LINES + v];
+        }
+        head = (head + 1024 - 64) & 1023;
+        let d0: &mut [f32; 64] = (&mut f0[head..head + 64])
+            .try_into()
+            .expect("64-aligned slot");
+        let d1: &mut [f32; 64] = (&mut f1[head..head + 64])
+            .try_into()
+            .expect("64-aligned slot");
+        // SAFETY: AVX per this fn's contract.
+        unsafe { matrixing2_avx(&s0, &s1, d0, d1) };
+        let o: &mut [f32; 64] = out[v * 64..]
+            .first_chunk_mut()
+            .expect("granule is 18 blocks of 2 x 32");
+        // SAFETY: AVX per this fn's contract; `head` is a multiple of 64.
+        unsafe { window2_avx(f0, f1, d, head, o) };
+    }
+    f0.rotate_left(head);
+    f1.rotate_left(head);
+}
+
+/// [`matrixing_avx`] for two channels in one pass: per channel the identical
+/// lane-wise sums (same `k` order, separate mul and add), with the cosine rows
+/// loaded once for both.
+///
+/// # Safety
+/// Caller must have verified AVX is available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn matrixing2_avx(
+    s0: &[f32; SUBBANDS],
+    s1: &[f32; SUBBANDS],
+    d0: &mut [f32; 64],
+    d1: &mut [f32; 64],
+) {
+    use std::arch::x86_64::*;
+    let ct = half_dct_t();
+    let (mut p0, mut m0, mut p1, mut m1) = ([0f32; 16], [0f32; 16], [0f32; 16], [0f32; 16]);
+    for k in 0..16 {
+        p0[k] = s0[k] + s0[31 - k];
+        m0[k] = s0[k] - s0[31 - k];
+        p1[k] = s1[k] + s1[31 - k];
+        m1[k] = s1[k] - s1[31 - k];
+    }
+    // SAFETY: a register constant -- no memory access; the ISA is this fn's contract. Redundant from Rust 1.86 (safe target-feature calls), required at the crate's MSRV (1.85).
+    #[allow(unused_unsafe)]
+    let (mut a0, mut a1) = unsafe { ([_mm256_setzero_ps(); 4], [_mm256_setzero_ps(); 4]) };
+    for k in 0..16 {
+        // SAFETY: `ct[k]` is `[f32; 32]` (`half_dct_t`); `v * 8 + 8 <= 32` for `v < 4`.
+        unsafe {
+            // Even lanes take the sum-folded input, odd lanes the difference.
+            let x0 = _mm256_blend_ps(_mm256_set1_ps(p0[k]), _mm256_set1_ps(m0[k]), 0xAA);
+            let x1 = _mm256_blend_ps(_mm256_set1_ps(p1[k]), _mm256_set1_ps(m1[k]), 0xAA);
+            for v in 0..4 {
+                let c = _mm256_loadu_ps(ct[k].as_ptr().add(v * 8));
+                a0[v] = _mm256_add_ps(a0[v], _mm256_mul_ps(c, x0));
+                a1[v] = _mm256_add_ps(a1[v], _mm256_mul_ps(c, x1));
+            }
+        }
+    }
+    // SAFETY: AVX per this fn's contract.
+    unsafe {
+        expand_g_avx(&a0, d0);
+        expand_g_avx(&a1, d1);
+    }
+}
+
+/// [`window_avx`] for two channels, writing the 2 x 32 outputs interleaved:
+/// per channel the identical 16-tap sums (`i` ascending, `a` before `b`,
+/// separate mul and add), with the window rows loaded once for both.
+///
+/// # Safety
+/// Caller must have verified AVX is available. Bounds are local, as in
+/// [`window_avx`] (`head` is masked to a multiple of 64).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn window2_avx(
+    f0: &[f32; 1024],
+    f1: &[f32; 1024],
+    d: &[f32; 512],
+    head: usize,
+    out: &mut [f32; 64],
+) {
+    use std::arch::x86_64::*;
+    let head = head & !63;
+    // SAFETY: a register constant -- no memory access; the ISA is this fn's contract. Redundant from Rust 1.86 (safe target-feature calls), required at the crate's MSRV (1.85).
+    #[allow(unused_unsafe)]
+    let (mut a0, mut a1) = unsafe { ([_mm256_setzero_ps(); 4], [_mm256_setzero_ps(); 4]) };
+    for i in 0..8 {
+        // The offsets and masks of `window_avx` (`a <= 960`, `b <= 992`).
+        let a = (head + i * 128) & 0x3C0;
+        let b = (head + i * 128 + 96) & 1023;
+        for v in 0..4 {
+            // SAFETY: as in `window_avx`: both 32-float spans end inside each FIFO (1024), and the `d` offsets reach at most 512, its length.
+            unsafe {
+                let da = _mm256_loadu_ps(d.as_ptr().add(i * 64 + v * 8));
+                let db = _mm256_loadu_ps(d.as_ptr().add(i * 64 + 32 + v * 8));
+                let fa0 = _mm256_loadu_ps(f0.as_ptr().add(a + v * 8));
+                let fa1 = _mm256_loadu_ps(f1.as_ptr().add(a + v * 8));
+                a0[v] = _mm256_add_ps(a0[v], _mm256_mul_ps(fa0, da));
+                a1[v] = _mm256_add_ps(a1[v], _mm256_mul_ps(fa1, da));
+                let fb0 = _mm256_loadu_ps(f0.as_ptr().add(b + v * 8));
+                let fb1 = _mm256_loadu_ps(f1.as_ptr().add(b + v * 8));
+                a0[v] = _mm256_add_ps(a0[v], _mm256_mul_ps(fb0, db));
+                a1[v] = _mm256_add_ps(a1[v], _mm256_mul_ps(fb1, db));
+            }
+        }
+    }
+    for v in 0..4 {
+        // Interleave L/R: [l0 r0 l1 r1 .. l7 r7] for this lane group of eight.
+        // SAFETY: `out` is `[f32; 64]`; `v * 16 + 16 <= 64` for `v < 4`.
+        unsafe {
+            let lo = _mm256_unpacklo_ps(a0[v], a1[v]);
+            let hi = _mm256_unpackhi_ps(a0[v], a1[v]);
+            _mm256_storeu_ps(
+                out.as_mut_ptr().add(v * 16),
+                _mm256_permute2f128_ps(lo, hi, 0x20),
+            );
+            _mm256_storeu_ps(
+                out.as_mut_ptr().add(v * 16 + 8),
+                _mm256_permute2f128_ps(lo, hi, 0x31),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **D14 gate.** The register expand is BIT-identical to the scalar
+    /// `expand_g` -- every lane, signed zeros, infinities and NaN payloads
+    /// included (negation must be a pure sign flip).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn expand_g_avx_matches_scalar() {
+        if !have_simd() {
+            eprintln!("no SIMD twin on this host - scalar path only, gate skipped");
+            return;
+        }
+        let mut st = 0x510E_527Fu32;
+        for trial in 0..512 {
+            let mut g = [0f32; 32];
+            for (m, x) in g.iter_mut().enumerate() {
+                st ^= st << 13;
+                st ^= st >> 17;
+                st ^= st << 5;
+                *x = match (st >> 28) & 7 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => f32::from_bits(0x7FC0_0000 | (st & 0x3F_FFFF)),
+                    3 => f32::NEG_INFINITY,
+                    _ => (st >> 8) as f32 / (1u32 << 24) as f32 - 0.5 + m as f32,
+                };
+            }
+            let want = expand_g(&g);
+            let mut got = [0f32; 64];
+            // SAFETY: gated on `have_simd()` above; loads are from `g` (32 floats).
+            unsafe {
+                use std::arch::x86_64::*;
+                let acc = [
+                    _mm256_loadu_ps(g.as_ptr()),
+                    _mm256_loadu_ps(g.as_ptr().add(8)),
+                    _mm256_loadu_ps(g.as_ptr().add(16)),
+                    _mm256_loadu_ps(g.as_ptr().add(24)),
+                ];
+                expand_g_avx(&acc, &mut got);
+            }
+            for i in 0..64 {
+                assert_eq!(got[i].to_bits(), want[i].to_bits(), "V[{i}] trial {trial}");
+            }
+        }
+    }
+
+    /// **D12 gate.** The two-channel synthesis is BIT-identical to two mono
+    /// passes on the scalar oracle, interleaved -- over consecutive granules (the
+    /// FIFOs carry), with signed zeros and silent subbands in the input.
+    #[test]
+    fn polyphase_stereo_matches_two_mono_passes() {
+        let mut st = 0x6A09_E667u32;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        let (mut fa0, mut fa1) = ([0f32; 1024], [0f32; 1024]);
+        let (mut fb0, mut fb1) = ([0f32; 1024], [0f32; 1024]);
+        for g in 0..40 {
+            let mut t = [[0f32; GRANULE_LINES]; 2];
+            for (c, tc) in t.iter_mut().enumerate() {
+                for (i, x) in tc.iter_mut().enumerate() {
+                    let r = next();
+                    *x = if (i / 18 + c + g) % 7 == 0 || r % 11 == 0 {
+                        if r & 1 == 0 {
+                            0.0
+                        } else {
+                            -0.0
+                        }
+                    } else {
+                        (r >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+                    };
+                }
+            }
+            let mut got = [0f32; 2 * GRANULE_LINES];
+            polyphase_stereo([&t[0], &t[1]], [&mut fa0, &mut fa1], &mut got);
+            let l = polyphase_impl(&t[0], &mut fb0, false);
+            let r = polyphase_impl(&t[1], &mut fb1, false);
+            for n in 0..GRANULE_LINES {
+                assert_eq!(got[2 * n].to_bits(), l[n].to_bits(), "L[{n}] granule {g}");
+                assert_eq!(
+                    got[2 * n + 1].to_bits(),
+                    r[n].to_bits(),
+                    "R[{n}] granule {g}"
+                );
+            }
+            assert!(fa0
+                .iter()
+                .zip(&fb0)
+                .all(|(x, y)| x.to_bits() == y.to_bits()));
+            assert!(fa1
+                .iter()
+                .zip(&fb1)
+                .all(|(x, y)| x.to_bits() == y.to_bits()));
+        }
+    }
 
     /// **D5 gate.** The AVX matrixing must be BIT-identical to the scalar
     /// `matrixing_fast`. It can be, because `m` is the lane: each of the 32
@@ -504,7 +837,8 @@ mod tests {
             }
             let a = matrixing_fast(&s);
             // SAFETY: gated on `have_simd()` above.
-            let b = unsafe { matrixing_simd(&s) };
+            let mut b = [0f32; 64];
+            unsafe { matrixing_simd(&s, &mut b) };
             assert_eq!(a, b, "matrixing SIMD/scalar mismatch on trial {trial}");
         }
     }

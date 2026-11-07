@@ -140,6 +140,11 @@ pub fn serialize_scalefactors(
 ///
 /// `frame_count` and `byte_count` describe the whole file *including* this frame.
 /// `vbr` selects the `Xing` tag (variable bitrate) over `Info` (constant).
+///
+/// No longer used by [`crate::Mp3Encoder`], which writes the gapless LAME-style
+/// tag of [`super::lametag::tag_frame`] instead: readers count the frames
+/// *after* the tag frame, and without the LAME extension's delay/padding they
+/// cannot trim the stream (issue #69). Kept for API compatibility.
 #[must_use]
 pub fn info_frame(header: &FrameHeader, frame_count: u32, byte_count: u32, vbr: bool) -> Vec<u8> {
     let mut out = header.to_bytes().to_vec();

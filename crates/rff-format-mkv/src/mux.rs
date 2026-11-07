@@ -37,9 +37,10 @@ use rff_format::{Muxer, Output, SeekOutput, Stream};
 
 use crate::{
     ID_AUDIO, ID_BIT_DEPTH, ID_BLOCK, ID_BLOCK_DURATION, ID_BLOCK_GROUP, ID_CHANNELS, ID_CLUSTER,
-    ID_CODEC_ID, ID_CODEC_PRIVATE, ID_CUES, ID_DURATION, ID_INFO, ID_PIXEL_HEIGHT, ID_PIXEL_WIDTH,
-    ID_SAMPLING_FREQUENCY, ID_SEGMENT, ID_SIMPLE_BLOCK, ID_TIMESTAMP, ID_TIMESTAMP_SCALE,
-    ID_TRACKS, ID_TRACK_ENTRY, ID_TRACK_NUMBER, ID_TRACK_TYPE, ID_VIDEO,
+    ID_CODEC_ID, ID_CODEC_PRIVATE, ID_CUES, ID_DISCARD_PADDING, ID_DURATION, ID_INFO,
+    ID_PIXEL_HEIGHT, ID_PIXEL_WIDTH, ID_SAMPLING_FREQUENCY, ID_SEGMENT, ID_SIMPLE_BLOCK,
+    ID_TIMESTAMP, ID_TIMESTAMP_SCALE, ID_TRACKS, ID_TRACK_ENTRY, ID_TRACK_NUMBER, ID_TRACK_TYPE,
+    ID_VIDEO,
 };
 
 // ---- EBML element IDs used only by the muxer ------------------------------
@@ -104,6 +105,16 @@ fn uint_body(v: u64) -> Vec<u8> {
 
 fn put_uint(out: &mut Vec<u8>, id: u32, v: u64) {
     put_elem(out, id, &uint_body(v));
+}
+
+/// Signed element (big-endian two's complement, minimal length) for a
+/// non-negative value: a leading zero byte keeps the sign bit clear.
+fn put_positive_int(out: &mut Vec<u8>, id: u32, v: u64) {
+    let mut body = uint_body(v);
+    if body[0] & 0x80 != 0 {
+        body.insert(0, 0);
+    }
+    put_elem(out, id, &body);
 }
 
 /// Unsigned element padded to exactly 8 bytes — used where the value is patched
@@ -233,8 +244,14 @@ struct TrackPlan {
 struct BufBlock {
     track: usize,
     ts_ms: i64,
+    /// The packet's DTS in ms, when it has one: the in-memory muxer orders
+    /// blocks by decode time (see [`decode_keys`]).
+    dts_ms: Option<i64>,
     duration_ms: i64,
     keyframe: bool,
+    /// Matroska `DiscardPadding` in ns (0 = none): the packet's
+    /// [`Packet::discard_padding`] samples at the track's rate.
+    discard_ns: u64,
     data: Vec<u8>,
 }
 
@@ -472,9 +489,12 @@ fn starts_cluster(cluster_ts: Option<i64>, ts_ms: i64, video_keyframe: bool) -> 
 }
 
 /// Serialize one block around its payload: the bytes before the frame data
-/// and the bytes after it (a BlockGroup's BlockDuration). Subtitles need a
-/// duration, so they get BlockGroup { Block, BlockDuration }; everything else
-/// is a SimpleBlock carrying the keyframe flag.
+/// and the bytes after it (a BlockGroup's BlockDuration / DiscardPadding).
+/// Subtitles need a duration, so they get BlockGroup { Block, BlockDuration };
+/// an audio block with end padding (a stream's last, from an encoder or a
+/// Matroska/WebM source) gets BlockGroup { Block, DiscardPadding }, as
+/// FFmpeg's muxer writes it; everything else is a SimpleBlock carrying the
+/// keyframe flag.
 fn block_parts(b: &BufBlock, rel: i16, is_sub: bool) -> (Vec<u8>, Vec<u8>) {
     // Block header: track vint + relative i16 + flags.
     let mut hdr = Vec::with_capacity(4);
@@ -483,9 +503,14 @@ fn block_parts(b: &BufBlock, rel: i16, is_sub: bool) -> (Vec<u8>, Vec<u8>) {
     let block_len = (hdr.len() + 1 + b.data.len()) as u64;
     let mut head = Vec::with_capacity(32);
     let mut tail = Vec::new();
-    if is_sub {
+    if is_sub || b.discard_ns > 0 {
         hdr.push(0x00);
-        put_uint(&mut tail, ID_BLOCK_DURATION, b.duration_ms.max(0) as u64);
+        if is_sub {
+            put_uint(&mut tail, ID_BLOCK_DURATION, b.duration_ms.max(0) as u64);
+        }
+        if b.discard_ns > 0 {
+            put_positive_int(&mut tail, ID_DISCARD_PADDING, b.discard_ns);
+        }
         let group_len = id_len(ID_BLOCK) + size_len(block_len) + block_len + tail.len() as u64;
         put_id(&mut head, ID_BLOCK_GROUP);
         put_size(&mut head, group_len);
@@ -585,14 +610,61 @@ fn prepare_block(tracks: &mut [TrackPlan], packet: &Packet) -> Result<Option<Buf
 
     let tb = plan.stream.time_base;
     let audio = plan.stream.media_type == MediaType::Audio;
+    let rate = plan.stream.sample_rate as u64;
+    // Samples → ns, rounded to nearest (FFmpeg's matroskaenc rescale); the
+    // demuxer's rounding back recovers the sample count exactly.
+    let discard_ns = match packet.discard_padding as u64 {
+        pad if audio && pad > 0 && rate > 0 => (pad * 1_000_000_000 + rate / 2) / rate,
+        _ => 0,
+    };
     Ok(Some(BufBlock {
         track: idx,
         ts_ms: to_ms(tb, packet.pts.or(packet.dts).unwrap_or(0)),
+        dts_ms: packet.dts.map(|d| to_ms(tb, d)),
         duration_ms: to_ms(tb, packet.duration.max(0)),
         // Audio frames are all random-access; trust the flag on video.
         keyframe: audio || packet.flags.keyframe,
+        discard_ns,
         data,
     }))
+}
+
+/// Each block's decode time in ms, for ordering the in-memory muxer's blocks
+/// the way the streaming muxer writes them: in decode order.
+///
+/// Per track, that is the packets' DTS when every packet has one and they never
+/// go backwards. Otherwise (Matroska input stores no DTS) it is derived as
+/// FFmpeg's demux layer derives it: the sorted timestamps, delayed by the
+/// reorder depth, assigned in arrival order. In-order timestamps give back
+/// exactly themselves, so a stream without reordering keeps its old order.
+fn decode_keys(blocks: &[BufBlock], tracks: usize) -> Vec<i64> {
+    let mut keys = vec![0i64; blocks.len()];
+    for t in 0..tracks {
+        let mine: Vec<usize> = (0..blocks.len())
+            .filter(|&i| blocks[i].track == t)
+            .collect();
+        let dts: Option<Vec<i64>> = mine.iter().map(|&i| blocks[i].dts_ms).collect();
+        if let Some(dts) = dts.filter(|d| d.windows(2).all(|w| w[1] >= w[0])) {
+            for (&i, d) in mine.iter().zip(dts) {
+                keys[i] = d;
+            }
+            continue;
+        }
+        let ts: Vec<i64> = mine.iter().map(|&i| blocks[i].ts_ms).collect();
+        let mut sorted = ts.clone();
+        sorted.sort_unstable();
+        let delay = sorted
+            .iter()
+            .zip(&ts)
+            .map(|(s, t)| s - t)
+            .max()
+            .unwrap_or(0)
+            .max(0);
+        for (&i, s) in mine.iter().zip(sorted) {
+            keys[i] = s - delay;
+        }
+    }
+    keys
 }
 
 // ---- The in-memory muxer (non-seekable outputs) ---------------------------
@@ -675,8 +747,13 @@ impl Muxer for MkvMuxer {
             }
         }
 
-        // --- Clusters: stable-sort by timestamp, roll on keyframes/5 s ---
-        self.blocks.sort_by_key(|b| b.ts_ms);
+        // --- Clusters: stable-sort by decode time, roll on keyframes/5 s ---
+        // Decode order, not presentation order: a B-frame stream sorted by
+        // pts puts each B-frame ahead of the reference it predicts from (#60).
+        let keys = decode_keys(&self.blocks, self.tracks.len());
+        let mut keyed: Vec<(i64, BufBlock)> = keys.into_iter().zip(self.blocks.drain(..)).collect();
+        keyed.sort_by_key(|(key, _)| *key);
+        self.blocks = keyed.into_iter().map(|(_, b)| b).collect();
         let is_video: Vec<bool> = self
             .tracks
             .iter()
@@ -1693,8 +1770,10 @@ mod tests {
         let big = BufBlock {
             track: 0,
             ts_ms: 0,
+            dts_ms: None,
             duration_ms: 40,
             keyframe: true,
+            discard_ns: 0,
             data: vec![0u8; 512 << 20],
         };
         for _ in 0..10 {
@@ -1718,5 +1797,48 @@ mod tests {
         let (id, size, _) = elem_at(&sink, w.segment + w.clusters[0]);
         assert_eq!(id, ID_CLUSTER);
         assert!(size > 5 << 30 && size < (5 << 30) + 4096, "{size}");
+    }
+
+    fn timed_block(track: usize, ts_ms: i64, dts_ms: Option<i64>) -> BufBlock {
+        BufBlock {
+            track,
+            ts_ms,
+            dts_ms,
+            duration_ms: 40,
+            keyframe: false,
+            discard_ns: 0,
+            data: Vec::new(),
+        }
+    }
+
+    /// #60: the in-memory muxer orders blocks by decode time, so B-frames
+    /// keep their arrival (decode) order instead of being sorted by pts.
+    #[test]
+    fn decode_keys_keep_b_frames_in_decode_order() {
+        // Video without DTS (a Matroska source), audio in order.
+        let blocks = [
+            timed_block(0, 0, None),
+            timed_block(1, 0, None),
+            timed_block(0, 80, None),
+            timed_block(0, 40, None),
+            timed_block(1, 20, None),
+            timed_block(0, 160, None),
+            timed_block(0, 120, None),
+        ];
+        let keys = decode_keys(&blocks, 2);
+        // video: sorted pts 0,40,80,120,160 delayed by 40; audio unchanged.
+        assert_eq!(keys, [-40, 0, 0, 40, 20, 80, 120]);
+        let video: Vec<i64> = (0..blocks.len())
+            .filter(|&i| blocks[i].track == 0)
+            .map(|i| keys[i])
+            .collect();
+        assert!(video.windows(2).all(|w| w[0] <= w[1]));
+        // With DTS, the DTS are the keys.
+        let blocks = [
+            timed_block(0, 0, Some(-80)),
+            timed_block(0, 160, Some(-40)),
+            timed_block(0, 80, Some(0)),
+        ];
+        assert_eq!(decode_keys(&blocks, 1), [-80, -40, 0]);
     }
 }

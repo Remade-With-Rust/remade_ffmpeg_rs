@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 
 use crate::bitio::BitReader;
 use crate::crc::{crc16, crc8};
+use crate::prof::{self, Ctr, Stage};
 
 /// Parsed STREAMINFO.
 #[derive(Debug, Clone, Default)]
@@ -61,9 +62,89 @@ pub struct Decoder<'a> {
     data: &'a [u8],
     /// Byte offset of the next frame's first byte.
     pos: usize,
+    core: FrameDecoder,
+}
+
+/// Decodes FLAC frames handed over one at a time — e.g. the packets a
+/// demuxer cuts — given the stream's STREAMINFO. It owns its per-channel
+/// scratch, so one `FrameDecoder` serves a whole stream without
+/// re-allocating, and nothing needs the `fLaC` header in front of a frame.
+/// Same checks as [`Decoder`]: header CRC-8, frame CRC-16, channel count.
+pub struct FrameDecoder {
     info: StreamInfo,
     /// Scratch: per-channel decode buffers (channel-assignment domain).
     scratch: Vec<Vec<i32>>,
+}
+
+impl StreamInfo {
+    /// Parse a STREAMINFO metadata block body (its 34 bytes, without the
+    /// 4-byte block header). Longer input is fine; shorter is
+    /// [`DecodeError::Truncated`].
+    pub fn parse(block: &[u8]) -> Result<StreamInfo, DecodeError> {
+        if block.len() < 34 {
+            return Err(DecodeError::Truncated);
+        }
+        Ok(parse_streaminfo(&block[..34]))
+    }
+}
+
+impl FrameDecoder {
+    /// A decoder for frames of the stream `info` describes (1..=8 channels).
+    pub fn new(info: StreamInfo) -> Result<FrameDecoder, DecodeError> {
+        if info.channels == 0 || info.channels > 8 {
+            return Err(DecodeError::Inconsistent("channels"));
+        }
+        let scratch = vec![Vec::new(); info.channels as usize];
+        Ok(FrameDecoder { info, scratch })
+    }
+
+    pub fn streaminfo(&self) -> &StreamInfo {
+        &self.info
+    }
+
+    /// Decode the frame at the start of `data` into `out` (planar, APPENDED
+    /// per channel, as [`Decoder::next_frame`]). Returns `(block size, bytes
+    /// the frame occupied)`; bytes after it are not looked at.
+    pub fn decode_frame(
+        &mut self,
+        data: &[u8],
+        out: &mut [Vec<i32>],
+    ) -> Result<(usize, usize), DecodeError> {
+        let _frame_scope = prof::scope(Stage::Frame);
+        let (bs, ch_assign, used) = self.decode_coded(data)?;
+        self.emit_planar(bs, ch_assign, out);
+        Ok((bs, used))
+    }
+
+    /// Decode the frame at the start of `data` and APPEND it to `out`
+    /// interleaved and converted to `S`, as
+    /// [`Decoder::next_frame_interleaved`]. Returns `(block size, bytes the
+    /// frame occupied)`; on an error `out` is left as it was.
+    pub fn decode_frame_interleaved<S: Sample>(
+        &mut self,
+        data: &[u8],
+        out: &mut Vec<S>,
+    ) -> Result<(usize, usize), DecodeError> {
+        let _frame_scope = prof::scope(Stage::Frame);
+        let scale = S::scale(self.info.bits_per_sample)?;
+        let (bs, ch_assign, used) = self.decode_coded(data)?;
+        let _out_scope = prof::scope(Stage::Output);
+        write_interleaved(&self.scratch, bs, ch_assign, scale, out);
+        Ok((bs, used))
+    }
+
+    /// Stereo reconstruction in the scratch, then append it to `out`.
+    fn emit_planar(&mut self, bs: usize, ch_assign: u32, out: &mut [Vec<i32>]) {
+        let decorr_scope = prof::scope(Stage::Decorr);
+        if let [a, b] = &mut self.scratch[..] {
+            decorrelate(ch_assign, &mut a[..bs], &mut b[..bs]);
+        }
+        drop(decorr_scope);
+        let _out_scope = prof::scope(Stage::Output);
+        for (o, s) in out.iter_mut().zip(&self.scratch) {
+            o.extend_from_slice(&s[..bs]);
+        }
+    }
 }
 
 impl<'a> Decoder<'a> {
@@ -100,31 +181,77 @@ impl<'a> Decoder<'a> {
             }
         }
         let info = info.ok_or(DecodeError::NotFlac)?;
-        if info.channels == 0 || info.channels > 8 {
-            return Err(DecodeError::Inconsistent("channels"));
-        }
-        let scratch = vec![Vec::new(); info.channels as usize];
-        Ok(Decoder {
-            data,
-            pos,
-            info,
-            scratch,
-        })
+        let core = FrameDecoder::new(info)?;
+        Ok(Decoder { data, pos, core })
     }
 
     pub fn streaminfo(&self) -> &StreamInfo {
-        &self.info
+        &self.core.info
     }
 
     /// Decode the next frame into `out` (planar, one Vec per channel; each
     /// channel's samples are APPENDED). Returns the frame's block size, or
     /// `None` at end of stream.
     pub fn next_frame(&mut self, out: &mut [Vec<i32>]) -> Result<Option<usize>, DecodeError> {
+        let _frame_scope = prof::scope(Stage::Frame);
+        let Some((bs, ch_assign)) = self.decode_frame()? else {
+            return Ok(None);
+        };
+        self.core.emit_planar(bs, ch_assign, out);
+        Ok(Some(bs))
+    }
+
+    /// Decode the next frame and APPEND it to `out` interleaved (frame by
+    /// frame, channels in stream order), converted to `S`:
+    ///
+    /// - `i32`: the native-width sample values (what [`Decoder::next_frame`]
+    ///   gives, interleaved);
+    /// - `f32`: normalised to [-1, 1) as `sample / 2^(bits_per_sample - 1)`
+    ///   (exact for up to 24-bit streams);
+    /// - `i16`: streams of at most 16 bits, scaled up to the 16-bit grid
+    ///   (`sample << (16 - bits_per_sample)`); a wider stream is an
+    ///   [`DecodeError::Inconsistent`] error before anything is decoded.
+    ///
+    /// Stereo decorrelation, interleaving and the conversion are one pass
+    /// over the decoded channels, so this is the cheapest way to interleaved
+    /// PCM. Returns the frame's block size, or `None` at end of stream; on an
+    /// error `out` is left as it was.
+    pub fn next_frame_interleaved<S: Sample>(
+        &mut self,
+        out: &mut Vec<S>,
+    ) -> Result<Option<usize>, DecodeError> {
+        let _frame_scope = prof::scope(Stage::Frame);
+        let scale = S::scale(self.core.info.bits_per_sample)?;
+        let Some((bs, ch_assign)) = self.decode_frame()? else {
+            return Ok(None);
+        };
+        let _out_scope = prof::scope(Stage::Output);
+        write_interleaved(&self.core.scratch, bs, ch_assign, scale, out);
+        Ok(Some(bs))
+    }
+
+    /// Decode the next frame into the core's scratch (coded channel
+    /// domain). Returns `(block size, channel assignment)`, or `None` at end
+    /// of stream. `pos` advances only past a frame that decoded cleanly.
+    fn decode_frame(&mut self) -> Result<Option<(usize, u32)>, DecodeError> {
         if self.pos >= self.data.len() {
             return Ok(None);
         }
-        let frame_start = self.pos;
-        let mut br = BitReader::new(&self.data[frame_start..]);
+        let (bs, ch_assign, used) = self.core.decode_coded(&self.data[self.pos..])?;
+        self.pos += used;
+        Ok(Some((bs, ch_assign)))
+    }
+}
+
+impl FrameDecoder {
+    /// Parse and decode the frame at the start of `data` into `scratch`
+    /// (coded channel domain: a stereo pair is still in its coded
+    /// assignment), verifying both CRCs. Returns `(block size, channel
+    /// assignment, bytes the frame occupied)`.
+    fn decode_coded(&mut self, data: &[u8]) -> Result<(usize, u32, usize), DecodeError> {
+        prof::count(Ctr::Frames, 1);
+        let hdr_scope = prof::scope(Stage::Header);
+        let mut br = BitReader::new(data);
 
         // --- frame header ---
         let sync = br.read_bits(14).ok_or(DecodeError::Truncated)?;
@@ -177,7 +304,7 @@ impl<'a> Decoder<'a> {
         debug_assert!(br.is_byte_aligned());
         let hdr_len = br.byte_pos();
         let hcrc = br.read_bits(8).ok_or(DecodeError::Truncated)? as u8;
-        if crc8(&self.data[frame_start..frame_start + hdr_len]) != hcrc {
+        if crc8(&data[..hdr_len]) != hcrc {
             return Err(DecodeError::BadFrameHeader("crc8"));
         }
 
@@ -192,6 +319,16 @@ impl<'a> Decoder<'a> {
         if nch != self.info.channels as usize {
             return Err(DecodeError::Inconsistent("frame channels"));
         }
+        drop(hdr_scope);
+        prof::count(
+            match ch_assign {
+                8 => Ctr::LeftSide,
+                9 => Ctr::SideRight,
+                10 => Ctr::MidSide,
+                _ => Ctr::Independent,
+            },
+            1,
+        );
 
         // --- subframes ---
         for (c, buf) in self.scratch.iter_mut().take(nch).enumerate() {
@@ -208,48 +345,186 @@ impl<'a> Decoder<'a> {
         }
 
         // --- footer ---
+        let crc_scope = prof::scope(Stage::Crc16);
         br.align_to_byte();
         let frame_len = br.byte_pos();
         let fcrc = br.read_bits(16).ok_or(DecodeError::Truncated)? as u16;
-        if crc16(&self.data[frame_start..frame_start + frame_len]) != fcrc {
+        prof::count(Ctr::CrcBytes, frame_len as u64);
+        if crc16(&data[..frame_len]) != fcrc {
             return Err(DecodeError::BadFrameCrc);
         }
-        self.pos = frame_start + frame_len + 2;
+        drop(crc_scope);
+        Ok((bs, ch_assign, frame_len + 2))
+    }
+}
 
-        // --- stereo reconstruction into out ---
-        match ch_assign {
-            8 => {
-                // left/side: R = L - side
-                let (l, s) = self.scratch.split_at_mut(1);
-                for i in 0..bs {
-                    let lv = l[0][i];
-                    let sv = s[0][i];
-                    s[0][i] = lv.wrapping_sub(sv);
-                }
-            }
-            9 => {
-                // side/right: L = side + R
-                let (s, r) = self.scratch.split_at_mut(1);
-                for i in 0..bs {
-                    s[0][i] = s[0][i].wrapping_add(r[0][i]);
-                }
-            }
-            10 => {
-                // mid/side: mid = (L+R)>>1 was stored; reconstruct exactly.
-                let (m, s) = self.scratch.split_at_mut(1);
-                for i in 0..bs {
-                    let mid = ((m[0][i] as i64) << 1) | ((s[0][i] as i64) & 1);
-                    let side = s[0][i] as i64;
-                    m[0][i] = ((mid + side) >> 1) as i32;
-                    s[0][i] = ((mid - side) >> 1) as i32;
-                }
-            }
-            _ => {}
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for i32 {}
+    impl Sealed for f32 {}
+    impl Sealed for i16 {}
+}
+
+/// Per-stream conversion parameters for a [`Sample`] type.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct Scale {
+    /// `1 / 2^(bps - 1)` (f32 output).
+    inv: f32,
+    /// `16 - bps` (i16 output).
+    up: u32,
+}
+
+/// Output sample types for [`Decoder::next_frame_interleaved`]: `i32`
+/// (native width), `f32` (normalised) and `i16` (streams of at most 16
+/// bits). Sealed: the conversions belong to this crate.
+pub trait Sample: Copy + Default + sealed::Sealed {
+    #[doc(hidden)]
+    fn scale(bits_per_sample: u32) -> Result<Scale, DecodeError>;
+    #[doc(hidden)]
+    fn from_native(v: i32, s: Scale) -> Self;
+}
+
+fn base_scale(bps: u32) -> Scale {
+    Scale {
+        inv: 1.0 / (1u64 << (bps.clamp(1, 32) - 1)) as f32,
+        up: 16u32.saturating_sub(bps),
+    }
+}
+
+impl Sample for i32 {
+    fn scale(bps: u32) -> Result<Scale, DecodeError> {
+        Ok(base_scale(bps))
+    }
+    #[inline(always)]
+    fn from_native(v: i32, _: Scale) -> i32 {
+        v
+    }
+}
+
+impl Sample for f32 {
+    fn scale(bps: u32) -> Result<Scale, DecodeError> {
+        Ok(base_scale(bps))
+    }
+    #[inline(always)]
+    fn from_native(v: i32, s: Scale) -> f32 {
+        v as f32 * s.inv
+    }
+}
+
+impl Sample for i16 {
+    fn scale(bps: u32) -> Result<Scale, DecodeError> {
+        if bps > 16 {
+            return Err(DecodeError::Inconsistent(
+                "i16 output needs a stream of at most 16 bits per sample",
+            ));
         }
-        for (o, s) in out.iter_mut().zip(&self.scratch) {
-            o.extend_from_slice(s);
+        Ok(base_scale(bps))
+    }
+    #[inline(always)]
+    fn from_native(v: i32, s: Scale) -> i16 {
+        (v << s.up) as i16
+    }
+}
+
+/// Decorrelate (stereo), interleave and convert one decoded block from the
+/// coded-channel scratch onto the end of `out`, in one pass.
+fn write_interleaved<S: Sample>(
+    chans: &[Vec<i32>],
+    bs: usize,
+    ch_assign: u32,
+    scale: Scale,
+    out: &mut Vec<S>,
+) {
+    let nch = chans.len();
+    let start = out.len();
+    // The fill is the block's size (cache-resident when the caller reuses
+    // `out` per frame); every slot is then overwritten.
+    out.resize(start + bs * nch, S::default());
+    let dst = &mut out[start..];
+    let cv = |v: i32| S::from_native(v, scale);
+    match chans {
+        [m] => {
+            for (d, &v) in dst.iter_mut().zip(&m[..bs]) {
+                *d = cv(v);
+            }
         }
-        Ok(Some(bs))
+        [a, b] => {
+            let pairs = dst.chunks_exact_mut(2).zip(a[..bs].iter().zip(&b[..bs]));
+            match ch_assign {
+                8 => {
+                    // left/side: R = L - side
+                    for (d, (&l, &s)) in pairs {
+                        d[0] = cv(l);
+                        d[1] = cv(l.wrapping_sub(s));
+                    }
+                }
+                9 => {
+                    // side/right: L = side + R
+                    for (d, (&s, &r)) in pairs {
+                        d[0] = cv(s.wrapping_add(r));
+                        d[1] = cv(r);
+                    }
+                }
+                10 => {
+                    // mid/side (the exact i32 form: see `decorrelate`)
+                    for (d, (&m, &s)) in pairs {
+                        let r = m.wrapping_sub(s >> 1);
+                        d[0] = cv(r.wrapping_add(s));
+                        d[1] = cv(r);
+                    }
+                }
+                _ => {
+                    for (d, (&l, &r)) in pairs {
+                        d[0] = cv(l);
+                        d[1] = cv(r);
+                    }
+                }
+            }
+        }
+        _ => {
+            for (c, ch) in chans.iter().enumerate() {
+                for (d, &v) in dst[c..].iter_mut().step_by(nch).zip(&ch[..bs]) {
+                    *d = cv(v);
+                }
+            }
+        }
+    }
+}
+
+/// Undo a stereo channel assignment in place: `a`/`b` hold the coded
+/// channel pair (left/side, side/right, mid/side) and come out as
+/// left/right. Independent channels (`ch_assign` 0..=7) are untouched.
+///
+/// Mid/side in `i32`: with `mid = 2m + (s & 1)`, exactly
+/// `(mid + s) >> 1 == m + (s >> 1) + (s & 1)` and
+/// `(mid - s) >> 1 == m - (s >> 1)`, so `R = m - (s >> 1)` and `L = R + s`,
+/// wrapping, equal the `i64` textbook form truncated to 32 bits for every
+/// input (`decorrelate_ref` in the tests). That keeps the lanes 32-bit, so
+/// the loops vectorize 4-wide.
+fn decorrelate(ch_assign: u32, a: &mut [i32], b: &mut [i32]) {
+    match ch_assign {
+        8 => {
+            // left/side: R = L - side
+            for (l, s) in a.iter().zip(b.iter_mut()) {
+                *s = l.wrapping_sub(*s);
+            }
+        }
+        9 => {
+            // side/right: L = side + R
+            for (s, r) in a.iter_mut().zip(b.iter()) {
+                *s = s.wrapping_add(*r);
+            }
+        }
+        10 => {
+            // mid/side
+            for (m, s) in a.iter_mut().zip(b.iter_mut()) {
+                let r = m.wrapping_sub(*s >> 1);
+                *m = r.wrapping_add(*s);
+                *s = r;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -312,6 +587,8 @@ fn decode_subframe(
     out: &mut [i32],
 ) -> Result<(), DecodeError> {
     debug_assert_eq!(out.len(), bs);
+    prof::count(Ctr::Subframes, 1);
+    let hdr_scope = prof::scope(Stage::SubHeader);
     if br.read_bits(1).ok_or(DecodeError::Truncated)? != 0 {
         return Err(DecodeError::BadSubframe("padding bit"));
     }
@@ -328,10 +605,16 @@ fn decode_subframe(
 
     match ty {
         0b000000 => {
+            drop(hdr_scope);
+            let _s = prof::scope(Stage::Misc);
+            prof::count(Ctr::Constant, 1);
             let v = br.read_signed(ebps).ok_or(DecodeError::Truncated)?;
             out.fill(v);
         }
         0b000001 => {
+            drop(hdr_scope);
+            let _s = prof::scope(Stage::Misc);
+            prof::count(Ctr::Verbatim, 1);
             for slot in out.iter_mut() {
                 *slot = br.read_signed(ebps).ok_or(DecodeError::Truncated)?;
             }
@@ -344,7 +627,10 @@ fn decode_subframe(
             for slot in out[..order].iter_mut() {
                 *slot = br.read_signed(ebps).ok_or(DecodeError::Truncated)?;
             }
+            drop(hdr_scope);
+            prof::count(Ctr::FixedSub, 1);
             decode_residual(br, bs, order, out)?;
+            let _s = prof::scope(Stage::Fixed);
             restore_fixed(out, order);
         }
         0b100000..=0b111111 => {
@@ -367,13 +653,29 @@ fn decode_subframe(
             for q in qlp.iter_mut().take(order) {
                 *q = br.read_signed(prec).ok_or(DecodeError::Truncated)?;
             }
+            drop(hdr_scope);
+            prof::count(Ctr::LpcSub, 1);
+            prof::count(Ctr::LpcOrderSum, order as u64);
+            prof::count(Ctr::LpcHighOrder, u64::from(order > 12));
+            // Accumulator bound: |sum| < 2^(ebps-1) * 2^(prec-1) * order.
+            let acc_bits = ebps + prec + (usize::BITS - (order - 1).leading_zeros());
+            prof::count(
+                if acc_bits <= 32 {
+                    Ctr::LpcSamples32
+                } else {
+                    Ctr::LpcSamples64
+                },
+                (bs - order) as u64,
+            );
             decode_residual(br, bs, order, out)?;
+            let _s = prof::scope(Stage::Lpc);
             restore_lpc(out, &qlp[..order], shift as u32);
         }
         _ => return Err(DecodeError::BadSubframe("reserved type")),
     }
 
     if wasted > 0 {
+        let _s = prof::scope(Stage::Misc);
         for v in out.iter_mut() {
             *v <<= wasted;
         }
@@ -391,6 +693,8 @@ fn decode_residual(
     order: usize,
     out: &mut [i32],
 ) -> Result<(), DecodeError> {
+    let _s = prof::scope(Stage::Residual);
+    prof::count(Ctr::Residuals, (bs - order) as u64);
     let method = br.read_bits(2).ok_or(DecodeError::Truncated)?;
     let (pbits, escape) = match method {
         0 => (4u32, 15u32),
@@ -409,7 +713,9 @@ fn decode_residual(
     for part in 0..n_part {
         let cnt = if part == 0 { psize - order } else { psize };
         let param = br.read_bits(pbits).ok_or(DecodeError::Truncated)?;
+        prof::count(Ctr::Partitions, 1);
         if param == escape {
+            prof::count(Ctr::EscapePartitions, 1);
             let raw = br.read_bits(5).ok_or(DecodeError::Truncated)?;
             if raw > 0 {
                 for slot in &mut out[w..w + cnt] {
@@ -420,10 +726,8 @@ fn decode_residual(
             }
             w += cnt;
         } else {
-            for slot in &mut out[w..w + cnt] {
-                let u = br.read_rice(param).ok_or(DecodeError::Truncated)?;
-                *slot = ((u >> 1) as i32) ^ -((u & 1) as i32); // un-zigzag
-            }
+            br.read_rice_signed_run(param, &mut out[w..w + cnt])
+                .ok_or(DecodeError::Truncated)?;
             w += cnt;
         }
     }
@@ -433,36 +737,52 @@ fn decode_residual(
 
 /// Invert the fixed polynomial predictors in place (samples after warm-up are
 /// residuals on entry, samples on exit).
+///
+/// The predictor state (the last `order` samples) rides in registers, so a
+/// sample's only dependency on the one before it is a scaled add — not a
+/// store-to-load round trip through `buf`. Wrapping `i32` arithmetic is
+/// exact mod 2^32 in any order, so this equals the textbook form bit for
+/// bit (`restore_fixed_ref` in the tests).
 fn restore_fixed(buf: &mut [i32], order: usize) {
+    let (warm, rest) = buf.split_at_mut(order);
     match order {
         0 => {}
         1 => {
-            for i in 1..buf.len() {
-                buf[i] = buf[i].wrapping_add(buf[i - 1]);
+            let mut p1 = warm[0];
+            for x in rest {
+                p1 = x.wrapping_add(p1);
+                *x = p1;
             }
         }
         2 => {
-            for i in 2..buf.len() {
-                buf[i] = buf[i]
-                    .wrapping_add(buf[i - 1].wrapping_mul(2))
-                    .wrapping_sub(buf[i - 2]);
+            let (mut p2, mut p1) = (warm[0], warm[1]);
+            for x in rest {
+                let v = x.wrapping_add(p1.wrapping_mul(2)).wrapping_sub(p2);
+                *x = v;
+                (p2, p1) = (p1, v);
             }
         }
         3 => {
-            for i in 3..buf.len() {
-                buf[i] = buf[i]
-                    .wrapping_add(buf[i - 1].wrapping_mul(3))
-                    .wrapping_sub(buf[i - 2].wrapping_mul(3))
-                    .wrapping_add(buf[i - 3]);
+            let (mut p3, mut p2, mut p1) = (warm[0], warm[1], warm[2]);
+            for x in rest {
+                let v = x
+                    .wrapping_add(p3)
+                    .wrapping_sub(p2.wrapping_mul(3))
+                    .wrapping_add(p1.wrapping_mul(3));
+                *x = v;
+                (p3, p2, p1) = (p2, p1, v);
             }
         }
         4 => {
-            for i in 4..buf.len() {
-                buf[i] = buf[i]
-                    .wrapping_add(buf[i - 1].wrapping_mul(4))
-                    .wrapping_sub(buf[i - 2].wrapping_mul(6))
-                    .wrapping_add(buf[i - 3].wrapping_mul(4))
-                    .wrapping_sub(buf[i - 4]);
+            let (mut p4, mut p3, mut p2, mut p1) = (warm[0], warm[1], warm[2], warm[3]);
+            for x in rest {
+                let v = x
+                    .wrapping_sub(p4)
+                    .wrapping_add(p3.wrapping_mul(4))
+                    .wrapping_sub(p2.wrapping_mul(6))
+                    .wrapping_add(p1.wrapping_mul(4));
+                *x = v;
+                (p4, p3, p2, p1) = (p3, p2, p1, v);
             }
         }
         _ => unreachable!(),
@@ -471,8 +791,84 @@ fn restore_fixed(buf: &mut [i32], order: usize) {
 
 /// Invert the LPC predictor in place. The recurrence is inherently serial,
 /// but const-order specializations let the compiler keep the whole predictor
-/// state in registers for the common orders.
+/// state in registers for the common orders. On x86-64 with AVX2, orders
+/// 5..=12 go to [`restore_lpc_avx2`].
 fn restore_lpc(buf: &mut [i32], qlp: &[i32], shift: u32) {
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    if (5..=12).contains(&qlp.len()) && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the CPU supports the feature the kernel was compiled for.
+        return unsafe { restore_lpc_avx2(buf, qlp, shift) };
+    }
+    restore_lpc_scalar(buf, qlp, shift)
+}
+
+/// LPC restore for orders 5..=12 with the taps split by age.
+///
+/// The scalar loop issues `order` 64-bit multiplies per sample (one port),
+/// and its newest-sample term is also the recurrence, so the loop sits at
+/// both bounds at once. Here the four newest samples ride in general
+/// registers (four scalar multiplies, the newest added last), and the taps
+/// of lags 5..=12 run on a register-resident 8 x i32 window of older
+/// samples: two `vpmuldq` (signed 32 x 32 -> 64, even and odd lanes) and a
+/// horizontal add. The window takes in a sample four iterations after it
+/// was produced, so the vector side has that long to finish and stays off
+/// the recurrence; it is never re-read from `buf`, so there is no
+/// store-to-load forwarding hazard. Coefficients past `order` are zero.
+///
+/// Exact: every product and the sum are exact in i64 (|qlp| < 2^15,
+/// |sample| < 2^32, at most 12 taps), so the order of the adds cannot change
+/// the result; `restore_lpc_matches_reference` checks it bit for bit.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn restore_lpc_avx2(buf: &mut [i32], qlp: &[i32], shift: u32) {
+    use core::arch::x86_64::*;
+    let order = qlp.len();
+    debug_assert!((5..=12).contains(&order) && buf.len() >= order);
+    let c = |j: usize| qlp.get(j).map_or(0i64, |&v| v as i64);
+    let (c0, c1, c2, c3) = (c(0), c(1), c(2), c(3));
+    // Window lane j holds the sample of lag 5 + j (lane 0 the most recent);
+    // `vpmuldq` reads the low dword of each qword, so the even lanes'
+    // coefficients sit in `ce` and the odd lanes' (after a 32-bit shift of
+    // the window) in `co`.
+    let ce = _mm256_set_epi64x(c(10), c(8), c(6), c(4));
+    let co = _mm256_set_epi64x(c(11), c(9), c(7), c(5));
+    let up = _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6);
+    let mut init = [0i32; 8];
+    for (j, w) in init.iter_mut().enumerate() {
+        // lag 5 + j relative to the first restored sample `order`
+        if let Some(k) = order.checked_sub(5 + j) {
+            *w = buf[k];
+        }
+    }
+    // SAFETY: `init` is 8 readable i32s.
+    let mut win = unsafe { _mm256_loadu_si256(init.as_ptr() as *const __m256i) };
+    let (mut h0, mut h1, mut h2, mut h3) = (
+        buf[order - 1] as i64,
+        buf[order - 2] as i64,
+        buf[order - 3] as i64,
+        buf[order - 4] as i64,
+    );
+    for slot in &mut buf[order..] {
+        let p = _mm256_add_epi64(
+            _mm256_mul_epi32(win, ce),
+            _mm256_mul_epi32(_mm256_srli_epi64::<32>(win), co),
+        );
+        let t = _mm_add_epi64(_mm256_castsi256_si128(p), _mm256_extracti128_si256::<1>(p));
+        let old = _mm_cvtsi128_si64(_mm_add_epi64(t, _mm_unpackhi_epi64(t, t)));
+        let sum = old + c3 * h3 + c2 * h2 + c1 * h1 + c0 * h0;
+        let x = slot.wrapping_add((sum >> shift) as i32);
+        *slot = x;
+        // Next sample's window: lags shift by one, the lag-4 sample enters.
+        win = _mm256_blend_epi32::<1>(
+            _mm256_permutevar8x32_epi32(win, up),
+            _mm256_set1_epi32(h3 as i32),
+        );
+        (h3, h2, h1, h0) = (h2, h1, h0, x as i64);
+    }
+}
+
+/// The portable LPC restore (and the AVX2 kernel's fallback).
+fn restore_lpc_scalar(buf: &mut [i32], qlp: &[i32], shift: u32) {
     #[inline(always)]
     fn run<const ORDER: usize>(buf: &mut [i32], qlp: &[i32], shift: u32) {
         let mut coeffs = [0i32; 32];
@@ -574,6 +970,287 @@ mod tests {
             c = (c + 1) % ch;
         }
         assert_eq!(ours, theirs);
+    }
+
+    /// The original fixed restore (every sample reloaded from `buf`): the
+    /// oracle for the register-carried loops.
+    fn restore_fixed_ref(buf: &mut [i32], order: usize) {
+        for i in order..buf.len() {
+            let p = |k: usize| buf[i - k];
+            let pred = match order {
+                0 => 0,
+                1 => p(1),
+                2 => p(1).wrapping_mul(2).wrapping_sub(p(2)),
+                3 => p(1)
+                    .wrapping_mul(3)
+                    .wrapping_sub(p(2).wrapping_mul(3))
+                    .wrapping_add(p(3)),
+                _ => p(1)
+                    .wrapping_mul(4)
+                    .wrapping_sub(p(2).wrapping_mul(6))
+                    .wrapping_add(p(3).wrapping_mul(4))
+                    .wrapping_sub(p(4)),
+            };
+            buf[i] = buf[i].wrapping_add(pred);
+        }
+    }
+
+    /// Orders 0..=4, lengths from exactly `order` up, small and wrapping
+    /// (full-range) values: the register-carried restore matches the oracle.
+    #[test]
+    fn restore_fixed_matches_reference() {
+        let mut x = 0xDEAD_BEEF_0BAD_F00Du64;
+        let mut rnd = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 32) as u32
+        };
+        for order in 0..=4usize {
+            for trial in 0..40 {
+                let n = order + (rnd() % 200) as usize;
+                let buf: Vec<i32> = (0..n)
+                    .map(|_| {
+                        if trial % 3 == 0 {
+                            rnd() as i32
+                        } else {
+                            rnd() as i32 >> 16
+                        }
+                    })
+                    .collect();
+                let (mut a, mut b) = (buf.clone(), buf);
+                restore_fixed(&mut a, order);
+                restore_fixed_ref(&mut b, order);
+                assert_eq!(a, b, "order={order} trial={trial}");
+            }
+        }
+    }
+
+    /// The original stereo reconstruction (mid/side through `i64`): the
+    /// oracle for the 32-bit `decorrelate`.
+    fn decorrelate_ref(ch_assign: u32, a: &mut [i32], b: &mut [i32]) {
+        for i in 0..a.len() {
+            match ch_assign {
+                8 => b[i] = a[i].wrapping_sub(b[i]),
+                9 => a[i] = a[i].wrapping_add(b[i]),
+                10 => {
+                    let mid = ((a[i] as i64) << 1) | ((b[i] as i64) & 1);
+                    let side = b[i] as i64;
+                    a[i] = ((mid + side) >> 1) as i32;
+                    b[i] = ((mid - side) >> 1) as i32;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Every assignment over random, extreme (i32::MIN / MAX / -1 / 0) and
+    /// small values: identical to the `i64` oracle.
+    #[test]
+    fn decorrelate_matches_reference() {
+        let mut x = 0x5555_AAAA_1234_5678u64;
+        let mut rnd = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 32) as u32
+        };
+        let edge = [
+            i32::MIN,
+            i32::MIN + 1,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            i32::MAX - 1,
+            i32::MAX,
+        ];
+        for ch_assign in [0u32, 1, 8, 9, 10] {
+            let mut a: Vec<i32> = Vec::new();
+            let mut b: Vec<i32> = Vec::new();
+            for &p in &edge {
+                for &q in &edge {
+                    a.push(p);
+                    b.push(q);
+                }
+            }
+            for i in 0..5000 {
+                let (p, q) = (rnd() as i32, rnd() as i32);
+                let sh = if i % 2 == 0 { 0 } else { 15 };
+                a.push(p >> sh);
+                b.push(q >> sh);
+            }
+            let (mut a1, mut b1) = (a.clone(), b.clone());
+            decorrelate(ch_assign, &mut a1, &mut b1);
+            decorrelate_ref(ch_assign, &mut a, &mut b);
+            assert_eq!((a1, b1), (a, b), "ch_assign={ch_assign}");
+        }
+    }
+
+    /// `next_frame_interleaved` (i32 / f32 / i16) equals the planar
+    /// `next_frame` output interleaved and converted by hand, frame by frame,
+    /// for mono, stereo (the encoder picks every assignment over this
+    /// signal) and 6 channels, 16- and 8-bit; i16 refuses a 24-bit stream.
+    #[test]
+    fn interleaved_matches_planar() {
+        let (l, r) = test_signal(40_000);
+        let streams: Vec<(Vec<u8>, u32)> = [1usize, 2, 6]
+            .iter()
+            .flat_map(|&ch| [16u32, 8].into_iter().map(move |bps| (ch, bps)))
+            .map(|(ch, bps)| {
+                let shift = 16 - bps;
+                let chans: Vec<Vec<i32>> = (0..ch)
+                    .map(|c| {
+                        let src = if c % 2 == 0 { &l } else { &r };
+                        src.iter().map(|&v| (v >> shift) + c as i32).collect()
+                    })
+                    .collect();
+                let refs: Vec<&[i32]> = chans.iter().map(|c| c.as_slice()).collect();
+                let mut enc = Encoder::new(44100, ch as u32, bps).unwrap();
+                enc.push_planar(&refs).unwrap();
+                (enc.finish(), bps)
+            })
+            .collect();
+        for (stream, bps) in &streams {
+            let mut planar = Decoder::new(stream).unwrap();
+            let mut di = Decoder::new(stream).unwrap();
+            let mut df = Decoder::new(stream).unwrap();
+            let mut ds = Decoder::new(stream).unwrap();
+            let nch = planar.streaminfo().channels as usize;
+            let inv = 1.0 / (1u64 << (bps - 1)) as f32;
+            let (mut oi, mut of, mut os) = (Vec::new(), Vec::new(), Vec::new());
+            loop {
+                let mut chans = vec![Vec::new(); nch];
+                let n = planar.next_frame(&mut chans).unwrap();
+                oi.clear();
+                of.clear();
+                os.clear();
+                assert_eq!(di.next_frame_interleaved::<i32>(&mut oi).unwrap(), n);
+                assert_eq!(df.next_frame_interleaved::<f32>(&mut of).unwrap(), n);
+                assert_eq!(ds.next_frame_interleaved::<i16>(&mut os).unwrap(), n);
+                let Some(n) = n else { break };
+                for i in 0..n {
+                    for c in 0..nch {
+                        let v = chans[c][i];
+                        assert_eq!(oi[i * nch + c], v);
+                        assert_eq!(of[i * nch + c].to_bits(), (v as f32 * inv).to_bits());
+                        assert_eq!(os[i * nch + c], (v << (16 - bps)) as i16);
+                    }
+                }
+            }
+        }
+        // i16 refuses wider streams without consuming a frame.
+        let mut enc = Encoder::new(48000, 1, 24).unwrap();
+        enc.push_planar(&[&l[..1000]]).unwrap();
+        let stream = enc.finish();
+        let mut d = Decoder::new(&stream).unwrap();
+        let mut o16: Vec<i16> = Vec::new();
+        assert!(d.next_frame_interleaved::<i16>(&mut o16).is_err());
+        let mut o32: Vec<i32> = Vec::new();
+        assert_eq!(
+            d.next_frame_interleaved::<i32>(&mut o32).unwrap(),
+            Some(1000)
+        );
+        assert_eq!(o32, l[..1000]);
+    }
+
+    /// A `FrameDecoder` fed the frames one at a time (cut by the byte
+    /// counts it reports, from a STREAMINFO parsed with `StreamInfo::parse`)
+    /// produces exactly what `Decoder` does over the whole stream, planar
+    /// and interleaved, and rejects a corrupted frame.
+    #[test]
+    fn frame_decoder_matches_stream_decoder() {
+        let (l, r) = test_signal(25_000);
+        let mut enc = Encoder::new(44100, 2, 16).unwrap();
+        enc.push_planar(&[&l, &r]).unwrap();
+        let stream = enc.finish();
+        let mut whole = Decoder::new(&stream).unwrap();
+        let mut want: Vec<i32> = Vec::new();
+        while whole.next_frame_interleaved(&mut want).unwrap().is_some() {}
+        // STREAMINFO body sits after "fLaC" + the 4-byte block header.
+        let info = StreamInfo::parse(&stream[8..]).unwrap();
+        let first = Decoder::new(&stream).unwrap().pos;
+        let mut fd = FrameDecoder::new(info.clone()).unwrap();
+        let mut planar = vec![Vec::new(); 2];
+        let mut got: Vec<i32> = Vec::new();
+        let mut at = first;
+        while at < stream.len() {
+            let (bs, used) = fd
+                .decode_frame_interleaved(&stream[at..], &mut got)
+                .unwrap();
+            let mut fd2 = FrameDecoder::new(info.clone()).unwrap();
+            let (bs2, used2) = fd2
+                .decode_frame(&stream[at..at + used], &mut planar)
+                .unwrap();
+            assert_eq!((bs, used), (bs2, used2));
+            at += used;
+        }
+        assert_eq!(got, want);
+        assert_eq!(planar, [l, r]);
+        let mut bad = stream[first..].to_vec();
+        bad[40] ^= 0x10;
+        assert!(fd.decode_frame_interleaved(&bad, &mut got).is_err());
+        assert!(StreamInfo::parse(&stream[8..20]).is_err());
+    }
+
+    /// The textbook LPC restore (every tap reloaded): the oracle for the
+    /// const-order loops and the AVX2 kernel.
+    fn restore_lpc_ref(buf: &mut [i32], qlp: &[i32], shift: u32) {
+        for i in qlp.len()..buf.len() {
+            let mut sum = 0i64;
+            for (j, &c) in qlp.iter().enumerate() {
+                sum += c as i64 * buf[i - 1 - j] as i64;
+            }
+            buf[i] = buf[i].wrapping_add((sum >> shift) as i32);
+        }
+    }
+
+    /// Every order 1..=32, every shift, lengths from exactly `order` up,
+    /// extreme coefficients (+-2^14) and full-range (wrapping) samples: the
+    /// dispatching restore (AVX2 for 5..=12 where the CPU has it) and the
+    /// scalar loops both match the oracle exactly.
+    #[test]
+    fn restore_lpc_matches_reference() {
+        let mut x = 0x0123_4567_89AB_CDEFu64;
+        let mut rnd = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 32) as u32
+        };
+        for order in 1..=32usize {
+            for shift in 0..16u32 {
+                let extreme = shift % 5 == 0;
+                let qlp: Vec<i32> = (0..order)
+                    .map(|_| {
+                        if extreme {
+                            [-16384, 16383][(rnd() & 1) as usize]
+                        } else {
+                            rnd() as i32 >> 18
+                        }
+                    })
+                    .collect();
+                let n = order + (rnd() % 300) as usize;
+                let buf: Vec<i32> = (0..n)
+                    .map(|_| {
+                        if extreme {
+                            rnd() as i32
+                        } else {
+                            rnd() as i32 >> 15
+                        }
+                    })
+                    .collect();
+                let mut want = buf.clone();
+                restore_lpc_ref(&mut want, &qlp, shift);
+                let mut a = buf.clone();
+                restore_lpc(&mut a, &qlp, shift);
+                assert_eq!(a, want, "dispatch order={order} shift={shift}");
+                let mut b = buf;
+                restore_lpc_scalar(&mut b, &qlp, shift);
+                assert_eq!(b, want, "scalar order={order} shift={shift}");
+            }
+        }
     }
 
     #[test]

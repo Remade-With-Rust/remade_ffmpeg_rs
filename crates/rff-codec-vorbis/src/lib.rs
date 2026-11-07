@@ -10,7 +10,9 @@
 //! FFmpeg's (WAV) order, not Vorbis's: see [`ffmpeg_channel_map`]. The stream's
 //! last packet is trimmed so the output ends at the final page's granule
 //! position (see [`Packet::end_position`]), dropping the encoder's end padding
-//! as FFmpeg, libvorbis and lewton's Ogg reader do.
+//! as FFmpeg, libvorbis and lewton's Ogg reader do. From Matroska/WebM the same
+//! padding arrives as the last block's `DiscardPadding`
+//! ([`Packet::discard_padding`]) and is dropped the same way.
 //!
 //! Encode is the in-house Vorbis **encoder** ([`rusty_vorbis`], see
 //! `docs/codec-vorbis-encoder.md`) — masking-driven floor, rate-distortion
@@ -134,6 +136,19 @@ fn end_trim(position: i64, packet: &Packet, decoded: usize) -> usize {
     }
 }
 
+/// How many of `decoded` samples are left once the packet's
+/// [`discard_padding`](Packet::discard_padding) (Matroska's `DiscardPadding`)
+/// is dropped off the end — FFmpeg's `decode.c`: only when it fits in what
+/// the packet decoded to (all of it drops the whole frame), else ignored.
+fn discard_padding(packet: &Packet, decoded: usize) -> usize {
+    let pad = packet.discard_padding as usize;
+    if pad > 0 && pad <= decoded {
+        decoded - pad
+    } else {
+        decoded
+    }
+}
+
 /// Where the stream is, in FFmpeg's terms, and how much to keep of each
 /// packet so the output ends where FFmpeg's does.
 struct Timeline {
@@ -184,10 +199,12 @@ impl Timeline {
             (d, d)
         };
         self.prev_blocksize = blocksize;
-        let samples = if packet.flags.end_of_stream {
-            // End FFmpeg's way: its output, trimmed to the granule, less what
-            // we have already output ahead of it.
-            let keep = end_trim(self.position, packet, ffmpeg_out as usize) as i64;
+        let samples = if packet.flags.end_of_stream || packet.discard_padding > 0 {
+            // End FFmpeg's way: its output, trimmed to the granule and/or by
+            // the container's discard padding, less what we have already
+            // output ahead of it.
+            let keep = end_trim(self.position, packet, ffmpeg_out as usize);
+            let keep = discard_padding(packet, keep) as i64;
             (keep - self.lead).clamp(0, decoded as i64) as usize
         } else {
             decoded
@@ -707,6 +724,46 @@ mod tests {
             kept += t.packet(&p, blocks[i], decoded[i]);
         }
         assert_eq!(kept, 2752);
+    }
+
+    /// Matroska/WebM: no granules, the last block's DiscardPadding instead.
+    /// Same stream as above: FFmpeg outputs 2,432 and drops 32 of the last
+    /// packet's 128; our decoder ran 448 ahead after the 4th packet and is
+    /// level again after the 5th.
+    #[test]
+    fn discard_padding_trims_the_last_packet_like_ffmpeg() {
+        let blocks = [256i64, 256, 2048, 2048, 256, 256];
+        let decoded = [0usize, 128, 576, 1472, 128, 128];
+        let run = |pad: u32| {
+            let mut t = Timeline::new(256);
+            let mut kept = Vec::new();
+            for i in 0..6 {
+                let mut p = Packet::from_data(0, Vec::new());
+                if i == 5 {
+                    p.discard_padding = pad;
+                }
+                kept.push(t.packet(&p, blocks[i], decoded[i]));
+            }
+            kept
+        };
+        assert_eq!(run(0), [0, 128, 576, 1472, 128, 128]);
+        assert_eq!(run(32), [0, 128, 576, 1472, 128, 96]);
+        assert_eq!(run(128), [0, 128, 576, 1472, 128, 0], "all of it");
+        assert_eq!(run(129), [0, 128, 576, 1472, 128, 128], "too long: ignored");
+
+        // A long last block announcing a short one that never comes: our
+        // decoder outputs its early tail, FFmpeg does not, and the trim is
+        // taken from FFmpeg's 1,024.
+        let blocks = [256i64, 256, 2048, 2048, 2048];
+        let decoded = [0usize, 128, 576, 1024, 1472];
+        let mut t = Timeline::new(256);
+        let mut kept = 0;
+        for i in 0..5 {
+            let mut p = Packet::from_data(0, Vec::new());
+            p.discard_padding = if i == 4 { 100 } else { 0 };
+            kept += t.packet(&p, blocks[i], decoded[i]);
+        }
+        assert_eq!(kept, 128 + 576 + 1024 + 1024 - 100);
     }
 
     #[test]

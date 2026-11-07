@@ -13,7 +13,9 @@
 //! When the stream's `OpusHead` (RFC 7845) arrives as extradata — as from the
 //! Ogg demuxer — the decoder honours it the way FFmpeg does: the pre-skip is
 //! dropped from the start, the output gain is applied, the last packet is
-//! trimmed to the final granule position ([`Packet::end_position`]).
+//! trimmed to the final granule position ([`Packet::end_position`]) — or, from
+//! Matroska/WebM (whose `CodecPrivate` is the same `OpusHead`), by the last
+//! block's `DiscardPadding` ([`Packet::discard_padding`]).
 //! Multichannel (mapping family ≠ 0) streams are refused as unsupported.
 
 use std::collections::VecDeque;
@@ -121,16 +123,18 @@ struct OpusDec {
 /// `(start, end)`: the slice of a packet's `decoded` samples FFmpeg keeps,
 /// given the pre-skip still pending and the stream `position` before the
 /// packet. Mirrors `oggparseopus.c` (end trimming: the overrun past the final
-/// granule, capped at the packet) and `decode.c` (the start skip first, which
-/// swallows any frame it covers whole; the end padding only when it fits in
-/// what is left). Advances `skip` past what this packet consumed.
+/// granule, capped at the packet; else the packet's Matroska discard padding)
+/// and `decode.c` (the start skip first, which swallows any frame it covers
+/// whole; the end padding only when it fits in what is left). Advances `skip`
+/// past what this packet consumed.
 fn keep_range(skip: &mut usize, position: i64, packet: &Packet, decoded: usize) -> (usize, usize) {
     let pad = match packet.end_position {
         Some(end) if packet.flags.end_of_stream => position
             .saturating_add(decoded as i64)
             .saturating_sub(end)
             .clamp(0, decoded as i64) as usize,
-        _ => 0,
+        // Matroska's `DiscardPadding` says the same thing directly.
+        _ => packet.discard_padding as usize,
     };
     if *skip >= decoded {
         *skip -= decoded;
@@ -657,6 +661,38 @@ mod tests {
         assert_eq!(keep_range(&mut skip, 4800, &p, 960), (100, 200));
         let mut skip = 900;
         assert_eq!(keep_range(&mut skip, 4800, &p, 960), (900, 960));
+    }
+
+    /// Matroska/WebM: the last block's DiscardPadding, in samples, cuts its
+    /// end under the same `decode.c` rules (it must fit after the skip).
+    #[test]
+    fn discard_padding_trims_like_the_final_granule() {
+        let mut p = Packet::from_data(0, Vec::new());
+        p.discard_padding = 648;
+        let mut skip = 0;
+        assert_eq!(keep_range(&mut skip, 0, &p, 960), (0, 312));
+        assert_eq!(keep_range(&mut skip, 0, &p, 648), (0, 0), "all of it");
+        assert_eq!(
+            keep_range(&mut skip, 0, &p, 600),
+            (0, 600),
+            "too long: ignored"
+        );
+        let mut skip = 312;
+        assert_eq!(
+            keep_range(&mut skip, 0, &p, 960),
+            (312, 312),
+            "all that's left"
+        );
+        let mut skip = 312;
+        p.discard_padding = 649;
+        assert_eq!(
+            keep_range(&mut skip, 0, &p, 960),
+            (312, 960),
+            "no room after skip"
+        );
+        let mut skip = 312;
+        p.discard_padding = 48;
+        assert_eq!(keep_range(&mut skip, 0, &p, 960), (312, 912));
     }
 
     /// Pre-skip comes off the front, the final granule trims the back: a

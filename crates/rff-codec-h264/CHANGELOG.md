@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.9](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-h264-v0.3.8...rff-codec-h264-v0.3.9) - 2026-10-29
+
+### Other
+
+- updated the following local packages: rff-core, rff-codec
+
+## [0.3.8](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-h264-v0.3.7...rff-codec-h264-v0.3.8) - 2026-10-28
+
+### Fixed
+
+- *(mp4,mkv)* write B-frame timing as FFmpeg does ([#60](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/60))
+
+### Other
+
+- Merge branch 'pr46' into fix/60-bframe-timing
+
+## [0.3.7](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-h264-v0.3.6...rff-codec-h264-v0.3.7) - 2026-10-24
+
+### Other
+
+- updated the following local packages: rff-core, rff-codec
+
+## [0.3.6](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-h264-v0.3.5...rff-codec-h264-v0.3.6) - 2026-10-24
+
+### Other
+
+- updated the following local packages: rff-core, rff-codec
+
+## [0.3.5](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-h264-v0.3.4...rff-codec-h264-v0.3.5) - 2026-10-24
+
+### Other
+
+- updated the following local packages: rff-core, rff-codec
+
+## [0.3.4](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-h264-v0.3.3...rff-codec-h264-v0.3.4) - 2026-10-24
+
+### Other
+
+- updated the following local packages: rff-core, rff-codec
+
 ## [0.3.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-h264-v0.3.2...rff-codec-h264-v0.3.3) - 2026-10-23
 
 ### Other

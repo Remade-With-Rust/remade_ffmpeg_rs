@@ -10,10 +10,12 @@
 //! self-contained — the same small MPEG-1/2/2.5 Layer III header fields the
 //! decoder reads, but only as far as the byte layout needs.
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use rff_core::{CodecId, Error, Packet, Rational, Result, SampleFormat};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, Stream};
+use rff_format::{
+    Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, SeekOutput, Stream,
+};
 
 /// Register the MP3 format into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {
@@ -27,6 +29,7 @@ pub fn register(registry: &mut FormatRegistry) {
         probe: Some(probe_mp3),
         mux_caps: MuxCaps::single(&[CodecId::Mp3]),
     });
+    registry.register_seekable_muxer("mp3", |output| Box::new(Mp3Muxer::new_seekable(output)));
 }
 
 // ── frame-header parsing (just enough to find boundaries) ─────────────────────
@@ -350,14 +353,67 @@ impl Demuxer for Mp3Demuxer {
 
 // ── muxer ─────────────────────────────────────────────────────────────────────
 
+/// Where the muxer writes: a pipe/socket, or a file it can seek back into.
+enum Sink {
+    Plain(Output),
+    Seekable(SeekOutput),
+}
+
+impl Sink {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        match self {
+            Sink::Plain(out) => out.write_all(bytes),
+            Sink::Seekable(out) => out.write_all(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Sink::Plain(out) => out.flush(),
+            Sink::Seekable(out) => out.flush(),
+        }
+    }
+}
+
+/// The MP3 muxer: packets (whole frames) are written straight through.
+///
+/// One exception keeps the output gapless. An encoder that streams its frames
+/// (`rusty_mp3`, like LAME) emits its Xing/Info tag frame FIRST as a
+/// placeholder -- its frame count, size, TOC and end padding are only known at
+/// the end -- and the completed tag LAST. On a seekable output that final tag
+/// is written back over the placeholder (same length, at the offset the
+/// placeholder was written to); on a pipe, where nothing can be rewritten, it
+/// is dropped, so a tag frame never lands after the audio (decoders would play
+/// it as a frame of silence).
 struct Mp3Muxer {
-    out: Output,
+    sink: Sink,
+    /// Packets written so far.
+    packets: u64,
+    /// Offset and length of the tag frame the stream started with, if it did.
+    lead_tag: Option<(u64, usize)>,
 }
 
 impl Mp3Muxer {
     fn new(out: Output) -> Mp3Muxer {
-        Mp3Muxer { out }
+        Mp3Muxer {
+            sink: Sink::Plain(out),
+            packets: 0,
+            lead_tag: None,
+        }
     }
+
+    fn new_seekable(out: SeekOutput) -> Mp3Muxer {
+        Mp3Muxer {
+            sink: Sink::Seekable(out),
+            packets: 0,
+            lead_tag: None,
+        }
+    }
+}
+
+/// True if `data` is exactly one frame carrying a Xing/Info tag.
+fn is_tag_packet(data: &[u8]) -> bool {
+    parse_header(data).is_some_and(|info| data.len() == info.size && is_header_frame(data, &info))
 }
 
 impl Muxer for Mp3Muxer {
@@ -374,12 +430,35 @@ impl Muxer for Mp3Muxer {
     fn write_packet(&mut self, packet: &Packet) -> Result<()> {
         // A packet is one (or more) complete MPEG frames; an MP3 file is just the
         // frames concatenated, so write them straight through.
-        self.out.write_all(&packet.data)?;
+        let data = &packet.data;
+        let first = self.packets == 0;
+        self.packets += 1;
+        if is_tag_packet(data) {
+            if first {
+                let at = match &mut self.sink {
+                    Sink::Seekable(out) => out.stream_position()?,
+                    Sink::Plain(_) => 0,
+                };
+                self.lead_tag = Some((at, data.len()));
+            } else {
+                // The completed tag for the placeholder this stream began with.
+                if let (Sink::Seekable(out), Some((at, len))) = (&mut self.sink, self.lead_tag) {
+                    if len == data.len() {
+                        let end = out.stream_position()?;
+                        out.seek(SeekFrom::Start(at))?;
+                        out.write_all(data)?;
+                        out.seek(SeekFrom::Start(end))?;
+                    }
+                }
+                return Ok(());
+            }
+        }
+        self.sink.write_all(data)?;
         Ok(())
     }
 
     fn write_trailer(&mut self) -> Result<()> {
-        self.out.flush()?;
+        self.sink.flush()?;
         Ok(())
     }
 }
@@ -479,6 +558,60 @@ mod tests {
         assert_eq!(dem.read_packet().unwrap().data[4], 0x11);
         assert_eq!(dem.read_packet().unwrap().data[4], 0x22);
         assert!(matches!(dem.read_packet(), Err(Error::Eof)));
+    }
+
+    /// A tag frame (header + `tag` at the Xing offset), `fill` after it.
+    fn tag_frame(tag: &[u8; 4], fill: u8) -> Vec<u8> {
+        let mut f = make_frame(HDR, fill);
+        f[36..40].copy_from_slice(tag);
+        f
+    }
+
+    /// The streaming encoder's packet order -- placeholder tag, audio, final
+    /// tag -- leaves the FINAL tag at the front of a seekable file, and no tag
+    /// frame after the audio of either sink.
+    #[test]
+    fn muxer_patches_the_leading_tag_frame() {
+        let packets = [
+            tag_frame(b"Info", 0x00),
+            make_frame(HDR, 0x11),
+            make_frame(HDR, 0x22),
+            tag_frame(b"Info", 0x77),
+        ];
+        let cur = Arc::new(Mutex::new(Cursor::new(Vec::new())));
+        struct Shared(Arc<Mutex<Cursor<Vec<u8>>>>);
+        impl Write for Shared {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(b)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Seek for Shared {
+            fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+                self.0.lock().unwrap().seek(to)
+            }
+        }
+        let mut mux = Mp3Muxer::new_seekable(Box::new(Shared(cur.clone())));
+        mux.write_header(&[Stream::new(0, CodecId::Mp3)]).unwrap();
+        for p in &packets {
+            mux.write_packet(&Packet::from_data(0, p.clone())).unwrap();
+        }
+        mux.write_trailer().unwrap();
+        let out = cur.lock().unwrap().get_ref().clone();
+        let want: Vec<u8> = [&packets[3][..], &packets[1], &packets[2]].concat();
+        assert_eq!(out, want, "seekable: final tag over the placeholder");
+
+        let sink = SharedSink(Arc::new(Mutex::new(Vec::new())));
+        let mut mux = Mp3Muxer::new(Box::new(sink.clone()));
+        mux.write_header(&[Stream::new(0, CodecId::Mp3)]).unwrap();
+        for p in &packets {
+            mux.write_packet(&Packet::from_data(0, p.clone())).unwrap();
+        }
+        mux.write_trailer().unwrap();
+        let want: Vec<u8> = packets[..3].concat();
+        assert_eq!(*sink.0.lock().unwrap(), want, "pipe: trailing tag dropped");
     }
 
     #[test]

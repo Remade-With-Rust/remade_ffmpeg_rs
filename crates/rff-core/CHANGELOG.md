@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-core-v0.3.1...rff-core-v0.4.0) - 2026-10-24
+
+### Fixed
+
+- *(mkv,vorbis,opus)* trim the stream end by Matroska DiscardPadding
+
 ## [0.3.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-core-v0.2.4...rff-core-v0.3.0) - 2026-10-22
 
 ### Fixed

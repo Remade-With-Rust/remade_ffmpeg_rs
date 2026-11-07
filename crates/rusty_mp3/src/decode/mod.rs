@@ -28,12 +28,22 @@ pub mod stereo;
 pub mod synth_window;
 pub mod synthesis;
 
-/// Lightweight decode-stage profiler (near-zero cost; read via [`prof::dump`]).
-/// Same role as the encoder's: find the real decode hotspots before optimizing.
+/// Decode-stage profiler, read via [`prof::dump`]. Same role as the encoder's:
+/// find the real decode hotspots before optimizing.
+///
+/// The stage CLOCK is behind the `profile` cargo feature. It used to run on every
+/// build: two `Instant::now()` per stage per granule and channel, ~52 clock reads
+/// per stereo frame on the shipping path, which is real time on a decoder doing a
+/// frame in a few microseconds. Without the feature [`time`] is a plain call. The
+/// deterministic censuses (block types, kernel reach) stay on: they cost a
+/// handful of relaxed adds per frame and back `MP3_CENSUS`.
 pub mod prof {
     use std::sync::atomic::{AtomicU64, Ordering};
     // No clock on the browser target -- see `time` below.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "profile",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     use std::time::Instant;
 
     pub static HUFFMAN: AtomicU64 = AtomicU64::new(0);
@@ -113,7 +123,10 @@ pub mod prof {
     /// first frame in a browser while compiling cleanly and passing every test on
     /// the host. WASI has a clock and keeps its timing; only the bare-wasm target
     /// compiles it out and runs `f` unwrapped.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "profile",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[inline]
     pub fn time<T>(bucket: &AtomicU64, f: impl FnOnce() -> T) -> T {
         let t = Instant::now();
@@ -122,14 +135,30 @@ pub mod prof {
         r
     }
 
-    /// Clock-free twin for the browser target: run the stage, record nothing.
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    /// Clock-free twin (no `profile` feature, or the browser target): run the
+    /// stage, record nothing.
+    #[cfg(not(all(
+        feature = "profile",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    )))]
     #[inline]
     pub fn time<T>(_bucket: &AtomicU64, f: impl FnOnce() -> T) -> T {
         f()
     }
 
+    /// Whether this build records stage times (see the module docs).
+    pub const TIMED: bool = cfg!(all(
+        feature = "profile",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ));
+
     pub fn dump() {
+        if !TIMED {
+            eprintln!(
+                "--- decode stage profile: not recorded (build with `--features profile`) ---"
+            );
+            return;
+        }
         let stages = [
             ("huffman", &HUFFMAN),
             ("scalefactors", &SCALEFAC),
@@ -234,22 +263,34 @@ impl TransformState {
         channels: usize,
         pcm: &mut Vec<f32>,
     ) {
-        let mut chan_pcm = [[0f32; GRANULE_LINES]; 2];
-        for ch in 0..channels {
+        let mut stage1 = |ch: usize, this: &mut Self| {
             prof::time(&prof::ANTIALIAS, || {
                 antialias::reduce(&gi[ch], &mut spectrum.lines[ch]);
             });
-            let time = prof::time(&prof::IMDCT, || {
-                imdct::hybrid(&gi[ch], &spectrum.lines[ch], &mut self.imdct_overlap[ch])
+            prof::time(&prof::IMDCT, || {
+                imdct::hybrid(&gi[ch], &spectrum.lines[ch], &mut this.imdct_overlap[ch])
+            })
+        };
+        let t0 = stage1(0, self);
+        if channels == 2 {
+            // D12: both channels' synthesis in one pass, written interleaved
+            // straight into the frame's PCM (no per-channel copy, no per-sample
+            // push).
+            let t1 = stage1(1, self);
+            let start = pcm.len();
+            pcm.resize(start + 2 * GRANULE_LINES, 0.0);
+            let Some(out) = pcm[start..].first_chunk_mut::<{ 2 * GRANULE_LINES }>() else {
+                return; // unreachable: just resized by exactly one stereo granule
+            };
+            let [f0, f1] = &mut self.synth_fifo;
+            prof::time(&prof::SYNTH, || {
+                synthesis::polyphase_stereo([&t0, &t1], [f0, f1], out);
             });
-            chan_pcm[ch] = prof::time(&prof::SYNTH, || {
-                synthesis::polyphase(&time, &mut self.synth_fifo[ch])
+        } else {
+            let p = prof::time(&prof::SYNTH, || {
+                synthesis::polyphase(&t0, &mut self.synth_fifo[0])
             });
-        }
-        for s in 0..GRANULE_LINES {
-            for cp in chan_pcm.iter().take(channels) {
-                pcm.push(cp[s]);
-            }
+            pcm.extend_from_slice(&p);
         }
     }
 }
@@ -395,12 +436,30 @@ fn entropy(
                 scalefactors::decode(main, &mut bit_pos, header, &si, gr, ch, prev)
             });
             let part2_3_end = part2_3_start + gi.part2_3_length as usize;
-            let (coeffs, nz) = prof::time(&prof::HUFFMAN, || {
-                huffman::decode(main, &mut bit_pos, part2_3_end, header, gi)
-            });
-            prof::time(&prof::REQUANT, || {
-                requantize::apply(header, gi, &sf, &coeffs, nz, &mut spectrum.lines[ch]);
-            });
+            let short = gi.window_switching && gi.block_type == crate::frame::BlockType::Short;
+            let nz = if short {
+                // Short blocks reorder while they requantize: two passes.
+                let (coeffs, nz) = prof::time(&prof::HUFFMAN, || {
+                    huffman::decode(main, &mut bit_pos, part2_3_end, header, gi)
+                });
+                prof::time(&prof::REQUANT, || {
+                    requantize::apply(header, gi, &sf, &coeffs, nz, &mut spectrum.lines[ch]);
+                });
+                nz
+            } else {
+                // D16: Huffman and requantize fused (timed as Huffman).
+                prof::time(&prof::HUFFMAN, || {
+                    huffman::decode_dequant_long(
+                        main,
+                        &mut bit_pos,
+                        part2_3_end,
+                        header,
+                        gi,
+                        &sf,
+                        &mut spectrum.lines[ch],
+                    )
+                })
+            };
             spectrum.nonzero[ch] = nz;
             scalefac[gr][ch] = sf;
         }

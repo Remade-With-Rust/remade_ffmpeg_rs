@@ -16,7 +16,7 @@ use crate::codebook::{CODEBOOKS, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, ZERO_
 use crate::config::aot;
 use crate::ics::{IcsInfo, WindowSequence};
 use crate::swb::swb_offsets;
-use crate::tables::{spectral_book, SCALEFACTOR_BOOK};
+use crate::tables::SCALEFACTOR_BOOK;
 use crate::tables_ext::{
     AAC_PRED_SFB_MAX, SWB_OFFSET_120, SWB_OFFSET_480, SWB_OFFSET_512, SWB_OFFSET_960,
     TNS_MAX_BANDS_480, TNS_MAX_BANDS_512,
@@ -544,12 +544,27 @@ pub fn decode_ics(
     }
 
     // spectral_data (integers first, so pulses stay exact)
+    drop(prof_ics); // the stages must not nest, or shares double-count
+    let prof_spec = crate::prof::scope(crate::prof::Stage::DecSpectral);
+    crate::prof::bump(crate::prof::Counter::ChannelFrames, 1);
+    crate::prof::bump(crate::prof::Counter::ShortFrames, usize::from(short));
+    crate::prof::bump(
+        crate::prof::Counter::TnsChannels,
+        usize::from(cd.tns.present),
+    );
     let swb = ics.swb;
     // Taken for the call (a failed frame just reallocates it next time).
     let mut quant = std::mem::take(&mut cd.quant);
     quant.resize(1024, 0);
+    // Without pulses (which edit the integers before dequantisation) a coded
+    // band is dequantised as it is decoded, straight into the coefficients:
+    // the same `dequant_with(q) * gain` on the same integers, minus a pass over
+    // the integer scratch. `fused[idx]` marks the bands done that way.
+    let fuse = pulse.is_none();
+    let mut fused = [false; 128];
+    let pow43 = crate::dsp::pow43_table();
+    let small = super::spectral::SmallPow43::get();
     let mut wbase = 0usize;
-    let mut tuple = [0i32; 4];
     for g in 0..info.num_window_groups {
         let glen = info.window_group_length[g] as usize;
         for sfb in 0..max_sfb {
@@ -561,20 +576,38 @@ pub fn decode_ics(
             let meta = CODEBOOKS
                 .get(cb as usize)
                 .ok_or_else(|| Error::invalid("aac: bad spectral codebook"))?;
-            let book = spectral_book(cb);
-            let tab = crate::codebook::tuple_table(cb);
+            let fb = super::spectral::fast_book(cb);
             let dim = meta.dim as usize;
+            crate::prof::bump(crate::prof::Counter::Codewords, glen * (e - s) / dim);
+            crate::prof::bump(crate::prof::Counter::CodedCoeffs, glen * (e - s));
+            // Whole tuples only (band widths are multiples of 4 in every table).
+            let n = (e - s) / dim * dim;
+            if fuse && n == e - s {
+                let idx = g * max_sfb + sfb;
+                fused[idx] = true;
+                let gain = crate::dsp::sf_gain(cd.sfo[idx]);
+                for w in 0..glen {
+                    let base = (wbase + w) * 128;
+                    let out = &mut cd.coeffs[base + s..base + e];
+                    if dim == 4 {
+                        super::spectral::decode_run_dequant::<4>(
+                            cb, fb, r, out, gain, small, pow43,
+                        )?;
+                    } else {
+                        super::spectral::decode_run_dequant::<2>(
+                            cb, fb, r, out, gain, small, pow43,
+                        )?;
+                    }
+                }
+                continue;
+            }
             for w in 0..glen {
                 let base = (wbase + w) * 128;
-                let mut i = s;
-                while i + dim <= e {
-                    let t = tab[book.decode(r)? as usize];
-                    for (o, &v) in tuple.iter_mut().zip(&t) {
-                        *o = i32::from(v);
-                    }
-                    crate::codebook::finish_tuple(meta, r, &mut tuple)?;
-                    quant[base + i..base + i + dim].copy_from_slice(&tuple[..dim]);
-                    i += dim;
+                let out = &mut quant[base + s..base + s + n];
+                if dim == 4 {
+                    super::spectral::decode_run::<4>(cb, fb, r, out)?;
+                } else {
+                    super::spectral::decode_run::<2>(cb, fb, r, out)?;
                 }
             }
         }
@@ -602,9 +635,8 @@ pub fn decode_ics(
     }
 
     // Dequantisation; PNS bands from the reference generator.
-    drop(prof_ics); // the stages must not nest, or shares double-count
+    drop(prof_spec); // the stages must not nest, or shares double-count
     let _prof = crate::prof::scope(crate::prof::Stage::DecDequant);
-    let pow43 = crate::dsp::pow43_table();
     // Every coefficient gets exactly one write: coded bands are dequantised or
     // noise-filled below, and only the uncoded spans - zero / intensity bands
     // and each window's tail above swb[max_sfb] - are zeroed. (Zeroing all
@@ -628,6 +660,7 @@ pub fn decode_ics(
             let cb = cd.band_type[idx];
             if cb == ZERO_HCB || cb >= INTENSITY_HCB2 {
                 let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+                crate::prof::bump(crate::prof::Counter::ZeroCoeffs, glen * (e - s));
                 for w in 0..glen {
                     let base = (wbase + w) * 128;
                     cd.coeffs[base + s..base + e].fill(0.0);
@@ -636,6 +669,7 @@ pub fn decode_ics(
             }
             let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
             if cb == NOISE_HCB {
+                crate::prof::bump(crate::prof::Counter::PnsCoeffs, glen * (e - s));
                 let g_amp = 2f32.powf(0.25 * cd.sfo[idx] as f32);
                 for w in 0..glen {
                     let base = (wbase + w) * 128;
@@ -655,6 +689,9 @@ pub fn decode_ics(
                         *v *= scale;
                     }
                 }
+                continue;
+            }
+            if fused[idx] {
                 continue;
             }
             let gain = crate::dsp::sf_gain(cd.sfo[idx]);

@@ -1,7 +1,7 @@
 [package]
 name = "rff-codec-aac"
 description = "Remade FFmpeg (Rust): AAC codec adapter (LC/Main/LTP/HE-AAC v1+v2/LD/ELD decode, AAC-LC encode) over the pure-Rust rusty_aac crate (no C/FFI)."
-version = "1.1.3"
+version = "1.1.10"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,6 +11,12 @@ homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 readme = "README.md"
 keywords = ["aac", "audio", "codec", "decoder", "encoder"]
 categories = ["multimedia", "multimedia::audio", "multimedia::encoding"]
+
+# `supply-chain/` (the cargo-vet store for this crate's CI gate) is not part of
+# the published crate: shipping it made every imports refresh change the
+# package, so release-plz cut a new version, which the gate then had to vet
+# again -- a release loop.
+exclude = ["supply-chain/"]
 
 [features]
 # `simd` (default) enables rusty_aac's SIMD twins: the encoder's AVX2 quantize and

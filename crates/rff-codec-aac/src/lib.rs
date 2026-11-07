@@ -71,9 +71,12 @@ struct AacDecoder {
 /// Map decoded PCM to an rff interleaved-`f32` [`AudioFrame`].
 fn pcm_to_frame(d: &rusty_aac::DecodedAudio) -> Frame {
     let samples = d.frames();
-    let mut bytes = Vec::with_capacity(d.samples.len() * 4);
-    for s in &d.samples {
-        bytes.extend_from_slice(&s.to_le_bytes());
+    // Fixed-size chunk writes over a pre-sized buffer: this compiles to a
+    // straight copy on little-endian hosts (a per-sample `extend_from_slice`
+    // paid a capacity check per sample and did not vectorise).
+    let mut bytes = vec![0u8; d.samples.len() * 4];
+    for (b, s) in bytes.chunks_exact_mut(4).zip(&d.samples) {
+        b.copy_from_slice(&s.to_le_bytes());
     }
     Frame::Audio(AudioFrame {
         sample_rate: d.sample_rate,

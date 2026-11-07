@@ -136,8 +136,111 @@ const CRC16_SLICE: [[u16; 256]; 8] = {
 /// brings the residue to zero, which is how a frame end is recognized.
 ///
 /// Every byte of the stream passes through here (frame boundaries are found
-/// by CRC), so it runs slice-by-8; [`crc16_bytewise`] is the oracle.
-fn crc16_update(mut crc: u16, data: &[u8]) -> u16 {
+/// by CRC): on x86-64 with PCLMULQDQ + SSSE3 a run of 64+ bytes folds with
+/// carry-less multiplies ([`crc16_clmul`]), otherwise it runs slice-by-8;
+/// [`crc16_bytewise`] is the oracle for both.
+fn crc16_update(crc: u16, data: &[u8]) -> u16 {
+    #[cfg(target_arch = "x86_64")]
+    if data.len() >= 64
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+        && std::arch::is_x86_feature_detected!("ssse3")
+    {
+        // SAFETY: the CPU supports the features the kernel was compiled for.
+        return unsafe { crc16_clmul(crc, data) };
+    }
+    crc16_slice8(crc, data)
+}
+
+/// `x^n mod P(x)` for the CRC-16 polynomial P = x^16 + x^15 + x^2 + 1, as
+/// the 16 coefficient bits (bit i = x^i).
+#[cfg(target_arch = "x86_64")]
+const fn xpow_mod(n: u32) -> u64 {
+    let mut r: u32 = 1;
+    let mut i = 0;
+    while i < n {
+        r <<= 1;
+        if r & 0x1_0000 != 0 {
+            r ^= 0x1_8005;
+        }
+        i += 1;
+    }
+    r as u64
+}
+
+/// CRC-16 continuing from `crc` by carry-less-multiply folding
+/// (`data.len() >= 64`); the same kernel as `rusty_flac`'s frame check.
+///
+/// Blocks are read as 128-bit big-endian polynomials (bit i = x^i, which is
+/// what PCLMULQDQ multiplies). Four accumulators each take every fourth
+/// block, X <- X * x^512 + B, with X * x^512 congruent to
+/// X_hi * (x^576 mod P) + X_lo * (x^512 mod P): two 64x16-bit products that
+/// fit 128 bits, so nothing is reduced in the loop. They are combined with
+/// the 128-bit fold, leftover blocks folded the same way, and the table CRC
+/// of the result's 16 big-endian bytes is X * x^16 mod P — the CRC of all
+/// that — from which the tail continues. A non-zero starting `crc` is the
+/// same as XOR-ing it into the first two message bytes (no reflection, no
+/// final XOR), i.e. into the top 16 bits of the first block.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "pclmulqdq,ssse3")]
+unsafe fn crc16_clmul(crc: u16, data: &[u8]) -> u16 {
+    use std::arch::x86_64::*;
+    debug_assert!(data.len() >= 64);
+    const K128: (u64, u64) = (xpow_mod(192), xpow_mod(128));
+    const K512: (u64, u64) = (xpow_mod(576), xpow_mod(512));
+    let rev = _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    // Macros, not closures, so the intrinsics are compiled in this
+    // function's target-feature context.
+    // SAFETY (all loads): `at + 16 <= data.len()` at every use.
+    macro_rules! load {
+        ($at:expr) => {
+            _mm_shuffle_epi8(
+                unsafe { _mm_loadu_si128(data.as_ptr().add($at) as *const __m128i) },
+                rev,
+            )
+        };
+    }
+    macro_rules! fold {
+        ($x:expr, $k:expr) => {
+            _mm_xor_si128(
+                _mm_clmulepi64_si128($x, $k, 0x11),
+                _mm_clmulepi64_si128($x, $k, 0x00),
+            )
+        };
+    }
+    let k128 = _mm_set_epi64x(K128.0 as i64, K128.1 as i64);
+    let k512 = _mm_set_epi64x(K512.0 as i64, K512.1 as i64);
+
+    let groups = data.len() / 64;
+    let init = _mm_set_epi64x(((crc as u64) << 48) as i64, 0);
+    let (mut x0, mut x1, mut x2, mut x3) = (
+        _mm_xor_si128(load!(0), init),
+        load!(16),
+        load!(32),
+        load!(48),
+    );
+    for g in 1..groups {
+        let at = g * 64;
+        x0 = _mm_xor_si128(fold!(x0, k512), load!(at));
+        x1 = _mm_xor_si128(fold!(x1, k512), load!(at + 16));
+        x2 = _mm_xor_si128(fold!(x2, k512), load!(at + 32));
+        x3 = _mm_xor_si128(fold!(x3, k512), load!(at + 48));
+    }
+    let mut x = _mm_xor_si128(fold!(x0, k128), x1);
+    x = _mm_xor_si128(fold!(x, k128), x2);
+    x = _mm_xor_si128(fold!(x, k128), x3);
+    let mut at = groups * 64;
+    while at + 16 <= data.len() {
+        x = _mm_xor_si128(fold!(x, k128), load!(at));
+        at += 16;
+    }
+    let mut be = [0u8; 16];
+    // SAFETY: `be` is 16 writable bytes.
+    unsafe { _mm_storeu_si128(be.as_mut_ptr() as *mut __m128i, _mm_shuffle_epi8(x, rev)) };
+    crc16_slice8(crc16_slice8(0, &be), &data[at..])
+}
+
+/// Slice-by-8 CRC-16 continuing from `crc`.
+fn crc16_slice8(mut crc: u16, data: &[u8]) -> u16 {
     let mut chunks = data.chunks_exact(8);
     for c in &mut chunks {
         let t = &CRC16_SLICE;
@@ -157,6 +260,29 @@ fn crc16_bytewise(crc: u16, data: &[u8]) -> u16 {
     data.iter().fold(crc, |c, &b| {
         (c << 8) ^ CRC16_TABLE[((c >> 8) ^ b as u16) as usize]
     })
+}
+
+/// Index of the first 0xFF byte (a frame sync candidate), eight bytes per
+/// step: `!w` has a zero byte exactly where `w` has 0xFF, and the classic
+/// has-zero-byte test flags it (its lowest flag is always exact).
+fn find_ff(b: &[u8]) -> Option<usize> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let mut chunks = b.chunks_exact(8);
+    let mut base = 0;
+    for c in &mut chunks {
+        let x = !u64::from_le_bytes(c.try_into().unwrap());
+        let z = x.wrapping_sub(LO) & !x & HI;
+        if z != 0 {
+            return Some(base + (z.trailing_zeros() / 8) as usize);
+        }
+        base += 8;
+    }
+    chunks
+        .remainder()
+        .iter()
+        .position(|&v| v == 0xFF)
+        .map(|i| base + i)
 }
 
 /// The fields of a frame header the demuxer uses.
@@ -323,7 +449,7 @@ impl FlacDemuxer {
     fn find_boundary(&mut self) -> Option<usize> {
         self.scan = self.scan.max(self.start + MIN_FRAME_BYTES);
         while self.scan < self.buf.len() {
-            let Some(off) = self.buf[self.scan..].iter().position(|&b| b == 0xFF) else {
+            let Some(off) = find_ff(&self.buf[self.scan..]) else {
                 self.scan = self.buf.len();
                 return None;
             };
@@ -693,6 +819,86 @@ mod tests {
 
     /// The slice-by-8 CRC must equal the bytewise one for every length (all
     /// remainders) and every starting CRC, including when resumed mid-stream.
+    #[test]
+    fn find_ff_matches_position() {
+        let mut x = 0x0F0F_1234_5678_9ABCu64;
+        let data: Vec<u8> = (0..5000)
+            .map(|i| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                if i % 293 == 0 {
+                    0xFF
+                } else {
+                    ((x >> 56) as u8).min(0xFE) // only planted 0xFF bytes
+                }
+            })
+            .collect();
+        for start in 0..300 {
+            for end in [
+                start,
+                start + 1,
+                start + 7,
+                start + 8,
+                start + 9,
+                data.len(),
+            ] {
+                let d = &data[start..end.min(data.len())];
+                assert_eq!(
+                    find_ff(d),
+                    d.iter().position(|&b| b == 0xFF),
+                    "{start}..{end}"
+                );
+            }
+        }
+        // 0xFE / 0x7F neighbours (borrow cases of the zero-byte test).
+        for pat in [[0xFEu8, 0xFF], [0x7F, 0xFF], [0xFF, 0xFE], [0x00, 0xFF]] {
+            for at in 0..16 {
+                let mut d = [0x11u8; 24];
+                d[at] = pat[0];
+                d[at + 1] = pat[1];
+                assert_eq!(
+                    find_ff(&d),
+                    d.iter().position(|&b| b == 0xFF),
+                    "{pat:?} at {at}"
+                );
+            }
+        }
+    }
+
+    /// The carry-less-multiply CRC continuation equals the bytewise oracle
+    /// for every length 64..=700 from several starting CRCs, and the
+    /// dispatching `crc16_update` too.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn crc16_clmul_matches_bytewise() {
+        let mut x = 0xACE1_ACE1_1234_5678u64;
+        let data: Vec<u8> = (0..4000)
+            .map(|i| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                if i % 61 < 6 {
+                    0xFF
+                } else {
+                    (x >> 56) as u8
+                }
+            })
+            .collect();
+        let have = std::arch::is_x86_feature_detected!("pclmulqdq")
+            && std::arch::is_x86_feature_detected!("ssse3");
+        for init in [0u16, 1, 0x8005, 0xFFFF, 0x1234] {
+            for len in 64..=700 {
+                let d = &data[3..3 + len];
+                let want = crc16_bytewise(init, d);
+                assert_eq!(crc16_update(init, d), want, "init={init:#x} len={len}");
+                if have {
+                    assert_eq!(
+                        unsafe { crc16_clmul(init, d) },
+                        want,
+                        "init={init:#x} len={len}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn crc16_slice_by_8_matches_bytewise() {
         let mut s = 0x1234_5678_9ABC_DEF0u64;
