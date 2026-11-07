@@ -741,38 +741,63 @@ impl<'a> SliceDecoder<'a> {
             (pu.flags & 1 != 0).then(|| &refs.l0[pu.ref_idx[0] as usize]),
             (pu.flags & 2 != 0).then(|| &refs.l1[pu.ref_idx[1] as usize]),
         ];
+        // Per-component geometry, computed for luma and ONCE for the chroma
+        // pair. Cb and Cr share the motion vector, the block, the fractional
+        // split and the plane geometry (`Picture::new` builds both chroma
+        // planes with the same `Plane::new(cw, ch)`), so the c = 2 pass was a
+        // byte-for-byte recomputation of everything c = 1 had just derived:
+        // the list scan, the full-pel test and both interior tests.
+        let mut bw = 0usize;
+        let mut bh = 0usize;
+        let mut xb = 0usize;
+        let mut yb = 0usize;
+        let mut bit_depth = 0u8;
+        let mut m = 0usize;
+        let mut used = [false; 2];
+        let mut geo = [(0i32, 0i32, 0usize, 0usize); 2];
+        // Per list: the full-pel source offset when the vector is integer and
+        // the block inside the picture, and the footprint offset when the
+        // filter support is inside the picture (otherwise the edge copy).
+        let mut fp_geo = [None; 2];
+        let mut inner = [None; 2];
+        let mut fw = 0usize;
+        let mut fh = 0usize;
         for c in 0..3usize {
-            let ss = if c == 0 { 0 } else { 1 };
-            let (bw, bh) = (w >> ss, h >> ss);
-            if bw == 0 || bh == 0 {
-                continue;
-            }
-            let (xb, yb) = (xp >> ss, yp >> ss);
-            let bit_depth = if c == 0 { sps.bit_depth_luma } else { sps.bit_depth_chroma };
-            let taps = if c == 0 { 8usize } else { 4 };
-            let m = taps / 2 - 1;
-            let (fw, fh) = (bw + taps - 1, bh + taps - 1);
-
-            // The fractional split is a property of the COMPONENT, not of the
-            // list: it was recomputed inside both per-list loops below.
-            let (frac_bits, frac_mask) = if c == 0 { (2u32, 3i32) } else { (3u32, 7i32) };
-
-            // Geometry first, for every list, so the full-pel fast path below
-            // can decide before any interpolation happens.
-            let mut used = [false; 2];
-            let mut geo = [(0i32, 0i32, 0usize, 0usize); 2];
-            for l in 0..2usize {
-                if pu.flags & (1 << l) == 0 {
+            if c != 2 {
+                let ss = if c == 0 { 0 } else { 1 };
+                (bw, bh) = (w >> ss, h >> ss);
+                if bw == 0 || bh == 0 {
                     continue;
                 }
-                used[l] = true;
-                let mv = pu.mv[l];
-                geo[l] = (
-                    xb as i32 + (mv[0] >> frac_bits),
-                    yb as i32 + (mv[1] >> frac_bits),
-                    (mv[0] & frac_mask) as usize,
-                    (mv[1] & frac_mask) as usize,
-                );
+                (xb, yb) = (xp >> ss, yp >> ss);
+                bit_depth = if c == 0 { sps.bit_depth_luma } else { sps.bit_depth_chroma };
+                let taps = if c == 0 { 8usize } else { 4 };
+                m = taps / 2 - 1;
+                (fw, fh) = (bw + taps - 1, bh + taps - 1);
+
+                // The fractional split is a property of the COMPONENT, not of
+                // the list.
+                let (frac_bits, frac_mask) = if c == 0 { (2u32, 3i32) } else { (3u32, 7i32) };
+                for l in 0..2usize {
+                    used[l] = false;
+                    fp_geo[l] = None;
+                    inner[l] = None;
+                    let Some(r) = rp[l] else { continue };
+                    used[l] = true;
+                    let mv = pu.mv[l];
+                    let (xi, yi, fx, fy) = (xb as i32 + (mv[0] >> frac_bits), yb as i32 + (mv[1] >> frac_bits), (mv[0] & frac_mask) as usize, (mv[1] & frac_mask) as usize);
+                    geo[l] = (xi, yi, fx, fy);
+                    let p = &r.pic.planes[c];
+                    if fx == 0 && fy == 0 && xi >= 0 && yi >= 0 && xi as usize + bw <= p.width && yi as usize + bh <= p.height {
+                        fp_geo[l] = Some((yi as usize * p.stride + xi as usize, p.stride));
+                    }
+                    let (x0, y0) = (xi - m as i32, yi - m as i32);
+                    if x0 >= 0 && y0 >= 0 && (x0 as usize + fw) <= p.width && (y0 as usize + fh) <= p.height {
+                        inner[l] = Some(y0 as usize * p.stride + x0 as usize);
+                    }
+                }
+            } else if bw == 0 || bh == 0 {
+                continue;
             }
 
             // Full-pel: decide PER LIST, not for the pair.
@@ -796,17 +821,7 @@ impl<'a> SliceDecoder<'a> {
                 Some(t) if neutral_weights(t, pu, used, c, wp_off) => None,
                 other => other,
             };
-            let mut fp = [None; 2];
-            if weights.is_none() && bit_depth <= 12 {
-                for l in 0..2usize {
-                    let Some(r) = rp[l] else { continue };
-                    let (xi, yi, fx, fy) = geo[l];
-                    let p = &r.pic.planes[c];
-                    if fx == 0 && fy == 0 && xi >= 0 && yi >= 0 && xi as usize + bw <= p.width && yi as usize + bh <= p.height {
-                        fp[l] = Some((yi as usize * p.stride + xi as usize, p.stride));
-                    }
-                }
-            }
+            let fp = if weights.is_none() && bit_depth <= 12 { fp_geo } else { [None; 2] };
 
             // One list's interpolation, into `pred` or -- when `out` says so --
             // straight into the picture with the default weighting fused into
@@ -821,11 +836,10 @@ impl<'a> SliceDecoder<'a> {
                 // whole integer/fractional split -- two shifts, two masks and
                 // two adds -- and threw the first copy away.
                 let (xi, yi, fx, fy) = geo[l];
-                let (x0, y0) = (xi - m as i32, yi - m as i32);
-                let interior = x0 >= 0 && y0 >= 0 && (x0 as usize + fw) <= plane.width && (y0 as usize + fh) <= plane.height;
-                let (src, stride): (&[u16], usize) = if interior {
-                    (&plane.data[y0 as usize * plane.stride + x0 as usize..], plane.stride)
+                let (src, stride): (&[u16], usize) = if let Some(o) = inner[l] {
+                    (&plane.data[o..], plane.stride)
                 } else {
+                    let (x0, y0) = (xi - m as i32, yi - m as i32);
                     if accel::census::ALWAYS {
                         accel::census::bump(&accel::census::MC_EDGE_PAD, 1);
                     }
