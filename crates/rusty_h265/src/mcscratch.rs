@@ -36,6 +36,26 @@ impl McScratch {
     }
 }
 
+/// The Cb and Cr filter footprints of one prediction unit, as
+/// `accel::mc::interp_chroma2` takes them: slices of the reference planes at
+/// `inner` when the footprint is inside the picture, and otherwise
+/// edge-extended copies in the two halves of `pad`. The chroma planes share
+/// their geometry, so one interior answer serves both.
+pub(crate) fn chroma_pair_src<'a>(planes: &'a [Plane; 3], inner: Option<usize>, x0: i32, y0: i32, fw: usize, fh: usize, pad: &'a mut [u16]) -> [(&'a [u16], usize); 2] {
+    match inner {
+        Some(o) => [(&planes[1].data[o..], planes[1].stride), (&planes[2].data[o..], planes[2].stride)],
+        None => {
+            if rusty_h265_accel::census::ALWAYS {
+                rusty_h265_accel::census::bump(&rusty_h265_accel::census::MC_EDGE_PAD, 2);
+            }
+            let (a, b) = pad.split_at_mut(fw * fh);
+            pad_footprint(a, &planes[1], x0, y0, fw, fh);
+            pad_footprint(b, &planes[2], x0, y0, fw, fh);
+            [(&*a, fw), (&*b, fw)]
+        }
+    }
+}
+
 /// Copies the `fw × fh` footprint at (`x0`, `y0`) out of `plane` into `pad`
 /// (see [`McScratch::pad`]). A free function over the buffer rather than a
 /// method, so a caller holding the scratch's other fields by `&mut` can call

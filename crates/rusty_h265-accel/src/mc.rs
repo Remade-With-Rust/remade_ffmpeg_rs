@@ -1556,9 +1556,8 @@ fn full_pel(p: McPlan, src: &[u16], stride: usize, m: usize, w: usize, h: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn interp<const N: usize, const NF: usize>(
-    src: &[u16],
-    stride: usize,
+fn interp<const N: usize, const NF: usize, const P: usize>(
+    src: [(&[u16], usize); P],
     fx: usize,
     fy: usize,
     w: usize,
@@ -1567,9 +1566,9 @@ fn interp<const N: usize, const NF: usize>(
     taps: &[[i16; N]; NF],
     spans: &[(usize, usize); NF],
     syms: &[bool; NF],
-    dst: &mut [i16],
+    dst: [&mut [i16]; P],
     tmp: &mut [i16],
-    mut out: Out<'_>,
+    mut out: [Out<'_>; P],
 ) {
     // `NF` is the number of fractional positions -- 4 for luma, 8 for chroma,
     // both powers of two -- and the caller derives `fx`/`fy` as `mv & (NF - 1)`.
@@ -1587,13 +1586,15 @@ fn interp<const N: usize, const NF: usize>(
     // down that arm. The bring-up switch `elide_taps` used to own now rides in
     // `McPlan`, so the read that picks the kernels also answers it.
     let p = plan();
-    // The combine, fused into the final pass when the kernels can take it.
-    let want = match out {
+    // The combine, fused into the final pass when the kernels can take it --
+    // resolved per plane, since each plane writes its own picture.
+    let want: [u8; P] = std::array::from_fn(|k| match out[k] {
         Out::Pred => 0u8,
         Out::Uni { .. } => 1,
         Out::Bi { .. } => 2,
-    };
-    let (m, o) = resolve_out(p, &mut out, w, h, bit_depth);
+    });
+    let mo: [(u8, Fused); P] = std::array::from_fn(|k| resolve_out(p, &mut out[k], w, h, bit_depth));
+    let mut done = [false; P];
     // ONE census probe likewise; it was four on the 2-D path.
     let cen = census::ALWAYS;
     if cen {
@@ -1608,10 +1609,10 @@ fn interp<const N: usize, const NF: usize>(
             } else {
                 &census::MC_FW_GE16
             },
-            (w * h) as u64,
+            (P * w * h) as u64,
         );
     }
-    if cen {
+    for _ in 0..if cen { P } else { 0 } {
         // Route: the fractional position the bitstream asked for. Four arms,
         // and the content picks — a stream from a full-pel-only encoder takes
         // the first on every block, one from a slow preset almost never does.
@@ -1630,7 +1631,7 @@ fn interp<const N: usize, const NF: usize>(
         }
     }
     let mg = margin(N);
-    let done = match (fx, fy) {
+    match (fx, fy) {
         // Full-pel, out of line and `#[cold]`.
         //
         // `motion_compensate` resolves integer motion vectors before it ever
@@ -1639,11 +1640,23 @@ fn interp<const N: usize, const NF: usize>(
         // `copy_shift` dispatch and `shift3` sat in the middle of the path the
         // other 99.8% take. `shift3` belongs to this arm alone in any case.
         (0, 0) => {
-            full_pel(p, src, stride, mg, w, h, bit_depth, dst);
-            m == 0
+            for k in 0..P {
+                full_pel(p, src[k].0, src[k].1, mg, w, h, bit_depth, dst[k]);
+                done[k] = mo[k].0 == 0;
+            }
         }
-        (fx, 0) => fir_h::<N>(p, &src[mg * stride..], stride, &taps[fx], w, h, shift1, dst, w, m, &o),
-        (0, fy) => fir_v_u16_sym::<N>(p, &src[mg..], stride, &taps[fy], w, h, shift1, bit_depth, syms[fy], dst, w, m, &o),
+        (fx, 0) => {
+            for k in 0..P {
+                let (sk, st) = src[k];
+                done[k] = fir_h::<N>(p, &sk[mg * st..], st, &taps[fx], w, h, shift1, dst[k], w, mo[k].0, &mo[k].1);
+            }
+        }
+        (0, fy) => {
+            for k in 0..P {
+                let (sk, st) = src[k];
+                done[k] = fir_v_u16_sym::<N>(p, &sk[mg..], st, &taps[fy], w, h, shift1, bit_depth, syms[fy], dst[k], w, mo[k].0, &mo[k].1);
+            }
+        }
         #[allow(clippy::identity_op)]
         (fx, fy) => {
             // Zero end taps: don't filter a row that gets multiplied by nothing.
@@ -1684,7 +1697,7 @@ fn interp<const N: usize, const NF: usize>(
             // and its stack array. `chroma_never_elides` pins the premise.
             let (lo, hi) = if N == 8 && p.elide { spans[fy] } else { (0, N - 1) };
             let rows = h + hi - lo;
-            if cen {
+            for _ in 0..if cen { P } else { 0 } {
                 census::route(hi - lo < N - 1, &census::RT_MC_TAP_ELIDE, &census::RT_MC_TAP_FULL);
                 // The deterministic evidence for the elision: rows of horizontal
                 // filtering actually performed. The loop BODY is unchanged, so
@@ -1692,22 +1705,34 @@ fn interp<const N: usize, const NF: usize>(
                 // count moves, and only a work count records it.
                 census::bump(&census::MC_FIR_H_ROWS, rows as u64);
             }
-            fir_h::<N>(p, &src[lo * stride..], stride, &taps[fx], w, rows, shift1, tmp, w, 0, &Fused::NONE);
+            // Planes one after the other through the shared `tmp`: each
+            // plane's vertical pass consumes the scratch before the next
+            // plane's horizontal pass overwrites it.
             if lo == 0 {
-                fir_v::<N>(p, tmp, w, t, w, h, 6, dst, w, m, &o)
+                for k in 0..P {
+                    let (sk, st) = src[k];
+                    fir_h::<N>(p, sk, st, &taps[fx], w, rows, shift1, tmp, w, 0, &Fused::NONE);
+                    done[k] = fir_v::<N>(p, tmp, w, t, w, h, 6, dst[k], w, mo[k].0, &mo[k].1);
+                }
             } else {
                 // Only filter 3 starts with a zero, so this rotation is off the
                 // common path; building it unconditionally would put a stack
                 // write on every 2-D call to save a row on a fifth of them.
                 let mut tv = [0i16; N];
                 tv[..N - lo].copy_from_slice(&t[lo..]);
-                fir_v::<N>(p, tmp, w, &tv, w, h, 6, dst, w, m, &o)
+                for k in 0..P {
+                    let (sk, st) = src[k];
+                    fir_h::<N>(p, &sk[lo * st..], st, &taps[fx], w, rows, shift1, tmp, w, 0, &Fused::NONE);
+                    done[k] = fir_v::<N>(p, tmp, w, &tv, w, h, 6, dst[k], w, mo[k].0, &mo[k].1);
+                }
             }
         }
-    };
+    }
     // Whatever the kernels could not fuse, combine the two-pass way.
-    if want != 0 && (m == 0 || !done) {
-        combine(out, &dst[..w * h], w, h, bit_depth);
+    for (k, o) in out.into_iter().enumerate() {
+        if want[k] != 0 && (mo[k].0 == 0 || !done[k]) {
+            combine(o, &dst[k][..w * h], w, h, bit_depth);
+        }
     }
 }
 
@@ -1732,7 +1757,7 @@ pub fn interp_luma(src: &[u16], stride: usize, fx: usize, fy: usize, w: usize, h
             (w * h) as u64,
         );
     }
-    interp::<8, 4>(src, stride, fx, fy, w, h, bit_depth, &LUMA_FILTER, &LUMA_SPAN, &LUMA_SYM, dst, tmp, out);
+    interp::<8, 4, 1>([(src, stride)], fx, fy, w, h, bit_depth, &LUMA_FILTER, &LUMA_SPAN, &LUMA_SYM, [dst], tmp, [out]);
 }
 
 /// Chroma prediction block (4-tap, eighth-sample).
@@ -1755,7 +1780,36 @@ pub fn interp_chroma(src: &[u16], stride: usize, fx: usize, fy: usize, w: usize,
             (w * h) as u64,
         );
     }
-    interp::<4, 8>(src, stride, fx, fy, w, h, bit_depth, &CHROMA_FILTER, &CHROMA_SPAN, &CHROMA_SYM, dst, tmp, out);
+    interp::<4, 8, 1>([(src, stride)], fx, fy, w, h, bit_depth, &CHROMA_FILTER, &CHROMA_SPAN, &CHROMA_SYM, [dst], tmp, [out]);
+}
+
+/// Both chroma prediction blocks of a prediction unit -- Cb and Cr -- in one
+/// call.
+///
+/// The two planes share the motion vector, so they share the fractional
+/// position, the block size and the filter: everything [`interp_chroma`]
+/// decides before it filters. Called once per plane, that decision -- the
+/// plan read, the arm, the tap tables, the `Out` resolution -- was made twice
+/// for an answer that could not differ; here it is made once and only the
+/// filtering runs per plane. Each `src[k]` is a `(footprint, stride)` pair as
+/// for [`interp_chroma`], `dst[k]` and `out[k]` that plane's intermediate and
+/// write. `tmp` is shared: the planes are filtered one after the other.
+#[allow(clippy::too_many_arguments)]
+pub fn interp_chroma2(src: [(&[u16], usize); 2], fx: usize, fy: usize, w: usize, h: usize, bit_depth: u8, dst: [&mut [i16]; 2], tmp: &mut [i16], out: [Out<'_>; 2]) {
+    if census::ALWAYS {
+        let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar;
+        census::bump(if simd { &census::MC_CHROMA_SIMD } else { &census::MC_CHROMA_SCALAR }, 2);
+        census::bump(&census::SAMPLES_MC, (2 * w * h) as u64);
+        census::bump(
+            match fy {
+                0 => &census::RT_MC_FY_NONE,
+                4 => &census::RT_MC_FY_SYM,
+                _ => &census::RT_MC_FY_ASYM,
+            },
+            (2 * w * h) as u64,
+        );
+    }
+    interp::<4, 8, 2>(src, fx, fy, w, h, bit_depth, &CHROMA_FILTER, &CHROMA_SPAN, &CHROMA_SYM, dst, tmp, out);
 }
 
 #[cfg(test)]
@@ -1921,6 +1975,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `interp_chroma2` is two `interp_chroma` calls: every fractional
+    /// position, all three output modes, widths through every epilogue, both
+    /// bit depths, two DIFFERENT planes and pictures with distinct strides.
+    #[test]
+    fn interp_chroma2_matches_two_calls() {
+        let mut st = 0x5eed_c4c4u32;
+        let mut checked = 0usize;
+        for &bd in &[8u8, 10] {
+            let max = (1u16 << bd) - 1;
+            for &(w, h) in &[(2usize, 2usize), (4, 4), (8, 4), (6, 8), (8, 8), (12, 4), (16, 16), (32, 32), (24, 8)] {
+                let (sa, sb) = (w + 3 + 5, w + 3 + 9);
+                let srca = random_plane(&mut st, sa * (h + 3) + 8, max);
+                let srcb = random_plane(&mut st, sb * (h + 3) + 8, max);
+                let other_a: Vec<i16> = (0..w * h).map(|i| ((i * 37) % 9000) as i16).collect();
+                let other_b: Vec<i16> = (0..w * h).map(|i| ((i * 53) % 9000) as i16).collect();
+                let ps = w + 7;
+                for fy in 0..8 {
+                    for fx in 0..8 {
+                        for mode in 0..3 {
+                            let mut tmp = vec![0i16; w * (h + 3)];
+                            let (mut ra, mut rb) = (vec![0i16; w * h], vec![0i16; w * h]);
+                            let (mut pa, mut pb) = (vec![0u16; ps * h], vec![0u16; ps * h]);
+                            fn out<'a>(mode: u8, pic: &'a mut [u16], stride: usize, other: &'a [i16]) -> Out<'a> {
+                                match mode {
+                                    0 => Out::Pred,
+                                    1 => Out::Uni { pic, stride },
+                                    _ => Out::Bi { pic, stride, other },
+                                }
+                            }
+                            let mk = |pic, other| out(mode, pic, ps, other);
+                            {
+                                let (pa, pb) = (&mut pa[..], &mut pb[..]);
+                                interp_chroma(&srca, sa, fx, fy, w, h, bd, &mut ra, &mut tmp, mk(pa, &other_a));
+                                interp_chroma(&srcb, sb, fx, fy, w, h, bd, &mut rb, &mut tmp, mk(pb, &other_b));
+                            }
+                            let (mut da, mut db) = (vec![0i16; w * h], vec![0i16; w * h]);
+                            let (mut qa, mut qb) = (vec![0u16; ps * h], vec![0u16; ps * h]);
+                            {
+                                let (qa, qb) = (&mut qa[..], &mut qb[..]);
+                                interp_chroma2([(&srca, sa), (&srcb, sb)], fx, fy, w, h, bd, [&mut da, &mut db], &mut tmp, [mk(qa, &other_a), mk(qb, &other_b)]);
+                            }
+                            let tag = format!("{w}x{h} bd={bd} frac=({fx},{fy}) mode={mode}");
+                            if mode == 0 {
+                                assert_eq!((ra, rb), (da, db), "pred {tag}");
+                            } else {
+                                assert_eq!((pa, pb), (qa, qb), "picture {tag}");
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 2 * 9 * 64 * 3);
     }
 
     /// The oracle: the same arithmetic with no dispatch and no kernels.
