@@ -2360,3 +2360,31 @@ FFmpeg 8.1.2 `hevc -threads 1`: 0.82x on the x265 clip and on `ipred_x24`
 run collided with a background conformance gate: every millisecond moved, the
 ratios did not (0.80 / 0.99 / 1.02 / 1.37 against the clean 0.80 / 0.94 / 1.02
 / 1.37), which is the case for paired ratios over per-arm medians.
+
+### Vein 11 (dual-plane chroma) and vein 13 (per-picture clears) — 2026-11-07
+
+Callgrind Ir, same instruments as above; every row 147/147 bit-exact, SEI
+6183/6183.
+
+| state (cumulative)                                              | 20 s 720p x265 inter | `dblk_heavy` |
+|-----------------------------------------------------------------|---------------------:|-------------:|
+| 0.7.0                                                           |             16.614 G |      3.869 G |
+| chroma pair shares one geometry pass in `motion_compensate`     |   16.575 (−0.23%)    | 3.863 (−0.16%) |
+| `interp_chroma2`: one dispatch (plan, arm, `Out`) for Cb and Cr |   16.463 (−0.68%)    | 3.848 (−0.38%) |
+| 8-wide chroma pair in one AVX2 vector, 2-D arm (lane-local filters, split emit) | **16.078 (−2.34%)** | **3.786 (−1.62%)** |
+
+Vein 11 total: −3.23% inter, −2.16% `dblk_heavy`.
+
+Vein 13 is refuted. `PicState::reuse` showed 387 M Ir of `memset`, but
+callgrind counts `rep stosb` once per byte: a 460,800-byte glibc `memset`
+counts 460,826 Ir while a 1,382,400-byte one counts 75,623 (above the
+non-temporal threshold glibc switches to vector stores). The `cell` and
+`bs_v`/`bs_h` clears are therefore ~575 K "Ir" a picture that the CPU executes
+as a handful of instructions. The one real lever, not clearing the 1.4 MB
+motion map (readers gated on `cell.pred_mode`), saved 37.7 M of `memset` and
+cost 57.0 M in `boundary_strength` and 21.4 M in `finish_picture`: +40.6 M net,
+reverted.
+
+Still open: the same lane trick for the H-only / V-only arms and 4-wide
+chroma; `pad_footprint` (575 M Ir, 287 K calls on the x265 clip); 8-bit `u8`
+planes.
