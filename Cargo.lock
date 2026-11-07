@@ -5709,7 +5709,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_h265"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "rusty_alloc-api",
  "rusty_h265-accel",
@@ -5717,7 +5717,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_h265-accel"
-version = "0.6.1"
+version = "0.7.0"
 
 [[package]]
 name = "rusty_jpeg"
