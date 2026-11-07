@@ -324,6 +324,11 @@ fn scalar_sao() -> bool {
     *F.get_or_init(|| std::env::var_os("RH265_SCALAR_SAO").is_some())
 }
 
+/// Diagnostic: how much of each plane the narrowed SAO copy actually touches.
+pub static SAO_COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SAO_PLANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SAO_SPANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// §8.7.3 sample adaptive offset over the deblocked picture.
 ///
 /// The shape here is the same lesson as motion compensation: the per-sample
@@ -339,11 +344,6 @@ fn scalar_sao() -> bool {
 /// - **Neighbour availability.** Only samples on the one-sample ring at the
 ///   edge of a coding tree block can have an unusable neighbour. The interior
 ///   — which is all but `4·cs` of `cs²` samples — needs no check whatsoever.
-/// Diagnostic: how much of each plane the narrowed SAO copy actually touches.
-pub static SAO_COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static SAO_PLANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static SAO_SPANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 #[inline(never)]
 fn sao(planes: &mut [Plane; 3], st: &PicState, sps: &Sps, pps: &Pps, scratch: &mut Vec<u16>, has_bypass: bool) {
     crate::prof_scope!(crate::prof::Stage::Sao);

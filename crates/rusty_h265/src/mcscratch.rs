@@ -40,7 +40,7 @@ impl McScratch {
 /// (see [`McScratch::pad`]). A free function over the buffer rather than a
 /// method, so a caller holding the scratch's other fields by `&mut` can call
 /// it.
-pub(crate) fn pad_footprint(pad: &mut Vec<u16>, plane: &Plane, x0: i32, y0: i32, fw: usize, fh: usize) {
+pub(crate) fn pad_footprint(pad: &mut [u16], plane: &Plane, x0: i32, y0: i32, fw: usize, fh: usize) {
     crate::prof_scope!(crate::prof::Stage::Pad);
     // `pad` is built at the largest footprint HEVC can ask for -- a 64x64
     // prediction block plus the 7-tap margin, which is exactly

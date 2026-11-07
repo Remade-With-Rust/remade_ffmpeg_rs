@@ -41,7 +41,8 @@ FREE RAG Converter Online -- <a href="https://RAGconverter.com">RAGconverter.com
 | Dimension | FFmpeg (C) | **remade_ffmpeg_rs (Rust) — today** | Goal |
 |---|:---:|:---:|:---:|
 | Memory-safety CVEs (core path) | many, historically | **0 — safe Rust** | structural |
-| Conformance | reference | **bit-exact** (VP9 315/315 vectors; MP3 vs FFmpeg) | maintain |
+| Conformance | reference | **bit-exact** (VP9 315/315 vectors; HEVC 147/147 JCT-VC streams; MP3 vs FFmpeg) | maintain |
+| **HEVC decode**, 1 thread | 1.0× | **1.37× faster** on weighted prediction · **parity** on deblocking-heavy and 10-bit · **0.80–0.86×** on mainstream 8-bit inter — pinned core, self-timed decode, paired verdicts; **1.23–1.50× faster** than 0.6 after an instruction-count campaign, bit-exact | → parity |
 | VP9 decode, 1 thread | 1.0× | **~0.16–0.21×** — younger, optimizing | → parity |
 | VP9 encode, 1 thread | 1.0× | **~0.3×**, at **~+36% bitrate** — matched settings, equal PSNR | → parity |
 | AAC encode (24 s clips) | 1.0× | **3.2–7.9× faster** — frame-parallel (ffmpeg's AAC is 1-thread) | maintain |
@@ -138,7 +139,7 @@ safer.
 | AV1 decode (avif) | [`rusty_av1d`](https://github.com/Remade-With-Rust/rusty-av1-toolkit) | BSD-2-Clause | ✅ (our rav1d fork; Rust port of dav1d) |
 | **AV2 decode** | **in-house** ([`rusty_av2d`](https://crates.io/crates/rusty_av2d)) | BSD-2-Clause | ✅ (byte-identical vs AVM across a 45-clip corpus; standalone crate) |
 | H.264 decode/encode | [`rusty_h264`](https://crates.io/crates/rusty_h264) | BSD-2-Clause | ✅ (portable Rust SIMD, no C, no assembler) |
-| **HEVC decode** | **in-house** ([`rusty_h265`](https://crates.io/crates/rusty_h265)) | Apache-2.0 | ✅ (147/147 JCT-VC conformance streams bit-exact; `forbid(unsafe_code)`, zero deps; standalone crate) |
+| **HEVC decode** | **in-house** ([`rusty_h265`](https://crates.io/crates/rusty_h265)) | Apache-2.0 | ✅ (147/147 JCT-VC conformance streams bit-exact; 0.80× to 1.37× FFmpeg's single-thread speed; `forbid(unsafe_code)` core; standalone crate) |
 | VP9 decode/encode | **in-house** ([`rusty_vp9`](https://crates.io/crates/rusty_vp9)) | Apache-2.0 | ✅ (bit-exact vs all 315 libvpx vectors; standalone crate) |
 | AAC decode/encode | **in-house** ([`rusty_aac`](https://crates.io/crates/rusty_aac)) | Apache-2.0 | ✅ (decode: LC, Main, LTP, HE-AAC v1/v2, ER LD/ELD; encode: AAC-LC; standalone crate) |
 | MP3 decode/encode | **in-house** ([`rusty_mp3`](https://crates.io/crates/rusty_mp3)) | Apache-2.0 | ✅ (decoder bit-exact vs FFmpeg; standalone crate) |

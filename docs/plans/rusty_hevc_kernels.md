@@ -2346,3 +2346,17 @@ Instruments added for this campaign: the WSL callgrind workflow (mini
 workspace, because cargo hangs on the 9p mount), `cgcalls.py` (self Ir, calls,
 edges), `cglines.py` (top source lines), `cgranges.py` (Ir per named source
 range), `cgdiff.py` (per-function diff between two runs).
+
+### Wall clock confirms the count — 2026-11-07
+
+`tools/bench/codec-bench.ps1`, pinned core, self-reported decode time, ABBA,
+both binaries under rusty_alloc. Campaign build against the pre-campaign build
+(306a9ca): 1.37x on the x265 clip, 1.39x on `in_to_tree_720p_8bit`, 1.50x on
+`ipred_x24` (11/11 pairs each); 1.296x / 1.358x / 1.233x / 1.291x on the
+8-bit / 10-bit / `dblk_heavy` / `wp_x10` set (20-21/21 pairs). Against
+FFmpeg 8.1.2 `hevc -threads 1`: 0.82x on the x265 clip and on `ipred_x24`
+(15/15), 0.80x 8-bit, parity on 10-bit and `dblk_heavy` (not verdicts),
+**1.37x faster on `wp_x10`** (20/21, z = 4.15); null arm 1.023x. One ffmpeg
+run collided with a background conformance gate: every millisecond moved, the
+ratios did not (0.80 / 0.99 / 1.02 / 1.37 against the clean 0.80 / 0.94 / 1.02
+/ 1.37), which is the case for paired ratios over per-arm medians.
