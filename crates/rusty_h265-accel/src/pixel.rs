@@ -1293,10 +1293,30 @@ pub fn pad_footprint(dst: &mut [u16], src: &[u16], stride: usize, width: usize, 
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     // SAFETY: the bounds the row loop relies on are the asserts above.
     unsafe {
-        pad_rows_sse2(dst, src, stride, width, height, x0, y0, fw, fh)
+        pad_rows_sse2::<1>([dst.as_mut_ptr()], [src.as_ptr()], stride, width, height, x0, y0, fw, fh)
     }
     #[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
     pad_rows_safe(dst, src, stride, width, height, x0, y0, fw, fh)
+}
+
+/// [`pad_footprint`] for two planes of the same geometry at once -- the Cb/Cr
+/// pair of one prediction unit. The row clamp, the repeat test and the column
+/// split are made once per row for both planes.
+#[allow(clippy::too_many_arguments)]
+pub fn pad_footprint2(da: &mut [u16], db: &mut [u16], sa: &[u16], sb: &[u16], stride: usize, width: usize, height: usize, x0: i32, y0: i32, fw: usize, fh: usize) {
+    assert!(width > 0 && height > 0 && fw > 0 && fh > 0 && stride >= width);
+    let need = stride * (height - 1) + width;
+    assert!(sa.len() >= need && sb.len() >= need && da.len() >= fw * fh + PAD_SLACK && db.len() >= fw * fh + PAD_SLACK);
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    // SAFETY: the bounds the row loop relies on are the asserts above.
+    unsafe {
+        pad_rows_sse2::<2>([da.as_mut_ptr(), db.as_mut_ptr()], [sa.as_ptr(), sb.as_ptr()], stride, width, height, x0, y0, fw, fh)
+    }
+    #[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
+    {
+        pad_rows_safe(da, sa, stride, width, height, x0, y0, fw, fh);
+        pad_rows_safe(db, sb, stride, width, height, x0, y0, fw, fh);
+    }
 }
 
 /// [`pad_footprint`] without vectors or `unsafe`: the slice form.
@@ -1322,13 +1342,15 @@ fn pad_rows_safe(dst: &mut [u16], src: &[u16], stride: usize, width: usize, heig
     }
 }
 
-/// The row loop of [`pad_footprint`], 8-sample SSE2 stores.
+/// The row loop of [`pad_footprint`], 8-sample SSE2 stores, over `P` planes
+/// that share the geometry.
 ///
 /// # Safety
-/// The bounds [`pad_footprint`] asserts.
+/// The bounds [`pad_footprint`] asserts, for every plane.
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn pad_rows_sse2(dst: &mut [u16], src: &[u16], stride: usize, width: usize, height: usize, x0: i32, y0: i32, fw: usize, fh: usize) {
+unsafe fn pad_rows_sse2<const P: usize>(dst: [*mut u16; P], src: [*const u16; P], stride: usize, width: usize, height: usize, x0: i32, y0: i32, fw: usize, fh: usize) {
     let (pw, ph) = (width as i32, height as i32);
     let left = (-x0).clamp(0, fw as i32) as usize;
     let right = ((x0 + fw as i32) - pw).clamp(0, fw as i32) as usize;
@@ -1341,27 +1363,31 @@ unsafe fn pad_rows_sse2(dst: &mut [u16], src: &[u16], stride: usize, width: usiz
         let sy = (y0 + y as i32).clamp(0, ph - 1) as usize;
         let o = y * fw;
         if sy == prev {
-            // SAFETY: `o - fw .. o + fw` lies inside `fw * fh` (y >= 1 here).
-            unsafe { copy_run(dst.as_mut_ptr().add(o), dst.as_ptr().add(o - fw), fw) };
+            for k in 0..P {
+                // SAFETY: `o - fw .. o + fw` lies inside `fw * fh` (y >= 1 here).
+                unsafe { copy_run(dst[k].add(o), dst[k].add(o - fw), fw) };
+            }
             continue;
         }
         prev = sy;
         let r = sy * stride;
-        // SAFETY: the row read is `r .. r + width`, inside `src` by the assert;
-        // every write is below `o + fw + 7 <= fw * fh + PAD_SLACK - 1`.
-        unsafe {
-            let d = dst.as_mut_ptr().add(o);
-            let s = src.as_ptr().add(r);
-            if mid == 0 {
-                splat_run(d, fw, *s.add(sx));
-                continue;
-            }
-            if left > 0 {
-                splat_run(d, left, *s);
-            }
-            copy_run(d.add(left), s.add(sx), mid);
-            if right > 0 {
-                splat_run(d.add(left + mid), right, *s.add(width - 1));
+        // SAFETY: the row read is `r .. r + width`, inside each source by the
+        // assert; every write is below `o + fw + 7 <= fw * fh + PAD_SLACK - 1`.
+        for k in 0..P {
+            unsafe {
+                let d = dst[k].add(o);
+                let s = src[k].add(r);
+                if mid == 0 {
+                    splat_run(d, fw, *s.add(sx));
+                    continue;
+                }
+                if left > 0 {
+                    splat_run(d, left, *s);
+                }
+                copy_run(d.add(left), s.add(sx), mid);
+                if right > 0 {
+                    splat_run(d.add(left + mid), right, *s.add(width - 1));
+                }
             }
         }
     }

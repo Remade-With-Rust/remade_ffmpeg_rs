@@ -49,8 +49,9 @@ pub(crate) fn chroma_pair_src<'a>(planes: &'a [Plane; 3], inner: Option<usize>, 
                 rusty_h265_accel::census::bump(&rusty_h265_accel::census::MC_EDGE_PAD, 2);
             }
             let (a, b) = pad.split_at_mut(fw * fh + rusty_h265_accel::pixel::PAD_SLACK);
-            pad_footprint(a, &planes[1], x0, y0, fw, fh);
-            pad_footprint(b, &planes[2], x0, y0, fw, fh);
+            let (p1, p2) = (&planes[1], &planes[2]);
+            debug_assert!(p1.stride == p2.stride && p1.width == p2.width && p1.height == p2.height);
+            rusty_h265_accel::pixel::pad_footprint2(a, b, &p1.data, &p2.data, p1.stride, p1.width, p1.height, x0, y0, fw, fh);
             [(&*a, fw), (&*b, fw)]
         }
     }
@@ -142,6 +143,29 @@ mod tests {
                             assert_eq!(s.pad[y * fw + x], p.get(sx, sy), "({x0},{y0}) {fw}x{fh} at ({x},{y})");
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// The two-plane pad is two one-plane pads: every position, footprint
+    /// shapes through the vector boundaries, two different planes.
+    #[test]
+    fn pad_footprint2_matches_two_pads() {
+        use rusty_h265_accel::pixel::{pad_footprint as pad1, pad_footprint2, PAD_SLACK};
+        let (a, mut b) = (plane_with(19, 11), plane_with(19, 11));
+        for v in b.data.iter_mut() {
+            *v = v.wrapping_mul(7).wrapping_add(3) & 1023;
+        }
+        for y0 in -9i32..14 {
+            for x0 in -9i32..22 {
+                for &(fw, fh) in &[(11usize, 11usize), (5, 7), (1, 1), (8, 4), (9, 9), (23, 5), (16, 2)] {
+                    let n = fw * fh + PAD_SLACK;
+                    let (mut ra, mut rb, mut qa, mut qb) = (vec![0u16; n], vec![0u16; n], vec![0u16; n], vec![0u16; n]);
+                    pad1(&mut ra, &a.data, a.stride, a.width, a.height, x0, y0, fw, fh);
+                    pad1(&mut rb, &b.data, b.stride, b.width, b.height, x0, y0, fw, fh);
+                    pad_footprint2(&mut qa, &mut qb, &a.data, &b.data, a.stride, a.width, a.height, x0, y0, fw, fh);
+                    assert_eq!((&ra[..fw * fh], &rb[..fw * fh]), (&qa[..fw * fh], &qb[..fw * fh]), "({x0},{y0}) {fw}x{fh}");
                 }
             }
         }
