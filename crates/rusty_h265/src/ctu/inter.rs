@@ -786,7 +786,12 @@ impl<'a> SliceDecoder<'a> {
                     let Some(r) = rp[l] else { continue };
                     used[l] = true;
                     let mv = pu.mv[l];
-                    let (xi, yi, fx, fy) = (xb as i32 + (mv[0] >> frac_bits), yb as i32 + (mv[1] >> frac_bits), (mv[0] & frac_mask) as usize, (mv[1] & frac_mask) as usize);
+                    let (xi, yi, fx, fy) = (
+                        xb as i32 + (mv[0] >> frac_bits),
+                        yb as i32 + (mv[1] >> frac_bits),
+                        (mv[0] & frac_mask) as usize,
+                        (mv[1] & frac_mask) as usize,
+                    );
                     geo[l] = (xi, yi, fx, fy);
                     let p = &r.pic.planes[c];
                     if fx == 0 && fy == 0 && xi >= 0 && yi >= 0 && xi as usize + bw <= p.width && yi as usize + bh <= p.height {
@@ -877,7 +882,17 @@ impl<'a> SliceDecoder<'a> {
                                 }
                                 None => {
                                     let (_, _, fx, fy) = geo[l];
-                                    interp_chroma2(src2!(l), fx, fy, bw, bh, bit_depth, [&mut *p0b, &mut *p0r], tmp, [Out::Uni { pic: db, stride }, Out::Uni { pic: dr, stride }]);
+                                    interp_chroma2(
+                                        src2!(l),
+                                        fx,
+                                        fy,
+                                        bw,
+                                        bh,
+                                        bit_depth,
+                                        [&mut *p0b, &mut *p0r],
+                                        tmp,
+                                        [Out::Uni { pic: db, stride }, Out::Uni { pic: dr, stride }],
+                                    );
                                 }
                             }
                         }
