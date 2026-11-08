@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.11](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-hevc-v0.2.10...rff-codec-hevc-v0.2.11) - 2026-11-08
+
+### Other
+
+- *(deps)* rusty_h265 + rusty_h265-accel 0.7.1
+
 ## [0.2.10](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-hevc-v0.2.9...rff-codec-hevc-v0.2.10) - 2026-11-07
 
 ### Other
