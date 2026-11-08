@@ -309,6 +309,133 @@ mod x86 {
         }
     }
 
+    /// Horizontal FIR over TWO 8-wide planes at once -- the chroma pair.
+    ///
+    /// Every operation the horizontal filter uses (`pmaddwd`, the 32-bit
+    /// unpacks, `packssdw`) works inside a 128-bit lane, so a 256-bit vector
+    /// whose low lane is a Cb row and whose high lane is the Cr row filters
+    /// both with the instruction count of one. An 8-wide block was the SSE2
+    /// tail's two four-wide groups per row, per plane; here it is one vector
+    /// step per row for the pair. Row `y` of the output is the joint row
+    /// `[Cb 0..8 | Cr 0..8]` at `dst + 16 * y`, which is exactly what
+    /// [`fir_v_avx2_dual8`] reads.
+    ///
+    /// # Safety
+    /// `sa`/`sb` must each have `stride * (h - 1) + 8 + N - 1` readable `u16`
+    /// at their stride; `dst` needs `16 * h` writable `i16`.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fir_h_avx2_dual8<const N: usize>(sa: *const u16, stra: usize, sb: *const u16, strb: usize, t: &[i16; N], h: usize, shift: u32, dst: *mut i16) {
+        let np = N / 2;
+        let mut taps = [_mm256_setzero_si256(); 4];
+        for k in 0..np {
+            taps[k] = _mm256_set1_epi32(pair(t, k));
+        }
+        let sh = _mm_cvtsi32_si128(shift as i32);
+        for y in 0..h {
+            let ra = unsafe { sa.add(y * stra) };
+            let rb = unsafe { sb.add(y * strb) };
+            let mut even = _mm256_setzero_si256();
+            let mut odd = _mm256_setzero_si256();
+            for k in 0..np {
+                let e = unsafe { _mm256_loadu2_m128i(rb.add(2 * k) as *const __m128i, ra.add(2 * k) as *const __m128i) };
+                even = _mm256_add_epi32(even, _mm256_madd_epi16(e, taps[k]));
+                let o = unsafe { _mm256_loadu2_m128i(rb.add(2 * k + 1) as *const __m128i, ra.add(2 * k + 1) as *const __m128i) };
+                odd = _mm256_add_epi32(odd, _mm256_madd_epi16(o, taps[k]));
+            }
+            even = _mm256_sra_epi32(even, sh);
+            odd = _mm256_sra_epi32(odd, sh);
+            let lo = _mm256_unpacklo_epi32(even, odd);
+            let hi = _mm256_unpackhi_epi32(even, odd);
+            unsafe { _mm256_storeu_si256(dst.add(16 * y) as *mut __m256i, _mm256_packs_epi32(lo, hi)) };
+        }
+    }
+
+    /// The vertical pass over the joint rows [`fir_h_avx2_dual8`] wrote, both
+    /// planes in one vector, each lane written to its own plane.
+    ///
+    /// The vertical arithmetic is lane-local for the same reason as the
+    /// horizontal (16-bit unpacks, `pmaddwd`, `packssdw`), so this is the
+    /// 16-wide loop of [`fir_v_avx2`] at stride 16 with a split write: the low
+    /// lane goes to plane A, the high lane to plane B.
+    ///
+    /// # Safety
+    /// `src` must have `16 * (h + N - 1)` readable `i16`. For `M == 0`,
+    /// `da`/`db` need `8 * h` writable `i16`; otherwise `oa`/`ob` must be
+    /// proven for an 8 x `h` block (as by `resolve_out`) with equal `shift`
+    /// and `max`.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fir_v_avx2_dual8<const N: usize, const M: u8>(src: *const i16, t: &[i16; N], h: usize, shift: u32, da: *mut i16, db: *mut i16, oa: &OutPtr, ob: &OutPtr) {
+        let np = N / 2;
+        let mut taps = [_mm256_setzero_si256(); 4];
+        for k in 0..np {
+            taps[k] = _mm256_set1_epi32(pair(t, k));
+        }
+        let sh = _mm_cvtsi32_si128(shift as i32);
+        // Two output rows per pass, sharing the `N - 1` overlapping loads.
+        let mut y = 0usize;
+        while y + 2 <= h {
+            let mut r = [_mm256_setzero_si256(); 9];
+            for (k, slot) in r.iter_mut().enumerate().take(N + 1) {
+                *slot = unsafe { _mm256_loadu_si256(src.add((y + k) * 16) as *const __m256i) };
+            }
+            let mut lo0 = _mm256_setzero_si256();
+            let mut hi0 = _mm256_setzero_si256();
+            let mut lo1 = _mm256_setzero_si256();
+            let mut hi1 = _mm256_setzero_si256();
+            for k in 0..np {
+                let (a, b, c) = (r[2 * k], r[2 * k + 1], r[2 * k + 2]);
+                lo0 = _mm256_add_epi32(lo0, _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), taps[k]));
+                hi0 = _mm256_add_epi32(hi0, _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), taps[k]));
+                lo1 = _mm256_add_epi32(lo1, _mm256_madd_epi16(_mm256_unpacklo_epi16(b, c), taps[k]));
+                hi1 = _mm256_add_epi32(hi1, _mm256_madd_epi16(_mm256_unpackhi_epi16(b, c), taps[k]));
+            }
+            unsafe {
+                emit_dual8::<M>(_mm256_packs_epi32(_mm256_sra_epi32(lo0, sh), _mm256_sra_epi32(hi0, sh)), da, db, oa, ob, y);
+                emit_dual8::<M>(_mm256_packs_epi32(_mm256_sra_epi32(lo1, sh), _mm256_sra_epi32(hi1, sh)), da, db, oa, ob, y + 1);
+            }
+            y += 2;
+        }
+        if y < h {
+            let mut lo = _mm256_setzero_si256();
+            let mut hi = _mm256_setzero_si256();
+            for k in 0..np {
+                let a = unsafe { _mm256_loadu_si256(src.add((y + 2 * k) * 16) as *const __m256i) };
+                let b = unsafe { _mm256_loadu_si256(src.add((y + 2 * k + 1) * 16) as *const __m256i) };
+                lo = _mm256_add_epi32(lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), taps[k]));
+                hi = _mm256_add_epi32(hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), taps[k]));
+            }
+            unsafe { emit_dual8::<M>(_mm256_packs_epi32(_mm256_sra_epi32(lo, sh), _mm256_sra_epi32(hi, sh)), da, db, oa, ob, y) };
+        }
+    }
+
+    /// Row `y` of the pair: the low lane of `p` is plane A's eight results,
+    /// the high lane plane B's -- the arithmetic of [`emit256`], split.
+    #[inline(always)]
+    unsafe fn emit_dual8<const M: u8>(p: __m256i, da: *mut i16, db: *mut i16, oa: &OutPtr, ob: &OutPtr, y: usize) {
+        unsafe {
+            if M == 0 {
+                _mm_storeu_si128(da.add(8 * y) as *mut __m128i, _mm256_castsi256_si128(p));
+                _mm_storeu_si128(db.add(8 * y) as *mut __m128i, _mm256_extracti128_si256::<1>(p));
+                return;
+            }
+            let off = _mm256_set1_epi16(1i16 << (oa.shift - 1));
+            let maxv = _mm256_set1_epi16(oa.max as i16);
+            let sh = _mm_cvtsi32_si128(oa.shift);
+            let v = if M == 2 {
+                let other = _mm256_loadu2_m128i(ob.other.add(y * ob.other_stride) as *const __m128i, oa.other.add(y * oa.other_stride) as *const __m128i);
+                _mm256_adds_epi16(p, other)
+            } else {
+                p
+            };
+            let v = _mm256_sra_epi16(_mm256_adds_epi16(v, off), sh);
+            let v = _mm256_min_epi16(_mm256_max_epi16(v, _mm256_setzero_si256()), maxv);
+            _mm_storeu_si128(oa.pic.add(y * oa.stride) as *mut __m128i, _mm256_castsi256_si128(v));
+            _mm_storeu_si128(ob.pic.add(y * ob.stride) as *mut __m128i, _mm256_extracti128_si256::<1>(v));
+        }
+    }
+
     /// Two taps packed into the halves of an `i32`, broadcast — the multiplier
     /// for one `pmaddwd`. `t[2k]` lands in the low `i16` lane, `t[2k+1]` in the
     /// high one, matching the operand order `pmaddwd` pairs them in.
@@ -1555,10 +1682,47 @@ fn full_pel(p: McPlan, src: &[u16], stride: usize, m: usize, w: usize, h: usize,
     copy_shift(p, &src[m * stride + m..], stride, w, h, shift3, dst, w);
 }
 
+/// The 2-D arm for an 8-wide PAIR of planes in one pass (see
+/// [`x86::fir_h_avx2_dual8`]). Returns false -- having written nothing --
+/// when it cannot take the pair, and the caller filters the planes one by one.
 #[allow(clippy::too_many_arguments)]
-fn interp<const N: usize, const NF: usize>(
-    src: &[u16],
-    stride: usize,
+fn dual8_2d<const N: usize>(p: McPlan, src: &[(&[u16], usize)], th: &[i16; N], tv: &[i16; N], h: usize, shift1: u32, dst: &mut [&mut [i16]], tmp: &mut [i16], mo: &[(u8, Fused)]) -> bool {
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    {
+        let rows = h + N - 1;
+        let [(sa, ta), (sb, tb)] = src else { return false };
+        let [da, db] = dst else { return false };
+        let [(ma, oa), (mb, ob)] = mo else { return false };
+        let fits = |s: &[u16], st: usize| s.len() >= st * (rows - 1) + 8 + N - 1;
+        if p.isa != crate::Isa::Avx2 || ma != mb || !fits(sa, *ta) || !fits(sb, *tb) || tmp.len() < 16 * rows || da.len() < 8 * h || db.len() < 8 * h {
+            return false;
+        }
+        if *ma != 0 && (oa.shift != ob.shift || oa.max != ob.max) {
+            return false;
+        }
+        // SAFETY: every length the kernels read or write is checked above;
+        // the fused pointers were proven for an 8 x h block by `resolve_out`.
+        unsafe {
+            x86::fir_h_avx2_dual8::<N>(sa.as_ptr(), *ta, sb.as_ptr(), *tb, th, rows, shift1, tmp.as_mut_ptr());
+            let (pa, pb) = (da.as_mut_ptr(), db.as_mut_ptr());
+            match ma {
+                0 => x86::fir_v_avx2_dual8::<N, 0>(tmp.as_ptr(), tv, h, 6, pa, pb, oa, ob),
+                1 => x86::fir_v_avx2_dual8::<N, 1>(tmp.as_ptr(), tv, h, 6, pa, pb, oa, ob),
+                _ => x86::fir_v_avx2_dual8::<N, 2>(tmp.as_ptr(), tv, h, 6, pa, pb, oa, ob),
+            }
+        }
+        return true;
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (p, src, th, tv, h, shift1, dst, tmp, mo);
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interp<const N: usize, const NF: usize, const P: usize>(
+    src: [(&[u16], usize); P],
     fx: usize,
     fy: usize,
     w: usize,
@@ -1567,9 +1731,9 @@ fn interp<const N: usize, const NF: usize>(
     taps: &[[i16; N]; NF],
     spans: &[(usize, usize); NF],
     syms: &[bool; NF],
-    dst: &mut [i16],
+    mut dst: [&mut [i16]; P],
     tmp: &mut [i16],
-    mut out: Out<'_>,
+    mut out: [Out<'_>; P],
 ) {
     // `NF` is the number of fractional positions -- 4 for luma, 8 for chroma,
     // both powers of two -- and the caller derives `fx`/`fy` as `mv & (NF - 1)`.
@@ -1587,13 +1751,15 @@ fn interp<const N: usize, const NF: usize>(
     // down that arm. The bring-up switch `elide_taps` used to own now rides in
     // `McPlan`, so the read that picks the kernels also answers it.
     let p = plan();
-    // The combine, fused into the final pass when the kernels can take it.
-    let want = match out {
+    // The combine, fused into the final pass when the kernels can take it --
+    // resolved per plane, since each plane writes its own picture.
+    let want: [u8; P] = std::array::from_fn(|k| match out[k] {
         Out::Pred => 0u8,
         Out::Uni { .. } => 1,
         Out::Bi { .. } => 2,
-    };
-    let (m, o) = resolve_out(p, &mut out, w, h, bit_depth);
+    });
+    let mo: [(u8, Fused); P] = std::array::from_fn(|k| resolve_out(p, &mut out[k], w, h, bit_depth));
+    let mut done = [false; P];
     // ONE census probe likewise; it was four on the 2-D path.
     let cen = census::ALWAYS;
     if cen {
@@ -1608,10 +1774,10 @@ fn interp<const N: usize, const NF: usize>(
             } else {
                 &census::MC_FW_GE16
             },
-            (w * h) as u64,
+            (P * w * h) as u64,
         );
     }
-    if cen {
+    for _ in 0..if cen { P } else { 0 } {
         // Route: the fractional position the bitstream asked for. Four arms,
         // and the content picks — a stream from a full-pel-only encoder takes
         // the first on every block, one from a slow preset almost never does.
@@ -1630,7 +1796,7 @@ fn interp<const N: usize, const NF: usize>(
         }
     }
     let mg = margin(N);
-    let done = match (fx, fy) {
+    match (fx, fy) {
         // Full-pel, out of line and `#[cold]`.
         //
         // `motion_compensate` resolves integer motion vectors before it ever
@@ -1639,11 +1805,23 @@ fn interp<const N: usize, const NF: usize>(
         // `copy_shift` dispatch and `shift3` sat in the middle of the path the
         // other 99.8% take. `shift3` belongs to this arm alone in any case.
         (0, 0) => {
-            full_pel(p, src, stride, mg, w, h, bit_depth, dst);
-            m == 0
+            for k in 0..P {
+                full_pel(p, src[k].0, src[k].1, mg, w, h, bit_depth, dst[k]);
+                done[k] = mo[k].0 == 0;
+            }
         }
-        (fx, 0) => fir_h::<N>(p, &src[mg * stride..], stride, &taps[fx], w, h, shift1, dst, w, m, &o),
-        (0, fy) => fir_v_u16_sym::<N>(p, &src[mg..], stride, &taps[fy], w, h, shift1, bit_depth, syms[fy], dst, w, m, &o),
+        (fx, 0) => {
+            for k in 0..P {
+                let (sk, st) = src[k];
+                done[k] = fir_h::<N>(p, &sk[mg * st..], st, &taps[fx], w, h, shift1, dst[k], w, mo[k].0, &mo[k].1);
+            }
+        }
+        (0, fy) => {
+            for k in 0..P {
+                let (sk, st) = src[k];
+                done[k] = fir_v_u16_sym::<N>(p, &sk[mg..], st, &taps[fy], w, h, shift1, bit_depth, syms[fy], dst[k], w, mo[k].0, &mo[k].1);
+            }
+        }
         #[allow(clippy::identity_op)]
         (fx, fy) => {
             // Zero end taps: don't filter a row that gets multiplied by nothing.
@@ -1684,7 +1862,7 @@ fn interp<const N: usize, const NF: usize>(
             // and its stack array. `chroma_never_elides` pins the premise.
             let (lo, hi) = if N == 8 && p.elide { spans[fy] } else { (0, N - 1) };
             let rows = h + hi - lo;
-            if cen {
+            for _ in 0..if cen { P } else { 0 } {
                 census::route(hi - lo < N - 1, &census::RT_MC_TAP_ELIDE, &census::RT_MC_TAP_FULL);
                 // The deterministic evidence for the elision: rows of horizontal
                 // filtering actually performed. The loop BODY is unchanged, so
@@ -1692,22 +1870,37 @@ fn interp<const N: usize, const NF: usize>(
                 // count moves, and only a work count records it.
                 census::bump(&census::MC_FIR_H_ROWS, rows as u64);
             }
-            fir_h::<N>(p, &src[lo * stride..], stride, &taps[fx], w, rows, shift1, tmp, w, 0, &Fused::NONE);
-            if lo == 0 {
-                fir_v::<N>(p, tmp, w, t, w, h, 6, dst, w, m, &o)
+            // Planes one after the other through the shared `tmp`: each
+            // plane's vertical pass consumes the scratch before the next
+            // plane's horizontal pass overwrites it.
+            if P == 2 && w == 8 && lo == 0 && dual8_2d::<N>(p, &src, &taps[fx], t, h, shift1, &mut dst, tmp, &mo) {
+                // Both planes, one vector each step: an 8-wide chroma pair.
+                done = [true; P];
+            } else if lo == 0 {
+                for k in 0..P {
+                    let (sk, st) = src[k];
+                    fir_h::<N>(p, sk, st, &taps[fx], w, rows, shift1, tmp, w, 0, &Fused::NONE);
+                    done[k] = fir_v::<N>(p, tmp, w, t, w, h, 6, dst[k], w, mo[k].0, &mo[k].1);
+                }
             } else {
                 // Only filter 3 starts with a zero, so this rotation is off the
                 // common path; building it unconditionally would put a stack
                 // write on every 2-D call to save a row on a fifth of them.
                 let mut tv = [0i16; N];
                 tv[..N - lo].copy_from_slice(&t[lo..]);
-                fir_v::<N>(p, tmp, w, &tv, w, h, 6, dst, w, m, &o)
+                for k in 0..P {
+                    let (sk, st) = src[k];
+                    fir_h::<N>(p, &sk[lo * st..], st, &taps[fx], w, rows, shift1, tmp, w, 0, &Fused::NONE);
+                    done[k] = fir_v::<N>(p, tmp, w, &tv, w, h, 6, dst[k], w, mo[k].0, &mo[k].1);
+                }
             }
         }
-    };
+    }
     // Whatever the kernels could not fuse, combine the two-pass way.
-    if want != 0 && (m == 0 || !done) {
-        combine(out, &dst[..w * h], w, h, bit_depth);
+    for (k, o) in out.into_iter().enumerate() {
+        if want[k] != 0 && (mo[k].0 == 0 || !done[k]) {
+            combine(o, &dst[k][..w * h], w, h, bit_depth);
+        }
     }
 }
 
@@ -1732,7 +1925,7 @@ pub fn interp_luma(src: &[u16], stride: usize, fx: usize, fy: usize, w: usize, h
             (w * h) as u64,
         );
     }
-    interp::<8, 4>(src, stride, fx, fy, w, h, bit_depth, &LUMA_FILTER, &LUMA_SPAN, &LUMA_SYM, dst, tmp, out);
+    interp::<8, 4, 1>([(src, stride)], fx, fy, w, h, bit_depth, &LUMA_FILTER, &LUMA_SPAN, &LUMA_SYM, [dst], tmp, [out]);
 }
 
 /// Chroma prediction block (4-tap, eighth-sample).
@@ -1755,7 +1948,36 @@ pub fn interp_chroma(src: &[u16], stride: usize, fx: usize, fy: usize, w: usize,
             (w * h) as u64,
         );
     }
-    interp::<4, 8>(src, stride, fx, fy, w, h, bit_depth, &CHROMA_FILTER, &CHROMA_SPAN, &CHROMA_SYM, dst, tmp, out);
+    interp::<4, 8, 1>([(src, stride)], fx, fy, w, h, bit_depth, &CHROMA_FILTER, &CHROMA_SPAN, &CHROMA_SYM, [dst], tmp, [out]);
+}
+
+/// Both chroma prediction blocks of a prediction unit -- Cb and Cr -- in one
+/// call.
+///
+/// The two planes share the motion vector, so they share the fractional
+/// position, the block size and the filter: everything [`interp_chroma`]
+/// decides before it filters. Called once per plane, that decision -- the
+/// plan read, the arm, the tap tables, the `Out` resolution -- was made twice
+/// for an answer that could not differ; here it is made once and only the
+/// filtering runs per plane. Each `src[k]` is a `(footprint, stride)` pair as
+/// for [`interp_chroma`], `dst[k]` and `out[k]` that plane's intermediate and
+/// write. `tmp` is shared: the planes are filtered one after the other.
+#[allow(clippy::too_many_arguments)]
+pub fn interp_chroma2(src: [(&[u16], usize); 2], fx: usize, fy: usize, w: usize, h: usize, bit_depth: u8, dst: [&mut [i16]; 2], tmp: &mut [i16], out: [Out<'_>; 2]) {
+    if census::ALWAYS {
+        let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar;
+        census::bump(if simd { &census::MC_CHROMA_SIMD } else { &census::MC_CHROMA_SCALAR }, 2);
+        census::bump(&census::SAMPLES_MC, (2 * w * h) as u64);
+        census::bump(
+            match fy {
+                0 => &census::RT_MC_FY_NONE,
+                4 => &census::RT_MC_FY_SYM,
+                _ => &census::RT_MC_FY_ASYM,
+            },
+            (2 * w * h) as u64,
+        );
+    }
+    interp::<4, 8, 2>(src, fx, fy, w, h, bit_depth, &CHROMA_FILTER, &CHROMA_SPAN, &CHROMA_SYM, dst, tmp, out);
 }
 
 #[cfg(test)]
@@ -1921,6 +2143,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `interp_chroma2` is two `interp_chroma` calls: every fractional
+    /// position, all three output modes, widths through every epilogue, both
+    /// bit depths, two DIFFERENT planes and pictures with distinct strides.
+    #[test]
+    fn interp_chroma2_matches_two_calls() {
+        let mut st = 0x5eed_c4c4u32;
+        let mut checked = 0usize;
+        for &bd in &[8u8, 10] {
+            let max = (1u16 << bd) - 1;
+            for &(w, h) in &[(2usize, 2usize), (4, 4), (8, 4), (6, 8), (8, 8), (12, 4), (16, 16), (32, 32), (24, 8)] {
+                let (sa, sb) = (w + 3 + 5, w + 3 + 9);
+                let srca = random_plane(&mut st, sa * (h + 3) + 8, max);
+                let srcb = random_plane(&mut st, sb * (h + 3) + 8, max);
+                let other_a: Vec<i16> = (0..w * h).map(|i| ((i * 37) % 9000) as i16).collect();
+                let other_b: Vec<i16> = (0..w * h).map(|i| ((i * 53) % 9000) as i16).collect();
+                let ps = w + 7;
+                for fy in 0..8 {
+                    for fx in 0..8 {
+                        for mode in 0..3 {
+                            let mut tmp = vec![0i16; w * (h + 3)];
+                            let (mut ra, mut rb) = (vec![0i16; w * h], vec![0i16; w * h]);
+                            let (mut pa, mut pb) = (vec![0u16; ps * h], vec![0u16; ps * h]);
+                            fn out<'a>(mode: u8, pic: &'a mut [u16], stride: usize, other: &'a [i16]) -> Out<'a> {
+                                match mode {
+                                    0 => Out::Pred,
+                                    1 => Out::Uni { pic, stride },
+                                    _ => Out::Bi { pic, stride, other },
+                                }
+                            }
+                            let mk = |pic, other| out(mode, pic, ps, other);
+                            {
+                                let (pa, pb) = (&mut pa[..], &mut pb[..]);
+                                interp_chroma(&srca, sa, fx, fy, w, h, bd, &mut ra, &mut tmp, mk(pa, &other_a));
+                                interp_chroma(&srcb, sb, fx, fy, w, h, bd, &mut rb, &mut tmp, mk(pb, &other_b));
+                            }
+                            let (mut da, mut db) = (vec![0i16; w * h], vec![0i16; w * h]);
+                            let (mut qa, mut qb) = (vec![0u16; ps * h], vec![0u16; ps * h]);
+                            {
+                                let (qa, qb) = (&mut qa[..], &mut qb[..]);
+                                interp_chroma2([(&srca, sa), (&srcb, sb)], fx, fy, w, h, bd, [&mut da, &mut db], &mut tmp, [mk(qa, &other_a), mk(qb, &other_b)]);
+                            }
+                            let tag = format!("{w}x{h} bd={bd} frac=({fx},{fy}) mode={mode}");
+                            if mode == 0 {
+                                assert_eq!((ra, rb), (da, db), "pred {tag}");
+                            } else {
+                                assert_eq!((pa, pb), (qa, qb), "picture {tag}");
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 2 * 9 * 64 * 3);
     }
 
     /// The oracle: the same arithmetic with no dispatch and no kernels.
