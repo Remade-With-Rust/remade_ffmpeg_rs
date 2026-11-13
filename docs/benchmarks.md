@@ -41,7 +41,7 @@ point for a young pure-Rust decoder — not parity, and we don't claim it.
 |-------|------:|---------------|
 | Inter prediction (sub-pixel motion comp) | **~53%** | yes (AVX2) |
 | Loop filter (deblocking) | **~41%** | yes (AVX2) |
-| Inverse transform | ~2% | no (scalar) |
+| Inverse transform | ~2% | no (scalar) — *0.2 found AVX2 kernels here, missing `#[target_feature]`* |
 | Intra prediction | ~2% | no (scalar) |
 | Entropy / token decode | ~2% | no (scalar) |
 
@@ -75,10 +75,45 @@ layout/prefetch + decades of tuning), not a missing multiply trick.
 > default (often slower). A compute-codegen flag can't speed up a memory-bound
 > workload; the phantom win was thermal drift. Lesson recorded in Caveats.
 
-**Conclusion:** the decoder is at its practical single-thread ceiling for a safe
-pure-Rust implementation. There is no free build-flag or compute-SIMD lever left;
-the only real levers are algorithmic memory-traffic reduction (hard) — or
-accepting the gap, since *bit-exact + memory-safe* is the honest story.
+**Conclusion (0.1, superseded — see below):** the decoder is at its practical
+single-thread ceiling for a safe pure-Rust implementation. There is no free
+build-flag or compute-SIMD lever left; the only real levers are algorithmic
+memory-traffic reduction (hard) — or accepting the gap, since *bit-exact +
+memory-safe* is the honest story.
+
+### 0.2 — the ceiling was not the ceiling
+
+> **Correction.** The conclusion above was wrong. A later campaign
+> (`rusty_vp9` 0.2) measured on **instruction counts** (callgrind, deterministic)
+> instead of the wall clock. It found **17.6–34.4% of decode instructions**
+> removable, with the decoded frames unchanged. Most of it was overhead around
+> kernels the table above lists as already SIMD or as negligible:
+>
+> - Motion compensation called a row kernel once per row, 26 calls per block. It now filters the whole block per call, 16 samples a step.
+> - Frame-edge tiles were gathered one clamped sample at a time.
+> - Four inverse-transform kernels had no `#[target_feature]`, so every intrinsic inside them was an out-of-line call.
+>
+> The wall clock ran into the same thermal noise the 0.1 attempts did, but the
+> instruction count gave a stable verdict on each change.
+
+Wall clock, 0.1 sources vs 0.2, single thread, pinned, ABBA-interleaved, minima
+(i7-14650HX, WSL2, both built with rusty_alloc and thin LTO):
+
+| workload | 0.1 | 0.2 | speed-up | pairs won |
+|---|---:|---:|---:|---|
+| decode park_joy 1080p (libvpx stream), ×3 | 1,186 ms | 1,064 ms | **1.11×** | 16/16 |
+| decode this page's 720p clip, ×4 | 962 ms | 885 ms | **1.09×** | 16/16 |
+| decode mobile CIF, high-rate, ×8 | 722 ms | 588 ms | **1.23×** | 16/16 |
+| encode foreman CIF, crf 32, speed 3 | 708 ms | 417 ms | **1.70×** | 12/12 |
+| encode akiyo CIF, crf 32, speed 3 | 351 ms | 174 ms | **2.02×** | 12/12 |
+| encode mobile CIF, crf 32, speed 0 | 1,292 ms | 727 ms | **1.78×** | 8/8 |
+| encode bus CIF, crf 32, speed 5 | 650 ms | 438 ms | **1.48×** | 12/12 |
+
+Decode wall clock improves less than its instruction count. The 1080p frames are
+memory-bound, and the benchmark binary hashes every output byte to prove the
+output is unchanged, which adds the same fixed cost to both arms. The
+FFmpeg comparison table above is from 0.1 and has **not** been re-measured
+against 0.2.
 
 ## Vorbis encode
 

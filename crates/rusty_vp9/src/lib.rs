@@ -925,6 +925,57 @@ pub struct DecodedFrame {
     pub pts: Option<i64>,
 }
 
+/// Append the `w x h` window of a u16 plane to `out` as bytes (`px as u8`).
+///
+/// This is every 8-bit frame the decoder hands out, so it is one pass over
+/// the whole picture per frame. With AVX2 it runs 32 samples a step.
+fn narrow_plane(src: &[u16], stride: usize, w: usize, h: usize, out: &mut Vec<u8>) {
+    #[cfg(target_arch = "x86_64")]
+    if w > 0 && h > 0 && std::is_x86_feature_detected!("avx2") {
+        let src = &src[..(h - 1) * stride + w];
+        out.reserve(w * h);
+        // SAFETY: AVX2 confirmed. Every row read is `w` samples at `y * stride`,
+        // `y < h`, inside the slice just taken; the `w * h` bytes written lie in
+        // the capacity just reserved, and all of them are initialised before
+        // `set_len` exposes them.
+        unsafe {
+            narrow_plane_avx2(src.as_ptr(), stride, w, h, out.as_mut_ptr().add(out.len()));
+            out.set_len(out.len() + w * h);
+        }
+        return;
+    }
+    for y in 0..h {
+        let row = &src[y * stride..y * stride + w];
+        out.extend(row.iter().map(|&px| px as u8));
+    }
+}
+
+/// # Safety
+/// AVX2 present; `src` readable for `(h - 1) * stride + w` samples; `dst`
+/// writable for `w * h` bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn narrow_plane_avx2(src: *const u16, stride: usize, w: usize, h: usize, dst: *mut u8) {
+    use std::arch::x86_64::*;
+    // `px as u8` keeps the low byte, so mask before the saturating pack.
+    let mask = _mm256_set1_epi16(0x00ff);
+    for y in 0..h {
+        let (s, d) = (src.add(y * stride), dst.add(y * w));
+        let mut x = 0;
+        while x + 32 <= w {
+            let a = _mm256_and_si256(_mm256_loadu_si256(s.add(x) as *const __m256i), mask);
+            let b = _mm256_and_si256(_mm256_loadu_si256(s.add(x + 16) as *const __m256i), mask);
+            let p = _mm256_permute4x64_epi64::<0xD8>(_mm256_packus_epi16(a, b));
+            _mm256_storeu_si256(d.add(x) as *mut __m256i, p);
+            x += 32;
+        }
+        while x < w {
+            *d.add(x) = *s.add(x) as u8;
+            x += 1;
+        }
+    }
+}
+
 /// Crop a decoded reference frame to its visible planes and wrap it as a
 /// [`DecodedFrame`]. 8-bit planes are emitted as bytes; 10/12-bit planes as
 /// little-endian `u16`.
@@ -935,15 +986,15 @@ fn crop_frame(rf: &decode::RefFrame, ss_x: u32, ss_y: u32, pts: Option<i64>) -> 
     for p in 0..3 {
         let (stride, w, hh) = (rf.stride[p], rf.w[p], rf.h[p]);
         let mut v = Vec::with_capacity(w * hh * if hbd { 2 } else { 1 });
-        for y in 0..hh {
-            let row = &rf.planes[p][y * stride..y * stride + w];
-            if hbd {
+        if hbd {
+            for y in 0..hh {
+                let row = &rf.planes[p][y * stride..y * stride + w];
                 for &px in row {
                     v.extend_from_slice(&px.to_le_bytes());
                 }
-            } else {
-                v.extend(row.iter().map(|&px| px as u8));
             }
+        } else {
+            narrow_plane(&rf.planes[p], stride, w, hh, &mut v);
         }
         planes.push(v);
         strides.push(if hbd { w * 2 } else { w });
@@ -1178,6 +1229,42 @@ mod tests {
             "[bench-par] threads={threads} {total} frames in {:.3}s -> {:.0} fps aggregate ({:.0} fps/thread)",
             el.as_secs_f64(), total as f64 / el.as_secs_f64(), total as f64 / el.as_secs_f64() / threads as f64
         );
+    }
+
+    /// The plane narrowing equals `px as u8` sample for sample: odd widths
+    /// (vector body plus tail), strides wider than the row, values above 255
+    /// (truncation, not saturation), appended after existing bytes.
+    #[test]
+    fn narrow_plane_matches_truncation() {
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        for &(w, h, stride) in &[
+            (1usize, 1usize, 1usize),
+            (31, 3, 40),
+            (32, 2, 32),
+            (33, 5, 37),
+            (176, 4, 180),
+            (1920, 2, 1920),
+        ] {
+            let src: Vec<u16> = (0..stride * h)
+                .map(|i| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    if i % 5 == 0 {
+                        s as u16
+                    } else {
+                        (s % 256) as u16
+                    }
+                })
+                .collect();
+            let mut got = vec![0xAAu8; 3];
+            narrow_plane(&src, stride, w, h, &mut got);
+            let mut want = vec![0xAAu8; 3];
+            for y in 0..h {
+                want.extend(src[y * stride..y * stride + w].iter().map(|&px| px as u8));
+            }
+            assert_eq!(got, want, "{w}x{h} stride {stride}");
+        }
     }
 
     #[test]

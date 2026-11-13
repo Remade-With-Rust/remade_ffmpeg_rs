@@ -109,7 +109,7 @@ rff-codec-mp3 = { path = "crates/rff-codec-mp3", version = "1.0.11" }
 # crate + thin rff-codec-* adapter). Each carries its OWN version â€” they ship
 # to crates.io on their own cadence, decoupled from the workspace version and
 # from each other, so these no longer move in lockstep at 0.1.x.
-rusty_vp9 = { path = "crates/rusty_vp9", version = "0.1.3" }
+rusty_vp9 = { path = "crates/rusty_vp9", version = "0.2.0" }
 rusty_h265 = { path = "crates/rusty_h265", version = "0.7.1" }
 rusty_h265-accel = { path = "crates/rusty_h265-accel", version = "0.7.1", default-features = false }
 rusty_flac = { path = "crates/rusty_flac", version = "0.2.2" }
@@ -223,7 +223,7 @@ jxl-oxide = "0.12"
 # LIBRARY behind a default-on `global-alloc` feature. That would hard-error
 # against the declaration above, so `rff-codec-h264` pins it with
 # `default-features = false`. Do not remove that.
-rusty_alloc-api = "=2.2.6"
+rusty_alloc-api = "=2.5.0"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-rustcrypto = "0.0.2-alpha"
 rustls-native-certs = "0.8"

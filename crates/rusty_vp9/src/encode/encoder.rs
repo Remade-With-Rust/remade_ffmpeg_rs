@@ -458,15 +458,63 @@ impl Default for Vp9Encoder {
 /// Copy a `u8` plane (display size) into a coded-size `u16` buffer, replicating
 /// the last in-frame row/column into the padding (libvpx `extend_frame`).
 fn to_coded(plane: &[u8], stride: usize, dw: usize, dh: usize, cw: usize, ch: usize) -> Vec<u16> {
-    let mut out = vec![0u16; cw * ch];
-    for y in 0..ch {
-        let sy = y.min(dh - 1);
-        for x in 0..cw {
-            let sx = x.min(dw - 1);
-            out[y * cw + x] = plane[sy * stride + sx] as u16;
-        }
+    // `out[y][x] = plane[min(y, dh - 1)][min(x, dw - 1)]`, built a row at a time
+    // into reserved capacity: widen the visible span, replicate its last sample
+    // across the right padding, then replicate the last visible row downwards.
+    // The old form zero-filled the whole plane first and then clamped both
+    // coordinates and computed a 2-D index for every sample.
+    assert!(dw >= 1 && dh >= 1, "empty source plane");
+    let mut out: Vec<u16> = Vec::with_capacity(cw * ch);
+    let copy_w = dw.min(cw);
+    let rows = dh.min(ch);
+    for y in 0..rows {
+        let row = &plane[y * stride..][..copy_w];
+        out.extend(row.iter().map(|&p| p as u16));
+        let last = row[copy_w - 1] as u16;
+        out.resize(out.len() + (cw - copy_w), last);
+    }
+    for _ in rows..ch {
+        let start = out.len() - cw;
+        out.extend_from_within(start..start + cw);
     }
     out
+}
+
+#[cfg(test)]
+mod to_coded_tests {
+    use super::to_coded;
+
+    /// Against the per-sample definition, with and without padding on each axis.
+    #[test]
+    fn to_coded_matches_definition() {
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        for &(dw, dh, cw, ch, stride) in &[
+            (13usize, 9usize, 16usize, 16usize, 17usize),
+            (16, 16, 16, 16, 16),
+            (1, 1, 8, 8, 3),
+            (8, 5, 8, 8, 8),
+            (5, 8, 8, 8, 11),
+            (352, 288, 352, 288, 352),
+            (175, 143, 176, 144, 180),
+        ] {
+            let plane: Vec<u8> = (0..stride * dh)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    s as u8
+                })
+                .collect();
+            let got = to_coded(&plane, stride, dw, dh, cw, ch);
+            assert_eq!(got.len(), cw * ch);
+            for y in 0..ch {
+                for x in 0..cw {
+                    let want = plane[y.min(dh - 1) * stride + x.min(dw - 1)] as u16;
+                    assert_eq!(got[y * cw + x], want, "{dw}x{dh} -> {cw}x{ch} at ({x},{y})");
+                }
+            }
+        }
+    }
 }
 
 impl Vp9Encoder {

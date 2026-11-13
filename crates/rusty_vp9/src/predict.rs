@@ -73,26 +73,30 @@ fn g(dst: &[u16], stride: usize, r: usize, c: usize) -> u16 {
 }
 
 fn v_pred(dst: &mut [u16], stride: usize, bs: usize, above: &[u16]) {
+    // Every row is the `bs` samples above the block (`above[0]` is the corner).
+    let row = &above[1..1 + bs];
     for r in 0..bs {
-        for c in 0..bs {
-            *d(dst, stride, r, c) = a(above, c as i32);
-        }
+        dst[r * stride..][..bs].copy_from_slice(row);
     }
 }
 
 fn h_pred(dst: &mut [u16], stride: usize, bs: usize, left: &[u16]) {
+    // A row is one value: fill it, rather than index `dst` once per sample.
     for r in 0..bs {
-        for c in 0..bs {
-            *d(dst, stride, r, c) = left[r];
-        }
+        dst[r * stride..][..bs].fill(left[r]);
     }
 }
 
 fn tm_pred(dst: &mut [u16], stride: usize, bs: usize, above: &[u16], left: &[u16], max: i32) {
     let tl = a(above, -1) as i32;
+    let ab = &above[1..1 + bs];
     for r in 0..bs {
-        for c in 0..bs {
-            *d(dst, stride, r, c) = clip(left[r] as i32 + a(above, c as i32) as i32 - tl, max);
+        // Per row `left[r] - tl` is a constant; the row is that plus `above`,
+        // clamped. On slices the loop has no per-sample index arithmetic or
+        // bounds check and vectorises.
+        let base = left[r] as i32 - tl;
+        for (o, &av) in dst[r * stride..][..bs].iter_mut().zip(ab) {
+            *o = clip(base + av as i32, max);
         }
     }
 }
@@ -122,9 +126,7 @@ fn dc_pred(
         ((max + 1) >> 1) as u16
     };
     for r in 0..bs {
-        for c in 0..bs {
-            *d(dst, stride, r, c) = dc;
-        }
+        dst[r * stride..][..bs].fill(dc);
     }
 }
 
