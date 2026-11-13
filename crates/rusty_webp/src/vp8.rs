@@ -1466,10 +1466,12 @@ impl<R: Read> Vp8Decoder<R> {
             LumaMode::H => predict_hpred(&mut ws, 16, 1, 1, stride),
             LumaMode::TM => predict_tmpred(&mut ws, 16, 1, 1, stride),
             LumaMode::DC => predict_dcpred(&mut ws, 16, stride, mby != 0, mbx != 0),
-            LumaMode::B => predict_4x4(&mut ws, stride, &mb.bpred, resdata),
+            LumaMode::B => predict_4x4(&mut ws, stride, &mb.bpred, resdata, mb.non_zero_dct),
         }
 
-        if mb.luma_mode != LumaMode::B {
+        // `non_zero_dct` is false when no block of the macroblock has a
+        // residual (every one is all zero): adding it would change nothing.
+        if mb.luma_mode != LumaMode::B && mb.non_zero_dct {
             for y in 0usize..4 {
                 for x in 0usize..4 {
                     let i = x + y * 4;
@@ -1534,7 +1536,10 @@ impl<R: Read> Vp8Decoder<R> {
             }
         }
 
-        for y in 0usize..2 {
+        // No residual anywhere in the macroblock: nothing to add. (A zero
+        // trip count rather than an `if` around the loops: measured better.)
+        let rows = if mb.non_zero_dct { 2usize } else { 0 };
+        for y in 0..rows {
             for x in 0usize..2 {
                 let i = x + y * 2;
                 let urb: &[i32; 16] = resdata[16 * 16 + i * 16..][..16].try_into().unwrap();
@@ -2419,7 +2424,16 @@ fn add_residue(pblock: &mut [u8], rblock: &[i32; 16], y0: usize, x0: usize, stri
     }
 }
 
-fn predict_4x4(ws: &mut [u8], stride: usize, modes: &[IntraMode], resdata: &[i32]) {
+/// Predicts the sixteen 4x4 luma blocks in turn, adding each one's residual
+/// (later blocks predict from it). `add_residual` is false when every
+/// residual of the macroblock is zero.
+fn predict_4x4(
+    ws: &mut [u8],
+    stride: usize,
+    modes: &[IntraMode],
+    resdata: &[i32],
+    add_residual: bool,
+) {
     for sby in 0usize..4 {
         for sbx in 0usize..4 {
             let i = sbx + sby * 4;
@@ -2439,8 +2453,10 @@ fn predict_4x4(ws: &mut [u8], stride: usize, modes: &[IntraMode], resdata: &[i32
                 IntraMode::HU => predict_bhupred(ws, x0, y0, stride),
             }
 
-            let rb: &[i32; 16] = resdata[i * 16..][..16].try_into().unwrap();
-            add_residue(ws, rb, y0, x0, stride);
+            if add_residual {
+                let rb: &[i32; 16] = resdata[i * 16..][..16].try_into().unwrap();
+                add_residue(ws, rb, y0, x0, stride);
+            }
         }
     }
 }
@@ -2807,7 +2823,7 @@ mod benches {
         ];
 
         b.iter(|| {
-            black_box(predict_4x4(&mut v, W * 2, &modes, &res_data));
+            black_box(predict_4x4(&mut v, W * 2, &modes, &res_data, true));
         });
     }
 
