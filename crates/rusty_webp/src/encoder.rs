@@ -330,23 +330,41 @@ fn hash2(a: u32, b: u32) -> usize {
 /// neighbours (dx, dy) for the current image width; everything else is
 /// `distance + 120`.
 struct DistMapper {
-    map: std::collections::HashMap<usize, u32>,
+    /// `short[d]` is the short code (1..=120) of pixel distance `d`, or 0 if
+    /// it has none. The short codes name neighbours at most seven rows up,
+    /// so the table is `7 * width + 9` bytes and a lookup is one load. (A
+    /// `HashMap` hashed every lookup with SipHash under a per-process random
+    /// key, which also made the encoder's instruction count vary from run
+    /// to run.)
+    short: Vec<u8>,
 }
 
 impl DistMapper {
     fn new(width: usize) -> Self {
-        let mut map = std::collections::HashMap::with_capacity(120);
+        let distance = |dx: i8, dy: i8| i64::from(dx) + i64::from(dy) * width as i64;
+        let longest = crate::lossless::DISTANCE_MAP
+            .iter()
+            .map(|&(dx, dy)| distance(dx, dy))
+            .max()
+            .unwrap_or(0)
+            .max(0) as usize;
+        let mut short = vec![0u8; longest + 1];
         for (i, &(dx, dy)) in crate::lossless::DISTANCE_MAP.iter().enumerate() {
-            let d = i64::from(dx) + i64::from(dy) * width as i64;
-            if d >= 1 {
-                map.entry(d as usize).or_insert(i as u32 + 1);
+            let d = distance(dx, dy);
+            // Several (dx, dy) can name one distance on narrow images: the
+            // first (lowest) code wins.
+            if d >= 1 && short[d as usize] == 0 {
+                short[d as usize] = i as u8 + 1;
             }
         }
-        Self { map }
+        Self { short }
     }
 
     fn code(&self, dist: usize) -> u32 {
-        self.map.get(&dist).copied().unwrap_or(dist as u32 + 120)
+        match self.short.get(dist) {
+            Some(&code) if code != 0 => u32::from(code),
+            _ => dist as u32 + 120,
+        }
     }
 }
 
@@ -1679,5 +1697,30 @@ mod tests {
             .encode(&img, 256, 256, crate::ColorType::Rgba8)
             .unwrap();
         assert_eq!(img, decode_rgba(&output, 256, 256));
+    }
+}
+
+#[cfg(test)]
+mod dist_mapper_tests {
+    use super::DistMapper;
+
+    /// The sorted table must give what the insertion-ordered map gave: the
+    /// first (lowest) code among the neighbours that name a distance.
+    #[test]
+    fn matches_first_insertion_map() {
+        for width in [1usize, 2, 3, 7, 8, 9, 16, 17, 100, 1920, 16383] {
+            let mut map = std::collections::HashMap::new();
+            for (i, &(dx, dy)) in crate::lossless::DISTANCE_MAP.iter().enumerate() {
+                let d = i64::from(dx) + i64::from(dy) * width as i64;
+                if d >= 1 {
+                    map.entry(d as usize).or_insert(i as u32 + 1);
+                }
+            }
+            let mapper = DistMapper::new(width);
+            for dist in 1..=(8 * width + 40) {
+                let want = map.get(&dist).copied().unwrap_or(dist as u32 + 120);
+                assert_eq!(mapper.code(dist), want, "width {width} dist {dist}");
+            }
+        }
     }
 }
