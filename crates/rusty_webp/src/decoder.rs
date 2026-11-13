@@ -246,6 +246,10 @@ struct AnimationState {
     previous_frame_x_offset: u32,
     previous_frame_y_offset: u32,
     canvas: Option<Vec<u8>>,
+    /// The pixel buffer of the last decoded frame, kept for the next one.
+    /// Every frame decode overwrites its whole buffer, so reusing it saves
+    /// allocating and zero-filling a frame's worth of memory per frame.
+    frame_scratch: Vec<u8>,
 }
 impl Default for AnimationState {
     fn default() -> Self {
@@ -258,6 +262,7 @@ impl Default for AnimationState {
             previous_frame_x_offset: 0,
             previous_frame_y_offset: 0,
             canvas: None,
+            frame_scratch: Vec::new(),
         }
     }
 }
@@ -845,14 +850,20 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
                 {
                     return Err(DecodingError::InconsistentImageSizes);
                 }
-                let mut rgb_frame = vec![0; frame_width as usize * frame_height as usize * 3];
+                let mut rgb_frame = reuse_buffer(
+                    &mut self.animation.frame_scratch,
+                    frame_width as usize * frame_height as usize * 3,
+                );
                 raw_frame.fill_rgb(&mut rgb_frame, self.webp_decode_options.lossy_upsampling);
                 (rgb_frame, false)
             }
             WebPRiffChunk::VP8L => {
                 let reader = (&mut self.r).take(chunk_size);
                 let mut lossless_decoder = LosslessDecoder::new(reader);
-                let mut rgba_frame = vec![0; frame_width as usize * frame_height as usize * 4];
+                let mut rgba_frame = reuse_buffer(
+                    &mut self.animation.frame_scratch,
+                    frame_width as usize * frame_height as usize * 4,
+                );
                 lossless_decoder.decode_frame(frame_width, frame_height, false, &mut rgba_frame)?;
                 (rgba_frame, true)
             }
@@ -876,7 +887,10 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
 
                 let frame = Vp8Decoder::decode_frame((&mut self.r).take(next_chunk_size))?;
 
-                let mut rgba_frame = vec![0; frame_width as usize * frame_height as usize * 4];
+                let mut rgba_frame = reuse_buffer(
+                    &mut self.animation.frame_scratch,
+                    frame_width as usize * frame_height as usize * 4,
+                );
                 frame.fill_rgba(&mut rgba_frame, self.webp_decode_options.lossy_upsampling);
 
                 alpha_chunk.apply(&mut rgba_frame, usize::from(frame.width));
@@ -915,6 +929,8 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
             self.animation.previous_frame_x_offset,
             self.animation.previous_frame_y_offset,
         );
+
+        self.animation.frame_scratch = frame;
 
         self.animation.previous_frame_width = frame_width;
         self.animation.previous_frame_height = frame_height;
@@ -986,6 +1002,14 @@ pub(crate) fn rgba_to_rgb(rgba: &[u8], rgb: &mut [u8]) {
     {
         dst.copy_from_slice(&src[..3]);
     }
+}
+
+/// Take `scratch` as a buffer of exactly `len` bytes. Its previous contents
+/// are kept (only growth is zero-filled): the caller overwrites all of it.
+fn reuse_buffer(scratch: &mut Vec<u8>, len: usize) -> Vec<u8> {
+    let mut buffer = std::mem::take(scratch);
+    buffer.resize(len, 0);
+    buffer
 }
 
 pub(crate) fn range_reader<R: BufRead + Seek>(
