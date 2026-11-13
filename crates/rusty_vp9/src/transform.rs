@@ -1456,6 +1456,10 @@ mod idct_avx2 {
     /// # Safety
     /// AVX2 required; `tmp` holds 1024 i32 and `dest` covers 32 rows of 32 `u16`
     /// at `stride` — the same accesses the scalar column loop makes.
+    // `target_feature` matters here: without it this function is compiled for
+    // the baseline, the SSE4.1/AVX2 intrinsics below cannot inline into it, and
+    // every one of them becomes a real call with its vectors passed in memory.
+    #[target_feature(enable = "avx2")]
     pub(super) unsafe fn idct32_cols_add(tmp: &[i32], dest: &mut [u16], stride: usize, max: i32) {
         const SHIFT: i32 = 6;
         let zero = _mm_setzero_si128();
@@ -1494,6 +1498,10 @@ mod idct_avx2 {
     /// # Safety
     /// AVX2 required; `tmp` holds 256 i32 and `dest` covers 16 rows of 16 `u16`
     /// at `stride` — the same accesses the scalar column loop makes.
+    // `target_feature` matters here: without it this function is compiled for
+    // the baseline, the SSE4.1/AVX2 intrinsics below cannot inline into it, and
+    // every one of them becomes a real call with its vectors passed in memory.
+    #[target_feature(enable = "avx2")]
     pub(super) unsafe fn idct16_cols_add(tmp: &[i32], dest: &mut [u16], stride: usize, max: i32) {
         // 16x16 always uses the size-6 final round-shift (4->4, 8->5, 16/32->6),
         // so it is a compile-time constant here rather than a parameter.
@@ -1573,6 +1581,10 @@ mod idct_avx2 {
     /// # Safety
     /// AVX2 must be available, `coeffs` must hold 16 i32, and `dest` must cover
     /// 4 rows of 4 `u16` at `stride` — the same accesses the scalar path makes.
+    // `target_feature` matters here: without it this function is compiled for
+    // the baseline, the SSE4.1/AVX2 intrinsics below cannot inline into it, and
+    // every one of them becomes a real call with its vectors passed in memory.
+    #[target_feature(enable = "avx2")]
     pub(super) unsafe fn idct4x4_add(
         coeffs: &[i32],
         dest: &mut [u16],
@@ -1609,6 +1621,10 @@ mod idct_avx2 {
         }
     }
 
+    // `target_feature` matters here: without it this function is compiled for
+    // the baseline, the SSE4.1/AVX2 intrinsics below cannot inline into it, and
+    // every one of them becomes a real call with its vectors passed in memory.
+    #[target_feature(enable = "avx2")]
     pub(super) unsafe fn idct8x8_add(
         coeffs: &[i32],
         dest: &mut [u16],
