@@ -121,9 +121,15 @@ type YSnap = (Vec<u16>, [u8; 16], [u8; 16]);
 /// so a NONE trial can be rolled back before trying SPLIT and vice-versa.
 struct BlockSnap {
     rec: [Vec<u16>; 3],
-    above_ctx: [Vec<u8>; 3],
+    /// The block's span of each plane's above context: at most 16 entries (a
+    /// 64-wide block), so held inline with its length. As four pooled `Vec`s
+    /// (with `above_seg`) these cost a pool take and a pool put apiece per
+    /// snapshot, to carry between 1 and 16 bytes each.
+    above_ctx: [[u8; 16]; 3],
+    above_len: [u8; 3],
     left_ctx: [[u8; 16]; 3],
-    above_seg: Vec<u8>,
+    above_seg: [u8; 8],
+    seg_len: u8,
     left_seg: [u8; 8],
     mi: Vec<ModeInfo>,
     x_mis: usize,
@@ -149,7 +155,6 @@ struct BlockSnap {
 // the copy itself is load-bearing and only where its memory COMES FROM is free to change.
 thread_local! {
     static POOL_U16: RefCell<Vec<Vec<u16>>> = const { RefCell::new(Vec::new()) };
-    static POOL_U8: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
     static POOL_MI: RefCell<Vec<Vec<ModeInfo>>> = const { RefCell::new(Vec::new()) };
 }
 /// The RD pass's decision cache: `(mi_row, mi_col, bsize) -> (winning mode, predictor,
@@ -340,7 +345,6 @@ pub fn set_snap_pool(on: bool) {
     SNAP_POOL.store(on as u8, std::sync::atomic::Ordering::Relaxed);
     if !on {
         let _ = POOL_U16.try_with(|p| p.borrow_mut().clear());
-        let _ = POOL_U8.try_with(|p| p.borrow_mut().clear());
         let _ = POOL_MI.try_with(|p| p.borrow_mut().clear());
     }
 }
@@ -378,7 +382,6 @@ macro_rules! pool_ops {
     };
 }
 pool_ops!(take_u16, put_u16, POOL_U16, u16);
-pool_ops!(take_u8, put_u8, POOL_U8, u8);
 pool_ops!(take_mi, put_mi, POOL_MI, ModeInfo);
 
 impl Drop for BlockSnap {
@@ -387,10 +390,6 @@ impl Drop for BlockSnap {
         for v in &mut self.rec {
             put_u16(std::mem::take(v));
         }
-        for v in &mut self.above_ctx {
-            put_u8(std::mem::take(v));
-        }
-        put_u8(std::mem::take(&mut self.above_seg));
         put_mi(std::mem::take(&mut self.mi));
     }
 }
@@ -2913,23 +2912,28 @@ impl FrameEncoder {
         // Slice the above-ctx/seg snapshots to the block's span — cloning the
         // frame-width Vecs per snapshot was pure overhead (a trial only mutates
         // the columns the block covers).
-        let above_ctx = std::array::from_fn(|pl| {
+        let mut above_ctx = [[0u8; 16]; 3];
+        let mut above_len = [0u8; 3];
+        for pl in 0..3 {
             let ss = self.rec[pl].ss_x;
             let c0 = (mi_col * 2) >> ss;
             let w = ((x_mis * 2) >> ss).max(1);
             let end = (c0 + w).min(self.above_ctx[pl].len());
-            let mut v = take_u8(end.saturating_sub(c0));
-            v.extend_from_slice(&self.above_ctx[pl][c0..end]);
-            v
-        });
+            let span = &self.above_ctx[pl][c0..end];
+            above_ctx[pl][..span.len()].copy_from_slice(span);
+            above_len[pl] = span.len() as u8;
+        }
         let seg_end = (mi_col + x_mis).min(self.above_seg.len());
-        let mut above_seg = take_u8(seg_end.saturating_sub(mi_col));
-        above_seg.extend_from_slice(&self.above_seg[mi_col..seg_end]);
+        let seg_span = &self.above_seg[mi_col..seg_end];
+        let mut above_seg = [0u8; 8];
+        above_seg[..seg_span.len()].copy_from_slice(seg_span);
         BlockSnap {
             rec,
             above_ctx,
+            above_len,
             left_ctx: self.left_ctx,
             above_seg,
+            seg_len: seg_span.len() as u8,
             left_seg: self.left_seg,
             mi,
             x_mis,
@@ -2960,12 +2964,12 @@ impl FrameEncoder {
         for pl in 0..3 {
             let ss = self.rec[pl].ss_x;
             let c0 = (mi_col * 2) >> ss;
-            let end = (c0 + s.above_ctx[pl].len()).min(self.above_ctx[pl].len());
+            let end = (c0 + s.above_len[pl] as usize).min(self.above_ctx[pl].len());
             self.above_ctx[pl][c0..end].copy_from_slice(&s.above_ctx[pl][..end - c0]);
         }
         self.left_ctx = s.left_ctx;
         let sc0 = mi_col;
-        let send = (sc0 + s.above_seg.len()).min(self.above_seg.len());
+        let send = (sc0 + s.seg_len as usize).min(self.above_seg.len());
         self.above_seg[sc0..send].copy_from_slice(&s.above_seg[..send - sc0]);
         self.left_seg = s.left_seg;
         let mut k = 0;
