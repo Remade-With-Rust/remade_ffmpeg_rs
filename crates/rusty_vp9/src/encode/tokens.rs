@@ -1065,8 +1065,7 @@ mod tests {
                 let mut walk = CostSink(0);
                 let class = code_magnitude(&mut walk, aval, prob2 as u8, &CAT6_PROB, 14);
                 assert_eq!(
-                    MAG_COST[prob2 as usize][aval as usize] as u64,
-                    walk.0,
+                    MAG_COST[prob2 as usize][aval as usize] as u64, walk.0,
                     "prob2={prob2} aval={aval}"
                 );
                 assert_eq!(class_of(aval), class, "class prob2={prob2} aval={aval}");

@@ -1237,13 +1237,24 @@ mod tests {
     #[test]
     fn narrow_plane_matches_truncation() {
         let mut s = 0x9e37_79b9_7f4a_7c15u64;
-        for &(w, h, stride) in &[(1usize, 1usize, 1usize), (31, 3, 40), (32, 2, 32), (33, 5, 37), (176, 4, 180), (1920, 2, 1920)] {
+        for &(w, h, stride) in &[
+            (1usize, 1usize, 1usize),
+            (31, 3, 40),
+            (32, 2, 32),
+            (33, 5, 37),
+            (176, 4, 180),
+            (1920, 2, 1920),
+        ] {
             let src: Vec<u16> = (0..stride * h)
                 .map(|i| {
                     s ^= s << 13;
                     s ^= s >> 7;
                     s ^= s << 17;
-                    if i % 5 == 0 { s as u16 } else { (s % 256) as u16 }
+                    if i % 5 == 0 {
+                        s as u16
+                    } else {
+                        (s % 256) as u16
+                    }
                 })
                 .collect();
             let mut got = vec![0xAAu8; 3];

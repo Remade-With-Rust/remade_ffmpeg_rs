@@ -1484,7 +1484,11 @@ unsafe fn filter_edge8_avx2<const W: usize, const VERT: bool>(
     // count, the store count and the contiguous/transposed choice below are all
     // compile-time constants in each, instead of branches taken per edge.
     let width = W;
-    let (pos_stride, lane_stride) = if VERT { (1usize, stride) } else { (stride, 1usize) };
+    let (pos_stride, lane_stride) = if VERT {
+        (1usize, stride)
+    } else {
+        (stride, 1usize)
+    };
     let bp = buf.as_mut_ptr();
     let ls = lane_stride as isize;
     let ps = pos_stride as isize;
@@ -1582,7 +1586,10 @@ unsafe fn filter_edge8_avx2<const W: usize, const VERT: bool>(
             let pk = _mm256_packus_epi32(*v, *v);
             let ra = i as isize + l as isize * ls;
             let rb = i as isize + (l as isize + 4) * ls;
-            _mm_storel_epi64(bp.offset(ra - 2) as *mut __m128i, _mm256_castsi256_si128(pk));
+            _mm_storel_epi64(
+                bp.offset(ra - 2) as *mut __m128i,
+                _mm256_castsi256_si128(pk),
+            );
             _mm_storel_epi64(
                 bp.offset(rb - 2) as *mut __m128i,
                 _mm256_extracti128_si256::<1>(pk),

@@ -275,7 +275,10 @@ mod blockkern_tests {
             let (w, h) = (1024usize, 3usize);
             let a = vec![max as u16; w * h];
             let b = vec![0u16; w * h];
-            assert_eq!(block_sse(&a, w, &b, w, w, h), block_sse_scalar(&a, w, &b, w, w, h));
+            assert_eq!(
+                block_sse(&a, w, &b, w, w, h),
+                block_sse_scalar(&a, w, &b, w, w, h)
+            );
             assert_eq!(block_sse(&a, w, &b, w, w, h), (max * max) * (w * h) as u64);
         }
     }

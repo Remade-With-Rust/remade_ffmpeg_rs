@@ -79,7 +79,9 @@ use crate::decode::{average_split_mvs, INTER_MODE_TREE};
 use crate::geom_tables::{B_HEIGHT_LOG2, B_WIDTH_LOG2};
 use crate::geom_tables::{MAX_TXSIZE, SIZE_GROUP};
 use crate::inter::{predict_block, RefPlane};
-use crate::loopfilter::{build_plane_masks, loop_filter_frame, loop_filter_plane_masked, PlaneMasks};
+use crate::loopfilter::{
+    build_plane_masks, loop_filter_frame, loop_filter_plane_masked, PlaneMasks,
+};
 use crate::mv::{find_mv_refs, get_mode_context, lower_mv_precision, use_mv_hp, MvRef, NmvCounts};
 use crate::predict::{build_intra_edges, predict};
 use crate::prob_tables::{DEFAULT_COEF_PROBS, KF_PARTITION_PROBS};
@@ -5126,8 +5128,7 @@ impl FrameEncoder {
                 self.me_skip
             };
             let (pr, pc) = (predictor.0 / 8, predictor.1 / 8);
-            let psad =
-                self.block_sad_sized_fast(base_x, base_y, pr, pc, swl, shl, i64::MAX, ref8);
+            let psad = self.block_sad_sized_fast(base_x, base_y, pr, pc, swl, shl, i64::MAX, ref8);
             let area = ((1i64 << bwl) * (1i64 << bhl) * 16) as f64; // luma pixels
             if (psad as f64) < t * area {
                 if realtime_skip {
@@ -5940,14 +5941,7 @@ impl FrameEncoder {
         if let Some(r8) = ref8 {
             let (fx, fy) = ((mv_q4.1 & 15) as usize, (mv_q4.0 & 15) as usize);
             let sp = &self.src[0];
-            if crate::inter::score4x4_window_ok(
-                    rp.w as i32,
-                    rp.h as i32,
-                    bx,
-                    by,
-                    fx != 0,
-                    fy != 0,
-                )
+            if crate::inter::score4x4_window_ok(rp.w as i32, rp.h as i32, bx, by, fx != 0, fy != 0)
                 && (base_y + 3) * sp.stride + base_x + 4 <= self.src8.len()
             {
                 let refp8 = crate::inter::RefPlane8 {
@@ -6162,7 +6156,7 @@ impl FrameEncoder {
                         }
                         let mv = (r * 8, c * 8);
                         let sad =
-                    self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges, ref8);
+                            self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges, ref8);
                         if sad < best_sad {
                             best_sad = sad;
                             best = mv;
@@ -6175,8 +6169,7 @@ impl FrameEncoder {
             // (~15–25 SADs vs 162 exhaustive). Whole-pel candidates, 1/8-pel units.
             let consider = |best_sad: &mut i64, best: &mut Mv, r: i32, c: i32| {
                 let mv = (r * 8, c * 8);
-                let sad =
-                    self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges, ref8);
+                let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges, ref8);
                 if sad < *best_sad {
                     *best_sad = sad;
                     *best = mv;
@@ -6220,8 +6213,7 @@ impl FrameEncoder {
                     continue; // `int` itself: already scored, cannot beat its own SAD
                 }
                 let mv = (int.0 + dr, int.1 + dc);
-                let sad =
-                    self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges, ref8);
+                let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges, ref8);
                 if sad < best_sad {
                     best_sad = sad;
                     best = mv;
@@ -6740,7 +6732,10 @@ impl FrameEncoder {
         // ~17 KB `TxScratch` on every call and frees it at the restore. That was
         // one `zalloc` + memset + free per transform block (callgrind: 20.6K Ir
         // per call, 53-62% of encode Ir; wall -9..-30%, 16/16 paired rounds).
-        let mut scratch = self.tx_scratch.take().expect("tx scratch is never lent twice");
+        let mut scratch = self
+            .tx_scratch
+            .take()
+            .expect("tx scratch is never lent twice");
         if self.tx_memset {
             scratch.clear(); // VP9_TX_MEMSET=1 — the A/B oracle arm
         }
@@ -7326,9 +7321,9 @@ impl FrameEncoder {
     fn luma_sse_of(&self, buf: &[u16]) -> u64 {
         let src = &self.src[0].buf;
         let n = self.src[0].w * self.src[0].h; // coded region only (skip padding rows)
-        // The whole frame as one long row through the SSE kernel. This runs once
-        // per candidate filter level (about 15 times a frame) and was a scalar
-        // i64 loop at ~7.5 instructions a pixel.
+                                               // The whole frame as one long row through the SSE kernel. This runs once
+                                               // per candidate filter level (about 15 times a frame) and was a scalar
+                                               // i64 loop at ~7.5 instructions a pixel.
         super::blockkern::run_sse(&src[..n], &buf[..n])
     }
 
@@ -7356,8 +7351,9 @@ impl FrameEncoder {
         h.loop_filter_level = lvl;
         c0.copy_from_slice(&self.rec[0].buf);
         let stride = self.rec[0].stride;
-        let done = masks
-            .is_some_and(|m| loop_filter_plane_masked(c0, stride, m, self.mi_rows, self.mi_cols, h));
+        let done = masks.is_some_and(|m| {
+            loop_filter_plane_masked(c0, stride, m, self.mi_rows, self.mi_cols, h)
+        });
         if !done {
             let mut planes = [(&mut *c0, stride, 0usize, 0usize)];
             loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
@@ -7368,7 +7364,10 @@ impl FrameEncoder {
             let mut chk = self.rec[0].buf.clone();
             let mut planes = [(&mut chk[..], stride, 0usize, 0usize)];
             loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
-            assert!(chk[..] == c0[..], "masked loop filter diverged at level {lvl}");
+            assert!(
+                chk[..] == c0[..],
+                "masked loop filter diverged at level {lvl}"
+            );
         }
         self.luma_sse_of(c0)
     }
@@ -7539,7 +7538,10 @@ impl FrameEncoder {
                 let mut chk = p0.buf.clone();
                 let mut planes = [(&mut chk[..], p0.stride, p0.ss_x, p0.ss_y)];
                 loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
-                assert!(chk == best_luma, "kept luma is not the best level's filter output");
+                assert!(
+                    chk == best_luma,
+                    "kept luma is not the best level's filter output"
+                );
             }
             p0.buf.copy_from_slice(&best_luma);
             let mut planes = [

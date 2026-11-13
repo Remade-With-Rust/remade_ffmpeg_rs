@@ -267,7 +267,15 @@ unsafe fn conv8_h_block_avx2(
         // 4-wide blocks have no wide step to take: go straight to the row kernel
         // rather than build this one's constants for nothing.
         for y in 0..h {
-            conv8_avx2(src.add(y * src_stride), 1, f, dst.add(y * dst_stride), w, max, avg);
+            conv8_avx2(
+                src.add(y * src_stride),
+                1,
+                f,
+                dst.add(y * dst_stride),
+                w,
+                max,
+                avg,
+            );
         }
         return;
     }
@@ -396,7 +404,10 @@ unsafe fn conv8_v_block_avx2(
             let d = dst.add(y * dst_stride + x);
             if avg {
                 let dv = _mm256_loadu_si256(d as *const __m256i);
-                let (dl, dh) = (_mm256_unpacklo_epi16(dv, zero), _mm256_unpackhi_epi16(dv, zero));
+                let (dl, dh) = (
+                    _mm256_unpacklo_epi16(dv, zero),
+                    _mm256_unpackhi_epi16(dv, zero),
+                );
                 l = _mm256_srai_epi32::<1>(_mm256_add_epi32(_mm256_add_epi32(l, dl), one));
                 hh = _mm256_srai_epi32::<1>(_mm256_add_epi32(_mm256_add_epi32(hh, dh), one));
             }
@@ -416,7 +427,15 @@ unsafe fn conv8_v_block_avx2(
     if x < w {
         for y in 0..h {
             let s = src.add(y * src_stride + x);
-            conv8_avx2(s, src_stride, f, dst.add(y * dst_stride + x), w - x, max, avg);
+            conv8_avx2(
+                s,
+                src_stride,
+                f,
+                dst.add(y * dst_stride + x),
+                w - x,
+                max,
+                avg,
+            );
         }
     }
 }
@@ -433,7 +452,14 @@ unsafe fn conv8_v_block_avx2(
 /// `ds`) writable for `w` samples each; the two blocks do not overlap.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn copy_block_avx2(src: *const u16, ss: usize, dst: *mut u16, ds: usize, w: usize, h: usize) {
+unsafe fn copy_block_avx2(
+    src: *const u16,
+    ss: usize,
+    dst: *mut u16,
+    ds: usize,
+    w: usize,
+    h: usize,
+) {
     use std::arch::x86_64::*;
     match w {
         4 => {
@@ -503,7 +529,11 @@ fn gather_tile(
     let left = (-xs).clamp(0, n as i32) as usize; // cells with x < 0
     let right = (xs + n as i32 - w as i32).clamp(0, n as i32) as usize; // cells with x >= w
     let mid = n - left - right;
-    let mid_src = if mid > 0 { (xs + left as i32) as usize } else { 0 };
+    let mid_src = if mid > 0 {
+        (xs + left as i32) as usize
+    } else {
+        0
+    };
     for ty in rows {
         let sy = (y0 + ty as i32).clamp(0, h - 1) as usize;
         let s_row = &refp.buf[sy * refp.stride..][..w];
@@ -1328,7 +1358,10 @@ mod u8score {
         src: *const u8,
         src_stride: usize,
     ) -> u32 {
-        let r = refp.buf.as_ptr().add(by as usize * refp.stride + bx as usize);
+        let r = refp
+            .buf
+            .as_ptr()
+            .add(by as usize * refp.stride + bx as usize);
         let d = _mm_sad_epu8(rows4(r, refp.stride), rows4(src, src_stride));
         (_mm_cvtsi128_si32(d) as u32) + (_mm_extract_epi32::<2>(d) as u32)
     }
@@ -1920,17 +1953,7 @@ unsafe fn predict_block_avx2(
                     max,
                     false,
                 );
-                conv8_v_block_avx2(
-                    tptr as *const u16,
-                    w,
-                    fy,
-                    dptr,
-                    dst_stride,
-                    w,
-                    h,
-                    max,
-                    avg,
-                );
+                conv8_v_block_avx2(tptr as *const u16, w, fy, dptr, dst_stride, w, h, max, avg);
             });
         }
     }
@@ -3129,8 +3152,22 @@ mod tests {
                 h: ph,
             };
             const TS: usize = 24;
-            for &(x0, y0) in &[(-5i32, -4i32), (0, 0), (pw - 6, ph - 3), (-30, 2), (pw + 9, -1), (2, ph + 5), (-2, -2)] {
-                for &(c0, c1, r0, r1) in &[(0usize, 15usize, 0usize, 11usize), (3, 11, 3, 7), (0, 15, 3, 7), (3, 11, 0, 11), (5, 5, 0, 4)] {
+            for &(x0, y0) in &[
+                (-5i32, -4i32),
+                (0, 0),
+                (pw - 6, ph - 3),
+                (-30, 2),
+                (pw + 9, -1),
+                (2, ph + 5),
+                (-2, -2),
+            ] {
+                for &(c0, c1, r0, r1) in &[
+                    (0usize, 15usize, 0usize, 11usize),
+                    (3, 11, 3, 7),
+                    (0, 15, 3, 7),
+                    (3, 11, 0, 11),
+                    (5, 5, 0, 4),
+                ] {
                     let mut want = vec![0xBEEFu16; TS * 12];
                     let mut got = want.clone();
                     for ty in r0..r1 {
@@ -3139,7 +3176,10 @@ mod tests {
                         }
                     }
                     gather_tile(&refp, x0, y0, &mut got, TS, c0..c1, r0..r1);
-                    assert_eq!(got, want, "plane {pw}x{ph} origin ({x0},{y0}) cols {c0}..{c1} rows {r0}..{r1}");
+                    assert_eq!(
+                        got, want,
+                        "plane {pw}x{ph} origin ({x0},{y0}) cols {c0}..{c1} rows {r0}..{r1}"
+                    );
                 }
             }
         }
@@ -3193,7 +3233,13 @@ mod tests {
                     for trial in 0..6 {
                         // Corners of the legal window first, then random interior.
                         let (subx, suby) = (px != 0, py != 0);
-                        let (x0, x1) = if subx { (3, pw - 13) } else if suby { (0, pw - 8) } else { (0, pw - 4) };
+                        let (x0, x1) = if subx {
+                            (3, pw - 13)
+                        } else if suby {
+                            (0, pw - 8)
+                        } else {
+                            (0, pw - 4)
+                        };
                         let (y0, y1) = if suby { (3, ph - 8) } else { (0, ph - 4) };
                         let (bx, by) = match trial {
                             0 => (x0, y0),

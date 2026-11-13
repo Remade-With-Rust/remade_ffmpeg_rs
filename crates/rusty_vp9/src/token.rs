@@ -95,11 +95,11 @@ pub fn decode_coefs(
     let max_eob = 16usize << (tx_size << 1);
     let row_shift = tx_size + 2; // log2 of the transform side; row = pos >> row_shift
     let mut max_row = 0usize; // highest row index holding a non-zero coefficient
-    // Every position and neighbour index below comes from a static scan table
-    // and is `< max_eob`, a power of two. Narrowing both buffers to exactly
-    // `max_eob` and masking the indices with `max_eob - 1` changes no value and
-    // lets the compiler drop the bounds check on each cache read and write (the
-    // context derivation alone reads the cache twice per token).
+                              // Every position and neighbour index below comes from a static scan table
+                              // and is `< max_eob`, a power of two. Narrowing both buffers to exactly
+                              // `max_eob` and masking the indices with `max_eob - 1` changes no value and
+                              // lets the compiler drop the bounds check on each cache read and write (the
+                              // context derivation alone reads the cache twice per token).
     let idx_mask = max_eob - 1;
     let dqcoeff = &mut dqcoeff[..max_eob];
     let token_cache = &mut token_cache[..max_eob];
@@ -117,14 +117,14 @@ pub fn decode_coefs(
         _ => (&CAT6_PROB, 14),
     };
     let mut dqv = dq.0; // DC quant for the first coefficient
-    // No clearing here (it used to zero `dqcoeff[..max_eob]` and
-    // `token_cache[..max_eob]` on every block, up to 5 KiB, even for the many
-    // blocks whose EOB is 0):
-    // * `dqcoeff` arrives all-zero by contract and the caller re-zeroes only the
-    //   rows `0..=max_row` this call can have written;
-    // * `token_cache` is only ever read at a position's two causal neighbours,
-    //   which precede it in scan order and were therefore written earlier in
-    //   this same call (see `coef_neighbours_precede_in_scan_order`).
+                        // No clearing here (it used to zero `dqcoeff[..max_eob]` and
+                        // `token_cache[..max_eob]` on every block, up to 5 KiB, even for the many
+                        // blocks whose EOB is 0):
+                        // * `dqcoeff` arrives all-zero by contract and the caller re-zeroes only the
+                        //   rows `0..=max_row` this call can have written;
+                        // * `token_cache` is only ever read at a position's two causal neighbours,
+                        //   which precede it in scan order and were therefore written earlier in
+                        //   this same call (see `coef_neighbours_precede_in_scan_order`).
     debug_assert!(dqcoeff[..max_eob].iter().all(|&v| v == 0));
 
     // The scan, its neighbour table and the band table are all indexed by a
@@ -321,7 +321,10 @@ mod tests {
                 for (c, &p) in scan[..n].iter().enumerate() {
                     order[p as usize] = c;
                 }
-                assert!(order.iter().all(|&c| c != usize::MAX), "scan is not a permutation");
+                assert!(
+                    order.iter().all(|&c| c != usize::MAX),
+                    "scan is not a permutation"
+                );
                 for c in 1..n {
                     for t in 0..2 {
                         let p = nb[2 * c + t] as usize;
