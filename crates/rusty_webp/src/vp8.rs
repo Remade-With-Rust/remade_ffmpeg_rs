@@ -1645,11 +1645,7 @@ impl<R: Read> Vp8Decoder<R> {
                         (i32::from(DCT_CAT_BASE[category]) + extra, 2)
                     };
 
-                let value = if decoder.session_read_flag(&mut s) {
-                    -abs_value
-                } else {
-                    abs_value
-                };
+                let value = decoder.session_read_signed(&mut s, abs_value);
 
                 let zigzag = ZIGZAG[i] as usize;
                 block[zigzag] = value * i32::from(if zigzag > 0 { acq } else { dcq });

@@ -474,6 +474,47 @@ fn state_read_flag(chunks: &[[u8; 4]], state: &mut State) -> bool {
     }
 }
 
+/// Read an even-odds flag and apply it as a sign: `-v` when the flag is set.
+///
+/// The same decode as [`state_read_flag`], without its branch or table
+/// loads (libwebp's `VP8GetSigned`): halving a normalised range always
+/// renormalises by exactly one bit, so the new `range - 1` is the old one,
+/// minus one when the flag is set, with its low bit forced; and the flag
+/// itself is a 0 / -1 mask that conditionally subtracts the split and
+/// negates `v`. Sign bits are close to random, so the branch was one the
+/// predictor could not learn.
+#[inline(always)]
+fn state_read_signed(chunks: &[[u8; 4]], state: &mut State, v: i32) -> i32 {
+    // A range of exactly 255 (only the state before the first read) halves
+    // to 128, which needs no shift: leave that one case to the general read.
+    if state.range_m1 == 254 {
+        return if state_read_flag(chunks, state) {
+            -v
+        } else {
+            v
+        };
+    }
+    if state.bit_count < 0 {
+        let chunk = chunks.get(state.chunk_index).copied().unwrap_or_default();
+        let v = u32::from_be_bytes(chunk);
+        state.chunk_index += 1;
+        state.value <<= 32;
+        state.value |= u64::from(v);
+        state.bit_count += 32;
+    }
+    debug_assert!(state.bit_count >= 0);
+
+    // `split - 1`, with split = range - range / 2
+    let split_m1 = state.range_m1 >> 1;
+    let window = (state.value >> state.bit_count) as u32;
+    // -1 when the flag is set (window >= split), else 0
+    let mask = (split_m1 as i32 - window as i32) >> 31;
+    state.value -= u64::from((split_m1 + 1) & mask as u32) << state.bit_count;
+    state.range_m1 = state.range_m1.wrapping_add(mask as u32) | 1;
+    state.bit_count -= 1;
+    (v ^ mask) - mask
+}
+
 /// A block-scoped fast-reading session: the decoder state is snapshotted
 /// once, every read runs on the snapshot, and the whole block commits with
 /// one validity check — instead of a state copy in and out per read. If the
@@ -508,6 +549,12 @@ impl ArithmeticDecoder {
     #[inline(always)]
     pub(crate) fn session_read_flag(&self, s: &mut FastSession) -> bool {
         state_read_flag(&self.chunks, &mut s.state)
+    }
+
+    /// Read a sign flag and return `v` with it applied.
+    #[inline(always)]
+    pub(crate) fn session_read_signed(&self, s: &mut FastSession, v: i32) -> i32 {
+        state_read_signed(&self.chunks, &mut s.state, v)
     }
 
     #[inline(always)]
@@ -647,6 +694,43 @@ mod tests {
         assert_eq!(185, decoder.read_literal(8).or_accumulate(&mut res));
         assert_eq!(31, decoder.read_literal(8).or_accumulate(&mut res));
         decoder.check(res, ()).unwrap();
+    }
+
+    /// `state_read_signed` must leave the same state and give the same sign
+    /// as `state_read_flag`, for every normalised range and bit position.
+    #[test]
+    fn signed_read_matches_flag_read() {
+        let chunks: Vec<[u8; 4]> = (0u32..64)
+            .map(|i| (i.wrapping_mul(2654435761) ^ 0x5bd1e995).to_be_bytes())
+            .collect();
+        for range_m1 in 127u32..=254 {
+            for bit_count in -1i32..32 {
+                for window in 0..=range_m1 {
+                    // any value below `range << bit_count` is a valid state
+                    let shift = bit_count.max(0) as u32;
+                    let low = u64::from(window.wrapping_mul(0x9e37_79b9)) & ((1u64 << shift) - 1);
+                    let start = State {
+                        chunk_index: 3,
+                        value: if bit_count < 0 {
+                            u64::from(window) >> 1
+                        } else {
+                            (u64::from(window) << shift) | low
+                        },
+                        range_m1,
+                        bit_count,
+                    };
+                    let (mut a, mut b) = (start, start);
+                    let flag = state_read_flag(&chunks, &mut a);
+                    let signed = state_read_signed(&chunks, &mut b, 7);
+                    assert_eq!(signed, if flag { -7 } else { 7 });
+                    assert_eq!(
+                        (a.chunk_index, a.value, a.range_m1, a.bit_count),
+                        (b.chunk_index, b.value, b.range_m1, b.bit_count),
+                        "range_m1 {range_m1} bit_count {bit_count} window {window}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
