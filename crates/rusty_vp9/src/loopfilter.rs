@@ -483,6 +483,7 @@ fn apply_sb_masks(
     ss_y: usize,
     lf: &LfInfo,
     m: &SbMasks,
+    lfl: &[u8; MI_BLOCK_SIZE * MI_BLOCK_SIZE],
     mi_rows: usize,
     mi_row: usize,
     mi_col: usize,
@@ -491,7 +492,6 @@ fn apply_sb_masks(
     let row_step = 1 << ss_y;
     let (v16, v8, v4) = (&m.v16, &m.v8, &m.v4);
     let (m16x16, m8x8, m4x4, m4x4_int) = (&m.m16x16, &m.m8x8, &m.m4x4, &m.m4x4_int);
-    let lfl = &m.lfl;
     // Vertical pass. Split out of the build loop above: mask construction reads
     // only `mi_grid`, and vertical filtering of mi-row `r` touches only pixel
     // rows [row_y, row_y+8), so no row can observe another's filtering and the
@@ -1661,11 +1661,106 @@ pub fn loop_filter_frame(
                 let base_x = (mi_col * 8) >> *ss_x;
                 let base_y = (mi_row * 8) >> *ss_y;
                 apply_sb_masks(
-                    buf, *stride, base_x, base_y, *ss_y, &lf, masks, mi_rows, mi_row, mi_col, bd,
+                    buf, *stride, base_x, base_y, *ss_y, &lf, masks, &masks.lfl, mi_rows, mi_row,
+                    mi_col, bd,
                 );
             }
             mi_col += MI_BLOCK_SIZE;
         }
         mi_row += MI_BLOCK_SIZE;
     }
+}
+
+/// The one filter level every block of the frame resolves to, if there is one:
+/// a non-zero frame level with no ref/mode deltas and no per-segment level.
+fn uniform_level(h: &FrameHeader) -> Option<u8> {
+    if h.loop_filter_level == 0 || h.lf_delta_enabled {
+        return None;
+    }
+    if h.seg_enabled && h.seg_feature_enabled.iter().any(|f| f[1]) {
+        return None;
+    }
+    Some(h.loop_filter_level.min(MAX_LOOP_FILTER as u32) as u8)
+}
+
+/// One plane's loop-filter masks for a whole frame, reusable across filter
+/// LEVELS (see [`build_plane_masks`]).
+pub struct PlaneMasks {
+    ss_x: usize,
+    ss_y: usize,
+    sbs: Vec<SbMasks>,
+}
+
+/// Build one plane's edge masks for the whole frame.
+///
+/// The masks depend on the filter level only through "is this block's level
+/// zero". When every block resolves to the same non-zero level (no deltas, no
+/// per-segment level) that never holds, so the masks are the same at EVERY
+/// non-zero level and an encoder searching levels can build them once instead
+/// of re-walking the mode-info grid per candidate. Returns `None` when the
+/// frame is not in that regime; the caller then uses [`loop_filter_frame`].
+pub fn build_plane_masks(
+    ss_x: usize,
+    ss_y: usize,
+    mi_grid: &[ModeInfo],
+    mi_rows: usize,
+    mi_cols: usize,
+    h: &FrameHeader,
+) -> Option<PlaneMasks> {
+    uniform_level(h)?;
+    let lf = build_lf_info(h);
+    let mut sbs =
+        Vec::with_capacity(mi_rows.div_ceil(MI_BLOCK_SIZE) * mi_cols.div_ceil(MI_BLOCK_SIZE));
+    let mut mi_row = 0;
+    while mi_row < mi_rows {
+        let mut mi_col = 0;
+        while mi_col < mi_cols {
+            sbs.push(build_sb_masks(
+                ss_x, ss_y, &lf, mi_grid, mi_rows, mi_cols, mi_row, mi_col,
+            ));
+            mi_col += MI_BLOCK_SIZE;
+        }
+        mi_row += MI_BLOCK_SIZE;
+    }
+    Some(PlaneMasks { ss_x, ss_y, sbs })
+}
+
+/// Deblock one plane in place at `h`'s level using prebuilt masks — the same
+/// result as [`loop_filter_frame`] on that plane. Returns `false`, leaving the
+/// plane untouched, if `h` is not in the uniform-level regime the masks were
+/// built for (then call [`loop_filter_frame`]).
+pub fn loop_filter_plane_masked(
+    buf: &mut [u16],
+    stride: usize,
+    masks: &PlaneMasks,
+    mi_rows: usize,
+    mi_cols: usize,
+    h: &FrameHeader,
+) -> bool {
+    let Some(level) = uniform_level(h) else {
+        return false;
+    };
+    let lf = build_lf_info(h);
+    let bd = h.bit_depth.max(8) as i32;
+    // Every mask bit belongs to a block at the uniform level, so the per-8x8
+    // level map the masks were built with is this constant wherever it is read.
+    let lfl = [level; MI_BLOCK_SIZE * MI_BLOCK_SIZE];
+    let mut sb = masks.sbs.iter();
+    let mut mi_row = 0;
+    while mi_row < mi_rows {
+        let mut mi_col = 0;
+        while mi_col < mi_cols {
+            let Some(m) = sb.next() else {
+                return false; // masks built for a different frame geometry
+            };
+            let base_x = (mi_col * 8) >> masks.ss_x;
+            let base_y = (mi_row * 8) >> masks.ss_y;
+            apply_sb_masks(
+                buf, stride, base_x, base_y, masks.ss_y, &lf, m, &lfl, mi_rows, mi_row, mi_col, bd,
+            );
+            mi_col += MI_BLOCK_SIZE;
+        }
+        mi_row += MI_BLOCK_SIZE;
+    }
+    true
 }

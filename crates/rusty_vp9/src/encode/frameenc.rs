@@ -79,7 +79,7 @@ use crate::decode::{average_split_mvs, INTER_MODE_TREE};
 use crate::geom_tables::{B_HEIGHT_LOG2, B_WIDTH_LOG2};
 use crate::geom_tables::{MAX_TXSIZE, SIZE_GROUP};
 use crate::inter::{predict_block, RefPlane};
-use crate::loopfilter::loop_filter_frame;
+use crate::loopfilter::{build_plane_masks, loop_filter_frame, loop_filter_plane_masked, PlaneMasks};
 use crate::mv::{find_mv_refs, get_mode_context, lower_mv_precision, use_mv_hp, MvRef, NmvCounts};
 use crate::predict::{build_intra_edges, predict};
 use crate::prob_tables::{DEFAULT_COEF_PROBS, KF_PARTITION_PROBS};
@@ -7270,12 +7270,36 @@ impl FrameEncoder {
     /// level search. Filters ONLY luma — the level choice is luma-SSE-gated, so cloning +
     /// deblocking chroma per candidate would be discarded work; the winner's real 3-plane
     /// filter is applied by the caller.
-    fn lf_luma_sse(&self, h: &mut FrameHeader, c0: &mut [u16], lvl: u32) -> u64 {
+    ///
+    /// `masks` are the luma edge masks built once for the frame (see
+    /// [`build_plane_masks`]): in the uniform-level regime this search runs in
+    /// they are the same at every candidate level, so re-walking the mode-info
+    /// grid per candidate — about 15 times a frame — was pure repetition.
+    fn lf_luma_sse(
+        &self,
+        h: &mut FrameHeader,
+        c0: &mut [u16],
+        lvl: u32,
+        masks: Option<&PlaneMasks>,
+    ) -> u64 {
         h.loop_filter_level = lvl;
         c0.copy_from_slice(&self.rec[0].buf);
-        let mut planes = [(c0, self.rec[0].stride, 0usize, 0usize)];
-        loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
-        self.luma_sse_of(planes[0].0)
+        let stride = self.rec[0].stride;
+        let done = masks
+            .is_some_and(|m| loop_filter_plane_masked(c0, stride, m, self.mi_rows, self.mi_cols, h));
+        if !done {
+            let mut planes = [(&mut *c0, stride, 0usize, 0usize)];
+            loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
+        }
+        // Debug builds re-derive the candidate the long way and compare.
+        #[cfg(debug_assertions)]
+        if done {
+            let mut chk = self.rec[0].buf.clone();
+            let mut planes = [(&mut chk[..], stride, 0usize, 0usize)];
+            loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
+            assert!(chk[..] == c0[..], "masked loop filter diverged at level {lvl}");
+        }
+        self.luma_sse_of(c0)
     }
 
     /// Observe-only per-segment-lf ceiling probe: the per-64×64-SB oracle (each SB filtered at
@@ -7368,8 +7392,13 @@ impl FrameEncoder {
         } else {
             &[8, 16, 24, 32, 40, 48, 56, 63]
         };
+        // Luma edge masks for every candidate below (any non-zero level builds
+        // the same ones; `None` if this frame is not in the uniform regime).
+        h.loop_filter_level = coarse[0];
+        let masks = build_plane_masks(0, 0, &self.mi, self.mi_rows, self.mi_cols, h);
+        let masks = masks.as_ref();
         for &lvl in coarse {
-            let sse = self.lf_luma_sse(h, &mut c0, lvl);
+            let sse = self.lf_luma_sse(h, &mut c0, lvl, masks);
             if sse < best.1 {
                 best = (lvl, sse);
             }
@@ -7382,7 +7411,7 @@ impl FrameEncoder {
                     if cand == 0 || cand == best.0 {
                         continue;
                     }
-                    let sse = self.lf_luma_sse(h, &mut c0, cand);
+                    let sse = self.lf_luma_sse(h, &mut c0, cand, masks);
                     if sse < best.1 {
                         best = (cand, sse);
                     }
@@ -7413,7 +7442,7 @@ impl FrameEncoder {
                 ((q * 20723 + 1015158) + (1 << 17)) >> 18
             }
             .clamp(0, 63);
-            let sse_guess = self.lf_luma_sse(h, &mut c0, guess as u32);
+            let sse_guess = self.lf_luma_sse(h, &mut c0, guess as u32, masks);
             eprintln!(
                 "LFHARVEST	q={}	qidx={}	key={}	best={}	sse_best={}	guess={}	sse_guess={}	sse_lvl0={}",
                 q, h.base_q_idx, key as u8, best.0, best.1, guess, sse_guess,
