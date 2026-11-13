@@ -81,10 +81,9 @@ fn v_pred(dst: &mut [u16], stride: usize, bs: usize, above: &[u16]) {
 }
 
 fn h_pred(dst: &mut [u16], stride: usize, bs: usize, left: &[u16]) {
+    // A row is one value: fill it, rather than index `dst` once per sample.
     for r in 0..bs {
-        for c in 0..bs {
-            *d(dst, stride, r, c) = left[r];
-        }
+        dst[r * stride..][..bs].fill(left[r]);
     }
 }
 
@@ -122,9 +121,7 @@ fn dc_pred(
         ((max + 1) >> 1) as u16
     };
     for r in 0..bs {
-        for c in 0..bs {
-            *d(dst, stride, r, c) = dc;
-        }
+        dst[r * stride..][..bs].fill(dc);
     }
 }
 
