@@ -394,11 +394,12 @@ pub(crate) fn read_alpha_chunk<R: BufRead>(
         let mut data = vec![0; usize::from(width) * usize::from(height) * 4];
         decoder.decode_frame(u32::from(width), u32::from(height), true, &mut data)?;
 
-        let mut green = vec![0; usize::from(width) * usize::from(height)];
-        for (rgba_val, green_val) in data.chunks_exact(4).zip(green.iter_mut()) {
-            *green_val = rgba_val[1];
-        }
-        green
+        // The alpha values are the green channel. Taken out of each pixel
+        // as a word (shift and truncate), which vectorizes; indexing the
+        // second byte of every 4-byte chunk moved one byte at a time.
+        data.chunks_exact(4)
+            .map(|px| (u32::from_le_bytes(px.try_into().unwrap()) >> 8) as u8)
+            .collect()
     } else {
         let mut framedata = vec![0; width as usize * height as usize];
         reader.read_exact(&mut framedata)?;
