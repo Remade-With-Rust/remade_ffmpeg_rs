@@ -2126,6 +2126,11 @@ impl<R: Read> Vp8Decoder<R> {
         // 1.5 KB moves) for every macroblock.
         let mut blocks = [0i32; 384];
 
+        // One entry is pushed per macroblock: size the list once instead of
+        // growing (and copying) it as the frame decodes.
+        self.macroblocks
+            .reserve_exact(self.mbwidth as usize * self.mbheight as usize);
+
         for mby in 0..self.mbheight as usize {
             let p = mby % self.num_partitions as usize;
             self.left = MacroBlock::default();
