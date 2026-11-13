@@ -938,10 +938,6 @@ fn matrix_cols<const N: usize>(tmp: &[i64], cb: &[i64], out: &mut [i32]) {
     }
 }
 
-/// Stage switch for the vector column pass (see [`matrix_avx2`]).
-#[cfg(target_arch = "x86_64")]
-const MATRIX_AVX2_COLS: bool = false;
-
 /// AVX2 twin of [`matrix_fwd`] for `N` in `{4, 8, 16}`. Bit-identical: the row
 /// pass is exact in `i32` under the table-derived `lim` guard, the column pass
 /// is the same exact `i64` sum, and the final shift keeps the low 32 bits.
@@ -969,11 +965,7 @@ mod matrix_avx2 {
         if !rows::<N>(residual, rp, rm.lim, tmp) {
             return false;
         }
-        if super::MATRIX_AVX2_COLS {
-            cols::<N>(tmp, cb, out);
-        } else {
-            super::matrix_cols::<N>(tmp, cb, out);
-        }
+        cols::<N>(tmp, cb, out);
         true
     }
 
