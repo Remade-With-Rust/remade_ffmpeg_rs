@@ -43,7 +43,7 @@ use crate::decode::{comp_ref_context, reference_mode_context};
 pub static DEDUP: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3]; // emit_lookups, hits, matches
 use super::prof;
-use super::transform::forward_transform;
+use super::transform::forward_transform_scratch;
 use super::varpart::VarTree;
 use super::varrd;
 use crate::block::{
@@ -929,6 +929,9 @@ pub(crate) struct TxScratch {
     levels: [i32; 1024],
     dqcoeff: [i32; 1024],
     token_cache: [u8; 1024],
+    /// Forward-transform intermediate (the 16x16 / 32x32 DCT column pass and the
+    /// ADST matrix row pass). Fully written before it is read, like the rest.
+    fwd_tmp: [i64; 1024],
 }
 
 impl Default for TxScratch {
@@ -939,6 +942,7 @@ impl Default for TxScratch {
             levels: [0; 1024],
             dqcoeff: [0; 1024],
             token_cache: [0; 1024],
+            fwd_tmp: [0; 1024],
         }
     }
 }
@@ -952,6 +956,7 @@ impl TxScratch {
         self.levels = [0; 1024];
         self.dqcoeff = [0; 1024];
         self.token_cache = [0; 1024];
+        self.fwd_tmp = [0; 1024];
     }
 }
 
@@ -6609,6 +6614,7 @@ impl FrameEncoder {
             levels,
             dqcoeff,
             token_cache,
+            fwd_tmp,
         } = &mut *scratch;
 
         let n = bs * bs;
@@ -6697,7 +6703,13 @@ impl FrameEncoder {
         if !from_cache {
             {
                 let _s = prof::Scope::new(prof::S::FwdTx);
-                forward_transform(&residual[..n], bs, tx_type, &mut coeffs[..n]);
+                forward_transform_scratch(
+                    &residual[..n],
+                    bs,
+                    tx_type,
+                    &mut coeffs[..n],
+                    &mut fwd_tmp[..],
+                );
             }
             eob = {
                 let _s = prof::Scope::new(prof::S::Quantize);

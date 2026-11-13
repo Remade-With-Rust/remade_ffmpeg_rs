@@ -400,8 +400,10 @@ fn fdct16_1d(inp: &[i64; 16], out: &mut [i64; 16]) {
 /// then a row pass (`(x+1)>>2` pre-scale). Output is in the decoder's
 /// dequantized-coefficient scale — the same domain `fdct4x4`/`fdct8x8` produce,
 /// so the decoder's `idct16` inverts it (gated by the round-trip test).
-fn fdct16x16(residual: &[i32], out: &mut [i32]) {
-    let mut inter = [0i64; 256];
+fn fdct16x16(residual: &[i32], out: &mut [i32], inter: &mut [i64]) {
+    // `inter` is caller scratch (>= 256): pass 0 writes all 256 entries before
+    // pass 1 reads any, so stale contents are unobservable.
+    let inter = &mut inter[..256];
     // Pass 0: columns, input ×4, stored transposed (each column's 16 freqs run).
     for col in 0..16 {
         let mut cin = [0i64; 16];
@@ -677,8 +679,9 @@ fn fdct32_1d(input: &[i64; 32], out: &mut [i64; 32]) {
 /// Forward 2-D 32×32 DCT (libvpx `vpx_fdct32x32`): both passes pre-scale ×4 /
 /// asymmetric `(x+1+sign)>>2` round to keep intermediates in range. Output in
 /// the decoder's dequantized-coefficient scale (gated by the round-trip test).
-fn fdct32x32(residual: &[i32], out: &mut [i32]) {
-    let mut inter = [0i64; 1024];
+fn fdct32x32(residual: &[i32], out: &mut [i32], inter: &mut [i64]) {
+    // `inter` is caller scratch (>= 1024), fully written by the column pass.
+    let inter = &mut inter[..1024];
     // Columns
     for i in 0..32 {
         let mut tin = [0i64; 32];
@@ -792,13 +795,21 @@ fn basis_for(n: usize, adst: bool) -> &'static [Vec<i64>] {
 /// Forward 2-D transform via the integer inverse-basis transpose. `row_adst` /
 /// `col_adst` select the per-dimension transform exactly as the decoder's
 /// `inverse_transform_add_rows` interprets `tx_type`.
-fn forward_2d_matrix(residual: &[i32], n: usize, row_adst: bool, col_adst: bool, out: &mut [i32]) {
+fn forward_2d_matrix(
+    residual: &[i32],
+    n: usize,
+    row_adst: bool,
+    col_adst: bool,
+    out: &mut [i32],
+    tmp: &mut [i64],
+) {
     let row_basis = basis_for(n, row_adst);
     let col_basis = basis_for(n, col_adst);
-    // Row pass: transform each row into the frequency domain. Stack scratch (n≤32
-    // ⇒ ≤8 KiB) instead of a heap `Vec` per call — this runs per ADST tx block.
-    let mut tmp_buf = [0i64; 32 * 32];
-    let tmp = &mut tmp_buf[..n * n];
+    // Row pass: transform each row into the frequency domain. `tmp` is caller
+    // scratch: a `[0i64; 32 * 32]` local here was an 8 KiB zero-fill on every
+    // ADST tx block, of which a 4x4 uses 128 bytes. The row pass writes all of
+    // `[..n * n]` before the column pass reads it.
+    let tmp = &mut tmp[..n * n];
     for r in 0..n {
         for k in 0..n {
             let bk = &row_basis[k];
@@ -842,19 +853,36 @@ fn tx_dirs(tx_type: TxType) -> (bool, bool) {
 /// decoder's dequantized-coefficient domain (divide by the quant step to get
 /// levels). Only DCT_DCT is wired so far; ADST and sizes 8/16/32 land next.
 pub fn forward_transform(residual: &[i32], n: usize, tx_type: TxType, out: &mut [i32]) {
+    let mut tmp = [0i64; 32 * 32];
+    forward_transform_scratch(residual, n, tx_type, out, &mut tmp);
+}
+
+/// [`forward_transform`] with caller-owned intermediate scratch (`tmp.len() >=
+/// 1024`). The encoder's per-tx-block path uses this so the 16x16 / 32x32 / ADST
+/// intermediates are not a 2-8 KiB zero-fill per call; contents of `tmp` on entry
+/// are irrelevant (every pass writes what the next reads) and the output is
+/// identical to [`forward_transform`].
+pub fn forward_transform_scratch(
+    residual: &[i32],
+    n: usize,
+    tx_type: TxType,
+    out: &mut [i32],
+    tmp: &mut [i64],
+) {
     debug_assert_eq!(residual.len(), n * n);
     debug_assert!(out.len() >= n * n);
+    debug_assert!(tmp.len() >= n * n);
     match (n, tx_type) {
         // Exact integer butterflies for the DCTs (fast; O(n log n)).
         (4, TxType::DctDct) => fdct4x4(residual, out),
         (8, TxType::DctDct) => fdct8x8(residual, out),
-        (16, TxType::DctDct) if use_fdct16() => fdct16x16(residual, out),
-        (32, TxType::DctDct) if use_fdct32() => fdct32x32(residual, out),
+        (16, TxType::DctDct) if use_fdct16() => fdct16x16(residual, out, tmp),
+        (32, TxType::DctDct) if use_fdct32() => fdct32x32(residual, out, tmp),
         // Everything else (all ADST — and 16/32 DCT under VP9_NO_FDCT16/32)
         // via the inverse-basis transpose.
         _ => {
             let (row_adst, col_adst) = tx_dirs(tx_type);
-            forward_2d_matrix(residual, n, row_adst, col_adst, out);
+            forward_2d_matrix(residual, n, row_adst, col_adst, out, tmp);
         }
     }
 }
