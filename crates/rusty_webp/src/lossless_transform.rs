@@ -44,11 +44,20 @@ pub(crate) fn apply_predictor_transform(
     }
 
     for y in 1..height {
-        for block_x in 0..block_xsize {
-            let block_index = (y >> size_bits) * block_xsize + block_x;
-            let predictor = predictor_data[block_index * 4 + 1];
-            let start_index = (y * width + (block_x << size_bits).max(1)) * 4;
-            let end_index = (y * width + ((block_x + 1) << size_bits).min(width)) * 4;
+        let modes = &predictor_data[(y >> size_bits) * block_xsize * 4..][..block_xsize * 4];
+        let mut block_x = 0;
+        while block_x < block_xsize {
+            let predictor = modes[block_x * 4 + 1];
+            // Neighbouring blocks that use the same predictor are one run:
+            // each mode works left to right from the state at its start, so
+            // one call over the run does what a call per block did.
+            let first = block_x;
+            block_x += 1;
+            while block_x < block_xsize && modes[block_x * 4 + 1] == predictor {
+                block_x += 1;
+            }
+            let start_index = (y * width + (first << size_bits).max(1)) * 4;
+            let end_index = (y * width + (block_x << size_bits).min(width)) * 4;
 
             match predictor {
                 0 => apply_predictor_transform_0(image_data, start_index..end_index, width),
