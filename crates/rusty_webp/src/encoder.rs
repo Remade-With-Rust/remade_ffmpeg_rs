@@ -369,19 +369,27 @@ struct CacheModel {
     /// zero for a slot the stream has not written yet. (A value and a
     /// separate `filled` flag meant two bounds-checked stores per insert,
     /// and an insert happens for every pixel of every copy.)
-    slots: Vec<u64>,
+    ///
+    /// Always [`Self::CAPACITY`] long, whatever the cache size: with a
+    /// fixed length and a masked index the store needs no bounds check.
+    slots: Box<[u64; Self::CAPACITY]>,
 }
 
 impl CacheModel {
     const FILLED: u64 = 1 << 32;
+    /// The largest cache the encoder considers (10 bits).
+    const CAPACITY: usize = 1 << 10;
 
     fn new(bits: u8) -> Self {
+        assert!((1usize << bits) <= Self::CAPACITY);
         Self {
             shift: 32 - u32::from(bits),
-            slots: vec![0; 1 << bits],
+            slots: Box::new([0; Self::CAPACITY]),
         }
     }
 
+    /// The slot of `v`: the top `bits` bits of the hash, so always below
+    /// `1 << bits`.
     #[inline(always)]
     fn index(&self, v: u32) -> usize {
         (0x1e35_a7bdu32.wrapping_mul(v) >> self.shift) as usize
@@ -395,7 +403,11 @@ impl CacheModel {
 
     #[inline(always)]
     fn insert(&mut self, v: u32) {
-        let i = self.index(v);
+        // The mask is a no-op (see `index`) that tells the compiler the slot
+        // is in range. Only here: inserts run for every pixel of every copy,
+        // where the saved check pays; on the lookup in `hit` the extra AND
+        // measured a loss on photographic content.
+        let i = self.index(v) & (Self::CAPACITY - 1);
         self.slots[i] = u64::from(v) | Self::FILLED;
     }
 }
