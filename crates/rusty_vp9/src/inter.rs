@@ -856,6 +856,149 @@ mod u8score {
         }
         sad
     }
+
+    // ---- 4x4 twins (the sub-8x8 search) ---------------------------------------
+    //
+    // Same `step2` arithmetic as the 8x8 kernels, so the bit-exactness proof at
+    // the top of this module carries over unchanged: each step still produces 8
+    // columns per row, and only the first 4 are scored.
+
+    /// Four 4-byte source rows packed into one xmm (row `y` in dword `y`).
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn rows4(p: *const u8, stride: usize) -> __m128i {
+        _mm_setr_epi32(
+            std::ptr::read_unaligned(p as *const i32),
+            std::ptr::read_unaligned(p.add(stride) as *const i32),
+            std::ptr::read_unaligned(p.add(2 * stride) as *const i32),
+            std::ptr::read_unaligned(p.add(3 * stride) as *const i32),
+        )
+    }
+
+    /// The first 4 columns of the two rows a `step2` returns (row A in bytes
+    /// 0..8, row B in 8..16), as bytes 0..8 of the result.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn low4x2(two: __m128i) -> __m128i {
+        _mm_shuffle_epi32::<0b00_00_10_00>(two)
+    }
+
+    /// SAD of a packed 4x4 prediction (rows 0,1 from `t01`, rows 2,3 from `t23`)
+    /// against a packed 4x4 source.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn sad4x4(t01: __m128i, t23: __m128i, src16: __m128i) -> u32 {
+        let pred = _mm_unpacklo_epi64(low4x2(t01), low4x2(t23));
+        let d = _mm_sad_epu8(pred, src16);
+        (_mm_cvtsi128_si32(d) as u32) + (_mm_extract_epi32::<2>(d) as u32)
+    }
+
+    /// Integer-MV 4x4 score: one `psadbw` over the packed block.
+    ///
+    /// # Safety
+    /// AVX2; (bx, by)..(bx+4, by+4) inside the plane; `src` covers 4 rows of 4.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn score4_copy(
+        refp: &RefPlane8,
+        bx: i32,
+        by: i32,
+        src: *const u8,
+        src_stride: usize,
+    ) -> u32 {
+        let r = refp.buf.as_ptr().add(by as usize * refp.stride + bx as usize);
+        let d = _mm_sad_epu8(rows4(r, refp.stride), rows4(src, src_stride));
+        (_mm_cvtsi128_si32(d) as u32) + (_mm_extract_epi32::<2>(d) as u32)
+    }
+
+    /// Fused horizontal-only 4x4 score.
+    ///
+    /// # Safety
+    /// AVX2; (bx-3, by)..(bx+13, by+4) inside the plane; `src` covers 4 rows of 4.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn score4_h(
+        refp: &RefPlane8,
+        bx: i32,
+        by: i32,
+        fx: &[i32; 8],
+        src: *const u8,
+        src_stride: usize,
+    ) -> u32 {
+        let tx = tp(fx);
+        let base = refp.buf.as_ptr();
+        let row = |r: i32| base.add((by + r) as usize * refp.stride + (bx - 3) as usize);
+        let t01 = step2(hwin2(row(0), row(1)), &tx);
+        let t23 = step2(hwin2(row(2), row(3)), &tx);
+        sad4x4(t01, t23, rows4(src, src_stride))
+    }
+
+    /// Fused vertical-only 4x4 score: 11 row loads, pair-interleaves shared
+    /// across the output rows.
+    ///
+    /// # Safety
+    /// AVX2; (bx, by-3)..(bx+8, by+8) inside the plane; `src` covers 4 rows of 4.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn score4_v(
+        refp: &RefPlane8,
+        bx: i32,
+        by: i32,
+        fy: &[i32; 8],
+        src: *const u8,
+        src_stride: usize,
+    ) -> u32 {
+        let ty = tp(fy);
+        let base = refp.buf.as_ptr();
+        let row = |r: i32| {
+            _mm_loadl_epi64(
+                base.add((by + r) as usize * refp.stride + bx as usize) as *const __m128i
+            )
+        };
+        let rows: [__m128i; 11] = std::array::from_fn(|j| row(j as i32 - 3));
+        let inter: [__m128i; 10] = std::array::from_fn(|j| _mm_unpacklo_epi8(rows[j], rows[j + 1]));
+        let m0: [__m256i; 4] =
+            std::array::from_fn(|k| _mm256_set_m128i(inter[1 + 2 * k], inter[2 * k]));
+        let m2: [__m256i; 4] =
+            std::array::from_fn(|k| _mm256_set_m128i(inter[3 + 2 * k], inter[2 + 2 * k]));
+        sad4x4(step2(m0, &ty), step2(m2, &ty), rows4(src, src_stride))
+    }
+
+    /// Fused two-pass 4x4 score.
+    ///
+    /// # Safety
+    /// AVX2; (bx-3, by-3)..(bx+13, by+8) inside the plane; `src` covers 4 rows of 4.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn score4_hv(
+        refp: &RefPlane8,
+        bx: i32,
+        by: i32,
+        fx: &[i32; 8],
+        fy: &[i32; 8],
+        src: *const u8,
+        src_stride: usize,
+    ) -> u32 {
+        let tx = tp(fx);
+        let ty = tp(fy);
+        let base = refp.buf.as_ptr();
+        let row = |r: i32| base.add((by + r) as usize * refp.stride + (bx - 3) as usize);
+        // Horizontal pass into 11 u8 rows (2 per step; the last row is doubled).
+        let mut tmp = [0u8; 16 * 6];
+        for i in 0..5 {
+            let two = step2(hwin2(row(2 * i as i32 - 3), row(2 * i as i32 - 2)), &tx);
+            _mm_storeu_si128(tmp.as_mut_ptr().add(16 * i) as *mut __m128i, two);
+        }
+        let last = step2(hwin2(row(7), row(7)), &tx);
+        _mm_storeu_si128(tmp.as_mut_ptr().add(16 * 5) as *mut __m128i, last);
+        // Vertical pass over rows 0..=10 of `tmp` (8 bytes each).
+        let inter: [__m128i; 10] = std::array::from_fn(|j| {
+            let a = _mm_loadl_epi64(tmp.as_ptr().add(8 * j) as *const __m128i);
+            let b = _mm_loadl_epi64(tmp.as_ptr().add(8 * (j + 1)) as *const __m128i);
+            _mm_unpacklo_epi8(a, b)
+        });
+        let m0: [__m256i; 4] =
+            std::array::from_fn(|k| _mm256_set_m128i(inter[1 + 2 * k], inter[2 * k]));
+        let m2: [__m256i; 4] =
+            std::array::from_fn(|k| _mm256_set_m128i(inter[3 + 2 * k], inter[2 + 2 * k]));
+        sad4x4(step2(m0, &ty), step2(m2, &ty), rows4(src, src_stride))
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1153,6 +1296,49 @@ pub unsafe fn subpel_score8x8_u8(
         (true, false) => u8score::score_h(refp, bx, by, fx, src, src_stride),
         (false, true) => u8score::score_v(refp, bx, by, fy, src, src_stride),
         (true, true) => u8score::score_hv(refp, bx, by, fx, fy, src, src_stride),
+    }
+}
+
+/// Whether the reference window a [`subpel_score4x4_u8`] call reads lies inside
+/// a `w x h` plane. The horizontal kernels read one 16-byte window per row
+/// (columns `bx-3 .. bx+13`), the vertical-only kernel 8-byte rows.
+#[inline]
+pub fn score4x4_window_ok(w: i32, h: i32, bx: i32, by: i32, subx: bool, suby: bool) -> bool {
+    let (nl, nr) = match (subx, suby) {
+        (true, _) => (3, 13),
+        (false, true) => (0, 8),
+        (false, false) => (0, 4),
+    };
+    let (nt, nb) = if suby { (3, 8) } else { (0, 4) };
+    bx - nl >= 0 && bx + nr <= w && by - nt >= 0 && by + nb <= h
+}
+
+/// Fused u8 4x4 subpel SCORE (interpolate + SAD, no pred store) for the
+/// sub-8x8 motion search — bit-identical to `predict_block`(u16) + a 4x4 SAD
+/// for 8-bit content (pinned by `score4x4_u8_matches_u16_path`).
+///
+/// # Safety
+/// AVX2 present; [`score4x4_window_ok`] holds for these arguments; `src` covers
+/// 4 rows of 4 bytes at `src_stride`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn subpel_score4x4_u8(
+    refp: &RefPlane8,
+    bx: i32,
+    by: i32,
+    subpel_x: usize,
+    subpel_y: usize,
+    filter: usize,
+    src: *const u8,
+    src_stride: usize,
+) -> u32 {
+    let fx = &SUBPEL_FILTERS[filter][subpel_x];
+    let fy = &SUBPEL_FILTERS[filter][subpel_y];
+    match (subpel_x != 0, subpel_y != 0) {
+        (false, false) => u8score::score4_copy(refp, bx, by, src, src_stride),
+        (true, false) => u8score::score4_h(refp, bx, by, fx, src, src_stride),
+        (false, true) => u8score::score4_v(refp, bx, by, fy, src, src_stride),
+        (true, true) => u8score::score4_hv(refp, bx, by, fx, fy, src, src_stride),
     }
 }
 
@@ -2331,6 +2517,109 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The fused u8 4x4 scorer must equal the u16 reference path (`predict_block`
+    /// + SAD) exactly, for every filter and every (subpel_x, subpel_y) phase
+    /// pair, at positions that sweep the whole legal window including its edges.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn score4x4_u8_matches_u16_path() {
+        if !has_avx2() {
+            return;
+        }
+        let mut s = 0x0440_2026_1112_bbbbu64;
+        let mut xs = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let (pw, ph, stride) = (40i32, 36i32, 44usize);
+        let refbuf16: Vec<u16> = (0..stride * ph as usize)
+            .map(|i| match i % 97 {
+                0 => 255,
+                1 => 0,
+                _ => (xs() % 256) as u16,
+            })
+            .collect();
+        let refbuf8: Vec<u8> = refbuf16.iter().map(|&v| v as u8).collect();
+        let srcbuf16: Vec<u16> = (0..stride * ph as usize)
+            .map(|_| (xs() % 256) as u16)
+            .collect();
+        let srcbuf8: Vec<u8> = srcbuf16.iter().map(|&v| v as u8).collect();
+        let refp16 = RefPlane {
+            buf: &refbuf16,
+            stride,
+            w: pw,
+            h: ph,
+        };
+        let refp8 = RefPlane8 {
+            buf: &refbuf8,
+            stride,
+            w: pw,
+            h: ph,
+        };
+        let mut checked = 0u32;
+        for filter in 0..4usize {
+            for px in 0..16usize {
+                for py in 0..16usize {
+                    for trial in 0..6 {
+                        // Corners of the legal window first, then random interior.
+                        let (subx, suby) = (px != 0, py != 0);
+                        let (x0, x1) = if subx { (3, pw - 13) } else if suby { (0, pw - 8) } else { (0, pw - 4) };
+                        let (y0, y1) = if suby { (3, ph - 8) } else { (0, ph - 4) };
+                        let (bx, by) = match trial {
+                            0 => (x0, y0),
+                            1 => (x1, y1),
+                            2 => (x0, y1),
+                            3 => (x1, y0),
+                            _ => (
+                                x0 + (xs() % (x1 - x0 + 1) as u64) as i32,
+                                y0 + (xs() % (y1 - y0 + 1) as u64) as i32,
+                            ),
+                        };
+                        assert!(score4x4_window_ok(pw, ph, bx, by, subx, suby));
+                        let (sx, sy) = ((xs() % 36) as usize, (xs() % 32) as usize);
+                        let mut pred = [0u16; 16];
+                        predict_block(
+                            &refp16, bx, by, px, py, filter, &mut pred, 4, 4, 4, false, 255,
+                        );
+                        let mut want = 0u32;
+                        for y in 0..4usize {
+                            for x in 0..4usize {
+                                let sv = srcbuf16[(sy + y) * stride + sx + x] as i32;
+                                want += (sv - pred[y * 4 + x] as i32).unsigned_abs();
+                            }
+                        }
+                        // SAFETY: AVX2 checked; window asserted in bounds; the
+                        // source block lies inside `srcbuf8`.
+                        let got = unsafe {
+                            subpel_score4x4_u8(
+                                &refp8,
+                                bx,
+                                by,
+                                px,
+                                py,
+                                filter,
+                                srcbuf8.as_ptr().add(sy * stride + sx),
+                                stride,
+                            )
+                        };
+                        assert_eq!(got, want, "filter={filter} px={px} py={py} bx={bx} by={by}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 4 * 16 * 16 * 6);
+        // One step outside each edge of the window is rejected.
+        assert!(!score4x4_window_ok(pw, ph, 2, 3, true, true));
+        assert!(!score4x4_window_ok(pw, ph, pw - 12, 3, true, true));
+        assert!(!score4x4_window_ok(pw, ph, 3, 2, true, true));
+        assert!(!score4x4_window_ok(pw, ph, 3, ph - 7, true, true));
+        assert!(!score4x4_window_ok(pw, ph, pw - 3, 0, false, false));
+        assert!(!score4x4_window_ok(pw, ph, pw - 7, 3, false, true));
     }
 
     /// The u8 fused score kernels must equal the u16 path (scalar predict_block

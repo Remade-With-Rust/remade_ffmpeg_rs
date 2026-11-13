@@ -5853,6 +5853,7 @@ impl FrameEncoder {
         bw: i32,
         bh: i32,
         edges: (i32, i32, i32, i32),
+        ref8: Option<&[u8]>,
     ) -> i64 {
         let base_x = mi_col * 8 + sub_x * 4;
         let base_y = mi_row * 8 + sub_y * 4;
@@ -5860,6 +5861,48 @@ impl FrameEncoder {
         let bx = base_x as i32 + (mv_q4.1 >> 4);
         let by = base_y as i32 + (mv_q4.0 >> 4);
         let rp = self.aref(0);
+        // u8 score domain (8-bit content): interpolate + `psadbw` fused, the
+        // prediction never stored. Bit-identical to the u16 path below (pinned
+        // by `score4x4_u8_matches_u16_path`); candidates whose filter window
+        // crosses the plane edge fall through to it.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(r8) = ref8 {
+            let (fx, fy) = ((mv_q4.1 & 15) as usize, (mv_q4.0 & 15) as usize);
+            let sp = &self.src[0];
+            if (SUB4_U8_INTEGER || fx != 0 || fy != 0)
+                && crate::inter::score4x4_window_ok(
+                    rp.w as i32,
+                    rp.h as i32,
+                    bx,
+                    by,
+                    fx != 0,
+                    fy != 0,
+                )
+                && (base_y + 3) * sp.stride + base_x + 4 <= self.src8.len()
+            {
+                let refp8 = crate::inter::RefPlane8 {
+                    buf: r8,
+                    stride: rp.stride,
+                    w: rp.w as i32,
+                    h: rp.h as i32,
+                };
+                // SAFETY: `ref8` is only ever `Some` under `u8_search()` (AVX2
+                // present); the reference window was just checked; the 4x4 source
+                // block was just checked to lie inside `src8`.
+                return unsafe {
+                    crate::inter::subpel_score4x4_u8(
+                        &refp8,
+                        bx,
+                        by,
+                        fx,
+                        fy,
+                        self.active_filter as usize,
+                        self.src8.as_ptr().add(base_y * sp.stride + base_x),
+                        sp.stride,
+                    )
+                } as i64;
+            }
+        }
         // Fast path: integer MV (no subpel fraction) + in-bounds 4×4 window → direct
         // SAD, skipping the 8-tap `predict_block` (which for frac=0 is a plain copy).
         // Byte-identical; covers the bulk of the integer search grid.
@@ -5983,7 +6026,7 @@ impl FrameEncoder {
         edges: (i32, i32, i32, i32),
     ) {
         use std::sync::atomic::Ordering::Relaxed;
-        let single = self.sub4x4_sad(mi_row, mi_col, idx, idy, best_mv, bw, bh, edges);
+        let single = self.sub4x4_sad(mi_row, mi_col, idx, idy, best_mv, bw, bh, edges, None);
         let neg = (-best_mv.0, -best_mv.1);
         let c0 = self.sub4x4_sad_compound(
             mi_row,
@@ -6026,6 +6069,7 @@ impl FrameEncoder {
         bw: i32,
         bh: i32,
         edges: (i32, i32, i32, i32),
+        ref8: Option<&[u8]>,
     ) -> (Mv, i64) {
         const R: i32 = 4;
         let mut best = (0i32, 0i32);
@@ -6047,7 +6091,8 @@ impl FrameEncoder {
                             continue;
                         }
                         let mv = (r * 8, c * 8);
-                        let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges);
+                        let sad =
+                    self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges, ref8);
                         if sad < best_sad {
                             best_sad = sad;
                             best = mv;
@@ -6060,7 +6105,8 @@ impl FrameEncoder {
             // (~15–25 SADs vs 162 exhaustive). Whole-pel candidates, 1/8-pel units.
             let consider = |best_sad: &mut i64, best: &mut Mv, r: i32, c: i32| {
                 let mv = (r * 8, c * 8);
-                let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges);
+                let sad =
+                    self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges, ref8);
                 if sad < *best_sad {
                     *best_sad = sad;
                     *best = mv;
@@ -6104,7 +6150,8 @@ impl FrameEncoder {
                     continue; // `int` itself: already scored, cannot beat its own SAD
                 }
                 let mv = (int.0 + dr, int.1 + dc);
-                let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges);
+                let sad =
+                    self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges, ref8);
                 if sad < best_sad {
                     best_sad = sad;
                     best = mv;
@@ -6151,6 +6198,9 @@ impl FrameEncoder {
         // A NEWMV must beat a predicted mode by ~this SAD to justify its MV bits.
         const NEWMV_SAD_PENALTY: i64 = 48;
         self.active_ref = slot;
+        // The u8 mirror of this reference, fetched once for the whole search.
+        let r8_arc = self.u8_search().then(|| self.ref8_active());
+        let ref8 = r8_arc.as_deref();
         let mut mi = ModeInfo {
             sb_type: bsize as u8,
             skip: false,
@@ -6169,7 +6219,7 @@ impl FrameEncoder {
                 let j = idy * 2 + idx;
                 // ZEROMV baseline.
                 let mut best_cost =
-                    self.sub4x4_sad(mi_row, mi_col, idx, idy, (0, 0), bw, bh, edges);
+                    self.sub4x4_sad(mi_row, mi_col, idx, idy, (0, 0), bw, bh, edges, ref8);
                 let mut best_mode = ZEROMV;
                 let mut best_mv = (0i32, 0i32);
                 // NEAREST / NEAR — free predicted MVs (no MV bits).
@@ -6178,7 +6228,7 @@ impl FrameEncoder {
                         self.enc_sub8x8_mv(&mi, m, j, 0, mi_row, mi_col, bsize, edges),
                         self.hp_mv,
                     );
-                    let c = self.sub4x4_sad(mi_row, mi_col, idx, idy, mv, bw, bh, edges);
+                    let c = self.sub4x4_sad(mi_row, mi_col, idx, idy, mv, bw, bh, edges, ref8);
                     if c < best_cost {
                         best_cost = c;
                         best_mode = m;
@@ -6226,7 +6276,7 @@ impl FrameEncoder {
                 );
                 let pred = lower_mv_precision(cand[0], self.hp_mv);
                 let (mvw, sad_w) =
-                    self.search_mv_sub(mi_row, mi_col, idx, idy, pred, bw, bh, edges);
+                    self.search_mv_sub(mi_row, mi_col, idx, idy, pred, bw, bh, edges, ref8);
                 let cw = sad_w + NEWMV_SAD_PENALTY;
                 // G4 harvest (observe-only): predicted-mode SAD vs the searched NEWMV.
                 if self.g1_harvest {
@@ -7502,6 +7552,11 @@ fn sad8x8(s: &[u16], ss: usize, r: &[u16], rs: usize, has_avx2: bool) -> u32 {
     let _ = has_avx2;
     sad8x8_scalar(s, ss, r, rs)
 }
+
+/// Stage switch: route integer-MV sub-block candidates through the u8 scorer
+/// too (sub-pel candidates always are).
+#[cfg(target_arch = "x86_64")]
+const SUB4_U8_INTEGER: bool = false;
 
 /// Index of the last row of a `bs x bs` coefficient block that holds a non-zero
 /// value (0 if the block is all zero).
