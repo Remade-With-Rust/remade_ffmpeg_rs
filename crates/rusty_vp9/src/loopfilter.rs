@@ -643,7 +643,10 @@ fn filter_selectively_horiz(
 /// steps between the 8 positions along the edge. The two callers below pick the
 /// orientation. `lane_stride == 1` (horizontal edge) makes the gather/scatter
 /// contiguous; the strided case (vertical edge) still vectorizes the arithmetic.
-#[allow(clippy::needless_range_loop)]
+///
+/// Test-only since the frame loop calls the kernel monomorphs directly (see
+/// [`apply_edge`]): this is the entry the scalar-oracle test drives.
+#[cfg(test)]
 fn filter_edge8(
     buf: &mut [u16],
     i: usize,
@@ -1210,6 +1213,22 @@ unsafe fn lf_core8(
     flat2 = and(flat2, le(ad(q6, q0), ftv));
     flat2 = and(flat2, le(ad(p7, p0), ftv));
     flat2 = and(flat2, le(ad(q7, q0), ftv));
+    // No lane both flat and flat2 => filter16 is unused and the edge is exactly
+    // the 8-wide result (`mask & flat & !flat2` is all of `mask & flat` then).
+    // Skip the fourteen filter16 sums; an edge that does use them pays one
+    // `vptest`.
+    let use8_any = and(mask, flat);
+    let use16_any = and(use8_any, flat2);
+    if _mm256_testz_si256(use16_any, use16_any) == 1 {
+        let use4 = _mm256_andnot_si256(flat, mask);
+        np[2] = sel(use8_any, f8p2, p2);
+        np[1] = sel(use8_any, f8p1, sel(use4, f4p1, p1));
+        np[0] = sel(use8_any, f8p0, sel(use4, f4p0, p0));
+        nq[0] = sel(use8_any, f8q0, sel(use4, f4q0, q0));
+        nq[1] = sel(use8_any, f8q1, sel(use4, f4q1, q1));
+        nq[2] = sel(use8_any, f8q2, q2);
+        return (np, nq);
+    }
     let r4 = |x| _mm256_srai_epi32::<4>(add(x, _mm256_set1_epi32(8)));
     let mk = |k, a| _mm256_mullo_epi32(_mm256_set1_epi32(k), a);
     let sum = |xs: &[__m256i]| {
