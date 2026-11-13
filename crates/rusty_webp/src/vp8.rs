@@ -1664,7 +1664,8 @@ impl<R: Read> Vp8Decoder<R> {
             let mut block = [0i32; 16];
             let dcq = self.segment[sindex].y2dc;
             let acq = self.segment[sindex].y2ac;
-            let (n, _) = self.read_coefficients(&mut block, p, plane, complexity as usize, dcq, acq)?;
+            let (n, _) =
+                self.read_coefficients(&mut block, p, plane, complexity as usize, dcq, acq)?;
 
             self.left.complexity[0] = if n { 1 } else { 0 };
             self.top[mbx].complexity[0] = if n { 1 } else { 0 };
@@ -1689,7 +1690,8 @@ impl<R: Read> Vp8Decoder<R> {
                 let dcq = self.segment[sindex].ydc;
                 let acq = self.segment[sindex].yac;
 
-                let (n, has_ac) = self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
+                let (n, has_ac) =
+                    self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
 
                 if block[0] != 0 || n {
                     mb.non_zero_dct = true;

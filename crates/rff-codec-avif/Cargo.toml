@@ -30,4 +30,6 @@ rusty_av1d.workspace = true
 # (same lesson as rusty_png's forced-serial DEFLATE).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rusty_av1e = { workspace = true, features = ["asm", "threading"] }
+# (rusty_av1d >= 1.2.1 ships `src/arm/asm-offsets.h`; 1.2.0 left it out of the
+# package, which broke `asm` on every ARM target — issue #14.)
 rusty_av1d = { workspace = true, features = ["asm"] }

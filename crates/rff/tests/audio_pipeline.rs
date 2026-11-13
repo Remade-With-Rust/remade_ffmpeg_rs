@@ -57,7 +57,12 @@ fn read_wav_pcm(engine: &Engine, path: &Path) -> Vec<u8> {
         .open_demuxer("wav", Box::new(fs::File::open(path).unwrap()))
         .unwrap();
     let _ = dem.read_header().unwrap();
-    dem.read_packet().unwrap().data
+    // The WAV demuxer streams the data chunk in blocks: concatenate them all.
+    let mut data = Vec::new();
+    while let Ok(p) = dem.read_packet() {
+        data.extend_from_slice(&p.data);
+    }
+    data
 }
 
 #[test]

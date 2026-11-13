@@ -37,11 +37,7 @@ fn weights() -> &'static ([f32; 8], [f32; 8]) {
 pub fn expand(gi: &GranuleSideInfo, lines: &mut [f32; GRANULE_LINES]) {
     let is_short = gi.window_switching && gi.block_type == BlockType::Short;
     let boundaries = if is_short {
-        if gi.mixed_block {
-            1
-        } else {
-            0
-        }
+        usize::from(gi.mixed_block)
     } else {
         31
     };

@@ -1,7 +1,7 @@
 [package]
 name = "rff-codec-aac"
-description = "Remade FFmpeg (Rust): AAC-LC codec adapter over the pure-Rust rusty_aac crate (no C/FFI)."
-version.workspace = true
+description = "Remade FFmpeg (Rust): AAC codec adapter (LC/Main/LTP/HE-AAC v1+v2/LD/ELD decode, AAC-LC encode) over the pure-Rust rusty_aac crate (no C/FFI)."
+version = "1.1.12"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,9 +12,16 @@ readme = "README.md"
 keywords = ["aac", "audio", "codec", "decoder", "encoder"]
 categories = ["multimedia", "multimedia::audio", "multimedia::encoding"]
 
+# `supply-chain/` (the cargo-vet store for this crate's CI gate) is not part of
+# the published crate: shipping it made every imports refresh change the
+# package, so release-plz cut a new version, which the gate then had to vet
+# again -- a release loop.
+exclude = ["supply-chain/"]
+
 [features]
-# `simd` (default) enables rusty_aac's runtime-detected AVX2 quantize kernel on
-# x86_64 — an isolated, bit-exact `unsafe` block with a scalar fallback.
+# `simd` (default) enables rusty_aac's SIMD twins: the encoder's AVX2 quantize and
+# |x|^0.75 kernels, and the decoder's FFT (AVX / NEON) and IMDCT-window (SSE /
+# NEON) kernels -- each bit-exact with its scalar fallback, which it keeps.
 # `--no-default-features` gives a 100%-safe scalar build. `simd-avx512` adds an
 # 8-lane AVX-512 tier on top (opt-in: its intrinsics require Rust ≥1.89, above
 # the workspace MSRV; runtime-detected, falls back to AVX2 on non-AVX-512 hosts).
@@ -26,3 +33,9 @@ simd-avx512 = ["rusty_aac/simd-avx512"]
 rff-core.workspace = true
 rff-codec.workspace = true
 rusty_aac.workspace = true
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Style-only, nursery: `match`/`if let` reads more plainly than `map_or_else`.
+option_if_let_else = "allow"

@@ -9,11 +9,17 @@
 //! transcribed separately; the decode here is what turns a correct lookup into
 //! correct coefficients, and is verified with synthetic codebooks.
 
-#![allow(dead_code)]
+// Untrusted input: narrowing casts are lint-enforced here (H-17).
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 
 use crate::{Error, Result};
 
 use crate::bits::BitReader;
+#[cfg(test)]
 use crate::huffman::HuffBook;
 
 /// Properties of one spectral Huffman codebook.
@@ -29,7 +35,7 @@ pub struct Codebook {
     pub esc: bool,
 }
 
-/// Codebook properties indexed by codebook number 0..=11 (0 = ZERO_HCB).
+/// Codebook properties indexed by codebook number 0..=11 (0 = `ZERO_HCB`).
 pub const CODEBOOKS: [Codebook; 12] = [
     Codebook {
         dim: 0,
@@ -107,13 +113,17 @@ pub const CODEBOOKS: [Codebook; 12] = [
 
 /// First codebook number for intensity stereo (14, 15) and the special markers.
 pub const ZERO_HCB: u8 = 0;
-pub const ESC_HCB: u8 = 11;
 pub const NOISE_HCB: u8 = 13;
 pub const INTENSITY_HCB2: u8 = 14;
 pub const INTENSITY_HCB: u8 = 15;
 
 /// Decode one codeword from `book` for codebook `cb` into `out[..cb.dim]`,
 /// returning quantized (signed) coefficients.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "measured: passing the 4-byte Codebook by value cost +0.7% encode / +1.4% decode instructions in the inlined hot loops"
+)]
+#[cfg(test)]
 pub fn decode_tuple(
     cb: &Codebook,
     book: &HuffBook,
@@ -127,16 +137,25 @@ pub fn decode_tuple(
 /// Turn a decoded codebook `idx` into quantized coefficients, reading any sign
 /// and escape bits that follow the codeword. Split out so it can be tested
 /// directly with explicit indices.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "measured: passing the 4-byte Codebook by value cost +0.7% encode / +1.4% decode instructions in the inlined hot loops"
+)]
+#[cfg(test)]
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "test oracle: digits are below the codebook modulus (<= 17)"
+)]
 pub fn apply_index(cb: &Codebook, idx: u16, r: &mut BitReader, out: &mut [i32]) -> Result<()> {
     let dim = cb.dim as usize;
     let modulo = if cb.unsigned {
-        cb.lav as u32 + 1
+        u32::from(cb.lav) + 1
     } else {
-        2 * cb.lav as u32 + 1
+        2 * u32::from(cb.lav) + 1
     };
 
     // Unpack the Huffman index into `dim` base-`modulo` digits (MSB first).
-    let mut v = idx as u32;
+    let mut v = u32::from(idx);
     let mut digits = [0u32; 4];
     for d in (0..dim).rev() {
         digits[d] = v % modulo;
@@ -148,10 +167,62 @@ pub fn apply_index(cb: &Codebook, idx: u16, r: &mut BitReader, out: &mut [i32]) 
         out[i] = if cb.unsigned {
             digits[i] as i32
         } else {
-            digits[i] as i32 - cb.lav as i32
+            digits[i] as i32 - i32::from(cb.lav)
         };
     }
 
+    finish_tuple(cb, r, out)
+}
+
+/// The unpacked tuple for every codebook index of spectral book `cbn` (1..=11):
+/// `dim` coefficients before sign and escape bits, so the decoder looks a tuple
+/// up instead of dividing it out of the index digit by digit.
+pub fn tuple_table(cbn: u8) -> &'static [[i8; 4]] {
+    static T: [std::sync::OnceLock<Vec<[i8; 4]>>; 12] = [const { std::sync::OnceLock::new() }; 12];
+    T[cbn as usize].get_or_init(|| {
+        let cb = &CODEBOOKS[cbn as usize];
+        let modulo = if cb.unsigned {
+            u32::from(cb.lav) + 1
+        } else {
+            2 * u32::from(cb.lav) + 1
+        };
+        let n = modulo.pow(u32::from(cb.dim));
+        (0..n)
+            .map(|idx| {
+                let (mut v, mut t) = (idx, [0i8; 4]);
+                for d in (0..cb.dim as usize).rev() {
+                    #[allow(
+                        clippy::cast_possible_wrap,
+                        reason = "a digit below the codebook modulus (<= 17)"
+                    )]
+                    let digit = (v % modulo) as i32;
+                    v /= modulo;
+                    let signed = if cb.unsigned {
+                        digit
+                    } else {
+                        digit - i32::from(cb.lav)
+                    };
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "a tuple digit lies within [-16, 16]"
+                    )]
+                    let narrow = signed as i8;
+                    t[d] = narrow;
+                }
+                t
+            })
+            .collect()
+    })
+}
+
+/// Sign bits (unsigned books) and escape values (book 11) that follow a codeword.
+#[inline]
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "measured: passing the 4-byte Codebook by value cost +0.7% encode / +1.4% decode instructions in the inlined hot loops"
+)]
+pub fn finish_tuple(cb: &Codebook, r: &mut BitReader, out: &mut [i32]) -> Result<()> {
+    let dim = cb.dim as usize;
     // Unsigned books: one sign bit per non-zero magnitude, in order.
     if cb.unsigned {
         for o in out.iter_mut().take(dim) {
@@ -164,7 +235,7 @@ pub fn apply_index(cb: &Codebook, idx: u16, r: &mut BitReader, out: &mut [i32]) 
     // Book 11: any magnitude equal to lav (16) is replaced by an escape value.
     if cb.esc {
         for o in out.iter_mut().take(dim) {
-            if o.unsigned_abs() == cb.lav as u32 {
+            if o.unsigned_abs() == u32::from(cb.lav) {
                 let mag = read_escape(r)?;
                 *o = if *o < 0 { -mag } else { mag };
             }
@@ -185,13 +256,40 @@ fn read_escape(r: &mut BitReader) -> Result<i32> {
     }
     let bits = n + 4;
     let word = r.read_bits(bits)?;
-    Ok(((1u32 << bits) + word) as i32)
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "bits <= 28 (n <= 24 above), so the value is below 2^29"
+    )]
+    let value = ((1u32 << bits) + word) as i32;
+    Ok(value)
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation, reason = "test data generators")]
 mod tests {
     use super::*;
     use crate::tables::spectral_book;
+
+    /// The tuple table equals `apply_index` (the digit-by-digit oracle) for every
+    /// index of every book. With an all-zero reader the sign bits read positive
+    /// and a book-11 escape decodes back to 16, so the outputs must match exactly.
+    #[test]
+    fn tuple_table_matches_apply_index() {
+        for cbn in 1..=11u8 {
+            let cb = &CODEBOOKS[cbn as usize];
+            let tab = tuple_table(cbn);
+            assert_eq!(tab.len(), spectral_book(cbn).count(), "book {cbn}");
+            for (idx, t) in tab.iter().enumerate() {
+                let zeros = [0u8; 8];
+                let mut r = BitReader::new(&zeros);
+                let mut want = [0i32; 4];
+                apply_index(cb, idx as u16, &mut r, &mut want).unwrap();
+                for d in 0..cb.dim as usize {
+                    assert_eq!(i32::from(t[d]), want[d], "book {cbn} idx {idx}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn signed_pair_offsets_by_lav() {

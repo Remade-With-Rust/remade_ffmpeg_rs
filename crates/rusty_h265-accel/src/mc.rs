@@ -177,6 +177,118 @@ fn copy_shift_scalar(src: &[u16], stride: usize, w: usize, h: usize, shift: u32,
 mod x86 {
     use std::arch::x86_64::*;
 
+    /// Where a final interpolation pass writes (the dispatcher resolves the
+    /// safe [`super::Out`] into this once the bounds are proven).
+    ///
+    /// `M` on the kernels: 0 = the 14-bit `i16` intermediate into `dst`
+    /// (then `put_uni`/`put_bi` runs later); 1 = `put_uni` fused: the picture
+    /// sample `clip((v + 2^(s-1)) >> s)`; 2 = `put_bi` fused with the OTHER
+    /// list's intermediate: `clip((v + o + 2^(s-1)) >> s)`. The fused forms do
+    /// exactly what `pixel::put_uni_avx2` / `put_bi_avx2` do to the same
+    /// packed `i16` lanes, so they are bit-identical to the two-pass form --
+    /// and the pass they remove (store `pred`, reload it, shift, clamp, store
+    /// the picture) was 1.15 G instructions on a 20 s 720p clip.
+    #[derive(Clone, Copy)]
+    pub struct OutPtr {
+        pub pic: *mut u16,
+        pub stride: usize,
+        pub other: *const i16,
+        pub other_stride: usize,
+        pub shift: i32,
+        pub max: i32,
+    }
+
+    impl OutPtr {
+        pub const NONE: OutPtr = OutPtr {
+            pic: std::ptr::null_mut(),
+            stride: 0,
+            other: std::ptr::null(),
+            other_stride: 0,
+            shift: 1,
+            max: 0,
+        };
+    }
+
+    /// Sixteen packed `i16` results for output row `y`, columns `x..x+16`.
+    #[inline(always)]
+    unsafe fn emit256<const M: u8>(p: __m256i, dst: *mut i16, o: &OutPtr, x: usize, y: usize) {
+        unsafe {
+            if M == 0 {
+                _mm256_storeu_si256(dst as *mut __m256i, p);
+                return;
+            }
+            let off = _mm256_set1_epi16(1i16 << (o.shift - 1));
+            let maxv = _mm256_set1_epi16(o.max as i16);
+            let sh = _mm_cvtsi32_si128(o.shift);
+            let v = if M == 2 {
+                _mm256_adds_epi16(p, _mm256_loadu_si256(o.other.add(y * o.other_stride + x) as *const __m256i))
+            } else {
+                p
+            };
+            let v = _mm256_sra_epi16(_mm256_adds_epi16(v, off), sh);
+            let v = _mm256_min_epi16(_mm256_max_epi16(v, _mm256_setzero_si256()), maxv);
+            _mm256_storeu_si256(o.pic.add(y * o.stride + x) as *mut __m256i, v);
+        }
+    }
+
+    /// Eight packed results.
+    #[inline(always)]
+    unsafe fn emit128<const M: u8>(p: __m128i, dst: *mut i16, o: &OutPtr, x: usize, y: usize) {
+        unsafe {
+            if M == 0 {
+                _mm_storeu_si128(dst as *mut __m128i, p);
+                return;
+            }
+            let off = _mm_set1_epi16(1i16 << (o.shift - 1));
+            let maxv = _mm_set1_epi16(o.max as i16);
+            let sh = _mm_cvtsi32_si128(o.shift);
+            let v = if M == 2 {
+                _mm_adds_epi16(p, _mm_loadu_si128(o.other.add(y * o.other_stride + x) as *const __m128i))
+            } else {
+                p
+            };
+            let v = _mm_sra_epi16(_mm_adds_epi16(v, off), sh);
+            let v = _mm_min_epi16(_mm_max_epi16(v, _mm_setzero_si128()), maxv);
+            _mm_storeu_si128(o.pic.add(y * o.stride + x) as *mut __m128i, v);
+        }
+    }
+
+    /// Four packed results (the low half of `p`).
+    #[inline(always)]
+    unsafe fn emit64<const M: u8>(p: __m128i, dst: *mut i16, o: &OutPtr, x: usize, y: usize) {
+        unsafe {
+            if M == 0 {
+                _mm_storel_epi64(dst as *mut __m128i, p);
+                return;
+            }
+            let off = _mm_set1_epi16(1i16 << (o.shift - 1));
+            let maxv = _mm_set1_epi16(o.max as i16);
+            let sh = _mm_cvtsi32_si128(o.shift);
+            let v = if M == 2 {
+                _mm_adds_epi16(p, _mm_loadl_epi64(o.other.add(y * o.other_stride + x) as *const __m128i))
+            } else {
+                p
+            };
+            let v = _mm_sra_epi16(_mm_adds_epi16(v, off), sh);
+            let v = _mm_min_epi16(_mm_max_epi16(v, _mm_setzero_si128()), maxv);
+            _mm_storel_epi64(o.pic.add(y * o.stride + x) as *mut __m128i, v);
+        }
+    }
+
+    /// One result, scalar -- the arithmetic of the scalar twins of `put_uni`
+    /// and `put_bi`.
+    #[inline(always)]
+    unsafe fn emit1<const M: u8>(v: i16, dst: *mut i16, o: &OutPtr, x: usize, y: usize) {
+        unsafe {
+            if M == 0 {
+                *dst = v;
+                return;
+            }
+            let s = v as i32 + if M == 2 { *o.other.add(y * o.other_stride + x) as i32 } else { 0 };
+            *o.pic.add(y * o.stride + x) = ((s + (1 << (o.shift - 1))) >> o.shift).clamp(0, o.max) as u16;
+        }
+    }
+
     /// A shift that vanishes when the caller's shift is zero, so the
     /// specialised path emits no instruction at all.
     #[inline(always)]
@@ -194,6 +306,133 @@ mod x86 {
             v
         } else {
             unsafe { _mm256_sra_epi32(v, sh) }
+        }
+    }
+
+    /// Horizontal FIR over TWO 8-wide planes at once -- the chroma pair.
+    ///
+    /// Every operation the horizontal filter uses (`pmaddwd`, the 32-bit
+    /// unpacks, `packssdw`) works inside a 128-bit lane, so a 256-bit vector
+    /// whose low lane is a Cb row and whose high lane is the Cr row filters
+    /// both with the instruction count of one. An 8-wide block was the SSE2
+    /// tail's two four-wide groups per row, per plane; here it is one vector
+    /// step per row for the pair. Row `y` of the output is the joint row
+    /// `[Cb 0..8 | Cr 0..8]` at `dst + 16 * y`, which is exactly what
+    /// [`fir_v_avx2_dual8`] reads.
+    ///
+    /// # Safety
+    /// `sa`/`sb` must each have `stride * (h - 1) + 8 + N - 1` readable `u16`
+    /// at their stride; `dst` needs `16 * h` writable `i16`.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fir_h_avx2_dual8<const N: usize>(sa: *const u16, stra: usize, sb: *const u16, strb: usize, t: &[i16; N], h: usize, shift: u32, dst: *mut i16) {
+        let np = N / 2;
+        let mut taps = [_mm256_setzero_si256(); 4];
+        for k in 0..np {
+            taps[k] = _mm256_set1_epi32(pair(t, k));
+        }
+        let sh = _mm_cvtsi32_si128(shift as i32);
+        for y in 0..h {
+            let ra = unsafe { sa.add(y * stra) };
+            let rb = unsafe { sb.add(y * strb) };
+            let mut even = _mm256_setzero_si256();
+            let mut odd = _mm256_setzero_si256();
+            for k in 0..np {
+                let e = unsafe { _mm256_loadu2_m128i(rb.add(2 * k) as *const __m128i, ra.add(2 * k) as *const __m128i) };
+                even = _mm256_add_epi32(even, _mm256_madd_epi16(e, taps[k]));
+                let o = unsafe { _mm256_loadu2_m128i(rb.add(2 * k + 1) as *const __m128i, ra.add(2 * k + 1) as *const __m128i) };
+                odd = _mm256_add_epi32(odd, _mm256_madd_epi16(o, taps[k]));
+            }
+            even = _mm256_sra_epi32(even, sh);
+            odd = _mm256_sra_epi32(odd, sh);
+            let lo = _mm256_unpacklo_epi32(even, odd);
+            let hi = _mm256_unpackhi_epi32(even, odd);
+            unsafe { _mm256_storeu_si256(dst.add(16 * y) as *mut __m256i, _mm256_packs_epi32(lo, hi)) };
+        }
+    }
+
+    /// The vertical pass over the joint rows [`fir_h_avx2_dual8`] wrote, both
+    /// planes in one vector, each lane written to its own plane.
+    ///
+    /// The vertical arithmetic is lane-local for the same reason as the
+    /// horizontal (16-bit unpacks, `pmaddwd`, `packssdw`), so this is the
+    /// 16-wide loop of [`fir_v_avx2`] at stride 16 with a split write: the low
+    /// lane goes to plane A, the high lane to plane B.
+    ///
+    /// # Safety
+    /// `src` must have `16 * (h + N - 1)` readable `i16`. For `M == 0`,
+    /// `da`/`db` need `8 * h` writable `i16`; otherwise `oa`/`ob` must be
+    /// proven for an 8 x `h` block (as by `resolve_out`) with equal `shift`
+    /// and `max`.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fir_v_avx2_dual8<const N: usize, const M: u8>(src: *const i16, t: &[i16; N], h: usize, shift: u32, da: *mut i16, db: *mut i16, oa: &OutPtr, ob: &OutPtr) {
+        let np = N / 2;
+        let mut taps = [_mm256_setzero_si256(); 4];
+        for k in 0..np {
+            taps[k] = _mm256_set1_epi32(pair(t, k));
+        }
+        let sh = _mm_cvtsi32_si128(shift as i32);
+        // Two output rows per pass, sharing the `N - 1` overlapping loads.
+        let mut y = 0usize;
+        while y + 2 <= h {
+            let mut r = [_mm256_setzero_si256(); 9];
+            for (k, slot) in r.iter_mut().enumerate().take(N + 1) {
+                *slot = unsafe { _mm256_loadu_si256(src.add((y + k) * 16) as *const __m256i) };
+            }
+            let mut lo0 = _mm256_setzero_si256();
+            let mut hi0 = _mm256_setzero_si256();
+            let mut lo1 = _mm256_setzero_si256();
+            let mut hi1 = _mm256_setzero_si256();
+            for k in 0..np {
+                let (a, b, c) = (r[2 * k], r[2 * k + 1], r[2 * k + 2]);
+                lo0 = _mm256_add_epi32(lo0, _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), taps[k]));
+                hi0 = _mm256_add_epi32(hi0, _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), taps[k]));
+                lo1 = _mm256_add_epi32(lo1, _mm256_madd_epi16(_mm256_unpacklo_epi16(b, c), taps[k]));
+                hi1 = _mm256_add_epi32(hi1, _mm256_madd_epi16(_mm256_unpackhi_epi16(b, c), taps[k]));
+            }
+            unsafe {
+                emit_dual8::<M>(_mm256_packs_epi32(_mm256_sra_epi32(lo0, sh), _mm256_sra_epi32(hi0, sh)), da, db, oa, ob, y);
+                emit_dual8::<M>(_mm256_packs_epi32(_mm256_sra_epi32(lo1, sh), _mm256_sra_epi32(hi1, sh)), da, db, oa, ob, y + 1);
+            }
+            y += 2;
+        }
+        if y < h {
+            let mut lo = _mm256_setzero_si256();
+            let mut hi = _mm256_setzero_si256();
+            for k in 0..np {
+                let a = unsafe { _mm256_loadu_si256(src.add((y + 2 * k) * 16) as *const __m256i) };
+                let b = unsafe { _mm256_loadu_si256(src.add((y + 2 * k + 1) * 16) as *const __m256i) };
+                lo = _mm256_add_epi32(lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), taps[k]));
+                hi = _mm256_add_epi32(hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), taps[k]));
+            }
+            unsafe { emit_dual8::<M>(_mm256_packs_epi32(_mm256_sra_epi32(lo, sh), _mm256_sra_epi32(hi, sh)), da, db, oa, ob, y) };
+        }
+    }
+
+    /// Row `y` of the pair: the low lane of `p` is plane A's eight results,
+    /// the high lane plane B's -- the arithmetic of [`emit256`], split.
+    #[inline(always)]
+    unsafe fn emit_dual8<const M: u8>(p: __m256i, da: *mut i16, db: *mut i16, oa: &OutPtr, ob: &OutPtr, y: usize) {
+        unsafe {
+            if M == 0 {
+                _mm_storeu_si128(da.add(8 * y) as *mut __m128i, _mm256_castsi256_si128(p));
+                _mm_storeu_si128(db.add(8 * y) as *mut __m128i, _mm256_extracti128_si256::<1>(p));
+                return;
+            }
+            let off = _mm256_set1_epi16(1i16 << (oa.shift - 1));
+            let maxv = _mm256_set1_epi16(oa.max as i16);
+            let sh = _mm_cvtsi32_si128(oa.shift);
+            let v = if M == 2 {
+                let other = _mm256_loadu2_m128i(ob.other.add(y * ob.other_stride) as *const __m128i, oa.other.add(y * oa.other_stride) as *const __m128i);
+                _mm256_adds_epi16(p, other)
+            } else {
+                p
+            };
+            let v = _mm256_sra_epi16(_mm256_adds_epi16(v, off), sh);
+            let v = _mm256_min_epi16(_mm256_max_epi16(v, _mm256_setzero_si256()), maxv);
+            _mm_storeu_si128(oa.pic.add(y * oa.stride) as *mut __m128i, _mm256_castsi256_si128(v));
+            _mm_storeu_si128(ob.pic.add(y * ob.stride) as *mut __m128i, _mm256_extracti128_si256::<1>(v));
         }
     }
 
@@ -282,30 +521,42 @@ mod x86 {
     /// two shifts from the inner loop rather than shifting by nothing, and the
     /// branch is outside both loops.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn fir_h_avx2<const N: usize>(src: *const u16, stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, dst: *mut i16, dst_stride: usize) {
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fir_h_avx2<const N: usize, const M: u8>(src: *const u16, stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, dst: *mut i16, dst_stride: usize, o: &OutPtr) {
         if shift == 0 {
-            return unsafe { fir_h_avx2_impl::<N, true>(src, stride, t, w, h, 0, dst, dst_stride) };
+            return unsafe { fir_h_avx2_impl::<N, true, M>(src, stride, t, w, h, 0, dst, dst_stride, o) };
         }
-        unsafe { fir_h_avx2_impl::<N, false>(src, stride, t, w, h, shift, dst, dst_stride) }
+        unsafe { fir_h_avx2_impl::<N, false, M>(src, stride, t, w, h, shift, dst, dst_stride, o) }
     }
 
     /// # Safety
     /// As [`fir_h_sse2`].
     #[target_feature(enable = "avx2")]
-    unsafe fn fir_h_avx2_impl<const N: usize, const NOSHIFT: bool>(src: *const u16, stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, dst: *mut i16, dst_stride: usize) {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn fir_h_avx2_impl<const N: usize, const NOSHIFT: bool, const M: u8>(
+        src: *const u16,
+        stride: usize,
+        t: &[i16; N],
+        w: usize,
+        h: usize,
+        shift: u32,
+        dst: *mut i16,
+        dst_stride: usize,
+        o: &OutPtr,
+    ) {
         let np = N / 2;
         let mut taps = [_mm256_setzero_si256(); 4];
         for k in 0..np {
             taps[k] = _mm256_set1_epi32(pair(t, k));
         }
         let sh = _mm_cvtsi32_si128(shift as i32);
+        let nvec = w / 16;
         for y in 0..h {
             let row = unsafe { src.add(y * stride) };
             let out = unsafe { dst.add(y * dst_stride) };
             // Two vectors per trip: the tap loop does the same work either
             // way, but the loop's own three instructions are then paid once
             // per 32 samples instead of once per 16.
-            let nvec = w / 16;
             for i in 0..nvec / 2 {
                 for half in 0..2usize {
                     let x = i * 32 + half * 16;
@@ -323,7 +574,7 @@ mod x86 {
                     }
                     let lo = _mm256_unpacklo_epi32(even, odd);
                     let hi = _mm256_unpackhi_epi32(even, odd);
-                    unsafe { _mm256_storeu_si256(out.add(x) as *mut __m256i, _mm256_packs_epi32(lo, hi)) };
+                    unsafe { emit256::<M>(_mm256_packs_epi32(lo, hi), out.add(x), o, x, y) };
                 }
             }
             if nvec % 2 == 1 {
@@ -342,17 +593,24 @@ mod x86 {
                 }
                 let lo = _mm256_unpacklo_epi32(even, odd);
                 let hi = _mm256_unpackhi_epi32(even, odd);
-                unsafe { _mm256_storeu_si256(out.add(x) as *mut __m256i, _mm256_packs_epi32(lo, hi)) };
+                unsafe { emit256::<M>(_mm256_packs_epi32(lo, hi), out.add(x), o, x, y) };
             }
-            let x = nvec * 16;
-            if x < w {
-                unsafe { fir_h_sse2_tail(row, t, x, w, shift, out) };
-            }
+        }
+        // The width remainder, ONCE for the whole block, not once per row.
+        //
+        // Inside the row loop this was a call per row -- 2.2 M calls on a 20 s
+        // clip for the 8-, 12- and 24-wide luma blocks, each rebuilding its
+        // tap vectors -- where the remaining columns are the same for every
+        // row and the callee can loop over them itself.
+        let x = nvec * 16;
+        if x < w {
+            unsafe { fir_h_sse2_tail::<N, M>(src, stride, t, x, w, h, shift, dst, dst_stride, o) };
         }
     }
 
     #[target_feature(enable = "sse2")]
-    unsafe fn fir_h_sse2_tail<const N: usize>(row: *const u16, t: &[i16; N], mut x: usize, w: usize, shift: u32, out: *mut i16) {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn fir_h_sse2_tail<const N: usize, const M: u8>(src: *const u16, stride: usize, t: &[i16; N], x0: usize, w: usize, h: usize, shift: u32, dst: *mut i16, dst_stride: usize, o: &OutPtr) {
         // A 4-wide step. This tail was fully scalar and serves EVERY row
         // narrower than eight, so a 4-wide chroma block filtered its whole
         // horizontal pass one sample at a time.
@@ -371,33 +629,38 @@ mod x86 {
         // a `packs` and a half-width `storel` for every four samples. Two groups
         // fill the store exactly and pay that pair once for eight -- the same
         // reason `planar_sse2` pairs.
-        let quad = |x: usize| {
-            let mut even = _mm_setzero_si128();
-            let mut odd = _mm_setzero_si128();
-            for k in 0..N / 2 {
-                even = _mm_add_epi32(even, _mm_madd_epi16(unsafe { _mm_loadu_si128(row.add(x + 2 * k) as *const __m128i) }, tp[k]));
-                odd = _mm_add_epi32(odd, _mm_madd_epi16(unsafe { _mm_loadu_si128(row.add(x + 2 * k + 1) as *const __m128i) }, tp[k]));
+        for y in 0..h {
+            let row = unsafe { src.add(y * stride) };
+            let out = unsafe { dst.add(y * dst_stride) };
+            let quad = |x: usize| {
+                let mut even = _mm_setzero_si128();
+                let mut odd = _mm_setzero_si128();
+                for k in 0..N / 2 {
+                    even = _mm_add_epi32(even, _mm_madd_epi16(unsafe { _mm_loadu_si128(row.add(x + 2 * k) as *const __m128i) }, tp[k]));
+                    odd = _mm_add_epi32(odd, _mm_madd_epi16(unsafe { _mm_loadu_si128(row.add(x + 2 * k + 1) as *const __m128i) }, tp[k]));
+                }
+                _mm_unpacklo_epi32(_mm_sra_epi32(even, shv), _mm_sra_epi32(odd, shv))
+            };
+            let mut x = x0;
+            while x + 8 <= w {
+                let v0 = quad(x);
+                let v1 = quad(x + 4);
+                unsafe { emit128::<M>(_mm_packs_epi32(v0, v1), out.add(x), o, x, y) };
+                x += 8;
             }
-            _mm_unpacklo_epi32(_mm_sra_epi32(even, shv), _mm_sra_epi32(odd, shv))
-        };
-        while x + 8 <= w {
-            let v0 = quad(x);
-            let v1 = quad(x + 4);
-            unsafe { _mm_storeu_si128(out.add(x) as *mut __m128i, _mm_packs_epi32(v0, v1)) };
-            x += 8;
-        }
-        if x + 4 <= w {
-            let v = quad(x);
-            unsafe { _mm_storel_epi64(out.add(x) as *mut __m128i, _mm_packs_epi32(v, v)) };
-            x += 4;
-        }
-        while x < w {
-            let mut acc = 0i32;
-            for i in 0..N {
-                acc += t[i] as i32 * unsafe { *row.add(x + i) } as i32;
+            if x + 4 <= w {
+                let v = quad(x);
+                unsafe { emit64::<M>(_mm_packs_epi32(v, v), out.add(x), o, x, y) };
+                x += 4;
             }
-            unsafe { *out.add(x) = (acc >> shift) as i16 };
-            x += 1;
+            while x < w {
+                let mut acc = 0i32;
+                for i in 0..N {
+                    acc += t[i] as i32 * unsafe { *row.add(x + i) } as i32;
+                }
+                unsafe { emit1::<M>((acc >> shift) as i16, out.add(x), o, x, y) };
+                x += 1;
+            }
         }
     }
 
@@ -538,17 +801,29 @@ mod x86 {
     /// **zero for 8-bit content**; the two-dimensional path shifts by 6. One
     /// branch outside the loops serves both without shifting by nothing.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn fir_v_avx2<const N: usize>(src: *const i16, stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, dst: *mut i16, dst_stride: usize) {
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fir_v_avx2<const N: usize, const M: u8>(src: *const i16, stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, dst: *mut i16, dst_stride: usize, o: &OutPtr) {
         if shift == 0 {
-            return unsafe { fir_v_avx2_impl::<N, true>(src, stride, t, w, h, 0, dst, dst_stride) };
+            return unsafe { fir_v_avx2_impl::<N, true, M>(src, stride, t, w, h, 0, dst, dst_stride, o) };
         }
-        unsafe { fir_v_avx2_impl::<N, false>(src, stride, t, w, h, shift, dst, dst_stride) }
+        unsafe { fir_v_avx2_impl::<N, false, M>(src, stride, t, w, h, shift, dst, dst_stride, o) }
     }
 
     /// # Safety
     /// As [`fir_v_avx2`].
     #[target_feature(enable = "avx2")]
-    unsafe fn fir_v_avx2_impl<const N: usize, const NOSHIFT: bool>(src: *const i16, stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, dst: *mut i16, dst_stride: usize) {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn fir_v_avx2_impl<const N: usize, const NOSHIFT: bool, const M: u8>(
+        src: *const i16,
+        stride: usize,
+        t: &[i16; N],
+        w: usize,
+        h: usize,
+        shift: u32,
+        dst: *mut i16,
+        dst_stride: usize,
+        o: &OutPtr,
+    ) {
         let np = N / 2;
         let mut taps = [_mm256_setzero_si256(); 4];
         for k in 0..np {
@@ -591,8 +866,8 @@ mod x86 {
                     hi1 = _mm256_add_epi32(hi1, _mm256_madd_epi16(_mm256_unpackhi_epi16(b, c), taps[k]));
                 }
                 unsafe {
-                    _mm256_storeu_si256(out0.add(x) as *mut __m256i, _mm256_packs_epi32(shr256::<NOSHIFT>(lo0, sh), shr256::<NOSHIFT>(hi0, sh)));
-                    _mm256_storeu_si256(out1.add(x) as *mut __m256i, _mm256_packs_epi32(shr256::<NOSHIFT>(lo1, sh), shr256::<NOSHIFT>(hi1, sh)));
+                    emit256::<M>(_mm256_packs_epi32(shr256::<NOSHIFT>(lo0, sh), shr256::<NOSHIFT>(hi0, sh)), out0.add(x), o, x, y);
+                    emit256::<M>(_mm256_packs_epi32(shr256::<NOSHIFT>(lo1, sh), shr256::<NOSHIFT>(hi1, sh)), out1.add(x), o, x, y + 1);
                 }
             }
             // The 8-wide step, for BOTH output rows at once.
@@ -628,8 +903,8 @@ mod x86 {
                     let (lo0, hi0) = if NOSHIFT { (lo0, hi0) } else { (_mm_sra_epi32(lo0, sh), _mm_sra_epi32(hi0, sh)) };
                     let (lo1, hi1) = if NOSHIFT { (lo1, hi1) } else { (_mm_sra_epi32(lo1, sh), _mm_sra_epi32(hi1, sh)) };
                     unsafe {
-                        _mm_storeu_si128(out0.add(x8) as *mut __m128i, _mm_packs_epi32(lo0, hi0));
-                        _mm_storeu_si128(out1.add(x8) as *mut __m128i, _mm_packs_epi32(lo1, hi1));
+                        emit128::<M>(_mm_packs_epi32(lo0, hi0), out0.add(x8), o, x8, y);
+                        emit128::<M>(_mm_packs_epi32(lo1, hi1), out1.add(x8), o, x8, y + 1);
                     }
                     x8 += 8;
                 }
@@ -650,19 +925,19 @@ mod x86 {
                 }
                 let (lo0, lo1) = if NOSHIFT { (lo0, lo1) } else { (_mm_sra_epi32(lo0, sh), _mm_sra_epi32(lo1, sh)) };
                 unsafe {
-                    _mm_storel_epi64(out0.add(x4) as *mut __m128i, _mm_packs_epi32(lo0, lo0));
-                    _mm_storel_epi64(out1.add(x4) as *mut __m128i, _mm_packs_epi32(lo1, lo1));
+                    emit64::<M>(_mm_packs_epi32(lo0, lo0), out0.add(x4), o, x4, y);
+                    emit64::<M>(_mm_packs_epi32(lo1, lo1), out1.add(x4), o, x4, y + 1);
                 }
                 x4 += 4;
             }
-            for (o, yy) in [(out0, y), (out1, y + 1)] {
+            for (orow, yy) in [(out0, y), (out1, y + 1)] {
                 let mut x = x4;
                 while x < w {
                     let mut acc = 0i32;
                     for i in 0..N {
                         acc += t[i] as i32 * unsafe { *src.add((yy + i) * stride + x) } as i32;
                     }
-                    unsafe { *o.add(x) = (acc >> shift) as i16 };
+                    unsafe { emit1::<M>((acc >> shift) as i16, orow.add(x), o, x, yy) };
                     x += 1;
                 }
             }
@@ -686,7 +961,7 @@ mod x86 {
                 // `unpack` and `packs` are per-128-bit-lane, and the unpack
                 // above split each 256-bit row the same way, so the halves
                 // land back in picture order without a permute.
-                unsafe { _mm256_storeu_si256(out.add(x) as *mut __m256i, _mm256_packs_epi32(lo_acc, hi_acc)) };
+                unsafe { emit256::<M>(_mm256_packs_epi32(lo_acc, hi_acc), out.add(x), o, x, y) };
             }
             let mut x = nvec * 16;
             // The odd-row path needs the same steps as the two-row body above.
@@ -701,7 +976,7 @@ mod x86 {
                     hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(r0, r1), tp));
                 }
                 let (lo, hi) = if NOSHIFT { (lo, hi) } else { (_mm_sra_epi32(lo, sh), _mm_sra_epi32(hi, sh)) };
-                unsafe { _mm_storeu_si128(out.add(x) as *mut __m128i, _mm_packs_epi32(lo, hi)) };
+                unsafe { emit128::<M>(_mm_packs_epi32(lo, hi), out.add(x), o, x, y) };
                 x += 8;
             }
             if x + 4 <= w {
@@ -712,7 +987,7 @@ mod x86 {
                     lo = _mm_add_epi32(lo, _mm_madd_epi16(_mm_unpacklo_epi16(r0, r1), _mm_set1_epi32(pair(t, k))));
                 }
                 let lo = if NOSHIFT { lo } else { _mm_sra_epi32(lo, sh) };
-                unsafe { _mm_storel_epi64(out.add(x) as *mut __m128i, _mm_packs_epi32(lo, lo)) };
+                unsafe { emit64::<M>(_mm_packs_epi32(lo, lo), out.add(x), o, x, y) };
                 x += 4;
             }
             while x < w {
@@ -720,7 +995,7 @@ mod x86 {
                 for i in 0..N {
                     acc += t[i] as i32 * unsafe { *src.add((y + i) * stride + x) } as i32;
                 }
-                unsafe { *out.add(x) = (acc >> shift) as i16 };
+                unsafe { emit1::<M>((acc >> shift) as i16, out.add(x), o, x, y) };
                 x += 1;
             }
             y += 1;
@@ -779,7 +1054,8 @@ mod x86 {
     /// As [`fir_v_avx2`]; `t` must be a palindrome and `src` must hold samples
     /// of at most 14 bits.
     #[target_feature(enable = "avx2")]
-    pub unsafe fn fir_v_avx2_sym<const N: usize>(src: *const i16, stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, dst: *mut i16, dst_stride: usize) {
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fir_v_avx2_sym<const N: usize, const M: u8>(src: *const i16, stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, dst: *mut i16, dst_stride: usize, o: &OutPtr) {
         debug_assert!((0..N / 2).all(|k| t[k] == t[N - 1 - k]), "kernel requires palindromic taps");
         let ng = N / 4; // folded tap pairs: 2 for luma, 1 for chroma
         let nh = N / 2; // folded row sums per output
@@ -821,18 +1097,18 @@ mod x86 {
                 // land back in picture order with no permute -- the same
                 // property the general kernel relies on.
                 unsafe {
-                    _mm256_storeu_si256(out0.add(x) as *mut __m256i, _mm256_packs_epi32(shr256_dyn(lo0, sh, shift), shr256_dyn(hi0, sh, shift)));
-                    _mm256_storeu_si256(out1.add(x) as *mut __m256i, _mm256_packs_epi32(shr256_dyn(lo1, sh, shift), shr256_dyn(hi1, sh, shift)));
+                    emit256::<M>(_mm256_packs_epi32(shr256_dyn(lo0, sh, shift), shr256_dyn(hi0, sh, shift)), out0.add(x), o, x, y);
+                    emit256::<M>(_mm256_packs_epi32(shr256_dyn(lo1, sh, shift), shr256_dyn(hi1, sh, shift)), out1.add(x), o, x, y + 1);
                 }
             }
-            for (o, yy) in [(out0, y), (out1, y + 1)] {
+            for (orow, yy) in [(out0, y), (out1, y + 1)] {
                 let mut x = nvec * 16;
                 while x < w {
                     let mut acc = 0i32;
                     for i in 0..N {
                         acc += t[i] as i32 * unsafe { *src.add((yy + i) * stride + x) } as i32;
                     }
-                    unsafe { *o.add(x) = (acc >> shift) as i16 };
+                    unsafe { emit1::<M>((acc >> shift) as i16, orow.add(x), o, x, yy) };
                     x += 1;
                 }
             }
@@ -854,7 +1130,7 @@ mod x86 {
                     lo = _mm256_add_epi32(lo, _mm256_madd_epi16(_mm256_unpacklo_epi16(p, q), taps[g]));
                     hi = _mm256_add_epi32(hi, _mm256_madd_epi16(_mm256_unpackhi_epi16(p, q), taps[g]));
                 }
-                unsafe { _mm256_storeu_si256(out.add(x) as *mut __m256i, _mm256_packs_epi32(shr256_dyn(lo, sh, shift), shr256_dyn(hi, sh, shift))) };
+                unsafe { emit256::<M>(_mm256_packs_epi32(shr256_dyn(lo, sh, shift), shr256_dyn(hi, sh, shift)), out.add(x), o, x, y) };
             }
             let mut x = nvec * 16;
             while x < w {
@@ -862,7 +1138,7 @@ mod x86 {
                 for i in 0..N {
                     acc += t[i] as i32 * unsafe { *src.add((y + i) * stride + x) } as i32;
                 }
-                unsafe { *out.add(x) = (acc >> shift) as i16 };
+                unsafe { emit1::<M>((acc >> shift) as i16, out.add(x), o, x, y) };
                 x += 1;
             }
             y += 1;
@@ -1081,6 +1357,88 @@ mod arm {
 // Dispatchers — safe, bounds proved here, loop inside the feature boundary
 // ---------------------------------------------------------------------------
 
+/// Where a prediction block's interpolation ends up.
+///
+/// `Pred` is the 14-bit intermediate in `dst`, for a caller that combines it
+/// itself (weighted prediction, or one list of a bi-prediction whose other list
+/// is full-pel). `Uni` and `Bi` fold §8.5.3.3.4.2's default weighting into the
+/// interpolation's final pass: the sample never reaches the intermediate buffer,
+/// which on a 20 s 720p clip was a store, a reload and a second loop over
+/// 1.2 M uni and 0.6 M bi blocks -- 1.15 G instructions. Bit-identical: the
+/// fused epilogue performs the exact operations of `pixel::put_uni` /
+/// `pixel::put_bi` on the same packed `i16` lanes.
+pub enum Out<'a> {
+    Pred,
+    Uni { pic: &'a mut [u16], stride: usize },
+    Bi { pic: &'a mut [u16], stride: usize, other: &'a [i16] },
+}
+
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+type Fused = x86::OutPtr;
+#[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
+#[derive(Clone, Copy)]
+struct Fused;
+#[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
+impl Fused {
+    const NONE: Fused = Fused;
+}
+
+/// The mode a kernel is asked for (0 = `Pred`, 1 = `Uni`, 2 = `Bi`) and the
+/// proven pointers for it. Falls back to `Pred` when the kernels cannot take
+/// the fused form here -- the caller then combines the intermediate itself.
+fn resolve_out(p: McPlan, out: &mut Out<'_>, w: usize, h: usize, bit_depth: u8) -> (u8, Fused) {
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    {
+        if p.isa == crate::Isa::Avx2 && bit_depth <= 12 {
+            let max = (1i32 << bit_depth) - 1;
+            match out {
+                Out::Pred => {}
+                Out::Uni { pic, stride } => {
+                    if pic.len() >= *stride * (h - 1) + w {
+                        return (
+                            1,
+                            x86::OutPtr {
+                                pic: pic.as_mut_ptr(),
+                                stride: *stride,
+                                other: std::ptr::null(),
+                                other_stride: 0,
+                                shift: 14 - bit_depth as i32,
+                                max,
+                            },
+                        );
+                    }
+                }
+                Out::Bi { pic, stride, other } => {
+                    if pic.len() >= *stride * (h - 1) + w && other.len() >= w * h {
+                        return (
+                            2,
+                            x86::OutPtr {
+                                pic: pic.as_mut_ptr(),
+                                stride: *stride,
+                                other: other.as_ptr(),
+                                other_stride: w,
+                                shift: 15 - bit_depth as i32,
+                                max,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let _ = (p, out, w, h, bit_depth);
+    (0, Fused::NONE)
+}
+
+/// The combine a non-fused path still owes: the two-pass form.
+fn combine(out: Out<'_>, pred: &[i16], w: usize, h: usize, bit_depth: u8) {
+    match out {
+        Out::Pred => {}
+        Out::Uni { pic, stride } => crate::pixel::put_uni(pic, stride, pred, w, h, bit_depth),
+        Out::Bi { pic, stride, other } => crate::pixel::put_bi(pic, stride, pred, other, w, h, bit_depth),
+    }
+}
+
 /// Full-pel copy, with runtime dispatch. See [`x86::copy_shift_sse2`].
 #[allow(clippy::too_many_arguments)]
 fn copy_shift(p: McPlan, src: &[u16], stride: usize, w: usize, h: usize, shift: u32, dst: &mut [i16], dst_stride: usize) {
@@ -1106,18 +1464,31 @@ fn copy_shift(p: McPlan, src: &[u16], stride: usize, w: usize, h: usize, shift: 
     copy_shift_scalar(src, stride, w, h, shift, dst, dst_stride);
 }
 
+/// Returns whether the output was written in mode `m` (a `false` means the
+/// intermediate went to `dst` and the caller still owes the combine).
 #[inline]
-fn fir_h<const N: usize>(p: McPlan, src: &[u16], stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, dst: &mut [i16], dst_stride: usize) {
+#[allow(clippy::too_many_arguments)]
+fn fir_h<const N: usize>(p: McPlan, src: &[u16], stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, dst: &mut [i16], dst_stride: usize, m: u8, o: &Fused) -> bool {
     debug_assert!(src.len() >= stride * (h - 1) + w + N - 1);
     debug_assert!(dst.len() >= dst_stride * (h - 1) + w);
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
         if src.len() >= stride * (h - 1) + w + N - 1 && dst.len() >= dst_stride * (h - 1) + w {
             // SAFETY: the lengths the kernels read and write are the ones
-            // asserted immediately above.
+            // asserted immediately above; `o` was proven by `resolve_out`.
             match p.isa {
-                crate::Isa::Avx2 => return unsafe { x86::fir_h_avx2::<N>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride) },
-                _ => return unsafe { x86::fir_h_sse2::<N>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride) },
+                crate::Isa::Avx2 => unsafe {
+                    match m {
+                        0 => x86::fir_h_avx2::<N, 0>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride, o),
+                        1 => x86::fir_h_avx2::<N, 1>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride, o),
+                        _ => x86::fir_h_avx2::<N, 2>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride, o),
+                    }
+                    return true;
+                },
+                _ => {
+                    unsafe { x86::fir_h_sse2::<N>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride) };
+                    return m == 0;
+                }
             }
         }
     }
@@ -1125,10 +1496,13 @@ fn fir_h<const N: usize>(p: McPlan, src: &[u16], stride: usize, t: &[i16; N], w:
     {
         if src.len() >= stride * (h - 1) + w + N - 1 && dst.len() >= dst_stride * (h - 1) + w {
             // SAFETY: as above.
-            return unsafe { arm::fir_h_neon::<N>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride) };
+            unsafe { arm::fir_h_neon::<N>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride) };
+            return m == 0;
         }
     }
+    let _ = o;
     fir_h_scalar::<N>(src, stride, t, w, h, shift, dst, dst_stride);
+    m == 0
 }
 
 /// Reinterprets sample data as `i16`. Every HEVC sample is below `2^14`, so
@@ -1197,7 +1571,22 @@ fn plan() -> McPlan {
 /// runtime condition, not a formality -- the identical fold is unavailable to
 /// the 2-D path precisely because its operands are intermediates that already
 /// fill the type.
-fn fir_v_u16_sym<const N: usize>(p: McPlan, src: &[u16], stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, bit_depth: u8, sym: bool, dst: &mut [i16], dst_stride: usize) {
+#[allow(clippy::too_many_arguments)]
+fn fir_v_u16_sym<const N: usize>(
+    p: McPlan,
+    src: &[u16],
+    stride: usize,
+    t: &[i16; N],
+    w: usize,
+    h: usize,
+    shift: u32,
+    bit_depth: u8,
+    sym: bool,
+    dst: &mut [i16],
+    dst_stride: usize,
+    m: u8,
+    o: &Fused,
+) -> bool {
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
         // `sym` is the caller's table lookup, not a scan of `t`, and the bounds
@@ -1207,44 +1596,60 @@ fn fir_v_u16_sym<const N: usize>(p: McPlan, src: &[u16], stride: usize, t: &[i16
         if sym && p.sym && p.isa == crate::Isa::Avx2 && fits && bit_depth <= 14 {
             // SAFETY: bounds checked just above; taps verified palindromic by
             // the table and the samples verified narrow enough for the i16 fold.
-            return unsafe { x86::fir_v_avx2_sym::<N>(as_i16(src).as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride) };
+            unsafe {
+                match m {
+                    0 => x86::fir_v_avx2_sym::<N, 0>(as_i16(src).as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride, o),
+                    1 => x86::fir_v_avx2_sym::<N, 1>(as_i16(src).as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride, o),
+                    _ => x86::fir_v_avx2_sym::<N, 2>(as_i16(src).as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride, o),
+                }
+            }
+            return true;
         }
         // Straight to the general kernel: falling through `fir_v_u16` would
         // probe the ISA a second time for a question already answered.
-        if fits {
-            // SAFETY: as above.
-            match p.isa {
-                crate::Isa::Avx2 => return unsafe { x86::fir_v_avx2::<N>(as_i16(src).as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride) },
-                crate::Isa::Scalar => {}
-                _ => return unsafe { x86::fir_v_sse2::<N>(as_i16(src).as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride) },
-            }
+        if fits && p.isa != crate::Isa::Scalar {
+            return fir_v::<N>(p, as_i16(src), stride, t, w, h, shift, dst, dst_stride, m, o);
         }
     }
     let _ = (bit_depth, sym);
-    fir_v_u16::<N>(p, src, stride, t, w, h, shift, dst, dst_stride);
+    fir_v_u16::<N>(p, src, stride, t, w, h, shift, dst, dst_stride, m, o)
 }
 
-fn fir_v_u16<const N: usize>(p: McPlan, src: &[u16], stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, dst: &mut [i16], dst_stride: usize) {
+#[allow(clippy::too_many_arguments)]
+fn fir_v_u16<const N: usize>(p: McPlan, src: &[u16], stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, dst: &mut [i16], dst_stride: usize, m: u8, o: &Fused) -> bool {
     #[cfg(feature = "simd")]
     {
         if p.isa != crate::Isa::Scalar {
-            return fir_v::<N>(p, as_i16(src), stride, t, w, h, shift, dst, dst_stride);
+            return fir_v::<N>(p, as_i16(src), stride, t, w, h, shift, dst, dst_stride, m, o);
         }
     }
-    let _ = p;
+    let _ = (p, o);
     fir_v_u16_scalar::<N>(src, stride, t, w, h, shift, dst, dst_stride);
+    m == 0
 }
 
 #[inline]
-fn fir_v<const N: usize>(p: McPlan, src: &[i16], stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, dst: &mut [i16], dst_stride: usize) {
+#[allow(clippy::too_many_arguments)]
+fn fir_v<const N: usize>(p: McPlan, src: &[i16], stride: usize, t: &[i16; N], w: usize, h: usize, shift: u32, dst: &mut [i16], dst_stride: usize, m: u8, o: &Fused) -> bool {
     debug_assert!(src.len() >= stride * (h + N - 2) + w);
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
         if src.len() >= stride * (h + N - 2) + w && dst.len() >= dst_stride * (h - 1) + w {
-            // SAFETY: the kernel reads `h + N - 1` rows of `w` and writes `h`.
+            // SAFETY: the kernel reads `h + N - 1` rows of `w` and writes `h`;
+            // `o` was proven by `resolve_out`.
             match p.isa {
-                crate::Isa::Avx2 => return unsafe { x86::fir_v_avx2::<N>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride) },
-                _ => return unsafe { x86::fir_v_sse2::<N>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride) },
+                crate::Isa::Avx2 => unsafe {
+                    match m {
+                        0 => x86::fir_v_avx2::<N, 0>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride, o),
+                        1 => x86::fir_v_avx2::<N, 1>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride, o),
+                        _ => x86::fir_v_avx2::<N, 2>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride, o),
+                    }
+                    return true;
+                },
+                _ => {
+                    unsafe { x86::fir_v_sse2::<N>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride) };
+                    return m == 0;
+                }
             }
         }
     }
@@ -1252,10 +1657,13 @@ fn fir_v<const N: usize>(p: McPlan, src: &[i16], stride: usize, t: &[i16; N], w:
     {
         if src.len() >= stride * (h + N - 2) + w && dst.len() >= dst_stride * (h - 1) + w {
             // SAFETY: as above.
-            return unsafe { arm::fir_v_neon::<N>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride) };
+            unsafe { arm::fir_v_neon::<N>(src.as_ptr(), stride, t, w, h, shift, dst.as_mut_ptr(), dst_stride) };
+            return m == 0;
         }
     }
+    let _ = o;
     fir_v_scalar::<N>(src, stride, t, w, h, shift, dst, dst_stride);
+    m == 0
 }
 
 /// One prediction block, `N`-tap, from an in-bounds footprint.
@@ -1274,10 +1682,47 @@ fn full_pel(p: McPlan, src: &[u16], stride: usize, m: usize, w: usize, h: usize,
     copy_shift(p, &src[m * stride + m..], stride, w, h, shift3, dst, w);
 }
 
+/// The 2-D arm for an 8-wide PAIR of planes in one pass (see
+/// [`x86::fir_h_avx2_dual8`]). Returns false -- having written nothing --
+/// when it cannot take the pair, and the caller filters the planes one by one.
 #[allow(clippy::too_many_arguments)]
-fn interp<const N: usize, const NF: usize>(
-    src: &[u16],
-    stride: usize,
+fn dual8_2d<const N: usize>(p: McPlan, src: &[(&[u16], usize)], th: &[i16; N], tv: &[i16; N], h: usize, shift1: u32, dst: &mut [&mut [i16]], tmp: &mut [i16], mo: &[(u8, Fused)]) -> bool {
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    {
+        let rows = h + N - 1;
+        let [(sa, ta), (sb, tb)] = src else { return false };
+        let [da, db] = dst else { return false };
+        let [(ma, oa), (mb, ob)] = mo else { return false };
+        let fits = |s: &[u16], st: usize| s.len() >= st * (rows - 1) + 8 + N - 1;
+        if p.isa != crate::Isa::Avx2 || ma != mb || !fits(sa, *ta) || !fits(sb, *tb) || tmp.len() < 16 * rows || da.len() < 8 * h || db.len() < 8 * h {
+            return false;
+        }
+        if *ma != 0 && (oa.shift != ob.shift || oa.max != ob.max) {
+            return false;
+        }
+        // SAFETY: every length the kernels read or write is checked above;
+        // the fused pointers were proven for an 8 x h block by `resolve_out`.
+        unsafe {
+            x86::fir_h_avx2_dual8::<N>(sa.as_ptr(), *ta, sb.as_ptr(), *tb, th, rows, shift1, tmp.as_mut_ptr());
+            let (pa, pb) = (da.as_mut_ptr(), db.as_mut_ptr());
+            match ma {
+                0 => x86::fir_v_avx2_dual8::<N, 0>(tmp.as_ptr(), tv, h, 6, pa, pb, oa, ob),
+                1 => x86::fir_v_avx2_dual8::<N, 1>(tmp.as_ptr(), tv, h, 6, pa, pb, oa, ob),
+                _ => x86::fir_v_avx2_dual8::<N, 2>(tmp.as_ptr(), tv, h, 6, pa, pb, oa, ob),
+            }
+        }
+        return true;
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = (p, src, th, tv, h, shift1, dst, tmp, mo);
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interp<const N: usize, const NF: usize, const P: usize>(
+    src: [(&[u16], usize); P],
     fx: usize,
     fy: usize,
     w: usize,
@@ -1286,8 +1731,9 @@ fn interp<const N: usize, const NF: usize>(
     taps: &[[i16; N]; NF],
     spans: &[(usize, usize); NF],
     syms: &[bool; NF],
-    dst: &mut [i16],
+    mut dst: [&mut [i16]; P],
     tmp: &mut [i16],
+    mut out: [Out<'_>; P],
 ) {
     // `NF` is the number of fractional positions -- 4 for luma, 8 for chroma,
     // both powers of two -- and the caller derives `fx`/`fy` as `mv & (NF - 1)`.
@@ -1296,7 +1742,6 @@ fn interp<const N: usize, const NF: usize>(
     // compare and a branch to a panic block apiece on every call.
     let fx = fx & (NF - 1);
     let fy = fy & (NF - 1);
-    let m = margin(N);
     let shift1 = (bit_depth as u32).saturating_sub(8).min(4);
     // ONE plan read for the whole call, threaded to every filter below.
     //
@@ -1306,6 +1751,15 @@ fn interp<const N: usize, const NF: usize>(
     // down that arm. The bring-up switch `elide_taps` used to own now rides in
     // `McPlan`, so the read that picks the kernels also answers it.
     let p = plan();
+    // The combine, fused into the final pass when the kernels can take it --
+    // resolved per plane, since each plane writes its own picture.
+    let want: [u8; P] = std::array::from_fn(|k| match out[k] {
+        Out::Pred => 0u8,
+        Out::Uni { .. } => 1,
+        Out::Bi { .. } => 2,
+    });
+    let mo: [(u8, Fused); P] = std::array::from_fn(|k| resolve_out(p, &mut out[k], w, h, bit_depth));
+    let mut done = [false; P];
     // ONE census probe likewise; it was four on the 2-D path.
     let cen = census::ALWAYS;
     if cen {
@@ -1320,10 +1774,10 @@ fn interp<const N: usize, const NF: usize>(
             } else {
                 &census::MC_FW_GE16
             },
-            (w * h) as u64,
+            (P * w * h) as u64,
         );
     }
-    if cen {
+    for _ in 0..if cen { P } else { 0 } {
         // Route: the fractional position the bitstream asked for. Four arms,
         // and the content picks — a stream from a full-pel-only encoder takes
         // the first on every block, one from a slow preset almost never does.
@@ -1341,6 +1795,7 @@ fn interp<const N: usize, const NF: usize>(
             census::route(p.sym && syms[fy], &census::RT_MC_VSYM, &census::RT_MC_VGEN);
         }
     }
+    let mg = margin(N);
     match (fx, fy) {
         // Full-pel, out of line and `#[cold]`.
         //
@@ -1349,9 +1804,24 @@ fn interp<const N: usize, const NF: usize>(
         // 252,001 interpolation calls on a 720p clip, 0.2%. Inlined, its
         // `copy_shift` dispatch and `shift3` sat in the middle of the path the
         // other 99.8% take. `shift3` belongs to this arm alone in any case.
-        (0, 0) => full_pel(p, src, stride, m, w, h, bit_depth, dst),
-        (fx, 0) => fir_h::<N>(p, &src[m * stride..], stride, &taps[fx], w, h, shift1, dst, w),
-        (0, fy) => fir_v_u16_sym::<N>(p, &src[m..], stride, &taps[fy], w, h, shift1, bit_depth, syms[fy], dst, w),
+        (0, 0) => {
+            for k in 0..P {
+                full_pel(p, src[k].0, src[k].1, mg, w, h, bit_depth, dst[k]);
+                done[k] = mo[k].0 == 0;
+            }
+        }
+        (fx, 0) => {
+            for k in 0..P {
+                let (sk, st) = src[k];
+                done[k] = fir_h::<N>(p, &sk[mg * st..], st, &taps[fx], w, h, shift1, dst[k], w, mo[k].0, &mo[k].1);
+            }
+        }
+        (0, fy) => {
+            for k in 0..P {
+                let (sk, st) = src[k];
+                done[k] = fir_v_u16_sym::<N>(p, &sk[mg..], st, &taps[fy], w, h, shift1, bit_depth, syms[fy], dst[k], w, mo[k].0, &mo[k].1);
+            }
+        }
         #[allow(clippy::identity_op)]
         (fx, fy) => {
             // Zero end taps: don't filter a row that gets multiplied by nothing.
@@ -1392,7 +1862,7 @@ fn interp<const N: usize, const NF: usize>(
             // and its stack array. `chroma_never_elides` pins the premise.
             let (lo, hi) = if N == 8 && p.elide { spans[fy] } else { (0, N - 1) };
             let rows = h + hi - lo;
-            if cen {
+            for _ in 0..if cen { P } else { 0 } {
                 census::route(hi - lo < N - 1, &census::RT_MC_TAP_ELIDE, &census::RT_MC_TAP_FULL);
                 // The deterministic evidence for the elision: rows of horizontal
                 // filtering actually performed. The loop BODY is unchanged, so
@@ -1400,17 +1870,36 @@ fn interp<const N: usize, const NF: usize>(
                 // count moves, and only a work count records it.
                 census::bump(&census::MC_FIR_H_ROWS, rows as u64);
             }
-            fir_h::<N>(p, &src[lo * stride..], stride, &taps[fx], w, rows, shift1, tmp, w);
-            if lo == 0 {
-                fir_v::<N>(p, tmp, w, t, w, h, 6, dst, w);
+            // Planes one after the other through the shared `tmp`: each
+            // plane's vertical pass consumes the scratch before the next
+            // plane's horizontal pass overwrites it.
+            if P == 2 && w == 8 && lo == 0 && dual8_2d::<N>(p, &src, &taps[fx], t, h, shift1, &mut dst, tmp, &mo) {
+                // Both planes, one vector each step: an 8-wide chroma pair.
+                done = [true; P];
+            } else if lo == 0 {
+                for k in 0..P {
+                    let (sk, st) = src[k];
+                    fir_h::<N>(p, sk, st, &taps[fx], w, rows, shift1, tmp, w, 0, &Fused::NONE);
+                    done[k] = fir_v::<N>(p, tmp, w, t, w, h, 6, dst[k], w, mo[k].0, &mo[k].1);
+                }
             } else {
                 // Only filter 3 starts with a zero, so this rotation is off the
                 // common path; building it unconditionally would put a stack
                 // write on every 2-D call to save a row on a fifth of them.
                 let mut tv = [0i16; N];
                 tv[..N - lo].copy_from_slice(&t[lo..]);
-                fir_v::<N>(p, tmp, w, &tv, w, h, 6, dst, w);
+                for k in 0..P {
+                    let (sk, st) = src[k];
+                    fir_h::<N>(p, &sk[lo * st..], st, &taps[fx], w, rows, shift1, tmp, w, 0, &Fused::NONE);
+                    done[k] = fir_v::<N>(p, tmp, w, &tv, w, h, 6, dst[k], w, mo[k].0, &mo[k].1);
+                }
             }
+        }
+    }
+    // Whatever the kernels could not fuse, combine the two-pass way.
+    for (k, o) in out.into_iter().enumerate() {
+        if want[k] != 0 && (mo[k].0 == 0 || !done[k]) {
+            combine(o, &dst[k][..w * h], w, h, bit_depth);
         }
     }
 }
@@ -1419,7 +1908,8 @@ fn interp<const N: usize, const NF: usize>(
 ///
 /// `src` starts at `(xInt − 3, yInt − 3)` and must have `(w + 7) × (h + 7)`
 /// samples readable at `stride`. `tmp` needs `w × (h + 7)`.
-pub fn interp_luma(src: &[u16], stride: usize, fx: usize, fy: usize, w: usize, h: usize, bit_depth: u8, dst: &mut [i16], tmp: &mut [i16]) {
+#[allow(clippy::too_many_arguments)]
+pub fn interp_luma(src: &[u16], stride: usize, fx: usize, fy: usize, w: usize, h: usize, bit_depth: u8, dst: &mut [i16], tmp: &mut [i16], out: Out<'_>) {
     if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar;
         census::bump(if simd { &census::MC_LUMA_SIMD } else { &census::MC_LUMA_SCALAR }, 1);
@@ -1435,14 +1925,15 @@ pub fn interp_luma(src: &[u16], stride: usize, fx: usize, fy: usize, w: usize, h
             (w * h) as u64,
         );
     }
-    interp::<8, 4>(src, stride, fx, fy, w, h, bit_depth, &LUMA_FILTER, &LUMA_SPAN, &LUMA_SYM, dst, tmp);
+    interp::<8, 4, 1>([(src, stride)], fx, fy, w, h, bit_depth, &LUMA_FILTER, &LUMA_SPAN, &LUMA_SYM, [dst], tmp, [out]);
 }
 
 /// Chroma prediction block (4-tap, eighth-sample).
 ///
 /// `src` starts at `(xInt − 1, yInt − 1)` with `(w + 3) × (h + 3)` samples.
 /// `tmp` needs `w × (h + 3)`.
-pub fn interp_chroma(src: &[u16], stride: usize, fx: usize, fy: usize, w: usize, h: usize, bit_depth: u8, dst: &mut [i16], tmp: &mut [i16]) {
+#[allow(clippy::too_many_arguments)]
+pub fn interp_chroma(src: &[u16], stride: usize, fx: usize, fy: usize, w: usize, h: usize, bit_depth: u8, dst: &mut [i16], tmp: &mut [i16], out: Out<'_>) {
     if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar;
         census::bump(if simd { &census::MC_CHROMA_SIMD } else { &census::MC_CHROMA_SCALAR }, 1);
@@ -1457,7 +1948,36 @@ pub fn interp_chroma(src: &[u16], stride: usize, fx: usize, fy: usize, w: usize,
             (w * h) as u64,
         );
     }
-    interp::<4, 8>(src, stride, fx, fy, w, h, bit_depth, &CHROMA_FILTER, &CHROMA_SPAN, &CHROMA_SYM, dst, tmp);
+    interp::<4, 8, 1>([(src, stride)], fx, fy, w, h, bit_depth, &CHROMA_FILTER, &CHROMA_SPAN, &CHROMA_SYM, [dst], tmp, [out]);
+}
+
+/// Both chroma prediction blocks of a prediction unit -- Cb and Cr -- in one
+/// call.
+///
+/// The two planes share the motion vector, so they share the fractional
+/// position, the block size and the filter: everything [`interp_chroma`]
+/// decides before it filters. Called once per plane, that decision -- the
+/// plan read, the arm, the tap tables, the `Out` resolution -- was made twice
+/// for an answer that could not differ; here it is made once and only the
+/// filtering runs per plane. Each `src[k]` is a `(footprint, stride)` pair as
+/// for [`interp_chroma`], `dst[k]` and `out[k]` that plane's intermediate and
+/// write. `tmp` is shared: the planes are filtered one after the other.
+#[allow(clippy::too_many_arguments)]
+pub fn interp_chroma2(src: [(&[u16], usize); 2], fx: usize, fy: usize, w: usize, h: usize, bit_depth: u8, dst: [&mut [i16]; 2], tmp: &mut [i16], out: [Out<'_>; 2]) {
+    if census::ALWAYS {
+        let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar;
+        census::bump(if simd { &census::MC_CHROMA_SIMD } else { &census::MC_CHROMA_SCALAR }, 2);
+        census::bump(&census::SAMPLES_MC, (2 * w * h) as u64);
+        census::bump(
+            match fy {
+                0 => &census::RT_MC_FY_NONE,
+                4 => &census::RT_MC_FY_SYM,
+                _ => &census::RT_MC_FY_ASYM,
+            },
+            (2 * w * h) as u64,
+        );
+    }
+    interp::<4, 8, 2>(src, fx, fy, w, h, bit_depth, &CHROMA_FILTER, &CHROMA_SPAN, &CHROMA_SYM, dst, tmp, out);
 }
 
 #[cfg(test)]
@@ -1522,7 +2042,7 @@ mod tests {
                     // SAFETY: `src` holds `stride * (h + 7) + w` samples, taps
                     // are palindromic, and `bd <= 12 <= 14`.
                     unsafe {
-                        x86::fir_v_avx2_sym::<8>(as_i16(&src).as_ptr(), stride, &LUMA_FILTER[2], w, h, shift, b.as_mut_ptr(), w);
+                        x86::fir_v_avx2_sym::<8, 0>(as_i16(&src).as_ptr(), stride, &LUMA_FILTER[2], w, h, shift, b.as_mut_ptr(), w, &x86::OutPtr::NONE);
                     }
                     assert_eq!(a, b, "luma f2 {w}x{h} bd={bd}");
 
@@ -1531,7 +2051,7 @@ mod tests {
                     fir_v_u16_scalar::<4>(&src, stride, &CHROMA_FILTER[4], w, h, shift, &mut c, w);
                     // SAFETY: as above; the 4-tap window is strictly smaller.
                     unsafe {
-                        x86::fir_v_avx2_sym::<4>(as_i16(&src).as_ptr(), stride, &CHROMA_FILTER[4], w, h, shift, d.as_mut_ptr(), w);
+                        x86::fir_v_avx2_sym::<4, 0>(as_i16(&src).as_ptr(), stride, &CHROMA_FILTER[4], w, h, shift, d.as_mut_ptr(), w, &x86::OutPtr::NONE);
                     }
                     assert_eq!(c, d, "chroma fC4 {w}x{h} bd={bd}");
                     checked += 2;
@@ -1594,7 +2114,7 @@ mod tests {
                         let mut t2 = vec![0i16; w * (h + 7)];
                         // scalar reference, bypassing dispatch
                         interp_scalar_ref::<8>(&src, stride, fx, fy, w, h, bd, &LUMA_FILTER, &mut a, &mut t1);
-                        interp_luma(&src, stride, fx, fy, w, h, bd, &mut b, &mut t2);
+                        interp_luma(&src, stride, fx, fy, w, h, bd, &mut b, &mut t2, Out::Pred);
                         assert_eq!(a, b, "luma {w}x{h} bd={bd} frac=({fx},{fy})");
                     }
                 }
@@ -1617,7 +2137,7 @@ mod tests {
                         let mut t1 = vec![0i16; w * (h + 3)];
                         let mut t2 = vec![0i16; w * (h + 3)];
                         interp_scalar_ref::<4>(&src, stride, fx, fy, w, h, bd, &CHROMA_FILTER, &mut a, &mut t1);
-                        interp_chroma(&src, stride, fx, fy, w, h, bd, &mut b, &mut t2);
+                        interp_chroma(&src, stride, fx, fy, w, h, bd, &mut b, &mut t2, Out::Pred);
                         assert_eq!(a, b, "chroma {w}x{h} bd={bd} frac=({fx},{fy})");
                     }
                 }
@@ -1625,7 +2145,143 @@ mod tests {
         }
     }
 
+    /// `interp_chroma2` is two `interp_chroma` calls: every fractional
+    /// position, all three output modes, widths through every epilogue, both
+    /// bit depths, two DIFFERENT planes and pictures with distinct strides.
+    #[test]
+    fn interp_chroma2_matches_two_calls() {
+        let mut st = 0x5eed_c4c4u32;
+        let mut checked = 0usize;
+        for &bd in &[8u8, 10] {
+            let max = (1u16 << bd) - 1;
+            for &(w, h) in &[(2usize, 2usize), (4, 4), (8, 4), (6, 8), (8, 8), (12, 4), (16, 16), (32, 32), (24, 8)] {
+                let (sa, sb) = (w + 3 + 5, w + 3 + 9);
+                let srca = random_plane(&mut st, sa * (h + 3) + 8, max);
+                let srcb = random_plane(&mut st, sb * (h + 3) + 8, max);
+                let other_a: Vec<i16> = (0..w * h).map(|i| ((i * 37) % 9000) as i16).collect();
+                let other_b: Vec<i16> = (0..w * h).map(|i| ((i * 53) % 9000) as i16).collect();
+                let ps = w + 7;
+                for fy in 0..8 {
+                    for fx in 0..8 {
+                        for mode in 0..3 {
+                            let mut tmp = vec![0i16; w * (h + 3)];
+                            let (mut ra, mut rb) = (vec![0i16; w * h], vec![0i16; w * h]);
+                            let (mut pa, mut pb) = (vec![0u16; ps * h], vec![0u16; ps * h]);
+                            fn out<'a>(mode: u8, pic: &'a mut [u16], stride: usize, other: &'a [i16]) -> Out<'a> {
+                                match mode {
+                                    0 => Out::Pred,
+                                    1 => Out::Uni { pic, stride },
+                                    _ => Out::Bi { pic, stride, other },
+                                }
+                            }
+                            let mk = |pic, other| out(mode, pic, ps, other);
+                            {
+                                let (pa, pb) = (&mut pa[..], &mut pb[..]);
+                                interp_chroma(&srca, sa, fx, fy, w, h, bd, &mut ra, &mut tmp, mk(pa, &other_a));
+                                interp_chroma(&srcb, sb, fx, fy, w, h, bd, &mut rb, &mut tmp, mk(pb, &other_b));
+                            }
+                            let (mut da, mut db) = (vec![0i16; w * h], vec![0i16; w * h]);
+                            let (mut qa, mut qb) = (vec![0u16; ps * h], vec![0u16; ps * h]);
+                            {
+                                let (qa, qb) = (&mut qa[..], &mut qb[..]);
+                                interp_chroma2([(&srca, sa), (&srcb, sb)], fx, fy, w, h, bd, [&mut da, &mut db], &mut tmp, [mk(qa, &other_a), mk(qb, &other_b)]);
+                            }
+                            let tag = format!("{w}x{h} bd={bd} frac=({fx},{fy}) mode={mode}");
+                            if mode == 0 {
+                                assert_eq!((ra, rb), (da, db), "pred {tag}");
+                            } else {
+                                assert_eq!((pa, pb), (qa, qb), "picture {tag}");
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 2 * 9 * 64 * 3);
+    }
+
     /// The oracle: the same arithmetic with no dispatch and no kernels.
+    /// The fused `Uni` / `Bi` output modes against the two-pass form they
+    /// replace -- every fractional position, widths that reach the 16-, 8-,
+    /// 4-wide and scalar epilogues, both bit depths, both tap counts.
+    #[test]
+    fn fused_combine_matches_two_pass() {
+        let mut st = 0xf00d_c0deu32;
+        let mut checked = 0usize;
+        for &bd in &[8u8, 10] {
+            let max = (1u16 << bd) - 1;
+            for &(w, h) in &[(4usize, 4usize), (8, 8), (12, 16), (16, 8), (24, 4), (32, 32), (6, 2), (2, 8), (64, 3)] {
+                for fx in 0..4usize {
+                    for fy in 0..4usize {
+                        let stride = w + 9;
+                        let src = random_plane(&mut st, stride * (h + 9) + 16, max);
+                        let mut tmp = vec![0i16; w * (h + 7)];
+                        // The reference: intermediate, then the pixel kernels.
+                        let mut pred0 = vec![0i16; w * h];
+                        let mut pred1 = vec![0i16; w * h];
+                        interp_luma(&src, stride, fx, fy, w, h, bd, &mut pred0, &mut tmp, Out::Pred);
+                        interp_luma(&src, stride, fy, fx, w, h, bd, &mut pred1, &mut tmp, Out::Pred);
+                        let pstride = w + 5;
+                        let mut want_uni = vec![0u16; pstride * h];
+                        let mut want_bi = vec![0u16; pstride * h];
+                        crate::pixel::put_uni(&mut want_uni, pstride, &pred0, w, h, bd);
+                        crate::pixel::put_bi(&mut want_bi, pstride, &pred1, &pred0, w, h, bd);
+                        // The fused forms.
+                        let mut got_uni = vec![0u16; pstride * h];
+                        let mut got_bi = vec![0u16; pstride * h];
+                        let mut scratch = vec![0i16; w * h];
+                        interp_luma(&src, stride, fx, fy, w, h, bd, &mut scratch, &mut tmp, Out::Uni { pic: &mut got_uni, stride: pstride });
+                        interp_luma(
+                            &src,
+                            stride,
+                            fy,
+                            fx,
+                            w,
+                            h,
+                            bd,
+                            &mut scratch,
+                            &mut tmp,
+                            Out::Bi {
+                                pic: &mut got_bi,
+                                stride: pstride,
+                                other: &pred0,
+                            },
+                        );
+                        assert_eq!(want_uni, got_uni, "uni {w}x{h} f=({fx},{fy}) bd={bd}");
+                        assert_eq!(want_bi, got_bi, "bi {w}x{h} f=({fx},{fy}) bd={bd}");
+                        // Chroma: eighth-sample positions, 4 taps.
+                        let (cfx, cfy) = (fx * 2 + 1, fy * 2);
+                        let mut cp0 = vec![0i16; w * h];
+                        interp_chroma(&src, stride, cfx, cfy, w, h, bd, &mut cp0, &mut tmp, Out::Pred);
+                        let mut cw = vec![0u16; pstride * h];
+                        crate::pixel::put_bi(&mut cw, pstride, &cp0, &pred0, w, h, bd);
+                        let mut cg = vec![0u16; pstride * h];
+                        interp_chroma(
+                            &src,
+                            stride,
+                            cfx,
+                            cfy,
+                            w,
+                            h,
+                            bd,
+                            &mut scratch,
+                            &mut tmp,
+                            Out::Bi {
+                                pic: &mut cg,
+                                stride: pstride,
+                                other: &pred0,
+                            },
+                        );
+                        assert_eq!(cw, cg, "chroma bi {w}x{h} f=({cfx},{cfy}) bd={bd}");
+                        checked += 3;
+                    }
+                }
+            }
+        }
+        assert!(checked > 400, "sweep collapsed to {checked} cases");
+    }
+
     fn interp_scalar_ref<const N: usize>(src: &[u16], stride: usize, fx: usize, fy: usize, w: usize, h: usize, bit_depth: u8, taps: &[[i16; N]], dst: &mut [i16], tmp: &mut [i16]) {
         let m = margin(N);
         let shift1 = (bit_depth as u32).saturating_sub(8).min(4);

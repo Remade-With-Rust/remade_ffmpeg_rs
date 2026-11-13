@@ -11,7 +11,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::OnceLock;
 
 use super::bitwriter::BoolEncoder;
 use crate::prob_tables::{
@@ -51,27 +50,47 @@ impl BitSink for BoolEncoder {
     }
 }
 
-/// Boolean-coder bit cost in Q8 (256ths of a bit): `cost_q8[q] = -log2(q/256)·256`.
-/// `P(bit=0) ≈ prob/256`, `P(bit=1) ≈ (256-prob)/256`.
-fn cost_table() -> &'static [u16; 257] {
-    static T: OnceLock<[u16; 257]> = OnceLock::new();
-    T.get_or_init(|| {
-        let mut t = [0u16; 257];
-        for (q, slot) in t.iter_mut().enumerate().skip(1) {
-            *slot = (-(q as f64 / 256.0).log2() * 256.0).round() as u16;
-        }
-        t[0] = t[1];
-        t
-    })
-}
+/// Boolean-coder bit cost in Q8 (256ths of a bit): `COST_Q8[q] = -log2(q/256)·256`
+/// rounded to nearest (index 0 mirrors index 1). `P(bit=0) ≈ prob/256`,
+/// `P(bit=1) ≈ (256-prob)/256`.
+///
+/// A literal table, not a lazily built one: every `cost_bit` used to probe a
+/// `OnceLock` first, and the RD walks price tens of millions of bits per encode.
+/// `cost_table_matches_formula` pins it to the formula.
+#[rustfmt::skip]
+const COST_Q8_INIT: [u16; 257] = [
+    2048, 2048, 1792, 1642, 1536, 1454, 1386, 1329, 1280, 1236, 1198, 1162,
+    1130, 1101, 1073, 1048, 1024, 1002, 980, 961, 942, 924, 906, 890,
+    874, 859, 845, 831, 817, 804, 792, 780, 768, 757, 746, 735,
+    724, 714, 705, 695, 686, 676, 668, 659, 650, 642, 634, 626,
+    618, 611, 603, 596, 589, 582, 575, 568, 561, 555, 548, 542,
+    536, 530, 524, 518, 512, 506, 501, 495, 490, 484, 479, 474,
+    468, 463, 458, 453, 449, 444, 439, 434, 430, 425, 420, 416,
+    412, 407, 403, 399, 394, 390, 386, 382, 378, 374, 370, 366,
+    362, 358, 355, 351, 347, 343, 340, 336, 333, 329, 326, 322,
+    319, 315, 312, 309, 305, 302, 299, 296, 292, 289, 286, 283,
+    280, 277, 274, 271, 268, 265, 262, 259, 256, 253, 250, 247,
+    245, 242, 239, 236, 234, 231, 228, 226, 223, 220, 218, 215,
+    212, 210, 207, 205, 202, 200, 197, 195, 193, 190, 188, 185,
+    183, 181, 178, 176, 174, 171, 169, 167, 164, 162, 160, 158,
+    156, 153, 151, 149, 147, 145, 143, 140, 138, 136, 134, 132,
+    130, 128, 126, 124, 122, 120, 118, 116, 114, 112, 110, 108,
+    106, 104, 102, 101, 99, 97, 95, 93, 91, 89, 87, 86,
+    84, 82, 80, 78, 77, 75, 73, 71, 70, 68, 66, 64,
+    63, 61, 59, 58, 56, 54, 53, 51, 49, 48, 46, 44,
+    43, 41, 40, 38, 36, 35, 33, 32, 30, 28, 27, 25,
+    24, 22, 21, 19, 18, 16, 15, 13, 12, 10, 9, 7,
+    6, 4, 3, 1, 0,
+];
+
+static COST_Q8: [u16; 257] = COST_Q8_INIT;
 
 #[inline]
 pub(crate) fn cost_bit(prob: u8, bit: u32) -> u64 {
-    let t = cost_table();
     if bit == 0 {
-        t[prob as usize] as u64
+        COST_Q8[prob as usize] as u64
     } else {
-        t[256 - prob as usize] as u64
+        COST_Q8[256 - prob as usize] as u64
     }
 }
 
@@ -100,31 +119,102 @@ fn class_of(aval: u32) -> u8 {
 /// Static magnitude-cost table: `MAG_COST[prob2][aval]` = Q8 cost of coding
 /// magnitude `aval` (1..=66, i.e. through CAT5) with pivot prob `prob2`. The
 /// magnitude cost depends ONLY on (prob2, aval) plus the constant Pareto/CAT
-/// tables — never on per-frame state — so it's built once per process, BY the
-/// canonical tree walk itself (identical sums by construction). CAT6 (aval ≥ 67,
-/// bit-depth-dependent) still walks. This kills the ~12-sequential-`cost_bit`
-/// chain per nonzero coefficient that dominated coef_cost/trellis at low crf.
-fn mag_cost_table() -> &'static [[u16; 67]; 256] {
-    static T: OnceLock<Box<[[u16; 67]; 256]>> = OnceLock::new();
-    T.get_or_init(|| {
-        let mut t = vec![[0u16; 67]; 256];
-        for prob2 in 1..=255usize {
-            for aval in 1..=66u32 {
-                let mut sink = CostSink(0);
-                // cat6 args unused for aval ≤ 66.
-                code_magnitude(&mut sink, aval, prob2 as u8, &CAT6_PROB, 14);
-                t[prob2][aval as usize] = sink.0 as u16;
+/// tables — never on per-frame state. CAT6 (aval ≥ 67, bit-depth-dependent)
+/// still walks. This kills the ~12-sequential-`cost_bit` chain per nonzero
+/// coefficient that dominated coef_cost/trellis at low crf.
+///
+/// Built at COMPILE time by [`mag_cost_const`], a `const` transcription of
+/// [`code_magnitude`] under a cost sink. It used to be built on first use
+/// behind a `OnceLock`, which every magnitude priced then had to probe.
+/// `mag_cost_table_matches_walk_exhaustively` pins all 16,830 entries to the
+/// real tree walk.
+static MAG_COST: [[u16; 67]; 256] = build_mag_cost();
+
+const fn cbit(prob: u8, bit: u32) -> u32 {
+    if bit == 0 {
+        COST_Q8_INIT[prob as usize] as u32
+    } else {
+        COST_Q8_INIT[256 - prob as usize] as u32
+    }
+}
+
+const fn cextra(value: u32, probs: &[u8], n: usize) -> u32 {
+    let mut c = 0;
+    let mut i = 0;
+    while i < n {
+        c += cbit(probs[i], (value >> (n - 1 - i)) & 1);
+        i += 1;
+    }
+    c
+}
+
+/// Q8 cost of magnitude `aval` (1..=66) under pivot `prob2` — the same token
+/// tree as [`code_magnitude`], summed instead of emitted.
+const fn mag_cost_const(aval: u32, prob2: u8) -> u32 {
+    if aval == 1 {
+        return cbit(prob2, 0); // ONE
+    }
+    let mut c = cbit(prob2, 1); // TWO+
+    let p = &PARETO8_FULL[prob2 as usize - 1];
+    if aval <= 4 {
+        c += cbit(p[0], 0);
+        if aval == 2 {
+            c += cbit(p[1], 0);
+        } else {
+            c += cbit(p[1], 1);
+            c += cbit(p[2], aval - 3); // 3→0, 4→1
+        }
+    } else {
+        c += cbit(p[0], 1);
+        if aval <= 10 {
+            c += cbit(p[3], 0);
+            if aval <= 6 {
+                c += cbit(p[4], 0);
+                c += cextra(aval - 5, &CAT1_PROB, 1);
+            } else {
+                c += cbit(p[4], 1);
+                c += cextra(aval - 7, &CAT2_PROB, 2);
+            }
+        } else {
+            c += cbit(p[3], 1);
+            if aval <= 34 {
+                c += cbit(p[5], 0);
+                if aval <= 18 {
+                    c += cbit(p[6], 0);
+                    c += cextra(aval - 11, &CAT3_PROB, 3);
+                } else {
+                    c += cbit(p[6], 1);
+                    c += cextra(aval - 19, &CAT4_PROB, 4);
+                }
+            } else {
+                c += cbit(p[5], 1);
+                c += cbit(p[7], 0);
+                c += cextra(aval - 35, &CAT5_PROB, 5);
             }
         }
-        t.into_boxed_slice().try_into().unwrap()
-    })
+    }
+    c
+}
+
+const fn build_mag_cost() -> [[u16; 67]; 256] {
+    let mut t = [[0u16; 67]; 256];
+    let mut prob2 = 1;
+    while prob2 <= 255 {
+        let mut aval = 1;
+        while aval <= 66 {
+            t[prob2][aval] = mag_cost_const(aval as u32, prob2 as u8) as u16;
+            aval += 1;
+        }
+        prob2 += 1;
+    }
+    t
 }
 
 /// Q8 cost of magnitude `aval` under pivot `prob2` — table hit for aval ≤ 66
 /// (through CAT5), `None` for the rare CAT6 range (caller falls back to exact).
 pub(crate) fn mag_cost_q8(prob2: u8, aval: u32) -> Option<u16> {
     if (1..=66).contains(&aval) {
-        Some(mag_cost_table()[prob2 as usize][aval as usize])
+        Some(MAG_COST[prob2 as usize][aval as usize])
     } else {
         None
     }
@@ -139,14 +229,26 @@ impl BitSink for CostSink {
         self.0 += cost_bit(prob, bit);
     }
 
-    #[inline]
+    #[inline(always)]
     fn put_magnitude(&mut self, aval: u32, prob2: u8, cat6: &[u8], cat6_bits: usize) -> u8 {
         if aval <= 66 {
-            self.0 += mag_cost_table()[prob2 as usize][aval as usize] as u64;
+            self.0 += MAG_COST[prob2 as usize][aval as usize] as u64;
             class_of(aval)
         } else {
-            code_magnitude(self, aval, prob2, cat6, cat6_bits)
+            self.put_magnitude_cat6(aval, prob2, cat6, cat6_bits)
         }
+    }
+}
+
+impl CostSink {
+    /// The CAT6 range (magnitude >= 67) walks the token tree. Out of line and
+    /// cold: it is rare, and inlined it made `put_magnitude` too big for LLVM to
+    /// inline at all, which turned the one-load table hit into a call per
+    /// non-zero coefficient.
+    #[cold]
+    #[inline(never)]
+    fn put_magnitude_cat6(&mut self, aval: u32, prob2: u8, cat6: &[u8], cat6_bits: usize) -> u8 {
+        code_magnitude(self, aval, prob2, cat6, cat6_bits)
     }
 }
 
@@ -174,9 +276,9 @@ fn code_magnitude<S: BitSink>(
         return 1;
     }
     sink.put(1, prob2); // TWO+
-    // Everything below the pivot codes with STATIC Pareto/CAT probs — a
-    // different population than the model pivot; tag it node 3 so the
-    // harvest can keep them apart (band/ctx are not meaningful here).
+                        // Everything below the pivot codes with STATIC Pareto/CAT probs — a
+                        // different population than the model pivot; tag it node 3 so the
+                        // harvest can keep them apart (band/ctx are not meaningful here).
     #[cfg(feature = "prometheus-telemetry")]
     crate::telemetry::set_site(3, 0, 0, 0);
     let p = &PARETO8_FULL[prob2 as usize - 1];
@@ -228,11 +330,52 @@ fn code_magnitude<S: BitSink>(
     }
 }
 
+/// Where [`code_block`] reports the symbols it codes.
+trait TokenTally {
+    /// An EOB / not-EOB decision was coded at `(band, ctx)`.
+    fn eob_branch(&mut self, band: usize, ctx: usize);
+    /// Token class `t` (0 ZERO, 1 ONE, 2 TWO+, 3 EOB) was coded at `(band, ctx)`.
+    fn token(&mut self, band: usize, ctx: usize, t: usize);
+}
+
+/// Tally into the frame's count arrays — the emit path.
+struct FrameTally<'a> {
+    coef: &'a mut [[[u32; 4]; 6]; 6],
+    eob: &'a mut [[u32; 6]; 6],
+}
+
+impl TokenTally for FrameTally<'_> {
+    #[inline]
+    fn eob_branch(&mut self, band: usize, ctx: usize) {
+        self.eob[band][ctx] += 1;
+    }
+
+    #[inline]
+    fn token(&mut self, band: usize, ctx: usize, t: usize) {
+        self.coef[band][ctx][t] += 1;
+    }
+}
+
+/// Count nothing — the costing path. Zero-sized, so the walk it is handed to
+/// has no count storage at all: nothing to borrow, nothing to zero. (The
+/// `const COUNTS: bool` it replaces still took two array references, and since
+/// the walk is not inlined into `coef_cost` those arrays had to exist — which
+/// is what the thread-local scratch there was working around.)
+struct NoTally;
+
+impl TokenTally for NoTally {
+    #[inline(always)]
+    fn eob_branch(&mut self, _band: usize, _ctx: usize) {}
+
+    #[inline(always)]
+    fn token(&mut self, _band: usize, _ctx: usize, _t: usize) {}
+}
+
 /// The shared coefficient-block walk used by both [`encode_coefs`] (emit) and
 /// [`coef_cost`] (cost). Mirrors `decode_coefs` exactly, including the token
 /// cache, context derivation and symbol counts.
 #[allow(clippy::too_many_arguments)]
-fn code_block<S: BitSink, const COUNTS: bool>(
+fn code_block<S: BitSink, C: TokenTally>(
     sink: &mut S,
     levels: &[i32],
     scan: &[i16],
@@ -242,8 +385,7 @@ fn code_block<S: BitSink, const COUNTS: bool>(
     tx_size: usize,
     mut ctx: usize,
     token_cache: &mut [u8],
-    coef_cnt: &mut [[[u32; 4]; 6]; 6],
-    eob_cnt: &mut [[u32; 6]; 6],
+    tally: &mut C,
     bit_depth: u32,
 ) {
     let max_eob = 16usize << (tx_size << 1);
@@ -266,17 +408,13 @@ fn code_block<S: BitSink, const COUNTS: bool>(
     let mut c = 0usize;
     while c < max_eob {
         let band = band_translate[c] as usize;
-        if COUNTS {
-            eob_cnt[band][ctx] += 1;
-        }
+        tally.eob_branch(band, ctx);
         #[cfg(feature = "prometheus-telemetry")]
         crate::telemetry::set_site(0, band as u8, ctx as u8, tx_size as u8);
         if c == eob {
             // End of block: no more non-zero coefficients.
             sink.put(0, coef_probs[band][ctx][0]);
-            if COUNTS {
-                coef_cnt[band][ctx][3] += 1; // EOB_MODEL_TOKEN
-            }
+            tally.token(band, ctx, 3); // EOB_MODEL_TOKEN
             break;
         }
         sink.put(1, coef_probs[band][ctx][0]); // not EOB
@@ -289,9 +427,7 @@ fn code_block<S: BitSink, const COUNTS: bool>(
             crate::telemetry::set_site(1, band as u8, ctx as u8, tx_size as u8);
             if levels[pos] == 0 {
                 sink.put(0, coef_probs[band][ctx][1]); // ZERO
-                if COUNTS {
-                    coef_cnt[band][ctx][0] += 1;
-                }
+                tally.token(band, ctx, 0);
                 token_cache[pos] = 0;
                 c += 1;
                 ctx = get_coef_context(nb, token_cache, c);
@@ -305,9 +441,7 @@ fn code_block<S: BitSink, const COUNTS: bool>(
         let pos = scan[c] as usize;
         let lvl = levels[pos];
         let aval = lvl.unsigned_abs();
-        if COUNTS {
-            coef_cnt[band][ctx][if aval >= 2 { 2 } else { 1 }] += 1; // TWO+ / ONE
-        }
+        tally.token(band, ctx, if aval >= 2 { 2 } else { 1 }); // TWO+ / ONE
         #[cfg(feature = "prometheus-telemetry")]
         crate::telemetry::set_site(2, band as u8, ctx as u8, tx_size as u8);
         let class = sink.put_magnitude(aval, coef_probs[band][ctx][2], cat6, cat6_bits);
@@ -544,7 +678,11 @@ impl<'a> RateTracker<'a> {
 
     /// Baseline walk in scan order — fills `cache`, `pcost`, and `total`.
     fn build(&mut self, levels: &[i32]) {
-        self.cache[..self.max_eob].fill(0);
+        // No `cache` pre-fill. Every read of it is at a causal neighbour of some
+        // scan index `<= eob`, i.e. at a scan index `< eob`, and this walk writes
+        // all of those before anything reads them (probes included). Stale
+        // bytes past the coded prefix are never reached — the same argument
+        // `code_block` relies on for its token cache.
         self.total = 0;
         let eob = self.eob;
         for c in 0..eob {
@@ -689,7 +827,7 @@ pub fn encode_coefs(
     eob_cnt: &mut [[u32; 6]; 6],
     bit_depth: u32,
 ) {
-    code_block::<_, true>(
+    code_block(
         enc,
         levels,
         scan,
@@ -699,8 +837,10 @@ pub fn encode_coefs(
         tx_size,
         ctx,
         token_cache,
-        coef_cnt,
-        eob_cnt,
+        &mut FrameTally {
+            coef: coef_cnt,
+            eob: eob_cnt,
+        },
         bit_depth,
     );
 }
@@ -721,33 +861,21 @@ pub fn coef_cost(
     token_cache: &mut [u8],
     bit_depth: u32,
 ) -> u64 {
-    // The symbol counts (`cc`/`ec`) are write-only garbage on the costing path —
-    // only `sink.0` is returned. Reuse thread-local scratch instead of zeroing
-    // ~720 bytes on every call (the trellis calls this millions of times).
-    thread_local! {
-        static SCRATCH: std::cell::RefCell<([[[u32; 4]; 6]; 6], [[u32; 6]; 6])> =
-            const { std::cell::RefCell::new(([[[0; 4]; 6]; 6], [[0; 6]; 6])) };
-    }
-    SCRATCH.with(|s| {
-        let mut b = s.borrow_mut();
-        let (cc, ec) = &mut *b;
-        let mut sink = CostSink(0);
-        code_block::<_, false>(
-            &mut sink,
-            levels,
-            scan,
-            nb,
-            eob,
-            coef_probs,
-            tx_size,
-            ctx,
-            token_cache,
-            cc,
-            ec,
-            bit_depth,
-        );
-        sink.0
-    })
+    let mut sink = CostSink(0);
+    code_block(
+        &mut sink,
+        levels,
+        scan,
+        nb,
+        eob,
+        coef_probs,
+        tx_size,
+        ctx,
+        token_cache,
+        &mut NoTally,
+        bit_depth,
+    );
+    sink.0
 }
 
 #[cfg(test)]
@@ -763,6 +891,16 @@ mod tests {
         *s ^= *s >> 7;
         *s ^= *s << 17;
         *s
+    }
+
+    /// The literal cost table is exactly the formula it replaced.
+    #[test]
+    fn cost_table_matches_formula() {
+        for q in 1..=256usize {
+            let want = (-(q as f64 / 256.0).log2() * 256.0).round() as u16;
+            assert_eq!(COST_Q8[q], want, "q={q}");
+        }
+        assert_eq!(COST_Q8[0], COST_Q8[1]);
     }
 
     /// A magnitude weighted toward small values but reaching every CAT range
@@ -927,8 +1065,7 @@ mod tests {
                 let mut walk = CostSink(0);
                 let class = code_magnitude(&mut walk, aval, prob2 as u8, &CAT6_PROB, 14);
                 assert_eq!(
-                    mag_cost_table()[prob2 as usize][aval as usize] as u64,
-                    walk.0,
+                    MAG_COST[prob2 as usize][aval as usize] as u64, walk.0,
                     "prob2={prob2} aval={aval}"
                 );
                 assert_eq!(class_of(aval), class, "class prob2={prob2} aval={aval}");

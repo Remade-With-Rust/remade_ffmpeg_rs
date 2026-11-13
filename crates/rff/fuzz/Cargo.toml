@@ -18,7 +18,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-rff = { path = ".." }
+# The facade's package is `remade-ffmpeg` (the short name is taken on
+# crates.io); its library, and so this dependency's name, is still `rff`.
+rff = { path = "..", package = "remade-ffmpeg" }
 rff-core = { path = "../../rff-core" }
 
 [[bin]]

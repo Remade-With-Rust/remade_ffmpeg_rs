@@ -19,7 +19,10 @@ use rff_core::{AudioFrame, Error, Result, SampleFormat};
 
 enum AFilter {
     Volume(f32),
-    ATrim { start: Option<f64>, end: Option<f64> },
+    ATrim {
+        start: Option<f64>,
+        end: Option<f64>,
+    },
 }
 
 /// An ordered `-af` chain plus the resample target it requests, if any.

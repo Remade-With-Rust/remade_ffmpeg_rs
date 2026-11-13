@@ -25,11 +25,13 @@ pub struct Wav {
 
 impl Wav {
     /// Samples per channel.
+    #[must_use]
     pub fn frames(&self) -> usize {
         self.samples.len() / self.channels.max(1) as usize
     }
 
     /// Channel 0 as mono.
+    #[must_use]
     pub fn mono(&self) -> Vec<f32> {
         if self.channels <= 1 {
             self.samples.clone()
@@ -51,11 +53,19 @@ fn u16le(b: &[u8]) -> u16 {
 }
 
 /// Read a RIFF/WAVE file (PCM s16 or IEEE f32).
+///
+/// # Errors
+///
+/// Any I/O error, or `InvalidData` for a file that is not PCM s16 / IEEE f32
+/// RIFF/WAVE.
 pub fn read(path: impl AsRef<Path>) -> io::Result<Wav> {
     let mut d = Vec::new();
     std::fs::File::open(path.as_ref())?.read_to_end(&mut d)?;
     if d.len() < 44 || &d[0..4] != b"RIFF" || &d[8..12] != b"WAVE" {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a RIFF/WAVE file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a RIFF/WAVE file",
+        ));
     }
     let (mut tag, mut channels, mut sample_rate, mut bits) = (1u16, 1u16, 44100u32, 16u16);
     let mut data: &[u8] = &[];
@@ -86,7 +96,7 @@ pub fn read(path: impl AsRef<Path>) -> io::Result<Wav> {
     let samples: Vec<f32> = match (tag, bits) {
         (1, 16) => data
             .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+            .map(|c| f32::from(i16::from_le_bytes([c[0], c[1]])) / 32768.0)
             .collect(),
         (1, 32) => data
             .chunks_exact(4)
@@ -115,6 +125,10 @@ pub fn read(path: impl AsRef<Path>) -> io::Result<Wav> {
 /// Clamped, not wrapped: a sample above full scale becomes full scale rather
 /// than wrapping to the opposite polarity, which would inject a click the
 /// external scorer would then charge to the encoder.
+///
+/// # Errors
+///
+/// Any I/O error from creating or writing the file.
 pub fn write_s16(
     path: impl AsRef<Path>,
     samples: &[f32],
@@ -130,7 +144,7 @@ pub fn write_s16(
     out.extend_from_slice(&1u16.to_le_bytes()); // PCM
     out.extend_from_slice(&channels.to_le_bytes());
     out.extend_from_slice(&sample_rate.to_le_bytes());
-    let byte_rate = sample_rate * channels as u32 * 2;
+    let byte_rate = sample_rate * u32::from(channels) * 2;
     out.extend_from_slice(&byte_rate.to_le_bytes());
     out.extend_from_slice(&(channels * 2).to_le_bytes()); // block align
     out.extend_from_slice(&16u16.to_le_bytes()); // bits

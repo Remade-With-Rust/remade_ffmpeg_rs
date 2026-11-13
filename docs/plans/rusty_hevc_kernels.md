@@ -2310,3 +2310,103 @@ being a performance question. Worth pricing; not worth assuming.
 Every one of those has its scalar twin in the tree as the oracle, and both intra and
 SAO carry an env switch (`RH265_SCALAR_INTRA`, `RH265_SCALAR_SAO`) so the A/B can be
 re-run inside one binary whenever the surrounding shares move.
+
+## The instruction-count campaign — nine veins, 2026-11-06/07
+
+Every number here is a callgrind instruction count (Ir) of the shipping
+configuration — rusty_alloc, AVX2 — built natively under WSL from the same
+sources; same-binary re-runs differ by ~20 K on 5 G. The gate for every row is
+the 147-stream JCT-VC md5 suite plus the kernels' `*_matches_scalar` oracles;
+all rows are bit-exact.
+
+| state (cumulative)                                        | 20 s 720p x265 inter | all-intra `ipred_x24` | `dblk_heavy` |
+|-----------------------------------------------------------|---------------------:|----------------------:|-------------:|
+| baseline                                                  |             25.162 G |              42.237 G |      5.251 G |
+| SAO: whole-CTB kernel when all eight neighbours usable, eight per-CTB flags for the ring, overlapping last vector instead of scalar tails | 22.987 (−8.6%) | 38.676 (−8.4%) | 5.275 |
+| transform: one block kernel per size (both passes inside the feature boundary) | 20.178 (−12.2%) | 32.686 (−15.5%) | 5.203 |
+| transform: dequant at the coefficient write; unrolled 4x4 and broadcast-row 8x8 kernels; deblock/SAO outlined | 19.986 (−1.0%) | 32.261 (−1.3%) | 5.201 |
+| deblocking: boundary strength derived at parse time, `edges` map and both frame scans removed | 18.602 (−6.9%) | 31.631 (−2.0%) | 4.403 (−15.3%) |
+| intra: five block-level availability answers, span gather, span substitution | 18.461 (−0.8%) | 28.235 (−10.7%) | 4.387 |
+| deblocking: zero-run skip in the filter walk, decisions computed inside the kernel from the loaded taps | 17.986 (−2.6%) | 27.762 (−1.7%) | 4.095 (−6.7%) |
+| glue: `isa()` inlined, horizontal tail once per block, constant-width pad copies, word-at-a-time NAL unescape/split | 17.576 (−2.3%) | 27.330 (−1.6%) | 4.062 |
+| MC: `put_uni`/`put_bi` fused into the final filter pass (`mc::Out`) | 17.064 (−2.9%) | 27.330 | 3.910 (−3.7%) |
+| per-4x4 maps packed into one `Cell` record, one fill per coding unit, `any_bypass` flag | **16.614 (−34.0%)** | **26.733 (−36.7%)** | **3.869 (−26.3%)** |
+
+On top of that, the same sources built with `-C target-cpu=x86-64-v3` count
+−3.4% (inter) and −4.5% (intra) fewer instructions; `tools/build-v3.ps1` is
+the artifact. A profile-guided build (`-Cprofile-generate`, the five bench
+streams as training set, `-Cprofile-use`) counts −8.0% (inter) and −13.5%
+(intra) — an upper bound, since the training set is the test set, and not a
+shipping configuration until a representative corpus trains it. Priced and not built: the SAO border-line save (needs the ring
+back; the plane-swap alternative moves 100% of the plane against the band
+copy's ~40%), write-on-decode for the motion map (loses on intra content),
+the dual-plane chroma interpolation and 8-bit sample planes.
+
+Instruments added for this campaign: the WSL callgrind workflow (mini
+workspace, because cargo hangs on the 9p mount), `cgcalls.py` (self Ir, calls,
+edges), `cglines.py` (top source lines), `cgranges.py` (Ir per named source
+range), `cgdiff.py` (per-function diff between two runs).
+
+### Wall clock confirms the count — 2026-11-07
+
+`tools/bench/codec-bench.ps1`, pinned core, self-reported decode time, ABBA,
+both binaries under rusty_alloc. Campaign build against the pre-campaign build
+(306a9ca): 1.37x on the x265 clip, 1.39x on `in_to_tree_720p_8bit`, 1.50x on
+`ipred_x24` (11/11 pairs each); 1.296x / 1.358x / 1.233x / 1.291x on the
+8-bit / 10-bit / `dblk_heavy` / `wp_x10` set (20-21/21 pairs). Against
+FFmpeg 8.1.2 `hevc -threads 1`: 0.82x on the x265 clip and on `ipred_x24`
+(15/15), 0.80x 8-bit, parity on 10-bit and `dblk_heavy` (not verdicts),
+**1.37x faster on `wp_x10`** (20/21, z = 4.15); null arm 1.023x. One ffmpeg
+run collided with a background conformance gate: every millisecond moved, the
+ratios did not (0.80 / 0.99 / 1.02 / 1.37 against the clean 0.80 / 0.94 / 1.02
+/ 1.37), which is the case for paired ratios over per-arm medians.
+
+### Vein 11 (dual-plane chroma) and vein 13 (per-picture clears) — 2026-11-07
+
+Callgrind Ir, same instruments as above; every row 147/147 bit-exact, SEI
+6183/6183.
+
+| state (cumulative)                                              | 20 s 720p x265 inter | `dblk_heavy` |
+|-----------------------------------------------------------------|---------------------:|-------------:|
+| 0.7.0                                                           |             16.614 G |      3.869 G |
+| chroma pair shares one geometry pass in `motion_compensate`     |   16.575 (−0.23%)    | 3.863 (−0.16%) |
+| `interp_chroma2`: one dispatch (plan, arm, `Out`) for Cb and Cr |   16.463 (−0.68%)    | 3.848 (−0.38%) |
+| 8-wide chroma pair in one AVX2 vector, 2-D arm (lane-local filters, split emit) | **16.078 (−2.34%)** | **3.786 (−1.62%)** |
+
+Vein 11 total: −3.23% inter, −2.16% `dblk_heavy`.
+
+Vein 13 is refuted. `PicState::reuse` showed 387 M Ir of `memset`, but
+callgrind counts `rep stosb` once per byte: a 460,800-byte glibc `memset`
+counts 460,826 Ir while a 1,382,400-byte one counts 75,623 (above the
+non-temporal threshold glibc switches to vector stores). The `cell` and
+`bs_v`/`bs_h` clears are therefore ~575 K "Ir" a picture that the CPU executes
+as a handful of instructions. The one real lever, not clearing the 1.4 MB
+motion map (readers gated on `cell.pred_mode`), saved 37.7 M of `memset` and
+cost 57.0 M in `boundary_strength` and 21.4 M in `finish_picture`: +40.6 M net,
+reverted.
+
+Still open: the same lane trick for the H-only / V-only arms and 4-wide
+chroma; `pad_footprint` (575 M Ir, 287 K calls on the x265 clip); 8-bit `u8`
+planes.
+
+### Vein 15 (edge padding) — 2026-11-07
+
+`pad_footprint` was 575 M Ir (3.5%) on the x265 clip once vein 11 moved it out
+of line: 287 K edge footprints, 5.4 M padded rows at ~90 instructions a row.
+91% of those rows overflow horizontally, so replicating rows above/below the
+picture was never the cost (a three-band restructure measured +30 M and was
+reverted).
+
+| state (cumulative)                                                    | 20 s 720p x265 inter | `dblk_heavy` |
+|-----------------------------------------------------------------------|---------------------:|-------------:|
+| after vein 11                                                         |             16.078 G |      3.786 G |
+| row kernel: left splat, span copy, right splat in 8-sample SSE2 stores (each may overrun into what is written next; `PAD_SLACK`) | 15.932 (−0.91%) | 3.740 (−1.20%) |
+| `pad_footprint2`: the Cb/Cr pair in one row loop                      |   15.911 (−0.13%)    | 3.734 (−0.18%) |
+| 16-sample AVX2 stores for the one-plane (luma) pad                    | **15.862 (−0.31%)**  | **3.720 (−0.36%)** |
+
+Vein 15 total: −1.35% inter, −1.74% `dblk_heavy`. The AVX2 store measured
++17 M when it also served chroma (rows too short for the wider store); only
+after the pair moved to `pad_footprint2` did it win on luma alone.
+
+Both veins together, from 0.7.0: **16.614 G -> 15.862 G (−4.53%)** inter,
+**3.869 G -> 3.720 G (−3.85%)** `dblk_heavy`; intra (`ipred_x24`) unchanged.

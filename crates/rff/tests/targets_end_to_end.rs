@@ -186,8 +186,8 @@ fn a_lossless_source_reports_its_lossless_targets_as_lossless() {
 fn a_video_input_offers_both_video_and_image_targets() {
     let engine = Engine::new();
     // A VP9 conformance vector is a real, small, in-repo video.
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vp9-vectors/vp90-2-02-size-130x132.webm");
+    let src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vp9-vectors/vp90-2-02-size-130x132.webm");
     if !src.exists() {
         eprintln!("skipping: {} not present", src.display());
         return;
@@ -212,7 +212,10 @@ fn a_video_input_offers_both_video_and_image_targets() {
 
     // The lossless remuxes are the ones that need no encoder at all.
     let copies: Vec<_> = plan.stream_copies().map(|t| t.format).collect();
-    assert!(copies.contains(&"webm"), "vp9 remuxes into webm: {copies:?}");
+    assert!(
+        copies.contains(&"webm"),
+        "vp9 remuxes into webm: {copies:?}"
+    );
     assert!(copies.contains(&"ivf"), "vp9 remuxes into ivf: {copies:?}");
     assert!(
         !copies.contains(&"mp4"),
@@ -234,11 +237,15 @@ fn a_target_list_never_promises_a_format_this_build_cannot_mux() {
 
 /// A one-cue SubRip file.
 fn write_srt(path: &Path) {
-    fs::write(path, "1
+    fs::write(
+        path,
+        "1
 00:00:01,000 --> 00:00:03,000
 hello
 
-").unwrap();
+",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -261,8 +268,8 @@ fn every_target_advertised_for_a_subtitle_input_actually_writes() {
 #[test]
 fn every_target_advertised_for_a_video_input_actually_writes() {
     let engine = Engine::new();
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vp9-vectors/vp90-2-02-size-130x132.webm");
+    let src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vp9-vectors/vp90-2-02-size-130x132.webm");
     if !src.exists() {
         eprintln!("skipping: {} not present", src.display());
         return;

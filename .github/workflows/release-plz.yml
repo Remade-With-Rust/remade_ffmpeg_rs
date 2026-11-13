@@ -42,6 +42,14 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # `cargo publish` verifies each tarball by building it, and rff-codec-avif
+      # pulls av-scenechange with its `asm` feature, which assembles with NASM.
+      # Without it the 0.2.4 release stopped after rff-core and rff-codec --
+      # a half-published family, the outcome the concurrency guard above exists
+      # to prevent.
+      - name: Install NASM
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
       # Pinned to an exact release. `@v0` does not exist -- there is no moving
       # major tag on this action -- and referencing it fails to resolve, which is
       # why the copy this replaced never ran successfully once.

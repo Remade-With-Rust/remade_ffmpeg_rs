@@ -34,7 +34,7 @@ static GLOBAL_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 fn fnv1a_f32(h: &mut u64, samples: &[f32]) {
     for s in samples {
         for b in s.to_bits().to_le_bytes() {
-            *h ^= b as u64;
+            *h ^= u64::from(b);
             *h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
@@ -42,7 +42,7 @@ fn fnv1a_f32(h: &mut u64, samples: &[f32]) {
 
 fn fnv1a_bytes(h: &mut u64, bytes: &[u8]) {
     for &b in bytes {
-        *h ^= b as u64;
+        *h ^= u64::from(b);
         *h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
 }
@@ -64,7 +64,8 @@ fn main() {
     let mut dec = Mp3Decoder::new();
     dec.push(mp3);
     dec.flush();
-    let (mut dh, mut frames, mut samples, mut rate, mut ch) = (0xcbf2_9ce4_8422_2325u64, 0, 0, 0, 0);
+    let (mut dh, mut frames, mut samples, mut rate, mut ch) =
+        (0xcbf2_9ce4_8422_2325u64, 0, 0, 0, 0);
     while let Ok(f) = dec.next_frame() {
         frames += 1;
         ch = f.channels;

@@ -247,11 +247,7 @@ impl RtmpPublisher {
         let mut buf = [0u8; 4096];
         while std::time::Instant::now() < deadline {
             let n = match self.socket.read(&mut buf) {
-                Ok(0) => {
-                    return Err(Error::invalid(format!(
-                        "rtmp: server closed during {what}"
-                    )))
-                }
+                Ok(0) => return Err(Error::invalid(format!("rtmp: server closed during {what}"))),
                 Ok(n) => n,
                 Err(e)
                     if matches!(
@@ -312,12 +308,8 @@ impl RtmpPublisher {
             if self.pending.len() < 11 {
                 return Ok(());
             }
-            let size = u32::from_be_bytes([
-                0,
-                self.pending[1],
-                self.pending[2],
-                self.pending[3],
-            ]) as usize;
+            let size =
+                u32::from_be_bytes([0, self.pending[1], self.pending[2], self.pending[3]]) as usize;
             let total = 11 + size + 4;
             if self.pending.len() < total {
                 return Ok(());
@@ -332,9 +324,9 @@ impl RtmpPublisher {
             let payload: Vec<u8> = self.pending[11..11 + size].to_vec();
             self.pending.drain(..total);
             let csid = match tag_type {
-                8 => 4,  // audio
-                9 => 6,  // video
-                _ => 5,  // script data (onMetaData)
+                8 => 4, // audio
+                9 => 6, // video
+                _ => 5, // script data (onMetaData)
             };
             let sid = self.stream_id;
             self.send_message(csid, tag_type, timestamp, sid, &payload)
@@ -361,7 +353,7 @@ impl Write for RtmpPublisher {
 fn handshake(socket: &mut TcpStream) -> Result<()> {
     let mut c0c1 = vec![RTMP_VERSION];
     c0c1.extend_from_slice(&[0u8; 8]); // time + zero
-    // "Random" fill — content is irrelevant for the plain handshake.
+                                       // "Random" fill — content is irrelevant for the plain handshake.
     c0c1.extend((0..HANDSHAKE_LEN - 8).map(|i| (i * 7 + 11) as u8));
     socket.write_all(&c0c1)?;
 
@@ -447,8 +439,7 @@ impl ChunkReader {
                 if b.len() < i + 11 {
                     return None;
                 }
-                st.length =
-                    u32::from_be_bytes([0, b[i + 3], b[i + 4], b[i + 5]]) as usize;
+                st.length = u32::from_be_bytes([0, b[i + 3], b[i + 4], b[i + 5]]) as usize;
                 st.type_id = b[i + 6];
                 i += 11;
             }

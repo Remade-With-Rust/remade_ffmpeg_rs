@@ -54,8 +54,8 @@ fn band_bins(sample_rate: u32) -> [(usize, usize); SFB_LONG] {
     let bpl = N_FFT as f32 / 1152.0;
     let mut bins = [(0usize, 0usize); SFB_LONG];
     for (b, slot) in bins.iter_mut().enumerate() {
-        let lo = (sfb[b] as f32 * bpl).round() as usize;
-        let hi = ((sfb[b + 1] as f32 * bpl).round() as usize).min(N_FFT / 2 + 1);
+        let lo = (f32::from(sfb[b]) * bpl).round() as usize;
+        let hi = ((f32::from(sfb[b + 1]) * bpl).round() as usize).min(N_FFT / 2 + 1);
         *slot = (lo, hi.max(lo));
     }
     bins
@@ -118,7 +118,7 @@ fn best_delay(orig: &[f32], coded: &[f32]) -> usize {
         let mut err = 0f64;
         let mut i = 0;
         while i < w {
-            let e = (orig[start + i] - coded[start + d + i]) as f64;
+            let e = f64::from(orig[start + i] - coded[start + d + i]);
             err += e * e;
             i += 64; // subsample the search for speed
         }
@@ -130,6 +130,7 @@ fn best_delay(orig: &[f32], coded: &[f32]) -> usize {
 }
 
 /// Align `coded` to `orig` and aggregate per-frame NMR into a report.
+#[must_use]
 pub fn track_nmr(orig: &[f32], coded: &[f32], sample_rate: u32) -> NmrReport {
     let win = hann();
     let bins = band_bins(sample_rate);
@@ -149,13 +150,13 @@ pub fn track_nmr(orig: &[f32], coded: &[f32], sample_rate: u32) -> NmrReport {
         let nmr = frame_nmr(o, c, sample_rate, &win, &bins);
         for (b, &v) in nmr.iter().enumerate() {
             let db = (10.0 * v.log10()).clamp(-120.0, 120.0);
-            sum_db += db as f64;
+            sum_db += f64::from(db);
             cells += 1;
             if v > 1.0 {
                 audible += 1;
             }
             max_db = max_db.max(db);
-            band_sum[b] += db as f64;
+            band_sum[b] += f64::from(db);
             band_cnt[b] += 1;
         }
         pos += HOP;

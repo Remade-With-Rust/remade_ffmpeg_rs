@@ -167,6 +167,9 @@ mod x86 {
         let hi = _mm_set1_epi16(-32768); // 0x8000: zero the odd bytes
         let bias = _mm_set1_epi16(super::LUT_BIAS);
         let nvec = w / 8;
+        // Overlapping last vector instead of a scalar tail -- exact, because
+        // every output reads only `src`. See `edge_avx2`.
+        let tail = w >= 8 && nvec * 8 < w;
         for y in 0..h {
             let s = unsafe { src.add(y * src_stride) };
             let d = unsafe { dst.add(y * dst_stride) };
@@ -193,6 +196,10 @@ mod x86 {
             }
             if nvec % 2 == 1 {
                 one((nvec - 1) * 8);
+            }
+            if tail {
+                one(w - 8);
+                continue;
             }
             let mut x = nvec * 8;
             while x < w {
@@ -304,30 +311,14 @@ mod x86 {
         let lut = unsafe { _mm_loadu_si128(ent.as_ptr() as *const __m128i) };
         let hi = _mm_set1_epi16(-32768);
         let bias = _mm_set1_epi16(super::LUT_BIAS);
+        let nvec = w / 8;
+        // Overlapping last vector instead of a scalar tail -- exact, because
+        // every output reads only `src`. See `edge_avx2`.
+        let tail = w >= 8 && nvec * 8 < w;
         for y in 0..h {
             let s = unsafe { src.add(y * src_stride) };
             let d = unsafe { dst.add(y * dst_stride) };
-            let nvec = w / 8;
-            // Two vectors per trip: same arithmetic, but the loop's own
-            // three instructions are paid once per two vectors.
-            for i in 0..nvec / 2 {
-                for half in 0..2usize {
-                    let x = i * 16 + half * 8;
-                    let p = unsafe { s.add(x) };
-                    let v = unsafe { _mm_loadu_si128(p as *const __m128i) };
-                    let a = unsafe { _mm_loadu_si128(p.offset(da) as *const __m128i) };
-                    let b = unsafe { _mm_loadu_si128(p.offset(db) as *const __m128i) };
-                    // sign(v − n) = cmpgt(n, v) − cmpgt(v, n), each being 0 or −1.
-                    let sa = _mm_sub_epi16(_mm_cmpgt_epi16(a, v), _mm_cmpgt_epi16(v, a));
-                    let sb = _mm_sub_epi16(_mm_cmpgt_epi16(b, v), _mm_cmpgt_epi16(v, b));
-                    let e = _mm_add_epi16(_mm_add_epi16(two, sa), sb);
-                    let off = _mm_sub_epi16(_mm_shuffle_epi8(lut, _mm_or_si128(e, hi)), bias);
-                    let r = _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(v, off), zero), maxv);
-                    unsafe { _mm_storeu_si128(d.add(x) as *mut __m128i, r) };
-                }
-            }
-            if nvec % 2 == 1 {
-                let x = (nvec - 1) * 8;
+            let one = |x: usize| {
                 let p = unsafe { s.add(x) };
                 let v = unsafe { _mm_loadu_si128(p as *const __m128i) };
                 let a = unsafe { _mm_loadu_si128(p.offset(da) as *const __m128i) };
@@ -339,6 +330,19 @@ mod x86 {
                 let off = _mm_sub_epi16(_mm_shuffle_epi8(lut, _mm_or_si128(e, hi)), bias);
                 let r = _mm_min_epi16(_mm_max_epi16(_mm_adds_epi16(v, off), zero), maxv);
                 unsafe { _mm_storeu_si128(d.add(x) as *mut __m128i, r) };
+            };
+            // Two vectors per trip: same arithmetic, but the loop's own
+            // three instructions are paid once per two vectors.
+            for i in 0..nvec / 2 {
+                one(i * 16);
+                one(i * 16 + 8);
+            }
+            if nvec % 2 == 1 {
+                one((nvec - 1) * 8);
+            }
+            if tail {
+                one(w - 8);
+                continue;
             }
             let mut x = nvec * 8;
             while x < w {
@@ -427,48 +431,43 @@ mod x86 {
         // A counted loop, not `while x + 16 <= w`: the latter makes LLVM carry
         // a second induction variable for the bound test (`movq`/`addq`/`cmpq`
         // on top of the real one). The trip count is loop-invariant, so hoist it.
+        // Narrower than one vector: the 128-bit kernel owns the whole block.
+        // `band_sse41`, not `band_sse2`: it takes exactly `(pos, offs)`, where
+        // the SSE2 twin wants `[(index, offset); 4]` marshalled onto the stack.
+        if w < 16 {
+            // SAFETY: same footprint as the caller proved.
+            return unsafe { band_sse41(dst, dst_stride, src, src_stride, w, h, shift, pos, offs, max) };
+        }
         let nvec = w / 16;
+        // Overlapping last vector instead of a remainder kernel -- exact,
+        // because every output reads only `src`. See `edge_avx2`.
+        let tail = nvec * 16 < w;
         for y in 0..h {
             let s = unsafe { src.add(y * src_stride) };
             let d = unsafe { dst.add(y * dst_stride) };
-            // Two vectors per trip: the body is six instructions and the loop
-            // bookkeeping three, so pairing them halves the bookkeeping's share.
-            for i in 0..nvec / 2 {
-                for half in 0..2usize {
-                    let x = i * 32 + half * 16;
-                    let v = unsafe { _mm256_loadu_si256(s.add(x) as *const __m256i) };
-                    let b = _mm256_srl_epi16(v, sh);
-                    // (b − pos) mod 32, then anything past the four active
-                    // bands folded onto index 15, whose entry is the bias.
-                    let dlt = band_index::<WRAP>(_mm256_sub_epi16(b, posv), mask31);
-                    let idx = _mm256_or_si256(_mm256_min_epu16(dlt, clamp), hi);
-                    let off = _mm256_sub_epi16(_mm256_shuffle_epi8(lut, idx), bias);
-                    let r = _mm256_min_epi16(_mm256_max_epi16(_mm256_adds_epi16(v, off), zero), maxv);
-                    unsafe { _mm256_storeu_si256(d.add(x) as *mut __m256i, r) };
-                }
-            }
-            if nvec % 2 == 1 {
-                let x = (nvec - 1) * 16;
+            let one = |x: usize| {
                 let v = unsafe { _mm256_loadu_si256(s.add(x) as *const __m256i) };
                 let b = _mm256_srl_epi16(v, sh);
+                // (b − pos) mod 32, then anything past the four active
+                // bands folded onto index 15, whose entry is the bias.
                 let dlt = band_index::<WRAP>(_mm256_sub_epi16(b, posv), mask31);
                 let idx = _mm256_or_si256(_mm256_min_epu16(dlt, clamp), hi);
                 let off = _mm256_sub_epi16(_mm256_shuffle_epi8(lut, idx), bias);
                 let r = _mm256_min_epi16(_mm256_max_epi16(_mm256_adds_epi16(v, off), zero), maxv);
                 unsafe { _mm256_storeu_si256(d.add(x) as *mut __m256i, r) };
+            };
+            // Two vectors per trip: the body is six instructions and the loop
+            // bookkeeping three, so pairing them halves the bookkeeping's share.
+            for i in 0..nvec / 2 {
+                one(i * 32);
+                one(i * 32 + 16);
             }
-        }
-        // The width remainder, ONCE for the whole block -- as in `edge_avx2`.
-        //
-        // `band_sse41`, not `band_sse2`: both finish correctly, but `band_sse2`
-        // takes the four active bands as `[(index, offset); 4]` while this
-        // kernel holds `(pos, offs)`, so calling it marshalled the array onto
-        // the stack with eight `movw`s and reloaded all seven vector constants
-        // afterwards. `band_sse41` takes exactly `(pos, offs)`.
-        let x = nvec * 16;
-        if x < w {
-            // SAFETY: the remaining columns of every row are in bounds.
-            unsafe { band_sse41(dst.add(x), dst_stride, src.add(x), src_stride, w - x, h, shift, pos, offs, max) };
+            if nvec % 2 == 1 {
+                one((nvec - 1) * 16);
+            }
+            if tail {
+                one(w - 16);
+            }
         }
     }
 
@@ -489,29 +488,26 @@ mod x86 {
         let lut = unsafe { lut16(ent) };
         let hi = _mm256_set1_epi16(-32768);
         let bias = _mm256_set1_epi16(LUT_BIAS);
+        // Narrower than one vector: the 128-bit kernel owns the whole block.
+        if w < 16 {
+            // SAFETY: same footprint as the caller proved.
+            return unsafe { edge_ssse3(dst, dst_stride, src, src_stride, w, h, da, db, table, max) };
+        }
         let nvec = w / 16;
+        // The width remainder is NOT a scalar tail and NOT a second kernel.
+        //
+        // Every SAO output depends only on `src`, which is the untouched
+        // deblocked copy, never on `dst`. So writing a column twice is exact,
+        // and the last `w % 16` columns are finished by one more full vector
+        // placed at `w - 16`, overlapping the one before it. The alternative
+        // -- handing the remainder to the 128-bit kernel -- measured 12,100
+        // instructions per 62-wide CTB against 4,400 for the 48 columns this
+        // loop did: its own scalar tail of six samples per row was the cost.
+        let tail = nvec * 16 < w;
         for y in 0..h {
             let s = unsafe { src.add(y * src_stride) };
             let d = unsafe { dst.add(y * dst_stride) };
-            // Two vectors per trip, as in `band_avx2`.
-            let body = nvec / 2;
-            for i in 0..body {
-                for half in 0..2usize {
-                    let x = i * 32 + half * 16;
-                    let p = unsafe { s.add(x) };
-                    let v = unsafe { _mm256_loadu_si256(p as *const __m256i) };
-                    let a = unsafe { _mm256_loadu_si256(p.offset(da) as *const __m256i) };
-                    let b = unsafe { _mm256_loadu_si256(p.offset(db) as *const __m256i) };
-                    let sa = _mm256_sub_epi16(_mm256_cmpgt_epi16(a, v), _mm256_cmpgt_epi16(v, a));
-                    let sb = _mm256_sub_epi16(_mm256_cmpgt_epi16(b, v), _mm256_cmpgt_epi16(v, b));
-                    let e = _mm256_add_epi16(_mm256_add_epi16(two, sa), sb);
-                    let off = _mm256_sub_epi16(_mm256_shuffle_epi8(lut, _mm256_or_si256(e, hi)), bias);
-                    let r = _mm256_min_epi16(_mm256_max_epi16(_mm256_adds_epi16(v, off), zero), maxv);
-                    unsafe { _mm256_storeu_si256(d.add(x) as *mut __m256i, r) };
-                }
-            }
-            if nvec % 2 == 1 {
-                let x = (nvec - 1) * 16;
+            let one = |x: usize| {
                 let p = unsafe { s.add(x) };
                 let v = unsafe { _mm256_loadu_si256(p as *const __m256i) };
                 let a = unsafe { _mm256_loadu_si256(p.offset(da) as *const __m256i) };
@@ -522,24 +518,18 @@ mod x86 {
                 let off = _mm256_sub_epi16(_mm256_shuffle_epi8(lut, _mm256_or_si256(e, hi)), bias);
                 let r = _mm256_min_epi16(_mm256_max_epi16(_mm256_adds_epi16(v, off), zero), maxv);
                 unsafe { _mm256_storeu_si256(d.add(x) as *mut __m256i, r) };
+            };
+            // Two vectors per trip, as in `band_avx2`.
+            for i in 0..nvec / 2 {
+                one(i * 32);
+                one(i * 32 + 16);
             }
-        }
-        // The width remainder, ONCE for the whole block.
-        //
-        // This used to sit inside the row loop with `h = 1`, so a block of
-        // height `h` made `h` calls, each re-deriving the kernel's constants
-        // and paying the call. The remaining columns are the same for every
-        // row and the callee already loops over `y`, so one call with the real
-        // height is the same work with the setup paid once.
-        //
-        // `edge_ssse3`, not `edge_sse2`: identical signature, but it selects
-        // the offset with one `pshufb` where the SSE2 kernel needs five
-        // `cmpeq`/`and`/`or` triples -- 2.812 instructions per output against
-        // 4.562. AVX2 implies SSSE3, so it is always available here.
-        let x = nvec * 16;
-        if x < w {
-            // SAFETY: the remaining columns of every row are in bounds.
-            unsafe { edge_ssse3(dst.add(x), dst_stride, src.add(x), src_stride, w - x, h, da, db, table, max) };
+            if nvec % 2 == 1 {
+                one((nvec - 1) * 16);
+            }
+            if tail {
+                one(w - 16);
+            }
         }
     }
 }
@@ -682,11 +672,14 @@ fn offsets_fit_lut(offs: &[i16]) -> bool {
 }
 
 pub fn sao_band(dst: &mut [u16], src: &[u16], stride: usize, x0: usize, y0: usize, w: usize, h: usize, shift: u32, pos: u8, band: &[i16; 32], max: i32) {
-    let ok = w > 0 && h > 0 && offsets_fit_lut(band) && {
+    let in_bounds = w > 0 && h > 0 && {
         let need = (y0 + h - 1) * stride + x0 + w;
         dst.len() >= need && src.len() >= need
     };
-    debug_assert!(ok);
+    debug_assert!(in_bounds);
+    // Offsets too large for the i8 LUT (RExt magnitudes) route to the scalar
+    // twin by design, so they are part of the gate but not of the assertion.
+    let ok = in_bounds && offsets_fit_lut(band);
     if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::SAO_BAND_SIMD } else { &census::SAO_BAND_SCALAR }, 1);
@@ -728,14 +721,16 @@ pub fn sao_band(dst: &mut [u16], src: &[u16], stride: usize, x0: usize, y0: usiz
 #[allow(clippy::too_many_arguments)]
 pub fn sao_edge(dst: &mut [u16], src: &[u16], stride: usize, x0: usize, y0: usize, w: usize, h: usize, da: (i32, i32), db: (i32, i32), offs: &[i16; 4], max: i32) {
     let (oa, ob) = (doff(da, stride), doff(db, stride));
-    let ok = w > 0 && h > 0 && offsets_fit_lut(offs) && {
+    let in_bounds = w > 0 && h > 0 && {
         let first = (y0 * stride + x0) as isize;
         let last = ((y0 + h - 1) * stride + x0 + w - 1) as isize;
         let lo = first + oa.min(ob).min(0);
         let hi = last + oa.max(ob).max(0);
         lo >= 0 && (hi as usize) < src.len() && (last as usize) < dst.len()
     };
-    debug_assert!(ok);
+    debug_assert!(in_bounds);
+    // As in `sao_band`: offsets that don't fit the LUT take the scalar twin.
+    let ok = in_bounds && offsets_fit_lut(offs);
     if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::SAO_EDGE_SIMD } else { &census::SAO_EDGE_SCALAR }, 1);

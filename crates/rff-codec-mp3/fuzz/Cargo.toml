@@ -1,0 +1,39 @@
+# cargo-fuzz harness for the rff-codec-mp3 adapter (use-protection-please H-26).
+# Detached workspace; libFuzzer needs Linux/macOS (WSL works):
+#
+#   cargo +nightly fuzz run decode_packets   # Decoder trait: packets split anywhere
+#   cargo +nightly fuzz run encode_frames    # Encoder trait: any frame shape + options
+[package]
+name = "rff-codec-mp3-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rff-codec-mp3 = { path = ".." }
+rff-codec = { path = "../../rff-codec" }
+rff-core = { path = "../../rff-core" }
+
+[[bin]]
+name = "decode_packets"
+path = "fuzz_targets/decode_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode_frames"
+path = "fuzz_targets/encode_frames.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+
+[workspace]

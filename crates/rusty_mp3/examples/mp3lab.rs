@@ -19,7 +19,7 @@ use rusty_mp3::lab::{self, bricks, experiment::Overrides, quantizer, signals, va
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().map(String::as_str).unwrap_or("help");
+    let cmd = args.first().map_or("help", String::as_str);
 
     match cmd {
         "bricks" => print!("{}", bricks::table()),

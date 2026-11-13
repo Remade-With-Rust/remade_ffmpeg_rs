@@ -6,7 +6,7 @@
 use super::{PartMode, SliceDecoder};
 use crate::cabac::*;
 use crate::error::{Error, Result};
-use crate::mcscratch::weighted_write;
+use crate::mcscratch::{weighted_write, McScratch};
 use crate::pic::{AvailAt, Motion, PicState, PRED_INTER, PRED_SKIP};
 use crate::slice::PredWeightTable;
 use rusty_h265_accel as accel;
@@ -231,10 +231,14 @@ impl<'a> SliceDecoder<'a> {
         };
         let mut merge = false;
         for (i, &(x, y, w, hh)) in parts[..np].iter().enumerate() {
-            if i > 0 {
-                self.mark_edges(x, y, w, hh, 1);
-            }
             merge = self.prediction_unit(x0, y0, n, x, y, w, hh, i, depth, false)?;
+            if i > 0 {
+                // The internal prediction block edges, once this partition's
+                // motion is stored. Not transform block edges (§8.7.2.3); a
+                // transform unit that shares one overwrites it with the cbf
+                // rule later, which is what the old edge bitmap resolved to.
+                self.bs_edges(x, y, w, hh, x != x0, y != y0, false);
+            }
         }
         Ok(merge && self.part_mode == PartMode::Part2Nx2N)
     }
@@ -380,7 +384,7 @@ impl<'a> SliceDecoder<'a> {
             return None;
         }
         let i = self.st.idx4(xnu, ynu);
-        let m = self.st.pred_mode[i];
+        let m = self.st.cell[i].pred_mode;
         (m == PRED_INTER || m == PRED_SKIP).then_some(i)
     }
 
@@ -737,38 +741,164 @@ impl<'a> SliceDecoder<'a> {
             (pu.flags & 1 != 0).then(|| &refs.l0[pu.ref_idx[0] as usize]),
             (pu.flags & 2 != 0).then(|| &refs.l1[pu.ref_idx[1] as usize]),
         ];
+        // Per-component geometry, computed for luma and ONCE for the chroma
+        // pair. Cb and Cr share the motion vector, the block, the fractional
+        // split and the plane geometry (`Picture::new` builds both chroma
+        // planes with the same `Plane::new(cw, ch)`), so the c = 2 pass was a
+        // byte-for-byte recomputation of everything c = 1 had just derived:
+        // the list scan, the full-pel test and both interior tests.
+        let mut bw = 0usize;
+        let mut bh = 0usize;
+        let mut xb = 0usize;
+        let mut yb = 0usize;
+        let mut bit_depth = 0u8;
+        let mut m = 0usize;
+        let mut used = [false; 2];
+        let mut geo = [(0i32, 0i32, 0usize, 0usize); 2];
+        // Per list: the full-pel source offset when the vector is integer and
+        // the block inside the picture, and the footprint offset when the
+        // filter support is inside the picture (otherwise the edge copy).
+        let mut fp_geo = [None; 2];
+        let mut inner = [None; 2];
+        let mut fw = 0usize;
+        let mut fh = 0usize;
+        let mut pair_done = false;
         for c in 0..3usize {
-            let ss = if c == 0 { 0 } else { 1 };
-            let (bw, bh) = (w >> ss, h >> ss);
-            if bw == 0 || bh == 0 {
-                continue;
-            }
-            let (xb, yb) = (xp >> ss, yp >> ss);
-            let bit_depth = if c == 0 { sps.bit_depth_luma } else { sps.bit_depth_chroma };
-            let taps = if c == 0 { 8usize } else { 4 };
-            let m = taps / 2 - 1;
-            let (fw, fh) = (bw + taps - 1, bh + taps - 1);
-
-            // The fractional split is a property of the COMPONENT, not of the
-            // list: it was recomputed inside both per-list loops below.
-            let (frac_bits, frac_mask) = if c == 0 { (2u32, 3i32) } else { (3u32, 7i32) };
-
-            // Geometry first, for every list, so the full-pel fast path below
-            // can decide before any interpolation happens.
-            let mut used = [false; 2];
-            let mut geo = [(0i32, 0i32, 0usize, 0usize); 2];
-            for l in 0..2usize {
-                if pu.flags & (1 << l) == 0 {
+            if c != 2 {
+                let ss = if c == 0 { 0 } else { 1 };
+                (bw, bh) = (w >> ss, h >> ss);
+                if bw == 0 || bh == 0 {
                     continue;
                 }
-                used[l] = true;
-                let mv = pu.mv[l];
-                geo[l] = (
-                    xb as i32 + (mv[0] >> frac_bits),
-                    yb as i32 + (mv[1] >> frac_bits),
-                    (mv[0] & frac_mask) as usize,
-                    (mv[1] & frac_mask) as usize,
-                );
+                (xb, yb) = (xp >> ss, yp >> ss);
+                bit_depth = if c == 0 { sps.bit_depth_luma } else { sps.bit_depth_chroma };
+                let taps = if c == 0 { 8usize } else { 4 };
+                m = taps / 2 - 1;
+                (fw, fh) = (bw + taps - 1, bh + taps - 1);
+
+                // The fractional split is a property of the COMPONENT, not of
+                // the list.
+                let (frac_bits, frac_mask) = if c == 0 { (2u32, 3i32) } else { (3u32, 7i32) };
+                for l in 0..2usize {
+                    used[l] = false;
+                    fp_geo[l] = None;
+                    inner[l] = None;
+                    let Some(r) = rp[l] else { continue };
+                    used[l] = true;
+                    let mv = pu.mv[l];
+                    let (xi, yi, fx, fy) = (
+                        xb as i32 + (mv[0] >> frac_bits),
+                        yb as i32 + (mv[1] >> frac_bits),
+                        (mv[0] & frac_mask) as usize,
+                        (mv[1] & frac_mask) as usize,
+                    );
+                    geo[l] = (xi, yi, fx, fy);
+                    let p = &r.pic.planes[c];
+                    if fx == 0 && fy == 0 && xi >= 0 && yi >= 0 && xi as usize + bw <= p.width && yi as usize + bh <= p.height {
+                        fp_geo[l] = Some((yi as usize * p.stride + xi as usize, p.stride));
+                    }
+                    let (x0, y0) = (xi - m as i32, yi - m as i32);
+                    if x0 >= 0 && y0 >= 0 && (x0 as usize + fw) <= p.width && (y0 as usize + fh) <= p.height {
+                        inner[l] = Some(y0 as usize * p.stride + x0 as usize);
+                    }
+                }
+            } else if bw == 0 || bh == 0 || pair_done {
+                continue;
+            }
+
+            // The chroma PAIR, in one pass, whenever neither plane is weighted.
+            //
+            // Cb and Cr share the vector and so the fractional position, the
+            // block and the filter; `accel::mc::interp_chroma2` makes those
+            // decisions once and filters both planes. Each plane gets half of
+            // `pred` and half of `pad`: a chroma block is at most 32x32 and
+            // its footprint 35x35, so both halves always fit. Weighted chroma
+            // (Cb and Cr carry separate weights) keeps the per-plane path.
+            if c == 1 && (used[0] || used[1]) {
+                let pair = match weights {
+                    None => true,
+                    Some(t) => neutral_weights(t, pu, used, 1, wp_off) && neutral_weights(t, pu, used, 2, wp_off),
+                };
+                if pair {
+                    pair_done = true;
+                    let fp = if bit_depth <= 12 { fp_geo } else { [None; 2] };
+                    let McScratch { pred, tmp, pad } = scratch;
+                    let [_, cb, cr] = &mut pic.planes;
+                    let stride = cb.stride;
+                    debug_assert_eq!(stride, cr.stride);
+                    let off = yb * stride + xb;
+                    let (db, dr) = (&mut cb.data[off..], &mut cr.data[off..]);
+                    let [q0, q1] = pred;
+                    let half = q0.len() / 2;
+                    let (p0b, p0r) = q0.split_at_mut(half);
+                    let (p1b, p1r) = q1.split_at_mut(half);
+                    let planes = |l: usize| &rp[l].expect("list resolved").pic.planes;
+                    macro_rules! src2 {
+                        ($l:expr) => {
+                            crate::mcscratch::chroma_pair_src(planes($l), inner[$l], geo[$l].0 - m as i32, geo[$l].1 - m as i32, fw, fh, &mut pad[..])
+                        };
+                    }
+                    use accel::mc::{interp_chroma2, Out};
+                    match (used[0], used[1]) {
+                        (true, true) => match (fp[0], fp[1]) {
+                            (Some((o0, s0)), Some((o1, s1))) => {
+                                let (a, b) = (planes(0), planes(1));
+                                accel::pixel::avg_block(db, stride, &a[1].data[o0..], s0, &b[1].data[o1..], s1, bw, bh);
+                                accel::pixel::avg_block(dr, stride, &a[2].data[o0..], s0, &b[2].data[o1..], s1, bw, bh);
+                            }
+                            (Some((o, s)), None) | (None, Some((o, s))) => {
+                                // The integer list is `f`, the filtered one `g`.
+                                let (f, g) = if fp[0].is_some() { (0, 1) } else { (1, 0) };
+                                let (_, _, fx, fy) = geo[g];
+                                interp_chroma2(src2!(g), fx, fy, bw, bh, bit_depth, [&mut *p1b, &mut *p1r], tmp, [Out::Pred, Out::Pred]);
+                                let a = planes(f);
+                                accel::pixel::put_bi_fp(db, stride, &a[1].data[o..], s, p1b, bw, bh, bit_depth);
+                                accel::pixel::put_bi_fp(dr, stride, &a[2].data[o..], s, p1r, bw, bh, bit_depth);
+                            }
+                            (None, None) => {
+                                let (_, _, fx, fy) = geo[0];
+                                interp_chroma2(src2!(0), fx, fy, bw, bh, bit_depth, [&mut *p0b, &mut *p0r], tmp, [Out::Pred, Out::Pred]);
+                                let (_, _, fx, fy) = geo[1];
+                                interp_chroma2(
+                                    src2!(1),
+                                    fx,
+                                    fy,
+                                    bw,
+                                    bh,
+                                    bit_depth,
+                                    [&mut *p1b, &mut *p1r],
+                                    tmp,
+                                    [Out::Bi { pic: db, stride, other: p0b }, Out::Bi { pic: dr, stride, other: p0r }],
+                                );
+                            }
+                        },
+                        _ => {
+                            let l = if used[0] { 0 } else { 1 };
+                            match fp[l] {
+                                Some((o, s)) => {
+                                    let a = planes(l);
+                                    accel::pixel::copy_block(db, stride, &a[1].data[o..], s, bw, bh);
+                                    accel::pixel::copy_block(dr, stride, &a[2].data[o..], s, bw, bh);
+                                }
+                                None => {
+                                    let (_, _, fx, fy) = geo[l];
+                                    interp_chroma2(
+                                        src2!(l),
+                                        fx,
+                                        fy,
+                                        bw,
+                                        bh,
+                                        bit_depth,
+                                        [&mut *p0b, &mut *p0r],
+                                        tmp,
+                                        [Out::Uni { pic: db, stride }, Out::Uni { pic: dr, stride }],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
             }
 
             // Full-pel: decide PER LIST, not for the pair.
@@ -792,47 +922,37 @@ impl<'a> SliceDecoder<'a> {
                 Some(t) if neutral_weights(t, pu, used, c, wp_off) => None,
                 other => other,
             };
-            let mut fp = [None; 2];
-            if weights.is_none() && bit_depth <= 12 {
-                for l in 0..2usize {
-                    let Some(r) = rp[l] else { continue };
-                    let (xi, yi, fx, fy) = geo[l];
-                    let p = &r.pic.planes[c];
-                    if fx == 0 && fy == 0 && xi >= 0 && yi >= 0 && xi as usize + bw <= p.width && yi as usize + bh <= p.height {
-                        fp[l] = Some((yi as usize * p.stride + xi as usize, p.stride));
-                    }
-                }
-            }
+            let fp = if weights.is_none() && bit_depth <= 12 { fp_geo } else { [None; 2] };
 
-            for l in 0..2usize {
-                if fp[l].is_some() {
-                    continue; // resolved above; no filter, no scratch
-                }
-                let Some(r) = rp[l] else { continue };
+            // One list's interpolation, into `pred` or -- when `out` says so --
+            // straight into the picture with the default weighting fused into
+            // the kernel's final pass (`accel::mc::Out`). The footprint is the
+            // reference plane itself when it is inside the picture, and the
+            // edge-extended copy in `pad` otherwise.
+            let McScratch { pred, tmp, pad } = scratch;
+            let interp = |l: usize, dst_pred: &mut [i16], pad: &mut Vec<u16>, tmp: &mut Vec<i16>, out: accel::mc::Out<'_>| {
+                let r = rp[l].expect("list resolved");
                 let plane = &r.pic.planes[c];
                 // `geo[l]` already holds this: the old shape recomputed the
                 // whole integer/fractional split -- two shifts, two masks and
                 // two adds -- and threw the first copy away.
                 let (xi, yi, fx, fy) = geo[l];
-                let (x0, y0) = (xi - m as i32, yi - m as i32);
-
-                let interior = x0 >= 0 && y0 >= 0 && (x0 as usize + fw) <= plane.width && (y0 as usize + fh) <= plane.height;
-                let (src, stride): (&[u16], usize) = if interior {
-                    (&plane.data[y0 as usize * plane.stride + x0 as usize..], plane.stride)
+                let (src, stride): (&[u16], usize) = if let Some(o) = inner[l] {
+                    (&plane.data[o..], plane.stride)
                 } else {
+                    let (x0, y0) = (xi - m as i32, yi - m as i32);
                     if accel::census::ALWAYS {
                         accel::census::bump(&accel::census::MC_EDGE_PAD, 1);
                     }
-                    scratch.pad_footprint(plane, x0, y0, fw, fh);
-                    (&scratch.pad[..], fw)
+                    crate::mcscratch::pad_footprint(pad, plane, x0, y0, fw, fh);
+                    (&pad[..], fw)
                 };
-                let pred = &mut scratch.pred[l];
                 if c == 0 {
-                    accel::mc::interp_luma(src, stride, fx, fy, bw, bh, bit_depth, pred, &mut scratch.tmp);
+                    accel::mc::interp_luma(src, stride, fx, fy, bw, bh, bit_depth, dst_pred, tmp, out);
                 } else {
-                    accel::mc::interp_chroma(src, stride, fx, fy, bw, bh, bit_depth, pred, &mut scratch.tmp);
+                    accel::mc::interp_chroma(src, stride, fx, fy, bw, bh, bit_depth, dst_pred, tmp, out);
                 }
-            }
+            };
 
             // NOT a profiler scope. Timing the combine step directly needs a
             // scope on ~2 M calls a clip, and at 545 ns of measured per-scope
@@ -844,27 +964,46 @@ impl<'a> SliceDecoder<'a> {
             let off = yb * stride + xb;
             let dst = &mut plane.data[off..];
             let refp = |l: usize| -> &[u16] { &rp[l].unwrap().pic.planes[c].data };
+            let (p0, p1) = pred.split_at_mut(1);
+            let (p0, p1) = (&mut p0[0], &mut p1[0]);
             match (used[0], used[1], weights) {
                 (true, false, None) | (false, true, None) => {
                     let l = if used[0] { 0 } else { 1 };
                     match fp[l] {
                         Some((o, ss2)) => accel::pixel::copy_block(dst, stride, &refp(l)[o..], ss2, bw, bh),
-                        None => accel::pixel::put_uni(dst, stride, &scratch.pred[l], bw, bh, bit_depth),
+                        // `put_uni`, fused into the final filter pass.
+                        None => interp(l, p0, pad, tmp, accel::mc::Out::Uni { pic: dst, stride }),
                     }
                 }
                 (true, true, None) => match (fp[0], fp[1]) {
                     (Some((o0, s0)), Some((o1, s1))) => accel::pixel::avg_block(dst, stride, &refp(0)[o0..], s0, &refp(1)[o1..], s1, bw, bh),
-                    (Some((o0, s0)), None) => accel::pixel::put_bi_fp(dst, stride, &refp(0)[o0..], s0, &scratch.pred[1], bw, bh, bit_depth),
-                    (None, Some((o1, s1))) => accel::pixel::put_bi_fp(dst, stride, &refp(1)[o1..], s1, &scratch.pred[0], bw, bh, bit_depth),
-                    (None, None) => accel::pixel::put_bi(dst, stride, &scratch.pred[0], &scratch.pred[1], bw, bh, bit_depth),
+                    (Some((o0, s0)), None) => {
+                        interp(1, p1, pad, tmp, accel::mc::Out::Pred);
+                        accel::pixel::put_bi_fp(dst, stride, &refp(0)[o0..], s0, p1, bw, bh, bit_depth);
+                    }
+                    (None, Some((o1, s1))) => {
+                        interp(0, p0, pad, tmp, accel::mc::Out::Pred);
+                        accel::pixel::put_bi_fp(dst, stride, &refp(1)[o1..], s1, p0, bw, bh, bit_depth);
+                    }
+                    (None, None) => {
+                        // List 0 to the intermediate; list 1's final pass adds
+                        // it and writes the picture -- `put_bi` fused.
+                        interp(0, p0, pad, tmp, accel::mc::Out::Pred);
+                        interp(1, p1, pad, tmp, accel::mc::Out::Bi { pic: dst, stride, other: p0 });
+                    }
                 },
                 // Explicit weighted prediction (§8.5.3.3.4.3) — rare enough
                 // that it stays scalar; the census counter records how rare.
                 (_, _, Some(t)) => {
+                    for l in 0..2usize {
+                        if used[l] && fp[l].is_none() {
+                            interp(l, if l == 0 { &mut *p0 } else { &mut *p1 }, pad, tmp, accel::mc::Out::Pred);
+                        }
+                    }
                     let denom = if c == 0 { t.luma_log2_weight_denom } else { t.chroma_log2_weight_denom };
                     let e0 = used[0].then(|| &t.l0[pu.ref_idx[0] as usize]);
                     let e1 = used[1].then(|| &t.l1[pu.ref_idx[1] as usize]);
-                    weighted_write(dst, stride, &scratch.pred, used, e0, e1, denom, c, bw, bh, bit_depth);
+                    weighted_write(dst, stride, pred, used, e0, e1, denom, c, bw, bh, bit_depth);
                 }
                 (false, false, None) => {}
             }

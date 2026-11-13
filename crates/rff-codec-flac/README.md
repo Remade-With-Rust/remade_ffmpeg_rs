@@ -4,9 +4,13 @@
 [![By Mata Network](https://img.shields.io/badge/by-Mata%20Network-5b2be0)](https://www.mata.network)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/LICENSE)
 
-The **FLAC** lossless audio codec adapter for **remade_ffmpeg_rs** — decode via
-the pure-Rust [`claxon`](https://crates.io/crates/claxon), encode via our
-in-house lossless encoder. No C, no FFI.
+The **FLAC** lossless audio codec adapter for **remade_ffmpeg_rs** — decode and
+encode via our in-house, pure-Rust [`rusty_flac`](https://crates.io/crates/rusty_flac).
+No C, no FFI.
+
+- **Streams frame by frame** — the decoder takes one FLAC frame per packet
+  (configured from the STREAMINFO in `extradata`, as the FLAC and Matroska
+  demuxers supply it), so decoding a long file never holds it whole.
 
 - **In-house encoder** — LPC prediction, stereo decorrelation, partitioned Rice residual coding and the MD5 signature over the unencoded samples.
 - **At parity with FFmpeg's FLAC** at `-compression_level 8` (within 0.03% on our corpus).

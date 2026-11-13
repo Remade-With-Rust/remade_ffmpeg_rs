@@ -31,68 +31,46 @@ impl McScratch {
         McScratch {
             pred: [vec![0; MAX_PB * MAX_PB], vec![0; MAX_PB * MAX_PB]],
             tmp: vec![0; MAX_PB * (MAX_PB + MAX_MARGIN)],
-            pad: vec![0; (MAX_PB + MAX_MARGIN) * (MAX_PB + MAX_MARGIN)],
+            pad: vec![0; (MAX_PB + MAX_MARGIN) * (MAX_PB + MAX_MARGIN) + rusty_h265_accel::pixel::PAD_SLACK],
         }
     }
+}
 
-    /// Copies the `fw × fh` footprint at (`x0`, `y0`) out of `plane` into
-    /// `pad`, extending the edge sample where the footprint leaves the
-    /// picture. Rows are split into a left run, an interior copy and a right
-    /// run, so the clamp costs three decisions per row rather than one per
-    /// sample.
-    pub fn pad_footprint(&mut self, plane: &Plane, x0: i32, y0: i32, fw: usize, fh: usize) {
-        crate::prof_scope!(crate::prof::Stage::Pad);
-        // `pad` is built at the largest footprint HEVC can ask for -- a 64x64
-        // prediction block plus the 7-tap margin, which is exactly
-        // `(64 + 7) * (64 + 7)` -- so this can only ever be a no-op. It is a
-        // `debug_assert` rather than a runtime resize so the release path does
-        // not carry a compare and a call to `Vec::resize` it can never take.
-        // `scratch_holds_the_largest_block` is the test that keeps it true.
-        debug_assert!(self.pad.len() >= fw * fh, "pad footprint {fw}x{fh} exceeds the scratch");
-        let pw = plane.width as i32;
-        let ph = plane.height as i32;
-        let left = (-x0).clamp(0, fw as i32) as usize;
-        let right = ((x0 + fw as i32) - pw).clamp(0, fw as i32) as usize;
-        let mid = fw - left - right;
-        // Rows above the picture all clamp to row 0, and rows below all clamp
-        // to the last one -- so a footprint hanging off an edge asked for the
-        // SAME output row several times over, rebuilding it each time: a clamp,
-        // a copy and up to two fills per repeat. Building it once and
-        // replicating is strictly less work, and blocks at a picture edge are
-        // 12% of motion compensation (`MC_EDGE_PAD` = 31,137 a clip).
-        // The source column range is the same for every row, so it is resolved
-        // once rather than per row.
-        let sx_mid = (x0 + left as i32) as usize;
-        let sx_all = x0.clamp(0, pw - 1) as usize;
-        let last = plane.width - 1;
-        let mut prev_sy = usize::MAX;
-        for y in 0..fh {
-            let sy = (y0 + y as i32).clamp(0, ph - 1) as usize;
-            if sy == prev_sy {
-                // `copy_within` on the flat buffer: the previous row is already
-                // exactly what this one would be.
-                let (a, b) = ((y - 1) * fw, y * fw);
-                self.pad.copy_within(a..a + fw, b);
-                continue;
+/// The Cb and Cr filter footprints of one prediction unit, as
+/// `accel::mc::interp_chroma2` takes them: slices of the reference planes at
+/// `inner` when the footprint is inside the picture, and otherwise
+/// edge-extended copies in the two halves of `pad`. The chroma planes share
+/// their geometry, so one interior answer serves both.
+pub(crate) fn chroma_pair_src<'a>(planes: &'a [Plane; 3], inner: Option<usize>, x0: i32, y0: i32, fw: usize, fh: usize, pad: &'a mut [u16]) -> [(&'a [u16], usize); 2] {
+    match inner {
+        Some(o) => [(&planes[1].data[o..], planes[1].stride), (&planes[2].data[o..], planes[2].stride)],
+        None => {
+            if rusty_h265_accel::census::ALWAYS {
+                rusty_h265_accel::census::bump(&rusty_h265_accel::census::MC_EDGE_PAD, 2);
             }
-            prev_sy = sy;
-            let rb = sy * plane.stride;
-            let row = &plane.data[rb..rb + plane.width];
-            let out = &mut self.pad[y * fw..y * fw + fw];
-            if mid > 0 {
-                out[left..left + mid].copy_from_slice(&row[sx_mid..sx_mid + mid]);
-                if left > 0 {
-                    out[..left].fill(row[0]);
-                }
-                if right > 0 {
-                    out[left + mid..].fill(row[last]);
-                }
-            } else {
-                // The whole footprint is off one side: one edge sample.
-                out.fill(row[sx_all]);
-            }
+            let (a, b) = pad.split_at_mut(fw * fh + rusty_h265_accel::pixel::PAD_SLACK);
+            let (p1, p2) = (&planes[1], &planes[2]);
+            debug_assert!(p1.stride == p2.stride && p1.width == p2.width && p1.height == p2.height);
+            rusty_h265_accel::pixel::pad_footprint2(a, b, &p1.data, &p2.data, p1.stride, p1.width, p1.height, x0, y0, fw, fh);
+            [(&*a, fw), (&*b, fw)]
         }
     }
+}
+
+/// Copies the `fw × fh` footprint at (`x0`, `y0`) out of `plane` into `pad`
+/// (see [`McScratch::pad`]). A free function over the buffer rather than a
+/// method, so a caller holding the scratch's other fields by `&mut` can call
+/// it.
+pub(crate) fn pad_footprint(pad: &mut [u16], plane: &Plane, x0: i32, y0: i32, fw: usize, fh: usize) {
+    crate::prof_scope!(crate::prof::Stage::Pad);
+    // `pad` is built at the largest footprint HEVC can ask for -- a 64x64
+    // prediction block plus the 7-tap margin, which is exactly
+    // `(64 + 7) * (64 + 7)` -- so this can only ever be a no-op. It is a
+    // `debug_assert` rather than a runtime resize so the release path does
+    // not carry a compare and a call to `Vec::resize` it can never take.
+    // `scratch_holds_the_largest_block` is the test that keeps it true.
+    debug_assert!(pad.len() >= fw * fh + rusty_h265_accel::pixel::PAD_SLACK, "pad footprint {fw}x{fh} exceeds the scratch");
+    rusty_h265_accel::pixel::pad_footprint(pad, &plane.data, plane.stride, plane.width, plane.height, x0, y0, fw, fh);
 }
 
 /// §8.5.3.3.4.3 explicit weighted prediction, uni or bi.
@@ -156,8 +134,8 @@ mod tests {
         let mut s = McScratch::new();
         for y0 in -9i32..14 {
             for x0 in -9i32..22 {
-                for &(fw, fh) in &[(11usize, 11usize), (5, 7), (1, 1), (12, 3)] {
-                    s.pad_footprint(&p, x0, y0, fw, fh);
+                for &(fw, fh) in &[(11usize, 11usize), (5, 7), (1, 1), (12, 3), (8, 4), (9, 9), (23, 5), (16, 2)] {
+                    pad_footprint(&mut s.pad, &p, x0, y0, fw, fh);
                     for y in 0..fh {
                         for x in 0..fw {
                             let sx = (x0 + x as i32).clamp(0, p.width as i32 - 1) as usize;
@@ -165,6 +143,29 @@ mod tests {
                             assert_eq!(s.pad[y * fw + x], p.get(sx, sy), "({x0},{y0}) {fw}x{fh} at ({x},{y})");
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// The two-plane pad is two one-plane pads: every position, footprint
+    /// shapes through the vector boundaries, two different planes.
+    #[test]
+    fn pad_footprint2_matches_two_pads() {
+        use rusty_h265_accel::pixel::{pad_footprint as pad1, pad_footprint2, PAD_SLACK};
+        let (a, mut b) = (plane_with(19, 11), plane_with(19, 11));
+        for v in b.data.iter_mut() {
+            *v = v.wrapping_mul(7).wrapping_add(3) & 1023;
+        }
+        for y0 in -9i32..14 {
+            for x0 in -9i32..22 {
+                for &(fw, fh) in &[(11usize, 11usize), (5, 7), (1, 1), (8, 4), (9, 9), (23, 5), (16, 2)] {
+                    let n = fw * fh + PAD_SLACK;
+                    let (mut ra, mut rb, mut qa, mut qb) = (vec![0u16; n], vec![0u16; n], vec![0u16; n], vec![0u16; n]);
+                    pad1(&mut ra, &a.data, a.stride, a.width, a.height, x0, y0, fw, fh);
+                    pad1(&mut rb, &b.data, b.stride, b.width, b.height, x0, y0, fw, fh);
+                    pad_footprint2(&mut qa, &mut qb, &a.data, &b.data, a.stride, a.width, a.height, x0, y0, fw, fh);
+                    assert_eq!((&ra[..fw * fh], &rb[..fw * fh]), (&qa[..fw * fh], &qb[..fw * fh]), "({x0},{y0}) {fw}x{fh}");
                 }
             }
         }

@@ -1,5 +1,5 @@
 //! The deterministic AAC content corpus — one signal per content class from
-//! `docs/codec-aac-great-gate.md` §1.1.
+//! `docs/finished/codec-aac-great-gate.md` §1.1.
 //!
 //! Every signal is generated from a formula or a seeded LCG: no binary fixtures,
 //! no wall clock, no `rand`. Identical bytes on every machine and every run, which
@@ -27,7 +27,7 @@
 
 use core::f32::consts::PI;
 
-/// Sample rate for the whole corpus. 44.1 kHz keeps us on the fs_index the
+/// Sample rate for the whole corpus. 44.1 kHz keeps us on the `fs_index` the
 /// encoder's SWB tables are best exercised at, and matches the MP3/Opus ladders.
 pub const SR: u32 = 44_100;
 
@@ -66,49 +66,53 @@ pub enum Class {
 impl Class {
     /// Stable short name — also the clip key for train/holdout splits, so a split
     /// stays put across rungs (great-gate §4 rule 4).
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Class::SpeechClean => "speech-clean",
-            Class::SpeechNoisy => "speech-noisy",
-            Class::MusicTonal => "music-tonal",
-            Class::Percussive => "percussive",
-            Class::NoiseLike => "noise-like",
-            Class::StereoWide => "stereo-wide",
-            Class::QuietDynamic => "quiet-dynamic",
-            Class::MixedSpeechMusic => "mixed-speech-music",
+            Self::SpeechClean => "speech-clean",
+            Self::SpeechNoisy => "speech-noisy",
+            Self::MusicTonal => "music-tonal",
+            Self::Percussive => "percussive",
+            Self::NoiseLike => "noise-like",
+            Self::StereoWide => "stereo-wide",
+            Self::QuietDynamic => "quiet-dynamic",
+            Self::MixedSpeechMusic => "mixed-speech-music",
         }
     }
 
     /// True for the two classes synthesized to close a corpus gap.
+    #[must_use]
     pub fn is_gap(self) -> bool {
-        matches!(self, Class::QuietDynamic | Class::MixedSpeechMusic)
+        matches!(self, Self::QuietDynamic | Self::MixedSpeechMusic)
     }
 
     /// The campaign arms this class is the decisive evidence for.
+    #[must_use]
     pub fn stresses(self) -> &'static [&'static str] {
         match self {
-            Class::SpeechClean => &["A3", "A2"],
-            Class::SpeechNoisy => &["A6", "A4"],
-            Class::MusicTonal => &["A2", "A8", "A6-anti"],
-            Class::Percussive => &["A1", "A3", "A9"],
-            Class::NoiseLike => &["A6"],
-            Class::StereoWide => &["A7", "A10"],
-            Class::QuietDynamic => &["A4", "A5"],
-            Class::MixedSpeechMusic => &["A5", "A9", "variable"],
+            Self::SpeechClean => &["A3", "A2"],
+            Self::SpeechNoisy => &["A6", "A4"],
+            Self::MusicTonal => &["A2", "A8", "A6-anti"],
+            Self::Percussive => &["A1", "A3", "A9"],
+            Self::NoiseLike => &["A6"],
+            Self::StereoWide => &["A7", "A10"],
+            Self::QuietDynamic => &["A4", "A5"],
+            Self::MixedSpeechMusic => &["A5", "A9", "variable"],
         }
     }
 
     /// Every class, in fixed order.
-    pub fn all() -> [Class; 8] {
+    #[must_use]
+    pub fn all() -> [Self; 8] {
         [
-            Class::SpeechClean,
-            Class::SpeechNoisy,
-            Class::MusicTonal,
-            Class::Percussive,
-            Class::NoiseLike,
-            Class::StereoWide,
-            Class::QuietDynamic,
-            Class::MixedSpeechMusic,
+            Self::SpeechClean,
+            Self::SpeechNoisy,
+            Self::MusicTonal,
+            Self::Percussive,
+            Self::NoiseLike,
+            Self::StereoWide,
+            Self::QuietDynamic,
+            Self::MixedSpeechMusic,
         ]
     }
 }
@@ -123,16 +127,19 @@ pub struct Signal {
 }
 
 impl Signal {
+    #[must_use]
     pub fn name(&self) -> &'static str {
         self.class.name()
     }
 
     /// Samples per channel.
+    #[must_use]
     pub fn frames(&self) -> usize {
         self.pcm.len() / self.channels.max(1) as usize
     }
 
     /// De-interleave into one plane per channel.
+    #[must_use]
     pub fn planes(&self) -> Vec<Vec<f32>> {
         let ch = self.channels.max(1) as usize;
         (0..ch)
@@ -141,6 +148,7 @@ impl Signal {
     }
 
     /// Channel 0 as mono — what the NMR metric scores.
+    #[must_use]
     pub fn mono(&self) -> Vec<f32> {
         if self.channels <= 1 {
             self.pcm.clone()
@@ -166,11 +174,11 @@ impl Rng {
     /// [`Class::StereoWide`]'s two channels play identical notes and read as
     /// fully correlated — caught by `stereo_wide_is_decorrelated`. The finalizer
     /// below (murmur3's) decorrelates adjacent seeds.
-    fn new(seed: u32) -> Rng {
+    fn new(seed: u32) -> Self {
         let mut z = seed ^ 0x9E37_79B9;
         z = (z ^ (z >> 16)).wrapping_mul(0x85EB_CA6B);
         z = (z ^ (z >> 13)).wrapping_mul(0xC2B2_AE35);
-        Rng(z ^ (z >> 16))
+        Self(z ^ (z >> 16))
     }
 
     fn next(&mut self) -> f32 {
@@ -192,7 +200,7 @@ impl Resonator {
     fn new(freq: f32, bandwidth: f32) -> Self {
         let r = (-PI * bandwidth / SR as f32).exp();
         let w = 2.0 * PI * freq / SR as f32;
-        Resonator {
+        Self {
             a1: 2.0 * r * w.cos(),
             a2: -r * r,
             y1: 0.0,
@@ -218,7 +226,11 @@ impl Resonator {
 /// were completely different — caught by `stereo_wide_is_decorrelated`. RMS
 /// normalization makes the mix weights mean what they say.
 fn rms_normalize(pcm: &mut [f32]) {
-    let ms: f64 = pcm.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / pcm.len().max(1) as f64;
+    let ms: f64 = pcm
+        .iter()
+        .map(|&x| f64::from(x) * f64::from(x))
+        .sum::<f64>()
+        / pcm.len().max(1) as f64;
     let rms = ms.sqrt() as f32;
     if rms > 1e-9 {
         for x in pcm.iter_mut() {
@@ -262,15 +274,12 @@ fn speech_core(n: usize, seed: u32) -> Vec<f32> {
         let f0 = 115.0 + 25.0 * (2.0 * PI * 0.7 * t).sin();
         phase += f0 / SR as f32;
         let excite = match syl {
-            0 | 1 => {
+            0 | 1
                 // Voiced: a narrow glottal pulse once per period.
-                if phase >= 1.0 {
+                if phase >= 1.0 => {
                     phase -= 1.0;
                     1.0
-                } else {
-                    0.0
                 }
-            }
             2 => 0.08 * rng.next(), // unvoiced fricative
             _ => 0.0,               // pause — the silence the reservoir should exploit
         };
@@ -291,7 +300,9 @@ fn music_core(n: usize, seed: u32) -> Vec<f32> {
     let mut out = vec![0f32; n];
     // A note every 0.25 s; each is a decaying harmonic stack.
     let note_len = SR as usize / 4;
-    let base = [220.0f32, 261.63, 329.63, 392.0, 440.0, 329.63, 261.63, 196.0];
+    let base = [
+        220.0f32, 261.63, 329.63, 392.0, 440.0, 329.63, 261.63, 196.0,
+    ];
     // Seeded transposition (±5 semitones) and a seeded note order.
     let transpose = 2f32.powf(rng.next() * 5.0 / 12.0);
     let mut order: Vec<usize> = (0..base.len()).collect();
@@ -394,6 +405,7 @@ fn mono(class: Class, mut pcm: Vec<f32>, peak: f32) -> Signal {
 }
 
 /// Build one class's signal.
+#[must_use]
 pub fn signal(class: Class) -> Signal {
     match class {
         Class::SpeechClean => mono(class, speech_core(LEN, 0x5EED_0001), 0.7),
@@ -403,7 +415,7 @@ pub fn signal(class: Class) -> Signal {
             normalize(&mut s, 0.7);
             let mut rng = Rng::new(0x00B0_15E0 ^ 0x5EED_0002);
             // Noise floor ~30 dB below the speech peak.
-            for v in s.iter_mut() {
+            for v in &mut s {
                 *v += 0.022 * rng.next();
             }
             mono(class, s, 0.7)
@@ -430,12 +442,11 @@ pub fn signal(class: Class) -> Signal {
             rms_normalize(&mut l_src);
             rms_normalize(&mut r_src);
             rms_normalize(&mut centre);
-            const W_MUSIC: f32 = 1.00;
-            const W_CENTRE: f32 = 0.45;
+            let (w_music, w_centre) = (1.00f32, 0.45f32);
             let mut pcm = Vec::with_capacity(LEN * 2);
             for i in 0..LEN {
-                pcm.push(l_src[i] * W_MUSIC + centre[i] * W_CENTRE);
-                pcm.push(r_src[i] * W_MUSIC + centre[i] * W_CENTRE);
+                pcm.push(l_src[i] * w_music + centre[i] * w_centre);
+                pcm.push(r_src[i] * w_music + centre[i] * w_centre);
             }
             normalize(&mut pcm, 0.7);
             Signal {
@@ -499,7 +510,10 @@ pub fn corpus() -> Vec<Signal> {
 
 /// Look up one signal by class name.
 pub fn by_name(name: &str) -> Option<Signal> {
-    Class::all().into_iter().find(|c| c.name() == name).map(signal)
+    Class::all()
+        .into_iter()
+        .find(|c| c.name() == name)
+        .map(signal)
 }
 
 #[cfg(test)]
@@ -536,7 +550,8 @@ mod tests {
         // QuietDynamic: the two halves must differ by ~40 dB, or it cannot judge A4/A5.
         let q = signal(Class::QuietDynamic);
         let half = LEN / 2;
-        let rms = |s: &[f32]| (s.iter().map(|&x| (x * x) as f64).sum::<f64>() / s.len() as f64).sqrt();
+        let rms =
+            |s: &[f32]| (s.iter().map(|&x| f64::from(x * x)).sum::<f64>() / s.len() as f64).sqrt();
         let lo = rms(&q.pcm[..half]);
         let hi = rms(&q.pcm[half + 4410..]);
         let db = 20.0 * (hi / lo.max(1e-12)).log10();
@@ -549,7 +564,7 @@ mod tests {
         // Spectral centroid is a cheap proxy that separates our speech from our music.
         let m = signal(Class::MixedSpeechMusic);
         let block = SR as usize / 2;
-        let energy = |s: &[f32]| s.iter().map(|&x| (x * x) as f64).sum::<f64>();
+        let energy = |s: &[f32]| s.iter().map(|&x| f64::from(x * x)).sum::<f64>();
         let e0 = energy(&m.pcm[..block]);
         let e1 = energy(&m.pcm[block..2 * block]);
         assert!(
@@ -566,9 +581,9 @@ mod tests {
         assert_eq!(s.channels, 2);
         let p = s.planes();
         let (l, r) = (&p[0], &p[1]);
-        let dot: f64 = l.iter().zip(r).map(|(&a, &b)| (a * b) as f64).sum();
-        let nl: f64 = l.iter().map(|&a| (a * a) as f64).sum::<f64>().sqrt();
-        let nr: f64 = r.iter().map(|&b| (b * b) as f64).sum::<f64>().sqrt();
+        let dot: f64 = l.iter().zip(r).map(|(&a, &b)| f64::from(a * b)).sum();
+        let nl: f64 = l.iter().map(|&a| f64::from(a * a)).sum::<f64>().sqrt();
+        let nr: f64 = r.iter().map(|&b| f64::from(b * b)).sum::<f64>().sqrt();
         let xcorr = dot / (nl * nr).max(1e-12);
         assert!(
             xcorr < 0.75,
@@ -584,7 +599,7 @@ mod tests {
         let mut e: Vec<f64> = s
             .pcm
             .chunks(128)
-            .map(|c| c.iter().map(|&x| (x * x) as f64).sum())
+            .map(|c| c.iter().map(|&x| f64::from(x * x)).sum())
             .collect();
         let peak = e.iter().copied().fold(0f64, f64::max);
         e.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -596,4 +611,3 @@ mod tests {
         );
     }
 }
-

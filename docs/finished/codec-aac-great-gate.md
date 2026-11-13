@@ -968,3 +968,70 @@ scoped, and reported through `SbrSupport` rather than faked. The remaining work 
 **decoder-first** (reading broadcast HE-AAC matters far more than emitting it) and
 wants its own conformance corpus — the ISO/3GPP HE-AAC reference streams — which
 is a campaign of the same shape as this one, not a rung inside it.
+
+## 10. Third pass (2026-10-04) — the decoder is complete; arm 1a built and measured
+
+### HE-AAC reconstruction ✅ — the §9 "stops here" boundary is gone
+
+The normative tables §9 named as the blocker were transcribed (QMF prototype,
+start-frequency offsets, the ten SBR and ten PS Huffman codebooks, the noise
+table), and the reconstruction landed on branch `aac-complete`: SBR
+(`sbr/dec.rs` — dual-rate, downsampled and implicit; QMF banks on FFTs in
+`sbr/qmf.rs`) and full Parametric Stereo (`sbr/ps.rs` — 10/20/34 bands, IPD/OPD).
+The same pass completed the rest of the decode family — Main prediction, LTP,
+ER AAC-LC/LTP, AAC-LD, AAC-ELD, 960-sample frames, 7.1 + PCE layouts, coupling
+channels, LATM v0/v1 with mid-stream configuration changes.
+
+Verdict instrument: `examples/aacconf.rs` over the FATE copy of ISO/IEC 14496-26
+against FFmpeg 8.1.2 (`-flags +bitexact`) and the ISO reference PCM: **81 EXACT
+(≤1 LSB) + 2 KNOWN of the 83 non-USAC streams**, 8 USAC refused. `SbrSupport` now
+reports `Full`; only ELD's low-delay SBR remains `CoreOnly` (it needs the complex
+low-delay filterbank, and FFmpeg has no implementation to use as an oracle).
+
+Two findings worth keeping:
+
+- **The downsampled SBR synthesis kernel is `(2n − 127.5)/64`** — the 64-band
+  kernel at half rate. Both a remembered spec form (`2n − 127`) and a kernel
+  fitted to a model of FFmpeg's DCT path were wrong; a peak-amplitude unit test
+  passed the wrong kernel. Round-trip SNR found it (64.4 dB, equal to the 64-band
+  bank). Test reconstruction, not peak.
+- **The last two NEAR streams were not what they looked like.** al15/am05 differed
+  by 2 LSB in one frame of exactly the channels a coupling element feeds — but the
+  CCE traced clean. The cause was TNS: the reference decoders dequantise
+  reflection coefficients from an 8-digit table that is not correctly-rounded
+  sine (sin 80° = 0.98480775, table 0.98480773), and a high-order recursive filter
+  amplified the few-ULP difference. Matching the table made both EXACT.
+
+### Arm 1a — window grouping ⚠️ BUILT, **NOT BANKED** (2026-10-04)
+
+Built as `window_grouping` (default off, **byte-identical off** — 12-cell hash
+proof on transient mono/stereo). Short frames split into window groups where a
+window's energy leaves its group's running mean by more than 6 dB; the A1 psy
+model runs **per group** and is centred **across** groups, so a quiet pre-attack
+group sits below the attack and is coded finer (the §8 refutation of A1 was the
+single-group sum handing pre-attack windows an attack-sized mask). Offsets clamp
+to ±30 so any two coded scalefactors stay within the ±60 delta. FFmpeg decodes
+every grouped stream error-free.
+
+PEAQ A/B against the shipping defaults (13 clips × 64/96/128/192k; cells whose
+bitstreams were byte-identical are exactly 0 and not re-scored — 20 of 52):
+
+| | value |
+|---|---|
+| mean Δ ODG | **−0.007** |
+| worst | **−0.308** (speech-noisy 64k) |
+| best | +0.044 (speech-noisy 192k), +0.029 (stereo-wide 64k) |
+| percussive (the target class) | +0.001 / +0.001 / −0.000 / +0.001 |
+
+**Neutral, and fails worst-class.** The class it was built for does not move at
+all, so the pre-echo this protects against is not what costs the percussive
+class its ODG at these rates. Kept in the code (off) as the substrate for any
+future short-block shaping; not a default.
+
+### What remains (encoder)
+
+A12 (distortion loop) and A5 (reservoir) are unchanged in priority. **A5 needs a
+decision before code:** the encoder's ~5× speed advantage comes from frame
+parallelism, and a bit reservoir is sequential state — either a serial reservoir
+pass ahead of the parallel quantisation, or chunk-local reservoirs with a
+documented reset cost.

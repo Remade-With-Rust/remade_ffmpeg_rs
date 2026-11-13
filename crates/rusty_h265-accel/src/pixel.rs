@@ -1269,6 +1269,217 @@ pub fn copy_block(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: u
     copy_block_scalar(dst, dst_stride, src, src_stride, w, h);
 }
 
+/// Samples [`pad_footprint`] may write past `fw * fh`: its vector stores run up
+/// to fifteen samples beyond a row's end -- into the next row, which is written
+/// afterwards, or on the last row into this slack.
+pub const PAD_SLACK: usize = 16;
+
+/// The edge-extended `fw x fh` window at (`x0`, `y0`) of a `width x height`
+/// plane (`src` at `stride`), into `dst` at stride `fw`: every sample is the
+/// plane sample at the clamped coordinate (§8.5.3.3.2's reference sample
+/// padding). `dst` needs `fw * fh + PAD_SLACK` samples.
+///
+/// A padded row is a left run of the edge sample, the in-picture span, and a
+/// right run of the other edge sample; rows that clamp to the same picture row
+/// repeat the row above. Built with 8-sample vector stores in that order --
+/// each store may overrun into what the next store, or the next row, then
+/// overwrites -- a row is a handful of stores, where the slice form paid a
+/// `memcpy` call, two runtime-length fills and their bounds checks, ~90
+/// instructions a row on 5.4 M rows of a 20 s 720p clip.
+#[allow(clippy::too_many_arguments)]
+pub fn pad_footprint(dst: &mut [u16], src: &[u16], stride: usize, width: usize, height: usize, x0: i32, y0: i32, fw: usize, fh: usize) {
+    assert!(width > 0 && height > 0 && fw > 0 && fh > 0 && stride >= width);
+    assert!(src.len() >= stride * (height - 1) + width && dst.len() >= fw * fh + PAD_SLACK);
+    // A one-plane pad is a LUMA footprint here (chroma goes through
+    // `pad_footprint2`), whose in-picture span is routinely 50-71 samples:
+    // sixteen samples a store halves the copy. Chroma rows are too short for
+    // the wider store to pay for itself, so the pair stays at eight.
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    if crate::isa() == crate::Isa::Avx2 {
+        // SAFETY: AVX2 is present; the bounds are the asserts above.
+        return unsafe { pad_rows_avx2(dst.as_mut_ptr(), src.as_ptr(), stride, width, height, x0, y0, fw, fh) };
+    }
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    // SAFETY: the bounds the row loop relies on are the asserts above.
+    unsafe {
+        pad_rows_sse2::<1, 8>([dst.as_mut_ptr()], [src.as_ptr()], stride, width, height, x0, y0, fw, fh)
+    }
+    #[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
+    pad_rows_safe(dst, src, stride, width, height, x0, y0, fw, fh)
+}
+
+/// [`pad_footprint`] for two planes of the same geometry at once -- the Cb/Cr
+/// pair of one prediction unit. The row clamp, the repeat test and the column
+/// split are made once per row for both planes.
+#[allow(clippy::too_many_arguments)]
+pub fn pad_footprint2(da: &mut [u16], db: &mut [u16], sa: &[u16], sb: &[u16], stride: usize, width: usize, height: usize, x0: i32, y0: i32, fw: usize, fh: usize) {
+    assert!(width > 0 && height > 0 && fw > 0 && fh > 0 && stride >= width);
+    let need = stride * (height - 1) + width;
+    assert!(sa.len() >= need && sb.len() >= need && da.len() >= fw * fh + PAD_SLACK && db.len() >= fw * fh + PAD_SLACK);
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    // SAFETY: the bounds the row loop relies on are the asserts above.
+    unsafe {
+        pad_rows_sse2::<2, 8>([da.as_mut_ptr(), db.as_mut_ptr()], [sa.as_ptr(), sb.as_ptr()], stride, width, height, x0, y0, fw, fh)
+    }
+    #[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
+    {
+        pad_rows_safe(da, sa, stride, width, height, x0, y0, fw, fh);
+        pad_rows_safe(db, sb, stride, width, height, x0, y0, fw, fh);
+    }
+}
+
+/// [`pad_footprint`] without vectors or `unsafe`: the slice form.
+#[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
+#[allow(clippy::too_many_arguments)]
+fn pad_rows_safe(dst: &mut [u16], src: &[u16], stride: usize, width: usize, height: usize, x0: i32, y0: i32, fw: usize, fh: usize) {
+    let (pw, ph) = (width as i32, height as i32);
+    let left = (-x0).clamp(0, fw as i32) as usize;
+    let right = ((x0 + fw as i32) - pw).clamp(0, fw as i32) as usize;
+    let mid = fw - left - right;
+    let sx = if mid > 0 { (x0 + left as i32) as usize } else { x0.clamp(0, pw - 1) as usize };
+    for y in 0..fh {
+        let sy = (y0 + y as i32).clamp(0, ph - 1) as usize;
+        let row = &src[sy * stride..sy * stride + width];
+        let out = &mut dst[y * fw..y * fw + fw];
+        if mid == 0 {
+            out.fill(row[sx]);
+            continue;
+        }
+        out[..left].fill(row[0]);
+        out[left..left + mid].copy_from_slice(&row[sx..sx + mid]);
+        out[left + mid..].fill(row[width - 1]);
+    }
+}
+
+/// [`pad_rows_sse2`] at sixteen samples a store.
+///
+/// # Safety
+/// AVX2 present; the bounds [`pad_footprint`] asserts.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pad_rows_avx2(dst: *mut u16, src: *const u16, stride: usize, width: usize, height: usize, x0: i32, y0: i32, fw: usize, fh: usize) {
+    unsafe { pad_rows_sse2::<1, 16>([dst], [src], stride, width, height, x0, y0, fw, fh) }
+}
+
+/// The row loop of [`pad_footprint`], `V`-sample stores (8: SSE2, 16: AVX2
+/// and only where it is enabled), over `P` planes that share the geometry.
+///
+/// # Safety
+/// The bounds [`pad_footprint`] asserts, for every plane.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn pad_rows_sse2<const P: usize, const V: usize>(dst: [*mut u16; P], src: [*const u16; P], stride: usize, width: usize, height: usize, x0: i32, y0: i32, fw: usize, fh: usize) {
+    let (pw, ph) = (width as i32, height as i32);
+    let left = (-x0).clamp(0, fw as i32) as usize;
+    let right = ((x0 + fw as i32) - pw).clamp(0, fw as i32) as usize;
+    let mid = fw - left - right;
+    // `mid > 0` puts the span inside the row; otherwise the footprint is off
+    // one side and every sample is the one edge sample at `sx`.
+    let sx = if mid > 0 { (x0 + left as i32) as usize } else { x0.clamp(0, pw - 1) as usize };
+    let mut prev = usize::MAX;
+    for y in 0..fh {
+        let sy = (y0 + y as i32).clamp(0, ph - 1) as usize;
+        let o = y * fw;
+        if sy == prev {
+            for k in 0..P {
+                // SAFETY: `o - fw .. o + fw` lies inside `fw * fh` (y >= 1 here).
+                unsafe { copy_run::<V>(dst[k].add(o), dst[k].add(o - fw), fw) };
+            }
+            continue;
+        }
+        prev = sy;
+        let r = sy * stride;
+        // SAFETY: the row read is `r .. r + width`, inside each source by the
+        // assert; every write is below `o + fw + V - 1 <= fw * fh + PAD_SLACK - 1`.
+        for k in 0..P {
+            unsafe {
+                let d = dst[k].add(o);
+                let s = src[k].add(r);
+                if mid == 0 {
+                    splat_run::<V>(d, fw, *s.add(sx));
+                    continue;
+                }
+                if left > 0 {
+                    splat_run::<V>(d, left, *s);
+                }
+                copy_run::<V>(d.add(left), s.add(sx), mid);
+                if right > 0 {
+                    splat_run::<V>(d.add(left + mid), right, *s.add(width - 1));
+                }
+            }
+        }
+    }
+}
+
+/// `n` copies of `v` at `d`, writing up to `n + V - 1`.
+///
+/// # Safety
+/// `d` must have `n.next_multiple_of(V)` writable samples; `V == 16` only
+/// where AVX2 is enabled.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn splat_run<const V: usize>(d: *mut u16, n: usize, v: u16) {
+    use std::arch::x86_64::*;
+    let mut i = 0;
+    unsafe {
+        if V == 16 {
+            let s = _mm256_set1_epi16(v as i16);
+            while i < n {
+                _mm256_storeu_si256(d.add(i) as *mut __m256i, s);
+                i += 16;
+            }
+        } else {
+            let s = _mm_set1_epi16(v as i16);
+            while i < n {
+                _mm_storeu_si128(d.add(i) as *mut __m128i, s);
+                i += 8;
+            }
+        }
+    }
+}
+
+/// `n` samples from `s` to `d` (not overlapping). Writes exactly `n` when
+/// `n >= 8` (whole vectors, then one overlapping the one before) and `n`
+/// below that, a sample at a time.
+///
+/// # Safety
+/// `s` must have `n` readable samples and `d` `n` writable ones; `V == 16`
+/// only where AVX2 is enabled.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn copy_run<const V: usize>(d: *mut u16, s: *const u16, n: usize) {
+    use std::arch::x86_64::*;
+    unsafe {
+        if V == 16 && n >= 16 {
+            let mut i = 0;
+            while i + 16 <= n {
+                _mm256_storeu_si256(d.add(i) as *mut __m256i, _mm256_loadu_si256(s.add(i) as *const __m256i));
+                i += 16;
+            }
+            if i < n {
+                _mm256_storeu_si256(d.add(n - 16) as *mut __m256i, _mm256_loadu_si256(s.add(n - 16) as *const __m256i));
+            }
+            return;
+        }
+        if n >= 8 {
+            let mut i = 0;
+            while i + 8 <= n {
+                _mm_storeu_si128(d.add(i) as *mut __m128i, _mm_loadu_si128(s.add(i) as *const __m128i));
+                i += 8;
+            }
+            if i < n {
+                _mm_storeu_si128(d.add(n - 8) as *mut __m128i, _mm_loadu_si128(s.add(n - 8) as *const __m128i));
+            }
+            return;
+        }
+        for i in 0..n {
+            *d.add(i) = *s.add(i);
+        }
+    }
+}
+
 /// Rounding average of two `w x h` rectangles — full-pel bi-prediction.
 #[allow(clippy::too_many_arguments)]
 pub fn avg_block(dst: &mut [u16], dst_stride: usize, a: &[u16], a_stride: usize, b: &[u16], b_stride: usize, w: usize, h: usize) {

@@ -10,7 +10,9 @@ static GLOBAL_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: decode_bench <file.webp> [iters]");
+    let path = args
+        .next()
+        .expect("usage: decode_bench <file.webp> [iters]");
     let iters: usize = args.next().map_or(5, |s| s.parse().expect("iters"));
 
     let data = std::fs::read(&path).expect("read input");

@@ -1,5 +1,5 @@
 //! `aacquality` — the AAC quality-ladder driver (P0 of the Great Gate campaign,
-//! `docs/codec-aac-great-gate.md`).
+//! `docs/finished/codec-aac-great-gate.md`).
 //!
 //! Runs the deterministic 8-class corpus through the encoder at four operating
 //! points, decodes each stream, and prints the per-clip × per-bitrate NMR table
@@ -21,6 +21,9 @@ use rusty_aac::lab::{corpus, ladder, signals::AacSignals};
 use rusty_aac::{AacEncoderConfig, WindowShape};
 use std::process::ExitCode;
 
+/// One measured arm: its label and the configuration it encodes with at a bitrate.
+type Arm = (&'static str, fn(u32) -> AacEncoderConfig);
+
 // Primary allocator for this target: our rusty_alloc, the pure-Rust mimalloc
 // remake. PROJECT CONVENTION (`CLAUDE.md`) — every encoder-carrying binary,
 // bench and example runs under it, because it is what ships. Examples are a
@@ -33,18 +36,21 @@ static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let show_signals = args.iter().any(|a| a == "--signals");
-    let bitrates: Vec<u32> = args
-        .windows(2)
-        .find(|w| w[0] == "--bitrates")
-        .map(|w| {
+    let bitrates: Vec<u32> = args.windows(2).find(|w| w[0] == "--bitrates").map_or_else(
+        || ladder::DEFAULT_BITRATES.to_vec(),
+        |w| {
             w[1].split(',')
                 .filter_map(|s| s.trim().parse().ok())
                 .collect()
-        })
-        .unwrap_or_else(|| ladder::DEFAULT_BITRATES.to_vec());
+        },
+    );
 
     println!("rusty_aac quality ladder — allocator: rusty_alloc (project default)");
-    println!("corpus: {} classes, {} operating points\n", corpus::Class::all().len(), bitrates.len());
+    println!(
+        "corpus: {} classes, {} operating points\n",
+        corpus::Class::all().len(),
+        bitrates.len()
+    );
 
     // ---- the null arm, before anything is believed -------------------------
     print!("null arm (encode twice, require byte-identical) ... ");
@@ -62,7 +68,10 @@ fn main() -> ExitCode {
     }
 
     // ---- the ladder ---------------------------------------------------------
-    println!("\n{:<20} {:>7} {:>10} {:>9} {:>9} {:>8}", "clip", "target", "measured", "audible%", "meanNMR", "frames");
+    println!(
+        "\n{:<20} {:>7} {:>10} {:>9} {:>9} {:>8}",
+        "clip", "target", "measured", "audible%", "meanNMR", "frames"
+    );
     println!("{}", "-".repeat(68));
 
     let mut worst_rate_err = 0f64;
@@ -94,7 +103,7 @@ fn main() -> ExitCode {
         println!("{}", "-".repeat(80));
         for sig in corpus::corpus() {
             let planes = sig.planes();
-            let refs: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
+            let refs: Vec<&[f32]> = planes.iter().map(std::vec::Vec::as_slice).collect();
             let s = AacSignals::analyze(&refs, sig.sample_rate);
             println!(
                 "{:<20} {:>9.2} {:>9.3} {:>9.2} {:>10.1} {:>9.0} {:>8.0}k",
@@ -142,8 +151,8 @@ fn main() -> ExitCode {
                 } else if dk > 0.01 {
                     kbd_losses += 1;
                 }
-                sum_kbd += dk as f64;
-                sum_auto += da as f64;
+                sum_kbd += f64::from(dk);
+                sum_auto += f64::from(da);
                 cells += 1;
                 println!(
                     "{:<20} {:>6}k {:>11.2} {:>+11.2} {:>+11.2}",
@@ -155,10 +164,16 @@ fn main() -> ExitCode {
                 );
             }
         }
-        let n = cells.max(1) as f64;
-        println!("\nmean Δaudible%:  kbd {:+.3}   auto {:+.3}", sum_kbd / n, sum_auto / n);
-        println!("kbd per-cell sign: {kbd_wins} better, {kbd_losses} worse, {} tied",
-                 cells - kbd_wins - kbd_losses);
+        let n = f64::from(cells.max(1));
+        println!(
+            "\nmean Δaudible%:  kbd {:+.3}   auto {:+.3}",
+            sum_kbd / n,
+            sum_auto / n
+        );
+        println!(
+            "kbd per-cell sign: {kbd_wins} better, {kbd_losses} worse, {} tied",
+            cells - kbd_wins - kbd_losses
+        );
         println!(
             "\nREAD THIS AS A SIGN TABLE, NOT A MEAN. A tool that wins on some content and\n\
              loses on other is a DISPATCH signal, not a mean-loss to discard. Banking any\n\
@@ -170,10 +185,8 @@ fn main() -> ExitCode {
     // ---- Rungs 1-3: per-class sign table ------------------------------------
     if args.iter().any(|a| a == "--rungs") {
         println!("\nRungs 1-3 — per-class Δaudible% vs the shipped encoder (NEGATIVE = better).");
-        println!(
-            "Exit criterion is WORST CLASS <= 0, verified per class, never on average.\n"
-        );
-        let arms: [(&str, fn(u32) -> AacEncoderConfig); 5] = [
+        println!("Exit criterion is WORST CLASS <= 0, verified per class, never on average.\n");
+        let arms: [Arm; 5] = [
             ("A6 PNS", |b| AacEncoderConfig {
                 bitrate_bps: b,
                 pns: true,
@@ -201,8 +214,8 @@ fn main() -> ExitCode {
             }),
         ];
         print!("{:<20} {:>7} {:>10}", "clip", "target", "base aud%");
-        for (n, _) in arms.iter() {
-            print!(" {:>12}", n);
+        for (n, _) in &arms {
+            print!(" {n:>12}");
         }
         println!();
         println!("{}", "-".repeat(102));
@@ -224,7 +237,7 @@ fn main() -> ExitCode {
                     let p = ladder::point_with(&sig, mk(b));
                     d[i] = p.nmr.pct_audible - base.nmr.pct_audible;
                     worst[i] = worst[i].max(d[i]);
-                    sums[i] += d[i] as f64;
+                    sums[i] += f64::from(d[i]);
                 }
                 cells += 1;
                 print!(
@@ -233,13 +246,13 @@ fn main() -> ExitCode {
                     b / 1000,
                     base.nmr.pct_audible
                 );
-                for v in d.iter() {
-                    print!(" {:>+12.2}", v);
+                for v in &d {
+                    print!(" {v:>+12.2}");
                 }
                 println!();
             }
         }
-        let n = cells.max(1) as f64;
+        let n = f64::from(cells.max(1));
         println!("\n{:<16} {:>12} {:>12}", "arm", "mean Δ", "WORST Δ");
         for (i, (name, _)) in arms.iter().enumerate() {
             println!(
@@ -247,7 +260,11 @@ fn main() -> ExitCode {
                 name,
                 sums[i] / n,
                 worst[i],
-                if worst[i] <= 0.0 { "PASSES worst-class" } else { "FAILS worst-class" }
+                if worst[i] <= 0.0 {
+                    "PASSES worst-class"
+                } else {
+                    "FAILS worst-class"
+                }
             );
         }
         println!(

@@ -124,12 +124,12 @@ extern crate std;
 
 mod common;
 mod encoder;
+#[cfg(feature = "color_quant")]
+mod kmeans;
 /// Vendored NeuQuant color quantizer (formerly the `color_quant` crate).
 /// Public so callers and benches can drive the quantizer directly.
 #[cfg(feature = "color_quant")]
 pub mod neuquant;
-#[cfg(feature = "color_quant")]
-mod kmeans;
 #[cfg(feature = "color_quant")]
 mod quantize;
 mod reader;
@@ -148,4 +148,3 @@ pub mod streaming_decoder {
     pub use crate::common::Block;
     pub use crate::reader::{Decoded, FrameDataType, FrameDecoder, OutputBuffer, StreamingDecoder};
 }
-

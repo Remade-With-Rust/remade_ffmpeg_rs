@@ -72,6 +72,10 @@ fn read_coeff(bd: &mut BoolDecoder, probs: &[u8], n: usize) -> i32 {
 /// * `coef_probs` — `[band][ctx][node]` model probs for this (tx, plane, ref).
 /// * `dq` — `(dc_quant, ac_quant)`.
 /// * `ctx` — initial above/left context (0..=2).
+/// * `dqcoeff` — **must be all-zero over `[..max_eob]` on entry.** On return
+///   every non-zero entry lies in rows `0..=max_row`; a caller that reuses the
+///   buffer clears those rows once it has consumed them.
+/// * `token_cache` — scratch; its contents on entry are irrelevant.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub fn decode_coefs(
@@ -89,8 +93,16 @@ pub fn decode_coefs(
     bit_depth: u32,
 ) -> (usize, usize) {
     let max_eob = 16usize << (tx_size << 1);
-    let n = 4usize << tx_size; // transform side; row = pos / n
+    let row_shift = tx_size + 2; // log2 of the transform side; row = pos >> row_shift
     let mut max_row = 0usize; // highest row index holding a non-zero coefficient
+                              // Every position and neighbour index below comes from a static scan table
+                              // and is `< max_eob`, a power of two. Narrowing both buffers to exactly
+                              // `max_eob` and masking the indices with `max_eob - 1` changes no value and
+                              // lets the compiler drop the bounds check on each cache read and write (the
+                              // context derivation alone reads the cache twice per token).
+    let idx_mask = max_eob - 1;
+    let dqcoeff = &mut dqcoeff[..max_eob];
+    let token_cache = &mut token_cache[..max_eob];
     let band_translate: &[u8] = if tx_size == 0 {
         &COEFBAND_4X4
     } else {
@@ -105,10 +117,22 @@ pub fn decode_coefs(
         _ => (&CAT6_PROB, 14),
     };
     let mut dqv = dq.0; // DC quant for the first coefficient
-                        // Caller passes reusable scratch; clear only the live `max_eob` prefix (the
-                        // tail is never read — neighbour positions are always `< max_eob`).
-    dqcoeff[..max_eob].iter_mut().for_each(|v| *v = 0);
-    token_cache[..max_eob].iter_mut().for_each(|v| *v = 0);
+                        // No clearing here (it used to zero `dqcoeff[..max_eob]` and
+                        // `token_cache[..max_eob]` on every block, up to 5 KiB, even for the many
+                        // blocks whose EOB is 0):
+                        // * `dqcoeff` arrives all-zero by contract and the caller re-zeroes only the
+                        //   rows `0..=max_row` this call can have written;
+                        // * `token_cache` is only ever read at a position's two causal neighbours,
+                        //   which precede it in scan order and were therefore written earlier in
+                        //   this same call (see `coef_neighbours_precede_in_scan_order`).
+    debug_assert!(dqcoeff[..max_eob].iter().all(|&v| v == 0));
+
+    // The scan, its neighbour table and the band table are all indexed by a
+    // scan index the loop keeps at or below `max_eob`. Cut to exactly the
+    // lengths that implies, their per-token bounds checks are provable.
+    let scan = &scan[..max_eob];
+    let nb = &nb[..2 * max_eob + 2];
+    let band_translate = &band_translate[..max_eob];
 
     let mut c = 0usize;
     while c < max_eob {
@@ -123,17 +147,20 @@ pub fn decode_coefs(
         // Run of ZERO tokens.
         while bd.read_bool(prob[1]) == 0 {
             coef_cnt[band][ctx][0] += 1; // ZERO_TOKEN
-            token_cache[scan[c] as usize] = 0;
+            token_cache[scan[c] as usize & idx_mask] = 0;
             dqv = dq.1;
             c += 1;
             if c >= max_eob {
                 return (c, max_row);
             }
-            ctx = get_coef_context(nb, &token_cache, c);
+            ctx = (1
+                + token_cache[nb[2 * c] as usize & idx_mask] as usize
+                + token_cache[nb[2 * c + 1] as usize & idx_mask] as usize)
+                >> 1;
             band = band_translate[c] as usize;
             prob = coef_probs[band][ctx];
         }
-        let pos = scan[c] as usize;
+        let pos = scan[c] as usize & idx_mask;
         // Non-zero token. prob[2] is both the >=TWO decision and Pareto pivot.
         let two_plus = bd.read_bool(prob[2]) != 0;
         coef_cnt[band][ctx][if two_plus { 2 } else { 1 }] += 1; // TWO+ / ONE token
@@ -176,9 +203,12 @@ pub fn decode_coefs(
         };
         // Sign bit (probability 128 = equiprobable).
         dqcoeff[pos] = if bd.read_bool(128) != 0 { -v } else { v };
-        max_row = max_row.max(pos / n);
+        max_row = max_row.max(pos >> row_shift);
         c += 1;
-        ctx = get_coef_context(nb, &token_cache, c);
+        ctx = (1
+            + token_cache[nb[2 * c] as usize & idx_mask] as usize
+            + token_cache[nb[2 * c + 1] as usize & idx_mask] as usize)
+            >> 1;
         dqv = dq.1;
     }
     (c, max_row)
@@ -270,6 +300,43 @@ mod tests {
         let mut bd = BoolDecoder::new(&data).unwrap();
         // With all-zero data the first bool is 0 -> leaf 0.
         assert_eq!(read_tree(&mut bd, &tree, &[128]), 0);
+    }
+
+    /// `decode_coefs` leaves `token_cache` uncleared between blocks. That is
+    /// only sound if a coefficient's two context neighbours always come earlier
+    /// in the scan, so they were written before they are read. Pin it for every
+    /// scan table the codec has.
+    #[test]
+    fn coef_neighbours_precede_in_scan_order() {
+        for tx_size in 0..4usize {
+            for tx_type in [
+                TxType::DctDct,
+                TxType::AdstDct,
+                TxType::DctAdst,
+                TxType::AdstAdst,
+            ] {
+                let (scan, nb) = get_scan(tx_size, tx_type);
+                let n = 16usize << (tx_size << 1);
+                let mut order = vec![usize::MAX; n];
+                for (c, &p) in scan[..n].iter().enumerate() {
+                    order[p as usize] = c;
+                }
+                assert!(
+                    order.iter().all(|&c| c != usize::MAX),
+                    "scan is not a permutation"
+                );
+                for c in 1..n {
+                    for t in 0..2 {
+                        let p = nb[2 * c + t] as usize;
+                        assert!(
+                            order[p] < c,
+                            "tx {tx_size} {tx_type:?}: neighbour {p} of scan index {c} is at {}",
+                            order[p]
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

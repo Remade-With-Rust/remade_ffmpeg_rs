@@ -30,7 +30,7 @@ fn read_wav(path: &str) -> (Vec<f32>, u32, u16) {
             let body = &d[i + 8..(i + 8 + sz).min(d.len())];
             let pcm = if bits == 16 {
                 body.chunks_exact(2)
-                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                    .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0)
                     .collect()
             } else {
                 body.chunks_exact(4)
@@ -45,6 +45,7 @@ fn read_wav(path: &str) -> (Vec<f32>, u32, u16) {
 }
 
 fn main() {
+    use std::sync::atomic::Ordering::Relaxed;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(path) = args.first() else {
         eprintln!("usage: encprof <input.wav> [kbps]");
@@ -75,13 +76,12 @@ fn main() {
     if let Some(out) = args.get(2) {
         std::fs::write(out, &mp3).expect("write output mp3");
     }
-    let secs = pcm.len() as f64 / ch.max(1) as f64 / rate as f64;
+    let secs = pcm.len() as f64 / f64::from(ch.max(1)) / f64::from(rate);
     println!(
         "{path}: {ch} ch @ {rate} Hz, {secs:.1} s -> {bytes} bytes ({:.1} kbps)",
         bytes as f64 * 8.0 / secs / 1000.0
     );
 
-    use std::sync::atomic::Ordering::Relaxed;
     let (nl, ns) = (prof::N_LONG.load(Relaxed), prof::N_SHORT.load(Relaxed));
     let (k0, ot) = (
         prof::OUTER_KEPT0.load(Relaxed),
@@ -99,6 +99,23 @@ fn main() {
     println!("  SF OVERFLOW (pre-fix guard would have truncated): {ovf}");
     let rs = prof::REFINE_STEPS.load(Relaxed);
     println!("  refine steps accepted: {rs}");
+    println!(
+        "  kernel census: filterbank passes simd {} scalar {} | quantize calls simd {} scalar {}",
+        prof::FB_PASSES[1].load(Relaxed),
+        prof::FB_PASSES[0].load(Relaxed),
+        prof::QUANT_CALLS[1].load(Relaxed),
+        prof::QUANT_CALLS[0].load(Relaxed)
+    );
+    println!(
+        "  short-block refine steps accepted: {}",
+        prof::SHORT_REFINE_STEPS.load(Relaxed)
+    );
+    println!(
+        "  cap-blocked refinement steps: low {} high {}   preflag-eligible granules: {}",
+        prof::CAP_BLOCK_LO.load(Relaxed),
+        prof::CAP_BLOCK_HI.load(Relaxed),
+        prof::PREFLAG_OK.load(Relaxed)
+    );
     let it = prof::OUTER_ITERS.load(Relaxed);
     println!(
         "  outer iterations: {it} total, {:.1} per long granule -- {} of them discarded",
@@ -132,7 +149,14 @@ fn main() {
     let hist: Vec<u64> = prof::NMR_HIST.iter().map(|a| a.load(Relaxed)).collect();
     let hsum: u64 = hist.iter().sum();
     let labels = [
-        "<1e-6", "1e-6", "1e-5", "1e-4", "1e-3", "1e-2", "0.1-1", ">=1 AUDIBLE",
+        "<1e-6",
+        "1e-6",
+        "1e-5",
+        "1e-4",
+        "1e-3",
+        "1e-2",
+        "0.1-1",
+        ">=1 AUDIBLE",
     ];
     println!("  NMR distribution over {hsum} coded bands (noise / masking threshold):");
     for (l, n) in labels.iter().zip(&hist) {

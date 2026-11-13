@@ -17,7 +17,7 @@
 //! 1. **Compare relatively.** Ours-vs-anchor at matched bitrate; the shared bias
 //!    largely cancels. An absolute NMR figure means little.
 //! 2. **NMR is the screen, PEAQ is the verdict.** A self-metric provably flatters
-//!    the encoder it came from. No rung in `docs/codec-aac-great-gate.md` is
+//!    the encoder it came from. No rung in `docs/finished/codec-aac-great-gate.md` is
 //!    banked on NMR alone — it exists to make the inner loop fast, and the ladder
 //!    (`super::ladder`) carries the external-oracle column beside it.
 //!
@@ -51,6 +51,7 @@ pub struct NmrReport {
 impl NmrReport {
     /// A single scalar for ranking: the audible percentage, tie-broken by mean.
     /// Lower is better.
+    #[must_use]
     pub fn score(&self) -> f32 {
         self.pct_audible + self.mean_nmr_db * 1e-3
     }
@@ -72,7 +73,7 @@ fn best_delay(orig: &[f32], coded: &[f32]) -> usize {
         let mut err = 0f64;
         let mut i = 0;
         while i < w {
-            let e = (orig[start + i] - coded[start + d + i]) as f64;
+            let e = f64::from(orig[start + i] - coded[start + d + i]);
             err += e * e;
             i += 32; // subsample the search
         }
@@ -128,18 +129,18 @@ pub fn track_nmr(orig: &[f32], coded: &[f32], sample_rate: u32) -> NmrReport {
             let (s, e) = (swb[b] as usize, swb[b + 1] as usize);
             let mut noise = 1e-12f64;
             for k in s..e.min(so.len()) {
-                let d = (so[k] - sc[k]) as f64;
+                let d = f64::from(so[k] - sc[k]);
                 noise += d * d;
             }
             let v = noise / mask[b].max(mask_floor).max(1e-20);
             let db = (10.0 * v.log10()).clamp(-120.0, 120.0) as f32;
-            sum_db += db as f64;
+            sum_db += f64::from(db);
             cells += 1;
             if v > 1.0 {
                 audible += 1;
             }
             max_db = max_db.max(db);
-            band_sum[b] += db as f64;
+            band_sum[b] += f64::from(db);
             band_cnt[b] += 1;
         }
         frames += 1;
@@ -196,7 +197,7 @@ pub fn per_frame_audible(orig: &[f32], coded: &[f32], sample_rate: u32) -> Vec<f
             let (s, e) = (swb[b] as usize, swb[b + 1] as usize);
             let mut noise = 1e-12f64;
             for k in s..e.min(so.len()) {
-                let d = (so[k] - sc[k]) as f64;
+                let d = f64::from(so[k] - sc[k]);
                 noise += d * d;
             }
             if noise / mask[b].max(mask_floor).max(1e-20) > 1.0 {
@@ -293,9 +294,9 @@ mod tests {
     /// the failure mode that silently invalidates a whole ladder.
     #[test]
     fn alignment_recovers_injected_delay() {
+        const D: usize = 2048;
         let s = corpus::signal(corpus::Class::MusicTonal);
         let m = s.mono();
-        const D: usize = 2048;
         let mut shifted = vec![0f32; D];
         shifted.extend_from_slice(&m);
         let r = track_nmr(&m, &shifted, s.sample_rate);

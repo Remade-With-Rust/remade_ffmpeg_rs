@@ -110,11 +110,53 @@ fn plane_tx_size(mi: &ModeInfo, ss_x: usize, ss_y: usize) -> usize {
         return tx;
     }
     // uv_txsize: clamp to the max tx of the subsampled block size.
-    let ss_bsize = ss_size_lookup(mi.sb_type as usize, ss_x, ss_y);
-    tx.min(MAX_TXSIZE[ss_bsize] as usize)
+    tx.min(SS_MAX_TX[ss_x & 1][ss_y & 1][mi.sb_type as usize] as usize)
+}
+
+/// `MAX_TXSIZE[ss_size_lookup(bsize, ss_x, ss_y)]` for every block size and
+/// subsampling, built at compile time. The run-time form searched the thirteen
+/// block sizes for the subsampled dimensions on every 8x8 cell of every
+/// subsampled plane. `ss_max_tx_table_matches_lookup` pins it to that search.
+const SS_MAX_TX: [[[u8; 13]; 2]; 2] = build_ss_max_tx();
+
+const fn build_ss_max_tx() -> [[[u8; 13]; 2]; 2] {
+    let mut t = [[[0u8; 13]; 2]; 2];
+    let mut sx = 0;
+    while sx < 2 {
+        let mut sy = 0;
+        while sy < 2 {
+            let mut b = 0;
+            while b < 13 {
+                let mut ssb = b;
+                if sx != 0 || sy != 0 {
+                    let w0 = NUM_4X4_W[b] >> sx;
+                    let h0 = NUM_4X4_H[b] >> sy;
+                    let w = if w0 < 1 { 1 } else { w0 };
+                    let hgt = if h0 < 1 { 1 } else { h0 };
+                    ssb = 0; // BLOCK_4X4 when nothing matches
+                    let mut found = false;
+                    let mut k = 0;
+                    while k < 13 {
+                        if !found && NUM_4X4_W[k] == w && NUM_4X4_H[k] == hgt {
+                            ssb = k;
+                            found = true;
+                        }
+                        k += 1;
+                    }
+                }
+                t[sx][sy][b] = MAX_TXSIZE[ssb] as u8;
+                b += 1;
+            }
+            sy += 1;
+        }
+        sx += 1;
+    }
+    t
 }
 
 /// `ss_size_lookup[bsize][ss_x][ss_y]` for the common 4:2:0/4:2:2/4:4:4 cases.
+/// (The oracle for [`SS_MAX_TX`].)
+#[cfg(test)]
 fn ss_size_lookup(bsize: usize, ss_x: usize, ss_y: usize) -> usize {
     // Map a luma block size to the chroma block size under subsampling.
     // Derived from libvpx ss_size_lookup; BLOCK_INVALID cases clamp to 4x4.
@@ -377,11 +419,16 @@ fn build_sb_masks(
     let mut v8 = [0u32; MI_BLOCK_SIZE];
     let mut v4 = [0u32; MI_BLOCK_SIZE];
 
+    // The cells of this superblock row that lie inside the frame.
+    let n_cols = MI_BLOCK_SIZE.min(mi_cols - mi_col);
     let mut r = 0;
     while r < MI_BLOCK_SIZE && mi_row + r < mi_rows {
+        // One slice (one bounds proof) per superblock row; the per-cell form
+        // recomputed the 2-D index and re-checked it for every cell.
+        let mi_row_cells = &mi_grid[(mi_row + r) * mi_cols + mi_col..][..n_cols];
         let mut c = 0;
-        while c < MI_BLOCK_SIZE && mi_col + c < mi_cols {
-            let mi = &mi_grid[(mi_row + r) * mi_cols + (mi_col + c)];
+        while c < n_cols {
+            let mi = &mi_row_cells[c];
             let sb_type = mi.sb_type as usize;
             let skip_this = mi.skip && mi.is_inter;
             let block_edge_left = if NUM_4X4_W[sb_type] > 1 {
@@ -483,15 +530,16 @@ fn apply_sb_masks(
     ss_y: usize,
     lf: &LfInfo,
     m: &SbMasks,
+    lfl: &[u8; MI_BLOCK_SIZE * MI_BLOCK_SIZE],
     mi_rows: usize,
     mi_row: usize,
     mi_col: usize,
     bd: i32,
+    avx2: bool,
 ) {
     let row_step = 1 << ss_y;
     let (v16, v8, v4) = (&m.v16, &m.v8, &m.v4);
     let (m16x16, m8x8, m4x4, m4x4_int) = (&m.m16x16, &m.m8x8, &m.m4x4, &m.m4x4_int);
-    let lfl = &m.lfl;
     // Vertical pass. Split out of the build loop above: mask construction reads
     // only `mi_grid`, and vertical filtering of mi-row `r` touches only pixel
     // rows [row_y, row_y+8), so no row can observe another's filtering and the
@@ -513,6 +561,7 @@ fn apply_sb_masks(
             &lf.thr,
             &lfl[r << 3..],
             bd,
+            avx2,
         );
         r += row_step;
     }
@@ -541,6 +590,7 @@ fn apply_sb_masks(
             &lf.thr,
             &lfl[r << 3..],
             bd,
+            avx2,
         );
         r += row_step;
     }
@@ -552,36 +602,36 @@ fn filter_selectively_vert(
     stride: usize,
     base_x: usize,
     y: usize,
-    mut m16: u32,
-    mut m8: u32,
-    mut m4: u32,
-    mut m4i: u32,
+    m16: u32,
+    m8: u32,
+    m4: u32,
+    m4i: u32,
     thr: &[Thresh],
     lfl: &[u8],
     bd: i32,
+    avx2: bool,
 ) {
-    let mut col = 0;
+    // Jump from one set bit to the next, in ascending column order as before.
+    // The shift-through form walked every column up to the highest set bit, and
+    // large blocks set one bit in four or eight.
     let mut any = m16 | m8 | m4 | m4i;
     while any != 0 {
+        let col = any.trailing_zeros() as usize;
+        let bit = 1u32 << col;
         let t = &thr[lfl[col] as usize];
         let x = base_x + col * 8;
         let base = y * stride + x;
-        if m16 & 1 != 0 {
-            apply_vert(buf, base, stride, 16, t, bd);
-        } else if m8 & 1 != 0 {
-            apply_vert(buf, base, stride, 8, t, bd);
-        } else if m4 & 1 != 0 {
-            apply_vert(buf, base, stride, 4, t, bd);
+        if m16 & bit != 0 {
+            apply_edge::<16, true>(buf, base, stride, t, bd, avx2);
+        } else if m8 & bit != 0 {
+            apply_edge::<8, true>(buf, base, stride, t, bd, avx2);
+        } else if m4 & bit != 0 {
+            apply_edge::<4, true>(buf, base, stride, t, bd, avx2);
         }
-        if m4i & 1 != 0 {
-            apply_vert(buf, base + 4, stride, 4, t, bd);
+        if m4i & bit != 0 {
+            apply_edge::<4, true>(buf, base + 4, stride, t, bd, avx2);
         }
-        col += 1;
-        m16 >>= 1;
-        m8 >>= 1;
-        m4 >>= 1;
-        m4i >>= 1;
-        any >>= 1;
+        any &= any - 1;
     }
 }
 
@@ -591,41 +641,38 @@ fn filter_selectively_horiz(
     stride: usize,
     base_x: usize,
     y: usize,
-    mut m16: u32,
-    mut m8: u32,
-    mut m4: u32,
-    mut m4i: u32,
+    m16: u32,
+    m8: u32,
+    m4: u32,
+    m4i: u32,
     thr: &[Thresh],
     lfl: &[u8],
     bd: i32,
+    avx2: bool,
 ) {
-    let mut col = 0;
     let mut any = m16 | m8 | m4 | m4i;
     while any != 0 {
+        let col = any.trailing_zeros() as usize;
+        let bit = 1u32 << col;
         let t = &thr[lfl[col] as usize];
         let x = base_x + col * 8;
         let base = y * stride + x;
-        if m16 & 1 != 0 {
-            apply_horiz(buf, base, stride, 16, t, bd);
-        } else if m8 & 1 != 0 {
-            apply_horiz(buf, base, stride, 8, t, bd);
-            if m4i & 1 != 0 {
-                apply_horiz(buf, base + 4 * stride, stride, 4, t, bd);
+        if m16 & bit != 0 {
+            apply_edge::<16, false>(buf, base, stride, t, bd, avx2);
+        } else if m8 & bit != 0 {
+            apply_edge::<8, false>(buf, base, stride, t, bd, avx2);
+            if m4i & bit != 0 {
+                apply_edge::<4, false>(buf, base + 4 * stride, stride, t, bd, avx2);
             }
-        } else if m4 & 1 != 0 {
-            apply_horiz(buf, base, stride, 4, t, bd);
-            if m4i & 1 != 0 {
-                apply_horiz(buf, base + 4 * stride, stride, 4, t, bd);
+        } else if m4 & bit != 0 {
+            apply_edge::<4, false>(buf, base, stride, t, bd, avx2);
+            if m4i & bit != 0 {
+                apply_edge::<4, false>(buf, base + 4 * stride, stride, t, bd, avx2);
             }
-        } else if m4i & 1 != 0 {
-            apply_horiz(buf, base + 4 * stride, stride, 4, t, bd);
+        } else if m4i & bit != 0 {
+            apply_edge::<4, false>(buf, base + 4 * stride, stride, t, bd, avx2);
         }
-        col += 1;
-        m16 >>= 1;
-        m8 >>= 1;
-        m4 >>= 1;
-        m4i >>= 1;
-        any >>= 1;
+        any &= any - 1;
     }
 }
 
@@ -638,7 +685,10 @@ fn filter_selectively_horiz(
 /// steps between the 8 positions along the edge. The two callers below pick the
 /// orientation. `lane_stride == 1` (horizontal edge) makes the gather/scatter
 /// contiguous; the strided case (vertical edge) still vectorizes the arithmetic.
-#[allow(clippy::needless_range_loop)]
+///
+/// Test-only since the frame loop calls the kernel monomorphs directly (see
+/// [`apply_edge`]): this is the entry the scalar-oracle test drives.
+#[cfg(test)]
 fn filter_edge8(
     buf: &mut [u16],
     i: usize,
@@ -651,12 +701,37 @@ fn filter_edge8(
     // AVX2: horizontal edges (lane_stride == 1) gather/scatter contiguously;
     // vertical edges transpose an 8×8 (or 8×16) tile in-register.
     #[cfg(target_arch = "x86_64")]
-    if std::is_x86_feature_detected!("avx2") {
+    if std::is_x86_feature_detected!("avx2") && (lane_stride == 1 || pos_stride == 1) {
+        let horiz = lane_stride == 1;
+        let stride = if horiz { pos_stride } else { lane_stride };
         // SAFETY: AVX2 confirmed; the caller's mask guarantees the p7..q7 read
         // window (along `pos_stride`, 8 lanes along `lane_stride`) is in-bounds.
-        unsafe { filter_edge8_avx2(buf, i, pos_stride, lane_stride, width, t, bd) };
+        unsafe {
+            match (width >= 16, width >= 8, horiz) {
+                (true, _, true) => filter_edge8_avx2::<16, false>(buf, i, stride, t, bd),
+                (false, true, true) => filter_edge8_avx2::<8, false>(buf, i, stride, t, bd),
+                (false, false, true) => filter_edge8_avx2::<4, false>(buf, i, stride, t, bd),
+                (true, _, false) => filter_edge8_avx2::<16, true>(buf, i, stride, t, bd),
+                (false, true, false) => filter_edge8_avx2::<8, true>(buf, i, stride, t, bd),
+                (false, false, false) => filter_edge8_avx2::<4, true>(buf, i, stride, t, bd),
+            }
+        }
         return;
     }
+    filter_edge8_portable(buf, i, pos_stride, lane_stride, width, t, bd);
+}
+
+/// The portable (auto-vectorised) body of [`filter_edge8`].
+#[allow(clippy::needless_range_loop)]
+fn filter_edge8_portable(
+    buf: &mut [u16],
+    i: usize,
+    pos_stride: usize,
+    lane_stride: usize,
+    width: usize,
+    t: &Thresh,
+    bd: i32,
+) {
     let base = 1i32 << (bd - 1);
     let ft = 1i32 << (bd - 8); // flat threshold
     let (lim, blimit, hev_thr) = (t.lim, t.mblim, t.hev_thr);
@@ -1070,6 +1145,7 @@ unsafe fn transpose8(r: &mut [std::arch::x86_64::__m256i; 8]) {
 /// `p0..p6` and `q0..q6`; unmodified positions equal their input.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn lf_core8(
     p: &[std::arch::x86_64::__m256i; 8],
     q: &[std::arch::x86_64::__m256i; 8],
@@ -1179,6 +1255,22 @@ unsafe fn lf_core8(
     flat2 = and(flat2, le(ad(q6, q0), ftv));
     flat2 = and(flat2, le(ad(p7, p0), ftv));
     flat2 = and(flat2, le(ad(q7, q0), ftv));
+    // No lane both flat and flat2 => filter16 is unused and the edge is exactly
+    // the 8-wide result (`mask & flat & !flat2` is all of `mask & flat` then).
+    // Skip the fourteen filter16 sums; an edge that does use them pays one
+    // `vptest`.
+    let use8_any = and(mask, flat);
+    let use16_any = and(use8_any, flat2);
+    if _mm256_testz_si256(use16_any, use16_any) == 1 {
+        let use4 = _mm256_andnot_si256(flat, mask);
+        np[2] = sel(use8_any, f8p2, p2);
+        np[1] = sel(use8_any, f8p1, sel(use4, f4p1, p1));
+        np[0] = sel(use8_any, f8p0, sel(use4, f4p0, p0));
+        nq[0] = sel(use8_any, f8q0, sel(use4, f4q0, q0));
+        nq[1] = sel(use8_any, f8q1, sel(use4, f4q1, q1));
+        nq[2] = sel(use8_any, f8q2, q2);
+        return (np, nq);
+    }
     let r4 = |x| _mm256_srai_epi32::<4>(add(x, _mm256_set1_epi32(8)));
     let mk = |k, a| _mm256_mullo_epi32(_mm256_set1_epi32(k), a);
     let sum = |xs: &[__m256i]| {
@@ -1380,16 +1472,23 @@ fn p_to_arr(p: &[std::arch::x86_64::__m256i; 8]) -> &[std::arch::x86_64::__m256i
 /// AVX2 present; the p7..q7 window in-bounds (caller's mask guarantees it).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn filter_edge8_avx2(
+unsafe fn filter_edge8_avx2<const W: usize, const VERT: bool>(
     buf: &mut [u16],
     i: usize,
-    pos_stride: usize,
-    lane_stride: usize,
-    width: usize,
+    stride: usize,
     t: &Thresh,
     bd: i32,
 ) {
     use std::arch::x86_64::*;
+    // One monomorph per (width class, orientation): the width tests, the tap
+    // count, the store count and the contiguous/transposed choice below are all
+    // compile-time constants in each, instead of branches taken per edge.
+    let width = W;
+    let (pos_stride, lane_stride) = if VERT {
+        (1usize, stride)
+    } else {
+        (stride, 1usize)
+    };
     let bp = buf.as_mut_ptr();
     let ls = lane_stride as isize;
     let ps = pos_stride as isize;
@@ -1466,6 +1565,36 @@ unsafe fn filter_edge8_avx2(
             st(-(k as isize) - 1, np[k]);
             st(k as isize, nq[k]);
         }
+    } else if W == 4 {
+        // Narrow vertical edge: only p1, p0, q0 and q1 can change, i.e. the four
+        // samples `[-2, 2)` around the edge in each of the 8 rows. Transpose just
+        // those four vectors back (two unpack levels) and store four samples a
+        // row, instead of rebuilding and re-transposing the whole 8-column tile
+        // to write back four columns that did not change.
+        let t0 = _mm256_unpacklo_epi32(np[1], np[0]);
+        let t1 = _mm256_unpackhi_epi32(np[1], np[0]);
+        let t2 = _mm256_unpacklo_epi32(nq[0], nq[1]);
+        let t3 = _mm256_unpackhi_epi32(nq[0], nq[1]);
+        // Rows (0, 4), (1, 5), (2, 6), (3, 7): low lane / high lane.
+        let rows = [
+            _mm256_unpacklo_epi64(t0, t2),
+            _mm256_unpackhi_epi64(t0, t2),
+            _mm256_unpacklo_epi64(t1, t3),
+            _mm256_unpackhi_epi64(t1, t3),
+        ];
+        for (l, v) in rows.iter().enumerate() {
+            let pk = _mm256_packus_epi32(*v, *v);
+            let ra = i as isize + l as isize * ls;
+            let rb = i as isize + (l as isize + 4) * ls;
+            _mm_storel_epi64(
+                bp.offset(ra - 2) as *mut __m128i,
+                _mm256_castsi256_si128(pk),
+            );
+            _mm_storel_epi64(
+                bp.offset(rb - 2) as *mut __m128i,
+                _mm256_extracti128_si256::<1>(pk),
+            );
+        }
     } else if n == 4 {
         // rebuild the 8-col tile [p3,p2,p1,p0,q0,q1,q2,q3] with modified values.
         let mut col = [zero; 8];
@@ -1517,14 +1646,47 @@ unsafe fn filter_edge8_avx2(
     }
 }
 
-/// Vertical edge (filter across columns): 8 (or 16) pixels down the edge.
-fn apply_vert(buf: &mut [u16], base: usize, stride: usize, width: usize, t: &Thresh, bd: i32) {
-    filter_edge8(buf, base, 1, stride, width, t, bd);
+/// Filter one 8-sample edge of width class `W` (4, 8 or 16). `VERT` is a
+/// vertical edge (filter across columns, samples down the edge); otherwise a
+/// horizontal one.
+///
+/// `avx2` is decided ONCE per frame by the caller. The wrapper this replaces
+/// probed the CPU feature and made an out-of-line call for every edge.
+#[inline(always)]
+fn apply_edge<const W: usize, const VERT: bool>(
+    buf: &mut [u16],
+    base: usize,
+    stride: usize,
+    t: &Thresh,
+    bd: i32,
+    avx2: bool,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2 {
+        // SAFETY: `avx2` is only true when the feature was detected; the
+        // caller's mask guarantees the p7..q7 window is in bounds.
+        unsafe { filter_edge8_avx2::<W, VERT>(buf, base, stride, t, bd) };
+        return;
+    }
+    let _ = avx2;
+    if VERT {
+        filter_edge8_portable(buf, base, 1, stride, W, t, bd);
+    } else {
+        filter_edge8_portable(buf, base, stride, 1, W, t, bd);
+    }
 }
 
-/// Horizontal edge (filter across rows): 8 pixels along the edge.
-fn apply_horiz(buf: &mut [u16], base: usize, stride: usize, width: usize, t: &Thresh, bd: i32) {
-    filter_edge8(buf, base, stride, 1, width, t, bd);
+/// Whether the AVX2 edge kernels may be used (checked once per frame).
+#[inline]
+fn lf_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -1598,6 +1760,21 @@ mod tests {
     }
 
     #[test]
+    fn ss_max_tx_table_matches_lookup() {
+        for sx in 0..2 {
+            for sy in 0..2 {
+                for b in 0..13 {
+                    assert_eq!(
+                        SS_MAX_TX[sx][sy][b] as usize,
+                        MAX_TXSIZE[ss_size_lookup(b, sx, sy)] as usize,
+                        "bsize {b} ss ({sx},{sy})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn thresholds_match_libvpx() {
         // sharpness 0: lim == level, mblim == 2*(level+2)+lim, hev == level>>4.
         let lf = build_lf_info(&hdr(20, 0));
@@ -1636,6 +1813,7 @@ pub fn loop_filter_frame(
     }
     let lf = build_lf_info(h);
     let bd = h.bit_depth.max(8) as i32;
+    let avx2 = lf_avx2();
     let mut mi_row = 0;
     while mi_row < mi_rows {
         let mut mi_col = 0;
@@ -1661,11 +1839,108 @@ pub fn loop_filter_frame(
                 let base_x = (mi_col * 8) >> *ss_x;
                 let base_y = (mi_row * 8) >> *ss_y;
                 apply_sb_masks(
-                    buf, *stride, base_x, base_y, *ss_y, &lf, masks, mi_rows, mi_row, mi_col, bd,
+                    buf, *stride, base_x, base_y, *ss_y, &lf, masks, &masks.lfl, mi_rows, mi_row,
+                    mi_col, bd, avx2,
                 );
             }
             mi_col += MI_BLOCK_SIZE;
         }
         mi_row += MI_BLOCK_SIZE;
     }
+}
+
+/// The one filter level every block of the frame resolves to, if there is one:
+/// a non-zero frame level with no ref/mode deltas and no per-segment level.
+fn uniform_level(h: &FrameHeader) -> Option<u8> {
+    if h.loop_filter_level == 0 || h.lf_delta_enabled {
+        return None;
+    }
+    if h.seg_enabled && h.seg_feature_enabled.iter().any(|f| f[1]) {
+        return None;
+    }
+    Some(h.loop_filter_level.min(MAX_LOOP_FILTER as u32) as u8)
+}
+
+/// One plane's loop-filter masks for a whole frame, reusable across filter
+/// LEVELS (see [`build_plane_masks`]).
+pub struct PlaneMasks {
+    ss_x: usize,
+    ss_y: usize,
+    sbs: Vec<SbMasks>,
+}
+
+/// Build one plane's edge masks for the whole frame.
+///
+/// The masks depend on the filter level only through "is this block's level
+/// zero". When every block resolves to the same non-zero level (no deltas, no
+/// per-segment level) that never holds, so the masks are the same at EVERY
+/// non-zero level and an encoder searching levels can build them once instead
+/// of re-walking the mode-info grid per candidate. Returns `None` when the
+/// frame is not in that regime; the caller then uses [`loop_filter_frame`].
+pub fn build_plane_masks(
+    ss_x: usize,
+    ss_y: usize,
+    mi_grid: &[ModeInfo],
+    mi_rows: usize,
+    mi_cols: usize,
+    h: &FrameHeader,
+) -> Option<PlaneMasks> {
+    uniform_level(h)?;
+    let lf = build_lf_info(h);
+    let mut sbs =
+        Vec::with_capacity(mi_rows.div_ceil(MI_BLOCK_SIZE) * mi_cols.div_ceil(MI_BLOCK_SIZE));
+    let mut mi_row = 0;
+    while mi_row < mi_rows {
+        let mut mi_col = 0;
+        while mi_col < mi_cols {
+            sbs.push(build_sb_masks(
+                ss_x, ss_y, &lf, mi_grid, mi_rows, mi_cols, mi_row, mi_col,
+            ));
+            mi_col += MI_BLOCK_SIZE;
+        }
+        mi_row += MI_BLOCK_SIZE;
+    }
+    Some(PlaneMasks { ss_x, ss_y, sbs })
+}
+
+/// Deblock one plane in place at `h`'s level using prebuilt masks — the same
+/// result as [`loop_filter_frame`] on that plane. Returns `false`, leaving the
+/// plane untouched, if `h` is not in the uniform-level regime the masks were
+/// built for (then call [`loop_filter_frame`]).
+pub fn loop_filter_plane_masked(
+    buf: &mut [u16],
+    stride: usize,
+    masks: &PlaneMasks,
+    mi_rows: usize,
+    mi_cols: usize,
+    h: &FrameHeader,
+) -> bool {
+    let Some(level) = uniform_level(h) else {
+        return false;
+    };
+    let lf = build_lf_info(h);
+    let bd = h.bit_depth.max(8) as i32;
+    let avx2 = lf_avx2();
+    // Every mask bit belongs to a block at the uniform level, so the per-8x8
+    // level map the masks were built with is this constant wherever it is read.
+    let lfl = [level; MI_BLOCK_SIZE * MI_BLOCK_SIZE];
+    let mut sb = masks.sbs.iter();
+    let mut mi_row = 0;
+    while mi_row < mi_rows {
+        let mut mi_col = 0;
+        while mi_col < mi_cols {
+            let Some(m) = sb.next() else {
+                return false; // masks built for a different frame geometry
+            };
+            let base_x = (mi_col * 8) >> masks.ss_x;
+            let base_y = (mi_row * 8) >> masks.ss_y;
+            apply_sb_masks(
+                buf, stride, base_x, base_y, masks.ss_y, &lf, m, &lfl, mi_rows, mi_row, mi_col, bd,
+                avx2,
+            );
+            mi_col += MI_BLOCK_SIZE;
+        }
+        mi_row += MI_BLOCK_SIZE;
+    }
+    true
 }

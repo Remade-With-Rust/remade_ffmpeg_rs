@@ -18,7 +18,9 @@ static GLOBAL_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: stage_profile <file.rgb> <w> <h> [reps]");
+    let path = args
+        .next()
+        .expect("usage: stage_profile <file.rgb> <w> <h> [reps]");
     let w: u16 = args.next().unwrap().parse().unwrap();
     let h: u16 = args.next().unwrap().parse().unwrap();
     let reps: usize = args.next().map(|r| r.parse().unwrap()).unwrap_or(3);
@@ -66,7 +68,10 @@ fn main() {
 
             // Stage 4: per-pixel palette mapping.
             let t = Instant::now();
-            let buffer: Vec<u8> = rgba.chunks_exact(4).map(|pix| nq.index_of(pix) as u8).collect();
+            let buffer: Vec<u8> = rgba
+                .chunks_exact(4)
+                .map(|pix| nq.index_of(pix) as u8)
+                .collect();
             let s4 = t.elapsed().as_secs_f64();
 
             let frame = Frame {
@@ -89,10 +94,15 @@ fn main() {
         drop(enc);
         let s5 = t.elapsed().as_secs_f64();
 
-        assert_eq!(out, oracle, "stage-assembled output diverged from library output");
+        assert_eq!(
+            out, oracle,
+            "stage-assembled output diverged from library output"
+        );
 
         for (b, v) in best.iter_mut().zip([s1, s2, s3, s4, s5]) {
-            if v < *b { *b = v; }
+            if v < *b {
+                *b = v;
+            }
         }
     }
 
@@ -109,7 +119,10 @@ fn main() {
     }
 
     let total: f64 = best.iter().sum();
-    let name = std::path::Path::new(&path).file_stem().unwrap().to_string_lossy();
+    let name = std::path::Path::new(&path)
+        .file_stem()
+        .unwrap()
+        .to_string_lossy();
     println!("{name}: {unique} unique colors / {} px", rgb.len() / 3);
     println!(
         "{name} {w}x{h} total {:.1} ms  (best-of-{reps}, oracle: byte-identical)",
@@ -119,6 +132,10 @@ fn main() {
         .iter()
         .zip(best)
     {
-        println!("  {label:<10} {:>8.1} ms  {:>5.1}%", v * 1e3, v / total * 100.0);
+        println!(
+            "  {label:<10} {:>8.1} ms  {:>5.1}%",
+            v * 1e3,
+            v / total * 100.0
+        );
     }
 }

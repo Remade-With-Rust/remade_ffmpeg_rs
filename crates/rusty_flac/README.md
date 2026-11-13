@@ -1,3 +1,9 @@
+### In The Wild with 321 Active Installs
+> **In the wild** — [RAG Converter](https://ragconverter.com) uses `rusty_flac` to decode the audio.
+> It makes personal and work files AI-readable without them leaving the machine:
+> the whole conversion runs as WebAssembly in the browser tab, with nothing
+> uploaded and nothing to install.
+
 # rusty_flac
 
 [![crates.io](https://img.shields.io/crates/v/rusty_flac?logo=rust)](https://crates.io/crates/rusty_flac)
@@ -8,7 +14,8 @@
 [![By Mata Network](https://img.shields.io/badge/by-Mata%20Network-5b2be0)](https://www.mata.network)
 
 > **rusty_flac** is a ground-up, pure-**Rust** FLAC **encoder and decoder**:
-> zero dependencies, no C, no FFI. It **encodes 17% faster and decodes 23%
+> no required dependencies, no C, no FFI, `no_std` + `alloc` ready. It
+> **encodes 17% faster and decodes 23%
 > faster than FFmpeg** while producing **smaller files on every benchmarked
 > content class** — and every stream is verified **losslessly interoperable in
 > both directions** (FFmpeg decodes ours bit-exact; we decode FFmpeg's
@@ -41,17 +48,17 @@ compression at the same time**, without giving up a byte of interoperability:
   round-trips bit-exact: FFmpeg decodes our streams to the exact source PCM,
   and we decode FFmpeg's streams to the exact source PCM. STREAMINFO carries
   the spec's MD5 signature, so `flac -t` verifies our output too.
-- **Zero dependencies.** No C, no FFI, no external crates — the bit I/O, CRCs,
+- **No required dependencies.** No C, no FFI — the bit I/O, CRCs,
   MD5, LPC analysis, Rice coding and all four stereo modes are in this crate.
-  `unsafe` exists only inside four AVX2 kernels (autocorrelation, Rice
-  parameter sums, fixed-order estimation, LPC residual), each runtime-detected
+  `unsafe` exists only inside four AVX2 kernels (integer autocorrelation,
+  Rice parameter sums, fixed-order estimation, LPC residual), each runtime-detected
   with a scalar twin kept as oracle and fallback, gated **bit-identical** by
   tests — on any other CPU you get the same bytes from safe Rust.
 
 | | FFmpeg flac (C) | **rusty_flac (Rust)** |
 |---|---|---|
 | C/C++ in the dependency tree | all of it | **none** |
-| Dependencies | libavcodec/libavutil | **zero** |
+| Dependencies | libavcodec/libavutil | **none required** (optional pure-Rust `libm` for `no_std`) |
 | Encode CPU (level 8) | 1.00× | **0.83× — 17.3% faster** |
 | Decode CPU | 1.00× | **0.77× — 22.7% faster** |
 | Output size, 20-combo gate matrix | baseline | **smaller on 20/20** |
@@ -98,6 +105,35 @@ realize runners-up when estimates are close (total size cost of all gating:
 tests; an unrolled MD5; a word-at-a-time bit reader with fused Rice reads; and
 pre-sized write-by-index decode buffers.</sub>
 
+### On a microcontroller (ESP32-S3, `no_std`)
+
+The same encoder runs on an ESP32-S3 (240 MHz Xtensa LX7, no f64 hardware)
+with `default-features = false, features = ["libm"]`. These are one-block
+16 kHz mono streams (4,096 samples) of fixed PCM, measured on a Seeed XIAO
+ESP32-S3:
+
+| | 0.1.3 | **0.2.0** |
+|---|---:|---:|
+| encode, level 0 | ~124 ms | **~15 ms** |
+| encode, level 8 | ~169 ms | **~20 ms** (loud content ~26 ms) |
+| peak heap, 8,192-sample stream | 193–209 KB | **124 KB** (140 KB worst case) |
+| faster than real time, 16 kHz mono | 2.4–4.3× | **10–17×** |
+
+<sub>The 0.1.3 row is the Janus team's microphone measurement; the 0.2.0 row
+comes from the retired-instruction and cycle counters over fixed PCM. Details
+and every step are in
+[`docs/plans/esp32-encoder-cost.md`](https://github.com/Remade-With-Rust/rusty_flac/blob/main/docs/plans/esp32-encoder-cost.md).</sub>
+
+What changed:
+- **The windows are a static table.** The full-block window is 5.7 KB of
+  Q15 in flash, so there is no per-stream cosine work.
+- **The LPC autocorrelation is exact integer arithmetic.** On a chip it was
+  57–78 % of the encode as soft-float calls; it is now native 32×32→64
+  multiplies, and the result is identical on every platform.
+- **The largest scratch buffers are shared** between analysis stages, and
+  sized to the signal.
+- **Chunked streams can reuse one encoder** with `Encoder::finish_and_reset`.
+
 ## What is this?
 
 `rusty_flac` encodes and decodes FLAC in pure Rust — the full subset in both
@@ -105,8 +141,9 @@ directions: FIXED and LPC prediction (orders to 12), all four stereo modes
 (independent, left/side, right/side, mid/side), **wasted-bits** detection,
 Rice and **Rice2** partitioned residuals with escape codes, 8/16/24-bit encode
 and 4–32-bit decode, up to 8 channels, CRC-8/CRC-16 verification, and the
-STREAMINFO MD5 audio signature. There is no C in the dependency tree — in
-fact there are **no dependencies at all**. It is a reimplementation of the
+STREAMINFO MD5 audio signature. There is no C in the dependency tree — the
+only dependency is optional and pure Rust (`libm`, for `no_std` builds). It
+is a reimplementation of the
 format, not a wrapper, and it is Apache-2.0: embed it in closed-source
 software with no copyleft obligations.
 
@@ -148,7 +185,9 @@ safer.
 FFmpeg, with the STREAMINFO MD5 signature `flac -t` checks):
 
 - **FIXED (orders 0–4) and LPC prediction (orders to 12)** with Levinson-
-  Durbin analysis over two Tukey apodization windows, libFLAC-style
+  Durbin analysis over two Tukey apodization windows (Q15 integer windows and
+  an exact integer autocorrelation, so every platform makes the same
+  decisions), libFLAC-style
   coefficient quantization with error feedback, and exact-arithmetic residuals
   the decoder inverts losslessly.
 - **All four stereo modes** — independent, left/side, right/side, mid/side —
@@ -167,6 +206,9 @@ FFmpeg, with the STREAMINFO MD5 signature `flac -t` checks):
   planar `i32` input, plus zero-copy-friendly `s16le`/`f32le` byte ingest.
 - **`EncodeStats`** wiring-audit counters on every decision path — a corpus
   run proves no path is silently dead and no fallback is silently hot.
+- **Chunked streams**: `Encoder::finish_and_reset` closes one complete stream
+  and starts the next on the same encoder, keeping its buffers and window
+  cache. The bytes are identical to a fresh encoder's.
 
 **Decoder** (validated sample-exact against claxon and FFmpeg on every gate
 clip, in-house and reference-encoded):
@@ -185,13 +227,15 @@ clip, in-house and reference-encoded):
 
 **Shared:**
 
-- **Zero dependencies, no C, no FFI.** Bit I/O, CRC-8/16, MD5 — all in-crate.
+- **No required dependencies, no C, no FFI.** Bit I/O, CRC-8/16, MD5 — all
+  in-crate. `no_std` + `alloc` with the optional pure-Rust `libm`.
 - **`unsafe` is confined to four AVX2 kernels**, each runtime-detected
   (`is_x86_feature_detected!`), each with a scalar twin kept as oracle and
-  fallback, each gated **bit-identical** by a dedicated test. Integer kernels
-  are exact by construction; the two float kernels are engineered to be exact
-  (deterministic reduction order; FMA only where every intermediate is an
-  integer below 2⁵³, range-guarded against the decoder's truncation).
+  fallback, each gated **bit-identical** by a dedicated test. Three are
+  integer kernels, exact by construction. The float one (the FMA LPC
+  residual) is engineered to be exact: FMA is used only where every
+  intermediate is an integer below 2⁵³, range-guarded against the decoder's
+  truncation.
 - Every speed brick landed **byte-identical** (verified against the previous
   binary) or, where the search space changed, size-gated on the corpus with
   the interop gates green.
@@ -206,7 +250,7 @@ or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-rusty_flac = "0.1"
+rusty_flac = "0.2"
 ```
 
 **Dropping it into `remade_ffmpeg`:** already done — `rff-codec-flac` in
@@ -250,6 +294,17 @@ let (flac, stats) = enc.finish_with_stats();
 println!("LPC {} / FIXED {} / mid-side {}", stats.sub_lpc, stats.sub_fixed, stats.stereo_mid_side);
 ```
 
+Chunked streams, one encoder reused (e.g. a device closing a file per second):
+
+```rust
+let mut enc = rusty_flac::Encoder::new(16_000, 1, 16).unwrap();
+for chunk in pcm_chunks {                 // &[u8] of s16le, one second each
+    enc.push_s16le_bytes(chunk).unwrap();
+    let flac = enc.finish_and_reset();    // a complete, standalone stream
+    send(flac);
+}
+```
+
 ## Architecture
 
 ```
@@ -262,10 +317,14 @@ src/
   bitio.rs    MSB-first accumulator bit writer + word-refill bit reader
   crc.rs      table-driven CRC-8 (0x07) and CRC-16 (0x8005)
   md5.rs      unrolled RFC 1321 MD5 for the STREAMINFO audio signature
+  window_table.rs  generated Q15 Tukey tapers for a full block
 tests/
-  gates.rs    the standing content-type gate matrix (two-decoder oracle)
+  gates.rs           the standing content-type gate matrix (two-decoder oracle)
+  stream_identity.rs pinned digest of the encoder's output over a matrix
+  peak_heap.rs       per-stream peak-heap ceilings (counting allocator)
 examples/
-  flacbench.rs  in-process encode/decode bench + stats (runs under rusty_alloc)
+  flacbench.rs    in-process encode/decode bench + stats (runs under rusty_alloc)
+  corpus_size.rs  compression gate over real WAV/FLAC files, lossless-checked
 ```
 
 ## Benchmarking & the gates
@@ -280,6 +339,12 @@ cargo test --release
 # (produce input with: ffmpeg -i in.wav -f s16le in.raw):
 cargo run --release --example flacbench -- in.raw 2 16 8 10
 RUSTY_FLAC_TIMING=1 cargo run --release --example flacbench -- in.raw 2 16 8 1
+
+# The chip's configuration on the host, including the peak-heap gate:
+cargo test --release --no-default-features --features libm
+
+# Compression gate over real audio (bytes per file and level, lossless-checked):
+cargo run --release --example corpus_size -- a.wav b.flac ...
 ```
 
 In the `remade_ffmpeg_rs` workspace, `tools/flac_gate.ps1` runs the FFmpeg
@@ -295,10 +360,32 @@ CPU-time harness that produced the N = 31 speed verdicts lives alongside it.
 | Windows | ✅ builds + tests |
 | Linux | ✅ builds + tests |
 | macOS | ✅ builds + tests |
+| `no_std` + `alloc` (`--no-default-features --features libm`) | ✅ checked on `riscv32imac-unknown-none-elf` and `thumbv7em-none-eabihf` in CI |
+| ESP32-S3 (`xtensa-esp32s3-none-elf`, esp-hal) | ✅ runs on hardware; output byte-identical to the host `libm` build |
 
 The AVX2 kernels are runtime-detected — no build flags, no `nasm`, no ISA
 floor. On any CPU without AVX2 (or any non-x86 target) the scalar twins run
 and produce the same bytes.
+
+### `no_std`
+
+```toml
+[dependencies]
+rusty_flac = { version = "0.2", default-features = false, features = ["libm"] }
+```
+
+The crate needs an allocator (`alloc`) — the encoder buffers the stream it is
+building — and nothing else. Without `std` there is no runtime AVX2 detection
+and no `RUSTY_FLAC_TIMING`; the encoder's scratch buffers are reused either
+way. The peak heap is gated in bytes per stream (`tests/peak_heap.rs`): about
+103 KB for a 4,096-sample 16-bit mono stream and 124 KB for 8,192 samples.
+
+The `libm` feature is what makes an encoder on a chip and an encoder on a host
+produce the **same bytes** for the same samples. The windows and the
+autocorrelation are already integer and platform-independent; `libm` routes
+the few remaining transcendentals (LPC quantisation, the order estimate)
+through the deterministic pure-Rust `libm` instead of the platform's. Build
+the host side with `--features libm` too when you want that guarantee.
 
 ## Roadmap
 
@@ -316,6 +403,8 @@ and produce the same bytes.
       directions; size-parity tolerance
 - [x] **Faster than FFmpeg on encode (0.83×) and decode (0.77×) with smaller
       output on 20/20 gate combos**
+- [x] **Microcontroller-ready encode**: integer autocorrelation, static windows,
+      byte-gated peak heap, `finish_and_reset` for chunked streams (0.2.0)
 - [ ] Streaming encode API (fixed-latency block push, bounded memory)
 - [ ] 32-bit encode (FLAC 1.4 extension; decode already handles it)
 - [ ] Seek-table and metadata (Vorbis comment / picture) blocks
@@ -326,7 +415,7 @@ and produce the same bytes.
 ## License
 
 Apache-2.0 — see [LICENSE](LICENSE). No GPL/LGPL anywhere in the dependency
-tree — there is no dependency tree.
+tree — the only (optional) dependency, `libm`, is MIT OR Apache-2.0.
 
 ## About Mata Network
 

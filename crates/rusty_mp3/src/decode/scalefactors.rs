@@ -6,8 +6,16 @@
 //! `scfsi` flags let granule 1 reuse granule 0's scalefactors per band group.
 //! Short blocks store three sets (one per window) and never share.
 
+// Parses untrusted bytes: narrowing casts are lint-enforced here (see the crate
+// lint policy in Cargo.toml) -- every one is masked, typed, or states its bound.
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 use crate::bitio::BitReader;
-use crate::frame::{BlockType, SideInfo};
+use crate::frame::{BlockType, GranuleSideInfo, SideInfo};
 use crate::header::{FrameHeader, MpegVersion};
 use crate::tables;
 
@@ -42,7 +50,7 @@ pub fn decode(
 
     if matches!(header.version, MpegVersion::V1) {
         let (slen1, slen2) = tables::SCALEFAC_COMPRESS_V1[gi.scalefac_compress as usize & 0xF];
-        let (s1, s2) = (slen1 as u32, slen2 as u32);
+        let (s1, s2) = (u32::from(slen1), u32::from(slen2));
 
         if gi.window_switching && gi.block_type == BlockType::Short {
             // Short scalefactors are stored band-major (each band's three windows
@@ -51,7 +59,7 @@ pub fn decode(
             let start = if gi.mixed_block {
                 // Mixed: long bands 0..8 (slen1), then short bands 3..12.
                 for b in 0..8 {
-                    sf.long[b] = r.read(s1) as u8;
+                    sf.long[b] = r.read_u8(s1);
                 }
                 3
             } else {
@@ -60,7 +68,7 @@ pub fn decode(
             for sfb in start..12 {
                 let slen = if sfb < 6 { s1 } else { s2 };
                 for window in 0..3 {
-                    sf.short[window][sfb] = r.read(slen) as u8;
+                    sf.short[window][sfb] = r.read_u8(slen);
                 }
             }
         } else {
@@ -71,7 +79,7 @@ pub fn decode(
                     if gr == 1 && si.scfsi[ch][g] {
                         sf.long[b] = prev.map_or(0, |p| p.long[b]);
                     } else {
-                        sf.long[b] = r.read(slen) as u8;
+                        sf.long[b] = r.read_u8(slen);
                     }
                 }
             }
@@ -96,17 +104,36 @@ pub fn decode(
         } else {
             0
         };
-        let (slen, nr) = tables::lsf_scale_params(gi.scalefac_compress, blocktype);
+        // The intensity-coded right channel reads its scalefactors (which double
+        // as panning positions) with its own scheme.
+        let (slen, nr) = if is_intensity_right(header, ch) {
+            tables::lsf_scale_params_intensity(gi.scalefac_compress, blocktype)
+        } else {
+            tables::lsf_scale_params(gi.scalefac_compress, blocktype)
+        };
         if is_short {
             // Groups fill (sfb, window) linearly, sfb-major (idx = 3·sfb + window) —
             // proven bit-identical to minimp3.
+            //
+            // MIXED (blocktype 2): the first 6 values are the LONG bands 0..6, and
+            // the short triplets then start at short band 3 (ISO 13818-3, and
+            // minimp3's mixed sfb table). Filling short bands from 0 here would put
+            // the long-part scalefactors on short bands 0..1 and shift every short
+            // band after them by two.
+            let long_vals = if gi.mixed_block { 6 } else { 0 };
+            let first_short = if gi.mixed_block { 3 } else { 0 };
             let mut idx = 0usize;
             for g in 0..4 {
                 for _ in 0..nr[g] {
-                    let v = r.read(slen[g] as u32) as u8;
-                    let (sfb, window) = (idx / 3, idx % 3);
-                    if sfb < crate::frame::SFB_SHORT {
-                        sf.short[window][sfb] = v;
+                    let v = r.read_u8(u32::from(slen[g]));
+                    if idx < long_vals {
+                        sf.long[idx] = v;
+                    } else {
+                        let j = idx - long_vals;
+                        let (sfb, window) = (first_short + j / 3, j % 3);
+                        if sfb < crate::frame::SFB_SHORT {
+                            sf.short[window][sfb] = v;
+                        }
                     }
                     idx += 1;
                 }
@@ -116,7 +143,7 @@ pub fn decode(
             let mut sfb = 0usize;
             for g in 0..4 {
                 for _ in 0..nr[g] {
-                    let v = r.read(slen[g] as u32) as u8;
+                    let v = r.read_u8(u32::from(slen[g]));
                     if sfb < crate::frame::SFB_LONG {
                         sf.long[sfb] = v;
                     }
@@ -130,7 +157,70 @@ pub fn decode(
     sf
 }
 
+/// Is this the intensity-coded right channel of an MPEG-2/2.5 joint-stereo pair?
+#[must_use]
+pub fn is_intensity_right(header: &FrameHeader, ch: usize) -> bool {
+    ch == 1
+        && !matches!(header.version, MpegVersion::V1)
+        && matches!(
+            header.channel_mode,
+            crate::frame::ChannelMode::JointStereo {
+                intensity_stereo: true,
+                ..
+            }
+        )
+}
+
+/// The ILLEGAL intensity position per band for the MPEG-2 right channel: the
+/// largest value its scalefactor field can hold, `2^slen - 1` (ISO 13818-3
+/// 2.4.3.2; minimp3 marks exactly this). A band read with `slen == 0` has no
+/// illegal value and reads 0xFF here. Laid out like [`ScaleFactors`], so the
+/// stereo stage can index it the same way it indexes the positions.
+#[must_use]
+pub fn lsf_intensity_illegal(gi: &GranuleSideInfo) -> ScaleFactors {
+    let is_short = gi.window_switching && gi.block_type == BlockType::Short;
+    let blocktype = match (is_short, gi.mixed_block) {
+        (false, _) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+    };
+    let (slen, nr) = tables::lsf_scale_params_intensity(gi.scalefac_compress, blocktype);
+    let mut out = ScaleFactors {
+        long: [0xFF; crate::frame::SFB_LONG],
+        short: [[0xFF; crate::frame::SFB_SHORT]; 3],
+    };
+    let (long_vals, first_short) = match blocktype {
+        0 => (usize::MAX, 0),
+        1 => (0, 0),
+        _ => (6, 3),
+    };
+    let mut idx = 0usize;
+    for g in 0..4 {
+        let max = if slen[g] == 0 {
+            0xFF
+        } else {
+            (((1u32 << slen[g]) - 1) & 0xFF) as u8
+        };
+        for _ in 0..nr[g] {
+            if idx < long_vals {
+                if idx < crate::frame::SFB_LONG {
+                    out.long[idx] = max;
+                }
+            } else {
+                let j = idx - long_vals;
+                let (sfb, w) = (first_short + j / 3, j % 3);
+                if sfb < crate::frame::SFB_SHORT {
+                    out.short[w][sfb] = max;
+                }
+            }
+            idx += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)] // test fixtures: small known values
 mod tests {
     use super::*;
     use crate::bitio::BitWriter;

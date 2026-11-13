@@ -14,7 +14,9 @@ static GLOBAL_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: encode_bench <file.rgb> <w> <h> <out.gif> [reps]");
+    let path = args
+        .next()
+        .expect("usage: encode_bench <file.rgb> <w> <h> <out.gif> [reps]");
     let w: u16 = args.next().unwrap().parse().unwrap();
     let h: u16 = args.next().unwrap().parse().unwrap();
     let out_path = args.next().expect("missing <out.gif>");
@@ -40,7 +42,14 @@ fn main() {
     }
     std::fs::write(&out_path, &out).unwrap();
 
-    let name = std::path::Path::new(&path).file_stem().unwrap().to_string_lossy();
+    let name = std::path::Path::new(&path)
+        .file_stem()
+        .unwrap()
+        .to_string_lossy();
     let policy = std::env::var("RUSTY_GIF_Q_POLICY").unwrap_or_else(|_| "default".into());
-    println!("{name} policy={policy} best {:.1} ms  bytes {}", best * 1e3, out.len());
+    println!(
+        "{name} policy={policy} best {:.1} ms  bytes {}",
+        best * 1e3,
+        out.len()
+    );
 }

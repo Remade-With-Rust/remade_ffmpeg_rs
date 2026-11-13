@@ -35,6 +35,28 @@ pub struct Motion {
     pub ref_lt: u8,
 }
 
+/// What the syntax established about one 4x4 block, in one 8-byte record.
+///
+/// `pred_mode` is `CuPredMode` (`PRED_*`, 0 = not decoded); `intra_mode` the
+/// luma intra prediction mode; `qp_y` is `QpY`; `ct_depth` the coding
+/// quadtree depth (the `split_cu_flag` context); `filter_bypass` says the
+/// loop filters must leave the samples alone (`pcm_loop_filter_disabled_flag
+/// && pcm_flag`, or `cu_transquant_bypass_flag`); `nz` says the luma
+/// transform block has coded coefficients.
+///
+/// `Default` is the not-yet-decoded record (`PRED_NONE`, no coefficients).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct Cell {
+    pub pred_mode: u8,
+    pub intra_mode: u8,
+    pub qp_y: i8,
+    pub ct_depth: u8,
+    pub filter_bypass: u8,
+    pub nz: u8,
+    pub _pad: [u8; 2],
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CtbFilterParams {
     pub deblock_disabled: bool,
@@ -85,22 +107,25 @@ pub struct PicState {
     pub ctb_done: Vec<bool>,
     /// Per CTB (raster): tile id. Shared for the same reason as [`zs`](Self::zs).
     pub tile_id: std::sync::Arc<[u32]>,
-    /// Per 4×4: `CuPredMode` (PRED_*).
-    pub pred_mode: Vec<u8>,
-    /// Per 4×4: luma intra prediction mode.
-    pub intra_mode: Vec<u8>,
-    /// Per 4×4: `QpY`.
-    pub qp_y: Vec<i8>,
-    /// Per 4×4: coding quadtree depth (split_cu_flag context).
-    pub ct_depth: Vec<u8>,
-    /// Per 4×4: bit0 = left edge is a TU edge, bit1 = top edge is a TU edge,
-    /// bit2 = left edge is a PU edge, bit3 = top edge is a PU edge.
-    pub edges: Vec<u8>,
-    /// Per 4×4: luma transform block has non-zero coefficients.
-    pub nz: Vec<u8>,
-    /// Per 4×4: samples must not be touched by the loop filters
-    /// (`pcm_loop_filter_disabled_flag && pcm_flag`, or `cu_transquant_bypass_flag`).
-    pub filter_bypass: Vec<u8>,
+    /// Per 4×4: the syntax record -- see [`Cell`]. One array where there
+    /// were six, so a coding unit fills it once rather than five times over
+    /// the same rectangle, and a reader that wants two facts about a block
+    /// loads one word.
+    pub cell: Vec<Cell>,
+    /// Any coding unit in the picture opted out of the loop filters
+    /// (`cu_transquant_bypass_flag`, or PCM with `pcm_loop_filter_disabled`).
+    /// Set as it is parsed, so the filters need not scan the map to learn it.
+    pub any_bypass: bool,
+    /// Per 4×4: deblocking boundary strength (§8.7.2.4) of the block's left
+    /// edge (`bs_v`) and top edge (`bs_h`); 0 = no edge or not filtered.
+    ///
+    /// Written during the PARSE, by the coding unit, prediction unit and
+    /// transform unit that own each edge, at the moment both sides are known.
+    /// It used to be an `edges` bitmap that a per-picture pass re-read for
+    /// every 4x4 block of the frame -- 57,600 at 720p -- to derive the same
+    /// strengths from the same maps; the producer knew the answer already.
+    pub bs_v: Vec<u8>,
+    pub bs_h: Vec<u8>,
     /// Per 4×4: motion.
     pub motion: Vec<Motion>,
     /// Per CTB: SAO parameters for Y, Cb, Cr.
@@ -230,31 +255,13 @@ impl PicState {
         self.slice_addr.fill(-1);
         self.ctb_slice.fill(0);
         self.ctb_done.fill(false);
-        self.pred_mode.fill(PRED_NONE);
-        // `intra_mode`, `qp_y`, `ct_depth` and `filter_bypass` are NOT reset.
-        //
-        // Every coding unit writes all four over its whole area -- `ct_depth`
-        // and `filter_bypass` before the skip test, `qp_y` from `set_cu_qp`,
-        // and `intra_mode` down all four CU shapes (skip, PCM, intra, inter) --
-        // and every 4x4 of a decoded coding tree block belongs to exactly one
-        // coding unit. Reads are guarded: neighbour queries go through §6.4.1
-        // availability, and the loop filters skip a block whose `slice_addr` is
-        // negative. So the fill was 230,400 bytes per picture of pure overwrite.
-        //
-        // That argument is TESTED, not asserted. Filling them with poison
-        // instead -- `ct_depth` 3 (desynchronises the split_cu_flag context),
-        // `filter_bypass` 1 (disables the loop filters), `intra_mode` 34 (a
-        // different angular direction), `qp_y` -26 (wrong dequantisation AND
-        // deblock strength) -- still decodes 147/147 with SEI 100/100. The
-        // control for that probe is `nz`, which is written only where a
-        // transform block has non-zero coefficients and so is genuinely not
-        // covered: poisoning it gives 19/147 and SEI 12/100. The probe has
-        // teeth, and these four maps are dead fills.
-        //
-        // The ones below stay for exactly that reason -- `nz` is sparse, and
-        // `motion` is not written at all by intra coding units.
-        self.edges.fill(0);
-        self.nz.fill(0);
+        // The record must read "not decoded" wherever no coding unit writes
+        // it (a lost slice), and every coding unit writes its whole area --
+        // including `nz = 0`, which used to need its own per-picture clear.
+        self.cell.fill(Cell::default());
+        self.any_bypass = false;
+        self.bs_v.fill(0);
+        self.bs_h.fill(0);
         self.motion.fill(Motion::default());
         self.sao.fill([SaoParams::default(); 3]);
         self.ctb_filter.fill(CtbFilterParams::default());
@@ -286,13 +293,10 @@ impl PicState {
             ctb_slice: vec![0; nctb],
             ctb_done: vec![false; nctb],
             tile_id,
-            pred_mode: vec![PRED_NONE; n4],
-            intra_mode: vec![1; n4],
-            qp_y: vec![0; n4],
-            ct_depth: vec![0; n4],
-            edges: vec![0; n4],
-            nz: vec![0; n4],
-            filter_bypass: vec![0; n4],
+            cell: vec![Cell::default(); n4],
+            any_bypass: false,
+            bs_v: vec![0; n4],
+            bs_h: vec![0; n4],
             motion: vec![Motion::default(); n4],
             sao: vec![[SaoParams::default(); 3]; nctb],
             ctb_filter: vec![CtbFilterParams::default(); nctb],
@@ -346,7 +350,7 @@ impl PicState {
         if self.slice_addr[cn] < 0 || self.slice_addr[cn] != a.slice || self.tile_id[cn] != a.tile {
             return None;
         }
-        if self.pred_mode[i] == PRED_NONE {
+        if self.cell[i].pred_mode == PRED_NONE {
             return None;
         }
         Some(i)
@@ -367,13 +371,29 @@ impl PicState {
             return false;
         }
         // Decoded at all (a lost slice leaves PRED_NONE).
-        self.pred_mode[i] != PRED_NONE
+        self.cell[i].pred_mode != PRED_NONE
     }
 
     /// §6.4.1: is the luma location (xn, yn) available for the block at (xc, yc)?
     #[inline]
     pub fn available(&self, xc: i32, yc: i32, xn: i32, yn: i32) -> bool {
         self.avail_n(&self.avail_at(xc, yc), xn, yn)
+    }
+
+    /// Writes one field of every record in a rectangle (luma sample units).
+    ///
+    /// For the facts that arrive after the coding unit's own fill: the intra
+    /// mode of each prediction block, the QP after a `cu_qp_delta`, a PCM
+    /// block's filter bypass, a transform block's `nz`.
+    pub fn fill4_with<T: Copy>(map: &mut [T], w4: usize, x: usize, y: usize, w: usize, h: usize, f: impl Fn(&mut T)) {
+        let (x0, y0) = (x >> 2, y >> 2);
+        let (x1, y1) = ((x + w).div_ceil(4), (y + h).div_ceil(4));
+        for yy in y0..y1 {
+            let r = yy * w4;
+            for c in &mut map[r + x0..r + x1] {
+                f(c);
+            }
+        }
     }
 
     /// Fills a rectangle (luma sample units) of a per-4×4 map.

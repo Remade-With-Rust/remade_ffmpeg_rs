@@ -1,0 +1,67 @@
+
+# cargo-vet audits file
+
+[audits]
+
+[[trusted.proc-macro2]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-03-01"
+end = "2027-10-04"
+notes = "Rust ecosystem maintainer; trusted by mozilla and bytecode-alliance (imported). thiserror and its proc-macro closure (syn/quote/proc-macro2/unicode-ident) are pulled in by rff-core."
+
+[[trusted.quote]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-03-01"
+end = "2027-10-04"
+notes = "Rust ecosystem maintainer; trusted by mozilla and bytecode-alliance (imported). thiserror and its proc-macro closure (syn/quote/proc-macro2/unicode-ident) are pulled in by rff-core."
+
+[[trusted.rff-codec]]
+criteria = "safe-to-deploy"
+user-id = 427321 # farmer_timmm (Ttimmahlax)
+start = "2026-07-01"
+end = "2027-10-04"
+notes = "First-party: published by the crates.io owner of rff-codec-mp3 itself (Remade-With-Rust / Mata Network)."
+
+[[trusted.rff-core]]
+criteria = "safe-to-deploy"
+user-id = 427321 # farmer_timmm (Ttimmahlax)
+start = "2026-07-01"
+end = "2027-10-04"
+notes = "First-party: published by the crates.io owner of rff-codec-mp3 itself (Remade-With-Rust / Mata Network)."
+
+[[trusted.rusty_mp3]]
+criteria = "safe-to-deploy"
+user-id = 427321 # farmer_timmm (Ttimmahlax)
+start = "2026-07-01"
+end = "2027-10-04"
+notes = "First-party: published by the crates.io owner of rff-codec-mp3 itself (Remade-With-Rust / Mata Network)."
+
+[[trusted.syn]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-03-01"
+end = "2027-10-04"
+notes = "Rust ecosystem maintainer; trusted by mozilla and bytecode-alliance (imported). thiserror and its proc-macro closure (syn/quote/proc-macro2/unicode-ident) are pulled in by rff-core."
+
+[[trusted.thiserror]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-03-01"
+end = "2027-10-04"
+notes = "Rust ecosystem maintainer; trusted by mozilla and bytecode-alliance (imported). thiserror and its proc-macro closure (syn/quote/proc-macro2/unicode-ident) are pulled in by rff-core."
+
+[[trusted.thiserror-impl]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-03-01"
+end = "2027-10-04"
+notes = "Rust ecosystem maintainer; trusted by mozilla and bytecode-alliance (imported). thiserror and its proc-macro closure (syn/quote/proc-macro2/unicode-ident) are pulled in by rff-core."
+
+[[trusted.unicode-ident]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-03-01"
+end = "2027-10-04"
+notes = "Rust ecosystem maintainer; trusted by mozilla and bytecode-alliance (imported). thiserror and its proc-macro closure (syn/quote/proc-macro2/unicode-ident) are pulled in by rff-core."

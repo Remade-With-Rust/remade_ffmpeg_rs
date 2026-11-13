@@ -1,16 +1,22 @@
 [package]
 name = "rusty_aac"
-version = "0.5.0"
+version = "2.0.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 authors = ["Mata Network <https://www.mata.network>"]
 homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
-description = "Pure-Rust AAC-LC decoder + encoder, no C/FFI. ~5x faster than FFmpeg's native AAC encoder and beats it on mono music at 128k+ (PEAQ-measured). Level-invariant transient detection, joint stereo rate loop, ADTS/MP4/LATM-LOAS, 5.1 layouts, HE-AAC signalling."
+description = "Pure-Rust AAC decoder (LC, Main, LTP, HE-AAC v1/v2 SBR+PS, ER LD/ELD; sample-exact vs FFmpeg on the ISO conformance suite) and AAC-LC encoder (~5x faster than FFmpeg's native encoder, PEAQ-measured). No C/FFI. ADTS/MP4/LATM-LOAS, 7.1 + PCE layouts."
 readme = "README.md"
 keywords = ["aac", "audio", "codec", "decoder", "encoder"]
 categories = ["multimedia::audio", "multimedia::encoding"]
 rust-version = "1.85"
+
+# `supply-chain/` (the cargo-vet store for this crate's CI gate) is not part of
+# the published crate: shipping it made every imports refresh change the
+# package, so release-plz cut a new version, which the gate then had to vet
+# again -- a release loop.
+exclude = ["supply-chain/"]
 
 [features]
 default = ["simd"]
@@ -18,8 +24,10 @@ simd = []
 simd-avx512 = ["simd"]
 # The quality lab: deterministic corpus + NMR metric + bitrate-ladder runner.
 # Dev/analysis only — it is the verdict instrument for the Great Gate campaign
-# (`docs/codec-aac-great-gate.md`), not part of the shipped codec surface.
+# (`docs/finished/codec-aac-great-gate.md`), not part of the shipped codec surface.
 lab = []
+# Stage profiler + SIMD-arm census (`src/prof.rs`). Measurement only; zero cost off.
+profile = []
 
 [dependencies]
 
@@ -49,3 +57,75 @@ required-features = ["lab"]
 [[example]]
 name = "aacenc"
 required-features = ["lab"]
+
+[[example]]
+name = "aacprof"
+required-features = ["profile", "lab"]
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Codec semantics -- applying these would change output:
+# `a * b + c` -> `mul_add` is a fused multiply-add: ONE rounding where the scalar
+# oracles, the SIMD twins and the reference decoders round twice. Bit-exactness
+# (ISO census 81 EXACT vs FFmpeg, SIMD == scalar) depends on NOT doing it.
+suboptimal_flops = "allow"
+imprecise_flops = "allow"
+# ISO/IEC 14496-3 tables (and FFmpeg's decoder tables the census is bit-exact against) are transcribed with the standard's digits;
+# the stored value is the nearest f32 either way, and the literal stays auditable
+# against the spec.
+excessive_precision = "allow"
+unreadable_literal = "allow"
+# Exact float equality IS the contract in the oracle and bit-exactness tests.
+float_cmp = "allow"
+float_cmp_const = "allow"
+# Integer -> float conversion in DSP formulas is the intended float semantics
+# (sample counts, table indices and levels are far below 2^24).
+cast_precision_loss = "allow"
+# Spec notation: the ISO pseudo-code's single-letter names (x, y, s, k, n...)
+# and index loops are kept so the code reads against the standard; the index
+# loops are also performance-pinned (the Ir ledgers in the commit history).
+many_single_char_names = "allow"
+similar_names = "allow"
+needless_range_loop = "allow"
+# Narrowing casts: the DSP and the encoder are built on values bounded by
+# construction (bit widths, table sizes, sample counts), so these are allowed
+# crate-wide. The modules that parse UNTRUSTED bytes re-enable all three with
+# `#![warn(...)]` and narrow only through masked/typed helpers or a
+# statement-level allow that states the bound (H-17).
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+# API promises not adopted: making a public fn `const` is a semver commitment.
+missing_const_for_fn = "allow"
+# Style-only, nursery: long first doc paragraphs carry the measurement history
+# that justifies each design decision.
+too_long_first_doc_paragraph = "allow"
+# Style-only: the frame/granule pipelines are written top to bottom against the
+# standard's section order; splitting them to a line budget obscures that.
+too_many_lines = "allow"
+# Nursery, with known false positives: its own `--fix` produced a use-after-move
+# in this crate (2026-10-04). Clones are reviewed by hand instead.
+redundant_clone = "allow"
+# Every `#[inline(always)]` in the crate is an instruction-count-measured
+# decision (callgrind ledgers in the commit history); removing one has been
+# measured to cost, never to help.
+inline_always = "allow"
+# Config and state structs mirror the bitstream's own flag fields
+# (ISO/IEC 14496-3 syntax) and the encoder's public tool switches; an enum per
+# flag would obscure the spec mapping.
+struct_excessive_bools = "allow"
+# Every pointer cast it flags feeds an UNALIGNED intrinsic (`loadu`/`storeu`,
+# `vld1q`/`vst1q`), which has no alignment requirement.
+cast_ptr_alignment = "allow"
+# Style-only: branches are ordered as in the ISO pseudo-code (and common case
+# first), and lookup `match`es transcribe the standard's tables one row per arm;
+# reordering or merging them would obscure the spec mapping.
+if_not_else = "allow"
+match_same_arms = "allow"
+# Style-only, nursery: `let x; if c { x = .. } else { x = .. }` is kept where it
+# mirrors the spec's conditional assignments.
+useless_let_if_seq = "allow"
+# Style-only, nursery: `match`/`if let` reads more plainly than `map_or_else`
+# closures, and in the hot paths a closure can hide the branch from review.
+option_if_let_else = "allow"

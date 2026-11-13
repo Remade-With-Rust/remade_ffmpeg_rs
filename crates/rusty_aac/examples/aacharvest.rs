@@ -77,7 +77,9 @@ fn arm_config(arm: &str, bitrate: u32) -> AacEncoderConfig {
 /// Stable, name-keyed train/holdout split (great-gate §4 rule 4: the branch fit
 /// and every leaf fit must share ONE split, and it must not move between rungs).
 fn split_of(name: &str) -> &'static str {
-    let h = name.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+    let h = name
+        .bytes()
+        .fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(b)));
     if h % 2 == 0 {
         "train"
     } else {
@@ -91,7 +93,8 @@ fn measure_quality(sig: &corpus::Signal, cfg: AacEncoderConfig) -> (u64, Vec<f32
     let adts = ladder::encode_adts_with(sig, cfg);
     let (evals, _bands) = work::take();
     let decoded = ladder::decode_mono(&adts);
-    let per_frame = rusty_aac::lab::quality::per_frame_audible(&sig.mono(), &decoded, sig.sample_rate);
+    let per_frame =
+        rusty_aac::lab::quality::per_frame_audible(&sig.mono(), &decoded, sig.sample_rate);
     (evals, per_frame)
 }
 
@@ -107,13 +110,15 @@ fn main() {
     let arm = args
         .windows(2)
         .find(|w| w[0] == "--arm")
-        .map(|w| w[1].clone())
-        .unwrap_or_else(|| "a2".to_string());
-    let bitrates: Vec<u32> = args
-        .windows(2)
-        .find(|w| w[0] == "--bitrates")
-        .map(|w| w[1].split(',').filter_map(|s| s.trim().parse().ok()).collect())
-        .unwrap_or_else(|| vec![64_000, 96_000, 128_000]);
+        .map_or_else(|| "a2".to_string(), |w| w[1].clone());
+    let bitrates: Vec<u32> = args.windows(2).find(|w| w[0] == "--bitrates").map_or_else(
+        || vec![64_000, 96_000, 128_000],
+        |w| {
+            w[1].split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect()
+        },
+    );
 
     // ---- method line, to stderr so it never contaminates the CSV -------------
     eprintln!("# aacharvest method line (codec-measurement)");
@@ -151,7 +156,11 @@ fn main() {
     let (w2, _) = measure_quality(&probe, cfg0);
     eprintln!(
         "#   WORK NULL      : {w1} vs {w2} -> {}",
-        if w1 == w2 { "DETERMINISTIC" } else { "NON-DETERMINISTIC (counter void)" }
+        if w1 == w2 {
+            "DETERMINISTIC"
+        } else {
+            "NON-DETERMINISTIC (counter void)"
+        }
     );
     eprintln!("#");
 
@@ -162,7 +171,7 @@ fn main() {
 
     for sig in corpus::corpus() {
         let planes = sig.planes();
-        let refs: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
+        let refs: Vec<&[f32]> = planes.iter().map(std::vec::Vec::as_slice).collect();
         let signals = AacSignals::analyze(&refs, sig.sample_rate);
         let split = split_of(sig.name());
 
@@ -213,7 +222,7 @@ fn main() {
                     split,
                     dwork,
                     dms,
-                    if fs.shipped_transient { 1 } else { 0 },
+                    i32::from(fs.shipped_transient),
                     b / 1000,
                     fs.tonality_mean,
                     fs.attack_max,

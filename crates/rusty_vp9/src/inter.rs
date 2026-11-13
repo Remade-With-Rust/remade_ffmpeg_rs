@@ -132,6 +132,419 @@ impl RefPlane<'_> {
     }
 }
 
+// ---- block-level 8-tap kernels ------------------------------------------------
+//
+// `conv8_avx2` filters ONE row per call. Motion compensation called it once per
+// output row (and once per row of the 2-D intermediate): about 26 calls a block,
+// each rebuilding its four tap-pair broadcasts and its constants, and each
+// producing only 8 samples per 256-bit step because the tap pairs were formed
+// by unpacking eight separate row loads into i32 lanes.
+//
+// These kernels take the whole block. The constants are built once, and the
+// arithmetic is arranged so a 256-bit step yields SIXTEEN samples:
+//
+//  * horizontal: `pmaddwd` of an unaligned load at `s + k` against the pair
+//    `(f[k], f[k+1])` is, per i32 lane `j`, taps `k, k+1` of output `2j`. Four
+//    loads (k = 0, 2, 4, 6) give the eight EVEN outputs with no shuffle at all;
+//    the same four from `s + 1` give the eight ODD ones. `even | odd << 16`
+//    interleaves them (each is already clamped to 16 bits).
+//  * vertical: `unpacklo/hi` of rows `k, k+1` puts the tap pair of every column
+//    side by side; four of each give outputs 0-3/8-11 and 4-7/12-15, which
+//    `packusdw` returns to column order.
+//
+// Same products, same exact i32 sums, same `(x + 64) >> 7`, same clamp and the
+// same averaging as `conv8_avx2`, so the output is bit-identical (pinned by
+// `conv8_block_matches_rowwise`). Columns left over (4-wide blocks) go through
+// `conv8_avx2` itself.
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn tap_pairs(f: &[i32; 8]) -> [std::arch::x86_64::__m256i; 4] {
+    use std::arch::x86_64::*;
+    [
+        _mm256_set1_epi32((f[1] << 16) | (f[0] & 0xffff)),
+        _mm256_set1_epi32((f[3] << 16) | (f[2] & 0xffff)),
+        _mm256_set1_epi32((f[5] << 16) | (f[4] & 0xffff)),
+        _mm256_set1_epi32((f[7] << 16) | (f[6] & 0xffff)),
+    ]
+}
+
+/// `clamp((acc + 64) >> 7, 0, max)` per i32 lane.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn fin256(
+    acc: std::arch::x86_64::__m256i,
+    maxv: std::arch::x86_64::__m256i,
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    let v = _mm256_srai_epi32::<7>(_mm256_add_epi32(acc, _mm256_set1_epi32(64)));
+    _mm256_min_epi32(_mm256_max_epi32(v, _mm256_setzero_si256()), maxv)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn fin128(
+    acc: std::arch::x86_64::__m128i,
+    maxv: std::arch::x86_64::__m128i,
+) -> std::arch::x86_64::__m128i {
+    use std::arch::x86_64::*;
+    let v = _mm_srai_epi32::<7>(_mm_add_epi32(acc, _mm_set1_epi32(64)));
+    _mm_min_epi32(_mm_max_epi32(v, _mm_setzero_si128()), maxv)
+}
+
+/// Taps of the eight outputs `0, 2, .., 14` relative to `s` (i32 lanes).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn h_taps256(
+    s: *const u16,
+    p: &[std::arch::x86_64::__m256i; 4],
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    _mm256_add_epi32(
+        _mm256_add_epi32(
+            _mm256_madd_epi16(_mm256_loadu_si256(s as *const __m256i), p[0]),
+            _mm256_madd_epi16(_mm256_loadu_si256(s.add(2) as *const __m256i), p[1]),
+        ),
+        _mm256_add_epi32(
+            _mm256_madd_epi16(_mm256_loadu_si256(s.add(4) as *const __m256i), p[2]),
+            _mm256_madd_epi16(_mm256_loadu_si256(s.add(6) as *const __m256i), p[3]),
+        ),
+    )
+}
+
+/// Taps of the four outputs `0, 2, 4, 6` relative to `s` (i32 lanes).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn h_taps128(
+    s: *const u16,
+    p: &[std::arch::x86_64::__m256i; 4],
+) -> std::arch::x86_64::__m128i {
+    use std::arch::x86_64::*;
+    // (No closure here: a closure inside a `target_feature` fn does not inherit
+    // the feature, and the AVX cast would become a call.)
+    let (q0, q1) = (_mm256_castsi256_si128(p[0]), _mm256_castsi256_si128(p[1]));
+    let (q2, q3) = (_mm256_castsi256_si128(p[2]), _mm256_castsi256_si128(p[3]));
+    _mm_add_epi32(
+        _mm_add_epi32(
+            _mm_madd_epi16(_mm_loadu_si128(s as *const __m128i), q0),
+            _mm_madd_epi16(_mm_loadu_si128(s.add(2) as *const __m128i), q1),
+        ),
+        _mm_add_epi32(
+            _mm_madd_epi16(_mm_loadu_si128(s.add(4) as *const __m128i), q2),
+            _mm_madd_epi16(_mm_loadu_si128(s.add(6) as *const __m128i), q3),
+        ),
+    )
+}
+
+/// Horizontal 8-tap over a `w x h` block. `src` points at the first tap of the
+/// first output (column `bx - 3`).
+///
+/// # Safety
+/// AVX2 required. Readable: rows `0..h` of `src` at `src_stride`, `w + 7`
+/// samples each. Writable (and readable when `avg`): rows `0..h` of `dst` at
+/// `dst_stride`, `w` samples each.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn conv8_h_block_avx2(
+    src: *const u16,
+    src_stride: usize,
+    f: &[i32; 8],
+    dst: *mut u16,
+    dst_stride: usize,
+    w: usize,
+    h: usize,
+    max: i32,
+    avg: bool,
+) {
+    use std::arch::x86_64::*;
+    if w < 8 {
+        // 4-wide blocks have no wide step to take: go straight to the row kernel
+        // rather than build this one's constants for nothing.
+        for y in 0..h {
+            conv8_avx2(
+                src.add(y * src_stride),
+                1,
+                f,
+                dst.add(y * dst_stride),
+                w,
+                max,
+                avg,
+            );
+        }
+        return;
+    }
+    let p = tap_pairs(f);
+    let maxv = _mm256_set1_epi32(max);
+    let one = _mm256_set1_epi32(1);
+    let lo16 = _mm256_set1_epi32(0xffff);
+    for y in 0..h {
+        let (s, d) = (src.add(y * src_stride), dst.add(y * dst_stride));
+        let mut x = 0;
+        while x + 16 <= w {
+            let mut e = fin256(h_taps256(s.add(x), &p), maxv);
+            let mut o = fin256(h_taps256(s.add(x + 1), &p), maxv);
+            if avg {
+                // Compound: `(pred + dst + 1) >> 1` against what is in `dst`.
+                let dv = _mm256_loadu_si256(d.add(x) as *const __m256i);
+                let de = _mm256_and_si256(dv, lo16);
+                let dod = _mm256_srli_epi32::<16>(dv);
+                e = _mm256_srai_epi32::<1>(_mm256_add_epi32(_mm256_add_epi32(e, de), one));
+                o = _mm256_srai_epi32::<1>(_mm256_add_epi32(_mm256_add_epi32(o, dod), one));
+            }
+            _mm256_storeu_si256(
+                d.add(x) as *mut __m256i,
+                _mm256_or_si256(e, _mm256_slli_epi32::<16>(o)),
+            );
+            x += 16;
+        }
+        if x + 8 <= w {
+            let mx = _mm256_castsi256_si128(maxv);
+            let mut e = fin128(h_taps128(s.add(x), &p), mx);
+            let mut o = fin128(h_taps128(s.add(x + 1), &p), mx);
+            if avg {
+                let dv = _mm_loadu_si128(d.add(x) as *const __m128i);
+                let de = _mm_and_si128(dv, _mm256_castsi256_si128(lo16));
+                let dod = _mm_srli_epi32::<16>(dv);
+                let o1 = _mm256_castsi256_si128(one);
+                e = _mm_srai_epi32::<1>(_mm_add_epi32(_mm_add_epi32(e, de), o1));
+                o = _mm_srai_epi32::<1>(_mm_add_epi32(_mm_add_epi32(o, dod), o1));
+            }
+            _mm_storeu_si128(
+                d.add(x) as *mut __m128i,
+                _mm_or_si128(e, _mm_slli_epi32::<16>(o)),
+            );
+            x += 8;
+        }
+        if x < w {
+            conv8_avx2(s.add(x), 1, f, d.add(x), w - x, max, avg);
+        }
+    }
+}
+
+/// Vertical 8-tap over a `w x h` block. `src` points at the first tap row of
+/// the first output row (row `by - 3`).
+///
+/// # Safety
+/// AVX2 required. Readable: rows `0..h + 7` of `src` at `src_stride`, `w`
+/// samples each. Writable (and readable when `avg`): rows `0..h` of `dst` at
+/// `dst_stride`, `w` samples each.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn conv8_v_block_avx2(
+    src: *const u16,
+    src_stride: usize,
+    f: &[i32; 8],
+    dst: *mut u16,
+    dst_stride: usize,
+    w: usize,
+    h: usize,
+    max: i32,
+    avg: bool,
+) {
+    use std::arch::x86_64::*;
+    if w < 16 {
+        // No 16-wide step to take (the row kernel already does 8 and 4).
+        for y in 0..h {
+            let s = src.add(y * src_stride);
+            conv8_avx2(s, src_stride, f, dst.add(y * dst_stride), w, max, avg);
+        }
+        return;
+    }
+    let p = tap_pairs(f);
+    let maxv = _mm256_set1_epi32(max);
+    let one = _mm256_set1_epi32(1);
+    let zero = _mm256_setzero_si256();
+    // Column strips of 16, rows inside. Output row `y` needs the tap pairs of
+    // source rows (y, y+1), (y+2, y+3), (y+4, y+5), (y+6, y+7). Row `y + 2`
+    // needs three of those same four again, so the unpacked pairs are kept in
+    // a ring of eight (pair `k` = rows `k, k+1`, slot `k & 7`): each output row
+    // then costs ONE row load and two unpacks instead of eight and eight.
+    let mut x = 0;
+    while x + 16 <= w {
+        let c = src.add(x);
+        let mut lo = [zero; 8];
+        let mut hi = [zero; 8];
+        let mut prev = _mm256_loadu_si256(c as *const __m256i);
+        for k in 0..7 {
+            let cur = _mm256_loadu_si256(c.add((k + 1) * src_stride) as *const __m256i);
+            lo[k] = _mm256_unpacklo_epi16(prev, cur);
+            hi[k] = _mm256_unpackhi_epi16(prev, cur);
+            prev = cur;
+        }
+        for y in 0..h {
+            let (k0, k2, k4, k6) = (y & 7, (y + 2) & 7, (y + 4) & 7, (y + 6) & 7);
+            let l = _mm256_add_epi32(
+                _mm256_add_epi32(
+                    _mm256_madd_epi16(lo[k0], p[0]),
+                    _mm256_madd_epi16(lo[k2], p[1]),
+                ),
+                _mm256_add_epi32(
+                    _mm256_madd_epi16(lo[k4], p[2]),
+                    _mm256_madd_epi16(lo[k6], p[3]),
+                ),
+            );
+            let hh = _mm256_add_epi32(
+                _mm256_add_epi32(
+                    _mm256_madd_epi16(hi[k0], p[0]),
+                    _mm256_madd_epi16(hi[k2], p[1]),
+                ),
+                _mm256_add_epi32(
+                    _mm256_madd_epi16(hi[k4], p[2]),
+                    _mm256_madd_epi16(hi[k6], p[3]),
+                ),
+            );
+            let (mut l, mut hh) = (fin256(l, maxv), fin256(hh, maxv));
+            let d = dst.add(y * dst_stride + x);
+            if avg {
+                let dv = _mm256_loadu_si256(d as *const __m256i);
+                let (dl, dh) = (
+                    _mm256_unpacklo_epi16(dv, zero),
+                    _mm256_unpackhi_epi16(dv, zero),
+                );
+                l = _mm256_srai_epi32::<1>(_mm256_add_epi32(_mm256_add_epi32(l, dl), one));
+                hh = _mm256_srai_epi32::<1>(_mm256_add_epi32(_mm256_add_epi32(hh, dh), one));
+            }
+            _mm256_storeu_si256(d as *mut __m256i, _mm256_packus_epi32(l, hh));
+            if y + 1 < h {
+                // Pair (y + 7, y + 8) takes the ring's one free slot; pair `y`
+                // is dead after this row and its slot is the next one freed.
+                let k7 = (y + 7) & 7;
+                let cur = _mm256_loadu_si256(c.add((y + 8) * src_stride) as *const __m256i);
+                lo[k7] = _mm256_unpacklo_epi16(prev, cur);
+                hi[k7] = _mm256_unpackhi_epi16(prev, cur);
+                prev = cur;
+            }
+        }
+        x += 16;
+    }
+    if x < w {
+        for y in 0..h {
+            let s = src.add(y * src_stride + x);
+            conv8_avx2(
+                s,
+                src_stride,
+                f,
+                dst.add(y * dst_stride + x),
+                w - x,
+                max,
+                avg,
+            );
+        }
+    }
+}
+
+/// Full-pel prediction: copy a `w x h` block of samples.
+///
+/// The block widths motion compensation uses are 4, 8, 16, 32 and 64, so each
+/// row is one to four fixed-width vector moves. As `copy_nonoverlapping(.., w)`
+/// with a runtime `w` it was a real `memcpy` call per row (1.7M of them on a
+/// 60-frame 720p decode).
+///
+/// # Safety
+/// AVX2 required. Rows `0..h` of `src` (at `ss`) readable and of `dst` (at
+/// `ds`) writable for `w` samples each; the two blocks do not overlap.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_block_avx2(
+    src: *const u16,
+    ss: usize,
+    dst: *mut u16,
+    ds: usize,
+    w: usize,
+    h: usize,
+) {
+    use std::arch::x86_64::*;
+    match w {
+        4 => {
+            for y in 0..h {
+                let v = (src.add(y * ss) as *const u64).read_unaligned();
+                (dst.add(y * ds) as *mut u64).write_unaligned(v);
+            }
+        }
+        8 => {
+            for y in 0..h {
+                let v = _mm_loadu_si128(src.add(y * ss) as *const __m128i);
+                _mm_storeu_si128(dst.add(y * ds) as *mut __m128i, v);
+            }
+        }
+        16 | 32 | 64 => {
+            for y in 0..h {
+                let (s, d) = (src.add(y * ss), dst.add(y * ds));
+                let mut x = 0;
+                while x < w {
+                    let v = _mm256_loadu_si256(s.add(x) as *const __m256i);
+                    _mm256_storeu_si256(d.add(x) as *mut __m256i, v);
+                    x += 16;
+                }
+            }
+        }
+        _ => {
+            for y in 0..h {
+                std::ptr::copy_nonoverlapping(src.add(y * ss), dst.add(y * ds), w);
+            }
+        }
+    }
+}
+
+/// Fill tile cells `rows x cols` (tile stride `ts`) with the edge-replicated
+/// reference samples `refp.px(x0 + tx, y0 + ty)`.
+///
+/// The replication clamp is separable, so the columns are split ONCE into
+/// `[left of the plane | inside it | right of it]` and each row is one clamp of
+/// `y` plus a fill, a copy and a fill. The per-sample form clamped both
+/// coordinates and bounds-checked a load for every cell — `(w + 7) * (h + 7)`
+/// of them, 225 for an 8x8 block.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn gather_tile(
+    refp: &RefPlane,
+    x0: i32,
+    y0: i32,
+    tile: &mut [u16],
+    ts: usize,
+    cols: std::ops::Range<usize>,
+    rows: std::ops::Range<usize>,
+) {
+    let (w, h) = (refp.w, refp.h);
+    let n = cols.len();
+    if n == 0 {
+        return;
+    }
+    // Degenerate planes (malformed streams) keep the defensive per-sample fetch.
+    if w < 1 || h < 1 || refp.buf.len() < (h as usize - 1) * refp.stride + w as usize {
+        for ty in rows {
+            for tx in cols.clone() {
+                tile[ty * ts + tx] = refp.px(x0 + tx as i32, y0 + ty as i32) as u16;
+            }
+        }
+        return;
+    }
+    let w = w as usize;
+    let xs = x0 + cols.start as i32; // plane x of the first cell
+    let left = (-xs).clamp(0, n as i32) as usize; // cells with x < 0
+    let right = (xs + n as i32 - w as i32).clamp(0, n as i32) as usize; // cells with x >= w
+    let mid = n - left - right;
+    let mid_src = if mid > 0 {
+        (xs + left as i32) as usize
+    } else {
+        0
+    };
+    for ty in rows {
+        let sy = (y0 + ty as i32).clamp(0, h - 1) as usize;
+        let s_row = &refp.buf[sy * refp.stride..][..w];
+        let t_row = &mut tile[ty * ts + cols.start..][..n];
+        t_row[..left].fill(s_row[0]);
+        t_row[left..left + mid].copy_from_slice(&s_row[mid_src..mid_src + mid]);
+        t_row[left + mid..].fill(s_row[w - 1]);
+    }
+}
+
 /// A/B switch for the clamped-tile edge path (DEFAULT ON; set to disable).
 #[cfg(target_arch = "x86_64")]
 fn no_edge_tile() -> bool {
@@ -525,6 +938,47 @@ pub unsafe fn sad8x8_u8(s: *const u8, ss: usize, r: *const u8, rs: usize) -> u32
     (_mm_cvtsi128_si64(acc) as u32) + (_mm_extract_epi64::<1>(acc) as u32)
 }
 
+/// Sampled-tile SAD of a whole block in the u8 planes: 8x8 tiles at
+/// `(tx * 8, ty * 8)` for `tx`/`ty` stepping by `step`, with the caller's
+/// early-out (`i64::MAX` once the running sum is strictly over `bound`).
+///
+/// The tile loop lives INSIDE the `target_feature` function so `sad8x8_u8`
+/// inlines into it; called per tile from ordinary code it is a real call each
+/// time.
+///
+/// # Safety
+/// AVX2 present; every sampled tile is readable in both planes, i.e. `s` and
+/// `r` cover `tiles_h * 8` rows of `tiles_w * 8` bytes at their strides.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn sad_tiles_u8(
+    s: *const u8,
+    ss: usize,
+    r: *const u8,
+    rs: usize,
+    tiles_w: usize,
+    tiles_h: usize,
+    step: usize,
+    bound: i64,
+) -> i64 {
+    let mut sad = 0i64;
+    let mut ty = 0;
+    while ty < tiles_h {
+        let (s_row, r_row) = (s.add(ty * 8 * ss), r.add(ty * 8 * rs));
+        let mut tx = 0;
+        while tx < tiles_w {
+            sad += sad8x8_u8(s_row.add(tx * 8), ss, r_row.add(tx * 8), rs) as i64;
+            if sad > bound {
+                return i64::MAX;
+            }
+            tx += step;
+        }
+        ty += step;
+    }
+    sad
+}
+
 #[cfg(target_arch = "x86_64")]
 mod u8score {
     // 16-lane pmaddubsw kernels: two 8-px rows per ymm (one per 128-lane).
@@ -856,6 +1310,152 @@ mod u8score {
         }
         sad
     }
+
+    // ---- 4x4 twins (the sub-8x8 search) ---------------------------------------
+    //
+    // Same `step2` arithmetic as the 8x8 kernels, so the bit-exactness proof at
+    // the top of this module carries over unchanged: each step still produces 8
+    // columns per row, and only the first 4 are scored.
+
+    /// Four 4-byte source rows packed into one xmm (row `y` in dword `y`).
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn rows4(p: *const u8, stride: usize) -> __m128i {
+        _mm_setr_epi32(
+            std::ptr::read_unaligned(p as *const i32),
+            std::ptr::read_unaligned(p.add(stride) as *const i32),
+            std::ptr::read_unaligned(p.add(2 * stride) as *const i32),
+            std::ptr::read_unaligned(p.add(3 * stride) as *const i32),
+        )
+    }
+
+    /// The first 4 columns of the two rows a `step2` returns (row A in bytes
+    /// 0..8, row B in 8..16), as bytes 0..8 of the result.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn low4x2(two: __m128i) -> __m128i {
+        _mm_shuffle_epi32::<0b00_00_10_00>(two)
+    }
+
+    /// SAD of a packed 4x4 prediction (rows 0,1 from `t01`, rows 2,3 from `t23`)
+    /// against a packed 4x4 source.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn sad4x4(t01: __m128i, t23: __m128i, src16: __m128i) -> u32 {
+        let pred = _mm_unpacklo_epi64(low4x2(t01), low4x2(t23));
+        let d = _mm_sad_epu8(pred, src16);
+        (_mm_cvtsi128_si32(d) as u32) + (_mm_extract_epi32::<2>(d) as u32)
+    }
+
+    /// Integer-MV 4x4 score: one `psadbw` over the packed block.
+    ///
+    /// # Safety
+    /// AVX2; (bx, by)..(bx+4, by+4) inside the plane; `src` covers 4 rows of 4.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn score4_copy(
+        refp: &RefPlane8,
+        bx: i32,
+        by: i32,
+        src: *const u8,
+        src_stride: usize,
+    ) -> u32 {
+        let r = refp
+            .buf
+            .as_ptr()
+            .add(by as usize * refp.stride + bx as usize);
+        let d = _mm_sad_epu8(rows4(r, refp.stride), rows4(src, src_stride));
+        (_mm_cvtsi128_si32(d) as u32) + (_mm_extract_epi32::<2>(d) as u32)
+    }
+
+    /// Fused horizontal-only 4x4 score.
+    ///
+    /// # Safety
+    /// AVX2; (bx-3, by)..(bx+13, by+4) inside the plane; `src` covers 4 rows of 4.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn score4_h(
+        refp: &RefPlane8,
+        bx: i32,
+        by: i32,
+        fx: &[i32; 8],
+        src: *const u8,
+        src_stride: usize,
+    ) -> u32 {
+        let tx = tp(fx);
+        let base = refp.buf.as_ptr();
+        let row = |r: i32| base.add((by + r) as usize * refp.stride + (bx - 3) as usize);
+        let t01 = step2(hwin2(row(0), row(1)), &tx);
+        let t23 = step2(hwin2(row(2), row(3)), &tx);
+        sad4x4(t01, t23, rows4(src, src_stride))
+    }
+
+    /// Fused vertical-only 4x4 score: 11 row loads, pair-interleaves shared
+    /// across the output rows.
+    ///
+    /// # Safety
+    /// AVX2; (bx, by-3)..(bx+8, by+8) inside the plane; `src` covers 4 rows of 4.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn score4_v(
+        refp: &RefPlane8,
+        bx: i32,
+        by: i32,
+        fy: &[i32; 8],
+        src: *const u8,
+        src_stride: usize,
+    ) -> u32 {
+        let ty = tp(fy);
+        let base = refp.buf.as_ptr();
+        let row = |r: i32| {
+            _mm_loadl_epi64(
+                base.add((by + r) as usize * refp.stride + bx as usize) as *const __m128i
+            )
+        };
+        let rows: [__m128i; 11] = std::array::from_fn(|j| row(j as i32 - 3));
+        let inter: [__m128i; 10] = std::array::from_fn(|j| _mm_unpacklo_epi8(rows[j], rows[j + 1]));
+        let m0: [__m256i; 4] =
+            std::array::from_fn(|k| _mm256_set_m128i(inter[1 + 2 * k], inter[2 * k]));
+        let m2: [__m256i; 4] =
+            std::array::from_fn(|k| _mm256_set_m128i(inter[3 + 2 * k], inter[2 + 2 * k]));
+        sad4x4(step2(m0, &ty), step2(m2, &ty), rows4(src, src_stride))
+    }
+
+    /// Fused two-pass 4x4 score.
+    ///
+    /// # Safety
+    /// AVX2; (bx-3, by-3)..(bx+13, by+8) inside the plane; `src` covers 4 rows of 4.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn score4_hv(
+        refp: &RefPlane8,
+        bx: i32,
+        by: i32,
+        fx: &[i32; 8],
+        fy: &[i32; 8],
+        src: *const u8,
+        src_stride: usize,
+    ) -> u32 {
+        let tx = tp(fx);
+        let ty = tp(fy);
+        let base = refp.buf.as_ptr();
+        let row = |r: i32| base.add((by + r) as usize * refp.stride + (bx - 3) as usize);
+        // Horizontal pass into 11 u8 rows (2 per step; the last row is doubled).
+        let mut tmp = [0u8; 16 * 6];
+        for i in 0..5 {
+            let two = step2(hwin2(row(2 * i as i32 - 3), row(2 * i as i32 - 2)), &tx);
+            _mm_storeu_si128(tmp.as_mut_ptr().add(16 * i) as *mut __m128i, two);
+        }
+        let last = step2(hwin2(row(7), row(7)), &tx);
+        _mm_storeu_si128(tmp.as_mut_ptr().add(16 * 5) as *mut __m128i, last);
+        // Vertical pass over rows 0..=10 of `tmp` (8 bytes each).
+        let inter: [__m128i; 10] = std::array::from_fn(|j| {
+            let a = _mm_loadl_epi64(tmp.as_ptr().add(8 * j) as *const __m128i);
+            let b = _mm_loadl_epi64(tmp.as_ptr().add(8 * (j + 1)) as *const __m128i);
+            _mm_unpacklo_epi8(a, b)
+        });
+        let m0: [__m256i; 4] =
+            std::array::from_fn(|k| _mm256_set_m128i(inter[1 + 2 * k], inter[2 * k]));
+        let m2: [__m256i; 4] =
+            std::array::from_fn(|k| _mm256_set_m128i(inter[3 + 2 * k], inter[2 + 2 * k]));
+        sad4x4(step2(m0, &ty), step2(m2, &ty), rows4(src, src_stride))
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1156,6 +1756,49 @@ pub unsafe fn subpel_score8x8_u8(
     }
 }
 
+/// Whether the reference window a [`subpel_score4x4_u8`] call reads lies inside
+/// a `w x h` plane. The horizontal kernels read one 16-byte window per row
+/// (columns `bx-3 .. bx+13`), the vertical-only kernel 8-byte rows.
+#[inline]
+pub fn score4x4_window_ok(w: i32, h: i32, bx: i32, by: i32, subx: bool, suby: bool) -> bool {
+    let (nl, nr) = match (subx, suby) {
+        (true, _) => (3, 13),
+        (false, true) => (0, 8),
+        (false, false) => (0, 4),
+    };
+    let (nt, nb) = if suby { (3, 8) } else { (0, 4) };
+    bx - nl >= 0 && bx + nr <= w && by - nt >= 0 && by + nb <= h
+}
+
+/// Fused u8 4x4 subpel SCORE (interpolate + SAD, no pred store) for the
+/// sub-8x8 motion search — bit-identical to `predict_block`(u16) + a 4x4 SAD
+/// for 8-bit content (pinned by `score4x4_u8_matches_u16_path`).
+///
+/// # Safety
+/// AVX2 present; [`score4x4_window_ok`] holds for these arguments; `src` covers
+/// 4 rows of 4 bytes at `src_stride`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn subpel_score4x4_u8(
+    refp: &RefPlane8,
+    bx: i32,
+    by: i32,
+    subpel_x: usize,
+    subpel_y: usize,
+    filter: usize,
+    src: *const u8,
+    src_stride: usize,
+) -> u32 {
+    let fx = &SUBPEL_FILTERS[filter][subpel_x];
+    let fy = &SUBPEL_FILTERS[filter][subpel_y];
+    match (subpel_x != 0, subpel_y != 0) {
+        (false, false) => u8score::score4_copy(refp, bx, by, src, src_stride),
+        (true, false) => u8score::score4_h(refp, bx, by, fx, src, src_stride),
+        (false, true) => u8score::score4_v(refp, bx, by, fy, src, src_stride),
+        (true, true) => u8score::score4_hv(refp, bx, by, fx, fy, src, src_stride),
+    }
+}
+
 /// Fused u8 8×8 subpel SQUARED ERROR (interpolate + SSE, no pred store) for the
 /// mode-shortlist `pred_sse` — bit-identical to `predict_block`(u16) + Σ(s−p)²
 /// for 8-bit content. Same window contract as [`subpel_score8x8_u8`].
@@ -1244,14 +1887,13 @@ unsafe fn predict_block_avx2(
     let dptr = dst.as_mut_ptr();
     match (subx, suby) {
         (false, false) => {
-            for y in 0..h {
-                let s = buf.add((by as usize + y) * stride + bx as usize);
-                let d = dptr.add(y * dst_stride);
-                if avg {
-                    avg8_avx2(s, d, w);
-                } else {
-                    std::ptr::copy_nonoverlapping(s, d, w);
+            let s0 = buf.add(by as usize * stride + bx as usize);
+            if avg {
+                for y in 0..h {
+                    avg8_avx2(s0.add(y * stride), dptr.add(y * dst_stride), w);
                 }
+            } else {
+                copy_block_avx2(s0, stride, dptr, dst_stride, w, h);
             }
         }
         (true, false) => {
@@ -1259,20 +1901,34 @@ unsafe fn predict_block_avx2(
                 predict8x8_h_avx2(refp, bx, by, fx, dptr, dst_stride, max);
                 return;
             }
-            for y in 0..h {
-                let s = buf.add((by as usize + y) * stride + (bx - 3) as usize);
-                conv8_avx2(s, 1, fx, dptr.add(y * dst_stride), w, max, avg);
-            }
+            conv8_h_block_avx2(
+                buf.add(by as usize * stride + (bx - 3) as usize),
+                stride,
+                fx,
+                dptr,
+                dst_stride,
+                w,
+                h,
+                max,
+                avg,
+            );
         }
         (false, true) => {
             if w == 8 && h == 8 && !avg {
                 predict8x8_v_avx2(refp, bx, by, fy, dptr, dst_stride, max);
                 return;
             }
-            for y in 0..h {
-                let s = buf.add((by + y as i32 - 3) as usize * stride + bx as usize);
-                conv8_avx2(s, stride, fy, dptr.add(y * dst_stride), w, max, avg);
-            }
+            conv8_v_block_avx2(
+                buf.add((by - 3) as usize * stride + bx as usize),
+                stride,
+                fy,
+                dptr,
+                dst_stride,
+                w,
+                h,
+                max,
+                avg,
+            );
         }
         (true, true) => {
             if w == 8 && h == 8 && !avg {
@@ -1287,21 +1943,18 @@ unsafe fn predict_block_avx2(
                 let tptr = tmp.as_mut_ptr();
                 // Intermediate horizontal pass is never averaged (avg only the
                 // final write into dst).
-                for r in 0..tmp_h {
-                    let s = buf.add((by + r as i32 - 3) as usize * stride + (bx - 3) as usize);
-                    conv8_avx2(s, 1, fx, tptr.add(r * w), w, max, false);
-                }
-                for y in 0..h {
-                    conv8_avx2(
-                        tptr.add(y * w) as *const u16,
-                        w,
-                        fy,
-                        dptr.add(y * dst_stride),
-                        w,
-                        max,
-                        avg,
-                    );
-                }
+                conv8_h_block_avx2(
+                    buf.add((by - 3) as usize * stride + (bx - 3) as usize),
+                    stride,
+                    fx,
+                    tptr,
+                    w,
+                    w,
+                    tmp_h,
+                    max,
+                    false,
+                );
+                conv8_v_block_avx2(tptr as *const u16, w, fy, dptr, dst_stride, w, h, max, avg);
             });
         }
     }
@@ -1542,13 +2195,14 @@ pub fn predict_block(
             let (tw, th) = (w + 7, h + 7);
             return TILE.with(|cell| {
                 let mut tile = cell.borrow_mut();
-                for ty in 0..th {
-                    let sy = by - 3 + ty as i32;
-                    let row = ty * TS;
-                    for tx in 0..tw {
-                        tile[row + tx] = refp.px(bx - 3 + tx as i32, sy) as u16;
-                    }
-                }
+                // Gather only what the filter will read. The block sits at (3, 3);
+                // a direction with no sub-pel phase is a plain copy with no tap
+                // reach, so its 7 extra columns / rows are never touched. (They
+                // keep whatever an earlier call left there, exactly as the cells
+                // past `tw`/`th` always have.)
+                let cols = if subx { 0..tw } else { 3..3 + w };
+                let rows = if suby { 0..th } else { 3..3 + h };
+                gather_tile(refp, bx - 3, by - 3, &mut tile[..], TS, cols, rows);
                 let tref = RefPlane {
                     buf: &tile[..],
                     stride: TS,
@@ -2331,6 +2985,314 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The block-level horizontal kernel must equal one `conv8_avx2` call per row,
+    /// bit for bit: every width mix (16-, 8- and 4-wide steps), with and without
+    /// compound averaging, at 8/10/12-bit, with samples at both extremes.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn conv8_h_block_matches_rowwise() {
+        if !has_avx2() {
+            return;
+        }
+        let mut s = 0x1357_9bdf_2468_ace0u64;
+        let mut xs = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for &max in &[255i32, 1023, 4095] {
+            for &w in &[4usize, 8, 12, 16, 20, 24, 28, 32, 64] {
+                for &h in &[1usize, 4, 8, 13] {
+                    for avg in [false, true] {
+                        for filter in 0..4usize {
+                            let phase = 1 + (xs() % 15) as usize;
+                            let f = &SUBPEL_FILTERS[filter][phase];
+                            let (ss, ds) = (w + 7 + 3, w + 5);
+                            let src: Vec<u16> = (0..ss * h + 16)
+                                .map(|i| match i % 53 {
+                                    0 => max as u16,
+                                    1 => 0,
+                                    _ => (xs() % (max as u64 + 1)) as u16,
+                                })
+                                .collect();
+                            let init: Vec<u16> = (0..ds * h + 16)
+                                .map(|_| (xs() % (max as u64 + 1)) as u16)
+                                .collect();
+                            let (mut want, mut got) = (init.clone(), init.clone());
+                            // SAFETY: AVX2 checked; the buffers are sized for the
+                            // rows and tap reach each call reads and writes.
+                            unsafe {
+                                for y in 0..h {
+                                    conv8_avx2(
+                                        src.as_ptr().add(y * ss),
+                                        1,
+                                        f,
+                                        want.as_mut_ptr().add(y * ds),
+                                        w,
+                                        max,
+                                        avg,
+                                    );
+                                }
+                                conv8_h_block_avx2(
+                                    src.as_ptr(),
+                                    ss,
+                                    f,
+                                    got.as_mut_ptr(),
+                                    ds,
+                                    w,
+                                    h,
+                                    max,
+                                    avg,
+                                );
+                            }
+                            assert_eq!(
+                                got, want,
+                                "h w={w} h={h} avg={avg} max={max} filter={filter} phase={phase}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The block-level vertical kernel must equal one `conv8_avx2` call per row,
+    /// bit for bit: every width mix (16-, 8- and 4-wide steps), with and without
+    /// compound averaging, at 8/10/12-bit, with samples at both extremes.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn conv8_v_block_matches_rowwise() {
+        if !has_avx2() {
+            return;
+        }
+        let mut s = 0x0f1e_2d3c_4b5a_6978u64;
+        let mut xs = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for &max in &[255i32, 1023, 4095] {
+            for &w in &[4usize, 8, 12, 16, 20, 24, 28, 32, 64] {
+                for &h in &[1usize, 4, 8, 13] {
+                    for avg in [false, true] {
+                        for filter in 0..4usize {
+                            let phase = 1 + (xs() % 15) as usize;
+                            let f = &SUBPEL_FILTERS[filter][phase];
+                            let (ss, ds) = (w + 3, w + 5);
+                            let src: Vec<u16> = (0..ss * (h + 7) + 16)
+                                .map(|i| match i % 53 {
+                                    0 => max as u16,
+                                    1 => 0,
+                                    _ => (xs() % (max as u64 + 1)) as u16,
+                                })
+                                .collect();
+                            let init: Vec<u16> = (0..ds * h + 16)
+                                .map(|_| (xs() % (max as u64 + 1)) as u16)
+                                .collect();
+                            let (mut want, mut got) = (init.clone(), init.clone());
+                            // SAFETY: AVX2 checked; the buffers are sized for the
+                            // rows and tap reach each call reads and writes.
+                            unsafe {
+                                for y in 0..h {
+                                    conv8_avx2(
+                                        src.as_ptr().add(y * ss),
+                                        ss,
+                                        f,
+                                        want.as_mut_ptr().add(y * ds),
+                                        w,
+                                        max,
+                                        avg,
+                                    );
+                                }
+                                conv8_v_block_avx2(
+                                    src.as_ptr(),
+                                    ss,
+                                    f,
+                                    got.as_mut_ptr(),
+                                    ds,
+                                    w,
+                                    h,
+                                    max,
+                                    avg,
+                                );
+                            }
+                            assert_eq!(
+                                got, want,
+                                "v w={w} h={h} avg={avg} max={max} filter={filter} phase={phase}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The row-wise tile gather equals the per-sample `px` fetch for windows
+    /// hanging off every side of the plane, wholly outside it, and for a plane
+    /// narrower than the window.
+    #[test]
+    fn gather_tile_matches_px() {
+        let mut s = 0x7777_1234_abcd_0001u64;
+        for &(pw, ph, stride) in &[(20i32, 12i32, 23usize), (3, 2, 3), (1, 1, 1), (9, 30, 16)] {
+            let buf: Vec<u16> = (0..stride * ph as usize)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (s % 1024) as u16
+                })
+                .collect();
+            let refp = RefPlane {
+                buf: &buf,
+                stride,
+                w: pw,
+                h: ph,
+            };
+            const TS: usize = 24;
+            for &(x0, y0) in &[
+                (-5i32, -4i32),
+                (0, 0),
+                (pw - 6, ph - 3),
+                (-30, 2),
+                (pw + 9, -1),
+                (2, ph + 5),
+                (-2, -2),
+            ] {
+                for &(c0, c1, r0, r1) in &[
+                    (0usize, 15usize, 0usize, 11usize),
+                    (3, 11, 3, 7),
+                    (0, 15, 3, 7),
+                    (3, 11, 0, 11),
+                    (5, 5, 0, 4),
+                ] {
+                    let mut want = vec![0xBEEFu16; TS * 12];
+                    let mut got = want.clone();
+                    for ty in r0..r1 {
+                        for tx in c0..c1 {
+                            want[ty * TS + tx] = refp.px(x0 + tx as i32, y0 + ty as i32) as u16;
+                        }
+                    }
+                    gather_tile(&refp, x0, y0, &mut got, TS, c0..c1, r0..r1);
+                    assert_eq!(
+                        got, want,
+                        "plane {pw}x{ph} origin ({x0},{y0}) cols {c0}..{c1} rows {r0}..{r1}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fused u8 4x4 scorer must equal the u16 reference path (`predict_block`
+    /// + SAD) exactly, for every filter and every (subpel_x, subpel_y) phase
+    /// pair, at positions that sweep the whole legal window including its edges.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn score4x4_u8_matches_u16_path() {
+        if !has_avx2() {
+            return;
+        }
+        let mut s = 0x0440_2026_1112_bbbbu64;
+        let mut xs = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let (pw, ph, stride) = (40i32, 36i32, 44usize);
+        let refbuf16: Vec<u16> = (0..stride * ph as usize)
+            .map(|i| match i % 97 {
+                0 => 255,
+                1 => 0,
+                _ => (xs() % 256) as u16,
+            })
+            .collect();
+        let refbuf8: Vec<u8> = refbuf16.iter().map(|&v| v as u8).collect();
+        let srcbuf16: Vec<u16> = (0..stride * ph as usize)
+            .map(|_| (xs() % 256) as u16)
+            .collect();
+        let srcbuf8: Vec<u8> = srcbuf16.iter().map(|&v| v as u8).collect();
+        let refp16 = RefPlane {
+            buf: &refbuf16,
+            stride,
+            w: pw,
+            h: ph,
+        };
+        let refp8 = RefPlane8 {
+            buf: &refbuf8,
+            stride,
+            w: pw,
+            h: ph,
+        };
+        let mut checked = 0u32;
+        for filter in 0..4usize {
+            for px in 0..16usize {
+                for py in 0..16usize {
+                    for trial in 0..6 {
+                        // Corners of the legal window first, then random interior.
+                        let (subx, suby) = (px != 0, py != 0);
+                        let (x0, x1) = if subx {
+                            (3, pw - 13)
+                        } else if suby {
+                            (0, pw - 8)
+                        } else {
+                            (0, pw - 4)
+                        };
+                        let (y0, y1) = if suby { (3, ph - 8) } else { (0, ph - 4) };
+                        let (bx, by) = match trial {
+                            0 => (x0, y0),
+                            1 => (x1, y1),
+                            2 => (x0, y1),
+                            3 => (x1, y0),
+                            _ => (
+                                x0 + (xs() % (x1 - x0 + 1) as u64) as i32,
+                                y0 + (xs() % (y1 - y0 + 1) as u64) as i32,
+                            ),
+                        };
+                        assert!(score4x4_window_ok(pw, ph, bx, by, subx, suby));
+                        let (sx, sy) = ((xs() % 36) as usize, (xs() % 32) as usize);
+                        let mut pred = [0u16; 16];
+                        predict_block(
+                            &refp16, bx, by, px, py, filter, &mut pred, 4, 4, 4, false, 255,
+                        );
+                        let mut want = 0u32;
+                        for y in 0..4usize {
+                            for x in 0..4usize {
+                                let sv = srcbuf16[(sy + y) * stride + sx + x] as i32;
+                                want += (sv - pred[y * 4 + x] as i32).unsigned_abs();
+                            }
+                        }
+                        // SAFETY: AVX2 checked; window asserted in bounds; the
+                        // source block lies inside `srcbuf8`.
+                        let got = unsafe {
+                            subpel_score4x4_u8(
+                                &refp8,
+                                bx,
+                                by,
+                                px,
+                                py,
+                                filter,
+                                srcbuf8.as_ptr().add(sy * stride + sx),
+                                stride,
+                            )
+                        };
+                        assert_eq!(got, want, "filter={filter} px={px} py={py} bx={bx} by={by}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 4 * 16 * 16 * 6);
+        // One step outside each edge of the window is rejected.
+        assert!(!score4x4_window_ok(pw, ph, 2, 3, true, true));
+        assert!(!score4x4_window_ok(pw, ph, pw - 12, 3, true, true));
+        assert!(!score4x4_window_ok(pw, ph, 3, 2, true, true));
+        assert!(!score4x4_window_ok(pw, ph, 3, ph - 7, true, true));
+        assert!(!score4x4_window_ok(pw, ph, pw - 3, 0, false, false));
+        assert!(!score4x4_window_ok(pw, ph, pw - 7, 3, false, true));
     }
 
     /// The u8 fused score kernels must equal the u16 path (scalar predict_block

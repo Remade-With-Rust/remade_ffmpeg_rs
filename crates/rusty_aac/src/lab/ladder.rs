@@ -13,7 +13,7 @@
 
 use super::corpus::{self, Class, Signal};
 use super::quality::{track_nmr, NmrReport};
-use crate::{AacEncoder, AacEncoderConfig, AacDecoder, AdtsHeader};
+use crate::{AacDecoder, AacEncoder, AacEncoderConfig, AdtsHeader};
 
 /// The default operating points — four, per the corpus law. Chosen to straddle
 /// the region where AAC tools change sign: 64k (where PNS/intensity earn their
@@ -35,13 +35,15 @@ impl Point {
     /// How far the rate loop landed from its target, as a ratio. A rung that
     /// changes this materially has changed the operating point, and its quality
     /// delta is not a like-for-like comparison.
+    #[must_use]
     pub fn rate_error(&self) -> f64 {
-        self.measured_bps / self.target_bps.max(1) as f64 - 1.0
+        self.measured_bps / f64::from(self.target_bps.max(1)) - 1.0
     }
 }
 
 /// Encode one corpus signal to an ADTS elementary stream at `bitrate`, using the
 /// default (arm 0) encoder configuration.
+#[must_use]
 pub fn encode_adts(sig: &Signal, bitrate: u32) -> Vec<u8> {
     encode_adts_with(
         sig,
@@ -54,6 +56,12 @@ pub fn encode_adts(sig: &Signal, bitrate: u32) -> Vec<u8> {
 
 /// Encode with an explicit configuration — how a rung's routed arm is measured
 /// against arm 0 on identical content.
+///
+/// # Panics
+///
+/// If the signal's channel count or rate is not encodable (lab signals always
+/// are).
+#[must_use]
 pub fn encode_adts_with(sig: &Signal, config: AacEncoderConfig) -> Vec<u8> {
     let mut enc = AacEncoder::new(config);
     enc.push_pcm(&sig.pcm, sig.channels, sig.sample_rate)
@@ -75,14 +83,14 @@ pub fn encode_adts_with(sig: &Signal, config: AacEncoderConfig) -> Vec<u8> {
 }
 
 /// Decode an ADTS stream and return channel 0 as mono.
+#[must_use]
 pub fn decode_mono(adts: &[u8]) -> Vec<f32> {
     let mut dec = AacDecoder::new();
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos + 7 <= adts.len() {
-        let hdr = match crate::parse_adts(&adts[pos..]) {
-            Ok(h) => h,
-            Err(_) => break,
+        let Ok(hdr) = crate::parse_adts(&adts[pos..]) else {
+            break;
         };
         let end = (pos + hdr.frame_length).min(adts.len());
         if let Ok(audio) = dec.decode(&adts[pos..end], None) {
@@ -98,6 +106,7 @@ pub fn decode_mono(adts: &[u8]) -> Vec<f32> {
 }
 
 /// Score one (clip, bitrate) cell with arm 0.
+#[must_use]
 pub fn point(sig: &Signal, bitrate: u32) -> Point {
     point_with(
         sig,
@@ -109,11 +118,12 @@ pub fn point(sig: &Signal, bitrate: u32) -> Point {
 }
 
 /// Score one (clip, bitrate) cell under an explicit configuration.
+#[must_use]
 pub fn point_with(sig: &Signal, config: AacEncoderConfig) -> Point {
     let bitrate = config.bitrate_bps;
     let adts = encode_adts_with(sig, config);
     let decoded = decode_mono(&adts);
-    let secs = sig.frames() as f64 / sig.sample_rate as f64;
+    let secs = sig.frames() as f64 / f64::from(sig.sample_rate);
     let measured_bps = (adts.len() * 8) as f64 / secs.max(1e-9);
     let nmr = track_nmr(&sig.mono(), &decoded, sig.sample_rate);
     Point {
@@ -125,6 +135,7 @@ pub fn point_with(sig: &Signal, config: AacEncoderConfig) -> Point {
 }
 
 /// Run the full corpus × bitrate ladder.
+#[must_use]
 pub fn run(bitrates: &[u32]) -> Vec<Point> {
     let mut pts = Vec::new();
     for sig in corpus::corpus() {
@@ -145,6 +156,7 @@ pub struct NullArm {
 }
 
 impl NullArm {
+    #[must_use]
     pub fn is_clean(&self) -> bool {
         self.divergent.is_empty()
     }
@@ -157,6 +169,7 @@ impl NullArm {
 ///
 /// This is `codec-measurement`'s null arm in its strictest available form: for a
 /// deterministic encoder the null is byte-identity, not "a small delta."
+#[must_use]
 pub fn null_arm(bitrates: &[u32]) -> NullArm {
     let mut identical = 0usize;
     let mut divergent = Vec::new();
@@ -246,7 +259,7 @@ mod tests {
             for &b in &DEFAULT_BITRATES {
                 let p = point(&sig, b);
                 assert!(
-                    p.measured_bps <= b as f64 * 1.15,
+                    p.measured_bps <= f64::from(b) * 1.15,
                     "{} @ {}k: overshot to {:.0} bps",
                     sig.name(),
                     b / 1000,

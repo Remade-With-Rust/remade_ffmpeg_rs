@@ -135,7 +135,9 @@ impl Muxer for Av2fMuxer {
             )));
         }
         if s.width == 0 || s.height == 0 {
-            return Err(Error::invalid("av2f mux: stream is missing image dimensions"));
+            return Err(Error::invalid(
+                "av2f mux: stream is missing image dimensions",
+            ));
         }
         self.width = s.width;
         self.height = s.height;
@@ -237,7 +239,8 @@ mod tests {
         s.width = 16;
         s.height = 16;
         mux.write_header(&[s]).unwrap();
-        mux.write_packet(&Packet::from_data(0, vec![1, 2, 3])).unwrap();
+        mux.write_packet(&Packet::from_data(0, vec![1, 2, 3]))
+            .unwrap();
         assert!(
             mux.write_packet(&Packet::from_data(0, vec![4, 5])).is_err(),
             "a second packet must fail loudly, not be dropped"

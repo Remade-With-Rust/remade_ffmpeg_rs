@@ -1,6 +1,6 @@
 [package]
 name = "rff-codec-vorbis"
-description = "Remade FFmpeg (Rust): Vorbis codec adapter — lewton-backed decoder + the pure-Rust rusty_vorbis encoder (no C/FFI)."
+description = "Remade FFmpeg (Rust): Vorbis codec adapter — the pure-Rust rusty_vorbis decoder and encoder (no C/FFI)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ rust-version.workspace = true
 authors.workspace = true
 homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 readme = "README.md"
-keywords = ["vorbis", "ogg", "audio", "codec", "encoder"]
+keywords = ["vorbis", "ogg", "audio", "decoder", "encoder"]
 categories = ["multimedia", "multimedia::audio", "multimedia::encoding"]
 
 [features]
@@ -23,5 +23,9 @@ simd = ["rusty_vorbis/simd"]
 [dependencies]
 rff-core.workspace = true
 rff-codec.workspace = true
-lewton.workspace = true
 rusty_vorbis.workspace = true
+
+# lewton is only the decode oracle for the encoder round-trip gates
+# (tests/encoder_lewton.rs); the shipping decoder is rusty_vorbis.
+[dev-dependencies]
+lewton.workspace = true

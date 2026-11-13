@@ -400,8 +400,10 @@ fn fdct16_1d(inp: &[i64; 16], out: &mut [i64; 16]) {
 /// then a row pass (`(x+1)>>2` pre-scale). Output is in the decoder's
 /// dequantized-coefficient scale — the same domain `fdct4x4`/`fdct8x8` produce,
 /// so the decoder's `idct16` inverts it (gated by the round-trip test).
-fn fdct16x16(residual: &[i32], out: &mut [i32]) {
-    let mut inter = [0i64; 256];
+fn fdct16x16(residual: &[i32], out: &mut [i32], inter: &mut [i64]) {
+    // `inter` is caller scratch (>= 256): pass 0 writes all 256 entries before
+    // pass 1 reads any, so stale contents are unobservable.
+    let inter = &mut inter[..256];
     // Pass 0: columns, input ×4, stored transposed (each column's 16 freqs run).
     for col in 0..16 {
         let mut cin = [0i64; 16];
@@ -677,8 +679,9 @@ fn fdct32_1d(input: &[i64; 32], out: &mut [i64; 32]) {
 /// Forward 2-D 32×32 DCT (libvpx `vpx_fdct32x32`): both passes pre-scale ×4 /
 /// asymmetric `(x+1+sign)>>2` round to keep intermediates in range. Output in
 /// the decoder's dequantized-coefficient scale (gated by the round-trip test).
-fn fdct32x32(residual: &[i32], out: &mut [i32]) {
-    let mut inter = [0i64; 1024];
+fn fdct32x32(residual: &[i32], out: &mut [i32], inter: &mut [i64]) {
+    // `inter` is caller scratch (>= 1024), fully written by the column pass.
+    let inter = &mut inter[..1024];
     // Columns
     for i in 0..32 {
         let mut tin = [0i64; 32];
@@ -769,57 +772,305 @@ fn build_basis(n: usize, adst: bool) -> Vec<Vec<i64>> {
         .collect()
 }
 
-/// Cached inverse basis for `(n, adst)`.
-fn basis_for(n: usize, adst: bool) -> &'static [Vec<i64>] {
-    macro_rules! cached {
-        ($n:expr, $adst:expr) => {{
-            static C: OnceLock<Vec<Vec<i64>>> = OnceLock::new();
-            C.get_or_init(|| build_basis($n, $adst)).as_slice()
-        }};
+/// Tables for the matrix forward transform of one `(n, adst)` pair.
+struct MatBasis {
+    /// `b[k * n + i] = basis[k][i]` — the inverse basis, row `k` contiguous.
+    b: Vec<i64>,
+    /// Row-pass pair table for `pmaddwd`: for input pair `j` and output `k`,
+    /// `rp[(j * n + k) * 2 + t] = basis[k][2 * j + t]` as `i16`.
+    rp: Vec<i16>,
+    /// Largest `|residual|` for which the vector row pass is exact: operands fit
+    /// `i16` and no partial sum of a row's products can leave `i32`. Derived
+    /// from the table itself (`i32::MAX / max_k Σ_i |b[k][i]|`); 0 disables it.
+    lim: i32,
+}
+
+fn build_mat_basis(n: usize, adst: bool) -> MatBasis {
+    let b: Vec<i64> = build_basis(n, adst).into_iter().flatten().collect();
+    let fits = b.iter().all(|v| v.unsigned_abs() <= i16::MAX as u64);
+    let l1 = b
+        .chunks_exact(n)
+        .map(|row| row.iter().map(|v| v.abs()).sum::<i64>())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let lim = if fits {
+        (i32::MAX as i64 / l1).min(i16::MAX as i64) as i32
+    } else {
+        0
+    };
+    let mut rp = vec![0i16; n * n];
+    if fits {
+        for j in 0..n / 2 {
+            for k in 0..n {
+                for t in 0..2 {
+                    rp[(j * n + k) * 2 + t] = b[k * n + 2 * j + t] as i16;
+                }
+            }
+        }
     }
-    match (n, adst) {
-        (4, false) => cached!(4, false),
-        (8, false) => cached!(8, false),
-        (16, false) => cached!(16, false),
-        (32, false) => cached!(32, false),
-        (4, true) => cached!(4, true),
-        (8, true) => cached!(8, true),
-        (16, true) => cached!(16, true),
-        _ => unreachable!("no basis for {n} adst={adst}"),
-    }
+    MatBasis { b, rp, lim }
+}
+
+/// Cached matrix-transform tables for `(n, adst)`.
+///
+/// One table set behind one `OnceLock`, each matrix a single contiguous slice.
+/// The previous shape (a `Vec<Vec<i64>>` per pair, each behind its own lock)
+/// cost two lock probes per call and a pointer chase plus a bounds check per
+/// row of every dot product.
+fn mat_basis(n: usize, adst: bool) -> &'static MatBasis {
+    static T: OnceLock<[MatBasis; 8]> = OnceLock::new();
+    let t = T.get_or_init(|| {
+        std::array::from_fn(|idx| {
+            let (n, adst) = (4usize << (idx >> 1), idx & 1 == 1);
+            if n == 32 && adst {
+                // VP9 has no 32-point ADST.
+                return MatBasis {
+                    b: Vec::new(),
+                    rp: Vec::new(),
+                    lim: 0,
+                };
+            }
+            build_mat_basis(n, adst)
+        })
+    });
+    let m = &t[((n.trailing_zeros() as usize - 2) << 1) | adst as usize];
+    assert!(m.b.len() == n * n, "no basis for {n} adst={adst}");
+    m
 }
 
 /// Forward 2-D transform via the integer inverse-basis transpose. `row_adst` /
 /// `col_adst` select the per-dimension transform exactly as the decoder's
 /// `inverse_transform_add_rows` interprets `tx_type`.
-fn forward_2d_matrix(residual: &[i32], n: usize, row_adst: bool, col_adst: bool, out: &mut [i32]) {
-    let row_basis = basis_for(n, row_adst);
-    let col_basis = basis_for(n, col_adst);
-    // Row pass: transform each row into the frequency domain. Stack scratch (n≤32
-    // ⇒ ≤8 KiB) instead of a heap `Vec` per call — this runs per ADST tx block.
-    let mut tmp_buf = [0i64; 32 * 32];
-    let tmp = &mut tmp_buf[..n * n];
-    for r in 0..n {
-        for k in 0..n {
-            let bk = &row_basis[k];
-            let mut acc = 0i64;
-            for i in 0..n {
-                acc += residual[r * n + i] as i64 * bk[i];
+///
+/// The result is the exact integer product `B_col · R · B_rowᵀ` with a single
+/// final round-shift, so any evaluation order gives the same output.
+fn forward_2d_matrix(
+    residual: &[i32],
+    n: usize,
+    row_adst: bool,
+    col_adst: bool,
+    out: &mut [i32],
+    tmp: &mut [i64],
+) {
+    let rm = mat_basis(n, row_adst);
+    let cm = mat_basis(n, col_adst);
+    #[cfg(target_arch = "x86_64")]
+    if n <= 16 && rm.lim > 0 && has_avx2() {
+        // SAFETY: AVX2 confirmed; the slices are length-checked inside.
+        let done = unsafe {
+            match n {
+                4 => matrix_avx2::forward::<4>(residual, rm, &cm.b, out, tmp),
+                8 => matrix_avx2::forward::<8>(residual, rm, &cm.b, out, tmp),
+                _ => matrix_avx2::forward::<16>(residual, rm, &cm.b, out, tmp),
             }
-            tmp[r * n + k] = acc;
+        };
+        if done {
+            return;
         }
     }
-    // Column pass + calibration round-shift.
-    let sh = calib_shift(n);
-    let round = 1i64 << (sh - 1);
-    for kc in 0..n {
-        for kr in 0..n {
-            let bk = &col_basis[kr];
+    forward_2d_matrix_scalar(residual, n, &rm.b, &cm.b, out, tmp);
+}
+
+fn forward_2d_matrix_scalar(
+    residual: &[i32],
+    n: usize,
+    rb: &[i64],
+    cb: &[i64],
+    out: &mut [i32],
+    tmp: &mut [i64],
+) {
+    match n {
+        4 => matrix_fwd::<4>(residual, rb, cb, out, tmp),
+        8 => matrix_fwd::<8>(residual, rb, cb, out, tmp),
+        16 => matrix_fwd::<16>(residual, rb, cb, out, tmp),
+        32 => matrix_fwd::<32>(residual, rb, cb, out, tmp),
+        _ => unreachable!("no matrix transform for n={n}"),
+    }
+}
+
+/// The scalar matrix transform for one size — the exact-integer reference.
+///
+/// `tmp` is caller scratch: a `[0i64; 32 * 32]` local here was an 8 KiB
+/// zero-fill on every ADST tx block, of which a 4x4 uses 128 bytes. The row
+/// pass writes all of `[..N * N]` before the column pass reads it.
+#[inline(always)]
+fn matrix_fwd<const N: usize>(
+    residual: &[i32],
+    rb: &[i64],
+    cb: &[i64],
+    out: &mut [i32],
+    tmp: &mut [i64],
+) {
+    let (residual, rb) = (&residual[..N * N], &rb[..N * N]);
+    let tmp = &mut tmp[..N * N];
+    // Row pass: tmp[r][k] = Σ_i residual[r][i] · rb[k][i].
+    for (rrow, trow) in residual.chunks_exact(N).zip(tmp.chunks_exact_mut(N)) {
+        for (t, bk) in trow.iter_mut().zip(rb.chunks_exact(N)) {
             let mut acc = 0i64;
-            for r in 0..n {
-                acc += tmp[r * n + kc] * bk[r];
+            for (&x, &b) in rrow.iter().zip(bk) {
+                acc += x as i64 * b;
             }
-            out[kr * n + kc] = ((acc + round) >> sh) as i32;
+            *t = acc;
+        }
+    }
+    matrix_cols::<N>(tmp, cb, out);
+}
+
+/// Column pass + calibration round-shift of the matrix transform:
+/// `out[kr][kc] = (Σ_r tmp[r][kc] · cb[kr][r] + round) >> sh`, accumulated a
+/// whole output row at a time so `tmp` is read along its rows.
+#[inline(always)]
+fn matrix_cols<const N: usize>(tmp: &[i64], cb: &[i64], out: &mut [i32]) {
+    let (tmp, cb, out) = (&tmp[..N * N], &cb[..N * N], &mut out[..N * N]);
+    let sh = calib_shift(N);
+    let round = 1i64 << (sh - 1);
+    for (orow, bk) in out.chunks_exact_mut(N).zip(cb.chunks_exact(N)) {
+        let mut acc = [0i64; N];
+        for (trow, &b) in tmp.chunks_exact(N).zip(bk) {
+            for (a, &t) in acc.iter_mut().zip(trow) {
+                *a += t * b;
+            }
+        }
+        for (o, a) in orow.iter_mut().zip(acc) {
+            *o = ((a + round) >> sh) as i32;
+        }
+    }
+}
+
+/// AVX2 twin of [`matrix_fwd`] for `N` in `{4, 8, 16}`. Bit-identical: the row
+/// pass is exact in `i32` under the table-derived `lim` guard, the column pass
+/// is the same exact `i64` sum, and the final shift keeps the low 32 bits.
+#[cfg(target_arch = "x86_64")]
+mod matrix_avx2 {
+    use super::{calib_shift, MatBasis};
+    use std::arch::x86_64::*;
+
+    /// Returns `false` when a residual exceeds the row-pass bound (`out` is
+    /// then unspecified); the caller runs the scalar path instead.
+    ///
+    /// # Safety
+    /// AVX2 must be available. `N` must be 4, 8 or 16.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn forward<const N: usize>(
+        residual: &[i32],
+        rm: &MatBasis,
+        cb: &[i64],
+        out: &mut [i32],
+        tmp: &mut [i64],
+    ) -> bool {
+        let (residual, cb) = (&residual[..N * N], &cb[..N * N]);
+        let (out, tmp) = (&mut out[..N * N], &mut tmp[..N * N]);
+        let rp = &rm.rp[..N * N];
+        if !rows::<N>(residual, rp, rm.lim, tmp) {
+            return false;
+        }
+        cols::<N>(tmp, cb, out);
+        true
+    }
+
+    /// Row pass: `tmp[r][k] = Σ_i residual[r][i] · basis[k][i]`, two taps per
+    /// `pmaddwd` with the output index `k` in the lanes. Results are stored
+    /// sign-extended to `i64` for the column pass.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn rows<const N: usize>(
+        residual: &[i32],
+        rp: &[i16],
+        lim: i32,
+        tmp: &mut [i64],
+    ) -> bool {
+        let res = residual.as_ptr();
+        let t = tmp.as_mut_ptr();
+        let p = rp.as_ptr();
+        if N == 4 {
+            let limv = _mm_set1_epi32(lim);
+            let t0 = _mm_loadu_si128(p as *const __m128i);
+            let t1 = _mm_loadu_si128(p.add(8) as *const __m128i);
+            let mut over = _mm_setzero_si128();
+            for r in 0..4 {
+                let x = _mm_loadu_si128(res.add(4 * r) as *const __m128i);
+                over = _mm_or_si128(over, _mm_cmpgt_epi32(_mm_abs_epi32(x), limv));
+                let pk = _mm_packs_epi32(x, x);
+                let acc = _mm_add_epi32(
+                    _mm_madd_epi16(_mm_shuffle_epi32::<0x00>(pk), t0),
+                    _mm_madd_epi16(_mm_shuffle_epi32::<0x55>(pk), t1),
+                );
+                _mm256_storeu_si256(t.add(4 * r) as *mut __m256i, _mm256_cvtepi32_epi64(acc));
+            }
+            return _mm_testz_si128(over, over) == 1;
+        }
+        let limv = _mm256_set1_epi32(lim);
+        let mut over = _mm256_setzero_si256();
+        for r in 0..N {
+            // Pack the row to i16 pairs: lane j of `pk` holds inputs (2j, 2j+1).
+            let pk = if N == 8 {
+                let x = _mm256_loadu_si256(res.add(8 * r) as *const __m256i);
+                over = _mm256_or_si256(over, _mm256_cmpgt_epi32(_mm256_abs_epi32(x), limv));
+                _mm256_castsi128_si256(_mm_packs_epi32(
+                    _mm256_castsi256_si128(x),
+                    _mm256_extracti128_si256::<1>(x),
+                ))
+            } else {
+                let x0 = _mm256_loadu_si256(res.add(16 * r) as *const __m256i);
+                let x1 = _mm256_loadu_si256(res.add(16 * r + 8) as *const __m256i);
+                over = _mm256_or_si256(over, _mm256_cmpgt_epi32(_mm256_abs_epi32(x0), limv));
+                over = _mm256_or_si256(over, _mm256_cmpgt_epi32(_mm256_abs_epi32(x1), limv));
+                _mm256_permute4x64_epi64::<0xD8>(_mm256_packs_epi32(x0, x1))
+            };
+            let mut acc = [_mm256_setzero_si256(); 2];
+            for j in 0..N / 2 {
+                let bj = _mm256_permutevar8x32_epi32(pk, _mm256_set1_epi32(j as i32));
+                for (v, a) in acc.iter_mut().enumerate().take(N / 8) {
+                    let tab = _mm256_loadu_si256(p.add((j * N + 8 * v) * 2) as *const __m256i);
+                    *a = _mm256_add_epi32(*a, _mm256_madd_epi16(bj, tab));
+                }
+            }
+            for (v, a) in acc.iter().enumerate().take(N / 8) {
+                let d = t.add(r * N + 8 * v);
+                _mm256_storeu_si256(
+                    d as *mut __m256i,
+                    _mm256_cvtepi32_epi64(_mm256_castsi256_si128(*a)),
+                );
+                _mm256_storeu_si256(
+                    d.add(4) as *mut __m256i,
+                    _mm256_cvtepi32_epi64(_mm256_extracti128_si256::<1>(*a)),
+                );
+            }
+        }
+        _mm256_testz_si256(over, over) == 1
+    }
+
+    /// Column pass: `out[kr][kc] = (Σ_r tmp[r][kc] · cb[kr][r] + round) >> sh`.
+    /// `pmuldq` gives the exact signed 64-bit products (both operands fit
+    /// `i32`); the arithmetic shift is taken as a logical one and truncated,
+    /// which agrees in the low 32 bits for any shift up to 32.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn cols<const N: usize>(tmp: &[i64], cb: &[i64], out: &mut [i32]) {
+        let t = tmp.as_ptr();
+        let o = out.as_mut_ptr();
+        let sh = calib_shift(N);
+        let round = _mm256_set1_epi64x(1i64 << (sh - 1));
+        let shv = _mm_cvtsi32_si128(sh as i32);
+        let low = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+        for kr in 0..N {
+            let mut acc = [_mm256_setzero_si256(); 4];
+            for r in 0..N {
+                let b = _mm256_set1_epi64x(*cb.get_unchecked(kr * N + r));
+                for (c, a) in acc.iter_mut().enumerate().take(N / 4) {
+                    let x = _mm256_loadu_si256(t.add(r * N + 4 * c) as *const __m256i);
+                    *a = _mm256_add_epi64(*a, _mm256_mul_epi32(x, b));
+                }
+            }
+            for (c, a) in acc.iter().enumerate().take(N / 4) {
+                let v = _mm256_srl_epi64(_mm256_add_epi64(*a, round), shv);
+                let v = _mm256_permutevar8x32_epi32(v, low);
+                _mm_storeu_si128(
+                    o.add(kr * N + 4 * c) as *mut __m128i,
+                    _mm256_castsi256_si128(v),
+                );
+            }
         }
     }
 }
@@ -842,19 +1093,36 @@ fn tx_dirs(tx_type: TxType) -> (bool, bool) {
 /// decoder's dequantized-coefficient domain (divide by the quant step to get
 /// levels). Only DCT_DCT is wired so far; ADST and sizes 8/16/32 land next.
 pub fn forward_transform(residual: &[i32], n: usize, tx_type: TxType, out: &mut [i32]) {
+    let mut tmp = [0i64; 32 * 32];
+    forward_transform_scratch(residual, n, tx_type, out, &mut tmp);
+}
+
+/// [`forward_transform`] with caller-owned intermediate scratch (`tmp.len() >=
+/// 1024`). The encoder's per-tx-block path uses this so the 16x16 / 32x32 / ADST
+/// intermediates are not a 2-8 KiB zero-fill per call; contents of `tmp` on entry
+/// are irrelevant (every pass writes what the next reads) and the output is
+/// identical to [`forward_transform`].
+pub fn forward_transform_scratch(
+    residual: &[i32],
+    n: usize,
+    tx_type: TxType,
+    out: &mut [i32],
+    tmp: &mut [i64],
+) {
     debug_assert_eq!(residual.len(), n * n);
     debug_assert!(out.len() >= n * n);
+    debug_assert!(tmp.len() >= n * n);
     match (n, tx_type) {
         // Exact integer butterflies for the DCTs (fast; O(n log n)).
         (4, TxType::DctDct) => fdct4x4(residual, out),
         (8, TxType::DctDct) => fdct8x8(residual, out),
-        (16, TxType::DctDct) if use_fdct16() => fdct16x16(residual, out),
-        (32, TxType::DctDct) if use_fdct32() => fdct32x32(residual, out),
+        (16, TxType::DctDct) if use_fdct16() => fdct16x16(residual, out, tmp),
+        (32, TxType::DctDct) if use_fdct32() => fdct32x32(residual, out, tmp),
         // Everything else (all ADST — and 16/32 DCT under VP9_NO_FDCT16/32)
         // via the inverse-basis transpose.
         _ => {
             let (row_adst, col_adst) = tx_dirs(tx_type);
-            forward_2d_matrix(residual, n, row_adst, col_adst, out);
+            forward_2d_matrix(residual, n, row_adst, col_adst, out, tmp);
         }
     }
 }
@@ -941,6 +1209,75 @@ mod tests {
             println!("{name}: {:.4} us/call", el / 2e6 * 1e6);
         }
         assert!(sink != 0);
+    }
+
+    /// The vector matrix transform must equal the scalar reference bit for
+    /// bit, for every size and ADST mix, on in-range residuals (including the
+    /// 8/10/12-bit extremes and the table's own bound), and must decline
+    /// anything past that bound rather than wrap.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn matrix_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        fn run(n: usize, residual: &[i32], rm: &MatBasis, cb: &[i64], out: &mut [i32]) -> bool {
+            let mut tmp = vec![-1i64; 1024];
+            // SAFETY: AVX2 checked by the caller; n is 4, 8 or 16.
+            unsafe {
+                match n {
+                    4 => matrix_avx2::forward::<4>(residual, rm, cb, out, &mut tmp),
+                    8 => matrix_avx2::forward::<8>(residual, rm, cb, out, &mut tmp),
+                    _ => matrix_avx2::forward::<16>(residual, rm, cb, out, &mut tmp),
+                }
+            }
+        }
+        let mut s = 0x1234_5678_9abc_def1u64;
+        for &n in &[4usize, 8, 16] {
+            for &(ra, ca) in &[(false, false), (false, true), (true, false), (true, true)] {
+                let (rm, cm) = (mat_basis(n, ra), mat_basis(n, ca));
+                assert!(rm.lim >= 4095, "n={n} adst={ra}: lim {}", rm.lim);
+                for round in 0..400 {
+                    let amp = match round % 4 {
+                        0 => 255i32,
+                        1 => 1023,
+                        2 => 4095,
+                        _ => rm.lim,
+                    };
+                    let residual: Vec<i32> = (0..n * n)
+                        .map(|i| match round {
+                            0..=3 => amp,
+                            4..=7 => -amp,
+                            8..=11 => {
+                                if i % 2 == 0 {
+                                    amp
+                                } else {
+                                    -amp
+                                }
+                            }
+                            _ => (xs(&mut s) % (2 * amp as u64 + 1)) as i32 - amp,
+                        })
+                        .collect();
+                    let mut want = vec![0i32; n * n];
+                    let mut got = vec![0x5a5a_5a5ai32; n * n];
+                    let mut t0 = vec![0i64; 1024];
+                    forward_2d_matrix_scalar(&residual, n, &rm.b, &cm.b, &mut want, &mut t0);
+                    assert!(
+                        run(n, &residual, rm, &cm.b, &mut got),
+                        "n={n} declined an in-range residual (amp {amp})"
+                    );
+                    assert_eq!(got, want, "n={n} row_adst={ra} col_adst={ca} round={round}");
+                }
+                // One sample past the bound must be declined, not wrapped.
+                let mut residual = vec![0i32; n * n];
+                residual[n * n - 1] = rm.lim + 1;
+                let mut got = vec![0i32; n * n];
+                assert!(
+                    !run(n, &residual, rm, &cm.b, &mut got),
+                    "n={n}: out-of-bound residual was not declined"
+                );
+            }
+        }
     }
 
     /// Byte-identity gate for the AVX2 `fdct8x8` vs the scalar oracle, over

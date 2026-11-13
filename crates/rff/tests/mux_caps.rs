@@ -103,7 +103,10 @@ fn every_declared_codec_is_accepted_by_its_muxer() {
             checked += 1;
         }
     }
-    assert!(checked >= 40, "only {checked} (format, codec) pairs checked");
+    assert!(
+        checked >= 40,
+        "only {checked} (format, codec) pairs checked"
+    );
 }
 
 #[test]

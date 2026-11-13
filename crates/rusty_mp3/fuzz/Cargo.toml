@@ -1,0 +1,60 @@
+# cargo-fuzz harness for rusty_mp3's untrusted-input entry points (H-26).
+# Detached from the parent workspace (its own empty [workspace] table) so
+# libfuzzer-sys never enters the normal build or the cargo-deny graph.
+# libFuzzer needs clang's sanitizer runtime, so run on Linux/macOS (WSL works):
+#
+#   cargo +nightly fuzz run decode            # stream decoder (Mp3Decoder)
+#   cargo +nightly fuzz run decode_frame      # frame-level decoder + header parse
+#   cargo +nightly fuzz run encode            # encoder on hostile PCM + config
+#   cargo +nightly fuzz run pipelined         # two-thread decoder == serial
+#   cargo +nightly fuzz run decode -- -max_total_time=600   # bounded run
+#
+# Seeds: corpus/<target>/ (small real streams + ISO conformance excerpts).
+[package]
+name = "rusty_mp3-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rusty_mp3 = { path = ".." }
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_frame"
+path = "fuzz_targets/decode_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode"
+path = "fuzz_targets/encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pipelined"
+path = "fuzz_targets/pipelined.rs"
+test = false
+doc = false
+bench = false
+
+# Overflow checks on: an arithmetic overflow on hostile input is a finding too.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+
+# Detach from the parent workspace.
+[workspace]

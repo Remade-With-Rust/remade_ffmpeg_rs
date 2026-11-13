@@ -66,7 +66,9 @@ fn phase1_parse_and_dpb_dry_run() {
     let mut n = 0;
     for (name, (w, h, pix_fmt, profile, frames)) in &probe {
         let path = dir.join(format!("{name}.bit"));
-        let Ok(data) = std::fs::read(&path) else { continue };
+        let Ok(data) = std::fs::read(&path) else {
+            continue;
+        };
         n += 1;
         let mut dec = rusty_h265::Decoder::new();
         dec.headers_only = true;

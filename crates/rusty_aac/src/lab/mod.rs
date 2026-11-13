@@ -1,5 +1,5 @@
 //! The AAC quality lab — the **verdict instrument** for the Great Gate campaign
-//! (`docs/codec-aac-great-gate.md`).
+//! (`docs/finished/codec-aac-great-gate.md`).
 //!
 //! Before this module existed there was no way to judge an AAC encoder change at
 //! all: no corpus, no metric, no ladder. Per `codec-tune-quality`, that made every
@@ -32,5 +32,5 @@ pub mod wav;
 pub use corpus::{corpus, Class, Signal};
 pub use ladder::{null_arm, point, run, Point};
 pub use quality::{track_nmr, NmrReport};
-pub use wav::Wav;
 pub use signals::{AacSignals, FrameSignals};
+pub use wav::Wav;

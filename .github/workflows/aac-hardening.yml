@@ -1,0 +1,159 @@
+# Hardening gate for the audited AAC crates (rusty_aac, rff-codec-aac).
+# use-protection-please: H-06 (pinned security toolchain), H-22 (pattern rules
+# beyond clippy), H-27 (continuous fuzzing), H-29 (differential conformance vs
+# the ISO/FATE reference PCM), H-37 (per-PR gate), H-40 (daily advisory scan).
+#
+# Every action is pinned to a commit SHA and every tool to an exact version;
+# the token is read-only.
+name: aac-hardening
+
+on:
+  push:
+    paths:
+      - "crates/rusty_aac/**"
+      - "crates/rff-codec-aac/**"
+      - "deny.toml"
+      - "tools/hardening/**"
+      - ".github/workflows/aac-hardening.yml"
+  pull_request:
+    paths:
+      - "crates/rusty_aac/**"
+      - "crates/rff-codec-aac/**"
+      - "deny.toml"
+      - "tools/hardening/**"
+      - ".github/workflows/aac-hardening.yml"
+  schedule:
+    # Daily: advisory scan + a fuzzing session (corpus carried between runs).
+    # Mondays additionally run the full Miri pass.
+    - cron: "41 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + clippy (-D warnings) + tests + pattern rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt -p rusty_aac -p rff-codec-aac -- --check
+      - run: cargo clippy -p rusty_aac -p rff-codec-aac --all-targets --all-features --no-deps --locked -- -D warnings
+      - run: cargo test -p rusty_aac -p rff-codec-aac --release --locked
+      - run: cargo test -p rusty_aac --release --locked --no-default-features
+      - run: python3 tools/hardening/aac_pattern_rules.py crates/rusty_aac
+      - run: python3 tools/hardening/aac_pattern_rules.py crates/rff-codec-aac
+
+  msrv:
+    name: MSRV 1.85 (default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: "1.85.0"
+      - run: cargo build -p rusty_aac --lib --locked
+
+  supply-chain:
+    name: audit + deny + vet + SBOM (crate closure)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.19.9,cargo-vet@0.10.2,cargo-cyclonedx@0.5.9
+      - run: bash tools/hardening/standalone_supply_chain.sh crates/rusty_aac "$RUNNER_TEMP/sbom"
+      - run: bash tools/hardening/standalone_supply_chain.sh crates/rff-codec-aac "$RUNNER_TEMP/sbom"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: aac-sbom
+          path: |
+            ${{ runner.temp }}/sbom/rusty_aac.cdx.json
+            ${{ runner.temp }}/sbom/rff-codec-aac.cdx.json
+
+  conformance:
+    name: ISO/IEC 14496-26 differential (FATE reference PCM)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # FFmpeg demuxes the MP4/TS containers; the gate compares against the FATE
+      # reference PCM, so the installed FFmpeg's own decoder does not matter.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg rsync
+      - run: rsync -rltLW --timeout=120 rsync://fate-suite.ffmpeg.org/fate-suite/aac/ "$RUNNER_TEMP/fate-aac/"
+      - run: cargo run -p rusty_aac --release --locked --example aacconf -- "$RUNNER_TEMP/fate-aac" --gate
+
+  fuzz:
+    name: cargo-fuzz (${{ github.event_name == 'schedule' && 'nightly session' || 'corpus replay' }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: nightly
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-fuzz@0.13.2
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            crates/rusty_aac/fuzz/work
+            crates/rff-codec-aac/fuzz/work
+          key: aac-fuzz-corpus-${{ github.run_id }}
+          restore-keys: aac-fuzz-corpus-
+      - name: Fuzz every target (codec + adapter)
+        run: |
+          secs=${{ github.event_name == 'schedule' && 180 || 0 }}
+          for spec in "crates/rusty_aac/fuzz:decode_adts decode_config latm parsers encode" \
+                      "crates/rff-codec-aac/fuzz:decode_packets encode_frames"; do
+            dir=${spec%%:*}
+            for t in ${spec#*:}; do
+              mkdir -p "$dir/work/$t"
+              if [ "$secs" -gt 0 ]; then
+                (cd "$dir" && cargo +nightly fuzz run -O --target x86_64-unknown-linux-gnu $t work/$t corpus/$t -- -max_total_time=$secs -rss_limit_mb=2048 -timeout=10)
+              else
+                (cd "$dir" && cargo +nightly fuzz run -O --target x86_64-unknown-linux-gnu $t work/$t corpus/$t -- -runs=0)
+              fi
+            done
+          done
+      - if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-crashers
+          path: |
+            crates/rusty_aac/fuzz/artifacts
+            crates/rff-codec-aac/fuzz/artifacts
+
+  miri:
+    name: Miri (lib suite, deterministic floats)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: nightly
+          components: miri
+      - name: Weekly gate (Mondays) unless dispatched by hand
+        id: day
+        run: echo "dow=$(date -u +%u)" >> "$GITHUB_OUTPUT"
+      - if: github.event_name == 'workflow_dispatch' || steps.day.outputs.dow == '1'
+        run: cargo +nightly miri test -p rusty_aac --lib
+        env:
+          MIRIFLAGS: -Zmiri-deterministic-floats

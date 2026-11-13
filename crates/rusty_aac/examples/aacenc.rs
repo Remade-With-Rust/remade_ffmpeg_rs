@@ -9,7 +9,7 @@
 //!     in.wav out.aac 128000 [arm ...]
 //! ```
 //!
-//! Arms: `a1` short-block psy, `a2` tonality SMR, `a3` TNS, `a6` PNS,
+//! Arms: `a1` short-block psy, `grp` window grouping (arm 1a), `a2` tonality SMR, `a3` TNS, `a6` PNS,
 //! `a7` intensity stereo, `a9` level-invariant transients, `a13` demand-based
 //! stereo bit split, `kbd`/`autoshape` window shape. With no arms it is byte-identical to the shipped defaults.
 
@@ -27,8 +27,8 @@ fn main() {
     }
     let (src, dst) = (&a[0], &a[1]);
     let bitrate: u32 = a[2].parse().expect("bitrate");
-    let arms: Vec<&str> = a[3..].iter().map(|s| s.as_str()).collect();
-    let on = |k: &str| arms.iter().any(|x| *x == k);
+    let arms: Vec<&str> = a[3..].iter().map(std::string::String::as_str).collect();
+    let on = |k: &str| arms.contains(&k);
 
     // ADDITIVE from the shipped defaults. Listing every field explicitly would
     // silently DISABLE arms that are now default-on, which is exactly how an
@@ -39,17 +39,42 @@ fn main() {
         bitrate_bps: bitrate,
         ..Default::default()
     };
-    if on("a1") { cfg.short_block_psy = true; }
-    if on("a2") { cfg.tonality_smr = true; }
-    if on("a3") { cfg.tns = true; }
-    if on("a6") { cfg.pns = true; }
-    if on("a7") { cfg.intensity = true; }
-    if on("a9") { cfg.relative_transients = true; }
-    if on("a13") { cfg.stereo_bit_split = true; }
-    if on("noa9") { cfg.relative_transients = false; }
-    if on("noa13") { cfg.stereo_bit_split = false; }
-    if on("kbd") { cfg.window_shape = WindowShape::Kbd; }
-    if on("autoshape") { cfg.window_shape = WindowShape::Auto; }
+    if on("a1") {
+        cfg.short_block_psy = true;
+    }
+    if on("a2") {
+        cfg.tonality_smr = true;
+    }
+    if on("a3") {
+        cfg.tns = true;
+    }
+    if on("a6") {
+        cfg.pns = true;
+    }
+    if on("a7") {
+        cfg.intensity = true;
+    }
+    if on("a9") {
+        cfg.relative_transients = true;
+    }
+    if on("a13") {
+        cfg.stereo_bit_split = true;
+    }
+    if on("grp") {
+        cfg.window_grouping = true;
+    }
+    if on("noa9") {
+        cfg.relative_transients = false;
+    }
+    if on("noa13") {
+        cfg.stereo_bit_split = false;
+    }
+    if on("kbd") {
+        cfg.window_shape = WindowShape::Kbd;
+    }
+    if on("autoshape") {
+        cfg.window_shape = WindowShape::Auto;
+    }
 
     let w = wav::read(src).expect("read wav");
     let mut enc = AacEncoder::new(cfg);

@@ -47,10 +47,10 @@ claimed an "outer distortion loop." There is none: `rate_loop` searches a single
 global base offset, and the per-band psy offsets are computed once, analytically,
 by `perceptual_offsets` — never iterated against the per-band threshold. The row
 has been corrected to describe what shipped. The real distortion loop is tracked
-as **arm A12** in `docs/codec-aac-great-gate.md`.
+as **arm A12** in `docs/finished/codec-aac-great-gate.md`.
 
 **What comes next** is no longer "optional later tools" — it is a campaign with a
-census, a corpus and a gate ledger: see **`docs/codec-aac-great-gate.md`**. TNS,
+census, a corpus and a gate ledger: see **`docs/finished/codec-aac-great-gate.md`**. TNS,
 PNS and intensity stereo are arms A3/A6/A7 there (all three already decode
 correctly in `crate::decode`, so each is gateable on round-trip from day one),
 alongside the larger missing structures: short-block psy (A1), tonality-adaptive

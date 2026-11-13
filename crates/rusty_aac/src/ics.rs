@@ -1,11 +1,12 @@
 //! `ics_info` — per-channel window/grouping configuration (ISO 14496-3
 //! §4.4.2.1) and the derived short-window grouping.
 
-#![allow(dead_code)]
-
+#[cfg(test)]
 use crate::{Error, Result};
 
+#[cfg(test)]
 use crate::bits::BitReader;
+#[cfg(test)]
 use crate::swb::swb_offsets;
 
 /// AAC window sequence (transform block structure).
@@ -18,26 +19,27 @@ pub enum WindowSequence {
 }
 
 impl WindowSequence {
-    fn from_bits(v: u32) -> WindowSequence {
+    #[cfg(test)]
+    fn from_bits(v: u32) -> Self {
         match v {
-            0 => WindowSequence::OnlyLong,
-            1 => WindowSequence::LongStart,
-            2 => WindowSequence::EightShort,
-            _ => WindowSequence::LongStop,
+            0 => Self::OnlyLong,
+            1 => Self::LongStart,
+            2 => Self::EightShort,
+            _ => Self::LongStop,
         }
     }
 
     pub fn is_short(self) -> bool {
-        self == WindowSequence::EightShort
+        self == Self::EightShort
     }
 
     /// The 2-bit window-sequence code (the encode side of `from_bits`).
     pub fn to_bits(self) -> u32 {
         match self {
-            WindowSequence::OnlyLong => 0,
-            WindowSequence::LongStart => 1,
-            WindowSequence::EightShort => 2,
-            WindowSequence::LongStop => 3,
+            Self::OnlyLong => 0,
+            Self::LongStart => 1,
+            Self::EightShort => 2,
+            Self::LongStop => 3,
         }
     }
 }
@@ -49,7 +51,7 @@ pub struct IcsInfo {
     /// Window shape for this block: false = sine, true = KBD.
     pub window_shape_kbd: bool,
     pub max_sfb: u8,
-    /// Number of transform windows (8 for EIGHT_SHORT, else 1).
+    /// Number of transform windows (8 for `EIGHT_SHORT`, else 1).
     pub num_windows: usize,
     /// Number of window groups.
     pub num_window_groups: usize,
@@ -60,17 +62,18 @@ pub struct IcsInfo {
 }
 
 /// Parse `ics_info` from the bitstream for sampling-frequency index `fs_index`.
+#[cfg(test)]
 pub fn parse_ics_info(r: &mut BitReader, fs_index: u8) -> Result<IcsInfo> {
     let _ics_reserved = r.read_bit()?;
     let window_sequence = WindowSequence::from_bits(r.read_bits(2)?);
     let window_shape_kbd = r.read_bool()?;
 
     let (max_sfb, scale_factor_grouping) = if window_sequence.is_short() {
-        let max_sfb = r.read_bits(4)? as u8;
+        let max_sfb = r.read_u8(4)?;
         let sfg = r.read_bits(7)?;
         (max_sfb, Some(sfg))
     } else {
-        let max_sfb = r.read_bits(6)? as u8;
+        let max_sfb = r.read_u8(6)?;
         let predictor_data_present = r.read_bool()?;
         if predictor_data_present {
             // AAC-LC has no prediction; a set bit means a non-LC stream.
@@ -88,6 +91,7 @@ pub fn parse_ics_info(r: &mut BitReader, fs_index: u8) -> Result<IcsInfo> {
             let mut groups = vec![1u8];
             for i in 0..7 {
                 if (sfg >> (6 - i)) & 1 == 1 {
+                    // Cannot fail: `groups` starts with one entry.
                     *groups.last_mut().unwrap() += 1;
                 } else {
                     groups.push(1);

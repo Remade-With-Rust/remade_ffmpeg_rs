@@ -139,7 +139,11 @@ mod tests {
         std::fs::write(dir.join("b.ts"), b"BB").unwrap();
         let playlist = dir.join("v.m3u8");
         let mut f = std::fs::File::create(&playlist).unwrap();
-        writeln!(f, "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.0,\na.ts\n#EXTINF:2.0,\nb.ts\n#EXT-X-ENDLIST").unwrap();
+        writeln!(
+            f,
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.0,\na.ts\n#EXTINF:2.0,\nb.ts\n#EXT-X-ENDLIST"
+        )
+        .unwrap();
         drop(f);
 
         let mut out = Vec::new();

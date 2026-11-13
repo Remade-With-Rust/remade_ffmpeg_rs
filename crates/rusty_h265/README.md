@@ -47,6 +47,47 @@ The `rusty_h265` binary is the conformance-harness front end:
 `rusty_h265 <in.bit> <out.yuv> [--verify-sei]` writes the cropped pictures as
 planar 4:2:0 (`u8`, or `u16` little-endian above 8 bits) in output order.
 
+## Performance
+
+Single-thread decode against FFmpeg 8.1.2's native `hevc` decoder
+(`-threads 1`). Both arms pinned to one core at High priority, timed by their
+own self-reported decode time, ABBA-interleaved, 15 pairs per stream, on an
+i7-14650HX. Ours is built as it ships: rusty_alloc, AVX2 kernels by runtime
+dispatch, everything else for the portable x86-64 baseline.
+
+| stream | FFmpeg 1T | rusty_h265 | × FFmpeg | paired verdict |
+|---|---:|---:|---:|---|
+| x265-encoded 20 s 720p30 clip | 1,199 ms | 1,461 ms | **0.82×** | 0/15, z = −3.87 |
+| JCT-VC 720p, 60 frames | 150 ms | 172 ms | **0.86×** | 0/15, z = −3.87 |
+| all-intra 720p (`ipred_x24`) | 1,759 ms | 2,159 ms | **0.82×** | 0/15, z = −3.87 |
+
+FFmpeg measured against itself reads 0.95×, so differences inside ~5% are
+noise. On the JCT-VC streams the picture is wider: weighted prediction runs
+**1.37× faster** than FFmpeg (20/21 pairs, z = +4.15), and deblocking-heavy and
+10-bit content are at parity.
+
+### What changed since 0.6
+
+An instruction-count campaign, measured with callgrind on a deterministic
+count rather than a clock, cut **34.0%** of the instructions on the x265 clip
+and **36.7%** on all-intra content. Every step was gated bit-exact on all 147
+JCT-VC conformance streams and every decoded-picture-hash SEI. The wall clock
+agrees, against the 0.6 decoder on the same harness (11/11 pairs each, z = 3.32):
+
+| stream | 0.6 | this release | speed-up |
+|---|---:|---:|---:|
+| x265-encoded 20 s 720p30 clip | 2,122 ms | 1,539 ms | **1.37×** |
+| JCT-VC 720p, 60 frames | 260 ms | 186 ms | **1.39×** |
+| all-intra 720p (`ipred_x24`) | 3,244 ms | 2,169 ms | **1.50×** |
+
+- **SAO** runs one whole-CTB kernel when all eight neighbours are usable, instead of a per-sample border ring.
+- **Inverse transform** runs one block kernel per size with both passes inside the SIMD boundary, and dequantization happens at the coefficient write.
+- **Deblocking strength** is written at parse time by the CU, PU and TU that own each edge; the frame-wide edge scans are gone.
+- **Deblocking** skips eight zero strengths at a time and computes its decisions inside the kernel.
+- **Intra reference gathering** answers availability once per block and copies spans, not samples.
+- **Motion compensation** folds the uni/bi output stage into the last interpolation pass.
+- **Per-4x4 metadata** lives in one packed record, filled once per coding unit, instead of six maps.
+
 ## Conformance
 
 `cargo test -p rusty_h265 --release` runs the unit tests and, when

@@ -7,7 +7,7 @@
 //!   noise is masked everywhere or no scalefactor budget remains.
 //!
 //! Produces the quantized integer spectrum plus the side-info fields (global
-//! gain, scalefactors, scalefac_compress, block flags) that describe it.
+//! gain, scalefactors, `scalefac_compress`, block flags) that describe it.
 
 use std::sync::OnceLock;
 
@@ -53,6 +53,7 @@ pub fn requant_magnitude(level: i32) -> f64 {
 /// Forward-quantize a (positive) frequency-line magnitude to its integer level
 /// under unit step: `ix = nint(|xr|^(3/4) − BIAS)`, clamped to `[0, MAX_LEVEL]`.
 /// The sign is carried separately, exactly as the bitstream does.
+#[must_use]
 pub fn quantize_level(xr: f64) -> i32 {
     level_from(xr.abs().powf(0.75))
 }
@@ -91,7 +92,7 @@ pub(crate) fn level_from(powered: f64) -> i32 {
     // and rejected here — it is bit-identical on all 24 corpus encodes but
     // differs at constructed ties, and weakening a standing exactness gate to buy
     // speed is the wrong trade when an exact form is available.
-    (m.clamp(0.0, MAX_LEVEL as f64) + 0.5) as i32
+    (m.clamp(0.0, f64::from(MAX_LEVEL)) + 0.5) as i32
 }
 
 /// **A1** — precompute `|freq[i]|^(3/4)` for the whole granule, once. The forward
@@ -125,18 +126,19 @@ pub(crate) fn level_from(powered: f64) -> i32 {
 ///
 /// Left as-is deliberately. Recorded so the next reader does not conclude from
 /// the old comment that `sqrt` loops in this crate are already wide.
+#[must_use]
 pub fn xrpow(freq: &[f32; GRANULE_LINES]) -> [f64; GRANULE_LINES] {
     let mut p = [0f64; GRANULE_LINES];
     if xrpow_use_powf() {
         for (pi, &f) in p.iter_mut().zip(freq.iter()) {
-            *pi = (f.abs() as f64).powf(0.75); // the scalar `powf` oracle
+            *pi = f64::from(f.abs()).powf(0.75); // the scalar `powf` oracle
         }
     } else {
         for (pi, &f) in p.iter_mut().zip(freq.iter()) {
             // x^0.75 = x^0.5 · x^0.25 = √(x·√x). 1 ULP vs powf, absorbed by the
             // quantizer's integer rounding. `sqrt` is SSE2-baseline so this loop
             // auto-vectorizes for free (see perf003 prune above).
-            let a = f.abs() as f64;
+            let a = f64::from(f.abs());
             *pi = (a * a.sqrt()).sqrt();
         }
     }
@@ -148,11 +150,7 @@ pub fn xrpow(freq: &[f32; GRANULE_LINES]) -> [f64; GRANULE_LINES] {
 /// the fast `sqrt` identity; `RFF_MP3_XRPOW=powf` forces the oracle.
 fn xrpow_use_powf() -> bool {
     static USE_POWF: OnceLock<bool> = OnceLock::new();
-    *USE_POWF.get_or_init(|| {
-        std::env::var("RFF_MP3_XRPOW")
-            .map(|v| v == "powf")
-            .unwrap_or(false)
-    })
+    *USE_POWF.get_or_init(|| std::env::var("RFF_MP3_XRPOW").is_ok_and(|v| v == "powf"))
 }
 
 /// One granule's quantized output.
@@ -169,7 +167,7 @@ pub struct QuantizedGranule {
 impl Default for QuantizedGranule {
     fn default() -> Self {
         // Arrays larger than 32 don't derive Default.
-        QuantizedGranule {
+        Self {
             coeffs: [0; GRANULE_LINES],
             side: GranuleSideInfo::default(),
             scalefactors: [0; 39],
@@ -286,7 +284,7 @@ fn quantize_into(
     out: &mut [i32; GRANULE_LINES],
 ) {
     let off = crate::tables::sfb_long_offsets(header.sample_rate);
-    let base = -0.25 * (gain - 210) as f64;
+    let base = -0.25 * f64::from(gain - 210);
     // One `exp2` for the granule; the per-band factor is a table lookup.
     let step_base = 2f64.powf(0.75 * base);
     let sf_step = sf_step_lut();
@@ -296,28 +294,184 @@ fn quantize_into(
     // folds it out.
     let mut sfx = *sf;
     sfx[21] = 0;
+    let mut steps = [0f64; 22];
     for b in 0..22 {
         let s = sfx[b];
-                                                       // step = scale_inv^(3/4): the per-band factor applied to the precomputed
-                                                       // |freq|^(3/4), instead of re-powering |freq|·scale_inv per line.
-                                                       //
-                                                       // Prometheus `perf002` (PRUNED 2026-07-08): factoring this into
-                                                       // `2^(0.75·base)·LUT[sf]` (per-band `powf`→LUT) was byte-identical but NOT
-                                                       // measurably faster (delta within run-to-run noise). Unlike xrpow's
-                                                       // `powf(0.75)` (arbitrary exponent → a real libm call → 8×), `2f64.powf(y)`
-                                                       // is base-2 and LLVM already lowers it to a fast `exp2` — so a LUT saves
-                                                       // nothing. Reverted; recorded in the Prometheus ledger.
-                                                       // VERIFIED 2026-07-08 at the asm level: rewriting these four base-2
-                                                       // `2f64.powf(x)` sites as explicit `x.exp2()` left the emitted call
-                                                       // counts identical (exp2=15/pow=10/powf=4 both ways) — the compiler
-                                                       // already does it, so `powf→exp2` is a genuine no-op. Don't re-try it.
-        let step = step_base * sf_step[s as usize];
+        // step = scale_inv^(3/4): the per-band factor applied to the precomputed
+        // |freq|^(3/4), instead of re-powering |freq|·scale_inv per line.
+        //
+        // Prometheus `perf002` (PRUNED 2026-07-08): factoring this into
+        // `2^(0.75·base)·LUT[sf]` (per-band `powf`→LUT) was byte-identical but NOT
+        // measurably faster (delta within run-to-run noise). Unlike xrpow's
+        // `powf(0.75)` (arbitrary exponent → a real libm call → 8×), `2f64.powf(y)`
+        // is base-2 and LLVM already lowers it to a fast `exp2` — so a LUT saves
+        // nothing. Reverted; recorded in the Prometheus ledger.
+        // VERIFIED 2026-07-08 at the asm level: rewriting these four base-2
+        // `2f64.powf(x)` sites as explicit `x.exp2()` left the emitted call
+        // counts identical (exp2=15/pow=10/powf=4 both ways) — the compiler
+        // already does it, so `powf→exp2` is a genuine no-op. Don't re-try it.
+        steps[b] = step_base * sf_step[s as usize];
+    }
+    let simd = crate::decode::isa::use_simd();
+    if simd {
+        // SAFETY: `use_simd()` checked the ISA; `off` spans exactly 0..576.
+        unsafe { quantize_lines_simd(off, &steps, freq, xrp, out) };
+    } else {
+        quantize_lines_scalar(off, &steps, freq, xrp, out);
+    }
+    // Kernel-reach census, once per call (never per line).
+    super::prof::QUANT_CALLS[usize::from(simd)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The per-line quantizer for all 22 bands: `sign(freq)·level_from(xrp·step[b])`.
+/// The scalar ORACLE for [`quantize_lines_simd`].
+#[inline]
+fn quantize_lines_scalar(
+    off: &[u16; 23],
+    steps: &[f64; 22],
+    freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
+    out: &mut [i32; GRANULE_LINES],
+) {
+    for b in 0..22 {
+        let step = steps[b];
         let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
         for i in lo..hi {
             let mag = level_from(xrp[i] * step);
             out[i] = if freq[i] < 0.0 { -mag } else { mag };
         }
     }
+}
+
+/// AVX twin of [`quantize_lines_scalar`], four lines per step. BIT-identical:
+/// the same f64 multiply, `level_from`'s exact sequence (subtract the bias, clamp
+/// to `[0, MAX_LEVEL]`, add one half, truncate -- `max_pd`/`min_pd` equal
+/// `f64::clamp` on these finite non-NaN inputs, and `cvttpd2dq` is the same
+/// truncation as `as i32`), and the sign applied as `(m ^ mask) - mask` where
+/// `mask` is `freq < 0.0` (so `-0.0` keeps its magnitude, as the scalar does).
+/// The rate loop calls this ~8x per granule; the 22-band loop lives INSIDE the
+/// `#[target_feature]` function, so each call crosses that boundary once.
+///
+/// # Safety
+/// AVX must be available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn quantize_lines_avx(
+    off: &[u16; 23],
+    steps: &[f64; 22],
+    freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
+    out: &mut [i32; GRANULE_LINES],
+) {
+    use std::arch::x86_64::*;
+    let (bias, zero, max, half) = (
+        _mm256_set1_pd(QUANT_BIAS),
+        _mm256_setzero_pd(),
+        _mm256_set1_pd(f64::from(MAX_LEVEL)),
+        _mm256_set1_pd(0.5),
+    );
+    let fzero = _mm_setzero_ps();
+    for b in 0..22 {
+        let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
+        let vstep = _mm256_set1_pd(steps[b]);
+        let mut i = lo;
+        while i + 4 <= hi {
+            // SAFETY: the loop guard `i + 4 <= hi` with `hi <= GRANULE_LINES` keeps all four lanes inside `xrp`, `freq` and `out` (each `[_; 576]`), whatever `off` holds.
+            unsafe {
+                let p = _mm256_mul_pd(_mm256_loadu_pd(xrp.as_ptr().add(i)), vstep);
+                let m = _mm256_sub_pd(p, bias);
+                let c = _mm256_min_pd(_mm256_max_pd(m, zero), max);
+                let mag = _mm256_cvttpd_epi32(_mm256_add_pd(c, half));
+                let neg = _mm_castps_si128(_mm_cmplt_ps(_mm_loadu_ps(freq.as_ptr().add(i)), fzero));
+                let q = _mm_sub_epi32(_mm_xor_si128(mag, neg), neg);
+                // `storeu` is the UNALIGNED store: the cast pointer is never
+                // dereferenced as an aligned `__m128i`.
+                #[allow(clippy::cast_ptr_alignment)]
+                _mm_storeu_si128(out.as_mut_ptr().add(i).cast::<__m128i>(), q);
+            }
+            i += 4;
+        }
+        let step = steps[b];
+        while i < hi {
+            let mag = level_from(xrp[i] * step);
+            out[i] = if freq[i] < 0.0 { -mag } else { mag };
+            i += 1;
+        }
+    }
+}
+
+/// NEON twin of [`quantize_lines_scalar`], two lines per step (f64x2). Same
+/// sequence: `vmaxq`/`vminq` clamp, `+0.5`, `vcvtq_s64_f64` truncation, narrowed to
+/// i32 (in range after the clamp), sign via `(m ^ mask) - mask`. BIT-identical.
+///
+/// # Safety
+/// NEON is baseline on AArch64; every access is bounded inside (`hi` is capped at
+/// `GRANULE_LINES`), whatever `off` holds.
+#[cfg(target_arch = "aarch64")]
+unsafe fn quantize_lines_neon(
+    off: &[u16; 23],
+    steps: &[f64; 22],
+    freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
+    out: &mut [i32; GRANULE_LINES],
+) {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is baseline on AArch64; every load/store is guarded by `i + 2 <= hi` with `hi <= GRANULE_LINES`, inside `xrp`, `freq` and `out` (each `[_; 576]`), whatever `off` holds.
+    unsafe {
+        let (bias, zero, max, half) = (
+            vdupq_n_f64(QUANT_BIAS),
+            vdupq_n_f64(0.0),
+            vdupq_n_f64(MAX_LEVEL as f64),
+            vdupq_n_f64(0.5),
+        );
+        for b in 0..22 {
+            let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
+            let vstep = vdupq_n_f64(steps[b]);
+            let mut i = lo;
+            while i + 2 <= hi {
+                let p = vmulq_f64(vld1q_f64(xrp.as_ptr().add(i)), vstep);
+                let c = vminq_f64(vmaxq_f64(vsubq_f64(p, bias), zero), max);
+                let mag = vmovn_s64(vcvtq_s64_f64(vaddq_f64(c, half)));
+                let neg =
+                    vreinterpret_s32_u32(vclt_f32(vld1_f32(freq.as_ptr().add(i)), vdup_n_f32(0.0)));
+                let q = vsub_s32(veor_s32(mag, neg), neg);
+                vst1_s32(out.as_mut_ptr().add(i), q);
+                i += 2;
+            }
+            let step = steps[b];
+            while i < hi {
+                let mag = level_from(xrp[i] * step);
+                out[i] = if freq[i] < 0.0 { -mag } else { mag };
+                i += 1;
+            }
+        }
+    }
+}
+
+/// This arch's quantizer twin (AVX / NEON / scalar).
+///
+/// # Safety
+/// Caller checked [`crate::decode::isa::simd_available`].
+#[inline]
+unsafe fn quantize_lines_simd(
+    off: &[u16; 23],
+    steps: &[f64; 22],
+    freq: &[f32; GRANULE_LINES],
+    xrp: &[f64; GRANULE_LINES],
+    out: &mut [i32; GRANULE_LINES],
+) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
+    unsafe {
+        quantize_lines_avx(off, steps, freq, xrp, out);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: forwards this fn's contract (the caller checked `simd_available()`).
+    unsafe {
+        quantize_lines_neon(off, steps, freq, xrp, out)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    quantize_lines_scalar(off, steps, freq, xrp, out)
 }
 
 /// Re-quantize ONE band in place, leaving every other line untouched.
@@ -337,8 +491,8 @@ fn quantize_band_in_place(
     coeffs: &mut [i32; GRANULE_LINES],
 ) {
     let off = crate::tables::sfb_long_offsets(header.sample_rate);
-    let base = -0.25 * (gain - 210) as f64;
-    let s = if b < 21 { sf_b } else { 0 } as f64;
+    let base = -0.25 * f64::from(gain - 210);
+    let s = f64::from(if b < 21 { sf_b } else { 0 });
     let step = 2f64.powf(0.75 * (base + SF_MULT * s));
     let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
     for i in lo..hi {
@@ -358,12 +512,12 @@ fn band_noise_one(
     b: usize,
 ) -> f32 {
     let off = crate::tables::sfb_long_offsets(header.sample_rate);
-    let scale = 2f64.powf(0.25 * (gain - 210) as f64) * sf_inv_lut()[sf_b as usize];
+    let scale = 2f64.powf(0.25 * f64::from(gain - 210)) * sf_inv_lut()[sf_b as usize];
     let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
     let mut e = 0f64;
     for i in lo..hi {
-        let xr = coeffs[i].signum() as f64 * requant_magnitude(coeffs[i]) * scale;
-        let d = freq[i] as f64 - xr;
+        let xr = f64::from(coeffs[i].signum()) * requant_magnitude(coeffs[i]) * scale;
+        let d = f64::from(freq[i]) - xr;
         e += d * d;
     }
     e as f32
@@ -382,15 +536,15 @@ fn band_noise(
     let mut noise = [0f32; 21];
     // Same factoring as `quantize_with_sf`: the granule term is one `exp2`, the
     // per-band term is a table lookup on the integer scalefactor.
-    let scale_base = 2f64.powf(0.25 * (gain - 210) as f64);
+    let scale_base = 2f64.powf(0.25 * f64::from(gain - 210));
     let sf_inv = sf_inv_lut();
     for (b, n) in noise.iter_mut().enumerate() {
         let scale = scale_base * sf_inv[sf[b] as usize];
         let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
         let mut e = 0f64;
         for i in lo..hi {
-            let xr = coeffs[i].signum() as f64 * requant_magnitude(coeffs[i]) * scale;
-            let d = freq[i] as f64 - xr;
+            let xr = f64::from(coeffs[i].signum()) * requant_magnitude(coeffs[i]) * scale;
+            let d = f64::from(freq[i]) - xr;
             e += d * d;
         }
         *n = e as f32;
@@ -505,6 +659,10 @@ fn inner_gain(
 /// over-threshold band, re-runs the inner loop, and keeps the lowest-peak-NMR
 /// result. With a flat threshold (C1) it degrades to pure rate control; with the
 /// real psymodel (Q1–Q4) it shapes quantization noise under the masking curve.
+///
+/// # Panics
+/// Never: the `expect` reads the best result of a search loop that always
+/// runs at least one iteration.
 pub fn loops(
     header: &FrameHeader,
     freq: &[f32; GRANULE_LINES],
@@ -552,16 +710,22 @@ pub fn loops(
         let huff_budget = bit_budget.saturating_sub(sf_bits);
 
         let mut coeffs = [0i32; GRANULE_LINES];
-        let (gain, inner) =
-            inner_gain(header, freq, &xrp, &sf, huff_budget, block_type, &mut coeffs);
+        let (gain, inner) = inner_gain(
+            header,
+            freq,
+            &xrp,
+            &sf,
+            huff_budget,
+            block_type,
+            &mut coeffs,
+        );
         // Reuse the quantization + Huffman selection the rate loop already did at
         // the winning gain (perf004); recompute only in the rare uncached case.
-        let mut side = match inner {
-            Some(side) => side,
-            None => {
-                quantize_into(header, freq, &xrp, gain, &sf, &mut coeffs);
-                huff_cost(header, &coeffs, block_type).0
-            }
+        let mut side = if let Some(side) = inner {
+            side
+        } else {
+            quantize_into(header, freq, &xrp, gain, &sf, &mut coeffs);
+            huff_cost(header, &coeffs, block_type).0
         };
         side.global_gain = gain as u8;
         side.scalefac_compress = compress;
@@ -678,12 +842,11 @@ fn loops_slack(
         block_type,
         &mut coeffs,
     );
-    let mut side = match inner {
-        Some(side) => side,
-        None => {
-            quantize_into(header, freq, xrp, gain, &sf, &mut coeffs);
-            huff_cost(header, &coeffs, block_type).0
-        }
+    let mut side = if let Some(side) = inner {
+        side
+    } else {
+        quantize_into(header, freq, xrp, gain, &sf, &mut coeffs);
+        huff_cost(header, &coeffs, block_type).0
     };
 
     // Per-band noise, kept incrementally: a refinement step changes exactly one
@@ -727,6 +890,29 @@ fn loops_slack(
                 worst = Some(b);
             }
         }
+        // Census: would the ranking have preferred a band that is already capped?
+        {
+            let mut any_best = None;
+            let mut any_score = f32::NEG_INFINITY;
+            for (bb, &n) in noise.iter().enumerate() {
+                let thr = (psy.thresholds[bb] * domain_scale).max(1e-20);
+                let sc = n / thr;
+                if sc > any_score && (!audible_only || n > thr) {
+                    any_score = sc;
+                    any_best = Some(bb);
+                }
+            }
+            if let Some(bb) = any_best {
+                if sf[bb] >= max_sf(bb) {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    if bb < 11 {
+                        super::prof::CAP_BLOCK_LO.fetch_add(1, Relaxed);
+                    } else {
+                        super::prof::CAP_BLOCK_HI.fetch_add(1, Relaxed);
+                    }
+                }
+            }
+        }
         let Some(b) = worst else { break };
 
         let mut trial = sf;
@@ -760,10 +946,12 @@ fn loops_slack(
     let mut scalefactors = [0u8; 39];
     scalefactors[..22].copy_from_slice(&sf);
 
-    use std::sync::atomic::Ordering::Relaxed;
-    super::prof::OUTER_TOTAL.fetch_add(1, Relaxed);
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
+    super::prof::OUTER_TOTAL.fetch_add(1, relaxed);
     if sf.iter().all(|&v| v == 0) {
-        super::prof::OUTER_KEPT0.fetch_add(1, Relaxed);
+        super::prof::OUTER_KEPT0.fetch_add(1, relaxed);
+    } else if (11..21).all(|b| sf[b] >= crate::tables::PRETAB[b]) {
+        super::prof::PREFLAG_OK.fetch_add(1, relaxed);
     }
 
     QuantizedGranule {
@@ -914,15 +1102,19 @@ pub fn loops_vbr(
         N.fetch_add(1, Relaxed);
         SUM_LO.fetch_add(lo.max(0) as u64, Relaxed);
         SUM_FLOOR.fetch_add(floor.max(0) as u64, Relaxed);
-        if floor > lo { CLAMPED.fetch_add(1, Relaxed); }
-        if lo >= 255 { SATURATED.fetch_add(1, Relaxed); }
+        if floor > lo {
+            CLAMPED.fetch_add(1, Relaxed);
+        }
+        if lo >= 255 {
+            SATURATED.fetch_add(1, Relaxed);
+        }
         let n = N.load(Relaxed);
         if n % 2000 == 0 {
             // What does the NMR actually read at the extremes?
             let p_floor = peak(floor);
             let p_max = peak(255);
-            let thr_min = psy.thresholds.iter().cloned().fold(f32::MAX, f32::min);
-            let thr_max = psy.thresholds.iter().cloned().fold(0f32, f32::max);
+            let thr_min = psy.thresholds.iter().copied().fold(f32::MAX, f32::min);
+            let thr_max = psy.thresholds.iter().copied().fold(0f32, f32::max);
             let sig: f32 = freq.iter().map(|x| x * x).sum();
             eprintln!(
                 "[nmr] peak(floor={floor})={p_floor:.6e} peak(255)={p_max:.6e} thr[min={thr_min:.3e} max={thr_max:.3e}] sig_energy={sig:.3e}"
@@ -1013,7 +1205,7 @@ mod c2_tests {
         let mut diffs = 0usize;
         for trial in 0..40 {
             let mut freq = [0f32; GRANULE_LINES];
-            for f in freq.iter_mut() {
+            for f in &mut freq {
                 s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 // magnitudes spanning the quantizer's working range
                 *f = ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0 * 1000.0;
@@ -1027,13 +1219,13 @@ mod c2_tests {
                 }
                 let got = quantize_with_sf(&header, &freq, &xrp, gain, &sf);
                 // Reference: the original per-line powf path.
-                let base = -0.25 * (gain - 210) as f64;
+                let base = -0.25 * f64::from(gain - 210);
                 for b in 0..22 {
-                    let sv = if b < 21 { sf[b] } else { 0 } as f64;
+                    let sv = f64::from(if b < 21 { sf[b] } else { 0 });
                     let scale_inv = 2f64.powf(base + SF_MULT * sv);
                     let (lo, hi) = (off[b] as usize, (off[b + 1] as usize).min(GRANULE_LINES));
                     for i in lo..hi {
-                        let mag = quantize_level(freq[i].abs() as f64 * scale_inv);
+                        let mag = quantize_level(f64::from(freq[i].abs()) * scale_inv);
                         let want = if freq[i] < 0.0 { -mag } else { mag };
                         total += 1;
                         if got[i] != want {
@@ -1123,7 +1315,7 @@ mod q6_tests {
     ) -> f32 {
         let mut sf = [0u8; 22];
         sf.copy_from_slice(&g.scalefactors[..22]);
-        let noise = band_noise(header, freq, &g.coeffs, g.side.global_gain as i32, &sf);
+        let noise = band_noise(header, freq, &g.coeffs, i32::from(g.side.global_gain), &sf);
         let mut peak = f32::NEG_INFINITY;
         for (b, &n) in noise.iter().enumerate() {
             peak = peak.max(10.0 * (n / thresholds[b].max(1e-20)).log10());
@@ -1179,7 +1371,7 @@ mod n4_tests {
     #[test]
     fn requant_magnitude_matches_power_law() {
         for level in [0, 1, 2, 3, 17, 255, 1024, MAX_LEVEL] {
-            let expect = (level as f64).powf(4.0 / 3.0);
+            let expect = f64::from(level).powf(4.0 / 3.0);
             assert!((requant_magnitude(level) - expect).abs() < 1e-9);
         }
         // Sign is carried separately, so the magnitude ignores it.
@@ -1214,6 +1406,55 @@ mod n4_tests {
     /// C gate: the branchless `level_from` must equal the original guarded form
     /// for every input, including the boundaries (≤0, the rounding seam, and the
     /// saturation knee) — a wide dense sweep plus the exact lattice midpoints.
+    /// The SIMD quantizer must be BIT-identical to the scalar oracle -- including
+    /// at the rounding seams (exact half-integer + bias), past saturation, at zero
+    /// and below the bias, and for `-0.0` frequencies (which keep a positive sign).
+    #[test]
+    fn quantize_lines_simd_matches_scalar() {
+        if !crate::decode::isa::simd_available() {
+            eprintln!("no SIMD twin on this host - scalar path only, gate skipped");
+            return;
+        }
+        let mut st = 0x6C07_8965u32;
+        let mut r = move || {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            st
+        };
+        for &rate in &[44100u32, 32000, 22050, 8000] {
+            let off = crate::tables::sfb_long_offsets(rate);
+            for trial in 0..64 {
+                let mut freq = [0f32; GRANULE_LINES];
+                let mut xrp = [0f64; GRANULE_LINES];
+                for i in 0..GRANULE_LINES {
+                    let k = r();
+                    freq[i] = match k % 7 {
+                        0 => -0.0,
+                        1 => 0.0,
+                        _ => ((k >> 3) as f32 / 2.0e8) - 10.0,
+                    };
+                    xrp[i] = match (k >> 8) % 5 {
+                        0 => f64::from(k % 9000) + 0.5 + QUANT_BIAS, // a rounding seam
+                        1 => 1.0e9,                                  // past saturation
+                        2 => 0.0,
+                        _ => f64::from(k >> 4) / 1.0e5,
+                    };
+                }
+                let mut steps = [0f64; 22];
+                for s in &mut steps {
+                    *s = [1.0, 0.5, 2.0, 0.123_456_7][(r() % 4) as usize];
+                }
+                let (mut a, mut b) = ([0i32; GRANULE_LINES], [0i32; GRANULE_LINES]);
+                quantize_lines_scalar(off, &steps, &freq, &xrp, &mut a);
+                // SAFETY: gated on simd_available(); off spans 0..576.
+                unsafe { quantize_lines_simd(off, &steps, &freq, &xrp, &mut b) };
+                assert_eq!(
+                    a, b,
+                    "quantizer SIMD/scalar mismatch at rate {rate} trial {trial}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn level_from_matches_guarded() {
         // The reference: the pre-optimisation guarded implementation.
@@ -1227,17 +1468,19 @@ mod n4_tests {
         };
         // Dense sweep across the working range and a bit past saturation.
         let mut p = -1.0f64;
+        // A float-stepped sweep is the point here (it lands near many rounding seams).
+        #[allow(clippy::while_float)]
         while p < 9000.0 {
             assert_eq!(level_from(p), guarded(p), "level_from mismatch at {p}");
             p += 0.013; // irrational-ish step to land near many rounding seams
         }
         // Exact half-integer + bias midpoints (the rounding boundary itself).
         for n in 0..50 {
-            let mid = n as f64 + 0.5 + QUANT_BIAS;
+            let mid = f64::from(n) + 0.5 + QUANT_BIAS;
             assert_eq!(level_from(mid), guarded(mid), "midpoint {mid}");
         }
         // Extremes.
-        for &p in &[f64::from(0), 1e9, MAX_LEVEL as f64 + 5.0] {
+        for &p in &[f64::from(0), 1e9, f64::from(MAX_LEVEL) + 5.0] {
             assert_eq!(level_from(p), guarded(p));
         }
     }

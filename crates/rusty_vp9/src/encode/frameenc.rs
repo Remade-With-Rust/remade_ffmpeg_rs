@@ -43,7 +43,7 @@ use crate::decode::{comp_ref_context, reference_mode_context};
 pub static DEDUP: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3]; // emit_lookups, hits, matches
 use super::prof;
-use super::transform::forward_transform;
+use super::transform::forward_transform_scratch;
 use super::varpart::VarTree;
 use super::varrd;
 use crate::block::{
@@ -79,7 +79,9 @@ use crate::decode::{average_split_mvs, INTER_MODE_TREE};
 use crate::geom_tables::{B_HEIGHT_LOG2, B_WIDTH_LOG2};
 use crate::geom_tables::{MAX_TXSIZE, SIZE_GROUP};
 use crate::inter::{predict_block, RefPlane};
-use crate::loopfilter::loop_filter_frame;
+use crate::loopfilter::{
+    build_plane_masks, loop_filter_frame, loop_filter_plane_masked, PlaneMasks,
+};
 use crate::mv::{find_mv_refs, get_mode_context, lower_mv_precision, use_mv_hp, MvRef, NmvCounts};
 use crate::predict::{build_intra_edges, predict};
 use crate::prob_tables::{DEFAULT_COEF_PROBS, KF_PARTITION_PROBS};
@@ -121,9 +123,15 @@ type YSnap = (Vec<u16>, [u8; 16], [u8; 16]);
 /// so a NONE trial can be rolled back before trying SPLIT and vice-versa.
 struct BlockSnap {
     rec: [Vec<u16>; 3],
-    above_ctx: [Vec<u8>; 3],
+    /// The block's span of each plane's above context: at most 16 entries (a
+    /// 64-wide block), so held inline with its length. As four pooled `Vec`s
+    /// (with `above_seg`) these cost a pool take and a pool put apiece per
+    /// snapshot, to carry between 1 and 16 bytes each.
+    above_ctx: [[u8; 16]; 3],
+    above_len: [u8; 3],
     left_ctx: [[u8; 16]; 3],
-    above_seg: Vec<u8>,
+    above_seg: [u8; 8],
+    seg_len: u8,
     left_seg: [u8; 8],
     mi: Vec<ModeInfo>,
     x_mis: usize,
@@ -149,7 +157,6 @@ struct BlockSnap {
 // the copy itself is load-bearing and only where its memory COMES FROM is free to change.
 thread_local! {
     static POOL_U16: RefCell<Vec<Vec<u16>>> = const { RefCell::new(Vec::new()) };
-    static POOL_U8: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
     static POOL_MI: RefCell<Vec<Vec<ModeInfo>>> = const { RefCell::new(Vec::new()) };
 }
 /// The RD pass's decision cache: `(mi_row, mi_col, bsize) -> (winning mode, predictor,
@@ -340,7 +347,6 @@ pub fn set_snap_pool(on: bool) {
     SNAP_POOL.store(on as u8, std::sync::atomic::Ordering::Relaxed);
     if !on {
         let _ = POOL_U16.try_with(|p| p.borrow_mut().clear());
-        let _ = POOL_U8.try_with(|p| p.borrow_mut().clear());
         let _ = POOL_MI.try_with(|p| p.borrow_mut().clear());
     }
 }
@@ -378,7 +384,6 @@ macro_rules! pool_ops {
     };
 }
 pool_ops!(take_u16, put_u16, POOL_U16, u16);
-pool_ops!(take_u8, put_u8, POOL_U8, u8);
 pool_ops!(take_mi, put_mi, POOL_MI, ModeInfo);
 
 impl Drop for BlockSnap {
@@ -387,10 +392,6 @@ impl Drop for BlockSnap {
         for v in &mut self.rec {
             put_u16(std::mem::take(v));
         }
-        for v in &mut self.above_ctx {
-            put_u8(std::mem::take(v));
-        }
-        put_u8(std::mem::take(&mut self.above_seg));
         put_mi(std::mem::take(&mut self.mi));
     }
 }
@@ -899,9 +900,9 @@ pub struct FrameEncoder {
     /// recon (a real dependency). Kept ON; skip only for experiments (would need BD-gating).
     snap_recon: bool,
     /// Reused per-tx-block scratch (see [`TxScratch`]). Boxed and moved out with
-    /// `mem::take` for the duration of `encode_tx_block` so it does not conflict
+    /// `Option::take` for the duration of `encode_tx_block` so it does not conflict
     /// with the `&self.src` / `&mut self.rec` borrows that function needs.
-    tx_scratch: Box<TxScratch>,
+    tx_scratch: Option<Box<TxScratch>>,
     /// Re-zero [`TxScratch`] on entry, reproducing the old stack-array cost
     /// exactly (`VP9_TX_MEMSET=1`). The A/B oracle for the scratch brick: output
     /// is byte-identical either way, so any difference is purely the memset.
@@ -929,6 +930,9 @@ pub(crate) struct TxScratch {
     levels: [i32; 1024],
     dqcoeff: [i32; 1024],
     token_cache: [u8; 1024],
+    /// Forward-transform intermediate (the 16x16 / 32x32 DCT column pass and the
+    /// ADST matrix row pass). Fully written before it is read, like the rest.
+    fwd_tmp: [i64; 1024],
 }
 
 impl Default for TxScratch {
@@ -939,6 +943,7 @@ impl Default for TxScratch {
             levels: [0; 1024],
             dqcoeff: [0; 1024],
             token_cache: [0; 1024],
+            fwd_tmp: [0; 1024],
         }
     }
 }
@@ -952,6 +957,7 @@ impl TxScratch {
         self.levels = [0; 1024];
         self.dqcoeff = [0; 1024];
         self.token_cache = [0; 1024];
+        self.fwd_tmp = [0; 1024];
     }
 }
 
@@ -1293,8 +1299,9 @@ impl FrameEncoder {
                 .unwrap_or(500.0),
             subpel_fast: false,
             motion_fast: std::env::var("VP9_MOTION_FAST").is_ok(),
-            subpel_bilinear: std::env::var("VP9_SUBPEL_BILINEAR").is_ok()
-                || std::env::var("VP9_SUBPEL_8TAP").is_err() && false, // set by presets
+            // Bilinear subpel is otherwise chosen by the presets. (The former
+            // `|| VP9_SUBPEL_8TAP.is_err() && false` arm was always false.)
+            subpel_bilinear: std::env::var("VP9_SUBPEL_BILINEAR").is_ok(),
             subpel_tree: std::env::var("VP9_SUBPEL_TREE").is_ok(),
             subpel_diag: std::env::var("VP9_SUBPEL_DIAG").is_ok(),
             hp_mv: std::env::var("VP9_NO_HP_MV").is_err(),
@@ -1413,7 +1420,7 @@ impl FrameEncoder {
             yuv_abort: std::env::var("VP9_NO_YUV_ABORT").is_err(),
             snap_recon: std::env::var("VP9_NO_SNAP_RECON").is_err(),
             model_rank: std::env::var("VP9_MODEL_RANK").is_ok(),
-            tx_scratch: Box::default(),
+            tx_scratch: Some(Box::default()),
             tx_memset: std::env::var("VP9_TX_MEMSET").is_ok(),
             has_avx2: {
                 #[cfg(target_arch = "x86_64")]
@@ -2907,23 +2914,28 @@ impl FrameEncoder {
         // Slice the above-ctx/seg snapshots to the block's span — cloning the
         // frame-width Vecs per snapshot was pure overhead (a trial only mutates
         // the columns the block covers).
-        let above_ctx = std::array::from_fn(|pl| {
+        let mut above_ctx = [[0u8; 16]; 3];
+        let mut above_len = [0u8; 3];
+        for pl in 0..3 {
             let ss = self.rec[pl].ss_x;
             let c0 = (mi_col * 2) >> ss;
             let w = ((x_mis * 2) >> ss).max(1);
             let end = (c0 + w).min(self.above_ctx[pl].len());
-            let mut v = take_u8(end.saturating_sub(c0));
-            v.extend_from_slice(&self.above_ctx[pl][c0..end]);
-            v
-        });
+            let span = &self.above_ctx[pl][c0..end];
+            above_ctx[pl][..span.len()].copy_from_slice(span);
+            above_len[pl] = span.len() as u8;
+        }
         let seg_end = (mi_col + x_mis).min(self.above_seg.len());
-        let mut above_seg = take_u8(seg_end.saturating_sub(mi_col));
-        above_seg.extend_from_slice(&self.above_seg[mi_col..seg_end]);
+        let seg_span = &self.above_seg[mi_col..seg_end];
+        let mut above_seg = [0u8; 8];
+        above_seg[..seg_span.len()].copy_from_slice(seg_span);
         BlockSnap {
             rec,
             above_ctx,
+            above_len,
             left_ctx: self.left_ctx,
             above_seg,
+            seg_len: seg_span.len() as u8,
             left_seg: self.left_seg,
             mi,
             x_mis,
@@ -2954,12 +2966,12 @@ impl FrameEncoder {
         for pl in 0..3 {
             let ss = self.rec[pl].ss_x;
             let c0 = (mi_col * 2) >> ss;
-            let end = (c0 + s.above_ctx[pl].len()).min(self.above_ctx[pl].len());
+            let end = (c0 + s.above_len[pl] as usize).min(self.above_ctx[pl].len());
             self.above_ctx[pl][c0..end].copy_from_slice(&s.above_ctx[pl][..end - c0]);
         }
         self.left_ctx = s.left_ctx;
         let sc0 = mi_col;
-        let send = (sc0 + s.above_seg.len()).min(self.above_seg.len());
+        let send = (sc0 + s.seg_len as usize).min(self.above_seg.len());
         self.above_seg[sc0..send].copy_from_slice(&s.above_seg[..send - sc0]);
         self.left_seg = s.left_seg;
         let mut k = 0;
@@ -4870,6 +4882,66 @@ impl FrameEncoder {
         sad
     }
 
+    /// [`block_sad_sized`](Self::block_sad_sized) with a whole-window interior
+    /// fast path in front (u8 domain): when the entire block window lies inside
+    /// both planes, every tile would take the same branches — in-source,
+    /// interior, u8 — so that is decided once and the tiles run with nothing per
+    /// tile but the SAD and the early-out. Same tiles, same order, same bound
+    /// test, so the same value.
+    ///
+    /// A separate entry point on purpose. It is for call sites whose candidates
+    /// are mostly interior (the diamond search, the predictor probe). The
+    /// exhaustive sweep already peels its interior runs into x4 batches, so what
+    /// it sends to `block_sad_sized` is mostly edge candidates: with the test in
+    /// front of every call it measured +0.037% at speed 0.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn block_sad_sized_fast(
+        &self,
+        base_x: usize,
+        base_y: usize,
+        mv_r: i32,
+        mv_c: i32,
+        bwl: usize,
+        bhl: usize,
+        bound: i64,
+        ref8: Option<&[u8]>,
+    ) -> i64 {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(r8) = ref8 {
+            let tiles_w = 1usize << bwl.saturating_sub(1);
+            let tiles_h = 1usize << bhl.saturating_sub(1);
+            let step = if tiles_w > 2 || tiles_h > 2 { 2 } else { 1 };
+            let (src, rp) = (&self.src[0], self.aref(0));
+            let (bw_px, bh_px) = (tiles_w * 8, tiles_h * 8);
+            let (x0, y0) = (base_x as i32 + mv_c, base_y as i32 + mv_r);
+            if x0 >= 0
+                && y0 >= 0
+                && x0 as usize + bw_px <= rp.w
+                && y0 as usize + bh_px <= rp.h
+                && base_x + bw_px <= src.w
+                && base_y + bh_px <= src.h
+            {
+                // SAFETY: AVX2 is implied by `ref8` (u8_search); both windows were
+                // just checked to lie inside their planes, whose u8 mirrors have
+                // the same geometry as the u16 planes.
+                return unsafe {
+                    crate::inter::sad_tiles_u8(
+                        self.src8.as_ptr().add(base_y * src.stride + base_x),
+                        src.stride,
+                        r8.as_ptr().add(y0 as usize * rp.stride + x0 as usize),
+                        rp.stride,
+                        tiles_w,
+                        tiles_h,
+                        step,
+                        bound,
+                    )
+                };
+            }
+        }
+        self.block_sad_sized(base_x, base_y, mv_r, mv_c, bwl, bhl, bound, ref8)
+    }
+
     fn block_sad_sized(
         &self,
         base_x: usize,
@@ -4944,14 +5016,21 @@ impl FrameEncoder {
             return sad8x8(s, src.stride, r, rp.stride, self.has_avx2) as i64;
         }
         // Edge path: clamp each sample to the coded region (unchanged semantics).
+        // The clamp is separable, so the eight columns are clamped once per call
+        // and each row once: the old form clamped both coordinates and did two
+        // bounds-checked 2-D index computations for every one of the 64 samples,
+        // and on panning content this path is most of the integer search.
+        let mut cx = [0usize; 8];
+        for (x, c) in cx.iter_mut().enumerate() {
+            *c = (base_x as i32 + x as i32 + mv_c).clamp(0, rw - 1) as usize;
+        }
         let mut sad = 0i64;
-        for y in 0..8i32 {
-            for x in 0..8i32 {
-                let sx = (base_x as i32 + x + mv_c).clamp(0, rw - 1) as usize;
-                let sy = (base_y as i32 + y + mv_r).clamp(0, rh - 1) as usize;
-                let r = rp.buf[sy * rp.stride + sx] as i64;
-                let s = src.buf[(base_y + y as usize) * src.stride + base_x + x as usize] as i64;
-                sad += (s - r).abs();
+        for y in 0..8usize {
+            let sy = (base_y as i32 + y as i32 + mv_r).clamp(0, rh - 1) as usize;
+            let r_row = &rp.buf[sy * rp.stride..][..rw as usize];
+            let s_row = &src.buf[(base_y + y) * src.stride + base_x..][..8];
+            for x in 0..8 {
+                sad += (s_row[x] as i64 - r_row[cx[x]] as i64).abs();
             }
         }
         sad
@@ -5049,7 +5128,7 @@ impl FrameEncoder {
                 self.me_skip
             };
             let (pr, pc) = (predictor.0 / 8, predictor.1 / 8);
-            let psad = self.block_sad_sized(base_x, base_y, pr, pc, swl, shl, i64::MAX, ref8);
+            let psad = self.block_sad_sized_fast(base_x, base_y, pr, pc, swl, shl, i64::MAX, ref8);
             let area = ((1i64 << bwl) * (1i64 << bhl) * 16) as f64; // luma pixels
             if (psad as f64) < t * area {
                 if realtime_skip {
@@ -5173,7 +5252,8 @@ impl FrameEncoder {
                 // the redundant work it saved. The subpel diamond keeps its dedup
                 // because each of its scores is a full MC interpolation.)
                 let consider = |best_sad: &mut i64, best_px: &mut (i32, i32), r: i32, c: i32| {
-                    let sad = self.block_sad_sized(base_x, base_y, r, c, swl, shl, *best_sad, ref8);
+                    let sad =
+                        self.block_sad_sized_fast(base_x, base_y, r, c, swl, shl, *best_sad, ref8);
                     let shorter = r.abs() + c.abs() < best_px.0.abs() + best_px.1.abs();
                     if sad < *best_sad || (sad == *best_sad && shorter) {
                         *best_sad = sad;
@@ -5616,6 +5696,16 @@ impl FrameEncoder {
         };
         let (nl, nr) = if fx != 0 { (3i32, 5i32) } else { (0, 0) };
         let (nt, nb) = if fy != 0 { (3i32, 4i32) } else { (0, 0) };
+        // Per-CALL invariants, hoisted out of the tile loop as in
+        // `predicted_sad_sized`: the u8 plane view and the profiler scope.
+        #[cfg(target_arch = "x86_64")]
+        let refp8_c = r8_arc.as_deref().map(|r8| crate::inter::RefPlane8 {
+            buf: r8,
+            stride: rp.stride,
+            w: refp.w,
+            h: refp.h,
+        });
+        let _s_call = prof::Scope::new(prof::S::Interp);
         let mut pred = [0u16; 64];
         let mut sse = 0i64;
         let mut sampled = 0i64;
@@ -5626,26 +5716,19 @@ impl FrameEncoder {
                 let (px, py) = (base_x + tx * 8, base_y + ty * 8);
                 if px + 8 <= src.w && py + 8 <= src.h {
                     sampled += 1;
-                    let _s = prof::Scope::new(prof::S::Interp);
                     let (bx, by) = (bx0 + (tx * 8) as i32, by0 + (ty * 8) as i32);
                     #[cfg(target_arch = "x86_64")]
-                    if let Some(r8) = &r8_arc {
+                    if let Some(refp8) = &refp8_c {
                         if bx - nl >= 0
                             && bx + 8 + nr <= refp.w
                             && by - nt >= 0
                             && by + 8 + nb <= refp.h
                         {
-                            let refp8 = crate::inter::RefPlane8 {
-                                buf: r8,
-                                stride: rp.stride,
-                                w: refp.w,
-                                h: refp.h,
-                            };
                             // SAFETY: window checked; AVX2 implied by u8_search;
                             // src8 mirrors src exactly for 8-bit content.
                             sse += unsafe {
                                 crate::inter::subpel_sse8x8_u8(
-                                    &refp8,
+                                    refp8,
                                     bx,
                                     by,
                                     fx,
@@ -5677,12 +5760,7 @@ impl FrameEncoder {
                         self.max_px,
                     );
                     let s = &src.buf[(py * src.stride + px)..];
-                    for r in 0..8 {
-                        for c in 0..8 {
-                            let d = s[r * src.stride + c] as i64 - pred[r * 8 + c] as i64;
-                            sse += d * d;
-                        }
-                    }
+                    sse += super::blockkern::block_sse(s, src.stride, &pred, 8, 8, 8) as i64;
                     // Shortlist abort: SSE accumulates non-negatively, so once
                     // STRICTLY over the bound this candidate provably cannot
                     // enter the top-K (the bound only shrinks as more collect) —
@@ -5847,6 +5925,7 @@ impl FrameEncoder {
         bw: i32,
         bh: i32,
         edges: (i32, i32, i32, i32),
+        ref8: Option<&[u8]>,
     ) -> i64 {
         let base_x = mi_col * 8 + sub_x * 4;
         let base_y = mi_row * 8 + sub_y * 4;
@@ -5854,6 +5933,42 @@ impl FrameEncoder {
         let bx = base_x as i32 + (mv_q4.1 >> 4);
         let by = base_y as i32 + (mv_q4.0 >> 4);
         let rp = self.aref(0);
+        // u8 score domain (8-bit content): interpolate + `psadbw` fused, the
+        // prediction never stored. Bit-identical to the u16 path below (pinned
+        // by `score4x4_u8_matches_u16_path`); candidates whose filter window
+        // crosses the plane edge fall through to it.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(r8) = ref8 {
+            let (fx, fy) = ((mv_q4.1 & 15) as usize, (mv_q4.0 & 15) as usize);
+            let sp = &self.src[0];
+            if crate::inter::score4x4_window_ok(rp.w as i32, rp.h as i32, bx, by, fx != 0, fy != 0)
+                && (base_y + 3) * sp.stride + base_x + 4 <= self.src8.len()
+            {
+                let refp8 = crate::inter::RefPlane8 {
+                    buf: r8,
+                    stride: rp.stride,
+                    w: rp.w as i32,
+                    h: rp.h as i32,
+                };
+                // SAFETY: `ref8` is only ever `Some` under `u8_search()` (AVX2
+                // present); the reference window was just checked; the 4x4 source
+                // block was just checked to lie inside `src8`.
+                return unsafe {
+                    crate::inter::subpel_score4x4_u8(
+                        &refp8,
+                        bx,
+                        by,
+                        fx,
+                        fy,
+                        self.active_filter as usize,
+                        self.src8.as_ptr().add(base_y * sp.stride + base_x),
+                        sp.stride,
+                    )
+                } as i64;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = ref8;
         // Fast path: integer MV (no subpel fraction) + in-bounds 4×4 window → direct
         // SAD, skipping the 8-tap `predict_block` (which for frac=0 is a plain copy).
         // Byte-identical; covers the bulk of the integer search grid.
@@ -5977,7 +6092,7 @@ impl FrameEncoder {
         edges: (i32, i32, i32, i32),
     ) {
         use std::sync::atomic::Ordering::Relaxed;
-        let single = self.sub4x4_sad(mi_row, mi_col, idx, idy, best_mv, bw, bh, edges);
+        let single = self.sub4x4_sad(mi_row, mi_col, idx, idy, best_mv, bw, bh, edges, None);
         let neg = (-best_mv.0, -best_mv.1);
         let c0 = self.sub4x4_sad_compound(
             mi_row,
@@ -6020,17 +6135,30 @@ impl FrameEncoder {
         bw: i32,
         bh: i32,
         edges: (i32, i32, i32, i32),
-    ) -> Mv {
+        ref8: Option<&[u8]>,
+    ) -> (Mv, i64) {
         const R: i32 = 4;
         let mut best = (0i32, 0i32);
         let mut best_sad = i64::MAX;
         if self.full_msearch {
             // Reference exhaustive ±4 (oracle for the diamond, `VP9_FULL_MSEARCH`).
-            for &(cr, cc) in &[(0i32, 0i32), (predictor.0 / 8, predictor.1 / 8)] {
+            let centres = [(0i32, 0i32), (predictor.0 / 8, predictor.1 / 8)];
+            for (ci, &(cr, cc)) in centres.iter().enumerate() {
                 for dr in -R..=R {
                     for dc in -R..=R {
-                        let mv = ((cr + dr) * 8, (cc + dc) * 8);
-                        let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges);
+                        let (r, c) = (cr + dr, cc + dc);
+                        // The predictor's square overlaps the zero-centred one
+                        // whenever the predictor is within 2R of zero (all 81
+                        // positions when it rounds to zero). A repeated position
+                        // has the SAD it had the first time, which cannot beat
+                        // itself under the strict `<` below, so skipping it is
+                        // exact.
+                        if ci == 1 && r.abs() <= R && c.abs() <= R {
+                            continue;
+                        }
+                        let mv = (r * 8, c * 8);
+                        let sad =
+                            self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges, ref8);
                         if sad < best_sad {
                             best_sad = sad;
                             best = mv;
@@ -6043,7 +6171,7 @@ impl FrameEncoder {
             // (~15–25 SADs vs 162 exhaustive). Whole-pel candidates, 1/8-pel units.
             let consider = |best_sad: &mut i64, best: &mut Mv, r: i32, c: i32| {
                 let mv = (r * 8, c * 8);
-                let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges);
+                let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges, ref8);
                 if sad < *best_sad {
                     *best_sad = sad;
                     *best = mv;
@@ -6083,15 +6211,20 @@ impl FrameEncoder {
         let int = best;
         for dr in [-4i32, -2, 0, 2, 4] {
             for dc in [-4i32, -2, 0, 2, 4] {
+                if dr == 0 && dc == 0 {
+                    continue; // `int` itself: already scored, cannot beat its own SAD
+                }
                 let mv = (int.0 + dr, int.1 + dc);
-                let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges);
+                let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges, ref8);
                 if sad < best_sad {
                     best_sad = sad;
                     best = mv;
                 }
             }
         }
-        best
+        // `best_sad` is the SAD of `best` (they are only ever updated together),
+        // so the caller need not score the winner a second time.
+        (best, best_sad)
     }
 
     /// Sub-8×8 per-sub-block decision (Part B). For `subsize` (BLOCK_4X4/8X4/4X8) it
@@ -6129,6 +6262,9 @@ impl FrameEncoder {
         // A NEWMV must beat a predicted mode by ~this SAD to justify its MV bits.
         const NEWMV_SAD_PENALTY: i64 = 48;
         self.active_ref = slot;
+        // The u8 mirror of this reference, fetched once for the whole search.
+        let r8_arc = self.u8_search().then(|| self.ref8_active());
+        let ref8 = r8_arc.as_deref();
         let mut mi = ModeInfo {
             sb_type: bsize as u8,
             skip: false,
@@ -6147,7 +6283,7 @@ impl FrameEncoder {
                 let j = idy * 2 + idx;
                 // ZEROMV baseline.
                 let mut best_cost =
-                    self.sub4x4_sad(mi_row, mi_col, idx, idy, (0, 0), bw, bh, edges);
+                    self.sub4x4_sad(mi_row, mi_col, idx, idy, (0, 0), bw, bh, edges, ref8);
                 let mut best_mode = ZEROMV;
                 let mut best_mv = (0i32, 0i32);
                 // NEAREST / NEAR — free predicted MVs (no MV bits).
@@ -6156,7 +6292,7 @@ impl FrameEncoder {
                         self.enc_sub8x8_mv(&mi, m, j, 0, mi_row, mi_col, bsize, edges),
                         self.hp_mv,
                     );
-                    let c = self.sub4x4_sad(mi_row, mi_col, idx, idy, mv, bw, bh, edges);
+                    let c = self.sub4x4_sad(mi_row, mi_col, idx, idy, mv, bw, bh, edges, ref8);
                     if c < best_cost {
                         best_cost = c;
                         best_mode = m;
@@ -6203,9 +6339,9 @@ impl FrameEncoder {
                     self.prev_mv(mi_row, mi_col),
                 );
                 let pred = lower_mv_precision(cand[0], self.hp_mv);
-                let mvw = self.search_mv_sub(mi_row, mi_col, idx, idy, pred, bw, bh, edges);
-                let cw = self.sub4x4_sad(mi_row, mi_col, idx, idy, mvw, bw, bh, edges)
-                    + NEWMV_SAD_PENALTY;
+                let (mvw, sad_w) =
+                    self.search_mv_sub(mi_row, mi_col, idx, idy, pred, bw, bh, edges, ref8);
+                let cw = sad_w + NEWMV_SAD_PENALTY;
                 // G4 harvest (observe-only): predicted-mode SAD vs the searched NEWMV.
                 if self.g1_harvest {
                     eprintln!(
@@ -6588,11 +6724,20 @@ impl FrameEncoder {
         // zero-init on every one of the ~2.1M calls a 20-frame CIF encode makes,
         // which measured as the largest single unattributed bucket in the
         // encoder. Every buffer is fully written over `[..n]` before it is read,
-        // so carrying stale bytes past `n` is unobservable. `mem::take` (a
-        // pointer move on a `Box`) keeps the borrow checker happy alongside the
+        // so carrying stale bytes past `n` is unobservable. `Option::take` (a
+        // pointer move) keeps the borrow checker happy alongside the
         // `&self.src` / `&mut self.rec` borrows below; it is restored at BOTH
-        // exits. `encode_tx_block` is not re-entrant, so the box is never empty.
-        let mut scratch = std::mem::take(&mut self.tx_scratch);
+        // exits. `encode_tx_block` is not re-entrant, so the slot is never empty.
+        //
+        // It must be `Option::take`, not `mem::take` on a bare `Box`: the latter
+        // leaves `Box::default()` behind, i.e. allocates and zero-fills a fresh
+        // ~17 KB `TxScratch` on every call and frees it at the restore. That was
+        // one `zalloc` + memset + free per transform block (callgrind: 20.6K Ir
+        // per call, 53-62% of encode Ir; wall -9..-30%, 16/16 paired rounds).
+        let mut scratch = self
+            .tx_scratch
+            .take()
+            .expect("tx scratch is never lent twice");
         if self.tx_memset {
             scratch.clear(); // VP9_TX_MEMSET=1 — the A/B oracle arm
         }
@@ -6602,32 +6747,30 @@ impl FrameEncoder {
             levels,
             dqcoeff,
             token_cache,
+            fwd_tmp,
         } = &mut *scratch;
 
         let n = bs * bs;
         let src = &self.src[plane];
-        // Row-sliced rather than 2-D indexed: the old form recomputed
-        // `(y0+y)*src.stride + x0+x` per pixel and defeated vectorisation across
-        // two different strides. Bounds are checked once per row, and the inner
-        // loop is a flat u16->i32 subtract that LLVM can widen.
-        for y in 0..bs {
-            let s_row = &src.buf[(y0 + y) * src.stride + x0..][..bs];
-            let p_row = &self.rec[plane].buf[dst_off + y * stride..][..bs];
-            let d_row = &mut residual[y * bs..][..bs];
-            for x in 0..bs {
-                d_row[x] = s_row[x] as i32 - p_row[x] as i32;
-            }
-        }
+        // One pass produces the residual AND its energy `Σ residual²`. The energy
+        // used to be re-derived by up to two further walks over `residual` (the
+        // skip-trial prediction SSE and the trellis gate below), and the
+        // subtract itself ran as a scalar loop: its length is a runtime `bs`, so
+        // the 4- and 8-wide blocks never reached LLVM's vector body.
+        let resid_sse = super::blockkern::residual_and_sse(
+            &src.buf[y0 * src.stride + x0..],
+            src.stride,
+            &self.rec[plane].buf[dst_off..],
+            stride,
+            bs,
+            &mut residual[..n],
+        );
         // Prediction-only SSE (Σ(src−pred)² = Σ residual²) — the distortion if this
         // block were coded `skip`. Accumulated on the measuring trial only (the
         // force_skip re-run re-uses the captured value). Same pixels the recon SSE
         // below sums, so the two are directly RD-comparable.
         if self.skip_trial && !self.force_skip {
-            let mut psse = 0u64;
-            for &r in &residual[..n] {
-                psse += (r as i64 * r as i64) as u64;
-            }
-            self.pending_pred_sse += psse;
+            self.pending_pred_sse += resid_sse;
         }
 
         // ---- forward transform + quantize (inter / lossless / chroma / 32×32
@@ -6690,7 +6833,13 @@ impl FrameEncoder {
         if !from_cache {
             {
                 let _s = prof::Scope::new(prof::S::FwdTx);
-                forward_transform(&residual[..n], bs, tx_type, &mut coeffs[..n]);
+                forward_transform_scratch(
+                    &residual[..n],
+                    bs,
+                    tx_type,
+                    &mut coeffs[..n],
+                    &mut fwd_tmp[..],
+                );
             }
             eob = {
                 let _s = prof::Scope::new(prof::S::Quantize);
@@ -6742,10 +6891,7 @@ impl FrameEncoder {
         // trellis is load-bearing for our quality (libvpx compensates elsewhere in realtime).
         let trellis_gated = trellis_here && self.use_trellis && eob > 0 && {
             if self.trellis_mse_t > 0.0 {
-                let mut rss = 0i64;
-                for &r in &residual[..n] {
-                    rss += (r as i64) * (r as i64);
-                }
+                let rss = resid_sse as i64; // Σ residual², from the residual pass
                 let qstep = (dq.1 >> 3).max(1) as i64;
                 (rss as f64) <= (n as f64) * ((qstep * qstep) as f64) * self.trellis_mse_t
             } else {
@@ -6799,8 +6945,9 @@ impl FrameEncoder {
                 .as_ref()
                 .map(|fc| &fc.coef_probs[tx_size][pt][inter])
                 .unwrap_or(default_probs);
-            let mut coef_cnt = [[[0u32; 4]; 6]; 6];
-            let mut eob_cnt = [[0u32; 6]; 6];
+            // Tally straight into the frame counts. `encode_coefs` only ever does
+            // `+= 1` on these, so a zeroed 720-byte local pair plus a 180-add merge
+            // per emitted block computed the same sums the long way round.
             encode_coefs(
                 enc,
                 &levels[..n],
@@ -6811,20 +6958,10 @@ impl FrameEncoder {
                 tx_size,
                 ctx0,
                 &mut token_cache[..n],
-                &mut coef_cnt,
-                &mut eob_cnt,
+                &mut self.counts.coef[tx_size][pt][inter],
+                &mut self.counts.eob_branch[tx_size][pt][inter],
                 8,
             );
-            let cc = &mut self.counts.coef[tx_size][pt][inter];
-            let ec = &mut self.counts.eob_branch[tx_size][pt][inter];
-            for band in 0..6 {
-                for c in 0..6 {
-                    for m in 0..4 {
-                        cc[band][c][m] += coef_cnt[band][c][m];
-                    }
-                    ec[band][c] += eob_cnt[band][c];
-                }
-            }
             0
         } else if let Some(rate) = trellis_rate {
             // The trellis already tracked the exact rate of the final block —
@@ -6872,7 +7009,7 @@ impl FrameEncoder {
                 let e = (dqcoeff[p] - coeffs[p]) as f64;
                 d += e * e * norm[p];
             }
-            self.tx_scratch = scratch; // restore before the early exit
+            self.tx_scratch = Some(scratch); // restore before the early exit
             return (bits, d as u64);
         }
 
@@ -6884,12 +7021,7 @@ impl FrameEncoder {
                 inverse_transform_dc_add(dqcoeff[0], bs, dst, stride, self.max_px);
             } else {
                 // max_row = highest non-zero coefficient row.
-                let mut max_row = 0usize;
-                for (pos, &c) in dqcoeff[..n].iter().enumerate() {
-                    if c != 0 {
-                        max_row = max_row.max(pos / bs);
-                    }
-                }
+                let max_row = last_nonzero_row(&dqcoeff[..n], bs);
                 inverse_transform_add_rows(
                     &dqcoeff[..n],
                     bs,
@@ -6908,19 +7040,15 @@ impl FrameEncoder {
         // widen. The i32 product cannot overflow: pixels are <= 16-bit, so the
         // squared difference is < 2^32 and 1024 of them still fit in u64.
         let src = &self.src[plane];
-        let rec = &self.rec[plane].buf;
-        let mut sse = 0u64;
-        for y in 0..bs {
-            let s_row = &src.buf[(y0 + y) * src.stride + x0..][..bs];
-            let r_row = &rec[dst_off + y * stride..][..bs];
-            let mut acc = 0u64;
-            for x in 0..bs {
-                let d = s_row[x] as i64 - r_row[x] as i64;
-                acc += (d * d) as u64;
-            }
-            sse += acc;
-        }
-        self.tx_scratch = scratch;
+        let sse = super::blockkern::block_sse(
+            &src.buf[y0 * src.stride + x0..],
+            src.stride,
+            &self.rec[plane].buf[dst_off..],
+            stride,
+            bs,
+            bs,
+        );
+        self.tx_scratch = Some(scratch);
         (bits, sse)
     }
 
@@ -7195,12 +7323,10 @@ impl FrameEncoder {
     fn luma_sse_of(&self, buf: &[u16]) -> u64 {
         let src = &self.src[0].buf;
         let n = self.src[0].w * self.src[0].h; // coded region only (skip padding rows)
-        let mut sse = 0u64;
-        for i in 0..n {
-            let d = src[i] as i64 - buf[i] as i64;
-            sse += (d * d) as u64;
-        }
-        sse
+                                               // The whole frame as one long row through the SSE kernel. This runs once
+                                               // per candidate filter level (about 15 times a frame) and was a scalar
+                                               // i64 loop at ~7.5 instructions a pixel.
+        super::blockkern::run_sse(&src[..n], &buf[..n])
     }
 
     /// R3 — loop-filter-level search: pick the `loop_filter_level` whose deblocked
@@ -7212,12 +7338,40 @@ impl FrameEncoder {
     /// level search. Filters ONLY luma — the level choice is luma-SSE-gated, so cloning +
     /// deblocking chroma per candidate would be discarded work; the winner's real 3-plane
     /// filter is applied by the caller.
-    fn lf_luma_sse(&self, h: &mut FrameHeader, c0: &mut [u16], lvl: u32) -> u64 {
+    ///
+    /// `masks` are the luma edge masks built once for the frame (see
+    /// [`build_plane_masks`]): in the uniform-level regime this search runs in
+    /// they are the same at every candidate level, so re-walking the mode-info
+    /// grid per candidate — about 15 times a frame — was pure repetition.
+    fn lf_luma_sse(
+        &self,
+        h: &mut FrameHeader,
+        c0: &mut [u16],
+        lvl: u32,
+        masks: Option<&PlaneMasks>,
+    ) -> u64 {
         h.loop_filter_level = lvl;
         c0.copy_from_slice(&self.rec[0].buf);
-        let mut planes = [(c0, self.rec[0].stride, 0usize, 0usize)];
-        loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
-        self.luma_sse_of(planes[0].0)
+        let stride = self.rec[0].stride;
+        let done = masks.is_some_and(|m| {
+            loop_filter_plane_masked(c0, stride, m, self.mi_rows, self.mi_cols, h)
+        });
+        if !done {
+            let mut planes = [(&mut *c0, stride, 0usize, 0usize)];
+            loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
+        }
+        // Debug builds re-derive the candidate the long way and compare.
+        #[cfg(debug_assertions)]
+        if done {
+            let mut chk = self.rec[0].buf.clone();
+            let mut planes = [(&mut chk[..], stride, 0usize, 0usize)];
+            loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
+            assert!(
+                chk[..] == c0[..],
+                "masked loop filter diverged at level {lvl}"
+            );
+        }
+        self.luma_sse_of(c0)
     }
 
     /// Observe-only per-segment-lf ceiling probe: the per-64×64-SB oracle (each SB filtered at
@@ -7305,15 +7459,25 @@ impl FrameEncoder {
         }
         let mut best = (0u32, self.luma_sse_of(&self.rec[0].buf));
         let mut c0 = self.rec[0].buf.clone();
+        // The filtered luma of the best level so far. Each candidate is filtered
+        // in full to be scored, so the winner's luma already exists by the time
+        // it wins: keep it instead of filtering luma once more at the end.
+        let mut best_luma: Vec<u16> = Vec::new();
         let coarse: &[u32] = if std::env::var("VP9_LF_COARSE").is_ok() {
             &[8, 16, 24, 32]
         } else {
             &[8, 16, 24, 32, 40, 48, 56, 63]
         };
+        // Luma edge masks for every candidate below (any non-zero level builds
+        // the same ones; `None` if this frame is not in the uniform regime).
+        h.loop_filter_level = coarse[0];
+        let masks = build_plane_masks(0, 0, &self.mi, self.mi_rows, self.mi_cols, h);
+        let masks = masks.as_ref();
         for &lvl in coarse {
-            let sse = self.lf_luma_sse(h, &mut c0, lvl);
+            let sse = self.lf_luma_sse(h, &mut c0, lvl, masks);
             if sse < best.1 {
                 best = (lvl, sse);
+                keep_luma(&mut best_luma, &mut c0);
             }
         }
         if std::env::var("VP9_LF_COARSE").is_err() {
@@ -7324,9 +7488,10 @@ impl FrameEncoder {
                     if cand == 0 || cand == best.0 {
                         continue;
                     }
-                    let sse = self.lf_luma_sse(h, &mut c0, cand);
+                    let sse = self.lf_luma_sse(h, &mut c0, cand, masks);
                     if sse < best.1 {
                         best = (cand, sse);
+                        keep_luma(&mut best_luma, &mut c0);
                     }
                 }
             }
@@ -7355,7 +7520,7 @@ impl FrameEncoder {
                 ((q * 20723 + 1015158) + (1 << 17)) >> 18
             }
             .clamp(0, 63);
-            let sse_guess = self.lf_luma_sse(h, &mut c0, guess as u32);
+            let sse_guess = self.lf_luma_sse(h, &mut c0, guess as u32, masks);
             eprintln!(
                 "LFHARVEST	q={}	qidx={}	key={}	best={}	sse_best={}	guess={}	sse_guess={}	sse_lvl0={}",
                 q, h.base_q_idx, key as u8, best.0, best.1, guess, sse_guess,
@@ -7366,13 +7531,38 @@ impl FrameEncoder {
         self.lf_level = best.0;
         if best.0 > 0 {
             let [p0, p1, p2] = &mut self.rec;
+            // Luma: the winning candidate's filtered plane, already computed.
+            // Chroma: filtered here (the search is luma-only). The planes are
+            // filtered independently, so this equals one three-plane call.
+            debug_assert_eq!(best_luma.len(), p0.buf.len());
+            #[cfg(debug_assertions)]
+            {
+                let mut chk = p0.buf.clone();
+                let mut planes = [(&mut chk[..], p0.stride, p0.ss_x, p0.ss_y)];
+                loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
+                assert!(
+                    chk == best_luma,
+                    "kept luma is not the best level's filter output"
+                );
+            }
+            p0.buf.copy_from_slice(&best_luma);
             let mut planes = [
-                (&mut p0.buf[..], p0.stride, p0.ss_x, p0.ss_y),
                 (&mut p1.buf[..], p1.stride, p1.ss_x, p1.ss_y),
                 (&mut p2.buf[..], p2.stride, p2.ss_x, p2.ss_y),
             ];
             loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
         }
+    }
+}
+
+/// Stash the candidate luma in `c0` as the best so far. The first keep copies
+/// (it sizes `best`); later keeps just swap the two buffers, since the next
+/// candidate overwrites all of `c0` anyway.
+fn keep_luma(best: &mut Vec<u16>, c0: &mut Vec<u16>) {
+    if best.len() == c0.len() {
+        std::mem::swap(best, c0);
+    } else {
+        best.clone_from(c0);
     }
 }
 
@@ -7490,6 +7680,31 @@ fn sad8x8(s: &[u16], ss: usize, r: &[u16], rs: usize, has_avx2: bool) -> u32 {
     }
     let _ = has_avx2;
     sad8x8_scalar(s, ss, r, rs)
+}
+
+/// Index of the last row of a `bs x bs` coefficient block that holds a non-zero
+/// value (0 if the block is all zero).
+///
+/// Scanned bottom-up a whole row at a time, with the row width a compile-time
+/// constant so each test is a short branch-free OR-reduction. The loop this
+/// replaces visited all `bs * bs` entries and paid a real divide by the runtime
+/// `bs` for every non-zero one. Sparse blocks (the common case) reject their
+/// empty rows a vector at a time; dense blocks stop at the first row tested.
+#[inline]
+fn last_nonzero_row(dq: &[i32], bs: usize) -> usize {
+    #[inline(always)]
+    fn scan<const BS: usize>(dq: &[i32]) -> usize {
+        dq[..BS * BS]
+            .chunks_exact(BS)
+            .rposition(|row| row.iter().fold(0i32, |a, &c| a | c) != 0)
+            .unwrap_or(0)
+    }
+    match bs {
+        4 => scan::<4>(dq),
+        8 => scan::<8>(dq),
+        16 => scan::<16>(dq),
+        _ => scan::<32>(dq),
+    }
 }
 
 /// Σ|src − ref| over a 4×4 block (sub-8×8 motion search). Scalar oracle.

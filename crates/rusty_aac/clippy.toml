@@ -1,0 +1,9 @@
+# Clippy configuration for rusty_aac (the lint LEVELS live in Cargo.toml [lints]).
+
+# Proper names, not code: keep doc_markdown from demanding backticks on them.
+doc-valid-idents = ["FFmpeg", "AArch64", "LeakSanitizer", "AddressSanitizer", "x86_64", ".."]
+
+# The SIMD kernels import the intrinsic namespaces whole -- hundreds of `_mm256_*`
+# / `vld1q_*` names, where a glob is the universal convention. No other module
+# may glob-import.
+allowed-wildcard-imports = ["x86_64", "aarch64"]

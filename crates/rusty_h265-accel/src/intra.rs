@@ -852,10 +852,9 @@ pub fn angular(dst: &mut [u16], dst_stride: usize, n: usize, refb: &[i16], off: 
     // The largest reference index this can touch is `off + n + (n*angle>>5) + 1`,
     // bounded by `off + 2n + 1`; the `+ 8` is the vector overread.
     let ok = (4..=MAX_N).contains(&n) && dst.len() >= dst_stride * (n - 1) + n && refb.len() >= off + 2 * n + 9 && angular_i16_is_exact(max);
-    debug_assert!(
-        !(4..=MAX_N).contains(&n) || angular_i16_is_exact(max),
-        "angular: max={max} exceeds the i16 headroom; the kernel would wrap"
-    );
+    // No debug_assert on `angular_i16_is_exact`: past the i16 headroom (RExt
+    // 12-bit and up) falling back to the scalar twin IS the designed path --
+    // `angular_is_exact_at_rext_bit_depths` exercises exactly that.
     if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::INTRA_ANGULAR_SIMD } else { &census::INTRA_ANGULAR_SCALAR }, 1);
@@ -882,10 +881,8 @@ pub fn angular(dst: &mut [u16], dst_stride: usize, n: usize, refb: &[i16], off: 
 /// caller needs no scratch block of its own.
 pub fn angular_t(dst: &mut [u16], dst_stride: usize, n: usize, refb: &[i16], off: usize, angle: i32, max: i32) {
     let ok = (4..=MAX_N).contains(&n) && dst.len() >= dst_stride * (n - 1) + n && refb.len() >= off + 2 * n + 9 && angular_i16_is_exact(max);
-    debug_assert!(
-        !(4..=MAX_N).contains(&n) || angular_i16_is_exact(max),
-        "angular_t: max={max} exceeds the i16 headroom; the kernel would wrap"
-    );
+    // No exactness debug_assert: see `angular` -- the scalar fallback past the
+    // i16 headroom is the designed path, not a bug.
     if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(if simd { &census::INTRA_ANGULAR_SIMD } else { &census::INTRA_ANGULAR_SCALAR }, 1);

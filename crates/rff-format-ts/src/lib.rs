@@ -258,13 +258,17 @@ impl TsDemuxer {
     /// scan one Annex-B payload for an SPS and fill them in. MPEG-TS carries
     /// no geometry of its own, so this is the only source.
     fn fill_dims(streams: &mut [Stream], idx: usize, data: &[u8]) {
-        let Some(s) = streams.get_mut(idx) else { return };
+        let Some(s) = streams.get_mut(idx) else {
+            return;
+        };
         if s.width != 0 {
             return;
         }
         let dims = match s.codec_id {
             CodecId::H264 => find_sps_annexb(data).and_then(sps_dimensions),
-            CodecId::Hevc => rff_format::hvc::find_nal_annexb(data, 33).and_then(rff_format::hvc::sps_dimensions),
+            CodecId::Hevc => {
+                rff_format::hvc::find_nal_annexb(data, 33).and_then(rff_format::hvc::sps_dimensions)
+            }
             _ => return,
         };
         if let Some((w, h)) = dims {

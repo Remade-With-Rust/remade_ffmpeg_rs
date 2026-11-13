@@ -843,6 +843,15 @@ pub fn inverse_transform_add(
     inverse_transform_add_rows(coeffs, n, tx_type, dest, stride, max, n)
 }
 
+/// Whether the `VP9_GATEPROBE` measurement tap is enabled. Read once per
+/// process: the tap sits on the 16x16 inverse-transform path, and looking the
+/// variable up there meant an environment scan on every such block.
+#[cfg(target_arch = "x86_64")]
+fn gateprobe() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var_os("VP9_GATEPROBE").is_some())
+}
+
 /// Like [`inverse_transform_add`] but only the first `nz_rows` coefficient rows
 /// are known to be non-zero (the sparse-EOB fast path) — the remaining rows are
 /// all-zero, so their 1-D transform is zero and the row pass skips them. Output
@@ -891,7 +900,7 @@ pub fn inverse_transform_add_rows(
     let nz_rows = nz_rows.clamp(1, n);
     // TEMP measurement: how often would each candidate 16x16 gate reject?
     #[cfg(target_arch = "x86_64")]
-    if n == 16 && !col_adst && std::env::var_os("VP9_GATEPROBE").is_some() {
+    if n == 16 && !col_adst && gateprobe() {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         pub static G: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
         let cmax = coeffs[..16 * nz_rows]
@@ -975,8 +984,9 @@ pub fn inverse_transform_add_rows(
                 idct_1d(i, o);
             }
         }
-        // Rows past the last non-zero coefficient transform to all-zero.
-        tmp[nz_rows * n..n * n].iter_mut().for_each(|v| *v = 0);
+        // Rows past the last non-zero coefficient transform to all-zero. They
+        // are only zero-padded in the arms below that read them: the DC-collapse
+        // arm reads row 0 alone, and the two gates read `tmp[..n * nz_rows]`.
         // The gate reads the ROW PASS OUTPUT (`tmp`), which is the actual input to
         // the vector butterfly. It is a branchless max-reduction so it vectorizes,
         // and it runs only for 16x16 DCT columns.
@@ -1020,6 +1030,7 @@ pub fn inverse_transform_add_rows(
         let vec_cols32 = false;
 
         if vec_cols32 {
+            tmp[nz_rows * n..n * n].fill(0);
             // SAFETY: AVX2 confirmed and the input bound checked above; tmp holds
             // 1024 i32 and dest covers 32 rows of 32 at `stride`.
             #[cfg(target_arch = "x86_64")]
@@ -1027,6 +1038,7 @@ pub fn inverse_transform_add_rows(
                 idct_avx2::idct32_cols_add(&tmp[..1024], dest, stride, max);
             }
         } else if vec_cols {
+            tmp[nz_rows * n..n * n].fill(0);
             // SAFETY: AVX2 confirmed and the coefficient bound checked above;
             // tmp holds 256 i32 and dest covers 16 rows of 16 at `stride`.
             #[cfg(target_arch = "x86_64")]
@@ -1055,6 +1067,7 @@ pub fn inverse_transform_add_rows(
                 }
             }
         } else {
+            tmp[nz_rows * n..n * n].fill(0);
             let mut col_in = [0i32; 32];
             let mut col_out = [0i32; 32];
             for col in 0..n {
@@ -1447,6 +1460,10 @@ mod idct_avx2 {
     /// # Safety
     /// AVX2 required; `tmp` holds 1024 i32 and `dest` covers 32 rows of 32 `u16`
     /// at `stride` — the same accesses the scalar column loop makes.
+    // `target_feature` matters here: without it this function is compiled for
+    // the baseline, the SSE4.1/AVX2 intrinsics below cannot inline into it, and
+    // every one of them becomes a real call with its vectors passed in memory.
+    #[target_feature(enable = "avx2")]
     pub(super) unsafe fn idct32_cols_add(tmp: &[i32], dest: &mut [u16], stride: usize, max: i32) {
         const SHIFT: i32 = 6;
         let zero = _mm_setzero_si128();
@@ -1485,6 +1502,10 @@ mod idct_avx2 {
     /// # Safety
     /// AVX2 required; `tmp` holds 256 i32 and `dest` covers 16 rows of 16 `u16`
     /// at `stride` — the same accesses the scalar column loop makes.
+    // `target_feature` matters here: without it this function is compiled for
+    // the baseline, the SSE4.1/AVX2 intrinsics below cannot inline into it, and
+    // every one of them becomes a real call with its vectors passed in memory.
+    #[target_feature(enable = "avx2")]
     pub(super) unsafe fn idct16_cols_add(tmp: &[i32], dest: &mut [u16], stride: usize, max: i32) {
         // 16x16 always uses the size-6 final round-shift (4->4, 8->5, 16/32->6),
         // so it is a compile-time constant here rather than a parameter.
@@ -1564,6 +1585,10 @@ mod idct_avx2 {
     /// # Safety
     /// AVX2 must be available, `coeffs` must hold 16 i32, and `dest` must cover
     /// 4 rows of 4 `u16` at `stride` — the same accesses the scalar path makes.
+    // `target_feature` matters here: without it this function is compiled for
+    // the baseline, the SSE4.1/AVX2 intrinsics below cannot inline into it, and
+    // every one of them becomes a real call with its vectors passed in memory.
+    #[target_feature(enable = "avx2")]
     pub(super) unsafe fn idct4x4_add(
         coeffs: &[i32],
         dest: &mut [u16],
@@ -1600,6 +1625,10 @@ mod idct_avx2 {
         }
     }
 
+    // `target_feature` matters here: without it this function is compiled for
+    // the baseline, the SSE4.1/AVX2 intrinsics below cannot inline into it, and
+    // every one of them becomes a real call with its vectors passed in memory.
+    #[target_feature(enable = "avx2")]
     pub(super) unsafe fn idct8x8_add(
         coeffs: &[i32],
         dest: &mut [u16],

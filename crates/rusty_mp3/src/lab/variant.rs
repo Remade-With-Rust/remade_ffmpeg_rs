@@ -9,6 +9,7 @@
 //! Generic over the brick's parameter type `P`, so every future brick reuses this
 //! same lookup.
 
+use std::fmt::Write as _;
 /// A named preset of a brick's parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct Preset<P: Copy + 'static> {
@@ -35,7 +36,7 @@ pub fn names<P: Copy>(table: &'static [Preset<P>]) -> String {
 pub fn list<P: Copy>(table: &'static [Preset<P>]) -> String {
     let mut s = String::new();
     for p in table {
-        s.push_str(&format!("  {:<10} {}\n", p.name, p.blurb));
+        let _ = writeln!(s, "  {:<10} {}", p.name, p.blurb);
     }
     s
 }

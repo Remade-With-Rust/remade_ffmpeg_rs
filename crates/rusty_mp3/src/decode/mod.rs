@@ -28,12 +28,22 @@ pub mod stereo;
 pub mod synth_window;
 pub mod synthesis;
 
-/// Lightweight decode-stage profiler (near-zero cost; read via [`prof::dump`]).
-/// Same role as the encoder's: find the real decode hotspots before optimizing.
+/// Decode-stage profiler, read via [`prof::dump`]. Same role as the encoder's:
+/// find the real decode hotspots before optimizing.
+///
+/// The stage CLOCK is behind the `profile` cargo feature. It used to run on every
+/// build: two `Instant::now()` per stage per granule and channel, ~52 clock reads
+/// per stereo frame on the shipping path, which is real time on a decoder doing a
+/// frame in a few microseconds. Without the feature [`time`] is a plain call. The
+/// deterministic censuses (block types, kernel reach) stay on: they cost a
+/// handful of relaxed adds per frame and back `MP3_CENSUS`.
 pub mod prof {
     use std::sync::atomic::{AtomicU64, Ordering};
     // No clock on the browser target -- see `time` below.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "profile",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     use std::time::Instant;
 
     pub static HUFFMAN: AtomicU64 = AtomicU64::new(0);
@@ -54,6 +64,40 @@ pub mod prof {
     /// Mixed blocks: short overall, but the lowest two subbands stay long, so
     /// they exercise BOTH IMDCT paths within one granule.
     pub static N_MIXED: AtomicU64 = AtomicU64::new(0);
+
+    /// KERNEL REACH census, tallied once per granule (never per element, so the
+    /// tap cannot become the thing measured). Units: long subbands through the
+    /// 36-point IMDCT, and synthesis passes (18 per granule per channel, each one
+    /// matrixing + windowing call). Every arm counts, so "the fast arm ran" comes
+    /// with "the slow arm did not" (codec-vectorize-kernel REACHABILITY.md).
+    pub static K_IMDCT_SIMD: AtomicU64 = AtomicU64::new(0);
+    pub static K_IMDCT_SCALAR: AtomicU64 = AtomicU64::new(0);
+    pub static K_SYNTH_SIMD: AtomicU64 = AtomicU64::new(0);
+    pub static K_SYNTH_SCALAR: AtomicU64 = AtomicU64::new(0);
+
+    /// Add `n` units to a kernel-arm counter.
+    #[inline]
+    pub fn kernel_tally(c: &AtomicU64, n: u64) {
+        c.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// One line: how much of the decode reached each kernel arm.
+    pub fn kernel_census() -> String {
+        let pct = |a: u64, b: u64| 100.0 * a as f64 / (a + b).max(1) as f64;
+        let (ia, is) = (
+            K_IMDCT_SIMD.load(Ordering::Relaxed),
+            K_IMDCT_SCALAR.load(Ordering::Relaxed),
+        );
+        let (sa, ss) = (
+            K_SYNTH_SIMD.load(Ordering::Relaxed),
+            K_SYNTH_SCALAR.load(Ordering::Relaxed),
+        );
+        format!(
+            "kernel census: imdct36 simd {ia} scalar {is} ({:.2}% simd) | synthesis simd {sa} scalar {ss} ({:.2}% simd)",
+            pct(ia, is),
+            pct(sa, ss)
+        )
+    }
 
     /// Print the block-type census and reset it.
     pub fn census() {
@@ -79,7 +123,10 @@ pub mod prof {
     /// first frame in a browser while compiling cleanly and passing every test on
     /// the host. WASI has a clock and keeps its timing; only the bare-wasm target
     /// compiles it out and runs `f` unwrapped.
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "profile",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[inline]
     pub fn time<T>(bucket: &AtomicU64, f: impl FnOnce() -> T) -> T {
         let t = Instant::now();
@@ -88,14 +135,30 @@ pub mod prof {
         r
     }
 
-    /// Clock-free twin for the browser target: run the stage, record nothing.
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    /// Clock-free twin (no `profile` feature, or the browser target): run the
+    /// stage, record nothing.
+    #[cfg(not(all(
+        feature = "profile",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    )))]
     #[inline]
     pub fn time<T>(_bucket: &AtomicU64, f: impl FnOnce() -> T) -> T {
         f()
     }
 
+    /// Whether this build records stage times (see the module docs).
+    pub const TIMED: bool = cfg!(all(
+        feature = "profile",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ));
+
     pub fn dump() {
+        if !TIMED {
+            eprintln!(
+                "--- decode stage profile: not recorded (build with `--features profile`) ---"
+            );
+            return;
+        }
         let stages = [
             ("huffman", &HUFFMAN),
             ("scalefactors", &SCALEFAC),
@@ -121,6 +184,45 @@ pub mod prof {
     }
 }
 
+/// Which instruction set the decode kernels may use.
+///
+/// `MP3_ISA=scalar` forces every kernel onto its scalar twin, read ONCE per
+/// process. It exists for two measurements no build flag can give cleanly: the
+/// ISA-rung A/B (the value of every vector kernel at once, same binary both
+/// arms) and the scalar-arm census (proof that the slow arm is not also what
+/// production runs). Both arms are bit-identical by construction, so flipping it
+/// changes speed only.
+pub mod isa {
+    /// A SIMD twin exists AND can run on this CPU (raw, ignores the override):
+    /// AVX by runtime detection on x86_64; NEON on aarch64, where it is baseline
+    /// (every AArch64 core has it, so there is nothing to detect); none elsewhere.
+    #[inline]
+    #[must_use]
+    pub fn simd_available() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx")
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            true
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            false
+        }
+    }
+
+    /// Whether the shipping path takes the SIMD kernels: available AND not forced off.
+    #[inline]
+    pub fn use_simd() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            simd_available() && !matches!(std::env::var("MP3_ISA").as_deref(), Ok("scalar"))
+        })
+    }
+}
+
 /// The transform half of the decoder's persistent state.
 ///
 /// Split out from [`Mp3Decode`] because the decoder's state divides cleanly in
@@ -137,7 +239,7 @@ pub struct TransformState {
 
 impl Default for TransformState {
     fn default() -> Self {
-        TransformState {
+        Self {
             imdct_overlap: [[0.0; GRANULE_LINES]; 2],
             synth_fifo: [[0.0; 1024]; 2],
         }
@@ -145,8 +247,9 @@ impl Default for TransformState {
 }
 
 impl TransformState {
-    pub fn new() -> TransformState {
-        TransformState::default()
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Stage 2 for one granule: alias reduction → hybrid IMDCT → polyphase
@@ -160,22 +263,34 @@ impl TransformState {
         channels: usize,
         pcm: &mut Vec<f32>,
     ) {
-        let mut chan_pcm = [[0f32; GRANULE_LINES]; 2];
-        for ch in 0..channels {
+        let mut stage1 = |ch: usize, this: &mut Self| {
             prof::time(&prof::ANTIALIAS, || {
-                antialias::reduce(&gi[ch], &mut spectrum.lines[ch])
+                antialias::reduce(&gi[ch], &mut spectrum.lines[ch]);
             });
-            let time = prof::time(&prof::IMDCT, || {
-                imdct::hybrid(&gi[ch], &spectrum.lines[ch], &mut self.imdct_overlap[ch])
+            prof::time(&prof::IMDCT, || {
+                imdct::hybrid(&gi[ch], &spectrum.lines[ch], &mut this.imdct_overlap[ch])
+            })
+        };
+        let t0 = stage1(0, self);
+        if channels == 2 {
+            // D12: both channels' synthesis in one pass, written interleaved
+            // straight into the frame's PCM (no per-channel copy, no per-sample
+            // push).
+            let t1 = stage1(1, self);
+            let start = pcm.len();
+            pcm.resize(start + 2 * GRANULE_LINES, 0.0);
+            let Some(out) = pcm[start..].first_chunk_mut::<{ 2 * GRANULE_LINES }>() else {
+                return; // unreachable: just resized by exactly one stereo granule
+            };
+            let [f0, f1] = &mut self.synth_fifo;
+            prof::time(&prof::SYNTH, || {
+                synthesis::polyphase_stereo([&t0, &t1], [f0, f1], out);
             });
-            chan_pcm[ch] = prof::time(&prof::SYNTH, || {
-                synthesis::polyphase(&time, &mut self.synth_fifo[ch])
+        } else {
+            let p = prof::time(&prof::SYNTH, || {
+                synthesis::polyphase(&t0, &mut self.synth_fifo[0])
             });
-        }
-        for s in 0..GRANULE_LINES {
-            for cp in chan_pcm.iter().take(channels) {
-                pcm.push(cp[s]);
-            }
+            pcm.extend_from_slice(&p);
         }
     }
 }
@@ -187,6 +302,7 @@ pub struct GranuleWork {
 }
 
 /// Persistent decoder state across frames.
+#[derive(Default)]
 pub struct Mp3Decode {
     /// Carries leftover main-data bytes between frames (`main_data_begin`).
     reservoir: reservoir::Reservoir,
@@ -194,18 +310,10 @@ pub struct Mp3Decode {
     transform: TransformState,
 }
 
-impl Default for Mp3Decode {
-    fn default() -> Self {
-        Mp3Decode {
-            reservoir: reservoir::Reservoir::default(),
-            transform: TransformState::default(),
-        }
-    }
-}
-
 impl Mp3Decode {
-    pub fn new() -> Mp3Decode {
-        Mp3Decode::default()
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Decode one frame's side-info + main-data into interleaved PCM samples.
@@ -217,6 +325,10 @@ impl Mp3Decode {
     ///
     /// Thin wrapper over the two stages, so the serial path and the pipelined
     /// path run exactly the same code.
+    ///
+    /// # Errors
+    /// Whatever [`decode_frame_entropy`](Self::decode_frame_entropy) returns:
+    /// a malformed side-information block.
     pub fn decode_frame(
         &mut self,
         header: &FrameHeader,
@@ -224,12 +336,24 @@ impl Mp3Decode {
         frame_main_data: &[u8],
     ) -> Result<Vec<f32>> {
         let channels = header.channel_mode.channels();
-        let work = self.decode_frame_entropy(header, side_info_bytes, frame_main_data)?;
-        let mut pcm = Vec::with_capacity(work.len() * GRANULE_LINES * channels);
-        for mut g in work {
-            self.transform
-                .granule_to_pcm(&g.side, &mut g.spectrum, channels, &mut pcm);
-        }
+        let mut pcm = Vec::with_capacity(header.version.granules() * GRANULE_LINES * channels);
+        // Each granule goes from the entropy stage straight into the transform
+        // stage, by reference. The serial path used to collect the frame's
+        // granules into a `Vec<GranuleWork>` first -- an allocation per frame,
+        // and every granule's spectrum (4.6 KB) copied in and copied out again.
+        // The two stages own disjoint state, so running them per granule rather
+        // than per frame changes nothing they compute.
+        let Self {
+            reservoir,
+            transform,
+        } = self;
+        entropy(
+            reservoir,
+            header,
+            side_info_bytes,
+            frame_main_data,
+            |side, spectrum| transform.granule_to_pcm(side, spectrum, channels, &mut pcm),
+        )?;
         Ok(pcm)
     }
 
@@ -238,77 +362,122 @@ impl Mp3Decode {
     ///
     /// Touches only the bit reservoir, never the IMDCT overlap or synthesis FIFO,
     /// which is what makes it safe to run on its own thread ahead of stage 2.
+    ///
+    /// # Errors
+    /// [`Error::InvalidData`](crate::Error::InvalidData) when the side information
+    /// is malformed (see [`sideinfo::parse`]).
     pub fn decode_frame_entropy(
         &mut self,
         header: &FrameHeader,
         side_info_bytes: &[u8],
         frame_main_data: &[u8],
     ) -> Result<Vec<GranuleWork>> {
-        let channels = header.channel_mode.channels();
-        let granules = header.version.granules();
-
-        // 1. Side information → the per-granule decode recipe.
-        let si: SideInfo = sideinfo::parse(header, side_info_bytes)?;
-
-        // 2. Reassemble main data across the reservoir boundary.
-        let main = self.reservoir.assemble(si.main_data_begin, frame_main_data);
-
-        let mut out = Vec::with_capacity(granules);
-        let mut bit_pos = 0usize;
-        // Granule 0's scalefactors are retained per channel for granule 1 `scfsi`
-        // reuse.
-        let mut scalefac: [[scalefactors::ScaleFactors; 2]; 2] = Default::default();
-        for gr in 0..granules {
-            let mut spectrum = GranuleSpectrum::default();
-            for ch in 0..channels {
-                let gi = &si.granules[gr][ch];
-                // Block-type census: which IMDCT path this granule/channel takes.
-                {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    let short =
-                        gi.window_switching && gi.block_type == crate::frame::BlockType::Short;
-                    match (short, gi.mixed_block) {
-                        (true, true) => prof::N_MIXED.fetch_add(1, Relaxed),
-                        (true, false) => prof::N_SHORT.fetch_add(1, Relaxed),
-                        _ => prof::N_LONG.fetch_add(1, Relaxed),
-                    };
-                }
-                // part2 (scalefactors) + part3 (Huffman) share one bit budget.
-                let part2_3_start = bit_pos;
-                let prev = if gr == 1 {
-                    Some(scalefac[0][ch].clone())
-                } else {
-                    None
-                };
-                let sf = prof::time(&prof::SCALEFAC, || {
-                    scalefactors::decode(&main, &mut bit_pos, header, &si, gr, ch, prev.as_ref())
+        // The pipelined decoder hands granules to another thread, so it needs
+        // them OWNED; this is the one place they are collected.
+        let mut out = Vec::with_capacity(header.version.granules());
+        entropy(
+            &mut self.reservoir,
+            header,
+            side_info_bytes,
+            frame_main_data,
+            |side, spectrum| {
+                out.push(GranuleWork {
+                    side: side.clone(),
+                    spectrum: spectrum.clone(),
                 });
-                scalefac[gr][ch] = sf.clone();
-                let part2_3_end = part2_3_start + gi.part2_3_length as usize;
-                let (coeffs, nz) = prof::time(&prof::HUFFMAN, || {
-                    huffman::decode(&main, &mut bit_pos, part2_3_end, header, gi)
-                });
-                prof::time(&prof::REQUANT, || {
-                    requantize::apply(header, gi, &sf, &coeffs, nz, &mut spectrum.lines[ch])
-                });
-                spectrum.nonzero[ch] = nz;
-            }
-
-            // 7. Joint-stereo (MS / intensity) across the two channels.
-            prof::time(&prof::STEREO, || {
-                stereo::process(header, &si.granules[gr], &mut spectrum)
-            });
-
-            out.push(GranuleWork {
-                side: [si.granules[gr][0].clone(), si.granules[gr][1].clone()],
-                spectrum,
-            });
-        }
+            },
+        )?;
         Ok(out)
     }
 }
 
+/// The entropy stage over one frame, handing each finished granule to
+/// `granule` by reference (its side info and its spectrum, ready for the
+/// transform stage). A free function over the reservoir alone, so a caller can
+/// lend it the reservoir while holding the transform state for `granule`.
+fn entropy(
+    reservoir: &mut reservoir::Reservoir,
+    header: &FrameHeader,
+    side_info_bytes: &[u8],
+    frame_main_data: &[u8],
+    mut granule: impl FnMut(&[GranuleSideInfo; 2], &mut GranuleSpectrum),
+) -> Result<()> {
+    let channels = header.channel_mode.channels();
+    let granules = header.version.granules();
+
+    // 1. Side information → the per-granule decode recipe.
+    let si: SideInfo = sideinfo::parse(header, side_info_bytes)?;
+
+    // 2. Reassemble main data across the reservoir boundary.
+    let main = reservoir.assemble(si.main_data_begin, frame_main_data);
+
+    let mut bit_pos = 0usize;
+    // Granule 0's scalefactors are retained per channel for granule 1 `scfsi`
+    // reuse.
+    let mut scalefac: [[scalefactors::ScaleFactors; 2]; 2] = Default::default();
+    for gr in 0..granules {
+        let mut spectrum = GranuleSpectrum::default();
+        for ch in 0..channels {
+            let gi = &si.granules[gr][ch];
+            // Block-type census: which IMDCT path this granule/channel takes.
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                let short = gi.window_switching && gi.block_type == crate::frame::BlockType::Short;
+                match (short, gi.mixed_block) {
+                    (true, true) => prof::N_MIXED.fetch_add(1, Relaxed),
+                    (true, false) => prof::N_SHORT.fetch_add(1, Relaxed),
+                    _ => prof::N_LONG.fetch_add(1, Relaxed),
+                };
+            }
+            // part2 (scalefactors) + part3 (Huffman) share one bit budget.
+            let part2_3_start = bit_pos;
+            let prev = (gr == 1).then(|| &scalefac[0][ch]);
+            let sf = prof::time(&prof::SCALEFAC, || {
+                scalefactors::decode(main, &mut bit_pos, header, &si, gr, ch, prev)
+            });
+            let part2_3_end = part2_3_start + gi.part2_3_length as usize;
+            let short = gi.window_switching && gi.block_type == crate::frame::BlockType::Short;
+            let nz = if short {
+                // Short blocks reorder while they requantize: two passes.
+                let (coeffs, nz) = prof::time(&prof::HUFFMAN, || {
+                    huffman::decode(main, &mut bit_pos, part2_3_end, header, gi)
+                });
+                prof::time(&prof::REQUANT, || {
+                    requantize::apply(header, gi, &sf, &coeffs, nz, &mut spectrum.lines[ch]);
+                });
+                nz
+            } else {
+                // D16: Huffman and requantize fused (timed as Huffman).
+                prof::time(&prof::HUFFMAN, || {
+                    huffman::decode_dequant_long(
+                        main,
+                        &mut bit_pos,
+                        part2_3_end,
+                        header,
+                        gi,
+                        &sf,
+                        &mut spectrum.lines[ch],
+                    )
+                })
+            };
+            spectrum.nonzero[ch] = nz;
+            scalefac[gr][ch] = sf;
+        }
+
+        // 7. Joint-stereo (MS / intensity) across the two channels.
+        prof::time(&prof::STEREO, || {
+            stereo::process(header, &si.granules[gr], &scalefac[gr][1], &mut spectrum);
+        });
+
+        granule(&si.granules[gr], &mut spectrum);
+    }
+    Ok(())
+}
+
 /// Entry used by the public decoder once the bricks are in place.
+///
+/// # Errors
+/// Always [`Error::Unimplemented`](crate::Error::Unimplemented).
 pub fn decode_frame_stub() -> Result<()> {
     Err(Error::Unimplemented("mp3 decode: pipeline not yet built"))
 }

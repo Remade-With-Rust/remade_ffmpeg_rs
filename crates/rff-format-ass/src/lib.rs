@@ -53,8 +53,7 @@ fn parse_ass(text: &str) -> Vec<(i64, i64, String)> {
         // Dialogue: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
         let mut fields = rest.splitn(4, ',');
         let _layer = fields.next();
-        let (Some(start), Some(end), Some(tail)) =
-            (fields.next(), fields.next(), fields.next())
+        let (Some(start), Some(end), Some(tail)) = (fields.next(), fields.next(), fields.next())
         else {
             continue;
         };

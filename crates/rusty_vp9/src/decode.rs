@@ -398,6 +398,11 @@ pub(crate) fn read_inter_mode(b: &mut BoolDecoder, probs: &[u8; 3]) -> u8 {
 
 /// `clamp_mv_to_umv_border_sb` — scale an MV to the plane's 1/16-pel grid and
 /// clamp it so the reference access stays within the unrestricted-MV border.
+///
+/// `#[inline]`: this is a dozen instructions of arithmetic, but as an
+/// out-of-line call it cost 54 per use (six arguments, a frame, and the
+/// `clamp` bound assertions) and the sub-8x8 search calls it per candidate.
+#[inline]
 pub(crate) fn clamp_mv_umv(
     mv: Mv,
     bw: i32,
@@ -1104,9 +1109,10 @@ pub struct Reconstructor {
     /// Maximum pixel value `(1<<bit_depth)-1` (255 at 8-bit), for clamping.
     max_px: i32,
     /// Per-transform-block scratch, reused across blocks to avoid re-allocating
-    /// / re-zeroing 4 KB + 1 KB on every coefficient decode. `decode_coefs`
-    /// clears `dqcoeff[..n²]` and `token_cache[..n²]` itself, so stale tail data
-    /// past the current transform size is never read.
+    /// / re-zeroing 4 KB + 1 KB on every coefficient decode. `dqcoeff` is kept
+    /// all-zero between blocks: `decode_block_coefs` clears just the rows a
+    /// block wrote once the inverse transform has consumed them. `token_cache`
+    /// is never cleared (see `decode_coefs`).
     dqcoeff: Vec<i32>,
     token_cache: Vec<u8>,
 }
@@ -2641,6 +2647,10 @@ impl Reconstructor {
                     max_row + 1,
                 );
             }
+            // Restore the all-zero buffer `decode_coefs` expects, touching only
+            // the rows that can hold a coefficient. A block with EOB 0 — most
+            // blocks at ordinary bitrates — skips this entirely.
+            self.dqcoeff[..bs * (max_row + 1)].fill(0);
         }
         Ok(())
     }
