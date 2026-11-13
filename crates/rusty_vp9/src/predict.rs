@@ -73,10 +73,10 @@ fn g(dst: &[u16], stride: usize, r: usize, c: usize) -> u16 {
 }
 
 fn v_pred(dst: &mut [u16], stride: usize, bs: usize, above: &[u16]) {
+    // Every row is the `bs` samples above the block (`above[0]` is the corner).
+    let row = &above[1..1 + bs];
     for r in 0..bs {
-        for c in 0..bs {
-            *d(dst, stride, r, c) = a(above, c as i32);
-        }
+        dst[r * stride..][..bs].copy_from_slice(row);
     }
 }
 
