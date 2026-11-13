@@ -678,7 +678,11 @@ impl<'a> RateTracker<'a> {
 
     /// Baseline walk in scan order — fills `cache`, `pcost`, and `total`.
     fn build(&mut self, levels: &[i32]) {
-        self.cache[..self.max_eob].fill(0);
+        // No `cache` pre-fill. Every read of it is at a causal neighbour of some
+        // scan index `<= eob`, i.e. at a scan index `< eob`, and this walk writes
+        // all of those before anything reads them (probes included). Stale
+        // bytes past the coded prefix are never reached — the same argument
+        // `code_block` relies on for its token cache.
         self.total = 0;
         let eob = self.eob;
         for c in 0..eob {
