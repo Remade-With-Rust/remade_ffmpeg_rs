@@ -93,8 +93,16 @@ pub fn decode_coefs(
     bit_depth: u32,
 ) -> (usize, usize) {
     let max_eob = 16usize << (tx_size << 1);
-    let n = 4usize << tx_size; // transform side; row = pos / n
+    let row_shift = tx_size + 2; // log2 of the transform side; row = pos >> row_shift
     let mut max_row = 0usize; // highest row index holding a non-zero coefficient
+    // Every position and neighbour index below comes from a static scan table
+    // and is `< max_eob`, a power of two. Narrowing both buffers to exactly
+    // `max_eob` and masking the indices with `max_eob - 1` changes no value and
+    // lets the compiler drop the bounds check on each cache read and write (the
+    // context derivation alone reads the cache twice per token).
+    let idx_mask = max_eob - 1;
+    let dqcoeff = &mut dqcoeff[..max_eob];
+    let token_cache = &mut token_cache[..max_eob];
     let band_translate: &[u8] = if tx_size == 0 {
         &COEFBAND_4X4
     } else {
@@ -132,17 +140,20 @@ pub fn decode_coefs(
         // Run of ZERO tokens.
         while bd.read_bool(prob[1]) == 0 {
             coef_cnt[band][ctx][0] += 1; // ZERO_TOKEN
-            token_cache[scan[c] as usize] = 0;
+            token_cache[scan[c] as usize & idx_mask] = 0;
             dqv = dq.1;
             c += 1;
             if c >= max_eob {
                 return (c, max_row);
             }
-            ctx = get_coef_context(nb, &token_cache, c);
+            ctx = (1
+                + token_cache[nb[2 * c] as usize & idx_mask] as usize
+                + token_cache[nb[2 * c + 1] as usize & idx_mask] as usize)
+                >> 1;
             band = band_translate[c] as usize;
             prob = coef_probs[band][ctx];
         }
-        let pos = scan[c] as usize;
+        let pos = scan[c] as usize & idx_mask;
         // Non-zero token. prob[2] is both the >=TWO decision and Pareto pivot.
         let two_plus = bd.read_bool(prob[2]) != 0;
         coef_cnt[band][ctx][if two_plus { 2 } else { 1 }] += 1; // TWO+ / ONE token
@@ -185,9 +196,12 @@ pub fn decode_coefs(
         };
         // Sign bit (probability 128 = equiprobable).
         dqcoeff[pos] = if bd.read_bool(128) != 0 { -v } else { v };
-        max_row = max_row.max(pos / n);
+        max_row = max_row.max(pos >> row_shift);
         c += 1;
-        ctx = get_coef_context(nb, &token_cache, c);
+        ctx = (1
+            + token_cache[nb[2 * c] as usize & idx_mask] as usize
+            + token_cache[nb[2 * c + 1] as usize & idx_mask] as usize)
+            >> 1;
         dqv = dq.1;
     }
     (c, max_row)
