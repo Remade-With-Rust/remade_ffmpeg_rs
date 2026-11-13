@@ -899,9 +899,9 @@ pub struct FrameEncoder {
     /// recon (a real dependency). Kept ON; skip only for experiments (would need BD-gating).
     snap_recon: bool,
     /// Reused per-tx-block scratch (see [`TxScratch`]). Boxed and moved out with
-    /// `mem::take` for the duration of `encode_tx_block` so it does not conflict
+    /// `Option::take` for the duration of `encode_tx_block` so it does not conflict
     /// with the `&self.src` / `&mut self.rec` borrows that function needs.
-    tx_scratch: Box<TxScratch>,
+    tx_scratch: Option<Box<TxScratch>>,
     /// Re-zero [`TxScratch`] on entry, reproducing the old stack-array cost
     /// exactly (`VP9_TX_MEMSET=1`). The A/B oracle for the scratch brick: output
     /// is byte-identical either way, so any difference is purely the memset.
@@ -1414,7 +1414,7 @@ impl FrameEncoder {
             yuv_abort: std::env::var("VP9_NO_YUV_ABORT").is_err(),
             snap_recon: std::env::var("VP9_NO_SNAP_RECON").is_err(),
             model_rank: std::env::var("VP9_MODEL_RANK").is_ok(),
-            tx_scratch: Box::default(),
+            tx_scratch: Some(Box::default()),
             tx_memset: std::env::var("VP9_TX_MEMSET").is_ok(),
             has_avx2: {
                 #[cfg(target_arch = "x86_64")]
@@ -6589,11 +6589,17 @@ impl FrameEncoder {
         // zero-init on every one of the ~2.1M calls a 20-frame CIF encode makes,
         // which measured as the largest single unattributed bucket in the
         // encoder. Every buffer is fully written over `[..n]` before it is read,
-        // so carrying stale bytes past `n` is unobservable. `mem::take` (a
-        // pointer move on a `Box`) keeps the borrow checker happy alongside the
+        // so carrying stale bytes past `n` is unobservable. `Option::take` (a
+        // pointer move) keeps the borrow checker happy alongside the
         // `&self.src` / `&mut self.rec` borrows below; it is restored at BOTH
-        // exits. `encode_tx_block` is not re-entrant, so the box is never empty.
-        let mut scratch = std::mem::take(&mut self.tx_scratch);
+        // exits. `encode_tx_block` is not re-entrant, so the slot is never empty.
+        //
+        // It must be `Option::take`, not `mem::take` on a bare `Box`: the latter
+        // leaves `Box::default()` behind, i.e. allocates and zero-fills a fresh
+        // ~17 KB `TxScratch` on every call and frees it at the restore. That was
+        // one `zalloc` + memset + free per transform block (callgrind: 20.6K Ir
+        // per call, 53-62% of encode Ir; wall -9..-30%, 16/16 paired rounds).
+        let mut scratch = self.tx_scratch.take().expect("tx scratch is never lent twice");
         if self.tx_memset {
             scratch.clear(); // VP9_TX_MEMSET=1 — the A/B oracle arm
         }
@@ -6873,7 +6879,7 @@ impl FrameEncoder {
                 let e = (dqcoeff[p] - coeffs[p]) as f64;
                 d += e * e * norm[p];
             }
-            self.tx_scratch = scratch; // restore before the early exit
+            self.tx_scratch = Some(scratch); // restore before the early exit
             return (bits, d as u64);
         }
 
@@ -6921,7 +6927,7 @@ impl FrameEncoder {
             }
             sse += acc;
         }
-        self.tx_scratch = scratch;
+        self.tx_scratch = Some(scratch);
         (bits, sse)
     }
 
