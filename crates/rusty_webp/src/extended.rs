@@ -363,6 +363,12 @@ pub(crate) struct AlphaChunk {
 }
 
 impl AlphaChunk {
+    /// Give the plane's buffer back, to be passed to the next
+    /// [`read_alpha_chunk`].
+    pub(crate) fn into_buffer(self) -> Vec<u8> {
+        self.data
+    }
+
     /// Unfilter the plane into the alpha byte of every pixel of `rgba`.
     pub(crate) fn apply(&self, rgba: &mut [u8], width: usize) {
         if self.in_green {
@@ -381,10 +387,27 @@ pub(crate) enum FilteringMethod {
     Gradient,
 }
 
+/// `scratch` as a buffer of exactly `len` bytes. A used buffer keeps its
+/// contents (only growth is zero-filled), for callers that overwrite all of
+/// it; an empty one is allocated zeroed in one step, as `vec![0; len]`.
+pub(crate) fn sized_buffer(mut scratch: Vec<u8>, len: usize) -> Vec<u8> {
+    if scratch.capacity() == 0 {
+        vec![0; len]
+    } else {
+        scratch.resize(len, 0);
+        scratch
+    }
+}
+
+/// Reads an ALPH chunk. `scratch` becomes the plane's buffer (its contents
+/// are overwritten, only growth is zero-filled): pass the buffer of a
+/// previous chunk, taken back with [`AlphaChunk::into_buffer`], to avoid
+/// allocating and zero-filling one per animation frame.
 pub(crate) fn read_alpha_chunk<R: BufRead>(
     reader: &mut R,
     width: u16,
     height: u16,
+    scratch: Vec<u8>,
 ) -> Result<AlphaChunk, DecodingError> {
     let info_byte = reader.read_u8()?;
 
@@ -415,14 +438,14 @@ pub(crate) fn read_alpha_chunk<R: BufRead>(
     let data = if lossless_compression {
         let mut decoder = LosslessDecoder::new(reader);
 
-        let mut data = vec![0; usize::from(width) * usize::from(height) * 4];
+        let mut data = sized_buffer(scratch, usize::from(width) * usize::from(height) * 4);
         decoder.decode_frame(u32::from(width), u32::from(height), true, &mut data)?;
 
         // The alpha values are the green channel of these pixels: they are
         // read from there when the plane is applied.
         data
     } else {
-        let mut framedata = vec![0; width as usize * height as usize];
+        let mut framedata = sized_buffer(scratch, width as usize * height as usize);
         reader.read_exact(&mut framedata)?;
         framedata
     };

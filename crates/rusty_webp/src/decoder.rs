@@ -250,6 +250,8 @@ struct AnimationState {
     /// Every frame decode overwrites its whole buffer, so reusing it saves
     /// allocating and zero-filling a frame's worth of memory per frame.
     frame_scratch: Vec<u8>,
+    /// Likewise the buffer of the last frame's alpha plane.
+    alpha_scratch: Vec<u8>,
 }
 impl Default for AnimationState {
     fn default() -> Self {
@@ -263,6 +265,7 @@ impl Default for AnimationState {
             previous_frame_y_offset: 0,
             canvas: None,
             frame_scratch: Vec::new(),
+            alpha_scratch: Vec::new(),
         }
     }
 }
@@ -773,6 +776,7 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
                     &mut range_reader(&mut self.r, range)?,
                     self.width as u16,
                     self.height as u16,
+                    Vec::new(),
                 )?;
 
                 alpha_chunk.apply(buf, usize::from(frame.width));
@@ -875,8 +879,12 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
                 // read alpha
                 let next_chunk_start = self.r.stream_position()? + chunk_size_rounded;
                 let mut reader = (&mut self.r).take(chunk_size);
-                let alpha_chunk =
-                    read_alpha_chunk(&mut reader, frame_width as u16, frame_height as u16)?;
+                let alpha_chunk = read_alpha_chunk(
+                    &mut reader,
+                    frame_width as u16,
+                    frame_height as u16,
+                    std::mem::take(&mut self.animation.alpha_scratch),
+                )?;
 
                 // read opaque
                 self.r.seek(io::SeekFrom::Start(next_chunk_start))?;
@@ -894,6 +902,7 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
                 frame.fill_rgba(&mut rgba_frame, self.webp_decode_options.lossy_upsampling);
 
                 alpha_chunk.apply(&mut rgba_frame, usize::from(frame.width));
+                self.animation.alpha_scratch = alpha_chunk.into_buffer();
 
                 (rgba_frame, true)
             }
@@ -1004,12 +1013,10 @@ pub(crate) fn rgba_to_rgb(rgba: &[u8], rgb: &mut [u8]) {
     }
 }
 
-/// Take `scratch` as a buffer of exactly `len` bytes. Its previous contents
-/// are kept (only growth is zero-filled): the caller overwrites all of it.
+/// Take `scratch` as a buffer of exactly `len` bytes (see
+/// [`extended::sized_buffer`]).
 fn reuse_buffer(scratch: &mut Vec<u8>, len: usize) -> Vec<u8> {
-    let mut buffer = std::mem::take(scratch);
-    buffer.resize(len, 0);
-    buffer
+    extended::sized_buffer(std::mem::take(scratch), len)
 }
 
 pub(crate) fn range_reader<R: BufRead + Seek>(
