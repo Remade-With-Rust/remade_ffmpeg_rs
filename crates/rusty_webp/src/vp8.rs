@@ -1462,10 +1462,10 @@ impl<R: Read> Vp8Decoder<R> {
         let mut ws = create_border_luma(mbx, mby, mw, &self.top_border_y, &self.left_border_y);
 
         match mb.luma_mode {
-            LumaMode::V => predict_vpred(&mut ws, 16, 1, 1, stride),
-            LumaMode::H => predict_hpred(&mut ws, 16, 1, 1, stride),
-            LumaMode::TM => predict_tmpred(&mut ws, 16, 1, 1, stride),
-            LumaMode::DC => predict_dcpred(&mut ws, 16, stride, mby != 0, mbx != 0),
+            LumaMode::V => predict_vpred::<16>(&mut ws, 1, 1, stride),
+            LumaMode::H => predict_hpred::<16>(&mut ws, 1, 1, stride),
+            LumaMode::TM => predict_tmpred::<16>(&mut ws, 1, 1, stride),
+            LumaMode::DC => predict_dcpred::<16>(&mut ws, stride, mby != 0, mbx != 0),
             LumaMode::B => predict_4x4(&mut ws, stride, &mb.bpred, resdata, mb.non_zero_dct),
         }
 
@@ -1517,20 +1517,20 @@ impl<R: Read> Vp8Decoder<R> {
 
         match mb.chroma_mode {
             ChromaMode::DC => {
-                predict_dcpred(&mut uws, 8, stride, mby != 0, mbx != 0);
-                predict_dcpred(&mut vws, 8, stride, mby != 0, mbx != 0);
+                predict_dcpred::<8>(&mut uws, stride, mby != 0, mbx != 0);
+                predict_dcpred::<8>(&mut vws, stride, mby != 0, mbx != 0);
             }
             ChromaMode::V => {
-                predict_vpred(&mut uws, 8, 1, 1, stride);
-                predict_vpred(&mut vws, 8, 1, 1, stride);
+                predict_vpred::<8>(&mut uws, 1, 1, stride);
+                predict_vpred::<8>(&mut vws, 1, 1, stride);
             }
             ChromaMode::H => {
-                predict_hpred(&mut uws, 8, 1, 1, stride);
-                predict_hpred(&mut vws, 8, 1, 1, stride);
+                predict_hpred::<8>(&mut uws, 1, 1, stride);
+                predict_hpred::<8>(&mut vws, 1, 1, stride);
             }
             ChromaMode::TM => {
-                predict_tmpred(&mut uws, 8, 1, 1, stride);
-                predict_tmpred(&mut vws, 8, 1, 1, stride);
+                predict_tmpred::<8>(&mut uws, 1, 1, stride);
+                predict_tmpred::<8>(&mut vws, 1, 1, stride);
             }
         }
 
@@ -2443,7 +2443,7 @@ fn predict_4x4(
             let x0 = sbx * 4 + 1;
 
             match modes[i] {
-                IntraMode::TM => predict_tmpred(ws, 4, x0, y0, stride),
+                IntraMode::TM => predict_tmpred::<4>(ws, x0, y0, stride),
                 IntraMode::VE => predict_bvepred(ws, x0, y0, stride),
                 IntraMode::HE => predict_bhepred(ws, x0, y0, stride),
                 IntraMode::DC => predict_bdcpred(ws, x0, y0, stride),
@@ -2463,32 +2463,32 @@ fn predict_4x4(
     }
 }
 
-fn predict_vpred(a: &mut [u8], size: usize, x0: usize, y0: usize, stride: usize) {
-    // This pass copies the top row to the rows below it.
+// The whole-block predictors take the block size as a const parameter: every
+// row is then a fixed-width copy, fill or loop the compiler emits inline,
+// where a runtime size made each row a `memset` call or an element loop.
+
+fn predict_vpred<const SIZE: usize>(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let (above, curr) = a.split_at_mut(stride * y0);
-    let above_slice = &above[x0..];
+    let above: [u8; SIZE] = above[x0..][..SIZE].try_into().unwrap();
 
-    for curr_chunk in curr.chunks_exact_mut(stride).take(size) {
-        for (curr, &above) in curr_chunk[1..].iter_mut().zip(above_slice) {
-            *curr = above;
-        }
+    for row in curr.chunks_exact_mut(stride).take(SIZE) {
+        row[1..][..SIZE].copy_from_slice(&above);
     }
 }
 
-fn predict_hpred(a: &mut [u8], size: usize, x0: usize, y0: usize, stride: usize) {
-    // This pass copies the first value of a row to the values right of it.
-    for chunk in a.chunks_exact_mut(stride).skip(y0).take(size) {
+fn predict_hpred<const SIZE: usize>(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
+    for chunk in a.chunks_exact_mut(stride).skip(y0).take(SIZE) {
         let left = chunk[x0 - 1];
-        chunk[x0..].iter_mut().for_each(|a| *a = left);
+        chunk[x0..][..SIZE].fill(left);
     }
 }
 
-fn predict_dcpred(a: &mut [u8], size: usize, stride: usize, above: bool, left: bool) {
+fn predict_dcpred<const SIZE: usize>(a: &mut [u8], stride: usize, above: bool, left: bool) {
     let mut sum = 0;
-    let mut shf = if size == 8 { 2 } else { 3 };
+    let mut shf = if SIZE == 8 { 2 } else { 3 };
 
     if left {
-        for y in 0usize..size {
+        for y in 0usize..SIZE {
             sum += u32::from(a[(y + 1) * stride]);
         }
 
@@ -2496,7 +2496,7 @@ fn predict_dcpred(a: &mut [u8], size: usize, stride: usize, above: bool, left: b
     }
 
     if above {
-        sum += a[1..=size].iter().fold(0, |acc, &x| acc + u32::from(x));
+        sum += a[1..=SIZE].iter().fold(0, |acc, &x| acc + u32::from(x));
 
         shf += 1;
     }
@@ -2507,45 +2507,26 @@ fn predict_dcpred(a: &mut [u8], size: usize, stride: usize, above: bool, left: b
         (sum + (1 << (shf - 1))) >> shf
     };
 
-    for y in 0usize..size {
-        a[1 + stride * (y + 1)..][..size]
-            .iter_mut()
-            .for_each(|a| *a = dcval as u8);
+    for row in a[stride..].chunks_exact_mut(stride).take(SIZE) {
+        row[1..][..SIZE].fill(dcval as u8);
     }
 }
 
 // Clippy suggests the clamp method, but it seems to optimize worse as of rustc 1.82.0 nightly.
 #[allow(clippy::manual_clamp)]
-fn predict_tmpred(a: &mut [u8], size: usize, x0: usize, y0: usize, stride: usize) {
+fn predict_tmpred<const SIZE: usize>(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     // The formula for tmpred is:
-    // X_ij = L_i + A_j - P (i, j=0, 1, 2, 3)
-    //
-    // |-----|-----|-----|-----|-----|
-    // | P   | A0  | A1  | A2  | A3  |
-    // |-----|-----|-----|-----|-----|
-    // | L0  | X00 | X01 | X02 | X03 |
-    // |-----|-----|-----|-----|-----|
-    // | L1  | X10 | X11 | X12 | X13 |
-    // |-----|-----|-----|-----|-----|
-    // | L2  | X20 | X21 | X22 | X23 |
-    // |-----|-----|-----|-----|-----|
-    // | L3  | X30 | X31 | X32 | X33 |
-    // |-----|-----|-----|-----|-----|
-    // Diagram from p. 52 of RFC 6386
-
-    // Split at L0
+    // x_block[y * stride + x] = (left + above - p).clamp(0, 255)
     let (above, x_block) = a.split_at_mut(y0 * stride + (x0 - 1));
     let p = i32::from(above[(y0 - 1) * stride + x0 - 1]);
-    let above_slice = &above[(y0 - 1) * stride + x0..];
+    let above: [u8; SIZE] = above[(y0 - 1) * stride + x0..][..SIZE].try_into().unwrap();
 
-    for y in 0usize..size {
-        let left_minus_p = i32::from(x_block[y * stride]) - p;
-
-        // Add 1 to skip over L0 byte
-        x_block[y * stride + 1..][..size]
-            .iter_mut()
-            .zip(above_slice)
-            .for_each(|(cur, &abv)| *cur = (left_minus_p + i32::from(abv)).max(0).min(255) as u8);
+    for row in x_block.chunks_mut(stride).take(SIZE) {
+        let left_minus_p = i32::from(row[0]) - p;
+        let cur: &mut [u8; SIZE] = (&mut row[1..][..SIZE]).try_into().unwrap();
+        for (cur, &abv) in cur.iter_mut().zip(&above) {
+            *cur = (left_minus_p + i32::from(abv)).max(0).min(255) as u8;
+        }
     }
 }
 
