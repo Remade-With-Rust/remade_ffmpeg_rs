@@ -363,33 +363,40 @@ fn prefix_encode(v: u32) -> (u32, u8, u32) {
 /// conservative: a hit is only claimed for values the stream actually
 /// inserted, never for the decoder's zero-initialised slots.
 struct CacheModel {
-    bits: u8,
-    slots: Vec<u32>,
-    filled: Vec<bool>,
+    /// `32 - bits`: the hash is the top `bits` bits of the product.
+    shift: u32,
+    /// One word per slot: the inserted value with [`Self::FILLED`] set, or
+    /// zero for a slot the stream has not written yet. (A value and a
+    /// separate `filled` flag meant two bounds-checked stores per insert,
+    /// and an insert happens for every pixel of every copy.)
+    slots: Vec<u64>,
 }
 
 impl CacheModel {
+    const FILLED: u64 = 1 << 32;
+
     fn new(bits: u8) -> Self {
         Self {
-            bits,
+            shift: 32 - u32::from(bits),
             slots: vec![0; 1 << bits],
-            filled: vec![false; 1 << bits],
         }
     }
 
+    #[inline(always)]
     fn index(&self, v: u32) -> usize {
-        (0x1e35_a7bdu32.wrapping_mul(v) >> (32 - self.bits)) as usize
+        (0x1e35_a7bdu32.wrapping_mul(v) >> self.shift) as usize
     }
 
+    #[inline(always)]
     fn hit(&self, v: u32) -> Option<usize> {
         let i = self.index(v);
-        (self.filled[i] && self.slots[i] == v).then_some(i)
+        (self.slots[i] == (u64::from(v) | Self::FILLED)).then_some(i)
     }
 
+    #[inline(always)]
     fn insert(&mut self, v: u32) {
         let i = self.index(v);
-        self.slots[i] = v;
-        self.filled[i] = true;
+        self.slots[i] = u64::from(v) | Self::FILLED;
     }
 }
 
