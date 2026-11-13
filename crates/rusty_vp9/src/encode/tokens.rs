@@ -11,7 +11,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::OnceLock;
 
 use super::bitwriter::BoolEncoder;
 use crate::prob_tables::{
@@ -59,7 +58,7 @@ impl BitSink for BoolEncoder {
 /// `OnceLock` first, and the RD walks price tens of millions of bits per encode.
 /// `cost_table_matches_formula` pins it to the formula.
 #[rustfmt::skip]
-static COST_Q8: [u16; 257] = [
+const COST_Q8_INIT: [u16; 257] = [
     2048, 2048, 1792, 1642, 1536, 1454, 1386, 1329, 1280, 1236, 1198, 1162,
     1130, 1101, 1073, 1048, 1024, 1002, 980, 961, 942, 924, 906, 890,
     874, 859, 845, 831, 817, 804, 792, 780, 768, 757, 746, 735,
@@ -83,6 +82,8 @@ static COST_Q8: [u16; 257] = [
     24, 22, 21, 19, 18, 16, 15, 13, 12, 10, 9, 7,
     6, 4, 3, 1, 0,
 ];
+
+static COST_Q8: [u16; 257] = COST_Q8_INIT;
 
 #[inline]
 pub(crate) fn cost_bit(prob: u8, bit: u32) -> u64 {
@@ -118,31 +119,102 @@ fn class_of(aval: u32) -> u8 {
 /// Static magnitude-cost table: `MAG_COST[prob2][aval]` = Q8 cost of coding
 /// magnitude `aval` (1..=66, i.e. through CAT5) with pivot prob `prob2`. The
 /// magnitude cost depends ONLY on (prob2, aval) plus the constant Pareto/CAT
-/// tables — never on per-frame state — so it's built once per process, BY the
-/// canonical tree walk itself (identical sums by construction). CAT6 (aval ≥ 67,
-/// bit-depth-dependent) still walks. This kills the ~12-sequential-`cost_bit`
-/// chain per nonzero coefficient that dominated coef_cost/trellis at low crf.
-fn mag_cost_table() -> &'static [[u16; 67]; 256] {
-    static T: OnceLock<Box<[[u16; 67]; 256]>> = OnceLock::new();
-    T.get_or_init(|| {
-        let mut t = vec![[0u16; 67]; 256];
-        for prob2 in 1..=255usize {
-            for aval in 1..=66u32 {
-                let mut sink = CostSink(0);
-                // cat6 args unused for aval ≤ 66.
-                code_magnitude(&mut sink, aval, prob2 as u8, &CAT6_PROB, 14);
-                t[prob2][aval as usize] = sink.0 as u16;
+/// tables — never on per-frame state. CAT6 (aval ≥ 67, bit-depth-dependent)
+/// still walks. This kills the ~12-sequential-`cost_bit` chain per nonzero
+/// coefficient that dominated coef_cost/trellis at low crf.
+///
+/// Built at COMPILE time by [`mag_cost_const`], a `const` transcription of
+/// [`code_magnitude`] under a cost sink. It used to be built on first use
+/// behind a `OnceLock`, which every magnitude priced then had to probe.
+/// `mag_cost_table_matches_walk_exhaustively` pins all 16,830 entries to the
+/// real tree walk.
+static MAG_COST: [[u16; 67]; 256] = build_mag_cost();
+
+const fn cbit(prob: u8, bit: u32) -> u32 {
+    if bit == 0 {
+        COST_Q8_INIT[prob as usize] as u32
+    } else {
+        COST_Q8_INIT[256 - prob as usize] as u32
+    }
+}
+
+const fn cextra(value: u32, probs: &[u8], n: usize) -> u32 {
+    let mut c = 0;
+    let mut i = 0;
+    while i < n {
+        c += cbit(probs[i], (value >> (n - 1 - i)) & 1);
+        i += 1;
+    }
+    c
+}
+
+/// Q8 cost of magnitude `aval` (1..=66) under pivot `prob2` — the same token
+/// tree as [`code_magnitude`], summed instead of emitted.
+const fn mag_cost_const(aval: u32, prob2: u8) -> u32 {
+    if aval == 1 {
+        return cbit(prob2, 0); // ONE
+    }
+    let mut c = cbit(prob2, 1); // TWO+
+    let p = &PARETO8_FULL[prob2 as usize - 1];
+    if aval <= 4 {
+        c += cbit(p[0], 0);
+        if aval == 2 {
+            c += cbit(p[1], 0);
+        } else {
+            c += cbit(p[1], 1);
+            c += cbit(p[2], aval - 3); // 3→0, 4→1
+        }
+    } else {
+        c += cbit(p[0], 1);
+        if aval <= 10 {
+            c += cbit(p[3], 0);
+            if aval <= 6 {
+                c += cbit(p[4], 0);
+                c += cextra(aval - 5, &CAT1_PROB, 1);
+            } else {
+                c += cbit(p[4], 1);
+                c += cextra(aval - 7, &CAT2_PROB, 2);
+            }
+        } else {
+            c += cbit(p[3], 1);
+            if aval <= 34 {
+                c += cbit(p[5], 0);
+                if aval <= 18 {
+                    c += cbit(p[6], 0);
+                    c += cextra(aval - 11, &CAT3_PROB, 3);
+                } else {
+                    c += cbit(p[6], 1);
+                    c += cextra(aval - 19, &CAT4_PROB, 4);
+                }
+            } else {
+                c += cbit(p[5], 1);
+                c += cbit(p[7], 0);
+                c += cextra(aval - 35, &CAT5_PROB, 5);
             }
         }
-        t.into_boxed_slice().try_into().unwrap()
-    })
+    }
+    c
+}
+
+const fn build_mag_cost() -> [[u16; 67]; 256] {
+    let mut t = [[0u16; 67]; 256];
+    let mut prob2 = 1;
+    while prob2 <= 255 {
+        let mut aval = 1;
+        while aval <= 66 {
+            t[prob2][aval] = mag_cost_const(aval as u32, prob2 as u8) as u16;
+            aval += 1;
+        }
+        prob2 += 1;
+    }
+    t
 }
 
 /// Q8 cost of magnitude `aval` under pivot `prob2` — table hit for aval ≤ 66
 /// (through CAT5), `None` for the rare CAT6 range (caller falls back to exact).
 pub(crate) fn mag_cost_q8(prob2: u8, aval: u32) -> Option<u16> {
     if (1..=66).contains(&aval) {
-        Some(mag_cost_table()[prob2 as usize][aval as usize])
+        Some(MAG_COST[prob2 as usize][aval as usize])
     } else {
         None
     }
@@ -157,14 +229,26 @@ impl BitSink for CostSink {
         self.0 += cost_bit(prob, bit);
     }
 
-    #[inline]
+    #[inline(always)]
     fn put_magnitude(&mut self, aval: u32, prob2: u8, cat6: &[u8], cat6_bits: usize) -> u8 {
         if aval <= 66 {
-            self.0 += mag_cost_table()[prob2 as usize][aval as usize] as u64;
+            self.0 += MAG_COST[prob2 as usize][aval as usize] as u64;
             class_of(aval)
         } else {
-            code_magnitude(self, aval, prob2, cat6, cat6_bits)
+            self.put_magnitude_cat6(aval, prob2, cat6, cat6_bits)
         }
+    }
+}
+
+impl CostSink {
+    /// The CAT6 range (magnitude >= 67) walks the token tree. Out of line and
+    /// cold: it is rare, and inlined it made `put_magnitude` too big for LLVM to
+    /// inline at all, which turned the one-load table hit into a call per
+    /// non-zero coefficient.
+    #[cold]
+    #[inline(never)]
+    fn put_magnitude_cat6(&mut self, aval: u32, prob2: u8, cat6: &[u8], cat6_bits: usize) -> u8 {
+        code_magnitude(self, aval, prob2, cat6, cat6_bits)
     }
 }
 
@@ -955,7 +1039,7 @@ mod tests {
                 let mut walk = CostSink(0);
                 let class = code_magnitude(&mut walk, aval, prob2 as u8, &CAT6_PROB, 14);
                 assert_eq!(
-                    mag_cost_table()[prob2 as usize][aval as usize] as u64,
+                    MAG_COST[prob2 as usize][aval as usize] as u64,
                     walk.0,
                     "prob2={prob2} aval={aval}"
                 );
