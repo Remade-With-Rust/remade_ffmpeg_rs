@@ -398,6 +398,11 @@ pub(crate) fn read_inter_mode(b: &mut BoolDecoder, probs: &[u8; 3]) -> u8 {
 
 /// `clamp_mv_to_umv_border_sb` — scale an MV to the plane's 1/16-pel grid and
 /// clamp it so the reference access stays within the unrestricted-MV border.
+///
+/// `#[inline]`: this is a dozen instructions of arithmetic, but as an
+/// out-of-line call it cost 54 per use (six arguments, a frame, and the
+/// `clamp` bound assertions) and the sub-8x8 search calls it per candidate.
+#[inline]
 pub(crate) fn clamp_mv_umv(
     mv: Mv,
     bw: i32,
