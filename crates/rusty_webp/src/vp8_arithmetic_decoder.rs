@@ -460,7 +460,8 @@ fn state_read_flag(chunks: &[[u8; 4]], state: &mut State) -> bool {
     }
     debug_assert!(state.bit_count >= 0);
 
-    let half_range = (state.range_m1 + 1) / 2;
+    // range / 2, with range = range_m1 + 1
+    let half_range = state.range_m1.div_ceil(2);
     let split = state.range_m1 + 1 - half_range;
     let bigsplit = u64::from(split) << state.bit_count;
 

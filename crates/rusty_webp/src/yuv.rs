@@ -267,6 +267,8 @@ const LANES: usize = 16;
 /// * b reaches 34238, past `i16`: its sum (at most 51923) stays unsigned and
 ///   the bias comes off with a saturating subtract, which is the same clamp
 ///   at zero that [`clip`] applies after the shift.
+// As for `clip`: the clamp method optimizes worse than max/min here.
+#[allow(clippy::manual_clamp)]
 #[inline(always)]
 fn convert_lanes(
     y: &[u8; LANES],
@@ -466,7 +468,7 @@ mod tests {
     #[test]
     fn lanes_match_scalar() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let mut check = |y: [u8; LANES], u: [u8; LANES], v: [u8; LANES]| {
+        let check = |y: [u8; LANES], u: [u8; LANES], v: [u8; LANES]| {
             let (r, g, b) = convert_lanes(&y, &u, &v);
             for i in 0..LANES {
                 assert_eq!(r[i], yuv_to_r(y[i], v[i]), "r y {} v {}", y[i], v[i]);

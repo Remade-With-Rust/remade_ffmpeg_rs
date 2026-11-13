@@ -1384,10 +1384,8 @@ impl<R: Read> Vp8Decoder<R> {
                 }
             }
             Some(mode) => {
-                for i in 0usize..4 {
-                    mb.bpred[12 + i] = mode;
-                    left[i] = mode;
-                }
+                mb.bpred[12..].fill(mode);
+                left[..4].fill(mode);
             }
         }
 

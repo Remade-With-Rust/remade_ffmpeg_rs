@@ -725,6 +725,10 @@ fn residual_cost(r: u8) -> u32 {
     u32::from(r.min(0u8.wrapping_sub(r)))
 }
 
+/// What [`neighbour_rows`] returns: current, left, top and top-left bytes
+/// (slices of the image) and a copy of the top-right bytes.
+type NeighbourRows<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a [u8], [u8; 4 << PRED_BITS]);
+
 /// Pixels `x0..x1` (`x0 >= 1`) of row `y >= 1` as bytes, with the bytes of
 /// their left, top and top-left neighbours (slices of the image, all the
 /// same length) and of their top-right neighbours (a copy, valid for that
@@ -740,7 +744,7 @@ fn neighbour_rows(
     x0: usize,
     x1: usize,
     y: usize,
-) -> (&[u8], &[u8], &[u8], &[u8], [u8; 4 << PRED_BITS]) {
+) -> NeighbourRows<'_> {
     let n = (x1 - x0) * 4;
     let row = (y * width + x0) * 4;
     let above = row - width * 4;
