@@ -555,37 +555,36 @@ fn filter_selectively_vert(
     stride: usize,
     base_x: usize,
     y: usize,
-    mut m16: u32,
-    mut m8: u32,
-    mut m4: u32,
-    mut m4i: u32,
+    m16: u32,
+    m8: u32,
+    m4: u32,
+    m4i: u32,
     thr: &[Thresh],
     lfl: &[u8],
     bd: i32,
     avx2: bool,
 ) {
-    let mut col = 0;
+    // Jump from one set bit to the next, in ascending column order as before.
+    // The shift-through form walked every column up to the highest set bit, and
+    // large blocks set one bit in four or eight.
     let mut any = m16 | m8 | m4 | m4i;
     while any != 0 {
+        let col = any.trailing_zeros() as usize;
+        let bit = 1u32 << col;
         let t = &thr[lfl[col] as usize];
         let x = base_x + col * 8;
         let base = y * stride + x;
-        if m16 & 1 != 0 {
+        if m16 & bit != 0 {
             apply_edge::<16, true>(buf, base, stride, t, bd, avx2);
-        } else if m8 & 1 != 0 {
+        } else if m8 & bit != 0 {
             apply_edge::<8, true>(buf, base, stride, t, bd, avx2);
-        } else if m4 & 1 != 0 {
+        } else if m4 & bit != 0 {
             apply_edge::<4, true>(buf, base, stride, t, bd, avx2);
         }
-        if m4i & 1 != 0 {
+        if m4i & bit != 0 {
             apply_edge::<4, true>(buf, base + 4, stride, t, bd, avx2);
         }
-        col += 1;
-        m16 >>= 1;
-        m8 >>= 1;
-        m4 >>= 1;
-        m4i >>= 1;
-        any >>= 1;
+        any &= any - 1;
     }
 }
 
@@ -595,42 +594,38 @@ fn filter_selectively_horiz(
     stride: usize,
     base_x: usize,
     y: usize,
-    mut m16: u32,
-    mut m8: u32,
-    mut m4: u32,
-    mut m4i: u32,
+    m16: u32,
+    m8: u32,
+    m4: u32,
+    m4i: u32,
     thr: &[Thresh],
     lfl: &[u8],
     bd: i32,
     avx2: bool,
 ) {
-    let mut col = 0;
     let mut any = m16 | m8 | m4 | m4i;
     while any != 0 {
+        let col = any.trailing_zeros() as usize;
+        let bit = 1u32 << col;
         let t = &thr[lfl[col] as usize];
         let x = base_x + col * 8;
         let base = y * stride + x;
-        if m16 & 1 != 0 {
+        if m16 & bit != 0 {
             apply_edge::<16, false>(buf, base, stride, t, bd, avx2);
-        } else if m8 & 1 != 0 {
+        } else if m8 & bit != 0 {
             apply_edge::<8, false>(buf, base, stride, t, bd, avx2);
-            if m4i & 1 != 0 {
+            if m4i & bit != 0 {
                 apply_edge::<4, false>(buf, base + 4 * stride, stride, t, bd, avx2);
             }
-        } else if m4 & 1 != 0 {
+        } else if m4 & bit != 0 {
             apply_edge::<4, false>(buf, base, stride, t, bd, avx2);
-            if m4i & 1 != 0 {
+            if m4i & bit != 0 {
                 apply_edge::<4, false>(buf, base + 4 * stride, stride, t, bd, avx2);
             }
-        } else if m4i & 1 != 0 {
+        } else if m4i & bit != 0 {
             apply_edge::<4, false>(buf, base + 4 * stride, stride, t, bd, avx2);
         }
-        col += 1;
-        m16 >>= 1;
-        m8 >>= 1;
-        m4 >>= 1;
-        m4i >>= 1;
-        any >>= 1;
+        any &= any - 1;
     }
 }
 
