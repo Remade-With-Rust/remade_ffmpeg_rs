@@ -599,20 +599,30 @@ fn cash(a: i16, b: i16) -> u8 {
 
 /// The 14 VP8L predictors, mirroring the decoder's
 /// `apply_predictor_transform_*` functions exactly (RGBA channel order).
+///
+/// Always inlined, with a generic (not `dyn`) per-channel helper: the
+/// predictor search calls this for all 14 modes of every pixel, and as an
+/// out-of-line function taking `&dyn Fn` each of those was a call, a
+/// run-time match on the mode and four indirect calls. Inlined into a loop
+/// over the modes, each mode's arm is selected at compile time.
+#[inline(always)]
 fn predict(mode: u8, l: [u8; 4], t: [u8; 4], tr: [u8; 4], tl: [u8; 4]) -> [u8; 4] {
-    let per = |f: &dyn Fn(usize) -> u8| [f(0), f(1), f(2), f(3)];
+    #[inline(always)]
+    fn per(f: impl Fn(usize) -> u8) -> [u8; 4] {
+        [f(0), f(1), f(2), f(3)]
+    }
     match mode {
         0 => [0, 0, 0, 255],
         1 => l,
         2 => t,
         3 => tr,
         4 => tl,
-        5 => per(&|i| avg2(avg2(l[i], tr[i]), t[i])),
-        6 => per(&|i| avg2(l[i], tl[i])),
-        7 => per(&|i| avg2(l[i], t[i])),
-        8 => per(&|i| avg2(tl[i], t[i])),
-        9 => per(&|i| avg2(t[i], tr[i])),
-        10 => per(&|i| avg2(avg2(l[i], tl[i]), avg2(t[i], tr[i]))),
+        5 => per(|i| avg2(avg2(l[i], tr[i]), t[i])),
+        6 => per(|i| avg2(l[i], tl[i])),
+        7 => per(|i| avg2(l[i], t[i])),
+        8 => per(|i| avg2(tl[i], t[i])),
+        9 => per(|i| avg2(t[i], tr[i])),
+        10 => per(|i| avg2(avg2(l[i], tl[i]), avg2(t[i], tr[i]))),
         11 => {
             // Select: whole-pixel choice between L and T by which is closer
             // to the gradient L+T-TL, summed over all four channels.
@@ -629,8 +639,8 @@ fn predict(mode: u8, l: [u8; 4], t: [u8; 4], tr: [u8; 4], tl: [u8; 4]) -> [u8; 4
                 t
             }
         }
-        12 => per(&|i| casf(i16::from(l[i]), i16::from(t[i]), i16::from(tl[i]))),
-        _ => per(&|i| cash((i16::from(l[i]) + i16::from(t[i])) / 2, i16::from(tl[i]))),
+        12 => per(|i| casf(i16::from(l[i]), i16::from(t[i]), i16::from(tl[i]))),
+        _ => per(|i| cash((i16::from(l[i]) + i16::from(t[i])) / 2, i16::from(tl[i]))),
     }
 }
 
