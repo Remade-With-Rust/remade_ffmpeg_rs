@@ -501,6 +501,7 @@ unsafe fn copy_block_avx2(
 /// `y` plus a fill, a copy and a fill. The per-sample form clamped both
 /// coordinates and bounds-checked a load for every cell — `(w + 7) * (h + 7)`
 /// of them, 225 for an 8x8 block.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn gather_tile(
     refp: &RefPlane,
     x0: i32,

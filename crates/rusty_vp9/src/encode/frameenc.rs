@@ -5967,6 +5967,8 @@ impl FrameEncoder {
                 } as i64;
             }
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = ref8;
         // Fast path: integer MV (no subpel fraction) + in-bounds 4×4 window → direct
         // SAD, skipping the 8-tap `predict_block` (which for frac=0 is a plain copy).
         // Byte-identical; covers the bulk of the integer search grid.
