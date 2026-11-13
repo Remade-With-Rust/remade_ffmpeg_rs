@@ -772,29 +772,34 @@ fn build_basis(n: usize, adst: bool) -> Vec<Vec<i64>> {
         .collect()
 }
 
-/// Cached inverse basis for `(n, adst)`.
-fn basis_for(n: usize, adst: bool) -> &'static [Vec<i64>] {
-    macro_rules! cached {
-        ($n:expr, $adst:expr) => {{
-            static C: OnceLock<Vec<Vec<i64>>> = OnceLock::new();
-            C.get_or_init(|| build_basis($n, $adst)).as_slice()
-        }};
-    }
-    match (n, adst) {
-        (4, false) => cached!(4, false),
-        (8, false) => cached!(8, false),
-        (16, false) => cached!(16, false),
-        (32, false) => cached!(32, false),
-        (4, true) => cached!(4, true),
-        (8, true) => cached!(8, true),
-        (16, true) => cached!(16, true),
-        _ => unreachable!("no basis for {n} adst={adst}"),
-    }
+/// Cached inverse basis for `(n, adst)`, flattened: `b[k * n + i] = basis[k][i]`.
+///
+/// One table set behind one `OnceLock`, each matrix a single contiguous slice.
+/// The previous shape (a `Vec<Vec<i64>>` per pair, each behind its own lock)
+/// cost two lock probes per call and a pointer chase plus a bounds check per
+/// row of every dot product.
+fn flat_basis(n: usize, adst: bool) -> &'static [i64] {
+    static T: OnceLock<[Vec<i64>; 8]> = OnceLock::new();
+    let t = T.get_or_init(|| {
+        std::array::from_fn(|idx| {
+            let (n, adst) = (4usize << (idx >> 1), idx & 1 == 1);
+            if n == 32 && adst {
+                return Vec::new(); // VP9 has no 32-point ADST
+            }
+            build_basis(n, adst).into_iter().flatten().collect()
+        })
+    });
+    let b = &t[((n.trailing_zeros() as usize - 2) << 1) | adst as usize];
+    assert!(b.len() == n * n, "no basis for {n} adst={adst}");
+    b
 }
 
 /// Forward 2-D transform via the integer inverse-basis transpose. `row_adst` /
 /// `col_adst` select the per-dimension transform exactly as the decoder's
 /// `inverse_transform_add_rows` interprets `tx_type`.
+///
+/// The result is the exact integer product `B_col · R · B_rowᵀ` with a single
+/// final round-shift, so any evaluation order gives the same output.
 fn forward_2d_matrix(
     residual: &[i32],
     n: usize,
@@ -803,34 +808,56 @@ fn forward_2d_matrix(
     out: &mut [i32],
     tmp: &mut [i64],
 ) {
-    let row_basis = basis_for(n, row_adst);
-    let col_basis = basis_for(n, col_adst);
-    // Row pass: transform each row into the frequency domain. `tmp` is caller
-    // scratch: a `[0i64; 32 * 32]` local here was an 8 KiB zero-fill on every
-    // ADST tx block, of which a 4x4 uses 128 bytes. The row pass writes all of
-    // `[..n * n]` before the column pass reads it.
-    let tmp = &mut tmp[..n * n];
-    for r in 0..n {
-        for k in 0..n {
-            let bk = &row_basis[k];
+    let rb = flat_basis(n, row_adst);
+    let cb = flat_basis(n, col_adst);
+    match n {
+        4 => matrix_fwd::<4>(residual, rb, cb, out, tmp),
+        8 => matrix_fwd::<8>(residual, rb, cb, out, tmp),
+        16 => matrix_fwd::<16>(residual, rb, cb, out, tmp),
+        32 => matrix_fwd::<32>(residual, rb, cb, out, tmp),
+        _ => unreachable!("no matrix transform for n={n}"),
+    }
+}
+
+/// The scalar matrix transform for one size — the exact-integer reference.
+///
+/// `tmp` is caller scratch: a `[0i64; 32 * 32]` local here was an 8 KiB
+/// zero-fill on every ADST tx block, of which a 4x4 uses 128 bytes. The row
+/// pass writes all of `[..N * N]` before the column pass reads it.
+#[inline(always)]
+fn matrix_fwd<const N: usize>(
+    residual: &[i32],
+    rb: &[i64],
+    cb: &[i64],
+    out: &mut [i32],
+    tmp: &mut [i64],
+) {
+    let (residual, rb, cb) = (&residual[..N * N], &rb[..N * N], &cb[..N * N]);
+    let (out, tmp) = (&mut out[..N * N], &mut tmp[..N * N]);
+    // Row pass: tmp[r][k] = Σ_i residual[r][i] · rb[k][i].
+    for (rrow, trow) in residual.chunks_exact(N).zip(tmp.chunks_exact_mut(N)) {
+        for (t, bk) in trow.iter_mut().zip(rb.chunks_exact(N)) {
             let mut acc = 0i64;
-            for i in 0..n {
-                acc += residual[r * n + i] as i64 * bk[i];
+            for (&x, &b) in rrow.iter().zip(bk) {
+                acc += x as i64 * b;
             }
-            tmp[r * n + k] = acc;
+            *t = acc;
         }
     }
-    // Column pass + calibration round-shift.
-    let sh = calib_shift(n);
+    // Column pass + calibration round-shift:
+    // out[kr][kc] = (Σ_r tmp[r][kc] · cb[kr][r] + round) >> sh, accumulated a
+    // whole output row at a time so `tmp` is read along its rows.
+    let sh = calib_shift(N);
     let round = 1i64 << (sh - 1);
-    for kc in 0..n {
-        for kr in 0..n {
-            let bk = &col_basis[kr];
-            let mut acc = 0i64;
-            for r in 0..n {
-                acc += tmp[r * n + kc] * bk[r];
+    for (orow, bk) in out.chunks_exact_mut(N).zip(cb.chunks_exact(N)) {
+        let mut acc = [0i64; N];
+        for (trow, &b) in tmp.chunks_exact(N).zip(bk) {
+            for (a, &t) in acc.iter_mut().zip(trow) {
+                *a += t * b;
             }
-            out[kr * n + kc] = ((acc + round) >> sh) as i32;
+        }
+        for (o, a) in orow.iter_mut().zip(acc) {
+            *o = ((a + round) >> sh) as i32;
         }
     }
 }
