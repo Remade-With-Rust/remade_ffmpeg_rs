@@ -1767,14 +1767,16 @@ impl<R: Read> Vp8Decoder<R> {
         decoder.check(res, (has_coefficients, last))
     }
 
+    /// Reads the macroblock's residual into `blocks`, which must be all zero
+    /// on entry: 24 inverse-transformed 4x4 blocks (16 luma, 4 U, 4 V).
     fn read_residual_data(
         &mut self,
         mb: &mut MacroBlock,
         mbx: usize,
         p: usize,
-    ) -> Result<[i32; 384], DecodingError> {
+        blocks: &mut [i32; 384],
+    ) -> Result<(), DecodingError> {
         let sindex = mb.segmentid as usize;
-        let mut blocks = [0i32; 384];
         let mut plane = if mb.luma_mode == LumaMode::B { 3 } else { 1 };
 
         if plane == 1 {
@@ -1865,7 +1867,7 @@ impl<R: Read> Vp8Decoder<R> {
             }
         }
 
-        Ok(blocks)
+        Ok(())
     }
 
     /// Does loop filtering on the macroblock
@@ -2127,6 +2129,12 @@ impl<R: Read> Vp8Decoder<R> {
             self.prof[3] += t.elapsed().as_nanos() as u64;
         }
 
+        // One residual buffer for the whole frame, kept all zero between
+        // macroblocks: it is cleared only after a macroblock that wrote a
+        // residual, instead of being zeroed and returned by value (two
+        // 1.5 KB moves) for every macroblock.
+        let mut blocks = [0i32; 384];
+
         for mby in 0..self.mbheight as usize {
             let p = mby % self.num_partitions as usize;
             self.left = MacroBlock::default();
@@ -2137,8 +2145,8 @@ impl<R: Read> Vp8Decoder<R> {
                     t = std::time::Instant::now();
                 }
                 let mut mb = self.read_macroblock_header(mbx)?;
-                let blocks = if !mb.coeffs_skipped {
-                    self.read_residual_data(&mut mb, mbx, p)?
+                if !mb.coeffs_skipped {
+                    self.read_residual_data(&mut mb, mbx, p, &mut blocks)?;
                 } else {
                     if mb.luma_mode != LumaMode::B {
                         self.left.complexity[0] = 0;
@@ -2149,9 +2157,7 @@ impl<R: Read> Vp8Decoder<R> {
                         self.left.complexity[i] = 0;
                         self.top[mbx].complexity[i] = 0;
                     }
-
-                    [0i32; 384]
-                };
+                }
                 #[cfg(feature = "profile")]
                 {
                     self.prof[0] += t.elapsed().as_nanos() as u64;
@@ -2163,6 +2169,11 @@ impl<R: Read> Vp8Decoder<R> {
                 #[cfg(feature = "profile")]
                 {
                     self.prof[1] += t.elapsed().as_nanos() as u64;
+                }
+
+                // Any nonzero residual sets `non_zero_dct`.
+                if mb.non_zero_dct {
+                    blocks.fill(0);
                 }
 
                 self.macroblocks.push(mb);
