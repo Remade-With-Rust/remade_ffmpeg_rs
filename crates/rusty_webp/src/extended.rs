@@ -149,14 +149,17 @@ pub(crate) fn composite_frame(
 
 /// Undo the alpha plane's prediction filter and store the result in the
 /// alpha byte of every pixel of `rgba` (rows of `width` RGBA pixels).
-/// `alpha` holds one filtered byte per pixel.
+/// `alpha` holds the filtered values: value `i` is byte `AT` of the `i`-th
+/// `STEP`-byte group, so a plane of single bytes is `<1, 0>` and the green
+/// channel of a decoded four-byte-per-pixel image is `<4, 1>` (no separate
+/// plane has to be extracted first).
 ///
 /// The filter method is fixed for the plane, and its edge rules depend only
 /// on the row and on whether the pixel is the first of its row, so the
 /// method is matched once and each row runs a plain loop.
 /// [`get_alpha_predictor`] is the same rule one pixel at a time, kept as the
 /// test oracle.
-pub(crate) fn apply_alpha_plane(
+pub(crate) fn apply_alpha_plane<const STEP: usize, const AT: usize>(
     rgba: &mut [u8],
     width: usize,
     alpha: &[u8],
@@ -169,37 +172,40 @@ pub(crate) fn apply_alpha_plane(
 
     // A row predicted from the left: each pixel adds to the previous result.
     // `first` is the predictor of the row's first pixel.
-    fn from_left(row: &mut [u8], deltas: &[u8], first: u8) {
+    fn from_left<const STEP: usize, const AT: usize>(row: &mut [u8], deltas: &[u8], first: u8) {
         let mut prev = first;
-        for (px, &d) in row.chunks_exact_mut(4).zip(deltas) {
-            prev = prev.wrapping_add(d);
+        for (px, d) in row.chunks_exact_mut(4).zip(deltas.chunks_exact(STEP)) {
+            prev = prev.wrapping_add(d[AT]);
             px[3] = prev;
         }
     }
 
     match filtering_method {
         FilteringMethod::None => {
-            for (px, &a) in rgba.chunks_exact_mut(4).zip(alpha) {
-                px[3] = a;
+            for (px, a) in rgba.chunks_exact_mut(4).zip(alpha.chunks_exact(STEP)) {
+                px[3] = a[AT];
             }
         }
         FilteringMethod::Horizontal => {
             // the first pixel of a row is predicted from the pixel above it
             let mut above = 0u8;
-            for (row, deltas) in rgba.chunks_exact_mut(stride).zip(alpha.chunks_exact(width)) {
-                from_left(row, deltas, above);
+            for (row, deltas) in rgba
+                .chunks_exact_mut(stride)
+                .zip(alpha.chunks_exact(width * STEP))
+            {
+                from_left::<STEP, AT>(row, deltas, above);
                 above = row[3];
             }
         }
         FilteringMethod::Vertical | FilteringMethod::Gradient => {
             let gradient = matches!(filtering_method, FilteringMethod::Gradient);
-            let mut rows = alpha.chunks_exact(width);
+            let mut rows = alpha.chunks_exact(width * STEP);
             // the first row has no row above: it is predicted from the left
             let Some(deltas) = rows.next() else { return };
             let Some(first_row) = rgba.get_mut(..stride) else {
                 return;
             };
-            from_left(first_row, deltas, 0);
+            from_left::<STEP, AT>(first_row, deltas, 0);
 
             let mut done = stride;
             for deltas in rows {
@@ -210,22 +216,24 @@ pub(crate) fn apply_alpha_plane(
                 let top = &before[done - stride..];
                 if gradient {
                     // first pixel: the one above; then left + top - top-left
-                    let mut left = top[3].wrapping_add(deltas[0]);
+                    let mut left = top[3].wrapping_add(deltas[AT]);
                     row[3] = left;
-                    for ((px, t), &d) in row[4..]
+                    for ((px, t), d) in row[4..]
                         .chunks_exact_mut(4)
                         .zip(top.windows(8).step_by(4))
-                        .zip(&deltas[1..])
+                        .zip(deltas[STEP..].chunks_exact(STEP))
                     {
                         let predictor = i16::from(left) + i16::from(t[7]) - i16::from(t[3]);
-                        left = (predictor.clamp(0, 255) as u8).wrapping_add(d);
+                        left = (predictor.clamp(0, 255) as u8).wrapping_add(d[AT]);
                         px[3] = left;
                     }
                 } else {
-                    for ((px, t), &d) in
-                        row.chunks_exact_mut(4).zip(top.chunks_exact(4)).zip(deltas)
+                    for ((px, t), d) in row
+                        .chunks_exact_mut(4)
+                        .zip(top.chunks_exact(4))
+                        .zip(deltas.chunks_exact(STEP))
                     {
-                        px[3] = t[3].wrapping_add(d);
+                        px[3] = t[3].wrapping_add(d[AT]);
                     }
                 }
                 done += stride;
@@ -347,6 +355,20 @@ pub(crate) struct AlphaChunk {
     _preprocessing: bool,
     pub(crate) filtering_method: FilteringMethod,
     pub(crate) data: Vec<u8>,
+    /// `data` is a decoded four-byte-per-pixel image with the alpha values
+    /// in its green channel, rather than one byte per pixel.
+    in_green: bool,
+}
+
+impl AlphaChunk {
+    /// Unfilter the plane into the alpha byte of every pixel of `rgba`.
+    pub(crate) fn apply(&self, rgba: &mut [u8], width: usize) {
+        if self.in_green {
+            apply_alpha_plane::<4, 1>(rgba, width, &self.data, self.filtering_method);
+        } else {
+            apply_alpha_plane::<1, 0>(rgba, width, &self.data, self.filtering_method);
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -394,12 +416,9 @@ pub(crate) fn read_alpha_chunk<R: BufRead>(
         let mut data = vec![0; usize::from(width) * usize::from(height) * 4];
         decoder.decode_frame(u32::from(width), u32::from(height), true, &mut data)?;
 
-        // The alpha values are the green channel. Taken out of each pixel
-        // as a word (shift and truncate), which vectorizes; indexing the
-        // second byte of every 4-byte chunk moved one byte at a time.
-        data.chunks_exact(4)
-            .map(|px| (u32::from_le_bytes(px.try_into().unwrap()) >> 8) as u8)
-            .collect()
+        // The alpha values are the green channel of these pixels: they are
+        // read from there when the plane is applied.
+        data
     } else {
         let mut framedata = vec![0; width as usize * height as usize];
         reader.read_exact(&mut framedata)?;
@@ -410,6 +429,7 @@ pub(crate) fn read_alpha_chunk<R: BufRead>(
         _preprocessing: preprocessing,
         filtering_method,
         data,
+        in_green: lossless_compression,
     };
 
     Ok(chunk)
@@ -455,9 +475,18 @@ mod alpha_tests {
                         want[i * 4 + 3] = predictor.wrapping_add(alpha[i]);
                     }
                 }
-                let mut got = image;
-                apply_alpha_plane(&mut got, width, &alpha, method);
+                let mut got = image.clone();
+                apply_alpha_plane::<1, 0>(&mut got, width, &alpha, method);
                 assert_eq!(got, want, "{width}x{height}");
+
+                // the same values as the green channel of four-byte pixels
+                let pixels: Vec<u8> = alpha
+                    .iter()
+                    .flat_map(|&a| [next(), a, next(), next()])
+                    .collect();
+                let mut got = image;
+                apply_alpha_plane::<4, 1>(&mut got, width, &pixels, method);
+                assert_eq!(got, want, "{width}x{height} from green");
             }
         }
     }

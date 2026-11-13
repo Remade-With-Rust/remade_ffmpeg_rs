@@ -772,12 +772,7 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
                     self.height as u16,
                 )?;
 
-                extended::apply_alpha_plane(
-                    buf,
-                    usize::from(frame.width),
-                    &alpha_chunk.data,
-                    alpha_chunk.filtering_method,
-                );
+                alpha_chunk.apply(buf, usize::from(frame.width));
             } else {
                 frame.fill_rgb(buf, self.webp_decode_options.lossy_upsampling);
             }
@@ -886,12 +881,7 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
                 let mut rgba_frame = vec![0; frame_width as usize * frame_height as usize * 4];
                 frame.fill_rgba(&mut rgba_frame, self.webp_decode_options.lossy_upsampling);
 
-                extended::apply_alpha_plane(
-                    &mut rgba_frame,
-                    usize::from(frame.width),
-                    &alpha_chunk.data,
-                    alpha_chunk.filtering_method,
-                );
+                alpha_chunk.apply(&mut rgba_frame, usize::from(frame.width));
 
                 (rgba_frame, true)
             }
