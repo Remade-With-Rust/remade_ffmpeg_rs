@@ -386,6 +386,27 @@ impl ArithmeticDecoder {
 // `FastDecoder` and the block-scoped `FastSession`.
 // ---------------------------------------------------------------------------
 
+/// `leading_zeros(range) - 24` for every range the decoder can hold (0..=255):
+/// the left shift that brings it back to 128..=255.
+const NORM_SHIFT: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = (i as u8).leading_zeros() as u8;
+        i += 1;
+    }
+    t
+};
+
+/// Shift required to satisfy `range >= 128`. The range never exceeds 255
+/// (it starts there and only shrinks before each renormalisation), so one
+/// table load replaces a bit scan, its zero case and a saturating subtract.
+#[inline(always)]
+fn norm_shift(range: u32) -> u32 {
+    debug_assert!(range < 256);
+    u32::from(NORM_SHIFT[range as u8 as usize])
+}
+
 #[inline(always)]
 fn state_read_bit(chunks: &[[u8; 4]], state: &mut State, probability: u8) -> bool {
     if state.bit_count < 0 {
@@ -412,7 +433,7 @@ fn state_read_bit(chunks: &[[u8; 4]], state: &mut State, probability: u8) -> boo
     };
     debug_assert!(state.range > 0);
 
-    let shift = state.range.leading_zeros().saturating_sub(24);
+    let shift = norm_shift(state.range);
     state.range <<= shift;
     state.bit_count -= shift as i32;
     debug_assert!(state.range >= 128);
@@ -446,7 +467,7 @@ fn state_read_flag(chunks: &[[u8; 4]], state: &mut State) -> bool {
     };
     debug_assert!(state.range > 0);
 
-    let shift = state.range.leading_zeros().saturating_sub(24);
+    let shift = norm_shift(state.range);
     state.range <<= shift;
     state.bit_count -= shift as i32;
     debug_assert!(state.range >= 128);
