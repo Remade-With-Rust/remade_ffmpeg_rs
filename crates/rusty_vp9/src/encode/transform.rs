@@ -1211,10 +1211,6 @@ mod tests {
         assert!(sink != 0);
     }
 
-    /// Byte-identity gate for the AVX2 `fdct8x8` vs the scalar oracle, over
-    /// random residuals at 8-bit (±255) and 10-bit (±1023) ranges plus the
-    /// extremes (all-max, all-min, impulse) — the i32-product headroom proof.
-    #[cfg(target_arch = "x86_64")]
     /// The vector matrix transform must equal the scalar reference bit for
     /// bit, for every size and ADST mix, on in-range residuals (including the
     /// 8/10/12-bit extremes and the table's own bound), and must decline
@@ -1284,6 +1280,10 @@ mod tests {
         }
     }
 
+    /// Byte-identity gate for the AVX2 `fdct8x8` vs the scalar oracle, over
+    /// random residuals at 8-bit (±255) and 10-bit (±1023) ranges plus the
+    /// extremes (all-max, all-min, impulse) — the i32-product headroom proof.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn fdct8x8_avx2_matches_scalar() {
         if !has_avx2() {
