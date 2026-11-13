@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.7](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/remade-ffmpeg-v0.4.6...remade-ffmpeg-v0.4.7) - 2026-11-13
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.4.6](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/remade-ffmpeg-v0.4.5...remade-ffmpeg-v0.4.6) - 2026-11-07
 
 ### Other

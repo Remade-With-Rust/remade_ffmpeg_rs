@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_vorbis-v0.1.2...rusty_vorbis-v0.1.3) - 2026-11-13
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.1.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_vorbis-v0.1.1...rusty_vorbis-v0.1.2) - 2026-10-22
 
 ### Added
