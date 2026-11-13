@@ -467,6 +467,53 @@ unsafe fn copy_block_avx2(src: *const u16, ss: usize, dst: *mut u16, ds: usize, 
     }
 }
 
+/// Fill tile cells `rows x cols` (tile stride `ts`) with the edge-replicated
+/// reference samples `refp.px(x0 + tx, y0 + ty)`.
+///
+/// The replication clamp is separable, so the columns are split ONCE into
+/// `[left of the plane | inside it | right of it]` and each row is one clamp of
+/// `y` plus a fill, a copy and a fill. The per-sample form clamped both
+/// coordinates and bounds-checked a load for every cell — `(w + 7) * (h + 7)`
+/// of them, 225 for an 8x8 block.
+fn gather_tile(
+    refp: &RefPlane,
+    x0: i32,
+    y0: i32,
+    tile: &mut [u16],
+    ts: usize,
+    cols: std::ops::Range<usize>,
+    rows: std::ops::Range<usize>,
+) {
+    let (w, h) = (refp.w, refp.h);
+    let n = cols.len();
+    if n == 0 {
+        return;
+    }
+    // Degenerate planes (malformed streams) keep the defensive per-sample fetch.
+    if w < 1 || h < 1 || refp.buf.len() < (h as usize - 1) * refp.stride + w as usize {
+        for ty in rows {
+            for tx in cols.clone() {
+                tile[ty * ts + tx] = refp.px(x0 + tx as i32, y0 + ty as i32) as u16;
+            }
+        }
+        return;
+    }
+    let w = w as usize;
+    let xs = x0 + cols.start as i32; // plane x of the first cell
+    let left = (-xs).clamp(0, n as i32) as usize; // cells with x < 0
+    let right = (xs + n as i32 - w as i32).clamp(0, n as i32) as usize; // cells with x >= w
+    let mid = n - left - right;
+    let mid_src = if mid > 0 { (xs + left as i32) as usize } else { 0 };
+    for ty in rows {
+        let sy = (y0 + ty as i32).clamp(0, h - 1) as usize;
+        let s_row = &refp.buf[sy * refp.stride..][..w];
+        let t_row = &mut tile[ty * ts + cols.start..][..n];
+        t_row[..left].fill(s_row[0]);
+        t_row[left..left + mid].copy_from_slice(&s_row[mid_src..mid_src + mid]);
+        t_row[left + mid..].fill(s_row[w - 1]);
+    }
+}
+
 /// A/B switch for the clamped-tile edge path (DEFAULT ON; set to disable).
 #[cfg(target_arch = "x86_64")]
 fn no_edge_tile() -> bool {
@@ -2124,13 +2171,7 @@ pub fn predict_block(
             let (tw, th) = (w + 7, h + 7);
             return TILE.with(|cell| {
                 let mut tile = cell.borrow_mut();
-                for ty in 0..th {
-                    let sy = by - 3 + ty as i32;
-                    let row = ty * TS;
-                    for tx in 0..tw {
-                        tile[row + tx] = refp.px(bx - 3 + tx as i32, sy) as u16;
-                    }
-                }
+                gather_tile(refp, bx - 3, by - 3, &mut tile[..], TS, 0..tw, 0..th);
                 let tref = RefPlane {
                     buf: &tile[..],
                     stride: TS,
@@ -3054,6 +3095,44 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// The row-wise tile gather equals the per-sample `px` fetch for windows
+    /// hanging off every side of the plane, wholly outside it, and for a plane
+    /// narrower than the window.
+    #[test]
+    fn gather_tile_matches_px() {
+        let mut s = 0x7777_1234_abcd_0001u64;
+        for &(pw, ph, stride) in &[(20i32, 12i32, 23usize), (3, 2, 3), (1, 1, 1), (9, 30, 16)] {
+            let buf: Vec<u16> = (0..stride * ph as usize)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (s % 1024) as u16
+                })
+                .collect();
+            let refp = RefPlane {
+                buf: &buf,
+                stride,
+                w: pw,
+                h: ph,
+            };
+            const TS: usize = 24;
+            for &(x0, y0) in &[(-5i32, -4i32), (0, 0), (pw - 6, ph - 3), (-30, 2), (pw + 9, -1), (2, ph + 5), (-2, -2)] {
+                for &(c0, c1, r0, r1) in &[(0usize, 15usize, 0usize, 11usize), (3, 11, 3, 7), (0, 15, 3, 7), (3, 11, 0, 11), (5, 5, 0, 4)] {
+                    let mut want = vec![0xBEEFu16; TS * 12];
+                    let mut got = want.clone();
+                    for ty in r0..r1 {
+                        for tx in c0..c1 {
+                            want[ty * TS + tx] = refp.px(x0 + tx as i32, y0 + ty as i32) as u16;
+                        }
+                    }
+                    gather_tile(&refp, x0, y0, &mut got, TS, c0..c1, r0..r1);
+                    assert_eq!(got, want, "plane {pw}x{ph} origin ({x0},{y0}) cols {c0}..{c1} rows {r0}..{r1}");
                 }
             }
         }
