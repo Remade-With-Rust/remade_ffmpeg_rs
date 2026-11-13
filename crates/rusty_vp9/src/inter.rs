@@ -353,51 +353,70 @@ unsafe fn conv8_v_block_avx2(
     let maxv = _mm256_set1_epi32(max);
     let one = _mm256_set1_epi32(1);
     let zero = _mm256_setzero_si256();
-    for y in 0..h {
-        let (s, d) = (src.add(y * src_stride), dst.add(y * dst_stride));
-        let mut x = 0;
-        while x + 16 <= w {
-            let c = s.add(x);
-            let r0 = _mm256_loadu_si256(c as *const __m256i);
-            let r1 = _mm256_loadu_si256(c.add(src_stride) as *const __m256i);
-            let r2 = _mm256_loadu_si256(c.add(2 * src_stride) as *const __m256i);
-            let r3 = _mm256_loadu_si256(c.add(3 * src_stride) as *const __m256i);
-            let r4 = _mm256_loadu_si256(c.add(4 * src_stride) as *const __m256i);
-            let r5 = _mm256_loadu_si256(c.add(5 * src_stride) as *const __m256i);
-            let r6 = _mm256_loadu_si256(c.add(6 * src_stride) as *const __m256i);
-            let r7 = _mm256_loadu_si256(c.add(7 * src_stride) as *const __m256i);
-            let lo = _mm256_add_epi32(
-                _mm256_add_epi32(
-                    _mm256_madd_epi16(_mm256_unpacklo_epi16(r0, r1), p[0]),
-                    _mm256_madd_epi16(_mm256_unpacklo_epi16(r2, r3), p[1]),
-                ),
-                _mm256_add_epi32(
-                    _mm256_madd_epi16(_mm256_unpacklo_epi16(r4, r5), p[2]),
-                    _mm256_madd_epi16(_mm256_unpacklo_epi16(r6, r7), p[3]),
-                ),
-            );
-            let hi = _mm256_add_epi32(
-                _mm256_add_epi32(
-                    _mm256_madd_epi16(_mm256_unpackhi_epi16(r0, r1), p[0]),
-                    _mm256_madd_epi16(_mm256_unpackhi_epi16(r2, r3), p[1]),
-                ),
-                _mm256_add_epi32(
-                    _mm256_madd_epi16(_mm256_unpackhi_epi16(r4, r5), p[2]),
-                    _mm256_madd_epi16(_mm256_unpackhi_epi16(r6, r7), p[3]),
-                ),
-            );
-            let (mut lo, mut hi) = (fin256(lo, maxv), fin256(hi, maxv));
-            if avg {
-                let dv = _mm256_loadu_si256(d.add(x) as *const __m256i);
-                let (dl, dh) = (_mm256_unpacklo_epi16(dv, zero), _mm256_unpackhi_epi16(dv, zero));
-                lo = _mm256_srai_epi32::<1>(_mm256_add_epi32(_mm256_add_epi32(lo, dl), one));
-                hi = _mm256_srai_epi32::<1>(_mm256_add_epi32(_mm256_add_epi32(hi, dh), one));
-            }
-            _mm256_storeu_si256(d.add(x) as *mut __m256i, _mm256_packus_epi32(lo, hi));
-            x += 16;
+    // Column strips of 16, rows inside. Output row `y` needs the tap pairs of
+    // source rows (y, y+1), (y+2, y+3), (y+4, y+5), (y+6, y+7). Row `y + 2`
+    // needs three of those same four again, so the unpacked pairs are kept in
+    // a ring of eight (pair `k` = rows `k, k+1`, slot `k & 7`): each output row
+    // then costs ONE row load and two unpacks instead of eight and eight.
+    let mut x = 0;
+    while x + 16 <= w {
+        let c = src.add(x);
+        let mut lo = [zero; 8];
+        let mut hi = [zero; 8];
+        let mut prev = _mm256_loadu_si256(c as *const __m256i);
+        for k in 0..7 {
+            let cur = _mm256_loadu_si256(c.add((k + 1) * src_stride) as *const __m256i);
+            lo[k] = _mm256_unpacklo_epi16(prev, cur);
+            hi[k] = _mm256_unpackhi_epi16(prev, cur);
+            prev = cur;
         }
-        if x < w {
-            conv8_avx2(s.add(x), src_stride, f, d.add(x), w - x, max, avg);
+        for y in 0..h {
+            let (k0, k2, k4, k6) = (y & 7, (y + 2) & 7, (y + 4) & 7, (y + 6) & 7);
+            let l = _mm256_add_epi32(
+                _mm256_add_epi32(
+                    _mm256_madd_epi16(lo[k0], p[0]),
+                    _mm256_madd_epi16(lo[k2], p[1]),
+                ),
+                _mm256_add_epi32(
+                    _mm256_madd_epi16(lo[k4], p[2]),
+                    _mm256_madd_epi16(lo[k6], p[3]),
+                ),
+            );
+            let hh = _mm256_add_epi32(
+                _mm256_add_epi32(
+                    _mm256_madd_epi16(hi[k0], p[0]),
+                    _mm256_madd_epi16(hi[k2], p[1]),
+                ),
+                _mm256_add_epi32(
+                    _mm256_madd_epi16(hi[k4], p[2]),
+                    _mm256_madd_epi16(hi[k6], p[3]),
+                ),
+            );
+            let (mut l, mut hh) = (fin256(l, maxv), fin256(hh, maxv));
+            let d = dst.add(y * dst_stride + x);
+            if avg {
+                let dv = _mm256_loadu_si256(d as *const __m256i);
+                let (dl, dh) = (_mm256_unpacklo_epi16(dv, zero), _mm256_unpackhi_epi16(dv, zero));
+                l = _mm256_srai_epi32::<1>(_mm256_add_epi32(_mm256_add_epi32(l, dl), one));
+                hh = _mm256_srai_epi32::<1>(_mm256_add_epi32(_mm256_add_epi32(hh, dh), one));
+            }
+            _mm256_storeu_si256(d as *mut __m256i, _mm256_packus_epi32(l, hh));
+            if y + 1 < h {
+                // Pair (y + 7, y + 8) takes the ring's one free slot; pair `y`
+                // is dead after this row and its slot is the next one freed.
+                let k7 = (y + 7) & 7;
+                let cur = _mm256_loadu_si256(c.add((y + 8) * src_stride) as *const __m256i);
+                lo[k7] = _mm256_unpacklo_epi16(prev, cur);
+                hi[k7] = _mm256_unpackhi_epi16(prev, cur);
+                prev = cur;
+            }
+        }
+        x += 16;
+    }
+    if x < w {
+        for y in 0..h {
+            let s = src.add(y * src_stride + x);
+            conv8_avx2(s, src_stride, f, dst.add(y * dst_stride + x), w - x, max, avg);
         }
     }
 }
