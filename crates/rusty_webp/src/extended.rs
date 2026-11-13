@@ -106,19 +106,21 @@ pub(crate) fn composite_frame(
     let height = frame_height.min(canvas_height.saturating_sub(frame_offset_y)) as usize;
 
     if frame_has_alpha && frame_use_alpha_blending {
+        // One row of the frame against one row of the canvas: two slices
+        // walked together, instead of two index computations and two
+        // bounds-checked sub-slices for every pixel.
         for y in 0..height {
-            for x in 0..width {
-                let frame_index = (x + y * frame_width as usize) * 4;
-                let canvas_index = ((x + frame_offset_x as usize)
-                    + (y + frame_offset_y as usize) * canvas_width as usize)
-                    * 4;
+            let frame_index = (y * frame_width as usize) * 4;
+            let canvas_index = (frame_offset_x as usize
+                + (y + frame_offset_y as usize) * canvas_width as usize)
+                * 4;
+            let input = &frame[frame_index..][..width * 4];
+            let output = &mut canvas[canvas_index..][..width * 4];
 
-                let input = &frame[frame_index..][..4];
-                let output = &mut canvas[canvas_index..][..4];
-
-                let blended =
-                    do_alpha_blending(input.try_into().unwrap(), output.try_into().unwrap());
-                output.copy_from_slice(&blended);
+            for (src, dst) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
+                let src: [u8; 4] = src.try_into().unwrap();
+                let under: [u8; 4] = (&*dst).try_into().unwrap();
+                dst.copy_from_slice(&do_alpha_blending(src, under));
             }
         }
     } else if frame_has_alpha {
