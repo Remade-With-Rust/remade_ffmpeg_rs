@@ -5869,8 +5869,7 @@ impl FrameEncoder {
         if let Some(r8) = ref8 {
             let (fx, fy) = ((mv_q4.1 & 15) as usize, (mv_q4.0 & 15) as usize);
             let sp = &self.src[0];
-            if (SUB4_U8_INTEGER || fx != 0 || fy != 0)
-                && crate::inter::score4x4_window_ok(
+            if crate::inter::score4x4_window_ok(
                     rp.w as i32,
                     rp.h as i32,
                     bx,
@@ -7552,11 +7551,6 @@ fn sad8x8(s: &[u16], ss: usize, r: &[u16], rs: usize, has_avx2: bool) -> u32 {
     let _ = has_avx2;
     sad8x8_scalar(s, ss, r, rs)
 }
-
-/// Stage switch: route integer-MV sub-block candidates through the u8 scorer
-/// too (sub-pel candidates always are).
-#[cfg(target_arch = "x86_64")]
-const SUB4_U8_INTEGER: bool = false;
 
 /// Index of the last row of a `bs x bs` coefficient block that holds a non-zero
 /// value (0 if the block is all zero).
