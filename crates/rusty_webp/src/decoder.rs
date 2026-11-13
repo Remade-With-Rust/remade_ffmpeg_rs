@@ -743,9 +743,7 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
             } else {
                 let mut data = vec![0; self.width as usize * self.height as usize * 4];
                 decoder.decode_frame(self.width, self.height, false, &mut data)?;
-                for (rgba_val, chunk) in data.chunks_exact(4).zip(buf.chunks_exact_mut(3)) {
-                    chunk.copy_from_slice(&rgba_val[..3]);
-                }
+                rgba_to_rgb(&data, buf);
             }
         } else {
             let range = self
@@ -930,12 +928,7 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
         if self.has_alpha() {
             buf.copy_from_slice(self.animation.canvas.as_ref().unwrap());
         } else {
-            for (b, c) in buf
-                .chunks_exact_mut(3)
-                .zip(self.animation.canvas.as_ref().unwrap().chunks_exact(4))
-            {
-                b.copy_from_slice(&c[..3]);
-            }
+            rgba_to_rgb(self.animation.canvas.as_ref().unwrap(), buf);
         }
 
         Ok(duration)
@@ -957,6 +950,41 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
     /// Sets the upsampling method that is used in lossy decoding
     pub fn set_lossy_upsampling(&mut self, upsampling_method: UpsamplingMethod) {
         self.webp_decode_options.lossy_upsampling = upsampling_method;
+    }
+}
+
+/// Copy RGBA pixels to RGB, dropping each alpha byte; stops at the shorter of
+/// the two buffers.
+///
+/// Eight pixels at a time between fixed-size arrays: each pixel is moved as
+/// one four-byte word whose spare byte lands on the next pixel's first byte
+/// and is overwritten by it, and the group's last pixel is moved as exactly
+/// three bytes. No bounds checks, and one move per pixel where the
+/// element-wise copy used three.
+pub(crate) fn rgba_to_rgb(rgba: &[u8], rgb: &mut [u8]) {
+    const GROUP: usize = 8;
+    // Trim both to the pixels they have in common, so that the groups and
+    // the leftovers of the two line up.
+    let pixels = (rgba.len() / 4).min(rgb.len() / 3);
+    let (rgba, rgb) = (&rgba[..pixels * 4], &mut rgb[..pixels * 3]);
+    let mut src_groups = rgba.chunks_exact(4 * GROUP);
+    let mut dst_groups = rgb.chunks_exact_mut(3 * GROUP);
+    for (src, dst) in (&mut src_groups).zip(&mut dst_groups) {
+        let src: &[u8; 4 * GROUP] = src.try_into().unwrap();
+        let dst: &mut [u8; 3 * GROUP] = dst.try_into().unwrap();
+        for k in 0..GROUP - 1 {
+            let word: [u8; 4] = src[4 * k..4 * k + 4].try_into().unwrap();
+            dst[3 * k..3 * k + 4].copy_from_slice(&word);
+        }
+        let last = GROUP - 1;
+        dst[3 * last..].copy_from_slice(&src[4 * last..4 * last + 3]);
+    }
+    for (src, dst) in src_groups
+        .remainder()
+        .chunks_exact(4)
+        .zip(dst_groups.into_remainder().chunks_exact_mut(3))
+    {
+        dst.copy_from_slice(&src[..3]);
     }
 }
 
@@ -1050,5 +1078,41 @@ mod tests {
         // All pixels are the same value
         let first_pixel = &data[..RGB_BPP];
         assert!(data.chunks_exact(3).all(|ch| ch.iter().eq(first_pixel)));
+    }
+}
+
+#[cfg(test)]
+mod rgba_to_rgb_tests {
+    use super::rgba_to_rgb;
+
+    #[test]
+    fn matches_per_pixel_copy_at_every_length() {
+        let rgba: Vec<u8> = (0..4 * 41u32)
+            .map(|i| (i.wrapping_mul(37) >> 1) as u8)
+            .collect();
+        for pixels in 0..=41usize {
+            for spare in [0usize, 1, 2, 5] {
+                // the shorter buffer decides how many pixels move
+                let mut got = vec![0xEEu8; pixels * 3 + spare];
+                rgba_to_rgb(&rgba, &mut got);
+                let mut want = vec![0xEEu8; pixels * 3 + spare];
+                for (dst, src) in want.chunks_exact_mut(3).zip(rgba.chunks_exact(4)) {
+                    dst.copy_from_slice(&src[..3]);
+                }
+                assert_eq!(got, want, "{pixels} pixels, {spare} spare bytes");
+
+                let mut got = vec![0xEEu8; 3 * 41 + 7];
+                let source = (pixels * 4 + spare.min(3)).min(rgba.len());
+                rgba_to_rgb(&rgba[..source], &mut got);
+                let mut want = vec![0xEEu8; 3 * 41 + 7];
+                for (dst, src) in want
+                    .chunks_exact_mut(3)
+                    .zip(rgba[..pixels * 4].chunks_exact(4))
+                {
+                    dst.copy_from_slice(&src[..3]);
+                }
+                assert_eq!(got, want, "{pixels} source pixels");
+            }
+        }
     }
 }
