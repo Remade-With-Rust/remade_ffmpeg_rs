@@ -547,6 +547,74 @@ pub(crate) fn subblock_filter_horizontal_batch<const N: usize>(
     store_cols(pixels, base, stride, &t, 2, 6);
 }
 
+/// Simple-filter core on centred lanes, taps ordered [p1, p0, q0, q1];
+/// writes p0 and q0. The same integer formulas per lane as
+/// [`simple_segment_vertical`].
+fn simple_edge_core<const N: usize>(edge_limit: u8, t: &mut [[i16; N]; 4]) {
+    let el = i16::from(edge_limit);
+    let [p1, p0, q0, q1] = t;
+    for i in 0..N {
+        let (v1, v0, w0, w1) = (p1[i], p0[i], q0[i], q1[i]);
+        let fmask = 2 * (v0 - w0).abs() + (v1 - w1).abs() / 2 <= el;
+        let a = clamp8(clamp8(v1 - w1) + 3 * (w0 - v0));
+        let b_ca = clamp8(a + 3) >> 3;
+        let a_ca = clamp8(a + 4) >> 3;
+        p0[i] = if fmask { clamp8(v0 + b_ca) } else { v0 };
+        q0[i] = if fmask { clamp8(w0 - a_ca) } else { w0 };
+    }
+}
+
+/// Batched [`simple_segment_vertical`]: N consecutive columns across a
+/// horizontal edge, `point` = first pixel below the edge.
+pub(crate) fn simple_filter_vertical_batch<const N: usize>(
+    edge_limit: u8,
+    pixels: &mut [u8],
+    point: usize,
+    stride: usize,
+) {
+    let mut t = [[0i16; N]; 4];
+    let mut rows = pixels[point - 2 * stride..].chunks(stride);
+    for row in &mut t {
+        let src: &[u8; N] = rows.next().unwrap()[..N].try_into().unwrap();
+        for i in 0..N {
+            row[i] = i16::from(src[i]) - 128;
+        }
+    }
+    simple_edge_core(edge_limit, &mut t);
+    let rows = pixels[point - stride..].chunks_mut(stride);
+    for (row, dst) in t[1..3].iter().zip(rows) {
+        let dst: &mut [u8; N] = (&mut dst[..N]).try_into().unwrap();
+        for i in 0..N {
+            dst[i] = (row[i] + 128) as u8;
+        }
+    }
+}
+
+/// Batched [`simple_segment_horizontal`]: N consecutive rows across a
+/// vertical edge, `base` = the p1 pixel (x0 − 2) of the first row.
+pub(crate) fn simple_filter_horizontal_batch<const N: usize>(
+    edge_limit: u8,
+    pixels: &mut [u8],
+    base: usize,
+    stride: usize,
+) {
+    let mut t = [[0i16; N]; 4];
+    let mut rows = pixels[base..].chunks(stride);
+    for i in 0..N {
+        let src: &[u8; 4] = rows.next().unwrap()[..4].try_into().unwrap();
+        for (tap, &s) in t.iter_mut().zip(src) {
+            tap[i] = i16::from(s) - 128;
+        }
+    }
+    simple_edge_core(edge_limit, &mut t);
+    let rows = pixels[base..].chunks_mut(stride);
+    for (i, row) in rows.take(N).enumerate() {
+        let dst: &mut [u8; 4] = (&mut row[..4]).try_into().unwrap();
+        dst[1] = (t[1][i] + 128) as u8;
+        dst[2] = (t[2][i] + 128) as u8;
+    }
+}
+
 #[cfg(test)]
 mod batch_tests {
     use super::*;
@@ -564,10 +632,30 @@ mod batch_tests {
     fn batch_matches_scalar() {
         let stride = 40usize;
         let mut seed = 0x00c0ffee_u64;
-        for (hev_t, il, el) in [(0u8, 1u8, 2u8), (5, 15, 15), (2, 63, 40), (10, 30, 80)] {
+        let mut params = vec![(0u8, 1u8, 2u8), (5, 15, 15), (2, 63, 40), (10, 30, 80)];
+        // the extremes of every limit, and a spread of random mixes
+        for &h in &[0u8, 255] {
+            for &i in &[0u8, 255] {
+                for &e in &[0u8, 254, 255] {
+                    params.push((h, i, e));
+                }
+            }
+        }
+        for _ in 0..200 {
+            params.push((lcg(&mut seed) >> 2, lcg(&mut seed) >> 1, lcg(&mut seed)));
+        }
+        for (hev_t, il, el) in params {
             let mut base = vec![0u8; stride * 40];
-            for v in base.iter_mut() {
-                *v = lcg(&mut seed);
+            // Half the cases are noise (mostly unfiltered), half a noisy
+            // ramp, where the edge tests pass and every filter arm runs.
+            let smooth = lcg(&mut seed) & 1 == 0;
+            for (n, v) in base.iter_mut().enumerate() {
+                let r = lcg(&mut seed);
+                *v = if smooth {
+                    (100 + (n % 40) as u8).wrapping_add(r % 12)
+                } else {
+                    r
+                };
             }
 
             // vertical (across a horizontal edge), 16 columns at point (8, 8)
@@ -620,6 +708,24 @@ mod batch_tests {
                 stride,
             );
             assert_eq!(a, b, "sb horizontal mismatch");
+
+            // simple filter, both directions
+            let mut a = base.clone();
+            for x in 0..16 {
+                simple_segment_vertical(el, &mut a, point + x, stride);
+            }
+            let mut b = base.clone();
+            simple_filter_vertical_batch::<16>(el, &mut b, point, stride);
+            assert_eq!(a, b, "simple vertical mismatch");
+
+            let mut a = base.clone();
+            for y in 0..16 {
+                let o = (8 + y) * stride + 8 - 4;
+                simple_segment_horizontal(el, &mut a[o..][..8]);
+            }
+            let mut b = base.clone();
+            simple_filter_horizontal_batch::<16>(el, &mut b, 8 * stride + 8 - 2, stride);
+            assert_eq!(a, b, "simple horizontal mismatch");
         }
     }
 }

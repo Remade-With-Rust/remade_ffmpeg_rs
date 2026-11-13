@@ -1765,15 +1765,12 @@ impl<R: Read> Vp8Decoder<R> {
             if mbx > 0 {
                 //simple loop filtering
                 if self.frame.filter_type {
-                    for y in 0usize..16 {
-                        let y0 = mby * 16 + y;
-                        let x0 = mbx * 16;
-
-                        loop_filter::simple_segment_horizontal(
-                            mbedge_limit,
-                            &mut self.frame.ybuf[y0 * luma_w + x0 - 4..][..8],
-                        );
-                    }
+                    loop_filter::simple_filter_horizontal_batch::<16>(
+                        mbedge_limit,
+                        &mut self.frame.ybuf,
+                        (mby * 16) * luma_w + mbx * 16 - 2,
+                        luma_w,
+                    );
                 } else {
                     loop_filter::macroblock_filter_horizontal_batch::<16>(
                         hev_threshold,
@@ -1806,15 +1803,12 @@ impl<R: Read> Vp8Decoder<R> {
             if do_subblock_filtering {
                 if self.frame.filter_type {
                     for x in (4usize..16 - 1).step_by(4) {
-                        for y in 0..16 {
-                            let y0 = mby * 16 + y;
-                            let x0 = mbx * 16 + x;
-
-                            loop_filter::simple_segment_horizontal(
-                                sub_bedge_limit,
-                                &mut self.frame.ybuf[y0 * luma_w + x0 - 4..][..8],
-                            );
-                        }
+                        loop_filter::simple_filter_horizontal_batch::<16>(
+                            sub_bedge_limit,
+                            &mut self.frame.ybuf,
+                            (mby * 16) * luma_w + mbx * 16 + x - 2,
+                            luma_w,
+                        );
                     }
                 } else {
                     for x in (4usize..16 - 3).step_by(4) {
@@ -1850,17 +1844,12 @@ impl<R: Read> Vp8Decoder<R> {
             //filter across top of macroblock
             if mby > 0 {
                 if self.frame.filter_type {
-                    for x in 0usize..16 {
-                        let y0 = mby * 16;
-                        let x0 = mbx * 16 + x;
-
-                        loop_filter::simple_segment_vertical(
-                            mbedge_limit,
-                            &mut self.frame.ybuf[..],
-                            y0 * luma_w + x0,
-                            luma_w,
-                        );
-                    }
+                    loop_filter::simple_filter_vertical_batch::<16>(
+                        mbedge_limit,
+                        &mut self.frame.ybuf,
+                        (mby * 16) * luma_w + mbx * 16,
+                        luma_w,
+                    );
                 } else {
                     //if bottom macroblock, can only filter if there is 3 pixels below
                     loop_filter::macroblock_filter_vertical_batch::<16>(
@@ -1894,17 +1883,12 @@ impl<R: Read> Vp8Decoder<R> {
             if do_subblock_filtering {
                 if self.frame.filter_type {
                     for y in (4usize..16 - 1).step_by(4) {
-                        for x in 0..16 {
-                            let y0 = mby * 16 + y;
-                            let x0 = mbx * 16 + x;
-
-                            loop_filter::simple_segment_vertical(
-                                sub_bedge_limit,
-                                &mut self.frame.ybuf[..],
-                                y0 * luma_w + x0,
-                                luma_w,
-                            );
-                        }
+                        loop_filter::simple_filter_vertical_batch::<16>(
+                            sub_bedge_limit,
+                            &mut self.frame.ybuf,
+                            (mby * 16 + y) * luma_w + mbx * 16,
+                            luma_w,
+                        );
                     }
                 } else {
                     for y in (4usize..16 - 3).step_by(4) {
