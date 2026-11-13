@@ -268,6 +268,7 @@ fn convert_lanes(
 
 /// Convert one row of full-resolution y, u and v samples to rgb, writing the
 /// first three bytes of every `BPP`-byte pixel.
+#[inline(always)]
 fn convert_row<const BPP: usize>(row_buffer: &mut [u8], y: &[u8], u: &[u8], v: &[u8]) {
     let mut out_chunks = row_buffer.chunks_exact_mut(LANES * BPP);
     let mut y_chunks = y.chunks_exact(LANES);
@@ -330,6 +331,9 @@ pub(crate) fn fill_rgb_buffer_simple<const BPP: usize>(
     chroma_width: usize,
     buffer_width: usize,
 ) {
+    // Full-width chroma rows for the row being converted, reused for every row.
+    let mut scratch = (vec![0u8; width], vec![0u8; width]);
+
     let u_row_twice_iter = u_buffer
         .chunks_exact(buffer_width / 2)
         .flat_map(|n| std::iter::repeat(n).take(2));
@@ -348,67 +352,38 @@ pub(crate) fn fill_rgb_buffer_simple<const BPP: usize>(
             &u_row[..chroma_width],
             &v_row[..chroma_width],
             row,
+            &mut scratch,
         );
     }
 }
 
+/// One row with simple (nearest) chroma: each chroma sample is repeated for
+/// its two pixels into the scratch rows, then the row is converted like any
+/// other (16 pixels at a time).
 fn fill_rgba_row_simple<const BPP: usize>(
     y_vec: &[u8],
     u_vec: &[u8],
     v_vec: &[u8],
     rgba: &mut [u8],
+    scratch: &mut (Vec<u8>, Vec<u8>),
 ) {
-    // Fill 2 pixels per iteration: these pixels share `u` and `v` components
-    let mut rgb_chunks = rgba.chunks_exact_mut(BPP * 2);
-    let mut y_chunks = y_vec.chunks_exact(2);
-    let mut u_iter = u_vec.iter();
-    let mut v_iter = v_vec.iter();
+    let (u, v) = (&mut scratch.0[..y_vec.len()], &mut scratch.1[..y_vec.len()]);
+    repeat_chroma(u_vec, u);
+    repeat_chroma(v_vec, v);
+    convert_row::<BPP>(rgba, y_vec, u, v);
+}
 
-    for (((rgb, y), &u), &v) in (&mut rgb_chunks)
-        .zip(&mut y_chunks)
-        .zip(&mut u_iter)
-        .zip(&mut v_iter)
-    {
-        let coeffs = [
-            mulhi(v, 26149),
-            mulhi(u, 6419),
-            mulhi(v, 13320),
-            mulhi(u, 33050),
-        ];
-
-        let get_r = |y: u8| clip(mulhi(y, 19077) + coeffs[0] - 14234);
-        let get_g = |y: u8| clip(mulhi(y, 19077) - coeffs[1] - coeffs[2] + 8708);
-        let get_b = |y: u8| clip(mulhi(y, 19077) + coeffs[3] - 17685);
-
-        let rgb1 = &mut rgb[0..3];
-        rgb1[0] = get_r(y[0]);
-        rgb1[1] = get_g(y[0]);
-        rgb1[2] = get_b(y[0]);
-
-        let rgb2 = &mut rgb[BPP..];
-        rgb2[0] = get_r(y[1]);
-        rgb2[1] = get_g(y[1]);
-        rgb2[2] = get_b(y[1]);
+/// Nearest-neighbour chroma: sample `k` goes to pixels `2k` and `2k + 1`
+/// (an odd width ends on a single pixel). Fixed two-byte stores: `fill` on a
+/// run-time-length pair is a `memset` call per pair.
+fn repeat_chroma(chroma: &[u8], out: &mut [u8]) {
+    let mut pairs = out.chunks_exact_mut(2);
+    for (pair, &c) in (&mut pairs).zip(chroma) {
+        pair[0] = c;
+        pair[1] = c;
     }
-
-    let remainder = rgb_chunks.into_remainder();
-    if remainder.len() >= 3 {
-        if let (Some(&y), Some(&u), Some(&v)) = (
-            y_chunks.remainder().iter().next(),
-            u_iter.next(),
-            v_iter.next(),
-        ) {
-            let coeffs = [
-                mulhi(v, 26149),
-                mulhi(u, 6419),
-                mulhi(v, 13320),
-                mulhi(u, 33050),
-            ];
-
-            remainder[0] = clip(mulhi(y, 19077) + coeffs[0] - 14234);
-            remainder[1] = clip(mulhi(y, 19077) - coeffs[1] - coeffs[2] + 8708);
-            remainder[2] = clip(mulhi(y, 19077) + coeffs[3] - 17685);
-        }
+    if let [last] = pairs.into_remainder() {
+        *last = chroma[chroma.len() - 1];
     }
 }
 
@@ -593,6 +568,75 @@ mod tests {
                         &v_buffer,
                         width,
                         height,
+                        buffer_width,
+                    );
+                }
+                assert_eq!(got, want, "{width}x{height} bpp {bpp}");
+            }
+        }
+    }
+
+    /// Simple (nearest) upsampling at awkward sizes against a per-pixel
+    /// reference: pixel (x, y) takes chroma sample (x / 2, y / 2).
+    #[test]
+    fn simple_buffer_matches_reference() {
+        let mut seed = 0xd1b5_4a32_d192_ed03u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 24) as u8
+        };
+        for &(width, height) in &[
+            (1usize, 1usize),
+            (2, 2),
+            (3, 5),
+            (16, 4),
+            (17, 3),
+            (33, 7),
+            (34, 8),
+        ] {
+            let buffer_width = width.div_ceil(16) * 16;
+            let rows = height.div_ceil(16) * 16;
+            let y_buffer: Vec<u8> = (0..buffer_width * rows).map(|_| next()).collect();
+            let u_buffer: Vec<u8> = (0..buffer_width * rows / 4).map(|_| next()).collect();
+            let v_buffer: Vec<u8> = (0..buffer_width * rows / 4).map(|_| next()).collect();
+            let cbw = buffer_width / 2;
+            for bpp in [3usize, 4] {
+                let mut want = vec![7u8; width * height * bpp];
+                for y in 0..height {
+                    for x in 0..width {
+                        let l = y_buffer[y * buffer_width + x];
+                        let (u, v) = (
+                            u_buffer[(y / 2) * cbw + x / 2],
+                            v_buffer[(y / 2) * cbw + x / 2],
+                        );
+                        let px = &mut want[(y * width + x) * bpp..][..3];
+                        px[0] = yuv_to_r(l, v);
+                        px[1] = yuv_to_g(l, u, v);
+                        px[2] = yuv_to_b(l, u);
+                    }
+                }
+                let mut got = vec![7u8; width * height * bpp];
+                let cw = width.div_ceil(2);
+                if bpp == 3 {
+                    fill_rgb_buffer_simple::<3>(
+                        &mut got,
+                        &y_buffer,
+                        &u_buffer,
+                        &v_buffer,
+                        width,
+                        cw,
+                        buffer_width,
+                    );
+                } else {
+                    fill_rgb_buffer_simple::<4>(
+                        &mut got,
+                        &y_buffer,
+                        &u_buffer,
+                        &v_buffer,
+                        width,
+                        cw,
                         buffer_width,
                     );
                 }
