@@ -1021,36 +1021,30 @@ impl<R: Read> Vp8Decoder<R> {
     fn update_token_probabilities(&mut self) -> Result<(), DecodingError> {
         // Fast path: all 1056 flags in one decoder session, instead of a
         // call that copies the decoder state in and out for every one (the
-        // largest fixed cost of decoding a small image). The new values are
-        // collected and stored only once the session has committed, so a
-        // session that ran past the buffer end leaves nothing changed for
-        // the committed path below.
-        let mut updates = [(0u16, 0u8); 4 * 8 * 3 * (NUM_DCT_TOKENS - 1)];
-        let mut count = 0;
+        // largest fixed cost of decoding a small image). Updates are stored
+        // as they are read, walking the two tables side by side; if the
+        // session ran past the buffer end the tables are put back for the
+        // committed path below.
+        let before = *self.token_probs;
         let mut s = self.b.begin_session();
-        for (index, prob) in COEFF_UPDATE_PROBS
+        let update_probs = COEFF_UPDATE_PROBS
             .as_flattened()
             .as_flattened()
-            .as_flattened()
-            .iter()
-            .enumerate()
-        {
-            if self.b.session_read_bool(&mut s, *prob) {
-                updates[count] = (index as u16, self.b.session_read_literal(&mut s, 8));
-                count += 1;
+            .as_flattened();
+        let nodes = self
+            .token_probs
+            .as_flattened_mut()
+            .as_flattened_mut()
+            .as_flattened_mut();
+        for (&update_prob, node) in update_probs.iter().zip(nodes) {
+            if self.b.session_read_bool(&mut s, update_prob) {
+                node.prob = self.b.session_read_literal(&mut s, 8);
             }
         }
         if self.b.commit_session(s) {
-            let probs = self
-                .token_probs
-                .as_flattened_mut()
-                .as_flattened_mut()
-                .as_flattened_mut();
-            for &(index, value) in &updates[..count] {
-                probs[usize::from(index)].prob = value;
-            }
             return Ok(());
         }
+        *self.token_probs = before;
 
         let mut res = self.b.start_accumulated_result();
         for (i, is) in COEFF_UPDATE_PROBS.iter().enumerate() {
