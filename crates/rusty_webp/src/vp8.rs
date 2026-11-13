@@ -1585,72 +1585,81 @@ impl<R: Read> Vp8Decoder<R> {
         let probs = &self.token_probs[plane];
         let decoder = &mut self.partitions[p];
 
-        // Fast path: read the whole block in one session — one state
-        // snapshot and one commit instead of a state copy in and out per
-        // read. The reads are the exact sequence of the committed path below.
+        // Fast path: read the whole block in one session (one state snapshot
+        // and one commit instead of a state copy in and out per read), with
+        // the token tree unrolled into straight-line reads. Node `k` of the
+        // tree is read with `tree[k].prob`; the reads are the exact sequence
+        // the generic tree walk of the committed path below makes.
         {
             let mut s = decoder.begin_session();
-            let mut complexity = complexity;
             let mut has_coefficients = false;
             let mut has_ac = false;
-            let mut skip = false;
+            let mut i = first;
+            let mut tree = &probs[COEFF_BANDS[i] as usize][complexity];
 
-            for i in first..16usize {
-                let band = COEFF_BANDS[i] as usize;
-                let tree = &probs[band][complexity];
+            // node 0: end of block?
+            'block: while decoder.session_read_bool(&mut s, tree[0].prob) {
+                has_coefficients = true;
 
-                let token = decoder.session_read_with_tree(&mut s, tree, tree[skip as usize]);
-
-                let mut abs_value = i32::from(match token {
-                    DCT_EOB => break,
-
-                    DCT_0 => {
-                        skip = true;
-                        has_coefficients = true;
-                        complexity = 0;
-                        continue;
+                // node 1: a run of zero coefficients. Each one moves to the
+                // next position's tree in the zero context and re-enters at
+                // node 1 (no end-of-block test after a zero).
+                while !decoder.session_read_bool(&mut s, tree[1].prob) {
+                    i += 1;
+                    if i == 16 {
+                        break 'block;
                     }
+                    tree = &probs[COEFF_BANDS[i] as usize][0];
+                }
 
-                    literal @ DCT_1..=DCT_4 => i16::from(literal),
-
-                    category @ DCT_CAT1..=DCT_CAT6 => {
-                        let probs = PROB_DCT_CAT[(category - DCT_CAT1) as usize];
-
-                        let mut extra = 0i16;
-
-                        for t in probs.iter().copied() {
+                // node 2: one, or something larger
+                let (abs_value, next_complexity) =
+                    if !decoder.session_read_bool(&mut s, tree[2].prob) {
+                        (1i32, 1usize)
+                    } else if !decoder.session_read_bool(&mut s, tree[3].prob) {
+                        // nodes 4, 5: two, three or four
+                        if !decoder.session_read_bool(&mut s, tree[4].prob) {
+                            (2, 2)
+                        } else {
+                            (
+                                3 + i32::from(decoder.session_read_bool(&mut s, tree[5].prob)),
+                                2,
+                            )
+                        }
+                    } else {
+                        // nodes 6..=10: the six categories
+                        let category = if !decoder.session_read_bool(&mut s, tree[6].prob) {
+                            usize::from(decoder.session_read_bool(&mut s, tree[7].prob))
+                        } else {
+                            let high = usize::from(decoder.session_read_bool(&mut s, tree[8].prob));
+                            let low = decoder.session_read_bool(&mut s, tree[9 + high].prob);
+                            2 + 2 * high + usize::from(low)
+                        };
+                        let mut extra = 0i32;
+                        for &t in &PROB_DCT_CAT[category] {
                             if t == 0 {
                                 break;
                             }
-                            let b = decoder.session_read_bool(&mut s, t);
-                            extra = extra + extra + i16::from(b);
+                            extra = extra + extra + i32::from(decoder.session_read_bool(&mut s, t));
                         }
+                        (i32::from(DCT_CAT_BASE[category]) + extra, 2)
+                    };
 
-                        i16::from(DCT_CAT_BASE[(category - DCT_CAT1) as usize]) + extra
-                    }
-
-                    c => panic!("unknown token: {c}"),
-                });
-
-                skip = false;
-
-                complexity = if abs_value == 0 {
-                    0
-                } else if abs_value == 1 {
-                    1
+                let value = if decoder.session_read_flag(&mut s) {
+                    -abs_value
                 } else {
-                    2
+                    abs_value
                 };
 
-                if decoder.session_read_flag(&mut s) {
-                    abs_value = -abs_value;
-                }
-
                 let zigzag = ZIGZAG[i] as usize;
-                block[zigzag] = abs_value * i32::from(if zigzag > 0 { acq } else { dcq });
+                block[zigzag] = value * i32::from(if zigzag > 0 { acq } else { dcq });
                 has_ac |= zigzag > 0;
 
-                has_coefficients = true;
+                i += 1;
+                if i == 16 {
+                    break;
+                }
+                tree = &probs[COEFF_BANDS[i] as usize][next_complexity];
             }
 
             if decoder.commit_session(s) {
