@@ -374,6 +374,13 @@ pub(crate) fn apply_color_transform(
             let green_to_blue = transform[1];
             let green_to_red = transform[2];
 
+            // All three multipliers zero: every delta is zero and the block
+            // is left as it is. One test per block instead of three
+            // multiplies per pixel.
+            if red_to_blue | green_to_blue | green_to_red == 0 {
+                continue;
+            }
+
             for pixel in block.chunks_exact_mut(4) {
                 let green = u32::from(pixel[1]);
                 let mut temp_red = u32::from(pixel[0]);
