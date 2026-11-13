@@ -1016,7 +1016,42 @@ impl<R: Read> Vp8Decoder<R> {
         }
     }
 
+    /// Read the frame header's token probability updates: one flag for each
+    /// of the 1056 probabilities, and a new 8-bit value where it is set.
     fn update_token_probabilities(&mut self) -> Result<(), DecodingError> {
+        // Fast path: all 1056 flags in one decoder session, instead of a
+        // call that copies the decoder state in and out for every one (the
+        // largest fixed cost of decoding a small image). The new values are
+        // collected and stored only once the session has committed, so a
+        // session that ran past the buffer end leaves nothing changed for
+        // the committed path below.
+        let mut updates = [(0u16, 0u8); 4 * 8 * 3 * (NUM_DCT_TOKENS - 1)];
+        let mut count = 0;
+        let mut s = self.b.begin_session();
+        for (index, prob) in COEFF_UPDATE_PROBS
+            .as_flattened()
+            .as_flattened()
+            .as_flattened()
+            .iter()
+            .enumerate()
+        {
+            if self.b.session_read_bool(&mut s, *prob) {
+                updates[count] = (index as u16, self.b.session_read_literal(&mut s, 8));
+                count += 1;
+            }
+        }
+        if self.b.commit_session(s) {
+            let probs = self
+                .token_probs
+                .as_flattened_mut()
+                .as_flattened_mut()
+                .as_flattened_mut();
+            for &(index, value) in &updates[..count] {
+                probs[usize::from(index)].prob = value;
+            }
+            return Ok(());
+        }
+
         let mut res = self.b.start_accumulated_result();
         for (i, is) in COEFF_UPDATE_PROBS.iter().enumerate() {
             for (j, js) in is.iter().enumerate() {

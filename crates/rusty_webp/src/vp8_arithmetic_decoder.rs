@@ -546,6 +546,18 @@ impl ArithmeticDecoder {
         state_read_bit(&self.chunks, &mut s.state, probability)
     }
 
+    /// Read an `n`-bit literal (most significant bit first) of even-odds
+    /// flags, as [`Self::read_literal`] does.
+    #[inline(always)]
+    pub(crate) fn session_read_literal(&self, s: &mut FastSession, n: u8) -> u8 {
+        let mut v = 0u8;
+        for _ in 0..n {
+            let b = state_read_flag(&self.chunks, &mut s.state);
+            v = (v << 1) + u8::from(b);
+        }
+        v
+    }
+
     /// Read a sign flag and return `v` with it applied.
     #[inline(always)]
     pub(crate) fn session_read_signed(&self, s: &mut FastSession, v: i32) -> i32 {
