@@ -6026,16 +6026,27 @@ impl FrameEncoder {
         bw: i32,
         bh: i32,
         edges: (i32, i32, i32, i32),
-    ) -> Mv {
+    ) -> (Mv, i64) {
         const R: i32 = 4;
         let mut best = (0i32, 0i32);
         let mut best_sad = i64::MAX;
         if self.full_msearch {
             // Reference exhaustive ±4 (oracle for the diamond, `VP9_FULL_MSEARCH`).
-            for &(cr, cc) in &[(0i32, 0i32), (predictor.0 / 8, predictor.1 / 8)] {
+            let centres = [(0i32, 0i32), (predictor.0 / 8, predictor.1 / 8)];
+            for (ci, &(cr, cc)) in centres.iter().enumerate() {
                 for dr in -R..=R {
                     for dc in -R..=R {
-                        let mv = ((cr + dr) * 8, (cc + dc) * 8);
+                        let (r, c) = (cr + dr, cc + dc);
+                        // The predictor's square overlaps the zero-centred one
+                        // whenever the predictor is within 2R of zero (all 81
+                        // positions when it rounds to zero). A repeated position
+                        // has the SAD it had the first time, which cannot beat
+                        // itself under the strict `<` below, so skipping it is
+                        // exact.
+                        if ci == 1 && r.abs() <= R && c.abs() <= R {
+                            continue;
+                        }
+                        let mv = (r * 8, c * 8);
                         let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges);
                         if sad < best_sad {
                             best_sad = sad;
@@ -6089,6 +6100,9 @@ impl FrameEncoder {
         let int = best;
         for dr in [-4i32, -2, 0, 2, 4] {
             for dc in [-4i32, -2, 0, 2, 4] {
+                if dr == 0 && dc == 0 {
+                    continue; // `int` itself: already scored, cannot beat its own SAD
+                }
                 let mv = (int.0 + dr, int.1 + dc);
                 let sad = self.sub4x4_sad(mi_row, mi_col, sub_x, sub_y, mv, bw, bh, edges);
                 if sad < best_sad {
@@ -6097,7 +6111,9 @@ impl FrameEncoder {
                 }
             }
         }
-        best
+        // `best_sad` is the SAD of `best` (they are only ever updated together),
+        // so the caller need not score the winner a second time.
+        (best, best_sad)
     }
 
     /// Sub-8×8 per-sub-block decision (Part B). For `subsize` (BLOCK_4X4/8X4/4X8) it
@@ -6209,9 +6225,9 @@ impl FrameEncoder {
                     self.prev_mv(mi_row, mi_col),
                 );
                 let pred = lower_mv_precision(cand[0], self.hp_mv);
-                let mvw = self.search_mv_sub(mi_row, mi_col, idx, idy, pred, bw, bh, edges);
-                let cw = self.sub4x4_sad(mi_row, mi_col, idx, idy, mvw, bw, bh, edges)
-                    + NEWMV_SAD_PENALTY;
+                let (mvw, sad_w) =
+                    self.search_mv_sub(mi_row, mi_col, idx, idy, pred, bw, bh, edges);
+                let cw = sad_w + NEWMV_SAD_PENALTY;
                 // G4 harvest (observe-only): predicted-mode SAD vs the searched NEWMV.
                 if self.g1_harvest {
                     eprintln!(
