@@ -5691,6 +5691,16 @@ impl FrameEncoder {
         };
         let (nl, nr) = if fx != 0 { (3i32, 5i32) } else { (0, 0) };
         let (nt, nb) = if fy != 0 { (3i32, 4i32) } else { (0, 0) };
+        // Per-CALL invariants, hoisted out of the tile loop as in
+        // `predicted_sad_sized`: the u8 plane view and the profiler scope.
+        #[cfg(target_arch = "x86_64")]
+        let refp8_c = r8_arc.as_deref().map(|r8| crate::inter::RefPlane8 {
+            buf: r8,
+            stride: rp.stride,
+            w: refp.w,
+            h: refp.h,
+        });
+        let _s_call = prof::Scope::new(prof::S::Interp);
         let mut pred = [0u16; 64];
         let mut sse = 0i64;
         let mut sampled = 0i64;
@@ -5701,26 +5711,19 @@ impl FrameEncoder {
                 let (px, py) = (base_x + tx * 8, base_y + ty * 8);
                 if px + 8 <= src.w && py + 8 <= src.h {
                     sampled += 1;
-                    let _s = prof::Scope::new(prof::S::Interp);
                     let (bx, by) = (bx0 + (tx * 8) as i32, by0 + (ty * 8) as i32);
                     #[cfg(target_arch = "x86_64")]
-                    if let Some(r8) = &r8_arc {
+                    if let Some(refp8) = &refp8_c {
                         if bx - nl >= 0
                             && bx + 8 + nr <= refp.w
                             && by - nt >= 0
                             && by + 8 + nb <= refp.h
                         {
-                            let refp8 = crate::inter::RefPlane8 {
-                                buf: r8,
-                                stride: rp.stride,
-                                w: refp.w,
-                                h: refp.h,
-                            };
                             // SAFETY: window checked; AVX2 implied by u8_search;
                             // src8 mirrors src exactly for 8-bit content.
                             sse += unsafe {
                                 crate::inter::subpel_sse8x8_u8(
-                                    &refp8,
+                                    refp8,
                                     bx,
                                     by,
                                     fx,
@@ -5752,12 +5755,7 @@ impl FrameEncoder {
                         self.max_px,
                     );
                     let s = &src.buf[(py * src.stride + px)..];
-                    for r in 0..8 {
-                        for c in 0..8 {
-                            let d = s[r * src.stride + c] as i64 - pred[r * 8 + c] as i64;
-                            sse += d * d;
-                        }
-                    }
+                    sse += super::blockkern::block_sse(s, src.stride, &pred, 8, 8, 8) as i64;
                     // Shortlist abort: SSE accumulates non-negatively, so once
                     // STRICTLY over the bound this candidate provably cannot
                     // enter the top-K (the bound only shrinks as more collect) —
