@@ -48,7 +48,9 @@ pub(crate) struct ArithmeticDecoder {
 struct State {
     chunk_index: usize,
     value: u64,
-    range: u32,
+    /// The coder's range minus one (127..=254 once normalised), the form
+    /// libwebp keeps: the split then needs no +1/-1 round trip per bit.
+    range_m1: u32,
     bit_count: i32,
 }
 
@@ -64,7 +66,7 @@ impl ArithmeticDecoder {
         let state = State {
             chunk_index: 0,
             value: 0,
-            range: 255,
+            range_m1: 254,
             bit_count: -8,
         };
         ArithmeticDecoder {
@@ -98,7 +100,7 @@ impl ArithmeticDecoder {
         let state = State {
             chunk_index: 0,
             value: 0,
-            range: 255,
+            range_m1: 254,
             bit_count: -8,
         };
         *self = Self {
@@ -285,28 +287,30 @@ impl ArithmeticDecoder {
         debug_assert!(self.state.bit_count >= 0);
 
         let probability = u32::from(probability);
-        let split = 1 + (((self.state.range - 1) * probability) >> 8);
+        let mut range = self.state.range_m1 + 1;
+        let split = 1 + (((range - 1) * probability) >> 8);
         let bigsplit = u64::from(split) << self.state.bit_count;
 
         let retval = if let Some(new_value) = self.state.value.checked_sub(bigsplit) {
-            self.state.range -= split;
+            range -= split;
             self.state.value = new_value;
             true
         } else {
-            self.state.range = split;
+            range = split;
             false
         };
-        debug_assert!(self.state.range > 0);
+        debug_assert!(range > 0);
 
-        // Compute shift required to satisfy `self.state.range >= 128`.
-        // Apply that shift to `self.state.range` and `self.state.bitcount`.
+        // Compute shift required to satisfy `range >= 128`.
+        // Apply that shift to `range` and `self.state.bitcount`.
         //
         // Subtract 24 because we only care about leading zeros in the
-        // lowest byte of `self.state.range` which is a `u32`.
-        let shift = self.state.range.leading_zeros().saturating_sub(24);
-        self.state.range <<= shift;
+        // lowest byte of `range` which is a `u32`.
+        let shift = range.leading_zeros().saturating_sub(24);
+        range <<= shift;
         self.state.bit_count -= shift as i32;
-        debug_assert!(self.state.range >= 128);
+        debug_assert!(range >= 128);
+        self.state.range_m1 = range - 1;
 
         BitResult::ok(retval)
     }
@@ -386,25 +390,34 @@ impl ArithmeticDecoder {
 // `FastDecoder` and the block-scoped `FastSession`.
 // ---------------------------------------------------------------------------
 
-/// `leading_zeros(range) - 24` for every range the decoder can hold (0..=255):
-/// the left shift that brings it back to 128..=255.
-const NORM_SHIFT: [u8; 256] = {
-    let mut t = [0u8; 256];
+/// Renormalisation, indexed by the un-normalised `range - 1` (0..=254; 255
+/// is never produced): the left shift that brings the range back to
+/// 128..=255 (`leading_zeros(range) - 24`), and the shifted range, again
+/// minus one. The range never exceeds 255 (it starts there and only shrinks
+/// before each renormalisation), so two table loads replace a bit scan, its
+/// zero case, a saturating subtract and a variable shift.
+const NORM: ([u8; 256], [u8; 256]) = {
+    let mut shift = [0u8; 256];
+    let mut range_m1 = [255u8; 256];
     let mut i = 0;
-    while i < 256 {
-        t[i] = (i as u8).leading_zeros() as u8;
+    while i < 255 {
+        let range = i as u32 + 1;
+        let s = (range as u8).leading_zeros();
+        shift[i] = s as u8;
+        range_m1[i] = ((range << s) - 1) as u8;
         i += 1;
     }
-    t
+    (shift, range_m1)
 };
 
-/// Shift required to satisfy `range >= 128`. The range never exceeds 255
-/// (it starts there and only shrinks before each renormalisation), so one
-/// table load replaces a bit scan, its zero case and a saturating subtract.
+/// Store the un-normalised `range - 1` back, normalised.
 #[inline(always)]
-fn norm_shift(range: u32) -> u32 {
-    debug_assert!(range < 256);
-    u32::from(NORM_SHIFT[range as u8 as usize])
+fn renormalise(state: &mut State, range_m1: u32) {
+    debug_assert!(range_m1 < 255);
+    let i = range_m1 as u8 as usize;
+    state.bit_count -= i32::from(NORM.0[i]);
+    state.range_m1 = u32::from(NORM.1[i]);
+    debug_assert!(state.range_m1 >= 127);
 }
 
 #[inline(always)]
@@ -419,26 +432,20 @@ fn state_read_bit(chunks: &[[u8; 4]], state: &mut State, probability: u8) -> boo
     }
     debug_assert!(state.bit_count >= 0);
 
-    let probability = u32::from(probability);
-    let split = 1 + (((state.range - 1) * probability) >> 8);
-    let bigsplit = u64::from(split) << state.bit_count;
+    // `split - 1`, with split = 1 + (((range - 1) * probability) >> 8)
+    let split_m1 = (state.range_m1 * u32::from(probability)) >> 8;
+    let bigsplit = u64::from(split_m1 + 1) << state.bit_count;
 
-    let retval = if let Some(new_value) = state.value.checked_sub(bigsplit) {
-        state.range -= split;
+    if let Some(new_value) = state.value.checked_sub(bigsplit) {
         state.value = new_value;
+        // range - split, minus one
+        renormalise(state, state.range_m1 - split_m1 - 1);
         true
     } else {
-        state.range = split;
+        // range = split
+        renormalise(state, split_m1);
         false
-    };
-    debug_assert!(state.range > 0);
-
-    let shift = norm_shift(state.range);
-    state.range <<= shift;
-    state.bit_count -= shift as i32;
-    debug_assert!(state.range >= 128);
-
-    retval
+    }
 }
 
 #[inline(always)]
@@ -453,26 +460,18 @@ fn state_read_flag(chunks: &[[u8; 4]], state: &mut State) -> bool {
     }
     debug_assert!(state.bit_count >= 0);
 
-    let half_range = state.range / 2;
-    let split = state.range - half_range;
+    let half_range = (state.range_m1 + 1) / 2;
+    let split = state.range_m1 + 1 - half_range;
     let bigsplit = u64::from(split) << state.bit_count;
 
-    let retval = if let Some(new_value) = state.value.checked_sub(bigsplit) {
-        state.range = half_range;
+    if let Some(new_value) = state.value.checked_sub(bigsplit) {
         state.value = new_value;
+        renormalise(state, half_range - 1);
         true
     } else {
-        state.range = split;
+        renormalise(state, split - 1);
         false
-    };
-    debug_assert!(state.range > 0);
-
-    let shift = norm_shift(state.range);
-    state.range <<= shift;
-    state.bit_count -= shift as i32;
-    debug_assert!(state.range >= 128);
-
-    retval
+    }
 }
 
 /// A block-scoped fast-reading session: the decoder state is snapshotted
