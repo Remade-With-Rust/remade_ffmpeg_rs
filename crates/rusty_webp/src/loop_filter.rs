@@ -421,10 +421,14 @@ fn sb_edge_core<const N: usize>(
 #[inline(always)]
 fn load_rows<const N: usize>(pixels: &[u8], point: usize, stride: usize) -> [[i16; N]; 8] {
     let mut t = [[0i16; N]; 8];
-    for (k, row) in t.iter_mut().enumerate() {
-        let base = point + k * stride - 4 * stride;
-        for (i, v) in row.iter_mut().enumerate() {
-            *v = i16::from(pixels[base + i]) - 128;
+    // One slice per tap row: a single bounds check, then a fixed-width
+    // widen-and-centre the compiler vectorizes (the indexed form checked and
+    // loaded every pixel on its own).
+    let mut rows = pixels[point - 4 * stride..].chunks(stride);
+    for row in &mut t {
+        let src: &[u8; N] = rows.next().unwrap()[..N].try_into().unwrap();
+        for i in 0..N {
+            row[i] = i16::from(src[i]) - 128;
         }
     }
     t
@@ -439,10 +443,11 @@ fn store_rows<const N: usize>(
     from: usize,
     to: usize,
 ) {
-    for k in from..to {
-        let base = point + k * stride - 4 * stride;
+    let rows = pixels[point - 4 * stride..].chunks_mut(stride);
+    for (row, dst) in t[from..to].iter().zip(rows.skip(from)) {
+        let dst: &mut [u8; N] = (&mut dst[..N]).try_into().unwrap();
         for i in 0..N {
-            pixels[base + i] = (t[k][i] + 128) as u8;
+            dst[i] = (row[i] + 128) as u8;
         }
     }
 }
