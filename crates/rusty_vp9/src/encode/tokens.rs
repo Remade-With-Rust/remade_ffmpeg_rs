@@ -330,11 +330,52 @@ fn code_magnitude<S: BitSink>(
     }
 }
 
+/// Where [`code_block`] reports the symbols it codes.
+trait TokenTally {
+    /// An EOB / not-EOB decision was coded at `(band, ctx)`.
+    fn eob_branch(&mut self, band: usize, ctx: usize);
+    /// Token class `t` (0 ZERO, 1 ONE, 2 TWO+, 3 EOB) was coded at `(band, ctx)`.
+    fn token(&mut self, band: usize, ctx: usize, t: usize);
+}
+
+/// Tally into the frame's count arrays — the emit path.
+struct FrameTally<'a> {
+    coef: &'a mut [[[u32; 4]; 6]; 6],
+    eob: &'a mut [[u32; 6]; 6],
+}
+
+impl TokenTally for FrameTally<'_> {
+    #[inline]
+    fn eob_branch(&mut self, band: usize, ctx: usize) {
+        self.eob[band][ctx] += 1;
+    }
+
+    #[inline]
+    fn token(&mut self, band: usize, ctx: usize, t: usize) {
+        self.coef[band][ctx][t] += 1;
+    }
+}
+
+/// Count nothing — the costing path. Zero-sized, so the walk it is handed to
+/// has no count storage at all: nothing to borrow, nothing to zero. (The
+/// `const COUNTS: bool` it replaces still took two array references, and since
+/// the walk is not inlined into `coef_cost` those arrays had to exist — which
+/// is what the thread-local scratch there was working around.)
+struct NoTally;
+
+impl TokenTally for NoTally {
+    #[inline(always)]
+    fn eob_branch(&mut self, _band: usize, _ctx: usize) {}
+
+    #[inline(always)]
+    fn token(&mut self, _band: usize, _ctx: usize, _t: usize) {}
+}
+
 /// The shared coefficient-block walk used by both [`encode_coefs`] (emit) and
 /// [`coef_cost`] (cost). Mirrors `decode_coefs` exactly, including the token
 /// cache, context derivation and symbol counts.
 #[allow(clippy::too_many_arguments)]
-fn code_block<S: BitSink, const COUNTS: bool>(
+fn code_block<S: BitSink, C: TokenTally>(
     sink: &mut S,
     levels: &[i32],
     scan: &[i16],
@@ -344,8 +385,7 @@ fn code_block<S: BitSink, const COUNTS: bool>(
     tx_size: usize,
     mut ctx: usize,
     token_cache: &mut [u8],
-    coef_cnt: &mut [[[u32; 4]; 6]; 6],
-    eob_cnt: &mut [[u32; 6]; 6],
+    tally: &mut C,
     bit_depth: u32,
 ) {
     let max_eob = 16usize << (tx_size << 1);
@@ -368,17 +408,13 @@ fn code_block<S: BitSink, const COUNTS: bool>(
     let mut c = 0usize;
     while c < max_eob {
         let band = band_translate[c] as usize;
-        if COUNTS {
-            eob_cnt[band][ctx] += 1;
-        }
+        tally.eob_branch(band, ctx);
         #[cfg(feature = "prometheus-telemetry")]
         crate::telemetry::set_site(0, band as u8, ctx as u8, tx_size as u8);
         if c == eob {
             // End of block: no more non-zero coefficients.
             sink.put(0, coef_probs[band][ctx][0]);
-            if COUNTS {
-                coef_cnt[band][ctx][3] += 1; // EOB_MODEL_TOKEN
-            }
+            tally.token(band, ctx, 3); // EOB_MODEL_TOKEN
             break;
         }
         sink.put(1, coef_probs[band][ctx][0]); // not EOB
@@ -391,9 +427,7 @@ fn code_block<S: BitSink, const COUNTS: bool>(
             crate::telemetry::set_site(1, band as u8, ctx as u8, tx_size as u8);
             if levels[pos] == 0 {
                 sink.put(0, coef_probs[band][ctx][1]); // ZERO
-                if COUNTS {
-                    coef_cnt[band][ctx][0] += 1;
-                }
+                tally.token(band, ctx, 0);
                 token_cache[pos] = 0;
                 c += 1;
                 ctx = get_coef_context(nb, token_cache, c);
@@ -407,9 +441,7 @@ fn code_block<S: BitSink, const COUNTS: bool>(
         let pos = scan[c] as usize;
         let lvl = levels[pos];
         let aval = lvl.unsigned_abs();
-        if COUNTS {
-            coef_cnt[band][ctx][if aval >= 2 { 2 } else { 1 }] += 1; // TWO+ / ONE
-        }
+        tally.token(band, ctx, if aval >= 2 { 2 } else { 1 }); // TWO+ / ONE
         #[cfg(feature = "prometheus-telemetry")]
         crate::telemetry::set_site(2, band as u8, ctx as u8, tx_size as u8);
         let class = sink.put_magnitude(aval, coef_probs[band][ctx][2], cat6, cat6_bits);
@@ -791,7 +823,7 @@ pub fn encode_coefs(
     eob_cnt: &mut [[u32; 6]; 6],
     bit_depth: u32,
 ) {
-    code_block::<_, true>(
+    code_block(
         enc,
         levels,
         scan,
@@ -801,8 +833,10 @@ pub fn encode_coefs(
         tx_size,
         ctx,
         token_cache,
-        coef_cnt,
-        eob_cnt,
+        &mut FrameTally {
+            coef: coef_cnt,
+            eob: eob_cnt,
+        },
         bit_depth,
     );
 }
@@ -823,33 +857,21 @@ pub fn coef_cost(
     token_cache: &mut [u8],
     bit_depth: u32,
 ) -> u64 {
-    // The symbol counts (`cc`/`ec`) are write-only garbage on the costing path —
-    // only `sink.0` is returned. Reuse thread-local scratch instead of zeroing
-    // ~720 bytes on every call (the trellis calls this millions of times).
-    thread_local! {
-        static SCRATCH: std::cell::RefCell<([[[u32; 4]; 6]; 6], [[u32; 6]; 6])> =
-            const { std::cell::RefCell::new(([[[0; 4]; 6]; 6], [[0; 6]; 6])) };
-    }
-    SCRATCH.with(|s| {
-        let mut b = s.borrow_mut();
-        let (cc, ec) = &mut *b;
-        let mut sink = CostSink(0);
-        code_block::<_, false>(
-            &mut sink,
-            levels,
-            scan,
-            nb,
-            eob,
-            coef_probs,
-            tx_size,
-            ctx,
-            token_cache,
-            cc,
-            ec,
-            bit_depth,
-        );
-        sink.0
-    })
+    let mut sink = CostSink(0);
+    code_block(
+        &mut sink,
+        levels,
+        scan,
+        nb,
+        eob,
+        coef_probs,
+        tx_size,
+        ctx,
+        token_cache,
+        &mut NoTally,
+        bit_depth,
+    );
+    sink.0
 }
 
 #[cfg(test)]
