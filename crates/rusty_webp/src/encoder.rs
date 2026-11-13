@@ -422,11 +422,13 @@ fn tokenize(px: &[u32], width: usize) -> Vec<Tok> {
 
     let extend = |c: usize, i: usize| -> usize {
         let max_len = (n - i).min(MAX_MATCH);
-        let mut l = 0usize;
-        while l < max_len && px[c + l] == px[i + l] {
-            l += 1;
-        }
-        l
+        // Two windows of one length (c < i, so both are in range) walked
+        // together: no bounds check per pixel, unlike `px[c + l] == px[i + l]`.
+        px[c..c + max_len]
+            .iter()
+            .zip(&px[i..i + max_len])
+            .take_while(|(a, b)| a == b)
+            .count()
     };
 
     let mut i = 0usize;
