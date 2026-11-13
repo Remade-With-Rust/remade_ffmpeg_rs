@@ -1568,6 +1568,9 @@ impl<R: Read> Vp8Decoder<R> {
         }
     }
 
+    /// Reads one block's coefficients, dequantised, into `block`. Returns
+    /// whether any token was coded, and the coding-order position of the
+    /// last nonzero coefficient (0 when only the DC, or nothing, is set).
     #[inline(always)]
     fn read_coefficients(
         &mut self,
@@ -1577,7 +1580,7 @@ impl<R: Read> Vp8Decoder<R> {
         complexity: usize,
         dcq: i16,
         acq: i16,
-    ) -> Result<(bool, bool), DecodingError> {
+    ) -> Result<(bool, usize), DecodingError> {
         // perform bounds checks once up front,
         // so that the compiler doesn't have to insert them in the hot loop below
         assert!(complexity <= 2);
@@ -1594,7 +1597,8 @@ impl<R: Read> Vp8Decoder<R> {
         {
             let mut s = decoder.begin_session();
             let mut has_coefficients = false;
-            let mut has_ac = false;
+            // position (in coding order) of the last nonzero coefficient
+            let mut last = 0usize;
             let mut i = first;
             let mut tree = &probs[COEFF_BANDS[i] as usize][complexity];
 
@@ -1650,7 +1654,7 @@ impl<R: Read> Vp8Decoder<R> {
 
                 let zigzag = ZIGZAG[i] as usize;
                 block[zigzag] = value * i32::from(if zigzag > 0 { acq } else { dcq });
-                has_ac |= zigzag > 0;
+                last = i;
 
                 i += 1;
                 if i == 16 {
@@ -1660,7 +1664,7 @@ impl<R: Read> Vp8Decoder<R> {
             }
 
             if decoder.commit_session(s) {
-                return Ok((has_coefficients, has_ac));
+                return Ok((has_coefficients, last));
             }
         }
 
@@ -1681,7 +1685,7 @@ impl<R: Read> Vp8Decoder<R> {
         complexity: usize,
         dcq: i16,
         acq: i16,
-    ) -> Result<(bool, bool), DecodingError> {
+    ) -> Result<(bool, usize), DecodingError> {
         let first = if plane == 0 { 1usize } else { 0usize };
         let probs = &self.token_probs[plane];
         let decoder = &mut self.partitions[p];
@@ -1692,7 +1696,7 @@ impl<R: Read> Vp8Decoder<R> {
 
         let mut complexity = complexity;
         let mut has_coefficients = false;
-        let mut has_ac = false;
+        let mut last = 0usize;
         let mut skip = false;
 
         for i in first..16usize {
@@ -1750,12 +1754,12 @@ impl<R: Read> Vp8Decoder<R> {
 
             let zigzag = ZIGZAG[i] as usize;
             block[zigzag] = abs_value * i32::from(if zigzag > 0 { acq } else { dcq });
-            has_ac |= zigzag > 0;
+            last = i;
 
             has_coefficients = true;
         }
 
-        decoder.check(res, (has_coefficients, has_ac))
+        decoder.check(res, (has_coefficients, last))
     }
 
     fn read_residual_data(
@@ -1799,13 +1803,15 @@ impl<R: Read> Vp8Decoder<R> {
                 let dcq = self.segment[sindex].ydc;
                 let acq = self.segment[sindex].yac;
 
-                let (n, has_ac) =
+                let (n, last) =
                     self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
 
                 if block[0] != 0 || n {
                     mb.non_zero_dct = true;
-                    if has_ac {
+                    if last >= 3 {
                         transform::idct4x4(block);
+                    } else if last > 0 {
+                        transform::idct4x4_ac3(block);
                     } else if block[0] != 0 {
                         transform::idct4x4_dc(block);
                     }
@@ -1833,12 +1839,14 @@ impl<R: Read> Vp8Decoder<R> {
                     let dcq = self.segment[sindex].uvdc;
                     let acq = self.segment[sindex].uvac;
 
-                    let (n, has_ac) =
+                    let (n, last) =
                         self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
                     if block[0] != 0 || n {
                         mb.non_zero_dct = true;
-                        if has_ac {
+                        if last >= 3 {
                             transform::idct4x4(block);
+                        } else if last > 0 {
+                            transform::idct4x4_ac3(block);
                         } else if block[0] != 0 {
                             transform::idct4x4_dc(block);
                         }
