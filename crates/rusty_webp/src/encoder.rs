@@ -650,6 +650,87 @@ fn residual_cost(r: u8) -> u32 {
     u32::from(r.min(0u8.wrapping_sub(r)))
 }
 
+/// Pixels `x0..x1` (`x0 >= 1`) of row `y >= 1` as bytes, with the bytes of
+/// their left, top and top-left neighbours (slices of the image, all the
+/// same length) and of their top-right neighbours (a copy, valid for that
+/// length).
+///
+/// Top-right is the row above one pixel on, except at the image's last
+/// column, where it wraps to this row's first pixel, as in the decoder's
+/// `i - width*4 + 4` addressing.
+#[inline(always)]
+fn neighbour_rows(
+    pixels: &[u8],
+    width: usize,
+    x0: usize,
+    x1: usize,
+    y: usize,
+) -> (&[u8], &[u8], &[u8], &[u8], [u8; 4 << PRED_BITS]) {
+    let n = (x1 - x0) * 4;
+    let row = (y * width + x0) * 4;
+    let above = row - width * 4;
+
+    let mut tr = [0u8; 4 << PRED_BITS];
+    if x1 == width {
+        tr[..n - 4].copy_from_slice(&pixels[above + 4..][..n - 4]);
+        tr[n - 4..n].copy_from_slice(&pixels[y * width * 4..][..4]);
+    } else {
+        tr[..n].copy_from_slice(&pixels[above + 4..][..n]);
+    }
+    (
+        &pixels[row..][..n],
+        &pixels[row - 4..][..n],
+        &pixels[above..][..n],
+        &pixels[above - 4..][..n],
+        tr,
+    )
+}
+
+/// Write one tile row's residuals under predictor `mode`: `cur - predicted`
+/// per byte. Slices as in [`row_costs`].
+fn row_residuals(mode: u8, out: &mut [u8], cur: &[u8], l: &[u8], t: &[u8], tr: &[u8], tl: &[u8]) {
+    let n = cur.len();
+    let (out, l, t, tr, tl) = (&mut out[..n], &l[..n], &t[..n], &tr[..n], &tl[..n]);
+
+    #[inline(always)]
+    fn fill(out: &mut [u8], cur: &[u8], predictor: impl Fn(usize) -> u8) {
+        for (i, (o, &px)) in out.iter_mut().zip(cur).enumerate() {
+            *o = px.wrapping_sub(predictor(i));
+        }
+    }
+
+    const OPAQUE_BLACK: [u8; 4] = [0, 0, 0, 255];
+    match mode {
+        0 => fill(out, cur, |i| OPAQUE_BLACK[i & 3]),
+        1 => fill(out, cur, |i| l[i]),
+        2 => fill(out, cur, |i| t[i]),
+        3 => fill(out, cur, |i| tr[i]),
+        4 => fill(out, cur, |i| tl[i]),
+        5 => fill(out, cur, |i| avg2(avg2(l[i], tr[i]), t[i])),
+        6 => fill(out, cur, |i| avg2(l[i], tl[i])),
+        7 => fill(out, cur, |i| avg2(l[i], t[i])),
+        8 => fill(out, cur, |i| avg2(tl[i], t[i])),
+        9 => fill(out, cur, |i| avg2(t[i], tr[i])),
+        10 => fill(out, cur, |i| avg2(avg2(l[i], tl[i]), avg2(t[i], tr[i]))),
+        11 => {
+            // select chooses a whole pixel: one pixel at a time
+            for k in (0..n).step_by(4) {
+                let px = |s: &[u8]| -> [u8; 4] { s[k..k + 4].try_into().unwrap() };
+                let p = predict(11, px(l), px(t), px(tr), px(tl));
+                for i in 0..4 {
+                    out[k + i] = cur[k + i].wrapping_sub(p[i]);
+                }
+            }
+        }
+        12 => fill(out, cur, |i| {
+            casf(i16::from(l[i]), i16::from(t[i]), i16::from(tl[i]))
+        }),
+        _ => fill(out, cur, |i| {
+            cash((i16::from(l[i]) + i16::from(t[i])) / 2, i16::from(tl[i]))
+        }),
+    }
+}
+
 /// Add one tile row's residual cost under each of the 14 predictors to
 /// `costs`. The five slices are the row's bytes and its left, top, top-right
 /// and top-left neighbours' bytes (RGBA, all the same length).
@@ -699,29 +780,6 @@ fn row_costs(costs: &mut [u32; 14], cur: &[u8], l: &[u8], t: &[u8], tr: &[u8], t
     });
 }
 
-/// Neighbours of pixel (x, y≥1, x≥1) as the decoder reconstructs them. TR at
-/// the row end wraps to the current row's first pixel (already decoded), as
-/// in the decoder's `i - width*4 + 4` addressing.
-fn neighbours(
-    pixels: &[u8],
-    width: usize,
-    x: usize,
-    y: usize,
-) -> ([u8; 4], [u8; 4], [u8; 4], [u8; 4]) {
-    let at = |xx: usize, yy: usize| -> [u8; 4] {
-        pixels[(yy * width + xx) * 4..][..4].try_into().unwrap()
-    };
-    let l = at(x - 1, y);
-    let t = at(x, y - 1);
-    let tl = at(x - 1, y - 1);
-    let tr = if x + 1 < width {
-        at(x + 1, y - 1)
-    } else {
-        at(0, y)
-    };
-    (l, t, tr, tl)
-}
-
 /// Choose one predictor per 16×16 tile (summed wrap-distance of residuals),
 /// then produce the residual image plus the predictor sub-image (mode in the
 /// green channel, as the decoder reads it).
@@ -746,26 +804,8 @@ fn predictor_select(
             let mut costs = [0u32; 14];
             let n = (x1 - x0) * 4;
             for y in y0..y1 {
-                // The tile's row and its neighbour rows as byte slices of
-                // one length: left is the row one pixel back, top / top-left
-                // the same in the row above.
-                let row = (y * width + x0) * 4;
-                let above = row - width * 4;
-                let cur = &pixels[row..][..n];
-                let l = &pixels[row - 4..][..n];
-                let t = &pixels[above..][..n];
-                let tl = &pixels[above - 4..][..n];
-                // Top-right is the row above one pixel on, except at the
-                // image's last column, where it wraps to this row's first
-                // pixel (see `neighbours`).
-                let mut tr_row = [0u8; 4 << PRED_BITS];
-                let tr = &mut tr_row[..n];
-                if x1 == width {
-                    tr[..n - 4].copy_from_slice(&pixels[above + 4..][..n - 4]);
-                    tr[n - 4..].copy_from_slice(&pixels[y * width * 4..][..4]);
-                } else {
-                    tr.copy_from_slice(&pixels[above + 4..][..n]);
-                }
+                let (cur, l, t, tl, tr) = neighbour_rows(pixels, width, x0, x1, y);
+                let tr = &tr[..n];
                 row_costs(&mut costs, cur, l, t, tr, tl);
             }
             let best = costs
@@ -791,14 +831,19 @@ fn predictor_select(
             out[y * width * 4 + i] =
                 pixels[y * width * 4 + i].wrapping_sub(pixels[(y - 1) * width * 4 + i]);
         }
-        for x in 1..width {
-            let mode = modes[(y >> PRED_BITS) * bw + (x >> PRED_BITS)];
-            let (l, t, tr, tl) = neighbours(pixels, width, x, y);
-            let p = predict(mode, l, t, tr, tl);
-            let o = (y * width + x) * 4;
-            for i in 0..4 {
-                out[o + i] = pixels[o + i].wrapping_sub(p[i]);
+        // One tile row at a time: the mode is fixed across it, so it is
+        // matched once and the residuals are a loop over the row's bytes.
+        for bx in 0..bw {
+            let x0 = (bx << PRED_BITS).max(1);
+            let x1 = ((bx + 1) << PRED_BITS).min(width);
+            if x0 >= x1 {
+                continue;
             }
+            let mode = modes[(y >> PRED_BITS) * bw + bx];
+            let n = (x1 - x0) * 4;
+            let (cur, l, t, tl, tr) = neighbour_rows(pixels, width, x0, x1, y);
+            let residuals = &mut out[(y * width + x0) * 4..][..n];
+            row_residuals(mode, residuals, cur, l, t, &tr[..n], tl);
         }
     }
 
