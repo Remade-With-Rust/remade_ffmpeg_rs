@@ -6,7 +6,7 @@ use std::io::{self, BufRead, Cursor, Read, Seek};
 use std::num::NonZeroU16;
 use std::ops::Range;
 
-use crate::extended::{self, get_alpha_predictor, read_alpha_chunk, WebPExtendedInfo};
+use crate::extended::{self, read_alpha_chunk, WebPExtendedInfo};
 
 use super::lossless::LosslessDecoder;
 use super::vp8::Vp8Decoder;
@@ -772,23 +772,12 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
                     self.height as u16,
                 )?;
 
-                for y in 0..frame.height {
-                    for x in 0..frame.width {
-                        let predictor: u8 = get_alpha_predictor(
-                            x.into(),
-                            y.into(),
-                            frame.width.into(),
-                            alpha_chunk.filtering_method,
-                            buf,
-                        );
-
-                        let alpha_index =
-                            usize::from(y) * usize::from(frame.width) + usize::from(x);
-                        let buffer_index = alpha_index * 4 + 3;
-
-                        buf[buffer_index] = predictor.wrapping_add(alpha_chunk.data[alpha_index]);
-                    }
-                }
+                extended::apply_alpha_plane(
+                    buf,
+                    usize::from(frame.width),
+                    &alpha_chunk.data,
+                    alpha_chunk.filtering_method,
+                );
             } else {
                 frame.fill_rgb(buf, self.webp_decode_options.lossy_upsampling);
             }
@@ -897,24 +886,12 @@ impl<R: BufRead + Seek> WebPDecoder<R> {
                 let mut rgba_frame = vec![0; frame_width as usize * frame_height as usize * 4];
                 frame.fill_rgba(&mut rgba_frame, self.webp_decode_options.lossy_upsampling);
 
-                for y in 0..frame.height {
-                    for x in 0..frame.width {
-                        let predictor: u8 = get_alpha_predictor(
-                            x.into(),
-                            y.into(),
-                            frame.width.into(),
-                            alpha_chunk.filtering_method,
-                            &rgba_frame,
-                        );
-
-                        let alpha_index =
-                            usize::from(y) * usize::from(frame.width) + usize::from(x);
-                        let buffer_index = alpha_index * 4 + 3;
-
-                        rgba_frame[buffer_index] =
-                            predictor.wrapping_add(alpha_chunk.data[alpha_index]);
-                    }
-                }
+                extended::apply_alpha_plane(
+                    &mut rgba_frame,
+                    usize::from(frame.width),
+                    &alpha_chunk.data,
+                    alpha_chunk.filtering_method,
+                );
 
                 (rgba_frame, true)
             }

@@ -147,6 +147,94 @@ pub(crate) fn composite_frame(
     }
 }
 
+/// Undo the alpha plane's prediction filter and store the result in the
+/// alpha byte of every pixel of `rgba` (rows of `width` RGBA pixels).
+/// `alpha` holds one filtered byte per pixel.
+///
+/// The filter method is fixed for the plane, and its edge rules depend only
+/// on the row and on whether the pixel is the first of its row, so the
+/// method is matched once and each row runs a plain loop.
+/// [`get_alpha_predictor`] is the same rule one pixel at a time, kept as the
+/// test oracle.
+pub(crate) fn apply_alpha_plane(
+    rgba: &mut [u8],
+    width: usize,
+    alpha: &[u8],
+    filtering_method: FilteringMethod,
+) {
+    if width == 0 {
+        return;
+    }
+    let stride = width * 4;
+
+    // A row predicted from the left: each pixel adds to the previous result.
+    // `first` is the predictor of the row's first pixel.
+    fn from_left(row: &mut [u8], deltas: &[u8], first: u8) {
+        let mut prev = first;
+        for (px, &d) in row.chunks_exact_mut(4).zip(deltas) {
+            prev = prev.wrapping_add(d);
+            px[3] = prev;
+        }
+    }
+
+    match filtering_method {
+        FilteringMethod::None => {
+            for (px, &a) in rgba.chunks_exact_mut(4).zip(alpha) {
+                px[3] = a;
+            }
+        }
+        FilteringMethod::Horizontal => {
+            // the first pixel of a row is predicted from the pixel above it
+            let mut above = 0u8;
+            for (row, deltas) in rgba.chunks_exact_mut(stride).zip(alpha.chunks_exact(width)) {
+                from_left(row, deltas, above);
+                above = row[3];
+            }
+        }
+        FilteringMethod::Vertical | FilteringMethod::Gradient => {
+            let gradient = matches!(filtering_method, FilteringMethod::Gradient);
+            let mut rows = alpha.chunks_exact(width);
+            // the first row has no row above: it is predicted from the left
+            let Some(deltas) = rows.next() else { return };
+            let Some(first_row) = rgba.get_mut(..stride) else {
+                return;
+            };
+            from_left(first_row, deltas, 0);
+
+            let mut done = stride;
+            for deltas in rows {
+                let (before, rest) = rgba.split_at_mut(done);
+                let Some(row) = rest.get_mut(..stride) else {
+                    return;
+                };
+                let top = &before[done - stride..];
+                if gradient {
+                    // first pixel: the one above; then left + top - top-left
+                    let mut left = top[3].wrapping_add(deltas[0]);
+                    row[3] = left;
+                    for ((px, t), &d) in row[4..]
+                        .chunks_exact_mut(4)
+                        .zip(top.windows(8).step_by(4))
+                        .zip(&deltas[1..])
+                    {
+                        let predictor = i16::from(left) + i16::from(t[7]) - i16::from(t[3]);
+                        left = (predictor.clamp(0, 255) as u8).wrapping_add(d);
+                        px[3] = left;
+                    }
+                } else {
+                    for ((px, t), &d) in
+                        row.chunks_exact_mut(4).zip(top.chunks_exact(4)).zip(deltas)
+                    {
+                        px[3] = t[3].wrapping_add(d);
+                    }
+                }
+                done += stride;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn get_alpha_predictor(
     x: usize,
     y: usize,
@@ -324,4 +412,52 @@ pub(crate) fn read_alpha_chunk<R: BufRead>(
     };
 
     Ok(chunk)
+}
+
+#[cfg(test)]
+mod alpha_tests {
+    use super::*;
+
+    /// The row-based unfilter must give what the per-pixel predictor gives,
+    /// for every method and for awkward sizes.
+    #[test]
+    fn alpha_plane_matches_per_pixel_predictor() {
+        let mut seed = 0x853c_49e6_748f_ea9bu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 24) as u8
+        };
+        for &(width, height) in &[
+            (1usize, 1usize),
+            (1, 5),
+            (5, 1),
+            (2, 2),
+            (7, 3),
+            (16, 9),
+            (33, 17),
+        ] {
+            let alpha: Vec<u8> = (0..width * height).map(|_| next()).collect();
+            for method in [
+                FilteringMethod::None,
+                FilteringMethod::Horizontal,
+                FilteringMethod::Vertical,
+                FilteringMethod::Gradient,
+            ] {
+                let image: Vec<u8> = (0..width * height * 4).map(|_| next()).collect();
+                let mut want = image.clone();
+                for y in 0..height {
+                    for x in 0..width {
+                        let predictor = get_alpha_predictor(x, y, width, method, &want);
+                        let i = y * width + x;
+                        want[i * 4 + 3] = predictor.wrapping_add(alpha[i]);
+                    }
+                }
+                let mut got = image;
+                apply_alpha_plane(&mut got, width, &alpha, method);
+                assert_eq!(got, want, "{width}x{height}");
+            }
+        }
+    }
 }
