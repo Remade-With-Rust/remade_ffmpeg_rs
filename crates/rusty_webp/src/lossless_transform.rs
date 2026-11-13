@@ -557,11 +557,15 @@ fn apply_color_indexing_transform_small_table<const W_BITS: u8, const EXP_ENTRY_
         let packed_argb_row_slice =
             &image_data[packed_row_input_global_offset..][..input_stride_bytes_packed];
 
+        // The packed indices are the green channel. Taken out of each pixel
+        // as a word (shift and truncate), which vectorizes; indexing byte 1
+        // of every 4-byte chunk moved one byte at a time.
         for (packed_argb_chunk, packed_idx) in packed_argb_row_slice
             .chunks_exact(4)
             .zip(packed_indices_for_row.iter_mut())
         {
-            *packed_idx = packed_argb_chunk[1];
+            let word = u32::from_le_bytes(packed_argb_chunk.try_into().unwrap());
+            *packed_idx = (word >> 8) as u8;
         }
 
         let output_row_global_offset = y * output_stride_bytes_expanded;
