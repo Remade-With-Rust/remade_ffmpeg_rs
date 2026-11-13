@@ -1300,6 +1300,90 @@ impl<R: Read> Vp8Decoder<R> {
     }
 
     fn read_macroblock_header(&mut self, mbx: usize) -> Result<MacroBlock, DecodingError> {
+        if let Some(mb) = self.read_macroblock_header_fast(mbx) {
+            return Ok(mb);
+        }
+        self.read_macroblock_header_committed(mbx)
+    }
+
+    /// The whole macroblock header in one decoder session: one state snapshot
+    /// and one commit, instead of a state copy in and out (and a call) per
+    /// tree read: up to 19 of them for a B_PRED macroblock. The reads are the
+    /// exact sequence of [`Self::read_macroblock_header_committed`].
+    ///
+    /// Returns `None`, with nothing changed, whenever the committed path has
+    /// to decide: the session ran past the buffer end, a mode is invalid, or
+    /// the frame is not a keyframe.
+    #[inline(always)]
+    fn read_macroblock_header_fast(&mut self, mbx: usize) -> Option<MacroBlock> {
+        if !self.frame.keyframe {
+            return None;
+        }
+        let mut mb = MacroBlock::default();
+        let mut s = self.b.begin_session();
+
+        if self.segments_enabled && self.segments_update_map {
+            let tree = &self.segment_tree_nodes;
+            mb.segmentid = self.b.session_read_with_tree(&mut s, tree, tree[0]) as u8;
+        }
+
+        mb.coeffs_skipped = match self.prob_skip_false {
+            Some(prob) => self.b.session_read_bool(&mut s, prob),
+            None => false,
+        };
+
+        let tree = &KEYFRAME_YMODE_NODES;
+        mb.luma_mode = LumaMode::from_i8(self.b.session_read_with_tree(&mut s, tree, tree[0]))?;
+
+        // Contexts are updated on copies and stored only once the session
+        // has committed.
+        let mut top = self.top[mbx].bpred;
+        let mut left = self.left.bpred;
+        match mb.luma_mode.into_intra() {
+            // `LumaMode::B` - This is predicted individually
+            None => {
+                for y in 0usize..4 {
+                    for x in 0usize..4 {
+                        let tree =
+                            &KEYFRAME_BPRED_MODE_NODES[top[12 + x] as usize][left[y] as usize];
+                        let intra = self.b.session_read_with_tree(&mut s, tree, tree[0]);
+                        let bmode = IntraMode::from_i8(intra)?;
+                        mb.bpred[x + y * 4] = bmode;
+                        top[12 + x] = bmode;
+                        left[y] = bmode;
+                    }
+                }
+            }
+            Some(mode) => {
+                for i in 0usize..4 {
+                    mb.bpred[12 + i] = mode;
+                    left[i] = mode;
+                }
+            }
+        }
+
+        let tree = &KEYFRAME_UV_MODE_NODES;
+        mb.chroma_mode = ChromaMode::from_i8(self.b.session_read_with_tree(&mut s, tree, tree[0]))?;
+
+        if !self.b.commit_session(s) {
+            return None;
+        }
+
+        self.left.bpred = left;
+        self.top[mbx].chroma_mode = mb.chroma_mode;
+        self.top[mbx].luma_mode = mb.luma_mode;
+        self.top[mbx].bpred = mb.bpred;
+        Some(mb)
+    }
+
+    /// The header through the committed per-read API, whose cold half handles
+    /// the final bytes of the partition and reports every error.
+    #[cold]
+    #[inline(never)]
+    fn read_macroblock_header_committed(
+        &mut self,
+        mbx: usize,
+    ) -> Result<MacroBlock, DecodingError> {
         let mut mb = MacroBlock::default();
         let mut res = self.b.start_accumulated_result();
 
