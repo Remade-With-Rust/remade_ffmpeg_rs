@@ -312,8 +312,13 @@ enum Tok {
 }
 
 /// Pack an RGBA byte quad into the ARGB word the spec hashes and matches on.
+///
+/// Read big-endian, the RGBA bytes are `r g b a` from the top; rotating right
+/// by one byte moves the alpha to the top. One load, a byte swap and a
+/// rotate, instead of four loads, three shifts and three ORs.
 fn pack_argb(p: &[u8]) -> u32 {
-    (u32::from(p[3]) << 24) | (u32::from(p[0]) << 16) | (u32::from(p[1]) << 8) | u32::from(p[2])
+    let rgba: [u8; 4] = p[..4].try_into().unwrap();
+    u32::from_be_bytes(rgba).rotate_right(8)
 }
 
 fn hash2(a: u32, b: u32) -> usize {
