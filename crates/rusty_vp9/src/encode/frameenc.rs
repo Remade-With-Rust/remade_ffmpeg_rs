@@ -7255,12 +7255,10 @@ impl FrameEncoder {
     fn luma_sse_of(&self, buf: &[u16]) -> u64 {
         let src = &self.src[0].buf;
         let n = self.src[0].w * self.src[0].h; // coded region only (skip padding rows)
-        let mut sse = 0u64;
-        for i in 0..n {
-            let d = src[i] as i64 - buf[i] as i64;
-            sse += (d * d) as u64;
-        }
-        sse
+        // The whole frame as one long row through the SSE kernel. This runs once
+        // per candidate filter level (about 15 times a frame) and was a scalar
+        // i64 loop at ~7.5 instructions a pixel.
+        super::blockkern::run_sse(&src[..n], &buf[..n])
     }
 
     /// R3 — loop-filter-level search: pick the `loop_filter_level` whose deblocked

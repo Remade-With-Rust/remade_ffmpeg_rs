@@ -117,8 +117,21 @@ unsafe fn residual_and_sse_sse2(
     _mm_cvtsi128_si64(_mm_add_epi64(acc64, hi)) as u64
 }
 
+/// `Σ (a[i] - b[i])²` over two equal-length sample runs — the whole-frame SSE
+/// the filter-level search takes per candidate.
+///
+/// A separate out-of-line symbol on purpose: [`block_sse`] is `inline(always)`
+/// for the per-transform-block call site, and when this frame-sized use called
+/// it directly LLVM stopped inlining it there too, which cost the block path a
+/// call per transform block (+0.1% on an encode that never runs the search).
+#[inline(never)]
+pub(crate) fn run_sse(a: &[u16], b: &[u16]) -> u64 {
+    let n = a.len().min(b.len());
+    block_sse(&a[..n], n, &b[..n], n, n, 1)
+}
+
 /// `Σ (a[y][x] - b[y][x])²` over a `w x h` block. `w` is 4 or a multiple of 8.
-#[inline]
+#[inline(always)]
 pub(crate) fn block_sse(
     a: &[u16],
     a_stride: usize,
