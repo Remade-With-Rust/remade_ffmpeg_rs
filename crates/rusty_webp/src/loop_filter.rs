@@ -457,10 +457,13 @@ fn store_rows<const N: usize>(
 #[inline(always)]
 fn load_cols<const N: usize>(pixels: &[u8], base: usize, stride: usize) -> [[i16; N]; 8] {
     let mut t = [[0i16; N]; 8];
+    // The 8 taps of a row are contiguous: take them as one fixed-size window
+    // (one bounds check per row instead of one per tap).
+    let mut rows = pixels[base..].chunks(stride);
     for i in 0..N {
-        let row = base + i * stride;
-        for (k, tap) in t.iter_mut().enumerate() {
-            tap[i] = i16::from(pixels[row + k]) - 128;
+        let src: &[u8; 8] = rows.next().unwrap()[..8].try_into().unwrap();
+        for (tap, &s) in t.iter_mut().zip(src) {
+            tap[i] = i16::from(s) - 128;
         }
     }
     t
@@ -475,10 +478,11 @@ fn store_cols<const N: usize>(
     from: usize,
     to: usize,
 ) {
-    for i in 0..N {
-        let row = base + i * stride;
+    let rows = pixels[base..].chunks_mut(stride);
+    for (i, row) in rows.take(N).enumerate() {
+        let dst: &mut [u8; 8] = (&mut row[..8]).try_into().unwrap();
         for k in from..to {
-            pixels[row + k] = (t[k][i] + 128) as u8;
+            dst[k] = (t[k][i] + 128) as u8;
         }
     }
 }
