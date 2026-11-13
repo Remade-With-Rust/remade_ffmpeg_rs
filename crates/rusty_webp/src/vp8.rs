@@ -1568,6 +1568,7 @@ impl<R: Read> Vp8Decoder<R> {
         }
     }
 
+    #[inline(always)]
     fn read_coefficients(
         &mut self,
         block: &mut [i32; 16],
@@ -1663,9 +1664,28 @@ impl<R: Read> Vp8Decoder<R> {
             }
         }
 
-        // The session ran past the buffer end (file tail): its writes into
-        // `block` are garbage — reset and redo through the committed
-        // per-read path, whose cold half handles the final bytes.
+        self.read_coefficients_committed(block, p, plane, complexity, dcq, acq)
+    }
+
+    /// The block through the committed per-read API, whose cold half handles
+    /// the final bytes of the partition. Runs only when the fast session ran
+    /// past the buffer end (file tail): the session's writes into `block`
+    /// are garbage, so it is reset first.
+    #[cold]
+    #[inline(never)]
+    fn read_coefficients_committed(
+        &mut self,
+        block: &mut [i32; 16],
+        p: usize,
+        plane: usize,
+        complexity: usize,
+        dcq: i16,
+        acq: i16,
+    ) -> Result<(bool, bool), DecodingError> {
+        let first = if plane == 0 { 1usize } else { 0usize };
+        let probs = &self.token_probs[plane];
+        let decoder = &mut self.partitions[p];
+
         block.fill(0);
 
         let mut res = decoder.start_accumulated_result();
