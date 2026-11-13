@@ -650,6 +650,55 @@ fn residual_cost(r: u8) -> u32 {
     u32::from(r.min(0u8.wrapping_sub(r)))
 }
 
+/// Add one tile row's residual cost under each of the 14 predictors to
+/// `costs`. The five slices are the row's bytes and its left, top, top-right
+/// and top-left neighbours' bytes (RGBA, all the same length).
+///
+/// Every predictor except select (11) works channel by channel, so its cost
+/// is a plain loop over the row's bytes that the compiler vectorizes; the
+/// per-pixel form evaluated [`predict`] fourteen times for each pixel in
+/// turn. The sums are the same integers, so the chosen modes are too.
+fn row_costs(costs: &mut [u32; 14], cur: &[u8], l: &[u8], t: &[u8], tr: &[u8], tl: &[u8]) {
+    let n = cur.len();
+    let (l, t, tr, tl) = (&l[..n], &t[..n], &tr[..n], &tl[..n]);
+
+    #[inline(always)]
+    fn sum(cur: &[u8], predictor: impl Fn(usize) -> u8) -> u32 {
+        let mut cost = 0u32;
+        for (i, &px) in cur.iter().enumerate() {
+            cost += residual_cost(px.wrapping_sub(predictor(i)));
+        }
+        cost
+    }
+
+    const OPAQUE_BLACK: [u8; 4] = [0, 0, 0, 255];
+    costs[0] += sum(cur, |i| OPAQUE_BLACK[i & 3]);
+    costs[1] += sum(cur, |i| l[i]);
+    costs[2] += sum(cur, |i| t[i]);
+    costs[3] += sum(cur, |i| tr[i]);
+    costs[4] += sum(cur, |i| tl[i]);
+    costs[5] += sum(cur, |i| avg2(avg2(l[i], tr[i]), t[i]));
+    costs[6] += sum(cur, |i| avg2(l[i], tl[i]));
+    costs[7] += sum(cur, |i| avg2(l[i], t[i]));
+    costs[8] += sum(cur, |i| avg2(tl[i], t[i]));
+    costs[9] += sum(cur, |i| avg2(t[i], tr[i]));
+    costs[10] += sum(cur, |i| avg2(avg2(l[i], tl[i]), avg2(t[i], tr[i])));
+    // select chooses a whole pixel: one pixel at a time
+    for k in (0..n).step_by(4) {
+        let px = |s: &[u8]| -> [u8; 4] { s[k..k + 4].try_into().unwrap() };
+        let p = predict(11, px(l), px(t), px(tr), px(tl));
+        for i in 0..4 {
+            costs[11] += residual_cost(cur[k + i].wrapping_sub(p[i]));
+        }
+    }
+    costs[12] += sum(cur, |i| {
+        casf(i16::from(l[i]), i16::from(t[i]), i16::from(tl[i]))
+    });
+    costs[13] += sum(cur, |i| {
+        cash((i16::from(l[i]) + i16::from(t[i])) / 2, i16::from(tl[i]))
+    });
+}
+
 /// Neighbours of pixel (x, y≥1, x≥1) as the decoder reconstructs them. TR at
 /// the row end wraps to the current row's first pixel (already decoded), as
 /// in the decoder's `i - width*4 + 4` addressing.
@@ -695,18 +744,29 @@ fn predictor_select(
                 continue; // border-only tile: mode never used
             }
             let mut costs = [0u32; 14];
+            let n = (x1 - x0) * 4;
             for y in y0..y1 {
-                for x in x0..x1 {
-                    let px: [u8; 4] = pixels[(y * width + x) * 4..][..4].try_into().unwrap();
-                    let (l, t, tr, tl) = neighbours(pixels, width, x, y);
-                    for (m, cost) in costs.iter_mut().enumerate() {
-                        let p = predict(m as u8, l, t, tr, tl);
-                        *cost += residual_cost(px[0].wrapping_sub(p[0]))
-                            + residual_cost(px[1].wrapping_sub(p[1]))
-                            + residual_cost(px[2].wrapping_sub(p[2]))
-                            + residual_cost(px[3].wrapping_sub(p[3]));
-                    }
+                // The tile's row and its neighbour rows as byte slices of
+                // one length: left is the row one pixel back, top / top-left
+                // the same in the row above.
+                let row = (y * width + x0) * 4;
+                let above = row - width * 4;
+                let cur = &pixels[row..][..n];
+                let l = &pixels[row - 4..][..n];
+                let t = &pixels[above..][..n];
+                let tl = &pixels[above - 4..][..n];
+                // Top-right is the row above one pixel on, except at the
+                // image's last column, where it wraps to this row's first
+                // pixel (see `neighbours`).
+                let mut tr_row = [0u8; 4 << PRED_BITS];
+                let tr = &mut tr_row[..n];
+                if x1 == width {
+                    tr[..n - 4].copy_from_slice(&pixels[above + 4..][..n - 4]);
+                    tr[n - 4..].copy_from_slice(&pixels[y * width * 4..][..4]);
+                } else {
+                    tr.copy_from_slice(&pixels[above + 4..][..n]);
                 }
+                row_costs(&mut costs, cur, l, t, tr, tl);
             }
             let best = costs
                 .iter()
