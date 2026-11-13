@@ -772,26 +772,71 @@ fn build_basis(n: usize, adst: bool) -> Vec<Vec<i64>> {
         .collect()
 }
 
-/// Cached inverse basis for `(n, adst)`, flattened: `b[k * n + i] = basis[k][i]`.
+/// Tables for the matrix forward transform of one `(n, adst)` pair.
+struct MatBasis {
+    /// `b[k * n + i] = basis[k][i]` — the inverse basis, row `k` contiguous.
+    b: Vec<i64>,
+    /// Row-pass pair table for `pmaddwd`: for input pair `j` and output `k`,
+    /// `rp[(j * n + k) * 2 + t] = basis[k][2 * j + t]` as `i16`.
+    rp: Vec<i16>,
+    /// Largest `|residual|` for which the vector row pass is exact: operands fit
+    /// `i16` and no partial sum of a row's products can leave `i32`. Derived
+    /// from the table itself (`i32::MAX / max_k Σ_i |b[k][i]|`); 0 disables it.
+    lim: i32,
+}
+
+fn build_mat_basis(n: usize, adst: bool) -> MatBasis {
+    let b: Vec<i64> = build_basis(n, adst).into_iter().flatten().collect();
+    let fits = b.iter().all(|v| v.unsigned_abs() <= i16::MAX as u64);
+    let l1 = b
+        .chunks_exact(n)
+        .map(|row| row.iter().map(|v| v.abs()).sum::<i64>())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let lim = if fits {
+        (i32::MAX as i64 / l1).min(i16::MAX as i64) as i32
+    } else {
+        0
+    };
+    let mut rp = vec![0i16; n * n];
+    if fits {
+        for j in 0..n / 2 {
+            for k in 0..n {
+                for t in 0..2 {
+                    rp[(j * n + k) * 2 + t] = b[k * n + 2 * j + t] as i16;
+                }
+            }
+        }
+    }
+    MatBasis { b, rp, lim }
+}
+
+/// Cached matrix-transform tables for `(n, adst)`.
 ///
 /// One table set behind one `OnceLock`, each matrix a single contiguous slice.
 /// The previous shape (a `Vec<Vec<i64>>` per pair, each behind its own lock)
 /// cost two lock probes per call and a pointer chase plus a bounds check per
 /// row of every dot product.
-fn flat_basis(n: usize, adst: bool) -> &'static [i64] {
-    static T: OnceLock<[Vec<i64>; 8]> = OnceLock::new();
+fn mat_basis(n: usize, adst: bool) -> &'static MatBasis {
+    static T: OnceLock<[MatBasis; 8]> = OnceLock::new();
     let t = T.get_or_init(|| {
         std::array::from_fn(|idx| {
             let (n, adst) = (4usize << (idx >> 1), idx & 1 == 1);
             if n == 32 && adst {
-                return Vec::new(); // VP9 has no 32-point ADST
+                // VP9 has no 32-point ADST.
+                return MatBasis {
+                    b: Vec::new(),
+                    rp: Vec::new(),
+                    lim: 0,
+                };
             }
-            build_basis(n, adst).into_iter().flatten().collect()
+            build_mat_basis(n, adst)
         })
     });
-    let b = &t[((n.trailing_zeros() as usize - 2) << 1) | adst as usize];
-    assert!(b.len() == n * n, "no basis for {n} adst={adst}");
-    b
+    let m = &t[((n.trailing_zeros() as usize - 2) << 1) | adst as usize];
+    assert!(m.b.len() == n * n, "no basis for {n} adst={adst}");
+    m
 }
 
 /// Forward 2-D transform via the integer inverse-basis transpose. `row_adst` /
@@ -808,8 +853,33 @@ fn forward_2d_matrix(
     out: &mut [i32],
     tmp: &mut [i64],
 ) {
-    let rb = flat_basis(n, row_adst);
-    let cb = flat_basis(n, col_adst);
+    let rm = mat_basis(n, row_adst);
+    let cm = mat_basis(n, col_adst);
+    #[cfg(target_arch = "x86_64")]
+    if n <= 16 && rm.lim > 0 && has_avx2() {
+        // SAFETY: AVX2 confirmed; the slices are length-checked inside.
+        let done = unsafe {
+            match n {
+                4 => matrix_avx2::forward::<4>(residual, rm, &cm.b, out, tmp),
+                8 => matrix_avx2::forward::<8>(residual, rm, &cm.b, out, tmp),
+                _ => matrix_avx2::forward::<16>(residual, rm, &cm.b, out, tmp),
+            }
+        };
+        if done {
+            return;
+        }
+    }
+    forward_2d_matrix_scalar(residual, n, &rm.b, &cm.b, out, tmp);
+}
+
+fn forward_2d_matrix_scalar(
+    residual: &[i32],
+    n: usize,
+    rb: &[i64],
+    cb: &[i64],
+    out: &mut [i32],
+    tmp: &mut [i64],
+) {
     match n {
         4 => matrix_fwd::<4>(residual, rb, cb, out, tmp),
         8 => matrix_fwd::<8>(residual, rb, cb, out, tmp),
@@ -832,8 +902,8 @@ fn matrix_fwd<const N: usize>(
     out: &mut [i32],
     tmp: &mut [i64],
 ) {
-    let (residual, rb, cb) = (&residual[..N * N], &rb[..N * N], &cb[..N * N]);
-    let (out, tmp) = (&mut out[..N * N], &mut tmp[..N * N]);
+    let (residual, rb) = (&residual[..N * N], &rb[..N * N]);
+    let tmp = &mut tmp[..N * N];
     // Row pass: tmp[r][k] = Σ_i residual[r][i] · rb[k][i].
     for (rrow, trow) in residual.chunks_exact(N).zip(tmp.chunks_exact_mut(N)) {
         for (t, bk) in trow.iter_mut().zip(rb.chunks_exact(N)) {
@@ -844,9 +914,15 @@ fn matrix_fwd<const N: usize>(
             *t = acc;
         }
     }
-    // Column pass + calibration round-shift:
-    // out[kr][kc] = (Σ_r tmp[r][kc] · cb[kr][r] + round) >> sh, accumulated a
-    // whole output row at a time so `tmp` is read along its rows.
+    matrix_cols::<N>(tmp, cb, out);
+}
+
+/// Column pass + calibration round-shift of the matrix transform:
+/// `out[kr][kc] = (Σ_r tmp[r][kc] · cb[kr][r] + round) >> sh`, accumulated a
+/// whole output row at a time so `tmp` is read along its rows.
+#[inline(always)]
+fn matrix_cols<const N: usize>(tmp: &[i64], cb: &[i64], out: &mut [i32]) {
+    let (tmp, cb, out) = (&tmp[..N * N], &cb[..N * N], &mut out[..N * N]);
     let sh = calib_shift(N);
     let round = 1i64 << (sh - 1);
     for (orow, bk) in out.chunks_exact_mut(N).zip(cb.chunks_exact(N)) {
@@ -858,6 +934,151 @@ fn matrix_fwd<const N: usize>(
         }
         for (o, a) in orow.iter_mut().zip(acc) {
             *o = ((a + round) >> sh) as i32;
+        }
+    }
+}
+
+/// Stage switch for the vector column pass (see [`matrix_avx2`]).
+#[cfg(target_arch = "x86_64")]
+const MATRIX_AVX2_COLS: bool = false;
+
+/// AVX2 twin of [`matrix_fwd`] for `N` in `{4, 8, 16}`. Bit-identical: the row
+/// pass is exact in `i32` under the table-derived `lim` guard, the column pass
+/// is the same exact `i64` sum, and the final shift keeps the low 32 bits.
+#[cfg(target_arch = "x86_64")]
+mod matrix_avx2 {
+    use super::{calib_shift, MatBasis};
+    use std::arch::x86_64::*;
+
+    /// Returns `false` when a residual exceeds the row-pass bound (`out` is
+    /// then unspecified); the caller runs the scalar path instead.
+    ///
+    /// # Safety
+    /// AVX2 must be available. `N` must be 4, 8 or 16.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn forward<const N: usize>(
+        residual: &[i32],
+        rm: &MatBasis,
+        cb: &[i64],
+        out: &mut [i32],
+        tmp: &mut [i64],
+    ) -> bool {
+        let (residual, cb) = (&residual[..N * N], &cb[..N * N]);
+        let (out, tmp) = (&mut out[..N * N], &mut tmp[..N * N]);
+        let rp = &rm.rp[..N * N];
+        if !rows::<N>(residual, rp, rm.lim, tmp) {
+            return false;
+        }
+        if super::MATRIX_AVX2_COLS {
+            cols::<N>(tmp, cb, out);
+        } else {
+            super::matrix_cols::<N>(tmp, cb, out);
+        }
+        true
+    }
+
+    /// Row pass: `tmp[r][k] = Σ_i residual[r][i] · basis[k][i]`, two taps per
+    /// `pmaddwd` with the output index `k` in the lanes. Results are stored
+    /// sign-extended to `i64` for the column pass.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn rows<const N: usize>(
+        residual: &[i32],
+        rp: &[i16],
+        lim: i32,
+        tmp: &mut [i64],
+    ) -> bool {
+        let res = residual.as_ptr();
+        let t = tmp.as_mut_ptr();
+        let p = rp.as_ptr();
+        if N == 4 {
+            let limv = _mm_set1_epi32(lim);
+            let t0 = _mm_loadu_si128(p as *const __m128i);
+            let t1 = _mm_loadu_si128(p.add(8) as *const __m128i);
+            let mut over = _mm_setzero_si128();
+            for r in 0..4 {
+                let x = _mm_loadu_si128(res.add(4 * r) as *const __m128i);
+                over = _mm_or_si128(over, _mm_cmpgt_epi32(_mm_abs_epi32(x), limv));
+                let pk = _mm_packs_epi32(x, x);
+                let acc = _mm_add_epi32(
+                    _mm_madd_epi16(_mm_shuffle_epi32::<0x00>(pk), t0),
+                    _mm_madd_epi16(_mm_shuffle_epi32::<0x55>(pk), t1),
+                );
+                _mm256_storeu_si256(t.add(4 * r) as *mut __m256i, _mm256_cvtepi32_epi64(acc));
+            }
+            return _mm_testz_si128(over, over) == 1;
+        }
+        let limv = _mm256_set1_epi32(lim);
+        let mut over = _mm256_setzero_si256();
+        for r in 0..N {
+            // Pack the row to i16 pairs: lane j of `pk` holds inputs (2j, 2j+1).
+            let pk = if N == 8 {
+                let x = _mm256_loadu_si256(res.add(8 * r) as *const __m256i);
+                over = _mm256_or_si256(over, _mm256_cmpgt_epi32(_mm256_abs_epi32(x), limv));
+                _mm256_castsi128_si256(_mm_packs_epi32(
+                    _mm256_castsi256_si128(x),
+                    _mm256_extracti128_si256::<1>(x),
+                ))
+            } else {
+                let x0 = _mm256_loadu_si256(res.add(16 * r) as *const __m256i);
+                let x1 = _mm256_loadu_si256(res.add(16 * r + 8) as *const __m256i);
+                over = _mm256_or_si256(over, _mm256_cmpgt_epi32(_mm256_abs_epi32(x0), limv));
+                over = _mm256_or_si256(over, _mm256_cmpgt_epi32(_mm256_abs_epi32(x1), limv));
+                _mm256_permute4x64_epi64::<0xD8>(_mm256_packs_epi32(x0, x1))
+            };
+            let mut acc = [_mm256_setzero_si256(); 2];
+            for j in 0..N / 2 {
+                let bj = _mm256_permutevar8x32_epi32(pk, _mm256_set1_epi32(j as i32));
+                for (v, a) in acc.iter_mut().enumerate().take(N / 8) {
+                    let tab = _mm256_loadu_si256(p.add((j * N + 8 * v) * 2) as *const __m256i);
+                    *a = _mm256_add_epi32(*a, _mm256_madd_epi16(bj, tab));
+                }
+            }
+            for (v, a) in acc.iter().enumerate().take(N / 8) {
+                let d = t.add(r * N + 8 * v);
+                _mm256_storeu_si256(
+                    d as *mut __m256i,
+                    _mm256_cvtepi32_epi64(_mm256_castsi256_si128(*a)),
+                );
+                _mm256_storeu_si256(
+                    d.add(4) as *mut __m256i,
+                    _mm256_cvtepi32_epi64(_mm256_extracti128_si256::<1>(*a)),
+                );
+            }
+        }
+        _mm256_testz_si256(over, over) == 1
+    }
+
+    /// Column pass: `out[kr][kc] = (Σ_r tmp[r][kc] · cb[kr][r] + round) >> sh`.
+    /// `pmuldq` gives the exact signed 64-bit products (both operands fit
+    /// `i32`); the arithmetic shift is taken as a logical one and truncated,
+    /// which agrees in the low 32 bits for any shift up to 32.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn cols<const N: usize>(tmp: &[i64], cb: &[i64], out: &mut [i32]) {
+        let t = tmp.as_ptr();
+        let o = out.as_mut_ptr();
+        let sh = calib_shift(N);
+        let round = _mm256_set1_epi64x(1i64 << (sh - 1));
+        let shv = _mm_cvtsi32_si128(sh as i32);
+        let low = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+        for kr in 0..N {
+            let mut acc = [_mm256_setzero_si256(); 4];
+            for r in 0..N {
+                let b = _mm256_set1_epi64x(*cb.get_unchecked(kr * N + r));
+                for (c, a) in acc.iter_mut().enumerate().take(N / 4) {
+                    let x = _mm256_loadu_si256(t.add(r * N + 4 * c) as *const __m256i);
+                    *a = _mm256_add_epi64(*a, _mm256_mul_epi32(x, b));
+                }
+            }
+            for (c, a) in acc.iter().enumerate().take(N / 4) {
+                let v = _mm256_srl_epi64(_mm256_add_epi64(*a, round), shv);
+                let v = _mm256_permutevar8x32_epi32(v, low);
+                _mm_storeu_si128(
+                    o.add(kr * N + 4 * c) as *mut __m128i,
+                    _mm256_castsi256_si128(v),
+                );
+            }
         }
     }
 }
@@ -1002,6 +1223,75 @@ mod tests {
     /// random residuals at 8-bit (±255) and 10-bit (±1023) ranges plus the
     /// extremes (all-max, all-min, impulse) — the i32-product headroom proof.
     #[cfg(target_arch = "x86_64")]
+    /// The vector matrix transform must equal the scalar reference bit for
+    /// bit, for every size and ADST mix, on in-range residuals (including the
+    /// 8/10/12-bit extremes and the table's own bound), and must decline
+    /// anything past that bound rather than wrap.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn matrix_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        fn run(n: usize, residual: &[i32], rm: &MatBasis, cb: &[i64], out: &mut [i32]) -> bool {
+            let mut tmp = vec![-1i64; 1024];
+            // SAFETY: AVX2 checked by the caller; n is 4, 8 or 16.
+            unsafe {
+                match n {
+                    4 => matrix_avx2::forward::<4>(residual, rm, cb, out, &mut tmp),
+                    8 => matrix_avx2::forward::<8>(residual, rm, cb, out, &mut tmp),
+                    _ => matrix_avx2::forward::<16>(residual, rm, cb, out, &mut tmp),
+                }
+            }
+        }
+        let mut s = 0x1234_5678_9abc_def1u64;
+        for &n in &[4usize, 8, 16] {
+            for &(ra, ca) in &[(false, false), (false, true), (true, false), (true, true)] {
+                let (rm, cm) = (mat_basis(n, ra), mat_basis(n, ca));
+                assert!(rm.lim >= 4095, "n={n} adst={ra}: lim {}", rm.lim);
+                for round in 0..400 {
+                    let amp = match round % 4 {
+                        0 => 255i32,
+                        1 => 1023,
+                        2 => 4095,
+                        _ => rm.lim,
+                    };
+                    let residual: Vec<i32> = (0..n * n)
+                        .map(|i| match round {
+                            0..=3 => amp,
+                            4..=7 => -amp,
+                            8..=11 => {
+                                if i % 2 == 0 {
+                                    amp
+                                } else {
+                                    -amp
+                                }
+                            }
+                            _ => (xs(&mut s) % (2 * amp as u64 + 1)) as i32 - amp,
+                        })
+                        .collect();
+                    let mut want = vec![0i32; n * n];
+                    let mut got = vec![0x5a5a_5a5ai32; n * n];
+                    let mut t0 = vec![0i64; 1024];
+                    forward_2d_matrix_scalar(&residual, n, &rm.b, &cm.b, &mut want, &mut t0);
+                    assert!(
+                        run(n, &residual, rm, &cm.b, &mut got),
+                        "n={n} declined an in-range residual (amp {amp})"
+                    );
+                    assert_eq!(got, want, "n={n} row_adst={ra} col_adst={ca} round={round}");
+                }
+                // One sample past the bound must be declined, not wrapped.
+                let mut residual = vec![0i32; n * n];
+                residual[n * n - 1] = rm.lim + 1;
+                let mut got = vec![0i32; n * n];
+                assert!(
+                    !run(n, &residual, rm, &cm.b, &mut got),
+                    "n={n}: out-of-bound residual was not declined"
+                );
+            }
+        }
+    }
+
     #[test]
     fn fdct8x8_avx2_matches_scalar() {
         if !has_avx2() {
