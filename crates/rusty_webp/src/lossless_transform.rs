@@ -89,27 +89,33 @@ pub fn apply_predictor_transform_1(image_data: &mut [u8], range: Range<usize>, _
     }
 }
 pub fn apply_predictor_transform_2(image_data: &mut [u8], range: Range<usize>, width: usize) {
-    assert!(range.end <= image_data.len());
-    let mut i = range.start;
-    while i < range.end {
-        image_data[i] = image_data[i].wrapping_add(image_data[i - width * 4]);
-        i += 1;
+    // The predictor is a pixel of the row above, which this row never
+    // writes: split there and add the two slices, which vectorizes (the
+    // indexed loop checked both bounds for every byte).
+    let (old, current) = image_data[..range.end].split_at_mut(range.start);
+    let above = &old[range.start - width * 4..];
+    for (byte, &predictor) in current.iter_mut().zip(above) {
+        *byte = byte.wrapping_add(predictor);
     }
 }
 pub fn apply_predictor_transform_3(image_data: &mut [u8], range: Range<usize>, width: usize) {
-    assert!(range.end <= image_data.len());
-    let mut i = range.start;
-    while i < range.end {
-        image_data[i] = image_data[i].wrapping_add(image_data[i - width * 4 + 4]);
-        i += 1;
+    // Top-right. For the last pixel of a row that is the first pixel of the
+    // row being written, which lies before `range` (a range never starts at
+    // a row's first pixel), so the source is still entirely in `old`.
+    let (old, current) = image_data[..range.end].split_at_mut(range.start);
+    let above = &old[range.start - width * 4 + 4..];
+    for (byte, &predictor) in current.iter_mut().zip(above) {
+        *byte = byte.wrapping_add(predictor);
     }
 }
 pub fn apply_predictor_transform_4(image_data: &mut [u8], range: Range<usize>, width: usize) {
-    assert!(range.end <= image_data.len());
-    let mut i = range.start;
-    while i < range.end {
-        image_data[i] = image_data[i].wrapping_add(image_data[i - width * 4 - 4]);
-        i += 1;
+    // The predictor is a pixel of the row above, which this row never
+    // writes: split there and add the two slices, which vectorizes (the
+    // indexed loop checked both bounds for every byte).
+    let (old, current) = image_data[..range.end].split_at_mut(range.start);
+    let above = &old[range.start - width * 4 - 4..];
+    for (byte, &predictor) in current.iter_mut().zip(above) {
+        *byte = byte.wrapping_add(predictor);
     }
 }
 pub fn apply_predictor_transform_5(image_data: &mut [u8], range: Range<usize>, width: usize) {
