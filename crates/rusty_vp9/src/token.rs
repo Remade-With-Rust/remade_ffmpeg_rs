@@ -127,6 +127,13 @@ pub fn decode_coefs(
     //   this same call (see `coef_neighbours_precede_in_scan_order`).
     debug_assert!(dqcoeff[..max_eob].iter().all(|&v| v == 0));
 
+    // The scan, its neighbour table and the band table are all indexed by a
+    // scan index the loop keeps at or below `max_eob`. Cut to exactly the
+    // lengths that implies, their per-token bounds checks are provable.
+    let scan = &scan[..max_eob];
+    let nb = &nb[..2 * max_eob + 2];
+    let band_translate = &band_translate[..max_eob];
+
     let mut c = 0usize;
     while c < max_eob {
         let mut band = band_translate[c] as usize;
