@@ -4950,14 +4950,21 @@ impl FrameEncoder {
             return sad8x8(s, src.stride, r, rp.stride, self.has_avx2) as i64;
         }
         // Edge path: clamp each sample to the coded region (unchanged semantics).
+        // The clamp is separable, so the eight columns are clamped once per call
+        // and each row once: the old form clamped both coordinates and did two
+        // bounds-checked 2-D index computations for every one of the 64 samples,
+        // and on panning content this path is most of the integer search.
+        let mut cx = [0usize; 8];
+        for (x, c) in cx.iter_mut().enumerate() {
+            *c = (base_x as i32 + x as i32 + mv_c).clamp(0, rw - 1) as usize;
+        }
         let mut sad = 0i64;
-        for y in 0..8i32 {
-            for x in 0..8i32 {
-                let sx = (base_x as i32 + x + mv_c).clamp(0, rw - 1) as usize;
-                let sy = (base_y as i32 + y + mv_r).clamp(0, rh - 1) as usize;
-                let r = rp.buf[sy * rp.stride + sx] as i64;
-                let s = src.buf[(base_y + y as usize) * src.stride + base_x + x as usize] as i64;
-                sad += (s - r).abs();
+        for y in 0..8usize {
+            let sy = (base_y as i32 + y as i32 + mv_r).clamp(0, rh - 1) as usize;
+            let r_row = &rp.buf[sy * rp.stride..][..rw as usize];
+            let s_row = &src.buf[(base_y + y) * src.stride + base_x..][..8];
+            for x in 0..8 {
+                sad += (s_row[x] as i64 - r_row[cx[x]] as i64).abs();
             }
         }
         sad
