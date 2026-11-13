@@ -6888,12 +6888,7 @@ impl FrameEncoder {
                 inverse_transform_dc_add(dqcoeff[0], bs, dst, stride, self.max_px);
             } else {
                 // max_row = highest non-zero coefficient row.
-                let mut max_row = 0usize;
-                for (pos, &c) in dqcoeff[..n].iter().enumerate() {
-                    if c != 0 {
-                        max_row = max_row.max(pos / bs);
-                    }
-                }
+                let max_row = last_nonzero_row(&dqcoeff[..n], bs);
                 inverse_transform_add_rows(
                     &dqcoeff[..n],
                     bs,
@@ -7490,6 +7485,31 @@ fn sad8x8(s: &[u16], ss: usize, r: &[u16], rs: usize, has_avx2: bool) -> u32 {
     }
     let _ = has_avx2;
     sad8x8_scalar(s, ss, r, rs)
+}
+
+/// Index of the last row of a `bs x bs` coefficient block that holds a non-zero
+/// value (0 if the block is all zero).
+///
+/// Scanned bottom-up a whole row at a time, with the row width a compile-time
+/// constant so each test is a short branch-free OR-reduction. The loop this
+/// replaces visited all `bs * bs` entries and paid a real divide by the runtime
+/// `bs` for every non-zero one. Sparse blocks (the common case) reject their
+/// empty rows a vector at a time; dense blocks stop at the first row tested.
+#[inline]
+fn last_nonzero_row(dq: &[i32], bs: usize) -> usize {
+    #[inline(always)]
+    fn scan<const BS: usize>(dq: &[i32]) -> usize {
+        dq[..BS * BS]
+            .chunks_exact(BS)
+            .rposition(|row| row.iter().fold(0i32, |a, &c| a | c) != 0)
+            .unwrap_or(0)
+    }
+    match bs {
+        4 => scan::<4>(dq),
+        8 => scan::<8>(dq),
+        16 => scan::<16>(dq),
+        _ => scan::<32>(dq),
+    }
 }
 
 /// Σ|src − ref| over a 4×4 block (sub-8×8 motion search). Scalar oracle.
