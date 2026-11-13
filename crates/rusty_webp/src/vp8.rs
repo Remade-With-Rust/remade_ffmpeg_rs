@@ -1498,13 +1498,11 @@ impl<R: Read> Vp8Decoder<R> {
             *top = w;
         }
 
-        for y in 0usize..16 {
-            for (ybuf, &ws) in self.frame.ybuf[(mby * 16 + y) * mw * 16 + mbx * 16..][..16]
-                .iter_mut()
-                .zip(ws[(1 + y) * stride + 1..][..16].iter())
-            {
-                *ybuf = ws;
-            }
+        // Store the macroblock: one fixed 16-byte copy per row (the
+        // element-wise zip moved a byte at a time).
+        let rows = self.frame.ybuf[(mby * 16) * mw * 16 + mbx * 16..].chunks_mut(mw * 16);
+        for (dst, src) in rows.zip(ws[stride + 1..].chunks(stride)).take(16) {
+            dst[..16].copy_from_slice(&src[..16]);
         }
     }
 
@@ -1561,15 +1559,8 @@ impl<R: Read> Vp8Decoder<R> {
             let uv_buf_index = (mby * 8 + y) * mw * 8 + mbx * 8;
             let ws_index = (1 + y) * stride + 1;
 
-            for (((ub, vb), &uw), &vw) in self.frame.ubuf[uv_buf_index..][..8]
-                .iter_mut()
-                .zip(self.frame.vbuf[uv_buf_index..][..8].iter_mut())
-                .zip(uws[ws_index..][..8].iter())
-                .zip(vws[ws_index..][..8].iter())
-            {
-                *ub = uw;
-                *vb = vw;
-            }
+            self.frame.ubuf[uv_buf_index..][..8].copy_from_slice(&uws[ws_index..][..8]);
+            self.frame.vbuf[uv_buf_index..][..8].copy_from_slice(&vws[ws_index..][..8]);
         }
     }
 
