@@ -2171,7 +2171,14 @@ pub fn predict_block(
             let (tw, th) = (w + 7, h + 7);
             return TILE.with(|cell| {
                 let mut tile = cell.borrow_mut();
-                gather_tile(refp, bx - 3, by - 3, &mut tile[..], TS, 0..tw, 0..th);
+                // Gather only what the filter will read. The block sits at (3, 3);
+                // a direction with no sub-pel phase is a plain copy with no tap
+                // reach, so its 7 extra columns / rows are never touched. (They
+                // keep whatever an earlier call left there, exactly as the cells
+                // past `tw`/`th` always have.)
+                let cols = if subx { 0..tw } else { 3..3 + w };
+                let rows = if suby { 0..th } else { 3..3 + h };
+                gather_tile(refp, bx - 3, by - 3, &mut tile[..], TS, cols, rows);
                 let tref = RefPlane {
                     buf: &tile[..],
                     stride: TS,
