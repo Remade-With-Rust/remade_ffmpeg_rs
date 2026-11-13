@@ -30,6 +30,13 @@ fn blend_pixel_nonpremult(src: u32, dst: u32) -> u32 {
 
     if src_a == 0 {
         dst
+    } else if src_a == 0xff {
+        // An opaque source replaces the destination: libwebp never blends
+        // such a pixel (`if (src_alpha != 0xff)` in its row blenders). It
+        // must not go through the arithmetic below, either: its
+        // `(1 << 24) / 255` scale rounds down, so every nonzero channel of
+        // an opaque pixel would come out one too low.
+        src
     } else {
         let dst_a = ((dst >> channel_shift(3)) & 0xff) as u8;
         // Approximate integer arithmetic for: dst_factor_a = (dst_a * (255 - src_a)) / 255
@@ -104,6 +111,25 @@ mod tests {
         };
 
         [blend_rgb[0], blend_rgb[1], blend_rgb[2], blend_alpha]
+    }
+
+    /// An opaque source pixel is copied exactly and a transparent one leaves
+    /// the canvas exactly as it was, whatever is underneath.
+    #[test]
+    fn opaque_and_transparent_sources_are_exact() {
+        for v in 0..=255u8 {
+            for under in [
+                [0u8, 0, 0, 0],
+                [255, 255, 255, 255],
+                [v, 7, 200, 128],
+                [3, v, 9, 255],
+            ] {
+                let opaque = [v, 255 - v, v / 2, 255];
+                assert_eq!(do_alpha_blending(opaque, under), opaque);
+                let transparent = [v, 255 - v, v / 2, 0];
+                assert_eq!(do_alpha_blending(transparent, under), under);
+            }
+        }
     }
 
     #[test]
