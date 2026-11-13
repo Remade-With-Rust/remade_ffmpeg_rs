@@ -605,10 +605,12 @@ impl<R: BufRead> LosslessDecoder<R> {
                 index += length;
             } else {
                 //color cache, so use previously stored pixels to get this pixel
-                let color_cache = huffman_info
-                    .color_cache
-                    .as_mut()
-                    .ok_or(DecodingError::BitStreamError)?;
+                // `let ... else`, not `.ok_or(err)?`: the latter builds the
+                // error up front and drops it again for every pixel that
+                // is coded from the cache.
+                let Some(color_cache) = huffman_info.color_cache.as_mut() else {
+                    return Err(DecodingError::BitStreamError);
+                };
                 let color = color_cache.lookup((code - 280).into());
                 data[index * 4..][..4].copy_from_slice(&color);
                 index += 1;
