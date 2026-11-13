@@ -4876,6 +4876,66 @@ impl FrameEncoder {
         sad
     }
 
+    /// [`block_sad_sized`](Self::block_sad_sized) with a whole-window interior
+    /// fast path in front (u8 domain): when the entire block window lies inside
+    /// both planes, every tile would take the same branches — in-source,
+    /// interior, u8 — so that is decided once and the tiles run with nothing per
+    /// tile but the SAD and the early-out. Same tiles, same order, same bound
+    /// test, so the same value.
+    ///
+    /// A separate entry point on purpose. It is for call sites whose candidates
+    /// are mostly interior (the diamond search, the predictor probe). The
+    /// exhaustive sweep already peels its interior runs into x4 batches, so what
+    /// it sends to `block_sad_sized` is mostly edge candidates: with the test in
+    /// front of every call it measured +0.037% at speed 0.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn block_sad_sized_fast(
+        &self,
+        base_x: usize,
+        base_y: usize,
+        mv_r: i32,
+        mv_c: i32,
+        bwl: usize,
+        bhl: usize,
+        bound: i64,
+        ref8: Option<&[u8]>,
+    ) -> i64 {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(r8) = ref8 {
+            let tiles_w = 1usize << bwl.saturating_sub(1);
+            let tiles_h = 1usize << bhl.saturating_sub(1);
+            let step = if tiles_w > 2 || tiles_h > 2 { 2 } else { 1 };
+            let (src, rp) = (&self.src[0], self.aref(0));
+            let (bw_px, bh_px) = (tiles_w * 8, tiles_h * 8);
+            let (x0, y0) = (base_x as i32 + mv_c, base_y as i32 + mv_r);
+            if x0 >= 0
+                && y0 >= 0
+                && x0 as usize + bw_px <= rp.w
+                && y0 as usize + bh_px <= rp.h
+                && base_x + bw_px <= src.w
+                && base_y + bh_px <= src.h
+            {
+                // SAFETY: AVX2 is implied by `ref8` (u8_search); both windows were
+                // just checked to lie inside their planes, whose u8 mirrors have
+                // the same geometry as the u16 planes.
+                return unsafe {
+                    crate::inter::sad_tiles_u8(
+                        self.src8.as_ptr().add(base_y * src.stride + base_x),
+                        src.stride,
+                        r8.as_ptr().add(y0 as usize * rp.stride + x0 as usize),
+                        rp.stride,
+                        tiles_w,
+                        tiles_h,
+                        step,
+                        bound,
+                    )
+                };
+            }
+        }
+        self.block_sad_sized(base_x, base_y, mv_r, mv_c, bwl, bhl, bound, ref8)
+    }
+
     fn block_sad_sized(
         &self,
         base_x: usize,
@@ -5062,7 +5122,8 @@ impl FrameEncoder {
                 self.me_skip
             };
             let (pr, pc) = (predictor.0 / 8, predictor.1 / 8);
-            let psad = self.block_sad_sized(base_x, base_y, pr, pc, swl, shl, i64::MAX, ref8);
+            let psad =
+                self.block_sad_sized_fast(base_x, base_y, pr, pc, swl, shl, i64::MAX, ref8);
             let area = ((1i64 << bwl) * (1i64 << bhl) * 16) as f64; // luma pixels
             if (psad as f64) < t * area {
                 if realtime_skip {
@@ -5186,7 +5247,8 @@ impl FrameEncoder {
                 // the redundant work it saved. The subpel diamond keeps its dedup
                 // because each of its scores is a full MC interpolation.)
                 let consider = |best_sad: &mut i64, best_px: &mut (i32, i32), r: i32, c: i32| {
-                    let sad = self.block_sad_sized(base_x, base_y, r, c, swl, shl, *best_sad, ref8);
+                    let sad =
+                        self.block_sad_sized_fast(base_x, base_y, r, c, swl, shl, *best_sad, ref8);
                     let shorter = r.abs() + c.abs() < best_px.0.abs() + best_px.1.abs();
                     if sad < *best_sad || (sad == *best_sad && shorter) {
                         *best_sad = sad;

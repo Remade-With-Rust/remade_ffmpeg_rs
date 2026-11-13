@@ -525,6 +525,47 @@ pub unsafe fn sad8x8_u8(s: *const u8, ss: usize, r: *const u8, rs: usize) -> u32
     (_mm_cvtsi128_si64(acc) as u32) + (_mm_extract_epi64::<1>(acc) as u32)
 }
 
+/// Sampled-tile SAD of a whole block in the u8 planes: 8x8 tiles at
+/// `(tx * 8, ty * 8)` for `tx`/`ty` stepping by `step`, with the caller's
+/// early-out (`i64::MAX` once the running sum is strictly over `bound`).
+///
+/// The tile loop lives INSIDE the `target_feature` function so `sad8x8_u8`
+/// inlines into it; called per tile from ordinary code it is a real call each
+/// time.
+///
+/// # Safety
+/// AVX2 present; every sampled tile is readable in both planes, i.e. `s` and
+/// `r` cover `tiles_h * 8` rows of `tiles_w * 8` bytes at their strides.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn sad_tiles_u8(
+    s: *const u8,
+    ss: usize,
+    r: *const u8,
+    rs: usize,
+    tiles_w: usize,
+    tiles_h: usize,
+    step: usize,
+    bound: i64,
+) -> i64 {
+    let mut sad = 0i64;
+    let mut ty = 0;
+    while ty < tiles_h {
+        let (s_row, r_row) = (s.add(ty * 8 * ss), r.add(ty * 8 * rs));
+        let mut tx = 0;
+        while tx < tiles_w {
+            sad += sad8x8_u8(s_row.add(tx * 8), ss, r_row.add(tx * 8), rs) as i64;
+            if sad > bound {
+                return i64::MAX;
+            }
+            tx += step;
+        }
+        ty += step;
+    }
+    sad
+}
+
 #[cfg(target_arch = "x86_64")]
 mod u8score {
     // 16-lane pmaddubsw kernels: two 8-px rows per ymm (one per 128-lane).
