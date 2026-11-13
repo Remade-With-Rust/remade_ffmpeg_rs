@@ -1561,6 +1561,33 @@ unsafe fn filter_edge8_avx2<const W: usize, const VERT: bool>(
             st(-(k as isize) - 1, np[k]);
             st(k as isize, nq[k]);
         }
+    } else if W == 4 {
+        // Narrow vertical edge: only p1, p0, q0 and q1 can change, i.e. the four
+        // samples `[-2, 2)` around the edge in each of the 8 rows. Transpose just
+        // those four vectors back (two unpack levels) and store four samples a
+        // row, instead of rebuilding and re-transposing the whole 8-column tile
+        // to write back four columns that did not change.
+        let t0 = _mm256_unpacklo_epi32(np[1], np[0]);
+        let t1 = _mm256_unpackhi_epi32(np[1], np[0]);
+        let t2 = _mm256_unpacklo_epi32(nq[0], nq[1]);
+        let t3 = _mm256_unpackhi_epi32(nq[0], nq[1]);
+        // Rows (0, 4), (1, 5), (2, 6), (3, 7): low lane / high lane.
+        let rows = [
+            _mm256_unpacklo_epi64(t0, t2),
+            _mm256_unpackhi_epi64(t0, t2),
+            _mm256_unpacklo_epi64(t1, t3),
+            _mm256_unpackhi_epi64(t1, t3),
+        ];
+        for (l, v) in rows.iter().enumerate() {
+            let pk = _mm256_packus_epi32(*v, *v);
+            let ra = i as isize + l as isize * ls;
+            let rb = i as isize + (l as isize + 4) * ls;
+            _mm_storel_epi64(bp.offset(ra - 2) as *mut __m128i, _mm256_castsi256_si128(pk));
+            _mm_storel_epi64(
+                bp.offset(rb - 2) as *mut __m128i,
+                _mm256_extracti128_si256::<1>(pk),
+            );
+        }
     } else if n == 4 {
         // rebuild the 8-col tile [p3,p2,p1,p0,q0,q1,q2,q3] with modified values.
         let mut col = [zero; 8];
