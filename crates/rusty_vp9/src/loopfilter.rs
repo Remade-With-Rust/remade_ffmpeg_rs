@@ -110,11 +110,53 @@ fn plane_tx_size(mi: &ModeInfo, ss_x: usize, ss_y: usize) -> usize {
         return tx;
     }
     // uv_txsize: clamp to the max tx of the subsampled block size.
-    let ss_bsize = ss_size_lookup(mi.sb_type as usize, ss_x, ss_y);
-    tx.min(MAX_TXSIZE[ss_bsize] as usize)
+    tx.min(SS_MAX_TX[ss_x & 1][ss_y & 1][mi.sb_type as usize] as usize)
+}
+
+/// `MAX_TXSIZE[ss_size_lookup(bsize, ss_x, ss_y)]` for every block size and
+/// subsampling, built at compile time. The run-time form searched the thirteen
+/// block sizes for the subsampled dimensions on every 8x8 cell of every
+/// subsampled plane. `ss_max_tx_table_matches_lookup` pins it to that search.
+const SS_MAX_TX: [[[u8; 13]; 2]; 2] = build_ss_max_tx();
+
+const fn build_ss_max_tx() -> [[[u8; 13]; 2]; 2] {
+    let mut t = [[[0u8; 13]; 2]; 2];
+    let mut sx = 0;
+    while sx < 2 {
+        let mut sy = 0;
+        while sy < 2 {
+            let mut b = 0;
+            while b < 13 {
+                let mut ssb = b;
+                if sx != 0 || sy != 0 {
+                    let w0 = NUM_4X4_W[b] >> sx;
+                    let h0 = NUM_4X4_H[b] >> sy;
+                    let w = if w0 < 1 { 1 } else { w0 };
+                    let hgt = if h0 < 1 { 1 } else { h0 };
+                    ssb = 0; // BLOCK_4X4 when nothing matches
+                    let mut found = false;
+                    let mut k = 0;
+                    while k < 13 {
+                        if !found && NUM_4X4_W[k] == w && NUM_4X4_H[k] == hgt {
+                            ssb = k;
+                            found = true;
+                        }
+                        k += 1;
+                    }
+                }
+                t[sx][sy][b] = MAX_TXSIZE[ssb] as u8;
+                b += 1;
+            }
+            sy += 1;
+        }
+        sx += 1;
+    }
+    t
 }
 
 /// `ss_size_lookup[bsize][ss_x][ss_y]` for the common 4:2:0/4:2:2/4:4:4 cases.
+/// (The oracle for [`SS_MAX_TX`].)
+#[cfg(test)]
 fn ss_size_lookup(bsize: usize, ss_x: usize, ss_y: usize) -> usize {
     // Map a luma block size to the chroma block size under subsampling.
     // Derived from libvpx ss_size_lookup; BLOCK_INVALID cases clamp to 4x4.
@@ -1681,6 +1723,21 @@ mod tests {
         h.loop_filter_sharpness = sharpness;
         h.lf_delta_enabled = false;
         h
+    }
+
+    #[test]
+    fn ss_max_tx_table_matches_lookup() {
+        for sx in 0..2 {
+            for sy in 0..2 {
+                for b in 0..13 {
+                    assert_eq!(
+                        SS_MAX_TX[sx][sy][b] as usize,
+                        MAX_TXSIZE[ss_size_lookup(b, sx, sy)] as usize,
+                        "bsize {b} ss ({sx},{sy})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
