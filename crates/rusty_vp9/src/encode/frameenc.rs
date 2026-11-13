@@ -6818,8 +6818,9 @@ impl FrameEncoder {
                 .as_ref()
                 .map(|fc| &fc.coef_probs[tx_size][pt][inter])
                 .unwrap_or(default_probs);
-            let mut coef_cnt = [[[0u32; 4]; 6]; 6];
-            let mut eob_cnt = [[0u32; 6]; 6];
+            // Tally straight into the frame counts. `encode_coefs` only ever does
+            // `+= 1` on these, so a zeroed 720-byte local pair plus a 180-add merge
+            // per emitted block computed the same sums the long way round.
             encode_coefs(
                 enc,
                 &levels[..n],
@@ -6830,20 +6831,10 @@ impl FrameEncoder {
                 tx_size,
                 ctx0,
                 &mut token_cache[..n],
-                &mut coef_cnt,
-                &mut eob_cnt,
+                &mut self.counts.coef[tx_size][pt][inter],
+                &mut self.counts.eob_branch[tx_size][pt][inter],
                 8,
             );
-            let cc = &mut self.counts.coef[tx_size][pt][inter];
-            let ec = &mut self.counts.eob_branch[tx_size][pt][inter];
-            for band in 0..6 {
-                for c in 0..6 {
-                    for m in 0..4 {
-                        cc[band][c][m] += coef_cnt[band][c][m];
-                    }
-                    ec[band][c] += eob_cnt[band][c];
-                }
-            }
             0
         } else if let Some(rate) = trellis_rate {
             // The trellis already tracked the exact rate of the final block —
