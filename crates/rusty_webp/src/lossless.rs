@@ -493,9 +493,17 @@ impl<R: BufRead> LosslessDecoder<R> {
             if index >= next_block_start {
                 let x = index % usize::from(width);
                 let y = index / usize::from(width);
-                next_block_start = (x | usize::from(huffman_info.mask)).min(usize::from(width - 1))
-                    + y * usize::from(width)
-                    + 1;
+                next_block_start = if huffman_info.bits == 0 {
+                    // One code group for the whole image: it never changes,
+                    // so this block (two divisions, a group lookup and the
+                    // single-symbol test) runs once instead of once per
+                    // pixel, which is what a block of one pixel meant.
+                    num_values
+                } else {
+                    (x | usize::from(huffman_info.mask)).min(usize::from(width - 1))
+                        + y * usize::from(width)
+                        + 1
+                };
 
                 let huff_index = huffman_info.get_huff_index(x as u16, y as u16);
                 tree = &huffman_info.huffman_code_groups[huff_index];
