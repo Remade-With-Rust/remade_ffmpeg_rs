@@ -1,4 +1,10 @@
 //! Does loop filtering on webp lossy images
+//!
+//! The decoder runs the batched kernels further down. The per-pixel filters
+//! at the top are the specification written out one crossing at a time: they
+//! are kept as the oracles the batched kernels are tested against, and are
+//! otherwise unused.
+#![cfg_attr(not(test), allow(dead_code))]
 
 #[inline]
 fn c(val: i32) -> i32 {

@@ -546,11 +546,6 @@ impl ArithmeticDecoder {
         state_read_bit(&self.chunks, &mut s.state, probability)
     }
 
-    #[inline(always)]
-    pub(crate) fn session_read_flag(&self, s: &mut FastSession) -> bool {
-        state_read_flag(&self.chunks, &mut s.state)
-    }
-
     /// Read a sign flag and return `v` with it applied.
     #[inline(always)]
     pub(crate) fn session_read_signed(&self, s: &mut FastSession, v: i32) -> i32 {

@@ -70,6 +70,24 @@ fn yuv_to_b(y: u8, u: u8) -> u8 {
     clip(mulhi(y, 19077) + mulhi(u, 33050) - 17685)
 }
 
+/// Per-image scratch rows, reused for every row: the full-width chroma of
+/// the row being converted, and the column blend it is interpolated from.
+struct Scratch {
+    u: Vec<u8>,
+    v: Vec<u8>,
+    blend: Vec<u16>,
+}
+
+impl Scratch {
+    fn new(width: usize) -> Self {
+        Self {
+            u: vec![0; width],
+            v: vec![0; width],
+            blend: vec![0; width.div_ceil(2)],
+        }
+    }
+}
+
 /// Fills an rgb buffer with the image from the yuv buffers
 /// Size of the buffer is assumed to be correct
 /// BPP is short for bytes per pixel, allows both rgb and rgba to be decoded
@@ -87,7 +105,7 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
     let chroma_width = width.div_ceil(2);
 
     // Full-width chroma rows for the row being converted, reused for every row.
-    let mut scratch = (vec![0u8; width], vec![0u8; width]);
+    let mut scratch = Scratch::new(width);
 
     // fill top row first since it only uses the top u/v row
     let top_row_y = &y_buffer[..width];
@@ -173,11 +191,12 @@ fn fill_row_fancy_with_2_uv_rows<const BPP: usize>(
     u_row_2: &[u8],
     v_row_1: &[u8],
     v_row_2: &[u8],
-    scratch: &mut (Vec<u8>, Vec<u8>),
+    scratch: &mut Scratch,
 ) {
-    let (u, v) = (&mut scratch.0[..y_row.len()], &mut scratch.1[..y_row.len()]);
-    upsample_row(u_row_1, u_row_2, u);
-    upsample_row(v_row_1, v_row_2, v);
+    let (u, v) = (&mut scratch.u[..y_row.len()], &mut scratch.v[..y_row.len()]);
+    let blend = &mut scratch.blend[..u_row_1.len()];
+    upsample_row(u_row_1, u_row_2, blend, u);
+    upsample_row(v_row_1, v_row_2, blend, v);
     convert_row::<BPP>(row_buffer, y_row, u, v);
 }
 
@@ -188,36 +207,40 @@ fn fill_row_fancy_with_1_uv_row<const BPP: usize>(
     y_row: &[u8],
     u_row: &[u8],
     v_row: &[u8],
-    scratch: &mut (Vec<u8>, Vec<u8>),
+    scratch: &mut Scratch,
 ) {
     fill_row_fancy_with_2_uv_rows::<BPP>(row_buffer, y_row, u_row, u_row, v_row, v_row, scratch);
 }
 
 /// Fancy-upsample one chroma row to the full width `out.len()`. `near` is
 /// the chroma row nearest the luma row being produced, `far` the other one
-/// of the pair; both hold `ceil(width / 2)` samples.
+/// of the pair; both hold `ceil(width / 2)` samples. `blend` is scratch of
+/// that length.
 ///
-/// Pixel 0 and, for even widths, the last pixel sit outside the chroma grid
-/// and mirror their single column; every other pixel pair `(2k+1, 2k+2)`
-/// blends columns `k` and `k+1` of both rows. One zip of plain slices, so
-/// the loop vectorizes.
-fn upsample_row(near: &[u8], far: &[u8], out: &mut [u8]) {
+/// The four-tap weights (9, 3, 3, 1) / 16 are a 3:1 blend down the columns
+/// followed by a 3:1 blend along the row, and the integer sums are the
+/// same: `9a + 3a' + 3b + b' = 3(3a + b) + (3a' + b')`. So the column blend
+/// is computed once per chroma sample, and each output is one more blend of
+/// two of those. Pixel 0 and, for even widths, the last pixel sit outside
+/// the chroma grid and mirror their single column. Plain slices throughout,
+/// so both loops vectorize.
+fn upsample_row(near: &[u8], far: &[u8], blend: &mut [u16], out: &mut [u8]) {
+    for ((b, &n), &f) in blend.iter_mut().zip(near).zip(far) {
+        *b = 3 * u16::from(n) + u16::from(f);
+    }
+
     let width = out.len();
-    out[0] = get_fancy_chroma_value(near[0], near[0], far[0], far[0]);
+    out[0] = ((4 * blend[0] + 8) >> 4) as u8;
 
     let pairs = (width - 1) / 2;
-    let (n0, n1) = (&near[..pairs], &near[1..=pairs]);
-    let (f0, f1) = (&far[..pairs], &far[1..=pairs]);
-    for ((((o, &a0), &a1), &b0), &b1) in
-        out[1..].chunks_exact_mut(2).zip(n0).zip(n1).zip(f0).zip(f1)
-    {
-        o[0] = get_fancy_chroma_value(a0, a1, b0, b1);
-        o[1] = get_fancy_chroma_value(a1, a0, b1, b0);
+    let (b0, b1) = (&blend[..pairs], &blend[1..=pairs]);
+    for ((o, &x0), &x1) in out[1..].chunks_exact_mut(2).zip(b0).zip(b1) {
+        o[0] = ((3 * x0 + x1 + 8) >> 4) as u8;
+        o[1] = ((3 * x1 + x0 + 8) >> 4) as u8;
     }
 
     if width % 2 == 0 {
-        let (a, b) = (near[pairs], far[pairs]);
-        out[width - 1] = get_fancy_chroma_value(a, a, b, b);
+        out[width - 1] = ((4 * blend[pairs] + 8) >> 4) as u8;
     }
 }
 
@@ -305,15 +328,6 @@ fn convert_row<const BPP: usize>(row_buffer: &mut [u8], y: &[u8], u: &[u8], v: &
 }
 
 #[inline]
-fn get_fancy_chroma_value(main: u8, secondary1: u8, secondary2: u8, tertiary: u8) -> u8 {
-    let val0 = u16::from(main);
-    let val1 = u16::from(secondary1);
-    let val2 = u16::from(secondary2);
-    let val3 = u16::from(tertiary);
-    ((9 * val0 + 3 * val1 + 3 * val2 + val3 + 8) / 16) as u8
-}
-
-#[inline]
 fn set_pixel(rgb: &mut [u8], y: u8, u: u8, v: u8) {
     rgb[0] = yuv_to_r(y, v);
     rgb[1] = yuv_to_g(y, u, v);
@@ -332,7 +346,7 @@ pub(crate) fn fill_rgb_buffer_simple<const BPP: usize>(
     buffer_width: usize,
 ) {
     // Full-width chroma rows for the row being converted, reused for every row.
-    let mut scratch = (vec![0u8; width], vec![0u8; width]);
+    let mut scratch = Scratch::new(width);
 
     let u_row_twice_iter = u_buffer
         .chunks_exact(buffer_width / 2)
@@ -365,9 +379,9 @@ fn fill_rgba_row_simple<const BPP: usize>(
     u_vec: &[u8],
     v_vec: &[u8],
     rgba: &mut [u8],
-    scratch: &mut (Vec<u8>, Vec<u8>),
+    scratch: &mut Scratch,
 ) {
-    let (u, v) = (&mut scratch.0[..y_vec.len()], &mut scratch.1[..y_vec.len()]);
+    let (u, v) = (&mut scratch.u[..y_vec.len()], &mut scratch.v[..y_vec.len()]);
     repeat_chroma(u_vec, u);
     repeat_chroma(v_vec, v);
     convert_row::<BPP>(rgba, y_vec, u, v);
