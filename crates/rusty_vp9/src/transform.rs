@@ -984,8 +984,9 @@ pub fn inverse_transform_add_rows(
                 idct_1d(i, o);
             }
         }
-        // Rows past the last non-zero coefficient transform to all-zero.
-        tmp[nz_rows * n..n * n].iter_mut().for_each(|v| *v = 0);
+        // Rows past the last non-zero coefficient transform to all-zero. They
+        // are only zero-padded in the arms below that read them: the DC-collapse
+        // arm reads row 0 alone, and the two gates read `tmp[..n * nz_rows]`.
         // The gate reads the ROW PASS OUTPUT (`tmp`), which is the actual input to
         // the vector butterfly. It is a branchless max-reduction so it vectorizes,
         // and it runs only for 16x16 DCT columns.
@@ -1029,6 +1030,7 @@ pub fn inverse_transform_add_rows(
         let vec_cols32 = false;
 
         if vec_cols32 {
+            tmp[nz_rows * n..n * n].fill(0);
             // SAFETY: AVX2 confirmed and the input bound checked above; tmp holds
             // 1024 i32 and dest covers 32 rows of 32 at `stride`.
             #[cfg(target_arch = "x86_64")]
@@ -1036,6 +1038,7 @@ pub fn inverse_transform_add_rows(
                 idct_avx2::idct32_cols_add(&tmp[..1024], dest, stride, max);
             }
         } else if vec_cols {
+            tmp[nz_rows * n..n * n].fill(0);
             // SAFETY: AVX2 confirmed and the coefficient bound checked above;
             // tmp holds 256 i32 and dest covers 16 rows of 16 at `stride`.
             #[cfg(target_arch = "x86_64")]
@@ -1064,6 +1067,7 @@ pub fn inverse_transform_add_rows(
                 }
             }
         } else {
+            tmp[nz_rows * n..n * n].fill(0);
             let mut col_in = [0i32; 32];
             let mut col_out = [0i32; 32];
             for col in 0..n {
