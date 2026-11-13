@@ -13,6 +13,7 @@
 
 mod adapt;
 mod bitwriter;
+mod blockkern;
 mod compressed;
 mod encoder;
 mod frame;

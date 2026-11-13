@@ -6619,28 +6619,25 @@ impl FrameEncoder {
 
         let n = bs * bs;
         let src = &self.src[plane];
-        // Row-sliced rather than 2-D indexed: the old form recomputed
-        // `(y0+y)*src.stride + x0+x` per pixel and defeated vectorisation across
-        // two different strides. Bounds are checked once per row, and the inner
-        // loop is a flat u16->i32 subtract that LLVM can widen.
-        for y in 0..bs {
-            let s_row = &src.buf[(y0 + y) * src.stride + x0..][..bs];
-            let p_row = &self.rec[plane].buf[dst_off + y * stride..][..bs];
-            let d_row = &mut residual[y * bs..][..bs];
-            for x in 0..bs {
-                d_row[x] = s_row[x] as i32 - p_row[x] as i32;
-            }
-        }
+        // One pass produces the residual AND its energy `Σ residual²`. The energy
+        // used to be re-derived by up to two further walks over `residual` (the
+        // skip-trial prediction SSE and the trellis gate below), and the
+        // subtract itself ran as a scalar loop: its length is a runtime `bs`, so
+        // the 4- and 8-wide blocks never reached LLVM's vector body.
+        let resid_sse = super::blockkern::residual_and_sse(
+            &src.buf[y0 * src.stride + x0..],
+            src.stride,
+            &self.rec[plane].buf[dst_off..],
+            stride,
+            bs,
+            &mut residual[..n],
+        );
         // Prediction-only SSE (Σ(src−pred)² = Σ residual²) — the distortion if this
         // block were coded `skip`. Accumulated on the measuring trial only (the
         // force_skip re-run re-uses the captured value). Same pixels the recon SSE
         // below sums, so the two are directly RD-comparable.
         if self.skip_trial && !self.force_skip {
-            let mut psse = 0u64;
-            for &r in &residual[..n] {
-                psse += (r as i64 * r as i64) as u64;
-            }
-            self.pending_pred_sse += psse;
+            self.pending_pred_sse += resid_sse;
         }
 
         // ---- forward transform + quantize (inter / lossless / chroma / 32×32
@@ -6761,10 +6758,7 @@ impl FrameEncoder {
         // trellis is load-bearing for our quality (libvpx compensates elsewhere in realtime).
         let trellis_gated = trellis_here && self.use_trellis && eob > 0 && {
             if self.trellis_mse_t > 0.0 {
-                let mut rss = 0i64;
-                for &r in &residual[..n] {
-                    rss += (r as i64) * (r as i64);
-                }
+                let rss = resid_sse as i64; // Σ residual², from the residual pass
                 let qstep = (dq.1 >> 3).max(1) as i64;
                 (rss as f64) <= (n as f64) * ((qstep * qstep) as f64) * self.trellis_mse_t
             } else {
