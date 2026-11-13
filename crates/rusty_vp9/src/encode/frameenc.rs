@@ -7387,6 +7387,10 @@ impl FrameEncoder {
         }
         let mut best = (0u32, self.luma_sse_of(&self.rec[0].buf));
         let mut c0 = self.rec[0].buf.clone();
+        // The filtered luma of the best level so far. Each candidate is filtered
+        // in full to be scored, so the winner's luma already exists by the time
+        // it wins: keep it instead of filtering luma once more at the end.
+        let mut best_luma: Vec<u16> = Vec::new();
         let coarse: &[u32] = if std::env::var("VP9_LF_COARSE").is_ok() {
             &[8, 16, 24, 32]
         } else {
@@ -7401,6 +7405,7 @@ impl FrameEncoder {
             let sse = self.lf_luma_sse(h, &mut c0, lvl, masks);
             if sse < best.1 {
                 best = (lvl, sse);
+                keep_luma(&mut best_luma, &mut c0);
             }
         }
         if std::env::var("VP9_LF_COARSE").is_err() {
@@ -7414,6 +7419,7 @@ impl FrameEncoder {
                     let sse = self.lf_luma_sse(h, &mut c0, cand, masks);
                     if sse < best.1 {
                         best = (cand, sse);
+                        keep_luma(&mut best_luma, &mut c0);
                     }
                 }
             }
@@ -7453,13 +7459,35 @@ impl FrameEncoder {
         self.lf_level = best.0;
         if best.0 > 0 {
             let [p0, p1, p2] = &mut self.rec;
+            // Luma: the winning candidate's filtered plane, already computed.
+            // Chroma: filtered here (the search is luma-only). The planes are
+            // filtered independently, so this equals one three-plane call.
+            debug_assert_eq!(best_luma.len(), p0.buf.len());
+            #[cfg(debug_assertions)]
+            {
+                let mut chk = p0.buf.clone();
+                let mut planes = [(&mut chk[..], p0.stride, p0.ss_x, p0.ss_y)];
+                loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
+                assert!(chk == best_luma, "kept luma is not the best level's filter output");
+            }
+            p0.buf.copy_from_slice(&best_luma);
             let mut planes = [
-                (&mut p0.buf[..], p0.stride, p0.ss_x, p0.ss_y),
                 (&mut p1.buf[..], p1.stride, p1.ss_x, p1.ss_y),
                 (&mut p2.buf[..], p2.stride, p2.ss_x, p2.ss_y),
             ];
             loop_filter_frame(&mut planes, &self.mi, self.mi_rows, self.mi_cols, h);
         }
+    }
+}
+
+/// Stash the candidate luma in `c0` as the best so far. The first keep copies
+/// (it sizes `best`); later keeps just swap the two buffers, since the next
+/// candidate overwrites all of `c0` anyway.
+fn keep_luma(best: &mut Vec<u16>, c0: &mut Vec<u16>) {
+    if best.len() == c0.len() {
+        std::mem::swap(best, c0);
+    } else {
+        best.clone_from(c0);
     }
 }
 
