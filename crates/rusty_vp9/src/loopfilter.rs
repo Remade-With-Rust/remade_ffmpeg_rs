@@ -377,11 +377,16 @@ fn build_sb_masks(
     let mut v8 = [0u32; MI_BLOCK_SIZE];
     let mut v4 = [0u32; MI_BLOCK_SIZE];
 
+    // The cells of this superblock row that lie inside the frame.
+    let n_cols = MI_BLOCK_SIZE.min(mi_cols - mi_col);
     let mut r = 0;
     while r < MI_BLOCK_SIZE && mi_row + r < mi_rows {
+        // One slice (one bounds proof) per superblock row; the per-cell form
+        // recomputed the 2-D index and re-checked it for every cell.
+        let mi_row_cells = &mi_grid[(mi_row + r) * mi_cols + mi_col..][..n_cols];
         let mut c = 0;
-        while c < MI_BLOCK_SIZE && mi_col + c < mi_cols {
-            let mi = &mi_grid[(mi_row + r) * mi_cols + (mi_col + c)];
+        while c < n_cols {
+            let mi = &mi_row_cells[c];
             let sb_type = mi.sb_type as usize;
             let skip_this = mi.skip && mi.is_inter;
             let block_edge_left = if NUM_4X4_W[sb_type] > 1 {
