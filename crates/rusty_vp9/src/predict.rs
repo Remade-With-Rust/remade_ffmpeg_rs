@@ -89,9 +89,14 @@ fn h_pred(dst: &mut [u16], stride: usize, bs: usize, left: &[u16]) {
 
 fn tm_pred(dst: &mut [u16], stride: usize, bs: usize, above: &[u16], left: &[u16], max: i32) {
     let tl = a(above, -1) as i32;
+    let ab = &above[1..1 + bs];
     for r in 0..bs {
-        for c in 0..bs {
-            *d(dst, stride, r, c) = clip(left[r] as i32 + a(above, c as i32) as i32 - tl, max);
+        // Per row `left[r] - tl` is a constant; the row is that plus `above`,
+        // clamped. On slices the loop has no per-sample index arithmetic or
+        // bounds check and vectorises.
+        let base = left[r] as i32 - tl;
+        for (o, &av) in dst[r * stride..][..bs].iter_mut().zip(ab) {
+            *o = clip(base + av as i32, max);
         }
     }
 }
