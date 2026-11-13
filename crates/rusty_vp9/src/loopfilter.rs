@@ -488,6 +488,7 @@ fn apply_sb_masks(
     mi_row: usize,
     mi_col: usize,
     bd: i32,
+    avx2: bool,
 ) {
     let row_step = 1 << ss_y;
     let (v16, v8, v4) = (&m.v16, &m.v8, &m.v4);
@@ -513,6 +514,7 @@ fn apply_sb_masks(
             &lf.thr,
             &lfl[r << 3..],
             bd,
+            avx2,
         );
         r += row_step;
     }
@@ -541,6 +543,7 @@ fn apply_sb_masks(
             &lf.thr,
             &lfl[r << 3..],
             bd,
+            avx2,
         );
         r += row_step;
     }
@@ -559,6 +562,7 @@ fn filter_selectively_vert(
     thr: &[Thresh],
     lfl: &[u8],
     bd: i32,
+    avx2: bool,
 ) {
     let mut col = 0;
     let mut any = m16 | m8 | m4 | m4i;
@@ -567,14 +571,14 @@ fn filter_selectively_vert(
         let x = base_x + col * 8;
         let base = y * stride + x;
         if m16 & 1 != 0 {
-            apply_vert(buf, base, stride, 16, t, bd);
+            apply_edge::<16, true>(buf, base, stride, t, bd, avx2);
         } else if m8 & 1 != 0 {
-            apply_vert(buf, base, stride, 8, t, bd);
+            apply_edge::<8, true>(buf, base, stride, t, bd, avx2);
         } else if m4 & 1 != 0 {
-            apply_vert(buf, base, stride, 4, t, bd);
+            apply_edge::<4, true>(buf, base, stride, t, bd, avx2);
         }
         if m4i & 1 != 0 {
-            apply_vert(buf, base + 4, stride, 4, t, bd);
+            apply_edge::<4, true>(buf, base + 4, stride, t, bd, avx2);
         }
         col += 1;
         m16 >>= 1;
@@ -598,6 +602,7 @@ fn filter_selectively_horiz(
     thr: &[Thresh],
     lfl: &[u8],
     bd: i32,
+    avx2: bool,
 ) {
     let mut col = 0;
     let mut any = m16 | m8 | m4 | m4i;
@@ -606,19 +611,19 @@ fn filter_selectively_horiz(
         let x = base_x + col * 8;
         let base = y * stride + x;
         if m16 & 1 != 0 {
-            apply_horiz(buf, base, stride, 16, t, bd);
+            apply_edge::<16, false>(buf, base, stride, t, bd, avx2);
         } else if m8 & 1 != 0 {
-            apply_horiz(buf, base, stride, 8, t, bd);
+            apply_edge::<8, false>(buf, base, stride, t, bd, avx2);
             if m4i & 1 != 0 {
-                apply_horiz(buf, base + 4 * stride, stride, 4, t, bd);
+                apply_edge::<4, false>(buf, base + 4 * stride, stride, t, bd, avx2);
             }
         } else if m4 & 1 != 0 {
-            apply_horiz(buf, base, stride, 4, t, bd);
+            apply_edge::<4, false>(buf, base, stride, t, bd, avx2);
             if m4i & 1 != 0 {
-                apply_horiz(buf, base + 4 * stride, stride, 4, t, bd);
+                apply_edge::<4, false>(buf, base + 4 * stride, stride, t, bd, avx2);
             }
         } else if m4i & 1 != 0 {
-            apply_horiz(buf, base + 4 * stride, stride, 4, t, bd);
+            apply_edge::<4, false>(buf, base + 4 * stride, stride, t, bd, avx2);
         }
         col += 1;
         m16 >>= 1;
@@ -651,12 +656,37 @@ fn filter_edge8(
     // AVX2: horizontal edges (lane_stride == 1) gather/scatter contiguously;
     // vertical edges transpose an 8×8 (or 8×16) tile in-register.
     #[cfg(target_arch = "x86_64")]
-    if std::is_x86_feature_detected!("avx2") {
+    if std::is_x86_feature_detected!("avx2") && (lane_stride == 1 || pos_stride == 1) {
+        let horiz = lane_stride == 1;
+        let stride = if horiz { pos_stride } else { lane_stride };
         // SAFETY: AVX2 confirmed; the caller's mask guarantees the p7..q7 read
         // window (along `pos_stride`, 8 lanes along `lane_stride`) is in-bounds.
-        unsafe { filter_edge8_avx2(buf, i, pos_stride, lane_stride, width, t, bd) };
+        unsafe {
+            match (width >= 16, width >= 8, horiz) {
+                (true, _, true) => filter_edge8_avx2::<16, false>(buf, i, stride, t, bd),
+                (false, true, true) => filter_edge8_avx2::<8, false>(buf, i, stride, t, bd),
+                (false, false, true) => filter_edge8_avx2::<4, false>(buf, i, stride, t, bd),
+                (true, _, false) => filter_edge8_avx2::<16, true>(buf, i, stride, t, bd),
+                (false, true, false) => filter_edge8_avx2::<8, true>(buf, i, stride, t, bd),
+                (false, false, false) => filter_edge8_avx2::<4, true>(buf, i, stride, t, bd),
+            }
+        }
         return;
     }
+    filter_edge8_portable(buf, i, pos_stride, lane_stride, width, t, bd);
+}
+
+/// The portable (auto-vectorised) body of [`filter_edge8`].
+#[allow(clippy::needless_range_loop)]
+fn filter_edge8_portable(
+    buf: &mut [u16],
+    i: usize,
+    pos_stride: usize,
+    lane_stride: usize,
+    width: usize,
+    t: &Thresh,
+    bd: i32,
+) {
     let base = 1i32 << (bd - 1);
     let ft = 1i32 << (bd - 8); // flat threshold
     let (lim, blimit, hev_thr) = (t.lim, t.mblim, t.hev_thr);
@@ -1070,6 +1100,7 @@ unsafe fn transpose8(r: &mut [std::arch::x86_64::__m256i; 8]) {
 /// `p0..p6` and `q0..q6`; unmodified positions equal their input.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn lf_core8(
     p: &[std::arch::x86_64::__m256i; 8],
     q: &[std::arch::x86_64::__m256i; 8],
@@ -1380,16 +1411,19 @@ fn p_to_arr(p: &[std::arch::x86_64::__m256i; 8]) -> &[std::arch::x86_64::__m256i
 /// AVX2 present; the p7..q7 window in-bounds (caller's mask guarantees it).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn filter_edge8_avx2(
+unsafe fn filter_edge8_avx2<const W: usize, const VERT: bool>(
     buf: &mut [u16],
     i: usize,
-    pos_stride: usize,
-    lane_stride: usize,
-    width: usize,
+    stride: usize,
     t: &Thresh,
     bd: i32,
 ) {
     use std::arch::x86_64::*;
+    // One monomorph per (width class, orientation): the width tests, the tap
+    // count, the store count and the contiguous/transposed choice below are all
+    // compile-time constants in each, instead of branches taken per edge.
+    let width = W;
+    let (pos_stride, lane_stride) = if VERT { (1usize, stride) } else { (stride, 1usize) };
     let bp = buf.as_mut_ptr();
     let ls = lane_stride as isize;
     let ps = pos_stride as isize;
@@ -1517,14 +1551,47 @@ unsafe fn filter_edge8_avx2(
     }
 }
 
-/// Vertical edge (filter across columns): 8 (or 16) pixels down the edge.
-fn apply_vert(buf: &mut [u16], base: usize, stride: usize, width: usize, t: &Thresh, bd: i32) {
-    filter_edge8(buf, base, 1, stride, width, t, bd);
+/// Filter one 8-sample edge of width class `W` (4, 8 or 16). `VERT` is a
+/// vertical edge (filter across columns, samples down the edge); otherwise a
+/// horizontal one.
+///
+/// `avx2` is decided ONCE per frame by the caller. The wrapper this replaces
+/// probed the CPU feature and made an out-of-line call for every edge.
+#[inline(always)]
+fn apply_edge<const W: usize, const VERT: bool>(
+    buf: &mut [u16],
+    base: usize,
+    stride: usize,
+    t: &Thresh,
+    bd: i32,
+    avx2: bool,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if avx2 {
+        // SAFETY: `avx2` is only true when the feature was detected; the
+        // caller's mask guarantees the p7..q7 window is in bounds.
+        unsafe { filter_edge8_avx2::<W, VERT>(buf, base, stride, t, bd) };
+        return;
+    }
+    let _ = avx2;
+    if VERT {
+        filter_edge8_portable(buf, base, 1, stride, W, t, bd);
+    } else {
+        filter_edge8_portable(buf, base, stride, 1, W, t, bd);
+    }
 }
 
-/// Horizontal edge (filter across rows): 8 pixels along the edge.
-fn apply_horiz(buf: &mut [u16], base: usize, stride: usize, width: usize, t: &Thresh, bd: i32) {
-    filter_edge8(buf, base, stride, 1, width, t, bd);
+/// Whether the AVX2 edge kernels may be used (checked once per frame).
+#[inline]
+fn lf_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -1636,6 +1703,7 @@ pub fn loop_filter_frame(
     }
     let lf = build_lf_info(h);
     let bd = h.bit_depth.max(8) as i32;
+    let avx2 = lf_avx2();
     let mut mi_row = 0;
     while mi_row < mi_rows {
         let mut mi_col = 0;
@@ -1662,7 +1730,7 @@ pub fn loop_filter_frame(
                 let base_y = (mi_row * 8) >> *ss_y;
                 apply_sb_masks(
                     buf, *stride, base_x, base_y, *ss_y, &lf, masks, &masks.lfl, mi_rows, mi_row,
-                    mi_col, bd,
+                    mi_col, bd, avx2,
                 );
             }
             mi_col += MI_BLOCK_SIZE;
@@ -1742,6 +1810,7 @@ pub fn loop_filter_plane_masked(
     };
     let lf = build_lf_info(h);
     let bd = h.bit_depth.max(8) as i32;
+    let avx2 = lf_avx2();
     // Every mask bit belongs to a block at the uniform level, so the per-8x8
     // level map the masks were built with is this constant wherever it is read.
     let lfl = [level; MI_BLOCK_SIZE * MI_BLOCK_SIZE];
@@ -1757,6 +1826,7 @@ pub fn loop_filter_plane_masked(
             let base_y = (mi_row * 8) >> masks.ss_y;
             apply_sb_masks(
                 buf, stride, base_x, base_y, masks.ss_y, &lf, m, &lfl, mi_rows, mi_row, mi_col, bd,
+                avx2,
             );
             mi_col += MI_BLOCK_SIZE;
         }
