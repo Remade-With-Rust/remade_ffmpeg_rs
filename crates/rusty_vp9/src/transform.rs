@@ -843,6 +843,15 @@ pub fn inverse_transform_add(
     inverse_transform_add_rows(coeffs, n, tx_type, dest, stride, max, n)
 }
 
+/// Whether the `VP9_GATEPROBE` measurement tap is enabled. Read once per
+/// process: the tap sits on the 16x16 inverse-transform path, and looking the
+/// variable up there meant an environment scan on every such block.
+#[cfg(target_arch = "x86_64")]
+fn gateprobe() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var_os("VP9_GATEPROBE").is_some())
+}
+
 /// Like [`inverse_transform_add`] but only the first `nz_rows` coefficient rows
 /// are known to be non-zero (the sparse-EOB fast path) — the remaining rows are
 /// all-zero, so their 1-D transform is zero and the row pass skips them. Output
@@ -891,7 +900,7 @@ pub fn inverse_transform_add_rows(
     let nz_rows = nz_rows.clamp(1, n);
     // TEMP measurement: how often would each candidate 16x16 gate reject?
     #[cfg(target_arch = "x86_64")]
-    if n == 16 && !col_adst && std::env::var_os("VP9_GATEPROBE").is_some() {
+    if n == 16 && !col_adst && gateprobe() {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         pub static G: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
         let cmax = coeffs[..16 * nz_rows]
