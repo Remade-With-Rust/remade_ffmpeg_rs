@@ -129,7 +129,10 @@ impl<'a> BoolDecoder<'a> {
     }
 
     /// Decode one boolean with probability `prob` (1..=255 of 256).
-    #[inline]
+    ///
+    /// `inline(always)`: about 25 instructions, and with a plain `#[inline]`
+    /// the mode-info and header parsers kept it as a call per bool.
+    #[inline(always)]
     pub fn read_bool(&mut self, prob: u8) -> u32 {
         let split = (self.range * prob as u32 + (256 - prob as u32)) >> 8;
         if self.count < 0 {
