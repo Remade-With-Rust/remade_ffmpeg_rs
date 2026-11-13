@@ -421,6 +421,52 @@ unsafe fn conv8_v_block_avx2(
     }
 }
 
+/// Full-pel prediction: copy a `w x h` block of samples.
+///
+/// The block widths motion compensation uses are 4, 8, 16, 32 and 64, so each
+/// row is one to four fixed-width vector moves. As `copy_nonoverlapping(.., w)`
+/// with a runtime `w` it was a real `memcpy` call per row (1.7M of them on a
+/// 60-frame 720p decode).
+///
+/// # Safety
+/// AVX2 required. Rows `0..h` of `src` (at `ss`) readable and of `dst` (at
+/// `ds`) writable for `w` samples each; the two blocks do not overlap.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_block_avx2(src: *const u16, ss: usize, dst: *mut u16, ds: usize, w: usize, h: usize) {
+    use std::arch::x86_64::*;
+    match w {
+        4 => {
+            for y in 0..h {
+                let v = (src.add(y * ss) as *const u64).read_unaligned();
+                (dst.add(y * ds) as *mut u64).write_unaligned(v);
+            }
+        }
+        8 => {
+            for y in 0..h {
+                let v = _mm_loadu_si128(src.add(y * ss) as *const __m128i);
+                _mm_storeu_si128(dst.add(y * ds) as *mut __m128i, v);
+            }
+        }
+        16 | 32 | 64 => {
+            for y in 0..h {
+                let (s, d) = (src.add(y * ss), dst.add(y * ds));
+                let mut x = 0;
+                while x < w {
+                    let v = _mm256_loadu_si256(s.add(x) as *const __m256i);
+                    _mm256_storeu_si256(d.add(x) as *mut __m256i, v);
+                    x += 16;
+                }
+            }
+        }
+        _ => {
+            for y in 0..h {
+                std::ptr::copy_nonoverlapping(src.add(y * ss), dst.add(y * ds), w);
+            }
+        }
+    }
+}
+
 /// A/B switch for the clamped-tile edge path (DEFAULT ON; set to disable).
 #[cfg(target_arch = "x86_64")]
 fn no_edge_tile() -> bool {
@@ -1760,14 +1806,13 @@ unsafe fn predict_block_avx2(
     let dptr = dst.as_mut_ptr();
     match (subx, suby) {
         (false, false) => {
-            for y in 0..h {
-                let s = buf.add((by as usize + y) * stride + bx as usize);
-                let d = dptr.add(y * dst_stride);
-                if avg {
-                    avg8_avx2(s, d, w);
-                } else {
-                    std::ptr::copy_nonoverlapping(s, d, w);
+            let s0 = buf.add(by as usize * stride + bx as usize);
+            if avg {
+                for y in 0..h {
+                    avg8_avx2(s0.add(y * stride), dptr.add(y * dst_stride), w);
                 }
+            } else {
+                copy_block_avx2(s0, stride, dptr, dst_stride, w, h);
             }
         }
         (true, false) => {
