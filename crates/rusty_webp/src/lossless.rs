@@ -711,9 +711,11 @@ struct ColorCache {
 impl ColorCache {
     #[inline(always)]
     fn insert(&mut self, color: [u8; 4]) {
-        let [r, g, b, a] = color;
-        let color_u32 =
-            (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b)) | (u32::from(a) << 24);
+        // The hash key is the pixel as ARGB. Read big-endian the RGBA bytes
+        // are `r g b a` from the top; rotating right one byte moves the
+        // alpha to the top: two instructions instead of four byte
+        // extensions, three shifts and three ORs.
+        let color_u32 = u32::from_be_bytes(color).rotate_right(8);
         let index = (0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits);
         self.color_cache[index as usize] = color;
     }
