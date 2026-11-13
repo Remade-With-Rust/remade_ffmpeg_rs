@@ -6912,18 +6912,14 @@ impl FrameEncoder {
         // widen. The i32 product cannot overflow: pixels are <= 16-bit, so the
         // squared difference is < 2^32 and 1024 of them still fit in u64.
         let src = &self.src[plane];
-        let rec = &self.rec[plane].buf;
-        let mut sse = 0u64;
-        for y in 0..bs {
-            let s_row = &src.buf[(y0 + y) * src.stride + x0..][..bs];
-            let r_row = &rec[dst_off + y * stride..][..bs];
-            let mut acc = 0u64;
-            for x in 0..bs {
-                let d = s_row[x] as i64 - r_row[x] as i64;
-                acc += (d * d) as u64;
-            }
-            sse += acc;
-        }
+        let sse = super::blockkern::block_sse(
+            &src.buf[y0 * src.stride + x0..],
+            src.stride,
+            &self.rec[plane].buf[dst_off..],
+            stride,
+            bs,
+            bs,
+        );
         self.tx_scratch = Some(scratch);
         (bits, sse)
     }
