@@ -513,35 +513,64 @@ struct Hists {
     extra_bits: u64,
 }
 
-/// Walk the tokens as the decoder will see them, maintaining the cache model,
-/// and count every symbol that would be written.
-fn histogram(toks: &[Tok], px: &[u32], cache_bits: u8) -> Hists {
-    let cache_size = if cache_bits > 0 {
-        1usize << cache_bits
-    } else {
-        0
-    };
-    let mut h = Hists {
-        green: vec![0; 256 + 24 + cache_size],
-        red: vec![0; 256],
-        blue: vec![0; 256],
-        alpha: vec![0; 256],
-        dist: vec![0; 40],
-        extra_bits: 0,
-    };
-    let mut cache = (cache_bits > 0).then(|| CacheModel::new(cache_bits));
+/// Colour-cache sizes (in bits; 0 = no cache) the encoder chooses between.
+const CACHE_CANDIDATES: [u8; 5] = [0, 4, 6, 8, 10];
+
+impl Hists {
+    fn new(cache_bits: u8) -> Self {
+        let cache_size = if cache_bits > 0 {
+            1usize << cache_bits
+        } else {
+            0
+        };
+        Self {
+            green: vec![0; 256 + 24 + cache_size],
+            red: vec![0; 256],
+            blue: vec![0; 256],
+            alpha: vec![0; 256],
+            dist: vec![0; 40],
+            extra_bits: 0,
+        }
+    }
+}
+
+/// Walk the tokens as the decoder will see them and count every symbol that
+/// would be written, for each of [`CACHE_CANDIDATES`] at once: one cache
+/// model per candidate, all fed from a single pass. (A pass per candidate
+/// walked the tokens, re-derived every prefix code and re-read every copied
+/// pixel five times.)
+fn histograms(toks: &[Tok], px: &[u32]) -> [Hists; 5] {
+    let mut hists = CACHE_CANDIDATES.map(Hists::new);
+    // the models of candidates 1.. (candidate 0 has no cache)
+    let mut caches = [
+        CacheModel::new(CACHE_CANDIDATES[1]),
+        CacheModel::new(CACHE_CANDIDATES[2]),
+        CacheModel::new(CACHE_CANDIDATES[3]),
+        CacheModel::new(CACHE_CANDIDATES[4]),
+    ];
     let mut pos = 0usize;
     for tok in toks {
         match *tok {
             Tok::Lit(v) => {
-                if let Some(idx) = cache.as_ref().and_then(|c| c.hit(v)) {
-                    h.green[280 + idx] += 1;
-                } else {
-                    h.green[(v >> 8) as u8 as usize] += 1;
-                    h.red[(v >> 16) as u8 as usize] += 1;
-                    h.blue[v as u8 as usize] += 1;
-                    h.alpha[(v >> 24) as u8 as usize] += 1;
-                    if let Some(c) = cache.as_mut() {
+                let g = (v >> 8) as u8 as usize;
+                let r = (v >> 16) as u8 as usize;
+                let b = v as u8 as usize;
+                let a = (v >> 24) as u8 as usize;
+
+                let (plain, cached) = hists.split_at_mut(1);
+                let h = &mut plain[0];
+                h.green[g] += 1;
+                h.red[r] += 1;
+                h.blue[b] += 1;
+                h.alpha[a] += 1;
+                for (h, c) in cached.iter_mut().zip(&mut caches) {
+                    if let Some(idx) = c.hit(v) {
+                        h.green[280 + idx] += 1;
+                    } else {
+                        h.green[g] += 1;
+                        h.red[r] += 1;
+                        h.blue[b] += 1;
+                        h.alpha[a] += 1;
                         c.insert(v);
                     }
                 }
@@ -550,11 +579,13 @@ fn histogram(toks: &[Tok], px: &[u32], cache_bits: u8) -> Hists {
             Tok::Copy { len, dist_code } => {
                 let (ls, le, _) = prefix_encode(len);
                 let (ds, de, _) = prefix_encode(dist_code);
-                h.green[256 + ls as usize] += 1;
-                h.dist[ds as usize] += 1;
-                h.extra_bits += u64::from(le) + u64::from(de);
-                if let Some(c) = cache.as_mut() {
-                    for &v in &px[pos..pos + len as usize] {
+                for h in &mut hists {
+                    h.green[256 + ls as usize] += 1;
+                    h.dist[ds as usize] += 1;
+                    h.extra_bits += u64::from(le) + u64::from(de);
+                }
+                for &v in &px[pos..pos + len as usize] {
+                    for c in &mut caches {
                         c.insert(v);
                     }
                 }
@@ -562,7 +593,7 @@ fn histogram(toks: &[Tok], px: &[u32], cache_bits: u8) -> Hists {
             }
         }
     }
-    h
+    hists
 }
 
 /// Shannon estimate of the coded size (bits) for one histogram set — used
@@ -874,8 +905,7 @@ fn write_backref_stream<W: Write>(
     let toks = tokenize(px, width);
 
     let mut best: Option<(u8, f64, Hists)> = None;
-    for bits in [0u8, 4, 6, 8, 10] {
-        let h = histogram(&toks, px, bits);
+    for (bits, h) in CACHE_CANDIDATES.into_iter().zip(histograms(&toks, px)) {
         let cost = estimate_bits(&h);
         if best.as_ref().is_none_or(|(_, c, _)| cost < *c) {
             best = Some((bits, cost, h));
