@@ -4,6 +4,12 @@ All notable changes to this crate. Security-relevant changes are listed first in
 each release, under **Security**. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.12](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-mp3-v1.0.11...rff-codec-mp3-v1.0.12) - 2026-11-13
+
+### Other
+
+- updated the following local packages: rff-core, rff-codec, rusty_mp3
+
 ## [1.0.11](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-mp3-v1.0.10...rff-codec-mp3-v1.0.11) - 2026-11-08
 
 ### Other

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.15](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-targets-v0.2.14...rff-targets-v0.2.15) - 2026-11-13
+
+### Other
+
+- updated the following local packages: rff-core, rff-codec, rff-format
+
 ## [0.2.14](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-targets-v0.2.13...rff-targets-v0.2.14) - 2026-11-08
 
 ### Other
