@@ -24,38 +24,122 @@
 //! The fragmented profile lives in [`fmp4`] (init/media segments) and powers
 //! the DASH VOD muxer in [`dash`].
 
+#[cfg(test)]
+mod container_tests;
 pub mod dash;
+mod entry;
 pub mod fmp4;
 
 use std::borrow::Cow;
 use std::io::{BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 
-use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result};
+use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result, Timecode};
+
+use entry::PcmLayout;
 use rff_format::{
     Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, ReadSeek, SeekInput,
     SeekOutput, Stream,
 };
 
-/// Register the MP4 format into a [`FormatRegistry`].
+/// What the `mp4` (ISO) muxer carries. H.264 and AAC lead: callers that pick
+/// a container's first codec of a media type get the widely playable pair.
+const MP4_CODECS: &[CodecId] = &[
+    CodecId::H264,
+    CodecId::Avif,
+    CodecId::Vp9,
+    CodecId::Apv,
+    CodecId::Aac,
+    CodecId::Opus,
+    CodecId::Flac,
+    CodecId::Alac,
+    CodecId::Ac3,
+    CodecId::Eac3,
+];
+
+/// What the `mov` (QuickTime) muxer carries: the same, plus the professional
+/// intermediates that only QuickTime defines entries for.
+const MOV_CODECS: &[CodecId] = &[
+    CodecId::H264,
+    CodecId::ProRes,
+    CodecId::DnxHd,
+    CodecId::Avif,
+    CodecId::Vp9,
+    CodecId::Apv,
+    CodecId::Aac,
+    CodecId::Pcm,
+    CodecId::Opus,
+    CodecId::Flac,
+    CodecId::Alac,
+    CodecId::Ac3,
+    CodecId::Eac3,
+];
+
+/// Which member of the family a muxer writes. The demuxer reads both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum Flavor {
+    /// ISO base media (`isom` brand, `nclx`).
+    #[default]
+    Mp4,
+    /// QuickTime (`qt  ` brand, `mhlr` handlers, `nclc`, `twos`/`lpcm`,
+    /// ProRes / DNx entries).
+    Mov,
+}
+
+impl Flavor {
+    fn codecs(self) -> &'static [CodecId] {
+        match self {
+            Flavor::Mp4 => MP4_CODECS,
+            Flavor::Mov => MOV_CODECS,
+        }
+    }
+
+    fn ftyp(self) -> Vec<u8> {
+        bx(
+            b"ftyp",
+            match self {
+                Flavor::Mp4 => FTYP_BODY,
+                Flavor::Mov => FTYP_QT_BODY,
+            },
+        )
+    }
+}
+
+/// Register the MP4 and MOV formats into a [`FormatRegistry`].
 pub fn register(registry: &mut FormatRegistry) {
     registry.register(Format {
         name: "mp4",
-        long_name: "MP4 / MOV (ISO Base Media File Format)",
-        extensions: &["mp4", "mov", "m4a", "m4v"],
+        long_name: "MP4 (ISO Base Media File Format)",
+        extensions: &["mp4", "m4a", "m4v"],
         demuxer: Some(|input| Box::new(Mp4Demuxer::new(input))),
-        muxer: Some(|output| Box::new(Mp4Muxer::new(output))),
+        muxer: Some(|output| Box::new(Mp4Muxer::with_flavor(output, Flavor::Mp4))),
         muxer_path: None,
         probe: Some(probe_mp4),
-        mux_caps: MuxCaps::container(&[CodecId::H264, CodecId::Avif, CodecId::Aac, CodecId::Opus]),
+        mux_caps: MuxCaps::container(MP4_CODECS),
     });
     // With a seekable source (a local file) read only `moov` and fetch each
     // sample on demand; the plain factory above is the pipe/stream fallback.
     registry.register_seekable_demuxer("mp4", |input| Box::new(Mp4Demuxer::new_seekable(input)));
     // Writing a file (seekable): stream `mdat` and put `moov` last, instead of
     // holding the whole output until the trailer (#28). The plain factory above
-    // still serves pipes and sockets. `.mov`/`.m4a`/`.m4v` resolve to "mp4" by
-    // extension, so they all take this path.
-    registry.register_seekable_muxer("mp4", |output| Box::new(Mp4StreamMuxer::new(output)));
+    // still serves pipes and sockets.
+    registry.register_seekable_muxer("mp4", |output| {
+        Box::new(Mp4StreamMuxer::with_flavor(output, Flavor::Mp4))
+    });
+    // QuickTime: the same demuxer, a muxer writing QuickTime's entries.
+    registry.register(Format {
+        name: "mov",
+        long_name: "QuickTime / MOV",
+        extensions: &["mov", "qt"],
+        demuxer: Some(|input| Box::new(Mp4Demuxer::new(input))),
+        muxer: Some(|output| Box::new(Mp4Muxer::with_flavor(output, Flavor::Mov))),
+        muxer_path: None,
+        probe: Some(probe_mov),
+        mux_caps: MuxCaps::container(MOV_CODECS),
+    });
+    registry.register_seekable_demuxer("mov", |input| Box::new(Mp4Demuxer::new_seekable(input)));
+    registry.register_seekable_muxer("mov", |output| {
+        Box::new(Mp4StreamMuxer::with_flavor(output, Flavor::Mov))
+    });
     registry.register(Format {
         name: "dash",
         long_name: "DASH (static MPD + fMP4 segments)",
@@ -83,6 +167,17 @@ fn probe_mp4(data: &[u8]) -> i32 {
     }
 }
 
+/// Sniff QuickTime: an `ftyp` whose major brand is `qt  ` (outbidding
+/// [`probe_mp4`]), or a classic QuickTime file that starts with a movie,
+/// media or padding atom and has no `ftyp`.
+fn probe_mov(data: &[u8]) -> i32 {
+    match data.get(4..8) {
+        Some(b"ftyp") if data.get(8..12) == Some(b"qt  ") => 95,
+        Some(b"moov" | b"mdat" | b"wide" | b"pnot") => 60,
+        _ => 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Byte / box helpers
 // ---------------------------------------------------------------------------
@@ -104,6 +199,11 @@ fn be64(b: &[u8], o: usize) -> u64 {
 /// Parse sibling boxes in `buf` into `(type, payload)` pairs, handling the
 /// 64-bit `largesize` and `size == 0` (to-end) forms.
 fn child_boxes(buf: &[u8]) -> Vec<([u8; 4], &[u8])> {
+    boxes_at(buf).into_iter().map(|(t, _, p)| (t, p)).collect()
+}
+
+/// [`child_boxes`], also giving each box's start offset within `buf`.
+fn boxes_at(buf: &[u8]) -> Vec<([u8; 4], usize, &[u8])> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 8 <= buf.len() {
@@ -125,7 +225,7 @@ fn child_boxes(buf: &[u8]) -> Vec<([u8; 4], &[u8])> {
         if end > buf.len() || end <= i || start > end {
             break;
         }
-        out.push((typ, &buf[start..end]));
+        out.push((typ, i, &buf[start..end]));
         i = end;
     }
     out
@@ -177,6 +277,9 @@ struct Mp4Demuxer {
     samples: Vec<SampleLoc>,
     /// Indexed by stream_index; `Some` for H.264 tracks needing conversion.
     avc: Vec<Option<AvcConfig>>,
+    /// Indexed by stream_index; `Some` for PCM tracks, whose on-disk byte
+    /// order or signedness may differ from rff's little-endian formats.
+    pcm: Vec<Option<PcmLayout>>,
     pos: usize,
 }
 
@@ -196,13 +299,15 @@ impl Mp4Demuxer {
             src,
             samples: Vec::new(),
             avc: Vec::new(),
+            pcm: Vec::new(),
             pos: 0,
         }
     }
 
-    /// Build streams + the file-ordered sample table from a `moov` payload.
-    fn parse_moov(&mut self, moov: &[u8]) -> Result<Vec<Stream>> {
-        let moov_children = child_boxes(moov);
+    /// Build streams + the file-ordered sample table from `moov` (and the
+    /// fragments' `moof`s), and say which timecode samples to read.
+    fn parse_moov(&mut self, top: &TopLevel) -> Result<(Vec<Stream>, Vec<PendingTimecode>)> {
+        let moov_children = child_boxes(&top.moov);
         // Movie timescale (mvhd), the unit of edit-list segment durations.
         let movie_timescale = find(&moov_children, b"mvhd").map_or(0, |mvhd| {
             if mvhd.first() == Some(&1) {
@@ -211,8 +316,12 @@ impl Mp4Demuxer {
                 be32(mvhd, 12)
             }
         });
+        let defaults = track_defaults(&moov_children);
         let mut streams = Vec::new();
         let mut tracks: Vec<Vec<SampleLoc>> = Vec::new();
+        let mut frags: Vec<FragTrack> = Vec::new();
+        let mut tmcd_refs: Vec<Vec<u32>> = Vec::new();
+        let mut timecodes: Vec<(u32, Timecode, u64)> = Vec::new();
         // FFmpeg's `advanced_editlist`: on until a track has no `stts` entries (a
         // fragmented file's empty `moov`), then off for that track and every later one.
         let mut advanced_editlist = true;
@@ -224,15 +333,66 @@ impl Mp4Demuxer {
                 advanced_editlist = false;
             }
             let timing = (movie_timescale, advanced_editlist);
-            if let Some((stream, samples, avc)) = parse_track(trak, streams.len(), timing) {
-                streams.push(stream);
-                tracks.push(samples);
-                self.avc.push(avc);
+            match parse_track(trak, streams.len(), timing, top.qt) {
+                Some(Parsed::Media(t)) => {
+                    frags.push(FragTrack {
+                        track_id: t.track_id,
+                        audio: t.stream.media_type == MediaType::Audio,
+                        offset: t.frag_offset,
+                        end: t.end,
+                        defaults: defaults
+                            .iter()
+                            .find(|(id, _)| *id == t.track_id)
+                            .map(|(_, d)| *d)
+                            .unwrap_or_default(),
+                    });
+                    streams.push(t.stream);
+                    tracks.push(t.samples);
+                    self.avc.push(t.avc);
+                    self.pcm.push(t.pcm);
+                    tmcd_refs.push(t.tmcd_refs);
+                }
+                Some(Parsed::Timecode {
+                    track_id,
+                    timecode,
+                    sample_offset,
+                }) => timecodes.push((track_id, timecode, sample_offset)),
+                None => {}
             }
         }
         if streams.is_empty() {
             return Err(Error::unsupported("mp4 demux: no usable tracks"));
         }
+        // A fragmented file's samples live in its `moof`s, after the (empty) index.
+        append_fragments(&top.moofs, &mut frags, &mut tracks);
+        for (stream, samples) in streams.iter_mut().zip(&tracks) {
+            stream.nb_frames = Some(samples.len() as u64);
+            if stream.duration.is_none() && !samples.is_empty() {
+                let total: i64 = samples.iter().map(|s| s.duration).sum();
+                stream.duration = (total > 0).then_some(total);
+            }
+        }
+        // A timecode track times the track that references it (`tref/tmcd`);
+        // unreferenced, it belongs to the first video track (camera files).
+        let pending = timecodes
+            .into_iter()
+            .map(|(id, timecode, offset)| {
+                let stream = tmcd_refs
+                    .iter()
+                    .position(|r| r.contains(&id))
+                    .or_else(|| {
+                        streams
+                            .iter()
+                            .position(|s| s.media_type == MediaType::Video)
+                    })
+                    .unwrap_or(0);
+                PendingTimecode {
+                    stream,
+                    timecode,
+                    offset,
+                }
+            })
+            .collect();
         // Yield samples in file order (natural interleave), each track's in its own
         // order: an edit list can replay samples, so a track's index isn't always in
         // offset order.
@@ -246,17 +406,93 @@ impl Mp4Demuxer {
             let loc = &tracks[t][i];
             self.samples.push(SampleLoc { ..*loc });
         }
-        Ok(streams)
+        Ok((streams, pending))
     }
 }
 
+/// A timecode track's start frame still to be read from `mdat`.
+struct PendingTimecode {
+    /// The stream it is attached to.
+    stream: usize,
+    timecode: Timecode,
+    /// File offset of the 4-byte frame number.
+    offset: u64,
+}
+
+impl PendingTimecode {
+    /// Attach the timecode once its 4-byte sample is read (a missing or short
+    /// sample leaves the stream without one rather than guessing).
+    fn apply(self, streams: &mut [Stream], sample: Option<&[u8]>) {
+        let Some(&[a, b, c, d]) = sample else { return };
+        if let Some(s) = streams.get_mut(self.stream) {
+            s.timecode = Some(Timecode {
+                start_frame: u32::from_be_bytes([a, b, c, d]),
+                ..self.timecode
+            });
+        }
+    }
+}
+
+/// The top-level boxes the demuxer reads: `moov`, every `moof` (with its file
+/// offset, which `trun` data offsets count from), and whether the file is
+/// QuickTime (from `ftyp`), which decides how sound descriptions are laid out.
+struct TopLevel {
+    qt: bool,
+    moov: Vec<u8>,
+    moofs: Vec<(u64, Vec<u8>)>,
+}
+
+/// QuickTime or ISO, as FFmpeg's `isom` flag: an `ftyp` whose major brand is
+/// not `qt  ` makes an ISO file unless `qt  ` is among its compatible brands;
+/// no `ftyp` at all is classic QuickTime.
+fn is_quicktime(ftyp: Option<&[u8]>) -> bool {
+    match ftyp {
+        None => true,
+        Some(f) => {
+            f.get(..4) == Some(b"qt  ")
+                || f.get(8..)
+                    .is_some_and(|c| c.chunks_exact(4).any(|b| b == b"qt  "))
+        }
+    }
+}
+
+/// The top-level boxes of a fully buffered file.
+fn top_level(buf: &[u8]) -> Result<TopLevel> {
+    let top = boxes_at(buf);
+    let moov = top
+        .iter()
+        .find(|(t, _, _)| t == b"moov")
+        .map(|(_, _, p)| p.to_vec())
+        .ok_or_else(|| Error::invalid("mp4 demux: no `moov`"))?;
+    let ftyp = top
+        .iter()
+        .find(|(t, _, _)| t == b"ftyp")
+        .map(|(_, _, p)| *p);
+    let moofs = top
+        .iter()
+        .filter(|(t, _, _)| t == b"moof")
+        .map(|(_, at, p)| (*at as u64, p.to_vec()))
+        .collect();
+    Ok(TopLevel {
+        qt: is_quicktime(ftyp),
+        moov,
+        moofs,
+    })
+}
+
+/// The largest `ftyp` or `moof` read into memory: index boxes are small, and
+/// a corrupt size must not become a giant allocation.
+const MAX_INDEX_BOX: u64 = 64 << 20;
+
 /// Walk the top-level boxes of a seekable file by header alone — seeking past
-/// `mdat` and everything else — and return the `moov` payload. Box framing
-/// matches [`child_boxes`]: 64-bit `largesize`, `size == 0` meaning "to end of
-/// file", and a box that is malformed or overruns the file ends the walk.
-fn read_moov(input: &mut dyn ReadSeek) -> Result<Vec<u8>> {
+/// `mdat` and everything else — and read `ftyp`, `moov` and every `moof`. Box
+/// framing matches [`child_boxes`]: 64-bit `largesize`, `size == 0` meaning
+/// "to end of file", and a box that is malformed or overruns the file ends
+/// the walk.
+fn read_top_level(input: &mut dyn ReadSeek) -> Result<TopLevel> {
     let file_len = input.seek(SeekFrom::End(0))?;
     let mut pos = 0u64;
+    let (mut ftyp, mut moov, mut moofs) = (None, None, Vec::new());
     while pos.saturating_add(8) <= file_len {
         input.seek(SeekFrom::Start(pos))?;
         let mut hdr = [0u8; 16];
@@ -278,18 +514,31 @@ fn read_moov(input: &mut dyn ReadSeek) -> Result<Vec<u8>> {
             Some(end) if size >= header_len && end <= file_len => end,
             _ => break,
         };
-        if &typ == b"moov" {
-            let len = size - header_len;
-            let mut moov = Vec::new();
-            input.take(len).read_to_end(&mut moov)?;
-            if moov.len() as u64 != len {
-                return Err(Error::invalid("mp4 demux: truncated `moov`"));
+        let len = size - header_len;
+        let wanted = match &typ {
+            b"moov" if moov.is_none() => true,
+            b"ftyp" | b"moof" => len <= MAX_INDEX_BOX,
+            _ => false,
+        };
+        if wanted {
+            let mut body = Vec::new();
+            input.take(len).read_to_end(&mut body)?;
+            if body.len() as u64 != len {
+                return Err(Error::invalid("mp4 demux: truncated index box"));
             }
-            return Ok(moov);
+            match &typ {
+                b"moov" => moov = Some(body),
+                b"ftyp" => ftyp = Some(body),
+                _ => moofs.push((pos, body)),
+            }
         }
         pos = end;
     }
-    Err(Error::invalid("mp4 demux: no `moov`"))
+    Ok(TopLevel {
+        qt: is_quicktime(ftyp.as_deref()),
+        moov: moov.ok_or_else(|| Error::invalid("mp4 demux: no `moov`"))?,
+        moofs,
+    })
 }
 
 impl Demuxer for Mp4Demuxer {
@@ -298,16 +547,24 @@ impl Demuxer for Mp4Demuxer {
             Source::Stream(mut input) => {
                 let mut buf = Vec::new();
                 input.read_to_end(&mut buf)?;
-                let top = child_boxes(&buf);
-                let moov =
-                    find(&top, b"moov").ok_or_else(|| Error::invalid("mp4 demux: no `moov`"))?;
-                let streams = self.parse_moov(moov)?;
+                let (mut streams, timecodes) = self.parse_moov(&top_level(&buf)?)?;
+                for tc in timecodes {
+                    let at = usize::try_from(tc.offset).unwrap_or(usize::MAX);
+                    let sample = buf.get(at..at.saturating_add(4));
+                    tc.apply(&mut streams, sample);
+                }
                 self.src = Source::Buffered(buf);
                 Ok(streams)
             }
             Source::Seekable(mut input) => {
-                let moov = read_moov(&mut input)?;
-                let streams = self.parse_moov(&moov)?;
+                let top = read_top_level(&mut input)?;
+                let (mut streams, timecodes) = self.parse_moov(&top)?;
+                for tc in timecodes {
+                    let mut sample = [0u8; 4];
+                    let ok = input.seek(SeekFrom::Start(tc.offset)).is_ok()
+                        && input.read_exact(&mut sample).is_ok();
+                    tc.apply(&mut streams, ok.then_some(&sample[..]));
+                }
                 // The reader's position is wherever the moov walk left it;
                 // start from an unknown position so the first sample seeks.
                 self.src = Source::Random {
@@ -368,7 +625,13 @@ impl Demuxer for Mp4Demuxer {
                 out
             }
             // A sample read from a seekable file is moved, not copied.
-            None => raw.into_owned(),
+            None => {
+                let mut data = raw.into_owned();
+                if let Some(Some(pcm)) = self.pcm.get(loc.stream_index) {
+                    pcm.convert(&mut data);
+                }
+                data
+            }
         };
 
         let mut packet = Packet::from_data(loc.stream_index, data);
@@ -391,14 +654,54 @@ fn stts_entries(trak: &[u8]) -> u32 {
     stts.unwrap_or(0)
 }
 
+/// One `trak`, as the demuxer uses it.
+enum Parsed {
+    Media(Box<MediaTrack>),
+    /// A QuickTime timecode track: not a stream of its own, but the start
+    /// timecode of the track that references it.
+    Timecode {
+        track_id: u32,
+        timecode: Timecode,
+        sample_offset: u64,
+    },
+}
+
+struct MediaTrack {
+    stream: Stream,
+    samples: Vec<SampleLoc>,
+    avc: Option<AvcConfig>,
+    pcm: Option<PcmLayout>,
+    track_id: u32,
+    /// Timecode tracks this one references (`tref/tmcd`).
+    tmcd_refs: Vec<u32>,
+    /// What fragment decode times are shifted by (the edit list's offset).
+    frag_offset: i64,
+    /// Decode time where the sample table ends: a fragment without `tfdt`
+    /// continues from here.
+    end: i64,
+}
+
 /// Build a [`Stream`] + sample list + optional H.264 config from one `trak`.
-/// `timing` is the movie timescale and whether FFmpeg's `advanced_editlist` is on.
-fn parse_track(
-    trak: &[u8],
-    index: usize,
-    timing: (u32, bool),
-) -> Option<(Stream, Vec<SampleLoc>, Option<AvcConfig>)> {
+/// `timing` is the movie timescale and whether FFmpeg's `advanced_editlist` is
+/// on; `qt` whether the file is QuickTime (sound description layout).
+fn parse_track(trak: &[u8], index: usize, timing: (u32, bool), qt: bool) -> Option<Parsed> {
     let trak_children = child_boxes(trak);
+    let track_id = find(&trak_children, b"tkhd").map_or(0, |t| {
+        if t.first() == Some(&1) {
+            be32(t, 20)
+        } else {
+            be32(t, 12)
+        }
+    });
+    let tmcd_refs: Vec<u32> = find(&trak_children, b"tref")
+        .map(|tref| {
+            child_boxes(tref)
+                .iter()
+                .filter(|(t, _)| t == b"tmcd")
+                .flat_map(|(_, p)| p.chunks_exact(4).map(|c| be32(c, 0)))
+                .collect()
+        })
+        .unwrap_or_default();
     let mdia = child_boxes(find(&trak_children, b"mdia")?);
     let hdlr = find(&mdia, b"hdlr")?;
     // FullBox(4) + pre_defined(4) → handler_type fourcc.
@@ -423,8 +726,29 @@ fn parse_track(
 
     let stsd = find(&stbl, b"stsd")?;
     let fourcc: [u8; 4] = stsd.get(12..16)?.try_into().ok()?; // entry format
-    let codec_id = map_codec(&fourcc);
+                                                              // The first entry's payload, bounded by its declared size.
+    let entry_end = 8usize
+        .saturating_add(be32(stsd, 8) as usize)
+        .min(stsd.len());
+    let entry = stsd.get(16..entry_end).unwrap_or(&[]);
 
+    if &handler == b"tmcd" || &fourcc == b"tmcd" {
+        let timecode = entry::parse_tmcd_entry(entry)?;
+        let first_chunk = match find(&stbl, b"stco") {
+            Some(stco) if be32(stco, 4) > 0 => u64::from(be32(stco, 8)),
+            _ => match find(&stbl, b"co64") {
+                Some(co64) if be32(co64, 4) > 0 => be64(co64, 8),
+                _ => return None,
+            },
+        };
+        return Some(Parsed::Timecode {
+            track_id,
+            timecode,
+            sample_offset: first_chunk,
+        });
+    }
+
+    let mut codec_id = entry::map_codec(&fourcc);
     let mut stream = Stream::new(index, codec_id);
     stream.media_type = match &handler {
         b"vide" => MediaType::Video,
@@ -432,25 +756,60 @@ fn parse_track(
         _ => codec_id.media_type(),
     };
     stream.time_base = Rational::new(1, timescale as i32);
+    if fourcc.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        stream.codec_tag = Some(fourcc);
+    }
 
-    // Codec dimensions / audio params from the sample entry (entry starts at 8).
+    // Codec dimensions / audio params from the sample entry.
+    let mut pcm = None;
     if stream.media_type == MediaType::Video {
-        stream.width = be16(stsd, 8 + 32);
-        stream.height = be16(stsd, 8 + 34);
+        stream.width = be16(entry, 24);
+        stream.height = be16(entry, 26);
+        if let Some(children) = entry.get(entry::VISUAL_CHILDREN..) {
+            entry::read_visual_children(&mut stream, children);
+        }
     } else if stream.media_type == MediaType::Audio {
-        stream.channels = be16(stsd, 8 + 24) as u16;
-        stream.sample_rate = be32(stsd, 8 + 32) >> 16;
-        // AAC: the AudioSpecificConfig lives in an `esds` child box (the
-        // AudioSampleEntry's children start 28 bytes into its content).
-        if codec_id == CodecId::Aac {
-            if let Some(after) = stsd.get(8 + 36..) {
-                if let Some((_, esds)) = child_boxes(after).iter().find(|(t, _)| t == b"esds") {
-                    if let Some(asc) = parse_esds(esds) {
+        // FFmpeg's rule for the QuickTime v1/v2 layout: a QuickTime file, or
+        // an `stsd` of version 0 (ISO's v1 entries come with an `stsd` v1).
+        let qt_layout = qt || stsd.first() == Some(&0);
+        let a = entry::parse_audio_entry(entry, qt_layout);
+        stream.channels = a.channels.min(u32::from(u16::MAX)) as u16;
+        stream.sample_rate = a.sample_rate;
+        match codec_id {
+            // The AudioSpecificConfig lives in `esds`; MP3 in MP4 is `mp4a`
+            // with an MPEG-1/2 audio object type.
+            CodecId::Aac => {
+                if let Some(esds) = a.child(b"esds") {
+                    if matches!(esds_object_type(esds), Some(0x69 | 0x6B)) {
+                        codec_id = CodecId::Mp3;
+                    } else if let Some(asc) = parse_esds(esds) {
                         stream.extradata = asc;
                     }
                 }
             }
+            CodecId::Flac => {
+                if let Some(si) = a.child(b"dfLa").and_then(entry::dfla_extradata) {
+                    stream.extradata = si;
+                }
+            }
+            // The ALAC magic cookie, inside a FullBox of the same name.
+            CodecId::Alac => {
+                if let Some(cookie) = a.child(b"alac").and_then(|p| p.get(4..)) {
+                    stream.extradata = cookie.to_vec();
+                }
+            }
+            CodecId::Ac3 => stream.extradata = a.child(b"dac3").unwrap_or(&[]).to_vec(),
+            CodecId::Eac3 => stream.extradata = a.child(b"dec3").unwrap_or(&[]).to_vec(),
+            CodecId::Pcm => {
+                pcm = entry::pcm_layout(&fourcc, &a);
+                match pcm {
+                    Some(layout) => stream.sample_format = Some(layout.format),
+                    None => codec_id = CodecId::None,
+                }
+            }
+            _ => {}
         }
+        stream.codec_id = codec_id;
     }
 
     // H.264 / HEVC: pull the config record (a child of the visual sample
@@ -482,10 +841,218 @@ fn parse_track(
         edits,
         advanced_editlist,
     };
-    let samples = build_samples(&stbl, index, &timing)?;
+    let samples = build_samples(&stbl, index, &timing, pcm.map(|p| p.frame_bytes))?;
     stream.duration = duration; // already in mdhd-timescale = time_base units
     stream.nb_frames = Some(samples.len() as u64);
-    Some((stream, samples, avc))
+    let frag_offset = time_offset(&timing);
+    let end = samples.last().map_or(0, |s| {
+        s.dts.saturating_add(frag_offset).saturating_add(s.duration)
+    });
+    Some(Parsed::Media(Box::new(MediaTrack {
+        stream,
+        samples,
+        avc,
+        pcm,
+        track_id,
+        tmcd_refs,
+        frag_offset,
+        end,
+    })))
+}
+
+/// The MPEG-4 `objectTypeIndication` of an `esds` (0x40 AAC, 0x69 / 0x6B
+/// MPEG-2 / MPEG-1 audio).
+fn esds_object_type(esds: &[u8]) -> Option<u8> {
+    let mut p = 4; // version/flags
+    while p < esds.len() {
+        let tag = esds[p];
+        p += 1;
+        // Skip the expandable length (up to 4 bytes).
+        let mut len = 0usize;
+        for _ in 0..4 {
+            let b = *esds.get(p)?;
+            p += 1;
+            len = (len << 7) | usize::from(b & 0x7F);
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        match tag {
+            0x03 => p += 3,
+            0x04 => return esds.get(p).copied(),
+            _ => p = p.saturating_add(len),
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Fragmented MP4 (moof / traf / trun)
+// ---------------------------------------------------------------------------
+
+/// `trex` (or `tfhd`) defaults for a track's fragment samples.
+#[derive(Clone, Copy, Default)]
+struct TrackDefaults {
+    duration: u32,
+    size: u32,
+    flags: u32,
+}
+
+/// What [`append_fragments`] needs per stream.
+struct FragTrack {
+    track_id: u32,
+    audio: bool,
+    offset: i64,
+    end: i64,
+    defaults: TrackDefaults,
+}
+
+/// `mvex/trex` defaults by track id.
+fn track_defaults(moov_children: &[([u8; 4], &[u8])]) -> Vec<(u32, TrackDefaults)> {
+    let Some(mvex) = find(moov_children, b"mvex") else {
+        return Vec::new();
+    };
+    child_boxes(mvex)
+        .into_iter()
+        .filter(|(t, p)| t == b"trex" && p.len() >= 24)
+        .map(|(_, p)| {
+            (
+                be32(p, 4),
+                TrackDefaults {
+                    duration: be32(p, 12),
+                    size: be32(p, 16),
+                    flags: be32(p, 20),
+                },
+            )
+        })
+        .collect()
+}
+
+/// `sample_is_non_sync_sample` and `sample_depends_on == 1` in fragment
+/// sample flags: either makes a video sample a non-keyframe (FFmpeg's rule).
+const FRAG_NON_SYNC: u32 = 0x0001_0000;
+const FRAG_DEPENDS_YES: u32 = 0x0100_0000;
+
+/// Append every `moof`'s samples (in file order) to their tracks, timed as
+/// FFmpeg's `mov_read_trun` times them: from the fragment's `tfdt` when it
+/// has one, else continuing from the track's last sample, less the edit
+/// list's offset; `pts` adds the `trun` composition offset.
+fn append_fragments(
+    moofs: &[(u64, Vec<u8>)],
+    frags: &mut [FragTrack],
+    tracks: &mut [Vec<SampleLoc>],
+) {
+    for (moof_offset, moof) in moofs {
+        // Without an explicit base, each `traf`'s data follows the previous
+        // one's (the first starting at the `moof` itself).
+        let mut implicit = *moof_offset;
+        for (typ, traf) in child_boxes(moof) {
+            if &typ != b"traf" {
+                continue;
+            }
+            let kids = child_boxes(traf);
+            let Some(tfhd) = find(&kids, b"tfhd") else {
+                continue;
+            };
+            let flags = be32(tfhd, 0) & 0x00FF_FFFF;
+            let track_id = be32(tfhd, 4);
+            let Some(t) = frags.iter().position(|f| f.track_id == track_id) else {
+                continue;
+            };
+            let mut at = 8;
+            let mut field = |present: bool, wide: bool| -> Option<u64> {
+                if !present {
+                    return None;
+                }
+                let v = if wide {
+                    be64(tfhd, at)
+                } else {
+                    u64::from(be32(tfhd, at))
+                };
+                at += if wide { 8 } else { 4 };
+                Some(v)
+            };
+            let base = field(flags & 0x1 != 0, true);
+            let _description = field(flags & 0x2 != 0, false);
+            let d = frags[t].defaults;
+            let duration = field(flags & 0x8 != 0, false).map_or(d.duration, |v| v as u32);
+            let size = field(flags & 0x10 != 0, false).map_or(d.size, |v| v as u32);
+            let sample_flags = field(flags & 0x20 != 0, false).map_or(d.flags, |v| v as u32);
+            let base = match base {
+                Some(b) => b,
+                None if flags & 0x2_0000 != 0 => *moof_offset, // default-base-is-moof
+                None => implicit,
+            };
+            if let Some(tfdt) = find(&kids, b"tfdt") {
+                frags[t].end = if tfdt.first() == Some(&1) {
+                    be64(tfdt, 4) as i64
+                } else {
+                    i64::from(be32(tfdt, 4))
+                };
+            }
+            let mut cursor = base;
+            for (typ, trun) in &kids {
+                if typ != b"trun" {
+                    continue;
+                }
+                let tf = be32(trun, 0) & 0x00FF_FFFF;
+                let mut q = 8;
+                if tf & 0x1 != 0 {
+                    cursor = base.wrapping_add(i64::from(be32(trun, q) as i32) as u64);
+                    q += 4;
+                }
+                let first_flags = (tf & 0x4 != 0).then(|| {
+                    q += 4;
+                    be32(trun, q - 4)
+                });
+                let fields = [0x100, 0x200, 0x400, 0x800]
+                    .iter()
+                    .filter(|&&bit| tf & bit != 0)
+                    .count();
+                let room = trun.len().saturating_sub(q);
+                let count = be32(trun, 4) as usize;
+                let count = if fields == 0 {
+                    count.min(MAX_INDEX_ENTRIES)
+                } else {
+                    count.min(room / (4 * fields))
+                };
+                let samples = &mut tracks[t];
+                for i in 0..count {
+                    if samples.len() >= MAX_INDEX_ENTRIES {
+                        return;
+                    }
+                    let mut next = |bit: u32| -> Option<u32> {
+                        (tf & bit != 0).then(|| {
+                            q += 4;
+                            be32(trun, q - 4)
+                        })
+                    };
+                    let dur = next(0x100).unwrap_or(duration);
+                    let len = next(0x200).unwrap_or(size);
+                    let mut sflags = next(0x400).unwrap_or(sample_flags);
+                    if i == 0 && tf & 0x400 == 0 {
+                        sflags = first_flags.unwrap_or(sflags);
+                    }
+                    // Read signed whatever the box version, as FFmpeg does.
+                    let cto = next(0x800).map_or(0, |v| i64::from(v as i32));
+                    let f = &mut frags[t];
+                    let dts = f.end.saturating_sub(f.offset);
+                    samples.push(SampleLoc {
+                        stream_index: t,
+                        offset: usize::try_from(cursor).unwrap_or(usize::MAX),
+                        size: len as usize,
+                        dts,
+                        pts: dts.saturating_add(cto),
+                        duration: i64::from(dur),
+                        keyframe: f.audio || sflags & (FRAG_NON_SYNC | FRAG_DEPENDS_YES) == 0,
+                    });
+                    cursor = cursor.saturating_add(u64::from(len));
+                    f.end = f.end.saturating_add(i64::from(dur));
+                }
+            }
+            implicit = cursor;
+        }
+    }
 }
 
 /// Extract the AudioSpecificConfig (DecoderSpecificInfo, tag 0x05) from an
@@ -516,17 +1083,6 @@ fn parse_esds(esds: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
-}
-
-fn map_codec(fourcc: &[u8; 4]) -> CodecId {
-    match fourcc {
-        b"avc1" | b"avc3" => CodecId::H264,
-        b"hvc1" | b"hev1" => CodecId::Hevc,
-        b"av01" => CodecId::Avif, // AV1 video — decoded by our rav1d-backed codec
-        b"Opus" => CodecId::Opus,
-        b"mp4a" => CodecId::Aac,
-        _ => CodecId::None,
-    }
 }
 
 /// What a track's timestamps depend on beyond its sample table.
@@ -774,6 +1330,7 @@ fn build_samples(
     stbl: &[([u8; 4], &[u8])],
     stream_index: usize,
     timing: &TrackTiming,
+    pcm_frame_bytes: Option<usize>,
 ) -> Option<Vec<SampleLoc>> {
     let stsz = find(stbl, b"stsz")?;
     let stsc = find(stbl, b"stsc")?;
@@ -831,6 +1388,24 @@ fn build_samples(
             .find(|(first, _)| *first <= chunk_1based)
             .map_or(0, |(_, spc)| *spc)
     };
+
+    // Uncompressed audio counts one `stsz` sample per PCM frame — millions of
+    // them, each a few bytes. As FFmpeg does, such a track is read a chunk at
+    // a time: one packet per chunk, its frames sized by the PCM layout (QuickTime
+    // writers put 1 in `stsz` as often as the real frame size).
+    let chunk_mode = pcm_frame_bytes.filter(|_| uniform != 0);
+    if let Some(frame_bytes) = chunk_mode {
+        let total = u64::from(be32(stsz, 8));
+        let samples = pcm_chunks(
+            &chunk_offsets,
+            &samples_in_chunk,
+            total,
+            stts,
+            frame_bytes,
+            stream_index,
+        );
+        return Some(index_samples(samples, timing, &[], false, 0));
+    }
 
     // Walk chunks, laying out samples sequentially within each. The capacity is
     // only a hint (bounded so a huge uniform sample_count can't pre-allocate GBs);
@@ -923,9 +1498,88 @@ fn build_samples(
         None => samples.iter_mut().for_each(|s| s.keyframe = true),
     }
 
-    // FFmpeg's index starts at -dts_shift, then (mov_build_index) without
-    // advanced_editlist moves by the edit's offset, or (mov_fix_index) is rebuilt
-    // by the edit list. pts = dts + dts_shift + composition offset.
+    Some(index_samples(
+        samples, timing, &offsets, has_ctts, dts_shift,
+    ))
+}
+
+/// One packet per chunk for a PCM track whose `stsz` counts frames: each
+/// chunk's frames sized by `frame_bytes`, timed by `stts` (usually one frame
+/// per tick at the sample rate).
+fn pcm_chunks(
+    chunk_offsets: &[u64],
+    samples_in_chunk: &dyn Fn(u32) -> u32,
+    total: u64,
+    stts: &[u8],
+    frame_bytes: usize,
+    stream_index: usize,
+) -> Vec<SampleLoc> {
+    let entries = (be32(stts, 4) as usize).min(stts.len().saturating_sub(8) / 8);
+    let (mut e, mut left, mut delta) = (0usize, 0u64, 1i64);
+    let (mut dts, mut remaining) = (0i64, total);
+    let mut out = Vec::with_capacity(chunk_offsets.len().min(1 << 16));
+    for (ci, &offset) in chunk_offsets.iter().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+        let n = u64::from(samples_in_chunk(ci as u32 + 1)).min(remaining);
+        let Some(size) = usize::try_from(n)
+            .ok()
+            .and_then(|n| n.checked_mul(frame_bytes))
+        else {
+            break;
+        };
+        if n == 0 {
+            continue;
+        }
+        remaining -= n;
+        let start = dts;
+        let mut need = n;
+        while need > 0 {
+            if left == 0 {
+                if e < entries {
+                    left = u64::from(be32(stts, 8 + 8 * e));
+                    delta = i64::from(be32(stts, 12 + 8 * e));
+                    e += 1;
+                    continue;
+                }
+                // Past the table: keep the last delta for the rest.
+                left = need;
+            }
+            let take = need.min(left);
+            dts = dts.saturating_add(delta.saturating_mul(take as i64));
+            need -= take;
+            left -= take;
+        }
+        out.push(SampleLoc {
+            stream_index,
+            offset: usize::try_from(offset).unwrap_or(usize::MAX),
+            size,
+            dts: start,
+            pts: start,
+            duration: dts - start,
+            keyframe: true,
+        });
+    }
+    out
+}
+
+/// A track's final index: FFmpeg's index starts at -dts_shift, then
+/// (mov_build_index) without advanced_editlist moves by the edit's offset, or
+/// (mov_fix_index) is rebuilt by the edit list. pts = dts + dts_shift +
+/// composition offset.
+fn index_samples(
+    samples: Vec<SampleLoc>,
+    timing: &TrackTiming,
+    offsets: &[i64],
+    has_ctts: bool,
+    dts_shift: i64,
+) -> Vec<SampleLoc> {
+    let offsets: Vec<i64> = if offsets.len() == samples.len() {
+        offsets.to_vec()
+    } else {
+        vec![0; samples.len()]
+    };
     let ts: Vec<i64> = samples
         .iter()
         .map(|s| s.dts.saturating_sub(dts_shift))
@@ -939,20 +1593,18 @@ fn build_samples(
         let keyframe: Vec<bool> = samples.iter().map(|s| s.keyframe).collect();
         fix_index(timing, &ts, &keyframe, &offsets, has_ctts, dts_shift)
     };
-    Some(
-        index
-            .into_iter()
-            .map(|(i, dts, _discard)| SampleLoc {
-                dts,
-                pts: if has_ctts {
-                    dts.saturating_add(dts_shift).saturating_add(offsets[i])
-                } else {
-                    dts
-                },
-                ..samples[i]
-            })
-            .collect(),
-    )
+    index
+        .into_iter()
+        .map(|(i, dts, _discard)| SampleLoc {
+            dts,
+            pts: if has_ctts {
+                dts.saturating_add(dts_shift).saturating_add(offsets[i])
+            } else {
+                dts
+            },
+            ..samples[i]
+        })
+        .collect()
 }
 
 /// What `mov_build_index` subtracts from every decode time when FFmpeg doesn't
@@ -1025,6 +1677,8 @@ fn build_av1c(sample: &[u8]) -> Option<Vec<u8>> {
 
 /// `ftyp` body: major brand `isom` v0x200, compatible `isom iso2 mp41`.
 const FTYP_BODY: &[u8] = b"isom\x00\x00\x02\x00isomiso2mp41";
+/// QuickTime `ftyp` body: major brand `qt  ` 0x200, compatible `qt  `.
+const FTYP_QT_BODY: &[u8] = b"qt  \x00\x00\x02\x00qt  ";
 
 /// One output track: its stream, sample entry and sample tables.
 ///
@@ -1048,6 +1702,12 @@ struct TrackOut {
     /// `stco`/`co64` + `stsc`: `(file offset, sample count)` per chunk, a
     /// chunk being a run of this track's samples stored back to back.
     chunks: Vec<(u64, u32)>,
+    /// QuickTime (`mov`) entries rather than ISO ones.
+    qt: bool,
+    /// How an uncompressed audio track is stored. Each packet is kept as one
+    /// entry here (its duration in frames), and `stsz`/`stts`/`stsc` are
+    /// written per PCM frame, as QuickTime and ISO both count them.
+    pcm: Option<entry::PcmOut>,
 }
 
 impl TrackOut {
@@ -1061,7 +1721,58 @@ impl TrackOut {
             pts: Vec::new(),
             dts: Vec::new(),
             chunks: Vec::new(),
+            qt: false,
+            pcm: None,
         }
+    }
+
+    /// A track of the `mp4`/`mov` muxers: its sample entry and whatever codec
+    /// configuration the stream's extradata already settles.
+    fn for_flavor(stream: &Stream, flavor: Flavor) -> Result<TrackOut> {
+        let qt = flavor == Flavor::Mov;
+        if !flavor.codecs().contains(&stream.codec_id) {
+            return Err(refuse(stream, flavor));
+        }
+        let mut pcm = None;
+        let fourcc = match stream.codec_id {
+            CodecId::H264 => *b"avc1",
+            CodecId::Avif => *b"av01",
+            CodecId::Vp9 => *b"vp09",
+            CodecId::Apv => *b"apv1",
+            CodecId::Aac => *b"mp4a",
+            CodecId::Opus => *b"Opus",
+            CodecId::Flac => *b"fLaC",
+            CodecId::Alac => *b"alac",
+            CodecId::Ac3 => *b"ac-3",
+            CodecId::Eac3 => *b"ec-3",
+            CodecId::ProRes => entry::prores_tag(stream, None),
+            CodecId::DnxHd => entry::dnx_tag(stream),
+            CodecId::Pcm => {
+                let out = entry::pcm_out(stream).ok_or_else(|| {
+                    Error::unsupported(
+                        "mp4 mux: a `pcm` stream needs an interleaved sample format \
+                         (u8, s16, s24, s32, f32 or f64)",
+                    )
+                })?;
+                let fourcc = out.fourcc;
+                pcm = Some(out);
+                fourcc
+            }
+            _ => return Err(refuse(stream, flavor)),
+        };
+        let mut t = TrackOut::new(stream, fourcc);
+        t.qt = qt;
+        t.pcm = pcm;
+        let extra = &stream.extradata;
+        t.config = match stream.codec_id {
+            CodecId::Apv if !extra.is_empty() => Some(fbx(b"apvC", 0, 0, extra)),
+            CodecId::Flac => entry::build_dfla(extra),
+            CodecId::Alac if extra.len() >= 24 => Some(fbx(b"alac", 0, 0, extra)),
+            CodecId::Ac3 if !extra.is_empty() => Some(bx(b"dac3", extra)),
+            CodecId::Eac3 if !extra.is_empty() => Some(bx(b"dec3", extra)),
+            _ => None,
+        };
+        Ok(t)
     }
 
     /// The bytes MP4 stores for a packet. H.264 goes from Annex-B to 4-byte
@@ -1090,9 +1801,29 @@ impl TrackOut {
                 }
                 scratch
             }
+            CodecId::Pcm => match &self.pcm {
+                Some(out) if out.layout.big_endian || out.layout.signed8 => {
+                    scratch.clear();
+                    scratch.extend_from_slice(data);
+                    out.layout.convert(scratch);
+                    scratch
+                }
+                _ => data,
+            },
             codec => {
-                if codec == CodecId::Avif && self.config.is_none() {
-                    self.config = build_av1c(data);
+                if self.config.is_none() {
+                    self.config = match codec {
+                        CodecId::Avif => build_av1c(data),
+                        CodecId::Vp9 => entry::build_vpcc(&self.stream, data),
+                        CodecId::Ac3 => entry::dac3_from_frame(data),
+                        CodecId::Eac3 => entry::dec3_from_frame(data),
+                        _ => None,
+                    };
+                }
+                // An untagged ProRes stream takes its profile from the first
+                // frame's chroma format (the moov is written last).
+                if codec == CodecId::ProRes && self.sizes.is_empty() {
+                    self.fourcc = entry::prores_tag(&self.stream, Some(data));
                 }
                 data
             }
@@ -1121,9 +1852,12 @@ impl TrackOut {
     /// Record where the newest sample landed: `offset` in the file, and whether
     /// it directly follows this track's previous sample (then it extends that
     /// chunk instead of opening one).
+    ///
+    /// PCM packets always open a chunk: a PCM track is read back a chunk at a
+    /// time, so one packet per chunk keeps packet boundaries across a remux.
     fn place(&mut self, offset: u64, contiguous: bool) {
         match self.chunks.last_mut() {
-            Some(chunk) if contiguous => chunk.1 += 1,
+            Some(chunk) if contiguous && self.pcm.is_none() => chunk.1 += 1,
             _ => self.chunks.push((offset, 1)),
         }
     }
@@ -1131,13 +1865,13 @@ impl TrackOut {
 
 /// One [`TrackOut`] per stream, refusing anything we cannot describe rather
 /// than writing a file that only fails later, in someone else's player.
-fn new_tracks(streams: &[Stream]) -> Result<Vec<TrackOut>> {
+fn new_tracks(streams: &[Stream], flavor: Flavor) -> Result<Vec<TrackOut>> {
     if streams.is_empty() {
         return Err(Error::invalid("mp4 mux: no streams"));
     }
     streams
         .iter()
-        .map(|s| Ok(TrackOut::new(s, mp4_fourcc(s)?)))
+        .map(|s| TrackOut::for_flavor(s, flavor))
         .collect()
 }
 
@@ -1182,6 +1916,26 @@ fn require_configs(tracks: &mut [TrackOut]) -> Result<()> {
                      open but decode nothing",
                 ));
             }
+            codec @ (CodecId::Vp9
+            | CodecId::Apv
+            | CodecId::Flac
+            | CodecId::Alac
+            | CodecId::Ac3
+            | CodecId::Eac3) => {
+                let (record, source) = match codec {
+                    CodecId::Vp9 => ("vpcC", "a keyframe as its first packet"),
+                    CodecId::Apv => ("apvC", "its configuration record as extradata"),
+                    CodecId::Flac => ("dfLa", "its STREAMINFO as extradata"),
+                    CodecId::Alac => ("alac", "its magic cookie as extradata"),
+                    CodecId::Ac3 => ("dac3", "a `dac3` as extradata or a valid first frame"),
+                    _ => ("dec3", "a `dec3` as extradata or a valid first frame"),
+                };
+                return Err(Error::invalid(format!(
+                    "mp4 mux: the {} stream needs {source} to build its `{record}` — \
+                     without it the output would open but decode nothing",
+                    codec.name()
+                )));
+            }
             _ => {}
         }
     }
@@ -1216,6 +1970,20 @@ struct TimingPlan {
 /// PTS give back exactly those PTS, so a stream without reordering is timed
 /// as before: real PTS deltas, or a nominal rate when PTS are missing.
 fn timing_plan(t: &TrackOut) -> TimingPlan {
+    // PCM: one tick per frame at the sample rate; each stored packet lasts
+    // as many frames as it holds.
+    if let Some(pcm) = &t.pcm {
+        let frame = pcm.layout.frame_bytes.max(1) as u32;
+        let durations: Vec<u32> = t.sizes.iter().map(|&s| s / frame).collect();
+        let presentation = durations.iter().map(|&d| u64::from(d)).sum();
+        return TimingPlan {
+            timescale: t.stream.sample_rate.max(1),
+            durations,
+            offsets: Vec::new(),
+            start: 0,
+            presentation,
+        };
+    }
     let timescale = pick_timescale(&t.stream);
     let media = t.stream.media_type;
     let Some(dts) = decode_times(&t.pts, &t.dts) else {
@@ -1288,26 +2056,63 @@ fn decode_times(pts: &[Option<i64>], dts: &[Option<i64>]) -> Option<Vec<i64>> {
     usable(&dts).then_some(dts)
 }
 
-/// The `moov` box: `mvhd` plus one `trak` per track, from the sample tables.
-fn build_moov(tracks: &[TrackOut], plans: &[TimingPlan]) -> Vec<u8> {
+/// A timecode track to write: the media track it times and where its 4-byte
+/// sample (the start frame number) sits in `mdat`.
+struct TmcdOut {
+    media: usize,
+    offset: u64,
+}
+
+/// The tracks that carry a start timecode, each needing a `tmcd` track.
+fn timecode_tracks(tracks: &[TrackOut]) -> Vec<usize> {
+    (0..tracks.len())
+        .filter(|&t| tracks[t].stream.timecode.is_some() && !tracks[t].sizes.is_empty())
+        .collect()
+}
+
+/// The `moov` box: `mvhd` plus one `trak` per track, from the sample tables,
+/// then one QuickTime timecode track per entry of `tmcd`.
+fn build_moov(tracks: &[TrackOut], plans: &[TimingPlan], tmcd: &[TmcdOut]) -> Vec<u8> {
     let movie_timescale = 1000u32;
     let mut traks = Vec::new();
     let mut max_movie_dur = 0u32;
+    let movie_dur_of = |plan: &TimingPlan| {
+        (plan.presentation * movie_timescale as u64 / plan.timescale.max(1) as u64) as u32
+    };
     for (t, track) in tracks.iter().enumerate() {
         let plan = &plans[t];
         let media_dur: u64 = plan.durations.iter().map(|&d| d as u64).sum();
-        let movie_dur =
-            (plan.presentation * movie_timescale as u64 / plan.timescale.max(1) as u64) as u32;
+        let movie_dur = movie_dur_of(plan);
         max_movie_dur = max_movie_dur.max(movie_dur);
-        traks.push(build_trak(
+        let tmcd_ref = tmcd
+            .iter()
+            .position(|m| m.media == t)
+            .map(|k| (tracks.len() + 1 + k) as u32);
+        traks.push(build_trak_with(
             track,
             (t + 1) as u32,
             plan,
             media_dur as u32,
             movie_dur,
+            tmcd_ref,
         ));
     }
-    let mut moov_body = build_mvhd(movie_timescale, max_movie_dur, tracks.len() as u32 + 1);
+    for (k, m) in tmcd.iter().enumerate() {
+        let (track, plan) = (&tracks[m.media], &plans[m.media]);
+        let Some(tc) = &track.stream.timecode else {
+            continue;
+        };
+        traks.push(build_tmcd_trak(
+            tc,
+            (tracks.len() + 1 + k) as u32,
+            m.offset,
+            (plan.presentation, plan.timescale),
+            movie_dur_of(plan),
+            track.qt,
+        ));
+    }
+    let next_track_id = (tracks.len() + tmcd.len()) as u32 + 1;
+    let mut moov_body = build_mvhd(movie_timescale, max_movie_dur, next_track_id);
     for trak in traks {
         moov_body.extend_from_slice(&trak);
     }
@@ -1324,6 +2129,7 @@ type BufPacket = (usize, Vec<u8>, bool, Option<i64>, Option<i64>);
 /// `mdat` and `moov` in one go. Files get [`Mp4StreamMuxer`] instead.
 struct Mp4Muxer {
     out: Output,
+    flavor: Flavor,
     /// Resolved in [`write_header`](Muxer::write_header): an unmappable codec
     /// is rejected before a single byte is written, and by construction there
     /// is no path that reaches the box writer without a real fourcc.
@@ -1332,9 +2138,15 @@ struct Mp4Muxer {
 }
 
 impl Mp4Muxer {
+    #[cfg(test)]
     fn new(out: Output) -> Mp4Muxer {
+        Mp4Muxer::with_flavor(out, Flavor::Mp4)
+    }
+
+    fn with_flavor(out: Output, flavor: Flavor) -> Mp4Muxer {
         Mp4Muxer {
             out,
+            flavor,
             tracks: Vec::new(),
             packets: Vec::new(),
         }
@@ -1343,7 +2155,7 @@ impl Mp4Muxer {
 
 impl Muxer for Mp4Muxer {
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
-        self.tracks = new_tracks(streams)?;
+        self.tracks = new_tracks(streams, self.flavor)?;
         Ok(())
     }
 
@@ -1391,8 +2203,10 @@ impl Muxer for Mp4Muxer {
         // --- mdat: samples interleaved; each track's contiguous runs are its
         // chunks (offset, sample_count) for stco/stsc. A payload too big for a
         // 32-bit box size takes the 64-bit `largesize` header. ---
-        let ftyp = bx(b"ftyp", FTYP_BODY);
-        let body_len: u64 = data.iter().flatten().map(|d| d.len() as u64).sum();
+        let ftyp = self.flavor.ftyp();
+        let timecoded = timecode_tracks(tracks);
+        let body_len: u64 =
+            data.iter().flatten().map(|d| d.len() as u64).sum::<u64>() + 4 * timecoded.len() as u64;
         let mdat_header = match u32::try_from(body_len + 8) {
             Ok(size) => [&size.to_be_bytes()[..], b"mdat"].concat(),
             Err(_) => [
@@ -1409,12 +2223,29 @@ impl Muxer for Mp4Muxer {
             off += data[t][i].len() as u64;
             prev = Some(t);
         }
-        let moov = build_moov(tracks, &plans);
+        // Timecode samples go last in `mdat`, 4 bytes each.
+        let tmcd: Vec<TmcdOut> = timecoded
+            .iter()
+            .enumerate()
+            .map(|(k, &media)| TmcdOut {
+                media,
+                offset: off + 4 * k as u64,
+            })
+            .collect();
+        let moov = build_moov(tracks, &plans, &tmcd);
 
         self.out.write_all(&ftyp)?;
         self.out.write_all(&mdat_header)?;
         for &(_, t, i) in &entries {
             self.out.write_all(&data[t][i])?;
+        }
+        for &media in &timecoded {
+            let start = tracks[media]
+                .stream
+                .timecode
+                .as_ref()
+                .map_or(0, |tc| tc.start_frame);
+            self.out.write_all(&start.to_be_bytes())?;
         }
         self.out.write_all(&moov)?;
         self.out.flush()?;
@@ -1441,6 +2272,7 @@ impl Muxer for Mp4Muxer {
 /// means reading `mdat` back, and the output is write+seek only.
 struct Mp4StreamMuxer {
     out: SeekOutput,
+    flavor: Flavor,
     tracks: Vec<TrackOut>,
     /// H.264 sample conversion buffer, reused across packets.
     scratch: Vec<u8>,
@@ -1456,9 +2288,15 @@ struct Mp4StreamMuxer {
 }
 
 impl Mp4StreamMuxer {
+    #[cfg(test)]
     fn new(out: SeekOutput) -> Mp4StreamMuxer {
+        Mp4StreamMuxer::with_flavor(out, Flavor::Mp4)
+    }
+
+    fn with_flavor(out: SeekOutput, flavor: Flavor) -> Mp4StreamMuxer {
         Mp4StreamMuxer {
             out,
+            flavor,
             tracks: Vec::new(),
             scratch: Vec::new(),
             last_track: None,
@@ -1498,10 +2336,10 @@ impl Muxer for Mp4StreamMuxer {
         if self.mdat_slot.is_some() {
             return Err(Error::invalid("mp4 mux: header already written"));
         }
-        self.tracks = new_tracks(streams)?;
+        self.tracks = new_tracks(streams, self.flavor)?;
         // Offsets are absolute, so start from wherever the sink is.
         let start = self.out.stream_position()?;
-        let ftyp = bx(b"ftyp", FTYP_BODY);
+        let ftyp = self.flavor.ftyp();
         self.out.write_all(&ftyp)?;
         self.out.write_all(&MDAT_OPEN)?;
         let slot = start + ftyp.len() as u64;
@@ -1536,7 +2374,22 @@ impl Muxer for Mp4StreamMuxer {
             .ok_or_else(|| Error::invalid("mp4 mux: trailer before header"))?;
         require_configs(&mut self.tracks)?;
         let plans: Vec<TimingPlan> = self.tracks.iter().map(timing_plan).collect();
-        let moov = build_moov(&self.tracks, &plans);
+        // Timecode samples close `mdat`, 4 bytes each.
+        let mut tmcd = Vec::new();
+        for media in timecode_tracks(&self.tracks) {
+            let start = self.tracks[media]
+                .stream
+                .timecode
+                .as_ref()
+                .map_or(0, |tc| tc.start_frame);
+            self.out.write_all(&start.to_be_bytes())?;
+            tmcd.push(TmcdOut {
+                media,
+                offset: self.pos,
+            });
+            self.pos += 4;
+        }
+        let moov = build_moov(&self.tracks, &plans, &tmcd);
         let mdat_end = self.pos;
         self.out.write_all(&moov)?;
         let end = mdat_end + moov.len() as u64;
@@ -1636,6 +2489,41 @@ pub(crate) fn mp4_fourcc(stream: &Stream) -> Result<[u8; 4]> {
     }))
 }
 
+/// Why the `mp4`/`mov` muxer cannot carry `stream`, and what to do instead.
+fn refuse(stream: &Stream, flavor: Flavor) -> Error {
+    let name = stream.codec_id.name();
+    let (fmt, ext) = match flavor {
+        Flavor::Mp4 => ("mp4", ".mp4"),
+        Flavor::Mov => ("mov", ".mov"),
+    };
+    let qt_only = matches!(stream.codec_id, CodecId::ProRes | CodecId::DnxHd);
+    Error::unsupported(match stream.media_type {
+        MediaType::Subtitle => format!(
+            "{fmt} mux: subtitle streams are not supported here (no `mov_text`); \
+             write Matroska (`.mkv`) instead, or extract the subtitles on their \
+             own with `-c:s subrip out.srt`"
+        ),
+        MediaType::Video if qt_only => format!(
+            "{fmt} mux: `{name}` is a QuickTime codec; write `.mov` to keep it as a \
+             stream copy, or re-encode with `-c:v h264`"
+        ),
+        MediaType::Video => format!(
+            "{fmt} mux: video codec `{name}` has no {ext} mapping here; re-encode \
+             with `-c:v h264`, or write `.mkv`/`.webm` to keep `{name}` as a stream copy"
+        ),
+        MediaType::Audio if stream.codec_id == CodecId::Pcm => format!(
+            "{fmt} mux: `pcm` has no {ext} mapping here (most MP4 players cannot \
+             play it); re-encode with `-c:a aac`, or write `.mov` to keep `pcm` \
+             as a stream copy"
+        ),
+        MediaType::Audio => format!(
+            "{fmt} mux: audio codec `{name}` has no {ext} mapping here; re-encode \
+             with `-c:a aac`, or write `.mkv` to keep `{name}` as a stream copy"
+        ),
+        other => format!("{fmt} mux: cannot carry a `{other}` stream (codec `{name}`)"),
+    })
+}
+
 /// `dOps` (OpusSpecificBox): the MP4 mapping of `OpusHead` (big-endian fields).
 fn build_dops(channels: u16, sample_rate: u32) -> Vec<u8> {
     let mut b = Vec::new();
@@ -1699,6 +2587,37 @@ fn build_trak(
     media_duration: u32,
     movie_duration: u32,
 ) -> Vec<u8> {
+    build_trak_with(track, track_id, plan, media_duration, movie_duration, None)
+}
+
+/// A media `hdlr`: QuickTime's (`mhlr` component, Pascal-string name) or
+/// ISO's (zero pre_defined, C-string name).
+fn build_hdlr(handler: &[u8; 4], name: &str, qt: bool) -> Vec<u8> {
+    let mut hd = Vec::new();
+    hd.extend_from_slice(if qt { b"mhlr" } else { &[0; 4] });
+    hd.extend_from_slice(handler);
+    pu32(&mut hd, 0);
+    pu32(&mut hd, 0);
+    pu32(&mut hd, 0); // reserved / component manufacturer, flags, mask
+    if qt {
+        hd.push(name.len() as u8);
+        hd.extend_from_slice(name.as_bytes());
+    } else {
+        hd.extend_from_slice(name.as_bytes());
+        hd.push(0);
+    }
+    fbx(b"hdlr", 0, 0, &hd)
+}
+
+/// [`build_trak`], with the id of the timecode track this one references.
+fn build_trak_with(
+    track: &TrackOut,
+    track_id: u32,
+    plan: &TimingPlan,
+    media_duration: u32,
+    movie_duration: u32,
+    tmcd_ref: Option<u32>,
+) -> Vec<u8> {
     let s = &track.stream;
 
     // tkhd — duration is in the *movie* timescale.
@@ -1731,15 +2650,7 @@ fn build_trak(
 
     let is_video = s.media_type == MediaType::Video;
 
-    // hdlr
-    let mut hd = Vec::new();
-    pu32(&mut hd, 0); // pre_defined
-    hd.extend_from_slice(if is_video { b"vide" } else { b"soun" });
-    pu32(&mut hd, 0);
-    pu32(&mut hd, 0);
-    pu32(&mut hd, 0); // reserved
-    hd.extend_from_slice(b"rff\x00"); // name
-    let hdlr = fbx(b"hdlr", 0, 0, &hd);
+    let hdlr = build_hdlr(if is_video { b"vide" } else { b"soun" }, "rff", track.qt);
 
     // minf: media header (vmhd / smhd) + dinf + stbl
     let media_header = if is_video {
@@ -1770,7 +2681,116 @@ fn build_trak(
     } else {
         Vec::new()
     };
-    bx(b"trak", &[tkhd, edts, mdia].concat())
+    let tref = match tmcd_ref {
+        Some(id) => bx(b"tref", &bx(b"tmcd", &id.to_be_bytes())),
+        None => Vec::new(),
+    };
+    bx(b"trak", &[tkhd, edts, tref, mdia].concat())
+}
+
+/// A QuickTime timecode track (`tmcd` handler, `gmhd` media header) whose
+/// one sample, at `offset`, spans the referenced track's presentation
+/// (`(duration, timescale)`), as QuickTime, FFmpeg and FilmCraft write it.
+fn build_tmcd_trak(
+    tc: &Timecode,
+    track_id: u32,
+    offset: u64,
+    (presentation, media_timescale): (u64, u32),
+    movie_duration: u32,
+    qt: bool,
+) -> Vec<u8> {
+    let (timescale, frame_duration) = entry::tmcd_rate(tc);
+    let duration = rescale(
+        presentation as i64,
+        i64::from(timescale),
+        i64::from(media_timescale.max(1)),
+    )
+    .clamp(i64::from(frame_duration), i64::from(u32::MAX)) as u32;
+
+    let mut tk = Vec::new();
+    pu32(&mut tk, 0);
+    pu32(&mut tk, 0); // creation, modification
+    pu32(&mut tk, track_id);
+    pu32(&mut tk, 0); // reserved
+    pu32(&mut tk, movie_duration);
+    tk.extend_from_slice(&[0u8; 16]); // reserved(8), layer, alternate_group, volume, reserved
+    identity_matrix(&mut tk);
+    pu32(&mut tk, 0);
+    pu32(&mut tk, 0); // width, height
+    let tkhd = fbx(b"tkhd", 0, 3, &tk);
+
+    let mut md = Vec::new();
+    pu32(&mut md, 0);
+    pu32(&mut md, 0);
+    pu32(&mut md, timescale);
+    pu32(&mut md, duration);
+    pu16(&mut md, 0x55C4); // 'und'
+    pu16(&mut md, 0);
+    let mdhd = fbx(b"mdhd", 0, 0, &md);
+    let hdlr = build_hdlr(b"tmcd", "TimeCodeHandler", qt);
+
+    let dinf = bx(
+        b"dinf",
+        &fbx(
+            b"dref",
+            0,
+            0,
+            &[&1u32.to_be_bytes()[..], &fbx(b"url ", 0, 1, &[])].concat(),
+        ),
+    );
+    let stsd = fbx(
+        b"stsd",
+        0,
+        0,
+        &[&1u32.to_be_bytes()[..], &entry::tmcd_entry(tc)].concat(),
+    );
+    let stts = fbx(
+        b"stts",
+        0,
+        0,
+        &[
+            1u32.to_be_bytes(),
+            1u32.to_be_bytes(),
+            duration.to_be_bytes(),
+        ]
+        .concat(),
+    );
+    let stsc = fbx(
+        b"stsc",
+        0,
+        0,
+        &[1u32, 1, 1, 1]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let stsz = fbx(
+        b"stsz",
+        0,
+        0,
+        &[0u32, 1, 4]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let stco = match u32::try_from(offset) {
+        Ok(o) => fbx(
+            b"stco",
+            0,
+            0,
+            &[1u32.to_be_bytes(), o.to_be_bytes()].concat(),
+        ),
+        Err(_) => fbx(
+            b"co64",
+            0,
+            0,
+            &[&1u32.to_be_bytes()[..], &offset.to_be_bytes()].concat(),
+        ),
+    };
+    let stbl = bx(b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
+    let minf = bx(b"minf", &[entry::tmcd_gmhd(), dinf, stbl].concat());
+    let mdia = bx(b"mdia", &[mdhd, hdlr, minf].concat());
+    bx(b"trak", &[tkhd, mdia].concat())
 }
 
 fn build_stbl(track: &TrackOut, plan: &TimingPlan) -> Vec<u8> {
@@ -1781,46 +2801,53 @@ fn build_stbl(track: &TrackOut, plan: &TimingPlan) -> Vec<u8> {
     // stsd: a video (VisualSampleEntry [+avcC]) or audio (AudioSampleEntry
     // [+dOps]) sample entry, depending on the track's media type.
     let mut entry = Vec::new();
-    entry.extend_from_slice(&[0u8; 6]); // reserved
-    pu16(&mut entry, 1); // data_reference_index
-    if s.media_type == MediaType::Video {
-        pu16(&mut entry, 0); // pre_defined
-        pu16(&mut entry, 0); // reserved
-        for _ in 0..3 {
-            pu32(&mut entry, 0); // pre_defined[3]
-        }
-        pu16(&mut entry, s.width as u16);
-        pu16(&mut entry, s.height as u16);
-        pu32(&mut entry, 0x0048_0000); // horizresolution 72dpi
-        pu32(&mut entry, 0x0048_0000); // vertresolution
-        pu32(&mut entry, 0); // reserved
-        pu16(&mut entry, 1); // frame_count
-        entry.extend_from_slice(&[0u8; 32]); // compressorname
-        pu16(&mut entry, 0x0018); // depth
-        pu16(&mut entry, 0xFFFF); // pre_defined
-        if let Some(cfg) = &track.config {
-            entry.extend_from_slice(cfg);
-        }
+    if let Some(pcm) = &track.pcm {
+        entry = entry::pcm_entry(s, pcm);
     } else {
-        // AudioSampleEntry: channelcount @16, samplerate (16.16) @24.
-        pu32(&mut entry, 0);
-        pu32(&mut entry, 0); // reserved (2× u32)
-        pu16(&mut entry, s.channels.max(1)); // channelcount
-        pu16(&mut entry, 16); // samplesize
-        pu16(&mut entry, 0); // pre_defined
-        pu16(&mut entry, 0); // reserved
-        pu32(&mut entry, s.sample_rate << 16); // samplerate
-        if s.codec_id == CodecId::Opus {
-            entry.extend_from_slice(&build_dops(s.channels, s.sample_rate));
-        } else if s.codec_id == CodecId::Aac {
-            // esds carries the AudioSpecificConfig: use the stream's extradata (a
-            // remux) or synthesize it from rate/channels (a fresh encode).
-            let asc = if s.extradata.is_empty() {
-                build_asc(s.sample_rate, s.channels)
-            } else {
-                s.extradata.clone()
-            };
-            entry.extend_from_slice(&build_esds(&asc));
+        entry.extend_from_slice(&[0u8; 6]); // reserved
+        pu16(&mut entry, 1); // data_reference_index
+        if s.media_type == MediaType::Video {
+            pu16(&mut entry, 0); // pre_defined
+            pu16(&mut entry, 0); // reserved
+            for _ in 0..3 {
+                pu32(&mut entry, 0); // pre_defined[3]
+            }
+            pu16(&mut entry, s.width as u16);
+            pu16(&mut entry, s.height as u16);
+            pu32(&mut entry, 0x0048_0000); // horizresolution 72dpi
+            pu32(&mut entry, 0x0048_0000); // vertresolution
+            pu32(&mut entry, 0); // reserved
+            pu16(&mut entry, 1); // frame_count
+            entry.extend_from_slice(&[0u8; 32]); // compressorname
+            pu16(&mut entry, 0x0018); // depth
+            pu16(&mut entry, 0xFFFF); // pre_defined
+            if let Some(cfg) = &track.config {
+                entry.extend_from_slice(cfg);
+            }
+            entry.extend_from_slice(&entry::visual_children(s, track.qt));
+        } else {
+            // AudioSampleEntry: channelcount @16, samplerate (16.16) @24.
+            pu32(&mut entry, 0);
+            pu32(&mut entry, 0); // reserved (2× u32)
+            pu16(&mut entry, s.channels.max(1)); // channelcount
+            pu16(&mut entry, 16); // samplesize
+            pu16(&mut entry, 0); // pre_defined
+            pu16(&mut entry, 0); // reserved
+            pu32(&mut entry, s.sample_rate << 16); // samplerate
+            if s.codec_id == CodecId::Opus {
+                entry.extend_from_slice(&build_dops(s.channels, s.sample_rate));
+            } else if s.codec_id == CodecId::Aac {
+                // esds carries the AudioSpecificConfig: use the stream's extradata (a
+                // remux) or synthesize it from rate/channels (a fresh encode).
+                let asc = if s.extradata.is_empty() {
+                    build_asc(s.sample_rate, s.channels)
+                } else {
+                    s.extradata.clone()
+                };
+                entry.extend_from_slice(&build_esds(&asc));
+            } else if let Some(cfg) = &track.config {
+                entry.extend_from_slice(cfg); // dfLa, alac, dac3, dec3
+            }
         }
     }
     let sample_entry = bx(&track.fourcc, &entry);
@@ -1828,6 +2855,12 @@ fn build_stbl(track: &TrackOut, plan: &TimingPlan) -> Vec<u8> {
     pu32(&mut stsd_b, 1); // entry_count
     stsd_b.extend_from_slice(&sample_entry);
     let stsd = fbx(b"stsd", 0, 0, &stsd_b);
+
+    // PCM counts frames: one stts run of 1-tick frames, a uniform stsz of
+    // the frame size, and stsc chunks holding their packets' frames.
+    if track.pcm.is_some() {
+        return build_pcm_stbl(track, plan, stsd);
+    }
 
     // stts: run-length-encode consecutive equal per-sample durations.
     let mut runs: Vec<(u32, u32)> = Vec::new(); // (count, delta)
@@ -1923,6 +2956,82 @@ fn build_stbl(track: &TrackOut, plan: &TimingPlan) -> Vec<u8> {
         b"stbl",
         &[stsd, stts, ctts, stsc, stsz, stco, stss].concat(),
     )
+}
+
+/// `stco` or, once any chunk starts past 4 GiB, `co64`.
+fn chunk_offsets_box(chunks: &[(u64, u32)]) -> Vec<u8> {
+    let mut b = Vec::new();
+    pu32(&mut b, chunks.len() as u32);
+    if chunks.iter().any(|&(off, _)| off > u32::MAX as u64) {
+        for &(off, _) in chunks {
+            b.extend_from_slice(&off.to_be_bytes());
+        }
+        fbx(b"co64", 0, 0, &b)
+    } else {
+        for &(off, _) in chunks {
+            pu32(&mut b, off as u32);
+        }
+        fbx(b"stco", 0, 0, &b)
+    }
+}
+
+/// The sample tables of a PCM track, counted in frames (the unit both
+/// QuickTime and ISO PCM use): every packet's frames are samples of one
+/// frame's size and one tick, and each chunk holds its packets' frames.
+fn build_pcm_stbl(track: &TrackOut, plan: &TimingPlan, stsd: Vec<u8>) -> Vec<u8> {
+    let frame_bytes = track
+        .pcm
+        .as_ref()
+        .map_or(1, |p| p.layout.frame_bytes.max(1)) as u32;
+    let total: u64 = plan.durations.iter().map(|&d| u64::from(d)).sum();
+    let total = u32::try_from(total).unwrap_or(u32::MAX);
+    let stts = fbx(
+        b"stts",
+        0,
+        0,
+        &[1, total, 1]
+            .iter()
+            .flat_map(|v: &u32| v.to_be_bytes())
+            .collect::<Vec<_>>(),
+    );
+    // Frames per chunk, from the packets each chunk holds.
+    let mut frames = Vec::with_capacity(track.chunks.len());
+    let mut packet = 0usize;
+    for &(_, count) in &track.chunks {
+        let end = (packet + count as usize).min(plan.durations.len());
+        frames.push(
+            plan.durations[packet..end]
+                .iter()
+                .map(|&d| d as u64)
+                .sum::<u64>() as u32,
+        );
+        packet = end;
+    }
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for (ci, &n) in frames.iter().enumerate() {
+        if runs.last().map(|r| r.1) != Some(n) {
+            runs.push((ci as u32 + 1, n));
+        }
+    }
+    let mut stsc_b = Vec::new();
+    pu32(&mut stsc_b, runs.len() as u32);
+    for (first, n) in runs {
+        pu32(&mut stsc_b, first);
+        pu32(&mut stsc_b, n);
+        pu32(&mut stsc_b, 1);
+    }
+    let stsc = fbx(b"stsc", 0, 0, &stsc_b);
+    let stsz = fbx(
+        b"stsz",
+        0,
+        0,
+        &[frame_bytes, total]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let stco = chunk_offsets_box(&track.chunks);
+    bx(b"stbl", &[stsd, stts, stsc, stsz, stco].concat())
 }
 
 #[cfg(test)]
@@ -2511,10 +3620,10 @@ mod tests {
     fn refuses_a_video_codec_it_cannot_describe() {
         let mut mux = Mp4Muxer::new(Box::new(Vec::new()));
         let err = mux
-            .write_header(&[probe_stream(CodecId::Vp9)])
-            .expect_err("vp9 has no MP4 sample entry here");
+            .write_header(&[probe_stream(CodecId::Vp8)])
+            .expect_err("vp8 has no MP4 sample entry here");
         let msg = err.to_string();
-        assert!(msg.contains("vp9"), "the error must name the codec: {msg}");
+        assert!(msg.contains("vp8"), "the error must name the codec: {msg}");
         // ...and point somewhere useful, rather than just saying no.
         assert!(
             msg.contains("-c:v h264") || msg.contains(".mkv"),
@@ -2524,7 +3633,8 @@ mod tests {
 
     #[test]
     fn refuses_an_audio_codec_it_cannot_describe() {
-        for codec in [CodecId::Mp3, CodecId::Flac, CodecId::Vorbis, CodecId::Pcm] {
+        // PCM is carried, but not without a sample format to describe it.
+        for codec in [CodecId::Mp3, CodecId::Vorbis, CodecId::Pcm] {
             let mut mux = Mp4Muxer::new(Box::new(Vec::new()));
             let err = mux
                 .write_header(&[probe_stream(codec)])
@@ -2921,7 +4031,7 @@ mod tests {
     fn the_streaming_muxer_refuses_before_writing_a_byte() {
         let sink = SharedCursor::default();
         let mut mux = Mp4StreamMuxer::new(Box::new(sink.clone()));
-        assert!(mux.write_header(&[probe_stream(CodecId::Vp9)]).is_err());
+        assert!(mux.write_header(&[probe_stream(CodecId::Vp8)]).is_err());
         assert!(sink.0.lock().unwrap().get_ref().is_empty());
         // ...and a missing `avcC` is still an error at the trailer.
         let mut mux = Mp4StreamMuxer::new(Box::new(SharedCursor::default()));
@@ -3049,7 +4159,12 @@ mod tests {
         assert_eq!(moov.windows(4).filter(|w| w == b"co64").count(), 2);
         assert!(!moov.windows(4).any(|w| w == b"stco"));
         let mut dem = Mp4Demuxer::with_source(Source::Done);
-        assert_eq!(dem.parse_moov(&moov[8..]).unwrap().len(), 2);
+        let top = TopLevel {
+            qt: false,
+            moov: moov[8..].to_vec(),
+            moofs: Vec::new(),
+        };
+        assert_eq!(dem.parse_moov(&top).unwrap().0.len(), 2);
         let (mut big_n, mut small_n) = (0, 0);
         for loc in &dem.samples {
             if loc.stream_index == 0 {

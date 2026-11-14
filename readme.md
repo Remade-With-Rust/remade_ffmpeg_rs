@@ -139,8 +139,8 @@ safer.
 | Container | **png** / **jpeg** / **gif** / **webp** / **jpegxl** | **demux + mux** |
 | Container | **wav** (RIFF/WAVE) / **ogg** (Opus/Vorbis) / **flac** | **demux + mux** |
 | Container | **avi** (Audio Video Interleaved) | **demux + mux** (RIFF/`hdrl`/`movi`/`idx1`) |
-| Container | **mp4** / **mov** (ISOBMFF) | **demux + mux** — sample tables; **A/V**: AV1 (`av01`/`av1C`), H.264 (`avc1`/`avcC`) or HEVC (`hvc1`/`hev1`/`hvcC`, demux) video + Opus audio (`dOps`); **AAC `esds` config (demux + mux)** so `rff -i in.wav out.m4a` writes a playable AAC MP4 |
-| Container | **matroska** / **webm** (EBML) | **demux** — track tree + Cluster/(Simple)Block packets; AV1/H.264/HEVC video + Opus/Vorbis/AAC/FLAC audio |
+| Container | **mp4** / **mov** (ISOBMFF) | **demux + mux**, separate ISO (`mp4`) and QuickTime (`mov`) muxers, **fragmented MP4 read** — H.264, HEVC (demux), AV1, VP9 (`vpcC`), APV, and in MOV **ProRes** (all six profiles) and **DNxHD/HR**; AAC (`esds`), Opus, FLAC (`dfLa`), ALAC, AC-3/E-AC-3, and **PCM in MOV** (`sowt` `twos` `in24` `in32` `fl32` `fl64` `lpcm`, sound description v0/v1/v2); `colr`/`pasp`/`clap`/`mdcv`/`clli` and the QuickTime **timecode track**, read and written |
+| Container | **matroska** / **webm** (EBML) | **demux + mux** — Cluster/(Simple)Block packets with lacing; AV1/H.264/HEVC/VP9/VP8 video + Opus/Vorbis/AAC/FLAC/MP3/AC-3/E-AC-3/ALAC/PCM audio, subtitles; **Colour + HDR mastering**, **WebM alpha** (BlockAdditions), **CodecDelay/SeekPreRoll**, header-stripping and zlib ContentEncodings (demux) |
 
 ## Install
 

@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
 
 use rff_core::{
-    CodecId, ColorRange, Dictionary, Error, MediaType, Packet, PixelFormat, Rational, Result,
-    SampleFormat,
+    CleanAperture, CodecId, ColorInfo, ColorRange, ContentLightLevel, Dictionary, Error,
+    MasteringDisplay, MediaType, Packet, PixelFormat, Rational, Result, SampleFormat, Timecode,
 };
 
 /// Description of one elementary stream within a container.
@@ -56,6 +56,37 @@ pub struct Stream {
     /// Total packet count (frames for video), when the container's index
     /// declares it. `None` when unknown — never a guess.
     pub nb_frames: Option<u64>,
+    /// The container's own code for this codec, when it has one worth
+    /// keeping: the MP4/QuickTime sample-entry fourcc (`apch` vs `apcn` names
+    /// the ProRes profile, `twos` vs `sowt` the PCM byte order on disk). A
+    /// muxer of the same family writes it back when it is valid for the
+    /// codec, so a remux keeps the original entry; `None` lets the muxer pick.
+    pub codec_tag: Option<[u8; 4]>,
+    // --- Video description (containers label; they do not convert) ---
+    /// Colour primaries / transfer / matrix (MP4 `colr`, Matroska `Colour`).
+    pub color: ColorInfo,
+    /// HDR mastering display (MP4 `mdcv`, Matroska `MasteringMetadata`).
+    pub mastering_display: Option<MasteringDisplay>,
+    /// HDR content light level (MP4 `clli`, Matroska `MaxCLL`/`MaxFALL`).
+    pub content_light: Option<ContentLightLevel>,
+    /// Pixel aspect ratio as `(horizontal, vertical)` spacing (MP4 `pasp`).
+    /// `None` when not recorded, which means square.
+    pub pixel_aspect: Option<(u32, u32)>,
+    /// Clean aperture (MP4 `clap`).
+    pub clean_aperture: Option<CleanAperture>,
+    /// Start timecode (a QuickTime `tmcd` track referenced by this video track).
+    pub timecode: Option<Timecode>,
+    /// The frames carry an alpha plane as a block addition (Matroska
+    /// `AlphaMode`; WebM VP8/VP9 alpha).
+    pub alpha_mode: bool,
+    // --- Audio timing the container records beside the packets ---
+    /// Samples the decoder must drop from the start, in nanoseconds
+    /// (Matroska `CodecDelay`; Opus pre-skip). The demuxer has already taken
+    /// it off packet timestamps; it is here so a remux can write it back.
+    pub codec_delay_ns: u64,
+    /// How far before a seek target decoding must start to converge, in
+    /// nanoseconds (Matroska `SeekPreRoll`; 80 ms for Opus).
+    pub seek_preroll_ns: u64,
 }
 
 impl Stream {
@@ -76,6 +107,16 @@ impl Stream {
             extradata: Vec::new(),
             duration: None,
             nb_frames: None,
+            codec_tag: None,
+            color: ColorInfo::UNSPECIFIED,
+            mastering_display: None,
+            content_light: None,
+            pixel_aspect: None,
+            clean_aperture: None,
+            timecode: None,
+            alpha_mode: false,
+            codec_delay_ns: 0,
+            seek_preroll_ns: 0,
         }
     }
 }

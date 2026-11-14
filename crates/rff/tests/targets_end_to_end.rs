@@ -217,10 +217,8 @@ fn a_video_input_offers_both_video_and_image_targets() {
         "vp9 remuxes into webm: {copies:?}"
     );
     assert!(copies.contains(&"ivf"), "vp9 remuxes into ivf: {copies:?}");
-    assert!(
-        !copies.contains(&"mp4"),
-        "mp4 cannot carry vp9 here, so it must not be advertised as a copy"
-    );
+    // MP4 carries VP9 as `vp09` + `vpcC` (built from the first keyframe).
+    assert!(copies.contains(&"mp4"), "vp9 remuxes into mp4: {copies:?}");
 }
 
 #[test]

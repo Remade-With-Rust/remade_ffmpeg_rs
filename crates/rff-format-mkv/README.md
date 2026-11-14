@@ -7,9 +7,15 @@
 The **Matroska / WebM (EBML)** demuxer for **remade_ffmpeg_rs** — our own code,
 not a binding.
 
-- **Demux** — EBML track tree plus Cluster / (Simple)Block packet extraction.
-- **Video**: AV1 and H.264. **Audio**: Opus, Vorbis, AAC, FLAC.
-- Demux only today; muxing is not yet implemented.
+- **Demux** — EBML track tree plus Cluster / (Simple)Block packet extraction,
+  streamed (memory is one block, not the file).
+- **Mux** — Matroska and WebM, streamed on seekable outputs.
+- **Video**: AV1, VP9, VP8, H.264 (HEVC demux). **Audio**: Opus, Vorbis, AAC,
+  FLAC, MP3, PCM, AC-3, E-AC-3, ALAC. **Subtitles**: SubRip, ASS (demux),
+  WebVTT.
+- Colour / HDR metadata (MasteringMetadata, MaxCLL/MaxFALL), WebM alpha
+  (`AlphaMode` + BlockAdditions), CodecDelay / SeekPreRoll, and on demux
+  ContentEncodings (header stripping, zlib; encrypted tracks are refused).
 - Pure Rust, no C/FFI.
 
 ## Usage

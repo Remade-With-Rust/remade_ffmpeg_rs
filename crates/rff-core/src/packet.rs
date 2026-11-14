@@ -47,6 +47,25 @@ pub struct Packet {
     pub data: Vec<u8>,
     /// Packet flags (keyframe, ...).
     pub flags: PacketFlags,
+    /// Extra per-frame payloads the container stores beside the frame —
+    /// Matroska `BlockAdditions`. WebM carries a VP8/VP9 alpha plane as the
+    /// addition with id 1. Empty for almost every packet.
+    pub additions: Vec<BlockAdditional>,
+}
+
+/// One container-side payload attached to a frame (Matroska `BlockMore`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockAdditional {
+    /// `BlockAddID`: what the payload is. `1` is the codec's own
+    /// "additional data" slot (WebM: the alpha-plane bitstream).
+    pub id: u64,
+    /// `BlockAdditional`: the payload bytes.
+    pub data: Vec<u8>,
+}
+
+impl BlockAdditional {
+    /// The WebM alpha-channel `BlockAddID`.
+    pub const ALPHA: u64 = 1;
 }
 
 impl Packet {

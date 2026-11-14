@@ -71,7 +71,9 @@ licensed (CI-enforced by `cargo-deny`).
 
 ## Containers / formats
 
-Demux **and** mux: `avi`, `mp4`/`mov`/`m4a`, **`matroska` (mkv/mka)**,
+Demux **and** mux: `avi`, `mp4`/`m4a`, **`mov`** (QuickTime: ProRes,
+DNxHD/HR, PCM, timecode tracks, colour/HDR boxes; fragmented MP4 is read),
+**`matroska` (mkv/mka)**,
 **`webm`** (restricted doctype, codec-checked), `mpegts`, `flv`, `ogg`, `wav`,
 `flac`, `mp3`, `y4m`, `ivf`, `avif`, `png`, `jpeg`, `mjpeg`, `mpjpeg`, `rtp`, `gif`, `webp`, `jxl`,
 `srt` (SubRip), `webvtt`, **HLS** (`.m3u8` + TS segments: mux via the

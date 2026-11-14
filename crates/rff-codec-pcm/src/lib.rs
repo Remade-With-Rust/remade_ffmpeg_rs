@@ -3,7 +3,9 @@
 //! PCM packets carry uncompressed interleaved samples, so they are *not*
 //! self-describing: the decoder learns the sample rate, channel count, and
 //! sample layout from [`CodecParams`] via [`configure`](rff_codec::Decoder::configure)
-//! (the new codec-parameters plumbing). Supports interleaved `s16` and `f32`.
+//! (the new codec-parameters plumbing). Encodes interleaved `s16` and `f32`;
+//! decodes those plus `u8`, `s24`, `s32` and `f64` (camera and DAW files in
+//! QuickTime), which it widens to the `s16` / `f32` every encoder takes.
 
 use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder, Encoder};
 use rff_core::{AudioFrame, Error, Frame, MediaType, Packet, Result, SampleFormat};
@@ -18,6 +20,56 @@ pub fn register(registry: &mut CodecRegistry) {
         decoder: Some(|| Box::new(PcmDecoder::default())),
         encoder: Some(|| Box::new(PcmEncoder::default())),
     });
+}
+
+/// The layout a decoded frame of `format` is delivered in: the two layouts
+/// every encoder here accepts. 8-bit widens to s16 exactly; 24/32-bit integer
+/// and 64-bit float go to f32 (24-bit exactly, the others to f32 precision).
+fn decoded_format(format: SampleFormat) -> Result<SampleFormat> {
+    match format {
+        SampleFormat::S16 | SampleFormat::U8 => Ok(SampleFormat::S16),
+        SampleFormat::F32 | SampleFormat::S24 | SampleFormat::S32 | SampleFormat::F64 => {
+            Ok(SampleFormat::F32)
+        }
+        other => Err(Error::unsupported(format!(
+            "pcm decode: sample format `{}` (interleaved u8/s16/s24/s32/f32/f64 only)",
+            other.name()
+        ))),
+    }
+}
+
+/// Convert interleaved `format` samples to [`decoded_format`]'s layout.
+/// `S16` and `F32` pass through untouched (no copy beyond the packet's).
+fn widen(format: SampleFormat, data: &[u8]) -> Vec<u8> {
+    match format {
+        SampleFormat::U8 => data
+            .iter()
+            .flat_map(|&b| (((b as i16) - 128) << 8).to_le_bytes())
+            .collect(),
+        SampleFormat::S24 => data
+            .chunks_exact(3)
+            .flat_map(|c| {
+                let v = i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 8;
+                (v as f32 / 8_388_608.0).to_le_bytes()
+            })
+            .collect(),
+        SampleFormat::S32 => data
+            .chunks_exact(4)
+            .map(|c| {
+                let v = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                (v as f64 / 2_147_483_648.0) as f32
+            })
+            .flat_map(f32::to_le_bytes)
+            .collect(),
+        SampleFormat::F64 => data
+            .chunks_exact(8)
+            .flat_map(|c| {
+                let v = f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+                (v as f32).to_le_bytes()
+            })
+            .collect(),
+        _ => data.to_vec(),
+    }
 }
 
 /// Reject sample layouts this codec can't handle (planar is unsupported).
@@ -45,7 +97,7 @@ impl Decoder for PcmDecoder {
         let format = params
             .sample_format
             .ok_or_else(|| Error::invalid("pcm decode: stream is missing a sample format"))?;
-        check_interleaved(format, "pcm decode")?;
+        decoded_format(format)?;
         self.sample_rate = params.sample_rate;
         self.channels = params.channels.max(1);
         self.format = Some(format);
@@ -65,8 +117,8 @@ impl Decoder for PcmDecoder {
         self.frame = Some(Frame::Audio(AudioFrame {
             sample_rate: self.sample_rate,
             channels: self.channels,
-            format,
-            planes: vec![packet.data.clone()],
+            format: decoded_format(format)?,
+            planes: vec![widen(format, &packet.data[..samples * frame_bytes])],
             samples,
             pts: packet.pts,
         }));
@@ -159,6 +211,78 @@ mod tests {
         let mut enc = PcmEncoder::default();
         enc.send_frame(&Frame::Audio(af)).unwrap();
         assert_eq!(enc.receive_packet().unwrap().data, data);
+    }
+
+    fn decode_one(format: SampleFormat, channels: u16, data: Vec<u8>) -> AudioFrame {
+        let mut dec = PcmDecoder::default();
+        dec.configure(&CodecParams {
+            sample_rate: 48_000,
+            channels,
+            sample_format: Some(format),
+            ..Default::default()
+        })
+        .unwrap();
+        dec.send_packet(&Packet::from_data(0, data)).unwrap();
+        let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+            unreachable!()
+        };
+        af
+    }
+
+    fn f32s(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    #[test]
+    fn camera_layouts_widen_to_what_encoders_take() {
+        // u8: 0x80 is silence, 0x00 full negative, 0xFF just under full positive.
+        let af = decode_one(SampleFormat::U8, 1, vec![0x80, 0x00, 0xFF]);
+        assert_eq!(af.format, SampleFormat::S16);
+        assert_eq!(af.samples, 3);
+        assert_eq!(
+            af.planes[0],
+            [0i16, -32768, 32512]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+
+        // s24: +half scale and -full scale, stereo, one frame.
+        let af = decode_one(
+            SampleFormat::S24,
+            2,
+            vec![0x00, 0x00, 0x40, 0x00, 0x00, 0x80],
+        );
+        assert_eq!(af.format, SampleFormat::F32);
+        assert_eq!(af.samples, 1);
+        assert_eq!(f32s(&af.planes[0]), [0.5, -1.0]);
+
+        // s32 and f64 land on the same values.
+        let af = decode_one(
+            SampleFormat::S32,
+            1,
+            [i32::MIN, 1 << 30]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        );
+        assert_eq!(f32s(&af.planes[0]), [-1.0, 0.5]);
+        let af = decode_one(
+            SampleFormat::F64,
+            1,
+            [0.25f64, -0.75]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        );
+        assert_eq!(f32s(&af.planes[0]), [0.25, -0.75]);
+
+        // A trailing partial frame is not decoded as a sample.
+        let af = decode_one(SampleFormat::S24, 2, vec![0; 7]);
+        assert_eq!((af.samples, af.planes[0].len()), (1, 8));
     }
 
     #[test]

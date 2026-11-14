@@ -164,6 +164,9 @@ rusty_av1d = { version = "1.2.1", default-features = false, features = ["bitdept
 # (MIT/Apache-2.0), carried forward in-tree. DEFLATE via miniz_oxide/fdeflate,
 # with an opt-in pure-Rust `zlib-rs` backend. See crates/rusty_png/NOTICE.md.
 rusty_png = { path = "crates/rusty_png", version = "0.3.2", features = ["parallel"] }
+# zlib inflate for Matroska ContentCompression (rff-format-mkv); the same
+# miniz_oxide release rusty_png already pulls in.
+miniz_oxide = "0.8.9"
 # gif: our own rusty_gif — a performance fork of image-rs/image-gif 0.14.2
 # with the NeuQuant quantizer (color_quant 1.1.0) vendored in-tree. Kept under
 # the `gif` dependency name so rff-side imports are unchanged. See
