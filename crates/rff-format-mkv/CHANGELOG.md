@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mkv-v0.4.7...rff-format-mkv-v0.4.8) - 2026-11-14
+
+### Fixed
+
+- *(mkv)* take a track's CodecDelay off its timestamps
+- *(mkv)* split laced blocks into their frames instead of dropping them
+
 ## [0.4.5](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mkv-v0.4.4...rff-format-mkv-v0.4.5) - 2026-10-29
 
 ### Fixed

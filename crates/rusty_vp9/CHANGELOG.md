@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_vp9-v0.2.0...rusty_vp9-v0.2.1) - 2026-11-14
+
+### Other
+
+- release v0.3.14
+
 ## [0.2.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_vp9-v0.1.3...rusty_vp9-v0.2.0) - 2026-11-13
 
 ### Fixed
