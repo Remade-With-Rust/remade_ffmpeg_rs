@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/remade-ffmpeg-v0.4.8...remade-ffmpeg-v0.5.0) - 2026-11-14
+
+### Added
+
+- *(mp4)* QuickTime MOV muxer, ProRes/DNx, PCM in MOV, timecode, colour/HDR, fragmented reads ([#110](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/110))
+
+### Other
+
+- *(targets)* vp9 now stream-copies into mp4 (vp09 + vpcC, #110)
+
 ## [0.4.8](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/remade-ffmpeg-v0.4.7...remade-ffmpeg-v0.4.8) - 2026-11-14
 
 ### Other

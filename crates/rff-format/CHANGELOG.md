@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-v0.4.8...rff-format-v0.5.0) - 2026-11-14
+
+### Added
+
+- *(core)* [**breaking**] video metadata, block additions, copy-only codecs and wider PCM for FilmCraft ([#110](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/110))
+
 ## [0.3.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-v0.3.0...rff-format-v0.3.1) - 2026-10-23
 
 ### Added
