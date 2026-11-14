@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mp4-v0.4.8...rff-format-mp4-v0.5.0) - 2026-11-14
+
+### Added
+
+- *(mp4)* QuickTime MOV muxer, ProRes/DNx, PCM in MOV, timecode, colour/HDR, fragmented reads ([#110](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/110))
+
+### Fixed
+
+- *(mp4)* keep PCM out of the mp4 muxer; it stays a mov feature
+
 ## [0.4.5](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mp4-v0.4.4...rff-format-mp4-v0.4.5) - 2026-10-29
 
 ### Fixed
