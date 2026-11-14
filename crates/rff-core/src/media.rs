@@ -80,6 +80,21 @@ pub enum CodecId {
     Subrip,
     /// WebVTT subtitle (`.vtt`): plain-text cues with `HH:MM:SS.mmm` timing.
     WebVtt,
+    /// Apple ProRes video (422 Proxy/LT/standard/HQ, 4444, 4444 XQ). Stream
+    /// copy only; the profile travels as the stream's `codec_tag`.
+    ProRes,
+    /// Avid DNxHD / DNxHR video. Stream copy only.
+    DnxHd,
+    /// APV (Advanced Professional Video). Stream copy only.
+    Apv,
+    /// VP8 video. Stream copy only.
+    Vp8,
+    /// Apple Lossless (ALAC) audio. Stream copy only.
+    Alac,
+    /// Dolby Digital (AC-3) audio. Stream copy only.
+    Ac3,
+    /// Dolby Digital Plus (E-AC-3) audio. Stream copy only.
+    Eac3,
 }
 
 impl CodecId {
@@ -107,6 +122,13 @@ impl CodecId {
             CodecId::RawVideo => "rawvideo",
             CodecId::Subrip => "subrip",
             CodecId::WebVtt => "webvtt",
+            CodecId::ProRes => "prores",
+            CodecId::DnxHd => "dnxhd",
+            CodecId::Apv => "apv",
+            CodecId::Vp8 => "vp8",
+            CodecId::Alac => "alac",
+            CodecId::Ac3 => "ac3",
+            CodecId::Eac3 => "eac3",
         }
     }
 
@@ -133,6 +155,8 @@ impl CodecId {
             CodecId::RawVideo => MediaType::Video,
             CodecId::Subrip => MediaType::Subtitle,
             CodecId::WebVtt => MediaType::Subtitle,
+            CodecId::ProRes | CodecId::DnxHd | CodecId::Apv | CodecId::Vp8 => MediaType::Video,
+            CodecId::Alac | CodecId::Ac3 | CodecId::Eac3 => MediaType::Audio,
         }
     }
 
@@ -145,8 +169,12 @@ impl CodecId {
     /// an internal detail, not something the CLI name selects.
     pub fn sample_format_from_name(name: &str) -> Option<SampleFormat> {
         match name {
+            "pcm_u8" => Some(SampleFormat::U8),
             "pcm_s16le" => Some(SampleFormat::S16),
+            "pcm_s24le" => Some(SampleFormat::S24),
+            "pcm_s32le" => Some(SampleFormat::S32),
             "pcm_f32le" => Some(SampleFormat::F32),
+            "pcm_f64le" => Some(SampleFormat::F64),
             _ => None,
         }
     }
@@ -162,7 +190,8 @@ impl CodecId {
             "mjpeg" | "jpeg" | "jpg" => Some(CodecId::Jpeg),
             "gif" => Some(CodecId::Gif),
             "webp" => Some(CodecId::Webp),
-            "pcm" | "pcm_s16le" | "pcm_f32le" => Some(CodecId::Pcm),
+            "pcm" | "pcm_u8" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le"
+            | "pcm_f64le" => Some(CodecId::Pcm),
             "vorbis" => Some(CodecId::Vorbis),
             "flac" => Some(CodecId::Flac),
             "jpegxl" | "jxl" => Some(CodecId::Jxl),
@@ -173,6 +202,13 @@ impl CodecId {
             "rawvideo" | "yuv4mpegpipe" => Some(CodecId::RawVideo),
             "srt" | "subrip" => Some(CodecId::Subrip),
             "vtt" | "webvtt" => Some(CodecId::WebVtt),
+            "prores" | "prores_ks" => Some(CodecId::ProRes),
+            "dnxhd" | "dnxhr" => Some(CodecId::DnxHd),
+            "apv" => Some(CodecId::Apv),
+            "vp8" | "libvpx" => Some(CodecId::Vp8),
+            "alac" => Some(CodecId::Alac),
+            "ac3" => Some(CodecId::Ac3),
+            "eac3" => Some(CodecId::Eac3),
             _ => None,
         }
     }
@@ -294,7 +330,9 @@ impl PixelFormat {
     }
 }
 
-/// Raw audio sample layout. A small starter subset.
+/// Raw audio sample layout. Multi-byte samples are little-endian; containers
+/// that store big-endian PCM (QuickTime `twos`, `in24`, ...) swap on the way
+/// in and out, so a buffer of a given format always means one byte order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SampleFormat {
@@ -304,6 +342,14 @@ pub enum SampleFormat {
     F32,
     /// 32-bit float, planar (one buffer per channel).
     F32Planar,
+    /// Unsigned 8-bit (128 = silence), interleaved.
+    U8,
+    /// Signed 24-bit packed in 3 bytes, interleaved.
+    S24,
+    /// Signed 32-bit, interleaved.
+    S32,
+    /// 64-bit float, interleaved.
+    F64,
 }
 
 impl SampleFormat {
@@ -312,14 +358,21 @@ impl SampleFormat {
             SampleFormat::S16 => "s16",
             SampleFormat::F32 => "flt",
             SampleFormat::F32Planar => "fltp",
+            SampleFormat::U8 => "u8",
+            SampleFormat::S24 => "s24",
+            SampleFormat::S32 => "s32",
+            SampleFormat::F64 => "dbl",
         }
     }
 
     /// Bytes occupied by one sample of one channel.
     pub fn bytes_per_sample(self) -> usize {
         match self {
+            SampleFormat::U8 => 1,
             SampleFormat::S16 => 2,
-            SampleFormat::F32 | SampleFormat::F32Planar => 4,
+            SampleFormat::S24 => 3,
+            SampleFormat::S32 | SampleFormat::F32 | SampleFormat::F32Planar => 4,
+            SampleFormat::F64 => 8,
         }
     }
 }

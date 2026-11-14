@@ -14,10 +14,12 @@ pub mod frame;
 pub mod media;
 pub mod packet;
 pub mod rational;
+pub mod video;
 
 pub use dict::Dictionary;
 pub use error::{Error, Result};
 pub use frame::{AudioFrame, Frame, VideoFrame};
 pub use media::{CodecId, ColorRange, MediaType, PixelFormat, SampleFormat};
-pub use packet::{Packet, PacketFlags};
+pub use packet::{BlockAdditional, Packet, PacketFlags};
 pub use rational::Rational;
+pub use video::{CleanAperture, ColorInfo, ContentLightLevel, MasteringDisplay, Timecode};
