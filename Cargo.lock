@@ -4910,7 +4910,7 @@ dependencies = [
 
 [[package]]
 name = "rff-cli"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "remade-ffmpeg",
  "rff-core",
@@ -5080,7 +5080,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-webp"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5291,7 +5291,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-webp"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5332,7 +5332,7 @@ version = "0.4.8"
 
 [[package]]
 name = "rff-server"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "axum",
  "remade-ffmpeg",
@@ -5782,7 +5782,7 @@ version = "0.2.1"
 
 [[package]]
 name = "rusty_webp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "byteorder-lite",
  "quick-error",
