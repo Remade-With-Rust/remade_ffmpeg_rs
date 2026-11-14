@@ -4,12 +4,25 @@
 [![By Mata Network](https://img.shields.io/badge/by-Mata%20Network-5b2be0)](https://www.mata.network)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/LICENSE)
 
-The **MP4 / MOV (ISOBMFF)** container demuxer for **remade_ffmpeg_rs** — our own
-code, not a binding.
+The **MP4 / QuickTime MOV (ISOBMFF)** container demuxer and muxers for
+**remade_ffmpeg_rs** — our own code, not a binding.
 
-- **Demux + mux** driven by the sample tables.
-- **Video**: AV1 (`av01`/`av1C`) and H.264 (`avc1`/`avcC`).
-- **Audio**: Opus (`dOps`) and AAC with `esds` config on both demux and mux — so `rff -i in.wav out.m4a` writes a playable AAC MP4.
+- **Two formats, one reader.** `mp4` writes ISO files (`isom`), `mov` writes
+  QuickTime (`qt  `); the demuxer reads both, progressive or **fragmented**
+  (`moof`/`traf`/`trun`/`tfdt`/`tfhd` with `mvex`/`trex` defaults).
+- **Video**: H.264 (`avc1`/`avcC`), HEVC (demux), AV1 (`av01`/`av1C`),
+  VP9 (`vp09`/`vpcC`), APV (`apv1`/`apvC`), and in MOV **ProRes**
+  (`apco` `apcs` `apcn` `apch` `ap4h` `ap4x`, the profile kept as the
+  stream's `codec_tag`) and **DNxHD/DNxHR** (`AVdn`/`AVdh`).
+- **Audio**: AAC (`esds`), Opus (`dOps`), FLAC (`fLaC`/`dfLa`), ALAC,
+  AC-3 / E-AC-3 (`dac3`/`dec3`, derived from the first frame when the source
+  has none), and **PCM**: QuickTime `sowt` `twos` `in24` `in32` `fl32` `fl64`
+  `lpcm` `raw ` with sound description v0/v1/v2 and `enda`, ISO `ipcm`/`fpcm`.
+  PCM comes out little-endian (one packet per chunk) and goes back in the
+  source's own entry on a remux.
+- **Descriptive boxes**, read and written: `colr` (`nclc`/`nclx`), `pasp`,
+  `clap`, `mdcv`, `clli`, and the QuickTime **timecode track** (`tmcd` +
+  `tref`), surfaced as the video stream's start `timecode`.
 - Pure Rust, no C/FFI.
 
 ## Usage

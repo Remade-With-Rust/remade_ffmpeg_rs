@@ -214,7 +214,19 @@ fn declared_codecs_are_registered_or_documented() {
         for &codec in f.mux_caps.codecs {
             let known = engine.codecs.by_id(codec).is_some()
                 // Text-cue "codecs" ride the subtitle path, not the registry.
-                || matches!(codec, CodecId::Subrip | CodecId::WebVtt);
+                || matches!(codec, CodecId::Subrip | CodecId::WebVtt)
+                // Professional and broadcast codecs rff carries as a stream
+                // copy (MOV / MP4 / Matroska) without decoding or encoding.
+                || matches!(
+                    codec,
+                    CodecId::ProRes
+                        | CodecId::DnxHd
+                        | CodecId::Apv
+                        | CodecId::Vp8
+                        | CodecId::Alac
+                        | CodecId::Ac3
+                        | CodecId::Eac3
+                );
             assert!(known, "`{}` declares unknown codec `{codec}`", f.name);
         }
     }
