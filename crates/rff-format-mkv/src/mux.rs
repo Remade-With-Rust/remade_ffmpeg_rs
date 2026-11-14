@@ -25,22 +25,43 @@
 //! * Opus/AAC/FLAC CodecPrivate come from `extradata` when present and are
 //!   synthesized from the stream parameters otherwise.
 //!
-//! WebM is the restricted doctype: VP9/AV1 video, Opus/Vorbis audio, WebVTT
-//! subtitles; anything else is refused rather than written as an invalid file.
+//! WebM is the restricted doctype: VP8/VP9/AV1 video, Opus/Vorbis audio,
+//! WebVTT subtitles; anything else is refused rather than written as an
+//! invalid file. Matroska also takes AC-3, E-AC-3 and ALAC (stream copy).
+//!
+//! Stream and packet metadata written back:
+//! * Video `Colour` with only the fields that say something (the element is
+//!   omitted when nothing is specified), `AlphaMode` + `MaxBlockAdditionID`
+//!   for [`Stream::alpha_mode`].
+//! * `CodecDelay` / `SeekPreRoll` from the stream; Opus falls back as FFmpeg
+//!   does (CodecDelay = the OpusHead pre-skip, SeekPreRoll = 80 ms). The codec
+//!   delay is added to every block timestamp, the inverse of the demuxer.
+//! * A packet with [`Packet::additions`] becomes a BlockGroup with
+//!   BlockAdditions; since a BlockGroup has no keyframe flag, a non-keyframe
+//!   one carries a ReferenceBlock to the track's previous block (FFmpeg's
+//!   choice of value).
 
 use std::collections::VecDeque;
 use std::io::{Seek, SeekFrom, Write};
 
-use rff_core::{CodecId, Error, MediaType, Packet, Result, SampleFormat};
+use rff_core::{
+    BlockAdditional, CodecId, ColorRange, Error, MasteringDisplay, MediaType, Packet, Result,
+    SampleFormat,
+};
 use rff_format::avc::{build_avcc_record, split_annexb};
 use rff_format::{Muxer, Output, SeekOutput, Stream};
 
 use crate::{
-    ID_AUDIO, ID_BIT_DEPTH, ID_BLOCK, ID_BLOCK_DURATION, ID_BLOCK_GROUP, ID_CHANNELS, ID_CLUSTER,
-    ID_CODEC_ID, ID_CODEC_PRIVATE, ID_CUES, ID_DISCARD_PADDING, ID_DURATION, ID_INFO,
-    ID_PIXEL_HEIGHT, ID_PIXEL_WIDTH, ID_SAMPLING_FREQUENCY, ID_SEGMENT, ID_SIMPLE_BLOCK,
-    ID_TIMESTAMP, ID_TIMESTAMP_SCALE, ID_TRACKS, ID_TRACK_ENTRY, ID_TRACK_NUMBER, ID_TRACK_TYPE,
-    ID_VIDEO,
+    ID_ALPHA_MODE, ID_AUDIO, ID_BIT_DEPTH, ID_BLOCK, ID_BLOCK_ADDITIONAL, ID_BLOCK_ADDITIONS,
+    ID_BLOCK_ADD_ID, ID_BLOCK_DURATION, ID_BLOCK_GROUP, ID_BLOCK_MORE, ID_CHANNELS, ID_CLUSTER,
+    ID_CODEC_DELAY, ID_CODEC_ID, ID_CODEC_PRIVATE, ID_COLOUR, ID_CUES, ID_DISCARD_PADDING,
+    ID_DURATION, ID_INFO, ID_LUMINANCE_MAX, ID_LUMINANCE_MIN, ID_MASTERING_METADATA,
+    ID_MATRIX_COEFFICIENTS, ID_MAX_BLOCK_ADDITION_ID, ID_MAX_CLL, ID_MAX_FALL, ID_PIXEL_HEIGHT,
+    ID_PIXEL_WIDTH, ID_PRIMARIES, ID_PRIMARY_B_X, ID_PRIMARY_B_Y, ID_PRIMARY_G_X, ID_PRIMARY_G_Y,
+    ID_PRIMARY_R_X, ID_PRIMARY_R_Y, ID_RANGE, ID_REFERENCE_BLOCK, ID_SAMPLING_FREQUENCY,
+    ID_SEEK_PREROLL, ID_SEGMENT, ID_SIMPLE_BLOCK, ID_TIMESTAMP, ID_TIMESTAMP_SCALE, ID_TRACKS,
+    ID_TRACK_ENTRY, ID_TRACK_NUMBER, ID_TRACK_TYPE, ID_TRANSFER_CHARACTERISTICS, ID_VIDEO,
+    ID_WHITE_POINT_X, ID_WHITE_POINT_Y,
 };
 
 // ---- EBML element IDs used only by the muxer ------------------------------
@@ -117,6 +138,15 @@ fn put_positive_int(out: &mut Vec<u8>, id: u32, v: u64) {
     put_elem(out, id, &body);
 }
 
+/// Signed element, minimal big-endian two's complement.
+fn put_int(out: &mut Vec<u8>, id: u32, v: i64) {
+    let mut n = 1;
+    while n < 8 && !(-(1i64 << (8 * n - 1))..1i64 << (8 * n - 1)).contains(&v) {
+        n += 1;
+    }
+    put_elem(out, id, &v.to_be_bytes()[8 - n..]);
+}
+
 /// Unsigned element padded to exactly 8 bytes — used where the value is patched
 /// in after layout (SeekPosition), so the element's size never changes.
 fn put_uint_fixed8(out: &mut Vec<u8>, id: u32, v: u64) {
@@ -143,6 +173,30 @@ fn opus_head(channels: u16, sample_rate: u32) -> Vec<u8> {
     v.extend_from_slice(&0u16.to_le_bytes()); // output gain
     v.push(0); // mapping family 0 (mono/stereo)
     v
+}
+
+/// The pre-skip of an OpusHead, in ns (pre-skip counts 48 kHz samples).
+fn opus_pre_skip_ns(head: &[u8]) -> u64 {
+    match head.get(10..12) {
+        Some(b) if head.starts_with(b"OpusHead") => {
+            u64::from(u16::from_le_bytes([b[0], b[1]])) * 1_000_000_000 / 48_000
+        }
+        _ => 0,
+    }
+}
+
+/// Opus SeekPreRoll: 80 ms, what libopus needs to converge (RFC 7845 §4.6).
+const OPUS_SEEK_PREROLL_NS: u64 = 80_000_000;
+
+/// ALAC CodecPrivate is the 24-byte `ALACSpecificConfig` (the MP4 magic
+/// cookie). FFmpeg-style extradata wraps it in a 12-byte QuickTime atom
+/// header (`size`, `alac`, version/flags), which comes off.
+fn alac_private(extradata: &[u8]) -> Option<Vec<u8>> {
+    match extradata {
+        [] => None,
+        e if e.len() >= 36 && &e[4..8] == b"alac" => Some(e[12..].to_vec()),
+        e => Some(e.to_vec()),
+    }
 }
 
 /// Unpack rff's `extradata` header packing (u32-LE length + bytes, repeated).
@@ -238,6 +292,12 @@ struct TrackPlan {
     /// Vorbis with no extradata: capture the first three packets as headers.
     vorbis_pending: usize,
     vorbis_headers: Vec<Vec<u8>>,
+    /// `CodecDelay` to write (ns, 0 = none).
+    codec_delay_ns: u64,
+    /// The codec delay in ms (1 ms ticks), added to every block timestamp.
+    delay_ms: i64,
+    /// `SeekPreRoll` to write (ns, 0 = none).
+    seek_preroll_ns: u64,
 }
 
 /// One buffered frame, timestamp already in milliseconds.
@@ -252,7 +312,16 @@ struct BufBlock {
     /// Matroska `DiscardPadding` in ns (0 = none): the packet's
     /// [`Packet::discard_padding`] samples at the track's rate.
     discard_ns: u64,
+    /// Matroska `BlockAdditions` ([`Packet::additions`]).
+    additions: Vec<BlockAdditional>,
     data: Vec<u8>,
+}
+
+impl BufBlock {
+    /// Payload bytes held in memory (for the interleave cap).
+    fn payload_len(&self) -> usize {
+        self.data.len() + self.additions.iter().map(|a| a.data.len()).sum::<usize>()
+    }
 }
 
 fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
@@ -266,15 +335,19 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
         is_av1: false,
         vorbis_pending: 0,
         vorbis_headers: Vec::new(),
+        codec_delay_ns: 0,
+        delay_ms: 0,
+        seek_preroll_ns: 0,
     };
     let webm_reject = |name: &str| {
         Err(Error::unsupported(format!(
-            "webm mux: `{name}` is not a WebM codec (VP9/AV1 video, Opus/Vorbis audio); \
+            "webm mux: `{name}` is not a WebM codec (VP8/VP9/AV1 video, Opus/Vorbis audio); \
              write .mkv instead"
         )))
     };
     match s.codec_id {
         CodecId::Vp9 => plan.codec = "V_VP9",
+        CodecId::Vp8 => plan.codec = "V_VP8",
         CodecId::Avif => {
             plan.codec = "V_AV1";
             plan.is_av1 = true;
@@ -329,6 +402,15 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
             }
             plan.codec = "A_MPEG/L3";
         }
+        CodecId::Ac3 | CodecId::Eac3 | CodecId::Alac if webm => {
+            return webm_reject(s.codec_id.name());
+        }
+        CodecId::Ac3 => plan.codec = "A_AC3",
+        CodecId::Eac3 => plan.codec = "A_EAC3",
+        CodecId::Alac => {
+            plan.codec = "A_ALAC";
+            plan.private = alac_private(&s.extradata);
+        }
         CodecId::Pcm => {
             if webm {
                 return webm_reject("pcm");
@@ -364,18 +446,97 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
             )))
         }
     }
+    let opus = s.codec_id == CodecId::Opus;
+    plan.codec_delay_ns = match s.codec_delay_ns {
+        0 if opus => plan.private.as_deref().map_or(0, opus_pre_skip_ns),
+        ns => ns,
+    };
+    plan.seek_preroll_ns = match s.seek_preroll_ns {
+        0 if opus => OPUS_SEEK_PREROLL_NS,
+        ns => ns,
+    };
+    // Rounded to the nearest tick, exactly as the demuxer takes it off.
+    plan.delay_ms =
+        ((u128::from(plan.codec_delay_ns) + 500_000) / 1_000_000).min(i64::MAX as u128) as i64;
     Ok(plan)
+}
+
+/// Codecs whose CodecPrivate only the stream can supply: refuse to write a
+/// header without it, since the file would open but decode nothing.
+fn check_privates(tracks: &[TrackPlan]) -> Result<()> {
+    for plan in tracks {
+        if plan.stream.codec_id == CodecId::Alac && plan.private.is_none() {
+            return Err(Error::invalid(
+                "mkv mux: the alac stream needs its magic cookie as extradata (the \
+                 CodecPrivate) — without it the output would open but decode nothing",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The Video `Colour` element for `s`, carrying only the fields that say
+/// something; `None` when nothing is specified.
+fn colour_element(s: &Stream) -> Option<Vec<u8>> {
+    let mut c = Vec::new();
+    let unspecified = rff_core::ColorInfo::UNSPECIFIED_CODE;
+    if s.color.matrix != unspecified {
+        put_uint(&mut c, ID_MATRIX_COEFFICIENTS, s.color.matrix.into());
+    }
+    match s.color_range {
+        ColorRange::Limited => put_uint(&mut c, ID_RANGE, 1),
+        ColorRange::Full => put_uint(&mut c, ID_RANGE, 2),
+        ColorRange::Unspecified => {}
+    }
+    if s.color.transfer != unspecified {
+        put_uint(&mut c, ID_TRANSFER_CHARACTERISTICS, s.color.transfer.into());
+    }
+    if s.color.primaries != unspecified {
+        put_uint(&mut c, ID_PRIMARIES, s.color.primaries.into());
+    }
+    if let Some(l) = s.content_light {
+        put_uint(&mut c, ID_MAX_CLL, l.max_cll.into());
+        put_uint(&mut c, ID_MAX_FALL, l.max_fall.into());
+    }
+    if let Some(m) = s.mastering_display {
+        let chroma = |v: u16| f64::from(v) * MasteringDisplay::CHROMA_UNIT;
+        let luma = |v: u32| f64::from(v) * MasteringDisplay::LUMA_UNIT;
+        let mut mm = Vec::new();
+        for (id, v) in [
+            (ID_PRIMARY_R_X, chroma(m.red.0)),
+            (ID_PRIMARY_R_Y, chroma(m.red.1)),
+            (ID_PRIMARY_G_X, chroma(m.green.0)),
+            (ID_PRIMARY_G_Y, chroma(m.green.1)),
+            (ID_PRIMARY_B_X, chroma(m.blue.0)),
+            (ID_PRIMARY_B_Y, chroma(m.blue.1)),
+            (ID_WHITE_POINT_X, chroma(m.white_point.0)),
+            (ID_WHITE_POINT_Y, chroma(m.white_point.1)),
+            (ID_LUMINANCE_MAX, luma(m.max_luminance)),
+            (ID_LUMINANCE_MIN, luma(m.min_luminance)),
+        ] {
+            put_float(&mut mm, id, v);
+        }
+        put_elem(&mut c, ID_MASTERING_METADATA, &mm);
+    }
+    (!c.is_empty()).then(|| {
+        let mut e = Vec::new();
+        put_elem(&mut e, ID_COLOUR, &c);
+        e
+    })
 }
 
 // ---- Shared element builders ----------------------------------------------
 
 /// Packet timestamp → milliseconds (the TimestampScale we write is 1 ms).
 /// Timestamps are in the *stream's* time base, per the muxer contract.
+/// Rounds to nearest (halves up) on both sides of zero: a codec-delayed
+/// stream's first timestamps are negative, and truncating division would
+/// pull them towards zero.
 fn to_ms(tb: rff_core::Rational, v: i64) -> i64 {
     if tb.num <= 0 || tb.den <= 0 {
         return v;
     }
-    ((v as i128 * 1000 * tb.num as i128 + (tb.den as i128 / 2)) / tb.den as i128) as i64
+    (v as i128 * 1000 * tb.num as i128 + (tb.den as i128 / 2)).div_euclid(tb.den as i128) as i64
 }
 
 /// The EBML header element.
@@ -446,11 +607,28 @@ fn tracks_element(tracks: &[TrackPlan]) -> Vec<u8> {
         if let Some(private) = &plan.private {
             put_elem(&mut te, ID_CODEC_PRIVATE, private);
         }
+        if plan.codec_delay_ns > 0 {
+            put_uint(&mut te, ID_CODEC_DELAY, plan.codec_delay_ns);
+        }
+        if plan.seek_preroll_ns > 0 {
+            put_uint(&mut te, ID_SEEK_PREROLL, plan.seek_preroll_ns);
+        }
+        let alpha = s.alpha_mode && s.media_type == MediaType::Video;
+        if alpha {
+            // The alpha plane rides as BlockAddID 1.
+            put_uint(&mut te, ID_MAX_BLOCK_ADDITION_ID, BlockAdditional::ALPHA);
+        }
         match s.media_type {
             MediaType::Video => {
                 let mut v = Vec::new();
                 put_uint(&mut v, ID_PIXEL_WIDTH, s.width as u64);
                 put_uint(&mut v, ID_PIXEL_HEIGHT, s.height as u64);
+                if alpha {
+                    put_uint(&mut v, ID_ALPHA_MODE, 1);
+                }
+                if let Some(colour) = colour_element(s) {
+                    v.extend_from_slice(&colour);
+                }
                 put_elem(&mut te, ID_VIDEO, &v);
             }
             MediaType::Audio => {
@@ -489,13 +667,23 @@ fn starts_cluster(cluster_ts: Option<i64>, ts_ms: i64, video_keyframe: bool) -> 
 }
 
 /// Serialize one block around its payload: the bytes before the frame data
-/// and the bytes after it (a BlockGroup's BlockDuration / DiscardPadding).
+/// and the bytes after it (a BlockGroup's other children).
 /// Subtitles need a duration, so they get BlockGroup { Block, BlockDuration };
 /// an audio block with end padding (a stream's last, from an encoder or a
 /// Matroska/WebM source) gets BlockGroup { Block, DiscardPadding }, as
-/// FFmpeg's muxer writes it; everything else is a SimpleBlock carrying the
+/// FFmpeg's muxer writes it; a frame with additions (WebM alpha) gets
+/// BlockGroup { Block, BlockAdditions }. A BlockGroup has no keyframe flag, so
+/// a non-keyframe one also gets a ReferenceBlock: the relative timestamp of
+/// the track's previous block (`prev_ts_ms`), as FFmpeg writes it — or -1
+/// when there is none, or it shares this timestamp, since a reference to
+/// itself would be meaningless. Everything else is a SimpleBlock carrying the
 /// keyframe flag.
-fn block_parts(b: &BufBlock, rel: i16, is_sub: bool) -> (Vec<u8>, Vec<u8>) {
+fn block_parts(
+    b: &BufBlock,
+    rel: i16,
+    is_sub: bool,
+    prev_ts_ms: Option<i64>,
+) -> (Vec<u8>, Vec<u8>) {
     // Block header: track vint + relative i16 + flags.
     let mut hdr = Vec::with_capacity(4);
     put_size(&mut hdr, b.track as u64 + 1); // track numbers are vints
@@ -503,13 +691,32 @@ fn block_parts(b: &BufBlock, rel: i16, is_sub: bool) -> (Vec<u8>, Vec<u8>) {
     let block_len = (hdr.len() + 1 + b.data.len()) as u64;
     let mut head = Vec::with_capacity(32);
     let mut tail = Vec::new();
-    if is_sub || b.discard_ns > 0 {
+    if is_sub || b.discard_ns > 0 || !b.additions.is_empty() {
         hdr.push(0x00);
         if is_sub {
             put_uint(&mut tail, ID_BLOCK_DURATION, b.duration_ms.max(0) as u64);
         }
+        if !b.keyframe {
+            let reference = prev_ts_ms
+                .map(|p| p.saturating_sub(b.ts_ms))
+                .filter(|&r| r != 0)
+                .unwrap_or(-1);
+            put_int(&mut tail, ID_REFERENCE_BLOCK, reference);
+        }
         if b.discard_ns > 0 {
             put_positive_int(&mut tail, ID_DISCARD_PADDING, b.discard_ns);
+        }
+        if !b.additions.is_empty() {
+            let mut adds = Vec::new();
+            for a in &b.additions {
+                let mut more = Vec::new();
+                if a.id != 1 {
+                    put_uint(&mut more, ID_BLOCK_ADD_ID, a.id);
+                }
+                put_elem(&mut more, ID_BLOCK_ADDITIONAL, &a.data);
+                put_elem(&mut adds, ID_BLOCK_MORE, &more);
+            }
+            put_elem(&mut tail, ID_BLOCK_ADDITIONS, &adds);
         }
         let group_len = id_len(ID_BLOCK) + size_len(block_len) + block_len + tail.len() as u64;
         put_id(&mut head, ID_BLOCK_GROUP);
@@ -610,6 +817,8 @@ fn prepare_block(tracks: &mut [TrackPlan], packet: &Packet) -> Result<Option<Buf
 
     let tb = plan.stream.time_base;
     let audio = plan.stream.media_type == MediaType::Audio;
+    let sub = plan.stream.media_type == MediaType::Subtitle;
+    let delay = plan.delay_ms;
     let rate = plan.stream.sample_rate as u64;
     // Samples → ns, rounded to nearest (FFmpeg's matroskaenc rescale); the
     // demuxer's rounding back recovers the sample count exactly.
@@ -619,12 +828,15 @@ fn prepare_block(tracks: &mut [TrackPlan], packet: &Packet) -> Result<Option<Buf
     };
     Ok(Some(BufBlock {
         track: idx,
-        ts_ms: to_ms(tb, packet.pts.or(packet.dts).unwrap_or(0)),
-        dts_ms: packet.dts.map(|d| to_ms(tb, d)),
+        // The codec delay goes on, as FFmpeg's muxer adds it (the demuxer takes it off).
+        ts_ms: to_ms(tb, packet.pts.or(packet.dts).unwrap_or(0)).saturating_add(delay),
+        dts_ms: packet.dts.map(|d| to_ms(tb, d).saturating_add(delay)),
         duration_ms: to_ms(tb, packet.duration.max(0)),
-        // Audio frames are all random-access; trust the flag on video.
-        keyframe: audio || packet.flags.keyframe,
+        // Audio frames and subtitle cues are all random-access; trust the flag
+        // on video.
+        keyframe: audio || sub || packet.flags.keyframe,
         discard_ns,
+        additions: packet.additions.clone(),
         data,
     }))
 }
@@ -741,6 +953,7 @@ impl Muxer for MkvMuxer {
 
         // A missing H.264 config means no SPS/PPS ever appeared — the file
         // would be undecodable; refuse rather than write it silently broken.
+        check_privates(&self.tracks)?;
         for (i, plan) in self.tracks.iter().enumerate() {
             if plan.is_avc && plan.private.is_none() && self.blocks.iter().any(|b| b.track == i) {
                 return Err(missing_avc_config());
@@ -766,6 +979,7 @@ impl Muxer for MkvMuxer {
             .collect();
 
         let mut clusters: Vec<(i64, Vec<u8>)> = Vec::new(); // (cluster ts, body)
+        let mut last_ts: Vec<Option<i64>> = vec![None; self.tracks.len()];
         for b in &self.blocks {
             let video_key = is_video[b.track] && b.keyframe;
             if starts_cluster(clusters.last().map(|c| c.0), b.ts_ms, video_key) {
@@ -775,7 +989,8 @@ impl Muxer for MkvMuxer {
             }
             let (cts, body) = clusters.last_mut().expect("just ensured");
             let rel = (b.ts_ms - *cts).clamp(i16::MIN as i64, i16::MAX as i64) as i16;
-            let (head, tail) = block_parts(b, rel, is_sub[b.track]);
+            let (head, tail) = block_parts(b, rel, is_sub[b.track], last_ts[b.track]);
+            last_ts[b.track] = Some(b.ts_ms);
             body.extend_from_slice(&head);
             body.extend_from_slice(&b.data);
             body.extend_from_slice(&tail);
@@ -946,6 +1161,9 @@ pub struct MkvStreamingMuxer {
     cues: Vec<(i64, u64)>,
     /// Segment duration so far: the max block end (ms).
     end_ms: Option<i64>,
+    /// Per track, the timestamp (ms) of the last block written: what a
+    /// ReferenceBlock points back to.
+    last_ts: Vec<Option<i64>>,
 }
 
 impl MkvStreamingMuxer {
@@ -972,6 +1190,7 @@ impl MkvStreamingMuxer {
             cluster: None,
             cues: Vec::new(),
             end_ms: None,
+            last_ts: Vec::new(),
         }
     }
 
@@ -1018,6 +1237,7 @@ impl MkvStreamingMuxer {
                 return Err(missing_avc_config());
             }
         }
+        check_privates(&self.tracks)?;
         self.base = self.out.stream_position()?;
         let ebml = ebml_header(self.webm);
         self.write(&ebml)?;
@@ -1079,7 +1299,7 @@ impl MkvStreamingMuxer {
                 return Ok(());
             }
             let e = self.queues[track].pop_front().expect("non-empty");
-            self.queued_bytes -= e.block.data.len();
+            self.queued_bytes -= e.block.payload_len();
             self.write_block(&e.block)?;
         }
     }
@@ -1100,7 +1320,8 @@ impl MkvStreamingMuxer {
         }
         let cts = self.cluster.as_ref().expect("cluster open").ts_ms;
         let rel = (b.ts_ms - cts).clamp(i16::MIN as i64, i16::MAX as i64) as i16;
-        let (head, tail) = block_parts(b, rel, self.is_sub[b.track]);
+        let (head, tail) = block_parts(b, rel, self.is_sub[b.track], self.last_ts[b.track]);
+        self.last_ts[b.track] = Some(b.ts_ms);
         self.write(&head)?;
         self.write(&b.data)?;
         self.write(&tail)?;
@@ -1156,6 +1377,7 @@ impl Muxer for MkvStreamingMuxer {
         self.is_video = kind(MediaType::Video);
         self.is_sub = kind(MediaType::Subtitle);
         self.queues = self.tracks.iter().map(|_| VecDeque::new()).collect();
+        self.last_ts = vec![None; self.tracks.len()];
         if self.header_ready() {
             self.write_file_header()?;
         }
@@ -1169,13 +1391,9 @@ impl Muxer for MkvStreamingMuxer {
         let Some(block) = prepare_block(&mut self.tracks, packet)? else {
             return self.pump(false);
         };
-        let tb = self.tracks[block.track].stream.time_base;
-        let key_ms = match packet.dts {
-            Some(dts) => to_ms(tb, dts),
-            None => block.ts_ms,
-        };
+        let key_ms = block.dts_ms.unwrap_or(block.ts_ms);
         self.max_key_ms = self.max_key_ms.max(key_ms);
-        self.queued_bytes += block.data.len();
+        self.queued_bytes += block.payload_len();
         self.seq += 1;
         self.queues[block.track].push_back(Queued {
             key_ms,
@@ -1774,6 +1992,7 @@ mod tests {
             duration_ms: 40,
             keyframe: true,
             discard_ns: 0,
+            additions: Vec::new(),
             data: vec![0u8; 512 << 20],
         };
         for _ in 0..10 {
@@ -1807,6 +2026,7 @@ mod tests {
             duration_ms: 40,
             keyframe: false,
             discard_ns: 0,
+            additions: Vec::new(),
             data: Vec::new(),
         }
     }

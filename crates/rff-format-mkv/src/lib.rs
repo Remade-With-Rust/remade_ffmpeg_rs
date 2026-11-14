@@ -10,13 +10,39 @@
 //! (Simple)Block into a [`Packet`]; peak memory is one block, not the file.
 //! The muxers (in [`mux`]) write the inverse: SeekHead + Info + Tracks +
 //! Clusters + Cues -- streamed on a seekable output, buffered otherwise.
+//!
+//! Beyond the frames themselves, both directions carry what an editor needs
+//! to keep a remux faithful:
+//!
+//! * Video `Colour` (matrix, range, transfer, primaries, MaxCLL/MaxFALL,
+//!   MasteringMetadata) ↔ [`Stream::color`], [`Stream::color_range`],
+//!   [`Stream::content_light`], [`Stream::mastering_display`].
+//! * `AlphaMode` ↔ [`Stream::alpha_mode`], and `BlockAdditions` ↔
+//!   [`Packet::additions`] (WebM VP8/VP9 alpha is BlockAddID 1). A laced block's
+//!   additions go on every frame of the block, as matroskadec does.
+//! * `CodecDelay` / `SeekPreRoll` ↔ [`Stream::codec_delay_ns`] /
+//!   [`Stream::seek_preroll_ns`]. The demuxer takes the codec delay off every
+//!   timestamp and the muxer puts it back on, so a remux keeps them stable.
+//! * A BlockGroup is a keyframe exactly when it has no `ReferenceBlock`, as in
+//!   matroskadec; the muxer writes one for non-keyframes it puts in groups.
+//! * `ContentEncodings` (demux only): header stripping and zlib are undone on
+//!   every frame (scope 1) and on CodecPrivate (scope 2) before any other
+//!   processing. Encrypted tracks, and bzlib/LZO compression, make
+//!   `read_header` fail with [`Error::Unsupported`] naming the track: the file
+//!   is refused rather than any track's ciphertext handed out as frames.
 
+mod encoding;
+#[cfg(test)]
+mod metadata_tests;
 mod mux;
 
 use std::collections::VecDeque;
 use std::io::{self, BufReader, Read};
 
-use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result, SampleFormat};
+use rff_core::{
+    BlockAdditional, CodecId, ColorInfo, ColorRange, ContentLightLevel, Error, MasteringDisplay,
+    MediaType, Packet, Rational, Result, SampleFormat,
+};
 use rff_format::avc::{avcc_to_annexb, parse_avcc, AvcConfig};
 use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Stream};
 
@@ -36,6 +62,7 @@ pub fn register(registry: &mut FormatRegistry) {
         probe: Some(probe_mkv),
         mux_caps: MuxCaps::container(&[
             CodecId::Vp9,
+            CodecId::Vp8,
             CodecId::Avif,
             CodecId::H264,
             CodecId::Opus,
@@ -44,6 +71,9 @@ pub fn register(registry: &mut FormatRegistry) {
             CodecId::Flac,
             CodecId::Mp3,
             CodecId::Pcm,
+            CodecId::Ac3,
+            CodecId::Eac3,
+            CodecId::Alac,
             CodecId::Subrip,
             CodecId::WebVtt,
         ]),
@@ -58,6 +88,7 @@ pub fn register(registry: &mut FormatRegistry) {
         probe: None, // content-probing is matroska's job; webm is chosen by name
         mux_caps: MuxCaps::container(&[
             CodecId::Vp9,
+            CodecId::Vp8,
             CodecId::Avif,
             CodecId::Opus,
             CodecId::Vorbis,
@@ -104,6 +135,28 @@ const ID_SAMPLING_FREQUENCY: u32 = 0xB5;
 const ID_CHANNELS: u32 = 0x9F;
 const ID_BIT_DEPTH: u32 = 0x6264;
 const ID_CODEC_DELAY: u32 = 0x56AA;
+const ID_SEEK_PREROLL: u32 = 0x56BB;
+const ID_MAX_BLOCK_ADDITION_ID: u32 = 0x55EE;
+const ID_CONTENT_ENCODINGS: u32 = 0x6D80;
+const ID_ALPHA_MODE: u32 = 0x53C0;
+const ID_COLOUR: u32 = 0x55B0;
+const ID_MATRIX_COEFFICIENTS: u32 = 0x55B1;
+const ID_RANGE: u32 = 0x55B9;
+const ID_TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
+const ID_PRIMARIES: u32 = 0x55BB;
+const ID_MAX_CLL: u32 = 0x55BC;
+const ID_MAX_FALL: u32 = 0x55BD;
+const ID_MASTERING_METADATA: u32 = 0x55D0;
+const ID_PRIMARY_R_X: u32 = 0x55D1;
+const ID_PRIMARY_R_Y: u32 = 0x55D2;
+const ID_PRIMARY_G_X: u32 = 0x55D3;
+const ID_PRIMARY_G_Y: u32 = 0x55D4;
+const ID_PRIMARY_B_X: u32 = 0x55D5;
+const ID_PRIMARY_B_Y: u32 = 0x55D6;
+const ID_WHITE_POINT_X: u32 = 0x55D7;
+const ID_WHITE_POINT_Y: u32 = 0x55D8;
+const ID_LUMINANCE_MAX: u32 = 0x55D9;
+const ID_LUMINANCE_MIN: u32 = 0x55DA;
 const ID_CLUSTER: u32 = 0x1F43_B675;
 const ID_TIMESTAMP: u32 = 0xE7;
 const ID_SIMPLE_BLOCK: u32 = 0xA3;
@@ -111,6 +164,11 @@ const ID_BLOCK_GROUP: u32 = 0xA0;
 const ID_BLOCK: u32 = 0xA1;
 const ID_BLOCK_DURATION: u32 = 0x9B;
 const ID_DISCARD_PADDING: u32 = 0x75A2;
+const ID_REFERENCE_BLOCK: u32 = 0xFB;
+const ID_BLOCK_ADDITIONS: u32 = 0x75A1;
+const ID_BLOCK_MORE: u32 = 0xA6;
+const ID_BLOCK_ADD_ID: u32 = 0xEE;
+const ID_BLOCK_ADDITIONAL: u32 = 0xA5;
 const ID_CUES: u32 = 0x1C53_BB6B;
 const ID_ATTACHMENTS: u32 = 0x1941_A469;
 const ID_CHAPTERS: u32 = 0x1043_A770;
@@ -252,6 +310,106 @@ impl<'a> Ebml<'a> {
     }
 }
 
+/// The children `(id, body)` of an in-memory element body. A child declaring
+/// more than is left gets what is left; the walk ends at the first header
+/// that doesn't parse.
+fn children(data: &[u8]) -> impl Iterator<Item = (u32, &[u8])> {
+    let mut e = Ebml::new(data);
+    std::iter::from_fn(move || {
+        if e.pos >= data.len() {
+            return None;
+        }
+        let id = e.read_id()?;
+        let (size, _) = e.read_size()?;
+        Some((
+            id,
+            e.read_bytes(usize::try_from(size).unwrap_or(usize::MAX)),
+        ))
+    })
+}
+
+/// An unsigned element's value from its whole body.
+fn uint_of(body: &[u8]) -> u64 {
+    Ebml::new(body).read_uint(body.len())
+}
+
+/// A float element's value from its whole body (0 for a size other than 4/8).
+fn float_of(body: &[u8]) -> f64 {
+    Ebml::new(body).read_float(body.len())
+}
+
+/// Apply a Video `Colour` body to `s`. Absent fields keep their unspecified
+/// defaults; out-of-range code points read as unspecified.
+fn parse_colour(s: &mut Stream, body: &[u8]) {
+    let code = |b: &[u8]| u16::try_from(uint_of(b)).unwrap_or(ColorInfo::UNSPECIFIED_CODE);
+    let level = |b: &[u8]| uint_of(b).min(u16::MAX as u64) as u16;
+    let mut light: Option<ContentLightLevel> = None;
+    for (id, b) in children(body) {
+        match id {
+            ID_MATRIX_COEFFICIENTS => s.color.matrix = code(b),
+            ID_TRANSFER_CHARACTERISTICS => s.color.transfer = code(b),
+            ID_PRIMARIES => s.color.primaries = code(b),
+            ID_RANGE => {
+                s.color_range = match uint_of(b) {
+                    1 => ColorRange::Limited,
+                    2 => ColorRange::Full,
+                    _ => ColorRange::Unspecified,
+                }
+            }
+            ID_MAX_CLL => light.get_or_insert_with(Default::default).max_cll = level(b),
+            ID_MAX_FALL => light.get_or_insert_with(Default::default).max_fall = level(b),
+            ID_MASTERING_METADATA => s.mastering_display = Some(parse_mastering(b)),
+            _ => {}
+        }
+    }
+    if light.is_some() {
+        s.content_light = light;
+    }
+}
+
+/// A `MasteringMetadata` body: floats (CIE 1931 xy, cd/m²) to ST 2086 units.
+fn parse_mastering(body: &[u8]) -> MasteringDisplay {
+    let mut m = MasteringDisplay::default();
+    for (id, b) in children(body) {
+        let v = float_of(b);
+        let c = MasteringDisplay::chroma_from_f64(v);
+        match id {
+            ID_PRIMARY_R_X => m.red.0 = c,
+            ID_PRIMARY_R_Y => m.red.1 = c,
+            ID_PRIMARY_G_X => m.green.0 = c,
+            ID_PRIMARY_G_Y => m.green.1 = c,
+            ID_PRIMARY_B_X => m.blue.0 = c,
+            ID_PRIMARY_B_Y => m.blue.1 = c,
+            ID_WHITE_POINT_X => m.white_point.0 = c,
+            ID_WHITE_POINT_Y => m.white_point.1 = c,
+            ID_LUMINANCE_MAX => m.max_luminance = MasteringDisplay::luma_from_f64(v),
+            ID_LUMINANCE_MIN => m.min_luminance = MasteringDisplay::luma_from_f64(v),
+            _ => {}
+        }
+    }
+    m
+}
+
+/// A `BlockAdditions` body: one [`BlockAdditional`] per `BlockMore` that has
+/// a payload (`BlockAddID` defaults to 1).
+fn parse_block_additions(body: &[u8]) -> Vec<BlockAdditional> {
+    children(body)
+        .filter(|&(id, _)| id == ID_BLOCK_MORE)
+        .filter_map(|(_, more)| {
+            let mut id = 1;
+            let mut data = None;
+            for (cid, b) in children(more) {
+                match cid {
+                    ID_BLOCK_ADD_ID => id = uint_of(b),
+                    ID_BLOCK_ADDITIONAL => data = Some(b.to_vec()),
+                    _ => {}
+                }
+            }
+            data.map(|data| BlockAdditional { id, data })
+        })
+        .collect()
+}
+
 /// An element header read off the stream: `start` is the absolute offset of
 /// its body.
 #[derive(Clone, Copy)]
@@ -367,6 +525,11 @@ struct MkvDemuxer {
     /// Indexed by stream index: the track's CodecDelay in nanoseconds (0: none), the
     /// encoder's priming, which block timestamps include and packet timestamps don't.
     codec_delay: Vec<u64>,
+    /// Indexed by stream index: the frame-scope ContentEncodings to undo.
+    codings: Vec<Vec<encoding::Coding>>,
+    /// A track the demuxer must refuse (encrypted, unsupported compression):
+    /// `read_header` fails with this message.
+    refused: Option<String>,
     /// The rest of a laced block's frames, returned before the walk goes on.
     laced: VecDeque<Packet>,
     timestamp_scale: u64,
@@ -397,6 +560,8 @@ impl MkvDemuxer {
             ass: Vec::new(),
             default_duration_ns: Vec::new(),
             codec_delay: Vec::new(),
+            codings: Vec::new(),
+            refused: None,
             laced: VecDeque::new(),
             timestamp_scale: 1_000_000, // default: 1 ms
             duration_ticks: None,
@@ -422,6 +587,9 @@ impl MkvDemuxer {
     /// first Cluster (Info, Tracks); other elements are streamed past.
     fn parse_headers(&mut self) -> Result<()> {
         let no_tracks = || Error::invalid("mkv: no tracks found");
+        if let Some(why) = &self.refused {
+            return Err(Error::unsupported(why.clone()));
+        }
         if self.done {
             return Err(no_tracks());
         }
@@ -489,6 +657,10 @@ impl MkvDemuxer {
                     self.src.skip(len)?;
                 }
             }
+        }
+        if let Some(why) = &self.refused {
+            self.done = true;
+            return Err(Error::unsupported(why.clone()));
         }
         if self.streams.is_empty() {
             self.done = true;
@@ -587,7 +759,7 @@ impl MkvDemuxer {
                     // A laced block yields several frames: return the first,
                     // queue the rest for the next calls.
                     let packets = if h.id == ID_SIMPLE_BLOCK {
-                        self.parse_block(&body, ts, 0)
+                        self.parse_block(&body, ts, 0, None)
                     } else {
                         self.parse_block_group(&body, ts)
                     };
@@ -656,6 +828,10 @@ impl MkvDemuxer {
         let mut default_duration_ns = 0u64;
         let mut frame_rate = 0.0f64;
         let mut codec_delay = 0u64;
+        let mut seek_preroll = 0u64;
+        let mut alpha_mode = 0u64;
+        let mut colour: Option<&[u8]> = None;
+        let mut encodings: Option<&[u8]> = None;
 
         let mut e = Ebml::new(data);
         while e.pos < data.len() {
@@ -671,6 +847,8 @@ impl MkvDemuxer {
                 ID_CODEC_PRIVATE => codec_private = e.read_bytes(len).to_vec(),
                 ID_DEFAULT_DURATION => default_duration_ns = e.read_uint(len),
                 ID_CODEC_DELAY => codec_delay = e.read_uint(len),
+                ID_SEEK_PREROLL => seek_preroll = e.read_uint(len),
+                ID_CONTENT_ENCODINGS => encodings = Some(e.read_bytes(len)),
                 ID_VIDEO => {
                     let mut v = Ebml::at(data, e.pos);
                     let ve = e.pos.saturating_add(len);
@@ -681,6 +859,8 @@ impl MkvDemuxer {
                             ID_PIXEL_WIDTH => width = v.read_uint(vsz as usize) as u32,
                             ID_PIXEL_HEIGHT => height = v.read_uint(vsz as usize) as u32,
                             ID_FRAME_RATE => frame_rate = v.read_float(vsz as usize),
+                            ID_ALPHA_MODE => alpha_mode = v.read_uint(vsz as usize),
+                            ID_COLOUR => colour = Some(v.read_bytes(vsz as usize)),
                             _ => v.skip(vsz as usize),
                         }
                     }
@@ -704,6 +884,28 @@ impl MkvDemuxer {
                 _ => e.skip(len),
             }
         }
+
+        // ContentEncodings come off before anything reads the CodecPrivate.
+        let codings = match encodings.map(encoding::parse).transpose() {
+            Ok(c) => c.unwrap_or_default(),
+            Err(why) => {
+                self.refused
+                    .get_or_insert(format!("mkv: track {number} ({codec}) {why}"));
+                encoding::Codings::default()
+            }
+        };
+        if !codings.private.is_empty() && !codec_private.is_empty() {
+            match encoding::decode(&codings.private, &codec_private) {
+                Some(p) => codec_private = p,
+                None => {
+                    self.refused.get_or_insert(format!(
+                        "mkv: track {number} ({codec}): its compressed CodecPrivate does not \
+                         decompress"
+                    ));
+                }
+            }
+        }
+        self.codings.push(codings.frames);
 
         let codec_id = map_codec(&codec);
         let is_ass = matches!(codec.as_str(), "S_TEXT/ASS" | "S_TEXT/SSA");
@@ -730,6 +932,14 @@ impl MkvDemuxer {
         s.height = height;
         s.sample_rate = rate;
         s.channels = channels;
+        s.codec_delay_ns = codec_delay;
+        s.seek_preroll_ns = seek_preroll;
+        if s.media_type == MediaType::Video {
+            s.alpha_mode = alpha_mode != 0;
+            if let Some(colour) = colour {
+                parse_colour(&mut s, colour);
+            }
+        }
         // PCM: the codec string + bit depth decide the sample layout.
         if codec_id == CodecId::Pcm {
             s.sample_format = match (codec.as_str(), bit_depth) {
@@ -764,14 +974,18 @@ impl MkvDemuxer {
         self.streams.push(s);
     }
 
-    /// A BlockGroup body. BlockDuration and DiscardPadding may come before or
-    /// after the Block: collect them all, then emit (subtitle cues need their
-    /// duration, a stream's last audio block its padding).
+    /// A BlockGroup body. BlockDuration, DiscardPadding, ReferenceBlock and
+    /// BlockAdditions may come before or after the Block: collect them all,
+    /// then emit (subtitle cues need their duration, a stream's last audio
+    /// block its padding). A BlockGroup's Block has no keyframe flag: as in
+    /// matroskadec, it is a keyframe exactly when no ReferenceBlock is present.
     fn parse_block_group(&self, group: &[u8], cluster_ts: i64) -> Vec<Packet> {
         let mut g = Ebml::new(group);
         let mut block: Option<&[u8]> = None;
         let mut duration = 0i64;
         let mut discard_ns = 0i64;
+        let mut referenced = false;
+        let mut additions = Vec::new();
         while g.pos < group.len() {
             let Some(gid) = g.read_id() else { break };
             let Some((gsz, _)) = g.read_size() else { break };
@@ -779,13 +993,28 @@ impl MkvDemuxer {
                 ID_BLOCK => block = Some(g.read_bytes(gsz as usize)),
                 ID_BLOCK_DURATION => duration = g.read_uint(gsz as usize) as i64,
                 ID_DISCARD_PADDING => discard_ns = g.read_int(gsz as usize),
+                ID_REFERENCE_BLOCK => {
+                    referenced = true;
+                    g.skip(gsz as usize);
+                }
+                ID_BLOCK_ADDITIONS => {
+                    additions.extend(parse_block_additions(g.read_bytes(gsz as usize)))
+                }
                 _ => g.skip(gsz as usize),
             }
         }
         let Some(block) = block else {
             return Vec::new();
         };
-        let mut packets = self.parse_block(block, cluster_ts, duration);
+        let mut packets = self.parse_block(block, cluster_ts, duration, Some(!referenced));
+        // Additions describe the block; a laced one shares them out to every
+        // frame, as matroskadec does (blocks with additions are not laced in
+        // practice).
+        if !additions.is_empty() {
+            for p in &mut packets {
+                p.additions = additions.clone();
+            }
+        }
         // DiscardPadding trims the end of the block, so it belongs to the
         // block's last frame (the only one when, as usual, it is not laced).
         if let Some(last) = packets.last_mut() {
@@ -800,8 +1029,17 @@ impl MkvDemuxer {
 
     /// Parse a (Simple)Block body: track vint, int16 relative timestamp, flags,
     /// then the frame payload, split into its frames when the block is laced.
-    /// `duration` is the BlockGroup's BlockDuration (0 when absent).
-    fn parse_block(&self, block: &[u8], cluster_ts: i64, duration: i64) -> Vec<Packet> {
+    /// `duration` is the BlockGroup's BlockDuration (0 when absent);
+    /// `keyframe` overrides the flags byte (a BlockGroup's is decided by its
+    /// ReferenceBlocks). Frames under a ContentEncoding are decoded first; one
+    /// that fails to (corrupt zlib) is dropped.
+    fn parse_block(
+        &self,
+        block: &[u8],
+        cluster_ts: i64,
+        duration: i64,
+        keyframe: Option<bool>,
+    ) -> Vec<Packet> {
         let mut b = Ebml::new(block);
         let Some((track_num, _)) = b.read_size() else {
             return Vec::new();
@@ -814,7 +1052,7 @@ impl MkvDemuxer {
         let flags = block[b.pos];
         b.pos += 1;
         let lacing = (flags >> 1) & 0x03;
-        let keyframe = flags & 0x80 != 0;
+        let keyframe = keyframe.unwrap_or(flags & 0x80 != 0);
         let Some(&(_, index)) = self.track_map.iter().find(|(n, _)| *n == track_num) else {
             return Vec::new();
         };
@@ -844,6 +1082,22 @@ impl MkvDemuxer {
             let n = n as i64;
             let lace_duration = block_duration.saturating_mul(n + 1) / count
                 - block_duration.saturating_mul(n) / count;
+            let this_pts = pts;
+            pts = match pts {
+                Some(t) if lace_duration != 0 => Some(t.saturating_add(lace_duration)),
+                _ => None,
+            };
+            let decoded;
+            let raw = match self.codings.get(index).filter(|c| !c.is_empty()) {
+                Some(codings) => match encoding::decode(codings, raw) {
+                    Some(d) => {
+                        decoded = d;
+                        &decoded[..]
+                    }
+                    None => continue,
+                },
+                None => raw,
+            };
             // H.264: AVCC → Annex-B, prepending SPS/PPS on keyframes so the
             // decoder is self-contained (mirrors the MP4 demuxer).
             let data = match self.avc.get(index).and_then(|a| a.as_ref()) {
@@ -863,14 +1117,10 @@ impl MkvDemuxer {
                 None => raw.to_vec(),
             };
             let mut packet = Packet::from_data(index, data);
-            packet.pts = pts;
+            packet.pts = this_pts;
             packet.duration = lace_duration.max(0);
             packet.flags.keyframe = keyframe;
             packets.push(packet);
-            pts = match pts {
-                Some(t) if lace_duration != 0 => Some(t.saturating_add(lace_duration)),
-                _ => None,
-            };
         }
         packets
     }
@@ -1013,6 +1263,7 @@ fn map_codec(codec: &str) -> CodecId {
     match codec {
         "V_AV1" => CodecId::Avif, // our AV1 (rav1d) decoder
         "V_VP9" => CodecId::Vp9,
+        "V_VP8" => CodecId::Vp8,
         "V_MPEG4/ISO/AVC" => CodecId::H264,
         "V_MPEGH/ISO/HEVC" => CodecId::Hevc,
         "A_OPUS" => CodecId::Opus,
@@ -1021,6 +1272,9 @@ fn map_codec(codec: &str) -> CodecId {
         "A_FLAC" => CodecId::Flac,
         "A_MPEG/L3" => CodecId::Mp3,
         "A_PCM/INT/LIT" | "A_PCM/FLOAT/IEEE" => CodecId::Pcm,
+        "A_AC3" | "A_AC3/BSID9" | "A_AC3/BSID10" => CodecId::Ac3,
+        "A_EAC3" => CodecId::Eac3,
+        "A_ALAC" => CodecId::Alac,
         // ASS/SSA tracks are reduced to plain text at block level, so they
         // surface as SubRip-contract cues.
         "S_TEXT/UTF8" | "S_TEXT/ASS" | "S_TEXT/SSA" => CodecId::Subrip,
@@ -1846,23 +2100,26 @@ mod tests {
     /// pre-streaming (whole-file buffered) demuxer — except that truncated
     /// cases cut inside a block now end one packet earlier: a cut-off final
     /// block is dropped, as matroskadec does (#89).
+    /// The subtitle cues (BlockGroups without a ReferenceBlock) of
+    /// `subs_pcm` and `ass` are keyframes since #110, as in matroskadec;
+    /// they were read as non-keyframes from the Block's (reserved) flag bit.
     const GOLDENS: &[(&str, usize, u64)] = &[
         ("vp9_opus", 240, 0x96842ed96f2e9d29),
         ("h264", 60, 0xbda95d370f6a1c36),
         ("vorbis", 100, 0x67050340b1055ab7),
-        ("subs_pcm", 132, 0x86965869a4a8cce6),
-        ("ass", 5, 0x11f42feb0e81cfe4),
+        ("subs_pcm", 132, 0x532373fc2f9794d2),
+        ("ass", 5, 0xbc3d3d1b2ec401b4),
         ("unknown_tail", 6, 0xc411396fdf4e6dd7),
         ("h264-1", 60, 0xbda95d370f6a1c36),
-        ("subs_pcm-1", 132, 0x86965869a4a8cce6),
+        ("subs_pcm-1", 132, 0x532373fc2f9794d2),
         ("h264-37", 60, 0xbda95d370f6a1c36),
-        ("subs_pcm-37", 132, 0x86965869a4a8cce6),
+        ("subs_pcm-37", 132, 0x532373fc2f9794d2),
         ("h264-500", 57, 0x944197e69bcc220c),
-        ("subs_pcm-500", 130, 0x10e6b244a52f13e1),
+        ("subs_pcm-500", 130, 0x24696c5276f8986d),
         ("h264-2000", 52, 0x0db854153e912db1),
-        ("subs_pcm-2000", 124, 0x0495861d89070666),
+        ("subs_pcm-2000", 124, 0xa27e3647b5ea09ba),
         ("h264-9000", 25, 0x3d86012f2d1caf9b),
-        ("subs_pcm-9000", 95, 0x3fdcb669f509617a),
+        ("subs_pcm-9000", 95, 0x3b6f23427d9c023e),
         ("ass@7", 0, 0xb88f458891534654),
         ("ass@68", 0, 0xb88f458891534654),
         ("ass@129", 0, 0xb88f458891534654),
@@ -1871,12 +2128,12 @@ mod tests {
         ("ass@312", 0, 0x7602000005937fb4),
         ("ass@373", 0, 0x372ea377fd90c6a2),
         ("ass@434", 0, 0x372ea377fd90c6a2),
-        ("ass@495", 1, 0xece803c11dc71d57),
-        ("ass@556", 2, 0x642e9560534b9b49),
-        ("ass@617", 3, 0x20df468e3a3d3675),
-        ("ass@678", 3, 0x20df468e3a3d3675),
-        ("ass@739", 4, 0xc3afca0a9bc477cf),
-        ("ass@800", 4, 0xc3afca0a9bc477cf),
+        ("ass@495", 1, 0xfcd68ba713f030b6),
+        ("ass@556", 2, 0x473268b97c254ad2),
+        ("ass@617", 3, 0xe5188e9f2efc314c),
+        ("ass@678", 3, 0xe5188e9f2efc314c),
+        ("ass@739", 4, 0xae692cd404adfdff),
+        ("ass@800", 4, 0xae692cd404adfdff),
         ("unknown_tail@7", 0, 0xb88f458891534654),
         ("unknown_tail@68", 0, 0xb88f458891534654),
         ("unknown_tail@129", 0, 0x19e5d80fc8c27d2f),
