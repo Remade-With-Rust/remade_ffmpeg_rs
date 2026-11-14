@@ -390,7 +390,7 @@ fn ac3_frame(n: u8) -> Vec<u8> {
 }
 
 #[test]
-fn mp4_carries_vp9_flac_alac_ac3_and_pcm() {
+fn mp4_carries_vp9_flac_alac_ac3() {
     let mut vp9 = Stream::new(0, CodecId::Vp9);
     vp9.width = 1920;
     vp9.height = 1080;
@@ -416,7 +416,6 @@ fn mp4_carries_vp9_flac_alac_ac3_and_pcm() {
         audio(1, CodecId::Flac, streaminfo.clone()),
         audio(2, CodecId::Alac, cookie.clone()),
         audio(3, CodecId::Ac3, Vec::new()),
-        pcm_stream(4, SampleFormat::F32, 2, None),
     ];
     let mut packets = Vec::new();
     for k in 0..3u8 {
@@ -430,23 +429,13 @@ fn mp4_carries_vp9_flac_alac_ac3_and_pcm() {
             p.flags.keyframe = true;
             packets.push(p);
         }
-        packets.extend(pcm_packets(4, 1600, 8, 1).into_iter().map(|mut p| {
-            p.pts = Some(i64::from(k) * 1600);
-            p
-        }));
     }
     for file in mux_both(Flavor::Mp4, &streams, &packets) {
         assert_eq!(&file[4..12], b"ftypisom");
         let (out, got) = demux(&file);
         assert_eq!(
             out.iter().map(|s| s.codec_id).collect::<Vec<_>>(),
-            [
-                CodecId::Vp9,
-                CodecId::Flac,
-                CodecId::Alac,
-                CodecId::Ac3,
-                CodecId::Pcm
-            ]
+            [CodecId::Vp9, CodecId::Flac, CodecId::Alac, CodecId::Ac3,]
         );
         // nclx colour (written) agrees with the vpcC built from the keyframe.
         assert_eq!(
@@ -460,11 +449,7 @@ fn mp4_carries_vp9_flac_alac_ac3_and_pcm() {
             3,
             "dac3 derived from the first frame"
         );
-        assert_eq!(
-            (out[4].codec_tag, out[4].sample_format),
-            (Some(*b"fpcm"), Some(SampleFormat::F32))
-        );
-        for s in 0..5 {
+        for s in 0..4 {
             let want: Vec<&Vec<u8>> = packets_of(&packets, s).iter().map(|p| &p.data).collect();
             let have: Vec<&Vec<u8>> = packets_of(&got, s).iter().map(|p| &p.data).collect();
             assert_eq!(have, want, "stream {s} payloads");
@@ -477,6 +462,31 @@ fn the_mp4_muxer_refuses_quicktime_only_codecs_and_points_at_mov() {
     let mut m = Mp4Muxer::with_flavor(Box::new(Vec::new()), Flavor::Mp4);
     let err = m.write_header(&[prores_stream()]).unwrap_err().to_string();
     assert!(err.contains("prores") && err.contains(".mov"), "{err}");
+    // PCM too: most MP4 players cannot play it, so `in.wav -> out.mp4` asks
+    // for AAC (or `.mov`) instead of stream-copying.
+    let mut m = Mp4Muxer::with_flavor(Box::new(Vec::new()), Flavor::Mp4);
+    let pcm = pcm_stream(0, SampleFormat::F32, 2, None);
+    let err = m.write_header(&[pcm]).unwrap_err().to_string();
+    assert!(
+        err.contains("pcm") && err.contains("-c:a aac") && err.contains(".mov"),
+        "{err}"
+    );
+}
+
+#[test]
+fn float_pcm_goes_into_mov_as_lpcm() {
+    let streams = [pcm_stream(0, SampleFormat::F32, 2, None)];
+    let packets = pcm_packets(0, 1600, 8, 3);
+    for file in mux_both(Flavor::Mov, &streams, &packets) {
+        let (out, got) = demux(&file);
+        assert_eq!(
+            (out[0].codec_tag, out[0].sample_format),
+            (Some(*b"lpcm"), Some(SampleFormat::F32))
+        );
+        let have: Vec<&Vec<u8>> = got.iter().map(|p| &p.data).collect();
+        let want: Vec<&Vec<u8>> = packets.iter().map(|p| &p.data).collect();
+        assert_eq!(have, want);
+    }
 }
 
 #[test]

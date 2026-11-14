@@ -54,7 +54,6 @@ const MP4_CODECS: &[CodecId] = &[
     CodecId::Alac,
     CodecId::Ac3,
     CodecId::Eac3,
-    CodecId::Pcm,
 ];
 
 /// What the `mov` (QuickTime) muxer carries: the same, plus the professional
@@ -78,7 +77,7 @@ const MOV_CODECS: &[CodecId] = &[
 /// Which member of the family a muxer writes. The demuxer reads both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum Flavor {
-    /// ISO base media (`isom` brand, `nclx`, `ipcm`).
+    /// ISO base media (`isom` brand, `nclx`).
     #[default]
     Mp4,
     /// QuickTime (`qt  ` brand, `mhlr` handlers, `nclc`, `twos`/`lpcm`,
@@ -1749,7 +1748,7 @@ impl TrackOut {
             CodecId::ProRes => entry::prores_tag(stream, None),
             CodecId::DnxHd => entry::dnx_tag(stream),
             CodecId::Pcm => {
-                let out = entry::pcm_out(stream, qt).ok_or_else(|| {
+                let out = entry::pcm_out(stream).ok_or_else(|| {
                     Error::unsupported(
                         "mp4 mux: a `pcm` stream needs an interleaved sample format \
                          (u8, s16, s24, s32, f32 or f64)",
@@ -2511,6 +2510,11 @@ fn refuse(stream: &Stream, flavor: Flavor) -> Error {
         MediaType::Video => format!(
             "{fmt} mux: video codec `{name}` has no {ext} mapping here; re-encode \
              with `-c:v h264`, or write `.mkv`/`.webm` to keep `{name}` as a stream copy"
+        ),
+        MediaType::Audio if stream.codec_id == CodecId::Pcm => format!(
+            "{fmt} mux: `pcm` has no {ext} mapping here (most MP4 players cannot \
+             play it); re-encode with `-c:a aac`, or write `.mov` to keep `pcm` \
+             as a stream copy"
         ),
         MediaType::Audio => format!(
             "{fmt} mux: audio codec `{name}` has no {ext} mapping here; re-encode \

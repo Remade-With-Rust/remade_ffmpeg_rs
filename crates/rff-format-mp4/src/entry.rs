@@ -539,9 +539,13 @@ pub(crate) struct PcmOut {
 /// Choose how to store a PCM stream. QuickTime keeps the stream's own tag
 /// when it can hold the format (a camera's `in24` stays `in24`), else
 /// FilmCraft's choice: `sowt` for 16-bit, `raw ` for 8-bit, `lpcm` v2 for
-/// the rest (and for any rate over 65535 Hz, which only v2 can state). ISO
-/// MP4 writes `ipcm`/`fpcm` with a little-endian `pcmC`.
-pub(crate) fn pcm_out(stream: &Stream, qt: bool) -> Option<PcmOut> {
+/// the rest (and for any rate over 65535 Hz, which only v2 can state).
+///
+/// Only the `mov` muxer writes PCM. ISO `ipcm`/`fpcm` are read, but `mp4`
+/// does not offer PCM: most MP4 players cannot play it, and an engine that
+/// stream-copies whatever the container accepts would turn `in.wav ->
+/// out.mp4` into such a file instead of asking for `-c:a aac`.
+pub(crate) fn pcm_out(stream: &Stream) -> Option<PcmOut> {
     let format = stream.sample_format?;
     let frame_bytes = format.bytes_per_sample() * usize::from(stream.channels.max(1));
     let layout = |big_endian: bool, signed8: bool| PcmLayout {
@@ -553,18 +557,6 @@ pub(crate) fn pcm_out(stream: &Stream, qt: bool) -> Option<PcmOut> {
     use SampleFormat::*;
     if !matches!(format, U8 | S16 | S24 | S32 | F32 | F64) {
         return None;
-    }
-    if !qt {
-        let fourcc = if matches!(format, F32 | F64) {
-            *b"fpcm"
-        } else {
-            *b"ipcm"
-        };
-        return Some(PcmOut {
-            fourcc,
-            layout: layout(false, format == U8),
-            version: 0,
-        });
     }
     let wide_rate = stream.sample_rate > 0xFFFF;
     let tagged = stream.codec_tag.filter(|_| !wide_rate).and_then(|tag| {
@@ -651,10 +643,6 @@ pub(crate) fn pcm_entry(stream: &Stream, out: &PcmOut) -> Vec<u8> {
             pu32(&mut e, bps); // bytes per packet (per channel)
             pu32(&mut e, out.layout.frame_bytes as u32); // bytes per frame
             pu32(&mut e, bps); // bytes per sample
-        }
-        if &out.fourcc == b"ipcm" || &out.fourcc == b"fpcm" {
-            let little = u8::from(!out.layout.big_endian);
-            e.extend_from_slice(&fbx(b"pcmC", 0, 0, &[little, bits as u8]));
         }
     }
     e

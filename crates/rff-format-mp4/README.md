@@ -17,9 +17,10 @@ The **MP4 / QuickTime MOV (ISOBMFF)** container demuxer and muxers for
 - **Audio**: AAC (`esds`), Opus (`dOps`), FLAC (`fLaC`/`dfLa`), ALAC,
   AC-3 / E-AC-3 (`dac3`/`dec3`, derived from the first frame when the source
   has none), and **PCM**: QuickTime `sowt` `twos` `in24` `in32` `fl32` `fl64`
-  `lpcm` `raw ` with sound description v0/v1/v2 and `enda`, ISO `ipcm`/`fpcm`.
-  PCM comes out little-endian (one packet per chunk) and goes back in the
-  source's own entry on a remux.
+  `lpcm` `raw ` with sound description v0/v1/v2 and `enda` (read and written
+  by `mov`), and ISO `ipcm`/`fpcm` (read). PCM comes out little-endian (one
+  packet per chunk) and goes back in the source's own entry on a remux. `mp4`
+  refuses PCM, as most MP4 players cannot play it.
 - **Descriptive boxes**, read and written: `colr` (`nclc`/`nclx`), `pasp`,
   `clap`, `mdcv`, `clli`, and the QuickTime **timecode track** (`tmcd` +
   `tref`), surfaced as the video stream's start `timecode`.
