@@ -48,7 +48,9 @@ pub(crate) struct ArithmeticDecoder {
 struct State {
     chunk_index: usize,
     value: u64,
-    range: u32,
+    /// The coder's range minus one (127..=254 once normalised), the form
+    /// libwebp keeps: the split then needs no +1/-1 round trip per bit.
+    range_m1: u32,
     bit_count: i32,
 }
 
@@ -64,7 +66,7 @@ impl ArithmeticDecoder {
         let state = State {
             chunk_index: 0,
             value: 0,
-            range: 255,
+            range_m1: 254,
             bit_count: -8,
         };
         ArithmeticDecoder {
@@ -98,7 +100,7 @@ impl ArithmeticDecoder {
         let state = State {
             chunk_index: 0,
             value: 0,
-            range: 255,
+            range_m1: 254,
             bit_count: -8,
         };
         *self = Self {
@@ -285,28 +287,30 @@ impl ArithmeticDecoder {
         debug_assert!(self.state.bit_count >= 0);
 
         let probability = u32::from(probability);
-        let split = 1 + (((self.state.range - 1) * probability) >> 8);
+        let mut range = self.state.range_m1 + 1;
+        let split = 1 + (((range - 1) * probability) >> 8);
         let bigsplit = u64::from(split) << self.state.bit_count;
 
         let retval = if let Some(new_value) = self.state.value.checked_sub(bigsplit) {
-            self.state.range -= split;
+            range -= split;
             self.state.value = new_value;
             true
         } else {
-            self.state.range = split;
+            range = split;
             false
         };
-        debug_assert!(self.state.range > 0);
+        debug_assert!(range > 0);
 
-        // Compute shift required to satisfy `self.state.range >= 128`.
-        // Apply that shift to `self.state.range` and `self.state.bitcount`.
+        // Compute shift required to satisfy `range >= 128`.
+        // Apply that shift to `range` and `self.state.bitcount`.
         //
         // Subtract 24 because we only care about leading zeros in the
-        // lowest byte of `self.state.range` which is a `u32`.
-        let shift = self.state.range.leading_zeros().saturating_sub(24);
-        self.state.range <<= shift;
+        // lowest byte of `range` which is a `u32`.
+        let shift = range.leading_zeros().saturating_sub(24);
+        range <<= shift;
         self.state.bit_count -= shift as i32;
-        debug_assert!(self.state.range >= 128);
+        debug_assert!(range >= 128);
+        self.state.range_m1 = range - 1;
 
         BitResult::ok(retval)
     }
@@ -386,6 +390,36 @@ impl ArithmeticDecoder {
 // `FastDecoder` and the block-scoped `FastSession`.
 // ---------------------------------------------------------------------------
 
+/// Renormalisation, indexed by the un-normalised `range - 1` (0..=254; 255
+/// is never produced): the left shift that brings the range back to
+/// 128..=255 (`leading_zeros(range) - 24`), and the shifted range, again
+/// minus one. The range never exceeds 255 (it starts there and only shrinks
+/// before each renormalisation), so two table loads replace a bit scan, its
+/// zero case, a saturating subtract and a variable shift.
+const NORM: ([u8; 256], [u8; 256]) = {
+    let mut shift = [0u8; 256];
+    let mut range_m1 = [255u8; 256];
+    let mut i = 0;
+    while i < 255 {
+        let range = i as u32 + 1;
+        let s = (range as u8).leading_zeros();
+        shift[i] = s as u8;
+        range_m1[i] = ((range << s) - 1) as u8;
+        i += 1;
+    }
+    (shift, range_m1)
+};
+
+/// Store the un-normalised `range - 1` back, normalised.
+#[inline(always)]
+fn renormalise(state: &mut State, range_m1: u32) {
+    debug_assert!(range_m1 < 255);
+    let i = range_m1 as u8 as usize;
+    state.bit_count -= i32::from(NORM.0[i]);
+    state.range_m1 = u32::from(NORM.1[i]);
+    debug_assert!(state.range_m1 >= 127);
+}
+
 #[inline(always)]
 fn state_read_bit(chunks: &[[u8; 4]], state: &mut State, probability: u8) -> bool {
     if state.bit_count < 0 {
@@ -398,26 +432,20 @@ fn state_read_bit(chunks: &[[u8; 4]], state: &mut State, probability: u8) -> boo
     }
     debug_assert!(state.bit_count >= 0);
 
-    let probability = u32::from(probability);
-    let split = 1 + (((state.range - 1) * probability) >> 8);
-    let bigsplit = u64::from(split) << state.bit_count;
+    // `split - 1`, with split = 1 + (((range - 1) * probability) >> 8)
+    let split_m1 = (state.range_m1 * u32::from(probability)) >> 8;
+    let bigsplit = u64::from(split_m1 + 1) << state.bit_count;
 
-    let retval = if let Some(new_value) = state.value.checked_sub(bigsplit) {
-        state.range -= split;
+    if let Some(new_value) = state.value.checked_sub(bigsplit) {
         state.value = new_value;
+        // range - split, minus one
+        renormalise(state, state.range_m1 - split_m1 - 1);
         true
     } else {
-        state.range = split;
+        // range = split
+        renormalise(state, split_m1);
         false
-    };
-    debug_assert!(state.range > 0);
-
-    let shift = state.range.leading_zeros().saturating_sub(24);
-    state.range <<= shift;
-    state.bit_count -= shift as i32;
-    debug_assert!(state.range >= 128);
-
-    retval
+    }
 }
 
 #[inline(always)]
@@ -432,26 +460,60 @@ fn state_read_flag(chunks: &[[u8; 4]], state: &mut State) -> bool {
     }
     debug_assert!(state.bit_count >= 0);
 
-    let half_range = state.range / 2;
-    let split = state.range - half_range;
+    // range / 2, with range = range_m1 + 1
+    let half_range = state.range_m1.div_ceil(2);
+    let split = state.range_m1 + 1 - half_range;
     let bigsplit = u64::from(split) << state.bit_count;
 
-    let retval = if let Some(new_value) = state.value.checked_sub(bigsplit) {
-        state.range = half_range;
+    if let Some(new_value) = state.value.checked_sub(bigsplit) {
         state.value = new_value;
+        renormalise(state, half_range - 1);
         true
     } else {
-        state.range = split;
+        renormalise(state, split - 1);
         false
-    };
-    debug_assert!(state.range > 0);
+    }
+}
 
-    let shift = state.range.leading_zeros().saturating_sub(24);
-    state.range <<= shift;
-    state.bit_count -= shift as i32;
-    debug_assert!(state.range >= 128);
+/// Read an even-odds flag and apply it as a sign: `-v` when the flag is set.
+///
+/// The same decode as [`state_read_flag`], without its branch or table
+/// loads (libwebp's `VP8GetSigned`): halving a normalised range always
+/// renormalises by exactly one bit, so the new `range - 1` is the old one,
+/// minus one when the flag is set, with its low bit forced; and the flag
+/// itself is a 0 / -1 mask that conditionally subtracts the split and
+/// negates `v`. Sign bits are close to random, so the branch was one the
+/// predictor could not learn.
+#[inline(always)]
+fn state_read_signed(chunks: &[[u8; 4]], state: &mut State, v: i32) -> i32 {
+    // A range of exactly 255 (only the state before the first read) halves
+    // to 128, which needs no shift: leave that one case to the general read.
+    if state.range_m1 == 254 {
+        return if state_read_flag(chunks, state) {
+            -v
+        } else {
+            v
+        };
+    }
+    if state.bit_count < 0 {
+        let chunk = chunks.get(state.chunk_index).copied().unwrap_or_default();
+        let v = u32::from_be_bytes(chunk);
+        state.chunk_index += 1;
+        state.value <<= 32;
+        state.value |= u64::from(v);
+        state.bit_count += 32;
+    }
+    debug_assert!(state.bit_count >= 0);
 
-    retval
+    // `split - 1`, with split = range - range / 2
+    let split_m1 = state.range_m1 >> 1;
+    let window = (state.value >> state.bit_count) as u32;
+    // -1 when the flag is set (window >= split), else 0
+    let mask = (split_m1 as i32 - window as i32) >> 31;
+    state.value -= u64::from((split_m1 + 1) & mask as u32) << state.bit_count;
+    state.range_m1 = state.range_m1.wrapping_add(mask as u32) | 1;
+    state.bit_count -= 1;
+    (v ^ mask) - mask
 }
 
 /// A block-scoped fast-reading session: the decoder state is snapshotted
@@ -485,9 +547,22 @@ impl ArithmeticDecoder {
         state_read_bit(&self.chunks, &mut s.state, probability)
     }
 
+    /// Read an `n`-bit literal (most significant bit first) of even-odds
+    /// flags, as [`Self::read_literal`] does.
     #[inline(always)]
-    pub(crate) fn session_read_flag(&self, s: &mut FastSession) -> bool {
-        state_read_flag(&self.chunks, &mut s.state)
+    pub(crate) fn session_read_literal(&self, s: &mut FastSession, n: u8) -> u8 {
+        let mut v = 0u8;
+        for _ in 0..n {
+            let b = state_read_flag(&self.chunks, &mut s.state);
+            v = (v << 1) + u8::from(b);
+        }
+        v
+    }
+
+    /// Read a sign flag and return `v` with it applied.
+    #[inline(always)]
+    pub(crate) fn session_read_signed(&self, s: &mut FastSession, v: i32) -> i32 {
+        state_read_signed(&self.chunks, &mut s.state, v)
     }
 
     #[inline(always)]
@@ -627,6 +702,43 @@ mod tests {
         assert_eq!(185, decoder.read_literal(8).or_accumulate(&mut res));
         assert_eq!(31, decoder.read_literal(8).or_accumulate(&mut res));
         decoder.check(res, ()).unwrap();
+    }
+
+    /// `state_read_signed` must leave the same state and give the same sign
+    /// as `state_read_flag`, for every normalised range and bit position.
+    #[test]
+    fn signed_read_matches_flag_read() {
+        let chunks: Vec<[u8; 4]> = (0u32..64)
+            .map(|i| (i.wrapping_mul(2654435761) ^ 0x5bd1e995).to_be_bytes())
+            .collect();
+        for range_m1 in 127u32..=254 {
+            for bit_count in -1i32..32 {
+                for window in 0..=range_m1 {
+                    // any value below `range << bit_count` is a valid state
+                    let shift = bit_count.max(0) as u32;
+                    let low = u64::from(window.wrapping_mul(0x9e37_79b9)) & ((1u64 << shift) - 1);
+                    let start = State {
+                        chunk_index: 3,
+                        value: if bit_count < 0 {
+                            u64::from(window) >> 1
+                        } else {
+                            (u64::from(window) << shift) | low
+                        },
+                        range_m1,
+                        bit_count,
+                    };
+                    let (mut a, mut b) = (start, start);
+                    let flag = state_read_flag(&chunks, &mut a);
+                    let signed = state_read_signed(&chunks, &mut b, 7);
+                    assert_eq!(signed, if flag { -7 } else { 7 });
+                    assert_eq!(
+                        (a.chunk_index, a.value, a.range_m1, a.bit_count),
+                        (b.chunk_index, b.value, b.range_m1, b.bit_count),
+                        "range_m1 {range_m1} bit_count {bit_count} window {window}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

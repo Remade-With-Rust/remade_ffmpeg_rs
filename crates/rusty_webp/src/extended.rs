@@ -106,19 +106,21 @@ pub(crate) fn composite_frame(
     let height = frame_height.min(canvas_height.saturating_sub(frame_offset_y)) as usize;
 
     if frame_has_alpha && frame_use_alpha_blending {
+        // One row of the frame against one row of the canvas: two slices
+        // walked together, instead of two index computations and two
+        // bounds-checked sub-slices for every pixel.
         for y in 0..height {
-            for x in 0..width {
-                let frame_index = (x + y * frame_width as usize) * 4;
-                let canvas_index = ((x + frame_offset_x as usize)
-                    + (y + frame_offset_y as usize) * canvas_width as usize)
-                    * 4;
+            let frame_index = (y * frame_width as usize) * 4;
+            let canvas_index = (frame_offset_x as usize
+                + (y + frame_offset_y as usize) * canvas_width as usize)
+                * 4;
+            let input = &frame[frame_index..][..width * 4];
+            let output = &mut canvas[canvas_index..][..width * 4];
 
-                let input = &frame[frame_index..][..4];
-                let output = &mut canvas[canvas_index..][..4];
-
-                let blended =
-                    do_alpha_blending(input.try_into().unwrap(), output.try_into().unwrap());
-                output.copy_from_slice(&blended);
+            for (src, dst) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
+                let src: [u8; 4] = src.try_into().unwrap();
+                let under: [u8; 4] = (&*dst).try_into().unwrap();
+                dst.copy_from_slice(&do_alpha_blending(src, under));
             }
         }
     } else if frame_has_alpha {
@@ -147,6 +149,102 @@ pub(crate) fn composite_frame(
     }
 }
 
+/// Undo the alpha plane's prediction filter and store the result in the
+/// alpha byte of every pixel of `rgba` (rows of `width` RGBA pixels).
+/// `alpha` holds the filtered values: value `i` is byte `AT` of the `i`-th
+/// `STEP`-byte group, so a plane of single bytes is `<1, 0>` and the green
+/// channel of a decoded four-byte-per-pixel image is `<4, 1>` (no separate
+/// plane has to be extracted first).
+///
+/// The filter method is fixed for the plane, and its edge rules depend only
+/// on the row and on whether the pixel is the first of its row, so the
+/// method is matched once and each row runs a plain loop.
+/// [`get_alpha_predictor`] is the same rule one pixel at a time, kept as the
+/// test oracle.
+pub(crate) fn apply_alpha_plane<const STEP: usize, const AT: usize>(
+    rgba: &mut [u8],
+    width: usize,
+    alpha: &[u8],
+    filtering_method: FilteringMethod,
+) {
+    if width == 0 {
+        return;
+    }
+    let stride = width * 4;
+
+    // A row predicted from the left: each pixel adds to the previous result.
+    // `first` is the predictor of the row's first pixel.
+    fn from_left<const STEP: usize, const AT: usize>(row: &mut [u8], deltas: &[u8], first: u8) {
+        let mut prev = first;
+        for (px, d) in row.chunks_exact_mut(4).zip(deltas.chunks_exact(STEP)) {
+            prev = prev.wrapping_add(d[AT]);
+            px[3] = prev;
+        }
+    }
+
+    match filtering_method {
+        FilteringMethod::None => {
+            for (px, a) in rgba.chunks_exact_mut(4).zip(alpha.chunks_exact(STEP)) {
+                px[3] = a[AT];
+            }
+        }
+        FilteringMethod::Horizontal => {
+            // the first pixel of a row is predicted from the pixel above it
+            let mut above = 0u8;
+            for (row, deltas) in rgba
+                .chunks_exact_mut(stride)
+                .zip(alpha.chunks_exact(width * STEP))
+            {
+                from_left::<STEP, AT>(row, deltas, above);
+                above = row[3];
+            }
+        }
+        FilteringMethod::Vertical | FilteringMethod::Gradient => {
+            let gradient = matches!(filtering_method, FilteringMethod::Gradient);
+            let mut rows = alpha.chunks_exact(width * STEP);
+            // the first row has no row above: it is predicted from the left
+            let Some(deltas) = rows.next() else { return };
+            let Some(first_row) = rgba.get_mut(..stride) else {
+                return;
+            };
+            from_left::<STEP, AT>(first_row, deltas, 0);
+
+            let mut done = stride;
+            for deltas in rows {
+                let (before, rest) = rgba.split_at_mut(done);
+                let Some(row) = rest.get_mut(..stride) else {
+                    return;
+                };
+                let top = &before[done - stride..];
+                if gradient {
+                    // first pixel: the one above; then left + top - top-left
+                    let mut left = top[3].wrapping_add(deltas[AT]);
+                    row[3] = left;
+                    for ((px, t), d) in row[4..]
+                        .chunks_exact_mut(4)
+                        .zip(top.windows(8).step_by(4))
+                        .zip(deltas[STEP..].chunks_exact(STEP))
+                    {
+                        let predictor = i16::from(left) + i16::from(t[7]) - i16::from(t[3]);
+                        left = (predictor.clamp(0, 255) as u8).wrapping_add(d[AT]);
+                        px[3] = left;
+                    }
+                } else {
+                    for ((px, t), d) in row
+                        .chunks_exact_mut(4)
+                        .zip(top.chunks_exact(4))
+                        .zip(deltas.chunks_exact(STEP))
+                    {
+                        px[3] = t[3].wrapping_add(d[AT]);
+                    }
+                }
+                done += stride;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn get_alpha_predictor(
     x: usize,
     y: usize,
@@ -259,6 +357,26 @@ pub(crate) struct AlphaChunk {
     _preprocessing: bool,
     pub(crate) filtering_method: FilteringMethod,
     pub(crate) data: Vec<u8>,
+    /// `data` is a decoded four-byte-per-pixel image with the alpha values
+    /// in its green channel, rather than one byte per pixel.
+    in_green: bool,
+}
+
+impl AlphaChunk {
+    /// Give the plane's buffer back, to be passed to the next
+    /// [`read_alpha_chunk`].
+    pub(crate) fn into_buffer(self) -> Vec<u8> {
+        self.data
+    }
+
+    /// Unfilter the plane into the alpha byte of every pixel of `rgba`.
+    pub(crate) fn apply(&self, rgba: &mut [u8], width: usize) {
+        if self.in_green {
+            apply_alpha_plane::<4, 1>(rgba, width, &self.data, self.filtering_method);
+        } else {
+            apply_alpha_plane::<1, 0>(rgba, width, &self.data, self.filtering_method);
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -269,10 +387,27 @@ pub(crate) enum FilteringMethod {
     Gradient,
 }
 
+/// `scratch` as a buffer of exactly `len` bytes. A used buffer keeps its
+/// contents (only growth is zero-filled), for callers that overwrite all of
+/// it; an empty one is allocated zeroed in one step, as `vec![0; len]`.
+pub(crate) fn sized_buffer(mut scratch: Vec<u8>, len: usize) -> Vec<u8> {
+    if scratch.capacity() == 0 {
+        vec![0; len]
+    } else {
+        scratch.resize(len, 0);
+        scratch
+    }
+}
+
+/// Reads an ALPH chunk. `scratch` becomes the plane's buffer (its contents
+/// are overwritten, only growth is zero-filled): pass the buffer of a
+/// previous chunk, taken back with [`AlphaChunk::into_buffer`], to avoid
+/// allocating and zero-filling one per animation frame.
 pub(crate) fn read_alpha_chunk<R: BufRead>(
     reader: &mut R,
     width: u16,
     height: u16,
+    scratch: Vec<u8>,
 ) -> Result<AlphaChunk, DecodingError> {
     let info_byte = reader.read_u8()?;
 
@@ -303,16 +438,14 @@ pub(crate) fn read_alpha_chunk<R: BufRead>(
     let data = if lossless_compression {
         let mut decoder = LosslessDecoder::new(reader);
 
-        let mut data = vec![0; usize::from(width) * usize::from(height) * 4];
+        let mut data = sized_buffer(scratch, usize::from(width) * usize::from(height) * 4);
         decoder.decode_frame(u32::from(width), u32::from(height), true, &mut data)?;
 
-        let mut green = vec![0; usize::from(width) * usize::from(height)];
-        for (rgba_val, green_val) in data.chunks_exact(4).zip(green.iter_mut()) {
-            *green_val = rgba_val[1];
-        }
-        green
+        // The alpha values are the green channel of these pixels: they are
+        // read from there when the plane is applied.
+        data
     } else {
-        let mut framedata = vec![0; width as usize * height as usize];
+        let mut framedata = sized_buffer(scratch, width as usize * height as usize);
         reader.read_exact(&mut framedata)?;
         framedata
     };
@@ -321,7 +454,65 @@ pub(crate) fn read_alpha_chunk<R: BufRead>(
         _preprocessing: preprocessing,
         filtering_method,
         data,
+        in_green: lossless_compression,
     };
 
     Ok(chunk)
+}
+
+#[cfg(test)]
+mod alpha_tests {
+    use super::*;
+
+    /// The row-based unfilter must give what the per-pixel predictor gives,
+    /// for every method and for awkward sizes.
+    #[test]
+    fn alpha_plane_matches_per_pixel_predictor() {
+        let mut seed = 0x853c_49e6_748f_ea9bu64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 24) as u8
+        };
+        for &(width, height) in &[
+            (1usize, 1usize),
+            (1, 5),
+            (5, 1),
+            (2, 2),
+            (7, 3),
+            (16, 9),
+            (33, 17),
+        ] {
+            let alpha: Vec<u8> = (0..width * height).map(|_| next()).collect();
+            for method in [
+                FilteringMethod::None,
+                FilteringMethod::Horizontal,
+                FilteringMethod::Vertical,
+                FilteringMethod::Gradient,
+            ] {
+                let image: Vec<u8> = (0..width * height * 4).map(|_| next()).collect();
+                let mut want = image.clone();
+                for y in 0..height {
+                    for x in 0..width {
+                        let predictor = get_alpha_predictor(x, y, width, method, &want);
+                        let i = y * width + x;
+                        want[i * 4 + 3] = predictor.wrapping_add(alpha[i]);
+                    }
+                }
+                let mut got = image.clone();
+                apply_alpha_plane::<1, 0>(&mut got, width, &alpha, method);
+                assert_eq!(got, want, "{width}x{height}");
+
+                // the same values as the green channel of four-byte pixels
+                let pixels: Vec<u8> = alpha
+                    .iter()
+                    .flat_map(|&a| [next(), a, next(), next()])
+                    .collect();
+                let mut got = image;
+                apply_alpha_plane::<4, 1>(&mut got, width, &pixels, method);
+                assert_eq!(got, want, "{width}x{height} from green");
+            }
+        }
+    }
 }

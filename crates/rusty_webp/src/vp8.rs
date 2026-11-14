@@ -1016,7 +1016,36 @@ impl<R: Read> Vp8Decoder<R> {
         }
     }
 
+    /// Read the frame header's token probability updates: one flag for each
+    /// of the 1056 probabilities, and a new 8-bit value where it is set.
     fn update_token_probabilities(&mut self) -> Result<(), DecodingError> {
+        // Fast path: all 1056 flags in one decoder session, instead of a
+        // call that copies the decoder state in and out for every one (the
+        // largest fixed cost of decoding a small image). Updates are stored
+        // as they are read, walking the two tables side by side; if the
+        // session ran past the buffer end the tables are put back for the
+        // committed path below.
+        let before = *self.token_probs;
+        let mut s = self.b.begin_session();
+        let update_probs = COEFF_UPDATE_PROBS
+            .as_flattened()
+            .as_flattened()
+            .as_flattened();
+        let nodes = self
+            .token_probs
+            .as_flattened_mut()
+            .as_flattened_mut()
+            .as_flattened_mut();
+        for (&update_prob, node) in update_probs.iter().zip(nodes) {
+            if self.b.session_read_bool(&mut s, update_prob) {
+                node.prob = self.b.session_read_literal(&mut s, 8);
+            }
+        }
+        if self.b.commit_session(s) {
+            return Ok(());
+        }
+        *self.token_probs = before;
+
         let mut res = self.b.start_accumulated_result();
         for (i, is) in COEFF_UPDATE_PROBS.iter().enumerate() {
             for (j, js) in is.iter().enumerate() {
@@ -1300,6 +1329,88 @@ impl<R: Read> Vp8Decoder<R> {
     }
 
     fn read_macroblock_header(&mut self, mbx: usize) -> Result<MacroBlock, DecodingError> {
+        if let Some(mb) = self.read_macroblock_header_fast(mbx) {
+            return Ok(mb);
+        }
+        self.read_macroblock_header_committed(mbx)
+    }
+
+    /// The whole macroblock header in one decoder session: one state snapshot
+    /// and one commit, instead of a state copy in and out (and a call) per
+    /// tree read: up to 19 of them for a B_PRED macroblock. The reads are the
+    /// exact sequence of [`Self::read_macroblock_header_committed`].
+    ///
+    /// Returns `None`, with nothing changed, whenever the committed path has
+    /// to decide: the session ran past the buffer end, a mode is invalid, or
+    /// the frame is not a keyframe.
+    #[inline(always)]
+    fn read_macroblock_header_fast(&mut self, mbx: usize) -> Option<MacroBlock> {
+        if !self.frame.keyframe {
+            return None;
+        }
+        let mut mb = MacroBlock::default();
+        let mut s = self.b.begin_session();
+
+        if self.segments_enabled && self.segments_update_map {
+            let tree = &self.segment_tree_nodes;
+            mb.segmentid = self.b.session_read_with_tree(&mut s, tree, tree[0]) as u8;
+        }
+
+        mb.coeffs_skipped = match self.prob_skip_false {
+            Some(prob) => self.b.session_read_bool(&mut s, prob),
+            None => false,
+        };
+
+        let tree = &KEYFRAME_YMODE_NODES;
+        mb.luma_mode = LumaMode::from_i8(self.b.session_read_with_tree(&mut s, tree, tree[0]))?;
+
+        // Contexts are updated on copies and stored only once the session
+        // has committed.
+        let mut top = self.top[mbx].bpred;
+        let mut left = self.left.bpred;
+        match mb.luma_mode.into_intra() {
+            // `LumaMode::B` - This is predicted individually
+            None => {
+                for y in 0usize..4 {
+                    for x in 0usize..4 {
+                        let tree =
+                            &KEYFRAME_BPRED_MODE_NODES[top[12 + x] as usize][left[y] as usize];
+                        let intra = self.b.session_read_with_tree(&mut s, tree, tree[0]);
+                        let bmode = IntraMode::from_i8(intra)?;
+                        mb.bpred[x + y * 4] = bmode;
+                        top[12 + x] = bmode;
+                        left[y] = bmode;
+                    }
+                }
+            }
+            Some(mode) => {
+                mb.bpred[12..].fill(mode);
+                left[..4].fill(mode);
+            }
+        }
+
+        let tree = &KEYFRAME_UV_MODE_NODES;
+        mb.chroma_mode = ChromaMode::from_i8(self.b.session_read_with_tree(&mut s, tree, tree[0]))?;
+
+        if !self.b.commit_session(s) {
+            return None;
+        }
+
+        self.left.bpred = left;
+        self.top[mbx].chroma_mode = mb.chroma_mode;
+        self.top[mbx].luma_mode = mb.luma_mode;
+        self.top[mbx].bpred = mb.bpred;
+        Some(mb)
+    }
+
+    /// The header through the committed per-read API, whose cold half handles
+    /// the final bytes of the partition and reports every error.
+    #[cold]
+    #[inline(never)]
+    fn read_macroblock_header_committed(
+        &mut self,
+        mbx: usize,
+    ) -> Result<MacroBlock, DecodingError> {
         let mut mb = MacroBlock::default();
         let mut res = self.b.start_accumulated_result();
 
@@ -1378,14 +1489,16 @@ impl<R: Read> Vp8Decoder<R> {
         let mut ws = create_border_luma(mbx, mby, mw, &self.top_border_y, &self.left_border_y);
 
         match mb.luma_mode {
-            LumaMode::V => predict_vpred(&mut ws, 16, 1, 1, stride),
-            LumaMode::H => predict_hpred(&mut ws, 16, 1, 1, stride),
-            LumaMode::TM => predict_tmpred(&mut ws, 16, 1, 1, stride),
-            LumaMode::DC => predict_dcpred(&mut ws, 16, stride, mby != 0, mbx != 0),
-            LumaMode::B => predict_4x4(&mut ws, stride, &mb.bpred, resdata),
+            LumaMode::V => predict_vpred::<16>(&mut ws, 1, 1, stride),
+            LumaMode::H => predict_hpred::<16>(&mut ws, 1, 1, stride),
+            LumaMode::TM => predict_tmpred::<16>(&mut ws, 1, 1, stride),
+            LumaMode::DC => predict_dcpred::<16>(&mut ws, stride, mby != 0, mbx != 0),
+            LumaMode::B => predict_4x4(&mut ws, stride, &mb.bpred, resdata, mb.non_zero_dct),
         }
 
-        if mb.luma_mode != LumaMode::B {
+        // `non_zero_dct` is false when no block of the macroblock has a
+        // residual (every one is all zero): adding it would change nothing.
+        if mb.luma_mode != LumaMode::B && mb.non_zero_dct {
             for y in 0usize..4 {
                 for x in 0usize..4 {
                     let i = x + y * 4;
@@ -1412,13 +1525,11 @@ impl<R: Read> Vp8Decoder<R> {
             *top = w;
         }
 
-        for y in 0usize..16 {
-            for (ybuf, &ws) in self.frame.ybuf[(mby * 16 + y) * mw * 16 + mbx * 16..][..16]
-                .iter_mut()
-                .zip(ws[(1 + y) * stride + 1..][..16].iter())
-            {
-                *ybuf = ws;
-            }
+        // Store the macroblock: one fixed 16-byte copy per row (the
+        // element-wise zip moved a byte at a time).
+        let rows = self.frame.ybuf[(mby * 16) * mw * 16 + mbx * 16..].chunks_mut(mw * 16);
+        for (dst, src) in rows.zip(ws[stride + 1..].chunks(stride)).take(16) {
+            dst[..16].copy_from_slice(&src[..16]);
         }
     }
 
@@ -1433,24 +1544,27 @@ impl<R: Read> Vp8Decoder<R> {
 
         match mb.chroma_mode {
             ChromaMode::DC => {
-                predict_dcpred(&mut uws, 8, stride, mby != 0, mbx != 0);
-                predict_dcpred(&mut vws, 8, stride, mby != 0, mbx != 0);
+                predict_dcpred::<8>(&mut uws, stride, mby != 0, mbx != 0);
+                predict_dcpred::<8>(&mut vws, stride, mby != 0, mbx != 0);
             }
             ChromaMode::V => {
-                predict_vpred(&mut uws, 8, 1, 1, stride);
-                predict_vpred(&mut vws, 8, 1, 1, stride);
+                predict_vpred::<8>(&mut uws, 1, 1, stride);
+                predict_vpred::<8>(&mut vws, 1, 1, stride);
             }
             ChromaMode::H => {
-                predict_hpred(&mut uws, 8, 1, 1, stride);
-                predict_hpred(&mut vws, 8, 1, 1, stride);
+                predict_hpred::<8>(&mut uws, 1, 1, stride);
+                predict_hpred::<8>(&mut vws, 1, 1, stride);
             }
             ChromaMode::TM => {
-                predict_tmpred(&mut uws, 8, 1, 1, stride);
-                predict_tmpred(&mut vws, 8, 1, 1, stride);
+                predict_tmpred::<8>(&mut uws, 1, 1, stride);
+                predict_tmpred::<8>(&mut vws, 1, 1, stride);
             }
         }
 
-        for y in 0usize..2 {
+        // No residual anywhere in the macroblock: nothing to add. (A zero
+        // trip count rather than an `if` around the loops: measured better.)
+        let rows = if mb.non_zero_dct { 2usize } else { 0 };
+        for y in 0..rows {
             for x in 0usize..2 {
                 let i = x + y * 2;
                 let urb: &[i32; 16] = resdata[16 * 16 + i * 16..][..16].try_into().unwrap();
@@ -1472,18 +1586,15 @@ impl<R: Read> Vp8Decoder<R> {
             let uv_buf_index = (mby * 8 + y) * mw * 8 + mbx * 8;
             let ws_index = (1 + y) * stride + 1;
 
-            for (((ub, vb), &uw), &vw) in self.frame.ubuf[uv_buf_index..][..8]
-                .iter_mut()
-                .zip(self.frame.vbuf[uv_buf_index..][..8].iter_mut())
-                .zip(uws[ws_index..][..8].iter())
-                .zip(vws[ws_index..][..8].iter())
-            {
-                *ub = uw;
-                *vb = vw;
-            }
+            self.frame.ubuf[uv_buf_index..][..8].copy_from_slice(&uws[ws_index..][..8]);
+            self.frame.vbuf[uv_buf_index..][..8].copy_from_slice(&vws[ws_index..][..8]);
         }
     }
 
+    /// Reads one block's coefficients, dequantised, into `block`. Returns
+    /// whether any token was coded, and the coding-order position of the
+    /// last nonzero coefficient (0 when only the DC, or nothing, is set).
+    #[inline(always)]
     fn read_coefficients(
         &mut self,
         block: &mut [i32; 16],
@@ -1492,7 +1603,7 @@ impl<R: Read> Vp8Decoder<R> {
         complexity: usize,
         dcq: i16,
         acq: i16,
-    ) -> Result<(bool, bool), DecodingError> {
+    ) -> Result<(bool, usize), DecodingError> {
         // perform bounds checks once up front,
         // so that the compiler doesn't have to insert them in the hot loop below
         assert!(complexity <= 2);
@@ -1501,89 +1612,114 @@ impl<R: Read> Vp8Decoder<R> {
         let probs = &self.token_probs[plane];
         let decoder = &mut self.partitions[p];
 
-        // Fast path: read the whole block in one session — one state
-        // snapshot and one commit instead of a state copy in and out per
-        // read. The reads are the exact sequence of the committed path below.
+        // Fast path: read the whole block in one session (one state snapshot
+        // and one commit instead of a state copy in and out per read), with
+        // the token tree unrolled into straight-line reads. Node `k` of the
+        // tree is read with `tree[k].prob`; the reads are the exact sequence
+        // the generic tree walk of the committed path below makes.
         {
             let mut s = decoder.begin_session();
-            let mut complexity = complexity;
             let mut has_coefficients = false;
-            let mut has_ac = false;
-            let mut skip = false;
+            // position (in coding order) of the last nonzero coefficient
+            let mut last = 0usize;
+            let mut i = first;
+            let mut tree = &probs[COEFF_BANDS[i] as usize][complexity];
 
-            for i in first..16usize {
-                let band = COEFF_BANDS[i] as usize;
-                let tree = &probs[band][complexity];
+            // node 0: end of block?
+            'block: while decoder.session_read_bool(&mut s, tree[0].prob) {
+                has_coefficients = true;
 
-                let token = decoder.session_read_with_tree(&mut s, tree, tree[skip as usize]);
-
-                let mut abs_value = i32::from(match token {
-                    DCT_EOB => break,
-
-                    DCT_0 => {
-                        skip = true;
-                        has_coefficients = true;
-                        complexity = 0;
-                        continue;
+                // node 1: a run of zero coefficients. Each one moves to the
+                // next position's tree in the zero context and re-enters at
+                // node 1 (no end-of-block test after a zero).
+                while !decoder.session_read_bool(&mut s, tree[1].prob) {
+                    i += 1;
+                    if i == 16 {
+                        break 'block;
                     }
+                    tree = &probs[COEFF_BANDS[i] as usize][0];
+                }
 
-                    literal @ DCT_1..=DCT_4 => i16::from(literal),
-
-                    category @ DCT_CAT1..=DCT_CAT6 => {
-                        let probs = PROB_DCT_CAT[(category - DCT_CAT1) as usize];
-
-                        let mut extra = 0i16;
-
-                        for t in probs.iter().copied() {
+                // node 2: one, or something larger
+                let (abs_value, next_complexity) =
+                    if !decoder.session_read_bool(&mut s, tree[2].prob) {
+                        (1i32, 1usize)
+                    } else if !decoder.session_read_bool(&mut s, tree[3].prob) {
+                        // nodes 4, 5: two, three or four
+                        if !decoder.session_read_bool(&mut s, tree[4].prob) {
+                            (2, 2)
+                        } else {
+                            (
+                                3 + i32::from(decoder.session_read_bool(&mut s, tree[5].prob)),
+                                2,
+                            )
+                        }
+                    } else {
+                        // nodes 6..=10: the six categories
+                        let category = if !decoder.session_read_bool(&mut s, tree[6].prob) {
+                            usize::from(decoder.session_read_bool(&mut s, tree[7].prob))
+                        } else {
+                            let high = usize::from(decoder.session_read_bool(&mut s, tree[8].prob));
+                            let low = decoder.session_read_bool(&mut s, tree[9 + high].prob);
+                            2 + 2 * high + usize::from(low)
+                        };
+                        let mut extra = 0i32;
+                        for &t in &PROB_DCT_CAT[category] {
                             if t == 0 {
                                 break;
                             }
-                            let b = decoder.session_read_bool(&mut s, t);
-                            extra = extra + extra + i16::from(b);
+                            extra = extra + extra + i32::from(decoder.session_read_bool(&mut s, t));
                         }
+                        (i32::from(DCT_CAT_BASE[category]) + extra, 2)
+                    };
 
-                        i16::from(DCT_CAT_BASE[(category - DCT_CAT1) as usize]) + extra
-                    }
-
-                    c => panic!("unknown token: {c}"),
-                });
-
-                skip = false;
-
-                complexity = if abs_value == 0 {
-                    0
-                } else if abs_value == 1 {
-                    1
-                } else {
-                    2
-                };
-
-                if decoder.session_read_flag(&mut s) {
-                    abs_value = -abs_value;
-                }
+                let value = decoder.session_read_signed(&mut s, abs_value);
 
                 let zigzag = ZIGZAG[i] as usize;
-                block[zigzag] = abs_value * i32::from(if zigzag > 0 { acq } else { dcq });
-                has_ac |= zigzag > 0;
+                block[zigzag] = value * i32::from(if zigzag > 0 { acq } else { dcq });
+                last = i;
 
-                has_coefficients = true;
+                i += 1;
+                if i == 16 {
+                    break;
+                }
+                tree = &probs[COEFF_BANDS[i] as usize][next_complexity];
             }
 
             if decoder.commit_session(s) {
-                return Ok((has_coefficients, has_ac));
+                return Ok((has_coefficients, last));
             }
         }
 
-        // The session ran past the buffer end (file tail): its writes into
-        // `block` are garbage — reset and redo through the committed
-        // per-read path, whose cold half handles the final bytes.
+        self.read_coefficients_committed(block, p, plane, complexity, dcq, acq)
+    }
+
+    /// The block through the committed per-read API, whose cold half handles
+    /// the final bytes of the partition. Runs only when the fast session ran
+    /// past the buffer end (file tail): the session's writes into `block`
+    /// are garbage, so it is reset first.
+    #[cold]
+    #[inline(never)]
+    fn read_coefficients_committed(
+        &mut self,
+        block: &mut [i32; 16],
+        p: usize,
+        plane: usize,
+        complexity: usize,
+        dcq: i16,
+        acq: i16,
+    ) -> Result<(bool, usize), DecodingError> {
+        let first = if plane == 0 { 1usize } else { 0usize };
+        let probs = &self.token_probs[plane];
+        let decoder = &mut self.partitions[p];
+
         block.fill(0);
 
         let mut res = decoder.start_accumulated_result();
 
         let mut complexity = complexity;
         let mut has_coefficients = false;
-        let mut has_ac = false;
+        let mut last = 0usize;
         let mut skip = false;
 
         for i in first..16usize {
@@ -1641,22 +1777,24 @@ impl<R: Read> Vp8Decoder<R> {
 
             let zigzag = ZIGZAG[i] as usize;
             block[zigzag] = abs_value * i32::from(if zigzag > 0 { acq } else { dcq });
-            has_ac |= zigzag > 0;
+            last = i;
 
             has_coefficients = true;
         }
 
-        decoder.check(res, (has_coefficients, has_ac))
+        decoder.check(res, (has_coefficients, last))
     }
 
+    /// Reads the macroblock's residual into `blocks`, which must be all zero
+    /// on entry: 24 inverse-transformed 4x4 blocks (16 luma, 4 U, 4 V).
     fn read_residual_data(
         &mut self,
         mb: &mut MacroBlock,
         mbx: usize,
         p: usize,
-    ) -> Result<[i32; 384], DecodingError> {
+        blocks: &mut [i32; 384],
+    ) -> Result<(), DecodingError> {
         let sindex = mb.segmentid as usize;
-        let mut blocks = [0i32; 384];
         let mut plane = if mb.luma_mode == LumaMode::B { 3 } else { 1 };
 
         if plane == 1 {
@@ -1690,13 +1828,15 @@ impl<R: Read> Vp8Decoder<R> {
                 let dcq = self.segment[sindex].ydc;
                 let acq = self.segment[sindex].yac;
 
-                let (n, has_ac) =
+                let (n, last) =
                     self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
 
                 if block[0] != 0 || n {
                     mb.non_zero_dct = true;
-                    if has_ac {
+                    if last >= 3 {
                         transform::idct4x4(block);
+                    } else if last > 0 {
+                        transform::idct4x4_ac3(block);
                     } else if block[0] != 0 {
                         transform::idct4x4_dc(block);
                     }
@@ -1724,12 +1864,14 @@ impl<R: Read> Vp8Decoder<R> {
                     let dcq = self.segment[sindex].uvdc;
                     let acq = self.segment[sindex].uvac;
 
-                    let (n, has_ac) =
+                    let (n, last) =
                         self.read_coefficients(block, p, plane, complexity as usize, dcq, acq)?;
                     if block[0] != 0 || n {
                         mb.non_zero_dct = true;
-                        if has_ac {
+                        if last >= 3 {
                             transform::idct4x4(block);
+                        } else if last > 0 {
+                            transform::idct4x4_ac3(block);
                         } else if block[0] != 0 {
                             transform::idct4x4_dc(block);
                         }
@@ -1743,7 +1885,7 @@ impl<R: Read> Vp8Decoder<R> {
             }
         }
 
-        Ok(blocks)
+        Ok(())
     }
 
     /// Does loop filtering on the macroblock
@@ -1765,15 +1907,12 @@ impl<R: Read> Vp8Decoder<R> {
             if mbx > 0 {
                 //simple loop filtering
                 if self.frame.filter_type {
-                    for y in 0usize..16 {
-                        let y0 = mby * 16 + y;
-                        let x0 = mbx * 16;
-
-                        loop_filter::simple_segment_horizontal(
-                            mbedge_limit,
-                            &mut self.frame.ybuf[y0 * luma_w + x0 - 4..][..8],
-                        );
-                    }
+                    loop_filter::simple_filter_horizontal_batch::<16>(
+                        mbedge_limit,
+                        &mut self.frame.ybuf,
+                        (mby * 16) * luma_w + mbx * 16 - 2,
+                        luma_w,
+                    );
                 } else {
                     loop_filter::macroblock_filter_horizontal_batch::<16>(
                         hev_threshold,
@@ -1806,15 +1945,12 @@ impl<R: Read> Vp8Decoder<R> {
             if do_subblock_filtering {
                 if self.frame.filter_type {
                     for x in (4usize..16 - 1).step_by(4) {
-                        for y in 0..16 {
-                            let y0 = mby * 16 + y;
-                            let x0 = mbx * 16 + x;
-
-                            loop_filter::simple_segment_horizontal(
-                                sub_bedge_limit,
-                                &mut self.frame.ybuf[y0 * luma_w + x0 - 4..][..8],
-                            );
-                        }
+                        loop_filter::simple_filter_horizontal_batch::<16>(
+                            sub_bedge_limit,
+                            &mut self.frame.ybuf,
+                            (mby * 16) * luma_w + mbx * 16 + x - 2,
+                            luma_w,
+                        );
                     }
                 } else {
                     for x in (4usize..16 - 3).step_by(4) {
@@ -1850,17 +1986,12 @@ impl<R: Read> Vp8Decoder<R> {
             //filter across top of macroblock
             if mby > 0 {
                 if self.frame.filter_type {
-                    for x in 0usize..16 {
-                        let y0 = mby * 16;
-                        let x0 = mbx * 16 + x;
-
-                        loop_filter::simple_segment_vertical(
-                            mbedge_limit,
-                            &mut self.frame.ybuf[..],
-                            y0 * luma_w + x0,
-                            luma_w,
-                        );
-                    }
+                    loop_filter::simple_filter_vertical_batch::<16>(
+                        mbedge_limit,
+                        &mut self.frame.ybuf,
+                        (mby * 16) * luma_w + mbx * 16,
+                        luma_w,
+                    );
                 } else {
                     //if bottom macroblock, can only filter if there is 3 pixels below
                     loop_filter::macroblock_filter_vertical_batch::<16>(
@@ -1894,17 +2025,12 @@ impl<R: Read> Vp8Decoder<R> {
             if do_subblock_filtering {
                 if self.frame.filter_type {
                     for y in (4usize..16 - 1).step_by(4) {
-                        for x in 0..16 {
-                            let y0 = mby * 16 + y;
-                            let x0 = mbx * 16 + x;
-
-                            loop_filter::simple_segment_vertical(
-                                sub_bedge_limit,
-                                &mut self.frame.ybuf[..],
-                                y0 * luma_w + x0,
-                                luma_w,
-                            );
-                        }
+                        loop_filter::simple_filter_vertical_batch::<16>(
+                            sub_bedge_limit,
+                            &mut self.frame.ybuf,
+                            (mby * 16 + y) * luma_w + mbx * 16,
+                            luma_w,
+                        );
                     }
                 } else {
                     for y in (4usize..16 - 3).step_by(4) {
@@ -2021,6 +2147,17 @@ impl<R: Read> Vp8Decoder<R> {
             self.prof[3] += t.elapsed().as_nanos() as u64;
         }
 
+        // One residual buffer for the whole frame, kept all zero between
+        // macroblocks: it is cleared only after a macroblock that wrote a
+        // residual, instead of being zeroed and returned by value (two
+        // 1.5 KB moves) for every macroblock.
+        let mut blocks = [0i32; 384];
+
+        // One entry is pushed per macroblock: size the list once instead of
+        // growing (and copying) it as the frame decodes.
+        self.macroblocks
+            .reserve_exact(self.mbwidth as usize * self.mbheight as usize);
+
         for mby in 0..self.mbheight as usize {
             let p = mby % self.num_partitions as usize;
             self.left = MacroBlock::default();
@@ -2031,8 +2168,8 @@ impl<R: Read> Vp8Decoder<R> {
                     t = std::time::Instant::now();
                 }
                 let mut mb = self.read_macroblock_header(mbx)?;
-                let blocks = if !mb.coeffs_skipped {
-                    self.read_residual_data(&mut mb, mbx, p)?
+                if !mb.coeffs_skipped {
+                    self.read_residual_data(&mut mb, mbx, p, &mut blocks)?;
                 } else {
                     if mb.luma_mode != LumaMode::B {
                         self.left.complexity[0] = 0;
@@ -2043,9 +2180,7 @@ impl<R: Read> Vp8Decoder<R> {
                         self.left.complexity[i] = 0;
                         self.top[mbx].complexity[i] = 0;
                     }
-
-                    [0i32; 384]
-                };
+                }
                 #[cfg(feature = "profile")]
                 {
                     self.prof[0] += t.elapsed().as_nanos() as u64;
@@ -2057,6 +2192,11 @@ impl<R: Read> Vp8Decoder<R> {
                 #[cfg(feature = "profile")]
                 {
                     self.prof[1] += t.elapsed().as_nanos() as u64;
+                }
+
+                // Any nonzero residual sets `non_zero_dct`.
+                if mb.non_zero_dct {
+                    blocks.fill(0);
                 }
 
                 self.macroblocks.push(mb);
@@ -2318,7 +2458,16 @@ fn add_residue(pblock: &mut [u8], rblock: &[i32; 16], y0: usize, x0: usize, stri
     }
 }
 
-fn predict_4x4(ws: &mut [u8], stride: usize, modes: &[IntraMode], resdata: &[i32]) {
+/// Predicts the sixteen 4x4 luma blocks in turn, adding each one's residual
+/// (later blocks predict from it). `add_residual` is false when every
+/// residual of the macroblock is zero.
+fn predict_4x4(
+    ws: &mut [u8],
+    stride: usize,
+    modes: &[IntraMode],
+    resdata: &[i32],
+    add_residual: bool,
+) {
     for sby in 0usize..4 {
         for sbx in 0usize..4 {
             let i = sbx + sby * 4;
@@ -2326,7 +2475,7 @@ fn predict_4x4(ws: &mut [u8], stride: usize, modes: &[IntraMode], resdata: &[i32
             let x0 = sbx * 4 + 1;
 
             match modes[i] {
-                IntraMode::TM => predict_tmpred(ws, 4, x0, y0, stride),
+                IntraMode::TM => predict_tmpred::<4>(ws, x0, y0, stride),
                 IntraMode::VE => predict_bvepred(ws, x0, y0, stride),
                 IntraMode::HE => predict_bhepred(ws, x0, y0, stride),
                 IntraMode::DC => predict_bdcpred(ws, x0, y0, stride),
@@ -2338,38 +2487,40 @@ fn predict_4x4(ws: &mut [u8], stride: usize, modes: &[IntraMode], resdata: &[i32
                 IntraMode::HU => predict_bhupred(ws, x0, y0, stride),
             }
 
-            let rb: &[i32; 16] = resdata[i * 16..][..16].try_into().unwrap();
-            add_residue(ws, rb, y0, x0, stride);
+            if add_residual {
+                let rb: &[i32; 16] = resdata[i * 16..][..16].try_into().unwrap();
+                add_residue(ws, rb, y0, x0, stride);
+            }
         }
     }
 }
 
-fn predict_vpred(a: &mut [u8], size: usize, x0: usize, y0: usize, stride: usize) {
-    // This pass copies the top row to the rows below it.
+// The whole-block predictors take the block size as a const parameter: every
+// row is then a fixed-width copy, fill or loop the compiler emits inline,
+// where a runtime size made each row a `memset` call or an element loop.
+
+fn predict_vpred<const SIZE: usize>(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     let (above, curr) = a.split_at_mut(stride * y0);
-    let above_slice = &above[x0..];
+    let above: [u8; SIZE] = above[x0..][..SIZE].try_into().unwrap();
 
-    for curr_chunk in curr.chunks_exact_mut(stride).take(size) {
-        for (curr, &above) in curr_chunk[1..].iter_mut().zip(above_slice) {
-            *curr = above;
-        }
+    for row in curr.chunks_exact_mut(stride).take(SIZE) {
+        row[1..][..SIZE].copy_from_slice(&above);
     }
 }
 
-fn predict_hpred(a: &mut [u8], size: usize, x0: usize, y0: usize, stride: usize) {
-    // This pass copies the first value of a row to the values right of it.
-    for chunk in a.chunks_exact_mut(stride).skip(y0).take(size) {
+fn predict_hpred<const SIZE: usize>(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
+    for chunk in a.chunks_exact_mut(stride).skip(y0).take(SIZE) {
         let left = chunk[x0 - 1];
-        chunk[x0..].iter_mut().for_each(|a| *a = left);
+        chunk[x0..][..SIZE].fill(left);
     }
 }
 
-fn predict_dcpred(a: &mut [u8], size: usize, stride: usize, above: bool, left: bool) {
+fn predict_dcpred<const SIZE: usize>(a: &mut [u8], stride: usize, above: bool, left: bool) {
     let mut sum = 0;
-    let mut shf = if size == 8 { 2 } else { 3 };
+    let mut shf = if SIZE == 8 { 2 } else { 3 };
 
     if left {
-        for y in 0usize..size {
+        for y in 0usize..SIZE {
             sum += u32::from(a[(y + 1) * stride]);
         }
 
@@ -2377,7 +2528,7 @@ fn predict_dcpred(a: &mut [u8], size: usize, stride: usize, above: bool, left: b
     }
 
     if above {
-        sum += a[1..=size].iter().fold(0, |acc, &x| acc + u32::from(x));
+        sum += a[1..=SIZE].iter().fold(0, |acc, &x| acc + u32::from(x));
 
         shf += 1;
     }
@@ -2388,45 +2539,26 @@ fn predict_dcpred(a: &mut [u8], size: usize, stride: usize, above: bool, left: b
         (sum + (1 << (shf - 1))) >> shf
     };
 
-    for y in 0usize..size {
-        a[1 + stride * (y + 1)..][..size]
-            .iter_mut()
-            .for_each(|a| *a = dcval as u8);
+    for row in a[stride..].chunks_exact_mut(stride).take(SIZE) {
+        row[1..][..SIZE].fill(dcval as u8);
     }
 }
 
 // Clippy suggests the clamp method, but it seems to optimize worse as of rustc 1.82.0 nightly.
 #[allow(clippy::manual_clamp)]
-fn predict_tmpred(a: &mut [u8], size: usize, x0: usize, y0: usize, stride: usize) {
+fn predict_tmpred<const SIZE: usize>(a: &mut [u8], x0: usize, y0: usize, stride: usize) {
     // The formula for tmpred is:
-    // X_ij = L_i + A_j - P (i, j=0, 1, 2, 3)
-    //
-    // |-----|-----|-----|-----|-----|
-    // | P   | A0  | A1  | A2  | A3  |
-    // |-----|-----|-----|-----|-----|
-    // | L0  | X00 | X01 | X02 | X03 |
-    // |-----|-----|-----|-----|-----|
-    // | L1  | X10 | X11 | X12 | X13 |
-    // |-----|-----|-----|-----|-----|
-    // | L2  | X20 | X21 | X22 | X23 |
-    // |-----|-----|-----|-----|-----|
-    // | L3  | X30 | X31 | X32 | X33 |
-    // |-----|-----|-----|-----|-----|
-    // Diagram from p. 52 of RFC 6386
-
-    // Split at L0
+    // x_block[y * stride + x] = (left + above - p).clamp(0, 255)
     let (above, x_block) = a.split_at_mut(y0 * stride + (x0 - 1));
     let p = i32::from(above[(y0 - 1) * stride + x0 - 1]);
-    let above_slice = &above[(y0 - 1) * stride + x0..];
+    let above: [u8; SIZE] = above[(y0 - 1) * stride + x0..][..SIZE].try_into().unwrap();
 
-    for y in 0usize..size {
-        let left_minus_p = i32::from(x_block[y * stride]) - p;
-
-        // Add 1 to skip over L0 byte
-        x_block[y * stride + 1..][..size]
-            .iter_mut()
-            .zip(above_slice)
-            .for_each(|(cur, &abv)| *cur = (left_minus_p + i32::from(abv)).max(0).min(255) as u8);
+    for row in x_block.chunks_mut(stride).take(SIZE) {
+        let left_minus_p = i32::from(row[0]) - p;
+        let cur: &mut [u8; SIZE] = (&mut row[1..][..SIZE]).try_into().unwrap();
+        for (cur, &abv) in cur.iter_mut().zip(&above) {
+            *cur = (left_minus_p + i32::from(abv)).max(0).min(255) as u8;
+        }
     }
 }
 
@@ -2706,7 +2838,7 @@ mod benches {
         ];
 
         b.iter(|| {
-            black_box(predict_4x4(&mut v, W * 2, &modes, &res_data));
+            black_box(predict_4x4(&mut v, W * 2, &modes, &res_data, true));
         });
     }
 
