@@ -70,6 +70,24 @@ fn yuv_to_b(y: u8, u: u8) -> u8 {
     clip(mulhi(y, 19077) + mulhi(u, 33050) - 17685)
 }
 
+/// Per-image scratch rows, reused for every row: the full-width chroma of
+/// the row being converted, and the column blend it is interpolated from.
+struct Scratch {
+    u: Vec<u8>,
+    v: Vec<u8>,
+    blend: Vec<u16>,
+}
+
+impl Scratch {
+    fn new(width: usize) -> Self {
+        Self {
+            u: vec![0; width],
+            v: vec![0; width],
+            blend: vec![0; width.div_ceil(2)],
+        }
+    }
+}
+
 /// Fills an rgb buffer with the image from the yuv buffers
 /// Size of the buffer is assumed to be correct
 /// BPP is short for bytes per pixel, allows both rgb and rgba to be decoded
@@ -86,12 +104,21 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
     let chroma_buffer_width = buffer_width / 2;
     let chroma_width = width.div_ceil(2);
 
+    // Full-width chroma rows for the row being converted, reused for every row.
+    let mut scratch = Scratch::new(width);
+
     // fill top row first since it only uses the top u/v row
     let top_row_y = &y_buffer[..width];
     let top_row_u = &u_buffer[..chroma_width];
     let top_row_v = &v_buffer[..chroma_width];
     let top_row_buffer = &mut buffer[..width * BPP];
-    fill_row_fancy_with_1_uv_row::<BPP>(top_row_buffer, top_row_y, top_row_u, top_row_v);
+    fill_row_fancy_with_1_uv_row::<BPP>(
+        top_row_buffer,
+        top_row_y,
+        top_row_u,
+        top_row_v,
+        &mut scratch,
+    );
 
     let mut main_row_chunks = buffer[width * BPP..].chunks_exact_mut(width * BPP * 2);
     // the y buffer iterator limits the end of the row iterator so we need this end index
@@ -120,6 +147,7 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
             &u_row_2[..chroma_width],
             &v_row_1[..chroma_width],
             &v_row_2[..chroma_width],
+            &mut scratch,
         );
         fill_row_fancy_with_2_uv_rows::<BPP>(
             row_buf_2,
@@ -128,6 +156,7 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
             &u_row_1[..chroma_width],
             &v_row_2[..chroma_width],
             &v_row_1[..chroma_width],
+            &mut scratch,
         );
     }
 
@@ -147,11 +176,14 @@ pub(crate) fn fill_rgb_buffer_fancy<const BPP: usize>(
             &final_y_row[..width],
             &final_u_row[..chroma_width],
             &final_v_row[..chroma_width],
+            &mut scratch,
         );
     }
 }
 
-/// Fills a row with the fancy interpolation as detailed
+/// Fills a row with the fancy interpolation as detailed: each chroma row is
+/// upsampled to full width (`u_row_1` / `v_row_1` are the rows nearest this
+/// luma row), then the row is converted.
 fn fill_row_fancy_with_2_uv_rows<const BPP: usize>(
     row_buffer: &mut [u8],
     y_row: &[u8],
@@ -159,126 +191,142 @@ fn fill_row_fancy_with_2_uv_rows<const BPP: usize>(
     u_row_2: &[u8],
     v_row_1: &[u8],
     v_row_2: &[u8],
+    scratch: &mut Scratch,
 ) {
-    // need to do left pixel separately since it will only have one u/v value
-    {
-        let rgb1 = &mut row_buffer[0..3];
-        let y_value = y_row[0];
-        // first pixel uses the first u/v as the main one
-        let u_value = get_fancy_chroma_value(u_row_1[0], u_row_1[0], u_row_2[0], u_row_2[0]);
-        let v_value = get_fancy_chroma_value(v_row_1[0], v_row_1[0], v_row_2[0], v_row_2[0]);
-        set_pixel(rgb1, y_value, u_value, v_value);
-    }
-
-    let rest_row_buffer = &mut row_buffer[BPP..];
-    let rest_y_row = &y_row[1..];
-
-    // we do two pixels at a time since they share the same u/v values
-    let mut main_row_chunks = rest_row_buffer.chunks_exact_mut(BPP * 2);
-    let mut main_y_chunks = rest_y_row.chunks_exact(2);
-
-    for (((((rgb, y_val), u_val_1), u_val_2), v_val_1), v_val_2) in (&mut main_row_chunks)
-        .zip(&mut main_y_chunks)
-        .zip(u_row_1.windows(2))
-        .zip(u_row_2.windows(2))
-        .zip(v_row_1.windows(2))
-        .zip(v_row_2.windows(2))
-    {
-        {
-            let rgb1 = &mut rgb[0..3];
-            let y_value = y_val[0];
-            // first pixel uses the first u/v as the main one
-            let u_value = get_fancy_chroma_value(u_val_1[0], u_val_1[1], u_val_2[0], u_val_2[1]);
-            let v_value = get_fancy_chroma_value(v_val_1[0], v_val_1[1], v_val_2[0], v_val_2[1]);
-            set_pixel(rgb1, y_value, u_value, v_value);
-        }
-        {
-            let rgb2 = &mut rgb[BPP..];
-            let y_value = y_val[1];
-            let u_value = get_fancy_chroma_value(u_val_1[1], u_val_1[0], u_val_2[1], u_val_2[0]);
-            let v_value = get_fancy_chroma_value(v_val_1[1], v_val_1[0], v_val_2[1], v_val_2[0]);
-            set_pixel(rgb2, y_value, u_value, v_value);
-        }
-    }
-
-    let final_pixel = main_row_chunks.into_remainder();
-    let final_y = main_y_chunks.remainder();
-
-    if let (rgb, [y_value]) = (final_pixel, final_y) {
-        let final_u_1 = *u_row_1.last().unwrap();
-        let final_u_2 = *u_row_2.last().unwrap();
-
-        let final_v_1 = *v_row_1.last().unwrap();
-        let final_v_2 = *v_row_2.last().unwrap();
-
-        let rgb1 = &mut rgb[0..3];
-        // first pixel uses the first u/v as the main one
-        let u_value = get_fancy_chroma_value(final_u_1, final_u_1, final_u_2, final_u_2);
-        let v_value = get_fancy_chroma_value(final_v_1, final_v_1, final_v_2, final_v_2);
-        set_pixel(rgb1, *y_value, u_value, v_value);
-    }
+    let (u, v) = (&mut scratch.u[..y_row.len()], &mut scratch.v[..y_row.len()]);
+    let blend = &mut scratch.blend[..u_row_1.len()];
+    upsample_row(u_row_1, u_row_2, blend, u);
+    upsample_row(v_row_1, v_row_2, blend, v);
+    convert_row::<BPP>(row_buffer, y_row, u, v);
 }
 
+/// The first and (for even heights) last row have a single chroma row: the
+/// same interpolation with that row standing in for both.
 fn fill_row_fancy_with_1_uv_row<const BPP: usize>(
     row_buffer: &mut [u8],
     y_row: &[u8],
     u_row: &[u8],
     v_row: &[u8],
+    scratch: &mut Scratch,
 ) {
-    // doing left pixel first
-    {
-        let rgb1 = &mut row_buffer[0..3];
-        let y_value = y_row[0];
+    fill_row_fancy_with_2_uv_rows::<BPP>(row_buffer, y_row, u_row, u_row, v_row, v_row, scratch);
+}
 
-        let u_value = u_row[0];
-        let v_value = v_row[0];
-        set_pixel(rgb1, y_value, u_value, v_value);
+/// Fancy-upsample one chroma row to the full width `out.len()`. `near` is
+/// the chroma row nearest the luma row being produced, `far` the other one
+/// of the pair; both hold `ceil(width / 2)` samples. `blend` is scratch of
+/// that length.
+///
+/// The four-tap weights (9, 3, 3, 1) / 16 are a 3:1 blend down the columns
+/// followed by a 3:1 blend along the row, and the integer sums are the
+/// same: `9a + 3a' + 3b + b' = 3(3a + b) + (3a' + b')`. So the column blend
+/// is computed once per chroma sample, and each output is one more blend of
+/// two of those. Pixel 0 and, for even widths, the last pixel sit outside
+/// the chroma grid and mirror their single column. Plain slices throughout,
+/// so both loops vectorize.
+fn upsample_row(near: &[u8], far: &[u8], blend: &mut [u16], out: &mut [u8]) {
+    for ((b, &n), &f) in blend.iter_mut().zip(near).zip(far) {
+        *b = 3 * u16::from(n) + u16::from(f);
     }
 
-    // two pixels at a time since they share the same u/v value
-    let mut main_row_chunks = row_buffer[BPP..].chunks_exact_mut(BPP * 2);
-    let mut main_y_row_chunks = y_row[1..].chunks_exact(2);
+    let width = out.len();
+    out[0] = ((4 * blend[0] + 8) >> 4) as u8;
 
-    for (((rgb, y_val), u_val), v_val) in (&mut main_row_chunks)
-        .zip(&mut main_y_row_chunks)
-        .zip(u_row.windows(2))
-        .zip(v_row.windows(2))
-    {
-        {
-            let rgb1 = &mut rgb[0..3];
-            let y_value = y_val[0];
-            // first pixel uses the first u/v as the main one
-            let u_value = get_fancy_chroma_value(u_val[0], u_val[1], u_val[0], u_val[1]);
-            let v_value = get_fancy_chroma_value(v_val[0], v_val[1], v_val[0], v_val[1]);
-            set_pixel(rgb1, y_value, u_value, v_value);
-        }
-        {
-            let rgb2 = &mut rgb[BPP..];
-            let y_value = y_val[1];
-            let u_value = get_fancy_chroma_value(u_val[1], u_val[0], u_val[1], u_val[0]);
-            let v_value = get_fancy_chroma_value(v_val[1], v_val[0], v_val[1], v_val[0]);
-            set_pixel(rgb2, y_value, u_value, v_value);
-        }
+    let pairs = (width - 1) / 2;
+    let (b0, b1) = (&blend[..pairs], &blend[1..=pairs]);
+    for ((o, &x0), &x1) in out[1..].chunks_exact_mut(2).zip(b0).zip(b1) {
+        o[0] = ((3 * x0 + x1 + 8) >> 4) as u8;
+        o[1] = ((3 * x1 + x0 + 8) >> 4) as u8;
     }
 
-    let final_pixel = main_row_chunks.into_remainder();
-    let final_y = main_y_row_chunks.remainder();
-
-    if let (rgb, [final_y]) = (final_pixel, final_y) {
-        let final_u = *u_row.last().unwrap();
-        let final_v = *v_row.last().unwrap();
-
-        set_pixel(rgb, *final_y, final_u, final_v);
+    if width % 2 == 0 {
+        out[width - 1] = ((4 * blend[pairs] + 8) >> 4) as u8;
     }
 }
 
-#[inline]
-fn get_fancy_chroma_value(main: u8, secondary1: u8, secondary2: u8, tertiary: u8) -> u8 {
-    let val0 = u16::from(main);
-    let val1 = u16::from(secondary1);
-    let val2 = u16::from(secondary2);
-    let val3 = u16::from(tertiary);
-    ((9 * val0 + 3 * val1 + 3 * val2 + val3 + 8) / 16) as u8
+/// `(v * coeff) >> 8` without leaving 16 bits: with `coeff = hi * 256 + lo`,
+/// the product is `v * hi * 256 + v * lo`, so the shifted value is exactly
+/// `v * hi + ((v * lo) >> 8)`, and neither term can overflow `u16`. A 32-bit
+/// product would be one multiply, but baseline x86-64 has no 32-bit vector
+/// multiply and the loop would stay scalar.
+#[inline(always)]
+fn mulhi16(v: u8, coeff: u16) -> u16 {
+    let v = u16::from(v);
+    v * (coeff >> 8) + ((v * (coeff & 0xff)) >> 8)
+}
+
+/// Pixels converted per step of [`convert_row`].
+const LANES: usize = 16;
+
+/// [`yuv_to_r`], [`yuv_to_g`] and [`yuv_to_b`] for `LANES` pixels at once, in
+/// 16-bit lanes (the way libwebp's SSE2 converter works):
+///
+/// * r and g: every partial sum fits `u16`, and the final value fits `i16`
+///   (r in -14234..=30814, g in -10952..=27710), so wrapping 16-bit
+///   arithmetic gives the 32-bit result exactly;
+/// * b reaches 34238, past `i16`: its sum (at most 51923) stays unsigned and
+///   the bias comes off with a saturating subtract, which is the same clamp
+///   at zero that [`clip`] applies after the shift.
+// As for `clip`: the clamp method optimizes worse than max/min here.
+#[allow(clippy::manual_clamp)]
+#[inline(always)]
+fn convert_lanes(
+    y: &[u8; LANES],
+    u: &[u8; LANES],
+    v: &[u8; LANES],
+) -> ([u8; LANES], [u8; LANES], [u8; LANES]) {
+    let (mut r, mut g, mut b) = ([0u8; LANES], [0u8; LANES], [0u8; LANES]);
+    for i in 0..LANES {
+        let luma = mulhi16(y[i], 19077);
+        let red = luma.wrapping_add(mulhi16(v[i], 26149)).wrapping_sub(14234) as i16;
+        let green = luma
+            .wrapping_sub(mulhi16(u[i], 6419))
+            .wrapping_sub(mulhi16(v[i], 13320))
+            .wrapping_add(8708) as i16;
+        let blue = (luma + mulhi16(u[i], 33050)).saturating_sub(17685);
+        r[i] = (red >> 6).max(0).min(255) as u8;
+        g[i] = (green >> 6).max(0).min(255) as u8;
+        b[i] = (blue >> 6).min(255) as u8;
+    }
+    (r, g, b)
+}
+
+/// Convert one row of full-resolution y, u and v samples to rgb, writing the
+/// first three bytes of every `BPP`-byte pixel.
+#[inline(always)]
+fn convert_row<const BPP: usize>(row_buffer: &mut [u8], y: &[u8], u: &[u8], v: &[u8]) {
+    let mut out_chunks = row_buffer.chunks_exact_mut(LANES * BPP);
+    let mut y_chunks = y.chunks_exact(LANES);
+    let mut u_chunks = u.chunks_exact(LANES);
+    let mut v_chunks = v.chunks_exact(LANES);
+
+    for (((out, y), u), v) in (&mut out_chunks)
+        .zip(&mut y_chunks)
+        .zip(&mut u_chunks)
+        .zip(&mut v_chunks)
+    {
+        let (r, g, b) = convert_lanes(
+            y.try_into().unwrap(),
+            u.try_into().unwrap(),
+            v.try_into().unwrap(),
+        );
+        for (i, rgb) in out.chunks_exact_mut(BPP).enumerate() {
+            rgb[0] = r[i];
+            rgb[1] = g[i];
+            rgb[2] = b[i];
+        }
+    }
+
+    // the last few pixels of the row, one at a time
+    for (((rgb, &y), &u), &v) in out_chunks
+        .into_remainder()
+        .chunks_exact_mut(BPP)
+        .zip(y_chunks.remainder())
+        .zip(u_chunks.remainder())
+        .zip(v_chunks.remainder())
+    {
+        set_pixel(rgb, y, u, v);
+    }
 }
 
 #[inline]
@@ -299,6 +347,9 @@ pub(crate) fn fill_rgb_buffer_simple<const BPP: usize>(
     chroma_width: usize,
     buffer_width: usize,
 ) {
+    // Full-width chroma rows for the row being converted, reused for every row.
+    let mut scratch = Scratch::new(width);
+
     let u_row_twice_iter = u_buffer
         .chunks_exact(buffer_width / 2)
         .flat_map(|n| std::iter::repeat(n).take(2));
@@ -317,67 +368,38 @@ pub(crate) fn fill_rgb_buffer_simple<const BPP: usize>(
             &u_row[..chroma_width],
             &v_row[..chroma_width],
             row,
+            &mut scratch,
         );
     }
 }
 
+/// One row with simple (nearest) chroma: each chroma sample is repeated for
+/// its two pixels into the scratch rows, then the row is converted like any
+/// other (16 pixels at a time).
 fn fill_rgba_row_simple<const BPP: usize>(
     y_vec: &[u8],
     u_vec: &[u8],
     v_vec: &[u8],
     rgba: &mut [u8],
+    scratch: &mut Scratch,
 ) {
-    // Fill 2 pixels per iteration: these pixels share `u` and `v` components
-    let mut rgb_chunks = rgba.chunks_exact_mut(BPP * 2);
-    let mut y_chunks = y_vec.chunks_exact(2);
-    let mut u_iter = u_vec.iter();
-    let mut v_iter = v_vec.iter();
+    let (u, v) = (&mut scratch.u[..y_vec.len()], &mut scratch.v[..y_vec.len()]);
+    repeat_chroma(u_vec, u);
+    repeat_chroma(v_vec, v);
+    convert_row::<BPP>(rgba, y_vec, u, v);
+}
 
-    for (((rgb, y), &u), &v) in (&mut rgb_chunks)
-        .zip(&mut y_chunks)
-        .zip(&mut u_iter)
-        .zip(&mut v_iter)
-    {
-        let coeffs = [
-            mulhi(v, 26149),
-            mulhi(u, 6419),
-            mulhi(v, 13320),
-            mulhi(u, 33050),
-        ];
-
-        let get_r = |y: u8| clip(mulhi(y, 19077) + coeffs[0] - 14234);
-        let get_g = |y: u8| clip(mulhi(y, 19077) - coeffs[1] - coeffs[2] + 8708);
-        let get_b = |y: u8| clip(mulhi(y, 19077) + coeffs[3] - 17685);
-
-        let rgb1 = &mut rgb[0..3];
-        rgb1[0] = get_r(y[0]);
-        rgb1[1] = get_g(y[0]);
-        rgb1[2] = get_b(y[0]);
-
-        let rgb2 = &mut rgb[BPP..];
-        rgb2[0] = get_r(y[1]);
-        rgb2[1] = get_g(y[1]);
-        rgb2[2] = get_b(y[1]);
+/// Nearest-neighbour chroma: sample `k` goes to pixels `2k` and `2k + 1`
+/// (an odd width ends on a single pixel). Fixed two-byte stores: `fill` on a
+/// run-time-length pair is a `memset` call per pair.
+fn repeat_chroma(chroma: &[u8], out: &mut [u8]) {
+    let mut pairs = out.chunks_exact_mut(2);
+    for (pair, &c) in (&mut pairs).zip(chroma) {
+        pair[0] = c;
+        pair[1] = c;
     }
-
-    let remainder = rgb_chunks.into_remainder();
-    if remainder.len() >= 3 {
-        if let (Some(&y), Some(&u), Some(&v)) = (
-            y_chunks.remainder().iter().next(),
-            u_iter.next(),
-            v_iter.next(),
-        ) {
-            let coeffs = [
-                mulhi(v, 26149),
-                mulhi(u, 6419),
-                mulhi(v, 13320),
-                mulhi(u, 33050),
-            ];
-
-            remainder[0] = clip(mulhi(y, 19077) + coeffs[0] - 14234);
-            remainder[1] = clip(mulhi(y, 19077) - coeffs[1] - coeffs[2] + 8708);
-            remainder[2] = clip(mulhi(y, 19077) + coeffs[3] - 17685);
-        }
+    if let [last] = pairs.into_remainder() {
+        *last = chroma[chroma.len() - 1];
     }
 }
 
@@ -439,6 +461,204 @@ mod tests {
         }
 
         assert_eq!(rgb_buffer, upsampled_rgb_buffer);
+    }
+
+    /// The 16-bit lane conversion must equal the scalar formulas for every
+    /// (y, u) and (y, v) pair, and for a spread of full triples.
+    #[test]
+    fn lanes_match_scalar() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let check = |y: [u8; LANES], u: [u8; LANES], v: [u8; LANES]| {
+            let (r, g, b) = convert_lanes(&y, &u, &v);
+            for i in 0..LANES {
+                assert_eq!(r[i], yuv_to_r(y[i], v[i]), "r y {} v {}", y[i], v[i]);
+                assert_eq!(
+                    g[i],
+                    yuv_to_g(y[i], u[i], v[i]),
+                    "g {} {} {}",
+                    y[i],
+                    u[i],
+                    v[i]
+                );
+                assert_eq!(b[i], yuv_to_b(y[i], u[i]), "b y {} u {}", y[i], u[i]);
+            }
+        };
+        // r depends on (y, v), b on (y, u): cover both planes fully
+        for y0 in (0..=255u8).step_by(LANES) {
+            for c in 0..=255u8 {
+                let y: [u8; LANES] = std::array::from_fn(|i| y0.wrapping_add(i as u8));
+                check(y, [c; LANES], [c; LANES]);
+                check(y, [c; LANES], [255 - c; LANES]);
+            }
+        }
+        for _ in 0..20_000 {
+            let mut next = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 24) as u8
+            };
+            let y: [u8; LANES] = std::array::from_fn(|_| next());
+            let u: [u8; LANES] = std::array::from_fn(|_| next());
+            let v: [u8; LANES] = std::array::from_fn(|_| next());
+            check(y, u, v);
+        }
+    }
+
+    /// Whole-buffer conversion at awkward sizes (odd and even, below and
+    /// above one lane group) against a direct per-pixel reference.
+    #[test]
+    fn fancy_buffer_matches_reference() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 24) as u8
+        };
+        for &(width, height) in &[
+            (1usize, 1usize),
+            (2, 2),
+            (3, 5),
+            (16, 4),
+            (17, 3),
+            (33, 7),
+            (34, 8),
+            (50, 2),
+        ] {
+            let buffer_width = width.div_ceil(16) * 16;
+            let rows = height.div_ceil(16) * 16;
+            let y_buffer: Vec<u8> = (0..buffer_width * rows).map(|_| next()).collect();
+            let u_buffer: Vec<u8> = (0..buffer_width * rows / 4).map(|_| next()).collect();
+            let v_buffer: Vec<u8> = (0..buffer_width * rows / 4).map(|_| next()).collect();
+            let (cbw, cw, ch) = (buffer_width / 2, width.div_ceil(2), height.div_ceil(2));
+
+            // reference: the interpolation weights written out per pixel
+            let chroma = |plane: &[u8], x: usize, y: usize| -> u8 {
+                let at = |cx: usize, cy: usize| u16::from(plane[cy * cbw + cx]);
+                let (cx, cy) = (x / 2, y / 2);
+                // the neighbour column / row on the side this pixel leans to
+                let ox = if x % 2 == 0 {
+                    cx.saturating_sub(1)
+                } else {
+                    (cx + 1).min(cw - 1)
+                };
+                let oy = if y % 2 == 0 {
+                    cy.saturating_sub(1)
+                } else {
+                    (cy + 1).min(ch - 1)
+                };
+                ((9 * at(cx, cy) + 3 * at(ox, cy) + 3 * at(cx, oy) + at(ox, oy) + 8) / 16) as u8
+            };
+            for bpp in [3usize, 4] {
+                let mut want = vec![7u8; width * height * bpp];
+                for y in 0..height {
+                    for x in 0..width {
+                        let (l, u, v) = (
+                            y_buffer[y * buffer_width + x],
+                            chroma(&u_buffer, x, y),
+                            chroma(&v_buffer, x, y),
+                        );
+                        let px = &mut want[(y * width + x) * bpp..][..3];
+                        px[0] = yuv_to_r(l, v);
+                        px[1] = yuv_to_g(l, u, v);
+                        px[2] = yuv_to_b(l, u);
+                    }
+                }
+                let mut got = vec![7u8; width * height * bpp];
+                if bpp == 3 {
+                    fill_rgb_buffer_fancy::<3>(
+                        &mut got,
+                        &y_buffer,
+                        &u_buffer,
+                        &v_buffer,
+                        width,
+                        height,
+                        buffer_width,
+                    );
+                } else {
+                    fill_rgb_buffer_fancy::<4>(
+                        &mut got,
+                        &y_buffer,
+                        &u_buffer,
+                        &v_buffer,
+                        width,
+                        height,
+                        buffer_width,
+                    );
+                }
+                assert_eq!(got, want, "{width}x{height} bpp {bpp}");
+            }
+        }
+    }
+
+    /// Simple (nearest) upsampling at awkward sizes against a per-pixel
+    /// reference: pixel (x, y) takes chroma sample (x / 2, y / 2).
+    #[test]
+    fn simple_buffer_matches_reference() {
+        let mut seed = 0xd1b5_4a32_d192_ed03u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 24) as u8
+        };
+        for &(width, height) in &[
+            (1usize, 1usize),
+            (2, 2),
+            (3, 5),
+            (16, 4),
+            (17, 3),
+            (33, 7),
+            (34, 8),
+        ] {
+            let buffer_width = width.div_ceil(16) * 16;
+            let rows = height.div_ceil(16) * 16;
+            let y_buffer: Vec<u8> = (0..buffer_width * rows).map(|_| next()).collect();
+            let u_buffer: Vec<u8> = (0..buffer_width * rows / 4).map(|_| next()).collect();
+            let v_buffer: Vec<u8> = (0..buffer_width * rows / 4).map(|_| next()).collect();
+            let cbw = buffer_width / 2;
+            for bpp in [3usize, 4] {
+                let mut want = vec![7u8; width * height * bpp];
+                for y in 0..height {
+                    for x in 0..width {
+                        let l = y_buffer[y * buffer_width + x];
+                        let (u, v) = (
+                            u_buffer[(y / 2) * cbw + x / 2],
+                            v_buffer[(y / 2) * cbw + x / 2],
+                        );
+                        let px = &mut want[(y * width + x) * bpp..][..3];
+                        px[0] = yuv_to_r(l, v);
+                        px[1] = yuv_to_g(l, u, v);
+                        px[2] = yuv_to_b(l, u);
+                    }
+                }
+                let mut got = vec![7u8; width * height * bpp];
+                let cw = width.div_ceil(2);
+                if bpp == 3 {
+                    fill_rgb_buffer_simple::<3>(
+                        &mut got,
+                        &y_buffer,
+                        &u_buffer,
+                        &v_buffer,
+                        width,
+                        cw,
+                        buffer_width,
+                    );
+                } else {
+                    fill_rgb_buffer_simple::<4>(
+                        &mut got,
+                        &y_buffer,
+                        &u_buffer,
+                        &v_buffer,
+                        width,
+                        cw,
+                        buffer_width,
+                    );
+                }
+                assert_eq!(got, want, "{width}x{height} bpp {bpp}");
+            }
+        }
     }
 
     #[test]

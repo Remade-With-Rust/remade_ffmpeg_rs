@@ -31,6 +31,26 @@ enum HuffmanTreeInner {
 #[derive(Clone, Debug)]
 pub(crate) struct HuffmanTree(HuffmanTreeInner);
 
+/// Every byte with its bits reversed.
+const REVERSED: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = (i as u8).reverse_bits();
+        i += 1;
+    }
+    t
+};
+
+/// `u16::reverse_bits`, as two table loads: baseline x86-64 has no
+/// bit-reverse instruction, and building a table reverses one code per
+/// symbol.
+#[inline(always)]
+fn reverse16(code: u16) -> u16 {
+    (u16::from(REVERSED[usize::from(code & 0xff)]) << 8)
+        | u16::from(REVERSED[usize::from(code >> 8)])
+}
+
 impl Default for HuffmanTree {
     fn default() -> Self {
         Self(HuffmanTreeInner::Single(0))
@@ -90,15 +110,14 @@ impl HuffmanTree {
             next_codes[length as usize] += 1;
 
             if length <= table_bits {
-                let mut j = (u16::reverse_bits(code) >> (16 - length)) as usize;
+                let mut j = (reverse16(code) >> (16 - length)) as usize;
                 let entry = (u32::from(length) << 16) | symbol as u32;
                 while j < table_size {
                     table[j] = entry;
                     j += 1 << length as usize;
                 }
             } else {
-                let table_index =
-                    ((u16::reverse_bits(code) >> (16 - length)) & table_mask) as usize;
+                let table_index = ((reverse16(code) >> (16 - length)) & table_mask) as usize;
                 let table_value = table[table_index];
 
                 debug_assert_eq!(table_value >> 16, 0);
@@ -243,6 +262,18 @@ impl HuffmanTree {
                 None
             }
             HuffmanTreeInner::Single(symbol) => Some((0, *symbol)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod reverse_tests {
+    use super::reverse16;
+
+    #[test]
+    fn reverse16_matches_reverse_bits() {
+        for code in 0..=u16::MAX {
+            assert_eq!(reverse16(code), code.reverse_bits());
         }
     }
 }

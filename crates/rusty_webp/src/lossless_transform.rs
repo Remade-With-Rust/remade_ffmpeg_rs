@@ -44,11 +44,20 @@ pub(crate) fn apply_predictor_transform(
     }
 
     for y in 1..height {
-        for block_x in 0..block_xsize {
-            let block_index = (y >> size_bits) * block_xsize + block_x;
-            let predictor = predictor_data[block_index * 4 + 1];
-            let start_index = (y * width + (block_x << size_bits).max(1)) * 4;
-            let end_index = (y * width + ((block_x + 1) << size_bits).min(width)) * 4;
+        let modes = &predictor_data[(y >> size_bits) * block_xsize * 4..][..block_xsize * 4];
+        let mut block_x = 0;
+        while block_x < block_xsize {
+            let predictor = modes[block_x * 4 + 1];
+            // Neighbouring blocks that use the same predictor are one run:
+            // each mode works left to right from the state at its start, so
+            // one call over the run does what a call per block did.
+            let first = block_x;
+            block_x += 1;
+            while block_x < block_xsize && modes[block_x * 4 + 1] == predictor {
+                block_x += 1;
+            }
+            let start_index = (y * width + (first << size_bits).max(1)) * 4;
+            let end_index = (y * width + (block_x << size_bits).min(width)) * 4;
 
             match predictor {
                 0 => apply_predictor_transform_0(image_data, start_index..end_index, width),
@@ -89,27 +98,33 @@ pub fn apply_predictor_transform_1(image_data: &mut [u8], range: Range<usize>, _
     }
 }
 pub fn apply_predictor_transform_2(image_data: &mut [u8], range: Range<usize>, width: usize) {
-    assert!(range.end <= image_data.len());
-    let mut i = range.start;
-    while i < range.end {
-        image_data[i] = image_data[i].wrapping_add(image_data[i - width * 4]);
-        i += 1;
+    // The predictor is a pixel of the row above, which this row never
+    // writes: split there and add the two slices, which vectorizes (the
+    // indexed loop checked both bounds for every byte).
+    let (old, current) = image_data[..range.end].split_at_mut(range.start);
+    let above = &old[range.start - width * 4..];
+    for (byte, &predictor) in current.iter_mut().zip(above) {
+        *byte = byte.wrapping_add(predictor);
     }
 }
 pub fn apply_predictor_transform_3(image_data: &mut [u8], range: Range<usize>, width: usize) {
-    assert!(range.end <= image_data.len());
-    let mut i = range.start;
-    while i < range.end {
-        image_data[i] = image_data[i].wrapping_add(image_data[i - width * 4 + 4]);
-        i += 1;
+    // Top-right. For the last pixel of a row that is the first pixel of the
+    // row being written, which lies before `range` (a range never starts at
+    // a row's first pixel), so the source is still entirely in `old`.
+    let (old, current) = image_data[..range.end].split_at_mut(range.start);
+    let above = &old[range.start - width * 4 + 4..];
+    for (byte, &predictor) in current.iter_mut().zip(above) {
+        *byte = byte.wrapping_add(predictor);
     }
 }
 pub fn apply_predictor_transform_4(image_data: &mut [u8], range: Range<usize>, width: usize) {
-    assert!(range.end <= image_data.len());
-    let mut i = range.start;
-    while i < range.end {
-        image_data[i] = image_data[i].wrapping_add(image_data[i - width * 4 - 4]);
-        i += 1;
+    // The predictor is a pixel of the row above, which this row never
+    // writes: split there and add the two slices, which vectorizes (the
+    // indexed loop checked both bounds for every byte).
+    let (old, current) = image_data[..range.end].split_at_mut(range.start);
+    let above = &old[range.start - width * 4 - 4..];
+    for (byte, &predictor) in current.iter_mut().zip(above) {
+        *byte = byte.wrapping_add(predictor);
     }
 }
 pub fn apply_predictor_transform_5(image_data: &mut [u8], range: Range<usize>, width: usize) {
@@ -374,6 +389,13 @@ pub(crate) fn apply_color_transform(
             let green_to_blue = transform[1];
             let green_to_red = transform[2];
 
+            // All three multipliers zero: every delta is zero and the block
+            // is left as it is. One test per block instead of three
+            // multiplies per pixel.
+            if red_to_blue | green_to_blue | green_to_red == 0 {
+                continue;
+            }
+
             for pixel in block.chunks_exact_mut(4) {
                 let green = u32::from(pixel[1]);
                 let mut temp_red = u32::from(pixel[0]);
@@ -535,11 +557,15 @@ fn apply_color_indexing_transform_small_table<const W_BITS: u8, const EXP_ENTRY_
         let packed_argb_row_slice =
             &image_data[packed_row_input_global_offset..][..input_stride_bytes_packed];
 
+        // The packed indices are the green channel. Taken out of each pixel
+        // as a word (shift and truncate), which vectorizes; indexing byte 1
+        // of every 4-byte chunk moved one byte at a time.
         for (packed_argb_chunk, packed_idx) in packed_argb_row_slice
             .chunks_exact(4)
             .zip(packed_indices_for_row.iter_mut())
         {
-            *packed_idx = packed_argb_chunk[1];
+            let word = u32::from_le_bytes(packed_argb_chunk.try_into().unwrap());
+            *packed_idx = (word >> 8) as u8;
         }
 
         let output_row_global_offset = y * output_stride_bytes_expanded;

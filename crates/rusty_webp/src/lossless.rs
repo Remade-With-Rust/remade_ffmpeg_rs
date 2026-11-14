@@ -493,9 +493,17 @@ impl<R: BufRead> LosslessDecoder<R> {
             if index >= next_block_start {
                 let x = index % usize::from(width);
                 let y = index / usize::from(width);
-                next_block_start = (x | usize::from(huffman_info.mask)).min(usize::from(width - 1))
-                    + y * usize::from(width)
-                    + 1;
+                next_block_start = if huffman_info.bits == 0 {
+                    // One code group for the whole image: it never changes,
+                    // so this block (two divisions, a group lookup and the
+                    // single-symbol test) runs once instead of once per
+                    // pixel, which is what a block of one pixel meant.
+                    num_values
+                } else {
+                    (x | usize::from(huffman_info.mask)).min(usize::from(width - 1))
+                        + y * usize::from(width)
+                        + 1
+                };
 
                 let huff_index = huffman_info.get_huff_index(x as u16, y as u16);
                 tree = &huffman_info.huffman_code_groups[huff_index];
@@ -605,10 +613,12 @@ impl<R: BufRead> LosslessDecoder<R> {
                 index += length;
             } else {
                 //color cache, so use previously stored pixels to get this pixel
-                let color_cache = huffman_info
-                    .color_cache
-                    .as_mut()
-                    .ok_or(DecodingError::BitStreamError)?;
+                // `let ... else`, not `.ok_or(err)?`: the latter builds the
+                // error up front and drops it again for every pixel that
+                // is coded from the cache.
+                let Some(color_cache) = huffman_info.color_cache.as_mut() else {
+                    return Err(DecodingError::BitStreamError);
+                };
                 let color = color_cache.lookup((code - 280).into());
                 data[index * 4..][..4].copy_from_slice(&color);
                 index += 1;
@@ -709,9 +719,11 @@ struct ColorCache {
 impl ColorCache {
     #[inline(always)]
     fn insert(&mut self, color: [u8; 4]) {
-        let [r, g, b, a] = color;
-        let color_u32 =
-            (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b)) | (u32::from(a) << 24);
+        // The hash key is the pixel as ARGB. Read big-endian the RGBA bytes
+        // are `r g b a` from the top; rotating right one byte moves the
+        // alpha to the top: two instructions instead of four byte
+        // extensions, three shifts and three ORs.
+        let color_u32 = u32::from_be_bytes(color).rotate_right(8);
         let index = (0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits);
         self.color_cache[index as usize] = color;
     }

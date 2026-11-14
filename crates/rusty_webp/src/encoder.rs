@@ -312,8 +312,13 @@ enum Tok {
 }
 
 /// Pack an RGBA byte quad into the ARGB word the spec hashes and matches on.
+///
+/// Read big-endian, the RGBA bytes are `r g b a` from the top; rotating right
+/// by one byte moves the alpha to the top. One load, a byte swap and a
+/// rotate, instead of four loads, three shifts and three ORs.
 fn pack_argb(p: &[u8]) -> u32 {
-    (u32::from(p[3]) << 24) | (u32::from(p[0]) << 16) | (u32::from(p[1]) << 8) | u32::from(p[2])
+    let rgba: [u8; 4] = p[..4].try_into().unwrap();
+    u32::from_be_bytes(rgba).rotate_right(8)
 }
 
 fn hash2(a: u32, b: u32) -> usize {
@@ -325,23 +330,41 @@ fn hash2(a: u32, b: u32) -> usize {
 /// neighbours (dx, dy) for the current image width; everything else is
 /// `distance + 120`.
 struct DistMapper {
-    map: std::collections::HashMap<usize, u32>,
+    /// `short[d]` is the short code (1..=120) of pixel distance `d`, or 0 if
+    /// it has none. The short codes name neighbours at most seven rows up,
+    /// so the table is `7 * width + 9` bytes and a lookup is one load. (A
+    /// `HashMap` hashed every lookup with SipHash under a per-process random
+    /// key, which also made the encoder's instruction count vary from run
+    /// to run.)
+    short: Vec<u8>,
 }
 
 impl DistMapper {
     fn new(width: usize) -> Self {
-        let mut map = std::collections::HashMap::with_capacity(120);
+        let distance = |dx: i8, dy: i8| i64::from(dx) + i64::from(dy) * width as i64;
+        let longest = crate::lossless::DISTANCE_MAP
+            .iter()
+            .map(|&(dx, dy)| distance(dx, dy))
+            .max()
+            .unwrap_or(0)
+            .max(0) as usize;
+        let mut short = vec![0u8; longest + 1];
         for (i, &(dx, dy)) in crate::lossless::DISTANCE_MAP.iter().enumerate() {
-            let d = i64::from(dx) + i64::from(dy) * width as i64;
-            if d >= 1 {
-                map.entry(d as usize).or_insert(i as u32 + 1);
+            let d = distance(dx, dy);
+            // Several (dx, dy) can name one distance on narrow images: the
+            // first (lowest) code wins.
+            if d >= 1 && short[d as usize] == 0 {
+                short[d as usize] = i as u8 + 1;
             }
         }
-        Self { map }
+        Self { short }
     }
 
     fn code(&self, dist: usize) -> u32 {
-        self.map.get(&dist).copied().unwrap_or(dist as u32 + 120)
+        match self.short.get(dist) {
+            Some(&code) if code != 0 => u32::from(code),
+            _ => dist as u32 + 120,
+        }
     }
 }
 
@@ -363,33 +386,52 @@ fn prefix_encode(v: u32) -> (u32, u8, u32) {
 /// conservative: a hit is only claimed for values the stream actually
 /// inserted, never for the decoder's zero-initialised slots.
 struct CacheModel {
-    bits: u8,
-    slots: Vec<u32>,
-    filled: Vec<bool>,
+    /// `32 - bits`: the hash is the top `bits` bits of the product.
+    shift: u32,
+    /// One word per slot: the inserted value with [`Self::FILLED`] set, or
+    /// zero for a slot the stream has not written yet. (A value and a
+    /// separate `filled` flag meant two bounds-checked stores per insert,
+    /// and an insert happens for every pixel of every copy.)
+    ///
+    /// Always [`Self::CAPACITY`] long, whatever the cache size: with a
+    /// fixed length and a masked index the store needs no bounds check.
+    slots: Box<[u64; Self::CAPACITY]>,
 }
 
 impl CacheModel {
+    const FILLED: u64 = 1 << 32;
+    /// The largest cache the encoder considers (10 bits).
+    const CAPACITY: usize = 1 << 10;
+
     fn new(bits: u8) -> Self {
+        assert!((1usize << bits) <= Self::CAPACITY);
         Self {
-            bits,
-            slots: vec![0; 1 << bits],
-            filled: vec![false; 1 << bits],
+            shift: 32 - u32::from(bits),
+            slots: Box::new([0; Self::CAPACITY]),
         }
     }
 
+    /// The slot of `v`: the top `bits` bits of the hash, so always below
+    /// `1 << bits`.
+    #[inline(always)]
     fn index(&self, v: u32) -> usize {
-        (0x1e35_a7bdu32.wrapping_mul(v) >> (32 - self.bits)) as usize
+        (0x1e35_a7bdu32.wrapping_mul(v) >> self.shift) as usize
     }
 
+    #[inline(always)]
     fn hit(&self, v: u32) -> Option<usize> {
         let i = self.index(v);
-        (self.filled[i] && self.slots[i] == v).then_some(i)
+        (self.slots[i] == (u64::from(v) | Self::FILLED)).then_some(i)
     }
 
+    #[inline(always)]
     fn insert(&mut self, v: u32) {
-        let i = self.index(v);
-        self.slots[i] = v;
-        self.filled[i] = true;
+        // The mask is a no-op (see `index`) that tells the compiler the slot
+        // is in range. Only here: inserts run for every pixel of every copy,
+        // where the saved check pays; on the lookup in `hit` the extra AND
+        // measured a loss on photographic content.
+        let i = self.index(v) & (Self::CAPACITY - 1);
+        self.slots[i] = u64::from(v) | Self::FILLED;
     }
 }
 
@@ -403,11 +445,13 @@ fn tokenize(px: &[u32], width: usize) -> Vec<Tok> {
 
     let extend = |c: usize, i: usize| -> usize {
         let max_len = (n - i).min(MAX_MATCH);
-        let mut l = 0usize;
-        while l < max_len && px[c + l] == px[i + l] {
-            l += 1;
-        }
-        l
+        // Two windows of one length (c < i, so both are in range) walked
+        // together: no bounds check per pixel, unlike `px[c + l] == px[i + l]`.
+        px[c..c + max_len]
+            .iter()
+            .zip(&px[i..i + max_len])
+            .take_while(|(a, b)| a == b)
+            .count()
     };
 
     let mut i = 0usize;
@@ -506,35 +550,64 @@ struct Hists {
     extra_bits: u64,
 }
 
-/// Walk the tokens as the decoder will see them, maintaining the cache model,
-/// and count every symbol that would be written.
-fn histogram(toks: &[Tok], px: &[u32], cache_bits: u8) -> Hists {
-    let cache_size = if cache_bits > 0 {
-        1usize << cache_bits
-    } else {
-        0
-    };
-    let mut h = Hists {
-        green: vec![0; 256 + 24 + cache_size],
-        red: vec![0; 256],
-        blue: vec![0; 256],
-        alpha: vec![0; 256],
-        dist: vec![0; 40],
-        extra_bits: 0,
-    };
-    let mut cache = (cache_bits > 0).then(|| CacheModel::new(cache_bits));
+/// Colour-cache sizes (in bits; 0 = no cache) the encoder chooses between.
+const CACHE_CANDIDATES: [u8; 5] = [0, 4, 6, 8, 10];
+
+impl Hists {
+    fn new(cache_bits: u8) -> Self {
+        let cache_size = if cache_bits > 0 {
+            1usize << cache_bits
+        } else {
+            0
+        };
+        Self {
+            green: vec![0; 256 + 24 + cache_size],
+            red: vec![0; 256],
+            blue: vec![0; 256],
+            alpha: vec![0; 256],
+            dist: vec![0; 40],
+            extra_bits: 0,
+        }
+    }
+}
+
+/// Walk the tokens as the decoder will see them and count every symbol that
+/// would be written, for each of [`CACHE_CANDIDATES`] at once: one cache
+/// model per candidate, all fed from a single pass. (A pass per candidate
+/// walked the tokens, re-derived every prefix code and re-read every copied
+/// pixel five times.)
+fn histograms(toks: &[Tok], px: &[u32]) -> [Hists; 5] {
+    let mut hists = CACHE_CANDIDATES.map(Hists::new);
+    // the models of candidates 1.. (candidate 0 has no cache)
+    let mut caches = [
+        CacheModel::new(CACHE_CANDIDATES[1]),
+        CacheModel::new(CACHE_CANDIDATES[2]),
+        CacheModel::new(CACHE_CANDIDATES[3]),
+        CacheModel::new(CACHE_CANDIDATES[4]),
+    ];
     let mut pos = 0usize;
     for tok in toks {
         match *tok {
             Tok::Lit(v) => {
-                if let Some(idx) = cache.as_ref().and_then(|c| c.hit(v)) {
-                    h.green[280 + idx] += 1;
-                } else {
-                    h.green[(v >> 8) as u8 as usize] += 1;
-                    h.red[(v >> 16) as u8 as usize] += 1;
-                    h.blue[v as u8 as usize] += 1;
-                    h.alpha[(v >> 24) as u8 as usize] += 1;
-                    if let Some(c) = cache.as_mut() {
+                let g = (v >> 8) as u8 as usize;
+                let r = (v >> 16) as u8 as usize;
+                let b = v as u8 as usize;
+                let a = (v >> 24) as u8 as usize;
+
+                let (plain, cached) = hists.split_at_mut(1);
+                let h = &mut plain[0];
+                h.green[g] += 1;
+                h.red[r] += 1;
+                h.blue[b] += 1;
+                h.alpha[a] += 1;
+                for (h, c) in cached.iter_mut().zip(&mut caches) {
+                    if let Some(idx) = c.hit(v) {
+                        h.green[280 + idx] += 1;
+                    } else {
+                        h.green[g] += 1;
+                        h.red[r] += 1;
+                        h.blue[b] += 1;
+                        h.alpha[a] += 1;
                         c.insert(v);
                     }
                 }
@@ -543,11 +616,13 @@ fn histogram(toks: &[Tok], px: &[u32], cache_bits: u8) -> Hists {
             Tok::Copy { len, dist_code } => {
                 let (ls, le, _) = prefix_encode(len);
                 let (ds, de, _) = prefix_encode(dist_code);
-                h.green[256 + ls as usize] += 1;
-                h.dist[ds as usize] += 1;
-                h.extra_bits += u64::from(le) + u64::from(de);
-                if let Some(c) = cache.as_mut() {
-                    for &v in &px[pos..pos + len as usize] {
+                for h in &mut hists {
+                    h.green[256 + ls as usize] += 1;
+                    h.dist[ds as usize] += 1;
+                    h.extra_bits += u64::from(le) + u64::from(de);
+                }
+                for &v in &px[pos..pos + len as usize] {
+                    for c in &mut caches {
                         c.insert(v);
                     }
                 }
@@ -555,7 +630,7 @@ fn histogram(toks: &[Tok], px: &[u32], cache_bits: u8) -> Hists {
             }
         }
     }
-    h
+    hists
 }
 
 /// Shannon estimate of the coded size (bits) for one histogram set — used
@@ -599,20 +674,30 @@ fn cash(a: i16, b: i16) -> u8 {
 
 /// The 14 VP8L predictors, mirroring the decoder's
 /// `apply_predictor_transform_*` functions exactly (RGBA channel order).
+///
+/// Always inlined, with a generic (not `dyn`) per-channel helper: the
+/// predictor search calls this for all 14 modes of every pixel, and as an
+/// out-of-line function taking `&dyn Fn` each of those was a call, a
+/// run-time match on the mode and four indirect calls. Inlined into a loop
+/// over the modes, each mode's arm is selected at compile time.
+#[inline(always)]
 fn predict(mode: u8, l: [u8; 4], t: [u8; 4], tr: [u8; 4], tl: [u8; 4]) -> [u8; 4] {
-    let per = |f: &dyn Fn(usize) -> u8| [f(0), f(1), f(2), f(3)];
+    #[inline(always)]
+    fn per(f: impl Fn(usize) -> u8) -> [u8; 4] {
+        [f(0), f(1), f(2), f(3)]
+    }
     match mode {
         0 => [0, 0, 0, 255],
         1 => l,
         2 => t,
         3 => tr,
         4 => tl,
-        5 => per(&|i| avg2(avg2(l[i], tr[i]), t[i])),
-        6 => per(&|i| avg2(l[i], tl[i])),
-        7 => per(&|i| avg2(l[i], t[i])),
-        8 => per(&|i| avg2(tl[i], t[i])),
-        9 => per(&|i| avg2(t[i], tr[i])),
-        10 => per(&|i| avg2(avg2(l[i], tl[i]), avg2(t[i], tr[i]))),
+        5 => per(|i| avg2(avg2(l[i], tr[i]), t[i])),
+        6 => per(|i| avg2(l[i], tl[i])),
+        7 => per(|i| avg2(l[i], t[i])),
+        8 => per(|i| avg2(tl[i], t[i])),
+        9 => per(|i| avg2(t[i], tr[i])),
+        10 => per(|i| avg2(avg2(l[i], tl[i]), avg2(t[i], tr[i]))),
         11 => {
             // Select: whole-pixel choice between L and T by which is closer
             // to the gradient L+T-TL, summed over all four channels.
@@ -629,8 +714,8 @@ fn predict(mode: u8, l: [u8; 4], t: [u8; 4], tr: [u8; 4], tl: [u8; 4]) -> [u8; 4
                 t
             }
         }
-        12 => per(&|i| casf(i16::from(l[i]), i16::from(t[i]), i16::from(tl[i]))),
-        _ => per(&|i| cash((i16::from(l[i]) + i16::from(t[i])) / 2, i16::from(tl[i]))),
+        12 => per(|i| casf(i16::from(l[i]), i16::from(t[i]), i16::from(tl[i]))),
+        _ => per(|i| cash((i16::from(l[i]) + i16::from(t[i])) / 2, i16::from(tl[i]))),
     }
 }
 
@@ -640,27 +725,138 @@ fn residual_cost(r: u8) -> u32 {
     u32::from(r.min(0u8.wrapping_sub(r)))
 }
 
-/// Neighbours of pixel (x, y≥1, x≥1) as the decoder reconstructs them. TR at
-/// the row end wraps to the current row's first pixel (already decoded), as
-/// in the decoder's `i - width*4 + 4` addressing.
-fn neighbours(
+/// What [`neighbour_rows`] returns: current, left, top and top-left bytes
+/// (slices of the image) and a copy of the top-right bytes.
+type NeighbourRows<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a [u8], [u8; 4 << PRED_BITS]);
+
+/// Pixels `x0..x1` (`x0 >= 1`) of row `y >= 1` as bytes, with the bytes of
+/// their left, top and top-left neighbours (slices of the image, all the
+/// same length) and of their top-right neighbours (a copy, valid for that
+/// length).
+///
+/// Top-right is the row above one pixel on, except at the image's last
+/// column, where it wraps to this row's first pixel, as in the decoder's
+/// `i - width*4 + 4` addressing.
+#[inline(always)]
+fn neighbour_rows(
     pixels: &[u8],
     width: usize,
-    x: usize,
+    x0: usize,
+    x1: usize,
     y: usize,
-) -> ([u8; 4], [u8; 4], [u8; 4], [u8; 4]) {
-    let at = |xx: usize, yy: usize| -> [u8; 4] {
-        pixels[(yy * width + xx) * 4..][..4].try_into().unwrap()
-    };
-    let l = at(x - 1, y);
-    let t = at(x, y - 1);
-    let tl = at(x - 1, y - 1);
-    let tr = if x + 1 < width {
-        at(x + 1, y - 1)
+) -> NeighbourRows<'_> {
+    let n = (x1 - x0) * 4;
+    let row = (y * width + x0) * 4;
+    let above = row - width * 4;
+
+    let mut tr = [0u8; 4 << PRED_BITS];
+    if x1 == width {
+        tr[..n - 4].copy_from_slice(&pixels[above + 4..][..n - 4]);
+        tr[n - 4..n].copy_from_slice(&pixels[y * width * 4..][..4]);
     } else {
-        at(0, y)
-    };
-    (l, t, tr, tl)
+        tr[..n].copy_from_slice(&pixels[above + 4..][..n]);
+    }
+    (
+        &pixels[row..][..n],
+        &pixels[row - 4..][..n],
+        &pixels[above..][..n],
+        &pixels[above - 4..][..n],
+        tr,
+    )
+}
+
+/// Write one tile row's residuals under predictor `mode`: `cur - predicted`
+/// per byte. Slices as in [`row_costs`].
+fn row_residuals(mode: u8, out: &mut [u8], cur: &[u8], l: &[u8], t: &[u8], tr: &[u8], tl: &[u8]) {
+    let n = cur.len();
+    let (out, l, t, tr, tl) = (&mut out[..n], &l[..n], &t[..n], &tr[..n], &tl[..n]);
+
+    #[inline(always)]
+    fn fill(out: &mut [u8], cur: &[u8], predictor: impl Fn(usize) -> u8) {
+        for (i, (o, &px)) in out.iter_mut().zip(cur).enumerate() {
+            *o = px.wrapping_sub(predictor(i));
+        }
+    }
+
+    const OPAQUE_BLACK: [u8; 4] = [0, 0, 0, 255];
+    match mode {
+        0 => fill(out, cur, |i| OPAQUE_BLACK[i & 3]),
+        1 => fill(out, cur, |i| l[i]),
+        2 => fill(out, cur, |i| t[i]),
+        3 => fill(out, cur, |i| tr[i]),
+        4 => fill(out, cur, |i| tl[i]),
+        5 => fill(out, cur, |i| avg2(avg2(l[i], tr[i]), t[i])),
+        6 => fill(out, cur, |i| avg2(l[i], tl[i])),
+        7 => fill(out, cur, |i| avg2(l[i], t[i])),
+        8 => fill(out, cur, |i| avg2(tl[i], t[i])),
+        9 => fill(out, cur, |i| avg2(t[i], tr[i])),
+        10 => fill(out, cur, |i| avg2(avg2(l[i], tl[i]), avg2(t[i], tr[i]))),
+        11 => {
+            // select chooses a whole pixel: one pixel at a time
+            for k in (0..n).step_by(4) {
+                let px = |s: &[u8]| -> [u8; 4] { s[k..k + 4].try_into().unwrap() };
+                let p = predict(11, px(l), px(t), px(tr), px(tl));
+                for i in 0..4 {
+                    out[k + i] = cur[k + i].wrapping_sub(p[i]);
+                }
+            }
+        }
+        12 => fill(out, cur, |i| {
+            casf(i16::from(l[i]), i16::from(t[i]), i16::from(tl[i]))
+        }),
+        _ => fill(out, cur, |i| {
+            cash((i16::from(l[i]) + i16::from(t[i])) / 2, i16::from(tl[i]))
+        }),
+    }
+}
+
+/// Add one tile row's residual cost under each of the 14 predictors to
+/// `costs`. The five slices are the row's bytes and its left, top, top-right
+/// and top-left neighbours' bytes (RGBA, all the same length).
+///
+/// Every predictor except select (11) works channel by channel, so its cost
+/// is a plain loop over the row's bytes that the compiler vectorizes; the
+/// per-pixel form evaluated [`predict`] fourteen times for each pixel in
+/// turn. The sums are the same integers, so the chosen modes are too.
+fn row_costs(costs: &mut [u32; 14], cur: &[u8], l: &[u8], t: &[u8], tr: &[u8], tl: &[u8]) {
+    let n = cur.len();
+    let (l, t, tr, tl) = (&l[..n], &t[..n], &tr[..n], &tl[..n]);
+
+    #[inline(always)]
+    fn sum(cur: &[u8], predictor: impl Fn(usize) -> u8) -> u32 {
+        let mut cost = 0u32;
+        for (i, &px) in cur.iter().enumerate() {
+            cost += residual_cost(px.wrapping_sub(predictor(i)));
+        }
+        cost
+    }
+
+    const OPAQUE_BLACK: [u8; 4] = [0, 0, 0, 255];
+    costs[0] += sum(cur, |i| OPAQUE_BLACK[i & 3]);
+    costs[1] += sum(cur, |i| l[i]);
+    costs[2] += sum(cur, |i| t[i]);
+    costs[3] += sum(cur, |i| tr[i]);
+    costs[4] += sum(cur, |i| tl[i]);
+    costs[5] += sum(cur, |i| avg2(avg2(l[i], tr[i]), t[i]));
+    costs[6] += sum(cur, |i| avg2(l[i], tl[i]));
+    costs[7] += sum(cur, |i| avg2(l[i], t[i]));
+    costs[8] += sum(cur, |i| avg2(tl[i], t[i]));
+    costs[9] += sum(cur, |i| avg2(t[i], tr[i]));
+    costs[10] += sum(cur, |i| avg2(avg2(l[i], tl[i]), avg2(t[i], tr[i])));
+    // select chooses a whole pixel: one pixel at a time
+    for k in (0..n).step_by(4) {
+        let px = |s: &[u8]| -> [u8; 4] { s[k..k + 4].try_into().unwrap() };
+        let p = predict(11, px(l), px(t), px(tr), px(tl));
+        for i in 0..4 {
+            costs[11] += residual_cost(cur[k + i].wrapping_sub(p[i]));
+        }
+    }
+    costs[12] += sum(cur, |i| {
+        casf(i16::from(l[i]), i16::from(t[i]), i16::from(tl[i]))
+    });
+    costs[13] += sum(cur, |i| {
+        cash((i16::from(l[i]) + i16::from(t[i])) / 2, i16::from(tl[i]))
+    });
 }
 
 /// Choose one predictor per 16×16 tile (summed wrap-distance of residuals),
@@ -685,18 +881,11 @@ fn predictor_select(
                 continue; // border-only tile: mode never used
             }
             let mut costs = [0u32; 14];
+            let n = (x1 - x0) * 4;
             for y in y0..y1 {
-                for x in x0..x1 {
-                    let px: [u8; 4] = pixels[(y * width + x) * 4..][..4].try_into().unwrap();
-                    let (l, t, tr, tl) = neighbours(pixels, width, x, y);
-                    for (m, cost) in costs.iter_mut().enumerate() {
-                        let p = predict(m as u8, l, t, tr, tl);
-                        *cost += residual_cost(px[0].wrapping_sub(p[0]))
-                            + residual_cost(px[1].wrapping_sub(p[1]))
-                            + residual_cost(px[2].wrapping_sub(p[2]))
-                            + residual_cost(px[3].wrapping_sub(p[3]));
-                    }
-                }
+                let (cur, l, t, tl, tr) = neighbour_rows(pixels, width, x0, x1, y);
+                let tr = &tr[..n];
+                row_costs(&mut costs, cur, l, t, tr, tl);
             }
             let best = costs
                 .iter()
@@ -721,14 +910,19 @@ fn predictor_select(
             out[y * width * 4 + i] =
                 pixels[y * width * 4 + i].wrapping_sub(pixels[(y - 1) * width * 4 + i]);
         }
-        for x in 1..width {
-            let mode = modes[(y >> PRED_BITS) * bw + (x >> PRED_BITS)];
-            let (l, t, tr, tl) = neighbours(pixels, width, x, y);
-            let p = predict(mode, l, t, tr, tl);
-            let o = (y * width + x) * 4;
-            for i in 0..4 {
-                out[o + i] = pixels[o + i].wrapping_sub(p[i]);
+        // One tile row at a time: the mode is fixed across it, so it is
+        // matched once and the residuals are a loop over the row's bytes.
+        for bx in 0..bw {
+            let x0 = (bx << PRED_BITS).max(1);
+            let x1 = ((bx + 1) << PRED_BITS).min(width);
+            if x0 >= x1 {
+                continue;
             }
+            let mode = modes[(y >> PRED_BITS) * bw + bx];
+            let n = (x1 - x0) * 4;
+            let (cur, l, t, tl, tr) = neighbour_rows(pixels, width, x0, x1, y);
+            let residuals = &mut out[(y * width + x0) * 4..][..n];
+            row_residuals(mode, residuals, cur, l, t, &tr[..n], tl);
         }
     }
 
@@ -752,8 +946,7 @@ fn write_backref_stream<W: Write>(
     let toks = tokenize(px, width);
 
     let mut best: Option<(u8, f64, Hists)> = None;
-    for bits in [0u8, 4, 6, 8, 10] {
-        let h = histogram(&toks, px, bits);
+    for (bits, h) in CACHE_CANDIDATES.into_iter().zip(histograms(&toks, px)) {
         let cost = estimate_bits(&h);
         if best.as_ref().is_none_or(|(_, c, _)| cost < *c) {
             best = Some((bits, cost, h));
@@ -1508,5 +1701,30 @@ mod tests {
             .encode(&img, 256, 256, crate::ColorType::Rgba8)
             .unwrap();
         assert_eq!(img, decode_rgba(&output, 256, 256));
+    }
+}
+
+#[cfg(test)]
+mod dist_mapper_tests {
+    use super::DistMapper;
+
+    /// The sorted table must give what the insertion-ordered map gave: the
+    /// first (lowest) code among the neighbours that name a distance.
+    #[test]
+    fn matches_first_insertion_map() {
+        for width in [1usize, 2, 3, 7, 8, 9, 16, 17, 100, 1920, 16383] {
+            let mut map = std::collections::HashMap::new();
+            for (i, &(dx, dy)) in crate::lossless::DISTANCE_MAP.iter().enumerate() {
+                let d = i64::from(dx) + i64::from(dy) * width as i64;
+                if d >= 1 {
+                    map.entry(d as usize).or_insert(i as u32 + 1);
+                }
+            }
+            let mapper = DistMapper::new(width);
+            for dist in 1..=(8 * width + 40) {
+                let want = map.get(&dist).copied().unwrap_or(dist as u32 + 120);
+                assert_eq!(mapper.code(dist), want, "width {width} dist {dist}");
+            }
+        }
     }
 }

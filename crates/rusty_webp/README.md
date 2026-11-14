@@ -26,6 +26,11 @@ Part of **[Remade With Rust](https://github.com/Remade-With-Rust)** by
 
 ## Measured against FFmpeg
 
+These ratios were measured on 0.1. 0.2 is faster again on every axis below
+(see [What changed in 0.2](#what-changed-in-02)) with the same decoded
+pixels and the same encoded bytes; they have not been re-measured against
+FFmpeg since.
+
 FFmpeg 8.1.2 (libwebp encoder, native VP8/VP8L decoder), pinned single core,
 child **CPU time**, ABBA-interleaved pairs, N = 21–31, null-arm floor ≤ 5%,
 real-content corpus (Derf video frames 1080p–8K, screen captures, alpha, odd
@@ -51,6 +56,56 @@ Where the compression comes from: greedy hash-chain LZ77 backward references,
 a color cache sized per image by entropy estimate, and per-tile predictor
 selection (14 modes, 16-px tiles) behind a run-rate content dispatch that
 skips the search where LZ77 already models the redundancy.
+
+## What changed in 0.2
+
+An instruction-count campaign over the whole crate: 45 changes, each
+measured on its own with callgrind and gated on output. Still images decode
+**bit-exact against libwebp 1.5.0** before and after on a libwebp-encoded
+corpus (lossy at three qualities, lossless photo / screen / palette, alpha),
+and the lossless encoder writes **byte-identical files**. Still no `unsafe`.
+
+0.1 against 0.2, one pinned core, interleaved pairs (0.2 won 10 of 10 on
+every row):
+
+| Workload | Instructions | Wall clock |
+|---|---:|---:|
+| Lossy decode, 1080p, q40 / q75 / q92 | −42% / −39% / −36% | **1.31–1.36× faster** |
+| Lossy + alpha | −45% | **1.41×** |
+| Lossy thumbnail (160×128) | −38% | **1.38×** |
+| Lossless decode, photo / screen / code | −19% / −32% / −28% | **1.12–1.16×** |
+| Animated, lossy / lossless | −47% / −43% | **1.54× / 1.52×** |
+| Lossless encode, photo | −69% | **2.1–2.2×** |
+| Lossless encode, screen / code | −41% / −43% | **1.30–1.34×** |
+
+Timings are whole-process (file read and an output hash included), so the
+codec's own gain is a little larger than the wall column shows.
+
+Where it came from:
+
+- **Lossy decode.** The loop filter loaded and stored its taps one
+  bounds-checked pixel at a time (31% of a 1080p decode); they are slices
+  now. Coefficient tokens are read as straight-line code instead of a
+  generic tree walk, with a branchless sign read, a table-driven
+  renormalisation and whole-macroblock decoder sessions. YUV→RGB runs 16
+  pixels at a time in 16-bit lanes, and a three-coefficient inverse
+  transform joins the DC-only one.
+- **Lossless decode.** Colour-transform blocks whose multipliers are zero
+  (most of them in libwebp's output) are skipped, the colour-cache key is
+  one byte-swapped load, predictors run over runs of blocks, and RGB
+  output is converted 32 pixels at a time.
+- **Alpha and animation.** The alpha plane is unfiltered a row at a time,
+  straight from the decoded pixels; frames blend row by row and reuse
+  their buffers.
+- **Lossless encode.** The predictor search costs each mode over a tile row
+  of bytes instead of calling a predictor per pixel per mode; the five
+  colour-cache candidates share one histogram pass.
+
+**Behaviour change (a fix):** in animated WebP, fully opaque pixels of
+alpha-blended frames decoded one level too dark in red, green and blue.
+0.2 copies opaque pixels as libwebp does, and both animations in the
+corpus now match libwebp's frame-by-frame output exactly. Still images are
+unaffected.
 
 ## What's in the box
 
