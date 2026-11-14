@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/remade-ffmpeg-v0.4.7...remade-ffmpeg-v0.4.8) - 2026-11-14
+
+### Other
+
+- *(fuzz)* print the findings before failing
+
 ## [0.4.7](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/remade-ffmpeg-v0.4.6...remade-ffmpeg-v0.4.7) - 2026-11-13
 
 ### Other
