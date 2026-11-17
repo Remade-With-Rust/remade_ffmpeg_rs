@@ -592,7 +592,15 @@ impl Demuxer for Mp4Demuxer {
             Source::Random { reader, cur } => {
                 let off = loc.offset as u64;
                 if *cur != off {
-                    reader.seek(SeekFrom::Start(off))?;
+                    // A short hop (past a discarded stream's samples, or an
+                    // edit-list replay) stays inside the buffer; a plain seek
+                    // would throw it away and re-read what it already holds.
+                    match (i64::try_from(off), i64::try_from(*cur)) {
+                        (Ok(to), Ok(from)) => reader.seek_relative(to - from)?,
+                        _ => {
+                            reader.seek(SeekFrom::Start(off))?;
+                        }
+                    }
                 }
                 // Read what is there, never a declared size up front: a
                 // corrupt `stsz` must not become a giant allocation.
