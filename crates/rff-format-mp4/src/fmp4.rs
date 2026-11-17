@@ -35,6 +35,7 @@ pub(crate) fn init_segment(track: &TrackOut, track_id: u32, timescale: u32, star
         offsets: Vec::new(),
         start,
         presentation: 0,
+        shown_from: 0,
     };
     let trak = super::build_trak(track, track_id, &empty, 0, 0);
 
