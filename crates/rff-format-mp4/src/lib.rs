@@ -641,6 +641,17 @@ impl Demuxer for Mp4Demuxer {
         packet.flags.keyframe = loc.keyframe;
         Ok(packet)
     }
+
+    /// Drop the discarded streams' samples still to be read, so they are
+    /// never fetched from the file or converted.
+    fn set_discard(&mut self, discard: &[bool]) {
+        let pos = self.pos;
+        let mut i = 0;
+        self.samples.retain(|s| {
+            i += 1;
+            i <= pos || !discard.get(s.stream_index).copied().unwrap_or(false)
+        });
+    }
 }
 
 /// The number of `stts` entries a `trak` declares (0 without one).

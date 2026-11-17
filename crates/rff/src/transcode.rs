@@ -1020,6 +1020,16 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
 
     let mut report = TranscodeReport::default();
 
+    // Streams every op skips (unmapped, -vn/-an, the overlay input once its
+    // frame is decoded) are never needed: let each demuxer drop them at the
+    // source instead of reading and converting packets only to discard them.
+    for (demuxer, ops) in demuxers.iter_mut().zip(&per_input_ops) {
+        let discard: Vec<bool> = ops.iter().map(|op| matches!(op, StreamOp::Skip)).collect();
+        if discard.contains(&true) {
+            demuxer.set_discard(&discard);
+        }
+    }
+
     // --- drive each input through its plan into the shared muxer ---
     for (demuxer, ops) in demuxers.iter_mut().zip(per_input_ops.iter_mut()) {
         loop {

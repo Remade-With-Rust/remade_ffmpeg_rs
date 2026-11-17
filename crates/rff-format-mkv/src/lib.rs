@@ -37,7 +37,7 @@ mod metadata_tests;
 mod mux;
 
 use std::collections::VecDeque;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 
 use rff_core::{
     BlockAdditional, CodecId, ColorInfo, ColorRange, ContentLightLevel, Error, MasteringDisplay,
@@ -491,6 +491,12 @@ impl Source {
         Ok(())
     }
 
+    /// The bytes buffered ahead of the read position, without consuming them
+    /// (fewer than any given count at a buffer boundary or end of input).
+    fn peek(&mut self) -> io::Result<&[u8]> {
+        self.r.fill_buf()
+    }
+
     /// Read up to `n` bytes (fewer at end of input — a truncated final block
     /// comes back partial). Allocation tracks bytes actually read, never `n`.
     fn body(&mut self, n: u64) -> io::Result<Vec<u8>> {
@@ -532,6 +538,9 @@ struct MkvDemuxer {
     refused: Option<String>,
     /// The rest of a laced block's frames, returned before the walk goes on.
     laced: VecDeque<Packet>,
+    /// Indexed by stream index: the caller drops this stream's packets, so
+    /// its SimpleBlocks are skipped unread.
+    discard: Vec<bool>,
     timestamp_scale: u64,
     /// Segment duration in `timestamp_scale` ticks (same unit as `time_base`).
     duration_ticks: Option<i64>,
@@ -563,6 +572,7 @@ impl MkvDemuxer {
             codings: Vec::new(),
             refused: None,
             laced: VecDeque::new(),
+            discard: Vec::new(),
             timestamp_scale: 1_000_000, // default: 1 ms
             duration_ticks: None,
             seg_end: None,
@@ -745,6 +755,7 @@ impl MkvDemuxer {
                         c.ts = v;
                     }
                 }
+                ID_SIMPLE_BLOCK if self.discarded_block(h.size)? => self.src.skip(h.size)?,
                 ID_SIMPLE_BLOCK | ID_BLOCK_GROUP if h.size <= MAX_BLOCK => {
                     let body = self.src.body(h.size)?;
                     if (body.len() as u64) < h.size {
@@ -774,6 +785,26 @@ impl MkvDemuxer {
                 }
             }
         }
+    }
+
+    /// Whether the SimpleBlock of `size` bytes about to be read is on a
+    /// discarded track, judged from its leading track-number vint without
+    /// consuming anything. A vint split across the buffer boundary reads as
+    /// "keep": the block is parsed as usual and the caller drops it.
+    fn discarded_block(&mut self, size: u64) -> io::Result<bool> {
+        if !self.discard.contains(&true) {
+            return Ok(false);
+        }
+        let head = self.src.peek()?;
+        let head = &head[..head.len().min(usize::try_from(size).unwrap_or(usize::MAX))];
+        let Some((track_num, _)) = Ebml::new(head).read_size() else {
+            return Ok(false);
+        };
+        Ok(self
+            .track_map
+            .iter()
+            .find(|(n, _)| *n == track_num)
+            .is_some_and(|&(_, index)| self.discard.get(index).copied().unwrap_or(false)))
     }
 
     fn parse_info(&mut self, data: &[u8]) {
@@ -1256,6 +1287,10 @@ impl Demuxer for MkvDemuxer {
             self.read_header()?;
         }
         self.next_packet()?.ok_or(Error::Eof)
+    }
+
+    fn set_discard(&mut self, discard: &[bool]) {
+        self.discard = discard.to_vec();
     }
 }
 
