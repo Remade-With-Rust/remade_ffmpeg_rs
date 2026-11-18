@@ -23,7 +23,10 @@
 //! gap in its page sequence numbers) is discarded rather than spliced. A bad
 //! page among the codec headers is an error. Otherwise reading stops at the
 //! first position that is not a complete `OggS` page header, and a final page
-//! cut short by end of input is returned unverified (clamped), as before.
+//! cut short by end of input is dropped, as libogg and FFmpeg drop it: its CRC
+//! cannot be checked, and the packet it cuts would decode to audio that is not
+//! in the file (#118). A truncated file therefore reads as an exact prefix of
+//! the whole file's packets.
 //! Packets carry no timestamps (as before) and no duration is declared — the
 //! last page's granule position would need the end of the stream. What each
 //! packet does carry is the page's granule position, on the last packet
@@ -176,8 +179,8 @@ impl Page {
     /// Split the page body by its lacing values, appending to `partial` (the
     /// stream's packet carried over from earlier pages) and calling `emit` for
     /// every packet that completes on this page. A lace of 255 continues the
-    /// packet; anything shorter ends it. A body cut short by end of input is
-    /// clamped, so the packets it truncates are emitted short. Packets come
+    /// packet; anything shorter ends it. (The page reader only hands over
+    /// whole pages; the clamp below is a guard, not a path.) Packets come
     /// out as stream-0 [`Packet`]s; the last one completing on the page carries
     /// the page's granule position and, on an EOS page, the end-of-stream flag.
     ///
@@ -346,8 +349,8 @@ impl PageReader {
 
     /// The next page whose CRC checks out, or `None` at end of input. Reading
     /// stops (without error) at the first position that does not hold a
-    /// complete `OggS` page header + segment table; a page whose body is cut
-    /// short by end of input is still returned (clamped, its CRC unverifiable).
+    /// complete `OggS` page header + segment table, or a whole body: a page cut
+    /// short by end of input is dropped, as libogg and FFmpeg drop it (#118).
     /// A page failing its CRC is dropped and counted (see
     /// [`take_dropped`](Self::take_dropped)), and the search resumes just
     /// past its capture pattern, FFmpeg's way.
@@ -403,9 +406,12 @@ impl PageReader {
             };
             if (page.body.len() as u64) < body_len {
                 self.done = true;
-                // Cut short by end of input: nothing to check the CRC
-                // against. Kept, as before, unless this is a resync guess.
-                return Ok((!self.resync).then_some(page));
+                // Cut short by end of input: there is nothing to check the CRC
+                // against, and a packet it ends would come out short and
+                // decode to audio that is not in the file. Dropped, as libogg
+                // and FFmpeg drop it (#118); the packet it began or carried on
+                // stays incomplete and is never emitted.
+                return Ok(None);
             }
             // The CRC covers the whole page with its own field zeroed.
             let crc = crc_update(0, &hdr[..22]);
@@ -903,8 +909,9 @@ mod tests {
         }
     }
 
-    /// Today's-behaviour oracle: the whole-buffer parser the streaming
-    /// demuxer replaced, kept verbatim so equivalence is checked, not assumed.
+    /// Oracle: the whole-buffer parser the streaming demuxer replaced, kept so
+    /// equivalence is checked, not assumed; since #118 it drops a final page
+    /// whose body is cut short, as libogg does.
     fn reference_packets(buf: &[u8]) -> Vec<Vec<u8>> {
         let mut packets = Vec::new();
         let mut partial: Vec<u8> = Vec::new();
@@ -916,9 +923,13 @@ mod tests {
                 break;
             }
             let segment_table = &buf[i + 27..table_end];
+            let body: usize = segment_table.iter().map(|&l| l as usize).sum();
+            if table_end + body > buf.len() {
+                break;
+            }
             let mut data = table_end;
             for &lace in segment_table {
-                let end = (data + lace as usize).min(buf.len());
+                let end = data + lace as usize;
                 partial.extend_from_slice(&buf[data..end]);
                 data = end;
                 if lace < 255 {
@@ -1181,6 +1192,28 @@ mod tests {
         for cut in 0..=file.len() {
             let buf = &file[..cut];
             assert_eq!(demux_bytes(buf), reference_demux(buf), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn a_cut_short_final_page_is_dropped_so_the_packets_are_a_prefix() {
+        // #118: a page cut inside its body used to be emitted clamped, and the
+        // packet it cut decoded to audio that is not in the file.
+        let mut seq = 0;
+        let mut file = paged(0x02, 3, &mut seq, &head_opus(), 255);
+        file.extend(paged(0, 3, &mut seq, &opus_tags(), 255));
+        let mut whole = Vec::new();
+        for i in 0..8usize {
+            let p: Vec<u8> = (0..(300 + i * 97)).map(|k| (k * 3 + i) as u8).collect();
+            file.extend(paged(0, 3, &mut seq, &p, 255));
+            whole.push(p);
+        }
+        let (_, _, all) = demux_bytes(&file).unwrap();
+        assert_eq!(all, whole);
+        for cut in 1..400 {
+            let (_, _, got) = demux_bytes(&file[..file.len() - cut]).unwrap();
+            assert!(got.len() < whole.len(), "cut {cut}: the cut packet is dropped");
+            assert_eq!(got[..], whole[..got.len()], "cut {cut}: an exact prefix");
         }
     }
 
