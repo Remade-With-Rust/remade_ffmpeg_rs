@@ -37,8 +37,8 @@ use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result, Timecode};
 
 use entry::PcmLayout;
 use rff_format::{
-    Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, ReadSeek, SeekInput,
-    SeekOutput, Stream,
+    Demuxer, EditEntry, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, ReadSeek,
+    SampleIndex, SampleInfo, SeekInput, SeekOutput, Stream,
 };
 
 /// What the `mp4` (ISO) muxer carries. H.264 and AAC lead: callers that pick
@@ -281,6 +281,19 @@ struct Mp4Demuxer {
     /// order or signedness may differ from rff's little-endian formats.
     pcm: Vec<Option<PcmLayout>>,
     pos: usize,
+    /// Per stream: positions in `samples` of its samples, in decode order
+    /// ([`SampleIndex`]).
+    by_track: Vec<Vec<u32>>,
+    /// Per stream: `(pts, number in the stream)` of its sync samples, by pts.
+    sync: Vec<Vec<(i64, u32)>>,
+    /// Per stream: the `elst` entries.
+    edits: Vec<Vec<EditEntry>>,
+    movie_timescale: u32,
+    /// Streams [`Demuxer::set_discard`] dropped: `read_packet` passes over
+    /// their samples without fetching them.
+    discard: Vec<bool>,
+    /// [`Demuxer::set_raw_samples`]: hand samples out as stored.
+    raw: bool,
 }
 
 impl Mp4Demuxer {
@@ -301,7 +314,87 @@ impl Mp4Demuxer {
             avc: Vec::new(),
             pcm: Vec::new(),
             pos: 0,
+            by_track: Vec::new(),
+            sync: Vec::new(),
+            edits: Vec::new(),
+            movie_timescale: 0,
+            discard: Vec::new(),
+            raw: false,
         }
+    }
+
+    /// Read one indexed sample's bytes and shape them as a packet (Annex-B
+    /// for H.264 / HEVC and little-endian PCM, unless `raw`).
+    fn fetch(&mut self, loc: &SampleLoc) -> Result<Packet> {
+        let out_of_range = || Error::invalid("mp4 demux: sample out of range");
+        let raw: Cow<[u8]> = match &mut self.src {
+            Source::Buffered(buf) => Cow::Borrowed(
+                buf.get(loc.offset..loc.offset.checked_add(loc.size).ok_or_else(out_of_range)?)
+                    .ok_or_else(out_of_range)?,
+            ),
+            Source::Random { reader, cur } => {
+                let off = loc.offset as u64;
+                if *cur != off {
+                    // A short hop (past a discarded stream's samples, or an
+                    // edit-list replay) stays inside the buffer; a plain seek
+                    // would throw it away and re-read what it already holds.
+                    match (i64::try_from(off), i64::try_from(*cur)) {
+                        (Ok(to), Ok(from)) => reader.seek_relative(to - from)?,
+                        _ => {
+                            reader.seek(SeekFrom::Start(off))?;
+                        }
+                    }
+                }
+                // Read what is there, never a declared size up front: a
+                // corrupt `stsz` must not become a giant allocation.
+                let mut data = Vec::new();
+                let got = reader.take(loc.size as u64).read_to_end(&mut data);
+                *cur = match got {
+                    Ok(n) => off + n as u64,
+                    Err(_) => u64::MAX,
+                };
+                match got {
+                    Ok(n) if n == loc.size => {}
+                    Ok(_) => return Err(out_of_range()),
+                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(out_of_range()),
+                    Err(e) => return Err(e.into()),
+                }
+                Cow::Owned(data)
+            }
+            _ => return Err(Error::invalid("mp4 demux: header not read")),
+        };
+
+        // H.264 / HEVC: convert AVCC length-prefixed NALs to Annex-B,
+        // prepending the parameter sets on keyframes so the decoder is
+        // self-contained. Raw mode keeps the stored form (and the config
+        // record is the stream's extradata).
+        let data = match &self.avc[loc.stream_index] {
+            Some(cfg) if !self.raw => {
+                let mut out = Vec::with_capacity(cfg.headers_annexb.len() + raw.len() + 16);
+                if loc.keyframe {
+                    out.extend_from_slice(&cfg.headers_annexb);
+                }
+                avcc_to_annexb(&raw, cfg.nal_len, &mut out);
+                out
+            }
+            // A sample read from a seekable file is moved, not copied.
+            _ => {
+                let mut data = raw.into_owned();
+                if !self.raw {
+                    if let Some(Some(pcm)) = self.pcm.get(loc.stream_index) {
+                        pcm.convert(&mut data);
+                    }
+                }
+                data
+            }
+        };
+
+        let mut packet = Packet::from_data(loc.stream_index, data);
+        packet.dts = Some(loc.dts);
+        packet.pts = Some(loc.pts);
+        packet.duration = loc.duration;
+        packet.flags.keyframe = loc.keyframe;
+        Ok(packet)
     }
 
     /// Build streams + the file-ordered sample table from `moov` (and the
@@ -350,6 +443,7 @@ impl Mp4Demuxer {
                     tracks.push(t.samples);
                     self.avc.push(t.avc);
                     self.pcm.push(t.pcm);
+                    self.edits.push(t.edits);
                     tmcd_refs.push(t.tmcd_refs);
                 }
                 Some(Parsed::Timecode {
@@ -396,6 +490,21 @@ impl Mp4Demuxer {
         // Yield samples in file order (natural interleave), each track's in its own
         // order: an edit list can replay samples, so a track's index isn't always in
         // offset order.
+        self.movie_timescale = movie_timescale;
+        self.by_track = tracks.iter().map(|t| Vec::with_capacity(t.len())).collect();
+        self.sync = tracks
+            .iter()
+            .map(|t| {
+                let mut s: Vec<(i64, u32)> = t
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.keyframe)
+                    .map(|(i, l)| (l.pts, i as u32))
+                    .collect();
+                s.sort_unstable();
+                s
+            })
+            .collect();
         let mut next = vec![0usize; tracks.len()];
         while let Some(t) = (0..tracks.len())
             .filter(|&t| next[t] < tracks[t].len())
@@ -404,6 +513,7 @@ impl Mp4Demuxer {
             let i = next[t];
             next[t] += 1;
             let loc = &tracks[t][i];
+            self.by_track[t].push(self.samples.len() as u32);
             self.samples.push(SampleLoc { ..*loc });
         }
         Ok((streams, pending))
@@ -578,89 +688,83 @@ impl Demuxer for Mp4Demuxer {
     }
 
     fn read_packet(&mut self) -> Result<Packet> {
-        let loc = match self.samples.get(self.pos) {
-            Some(loc) => loc,
-            None => return Err(Error::Eof),
-        };
-        self.pos += 1;
-        let out_of_range = || Error::invalid("mp4 demux: sample out of range");
-        let raw: Cow<[u8]> = match &mut self.src {
-            Source::Buffered(buf) => Cow::Borrowed(
-                buf.get(loc.offset..loc.offset.checked_add(loc.size).ok_or_else(out_of_range)?)
-                    .ok_or_else(out_of_range)?,
-            ),
-            Source::Random { reader, cur } => {
-                let off = loc.offset as u64;
-                if *cur != off {
-                    // A short hop (past a discarded stream's samples, or an
-                    // edit-list replay) stays inside the buffer; a plain seek
-                    // would throw it away and re-read what it already holds.
-                    match (i64::try_from(off), i64::try_from(*cur)) {
-                        (Ok(to), Ok(from)) => reader.seek_relative(to - from)?,
-                        _ => {
-                            reader.seek(SeekFrom::Start(off))?;
-                        }
-                    }
-                }
-                // Read what is there, never a declared size up front: a
-                // corrupt `stsz` must not become a giant allocation.
-                let mut data = Vec::new();
-                let got = reader.take(loc.size as u64).read_to_end(&mut data);
-                *cur = match got {
-                    Ok(n) => off + n as u64,
-                    Err(_) => u64::MAX,
-                };
-                match got {
-                    Ok(n) if n == loc.size => {}
-                    Ok(_) => return Err(out_of_range()),
-                    Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(out_of_range()),
-                    Err(e) => return Err(e.into()),
-                }
-                Cow::Owned(data)
+        loop {
+            let Some(loc) = self.samples.get(self.pos) else {
+                return Err(Error::Eof);
+            };
+            self.pos += 1;
+            if self.discard.get(loc.stream_index).copied().unwrap_or(false) {
+                continue;
             }
-            _ => return Err(Error::invalid("mp4 demux: header not read")),
-        };
-
-        // H.264: convert AVCC length-prefixed NALs to Annex-B, prepending the
-        // SPS/PPS on keyframes so the decoder is self-contained.
-        let data = match &self.avc[loc.stream_index] {
-            Some(cfg) => {
-                let mut out = Vec::with_capacity(cfg.headers_annexb.len() + raw.len() + 16);
-                if loc.keyframe {
-                    out.extend_from_slice(&cfg.headers_annexb);
-                }
-                avcc_to_annexb(&raw, cfg.nal_len, &mut out);
-                out
-            }
-            // A sample read from a seekable file is moved, not copied.
-            None => {
-                let mut data = raw.into_owned();
-                if let Some(Some(pcm)) = self.pcm.get(loc.stream_index) {
-                    pcm.convert(&mut data);
-                }
-                data
-            }
-        };
-
-        let mut packet = Packet::from_data(loc.stream_index, data);
-        packet.dts = Some(loc.dts);
-        packet.pts = Some(loc.pts);
-        packet.duration = loc.duration;
-        packet.flags.keyframe = loc.keyframe;
-        Ok(packet)
+            let loc = SampleLoc { ..*loc };
+            return self.fetch(&loc);
+        }
     }
 
-    /// Drop the discarded streams' samples still to be read, so they are
-    /// never fetched from the file or converted.
+    /// Drop the discarded streams' samples still to be read: `read_packet`
+    /// passes over them without fetching or converting them. (They stay in
+    /// the index, which [`SampleIndex`] reads by position.)
     fn set_discard(&mut self, discard: &[bool]) {
-        let pos = self.pos;
-        let mut i = 0;
-        self.samples.retain(|s| {
-            i += 1;
-            i <= pos || !discard.get(s.stream_index).copied().unwrap_or(false)
-        });
+        self.discard = discard.to_vec();
+    }
+
+    fn sample_index(&mut self) -> Option<&mut dyn SampleIndex> {
+        match self.src {
+            Source::Buffered(_) | Source::Random { .. } => Some(self),
+            _ => None,
+        }
+    }
+
+    fn set_raw_samples(&mut self, raw: bool) -> bool {
+        self.raw = raw;
+        true
     }
 }
+
+impl SampleIndex for Mp4Demuxer {
+    fn sample_count(&self, stream: usize) -> u64 {
+        self.by_track.get(stream).map_or(0, |t| t.len() as u64)
+    }
+
+    fn sample_info(&self, stream: usize, index: u64) -> Option<SampleInfo> {
+        let at = *self.by_track.get(stream)?.get(usize::try_from(index).ok()?)?;
+        let l = &self.samples[at as usize];
+        Some(SampleInfo {
+            offset: l.offset as u64,
+            size: l.size as u32,
+            dts: l.dts,
+            pts: l.pts,
+            duration: l.duration,
+            sync: l.keyframe,
+        })
+    }
+
+    fn read_sample(&mut self, stream: usize, index: u64) -> Result<Packet> {
+        let at = usize::try_from(index)
+            .ok()
+            .and_then(|i| self.by_track.get(stream)?.get(i).copied())
+            .ok_or_else(|| Error::invalid("mp4 demux: no such sample"))?;
+        let loc = SampleLoc { ..self.samples[at as usize] };
+        self.fetch(&loc)
+    }
+
+    fn sync_at_or_before(&self, stream: usize, pts: i64) -> Option<u64> {
+        let s = self.sync.get(stream)?;
+        let n = s.partition_point(|&(p, _)| p <= pts);
+        // The latest-shown sync sample at or before `pts`; among equal pts the
+        // one decoded last (sorted by (pts, number)).
+        n.checked_sub(1).map(|i| u64::from(s[i].1))
+    }
+
+    fn edit_list(&self, stream: usize) -> &[EditEntry] {
+        self.edits.get(stream).map_or(&[], Vec::as_slice)
+    }
+
+    fn movie_timescale(&self) -> Option<u32> {
+        (self.movie_timescale > 0).then_some(self.movie_timescale)
+    }
+}
+
 
 /// The number of `stts` entries a `trak` declares (0 without one).
 fn stts_entries(trak: &[u8]) -> u32 {
@@ -698,6 +802,8 @@ struct MediaTrack {
     /// Decode time where the sample table ends: a fragment without `tfdt`
     /// continues from here.
     end: i64,
+    /// The `elst` entries, for [`SampleIndex::edit_list`].
+    edits: Vec<EditEntry>,
 }
 
 /// Build a [`Stream`] + sample list + optional H.264 config from one `trak`.
@@ -834,23 +940,33 @@ fn parse_track(trak: &[u8], index: usize, timing: (u32, bool), qt: bool) -> Opti
     // H.264 / HEVC: pull the config record (a child of the visual sample
     // entry, which begins 86 bytes in) — `avcC` or `hvcC`. Both yield the NAL
     // length size and the Annex-B parameter sets.
+    // The record itself is the stream's extradata, as FFmpeg gives it: a
+    // decoder can be set up before any sample is read, and a remux into a
+    // container that wants out-of-band config has it (#114).
+    let record = |tag: &[u8; 4]| -> Option<Vec<u8>> {
+        child_boxes(stsd.get(8 + 86..)?)
+            .iter()
+            .find(|(t, _)| t == tag)
+            .map(|(_, p)| p.to_vec())
+    };
     let avc = match codec_id {
-        CodecId::H264 => child_boxes(stsd.get(8 + 86..)?)
-            .iter()
-            .find(|(t, _)| t == b"avcC")
-            .and_then(|(_, p)| parse_avcc(p)),
-        CodecId::Hevc => child_boxes(stsd.get(8 + 86..)?)
-            .iter()
-            .find(|(t, _)| t == b"hvcC")
-            .and_then(|(_, p)| rff_format::hvc::parse_hvcc(p)),
+        CodecId::H264 => record(b"avcC").and_then(|r| {
+            let cfg = parse_avcc(&r);
+            stream.extradata = r;
+            cfg
+        }),
+        CodecId::Hevc => record(b"hvcC").and_then(|r| {
+            let cfg = rff_format::hvc::parse_hvcc(&r);
+            stream.extradata = r;
+            cfg
+        }),
         _ => None,
     };
 
     let (movie_timescale, advanced_editlist) = timing;
-    let edits = find(&trak_children, b"edts")
-        .and_then(|edts| find(&child_boxes(edts), b"elst"))
-        .map(parse_elst)
-        .unwrap_or_default();
+    let elst = find(&trak_children, b"edts").and_then(|edts| find(&child_boxes(edts), b"elst"));
+    let edits = elst.map(parse_elst).unwrap_or_default();
+    let edit_entries = elst.map(elst_entries).unwrap_or_default();
     let timing = TrackTiming {
         audio: stream.media_type == MediaType::Audio,
         vorbis: codec_id == CodecId::Vorbis,
@@ -876,7 +992,31 @@ fn parse_track(trak: &[u8], index: usize, timing: (u32, bool), qt: bool) -> Opti
         tmcd_refs,
         frag_offset,
         end,
+        edits: edit_entries,
     })))
+}
+
+/// An `elst` box as [`EditEntry`]s, for [`SampleIndex::edit_list`]: what
+/// [`parse_elst`] reads, plus each entry's rate.
+fn elst_entries(elst: &[u8]) -> Vec<EditEntry> {
+    let v1 = elst.first() == Some(&1);
+    let stride = if v1 { 20 } else { 12 };
+    let count = (be32(elst, 4) as usize).min(elst.len().saturating_sub(8) / stride);
+    (0..count)
+        .map(|k| {
+            let o = 8 + k * stride;
+            let (segment_duration, media_time, rate_at) = if v1 {
+                (be64(elst, o) as i64, be64(elst, o + 8) as i64, o + 16)
+            } else {
+                (i64::from(be32(elst, o)), i64::from(be32(elst, o + 4) as i32), o + 8)
+            };
+            EditEntry {
+                segment_duration,
+                media_time,
+                media_rate: be32(elst, rate_at) as i32,
+            }
+        })
+        .collect()
 }
 
 /// The MPEG-4 `objectTypeIndication` of an `esds` (0x40 AAC, 0x69 / 0x6B

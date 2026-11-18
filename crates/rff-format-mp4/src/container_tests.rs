@@ -594,3 +594,224 @@ fn malformed_new_boxes_do_not_panic() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Random access (#114): SampleIndex, raw samples, extradata, edit lists.
+// ---------------------------------------------------------------------------
+
+/// Every packet of `file` in order, plus a fresh demuxer (header read), for
+/// the buffered and the seekable source.
+fn open_both(file: &[u8]) -> Vec<(Mp4Demuxer, Vec<Packet>)> {
+    let mk = |seekable: bool| {
+        let mut d = if seekable {
+            Mp4Demuxer::new_seekable(Box::new(Cursor::new(file.to_vec())))
+        } else {
+            Mp4Demuxer::new(Box::new(Cursor::new(file.to_vec())))
+        };
+        d.read_header().unwrap();
+        d
+    };
+    [false, true]
+        .into_iter()
+        .map(|seekable| {
+            let mut d = mk(seekable);
+            let mut packets = Vec::new();
+            while let Ok(p) = d.read_packet() {
+                packets.push(p);
+            }
+            (mk(seekable), packets)
+        })
+        .collect()
+}
+
+/// The stored form of a packet's first bytes: PCM `in24` is big-endian on
+/// disk, ProRes is stored as is.
+fn stored_head(data: &[u8], stream: usize) -> Vec<u8> {
+    let mut d = data[..6.min(data.len())].to_vec();
+    if stream == 1 {
+        d.chunks_exact_mut(3).for_each(<[u8]>::reverse);
+    }
+    d
+}
+
+#[test]
+fn the_sample_index_agrees_with_read_packet() {
+    let streams = [prores_stream(), pcm_stream(1, SampleFormat::S24, 2, Some(*b"in24"))];
+    let packets = interleave(video_packets(|i| prores_frame(i, 2), 8), pcm_packets(1, 1500, 6, 8));
+    for file in mux_both(Flavor::Mov, &streams, &packets) {
+        for (mut d, got) in open_both(&file) {
+            let idx = d.sample_index().expect("an MP4 has an index");
+            for s in 0..2 {
+                let want: Vec<&Packet> = got.iter().filter(|p| p.stream_index == s).collect();
+                assert_eq!(idx.sample_count(s), want.len() as u64);
+                for (i, p) in want.iter().enumerate() {
+                    let info = idx.sample_info(s, i as u64).unwrap();
+                    assert_eq!(
+                        (Some(info.dts), Some(info.pts), info.duration, info.sync),
+                        (p.dts, p.pts, p.duration, p.flags.keyframe)
+                    );
+                    let again = idx.read_sample(s, i as u64).unwrap();
+                    assert_eq!(again.data, p.data, "stream {s} sample {i}");
+                    let head = stored_head(&again.data, s);
+                    assert_eq!(&file[info.offset as usize..][..head.len()], &head[..]);
+                }
+                assert!(idx.sample_info(s, want.len() as u64).is_none());
+            }
+            assert_eq!(idx.sample_count(9), 0);
+        }
+    }
+}
+
+#[test]
+fn reading_through_the_index_does_not_move_read_packet() {
+    let streams = [prores_stream()];
+    let packets = video_packets(|i| prores_frame(i, 2), 6);
+    let [file, _] = mux_both(Flavor::Mov, &streams, &packets);
+    let mut d = Mp4Demuxer::new_seekable(Box::new(Cursor::new(file)));
+    d.read_header().unwrap();
+    assert_eq!(d.read_packet().unwrap().data, packets[0].data);
+    assert_eq!(d.sample_index().unwrap().read_sample(0, 5).unwrap().data, packets[5].data);
+    assert_eq!(d.read_packet().unwrap().data, packets[1].data, "the read position is kept");
+}
+
+#[test]
+fn sync_at_or_before_finds_the_keyframe_to_start_from() {
+    let mut v = Stream::new(0, CodecId::Avif);
+    v.width = 8;
+    v.height = 8;
+    v.time_base = Rational::new(1, 25);
+    let keys = [true, false, false, true, false, false, false, true, false];
+    let packets: Vec<Packet> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, &k)| {
+            let mut data = if i == 0 { vec![0x0A, 0x03, 0, 0, 0] } else { Vec::new() };
+            data.push(i as u8);
+            let mut p = Packet::from_data(0, data);
+            p.pts = Some(i as i64);
+            p.dts = p.pts;
+            p.flags.keyframe = k;
+            p
+        })
+        .collect();
+    let [file, _] = mux_both(Flavor::Mp4, &[v], &packets);
+    let mut d = Mp4Demuxer::new_seekable(Box::new(Cursor::new(file)));
+    d.read_header().unwrap();
+    let idx = d.sample_index().unwrap();
+    let at = |pts| idx.sync_at_or_before(0, pts);
+    assert_eq!(
+        [at(0), at(2), at(3), at(6), at(7), at(100)],
+        [Some(0), Some(0), Some(3), Some(3), Some(7), Some(7)]
+    );
+    assert_eq!(at(-1), None, "nothing is shown that early");
+}
+
+/// A minimal H.264 keyframe and P frame, Annex-B, with SPS/PPS in band.
+fn h264_frames() -> Vec<Packet> {
+    let sps: &[u8] = &[0x67, 0x42, 0x00, 0x1E, 0xAB];
+    let pps: &[u8] = &[0x68, 0xCE, 0x38, 0x80];
+    let slice: &[u8] = &[0x65, 0x88, 0x84, 0x21];
+    let mut key = Vec::new();
+    for nal in [sps, pps, slice] {
+        key.extend_from_slice(&[0, 0, 0, 1]);
+        key.extend_from_slice(nal);
+    }
+    let p = vec![0, 0, 0, 1, 0x41, 0x9A, 0x00, 0x10];
+    [key, p]
+        .into_iter()
+        .enumerate()
+        .map(|(i, data)| {
+            let mut pk = Packet::from_data(0, data);
+            pk.pts = Some(i as i64);
+            pk.dts = pk.pts;
+            pk.flags.keyframe = i == 0;
+            pk
+        })
+        .collect()
+}
+
+#[test]
+fn h264_extradata_is_the_avcc_record_and_raw_samples_stay_length_prefixed() {
+    let mut v = Stream::new(0, CodecId::H264);
+    v.width = 16;
+    v.height = 16;
+    v.time_base = Rational::new(1, 25);
+    let [file, _] = mux_both(Flavor::Mp4, &[v], &h264_frames());
+    let mut d = Mp4Demuxer::new(Box::new(Cursor::new(file.clone())));
+    let streams = d.read_header().unwrap();
+    let rec = &streams[0].extradata;
+    assert_eq!(rec[0], 1, "an AVCDecoderConfigurationRecord");
+    assert!(rec.windows(5).any(|w| w == [0x67, 0x42, 0x00, 0x1E, 0xAB]), "carries the SPS");
+    // Default: Annex-B with the parameter sets on the keyframe.
+    let key = d.read_packet().unwrap();
+    assert_eq!(&key.data[..5], &[0, 0, 0, 1, 0x67]);
+    // Raw: the stored 4-byte length prefixes, slice only.
+    let mut d = Mp4Demuxer::new(Box::new(Cursor::new(file)));
+    d.read_header().unwrap();
+    assert!(d.set_raw_samples(true));
+    assert_eq!(d.read_packet().unwrap().data, [0, 0, 0, 4, 0x65, 0x88, 0x84, 0x21]);
+    assert_eq!(d.read_packet().unwrap().data, [0, 0, 0, 4, 0x41, 0x9A, 0x00, 0x10]);
+    assert_eq!(
+        d.sample_index().unwrap().read_sample(0, 0).unwrap().data,
+        [0, 0, 0, 4, 0x65, 0x88, 0x84, 0x21]
+    );
+}
+
+#[test]
+fn raw_pcm_keeps_the_stored_byte_order() {
+    let streams = [pcm_stream(0, SampleFormat::S16, 2, Some(*b"twos"))];
+    let packets = pcm_packets(0, 100, 4, 2);
+    let [file, _] = mux_both(Flavor::Mov, &streams, &packets);
+    let mut d = Mp4Demuxer::new(Box::new(Cursor::new(file)));
+    d.read_header().unwrap();
+    d.set_raw_samples(true);
+    let got = d.read_packet().unwrap().data;
+    let mut want = packets[0].data.clone();
+    want.chunks_exact_mut(2).for_each(<[u8]>::reverse);
+    assert_eq!(got, want, "twos stays big-endian");
+}
+
+#[test]
+fn the_edit_list_is_exposed_with_the_movie_timescale() {
+    let mut v = prores_stream();
+    v.timecode = None;
+    v.time_base = Rational::new(1, 1000);
+    let mut packets = Vec::new();
+    for i in 0..4i64 {
+        let mut p = Packet::from_data(0, prores_frame(i as u8, 2));
+        p.pts = Some(500 + 40 * i);
+        p.dts = p.pts;
+        p.flags.keyframe = true;
+        packets.push(p);
+    }
+    let a = pcm_stream(1, SampleFormat::S16, 1, None);
+    packets.extend(pcm_packets(1, 4800, 2, 3));
+    let [file, _] = mux_both(Flavor::Mov, &[v, a], &packets);
+    let mut d = Mp4Demuxer::new(Box::new(Cursor::new(file)));
+    d.read_header().unwrap();
+    let idx = d.sample_index().unwrap();
+    assert_eq!(idx.movie_timescale(), Some(1000));
+    let e = idx.edit_list(0);
+    assert_eq!(e.len(), 2, "{e:?}");
+    assert_eq!((e[0].segment_duration, e[0].media_time), (500, -1), "the empty edit");
+    assert_eq!((e[1].media_time, e[1].media_rate), (0, 0x10000));
+    assert!(idx.edit_list(1).is_empty());
+}
+
+#[test]
+fn discarded_streams_are_skipped_but_stay_in_the_index() {
+    let streams = [prores_stream(), pcm_stream(1, SampleFormat::S16, 2, None)];
+    let packets = interleave(video_packets(|i| prores_frame(i, 2), 4), pcm_packets(1, 1000, 4, 4));
+    let [file, _] = mux_both(Flavor::Mov, &streams, &packets);
+    let mut d = Mp4Demuxer::new_seekable(Box::new(Cursor::new(file)));
+    d.read_header().unwrap();
+    d.set_discard(&[false, true]);
+    let mut got = Vec::new();
+    while let Ok(p) = d.read_packet() {
+        got.push(p.stream_index);
+    }
+    assert_eq!(got, [0, 0, 0, 0]);
+    let idx = d.sample_index().unwrap();
+    assert_eq!(idx.sample_count(1), 4);
+    assert_eq!(idx.read_sample(1, 2).unwrap().data, packets_of(&packets, 1)[2].data);
+}
