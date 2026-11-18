@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_vp9-v0.2.1...rusty_vp9-v0.3.0) - 2026-11-18
+
+### Added
+
+- *(vp9)* [**breaking**] keyframe interval; VP9_* environment switches behind a feature ([#119](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/119))
+
+### Other
+
+- rustfmt the Ogg and VP9 changes
+
 ## [0.2.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_vp9-v0.2.0...rusty_vp9-v0.2.1) - 2026-11-14
 
 ### Other

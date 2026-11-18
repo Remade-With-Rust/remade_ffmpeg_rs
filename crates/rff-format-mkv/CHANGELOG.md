@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mkv-v0.5.0...rff-format-mkv-v0.6.0) - 2026-11-18
+
+### Other
+
+- *(format)* demuxers skip discarded streams at the source (Demuxer::set_discard)
+
 ## [0.5.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mkv-v0.4.8...rff-format-mkv-v0.5.0) - 2026-11-14
 
 ### Added

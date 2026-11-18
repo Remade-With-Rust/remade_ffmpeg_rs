@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.3.16...rff-cli-v0.4.0) - 2026-11-18
+
+### Fixed
+
+- *(cli)* [**breaking**] -vn/-an/-sn/-dn drop streams; unknown -c names are an error (#116, #117)
+
 ## [0.3.16](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.3.15...rff-cli-v0.3.16) - 2026-11-14
 
 ### Other
