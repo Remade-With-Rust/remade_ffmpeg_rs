@@ -2,8 +2,11 @@
 //! bitstream filter plus a minimal SPS reader).
 //!
 //! rff's packet contract for H.264 is **Annex-B**: every NAL prefixed with a
-//! `00 00 00 01` start code, SPS/PPS repeated before each keyframe, and
-//! `Stream::extradata` left empty. Containers that store AVCC (length-prefixed
+//! `00 00 00 01` start code and SPS/PPS repeated before each keyframe. A
+//! demuxer that reads an `avcC` record hands it out as `Stream::extradata`,
+//! as FFmpeg does, so a decoder or a muxer can be set up before the first
+//! packet; rff's own decoders take extradata only when it is Annex-B and
+//! otherwise rely on the in-band sets. Containers that store AVCC (length-prefixed
 //! NALs + an `avcC` config record) — MP4 and Matroska — use [`parse_avcc`] +
 //! [`avcc_to_annexb`] to normalise, so consumers see one format regardless of
 //! the container. [`sps_dimensions`] recovers coded width/height for containers

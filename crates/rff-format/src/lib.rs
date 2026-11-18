@@ -182,8 +182,11 @@ pub trait Demuxer: Send {
     /// Hand out samples as the container stores them instead of in the form
     /// rff's decoders take: H.264 / HEVC length-prefixed (AVCC / HVCC)
     /// rather than Annex-B with the parameter sets put in front of each
-    /// keyframe, PCM in the stored byte order, Matroska frames without the
-    /// header stripping undone. Call it after
+    /// keyframe, PCM in the stored byte order, ASS events in Matroska as
+    /// stored. Storage transforms of the container itself (Matroska
+    /// ContentEncodings and header stripping, the ProRes frame header MKV
+    /// drops) are still undone, so a sample is always a whole codec frame.
+    /// Call it after
     /// [`read_header`](Demuxer::read_header); it applies to
     /// [`read_packet`](Demuxer::read_packet) and to [`SampleIndex::read_sample`].
     /// Returns whether the demuxer honours it (the default does not: its
