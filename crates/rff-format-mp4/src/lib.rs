@@ -45,7 +45,9 @@ use rff_format::{
 /// a container's first codec of a media type get the widely playable pair.
 const MP4_CODECS: &[CodecId] = &[
     CodecId::H264,
+    CodecId::Hevc,
     CodecId::Avif,
+    CodecId::Jpeg,
     CodecId::Vp9,
     CodecId::Apv,
     CodecId::Aac,
@@ -54,14 +56,17 @@ const MP4_CODECS: &[CodecId] = &[
     CodecId::Alac,
     CodecId::Ac3,
     CodecId::Eac3,
+    CodecId::Mp3,
 ];
 
 /// What the `mov` (QuickTime) muxer carries: the same, plus the professional
 /// intermediates that only QuickTime defines entries for.
 const MOV_CODECS: &[CodecId] = &[
     CodecId::H264,
+    CodecId::Hevc,
     CodecId::ProRes,
     CodecId::DnxHd,
+    CodecId::Jpeg,
     CodecId::Avif,
     CodecId::Vp9,
     CodecId::Apv,
@@ -72,6 +77,7 @@ const MOV_CODECS: &[CodecId] = &[
     CodecId::Alac,
     CodecId::Ac3,
     CodecId::Eac3,
+    CodecId::Mp3,
 ];
 
 /// Which member of the family a muxer writes. The demuxer reads both.
@@ -727,7 +733,10 @@ impl SampleIndex for Mp4Demuxer {
     }
 
     fn sample_info(&self, stream: usize, index: u64) -> Option<SampleInfo> {
-        let at = *self.by_track.get(stream)?.get(usize::try_from(index).ok()?)?;
+        let at = *self
+            .by_track
+            .get(stream)?
+            .get(usize::try_from(index).ok()?)?;
         let l = &self.samples[at as usize];
         Some(SampleInfo {
             offset: l.offset as u64,
@@ -744,7 +753,9 @@ impl SampleIndex for Mp4Demuxer {
             .ok()
             .and_then(|i| self.by_track.get(stream)?.get(i).copied())
             .ok_or_else(|| Error::invalid("mp4 demux: no such sample"))?;
-        let loc = SampleLoc { ..self.samples[at as usize] };
+        let loc = SampleLoc {
+            ..self.samples[at as usize]
+        };
         self.fetch(&loc)
     }
 
@@ -764,7 +775,6 @@ impl SampleIndex for Mp4Demuxer {
         (self.movie_timescale > 0).then_some(self.movie_timescale)
     }
 }
-
 
 /// The number of `stts` entries a `trak` declares (0 without one).
 fn stts_entries(trak: &[u8]) -> u32 {
@@ -1008,7 +1018,11 @@ fn elst_entries(elst: &[u8]) -> Vec<EditEntry> {
             let (segment_duration, media_time, rate_at) = if v1 {
                 (be64(elst, o) as i64, be64(elst, o + 8) as i64, o + 16)
             } else {
-                (i64::from(be32(elst, o)), i64::from(be32(elst, o + 4) as i32), o + 8)
+                (
+                    i64::from(be32(elst, o)),
+                    i64::from(be32(elst, o + 4) as i32),
+                    o + 8,
+                )
             };
             EditEntry {
                 segment_duration,
@@ -1895,6 +1909,11 @@ impl TrackOut {
         let mut pcm = None;
         let fourcc = match stream.codec_id {
             CodecId::H264 => *b"avc1",
+            // Parameter sets out of band in `hvcC` (they are lifted out of
+            // the samples), which is what `hvc1` says.
+            CodecId::Hevc => *b"hvc1",
+            CodecId::Jpeg => *b"jpeg",
+            CodecId::Mp3 => *b"mp4a",
             CodecId::Avif => *b"av01",
             CodecId::Vp9 => *b"vp09",
             CodecId::Apv => *b"apv1",
@@ -1957,6 +1976,26 @@ impl TrackOut {
                     if self.config.is_none() {
                         self.config = Some(build_avcc(s, p));
                     }
+                }
+                scratch
+            }
+            CodecId::Hevc => {
+                scratch.clear();
+                let (mut vps, mut sps, mut pps) = (None, None, None);
+                for nal in split_annexb(data) {
+                    match nal.first().map(|b| (b >> 1) & 0x3F) {
+                        Some(32) => vps = Some(nal),
+                        Some(33) => sps = Some(nal),
+                        Some(34) => pps = Some(nal),
+                        _ => {
+                            pu32(scratch, nal.len() as u32);
+                            scratch.extend_from_slice(nal);
+                        }
+                    }
+                }
+                if let (Some(v), Some(s), Some(p), None) = (vps, sps, pps, &self.config) {
+                    self.config =
+                        rff_format::hvc::build_hvcc_record(v, s, p).map(|r| bx(b"hvcC", &r));
                 }
                 scratch
             }
@@ -2065,6 +2104,27 @@ fn require_configs(tracks: &mut [TrackOut]) -> Result<()> {
                         "mp4 mux: the h264 stream carries no SPS/PPS, in-band or \
                          in extradata, so its `avcC` cannot be built — the output \
                          would open but decode nothing",
+                    ));
+                }
+            }
+            CodecId::Hevc => {
+                // An hvcC in extradata (a remux): rebuild it around 4-byte
+                // NAL lengths, which is how the samples are written.
+                track.config =
+                    rff_format::hvc::parse_hvcc(&track.stream.extradata).and_then(|cfg| {
+                        let nals = split_annexb(&cfg.headers_annexb);
+                        let of = |t: u8| {
+                            nals.iter()
+                                .find(|n| n.first().map(|b| (b >> 1) & 0x3F) == Some(t))
+                        };
+                        let r = rff_format::hvc::build_hvcc_record(of(32)?, of(33)?, of(34)?)?;
+                        Some(bx(b"hvcC", &r))
+                    });
+                if track.config.is_none() {
+                    return Err(Error::invalid(
+                        "mp4 mux: the hevc stream carries no VPS/SPS/PPS, in-band or \
+                         in extradata, so its `hvcC` cannot be built — the output would \
+                         open but decode nothing",
                     ));
                 }
             }
@@ -2738,6 +2798,19 @@ fn build_esds(asc: &[u8]) -> Vec<u8> {
     fbx(b"esds", 0, 0, &esd)
 }
 
+/// `esds` for MP3 in MP4: objectTypeIndication 0x6B (MPEG-1 audio; it covers
+/// MPEG-2 layer III too in practice, as FFmpeg writes it) and no
+/// DecoderSpecificInfo, since each frame header carries its own parameters.
+fn build_esds_mp3() -> Vec<u8> {
+    let dcd = [0x04u8, 13, 0x6B, 0x15, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0];
+    let mut es = vec![0x00u8, 0x00, 0x00];
+    es.extend_from_slice(&dcd);
+    es.extend_from_slice(&[0x06, 0x01, 0x02]);
+    let mut esd = vec![0x03u8, es.len() as u8];
+    esd.extend_from_slice(&es);
+    fbx(b"esds", 0, 0, &esd)
+}
+
 fn build_mvhd(timescale: u32, duration: u32, next_track_id: u32) -> Vec<u8> {
     let mut b = Vec::new();
     pu32(&mut b, 0); // creation
@@ -3041,6 +3114,8 @@ fn build_stbl(track: &TrackOut, plan: &TimingPlan) -> Vec<u8> {
                     s.extradata.clone()
                 };
                 entry.extend_from_slice(&build_esds(&asc));
+            } else if s.codec_id == CodecId::Mp3 {
+                entry.extend_from_slice(&build_esds_mp3());
             } else if let Some(cfg) = &track.config {
                 entry.extend_from_slice(cfg); // dfLa, alac, dac3, dec3
             }
@@ -3830,7 +3905,7 @@ mod tests {
     #[test]
     fn refuses_an_audio_codec_it_cannot_describe() {
         // PCM is carried, but not without a sample format to describe it.
-        for codec in [CodecId::Mp3, CodecId::Vorbis, CodecId::Pcm] {
+        for codec in [CodecId::Vorbis, CodecId::Pcm] {
             let mut mux = Mp4Muxer::new(Box::new(Vec::new()));
             let err = mux
                 .write_header(&[probe_stream(codec)])

@@ -636,8 +636,14 @@ fn stored_head(data: &[u8], stream: usize) -> Vec<u8> {
 
 #[test]
 fn the_sample_index_agrees_with_read_packet() {
-    let streams = [prores_stream(), pcm_stream(1, SampleFormat::S24, 2, Some(*b"in24"))];
-    let packets = interleave(video_packets(|i| prores_frame(i, 2), 8), pcm_packets(1, 1500, 6, 8));
+    let streams = [
+        prores_stream(),
+        pcm_stream(1, SampleFormat::S24, 2, Some(*b"in24")),
+    ];
+    let packets = interleave(
+        video_packets(|i| prores_frame(i, 2), 8),
+        pcm_packets(1, 1500, 6, 8),
+    );
     for file in mux_both(Flavor::Mov, &streams, &packets) {
         for (mut d, got) in open_both(&file) {
             let idx = d.sample_index().expect("an MP4 has an index");
@@ -670,8 +676,15 @@ fn reading_through_the_index_does_not_move_read_packet() {
     let mut d = Mp4Demuxer::new_seekable(Box::new(Cursor::new(file)));
     d.read_header().unwrap();
     assert_eq!(d.read_packet().unwrap().data, packets[0].data);
-    assert_eq!(d.sample_index().unwrap().read_sample(0, 5).unwrap().data, packets[5].data);
-    assert_eq!(d.read_packet().unwrap().data, packets[1].data, "the read position is kept");
+    assert_eq!(
+        d.sample_index().unwrap().read_sample(0, 5).unwrap().data,
+        packets[5].data
+    );
+    assert_eq!(
+        d.read_packet().unwrap().data,
+        packets[1].data,
+        "the read position is kept"
+    );
 }
 
 #[test]
@@ -685,7 +698,11 @@ fn sync_at_or_before_finds_the_keyframe_to_start_from() {
         .iter()
         .enumerate()
         .map(|(i, &k)| {
-            let mut data = if i == 0 { vec![0x0A, 0x03, 0, 0, 0] } else { Vec::new() };
+            let mut data = if i == 0 {
+                vec![0x0A, 0x03, 0, 0, 0]
+            } else {
+                Vec::new()
+            };
             data.push(i as u8);
             let mut p = Packet::from_data(0, data);
             p.pts = Some(i as i64);
@@ -741,7 +758,10 @@ fn h264_extradata_is_the_avcc_record_and_raw_samples_stay_length_prefixed() {
     let streams = d.read_header().unwrap();
     let rec = &streams[0].extradata;
     assert_eq!(rec[0], 1, "an AVCDecoderConfigurationRecord");
-    assert!(rec.windows(5).any(|w| w == [0x67, 0x42, 0x00, 0x1E, 0xAB]), "carries the SPS");
+    assert!(
+        rec.windows(5).any(|w| w == [0x67, 0x42, 0x00, 0x1E, 0xAB]),
+        "carries the SPS"
+    );
     // Default: Annex-B with the parameter sets on the keyframe.
     let key = d.read_packet().unwrap();
     assert_eq!(&key.data[..5], &[0, 0, 0, 1, 0x67]);
@@ -749,8 +769,14 @@ fn h264_extradata_is_the_avcc_record_and_raw_samples_stay_length_prefixed() {
     let mut d = Mp4Demuxer::new(Box::new(Cursor::new(file)));
     d.read_header().unwrap();
     assert!(d.set_raw_samples(true));
-    assert_eq!(d.read_packet().unwrap().data, [0, 0, 0, 4, 0x65, 0x88, 0x84, 0x21]);
-    assert_eq!(d.read_packet().unwrap().data, [0, 0, 0, 4, 0x41, 0x9A, 0x00, 0x10]);
+    assert_eq!(
+        d.read_packet().unwrap().data,
+        [0, 0, 0, 4, 0x65, 0x88, 0x84, 0x21]
+    );
+    assert_eq!(
+        d.read_packet().unwrap().data,
+        [0, 0, 0, 4, 0x41, 0x9A, 0x00, 0x10]
+    );
     assert_eq!(
         d.sample_index().unwrap().read_sample(0, 0).unwrap().data,
         [0, 0, 0, 4, 0x65, 0x88, 0x84, 0x21]
@@ -793,7 +819,11 @@ fn the_edit_list_is_exposed_with_the_movie_timescale() {
     assert_eq!(idx.movie_timescale(), Some(1000));
     let e = idx.edit_list(0);
     assert_eq!(e.len(), 2, "{e:?}");
-    assert_eq!((e[0].segment_duration, e[0].media_time), (500, -1), "the empty edit");
+    assert_eq!(
+        (e[0].segment_duration, e[0].media_time),
+        (500, -1),
+        "the empty edit"
+    );
     assert_eq!((e[1].media_time, e[1].media_rate), (0, 0x10000));
     assert!(idx.edit_list(1).is_empty());
 }
@@ -801,7 +831,10 @@ fn the_edit_list_is_exposed_with_the_movie_timescale() {
 #[test]
 fn discarded_streams_are_skipped_but_stay_in_the_index() {
     let streams = [prores_stream(), pcm_stream(1, SampleFormat::S16, 2, None)];
-    let packets = interleave(video_packets(|i| prores_frame(i, 2), 4), pcm_packets(1, 1000, 4, 4));
+    let packets = interleave(
+        video_packets(|i| prores_frame(i, 2), 4),
+        pcm_packets(1, 1000, 4, 4),
+    );
     let [file, _] = mux_both(Flavor::Mov, &streams, &packets);
     let mut d = Mp4Demuxer::new_seekable(Box::new(Cursor::new(file)));
     d.read_header().unwrap();
@@ -813,5 +846,139 @@ fn discarded_streams_are_skipped_but_stay_in_the_index() {
     assert_eq!(got, [0, 0, 0, 0]);
     let idx = d.sample_index().unwrap();
     assert_eq!(idx.sample_count(1), 4);
-    assert_eq!(idx.read_sample(1, 2).unwrap().data, packets_of(&packets, 1)[2].data);
+    assert_eq!(
+        idx.read_sample(1, 2).unwrap().data,
+        packets_of(&packets, 1)[2].data
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mux coverage (#114): HEVC, MJPEG, MP3.
+// ---------------------------------------------------------------------------
+
+/// The VPS/SPS/PPS of the JCT-VC `IPRED_A_docomo_2` stream (832x480 Main),
+/// NAL headers included; a slice NAL of type 19 (IDR) and 1 (TRAIL_R).
+const HEVC_VPS: &[u8] = &[
+    0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00,
+    0x03, 0x00, 0x00, 0x03, 0x00, 0x99, 0xf0, 0x24,
+];
+const HEVC_SPS: &[u8] = &[
+    0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00,
+    0x03, 0x00, 0x99, 0xa0, 0x06, 0x82, 0x01, 0xe1, 0xfe, 0x5f, 0x92, 0x46, 0xd9, 0x6c, 0x80,
+];
+const HEVC_PPS: &[u8] = &[0x44, 0x01, 0xc1, 0x90, 0x95, 0x81, 0x12];
+
+fn annexb(nals: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for n in nals {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(n);
+    }
+    out
+}
+
+#[test]
+fn hevc_goes_into_mp4_and_mov_with_an_hvcc() {
+    let idr: &[u8] = &[0x26, 0x01, 0xAF, 0x09, 0x40];
+    let trail: &[u8] = &[0x02, 0x01, 0xD0, 0x11];
+    for flavor in [Flavor::Mp4, Flavor::Mov] {
+        let mut v = Stream::new(0, CodecId::Hevc);
+        v.width = 832;
+        v.height = 480;
+        v.time_base = Rational::new(1, 25);
+        let frames = [
+            annexb(&[HEVC_VPS, HEVC_SPS, HEVC_PPS, idr]),
+            annexb(&[trail]),
+        ];
+        let packets: Vec<Packet> = frames
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let mut p = Packet::from_data(0, f.clone());
+                p.pts = Some(i as i64);
+                p.dts = p.pts;
+                p.flags.keyframe = i == 0;
+                p
+            })
+            .collect();
+        for file in mux_both(flavor, &[v.clone()], &packets) {
+            assert!(file.windows(4).any(|w| w == b"hvc1") && file.windows(4).any(|w| w == b"hvcC"));
+            let (out, got) = demux(&file);
+            assert_eq!(out[0].codec_id, CodecId::Hevc);
+            assert_eq!(out[0].extradata[0], 1, "the hvcC record is the extradata");
+            // Default demux: Annex-B with the parameter sets on the keyframe.
+            assert_eq!(got[0].data, frames[0], "{flavor:?}");
+            assert_eq!(got[1].data, frames[1]);
+        }
+        // A remux whose parameter sets are only in extradata (an hvcC).
+        let [file, _] = mux_both(flavor, &[v.clone()], &packets);
+        let (out, _) = demux(&file);
+        let mut copy = v.clone();
+        copy.extradata = out[0].extradata.clone();
+        let bare: Vec<Packet> = packets
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Packet {
+                data: if i == 0 {
+                    annexb(&[idr])
+                } else {
+                    p.data.clone()
+                },
+                ..p.clone()
+            })
+            .collect();
+        let [again, _] = mux_both(flavor, &[copy], &bare);
+        let (_, got) = demux(&again);
+        assert_eq!(got[0].data, frames[0], "hvcC rebuilt from extradata");
+    }
+}
+
+#[test]
+fn mjpeg_goes_into_mov_and_mp4_as_jpeg() {
+    let mut v = Stream::new(0, CodecId::Jpeg);
+    v.width = 64;
+    v.height = 48;
+    v.time_base = Rational::new(1, 30);
+    let packets = video_packets(|i| vec![0xFF, 0xD8, 0xFF, 0xE0, i, 0xFF, 0xD9], 3);
+    for flavor in [Flavor::Mov, Flavor::Mp4] {
+        for file in mux_both(flavor, &[v.clone()], &packets) {
+            let (out, got) = demux(&file);
+            assert_eq!(
+                (out[0].codec_id, out[0].codec_tag),
+                (CodecId::Jpeg, Some(*b"jpeg"))
+            );
+            assert_eq!(
+                got.iter().map(|p| &p.data).collect::<Vec<_>>(),
+                packets.iter().map(|p| &p.data).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
+fn mp3_goes_into_mp4_as_mp4a_object_type_0x6b() {
+    let mut a = Stream::new(0, CodecId::Mp3);
+    a.sample_rate = 44_100;
+    a.channels = 2;
+    a.time_base = Rational::new(1, 44_100);
+    let packets: Vec<Packet> = (0..4)
+        .map(|i| {
+            let mut p = Packet::from_data(0, vec![0xFF, 0xFB, 0x90, 0x64, i]);
+            p.pts = Some(i64::from(i) * 1152);
+            p.dts = p.pts;
+            p.flags.keyframe = true;
+            p
+        })
+        .collect();
+    for file in mux_both(Flavor::Mp4, &[a], &packets) {
+        let (out, got) = demux(&file);
+        assert_eq!(
+            out[0].codec_id,
+            CodecId::Mp3,
+            "mp4a + esds 0x6B reads back as MP3"
+        );
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[3].data, packets[3].data);
+        assert_eq!(got[1].pts, Some(1152));
+    }
 }
