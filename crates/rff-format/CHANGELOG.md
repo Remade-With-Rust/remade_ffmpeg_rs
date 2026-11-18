@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-v0.6.0...rff-format-v0.6.1) - 2026-11-18
+
+### Added
+
+- *(mp4)* faststart and caller edit lists ([#114](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/114))
+- *(format)* Demuxer::sample_index and set_raw_samples (random access, #114)
+
+### Other
+
+- *(format)* raw samples and avcC/hvcC extradata as the demuxers now give them ([#114](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/114))
+
 ## [0.6.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-v0.5.0...rff-format-v0.6.0) - 2026-11-18
 
 ### Other

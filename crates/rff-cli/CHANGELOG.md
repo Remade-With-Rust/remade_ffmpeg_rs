@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.4.0...rff-cli-v0.4.1) - 2026-11-18
+
+### Added
+
+- *(mp4)* faststart and caller edit lists ([#114](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/114))
+
 ## [0.4.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.3.16...rff-cli-v0.4.0) - 2026-11-18
 
 ### Fixed
