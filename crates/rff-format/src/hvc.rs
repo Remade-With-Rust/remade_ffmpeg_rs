@@ -3,8 +3,8 @@
 //! builder, plus a minimal SPS reader.
 //!
 //! rff's packet contract for HEVC is the same as for H.264: **Annex-B**, with
-//! parameter sets repeated before each keyframe and `Stream::extradata` left
-//! empty. `hvc1`/`hev1` (MP4) and `V_MPEGH/ISO/HEVC` (Matroska) store
+//! parameter sets repeated before each keyframe, and the `hvcC` record (when
+//! the container has one) as `Stream::extradata`. `hvc1`/`hev1` (MP4) and `V_MPEGH/ISO/HEVC` (Matroska) store
 //! length-prefixed NALs plus an `hvcC` record, so demuxers normalise with
 //! [`parse_hvcc`] and [`crate::avc::avcc_to_annexb`] (the length-prefix
 //! conversion is codec-independent).

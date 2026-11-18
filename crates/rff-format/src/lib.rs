@@ -167,6 +167,97 @@ pub trait Demuxer: Send {
     /// a hint: a demuxer that ignores it (the default) still returns them and
     /// the caller drops them, so either way the kept packets are identical.
     fn set_discard(&mut self, _discard: &[bool]) {}
+
+    /// Random access to the container's index, for an editor that jumps to a
+    /// frame instead of reading the file in order: per-stream sample tables,
+    /// reading a sample by number, and the sync sample at or before a time.
+    /// Available after [`read_header`](Demuxer::read_header) from demuxers
+    /// whose container has an index (MP4 sample tables, Matroska clusters and
+    /// Cues); `None` from the rest (the default). Reading through the index
+    /// does not move [`read_packet`](Demuxer::read_packet)'s position.
+    fn sample_index(&mut self) -> Option<&mut dyn SampleIndex> {
+        None
+    }
+
+    /// Hand out samples as the container stores them instead of in the form
+    /// rff's decoders take: H.264 / HEVC length-prefixed (AVCC / HVCC)
+    /// rather than Annex-B with the parameter sets put in front of each
+    /// keyframe, PCM in the stored byte order, ASS events in Matroska as
+    /// stored. Storage transforms of the container itself (Matroska
+    /// ContentEncodings and header stripping, the ProRes frame header MKV
+    /// drops) are still undone, so a sample is always a whole codec frame.
+    /// Call it after
+    /// [`read_header`](Demuxer::read_header); it applies to
+    /// [`read_packet`](Demuxer::read_packet) and to [`SampleIndex::read_sample`].
+    /// Returns whether the demuxer honours it (the default does not: its
+    /// samples are already stored as they are handed out).
+    fn set_raw_samples(&mut self, _raw: bool) -> bool {
+        false
+    }
+}
+
+/// One sample (packet) of a stream as the container's index records it.
+///
+/// The timestamps are the ones [`Demuxer::read_packet`] gives the sample, in
+/// the stream's time base, with the edit list applied; the edit list itself is
+/// [`SampleIndex::edit_list`]. `offset` and `size` locate the stored bytes, so
+/// a caller can also read them itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampleInfo {
+    /// File offset of the stored sample.
+    pub offset: u64,
+    /// Stored size in bytes.
+    pub size: u32,
+    /// Decode timestamp.
+    pub dts: i64,
+    /// Presentation timestamp.
+    pub pts: i64,
+    /// Duration (0 when the container does not say).
+    pub duration: i64,
+    /// A sync sample (keyframe): decoding can start here.
+    pub sync: bool,
+}
+
+/// One entry of a stream's edit list (MP4 `elst`): `segment_duration` of
+/// presentation, in the movie time scale, showing the media from
+/// `media_time` (stream time base); `media_time` -1 is an empty edit (a
+/// delay). `media_rate` is 16.16 fixed point (0x10000 = normal speed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditEntry {
+    pub segment_duration: i64,
+    pub media_time: i64,
+    pub media_rate: i32,
+}
+
+/// Random access over a demuxer's index; see [`Demuxer::sample_index`].
+pub trait SampleIndex {
+    /// Samples in stream `stream` (0 for an unknown stream).
+    fn sample_count(&self, stream: usize) -> u64;
+
+    /// The index entry of sample `index` of `stream`, in decode order.
+    fn sample_info(&self, stream: usize, index: u64) -> Option<SampleInfo>;
+
+    /// Read sample `index` of `stream` as a packet, in the same form as
+    /// [`Demuxer::read_packet`] would give it (see
+    /// [`Demuxer::set_raw_samples`]).
+    fn read_sample(&mut self, stream: usize, index: u64) -> Result<Packet>;
+
+    /// The last sync sample of `stream` whose presentation time is at or
+    /// before `pts`: where decoding starts to show the frame at `pts`.
+    /// `None` if no sync sample is that early.
+    fn sync_at_or_before(&self, stream: usize, pts: i64) -> Option<u64>;
+
+    /// The stream's edit list (empty when it has none, or the container has
+    /// no such thing).
+    fn edit_list(&self, _stream: usize) -> &[EditEntry] {
+        &[]
+    }
+
+    /// The movie time scale [`EditEntry::segment_duration`] counts in (MP4
+    /// `mvhd`), when the container has one.
+    fn movie_timescale(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Writes a container format: declare streams, write packets, finalize.
@@ -175,6 +266,23 @@ pub trait Muxer: Send {
     /// [`write_header`](Muxer::write_header); formats without a metadata slot
     /// simply ignore it (the default).
     fn set_metadata(&mut self, _metadata: &Dictionary) {}
+
+    /// A muxer option, FFmpeg-style (`movflags`, `+faststart`). Called before
+    /// [`write_header`](Muxer::write_header). Returns whether the muxer knows
+    /// the option; the default knows none.
+    fn set_option(&mut self, _key: &str, _value: &str) -> bool {
+        false
+    }
+
+    /// Write `edits` as stream `stream`'s edit list instead of the one the
+    /// muxer would derive (encoder delay, trims, a start delay). Segment
+    /// durations are in the muxer's movie time scale (1/1000 s for MP4), media
+    /// times in the stream's time base, -1 for an empty edit. Called before
+    /// [`write_trailer`](Muxer::write_trailer). Returns whether the container
+    /// has edit lists; the default has none.
+    fn set_edit_list(&mut self, _stream: usize, _edits: &[EditEntry]) -> bool {
+        false
+    }
 
     /// Write the container header for the given set of streams.
     fn write_header(&mut self, streams: &[Stream]) -> Result<()>;

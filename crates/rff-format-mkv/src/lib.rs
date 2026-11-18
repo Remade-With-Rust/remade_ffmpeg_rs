@@ -30,21 +30,36 @@
 //!   processing. Encrypted tracks, and bzlib/LZO compression, make
 //!   `read_header` fail with [`Error::Unsupported`] naming the track: the file
 //!   is refused rather than any track's ciphertext handed out as frames.
+//!
+//! Random access ([`Demuxer::sample_index`], issue #114): opened over a
+//! seekable input (the `matroska`/`webm` seekable factories, which a local
+//! file gets), the demuxer builds a per-stream frame table on the first call
+//! by walking every Cluster's block headers and seeking past the frame
+//! payloads, then reads any frame by its offset without moving
+//! `read_packet`'s position (see the `index` module for the rules). A plain
+//! [`Input`] (a pipe) has no index: scanning it would consume the stream.
+//! [`Demuxer::set_raw_samples`] hands H.264/HEVC frames out length-prefixed
+//! (as stored) and ASS events unreduced; ContentEncodings and the ProRes
+//! frame header are still restored, since those are Matroska storage
+//! quirks, not the codec's stored form.
 
 mod encoding;
+mod index;
+#[cfg(test)]
+mod index_tests;
 #[cfg(test)]
 mod metadata_tests;
 mod mux;
 
 use std::collections::VecDeque;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 
 use rff_core::{
     BlockAdditional, CodecId, ColorInfo, ColorRange, ContentLightLevel, Error, MasteringDisplay,
     MediaType, Packet, Rational, Result, SampleFormat,
 };
 use rff_format::avc::{avcc_to_annexb, parse_avcc, AvcConfig};
-use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Stream};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, SeekInput, Stream};
 
 pub use mux::{MkvMuxer, MkvStreamingMuxer};
 
@@ -65,6 +80,8 @@ pub fn register(registry: &mut FormatRegistry) {
             CodecId::Vp8,
             CodecId::Avif,
             CodecId::H264,
+            CodecId::Hevc,
+            CodecId::ProRes,
             CodecId::Opus,
             CodecId::Vorbis,
             CodecId::Aac,
@@ -101,6 +118,11 @@ pub fn register(registry: &mut FormatRegistry) {
         Box::new(MkvStreamingMuxer::new(out, false))
     });
     registry.register_seekable_muxer("webm", |out| Box::new(MkvStreamingMuxer::new(out, true)));
+    // Seekable inputs (local files) get random access through the index.
+    registry.register_seekable_demuxer("matroska", |input| {
+        Box::new(MkvDemuxer::new_seekable(input))
+    });
+    registry.register_seekable_demuxer("webm", |input| Box::new(MkvDemuxer::new_seekable(input)));
 }
 
 /// The EBML magic (`\x1A\x45\xDF\xA3`) starts every Matroska/WebM file.
@@ -420,27 +442,58 @@ struct ElemHeader {
     start: u64,
 }
 
-/// The input, buffered, with the absolute position tracked (it can't seek).
-struct Source {
-    r: BufReader<Input>,
-    pos: u64,
+/// What the demuxer reads from: a plain byte stream (a pipe), or one that can
+/// also seek (a local file), which is what random access needs.
+enum Inner {
+    Plain(Input),
+    Seek(SeekInput),
 }
 
-impl Source {
-    fn byte(&mut self) -> io::Result<Option<u8>> {
-        let mut b = [0u8];
-        loop {
-            match self.r.read(&mut b) {
-                Ok(0) => return Ok(None),
-                Ok(_) => {
-                    self.pos += 1;
-                    return Ok(Some(b[0]));
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
+impl Read for Inner {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Inner::Plain(r) => r.read(buf),
+            Inner::Seek(r) => r.read(buf),
         }
     }
+}
+
+impl Seek for Inner {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            Inner::Plain(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "mkv: the input cannot seek",
+            )),
+            Inner::Seek(r) => r.seek(pos),
+        }
+    }
+}
+
+/// One byte from `r`, `None` at end of input.
+fn read_byte<R: Read + ?Sized>(r: &mut R) -> io::Result<Option<u8>> {
+    let mut b = [0u8];
+    loop {
+        match r.read(&mut b) {
+            Ok(0) => return Ok(None),
+            Ok(_) => return Ok(Some(b[0])),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// A byte source the Cluster walk reads from: the streaming [`Source`], or
+/// the index scan's seeking reader. Positions count from where the demuxer
+/// started reading.
+trait Src {
+    fn pos(&self) -> u64;
+    fn byte(&mut self) -> io::Result<Option<u8>>;
+    /// Discard up to `n` bytes (fewer at end of input).
+    fn skip(&mut self, n: u64) -> io::Result<()>;
+    /// Read up to `n` bytes (fewer at end of input — a truncated final block
+    /// comes back partial). Allocation tracks bytes actually read, never `n`.
+    fn body(&mut self, n: u64) -> io::Result<Vec<u8>>;
 
     /// The next element header (ID + size vint). `None` at end of input, on
     /// a truncated header, or on an invalid vint — all of which end a walk.
@@ -480,25 +533,42 @@ impl Source {
             id,
             size,
             unknown,
-            start: self.pos,
+            start: self.pos(),
         }))
     }
+}
 
-    /// Discard up to `n` bytes (fewer at end of input) without buffering them.
+/// The input, buffered, with the position tracked. The streaming walk never
+/// seeks (a pipe and a file are read alike); only the random-access paths
+/// seek, and they put the reader back where this walk left it.
+struct Source {
+    r: BufReader<Inner>,
+    pos: u64,
+    /// The input's own offset when the demuxer got it: `pos` 0 is file
+    /// offset `base` (0 for a plain stream).
+    base: u64,
+}
+
+impl Src for Source {
+    fn pos(&self) -> u64 {
+        self.pos
+    }
+
+    fn byte(&mut self) -> io::Result<Option<u8>> {
+        let b = read_byte(&mut self.r)?;
+        if b.is_some() {
+            self.pos += 1;
+        }
+        Ok(b)
+    }
+
+    /// Discards without buffering the skipped bytes.
     fn skip(&mut self, n: u64) -> io::Result<()> {
         let copied = io::copy(&mut (&mut self.r).take(n), &mut io::sink())?;
         self.pos += copied;
         Ok(())
     }
 
-    /// The bytes buffered ahead of the read position, without consuming them
-    /// (fewer than any given count at a buffer boundary or end of input).
-    fn peek(&mut self) -> io::Result<&[u8]> {
-        self.r.fill_buf()
-    }
-
-    /// Read up to `n` bytes (fewer at end of input — a truncated final block
-    /// comes back partial). Allocation tracks bytes actually read, never `n`.
     fn body(&mut self, n: u64) -> io::Result<Vec<u8>> {
         let mut v = Vec::new();
         (&mut self.r).take(n).read_to_end(&mut v)?;
@@ -507,43 +577,53 @@ impl Source {
     }
 }
 
+impl Source {
+    /// The bytes buffered ahead of the read position, without consuming them
+    /// (fewer than any given count at a buffer boundary or end of input).
+    fn peek(&mut self) -> io::Result<&[u8]> {
+        self.r.fill_buf()
+    }
+
+    fn seekable(&self) -> bool {
+        matches!(self.r.get_ref(), Inner::Seek(_))
+    }
+
+    /// Read `len` bytes at file offset `offset`, then put the reader back at
+    /// the streaming walk's position. Fewer bytes at end of input.
+    fn read_at(&mut self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+        let read = (|| {
+            self.r.seek(SeekFrom::Start(offset))?;
+            let mut v = Vec::new();
+            (&mut self.r).take(len).read_to_end(&mut v)?;
+            Ok(v)
+        })();
+        // Seeking the BufReader drops its read-ahead, so the walk resumes
+        // with exactly the bytes it would have read next.
+        self.restore()?;
+        read
+    }
+
+    /// Re-seek the reader to the walk's position (after the inner reader was
+    /// moved underneath the buffer).
+    fn restore(&mut self) -> io::Result<()> {
+        self.r
+            .seek(SeekFrom::Start(self.base + self.pos))
+            .map(|_| ())
+    }
+}
+
 /// The Cluster being walked: its end offset (`None` = unknown size, ended by
 /// the next level-1 element) and its base timestamp.
+#[derive(Clone, Copy)]
 struct Cluster {
     end: Option<u64>,
     ts: i64,
 }
 
-struct MkvDemuxer {
-    src: Source,
-    streams: Vec<Stream>,
-    /// Maps a Matroska track number to our 0-based stream index.
-    track_map: Vec<(u64, usize)>,
-    /// Indexed by stream index; `Some` for H.264 tracks whose CodecPrivate is
-    /// an `avcC` — their blocks are AVCC and get normalised to Annex-B.
-    avc: Vec<Option<AvcConfig>>,
-    /// Indexed by stream index; ASS/SSA subtitle tracks, whose block payloads
-    /// carry `ReadOrder,Layer,Style,…,Text` and get reduced to plain text.
-    ass: Vec<bool>,
-    /// Indexed by stream index; the track's DefaultDuration in nanoseconds
-    /// (0 = none), which a block without its own BlockDuration lasts per frame.
-    default_duration_ns: Vec<u64>,
-    /// Indexed by stream index: the track's CodecDelay in nanoseconds (0: none), the
-    /// encoder's priming, which block timestamps include and packet timestamps don't.
-    codec_delay: Vec<u64>,
-    /// Indexed by stream index: the frame-scope ContentEncodings to undo.
-    codings: Vec<Vec<encoding::Coding>>,
-    /// A track the demuxer must refuse (encrypted, unsupported compression):
-    /// `read_header` fails with this message.
-    refused: Option<String>,
-    /// The rest of a laced block's frames, returned before the walk goes on.
-    laced: VecDeque<Packet>,
-    /// Indexed by stream index: the caller drops this stream's packets, so
-    /// its SimpleBlocks are skipped unread.
-    discard: Vec<bool>,
-    timestamp_scale: u64,
-    /// Segment duration in `timestamp_scale` ticks (same unit as `time_base`).
-    duration_ticks: Option<i64>,
+/// Where a walk over the Segment's Clusters stands. `read_packet` and the
+/// index scan run the same walk, so they meet the same blocks.
+#[derive(Clone, Copy, Default)]
+struct Walk {
     /// Absolute end of the Segment body; `None` = unknown size (runs to EOF).
     seg_end: Option<u64>,
     cluster: Option<Cluster>,
@@ -553,36 +633,9 @@ struct MkvDemuxer {
     pending: Option<ElemHeader>,
     /// The walk is over (end of Segment, end of input, or corrupt framing).
     done: bool,
-    parsed: bool,
 }
 
-impl MkvDemuxer {
-    fn new(input: Input) -> MkvDemuxer {
-        MkvDemuxer {
-            src: Source {
-                r: BufReader::with_capacity(READ_BUF, input),
-                pos: 0,
-            },
-            streams: Vec::new(),
-            track_map: Vec::new(),
-            avc: Vec::new(),
-            ass: Vec::new(),
-            default_duration_ns: Vec::new(),
-            codec_delay: Vec::new(),
-            codings: Vec::new(),
-            refused: None,
-            laced: VecDeque::new(),
-            discard: Vec::new(),
-            timestamp_scale: 1_000_000, // default: 1 ms
-            duration_ticks: None,
-            seg_end: None,
-            cluster: None,
-            pending: None,
-            done: false,
-            parsed: false,
-        }
-    }
-
+impl Walk {
     /// `size` clamped to what is left of the innermost enclosing element with
     /// a known end (the Cluster being walked, else the Segment).
     fn bounded(&self, h: &ElemHeader) -> u64 {
@@ -593,6 +646,400 @@ impl MkvDemuxer {
         }
     }
 
+    /// Walk Cluster children up to the next SimpleBlock or BlockGroup header
+    /// and return it with its Cluster's timestamp; the caller consumes the
+    /// body next (or ends the walk). `None` = the walk is over.
+    fn next_block<S: Src>(&mut self, src: &mut S) -> io::Result<Option<(ElemHeader, i64)>> {
+        loop {
+            if self.done {
+                return Ok(None);
+            }
+            let h = match self.pending.take() {
+                Some(h) => h,
+                None => {
+                    let pos = src.pos();
+                    if let Some(Cluster { end: Some(end), .. }) = self.cluster {
+                        if pos >= end {
+                            self.cluster = None;
+                            continue;
+                        }
+                    }
+                    if self.seg_end.is_some_and(|end| pos >= end) {
+                        self.done = true;
+                        continue;
+                    }
+                    match src.header()? {
+                        Some(h) => h,
+                        None => {
+                            // Corrupt framing inside a known-size Cluster:
+                            // resync at its end. Anywhere else (or at EOF)
+                            // the walk is over.
+                            match self.cluster.take().and_then(|c| c.end) {
+                                Some(end) if end > src.pos() => src.skip(end - src.pos())?,
+                                _ => self.done = true,
+                            }
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            // Segment level: enter Clusters, stream past everything else.
+            let Some(ts) = self.cluster.as_ref().map(|c| c.ts) else {
+                if h.id == ID_CLUSTER {
+                    let end = (!h.unknown).then(|| h.start.saturating_add(self.bounded(&h)));
+                    self.cluster = Some(Cluster { end, ts: 0 });
+                } else if !h.unknown {
+                    let len = self.bounded(&h);
+                    src.skip(len)?;
+                }
+                continue;
+            };
+
+            // Inside a Cluster.
+            if is_level1(h.id) {
+                self.cluster = None;
+                self.pending = Some(h);
+                continue;
+            }
+            if h.unknown {
+                continue; // descend into an unknown-size child
+            }
+            match h.id {
+                ID_TIMESTAMP => {
+                    let body = src.body(h.size.min(8))?;
+                    src.skip(h.size.saturating_sub(8))?;
+                    let v = Ebml::new(&body).read_uint(h.size.min(8) as usize) as i64;
+                    if let Some(c) = self.cluster.as_mut() {
+                        c.ts = v;
+                    }
+                }
+                ID_SIMPLE_BLOCK | ID_BLOCK_GROUP => return Ok(Some((h, ts))),
+                _ => {
+                    let len = self.bounded(&h);
+                    src.skip(len)?;
+                }
+            }
+        }
+    }
+}
+
+/// The fixed part of a (Simple)Block: whose it is, its relative timestamp,
+/// its flags, and where the frame data starts.
+struct BlockHead {
+    index: usize,
+    rel: i64,
+    flags: u8,
+    payload_at: usize,
+}
+
+impl BlockHead {
+    fn lacing(&self) -> u8 {
+        (self.flags >> 1) & 0x03
+    }
+}
+
+/// Per-track facts the block parsing, timing and frame shaping need — split
+/// from the reader so the index scan can borrow both. Every `Vec` is indexed
+/// by stream index.
+struct Tracks {
+    /// Maps a Matroska track number to our 0-based stream index.
+    track_map: Vec<(u64, usize)>,
+    /// `Some` for H.264/HEVC tracks whose CodecPrivate is an `avcC`/`hvcC`:
+    /// their blocks are length-prefixed and get normalised to Annex-B.
+    avc: Vec<Option<AvcConfig>>,
+    /// ASS/SSA subtitle tracks, whose block payloads carry
+    /// `ReadOrder,Layer,Style,…,Text` and get reduced to plain text.
+    ass: Vec<bool>,
+    /// ProRes tracks: Matroska stores their frames without the leading
+    /// 8-byte `size` + `icpf` atom header, which is put back.
+    prores: Vec<bool>,
+    /// The track's DefaultDuration in nanoseconds (0 = none), which a block
+    /// without its own BlockDuration lasts per frame.
+    default_duration_ns: Vec<u64>,
+    /// The track's CodecDelay in nanoseconds (0: none), the encoder's
+    /// priming, which block timestamps include and packet timestamps don't.
+    codec_delay: Vec<u64>,
+    /// The frame-scope ContentEncodings to undo.
+    codings: Vec<Vec<encoding::Coding>>,
+    /// Audio sample rate (DiscardPadding is converted to samples at it).
+    sample_rate: Vec<u32>,
+    timestamp_scale: u64,
+    /// [`Demuxer::set_raw_samples`]: no Annex-B conversion, no ASS reduction.
+    raw: bool,
+}
+
+impl Tracks {
+    fn new() -> Tracks {
+        Tracks {
+            track_map: Vec::new(),
+            avc: Vec::new(),
+            ass: Vec::new(),
+            prores: Vec::new(),
+            default_duration_ns: Vec::new(),
+            codec_delay: Vec::new(),
+            codings: Vec::new(),
+            sample_rate: Vec::new(),
+            timestamp_scale: 1_000_000, // default: 1 ms
+            raw: false,
+        }
+    }
+
+    fn stream_of(&self, track_num: u64) -> Option<usize> {
+        self.track_map
+            .iter()
+            .find(|(n, _)| *n == track_num)
+            .map(|&(_, index)| index)
+    }
+
+    /// The header of a (Simple)Block of `len` bytes, from `head`, its first
+    /// bytes (at least `min(len, 16)` of them): track vint, int16 relative
+    /// timestamp, flags. `None` when the block is too short or on no track
+    /// of ours — such a block yields no frames.
+    fn block_head(&self, head: &[u8], len: usize) -> Option<BlockHead> {
+        let mut b = Ebml::new(head);
+        let (track_num, _) = b.read_size()?;
+        if b.pos + 3 > len || b.pos + 3 > head.len() {
+            return None;
+        }
+        let rel = i16::from_be_bytes([head[b.pos], head[b.pos + 1]]) as i64;
+        let flags = head[b.pos + 2];
+        Some(BlockHead {
+            index: self.stream_of(track_num)?,
+            rel,
+            flags,
+            payload_at: b.pos + 3,
+        })
+    }
+
+    /// `(pts, duration)` of each of the `count` frames of a block of stream
+    /// `index`. As matroskadec: a block without a BlockDuration (`duration`
+    /// 0) lasts DefaultDuration per frame, the duration is shared out between
+    /// the frames, and each frame's timestamp follows the previous one's;
+    /// after a frame of zero duration the rest have none. The CodecDelay
+    /// comes off every timestamp (ffmpeg's muxer adds it on), rounded to the
+    /// nearest tick: an AAC or Opus stream's first packet is negative.
+    fn lace_times(
+        &self,
+        index: usize,
+        cluster_ts: i64,
+        rel: i64,
+        duration: i64,
+        count: usize,
+    ) -> Vec<(Option<i64>, i64)> {
+        let count = count as i64;
+        let block_duration = if duration > 0 {
+            duration
+        } else {
+            let default = self.default_duration_ns.get(index).copied().unwrap_or(0);
+            (u128::from(default) * count as u128 / u128::from(self.timestamp_scale.max(1)))
+                .min(i64::MAX as u128) as i64
+        };
+        let delay = self.codec_delay.get(index).copied().unwrap_or(0);
+        let scale = u128::from(self.timestamp_scale.max(1));
+        let delay = ((2 * u128::from(delay) + scale) / (2 * scale)).min(i64::MAX as u128) as i64;
+        let mut pts = Some(cluster_ts.wrapping_add(rel).saturating_sub(delay));
+        (0..count)
+            .map(|n| {
+                let lace_duration = block_duration.saturating_mul(n + 1) / count
+                    - block_duration.saturating_mul(n) / count;
+                let this_pts = pts;
+                pts = match pts {
+                    Some(t) if lace_duration != 0 => Some(t.saturating_add(lace_duration)),
+                    _ => None,
+                };
+                (this_pts, lace_duration.max(0))
+            })
+            .collect()
+    }
+
+    /// One stored frame of stream `index` in the form packets carry it:
+    /// ContentEncodings undone, the ProRes frame header put back, and —
+    /// unless raw — H.264/HEVC AVCC → Annex-B (with the parameter sets in
+    /// front of keyframes, so the decoder is self-contained; mirrors the MP4
+    /// demuxer) and ASS events reduced to their text. `None` when a
+    /// ContentEncoding does not decode (corrupt zlib).
+    fn shape(&self, index: usize, stored: &[u8], keyframe: bool) -> Option<Vec<u8>> {
+        let decoded;
+        let mut frame = match self.codings.get(index).filter(|c| !c.is_empty()) {
+            Some(codings) => {
+                decoded = encoding::decode(codings, stored)?;
+                &decoded[..]
+            }
+            None => stored,
+        };
+        let restored;
+        if self.prores.get(index).copied().unwrap_or(false) && frame.get(4..8) != Some(b"icpf") {
+            // As matroskadec: the 8-byte header comes back only when absent
+            // (some writers keep it).
+            let size = u32::try_from(frame.len() + 8).unwrap_or(u32::MAX);
+            restored = [&size.to_be_bytes()[..], b"icpf", frame].concat();
+            frame = &restored[..];
+        }
+        if self.raw {
+            return Some(frame.to_vec());
+        }
+        Some(match self.avc.get(index).and_then(|a| a.as_ref()) {
+            Some(cfg) => {
+                let mut out = Vec::with_capacity(cfg.headers_annexb.len() + frame.len() + 16);
+                if keyframe {
+                    out.extend_from_slice(&cfg.headers_annexb);
+                }
+                avcc_to_annexb(frame, cfg.nal_len, &mut out);
+                out
+            }
+            // ASS blocks: `ReadOrder,Layer,Style,Name,ML,MR,MV,Effect,Text` —
+            // reduce to the plain text our subtitle contract carries.
+            None if self.ass.get(index).copied().unwrap_or(false) => {
+                rff_subtitle::ass_dialogue_text(&String::from_utf8_lossy(frame), 8).into_bytes()
+            }
+            None => frame.to_vec(),
+        })
+    }
+
+    /// A BlockGroup body. BlockDuration, DiscardPadding, ReferenceBlock and
+    /// BlockAdditions may come before or after the Block: collect them all,
+    /// then emit (subtitle cues need their duration, a stream's last audio
+    /// block its padding). A BlockGroup's Block has no keyframe flag: as in
+    /// matroskadec, it is a keyframe exactly when no ReferenceBlock is present.
+    fn parse_block_group(&self, group: &[u8], cluster_ts: i64) -> Vec<Packet> {
+        let mut g = Ebml::new(group);
+        let mut block: Option<&[u8]> = None;
+        let mut duration = 0i64;
+        let mut discard_ns = 0i64;
+        let mut referenced = false;
+        let mut additions = Vec::new();
+        while g.pos < group.len() {
+            let Some(gid) = g.read_id() else { break };
+            let Some((gsz, _)) = g.read_size() else { break };
+            match gid {
+                ID_BLOCK => block = Some(g.read_bytes(gsz as usize)),
+                ID_BLOCK_DURATION => duration = g.read_uint(gsz as usize) as i64,
+                ID_DISCARD_PADDING => discard_ns = g.read_int(gsz as usize),
+                ID_REFERENCE_BLOCK => {
+                    referenced = true;
+                    g.skip(gsz as usize);
+                }
+                ID_BLOCK_ADDITIONS => {
+                    additions.extend(parse_block_additions(g.read_bytes(gsz as usize)))
+                }
+                _ => g.skip(gsz as usize),
+            }
+        }
+        let Some(block) = block else {
+            return Vec::new();
+        };
+        let mut packets = self.parse_block(block, cluster_ts, duration, Some(!referenced));
+        // Additions describe the block; a laced one shares them out to every
+        // frame, as matroskadec does (blocks with additions are not laced in
+        // practice).
+        if !additions.is_empty() {
+            for p in &mut packets {
+                p.additions = additions.clone();
+            }
+        }
+        // DiscardPadding trims the end of the block, so it belongs to the
+        // block's last frame (the only one when, as usual, it is not laced).
+        if let Some(last) = packets.last_mut() {
+            let rate = self
+                .sample_rate
+                .get(last.stream_index)
+                .copied()
+                .unwrap_or(0);
+            last.discard_padding = discard_samples(discard_ns, rate);
+        }
+        packets
+    }
+
+    /// Parse a (Simple)Block body: header, then the frame payload, split into
+    /// its frames when the block is laced. `duration` is the BlockGroup's
+    /// BlockDuration (0 when absent); `keyframe` overrides the flags byte (a
+    /// BlockGroup's is decided by its ReferenceBlocks). A frame whose
+    /// ContentEncoding fails to decode (corrupt zlib) is dropped.
+    fn parse_block(
+        &self,
+        block: &[u8],
+        cluster_ts: i64,
+        duration: i64,
+        keyframe: Option<bool>,
+    ) -> Vec<Packet> {
+        let Some(head) = self.block_head(block, block.len()) else {
+            return Vec::new();
+        };
+        let keyframe = keyframe.unwrap_or(head.flags & 0x80 != 0);
+        // A block whose lace sizes don't add up is dropped, as FFmpeg drops it.
+        let Some(laces) = split_laces(&block[head.payload_at..], head.lacing()) else {
+            return Vec::new();
+        };
+        let times = self.lace_times(head.index, cluster_ts, head.rel, duration, laces.len());
+        let mut packets = Vec::with_capacity(laces.len());
+        for (stored, (pts, duration)) in laces.into_iter().zip(times) {
+            let Some(data) = self.shape(head.index, stored, keyframe) else {
+                continue;
+            };
+            let mut packet = Packet::from_data(head.index, data);
+            packet.pts = pts;
+            packet.duration = duration;
+            packet.flags.keyframe = keyframe;
+            packets.push(packet);
+        }
+        packets
+    }
+}
+
+struct MkvDemuxer {
+    src: Source,
+    streams: Vec<Stream>,
+    t: Tracks,
+    /// A track the demuxer must refuse (encrypted, unsupported compression):
+    /// `read_header` fails with this message.
+    refused: Option<String>,
+    /// The rest of a laced block's frames, returned before the walk goes on.
+    laced: VecDeque<Packet>,
+    /// Indexed by stream index: the caller drops this stream's packets, so
+    /// its SimpleBlocks are skipped unread.
+    discard: Vec<bool>,
+    /// Segment duration in `timestamp_scale` ticks (same unit as `time_base`).
+    duration_ticks: Option<i64>,
+    walk: Walk,
+    /// Where the first Cluster's header starts (the index scan starts there).
+    clusters_at: Option<u64>,
+    /// The random-access index, built on the first `sample_index` call.
+    index: Option<index::Index>,
+    parsed: bool,
+}
+
+impl MkvDemuxer {
+    fn new(input: Input) -> MkvDemuxer {
+        MkvDemuxer::with_inner(Inner::Plain(input), 0)
+    }
+
+    /// Over a seekable input: the same streaming demuxer, plus random access.
+    fn new_seekable(mut input: SeekInput) -> MkvDemuxer {
+        let base = input.stream_position().unwrap_or(0);
+        MkvDemuxer::with_inner(Inner::Seek(input), base)
+    }
+
+    fn with_inner(inner: Inner, base: u64) -> MkvDemuxer {
+        MkvDemuxer {
+            src: Source {
+                r: BufReader::with_capacity(READ_BUF, inner),
+                pos: 0,
+                base,
+            },
+            streams: Vec::new(),
+            t: Tracks::new(),
+            refused: None,
+            laced: VecDeque::new(),
+            discard: Vec::new(),
+            duration_ticks: None,
+            walk: Walk::default(),
+            clusters_at: None,
+            index: None,
+            parsed: false,
+        }
+    }
+
     /// Skip the EBML header, enter the Segment and parse everything up to the
     /// first Cluster (Info, Tracks); other elements are streamed past.
     fn parse_headers(&mut self) -> Result<()> {
@@ -600,43 +1047,45 @@ impl MkvDemuxer {
         if let Some(why) = &self.refused {
             return Err(Error::unsupported(why.clone()));
         }
-        if self.done {
+        if self.walk.done {
             return Err(no_tracks());
         }
         loop {
             let Some(h) = self.src.header()? else {
-                self.done = true;
+                self.walk.done = true;
                 return Err(no_tracks());
             };
             if h.id == ID_SEGMENT {
-                self.seg_end = (!h.unknown).then(|| h.start.saturating_add(h.size));
+                self.walk.seg_end = (!h.unknown).then(|| h.start.saturating_add(h.size));
                 break;
             }
             if h.unknown {
-                self.done = true;
+                self.walk.done = true;
                 return Err(no_tracks());
             }
             self.src.skip(h.size)?;
         }
         loop {
-            if self.seg_end.is_some_and(|end| self.src.pos >= end) {
-                self.done = true;
+            if self.walk.seg_end.is_some_and(|end| self.src.pos >= end) {
+                self.walk.done = true;
                 break;
             }
+            let at = self.src.pos;
             let Some(h) = self.src.header()? else {
-                self.done = true;
+                self.walk.done = true;
                 break;
             };
             match h.id {
                 ID_CLUSTER => {
-                    self.pending = Some(h);
+                    self.clusters_at = Some(at);
+                    self.walk.pending = Some(h);
                     break;
                 }
                 // An unknown-size element (only legal for Segment/Cluster):
                 // descend into it, so its children are met one by one.
                 _ if h.unknown => {}
                 ID_INFO | ID_TRACKS => {
-                    let len = self.bounded(&h);
+                    let len = self.walk.bounded(&h);
                     if len > MAX_HEADER_ELEMENT {
                         self.src.skip(len)?;
                         continue;
@@ -650,7 +1099,7 @@ impl MkvDemuxer {
                 }
                 // Children of an unknown-size Info/Tracks descended into.
                 ID_TRACK_ENTRY | ID_TIMESTAMP_SCALE | ID_DURATION => {
-                    let len = self.bounded(&h);
+                    let len = self.walk.bounded(&h);
                     if len > MAX_HEADER_ELEMENT {
                         self.src.skip(len)?;
                         continue;
@@ -663,17 +1112,17 @@ impl MkvDemuxer {
                     }
                 }
                 _ => {
-                    let len = self.bounded(&h);
+                    let len = self.walk.bounded(&h);
                     self.src.skip(len)?;
                 }
             }
         }
         if let Some(why) = &self.refused {
-            self.done = true;
+            self.walk.done = true;
             return Err(Error::unsupported(why.clone()));
         }
         if self.streams.is_empty() {
-            self.done = true;
+            self.walk.done = true;
             return Err(no_tracks());
         }
         for s in &mut self.streams {
@@ -690,99 +1139,38 @@ impl MkvDemuxer {
             return Ok(Some(p));
         }
         loop {
-            if self.done {
+            let Some((h, ts)) = self.walk.next_block(&mut self.src)? else {
                 return Ok(None);
-            }
-            let h = match self.pending.take() {
-                Some(h) => h,
-                None => {
-                    let pos = self.src.pos;
-                    if let Some(Cluster { end: Some(end), .. }) = self.cluster {
-                        if pos >= end {
-                            self.cluster = None;
-                            continue;
-                        }
-                    }
-                    if self.seg_end.is_some_and(|end| pos >= end) {
-                        self.done = true;
-                        continue;
-                    }
-                    match self.src.header()? {
-                        Some(h) => h,
-                        None => {
-                            // Corrupt framing inside a known-size Cluster:
-                            // resync at its end. Anywhere else (or at EOF)
-                            // the walk is over.
-                            match self.cluster.take().and_then(|c| c.end) {
-                                Some(end) if end > self.src.pos => {
-                                    self.src.skip(end - self.src.pos)?;
-                                }
-                                _ => self.done = true,
-                            }
-                            continue;
-                        }
-                    }
-                }
             };
-
-            // Segment level: enter Clusters, stream past everything else.
-            let Some(ts) = self.cluster.as_ref().map(|c| c.ts) else {
-                if h.id == ID_CLUSTER {
-                    let end = (!h.unknown).then(|| h.start.saturating_add(self.bounded(&h)));
-                    self.cluster = Some(Cluster { end, ts: 0 });
-                } else if !h.unknown {
-                    let len = self.bounded(&h);
-                    self.src.skip(len)?;
-                }
-                continue;
-            };
-
-            // Inside a Cluster.
-            if is_level1(h.id) {
-                self.cluster = None;
-                self.pending = Some(h);
+            if h.id == ID_SIMPLE_BLOCK && self.discarded_block(h.size)? {
+                self.src.skip(h.size)?;
                 continue;
             }
-            if h.unknown {
-                continue; // descend into an unknown-size child
+            if h.size > MAX_BLOCK {
+                let len = self.walk.bounded(&h);
+                self.src.skip(len)?;
+                continue;
             }
-            match h.id {
-                ID_TIMESTAMP => {
-                    let body = self.src.body(h.size.min(8))?;
-                    self.src.skip(h.size.saturating_sub(8))?;
-                    let v = Ebml::new(&body).read_uint(h.size.min(8) as usize) as i64;
-                    if let Some(c) = self.cluster.as_mut() {
-                        c.ts = v;
-                    }
-                }
-                ID_SIMPLE_BLOCK if self.discarded_block(h.size)? => self.src.skip(h.size)?,
-                ID_SIMPLE_BLOCK | ID_BLOCK_GROUP if h.size <= MAX_BLOCK => {
-                    let body = self.src.body(h.size)?;
-                    if (body.len() as u64) < h.size {
-                        // Input ended inside the (Simple)Block or BlockGroup.
-                        // matroskadec drops such a block (`ebml_read_binary`
-                        // fails a short read; a cut BlockGroup fails its
-                        // nest), so the partial last frame of a truncated
-                        // file is never decoded. The input is exhausted.
-                        self.done = true;
-                        continue;
-                    }
-                    // A laced block yields several frames: return the first,
-                    // queue the rest for the next calls.
-                    let packets = if h.id == ID_SIMPLE_BLOCK {
-                        self.parse_block(&body, ts, 0, None)
-                    } else {
-                        self.parse_block_group(&body, ts)
-                    };
-                    self.laced.extend(packets);
-                    if let Some(p) = self.laced.pop_front() {
-                        return Ok(Some(p));
-                    }
-                }
-                _ => {
-                    let len = self.bounded(&h);
-                    self.src.skip(len)?;
-                }
+            let body = self.src.body(h.size)?;
+            if (body.len() as u64) < h.size {
+                // Input ended inside the (Simple)Block or BlockGroup.
+                // matroskadec drops such a block (`ebml_read_binary` fails a
+                // short read; a cut BlockGroup fails its nest), so the
+                // partial last frame of a truncated file is never decoded.
+                // The input is exhausted.
+                self.walk.done = true;
+                continue;
+            }
+            // A laced block yields several frames: return the first, queue
+            // the rest for the next calls.
+            let packets = if h.id == ID_SIMPLE_BLOCK {
+                self.t.parse_block(&body, ts, 0, None)
+            } else {
+                self.t.parse_block_group(&body, ts)
+            };
+            self.laced.extend(packets);
+            if let Some(p) = self.laced.pop_front() {
+                return Ok(Some(p));
             }
         }
     }
@@ -801,10 +1189,9 @@ impl MkvDemuxer {
             return Ok(false);
         };
         Ok(self
-            .track_map
-            .iter()
-            .find(|(n, _)| *n == track_num)
-            .is_some_and(|&(_, index)| self.discard.get(index).copied().unwrap_or(false)))
+            .t
+            .stream_of(track_num)
+            .is_some_and(|index| self.discard.get(index).copied().unwrap_or(false)))
     }
 
     fn parse_info(&mut self, data: &[u8]) {
@@ -821,7 +1208,7 @@ impl MkvDemuxer {
     /// One Info child whose body starts at `e.pos`.
     fn info_element(&mut self, id: u32, e: &mut Ebml, len: usize) {
         match id {
-            ID_TIMESTAMP_SCALE => self.timestamp_scale = e.read_uint(len),
+            ID_TIMESTAMP_SCALE => self.t.timestamp_scale = e.read_uint(len),
             // Duration is a float in `timestamp_scale` ticks — our time_base.
             ID_DURATION => {
                 let d = e.read_float(len);
@@ -936,11 +1323,12 @@ impl MkvDemuxer {
                 }
             }
         }
-        self.codings.push(codings.frames);
+        self.t.codings.push(codings.frames);
 
         let codec_id = map_codec(&codec);
         let is_ass = matches!(codec.as_str(), "S_TEXT/ASS" | "S_TEXT/SSA");
-        self.ass.push(is_ass);
+        self.t.ass.push(is_ass);
+        self.t.prores.push(codec_id == CodecId::ProRes);
         // A video track without DefaultDuration but with the (deprecated)
         // FrameRate gets one derived from it, as matroskadec does.
         if default_duration_ns == 0 && track_type == 1 && frame_rate > 0.0 {
@@ -949,8 +1337,9 @@ impl MkvDemuxer {
                 default_duration_ns = ns as u64;
             }
         }
-        self.default_duration_ns.push(default_duration_ns);
-        self.codec_delay.push(codec_delay);
+        self.t.default_duration_ns.push(default_duration_ns);
+        self.t.codec_delay.push(codec_delay);
+        self.t.sample_rate.push(rate);
         let index = self.streams.len();
         let mut s = Stream::new(index, codec_id);
         s.media_type = match track_type {
@@ -971,189 +1360,53 @@ impl MkvDemuxer {
                 parse_colour(&mut s, colour);
             }
         }
-        // PCM: the codec string + bit depth decide the sample layout.
+        // PCM: the codec string + bit depth decide the sample layout. 8-bit
+        // integer PCM is unsigned (RFC 9559 codec mapping; FFmpeg's pcm_u8).
         if codec_id == CodecId::Pcm {
             s.sample_format = match (codec.as_str(), bit_depth) {
+                ("A_PCM/FLOAT/IEEE", 64) => Some(SampleFormat::F64),
                 ("A_PCM/FLOAT/IEEE", _) => Some(SampleFormat::F32),
+                (_, 8) => Some(SampleFormat::U8),
                 (_, 0 | 16) => Some(SampleFormat::S16),
-                _ => None, // 24-bit int etc. — no rff layout yet
+                (_, 24) => Some(SampleFormat::S24),
+                (_, 32) => Some(SampleFormat::S32),
+                _ => None, // 12-bit, 20-bit... no rff layout
             };
         }
         // H.264 and HEVC are stored length-prefixed (CodecPrivate = `avcC` /
-        // `hvcC`). Normalise to rff's Annex-B packet contract — same as
-        // rff-format-mp4 — so extradata stays empty and the parameter sets
-        // ride in the keyframe packets.
+        // `hvcC`). Packets are normalised to rff's Annex-B contract — same as
+        // rff-format-mp4 — with the parameter sets riding in the keyframes,
+        // unless raw samples are asked for. `extradata` is the CodecPrivate
+        // record either way, as FFmpeg sets it: rff's H.264/HEVC decoders take
+        // only Annex-B extradata and ignore a record, the Matroska and MP4
+        // muxers take their parameter sets from the in-band NALs first, and a
+        // raw-sample caller (FilmCraft) needs the record to configure its own
+        // decoder. (Before #114 it was left empty.)
         let avc = match codec_id {
             CodecId::H264 => parse_avcc(&codec_private),
             CodecId::Hevc => rff_format::hvc::parse_hvcc(&codec_private),
             _ => None,
         };
-        s.extradata = if avc.is_some() {
-            Vec::new()
-        } else if codec_id == CodecId::Vorbis {
+        s.extradata = match codec_id {
             // Matroska stores the three Vorbis setup headers Xiph-laced; rff's
             // decoder contract wants them u32-LE length-prefixed (the Ogg
             // demuxer's packing). Convert, or the decoder can't configure.
-            xiph_to_packed(&codec_private).unwrap_or(codec_private)
-        } else {
-            codec_private
+            CodecId::Vorbis => xiph_to_packed(&codec_private).unwrap_or(codec_private),
+            // ProRes' CodecPrivate is just the profile fourcc (`apcn`, ...),
+            // which rff carries as the codec tag, as the MP4 demuxer does.
+            CodecId::ProRes => {
+                if let Ok(tag) = <[u8; 4]>::try_from(&codec_private[..]) {
+                    s.codec_tag = Some(tag);
+                }
+                Vec::new()
+            }
+            _ => codec_private,
         };
-        self.avc.push(avc);
+        self.t.avc.push(avc);
         // Matroska timestamps are in `timestamp_scale` ns; expose ms time base.
-        s.time_base = Rational::new(1, (1_000_000_000 / self.timestamp_scale.max(1)) as i32);
-        self.track_map.push((number, index));
+        s.time_base = Rational::new(1, (1_000_000_000 / self.t.timestamp_scale.max(1)) as i32);
+        self.t.track_map.push((number, index));
         self.streams.push(s);
-    }
-
-    /// A BlockGroup body. BlockDuration, DiscardPadding, ReferenceBlock and
-    /// BlockAdditions may come before or after the Block: collect them all,
-    /// then emit (subtitle cues need their duration, a stream's last audio
-    /// block its padding). A BlockGroup's Block has no keyframe flag: as in
-    /// matroskadec, it is a keyframe exactly when no ReferenceBlock is present.
-    fn parse_block_group(&self, group: &[u8], cluster_ts: i64) -> Vec<Packet> {
-        let mut g = Ebml::new(group);
-        let mut block: Option<&[u8]> = None;
-        let mut duration = 0i64;
-        let mut discard_ns = 0i64;
-        let mut referenced = false;
-        let mut additions = Vec::new();
-        while g.pos < group.len() {
-            let Some(gid) = g.read_id() else { break };
-            let Some((gsz, _)) = g.read_size() else { break };
-            match gid {
-                ID_BLOCK => block = Some(g.read_bytes(gsz as usize)),
-                ID_BLOCK_DURATION => duration = g.read_uint(gsz as usize) as i64,
-                ID_DISCARD_PADDING => discard_ns = g.read_int(gsz as usize),
-                ID_REFERENCE_BLOCK => {
-                    referenced = true;
-                    g.skip(gsz as usize);
-                }
-                ID_BLOCK_ADDITIONS => {
-                    additions.extend(parse_block_additions(g.read_bytes(gsz as usize)))
-                }
-                _ => g.skip(gsz as usize),
-            }
-        }
-        let Some(block) = block else {
-            return Vec::new();
-        };
-        let mut packets = self.parse_block(block, cluster_ts, duration, Some(!referenced));
-        // Additions describe the block; a laced one shares them out to every
-        // frame, as matroskadec does (blocks with additions are not laced in
-        // practice).
-        if !additions.is_empty() {
-            for p in &mut packets {
-                p.additions = additions.clone();
-            }
-        }
-        // DiscardPadding trims the end of the block, so it belongs to the
-        // block's last frame (the only one when, as usual, it is not laced).
-        if let Some(last) = packets.last_mut() {
-            let rate = self
-                .streams
-                .get(last.stream_index)
-                .map_or(0, |s| s.sample_rate);
-            last.discard_padding = discard_samples(discard_ns, rate);
-        }
-        packets
-    }
-
-    /// Parse a (Simple)Block body: track vint, int16 relative timestamp, flags,
-    /// then the frame payload, split into its frames when the block is laced.
-    /// `duration` is the BlockGroup's BlockDuration (0 when absent);
-    /// `keyframe` overrides the flags byte (a BlockGroup's is decided by its
-    /// ReferenceBlocks). Frames under a ContentEncoding are decoded first; one
-    /// that fails to (corrupt zlib) is dropped.
-    fn parse_block(
-        &self,
-        block: &[u8],
-        cluster_ts: i64,
-        duration: i64,
-        keyframe: Option<bool>,
-    ) -> Vec<Packet> {
-        let mut b = Ebml::new(block);
-        let Some((track_num, _)) = b.read_size() else {
-            return Vec::new();
-        };
-        if b.pos + 3 > block.len() {
-            return Vec::new();
-        }
-        let rel = i16::from_be_bytes([block[b.pos], block[b.pos + 1]]) as i64;
-        b.pos += 2;
-        let flags = block[b.pos];
-        b.pos += 1;
-        let lacing = (flags >> 1) & 0x03;
-        let keyframe = keyframe.unwrap_or(flags & 0x80 != 0);
-        let Some(&(_, index)) = self.track_map.iter().find(|(n, _)| *n == track_num) else {
-            return Vec::new();
-        };
-        // A block whose lace sizes don't add up is dropped, as FFmpeg drops it.
-        let Some(laces) = split_laces(&block[b.pos..], lacing) else {
-            return Vec::new();
-        };
-        // As matroskadec: a block without a BlockDuration lasts DefaultDuration per frame,
-        // the duration is shared out between the frames, and each frame's timestamp follows
-        // the previous one's; after a frame of zero duration the rest have none.
-        let count = laces.len() as i64;
-        let block_duration = if duration > 0 {
-            duration
-        } else {
-            let default = self.default_duration_ns.get(index).copied().unwrap_or(0);
-            (u128::from(default) * count as u128 / u128::from(self.timestamp_scale.max(1)))
-                .min(i64::MAX as u128) as i64
-        };
-        // As matroskadec, the CodecDelay comes off every timestamp (ffmpeg's muxer adds it
-        // on), rounded to the nearest tick: an AAC or Opus stream's first packet is negative.
-        let delay = self.codec_delay.get(index).copied().unwrap_or(0);
-        let scale = u128::from(self.timestamp_scale.max(1));
-        let delay = ((2 * u128::from(delay) + scale) / (2 * scale)).min(i64::MAX as u128) as i64;
-        let mut pts = Some(cluster_ts.wrapping_add(rel).saturating_sub(delay));
-        let mut packets = Vec::with_capacity(laces.len());
-        for (n, raw) in laces.into_iter().enumerate() {
-            let n = n as i64;
-            let lace_duration = block_duration.saturating_mul(n + 1) / count
-                - block_duration.saturating_mul(n) / count;
-            let this_pts = pts;
-            pts = match pts {
-                Some(t) if lace_duration != 0 => Some(t.saturating_add(lace_duration)),
-                _ => None,
-            };
-            let decoded;
-            let raw = match self.codings.get(index).filter(|c| !c.is_empty()) {
-                Some(codings) => match encoding::decode(codings, raw) {
-                    Some(d) => {
-                        decoded = d;
-                        &decoded[..]
-                    }
-                    None => continue,
-                },
-                None => raw,
-            };
-            // H.264: AVCC → Annex-B, prepending SPS/PPS on keyframes so the
-            // decoder is self-contained (mirrors the MP4 demuxer).
-            let data = match self.avc.get(index).and_then(|a| a.as_ref()) {
-                Some(cfg) => {
-                    let mut out = Vec::with_capacity(cfg.headers_annexb.len() + raw.len() + 16);
-                    if keyframe {
-                        out.extend_from_slice(&cfg.headers_annexb);
-                    }
-                    avcc_to_annexb(raw, cfg.nal_len, &mut out);
-                    out
-                }
-                // ASS blocks: `ReadOrder,Layer,Style,Name,ML,MR,MV,Effect,Text` —
-                // reduce to the plain text our subtitle contract carries.
-                None if self.ass.get(index).copied().unwrap_or(false) => {
-                    rff_subtitle::ass_dialogue_text(&String::from_utf8_lossy(raw), 8).into_bytes()
-                }
-                None => raw.to_vec(),
-            };
-            let mut packet = Packet::from_data(index, data);
-            packet.pts = this_pts;
-            packet.duration = lace_duration.max(0);
-            packet.flags.keyframe = keyframe;
-            packets.push(packet);
-        }
-        packets
     }
 }
 
@@ -1292,6 +1545,26 @@ impl Demuxer for MkvDemuxer {
     fn set_discard(&mut self, discard: &[bool]) {
         self.discard = discard.to_vec();
     }
+
+    /// Built on the first call (a scan of every Cluster's block headers,
+    /// seeking past the frames), so `read_header` stays cheap. `None` for a
+    /// demuxer over a plain [`Input`] — scanning a pipe would consume it —
+    /// for a file whose header does not parse, or when the scan hits an I/O
+    /// error (a later call tries again).
+    fn sample_index(&mut self) -> Option<&mut dyn rff_format::SampleIndex> {
+        if !self.src.seekable() || (!self.parsed && self.read_header().is_err()) {
+            return None;
+        }
+        if self.index.is_none() {
+            self.index = Some(self.build_index().ok()?);
+        }
+        Some(self)
+    }
+
+    fn set_raw_samples(&mut self, raw: bool) -> bool {
+        self.t.raw = raw;
+        true
+    }
 }
 
 fn map_codec(codec: &str) -> CodecId {
@@ -1301,6 +1574,7 @@ fn map_codec(codec: &str) -> CodecId {
         "V_VP8" => CodecId::Vp8,
         "V_MPEG4/ISO/AVC" => CodecId::H264,
         "V_MPEGH/ISO/HEVC" => CodecId::Hevc,
+        "V_PRORES" => CodecId::ProRes,
         "A_OPUS" => CodecId::Opus,
         "A_VORBIS" => CodecId::Vorbis,
         "A_AAC" => CodecId::Aac,
@@ -1456,7 +1730,14 @@ mod tests {
         let mut dem = MkvDemuxer::new(Box::new(Cursor::new(file)));
         let streams = dem.read_header().unwrap();
         assert_eq!(streams[0].codec_id, CodecId::H264);
-        assert!(streams[0].extradata.is_empty()); // normalised to Annex-B
+        // Packets are normalised to Annex-B, but since #114 `extradata` is the
+        // CodecPrivate `avcC` record (as in FFmpeg) rather than empty: rff's
+        // H.264 decoder ignores non-Annex-B extradata, the muxers take the
+        // in-band SPS/PPS first, and raw-sample callers need the record.
+        assert_eq!(
+            streams[0].extradata,
+            rff_format::avc::build_avcc_record(&[0x67, 0xAA, 0xBB], &[0x68, 0xCC])
+        );
         let p = dem.read_packet().unwrap();
         // Keyframe comes back with SPS/PPS prepended, then the slice.
         assert_eq!(p.data, sample);
@@ -2138,22 +2419,25 @@ mod tests {
     /// The subtitle cues (BlockGroups without a ReferenceBlock) of
     /// `subs_pcm` and `ass` are keyframes since #110, as in matroskadec;
     /// they were read as non-keyframes from the Block's (reserved) flag bit.
+    /// The H.264 streams of `h264` and `unknown_tail` carry their `avcC`
+    /// CodecPrivate as extradata since #114 (it was emptied before); only
+    /// their `S` line's `xd=` changed — every packet line is as it was.
     const GOLDENS: &[(&str, usize, u64)] = &[
         ("vp9_opus", 240, 0x96842ed96f2e9d29),
-        ("h264", 60, 0xbda95d370f6a1c36),
+        ("h264", 60, 0x5c4c27905a50d118),
         ("vorbis", 100, 0x67050340b1055ab7),
         ("subs_pcm", 132, 0x532373fc2f9794d2),
         ("ass", 5, 0xbc3d3d1b2ec401b4),
-        ("unknown_tail", 6, 0xc411396fdf4e6dd7),
-        ("h264-1", 60, 0xbda95d370f6a1c36),
+        ("unknown_tail", 6, 0xd01fa93bf003106a),
+        ("h264-1", 60, 0x5c4c27905a50d118),
         ("subs_pcm-1", 132, 0x532373fc2f9794d2),
-        ("h264-37", 60, 0xbda95d370f6a1c36),
+        ("h264-37", 60, 0x5c4c27905a50d118),
         ("subs_pcm-37", 132, 0x532373fc2f9794d2),
-        ("h264-500", 57, 0x944197e69bcc220c),
+        ("h264-500", 57, 0x6a00c1ca4dc63c2a),
         ("subs_pcm-500", 130, 0x24696c5276f8986d),
-        ("h264-2000", 52, 0x0db854153e912db1),
+        ("h264-2000", 52, 0x53ede276f7118153),
         ("subs_pcm-2000", 124, 0xa27e3647b5ea09ba),
-        ("h264-9000", 25, 0x3d86012f2d1caf9b),
+        ("h264-9000", 25, 0x40d4810173941e0d),
         ("subs_pcm-9000", 95, 0x3b6f23427d9c023e),
         ("ass@7", 0, 0xb88f458891534654),
         ("ass@68", 0, 0xb88f458891534654),
@@ -2172,25 +2456,25 @@ mod tests {
         ("unknown_tail@7", 0, 0xb88f458891534654),
         ("unknown_tail@68", 0, 0xb88f458891534654),
         ("unknown_tail@129", 0, 0x19e5d80fc8c27d2f),
-        ("unknown_tail@190", 0, 0xe16a82a06e5f72c7),
-        ("unknown_tail@251", 0, 0x794321a15a45a76a),
-        ("unknown_tail@312", 0, 0x1a3e72b070089f79),
-        ("unknown_tail@373", 0, 0x1a3e72b070089f79),
-        ("unknown_tail@434", 0, 0x1a3e72b070089f79),
-        ("unknown_tail@495", 0, 0x1a3e72b070089f79),
-        ("unknown_tail@556", 0, 0x1a3e72b070089f79),
-        ("unknown_tail@617", 0, 0x1a3e72b070089f79),
-        ("unknown_tail@678", 1, 0xe9af22a16a8307bd),
-        ("unknown_tail@739", 1, 0xe9af22a16a8307bd),
-        ("unknown_tail@800", 2, 0x769b56f7dc4d42ae),
-        ("unknown_tail@861", 2, 0x769b56f7dc4d42ae),
-        ("unknown_tail@922", 3, 0xb0138b7ec7bd1d1f),
-        ("unknown_tail@983", 3, 0xb0138b7ec7bd1d1f),
-        ("unknown_tail@1044", 3, 0xb0138b7ec7bd1d1f),
-        ("unknown_tail@1105", 3, 0xb0138b7ec7bd1d1f),
-        ("unknown_tail@1166", 4, 0x86f6fb2e149851b4),
-        ("unknown_tail@1227", 4, 0x86f6fb2e149851b4),
-        ("unknown_tail@1288", 5, 0xf6378f88235849f0),
+        ("unknown_tail@190", 0, 0x6d14f29c6c0d50a0),
+        ("unknown_tail@251", 0, 0x06be397d26729f81),
+        ("unknown_tail@312", 0, 0x21b4aa2bd797c46e),
+        ("unknown_tail@373", 0, 0x21b4aa2bd797c46e),
+        ("unknown_tail@434", 0, 0x21b4aa2bd797c46e),
+        ("unknown_tail@495", 0, 0x21b4aa2bd797c46e),
+        ("unknown_tail@556", 0, 0x21b4aa2bd797c46e),
+        ("unknown_tail@617", 0, 0x21b4aa2bd797c46e),
+        ("unknown_tail@678", 1, 0x824f1934c6a2a03a),
+        ("unknown_tail@739", 1, 0x824f1934c6a2a03a),
+        ("unknown_tail@800", 2, 0x8804c82d4fc6991f),
+        ("unknown_tail@861", 2, 0x8804c82d4fc6991f),
+        ("unknown_tail@922", 3, 0x004476e00daa4484),
+        ("unknown_tail@983", 3, 0x004476e00daa4484),
+        ("unknown_tail@1044", 3, 0x004476e00daa4484),
+        ("unknown_tail@1105", 3, 0x004476e00daa4484),
+        ("unknown_tail@1166", 4, 0xcb04512bc56ccc87),
+        ("unknown_tail@1227", 4, 0xcb04512bc56ccc87),
+        ("unknown_tail@1288", 5, 0x0b7c38dd90ea8a97),
     ];
 
     #[test]
