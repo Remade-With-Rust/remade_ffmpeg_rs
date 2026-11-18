@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-ogg-v0.5.0...rff-format-ogg-v0.6.0) - 2026-11-18
+
+### Fixed
+
+- *(ogg)* drop a final page cut short by end of input ([#118](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/118))
+
+### Other
+
+- rustfmt the Ogg and VP9 changes
+
 ## [0.4.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-ogg-v0.3.1...rff-format-ogg-v0.4.0) - 2026-10-24
 
 ### Fixed
