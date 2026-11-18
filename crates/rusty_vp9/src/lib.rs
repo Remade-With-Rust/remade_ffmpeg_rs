@@ -37,6 +37,7 @@ mod quant;
 mod scan_tables;
 mod token;
 mod transform;
+mod tune;
 
 /// Prometheus telemetry hooks — the coefficient-bin entropy tap for offline
 /// probability-law discovery by the private Prometheus refinery (CASC
@@ -900,7 +901,7 @@ fn split_superframe(data: &[u8]) -> Vec<Vec<u8>> {
 /// A/B switch for the frame-buffer pool (DEFAULT ON; set to disable).
 fn pool_disabled() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("VP9_NO_PLANE_POOL").is_ok())
+    *E.get_or_init(|| crate::tune::var("VP9_NO_PLANE_POOL").is_ok())
 }
 
 /// One decoded picture, cropped to its visible size.

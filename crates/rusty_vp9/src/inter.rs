@@ -549,7 +549,7 @@ fn gather_tile(
 #[cfg(target_arch = "x86_64")]
 fn no_edge_tile() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("VP9_NO_MC_EDGE_TILE").is_ok())
+    *E.get_or_init(|| crate::tune::var("VP9_NO_MC_EDGE_TILE").is_ok())
 }
 
 #[cfg(target_arch = "x86_64")]

@@ -18,5 +18,10 @@ rust-version = "1.85"
 # emit path. Off by default; the production build is byte-identical without
 # it, and byte-identical WITH it too — the tap only observes.
 prometheus-telemetry = []
+# Read the `VP9_*` experiment and diagnostic switches from the environment
+# (kernel A/B toggles, RD tuning knobs, probes, dumps). Off by default, so a
+# stray environment variable cannot change what an application exports
+# (#119); the measurement rigs build with it on.
+env-tuning = []
 
 [dependencies]

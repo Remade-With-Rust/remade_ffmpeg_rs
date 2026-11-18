@@ -758,7 +758,7 @@ fn iadst_1d(input: &[i32], output: &mut [i32]) {
 #[cfg(target_arch = "x86_64")]
 fn no_tx32_avx2() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("VP9_NO_TX32_AVX2").is_ok())
+    *E.get_or_init(|| crate::tune::var("VP9_NO_TX32_AVX2").is_ok())
 }
 
 /// A/B switch for the AVX2 16×16 column pass (DEFAULT ON; set to disable).
@@ -777,7 +777,7 @@ fn no_tx32_avx2() -> bool {
 #[cfg(target_arch = "x86_64")]
 fn no_tx16_avx2() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("VP9_NO_TX16_AVX2").is_ok())
+    *E.get_or_init(|| crate::tune::var("VP9_NO_TX16_AVX2").is_ok())
 }
 
 /// A/B switch for the AVX2 4×4 kernel, so its contribution is measurable on its
@@ -785,7 +785,7 @@ fn no_tx16_avx2() -> bool {
 #[cfg(target_arch = "x86_64")]
 fn no_tx4_avx2() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("VP9_NO_TX4_AVX2").is_ok())
+    *E.get_or_init(|| crate::tune::var("VP9_NO_TX4_AVX2").is_ok())
 }
 
 /// The constant an inverse DCT produces from a DC-only input, before the final
@@ -849,7 +849,7 @@ pub fn inverse_transform_add(
 #[cfg(target_arch = "x86_64")]
 fn gateprobe() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var_os("VP9_GATEPROBE").is_some())
+    *E.get_or_init(|| crate::tune::var_os("VP9_GATEPROBE").is_some())
 }
 
 /// Like [`inverse_transform_add`] but only the first `nz_rows` coefficient rows

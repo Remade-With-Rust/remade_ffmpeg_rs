@@ -123,7 +123,7 @@ fn enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var("VP9_DPROF").is_ok();
+            let on = crate::tune::var("VP9_DPROF").is_ok();
             ENABLED.store(on as u8, Relaxed);
             on
         }
