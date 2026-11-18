@@ -3144,10 +3144,83 @@ pub struct EncodedPacket {
     pub duration: u32,
 }
 
+/// Encoding tables a stream needs, built once from its rate and channels.
+struct Tables {
+    swb: &'static [u16],
+    swb_s: &'static [u16],
+    sine_s: Vec<f32>,
+    kbd_s: Vec<f32>,
+    per_channel: usize,
+    plan: Vec<Elem>,
+}
+
+/// The transient detector run a frame at a time, for streaming: the same rule
+/// as [`detect_transients`] (absolute guard) and [`detect_transients_relative`]
+/// (floor relative to the signal's mean sub-block energy). A stream does not
+/// know its whole clip's mean until the end, so the relative floor uses the
+/// mean of the sub-blocks seen so far, this frame's included. The absolute
+/// detector needs nothing ahead and gives the whole-clip flags exactly.
+#[derive(Clone, Default)]
+struct Detector {
+    avg: f64,
+    sum: f64,
+    count: u64,
+}
+
+impl Detector {
+    fn frame(&mut self, sub: &[f64; 8], f: usize, relative: bool) -> bool {
+        if relative {
+            self.sum += sub.iter().sum::<f64>();
+            self.count += 8;
+            let floor = (self.sum / self.count as f64 * 1e-3).max(f64::MIN_POSITIVE);
+            let mut amax = 1.0f32;
+            for &e in sub {
+                amax = amax.max((e / self.avg.max(floor)) as f32);
+                self.avg = 0.75 * self.avg + 0.25 * e;
+            }
+            f > 0 && amax > 10.0
+        } else {
+            let mut attack = 1.0f64;
+            for &e in sub {
+                if self.avg > 1e-3 {
+                    attack = attack.max(e / self.avg);
+                }
+                self.avg = 0.75 * self.avg + 0.25 * e;
+            }
+            f > 0 && attack > 10.0
+        }
+    }
+}
+
+/// [`AacEncoder::set_streaming`] state: what has been analysed and encoded.
+struct Streaming {
+    tables: Tables,
+    /// Per channel.
+    det: Vec<Detector>,
+    /// Per channel: each analysed frame's raw transient flag.
+    flags: Vec<Vec<bool>>,
+    /// Per element: each frame's final window sequence.
+    seqs: Vec<Vec<WindowSequence>>,
+    /// Per frame: KBD (true) or sine window shape.
+    shapes: Vec<bool>,
+    /// Frames whose transient flags are known.
+    analysed: usize,
+    /// The next frame to encode.
+    next: usize,
+}
+
 /// AAC-LC encoder. Push PCM with [`push_pcm`](AacEncoder::push_pcm) (or
 /// [`push_pcm_planar`](AacEncoder::push_pcm_planar)), call
 /// [`finish`](AacEncoder::finish), then drain [`next_packet`](AacEncoder::next_packet)
 /// until it returns [`Error::Eof`].
+///
+/// By default every frame is encoded inside `finish`, from a whole-clip
+/// analysis. [`set_streaming`](AacEncoder::set_streaming) encodes as the PCM
+/// arrives instead: packets come out of `next_packet` two frames behind the
+/// input, and memory stays at a few frames however long the stream is. The
+/// encoder's delay and padding, for an MP4 edit list, are
+/// [`priming_samples`](AacEncoder::priming_samples) and
+/// [`padding_samples`](AacEncoder::padding_samples).
 pub struct AacEncoder {
     sample_rate: u32,
     channels: usize,
@@ -3171,9 +3244,17 @@ pub struct AacEncoder {
     chans: Vec<Vec<f32>>,
     initialized: bool,
     /// Encoded raw access units (`raw_data_block`, no ADTS) awaiting `next_packet`,
-    /// each with its sample-domain PTS. Filled on `finish`.
+    /// each with its sample-domain PTS. Filled on `finish` (or as frames
+    /// complete, when streaming).
     queue: VecDeque<(Vec<u8>, i64)>,
     flushed: bool,
+    /// Samples pushed per channel.
+    total_in: u64,
+    /// Blocks dropped from the front of `chans` (streaming); `chans[c][0]` is
+    /// sample `base_block * FRAME_LEN` of the stream. 0 for a whole-clip encode.
+    base_block: usize,
+    streaming: bool,
+    stream: Option<Box<Streaming>>,
 }
 
 impl AacEncoder {
@@ -3200,7 +3281,54 @@ impl AacEncoder {
             initialized: false,
             queue: VecDeque::new(),
             flushed: false,
+            total_in: 0,
+            base_block: 0,
+            streaming: false,
+            stream: None,
         }
+    }
+
+    /// Encode as the PCM arrives instead of all at [`finish`](Self::finish):
+    /// after each push, every frame whose window decisions are final (two
+    /// frames behind the input) is encoded and queued for
+    /// [`next_packet`](Self::next_packet), and the samples behind it are
+    /// dropped. Memory stays at a few frames for a stream of any length.
+    ///
+    /// Call it before the first push; later calls are ignored. Differences
+    /// from the default whole-clip encode, which needs the clip's end:
+    /// the level-invariant transient detector (on by default) floors its
+    /// running average at the mean energy seen so far rather than the whole
+    /// clip's, so quiet openings can switch to short blocks at slightly
+    /// different frames; and [`WindowShape::Auto`] codes every frame with the
+    /// sine window. With `relative_transients: false` the packets are
+    /// byte-identical to the whole-clip encode.
+    pub fn set_streaming(&mut self, on: bool) {
+        if self.total_in == 0 && !self.flushed {
+            self.streaming = on;
+        }
+    }
+
+    /// Samples of encoder delay at the start of the decoded output: decoded
+    /// sample `t` is input sample `t - priming_samples()`. 1024 for AAC-LC (one
+    /// MDCT frame of overlap). The `media_time` of an MP4 edit list, and the
+    /// first number of an `iTunSMPB`.
+    #[must_use]
+    pub fn priming_samples(&self) -> u32 {
+        FRAME_LEN as u32
+    }
+
+    /// Samples of padding after the last input sample in the decoded output,
+    /// known once [`finish`](Self::finish) has run: the decoded stream is
+    /// `priming + input + padding` samples long, a whole number of 1024-sample
+    /// frames. The last number of an `iTunSMPB`; the edit list's segment
+    /// duration is the input length.
+    #[must_use]
+    pub fn padding_samples(&self) -> Option<u32> {
+        if !self.flushed || !self.initialized {
+            return None;
+        }
+        let n = self.total_in;
+        Some((n.div_ceil(FRAME_LEN as u64) * FRAME_LEN as u64 - n) as u32)
     }
 
     /// The stream's sample rate (0 until the first PCM is pushed).
@@ -3277,6 +3405,10 @@ impl AacEncoder {
                 );
             }
         }
+        self.total_in += n as u64;
+        if self.streaming {
+            self.stream_advance(false);
+        }
         Ok(())
     }
 
@@ -3288,8 +3420,18 @@ impl AacEncoder {
     /// As [`push_pcm`](Self::push_pcm).
     pub fn push_pcm_planar(&mut self, planes: &[&[f32]], sample_rate: u32) -> Result<()> {
         self.init(planes.len() as u16, sample_rate)?;
+        let n = planes
+            .iter()
+            .take(self.channels)
+            .map(|p| p.len())
+            .min()
+            .unwrap_or(0);
         for (c, plane) in planes.iter().enumerate().take(self.channels) {
-            self.chans[c].extend(plane.iter().map(|&x| sanitize(x)));
+            self.chans[c].extend(plane[..n].iter().map(|&x| sanitize(x)));
+        }
+        self.total_in += n as u64;
+        if self.streaming {
+            self.stream_advance(false);
         }
         Ok(())
     }
@@ -3302,7 +3444,7 @@ impl AacEncoder {
     /// it lies wholly inside it; only a block running past the end is built
     /// (zero-padded). Every frame used to copy four 4 KB blocks this way.
     fn block_cow(&self, ch: usize, b: usize) -> std::borrow::Cow<'_, [f32; FRAME_LEN]> {
-        let s = b * FRAME_LEN;
+        let s = (b - self.base_block) * FRAME_LEN;
         match self.chans[ch].get(s..s + FRAME_LEN) {
             Some(x) => std::borrow::Cow::Borrowed(x.try_into().expect("FRAME_LEN samples")),
             None => std::borrow::Cow::Owned(self.block(ch, b)),
@@ -3312,11 +3454,9 @@ impl AacEncoder {
     /// One block's samples for channel `ch` (zero-padded past the buffered input).
     fn block(&self, ch: usize, b: usize) -> [f32; FRAME_LEN] {
         let mut cur = [0f32; FRAME_LEN];
+        let at = (b - self.base_block) * FRAME_LEN;
         for (i, s) in cur.iter_mut().enumerate() {
-            *s = self.chans[ch]
-                .get(b * FRAME_LEN + i)
-                .copied()
-                .unwrap_or(0.0);
+            *s = self.chans[ch].get(at + i).copied().unwrap_or(0.0);
         }
         cur
     }
@@ -3543,6 +3683,136 @@ impl AacEncoder {
 
     /// Encode all buffered frames to raw access units. Frames are independent, so
     /// they fan out across worker threads (ffmpeg's AAC encoder is single-threaded).
+    fn tables(&self) -> Tables {
+        let frame_budget = (self.bitrate as usize * FRAME_LEN / self.sample_rate.max(1) as usize)
+            .saturating_sub(59);
+        Tables {
+            swb: swb_offsets(true, self.fs_index),
+            swb_s: swb_offsets(false, self.fs_index),
+            sine_s: crate::dsp::sine_window(SHORT_N),
+            kbd_s: crate::dsp::kbd_window(SHORT_N, 6.0),
+            per_channel: (frame_budget / self.channels.max(1))
+                .saturating_sub(7)
+                .min(MAX_CHANNEL_BITS),
+            plan: element_plan(self.channels).expect("channel count validated in init"),
+        }
+    }
+
+    /// Sub-block energies of frame `f` of channel `ch`, zero past the input.
+    fn sub_energies(&self, ch: usize, f: usize) -> [f64; 8] {
+        let chan = &self.chans[ch];
+        let at = (f - self.base_block) * FRAME_LEN;
+        std::array::from_fn(|sb| {
+            (0..SHORT_HALF)
+                .map(|i| {
+                    let x = f64::from(chan.get(at + sb * SHORT_HALF + i).copied().unwrap_or(0.0));
+                    x * x
+                })
+                .sum()
+        })
+    }
+
+    /// Streaming: analyse the frames now complete, finalise the window
+    /// sequences two frames behind them, encode those frames, and drop the
+    /// samples no later frame needs. `last` (from `finish`) analyses and
+    /// encodes everything, through the flush frame, as the whole-clip encode
+    /// does.
+    fn stream_advance(&mut self, last: bool) {
+        if !self.initialized {
+            return;
+        }
+        if self.stream.is_none() {
+            self.stream = Some(Box::new(Streaming {
+                tables: self.tables(),
+                det: vec![Detector::default(); self.channels],
+                flags: vec![Vec::new(); self.channels],
+                seqs: Vec::new(),
+                shapes: Vec::new(),
+                analysed: 0,
+                next: 0,
+            }));
+        }
+        let mut st = self.stream.take().expect("just set");
+        if st.seqs.is_empty() {
+            st.seqs = vec![Vec::new(); st.tables.plan.len()];
+        }
+        // Frames whose samples are all here (all of them, padded, at the end).
+        let held = self.base_block + self.chans[0].len() / FRAME_LEN;
+        let avail = if last {
+            (self.total_in as usize).div_ceil(FRAME_LEN) + 1
+        } else {
+            held
+        };
+        while st.analysed < avail {
+            let f = st.analysed;
+            for ch in 0..self.channels {
+                let sub = self.sub_energies(ch, f);
+                let flag = st.det[ch].frame(&sub, f, self.relative_transients);
+                st.flags[ch].push(flag);
+            }
+            st.shapes
+                .push(matches!(self.window_shape, WindowShape::Kbd));
+            st.analysed += 1;
+        }
+        // A frame's sequence depends on the transient flags up to two frames
+        // after it (a run's LongStart, a one-frame gap merged into the run).
+        let ready = if last {
+            st.analysed
+        } else {
+            st.analysed.saturating_sub(2)
+        };
+        for (e, elem) in st.tables.plan.iter().enumerate() {
+            let done = st.seqs[e].len();
+            if done >= ready {
+                continue;
+            }
+            // Four frames of left context make the window's start effects
+            // irrelevant to the frames finalised from it.
+            let w0 = done.saturating_sub(4);
+            let joint: Vec<bool> = (w0..st.analysed)
+                .map(|f| match *elem {
+                    Elem::Cpe(l, r) => st.flags[l][f] || st.flags[r][f],
+                    Elem::Sce(ch) => st.flags[ch][f],
+                    Elem::Lfe(_) => false,
+                })
+                .collect();
+            let seq = match *elem {
+                Elem::Lfe(_) => vec![WindowSequence::OnlyLong; joint.len()],
+                _ => assign_sequences(&joint),
+            };
+            st.seqs[e].extend_from_slice(&seq[done - w0..ready - w0]);
+        }
+        // Encode every frame whose sequence is final.
+        let t = &st.tables;
+        let out: Vec<(Vec<u8>, i64)> = (st.next..ready)
+            .map(|b| {
+                self.encode_frame(
+                    b,
+                    t.swb,
+                    t.swb_s,
+                    &t.sine_s,
+                    &t.kbd_s,
+                    &st.seqs,
+                    &st.shapes,
+                    t.per_channel,
+                    &t.plan,
+                )
+            })
+            .collect();
+        st.next = st.next.max(ready);
+        self.queue.extend(out);
+        // The next frame needs its previous block for the MDCT overlap.
+        let keep_from = st.next.saturating_sub(1).max(self.base_block);
+        let drop = keep_from - self.base_block;
+        if drop > 0 {
+            for chan in &mut self.chans {
+                chan.drain(..(drop * FRAME_LEN).min(chan.len()));
+            }
+            self.base_block = keep_from;
+        }
+        self.stream = Some(st);
+    }
+
     fn encode_stream(&self) -> Vec<(Vec<u8>, i64)> {
         let swb = swb_offsets(true, self.fs_index);
         let swb_s = swb_offsets(false, self.fs_index);
@@ -3643,13 +3913,17 @@ impl AacEncoder {
         }
         self.flushed = true;
         if self.initialized {
-            self.queue = self.encode_stream().into();
+            if self.streaming {
+                self.stream_advance(true);
+            } else {
+                self.queue = self.encode_stream().into();
+            }
         }
     }
 
-    /// Retrieve the next encoded access unit. Returns [`Error::Again`] before
-    /// [`finish`](AacEncoder::finish) has been called, and [`Error::Eof`] once
-    /// fully drained.
+    /// Retrieve the next encoded access unit. Returns [`Error::Again`] when
+    /// none is ready (before [`finish`](AacEncoder::finish), unless
+    /// streaming), and [`Error::Eof`] once fully drained.
     ///
     /// # Errors
     ///
