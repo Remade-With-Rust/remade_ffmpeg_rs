@@ -13,6 +13,8 @@
 //! This is a deliberately pragmatic subset: the common options people actually
 //! type. Unknown options are skipped with a warning rather than aborting, and
 //! the recognised set is easy to extend — add an arm to the match in [`parse`].
+//! A codec name is different: an unknown `-c` value is an error, because
+//! ignoring it would silently encode with something else.
 
 use std::path::PathBuf;
 
@@ -87,6 +89,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
     let mut audio_filters: Option<String> = None;
     let mut filter_complex: Option<String> = None;
     let mut maps: Vec<MapSpec> = Vec::new();
+    let mut disabled: Vec<MediaType> = Vec::new();
     let mut overwrite = false;
     let mut output_path: Option<PathBuf> = None;
     // Trim window: -ss (start), -t (duration), -to (absolute end).
@@ -164,7 +167,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                     &mut subtitle_codec,
                     &mut audio_sample_format,
                     &mut warnings,
-                );
+                )?;
             }
             "vcodec" => {
                 let name = take_value(args, &mut i, arg)?;
@@ -176,7 +179,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                     &mut subtitle_codec,
                     &mut audio_sample_format,
                     &mut warnings,
-                );
+                )?;
             }
             "acodec" => {
                 let name = take_value(args, &mut i, arg)?;
@@ -188,7 +191,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                     &mut subtitle_codec,
                     &mut audio_sample_format,
                     &mut warnings,
-                );
+                )?;
             }
             "scodec" => {
                 let name = take_value(args, &mut i, arg)?;
@@ -200,8 +203,15 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
                     &mut subtitle_codec,
                     &mut audio_sample_format,
                     &mut warnings,
-                );
+                )?;
             }
+
+            // Stream disabling: -vn / -an / -sn / -dn drop every video /
+            // audio / subtitle / data stream from the output, mapped or not.
+            "vn" => disabled.push(MediaType::Video),
+            "an" => disabled.push(MediaType::Audio),
+            "sn" => disabled.push(MediaType::Subtitle),
+            "dn" => disabled.push(MediaType::Data),
 
             // Stream selection: -map INPUT[:v|:a|:N] (repeatable).
             "map" => {
@@ -367,13 +377,12 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
             }
 
             // Anything else: accept gracefully. Best-effort consume a trailing
-            // value so we don't mistake it for the output path.
+            // value so we don't mistake it for the output path — but never the
+            // last argument, which is where the output path goes.
             _ => {
                 warnings.push(format!("unrecognized option `-{opt}` (ignored)"));
-                if let Some(next) = args.get(i + 1) {
-                    if !next.starts_with('-') {
-                        i += 1;
-                    }
+                if i + 2 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
                 }
             }
         }
@@ -463,6 +472,7 @@ pub fn parse(args: &[String]) -> Result<Cli, String> {
         filter_complex,
         max_video_frames,
         maps,
+        disabled,
         overwrite,
         trim_start,
         trim_end,
@@ -547,7 +557,9 @@ fn parse_rate(value: &str) -> Result<(u32, u32), String> {
 }
 
 /// Resolve a codec name to an id (treating `copy` as "no re-encode" → `None`)
-/// and assign it to the slot selected by the stream specifier.
+/// and assign it to the slot selected by the stream specifier. An unknown
+/// name is an error, as FFmpeg's "Unknown encoder" is: leaving the slot unset
+/// would stream-copy or default-encode instead of what the command names.
 #[allow(clippy::too_many_arguments)]
 fn apply_codec(
     spec: Option<&str>,
@@ -557,14 +569,15 @@ fn apply_codec(
     subtitle: &mut Option<CodecId>,
     audio_format: &mut Option<rff_core::SampleFormat>,
     warnings: &mut Vec<String>,
-) {
+) -> Result<(), String> {
     if name == "copy" {
         // Stream copy: leave the slot unset; the pipeline will passthrough.
-        return;
+        return Ok(());
     }
     let Some(id) = CodecId::from_name(name) else {
-        warnings.push(format!("unknown codec `{name}` (ignored)"));
-        return;
+        return Err(format!(
+            "unknown encoder `{name}` (`rff -codecs` lists the supported ones)"
+        ));
     };
     // `pcm_s16le` vs `pcm_f32le` differ only in the name; keep what it pins.
     let pinned = CodecId::sample_format_from_name(name);
@@ -593,5 +606,58 @@ fn apply_codec(
             _ => {}
         },
         _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output(args: &[&str]) -> (OutputSpec, Vec<String>) {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let cli = parse(&args).expect("parses");
+        let Action::Transcode(mut spec) = cli.action else {
+            panic!("expected a transcode");
+        };
+        (spec.outputs.remove(0), cli.warnings)
+    }
+
+    #[test]
+    fn vn_and_an_disable_stream_kinds() {
+        let (out, warnings) = output(&["-i", "src.mp4", "-vn", "-c:a", "opus", "out.m4a"]);
+        assert_eq!(out.disabled, vec![MediaType::Video]);
+        assert_eq!(out.path, PathBuf::from("out.m4a"));
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let (out, _) = output(&["-i", "src.mp4", "-c:v", "h264", "-an", "out.mp4"]);
+        assert_eq!(out.disabled, vec![MediaType::Audio]);
+        assert_eq!(out.path, PathBuf::from("out.mp4"));
+    }
+
+    #[test]
+    fn unknown_encoder_is_an_error_naming_it() {
+        for name in ["libsvtav1", "nonexistentcodec"] {
+            let args: Vec<String> = ["-i", "src.mp4", "-c:v", name, "out.mkv"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let err = parse(&args).err().expect("unknown encoder must fail");
+            assert!(err.contains(name), "{err}");
+        }
+        let (out, _) = output(&["-i", "src.mp4", "-c:v", "libx265", "out.mkv"]);
+        assert_eq!(out.video_codec.map(|c| c.codec), Some(CodecId::Hevc));
+        let (out, _) = output(&["-i", "src.mp4", "-c:v", "copy", "out.mkv"]);
+        assert!(out.video_codec.is_none());
+    }
+
+    #[test]
+    fn unknown_option_never_takes_the_output_path() {
+        let (out, warnings) = output(&["-i", "src.mp4", "-bogus", "out.mp4"]);
+        assert_eq!(out.path, PathBuf::from("out.mp4"));
+        assert_eq!(warnings.len(), 1);
+        // Still consumes a value that is not the last argument.
+        let (out, _) = output(&["-i", "src.mp4", "-pix_fmt", "yuv420p", "out.mp4"]);
+        assert_eq!(out.path, PathBuf::from("out.mp4"));
     }
 }

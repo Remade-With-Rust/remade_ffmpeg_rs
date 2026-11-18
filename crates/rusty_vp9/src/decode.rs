@@ -945,7 +945,7 @@ struct Plane {
 /// restore the conservative behaviour.
 fn zero_recycled() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("VP9_ZERO_RECYCLED").is_ok())
+    *E.get_or_init(|| crate::tune::var("VP9_ZERO_RECYCLED").is_ok())
 }
 
 impl Plane {

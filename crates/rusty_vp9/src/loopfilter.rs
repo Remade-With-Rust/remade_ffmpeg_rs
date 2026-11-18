@@ -376,7 +376,7 @@ mod scalar_ref {
 /// A/B switch for mask sharing (DEFAULT ON; set to rebuild per plane).
 fn no_mask_share() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("VP9_NO_LF_MASK_SHARE").is_ok())
+    *E.get_or_init(|| crate::tune::var("VP9_NO_LF_MASK_SHARE").is_ok())
 }
 
 /// The per-superblock loop-filter masks. Built once per (subsampling, SB) and

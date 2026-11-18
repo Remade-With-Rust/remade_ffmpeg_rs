@@ -160,6 +160,13 @@ pub trait Demuxer: Send {
 
     /// Read the next packet. Returns [`Error::Eof`] at end of input.
     fn read_packet(&mut self) -> Result<Packet>;
+
+    /// Name the streams the caller will drop: `discard[i]` is stream `i`.
+    /// Called after [`read_header`](Demuxer::read_header); a demuxer may then
+    /// skip those streams' packets without reading or converting them. It is
+    /// a hint: a demuxer that ignores it (the default) still returns them and
+    /// the caller drops them, so either way the kept packets are identical.
+    fn set_discard(&mut self, _discard: &[bool]) {}
 }
 
 /// Writes a container format: declare streams, write packets, finalize.

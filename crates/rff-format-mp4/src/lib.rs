@@ -592,7 +592,15 @@ impl Demuxer for Mp4Demuxer {
             Source::Random { reader, cur } => {
                 let off = loc.offset as u64;
                 if *cur != off {
-                    reader.seek(SeekFrom::Start(off))?;
+                    // A short hop (past a discarded stream's samples, or an
+                    // edit-list replay) stays inside the buffer; a plain seek
+                    // would throw it away and re-read what it already holds.
+                    match (i64::try_from(off), i64::try_from(*cur)) {
+                        (Ok(to), Ok(from)) => reader.seek_relative(to - from)?,
+                        _ => {
+                            reader.seek(SeekFrom::Start(off))?;
+                        }
+                    }
                 }
                 // Read what is there, never a declared size up front: a
                 // corrupt `stsz` must not become a giant allocation.
@@ -640,6 +648,17 @@ impl Demuxer for Mp4Demuxer {
         packet.duration = loc.duration;
         packet.flags.keyframe = loc.keyframe;
         Ok(packet)
+    }
+
+    /// Drop the discarded streams' samples still to be read, so they are
+    /// never fetched from the file or converted.
+    fn set_discard(&mut self, discard: &[bool]) {
+        let pos = self.pos;
+        let mut i = 0;
+        self.samples.retain(|s| {
+            i += 1;
+            i <= pos || !discard.get(s.stream_index).copied().unwrap_or(false)
+        });
     }
 }
 
@@ -1956,6 +1975,10 @@ struct TimingPlan {
     start: i64,
     /// Presentation length, from `start` to the end of the last frame shown.
     presentation: u64,
+    /// When the first frame is shown, on the track's own timeline (0 when
+    /// frames are timed from 0 or before it). [`build_moov`] delays the track
+    /// by how much later this is than the earliest track's, as an empty edit.
+    shown_from: i64,
 }
 
 /// A track's `stts`/`ctts`/`elst`, as FFmpeg's movenc derives them: `stts`
@@ -1982,6 +2005,7 @@ fn timing_plan(t: &TrackOut) -> TimingPlan {
             offsets: Vec::new(),
             start: 0,
             presentation,
+            shown_from: 0,
         };
     }
     let timescale = pick_timescale(&t.stream);
@@ -1995,6 +2019,7 @@ fn timing_plan(t: &TrackOut) -> TimingPlan {
             offsets: Vec::new(),
             start: 0,
             presentation,
+            shown_from: t.pts.iter().flatten().min().copied().unwrap_or(0).max(0),
         };
     };
     let durations = sample_durations(
@@ -2029,6 +2054,7 @@ fn timing_plan(t: &TrackOut) -> TimingPlan {
         offsets,
         start,
         presentation,
+        shown_from: first_shown,
     }
 }
 
@@ -2079,11 +2105,23 @@ fn build_moov(tracks: &[TrackOut], plans: &[TimingPlan], tmcd: &[TmcdOut]) -> Ve
     let movie_dur_of = |plan: &TimingPlan| {
         (plan.presentation * movie_timescale as u64 / plan.timescale.max(1) as u64) as u32
     };
+    // A track whose first frame is shown after the others' starts that much
+    // into the movie, behind an empty edit (#115). Measured from the earliest
+    // track rather than from 0, as ffmpeg measures from the file's start time,
+    // so streams that all begin at 10 s are not given 10 s of nothing.
+    let shown_ms: Vec<i64> = plans
+        .iter()
+        .map(|p| {
+            p.shown_from.saturating_mul(movie_timescale as i64) / i64::from(p.timescale.max(1))
+        })
+        .collect();
+    let movie_start = shown_ms.iter().copied().min().unwrap_or(0);
     for (t, track) in tracks.iter().enumerate() {
         let plan = &plans[t];
         let media_dur: u64 = plan.durations.iter().map(|&d| d as u64).sum();
         let movie_dur = movie_dur_of(plan);
-        max_movie_dur = max_movie_dur.max(movie_dur);
+        let delay = u32::try_from(shown_ms[t] - movie_start).unwrap_or(u32::MAX);
+        max_movie_dur = max_movie_dur.max(movie_dur.saturating_add(delay));
         let tmcd_ref = tmcd
             .iter()
             .position(|m| m.media == t)
@@ -2092,8 +2130,7 @@ fn build_moov(tracks: &[TrackOut], plans: &[TimingPlan], tmcd: &[TmcdOut]) -> Ve
             track,
             (t + 1) as u32,
             plan,
-            media_dur as u32,
-            movie_dur,
+            (media_dur as u32, movie_dur, delay),
             tmcd_ref,
         ));
     }
@@ -2587,7 +2624,13 @@ fn build_trak(
     media_duration: u32,
     movie_duration: u32,
 ) -> Vec<u8> {
-    build_trak_with(track, track_id, plan, media_duration, movie_duration, None)
+    build_trak_with(
+        track,
+        track_id,
+        plan,
+        (media_duration, movie_duration, 0),
+        None,
+    )
 }
 
 /// A media `hdlr`: QuickTime's (`mhlr` component, Pascal-string name) or
@@ -2610,23 +2653,25 @@ fn build_hdlr(handler: &[u8; 4], name: &str, qt: bool) -> Vec<u8> {
 }
 
 /// [`build_trak`], with the id of the timecode track this one references.
+/// `durations` is `(media, movie, delay)`: the media length in the track's
+/// timescale, the presentation length and the empty-edit delay before it in
+/// the movie timescale.
 fn build_trak_with(
     track: &TrackOut,
     track_id: u32,
     plan: &TimingPlan,
-    media_duration: u32,
-    movie_duration: u32,
+    (media_duration, movie_duration, delay): (u32, u32, u32),
     tmcd_ref: Option<u32>,
 ) -> Vec<u8> {
     let s = &track.stream;
 
-    // tkhd — duration is in the *movie* timescale.
+    // tkhd — duration is in the *movie* timescale: the sum of the edits.
     let mut tk = Vec::new();
     pu32(&mut tk, 0);
     pu32(&mut tk, 0); // creation, modification
     pu32(&mut tk, track_id);
     pu32(&mut tk, 0); // reserved
-    pu32(&mut tk, movie_duration);
+    pu32(&mut tk, movie_duration.saturating_add(delay));
     pu32(&mut tk, 0);
     pu32(&mut tk, 0); // reserved
     pu16(&mut tk, 0); // layer
@@ -2669,17 +2714,28 @@ fn build_trak_with(
     let minf = bx(b"minf", &[media_header, dinf, stbl].concat());
 
     let mdia = bx(b"mdia", &[mdhd, hdlr, minf].concat());
-    // edts/elst: one edit that starts presentation `plan.start` into the
-    // media, so a B-frame stream's reorder delay is not shown as a gap.
-    let edts = if plan.start > 0 {
-        let mut el = Vec::new();
-        pu32(&mut el, 1); // entry_count
-        pu32(&mut el, movie_duration); // segment_duration (movie timescale)
-        pu32(&mut el, plan.start.min(i64::from(i32::MAX)) as u32); // media_time
-        pu32(&mut el, 0x0001_0000); // media_rate 1.0
-        bx(b"edts", &fbx(b"elst", 0, 0, &el))
-    } else {
+    // edts/elst, as movenc writes it: an empty edit (media_time -1) for a
+    // track shown after the movie starts, then one edit that starts
+    // presentation `plan.start` into the media, so a B-frame stream's reorder
+    // delay is not shown as a gap.
+    let mut edits: Vec<(u32, u32)> = Vec::new(); // (segment_duration, media_time)
+    if delay > 0 {
+        edits.push((delay, u32::MAX));
+    }
+    if delay > 0 || plan.start > 0 {
+        edits.push((movie_duration, plan.start.min(i64::from(i32::MAX)) as u32));
+    }
+    let edts = if edits.is_empty() {
         Vec::new()
+    } else {
+        let mut el = Vec::new();
+        pu32(&mut el, edits.len() as u32); // entry_count
+        for (segment, media_time) in edits {
+            pu32(&mut el, segment); // segment_duration (movie timescale)
+            pu32(&mut el, media_time);
+            pu32(&mut el, 0x0001_0000); // media_rate 1.0
+        }
+        bx(b"edts", &fbx(b"elst", 0, 0, &el))
     };
     let tref = match tmcd_ref {
         Some(id) => bx(b"tref", &bx(b"tmcd", &id.to_be_bytes())),
@@ -4324,5 +4380,117 @@ mod tests {
             .map(|(i, &p)| (i as u8, p, p))
             .collect();
         assert_eq!(got, want);
+    }
+
+    /// An AV1 track at 1/1000 shown from `video_ms` and an Opus track at
+    /// 1/48000 shown from `audio_ticks`, through `mux`. `bframes` times the
+    /// video in decode order I P B B with dts one frame before the first pts.
+    fn feed_delayed(mux: &mut dyn Muxer, video_ms: i64, audio_ticks: i64, bframes: bool) {
+        let mut vs = Stream::new(0, CodecId::Avif);
+        vs.media_type = MediaType::Video;
+        vs.width = 8;
+        vs.height = 8;
+        vs.time_base = Rational::new(1, 1000);
+        let mut as_ = Stream::new(1, CodecId::Opus);
+        as_.media_type = MediaType::Audio;
+        as_.channels = 1;
+        as_.sample_rate = 48_000;
+        as_.time_base = Rational::new(1, 48_000);
+        mux.write_header(&[vs, as_]).unwrap();
+        let order: [i64; 4] = if bframes { [0, 3, 1, 2] } else { [0, 1, 2, 3] };
+        for (n, &k) in order.iter().enumerate() {
+            let mut data = if n == 0 {
+                vec![0x0A, 0x03, 0, 0, 0]
+            } else {
+                Vec::new()
+            };
+            data.push(n as u8);
+            let mut p = Packet::from_data(0, data);
+            p.pts = Some(video_ms + 40 * k);
+            p.dts = Some(video_ms + 40 * n as i64 - if bframes { 40 } else { 0 });
+            p.flags.keyframe = n == 0;
+            mux.write_packet(&p).unwrap();
+        }
+        for n in 0..10i64 {
+            let mut p = Packet::from_data(1, vec![n as u8; 4]);
+            p.pts = Some(audio_ticks + 960 * n);
+            p.dts = p.pts;
+            p.flags.keyframe = true;
+            mux.write_packet(&p).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+
+    /// The video `elst` entries as `(segment_duration, media_time)`, and
+    /// the `tkhd` duration, of the first track in `file`.
+    fn video_edits(file: &[u8]) -> (Vec<(u32, i32)>, u32) {
+        let tkhd = file.windows(4).position(|w| w == b"tkhd").expect("tkhd");
+        let duration = be32(file, tkhd + 4 + 4 + 16);
+        let next_trak = tkhd
+            + file[tkhd..]
+                .windows(4)
+                .position(|w| w == b"trak")
+                .expect("trak");
+        let Some(elst) = file[..next_trak].windows(4).position(|w| w == b"elst") else {
+            return (Vec::new(), duration);
+        };
+        let at = elst + 8;
+        let edits = (0..be32(file, at) as usize)
+            .map(|k| {
+                (
+                    be32(file, at + 4 + 12 * k),
+                    be32(file, at + 8 + 12 * k) as i32,
+                )
+            })
+            .collect();
+        (edits, duration)
+    }
+
+    /// #115: a video track starting 500 ms after the audio keeps its start
+    /// delay through a remux -- an empty edit then the media, as movenc
+    /// writes it -- in both the piped and the seekable muxer.
+    #[test]
+    fn a_start_delay_is_written_as_an_empty_edit() {
+        let piped = |v, a, b| {
+            let sink = SharedBuf(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+            feed_delayed(&mut Mp4Muxer::new(Box::new(sink.clone())), v, a, b);
+            let file = sink.0.lock().unwrap().clone();
+            file
+        };
+        let seekable = |v, a, b| {
+            let sink = SharedCursor::default();
+            feed_delayed(&mut Mp4StreamMuxer::new(Box::new(sink.clone())), v, a, b);
+            let file = sink.0.lock().unwrap().get_ref().clone();
+            file
+        };
+        for mux in [&piped as &dyn Fn(i64, i64, bool) -> Vec<u8>, &seekable] {
+            let file = mux(500, 0, false);
+            assert_eq!(video_edits(&file), (vec![(500, -1), (160, 0)], 660));
+            let shown: Vec<(u8, i64, i64)> = timed_packets(file.clone(), 0);
+            assert_eq!(
+                (shown[0].1, shown[0].2),
+                (500, 500),
+                "the first frame stays at 500 ms"
+            );
+            assert_eq!(
+                timed_packets(file, 1)[0].1,
+                0,
+                "the audio still starts at 0"
+            );
+
+            // Reordered frames: the delay comes first, then the edit hiding
+            // the reorder depth.
+            let file = mux(500, 0, true);
+            assert_eq!(video_edits(&file), (vec![(500, -1), (160, 40)], 660));
+            let pts: Vec<i64> = timed_packets(file, 0).iter().map(|p| p.1).collect();
+            assert_eq!(pts, [500, 620, 540, 580]);
+
+            // Every track starting at 10 s is the file's start, not a delay.
+            let file = mux(10_000, 480_000, false);
+            assert_eq!(video_edits(&file), (vec![], 160));
+            // ...but a track 500 ms behind the others still is.
+            let file = mux(10_500, 480_000, false);
+            assert_eq!(video_edits(&file).0, [(500, -1), (160, 0)]);
+        }
     }
 }
