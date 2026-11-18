@@ -1016,6 +1016,13 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     if !output.metadata.is_empty() {
         muxer.set_metadata(&output.metadata);
     }
+    // Format options (`-movflags +faststart`) reach byte-sink muxers too; a
+    // path muxer already took them in its factory.
+    if muxer_path_factory.is_none() {
+        for (key, value) in output.format_options.iter() {
+            muxer.set_option(key, value);
+        }
+    }
     muxer.write_header(&out_streams)?;
 
     let mut report = TranscodeReport::default();

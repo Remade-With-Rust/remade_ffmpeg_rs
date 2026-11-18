@@ -1881,6 +1881,8 @@ struct TrackOut {
     /// entry here (its duration in frames), and `stsz`/`stts`/`stsc` are
     /// written per PCM frame, as QuickTime and ISO both count them.
     pcm: Option<entry::PcmOut>,
+    /// [`Muxer::set_edit_list`]: written instead of the derived edit list.
+    edits: Option<Vec<EditEntry>>,
 }
 
 impl TrackOut {
@@ -1896,6 +1898,7 @@ impl TrackOut {
             chunks: Vec::new(),
             qt: false,
             pcm: None,
+            edits: None,
         }
     }
 
@@ -2320,8 +2323,20 @@ fn build_moov(tracks: &[TrackOut], plans: &[TimingPlan], tmcd: &[TmcdOut]) -> Ve
         let plan = &plans[t];
         let media_dur: u64 = plan.durations.iter().map(|&d| d as u64).sum();
         let movie_dur = movie_dur_of(plan);
-        let delay = u32::try_from(shown_ms[t] - movie_start).unwrap_or(u32::MAX);
-        max_movie_dur = max_movie_dur.max(movie_dur.saturating_add(delay));
+        let delay = if track.edits.is_some() {
+            0
+        } else {
+            u32::try_from(shown_ms[t] - movie_start).unwrap_or(u32::MAX)
+        };
+        let shown = match &track.edits {
+            Some(e) => e
+                .iter()
+                .map(|x| x.segment_duration.max(0))
+                .sum::<i64>()
+                .min(i64::from(u32::MAX)) as u32,
+            None => movie_dur.saturating_add(delay),
+        };
+        max_movie_dur = max_movie_dur.max(shown);
         let tmcd_ref = tmcd
             .iter()
             .position(|m| m.media == t)
@@ -2367,6 +2382,10 @@ type BufPacket = (usize, Vec<u8>, bool, Option<i64>, Option<i64>);
 struct Mp4Muxer {
     out: Output,
     flavor: Flavor,
+    /// `movflags=+faststart`: `moov` before `mdat`.
+    faststart: bool,
+    /// [`Muxer::set_edit_list`] calls, applied once the tracks exist.
+    edits: Vec<(usize, Vec<EditEntry>)>,
     /// Resolved in [`write_header`](Muxer::write_header): an unmappable codec
     /// is rejected before a single byte is written, and by construction there
     /// is no path that reaches the box writer without a real fourcc.
@@ -2384,8 +2403,147 @@ impl Mp4Muxer {
         Mp4Muxer {
             out,
             flavor,
+            faststart: false,
+            edits: Vec::new(),
             tracks: Vec::new(),
             packets: Vec::new(),
+        }
+    }
+}
+
+/// Whether a `movflags` value turns `faststart` on (`+faststart`,
+/// `faststart`, `+frag_keyframe+faststart`, ...).
+fn wants_faststart(key: &str, value: &str) -> Option<bool> {
+    (key == "movflags").then(|| {
+        value
+            .split('+')
+            .chain(std::iter::once(""))
+            .any(|f| f.trim() == "faststart")
+    })
+}
+
+/// Write a whole buffered movie: `ftyp`, then `mdat` and `moov` (or, with
+/// `faststart`, `moov` first, its chunk offsets past itself), samples
+/// interleaved by decode time. `start` is where the sink stands (chunk
+/// offsets are absolute). Shared by the pipe muxer and the seekable muxer's
+/// faststart mode.
+fn write_buffered<W: Write + ?Sized>(
+    out: &mut W,
+    start: u64,
+    flavor: Flavor,
+    faststart: bool,
+    tracks: &mut [TrackOut],
+    packets: Vec<BufPacket>,
+) -> Result<()> {
+    // --- Per-track: gather samples (H.264 → AVCC + avcC; else as-is) ---
+    let mut data: Vec<Vec<Vec<u8>>> = vec![Vec::new(); tracks.len()];
+    let mut scratch = Vec::new();
+    for (idx, bytes, keyframe, pts, dts) in packets {
+        let Some(track) = tracks.get_mut(idx) else {
+            continue;
+        };
+        let sample = track.sample_bytes(&bytes, &mut scratch);
+        track.push_sample(sample.len(), keyframe, pts, dts)?;
+        data[idx].push(sample.to_vec());
+    }
+    require_configs(tracks)?;
+    let plans: Vec<TimingPlan> = tracks.iter().map(timing_plan).collect();
+
+    // --- interleave: order every sample by decode time across all tracks ---
+    let mut entries: Vec<(f64, usize, usize)> = Vec::new(); // (start_s, track, local)
+    for (t, samples) in data.iter().enumerate() {
+        let ts = plans[t].timescale.max(1) as f64;
+        let mut acc = 0i64;
+        for i in 0..samples.len() {
+            entries.push((acc as f64 / ts, t, i));
+            acc += plans[t].durations[i] as i64;
+        }
+    }
+    entries.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let ftyp = flavor.ftyp();
+    let timecoded = timecode_tracks(tracks);
+    let body_len: u64 =
+        data.iter().flatten().map(|d| d.len() as u64).sum::<u64>() + 4 * timecoded.len() as u64;
+    let mdat_header = match u32::try_from(body_len + 8) {
+        Ok(size) => [&size.to_be_bytes()[..], b"mdat"].concat(),
+        Err(_) => [
+            &1u32.to_be_bytes()[..],
+            b"mdat",
+            &(body_len + 16).to_be_bytes(),
+        ]
+        .concat(),
+    };
+    // Lay the samples out from `base`, then build `moov` over that layout.
+    let layout = |tracks: &mut [TrackOut], base: u64| -> Vec<u8> {
+        let mut off = base;
+        let mut prev: Option<usize> = None;
+        for t in tracks.iter_mut() {
+            t.chunks.clear();
+        }
+        for &(_, t, i) in &entries {
+            tracks[t].place(off, prev == Some(t));
+            off += data[t][i].len() as u64;
+            prev = Some(t);
+        }
+        // Timecode samples go last in `mdat`, 4 bytes each.
+        let tmcd: Vec<TmcdOut> = timecoded
+            .iter()
+            .enumerate()
+            .map(|(k, &media)| TmcdOut {
+                media,
+                offset: off + 4 * k as u64,
+            })
+            .collect();
+        build_moov(tracks, &plans, &tmcd)
+    };
+    let head = start + (ftyp.len() + mdat_header.len()) as u64;
+    let moov = if faststart {
+        // `moov` first: its size moves every chunk offset, and an offset
+        // past 4 GiB can switch a track to `co64` and change that size, so
+        // lay out until it is stable (twice, or three times at most).
+        let mut moov = layout(tracks, head);
+        for _ in 0..3 {
+            let next = layout(tracks, head + moov.len() as u64);
+            let stable = next.len() == moov.len();
+            moov = next;
+            if stable {
+                break;
+            }
+        }
+        moov
+    } else {
+        layout(tracks, head)
+    };
+
+    out.write_all(&ftyp)?;
+    if faststart {
+        out.write_all(&moov)?;
+    }
+    out.write_all(&mdat_header)?;
+    for &(_, t, i) in &entries {
+        out.write_all(&data[t][i])?;
+    }
+    for &media in &timecoded {
+        let start = tracks[media]
+            .stream
+            .timecode
+            .as_ref()
+            .map_or(0, |tc| tc.start_frame);
+        out.write_all(&start.to_be_bytes())?;
+    }
+    if !faststart {
+        out.write_all(&moov)?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// Apply [`Muxer::set_edit_list`] calls to the tracks.
+fn apply_edits(tracks: &mut [TrackOut], edits: &mut Vec<(usize, Vec<EditEntry>)>) {
+    for (s, e) in edits.drain(..) {
+        if let Some(t) = tracks.get_mut(s) {
+            t.edits = Some(e);
         }
     }
 }
@@ -2407,86 +2565,32 @@ impl Muxer for Mp4Muxer {
         Ok(())
     }
 
-    fn write_trailer(&mut self) -> Result<()> {
-        let tracks = &mut self.tracks;
-        // --- Per-track: gather samples (H.264 → AVCC + avcC; else as-is) ---
-        let mut data: Vec<Vec<Vec<u8>>> = vec![Vec::new(); tracks.len()];
-        let mut scratch = Vec::new();
-        for (idx, bytes, keyframe, pts, dts) in std::mem::take(&mut self.packets) {
-            let Some(track) = tracks.get_mut(idx) else {
-                continue;
-            };
-            let sample = track.sample_bytes(&bytes, &mut scratch);
-            track.push_sample(sample.len(), keyframe, pts, dts)?;
-            data[idx].push(sample.to_vec());
-        }
-        require_configs(tracks)?;
-        let plans: Vec<TimingPlan> = tracks.iter().map(timing_plan).collect();
-
-        // --- interleave: order every sample by decode time across all tracks ---
-        // decode time = cumulative duration / timescale (seconds). A *stable* sort
-        // keeps each track's samples in order; ties fall back to track order.
-        let mut entries: Vec<(f64, usize, usize)> = Vec::new(); // (start_s, track, local)
-        for (t, samples) in data.iter().enumerate() {
-            let ts = plans[t].timescale.max(1) as f64;
-            let mut acc = 0i64;
-            for i in 0..samples.len() {
-                entries.push((acc as f64 / ts, t, i));
-                acc += plans[t].durations[i] as i64;
+    fn set_option(&mut self, key: &str, value: &str) -> bool {
+        match wants_faststart(key, value) {
+            Some(on) => {
+                self.faststart = on;
+                true
             }
+            None => false,
         }
-        entries.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    }
 
-        // --- mdat: samples interleaved; each track's contiguous runs are its
-        // chunks (offset, sample_count) for stco/stsc. A payload too big for a
-        // 32-bit box size takes the 64-bit `largesize` header. ---
-        let ftyp = self.flavor.ftyp();
-        let timecoded = timecode_tracks(tracks);
-        let body_len: u64 =
-            data.iter().flatten().map(|d| d.len() as u64).sum::<u64>() + 4 * timecoded.len() as u64;
-        let mdat_header = match u32::try_from(body_len + 8) {
-            Ok(size) => [&size.to_be_bytes()[..], b"mdat"].concat(),
-            Err(_) => [
-                &1u32.to_be_bytes()[..],
-                b"mdat",
-                &(body_len + 16).to_be_bytes(),
-            ]
-            .concat(),
-        };
-        let mut off = (ftyp.len() + mdat_header.len()) as u64;
-        let mut prev: Option<usize> = None;
-        for &(_, t, i) in &entries {
-            tracks[t].place(off, prev == Some(t));
-            off += data[t][i].len() as u64;
-            prev = Some(t);
-        }
-        // Timecode samples go last in `mdat`, 4 bytes each.
-        let tmcd: Vec<TmcdOut> = timecoded
-            .iter()
-            .enumerate()
-            .map(|(k, &media)| TmcdOut {
-                media,
-                offset: off + 4 * k as u64,
-            })
-            .collect();
-        let moov = build_moov(tracks, &plans, &tmcd);
+    fn set_edit_list(&mut self, stream: usize, edits: &[EditEntry]) -> bool {
+        self.edits.push((stream, edits.to_vec()));
+        true
+    }
 
-        self.out.write_all(&ftyp)?;
-        self.out.write_all(&mdat_header)?;
-        for &(_, t, i) in &entries {
-            self.out.write_all(&data[t][i])?;
-        }
-        for &media in &timecoded {
-            let start = tracks[media]
-                .stream
-                .timecode
-                .as_ref()
-                .map_or(0, |tc| tc.start_frame);
-            self.out.write_all(&start.to_be_bytes())?;
-        }
-        self.out.write_all(&moov)?;
-        self.out.flush()?;
-        Ok(())
+    fn write_trailer(&mut self) -> Result<()> {
+        apply_edits(&mut self.tracks, &mut self.edits);
+        let packets = std::mem::take(&mut self.packets);
+        write_buffered(
+            &mut *self.out,
+            0,
+            self.flavor,
+            self.faststart,
+            &mut self.tracks,
+            packets,
+        )
     }
 }
 
@@ -2510,6 +2614,12 @@ impl Muxer for Mp4Muxer {
 struct Mp4StreamMuxer {
     out: SeekOutput,
     flavor: Flavor,
+    /// `movflags=+faststart`: `moov` must precede `mdat`, which a write-only
+    /// output cannot rearrange afterwards, so the packets are held and the
+    /// movie is written whole at the trailer (memory: the whole output).
+    faststart: bool,
+    held: Vec<BufPacket>,
+    edits: Vec<(usize, Vec<EditEntry>)>,
     tracks: Vec<TrackOut>,
     /// H.264 sample conversion buffer, reused across packets.
     scratch: Vec<u8>,
@@ -2534,6 +2644,9 @@ impl Mp4StreamMuxer {
         Mp4StreamMuxer {
             out,
             flavor,
+            faststart: false,
+            held: Vec::new(),
+            edits: Vec::new(),
             tracks: Vec::new(),
             scratch: Vec::new(),
             last_track: None,
@@ -2569,11 +2682,32 @@ fn finish_mdat<W: Write + Seek + ?Sized>(out: &mut W, slot: u64, end: u64) -> st
 }
 
 impl Muxer for Mp4StreamMuxer {
+    fn set_option(&mut self, key: &str, value: &str) -> bool {
+        match wants_faststart(key, value) {
+            Some(on) if self.mdat_slot.is_none() => {
+                self.faststart = on;
+                true
+            }
+            Some(_) => false,
+            None => false,
+        }
+    }
+
+    fn set_edit_list(&mut self, stream: usize, edits: &[EditEntry]) -> bool {
+        self.edits.push((stream, edits.to_vec()));
+        true
+    }
+
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
         if self.mdat_slot.is_some() {
             return Err(Error::invalid("mp4 mux: header already written"));
         }
         self.tracks = new_tracks(streams, self.flavor)?;
+        if self.faststart {
+            // Nothing is written until the trailer; mark the header done.
+            self.mdat_slot = Some(0);
+            return Ok(());
+        }
         // Offsets are absolute, so start from wherever the sink is.
         let start = self.out.stream_position()?;
         let ftyp = self.flavor.ftyp();
@@ -2588,6 +2722,16 @@ impl Muxer for Mp4StreamMuxer {
     fn write_packet(&mut self, packet: &Packet) -> Result<()> {
         if self.mdat_slot.is_none() || self.finished {
             return Err(Error::invalid("mp4 mux: packet outside header..trailer"));
+        }
+        if self.faststart {
+            self.held.push((
+                packet.stream_index,
+                packet.data.clone(),
+                packet.is_keyframe(),
+                packet.pts,
+                packet.dts,
+            ));
+            return Ok(());
         }
         let t = packet.stream_index;
         let Some(track) = self.tracks.get_mut(t) else {
@@ -2609,6 +2753,21 @@ impl Muxer for Mp4StreamMuxer {
         let slot = self
             .mdat_slot
             .ok_or_else(|| Error::invalid("mp4 mux: trailer before header"))?;
+        apply_edits(&mut self.tracks, &mut self.edits);
+        if self.faststart {
+            let held = std::mem::take(&mut self.held);
+            let start = self.out.stream_position()?;
+            write_buffered(
+                &mut *self.out,
+                start,
+                self.flavor,
+                true,
+                &mut self.tracks,
+                held,
+            )?;
+            self.finished = true;
+            return Ok(());
+        }
         require_configs(&mut self.tracks)?;
         let plans: Vec<TimingPlan> = self.tracks.iter().map(timing_plan).collect();
         // Timecode samples close `mdat`, 4 bytes each.
@@ -2884,7 +3043,15 @@ fn build_trak_with(
     pu32(&mut tk, 0); // creation, modification
     pu32(&mut tk, track_id);
     pu32(&mut tk, 0); // reserved
-    pu32(&mut tk, movie_duration.saturating_add(delay));
+    let presented = match &track.edits {
+        Some(e) => e
+            .iter()
+            .map(|x| x.segment_duration.max(0))
+            .sum::<i64>()
+            .min(i64::from(u32::MAX)) as u32,
+        None => movie_duration.saturating_add(delay),
+    };
+    pu32(&mut tk, presented);
     pu32(&mut tk, 0);
     pu32(&mut tk, 0); // reserved
     pu16(&mut tk, 0); // layer
@@ -2938,7 +3105,9 @@ fn build_trak_with(
     if delay > 0 || plan.start > 0 {
         edits.push((movie_duration, plan.start.min(i64::from(i32::MAX)) as u32));
     }
-    let edts = if edits.is_empty() {
+    let edts = if let Some(custom) = &track.edits {
+        custom_elst(custom, &track.stream, plan.timescale)
+    } else if edits.is_empty() {
         Vec::new()
     } else {
         let mut el = Vec::new();
@@ -2955,6 +3124,47 @@ fn build_trak_with(
         None => Vec::new(),
     };
     bx(b"trak", &[tkhd, edts, tref, mdia].concat())
+}
+
+/// `edts` for a caller's edit list ([`Muxer::set_edit_list`]): media times
+/// from the stream's time base into the track's, version 1 when a value needs
+/// 64 bits. An empty list writes no `edts`.
+fn custom_elst(edits: &[EditEntry], stream: &Stream, timescale: u32) -> Vec<u8> {
+    if edits.is_empty() {
+        return Vec::new();
+    }
+    let tb = stream.time_base;
+    let media = |t: i64| {
+        if t < 0 {
+            -1
+        } else {
+            rescale(
+                t.saturating_mul(i64::from(tb.num)),
+                i64::from(timescale),
+                i64::from(tb.den.max(1)),
+            )
+        }
+    };
+    let rows: Vec<(i64, i64, i32)> = edits
+        .iter()
+        .map(|e| (e.segment_duration.max(0), media(e.media_time), e.media_rate))
+        .collect();
+    let wide = rows
+        .iter()
+        .any(|&(d, m, _)| d > i64::from(u32::MAX) || m > i64::from(i32::MAX) || m < -1);
+    let mut el = Vec::new();
+    pu32(&mut el, rows.len() as u32);
+    for (d, m, r) in rows {
+        if wide {
+            el.extend_from_slice(&(d as u64).to_be_bytes());
+            el.extend_from_slice(&m.to_be_bytes());
+        } else {
+            pu32(&mut el, d as u32);
+            pu32(&mut el, m as i32 as u32);
+        }
+        pu32(&mut el, r as u32);
+    }
+    bx(b"edts", &fbx(b"elst", u8::from(wide), 0, &el))
 }
 
 /// A QuickTime timecode track (`tmcd` handler, `gmhd` media header) whose

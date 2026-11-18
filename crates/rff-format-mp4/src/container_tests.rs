@@ -982,3 +982,237 @@ fn mp3_goes_into_mp4_as_mp4a_object_type_0x6b() {
         assert_eq!(got[1].pts, Some(1152));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Faststart and caller edit lists (#114).
+// ---------------------------------------------------------------------------
+
+/// [`mux_both`] with `setup` applied to each muxer before its header.
+fn mux_both_with(
+    flavor: Flavor,
+    streams: &[Stream],
+    packets: &[Packet],
+    setup: &dyn Fn(&mut dyn Muxer),
+) -> [Vec<u8>; 2] {
+    let run = |m: &mut dyn Muxer| {
+        setup(m);
+        m.write_header(streams).unwrap();
+        for p in packets {
+            m.write_packet(p).unwrap();
+        }
+        m.write_trailer().unwrap();
+    };
+    let buffered = Shared::default();
+    run(&mut Mp4Muxer::with_flavor(
+        Box::new(buffered.clone()),
+        flavor,
+    ));
+    let streamed = Shared::default();
+    run(&mut Mp4StreamMuxer::with_flavor(
+        Box::new(streamed.clone()),
+        flavor,
+    ));
+    let take = |s: Shared| s.0.lock().unwrap().get_ref().clone();
+    [take(buffered), take(streamed)]
+}
+
+/// The top-level box types of `file`, in order.
+fn top_level(file: &[u8]) -> Vec<[u8; 4]> {
+    let mut at = 0usize;
+    let mut out = Vec::new();
+    while at + 8 <= file.len() {
+        let mut size = u32::from_be_bytes(file[at..at + 4].try_into().unwrap()) as u64;
+        let kind: [u8; 4] = file[at + 4..at + 8].try_into().unwrap();
+        if size == 1 {
+            size = u64::from_be_bytes(file[at + 8..at + 16].try_into().unwrap());
+        }
+        out.push(kind);
+        at += size as usize;
+    }
+    out
+}
+
+#[test]
+fn faststart_puts_moov_before_mdat_and_reads_back_the_same() {
+    let streams = [
+        prores_stream(),
+        pcm_stream(1, SampleFormat::S24, 2, Some(*b"in24")),
+    ];
+    let packets = interleave(
+        video_packets(|i| prores_frame(i, 2), 6),
+        pcm_packets(1, 1500, 6, 6),
+    );
+    let plain = mux_both(Flavor::Mov, &streams, &packets);
+    let (_, want) = demux(&plain[0]);
+    for flags in ["+faststart", "faststart", "+frag_keyframe+faststart"] {
+        let fast = mux_both_with(Flavor::Mov, &streams, &packets, &|m| {
+            assert!(m.set_option("movflags", flags));
+        });
+        for file in &fast {
+            assert_eq!(top_level(file), [*b"ftyp", *b"moov", *b"mdat"], "{flags}");
+            let (_, got) = demux(file);
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!(
+                    (g.stream_index, g.pts, g.dts, &g.data),
+                    (w.stream_index, w.pts, w.dts, &w.data)
+                );
+            }
+            // The index's offsets point past `moov`, at the stored samples.
+            let mut d = Mp4Demuxer::new(Box::new(Cursor::new(file.clone())));
+            d.read_header().unwrap();
+            let idx = d.sample_index().unwrap();
+            let info = idx.sample_info(0, 3).unwrap();
+            let raw = idx.read_sample(0, 3).unwrap().data;
+            assert_eq!(&file[info.offset as usize..][..raw.len()], &raw[..]);
+        }
+        // Same bytes from both muxers, and as large as the plain file.
+        assert_eq!(fast[0], fast[1]);
+        assert_eq!(fast[0].len(), plain[0].len());
+    }
+}
+
+#[test]
+fn faststart_carries_the_timecode_sample() {
+    // `prores_stream` has a timecode, so a `tmcd` track and its 4-byte sample.
+    let streams = [prores_stream()];
+    let packets = video_packets(|i| prores_frame(i, 2), 3);
+    let [plain, _] = mux_both(Flavor::Mov, &streams, &packets);
+    let [fast, _] = mux_both_with(Flavor::Mov, &streams, &packets, &|m| {
+        m.set_option("movflags", "+faststart");
+    });
+    let read = |file: &[u8]| {
+        let mut d = Mp4Demuxer::new(Box::new(Cursor::new(file.to_vec())));
+        d.read_header().unwrap()[0].timecode.clone()
+    };
+    assert!(read(&plain).is_some());
+    assert_eq!(read(&fast), read(&plain));
+}
+
+#[test]
+fn other_movflags_and_unknown_options_leave_the_layout_alone() {
+    let streams = [prores_stream()];
+    let packets = video_packets(|i| prores_frame(i, 2), 2);
+    let plain = mux_both(Flavor::Mov, &streams, &packets);
+    let got = mux_both_with(Flavor::Mov, &streams, &packets, &|m| {
+        assert!(
+            m.set_option("movflags", "+frag_keyframe"),
+            "movflags is known"
+        );
+        assert!(!m.set_option("brand", "qt  "), "an option the muxer lacks");
+    });
+    assert_eq!(got, plain);
+    assert_eq!(top_level(&got[0]).last(), Some(b"moov"));
+}
+
+#[test]
+fn faststart_is_refused_once_the_seekable_header_is_out() {
+    let mut m = Mp4StreamMuxer::with_flavor(Box::new(Shared::default()), Flavor::Mov);
+    m.write_header(&[prores_stream()]).unwrap();
+    assert!(
+        !m.set_option("movflags", "+faststart"),
+        "mdat is already open"
+    );
+}
+
+#[test]
+fn a_caller_edit_list_replaces_the_derived_one() {
+    let mut v = prores_stream();
+    v.timecode = None;
+    v.time_base = Rational::new(1, 1000);
+    let packets: Vec<Packet> = (0..4i64)
+        .map(|i| {
+            let mut p = Packet::from_data(0, prores_frame(i as u8, 2));
+            p.pts = Some(40 * i);
+            p.dts = p.pts;
+            p.flags.keyframe = true;
+            p
+        })
+        .collect();
+    // A 250 ms empty edit, then the media from 40 ms (the second frame) for
+    // 120 ms: what a caller trimming the head and delaying the start writes.
+    let edits = [
+        EditEntry {
+            segment_duration: 250,
+            media_time: -1,
+            media_rate: 0x10000,
+        },
+        EditEntry {
+            segment_duration: 120,
+            media_time: 40,
+            media_rate: 0x10000,
+        },
+    ];
+    for file in mux_both_with(Flavor::Mov, &[v.clone()], &packets, &|m| {
+        assert!(m.set_edit_list(0, &edits));
+    }) {
+        let mut d = Mp4Demuxer::new(Box::new(Cursor::new(file.clone())));
+        d.read_header().unwrap();
+        let idx = d.sample_index().unwrap();
+        let ts = idx.movie_timescale().unwrap() as i64;
+        let back = idx.edit_list(0).to_vec();
+        assert_eq!(back.len(), 2, "{back:?}");
+        assert_eq!(
+            (back[0].segment_duration * 1000 / ts, back[0].media_time),
+            (250, -1)
+        );
+        assert_eq!(back[1].segment_duration * 1000 / ts, 120);
+        // Media time is in the track's time scale: 40 ms of it, not zero.
+        assert!(back[1].media_time > 0, "{back:?}");
+        assert_eq!(back[1].media_rate, 0x10000);
+        // read_packet applies it: frame 0 is before the edit (and frame 1 is a
+        // keyframe), so it is dropped; frames 1-3 fill the 120 ms from 250 ms.
+        let (_, got) = demux(&file);
+        let shown: Vec<_> = got.iter().map(|p| p.pts).collect();
+        assert_eq!(shown, [Some(250), Some(290), Some(330)]);
+        assert_eq!(got[0].data, packets[1].data);
+    }
+}
+
+#[test]
+fn a_wide_caller_edit_list_is_written_as_version_1() {
+    let mut v = prores_stream();
+    v.timecode = None;
+    let packets = video_packets(|i| prores_frame(i, 2), 2);
+    let long = i64::from(u32::MAX) + 10;
+    let edits = [EditEntry {
+        segment_duration: long,
+        media_time: 0,
+        media_rate: 0x10000,
+    }];
+    let [file, _] = mux_both_with(Flavor::Mov, &[v], &packets, &|m| {
+        m.set_edit_list(0, &edits);
+    });
+    let mut d = Mp4Demuxer::new(Box::new(Cursor::new(file)));
+    d.read_header().unwrap();
+    let back = d.sample_index().unwrap().edit_list(0).to_vec();
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0].segment_duration, long, "64-bit segment kept");
+}
+
+#[test]
+fn an_empty_caller_edit_list_writes_no_edts() {
+    let mut v = prores_stream();
+    v.timecode = None;
+    v.time_base = Rational::new(1, 1000);
+    let packets: Vec<Packet> = (0..2i64)
+        .map(|i| {
+            let mut p = Packet::from_data(0, prores_frame(i as u8, 2));
+            p.pts = Some(500 + 40 * i);
+            p.dts = p.pts;
+            p.flags.keyframe = true;
+            p
+        })
+        .collect();
+    // Derived: with an audio track starting at 0, the video's 500 ms start
+    // is an empty edit. A caller's empty list overrides it with none.
+    let mut packets = packets;
+    packets.extend(pcm_packets(1, 4800, 2, 3));
+    let streams = [v, pcm_stream(1, SampleFormat::S16, 1, None)];
+    let [derived, _] = mux_both(Flavor::Mov, &streams, &packets);
+    assert!(derived.windows(4).any(|w| w == b"edts"));
+    let [file, _] = mux_both_with(Flavor::Mov, &streams, &packets, &|m| {
+        m.set_edit_list(0, &[]);
+    });
+    assert!(!file.windows(4).any(|w| w == b"edts"));
+}

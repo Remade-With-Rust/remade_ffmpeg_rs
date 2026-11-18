@@ -264,6 +264,23 @@ pub trait Muxer: Send {
     /// simply ignore it (the default).
     fn set_metadata(&mut self, _metadata: &Dictionary) {}
 
+    /// A muxer option, FFmpeg-style (`movflags`, `+faststart`). Called before
+    /// [`write_header`](Muxer::write_header). Returns whether the muxer knows
+    /// the option; the default knows none.
+    fn set_option(&mut self, _key: &str, _value: &str) -> bool {
+        false
+    }
+
+    /// Write `edits` as stream `stream`'s edit list instead of the one the
+    /// muxer would derive (encoder delay, trims, a start delay). Segment
+    /// durations are in the muxer's movie time scale (1/1000 s for MP4), media
+    /// times in the stream's time base, -1 for an empty edit. Called before
+    /// [`write_trailer`](Muxer::write_trailer). Returns whether the container
+    /// has edit lists; the default has none.
+    fn set_edit_list(&mut self, _stream: usize, _edits: &[EditEntry]) -> bool {
+        false
+    }
+
     /// Write the container header for the given set of streams.
     fn write_header(&mut self, streams: &[Stream]) -> Result<()>;
 
