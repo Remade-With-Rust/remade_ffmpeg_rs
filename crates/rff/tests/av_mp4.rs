@@ -224,3 +224,42 @@ fn map_selects_individual_streams() {
         let _ = fs::remove_file(p);
     }
 }
+
+#[test]
+fn disabled_kinds_drop_streams_even_when_mapped() {
+    let engine = Engine::new();
+    let avif = tmp("dv", "avif");
+    let wav = tmp("da", "wav");
+    let mp4 = tmp("dav", "mp4");
+    write_avif(&engine, &avif);
+    write_wav(&engine, &wav);
+    rff::transcode::run(&engine, &av_spec(vec![avif.clone(), wav.clone()], &mp4)).expect("mux");
+
+    // `-vn`, with the default selection and with `-map 0` naming the video.
+    let no_video = tmp("novideo", "mp4");
+    for maps in [
+        Vec::new(),
+        vec![MapSpec {
+            input: 0,
+            selector: MapSelector::All,
+        }],
+    ] {
+        let mut spec = av_spec(vec![mp4.clone()], &no_video);
+        spec.outputs[0].video_codec = None;
+        spec.outputs[0].maps = maps;
+        spec.outputs[0].disabled = vec![MediaType::Video];
+        rff::transcode::run(&engine, &spec).expect("-vn");
+        let info = rff::probe::probe(&engine, &no_video).unwrap();
+        assert_eq!(info.streams.len(), 1);
+        assert_eq!(info.streams[0].media_type, MediaType::Audio);
+    }
+
+    // `-vn -an` leaves nothing to write: an error, not an empty file.
+    let mut spec = av_spec(vec![mp4.clone()], &no_video);
+    spec.outputs[0].disabled = vec![MediaType::Video, MediaType::Audio];
+    assert!(rff::transcode::run(&engine, &spec).is_err());
+
+    for p in [avif, wav, mp4, no_video] {
+        let _ = fs::remove_file(p);
+    }
+}

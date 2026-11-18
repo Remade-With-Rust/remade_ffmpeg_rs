@@ -163,6 +163,13 @@ impl Encoder for Vp9Encoder {
                 .or_else(|| options.get("speed"))
                 .or_else(|| options.get("quality"))
                 .and_then(|v| v.parse::<u32>().ok()),
+            // `-g N` is ffmpeg's GOP size, which it maps to libvpx's
+            // `kf_max_dist`; `keyint_max` is the libvpx spelling.
+            keyframe_interval: options
+                .get("g")
+                .or_else(|| options.get("keyint_max"))
+                .and_then(|v| v.parse::<u32>().ok()),
+            ..Default::default()
         };
         self.inner.configure(&cfg).map_err(map_err)
     }

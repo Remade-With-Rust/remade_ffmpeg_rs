@@ -98,6 +98,7 @@ fn print_help() {
     println!("  -g N               keyframe interval in frames");
     println!("  -vf FILTERS        video filter graph (e.g. scale=640:480, crop=W:H:X:Y)");
     println!("  -map SPEC          select streams: INPUT[:v|:a|:N] (repeatable)");
+    println!("  -vn / -an / -sn    drop video / audio / subtitle streams from the output");
     println!("  -y / -n            overwrite / never overwrite the output");
     println!("  -codecs            list supported codecs");
     println!("  -formats           list supported container formats");

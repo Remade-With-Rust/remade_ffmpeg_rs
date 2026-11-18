@@ -320,6 +320,21 @@ pub struct Vp9EncoderConfig {
     pub two_pass: bool,
     /// Speed preset, 0 best..6 fastest (values above 6 are clamped).
     pub speed: Option<u32>,
+    /// Maximum keyframe interval (GOP length) in frames, libvpx's
+    /// `kf_max_dist` / ffmpeg's `-g`: a keyframe at least every N frames, so
+    /// a long export can be seeked. With ALT-REF lookahead the keyframe falls
+    /// on a group boundary and groups are cut to fit. `None` or 0: only the
+    /// first frame (and a resize) is a keyframe, as before.
+    pub keyframe_interval: Option<u32>,
+    /// Chained entropy contexts and motion vectors across P frames (default
+    /// on; measured -11.15% BD-rate). Was the `VP9_NO_CHAIN` environment
+    /// variable, which now needs the `env-tuning` feature.
+    pub chain: Option<bool>,
+    /// Group motion below which an ALT-REF group is coded as plain P frames
+    /// (default 8.0). Was `VP9_LAG_MOTION_THRESH`.
+    pub lag_motion_thresh: Option<f64>,
+    /// ALT-REF qindex multiplier at q = 0 (default 0.5). Was `VP9_ARF_QSCALE`.
+    pub arf_qscale: Option<f64>,
 }
 
 /// In-house VP9 encoder: the first frame is a key frame, subsequent frames are
@@ -331,6 +346,11 @@ pub struct Vp9Encoder {
     /// Previous frame's reconstruction (coded size) + its dimensions, used as the
     /// LAST reference; `None` ⇒ the next frame is coded as a key frame.
     reference: Option<([Vec<u16>; 3], u32, u32)>,
+    /// [`Vp9EncoderConfig::keyframe_interval`]; 0 = no forced keyframes.
+    keyframe_interval: u32,
+    /// Shown frames since the last keyframe, the keyframe counted (0 before
+    /// the first).
+    since_key: u32,
     /// The most recent key frame's reconstruction (+ dims), installed as the GOLDEN
     /// reference on every P frame (a stable long-term anchor the per-block RD may pick).
     golden: Option<([Vec<u16>; 3], u32, u32)>,
@@ -410,6 +430,8 @@ impl Default for Vp9Encoder {
             packets: VecDeque::new(),
             eof: false,
             reference: None,
+            keyframe_interval: 0,
+            since_key: 0,
             golden: None,
             rc: None,
             lag: 0,
@@ -427,7 +449,7 @@ impl Default for Vp9Encoder {
             // prior default, byte-identical to the pinned corpus) and speed 0 (the
             // exhaustive-RD anchor) remain selectable. `-speed`/`-cpu-used N` overrides.
             speed: 3,
-            chain: std::env::var("VP9_NO_CHAIN").is_err(), // F3: corpus-gated −11.15% BD
+            chain: crate::tune::var("VP9_NO_CHAIN").is_err(), // F3: corpus-gated −11.15% BD
             companion: None,
             chain_prev_p: false,
             last_recon: None,
@@ -435,17 +457,17 @@ impl Default for Vp9Encoder {
             recon_check_dec: None,
             group_chain: false,
             pass2_chaining: false,
-            lag_motion_thresh: std::env::var("VP9_LAG_MOTION_THRESH")
+            lag_motion_thresh: crate::tune::var("VP9_LAG_MOTION_THRESH")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8.0),
             // 0.5 = the ARF q-boost (measured -8.87% BD vs plain IPPP on 1080p
             // motion). 1.0 restores the old un-boosted, net-loss ARF.
-            arf_qscale: std::env::var("VP9_ARF_QSCALE")
+            arf_qscale: crate::tune::var("VP9_ARF_QSCALE")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.5),
-            dispatch_budget_us: std::env::var("VP9_DISPATCH_BUDGET")
+            dispatch_budget_us: crate::tune::var("VP9_DISPATCH_BUDGET")
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
                 .filter(|ms| *ms > 0.0)
@@ -572,7 +594,36 @@ impl Vp9Encoder {
             // variance-partition dispatcher, rising route fraction). See `set_speed`.
             self.speed = sp.min(6);
         }
+        if let Some(n) = cfg.keyframe_interval {
+            self.keyframe_interval = n;
+        }
+        if let Some(chain) = cfg.chain {
+            self.chain = chain;
+        }
+        if let Some(t) = cfg.lag_motion_thresh {
+            self.lag_motion_thresh = t;
+        }
+        if let Some(s) = cfg.arf_qscale {
+            self.arf_qscale = s;
+        }
         Ok(())
+    }
+
+    /// Whether `next` more shown frames without a keyframe would run past the
+    /// keyframe interval: the next frame (or group) must start with one.
+    fn key_due(&self, next: u32) -> bool {
+        self.keyframe_interval > 0
+            && self.since_key > 0
+            && self.since_key.saturating_add(next) > self.keyframe_interval
+    }
+
+    /// The ALT-REF group length: the lookahead, but never past the keyframe
+    /// interval, so a group-aligned keyframe can keep every GOP within it.
+    fn group_len(&self) -> usize {
+        match self.keyframe_interval {
+            0 => self.lag,
+            n => self.lag.min(n as usize),
+        }
     }
 
     /// Feed one 8-bit YUV 4:2:0 frame: `planes`/`strides` are the display-size
@@ -605,7 +656,7 @@ impl Vp9Encoder {
         if self.lag > 1 {
             // ALT-REF lookahead: buffer, and emit a group once it is `lag` frames long.
             self.lookahead.push_back(([y, u, v], width, height));
-            if self.lookahead.len() >= self.lag {
+            if self.lookahead.len() >= self.group_len() {
                 let group: Vec<_> = self.lookahead.drain(..).collect();
                 self.code_altref_group(group);
             }
@@ -674,7 +725,7 @@ impl Vp9Encoder {
                 const K: f64 = 0.4; // gain: settles in a few frames without ringing
                 let prev = self.dispatch_q_state;
                 self.dispatch_q_state = (prev + K * err).clamp(0.0, 0.95);
-                if std::env::var("VP9_BUDGET_DEBUG").is_ok() {
+                if crate::tune::var("VP9_BUDGET_DEBUG").is_ok() {
                     eprintln!(
                         "BUDGET decision={:.1}ms target={:.1}ms q {:.3}->{:.3}",
                         enc.decision_us() as f64 / 1000.0,
@@ -716,11 +767,15 @@ impl Vp9Encoder {
         altref: Option<&[Vec<u16>; 3]>,
         qindex: u32,
     ) -> Vec<u8> {
+        if self.key_due(1) {
+            self.reference = None; // `keyframe_interval` reached: restart here
+        }
         let reference = match self.reference.take() {
             Some((planes, rw, rh)) if rw == w && rh == h => Some(planes),
             _ => None,
         };
         let is_key = reference.is_none();
+        self.since_key = if is_key { 1 } else { self.since_key + 1 };
         let mut enc = FrameEncoder::new(w, h, qindex, coded, reference);
         enc.set_speed(self.speed);
         self.budget_apply(&mut enc);
@@ -774,7 +829,7 @@ impl Vp9Encoder {
         // self-consistent; it is the encoder's belief about it that is wrong).
         //
         // Our decoder is 315/315 bit-exact against libvpx, so it is a trustworthy oracle.
-        if std::env::var("VP9_RECON_CHECK").is_ok() {
+        if crate::tune::var("VP9_RECON_CHECK").is_ok() {
             self.recon_check(&bytes, &recon, w, h);
         }
         if is_key {
@@ -793,7 +848,7 @@ impl Vp9Encoder {
     /// Without this the whole ALT-REF path was invisible to the oracle: `recon_check` ran
     /// only from `code_frame_q`, and the lag>1 path goes through `code_altref_group`.
     fn recon_verify(&mut self, bytes: &[u8], expect: Option<&[Vec<u16>; 3]>, w: u32, h: u32) {
-        if std::env::var("VP9_RECON_CHECK").is_err() {
+        if crate::tune::var("VP9_RECON_CHECK").is_err() {
             return;
         }
         match expect {
@@ -866,7 +921,7 @@ impl Vp9Encoder {
             );
             // Level 2: a 64x64-superblock map of where luma diverges, so the pattern
             // (tile column, SB column, scattered, edge) is visible instead of guessed.
-            if std::env::var("VP9_RECON_CHECK").ok().as_deref() == Some("2") {
+            if crate::tune::var("VP9_RECON_CHECK").ok().as_deref() == Some("2") {
                 let (pw, ph) = (w as usize, h as usize);
                 let cw = recon[0].len() / ph.max(1);
                 let (sbx, sby) = (pw.div_ceil(64), ph.div_ceil(64));
@@ -932,6 +987,7 @@ impl Vp9Encoder {
 
         // Pass 1: probe the true size at a fixed qindex.
         self.reference = None;
+        self.since_key = 0;
         self.golden = None;
         let mut probe_bits = 0.0f64;
         for (c, w, h) in &frames {
@@ -943,7 +999,7 @@ impl Vp9Encoder {
         let q2 = (Q_PROBE as f64 + Q_PER_2X * ratio.log2()).clamp(4.0, 220.0);
         let q_key = (q2 - KEY_BONUS).clamp(4.0, 220.0).round() as u32;
         let q_inter = q2.round() as u32;
-        if std::env::var("VP9_2PASS_DBG").is_ok() {
+        if crate::tune::var("VP9_2PASS_DBG").is_ok() {
             eprintln!(
                 "2pass: probe_bits={probe_bits:.0} target_total={target_total:.0} ratio={ratio:.3} q2={q2:.1} q_key={q_key} q_inter={q_inter}"
             );
@@ -953,6 +1009,7 @@ impl Vp9Encoder {
         // chaining engages here (pass 1 was a throwaway probe): fresh companion,
         // each frame coded against the previous frame's adapted context/MVs.
         self.reference = None;
+        self.since_key = 0;
         self.golden = None;
         self.companion = None;
         self.chain_prev_p = false;
@@ -1028,8 +1085,15 @@ impl Vp9Encoder {
             return;
         }
         let (w, h) = (frames[0].1, frames[0].2);
-        // The first group, or any resize, restarts with a key frame + fresh slots.
-        let need_key = self.slots[0].is_none() || self.group_dims != Some((w, h));
+        // The first group, or any resize, restarts with a key frame + fresh slots;
+        // so does a group that would run past `keyframe_interval`.
+        let need_key =
+            self.slots[0].is_none() || self.group_dims != Some((w, h)) || self.key_due(n as u32);
+        self.since_key = if need_key {
+            n as u32
+        } else {
+            self.since_key + n as u32
+        };
         self.group_dims = Some((w, h));
         self.group_chain = self.chain && !self.twopass;
 
@@ -1144,7 +1208,7 @@ impl Vp9Encoder {
         //   bus    qscale 0.5 -> +37.11%   1.0 -> +14.31%
         // `VP9_ARF_QSCALE_FLAT=1` restores the old flat multiplier (the A/B oracle).
         let base = self.next_qindex() as f64;
-        let qs = if std::env::var("VP9_ARF_QSCALE_FLAT").is_ok() {
+        let qs = if crate::tune::var("VP9_ARF_QSCALE_FLAT").is_ok() {
             self.arf_qscale
         } else {
             const Q_MAX: f64 = 220.0; // top of the qindex range rate control uses

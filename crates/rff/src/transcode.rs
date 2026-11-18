@@ -183,6 +183,9 @@ pub struct OutputSpec {
     /// Explicit stream selection (`-map`). Empty = default (all video + audio,
     /// in input/stream order).
     pub maps: Vec<MapSpec>,
+    /// Media kinds dropped from the output whatever selected them (`-vn`,
+    /// `-an`, `-sn`, `-dn`).
+    pub disabled: Vec<MediaType>,
     /// Overwrite the output if it exists (`-y`); otherwise fail (`-n`).
     pub overwrite: bool,
     /// Stop after this many VIDEO frames (`-frames:v N`). `None` = whole input.
@@ -1017,6 +1020,16 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
 
     let mut report = TranscodeReport::default();
 
+    // Streams every op skips (unmapped, -vn/-an, the overlay input once its
+    // frame is decoded) are never needed: let each demuxer drop them at the
+    // source instead of reading and converting packets only to discard them.
+    for (demuxer, ops) in demuxers.iter_mut().zip(&per_input_ops) {
+        let discard: Vec<bool> = ops.iter().map(|op| matches!(op, StreamOp::Skip)).collect();
+        if discard.contains(&true) {
+            demuxer.set_discard(&discard);
+        }
+    }
+
     // --- drive each input through its plan into the shared muxer ---
     for (demuxer, ops) in demuxers.iter_mut().zip(per_input_ops.iter_mut()) {
         loop {
@@ -1038,8 +1051,15 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
 
 /// Resolve which `(input_index, stream_index)` pairs go to the output, in
 /// output order. With no `-map`, defaults to every video + audio stream across
-/// all inputs (input order, then stream order).
+/// all inputs (input order, then stream order). Kinds in
+/// [`OutputSpec::disabled`] are then dropped, mapped or not.
 fn select_streams(inputs: &[Vec<Stream>], output: &OutputSpec) -> Result<Vec<(usize, usize)>> {
+    let mut selection = mapped_streams(inputs, output)?;
+    selection.retain(|&(ii, i)| !output.disabled.contains(&inputs[ii][i].media_type));
+    Ok(selection)
+}
+
+fn mapped_streams(inputs: &[Vec<Stream>], output: &OutputSpec) -> Result<Vec<(usize, usize)>> {
     let mut selection = Vec::new();
     if output.maps.is_empty() {
         for (ii, streams) in inputs.iter().enumerate() {

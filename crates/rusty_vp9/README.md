@@ -68,6 +68,7 @@ fn encode() -> Result<(), Error> {
         crf: Some(32),          // constant quality; or bitrate_bps for rate control
         lag: Some(8),           // ALT-REF lookahead groups
         speed: Some(3),         // 0 = best quality .. 6 = fastest
+        keyframe_interval: Some(120), // a keyframe at least every 120 frames (seekable)
         ..Default::default()
     })?;
 
@@ -88,6 +89,11 @@ fn encode() -> Result<(), Error> {
     Ok(())
 }
 ```
+
+Every setting is on `Vp9EncoderConfig`. The `VP9_*` environment switches the
+measurement campaigns use (kernel A/B toggles, RD knobs, probes) are read only
+when the crate is built with the `env-tuning` feature, so a stray variable on a
+user's machine cannot change what an application writes.
 
 The bitstream toolbox is public too: `parse_uncompressed_header` /
 `FrameHeader`, `consume_compressed_header`, and the `BitReader` /

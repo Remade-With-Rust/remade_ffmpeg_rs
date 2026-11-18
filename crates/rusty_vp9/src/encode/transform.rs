@@ -321,7 +321,7 @@ pub fn fwht4x4(residual: &[i32], out: &mut [i32]) {
 /// falls back to the O(n²) inverse-basis matmul (the BD-rate A/B oracle).
 fn use_fdct16() -> bool {
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("VP9_NO_FDCT16").is_err())
+    *F.get_or_init(|| crate::tune::var("VP9_NO_FDCT16").is_err())
 }
 
 /// One-dimension 16-point forward DCT — the inner butterfly of libvpx
@@ -436,7 +436,7 @@ fn fdct16x16(residual: &[i32], out: &mut [i32], inter: &mut [i64]) {
 /// falls back to the O(n²) inverse-basis matmul (the BD-rate A/B oracle).
 fn use_fdct32() -> bool {
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("VP9_NO_FDCT32").is_err())
+    *F.get_or_init(|| crate::tune::var("VP9_NO_FDCT32").is_err())
 }
 
 /// One-dimension 32-point forward DCT — libvpx `vpx_fdct32` with `round == 0`

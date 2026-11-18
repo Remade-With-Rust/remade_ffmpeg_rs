@@ -203,7 +203,7 @@ impl ModeMap {
             0 => false,
             1 => true,
             _ => {
-                let v = std::env::var("VP9_MODEMAP_STD").is_ok();
+                let v = crate::tune::var("VP9_MODEMAP_STD").is_ok();
                 MODEMAP_STD.store(v as u8, std::sync::atomic::Ordering::Relaxed);
                 v
             }
@@ -310,7 +310,7 @@ pub static REF_HIST: [std::sync::atomic::AtomicU64; 4] =
 
 fn ref_hist_on() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("VP9_REF_HIST").is_ok())
+    *E.get_or_init(|| crate::tune::var("VP9_REF_HIST").is_ok())
 }
 
 /// Read and clear the reference histogram.
@@ -331,7 +331,7 @@ fn snap_pool_enabled() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var("VP9_NO_SNAP_POOL").is_err();
+            let on = crate::tune::var("VP9_NO_SNAP_POOL").is_err();
             SNAP_POOL.store(on as u8, std::sync::atomic::Ordering::Relaxed);
             on
         }
@@ -972,7 +972,7 @@ impl TxScratch {
 /// Presets must therefore use `env_f64(..).unwrap_or(default)`, never a bare
 /// assignment, or the knob is not sweepable at that tier.
 fn env_f64(key: &str) -> Option<f64> {
-    std::env::var(key).ok().and_then(|v| v.parse().ok())
+    crate::tune::var(key).ok().and_then(|v| v.parse().ok())
 }
 
 impl FrameEncoder {
@@ -990,7 +990,7 @@ impl FrameEncoder {
     /// temporal signal → resolution fallback. `VP9_LAMBDA_MULT` fixes it; `VP9_LAMBDA_RES`
     /// forces the old resolution model (A/B).
     fn lambda_mult(activity: f64, is_inter: bool, width: u32, height: u32) -> f64 {
-        if let Some(m) = std::env::var("VP9_LAMBDA_MULT")
+        if let Some(m) = crate::tune::var("VP9_LAMBDA_MULT")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
         {
@@ -1004,7 +1004,7 @@ impl FrameEncoder {
             let t = ((px.ln() - LO_PX.ln()) / (HI_PX.ln() - LO_PX.ln())).clamp(0.0, 1.0);
             0.0007 + t * (0.0005 - 0.0007)
         };
-        if !is_inter || std::env::var("VP9_LAMBDA_RES").is_ok() {
+        if !is_inter || crate::tune::var("VP9_LAMBDA_RES").is_ok() {
             return res_mult;
         }
         const A_LO: f64 = 2.0; // ≤ this (static) → MULT_HI
@@ -1018,7 +1018,7 @@ impl FrameEncoder {
         // active 1080p didn't). Floor the activity λ at `res_mult` (0.0007 CIF → 0.0005 1080p)
         // — the full model is λ(activity, resolution): activity picks λ, resolution floors it.
         // Only bites low-res high-activity blocks; akiyo/foreman/1080p are unchanged.
-        if std::env::var("VP9_LAMBDA_NOFLOOR").is_ok() {
+        if crate::tune::var("VP9_LAMBDA_NOFLOOR").is_ok() {
             act_mult
         } else {
             act_mult.max(res_mult)
@@ -1101,7 +1101,7 @@ impl FrameEncoder {
                 0.0
             }
         });
-        if std::env::var("VP9_ACT_DEBUG").is_ok() {
+        if crate::tune::var("VP9_ACT_DEBUG").is_ok() {
             eprintln!("ACT activity={:.3} inter={}", activity, is_inter);
         }
         let dc_y = dc_quant(qindex as i32, 8);
@@ -1126,7 +1126,7 @@ impl FrameEncoder {
             // No segmentation / delta-q: one quantizer for Y and one for UV.
             dq_y: (dc_y, ac_y),
             dq_uv: (dc_quant(qindex as i32, 8), ac_quant(qindex as i32, 8)),
-            aq: std::env::var("VP9_AQ")
+            aq: crate::tune::var("VP9_AQ")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
@@ -1149,12 +1149,12 @@ impl FrameEncoder {
             // search — a −1.58% BD-rate win at speed 3, −0.90% at speed 0, decoder-ready).
             // `VP9_INTERP_FILTER=N` pins a fixed frame filter (0=EIGHTTAP/1=SMOOTH/2=SHARP,
             // the ceiling probe); `VP9_NO_SWITCHABLE` escapes to fixed EIGHTTAP.
-            interp_filter: if let Some(f) = std::env::var("VP9_INTERP_FILTER")
+            interp_filter: if let Some(f) = crate::tune::var("VP9_INTERP_FILTER")
                 .ok()
                 .and_then(|v| v.parse().ok())
             {
                 f
-            } else if std::env::var("VP9_NO_SWITCHABLE").is_ok() {
+            } else if crate::tune::var("VP9_NO_SWITCHABLE").is_ok() {
                 0
             } else {
                 4
@@ -1176,47 +1176,47 @@ impl FrameEncoder {
             // INFLATION (hundreds of subexp deltas each saving <1 token bit); the
             // per-prob savings gate keeps only paying deltas, so the update can now
             // only shrink the stream. `VP9_NO_2PASS=1` skips the gather pass entirely.
-            use_prob_updates: std::env::var("VP9_NO_2PASS").is_err(),
+            use_prob_updates: crate::tune::var("VP9_NO_2PASS").is_err(),
             // R5 AC deadzone: OFF (4 = round-to-nearest). It lowered the encoder's
             // own RD cost J ~1.6%, but the unbiased BD-rate oracle
             // (`encode::quality`) proved it's a **+1.66% LOSS** (sheds bitrate for
             // far more PSNR) — the J self-metric flattered a loss. Kept as the
             // worked example of why a video RD knob needs the BD-rate gate.
             ac_round_num: 4,
-            trellis_lambda_scale: std::env::var("VP9_TRELLIS_LAMBDA")
+            trellis_lambda_scale: crate::tune::var("VP9_TRELLIS_LAMBDA")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1.0),
             // 2.5 = the content-adaptive sweet spot (mean −4.19% BD, all clips win, 32/32
             // conformant); k≈4 over-trims and can desync at extreme λ, so it's capped here.
-            lf_from_q: std::env::var("VP9_LF_FROM_Q").is_ok(),
-            trellis_k: std::env::var("VP9_TRELLIS_K")
+            lf_from_q: crate::tune::var("VP9_LF_FROM_Q").is_ok(),
+            trellis_k: crate::tune::var("VP9_TRELLIS_K")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2.5),
             // R5 — ON: BD-rate oracle scores it −0.45% at the calibrated λ (a real
             // win; the same knob was a +40% catastrophe at the old too-high λ).
-            use_trellis: std::env::var("VP9_NO_TRELLIS").is_err(),
-            trellis_exact: std::env::var("VP9_TRELLIS_EXACT").is_ok(),
+            use_trellis: crate::tune::var("VP9_NO_TRELLIS").is_err(),
+            trellis_exact: crate::tune::var("VP9_TRELLIS_EXACT").is_ok(),
             // Roof — ON: BD-rate oracle scores it −18% (an 8×8 transform decorrelates
             // smooth residual far better than four 4×4s — fewer bits AND higher PSNR).
-            use_tx_search: std::env::var("VP9_NO_TXSEARCH").is_err(),
-            tx_order: std::env::var("VP9_NO_TXORDER").is_err(),
-            tx_thresh: std::env::var("VP9_TX_THRESH")
+            use_tx_search: crate::tune::var("VP9_NO_TXSEARCH").is_err(),
+            tx_order: crate::tune::var("VP9_NO_TXORDER").is_err(),
+            tx_thresh: crate::tune::var("VP9_TX_THRESH")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0),
-            tx4x4: std::env::var("VP9_TX4X4").is_ok(),
-            tx_cap: std::env::var("VP9_TXCAP")
+            tx4x4: crate::tune::var("VP9_TX4X4").is_ok(),
+            tx_cap: crate::tune::var("VP9_TXCAP")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1),
-            intra_gate: std::env::var("VP9_NO_INTRA_GATE").is_err(),
-            intra_gate_t: std::env::var("VP9_INTRA_GATE_T")
+            intra_gate: crate::tune::var("VP9_NO_INTRA_GATE").is_err(),
+            intra_gate_t: crate::tune::var("VP9_INTRA_GATE_T")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1000.0),
-            mode_shortlist: std::env::var("VP9_NO_SHORTLIST").is_err(),
+            mode_shortlist: crate::tune::var("VP9_NO_SHORTLIST").is_err(),
             // Speed-0 value. BD-gated over 7 clips (CIF + 4CIF + 720p + 1080p),
             // 5-point ladders: full-RD-ing only the TOP shortlist candidate is
             // -1.25% mean BD-rate with no clip regressing (akiyo -3.79, foreman
@@ -1230,20 +1230,20 @@ impl FrameEncoder {
             // worst +3.30%**, because the tier's other prunes (mode_thresh_mult,
             // g1_scale, no tx-search, no sub-8x8) have already removed the slack,
             // so the shortlist is the last real RD comparison left.
-            shortlist_k: std::env::var("VP9_SHORTLIST_K")
+            shortlist_k: crate::tune::var("VP9_SHORTLIST_K")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1),
-            shortlist_k_env: std::env::var("VP9_SHORTLIST_K").is_ok(),
+            shortlist_k_env: crate::tune::var("VP9_SHORTLIST_K").is_ok(),
             force_min_bsize: BLOCK_8X8, // only used when partition RD is off
             // Sub-8×8 (4×4/8×4/4×8) inter prediction: on by default (conformant, a BD-rate
             // win); `VP9_NO_SUB8X8` disables it (faster encode).
-            sub8x8: std::env::var("VP9_NO_SUB8X8").is_err(),
+            sub8x8: crate::tune::var("VP9_NO_SUB8X8").is_err(),
             // Roof — ON: BD-rate oracle scores recursive partitioning −37% vs all-8×8
             // (large blocks are far cheaper on smooth content; it can always fall back
             // to 8×8 on detail). Key-frame only for now — inter stays all-8×8.
             use_partition_rd: true,
-            disable_lf: std::env::var("VP9_NO_LF").is_ok(),
+            disable_lf: crate::tune::var("VP9_NO_LF").is_ok(),
             pending_eob: 0,
             trial_abort_at: None,
             skip_trial: false,
@@ -1252,14 +1252,14 @@ impl FrameEncoder {
             last_trial_tx: 0,
             pending_pred_sse: 0,
             force_skip: false,
-            rd_skip: std::env::var("VP9_NO_RD_SKIP").is_err(),
+            rd_skip: crate::tune::var("VP9_NO_RD_SKIP").is_err(),
             // Activity-gated partition-merge bias. On near-static frames we over-split the
             // background into small skip blocks (akiyo: 84 8×8/frame vs libvpx's 21) —
             // splitting to code noise-level residual libvpx skips as one large block. Bias
             // SPLIT-vs-NONE toward the large skip block, but ONLY for near-static content
             // (the same signal the λ uses); any real motion keeps fine partitions. Env
             // `VP9_SPLIT_PEN` overrides with a fixed value.
-            split_penalty: std::env::var("VP9_SPLIT_PEN")
+            split_penalty: crate::tune::var("VP9_SPLIT_PEN")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or_else(|| {
@@ -1271,88 +1271,88 @@ impl FrameEncoder {
                         1.0
                     }
                 }),
-            full_msearch: std::env::var("VP9_DIAMOND_MSEARCH").is_err(),
-            msearch_dedup: std::env::var("VP9_NO_MSEARCH_DEDUP").is_err(),
-            me_skip: std::env::var("VP9_ME_SKIP")
+            full_msearch: crate::tune::var("VP9_DIAMOND_MSEARCH").is_err(),
+            msearch_dedup: crate::tune::var("VP9_NO_MSEARCH_DEDUP").is_err(),
+            me_skip: crate::tune::var("VP9_ME_SKIP")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0),
-            msearch_x4: std::env::var("VP9_NO_MSEARCH_X4").is_err(),
-            corner_sad: std::env::var("VP9_CORNER_SAD").is_ok(),
+            msearch_x4: crate::tune::var("VP9_NO_MSEARCH_X4").is_err(),
+            corner_sad: crate::tune::var("VP9_CORNER_SAD").is_ok(),
             // 48 == NEWMV_SAD_PENALTY is PROVABLY lossless (a searched MV pays SAD+48).
             // Default 64 is the aggressive child: harvest showed <=0.8% of NEWMV wins
             // lost, BD-gated NEUTRAL (+0.02%) on the corpus ladder, ~-15% encode time.
-            sub8x8_prescreen: std::env::var("VP9_SUB8X8_PRESCREEN")
+            sub8x8_prescreen: crate::tune::var("VP9_SUB8X8_PRESCREEN")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(64),
-            sub8_probe: std::env::var("VP9_SUB8_PROBE").is_ok(),
-            lfseg_probe_on: std::env::var("VP9_LFSEG_PROBE").is_ok(),
-            sub8x8_multiref: std::env::var("VP9_NO_SUB8X8_MULTIREF").is_err(),
-            sub8x8_ref_penalty: std::env::var("VP9_SUB8X8_REF_PENALTY")
+            sub8_probe: crate::tune::var("VP9_SUB8_PROBE").is_ok(),
+            lfseg_probe_on: crate::tune::var("VP9_LFSEG_PROBE").is_ok(),
+            sub8x8_multiref: crate::tune::var("VP9_NO_SUB8X8_MULTIREF").is_err(),
+            sub8x8_ref_penalty: crate::tune::var("VP9_SUB8X8_REF_PENALTY")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256.0),
-            sub8x8_multiref_gate: std::env::var("VP9_SUB8X8_MULTIREF_GATE")
+            sub8x8_multiref_gate: crate::tune::var("VP9_SUB8X8_MULTIREF_GATE")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(500.0),
             subpel_fast: false,
-            motion_fast: std::env::var("VP9_MOTION_FAST").is_ok(),
+            motion_fast: crate::tune::var("VP9_MOTION_FAST").is_ok(),
             // Bilinear subpel is otherwise chosen by the presets. (The former
             // `|| VP9_SUBPEL_8TAP.is_err() && false` arm was always false.)
-            subpel_bilinear: std::env::var("VP9_SUBPEL_BILINEAR").is_ok(),
-            subpel_tree: std::env::var("VP9_SUBPEL_TREE").is_ok(),
-            subpel_diag: std::env::var("VP9_SUBPEL_DIAG").is_ok(),
-            hp_mv: std::env::var("VP9_NO_HP_MV").is_err(),
-            compound: std::env::var("VP9_COMPOUND").is_ok()
-                || std::env::var("VP9_COMPOUND_FORCE").is_ok(),
-            compound_force: std::env::var("VP9_COMPOUND_FORCE").is_ok(),
-            no_compound: std::env::var("VP9_NO_COMPOUND").is_ok(),
+            subpel_bilinear: crate::tune::var("VP9_SUBPEL_BILINEAR").is_ok(),
+            subpel_tree: crate::tune::var("VP9_SUBPEL_TREE").is_ok(),
+            subpel_diag: crate::tune::var("VP9_SUBPEL_DIAG").is_ok(),
+            hp_mv: crate::tune::var("VP9_NO_HP_MV").is_err(),
+            compound: crate::tune::var("VP9_COMPOUND").is_ok()
+                || crate::tune::var("VP9_COMPOUND_FORCE").is_ok(),
+            compound_force: crate::tune::var("VP9_COMPOUND_FORCE").is_ok(),
+            no_compound: crate::tune::var("VP9_NO_COMPOUND").is_ok(),
             altref_future: false,
-            compound_gate: std::env::var("VP9_COMPOUND_GATE")
+            compound_gate: crate::tune::var("VP9_COMPOUND_GATE")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0),
             // Default-ON with the cost penalty that makes it a net win (mobile −6.57→−7.19%,
             // bus −1.55→−1.97%). `VP9_NO_COMPOUND_NEAR` opts out.
-            compound_near: std::env::var("VP9_NO_COMPOUND_NEAR").is_err(),
-            compound_filter: std::env::var("VP9_NO_COMPOUND_FILTER").is_err(),
-            compound_joint: std::env::var("VP9_NO_COMPOUND_JOINT").is_err(),
-            compound_near_penalty: std::env::var("VP9_COMPOUND_NEAR_PEN")
+            compound_near: crate::tune::var("VP9_NO_COMPOUND_NEAR").is_err(),
+            compound_filter: crate::tune::var("VP9_NO_COMPOUND_FILTER").is_err(),
+            compound_joint: crate::tune::var("VP9_NO_COMPOUND_JOINT").is_err(),
+            compound_near_penalty: crate::tune::var("VP9_COMPOUND_NEAR_PEN")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(24.0),
-            trellis_trials: std::env::var("VP9_FAST_TRIALS").is_err(),
-            trial_recon: std::env::var("VP9_TRIAL_RECON").is_ok(),
-            split_early: std::env::var("VP9_SPLIT_EARLY").is_ok(),
-            mode_thresh_mult: std::env::var("VP9_MODE_THRESH")
+            trellis_trials: crate::tune::var("VP9_FAST_TRIALS").is_err(),
+            trial_recon: crate::tune::var("VP9_TRIAL_RECON").is_ok(),
+            split_early: crate::tune::var("VP9_SPLIT_EARLY").is_ok(),
+            mode_thresh_mult: crate::tune::var("VP9_MODE_THRESH")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0),
-            g1_64: std::env::var("VP9_G1_64")
+            g1_64: crate::tune::var("VP9_G1_64")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0),
-            trellis_frozen: std::env::var("VP9_TRELLIS_EXACT_CTX").is_err(),
-            trellis_mse_t: std::env::var("VP9_TRELLIS_MSE_T")
+            trellis_frozen: crate::tune::var("VP9_TRELLIS_EXACT_CTX").is_err(),
+            trellis_mse_t: crate::tune::var("VP9_TRELLIS_MSE_T")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.0),
-            emit_dedup: std::env::var("VP9_DEDUP").is_ok(),
+            emit_dedup: crate::tune::var("VP9_DEDUP").is_ok(),
             dedup_map: std::cell::RefCell::new(std::collections::HashMap::new()),
-            subpel_rounds: std::env::var("VP9_SUBPEL_ROUNDS")
+            subpel_rounds: crate::tune::var("VP9_SUBPEL_ROUNDS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
-            g1_harvest: std::env::var("VP9_G1_HARVEST").is_ok(),
+            g1_harvest: crate::tune::var("VP9_G1_HARVEST").is_ok(),
             tile_start: 0,
             tile_end: mi_cols,
             chain: false,
             prev_mvs: None,
             tile_cols_log2: {
                 let sb_cols = mi_cols.div_ceil(8);
-                let mut l2: u32 = std::env::var("VP9_TILE_COLS")
+                let mut l2: u32 = crate::tune::var("VP9_TILE_COLS")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(if sb_cols >= 16 { 2 } else { 0 });
@@ -1361,8 +1361,8 @@ impl FrameEncoder {
                 }
                 l2
             },
-            g1_gate: std::env::var("VP9_NO_G1GATE").is_err(),
-            g3_gate: std::env::var("VP9_G3GATE").is_ok(), // harvest-first: off by default
+            g1_gate: crate::tune::var("VP9_NO_G1GATE").is_err(),
+            g3_gate: crate::tune::var("VP9_G3GATE").is_ok(), // harvest-first: off by default
             g1_scale: 1.0,
             g1_area: 1.0,
             // Default 40.0 (was 18.0, the shared G1 value). BD-gated on a 5-point
@@ -1370,58 +1370,58 @@ impl FrameEncoder {
             // it is -0.10% mean BD-rate — a WIN — with a single regressing clip
             // (akiyo +0.32%). `VP9_NO_SUB8X8_GATE` restores the old 18.0 + skipgate-off
             // behaviour exactly and is the A/B oracle.
-            sub8x8_g1: std::env::var("VP9_SUB8X8_G1")
+            sub8x8_g1: crate::tune::var("VP9_SUB8X8_G1")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(if std::env::var("VP9_NO_SUB8X8_GATE").is_ok() {
+                .unwrap_or(if crate::tune::var("VP9_NO_SUB8X8_GATE").is_ok() {
                     18.0
                 } else {
                     40.0
                 }),
-            sub8x8_skipgate: std::env::var("VP9_NO_SUB8X8_GATE").is_err(),
+            sub8x8_skipgate: crate::tune::var("VP9_NO_SUB8X8_GATE").is_err(),
             last_none_sse: 0,
-            var_part: std::env::var("VP9_VAR_PART").is_ok(),
-            var_thresh_mult: std::env::var("VP9_VAR_THRESH")
+            var_part: crate::tune::var("VP9_VAR_PART").is_ok(),
+            var_thresh_mult: crate::tune::var("VP9_VAR_THRESH")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(24.0),
             vt: None,
-            dispatch: std::env::var("VP9_DISPATCH").is_ok(),
-            dispatch_thresh: std::env::var("VP9_DISPATCH_T")
+            dispatch: crate::tune::var("VP9_DISPATCH").is_ok(),
+            dispatch_thresh: crate::tune::var("VP9_DISPATCH_T")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3000),
-            dispatch_fixed_t: std::env::var("VP9_DISPATCH_T").is_ok(),
-            dispatch_q: std::env::var("VP9_DISPATCH_Q")
+            dispatch_fixed_t: crate::tune::var("VP9_DISPATCH_T").is_ok(),
+            dispatch_q: crate::tune::var("VP9_DISPATCH_Q")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.5),
-            dispatch_hi: std::env::var("VP9_DISPATCH_HI").is_ok(),
+            dispatch_hi: crate::tune::var("VP9_DISPATCH_HI").is_ok(),
             decision_us: 0,
-            nonrd_leaf: std::env::var("VP9_NONRD_LEAF").is_ok(),
+            nonrd_leaf: crate::tune::var("VP9_NONRD_LEAF").is_ok(),
             variance_leaf: false,
             // Default 1.0 SAD/px: BD-neutral (−0.05%) at ~1.05× (1.14× on static content
             // where the gate fires often). Only ever active on the nonrd leaf (gated), so
             // harmless at the RD tiers. `VP9_NONRD_ME_SKIP=0` disables.
-            nonrd_me_skip: std::env::var("VP9_NONRD_ME_SKIP")
+            nonrd_me_skip: crate::tune::var("VP9_NONRD_ME_SKIP")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1.0),
-            model_skip: std::env::var("VP9_MODEL_SKIP").is_ok(),
-            model_skip_t: std::env::var("VP9_MODEL_SKIP_T")
+            model_skip: crate::tune::var("VP9_MODEL_SKIP").is_ok(),
+            model_skip_t: crate::tune::var("VP9_MODEL_SKIP_T")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(23),
-            chroma_rd: std::env::var("VP9_CHROMA_RD").is_ok(), // set_speed enables for speed ≤ 3
-            chroma_rd_w: std::env::var("VP9_CHROMA_RD_W")
+            chroma_rd: crate::tune::var("VP9_CHROMA_RD").is_ok(), // set_speed enables for speed ≤ 3
+            chroma_rd_w: crate::tune::var("VP9_CHROMA_RD_W")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.35), // tuned optimum (BD-rate-swept @s3)
-            yuv_abort: std::env::var("VP9_NO_YUV_ABORT").is_err(),
-            snap_recon: std::env::var("VP9_NO_SNAP_RECON").is_err(),
-            model_rank: std::env::var("VP9_MODEL_RANK").is_ok(),
+            yuv_abort: crate::tune::var("VP9_NO_YUV_ABORT").is_err(),
+            snap_recon: crate::tune::var("VP9_NO_SNAP_RECON").is_err(),
+            model_rank: crate::tune::var("VP9_MODEL_RANK").is_ok(),
             tx_scratch: Some(Box::default()),
-            tx_memset: std::env::var("VP9_TX_MEMSET").is_ok(),
+            tx_memset: crate::tune::var("VP9_TX_MEMSET").is_ok(),
             has_avx2: {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -1617,11 +1617,11 @@ impl FrameEncoder {
                                      // Bilinear-scored subpel refinement (libvpx sub_pixel_tree semantics):
                                      // BD +0.55% mean for a cheaper scorer; `VP9_SUBPEL_8TAP` restores the
                                      // commit-grade 8-tap scorer.
-            self.subpel_bilinear = std::env::var("VP9_SUBPEL_8TAP").is_err();
+            self.subpel_bilinear = crate::tune::var("VP9_SUBPEL_8TAP").is_err();
             // Plus+diagonal single-pass subpel (8.3 scores/search vs 12.9,
             // subpel 2.4→1.2µs — BELOW libvpx's 1.75): BD +1.35% mean, the
             // speed-first trade; `VP9_SUBPEL_WALK` restores the iterating diamond.
-            self.subpel_diag = std::env::var("VP9_SUBPEL_WALK").is_err();
+            self.subpel_diag = crate::tune::var("VP9_SUBPEL_WALK").is_err();
         }
         if speed >= 4 {
             // Loop-filter level from a closed form instead of the 14-evaluation
@@ -1639,7 +1639,7 @@ impl FrameEncoder {
             // libvpx is the scarce resource there, so trading 0.155% BD for
             // ~5% speed only pays where speed is the objective. `VP9_LF_FROM_Q`
             // forces it on at any tier; `VP9_LF_SEARCH` forces the search.
-            self.lf_from_q = std::env::var("VP9_LF_SEARCH").is_err();
+            self.lf_from_q = crate::tune::var("VP9_LF_SEARCH").is_err();
         }
         if speed >= 3 {
             // Rebuilt from libvpx's cpu3-4 speed-features (the old rung dropped
@@ -1712,10 +1712,10 @@ impl FrameEncoder {
             // to these tiers — ~1.1× faster at neutral-or-better BD-rate (s5 −0.26%,
             // s6 −0.10% mean; akiyo −1.6% where model-skip helps most). `VP9_NO_NONRD_LEAF`
             // disables. See the non-RD leaf field doc.
-            if std::env::var("VP9_NO_NONRD_LEAF").is_err() {
+            if crate::tune::var("VP9_NO_NONRD_LEAF").is_err() {
                 self.nonrd_leaf = true;
             }
-            if std::env::var("VP9_DISPATCH_Q").is_err() {
+            if crate::tune::var("VP9_DISPATCH_Q").is_err() {
                 self.dispatch_q = match speed {
                     4 => 0.50, // ~1.4× on busy content, near-neutral quality
                     5 => 0.75, // ~1.8×
@@ -1727,9 +1727,9 @@ impl FrameEncoder {
         // 0.35·chroma RD instead of luma alone. A −0.30% BD-rate win @s3 (akiyo −0.83%,
         // mobile −0.38%) for ~1.18× encode, so a COMPRESSION-tier default (speed ≤ 3);
         // the realtime rungs (≥4) stay fast. `VP9_CHROMA_RD`/`VP9_NO_CHROMA_RD` override.
-        self.chroma_rd = if std::env::var("VP9_CHROMA_RD").is_ok() {
+        self.chroma_rd = if crate::tune::var("VP9_CHROMA_RD").is_ok() {
             true
-        } else if std::env::var("VP9_NO_CHROMA_RD").is_ok() {
+        } else if crate::tune::var("VP9_NO_CHROMA_RD").is_ok() {
             false
         } else {
             speed <= 3
@@ -1746,7 +1746,7 @@ impl FrameEncoder {
         self.dispatch_q = q.clamp(0.0, 1.0);
         // The budget controller uses the variance path for speed, so its fast arm gets
         // the non-RD leaf too (Pareto: ~1.1× faster at neutral BD). `VP9_NO_NONRD_LEAF` off.
-        if std::env::var("VP9_NO_NONRD_LEAF").is_err() {
+        if crate::tune::var("VP9_NO_NONRD_LEAF").is_err() {
             self.nonrd_leaf = true;
         }
     }
@@ -1983,7 +1983,7 @@ impl FrameEncoder {
         // "wins" residual bits it silently spends back on signaling (measured:
         // tx-search made static clips BIGGER). `VP9_NO_TXCOST` restores the
         // uncosted search (the A/B oracle).
-        let charge = std::env::var("VP9_NO_TXCOST").is_err();
+        let charge = crate::tune::var("VP9_NO_TXCOST").is_err();
         let above = self.above_mi(mi_row, mi_col);
         let left = self.left_mi(mi_row, mi_col);
         let ctx = tx_size_context(mi, above.as_ref(), left.as_ref());
@@ -2174,11 +2174,11 @@ impl FrameEncoder {
             // ~8000 enables AQ on mostly-flat frames (akiyo inter ~1.4k) where it wins on
             // BOTH PSNR and SSIM, and disables it on textured content (foreman ~15k,
             // mobile ~130k) where it loses. Calibrated on the CIF set.
-            let maxvar: i64 = std::env::var("VP9_AQ_MAXVAR")
+            let maxvar: i64 = crate::tune::var("VP9_AQ_MAXVAR")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8000);
-            if std::env::var("VP9_AQ_DEBUG").is_ok() {
+            if crate::tune::var("VP9_AQ_DEBUG").is_ok() {
                 eprintln!(
                     "AQ median_var={} gate_max={} active={}",
                     median,
@@ -2203,7 +2203,7 @@ impl FrameEncoder {
             }
         }
         let initial = self.fc.clone();
-        let _prof = std::env::var("VP9_PROF").is_ok();
+        let _prof = crate::tune::var("VP9_PROF").is_ok();
         let _t = std::time::Instant::now();
         if self.partition_rd_active() {
             // Brick 4: measure this frame's SB variance distribution and set the
@@ -2343,7 +2343,7 @@ impl FrameEncoder {
             );
         }
         prof::dump();
-        if std::env::var("VP9_IF_HARVEST").is_ok() {
+        if crate::tune::var("VP9_IF_HARVEST").is_ok() {
             use std::sync::atomic::Ordering::Relaxed;
             let s0 = IF_HARVEST[0].load(Relaxed);
             let smin = IF_HARVEST[1].load(Relaxed);
@@ -2355,7 +2355,7 @@ impl FrameEncoder {
                 100.0 * (s0.saturating_sub(smin)) as f64 / s0.max(1) as f64,
             );
         }
-        if std::env::var("VP9_SUB8_PROBE").is_ok() {
+        if crate::tune::var("VP9_SUB8_PROBE").is_ok() {
             use std::sync::atomic::Ordering::Relaxed;
             let s0 = SUB8_PROBE[0].load(Relaxed);
             let smin = SUB8_PROBE[1].load(Relaxed);
@@ -2367,7 +2367,7 @@ impl FrameEncoder {
                 100.0 * (s0.saturating_sub(smin)) as f64 / s0.max(1) as f64,
             );
         }
-        if std::env::var("VP9_LFSEG_PROBE").is_ok() {
+        if crate::tune::var("VP9_LFSEG_PROBE").is_ok() {
             use std::sync::atomic::Ordering::Relaxed;
             let g = LFSEG_PROBE[0].load(Relaxed);
             let c = LFSEG_PROBE[1].load(Relaxed);
@@ -4351,7 +4351,7 @@ impl FrameEncoder {
             // predicts BEST on its own (lower single-ref J). The other var almost never
             // wins the averaged prediction, so this halves the compound trials at ~0 BD.
             // `VP9_COMPOUND_ALLVAR` restores the exhaustive both-vars A/B oracle.
-            let all_var = std::env::var("VP9_COMPOUND_ALLVAR").is_ok();
+            let all_var = crate::tune::var("VP9_COMPOUND_ALLVAR").is_ok();
             let best_var = if all_var {
                 usize::MAX // sentinel: don't filter
             } else {
@@ -4485,7 +4485,7 @@ impl FrameEncoder {
         // Interp-filter ceiling probe (env `VP9_IF_HARVEST`, observe-only): score the
         // winning inter MV's residual SSE under EIGHTTAP/SMOOTH/SHARP; accumulate the
         // per-block minimum vs EIGHTTAP. The reduction bounds the switchable-filter win.
-        if best_inter.0.is_finite() && std::env::var("VP9_IF_HARVEST").is_ok() {
+        if best_inter.0.is_finite() && crate::tune::var("VP9_IF_HARVEST").is_ok() {
             use std::sync::atomic::Ordering::Relaxed;
             let (_j, slot, _rf, _mode, mv, _p) = best_inter;
             let save_ref = self.active_ref;
@@ -7463,7 +7463,7 @@ impl FrameEncoder {
         // in full to be scored, so the winner's luma already exists by the time
         // it wins: keep it instead of filtering luma once more at the end.
         let mut best_luma: Vec<u16> = Vec::new();
-        let coarse: &[u32] = if std::env::var("VP9_LF_COARSE").is_ok() {
+        let coarse: &[u32] = if crate::tune::var("VP9_LF_COARSE").is_ok() {
             &[8, 16, 24, 32]
         } else {
             &[8, 16, 24, 32, 40, 48, 56, 63]
@@ -7480,7 +7480,7 @@ impl FrameEncoder {
                 keep_luma(&mut best_luma, &mut c0);
             }
         }
-        if std::env::var("VP9_LF_COARSE").is_err() {
+        if crate::tune::var("VP9_LF_COARSE").is_err() {
             // Local descent around the coarse best (re-centres each step → bridges the
             // step-8 gaps to the true minimum).
             for step in [4u32, 2, 1] {
@@ -7510,7 +7510,7 @@ impl FrameEncoder {
         // HARVEST TAP (observe-only, `VP9_LFHARVEST=1`): the searched optimum
         // alongside the features a predictor could use. Feeds the offline
         // question "can a formula replace this 14-evaluation search?".
-        if std::env::var_os("VP9_LFHARVEST").is_some() {
+        if crate::tune::var_os("VP9_LFHARVEST").is_some() {
             let q = crate::quant::ac_quant(h.base_q_idx as i32, 8);
             let key = h.key_frame || h.intra_only;
             // libvpx's LPF_PICK_FROM_Q closed form, for comparison.
