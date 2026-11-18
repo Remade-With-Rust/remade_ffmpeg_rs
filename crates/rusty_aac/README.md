@@ -98,6 +98,45 @@ fn encode(pcm: &[f32], channels: u16, sample_rate: u32) -> Result<Vec<u8>, Error
 }
 ```
 
+#### Streaming encode
+
+`finish()` encodes the whole clip at once. To encode as you render, and mux
+packets as they come, call `set_streaming(true)` before the first push.
+Packets then come out of `next_packet` two frames behind the input, and the
+encoder holds a few frames of PCM however long the stream is:
+
+```rust
+use rusty_aac::{AacEncoder, AacEncoderConfig, EncodedPacket, Error};
+
+fn stream(
+    rendered: impl IntoIterator<Item = Vec<f32>>, // interleaved f32, any length
+    channels: u16,
+    sample_rate: u32,
+    mut mux: impl FnMut(EncodedPacket),           // packet.pts is in samples
+) -> Result<(u32, Option<u32>), Error> {
+    let mut encoder = AacEncoder::new(AacEncoderConfig::default());
+    encoder.set_streaming(true);
+    for chunk in rendered {
+        encoder.push_pcm(&chunk, channels, sample_rate)?;
+        while let Ok(packet) = encoder.next_packet() {
+            mux(packet);
+        }
+    }
+    encoder.finish(); // the last frames and the flush frame
+    while let Ok(packet) = encoder.next_packet() {
+        mux(packet);
+    }
+    // For the MP4 edit list (or iTunSMPB): the decoded stream starts
+    // priming_samples() (1024) early and ends padding_samples() late.
+    Ok((encoder.priming_samples(), encoder.padding_samples()))
+}
+```
+
+On the lab corpus (all eight classes) the streamed packets are byte-identical
+to `finish()`'s. The one difference by construction is the level-invariant
+transient detector's floor, which streams use the mean seen so far for; with
+`relative_transients: false` the two are identical on any input.
+
 ### LATM / LOAS (MPEG-TS, broadcast)
 
 ```rust,ignore
