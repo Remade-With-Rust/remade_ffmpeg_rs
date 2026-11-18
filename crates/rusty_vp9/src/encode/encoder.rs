@@ -1087,10 +1087,13 @@ impl Vp9Encoder {
         let (w, h) = (frames[0].1, frames[0].2);
         // The first group, or any resize, restarts with a key frame + fresh slots;
         // so does a group that would run past `keyframe_interval`.
-        let need_key = self.slots[0].is_none()
-            || self.group_dims != Some((w, h))
-            || self.key_due(n as u32);
-        self.since_key = if need_key { n as u32 } else { self.since_key + n as u32 };
+        let need_key =
+            self.slots[0].is_none() || self.group_dims != Some((w, h)) || self.key_due(n as u32);
+        self.since_key = if need_key {
+            n as u32
+        } else {
+            self.since_key + n as u32
+        };
         self.group_dims = Some((w, h));
         self.group_chain = self.chain && !self.twopass;
 

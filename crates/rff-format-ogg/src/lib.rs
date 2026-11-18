@@ -1212,7 +1212,10 @@ mod tests {
         assert_eq!(all, whole);
         for cut in 1..400 {
             let (_, _, got) = demux_bytes(&file[..file.len() - cut]).unwrap();
-            assert!(got.len() < whole.len(), "cut {cut}: the cut packet is dropped");
+            assert!(
+                got.len() < whole.len(),
+                "cut {cut}: the cut packet is dropped"
+            );
             assert_eq!(got[..], whole[..got.len()], "cut {cut}: an exact prefix");
         }
     }

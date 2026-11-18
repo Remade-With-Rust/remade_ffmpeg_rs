@@ -32,8 +32,13 @@ fn encode(cfg: &Vp9EncoderConfig, n: u32) -> (Vec<bool>, Vec<Vec<u8>>) {
     };
     for i in 0..n {
         let f = frame(i);
-        enc.push_frame([&f[0], &f[1], &f[2]], [W as usize, (W / 2) as usize, (W / 2) as usize], W, H)
-            .unwrap();
+        enc.push_frame(
+            [&f[0], &f[1], &f[2]],
+            [W as usize, (W / 2) as usize, (W / 2) as usize],
+            W,
+            H,
+        )
+        .unwrap();
         drain(&mut enc);
     }
     enc.flush();
@@ -54,7 +59,11 @@ fn decodes(data: &[Vec<u8>]) -> usize {
 }
 
 fn key_positions(keys: &[bool]) -> Vec<usize> {
-    keys.iter().enumerate().filter(|(_, &k)| k).map(|(i, _)| i).collect()
+    keys.iter()
+        .enumerate()
+        .filter(|(_, &k)| k)
+        .map(|(i, _)| i)
+        .collect()
 }
 
 #[test]
