@@ -19,6 +19,21 @@
 //! * H.264 arrives Annex-B (SPS/PPS in-band on keyframes) and is stored AVCC
 //!   with a CodecPrivate `AVCDecoderConfigurationRecord` — the inverse of the
 //!   demuxer's normalisation, mirroring `rff-format-mp4`.
+//! * HEVC (`V_MPEGH/ISO/HEVC`) the same way: Annex-B in, 4-byte
+//!   length-prefixed NALs stored, VPS/SPS/PPS hoisted into an `hvcC`
+//!   CodecPrivate — taken from `extradata` when that is an `hvcC` record
+//!   (rebuilt when it declares other than 4-byte lengths), else built from
+//!   the first in-band VPS/SPS/PPS.
+//! * ProRes (`V_PRORES`): frames are stored without their leading 8-byte
+//!   `size` + `icpf` atom header, as FFmpeg's matroskaenc does ("Matroska
+//!   specification requires to remove the first QuickTime atom"; the demuxer
+//!   puts it back); CodecPrivate is the profile fourcc — [`Stream::codec_tag`]
+//!   when it names a ProRes profile, else `apcn`.
+//! * PCM: `A_PCM/INT/LIT` at BitDepth 8 (unsigned, as the codec mapping
+//!   requires), 16, 24 or 32, and `A_PCM/FLOAT/IEEE` at 32 or 64.
+//! * DNxHD/DNxHR and APV are refused: Matroska has no native codec ID for
+//!   either (DNx would need a `V_QUICKTIME`/`V_MS/VFW/FOURCC` wrapper; APV
+//!   has no mapping at all).
 //! * Vorbis: three setup headers either packed in `extradata` (u32-LE length
 //!   prefixed, the rff contract) or arriving as the first three packets (a
 //!   fresh `rusty_vorbis` encode) become the Xiph-laced CodecPrivate.
@@ -27,7 +42,7 @@
 //!
 //! WebM is the restricted doctype: VP8/VP9/AV1 video, Opus/Vorbis audio,
 //! WebVTT subtitles; anything else is refused rather than written as an
-//! invalid file. Matroska also takes AC-3, E-AC-3 and ALAC (stream copy).
+//! invalid file. Matroska also takes HEVC, ProRes, AC-3, E-AC-3 and ALAC.
 //!
 //! Stream and packet metadata written back:
 //! * Video `Colour` with only the fields that say something (the element is
@@ -49,6 +64,7 @@ use rff_core::{
     SampleFormat,
 };
 use rff_format::avc::{build_avcc_record, split_annexb};
+use rff_format::hvc::{build_hvcc_record, parse_hvcc};
 use rff_format::{Muxer, Output, SeekOutput, Stream};
 
 use crate::{
@@ -287,6 +303,10 @@ struct TrackPlan {
     bit_depth: Option<u64>,
     /// H.264: convert Annex-B packets to AVCC blocks.
     is_avc: bool,
+    /// HEVC: convert Annex-B packets to length-prefixed blocks.
+    is_hevc: bool,
+    /// ProRes: drop the frame's 8-byte `size` + `icpf` header.
+    is_prores: bool,
     /// AV1: CodecPrivate is harvested from the first packet's sequence header.
     is_av1: bool,
     /// Vorbis with no extradata: capture the first three packets as headers.
@@ -332,6 +352,8 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
         private: None,
         bit_depth: None,
         is_avc: false,
+        is_hevc: false,
+        is_prores: false,
         is_av1: false,
         vorbis_pending: 0,
         vorbis_headers: Vec::new(),
@@ -358,6 +380,22 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
             }
             plan.codec = "V_MPEG4/ISO/AVC";
             plan.is_avc = true;
+        }
+        CodecId::Hevc => {
+            if webm {
+                return webm_reject("hevc");
+            }
+            plan.codec = "V_MPEGH/ISO/HEVC";
+            plan.is_hevc = true;
+            plan.private = hvcc_from_extradata(&s.extradata);
+        }
+        CodecId::ProRes => {
+            if webm {
+                return webm_reject("prores");
+            }
+            plan.codec = "V_PRORES";
+            plan.is_prores = true;
+            plan.private = Some(prores_fourcc(s).to_vec());
         }
         CodecId::Opus => {
             plan.codec = "A_OPUS";
@@ -415,22 +453,25 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
             if webm {
                 return webm_reject("pcm");
             }
-            match s.sample_format {
-                Some(SampleFormat::S16) | None => {
-                    plan.codec = "A_PCM/INT/LIT";
-                    plan.bit_depth = Some(16);
-                }
-                Some(SampleFormat::F32) => {
-                    plan.codec = "A_PCM/FLOAT/IEEE";
-                    plan.bit_depth = Some(32);
-                }
+            // Little-endian interleaved, as rff carries PCM; 8-bit integer
+            // PCM is unsigned in Matroska, which is rff's u8.
+            let (codec, depth) = match s.sample_format {
+                Some(SampleFormat::U8) => ("A_PCM/INT/LIT", 8),
+                Some(SampleFormat::S16) | None => ("A_PCM/INT/LIT", 16),
+                Some(SampleFormat::S24) => ("A_PCM/INT/LIT", 24),
+                Some(SampleFormat::S32) => ("A_PCM/INT/LIT", 32),
+                Some(SampleFormat::F32) => ("A_PCM/FLOAT/IEEE", 32),
+                Some(SampleFormat::F64) => ("A_PCM/FLOAT/IEEE", 64),
                 Some(other) => {
                     return Err(Error::unsupported(format!(
-                        "mkv mux: PCM sample format `{}` (interleaved s16/f32 only)",
+                        "mkv mux: PCM sample format `{}` (interleaved u8/s16/s24/s32/f32/f64 \
+                         only)",
                         other.name()
                     )))
                 }
-            }
+            };
+            plan.codec = codec;
+            plan.bit_depth = Some(depth);
         }
         CodecId::Subrip => {
             if webm {
@@ -459,6 +500,36 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
     plan.delay_ms =
         ((u128::from(plan.codec_delay_ns) + 500_000) / 1_000_000).min(i64::MAX as u128) as i64;
     Ok(plan)
+}
+
+/// An `hvcC` CodecPrivate from a stream's `extradata`, when it holds one.
+/// Blocks are written with 4-byte NAL lengths, so a record declaring another
+/// length is rebuilt from its parameter sets rather than copied (a copied
+/// `lengthSizeMinusOne` would misframe every block).
+fn hvcc_from_extradata(extradata: &[u8]) -> Option<Vec<u8>> {
+    let cfg = parse_hvcc(extradata)?;
+    if cfg.nal_len == 4 {
+        return Some(extradata.to_vec());
+    }
+    let nals = split_annexb(&cfg.headers_annexb);
+    let find = |t: u8| {
+        nals.iter()
+            .copied()
+            .find(|n| n.first().map(|b| (b >> 1) & 0x3F) == Some(t))
+    };
+    build_hvcc_record(find(32).unwrap_or(&[]), find(33)?, find(34)?)
+}
+
+/// The ProRes profiles a `V_PRORES` CodecPrivate names.
+const PRORES_FOURCCS: [[u8; 4]; 6] = [*b"apco", *b"apcs", *b"apcn", *b"apch", *b"ap4h", *b"ap4x"];
+
+/// `V_PRORES` CodecPrivate: the stream's codec tag when it is a ProRes
+/// profile fourcc (an MP4/MOV or Matroska source keeps it), else `apcn`.
+fn prores_fourcc(s: &Stream) -> [u8; 4] {
+    match s.codec_tag {
+        Some(tag) if PRORES_FOURCCS.contains(&tag) => tag,
+        _ => *b"apcn",
+    }
 }
 
 /// Codecs whose CodecPrivate only the stream can supply: refuse to write a
@@ -649,8 +720,17 @@ fn tracks_element(tracks: &[TrackPlan]) -> Vec<u8> {
     tracks_elem
 }
 
-fn missing_avc_config() -> Error {
-    Error::invalid("mkv mux: H.264 stream carried no SPS/PPS (need Annex-B with in-band headers)")
+fn missing_ps_config(plan: &TrackPlan) -> Error {
+    if plan.is_hevc {
+        Error::invalid(
+            "mkv mux: HEVC stream carried no VPS/SPS/PPS (need Annex-B with in-band headers, \
+             or an hvcC record as extradata)",
+        )
+    } else {
+        Error::invalid(
+            "mkv mux: H.264 stream carried no SPS/PPS (need Annex-B with in-band headers)",
+        )
+    }
 }
 
 /// Cluster policy: open a new Cluster for a block at `ts_ms` when there is
@@ -788,14 +868,20 @@ fn prepare_block(tracks: &mut [TrackPlan], packet: &Packet) -> Result<Option<Buf
         return Ok(None);
     }
 
-    // H.264: Annex-B → AVCC block; hoist SPS/PPS into CodecPrivate.
-    let data = if plan.is_avc {
+    // H.264 / HEVC: Annex-B → length-prefixed block; hoist the parameter
+    // sets into CodecPrivate (the demuxer puts them back on keyframes).
+    let data = if plan.is_avc || plan.is_hevc {
+        let hevc = plan.is_hevc;
         let mut sample = Vec::new();
-        let (mut sps, mut pps) = (None, None);
+        let (mut vps, mut sps, mut pps) = (None, None, None);
         for nal in split_annexb(&packet.data) {
-            match nal.first().map(|b| b & 0x1F) {
-                Some(7) => sps = Some(nal.to_vec()),
-                Some(8) => pps = Some(nal.to_vec()),
+            let kind = nal
+                .first()
+                .map(|&b| if hevc { (b >> 1) & 0x3F } else { b & 0x1F });
+            match (hevc, kind) {
+                (false, Some(7)) | (true, Some(33)) => sps = Some(nal),
+                (false, Some(8)) | (true, Some(34)) => pps = Some(nal),
+                (true, Some(32)) => vps = Some(nal),
                 _ => {
                     sample.extend_from_slice(&(nal.len() as u32).to_be_bytes());
                     sample.extend_from_slice(nal);
@@ -803,11 +889,19 @@ fn prepare_block(tracks: &mut [TrackPlan], packet: &Packet) -> Result<Option<Buf
             }
         }
         if plan.private.is_none() {
-            if let (Some(s), Some(p)) = (&sps, &pps) {
-                plan.private = Some(build_avcc_record(s, p));
-            }
+            plan.private = match (sps, pps) {
+                (Some(s), Some(p)) if hevc => build_hvcc_record(vps.unwrap_or(&[]), s, p),
+                (Some(s), Some(p)) => Some(build_avcc_record(s, p)),
+                _ => None,
+            };
         }
         sample
+    } else if plan.is_prores {
+        // Matroska drops the frame's first QuickTime atom header.
+        match packet.data.get(4..8) {
+            Some(b"icpf") => packet.data[8..].to_vec(),
+            _ => packet.data.clone(),
+        }
     } else {
         if plan.is_av1 && plan.private.is_none() {
             plan.private = rff_format::av1::config_record(&packet.data);
@@ -955,8 +1049,11 @@ impl Muxer for MkvMuxer {
         // would be undecodable; refuse rather than write it silently broken.
         check_privates(&self.tracks)?;
         for (i, plan) in self.tracks.iter().enumerate() {
-            if plan.is_avc && plan.private.is_none() && self.blocks.iter().any(|b| b.track == i) {
-                return Err(missing_avc_config());
+            if (plan.is_avc || plan.is_hevc)
+                && plan.private.is_none()
+                && self.blocks.iter().any(|b| b.track == i)
+            {
+                return Err(missing_ps_config(plan));
             }
         }
 
@@ -1211,9 +1308,9 @@ impl MkvStreamingMuxer {
 
     /// Every CodecPrivate that packets can still reveal has been revealed.
     fn header_ready(&self) -> bool {
-        self.tracks
-            .iter()
-            .all(|p| p.vorbis_pending == 0 && !((p.is_avc || p.is_av1) && p.private.is_none()))
+        self.tracks.iter().all(|p| {
+            p.vorbis_pending == 0 && !((p.is_avc || p.is_hevc || p.is_av1) && p.private.is_none())
+        })
     }
 
     /// The interleave queues hold more than they should: write regardless.
@@ -1233,8 +1330,9 @@ impl MkvStreamingMuxer {
         // An H.264 track that already has blocks but no SPS/PPS would be
         // undecodable (the in-memory muxer refuses it at the trailer).
         for (i, plan) in self.tracks.iter().enumerate() {
-            if plan.is_avc && plan.private.is_none() && !self.queues[i].is_empty() {
-                return Err(missing_avc_config());
+            if (plan.is_avc || plan.is_hevc) && plan.private.is_none() && !self.queues[i].is_empty()
+            {
+                return Err(missing_ps_config(plan));
             }
         }
         check_privates(&self.tracks)?;
@@ -1306,8 +1404,8 @@ impl MkvStreamingMuxer {
 
     fn write_block(&mut self, b: &BufBlock) -> Result<()> {
         let plan = &self.tracks[b.track];
-        if plan.is_avc && plan.private.is_none() {
-            return Err(missing_avc_config());
+        if (plan.is_avc || plan.is_hevc) && plan.private.is_none() {
+            return Err(missing_ps_config(plan));
         }
         let video_key = self.is_video[b.track] && b.keyframe;
         let cluster_ts = self.cluster.as_ref().map(|c| c.ts_ms);
