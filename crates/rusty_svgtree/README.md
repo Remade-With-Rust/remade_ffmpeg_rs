@@ -13,6 +13,25 @@ and JPEG from `rusty_png` and `rusty_jpeg`. `#![forbid(unsafe_code)]`, no C.
 Part of **[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)**
 by **[Mata Network](https://www.mata.network/)**.
 
+
+## Against resvg and nanosvg (C), side by side
+
+`../rusty_raster/bench-c/` renders an SVG corpus with this crate, resvg 0.48 and nanosvg. The corpus is 105 files: 34 feature tests and 71 real SVGs from a Windows Program Files tree, each fitted to a 1024 px box.
+
+- **Pixels:**
+  - 98 of the 105 files are identical to resvg; the other 7 are 36-55 dB.
+  - 7 files use `<filter>` or `<text>`, which are not implemented (the filter is skipped and the content drawn).
+  - 1 file differs only by JPEG decoder rounding.
+- **nanosvg:** its median PSNR against both this crate and resvg is 27 dB. It has no CSS, clip paths, masks or `preserveAspectRatio`, so it serves only as a speed reference.
+- **Speed:** measured over the 98 files where this crate and resvg produce identical pixels, so both do the same work. Parse and render the whole set, minimum of 11 pinned, ABBA-interleaved rounds.
+
+| | rusty_svgtree | resvg 0.48 (Rust) | nanosvg (C) |
+|---|---:|---:|---:|
+| time | 992 ms | **518 ms** | **481 ms** |
+| relative to rusty_svgtree | 1.00x | 1.91x faster | 2.06x faster |
+
+This crate is about half the speed of both, and is not profiled yet. Part of the gap is `rusty_raster`'s scalar lanes, which run 0.70-0.95x of tiny-skia. Over the full 105 files the totals look reversed (resvg spends seconds on filters this crate skips), so that comparison is not reported as a speed result.
+
 ## What is verified
 
 **Oracle: resvg 0.48.1** (dev-dependency; numbers measured with this crate on

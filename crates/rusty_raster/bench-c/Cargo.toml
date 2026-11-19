@@ -1,0 +1,23 @@
+# Side-by-side bench: rusty_raster vs tiny-skia (Rust) vs Cairo (C), and
+# rusty_svgtree vs resvg (Rust) vs nanosvg (C). Tooling only: its own
+# workspace, outside both published packages. See README.md for setup.
+[package]
+name = "rusty_raster-bench-c"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+rusty_raster = { path = "..", default-features = false }
+rusty_svgtree = { path = "../../rusty_svgtree" }
+tiny-skia = "0.12.0"
+resvg = { version = "0.48.1", default-features = false, features = ["raster-images"] }
+rusty_alloc-api = "=2.5.0"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+debug = 1

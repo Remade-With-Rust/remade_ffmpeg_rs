@@ -15,6 +15,23 @@ See [NOTICE.md](NOTICE.md) for attribution and what changed.
 Part of **[remade_ffmpeg_rs](https://github.com/Remade-With-Rust/remade_ffmpeg_rs)**
 by **[Mata Network](https://www.mata.network/)**.
 
+
+## Against Cairo (C) and tiny-skia, side by side
+
+`bench-c/` draws four workloads on a 2048x2048 surface with this crate, tiny-skia 0.12 and Cairo, compares the pixels, and times all three in one process (setup and method in `bench-c/README.md`).
+
+| workload | vs tiny-skia: pixels | vs tiny-skia: speed | vs Cairo: PSNR | vs Cairo: speed |
+|---|---|---:|---:|---:|
+| 20,000 small anti-aliased triangles and circles | identical | 0.95x | 44.6 dB | 1.01x |
+| 6,000-vertex self-intersecting star, even-odd | identical | 0.87x | 34.6 dB | **1.71x** |
+| 600 cubics, width 8, round joins/caps, dashed | identical | 0.93x | 38.6 dB | **1.28x** |
+| 600 linear and radial gradient rectangles | identical | 0.70x | 47.4 dB | 0.87x |
+
+- **Speed columns:** above 1 means this crate is faster. Each entry is the minimum time over 15 pinned, ABBA-interleaved rounds; every speed row is 13/15 to 15/15 one way, except 5/15 against tiny-skia on small paths.
+- **PSNR against Cairo:** Cairo anti-aliases differently. tiny-skia scores exactly the same against it.
+- **Speed against Cairo:** this crate is faster on large paths and strokes, at parity on many small paths, and behind on gradients.
+- **Speed against tiny-skia:** 5–13% behind on geometry and 30% behind on gradients. That is the cost of the scalar lane types that replaced tiny-skia's `unsafe` SSE2 intrinsics; making them auto-vectorise is the next speed step.
+
 ## What is verified
 
 **Oracle: tiny-skia 0.12.0** (dev-dependency only). A deterministic corpus of
