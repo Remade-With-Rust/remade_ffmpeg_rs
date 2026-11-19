@@ -66,6 +66,14 @@ impl BitWriter {
         self.write(u32::from(b), 1);
     }
 
+    /// Append everything `other` holds, bit for bit.
+    pub fn append(&mut self, other: &Self) {
+        for &byte in &other.buf {
+            self.write(u32::from(byte), 8);
+        }
+        self.write(u32::from(other.cur), u32::from(other.nbits));
+    }
+
     /// Total bits written so far.
     #[must_use]
     pub fn bit_len(&self) -> usize {
@@ -573,7 +581,102 @@ fn masking_from_energy(
             };
             spread * smr
         })
+        .zip(ath_long(swb, sample_rate, n_coeffs).iter())
+        .map(|(thr, &ath)| thr.max(ath))
         .collect()
+}
+
+/// The absolute threshold of hearing (Terhardt's approximation), in dB SPL, at
+/// `hz`, capped at [`ATH_CAP_DB`].
+fn ath_db(hz: f64) -> f64 {
+    let f = (hz / 1000.0).max(0.02);
+    let db = 3.64 * f.powf(-0.8) - 6.5 * (-0.6 * (f - 3.3).powi(2)).exp() + 1e-3 * f.powi(4);
+    db.min(ATH_CAP_DB)
+}
+
+/// Ceiling on the hearing floor, in dB SPL (-80 dBFS). Terhardt's curve rises
+/// past 65 dB SPL at 16 kHz and past full scale near 18 kHz; uncapped, it acts
+/// as a bandwidth cut and drops quiet high detail that PEAQ still hears.
+/// Measured (PEAQ ODG vs the floor-less encoder, same decoder): a 50 dB cap
+/// cost stereo guitar 0.33 at 128 kbps and 0.20 at 320 kbps; at 20 dB those
+/// are at parity (-0.001, +0.002) while piano keeps +0.93 at 128 kbps.
+const ATH_CAP_DB: f64 = 20.0;
+
+/// Energy, in this encoder's long-block coefficient domain, of a full-scale
+/// sine: the reference the threshold of hearing is placed against (0 dBFS =
+/// [`ATH_FULL_SCALE_SPL`]). Measured once through the encoder's own long
+/// filterbank, so it tracks `SPEC_SCALE` and the MDCT normalisation exactly.
+fn full_scale_sine_energy() -> f64 {
+    static E: OnceLock<f64> = OnceLock::new();
+    *E.get_or_init(|| {
+        let n2 = 2 * FRAME_LEN;
+        let win: Vec<f32> = (0..n2)
+            .map(|n| (std::f64::consts::PI * (n as f64 + 0.5) / n2 as f64).sin() as f32)
+            .collect();
+        // 1 kHz at 48 kHz: a whole number of cycles per frame does not matter
+        // for the energy, which is what is measured.
+        let s = |n: usize| (2.0 * std::f64::consts::PI * 1000.0 * n as f64 / 48_000.0).sin() as f32;
+        let mut prev = [0f32; FRAME_LEN];
+        let mut cur = [0f32; FRAME_LEN];
+        for n in 0..FRAME_LEN {
+            prev[n] = s(n);
+            cur[n] = s(FRAME_LEN + n);
+        }
+        analyze_long(&prev, &cur, &win)
+            .iter()
+            .map(|&x| f64::from(x).powi(2))
+            .sum()
+    })
+}
+
+/// Sound pressure level a full-scale sine is taken to play at: 100 dB, 4 dB
+/// above the usual 16-bit convention of 96, which lowers the floor by 4 dB --
+/// margin for listening louder than the convention assumes. Measured (PEAQ
+/// ODG vs the floor-less encoder, same decoder): at 96 dB stereo vocal lost
+/// 0.15 at 320 kbps and mono piano 0.31 at 128 kbps; 100 dB is the setting
+/// the sweep found at parity on the losing clips.
+const ATH_FULL_SCALE_SPL: f64 = 100.0;
+
+/// Per-band absolute-threshold floor for the long-block mask (energy units):
+/// the energy a tone at the band's quietest audible level would have. A band
+/// whose content sits below it is inaudible, so its mask never falls below it.
+///
+/// Without this floor the mask scaled with each band's own energy, however
+/// small: a band holding only a tone's window leakage got a mask 18 dB below
+/// that leakage and was coded as if it mattered. On a 440 Hz tone at 96 kbps
+/// that spent the frame on ~450 near-silent coefficients and left the tone
+/// with 7 quantizer levels (17 dB SNR, and a 1.5x level error at 21 kbps):
+/// `remade_ffmpeg_rs#129`.
+///
+/// Long blocks only (`n_coeffs == FRAME_LEN`): short-block band energies are
+/// summed over a window group whose size this function does not see, so they
+/// keep the relative mask (short-block psy is off by default).
+fn ath_long(swb: &[u16], sample_rate: u32, n_coeffs: usize) -> Arc<Vec<f64>> {
+    type Cache = Mutex<HashMap<(u32, usize, usize), Arc<Vec<f64>>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (sample_rate, swb.len(), n_coeffs);
+    if let Some(a) = cache.lock().unwrap().get(&key) {
+        return a.clone();
+    }
+    let num_swb = swb.len() - 1;
+    let ath: Vec<f64> = if n_coeffs == FRAME_LEN {
+        let e_fs = full_scale_sine_energy();
+        let hz_per_line = f64::from(sample_rate) * 0.5 / n_coeffs as f64;
+        (0..num_swb)
+            .map(|sfb| {
+                let min_db = (usize::from(swb[sfb])..usize::from(swb[sfb + 1]))
+                    .map(|k| ath_db((k as f64 + 0.5) * hz_per_line))
+                    .fold(f64::INFINITY, f64::min);
+                e_fs * 10f64.powf((min_db - ATH_FULL_SCALE_SPL) / 10.0)
+            })
+            .collect()
+    } else {
+        vec![0.0; num_swb]
+    };
+    let arc = Arc::new(ath);
+    cache.lock().unwrap().insert(key, arc.clone());
+    arc
 }
 
 /// **Arm A2.** Signal-to-mask ratio as a function of band tonality and Bark.
@@ -3504,11 +3607,16 @@ impl AacEncoder {
             stereo_bit_split: self.stereo_bit_split,
         };
 
-        let mut rdb = BitWriter::new();
         // One pass over the ISO element sequence. `seqs` is indexed by ELEMENT,
         // not by channel: a CPE shares one window sequence across its pair, so
         // the two channels' transient flags were joined when the plan was built.
-        for (ei, elem) in plan.iter().enumerate() {
+        // Encode one element into its own writer at `per_channel` bits per
+        // channel. Elements are independent within a frame (the encoder keeps
+        // no per-element state between them), so one can be re-encoded at a
+        // different budget.
+        let encode_elem = |ei: usize, elem: &Elem, per_channel: usize| -> BitWriter {
+            let mut wr = BitWriter::new();
+            let w = &mut wr;
             let seq = seqs[ei][b];
             let tag = ei as u32;
             match *elem {
@@ -3519,7 +3627,7 @@ impl AacEncoder {
                         let sl = analyze_short(&p0, &c0, short_win);
                         let sr_ = analyze_short(&p1, &c1, short_win);
                         encode_cpe(
-                            &mut rdb,
+                            w,
                             tag,
                             &sl,
                             &sr_,
@@ -3543,7 +3651,7 @@ impl AacEncoder {
                         let sl = analyze_long(&p0, &c0, &win);
                         let sr_ = analyze_long(&p1, &c1, &win);
                         encode_cpe(
-                            &mut rdb,
+                            w,
                             tag,
                             &sl,
                             &sr_,
@@ -3562,7 +3670,7 @@ impl AacEncoder {
                     if seq == WindowSequence::EightShort {
                         let spec = analyze_short(&p, &c, short_win);
                         encode_channel_element_short(
-                            &mut rdb,
+                            w,
                             tag,
                             &spec,
                             swb_s,
@@ -3583,7 +3691,7 @@ impl AacEncoder {
                         );
                         let spec = analyze_long(&p, &c, &win);
                         encode_channel_element(
-                            &mut rdb,
+                            w,
                             tag,
                             &spec,
                             swb,
@@ -3597,6 +3705,50 @@ impl AacEncoder {
                     }
                 }
             }
+            wr
+        };
+        let mut writers: Vec<BitWriter> = plan
+            .iter()
+            .enumerate()
+            .map(|(ei, e)| encode_elem(ei, e, per_channel))
+            .collect();
+        // Multichannel: hand the bits that some elements leave unused (silence,
+        // an LFE, simple content) to the elements that used their whole share,
+        // and re-encode those. The budget had been split evenly and never
+        // pooled, so a 5.1 stream with only its centre active coded that
+        // centre at a sixth of the bitrate (remade_ffmpeg_rs#129). One element
+        // (mono, stereo) has nothing to pool, so its output is unchanged.
+        if plan.len() > 1 {
+            let nch = |e: &Elem| if matches!(e, Elem::Cpe(..)) { 2 } else { 1 };
+            let budget = |e: &Elem| per_channel * nch(e);
+            // An element that used half its budget or more was limited by it:
+            // the rate loop's base steps are coarse at small budgets, so a
+            // limited element can land well short of its target. Silence and an
+            // LFE use a few dozen bits.
+            let binding = |e: &Elem, used: usize| 2 * used >= budget(e);
+            let mut spare = 0usize;
+            let mut binding_ch = 0usize;
+            for (e, w) in plan.iter().zip(&writers) {
+                if binding(e, w.bit_len()) {
+                    binding_ch += nch(e);
+                } else {
+                    spare += budget(e) - w.bit_len();
+                }
+            }
+            if binding_ch > 0 && spare >= 64 * binding_ch {
+                let more = (per_channel + spare / binding_ch).min(MAX_CHANNEL_BITS);
+                if more > per_channel {
+                    for (ei, e) in plan.iter().enumerate() {
+                        if binding(e, writers[ei].bit_len()) {
+                            writers[ei] = encode_elem(ei, e, more);
+                        }
+                    }
+                }
+            }
+        }
+        let mut rdb = BitWriter::new();
+        for w in &writers {
+            rdb.append(w);
         }
         rdb.write(ID_END, 3);
         (rdb.into_bytes(), (b * FRAME_LEN) as i64)
@@ -5163,6 +5315,29 @@ mod rung123 {
             .collect()
     }
 
+    /// [`transient_signal`] with a broadband (noise) attack, for arm A3. TNS
+    /// engages only when the coded range reaches `TNS_MAX_LONG`; a tone plus a
+    /// 3.3 kHz burst has nothing up there once the mask has a hearing floor
+    /// (#129), so its top bands are correctly left uncoded and TNS never fires.
+    fn broadband_transient_signal(sr: u32, frames: usize) -> Vec<f32> {
+        let mut x = 0x2468_ACE1u32;
+        let mut noise = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let mut v = transient_signal(sr, frames);
+        for (i, s) in v.iter_mut().enumerate() {
+            let k = i % (3 * FRAME_LEN);
+            let n = noise();
+            if k < 500 && i > FRAME_LEN {
+                *s += 0.5 * (1.0 - k as f32 / 500.0) * n;
+            }
+        }
+        v
+    }
+
     /// A tonal signal — a harmonic stack, the content arm A2 should treat
     /// differently from noise.
     fn tonal_signal(sr: u32, frames: usize) -> Vec<f32> {
@@ -5377,7 +5552,7 @@ mod rung123 {
     #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn a3_tns_inverts_exactly() {
         let sr = 44100u32;
-        let pcm = transient_signal(sr, 14);
+        let pcm = broadband_transient_signal(sr, 14);
 
         let snr_of = |cfg: AacEncoderConfig| -> f64 {
             let pkts = encode(&pcm, 1, sr, cfg);
@@ -5396,11 +5571,11 @@ mod rung123 {
         };
 
         let base = snr_of(AacEncoderConfig {
-            bitrate_bps: 128_000,
+            bitrate_bps: 256_000,
             ..Default::default()
         });
         let with_tns = snr_of(AacEncoderConfig {
-            bitrate_bps: 128_000,
+            bitrate_bps: 256_000,
             tns: true,
             ..Default::default()
         });
@@ -5447,14 +5622,17 @@ mod rung123 {
     #[test]
     #[cfg_attr(miri, ignore = "too slow to interpret: over 2 minutes under Miri")]
     fn a3_tns_actually_engages() {
+        // 256 kbps: TNS engages only on frames coded up to TNS_MAX_LONG (about
+        // 16 kHz here), and since the hearing floor (#129) 128 kbps mono no
+        // longer spends bits on the top bands of this signal.
         let sr = 44100u32;
-        let pcm = transient_signal(sr, 14);
+        let pcm = broadband_transient_signal(sr, 14);
         let off = encode(
             &pcm,
             1,
             sr,
             AacEncoderConfig {
-                bitrate_bps: 128_000,
+                bitrate_bps: 256_000,
                 ..Default::default()
             },
         );
@@ -5463,7 +5641,7 @@ mod rung123 {
             1,
             sr,
             AacEncoderConfig {
-                bitrate_bps: 128_000,
+                bitrate_bps: 256_000,
                 tns: true,
                 ..Default::default()
             },
@@ -5923,5 +6101,83 @@ mod rung_a7 {
             off, on,
             "A7 fired on fully decorrelated channels - the correlation gate is not working"
         );
+    }
+}
+
+/// `remade_ffmpeg_rs#129`: a pure tone, and a 5.1 stream with only its centre
+/// active, must come back at their level and with the precision their bitrate
+/// buys. Before the hearing floor the mask scaled with each band's own energy,
+/// so near-silent bands took the bits (a 440 Hz tone at 128 kbps: 19.8 dB);
+/// before budget pooling a lone 5.1 centre got a sixth of the bitrate (320
+/// kbps: 10.2 dB, gain up to 1.54 at 128 kbps).
+#[cfg(test)]
+mod fidelity_129 {
+    use super::*;
+
+    /// Encode interleaved `pcm`, decode it, and return channel `c`'s gain and
+    /// SNR (dB) against `src` over the middle half, at the encoder's
+    /// 1024-sample delay; plus the largest output sample on every other channel.
+    fn gain_snr(pcm: &[f32], ch: usize, c: usize, sr: u32, kbps: u32) -> (f64, f64, f32) {
+        let mut e = AacEncoder::new(AacEncoderConfig {
+            bitrate_bps: kbps * 1000,
+            ..Default::default()
+        });
+        e.push_pcm(pcm, ch as u16, sr).unwrap();
+        e.finish();
+        let mut dec = crate::decode::Decoder::new(sr);
+        let mut out: Vec<f32> = Vec::new();
+        while let Ok(p) = e.next_packet() {
+            out.extend(dec.decode(&p.data, None).expect("decode").samples);
+        }
+        let n = pcm.len() / ch;
+        let (mut xy, mut xx) = (0f64, 0f64);
+        for i in n / 4..n * 3 / 4 {
+            let (x, y) = (
+                f64::from(pcm[i * ch + c]),
+                f64::from(out[(i + FRAME_LEN) * ch + c]),
+            );
+            xy += x * y;
+            xx += x * x;
+        }
+        let g = xy / xx;
+        let mut err = 0f64;
+        for i in n / 4..n * 3 / 4 {
+            let e = f64::from(out[(i + FRAME_LEN) * ch + c]) - f64::from(pcm[i * ch + c]);
+            err += e * e;
+        }
+        let others = (0..out.len())
+            .filter(|i| i % ch != c)
+            .map(|i| out[i].abs())
+            .fold(0f32, f32::max);
+        (g, 10.0 * (xx / err).log10(), others)
+    }
+
+    fn tone(n: usize, ch: usize, c: usize, sr: u32) -> Vec<f32> {
+        let amp = 10f32.powf(-10.0 / 20.0);
+        let mut v = vec![0f32; n * ch];
+        for i in 0..n {
+            v[i * ch + c] = amp * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sr as f32).sin();
+        }
+        v
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret")]
+    fn a_pure_tone_gets_the_bits() {
+        let sr = 48_000;
+        let (g, snr, _) = gain_snr(&tone(sr as usize * 2, 1, 0, sr), 1, 0, sr, 128);
+        assert!((0.99..=1.01).contains(&g), "gain {g}");
+        assert!(snr > 30.0, "a 440 Hz tone at 128 kbps: {snr:.1} dB");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret")]
+    fn a_lone_5_1_centre_gets_the_whole_bitrate() {
+        let sr = 48_000;
+        // WAV / FFmpeg order: L R C LFE Ls Rs.
+        let (g, snr, others) = gain_snr(&tone(sr as usize * 2, 6, 2, sr), 6, 2, sr, 320);
+        assert!((0.99..=1.01).contains(&g), "centre gain {g}");
+        assert!(snr > 45.0, "5.1 centre alone at 320 kbps: {snr:.1} dB");
+        assert!(others < 1e-3, "silent channels stay silent: {others}");
     }
 }
