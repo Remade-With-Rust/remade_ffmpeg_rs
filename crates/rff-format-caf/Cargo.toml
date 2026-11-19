@@ -1,0 +1,17 @@
+[package]
+name = "rff-format-caf"
+description = "Remade FFmpeg (Rust): Core Audio Format (CAF) container (demux): LPCM, ALAC, AAC, ima4 and G.711."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["caf", "core-audio", "alac", "container", "audio"]
+categories = ["multimedia", "multimedia::audio", "parser-implementations"]
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true

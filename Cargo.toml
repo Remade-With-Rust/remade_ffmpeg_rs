@@ -42,6 +42,8 @@ default-members = [
     "crates/rff-codec-rawvideo",
     "crates/rff-format-wav",
     "crates/rff-format-aiff",
+    "crates/rff-format-caf",
+    "crates/rff-codec-alac",
     "crates/rff-format-y4m",
     "crates/rff-format-ivf",
     "crates/rff-format-av2f",
@@ -125,6 +127,8 @@ rff-codec-rawvideo = { path = "crates/rff-codec-rawvideo", version = "0.6.1" }
 rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.6.1" }
 rff-format-wav = { path = "crates/rff-format-wav", version = "0.6.1" }
 rff-format-aiff = { path = "crates/rff-format-aiff", version = "0.6.1" }
+rff-format-caf = { path = "crates/rff-format-caf", version = "0.6.1" }
+rff-codec-alac = { path = "crates/rff-codec-alac", version = "0.6.1" }
 rff-format-ogg = { path = "crates/rff-format-ogg", version = "0.6.1" }
 rff-format-flac = { path = "crates/rff-format-flac", version = "0.6.1" }
 rff-format-mp3 = { path = "crates/rff-format-mp3", version = "0.6.1" }

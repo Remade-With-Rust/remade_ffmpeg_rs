@@ -36,12 +36,12 @@ CRATES=(
   # wave 1 — abstractions over rff-core
   rff-codec rff-format rff-filter rff-io
   # wave 2 — leaf codecs
-  rff-codec-aac rff-codec-avif rff-codec-flac rff-codec-gif rff-codec-h264
+  rff-codec-aac rff-codec-alac rff-codec-avif rff-codec-flac rff-codec-gif rff-codec-h264
   rff-codec-jpeg rff-codec-jxl rff-codec-mp3 rff-codec-openh264 rff-codec-opus
   rff-codec-pcm rff-codec-png rff-codec-rawvideo rff-codec-vorbis
   rff-codec-vp9 rff-codec-webp
   # wave 2 — leaf containers
-  rff-format-aiff rff-format-avi rff-format-avif rff-format-flac rff-format-flv rff-format-gif
+  rff-format-aiff rff-format-avi rff-format-caf rff-format-avif rff-format-flac rff-format-flv rff-format-gif
   rff-format-ivf rff-format-jpeg rff-format-jxl rff-format-mkv rff-format-mp3
   rff-format-mp4 rff-format-ogg rff-format-png rff-format-srt rff-format-ts
   rff-format-wav rff-format-webp rff-format-webvtt rff-format-y4m

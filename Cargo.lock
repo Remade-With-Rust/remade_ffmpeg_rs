@@ -4782,6 +4782,7 @@ dependencies = [
  "md-5",
  "rff-codec",
  "rff-codec-aac",
+ "rff-codec-alac",
  "rff-codec-av2",
  "rff-codec-avif",
  "rff-codec-flac",
@@ -4807,6 +4808,7 @@ dependencies = [
  "rff-format-av2f",
  "rff-format-avi",
  "rff-format-avif",
+ "rff-format-caf",
  "rff-format-flac",
  "rff-format-flv",
  "rff-format-gif",
@@ -4932,6 +4934,14 @@ dependencies = [
  "rff-codec",
  "rff-core",
  "rusty_aac",
+]
+
+[[package]]
+name = "rff-codec-alac"
+version = "0.6.1"
+dependencies = [
+ "rff-codec",
+ "rff-core",
 ]
 
 [[package]]
@@ -5145,6 +5155,14 @@ dependencies = [
 
 [[package]]
 name = "rff-format-avif"
+version = "0.6.1"
+dependencies = [
+ "rff-core",
+ "rff-format",
+]
+
+[[package]]
+name = "rff-format-caf"
 version = "0.6.1"
 dependencies = [
  "rff-core",
