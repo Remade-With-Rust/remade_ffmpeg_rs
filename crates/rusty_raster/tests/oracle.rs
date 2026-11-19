@@ -8,8 +8,6 @@
 //! table. `RR_ORACLE_DUMP=<dir>` writes both renders of every differing scene
 //! as PNG.
 
-use std::fmt::Write as _;
-
 // ---------------------------------------------------------------------------
 // Scene description (backend-neutral)
 
@@ -127,7 +125,7 @@ enum Op {
 }
 
 #[derive(Clone, Debug)]
-struct Scene {
+pub struct Scene {
     cat: &'static str,
     name: String,
     w: u32,
@@ -162,7 +160,7 @@ fn src_bytes() -> Vec<u8> {
 
 macro_rules! backend {
     ($fname:ident, $ns:ident) => {
-        fn $fname(sc: &Scene) -> Option<Vec<u8>> {
+        pub fn $fname(sc: &Scene) -> Option<Vec<u8>> {
             use $ns as s;
 
             fn ts(t: &[f32; 6]) -> s::Transform {
@@ -703,7 +701,7 @@ fn random_mask(r: &mut Rng, w: f32, h: f32) -> Option<MaskSpec> {
     }
 }
 
-fn corpus() -> Vec<Scene> {
+pub fn corpus() -> Vec<Scene> {
     let mut out = Vec::new();
     let mut push = |cat: &'static str, name: String, w: u32, h: u32, bg, ops| {
         out.push(Scene {
@@ -1492,6 +1490,8 @@ fn dump_png(dir: &str, name: &str, w: u32, h: u32, data: Vec<u8>) {
 
 #[test]
 fn oracle_corpus_vs_tiny_skia() {
+    use std::fmt::Write as _;
+
     let scenes = corpus();
     let dump = std::env::var("RR_ORACLE_DUMP").ok();
 

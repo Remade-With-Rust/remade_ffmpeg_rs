@@ -32,3 +32,7 @@ rusty_alloc-api.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[[example]]
+name = "rasterbench"
+test = false

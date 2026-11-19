@@ -82,3 +82,49 @@ impl<T, const N: usize> IntoIterator for ArrayVec<T, N> {
         self.0.into_iter()
     }
 }
+
+/// A fixed-capacity vector on the stack for `Copy` items: tiny-skia's
+/// allocation-free `ArrayVec`, without `unsafe`. Unused slots hold a filler
+/// value. Pushing past the capacity (which the callers' bounds rule out) is
+/// debug-asserted and otherwise dropped instead of panicking.
+#[derive(Clone, Copy, Debug)]
+pub struct StackVec<T: Copy, const N: usize> {
+    buf: [T; N],
+    len: usize,
+}
+
+impl<T: Copy, const N: usize> StackVec<T, N> {
+    #[inline]
+    pub fn new(fill: T) -> Self {
+        StackVec {
+            buf: [fill; N],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    pub fn push(&mut self, v: T) {
+        debug_assert!(self.len < N, "StackVec capacity {N} exceeded");
+        if let Some(slot) = self.buf.get_mut(self.len) {
+            *slot = v;
+            self.len += 1;
+        }
+    }
+}
+
+impl<T: Copy, const N: usize> core::ops::Deref for StackVec<T, N> {
+    type Target = [T];
+    #[inline]
+    fn deref(&self) -> &[T] {
+        &self.buf[..self.len]
+    }
+}
+
+impl<T: Copy, const N: usize> IntoIterator for StackVec<T, N> {
+    type Item = T;
+    type IntoIter = core::iter::Take<core::array::IntoIter<T, N>>;
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.buf.into_iter().take(self.len)
+    }
+}

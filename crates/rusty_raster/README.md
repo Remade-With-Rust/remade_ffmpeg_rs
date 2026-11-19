@@ -132,7 +132,17 @@ takes any `&mut [u8]` of `w * h * 4` premultiplied RGBA bytes.
 
 - Same feature set as tiny-skia 0.12: no text, no image filters, no
   GPU path. Output is 8-bit premultiplied RGBA only.
-- Speed has not been measured against tiny-skia yet. The pipeline lanes are
-  scalar arrays that LLVM auto-vectorises; tiny-skia uses SSE2/AVX/NEON
-  intrinsics, so expect this crate to be slower until it is measured and
-  tuned. No speed number is claimed.
+- **Speed: about 1.7x slower than tiny-skia today.** Measured with
+  `examples/rasterbench.rs` on the 645-scene oracle corpus:
+  - Setup: both crates in one process under `rusty_alloc`, pinned to one core
+    at High priority, each arm timed on its own monotonic clock, ABBA rounds,
+    20 rounds x 6 repetitions, cpu/wall 0.99.
+  - Result: tiny-skia takes a median 0.582x our time (range 0.559 to 0.602),
+    and we are faster in 0 of 20 rounds (z = -4.47).
+  - Noise floor: the null arm (this crate against itself) reads 1.014
+    (range 0.976 to 1.041).
+  - Work parity: 645 scenes rendered per arm.
+
+  tiny-skia runs SSE2 intrinsics; the lanes here are scalar arrays that LLVM
+  auto-vectorises. That is the leading suspect for the gap, but it is not yet
+  profiled. Closing it without `unsafe` is the next piece of work.

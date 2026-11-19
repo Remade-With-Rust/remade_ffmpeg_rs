@@ -4,7 +4,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::arrayvec::ArrayVec;
+use crate::arrayvec::StackVec;
 
 use crate::path::{NormalizedF32Exclusive, SCALAR_MAX};
 
@@ -31,7 +31,7 @@ macro_rules! copy_4_points {
 /// Max curvature in X and Y split cubic into 9 pieces, * (line + cubic).
 const MAX_VERBS: usize = 18;
 
-pub type ClippedEdges = ArrayVec<PathEdge, MAX_VERBS>;
+pub type ClippedEdges = StackVec<PathEdge, MAX_VERBS>;
 
 pub struct EdgeClipper {
     clip: Rect,
@@ -44,7 +44,7 @@ impl EdgeClipper {
         EdgeClipper {
             clip,
             can_cull_to_the_right,
-            edges: ArrayVec::new(),
+            edges: StackVec::new(PathEdge::LineTo(Point::zero(), Point::zero())),
         }
     }
 
