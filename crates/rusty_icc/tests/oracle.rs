@@ -20,7 +20,7 @@
 
 mod common;
 
-use common::{camera_lut16_lab, camera_mab_xyz, data, fogra39};
+use common::{camera_lut16_lab, camera_mab_xyz, data, fogra39, srgb_as_mab};
 use moxcms::{ColorProfile, InterpolationMethod, Layout as ML, RenderingIntent, TransformOptions};
 use rusty_icc::color::{delta_e_2000, Lab};
 use rusty_icc::{Intent, Layout, Options, Profile, Transform};
@@ -536,4 +536,63 @@ fn grey_profiles() {
     for r in &rows {
         assert!(r.max_de < 1.0, "{}: {}", r.name, r.max_de);
     }
+}
+
+/// sRGB encoded as an `mAB ` (M curves + matrix, XYZ PCS) must transform
+/// exactly like the matrix/TRC sRGB. Measures each engine against itself,
+/// which locates the LUT-path residual in the rows above.
+#[test]
+fn lut_vs_matrix_self_consistency_both_engines() {
+    let lut = srgb_as_mab().encode();
+    let mat = Profile::new_srgb().encode();
+    let p3 = Profile::new_display_p3().encode();
+    let src: Vec<f32> = grid(3, 33).iter().map(|&v| v as f32).collect();
+    let i = Intent::RelativeColorimetric;
+    let ours = |s: &[u8]| {
+        let t = Transform::new(
+            &Profile::new_from_slice(s).unwrap(),
+            Layout::Rgb,
+            &Profile::new_from_slice(&p3).unwrap(),
+            Layout::Rgb,
+            i,
+            Options::default(),
+        )
+        .unwrap();
+        let mut o = vec![0f32; src.len()];
+        t.transform(&src, &mut o).unwrap();
+        o
+    };
+    let mox = |s: &[u8]| {
+        let opts = TransformOptions {
+            rendering_intent: mox_intent(i),
+            allow_use_cicp_transfer: false,
+            prefer_fixed_point: false,
+            interpolation_method: InterpolationMethod::Tetrahedral,
+            ..TransformOptions::default()
+        };
+        let t = ColorProfile::new_from_slice(s)
+            .unwrap()
+            .create_transform_f32(
+                ML::Rgb,
+                &ColorProfile::new_from_slice(&p3).unwrap(),
+                ML::Rgb,
+                opts,
+            )
+            .unwrap();
+        let mut o = vec![0f32; src.len()];
+        t.transform(&src, &mut o).unwrap();
+        o
+    };
+    let stat = |a: &[f32], b: &[f32]| {
+        let mut mx = 0f32;
+        let mut sum = 0f64;
+        for (x, y) in a.iter().zip(b) {
+            mx = mx.max((x - y).abs());
+            sum += f64::from((x - y).abs());
+        }
+        (mx, sum / a.len() as f64)
+    };
+    let (o, m) = (stat(&ours(&lut), &ours(&mat)), stat(&mox(&lut), &mox(&mat)));
+    println!("sRGB-as-mAB vs matrix sRGB -> P3, f32, 33^3: rusty_icc max {:.2e} mean {:.2e}; moxcms max {:.2e} mean {:.2e}", o.0, o.1, m.0, m.1);
+    assert!(o.0 < 1e-3, "{o:?}");
 }

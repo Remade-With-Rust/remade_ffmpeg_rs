@@ -5,11 +5,9 @@
 
 mod common;
 
-use common::{camera_lut16_lab, camera_mab_xyz, data, fogra39, DATA_PROFILES};
+use common::{camera_lut16_lab, camera_mab_xyz, data, fogra39, srgb_as_mab, DATA_PROFILES};
 use rusty_icc::color::{delta_e_2000, Lab, Xy, Xyz};
-use rusty_icc::{
-    AbLut, Curve, GamutCheck, Intent, Layout, Lut, Options, Profile, ProfileClass, Tag, Transform,
-};
+use rusty_icc::{Curve, GamutCheck, Intent, Layout, Lut, Options, Profile, Tag, Transform};
 
 fn rt(p: &Profile) -> Profile {
     let bytes = p.encode();
@@ -154,46 +152,6 @@ fn written_profiles_transform_like_builtins() {
     a.transform(&src, &mut x).unwrap();
     b.transform(&src, &mut y).unwrap();
     assert_eq!(x, y);
-}
-
-/// sRGB written as an `mAB ` (M curves = sRGB curve, matrix = colorants,
-/// XYZ PCS): through the LUT path it must equal the matrix-shaper path.
-fn srgb_as_mab() -> Profile {
-    let base = Profile::new_srgb();
-    let c = base.colorants().unwrap();
-    let q = |v: f64| (v * 32768.0 / 65535.0 * 65536.0).round() / 65536.0;
-    let m = [
-        q(c[0].x),
-        q(c[1].x),
-        q(c[2].x),
-        q(c[0].y),
-        q(c[1].y),
-        q(c[2].y),
-        q(c[0].z),
-        q(c[1].z),
-        q(c[2].z),
-        0.0,
-        0.0,
-        0.0,
-    ];
-    let mut p = base;
-    for s in [*b"rXYZ", *b"gXYZ", *b"bXYZ", *b"rTRC", *b"gTRC", *b"bTRC"] {
-        p.remove_tag(s);
-    }
-    p.header.class = ProfileClass::ColorSpace;
-    p.set_tag(
-        *b"A2B0",
-        Tag::Lut(Lut::AToB(AbLut {
-            inputs: 3,
-            outputs: 3,
-            a: None,
-            clut: None,
-            m: Some(vec![Curve::srgb(), Curve::srgb(), Curve::srgb()]),
-            matrix: Some(m),
-            b: vec![Curve::identity(), Curve::identity(), Curve::identity()],
-        })),
-    );
-    p
 }
 
 #[test]
