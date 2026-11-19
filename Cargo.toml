@@ -170,6 +170,9 @@ rusty_av1d = { version = "1.2.1", default-features = false, features = ["bitdept
 # (MIT/Apache-2.0), carried forward in-tree. DEFLATE via miniz_oxide/fdeflate,
 # with an opt-in pure-Rust `zlib-rs` backend. See crates/rusty_png/NOTICE.md.
 rusty_png = { path = "crates/rusty_png", version = "0.3.2", features = ["parallel"] }
+# 2D rasteriser: our own rusty_raster, a hardened fork of tiny-skia 0.12
+# (BSD-3-Clause, Skia-derived). See crates/rusty_raster/NOTICE.md.
+rusty_raster = { path = "crates/rusty_raster", version = "0.1.0" }
 # zlib inflate for Matroska ContentCompression (rff-format-mkv); the same
 # miniz_oxide release rusty_png already pulls in.
 miniz_oxide = "0.8.9"
