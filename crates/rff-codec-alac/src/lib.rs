@@ -105,7 +105,10 @@ const OFFSETS: [[u8; 8]; 8] = [
     [2, 6, 7, 0, 1, 4, 5, 3],
 ];
 
-/// MSB-first bit reader over a packet.
+/// MSB-first bit reader over a packet. Reads are served from one unaligned
+/// big-endian 64-bit load at the current byte, so any read of up to 32 bits
+/// is a load, a shift and a mask rather than a walk over bytes. Past the end
+/// of the packet it reads zeros.
 struct Bits<'a> {
     data: &'a [u8],
     pos: usize, // in bits
@@ -120,52 +123,52 @@ impl<'a> Bits<'a> {
         (self.data.len() * 8) as isize - self.pos as isize
     }
 
-    fn bit(&mut self) -> u32 {
-        let byte = self.data.get(self.pos / 8).copied().unwrap_or(0);
-        let b = (byte >> (7 - self.pos % 8)) & 1;
-        self.pos += 1;
-        b as u32
+    /// The next 57 or more bits, MSB-aligned (zeros past the end).
+    #[inline(always)]
+    fn window(&self) -> u64 {
+        let at = self.pos >> 3;
+        let word = match self.data.get(at..at + 8) {
+            Some(w) => u64::from_be_bytes(w.try_into().unwrap()),
+            None => self.window_tail(at),
+        };
+        word << (self.pos & 7)
+    }
+
+    /// `window` within 8 bytes of the end, zero-padded.
+    #[cold]
+    #[inline(never)]
+    fn window_tail(&self, at: usize) -> u64 {
+        let mut w = [0u8; 8];
+        if let Some(rest) = self.data.get(at..) {
+            w[..rest.len()].copy_from_slice(rest);
+        }
+        u64::from_be_bytes(w)
+    }
+
+    /// The next `n` (0..=32) bits without consuming them.
+    #[inline(always)]
+    fn peek(&self, n: u32) -> u32 {
+        if n == 0 {
+            return 0;
+        }
+        (self.window() >> (64 - n)) as u32
     }
 
     /// Read `n` (0..=32) bits; past the end reads zeros.
+    #[inline(always)]
     fn read(&mut self, n: u32) -> u32 {
-        let mut v: u64 = 0;
-        let mut need = n;
-        while need > 0 {
-            let byte = self.data.get(self.pos / 8).copied().unwrap_or(0) as u64;
-            let off = (self.pos % 8) as u32;
-            let take = (8 - off).min(need);
-            let bits = (byte >> (8 - off - take)) & ((1 << take) - 1);
-            v = (v << take) | bits;
-            self.pos += take as usize;
-            need -= take;
-        }
-        v as u32
+        let v = self.peek(n);
+        self.pos += n as usize;
+        v
     }
 
-    fn peek(&self, n: u32) -> u32 {
-        let mut c = Bits {
-            data: self.data,
-            pos: self.pos,
-        };
-        c.read(n)
-    }
-
+    #[inline(always)]
     fn skip(&mut self, n: u32) {
         self.pos += n as usize;
     }
 
     fn sbits(&mut self, n: u32) -> i32 {
         sign_extend(self.read(n) as i32, n)
-    }
-
-    /// Count of 1 bits before a 0, at most 9 (FFmpeg's `get_unary_0_9`).
-    fn unary_0_9(&mut self) -> u32 {
-        let mut n = 0;
-        while n < 9 && self.bit() == 1 {
-            n += 1;
-        }
-        n
     }
 }
 
@@ -177,21 +180,32 @@ fn sign_extend(v: i32, bits: u32) -> i32 {
     (v << s) >> s
 }
 
+/// One adaptive Golomb-Rice value (FFmpeg's `decode_scalar`): a unary prefix
+/// of at most 9, then either `bps` raw bits (prefix 9) or `k` bits of
+/// remainder. `k` is at least 1 for every caller. Everything but the escape
+/// comes from one window load.
 fn decode_scalar(b: &mut Bits, k: u32, bps: u32) -> u32 {
-    let mut x = b.unary_0_9();
+    let w = b.window();
+    let x = (!w).leading_zeros().min(9);
     if x > 8 {
-        x = b.read(bps);
-    } else if k != 1 {
-        let extra = b.peek(k);
-        x = (x << k).wrapping_sub(x);
-        if extra > 1 {
-            x = x.wrapping_add(extra - 1);
-            b.skip(k);
-        } else {
-            b.skip(k - 1);
-        }
+        b.skip(9);
+        return b.read(bps);
     }
-    x
+    if k == 1 {
+        b.skip(x + 1);
+        return x;
+    }
+    // The remainder starts after the prefix and its 0; x + 1 + k <= 9 + 32
+    // bits, inside the window's 57.
+    let extra = ((w << (x + 1)) >> (64 - k)) as u32;
+    let base = (x << k).wrapping_sub(x);
+    if extra > 1 {
+        b.skip(x + 1 + k);
+        base.wrapping_add(extra - 1)
+    } else {
+        b.skip(x + k);
+        base
+    }
 }
 
 fn log2(v: u32) -> u32 {
@@ -288,36 +302,123 @@ fn lpc_prediction(
         out[i] = sign_extend(out[i - 1].wrapping_add(err[i]), bps);
         i += 1;
     }
-    while i < n {
-        // d = out[i - order - 1]; pred[j] = out[i - order + j].
-        let base = i - order - 1;
-        let d = out[base];
+    if i >= n {
+        return;
+    }
+    // The common encoder orders get their own copies of the loop, so the
+    // per-sample dot product and adaptation run over a known length.
+    match order {
+        4 => lpc_fixed::<4>(err, out, bps, &mut coefs[..4], quant),
+        8 => lpc_fixed::<8>(err, out, bps, &mut coefs[..8], quant),
+        _ => lpc_adaptive(err, out, bps, &mut coefs[..order], order, quant),
+    }
+}
+
+/// `lpc_adaptive` for a fixed order, with the coefficients and the last `N`
+/// outputs held in local arrays for the whole frame. Every sample writes
+/// both (the new output, the adapted coefficients) and the next sample reads
+/// them all back; through memory those reads wait on the stores just made,
+/// and in registers they do not. Same arithmetic, same results.
+#[inline(always)]
+fn lpc_fixed<const N: usize>(
+    err: &[i32],
+    out: &mut [i32],
+    bps: u32,
+    coefs: &mut [i16],
+    quant: u32,
+) {
+    let n = err.len().min(out.len());
+    if n <= N + 1 {
+        return;
+    }
+    let round = 1i64 << (quant - 1);
+    let mut c: [i16; N] = coefs[..N].try_into().unwrap();
+    // `d` is out[i - N - 1]; `past[j]` is out[i - N + j].
+    let mut d = out[0];
+    let mut past: [i32; N] = out[1..=N].try_into().unwrap();
+    for (o, &e) in out[N + 1..n].iter_mut().zip(&err[N + 1..n]) {
         let mut val: i32 = 0;
-        for j in 0..order {
-            val = val.wrapping_add(
-                out[base + 1 + j]
-                    .wrapping_sub(d)
-                    .wrapping_mul(coefs[j] as i32),
-            );
+        for j in 0..N {
+            val = val.wrapping_add(past[j].wrapping_sub(d).wrapping_mul(i32::from(c[j])));
         }
-        let rounded = ((val as i64 + (1i64 << (quant - 1))) >> quant) as i32;
-        let mut error_val = err[i] as u32;
-        let v = rounded.wrapping_add(d).wrapping_add(error_val as i32);
-        out[i] = sign_extend(v, bps);
-        let error_sign = sign_only(error_val as i32);
-        if error_sign != 0 {
-            let mut j = 0;
-            while j < order && (error_val.wrapping_mul(error_sign as u32) as i32) > 0 {
-                let mut v = d.wrapping_sub(out[base + 1 + j]);
-                let sign = sign_only(v) * error_sign;
-                coefs[j] = coefs[j].wrapping_sub(sign as i16);
-                v = v.wrapping_mul(sign);
-                error_val =
-                    error_val.wrapping_sub(((v >> quant) as u32).wrapping_mul(j as u32 + 1));
-                j += 1;
+        let rounded = ((i64::from(val) + round) >> quant) as i32;
+        let y = sign_extend(rounded.wrapping_add(d).wrapping_add(e), bps);
+        *o = y;
+        // The adaptation, split by the residual's sign so each loop's stop
+        // test is a plain compare (the shape symphonia uses). The test runs
+        // after each step, which is the same as before the next one, since
+        // it holds on entry.
+        let mut error_val = e;
+        if e > 0 {
+            for j in 0..N {
+                let v = d.wrapping_sub(past[j]);
+                let sign = sign_only(v);
+                c[j] = c[j].wrapping_sub(sign as i16);
+                error_val = error_val
+                    .wrapping_sub((v.wrapping_mul(sign) >> quant).wrapping_mul(j as i32 + 1));
+                if error_val <= 0 {
+                    break;
+                }
+            }
+        } else if e.wrapping_neg() > 0 {
+            // (Written as a negation, like the original `error * sign > 0`
+            // test, so i32::MIN stops it exactly as there.)
+            for j in 0..N {
+                let v = d.wrapping_sub(past[j]);
+                let sign = sign_only(v);
+                c[j] = c[j].wrapping_add(sign as i16);
+                error_val = error_val
+                    .wrapping_sub((v.wrapping_mul(-sign) >> quant).wrapping_mul(j as i32 + 1));
+                if error_val.wrapping_neg() <= 0 {
+                    break;
+                }
             }
         }
-        i += 1;
+        d = past[0];
+        past.copy_within(1.., 0);
+        past[N - 1] = y;
+    }
+    coefs[..N].copy_from_slice(&c);
+}
+
+/// The adaptive part of `lpc_prediction`, from sample `order + 1` on.
+#[inline(always)]
+fn lpc_adaptive(
+    err: &[i32],
+    out: &mut [i32],
+    bps: u32,
+    coefs: &mut [i16],
+    order: usize,
+    quant: u32,
+) {
+    let n = err.len().min(out.len());
+    let round = 1i64 << (quant - 1);
+    for i in order + 1..n {
+        // `win[0]` is d = out[i - order - 1]; `win[1 + j]` pairs with coefs[j].
+        let (head, tail) = out.split_at_mut(i);
+        let win = &head[i - order - 1..];
+        let d = win[0];
+        let past = &win[1..=order];
+        let val = past.iter().zip(coefs.iter()).fold(0i32, |acc, (&o, &c)| {
+            acc.wrapping_add(o.wrapping_sub(d).wrapping_mul(i32::from(c)))
+        });
+        let rounded = ((i64::from(val) + round) >> quant) as i32;
+        let mut error_val = err[i] as u32;
+        tail[0] = sign_extend(rounded.wrapping_add(d).wrapping_add(error_val as i32), bps);
+        let error_sign = sign_only(error_val as i32);
+        if error_sign != 0 {
+            for (j, (&o, c)) in past.iter().zip(coefs.iter_mut()).enumerate() {
+                if (error_val.wrapping_mul(error_sign as u32) as i32) <= 0 {
+                    break;
+                }
+                let v = d.wrapping_sub(o);
+                let sign = sign_only(v) * error_sign;
+                *c = c.wrapping_sub(sign as i16);
+                error_val = error_val.wrapping_sub(
+                    ((v.wrapping_mul(sign) >> quant) as u32).wrapping_mul(j as u32 + 1),
+                );
+            }
+        }
     }
 }
 
