@@ -1,4 +1,5 @@
-//! Native MP3 elementary-stream container (`.mp3`).
+//! Native MPEG audio elementary-stream container (`.mp3`, and for reading
+//! `.mp2` / `.mp1` / `.mpa`).
 //!
 //! An MP3 file is not really a container — it is a bare sequence of MPEG audio
 //! frames, optionally wrapped in ID3 tags. So the muxer just writes each packet's
@@ -6,9 +7,13 @@
 //! tags and the leading Xing/Info header, and emits one [`Packet`] per audio
 //! frame with a sample-accurate PTS.
 //!
+//! The demuxer reads Layer I and Layer II streams too (MP1 / MP2, including
+//! free format), locking onto the layer of the first frame and labelling the
+//! stream [`CodecId::Mp1`] / [`CodecId::Mp2`] / [`CodecId::Mp3`] by it.
+//!
 //! Frame parsing here is a container concern (finding frame boundaries), kept
-//! self-contained — the same small MPEG-1/2/2.5 Layer III header fields the
-//! decoder reads, but only as far as the byte layout needs.
+//! self-contained — the same small MPEG-1/2/2.5 header fields the decoder
+//! reads, but only as far as the byte layout needs.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -30,6 +35,20 @@ pub fn register(registry: &mut FormatRegistry) {
         mux_caps: MuxCaps::single(&[CodecId::Mp3]),
     });
     registry.register_seekable_muxer("mp3", |output| Box::new(Mp3Muxer::new_seekable(output)));
+    // The Layer I/II extensions, for reading: the same demuxer (content
+    // probing already finds these files through `mp3`; this is the
+    // filename fallback). No muxer -- there is no MP1/MP2 encoder, and an
+    // `.mp2` output must not silently receive Layer III frames.
+    registry.register(Format {
+        name: "mp2",
+        long_name: "MP2/MP1 (MPEG audio layer 2/1)",
+        extensions: &["mp2", "mp1", "mpa", "m2a", "m1a"],
+        demuxer: Some(|input| Box::new(Mp3Demuxer::new(input))),
+        muxer: None,
+        muxer_path: None,
+        probe: None,
+        mux_caps: MuxCaps::NONE,
+    });
 }
 
 // ── frame-header parsing (just enough to find boundaries) ─────────────────────
@@ -45,9 +64,12 @@ const BITRATE_V2: [u32; 16] = [
 const SAMPLE_RATE: [u32; 4] = [44100, 48000, 32000, 0];
 
 struct FrameInfo {
+    /// 1, 2 or 3.
+    layer: u8,
     sample_rate: u32,
     channels: u16,
-    /// Decoded samples this frame yields (1152 MPEG-1, 576 MPEG-2/2.5).
+    /// Decoded samples this frame yields (Layer III: 1152 MPEG-1, 576
+    /// MPEG-2/2.5; Layer I 384, Layer II 1152).
     samples: u32,
     /// Total frame length in bytes (header + side info + main data + padding).
     size: usize,
@@ -108,6 +130,7 @@ fn parse_header(b: &[u8]) -> Option<FrameInfo> {
         (false, false) => 9,
     };
     Some(FrameInfo {
+        layer: 3,
         sample_rate,
         channels,
         samples,
@@ -117,10 +140,155 @@ fn parse_header(b: &[u8]) -> Option<FrameInfo> {
 }
 
 /// True if this frame carries a Xing/Info VBR/CBR header (a silent frame players
-/// read for duration but skip on playback).
+/// read for duration but skip on playback). Layer III only.
 fn is_header_frame(frame: &[u8], info: &FrameInfo) -> bool {
     let o = info.tag_offset;
-    frame.len() >= o + 4 && matches!(&frame[o..o + 4], b"Xing" | b"Info")
+    info.layer == 3 && frame.len() >= o + 4 && matches!(&frame[o..o + 4], b"Xing" | b"Info")
+}
+
+/// Bitrate (kbps) by index: MPEG-1 Layer I, MPEG-1 Layer II, MPEG-2/2.5
+/// Layer I, MPEG-2/2.5 Layer II.
+const BITRATE_L12: [[u32; 16]; 4] = [
+    [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0],
+    [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0],
+    [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0],
+    [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
+];
+/// Largest free-format frame searched for (bytes).
+const MAX_FREE_FRAME: usize = 4096;
+
+/// A Layer I / II frame header: geometry plus the fields that must stay put
+/// from frame to frame of one stream.
+struct L12Header {
+    /// `size` is 0 for a free-format frame (its size is the distance to the
+    /// next header).
+    info: FrameInfo,
+    /// Version bits, layer, sample-rate index, CRC flag, free format: equal
+    /// across the frames of one stream.
+    key: (u32, u8, usize, bool, bool),
+    /// Bytes the padding bit added (4 in Layer I, 1 in Layer II, or 0).
+    pad: usize,
+}
+
+/// Parse a Layer I or II header (`None` for anything else, or reserved fields).
+fn parse_l12_header(b: &[u8]) -> Option<L12Header> {
+    let h = u32::from_be_bytes(*b.first_chunk::<4>()?);
+    if (h >> 21) & 0x7FF != 0x7FF {
+        return None;
+    }
+    let version = (h >> 19) & 0x3;
+    let layer: u8 = match (h >> 17) & 0x3 {
+        0b11 => 1,
+        0b10 => 2,
+        _ => return None,
+    };
+    let br_idx = ((h >> 12) & 0xF) as usize;
+    let sr_idx = ((h >> 10) & 0x3) as usize;
+    if version == 0b01 || br_idx == 15 || sr_idx == 3 {
+        return None;
+    }
+    let mpeg1 = version == 0b11;
+    let bitrate = BITRATE_L12[usize::from(!mpeg1) * 2 + usize::from(layer - 1)][br_idx];
+    let sample_rate = match version {
+        0b11 => SAMPLE_RATE[sr_idx],
+        0b10 => SAMPLE_RATE[sr_idx] / 2,
+        _ => SAMPLE_RATE[sr_idx] / 4,
+    };
+    let padding = ((h >> 9) & 1) as usize;
+    let (samples, pad, size) = if layer == 1 {
+        (384, padding * 4, (12 * bitrate as usize * 1000 / sample_rate as usize + padding) * 4)
+    } else {
+        (1152, padding, 144 * bitrate as usize * 1000 / sample_rate as usize + padding)
+    };
+    let size = if br_idx == 0 { 0 } else { size };
+    let crc = (h >> 16) & 1 == 0;
+    let channels: u16 = if (h >> 6) & 0x3 == 0b11 { 1 } else { 2 };
+    Some(L12Header {
+        info: FrameInfo {
+            layer,
+            sample_rate,
+            channels,
+            samples,
+            size,
+            tag_offset: 0,
+        },
+        key: (version, layer, sr_idx, crc, br_idx == 0),
+        pad,
+    })
+}
+
+/// The header `b` starts, if it can follow `h` in one stream (same version,
+/// layer, rate, CRC flag, free-format-ness and channel count).
+fn l12_next(h: &L12Header, b: &[u8]) -> Option<L12Header> {
+    parse_l12_header(b).filter(|n| n.key == h.key && n.info.channels == h.info.channels)
+}
+
+/// Bytes that can follow the last frame of a stream: a tag.
+fn is_tag_start(b: &[u8]) -> bool {
+    b.starts_with(b"TAG") || b.starts_with(b"APE") || b.starts_with(b"ID3") || b.starts_with(b"LYR")
+}
+
+/// Free-format frame size at the start of `buf`: the distance to the next
+/// header of the stream (`None` if none is in reach).
+fn free_size_in(h: &L12Header, buf: &[u8]) -> Option<usize> {
+    let min = if h.info.layer == 1 { 24 } else { 48 };
+    (min..=MAX_FREE_FRAME.min(buf.len().saturating_sub(4)))
+        .find(|&i| buf[i] == 0xFF && l12_next(h, &buf[i..]).is_some())
+}
+
+/// Whether a Layer I/II frame `h` of `size` bytes at the start of `buf` is
+/// confirmed by the two headers of its stream after it (or a tag, or the end
+/// of the data exactly at a frame boundary, in their place). `at_end`: `buf`
+/// runs to the end of the input, so nothing more can arrive.
+fn l12_confirmed(h: &L12Header, size: usize, buf: &[u8], at_end: bool) -> bool {
+    let (mut at, mut prev_pad, mut size) = (size, h.pad, size);
+    let free = h.key.4;
+    let levels = if free { 3 } else { 2 };
+    for depth in 0..levels {
+        let Some(next) = buf.get(at..) else {
+            // The confirming frame runs past the data.
+            return !at_end && depth > 0;
+        };
+        if next.len() < 4 {
+            return depth > 0 || (next.is_empty() && at_end);
+        }
+        if is_tag_start(next) {
+            return true;
+        }
+        let Some(n) = l12_next(h, next) else {
+            // Free format searched for the first level; a stream switch is
+            // fine at the last.
+            return free && depth == 2 && parse_l12_header(next).is_some();
+        };
+        let n_size = if free { size - prev_pad + n.pad } else { n.info.size };
+        at += n_size;
+        prev_pad = n.pad;
+        size = n_size;
+    }
+    true
+}
+
+/// Probe score for a Layer I/II stream: a confirmed frame near the start.
+fn probe_l12(data: &[u8]) -> i32 {
+    let mut i = 0;
+    while i + 4 <= data.len() {
+        if data[i] == 0xFF && data[i + 1] & 0xE4 == 0xE4 {
+            if let Some(h) = parse_l12_header(&data[i..]) {
+                let size = if h.key.4 {
+                    free_size_in(&h, &data[i..])
+                } else {
+                    Some(h.info.size)
+                };
+                // The probe buffer is a prefix: running out of it is not the
+                // end of the file.
+                if size.is_some_and(|s| l12_confirmed(&h, s, &data[i..], false)) {
+                    return if i < 4 { 80 } else { 40 };
+                }
+            }
+        }
+        i += 1;
+    }
+    0
 }
 
 /// First byte offset of a valid frame sync at or after `start`.
@@ -155,11 +323,15 @@ fn probe_mp3(data: &[u8]) -> i32 {
     if data.len() >= 3 && &data[0..3] == b"ID3" {
         return 90;
     }
-    match find_sync(data, 0) {
+    let l3 = match find_sync(data, 0) {
         Some(i) if i < 4 => 80, // sync right at the front
         Some(_) => 40,          // sync after some junk — weaker
         None => 0,
+    };
+    if l3 == 80 {
+        return l3;
     }
+    l3.max(probe_l12(data))
 }
 
 // ── demuxer ───────────────────────────────────────────────────────────────────
@@ -192,6 +364,17 @@ struct Mp3Demuxer {
     /// The input has reported end of file.
     eof: bool,
     next_pts: i64,
+    /// Layer locked from the first frame (0 before `read_header`). A Layer III
+    /// stream never looks at Layer I/II headers (as before they existed here);
+    /// a Layer I/II stream takes only headers of its own layer.
+    layer: u8,
+    /// The previous frame ended exactly at `pos`: a Layer I/II header there is
+    /// taken without confirmation.
+    after_frame: bool,
+    /// Measured free-format frame size, without padding.
+    free_size: Option<usize>,
+    /// `read_packet` has reported the end: it keeps doing so.
+    done: bool,
 }
 
 impl Mp3Demuxer {
@@ -203,6 +386,10 @@ impl Mp3Demuxer {
             pos: 0,
             eof: false,
             next_pts: 0,
+            layer: 0,
+            after_frame: false,
+            free_size: None,
+            done: false,
         }
     }
 
@@ -256,23 +443,115 @@ impl Mp3Demuxer {
         Ok(())
     }
 
-    /// Advance to the next valid frame header; `false` at end of input. Every
-    /// step consumes at least one byte or returns.
-    fn next_sync(&mut self) -> std::io::Result<bool> {
+    /// A Layer I/II frame at `pos`, if one is there: its geometry (with the
+    /// free-format size resolved). `contiguous`: the previous frame ended
+    /// here, so the header needs no confirmation.
+    fn l12_frame(&mut self, contiguous: bool) -> std::io::Result<Option<FrameInfo>> {
+        let Some(h) = parse_l12_header(&self.buf[self.pos..]) else {
+            return Ok(None);
+        };
+        if self.layer != 0 && h.info.layer != self.layer {
+            return Ok(None);
+        }
+        let size = if h.key.4 {
+            // Free format: the measured size while the header after it agrees,
+            // else measure (again) by searching for the next header.
+            let cached = self.free_size.map(|s| s + h.pad);
+            let fits = match cached {
+                Some(s) => {
+                    self.fill(s + 4)?;
+                    let next = &self.buf[self.pos..];
+                    next.len() < s + 4 || is_tag_start(&next[s..]) || parse_l12_header(&next[s..]).is_some()
+                }
+                None => false,
+            };
+            if fits {
+                cached
+            } else {
+                self.fill(MAX_FREE_FRAME + 4)?;
+                free_size_in(&h, &self.buf[self.pos..])
+            }
+        } else {
+            Some(h.info.size)
+        };
+        let Some(size) = size.filter(|&s| s > 6) else {
+            return Ok(None);
+        };
+        if !contiguous {
+            // Room for the frame and the two after it (or as far as the input
+            // goes); no Layer I/II frame is longer than `MAX_FREE_FRAME`.
+            let look = size + 2 * MAX_FREE_FRAME + 4;
+            let complete = self.fill(look)?;
+            if !l12_confirmed(&h, size, &self.buf[self.pos..], !complete) {
+                return Ok(None);
+            }
+        }
+        if h.key.4 {
+            self.free_size = Some(size - h.pad);
+        }
+        Ok(Some(FrameInfo { size, ..h.info }))
+    }
+
+    /// Whether the Layer III frame at `pos` is followed by two more Layer III
+    /// headers, each where the frame before it ends (or by a tag, or by the
+    /// end of the input, in their place).
+    fn l3_confirmed(&mut self, info: &FrameInfo) -> std::io::Result<bool> {
+        // The largest Layer III frame is 1441 bytes.
+        let complete = self.fill(info.size + 2 * 1441 + 4)?;
+        let buf = &self.buf[self.pos..];
+        let mut at = info.size;
+        for _ in 0..2 {
+            match buf.get(at..) {
+                // Past or at the end of the input: nothing contradicts it.
+                None => return Ok(true),
+                Some(next) if next.len() < 4 => return Ok(!complete || next.is_empty()),
+                Some(next) if is_tag_start(next) => return Ok(true),
+                Some(next) => match parse_header(next) {
+                    Some(n) => at += n.size,
+                    None => return Ok(false),
+                },
+            }
+        }
+        Ok(true)
+    }
+
+    /// Advance to the next valid frame header and return its geometry; `None`
+    /// at end of input. Every step consumes at least one byte or returns.
+    fn next_sync(&mut self) -> std::io::Result<Option<FrameInfo>> {
+        let mut contiguous = self.after_frame;
         loop {
             if !self.fill(4)? {
-                return Ok(false);
+                return Ok(None);
             }
             let b = &self.buf[self.pos..];
-            if b[0] == 0xFF && b[1] & 0xE0 == 0xE0 && parse_header(b).is_some() {
-                return Ok(true);
+            if b[0] == 0xFF && b[1] & 0xE0 == 0xE0 {
+                if b[1] & 0x04 == 0 {
+                    // Layer III (or the reserved layer, which never parses).
+                    // Taken on sight once the stream is known to be Layer III,
+                    // exactly as before; the FIRST frame must be confirmed,
+                    // or a Layer III-shaped false sync in garbage ahead of a
+                    // Layer I/II stream would lock the demuxer to Layer III.
+                    if self.layer == 0 || self.layer == 3 {
+                        if let Some(info) = parse_header(b) {
+                            if self.layer == 3 || self.l3_confirmed(&info)? {
+                                return Ok(Some(info));
+                            }
+                        }
+                    }
+                } else if self.layer != 3 {
+                    if let Some(info) = self.l12_frame(contiguous)? {
+                        return Ok(Some(info));
+                    }
+                }
             }
+            contiguous = false;
+            let b = &self.buf[self.pos..];
             if b.starts_with(b"TAG") {
                 // ID3v1 iff exactly its 128 bytes remain.
                 let more = self.fill(ID3V1_LEN + 1)?;
                 if !more && self.avail() == ID3V1_LEN {
                     self.pos = self.buf.len();
-                    return Ok(false);
+                    return Ok(None);
                 }
             } else if b.starts_with(b"APET") && self.fill(APE_HEADER_LEN)? {
                 let h = &self.buf[self.pos..self.pos + APE_HEADER_LEN];
@@ -307,13 +586,17 @@ impl Demuxer for Mp3Demuxer {
         self.fill(10)?;
         let id3 = id3v2_len(&self.buf[self.pos..]);
         self.skip(id3 as u64)?;
-        if !self.next_sync()? {
+        let Some(info) = self.next_sync()? else {
             return Err(Error::invalid("mp3 demux: no MPEG audio frame found"));
-        }
-        let info = parse_header(&self.buf[self.pos..])
-            .ok_or_else(|| Error::invalid("mp3 demux: bad frame header"))?;
+        };
+        self.layer = info.layer;
+        let codec = match info.layer {
+            1 => CodecId::Mp1,
+            2 => CodecId::Mp2,
+            _ => CodecId::Mp3,
+        };
 
-        let mut stream = Stream::new(0, CodecId::Mp3);
+        let mut stream = Stream::new(0, codec);
         stream.sample_rate = info.sample_rate;
         stream.channels = info.channels;
         stream.sample_format = Some(SampleFormat::F32);
@@ -322,24 +605,23 @@ impl Demuxer for Mp3Demuxer {
     }
 
     fn read_packet(&mut self) -> Result<Packet> {
+        if self.done {
+            return Err(Error::Eof);
+        }
         loop {
-            if !self.next_sync()? {
+            let Some(info) = self.next_sync()? else {
+                self.done = true;
                 return Err(Error::Eof);
-            }
-            let info = match parse_header(&self.buf[self.pos..]) {
-                Some(i) => i,
-                None => {
-                    self.pos += 1;
-                    continue;
-                }
             };
             if !self.fill(info.size)? {
+                self.done = true;
                 return Err(Error::Eof); // trailing partial frame
             }
             let frame = &self.buf[self.pos..self.pos + info.size];
             let header_frame = is_header_frame(frame, &info);
             let data = (!header_frame).then(|| frame.to_vec());
             self.pos += info.size;
+            self.after_frame = true;
 
             // Drop the Xing/Info header frame (silent; metadata only).
             let Some(data) = data else { continue };
@@ -881,5 +1163,144 @@ mod tests {
         // Reading packets before the header is just end-of-stream.
         let mut dem = Mp3Demuxer::new(Box::new(Cursor::new(good)));
         assert!(matches!(dem.read_packet(), Err(Error::Eof)));
+    }
+
+    // ---- Layer I / II (MP1 / MP2) ----
+
+    /// MPEG-1 Layer II, 192 kbps, 44.1 kHz, stereo, no CRC (626/627 bytes).
+    const L2: [u8; 4] = [0xFF, 0xFD, 0xA0, 0x04];
+    /// MPEG-1 Layer I, 384 kbps, 48 kHz, mono (384 bytes).
+    const L1: [u8; 4] = [0xFF, 0xFF, 0xC4, 0xC0];
+    /// MPEG-2 Layer II, 24 kHz, 96 kbps, mono (576 bytes).
+    const L2_LSF: [u8; 4] = [0xFF, 0xF5, 0xA4, 0xC0];
+
+    fn l12_frame(hdr: [u8; 4], fill: u8) -> Vec<u8> {
+        let size = parse_l12_header(&hdr).unwrap().info.size;
+        let mut f = hdr.to_vec();
+        f.resize(size, fill);
+        f
+    }
+    fn l12_frames(hdr: [u8; 4], n: usize) -> Vec<u8> {
+        (0..n).flat_map(|i| l12_frame(hdr, 1 + (i % 200) as u8)).collect()
+    }
+
+    #[test]
+    fn demuxes_layer1_and_layer2_with_their_codec_ids() {
+        for (hdr, codec, rate, ch, spf, size) in [
+            (L2, CodecId::Mp2, 44100, 2, 1152, 626),
+            (L1, CodecId::Mp1, 48000, 1, 384, 384),
+            (L2_LSF, CodecId::Mp2, 24000, 1, 1152, 576),
+        ] {
+            let file = cat(&[&id3v2(30), &l12_frames(hdr, 5)]);
+            let (head, packets, end) = drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(file)))));
+            assert!(head.contains(&format!("{codec:?}")), "{head}");
+            assert!(head.contains(&format!("sample_rate: {rate}")), "{head}");
+            assert!(head.contains(&format!("channels: {ch}")), "{head}");
+            assert_eq!(packets.len(), 5);
+            for (i, p) in packets.iter().enumerate() {
+                assert_eq!(p.1, Some((i * spf) as i64));
+                assert_eq!(p.6.len(), size);
+                assert_eq!(p.6[4], 1 + i as u8);
+            }
+            assert_eq!(end, "end of stream");
+        }
+    }
+
+    #[test]
+    fn probes_layer1_and_layer2() {
+        assert_eq!(probe_mp3(&l12_frames(L2, 4)), 80);
+        assert_eq!(probe_mp3(&l12_frames(L1, 4)), 80);
+        assert_eq!(probe_mp3(&cat(&[&[0u8; 100], &l12_frames(L2_LSF, 4)])), 40);
+        // One lone header is not a stream.
+        let mut lone = L2.to_vec();
+        lone.resize(3000, 0);
+        assert_eq!(probe_mp3(&lone), 0);
+        // The Layer I/II extensions fall back to this demuxer, read-only.
+        let mut reg = FormatRegistry::new();
+        register(&mut reg);
+        for ext in ["mp2", "mp1", "mpa", "m2a"] {
+            let f = reg.by_extension(ext).unwrap();
+            assert_eq!(f.name, "mp2");
+            assert!(f.can_demux() && !f.can_mux());
+        }
+        assert_eq!(reg.by_extension("mp3").unwrap().name, "mp3");
+        assert_eq!(reg.probe(&l12_frames(L2, 4)).unwrap().name, "mp3");
+    }
+
+    /// Free format: bitrate index 0, each frame's size is the distance to the
+    /// next header; the demuxer measures it and emits whole frames.
+    #[test]
+    fn demuxes_free_format() {
+        let mut file = Vec::new();
+        for i in 0..6u8 {
+            let mut f = vec![0xFF, 0xFD, 0x02 * (i % 2), 0x04]; // free, padding alternates
+            f.resize(500 + usize::from(i % 2), 7 + i);
+            file.extend_from_slice(&f);
+        }
+        let (head, packets, _) = drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(file)))));
+        assert!(head.contains("Mp2"), "{head}");
+        assert_eq!(packets.len(), 6);
+        for (i, p) in packets.iter().enumerate() {
+            assert_eq!(p.6.len(), 500 + i % 2, "frame {i}");
+            assert_eq!(p.6[4], 7 + i as u8);
+        }
+    }
+
+    /// Sync-heavy garbage around and between Layer II frames: every real frame
+    /// comes out, nothing else; truncation anywhere never panics.
+    #[test]
+    fn layer2_garbage_and_truncation() {
+        let mut x = 0x9E37_79B9_u32;
+        let mut garbage = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    if x % 3 == 0 {
+                        0xFF
+                    } else {
+                        (x >> 8) as u8
+                    }
+                })
+                .collect()
+        };
+        let frames = l12_frames(L2, 12);
+        let size = 626;
+        let file = cat(&[
+            &garbage(4000),
+            &frames[..5 * size],
+            &garbage(3000),
+            &frames[5 * size..],
+            &garbage(1500),
+        ]);
+        for chunk in [usize::MAX, 333] {
+            let (input, _) = counting(file.clone(), chunk);
+            let (_, packets, _) = drive(Box::new(Mp3Demuxer::new(input)));
+            let got: Vec<u8> = packets.iter().flat_map(|p| p.6.clone()).collect();
+            assert_eq!(got, frames, "chunk {chunk}");
+        }
+        let short = cat(&[&l12_frames(L1, 3), &l12_frames(L2_LSF, 2)]);
+        for cut in 0..short.len() {
+            let _ = drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(
+                short[..cut].to_vec(),
+            )))));
+        }
+    }
+
+    /// A Layer III stream ignores Layer I/II-shaped bytes (as it always did),
+    /// and a Layer II stream ignores Layer III-shaped ones.
+    #[test]
+    fn the_first_frame_locks_the_layer() {
+        let file = cat(&[&frames(3), &l12_frames(L2, 3), &frames(2)]);
+        let (head, packets, _) = drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(file.clone())))));
+        assert!(head.contains("Mp3"));
+        assert_eq!(packets.len(), 5);
+        assert!(packets.iter().all(|p| p.6[1] & 0x06 == 0x02), "Layer III only");
+        assert_same_as_legacy("l3 with l2 inside", &file, &[1, usize::MAX]);
+        let file = cat(&[&l12_frames(L2, 3), &frames(3), &l12_frames(L2, 2)]);
+        let (head, packets, _) = drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(file)))));
+        assert!(head.contains("Mp2"));
+        assert_eq!(packets.len(), 5);
     }
 }

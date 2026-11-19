@@ -533,6 +533,51 @@ fn polyphase_impl(
     pcm
 }
 
+/// The synthesis filterbank over any number of passes, for one channel: each
+/// block of 32 subband samples becomes 32 PCM samples, written to
+/// `pcm[(block * 32 + j) * stride]` (`stride` 2 interleaves a stereo frame when
+/// `pcm` starts at the channel's first slot). `fifo` is the persistent `V[]`.
+///
+/// Layers I and II deliver 12 and 36 blocks a frame rather than Layer III's 18,
+/// so they cannot use [`polyphase`]'s granule shape. This runs the same
+/// matrixing and windowing sums ([`matrixing_fast`], [`window_scalar`]) in the
+/// same order, and the SIMD twins are bit-identical to those, so the output is
+/// exactly what [`polyphase`] produces for the same passes on either ISA arm
+/// (pinned by `polyphase_blocks_matches_polyphase`). It stays on the scalar
+/// twins so it adds no `unsafe`; the Layer II decoder feeds whole 18-pass
+/// granules to [`polyphase`] / [`polyphase_stereo`] and only Layer I's 12-pass
+/// frames come here. Samples that would land past the end of `pcm` are dropped.
+///
+/// # Panics
+/// Never: the one `expect` takes a 64-float run of the 1024-float FIFO at a
+/// `head` that is always a multiple of 64.
+pub fn polyphase_blocks(
+    blocks: &[[f32; SUBBANDS]],
+    fifo: &mut [f32; 1024],
+    pcm: &mut [f32],
+    stride: usize,
+) {
+    let d = &SYNTH_D;
+    let stride = stride.max(1);
+    // See `polyphase_impl` (D2): circular FIFO, rotated back once at the end.
+    let mut head = 0usize;
+    let mut out = [0f32; 32];
+    for (v, s) in blocks.iter().enumerate() {
+        head = (head + 1024 - 64) & 1023;
+        let slot: &mut [f32; 64] = (&mut fifo[head..head + 64])
+            .try_into()
+            .expect("head is a multiple of 64 below 1024");
+        *slot = matrixing_fast(s);
+        window_scalar(fifo, d, head, &mut out);
+        for (j, &x) in out.iter().enumerate() {
+            if let Some(p) = pcm.get_mut((v * 32 + j) * stride) {
+                *p = x;
+            }
+        }
+    }
+    fifo.rotate_left(head);
+}
+
 /// **D12** — the synthesis filterbank for BOTH channels of a stereo granule at
 /// once, writing interleaved PCM (`out[2 * n + ch]`).
 ///
@@ -936,6 +981,47 @@ mod tests {
             worst < 1e-5,
             "fast matrixing diverges from dense: {worst:.2e}"
         );
+    }
+
+    /// `polyphase_blocks` (the Layer I/II entry) is BIT-identical to
+    /// `polyphase` on the same passes, across consecutive calls (the FIFO
+    /// carries), whatever ISA arm `polyphase` takes.
+    #[test]
+    fn polyphase_blocks_matches_polyphase() {
+        let mut st = 0x9B05_688Cu32;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            (st >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        let mut fa = [0f32; 1024];
+        let mut fb = [0f32; 1024];
+        for granule in 0..4 {
+            let mut time = [0f32; GRANULE_LINES];
+            for t in &mut time {
+                *t = next();
+            }
+            let want = polyphase(&time, &mut fa);
+            let mut blocks = [[0f32; SUBBANDS]; SUBBAND_LINES];
+            for (v, b) in blocks.iter_mut().enumerate() {
+                for (k, x) in b.iter_mut().enumerate() {
+                    *x = time[k * SUBBAND_LINES + v];
+                }
+            }
+            // Two calls of 12 + 6 passes: the pass count need not be 18.
+            let mut got = [0f32; GRANULE_LINES];
+            polyphase_blocks(&blocks[..12], &mut fb, &mut got[..12 * 32], 1);
+            polyphase_blocks(&blocks[12..], &mut fb, &mut got[12 * 32..], 1);
+            for i in 0..GRANULE_LINES {
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[i].to_bits(),
+                    "granule {granule} [{i}]"
+                );
+            }
+            assert_eq!(fa, fb, "FIFO state after granule {granule}");
+        }
     }
 
     #[test]
