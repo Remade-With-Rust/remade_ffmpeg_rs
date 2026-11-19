@@ -4913,7 +4913,7 @@ dependencies = [
 
 [[package]]
 name = "rff-cli"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "remade-ffmpeg",
  "rff-core",
@@ -4929,7 +4929,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-aac"
-version = "1.1.17"
+version = "1.1.18"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5360,7 +5360,7 @@ version = "0.6.2"
 
 [[package]]
 name = "rff-server"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "axum",
  "remade-ffmpeg",
@@ -5559,7 +5559,7 @@ checksum = "9e0955c164ddbc021a96621f850ea0cf893d78aaf61e76c19a5a27f063f9ce24"
 
 [[package]]
 name = "rusty_aac"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "rusty_alloc-api",
 ]
