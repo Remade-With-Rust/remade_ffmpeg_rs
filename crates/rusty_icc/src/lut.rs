@@ -561,6 +561,16 @@ impl ClutEval {
         f64::from(self.data.get(idx + o).copied().unwrap_or(0.0))
     }
 
+    /// The `outputs` values of the grid point at flat offset `idx`: one
+    /// bounds check per corner instead of one per value. Out of range (only
+    /// reachable through a hand-built inconsistent [`Clut`]) reads zeros,
+    /// as `at` does.
+    fn corner(&self, idx: usize) -> &[f32] {
+        const ZERO: [f32; MAX_CHANNELS] = [0.0; MAX_CHANNELS];
+        let n = self.outputs.min(MAX_CHANNELS);
+        self.data.get(idx..idx + n).unwrap_or(&ZERO[..n])
+    }
+
     /// Interpolates dimensions `dim..n` starting at flat offset `origin`.
     fn interp(
         &self,
@@ -613,36 +623,37 @@ impl ClutEval {
         out: &mut [f64; 16],
     ) {
         let (rx, ry, rz) = (frac[dim], frac[dim + 1], frac[dim + 2]);
-        let (sx, sy, sz) = (step[dim], step[dim + 1], step[dim + 2]);
-        for (o, v) in out.iter_mut().enumerate().take(self.outputs) {
-            let p = |dx: usize, dy: usize, dz: usize| self.at(origin + dx + dy + dz, o);
-            let c0 = p(0, 0, 0);
-            let (c1, c2, c3);
-            if rx >= ry && ry >= rz {
-                c1 = p(sx, 0, 0) - c0;
-                c2 = p(sx, sy, 0) - p(sx, 0, 0);
-                c3 = p(sx, sy, sz) - p(sx, sy, 0);
-            } else if rx >= rz && rz >= ry {
-                c1 = p(sx, 0, 0) - c0;
-                c2 = p(sx, sy, sz) - p(sx, 0, sz);
-                c3 = p(sx, 0, sz) - p(sx, 0, 0);
-            } else if rz >= rx && rx >= ry {
-                c1 = p(sx, 0, sz) - p(0, 0, sz);
-                c2 = p(sx, sy, sz) - p(sx, 0, sz);
-                c3 = p(0, 0, sz) - c0;
-            } else if ry >= rx && rx >= rz {
-                c1 = p(sx, sy, 0) - p(0, sy, 0);
-                c2 = p(0, sy, 0) - c0;
-                c3 = p(sx, sy, sz) - p(sx, sy, 0);
-            } else if ry >= rz && rz >= rx {
-                c1 = p(sx, sy, sz) - p(0, sy, sz);
-                c2 = p(0, sy, 0) - c0;
-                c3 = p(0, sy, sz) - p(0, sy, 0);
-            } else {
-                c1 = p(sx, sy, sz) - p(0, sy, sz);
-                c2 = p(0, sy, sz) - p(0, 0, sz);
-                c3 = p(0, 0, sz) - c0;
-            }
+        let (x, y, z) = (step[dim], step[dim + 1], step[dim + 2]);
+        // Each `(a, b)` pair is the corner offsets of `c = P(a) - P(b)`; the
+        // per-channel arithmetic is the reference's, so results are
+        // bit-identical. Corners are fetched as slices (one bounds check
+        // each) and zipped, instead of a checked load per value.
+        let [(a1, b1), (a2, b2), (a3, b3)] = if rx >= ry && ry >= rz {
+            [(x, 0), (x + y, x), (x + y + z, x + y)]
+        } else if rx >= rz && rz >= ry {
+            [(x, 0), (x + y + z, x + z), (x + z, x)]
+        } else if rz >= rx && rx >= ry {
+            [(x + z, z), (x + y + z, x + z), (z, 0)]
+        } else if ry >= rx && rx >= rz {
+            [(x + y, y), (y, 0), (x + y + z, x + y)]
+        } else if ry >= rz && rz >= rx {
+            [(x + y + z, y + z), (y, 0), (y + z, y)]
+        } else {
+            [(x + y + z, y + z), (y + z, z), (z, 0)]
+        };
+        let c = |d: usize| self.corner(origin + d);
+        let (p0, pa1, pb1, pa2, pb2, pa3, pb3) = (c(0), c(a1), c(b1), c(a2), c(b2), c(a3), c(b3));
+        let lanes = out
+            .iter_mut()
+            .zip(p0)
+            .zip(pa1.iter().zip(pb1))
+            .zip(pa2.iter().zip(pb2))
+            .zip(pa3.iter().zip(pb3));
+        for ((((v, &q0), (&qa1, &qb1)), (&qa2, &qb2)), (&qa3, &qb3)) in lanes {
+            let c0 = f64::from(q0);
+            let c1 = f64::from(qa1) - f64::from(qb1);
+            let c2 = f64::from(qa2) - f64::from(qb2);
+            let c3 = f64::from(qa3) - f64::from(qb3);
             *v = c0 + c1 * rx + c2 * ry + c3 * rz;
         }
     }
