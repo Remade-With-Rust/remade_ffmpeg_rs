@@ -1,0 +1,60 @@
+[package]
+name = "rusty_tiff"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+authors = ["Mata Network <https://www.mata.network>"]
+description = "Pure-Rust TIFF and BigTIFF decoder and encoder: strips and tiles, LZW/Deflate/PackBits, CCITT G3/G4, JPEG-in-TIFF, float and predictors, multipage and SubIFDs (DNG's TIFF layer), ICC/EXIF/XMP tags. Pixel-identical to image-tiff on its matrix; malformed input errors, never panics. No C, no unsafe."
+readme = "README.md"
+keywords = ["tiff", "bigtiff", "image", "decoder", "encoder"]
+categories = ["multimedia::images", "multimedia::encoding"]
+include = ["/LICENSE", "/README.md", "/src/"]
+
+[features]
+default = ["jpeg"]
+# JPEG-in-TIFF (compression 7, shared JPEGTables) through the house `rusty_jpeg`.
+jpeg = ["dep:rusty_jpeg"]
+
+[dependencies]
+# DEFLATE (compression 8 and 32946) through flate2's PURE-RUST zlib-rs backend,
+# the same backend rusty_png ships by default. No C zlib anywhere.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+rusty_jpeg = { version = "0.4.8", optional = true }
+
+[dev-dependencies]
+# Bench/example roots only (project convention, see CLAUDE.md): every
+# encoder-carrying binary declares rusty_alloc as its global allocator. The
+# library itself never does.
+rusty_alloc-api.workspace = true
+# ORACLE ONLY: image-tiff, the crate this one replaces. Every pixel test decodes
+# with both and requires byte-identical buffers.
+tiff = "0.11.3"
+# Independent CCITT G4 encoder/decoder and G3 1-D decoder (the fax crate image-tiff uses).
+fax = "0.2.6"
+# Independent LZW (the codec image-tiff uses), cross-checked both directions.
+weezl = "0.1.10"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Narrowing casts are made after explicit range checks on untrusted values; the
+# remaining ones are bounded by construction (bit depths, sample counts).
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
+cast_precision_loss = "allow"
+# Exact float equality is the oracle contract in the tests.
+float_cmp = "allow"
+module_name_repetitions = "allow"
+too_many_lines = "allow"
+similar_names = "allow"
+many_single_char_names = "allow"
+needless_range_loop = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+unreadable_literal = "allow"
+struct_excessive_bools = "allow"
+match_same_arms = "allow"
