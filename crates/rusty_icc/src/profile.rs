@@ -590,6 +590,22 @@ impl Profile {
         self.has_exact_lut(intent, input) || self.is_matrix_shaper()
     }
 
+    /// The black point of this profile used as a source with `intent`, in
+    /// D50 XYZ (`LittleCMS`'s `cmsDetectBlackPoint`). Zero when undefined
+    /// (absolute colorimetric, device-link and abstract profiles).
+    #[must_use]
+    pub fn detect_black_point(&self, intent: Intent) -> Xyz {
+        crate::pipeline::detect_black_point(self, intent)
+    }
+
+    /// The black point of this profile used as a destination with
+    /// `intent`, in D50 XYZ (`LittleCMS`'s `cmsDetectDestinationBlackPoint`,
+    /// the Adobe round-trip algorithm for LUT-based outputs).
+    #[must_use]
+    pub fn detect_destination_black_point(&self, intent: Intent) -> Xyz {
+        crate::pipeline::detect_destination_black_point(self, intent)
+    }
+
     // ---------------------------------------------------------- constructors
 
     fn blank(class: ProfileClass, color_space: ColorSpace, pcs: ColorSpace) -> Self {

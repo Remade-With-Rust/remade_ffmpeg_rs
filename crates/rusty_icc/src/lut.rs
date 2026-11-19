@@ -448,6 +448,15 @@ pub(crate) enum Stage {
     Clut(ClutEval),
 }
 
+/// Switches every CLUT stage in `stages` to trilinear interpolation.
+pub(crate) fn make_trilinear(stages: &mut [Stage]) {
+    for s in stages {
+        if let Stage::Clut(c) = s {
+            c.trilinear = true;
+        }
+    }
+}
+
 impl Stage {
     fn from_ab_matrix(m: &[f64; 12]) -> Self {
         Self::Matrix {
@@ -489,6 +498,11 @@ pub(crate) struct ClutEval {
     strides: Vec<usize>,
     pub(crate) outputs: usize,
     data: Vec<f32>,
+    /// Trilinear instead of tetrahedral for 3 inputs. `LittleCMS` uses it
+    /// for every CLUT of an output (`B2Ax`) LUT whose PCS is Lab
+    /// (`ChangeInterpolationToTrilinear` in `cmsio1.c`): Lab is not a space
+    /// where tetrahedral splitting is well behaved.
+    pub(crate) trilinear: bool,
 }
 
 impl ClutEval {
@@ -514,6 +528,7 @@ impl ClutEval {
             strides,
             outputs,
             data,
+            trilinear: false,
         }
     }
 
@@ -569,7 +584,7 @@ impl ClutEval {
                     *v = a + (b - a) * f;
                 }
             }
-            3 => self.tetra(dim, origin, frac, step, out),
+            3 if !self.trilinear => self.tetra(dim, origin, frac, step, out),
             _ => {
                 // Linear along this dimension between two lower-dimensional
                 // interpolations (LittleCMS's `Eval4Inputs` pattern).

@@ -9,7 +9,7 @@ use crate::color::{
 };
 use crate::curve::{clamp01, Curve};
 use crate::error::{Error, Result};
-use crate::lut::{Lut, Stage};
+use crate::lut::{make_trilinear, Lut, Stage};
 use crate::profile::{ColorSpace, Profile, ProfileClass};
 use crate::transform::Intent;
 
@@ -212,7 +212,12 @@ fn abstract_side(p: &Profile) -> Result<Side> {
     if legacy16 && data == Pcs::Lab {
         ops.push(Op::Scale(1.0 / LAB_V2_TO_V4));
     }
-    ops.extend(lut.stages().into_iter().map(Op::Lut));
+    let mut stages = lut.stages();
+    if pcs == Pcs::Lab {
+        // `_cmsReadDevicelinkLUT` also interpolates Lab-PCS CLUTs trilinearly.
+        make_trilinear(&mut stages);
+    }
+    ops.extend(stages.into_iter().map(Op::Lut));
     decode_ops(&mut ops, pcs, legacy16);
     Ok(Side {
         ops,
@@ -331,7 +336,13 @@ pub(crate) fn output_side(p: &Profile, intent: Intent) -> Result<Side> {
         let legacy16 = matches!(lut, Lut::Lut16(_));
         let mut ops = Vec::new();
         encode_ops(&mut ops, pcs, legacy16);
-        ops.extend(lut.stages().into_iter().map(Op::Lut));
+        let mut stages = lut.stages();
+        if pcs == Pcs::Lab {
+            // As `LittleCMS` `_cmsReadOutputLUT`: Lab-indexed output CLUTs
+            // interpolate trilinearly.
+            make_trilinear(&mut stages);
+        }
+        ops.extend(stages.into_iter().map(Op::Lut));
         if legacy16 && cs == ColorSpace::Lab {
             ops.push(Op::Scale(LAB_V2_TO_V4));
         }

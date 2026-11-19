@@ -540,3 +540,63 @@ fn curves_round_trip_all_parametric_types() {
     rt(&p);
     let _ = Xyz::default();
 }
+
+/// `LittleCMS` interpolates the CLUTs of Lab-PCS output LUTs trilinearly
+/// (`ChangeInterpolationToTrilinear`); tetrahedral there was the largest
+/// divergence the lcms2 grid comparison found (P3 -> ICC sRGB v4 `mBA`,
+/// perceptual, f32: mean dE00 0.108 before, 0.0019 after). A 2x2x2 CLUT holding
+/// x*y*z is reproduced exactly by trilinear and not by tetrahedral.
+#[test]
+fn lab_pcs_output_luts_interpolate_trilinearly() {
+    use rusty_icc::{AbLut, Clut, ColorSpace, ProfileClass};
+    let mut data = Vec::new();
+    for i in 0..2u16 {
+        for j in 0..2u16 {
+            for k in 0..2u16 {
+                data.extend([i * j * k * 65535, i * 65535, j * 65535]);
+            }
+        }
+    }
+    let mut p = Profile::new_srgb();
+    for s in [*b"rXYZ", *b"gXYZ", *b"bXYZ", *b"rTRC", *b"gTRC", *b"bTRC"] {
+        p.remove_tag(s);
+    }
+    p.header.class = ProfileClass::Output;
+    p.header.pcs = ColorSpace::Lab;
+    let id = || vec![Curve::identity(), Curve::identity(), Curve::identity()];
+    p.set_tag(
+        *b"B2A0",
+        Tag::Lut(Lut::BToA(AbLut {
+            inputs: 3,
+            outputs: 3,
+            a: Some(id()),
+            clut: Some(Clut {
+                grid: vec![2, 2, 2],
+                outputs: 3,
+                data,
+                precision: 2,
+            }),
+            m: None,
+            matrix: None,
+            b: id(),
+        })),
+    );
+    let p = rt(&p);
+    let t = Transform::new(
+        &Profile::new_lab_identity(),
+        Layout::Lab,
+        &p,
+        Layout::Rgb,
+        // Relative: perceptual into this v4 LUT profile would add the
+        // implicit v4 BPC and move the values.
+        Intent::RelativeColorimetric,
+        Options::default(),
+    )
+    .unwrap();
+    for &(x, y, z) in &[(0.3f32, 0.7f32, 0.5f32), (0.9, 0.2, 0.6), (0.5, 0.5, 0.5)] {
+        let lab = [x * 100.0, y * 255.0 - 128.0, z * 255.0 - 128.0];
+        let mut o = [0f32; 3];
+        t.transform(&lab, &mut o).unwrap();
+        assert!((o[0] - x * y * z).abs() < 1e-5, "{o:?} vs {}", x * y * z);
+    }
+}
