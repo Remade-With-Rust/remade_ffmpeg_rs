@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="240" height="200">
+<g fill="none" stroke="#246" stroke-width="12">
+<path d="M20 60 L50 20 L80 60" stroke-linejoin="miter"/>
+<path d="M100 60 L130 20 L160 60" stroke-linejoin="round"/>
+<path d="M180 60 L210 20 L235 60" stroke-linejoin="bevel"/>
+<path d="M20 110 H80" stroke-linecap="butt"/>
+<path d="M100 110 H160" stroke-linecap="round"/>
+<path d="M180 110 H225" stroke-linecap="square"/>
+<path d="M20 190 L60 140 L100 190" stroke-miterlimit="1.5"/>
+<path d="M130 190 L135 140 L140 190" stroke-miterlimit="10"/>
+<path d="M170 190 L175 140 L180 190" stroke-linejoin="miter-clip" stroke-miterlimit="2"/>
+</g></svg>

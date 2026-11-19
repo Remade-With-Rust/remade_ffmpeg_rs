@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd" [
+<!ENTITY ns_svg "http://www.w3.org/2000/svg">
+<!ENTITY ns_xlink "http://www.w3.org/1999/xlink">
+]>
+<svg version="1.1" id="Layer_1" xmlns="&ns_svg;" xmlns:xlink="&ns_xlink;" x="0px" y="0px" width="120px" height="120px" viewBox="0 0 120 120" enable-background="new 0 0 120 120" xml:space="preserve">
+<style type="text/css">
+	.st0{fill:#2E3192;}
+	.st1{fill:none;stroke:#ED1C24;stroke-width:4;stroke-miterlimit:10;}
+	.st2{opacity:0.6;fill:#39B54A;}
+</style>
+<g>
+	<rect x="10" y="10" class="st0" width="50" height="50"/>
+	<circle class="st1" cx="80" cy="40" r="25"/>
+	<polygon class="st2" points="20,110 60,70 100,110 "/>
+</g>
+</svg>

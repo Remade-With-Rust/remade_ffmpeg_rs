@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="100">
+<switch><rect systemLanguage="fr" x="10" y="10" width="80" height="80" fill="red"/><rect systemLanguage="en-US" x="10" y="10" width="80" height="80" fill="green"/></switch>
+<rect x="110" y="10" width="30" height="30" fill="red" display="none"/>
+<rect x="150" y="10" width="30" height="30" fill="red" visibility="hidden"/>
+<g visibility="hidden"><rect x="110" y="50" width="30" height="30" fill="blue" visibility="visible"/></g>
+<rect x="150" y="50" width="30" height="30" fill="red" requiredExtensions="http://example.org/x"/>
+</svg>

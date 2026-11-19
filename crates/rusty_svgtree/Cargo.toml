@@ -1,0 +1,34 @@
+[package]
+name = "rusty_svgtree"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+authors = ["Mata Network <https://www.mata.network>"]
+description = "Pure-Rust SVG parser and renderer: parses SVG into a simplified render tree (usvg-style: paths, shapes, transforms, viewBox, CSS, gradients, use/symbol, clip paths, masks, group opacity, embedded PNG/JPEG) and renders it with rusty_raster. Hostile inputs error or clamp. Measured against resvg."
+readme = "README.md"
+keywords = ["svg", "vector", "render", "rasterizer", "graphics"]
+categories = ["graphics", "rendering", "multimedia::images"]
+include = ["/LICENSE", "/README.md", "/src/"]
+
+[features]
+default = ["raster-images"]
+# Decode embedded `data:` PNG/JPEG images through the house rusty_png and
+# rusty_jpeg crates. Off, `<image>` elements are parsed and skipped.
+raster-images = ["dep:rusty_png", "dep:rusty_jpeg"]
+
+[dependencies]
+rusty_raster.workspace = true
+rusty_xml = "0.10.2"
+rusty_png = { workspace = true, optional = true }
+rusty_jpeg = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The oracle: every corpus SVG is rendered by both stacks and compared.
+resvg = { version = "0.48.1", default-features = false, features = ["raster-images"] }
+rusty_alloc-api.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

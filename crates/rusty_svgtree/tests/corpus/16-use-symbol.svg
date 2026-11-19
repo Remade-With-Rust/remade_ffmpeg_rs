@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200">
+<defs>
+<g id="pair"><rect width="20" height="20" fill="#c00"/><circle cx="35" cy="10" r="10" fill="#00c"/></g>
+<symbol id="sym" viewBox="0 0 10 10"><path d="M0 0 L10 5 L0 10z" fill="green"/></symbol>
+</defs>
+<use href="#pair" x="10" y="10"/>
+<use xlink:href="#pair" transform="translate(80 10) scale(1.5)"/>
+<use href="#sym" x="10" y="60" width="60" height="60"/>
+<use href="#sym" x="90" y="60" width="100" height="40" fill="red"/>
+<g id="outer"><use href="#pair" x="10" y="150" opacity="0.5"/></g>
+<use href="#outer" x="100"/>
+</svg>

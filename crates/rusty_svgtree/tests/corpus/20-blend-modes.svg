@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="240" height="120">
+<rect width="240" height="120" fill="#48c"/>
+<g><circle cx="30" cy="30" r="25" fill="#f80" style="mix-blend-mode: multiply"/>
+<circle cx="90" cy="30" r="25" fill="#f80" style="mix-blend-mode: screen"/>
+<circle cx="150" cy="30" r="25" fill="#f80" style="mix-blend-mode: overlay"/>
+<circle cx="210" cy="30" r="25" fill="#f80" style="mix-blend-mode: difference"/>
+<circle cx="30" cy="90" r="25" fill="#f80" style="mix-blend-mode: color-dodge"/>
+<circle cx="90" cy="90" r="25" fill="#f80" style="mix-blend-mode: soft-light"/>
+<circle cx="150" cy="90" r="25" fill="#f80" style="mix-blend-mode: hue"/>
+<circle cx="210" cy="90" r="25" fill="#f80" style="mix-blend-mode: luminosity"/></g>
+</svg>
