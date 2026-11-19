@@ -317,3 +317,71 @@ fn registers_and_probes() {
     assert_eq!(reg.probe(&file).map(|f| f.name), Some("aiff"));
     assert_eq!(reg.by_extension("aifc").map(|f| f.name), Some("aiff"));
 }
+
+/// Case variants and QuickTime's little-endian `23ni` / `42ni` (#125 follow-up:
+/// symphonia accepts all of these, and they occur in the wild).
+#[test]
+fn compression_types_ignore_case_and_take_the_little_endian_spellings() {
+    let s16: [i16; 4] = [0, 1, -1, 1234];
+    let be16: Vec<u8> = s16.iter().flat_map(|v| v.to_be_bytes()).collect();
+    let le16: Vec<u8> = s16.iter().flat_map(|v| v.to_le_bytes()).collect();
+    for (tag, data) in [
+        (b"none", be16.as_slice()),
+        (b"TWOS", be16.as_slice()),
+        (b"Twos", be16.as_slice()),
+        (b"SOWT", le16.as_slice()),
+    ] {
+        let file = form(
+            b"AIFC",
+            &[
+                (b"COMM", comm(2, 16, 8000, Some(tag))),
+                (b"SSND", ssnd(data, 0)),
+            ],
+        );
+        let (s, p) = demux(file).unwrap();
+        assert_eq!(s.sample_format, Some(SampleFormat::S16), "{tag:?}");
+        assert_eq!(payload(&p), le16, "{tag:?}");
+    }
+
+    let s32: [i32; 2] = [0x0102_0304, -5];
+    let le32: Vec<u8> = s32.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let be32: Vec<u8> = s32.iter().flat_map(|v| v.to_be_bytes()).collect();
+    for (tag, data) in [(b"IN32", be32.as_slice()), (b"23ni", le32.as_slice())] {
+        let file = form(
+            b"AIFC",
+            &[
+                (b"COMM", comm(1, 32, 8000, Some(tag))),
+                (b"SSND", ssnd(data, 0)),
+            ],
+        );
+        let (s, p) = demux(file).unwrap();
+        assert_eq!(s.sample_format, Some(SampleFormat::S32), "{tag:?}");
+        assert_eq!(payload(&p), le32, "{tag:?}");
+    }
+
+    let le24 = [0x03u8, 0x02, 0x01, 0xFB, 0xFF, 0xFF];
+    let be24 = [0x01u8, 0x02, 0x03, 0xFF, 0xFF, 0xFB];
+    for (tag, data) in [(b"IN24", be24.as_slice()), (b"42ni", le24.as_slice())] {
+        let file = form(
+            b"AIFC",
+            &[
+                (b"COMM", comm(1, 24, 8000, Some(tag))),
+                (b"SSND", ssnd(data, 0)),
+            ],
+        );
+        let (s, p) = demux(file).unwrap();
+        assert_eq!(s.sample_format, Some(SampleFormat::S24), "{tag:?}");
+        assert_eq!(payload(&p), le24, "{tag:?}");
+    }
+
+    for (tag, codec) in [(b"ALAW", CodecId::PcmAlaw), (b"Ulaw", CodecId::PcmMulaw)] {
+        let file = form(
+            b"AIFC",
+            &[
+                (b"COMM", comm(1, 16, 8000, Some(tag))),
+                (b"SSND", ssnd(&[0x55; 4], 0)),
+            ],
+        );
+        assert_eq!(demux(file).unwrap().0.codec_id, codec, "{tag:?}");
+    }
+}
