@@ -1,0 +1,23 @@
+[package]
+name = "rusty_tiff_bench_libtiff"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "rusty_tiff vs libtiff: corpus comparison and side-by-side speed (Linux, links libtiff.so.6 via FFI)."
+
+# Standalone: not a member of the remade_ffmpeg_rs workspace and not part of
+# the published rusty_tiff package (its `include` list carries only src/).
+[workspace]
+
+[dependencies]
+rusty_tiff = { path = ".." }
+# Same pin as the remade_ffmpeg_rs workspace: the Rust arm runs under the
+# allocator that ships (CLAUDE.md).
+rusty_alloc-api = "=2.5.0"
+
+# The workspace's shipping profile.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+debug = 1

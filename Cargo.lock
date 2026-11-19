@@ -5854,9 +5854,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_jpeg"
-version = "0.4.6"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03629dcbe762841b2de7fb581d03555b6dc21e7b844d87caaf909310a7a08fea"
+checksum = "86c9670ba36e698633e33cab4d7d8ef5902a98adfb979efb6f5536fcfc14f598"
 
 [[package]]
 name = "rusty_json_turbo"
@@ -5899,6 +5899,18 @@ dependencies = [
  "rand 0.8.6",
  "rusty_alloc-api",
  "simd-adler32",
+]
+
+[[package]]
+name = "rusty_tiff"
+version = "0.1.0"
+dependencies = [
+ "fax",
+ "flate2",
+ "rusty_alloc-api",
+ "rusty_jpeg",
+ "tiff",
+ "weezl",
 ]
 
 [[package]]
