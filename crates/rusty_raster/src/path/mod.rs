@@ -16,6 +16,7 @@ mod dash;
 mod f32x2_t;
 pub(crate) mod f32x4_t;
 mod floating_point;
+#[allow(clippy::module_inception)]
 mod path;
 mod path_builder;
 pub mod path_geometry;

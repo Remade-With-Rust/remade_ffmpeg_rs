@@ -118,6 +118,8 @@ const QUAD_RECURSIVE_LIMIT: usize = 3;
 // quads with extreme widths (e.g. (0,1) (1,6) (0,3) width=5e7) recurse to point of failure
 // largest seen for normal cubics: 5, 26
 // largest seen for normal quads: 11
+const MAX_SPLITS_PER_CURVE: u32 = 1 << 16;
+
 const RECURSIVE_LIMITS: [i32; 4] = [5 * 3, 26 * 3, 11 * 3, 11 * 3]; // 3x limits seen in practice
 
 type CapProc = fn(
@@ -217,6 +219,10 @@ pub struct PathStroker {
     stroke_type: StrokeType,
 
     recursion_depth: i32, // track stack depth to abort if numerics run amok
+    // Splits left for the current curve. The depth limits alone allow ~2^78
+    // binary splits when the numerics never converge (hostile input); real
+    // curves use a handful.
+    split_budget: u32,
     found_tangents: bool, // do less work until tangents meet (cubic)
     join_completed: bool, // previous join was not degenerate
 }
@@ -260,6 +266,7 @@ impl PathStroker {
             stroke_type: StrokeType::Outer,
 
             recursion_depth: 0,
+            split_budget: MAX_SPLITS_PER_CURVE,
             found_tangents: false,
             join_completed: false,
         }
@@ -471,6 +478,7 @@ impl PathStroker {
     }
 
     fn quad_to(&mut self, p1: Point, p2: Point) {
+        self.split_budget = MAX_SPLITS_PER_CURVE;
         let quad = [self.prev_pt, p1, p2];
         let (reduction, reduction_type) = check_quad_linear(&quad);
         if reduction_type == ReductionType::Point {
@@ -539,6 +547,7 @@ impl PathStroker {
     }
 
     fn cubic_to(&mut self, pt1: Point, pt2: Point, pt3: Point) {
+        self.split_budget = MAX_SPLITS_PER_CURVE;
         let cubic = [self.prev_pt, pt1, pt2, pt3];
         let mut reduction = [Point::zero(); 3];
         let mut tangent_pt = Point::zero();
@@ -666,6 +675,10 @@ impl PathStroker {
         if self.recursion_depth > RECURSIVE_LIMITS[self.found_tangents as usize] {
             return false; // just abort if projected quad isn't representable
         }
+        if self.split_budget == 0 {
+            return false;
+        }
+        self.split_budget -= 1;
 
         let mut half = QuadConstruct::default();
         if !half.init_with_start(quad_points) {
@@ -1010,6 +1023,10 @@ impl PathStroker {
         if self.recursion_depth > RECURSIVE_LIMITS[QUAD_RECURSIVE_LIMIT] {
             return false; // just abort if projected quad isn't representable
         }
+        if self.split_budget == 0 {
+            return false;
+        }
+        self.split_budget -= 1;
 
         let mut half = QuadConstruct::default();
         half.init_with_start(quad_points);

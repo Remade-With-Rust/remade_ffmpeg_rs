@@ -4,6 +4,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#[cfg(feature = "png-format")]
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -44,11 +45,10 @@ impl Pixmap {
         let size = IntSize::from_wh(width, height)?;
         let data_len = data_len_for_size(size)?;
 
-        // We cannot check that allocation was successful yet.
-        // We have to wait for https://github.com/rust-lang/rust/issues/48043
-
+        // Fallible allocation: an oversized request returns `None` instead of
+        // aborting the process (tiny-skia uses `vec![0; len]`).
         Some(Pixmap {
-            data: vec![0; data_len],
+            data: try_zeroed(data_len)?,
             size,
         })
     }
@@ -75,7 +75,7 @@ impl Pixmap {
     #[cfg(feature = "png-format")]
     pub fn decode_png(data: &[u8]) -> Result<Self, rusty_png::DecodingError> {
         fn make_custom_png_error(msg: &str) -> rusty_png::DecodingError {
-            std::io::Error::new(std::io::ErrorKind::Other, msg).into()
+            std::io::Error::other(msg).into()
         }
 
         let mut decoder = rusty_png::Decoder::new(std::io::Cursor::new(data));
@@ -596,6 +596,14 @@ pub struct SubPixmapMut<'a> {
     pub data: &'a mut [u8],
     pub size: IntSize,
     pub real_width: usize,
+}
+
+/// A zeroed buffer, or `None` when the allocator refuses the request.
+pub(crate) fn try_zeroed(len: usize) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len).ok()?;
+    v.resize(len, 0);
+    Some(v)
 }
 
 fn fill_bytes(data: &mut [u8], color: Color) {

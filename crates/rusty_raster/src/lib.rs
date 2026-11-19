@@ -51,6 +51,11 @@
 #![allow(clippy::eq_op)]
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
 #![allow(clippy::upper_case_acronyms)]
+// The inherited tiny-skia unit tests keep their own style.
+#![cfg_attr(
+    test,
+    allow(clippy::bool_assert_comparison, clippy::field_reassign_with_default)
+)]
 
 extern crate alloc;
 

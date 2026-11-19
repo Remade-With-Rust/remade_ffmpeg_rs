@@ -12,7 +12,6 @@ use crate::blitter::{Blitter, Mask};
 use crate::color::AlphaU8;
 use crate::geom::ScreenIntRect;
 use crate::mask::SubMaskRef;
-use crate::math::LENGTH_U32_ONE;
 use crate::pipeline::{self, RasterPipeline, RasterPipelineBuilder};
 use crate::pixmap::SubPixmapMut;
 
@@ -254,10 +253,32 @@ impl<'a, 'b: 'a> RasterPipelineBlitter<'a, 'b> {
     }
 }
 
+impl RasterPipelineBlitter<'_, '_> {
+    /// Clips `rect` to the destination. Every scan converter is supposed to
+    /// stay inside its clip; this guard is what turns a fixed-point overflow
+    /// on hostile geometry into clipped output instead of an out-of-bounds
+    /// panic (as in tiny-skia). For in-bounds rects it is the identity.
+    #[inline]
+    fn clip(&self, rect: &ScreenIntRect) -> Option<ScreenIntRect> {
+        let w = self.pixmap.size.width();
+        let h = self.pixmap.size.height();
+        if rect.x() >= w || rect.y() >= h {
+            return None;
+        }
+        let right = rect.x().saturating_add(rect.width()).min(w);
+        let bottom = rect.y().saturating_add(rect.height()).min(h);
+        if right == rect.right() && bottom == rect.bottom() {
+            return Some(*rect);
+        }
+        ScreenIntRect::from_xywh(rect.x(), rect.y(), right - rect.x(), bottom - rect.y())
+    }
+}
+
 impl Blitter for RasterPipelineBlitter<'_, '_> {
     fn blit_h(&mut self, x: u32, y: u32, width: LengthU32) {
-        let r = ScreenIntRect::from_xywh_safe(x, y, width, LENGTH_U32_ONE);
-        self.blit_rect(&r);
+        if let Some(r) = ScreenIntRect::from_xywh(x, y, width.get(), 1) {
+            self.blit_rect(&r);
+        }
     }
 
     fn blit_anti_h(&mut self, mut x: u32, y: u32, aa: &mut [AlphaU8], runs: &mut [AlphaRun]) {
@@ -265,11 +286,14 @@ impl Blitter for RasterPipelineBlitter<'_, '_> {
 
         let mut aa_offset = 0;
         let mut run_offset = 0;
-        let mut run_opt = runs[0];
+        let mut run_opt = runs.first().copied().flatten();
         while let Some(run) = run_opt {
             let width = LengthU32::from(run);
+            let Some(&alpha) = aa.get(aa_offset) else {
+                break;
+            };
 
-            match aa[aa_offset] {
+            match alpha {
                 ALPHA_U8_TRANSPARENT => {}
                 ALPHA_U8_OPAQUE => {
                     self.blit_h(x, y, width);
@@ -277,26 +301,31 @@ impl Blitter for RasterPipelineBlitter<'_, '_> {
                 alpha => {
                     self.blit_anti_h_rp.ctx.current_coverage = alpha as f32 * (1.0 / 255.0);
 
-                    let rect = ScreenIntRect::from_xywh_safe(x, y, width, LENGTH_U32_ONE);
-                    self.blit_anti_h_rp.run(
-                        &rect,
-                        pipeline::AAMaskCtx::default(),
-                        mask_ctx,
-                        self.pixmap_src,
-                        self.pixmap,
-                    );
+                    let rect =
+                        ScreenIntRect::from_xywh(x, y, width.get(), 1).and_then(|r| self.clip(&r));
+                    if let Some(rect) = rect {
+                        self.blit_anti_h_rp.run(
+                            &rect,
+                            pipeline::AAMaskCtx::default(),
+                            mask_ctx,
+                            self.pixmap_src,
+                            self.pixmap,
+                        );
+                    }
                 }
             }
 
-            x += width.get();
+            x = x.saturating_add(width.get());
             run_offset += usize::from(run.get());
             aa_offset += usize::from(run.get());
-            run_opt = runs[run_offset];
+            run_opt = runs.get(run_offset).copied().flatten();
         }
     }
 
     fn blit_v(&mut self, x: u32, y: u32, height: LengthU32, alpha: AlphaU8) {
-        let bounds = ScreenIntRect::from_xywh_safe(x, y, LENGTH_U32_ONE, height);
+        let Some(bounds) = ScreenIntRect::from_xywh(x, y, 1, height.get()) else {
+            return;
+        };
 
         let mask = Mask {
             image: [alpha, alpha],
@@ -308,7 +337,9 @@ impl Blitter for RasterPipelineBlitter<'_, '_> {
     }
 
     fn blit_anti_h2(&mut self, x: u32, y: u32, alpha0: AlphaU8, alpha1: AlphaU8) {
-        let bounds = ScreenIntRect::from_xywh(x, y, 2, 1).unwrap();
+        let Some(bounds) = ScreenIntRect::from_xywh(x, y, 2, 1) else {
+            return;
+        };
 
         let mask = Mask {
             image: [alpha0, alpha1],
@@ -320,7 +351,9 @@ impl Blitter for RasterPipelineBlitter<'_, '_> {
     }
 
     fn blit_anti_v2(&mut self, x: u32, y: u32, alpha0: AlphaU8, alpha1: AlphaU8) {
-        let bounds = ScreenIntRect::from_xywh(x, y, 1, 2).unwrap();
+        let Some(bounds) = ScreenIntRect::from_xywh(x, y, 1, 2) else {
+            return;
+        };
 
         let mask = Mask {
             image: [alpha0, alpha1],
@@ -332,6 +365,10 @@ impl Blitter for RasterPipelineBlitter<'_, '_> {
     }
 
     fn blit_rect(&mut self, rect: &ScreenIntRect) {
+        let Some(rect) = self.clip(rect) else {
+            return;
+        };
+        let rect = &rect;
         if let Some(c) = self.memset2d_color {
             if self.is_mask {
                 for y in 0..rect.height() {
@@ -371,6 +408,10 @@ impl Blitter for RasterPipelineBlitter<'_, '_> {
     }
 
     fn blit_mask(&mut self, mask: &Mask, clip: &ScreenIntRect) {
+        let Some(clip) = self.clip(clip) else {
+            return;
+        };
+        let clip = &clip;
         let aa_mask_ctx = pipeline::AAMaskCtx {
             pixels: mask.image,
             stride: mask.row_bytes,

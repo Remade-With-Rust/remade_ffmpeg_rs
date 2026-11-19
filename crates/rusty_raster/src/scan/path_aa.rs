@@ -223,9 +223,28 @@ impl Blitter for SuperBlitter<'_> {
         match x.checked_sub(self.base.super_left) {
             Some(n) => x = n,
             None => {
-                width = LengthU32::new(x + width.get()).unwrap();
+                // tiny-skia's arithmetic, kept for pixel parity; only the
+                // overflow (which panicked there) is new.
+                width = match x.checked_add(width.get()).and_then(LengthU32::new) {
+                    Some(w) => w,
+                    None => return,
+                };
                 x = 0;
             }
+        }
+
+        // Clip the span to the run buffer. Well-formed paths never reach past
+        // it; overflowed fixed-point edges from hostile geometry can, and
+        // tiny-skia then indexes out of bounds inside `AlphaRuns`.
+        let super_width = self.base.width.get() << SHIFT;
+        if x >= super_width {
+            return;
+        }
+        if x + width.get() > super_width {
+            width = match LengthU32::new(super_width - x) {
+                Some(w) => w,
+                None => return,
+            };
         }
 
         debug_assert!(y as i32 >= self.base.curr_y);

@@ -410,7 +410,11 @@ impl Rect {
             }
         }
 
-        let mut accum = f32x4::default();
+        // tiny-skia starts `accum` at zero, so a NaN or infinity in the first
+        // one or two points never reached it and such a path was accepted
+        // (it later sent the stroker into a multi-GiB allocation). Folding the
+        // seed points in as `x * 0` keeps tiny-skia's overflow-free test.
+        let mut accum = min * f32x4::default();
         while offset != points.len() {
             let pt0 = points[offset + 0];
             let pt1 = points[offset + 1];

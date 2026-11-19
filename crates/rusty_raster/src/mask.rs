@@ -44,8 +44,9 @@ impl Mask {
     /// Creates a new mask, allocating a buffer of the given size.
     pub fn new(width: u32, height: u32) -> Option<Self> {
         let size = IntSize::from_wh(width, height)?;
+        let len = (width as usize).checked_mul(height as usize)?;
         Some(Mask {
-            data: vec![0; width as usize * height as usize],
+            data: crate::pixmap::try_zeroed(len)?,
             size,
         })
     }
@@ -180,7 +181,7 @@ impl Mask {
     #[cfg(feature = "png-format")]
     pub fn decode_png(data: &[u8]) -> Result<Self, rusty_png::DecodingError> {
         fn make_custom_png_error(msg: &str) -> rusty_png::DecodingError {
-            std::io::Error::new(std::io::ErrorKind::Other, msg).into()
+            std::io::Error::other(msg).into()
         }
 
         let mut decoder = rusty_png::Decoder::new(std::io::Cursor::new(data));

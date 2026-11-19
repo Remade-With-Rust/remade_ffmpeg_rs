@@ -476,7 +476,11 @@ impl PixmapMut<'_> {
         transform: Transform,
         mask: Option<&Mask>,
     ) {
-        let rect = pixmap.size().to_int_rect(x, y).to_rect();
+        // tiny-skia unwraps here and panics when `x + width` overflows `i32`.
+        let Some(rect) = IntRect::from_xywh(x, y, pixmap.width(), pixmap.height()) else {
+            return;
+        };
+        let rect = rect.to_rect();
 
         // TODO: SkSpriteBlitter
         // TODO: partially clipped

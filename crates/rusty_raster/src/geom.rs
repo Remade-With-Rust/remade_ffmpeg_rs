@@ -149,6 +149,7 @@ impl ScreenIntRect {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod screen_int_rect_tests {
     use super::*;
 

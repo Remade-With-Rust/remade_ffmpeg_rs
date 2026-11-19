@@ -223,11 +223,35 @@ macro_rules! backend {
             fn blend(v: u8) -> s::BlendMode {
                 use s::BlendMode::*;
                 const ALL: [s::BlendMode; 29] = [
-                    SourceOver, Clear, Source, Destination, DestinationOver, SourceIn,
-                    DestinationIn, SourceOut, DestinationOut, SourceAtop, DestinationAtop, Xor,
-                    Plus, Modulate, Screen, Overlay, Darken, Lighten, ColorDodge, ColorBurn,
-                    HardLight, SoftLight, Difference, Exclusion, Multiply, Hue, Saturation,
-                    Color, Luminosity,
+                    SourceOver,
+                    Clear,
+                    Source,
+                    Destination,
+                    DestinationOver,
+                    SourceIn,
+                    DestinationIn,
+                    SourceOut,
+                    DestinationOut,
+                    SourceAtop,
+                    DestinationAtop,
+                    Xor,
+                    Plus,
+                    Modulate,
+                    Screen,
+                    Overlay,
+                    Darken,
+                    Lighten,
+                    ColorDodge,
+                    ColorBurn,
+                    HardLight,
+                    SoftLight,
+                    Difference,
+                    Exclusion,
+                    Multiply,
+                    Hue,
+                    Saturation,
+                    Color,
+                    Luminosity,
                 ];
                 ALL[v as usize % 29]
             }
@@ -244,39 +268,57 @@ macro_rules! backend {
             fn paint<'a>(p: &PaintSpec, src: &'a s::Pixmap) -> Option<s::Paint<'a>> {
                 let shader = match &p.shader {
                     ShaderSpec::Solid(c) => s::Shader::SolidColor(color(*c)),
-                    ShaderSpec::Linear { p0, p1, stops: st, spread: sp, ts: t } => {
-                        s::LinearGradient::new(
-                            s::Point::from_xy(p0.0, p0.1),
-                            s::Point::from_xy(p1.0, p1.1),
-                            stops(st),
-                            spread(*sp),
-                            ts(t),
-                        )?
-                    }
-                    ShaderSpec::Radial { c0, r0, c1, r1, stops: st, spread: sp, ts: t } => {
-                        s::RadialGradient::new(
-                            s::Point::from_xy(c0.0, c0.1),
-                            *r0,
-                            s::Point::from_xy(c1.0, c1.1),
-                            *r1,
-                            stops(st),
-                            spread(*sp),
-                            ts(t),
-                        )?
-                    }
-                    ShaderSpec::Sweep { c, a0, a1, stops: st, spread: sp, ts: t } => {
-                        s::SweepGradient::new(
-                            s::Point::from_xy(c.0, c.1),
-                            *a0,
-                            *a1,
-                            stops(st),
-                            spread(*sp),
-                            ts(t),
-                        )?
-                    }
-                    ShaderSpec::Pattern { spread: sp, quality: q, opacity, ts: t } => {
-                        s::Pattern::new(src.as_ref(), spread(*sp), quality(*q), *opacity, ts(t))
-                    }
+                    ShaderSpec::Linear {
+                        p0,
+                        p1,
+                        stops: st,
+                        spread: sp,
+                        ts: t,
+                    } => s::LinearGradient::new(
+                        s::Point::from_xy(p0.0, p0.1),
+                        s::Point::from_xy(p1.0, p1.1),
+                        stops(st),
+                        spread(*sp),
+                        ts(t),
+                    )?,
+                    ShaderSpec::Radial {
+                        c0,
+                        r0,
+                        c1,
+                        r1,
+                        stops: st,
+                        spread: sp,
+                        ts: t,
+                    } => s::RadialGradient::new(
+                        s::Point::from_xy(c0.0, c0.1),
+                        *r0,
+                        s::Point::from_xy(c1.0, c1.1),
+                        *r1,
+                        stops(st),
+                        spread(*sp),
+                        ts(t),
+                    )?,
+                    ShaderSpec::Sweep {
+                        c,
+                        a0,
+                        a1,
+                        stops: st,
+                        spread: sp,
+                        ts: t,
+                    } => s::SweepGradient::new(
+                        s::Point::from_xy(c.0, c.1),
+                        *a0,
+                        *a1,
+                        stops(st),
+                        spread(*sp),
+                        ts(t),
+                    )?,
+                    ShaderSpec::Pattern {
+                        spread: sp,
+                        quality: q,
+                        opacity,
+                        ts: t,
+                    } => s::Pattern::new(src.as_ref(), spread(*sp), quality(*q), *opacity, ts(t)),
                 };
                 Some(s::Paint {
                     shader,
@@ -289,7 +331,13 @@ macro_rules! backend {
 
             fn mask(m: &MaskSpec, w: u32, h: u32, src: &s::Pixmap) -> Option<s::Mask> {
                 match m {
-                    MaskSpec::Path { cmds, even_odd, aa, ts: t, invert } => {
+                    MaskSpec::Path {
+                        cmds,
+                        even_odd,
+                        aa,
+                        ts: t,
+                        invert,
+                    } => {
                         let mut mk = s::Mask::new(w, h)?;
                         if let Some(p) = path(cmds) {
                             let rule = if *even_odd {
@@ -332,7 +380,13 @@ macro_rules! backend {
             let (w, h) = (sc.w, sc.h);
             for op in &sc.ops {
                 match op {
-                    Op::Fill { cmds, paint: p, even_odd, ts: t, mask: m } => {
+                    Op::Fill {
+                        cmds,
+                        paint: p,
+                        even_odd,
+                        ts: t,
+                        mask: m,
+                    } => {
                         let (Some(pa), Some(pt)) = (paint(p, &src), path(cmds)) else {
                             continue;
                         };
@@ -344,7 +398,13 @@ macro_rules! backend {
                         };
                         pm.fill_path(&pt, &pa, rule, ts(t), mk.as_ref());
                     }
-                    Op::Stroke { cmds, paint: p, stroke: st, ts: t, mask: m } => {
+                    Op::Stroke {
+                        cmds,
+                        paint: p,
+                        stroke: st,
+                        ts: t,
+                        mask: m,
+                    } => {
                         let (Some(pa), Some(pt)) = (paint(p, &src), path(cmds)) else {
                             continue;
                         };
@@ -370,7 +430,12 @@ macro_rules! backend {
                         };
                         pm.stroke_path(&pt, &pa, &stroke, ts(t), mk.as_ref());
                     }
-                    Op::FillRect { r, paint: p, ts: t, mask: m } => {
+                    Op::FillRect {
+                        r,
+                        paint: p,
+                        ts: t,
+                        mask: m,
+                    } => {
                         let (Some(pa), Some(rect)) =
                             (paint(p, &src), s::Rect::from_xywh(r.0, r.1, r.2, r.3))
                         else {
@@ -379,7 +444,15 @@ macro_rules! backend {
                         let mk = m.as_ref().and_then(|m| mask(m, w, h, &src));
                         pm.fill_rect(rect, &pa, ts(t), mk.as_ref());
                     }
-                    Op::Pixmap { x, y, opacity, blend: b, quality: q, ts: t, mask: m } => {
+                    Op::Pixmap {
+                        x,
+                        y,
+                        opacity,
+                        blend: b,
+                        quality: q,
+                        ts: t,
+                        mask: m,
+                    } => {
                         let mk = m.as_ref().and_then(|m| mask(m, w, h, &src));
                         let pp = s::PixmapPaint {
                             opacity: *opacity,
@@ -426,7 +499,12 @@ impl Rng {
         self.next() & 1 == 1
     }
     fn rgba(&mut self) -> [u8; 4] {
-        [self.u(256) as u8, self.u(256) as u8, self.u(256) as u8, self.u(256) as u8]
+        [
+            self.u(256) as u8,
+            self.u(256) as u8,
+            self.u(256) as u8,
+            self.u(256) as u8,
+        ]
     }
     fn opaque(&mut self) -> [u8; 4] {
         [self.u(256) as u8, self.u(256) as u8, self.u(256) as u8, 255]
@@ -434,7 +512,13 @@ impl Rng {
 }
 
 fn solid(c: [u8; 4], aa: bool) -> PaintSpec {
-    PaintSpec { shader: ShaderSpec::Solid(c), blend: 0, aa, colorspace: 0, hq: false }
+    PaintSpec {
+        shader: ShaderSpec::Solid(c),
+        blend: 0,
+        aa,
+        colorspace: 0,
+        hq: false,
+    }
 }
 
 fn random_stops(r: &mut Rng) -> Stops {
@@ -456,13 +540,27 @@ fn random_transform(r: &mut Rng, w: f32, h: f32) -> [f32; 6] {
         2 => {
             let s = r.f(0.3, 2.5);
             let t = r.f(0.3, 2.5);
-            [s, 0.0, 0.0, t, r.f(-w * 0.3, w * 0.3), r.f(-h * 0.3, h * 0.3)]
+            [
+                s,
+                0.0,
+                0.0,
+                t,
+                r.f(-w * 0.3, w * 0.3),
+                r.f(-h * 0.3, h * 0.3),
+            ]
         }
         3 => {
             let a = r.f(-3.2, 3.2);
             let (sn, cs) = a.sin_cos();
             let (cx, cy) = (w / 2.0, h / 2.0);
-            [cs, sn, -sn, cs, cx - cs * cx + sn * cy, cy - sn * cx - cs * cy]
+            [
+                cs,
+                sn,
+                -sn,
+                cs,
+                cx - cs * cx + sn * cy,
+                cy - sn * cx - cs * cy,
+            ]
         }
         _ => [
             r.f(0.5, 1.5),
@@ -509,7 +607,8 @@ fn star(cx: f32, cy: f32, r_out: f32, r_in: f32, n: u32, rot: f32) -> Vec<Cmd> {
 fn pentagram(cx: f32, cy: f32, r: f32) -> Vec<Cmd> {
     let mut v = Vec::new();
     for i in 0..5 {
-        let a = -std::f32::consts::FRAC_PI_2 + (i * 2 % 5) as f32 * 2.0 * std::f32::consts::PI / 5.0;
+        let a =
+            -std::f32::consts::FRAC_PI_2 + (i * 2 % 5) as f32 * 2.0 * std::f32::consts::PI / 5.0;
         let (x, y) = (cx + r * a.cos(), cy + r * a.sin());
         v.push(if i == 0 { Cmd::M(x, y) } else { Cmd::L(x, y) });
     }
@@ -533,7 +632,11 @@ fn random_paint(r: &mut Rng, w: f32, h: f32) -> PaintSpec {
             ShaderSpec::Radial {
                 c0,
                 r0: if r.b() { 0.0 } else { r.f(0.0, w / 4.0) },
-                c1: if focal { (r.f(0.0, w), r.f(0.0, h)) } else { c0 },
+                c1: if focal {
+                    (r.f(0.0, w), r.f(0.0, h))
+                } else {
+                    c0
+                },
                 r1: r.f(1.0, w),
                 stops: random_stops(r),
                 spread: r.u(3) as u8,
@@ -603,7 +706,14 @@ fn random_mask(r: &mut Rng, w: f32, h: f32) -> Option<MaskSpec> {
 fn corpus() -> Vec<Scene> {
     let mut out = Vec::new();
     let mut push = |cat: &'static str, name: String, w: u32, h: u32, bg, ops| {
-        out.push(Scene { cat, name, w, h, bg, ops });
+        out.push(Scene {
+            cat,
+            name,
+            w,
+            h,
+            bg,
+            ops,
+        });
     };
     let white = Some([255, 255, 255, 255]);
 
@@ -614,7 +724,15 @@ fn corpus() -> Vec<Scene> {
         ("oval", vec![Cmd::Oval(8.5, 20.25, 80.0, 45.5)]),
         ("tiny-circle", vec![Cmd::Circle(50.2, 50.7, 0.8)]),
         ("thin-rect", vec![Cmd::Rect(10.0, 10.0, 0.3, 70.0)]),
-        ("triangle", vec![Cmd::M(10.0, 90.0), Cmd::L(50.0, 5.5), Cmd::L(93.3, 80.1), Cmd::Z]),
+        (
+            "triangle",
+            vec![
+                Cmd::M(10.0, 90.0),
+                Cmd::L(50.0, 5.5),
+                Cmd::L(93.3, 80.1),
+                Cmd::Z,
+            ],
+        ),
         ("rounded", {
             let (x, y, w, h, k) = (15.0, 15.0, 70.0, 60.0, 12.0);
             vec![
@@ -630,7 +748,10 @@ fn corpus() -> Vec<Scene> {
                 Cmd::Z,
             ]
         }),
-        ("donut", vec![Cmd::Circle(50.0, 50.0, 40.0), Cmd::Circle(50.0, 50.0, 20.0)]),
+        (
+            "donut",
+            vec![Cmd::Circle(50.0, 50.0, 40.0), Cmd::Circle(50.0, 50.0, 20.0)],
+        ),
         ("off-canvas", vec![Cmd::Circle(-10.0, 105.0, 45.0)]),
     ];
     for (name, cmds) in &shapes {
@@ -695,12 +816,23 @@ fn corpus() -> Vec<Scene> {
             120,
             90,
             white,
-            vec![Op::Fill { cmds, paint: solid(c, aa), even_odd: eo, ts: t, mask: None }],
+            vec![Op::Fill {
+                cmds,
+                paint: solid(c, aa),
+                even_odd: eo,
+                ts: t,
+                mask: None,
+            }],
         );
     }
 
     // 4. Every join x cap, three widths, open and closed.
-    let open = vec![Cmd::M(15.0, 80.0), Cmd::L(35.0, 20.0), Cmd::L(55.0, 75.0), Cmd::Q(85.0, 10.0, 90.0, 60.0)];
+    let open = vec![
+        Cmd::M(15.0, 80.0),
+        Cmd::L(35.0, 20.0),
+        Cmd::L(55.0, 75.0),
+        Cmd::Q(85.0, 10.0, 90.0, 60.0),
+    ];
     let sharp = vec![Cmd::M(10.0, 70.0), Cmd::L(90.0, 60.0), Cmd::L(12.0, 50.0)];
     for (pn, base) in [("open", &open), ("sharp", &sharp)] {
         for join in 0..4u8 {
@@ -720,7 +852,13 @@ fn corpus() -> Vec<Scene> {
                             vec![Op::Stroke {
                                 cmds,
                                 paint: solid([20, 20, 20, 255], true),
-                                stroke: StrokeSpec { width, miter: 4.0, cap, join, dash: None },
+                                stroke: StrokeSpec {
+                                    width,
+                                    miter: 4.0,
+                                    cap,
+                                    join,
+                                    dash: None,
+                                },
                                 ts: ID,
                                 mask: None,
                             }],
@@ -742,7 +880,13 @@ fn corpus() -> Vec<Scene> {
                 vec![Op::Stroke {
                     cmds: sharp.clone(),
                     paint: solid([0, 0, 120, 255], true),
-                    stroke: StrokeSpec { width: 9.0, miter, cap: 0, join, dash: None },
+                    stroke: StrokeSpec {
+                        width: 9.0,
+                        miter,
+                        cap: 0,
+                        join,
+                        dash: None,
+                    },
                     ts: ID,
                     mask: None,
                 }],
@@ -753,9 +897,13 @@ fn corpus() -> Vec<Scene> {
     // 5. Thin strokes and hairlines (incl. under transforms).
     for (i, width) in [0.0f32, 0.1, 0.25, 0.5, 0.75, 1.0, 1.25].iter().enumerate() {
         for aa in [true, false] {
-            for (ti, t) in [ID, [2.0, 0.0, 0.0, 0.5, 0.0, 10.0], [0.7, 0.7, -0.7, 0.7, 50.0, -20.0]]
-                .iter()
-                .enumerate()
+            for (ti, t) in [
+                ID,
+                [2.0, 0.0, 0.0, 0.5, 0.0, 10.0],
+                [0.7, 0.7, -0.7, 0.7, 50.0, -20.0],
+            ]
+            .iter()
+            .enumerate()
             {
                 push(
                     "thin-strokes",
@@ -771,7 +919,13 @@ fn corpus() -> Vec<Scene> {
                             Cmd::C(80.0, 0.0, 99.0, 99.0, 3.0, 97.0),
                         ],
                         paint: solid([0, 0, 0, 255], aa),
-                        stroke: StrokeSpec { width: *width, miter: 4.0, cap: (i % 3) as u8, join: 0, dash: None },
+                        stroke: StrokeSpec {
+                            width: *width,
+                            miter: 4.0,
+                            cap: (i % 3) as u8,
+                            join: 0,
+                            dash: None,
+                        },
                         ts: *t,
                         mask: None,
                     }],
@@ -799,7 +953,13 @@ fn corpus() -> Vec<Scene> {
             100,
             100,
             white,
-            vec![Op::Stroke { cmds, paint: solid([10, 120, 10, 255], true), stroke, ts: ID, mask: None }],
+            vec![Op::Stroke {
+                cmds,
+                paint: solid([10, 120, 10, 255], true),
+                stroke,
+                ts: ID,
+                mask: None,
+            }],
         );
     }
     push(
@@ -811,7 +971,13 @@ fn corpus() -> Vec<Scene> {
         vec![Op::Stroke {
             cmds: vec![Cmd::Circle(50.0, 50.0, 40.0)],
             paint: solid([0, 0, 0, 255], true),
-            stroke: StrokeSpec { width: 4.0, miter: 4.0, cap: 1, join: 2, dash: Some((vec![0.0, 8.0], 0.0)) },
+            stroke: StrokeSpec {
+                width: 4.0,
+                miter: 4.0,
+                cap: 1,
+                join: 2,
+                dash: Some((vec![0.0, 8.0], 0.0)),
+            },
             ts: ID,
             mask: None,
         }],
@@ -819,14 +985,63 @@ fn corpus() -> Vec<Scene> {
 
     // 7. Gradients: every kind x spread, plus random ones.
     for spread in 0..3u8 {
-        let st: Stops = vec![(0.0, [255, 0, 0, 255]), (0.4, [0, 255, 0, 128]), (1.0, [0, 0, 255, 255])];
+        let st: Stops = vec![
+            (0.0, [255, 0, 0, 255]),
+            (0.4, [0, 255, 0, 128]),
+            (1.0, [0, 0, 255, 255]),
+        ];
         let kinds = [
-            ShaderSpec::Linear { p0: (30.0, 40.0), p1: (70.0, 60.0), stops: st.clone(), spread, ts: ID },
-            ShaderSpec::Radial { c0: (50.0, 50.0), r0: 0.0, c1: (50.0, 50.0), r1: 25.0, stops: st.clone(), spread, ts: ID },
-            ShaderSpec::Radial { c0: (40.0, 45.0), r0: 0.0, c1: (55.0, 50.0), r1: 30.0, stops: st.clone(), spread, ts: ID },
-            ShaderSpec::Radial { c0: (30.0, 50.0), r0: 5.0, c1: (60.0, 50.0), r1: 20.0, stops: st.clone(), spread, ts: ID },
-            ShaderSpec::Radial { c0: (30.0, 50.0), r0: 20.0, c1: (60.0, 50.0), r1: 20.0, stops: st.clone(), spread, ts: ID },
-            ShaderSpec::Sweep { c: (50.0, 50.0), a0: 0.0, a1: 270.0, stops: st.clone(), spread, ts: ID },
+            ShaderSpec::Linear {
+                p0: (30.0, 40.0),
+                p1: (70.0, 60.0),
+                stops: st.clone(),
+                spread,
+                ts: ID,
+            },
+            ShaderSpec::Radial {
+                c0: (50.0, 50.0),
+                r0: 0.0,
+                c1: (50.0, 50.0),
+                r1: 25.0,
+                stops: st.clone(),
+                spread,
+                ts: ID,
+            },
+            ShaderSpec::Radial {
+                c0: (40.0, 45.0),
+                r0: 0.0,
+                c1: (55.0, 50.0),
+                r1: 30.0,
+                stops: st.clone(),
+                spread,
+                ts: ID,
+            },
+            ShaderSpec::Radial {
+                c0: (30.0, 50.0),
+                r0: 5.0,
+                c1: (60.0, 50.0),
+                r1: 20.0,
+                stops: st.clone(),
+                spread,
+                ts: ID,
+            },
+            ShaderSpec::Radial {
+                c0: (30.0, 50.0),
+                r0: 20.0,
+                c1: (60.0, 50.0),
+                r1: 20.0,
+                stops: st.clone(),
+                spread,
+                ts: ID,
+            },
+            ShaderSpec::Sweep {
+                c: (50.0, 50.0),
+                a0: 0.0,
+                a1: 270.0,
+                stops: st.clone(),
+                spread,
+                ts: ID,
+            },
         ];
         for (k, shader) in kinds.into_iter().enumerate() {
             push(
@@ -837,7 +1052,13 @@ fn corpus() -> Vec<Scene> {
                 white,
                 vec![Op::FillRect {
                     r: (0.0, 0.0, 100.0, 100.0),
-                    paint: PaintSpec { shader, blend: 0, aa: true, colorspace: 0, hq: false },
+                    paint: PaintSpec {
+                        shader,
+                        blend: 0,
+                        aa: true,
+                        colorspace: 0,
+                        hq: false,
+                    },
                     ts: ID,
                     mask: None,
                 }],
@@ -864,7 +1085,13 @@ fn corpus() -> Vec<Scene> {
             100,
             100,
             white,
-            vec![Op::Fill { cmds, paint: p, even_odd: false, ts: ID, mask: None }],
+            vec![Op::Fill {
+                cmds,
+                paint: p,
+                even_odd: false,
+                ts: ID,
+                mask: None,
+            }],
         );
     }
     // Colour spaces on a linear gradient.
@@ -919,7 +1146,13 @@ fn corpus() -> Vec<Scene> {
                 Op::Stroke {
                     cmds: vec![Cmd::Rect(20.0, 20.0, 60.0, 60.0)],
                     paint: solid([0, 0, 0, 255], true),
-                    stroke: StrokeSpec { width: 3.0, miter: 4.0, cap: 0, join: 0, dash: None },
+                    stroke: StrokeSpec {
+                        width: 3.0,
+                        miter: 4.0,
+                        cap: 0,
+                        join: 0,
+                        dash: None,
+                    },
                     ts: t,
                     mask: None,
                 },
@@ -936,7 +1169,11 @@ fn corpus() -> Vec<Scene> {
                     shader: ShaderSpec::Linear {
                         p0: (0.0, 0.0),
                         p1: (64.0, 64.0),
-                        stops: vec![(0.0, [255, 200, 0, 255]), (0.5, [0, 120, 255, 100]), (1.0, [40, 200, 90, 255])],
+                        stops: vec![
+                            (0.0, [255, 200, 0, 255]),
+                            (0.5, [0, 120, 255, 100]),
+                            (1.0, [40, 200, 90, 255]),
+                        ],
                         spread: 0,
                         ts: ID,
                     },
@@ -971,7 +1208,13 @@ fn corpus() -> Vec<Scene> {
                     backdrop,
                     Op::Fill {
                         cmds: vec![Cmd::Circle(32.0, 32.0, 26.0)],
-                        paint: PaintSpec { shader, blend: b, aa: true, colorspace: 0, hq: false },
+                        paint: PaintSpec {
+                            shader,
+                            blend: b,
+                            aa: true,
+                            colorspace: 0,
+                            hq: false,
+                        },
                         even_odd: false,
                         ts: ID,
                         mask: None,
@@ -1000,11 +1243,23 @@ fn corpus() -> Vec<Scene> {
             80,
             white,
             vec![
-                Op::Fill { cmds, paint: p, even_odd: false, ts: ID, mask: mask.clone() },
+                Op::Fill {
+                    cmds,
+                    paint: p,
+                    even_odd: false,
+                    ts: ID,
+                    mask: mask.clone(),
+                },
                 Op::Stroke {
                     cmds: vec![Cmd::M(0.0, 0.0), Cmd::L(80.0, 80.0)],
                     paint: solid([0, 0, 0, 255], true),
-                    stroke: StrokeSpec { width: 5.0, miter: 4.0, cap: 1, join: 0, dash: None },
+                    stroke: StrokeSpec {
+                        width: 5.0,
+                        miter: 4.0,
+                        cap: 1,
+                        join: 0,
+                        dash: None,
+                    },
                     ts: ID,
                     mask,
                 },
@@ -1031,7 +1286,15 @@ fn corpus() -> Vec<Scene> {
                     96,
                     96,
                     white,
-                    vec![Op::Pixmap { x: 7, y: 9, opacity, blend: 0, quality: q, ts: *t, mask: None }],
+                    vec![Op::Pixmap {
+                        x: 7,
+                        y: 9,
+                        opacity,
+                        blend: 0,
+                        quality: q,
+                        ts: *t,
+                        mask: None,
+                    }],
                 );
             }
         }
@@ -1102,7 +1365,12 @@ fn corpus() -> Vec<Scene> {
         100,
         white,
         vec![Op::Fill {
-            cmds: vec![Cmd::M(-1.0e6, -1.0e6), Cmd::L(1.0e6, 50.0), Cmd::L(50.0, 1.0e6), Cmd::Z],
+            cmds: vec![
+                Cmd::M(-1.0e6, -1.0e6),
+                Cmd::L(1.0e6, 50.0),
+                Cmd::L(50.0, 1.0e6),
+                Cmd::Z,
+            ],
             paint: solid([0, 100, 0, 255], true),
             even_odd: false,
             ts: ID,
@@ -1118,7 +1386,13 @@ fn corpus() -> Vec<Scene> {
         vec![Op::Stroke {
             cmds: vec![Cmd::M(10.0, 10.0), Cmd::L(90.0, 90.0)],
             paint: solid([0, 0, 0, 200], true),
-            stroke: StrokeSpec { width: 5000.0, miter: 4.0, cap: 2, join: 0, dash: None },
+            stroke: StrokeSpec {
+                width: 5000.0,
+                miter: 4.0,
+                cap: 2,
+                join: 0,
+                dash: None,
+            },
             ts: ID,
             mask: None,
         }],
@@ -1146,9 +1420,18 @@ fn corpus() -> Vec<Scene> {
         12,
         white,
         vec![Op::Stroke {
-            cmds: vec![Cmd::M(0.0, 6.0), Cmd::C(400.0, -20.0, 800.0, 30.0, 1200.0, 6.0)],
+            cmds: vec![
+                Cmd::M(0.0, 6.0),
+                Cmd::C(400.0, -20.0, 800.0, 30.0, 1200.0, 6.0),
+            ],
             paint: solid([0, 0, 0, 255], true),
-            stroke: StrokeSpec { width: 2.0, miter: 4.0, cap: 1, join: 0, dash: Some((vec![10.0, 4.0], 0.0)) },
+            stroke: StrokeSpec {
+                width: 2.0,
+                miter: 4.0,
+                cap: 1,
+                join: 0,
+                dash: Some((vec![10.0, 4.0], 0.0)),
+            },
             ts: ID,
             mask: None,
         }],
@@ -1191,12 +1474,18 @@ fn compare(a: &[u8], b: &[u8]) -> Cmp {
     } else {
         10.0 * (255.0f64 * 255.0 / mse).log10()
     };
-    Cmp { max_diff, mismatch_pct: 100.0 * px_diff as f64 / n_px as f64, psnr }
+    Cmp {
+        max_diff,
+        mismatch_pct: 100.0 * px_diff as f64 / n_px as f64,
+        psnr,
+    }
 }
 
 fn dump_png(dir: &str, name: &str, w: u32, h: u32, data: Vec<u8>) {
     let file = format!("{dir}/{}.png", name.replace(['/', '='], "_"));
-    if let Some(pm) = rusty_raster::Pixmap::from_vec(data, rusty_raster::IntSize::from_wh(w, h).unwrap()) {
+    if let Some(pm) =
+        rusty_raster::Pixmap::from_vec(data, rusty_raster::IntSize::from_wh(w, h).unwrap())
+    {
         let _ = pm.save_png(file);
     }
 }
@@ -1216,7 +1505,10 @@ fn oracle_corpus_vs_tiny_skia() {
         worst_mismatch: f64,
     }
     let mut cats: Vec<(&str, Agg)> = Vec::new();
-    let mut total = Agg { min_psnr: f64::INFINITY, ..Default::default() };
+    let mut total = Agg {
+        min_psnr: f64::INFINITY,
+        ..Default::default()
+    };
     let mut diffs = String::new();
     let mut oracle_panics = 0usize;
     let mut both_none = 0usize;
@@ -1229,7 +1521,12 @@ fn oracle_corpus_vs_tiny_skia() {
             Ok(t) => t,
             Err(_) => {
                 oracle_panics += 1;
-                writeln!(diffs, "  {}/{}: tiny-skia PANICKED (rusty_raster rendered)", sc.cat, sc.name).unwrap();
+                writeln!(
+                    diffs,
+                    "  {}/{}: tiny-skia PANICKED (rusty_raster rendered)",
+                    sc.cat, sc.name
+                )
+                .unwrap();
                 continue;
             }
         };
@@ -1239,7 +1536,13 @@ fn oracle_corpus_vs_tiny_skia() {
                 both_none += 1;
                 continue;
             }
-            (a, b) => panic!("{}/{}: one side failed: ours={} theirs={}", sc.cat, sc.name, a.is_some(), b.is_some()),
+            (a, b) => panic!(
+                "{}/{}: one side failed: ours={} theirs={}",
+                sc.cat,
+                sc.name,
+                a.is_some(),
+                b.is_some()
+            ),
         };
         let c = compare(&a, &b);
         if c.max_diff != 0 {
@@ -1252,14 +1555,32 @@ fn oracle_corpus_vs_tiny_skia() {
             .unwrap();
             if let Some(dir) = &dump {
                 std::fs::create_dir_all(dir).unwrap();
-                dump_png(dir, &format!("{}_{}_rr", sc.cat, sc.name), sc.w, sc.h, a.clone());
-                dump_png(dir, &format!("{}_{}_ts", sc.cat, sc.name), sc.w, sc.h, b.clone());
+                dump_png(
+                    dir,
+                    &format!("{}_{}_rr", sc.cat, sc.name),
+                    sc.w,
+                    sc.h,
+                    a.clone(),
+                );
+                dump_png(
+                    dir,
+                    &format!("{}_{}_ts", sc.cat, sc.name),
+                    sc.w,
+                    sc.h,
+                    b.clone(),
+                );
             }
         }
         let idx = match cats.iter().position(|(k, _)| *k == sc.cat) {
             Some(i) => i,
             None => {
-                cats.push((sc.cat, Agg { min_psnr: f64::INFINITY, ..Default::default() }));
+                cats.push((
+                    sc.cat,
+                    Agg {
+                        min_psnr: f64::INFINITY,
+                        ..Default::default()
+                    },
+                ));
                 cats.len() - 1
             }
         };
@@ -1275,8 +1596,17 @@ fn oracle_corpus_vs_tiny_skia() {
         }
     }
 
-    let fmt_psnr = |p: f64| if p.is_infinite() { "inf".to_string() } else { format!("{p:.2}") };
-    println!("\nrusty_raster vs tiny-skia 0.12.0 ({} scenes)", scenes.len());
+    let fmt_psnr = |p: f64| {
+        if p.is_infinite() {
+            "inf".to_string()
+        } else {
+            format!("{p:.2}")
+        }
+    };
+    println!(
+        "\nrusty_raster vs tiny-skia 0.12.0 ({} scenes)",
+        scenes.len()
+    );
     println!(
         "| category | scenes | pixel-identical | max channel diff | worst mismatch % | mean mismatch % | min PSNR dB |"
     );
@@ -1306,8 +1636,18 @@ fn oracle_corpus_vs_tiny_skia() {
     // ColorDodge / ColorBurn blend modes use it. Every other scene must be
     // bit-identical, and those may differ by at most one level.
     for (sc, max_diff) in &differing {
-        assert!(uses_dodge_or_burn(sc), "unexpected oracle difference in {}/{}", sc.cat, sc.name);
-        assert!(*max_diff <= 1, "{}/{} differs by {max_diff}", sc.cat, sc.name);
+        assert!(
+            uses_dodge_or_burn(sc),
+            "unexpected oracle difference in {}/{}",
+            sc.cat,
+            sc.name
+        );
+        assert!(
+            *max_diff <= 1,
+            "{}/{} differs by {max_diff}",
+            sc.cat,
+            sc.name
+        );
     }
 }
 
@@ -1315,7 +1655,9 @@ fn uses_dodge_or_burn(sc: &Scene) -> bool {
     // Indices 18 and 19 in the blend table are ColorDodge and ColorBurn.
     let is = |b: u8| matches!(b % 29, 18 | 19);
     sc.ops.iter().any(|op| match op {
-        Op::Fill { paint, .. } | Op::Stroke { paint, .. } | Op::FillRect { paint, .. } => is(paint.blend),
+        Op::Fill { paint, .. } | Op::Stroke { paint, .. } | Op::FillRect { paint, .. } => {
+            is(paint.blend)
+        }
         Op::Pixmap { blend, .. } => is(*blend),
     })
 }

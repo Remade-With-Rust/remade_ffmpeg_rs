@@ -1109,7 +1109,7 @@ fn apply_vector_mask(p: &mut Pipeline) {
 fn alter_2pt_conical_compensate_focal(p: &mut Pipeline) {
     let ctx = &p.ctx.two_point_conical_gradient;
 
-    p.r = p.r + f32x8::splat(ctx.p1);
+    p.r += f32x8::splat(ctx.p1);
 
     p.next_stage();
 }

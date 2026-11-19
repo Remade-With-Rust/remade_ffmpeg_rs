@@ -80,26 +80,32 @@ impl AlphaRuns {
     ) -> usize {
         let mut x = x as usize;
 
+        // `offset_x` is a search hint: the run start the previous span on this
+        // row ended in. Spans arrive left to right for well-formed edges; a
+        // span left of the hint (overflowed edges from hostile geometry)
+        // restarts the walk at 0 instead of underflowing as in tiny-skia.
+        let offset_x = if x >= offset_x { offset_x } else { 0 };
+
         let mut runs_offset = offset_x;
         let mut alpha_offset = offset_x;
         let mut last_alpha_offset = offset_x;
         x -= offset_x;
 
         if start_alpha != 0 {
-            Self::break_run(
-                &mut self.runs[runs_offset..],
-                &mut self.alpha[alpha_offset..],
+            if !Self::break_run(
+                self.runs.get_mut(runs_offset..).unwrap_or_default(),
+                self.alpha.get_mut(alpha_offset..).unwrap_or_default(),
                 x,
                 1,
-            );
-            // I should be able to just add alpha[x] + start_alpha.
-            // However, if the trailing edge of the previous span and the leading
-            // edge of the current span round to the same super-sampled x value,
-            // I might overflow to 256 with this add, hence the funny subtract (crud).
-            let tmp = u16::from(self.alpha[alpha_offset + x]) + u16::from(start_alpha);
+            ) {
+                return 0;
+            }
+            let Some(a) = self.alpha.get_mut(alpha_offset + x) else {
+                return 0;
+            };
+            let tmp = u16::from(*a) + u16::from(start_alpha);
             debug_assert!(tmp <= 256);
-            // was (tmp >> 7), but that seems wrong if we're trying to catch 256
-            self.alpha[alpha_offset + x] = (tmp - (tmp >> 8)) as u8;
+            *a = (tmp - (tmp >> 8)) as u8;
 
             runs_offset += x + 1;
             alpha_offset += x + 1;
@@ -107,23 +113,31 @@ impl AlphaRuns {
         }
 
         if middle_count != 0 {
-            Self::break_run(
-                &mut self.runs[runs_offset..],
-                &mut self.alpha[alpha_offset..],
+            if !Self::break_run(
+                self.runs.get_mut(runs_offset..).unwrap_or_default(),
+                self.alpha.get_mut(alpha_offset..).unwrap_or_default(),
                 x,
                 middle_count,
-            );
+            ) {
+                return 0;
+            }
             alpha_offset += x;
             runs_offset += x;
             x = 0;
             loop {
-                let a = Self::catch_overflow(
-                    u16::from(self.alpha[alpha_offset]) + u16::from(max_value),
-                );
-                self.alpha[alpha_offset] = a;
+                let Some(a) = self.alpha.get_mut(alpha_offset) else {
+                    return 0;
+                };
+                *a = Self::catch_overflow(u16::from(*a) + u16::from(max_value));
 
-                let n = usize::from(self.runs[runs_offset].unwrap().get());
+                let Some(Some(n)) = self.runs.get(runs_offset) else {
+                    return 0;
+                };
+                let n = usize::from(n.get());
                 debug_assert!(n <= middle_count);
+                if n > middle_count {
+                    return 0;
+                }
                 alpha_offset += n;
                 runs_offset += n;
                 middle_count -= n;
@@ -137,29 +151,32 @@ impl AlphaRuns {
         }
 
         if stop_alpha != 0 {
-            Self::break_run(
-                &mut self.runs[runs_offset..],
-                &mut self.alpha[alpha_offset..],
+            if !Self::break_run(
+                self.runs.get_mut(runs_offset..).unwrap_or_default(),
+                self.alpha.get_mut(alpha_offset..).unwrap_or_default(),
                 x,
                 1,
-            );
+            ) {
+                return 0;
+            }
             alpha_offset += x;
-            self.alpha[alpha_offset] += stop_alpha;
+            let Some(a) = self.alpha.get_mut(alpha_offset) else {
+                return 0;
+            };
+            // tiny-skia uses `+=`, which wraps in a release build.
+            *a = a.wrapping_add(stop_alpha);
             last_alpha_offset = alpha_offset;
         }
 
-        // new offset_x
         last_alpha_offset
     }
 
-    /// Break the runs in the buffer at offsets x and x+count, properly
-    /// updating the runs to the right and left.
-    ///
-    /// i.e. from the state AAAABBBB, run-length encoded as A4B4,
-    /// break_run(..., 2, 5) would produce AAAABBBB rle as A2A2B3B1.
     /// Allows add() to sum another run to some of the new sub-runs.
     /// i.e. adding ..CCCCC. would produce AADDEEEB, rle as A2D2E3B1.
-    fn break_run(runs: &mut [AlphaRun], alpha: &mut [u8], mut x: usize, count: usize) {
+    ///
+    /// Returns `false` (leaving the row partially updated) if the walk would
+    /// leave the buffer, which only overflowed hostile geometry can cause.
+    fn break_run(runs: &mut [AlphaRun], alpha: &mut [u8], mut x: usize, count: usize) -> bool {
         debug_assert!(count > 0);
 
         let orig_x = x;
@@ -167,12 +184,18 @@ impl AlphaRuns {
         let mut alpha_offset = 0;
 
         while x > 0 {
-            let n = usize::from(runs[runs_offset].unwrap().get());
+            let Some(Some(n)) = runs.get(runs_offset) else {
+                return false;
+            };
+            let n = usize::from(n.get());
             debug_assert!(n > 0);
 
             if x < n {
+                if alpha_offset + x >= alpha.len() || runs_offset + x >= runs.len() {
+                    return false;
+                }
                 alpha[alpha_offset + x] = alpha[alpha_offset];
-                runs[runs_offset + 0] = NonZeroU16::new(x as u16);
+                runs[runs_offset] = NonZeroU16::new(x as u16);
                 runs[runs_offset + x] = NonZeroU16::new((n - x) as u16);
                 break;
             }
@@ -186,12 +209,18 @@ impl AlphaRuns {
         x = count;
 
         loop {
-            let n = usize::from(runs[runs_offset].unwrap().get());
+            let Some(Some(n)) = runs.get(runs_offset) else {
+                return false;
+            };
+            let n = usize::from(n.get());
             debug_assert!(n > 0);
 
             if x < n {
+                if alpha_offset + x >= alpha.len() || runs_offset + x >= runs.len() {
+                    return false;
+                }
                 alpha[alpha_offset + x] = alpha[alpha_offset];
-                runs[runs_offset + 0] = NonZeroU16::new(x as u16);
+                runs[runs_offset] = NonZeroU16::new(x as u16);
                 runs[runs_offset + x] = NonZeroU16::new((n - x) as u16);
                 break;
             }
@@ -204,6 +233,7 @@ impl AlphaRuns {
             runs_offset += n;
             alpha_offset += n;
         }
+        true
     }
 
     /// Cut (at offset x in the buffer) a run into two shorter runs with
@@ -215,10 +245,16 @@ impl AlphaRuns {
         let mut alpha_i = 0;
         let mut run_i = 0;
         while x > 0 {
-            let n = runs[run_i].unwrap().get();
+            let Some(Some(n)) = runs.get(run_i) else {
+                return;
+            };
+            let n = n.get();
             let n_usize = usize::from(n);
             let n_i32 = i32::from(n);
             if x < n_i32 {
+                if alpha_i + x as usize >= alpha.len() || x as usize >= runs.len() {
+                    return;
+                }
                 alpha[alpha_i + x as usize] = alpha[alpha_i];
                 runs[0] = NonZeroU16::new(x as u16);
                 runs[x as usize] = NonZeroU16::new((n_i32 - x) as u16);

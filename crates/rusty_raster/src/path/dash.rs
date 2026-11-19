@@ -720,7 +720,7 @@ fn compute_pos_tan(
             }
         }
         SegmentType::Quad => {
-            let src = crate::path::array_ref::<_, 3>(&points, 0);
+            let src = crate::path::array_ref::<_, 3>(points, 0);
             if let Some(pos) = pos {
                 *pos = path_geometry::eval_quad_at(src, t);
             }
@@ -731,7 +731,7 @@ fn compute_pos_tan(
             }
         }
         SegmentType::Cubic => {
-            let src = crate::path::array_ref::<_, 4>(&points, 0);
+            let src = crate::path::array_ref::<_, 4>(points, 0);
             if let Some(pos) = pos {
                 *pos = path_geometry::eval_cubic_pos_at(src, t);
             }
@@ -807,7 +807,7 @@ fn segment_to(
                 } else {
                     let stop_t = NormalizedF32Exclusive::new_bounded(stop_t.get());
                     path_geometry::chop_cubic_at2(
-                        crate::path::array_ref::<_, 4>(&points, 0),
+                        crate::path::array_ref::<_, 4>(points, 0),
                         stop_t,
                         &mut tmp0,
                     );
@@ -816,7 +816,7 @@ fn segment_to(
             } else {
                 let start_tt = NormalizedF32Exclusive::new_bounded(start_t.get());
                 path_geometry::chop_cubic_at2(
-                    crate::path::array_ref::<_, 4>(&points, 0),
+                    crate::path::array_ref::<_, 4>(points, 0),
                     start_tt,
                     &mut tmp0,
                 );
