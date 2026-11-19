@@ -1,0 +1,20 @@
+# Accuracy oracle and side-by-side speed bench against LittleCMS 2.
+# Tooling, not shipped: outside the published package (`include` in
+# ../Cargo.toml) and its own workspace root, so it never joins the main
+# workspace build. Links the system liblcms2 (C) on purpose: lcms2 is the
+# oracle. See README.md.
+[package]
+name = "rusty_icc_bench_lcms"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+rusty_icc = { path = ".." }
+# Project convention (CLAUDE.md): bench binaries run under rusty_alloc.
+rusty_alloc-api = "2.5.0"
+
+[profile.release]
+codegen-units = 1
