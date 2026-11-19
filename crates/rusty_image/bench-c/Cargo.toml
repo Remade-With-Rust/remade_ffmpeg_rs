@@ -1,0 +1,21 @@
+# Side-by-side bench against the C references (stb_image / stb_image_write,
+# the reference qoi.h, ImageMagick 7, gdk-pixbuf). Tooling only: its own
+# workspace, outside the published package. See README.md for setup.
+[package]
+name = "rusty_image-bench-c"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+rusty_image = { path = ".." }
+rusty_alloc-api = "=2.5.0"
+image = { version = "0.25.10", default-features = false, features = ["bmp", "tga", "hdr", "ico", "pnm", "qoi"] }
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+debug = 1
