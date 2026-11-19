@@ -96,6 +96,7 @@ impl Demuxer for LegacyWavDemuxer {
                 channels,
                 sample_rate,
                 delivery,
+                ..
             },
             raw,
         ) = read_wav(&mut input)?;

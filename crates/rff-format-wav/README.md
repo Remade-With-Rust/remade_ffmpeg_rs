@@ -9,6 +9,9 @@ not a binding.
 
 - **Demux + mux** — RIFF chunks, `fmt ` and `data`.
 - Carries linear PCM (`s16le` / `f32le`) via [`rff-codec-pcm`](https://crates.io/crates/rff-codec-pcm).
+- Also reads `u8`/`s24`/`s32`/`f64` PCM, `WAVE_FORMAT_EXTENSIBLE`, G.711 A-law and
+  µ-law, Microsoft and IMA ADPCM (one block per packet), and the 64-bit RF64 /
+  BW64 variants.
 - The reference input/output path for every audio measurement in the project.
 - Pure Rust, no C/FFI.
 

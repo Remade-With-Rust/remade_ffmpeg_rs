@@ -95,6 +95,17 @@ pub enum CodecId {
     Ac3,
     /// Dolby Digital Plus (E-AC-3) audio. Stream copy only.
     Eac3,
+    /// G.711 A-law audio (WAV format 0x0006, AIFF-C/CAF `alaw`).
+    PcmAlaw,
+    /// G.711 µ-law audio (WAV format 0x0007, AIFF-C/CAF `ulaw`).
+    PcmMulaw,
+    /// Microsoft ADPCM (WAV format 0x0002). One block per packet.
+    AdpcmMs,
+    /// IMA/DVI ADPCM as WAV stores it (format 0x0011). One block per packet.
+    AdpcmImaWav,
+    /// IMA ADPCM as QuickTime stores it (`ima4`: 34-byte blocks of 64 samples
+    /// per channel), in AIFF-C, CAF and MOV.
+    AdpcmImaQt,
 }
 
 impl CodecId {
@@ -129,6 +140,11 @@ impl CodecId {
             CodecId::Alac => "alac",
             CodecId::Ac3 => "ac3",
             CodecId::Eac3 => "eac3",
+            CodecId::PcmAlaw => "pcm_alaw",
+            CodecId::PcmMulaw => "pcm_mulaw",
+            CodecId::AdpcmMs => "adpcm_ms",
+            CodecId::AdpcmImaWav => "adpcm_ima_wav",
+            CodecId::AdpcmImaQt => "adpcm_ima_qt",
         }
     }
 
@@ -157,6 +173,11 @@ impl CodecId {
             CodecId::WebVtt => MediaType::Subtitle,
             CodecId::ProRes | CodecId::DnxHd | CodecId::Apv | CodecId::Vp8 => MediaType::Video,
             CodecId::Alac | CodecId::Ac3 | CodecId::Eac3 => MediaType::Audio,
+            CodecId::PcmAlaw
+            | CodecId::PcmMulaw
+            | CodecId::AdpcmMs
+            | CodecId::AdpcmImaWav
+            | CodecId::AdpcmImaQt => MediaType::Audio,
         }
     }
 
@@ -209,6 +230,11 @@ impl CodecId {
             "alac" => Some(CodecId::Alac),
             "ac3" => Some(CodecId::Ac3),
             "eac3" => Some(CodecId::Eac3),
+            "pcm_alaw" | "alaw" => Some(CodecId::PcmAlaw),
+            "pcm_mulaw" | "mulaw" | "ulaw" => Some(CodecId::PcmMulaw),
+            "adpcm_ms" => Some(CodecId::AdpcmMs),
+            "adpcm_ima_wav" => Some(CodecId::AdpcmImaWav),
+            "adpcm_ima_qt" | "ima4" => Some(CodecId::AdpcmImaQt),
             _ => None,
         }
     }

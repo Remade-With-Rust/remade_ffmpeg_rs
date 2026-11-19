@@ -7,7 +7,10 @@
 The **linear PCM** audio codec adapter for **remade_ffmpeg_rs** — uncompressed
 audio, in-house, zero dependencies beyond the core traits.
 
-- **`s16le` and `f32le`**, decode and encode.
+- **`s16le` and `f32le`**, decode and encode; `u8`, `s24`, `s32` and `f64` decode.
+- **G.711 A-law and µ-law**, **Microsoft ADPCM**, and **IMA ADPCM** in its WAV
+  and QuickTime (`ima4`) layouts, decode to `s16` with FFmpeg's arithmetic.
+  Damaged blocks decode as far as their bytes go instead of failing.
 - The sample layout lives in the stream's `SampleFormat`, so the codec is a thin, exact byte↔sample reinterpretation.
 - The reference path for lossless round-trips and for measuring every other audio codec against.
 
