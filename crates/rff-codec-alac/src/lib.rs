@@ -328,7 +328,9 @@ fn decode_frame(cfg: &AlacConfig, data: &[u8], out: &mut [Vec<i32>]) -> Result<u
     let mut b = Bits::new(data);
     let mut ch = 0usize;
     let mut nb_samples: Option<usize> = None;
-    while b.left() >= 3 {
+    // Stop once every channel has decoded: bytes after that (damage, or an
+    // encoder's padding) are not read as more elements.
+    while ch < channels && b.left() >= 3 {
         let element = b.read(3);
         if element == 7 {
             break; // END

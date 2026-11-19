@@ -135,10 +135,12 @@ impl FlacDecoder {
         Ok(())
     }
 
-    /// Frame packet(s), as the FLAC / Matroska demuxers emit them. The first
-    /// frame must decode; further frames in the same packet decode too, and
-    /// bytes after the last one that don't parse as a frame (e.g. a
-    /// trailing tag) are ignored. An empty packet yields nothing.
+    /// Frame packet(s), as the FLAC / Matroska demuxers emit them. Every
+    /// frame in the packet decodes; a frame that fails (damage) is dropped
+    /// and decoding resumes at the next frame sync code, and bytes after the
+    /// last frame that don't parse as one (e.g. a trailing tag) are ignored.
+    /// The packet is an error only when no frame in it decodes. An empty
+    /// packet yields nothing.
     fn decode_frames(&mut self, data: &[u8], pts: Option<i64>) -> Result<()> {
         let Some(core) = self.core.as_mut() else {
             return Err(Error::invalid(
@@ -156,14 +158,30 @@ impl FlacDecoder {
         ) -> Result<()> {
             out.clear();
             let mut at = 0;
+            let mut first_err = None;
             while at < data.len() {
                 match core.decode_frame_interleaved(&data[at..], out) {
-                    Ok((_, used)) => at += used,
-                    Err(e) if at == 0 => return Err(map_err(e)),
-                    Err(_) => break,
+                    Ok((_, used)) => at += used.max(1),
+                    Err(e) => {
+                        // A damaged frame: drop it and resync at the next
+                        // frame sync code, as symphonia and libFLAC do. The
+                        // demuxer cannot split a frame whose CRC-16 fails, so
+                        // one bad frame arrives glued to the good frames after
+                        // it; giving up here lost all of them. A false sync
+                        // inside frame data fails the frame CRC and is
+                        // skipped the same way.
+                        first_err.get_or_insert(e);
+                        match next_sync(data, at + 1) {
+                            Some(next) => at = next,
+                            None => break,
+                        }
+                    }
                 }
             }
-            Ok(())
+            match first_err {
+                Some(e) if out.is_empty() => Err(map_err(e)),
+                _ => Ok(()),
+            }
         }
         let frame = if info.bits_per_sample <= 16 {
             run(core, data, &mut self.s16)?;
@@ -175,6 +193,14 @@ impl FlacDecoder {
         self.frames.push_back(Frame::Audio(frame));
         Ok(())
     }
+}
+
+/// The next FLAC frame sync code (`0xFFF8` / `0xFFF9`) at or after `from`.
+fn next_sync(data: &[u8], from: usize) -> Option<usize> {
+    let tail = data.get(from..)?;
+    tail.windows(2)
+        .position(|w| w[0] == 0xFF && w[1] & 0xFE == 0xF8)
+        .map(|i| from + i)
 }
 
 impl Decoder for FlacDecoder {

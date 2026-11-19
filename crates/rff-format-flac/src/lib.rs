@@ -424,6 +424,17 @@ struct FlacDemuxer {
     fixed_block: Option<u32>,
     /// Running sample position, for frames whose header can't place them.
     next_pts: i64,
+    /// Positions after `start` holding a frame header whose CRC-8 checks but
+    /// where the CRC-16 did not: the resync candidates if the current frame
+    /// is damaged.
+    weak: Vec<usize>,
+    /// How many of `weak` have been tested and found not to start a frame.
+    resync_checked: usize,
+    /// The largest frame this stream can hold (from `STREAMINFO`). Scanning
+    /// further than this without a CRC-16 match means the current frame is
+    /// damaged, and the packet is cut at `weak` instead of running on (up to
+    /// [`MAX_FRAME_BYTES`]) and swallowing the good frames after it.
+    frame_limit: usize,
 }
 
 impl FlacDemuxer {
@@ -441,6 +452,9 @@ impl FlacDemuxer {
             time_base: Rational::new(1, 1),
             fixed_block: None,
             next_pts: 0,
+            weak: Vec::new(),
+            resync_checked: 0,
+            frame_limit: MAX_FRAME_BYTES,
         }
     }
 
@@ -466,11 +480,68 @@ impl FlacDemuxer {
                     if self.crc == 0 {
                         return Some(p);
                     }
+                    self.weak.push(p);
                     self.scan = p + 1;
+                    if p - self.start > self.frame_limit {
+                        // Past any frame this stream can hold: the current
+                        // frame is damaged. End it where a real frame starts.
+                        if let Some(q) = self.resync() {
+                            return Some(q);
+                        }
+                    }
                 }
             }
         }
+        if self.scan - self.start > self.frame_limit {
+            return self.resync();
+        }
         None
+    }
+
+    /// The first resync candidate at which a whole frame starts (see
+    /// [`frame_ok_at`](Self::frame_ok_at)); `None` if none does yet.
+    fn resync(&mut self) -> Option<usize> {
+        while let Some(&q) = self.weak.get(self.resync_checked) {
+            match self.frame_ok_at(q) {
+                Some(true) => return Some(q),
+                Some(false) => self.resync_checked += 1,
+                None => return None, // needs more input: test it again later
+            }
+        }
+        None
+    }
+
+    /// Whether a frame starts at `q`: its CRC-16 closes at a later frame
+    /// header (or at the end of input) within `frame_limit` bytes. `None` =
+    /// the buffer does not reach far enough to say yet.
+    fn frame_ok_at(&self, q: usize) -> Option<bool> {
+        let end = self.buf.len();
+        let (mut crc, mut pos, mut scan) = (0u16, q, q + MIN_FRAME_BYTES);
+        while scan < end {
+            let Some(off) = find_ff(&self.buf[scan..]) else {
+                break;
+            };
+            let r = scan + off;
+            if r - q > self.frame_limit {
+                return Some(false);
+            }
+            match parse_frame_header(&self.buf[r..], self.eof, self.channels) {
+                HeaderParse::Need => return self.eof.then_some(false),
+                HeaderParse::Bad => scan = r + 1,
+                HeaderParse::Ok(_) => {
+                    crc = crc16_update(crc, &self.buf[pos..r]);
+                    pos = r;
+                    if crc == 0 {
+                        return Some(true);
+                    }
+                    scan = r + 1;
+                }
+            }
+        }
+        if self.eof {
+            return Some(crc16_update(crc, &self.buf[pos..end]) == 0);
+        }
+        (end - q > self.frame_limit).then_some(false)
     }
 
     /// Cut `buf[start..end]` off as the next packet.
@@ -480,6 +551,8 @@ impl FlacDemuxer {
         self.scan = end;
         self.crc = 0;
         self.crc_pos = end;
+        self.weak.clear();
+        self.resync_checked = 0;
 
         let mut packet = Packet::from_data(0, Vec::new());
         match parse_frame_header(&data, true, self.channels) {
@@ -507,6 +580,9 @@ impl FlacDemuxer {
             self.buf.drain(..self.start);
             self.scan -= self.start;
             self.crc_pos -= self.start;
+            for w in self.weak.iter_mut() {
+                *w -= self.start;
+            }
             self.start = 0;
         }
         let Some(reader) = self.reader.as_mut() else {
@@ -551,6 +627,23 @@ impl Demuxer for FlacDemuxer {
             streaminfo(&header).ok_or_else(|| Error::invalid("flac demux: bad STREAMINFO"))?;
         let min_block = u16::from_be_bytes([header[8], header[9]]) as u32;
         let max_block = u16::from_be_bytes([header[10], header[11]]) as u32;
+        // STREAMINFO's max frame size when stated; otherwise the largest
+        // frame its block size, channels and depth allow (every subframe
+        // verbatim) plus header slack.
+        let max_frame = u32::from_be_bytes([0, header[15], header[16], header[17]]) as usize;
+        let bits = ((((header[20] & 1) as usize) << 4) | (header[21] >> 4) as usize) + 1;
+        let block = if max_block >= 16 {
+            max_block as usize
+        } else {
+            65_535
+        };
+        let verbatim = block * channels as usize * (bits + 1).div_ceil(8) + 1024;
+        self.frame_limit = if max_frame > 0 {
+            max_frame.max(64) * 2
+        } else {
+            verbatim
+        }
+        .min(MAX_FRAME_BYTES);
 
         let mut stream = Stream::new(0, CodecId::Flac);
         stream.sample_rate = sample_rate;
@@ -573,6 +666,16 @@ impl Demuxer for FlacDemuxer {
                 return Ok(self.emit(end));
             }
             if self.eof {
+                // A damaged frame near the end: if what is left is longer
+                // than any frame can be, split at the header after it rather
+                // than gluing the remaining frames to it. (The last frame has
+                // no boundary after it, so a header-like run inside it must
+                // not split it.)
+                if self.buf.len() - self.start > self.frame_limit {
+                    if let Some(q) = self.resync() {
+                        return Ok(self.emit(q));
+                    }
+                }
                 if self.start < self.buf.len() {
                     return Ok(self.emit(self.buf.len()));
                 }
@@ -955,6 +1058,27 @@ mod tests {
             parse_frame_header(&bad, true, 1),
             HeaderParse::Bad
         ));
+    }
+
+    #[test]
+    fn a_damaged_frame_does_not_swallow_the_frames_after_it() {
+        // Frame 5's CRC-16 fails, so no exact boundary ends it. The packet
+        // must still end at the next frame header once the scan passes the
+        // largest frame the stream can hold, not run on to the 16 MB cap and
+        // carry every later frame with it (which then failed to decode as
+        // one packet). Fake headers inside the samples must not split frames.
+        let (mut file, frames) = test_file(40, 1152, 300, true);
+        let header = mono_header(1152, 300).len();
+        let at = header + frames[..5].iter().map(Vec::len).sum::<usize>() + 100;
+        file[at] ^= 0x10;
+        let (_, packets) = demux(&file).unwrap();
+        let got: Vec<&[u8]> = packets.iter().map(|p| p.data.as_slice()).collect();
+        assert_eq!(got.len(), frames.len());
+        for i in (0..frames.len()).filter(|&i| i != 5) {
+            assert_eq!(got[i], frames[i].as_slice(), "frame {i}");
+        }
+        // The input is still partitioned exactly.
+        assert_eq!(got.concat(), file[header..]);
     }
 
     #[test]
