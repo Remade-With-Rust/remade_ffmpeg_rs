@@ -262,8 +262,11 @@ fn l12_confirmed(h: &L12Header, size: usize, buf: &[u8], at_end: bool) -> bool {
     let levels = if free { 3 } else { 2 };
     for depth in 0..levels {
         let Some(next) = buf.get(at..) else {
-            // The confirming frame runs past the data.
-            return !at_end && depth > 0;
+            // The confirming frame runs past the data. Its header already
+            // matched, which is confirmation enough even at the end of the
+            // input: a file cut inside its second frame still has a whole
+            // first one (#125 follow-up; Layer III takes the same view).
+            return depth > 0;
         };
         if next.len() < 4 {
             return depth > 0 || (next.is_empty() && at_end);
@@ -1229,6 +1232,26 @@ mod tests {
             }
             assert_eq!(end, "end of stream");
         }
+    }
+
+    /// #125 follow-up: one whole frame, then a cut-off second one (the shape
+    /// of a short file truncated at 60%). The first frame is confirmed by the
+    /// second's header and is delivered; the partial frame is not.
+    #[test]
+    fn one_whole_frame_before_a_cut_off_one_is_delivered() {
+        for hdr in [L2, L1, L2_LSF] {
+            let whole = l12_frame(hdr, 7);
+            let mut file = whole.clone();
+            file.extend_from_slice(&l12_frame(hdr, 8)[..whole.len() * 6 / 10]);
+            let (_, packets, end) = drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(file)))));
+            assert!(!packets.is_empty(), "{hdr:02X?}: {end}");
+            assert_eq!(packets[0].6, whole, "{hdr:02X?}");
+        }
+        // A lone cut-off frame is still nothing to lock onto.
+        let cut = l12_frame(L2, 7)[..400].to_vec();
+        assert!(Mp3Demuxer::new(Box::new(Cursor::new(cut)))
+            .read_header()
+            .is_err());
     }
 
     #[test]

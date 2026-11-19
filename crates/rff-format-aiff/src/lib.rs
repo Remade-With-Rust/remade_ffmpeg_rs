@@ -12,10 +12,13 @@
 //! |---|---|
 //! | `NONE`, `twos` (big-endian), `sowt` (little-endian) signed PCM | `pcm`: 8-bit widened to s16, 16-bit s16, 24-bit s24, 32-bit s32 |
 //! | `raw ` (unsigned 8-bit) | `pcm` s16 |
-//! | `fl32` / `FL32`, `fl64` / `FL64` | `pcm` f32 / f64 |
-//! | `in24` / `in32` (big-endian) | `pcm` s24 / s32 |
-//! | `alaw` / `ALAW`, `ulaw` / `ULAW` | `pcm_alaw` / `pcm_mulaw` |
+//! | `fl32`, `fl64` | `pcm` f32 / f64 |
+//! | `in24` / `in32` (big-endian), `42ni` / `23ni` (little-endian) | `pcm` s24 / s32 |
+//! | `alaw`, `ulaw` | `pcm_alaw` / `pcm_mulaw` |
 //! | `ima4` | `adpcm_ima_qt`, whole 34-byte-per-channel frames |
+//!
+//! Types match without regard to case (`none`, `SOWT` and `IN24` all occur in
+//! the wild).
 //!
 //! PCM is byte-swapped to the engine's little-endian layouts on read, so the
 //! [`pcm`](rff-codec-pcm) decoder takes it unchanged. Sample sizes that are
@@ -188,28 +191,36 @@ fn plan_for(compression: &[u8; 4], bits: u16) -> Result<Plan> {
             format,
         })
     };
-    match compression {
-        b"NONE" | b"twos" => pcm(true),
+    let fixed = |bytes: usize, big_endian: bool| -> Result<Plan> {
+        Ok(Plan::Pcm {
+            bytes,
+            big_endian,
+            format: if bytes == 3 {
+                SampleFormat::S24
+            } else {
+                SampleFormat::S32
+            },
+        })
+    };
+    // Writers disagree on case (`none`, `SOWT`, `IN24`), and no two types
+    // differ only in case, so the match ignores it.
+    match &compression.map(|b| b.to_ascii_lowercase()) {
+        b"none" | b"twos" => pcm(true),
         b"sowt" => pcm(false),
-        b"in24" => Ok(Plan::Pcm {
-            bytes: 3,
-            big_endian: true,
-            format: SampleFormat::S24,
-        }),
-        b"in32" => Ok(Plan::Pcm {
-            bytes: 4,
-            big_endian: true,
-            format: SampleFormat::S32,
-        }),
+        b"in24" => fixed(3, true),
+        b"in32" => fixed(4, true),
+        // QuickTime's little-endian spellings: the big-endian tag reversed.
+        b"42ni" => fixed(3, false),
+        b"23ni" => fixed(4, false),
         b"raw " => Ok(Plan::U8),
-        b"fl32" | b"FL32" => Ok(Plan::Float { bytes: 4 }),
-        b"fl64" | b"FL64" => Ok(Plan::Float { bytes: 8 }),
-        b"alaw" | b"ALAW" => Ok(Plan::G711(CodecId::PcmAlaw)),
-        b"ulaw" | b"ULAW" => Ok(Plan::G711(CodecId::PcmMulaw)),
+        b"fl32" => Ok(Plan::Float { bytes: 4 }),
+        b"fl64" => Ok(Plan::Float { bytes: 8 }),
+        b"alaw" => Ok(Plan::G711(CodecId::PcmAlaw)),
+        b"ulaw" => Ok(Plan::G711(CodecId::PcmMulaw)),
         b"ima4" => Ok(Plan::Ima4),
-        other => Err(Error::unsupported(format!(
+        _ => Err(Error::unsupported(format!(
             "aiff demux: compression type `{}`",
-            String::from_utf8_lossy(other)
+            String::from_utf8_lossy(compression)
         ))),
     }
 }
