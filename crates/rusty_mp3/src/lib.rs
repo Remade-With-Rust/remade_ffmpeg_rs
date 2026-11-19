@@ -90,6 +90,11 @@ pub struct Mp3Decoder {
     last_layer: u8,
     /// Free-format Layer I/II frame size without padding, once measured.
     free_size: Option<usize>,
+    /// `Some(took)`: frame-sync only -- make every sync decision exactly as
+    /// decoding would (none depends on a decode result) but decode nothing,
+    /// recording in `took` whether a Layer I/II frame was taken. Used by
+    /// [`decode_pipelined`] to learn whether the serial path takes any.
+    dry_run: Option<bool>,
 }
 
 /// What the Layer I/II syncer decided at one candidate header.
@@ -325,12 +330,16 @@ impl Mp3Decoder {
         if h.is_free_format() {
             self.free_size = Some(size - h.padding_bytes());
         }
-        let pcm = self.layer12.decode_frame(&h, &self.buf[pos..end]);
-        self.queue.push_back(DecodedAudio {
-            sample_rate: h.sample_rate,
-            channels: if h.channels() == 2 { 2 } else { 1 },
-            samples: pcm,
-        });
+        if let Some(took) = self.dry_run.as_mut() {
+            *took = true;
+        } else {
+            let pcm = self.layer12.decode_frame(&h, &self.buf[pos..end]);
+            self.queue.push_back(DecodedAudio {
+                sample_rate: h.sample_rate,
+                channels: if h.channels() == 2 { 2 } else { 1 },
+                samples: pcm,
+            });
+        }
         self.contiguous = true;
         self.last_layer = match h.layer {
             layer12::Layer::I => 1,
@@ -355,16 +364,6 @@ impl Mp3Decoder {
             // or II, which have their own syncer and decoder. Layer III (0b01)
             // and the reserved layer fall through to the path below unchanged.
             if self.buf[pos + 1] & 0x04 != 0 {
-                // A Layer III stream stays Layer III: a Layer I/II header after
-                // Layer III frames is garbage (a false sync), as it always was
-                // for this decoder. This also keeps `decode_pipelined`, whose
-                // Layer III pipeline never takes Layer I/II frames, equal to the
-                // serial path on every input (the `pipelined` fuzz target).
-                if self.last_layer == 3 {
-                    pos += 1;
-                    self.contiguous = false;
-                    continue;
-                }
                 match self.layer12_step(pos) {
                     Step::Took(n) => pos += n,
                     Step::Skip => {
@@ -424,7 +423,9 @@ impl Mp3Decoder {
             let side_info = &self.buf[si_start..main_start];
             let main_data = &self.buf[main_start..pos + frame_size];
 
-            if let Ok(pcm) = self.state.decode_frame(&header, side_info, main_data) {
+            if self.dry_run.is_some() {
+                // Sync decisions only: the frame is taken either way.
+            } else if let Ok(pcm) = self.state.decode_frame(&header, side_info, main_data) {
                 let channels = header.channel_mode.channels().max(1);
                 self.queue.push_back(DecodedAudio {
                     sample_rate: header.sample_rate,
@@ -438,6 +439,30 @@ impl Mp3Decoder {
         }
         self.buf.drain(0..pos);
     }
+}
+
+/// Whether the serial decoder would take any Layer I/II frame from `bytes`:
+/// its own frame syncer, run without decoding.
+fn serial_takes_layer12(bytes: &[u8]) -> bool {
+    if !starts_with_layer12(bytes) && !has_layer12_header(bytes) {
+        return false;
+    }
+    let mut dry = Mp3Decoder::default();
+    dry.dry_run = Some(false);
+    dry.buf.extend_from_slice(bytes);
+    dry.eof = true;
+    dry.parse_frames();
+    dry.dry_run == Some(true)
+}
+
+/// Whether `bytes` holds anything that parses as a Layer I/II header at all
+/// (a cheap pre-check: a clean Layer III file usually has a few, by chance).
+fn has_layer12_header(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|w| {
+        w[0] == 0xFF
+            && w[1] & 0xE4 == 0xE4
+            && layer12::Layer12Header::parse([w[0], w[1], w[2], w[3]]).is_ok()
+    })
 }
 
 /// Whether the first frame [`Mp3Decoder`] would take from `bytes` is a Layer I
@@ -516,8 +541,14 @@ pub fn decode_pipelined(bytes: &[u8]) -> Vec<DecodedAudio> {
 
     // Layer I/II streams have no entropy/transform split to pipeline (and no
     // reservoir to serialise): they take the streaming decoder.
+    // The Layer III pipeline takes only Layer III frames, so it is used only
+    // when the serial path would take no Layer I/II frame anywhere in the
+    // input -- the serial frame syncer, run dry, says so. Otherwise the input
+    // takes the serial path, so the two always agree (the `pipelined` fuzz
+    // target found an input where they did not: Layer I false syncs after
+    // Layer III frames).
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    if starts_with_layer12(bytes) {
+    if serial_takes_layer12(bytes) {
         let mut dec = Mp3Decoder::new();
         dec.push(bytes);
         dec.flush();
