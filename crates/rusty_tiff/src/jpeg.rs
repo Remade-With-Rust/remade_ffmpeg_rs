@@ -81,8 +81,13 @@ pub(crate) fn decode(
             "{precision}-bit JPEG-in-TIFF"
         )));
     }
-    if !matches!(nc, 1 | 3 | 4) || w == 0 || h == 0 {
+    if w == 0 || h == 0 || nc == 0 {
         return Err(TiffError::format("JPEG frame with unusable geometry"));
+    }
+    if !matches!(nc, 1 | 3 | 4) {
+        return Err(TiffError::unsupported(format!(
+            "{nc}-component JPEG-in-TIFF (rusty_jpeg decodes 1, 3 or 4)"
+        )));
     }
     if usize::from(w) * usize::from(h) * usize::from(nc) > max_bytes {
         return Err(TiffError::limits("JPEG chunk exceeds the decoding limit"));

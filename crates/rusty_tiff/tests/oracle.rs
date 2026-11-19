@@ -518,3 +518,43 @@ fn multipage_matches() {
     assert_eq!(o[0].bytes, g8);
     println!("multipage: 3 pages identical");
 }
+
+/// FillOrder 2 reverses the bits of the compressed bytes for every codec but
+/// JPEG, as libtiff does (found by the libtiff corpus: LZW/Deflate/PackBits
+/// bilevel files written by ImageMagick with `tiff:fill-order=lsb`).
+#[test]
+fn fill_order_2_applies_to_every_codec() {
+    use rusty_tiff::{Tag, Value};
+    let px: Vec<u8> = (0..64 * 16).map(|i| (i * 7 % 251) as u8).collect();
+    for comp in [
+        Compression::None,
+        Compression::Lzw,
+        Compression::deflate(),
+        Compression::PackBits,
+    ] {
+        let mut f = Cursor::new(Vec::new());
+        {
+            let mut e = TiffEncoder::new(&mut f).unwrap();
+            let mut i = e
+                .new_image::<colortype::Gray8>(64, 16)
+                .unwrap()
+                .with_compression(comp);
+            i.rows_per_strip(16);
+            i.add_tag(Tag::FillOrder, Value::Short(vec![2]));
+            i.write_data(&px).unwrap();
+        }
+        let mut file = f.into_inner();
+        let (off, cnt) = {
+            let mut d = rusty_tiff::Decoder::new(Cursor::new(&file)).unwrap();
+            (
+                d.get_tag_u64(Tag::StripOffsets).unwrap() as usize,
+                d.get_tag_u64(Tag::StripByteCounts).unwrap() as usize,
+            )
+        };
+        for b in &mut file[off..off + cnt] {
+            *b = b.reverse_bits();
+        }
+        let o = ours(&file).unwrap();
+        assert_eq!(o[0].bytes, px, "{comp:?}");
+    }
+}

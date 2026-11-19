@@ -1190,17 +1190,10 @@ fn decode_chunk<R: Read + Seek>(
     }
     let mut raw = s.read_at(offset, n)?;
     let comp = info.compression;
-    if info.fill_order == 2
-        && info.bits_per_sample < 8
-        && matches!(
-            comp,
-            compression::NONE
-                | compression::PACKBITS
-                | compression::CCITT_RLE
-                | compression::CCITT_FAX3
-                | compression::CCITT_FAX4
-        )
-    {
+    // FillOrder 2: reverse the bits of every compressed byte, as libtiff
+    // does for every codec except JPEG (verified against libtiff 4.7 on
+    // LZW, Deflate, PackBits, none and CCITT).
+    if info.fill_order == 2 && !matches!(comp, compression::JPEG | compression::OLD_JPEG) {
         reverse_bits(&mut raw);
     }
     let mut buf = zeroed::<u8>(expected)?;
