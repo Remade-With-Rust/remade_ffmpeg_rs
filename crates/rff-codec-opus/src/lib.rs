@@ -16,12 +16,21 @@
 //! trimmed to the final granule position ([`Packet::end_position`]) — or, from
 //! Matroska/WebM (whose `CodecPrivate` is the same `OpusHead`), by the last
 //! block's `DiscardPadding` ([`Packet::discard_padding`]).
-//! Multichannel (mapping family ≠ 0) streams are refused as unsupported.
+//!
+//! Multichannel streams — mapping family 1 (Vorbis-order surround, up to 7.1)
+//! and 255 (application-defined) — decode through the multistream decoder,
+//! with the layout the `OpusHead` declares: its stream count, coupled count
+//! and channel mapping table (a 255 entry is a silent channel; one decoded
+//! channel may feed several outputs). Output channels come in FFmpeg's order:
+//! family 1 is reordered from Vorbis order the way libavcodec does (centre
+//! third, LFE fourth — 5.1 as FL FR FC LFE BL BR), family 255 keeps the
+//! table's order. Other families (2/3, ambisonics) are refused.
 
 use std::collections::VecDeque;
 
 use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder, Encoder};
 use rff_core::{AudioFrame, Dictionary, Error, Frame, MediaType, Packet, Result, SampleFormat};
+use rusty_opus::multistream::{ChannelLayout, OpusMSDecoder};
 use rusty_opus::parallel::{encode_parallel, ParallelConfig};
 use rusty_opus::{Application, OpusDecoder, OpusEncoder};
 
@@ -103,9 +112,63 @@ impl OpusHead {
     }
 }
 
+/// Vorbis → FFmpeg channel order for mapping family 1: output channel `i`
+/// takes Vorbis-order channel `map[i]`. Vorbis puts the centre second and the
+/// LFE last; FFmpeg puts the centre third and the LFE fourth. This is
+/// libavcodec's `ff_vorbis_channel_layout_offsets`, which `opus_parse.c`
+/// (`channel_reorder_vorbis`) applies to the OpusHead mapping table. 1, 2 and
+/// 4 channels are the same in both orders.
+fn ffmpeg_order(channels: usize) -> &'static [usize] {
+    match channels {
+        1 => &[0],
+        2 => &[0, 1],
+        3 => &[0, 2, 1],
+        4 => &[0, 1, 2, 3],
+        5 => &[0, 2, 1, 3, 4],
+        6 => &[0, 2, 1, 5, 3, 4],
+        7 => &[0, 2, 1, 6, 5, 3, 4],
+        8 => &[0, 2, 1, 7, 5, 6, 3, 4],
+        _ => &[],
+    }
+}
+
+/// The multistream layout an `OpusHead` with mapping family 1 or 255
+/// declares, its mapping table permuted into FFmpeg's output order (so the
+/// decoder writes that order directly).
+fn multistream_layout(head: &[u8]) -> Result<ChannelLayout> {
+    let mut layout = ChannelLayout::from_opus_head(head)
+        .map_err(|e| Error::invalid(format!("opus decode: OpusHead channel mapping: {e}")))?;
+    if head[18] == 1 {
+        let vorbis = layout.mapping.clone();
+        layout.mapping = ffmpeg_order(layout.nb_channels)
+            .iter()
+            .map(|&v| vorbis[v])
+            .collect();
+    }
+    Ok(layout)
+}
+
+/// The decoder behind [`OpusDec`]: one Opus stream (mapping family 0, or no
+/// `OpusHead`), or several (families 1 and 255).
+enum Inner {
+    /// Boxed: an `OpusDecoder` is ~11 KB, the multistream one a few `Vec`s.
+    Single(Box<OpusDecoder>),
+    Multi(OpusMSDecoder),
+}
+
+impl Inner {
+    fn decode(&mut self, data: &[u8], frame_size: usize, out: &mut [f32]) -> Result<usize> {
+        match self {
+            Inner::Single(d) => d.decode(data, frame_size, out),
+            Inner::Multi(d) => d.decode(data, frame_size, out),
+        }
+        .map_err(|e| Error::invalid(format!("opus decode: {e}")))
+    }
+}
+
 #[derive(Default)]
 struct OpusDec {
-    dec: Option<OpusDecoder>,
+    dec: Option<Inner>,
     sample_rate: u32,
     channels: u16,
     /// Linear output gain from `OpusHead` (1.0 = none).
@@ -163,15 +226,23 @@ impl Decoder for OpusDec {
             Some(h) if h.channels > 0 => h.channels,
             _ => params.channels.max(1),
         };
-        // Mapping family 1+ (surround, ambisonics) packs several Opus streams
-        // per packet; only the single-stream family 0 is decoded here.
-        if let Some(family @ 1..) = head.as_ref().map(|h| h.mapping_family) {
-            return Err(Error::unsupported(format!(
-                "opus decode: channel mapping family {family} (multichannel Opus)"
-            )));
-        }
-        let dec = OpusDecoder::new(rate as i32, channels as usize)
-            .map_err(|e| Error::invalid(format!("opus decode init: {e}")))?;
+        // Mapping families 1 and 255 pack several Opus streams per packet;
+        // family 0 (or no OpusHead) is one stream.
+        let dec = match head.as_ref().map_or(0, |h| h.mapping_family) {
+            0 => Inner::Single(Box::new(
+                OpusDecoder::new(rate as i32, channels as usize)
+                    .map_err(|e| Error::invalid(format!("opus decode init: {e}")))?,
+            )),
+            1 | 255 => Inner::Multi(
+                OpusMSDecoder::with_layout(rate as i32, multistream_layout(&params.extradata)?)
+                    .map_err(|e| Error::invalid(format!("opus decode init: {e}")))?,
+            ),
+            family => {
+                return Err(Error::unsupported(format!(
+                    "opus decode: channel mapping family {family} (ambisonics)"
+                )))
+            }
+        };
         // Pre-skip (like granules) counts 48 kHz samples.
         self.skip = head
             .as_ref()
@@ -197,9 +268,7 @@ impl Decoder for OpusDec {
             .ok_or_else(|| Error::invalid("opus decode: not configured"))?;
 
         let mut out = vec![0f32; frame_size * channels];
-        let decoded = dec
-            .decode(&packet.data, frame_size, &mut out)
-            .map_err(|e| Error::invalid(format!("opus decode: {e}")))?;
+        let decoded = dec.decode(&packet.data, frame_size, &mut out)?;
         let (start, end) = keep_range(&mut self.skip, self.position, packet, decoded);
         self.position = packet
             .end_position
@@ -731,19 +800,171 @@ mod tests {
         }
     }
 
-    /// Multistream (surround) packets are not decoded: refuse them clearly
-    /// rather than misread them as one stream.
+    /// Ambisonics (families 2/3) are not decoded: refuse them clearly
+    /// rather than misread them.
     #[test]
-    fn multichannel_mapping_is_refused() {
+    fn ambisonic_mapping_is_refused() {
         let mut dec = OpusDec::default();
+        let mut extradata = head(4, 312, 0, 0);
+        extradata[18] = 2;
+        extradata.extend_from_slice(&[2, 2, 0, 1, 2, 3]);
         let err = dec
             .configure(&CodecParams {
                 sample_rate: 48_000,
-                channels: 6,
-                extradata: head(6, 312, 0, 1),
+                channels: 4,
+                extradata,
                 ..Default::default()
             })
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "{err}");
+    }
+
+    /// A family-1/255 OpusHead whose table names no stream is invalid data.
+    #[test]
+    fn bad_mapping_table_is_invalid() {
+        let mut extradata = head(6, 312, 0, 1);
+        extradata[24] = 9; // 5.1 table entry for output 3 -> decoded ch 9
+        let err = OpusDec::default()
+            .configure(&CodecParams {
+                sample_rate: 48_000,
+                channels: 6,
+                extradata,
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "{err}");
+    }
+
+    /// FFmpeg's order for family 1: libavcodec's
+    /// `ff_vorbis_channel_layout_offsets`, each a permutation.
+    #[test]
+    fn family_1_order_is_ffmpegs() {
+        assert_eq!(ffmpeg_order(3), [0, 2, 1]);
+        assert_eq!(ffmpeg_order(5), [0, 2, 1, 3, 4]);
+        assert_eq!(ffmpeg_order(6), [0, 2, 1, 5, 3, 4]);
+        assert_eq!(ffmpeg_order(7), [0, 2, 1, 6, 5, 3, 4]);
+        assert_eq!(ffmpeg_order(8), [0, 2, 1, 7, 5, 6, 3, 4]);
+        for n in 1..=8 {
+            let mut m = ffmpeg_order(n).to_vec();
+            m.sort_unstable();
+            assert_eq!(m, (0..n).collect::<Vec<_>>());
+        }
+        // The 5.1 table (Vorbis FL FC FR RL RR LFE over streams
+        // [FL/FR coupled, RL/RR coupled, FC, LFE]) becomes FL FR FC LFE BL BR.
+        let layout = multistream_layout(&head(6, 0, 0, 1)).unwrap();
+        assert_eq!(layout.mapping, [0, 1, 4, 5, 2, 3]);
+        // Family 255 keeps the table's order.
+        let mut h = head(4, 0, 0, 255);
+        h.truncate(19);
+        h.extend_from_slice(&[2, 0, 1, 255, 0, 1]);
+        assert_eq!(multistream_layout(&h).unwrap().mapping, [1, 255, 0, 1]);
+    }
+
+    /// `frames` 20 ms mono packets of a `freq`-radian tone, then each
+    /// packet's own decode (the per-stream reference).
+    fn mono_stream(frames: usize, freq: f32) -> (Vec<Vec<u8>>, Vec<Vec<f32>>) {
+        let mut enc = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+        let mut dec = OpusDecoder::new(48_000, 1).unwrap();
+        let mut buf = vec![0u8; 1500];
+        let mut pcm_out = vec![0f32; 960];
+        (0..frames)
+            .map(|k| {
+                let pcm: Vec<f32> = (0..960)
+                    .map(|i| ((k * 960 + i) as f32 * freq).sin() * 0.3)
+                    .collect();
+                let n = enc.encode(&pcm, 960, &mut buf).unwrap();
+                dec.decode(&buf[..n], 960, &mut pcm_out).unwrap();
+                (buf[..n].to_vec(), pcm_out.clone())
+            })
+            .unzip()
+    }
+
+    /// Family 255 through the codec: two mono streams, mapping
+    /// `[1, 255, 0, 0]` — output 0 is stream 1, output 1 silent, outputs 2
+    /// and 3 both stream 0 — with the pre-skip and output gain applied as
+    /// for one stream.
+    #[test]
+    fn family_255_maps_silent_and_duplicated_outputs() {
+        let (a, ref_a) = mono_stream(4, 0.031);
+        let (b, ref_b) = mono_stream(4, 0.077);
+        let packets: Vec<Packet> = a
+            .iter()
+            .zip(&b)
+            .map(|(pa, pb)| {
+                let mut rp = rusty_opus::repacketizer::Repacketizer::new();
+                rp.cat(pa).unwrap();
+                let mut data = rp.out_self_delimited().unwrap();
+                data.extend_from_slice(pb);
+                Packet::from_data(0, data)
+            })
+            .collect();
+        let mut extradata = head(4, 100, 3 * 256, 255);
+        extradata.truncate(19);
+        extradata.extend_from_slice(&[2, 0, 1, 255, 0, 0]);
+        let mut dec = OpusDec::default();
+        dec.configure(&CodecParams {
+            sample_rate: 48_000,
+            channels: 4,
+            extradata,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut out = Vec::new();
+        for p in &packets {
+            dec.send_packet(p).unwrap();
+            while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+                assert_eq!(af.channels, 4);
+                out.extend(
+                    af.planes[0]
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                );
+            }
+        }
+        let g = 10f64.powf(3.0 / 20.0) as f32;
+        let (sa, sb): (Vec<f32>, Vec<f32>) = (ref_a.concat(), ref_b.concat());
+        assert_eq!(out.len(), (960 * 4 - 100) * 4);
+        for (i, frame) in out.chunks_exact(4).enumerate() {
+            let t = i + 100;
+            assert_eq!(frame, [sb[t] * g, 0.0, sa[t] * g, sa[t] * g], "frame {i}");
+        }
+    }
+
+    /// Family 1 5.1 through the codec comes out in FFmpeg's order: output
+    /// `i` is the Vorbis-order decode's channel `ffmpeg_order(6)[i]`.
+    #[test]
+    fn family_1_decodes_in_ffmpeg_order() {
+        let mut enc =
+            rusty_opus::multistream::OpusMSEncoder::new(48_000, 6, 1, Application::Audio).unwrap();
+        let mut vorbis = rusty_opus::multistream::OpusMSDecoder::new(48_000, 6, 1).unwrap();
+        let mut dec = OpusDec::default();
+        dec.configure(&CodecParams {
+            sample_rate: 48_000,
+            channels: 6,
+            extradata: head(6, 0, 0, 1),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut want = vec![0f32; 960 * 6];
+        for k in 0..5 {
+            // A different tone per channel.
+            let pcm: Vec<f32> = (0..960 * 6)
+                .map(|i| ((k * 960 + i / 6) as f32 * 0.01 * (1 + i % 6) as f32).sin() * 0.2)
+                .collect();
+            let data = enc.encode(&pcm, 960).unwrap();
+            assert_eq!(vorbis.decode(&data, 960, &mut want).unwrap(), 960);
+            dec.send_packet(&Packet::from_data(0, data)).unwrap();
+            let Ok(Frame::Audio(af)) = dec.receive_frame() else {
+                panic!("no frame");
+            };
+            let got: Vec<f32> = af.planes[0]
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            for (g, w) in got.chunks_exact(6).zip(want.chunks_exact(6)) {
+                let reordered: Vec<f32> = ffmpeg_order(6).iter().map(|&v| w[v]).collect();
+                assert_eq!(g, reordered);
+            }
+        }
     }
 }
