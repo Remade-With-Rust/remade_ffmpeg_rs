@@ -1,0 +1,17 @@
+[package]
+name = "rff-format-aiff"
+description = "Remade FFmpeg (Rust): AIFF / AIFF-C audio container (demux): PCM, float, G.711 and ima4."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["aiff", "aifc", "pcm", "container", "audio"]
+categories = ["multimedia", "multimedia::audio", "parser-implementations"]
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true

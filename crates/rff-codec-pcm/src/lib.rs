@@ -6,6 +6,13 @@
 //! (the new codec-parameters plumbing). Encodes interleaved `s16` and `f32`;
 //! decodes those plus `u8`, `s24`, `s32` and `f64` (camera and DAW files in
 //! QuickTime), which it widens to the `s16` / `f32` every encoder takes.
+//!
+//! Also decodes the companded and ADPCM formats WAV, AIFF-C and CAF carry,
+//! all to interleaved `s16`: G.711 A-law and µ-law, Microsoft ADPCM, and IMA
+//! ADPCM in its WAV and QuickTime (`ima4`) layouts.
+
+mod adpcm;
+mod g711;
 
 use rff_codec::{Codec, CodecParams, CodecRegistry, Decoder, Encoder};
 use rff_core::{AudioFrame, Error, Frame, MediaType, Packet, Result, SampleFormat};
@@ -20,6 +27,154 @@ pub fn register(registry: &mut CodecRegistry) {
         decoder: Some(|| Box::new(PcmDecoder::default())),
         encoder: Some(|| Box::new(PcmEncoder::default())),
     });
+    let decoders: [DecoderEntry; 5] = [
+        (
+            rff_core::CodecId::PcmAlaw,
+            "pcm_alaw",
+            "PCM A-law (G.711)",
+            || Box::new(CodedDecoder::new(Kind::Alaw)),
+        ),
+        (
+            rff_core::CodecId::PcmMulaw,
+            "pcm_mulaw",
+            "PCM µ-law (G.711)",
+            || Box::new(CodedDecoder::new(Kind::Mulaw)),
+        ),
+        (
+            rff_core::CodecId::AdpcmMs,
+            "adpcm_ms",
+            "ADPCM Microsoft",
+            || Box::new(CodedDecoder::new(Kind::Ms)),
+        ),
+        (
+            rff_core::CodecId::AdpcmImaWav,
+            "adpcm_ima_wav",
+            "ADPCM IMA WAV",
+            || Box::new(CodedDecoder::new(Kind::ImaWav)),
+        ),
+        (
+            rff_core::CodecId::AdpcmImaQt,
+            "adpcm_ima_qt",
+            "ADPCM IMA QuickTime",
+            || Box::new(CodedDecoder::new(Kind::ImaQt)),
+        ),
+    ];
+    for (id, name, long_name, decoder) in decoders {
+        registry.register(Codec {
+            id,
+            name,
+            long_name,
+            media_type: MediaType::Audio,
+            decoder: Some(decoder),
+            encoder: None,
+        });
+    }
+}
+
+/// A decode-only registration: id, name, long name, constructor.
+type DecoderEntry = (
+    rff_core::CodecId,
+    &'static str,
+    &'static str,
+    fn() -> Box<dyn Decoder>,
+);
+
+/// Which compressed layout a [`CodedDecoder`] reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Alaw,
+    Mulaw,
+    Ms,
+    ImaWav,
+    ImaQt,
+}
+
+/// Decoder for the G.711 and ADPCM formats. Output is interleaved s16.
+///
+/// MS and WAV IMA ADPCM take one block per packet (the WAV demuxer packets
+/// them that way); `ima4` takes any number of whole 34-byte-per-channel
+/// frames; G.711 takes any number of bytes.
+struct CodedDecoder {
+    kind: Kind,
+    sample_rate: u32,
+    channels: u16,
+    ms_coefs: Vec<(i32, i32)>,
+    qt_state: Vec<adpcm::ImaChan>,
+    frame: Option<Frame>,
+    eof: bool,
+}
+
+impl CodedDecoder {
+    fn new(kind: Kind) -> CodedDecoder {
+        CodedDecoder {
+            kind,
+            sample_rate: 0,
+            channels: 1,
+            ms_coefs: adpcm::MS_COEFS.to_vec(),
+            qt_state: Vec::new(),
+            frame: None,
+            eof: false,
+        }
+    }
+}
+
+impl Decoder for CodedDecoder {
+    fn configure(&mut self, params: &CodecParams) -> Result<()> {
+        if params.channels == 0 {
+            return Err(Error::invalid(format!(
+                "{:?} decode: stream has no channel count",
+                self.kind
+            )));
+        }
+        self.sample_rate = params.sample_rate;
+        self.channels = params.channels;
+        if self.kind == Kind::Ms {
+            self.ms_coefs = adpcm::ms_coefs(&params.extradata);
+        }
+        Ok(())
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        let ch = self.channels as usize;
+        let (data, samples) = match self.kind {
+            Kind::Alaw | Kind::Mulaw => {
+                let table = if self.kind == Kind::Alaw {
+                    &g711::ALAW
+                } else {
+                    &g711::ULAW
+                };
+                let samples = packet.data.len() / ch;
+                (g711::expand(table, &packet.data[..samples * ch]), samples)
+            }
+            Kind::Ms => adpcm::decode_ms(&packet.data, ch, &self.ms_coefs),
+            Kind::ImaWav => adpcm::decode_ima_wav(&packet.data, ch),
+            Kind::ImaQt => adpcm::decode_ima_qt(&packet.data, &mut self.qt_state, ch),
+        };
+        self.frame = Some(Frame::Audio(AudioFrame {
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            format: SampleFormat::S16,
+            planes: vec![data],
+            samples,
+            pts: packet.pts,
+        }));
+        Ok(())
+    }
+
+    fn receive_frame(&mut self) -> Result<Frame> {
+        if let Some(frame) = self.frame.take() {
+            return Ok(frame);
+        }
+        if self.eof {
+            Err(Error::Eof)
+        } else {
+            Err(Error::Again)
+        }
+    }
+
+    fn flush(&mut self) {
+        self.eof = true;
+    }
 }
 
 /// The layout a decoded frame of `format` is delivered in: the two layouts
@@ -283,6 +438,47 @@ mod tests {
         // A trailing partial frame is not decoded as a sample.
         let af = decode_one(SampleFormat::S24, 2, vec![0; 7]);
         assert_eq!((af.samples, af.planes[0].len()), (1, 8));
+    }
+
+    #[test]
+    fn registered_coded_decoders_decode_through_the_registry() {
+        let mut reg = CodecRegistry::default();
+        register(&mut reg);
+        let decode = |id: rff_core::CodecId, channels: u16, data: Vec<u8>| {
+            let mut dec = reg.find_decoder(id).expect("registered");
+            dec.configure(&CodecParams {
+                codec_id: id,
+                sample_rate: 8000,
+                channels,
+                ..Default::default()
+            })
+            .unwrap();
+            dec.send_packet(&Packet::from_data(0, data)).unwrap();
+            let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+                unreachable!()
+            };
+            af
+        };
+        let af = decode(rff_core::CodecId::PcmMulaw, 2, vec![0xFF, 0x80, 0x00]);
+        assert_eq!((af.format, af.samples), (SampleFormat::S16, 1));
+        assert_eq!(af.planes[0], [0, 0, 0x7C, 0x7D]); // 0, 32124
+        let af = decode(rff_core::CodecId::PcmAlaw, 1, vec![0xD5]);
+        assert_eq!(af.planes[0], 8i16.to_le_bytes());
+        let mut ms = vec![0u8];
+        for v in [16i16, 100, 50] {
+            ms.extend_from_slice(&v.to_le_bytes());
+        }
+        ms.push(0x1F);
+        let af = decode(rff_core::CodecId::AdpcmMs, 1, ms);
+        assert_eq!(af.samples, 4);
+        let af = decode(
+            rff_core::CodecId::AdpcmImaWav,
+            1,
+            vec![0x10, 0, 0, 0, 0x77, 0x77, 0x77, 0x77],
+        );
+        assert_eq!(af.samples, 9);
+        let af = decode(rff_core::CodecId::AdpcmImaQt, 1, vec![0; 34]);
+        assert_eq!(af.samples, 64);
     }
 
     #[test]

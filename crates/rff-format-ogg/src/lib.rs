@@ -6,7 +6,14 @@
 //! input sample rate), the second is `OpusTags`, and the rest are Opus audio
 //! packets.
 //!
-//! This implementation exposes a single Opus or Vorbis stream. The demuxer
+//! FLAC in Ogg (the `0x7F "FLAC"` mapping, `.oga`) is read too: the first
+//! packet's STREAMINFO becomes the stream's `extradata` (`fLaC` + the block),
+//! the metadata packets after it are dropped, and each audio packet is one
+//! FLAC frame for the [`flac`](rff-codec-flac) decoder. Packets that are not
+//! FLAC frames (by their sync code) are dropped too, so a mapping whose
+//! header count is 0 ("unknown") still reads.
+//!
+//! This implementation exposes a single Opus, Vorbis or FLAC stream. The demuxer
 //! streams: it reads one page at a time from a plain (non-seekable) reader,
 //! reassembles packets across pages per logical stream (serial number), and
 //! exposes the first logical stream whose first packet is `OpusHead` or a
@@ -46,8 +53,8 @@ use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Muxer, Output,
 pub fn register(registry: &mut FormatRegistry) {
     registry.register(Format {
         name: "ogg",
-        long_name: "Ogg (Opus / Vorbis)",
-        extensions: &["ogg", "opus"],
+        long_name: "Ogg (Opus / Vorbis / FLAC)",
+        extensions: &["ogg", "opus", "oga"],
         demuxer: Some(|input| Box::new(OggDemuxer::new(input))),
         muxer: Some(|output| Box::new(OggMuxer::new(output))),
         muxer_path: None,
@@ -477,9 +484,34 @@ fn identify(first: &[u8]) -> Option<Mapping> {
             sample_format: SampleFormat::F32,
             headers: 3,
         })
+    } else if first.len() >= 51
+        && first[0] == 0x7F
+        && &first[1..5] == b"FLAC"
+        && &first[9..13] == b"fLaC"
+    {
+        // 0x7F "FLAC", version (2), header packet count (2), "fLaC", then
+        // the STREAMINFO block: its 4-byte header at 13, its body at 17.
+        let si = &first[17..];
+        Some(Mapping {
+            codec_id: CodecId::Flac,
+            channels: ((si[12] >> 1) & 7) as u16 + 1,
+            sample_rate: ((si[10] as u32) << 12) | ((si[11] as u32) << 4) | ((si[12] as u32) >> 4),
+            // The FLAC decoder emits float, as the native FLAC demuxer says.
+            sample_format: SampleFormat::F32,
+            // Only the mapping packet is needed; metadata packets after it
+            // are dropped by `is_flac_frame`, whatever their declared count.
+            headers: 1,
+        })
     } else {
         None
     }
+}
+
+/// Whether an Ogg FLAC packet is an audio frame: it opens with the 14-bit
+/// frame sync code. Metadata blocks open with a block type (0..=0x7E, plus the
+/// last-block flag), never 0xFF.
+fn is_flac_frame(p: &[u8]) -> bool {
+    p.len() >= 2 && p[0] == 0xFF && p[1] & 0xFE == 0xF8
 }
 
 // ---------------------------------------------------------------------------
@@ -678,7 +710,7 @@ impl Demuxer for OggDemuxer {
 
         let Some((serial, m)) = chosen else {
             return Err(if any_packet {
-                Error::unsupported("ogg demux: unrecognized codec (expected Opus or Vorbis)")
+                Error::unsupported("ogg demux: unrecognized codec (expected Opus, Vorbis or FLAC)")
             } else {
                 Error::invalid("ogg demux: no packets")
             });
@@ -691,10 +723,14 @@ impl Demuxer for OggDemuxer {
                 let three: Vec<&[u8]> = got.iter().take(3).map(|p| p.data.as_slice()).collect();
                 pack_headers(&three)
             }
+            CodecId::Flac => got[0].data[9..].to_vec(),
             _ => got[0].data.clone(),
         };
         let consumed = got.len().min(m.headers);
-        self.queue = got.drain(consumed..).collect();
+        self.queue = got
+            .drain(consumed..)
+            .filter(|p| m.codec_id != CodecId::Flac || is_flac_frame(&p.data))
+            .collect();
         self.target = Some(Target {
             serial,
             codec_id: m.codec_id,
@@ -792,7 +828,7 @@ impl Demuxer for OggDemuxer {
                     }
                 } else if *skip > 0 {
                     *skip -= 1;
-                } else {
+                } else if *codec_id != CodecId::Flac || is_flac_frame(&p.data) {
                     queue.push_back(p);
                 }
             });
@@ -1279,6 +1315,53 @@ mod tests {
             packets,
             vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
         );
+    }
+
+    /// An Ogg FLAC mapping packet: 44.1 kHz stereo 16-bit STREAMINFO, with
+    /// `headers` declared metadata packets.
+    fn flac_mapping(headers: u16) -> Vec<u8> {
+        let mut p = vec![0x7F];
+        p.extend_from_slice(b"FLAC");
+        p.extend_from_slice(&[1, 0]);
+        p.extend_from_slice(&headers.to_be_bytes());
+        p.extend_from_slice(b"fLaC");
+        p.extend_from_slice(&[0x00, 0, 0, 34]); // STREAMINFO block header
+        let mut si = vec![0x10, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0, 0];
+        // 44100 Hz (20 bits), 2 channels (3 bits: 1), 16 bits (5 bits: 15).
+        let rate = 44_100u32;
+        si.push((rate >> 12) as u8);
+        si.push((rate >> 4) as u8);
+        si.push(((rate & 0xF) << 4) as u8 | (1 << 1));
+        si.push(15 << 4);
+        si.extend_from_slice(&[0; 20]);
+        p.extend_from_slice(&si);
+        assert_eq!(p.len(), 51);
+        p
+    }
+
+    #[test]
+    fn flac_in_ogg_exposes_streaminfo_and_frames() {
+        let frames = [vec![0xFF, 0xF8, 1, 2, 3], vec![0xFF, 0xF9, 4, 5]];
+        let comment = vec![0x84, 0, 0, 2, 0xAA, 0xBB]; // VORBIS_COMMENT, last block
+        for declared in [1u16, 0] {
+            // Mapping page, then the comment and both frames on one page.
+            let mut file = raw_page(0x02, 7, 0, &[51], &flac_mapping(declared));
+            let body: Vec<u8> = [comment.clone(), frames[0].clone(), frames[1].clone()].concat();
+            file.extend(raw_page(0x04, 7, 1, &[6, 5, 4], &body));
+            let mut dem = OggDemuxer::new(Box::new(Cursor::new(file.clone())));
+            let s = dem.read_header().unwrap().remove(0);
+            assert_eq!(
+                (s.codec_id, s.channels, s.sample_rate),
+                (CodecId::Flac, 2, 44_100)
+            );
+            assert_eq!(&s.extradata[..4], b"fLaC");
+            assert_eq!(s.extradata.len(), 42);
+            let (_, _, packets) = demux_bytes(&file).unwrap();
+            assert_eq!(
+                packets, frames,
+                "declared {declared}: metadata dropped, frames kept"
+            );
+        }
     }
 
     #[test]

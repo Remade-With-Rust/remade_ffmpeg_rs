@@ -12,6 +12,7 @@ for both decode and encode.
 - **Faster than `libopus` per core, on speech *and* music** — 1.0–1.5× single-thread (fair, one thread each), via three **byte-identical AVX2 SILK kernels** (LPC short-prediction, warped autocorrelation, and the cross-state NSQ shaping filter) plus an O(n²)-copy fix in the encode wrapper.
 - **Frame-parallel encoding** takes wall-clock to **2–4× faster** than libopus, which is single-threaded per stream. Chunked and state-primed, gated **PEAQ-neutral** (ΔODG ≤ 0.03).
 - **FFmpeg decodes our output at unity.** The decoder passes all 12 official RFC 6716/8251 test vectors.
+- **Multichannel decode**: `OpusHead` mapping families 1 (surround up to 7.1) and 255 (custom layouts, silent and duplicated channels), in FFmpeg's channel order, checked against libopus's multistream decoder.
 - Knobs: `-b:a`, `-compression_level`, `-opus_parallel`.
 - Opus is royalty-free.
 

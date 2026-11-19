@@ -1580,6 +1580,8 @@ fn map_codec(codec: &str) -> CodecId {
         "A_AAC" => CodecId::Aac,
         "A_FLAC" => CodecId::Flac,
         "A_MPEG/L3" => CodecId::Mp3,
+        "A_MPEG/L2" => CodecId::Mp2,
+        "A_MPEG/L1" => CodecId::Mp1,
         "A_PCM/INT/LIT" | "A_PCM/FLOAT/IEEE" => CodecId::Pcm,
         "A_AC3" | "A_AC3/BSID9" | "A_AC3/BSID10" => CodecId::Ac3,
         "A_EAC3" => CodecId::Eac3,
@@ -1932,6 +1934,13 @@ mod tests {
                 (3, 20, Some(1133), 17),
             ]
         );
+    }
+
+    #[test]
+    fn mpeg_audio_layers_map_to_their_codecs() {
+        assert_eq!(map_codec("A_MPEG/L3"), CodecId::Mp3);
+        assert_eq!(map_codec("A_MPEG/L2"), CodecId::Mp2);
+        assert_eq!(map_codec("A_MPEG/L1"), CodecId::Mp1);
     }
 
     #[test]

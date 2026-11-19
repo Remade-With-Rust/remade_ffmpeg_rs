@@ -1,0 +1,17 @@
+[package]
+name = "rff-codec-alac"
+description = "Remade FFmpeg (Rust): Apple Lossless (ALAC) audio decoder, 16/20/24/32-bit, 1-8 channels."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["alac", "apple-lossless", "audio", "decoder", "codec"]
+categories = ["multimedia", "multimedia::audio", "multimedia::encoding"]
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true

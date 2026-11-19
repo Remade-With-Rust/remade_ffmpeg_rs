@@ -3,9 +3,16 @@
 //! Reads the `fmt ` chunk for the PCM layout and streams the `data` chunk as
 //! successive packets of whole sample frames (up to 4096 per packet) for
 //! the [`pcm`](rff-codec-pcm) codec; writes both back. Supports interleaved
-//! `s16` (WAVE format 1) and `f32` (format 3), plus u8/s24 repacked on read.
-//! The codec parameters (sample rate, channels, sample format) ride on the
-//! [`Stream`].
+//! `s16` (WAVE format 1) and `f32` (format 3), plus u8/s24 repacked on read
+//! and s32/f64 passed through.
+//!
+//! Also reads the compressed WAVE formats: G.711 A-law (6) and µ-law (7) as
+//! `pcm_alaw` / `pcm_mulaw` packets, and Microsoft ADPCM (2) and IMA ADPCM
+//! (0x11) one block per packet. `WAVE_FORMAT_EXTENSIBLE` resolves through its
+//! SubFormat GUID to any of these. RF64 and BW64 files (the 64-bit-size
+//! variants, with a `ds64` chunk) read like RIFF ones. The codec parameters
+//! (sample rate, channels, sample format, and for MS ADPCM its coefficient
+//! table as extradata) ride on the [`Stream`].
 
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 
@@ -31,9 +38,12 @@ pub fn register(registry: &mut FormatRegistry) {
     registry.register_seekable_muxer("wav", |output| Box::new(WavMuxer::new_seekable(output)));
 }
 
-/// Sniff WAV: a RIFF file whose form type is `WAVE`.
+/// Sniff WAV: a RIFF (or 64-bit RF64 / BW64) file whose form type is `WAVE`.
 fn probe_wav(data: &[u8]) -> i32 {
-    if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WAVE" {
+    if data.len() >= 12
+        && matches!(&data[0..4], b"RIFF" | b"RF64" | b"BW64")
+        && &data[8..12] == b"WAVE"
+    {
         100
     } else {
         0
@@ -111,11 +121,55 @@ impl Delivery {
 
 /// Map a WAVE `(format_tag, bits_per_sample)` to a delivery plan.
 fn sample_format(tag: u16, bits: u16) -> Option<Delivery> {
+    // Container width: bits rounded up to whole bytes (a 20-bit file stores
+    // 3-byte samples, a 12-bit one 2-byte samples, sign in the top bit).
+    match (tag, bits.div_ceil(8)) {
+        (1, 2) => Some(Delivery::Native(SampleFormat::S16)),
+        (3, 4) => Some(Delivery::Native(SampleFormat::F32)),
+        (1, 1) => Some(Delivery::U8ToS16),
+        (1, 3) => Some(Delivery::S24ToF32),
+        (1, 4) => Some(Delivery::Native(SampleFormat::S32)),
+        (3, 8) => Some(Delivery::Native(SampleFormat::F64)),
+        _ => None,
+    }
+}
+
+/// A compressed WAVE format: the codec and how the data chunk is packeted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Coded {
+    /// G.711: one byte per sample, packeted like PCM.
+    G711(CodecId),
+    /// Block ADPCM: one `block_align`-byte block per packet.
+    Block(CodecId),
+}
+
+impl Coded {
+    fn codec(self) -> CodecId {
+        match self {
+            Coded::G711(c) | Coded::Block(c) => c,
+        }
+    }
+
+    /// Samples per channel in one ADPCM block of `len` bytes (a short final
+    /// block holds fewer), as the decoder will produce them.
+    fn block_samples(self, len: usize, channels: usize) -> usize {
+        let ch = channels.max(1);
+        match self {
+            Coded::Block(CodecId::AdpcmMs) if len >= 7 * ch => 2 + (len - 7 * ch) * 2 / ch,
+            Coded::Block(CodecId::AdpcmImaWav) if len >= 4 * ch => {
+                1 + 8 * ((len - 4 * ch) / (4 * ch))
+            }
+            _ => 0,
+        }
+    }
+}
+
+fn coded_format(tag: u16, bits: u16) -> Option<Coded> {
     match (tag, bits) {
-        (1, 16) => Some(Delivery::Native(SampleFormat::S16)),
-        (3, 32) => Some(Delivery::Native(SampleFormat::F32)),
-        (1, 8) => Some(Delivery::U8ToS16),
-        (1, 24) => Some(Delivery::S24ToF32),
+        (6, 8) => Some(Coded::G711(CodecId::PcmAlaw)),
+        (7, 8) => Some(Coded::G711(CodecId::PcmMulaw)),
+        (2, 4) => Some(Coded::Block(CodecId::AdpcmMs)),
+        (0x11, 4) => Some(Coded::Block(CodecId::AdpcmImaWav)),
         _ => None,
     }
 }
@@ -154,6 +208,11 @@ struct WavDemuxer {
     input: Option<Input>,
     source: Option<Source>,
     delivery: Delivery,
+    /// The compressed format, if the file holds one.
+    coded: Option<Coded>,
+    channels: usize,
+    /// File bytes per packet for block ADPCM (`nBlockAlign`).
+    block_align: usize,
     /// File bytes per sample frame (all channels), at least 1.
     raw_frame: usize,
     /// Frames per packet (≤ [`FRAMES_PER_PACKET`]).
@@ -171,6 +230,9 @@ impl WavDemuxer {
             input: Some(input),
             source: None,
             delivery: Delivery::Native(SampleFormat::S16),
+            coded: None,
+            channels: 1,
+            block_align: 0,
             raw_frame: 1,
             frames_per_packet: FRAMES_PER_PACKET,
             next_pts: 0,
@@ -183,7 +245,15 @@ impl WavDemuxer {
 struct WavFmt {
     channels: u16,
     sample_rate: u32,
+    /// How PCM samples are delivered (a placeholder for a compressed format).
     delivery: Delivery,
+    /// A compressed format, when the tag names one.
+    coded: Option<Coded>,
+    /// `nBlockAlign`: the ADPCM block size.
+    block_align: u16,
+    /// The bytes after `cbSize` (MS ADPCM: samples per block and its
+    /// coefficient table), handed to the decoder as extradata.
+    extra: Vec<u8>,
 }
 
 /// Parse a `fmt ` chunk body (`f` = its bytes, clipped to the file).
@@ -204,15 +274,38 @@ fn parse_fmt(f: &[u8]) -> Result<WavFmt> {
         }
         format_tag = rd_u16(f, 24);
     }
-    let delivery = sample_format(format_tag, bits).ok_or_else(|| {
-        Error::unsupported(format!(
-            "wav demux: format tag {format_tag}, {bits}-bit (pcm u8/s16/s24 or f32)"
-        ))
-    })?;
+    let block_align = rd_u16(f, 12);
+    let extra = if f.len() >= 18 {
+        let cb = rd_u16(f, 16) as usize;
+        f[18..(18 + cb).min(f.len())].to_vec()
+    } else {
+        Vec::new()
+    };
+    let coded = coded_format(format_tag, bits);
+    let delivery = match coded {
+        Some(Coded::Block(codec)) => {
+            if (block_align as usize) < 4 * channels.max(1) as usize {
+                return Err(Error::invalid(format!(
+                    "wav demux: {codec} with a {block_align}-byte block for {channels} channels"
+                )));
+            }
+            Delivery::Native(SampleFormat::S16)
+        }
+        Some(Coded::G711(_)) => Delivery::Native(SampleFormat::U8),
+        None => sample_format(format_tag, bits).ok_or_else(|| {
+            Error::unsupported(format!(
+                "wav demux: format tag {format_tag:#06x}, {bits}-bit (pcm u8/s16/s24/s32, \
+                 float f32/f64, G.711, MS or IMA ADPCM)"
+            ))
+        })?,
+    };
     Ok(WavFmt {
         channels,
         sample_rate,
         delivery,
+        coded,
+        block_align,
+        extra,
     })
 }
 
@@ -265,6 +358,8 @@ fn open_wav(input: Input) -> Result<(WavFmt, Source)> {
     }
     let mut fmt: Option<WavFmt> = None;
     let mut early_data: Option<Vec<u8>> = None;
+    // RF64 / BW64: the real data size, from the `ds64` chunk.
+    let mut ds64_data: Option<u64> = None;
     loop {
         let mut ch = [0u8; 8];
         if read_full(&mut r, &mut ch)? < 8 {
@@ -278,11 +373,24 @@ fn open_wav(input: Input) -> Result<(WavFmt, Source)> {
                 fmt = Some(parse_fmt(&body)?);
                 skip(&mut r, size - body.len() as u64 + pad)?;
             }
+            b"ds64" if ds64_data.is_none() => {
+                // riffSize(8), dataSize(8), sampleCount(8), table...
+                let body = read_up_to(&mut r, size.min(24))?;
+                if body.len() >= 16 {
+                    ds64_data = Some(u64::from_le_bytes(body[8..16].try_into().unwrap()));
+                }
+                skip(&mut r, size - body.len() as u64 + pad)?;
+            }
             b"data" if early_data.is_none() => {
                 if let Some(fmt) = fmt.take() {
                     // 0 and 0xFFFFFFFF both mean "length unknown" (a streamed
                     // WAV whose writer could not seek back): read to EOF.
-                    let remaining = (size != 0 && size != 0xFFFF_FFFF).then_some(size);
+                    // RF64 states the real size in `ds64`.
+                    let remaining = match (size, ds64_data) {
+                        (0xFFFF_FFFF, Some(n)) if n != 0 => Some(n),
+                        (0 | 0xFFFF_FFFF, _) => None,
+                        _ => Some(size),
+                    };
                     return Ok((
                         fmt,
                         Source::Stream {
@@ -291,6 +399,10 @@ fn open_wav(input: Input) -> Result<(WavFmt, Source)> {
                         },
                     ));
                 }
+                let size = match (size, ds64_data) {
+                    (0xFFFF_FFFF, Some(n)) => n,
+                    _ => size,
+                };
                 early_data = Some(read_up_to(&mut r, size)?);
                 skip(&mut r, pad)?;
             }
@@ -313,24 +425,40 @@ impl Demuxer for WavDemuxer {
                 channels,
                 sample_rate,
                 delivery,
+                coded,
+                block_align,
+                extra,
             },
             source,
         ) = open_wav(input)?;
         self.delivery = delivery;
+        self.coded = coded;
+        self.channels = channels.max(1) as usize;
+        self.block_align = block_align as usize;
         self.raw_frame = delivery.raw_bytes() * channels.max(1) as usize;
         self.frames_per_packet = (MAX_PACKET_BYTES / self.raw_frame).clamp(1, FRAMES_PER_PACKET);
         self.source = Some(source);
 
-        let mut stream = Stream::new(0, CodecId::Pcm);
+        let mut stream = Stream::new(0, coded.map_or(CodecId::Pcm, Coded::codec));
         stream.sample_rate = sample_rate;
         stream.channels = channels;
-        stream.sample_format = Some(delivery.format());
+        // Compressed formats: the layout the decoder produces.
+        stream.sample_format = Some(match coded {
+            Some(_) => SampleFormat::S16,
+            None => delivery.format(),
+        });
+        if coded == Some(Coded::Block(CodecId::AdpcmMs)) {
+            stream.extradata = extra;
+        }
         stream.time_base = Rational::new(1, sample_rate.max(1) as i32);
         Ok(vec![stream])
     }
 
     fn read_packet(&mut self) -> Result<Packet> {
-        let block = self.raw_frame * self.frames_per_packet;
+        let block = match self.coded {
+            Some(Coded::Block(_)) => self.block_align,
+            _ => self.raw_frame * self.frames_per_packet,
+        };
         let raw = match self.source.as_mut() {
             None => return Err(Error::Eof),
             Some(Source::Stream { reader, remaining }) => {
@@ -353,8 +481,16 @@ impl Demuxer for WavDemuxer {
             return Err(Error::Eof);
         }
         self.emitted = true;
-        let frames = (raw.len() / self.raw_frame) as i64;
-        let (_, data) = self.delivery.deliver(raw);
+        let (frames, data) = match self.coded {
+            Some(coded @ Coded::Block(_)) => {
+                (coded.block_samples(raw.len(), self.channels) as i64, raw)
+            }
+            Some(Coded::G711(_)) => ((raw.len() / self.raw_frame) as i64, raw),
+            None => (
+                (raw.len() / self.raw_frame) as i64,
+                self.delivery.deliver(raw).1,
+            ),
+        };
         let mut packet = Packet::from_data(0, data);
         packet.pts = Some(self.next_pts);
         packet.duration = frames;
@@ -608,6 +744,195 @@ mod tests {
         let streams = dem.read_header().unwrap();
         assert_eq!(streams[0].sample_format, Some(SampleFormat::F32));
         assert_eq!(streams[0].channels, 2);
+    }
+
+    fn header_and_packets(file: Vec<u8>) -> (Stream, Vec<Packet>) {
+        let mut dem = WavDemuxer::new(Box::new(Cursor::new(file)));
+        let stream = dem.read_header().unwrap().remove(0);
+        let mut packets = Vec::new();
+        loop {
+            match dem.read_packet() {
+                Ok(p) => packets.push(p),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        (stream, packets)
+    }
+
+    #[test]
+    fn s32_and_f64_pass_through_untouched() {
+        let data: Vec<u8> = (0..64u8).collect();
+        for (tag, bits, format) in [(1, 32, SampleFormat::S32), (3, 64, SampleFormat::F64)] {
+            let (s, packets) =
+                header_and_packets(wav_file(&fmt_chunk(tag, 2, 48_000, bits), &data));
+            assert_eq!((s.codec_id, s.sample_format), (CodecId::Pcm, Some(format)));
+            let frames = 64 / (2 * bits as i64 / 8);
+            assert_eq!(packets.len(), 1);
+            assert_eq!(
+                (packets[0].data.as_slice(), packets[0].duration),
+                (&data[..], frames)
+            );
+        }
+        // 20-bit audio lives in 3-byte containers.
+        let (s, _) = header_and_packets(wav_file(&fmt_chunk(1, 1, 48_000, 20), &[0; 6]));
+        assert_eq!(s.sample_format, Some(SampleFormat::F32));
+    }
+
+    #[test]
+    fn g711_streams_carry_the_bytes_as_coded_packets() {
+        for (tag, codec) in [(6u16, CodecId::PcmAlaw), (7, CodecId::PcmMulaw)] {
+            let data: Vec<u8> = (0..=255u8).collect();
+            let (s, packets) = header_and_packets(wav_file(&fmt_chunk(tag, 2, 8000, 8), &data));
+            assert_eq!((s.codec_id, s.channels, s.sample_rate), (codec, 2, 8000));
+            assert_eq!(s.sample_format, Some(SampleFormat::S16));
+            assert_eq!(packets.len(), 1);
+            assert_eq!(
+                (packets[0].data.as_slice(), packets[0].duration),
+                (&data[..], 128)
+            );
+        }
+    }
+
+    /// An MS or IMA ADPCM `fmt ` chunk with `block` bytes per block and the
+    /// given extension bytes after cbSize.
+    fn adpcm_fmt(tag: u16, channels: u16, block: u16, ext: &[u8]) -> Vec<u8> {
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&tag.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&22_050u32.to_le_bytes());
+        fmt.extend_from_slice(&11_100u32.to_le_bytes());
+        fmt.extend_from_slice(&block.to_le_bytes());
+        fmt.extend_from_slice(&4u16.to_le_bytes());
+        fmt.extend_from_slice(&(ext.len() as u16).to_le_bytes());
+        fmt.extend_from_slice(ext);
+        fmt
+    }
+
+    #[test]
+    fn adpcm_is_one_block_per_packet_with_its_sample_count() {
+        // MS stereo, 512-byte blocks: 2 + (512 - 14) * 2 / 2 = 500 samples.
+        // Two whole blocks and a 100-byte tail: 2 + 86 = 88 samples.
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&500u16.to_le_bytes());
+        ext.extend_from_slice(&7u16.to_le_bytes());
+        for (a, b) in [
+            (256i16, 0i16),
+            (512, -256),
+            (0, 0),
+            (192, 64),
+            (240, 0),
+            (460, -208),
+            (392, -232),
+        ] {
+            ext.extend_from_slice(&a.to_le_bytes());
+            ext.extend_from_slice(&b.to_le_bytes());
+        }
+        let data = vec![0u8; 512 * 2 + 100];
+        let (s, packets) = header_and_packets(wav_file(&adpcm_fmt(2, 2, 512, &ext), &data));
+        assert_eq!(s.codec_id, CodecId::AdpcmMs);
+        assert_eq!(
+            s.extradata, ext,
+            "the coefficient table reaches the decoder"
+        );
+        let sizes: Vec<_> = packets
+            .iter()
+            .map(|p| (p.data.len(), p.duration, p.pts))
+            .collect();
+        assert_eq!(
+            sizes,
+            [
+                (512, 500, Some(0)),
+                (512, 500, Some(500)),
+                (100, 88, Some(1000))
+            ]
+        );
+
+        // IMA mono, 256-byte blocks: 1 + 8 * (252 / 4) = 505 samples.
+        let data = vec![0u8; 256 * 3];
+        let (s, packets) = header_and_packets(wav_file(
+            &adpcm_fmt(0x11, 1, 256, &505u16.to_le_bytes()),
+            &data,
+        ));
+        assert_eq!(s.codec_id, CodecId::AdpcmImaWav);
+        assert!(s.extradata.is_empty());
+        assert_eq!(
+            packets.iter().map(|p| p.duration).collect::<Vec<_>>(),
+            [505, 505, 505]
+        );
+
+        // A block too small for its own headers is refused at the header.
+        let file = wav_file(&adpcm_fmt(0x11, 2, 6, &[]), &[0; 12]);
+        let mut dem = WavDemuxer::new(Box::new(Cursor::new(file)));
+        assert!(dem.read_header().is_err());
+    }
+
+    #[test]
+    fn extensible_resolves_compressed_subformats() {
+        let mut fmt = fmt_chunk(0xFFFE, 1, 8000, 8);
+        fmt.extend_from_slice(&22u16.to_le_bytes());
+        fmt.extend_from_slice(&8u16.to_le_bytes());
+        fmt.extend_from_slice(&4u32.to_le_bytes());
+        fmt.extend_from_slice(&7u16.to_le_bytes()); // SubFormat: µ-law
+        fmt.extend_from_slice(&[0u8; 14]);
+        let (s, _) = header_and_packets(wav_file(&fmt, &[0xFF; 10]));
+        assert_eq!(s.codec_id, CodecId::PcmMulaw);
+    }
+
+    #[test]
+    fn rf64_reads_its_data_size_from_ds64() {
+        // RF64 with a trailing chunk after `data`: the ds64 size must stop the
+        // samples there, where "0xFFFFFFFF = to EOF" would read the trailer
+        // as audio.
+        let pcm_bytes: Vec<u8> = (0..40u8).collect();
+        let mut ds64 = Vec::new();
+        ds64.extend_from_slice(&0u64.to_le_bytes()); // riff size (unused)
+        ds64.extend_from_slice(&(pcm_bytes.len() as u64).to_le_bytes());
+        ds64.extend_from_slice(&10u64.to_le_bytes()); // sample count
+        ds64.extend_from_slice(&0u32.to_le_bytes()); // table length
+        for magic in [b"RF64", b"BW64"] {
+            let mut body = b"WAVE".to_vec();
+            put_chunk(&mut body, b"ds64", &ds64);
+            put_chunk(&mut body, b"fmt ", &fmt_chunk(1, 2, 44_100, 16));
+            body.extend_from_slice(b"data");
+            body.extend_from_slice(&u32::MAX.to_le_bytes());
+            body.extend_from_slice(&pcm_bytes);
+            put_chunk(&mut body, b"LIST", b"trailing metadata!");
+            let mut file = magic.to_vec();
+            file.extend_from_slice(&u32::MAX.to_le_bytes());
+            file.extend_from_slice(&body);
+            assert_eq!(probe_wav(&file), 100);
+            let (_, packets) = header_and_packets(file);
+            let all: Vec<u8> = packets.iter().flat_map(|p| p.data.clone()).collect();
+            assert_eq!(all, pcm_bytes, "{}", String::from_utf8_lossy(magic));
+        }
+    }
+
+    #[test]
+    fn coded_layouts_survive_truncation_and_garbage() {
+        let mut ext = 500u16.to_le_bytes().to_vec();
+        ext.extend_from_slice(&0u16.to_le_bytes());
+        for fmt in [
+            adpcm_fmt(2, 2, 512, &ext),
+            adpcm_fmt(0x11, 1, 256, &505u16.to_le_bytes()),
+            fmt_chunk(6, 1, 8000, 8),
+        ] {
+            let mut x = 0x9E37_79B9_u32;
+            let data: Vec<u8> = (0..1500)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect();
+            let good = wav_file(&fmt, &data);
+            for cut in 0..good.len() {
+                let _ = drive(Box::new(WavDemuxer::new(Box::new(Cursor::new(
+                    good[..cut].to_vec(),
+                )))));
+            }
+        }
     }
 
     /// The prefix-read demuxer must return exactly what the old whole-buffer

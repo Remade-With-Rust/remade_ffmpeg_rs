@@ -1,7 +1,11 @@
 //! MP3 (MPEG-1/2/2.5 Audio Layer III) codec, backed by the pure-Rust
 //! [`rusty_mp3`] decoder + encoder (formerly in-tree here, now a standalone
 //! publishable crate — the same adapter pattern as `rff-codec-h264` over
-//! `rusty_h264`).
+//! `rusty_h264`). The same decoder is registered for MP2 and MP1 (MPEG-1/2
+//! Layers II and I): it decodes whichever layer each frame header names, so a
+//! container that labels an MPEG audio stream with the wrong layer (MP4's
+//! `mp4a` object types 0x69/0x6B, MPEG-TS stream types 0x03/0x04) still
+//! decodes.
 //!
 //! This crate is the thin rff-facing layer: `register()` wires the codec into
 //! the registry, the wrapper structs implement the rff [`Decoder`]/[`Encoder`]
@@ -42,6 +46,23 @@ pub fn register(registry: &mut CodecRegistry) {
         media_type: MediaType::Audio,
         decoder: Some(|| Box::new(Mp3Decoder::default())),
         encoder: Some(|| Box::new(Mp3Encoder::default())),
+    });
+    // Decode only: the frame-syncing decoder handles all three layers.
+    registry.register(Codec {
+        id: CodecId::Mp2,
+        name: "mp2",
+        long_name: "MP2 (MPEG audio layer 2)",
+        media_type: MediaType::Audio,
+        decoder: Some(|| Box::new(Mp3Decoder::default())),
+        encoder: None,
+    });
+    registry.register(Codec {
+        id: CodecId::Mp1,
+        name: "mp1",
+        long_name: "MP1 (MPEG audio layer 1)",
+        media_type: MediaType::Audio,
+        decoder: Some(|| Box::new(Mp3Decoder::default())),
+        encoder: None,
     });
 }
 
@@ -515,5 +536,54 @@ mod tests {
         assert_eq!(codec.id, CodecId::Mp3);
         assert_eq!(codec.media_type, MediaType::Audio);
         assert!(codec.can_decode() && codec.can_encode());
+        for (name, id) in [("mp2", CodecId::Mp2), ("mp1", CodecId::Mp1)] {
+            let codec = reg.by_name(name).expect("registered");
+            assert_eq!(codec.id, id);
+            assert_eq!(codec.media_type, MediaType::Audio);
+            assert!(codec.can_decode() && !codec.can_encode());
+            assert_eq!(CodecId::from_name(name), Some(id));
+            assert_eq!(id.name(), name);
+        }
+    }
+
+    /// One minimal MPEG-1 Layer II frame (192 kbps, 44.1 kHz, stereo): all
+    /// allocations zero, so it decodes to 1152 silent stereo samples.
+    fn silent_mp2_frame() -> Vec<u8> {
+        let mut f = vec![0xFF, 0xFD, 0xA0, 0x04];
+        f.resize(626, 0);
+        f
+    }
+
+    /// The decoder registered under `mp2` (and the `mp3` one, for containers
+    /// that label Layer II as MPEG audio) decodes Layer II packets, one frame
+    /// per packet as a demuxer delivers them.
+    #[test]
+    fn decodes_layer2_packets_under_every_id() {
+        let mut reg = CodecRegistry::new();
+        register(&mut reg);
+        for id in [CodecId::Mp2, CodecId::Mp3, CodecId::Mp1] {
+            let mut dec = reg.find_decoder(id).expect("decoder");
+            let mut samples = 0;
+            let mut drain = |dec: &mut Box<dyn Decoder>| loop {
+                match dec.receive_frame() {
+                    Ok(Frame::Audio(af)) => {
+                        assert_eq!((af.sample_rate, af.channels), (44100, 2));
+                        assert!(af.planes[0].iter().all(|&b| b == 0));
+                        samples += af.samples;
+                    }
+                    Ok(_) => {}
+                    Err(Error::Again | Error::Eof) => break,
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            for _ in 0..4 {
+                dec.send_packet(&Packet::from_data(0, silent_mp2_frame()))
+                    .unwrap();
+                drain(&mut dec);
+            }
+            dec.flush();
+            drain(&mut dec);
+            assert_eq!(samples, 4 * 1152, "{id}");
+        }
     }
 }

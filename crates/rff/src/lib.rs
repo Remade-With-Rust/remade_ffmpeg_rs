@@ -61,6 +61,7 @@ fn register_builtin_codecs(codecs: &mut CodecRegistry) {
     rff_codec_gif::register(codecs);
     rff_codec_webp::register(codecs);
     rff_codec_pcm::register(codecs);
+    rff_codec_alac::register(codecs);
     rff_codec_vorbis::register(codecs);
     rff_codec_flac::register(codecs);
     rff_codec_jxl::register(codecs);
@@ -85,6 +86,8 @@ fn register_builtin_formats(formats: &mut FormatRegistry) {
     rff_format_gif::register(formats);
     rff_format_webp::register(formats);
     rff_format_wav::register(formats);
+    rff_format_aiff::register(formats);
+    rff_format_caf::register(formats);
     rff_format_y4m::register(formats);
     rff_format_ivf::register(formats);
     // AV2F is EXPERIMENTAL: its four-character codes are chosen by us, not

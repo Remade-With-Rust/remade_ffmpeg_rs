@@ -1,6 +1,6 @@
 [package]
 name = "rff-codec-pcm"
-description = "Remade FFmpeg (Rust): linear PCM audio codec (s16le / f32le)."
+description = "Remade FFmpeg (Rust): linear PCM audio codec (s16le / f32le), plus G.711 A-law/µ-law and MS/IMA ADPCM decoders."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
