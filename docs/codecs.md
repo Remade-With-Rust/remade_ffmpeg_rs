@@ -1,7 +1,7 @@
 # Codecs and formats
 
 The full per-codec and per-container detail behind the summary table in the
-[README](../README.md): what each backend covers, how it was verified, and how
+[README](../readme.md): what each backend covers, how it was verified, and how
 it was measured. Every codec backend is 100% Rust (no C/C++ FFI) and
 permissively licensed; container (de)muxers are our own code.
 
