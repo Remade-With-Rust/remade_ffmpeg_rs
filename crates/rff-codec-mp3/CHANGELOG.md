@@ -4,6 +4,16 @@ All notable changes to this crate. Security-relevant changes are listed first in
 each release, under **Security**. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-mp3-v1.0.16...rff-codec-mp3-v1.1.0) - 2026-11-19
+
+### Added
+
+- *(rff)* MP2 / MP1 codec ids, decoders and .mp2/.mp1/.mpa demuxing (#125 phase D)
+
+### Other
+
+- *(supply-chain)* import the 0.6.1 audits for the rff-codec-mp3 vet store
+
 ## [1.0.16](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-mp3-v1.0.15...rff-codec-mp3-v1.0.16) - 2026-11-18
 
 ### Other

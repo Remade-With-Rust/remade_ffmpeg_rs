@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.16](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-opus-v0.3.15...rff-codec-opus-v0.3.16) - 2026-11-19
+
+### Added
+
+- *(opus)* decode multichannel Opus, mapping families 1 and 255
+
 ## [0.3.15](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-opus-v0.3.14...rff-codec-opus-v0.3.15) - 2026-11-18
 
 ### Other

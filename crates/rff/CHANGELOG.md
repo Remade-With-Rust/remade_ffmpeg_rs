@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/remade-ffmpeg-v0.6.1...remade-ffmpeg-v0.6.2) - 2026-11-19
+
+### Added
+
+- *(opus)* decode multichannel Opus, mapping families 1 and 255
+- *(audio)* ALAC decoder and CAF demuxer, rff-codec-alac + rff-format-caf (#125 phase C)
+- *(format)* AIFF / AIFF-C demuxer, rff-format-aiff (#125 phase B)
+
+### Other
+
+- keep each file's line endings as on main
+
 ## [0.6.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/remade-ffmpeg-v0.6.0...remade-ffmpeg-v0.6.1) - 2026-11-18
 
 ### Added

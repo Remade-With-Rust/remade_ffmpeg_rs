@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mp4-v0.6.1...rff-format-mp4-v0.6.2) - 2026-11-19
+
+### Fixed
+
+- *(mp4)* a cut-short file reads its samples, then ends (#125 phase E)
+
+### Other
+
+- keep each file's line endings as on main
+
 ## [0.6.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mp4-v0.6.0...rff-format-mp4-v0.6.1) - 2026-11-18
 
 ### Added

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-core-v0.6.1...rff-core-v0.6.2) - 2026-11-19
+
+### Added
+
+- *(rff)* MP2 / MP1 codec ids, decoders and .mp2/.mp1/.mpa demuxing (#125 phase D)
+- *(audio)* G.711 and ADPCM decoders, extended WAV, FLAC in Ogg (#125 phase A)
+
 ## [0.5.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-core-v0.4.8...rff-core-v0.5.0) - 2026-11-14
 
 ### Added

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.17](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-webp-v0.2.16...rff-codec-webp-v0.2.17) - 2026-11-19
+
+### Other
+
+- updated the following local packages: rff-core, rff-codec
+
 ## [0.2.16](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-webp-v0.2.15...rff-codec-webp-v0.2.16) - 2026-11-18
 
 ### Other

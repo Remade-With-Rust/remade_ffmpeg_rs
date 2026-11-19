@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-flac-v0.6.1...rff-codec-flac-v0.6.2) - 2026-11-19
+
+### Fixed
+
+- *(flac)* a damaged frame no longer takes the frames after it with it (#125 phase E)
+
+### Other
+
+- keep each file's line endings as on main
+
 ## [0.4.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-flac-v0.4.1...rff-codec-flac-v0.4.2) - 2026-10-24
 
 ### Other
