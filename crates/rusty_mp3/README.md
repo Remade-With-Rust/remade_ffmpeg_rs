@@ -7,10 +7,13 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/LICENSE)
 
 A complete MP3 (MPEG-1, MPEG-2 and MPEG-2.5 Audio Layer III) **decoder and
-encoder** in pure Rust. No C, no FFI, and no runtime dependencies.
+encoder** in pure Rust, which also decodes MP1 and MP2 (MPEG-1/2 Audio Layers I
+and II). No C, no FFI, and no runtime dependencies.
 
 - **Conformant.** The decoder passes all 16 ISO 11172-4 / 13818-4 Layer III
   conformance vectors and matches FFmpeg bit for bit on a 678-stream corpus.
+  The Layer I and II decoder matches the ISO 11172-4 Layer I/II vectors to
+  within 1 LSB.
 - **Complete.** Encoding covers CBR (8–320 kbps) and VBR, mono, stereo and
   joint stereo, a psychoacoustic model, transient block switching, per-band
   noise shaping, the bit reservoir, and gapless LAME-style Info/Xing tags.
@@ -188,8 +191,19 @@ is treated as a bug.
   releases when encoding quality improves; such changes are noted in the
   [changelog](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rusty_mp3/CHANGELOG.md).
 
-**Not supported:** free-format bitrate streams (the decoder rejects them) and
-MPEG Layers I and II. The encoder does not produce intensity stereo or mixed
+**Layers I and II.** `Mp3Decoder` decodes MP1 and MP2 streams too, frame by
+frame as each header says: MPEG-1 and the MPEG-2 low sampling rates (16, 22.05
+and 24 kHz), mono, stereo, dual channel and joint (intensity) stereo,
+CRC-protected frames (the CRC is skipped, not checked) and free format. The
+requantization follows FFmpeg's float decoder, and the polyphase synthesis is
+the Layer III decoder's. The 15 ISO 11172-4 Layer I/II vectors, an MPEG-2
+24 kHz stream and a free-format stream all decode within 1 LSB of their
+reference output (`tests/layer12.rs`). A Layer I/II frame found anywhere but straight after the
+previous frame is only decoded once the next two headers of its stream
+confirm it, so garbage and false syncs do not become frames.
+
+**Not supported:** free-format Layer III streams (the decoder rejects them) and
+Layer I/II encoding. The encoder does not produce intensity stereo or mixed
 blocks. It uses the bit reservoir for MPEG-1 CBR up to 256 kbps, and a fixed
 per-frame budget elsewhere.
 

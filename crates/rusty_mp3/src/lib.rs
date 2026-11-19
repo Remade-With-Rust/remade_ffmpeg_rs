@@ -1,5 +1,6 @@
 //! `rusty_mp3` — an in-house, pure-Rust MP3 (MPEG-1/2/2.5 Audio Layer III)
-//! decoder **and** encoder. Zero dependencies, no C, no FFI.
+//! decoder **and** encoder, which also decodes MPEG-1/2 Layers I and II (MP1 /
+//! MP2). Zero dependencies, no C, no FFI.
 //!
 //! Why in-house: the robust Rust MP3 crate (Symphonia) is MPL-2.0, which trips
 //! a no-copyleft license gate; the permissive one (puremp3) is incomplete, and
@@ -15,6 +16,8 @@
 //!   stereo → antialias → IMDCT → synthesis filterbank → PCM
 //! * [`encode`]: analysis filterbank → MDCT → psychoacoustic model → two-loop
 //!   quantizer → Huffman → bitstream
+//! * [`layer12`]: Layer I / Layer II decode (allocation → scalefactors →
+//!   grouped samples → requantize → the same synthesis filterbank)
 //!
 //! ## Stream API
 //!
@@ -33,6 +36,7 @@ pub mod encode;
 pub mod error;
 pub mod frame;
 pub mod header;
+pub mod layer12;
 pub mod tables;
 
 /// MP3 encoder experiment harness — brick tracking, corpus, metrics, variant
@@ -71,10 +75,49 @@ pub struct DecodedAudio {
 #[derive(Default)]
 pub struct Mp3Decoder {
     state: Mp3Decode,
+    /// Layer I / II state (the synthesis FIFO), used when a frame header names
+    /// one of those layers.
+    layer12: layer12::Layer12Decode,
     /// Accumulated bytes awaiting frame-sync (packets may split/join frames).
     buf: Vec<u8>,
     queue: VecDeque<DecodedAudio>,
     eof: bool,
+    /// No byte has been skipped since the last frame ended: the next header
+    /// starts exactly where the stream says it should. A Layer I/II header found
+    /// any other way (the first one, or after a resync) must be confirmed.
+    contiguous: bool,
+    /// Layer of the last frame taken (0 = none yet).
+    last_layer: u8,
+    /// Free-format Layer I/II frame size without padding, once measured.
+    free_size: Option<usize>,
+}
+
+/// What the Layer I/II syncer decided at one candidate header.
+enum Step {
+    /// A frame of this many bytes was decoded.
+    Took(usize),
+    /// Not a frame: advance one byte.
+    Skip,
+    /// Undecidable until more input arrives.
+    Wait,
+}
+
+/// Bytes that can legitimately follow the last frame of a stream: a tag.
+fn is_tag_start(b: &[u8]) -> bool {
+    b.starts_with(b"TAG") || b.starts_with(b"APE") || b.starts_with(b"ID3") || b.starts_with(b"LYR")
+}
+
+/// The Layer I/II header `b` starts, if it can be the next frame of `h`'s
+/// stream: [`same_stream`](layer12::Layer12Header::same_stream), and the same
+/// CRC protection and channel count.
+fn next_in_stream(h: &layer12::Layer12Header, b: &[u8]) -> Option<layer12::Layer12Header> {
+    let n = layer12::Layer12Header::parse(*b.first_chunk::<4>()?).ok()?;
+    (h.same_stream(&n) && h.crc_protected == n.crc_protected && h.channels() == n.channels())
+        .then_some(n)
+}
+
+fn continues_stream(h: &layer12::Layer12Header, b: &[u8]) -> bool {
+    next_in_stream(h, b).is_some()
 }
 
 /// `MP3_CENSUS=1`: print the kernel-reach census when a decoder is dropped, so the
@@ -119,9 +162,177 @@ impl Mp3Decoder {
     }
 
     /// Signal end of input: once the queue drains, [`next_frame`](Mp3Decoder::next_frame)
-    /// returns `Err(Eof)` instead of `Err(Again)`.
+    /// returns `Err(Eof)` instead of `Err(Again)`. A Layer I/II frame still
+    /// waiting for the header after it to confirm it is decoded now.
     pub fn flush(&mut self) {
         self.eof = true;
+        // Idempotent for Layer III: the buffer ends in a partial frame (or fewer
+        // than 4 bytes), and re-scanning it stops at the same place.
+        self.parse_frames();
+    }
+
+    /// Size of a free-format Layer I/II frame at `pos`: the distance to the
+    /// next free-format header of the same stream, measured once and reused.
+    fn free_format_size(&self, pos: usize, h: &layer12::Layer12Header) -> Option<usize> {
+        // The measured size, unless no header (of any Layer I/II stream) or tag
+        // follows it -- the free-format rate changed, as in a concatenation:
+        // then measure again.
+        if let Some(unpadded) = self.free_size {
+            let size = unpadded + h.padding_bytes();
+            match self.buf.get(pos + size..) {
+                Some(next) if next.len() >= 4 => {
+                    let header = next
+                        .first_chunk::<4>()
+                        .is_some_and(|&nb| layer12::Layer12Header::parse(nb).is_ok());
+                    if header || is_tag_start(next) {
+                        return Some(size);
+                    }
+                }
+                _ => return Some(size),
+            }
+        }
+        let lo = pos + h.min_free_format_size();
+        let hi = (pos + layer12::MAX_FREE_FORMAT_FRAME).min(self.buf.len().saturating_sub(4));
+        let buf = &self.buf;
+        let found = (lo..=hi).find(|&i| buf[i] == 0xFF && continues_stream(h, &buf[i..]))?;
+        // Remembered only once a frame of this size is taken (`layer12_step`):
+        // a size measured from garbage must not stick.
+        Some(found - pos)
+    }
+
+    /// Whether the Layer I/II frame `h` at `pos..end` is confirmed by what
+    /// follows it: the next two headers of its stream, each where the one
+    /// before says it ends -- or, in their place, a trailing tag or the end of
+    /// the input. `None`: wait for more input. `strict` (after Layer III
+    /// frames) accepts only headers.
+    ///
+    /// A confirming frame cut off by the end of the input confirms nothing: in
+    /// sync-heavy garbage near the end, a single matching header is a ~1%
+    /// coincidence, so it must not be enough.
+    fn confirm(&self, h: &layer12::Layer12Header, pos: usize, end: usize, strict: bool) -> Option<bool> {
+        let (mut prev, mut prev_size, mut at) = (h.clone(), end - pos, end);
+        // A free-format size was found BY matching the first header after it,
+        // so that one proves nothing: look one further.
+        let levels = if h.is_free_format() { 3 } else { 2 };
+        for depth in 0..levels {
+            let Some(next) = self.buf.get(at..) else {
+                return if self.eof { Some(false) } else { None };
+            };
+            if next.len() < 4 {
+                if !self.eof {
+                    return None;
+                }
+                // At the end of input an unconfirmed frame must end exactly
+                // there, not a few stray bytes short of it.
+                return Some(depth > 0 || (!strict && next.is_empty()));
+            }
+            if !strict && is_tag_start(next) {
+                return Some(true);
+            }
+            let Some(n) = next_in_stream(&prev, next) else {
+                // The last free-format level also takes the start of another
+                // Layer I/II stream (a rate switch, as in a concatenation).
+                let other = next
+                    .first_chunk::<4>()
+                    .is_some_and(|&nb| layer12::Layer12Header::parse(nb).is_ok());
+                return Some(depth == 2 && other);
+            };
+            // A free-format stream keeps its size; only the padding varies.
+            let size = n
+                .frame_size()
+                .unwrap_or_else(|| prev_size - prev.padding_bytes() + n.padding_bytes());
+            at += size;
+            prev = n;
+            prev_size = size;
+        }
+        Some(true)
+    }
+
+    /// [`confirm`](Self::confirm) for a Layer III header met inside a Layer
+    /// I/II stream: the next two Layer III headers of the same version and
+    /// rate, where each frame says the next begins.
+    fn layer3_confirmed(&self, h: &FrameHeader, end: usize) -> Option<bool> {
+        let mut at = end;
+        for _ in 0..2 {
+            let Some(next) = self.buf.get(at..).filter(|b| b.len() >= 4) else {
+                return if self.eof { Some(false) } else { None };
+            };
+            let Some(n) = next
+                .first_chunk::<4>()
+                .and_then(|&nb| FrameHeader::parse(nb).ok())
+                .filter(|n| n.version == h.version && n.sample_rate == h.sample_rate)
+            else {
+                return Some(false);
+            };
+            at += n.frame_size().max(4);
+        }
+        Some(true)
+    }
+
+    /// The Layer I/II syncer at a candidate header at `pos`.
+    ///
+    /// Layers I and II have no bit reservoir, so a false sync costs only its
+    /// own frame -- but it also swallows the bytes it claims, which may hold the
+    /// real next frame. So a header is taken on its own only when it sits
+    /// exactly where the previous frame ended; otherwise (the first frame, or
+    /// after garbage) it must be confirmed by the two headers after it (see
+    /// [`confirm`](Self::confirm)): one matching header is a ~1% coincidence in
+    /// sync-heavy garbage, two in a row are not.
+    fn layer12_step(&mut self, pos: usize) -> Step {
+        let hb = [
+            self.buf[pos],
+            self.buf[pos + 1],
+            self.buf[pos + 2],
+            self.buf[pos + 3],
+        ];
+        let Ok(h) = layer12::Layer12Header::parse(hb) else {
+            return Step::Skip;
+        };
+        let size = match h.frame_size() {
+            Some(s) => s,
+            None => match self.free_format_size(pos, &h) {
+                Some(s) => s,
+                None if self.eof
+                    || self.buf.len() - pos > layer12::MAX_FREE_FORMAT_FRAME + 4 =>
+                {
+                    return Step::Skip
+                }
+                None => return Step::Wait,
+            },
+        };
+        let min = 4 + if h.crc_protected { 2 } else { 0 };
+        if size <= min {
+            return Step::Skip;
+        }
+        let end = pos + size;
+        if end > self.buf.len() {
+            return if self.eof { Step::Skip } else { Step::Wait };
+        }
+        // After Layer III frames, a Layer I/II header must prove itself by the
+        // next header: one inside Layer III garbage must not swallow real frames.
+        let strict = self.last_layer == 3;
+        if strict || !self.contiguous {
+            match self.confirm(&h, pos, end, strict) {
+                None => return Step::Wait,
+                Some(false) => return Step::Skip,
+                Some(true) => {}
+            }
+        }
+        if h.is_free_format() {
+            self.free_size = Some(size - h.padding_bytes());
+        }
+        let pcm = self.layer12.decode_frame(&h, &self.buf[pos..end]);
+        self.queue.push_back(DecodedAudio {
+            sample_rate: h.sample_rate,
+            channels: if h.channels() == 2 { 2 } else { 1 },
+            samples: pcm,
+        });
+        self.contiguous = true;
+        self.last_layer = match h.layer {
+            layer12::Layer::I => 1,
+            layer12::Layer::II => 2,
+        };
+        Step::Took(size)
     }
 
     /// Frame-sync the buffer: for each complete frame, split header / side-info /
@@ -133,6 +344,21 @@ impl Mp3Decoder {
             // Sync = 11 set bits: 0xFF then top 3 bits of the next byte.
             if self.buf[pos] != 0xFF || self.buf[pos + 1] & 0xE0 != 0xE0 {
                 pos += 1;
+                self.contiguous = false;
+                continue;
+            }
+            // Layer field 0b11 / 0b10 (bit 2 of the second byte set): Layer I
+            // or II, which have their own syncer and decoder. Layer III (0b01)
+            // and the reserved layer fall through to the path below unchanged.
+            if self.buf[pos + 1] & 0x04 != 0 {
+                match self.layer12_step(pos) {
+                    Step::Took(n) => pos += n,
+                    Step::Skip => {
+                        pos += 1;
+                        self.contiguous = false;
+                    }
+                    Step::Wait => break,
+                }
                 continue;
             }
             let hb = [
@@ -143,15 +369,31 @@ impl Mp3Decoder {
             ];
             let Ok(header) = FrameHeader::parse(hb) else {
                 pos += 1;
+                self.contiguous = false;
                 continue;
             };
             let frame_size = header.frame_size();
             if frame_size < 4 {
                 pos += 1;
+                self.contiguous = false;
                 continue;
             }
             if pos + frame_size > self.buf.len() {
                 break; // incomplete frame — wait for more data
+            }
+            // Inside a Layer I/II stream (only there: a Layer III stream never
+            // sets `last_layer` to 1 or 2), a Layer III header is garbage until
+            // the two headers after it confirm it.
+            if matches!(self.last_layer, 1 | 2) {
+                match self.layer3_confirmed(&header, pos + frame_size) {
+                    None => break,
+                    Some(false) => {
+                        pos += 1;
+                        self.contiguous = false;
+                        continue;
+                    }
+                    Some(true) => {}
+                }
             }
 
             let crc = if header.crc_protected { 2 } else { 0 };
@@ -160,6 +402,7 @@ impl Mp3Decoder {
             let main_start = si_start + si_len;
             if main_start > pos + frame_size {
                 pos += 1;
+                self.contiguous = false;
                 continue;
             }
             // The decoder reads both parts straight out of the sync buffer (it
@@ -176,9 +419,48 @@ impl Mp3Decoder {
                 });
             }
             pos += frame_size;
+            self.contiguous = true;
+            self.last_layer = 3;
         }
         self.buf.drain(0..pos);
     }
+}
+
+/// Whether the first frame [`Mp3Decoder`] would take from `bytes` is a Layer I
+/// or II frame (by the same rules: a Layer III header is taken on sight, a
+/// Layer I/II header when the next header of its stream, a tag, or the end of
+/// the input follows it).
+fn starts_with_layer12(bytes: &[u8]) -> bool {
+    let mut pos = 0;
+    while pos + 4 <= bytes.len() {
+        if bytes[pos] != 0xFF || bytes[pos + 1] & 0xE0 != 0xE0 {
+            pos += 1;
+            continue;
+        }
+        let hb = [bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]];
+        if bytes[pos + 1] & 0x04 == 0 {
+            if FrameHeader::parse(hb).is_ok_and(|h| h.frame_size() >= 4) {
+                return false;
+            }
+        } else if let Ok(h) = layer12::Layer12Header::parse(hb) {
+            // Free format is measured by the streaming syncer; a free-format
+            // Layer I/II header found first sends the stream there.
+            match h.frame_size() {
+                None => return true,
+                Some(size) => {
+                    let next = bytes.get(pos + size..).unwrap_or(&[]);
+                    if pos + size == bytes.len()
+                        || continues_stream(&h, next)
+                        || is_tag_start(next)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        pos += 1;
+    }
+    false
 }
 
 /// Decode a complete MP3 stream with a **two-stage pipeline** across two threads.
@@ -210,6 +492,20 @@ pub fn decode_pipelined(bytes: &[u8]) -> Vec<DecodedAudio> {
     // is no thread to give it, degrade instead of failing.
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     {
+        let mut dec = Mp3Decoder::new();
+        dec.push(bytes);
+        dec.flush();
+        let mut out = Vec::new();
+        while let Ok(f) = dec.next_frame() {
+            out.push(f);
+        }
+        return out;
+    }
+
+    // Layer I/II streams have no entropy/transform split to pipeline (and no
+    // reservoir to serialise): they take the streaming decoder.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    if starts_with_layer12(bytes) {
         let mut dec = Mp3Decoder::new();
         dec.push(bytes);
         dec.flush();
