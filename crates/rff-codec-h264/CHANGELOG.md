@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.17](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-h264-v0.3.16...rff-codec-h264-v0.3.17) - 2026-11-19
+
+### Other
+
+- updated the following local packages: rff-core, rff-codec
+
 ## [0.3.16](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-h264-v0.3.15...rff-codec-h264-v0.3.16) - 2026-11-19
 
 ### Other
