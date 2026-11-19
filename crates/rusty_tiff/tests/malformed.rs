@@ -1,0 +1,333 @@
+//! Malformed input: every case must return `Err` (or a valid image), never
+//! panic, never spin, never allocate past the limits.
+#![allow(clippy::pedantic)] // test harness code: oracle plumbing, not library API
+
+mod common;
+
+use std::io::Cursor;
+use std::time::{Duration, Instant};
+
+use common::Rng;
+use rusty_tiff::encoder::{colortype, Compression, Predictor, TiffEncoder};
+use rusty_tiff::{ccitt, Decoder, Limits, TiffError};
+
+fn r16(b: &[u8], o: usize) -> usize {
+    usize::from(u16::from_le_bytes([b[o], b[o + 1]]))
+}
+fn r32(b: &[u8], o: usize) -> usize {
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as usize
+}
+fn w32(b: &mut [u8], o: usize, v: u32) {
+    b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Offsets of each IFD in a little-endian classic file.
+fn ifds(b: &[u8]) -> Vec<usize> {
+    let mut v = Vec::new();
+    let mut o = r32(b, 4);
+    while o != 0 && v.len() < 100 {
+        v.push(o);
+        o = r32(b, o + 2 + r16(b, o) * 12);
+    }
+    v
+}
+
+/// Position of the 4-byte value/offset field of `tag` in the IFD at `ifd`.
+fn field_pos(b: &[u8], ifd: usize, tag: u16) -> usize {
+    let n = r16(b, ifd);
+    (0..n)
+        .map(|k| ifd + 2 + k * 12)
+        .find(|&e| r16(b, e) == usize::from(tag))
+        .map(|e| e + 8)
+        .expect("tag present")
+}
+
+fn two_page() -> Vec<u8> {
+    let mut f = Cursor::new(Vec::new());
+    let mut e = TiffEncoder::new(&mut f).unwrap();
+    e.write_image::<colortype::Gray8>(8, 8, &[7u8; 64]).unwrap();
+    e.write_image::<colortype::Gray8>(4, 4, &[9u8; 16]).unwrap();
+    f.into_inner()
+}
+
+/// Decode everything reachable: all pages, all tags, EXIF/SubIFDs.
+fn decode_all(file: &[u8], limits: Limits) -> Result<usize, TiffError> {
+    let mut d = Decoder::new(Cursor::new(file))?.with_limits(limits);
+    let mut pages = 0;
+    for _ in 0..64 {
+        let _ = d.tags();
+        let _ = d.icc_profile();
+        let _ = d.exif_ifd();
+        if let Ok(subs) = d.sub_ifds() {
+            let _ = subs.len();
+        }
+        let _ = d.colortype();
+        d.read_image()?;
+        pages += 1;
+        if !d.more_images() {
+            break;
+        }
+        d.next_image()?;
+    }
+    Ok(pages)
+}
+
+#[test]
+fn ifd_self_loop_errors() {
+    let mut b = two_page();
+    let first = ifds(&b)[0];
+    let next_pos = first + 2 + r16(&b, first) * 12;
+    w32(&mut b, next_pos, first as u32);
+    let mut d = Decoder::new(Cursor::new(&b)).unwrap();
+    assert!(d.more_images());
+    match d.next_image() {
+        Err(TiffError::Format(m)) => assert!(m.contains("loop"), "{m}"),
+        r => panic!("self-loop not detected: {r:?}"),
+    }
+}
+
+#[test]
+fn ifd_two_cycle_errors() {
+    let mut b = two_page();
+    let v = ifds(&b);
+    let second = v[1];
+    let next_pos = second + 2 + r16(&b, second) * 12;
+    w32(&mut b, next_pos, v[0] as u32);
+    let mut d = Decoder::new(Cursor::new(&b)).unwrap();
+    d.next_image().unwrap();
+    assert!(matches!(d.next_image(), Err(TiffError::Format(_))));
+    // seek_to_image restarts the walk: the same chain is walkable again.
+    d.seek_to_image(1).unwrap();
+    assert_eq!(d.dimensions().unwrap(), (4, 4));
+}
+
+#[test]
+fn offsets_past_eof_error() {
+    let mut b = two_page();
+    let first = ifds(&b)[0];
+    let p = field_pos(&b, first, 273);
+    w32(&mut b, p, 0x7FFF_FFF0);
+    let mut d = Decoder::new(Cursor::new(&b)).unwrap();
+    assert!(matches!(d.read_image(), Err(TiffError::Format(_))));
+    // First IFD offset past EOF.
+    let mut b = two_page();
+    w32(&mut b, 4, 0xFFFF_FF00);
+    assert!(Decoder::new(Cursor::new(&b)).is_err());
+}
+
+#[test]
+fn absurd_dimensions_error_before_allocating() {
+    let mut b = two_page();
+    let first = ifds(&b)[0];
+    // ImageWidth/ImageLength/RowsPerStrip are SHORT here; retype as LONG 2^31
+    // (one strip, so the layout is consistent and only the size is absurd).
+    for tag in [256u16, 257, 278] {
+        let p = field_pos(&b, first, tag);
+        b[p - 6..p - 4].copy_from_slice(&4u16.to_le_bytes());
+        w32(&mut b, p, 1 << 31);
+    }
+    let t = Instant::now();
+    let mut d = Decoder::new(Cursor::new(&b)).unwrap();
+    assert_eq!(d.dimensions().unwrap(), (1 << 31, 1 << 31));
+    assert!(matches!(d.read_image(), Err(TiffError::Limits(_))));
+    // Even with no limits, a 2^62-byte buffer is a recoverable error.
+    let mut d = Decoder::new(Cursor::new(&b))
+        .unwrap()
+        .with_limits(Limits::unlimited());
+    assert!(d.read_image().is_err());
+    assert!(t.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn lying_strip_byte_counts() {
+    // Too large: clamped to EOF, data still decodes.
+    let mut b = two_page();
+    let first = ifds(&b)[0];
+    let p = field_pos(&b, first, 279);
+    w32(&mut b, p, 0xFFFF_0000);
+    let mut d = Decoder::new(Cursor::new(&b)).unwrap();
+    assert_eq!(
+        d.read_image().unwrap(),
+        rusty_tiff::DecodingResult::U8(vec![7; 64])
+    );
+    // Too small: short strip is an error.
+    let mut b = two_page();
+    let p = field_pos(&b, first, 279);
+    w32(&mut b, p, 10);
+    let mut d = Decoder::new(Cursor::new(&b)).unwrap();
+    assert!(matches!(d.read_image(), Err(TiffError::Format(_))));
+}
+
+#[test]
+fn bigtiff_lying_entry_count() {
+    let mut f = Cursor::new(Vec::new());
+    TiffEncoder::new_big(&mut f)
+        .unwrap()
+        .write_image::<colortype::Gray8>(4, 4, &[1u8; 16])
+        .unwrap();
+    let mut b = f.into_inner();
+    let ifd = u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize;
+    b[ifd..ifd + 8].copy_from_slice(&(u64::MAX / 3).to_le_bytes());
+    assert!(Decoder::new(Cursor::new(&b)).is_err());
+}
+
+fn lzw_file(w: u32, h: u32) -> Vec<u8> {
+    let mut f = Cursor::new(Vec::new());
+    let px: Vec<u8> = (0..w * h * 3).map(|i| (i % 251) as u8).collect();
+    TiffEncoder::new(&mut f)
+        .unwrap()
+        .with_compression(Compression::Lzw)
+        .write_image::<colortype::RGB8>(w, h, &px)
+        .unwrap();
+    f.into_inner()
+}
+
+#[test]
+fn lzw_garbage_errors() {
+    let b = lzw_file(64, 64);
+    let first = ifds(&b)[0];
+    let off = r32(&b, field_pos(&b, first, 273));
+    let mut r = Rng(5);
+    for trial in 0..200 {
+        let mut g = b.clone();
+        let n = 20 + trial;
+        let end = (off + n).min(g.len());
+        for x in &mut g[off..end] {
+            *x = r.next() as u8;
+        }
+        let _ = decode_all(&g, Limits::default());
+    }
+}
+
+/// Seed files covering every decode path: compressions, predictors, tiles,
+/// planar, sub-byte, float, CCITT, BigTIFF.
+fn seeds() -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let px8: Vec<u8> = (0..33 * 21 * 4).map(|i| (i * 13 % 256) as u8).collect();
+    let px16: Vec<u16> = (0..33 * 21 * 3).map(|i| (i * 977) as u16).collect();
+    let pxf: Vec<f32> = (0..33 * 21).map(|i| i as f32 * 0.5).collect();
+    for comp in [
+        Compression::None,
+        Compression::Lzw,
+        Compression::deflate(),
+        Compression::PackBits,
+    ] {
+        let mut f = Cursor::new(Vec::new());
+        {
+            let mut e = TiffEncoder::new(&mut f).unwrap().with_compression(comp);
+            let mut i = e
+                .new_image::<colortype::RGBA8>(33, 21)
+                .unwrap()
+                .with_predictor(Predictor::Horizontal);
+            i.tiles(16, 16);
+            i.write_data(&px8).unwrap();
+            let mut i = e.new_image::<colortype::RGB16>(33, 21).unwrap();
+            i.planar(true);
+            i.rows_per_strip(4);
+            i.write_data(&px16).unwrap();
+            e.new_image::<colortype::Gray32Float>(33, 21)
+                .unwrap()
+                .with_predictor(Predictor::FloatingPoint)
+                .write_data(&pxf)
+                .unwrap();
+            let bits: Vec<u8> = (0..5 * 21).map(|i| (i * 37) as u8).collect();
+            e.write_image::<colortype::Gray1>(33, 21, &bits).unwrap();
+        }
+        out.push(f.into_inner());
+    }
+    for comp in [Compression::Fax3, Compression::Fax4] {
+        let mut f = Cursor::new(Vec::new());
+        let bits: Vec<u8> = (0..5 * 21)
+            .map(|i| if i % 3 == 0 { 0xF0 } else { 0 })
+            .collect();
+        TiffEncoder::new(&mut f)
+            .unwrap()
+            .with_compression(comp)
+            .write_image::<colortype::Gray1>(33, 21, &bits)
+            .unwrap();
+        out.push(f.into_inner());
+    }
+    let mut f = Cursor::new(Vec::new());
+    TiffEncoder::new_big(&mut f)
+        .unwrap()
+        .with_compression(Compression::Lzw)
+        .write_image::<colortype::CMYK8>(33, 21, &px8[..33 * 21 * 4])
+        .unwrap();
+    out.push(f.into_inner());
+    out
+}
+
+#[test]
+fn truncations_never_panic() {
+    let mut n = 0;
+    let mut worst = Duration::ZERO;
+    for s in seeds() {
+        let step = (s.len() / 400).max(1);
+        for len in (0..s.len()).step_by(step) {
+            let t = Instant::now();
+            let _ = decode_all(&s[..len], Limits::default());
+            worst = worst.max(t.elapsed());
+            n += 1;
+        }
+    }
+    println!("truncation: {n} truncated files, slowest decode {worst:?}");
+    assert!(worst < Duration::from_secs(2));
+}
+
+#[test]
+fn mutation_fuzz_never_panics() {
+    let seeds = seeds();
+    let limits = {
+        let mut l = Limits::default();
+        l.decoding_buffer_size = 16 << 20;
+        l.intermediate_buffer_size = 16 << 20;
+        l.ifd_value_size = 1 << 20;
+        l
+    };
+    let mut r = Rng(0xC0FFEE);
+    let iterations = 20_000;
+    let mut ok = 0;
+    let mut worst = Duration::ZERO;
+    let start = Instant::now();
+    for it in 0..iterations {
+        let s = &seeds[it % seeds.len()];
+        let mut m = s.clone();
+        let flips = 1 + (r.next() % 8) as usize;
+        for _ in 0..flips {
+            let pos = (r.next() as usize) % m.len();
+            match r.next() % 4 {
+                0 => m[pos] ^= 1 << (r.next() % 8),
+                1 => m[pos] = r.next() as u8,
+                2 => m[pos] = 0xFF,
+                _ => m[pos] = 0,
+            }
+        }
+        if r.next() % 8 == 0 {
+            let cut = (r.next() as usize) % m.len();
+            m.truncate(cut);
+        }
+        let t = Instant::now();
+        if decode_all(&m, limits.clone()).is_ok() {
+            ok += 1;
+        }
+        worst = worst.max(t.elapsed());
+    }
+    println!(
+        "mutation fuzz: {iterations} mutated files ({ok} still decoded), no panic, \
+         slowest {worst:?}, total {:?}",
+        start.elapsed()
+    );
+    assert!(worst < Duration::from_secs(2));
+}
+
+#[test]
+fn ccitt_garbage_with_huge_columns_is_bounded() {
+    let mut r = Rng(77);
+    for _ in 0..500 {
+        let data: Vec<u8> = (0..64).map(|_| r.next() as u8).collect();
+        let mut o = ccitt::Options::new(ccitt::Coding::Group4, 1 << 20);
+        o.max_output_bytes = 1 << 20;
+        let _ = ccitt::decode(&data, &o);
+        let _ = ccitt::decode_g4(&data, 1 << 20, 1 << 20, &o);
+    }
+}
