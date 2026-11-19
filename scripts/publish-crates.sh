@@ -41,7 +41,7 @@ CRATES=(
   rff-codec-pcm rff-codec-png rff-codec-rawvideo rff-codec-vorbis
   rff-codec-vp9 rff-codec-webp
   # wave 2 — leaf containers
-  rff-format-avi rff-format-avif rff-format-flac rff-format-flv rff-format-gif
+  rff-format-aiff rff-format-avi rff-format-avif rff-format-flac rff-format-flv rff-format-gif
   rff-format-ivf rff-format-jpeg rff-format-jxl rff-format-mkv rff-format-mp3
   rff-format-mp4 rff-format-ogg rff-format-png rff-format-srt rff-format-ts
   rff-format-wav rff-format-webp rff-format-webvtt rff-format-y4m

@@ -85,6 +85,7 @@ fn register_builtin_formats(formats: &mut FormatRegistry) {
     rff_format_gif::register(formats);
     rff_format_webp::register(formats);
     rff_format_wav::register(formats);
+    rff_format_aiff::register(formats);
     rff_format_y4m::register(formats);
     rff_format_ivf::register(formats);
     // AV2F is EXPERIMENTAL: its four-character codes are chosen by us, not

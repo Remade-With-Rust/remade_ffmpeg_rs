@@ -4802,6 +4802,7 @@ dependencies = [
  "rff-core",
  "rff-filter",
  "rff-format",
+ "rff-format-aiff",
  "rff-format-ass",
  "rff-format-av2f",
  "rff-format-avi",
@@ -5106,6 +5107,14 @@ name = "rff-format"
 version = "0.6.1"
 dependencies = [
  "rff-core",
+]
+
+[[package]]
+name = "rff-format-aiff"
+version = "0.6.1"
+dependencies = [
+ "rff-core",
+ "rff-format",
 ]
 
 [[package]]
