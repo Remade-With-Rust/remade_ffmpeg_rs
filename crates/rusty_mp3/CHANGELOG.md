@@ -7,6 +7,17 @@ decoder output is bit-exact and stable; encoder output may change in minor
 releases when quality improves. Engineering notes for releases before 1.0.0
 are in [`docs/history.md`](docs/history.md).
 
+## [1.1.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_mp3-v1.0.6...rusty_mp3-v1.1.0) - 2026-11-19
+
+### Added
+
+- *(mp3)* MPEG-1/2 Layer I and Layer II decoding in rusty_mp3 (#125 phase D)
+
+### Fixed
+
+- *(mp3)* route pipelined decode by the serial syncer, not by layer lock
+- *(mp3)* a Layer III stream stays Layer III, so pipelined decode equals serial
+
 ## [1.0.6](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_mp3-v1.0.5...rusty_mp3-v1.0.6) - 2026-11-13
 
 ### Other
