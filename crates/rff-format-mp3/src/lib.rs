@@ -149,10 +149,18 @@ fn is_header_frame(frame: &[u8], info: &FrameInfo) -> bool {
 /// Bitrate (kbps) by index: MPEG-1 Layer I, MPEG-1 Layer II, MPEG-2/2.5
 /// Layer I, MPEG-2/2.5 Layer II.
 const BITRATE_L12: [[u32; 16]; 4] = [
-    [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0],
-    [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0],
-    [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0],
-    [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
+    [
+        0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0,
+    ],
+    [
+        0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0,
+    ],
+    [
+        0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0,
+    ],
+    [
+        0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
+    ],
 ];
 /// Largest free-format frame searched for (bytes).
 const MAX_FREE_FRAME: usize = 4096;
@@ -196,9 +204,17 @@ fn parse_l12_header(b: &[u8]) -> Option<L12Header> {
     };
     let padding = ((h >> 9) & 1) as usize;
     let (samples, pad, size) = if layer == 1 {
-        (384, padding * 4, (12 * bitrate as usize * 1000 / sample_rate as usize + padding) * 4)
+        (
+            384,
+            padding * 4,
+            (12 * bitrate as usize * 1000 / sample_rate as usize + padding) * 4,
+        )
     } else {
-        (1152, padding, 144 * bitrate as usize * 1000 / sample_rate as usize + padding)
+        (
+            1152,
+            padding,
+            144 * bitrate as usize * 1000 / sample_rate as usize + padding,
+        )
     };
     let size = if br_idx == 0 { 0 } else { size };
     let crc = (h >> 16) & 1 == 0;
@@ -260,7 +276,11 @@ fn l12_confirmed(h: &L12Header, size: usize, buf: &[u8], at_end: bool) -> bool {
             // fine at the last.
             return free && depth == 2 && parse_l12_header(next).is_some();
         };
-        let n_size = if free { size - prev_pad + n.pad } else { n.info.size };
+        let n_size = if free {
+            size - prev_pad + n.pad
+        } else {
+            n.info.size
+        };
         at += n_size;
         prev_pad = n.pad;
         size = n_size;
@@ -461,7 +481,9 @@ impl Mp3Demuxer {
                 Some(s) => {
                     self.fill(s + 4)?;
                     let next = &self.buf[self.pos..];
-                    next.len() < s + 4 || is_tag_start(&next[s..]) || parse_l12_header(&next[s..]).is_some()
+                    next.len() < s + 4
+                        || is_tag_start(&next[s..])
+                        || parse_l12_header(&next[s..]).is_some()
                 }
                 None => false,
             };
@@ -1181,7 +1203,9 @@ mod tests {
         f
     }
     fn l12_frames(hdr: [u8; 4], n: usize) -> Vec<u8> {
-        (0..n).flat_map(|i| l12_frame(hdr, 1 + (i % 200) as u8)).collect()
+        (0..n)
+            .flat_map(|i| l12_frame(hdr, 1 + (i % 200) as u8))
+            .collect()
     }
 
     #[test]
@@ -1192,7 +1216,8 @@ mod tests {
             (L2_LSF, CodecId::Mp2, 24000, 1, 1152, 576),
         ] {
             let file = cat(&[&id3v2(30), &l12_frames(hdr, 5)]);
-            let (head, packets, end) = drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(file)))));
+            let (head, packets, end) =
+                drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(file)))));
             assert!(head.contains(&format!("{codec:?}")), "{head}");
             assert!(head.contains(&format!("sample_rate: {rate}")), "{head}");
             assert!(head.contains(&format!("channels: {ch}")), "{head}");
@@ -1293,10 +1318,15 @@ mod tests {
     #[test]
     fn the_first_frame_locks_the_layer() {
         let file = cat(&[&frames(3), &l12_frames(L2, 3), &frames(2)]);
-        let (head, packets, _) = drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(file.clone())))));
+        let (head, packets, _) = drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(
+            file.clone(),
+        )))));
         assert!(head.contains("Mp3"));
         assert_eq!(packets.len(), 5);
-        assert!(packets.iter().all(|p| p.6[1] & 0x06 == 0x02), "Layer III only");
+        assert!(
+            packets.iter().all(|p| p.6[1] & 0x06 == 0x02),
+            "Layer III only"
+        );
         assert_same_as_legacy("l3 with l2 inside", &file, &[1, usize::MAX]);
         let file = cat(&[&l12_frames(L2, 3), &frames(3), &l12_frames(L2, 2)]);
         let (head, packets, _) = drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(file)))));

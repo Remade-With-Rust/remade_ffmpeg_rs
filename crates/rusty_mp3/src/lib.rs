@@ -209,7 +209,13 @@ impl Mp3Decoder {
     /// A confirming frame cut off by the end of the input confirms nothing: in
     /// sync-heavy garbage near the end, a single matching header is a ~1%
     /// coincidence, so it must not be enough.
-    fn confirm(&self, h: &layer12::Layer12Header, pos: usize, end: usize, strict: bool) -> Option<bool> {
+    fn confirm(
+        &self,
+        h: &layer12::Layer12Header,
+        pos: usize,
+        end: usize,
+        strict: bool,
+    ) -> Option<bool> {
         let (mut prev, mut prev_size, mut at) = (h.clone(), end - pos, end);
         // A free-format size was found BY matching the first header after it,
         // so that one proves nothing: look one further.
@@ -292,9 +298,7 @@ impl Mp3Decoder {
             Some(s) => s,
             None => match self.free_format_size(pos, &h) {
                 Some(s) => s,
-                None if self.eof
-                    || self.buf.len() - pos > layer12::MAX_FREE_FORMAT_FRAME + 4 =>
-                {
+                None if self.eof || self.buf.len() - pos > layer12::MAX_FREE_FORMAT_FRAME + 4 => {
                     return Step::Skip
                 }
                 None => return Step::Wait,
@@ -351,6 +355,16 @@ impl Mp3Decoder {
             // or II, which have their own syncer and decoder. Layer III (0b01)
             // and the reserved layer fall through to the path below unchanged.
             if self.buf[pos + 1] & 0x04 != 0 {
+                // A Layer III stream stays Layer III: a Layer I/II header after
+                // Layer III frames is garbage (a false sync), as it always was
+                // for this decoder. This also keeps `decode_pipelined`, whose
+                // Layer III pipeline never takes Layer I/II frames, equal to the
+                // serial path on every input (the `pipelined` fuzz target).
+                if self.last_layer == 3 {
+                    pos += 1;
+                    self.contiguous = false;
+                    continue;
+                }
                 match self.layer12_step(pos) {
                     Step::Took(n) => pos += n,
                     Step::Skip => {
@@ -449,9 +463,7 @@ fn starts_with_layer12(bytes: &[u8]) -> bool {
                 None => return true,
                 Some(size) => {
                     let next = bytes.get(pos + size..).unwrap_or(&[]);
-                    if pos + size == bytes.len()
-                        || continues_stream(&h, next)
-                        || is_tag_start(next)
+                    if pos + size == bytes.len() || continues_stream(&h, next) || is_tag_start(next)
                     {
                         return true;
                     }

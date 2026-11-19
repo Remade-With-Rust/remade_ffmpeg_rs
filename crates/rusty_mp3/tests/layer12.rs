@@ -126,7 +126,11 @@ fn whole_frames(bit: &[u8]) -> Option<usize> {
 }
 
 fn max_abs_diff(a: &[i32], b: &[i32]) -> i32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).max().unwrap_or(0)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .max()
+        .unwrap_or(0)
 }
 
 #[test]
@@ -150,7 +154,11 @@ fn iso_layer12_vectors_decode_within_one_lsb() {
             refs.len()
         );
         if ours.len() > refs.len() {
-            failures.push(format!("{stem}: {} samples vs reference {}", ours.len(), refs.len()));
+            failures.push(format!(
+                "{stem}: {} samples vs reference {}",
+                ours.len(),
+                refs.len()
+            ));
         }
         // Every frame the file holds whole is decoded.
         if let Some(whole) = whole_frames(&bit) {
@@ -233,11 +241,15 @@ struct Row {
 }
 const RA: Row = Row {
     nbal: 4,
-    steps: &[3, 7, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767, 65535],
+    steps: &[
+        3, 7, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767, 65535,
+    ],
 };
 const RB: Row = Row {
     nbal: 4,
-    steps: &[3, 5, 7, 9, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 65535],
+    steps: &[
+        3, 5, 7, 9, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 65535,
+    ],
 };
 const RC: Row = Row {
     nbal: 3,
@@ -249,7 +261,9 @@ const RD: Row = Row {
 };
 const RE: Row = Row {
     nbal: 4,
-    steps: &[3, 5, 9, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767],
+    steps: &[
+        3, 5, 9, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767,
+    ],
 };
 const RF: Row = Row {
     nbal: 3,
@@ -257,7 +271,9 @@ const RF: Row = Row {
 };
 const RG: Row = Row {
     nbal: 4,
-    steps: &[3, 5, 7, 9, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383],
+    steps: &[
+        3, 5, 7, 9, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383,
+    ],
 };
 const RH: Row = Row {
     nbal: 2,
@@ -378,13 +394,21 @@ fn crc16(b: &[u8], from: usize, n: usize, mut crc: u16) -> u16 {
 const BITRATES: [[[u32; 16]; 2]; 2] = [
     // MPEG-1: Layer I, Layer II
     [
-        [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0],
-        [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0],
+        [
+            0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0,
+        ],
+        [
+            0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0,
+        ],
     ],
     // MPEG-2: Layer I, Layer II
     [
-        [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0],
-        [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
+        [
+            0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0,
+        ],
+        [
+            0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
+        ],
     ],
 ];
 
@@ -444,14 +468,21 @@ fn encode(pcm: &[f32], cfg: Cfg) -> Vec<u8> {
     }
     let vi = usize::from(lsf);
     let li = usize::from(layer2);
-    let bri = BITRATES[vi][li].iter().position(|&b| b == cfg.kbps).expect("legal bitrate") as u32;
+    let bri = BITRATES[vi][li]
+        .iter()
+        .position(|&b| b == cfg.kbps)
+        .expect("legal bitrate") as u32;
     let base = match cfg.rate * if lsf { 2 } else { 1 } {
         44100 => 0,
         48000 => 1,
         32000 => 2,
         r => panic!("rate {r}"),
     };
-    let unit = if layer2 { 144 * cfg.kbps * 1000 } else { 12 * cfg.kbps * 1000 };
+    let unit = if layer2 {
+        144 * cfg.kbps * 1000
+    } else {
+        12 * cfg.kbps * 1000
+    };
     let rows: Vec<&Row> = if layer2 {
         l2_rows(cfg.kbps, nch, cfg.rate, lsf)
     } else {
@@ -612,15 +643,15 @@ fn encode(pcm: &[f32], cfg: Cfg) -> Vec<u8> {
                     continue;
                 }
                 let s = sf[ch][i];
-                let sent: &[u32] = if !layer2 {
-                    &s[..1]
-                } else {
+                let sent: &[u32] = if layer2 {
                     match scfsi[ch][i] {
                         0 => &s[..],
                         1 => &[s[0], s[2]],
                         2 => &s[..1],
                         _ => &[s[0], s[1]],
                     }
+                } else {
+                    &s[..1]
                 };
                 for &v in sent {
                     w.put(6, v);
@@ -740,7 +771,11 @@ fn check(name: &str, cfg: Cfg, input: &[f32], min_snr: f64) -> Decoded {
     assert_eq!(d.frames, frames, "{name}: frame count");
     assert_eq!(d.channels, cfg.channels(), "{name}: channels");
     assert_eq!(d.rate, cfg.rate, "{name}: rate");
-    assert_eq!(d.samples.len(), frames * spf * cfg.channels(), "{name}: samples");
+    assert_eq!(
+        d.samples.len(),
+        frames * spf * cfg.channels(),
+        "{name}: samples"
+    );
     let s = snr(input, &d.samples, cfg.channels());
     eprintln!("{name:<36} {} frames  SNR {s:.1?} dB", d.frames);
     for (ch, v) in s.iter().enumerate() {
@@ -748,9 +783,15 @@ fn check(name: &str, cfg: Cfg, input: &[f32], min_snr: f64) -> Decoded {
     }
     // Every push chunking and the pipelined entry decode identically.
     for chunk in [1, 7, 1000] {
-        assert!(bits_eq(&decode_chunked(&stream, chunk).samples, &d.samples), "{name}: chunk {chunk}");
+        assert!(
+            bits_eq(&decode_chunked(&stream, chunk).samples, &d.samples),
+            "{name}: chunk {chunk}"
+        );
     }
-    let piped: Vec<f32> = decode_pipelined(&stream).into_iter().flat_map(|f| f.samples).collect();
+    let piped: Vec<f32> = decode_pipelined(&stream)
+        .into_iter()
+        .flat_map(|f| f.samples)
+        .collect();
     assert!(bits_eq(&piped, &d.samples), "{name}: pipelined");
     d
 }
@@ -775,7 +816,12 @@ fn layer2_mpeg1_all_tables_and_modes() {
     ] {
         let st = mode != 3;
         let input = signal(rate, if st { 2 } else { 1 }, 0.5, 0.7, false);
-        check(&format!("L2 {rate} {kbps}k mode {mode}"), Cfg::l2(rate, kbps, mode), &input, min);
+        check(
+            &format!("L2 {rate} {kbps}k mode {mode}"),
+            Cfg::l2(rate, kbps, mode),
+            &input,
+            min,
+        );
     }
 }
 
@@ -791,7 +837,12 @@ fn layer2_mpeg2_low_rates() {
     ] {
         let st = mode != 3;
         let input = signal(rate, if st { 2 } else { 1 }, 0.6, 0.7, false);
-        check(&format!("L2 LSF {rate} {kbps}k mode {mode}"), Cfg::l2(rate, kbps, mode), &input, 8.0);
+        check(
+            &format!("L2 LSF {rate} {kbps}k mode {mode}"),
+            Cfg::l2(rate, kbps, mode),
+            &input,
+            8.0,
+        );
     }
 }
 
@@ -806,10 +857,18 @@ fn layer2_joint_stereo_every_bound() {
             ext,
             ..Cfg::l2(44100, 192, 1)
         };
-        let d = check(&format!("L2 joint stereo bound {}", 4 * (ext + 1)), cfg, &input, 25.0);
+        let d = check(
+            &format!("L2 joint stereo bound {}", 4 * (ext + 1)),
+            cfg,
+            &input,
+            25.0,
+        );
         // Different bounds are different streams: the decode must differ.
         if let Some(p) = &prev {
-            assert!(!bits_eq(p, &d.samples), "bound {ext} decoded like the previous");
+            assert!(
+                !bits_eq(p, &d.samples),
+                "bound {ext} decoded like the previous"
+            );
         }
         prev = Some(d.samples);
     }
@@ -840,7 +899,12 @@ fn layer1_modes_and_rates() {
             ext,
             ..Cfg::l1(rate, kbps, mode)
         };
-        check(&format!("L1 {rate} {kbps}k mode {mode} ext {ext}"), cfg, &input, 20.0);
+        check(
+            &format!("L1 {rate} {kbps}k mode {mode} ext {ext}"),
+            cfg,
+            &input,
+            20.0,
+        );
     }
 }
 
@@ -883,7 +947,10 @@ fn crc_frames_decode_like_plain_frames() {
         stripped.extend_from_slice(&f);
         pos += size;
     }
-    assert!(bits_eq(&decode(&protected).samples, &decode(&stripped).samples));
+    assert!(bits_eq(
+        &decode(&protected).samples,
+        &decode(&stripped).samples
+    ));
 }
 
 /// Free format: bitrate index 0, frame size found by the distance to the next
@@ -905,9 +972,15 @@ fn free_format_decodes_like_table_bitrate() {
         let stream = encode(&input, cfg);
         let free = decode(&stream);
         assert_eq!(free.frames, table.frames, "{layer:?} {rate} {kbps}");
-        assert!(bits_eq(&free.samples, &table.samples), "{layer:?} {rate} {kbps}");
+        assert!(
+            bits_eq(&free.samples, &table.samples),
+            "{layer:?} {rate} {kbps}"
+        );
         for chunk in [1, 333] {
-            assert!(bits_eq(&decode_chunked(&stream, chunk).samples, &table.samples));
+            assert!(bits_eq(
+                &decode_chunked(&stream, chunk).samples,
+                &table.samples
+            ));
         }
     }
 }
@@ -967,13 +1040,22 @@ fn garbage_is_skipped_and_decoding_resumes() {
     file.extend_from_slice(&tail);
     for chunk in [usize::MAX, 4096, 77] {
         let d = decode_chunked(&file, chunk);
-        assert_eq!(d.frames, frames, "chunk {chunk}: every real frame, no junk frames");
-        assert!(bits_eq(&d.samples, &reference.samples), "chunk {chunk}: decode equals clean");
+        assert_eq!(
+            d.frames, frames,
+            "chunk {chunk}: every real frame, no junk frames"
+        );
+        assert!(
+            bits_eq(&d.samples, &reference.samples),
+            "chunk {chunk}: decode equals clean"
+        );
         let mut led = lead.clone();
         led.extend_from_slice(&file);
         let d = decode_chunked(&led, chunk);
         let tail = &d.samples[d.samples.len().saturating_sub(reference.samples.len())..];
-        assert!(bits_eq(tail, &reference.samples), "chunk {chunk}: lead garbage");
+        assert!(
+            bits_eq(tail, &reference.samples),
+            "chunk {chunk}: lead garbage"
+        );
     }
     // Damage inside a frame: overwrite frame k's payload with garbage.
     let mut hurt = clean.clone();
@@ -984,7 +1066,11 @@ fn garbage_is_skipped_and_decoding_resumes() {
     let hit = k * per_frame..(k + 2) * per_frame;
     for (i, (a, b)) in d.samples.iter().zip(&reference.samples).enumerate() {
         if !hit.contains(&i) {
-            assert_eq!(a.to_bits(), b.to_bits(), "sample {i} outside the damaged frame");
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "sample {i} outside the damaged frame"
+            );
         }
     }
     // A damaged HEADER: that frame is lost, the rest resync.
@@ -1015,7 +1101,10 @@ fn truncation_never_panics() {
             let whole = cut / size;
             let spf = if cfg.layer == Layer::II { 1152 } else { 384 };
             let check = n.min(whole.saturating_sub(1) * spf);
-            assert!(bits_eq(&d.samples[..check], &full.samples[..check]), "cut {cut}");
+            assert!(
+                bits_eq(&d.samples[..check], &full.samples[..check]),
+                "cut {cut}"
+            );
         }
         let _ = decode_chunked(&s[..s.len() - 3], 5);
     }
@@ -1028,11 +1117,18 @@ fn hostile_bytes_never_panic() {
     let mut rnd = xorshift(0x0BAD_F00D);
     for trial in 0..200 {
         let mut s = clean.clone();
-        for _ in 0..1 + trial % 40 {
+        for _ in 0..=(trial % 40) {
             let at = rnd() as usize % s.len();
             s[at] ^= 1 << (rnd() % 8);
         }
-        let d = decode_chunked(&s, if trial % 2 == 0 { usize::MAX } else { 1 + trial });
+        let d = decode_chunked(
+            &s,
+            if trial % 2 == 0 {
+                usize::MAX
+            } else {
+                1 + trial
+            },
+        );
         assert!(d.samples.iter().all(|v| v.is_finite()), "trial {trial}");
         let _ = decode_pipelined(&s);
     }
@@ -1054,7 +1150,10 @@ fn hostile_bytes_never_panic() {
             s[at + 1] = 0xF0 | ((k as u8) & 0x0F); // any version/layer/CRC
         }
         let d = decode_chunked(&s, 1 + trial as usize * 97);
-        assert!(d.samples.iter().all(|v| v.is_finite()), "noise trial {trial}");
+        assert!(
+            d.samples.iter().all(|v| v.is_finite()),
+            "noise trial {trial}"
+        );
         let _ = decode_pipelined(&s);
     }
 }
@@ -1063,9 +1162,7 @@ fn hostile_bytes_never_panic() {
 /// not decode as frames once Layer III frames have been seen.
 #[test]
 fn layer12_garbage_in_layer3_stream_is_not_decoded() {
-    let pcm: Vec<f32> = (0..44100)
-        .map(|i| 0.3 * (i as f32 * 0.05).sin())
-        .collect();
+    let pcm: Vec<f32> = (0..44100).map(|i| 0.3 * (i as f32 * 0.05).sin()).collect();
     let mut enc = rusty_mp3::Mp3Encoder::new(rusty_mp3::Mp3EncoderConfig {
         bitrate_kbps: 128,
         vbr_quality: None,
@@ -1085,7 +1182,9 @@ fn layer12_garbage_in_layer3_stream_is_not_decoded() {
     let mut at = 0;
     while at < mp3.len() / 2 {
         let hb: [u8; 4] = mp3[at..at + 4].try_into().unwrap();
-        at += rusty_mp3::header::FrameHeader::parse(hb).unwrap().frame_size();
+        at += rusty_mp3::header::FrameHeader::parse(hb)
+            .unwrap()
+            .frame_size();
     }
     let mut file = mp3[..at].to_vec();
     file.extend_from_slice(&fake);
@@ -1154,16 +1253,25 @@ fn write_corpus_files() {
         ("l1_48k_mono_256.mp1", Cfg::l1(48000, 256, 3)),
         ("l1_32k_dual_448.mp1", Cfg::l1(32000, 448, 2)),
         ("l1_44k_js_b8_320.mp1", joint(Cfg::l1(44100, 320, 1), 1)),
-        ("l1_44k_js_b16_crc_256.mp1", crc(joint(Cfg::l1(44100, 256, 1), 3))),
+        (
+            "l1_44k_js_b16_crc_256.mp1",
+            crc(joint(Cfg::l1(44100, 256, 1), 3)),
+        ),
         ("l1_24k_st_128.mp1", Cfg::l1(24000, 128, 0)),
         ("l1_16k_mono_64.mp1", Cfg::l1(16000, 64, 3)),
         ("l2_44k_js_b4_192.mp2", joint(Cfg::l2(44100, 192, 1), 0)),
         ("l2_44k_js_b8_128.mp2", joint(Cfg::l2(44100, 128, 1), 1)),
-        ("l2_44k_js_b12_crc_160.mp2", crc(joint(Cfg::l2(44100, 160, 1), 2))),
+        (
+            "l2_44k_js_b12_crc_160.mp2",
+            crc(joint(Cfg::l2(44100, 160, 1), 2)),
+        ),
         ("l2_48k_js_b16_256.mp2", joint(Cfg::l2(48000, 256, 1), 3)),
         ("l2_32k_js_b4_64.mp2", joint(Cfg::l2(32000, 64, 1), 0)),
         ("l2_24k_js_b8_96.mp2", joint(Cfg::l2(24000, 96, 1), 1)),
-        ("l2_22k_js_b4_crc_64.mp2", crc(joint(Cfg::l2(22050, 64, 1), 0))),
+        (
+            "l2_22k_js_b4_crc_64.mp2",
+            crc(joint(Cfg::l2(22050, 64, 1), 0)),
+        ),
         ("l2_16k_js_b8_48.mp2", joint(Cfg::l2(16000, 48, 1), 1)),
         ("l2_48k_dual_crc_384.mp2", crc(Cfg::l2(48000, 384, 2))),
         ("l2_44k_free_192.mp2", free(Cfg::l2(44100, 192, 0))),
@@ -1173,5 +1281,76 @@ fn write_corpus_files() {
         let stream = encode(&source(cfg.rate, cfg.channels()), cfg);
         std::fs::write(dir.join(name), &stream).unwrap();
         eprintln!("wrote {name}: {} bytes", stream.len());
+    }
+}
+
+/// `decode_pipelined` must equal the serial decoder on any input (the
+/// `pipelined` fuzz target's contract). `pipelined_crash_1.bin` is the
+/// fuzzer's find: a Layer III stream with Layer I false syncs near its end,
+/// which the serial decoder once took (at `flush`) and the Layer III pipeline
+/// never does. Also replays the fuzz seed corpus and mutations of it and of a
+/// Layer II stream.
+#[test]
+fn pipelined_equals_serial_on_damaged_and_mixed_input() {
+    fn same(data: &[u8]) -> bool {
+        let piped = decode_pipelined(data);
+        let mut dec = Mp3Decoder::new();
+        dec.push(data);
+        dec.flush();
+        let mut serial = Vec::new();
+        while let Ok(f) = dec.next_frame() {
+            serial.push(f);
+        }
+        piped.len() == serial.len()
+            && piped.iter().zip(&serial).all(|(a, b)| {
+                a.channels == b.channels
+                    && a.sample_rate == b.sample_rate
+                    && bits_eq(&a.samples, &b.samples)
+            })
+    }
+    let mut inputs: Vec<Vec<u8>> = vec![
+        include_bytes!("data/pipelined_crash_1.bin").to_vec(),
+        stream_l2().0,
+    ];
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/pipelined");
+    if let Ok(dir) = std::fs::read_dir(&corpus) {
+        for e in dir.flatten() {
+            if let Ok(b) = std::fs::read(e.path()) {
+                inputs.push(b);
+            }
+        }
+    }
+    let mut rnd = xorshift(0x5EED_1234);
+    let seeds = inputs.clone();
+    for seed in &seeds {
+        if seed.is_empty() {
+            continue;
+        }
+        for _ in 0..60 {
+            let mut v = seed.clone();
+            for _ in 0..=(rnd() % 16) {
+                let at = rnd() as usize % v.len();
+                v[at] = match rnd() % 3 {
+                    0 => 0xFF,
+                    1 => v[at] ^ (1 << (rnd() % 8)),
+                    _ => rnd() as u8,
+                };
+            }
+            inputs.push(v);
+        }
+        // A Layer III stream with a Layer II stream glued on, and the reverse.
+        let mut glued = seed.clone();
+        glued.extend_from_slice(&stream_l2().0);
+        inputs.push(glued);
+        let mut glued = stream_l2().0;
+        glued.extend_from_slice(seed);
+        inputs.push(glued);
+    }
+    for (i, data) in inputs.iter().enumerate() {
+        assert!(
+            same(data),
+            "input {i} ({} bytes): pipelined differs from serial",
+            data.len()
+        );
     }
 }

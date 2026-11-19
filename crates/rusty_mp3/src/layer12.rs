@@ -366,7 +366,7 @@ fn l1_unscale(n: u32, mant: u32, scale: u8) -> i32 {
 #[inline]
 fn l2_unscale_group(steps: u32, mant: u32, scale: u8) -> i32 {
     let shift = u32::from(scale / 3); // 0..=21
-    // `mant` < 16 and `steps / 2` <= 4: the difference fits easily.
+                                      // `mant` < 16 and `steps / 2` <= 4: the difference fits easily.
     #[allow(clippy::cast_possible_wrap)]
     let level = mant as i32 - (steps >> 1) as i32;
     let val = level * L2_MULT[(steps >> 2) as usize][usize::from(scale % 3)];
@@ -467,8 +467,14 @@ const fn rows(spans: &[(usize, &'static AllocRow)]) -> [&'static AllocRow; 30] {
 /// Tables 3-B.2a (27 subbands), 3-B.2b (30), 3-B.2c (8), 3-B.2d (12) and the
 /// MPEG-2 LSF Table B.1 (30), in FFmpeg's order (`ff_mpa_l2_select_table`).
 static ALLOC_TABLES: [AllocTable; 5] = [
-    table(rows(&[(3, &ROW_A), (8, &ROW_B), (12, &ROW_C), (7, &ROW_D)]), 27),
-    table(rows(&[(3, &ROW_A), (8, &ROW_B), (12, &ROW_C), (7, &ROW_D)]), 30),
+    table(
+        rows(&[(3, &ROW_A), (8, &ROW_B), (12, &ROW_C), (7, &ROW_D)]),
+        27,
+    ),
+    table(
+        rows(&[(3, &ROW_A), (8, &ROW_B), (12, &ROW_C), (7, &ROW_D)]),
+        30,
+    ),
     table(rows(&[(2, &ROW_E), (28, &ROW_F)]), 8),
     table(rows(&[(2, &ROW_E), (28, &ROW_F)]), 12),
     table(rows(&[(4, &ROW_G), (7, &ROW_F), (19, &ROW_H)]), 30),
