@@ -257,6 +257,43 @@ struct WavFmt {
 }
 
 /// Parse a `fmt ` chunk body (`f` = its bytes, clipped to the file).
+/// The tail (bytes 2..16) of `KSDATAFORMAT_SUBTYPE_*` /
+/// `MEDIASUBTYPE_*` GUIDs, `{0000xxxx-0000-0010-8000-00AA00389B71}`, whose
+/// first two bytes are a `WAVE_FORMAT_*` tag.
+const KS_SUBTYPE_TAIL: [u8; 14] = [
+    0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+];
+
+/// The same for the ambisonic B-format family,
+/// `{0000xxxx-0721-11D3-8644-C8C1CA000000}` (PCM and IEEE float B-format).
+const AMBISONIC_SUBTYPE_TAIL: [u8; 14] = [
+    0x00, 0x00, 0x21, 0x07, 0xD3, 0x11, 0x86, 0x44, 0xC8, 0xC1, 0xCA, 0x00, 0x00, 0x00,
+];
+
+/// Whether an extensible SubFormat GUID is a format tag in a known GUID
+/// family (the tag itself is checked later, like a plain `fmt ` tag).
+fn subformat_carries_tag(guid: &[u8; 16]) -> bool {
+    guid[2..] == KS_SUBTYPE_TAIL || guid[2..] == AMBISONIC_SUBTYPE_TAIL
+}
+
+/// A GUID in its registry spelling, for error messages.
+fn guid_string(g: &[u8; 16]) -> String {
+    format!(
+        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        u32::from_le_bytes([g[0], g[1], g[2], g[3]]),
+        u16::from_le_bytes([g[4], g[5]]),
+        u16::from_le_bytes([g[6], g[7]]),
+        g[8],
+        g[9],
+        g[10],
+        g[11],
+        g[12],
+        g[13],
+        g[14],
+        g[15]
+    )
+}
+
 fn parse_fmt(f: &[u8]) -> Result<WavFmt> {
     if f.len() < 16 {
         return Err(Error::invalid("wav demux: short `fmt ` chunk"));
@@ -267,10 +304,19 @@ fn parse_fmt(f: &[u8]) -> Result<WavFmt> {
     let bits = rd_u16(f, 14);
     // WAVE_FORMAT_EXTENSIBLE: the real tag is the SubFormat GUID's first
     // two bytes (fmt chunk offset 24), after cbSize(2) + valid-bits(2) +
-    // channel-mask(4).
+    // channel-mask(4). The rest of the GUID must be one of the two families
+    // that carry a format tag that way; any other GUID names a format of its
+    // own, which a tag that merely starts like PCM must not be read as.
     if format_tag == 0xFFFE {
-        if f.len() < 26 {
+        if f.len() < 40 {
             return Err(Error::invalid("wav demux: short extensible `fmt ` chunk"));
+        }
+        let guid: &[u8; 16] = f[24..40].try_into().unwrap();
+        if !subformat_carries_tag(guid) {
+            return Err(Error::unsupported(format!(
+                "wav demux: extensible SubFormat GUID {}",
+                guid_string(guid)
+            )));
         }
         format_tag = rd_u16(f, 24);
     }
@@ -737,7 +783,7 @@ mod tests {
         fmt.extend_from_slice(&24u16.to_le_bytes()); // valid bits
         fmt.extend_from_slice(&3u32.to_le_bytes()); // channel mask
         fmt.extend_from_slice(&1u16.to_le_bytes()); // SubFormat: PCM
-        fmt.extend_from_slice(&[0u8; 14]); // rest of GUID
+        fmt.extend_from_slice(&KS_SUBTYPE_TAIL); // rest of GUID
         let file = wav_file(&fmt, &[0u8; 6]);
 
         let mut dem = WavDemuxer::new(Box::new(Cursor::new(file)));
@@ -874,9 +920,54 @@ mod tests {
         fmt.extend_from_slice(&8u16.to_le_bytes());
         fmt.extend_from_slice(&4u32.to_le_bytes());
         fmt.extend_from_slice(&7u16.to_le_bytes()); // SubFormat: µ-law
-        fmt.extend_from_slice(&[0u8; 14]);
+        fmt.extend_from_slice(&KS_SUBTYPE_TAIL);
         let (s, _) = header_and_packets(wav_file(&fmt, &[0xFF; 10]));
         assert_eq!(s.codec_id, CodecId::PcmMulaw);
+    }
+
+    /// #125 follow-up: only the two GUID families that carry a format tag in
+    /// their first bytes resolve; a GUID that merely starts like PCM is some
+    /// other format and is refused, not read as PCM.
+    #[test]
+    fn extensible_checks_the_whole_subformat_guid() {
+        let ext = |tail: &[u8]| {
+            let mut fmt = fmt_chunk(0xFFFE, 2, 48_000, 16);
+            fmt.extend_from_slice(&22u16.to_le_bytes());
+            fmt.extend_from_slice(&16u16.to_le_bytes());
+            fmt.extend_from_slice(&3u32.to_le_bytes());
+            fmt.extend_from_slice(&1u16.to_le_bytes()); // looks like PCM
+            fmt.extend_from_slice(tail);
+            WavDemuxer::new(Box::new(Cursor::new(wav_file(&fmt, &[0u8; 8])))).read_header()
+        };
+        assert_eq!(ext(&KS_SUBTYPE_TAIL).unwrap()[0].codec_id, CodecId::Pcm);
+        assert_eq!(
+            ext(&AMBISONIC_SUBTYPE_TAIL).unwrap()[0].codec_id,
+            CodecId::Pcm
+        );
+        for bad in [
+            [0u8; 14],
+            {
+                let mut t = KS_SUBTYPE_TAIL;
+                t[13] ^= 1;
+                t
+            },
+            {
+                let mut t = KS_SUBTYPE_TAIL;
+                t[0] = 1; // a Data1 above 0xFFFF
+                t
+            },
+        ] {
+            let err = ext(&bad).unwrap_err().to_string();
+            assert!(err.contains("SubFormat GUID"), "{err}");
+        }
+        // A cut-off GUID is an error, not a panic.
+        let mut short = fmt_chunk(0xFFFE, 2, 48_000, 16);
+        short.extend_from_slice(&[22, 0, 16, 0, 3, 0, 0, 0, 1, 0]);
+        assert!(
+            WavDemuxer::new(Box::new(Cursor::new(wav_file(&short, &[0u8; 8]))))
+                .read_header()
+                .is_err()
+        );
     }
 
     #[test]
@@ -1230,7 +1321,7 @@ mod tests {
         ext.extend_from_slice(&24u16.to_le_bytes());
         ext.extend_from_slice(&3u32.to_le_bytes());
         ext.extend_from_slice(&1u16.to_le_bytes());
-        ext.extend_from_slice(&[0u8; 14]);
+        ext.extend_from_slice(&KS_SUBTYPE_TAIL);
         let f = |fmt: &Vec<u8>, n: usize| {
             riff(&[(b"fmt ", fmt.clone(), None), (b"data", pcm(n), None)])
         };
