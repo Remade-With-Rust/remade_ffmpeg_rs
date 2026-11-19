@@ -3537,6 +3537,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "moxcms"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "561875e11b3d8618524f974f85e4bbd05a64a112b8f7541ffcc236b5166c0564"
+dependencies = [
+ "num-traits",
+ "pxfm",
+]
+
+[[package]]
 name = "muda"
 version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4546,6 +4556,12 @@ dependencies = [
  "quote",
  "syn 2.0.118",
 ]
+
+[[package]]
+name = "pxfm"
+version = "0.1.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "quick-error"
@@ -5746,6 +5762,14 @@ dependencies = [
 [[package]]
 name = "rusty_h265-accel"
 version = "0.7.1"
+
+[[package]]
+name = "rusty_icc"
+version = "0.1.0"
+dependencies = [
+ "moxcms",
+ "rusty_alloc-api",
+]
 
 [[package]]
 name = "rusty_jpeg"

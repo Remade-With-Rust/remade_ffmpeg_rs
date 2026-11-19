@@ -1,0 +1,596 @@
+//! Colour transforms between profiles.
+
+use std::sync::{Arc, OnceLock};
+
+use crate::color::delta_e_2000;
+use crate::curve::clamp01;
+use crate::error::{Error, Result};
+use crate::lut::ClutEval;
+use crate::pipeline::{build_chain, Chain, GamutChain, ShaperLink};
+use crate::profile::{ColorSpace, Profile};
+
+/// ICC rendering intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Intent {
+    /// Perceptual (`A2B0`/`B2A0`).
+    #[default]
+    Perceptual = 0,
+    /// Media-relative colorimetric (`A2B1`/`B2A1`).
+    RelativeColorimetric = 1,
+    /// Saturation (`A2B2`/`B2A2`).
+    Saturation = 2,
+    /// ICC-absolute colorimetric: relative colorimetric tags plus media
+    /// white point scaling.
+    AbsoluteColorimetric = 3,
+}
+
+/// Pixel layout: channel order and alpha. Samples are interleaved.
+///
+/// Value conventions: device channels (grey, RGB, CMYK ink) are `0..=MAX`
+/// for integers and `0.0..=1.0` for `f32`. L*a*b* uses the ICC v4
+/// encodings for integers (`u8`: `L * 255 / 100`, `a + 128`; `u16`:
+/// `L * 65535 / 100`, `(a + 128) * 257`) and natural units for `f32`
+/// (`L` in `0..=100`, `a`/`b` around zero). Alpha is copied through
+/// unchanged, or set opaque when the source has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Layout {
+    /// Grey.
+    Gray,
+    /// Grey, alpha.
+    GrayAlpha,
+    /// Red, green, blue.
+    Rgb,
+    /// Red, green, blue, alpha.
+    Rgba,
+    /// Cyan, magenta, yellow, black.
+    Cmyk,
+    /// Cyan, magenta, yellow, black, alpha.
+    Cmyka,
+    /// L*, a*, b*.
+    Lab,
+    /// L*, a*, b*, alpha.
+    Laba,
+}
+
+impl Layout {
+    /// Samples per pixel.
+    #[must_use]
+    pub const fn channels(self) -> usize {
+        self.color_channels() + self.has_alpha() as usize
+    }
+
+    /// Colour samples per pixel (alpha excluded).
+    #[must_use]
+    pub const fn color_channels(self) -> usize {
+        match self {
+            Self::Gray | Self::GrayAlpha => 1,
+            Self::Rgb | Self::Rgba | Self::Lab | Self::Laba => 3,
+            Self::Cmyk | Self::Cmyka => 4,
+        }
+    }
+
+    /// `true` when the last sample is alpha.
+    #[must_use]
+    pub const fn has_alpha(self) -> bool {
+        matches!(
+            self,
+            Self::GrayAlpha | Self::Rgba | Self::Cmyka | Self::Laba
+        )
+    }
+
+    /// The colour space this layout carries.
+    #[must_use]
+    pub const fn color_space(self) -> ColorSpace {
+        match self {
+            Self::Gray | Self::GrayAlpha => ColorSpace::Gray,
+            Self::Rgb | Self::Rgba => ColorSpace::Rgb,
+            Self::Cmyk | Self::Cmyka => ColorSpace::Cmyk,
+            Self::Lab | Self::Laba => ColorSpace::Lab,
+        }
+    }
+
+    const fn is_lab(self) -> bool {
+        matches!(self, Self::Lab | Self::Laba)
+    }
+}
+
+/// Transform options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Options {
+    /// Black-point compensation (the Adobe / `LittleCMS` algorithm). Ignored
+    /// for absolute colorimetric; as in `LittleCMS`, perceptual and
+    /// saturation transforms into ICC v4 profiles always compensate.
+    pub black_point_compensation: bool,
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for u8 {}
+    impl Sealed for u16 {}
+    impl Sealed for f32 {}
+}
+
+/// Sample type kinds (implementation detail of [`Sample`]).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleKind {
+    U8,
+    U16,
+    F32,
+}
+
+/// A pixel sample type: `u8`, `u16` or `f32`.
+pub trait Sample: Copy + Send + Sync + 'static + sealed::Sealed {
+    #[doc(hidden)]
+    const KIND: SampleKind;
+    #[doc(hidden)]
+    fn to_unit(self) -> f64;
+    #[doc(hidden)]
+    fn from_unit(v: f64) -> Self;
+    #[doc(hidden)]
+    fn opaque() -> Self;
+    #[doc(hidden)]
+    fn index(self) -> usize;
+}
+
+impl Sample for u8 {
+    const KIND: SampleKind = SampleKind::U8;
+    fn to_unit(self) -> f64 {
+        f64::from(self) / 255.0
+    }
+    fn from_unit(v: f64) -> Self {
+        (clamp01(v) * 255.0 + 0.5) as Self
+    }
+    fn opaque() -> Self {
+        Self::MAX
+    }
+    fn index(self) -> usize {
+        usize::from(self)
+    }
+}
+
+impl Sample for u16 {
+    const KIND: SampleKind = SampleKind::U16;
+    fn to_unit(self) -> f64 {
+        f64::from(self) / 65535.0
+    }
+    fn from_unit(v: f64) -> Self {
+        (clamp01(v) * 65535.0 + 0.5) as Self
+    }
+    fn opaque() -> Self {
+        Self::MAX
+    }
+    fn index(self) -> usize {
+        usize::from(self)
+    }
+}
+
+impl Sample for f32 {
+    const KIND: SampleKind = SampleKind::F32;
+    fn to_unit(self) -> f64 {
+        f64::from(self)
+    }
+    fn from_unit(v: f64) -> Self {
+        v as Self
+    }
+    fn opaque() -> Self {
+        1.0
+    }
+    fn index(self) -> usize {
+        0
+    }
+}
+
+/// Entries of the inverse-curve output tables, indexed by `sqrt(linear)`
+/// so the steep start of a gamma inverse is sampled densely.
+const OUT_TABLE: usize = 16384;
+
+struct ShaperEngine {
+    link: ShaperLink,
+    m: [[f32; 3]; 3],
+    off: [f32; 3],
+    in8: Vec<Vec<f32>>,
+    in16: OnceLock<Vec<Vec<f32>>>,
+    out: Vec<Vec<f32>>,
+}
+
+impl ShaperEngine {
+    fn new(link: ShaperLink) -> Self {
+        let table = |n: usize| -> Vec<Vec<f32>> {
+            link.in_curves
+                .iter()
+                .map(|c| {
+                    (0..n)
+                        .map(|i| c.eval(i as f64 / (n - 1) as f64) as f32)
+                        .collect()
+                })
+                .collect()
+        };
+        let in8 = table(256);
+        let out = link
+            .out_curves
+            .iter()
+            .map(|c| {
+                (0..OUT_TABLE)
+                    .map(|i| {
+                        let t = i as f64 / (OUT_TABLE - 1) as f64;
+                        c.eval_inverse(t * t) as f32
+                    })
+                    .collect()
+            })
+            .collect();
+        let m = link.m.map(|r| r.map(|v| v as f32));
+        let off = link.off.map(|v| v as f32);
+        Self {
+            link,
+            m,
+            off,
+            in8,
+            in16: OnceLock::new(),
+            out,
+        }
+    }
+
+    fn in16(&self) -> &Vec<Vec<f32>> {
+        self.in16.get_or_init(|| {
+            self.link
+                .in_curves
+                .iter()
+                .map(|c| {
+                    (0..65536)
+                        .map(|i| c.eval(f64::from(i) / 65535.0) as f32)
+                        .collect()
+                })
+                .collect()
+        })
+    }
+
+    #[inline]
+    fn lookup_out(table: &[f32], lin: f32) -> f32 {
+        let lin = if lin > 0.0 { lin.min(1.0) } else { 0.0 };
+        let pos = lin.sqrt() * (OUT_TABLE - 1) as f32;
+        let i = (pos as usize).min(OUT_TABLE - 2);
+        let f = pos - i as f32;
+        table[i] + (table[i + 1] - table[i]) * f
+    }
+}
+
+enum Engine {
+    Shaper(ShaperEngine),
+    Grid(ClutEval),
+}
+
+/// A colour transform from one profile (and layout) to another.
+///
+/// `u8`/`u16` data runs through a matrix-shaper fast path when both ends
+/// are matrix/TRC (or grey TRC) profiles and nothing else intervenes;
+/// otherwise through a device-link grid (33 points per axis for 3 inputs,
+/// 17 for 4, 4096 for 1) interpolated tetrahedrally (3-D) or linearly over
+/// tetrahedral (4-D). `f32` data always runs the exact pipeline.
+pub struct Transform {
+    src_layout: Layout,
+    dst_layout: Layout,
+    chain: Arc<Chain>,
+    engine: Engine,
+}
+
+impl core::fmt::Debug for Transform {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Transform")
+            .field("src_layout", &self.src_layout)
+            .field("dst_layout", &self.dst_layout)
+            .field(
+                "engine",
+                &match self.engine {
+                    Engine::Shaper(_) => "matrix-shaper",
+                    Engine::Grid(_) => "grid",
+                },
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+fn grid_points(in_ch: usize) -> usize {
+    match in_ch {
+        1 => 4096,
+        2 => 129,
+        3 => 33,
+        _ => 17,
+    }
+}
+
+impl Transform {
+    /// A transform from `src` (pixels in `src_layout`) to `dst` (pixels in
+    /// `dst_layout`) with `intent`.
+    ///
+    /// # Errors
+    /// [`Error::InvalidTransform`] when a layout does not match its
+    /// profile's colour space; [`Error::Unsupported`] /
+    /// [`Error::Malformed`] when a profile cannot be used in the needed
+    /// direction.
+    pub fn new(
+        src: &Profile,
+        src_layout: Layout,
+        dst: &Profile,
+        dst_layout: Layout,
+        intent: Intent,
+        options: Options,
+    ) -> Result<Self> {
+        let b = options.black_point_compensation;
+        Self::from_chain(
+            build_chain(&[src, dst], &[intent, intent], &[b, b])?,
+            src_layout,
+            dst_layout,
+        )
+    }
+
+    /// A soft-proofing transform: `src` to the `proof` device with
+    /// `intent`, then the proof device's colours to `dst` with
+    /// `proof_intent` (`LittleCMS`'s `cmsCreateProofingTransform` chain
+    /// `src, proof, proof, dst` with intents `intent, intent, relative,
+    /// proof_intent`). Use [`Intent::AbsoluteColorimetric`] as
+    /// `proof_intent` to simulate the proof paper white.
+    ///
+    /// # Errors
+    /// As [`Transform::new`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_proofing(
+        src: &Profile,
+        src_layout: Layout,
+        proof: &Profile,
+        dst: &Profile,
+        dst_layout: Layout,
+        intent: Intent,
+        proof_intent: Intent,
+        options: Options,
+    ) -> Result<Self> {
+        let b = options.black_point_compensation;
+        Self::from_chain(
+            build_chain(
+                &[src, proof, proof, dst],
+                &[intent, intent, Intent::RelativeColorimetric, proof_intent],
+                &[b, b, false, false],
+            )?,
+            src_layout,
+            dst_layout,
+        )
+    }
+
+    fn from_chain(chain: Chain, src_layout: Layout, dst_layout: Layout) -> Result<Self> {
+        if src_layout.color_space() != chain.in_space {
+            return Err(Error::InvalidTransform(
+                "source layout does not match the source profile colour space",
+            ));
+        }
+        if dst_layout.color_space() != chain.out_space {
+            return Err(Error::InvalidTransform(
+                "destination layout does not match the destination colour space",
+            ));
+        }
+        let engine = if let Some(link) = chain.shaper.clone() {
+            Engine::Shaper(ShaperEngine::new(link))
+        } else {
+            let g = grid_points(chain.in_ch);
+            let total = (0..chain.in_ch).fold(1usize, |a, _| a * g);
+            let mut data = Vec::with_capacity(total * chain.out_ch);
+            let mut input = [0.0f64; 16];
+            let mut out = [0.0f64; 16];
+            for idx in 0..total {
+                let mut rem = idx;
+                for c in (0..chain.in_ch).rev() {
+                    input[c] = (rem % g) as f64 / (g - 1) as f64;
+                    rem /= g;
+                }
+                chain.eval(&input, &mut out);
+                data.extend(out[..chain.out_ch].iter().map(|&v| v as f32));
+            }
+            Engine::Grid(ClutEval::from_f32(vec![g; chain.in_ch], chain.out_ch, data))
+        };
+        Ok(Self {
+            src_layout,
+            dst_layout,
+            chain: Arc::new(chain),
+            engine,
+        })
+    }
+
+    /// The source layout.
+    #[must_use]
+    pub const fn src_layout(&self) -> Layout {
+        self.src_layout
+    }
+
+    /// The destination layout.
+    #[must_use]
+    pub const fn dst_layout(&self) -> Layout {
+        self.dst_layout
+    }
+
+    /// `true` when integer data takes the matrix-shaper fast path.
+    #[must_use]
+    pub const fn is_matrix_shaper(&self) -> bool {
+        matches!(self.engine, Engine::Shaper(_))
+    }
+
+    /// Transforms interleaved pixels from `src` into `dst`. `dst` must hold
+    /// exactly as many pixels as `src`.
+    ///
+    /// # Errors
+    /// [`Error::BufferSize`] when the lengths do not match the layouts.
+    pub fn transform<T: Sample>(&self, src: &[T], dst: &mut [T]) -> Result<()> {
+        let sc = self.src_layout.channels();
+        let dc = self.dst_layout.channels();
+        if src.len() % sc != 0 || dst.len() != src.len() / sc * dc {
+            return Err(Error::BufferSize {
+                src: src.len(),
+                dst: dst.len(),
+            });
+        }
+        let src_alpha = self.src_layout.has_alpha();
+        let dst_alpha = self.dst_layout.has_alpha();
+        let in_ch = self.src_layout.color_channels();
+        let out_ch = self.dst_layout.color_channels();
+        match (&self.engine, T::KIND) {
+            (Engine::Shaper(e), SampleKind::U8 | SampleKind::U16) => {
+                let tables = if T::KIND == SampleKind::U8 {
+                    &e.in8
+                } else {
+                    e.in16()
+                };
+                for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+                    let mut lin = [0.0f32; 3];
+                    for c in 0..in_ch {
+                        lin[c] = tables[c][sp[c].index()];
+                    }
+                    for (o, d) in dp.iter_mut().enumerate().take(out_ch) {
+                        let row = e.m[o];
+                        let v = row[0] * lin[0] + row[1] * lin[1] + row[2] * lin[2] + e.off[o];
+                        *d = T::from_unit(f64::from(ShaperEngine::lookup_out(&e.out[o], v)));
+                    }
+                    if dst_alpha {
+                        dp[dc - 1] = if src_alpha { sp[sc - 1] } else { T::opaque() };
+                    }
+                }
+            }
+            (Engine::Grid(g), SampleKind::U8 | SampleKind::U16) => {
+                let mut input = [0.0f64; 16];
+                let mut out = [0.0f64; 16];
+                for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+                    for c in 0..in_ch {
+                        input[c] = sp[c].to_unit();
+                    }
+                    g.eval(&input[..in_ch], &mut out);
+                    for c in 0..out_ch {
+                        dp[c] = T::from_unit(out[c]);
+                    }
+                    if dst_alpha {
+                        dp[dc - 1] = if src_alpha { sp[sc - 1] } else { T::opaque() };
+                    }
+                }
+            }
+            _ => {
+                let src_lab = self.src_layout.is_lab();
+                let dst_lab = self.dst_layout.is_lab();
+                let mut input = [0.0f64; 16];
+                let mut out = [0.0f64; 16];
+                for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+                    for c in 0..in_ch {
+                        input[c] = sp[c].to_unit();
+                    }
+                    if src_lab {
+                        input[0] /= 100.0;
+                        input[1] = (input[1] + 128.0) / 255.0;
+                        input[2] = (input[2] + 128.0) / 255.0;
+                    }
+                    self.chain.eval(&input, &mut out);
+                    if dst_lab {
+                        out[0] *= 100.0;
+                        out[1] = out[1] * 255.0 - 128.0;
+                        out[2] = out[2] * 255.0 - 128.0;
+                    }
+                    for c in 0..out_ch {
+                        dp[c] = T::from_unit(out[c]);
+                    }
+                    if dst_alpha {
+                        dp[dc - 1] = if src_alpha { sp[sc - 1] } else { T::opaque() };
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Gamut checking against a proofing profile.
+///
+/// Each source colour is taken to the PCS as it would arrive at `proof`
+/// (with `intent`), sent through the proof's PCS-to-device side and back
+/// through its relative-colorimetric device-to-PCS side; a colour is out of
+/// gamut when the round trip moves it by more than `threshold` CIEDE2000.
+/// Device values clipped by the proof's output side are what move it, so
+/// this flags both matrix-shaper and LUT gamut boundaries; LUT round-trip
+/// error inside the gamut is why the threshold is not zero. The `gamt` tag
+/// is not consulted.
+pub struct GamutCheck {
+    layout: Layout,
+    chain: GamutChain,
+    threshold: f64,
+}
+
+impl core::fmt::Debug for GamutCheck {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GamutCheck")
+            .field("layout", &self.layout)
+            .field("threshold", &self.threshold)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GamutCheck {
+    /// Builds a gamut check of `src` colours against `proof`.
+    ///
+    /// # Errors
+    /// As [`Transform::new`].
+    pub fn new(
+        src: &Profile,
+        layout: Layout,
+        proof: &Profile,
+        intent: Intent,
+        options: Options,
+        threshold: f64,
+    ) -> Result<Self> {
+        let chain = GamutChain::new(src, proof, intent, options.black_point_compensation)?;
+        if layout.color_space() != chain.in_space {
+            return Err(Error::InvalidTransform(
+                "layout does not match the source profile colour space",
+            ));
+        }
+        Ok(Self {
+            layout,
+            chain,
+            threshold,
+        })
+    }
+
+    /// The CIEDE2000 shift of each pixel through the proof round trip.
+    ///
+    /// # Errors
+    /// [`Error::BufferSize`] when `out` does not hold one value per pixel.
+    pub fn delta_e<T: Sample>(&self, src: &[T], out: &mut [f64]) -> Result<()> {
+        let sc = self.layout.channels();
+        if src.len() % sc != 0 || out.len() != src.len() / sc {
+            return Err(Error::BufferSize {
+                src: src.len(),
+                dst: out.len(),
+            });
+        }
+        let lab = self.layout.is_lab() && T::KIND == SampleKind::F32;
+        let mut input = [0.0f64; 16];
+        for (sp, o) in src.chunks_exact(sc).zip(out.iter_mut()) {
+            for c in 0..self.layout.color_channels() {
+                input[c] = sp[c].to_unit();
+            }
+            if lab {
+                input[0] /= 100.0;
+                input[1] = (input[1] + 128.0) / 255.0;
+                input[2] = (input[2] + 128.0) / 255.0;
+            }
+            let (a, b) = self.chain.eval(&input);
+            *o = delta_e_2000(a, b);
+        }
+        Ok(())
+    }
+
+    /// Marks each pixel `true` when it is out of the proof's gamut.
+    ///
+    /// # Errors
+    /// [`Error::BufferSize`] when `out` does not hold one flag per pixel.
+    pub fn check<T: Sample>(&self, src: &[T], out: &mut [bool]) -> Result<()> {
+        let mut d = vec![0.0; out.len()];
+        self.delta_e(src, &mut d)?;
+        for (o, v) in out.iter_mut().zip(d) {
+            *o = v > self.threshold;
+        }
+        Ok(())
+    }
+}
