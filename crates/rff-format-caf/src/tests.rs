@@ -304,3 +304,56 @@ fn registers_and_probes() {
     ]);
     assert_eq!(reg.probe(&file).map(|f| f.name), Some("caf"));
 }
+
+/// #125 follow-up: MPEG audio and FLAC in CAF (symphonia maps both).
+#[test]
+fn mpeg_audio_and_flac_follow_the_packet_table() {
+    let packets: [&[u8]; 2] = [&[0xFF, 0xFB, 1, 2], &[0xFF, 0xFB, 3]];
+    let table = varints(&[4, 3]);
+    for (tag, codec, fpp) in [
+        (b".mp1", CodecId::Mp1, 384),
+        (b".mp2", CodecId::Mp2, 1152),
+        (b".mp3", CodecId::Mp3, 1152),
+    ] {
+        let file = caf(&[
+            (b"desc", desc(44_100.0, tag, 0, 0, fpp, 2, 0)),
+            (b"pakt", pakt(2, 2 * fpp as i64, 0, &table)),
+            (b"data", data(&packets.concat())),
+        ]);
+        let (s, p) = demux(file).unwrap();
+        assert_eq!((s.codec_id, s.channels), (codec, 2));
+        let got: Vec<Vec<u8>> = p.iter().map(|p| p.data.clone()).collect();
+        assert_eq!(got, packets.map(<[u8]>::to_vec));
+        assert_eq!(p[1].pts, Some(fpp as i64));
+    }
+
+    // FLAC: the STREAMINFO comes out of the cookie's metadata blocks, whichever
+    // opening the cookie has.
+    let si: Vec<u8> = (0..34u8).collect();
+    let mut blocks = vec![0x04, 0, 0, 2, b'h', b'i']; // a VORBIS_COMMENT first
+    blocks.extend_from_slice(&[0x80, 0, 0, 34]);
+    blocks.extend_from_slice(&si);
+    let mut dfla = (12 + blocks.len() as u32).to_be_bytes().to_vec();
+    dfla.extend_from_slice(b"dfLa\0\0\0\0");
+    dfla.extend_from_slice(&blocks);
+    let flac_marker = [b"fLaC".as_slice(), &blocks].concat();
+    for (name, cookie, want) in [
+        ("dfLa box", dfla, si.clone()),
+        ("fLaC marker", flac_marker, si.clone()),
+        ("bare blocks", blocks.clone(), si.clone()),
+        ("no STREAMINFO", vec![1, 2, 3], vec![1, 2, 3]),
+    ] {
+        let file = caf(&[
+            (b"desc", desc(48_000.0, b"flac", 0, 0, 4096, 1, 0)),
+            (b"kuki", cookie),
+            (b"pakt", pakt(2, 8000, 0, &table)),
+            (b"data", data(&packets.concat())),
+        ]);
+        let (s, p) = demux(file).unwrap();
+        assert_eq!(s.codec_id, CodecId::Flac, "{name}");
+        assert_eq!(s.extradata, want, "{name}");
+        assert_eq!(p.len(), 2, "{name}");
+    }
+    // A truncated block list is not a panic.
+    assert_eq!(flac_streaminfo(&[0x80, 0, 0, 34, 1]), [0x80, 0, 0, 34, 1]);
+}

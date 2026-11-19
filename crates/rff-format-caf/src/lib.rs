@@ -14,6 +14,8 @@
 //! | `lpcm` (int 8-32 bit or float 32/64, either byte order) | `pcm`, byte-swapped to little-endian (8-bit widened to s16) |
 //! | `alac` | `alac`, one packet per ALAC frame, the cookie as extradata |
 //! | `aac ` | `aac`, one packet per AAC frame, the AudioSpecificConfig (from the cookie's ES descriptor) as extradata |
+//! | `.mp1` / `.mp2` / `.mp3` | `mp1` / `mp2` / `mp3`, one packet per MPEG audio frame |
+//! | `flac` | `flac`, one packet per FLAC frame, the STREAMINFO (from the cookie's metadata blocks) as extradata |
 //! | `ima4` | `adpcm_ima_qt`, whole 34-byte-per-channel frames |
 //! | `alaw` / `ulaw` | `pcm_alaw` / `pcm_mulaw` |
 //!
@@ -111,7 +113,8 @@ enum Plan {
     },
     /// Constant-size packets passed through (G.711, ima4).
     Constant(CodecId),
-    /// Variable-size packets from the packet table (ALAC, AAC).
+    /// Variable-size packets from the packet table (ALAC, AAC, MPEG audio,
+    /// FLAC).
     Variable(CodecId),
 }
 
@@ -152,6 +155,10 @@ fn plan_for(d: &Desc) -> Result<Plan> {
         b"ima4" => Ok(Plan::Constant(CodecId::AdpcmImaQt)),
         b"alac" => Ok(Plan::Variable(CodecId::Alac)),
         b"aac " => Ok(Plan::Variable(CodecId::Aac)),
+        b".mp1" => Ok(Plan::Variable(CodecId::Mp1)),
+        b".mp2" => Ok(Plan::Variable(CodecId::Mp2)),
+        b".mp3" => Ok(Plan::Variable(CodecId::Mp3)),
+        b"flac" => Ok(Plan::Variable(CodecId::Flac)),
         other => Err(Error::unsupported(format!(
             "caf demux: format `{}`",
             String::from_utf8_lossy(other)
@@ -319,6 +326,42 @@ fn aac_config(cookie: &[u8]) -> Vec<u8> {
     };
     find(0)
         .or_else(|| find(4))
+        .unwrap_or_else(|| cookie.to_vec())
+}
+
+/// The STREAMINFO inside a FLAC magic cookie, as the FLAC decoder takes it
+/// (the bare 34-byte block). The cookie holds FLAC metadata blocks with their
+/// headers, possibly inside a `dfLa`-style box (size, `dfLa`, version and
+/// flags) or after a `fLaC` marker; each of those openings is tried, and a
+/// cookie with no STREAMINFO is passed on as it is.
+fn flac_streaminfo(cookie: &[u8]) -> Vec<u8> {
+    let find_in = |mut blocks: &[u8]| -> Option<Vec<u8>> {
+        // Metadata blocks: a type byte (high bit = last), a 24-bit length.
+        while blocks.len() >= 4 {
+            let kind = blocks[0] & 0x7F;
+            let len = u32::from_be_bytes([0, blocks[1], blocks[2], blocks[3]]) as usize;
+            let body = blocks.get(4..4 + len)?;
+            if kind == 0 {
+                return (len == 34).then(|| body.to_vec());
+            }
+            if blocks[0] & 0x80 != 0 {
+                return None;
+            }
+            blocks = &blocks[4 + len..];
+        }
+        None
+    };
+    let mut starts = Vec::new();
+    if let Some(p) = cookie.windows(4).position(|w| w == b"dfLa") {
+        starts.push(p + 8); // after the tag and the FullBox version/flags
+    }
+    if let Some(p) = cookie.windows(4).position(|w| w == b"fLaC") {
+        starts.push(p + 4);
+    }
+    starts.push(0);
+    starts
+        .into_iter()
+        .find_map(|at| cookie.get(at..).and_then(find_in))
         .unwrap_or_else(|| cookie.to_vec())
 }
 
@@ -571,10 +614,10 @@ impl Demuxer for CafDemuxer {
             }
             Plan::Variable(codec) => {
                 let table = h.table.unwrap_or_default();
-                stream.extradata = if codec == CodecId::Aac {
-                    aac_config(&h.cookie)
-                } else {
-                    h.cookie.clone()
+                stream.extradata = match codec {
+                    CodecId::Aac => aac_config(&h.cookie),
+                    CodecId::Flac => flac_streaminfo(&h.cookie),
+                    _ => h.cookie.clone(),
                 };
                 if let Some(v) = table.valid_frames {
                     stream.duration = Some(v as i64);
