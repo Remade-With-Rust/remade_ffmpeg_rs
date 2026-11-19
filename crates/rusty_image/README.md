@@ -27,7 +27,7 @@ and the same bytes (HDR floats bit for bit).
 
 | corpus | identical | refused by both | mismatched |
 |---|---:|---:|---:|
-| BMP files (all header versions, bit depths, compressions, masks, top-down) | 3,953 | 47 | 0 |
+| BMP files (all header versions, bit depths, compressions, masks, top-down, masks-in-header-only) | 4,195 | 47 | 0 |
 | the same DIBs headerless (`CF_DIB` / `CF_DIBV5` path) | 3,856 | 144 | 0 |
 | TGA (types 1/2/3/9/10/11, 8-32 bit, colour maps, origins, RLE) | 3,199 | 801 | 0 |
 | Radiance HDR (new RLE, old RLE, flat) | 600 | 0 | 0 |
@@ -46,6 +46,62 @@ and the same bytes (HDR floats bit for bit).
 - **Damaged input:** more than 17,000 truncated and bit-flipped copies decoded
   without a panic. A header claiming more than 1 GiB of pixels, or a BMP side
   past 65,535, is refused before anything is allocated.
+
+## Against the C references (stb_image, qoi.h, ImageMagick 7, gdk-pixbuf)
+
+`bench-c/` decodes and encodes the same files with each engine, in one process (setup and method in `bench-c/README.md`).
+
+**Corpus:** 115 files.
+- 102 are small variants written by ImageMagick: every BMP depth (with and without RLE), core/V3/V5 headers, TGA raw/RLE/grey/colour-mapped, PNM ASCII and binary at 8 and 16-bit, PAM, HDR, QOI and ICO.
+- 13 are 8.3 Mpx versions of a real photograph.
+
+**Result:** no file that this crate refuses or decodes wrongly. The disagreements come from the other libraries:
+- **stb_image:** reads no RLE BMP and no PAM. It does not rescale low-maxval PNM. It decodes HDR as `(c + 0.5) * 2^(e-136)`; this crate, `image` and ImageMagick use `c * 2^(e-136)`.
+- **gdk-pixbuf:** returns 16-bit PNM as 8-bit.
+- **ImageMagick:** picks a different entry from multi-size icons. Its HDR values differ by at most 1.5e-5 (it stores pixels at 16 bits).
+
+The corpus did find one bug here, now fixed: a V5 bitfield BMP with its masks only inside the header. The `image` oracle now generates that layout too.
+
+**Decode speed** (Mpx/s, 8.3 Mpx photo; higher is faster; "-" means the engine does not read the format):
+
+| file | rusty_image | stb_image | qoi.h | ImageMagick 7 | gdk-pixbuf | image (Rust) |
+|---|---:|---:|---:|---:|---:|---:|
+| BMP 24-bit | **1756** | 539 | | 369 | 149 | 639 |
+| BMP 32-bit bitfields + alpha | **997** | 400 | | 147 | 107 | 558 |
+| BMP RLE8 | 461 | - | | 115 | 244 | **543** |
+| TGA 24-bit raw | 1576 | **1626** | | 88 | 158 | 1001 |
+| TGA RLE 24-bit | 273 | **288** | | 101 | 167 | 252 |
+| TGA RLE 32-bit | **990** | 265 | | 73 | 120 | 700 |
+| PPM 8-bit | 4691 | **7632** | | 330 | 197 | 4305 |
+| PPM 16-bit | 1122 | 297 | | 331 | 64 | **1168** |
+| PGM 8-bit | **16105** | 15304 | | 283 | 253 | 12554 |
+| PAM RGBA | 3019 | - | | 243 | - | **3099** |
+| HDR (RLE) | 161 | 133 | | 46 | | **210** |
+| QOI RGB | 212 | | 274 | 114 | | **279** |
+| QOI RGBA | 262 | | 271 | 52 | | **357** |
+
+**Encode speed** (Mpx/s):
+
+| output | rusty_image | stb_image_write | qoi.h | ImageMagick 7 |
+|---|---:|---:|---:|---:|
+| BMP 24-bit | **1325** | 1014 | | 138 |
+| BMP 32-bit | **1231** | 335 | | 110 |
+| TGA RLE 24-bit | **252** | 174 | | 61 |
+| TGA RLE 32-bit | **608** | 233 | | 49 |
+| PPM | **7988** | | | 160 |
+| HDR | 58 | **73** | | 20 |
+| QOI RGB | 191 | | **226** | 106 |
+| QOI RGBA | 199 | | **224** | 38 |
+
+**Summary:**
+- **Faster than every C engine** at BMP decode, RLE32 TGA decode, 16-bit PNM decode, and BMP, TGA and PPM encode.
+- **Faster than ImageMagick and gdk-pixbuf everywhere.**
+- **At parity with stb_image** on raw TGA, TGA RLE24 and PGM.
+- **Behind:**
+  - stb_image on 8-bit PPM (0.61x);
+  - qoi.h on QOI (0.77-0.97x decode, 0.85-0.89x encode);
+  - stb_image_write on HDR encode (0.80x).
+- **Against the `image` crate:** behind on QOI, HDR and RLE8 decode.
 
 ## API
 
