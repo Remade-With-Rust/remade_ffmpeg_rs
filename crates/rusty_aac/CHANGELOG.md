@@ -6,6 +6,16 @@ each release, under **Security**. The project follows
 decoder output is stable (gated against the ISO/IEC 14496-26 conformance suite);
 encoder output may change in minor releases when quality improves.
 
+## [2.1.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v2.1.0...rusty_aac-v2.1.1) - 2026-11-19
+
+### Fixed
+
+- *(aac)* a hearing floor in the mask, and pooled multichannel budgets ([#129](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/129))
+
+### Other
+
+- *(aac)* backticks in the #129 test-module doc
+
 ## [2.1.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v2.0.2...rusty_aac-v2.1.0) - 2026-11-18
 
 ### Added

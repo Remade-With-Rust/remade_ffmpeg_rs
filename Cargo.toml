@@ -104,7 +104,7 @@ rff-codec-pcm = { path = "crates/rff-codec-pcm", version = "0.6.2" }
 rff-codec-vorbis = { path = "crates/rff-codec-vorbis", version = "0.6.2" }
 rff-codec-flac = { path = "crates/rff-codec-flac", version = "0.6.2" }
 rff-codec-jxl = { path = "crates/rff-codec-jxl", version = "0.6.2" }
-rff-codec-aac = { path = "crates/rff-codec-aac", version = "1.1.17" }
+rff-codec-aac = { path = "crates/rff-codec-aac", version = "1.1.18" }
 rff-codec-vp9 = { path = "crates/rff-codec-vp9", version = "0.6.2" }
 rff-codec-av2 = { path = "crates/rff-codec-av2", version = "0.6.2" }
 rff-codec-mp3 = { path = "crates/rff-codec-mp3", version = "1.1.0" }
@@ -117,7 +117,7 @@ rusty_h265 = { path = "crates/rusty_h265", version = "0.7.1" }
 rusty_h265-accel = { path = "crates/rusty_h265-accel", version = "0.7.1", default-features = false }
 rusty_flac = { path = "crates/rusty_flac", version = "0.2.2" }
 rusty_mp3 = { path = "crates/rusty_mp3", version = "1.1.0" }
-rusty_aac = { path = "crates/rusty_aac", version = "2.1.0" }
+rusty_aac = { path = "crates/rusty_aac", version = "2.1.1" }
 rusty_vorbis = { path = "crates/rusty_vorbis", version = "0.1.3" }
 # jpeg: our own rusty_jpeg, from crates.io (the vendored copy is gone: one
 # repository publishes it — github.com/Remade-With-Rust/rusty_jpeg).
