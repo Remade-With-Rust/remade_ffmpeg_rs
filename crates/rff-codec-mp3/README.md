@@ -12,6 +12,9 @@ No C, no FFI, and no `unsafe` code in this crate.
 
 - **Decoding** of MPEG-1, MPEG-2 and MPEG-2.5 Layer III. It passes all 16 ISO
   conformance vectors and matches FFmpeg bit for bit on a 678-stream corpus.
+- **Decoding of MP2 and MP1** (Layers II and I, MPEG-1 and the MPEG-2 low
+  rates), registered as `mp2` and `mp1`. One decoder serves all three ids and
+  decodes whichever layer each frame header names.
 - **Encoding** at CBR or VBR, mono, stereo or joint stereo, configured with the
   usual FFmpeg options: `-b:a 192k` for a bitrate, `-q:a 0`–`9` for VBR quality.
 - **Input formats:** interleaved `s16` and `f32` frames are encoded directly,

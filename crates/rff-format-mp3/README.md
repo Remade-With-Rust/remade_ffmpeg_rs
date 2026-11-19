@@ -8,6 +8,8 @@ The native **MP3** elementary-stream container for **remade_ffmpeg_rs** — our 
 code, not a binding.
 
 - **Demux + mux** — frame sync, ID3 skipping, Xing/Info header handling.
+- **Reads MP2 and MP1 too** (`.mp2`, `.mp1`, `.mpa`, including free format): the
+  stream is labelled `mp2` / `mp1` / `mp3` by the layer of its first frame.
 - A bare MPEG audio elementary stream: there is no real container, which is exactly what this crate models.
 - Pure Rust, no C/FFI.
 

@@ -106,6 +106,10 @@ pub enum CodecId {
     /// IMA ADPCM as QuickTime stores it (`ima4`: 34-byte blocks of 64 samples
     /// per channel), in AIFF-C, CAF and MOV.
     AdpcmImaQt,
+    /// MPEG-1/2 Audio Layer II (MP2). Decode only.
+    Mp2,
+    /// MPEG-1/2 Audio Layer I (MP1). Decode only.
+    Mp1,
 }
 
 impl CodecId {
@@ -145,6 +149,8 @@ impl CodecId {
             CodecId::AdpcmMs => "adpcm_ms",
             CodecId::AdpcmImaWav => "adpcm_ima_wav",
             CodecId::AdpcmImaQt => "adpcm_ima_qt",
+            CodecId::Mp2 => "mp2",
+            CodecId::Mp1 => "mp1",
         }
     }
 
@@ -178,6 +184,7 @@ impl CodecId {
             | CodecId::AdpcmMs
             | CodecId::AdpcmImaWav
             | CodecId::AdpcmImaQt => MediaType::Audio,
+            CodecId::Mp2 | CodecId::Mp1 => MediaType::Audio,
         }
     }
 
@@ -235,6 +242,8 @@ impl CodecId {
             "adpcm_ms" => Some(CodecId::AdpcmMs),
             "adpcm_ima_wav" => Some(CodecId::AdpcmImaWav),
             "adpcm_ima_qt" | "ima4" => Some(CodecId::AdpcmImaQt),
+            "mp2" | "mp2float" => Some(CodecId::Mp2),
+            "mp1" | "mp1float" => Some(CodecId::Mp1),
             _ => None,
         }
     }
