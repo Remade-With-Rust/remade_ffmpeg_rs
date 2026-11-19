@@ -239,7 +239,11 @@ pub(crate) const QT_SAMPLES: usize = 64;
 /// channel order. `state` carries each channel's predictor and step index
 /// across packets, as QuickTime's decoder does. Returns s16 bytes and samples
 /// per channel; a trailing partial frame is ignored.
-pub(crate) fn decode_ima_qt(data: &[u8], state: &mut Vec<ImaChan>, channels: usize) -> (Vec<u8>, usize) {
+pub(crate) fn decode_ima_qt(
+    data: &[u8],
+    state: &mut Vec<ImaChan>,
+    channels: usize,
+) -> (Vec<u8>, usize) {
     if channels == 0 {
         return (Vec::new(), 0);
     }
@@ -281,7 +285,9 @@ mod tests {
     use super::*;
 
     fn s16s(b: &[u8]) -> Vec<i16> {
-        b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()
+        b.chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect()
     }
 
     /// A straightforward IMA encoder (the inverse of `expand_mul`), used to
@@ -306,7 +312,9 @@ mod tests {
     fn ima_wav_block_tracks_its_source() {
         let channels = 2;
         let groups = 127; // 8 header bytes + 127 * 8 = 1024: the usual stereo block, 1017 samples
-        let src: Vec<Vec<i32>> = (0..channels).map(|c| sine(1 + 8 * groups, c as f64)).collect();
+        let src: Vec<Vec<i32>> = (0..channels)
+            .map(|c| sine(1 + 8 * groups, c as f64))
+            .collect();
         let mut block = Vec::new();
         let mut enc = vec![ImaChan::default(); channels];
         // What the encoder's own decoder model reconstructs, per channel.
@@ -336,7 +344,11 @@ mod tests {
         // pins the header, the group interleave and the nibble order.
         for i in 0..samples {
             for c in 0..channels {
-                assert_eq!(got[i * channels + c] as i32, recon[c][i], "sample {i} ch {c}");
+                assert_eq!(
+                    got[i * channels + c] as i32,
+                    recon[c][i],
+                    "sample {i} ch {c}"
+                );
             }
         }
         // And once the step size has adapted, it tracks the source.

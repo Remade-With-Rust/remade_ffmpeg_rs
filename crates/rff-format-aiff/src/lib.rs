@@ -144,10 +144,7 @@ impl Plan {
     /// Repack whole file frames to what the packet carries.
     fn deliver(self, raw: Vec<u8>) -> Vec<u8> {
         match self {
-            Plan::Pcm {
-                bytes: 1,
-                ..
-            } => raw
+            Plan::Pcm { bytes: 1, .. } => raw
                 .iter()
                 .flat_map(|&b| ((b as i8 as i16) << 8).to_le_bytes())
                 .collect(),

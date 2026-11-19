@@ -27,22 +27,37 @@ pub fn register(registry: &mut CodecRegistry) {
         decoder: Some(|| Box::new(PcmDecoder::default())),
         encoder: Some(|| Box::new(PcmEncoder::default())),
     });
-    let decoders: [(rff_core::CodecId, &'static str, &'static str, fn() -> Box<dyn Decoder>); 5] = [
-        (rff_core::CodecId::PcmAlaw, "pcm_alaw", "PCM A-law (G.711)", || {
-            Box::new(CodedDecoder::new(Kind::Alaw))
-        }),
-        (rff_core::CodecId::PcmMulaw, "pcm_mulaw", "PCM µ-law (G.711)", || {
-            Box::new(CodedDecoder::new(Kind::Mulaw))
-        }),
-        (rff_core::CodecId::AdpcmMs, "adpcm_ms", "ADPCM Microsoft", || {
-            Box::new(CodedDecoder::new(Kind::Ms))
-        }),
-        (rff_core::CodecId::AdpcmImaWav, "adpcm_ima_wav", "ADPCM IMA WAV", || {
-            Box::new(CodedDecoder::new(Kind::ImaWav))
-        }),
-        (rff_core::CodecId::AdpcmImaQt, "adpcm_ima_qt", "ADPCM IMA QuickTime", || {
-            Box::new(CodedDecoder::new(Kind::ImaQt))
-        }),
+    let decoders: [DecoderEntry; 5] = [
+        (
+            rff_core::CodecId::PcmAlaw,
+            "pcm_alaw",
+            "PCM A-law (G.711)",
+            || Box::new(CodedDecoder::new(Kind::Alaw)),
+        ),
+        (
+            rff_core::CodecId::PcmMulaw,
+            "pcm_mulaw",
+            "PCM µ-law (G.711)",
+            || Box::new(CodedDecoder::new(Kind::Mulaw)),
+        ),
+        (
+            rff_core::CodecId::AdpcmMs,
+            "adpcm_ms",
+            "ADPCM Microsoft",
+            || Box::new(CodedDecoder::new(Kind::Ms)),
+        ),
+        (
+            rff_core::CodecId::AdpcmImaWav,
+            "adpcm_ima_wav",
+            "ADPCM IMA WAV",
+            || Box::new(CodedDecoder::new(Kind::ImaWav)),
+        ),
+        (
+            rff_core::CodecId::AdpcmImaQt,
+            "adpcm_ima_qt",
+            "ADPCM IMA QuickTime",
+            || Box::new(CodedDecoder::new(Kind::ImaQt)),
+        ),
     ];
     for (id, name, long_name, decoder) in decoders {
         registry.register(Codec {
@@ -55,6 +70,14 @@ pub fn register(registry: &mut CodecRegistry) {
         });
     }
 }
+
+/// A decode-only registration: id, name, long name, constructor.
+type DecoderEntry = (
+    rff_core::CodecId,
+    &'static str,
+    &'static str,
+    fn() -> Box<dyn Decoder>,
+);
 
 /// Which compressed layout a [`CodedDecoder`] reads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -448,7 +471,11 @@ mod tests {
         ms.push(0x1F);
         let af = decode(rff_core::CodecId::AdpcmMs, 1, ms);
         assert_eq!(af.samples, 4);
-        let af = decode(rff_core::CodecId::AdpcmImaWav, 1, vec![0x10, 0, 0, 0, 0x77, 0x77, 0x77, 0x77]);
+        let af = decode(
+            rff_core::CodecId::AdpcmImaWav,
+            1,
+            vec![0x10, 0, 0, 0, 0x77, 0x77, 0x77, 0x77],
+        );
         assert_eq!(af.samples, 9);
         let af = decode(rff_core::CodecId::AdpcmImaQt, 1, vec![0; 34]);
         assert_eq!(af.samples, 64);

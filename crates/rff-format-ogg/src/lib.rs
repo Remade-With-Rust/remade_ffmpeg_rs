@@ -1350,11 +1350,17 @@ mod tests {
             file.extend(raw_page(0x04, 7, 1, &[6, 5, 4], &body));
             let mut dem = OggDemuxer::new(Box::new(Cursor::new(file.clone())));
             let s = dem.read_header().unwrap().remove(0);
-            assert_eq!((s.codec_id, s.channels, s.sample_rate), (CodecId::Flac, 2, 44_100));
+            assert_eq!(
+                (s.codec_id, s.channels, s.sample_rate),
+                (CodecId::Flac, 2, 44_100)
+            );
             assert_eq!(&s.extradata[..4], b"fLaC");
             assert_eq!(s.extradata.len(), 42);
             let (_, _, packets) = demux_bytes(&file).unwrap();
-            assert_eq!(packets, frames, "declared {declared}: metadata dropped, frames kept");
+            assert_eq!(
+                packets, frames,
+                "declared {declared}: metadata dropped, frames kept"
+            );
         }
     }
 

@@ -81,7 +81,10 @@ mod tests {
         for b in 0..0x7Fu8 {
             let (lo, hi) = (ULAW[(0xFF - b) as usize], ULAW[(0xFE - b) as usize]);
             assert!(hi > lo, "µ-law not monotone at {b}");
-            let (lo, hi) = (ALAW[((b ^ 0x55) | 0x80) as usize], ALAW[(((b + 1) ^ 0x55) | 0x80) as usize]);
+            let (lo, hi) = (
+                ALAW[((b ^ 0x55) | 0x80) as usize],
+                ALAW[(((b + 1) ^ 0x55) | 0x80) as usize],
+            );
             assert!(hi > lo, "A-law not monotone at {b}");
         }
     }

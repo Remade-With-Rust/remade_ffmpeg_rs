@@ -486,7 +486,10 @@ impl Demuxer for WavDemuxer {
                 (coded.block_samples(raw.len(), self.channels) as i64, raw)
             }
             Some(Coded::G711(_)) => ((raw.len() / self.raw_frame) as i64, raw),
-            None => ((raw.len() / self.raw_frame) as i64, self.delivery.deliver(raw).1),
+            None => (
+                (raw.len() / self.raw_frame) as i64,
+                self.delivery.deliver(raw).1,
+            ),
         };
         let mut packet = Packet::from_data(0, data);
         packet.pts = Some(self.next_pts);
@@ -761,11 +764,15 @@ mod tests {
     fn s32_and_f64_pass_through_untouched() {
         let data: Vec<u8> = (0..64u8).collect();
         for (tag, bits, format) in [(1, 32, SampleFormat::S32), (3, 64, SampleFormat::F64)] {
-            let (s, packets) = header_and_packets(wav_file(&fmt_chunk(tag, 2, 48_000, bits), &data));
+            let (s, packets) =
+                header_and_packets(wav_file(&fmt_chunk(tag, 2, 48_000, bits), &data));
             assert_eq!((s.codec_id, s.sample_format), (CodecId::Pcm, Some(format)));
             let frames = 64 / (2 * bits as i64 / 8);
             assert_eq!(packets.len(), 1);
-            assert_eq!((packets[0].data.as_slice(), packets[0].duration), (&data[..], frames));
+            assert_eq!(
+                (packets[0].data.as_slice(), packets[0].duration),
+                (&data[..], frames)
+            );
         }
         // 20-bit audio lives in 3-byte containers.
         let (s, _) = header_and_packets(wav_file(&fmt_chunk(1, 1, 48_000, 20), &[0; 6]));
@@ -780,7 +787,10 @@ mod tests {
             assert_eq!((s.codec_id, s.channels, s.sample_rate), (codec, 2, 8000));
             assert_eq!(s.sample_format, Some(SampleFormat::S16));
             assert_eq!(packets.len(), 1);
-            assert_eq!((packets[0].data.as_slice(), packets[0].duration), (&data[..], 128));
+            assert_eq!(
+                (packets[0].data.as_slice(), packets[0].duration),
+                (&data[..], 128)
+            );
         }
     }
 
@@ -806,23 +816,50 @@ mod tests {
         let mut ext = Vec::new();
         ext.extend_from_slice(&500u16.to_le_bytes());
         ext.extend_from_slice(&7u16.to_le_bytes());
-        for (a, b) in [(256i16, 0i16), (512, -256), (0, 0), (192, 64), (240, 0), (460, -208), (392, -232)] {
+        for (a, b) in [
+            (256i16, 0i16),
+            (512, -256),
+            (0, 0),
+            (192, 64),
+            (240, 0),
+            (460, -208),
+            (392, -232),
+        ] {
             ext.extend_from_slice(&a.to_le_bytes());
             ext.extend_from_slice(&b.to_le_bytes());
         }
         let data = vec![0u8; 512 * 2 + 100];
         let (s, packets) = header_and_packets(wav_file(&adpcm_fmt(2, 2, 512, &ext), &data));
         assert_eq!(s.codec_id, CodecId::AdpcmMs);
-        assert_eq!(s.extradata, ext, "the coefficient table reaches the decoder");
-        let sizes: Vec<_> = packets.iter().map(|p| (p.data.len(), p.duration, p.pts)).collect();
-        assert_eq!(sizes, [(512, 500, Some(0)), (512, 500, Some(500)), (100, 88, Some(1000))]);
+        assert_eq!(
+            s.extradata, ext,
+            "the coefficient table reaches the decoder"
+        );
+        let sizes: Vec<_> = packets
+            .iter()
+            .map(|p| (p.data.len(), p.duration, p.pts))
+            .collect();
+        assert_eq!(
+            sizes,
+            [
+                (512, 500, Some(0)),
+                (512, 500, Some(500)),
+                (100, 88, Some(1000))
+            ]
+        );
 
         // IMA mono, 256-byte blocks: 1 + 8 * (252 / 4) = 505 samples.
         let data = vec![0u8; 256 * 3];
-        let (s, packets) = header_and_packets(wav_file(&adpcm_fmt(0x11, 1, 256, &505u16.to_le_bytes()), &data));
+        let (s, packets) = header_and_packets(wav_file(
+            &adpcm_fmt(0x11, 1, 256, &505u16.to_le_bytes()),
+            &data,
+        ));
         assert_eq!(s.codec_id, CodecId::AdpcmImaWav);
         assert!(s.extradata.is_empty());
-        assert_eq!(packets.iter().map(|p| p.duration).collect::<Vec<_>>(), [505, 505, 505]);
+        assert_eq!(
+            packets.iter().map(|p| p.duration).collect::<Vec<_>>(),
+            [505, 505, 505]
+        );
 
         // A block too small for its own headers is refused at the header.
         let file = wav_file(&adpcm_fmt(0x11, 2, 6, &[]), &[0; 12]);
@@ -891,7 +928,9 @@ mod tests {
                 .collect();
             let good = wav_file(&fmt, &data);
             for cut in 0..good.len() {
-                let _ = drive(Box::new(WavDemuxer::new(Box::new(Cursor::new(good[..cut].to_vec())))));
+                let _ = drive(Box::new(WavDemuxer::new(Box::new(Cursor::new(
+                    good[..cut].to_vec(),
+                )))));
             }
         }
     }
