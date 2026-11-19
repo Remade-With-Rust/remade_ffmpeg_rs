@@ -1073,6 +1073,40 @@ fn faststart_puts_moov_before_mdat_and_reads_back_the_same() {
 }
 
 #[test]
+fn a_cut_short_faststart_file_reads_its_samples_then_ends() {
+    // A download or copy cut short: `moov` (up front) still lists every
+    // sample, but the tail of `mdat` is missing. The samples that are there
+    // come out, in order, and the read ends in end-of-stream rather than an
+    // error (`demux` panics on any error, through both readers).
+    let streams = [
+        prores_stream(),
+        pcm_stream(1, SampleFormat::S16, 2, Some(*b"sowt")),
+    ];
+    let packets = interleave(
+        video_packets(|i| prores_frame(i, 2), 8),
+        pcm_packets(1, 1500, 8, 4),
+    );
+    let [fast, _] = mux_both_with(Flavor::Mov, &streams, &packets, &|m| {
+        assert!(m.set_option("movflags", "+faststart"));
+    });
+    let (_, want) = demux(&fast);
+    for pct in [40, 60, 95] {
+        let (_, got) = demux(&fast[..fast.len() * pct / 100]);
+        assert!(
+            !got.is_empty() && got.len() < want.len(),
+            "{pct}%: {}",
+            got.len()
+        );
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(
+                (g.stream_index, g.pts, &g.data),
+                (w.stream_index, w.pts, &w.data)
+            );
+        }
+    }
+}
+
+#[test]
 fn faststart_carries_the_timecode_sample() {
     // `prores_stream` has a timecode, so a `tmcd` track and its 4-byte sample.
     let streams = [prores_stream()];

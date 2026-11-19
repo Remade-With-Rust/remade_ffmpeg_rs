@@ -332,7 +332,7 @@ impl Mp4Demuxer {
     /// Read one indexed sample's bytes and shape them as a packet (Annex-B
     /// for H.264 / HEVC and little-endian PCM, unless `raw`).
     fn fetch(&mut self, loc: &SampleLoc) -> Result<Packet> {
-        let out_of_range = || Error::invalid("mp4 demux: sample out of range");
+        let out_of_range = || Error::invalid(OUT_OF_RANGE);
         let raw: Cow<[u8]> = match &mut self.src {
             Source::Buffered(buf) => Cow::Borrowed(
                 buf.get(loc.offset..loc.offset.checked_add(loc.size).ok_or_else(out_of_range)?)
@@ -703,7 +703,15 @@ impl Demuxer for Mp4Demuxer {
                 continue;
             }
             let loc = SampleLoc { ..*loc };
-            return self.fetch(&loc);
+            match self.fetch(&loc) {
+                // The sample's bytes are not in the file: a download or copy
+                // cut short (the `moov` up front still lists the rest), or one
+                // corrupt `stsz` entry. Skip it, as FFmpeg does, so the
+                // samples that are there all come out and a truncated file
+                // ends in end-of-stream instead of an error.
+                Err(Error::InvalidData(m)) if m == OUT_OF_RANGE => continue,
+                other => return other,
+            }
         }
     }
 
@@ -726,6 +734,9 @@ impl Demuxer for Mp4Demuxer {
         true
     }
 }
+
+/// The error for a sample whose bytes lie outside the file.
+const OUT_OF_RANGE: &str = "mp4 demux: sample out of range";
 
 impl SampleIndex for Mp4Demuxer {
     fn sample_count(&self, stream: usize) -> u64 {
