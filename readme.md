@@ -13,50 +13,132 @@ FREE RAG Converter Online -- <a href="https://RAGconverter.com">RAGconverter.com
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![Platforms: Windows · macOS · Linux · Web](https://img.shields.io/badge/platforms-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux%20%C2%B7%20Web-informational)
 
-> **remade_ffmpeg_rs** is a memory-safe media toolkit — decode, encode,
-> transcode, mux and probe audio/video — a ground-up **Rust** rebuild of
-> [FFmpeg](https://github.com/FFmpeg/FFmpeg) (LGPL-2.1+/GPL-2.0+/C), under a
-> permissive license, built for speed, safety, and zero copyleft strings.
-> Check out [FFAI](https://github.com/remade-with-rust/ffai), a sister project providing media for AI first world.
+**A memory-safe, ground-up Rust rebuild of [FFmpeg](https://github.com/FFmpeg/FFmpeg).**
+- **What it does:** decode, encode, transcode, mux and probe audio, video and images.
+- **How you use it:** the same `ffmpeg` / `ffprobe` commands and flags, or the same engine embedded as a library.
+- **License:** Apache-2.0, with no copyleft anywhere in the tree.
+- **Provenance:** a reimplementation, not a fork. Only FFmpeg's file formats and command line are matched; none of its code is used.
 
-> **Status — pre-1.0, and not yet independently audited.** APIs and codec
-> coverage are still moving, but nothing will ship that is not byte exact. See the
-> [security policy](SECURITY.md), the
-> [compatibility & patent matrix](docs/compatibility.md), and
-> [how to contribute](CONTRIBUTING.md).
->
-> Access our most important <a href="https://drive.google.com/drive/u/1/folders/1VjvP1zSJWH1DmkTqL1qEPt3OM8Ub8jPX">AI skills to building a new internet</a>.
+Sister project: [FFAI](https://github.com/remade-with-rust/ffai), media for an AI-first world.
 
----
-
-## The headline
-
-| Dimension | FFmpeg (C) | **remade_ffmpeg_rs (Rust) — today** | Goal |
-|---|:---:|:---:|:---:|
-| Memory-safety CVEs (core path) | many, historically | **0 — safe Rust** | structural |
-| Conformance | reference | **bit-exact** (VP9 315/315 vectors; HEVC 147/147 JCT-VC streams; MP3 vs FFmpeg) | maintain |
-| **HEVC decode**, 1 thread | 1.0× | **1.37× faster** on weighted prediction · **parity** on deblocking-heavy and 10-bit · **0.80–0.86×** on mainstream 8-bit inter — pinned core, self-timed decode, paired verdicts; **1.23–1.50× faster** than 0.6 after an instruction-count campaign, bit-exact | → parity |
-| VP9 decode, 1 thread | 1.0× | **~0.16–0.21×** as measured on 0.1 — younger, optimizing; 0.2 decodes **1.09–1.23× faster** than 0.1 after an instruction-count campaign (17.6–34.4% fewer instructions), identical output | → parity |
-| VP9 encode, 1 thread | 1.0× | **~0.3×**, at **~+36% bitrate** as measured on 0.1 — matched settings, equal PSNR; 0.2 encodes **1.48–2.02× faster** than 0.1 with a byte-identical bitstream | → parity |
-| AAC encode (24 s clips) | 1.0× | **3.2–7.9× faster** — frame-parallel (ffmpeg's AAC is 1-thread) | maintain |
-| Vorbis encode (stereo music) | 1.0× | **~5.3× faster** — frame-parallel; the **first permissive-Rust Vorbis encoder** | → single-thread |
-| Opus encode (`libopus`) | 1.0× | **1.50× faster** CELT speech · **1.60×** stereo music · **0.96×** SILK — 1 core each, pinned CPU, coding path verified; **quality at parity** (mean −0.015 BD-ODG, 18 classes) · frame-parallel adds wall-clock on top | maintain |
-| **MP3 decode** | 1.0× | **1.24× faster** on 1 core · **1.39×** on 2 (two-stage pipeline) — matched physical cores, decode-only both sides, 15/15 pairs, at **lower total CPU** (1,875 vs 2,125 ms) | maintain |
-| PNG decode | 1.0× | **2.55–2.89× faster** (median 2.60×) — 1 core each, decode-only, identical work | maintain |
-| PNG encode | 1.0× | **0.94–1.05× per core** on public CLIC photographs, **0.86–0.91×** on video frames — encode-only from raw, matched filter *and* size, at 0.2–0.3% *smaller* · **2.11–3.06× faster** wall-clock (block-parallel) | → per-core parity on video frames |
-| License + embedding | LGPL/GPL · C FFI | **Apache-2.0 · pure Rust · no FFI** | — |
+> **Status:** pre-1.0 and not yet independently audited. APIs and codec coverage
+> are still moving; nothing ships that is not byte-exact against its oracle.
+> See [SECURITY.md](SECURITY.md), the [compatibility & patent matrix](docs/compatibility.md)
+> and [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
-## What is remade ffmpeg? Why did we make it?
+## Built for files that fight back
 
-`remade_ffmpeg_rs` rebuilds FFmpeg's pipeline — demux → decode → filter →
-encode → mux — as a set of small, composable Rust crates. The goal is that
-anyone using it *feels* like they're using FFmpeg (same `ffmpeg`/`ffprobe`
-commands, same flags) while getting memory safety, a clean embeddable library
-API, and a permissive license with no GPL/LGPL anywhere in the tree. It's a
-reimplementation, not a fork: no FFmpeg source is copied — only its file
-formats and command-line interface are matched.
+Media decoders are where memory-safety bugs live: they parse untrusted bytes at high speed. Our codecs are built to the opposite standard:
+- each one is checked against an external oracle;
+- each one is fed damaged and hostile input;
+- each speed-up is gated on identical output.
+
+| Gate | Evidence |
+|---|---|
+| **Conformance** | **VP9:** all 315 libvpx vectors bit-exact, checked in CI. **HEVC:** 147/147 JCT-VC streams bit-exact. **AV2:** a 47-clip corpus byte-identical to AOM's `avmdec`. **H.264:** 35/35 openh264 conformance streams bit-exact against `h264dec`, and our encoder's output decodes bit-exactly in FFmpeg at QP 0–51. **AAC:** all 83 non-USAC ISO/IEC 14496-26 streams within 1 LSB of FFmpeg, re-checked in CI against FATE. **MP3:** bit-exact against FFmpeg; Layer I/II within 1 LSB of the ISO vectors. |
+| **Hostile input** | **VP9:** 50,000 malformed streams per CI run, none may panic. **JPEG:** 117,120 mutated decodes, 0 panics. **PNG:** 175/175 pngsuite files plus 2,100 mutated inputs, 0 panics. **AAC and MP3:** cargo-fuzz corpus replay on every change, plus nightly fuzz sessions. |
+| **Damaged files** | **Our sweep:** 824 damaged audio files (truncated, bit-flipped, zeroed blocks), decoded side by side with symphonia. We recover at least as much audio on every one, and more on 184. **Independent check:** a paired run by ArtCraft over 434 files, 235 of them damaged ([#125](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/issues/125)). Its one shortfall is fixed in 0.6.3. |
+| **Memory safety** | Safe Rust on the core path. The H.264 and HEVC codec cores are `#![forbid(unsafe_code)]`. SIMD is isolated behind runtime dispatch, and each kernel keeps a scalar twin as its test oracle. Miri runs on the AAC and MP3 libraries. |
+| **Speed without drift** | Each optimization is gated against the code it replaces: identical output on exact paths, a bounded error plus end-to-end SNR on float paths. Example: ALAC decode got about 2× faster in 0.6.3, with byte-identical output on every fixture. |
+| **Supply chain** | `cargo-deny` (no copyleft), `cargo-audit`, `cargo-vet` and a CycloneDX SBOM per crate closure, with MSRV 1.85. |
+
+When a downstream team finds a fault, the fix ships with a regression test and measured before/after numbers. [#125](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/issues/125) and [#129](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/issues/129) show the loop.
+
+## Speed against FFmpeg
+
+Each comparison runs on one pinned core with paired, interleaved runs and the same work in both arms. [docs/benchmarks.md](docs/benchmarks.md) has the methods.
+
+| | vs FFmpeg (C) |
+|---|---|
+| **AAC encode** | **3.2–7.9× faster**, frame-parallel (FFmpeg's encoder is single-threaded) |
+| **Vorbis encode** | **~5.3× faster**, frame-parallel; the first permissive-Rust Vorbis encoder |
+| **PNG decode** | **2.55–2.89× faster** |
+| **Opus encode** (vs `libopus`) | **1.50×** on CELT speech and **1.60×** on stereo music, per core, at quality parity (−0.015 BD-ODG over 18 classes) |
+| **HEVC decode** | **1.37×** on weighted prediction; parity on deblocking-heavy and 10-bit streams; **0.80–0.86×** on mainstream 8-bit inter |
+| **MP3 decode** | **1.24×** on 1 core and **1.39×** on 2, at lower total CPU |
+| **VP9** | younger, still being optimized: decode about 0.2×, encode about 0.3× at about +36% bitrate (both measured on 0.1) |
+
+## Codecs and formats
+
+Every backend is pure Rust with no C/C++ FFI, and every container (de)muxer is our own code. [docs/codecs.md](docs/codecs.md) has the full per-codec detail and measurements.
+
+| Codec | Decode | Encode | Backend |
+|---|:---:|:---:|---|
+| H.264 | ✅ | ✅ | [`rusty_h264`](https://crates.io/crates/rusty_h264) |
+| HEVC | ✅ | | [`rusty_h265`](https://crates.io/crates/rusty_h265) |
+| VP9 | ✅ | ✅ | [`rusty_vp9`](https://crates.io/crates/rusty_vp9) |
+| AV1 / AVIF | ✅ | ✅ | [`rusty_av1d` / `rusty_av1e`](https://github.com/Remade-With-Rust/rusty-av1-toolkit) |
+| AV2 (research preview) | ✅ | | [`rusty_av2d`](https://crates.io/crates/rusty_av2d) |
+| AAC (LC, Main, LTP, HE v1/v2, LD/ELD) | ✅ | ✅ LC | [`rusty_aac`](https://crates.io/crates/rusty_aac) |
+| MP3 / MP2 / MP1 | ✅ | ✅ MP3 | [`rusty_mp3`](https://crates.io/crates/rusty_mp3) |
+| Opus | ✅ | ✅ | [`rusty-opus`](https://crates.io/crates/rusty-opus) |
+| Vorbis | ✅ | ✅ | [`rusty_vorbis`](https://crates.io/crates/rusty_vorbis) |
+| FLAC | ✅ | ✅ | [`rusty_flac`](https://crates.io/crates/rusty_flac) |
+| ALAC | ✅ | | in-house |
+| PCM, G.711, MS/IMA ADPCM | ✅ | ✅ PCM | in-house |
+| PNG, JPEG, WebP | ✅ | ✅ | [`rusty_png`](https://crates.io/crates/rusty_png), [`rusty_jpeg`](https://crates.io/crates/rusty_jpeg), [`rusty_webp`](https://crates.io/crates/rusty_webp) |
+| GIF · JPEG XL | ✅ | ✅ GIF | `gif` · `jxl-oxide` |
+
+**Containers:**
+- **Demux and mux:** MP4/MOV (including fragmented read), Matroska/WebM, Ogg, WAV (RF64/BW64), FLAC, AVI, IVF, AVIF and the image formats.
+- **Demux only:** AIFF/AIFF-C and CAF.
+
+## Install
+
+```sh
+cargo install rff-cli                           # rff + rffprobe
+cargo install rff-cli --features drop-in-names  # also ffmpeg + ffprobe
+cargo add remade-ffmpeg                         # the engine as a library
+```
+
+The drop-in names are opt-in because they shadow a real FFmpeg on your `PATH`. Prebuilt archives with both name pairs are on [Releases](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/releases).
+
+## Quick start
+
+```sh
+rff -codecs                                          # what this build supports
+rffprobe input.mp4                                   # inspect a file
+rff -i input.wav -c:a aac -b:a 128k -y output.m4a    # WAV -> AAC in MP4
+rff -i input.wav -c:a flac -y output.flac            # lossless
+rff -i input.avif -c:v avif -y output.avif           # AV1 decode + re-encode
+```
+
+The engine also runs as an API-first HTTP server:
+
+```sh
+cargo run -p rff-server   # listens on 127.0.0.1:8080
+curl localhost:8080/v1/codecs
+```
+
+## Architecture
+
+The Cargo workspace mirrors FFmpeg's library split:
+- a dependency-free core (`rff-core`);
+- codec and format layers (`rff-codec`, `rff-format`);
+- one crate per codec and per container;
+- the engine facade (`rff`, published as `remade-ffmpeg`);
+- thin front-ends: `rff-cli`, `rff-server`, and a Dioxus `rff-ui`.
+
+Adding a backend means implementing `Decoder`/`Encoder` or `Demuxer`/`Muxer` and calling `register(...)`. [docs/architecture.md](docs/architecture.md) has the details, and [docs/roadmap.md](docs/roadmap.md) has what's next: AV2 encode, fMP4/CMAF, low-latency live, IAMF.
+
+**Server authentication:**
+- **MATA mID:** a locally verified cryptographic identity, with no central auth server (`rff-auth`, feature `mata-mid`).
+- **Bearer tokens:** a standard bearer-token option for stock clients.
+
+**Building from source:**
+- **Toolchain:** Rust 1.85+.
+- **Commands:** `cargo build`. The default `h264-asm` feature is portable Rust SIMD with no assembler or C; `--no-default-features` gives scalar H.264, and `--features https` adds TLS input.
+
+## License, patents, trademark
+
+- **License:** Apache-2.0. The library, CLI, server and every codec/format crate have **no copyleft** in their dependency tree, enforced in CI by `cargo-deny`. The optional Dioxus UI is scoped out of that gate, since its webview stack pulls in MPL-2.0 crates.
+- **Patents:** this is a clean-room reimplementation, which clears copyright but not patents.
+  - **No obligations:** most of the stack is royalty-free or patent-expired (AV1, VP9, Opus, FLAC, Vorbis, PNG, JPEG, WebP, MP3).
+  - **Patent-relevant:** **H.264 and AAC**. As with FFmpeg, no patent license is granted, and any royalties fall to whoever distributes or commercially deploys a product that includes them.
+  - Details are in [docs/compatibility.md#patents](docs/compatibility.md#patents). This is not legal advice.
+- **Trademark:** not affiliated with or endorsed by the FFmpeg project. "FFmpeg" is a trademark of Fabrice Bellard. The `ffmpeg`/`ffprobe` names exist only for command-line compatibility.
 
 ## Remade With Rust
 
@@ -74,250 +156,6 @@ safer.
 → More projects: **[remadewithrust.com](https://remadewithrust.com)** and **[github.com/remade-with-rust](https://github.com/remade-with-rust)** 
 
 <!-- /ORG BOILERPLATE -->
-
-## Features
-
-- **Drop-in CLI.** `rff` and `rffprobe` binaries that speak the flags you
-  already know (`-i`, `-c:v`, `-c:a`, `-b:v`, `-f`, `-y`, `-codecs`, ...), and
-  install as `ffmpeg`/`ffprobe` on request (`--features drop-in-names`).
-- **Layered, swappable architecture.** One crate per codec and per container,
-  registered into a central engine — mirrors FFmpeg's `libav*` split. See
-  [docs/architecture.md](docs/architecture.md).
-- **API-first.** The CLI and the HTTP server are thin shells over the `rff`
-  engine library, so AI agents and remote tools get first-class access.
-- **Sovereign auth.** Server access uses [MATA mID](https://www.mata.network)
-  verification — a locally-verified cryptographic identity, no central auth.
-- **One UI, every target.** A [Dioxus](https://dioxuslabs.com) front-end for
-  web, PWA, desktop (Windows/macOS) and mobile (iOS/Android) from one codebase.
-- **Permissive license** (Apache-2.0) — embed it in closed-source software freely.
-- **100% safe Rust** on the core path; every future `unsafe` boundary documented and isolated.
-
-### Codecs & formats (growing)
-
-| Codec | Backing crate | License | Pure Rust |
-|---|---|---|---|
-| AV1 encode (avif) | [`rusty_av1e`](https://github.com/Remade-With-Rust/rusty-av1-toolkit) | BSD-2-Clause | ✅ (our rav1e fork; pure-Rust, no asm) |
-| AV1 decode (avif) | [`rusty_av1d`](https://github.com/Remade-With-Rust/rusty-av1-toolkit) | BSD-2-Clause | ✅ (our rav1d fork; Rust port of dav1d) |
-| **AV2 decode** | **in-house** ([`rusty_av2d`](https://crates.io/crates/rusty_av2d)) | BSD-2-Clause | ✅ (byte-identical vs AVM across a 45-clip corpus; standalone crate) |
-| H.264 decode/encode | [`rusty_h264`](https://crates.io/crates/rusty_h264) | BSD-2-Clause | ✅ (portable Rust SIMD, no C, no assembler) |
-| **HEVC decode** | **in-house** ([`rusty_h265`](https://crates.io/crates/rusty_h265)) | Apache-2.0 | ✅ (147/147 JCT-VC conformance streams bit-exact; 0.80× to 1.37× FFmpeg's single-thread speed; `forbid(unsafe_code)` core; standalone crate) |
-| VP9 decode/encode | **in-house** ([`rusty_vp9`](https://crates.io/crates/rusty_vp9)) | Apache-2.0 | ✅ (bit-exact vs all 315 libvpx vectors; 0.2 encodes 1.5–2.0× and decodes 1.1–1.2× faster than 0.1; standalone crate) |
-| AAC decode/encode | **in-house** ([`rusty_aac`](https://crates.io/crates/rusty_aac)) | Apache-2.0 | ✅ (decode: LC, Main, LTP, HE-AAC v1/v2, ER LD/ELD; encode: AAC-LC; standalone crate) |
-| MP3 decode/encode | **in-house** ([`rusty_mp3`](https://crates.io/crates/rusty_mp3)) | Apache-2.0 | ✅ (decoder bit-exact vs FFmpeg; standalone crate) |
-| PNG encode/decode | **in-house** ([`rusty_png`](https://crates.io/crates/rusty_png)) | MIT OR Apache-2.0 | ✅ (performance fork of `image-rs/image-png`; pure-Rust `zlib-rs` DEFLATE, parallel encode; standalone crate) |
-| JPEG decode/encode | **in-house** ([`rusty_jpeg`](https://crates.io/crates/rusty_jpeg)) | (MIT OR Apache-2.0) AND IJG | ✅ (vendored merge of `jpeg-decoder` + `jpeg-encoder`; baseline + progressive; standalone crate) |
-| GIF encode/decode | [`gif`](https://crates.io/crates/gif) | MIT/Apache-2.0 | ✅ |
-| WebP encode/decode | **in-house** ([`rusty_webp`](https://crates.io/crates/rusty_webp)) | MIT OR Apache-2.0 | ✅ (performance/feature fork of `image-rs/image-webp`; 0.2 decodes 1.1–1.5× and encodes 1.3–2.2× faster than 0.1 with identical output; standalone crate) |
-| Opus encode/decode | [`rusty-opus`](https://crates.io/crates/rusty-opus) (our `opus-rs` fork) | BSD-3-Clause | ✅ (AVX2 SILK + frame-parallel; pure Rust, no C/FFI) |
-| Vorbis encode + decode | **in-house** ([`rusty_vorbis`](https://crates.io/crates/rusty_vorbis)) | Apache-2.0 | ✅ (first permissive Rust Vorbis encoder; decoder matches FFmpeg 8.1 — same frame counts, max abs diff ~2e-7 — and is ~1.5x faster than symphonia; the CLI decodes Vorbis with it) |
-| FLAC decode | [`claxon`](https://crates.io/crates/claxon) | Apache-2.0 | ✅ |
-| FLAC encode | **in-house** (`rff-codec-flac`) | Apache-2.0 | ✅ (lossless, no dep) |
-| JPEG XL decode | [`jxl-oxide`](https://crates.io/crates/jxl-oxide) | MIT/Apache-2.0 | ✅ |
-
-**Codec backends — every one is 100% Rust (no C/C++ FFI) and permissively licensed.** Container (de)muxers are our own code. See [docs/pure-rust-codecs.md](docs/pure-rust-codecs.md) for the full vetted survey (what's clean, what's license-blocked, what has no pure-Rust option).
-
-| Kind | Supported | Status |
-|---|---|---|
-| Video codec | **vp9** (VP9) | **decode + encode** — in-house pure-Rust (**`rusty_vp9`**, also usable standalone). Decoder **bit-exact against all 315 official libvpx conformance vectors** (profiles 0–3, 8/10/12-bit, AVX2 + NEON). Encoder: RDO partition/mode, rate control (CBR + two-pass), golden/ALT-REF + temporal filtering, compound (bi-directional) prediction, **validated pixel-exact vs libvpx & ffmpeg**. Read at a **matched operating point** — both encoders in constant-quality mode at the same cq ladder, speed preset and lookahead, compared at equal PSNR — it needs **~+36% bitrate** and runs **~3× slower** than libvpx on the Derf CIF set (measured on 0.1; 0.2 encodes **1.5–2.0× faster** than 0.1 with a byte-identical bitstream, so the speed gap has narrowed but has not been re-measured against libvpx). (Keyframe-only BD-rate is ~+0.9%: the gap is the **inter** path, not residual coding.) Younger than libvpx, actively optimizing |
-| Video codec | **h264** (H.264 / AVC) | **decode + encode** — in-house pure-Rust (**[`rusty_h264`](https://crates.io/crates/rusty_h264)**, also usable standalone), **default**. Codec core is `#![forbid(unsafe_code)]`; `unsafe`/asm is confined to one acceleration crate. Decoder **bit-exact vs Cisco's `h264dec`** across openh264's conformance corpus (35/35 clean streams) and **pixel-exact vs FFmpeg** on the CABAC paths; encoder decodes **bit-exactly under FFmpeg across QP 0–51**. Decode speed measured on **x264-encoded** 720p (our own encoder's output understates decode cost — its fast preset emits no sub-pel motion, skipping the whole interpolation path), one pinned core, CPU time, ABBA-alternated, 9 pairs, **9/9 with z = 3.00**: **1.98× / 2.16× / 2.06× behind FFmpeg's native `h264`** at x264 `veryfast` (baseline/CAVLC) / `medium` (main/CABAC) / `slower` (high) — i.e. **213 / 146 / 125 Mpx/s** vs 412 / 294 / 255. Younger than FFmpeg's h264, actively optimizing |
-| Video codec | **AV1** (AV1) | **decode + encode** — the royalty-free next-gen codec, **100% pure Rust, no C/FFI**. Our [rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit) (`rusty_av1d` / `rusty_av1e`, BSD-2) forks **rav1d** (Rust port of VideoLAN's **dav1d**, the world's fastest AV1 decoder) + **rav1e** (the reference pure-Rust AV1 encoder), with a no-`nasm`, no-asm pure-Rust build path. Our encoder fork runs **~1.10× faster than stock rav1e at byte-identical output**, or up to **~1.69× faster** in opt-in `--racecar` mode |
-| Video codec | **av2** (AV2) | **decode** — AOMedia's successor to AV1, **100% pure Rust, no C/FFI** ([`rusty_av2d`](https://crates.io/crates/rusty_av2d), also usable standalone). The first independent AV2 decoder: every clip in a **47-clip conformance corpus decodes byte-identical to AOM's `avmdec`**, alongside 112 unit/integration tests — a single differing byte fails the gate. Coverage spans all intra modes, compound prediction and B-pyramids, TIP (including TIP-as-output), the warp family, wedge compound, all five in-loop filters, delta-Q, loop restoration, TX partitioning, 64px and 128px superblocks, the full {8,10-bit} × {4:2:0, 4:2:2, 4:4:4} matrix, film grain, S-frames, palette/screen content, quantization matrices, multi-tile streams, and non-superblock-aligned frame dimensions; eleven clips are single-tool-disabled controls verifying each sequence-header gate in both directions. Forked from rav1d and retargeted AV1→AV2 by inverting the AVM reference decoder's parse against a symbol-level oracle. **Research preview** — AV2 is not a finalized standard (no official vectors exist; the bitstream may still change), performance is unoptimized and unmeasured, and there is **no AV2 encoder**. Reads `.ivf` (fourcc `AV02`) |
-| Image codec | **avif** (AV1 still image) | **decode + encode**, 8- & 10-bit (`rusty_av1d` / `rusty_av1e`) |
-| Image codec | **png** | **decode + encode** — in-house pure-Rust (**[`rusty_png`](https://crates.io/crates/rusty_png)**, also usable standalone). A performance fork of `image-rs/image-png`, carried forward in-tree, gated against upstream on 330 comparisons (11 images × 30 configurations): **upstream's decoder reads our output back to the source pixels 330/330**, and encode bytes match upstream 190/330 — the 140 that differ are `Default`/`Best` streaming a run of 256 KiB IDATs where upstream writes one giant chunk, which leaves the DEFLATE payload byte-for-byte identical and costs **+0.0045%** file size. Full colour-type and bit-depth coverage, APNG, interlacing. **DEFLATE via `zlib-rs`** — flate2's pure-Rust zlib rewrite, so no C enters the tree — which measured **1.68–2.72× faster** than the stock `miniz_oxide` backend at size parity. **Multi-threaded DEFLATE for a single image** (pigz-style block splitting; ffmpeg's PNG encoder is single-threaded per image): **2.11–3.06× faster end-to-end at 0.1–0.2% smaller**, with blocks *sized* not counted so an image too small to split stays serial and pays **+0.00%**. Encoder settings **dispatch on content** — a measured repeated-pixel signal that separates photographs (0.0366–0.2037) from graphics (0.5312–0.9790) with nothing between — plus automatic gray/palette narrowing, together taking nine real screenshots/charts/diagrams from **+115.6% to −6.1%** against ffmpeg's default while leaving photographs byte-identical. 16-bit input reduces to 8-bit **matching ffmpeg exactly** (100.00% agreement over 6.2 M samples, against 66.01% for the truncation it replaced). **IDAT is streamed, not accumulated** — the encoder used to build the entire compressed stream in one buffer and copy all of it into the writer, because a chunk carries its length ahead of its payload; emitting fixed 256 KiB chunks removes the need to know the total at all. The parallel path streams too — it had been making **three** full-size copies (each worker's block, a buffer concatenating them, then a third to prepend two header bytes), and its IDAT payload is byte-identical at 2, 4 and 8 threads. With a matching fix to a redundant whole-frame clone in the codec glue, **peak memory falls 24–40%** measured same-config at both ends: level 6 single-thread **39–40%** (park_joy 94.9 → 57.6 MB), level 6 `-threads 8` **27–29%** (118.7 → 85.1 MB), default `Fast` **24–26%** (101.1 → 77.3 MB). These are memory results only: every accompanying speed measurement landed inside the noise floor and none is claimed. `-compression_level`, `-pred`, `-threads`. Measured on the **public CLIC professional** validation set (native-RGB photography — citable, reproducible) alongside the Derf/xiph frames, one instrument, each direction measured *alone*: **decode-only 2.55–2.89× faster** than ffmpeg (median 2.60×, z = 3); **encode-only from raw**, at matched filter *and* matched size, **0.94–1.05× on CLIC photographs** (median 0.97×) and **0.86–0.91× on video frames**, at 0.2–0.3% *smaller*. That split is real and reported as two ranges rather than averaged. Whatever residue remains is `zlib-rs` vs zlib, not PNG, since the profiler puts DEFLATE at 94–99.5% of encode. 175/175 pngsuite files and 2,100 randomly-mutated inputs: **zero panics** |
-| Image codec | **mjpeg** (JPEG/MJPEG) | **decode + encode** — in-house pure-Rust (**[`rusty_jpeg`](https://crates.io/crates/rusty_jpeg)**, also usable standalone). Baseline **and** progressive DCT, planar YUV in/out, `-q:v` / `-sampling` / `-progressive` / `-optimize_huffman` / `-trellis` / `-restart_interval`. **At parity with FFmpeg 8.1.2** on both halves at matched output size (encode median 0.96×, N=41; decode 1.02×, N=31 — paired, interleaved, pinned CPU time). **Box-averaged chroma** downsampling is worth −17.12% BD-rate on chroma-detailed content vs the point-sampling it replaced. `-optimize_huffman 1` gives −7.4% file size, losslessly, for ~2× encode. AVX2/SSE4.1 kernels on x86 and NEON on aarch64, each with a scalar twin asserted bit-exact in CI; ARM kernels verified on real ARM hardware. Fuzzed, and validated against a foreign-encoder corpus — 117,120 mutated decodes, zero panics |
-| Image codec | **gif** | **decode + encode** (pure-Rust `gif`; first frame) |
-| Image codec | **webp** (VP8/VP8L) | **decode + lossless encode** — in-house pure-Rust (**[`rusty_webp`](https://crates.io/crates/rusty_webp)**, our fork of `image-rs/image-webp` 0.2.4, also usable standalone). **Decode:** VP8 (lossy), VP8L (lossless), and **animated WebP** — all frames, composited, with per-frame durations (FFmpeg's native webp decoder errors on animated files). Still lossy images decode straight to their native YUV 4:2:0 planes — no RGB round-trip — and the output is **bit-exact with FFmpeg's decoder** on every corpus image. Measured (pinned CPU time, ABBA-interleaved, N=31, null-arm ≤5%, 8K real-content corpus): **lossy decode 1.24–1.29× faster than FFmpeg** (batched branch-free loop-filter kernels ~6× on a stage that was 49% of decode, a block-scoped fast session in the boolean decoder, and a DC-only IDCT path — each bit-exact-gated against in-tree scalar oracles), **lossless decode ~2.15× faster**. Those ratios were measured on 0.1; **0.2 is faster again with identical pixels** (0.1 → 0.2, pinned interleaved pairs: lossy decode **1.31–1.41×**, lossless decode **1.12–1.16×**, animations **1.5×**, after an instruction-count campaign that removed 36–45% of lossy-decode instructions; stills gated bit-exact against libwebp 1.5.0), and it fixes animated frames whose opaque pixels decoded one level too dark. **Encode (lossless VP8L):** greedy hash-chain LZ77 backward references, color cache (size picked per image by entropy estimate), and per-tile predictor selection (14 modes, 16-px tiles) behind a run-rate content dispatch — **1.6–2.8× faster than libwebp's default effort (m4)** at **+4–13% size on photos** (smaller than libwebp's fastest mode m0 on every corpus image) and up to **39% smaller than m4 on screen/repeated content**. Those encode figures are from 0.1 as well: 0.2 encodes **1.3–2.2× faster than 0.1** and writes byte-identical files. Lossy (VP8) encoding not yet implemented |
-| Image codec | **jpegxl** (JPEG XL) | **decode** (pure-Rust `jxl-oxide`; no Rust encoder yet) |
-| Audio codec | **aac** | in-house **`rusty_aac`** (also usable standalone) — **decoder** for the MPEG-4 AAC family short of USAC: AAC-LC, Main, LTP, **HE-AAC v1/v2 (SBR, PS)**, ER AAC-LC/LTP, AAC-LD, AAC-ELD, 960-sample frames, PCE layouts, LATM; all 83 non-USAC ISO/IEC 14496-26 conformance streams within 1 LSB of FFmpeg. **Encoder** (AAC-LC, mono–5.1): psychoacoustic model, block switching, M/S and joint stereo rate control, MP4 `esds` — 3–8× faster than FFmpeg's native AAC encoder (frame-parallel) |
-| Audio codec | **mp3** (MPEG-1/2 Layer III), **mp2** / **mp1** (Layer II / I, decode) | in-house **decoder + encoder** (**`rusty_mp3`**, also usable standalone). Layer I and II decode too, MPEG-2 low rates and free format included, within 1 LSB of the ISO vectors and within 0.05 s16 of symphonia — decoder **bit-exact vs FFmpeg** and **faster than it at matched CPU** — decode-and-discard on the same physical cores, 27.5-min stream, 15 pairs: **1.24× faster on 1 core** (1,952 vs 2,431 ms, 15/15, z = −3.87) and **1.39× on 2** (1,017 vs 1,455 ms) via a two-stage pipeline, at **lower total CPU** (1,875 vs 2,125 ms). Five bit-identical decode bricks got there (word-load bit reader, circular synthesis FIFO, exact-symmetry + AVX IMDCT, AVX matrixing/window, division-free Huffman); the pipeline splits entropy from transform along a state boundary, so output stays bit-identical. encoder MPEG-1/2/2.5, CBR + VBR, joint stereo, block switching, bit reservoir. **0.4.0** caches the psychoacoustic model's FFT twiddle factors (rebuilt on every call before, for ten distinct values) and reuses the mid/side scratch across frames: **1.045× faster encode** (pinned CPU, 33/41 pairs, z = 3.90) at **34% fewer allocations per frame**. **0.4.1** makes decode **1.185× faster** (39/41 pairs, z = 5.78) via an O(1) word-load bit reader, a circular synthesis FIFO with a contiguous window loop, and a half-work IMDCT that exploits an exact kernel symmetry. Every one of these is **byte-identical**, verified over a 15-stream corpus (all channel modes, MPEG-1/2/2.5, 128–320k + VBR, four content classes). **Quality, PEAQ ODG at matched *actual* bitrate vs LAME, three-clip corpus:** CBR 192k mean gap **0.72 ODG** (guitar 0.29 · piano 0.48 · clicks 1.39); CBR 128k mean gap **1.08** (0.37 · 1.13 · 1.75). Content-dependent — close on tonal material, **1.4–1.8 behind on transients**, where the per-band distortion loop is inert and the psymodel has no short-block thresholds. **0.6.0** rebuilt VBR after PEAQ caught it **3.51 ODG** adrift (−3.50 vs +0.01 at ~200 kbps): `-q:a` is now a target bitrate driving the same two-loop quantizer CBR uses, instead of a separate unanchored noise-to-mask search |
-| Audio codec | **opus** | **decode + encode** — our own **[rusty-opus](https://github.com/Remade-With-Rust/rusty-opus)** (BSD-3 performance fork of the pure-Rust `opus-rs`). **Quality at parity with `libopus`** (mean −0.015 BD-ODG over 18 content classes × 5 rates, matched actual bitrate) and **18/18 classes ahead of FFmpeg's own native Opus encoder** (+1.5 ODG). Three **byte-identical AVX2 SILK kernels** + an O(n²)-copy fix in the encode wrapper make `rff -c:a opus` **1.50× faster than `libopus` on CELT speech and 1.60× on stereo music per core** (3.0× FFmpeg's native encoder on music), and within **4%** on the SILK path (pinned CPU, slope-corrected, N=41, coding path verified from TOC bytes); **frame-parallel encoding** (chunked + state-primed, **PEAQ-neutral** ΔODG ≤ 0.03) adds wall-clock on top, since libopus is single-threaded per stream — **ffmpeg decodes our output at unity**. Knobs: `-b:a`, `-compression_level`, `-opus_parallel` |
-| Audio codec | **vorbis** | **decode + encode** — decode via the **in-house decoder** (FFmpeg-matched, float output in FFmpeg channel order, granule end-trim); **in-house encoder** (**[`rusty_vorbis`](https://crates.io/crates/rusty_vorbis)**, also usable standalone) — *the first permissively-licensed Vorbis encoder in Rust* (none existed before). Window → **N/4-FFT MDCT** → Bark-scale masking floor → channel coupling + point stereo → rate-distortion residue VQ, emitting an embedded libvorbis setup header; `-q:a 0–9`. **ffmpeg decodes our output**, validated packet-exact against `lewton` + libvorbis. **~5.3× faster than libvorbis wall-clock** (stereo music, 24 cores) via **frame-parallel** encoding (libvorbis is single-threaded) over a structure-of-arrays + AVX2 residue-VQ search and an **energy-bucket class shortlist** (PEAQ-validated perceptually neutral, ΔODG ≤ 0.03); per-thread ~1.4× behind libvorbis (was 4.7×) |
-| Audio codec | **flac** | **decode + encode** — decode via pure-Rust `claxon`; **in-house lossless encoder** (LPC + stereo decorrelation + partitioned Rice + MD5), **at parity with ffmpeg's FLAC** |
-| Audio codec | **pcm** (s16le / f32le) | **decode + encode** (in-house); also decodes u8, s24, s32 and f64 |
-| Audio codec | **alac** (Apple Lossless) | **decode** (in-house) — 16/20/24/32-bit, 1–8 channels, from MP4, CAF and Matroska; FFmpeg's arithmetic and channel order. **Lossless on every test stream** (decoded output equals the source PCM at 16/24/32 bits, 1–8 channels) and **sample-exact against symphonia** |
-| Audio codec | **pcm_alaw** / **pcm_mulaw** (G.711), **adpcm_ms**, **adpcm_ima_wav**, **adpcm_ima_qt** (`ima4`) | **decode** (in-house) to s16, with FFmpeg's arithmetic. **Sample-exact against symphonia** on sox-encoded WAVs (mono, stereo, 8 kHz) |
-| Container | **avif** (AV1 Image File Format) | **demux + mux** (reads foreign AVIFs too) |
-| Container | **av2f** (AV2 still image) | **demux + mux** — ⚠️ **EXPERIMENTAL, not an AOM standard.** One AV2 picture in an ISOBMFF/HEIF file, in AVIF's shape ([`rusty_av2f`](https://crates.io/crates/rusty_av2f), also usable standalone). AVIF's brand / item type / config record are fixed by a published AOM specification; **no equivalent document exists for AV2**, so ours (`av2f` / `av02` / `av2C`) are *chosen*, not specified — isolated in one source file so adopting a real spec is a one-file edit. **Files written here are readable here and nowhere else**, with no compatibility promise. Gated end to end: a committed `.av2f` fixture decodes **byte-identical to AOM's `avmdec`**, and re-muxing reproduces the file byte for byte. Writes only the full still-picture header (the compact `single_picture_header_flag` form is refused until `rusty_av2d` parses it bit-exactly) |
-| Container | **png** / **jpeg** / **gif** / **webp** / **jpegxl** | **demux + mux** |
-| Container | **wav** (RIFF/WAVE) / **ogg** (Opus/Vorbis) / **flac** | **demux + mux**. WAV also reads RF64/BW64, `WAVE_FORMAT_EXTENSIBLE`, s32/f64, G.711 and MS/IMA ADPCM; Ogg also reads FLAC (`.oga`) |
-| Container | **aiff** (AIFF / AIFF-C) / **caf** (Core Audio Format) | **demux** — AIFF: NONE/twos/sowt PCM, in24/in32, fl32/fl64, alaw/ulaw, ima4. CAF: lpcm, ALAC, AAC, ima4, alaw/ulaw, with the packet table. Sample-exact against symphonia |
-| Container | **avi** (Audio Video Interleaved) | **demux + mux** (RIFF/`hdrl`/`movi`/`idx1`) |
-| Container | **mp4** / **mov** (ISOBMFF) | **demux + mux**, separate ISO (`mp4`) and QuickTime (`mov`) muxers, **fragmented MP4 read** — H.264, HEVC (demux), AV1, VP9 (`vpcC`), APV, and in MOV **ProRes** (all six profiles) and **DNxHD/HR**; AAC (`esds`), Opus, FLAC (`dfLa`), ALAC, AC-3/E-AC-3, and **PCM in MOV** (`sowt` `twos` `in24` `in32` `fl32` `fl64` `lpcm`, sound description v0/v1/v2); `colr`/`pasp`/`clap`/`mdcv`/`clli` and the QuickTime **timecode track**, read and written |
-| Container | **matroska** / **webm** (EBML) | **demux + mux** — Cluster/(Simple)Block packets with lacing; AV1/H.264/HEVC/VP9/VP8 video + Opus/Vorbis/AAC/FLAC/MP3/AC-3/E-AC-3/ALAC/PCM audio, subtitles; **Colour + HDR mastering**, **WebM alpha** (BlockAdditions), **CodecDelay/SeekPreRoll**, header-stripping and zlib ContentEncodings (demux) |
-
-## Install
-
-```sh
-# Pure Rust, no build prerequisites. Add `--features https` for https:// input.
-cargo install rff-cli
-```
-
-This installs the **`rff`** and **`rffprobe`** binaries.
-
-Want the drop-in `ffmpeg`/`ffprobe` names, so existing scripts work unchanged?
-
-```sh
-cargo install rff-cli --features drop-in-names
-```
-
-That's opt-in on purpose: those names shadow a real FFmpeg on your `PATH`, which
-should be your explicit choice rather than a side effect of installing. The
-prebuilt archives on
-[Releases](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/releases) ship
-both name pairs.
-
-To embed the engine in your own application, take the library instead:
-
-```sh
-cargo add remade-ffmpeg
-```
-
-From a source checkout: `cargo install --path crates/rff-cli`.
-
-## Quick start
-
-```sh
-# List what this build supports — just like FFmpeg:
-rff -codecs
-rff -formats
-
-# Inspect a file:
-rffprobe input.avif
-
-# Transcode AVIF → AVIF end to end (decode AV1, re-encode AV1, rewrap):
-rff -i input.avif -c:v avif -y output.avif
-
-# Encode audio with an in-house, pure-Rust encoder — WAV → AAC in an MP4
-# (psychoacoustic model, transient block switching, M/S stereo, esds config):
-rff -i input.wav -c:a aac -b:a 128k -y output.m4a
-
-# …or FLAC (lossless, at ffmpeg parity), MP3, Vorbis, or Opus — same engine:
-rff -i input.wav -c:a flac -y output.flac
-rff -i input.wav -c:a vorbis -q:a 4 -y output.ogg
-```
-
-<sub>Installed with `--features drop-in-names` (or taken from a release archive),
-the same commands work as `ffmpeg` / `ffprobe`.</sub>
-
-Or talk to the engine over HTTP (API-first):
-
-```sh
-cargo run -p rff-server          # listens on 127.0.0.1:8080
-curl localhost:8080/v1/codecs
-curl localhost:8080/healthz
-```
-
-## Architecture
-
-A Cargo workspace that mirrors FFmpeg's own library decomposition: a
-dependency-free core (`rff-core`), codec/format abstraction layers
-(`rff-codec`, `rff-format`), one crate per codec/container, an engine facade
-(`rff`), and the front-ends (`rff-cli`, `rff-server`, `rff-ui`). Full details:
-[docs/architecture.md](docs/architecture.md).
-
-```
-  rff-core ◀── rff-codec ◀── rff-codec-{h264,opus,avif} ┐
-       ▲   ◀── rff-format ◀── rff-format-avi ────────────┤
-       │                                                 ▼
-       └──────────────────────────────────────────────▶ rff (engine facade)
-                                                          ▲
-                                  ┌───────────────────────┼──────────────┐
-                               rff-cli (ffmpeg/ffprobe)  rff-server     rff-ui
-```
-
-## Authentication & deployment
-
-- **MATA mID (default for MATA deployments).** Authenticate with a MATA mID — a
-  locally-verified cryptographic identity; no interactive step, built for
-  programmatic / headless / fleet deployments. Implemented behind the
-  `rff-auth` `mata-mid` feature.
-- **Bearer token / dev mode (universal compatibility).** A standard
-  `Authorization: Bearer` mechanism is retained so stock clients work; the
-  bundled `DevAllowAll` verifier is for local development only.
-
-## Building from source
-
-> The default build enables `h264-asm`: rusty_h264's SIMD kernels, which since
-> rusty_h264 0.10 are **portable Rust** (SSE2/AVX2 on x86-64, NEON on
-> aarch64) — no assembler, no C, nothing to install. `--no-default-features`
-> is the pure scalar H.264 path.
-
-```sh
-git clone https://github.com/Remade-With-Rust/remade_ffmpeg_rs
-cd remade_ffmpeg_rs
-cargo build                          # default: h264-asm (portable Rust SIMD)
-cargo build --no-default-features    # scalar H.264
-cargo build --features https         # add rustls TLS for https:// input
-cargo run -p rff-ui                  # build/run the Dioxus desktop UI on demand
-```
-
-**Requirements:** Rust 1.85+ (stable). The Dioxus UI additionally needs a
-system webview (WebView2 on Windows, WebKitGTK on Linux) and, for web/mobile
-targets, the `dx` CLI (`cargo install dioxus-cli`).
-
-## Platform support
-
-| Platform | Status |
-|---|---|
-| Windows / macOS / Linux (CLI + server) | ✅ builds |
-| Web (WASM) / PWA / mobile (Dioxus UI) | 🚧 scaffolded |
-
-Adding a codec or container backend is a first-class extension point —
-implement the `Decoder`/`Encoder` or `Demuxer`/`Muxer` traits and call
-`register(...)`, no engine-core changes required.
-
-## Roadmap
-
-Prioritized **next-gen first** — full detail in [docs/roadmap.md](docs/roadmap.md).
-What's shipped today is the [compatibility matrix](docs/compatibility.md).
-
-- **Next-gen (priority):** AV2 **decode shipped** (byte-identical vs AVM), AV2 encode *(in progress)* · fMP4/CMAF segments ·
-  low-latency live (SRT / WebRTC / Media-over-QUIC) · IAMF spatial audio.
-- **Current-modern:** DASH output · HLS completion (`-hls_time`, live playlists) ·
-  `filter_complex` `concat` · two-pass execution · HTTPS in the default build.
-
-## License
-
-Apache-2.0 — see [LICENSE](LICENSE). The embeddable **core** — the library, the
-`ffmpeg`/`ffprobe` CLI, the server, and every codec/format crate — has **no
-copyleft anywhere** in its dependency tree, CI-enforced via `cargo-deny` (see
-[deny.toml](deny.toml)). The optional Dioxus UI (`rff-ui`, built on demand and
-never part of the published binaries) pulls MPL-2.0 crates transitively through
-its webview stack, so it's scoped out of the gate and tracked separately.
-
-## Patents
-
-Licensing and patents are **separate** things. The clean-room work clears
-*copyright* — there's no GPL/FFmpeg code here, hence the permissive license
-above — but an independent implementation does **not** clear *patents*: a patent
-covers a *technique in the standard*, which any implementation practices
-regardless of language or authorship.
-
-Most of the stack is **royalty-free or patent-expired** — AV1/AVIF, VP9, Opus,
-FLAC, Vorbis, PNG, JPEG, GIF, WebP, JPEG XL, MP3 (expired 2017), PCM — and
-carries no patent obligation for anyone.
-
-Two codecs are **patent-relevant**: **H.264/AVC** (via `rusty_h264`) and
-**AAC** (our in-house `rusty_aac`: an AAC-LC *encoder* — the largely-expired,
-lowest-risk corner — and a *decoder* for the wider family, including HE-AAC v1/v2
-(SBR, Parametric Stereo) and the low-delay object types, whose patents are more
-recent). We take the same posture as FFmpeg: these ship in the
-default build, **no patent license is granted or implied**, and any patent
-royalties (e.g. to the Via LA pools) are the responsibility of the party that
-distributes or commercially deploys a product incorporating them — not of the
-project or of people simply running the tool. If that matters for your use,
-gate H.264/AAC out behind a feature or obtain a pool license, and **consult IP
-counsel** for commercial deployments. Full breakdown:
-[docs/compatibility.md#patents](docs/compatibility.md#patents). *(This is
-engineering context, not legal advice.)*
-
-## Trademark
-
-This is an independent, clean-room reimplementation. It is **not affiliated
-with, endorsed by, or derived from the source code of the FFmpeg project**.
-"FFmpeg" is a trademark of Fabrice Bellard. The `ffmpeg` and `ffprobe`
-executable names are provided solely for command-line compatibility so existing
-scripts and workflows keep working; the product itself is **remade_ffmpeg_rs**.
 
 ## About Mata Network
 
