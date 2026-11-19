@@ -1,0 +1,2 @@
+# Format names, not code identifiers: keep them plain in doc comments.
+doc-valid-idents = ["BigTIFF", "SubIFD", "SubIFDs", "PackBits", "CIELab", "LinearRaw", "GeoTIFF", ".."]
