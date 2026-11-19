@@ -1,0 +1,31 @@
+[package]
+name = "rusty_icc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+authors = ["Mata Network <https://www.mata.network>"]
+description = "Pure-Rust ICC colour management: v2/v4 profile parsing and writing, matrix-shaper and LUT (lut8/lut16/mAB/mBA) transforms for RGB, CMYK, grey and Lab, four rendering intents, black-point compensation, soft-proofing and gamut checks. No C, no unsafe, no dependencies."
+readme = "README.md"
+keywords = ["icc", "color", "colour", "cms", "profile"]
+categories = ["multimedia::images", "graphics"]
+# Test data (third-party CC0 / ICC profiles, see tests/data/README.md) and the
+# oracle tests stay in the repository; the published package is the library.
+include = ["/LICENSE", "/README.md", "/src/"]
+
+[dependencies]
+
+# `moxcms` is the ORACLE only (pure Rust, BSD-3-Clause OR Apache-2.0): the
+# grid comparisons in `tests/oracle.rs` transform the same colours through it
+# and through this crate. It is never a normal dependency.
+# `rusty_alloc-api`: project convention (root `Cargo.toml`, `CLAUDE.md`) --
+# every example/bench root runs under our own allocator; the library never
+# declares a global allocator.
+[dev-dependencies]
+moxcms = { version = "0.9", default-features = false, features = ["options"] }
+rusty_alloc-api.workspace = true
+
+[lints.clippy]
+doc_markdown = "warn"
