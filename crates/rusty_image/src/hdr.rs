@@ -209,8 +209,12 @@ fn to_rgbe(c: [f32; 3]) -> [u8; 4] {
     if m.is_nan() || m <= 1e-32 || !m.is_finite() {
         return [0; 4];
     }
-    let e = m.log2().floor() as i32 + 1; // m = f * 2^e, f in [0.5, 1)
-    let scale = (2f32).powi(-e) * 256.0;
+    // m = f * 2^e with f in [0.5, 1): frexp, read from the float's bits
+    // (m > 1e-32 is a normal float, so its exponent field is the answer).
+    let e = ((m.to_bits() >> 23) & 0xff) as i32 - 126;
+    // 2^(8 - e), exact; 8 - e stays inside the normal exponent range for
+    // the e values that reach here (-105 .. 129).
+    let scale = f32::from_bits(((8 - e + 127).clamp(1, 254) as u32) << 23);
     let q = |v: f32| ((v.max(0.0) * scale) as i32).clamp(0, 255) as u8;
     let e = (e + 128).clamp(0, 255) as u8;
     [q(c[0]), q(c[1]), q(c[2]), e]

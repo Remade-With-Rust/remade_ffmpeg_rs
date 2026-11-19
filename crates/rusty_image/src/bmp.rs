@@ -395,14 +395,49 @@ fn read_direct(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
         Kind::Rgb16 => Some(RGB555),
         _ => h.fields,
     };
+    // Standard 8-8-8(-8) masks are plain byte moves.
+    let std_masks = fields.is_some_and(|f| {
+        bytes_pp == 4
+            && f.r == Field { shift: 16, len: 8 }
+            && f.g == Field { shift: 8, len: 8 }
+            && f.b == Field { shift: 0, len: 8 }
+            && (f.a.len == 0 || f.a == Field { shift: 24, len: 8 })
+    });
+    let std_alpha = std_masks && fields.is_some_and(|f| f.a.len != 0);
     for i in 0..h.height {
         let src = r.bytes(h.width * bytes_pp)?;
         r.skip(pad)?;
         let y = row(h, i);
         let dst = &mut buf[y * stride..(y + 1) * stride];
-        for (px, s) in dst.chunks_exact_mut(ch).zip(src.chunks_exact(bytes_pp)) {
-            match h.kind {
-                Kind::Rgb24 | Kind::Rgb32 | Kind::Rgba32 => {
+        match (h.kind, ch) {
+            (Kind::Rgb24, 3) => {
+                for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(3)) {
+                    px.copy_from_slice(&[s[2], s[1], s[0]]);
+                }
+            }
+            (Kind::Rgb32, 3) => {
+                for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
+                    px.copy_from_slice(&[s[2], s[1], s[0]]);
+                }
+            }
+            (Kind::Bitfields32, _) if std_masks => {
+                if ch == 4 {
+                    for (px, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                        px.copy_from_slice(&[
+                            s[2],
+                            s[1],
+                            s[0],
+                            if std_alpha { s[3] } else { 0xff },
+                        ]);
+                    }
+                } else {
+                    for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
+                        px.copy_from_slice(&[s[2], s[1], s[0]]);
+                    }
+                }
+            }
+            (Kind::Rgb24 | Kind::Rgb32 | Kind::Rgba32, _) => {
+                for (px, s) in dst.chunks_exact_mut(ch).zip(src.chunks_exact(bytes_pp)) {
                     px[0] = s[2];
                     px[1] = s[1];
                     px[2] = s[0];
@@ -410,8 +445,10 @@ fn read_direct(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
                         px[3] = if h.kind == Kind::Rgba32 { s[3] } else { 0xff };
                     }
                 }
-                _ => {
-                    let f = fields.expect("bitfield kinds carry masks");
+            }
+            _ => {
+                let f = fields.expect("bitfield kinds carry masks");
+                for (px, s) in dst.chunks_exact_mut(ch).zip(src.chunks_exact(bytes_pp)) {
                     let v = if bytes_pp == 2 {
                         u32::from(u16::from_le_bytes([s[0], s[1]]))
                     } else {

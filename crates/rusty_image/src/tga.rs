@@ -110,7 +110,14 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     }
     let mut img = Image::zeroed(width as u32, height as u32, format)?;
     let n_raw = width * height * raw_bpp;
-    let mut raw = vec![0u8; n_raw];
+    // Without a colour map or 15/16-bit expansion the raw pixels are the
+    // output layout: decode straight into the output buffer.
+    let direct = map.is_none() && !rgb15;
+    let mut raw = if direct {
+        std::mem::take(&mut img.pixels)
+    } else {
+        vec![0u8; n_raw]
+    };
     if rle {
         let mut i = 0;
         while i < n_raw {
@@ -169,7 +176,7 @@ pub fn decode(data: &[u8]) -> Result<Image> {
             o.copy_from_slice(&expand15([s[0], s[1]]));
         }
     } else {
-        out[..n_raw].copy_from_slice(&raw);
+        *out = raw;
     }
     if matches!(format, PixelFormat::Rgb8 | PixelFormat::Rgba8) {
         for p in out.chunks_exact_mut(out_bpp) {
@@ -207,53 +214,54 @@ pub fn encode(image: &Image) -> Result<Vec<u8>> {
     out.push(depth);
     out.push(attr | 0x20);
     // Stored pixels: BGR(A) for colour.
-    let px: Vec<u8> = if bpp >= 3 {
-        image
-            .pixels
-            .chunks_exact(bpp)
-            .flat_map(|p| {
-                let mut q = [p[2], p[1], p[0], 0];
-                if bpp == 4 {
-                    q[3] = p[3];
-                }
-                q.into_iter().take(bpp)
-            })
-            .collect()
-    } else {
-        image.pixels.clone()
-    };
+    let mut px = image.pixels.clone();
+    if bpp >= 3 {
+        for p in px.chunks_exact_mut(bpp) {
+            p.swap(0, 2);
+        }
+    }
     // RLE per row (packets never cross rows, which every reader accepts).
     let w = image.width as usize;
+    out.reserve(px.len() + px.len() / 128 + 1);
     for row in px.chunks_exact(w * bpp) {
-        let pixels: Vec<&[u8]> = row.chunks_exact(bpp).collect();
-        let mut i = 0;
-        while i < pixels.len() {
-            let mut run = 1;
-            while i + run < pixels.len() && run < 128 && pixels[i + run] == pixels[i] {
-                run += 1;
-            }
-            if run > 1 {
-                out.push(0x80 | (run - 1) as u8);
-                out.extend_from_slice(pixels[i]);
-                i += run;
-            } else {
-                let start = i;
-                i += 1;
-                while i < pixels.len()
-                    && i - start < 128
-                    && !(i + 1 < pixels.len() && pixels[i + 1] == pixels[i])
-                {
-                    i += 1;
-                }
-                out.push((i - start - 1) as u8);
-                for p in &pixels[start..i] {
-                    out.extend_from_slice(p);
-                }
-            }
+        match bpp {
+            1 => rle_row::<1>(row, &mut out),
+            2 => rle_row::<2>(row, &mut out),
+            3 => rle_row::<3>(row, &mut out),
+            _ => rle_row::<4>(row, &mut out),
         }
     }
     // TGA 2.0 footer: no extension or developer area.
     out.extend_from_slice(&[0u8; 8]);
     out.extend_from_slice(b"TRUEVISION-XFILE.\0");
     Ok(out)
+}
+
+/// RLE-encode one row of `B`-byte pixels: runs of two or more identical
+/// pixels as run packets, everything else as raw packets (a raw packet stops
+/// where a run of two begins), each at most 128 pixels.
+fn rle_row<const B: usize>(row: &[u8], out: &mut Vec<u8>) {
+    let px = |i: usize| -> [u8; B] { row[i * B..i * B + B].try_into().unwrap() };
+    let n = row.len() / B;
+    let mut i = 0;
+    while i < n {
+        let p = px(i);
+        let mut run = 1;
+        while i + run < n && run < 128 && px(i + run) == p {
+            run += 1;
+        }
+        if run > 1 {
+            out.push(0x80 | (run - 1) as u8);
+            out.extend_from_slice(&p);
+            i += run;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < n && i - start < 128 && !(i + 1 < n && px(i + 1) == px(i)) {
+            i += 1;
+        }
+        out.push((i - start - 1) as u8);
+        out.extend_from_slice(&row[start * B..i * B]);
+    }
 }

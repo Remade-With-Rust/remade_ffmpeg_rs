@@ -40,44 +40,69 @@ pub fn decode(data: &[u8]) -> Result<Image> {
         4 => PixelFormat::Rgba8,
         n => return Err(Error::invalid(format!("qoi: {n} channels"))),
     };
-    let ch = usize::from(channels);
-    let mut img = Image::zeroed(width, height, format)?;
+    let len = crate::byte_len(width, height, format)?;
+    let data = r.rest();
+    let pixels = if channels == 3 {
+        decode_ops::<3>(data, len)?
+    } else {
+        decode_ops::<4>(data, len)?
+    };
+    Image::new(width, height, format, pixels)
+}
+
+/// The op stream into `len` bytes of `CH`-channel pixels. Reads go through
+/// `data.get`, so a cut-off stream is an error; the output is written
+/// straight into a pre-sized buffer, one fixed-size store per pixel.
+fn decode_ops<const CH: usize>(data: &[u8], len: usize) -> Result<Vec<u8>> {
+    let mut out = vec![0u8; len];
     let mut index = [[0u8; 4]; 64];
     let mut px = [0u8, 0, 0, 255];
-    let mut run = 0u32;
-    for out in img.pixels.chunks_exact_mut(ch) {
-        if run > 0 {
-            run -= 1;
-        } else {
-            let b = r.u8()?;
-            match b {
-                OP_RGB => {
-                    let c = r.array::<3>()?;
-                    px[..3].copy_from_slice(&c);
-                }
-                OP_RGBA => px = r.array::<4>()?,
-                _ => match b & 0xc0 {
-                    OP_INDEX => px = index[usize::from(b & 0x3f)],
-                    OP_DIFF => {
-                        px[0] = px[0].wrapping_add(((b >> 4) & 3).wrapping_sub(2));
-                        px[1] = px[1].wrapping_add(((b >> 2) & 3).wrapping_sub(2));
-                        px[2] = px[2].wrapping_add((b & 3).wrapping_sub(2));
-                    }
-                    OP_LUMA => {
-                        let b2 = r.u8()?;
-                        let dg = (b & 0x3f).wrapping_sub(32);
-                        px[0] = px[0].wrapping_add(dg.wrapping_sub(8).wrapping_add(b2 >> 4));
-                        px[1] = px[1].wrapping_add(dg);
-                        px[2] = px[2].wrapping_add(dg.wrapping_sub(8).wrapping_add(b2 & 0x0f));
-                    }
-                    _ => run = u32::from(b & 0x3f),
-                },
+    let mut pos = 0usize;
+    let mut o = 0usize;
+    let byte = |pos: &mut usize| -> Result<u8> {
+        let b = *data.get(*pos).ok_or(Error::Truncated)?;
+        *pos += 1;
+        Ok(b)
+    };
+    while o < len {
+        let b = byte(&mut pos)?;
+        let mut run = 1usize;
+        match b {
+            OP_RGB => {
+                let c = data.get(pos..pos + 3).ok_or(Error::Truncated)?;
+                px[..3].copy_from_slice(c);
+                pos += 3;
             }
-            index[hash(px)] = px;
+            OP_RGBA => {
+                let c = data.get(pos..pos + 4).ok_or(Error::Truncated)?;
+                px.copy_from_slice(c);
+                pos += 4;
+            }
+            _ => match b & 0xc0 {
+                OP_INDEX => px = index[usize::from(b & 0x3f)],
+                OP_DIFF => {
+                    px[0] = px[0].wrapping_add(((b >> 4) & 3).wrapping_sub(2));
+                    px[1] = px[1].wrapping_add(((b >> 2) & 3).wrapping_sub(2));
+                    px[2] = px[2].wrapping_add((b & 3).wrapping_sub(2));
+                }
+                OP_LUMA => {
+                    let b2 = byte(&mut pos)?;
+                    let dg = (b & 0x3f).wrapping_sub(32);
+                    px[0] = px[0].wrapping_add(dg.wrapping_sub(8).wrapping_add(b2 >> 4));
+                    px[1] = px[1].wrapping_add(dg);
+                    px[2] = px[2].wrapping_add(dg.wrapping_sub(8).wrapping_add(b2 & 0x0f));
+                }
+                _ => run = usize::from(b & 0x3f) + 1,
+            },
         }
-        out.copy_from_slice(&px[..ch]);
+        index[hash(px)] = px;
+        let n = run.min((len - o) / CH);
+        for chunk in out[o..o + n * CH].chunks_exact_mut(CH) {
+            chunk.copy_from_slice(&px[..CH]);
+        }
+        o += n * CH;
     }
-    Ok(img)
+    Ok(out)
 }
 
 /// Encode `Rgb8` or `Rgba8` as QOI (sRGB colour space flag).
