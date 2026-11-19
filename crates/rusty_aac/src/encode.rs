@@ -6104,7 +6104,7 @@ mod rung_a7 {
     }
 }
 
-/// remade_ffmpeg_rs#129: a pure tone, and a 5.1 stream with only its centre
+/// `remade_ffmpeg_rs#129`: a pure tone, and a 5.1 stream with only its centre
 /// active, must come back at their level and with the precision their bitrate
 /// buys. Before the hearing floor the mask scaled with each band's own energy,
 /// so near-silent bands took the bits (a 440 Hz tone at 128 kbps: 19.8 dB);
