@@ -15,14 +15,15 @@ by **[Mata Network](https://www.mata.network/)**.
 
 ## What is verified
 
-**Oracle: resvg 0.48.1.** Every SVG is rendered by both stacks at the same
+**Oracle: resvg 0.48.1** (dev-dependency; numbers measured with this crate on
+`rusty_raster` and resvg on tiny-skia 0.12). Every SVG is rendered by both stacks at the same
 size and the premultiplied RGBA8 buffers are compared byte for byte
 (`cargo test -p rusty_svgtree --release --test oracle -- --nocapture`).
 
 | corpus | renders | pixel-identical | the rest |
 |---|---:|---:|---|
 | feature corpus, 34 files (`tests/corpus/`) at scales 0.66, 1, 2.5 | 102 | **99** | 3 = the JPEG file: max channel diff 23, 13% of pixels, PSNR 55.37 dB min. rusty_jpeg and resvg's zune-jpeg round the IDCT/upsampling differently. |
-| 212 real-world SVGs shipped in crates.io packages (Inkscape, Illustrator, diagrams.net, plotters, docs diagrams), fit to 800 px | 212 | **208** | 4 = one logo (four copies): resvg drops a `gradientTransform` inherited through `href`, which the spec says to inherit; we inherit it (PSNR 25.29 dB). |
+| 220 real-world SVGs shipped in crates.io packages in the local cargo registry (Inkscape, Illustrator, diagrams.net, plotters, docs diagrams), fit to 800 px (`RSVG_EXTRA_DIR=<dir>`) | 220 | **216** | 4 = one logo (four copies). It uses a gradient whose `gradientTransform` is inherited through `href`. The spec says to inherit it, and we do. usvg 0.48.1 drops it: `convert_linear` reads the attribute with `resolve_transform`, which looks only at the node itself (PSNR 25.29 dB). |
 
 The feature corpus covers every basic shape, all path commands (arcs
 converted exactly as resvg's kurbo does), fill rules, every join and cap,
@@ -51,11 +52,13 @@ units, a pathological style
 sheet, CSS descendant-combinator backtracking (over 60 s with the matching
 budget removed, 0.21 s with it), one `objectBoundingBox` clip path shared by
 20,000 elements (over 60 s with the conversion budget removed, 2.93 s with
-it), coordinates that overflow inside tiny-skia-path's unwrapping rect and
-size helpers, and 2,040 deterministic byte-mutations of the feature corpus
-(8,480 more were run once over the 212 real-world files: no panic).
-The tiny-`viewBox` stroke case panics resvg 0.48.1 itself (tiny-skia
-`blit_anti_h` index out of range).
+it), coordinates that overflow inside the unwrapping rect and size helpers
+inherited from tiny-skia-path, and 2,040 deterministic byte-mutations of the
+feature corpus. During development, 8,480 more mutations of the real-world
+files were run once against tiny-skia; none panicked. The tiny-`viewBox`
+stroke case panics resvg 0.48.1 itself (tiny-skia `blit_anti_h` index out of
+range); on `rusty_raster`, which clips every span, it renders, and all 25
+tests pass.
 
 No speed numbers are claimed yet.
 
