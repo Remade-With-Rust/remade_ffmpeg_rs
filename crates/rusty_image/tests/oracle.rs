@@ -345,6 +345,19 @@ fn bmp_matches_image() {
             rusty_image::bmp::decode(&f),
             oracle(&f, ImageFormat::Bmp),
         );
+        // V4/V5 bitfields with the masks only inside the header (no copy
+        // after it), as ImageMagick writes them: for small images the file
+        // ends before header + 12.
+        if masks == 12 && s.header != 40 {
+            let h = s.header as usize;
+            let d2 = [&d[..h], &d[h + 12..]].concat();
+            let f2 = bmp_file(&d2, s.header, palette);
+            t.check(
+                &format!("bmp#{i} h{} masks in header only", s.header),
+                rusty_image::bmp::decode(&f2),
+                oracle(&f2, ImageFormat::Bmp),
+            );
+        }
         // The same DIB, headerless, as the clipboard hands it over.
         let theirs = image::codecs::bmp::BmpDecoder::new_without_file_header(Cursor::new(&d))
             .and_then(DynamicImage::from_decoder);
@@ -926,7 +939,7 @@ fn qoi_and_encoders_round_trip_through_image() {
         let px16: Vec<u8> = wide
             .pixels
             .iter()
-            .flat_map(|&v| (u16::from(v) * 257 + 3).to_ne_bytes())
+            .flat_map(|&v| (u16::from(v) * 257 ^ 3).to_ne_bytes())
             .collect();
         let img16 = Image::new(wide.width, wide.height, PixelFormat::Rgba16, px16).unwrap();
         let f = rusty_image::encode(&img16, Format::Pnm).unwrap();

@@ -258,10 +258,14 @@ fn read_header(r: &mut Reader, mode: Mode) -> Result<Header> {
             mask_bytes = 12;
         }
     }
-    r.seek(header_end + mask_bytes)?;
+    // Where the colour table would start. A file with masks only inside a
+    // V4/V5 header can end before this point (a tiny image whose pixels sit
+    // at the header's end); that only matters when something is read here.
+    let after_header = header_end + mask_bytes;
 
     let mut palette = None;
     if matches!(kind, Kind::Palette | Kind::Rle4 | Kind::Rle8) {
+        r.seek(after_header)?;
         let per = if header_size == CORE { 3 } else { 4 };
         let max = 1usize << bit_count;
         let n = match colors_used {
@@ -281,7 +285,12 @@ fn read_header(r: &mut Reader, mode: Mode) -> Result<Header> {
         palette = Some(p);
     }
     if mode != Mode::File {
-        data_offset = r.pos();
+        // Pixels follow the colour table (or the masks).
+        data_offset = if palette.is_some() {
+            r.pos()
+        } else {
+            after_header
+        };
     }
     let mut height = height as usize;
     if mode == Mode::Ico {
