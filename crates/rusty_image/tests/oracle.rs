@@ -939,7 +939,7 @@ fn qoi_and_encoders_round_trip_through_image() {
         let px16: Vec<u8> = wide
             .pixels
             .iter()
-            .flat_map(|&v| (u16::from(v) * 257 ^ 3).to_ne_bytes())
+            .flat_map(|&v| ((u16::from(v) * 257) ^ 3).to_ne_bytes())
             .collect();
         let img16 = Image::new(wide.width, wide.height, PixelFormat::Rgba16, px16).unwrap();
         let f = rusty_image::encode(&img16, Format::Pnm).unwrap();
