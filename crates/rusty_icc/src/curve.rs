@@ -194,7 +194,9 @@ fn eval_table(t: &[u16], x: f64) -> f64 {
         1 => pow_pos(x, f64::from(t[0]) / 256.0),
         n => {
             let pos = x * (n - 1) as f64;
-            let i = (pos.floor() as usize).min(n - 2);
+            // `x` is clamped to `0..=1` by the caller, so `pos >= 0` and the
+            // cast truncation is the floor (no libm call).
+            let i = (pos as usize).min(n - 2);
             let f = pos - i as f64;
             let a = f64::from(t[i]);
             let b = f64::from(t[i + 1]);
