@@ -543,7 +543,10 @@ impl ClutEval {
         for i in 0..n {
             let g = self.grid[i];
             let p = clamp01(x[i]) * (g - 1) as f64;
-            let i0 = (p.floor() as usize).min(g - 1);
+            // `p` is in `0..=g-1` (clamped above), so truncation is the
+            // floor; `f64::floor` is a libm call on baseline x86-64 (no
+            // SSE4.1 `roundsd`), the cast is one `cvttsd2si`.
+            let i0 = (p as usize).min(g - 1);
             let f = p - i0 as f64;
             base[i] = i0 * self.strides[i];
             frac[i] = f;
