@@ -1,0 +1,27 @@
+[package]
+name = "rusty_image"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+authors = ["Mata Network <https://www.mata.network>"]
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+description = "Pure-Rust BMP (incl. CF_DIB/CF_DIBV5 clipboard DIBs), TGA, Radiance HDR, ICO/CUR, PNM/PAM and QOI decode + encode, plus header-only probing for 13 image formats. Pixel-exact against the image crate, no C, no unsafe."
+readme = "README.md"
+keywords = ["bmp", "tga", "qoi", "ico", "image"]
+categories = ["multimedia::images", "encoding"]
+rust-version = "1.85"
+include = ["/LICENSE", "/README.md", "/src/"]
+
+# NOTE: fields are direct (not workspace-inherited), same as the other
+# standalone rusty_* crates, so the crate builds outside this workspace.
+
+[dependencies]
+# PNG-compressed ICO/CUR entries (decode and encode).
+rusty_png = { path = "../rusty_png", version = "0.3.2" }
+
+[dev-dependencies]
+# The oracle: every decoder is gated pixel-for-pixel against image 0.25.
+image = { version = "0.25.10", default-features = false, features = ["bmp", "tga", "hdr", "ico", "pnm", "qoi", "png", "jpeg", "gif", "webp", "tiff"] }
+# The oracle for `probe`.
+imagesize = "0.14"
