@@ -114,6 +114,20 @@ pub fn decode_with_meta(data: &[u8]) -> Result<(Image, Meta)> {
     r.seek(pos)?;
     let standard = a1 == "-Y" && a2 == "+X";
     for s in 0..lines {
+        if standard {
+            let rest = r.rest();
+            let new_rle = rest.len() >= 4 && rest[0] == 2 && rest[1] == 2 && rest[2] < 128;
+            if !new_rle {
+                // Flat / old-RLE scanline in standard orientation: convert
+                // straight from the file bytes into the output row, with no
+                // intermediate scanline copy. Measured +8.6M Ir (6%) but
+                // -10% wall (0.29 s -> 0.26 s, 6/6 interleaved pairs): the
+                // store-then-reload through the scanline buffer cost more
+                // than the extra instructions. The clock wins.
+                read_flat_f32(&mut r, &mut img.pixels[s * len * 12..(s + 1) * len * 12])?;
+                continue;
+            }
+        }
         read_scanline(&mut r, &mut scan)?;
         if standard {
             // Scanline s is output row s: one row slice, fixed 12-byte stores.
@@ -146,6 +160,52 @@ pub fn decode_with_meta(data: &[u8]) -> Result<(Image, Meta)> {
         }
     }
     Ok((img, meta))
+}
+
+/// One flat or old-RLE scanline of `row.len() / 12` pixels, decoded straight
+/// into 12-byte float pixels (`row`). Same rules and errors as
+/// [`read_scanline`]'s flat path; a run repeats the previous output pixel.
+fn read_flat_f32(r: &mut crate::read::Reader, row: &mut [u8]) -> Result<()> {
+    let width = row.len() / 12;
+    let put = |d: &mut [u8], c: &[u8]| {
+        let f = to_f32([c[0], c[1], c[2]], c[3]);
+        d[0..4].copy_from_slice(&f[0].to_ne_bytes());
+        d[4..8].copy_from_slice(&f[1].to_ne_bytes());
+        d[8..12].copy_from_slice(&f[2].to_ne_bytes());
+    };
+    let is_run =
+        |c: &[u8]| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) & 0x00ff_ffff == 0x0001_0101;
+    let mut chunks = r.rest().chunks_exact(4);
+    let first = chunks.next().ok_or(Error::Truncated)?;
+    if is_run(first) {
+        return Err(Error::invalid("hdr: scanline starts with a run"));
+    }
+    put(&mut row[..12], first);
+    let (mut used, mut x, mut mult) = (4usize, 1usize, 1usize);
+    while x < width {
+        let c = chunks.next().ok_or(Error::Truncated)?;
+        used += 4;
+        if is_run(c) {
+            let n = usize::from(c[3])
+                .checked_mul(mult)
+                .ok_or_else(|| Error::invalid("hdr: run overflow"))?;
+            mult = mult.saturating_mul(256);
+            if x + n > width {
+                return Err(Error::invalid("hdr: scanline overrun"));
+            }
+            let (done, rest) = row.split_at_mut(x * 12);
+            let p = &done[(x - 1) * 12..];
+            for d in rest[..n * 12].chunks_exact_mut(12) {
+                d.copy_from_slice(p);
+            }
+            x += n;
+        } else {
+            mult = 1;
+            put(&mut row[x * 12..x * 12 + 12], c);
+            x += 1;
+        }
+    }
+    r.skip(used)
 }
 
 fn read_scanline(r: &mut crate::read::Reader, buf: &mut [[u8; 4]]) -> Result<()> {
