@@ -209,6 +209,14 @@ pub fn encode(image: &Image) -> Result<Vec<u8>> {
 /// Keeping the branches but writing into a pre-sized, zero-filled buffer by
 /// index (no Vec capacity checks) also lost: Ir RGB -30.8% -> -31.5% but
 /// RGBA -46.4% -> -35.5%; wall 1.01 -> 1.06 s RGB, 0.36 -> 0.47 s RGBA.
+///
+/// Per-op census (callgrind branch sim, 1536x1024 photo): RGB data emits
+/// INDEX 34% / LUMA 32% / RUN 15% / DIFF 10% / RGB 9%, and 645K of its
+/// mispredicts sit on two lines - `px == prev` (342K) and `index[h] == px`
+/// (303K) - the format's own per-pixel questions, near coin flips on photo
+/// content. The DIFF/LUMA/RGB choice contributes almost none, which is why
+/// the branch-free choice lost. The RGBA fixture is 91% RGBA ops (167K
+/// mispredicts, 116K on `a == pa`): instruction-bound, one 5-byte op a pixel.
 fn encode_ops<const CH: usize>(pixels: &[u8], out: &mut Vec<u8>) {
     let mut index = [0u32; 64];
     let mut prev = 0xff00_0000u32;
