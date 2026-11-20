@@ -85,21 +85,71 @@ pub(crate) fn encode_row(row: &[u8], out: &mut Vec<u8>) {
         }
         // Literal run until a repeat of 2+ starts or 128 bytes.
         let start = i;
-        i += 1;
-        while i < n && i - start < 128 {
-            if i + 1 < n && row[i] == row[i + 1] {
-                break;
-            }
-            i += 1;
-        }
+        i = literal_end(row, start + 1, n.min(start + 128));
         out.push((i - start - 1) as u8);
         out.extend_from_slice(&row[start..i]);
     }
 }
 
+/// The first `j` in `from..lim` where `row[j] == row[j + 1]` (a repeat
+/// starts), or `lim`.
+///
+/// Eight positions per step: XOR the eight bytes at `j` with the eight at
+/// `j + 1`, and a zero byte marks a repeat. In `(x - 0x01..) & !x & 0x80..`
+/// a borrow can flag a byte above a real zero but never below one, so the
+/// lowest flagged byte is the first repeat. A byte-at-a-time scan here was
+/// most of the encoder's cost (about 8 Ir a byte).
+#[inline]
+fn literal_end(row: &[u8], from: usize, lim: usize) -> usize {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let n = row.len();
+    let mut j = from;
+    while j + 9 <= n && j + 8 <= lim {
+        let a = u64::from_le_bytes(row[j..j + 8].try_into().unwrap());
+        let b = u64::from_le_bytes(row[j + 1..j + 9].try_into().unwrap());
+        let x = a ^ b;
+        let z = x.wrapping_sub(LO) & !x & HI;
+        if z != 0 {
+            return j + (z.trailing_zeros() / 8) as usize;
+        }
+        j += 8;
+    }
+    while j < lim {
+        if j + 1 < n && row[j] == row[j + 1] {
+            return j;
+        }
+        j += 1;
+    }
+    lim
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_end_matches_byte_scan() {
+        let mut seed = 5u32;
+        for len in 0..300usize {
+            let row: Vec<u8> = (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    // Small alphabet so repeats land everywhere, incl. 0x80/0x01 bytes.
+                    [0u8, 1, 0x80, 0x81, 0xff, 7][(seed >> 16) as usize % 6]
+                })
+                .collect();
+            for from in 0..=len {
+                for lim in from..=len.min(from + 140) {
+                    let mut want = from;
+                    while want < lim && !(want + 1 < len && row[want] == row[want + 1]) {
+                        want += 1;
+                    }
+                    assert_eq!(literal_end(&row, from, lim), want, "{len} {from} {lim}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn round_trip() {
