@@ -26,7 +26,7 @@ pub struct Limits {
     /// data ends early keeps what it holds and the rest reads as zero, but
     /// only while the zero-filled bytes stay within this many times the bytes
     /// really decoded, plus 64 KiB (so small images always recover). Past
-    /// that the image is refused: a damaged size field (say SamplesPerPixel
+    /// that the image is refused: a damaged size field (say `SamplesPerPixel`
     /// = 12,800) must not turn a 53 KB file into hundreds of megabytes of
     /// zeros. The same bound is applied before anything is allocated, from
     /// the bytes the chunks hold and the most their compression can expand.
