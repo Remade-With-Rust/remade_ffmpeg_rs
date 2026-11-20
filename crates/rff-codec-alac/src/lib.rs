@@ -172,11 +172,13 @@ impl<'a> Bits<'a> {
     }
 }
 
+/// Sign-extend the low `bits` (0..=32) bits of `v`. Every caller passes a
+/// width in that range (a sample size, a coded width, 16). There is no
+/// test: at 0 and 32 the shift is 0 and `v` comes back unchanged.
+#[inline(always)]
 fn sign_extend(v: i32, bits: u32) -> i32 {
-    if bits == 0 || bits >= 32 {
-        return v;
-    }
-    let s = 32 - bits;
+    debug_assert!(bits <= 32);
+    let s = 32u32.wrapping_sub(bits) & 31;
     (v << s) >> s
 }
 
