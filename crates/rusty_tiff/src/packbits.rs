@@ -57,7 +57,11 @@ pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffRes
             };
             i += 1;
             let take = run.min(target - out.len());
-            if take <= INLINE_RUN {
+            if take == 2 {
+                // The commonest repeat on 16-bit data: one fixed 2-byte
+                // append instead of two pushes.
+                out.extend_from_slice(&[b, b]);
+            } else if take <= INLINE_RUN {
                 for _ in 0..take {
                     out.push(b);
                 }
