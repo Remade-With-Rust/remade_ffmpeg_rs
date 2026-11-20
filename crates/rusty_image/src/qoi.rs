@@ -206,6 +206,9 @@ pub fn encode(image: &Image) -> Result<Vec<u8>> {
 /// (to dodge op mispredicts, 645K of 4.4M on RGB data in callgrind's branch
 /// sim) measured worse on both instruments: Ir RGB -28.5% -> -10.3%, RGBA
 /// -> +2.7%; wall 0.70 s -> 0.82 s RGB, 0.28 s -> 0.59 s RGBA.
+/// Keeping the branches but writing into a pre-sized, zero-filled buffer by
+/// index (no Vec capacity checks) also lost: Ir RGB -30.8% -> -31.5% but
+/// RGBA -46.4% -> -35.5%; wall 1.01 -> 1.06 s RGB, 0.36 -> 0.47 s RGBA.
 fn encode_ops<const CH: usize>(pixels: &[u8], out: &mut Vec<u8>) {
     let mut index = [0u32; 64];
     let mut prev = 0xff00_0000u32;
