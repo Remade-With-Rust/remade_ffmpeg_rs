@@ -123,6 +123,9 @@ pub enum SampleKind {
 pub trait Sample: Copy + Send + Sync + 'static + sealed::Sealed {
     #[doc(hidden)]
     const KIND: SampleKind;
+    /// Entries of a per-value input table (a power of two), 0 for `f32`.
+    #[doc(hidden)]
+    const TABLE_LEN: usize;
     #[doc(hidden)]
     fn to_unit(self) -> f64;
     #[doc(hidden)]
@@ -135,6 +138,7 @@ pub trait Sample: Copy + Send + Sync + 'static + sealed::Sealed {
 
 impl Sample for u8 {
     const KIND: SampleKind = SampleKind::U8;
+    const TABLE_LEN: usize = 256;
     fn to_unit(self) -> f64 {
         f64::from(self) / 255.0
     }
@@ -151,6 +155,7 @@ impl Sample for u8 {
 
 impl Sample for u16 {
     const KIND: SampleKind = SampleKind::U16;
+    const TABLE_LEN: usize = 65536;
     fn to_unit(self) -> f64 {
         f64::from(self) / 65535.0
     }
@@ -167,6 +172,7 @@ impl Sample for u16 {
 
 impl Sample for f32 {
     const KIND: SampleKind = SampleKind::F32;
+    const TABLE_LEN: usize = 0;
     fn to_unit(self) -> f64 {
         f64::from(self)
     }
@@ -185,40 +191,35 @@ impl Sample for f32 {
 /// so the steep start of a gamma inverse is sampled densely.
 const OUT_TABLE: usize = 16384;
 
+/// Matrix-shaper engine for integer samples. Tables are flat, one fixed-size
+/// row per channel (`TABLE_LEN` input entries, `OUT_TABLE` output entries),
+/// so the hot loop slices a row once and its indexing is provably in bounds.
 struct ShaperEngine {
     link: ShaperLink,
     m: [[f32; 3]; 3],
     off: [f32; 3],
-    in8: Vec<Vec<f32>>,
-    in16: OnceLock<Vec<Vec<f32>>>,
-    out: Vec<Vec<f32>>,
+    in8: Box<[f32]>,
+    in16: OnceLock<Box<[f32]>>,
+    out: Box<[[f32; OUT_TABLE]]>,
 }
 
 impl ShaperEngine {
-    fn new(link: ShaperLink) -> Self {
-        let table = |n: usize| -> Vec<Vec<f32>> {
-            link.in_curves
-                .iter()
-                .map(|c| {
-                    (0..n)
-                        .map(|i| c.eval(i as f64 / (n - 1) as f64) as f32)
-                        .collect()
-                })
-                .collect()
-        };
-        let in8 = table(256);
-        let out = link
-            .out_curves
+    fn table(link: &ShaperLink, n: usize) -> Box<[f32]> {
+        link.in_curves
             .iter()
-            .map(|c| {
-                (0..OUT_TABLE)
-                    .map(|i| {
-                        let t = i as f64 / (OUT_TABLE - 1) as f64;
-                        c.eval_inverse(t * t) as f32
-                    })
-                    .collect()
-            })
-            .collect();
+            .flat_map(|c| (0..n).map(move |i| c.eval(i as f64 / (n - 1) as f64) as f32))
+            .collect()
+    }
+
+    fn new(link: ShaperLink) -> Self {
+        let in8 = Self::table(&link, 256);
+        let mut out = vec![[0.0f32; OUT_TABLE]; link.out_curves.len()].into_boxed_slice();
+        for (row, c) in out.iter_mut().zip(&link.out_curves) {
+            for (i, v) in row.iter_mut().enumerate() {
+                let t = i as f64 / (OUT_TABLE - 1) as f64;
+                *v = c.eval_inverse(t * t) as f32;
+            }
+        }
         let m = link.m.map(|r| r.map(|v| v as f32));
         let off = link.off.map(|v| v as f32);
         Self {
@@ -231,27 +232,49 @@ impl ShaperEngine {
         }
     }
 
-    fn in16(&self) -> &Vec<Vec<f32>> {
-        self.in16.get_or_init(|| {
-            self.link
-                .in_curves
-                .iter()
-                .map(|c| {
-                    (0..65536)
-                        .map(|i| c.eval(f64::from(i) / 65535.0) as f32)
-                        .collect()
-                })
-                .collect()
-        })
+    fn in16(&self) -> &[f32] {
+        self.in16.get_or_init(|| Self::table(&self.link, 65536))
     }
 
     #[inline]
-    fn lookup_out(table: &[f32], lin: f32) -> f32 {
+    fn lookup_out(table: &[f32; OUT_TABLE], lin: f32) -> f32 {
         let lin = if lin > 0.0 { lin.min(1.0) } else { 0.0 };
         let pos = lin.sqrt() * (OUT_TABLE - 1) as f32;
         let i = (pos as usize).min(OUT_TABLE - 2);
         let f = pos - i as f32;
         table[i] + (table[i + 1] - table[i]) * f
+    }
+
+    /// The integer hot loop, monomorphised on the colour channel counts so
+    /// every per-channel index is a constant.
+    #[allow(clippy::too_many_arguments)]
+    fn run<T: Sample, const IN: usize, const OUT: usize>(
+        &self,
+        tables: &[f32],
+        src: &[T],
+        dst: &mut [T],
+        sc: usize,
+        dc: usize,
+        src_alpha: bool,
+        dst_alpha: bool,
+    ) {
+        let n = T::TABLE_LEN;
+        let rows: [&[f32]; IN] = core::array::from_fn(|c| &tables[c * n..(c + 1) * n]);
+        let outs: [&[f32; OUT_TABLE]; OUT] = core::array::from_fn(|o| &self.out[o]);
+        for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+            let mut lin = [0.0f32; 3];
+            for c in 0..IN {
+                lin[c] = rows[c][sp[c].index() & (n - 1)];
+            }
+            for o in 0..OUT {
+                let row = self.m[o];
+                let v = row[0] * lin[0] + row[1] * lin[1] + row[2] * lin[2] + self.off[o];
+                dp[o] = T::from_unit(f64::from(Self::lookup_out(outs[o], v)));
+            }
+            if dst_alpha {
+                dp[dc - 1] = if src_alpha { sp[sc - 1] } else { T::opaque() };
+            }
+        }
     }
 }
 
@@ -433,23 +456,16 @@ impl Transform {
         match (&self.engine, T::KIND) {
             (Engine::Shaper(e), SampleKind::U8 | SampleKind::U16) => {
                 let tables = if T::KIND == SampleKind::U8 {
-                    &e.in8
+                    &e.in8[..]
                 } else {
                     e.in16()
                 };
-                for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
-                    let mut lin = [0.0f32; 3];
-                    for c in 0..in_ch {
-                        lin[c] = tables[c][sp[c].index()];
-                    }
-                    for (o, d) in dp.iter_mut().enumerate().take(out_ch) {
-                        let row = e.m[o];
-                        let v = row[0] * lin[0] + row[1] * lin[1] + row[2] * lin[2] + e.off[o];
-                        *d = T::from_unit(f64::from(ShaperEngine::lookup_out(&e.out[o], v)));
-                    }
-                    if dst_alpha {
-                        dp[dc - 1] = if src_alpha { sp[sc - 1] } else { T::opaque() };
-                    }
+                let a = (src, dst, sc, dc, src_alpha, dst_alpha);
+                match (in_ch, out_ch) {
+                    (3, 3) => e.run::<T, 3, 3>(tables, a.0, a.1, a.2, a.3, a.4, a.5),
+                    (3, 1) => e.run::<T, 3, 1>(tables, a.0, a.1, a.2, a.3, a.4, a.5),
+                    (1, 3) => e.run::<T, 1, 3>(tables, a.0, a.1, a.2, a.3, a.4, a.5),
+                    _ => e.run::<T, 1, 1>(tables, a.0, a.1, a.2, a.3, a.4, a.5),
                 }
             }
             (Engine::Grid(g), SampleKind::U8 | SampleKind::U16) => {
