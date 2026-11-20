@@ -207,23 +207,33 @@ fn copy_back(out: &mut [u8], from: usize, at: usize, l: usize) {
     }
 }
 
+/// MSB-first bit packer. Codes collect in a 64-bit accumulator and leave
+/// four bytes at a time, so a 9..12-bit code costs a shift and an or rather
+/// than a loop of single-byte pushes.
 struct BitWriter {
     out: Vec<u8>,
-    acc: u32,
+    acc: u64,
     nbits: u32,
 }
 
 impl BitWriter {
+    #[inline]
     fn put(&mut self, code: u16, width: u32) {
-        self.acc = (self.acc << width) | u32::from(code);
+        // Bits above the low `nbits` are already written; they fall off the
+        // top of the shift or out of the `as u32` below, so no masking.
+        self.acc = (self.acc << width) | u64::from(code);
         self.nbits += width;
+        if self.nbits >= 32 {
+            self.nbits -= 32;
+            self.out
+                .extend_from_slice(&((self.acc >> self.nbits) as u32).to_be_bytes());
+        }
+    }
+    fn finish(mut self) -> Vec<u8> {
         while self.nbits >= 8 {
             self.nbits -= 8;
             self.out.push((self.acc >> self.nbits) as u8);
         }
-        self.acc &= (1 << self.nbits) - 1;
-    }
-    fn finish(mut self) -> Vec<u8> {
         if self.nbits > 0 {
             self.out.push((self.acc << (8 - self.nbits)) as u8);
         }
@@ -231,67 +241,119 @@ impl BitWriter {
     }
 }
 
-/// Encode with TIFF 6 LZW (MSB-first, early change, clear at start and when
-/// the table fills).
-pub(crate) fn encode(data: &[u8]) -> Vec<u8> {
-    const HSIZE: usize = 1 << 14;
-    let mut keys = vec![u32::MAX; HSIZE];
-    let mut vals = vec![0u16; HSIZE];
-    let mut w = BitWriter {
-        out: Vec::with_capacity(data.len() / 2 + 16),
-        acc: 0,
-        nbits: 0,
-    };
-    let mut width = 9u32;
-    let mut next = FIRST;
-    w.put(CLEAR, width);
-    let Some((&b0, rest)) = data.split_first() else {
-        w.put(EOI, width);
-        return w.finish();
-    };
-    let mut cur = u16::from(b0);
-    for &b in rest {
-        let key = (u32::from(cur) << 8) | u32::from(b);
-        let mut h = (key.wrapping_mul(0x9E37_79B1) >> 18) as usize & (HSIZE - 1);
-        let found = loop {
-            if keys[h] == key {
-                break Some(vals[h]);
-            }
-            if keys[h] == u32::MAX {
-                break None;
-            }
-            h = (h + 1) & (HSIZE - 1);
+/// Hash table slots (a power of two, well above the 4094 live codes).
+const HSIZE: usize = 1 << 14;
+/// A key is `prefix code << 8 | byte`: under 2^20, since codes are < 4096.
+const KEY_BITS: u32 = 20;
+
+/// TIFF 6 LZW encoder (MSB-first, early change, clear at start and when the
+/// table fills), reusable across strips and tiles.
+///
+/// The string table is an open-addressed hash of `(prefix, byte) -> code`.
+/// Instead of refilling its 16 Ki slots at every clear code and for every
+/// strip (a default strip is about 8 KB, so the refill cost more than the
+/// coding), each stored key carries a generation number in its top bits and
+/// a clear just starts a new generation: a slot holding an older generation
+/// reads as empty. The slots are refilled only when the generation counter
+/// wraps, once every 4095 clears.
+pub(crate) struct LzwEncoder {
+    keys: Vec<u32>,
+    vals: Vec<u16>,
+    /// Current generation, `1..(1 << (32 - KEY_BITS))`; 0 marks a slot
+    /// never written since the last refill.
+    gen: u32,
+}
+
+impl LzwEncoder {
+    pub(crate) fn new() -> Self {
+        Self {
+            keys: vec![0; HSIZE],
+            vals: vec![0; HSIZE],
+            gen: 0,
+        }
+    }
+
+    /// Forget every string: start a new generation.
+    #[inline]
+    fn clear(&mut self) {
+        self.gen += 1;
+        if self.gen == 1 << (32 - KEY_BITS) {
+            self.keys.fill(0);
+            self.gen = 1;
+        }
+    }
+
+    /// Encode one strip or tile.
+    pub(crate) fn encode(&mut self, data: &[u8]) -> Vec<u8> {
+        self.clear();
+        let mut w = BitWriter {
+            out: Vec::with_capacity(data.len() / 2 + 16),
+            acc: 0,
+            nbits: 0,
         };
-        if let Some(code) = found {
-            cur = code;
-            continue;
+        let mut width = 9u32;
+        let mut next = FIRST;
+        w.put(CLEAR, width);
+        let Some((&b0, rest)) = data.split_first() else {
+            w.put(EOI, width);
+            return w.finish();
+        };
+        let mut tag = self.gen << KEY_BITS;
+        let mut cur = u16::from(b0);
+        for &b in rest {
+            let key = (u32::from(cur) << 8) | u32::from(b);
+            let tagged = tag | key;
+            let mut h = (key.wrapping_mul(0x9E37_79B1) >> 18) as usize & (HSIZE - 1);
+            let found = loop {
+                let k = self.keys[h];
+                if k == tagged {
+                    break Some(self.vals[h]);
+                }
+                // Keys are below 2^KEY_BITS, so anything under this
+                // generation's tag was written by an earlier one: empty.
+                if k < tag {
+                    break None;
+                }
+                h = (h + 1) & (HSIZE - 1);
+            };
+            if let Some(code) = found {
+                cur = code;
+                continue;
+            }
+            w.put(cur, width);
+            self.keys[h] = tagged;
+            self.vals[h] = next;
+            next += 1;
+            // Encoder side of early change: libtiff's `free_ent > maxcode`.
+            if next >= 4094 {
+                w.put(CLEAR, width);
+                self.clear();
+                tag = self.gen << KEY_BITS;
+                width = 9;
+                next = FIRST;
+            } else if next >= (1u16 << width) {
+                width += 1;
+            }
+            cur = u16::from(b);
         }
         w.put(cur, width);
-        keys[h] = key;
-        vals[h] = next;
+        // The decoder adds an entry after this code; mirror its width change.
         next += 1;
-        // Encoder side of early change: libtiff's `free_ent > maxcode`.
         if next >= 4094 {
             w.put(CLEAR, width);
-            keys.fill(u32::MAX);
             width = 9;
-            next = FIRST;
         } else if next >= (1u16 << width) {
             width += 1;
         }
-        cur = u16::from(b);
+        w.put(EOI, width);
+        w.finish()
     }
-    w.put(cur, width);
-    // The decoder adds an entry after this code; mirror its width change.
-    next += 1;
-    if next >= 4094 {
-        w.put(CLEAR, width);
-        width = 9;
-    } else if next >= (1u16 << width) {
-        width += 1;
-    }
-    w.put(EOI, width);
-    w.finish()
+}
+
+/// One-shot encode (tests).
+#[cfg(test)]
+pub(crate) fn encode(data: &[u8]) -> Vec<u8> {
+    LzwEncoder::new().encode(data)
 }
 
 #[cfg(test)]
@@ -317,6 +379,33 @@ mod tests {
             decode(&enc, &mut out).unwrap();
             assert_eq!(out, data, "n={n}");
         }
+    }
+
+    /// A reused encoder (generation-stamped table, wrapping past 4095
+    /// clears) must emit exactly what a fresh one does for every strip.
+    #[test]
+    fn reused_encoder_matches_fresh_across_generation_wrap() {
+        let mut enc = LzwEncoder::new();
+        let mut seed = 11u32;
+        for strip in 0..5000usize {
+            let n = if strip % 500 == 0 { 20_000 } else { strip % 97 };
+            let data: Vec<u8> = (0..n)
+                .map(|i| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    if i % 5 < 2 {
+                        (i / 9) as u8
+                    } else {
+                        (seed >> 24) as u8
+                    }
+                })
+                .collect();
+            let got = enc.encode(&data);
+            assert_eq!(got, encode(&data), "strip {strip}");
+            let mut out = vec![0u8; n];
+            decode(&got, &mut out).unwrap();
+            assert_eq!(out, data, "strip {strip}");
+        }
+        assert!(enc.gen < 5000, "generation counter wrapped and refilled");
     }
 
     #[test]
