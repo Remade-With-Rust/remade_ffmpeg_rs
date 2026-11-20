@@ -170,6 +170,9 @@ rusty_av1d = { version = "1.2.1", default-features = false, features = ["bitdept
 # (MIT/Apache-2.0), carried forward in-tree. DEFLATE via miniz_oxide/fdeflate,
 # with an opt-in pure-Rust `zlib-rs` backend. See crates/rusty_png/NOTICE.md.
 rusty_png = { path = "crates/rusty_png", version = "0.3.2", features = ["parallel"] }
+# 2D rasteriser: our own rusty_raster, a hardened fork of tiny-skia 0.12
+# (BSD-3-Clause, Skia-derived). See crates/rusty_raster/NOTICE.md.
+rusty_raster = { path = "crates/rusty_raster", version = "0.1.0" }
 # zlib inflate for Matroska ContentCompression (rff-format-mkv); the same
 # miniz_oxide release rusty_png already pulls in.
 miniz_oxide = "0.8.9"
@@ -252,6 +255,16 @@ codegen-units = 1
 # `Err` rather than killing the process. The unwind path is cold (hot decode
 # loops never panic), so the cost is binary size, not throughput.
 panic = "unwind"
+
+# tiny-skia 0.12 is only a dev-dependency: rusty_raster's differential oracle
+# (`crates/rusty_raster/tests/oracle.rs`) renders every scene with it live and
+# compares. Its `u16x16` lanes add with plain `+`, which wraps in release (the
+# behaviour every tiny-skia user ships) but panics under debug overflow checks,
+# and its blitter destructor then panics again and aborts the test process.
+# Building that one package without overflow checks lets the oracle run live in
+# debug test builds as well. rusty_raster itself keeps its overflow checks.
+[profile.dev.package.tiny-skia]
+overflow-checks = false
 
 # THE JSON SWAP (rusty_json_turbo). One table converts the WHOLE graph.
 #

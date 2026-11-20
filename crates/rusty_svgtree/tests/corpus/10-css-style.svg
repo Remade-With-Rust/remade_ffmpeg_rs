@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200">
+<style type="text/css"><![CDATA[
+rect { fill: #777; }
+.red { fill: #d22; stroke: black; stroke-width: 2 }
+#special { fill: #2d2 !important; }
+g > circle { fill: #22d; }
+g circle.big { stroke: orange; stroke-width: 6; }
+[data-x="1"] { opacity: 0.5 }
+path:first-child { fill: hotpink }
+@media print { rect { fill: yellow } }
+]]></style>
+<rect x="10" y="10" width="50" height="50"/>
+<rect x="70" y="10" width="50" height="50" class="red"/>
+<rect x="130" y="10" width="50" height="50" id="special" style="fill: red"/>
+<g><circle cx="35" cy="110" r="25"/><circle cx="100" cy="110" r="25" class="big"/></g>
+<rect x="130" y="85" width="50" height="50" fill="purple" data-x="1"/>
+<g><path d="M10 150 h60 v40 h-60z"/><path d="M90 150 h60 v40 h-60z"/></g>
+</svg>

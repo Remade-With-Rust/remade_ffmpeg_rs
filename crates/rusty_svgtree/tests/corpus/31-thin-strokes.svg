@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="100">
+<g fill="none" stroke="black">
+<path d="M10 10 L190 30" stroke-width="0.5"/><path d="M10 30 L190 50" stroke-width="0.1"/>
+<path d="M10 50 Q100 0 190 90" stroke-width="0.8"/><circle cx="100" cy="70" r="20" stroke-width="0.3"/>
+<rect x="10.5" y="80.5" width="50" height="10" stroke-width="1"/>
+</g></svg>

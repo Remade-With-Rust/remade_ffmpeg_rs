@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">
+<defs>
+<pattern id="a" width="0.25" height="0.25"><rect width="10" height="10" fill="#063"/></pattern>
+<pattern id="b" width="0.2" height="0.2" patternContentUnits="objectBoundingBox"><circle cx="0.1" cy="0.1" r="0.08" fill="#c06"/></pattern>
+<pattern id="c" width="0.5" height="0.5" viewBox="0 0 10 10"><path d="M0 0 L10 10 M10 0 L0 10" stroke="#00c" stroke-width="2"/></pattern>
+<pattern id="d" href="#a" patternTransform="skewX(20)"/>
+</defs>
+<rect x="10" y="10" width="80" height="80" fill="url(#a)"/>
+<rect x="110" y="10" width="80" height="80" fill="url(#b)"/>
+<ellipse cx="50" cy="150" rx="40" ry="30" fill="url(#c)"/>
+<rect x="110" y="110" width="80" height="80" fill="url(#d)" stroke="black"/>
+</svg>
