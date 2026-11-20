@@ -615,6 +615,43 @@ fn decode_2d_row(
     Ok(RowEnd::Done)
 }
 
+/// Paint pixels `s..e` of a packed MSB-first row black: a head mask, whole
+/// bytes, a tail mask. Setting one bit per pixel was 55% of a G4 decode.
+#[inline]
+fn paint_span(out: &mut [u8], s: usize, e: usize, black_is_1: bool) {
+    if s >= e {
+        return;
+    }
+    let (sb, eb) = (s >> 3, e >> 3);
+    let head = 0xFFu8 >> (s & 7);
+    // Bits of byte `eb` before `e` (none when `e` is byte-aligned).
+    let tail = !(0xFFu8 >> (e & 7));
+    let apply = |b: &mut u8, m: u8| {
+        if black_is_1 {
+            *b |= m;
+        } else {
+            *b &= !m;
+        }
+    };
+    if sb == eb {
+        apply(&mut out[sb], head & tail);
+        return;
+    }
+    apply(&mut out[sb], head);
+    let fill = if black_is_1 { 0xFF } else { 0 };
+    let mid = &mut out[sb + 1..eb];
+    if mid.len() <= 16 {
+        for b in mid {
+            *b = fill;
+        }
+    } else {
+        mid.fill(fill);
+    }
+    if tail != 0 {
+        apply(&mut out[eb], tail);
+    }
+}
+
 fn render_row(changes: &[u32], width: u32, out: &mut [u8], black_is_1: bool) {
     // White background; padding bits are cleared below so they are always 0.
     out.fill(if black_is_1 { 0 } else { 0xFF });
@@ -622,13 +659,7 @@ fn render_row(changes: &[u32], width: u32, out: &mut [u8], black_is_1: bool) {
     while k < changes.len() {
         let s = changes[k] as usize;
         let e = changes.get(k + 1).map_or(width, |&x| x) as usize;
-        for x in s..e {
-            if black_is_1 {
-                out[x >> 3] |= 0x80 >> (x & 7);
-            } else {
-                out[x >> 3] &= !(0x80 >> (x & 7));
-            }
-        }
+        paint_span(out, s, e, black_is_1);
         k += 2;
     }
     if !black_is_1 && !width.is_multiple_of(8) {
@@ -1010,6 +1041,31 @@ pub fn encode(pixels: &[u8], opts: &Options) -> Result<Vec<u8>, CcittError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paint_span_matches_per_bit() {
+        for width in 1..70usize {
+            let bytes = width.div_ceil(8);
+            for s in 0..=width {
+                for e in s..=width {
+                    for black_is_1 in [true, false] {
+                        let init = if black_is_1 { 0u8 } else { 0xFF };
+                        let mut want = vec![init; bytes];
+                        for x in s..e {
+                            if black_is_1 {
+                                want[x >> 3] |= 0x80 >> (x & 7);
+                            } else {
+                                want[x >> 3] &= !(0x80 >> (x & 7));
+                            }
+                        }
+                        let mut got = vec![init; bytes];
+                        paint_span(&mut got, s, e, black_is_1);
+                        assert_eq!(got, want, "{width} {s} {e} {black_is_1}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn tables_are_prefix_free_and_complete() {
