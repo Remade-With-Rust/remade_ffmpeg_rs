@@ -90,6 +90,17 @@ macro_rules! sample_impl {
             fn put_ne(self, out: &mut Vec<u8>) {
                 out.extend_from_slice(&self.to_ne_bytes());
             }
+            /// One sized buffer filled with fixed-width stores, instead of
+            /// a growing Vec with a capacity check per sample.
+            #[inline]
+            fn ne_bytes(src: &[Self]) -> std::borrow::Cow<'_, [u8]> {
+                const B: usize = std::mem::size_of::<$t>();
+                let mut out = vec![0u8; src.len() * B];
+                for (d, s) in out.chunks_exact_mut(B).zip(src) {
+                    d.copy_from_slice(&s.to_ne_bytes());
+                }
+                std::borrow::Cow::Owned(out)
+            }
         }
     )*};
 }

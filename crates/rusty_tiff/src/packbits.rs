@@ -80,13 +80,15 @@ pub(crate) fn encode_row(row: &[u8], out: &mut Vec<u8>) {
     let mut i = 0;
     while i < n {
         // Repeat run?
+        // A slice-iterator scan here measured the same (-0.6M on 16-bit,
+        // +0.1M on 8-bit): the loop's bounds checks are not the cost.
         let mut r = 1;
         while i + r < n && r < 128 && row[i + r] == row[i] {
             r += 1;
         }
         if r >= 2 {
-            out.push((1 - r as i32) as i8 as u8);
-            out.push(row[i]);
+            // Header and byte as one fixed 2-byte append (one capacity check).
+            out.extend_from_slice(&[(1 - r as i32) as i8 as u8, row[i]]);
             i += r;
             continue;
         }
