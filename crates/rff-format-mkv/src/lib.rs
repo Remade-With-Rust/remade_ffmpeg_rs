@@ -50,6 +50,9 @@ mod index_tests;
 #[cfg(test)]
 mod metadata_tests;
 mod mux;
+mod props;
+#[cfg(test)]
+mod props_tests;
 
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
@@ -1007,6 +1010,8 @@ struct MkvDemuxer {
     /// The random-access index, built on the first `sample_index` call.
     index: Option<index::Index>,
     parsed: bool,
+    /// `Info` and global `Tags` ([`Demuxer::metadata`]).
+    metadata: rff_core::Dictionary,
 }
 
 impl MkvDemuxer {
@@ -1037,6 +1042,7 @@ impl MkvDemuxer {
             clusters_at: None,
             index: None,
             parsed: false,
+            metadata: rff_core::Dictionary::new(),
         }
     }
 
@@ -1050,6 +1056,11 @@ impl MkvDemuxer {
         if self.walk.done {
             return Err(no_tracks());
         }
+        let segment_data;
+        // Where the SeekHead says `Tags` is (Segment-relative), and whether
+        // the header walk met it before the first Cluster.
+        let mut tags_at: Option<u64> = None;
+        let mut tags_read = false;
         loop {
             let Some(h) = self.src.header()? else {
                 self.walk.done = true;
@@ -1057,6 +1068,7 @@ impl MkvDemuxer {
             };
             if h.id == ID_SEGMENT {
                 self.walk.seg_end = (!h.unknown).then(|| h.start.saturating_add(h.size));
+                segment_data = h.start;
                 break;
             }
             if h.unknown {
@@ -1097,6 +1109,17 @@ impl MkvDemuxer {
                         self.parse_tracks(&body);
                     }
                 }
+                // Tags before the Clusters (rff writes them there), and the
+                // SeekHead, which says where later Tags are.
+                ID_TAGS | ID_SEEK_HEAD if h.size <= MAX_HEADER_ELEMENT => {
+                    let body = self.src.body(self.walk.bounded(&h))?;
+                    if h.id == ID_TAGS {
+                        props::read_tags(&mut self.metadata, &body);
+                        tags_read = true;
+                    } else {
+                        tags_at = tags_at.or_else(|| seek_target(&body, ID_TAGS));
+                    }
+                }
                 // Children of an unknown-size Info/Tracks descended into.
                 ID_TRACK_ENTRY | ID_TIMESTAMP_SCALE | ID_DURATION => {
                     let len = self.walk.bounded(&h);
@@ -1124,6 +1147,21 @@ impl MkvDemuxer {
         if self.streams.is_empty() {
             self.walk.done = true;
             return Err(no_tracks());
+        }
+        // Tags after the Clusters (FFmpeg writes them at the end): read them
+        // through the SeekHead when the input can seek there and back.
+        if let (false, Some(rel), true) = (tags_read, tags_at, self.src.seekable()) {
+            let at = self.src.base + segment_data.saturating_add(rel);
+            if let Ok(head) = self.src.read_at(at, 12) {
+                let mut e = Ebml::new(&head);
+                if let (Some(ID_TAGS), Some((size, false))) = (e.read_id(), e.read_size()) {
+                    if size <= MAX_HEADER_ELEMENT {
+                        if let Ok(body) = self.src.read_at(at + e.pos as u64, size) {
+                            props::read_tags(&mut self.metadata, &body);
+                        }
+                    }
+                }
+            }
         }
         for s in &mut self.streams {
             s.duration = self.duration_ticks;
@@ -1216,7 +1254,10 @@ impl MkvDemuxer {
                     self.duration_ticks = Some(d as i64);
                 }
             }
-            _ => e.skip(len),
+            _ => {
+                let body = e.read_bytes(len);
+                props::info_element(&mut self.metadata, id, body);
+            }
         }
     }
 
@@ -1250,6 +1291,10 @@ impl MkvDemuxer {
         let mut alpha_mode = 0u64;
         let mut colour: Option<&[u8]> = None;
         let mut encodings: Option<&[u8]> = None;
+        // Name, Language, flags (applied once the stream exists) and the
+        // whole Video body (crop, display size, projection, interlacing).
+        let mut props: Vec<(u32, &[u8])> = Vec::new();
+        let mut video_body: Option<&[u8]> = None;
 
         let mut e = Ebml::new(data);
         while e.pos < data.len() {
@@ -1268,6 +1313,7 @@ impl MkvDemuxer {
                 ID_SEEK_PREROLL => seek_preroll = e.read_uint(len),
                 ID_CONTENT_ENCODINGS => encodings = Some(e.read_bytes(len)),
                 ID_VIDEO => {
+                    video_body = data.get(e.pos..e.pos.saturating_add(len).min(data.len()));
                     let mut v = Ebml::at(data, e.pos);
                     let ve = e.pos.saturating_add(len);
                     while v.pos < ve {
@@ -1299,7 +1345,12 @@ impl MkvDemuxer {
                     }
                     e.skip(len);
                 }
-                _ => e.skip(len),
+                _ => {
+                    if let Some(body) = data.get(e.pos..e.pos.saturating_add(len).min(data.len())) {
+                        props.push((id, body));
+                    }
+                    e.skip(len);
+                }
             }
         }
 
@@ -1359,7 +1410,15 @@ impl MkvDemuxer {
             if let Some(colour) = colour {
                 parse_colour(&mut s, colour);
             }
+            if let Some(video) = video_body {
+                props::apply_video(&mut s, video);
+            }
         }
+        let mut lang = props::Lang::default();
+        for (id, body) in props {
+            props::track_element(&mut s, &mut lang, id, body);
+        }
+        s.language = lang.resolve();
         // PCM: the codec string + bit depth decide the sample layout. 8-bit
         // integer PCM is unsigned (RFC 9559 codec mapping; FFmpeg's pcm_u8).
         if codec_id == CodecId::Pcm {
@@ -1565,6 +1624,27 @@ impl Demuxer for MkvDemuxer {
         self.t.raw = raw;
         true
     }
+
+    fn metadata(&self) -> Option<&rff_core::Dictionary> {
+        Some(&self.metadata)
+    }
+}
+
+/// The Segment-relative position a SeekHead body gives for `target`.
+fn seek_target(seekhead: &[u8], target: u32) -> Option<u64> {
+    children(seekhead)
+        .filter(|&(id, _)| id == 0x4DBB) // Seek
+        .find_map(|(_, seek)| {
+            let (mut id, mut pos) = (None, None);
+            for (cid, b) in children(seek) {
+                match cid {
+                    0x53AB => id = Ebml::new(b).read_id(), // SeekID
+                    0x53AC => pos = Some(uint_of(b)),      // SeekPosition
+                    _ => {}
+                }
+            }
+            (id == Some(target)).then_some(pos).flatten()
+        })
 }
 
 fn map_codec(codec: &str) -> CodecId {
