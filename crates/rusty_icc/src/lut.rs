@@ -482,9 +482,11 @@ impl Stage {
                 n
             }
             Self::Clut(c) => {
-                let mut input = [0.0; 16];
-                input[..n].copy_from_slice(&v[..n]);
-                c.eval(&input[..c.grid.len()], &mut v[..]);
+                // A whole-array copy (constant length, inlined) instead of a
+                // runtime-length `memcpy`; `eval` reads only `grid.len()`
+                // (== n) inputs.
+                let input = *v;
+                c.eval(&input[..c.grid.len()], v);
                 c.outputs
             }
         }
@@ -534,8 +536,7 @@ impl ClutEval {
 
     /// Interpolates at `x` (one value per input, clamped to `0..=1`) into
     /// `out[..outputs]`.
-    pub(crate) fn eval(&self, x: &[f64], out: &mut [f64]) {
-        let mut acc = [0.0f64; 16];
+    pub(crate) fn eval(&self, x: &[f64], out: &mut [f64; 16]) {
         let n = self.grid.len();
         let mut base = [0usize; 16];
         let mut frac = [0.0f64; 16];
@@ -553,8 +554,9 @@ impl ClutEval {
             step[i] = if i0 + 1 < g { self.strides[i] } else { 0 };
         }
         let origin: usize = base[..n].iter().sum();
-        self.interp(n, 0, origin, &frac, &step, &mut acc);
-        out[..self.outputs].copy_from_slice(&acc[..self.outputs]);
+        // Straight into the caller's array: the old scratch + runtime-length
+        // `copy_from_slice` was a `memcpy` call per lookup.
+        self.interp(n, 0, origin, &frac, &step, out);
     }
 
     fn at(&self, idx: usize, o: usize) -> f64 {
@@ -677,7 +679,7 @@ mod tests {
             }
         }
         let c = ClutEval::from_f32(vec![g, g, g], 3, data);
-        let mut out = [0.0; 3];
+        let mut out = [0.0; 16];
         c.eval(&[0.3, 0.71, 0.05], &mut out);
         assert!((out[0] - 0.3).abs() < 1e-6);
         assert!((out[1] - (0.355 + 0.0125)).abs() < 1e-6);
@@ -699,7 +701,7 @@ mod tests {
             }
         }
         let c = ClutEval::from_f32(vec![g; 4], 1, data);
-        let mut out = [0.0; 1];
+        let mut out = [0.0; 16];
         c.eval(&[0.1, 0.9, 0.4, 0.6], &mut out);
         assert!((out[0] - 0.5).abs() < 1e-6);
     }
