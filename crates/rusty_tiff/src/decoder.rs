@@ -1339,8 +1339,8 @@ fn decode_chunk_append<R: Read + Seek>(
                 };
                 let mut o = ccitt::Options::new(coding, cw).with_rows(rows);
                 o.max_output_bytes = limits.intermediate_buffer_size;
-                let px = ccitt::decode(&raw, &o)?;
-                dst.extend_from_slice(&px[..expected]);
+                ccitt::decode_append(&raw, &o, dst)?;
+                dst.truncate(start + expected);
                 return Ok(());
             }
             compression::JPEG => {

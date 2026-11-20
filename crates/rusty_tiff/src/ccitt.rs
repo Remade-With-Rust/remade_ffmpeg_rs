@@ -669,6 +669,19 @@ fn render_row(changes: &[u32], width: u32, out: &mut [u8], black_is_1: bool) {
 
 /// Decode with explicit options. Returns packed rows (see the module docs).
 pub fn decode(data: &[u8], opts: &Options) -> Result<Vec<u8>, CcittError> {
+    let mut out = Vec::new();
+    decode_append(data, opts, &mut out)?;
+    Ok(out)
+}
+
+/// [`decode`], appending the rows to `out`: each row is rendered straight
+/// into its place (no per-row buffer copy, and the TIFF decoder needs no
+/// copy of a whole decoded strip into the image).
+pub(crate) fn decode_append(
+    data: &[u8],
+    opts: &Options,
+    out: &mut Vec<u8>,
+) -> Result<(), CcittError> {
     let width = opts.columns;
     if width == 0 || width > 1 << 20 {
         return err(0, format!("unsupported column count {width}"));
@@ -679,13 +692,13 @@ pub fn decode(data: &[u8], opts: &Options) -> Result<Vec<u8>, CcittError> {
             return err(0, "output would exceed max_output_bytes");
         }
     }
-    let mut out = Vec::with_capacity(opts.rows.map_or(0, |r| r as usize * stride));
+    let base = out.len();
+    out.reserve(opts.rows.map_or(0, |r| r as usize * stride));
     let mut b = Bits::new(data);
     let mut reference: Vec<u32> = vec![width; 3];
     let mut cur: Vec<u32> = Vec::new();
     let mut eol_pending = false;
     let mut row: u32 = 0;
-    let mut row_buf = vec![0u8; stride];
 
     loop {
         if let Some(rows) = opts.rows {
@@ -695,7 +708,7 @@ pub fn decode(data: &[u8], opts: &Options) -> Result<Vec<u8>, CcittError> {
         } else if b.rest_is_zero() {
             // Unknown row count: trailing fill (or nothing) ends the image.
             break;
-        } else if out.len() + stride > opts.max_output_bytes {
+        } else if out.len() - base + stride > opts.max_output_bytes {
             return err(row, "output would exceed max_output_bytes");
         }
         let end = match opts.coding {
@@ -781,8 +794,9 @@ pub fn decode(data: &[u8], opts: &Options) -> Result<Vec<u8>, CcittError> {
                 Coding::ModifiedHuffman => return err(row, "EOL in Modified Huffman data"),
             }
         }
-        render_row(&cur, width, &mut row_buf, opts.black_is_1);
-        out.extend_from_slice(&row_buf);
+        let at = out.len();
+        out.resize(at + stride, 0);
+        render_row(&cur, width, &mut out[at..], opts.black_is_1);
         reference.clear();
         reference.extend_from_slice(&cur);
         reference.extend_from_slice(&[width; 3]);
@@ -793,7 +807,7 @@ pub fn decode(data: &[u8], opts: &Options) -> Result<Vec<u8>, CcittError> {
             return err(row, format!("only {row} of {rows} rows present"));
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Decode Group 4 (T.6) data of `width` x `height` pixels. `opts.coding`,

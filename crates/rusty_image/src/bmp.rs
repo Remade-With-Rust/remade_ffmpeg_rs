@@ -652,12 +652,16 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
 
 // ── encode ───────────────────────────────────────────────────────────────────
 
-/// The pixel array of `image` as a bottom-up DIB, and its header fields.
+/// The layout of `image` as a bottom-up DIB: its header fields and the size
+/// of its pixel array. The pixels themselves are written straight into the
+/// output after the headers by [`dib_pixels`] (building them in their own
+/// Vec first and then appending it was a second full copy).
 struct Dib {
     bit_count: u16,
     compression: u32,
     palette: Vec<u8>,
-    pixels: Vec<u8>,
+    row_bytes: usize,
+    pixels_len: usize,
 }
 
 fn dib_body(image: &Image) -> Result<Dib> {
@@ -668,7 +672,6 @@ fn dib_body(image: &Image) -> Result<Dib> {
             image.width, image.height
         )));
     }
-    let ch = image.format.channels();
     let (bit_count, compression, bpp) = match image.format {
         PixelFormat::L8 => (8u16, 0u32, 1usize),
         PixelFormat::Rgb8 => (24, 0, 3),
@@ -680,16 +683,6 @@ fn dib_body(image: &Image) -> Result<Dib> {
         }
     };
     let row_bytes = (w * bpp).div_ceil(4) * 4;
-    let mut pixels = vec![0u8; row_bytes * h];
-    for y in 0..h {
-        let src = &image.pixels[y * w * ch..(y + 1) * w * ch];
-        let dst = &mut pixels[(h - 1 - y) * row_bytes..][..w * bpp];
-        match image.format {
-            PixelFormat::L8 => dst.copy_from_slice(src),
-            PixelFormat::Rgb8 => crate::swizzle::swap_rb3(dst, src),
-            _ => crate::swizzle::swap_rb4(dst, src),
-        }
-    }
     let palette = if image.format == PixelFormat::L8 {
         (0..=255u8).flat_map(|v| [v, v, v, 0]).collect()
     } else {
@@ -699,8 +692,28 @@ fn dib_body(image: &Image) -> Result<Dib> {
         bit_count,
         compression,
         palette,
-        pixels,
+        row_bytes,
+        pixels_len: row_bytes * h,
     })
+}
+
+/// Append `image`'s bottom-up pixel array (rows padded to 4 bytes) to `out`.
+fn dib_pixels(image: &Image, d: &Dib, out: &mut Vec<u8>) {
+    let (w, h) = (image.width as usize, image.height as usize);
+    let ch = image.format.channels();
+    let bpp = usize::from(d.bit_count) / 8;
+    let base = out.len();
+    out.resize(base + d.pixels_len, 0);
+    let pixels = &mut out[base..];
+    for y in 0..h {
+        let src = &image.pixels[y * w * ch..(y + 1) * w * ch];
+        let dst = &mut pixels[(h - 1 - y) * d.row_bytes..][..w * bpp];
+        match image.format {
+            PixelFormat::L8 => dst.copy_from_slice(src),
+            PixelFormat::Rgb8 => crate::swizzle::swap_rb3(dst, src),
+            _ => crate::swizzle::swap_rb4(dst, src),
+        }
+    }
 }
 
 const MASKS_RGBA: [u32; 4] = [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0xff00_0000];
@@ -712,7 +725,7 @@ fn info_header(out: &mut Vec<u8>, size: u32, image: &Image, d: &Dib) {
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&d.bit_count.to_le_bytes());
     out.extend_from_slice(&d.compression.to_le_bytes());
-    out.extend_from_slice(&(d.pixels.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(d.pixels_len as u32).to_le_bytes());
     out.extend_from_slice(&2835u32.to_le_bytes()); // 72 dpi
     out.extend_from_slice(&2835u32.to_le_bytes());
     let colors = (d.palette.len() / 4) as u32;
@@ -745,7 +758,7 @@ pub fn encode(image: &Image) -> Result<Vec<u8>> {
         INFO
     };
     let offset = 14 + header as usize + d.palette.len();
-    let total = offset + d.pixels.len();
+    let total = offset + d.pixels_len;
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(b"BM");
     out.extend_from_slice(&(total as u32).to_le_bytes());
@@ -756,7 +769,7 @@ pub fn encode(image: &Image) -> Result<Vec<u8>> {
         v4_v5_tail(&mut out, false);
     }
     out.extend_from_slice(&d.palette);
-    out.extend_from_slice(&d.pixels);
+    dib_pixels(image, &d, &mut out);
     Ok(out)
 }
 
@@ -781,7 +794,7 @@ pub fn encode_dib(image: &Image, kind: DibKind) -> Result<Vec<u8>> {
         DibKind::Dib => INFO,
         DibKind::DibV5 => V5,
     };
-    let mut out = Vec::with_capacity(header as usize + 12 + d.palette.len() + d.pixels.len());
+    let mut out = Vec::with_capacity(header as usize + 12 + d.palette.len() + d.pixels_len);
     info_header(&mut out, header, image, &d);
     if header == V5 {
         v4_v5_tail(&mut out, true);
@@ -792,7 +805,7 @@ pub fn encode_dib(image: &Image, kind: DibKind) -> Result<Vec<u8>> {
         }
     }
     out.extend_from_slice(&d.palette);
-    out.extend_from_slice(&d.pixels);
+    dib_pixels(image, &d, &mut out);
     Ok(out)
 }
 

@@ -331,6 +331,8 @@ fn rle_row<const B: usize>(row: &[u8], out: &mut Vec<u8>) {
             i += 1;
         }
         out.push((i - start - 1) as u8);
+        // One copy per raw packet. Pushing short packets byte by byte to
+        // dodge the memcpy call measured +5.3M Ir on 24-bit (-9.3% -> -3.4%).
         out.extend_from_slice(&row[start * B..i * B]);
     }
 }
