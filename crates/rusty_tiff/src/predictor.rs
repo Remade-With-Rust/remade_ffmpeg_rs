@@ -56,17 +56,66 @@ pub(crate) fn undo_horizontal(buf: &mut [u8], row_bytes: usize, spp: usize, byte
         return;
     }
     for row in buf.chunks_mut(row_bytes) {
-        match bytes {
-            1 => {
+        match (bytes, spp) {
+            (1, 1) => undo_h8::<1>(row),
+            (1, 2) => undo_h8::<2>(row),
+            (1, 3) => undo_h8::<3>(row),
+            (1, 4) => undo_h8::<4>(row),
+            (1, _) => {
                 for i in spp..row.len() {
                     row[i] = row[i].wrapping_add(row[i - spp]);
                 }
             }
-            2 => undo_h16(row, spp),
-            4 => undo_h32(row, spp),
-            8 => undo_h64(row, spp),
+            (2, 1) => undo_h16n::<1>(row),
+            (2, 3) => undo_h16n::<3>(row),
+            (2, 4) => undo_h16n::<4>(row),
+            (2, _) => undo_h16(row, spp),
+            (4, _) => undo_h32(row, spp),
+            (8, _) => undo_h64(row, spp),
             _ => {}
         }
+    }
+}
+
+/// 8-bit horizontal predictor for `N` samples per pixel: a running per-
+/// sample accumulator in a fixed-size array instead of `row[i - spp]`
+/// re-reads with a bounds check per byte. A trailing partial pixel (row
+/// bytes not a multiple of `N`) is added to the last pixel, as the generic
+/// loop does.
+fn undo_h8<const N: usize>(row: &mut [u8]) {
+    let mut px = row.chunks_exact_mut(N);
+    let Some(first) = px.next() else { return };
+    let mut acc: [u8; N] = (&*first).try_into().unwrap();
+    for p in &mut px {
+        for k in 0..N {
+            acc[k] = acc[k].wrapping_add(p[k]);
+            p[k] = acc[k];
+        }
+    }
+    for (b, a) in px.into_remainder().iter_mut().zip(acc) {
+        *b = b.wrapping_add(a);
+    }
+}
+
+/// The same for native-endian 16-bit samples.
+fn undo_h16n<const N: usize>(row: &mut [u8]) {
+    let mut px = row.chunks_exact_mut(2 * N);
+    let Some(first) = px.next() else { return };
+    let mut acc = [0u16; N];
+    for k in 0..N {
+        acc[k] = u16::from_ne_bytes([first[2 * k], first[2 * k + 1]]);
+    }
+    for p in &mut px {
+        for k in 0..N {
+            acc[k] = acc[k].wrapping_add(u16::from_ne_bytes([p[2 * k], p[2 * k + 1]]));
+            p[2 * k..2 * k + 2].copy_from_slice(&acc[k].to_ne_bytes());
+        }
+    }
+    // A trailing partial pixel: whole samples only, as the generic loop.
+    let rem = px.into_remainder();
+    for (k, s) in rem.chunks_exact_mut(2).enumerate() {
+        let v = u16::from_ne_bytes([s[0], s[1]]).wrapping_add(acc[k]);
+        s.copy_from_slice(&v.to_ne_bytes());
     }
 }
 
