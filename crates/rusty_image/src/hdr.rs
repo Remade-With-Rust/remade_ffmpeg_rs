@@ -290,7 +290,10 @@ fn to_rgbe(c: [f32; 3]) -> [u8; 4] {
     // 2^(8 - e), exact; 8 - e stays inside the normal exponent range for
     // the e values that reach here (-105 .. 129).
     let scale = f32::from_bits(((8 - e + 127).clamp(1, 254) as u32) << 23);
-    let q = |v: f32| ((v.max(0.0) * scale) as i32).clamp(0, 255) as u8;
+    // Every component is <= m and m * scale is in [128, 256), so the product
+    // is below 256: the i32 conversion already lands in 0..=255 (negative
+    // components are cut to 0 first) and needs no clamp.
+    let q = |v: f32| (v.max(0.0) * scale) as i32 as u8;
     let e = (e + 128).clamp(0, 255) as u8;
     [q(c[0]), q(c[1]), q(c[2]), e]
 }
@@ -353,12 +356,18 @@ fn rle_component(v: &[u8], out: &mut Vec<u8>) {
         }
         let start = i;
         while i < v.len() && i - start < 128 {
-            let mut ahead = 1;
-            while i + ahead < v.len() && ahead < 4 && v[i + ahead] == v[i] {
-                ahead += 1;
-            }
-            if ahead >= 4 {
-                break;
+            // A run of four starts here: one word compare against the byte
+            // splatted four times, instead of looking ahead byte by byte.
+            // More instructions than the old look-ahead (whose loop usually
+            // exited after one compare) but branch-free per position: wall
+            // 0.42 -> 0.33 s. Testing the next byte first to skip the word
+            // build had the best Ir and the worst wall (0.52 s): that test
+            // is the unpredictable branch.
+            if let Some(w) = v.get(i..i + 4) {
+                let w = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                if w == u32::from(v[i]) * 0x0101_0101 {
+                    break;
+                }
             }
             i += 1;
         }
