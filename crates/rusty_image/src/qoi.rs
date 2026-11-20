@@ -14,10 +14,45 @@ const OP_RGB: u8 = 0xfe;
 const OP_RGBA: u8 = 0xff;
 const END: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 1];
 
+/// `(r*3 + g*5 + b*7 + a*11) % 64`, with one multiply: the four bytes are
+/// spread into 16-bit lanes (r, b, g, a from the bottom) and multiplied by a
+/// constant whose lanes hold the weights in reverse, so lane 3 of the product
+/// is exactly the weighted sum. No lane can carry into the next (the largest
+/// lane sum is 255 * 26 = 6630), so the low six bits of lane 3 are the hash.
+#[inline]
 fn hash(p: [u8; 4]) -> usize {
-    (usize::from(p[0]) * 3 + usize::from(p[1]) * 5 + usize::from(p[2]) * 7 + usize::from(p[3]) * 11)
-        % 64
+    hash_u32(u32::from_le_bytes(p))
 }
+
+/// [`hash`] of a pixel packed little-endian (r in the low byte).
+#[inline]
+fn hash_u32(v: u32) -> usize {
+    let v = u64::from(v);
+    let w = (v & 0x00ff_00ff) | ((v & 0xff00_ff00) << 24);
+    ((w.wrapping_mul((3 << 48) | (7 << 32) | (5 << 16) | 11) >> 48) & 63) as usize
+}
+
+/// Add two packed pixels byte by byte, each byte wrapping on its own (no
+/// carry crosses into the next channel).
+#[inline]
+fn add_bytes(a: u32, b: u32) -> u32 {
+    ((a & 0x7f7f_7f7f) + (b & 0x7f7f_7f7f)) ^ ((a ^ b) & 0x8080_8080)
+}
+
+/// QOI_OP_DIFF's low six bits -> the packed per-channel addend
+/// (`dr`, `dg`, `db` each biased by 2; alpha unchanged).
+const DIFF_ADD: [u32; 64] = {
+    let mut t = [0u32; 64];
+    let mut i = 0;
+    while i < 64 {
+        let (r, g, b) = ((i as u32 >> 4) & 3, (i as u32 >> 2) & 3, i as u32 & 3);
+        t[i] = (r.wrapping_sub(2) & 0xff)
+            | ((g.wrapping_sub(2) & 0xff) << 8)
+            | ((b.wrapping_sub(2) & 0xff) << 16);
+        i += 1;
+    }
+    t
+};
 
 /// Decode a QOI file.
 pub fn decode(data: &[u8]) -> Result<Image> {
@@ -51,56 +86,76 @@ pub fn decode(data: &[u8]) -> Result<Image> {
 }
 
 /// The op stream into `len` bytes of `CH`-channel pixels. Reads go through
-/// `data.get`, so a cut-off stream is an error; the output is written
-/// straight into a pre-sized buffer, one fixed-size store per pixel.
+/// `data.get`, so a cut-off stream is an error.
+///
+/// The output is pre-sized and every pixel is one fixed 4-byte store: for
+/// three channels the fourth byte lands on the next pixel's first byte, which
+/// that pixel then overwrites (pixels are written strictly in order and every
+/// position below `len` is written), and only the last pixel, with no room
+/// for four bytes, takes a 3-byte store. A run's length is counted in bytes,
+/// so no division by the channel count per op.
 fn decode_ops<const CH: usize>(data: &[u8], len: usize) -> Result<Vec<u8>> {
     let mut out = vec![0u8; len];
-    let mut index = [[0u8; 4]; 64];
-    let mut px = [0u8, 0, 0, 255];
+    // Pixels packed little-endian (r in the low byte): an index op is one
+    // load, the hash reads the word directly and a pixel is one store.
+    let mut index = [0u32; 64];
+    let mut px = 0xff00_0000u32;
     let mut pos = 0usize;
     let mut o = 0usize;
-    let byte = |pos: &mut usize| -> Result<u8> {
-        let b = *data.get(*pos).ok_or(Error::Truncated)?;
-        *pos += 1;
-        Ok(b)
-    };
     while o < len {
-        let b = byte(&mut pos)?;
-        let mut run = 1usize;
-        match b {
+        let b = *data.get(pos).ok_or(Error::Truncated)?;
+        pos += 1;
+        let end = match b {
             OP_RGB => {
                 let c = data.get(pos..pos + 3).ok_or(Error::Truncated)?;
-                px[..3].copy_from_slice(c);
+                px = (px & 0xff00_0000)
+                    | u32::from(c[0])
+                    | (u32::from(c[1]) << 8)
+                    | (u32::from(c[2]) << 16);
                 pos += 3;
+                o + CH
             }
             OP_RGBA => {
                 let c = data.get(pos..pos + 4).ok_or(Error::Truncated)?;
-                px.copy_from_slice(c);
+                px = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
                 pos += 4;
+                o + CH
             }
             _ => match b & 0xc0 {
-                OP_INDEX => px = index[usize::from(b & 0x3f)],
+                OP_INDEX => {
+                    px = index[usize::from(b & 0x3f)];
+                    o + CH
+                }
                 OP_DIFF => {
-                    px[0] = px[0].wrapping_add(((b >> 4) & 3).wrapping_sub(2));
-                    px[1] = px[1].wrapping_add(((b >> 2) & 3).wrapping_sub(2));
-                    px[2] = px[2].wrapping_add((b & 3).wrapping_sub(2));
+                    px = add_bytes(px, DIFF_ADD[usize::from(b & 0x3f)]);
+                    o + CH
                 }
                 OP_LUMA => {
-                    let b2 = byte(&mut pos)?;
+                    let b2 = *data.get(pos).ok_or(Error::Truncated)?;
+                    pos += 1;
                     let dg = (b & 0x3f).wrapping_sub(32);
-                    px[0] = px[0].wrapping_add(dg.wrapping_sub(8).wrapping_add(b2 >> 4));
-                    px[1] = px[1].wrapping_add(dg);
-                    px[2] = px[2].wrapping_add(dg.wrapping_sub(8).wrapping_add(b2 & 0x0f));
+                    let dr = dg.wrapping_sub(8).wrapping_add(b2 >> 4);
+                    let db = dg.wrapping_sub(8).wrapping_add(b2 & 0x0f);
+                    px = add_bytes(
+                        px,
+                        u32::from(dr) | (u32::from(dg) << 8) | (u32::from(db) << 16),
+                    );
+                    o + CH
                 }
-                _ => run = usize::from(b & 0x3f) + 1,
+                // OP_RUN: the same pixel, up to 62 times, never past the end.
+                _ => (o + (usize::from(b & 0x3f) + 1) * CH).min(len),
             },
+        };
+        index[hash_u32(px)] = px;
+        let bytes = px.to_le_bytes();
+        while o < end {
+            if let Some(d) = out.get_mut(o..o + 4) {
+                d.copy_from_slice(&bytes);
+            } else {
+                out[o..o + CH].copy_from_slice(&bytes[..CH]);
+            }
+            o += CH;
         }
-        index[hash(px)] = px;
-        let n = run.min((len - o) / CH);
-        for chunk in out[o..o + n * CH].chunks_exact_mut(CH) {
-            chunk.copy_from_slice(&px[..CH]);
-        }
-        o += n * CH;
     }
     Ok(out)
 }
@@ -125,53 +180,152 @@ pub fn encode(image: &Image) -> Result<Vec<u8>> {
     out.extend_from_slice(&image.height.to_be_bytes());
     out.push(ch as u8);
     out.push(0);
-    let mut index = [[0u8; 4]; 64];
-    let mut prev = [0u8, 0, 0, 255];
-    let mut run = 0u8;
-    let n = image.pixels.len() / ch;
-    for (i, p) in image.pixels.chunks_exact(ch).enumerate() {
-        let px = [p[0], p[1], p[2], if ch == 4 { p[3] } else { 255 }];
-        if px == prev {
-            run += 1;
-            if run == 62 || i == n - 1 {
-                out.push(OP_RUN | (run - 1));
-                run = 0;
-            }
-            continue;
-        }
-        if run > 0 {
-            out.push(OP_RUN | (run - 1));
-            run = 0;
-        }
-        let h = hash(px);
-        if index[h] == px {
-            out.push(OP_INDEX | h as u8);
-        } else {
-            index[h] = px;
-            if px[3] == prev[3] {
-                let dr = px[0].wrapping_sub(prev[0]) as i8;
-                let dg = px[1].wrapping_sub(prev[1]) as i8;
-                let db = px[2].wrapping_sub(prev[2]) as i8;
-                let (dr_dg, db_dg) = (dr.wrapping_sub(dg), db.wrapping_sub(dg));
-                if (-2..=1).contains(&dr) && (-2..=1).contains(&dg) && (-2..=1).contains(&db) {
-                    out.push(
-                        OP_DIFF | ((dr + 2) as u8) << 4 | ((dg + 2) as u8) << 2 | (db + 2) as u8,
-                    );
-                } else if (-32..=31).contains(&dg)
-                    && (-8..=7).contains(&dr_dg)
-                    && (-8..=7).contains(&db_dg)
-                {
-                    out.push(OP_LUMA | (dg + 32) as u8);
-                    out.push(((dr_dg + 8) as u8) << 4 | (db_dg + 8) as u8);
-                } else {
-                    out.extend_from_slice(&[OP_RGB, px[0], px[1], px[2]]);
-                }
-            } else {
-                out.extend_from_slice(&[OP_RGBA, px[0], px[1], px[2], px[3]]);
-            }
-        }
-        prev = px;
+    if ch == 3 {
+        encode_ops::<3>(&image.pixels, &mut out);
+    } else {
+        encode_ops::<4>(&image.pixels, &mut out);
     }
     out.extend_from_slice(&END);
     Ok(out)
+}
+
+/// The op stream for `CH`-channel pixels, appended to `out`. The channel
+/// count is a constant, so building the pixel is a load, not a per-pixel
+/// branch. A run still pending at the end is flushed after the loop rather
+/// than tested for on every pixel.
+///
+/// Pixels are packed little-endian (r in the low byte), as in the decoder:
+/// the equality tests, the hash and the index are single-word operations.
+/// The per-pixel body is a local macro over plain locals: as a method on a
+/// state struct the 256-byte index kept the whole struct in memory, so
+/// `prev` and `run` went through it every pixel (measured +6% Ir at 24-bit).
+fn encode_ops<const CH: usize>(pixels: &[u8], out: &mut Vec<u8>) {
+    let mut index = [0u32; 64];
+    let mut prev = 0xff00_0000u32;
+    let mut run = 0u8;
+    macro_rules! pixel {
+        ($px:expr) => {{
+            let px: u32 = $px;
+            if px == prev {
+                run += 1;
+                if run == 62 {
+                    out.push(OP_RUN | 61);
+                    run = 0;
+                }
+                continue;
+            }
+            if run > 0 {
+                out.push(OP_RUN | (run - 1));
+                run = 0;
+            }
+            let h = hash_u32(px);
+            if index[h] == px {
+                out.push(OP_INDEX | h as u8);
+            } else {
+                index[h] = px;
+                let [r, g, b, a] = px.to_le_bytes();
+                let [pr, pg, pb, pa] = prev.to_le_bytes();
+                if a == pa {
+                    let dr = r.wrapping_sub(pr) as i8;
+                    let dg = g.wrapping_sub(pg) as i8;
+                    let db = b.wrapping_sub(pb) as i8;
+                    let (dr_dg, db_dg) = (dr.wrapping_sub(dg), db.wrapping_sub(dg));
+                    if (-2..=1).contains(&dr) && (-2..=1).contains(&dg) && (-2..=1).contains(&db) {
+                        out.push(
+                            OP_DIFF
+                                | ((dr + 2) as u8) << 4
+                                | ((dg + 2) as u8) << 2
+                                | (db + 2) as u8,
+                        );
+                    } else if (-32..=31).contains(&dg)
+                        && (-8..=7).contains(&dr_dg)
+                        && (-8..=7).contains(&db_dg)
+                    {
+                        out.extend_from_slice(&[
+                            OP_LUMA | (dg + 32) as u8,
+                            ((dr_dg + 8) as u8) << 4 | (db_dg + 8) as u8,
+                        ]);
+                    } else {
+                        out.extend_from_slice(&[OP_RGB, r, g, b]);
+                    }
+                } else {
+                    out.extend_from_slice(&[OP_RGBA, r, g, b, a]);
+                }
+            }
+            prev = px;
+        }};
+    }
+    if CH == 4 {
+        for p in pixels.chunks_exact(4) {
+            pixel!(u32::from_le_bytes([p[0], p[1], p[2], p[3]]));
+        }
+    } else {
+        let n = pixels.len() / 3;
+        for i in 0..n {
+            let at = i * 3;
+            pixel!(if let Some(q) = pixels.get(at..at + 4) {
+                // One 4-byte load; the fourth byte (the next pixel's red)
+                // is replaced by opaque alpha.
+                u32::from_le_bytes([q[0], q[1], q[2], q[3]]) | 0xff00_0000
+            } else {
+                u32::from_le_bytes([pixels[at], pixels[at + 1], pixels[at + 2], 255])
+            });
+        }
+    }
+    if run > 0 {
+        out.push(OP_RUN | (run - 1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{add_bytes, hash, DIFF_ADD};
+
+    #[test]
+    fn packed_byte_add_wraps_per_channel() {
+        let mut s = 0x1234_5679u32;
+        for _ in 0..200_000 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            let t = s.rotate_left(11) ^ 0xa5a5_5a5a;
+            let (a, b) = (s.to_le_bytes(), t.to_le_bytes());
+            let want = [
+                a[0].wrapping_add(b[0]),
+                a[1].wrapping_add(b[1]),
+                a[2].wrapping_add(b[2]),
+                a[3].wrapping_add(b[3]),
+            ];
+            assert_eq!(add_bytes(s, t).to_le_bytes(), want);
+        }
+        for i in 0..64u8 {
+            let d = DIFF_ADD[usize::from(i)].to_le_bytes();
+            assert_eq!(d[0], ((i >> 4) & 3).wrapping_sub(2));
+            assert_eq!(d[1], ((i >> 2) & 3).wrapping_sub(2));
+            assert_eq!(d[2], (i & 3).wrapping_sub(2));
+            assert_eq!(d[3], 0);
+        }
+    }
+
+    #[test]
+    fn one_multiply_hash_matches_the_spec_formula() {
+        let mut s = 0x9e37_79b9u32;
+        for i in 0..200_000u32 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            let p = if i < 4 {
+                [255u8 * (i as u8 & 1), 255, 255, 255]
+            } else {
+                s.to_le_bytes()
+            };
+            let want = (usize::from(p[0]) * 3
+                + usize::from(p[1]) * 5
+                + usize::from(p[2]) * 7
+                + usize::from(p[3]) * 11)
+                % 64;
+            assert_eq!(hash(p), want, "{p:?}");
+        }
+        assert_eq!(hash([255; 4]), (255 * 26) % 64);
+    }
 }
