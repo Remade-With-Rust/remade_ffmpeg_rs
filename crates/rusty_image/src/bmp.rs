@@ -441,11 +441,7 @@ fn read_direct(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
         let y = row(h, i);
         let dst = &mut buf[y * stride..(y + 1) * stride];
         match (h.kind, ch) {
-            (Kind::Rgb24, 3) => {
-                for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(3)) {
-                    px.copy_from_slice(&[s[2], s[1], s[0]]);
-                }
-            }
+            (Kind::Rgb24, 3) => crate::swizzle::swap_rb3(dst, src),
             (Kind::Rgb32, 3) => {
                 for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
                     px.copy_from_slice(&[s[2], s[1], s[0]]);
@@ -459,8 +455,7 @@ fn read_direct(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
                     let opaque = if std_alpha { 0 } else { 0xff00_0000u32 };
                     for (px, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
                         let v = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-                        let v =
-                            (v & 0xff00_ff00) | ((v >> 16) & 0xff) | ((v & 0xff) << 16) | opaque;
+                        let v = v.swap_bytes().rotate_right(8) | opaque;
                         px.copy_from_slice(&v.to_le_bytes());
                     }
                 } else {
@@ -691,16 +686,8 @@ fn dib_body(image: &Image) -> Result<Dib> {
         let dst = &mut pixels[(h - 1 - y) * row_bytes..][..w * bpp];
         match image.format {
             PixelFormat::L8 => dst.copy_from_slice(src),
-            PixelFormat::Rgb8 => {
-                for (d, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(3)) {
-                    d.copy_from_slice(&[s[2], s[1], s[0]]);
-                }
-            }
-            _ => {
-                for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-                    d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
-                }
-            }
+            PixelFormat::Rgb8 => crate::swizzle::swap_rb3(dst, src),
+            _ => crate::swizzle::swap_rb4(dst, src),
         }
     }
     let palette = if image.format == PixelFormat::L8 {

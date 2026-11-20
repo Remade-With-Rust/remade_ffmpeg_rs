@@ -232,11 +232,10 @@ fn expand_rle<const B: usize>(r: &mut Reader, raw: &mut [u8], swz: bool) -> Resu
 /// BGR(A) <-> RGB(A).
 #[inline]
 fn bgr_copy<const B: usize>(dst: &mut [u8], src: &[u8]) {
-    for (d, s) in dst.chunks_exact_mut(B).zip(src.chunks_exact(B)) {
-        let mut q = [0u8; B];
-        q.copy_from_slice(s);
-        q.swap(0, 2);
-        d.copy_from_slice(&q);
+    if B == 3 {
+        crate::swizzle::swap_rb3(dst, src);
+    } else {
+        crate::swizzle::swap_rb4(dst, src);
     }
 }
 
