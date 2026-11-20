@@ -631,7 +631,7 @@ fn render_row(changes: &[u32], width: u32, out: &mut [u8], black_is_1: bool) {
         }
         k += 2;
     }
-    if !black_is_1 && width % 8 != 0 {
+    if !black_is_1 && !width.is_multiple_of(8) {
         let last = out.len() - 1;
         out[last] &= 0xFFu8 << (8 - width % 8);
     }

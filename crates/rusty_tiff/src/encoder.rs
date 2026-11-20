@@ -650,7 +650,7 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
                     };
                     let off = self.enc.pos()?;
                     self.enc.check_offset(off + coded.len() as u64)?;
-                    self.enc.w.write_all(&coded)?;
+                    self.enc.w.write_all(coded)?;
                     offsets.push(off);
                     counts.push(coded.len() as u64);
                 }
