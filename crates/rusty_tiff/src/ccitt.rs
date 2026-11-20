@@ -600,11 +600,10 @@ fn decode_2d_row(
                 a0 = a2;
             }
             Mode::Vertical(d) => {
-                let a1 = b1 + i64::from(d);
-                if a1 < a0.max(0) {
-                    return err(row, "vertical mode moves left of a0");
-                }
-                let a1 = a1.min(w);
+                // A damaged code can put a1 left of a0; libtiff clamps it to
+                // a0 (a zero-length run) and carries on, so does this. Every
+                // mode consumes bits, so a stuck a0 still terminates.
+                let a1 = (b1 + i64::from(d)).max(a0.max(0)).min(w);
                 push_change(cur, a1 as u32, width);
                 a0 = a1;
                 white = !white;
