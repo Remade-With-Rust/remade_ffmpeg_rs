@@ -249,20 +249,27 @@ fn encode_ops<const CH: usize>(pixels: &[u8], out: &mut Vec<u8>) {
                     // stay under the field size: one compare per op instead
                     // of a range test per component.
                     let dg = g.wrapping_sub(pg);
-                    let dr2 = r.wrapping_sub(pr).wrapping_add(2);
-                    let dg2 = dg.wrapping_add(2);
-                    let db2 = b.wrapping_sub(pb).wrapping_add(2);
-                    if (dr2 | dg2 | db2) < 4 {
-                        out.push(OP_DIFF | dr2 << 4 | dg2 << 2 | db2);
-                    } else {
-                        let dg32 = dg.wrapping_add(32);
-                        let rd8 = r.wrapping_sub(pr).wrapping_sub(dg).wrapping_add(8);
-                        let bd8 = b.wrapping_sub(pb).wrapping_sub(dg).wrapping_add(8);
-                        if dg32 < 64 && (rd8 | bd8) < 16 {
-                            out.extend_from_slice(&[OP_LUMA | dg32, rd8 << 4 | bd8]);
+                    let dg32 = dg.wrapping_add(32);
+                    // Green's LUMA range first (one compare): DIFF is a
+                    // subset of it, and a miss goes straight to RGB.
+                    if dg32 < 64 {
+                        let dr = r.wrapping_sub(pr);
+                        let db = b.wrapping_sub(pb);
+                        let (dr2, dg2, db2) =
+                            (dr.wrapping_add(2), dg.wrapping_add(2), db.wrapping_add(2));
+                        if (dr2 | dg2 | db2) < 4 {
+                            out.push(OP_DIFF | dr2 << 4 | dg2 << 2 | db2);
                         } else {
-                            out.extend_from_slice(&[OP_RGB, r, g, b]);
+                            let rd8 = dr.wrapping_sub(dg).wrapping_add(8);
+                            let bd8 = db.wrapping_sub(dg).wrapping_add(8);
+                            if (rd8 | bd8) < 16 {
+                                out.extend_from_slice(&[OP_LUMA | dg32, rd8 << 4 | bd8]);
+                            } else {
+                                out.extend_from_slice(&[OP_RGB, r, g, b]);
+                            }
                         }
+                    } else {
+                        out.extend_from_slice(&[OP_RGB, r, g, b]);
                     }
                 } else {
                     out.extend_from_slice(&[OP_RGBA, r, g, b, a]);
