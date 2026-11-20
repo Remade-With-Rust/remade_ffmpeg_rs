@@ -14,17 +14,18 @@ const OP_RGB: u8 = 0xfe;
 const OP_RGBA: u8 = 0xff;
 const END: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 1];
 
-/// `(r*3 + g*5 + b*7 + a*11) % 64`, with one multiply: the four bytes are
-/// spread into 16-bit lanes (r, b, g, a from the bottom) and multiplied by a
-/// constant whose lanes hold the weights in reverse, so lane 3 of the product
-/// is exactly the weighted sum. No lane can carry into the next (the largest
-/// lane sum is 255 * 26 = 6630), so the low six bits of lane 3 are the hash.
-#[inline]
+/// [`hash_u32`] of a pixel as bytes (for the spec-formula test).
+#[cfg(test)]
 fn hash(p: [u8; 4]) -> usize {
     hash_u32(u32::from_le_bytes(p))
 }
 
-/// [`hash`] of a pixel packed little-endian (r in the low byte).
+/// The QOI colour hash `(r*3 + g*5 + b*7 + a*11) % 64` of a pixel packed
+/// little-endian (r in the low byte), with one multiply: the four bytes are
+/// spread into 16-bit lanes (r, b, g, a from the bottom) and multiplied by a
+/// constant whose lanes hold the weights in reverse, so lane 3 of the product
+/// is exactly the weighted sum. No lane can carry into the next (the largest
+/// lane sum is 255 * 26 = 6630), so the low six bits of lane 3 are the hash.
 #[inline]
 fn hash_u32(v: u32) -> usize {
     let v = u64::from(v);
@@ -105,46 +106,43 @@ fn decode_ops<const CH: usize>(data: &[u8], len: usize) -> Result<Vec<u8>> {
     while o < len {
         let b = *data.get(pos).ok_or(Error::Truncated)?;
         pos += 1;
-        let end = match b {
-            OP_RGB => {
-                let c = data.get(pos..pos + 3).ok_or(Error::Truncated)?;
-                px = (px & 0xff00_0000)
-                    | u32::from(c[0])
-                    | (u32::from(c[1]) << 8)
-                    | (u32::from(c[2]) << 16);
-                pos += 3;
-                o + CH
-            }
-            OP_RGBA => {
-                let c = data.get(pos..pos + 4).ok_or(Error::Truncated)?;
-                px = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                pos += 4;
-                o + CH
-            }
-            _ => match b & 0xc0 {
-                OP_INDEX => {
-                    px = index[usize::from(b & 0x3f)];
-                    o + CH
-                }
-                OP_DIFF => {
-                    px = add_bytes(px, DIFF_ADD[usize::from(b & 0x3f)]);
-                    o + CH
-                }
-                OP_LUMA => {
-                    let b2 = *data.get(pos).ok_or(Error::Truncated)?;
-                    pos += 1;
-                    let dg = (b & 0x3f).wrapping_sub(32);
-                    let dr = dg.wrapping_sub(8).wrapping_add(b2 >> 4);
-                    let db = dg.wrapping_sub(8).wrapping_add(b2 & 0x0f);
-                    px = add_bytes(
-                        px,
-                        u32::from(dr) | (u32::from(dg) << 8) | (u32::from(db) << 16),
-                    );
-                    o + CH
-                }
-                // OP_RUN: the same pixel, up to 62 times, never past the end.
-                _ => (o + (usize::from(b & 0x3f) + 1) * CH).min(len),
-            },
+        // Dispatch as a chain of range tests on the 2-bit tag. A `match`
+        // here compiled to an indirect jump table, and on 3-channel data
+        // its target mispredicted on 59% of ops (callgrind branch sim:
+        // 797K of 1.36M), which Ir cannot see.
+        let end = if b < OP_DIFF {
+            px = index[usize::from(b & 0x3f)];
+            o + CH
+        } else if b < OP_LUMA {
+            px = add_bytes(px, DIFF_ADD[usize::from(b & 0x3f)]);
+            o + CH
+        } else if b < OP_RUN {
+            let b2 = *data.get(pos).ok_or(Error::Truncated)?;
+            pos += 1;
+            let dg = (b & 0x3f).wrapping_sub(32);
+            let dr = dg.wrapping_sub(8).wrapping_add(b2 >> 4);
+            let db = dg.wrapping_sub(8).wrapping_add(b2 & 0x0f);
+            px = add_bytes(
+                px,
+                u32::from(dr) | (u32::from(dg) << 8) | (u32::from(db) << 16),
+            );
+            o + CH
+        } else if b < OP_RGB {
+            // OP_RUN: the same pixel, up to 62 times, never past the end.
+            (o + (usize::from(b & 0x3f) + 1) * CH).min(len)
+        } else if b == OP_RGB {
+            let c = data.get(pos..pos + 3).ok_or(Error::Truncated)?;
+            px = (px & 0xff00_0000)
+                | u32::from(c[0])
+                | (u32::from(c[1]) << 8)
+                | (u32::from(c[2]) << 16);
+            pos += 3;
+            o + CH
+        } else {
+            let c = data.get(pos..pos + 4).ok_or(Error::Truncated)?;
+            px = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            pos += 4;
+            o + CH
         };
         index[hash_u32(px)] = px;
         let bytes = px.to_le_bytes();
@@ -199,6 +197,11 @@ pub fn encode(image: &Image) -> Result<Vec<u8>> {
 /// The per-pixel body is a local macro over plain locals: as a method on a
 /// state struct the 256-byte index kept the whole struct in memory, so
 /// `prev` and `run` went through it every pixel (measured +6% Ir at 24-bit).
+/// The op choice stays branchy: computing every candidate encoding, picking
+/// one by value selects and always storing 8 bytes into a pre-sized buffer
+/// (to dodge op mispredicts, 645K of 4.4M on RGB data in callgrind's branch
+/// sim) measured worse on both instruments: Ir RGB -28.5% -> -10.3%, RGBA
+/// -> +2.7%; wall 0.70 s -> 0.82 s RGB, 0.28 s -> 0.59 s RGBA.
 fn encode_ops<const CH: usize>(pixels: &[u8], out: &mut Vec<u8>) {
     let mut index = [0u32; 64];
     let mut prev = 0xff00_0000u32;
