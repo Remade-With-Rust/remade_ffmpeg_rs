@@ -57,7 +57,15 @@ fn fogra() -> Profile {
 }
 
 fn xf(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) -> Transform {
-    Transform::new(src, sl, dst, dl, Intent::RelativeColorimetric, Options::default()).unwrap()
+    Transform::new(
+        src,
+        sl,
+        dst,
+        dl,
+        Intent::RelativeColorimetric,
+        Options::default(),
+    )
+    .unwrap()
 }
 
 #[inline(never)]
@@ -87,20 +95,32 @@ fn hot_parse_encode(bytes: &[u8]) -> Vec<u8> {
 
 fn run_u8(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) {
     let t = xf(src, sl, dst, dl);
-    let s: Vec<u8> = image(sl.channels()).iter().map(|&u| (u * 255.0).round() as u8).collect();
+    let s: Vec<u8> = image(sl.channels())
+        .iter()
+        .map(|&u| (u * 255.0).round() as u8)
+        .collect();
     let mut o = vec![0u8; SIDE * SIDE * dl.channels()];
-    t.transform(&s[..sl.channels()], &mut o[..dl.channels()]).unwrap(); // warm lazy state
+    t.transform(&s[..sl.channels()], &mut o[..dl.channels()])
+        .unwrap(); // warm lazy state
     hot_transform_u8(&t, &s, &mut o);
     println!("pixels {} fnv {:016x}", SIDE * SIDE, fnv(o.iter().copied()));
 }
 
 fn run_u16(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) {
     let t = xf(src, sl, dst, dl);
-    let s: Vec<u16> = image(sl.channels()).iter().map(|&u| (u * 65535.0).round() as u16).collect();
+    let s: Vec<u16> = image(sl.channels())
+        .iter()
+        .map(|&u| (u * 65535.0).round() as u16)
+        .collect();
     let mut o = vec![0u16; SIDE * SIDE * dl.channels()];
-    t.transform(&s[..sl.channels()], &mut o[..dl.channels()]).unwrap();
+    t.transform(&s[..sl.channels()], &mut o[..dl.channels()])
+        .unwrap();
     hot_transform_u16(&t, &s, &mut o);
-    println!("pixels {} fnv {:016x}", SIDE * SIDE, fnv(o.iter().flat_map(|v| v.to_le_bytes())));
+    println!(
+        "pixels {} fnv {:016x}",
+        SIDE * SIDE,
+        fnv(o.iter().flat_map(|v| v.to_le_bytes()))
+    );
 }
 
 fn run_f32(src: &Profile, sl: Layout, dst: &Profile, dl: Layout, lab_in: bool) {
@@ -115,7 +135,11 @@ fn run_f32(src: &Profile, sl: Layout, dst: &Profile, dl: Layout, lab_in: bool) {
     }
     let mut o = vec![0f32; SIDE * SIDE * dl.channels()];
     hot_transform_f32(&t, &s, &mut o);
-    println!("pixels {} fnv {:016x}", SIDE * SIDE, fnv(o.iter().flat_map(|v| v.to_le_bytes())));
+    println!(
+        "pixels {} fnv {:016x}",
+        SIDE * SIDE,
+        fnv(o.iter().flat_map(|v| v.to_le_bytes()))
+    );
 }
 
 fn main() {
@@ -142,7 +166,10 @@ fn main() {
             let s: Vec<u16> = (0..n * 64).map(|i| (i * 1031 % 65536) as u16).collect();
             let mut o = vec![0u16; 64 * if mode == "build3" { 4 } else { 3 }];
             t.transform(&s, &mut o).unwrap();
-            println!("pixels 64 fnv {:016x}", fnv(o.iter().flat_map(|v| v.to_le_bytes())));
+            println!(
+                "pixels 64 fnv {:016x}",
+                fnv(o.iter().flat_map(|v| v.to_le_bytes()))
+            );
         }
         "parse" => {
             let path = std::env::var("RUSTY_ICC_FOGRA39").expect("RUSTY_ICC_FOGRA39");

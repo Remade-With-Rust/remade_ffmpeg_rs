@@ -576,7 +576,11 @@ impl ClutEval {
             let (i0, f) = axes[i];
             origin += i0 * self.strides[i];
             frac[i] = f;
-            step[i] = if i0 + 1 < self.grid[i] { self.strides[i] } else { 0 };
+            step[i] = if i0 + 1 < self.grid[i] {
+                self.strides[i]
+            } else {
+                0
+            };
         }
         // Straight into the caller's array: the old scratch + runtime-length
         // `copy_from_slice` was a `memcpy` call per lookup.

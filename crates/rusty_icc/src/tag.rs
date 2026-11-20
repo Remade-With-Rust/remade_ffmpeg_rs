@@ -205,20 +205,17 @@ impl Tag {
                 52 + tables + 2 * l.clut.data.len()
             }
             Self::Lut(Lut::AToB(l) | Lut::BToA(l)) => {
-                let curves: usize = l
-                    .a
-                    .iter()
-                    .chain(&l.m)
-                    .flatten()
-                    .chain(&l.b)
-                    .map(curve)
-                    .sum();
+                let curves: usize =
+                    l.a.iter()
+                        .chain(&l.m)
+                        .flatten()
+                        .chain(&l.b)
+                        .map(curve)
+                        .sum();
                 96 + curves + l.clut.as_ref().map_or(0, |c| 24 + 2 * c.data.len())
             }
             Self::Text(t) => 12 + t.len(),
-            Self::Description {
-                ascii, unicode, ..
-            } => 100 + ascii.len() + 2 * unicode.len(),
+            Self::Description { ascii, unicode, .. } => 100 + ascii.len() + 2 * unicode.len(),
             Self::Mluc(v) => 16 + v.iter().map(|s| 12 + 2 * s.text.len()).sum::<usize>(),
             Self::S15Fixed16(v) => 8 + 4 * v.len(),
             Self::Signature(_) => 12,
