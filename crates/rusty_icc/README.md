@@ -105,31 +105,118 @@ Reading it:
 - Order and rounds: each arm ran once to warm up, then 21 rounds whose arm
   order reverses every round.
 - Timing: `std::time::Instant` around one whole-image call per run.
-  Runs last at least 110 ms, so clock resolution does not matter. Thread
-  CPU/wall was 1.000 in every sample.
+  Runs last at least 92 ms, so clock resolution does not matter. Thread
+  CPU/wall was 0.999 to 1.000 in every sample.
 - Input: one deterministic 4096x4096 gradient + sinusoid + noise image
   (16.78 Mpx), the same pixels for every arm. Output buffers are the same size
   for every arm. Intent relative.
 - rusty_icc paths: the matrix-shaper path for sRGB to P3, the 33^3/17^4
   device-link grid for FOGRA39, the exact pipeline for f32.
-- Null arm: medians agree to within 1.8% (0.982 to 1.009) in every case. The
-  worst single pair was 0.910 to 1.287.
+- Null arm: medians agree to within 0.5% (0.998 to 1.005) in every case. The
+  worst single pair was 0.924 to 1.280.
+- These numbers are from after the performance pass below (binary
+  2026-11-19 19:39). The 0.1.0 run is in the last column. Absolute rates drift
+  between sessions: lcms2's 8-bit rate moved from 152 to 180 Mpx/s, and lcms2
+  is the same system library in both runs. So compare the in-run ratios, not
+  Mpx/s across runs.
 
-| case | rusty_icc Mpx/s (best / median) | lcms2 flags 0 | lcms2 alt flags | rusty_icc faster in (vs flags 0) | median time ratio lcms2/rusty_icc |
-|---|---:|---:|---:|---:|---:|
-| sRGB -> P3, u8 | 54.1 / 49.0 | 152.3 / 138.6 | 149.1 / 141.8 | 0/21 (z -4.58) | 0.353 |
-| sRGB -> P3, u16 | 46.3 / 41.2 | 45.2 / 42.6 | 48.0 / 44.3 | 12/21 (z +0.65) | 1.025 |
-| sRGB -> FOGRA39, u8 | 18.2 / 16.9 | 44.3 / 41.0 | 43.8 / 42.0 | 0/21 (z -4.58) | 0.417 |
-| FOGRA39 -> sRGB, u16 | 12.7 / 12.0 | 25.6 / 23.8 | 27.5 / 25.4 | 0/21 (z -4.58) | 0.501 |
-| sRGB -> Lab, f32 | 5.4 / 5.1 | 7.3 / 6.7 | 7.5 / 6.7 | 0/21 (z -4.58) | 0.763 |
-| Lab -> sRGB, f32 | 7.6 / 6.8 | 9.0 / 8.3 | 8.8 / 8.3 | 0/21 (z -4.58) | 0.831 |
+| case | rusty_icc Mpx/s (best / median) | lcms2 flags 0 | lcms2 alt flags | rusty_icc faster in (vs flags 0) | median time ratio lcms2/rusty_icc | ratio in 0.1.0 |
+|---|---:|---:|---:|---:|---:|---:|
+| sRGB -> P3, u8 | 69.0 / 66.4 | 180.1 / 170.8 | 181.0 / 172.4 | 0/21 (z -4.58) | 0.383 | 0.353 |
+| sRGB -> P3, u16 | 64.1 / 61.6 | 55.4 / 53.8 | 58.6 / 56.7 | **21/21 (z +4.58)** | **1.152** | 1.025 |
+| sRGB -> FOGRA39, u8 | 35.8 / 34.7 | 51.9 / 49.5 | 54.2 / 52.3 | 0/21 (z -4.58) | 0.698 | 0.417 |
+| FOGRA39 -> sRGB, u16 | 20.7 / 19.7 | 31.2 / 29.9 | 32.6 / 31.9 | 0/21 (z -4.58) | 0.666 | 0.501 |
+| sRGB -> Lab, f32 | 7.9 / 7.6 | 8.5 / 8.3 | 8.5 / 8.2 | 3/21 (z -3.27) | 0.929 | 0.763 |
+| Lab -> sRGB, f32 | 11.4 / 11.2 | 10.0 / 9.7 | 10.0 / 9.7 | **21/21 (z +4.58)** | **1.143** | 0.831 |
 
-lcms2 is faster everywhere except 16-bit matrix-shaper, where the two tie
-(lcms2 with `HIGHRESPRECALC` is ahead in 15 of 21 pairs, z -1.96, borderline):
-2.8x for 8-bit matrix-shaper, 2.4x for RGB to CMYK, 2.0x for CMYK to RGB in
-16 bits, and 1.2-1.3x for float. rusty_icc's integer loops are scalar f32/f64
-per pixel with no SIMD, and there has been no speed work yet. No
-speed fix was made here.
+Where the gap now stands:
+- **rusty_icc is faster** on 16-bit matrix-shaper (1.15x against lcms2 at
+  flags 0, 1.09x against `HIGHRESPRECALC`, 20/21 pairs) and on Lab to sRGB in
+  float (1.14x).
+- **lcms2 is still faster** in four cases:
+  - 8-bit matrix-shaper, by 2.6x. lcms2 has a dedicated 8-bit fixed-point
+    path.
+  - RGB to CMYK in 8 bits, by 1.4x.
+  - CMYK to RGB in 16 bits, by 1.5x.
+  - sRGB to Lab in float, by 1.08x.
+- rusty_icc is scalar with no SIMD. Every integer output stays byte-identical
+  to 0.1.0, so lcms2's fixed-point arithmetic is not an option without
+  changing results.
+
+### Performance pass (callgrind instruction counts)
+
+**Instrument.**
+- `examples/icc_ir.rs` runs fixed 256x256 workloads under `rusty_alloc`.
+  Construction, parse and encode have their own workloads.
+- `bench-lcms/cg.sh` counts only the `#[inline(never)] hot_*` functions
+  (`--toggle-collect`), in WSL, invoked identically every time. Every run
+  prints the pixel/byte count and an FNV of the output as work-parity
+  anchors.
+- Exactness ladder this session: a re-run of the same binary gave the same
+  count to the instruction; a rebuild after an unrelated edit moved untouched
+  workloads by 0 to 48 instructions.
+
+**Gates on every brick:**
+- all 9 anchors unchanged;
+- at the end, the full test suite;
+- the lcms2 accuracy and black-point tables, byte-identical to the committed
+  `bench-lcms/results/*.md`.
+
+Integer and float outputs are bit-identical to 0.1.0.
+
+| workload | Ir 0.1.0 | Ir now | change | Ir/pixel now |
+|---|---:|---:|---:|---:|
+| sRGB -> P3, u8 (matrix-shaper) | 14,876,788 | 11,665,579 | -21.6% | 178 |
+| sRGB -> P3, u16 (matrix-shaper) | 14,876,815 | 11,665,608 | -21.6% | 178 |
+| sRGB -> FOGRA39, u8 (33^3 grid) | 52,183,953 | 29,383,878 | -43.7% | 448 |
+| FOGRA39 -> sRGB, u16 (17^4 grid) | 76,743,592 | 56,188,182 | -26.8% | 857 |
+| sRGB -> Lab, f32 (exact pipeline) | 127,793,649 | 100,058,095 | -21.7% | 1527 |
+| Lab -> sRGB, f32 (exact pipeline) | 117,451,720 | 91,382,641 | -22.2% | 1394 |
+| Transform::new sRGB -> FOGRA39 (33^3 build) | 124,796,781 | 110,023,896 | -11.8% | - |
+| Transform::new FOGRA39 -> sRGB (17^4 build) | 279,354,676 | 236,660,195 | -15.3% | - |
+| FOGRA39 parse + encode | 9,396,037 | 3,183,843 | -66.1% | - |
+
+**What the census found.** The census used self cost, call counts, and the
+`--tree=caller` view of memcpy/memset/realloc/allocator callers.
+- The transform hot loops make **no allocations per pixel**.
+- **Copies** were runtime-length `copy_from_slice` calls, each a real `memcpy`:
+  - in `ClutEval::eval` (101,474 calls on the 8-bit grid workload);
+  - in `Chain::eval`, both in and out (202,946 calls on the float workloads);
+  - in `Stage::apply`.
+- `Profile::encode` grew its buffer by doubling: 40 reallocs, each copying
+  everything written so far.
+- **Instruction sites:**
+  - `f64::floor`, which is a libm call on baseline x86-64 (4.7% + 2.2% of the
+    grid workloads);
+  - checked loads of every CLUT corner value;
+  - `Vec<Vec<f32>>` table indexing through runtime channel counts in the
+    matrix-shaper loop (68% of p3u8 self cost, 8% of it in slice bounds
+    checks);
+  - libm `pow(x, 1.0)` on identity curves;
+  - a per-element push in LUT encoding.
+
+**Kept bricks**, one commit each, with Ir before and after in the commit body:
+
+| brick | main effect |
+|---|---|
+| truncate instead of `floor()` in CLUT interpolation | fogu8 -13.0%, fog16 -11.6% |
+| the same in sampled-curve evaluation | build3 -6.7%, build4 -5.7% |
+| tetrahedral kernel reads corners as slices (choose the tetrahedron once, one bounds check per corner) | fogu8 -14.4%, fog16 -13.2% |
+| monomorphised matrix-shaper loop over fixed-size table rows | p3u8 / p3u16 -21.6% |
+| grid loop in its own function (undid that brick's +1.7-1.9% on the grid path) | fogu8 -3.3%, fog16 -2.6% |
+| CLUT eval writes into the caller's array (no memcpy) | fogu8 -5.7%, fog16 -3.6% |
+| `Chain::eval` on whole `[f64; 16]` arrays (no memcpy) | labf32 -1.5%, labinf32 -1.6% |
+| skip libm `pow` for exponent 1.0 (identity curves, exact) | labf32 -19.5%, labinf32 -20.4% (build +0.2/+0.4%) |
+| `Profile::encode` reserves its size up front | parse -11.1% |
+| bulk big-endian writers for LUT data | parse -61.9% |
+| 8-bit grid lookups read a per-value (cell, fraction) table | fogu8 -18.7% |
+
+**Refuted and reverted:**
+- Choosing the tetrahedron once but keeping the per-value checked loads:
+  fogu8 +2.4%, fog16 +1.7%. The win needs both halves.
+- Routing `ClutEval::eval` itself through the axis-table code (one body, two
+  call sites): fogu8 -18.7% but fog16 +11.8% and build +1.5%. The body was
+  split per call site instead.
 
 ## Other checks
 

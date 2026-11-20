@@ -298,7 +298,16 @@ impl Profile {
     /// share one copy, and v4 profiles get their MD5 profile ID computed.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::default();
+        let hint = 132
+            + 12 * self.tags.len()
+            + self
+                .tags
+                .iter()
+                .map(|(_, t)| t.size_hint() + 3)
+                .sum::<usize>();
+        let mut w = Writer {
+            buf: Vec::with_capacity(hint),
+        };
         w.zeros(128);
         w.u32(self.tags.len() as u32);
         let table_at = w.len();

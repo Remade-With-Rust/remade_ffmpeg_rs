@@ -669,12 +669,15 @@ pub(crate) struct Chain {
 }
 
 impl Chain {
-    /// Evaluates one colour (normalised in, normalised out).
-    pub(crate) fn eval(&self, input: &[f64], out: &mut [f64]) {
-        let mut v = [0.0; 16];
-        v[..self.in_ch].copy_from_slice(&input[..self.in_ch]);
+    /// Evaluates one colour (normalised in, normalised out). Values past
+    /// `in_ch` in `input` must be zero (callers keep zero-tailed arrays);
+    /// `out` past `out_ch` is unspecified. Whole-array copies have a
+    /// constant length and inline, where the old runtime-length
+    /// `copy_from_slice`s were two `memcpy` calls per colour.
+    pub(crate) fn eval(&self, input: &[f64; 16], out: &mut [f64; 16]) {
+        let mut v = *input;
         run(&self.ops, &mut v, self.in_ch);
-        out[..self.out_ch].copy_from_slice(&v[..self.out_ch]);
+        *out = v;
     }
 }
 

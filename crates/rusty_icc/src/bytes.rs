@@ -122,6 +122,23 @@ impl Writer {
         self.buf
             .extend_from_slice(&crate::color::to_s15f16(v).to_be_bytes());
     }
+    /// Writes `v` as big-endian `u16`s: one length extension, then a loop
+    /// with no per-element capacity check.
+    pub(crate) fn u16s(&mut self, v: &[u16]) {
+        let start = self.buf.len();
+        self.buf.resize(start + 2 * v.len(), 0);
+        for (d, &x) in self.buf[start..].chunks_exact_mut(2).zip(v) {
+            d.copy_from_slice(&x.to_be_bytes());
+        }
+    }
+    /// Writes 8-bit values held as `v * 257` (rounded back to 8 bits).
+    pub(crate) fn u8s_from_u16(&mut self, v: &[u16]) {
+        let start = self.buf.len();
+        self.buf.resize(start + v.len(), 0);
+        for (d, &x) in self.buf[start..].iter_mut().zip(v) {
+            *d = ((u32::from(x) + 128) / 257) as u8;
+        }
+    }
     pub(crate) fn sig(&mut self, s: [u8; 4]) {
         self.buf.extend_from_slice(&s);
     }

@@ -75,13 +75,9 @@ impl Clut {
 
     fn encode_data(&self, w: &mut Writer) {
         if self.precision == 1 {
-            for &v in &self.data {
-                w.u8(((u32::from(v) + 128) / 257) as u8);
-            }
+            w.u8s_from_u16(&self.data);
         } else {
-            for &v in &self.data {
-                w.u16(v);
-            }
+            w.u16s(&self.data);
         }
     }
 }
@@ -318,12 +314,10 @@ impl Lut {
                     w.s15f16(m);
                 }
                 let put = |w: &mut Writer, t: &Vec<u16>| {
-                    for &v in t {
-                        if sixteen {
-                            w.u16(v);
-                        } else {
-                            w.u8(((u32::from(v) + 128) / 257) as u8);
-                        }
+                    if sixteen {
+                        w.u16s(t);
+                    } else {
+                        w.u8s_from_u16(t);
                     }
                 };
                 if sixteen {
@@ -482,9 +476,11 @@ impl Stage {
                 n
             }
             Self::Clut(c) => {
-                let mut input = [0.0; 16];
-                input[..n].copy_from_slice(&v[..n]);
-                c.eval(&input[..c.grid.len()], &mut v[..]);
+                // A whole-array copy (constant length, inlined) instead of a
+                // runtime-length `memcpy`; `eval` reads only `grid.len()`
+                // (== n) inputs.
+                let input = *v;
+                c.eval(&input[..c.grid.len()], v);
                 c.outputs
             }
         }
@@ -534,28 +530,75 @@ impl ClutEval {
 
     /// Interpolates at `x` (one value per input, clamped to `0..=1`) into
     /// `out[..outputs]`.
-    pub(crate) fn eval(&self, x: &[f64], out: &mut [f64]) {
-        let mut acc = [0.0f64; 16];
+    /// Grid cell and fraction of coordinate `x` on an axis of `g` points.
+    #[inline]
+    pub(crate) fn axis(g: usize, x: f64) -> (usize, f64) {
+        let p = clamp01(x) * (g - 1) as f64;
+        // `p` is in `0..=g-1` (clamped above), so truncation is the floor;
+        // `f64::floor` is a libm call on baseline x86-64 (no SSE4.1
+        // `roundsd`), the cast is one `cvttsd2si`.
+        let i0 = (p as usize).min(g - 1);
+        (i0, p - i0 as f64)
+    }
+
+    /// Grid points along input `i`.
+    pub(crate) fn points(&self, i: usize) -> usize {
+        self.grid[i]
+    }
+
+    pub(crate) fn eval(&self, x: &[f64], out: &mut [f64; 16]) {
+        // Kept as its own body, not routed through `eval_axes`: building the
+        // 16-entry axis array first cost the 4-input grid path +11.8% Ir
+        // (fog16) and the grid builds +1.5%.
         let n = self.grid.len();
         let mut base = [0usize; 16];
         let mut frac = [0.0f64; 16];
         let mut step = [0usize; 16];
         for i in 0..n {
             let g = self.grid[i];
-            let p = clamp01(x[i]) * (g - 1) as f64;
-            let i0 = (p.floor() as usize).min(g - 1);
-            let f = p - i0 as f64;
+            let (i0, f) = Self::axis(g, x[i]);
             base[i] = i0 * self.strides[i];
             frac[i] = f;
             step[i] = if i0 + 1 < g { self.strides[i] } else { 0 };
         }
         let origin: usize = base[..n].iter().sum();
-        self.interp(n, 0, origin, &frac, &step, &mut acc);
-        out[..self.outputs].copy_from_slice(&acc[..self.outputs]);
+        self.interp(n, 0, origin, &frac, &step, out);
+    }
+
+    /// `eval` with every input's `(cell, fraction)` already known (from
+    /// [`ClutEval::axis`], e.g. tabulated per 8-bit input value).
+    pub(crate) fn eval_axes(&self, axes: &[(usize, f64); 16], out: &mut [f64; 16]) {
+        let n = self.grid.len();
+        let mut frac = [0.0f64; 16];
+        let mut step = [0usize; 16];
+        let mut origin = 0usize;
+        for i in 0..n {
+            let (i0, f) = axes[i];
+            origin += i0 * self.strides[i];
+            frac[i] = f;
+            step[i] = if i0 + 1 < self.grid[i] {
+                self.strides[i]
+            } else {
+                0
+            };
+        }
+        // Straight into the caller's array: the old scratch + runtime-length
+        // `copy_from_slice` was a `memcpy` call per lookup.
+        self.interp(n, 0, origin, &frac, &step, out);
     }
 
     fn at(&self, idx: usize, o: usize) -> f64 {
         f64::from(self.data.get(idx + o).copied().unwrap_or(0.0))
+    }
+
+    /// The `outputs` values of the grid point at flat offset `idx`: one
+    /// bounds check per corner instead of one per value. Out of range (only
+    /// reachable through a hand-built inconsistent [`Clut`]) reads zeros,
+    /// as `at` does.
+    fn corner(&self, idx: usize) -> &[f32] {
+        const ZERO: [f32; MAX_CHANNELS] = [0.0; MAX_CHANNELS];
+        let n = self.outputs.min(MAX_CHANNELS);
+        self.data.get(idx..idx + n).unwrap_or(&ZERO[..n])
     }
 
     /// Interpolates dimensions `dim..n` starting at flat offset `origin`.
@@ -610,36 +653,37 @@ impl ClutEval {
         out: &mut [f64; 16],
     ) {
         let (rx, ry, rz) = (frac[dim], frac[dim + 1], frac[dim + 2]);
-        let (sx, sy, sz) = (step[dim], step[dim + 1], step[dim + 2]);
-        for (o, v) in out.iter_mut().enumerate().take(self.outputs) {
-            let p = |dx: usize, dy: usize, dz: usize| self.at(origin + dx + dy + dz, o);
-            let c0 = p(0, 0, 0);
-            let (c1, c2, c3);
-            if rx >= ry && ry >= rz {
-                c1 = p(sx, 0, 0) - c0;
-                c2 = p(sx, sy, 0) - p(sx, 0, 0);
-                c3 = p(sx, sy, sz) - p(sx, sy, 0);
-            } else if rx >= rz && rz >= ry {
-                c1 = p(sx, 0, 0) - c0;
-                c2 = p(sx, sy, sz) - p(sx, 0, sz);
-                c3 = p(sx, 0, sz) - p(sx, 0, 0);
-            } else if rz >= rx && rx >= ry {
-                c1 = p(sx, 0, sz) - p(0, 0, sz);
-                c2 = p(sx, sy, sz) - p(sx, 0, sz);
-                c3 = p(0, 0, sz) - c0;
-            } else if ry >= rx && rx >= rz {
-                c1 = p(sx, sy, 0) - p(0, sy, 0);
-                c2 = p(0, sy, 0) - c0;
-                c3 = p(sx, sy, sz) - p(sx, sy, 0);
-            } else if ry >= rz && rz >= rx {
-                c1 = p(sx, sy, sz) - p(0, sy, sz);
-                c2 = p(0, sy, 0) - c0;
-                c3 = p(0, sy, sz) - p(0, sy, 0);
-            } else {
-                c1 = p(sx, sy, sz) - p(0, sy, sz);
-                c2 = p(0, sy, sz) - p(0, 0, sz);
-                c3 = p(0, 0, sz) - c0;
-            }
+        let (x, y, z) = (step[dim], step[dim + 1], step[dim + 2]);
+        // Each `(a, b)` pair is the corner offsets of `c = P(a) - P(b)`; the
+        // per-channel arithmetic is the reference's, so results are
+        // bit-identical. Corners are fetched as slices (one bounds check
+        // each) and zipped, instead of a checked load per value.
+        let [(a1, b1), (a2, b2), (a3, b3)] = if rx >= ry && ry >= rz {
+            [(x, 0), (x + y, x), (x + y + z, x + y)]
+        } else if rx >= rz && rz >= ry {
+            [(x, 0), (x + y + z, x + z), (x + z, x)]
+        } else if rz >= rx && rx >= ry {
+            [(x + z, z), (x + y + z, x + z), (z, 0)]
+        } else if ry >= rx && rx >= rz {
+            [(x + y, y), (y, 0), (x + y + z, x + y)]
+        } else if ry >= rz && rz >= rx {
+            [(x + y + z, y + z), (y, 0), (y + z, y)]
+        } else {
+            [(x + y + z, y + z), (y + z, z), (z, 0)]
+        };
+        let c = |d: usize| self.corner(origin + d);
+        let (p0, pa1, pb1, pa2, pb2, pa3, pb3) = (c(0), c(a1), c(b1), c(a2), c(b2), c(a3), c(b3));
+        let lanes = out
+            .iter_mut()
+            .zip(p0)
+            .zip(pa1.iter().zip(pb1))
+            .zip(pa2.iter().zip(pb2))
+            .zip(pa3.iter().zip(pb3));
+        for ((((v, &q0), (&qa1, &qb1)), (&qa2, &qb2)), (&qa3, &qb3)) in lanes {
+            let c0 = f64::from(q0);
+            let c1 = f64::from(qa1) - f64::from(qb1);
+            let c2 = f64::from(qa2) - f64::from(qb2);
+            let c3 = f64::from(qa3) - f64::from(qb3);
             *v = c0 + c1 * rx + c2 * ry + c3 * rz;
         }
     }
@@ -663,11 +707,33 @@ mod tests {
             }
         }
         let c = ClutEval::from_f32(vec![g, g, g], 3, data);
-        let mut out = [0.0; 3];
+        let mut out = [0.0; 16];
         c.eval(&[0.3, 0.71, 0.05], &mut out);
         assert!((out[0] - 0.3).abs() < 1e-6);
         assert!((out[1] - (0.355 + 0.0125)).abs() < 1e-6);
         assert!((out[2] - 0.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn eval_axes_matches_eval_bit_for_bit() {
+        // The tabulated 8-bit path must give exactly what `eval` gives.
+        let g = 17usize;
+        let data: Vec<f32> = (0..g * g * g * 3)
+            .map(|i| ((i * 7919) % 1000) as f32 / 999.0)
+            .collect();
+        let c = ClutEval::from_f32(vec![g; 3], 3, data);
+        for &(r, gg, b) in &[(0u8, 0u8, 0u8), (255, 128, 1), (17, 200, 99), (64, 64, 255)] {
+            let x = [r, gg, b].map(|v| f64::from(v) / 255.0);
+            let mut a = [0.0; 16];
+            c.eval(&x, &mut a);
+            let mut axes = [(0usize, 0.0f64); 16];
+            for i in 0..3 {
+                axes[i] = ClutEval::axis(g, x[i]);
+            }
+            let mut b2 = [0.0; 16];
+            c.eval_axes(&axes, &mut b2);
+            assert_eq!(a.map(f64::to_bits), b2.map(f64::to_bits));
+        }
     }
 
     #[test]
@@ -685,7 +751,7 @@ mod tests {
             }
         }
         let c = ClutEval::from_f32(vec![g; 4], 1, data);
-        let mut out = [0.0; 1];
+        let mut out = [0.0; 16];
         c.eval(&[0.1, 0.9, 0.4, 0.6], &mut out);
         assert!((out[0] - 0.5).abs() < 1e-6);
     }
