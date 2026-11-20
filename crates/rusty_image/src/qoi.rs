@@ -172,6 +172,10 @@ pub fn encode(image: &Image) -> Result<Vec<u8>> {
     if image.width == 0 || image.height == 0 {
         return Err(Error::unsupported("qoi: empty image"));
     }
+    // Reserving the worst case (CH + 1 bytes a pixel) to avoid the one
+    // realloc an RGBA photo that encodes larger than its pixels pays measured
+    // worse (Ir +3.5M RGB / +2M RGBA) and tied on the clock, so the input
+    // size stays the guess.
     let mut out = Vec::with_capacity(14 + image.pixels.len() + 8);
     out.extend_from_slice(b"qoif");
     out.extend_from_slice(&image.width.to_be_bytes());
