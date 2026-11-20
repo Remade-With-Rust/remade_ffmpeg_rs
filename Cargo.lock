@@ -5019,7 +5019,7 @@ dependencies = [
 
 [[package]]
 name = "rff-cli"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "remade-ffmpeg",
  "rff-core",
@@ -5466,7 +5466,7 @@ version = "0.6.3"
 
 [[package]]
 name = "rff-server"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "axum",
  "remade-ffmpeg",
@@ -5855,7 +5855,7 @@ version = "0.7.1"
 
 [[package]]
 name = "rusty_icc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "moxcms 0.9.2",
  "rusty_alloc-api",
@@ -5863,7 +5863,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_image"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "imagesize",
@@ -5921,7 +5921,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_tiff"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "fax",
