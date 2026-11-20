@@ -256,6 +256,16 @@ codegen-units = 1
 # loops never panic), so the cost is binary size, not throughput.
 panic = "unwind"
 
+# tiny-skia 0.12 is only a dev-dependency: rusty_raster's differential oracle
+# (`crates/rusty_raster/tests/oracle.rs`) renders every scene with it live and
+# compares. Its `u16x16` lanes add with plain `+`, which wraps in release (the
+# behaviour every tiny-skia user ships) but panics under debug overflow checks,
+# and its blitter destructor then panics again and aborts the test process.
+# Building that one package without overflow checks lets the oracle run live in
+# debug test builds as well. rusty_raster itself keeps its overflow checks.
+[profile.dev.package.tiny-skia]
+overflow-checks = false
+
 # THE JSON SWAP (rusty_json_turbo). One table converts the WHOLE graph.
 #
 # `serde_json` here is the house fork, `Remade-With-Rust/rusty_json_turbo`: a

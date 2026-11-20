@@ -531,6 +531,27 @@ fn random_stops(r: &mut Rng) -> Stops {
     v
 }
 
+/// `(sin a, cos a)` from `+ - * /` and `round` only, all exactly rounded IEEE
+/// operations, so the corpus is the same scene list on every platform.
+/// `f32::sin_cos` calls the platform libm, which is not correctly rounded and
+/// differs between MSVC, glibc and Apple: with it, five `mixed-random` scenes
+/// had different coordinates on Windows and Linux.
+fn sin_cos(a: f32) -> (f32, f32) {
+    const TAU: f64 = std::f64::consts::TAU;
+    let x = f64::from(a);
+    let r = x - (x / TAU).round() * TAU; // |r| <= pi
+    let r2 = r * r;
+    // Taylor series to degree 25 (sin) and 24 (cos): the truncation error
+    // at |r| = pi is below 1e-12, far under f32 precision.
+    let (mut s, mut c) = (0.0f64, 0.0f64);
+    for k in (0..12).rev() {
+        let k = f64::from(k);
+        s = 1.0 - s * r2 / ((2.0 * k + 2.0) * (2.0 * k + 3.0));
+        c = 1.0 - c * r2 / ((2.0 * k + 1.0) * (2.0 * k + 2.0));
+    }
+    ((s * r) as f32, c as f32)
+}
+
 fn random_transform(r: &mut Rng, w: f32, h: f32) -> [f32; 6] {
     match r.u(5) {
         0 => ID,
@@ -549,7 +570,7 @@ fn random_transform(r: &mut Rng, w: f32, h: f32) -> [f32; 6] {
         }
         3 => {
             let a = r.f(-3.2, 3.2);
-            let (sn, cs) = a.sin_cos();
+            let (sn, cs) = sin_cos(a);
             let (cx, cy) = (w / 2.0, h / 2.0);
             [
                 cs,
@@ -595,7 +616,8 @@ fn star(cx: f32, cy: f32, r_out: f32, r_in: f32, n: u32, rot: f32) -> Vec<Cmd> {
     for i in 0..n * 2 {
         let a = rot + i as f32 * std::f32::consts::PI / n as f32;
         let r = if i % 2 == 0 { r_out } else { r_in };
-        let (x, y) = (cx + r * a.cos(), cy + r * a.sin());
+        let (sn, cs) = sin_cos(a);
+        let (x, y) = (cx + r * cs, cy + r * sn);
         v.push(if i == 0 { Cmd::M(x, y) } else { Cmd::L(x, y) });
     }
     v.push(Cmd::Z);
@@ -607,7 +629,8 @@ fn pentagram(cx: f32, cy: f32, r: f32) -> Vec<Cmd> {
     for i in 0..5 {
         let a =
             -std::f32::consts::FRAC_PI_2 + (i * 2 % 5) as f32 * 2.0 * std::f32::consts::PI / 5.0;
-        let (x, y) = (cx + r * a.cos(), cy + r * a.sin());
+        let (sn, cs) = sin_cos(a);
+        let (x, y) = (cx + r * cs, cy + r * sn);
         v.push(if i == 0 { Cmd::M(x, y) } else { Cmd::L(x, y) });
     }
     v.push(Cmd::Z);
@@ -1488,102 +1511,34 @@ fn dump_png(dir: &str, name: &str, w: u32, h: u32, data: Vec<u8>) {
     }
 }
 
-/// FNV-1a 64 of a render: the per-scene digest stored in `oracle_digests.txt`.
-fn fnv64(data: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &b in data {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-
 fn scene_key(sc: &Scene) -> String {
     format!("{}/{}", sc.cat, sc.name)
 }
 
-/// tiny-skia 0.12.0's render of every scene, as `key digest` lines (`None` for
-/// a scene it refuses). Regenerate in a release build with
-/// `RR_ORACLE_WRITE_DIGESTS=tests/oracle_digests.txt`.
-const TINY_SKIA_DIGESTS: &str = include_str!("oracle_digests.txt");
-
-fn stored_digests() -> std::collections::HashMap<&'static str, &'static str> {
-    TINY_SKIA_DIGESTS
-        .lines()
-        .filter_map(|l| l.rsplit_once(' '))
-        .collect()
-}
-
-fn digest_str(r: &Option<Vec<u8>>) -> String {
-    match r {
-        Some(px) => format!("{:016x}", fnv64(px)),
-        None => "none".to_string(),
-    }
-}
-
-/// Debug builds: tiny-skia 0.12 overflows its `u16x16` lanes with plain `+`
-/// (wrapping in release, a panic in debug) and then panics again in its
-/// `SuperBlitter` destructor, which aborts. So a debug build compares
-/// `rusty_raster` against tiny-skia's stored release renders instead of
-/// calling it; the release test checks that the stored digests are current.
-#[cfg(debug_assertions)]
-#[test]
-fn oracle_corpus_vs_tiny_skia_digests() {
-    let scenes = corpus();
-    let stored = stored_digests();
-    let mut identical = 0usize;
-    for sc in &scenes {
-        let key = scene_key(sc);
-        let want = stored
-            .get(key.as_str())
-            .unwrap_or_else(|| panic!("no stored digest for {key}"));
-        let got = digest_str(&render_rr(sc));
-        if got == *want {
-            identical += 1;
-        } else {
-            assert!(
-                uses_dodge_or_burn(sc),
-                "{key}: differs from tiny-skia's stored render"
-            );
-        }
-    }
-    println!(
-        "debug digest oracle: {identical}/{} scenes identical to tiny-skia 0.12.0",
-        scenes.len()
-    );
-    assert!(scenes.len() > 600);
-}
-
-#[cfg_attr(
-    debug_assertions,
-    ignore = "tiny-skia 0.12 aborts in debug builds (u16 lane overflow); the digest test covers debug"
-)]
+/// Every scene is rendered by both crates on the machine running the test and
+/// the two buffers are compared, in debug and release builds alike.
+///
+/// Live, not against stored renders, because tiny-skia's pixels are not the
+/// same on every platform. Its cubic clipping (`cubic_dchop_at_intercept` ->
+/// `Cubic64` root finding) and cubic stroking call `f64`/`f32` `acos`, `cos`
+/// and `powf` from the platform libm (MSVC UCRT, glibc, Apple libm), which are
+/// not correctly rounded and disagree in the last place: on the same inputs
+/// UCRT returns `acos(0x3fd52bfe8501987e) = 0x3ff3bcf75f0ca82a` and glibc
+/// `...829`, the chopped cubic moves, and tiny-skia's own render of
+/// `curves/seed27` differs between Windows and Linux. rusty_raster makes the
+/// same calls, so it matches tiny-skia on each platform; digests recorded on
+/// one platform fail on another. tiny-skia runs in debug builds because the
+/// workspace builds it without overflow checks (see the root `Cargo.toml`).
 #[test]
 fn oracle_corpus_vs_tiny_skia() {
     use std::fmt::Write as _;
 
     let scenes = corpus();
-    // The stored digests must match tiny-skia's live renders; optionally
-    // rewrite them.
     {
-        let stored = stored_digests();
-        let mut out = String::new();
         let mut keys = std::collections::HashSet::new();
         for sc in &scenes {
             let key = scene_key(sc);
             assert!(keys.insert(key.clone()), "duplicate scene key {key}");
-            let d = digest_str(&render_ts(sc));
-            writeln!(out, "{key} {d}").unwrap();
-            if std::env::var_os("RR_ORACLE_WRITE_DIGESTS").is_none() {
-                assert_eq!(
-                    stored.get(key.as_str()).copied(),
-                    Some(d.as_str()),
-                    "stale stored digest for {key}"
-                );
-            }
-        }
-        if let Some(path) = std::env::var_os("RR_ORACLE_WRITE_DIGESTS") {
-            std::fs::write(path, out).unwrap();
         }
     }
     let dump = std::env::var("RR_ORACLE_DUMP").ok();

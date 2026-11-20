@@ -62,12 +62,19 @@ one level on at most 0.83% of pixels. Those two modes divide through
 12-bit hardware approximation that differs between CPU vendors. This crate
 divides exactly. The test asserts this: any other difference fails it.
 
-tiny-skia 0.12 cannot run in a debug build: its `u16` lanes use plain `+`,
-which wraps in release and panics in debug. Its blitter destructor then
-panics again and aborts the process. So the release test also checks a
-committed FNV-1a digest of tiny-skia's render for every scene
-(`tests/oracle_digests.txt`), and a debug build compares this crate against
-those digests under the same rule.
+The comparison is live, on the machine running the test, and not against
+stored renders: tiny-skia's pixels are not the same on every platform. Its
+cubic clipping and cubic stroking call `acos`, `cos` and `powf` from the
+platform libm (MSVC UCRT, glibc, Apple libm), which are not correctly rounded
+and disagree in the last place, so tiny-skia's own render of some scenes
+differs between Windows and Linux. This crate makes the same calls and matches
+tiny-skia on each platform.
+
+tiny-skia 0.12's `u16` lanes use plain `+`, which wraps in release and panics
+under debug overflow checks (its blitter destructor then panics again and
+aborts the process). The workspace builds the tiny-skia package without
+overflow checks (`[profile.dev.package.tiny-skia]`), so the oracle also runs
+in debug builds, where this crate keeps its own overflow checks.
 
 tiny-skia's own integration suite (157 tests against 121 reference PNGs) is
 ported under `tests/integration` and passes unchanged.
