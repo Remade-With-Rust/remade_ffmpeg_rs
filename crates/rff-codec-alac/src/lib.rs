@@ -318,6 +318,19 @@ fn lpc_prediction(
     }
 }
 
+/// First-order prediction in place: each sample is the previous one plus
+/// its residual.
+fn first_order(buf: &mut [i32], bps: u32) {
+    let Some((first, rest)) = buf.split_first_mut() else {
+        return;
+    };
+    let mut prev = *first;
+    for v in rest {
+        prev = sign_extend(prev.wrapping_add(*v), bps);
+        *v = prev;
+    }
+}
+
 /// `lpc_adaptive` for a fixed order, with the coefficients and the last `N`
 /// outputs held in local arrays for the whole frame. Every sample writes
 /// both (the new output, the adapted coefficients) and the next sample reads
@@ -428,7 +441,13 @@ fn lpc_adaptive(
 
 /// Decode one ALAC frame into per-channel buffers (output order). Returns
 /// the samples per channel.
-fn decode_frame(cfg: &AlacConfig, data: &[u8], out: &mut [Vec<i32>]) -> Result<usize> {
+fn decode_frame(
+    cfg: &AlacConfig,
+    data: &[u8],
+    out: &mut [Vec<i32>],
+    extra_buf: &mut Vec<u32>,
+    residual: &mut Vec<i32>,
+) -> Result<usize> {
     let channels = cfg.channels as usize;
     let mut b = Bits::new(data);
     let mut ch = 0usize;
@@ -449,7 +468,15 @@ fn decode_frame(cfg: &AlacConfig, data: &[u8], out: &mut [Vec<i32>]) -> Result<u
             return Err(Error::invalid("alac: more channel elements than channels"));
         }
         let at = OFFSETS[channels - 1][ch] as usize;
-        let n = decode_element(cfg, &mut b, elem_ch, nb_samples, &mut out[at..at + elem_ch])?;
+        let n = decode_element(
+            cfg,
+            &mut b,
+            elem_ch,
+            nb_samples,
+            &mut out[at..at + elem_ch],
+            extra_buf,
+            residual,
+        )?;
         nb_samples = Some(n);
         ch += elem_ch;
     }
@@ -465,6 +492,8 @@ fn decode_element(
     channels: usize,
     expected: Option<usize>,
     out: &mut [Vec<i32>],
+    extra_buf: &mut Vec<u32>,
+    residual: &mut Vec<i32>,
 ) -> Result<usize> {
     b.skip(4); // element instance tag
     b.skip(12); // unused
@@ -487,14 +516,14 @@ fn decode_element(
     if expected.is_some_and(|e| e != n) {
         return Err(Error::invalid("alac: elements disagree on the frame size"));
     }
+    // Every path below writes all `n` samples of each channel, so a buffer
+    // only needs the right length, not zeroing.
     for o in out.iter_mut() {
-        o.clear();
         o.resize(n, 0);
     }
     let mut decorr_shift = 0u32;
     let mut decorr_left_weight = 0i32;
     let mut extra = 0u32;
-    let mut extra_buf: Vec<Vec<u32>> = Vec::new();
     if is_compressed {
         decorr_shift = b.read(8);
         decorr_left_weight = b.read(8) as i32;
@@ -523,35 +552,25 @@ fn decode_element(
             if b.left() < (n * channels * extra as usize) as isize {
                 return Err(Error::invalid("alac: shifted bytes run past the packet"));
             }
-            extra_buf = vec![vec![0u32; n]; channels];
-            for i in 0..n {
-                for e in extra_buf.iter_mut() {
-                    e[i] = b.read(extra);
-                }
-            }
+            // Stored sample-major, channel-minor, as they are read.
+            extra_buf.clear();
+            extra_buf.extend((0..n * channels).map(|_| b.read(extra)));
         }
-        let mut residual = vec![0i32; n];
+        residual.resize(n, 0);
         for c in 0..channels {
+            let buf = &mut residual[..n];
             rice_decompress(
                 b,
-                &mut residual,
+                buf,
                 bps,
                 hist_mult[c] * cfg.pb as u32 / 4,
                 cfg.mb as u32,
                 cfg.kb as u32,
             )?;
             if pred_type[c] == 15 {
-                let copy = residual.clone();
-                lpc_prediction(&copy, &mut residual, bps, &mut [], 31, 0);
+                first_order(buf, bps);
             }
-            lpc_prediction(
-                &residual,
-                &mut out[c],
-                bps,
-                &mut coefs[c],
-                order[c],
-                quant[c],
-            );
+            lpc_prediction(buf, &mut out[c], bps, &mut coefs[c], order[c], quant[c]);
         }
     } else {
         for i in 0..n {
@@ -572,9 +591,9 @@ fn decode_element(
         }
     }
     if extra > 0 {
-        for (o, e) in out.iter_mut().zip(&extra_buf) {
-            for i in 0..n {
-                o[i] = ((o[i] as u32) << extra | e[i]) as i32;
+        for (c, o) in out.iter_mut().enumerate() {
+            for (s, e) in o.iter_mut().zip(extra_buf[c..].iter().step_by(channels)) {
+                *s = ((*s as u32) << extra | e) as i32;
             }
         }
     }
@@ -619,6 +638,10 @@ struct AlacDecoder {
     config: Option<AlacConfig>,
     sample_rate: u32,
     buffers: Vec<Vec<i32>>,
+    /// Shifted low bytes of the element being decoded, reused across frames.
+    extra_buf: Vec<u32>,
+    /// Residuals of the channel being decoded, reused across frames.
+    residual: Vec<i32>,
     frame: Option<Frame>,
     eof: bool,
 }
@@ -641,7 +664,13 @@ impl Decoder for AlacDecoder {
         let cfg = self
             .config
             .ok_or_else(|| Error::invalid("alac: not configured"))?;
-        let n = decode_frame(&cfg, &packet.data, &mut self.buffers)?;
+        let n = decode_frame(
+            &cfg,
+            &packet.data,
+            &mut self.buffers,
+            &mut self.extra_buf,
+            &mut self.residual,
+        )?;
         let (format, data) = if cfg.bit_depth == 16 {
             let data = interleave(&self.buffers, n, |s| (s as i16).to_le_bytes());
             (SampleFormat::S16, data)
