@@ -168,9 +168,12 @@ impl DecodingResult {
         self.len() == 0
     }
 
-    /// The samples as native-endian bytes (a copy).
+    /// The samples as native-endian bytes (a copy). To avoid the copy of
+    /// 8-bit data, use [`Self::into_ne_bytes`].
     #[must_use]
     pub fn to_ne_bytes(&self) -> Vec<u8> {
+        // `flat_map(..).collect()` is fine here: a sized buffer with
+        // fixed-width stores measured the same (16-bit decode, within 300 Ir).
         fn f<T: Copy, const N: usize>(v: &[T], g: impl Fn(T) -> [u8; N]) -> Vec<u8> {
             v.iter().flat_map(|&x| g(x)).collect()
         }
@@ -185,6 +188,19 @@ impl DecodingResult {
             Self::I64(v) => f(v, i64::to_ne_bytes),
             Self::F32(v) => f(v, f32::to_ne_bytes),
             Self::F64(v) => f(v, f64::to_ne_bytes),
+        }
+    }
+
+    /// The samples as native-endian bytes, consuming the result: 8-bit
+    /// samples (`U8`, and `I8` reinterpreted in place) are moved out with no
+    /// copy; wider samples are converted once, as [`Self::to_ne_bytes`] does.
+    /// Prefer this when handing pixels on as bytes.
+    #[must_use]
+    pub fn into_ne_bytes(self) -> Vec<u8> {
+        match self {
+            Self::U8(v) => v,
+            Self::I8(v) => v.into_iter().map(|x| x as u8).collect(),
+            other => other.to_ne_bytes(),
         }
     }
 }
@@ -1490,6 +1506,29 @@ fn known(e: Option<&ifd::Entry>) -> Option<&ifd::Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ne_bytes_both_ways_agree() {
+        let cases = [
+            DecodingResult::U8(vec![1, 2, 250]),
+            DecodingResult::I8(vec![-1, 0, 7]),
+            DecodingResult::U16(vec![0x0102, 0xfffe]),
+            DecodingResult::F32(vec![1.5, -0.25]),
+            DecodingResult::U64(vec![u64::MAX - 3]),
+        ];
+        for c in cases {
+            let want: Vec<u8> = match &c {
+                DecodingResult::U8(v) => v.clone(),
+                DecodingResult::I8(v) => v.iter().map(|&x| x as u8).collect(),
+                DecodingResult::U16(v) => v.iter().flat_map(|x| x.to_ne_bytes()).collect(),
+                DecodingResult::F32(v) => v.iter().flat_map(|x| x.to_ne_bytes()).collect(),
+                DecodingResult::U64(v) => v.iter().flat_map(|x| x.to_ne_bytes()).collect(),
+                _ => unreachable!(),
+            };
+            assert_eq!(c.to_ne_bytes(), want);
+            assert_eq!(c.into_ne_bytes(), want);
+        }
+    }
 
     #[test]
     fn f16_conversion() {

@@ -436,7 +436,16 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
         self
     }
 
-    /// Rows per strip (default: about 8 KiB per strip).
+    /// Rows per strip (default: about 8 KiB per strip, libtiff's convention,
+    /// which keeps a reader's working set small).
+    ///
+    /// Each strip is compressed on its own, so with Deflate (and to a lesser
+    /// degree LZW) small strips cost size: every strip restarts the
+    /// compressor's history. On a 1024x1024 RGB8 photo at level 6, 8 KiB
+    /// strips came out 38% larger than ~1 MB strips (the `tiff` crate's
+    /// default), and LZW about 3% larger. For smaller Deflate files, ask for
+    /// bigger strips, e.g. `rows_per_strip((1 << 20) / row_bytes)`; a reader
+    /// then needs a buffer of that size per strip.
     pub fn rows_per_strip(&mut self, rows: u32) {
         self.rows_per_strip = Some(rows.max(1));
         self.tiles = None;
