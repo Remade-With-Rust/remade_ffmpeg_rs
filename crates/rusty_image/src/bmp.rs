@@ -361,21 +361,52 @@ fn row(h: &Header, i: usize) -> usize {
 fn read_palette_pixels(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
     let ch = if h.alpha { 4 } else { 3 };
     let pal = h.palette.as_deref().expect("palette kinds carry a palette");
-    if ch == 4 {
-        buf.chunks_exact_mut(4).for_each(|p| p[3] = 0xff);
-    }
     let bits = usize::from(h.bit_count);
     let row_bytes = (bits * h.width).div_ceil(32) * 4;
     let stride = h.width * ch;
+    if bits == 8 {
+        // One index per byte: each pixel is one 4-byte store from a padded
+        // palette (alpha 0xff). With three channels the fourth byte lands on
+        // the next pixel's first byte, which that pixel overwrites; the
+        // row's last pixel takes a 3-byte store.
+        let mut pal4 = [[0u8, 0, 0, 0xff]; 256];
+        for (q, p) in pal4.iter_mut().zip(pal.iter()) {
+            q[..3].copy_from_slice(p);
+        }
+        for i in 0..h.height {
+            let src = &r.bytes(row_bytes)?[..h.width];
+            let y = row(h, i);
+            let dst = &mut buf[y * stride..(y + 1) * stride];
+            if ch == 4 {
+                for (px, &idx) in dst.chunks_exact_mut(4).zip(src) {
+                    px.copy_from_slice(&pal4[usize::from(idx)]);
+                }
+            } else if let Some((&last, head)) = src.split_last() {
+                let mut o = 0;
+                for &idx in head {
+                    dst[o..o + 4].copy_from_slice(&pal4[usize::from(idx)]);
+                    o += 3;
+                }
+                dst[o..o + 3].copy_from_slice(&pal4[usize::from(last)][..3]);
+            }
+        }
+        return Ok(());
+    }
+    if ch == 4 {
+        buf.chunks_exact_mut(4).for_each(|p| p[3] = 0xff);
+    }
+    // 1, 2 or 4 bits: `per_byte` is a power of two, so the byte and the bit
+    // position come from a shift and a mask, not a division per pixel.
+    let per_byte = 8 / bits;
+    let lg = per_byte.trailing_zeros();
+    let mask = ((1u16 << bits) - 1) as u8;
     for i in 0..h.height {
         let src = r.bytes(row_bytes)?;
         let y = row(h, i);
         let dst = &mut buf[y * stride..(y + 1) * stride];
-        let per_byte = 8 / bits;
-        let mask = ((1u16 << bits) - 1) as u8;
         for (x, px) in dst.chunks_exact_mut(ch).enumerate() {
-            let byte = src[x / per_byte];
-            let shift = 8 - bits * (x % per_byte + 1);
+            let byte = src[x >> lg];
+            let shift = 8 - bits * ((x & (per_byte - 1)) + 1);
             let idx = (byte >> shift) & mask;
             px[..3].copy_from_slice(&pal[idx as usize]);
         }
@@ -422,13 +453,15 @@ fn read_direct(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
             }
             (Kind::Bitfields32, _) if std_masks => {
                 if ch == 4 {
+                    // BGRA -> RGBA as one word: swap bytes 0 and 2, and force
+                    // alpha opaque (decided once, not per pixel) when the
+                    // file has no alpha mask.
+                    let opaque = if std_alpha { 0 } else { 0xff00_0000u32 };
                     for (px, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-                        px.copy_from_slice(&[
-                            s[2],
-                            s[1],
-                            s[0],
-                            if std_alpha { s[3] } else { 0xff },
-                        ]);
+                        let v = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+                        let v =
+                            (v & 0xff00_ff00) | ((v >> 16) & 0xff) | ((v & 0xff) << 16) | opaque;
+                        px.copy_from_slice(&v.to_le_bytes());
                     }
                 } else {
                     for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
@@ -490,6 +523,9 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
     while ri < h.height {
         let mut px = 0usize;
         let mut x = 0usize;
+        // Byte offset of this file row in `buf`, recomputed only when a
+        // delta moves to another row (not per pixel, not per run).
+        let mut rb = row(h, ri) * stride;
         loop {
             let control = r.u8()?;
             if control == 0 {
@@ -521,6 +557,7 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
                             if ri >= h.height {
                                 return Err(corrupt());
                             }
+                            rb = row(h, ri) * stride;
                             px = 0;
                             for _ in 0..x {
                                 if px >= h.width {
@@ -562,13 +599,17 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
                                 }
                             }
                         } else {
-                            for &i in idx.iter().take(n) {
-                                if px >= h.width {
-                                    return Err(corrupt());
-                                }
-                                set(buf, ri, px, i);
-                                px += 1;
+                            // A literal running past the row is corrupt (the
+                            // whole decode fails, so no partial row matters).
+                            if n > h.width - px {
+                                return Err(corrupt());
                             }
+                            let mut o = rb + px * ch;
+                            for &i in &idx[..n] {
+                                buf[o..o + 3].copy_from_slice(&pal[usize::from(i)]);
+                                o += ch;
+                            }
+                            px += n;
                         }
                         x += n;
                     }
@@ -595,10 +636,16 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
                     // A run longer than the row is clamped to it (ImageMagick
                     // writes such files).
                     let take = n.min(h.width - px);
+                    // Runs average about two pixels in real files: a plain
+                    // offset loop, no per-run slice or chunk setup (that
+                    // shape measured +15% Ir on the RLE8 fixture).
+                    let c = pal[usize::from(index)];
+                    let mut o = rb + px * ch;
                     for _ in 0..take {
-                        set(buf, ri, px, index);
-                        px += 1;
+                        buf[o..o + 3].copy_from_slice(&c);
+                        o += ch;
                     }
+                    px += take;
                 }
                 x += n;
             }
