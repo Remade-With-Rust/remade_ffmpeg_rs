@@ -1488,11 +1488,104 @@ fn dump_png(dir: &str, name: &str, w: u32, h: u32, data: Vec<u8>) {
     }
 }
 
+/// FNV-1a 64 of a render: the per-scene digest stored in `oracle_digests.txt`.
+fn fnv64(data: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in data {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn scene_key(sc: &Scene) -> String {
+    format!("{}/{}", sc.cat, sc.name)
+}
+
+/// tiny-skia 0.12.0's render of every scene, as `key digest` lines (`None` for
+/// a scene it refuses). Regenerate in a release build with
+/// `RR_ORACLE_WRITE_DIGESTS=tests/oracle_digests.txt`.
+const TINY_SKIA_DIGESTS: &str = include_str!("oracle_digests.txt");
+
+fn stored_digests() -> std::collections::HashMap<&'static str, &'static str> {
+    TINY_SKIA_DIGESTS
+        .lines()
+        .filter_map(|l| l.rsplit_once(' '))
+        .collect()
+}
+
+fn digest_str(r: &Option<Vec<u8>>) -> String {
+    match r {
+        Some(px) => format!("{:016x}", fnv64(px)),
+        None => "none".to_string(),
+    }
+}
+
+/// Debug builds: tiny-skia 0.12 overflows its `u16x16` lanes with plain `+`
+/// (wrapping in release, a panic in debug) and then panics again in its
+/// `SuperBlitter` destructor, which aborts. So a debug build compares
+/// `rusty_raster` against tiny-skia's stored release renders instead of
+/// calling it; the release test checks that the stored digests are current.
+#[cfg(debug_assertions)]
+#[test]
+fn oracle_corpus_vs_tiny_skia_digests() {
+    let scenes = corpus();
+    let stored = stored_digests();
+    let mut identical = 0usize;
+    for sc in &scenes {
+        let key = scene_key(sc);
+        let want = stored
+            .get(key.as_str())
+            .unwrap_or_else(|| panic!("no stored digest for {key}"));
+        let got = digest_str(&render_rr(sc));
+        if got == *want {
+            identical += 1;
+        } else {
+            assert!(
+                uses_dodge_or_burn(sc),
+                "{key}: differs from tiny-skia's stored render"
+            );
+        }
+    }
+    println!(
+        "debug digest oracle: {identical}/{} scenes identical to tiny-skia 0.12.0",
+        scenes.len()
+    );
+    assert!(scenes.len() > 600);
+}
+
+#[cfg_attr(
+    debug_assertions,
+    ignore = "tiny-skia 0.12 aborts in debug builds (u16 lane overflow); the digest test covers debug"
+)]
 #[test]
 fn oracle_corpus_vs_tiny_skia() {
     use std::fmt::Write as _;
 
     let scenes = corpus();
+    // The stored digests must match tiny-skia's live renders; optionally
+    // rewrite them.
+    {
+        let stored = stored_digests();
+        let mut out = String::new();
+        let mut keys = std::collections::HashSet::new();
+        for sc in &scenes {
+            let key = scene_key(sc);
+            assert!(keys.insert(key.clone()), "duplicate scene key {key}");
+            let d = digest_str(&render_ts(sc));
+            writeln!(out, "{key} {d}").unwrap();
+            if std::env::var_os("RR_ORACLE_WRITE_DIGESTS").is_none() {
+                assert_eq!(
+                    stored.get(key.as_str()).copied(),
+                    Some(d.as_str()),
+                    "stale stored digest for {key}"
+                );
+            }
+        }
+        if let Some(path) = std::env::var_os("RR_ORACLE_WRITE_DIGESTS") {
+            std::fs::write(path, out).unwrap();
+        }
+    }
     let dump = std::env::var("RR_ORACLE_DUMP").ok();
 
     #[derive(Default)]

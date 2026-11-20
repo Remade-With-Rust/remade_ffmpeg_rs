@@ -262,6 +262,9 @@ impl Mask {
         anti_alias: bool,
         transform: Transform,
     ) {
+        if !transform.is_finite() {
+            return;
+        }
         if transform.is_identity() {
             // This is sort of similar to SkDraw::drawPath
 

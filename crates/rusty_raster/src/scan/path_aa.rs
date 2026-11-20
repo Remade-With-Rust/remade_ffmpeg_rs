@@ -208,7 +208,11 @@ impl<'a> SuperBlitter<'a> {
 
 impl Drop for SuperBlitter<'_> {
     fn drop(&mut self) {
-        self.flush();
+        // Never blit from a destructor that runs during unwinding: a second
+        // panic there aborts the process.
+        if !std::thread::panicking() {
+            self.flush();
+        }
     }
 }
 

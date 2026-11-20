@@ -1357,7 +1357,7 @@ fn conv_dasharray(node: SvgNode, state: &State) -> Option<Vec<f32>> {
     if sum.abs() <= f32::EPSILON * 4.0 {
         return None;
     }
-    if list.len() % 2 != 0 {
+    if list.len() & 1 == 1 {
         let mut t = list.clone();
         t.extend_from_slice(&list);
         return Some(t);

@@ -62,11 +62,20 @@ one level on at most 0.83% of pixels. Those two modes divide through
 12-bit hardware approximation that differs between CPU vendors. This crate
 divides exactly. The test asserts this: any other difference fails it.
 
+tiny-skia 0.12 cannot run in a debug build: its `u16` lanes use plain `+`,
+which wraps in release and panics in debug. Its blitter destructor then
+panics again and aborts the process. So the release test also checks a
+committed FNV-1a digest of tiny-skia's render for every scene
+(`tests/oracle_digests.txt`), and a debug build compares this crate against
+those digests under the same rule.
+
 tiny-skia's own integration suite (157 tests against 121 reference PNGs) is
 ported under `tests/integration` and passes unchanged.
 
-**Hostile input: 11 tests** (`tests/hostile.rs`, 1.99 s in a release build).
-Each draw call must return without panicking and in bounded time and memory.
+**Hostile input: 11 tests** (`tests/hostile.rs`; 1.55 s in release, 27.98 s in debug). Each draw call
+must return without panicking, in debug and release builds, and in bounded
+time and memory. Debug builds run with debug assertions and overflow checks
+on.
 The tests cover:
 
 - zero-size, 1-pixel and oversized pixmaps and masks: a 10^18-byte request

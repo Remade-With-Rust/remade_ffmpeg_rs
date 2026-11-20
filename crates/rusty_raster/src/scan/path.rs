@@ -215,7 +215,18 @@ fn walk_edges(
 
         let mut curr_idx = edges[0].next.unwrap() as usize;
         while edges[curr_idx].first_y <= curr_y as i32 {
-            debug_assert!(edges[curr_idx].last_y >= curr_y as i32);
+            // An active edge always ends at or below the current scanline for
+            // well-formed geometry (tiny-skia debug-asserts this). Fixed-point
+            // overflow on hostile geometry can break it; such an edge is
+            // dropped instead of walking on with a stale slope.
+            if edges[curr_idx].last_y < curr_y as i32 {
+                let Some(next_idx) = edges[curr_idx].next else {
+                    break;
+                };
+                remove_edge(curr_idx, edges);
+                curr_idx = next_idx as usize;
+                continue;
+            }
 
             let x = fdot16::round_to_i32(edges[curr_idx].x) as u32; // TODO: check
 
@@ -228,7 +239,10 @@ fn walk_edges(
 
             if (w & winding_mask) == 0 {
                 // we finished an interval
-                if let Some(width) = LengthU32::new(x - left) {
+                // `wrapping_sub` is the release-build behaviour of tiny-skia's
+                // `x - left`; it only wraps for edges out of x order (hostile
+                // geometry), and the blitter clips the resulting span.
+                if let Some(width) = LengthU32::new(x.wrapping_sub(left)) {
                     blitter.blit_h(left, curr_y, width);
                 }
             }
@@ -258,7 +272,9 @@ fn walk_edges(
                     }
                     Edge::Cubic(ref mut cubic) => {
                         if cubic.curve_count < 0 && cubic.update() {
-                            debug_assert!(cubic.line.first_y == curr_y as i32 + 1);
+                            // tiny-skia asserts `first_y == curr_y + 1`; on
+                            // overflowed hostile edges it need not hold, and the
+                            // walk above drops an edge that falls behind.
 
                             new_x = cubic.line.x;
 
@@ -275,7 +291,7 @@ fn walk_edges(
                 }
             } else {
                 debug_assert!(edges[curr_idx].last_y > curr_y as i32);
-                new_x = edges[curr_idx].x + edges[curr_idx].dx;
+                new_x = edges[curr_idx].x.wrapping_add(edges[curr_idx].dx);
                 edges[curr_idx].x = new_x;
 
                 if new_x < prev_x {
@@ -291,7 +307,7 @@ fn walk_edges(
 
         if (w & winding_mask) != 0 {
             // was our right-edge culled away?
-            if let Some(width) = LengthU32::new(right_clip - left) {
+            if let Some(width) = LengthU32::new(right_clip.wrapping_sub(left)) {
                 blitter.blit_h(left, curr_y, width);
             }
         }

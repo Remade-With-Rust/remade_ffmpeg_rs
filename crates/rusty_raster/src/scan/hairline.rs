@@ -418,9 +418,10 @@ fn hair_quad(
 }
 
 fn compute_nocheck_quad_bounds(points: &[Point; 3]) -> Option<Rect> {
-    debug_assert!(points[0].is_finite());
-    debug_assert!(points[1].is_finite());
-    debug_assert!(points[2].is_finite());
+    // See `compute_nocheck_cubic_bounds`.
+    if !points.iter().all(|p| p.is_finite()) {
+        return None;
+    }
 
     let mut min = points[0].to_f32x2();
     let mut max = min;
@@ -552,10 +553,12 @@ fn hair_cubic(
 }
 
 fn compute_nocheck_cubic_bounds(points: &[Point; 4]) -> Option<Rect> {
-    debug_assert!(points[0].is_finite());
-    debug_assert!(points[1].is_finite());
-    debug_assert!(points[2].is_finite());
-    debug_assert!(points[3].is_finite());
+    // tiny-skia debug-asserts finiteness; subdivision of huge (finite)
+    // geometry can overflow to infinity, and `Rect::from_ltrb` rejects that
+    // anyway, so answer `None` up front in every build.
+    if !points.iter().all(|p| p.is_finite()) {
+        return None;
+    }
 
     let mut min = points[0].to_f32x2();
     let mut max = min;

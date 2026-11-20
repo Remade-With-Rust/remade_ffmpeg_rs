@@ -187,6 +187,12 @@ impl PixmapMut<'_> {
         transform: Transform,
         mask: Option<&Mask>,
     ) {
+        if !transform.is_finite() {
+            // Rejected at the API boundary: nothing downstream is defined
+            // for a non-finite transform (tiny-skia can trip internal
+            // asserts on one).
+            return;
+        }
         // TODO: we probably can use tiler for rect too
         if transform.is_identity() && !DrawTiler::required(self.width(), self.height()) {
             // TODO: ignore rects outside the pixmap
@@ -220,6 +226,12 @@ impl PixmapMut<'_> {
         transform: Transform,
         mask: Option<&Mask>,
     ) {
+        if !transform.is_finite() {
+            // Rejected at the API boundary: nothing downstream is defined
+            // for a non-finite transform (tiny-skia can trip internal
+            // asserts on one).
+            return;
+        }
         if transform.is_identity() {
             // This is sort of similar to SkDraw::drawPath
 
@@ -333,8 +345,16 @@ impl PixmapMut<'_> {
         transform: Transform,
         mask: Option<&Mask>,
     ) {
-        if stroke.width < 0.0 {
+        // tiny-skia rejects only a negative width; a NaN or infinite width
+        // reached internal asserts. Neither can produce a meaningful stroke.
+        if !(stroke.width >= 0.0 && stroke.width.is_finite()) {
             // tiny-skia logs "negative stroke width isn't allowed" here.
+            return;
+        }
+        if !transform.is_finite() {
+            // Rejected at the API boundary: nothing downstream is defined
+            // for a non-finite transform (tiny-skia can trip internal
+            // asserts on one).
             return;
         }
 
@@ -476,6 +496,12 @@ impl PixmapMut<'_> {
         transform: Transform,
         mask: Option<&Mask>,
     ) {
+        if !transform.is_finite() {
+            // Rejected at the API boundary: nothing downstream is defined
+            // for a non-finite transform (tiny-skia can trip internal
+            // asserts on one).
+            return;
+        }
         // tiny-skia unwraps here and panics when `x + width` overflows `i32`.
         let Some(rect) = IntRect::from_xywh(x, y, pixmap.width(), pixmap.height()) else {
             return;
