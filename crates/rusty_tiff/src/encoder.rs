@@ -65,6 +65,14 @@ pub trait TiffSample: Copy + private::Sealed {
     const BYTES: usize;
     /// Append the native-endian bytes.
     fn put_ne(self, out: &mut Vec<u8>);
+    /// Append the samples' native-endian bytes to `out`.
+    #[doc(hidden)]
+    fn extend_ne(src: &[Self], out: &mut Vec<u8>) {
+        out.reserve(src.len() * Self::BYTES);
+        for &s in src {
+            s.put_ne(out);
+        }
+    }
     /// The samples as native-endian bytes: borrowed for byte samples,
     /// converted in one sized pass otherwise.
     #[doc(hidden)]
@@ -89,6 +97,15 @@ macro_rules! sample_impl {
             #[inline]
             fn put_ne(self, out: &mut Vec<u8>) {
                 out.extend_from_slice(&self.to_ne_bytes());
+            }
+            #[inline]
+            fn extend_ne(src: &[Self], out: &mut Vec<u8>) {
+                const B: usize = std::mem::size_of::<$t>();
+                let base = out.len();
+                out.resize(base + src.len() * B, 0);
+                for (d, s) in out[base..].chunks_exact_mut(B).zip(src) {
+                    d.copy_from_slice(&s.to_ne_bytes());
+                }
             }
             /// One sized buffer filled with fixed-width stores, instead of
             /// a growing Vec with a capacity check per sample.
@@ -529,9 +546,21 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
         if C::PHOTOMETRIC == photometric::PALETTE && !self.tags.contains_key(&320) {
             return Err(TiffError::usage("palette image without a colormap"));
         }
-        // Byte samples are used in place; wider ones are converted once.
-        let native = C::Inner::ne_bytes(data);
         let planar = self.planar && spp > 1;
+        // Byte samples are used in place. Wider ones in whole-width strips
+        // are converted strip by strip into the reused chunk buffer below;
+        // only tiles, planes and sub-byte rows (random row access) need the
+        // whole image converted up front. A full-image conversion for every
+        // wide write cost a fresh image-sized allocation (and its page
+        // faults on a system allocator) that the clock saw and Ir did not:
+        // ArtCraft measured RGB16 uncompressed encode at 0.66x of tiff 0.11.
+        let wide = C::Inner::BYTES > 1;
+        let whole = !wide || self.tiles.is_some() || planar || bits < 8;
+        let native: std::borrow::Cow<'_, [u8]> = if whole {
+            C::Inner::ne_bytes(data)
+        } else {
+            std::borrow::Cow::Borrowed(&[])
+        };
         let spp_chunk = if planar { 1 } else { spp };
         let (tiled, cw, ch) = if let Some((tw, th)) = self.tiles {
             (true, tw, th)
@@ -572,11 +601,17 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
                     // is one contiguous stretch of the input.
                     let contiguous =
                         !tiled && !planar && bits >= 8 && x0 == 0 && cw == w && y0 + rows <= h;
-                    let chunk: &[u8] = if contiguous && !rewrites {
+                    let chunk: &[u8] = if contiguous && !wide && !rewrites {
                         &native[y0 as usize * full_row..][..len]
                     } else {
                         buf.clear();
-                        if contiguous {
+                        if contiguous && wide {
+                            let ns = full_row / C::Inner::BYTES;
+                            C::Inner::extend_ne(
+                                &data[y0 as usize * ns..][..rows as usize * ns],
+                                &mut buf,
+                            );
+                        } else if contiguous {
                             buf.extend_from_slice(&native[y0 as usize * full_row..][..len]);
                         } else {
                             // Tiles and planes: padding must read as zero.
