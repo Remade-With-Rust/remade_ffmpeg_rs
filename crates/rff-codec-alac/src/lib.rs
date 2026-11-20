@@ -579,6 +579,39 @@ fn decode_element(
     Ok(n)
 }
 
+/// Interleave the first `n` samples of each channel into little-endian bytes,
+/// `W` bytes a sample. Mono and stereo get loops of their own, so the common
+/// cases write whole frames without a per-sample channel loop.
+fn interleave<const W: usize>(
+    bufs: &[Vec<i32>],
+    n: usize,
+    conv: impl Fn(i32) -> [u8; W],
+) -> Vec<u8> {
+    let ch = bufs.len();
+    let mut out = vec![0u8; n * ch * W];
+    match bufs {
+        [m] => {
+            for (d, &s) in out.chunks_exact_mut(W).zip(&m[..n]) {
+                d.copy_from_slice(&conv(s));
+            }
+        }
+        [l, r] => {
+            for (d, (&a, &b)) in out.chunks_exact_mut(2 * W).zip(l[..n].iter().zip(&r[..n])) {
+                d[..W].copy_from_slice(&conv(a));
+                d[W..].copy_from_slice(&conv(b));
+            }
+        }
+        _ => {
+            for (i, d) in out.chunks_exact_mut(ch * W).enumerate() {
+                for (b, o) in bufs.iter().zip(d.chunks_exact_mut(W)) {
+                    o.copy_from_slice(&conv(b[i]));
+                }
+            }
+        }
+    }
+    out
+}
+
 #[derive(Default)]
 struct AlacDecoder {
     config: Option<AlacConfig>,
@@ -607,26 +640,19 @@ impl Decoder for AlacDecoder {
             .config
             .ok_or_else(|| Error::invalid("alac: not configured"))?;
         let n = decode_frame(&cfg, &packet.data, &mut self.buffers)?;
-        let channels = cfg.channels as usize;
         let (format, data) = if cfg.bit_depth == 16 {
-            let mut out = Vec::with_capacity(n * channels * 2);
-            for i in 0..n {
-                for b in &self.buffers {
-                    out.extend_from_slice(&(b[i] as i16).to_le_bytes());
-                }
-            }
-            (SampleFormat::S16, out)
+            let data = interleave(&self.buffers, n, |s| (s as i16).to_le_bytes());
+            (SampleFormat::S16, data)
         } else {
             // Left-justify to 32 bits (as FFmpeg's s32 output), then scale.
+            // `v as f32` rounds once, and scaling by a power of two is exact,
+            // so this is the same value as rounding `v / 2^31` from f64.
             let shift = 32 - cfg.bit_depth as u32;
-            let mut out = Vec::with_capacity(n * channels * 4);
-            for i in 0..n {
-                for b in &self.buffers {
-                    let v = (b[i] as u32).wrapping_shl(shift) as i32;
-                    out.extend_from_slice(&((v as f64 / 2_147_483_648.0) as f32).to_le_bytes());
-                }
-            }
-            (SampleFormat::F32, out)
+            let data = interleave(&self.buffers, n, |s| {
+                let v = (s as u32).wrapping_shl(shift) as i32;
+                (v as f32 * (1.0 / 2_147_483_648.0)).to_le_bytes()
+            });
+            (SampleFormat::F32, data)
         };
         self.frame = Some(Frame::Audio(AudioFrame {
             sample_rate: self.sample_rate,
