@@ -240,7 +240,12 @@ impl ShaperEngine {
     fn lookup_out(table: &[f32; OUT_TABLE], lin: f32) -> f32 {
         let lin = if lin > 0.0 { lin.min(1.0) } else { 0.0 };
         let pos = lin.sqrt() * (OUT_TABLE - 1) as f32;
-        let i = (pos as usize).min(OUT_TABLE - 2);
+        // `lin` is clamped to 0..=1 (NaN to 0), so `pos` is in
+        // 0..=OUT_TABLE-1 and the i32 conversion (one `cvttss2si`) equals
+        // the saturating `as usize`: matrix-shaper -12.4% Ir. The same trick
+        // on `Sample::from_unit`'s f64 -> u8/u16 cast measured worse
+        // (+262K here, +0.2..0.35% on the grid paths), so it is not used.
+        let i = (pos as i32 as usize).min(OUT_TABLE - 2);
         let f = pos - i as f32;
         table[i] + (table[i + 1] - table[i]) * f
     }
