@@ -185,6 +185,47 @@ impl Tag {
         }
     }
 
+    /// An upper-bound estimate of the encoded size, so `Profile::encode`
+    /// can reserve once instead of growing its buffer by doubling.
+    pub(crate) fn size_hint(&self) -> usize {
+        let curve = |c: &Curve| match c {
+            Curve::Table(t) => 16 + 2 * t.len(),
+            Curve::Parametric { .. } => 44,
+        };
+        match self {
+            Self::Xyz(v) => 8 + 12 * v.len(),
+            Self::Curve(c) => curve(c),
+            Self::Lut(Lut::Lut8(l) | Lut::Lut16(l)) => {
+                let tables: usize = l
+                    .input_tables
+                    .iter()
+                    .chain(&l.output_tables)
+                    .map(|t| 2 * t.len())
+                    .sum();
+                52 + tables + 2 * l.clut.data.len()
+            }
+            Self::Lut(Lut::AToB(l) | Lut::BToA(l)) => {
+                let curves: usize = l
+                    .a
+                    .iter()
+                    .chain(&l.m)
+                    .flatten()
+                    .chain(&l.b)
+                    .map(curve)
+                    .sum();
+                96 + curves + l.clut.as_ref().map_or(0, |c| 24 + 2 * c.data.len())
+            }
+            Self::Text(t) => 12 + t.len(),
+            Self::Description {
+                ascii, unicode, ..
+            } => 100 + ascii.len() + 2 * unicode.len(),
+            Self::Mluc(v) => 16 + v.iter().map(|s| 12 + 2 * s.text.len()).sum::<usize>(),
+            Self::S15Fixed16(v) => 8 + 4 * v.len(),
+            Self::Signature(_) => 12,
+            Self::Raw(b) => b.len(),
+        }
+    }
+
     pub(crate) fn encode(&self, w: &mut Writer) {
         match self {
             Self::Xyz(v) => {
