@@ -535,6 +535,7 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
         let mut buf: Vec<u8> = Vec::new();
         let mut packed: Vec<u8> = Vec::new();
         let mut lzw_enc: Option<lzw::LzwEncoder> = None;
+        let mut zlib_enc: Option<deflate::DeflateEncoder> = None;
         // The predictor (and a big-endian byte swap) rewrite the chunk, so
         // they need it in `buf`; otherwise a full-width strip can be handed
         // to the codec straight from the input.
@@ -626,7 +627,11 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
                             &lzw_out
                         }
                         Compression::Deflate(level) => {
-                            other_out = deflate::encode(chunk, u32::from(level));
+                            other_out = zlib_enc
+                                .get_or_insert_with(|| {
+                                    deflate::DeflateEncoder::new(u32::from(level))
+                                })
+                                .encode(chunk);
                             &other_out
                         }
                         Compression::PackBits => {

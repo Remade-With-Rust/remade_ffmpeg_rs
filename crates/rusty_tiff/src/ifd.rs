@@ -248,8 +248,11 @@ pub(crate) fn read_ifd<R: Read + Seek>(
             field[..4].copy_from_slice(&e[8..12]);
             u64::from(s.u32_from(&e[4..8]))
         };
-        // First occurrence wins on duplicate tags.
-        entries.entry(tag).or_insert(Entry { ty, count, field });
+        // The last occurrence wins on a duplicate tag, as in the `tiff`
+        // crate: a bit flip that turns one tag number into another's
+        // duplicates the second tag ahead of its real entry (ArtCraft's
+        // case: BitsPerSample 258 -> 259 put Compression 8 before the real 1).
+        entries.insert(tag, Entry { ty, count, field });
     }
     Ok(Ifd {
         offset,

@@ -107,6 +107,26 @@ fn unknown_field_type_is_skipped() {
     }
 }
 
+/// A duplicate tag keeps its last entry (as the `tiff` crate does): a bit
+/// flip turning BitsPerSample (258) into 259 leaves Compression = 8 ahead of
+/// the real Compression = 1, and the strip is uncompressed.
+#[test]
+fn duplicate_tag_keeps_the_last_entry() {
+    let (w, h) = (37u32, 21u32);
+    let px: Vec<u8> = (0..w * h).map(|i| (i * 13) as u8).collect();
+    let mut f = Cursor::new(Vec::new());
+    TiffEncoder::new(&mut f)
+        .unwrap()
+        .write_image::<colortype::Gray8>(w, h, &px)
+        .unwrap();
+    let mut b = f.into_inner();
+    let first = ifds(&b)[0];
+    let tag_pos = field_pos(&b, first, 258) - 8;
+    b[tag_pos..tag_pos + 2].copy_from_slice(&259u16.to_le_bytes());
+    let mut d = Decoder::new(Cursor::new(&b)).unwrap();
+    assert!(d.read_image().is_ok(), "duplicate Compression tag refused");
+}
+
 #[test]
 fn ifd_self_loop_errors() {
     let mut b = two_page();
@@ -185,12 +205,18 @@ fn lying_strip_byte_counts() {
         d.read_image().unwrap(),
         rusty_tiff::DecodingResult::U8(vec![7; 64])
     );
-    // Too small: short strip is an error.
+    // Too small: the strip keeps its bytes and the rest reads as zero (as
+    // the `tiff` crate does), rather than losing the image.
     let mut b = two_page();
     let p = field_pos(&b, first, 279);
     w32(&mut b, p, 10);
     let mut d = Decoder::new(Cursor::new(&b)).unwrap();
-    assert!(matches!(d.read_image(), Err(TiffError::Format(_))));
+    let mut want = vec![7u8; 10];
+    want.resize(64, 0);
+    assert_eq!(
+        d.read_image().unwrap(),
+        rusty_tiff::DecodingResult::U8(want)
+    );
 }
 
 #[test]

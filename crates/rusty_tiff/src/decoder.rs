@@ -1289,12 +1289,12 @@ fn decode_chunk_append<R: Read + Seek>(
         info.fill_order == 2 && !matches!(comp, compression::JPEG | compression::OLD_JPEG);
     let start = dst.len();
     if comp == compression::NONE {
-        if (n as usize) < expected {
-            return Err(TiffError::format(format!(
-                "chunk {idx} holds {n} of {expected} bytes"
-            )));
-        }
-        s.read_at_into(offset, expected, dst)?;
+        // A chunk shorter than its rows (a damaged byte count, or a file cut
+        // off) keeps the bytes it has and the rest reads as zero, as the
+        // `tiff` crate does, rather than losing the whole image.
+        let have = (n as usize).min(expected);
+        s.read_at_into(offset, have, dst)?;
+        dst.resize(start + expected, 0);
         if reverse {
             reverse_bits(&mut dst[start..]);
         }

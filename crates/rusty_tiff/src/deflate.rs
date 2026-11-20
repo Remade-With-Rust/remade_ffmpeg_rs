@@ -52,6 +52,12 @@ pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffRes
                 out.truncate(target);
                 return Ok(());
             }
+            // A failed check on a payload that did not fully inflate keeps
+            // what did and zero-fills the rest, as the `tiff` crate does.
+            Err(e) if e.to_string().contains("data check") => {
+                out.resize(target, 0);
+                return Ok(());
+            }
             Err(e) => return Err(TiffError::format(format!("Deflate: {e}"))),
         };
         let progressed = d.total_in() != in_before || out.len() != out_before;
@@ -60,18 +66,17 @@ pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffRes
             return Ok(());
         }
         match status {
+            // The stream (or the strip's data) ended short of the rows: keep
+            // what inflated and zero-fill the rest, like a short LZW or
+            // PackBits strip.
             Status::StreamEnd => {
-                return Err(TiffError::format(format!(
-                    "Deflate stream ended after {} of {n} bytes",
-                    out.len() - base
-                )))
+                out.resize(target, 0);
+                return Ok(());
             }
             Status::Ok | Status::BufError => {
                 if !progressed {
-                    return Err(TiffError::format(format!(
-                        "Deflate data ended after {} of {n} bytes",
-                        out.len() - base
-                    )));
+                    out.resize(target, 0);
+                    return Ok(());
                 }
                 if out.len() == out.capacity() {
                     // Capacity exhausted below the target cannot happen with
@@ -85,8 +90,37 @@ pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffRes
 }
 
 /// Deflate `data` into a zlib stream at `level` (0-9).
+#[cfg(test)]
 pub(crate) fn encode(data: &[u8], level: u32) -> Vec<u8> {
-    let mut c = Compress::new(Compression::new(level.min(9)), true);
+    DeflateEncoder::new(level).encode(data)
+}
+
+/// A zlib compressor reused across strips and tiles.
+///
+/// `Compress::new` zero-initialises the whole zlib state (window, hash
+/// chains, pending buffer: about 500 KB) and a default strip is about 8 KB,
+/// so building one per strip spent 40% of a Deflate encode in `memset`.
+/// `reset` returns the same state to a fresh stream, and the output is the
+/// same bytes a new compressor would produce.
+pub(crate) struct DeflateEncoder {
+    c: Compress,
+}
+
+impl DeflateEncoder {
+    pub(crate) fn new(level: u32) -> Self {
+        Self {
+            c: Compress::new(Compression::new(level.min(9)), true),
+        }
+    }
+
+    /// Deflate one strip or tile into a zlib stream.
+    pub(crate) fn encode(&mut self, data: &[u8]) -> Vec<u8> {
+        self.c.reset();
+        encode_with(&mut self.c, data)
+    }
+}
+
+fn encode_with(c: &mut Compress, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() / 2 + 64);
     loop {
         let ip = c.total_in() as usize;
@@ -165,10 +199,15 @@ mod tests {
 
     #[test]
     fn short_and_garbage() {
+        // A stream shorter than the strip keeps what it holds, zero-filled
+        // (as the `tiff` crate does); an empty strip reads as zeros.
         let enc = encode(&[1, 2, 3], 6);
-        let mut out = vec![0u8; 10];
-        assert!(decode(&enc, &mut out).is_err());
+        let mut out = vec![0xaa; 10];
+        decode(&enc, &mut out).unwrap();
+        assert_eq!(out, [1, 2, 3, 0, 0, 0, 0, 0, 0, 0]);
+        decode(&[], &mut out).unwrap();
+        assert_eq!(out, [0; 10]);
+        // Garbage is still an error.
         assert!(decode(&[0x78, 0x9c, 0xff, 0xff, 0xff], &mut out).is_err());
-        assert!(decode(&[], &mut out).is_err());
     }
 }
