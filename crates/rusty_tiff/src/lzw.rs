@@ -51,10 +51,35 @@ impl BitReader<'_> {
 }
 
 /// Decode a TIFF LZW strip/tile into `out`, which must be filled exactly.
+#[cfg(test)]
+pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
+    let mut v = Vec::new();
+    decode_append(data, &mut v, out.len())?;
+    out.copy_from_slice(&v);
+    Ok(())
+}
+
+/// Strings this long or shorter are copied byte by byte; longer ones with
+/// one `extend_from_within` (a runtime-length memcpy call costs more than a
+/// few bytes).
+const INLINE_COPY: usize = 8;
+
+/// Decode a TIFF LZW strip/tile, appending exactly `n` bytes to `out`.
+///
+/// Every code's string is, by construction, an earlier stretch of this same
+/// output: code `k` added after emitting `prev` is `string(prev)` plus the
+/// next string's first byte, which is exactly the `len(prev) + 1` bytes
+/// starting where `prev` was emitted. So instead of a prefix/suffix table
+/// walked back to front one byte at a time, each code records where it was
+/// first emitted and how long it is, and emitting it is a copy from there.
 ///
 /// Old-style (LSB-first) data is detected the way libtiff does it: a first
 /// byte of 0 with the low bit of the second byte set.
-pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
+pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffResult<()> {
+    out.try_reserve_exact(n)
+        .map_err(|_| TiffError::limits(format!("cannot allocate {n} bytes")))?;
+    let base = out.len();
+    let target = base + n;
     let old_style = data.len() >= 2 && data[0] == 0 && (data[1] & 1) != 0;
     let mut br = BitReader {
         data,
@@ -63,27 +88,21 @@ pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
         nbits: 0,
         msb: !old_style,
     };
-    // Per code: prefix, final byte, first byte, length.
-    let mut prefix = vec![0u16; MAX_CODES];
-    let mut suffix = vec![0u8; MAX_CODES];
-    let mut first = vec![0u8; MAX_CODES];
+    // Per code >= 258: absolute start of its first emission in `out`, and
+    // its length. Codes < 256 are their own byte.
+    let mut start = vec![0usize; MAX_CODES];
     let mut len = vec![0u16; MAX_CODES];
-    for i in 0..256 {
-        suffix[i] = i as u8;
-        first[i] = i as u8;
-        len[i] = 1;
-    }
     let early = u16::from(!old_style);
     let mut width = 9u32;
     let mut next = FIRST;
-    let mut prev: Option<u16> = None;
-    let mut pos = 0usize;
+    // The previous code's emission: (code, start, length).
+    let mut prev: Option<(u16, usize, u16)> = None;
 
-    while pos < out.len() {
+    while out.len() < target {
         let Some(code) = br.read(width) else {
             return Err(TiffError::format(format!(
-                "LZW data ended after {pos} of {} bytes",
-                out.len()
+                "LZW data ended after {} of {n} bytes",
+                out.len() - base
             )));
         };
         if code == CLEAR {
@@ -94,59 +113,66 @@ pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
         }
         if code == EOI {
             return Err(TiffError::format(format!(
-                "LZW end-of-information after {pos} of {} bytes",
-                out.len()
+                "LZW end-of-information after {} of {n} bytes",
+                out.len() - base
             )));
         }
-        let Some(p) = prev else {
+        let at = out.len();
+        let Some((_, pstart, plen)) = prev else {
             // First code after a clear (or at the start): must be a literal.
             if code > 255 {
                 return Err(TiffError::format("LZW: non-literal code after clear"));
             }
-            out[pos] = code as u8;
-            pos += 1;
-            prev = Some(code);
+            out.push(code as u8);
+            prev = Some((code, at, 1));
             continue;
         };
-        let (string_code, extra) = if code < next {
-            (code, None)
+        let room = target - at;
+        let elen: u16 = if code < 256 {
+            out.push(code as u8);
+            1
+        } else if code < next {
+            let (s0, l) = (start[code as usize], len[code as usize]);
+            copy_back(out, s0, usize::from(l).min(room));
+            l
         } else if code == next && (next as usize) < MAX_CODES {
             // KwKwK: the string is prev + first(prev).
-            (p, Some(first[p as usize]))
+            let l = usize::from(plen);
+            copy_back(out, pstart, l.min(room));
+            if l < room {
+                let b = out[pstart];
+                out.push(b);
+            }
+            plen.saturating_add(1)
         } else {
             return Err(TiffError::format(format!("LZW: invalid code {code}")));
         };
-        // Emit the string for string_code (written back to front), clipped to out.
-        let slen = len[string_code as usize] as usize;
-        let total = slen + usize::from(extra.is_some());
-        let mut c = string_code;
-        for i in (0..slen).rev() {
-            if pos + i < out.len() {
-                out[pos + i] = suffix[c as usize];
-            }
-            c = prefix[c as usize];
-        }
-        if let Some(b) = extra {
-            if pos + slen < out.len() {
-                out[pos + slen] = b;
-            }
-        }
-        pos += total;
-        // Add prev + first(code-string) to the table.
+        // Add prev + first(this string): plen + 1 bytes from prev's start.
         if (next as usize) < MAX_CODES {
-            let n = next as usize;
-            prefix[n] = p;
-            suffix[n] = first[string_code as usize];
-            first[n] = first[p as usize];
-            len[n] = len[p as usize].saturating_add(1);
+            start[next as usize] = pstart;
+            len[next as usize] = plen.saturating_add(1);
             next += 1;
             if width < 12 && next >= (1u16 << width) - early {
                 width += 1;
             }
         }
-        prev = Some(code);
+        prev = Some((code, at, elen));
     }
+    out.truncate(target);
     Ok(())
+}
+
+/// Append `l` bytes copied from `out[from..]` (always fully before the end).
+#[inline]
+fn copy_back(out: &mut Vec<u8>, from: usize, l: usize) {
+    if l <= INLINE_COPY {
+        for k in 0..l {
+            let b = out[from + k];
+            out.push(b);
+        }
+    } else {
+        out.extend_from_within(from..from + l);
+    }
 }
 
 struct BitWriter {

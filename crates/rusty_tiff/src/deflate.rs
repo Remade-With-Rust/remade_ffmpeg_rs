@@ -5,41 +5,61 @@ use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, 
 
 use crate::error::{TiffError, TiffResult};
 
-/// Inflate into `out`, which must be filled exactly. Output beyond `out` is
-/// never produced (the inflater writes only into the slice), so a
-/// decompression bomb costs at most `out.len()` bytes.
+/// Inflate into `out`, which must be filled exactly.
+#[cfg(test)]
 pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
+    let mut v = Vec::new();
+    decode_append(data, &mut v, out.len())?;
+    out.copy_from_slice(&v);
+    Ok(())
+}
+
+/// Inflate exactly `n` bytes onto the end of `out`, straight into its spare
+/// capacity (no zero-fill first). Capacity is reserved for exactly `n`
+/// more, so a decompression bomb costs at most `n` bytes; anything the
+/// inflater writes past `n` (only possible if the allocator handed back
+/// more capacity than asked) is truncated away.
+pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffResult<()> {
+    out.try_reserve_exact(n)
+        .map_err(|_| TiffError::limits(format!("cannot allocate {n} bytes")))?;
+    let base = out.len();
+    let target = base + n;
     let mut d = Decompress::new(true);
     loop {
-        let in_before = d.total_in();
-        let out_before = d.total_out();
-        let ip = in_before as usize;
-        let op = out_before as usize;
-        if op >= out.len() {
+        if out.len() >= target {
+            out.truncate(target);
             return Ok(());
         }
+        let in_before = d.total_in();
+        let out_before = out.len();
+        let ip = in_before as usize;
         let status = d
-            .decompress(&data[ip..], &mut out[op..], FlushDecompress::None)
+            .decompress_vec(&data[ip..], out, FlushDecompress::None)
             .map_err(|e| TiffError::format(format!("Deflate: {e}")))?;
-        let progressed = d.total_in() != in_before || d.total_out() != out_before;
-        if (d.total_out() as usize) >= out.len() {
+        let progressed = d.total_in() != in_before || out.len() != out_before;
+        if out.len() >= target {
+            out.truncate(target);
             return Ok(());
         }
         match status {
             Status::StreamEnd => {
                 return Err(TiffError::format(format!(
-                    "Deflate stream ended after {} of {} bytes",
-                    d.total_out(),
-                    out.len()
+                    "Deflate stream ended after {} of {n} bytes",
+                    out.len() - base
                 )))
             }
             Status::Ok | Status::BufError => {
                 if !progressed {
                     return Err(TiffError::format(format!(
-                        "Deflate data ended after {} of {} bytes",
-                        d.total_out(),
-                        out.len()
+                        "Deflate data ended after {} of {n} bytes",
+                        out.len() - base
                     )));
+                }
+                if out.len() == out.capacity() {
+                    // Capacity exhausted below the target cannot happen with
+                    // the reservation above, but never spin if it does.
+                    out.try_reserve_exact(target - out.len())
+                        .map_err(|_| TiffError::limits("cannot allocate"))?;
                 }
             }
         }

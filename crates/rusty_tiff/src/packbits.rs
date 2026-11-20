@@ -3,36 +3,64 @@
 use crate::error::{TiffError, TiffResult};
 
 /// Decode into `out`, which must be filled exactly; extra input is ignored.
+#[cfg(test)]
 pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
+    let mut v = Vec::new();
+    decode_append(data, &mut v, out.len())?;
+    out.copy_from_slice(&v);
+    Ok(())
+}
+
+/// Runs this long or shorter are written byte by byte: TIFF PackBits data
+/// is mostly short runs (16-bit samples give 2-3 byte runs), and a libc
+/// `memset`/`memcpy` call per run cost more than the bytes (4.6 M memset
+/// calls at 22 instructions each on one 16-bit 1.5 Mpx image).
+const INLINE_RUN: usize = 16;
+
+/// Append exactly `n` decoded bytes to `out`; extra input is ignored.
+/// Nothing is zero-filled first, and `out` grows by at most `n`.
+pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffResult<()> {
+    out.try_reserve_exact(n)
+        .map_err(|_| TiffError::limits(format!("cannot allocate {n} bytes")))?;
+    let target = out.len() + n;
     let mut i = 0usize;
-    let mut pos = 0usize;
-    while pos < out.len() {
+    while out.len() < target {
         let Some(&h) = data.get(i) else {
             return Err(TiffError::format(format!(
-                "PackBits data ended after {pos} of {} bytes",
-                out.len()
+                "PackBits data ended after {} of {n} bytes",
+                n - (target - out.len())
             )));
         };
         i += 1;
         let h = h as i8;
         if h >= 0 {
-            let n = h as usize + 1;
+            let run = h as usize + 1;
             let src = data
-                .get(i..i + n)
+                .get(i..i + run)
                 .ok_or_else(|| TiffError::format("PackBits literal run past end of data"))?;
-            let take = n.min(out.len() - pos);
-            out[pos..pos + take].copy_from_slice(&src[..take]);
-            pos += take;
-            i += n;
+            let take = run.min(target - out.len());
+            if take <= INLINE_RUN {
+                for &b in &src[..take] {
+                    out.push(b);
+                }
+            } else {
+                out.extend_from_slice(&src[..take]);
+            }
+            i += run;
         } else if h != -128 {
-            let n = (1 - i32::from(h)) as usize;
+            let run = (1 - i32::from(h)) as usize;
             let &b = data
                 .get(i)
                 .ok_or_else(|| TiffError::format("PackBits repeat past end of data"))?;
             i += 1;
-            let take = n.min(out.len() - pos);
-            out[pos..pos + take].fill(b);
-            pos += take;
+            let take = run.min(target - out.len());
+            if take <= INLINE_RUN {
+                for _ in 0..take {
+                    out.push(b);
+                }
+            } else {
+                out.resize(out.len() + take, b);
+            }
         }
     }
     Ok(())

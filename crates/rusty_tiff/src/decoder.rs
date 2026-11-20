@@ -1054,6 +1054,9 @@ fn decode_image<R: Read + Seek>(
         )));
     }
     let samples = total_bytes / (usize::from(bits.max(8)) / 8);
+    if !info.tiled && img.planes() == 1 {
+        return decode_strips(s, img, limits, interpret, total_bytes, samples);
+    }
     let mut out = match bits {
         1 | 2 | 4 => Out::Packed(zeroed(total_bytes)?),
         8 => Out::U8(zeroed(samples)?),
@@ -1064,6 +1067,8 @@ fn decode_image<R: Read + Seek>(
     let (across, down) = img.across_down();
     let (cw, ch) = info.chunk_dimensions;
     let spp_chunk = img.spp_chunk();
+    // One chunk buffer, reused for every tile and plane.
+    let mut chunk = Vec::new();
     for plane in 0..img.planes() {
         for cy in 0..down {
             for cx in 0..across {
@@ -1076,13 +1081,15 @@ fn decode_image<R: Read + Seek>(
                     ch.min(info.height - y0)
                 };
                 let chunk_row_bytes = row_bytes(cw, spp_chunk, bits)?;
-                let chunk = decode_chunk(
+                chunk.clear();
+                decode_chunk_append(
                     s,
                     img,
                     idx,
                     (cw, rows_in_chunk, chunk_row_bytes),
                     limits,
                     interpret,
+                    &mut chunk,
                 )?;
                 let g = Geom {
                     width: info.width as usize,
@@ -1106,6 +1113,82 @@ fn decode_image<R: Read + Seek>(
             }
         }
     }
+    Ok(typed_result(out, info.sample_kind, bits))
+}
+
+/// Strip images with one plane: strips are full-width rows in order, so
+/// each one is decoded straight onto the end of the output (bytes, for 1-8
+/// bit samples), or into one reused strip buffer appended as typed samples.
+/// Nothing is zero-filled and nothing is copied twice.
+fn decode_strips<R: Read + Seek>(
+    s: &mut Stream<R>,
+    img: &Image,
+    limits: &Limits,
+    interpret: bool,
+    total_bytes: usize,
+    samples: usize,
+) -> TiffResult<DecodingResult> {
+    let info = &img.info;
+    let bits = info.bits_per_sample;
+    let (cw, ch) = info.chunk_dimensions;
+    let row = row_bytes(cw, img.spp_chunk(), bits)?;
+    let (_, down) = img.across_down();
+    let rows_of = |cy: u32| ch.min(info.height - cy * ch);
+    let out = if bits <= 8 {
+        let mut out: Vec<u8> = Vec::new();
+        out.try_reserve_exact(total_bytes)
+            .map_err(|_| TiffError::limits(format!("cannot allocate {total_bytes} bytes")))?;
+        for cy in 0..down {
+            decode_chunk_append(
+                s,
+                img,
+                cy as usize,
+                (cw, rows_of(cy), row),
+                limits,
+                interpret,
+                &mut out,
+            )?;
+        }
+        if bits == 8 {
+            Out::U8(out)
+        } else {
+            Out::Packed(out)
+        }
+    } else {
+        let mut chunk = Vec::new();
+        macro_rules! typed {
+            ($t:ty, $v:ident) => {{
+                let mut out: Vec<$t> = Vec::new();
+                out.try_reserve_exact(samples)
+                    .map_err(|_| TiffError::limits(format!("cannot allocate {samples} samples")))?;
+                for cy in 0..down {
+                    chunk.clear();
+                    decode_chunk_append(
+                        s,
+                        img,
+                        cy as usize,
+                        (cw, rows_of(cy), row),
+                        limits,
+                        interpret,
+                        &mut chunk,
+                    )?;
+                    // `chunks_exact` fixes the length, so this converts with
+                    // no fallible path and vectorises.
+                    out.extend(
+                        chunk
+                            .chunks_exact(<$t>::N)
+                            .map(|c| <$t>::from_ne_bytes(c.try_into().unwrap())),
+                    );
+                }
+                Out::$v(out)
+            }};
+        }
+        match bits {
+            16 => typed!(u16, U16),
+            32 => typed!(u32, U32),
+            _ => typed!(u64, U64),
+        }
+    };
     Ok(typed_result(out, info.sample_kind, bits))
 }
 
@@ -1156,16 +1239,19 @@ fn reverse_bits(buf: &mut [u8]) {
     }
 }
 
-/// Decompress and un-predict one chunk into native-endian rows of
-/// `chunk_row_bytes`.
-fn decode_chunk<R: Read + Seek>(
+/// Decompress and un-predict one chunk, appending exactly
+/// `chunk_row_bytes * rows` native-endian bytes to `dst`. Codecs write
+/// straight into `dst`'s spare capacity (no zero-fill), and uncompressed data
+/// is read from the file directly into place.
+fn decode_chunk_append<R: Read + Seek>(
     s: &mut Stream<R>,
     img: &Image,
     idx: usize,
     (cw, rows, chunk_row_bytes): (u32, u32, usize),
     limits: &Limits,
     interpret: bool,
-) -> TiffResult<Vec<u8>> {
+    dst: &mut Vec<u8>,
+) -> TiffResult<()> {
     let info = &img.info;
     let expected = chunk_row_bytes
         .checked_mul(rows as usize)
@@ -1188,76 +1274,85 @@ fn decode_chunk<R: Read + Seek>(
             "compressed chunk exceeds intermediate_buffer_size",
         ));
     }
-    let mut raw = s.read_at(offset, n)?;
     let comp = info.compression;
     // FillOrder 2: reverse the bits of every compressed byte, as libtiff
     // does for every codec except JPEG (verified against libtiff 4.7 on
     // LZW, Deflate, PackBits, none and CCITT).
-    if info.fill_order == 2 && !matches!(comp, compression::JPEG | compression::OLD_JPEG) {
-        reverse_bits(&mut raw);
-    }
-    let mut buf = zeroed::<u8>(expected)?;
-    match comp {
-        compression::NONE => {
-            if raw.len() < expected {
-                return Err(TiffError::format(format!(
-                    "chunk {idx} holds {} of {expected} bytes",
-                    raw.len()
-                )));
+    let reverse =
+        info.fill_order == 2 && !matches!(comp, compression::JPEG | compression::OLD_JPEG);
+    let start = dst.len();
+    if comp == compression::NONE {
+        if (n as usize) < expected {
+            return Err(TiffError::format(format!(
+                "chunk {idx} holds {n} of {expected} bytes"
+            )));
+        }
+        s.read_at_into(offset, expected, dst)?;
+        if reverse {
+            reverse_bits(&mut dst[start..]);
+        }
+    } else {
+        let mut raw = s.read_at(offset, n)?;
+        if reverse {
+            reverse_bits(&mut raw);
+        }
+        match comp {
+            compression::LZW => lzw::decode_append(&raw, dst, expected)?,
+            compression::DEFLATE | compression::OLD_DEFLATE => {
+                deflate::decode_append(&raw, dst, expected)?
             }
-            buf.copy_from_slice(&raw[..expected]);
-        }
-        compression::LZW => lzw::decode(&raw, &mut buf)?,
-        compression::DEFLATE | compression::OLD_DEFLATE => deflate::decode(&raw, &mut buf)?,
-        compression::PACKBITS => packbits::decode(&raw, &mut buf)?,
-        compression::CCITT_RLE | compression::CCITT_FAX3 | compression::CCITT_FAX4 => {
-            if info.bits_per_sample != 1 || info.samples_per_pixel != 1 {
-                return Err(TiffError::format(
-                    "CCITT compression on a non-bilevel image",
-                ));
+            compression::PACKBITS => packbits::decode_append(&raw, dst, expected)?,
+            compression::CCITT_RLE | compression::CCITT_FAX3 | compression::CCITT_FAX4 => {
+                if info.bits_per_sample != 1 || info.samples_per_pixel != 1 {
+                    return Err(TiffError::format(
+                        "CCITT compression on a non-bilevel image",
+                    ));
+                }
+                let coding = match comp {
+                    compression::CCITT_RLE => ccitt::Coding::ModifiedHuffman,
+                    compression::CCITT_FAX3 if img.t4_options & 1 != 0 => ccitt::Coding::Group3_2D,
+                    compression::CCITT_FAX3 => ccitt::Coding::Group3_1D,
+                    _ => ccitt::Coding::Group4,
+                };
+                let mut o = ccitt::Options::new(coding, cw).with_rows(rows);
+                o.max_output_bytes = limits.intermediate_buffer_size;
+                let px = ccitt::decode(&raw, &o)?;
+                dst.extend_from_slice(&px[..expected]);
+                return Ok(());
             }
-            let coding = match comp {
-                compression::CCITT_RLE => ccitt::Coding::ModifiedHuffman,
-                compression::CCITT_FAX3 if img.t4_options & 1 != 0 => ccitt::Coding::Group3_2D,
-                compression::CCITT_FAX3 => ccitt::Coding::Group3_1D,
-                _ => ccitt::Coding::Group4,
-            };
-            let mut o = ccitt::Options::new(coding, cw).with_rows(rows);
-            o.max_output_bytes = limits.intermediate_buffer_size;
-            let px = ccitt::decode(&raw, &o)?;
-            buf.copy_from_slice(&px[..expected]);
-            return Ok(buf);
+            compression::JPEG => {
+                dst.resize(start + expected, 0);
+                decode_jpeg_chunk(
+                    img,
+                    &raw,
+                    (cw, rows, chunk_row_bytes),
+                    &mut dst[start..],
+                    limits,
+                    interpret,
+                )?;
+                return Ok(());
+            }
+            compression::OLD_JPEG => {
+                return Err(TiffError::unsupported("old-style JPEG (compression 6)"))
+            }
+            c => return Err(TiffError::unsupported(format!("compression {c}"))),
         }
-        compression::JPEG => {
-            decode_jpeg_chunk(
-                img,
-                &raw,
-                (cw, rows, chunk_row_bytes),
-                &mut buf,
-                limits,
-                interpret,
-            )?;
-            return Ok(buf);
-        }
-        compression::OLD_JPEG => {
-            return Err(TiffError::unsupported("old-style JPEG (compression 6)"))
-        }
-        c => return Err(TiffError::unsupported(format!("compression {c}"))),
     }
+    let buf = &mut dst[start..];
     let bytes = usize::from(info.bits_per_sample) / 8;
     let spp = usize::from(img.spp_chunk());
     match info.predictor {
-        pred::FLOATING_POINT => predictor::undo_float(&mut buf, chunk_row_bytes, spp, bytes),
+        pred::FLOATING_POINT => predictor::undo_float(buf, chunk_row_bytes, spp, bytes),
         p => {
             if s.big_endian != cfg!(target_endian = "big") {
-                predictor::swap_bytes(&mut buf, bytes);
+                predictor::swap_bytes(buf, bytes);
             }
             if p == pred::HORIZONTAL {
-                predictor::undo_horizontal(&mut buf, chunk_row_bytes, spp, bytes);
+                predictor::undo_horizontal(buf, chunk_row_bytes, spp, bytes);
             }
         }
     }
-    Ok(buf)
+    Ok(())
 }
 
 #[cfg(feature = "jpeg")]
