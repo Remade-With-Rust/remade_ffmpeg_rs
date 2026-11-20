@@ -92,16 +92,24 @@ pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
 ///
 /// Old-style (LSB-first) data is detected the way libtiff does it: a first
 /// byte of 0 with the low bit of the second byte set.
+///
+/// A strip that ends early (its data runs out, or an end-of-information code
+/// arrives, before `n` bytes) keeps the bytes it did decode and the rest stay
+/// zero, as the `tiff` crate does: damaged files commonly lose a strip's last
+/// byte or two, and refusing the whole image for that loses every good pixel.
+/// An invalid code is still an error.
 pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffResult<()> {
     let base = out.len();
     out.try_reserve_exact(n)
         .map_err(|_| TiffError::limits(format!("cannot allocate {n} bytes")))?;
     out.resize(base + n, 0);
-    decode_into(data, &mut out[base..])
+    decode_into(data, &mut out[base..])?;
+    Ok(())
 }
 
-/// Decode into `out`, which must be filled exactly.
-fn decode_into(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
+/// Decode into `out`; returns how many bytes were produced (fewer than
+/// `out.len()` when the data or an end-of-information code ends it early).
+fn decode_into(data: &[u8], out: &mut [u8]) -> TiffResult<usize> {
     let n = out.len();
     let old_style = data.len() >= 2 && data[0] == 0 && (data[1] & 1) != 0;
     let mut br = BitReader {
@@ -124,9 +132,7 @@ fn decode_into(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
 
     while pos < n {
         let Some(code) = br.read(width) else {
-            return Err(TiffError::format(format!(
-                "LZW data ended after {pos} of {n} bytes"
-            )));
+            return Ok(pos);
         };
         if code == CLEAR {
             width = 9;
@@ -136,9 +142,7 @@ fn decode_into(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
             continue;
         }
         if code == EOI {
-            return Err(TiffError::format(format!(
-                "LZW end-of-information after {pos} of {n} bytes"
-            )));
+            return Ok(pos);
         }
         if plen == 0 {
             // First code after a clear (or at the start): must be a literal.
@@ -188,7 +192,7 @@ fn decode_into(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
         }
         (pstart, plen) = (at, elen);
     }
-    Ok(())
+    Ok(n)
 }
 
 /// Copy `l` bytes from `out[from..]` to `out[at..]`; the source lies wholly
@@ -432,13 +436,26 @@ mod eoi_tests {
     /// Decode until EOI; return the number of bytes before it.
     fn len_to_eoi(data: &[u8]) -> Option<usize> {
         let mut out = vec![0u8; 1 << 20];
-        // Decode into a large buffer: decode() errors at EOI with the count.
-        match decode(data, &mut out) {
-            Err(TiffError::Format(m)) if m.contains("end-of-information") => {
-                m.split_whitespace().nth(3)?.parse().ok()
-            }
-            _ => None,
+        // A large buffer: EOI ends the decode early with the count.
+        decode_into(data, &mut out).ok().filter(|&n| n < out.len())
+    }
+
+    #[test]
+    fn short_strip_keeps_decoded_bytes_and_zero_fills() {
+        let data: Vec<u8> = (0..512u32).map(|i| (i * 7 % 251 + 1) as u8).collect();
+        let enc = encode(&data);
+        for cut in 1..=3 {
+            let mut out = vec![0xaa; data.len()];
+            decode(&enc[..enc.len() - cut], &mut out).unwrap();
+            let good = out.iter().zip(&data).take_while(|(a, b)| a == b).count();
+            assert!(good >= data.len() - 16, "cut {cut}: {good}");
+            assert!(out[good..].iter().all(|&b| b == 0), "cut {cut}");
         }
+        // Asking for more than the strip holds: the tail is zero.
+        let mut out = vec![0xaa; data.len() + 100];
+        decode(&enc, &mut out).unwrap();
+        assert_eq!(&out[..data.len()], &data[..]);
+        assert!(out[data.len()..].iter().all(|&b| b == 0));
     }
 
     #[test]

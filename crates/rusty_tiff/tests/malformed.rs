@@ -72,6 +72,41 @@ fn decode_all(file: &[u8], limits: Limits) -> Result<usize, TiffError> {
     Ok(pages)
 }
 
+/// TIFF 6.0 section 2: readers skip a field whose type code is undefined.
+/// A damaged type on an optional tag must not cost the image; on a required
+/// tag the image still fails (as missing).
+#[test]
+fn unknown_field_type_is_skipped() {
+    let clean = two_page();
+    let first = ifds(&clean)[0];
+    let pixels = |b: &[u8]| -> Result<Vec<u8>, TiffError> {
+        let mut d = Decoder::new(Cursor::new(b))?;
+        match d.read_image()? {
+            rusty_tiff::DecodingResult::U8(v) => Ok(v),
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    let want = pixels(&clean).unwrap();
+    let n = r16(&clean, first);
+    let tags: Vec<u16> = (0..n)
+        .map(|k| r16(&clean, first + 2 + k * 12) as u16)
+        .collect();
+    let optional = [282u16, 283, 284, 296, 305, 277]
+        .into_iter()
+        .find(|t| tags.contains(t))
+        .expect("an optional tag is written");
+    for (tag, should_decode) in [(optional, true), (256, false)] {
+        let mut b = clean.clone();
+        let ty = field_pos(&b, first, tag) - 6;
+        b[ty..ty + 2].copy_from_slice(&1028u16.to_le_bytes());
+        match (pixels(&b), should_decode) {
+            (Ok(v), true) => assert_eq!(v, want, "tag {tag}"),
+            (Err(_), false) => {}
+            (r, _) => panic!("tag {tag}: {:?}", r.map(|v| v.len())),
+        }
+    }
+}
+
 #[test]
 fn ifd_self_loop_errors() {
     let mut b = two_page();

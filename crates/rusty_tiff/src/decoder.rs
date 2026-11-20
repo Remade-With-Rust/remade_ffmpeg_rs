@@ -421,8 +421,13 @@ impl<R: Read + Seek> Decoder<R> {
     // ---- tags --------------------------------------------------------------
 
     /// A tag of the current IFD, or `None` if absent.
+    ///
+    /// An entry whose field-type code TIFF does not define reads as absent:
+    /// TIFF 6.0 section 2 has readers skip fields of an unexpected type, so a
+    /// damaged type code on an optional tag no longer fails the file (a
+    /// required tag hit this way still fails, as missing).
     pub fn find_tag(&mut self, tag: Tag) -> TiffResult<Option<Value>> {
-        match self.ifd.entries.get(&tag.to_u16()) {
+        match known(self.ifd.entries.get(&tag.to_u16())) {
             None => Ok(None),
             Some(e) => {
                 let e = e.clone();
@@ -437,8 +442,9 @@ impl<R: Read + Seek> Decoder<R> {
     }
 
     /// A tag of another IFD (from [`Self::read_ifd`], [`Self::exif_ifd`]...).
+    /// Undefined field types read as absent, as in [`Self::find_tag`].
     pub fn find_tag_in(&mut self, ifd: &Ifd, tag: Tag) -> TiffResult<Option<Value>> {
-        match ifd.entries.get(&tag.to_u16()) {
+        match known(ifd.entries.get(&tag.to_u16())) {
             None => Ok(None),
             Some(e) => {
                 ifd::read_value(&mut self.s, self.bigtiff, e, self.limits.ifd_value_size).map(Some)
@@ -447,8 +453,9 @@ impl<R: Read + Seek> Decoder<R> {
     }
 
     /// The raw value bytes of a tag of the current IFD, in file byte order.
+    /// Undefined field types read as absent, as in [`Self::find_tag`].
     pub fn find_tag_bytes(&mut self, tag: Tag) -> TiffResult<Option<Vec<u8>>> {
-        match self.ifd.entries.get(&tag.to_u16()) {
+        match known(self.ifd.entries.get(&tag.to_u16())) {
             None => Ok(None),
             Some(e) => {
                 let e = e.clone();
@@ -1299,7 +1306,7 @@ fn decode_chunk_append<R: Read + Seek>(
         match comp {
             compression::LZW => lzw::decode_append(&raw, dst, expected)?,
             compression::DEFLATE | compression::OLD_DEFLATE => {
-                deflate::decode_append(&raw, dst, expected)?
+                deflate::decode_append(&raw, dst, expected)?;
             }
             compression::PACKBITS => packbits::decode_append(&raw, dst, expected)?,
             compression::CCITT_RLE | compression::CCITT_FAX3 | compression::CCITT_FAX4 => {
@@ -1472,6 +1479,12 @@ fn expand_palette(
         _ => return Err(TiffError::unsupported("palette sample type")),
     }
     Ok(DecodingResult::U16(out))
+}
+
+/// The entry, unless its field-type code is one TIFF does not define (such
+/// a field is skipped, per TIFF 6.0 section 2).
+fn known(e: Option<&ifd::Entry>) -> Option<&ifd::Entry> {
+    e.filter(|e| e.field_type().is_some())
 }
 
 #[cfg(test)]
