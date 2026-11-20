@@ -187,10 +187,17 @@ fn read_scanline(r: &mut crate::read::Reader, buf: &mut [[u8; 4]]) -> Result<()>
         return Err(Error::invalid("hdr: scanline starts with a run"));
     }
     buf[0] = first;
+    // Walk the remaining bytes as 4-byte chunks and consume them once at the
+    // end, instead of a fallible 4-byte read per pixel.
+    let mut chunks = r.rest().chunks_exact(4);
+    let mut used = 0usize;
     let (mut x, mut mult, mut prev) = (1usize, 1usize, first);
     while x < width {
-        let p = r.array::<4>()?;
-        if is_run(p) {
+        let c = chunks.next().ok_or(Error::Truncated)?;
+        used += 4;
+        let p = [c[0], c[1], c[2], c[3]];
+        // `is_run` as one masked word compare.
+        if u32::from_le_bytes(p) & 0x00ff_ffff == 0x0001_0101 {
             let n = usize::from(p[3])
                 .checked_mul(mult)
                 .ok_or_else(|| Error::invalid("hdr: run overflow"))?;
@@ -207,7 +214,7 @@ fn read_scanline(r: &mut crate::read::Reader, buf: &mut [[u8; 4]]) -> Result<()>
             x += 1;
         }
     }
-    Ok(())
+    r.skip(used)
 }
 
 /// Float RGB to RGBE (the standard `frexp` rounding Radiance uses).
