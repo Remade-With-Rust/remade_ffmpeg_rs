@@ -469,20 +469,7 @@ impl Transform {
                 }
             }
             (Engine::Grid(g), SampleKind::U8 | SampleKind::U16) => {
-                let mut input = [0.0f64; 16];
-                let mut out = [0.0f64; 16];
-                for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
-                    for c in 0..in_ch {
-                        input[c] = sp[c].to_unit();
-                    }
-                    g.eval(&input[..in_ch], &mut out);
-                    for c in 0..out_ch {
-                        dp[c] = T::from_unit(out[c]);
-                    }
-                    if dst_alpha {
-                        dp[dc - 1] = if src_alpha { sp[sc - 1] } else { T::opaque() };
-                    }
-                }
+                run_grid(g, src, dst, (sc, dc, in_ch, out_ch), (src_alpha, dst_alpha));
             }
             _ => {
                 let src_lab = self.src_layout.is_lab();
@@ -514,6 +501,32 @@ impl Transform {
             }
         }
         Ok(())
+    }
+}
+
+/// The integer device-link grid loop, in its own frame so the inlining
+/// decisions of the matrix-shaper monomorphs in `Transform::transform` do
+/// not reshape it (sharing the frame cost the grid path +1.7-1.9% Ir).
+fn run_grid<T: Sample>(
+    g: &ClutEval,
+    src: &[T],
+    dst: &mut [T],
+    (sc, dc, in_ch, out_ch): (usize, usize, usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) {
+    let mut input = [0.0f64; 16];
+    let mut out = [0.0f64; 16];
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        for c in 0..in_ch {
+            input[c] = sp[c].to_unit();
+        }
+        g.eval(&input[..in_ch], &mut out);
+        for c in 0..out_ch {
+            dp[c] = T::from_unit(out[c]);
+        }
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { T::opaque() };
+        }
     }
 }
 
