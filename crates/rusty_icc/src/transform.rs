@@ -514,8 +514,30 @@ fn run_grid<T: Sample>(
     (sc, dc, in_ch, out_ch): (usize, usize, usize, usize),
     (src_alpha, dst_alpha): (bool, bool),
 ) {
-    let mut input = [0.0f64; 16];
     let mut out = [0.0f64; 16];
+    if T::KIND == SampleKind::U8 {
+        // Every 8-bit value's (cell, fraction), computed by the same
+        // expressions `eval` uses, once per call instead of per pixel.
+        let points = g.points(0);
+        let table: Vec<(usize, f64)> = (0..256u16)
+            .map(|v| ClutEval::axis(points, (v as u8).to_unit()))
+            .collect();
+        let mut axes = [(0usize, 0.0f64); 16];
+        for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+            for c in 0..in_ch {
+                axes[c] = table[sp[c].index() & 255];
+            }
+            g.eval_axes(&axes, &mut out);
+            for c in 0..out_ch {
+                dp[c] = T::from_unit(out[c]);
+            }
+            if dst_alpha {
+                dp[dc - 1] = if src_alpha { sp[sc - 1] } else { T::opaque() };
+            }
+        }
+        return;
+    }
+    let mut input = [0.0f64; 16];
     for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
         for c in 0..in_ch {
             input[c] = sp[c].to_unit();

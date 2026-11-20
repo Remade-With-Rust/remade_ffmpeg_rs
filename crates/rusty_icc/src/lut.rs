@@ -530,24 +530,54 @@ impl ClutEval {
 
     /// Interpolates at `x` (one value per input, clamped to `0..=1`) into
     /// `out[..outputs]`.
+    /// Grid cell and fraction of coordinate `x` on an axis of `g` points.
+    #[inline]
+    pub(crate) fn axis(g: usize, x: f64) -> (usize, f64) {
+        let p = clamp01(x) * (g - 1) as f64;
+        // `p` is in `0..=g-1` (clamped above), so truncation is the floor;
+        // `f64::floor` is a libm call on baseline x86-64 (no SSE4.1
+        // `roundsd`), the cast is one `cvttsd2si`.
+        let i0 = (p as usize).min(g - 1);
+        (i0, p - i0 as f64)
+    }
+
+    /// Grid points along input `i`.
+    pub(crate) fn points(&self, i: usize) -> usize {
+        self.grid[i]
+    }
+
     pub(crate) fn eval(&self, x: &[f64], out: &mut [f64; 16]) {
+        // Kept as its own body, not routed through `eval_axes`: building the
+        // 16-entry axis array first cost the 4-input grid path +11.8% Ir
+        // (fog16) and the grid builds +1.5%.
         let n = self.grid.len();
         let mut base = [0usize; 16];
         let mut frac = [0.0f64; 16];
         let mut step = [0usize; 16];
         for i in 0..n {
             let g = self.grid[i];
-            let p = clamp01(x[i]) * (g - 1) as f64;
-            // `p` is in `0..=g-1` (clamped above), so truncation is the
-            // floor; `f64::floor` is a libm call on baseline x86-64 (no
-            // SSE4.1 `roundsd`), the cast is one `cvttsd2si`.
-            let i0 = (p as usize).min(g - 1);
-            let f = p - i0 as f64;
+            let (i0, f) = Self::axis(g, x[i]);
             base[i] = i0 * self.strides[i];
             frac[i] = f;
             step[i] = if i0 + 1 < g { self.strides[i] } else { 0 };
         }
         let origin: usize = base[..n].iter().sum();
+        self.interp(n, 0, origin, &frac, &step, out);
+    }
+
+    /// `eval` with every input's `(cell, fraction)` already known (from
+    /// [`ClutEval::axis`], e.g. tabulated per 8-bit input value).
+    pub(crate) fn eval_axes(&self, axes: &[(usize, f64); 16], out: &mut [f64; 16]) {
+        let n = self.grid.len();
+        let mut frac = [0.0f64; 16];
+        let mut step = [0usize; 16];
+        let mut origin = 0usize;
+        for i in 0..n {
+            let (i0, f) = axes[i];
+            origin += i0 * self.strides[i];
+            frac[i] = f;
+            step[i] = if i0 + 1 < self.grid[i] { self.strides[i] } else { 0 };
+        }
         // Straight into the caller's array: the old scratch + runtime-length
         // `copy_from_slice` was a `memcpy` call per lookup.
         self.interp(n, 0, origin, &frac, &step, out);
@@ -678,6 +708,28 @@ mod tests {
         assert!((out[0] - 0.3).abs() < 1e-6);
         assert!((out[1] - (0.355 + 0.0125)).abs() < 1e-6);
         assert!((out[2] - 0.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn eval_axes_matches_eval_bit_for_bit() {
+        // The tabulated 8-bit path must give exactly what `eval` gives.
+        let g = 17usize;
+        let data: Vec<f32> = (0..g * g * g * 3)
+            .map(|i| ((i * 7919) % 1000) as f32 / 999.0)
+            .collect();
+        let c = ClutEval::from_f32(vec![g; 3], 3, data);
+        for &(r, gg, b) in &[(0u8, 0u8, 0u8), (255, 128, 1), (17, 200, 99), (64, 64, 255)] {
+            let x = [r, gg, b].map(|v| f64::from(v) / 255.0);
+            let mut a = [0.0; 16];
+            c.eval(&x, &mut a);
+            let mut axes = [(0usize, 0.0f64); 16];
+            for i in 0..3 {
+                axes[i] = ClutEval::axis(g, x[i]);
+            }
+            let mut b2 = [0.0; 16];
+            c.eval_axes(&axes, &mut b2);
+            assert_eq!(a.map(f64::to_bits), b2.map(f64::to_bits));
+        }
     }
 
     #[test]
