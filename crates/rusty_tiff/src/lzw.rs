@@ -21,31 +21,49 @@ struct BitReader<'a> {
 }
 
 impl BitReader<'_> {
-    /// Next `width`-bit code, or `None` at end of data.
+    /// Next `width`-bit code (9..=12), or `None` at end of data.
+    ///
+    /// The accumulator holds `nbits` unread bits (MSB-first: the low
+    /// `nbits` bits; LSB-first: the low bits, consumed from the bottom).
+    /// It is refilled 32 bits at a time while four bytes remain, so a code
+    /// costs one test and one shift instead of a loop over bytes.
     #[inline]
     fn read(&mut self, width: u32) -> Option<u16> {
-        while self.nbits < width {
-            let b = *self.data.get(self.pos)?;
-            self.pos += 1;
-            if self.msb {
-                self.acc = (self.acc << 8) | u64::from(b);
+        if self.nbits < width {
+            if let Some(w) = self.data.get(self.pos..self.pos + 4) {
+                let w: [u8; 4] = w.try_into().unwrap();
+                if self.msb {
+                    self.acc = (self.acc << 32) | u64::from(u32::from_be_bytes(w));
+                } else {
+                    self.acc |= u64::from(u32::from_le_bytes(w)) << self.nbits;
+                }
+                self.pos += 4;
+                self.nbits += 32;
             } else {
-                self.acc |= u64::from(b) << self.nbits;
+                while self.nbits < width {
+                    let b = *self.data.get(self.pos)?;
+                    self.pos += 1;
+                    if self.msb {
+                        self.acc = (self.acc << 8) | u64::from(b);
+                    } else {
+                        self.acc |= u64::from(b) << self.nbits;
+                    }
+                    self.nbits += 8;
+                }
             }
-            self.nbits += 8;
         }
         let mask = (1u64 << width) - 1;
+        self.nbits -= width;
         let code = if self.msb {
-            (self.acc >> (self.nbits - width)) & mask
+            // Bits above `nbits + width` are already consumed: masking the
+            // code is enough, the accumulator never needs clearing (it holds
+            // at most 31 + 32 bits, so the shift never overflows).
+            (self.acc >> self.nbits) & mask
         } else {
             let c = self.acc & mask;
             self.acc >>= width;
             c
         };
-        self.nbits -= width;
-        if self.msb {
-            self.acc &= (1u64 << self.nbits) - 1;
-        }
         Some(code as u16)
     }
 }
@@ -59,11 +77,6 @@ pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
     Ok(())
 }
 
-/// Strings this long or shorter are copied byte by byte; longer ones with
-/// one `extend_from_within` (a runtime-length memcpy call costs more than a
-/// few bytes).
-const INLINE_COPY: usize = 8;
-
 /// Decode a TIFF LZW strip/tile, appending exactly `n` bytes to `out`.
 ///
 /// Every code's string is, by construction, an earlier stretch of this same
@@ -73,13 +86,23 @@ const INLINE_COPY: usize = 8;
 /// walked back to front one byte at a time, each code records where it was
 /// first emitted and how long it is, and emitting it is a copy from there.
 ///
+/// The output is sized once (one zero-fill, about one instruction a byte)
+/// and written by index: a `Vec::push` per byte, with its capacity check and
+/// length update, measured several times that.
+///
 /// Old-style (LSB-first) data is detected the way libtiff does it: a first
 /// byte of 0 with the low bit of the second byte set.
 pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffResult<()> {
+    let base = out.len();
     out.try_reserve_exact(n)
         .map_err(|_| TiffError::limits(format!("cannot allocate {n} bytes")))?;
-    let base = out.len();
-    let target = base + n;
+    out.resize(base + n, 0);
+    decode_into(data, &mut out[base..])
+}
+
+/// Decode into `out`, which must be filled exactly.
+fn decode_into(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
+    let n = out.len();
     let old_style = data.len() >= 2 && data[0] == 0 && (data[1] & 1) != 0;
     let mut br = BitReader {
         data,
@@ -88,60 +111,66 @@ pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffRes
         nbits: 0,
         msb: !old_style,
     };
-    // Per code >= 258: absolute start of its first emission in `out`, and
-    // its length. Codes < 256 are their own byte.
-    let mut start = vec![0usize; MAX_CODES];
+    // Per code >= 258: start of its first emission in `out`, and its length.
+    let mut start = vec![0u32; MAX_CODES];
     let mut len = vec![0u16; MAX_CODES];
     let early = u16::from(!old_style);
     let mut width = 9u32;
     let mut next = FIRST;
-    // The previous code's emission: (code, start, length).
-    let mut prev: Option<(u16, usize, u16)> = None;
+    let mut limit = (1u16 << width) - early;
+    // The previous code's emission: start and length (0 = no previous code).
+    let (mut pstart, mut plen) = (0usize, 0u16);
+    let mut pos = 0usize;
 
-    while out.len() < target {
+    while pos < n {
         let Some(code) = br.read(width) else {
             return Err(TiffError::format(format!(
-                "LZW data ended after {} of {n} bytes",
-                out.len() - base
+                "LZW data ended after {pos} of {n} bytes"
             )));
         };
         if code == CLEAR {
             width = 9;
             next = FIRST;
-            prev = None;
+            limit = (1u16 << width) - early;
+            plen = 0;
             continue;
         }
         if code == EOI {
             return Err(TiffError::format(format!(
-                "LZW end-of-information after {} of {n} bytes",
-                out.len() - base
+                "LZW end-of-information after {pos} of {n} bytes"
             )));
         }
-        let at = out.len();
-        let Some((_, pstart, plen)) = prev else {
+        if plen == 0 {
             // First code after a clear (or at the start): must be a literal.
             if code > 255 {
                 return Err(TiffError::format("LZW: non-literal code after clear"));
             }
-            out.push(code as u8);
-            prev = Some((code, at, 1));
+            out[pos] = code as u8;
+            (pstart, plen) = (pos, 1);
+            pos += 1;
             continue;
-        };
-        let room = target - at;
+        }
+        let at = pos;
+        let room = n - at;
         let elen: u16 = if code < 256 {
-            out.push(code as u8);
+            out[pos] = code as u8;
+            pos += 1;
             1
         } else if code < next {
-            let (s0, l) = (start[code as usize], len[code as usize]);
-            copy_back(out, s0, usize::from(l).min(room));
+            let (s0, l) = (start[code as usize] as usize, len[code as usize]);
+            let take = usize::from(l).min(room);
+            copy_back(out, s0, at, take);
+            pos += take;
             l
         } else if code == next && (next as usize) < MAX_CODES {
             // KwKwK: the string is prev + first(prev).
             let l = usize::from(plen);
-            copy_back(out, pstart, l.min(room));
+            let take = l.min(room);
+            copy_back(out, pstart, at, take);
+            pos += take;
             if l < room {
-                let b = out[pstart];
-                out.push(b);
+                out[pos] = out[pstart];
+                pos += 1;
             }
             plen.saturating_add(1)
         } else {
@@ -149,29 +178,32 @@ pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffRes
         };
         // Add prev + first(this string): plen + 1 bytes from prev's start.
         if (next as usize) < MAX_CODES {
-            start[next as usize] = pstart;
+            start[next as usize] = pstart as u32;
             len[next as usize] = plen.saturating_add(1);
             next += 1;
-            if width < 12 && next >= (1u16 << width) - early {
+            if width < 12 && next >= limit {
                 width += 1;
+                limit = (1u16 << width) - early;
             }
         }
-        prev = Some((code, at, elen));
+        (pstart, plen) = (at, elen);
     }
-    out.truncate(target);
     Ok(())
 }
 
-/// Append `l` bytes copied from `out[from..]` (always fully before the end).
+/// Copy `l` bytes from `out[from..]` to `out[at..]`; the source lies wholly
+/// before `at`, so the two never overlap.
 #[inline]
-fn copy_back(out: &mut Vec<u8>, from: usize, l: usize) {
-    if l <= INLINE_COPY {
-        for k in 0..l {
-            let b = out[from + k];
-            out.push(b);
+fn copy_back(out: &mut [u8], from: usize, at: usize, l: usize) {
+    let (done, rest) = out.split_at_mut(at);
+    let src = &done[from..from + l];
+    let dst = &mut rest[..l];
+    if l <= 16 {
+        for (d, s) in dst.iter_mut().zip(src) {
+            *d = *s;
         }
     } else {
-        out.extend_from_within(from..from + l);
+        dst.copy_from_slice(src);
     }
 }
 
