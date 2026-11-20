@@ -132,7 +132,7 @@ fn decode_into(data: &[u8], out: &mut [u8]) -> TiffResult<usize> {
 
     while pos < n {
         let Some(code) = br.read(width) else {
-            return Ok(pos);
+            return Ok(ended(out, pos));
         };
         if code == CLEAR {
             width = 9;
@@ -142,7 +142,7 @@ fn decode_into(data: &[u8], out: &mut [u8]) -> TiffResult<usize> {
             continue;
         }
         if code == EOI {
-            return Ok(pos);
+            return Ok(ended(out, pos));
         }
         if plen == 0 {
             // First code after a clear (or at the start): must be a literal.
@@ -195,11 +195,27 @@ fn decode_into(data: &[u8], out: &mut [u8]) -> TiffResult<usize> {
     Ok(n)
 }
 
+/// A strip that ends at `pos` short of `out.len()`: clear the up to 15
+/// bytes an overcopy may have written past it, so the rest reads as zero.
+#[cold]
+fn ended(out: &mut [u8], pos: usize) -> usize {
+    let n = out.len();
+    out[pos..n.min(pos + 16)].fill(0);
+    pos
+}
+
 /// Copy `l` bytes from `out[from..]` to `out[at..]`; the source lies wholly
 /// before `at`, so the two never overlap.
 #[inline]
 fn copy_back(out: &mut [u8], from: usize, at: usize, l: usize) {
     let (done, rest) = out.split_at_mut(at);
+    if l <= 16 && from + 16 <= at && rest.len() >= 16 {
+        // Overcopy: one constant 16-byte copy. The bytes past `l` land on
+        // output the next codes overwrite (decode_into re-zeroes them if
+        // the strip ends early, so a short strip still reads as zeros).
+        rest[..16].copy_from_slice(&done[from..from + 16]);
+        return;
+    }
     let src = &done[from..from + l];
     let dst = &mut rest[..l];
     if l <= 16 {
@@ -261,8 +277,10 @@ const KEY_BITS: u32 = 20;
 /// reads as empty. The slots are refilled only when the generation counter
 /// wraps, once every 4095 clears.
 pub(crate) struct LzwEncoder {
-    keys: Vec<u32>,
-    vals: Vec<u16>,
+    // Fixed-size tables: a probe index is masked to `HSIZE - 1`, so with the
+    // length in the type the bounds check on every probe disappears.
+    keys: Box<[u32; HSIZE]>,
+    vals: Box<[u16; HSIZE]>,
     /// Current generation, `1..(1 << (32 - KEY_BITS))`; 0 marks a slot
     /// never written since the last refill.
     gen: u32,
@@ -271,8 +289,8 @@ pub(crate) struct LzwEncoder {
 impl LzwEncoder {
     pub(crate) fn new() -> Self {
         Self {
-            keys: vec![0; HSIZE],
-            vals: vec![0; HSIZE],
+            keys: vec![0u32; HSIZE].into_boxed_slice().try_into().unwrap(),
+            vals: vec![0u16; HSIZE].into_boxed_slice().try_into().unwrap(),
             gen: 0,
         }
     }
