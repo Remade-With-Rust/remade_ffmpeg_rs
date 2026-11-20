@@ -115,6 +115,17 @@ pub fn decode_with_meta(data: &[u8]) -> Result<(Image, Meta)> {
     let standard = a1 == "-Y" && a2 == "+X";
     for s in 0..lines {
         read_scanline(&mut r, &mut scan)?;
+        if standard {
+            // Scanline s is output row s: one row slice, fixed 12-byte stores.
+            let row = &mut img.pixels[s * len * 12..(s + 1) * len * 12];
+            for (d, px) in row.chunks_exact_mut(12).zip(&scan) {
+                let f = to_f32([px[0], px[1], px[2]], px[3]);
+                d[0..4].copy_from_slice(&f[0].to_ne_bytes());
+                d[4..8].copy_from_slice(&f[1].to_ne_bytes());
+                d[8..12].copy_from_slice(&f[2].to_ne_bytes());
+            }
+            continue;
+        }
         for (p, px) in scan.iter().enumerate() {
             let (x, y) = if transposed {
                 (
@@ -127,11 +138,7 @@ pub fn decode_with_meta(data: &[u8]) -> Result<(Image, Meta)> {
                     if a1 == "-Y" { s } else { lines - 1 - s },
                 )
             };
-            let o = if standard {
-                (s * len + p) * 12
-            } else {
-                (y * width as usize + x) * 12
-            };
+            let o = (y * width as usize + x) * 12;
             let f = to_f32([px[0], px[1], px[2]], px[3]);
             for (k, v) in f.iter().enumerate() {
                 img.pixels[o + k * 4..o + k * 4 + 4].copy_from_slice(&v.to_ne_bytes());
@@ -204,6 +211,7 @@ fn read_scanline(r: &mut crate::read::Reader, buf: &mut [[u8; 4]]) -> Result<()>
 }
 
 /// Float RGB to RGBE (the standard `frexp` rounding Radiance uses).
+#[inline]
 fn to_rgbe(c: [f32; 3]) -> [u8; 4] {
     let m = c[0].max(c[1]).max(c[2]);
     if m.is_nan() || m <= 1e-32 || !m.is_finite() {
@@ -234,28 +242,30 @@ pub fn encode(image: &Image) -> Result<Vec<u8>> {
         image.height, image.width
     )
     .into_bytes();
-    let floats = image.as_f32().expect("Rgb32F is float");
-    let mut comp = vec![0u8; w];
-    for y in 0..h {
-        let row: Vec<[u8; 4]> = (0..w)
-            .map(|x| {
-                let o = (y * w + x) * 3;
-                to_rgbe([floats[o], floats[o + 1], floats[o + 2]])
-            })
-            .collect();
+    // One reused plane per RGBE component, filled straight from the pixel
+    // bytes: no whole-image float copy, no per-row allocation.
+    let mut planes = [vec![0u8; w], vec![0u8; w], vec![0u8; w], vec![0u8; w]];
+    // Worst case is about one byte of RLE overhead per 128 literal bytes.
+    out.reserve(w * h * 4 + h * (4 + 4 * (w / 128 + 1)));
+    for row in image.pixels.chunks_exact(w * 12) {
+        for (x, px) in row.chunks_exact(12).enumerate() {
+            let f = |k: usize| f32::from_ne_bytes([px[k], px[k + 1], px[k + 2], px[k + 3]]);
+            let e = to_rgbe([f(0), f(4), f(8)]);
+            planes[0][x] = e[0];
+            planes[1][x] = e[1];
+            planes[2][x] = e[2];
+            planes[3][x] = e[3];
+        }
         if !(8..0x8000).contains(&w) {
             // Too short or too long for new-style RLE: flat pixels.
-            for p in &row {
-                out.extend_from_slice(p);
+            for x in 0..w {
+                out.extend_from_slice(&[planes[0][x], planes[1][x], planes[2][x], planes[3][x]]);
             }
             continue;
         }
         out.extend_from_slice(&[2, 2, (w >> 8) as u8, w as u8]);
-        for c in 0..4 {
-            for (d, p) in comp.iter_mut().zip(&row) {
-                *d = p[c];
-            }
-            rle_component(&comp, &mut out);
+        for plane in &planes {
+            rle_component(plane, &mut out);
         }
     }
     Ok(out)
@@ -286,6 +296,13 @@ fn rle_component(v: &[u8], out: &mut Vec<u8>) {
             i += 1;
         }
         out.push((i - start) as u8);
-        out.extend_from_slice(&v[start..i]);
+        if i - start <= 16 {
+            // Short literal runs: inline bytes, not a memcpy call each.
+            for &b in &v[start..i] {
+                out.push(b);
+            }
+        } else {
+            out.extend_from_slice(&v[start..i]);
+        }
     }
 }
