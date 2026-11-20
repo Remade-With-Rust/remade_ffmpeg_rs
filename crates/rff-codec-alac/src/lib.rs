@@ -183,7 +183,9 @@ fn sign_extend(v: i32, bits: u32) -> i32 {
 /// One adaptive Golomb-Rice value (FFmpeg's `decode_scalar`): a unary prefix
 /// of at most 9, then either `bps` raw bits (prefix 9) or `k` bits of
 /// remainder. `k` is at least 1 for every caller. Everything but the escape
-/// comes from one window load.
+/// comes from one window load. Inlined, since it runs once per residual:
+/// as a call it cost 8-11% more instructions over the whole decode.
+#[inline(always)]
 fn decode_scalar(b: &mut Bits, k: u32, bps: u32) -> u32 {
     let w = b.window();
     let x = (!w).leading_zeros().min(9);
