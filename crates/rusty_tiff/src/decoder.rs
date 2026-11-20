@@ -1196,7 +1196,9 @@ fn decode_strips<R: Read + Seek>(
                         &mut chunk,
                     )?;
                     // `chunks_exact` fixes the length, so this converts with
-                    // no fallible path and vectorises.
+                    // no fallible path and vectorises. (A resize + memcpy
+                    // through a bytemuck byte view measured worse: +8.8M Ir
+                    // and 0.19 -> 0.21 s wall on 16-bit uncompressed.)
                     out.extend(
                         chunk
                             .chunks_exact(<$t>::N)
