@@ -182,7 +182,14 @@ pub(crate) fn clamp01(v: f64) -> f64 {
 
 fn pow_pos(base: f64, e: f64) -> f64 {
     if base > 0.0 {
-        base.powf(e)
+        // Identity curves (`para` gamma 1.0 is how v4 profiles, including
+        // the Lab identity, spell "no curve") would otherwise pay a libm
+        // `pow` per channel per colour; `pow(x, 1.0) == x` exactly.
+        if e == 1.0 {
+            base
+        } else {
+            base.powf(e)
+        }
     } else {
         0.0
     }
