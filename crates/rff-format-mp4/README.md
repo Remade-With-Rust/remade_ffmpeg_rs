@@ -23,7 +23,20 @@ The **MP4 / QuickTime MOV (ISOBMFF)** container demuxer and muxers for
   refuses PCM, as most MP4 players cannot play it.
 - **Descriptive boxes**, read and written: `colr` (`nclc`/`nclx`), `pasp`,
   `clap`, `mdcv`, `clli`, and the QuickTime **timecode track** (`tmcd` +
-  `tref`), surfaced as the video stream's start `timecode`.
+  `tref`), surfaced as the video stream's start `timecode`; the `tkhd`
+  matrix (rotation, `Stream::display_matrix`), `mdhd` language and `fiel`.
+- **Editing**: the stored sample table and the edit list through
+  `SampleIndex` (`raw_sample_info`, `edit_list`), caller edit lists, and a
+  configurable movie time scale (`set_option("movie_timescale", "48000")`),
+  so sample-exact trims such as AAC priming and padding round-trip.
+- **Metadata**: `set_metadata` writes `udta` (`meta/ilst` in `mp4`,
+  QuickTime text atoms in `mov`, `creation_time` in `mvhd`);
+  `Demuxer::metadata` reads them back, plus `meta/keys`.
+- **Faststart** (`movflags=+faststart`): the file muxer spools samples to a
+  temporary file and writes `moov` first; `faststart_in_place` rewrites an
+  existing file through any `Read + Write + Seek` with bounded memory.
+- Rates of 65,536 Hz and more are written exactly (`srat` in ISO files, a v2
+  sound description in MOV), and offsets stay 64-bit on 32-bit targets.
 - Pure Rust, no C/FFI.
 
 ## Usage
