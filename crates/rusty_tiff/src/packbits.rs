@@ -20,7 +20,10 @@ const INLINE_RUN: usize = 16;
 /// Append exactly `n` decoded bytes to `out`; extra input is ignored.
 /// Nothing is zero-filled first, and `out` grows by at most `n`. (Writing
 /// by index into a zero-filled buffer instead measured +4.5% on 16-bit and
-/// +17% on 8-bit: this appends straight into the image.)
+/// +17% on 8-bit: this appends straight into the image. A second version
+/// with constant 16-byte over-copies/over-stores for short packets won 6%
+/// wall on the repeat-2 16-bit fixture but lost 12% wall on the 8-bit photo,
+/// whose long literals then cost a zero-fill pass plus a copy.)
 pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffResult<()> {
     out.try_reserve_exact(n)
         .map_err(|_| TiffError::limits(format!("cannot allocate {n} bytes")))?;
