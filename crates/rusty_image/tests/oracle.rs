@@ -1041,7 +1041,17 @@ fn probe_matches_imagesize() {
     let (mut agree, mut differ) = (0, Vec::new());
     for (name, b) in &files {
         let ours = rusty_image::probe(b).map(|(_, w, h)| (w as usize, h as usize));
-        let theirs = imagesize::blob_size(b).ok().map(|s| (s.width, s.height));
+        // imagesize has no answer for PAM (P7): the reference there is the
+        // size a full decode produces. (Both used to say None: our probe
+        // UTF-8-checked binary pixels after ENDHDR.)
+        let theirs = imagesize::blob_size(b)
+            .ok()
+            .map(|s| (s.width, s.height))
+            .or_else(|| {
+                rusty_image::decode(b)
+                    .ok()
+                    .map(|i| (i.width as usize, i.height as usize))
+            });
         if ours == theirs {
             agree += 1;
         } else {
@@ -1076,4 +1086,17 @@ fn hostile_dimensions_error_before_allocating() {
     assert!(rusty_image::decode(&qoi).is_err());
     assert!(rusty_image::decode(b"P5 2147483648 2147483648 255 ").is_err());
     assert!(rusty_image::decode(b"#?RADIANCE\n\n-Y 99999999 +X 99999999\n").is_err());
+}
+
+/// ArtCraft's report: a PAM whose pixels after ENDHDR are not UTF-8 (any
+/// 16-bit PAM) probed as None while decoding fine.
+#[test]
+fn probe_reads_pam_with_binary_pixels() {
+    let mut f =
+        b"P7\nWIDTH 3\nHEIGHT 2\nDEPTH 1\nMAXVAL 65535\nTUPLTYPE GRAYSCALE\nENDHDR\n".to_vec();
+    f.extend((0..6u16).flat_map(|i| (0xff00u16 | i).to_be_bytes()));
+    let (_, w, h) = rusty_image::probe(&f).expect("probe");
+    assert_eq!((w, h), (3, 2));
+    let img = rusty_image::decode(&f).unwrap();
+    assert_eq!((img.width, img.height), (3, 2));
 }

@@ -49,10 +49,32 @@ impl<R: Read + Seek> Stream<R> {
             )));
         }
         let n = usize::try_from(n).map_err(|_| TiffError::limits("read too large"))?;
-        let mut buf = crate::decoder::zeroed::<u8>(n)?;
-        self.inner.seek(SeekFrom::Start(offset))?;
-        self.inner.read_exact(&mut buf)?;
+        let mut buf = Vec::new();
+        self.read_at_into(offset, n, &mut buf)?;
         Ok(buf)
+    }
+
+    /// Append exactly `n` bytes at `offset` to `out`, reading straight into
+    /// its spare capacity: no zero-fill first (the old `zeroed` + `read_exact`
+    /// wrote every byte twice). The caller has range-checked `offset + n`.
+    pub(crate) fn read_at_into(
+        &mut self,
+        offset: u64,
+        n: usize,
+        out: &mut Vec<u8>,
+    ) -> TiffResult<()> {
+        out.try_reserve_exact(n)
+            .map_err(|_| TiffError::limits(format!("cannot allocate {n} bytes")))?;
+        self.inner.seek(SeekFrom::Start(offset))?;
+        let before = out.len();
+        (&mut self.inner).take(n as u64).read_to_end(out)?;
+        if out.len() - before != n {
+            return Err(TiffError::format(format!(
+                "range at {offset} ended after {} of {n} bytes",
+                out.len() - before
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn u16_from(&self, b: &[u8]) -> u16 {
@@ -226,8 +248,11 @@ pub(crate) fn read_ifd<R: Read + Seek>(
             field[..4].copy_from_slice(&e[8..12]);
             u64::from(s.u32_from(&e[4..8]))
         };
-        // First occurrence wins on duplicate tags.
-        entries.entry(tag).or_insert(Entry { ty, count, field });
+        // The last occurrence wins on a duplicate tag, as in the `tiff`
+        // crate: a bit flip that turns one tag number into another's
+        // duplicates the second tag ahead of its real entry (ArtCraft's
+        // case: BitsPerSample 258 -> 259 put Compression 8 before the real 1).
+        entries.insert(tag, Entry { ty, count, field });
     }
     Ok(Ifd {
         offset,

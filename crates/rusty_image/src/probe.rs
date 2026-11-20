@@ -317,7 +317,13 @@ fn hdr(d: &[u8]) -> Option<(u32, u32)> {
 
 fn pnm(d: &[u8]) -> Option<(u32, u32)> {
     if d[1] == b'7' {
-        let text = std::str::from_utf8(d.get(..d.len().min(4096))?).ok()?;
+        // The header is ASCII, but the 4 KiB window can run into binary
+        // pixels after ENDHDR (any 16-bit PAM): read the valid UTF-8 prefix.
+        let head = d.get(..d.len().min(4096))?;
+        let text = match std::str::from_utf8(head) {
+            Ok(t) => t,
+            Err(e) => std::str::from_utf8(&head[..e.valid_up_to()]).ok()?,
+        };
         let (mut w, mut h) = (None, None);
         for l in text.lines().skip(1) {
             let mut it = l.split_whitespace();

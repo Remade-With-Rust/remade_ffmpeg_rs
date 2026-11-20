@@ -600,11 +600,10 @@ fn decode_2d_row(
                 a0 = a2;
             }
             Mode::Vertical(d) => {
-                let a1 = b1 + i64::from(d);
-                if a1 < a0.max(0) {
-                    return err(row, "vertical mode moves left of a0");
-                }
-                let a1 = a1.min(w);
+                // A damaged code can put a1 left of a0; libtiff clamps it to
+                // a0 (a zero-length run) and carries on, so does this. Every
+                // mode consumes bits, so a stuck a0 still terminates.
+                let a1 = (b1 + i64::from(d)).max(a0.max(0)).min(w);
                 push_change(cur, a1 as u32, width);
                 a0 = a1;
                 white = !white;
@@ -615,6 +614,43 @@ fn decode_2d_row(
     Ok(RowEnd::Done)
 }
 
+/// Paint pixels `s..e` of a packed MSB-first row black: a head mask, whole
+/// bytes, a tail mask. Setting one bit per pixel was 55% of a G4 decode.
+#[inline]
+fn paint_span(out: &mut [u8], s: usize, e: usize, black_is_1: bool) {
+    if s >= e {
+        return;
+    }
+    let (sb, eb) = (s >> 3, e >> 3);
+    let head = 0xFFu8 >> (s & 7);
+    // Bits of byte `eb` before `e` (none when `e` is byte-aligned).
+    let tail = !(0xFFu8 >> (e & 7));
+    let apply = |b: &mut u8, m: u8| {
+        if black_is_1 {
+            *b |= m;
+        } else {
+            *b &= !m;
+        }
+    };
+    if sb == eb {
+        apply(&mut out[sb], head & tail);
+        return;
+    }
+    apply(&mut out[sb], head);
+    let fill = if black_is_1 { 0xFF } else { 0 };
+    let mid = &mut out[sb + 1..eb];
+    if mid.len() <= 16 {
+        for b in mid {
+            *b = fill;
+        }
+    } else {
+        mid.fill(fill);
+    }
+    if tail != 0 {
+        apply(&mut out[eb], tail);
+    }
+}
+
 fn render_row(changes: &[u32], width: u32, out: &mut [u8], black_is_1: bool) {
     // White background; padding bits are cleared below so they are always 0.
     out.fill(if black_is_1 { 0 } else { 0xFF });
@@ -622,16 +658,10 @@ fn render_row(changes: &[u32], width: u32, out: &mut [u8], black_is_1: bool) {
     while k < changes.len() {
         let s = changes[k] as usize;
         let e = changes.get(k + 1).map_or(width, |&x| x) as usize;
-        for x in s..e {
-            if black_is_1 {
-                out[x >> 3] |= 0x80 >> (x & 7);
-            } else {
-                out[x >> 3] &= !(0x80 >> (x & 7));
-            }
-        }
+        paint_span(out, s, e, black_is_1);
         k += 2;
     }
-    if !black_is_1 && width % 8 != 0 {
+    if !black_is_1 && !width.is_multiple_of(8) {
         let last = out.len() - 1;
         out[last] &= 0xFFu8 << (8 - width % 8);
     }
@@ -639,6 +669,19 @@ fn render_row(changes: &[u32], width: u32, out: &mut [u8], black_is_1: bool) {
 
 /// Decode with explicit options. Returns packed rows (see the module docs).
 pub fn decode(data: &[u8], opts: &Options) -> Result<Vec<u8>, CcittError> {
+    let mut out = Vec::new();
+    decode_append(data, opts, &mut out)?;
+    Ok(out)
+}
+
+/// [`decode`], appending the rows to `out`: each row is rendered straight
+/// into its place (no per-row buffer copy, and the TIFF decoder needs no
+/// copy of a whole decoded strip into the image).
+pub(crate) fn decode_append(
+    data: &[u8],
+    opts: &Options,
+    out: &mut Vec<u8>,
+) -> Result<(), CcittError> {
     let width = opts.columns;
     if width == 0 || width > 1 << 20 {
         return err(0, format!("unsupported column count {width}"));
@@ -649,13 +692,13 @@ pub fn decode(data: &[u8], opts: &Options) -> Result<Vec<u8>, CcittError> {
             return err(0, "output would exceed max_output_bytes");
         }
     }
-    let mut out = Vec::with_capacity(opts.rows.map_or(0, |r| r as usize * stride));
+    let base = out.len();
+    out.reserve(opts.rows.map_or(0, |r| r as usize * stride));
     let mut b = Bits::new(data);
     let mut reference: Vec<u32> = vec![width; 3];
     let mut cur: Vec<u32> = Vec::new();
     let mut eol_pending = false;
     let mut row: u32 = 0;
-    let mut row_buf = vec![0u8; stride];
 
     loop {
         if let Some(rows) = opts.rows {
@@ -665,7 +708,7 @@ pub fn decode(data: &[u8], opts: &Options) -> Result<Vec<u8>, CcittError> {
         } else if b.rest_is_zero() {
             // Unknown row count: trailing fill (or nothing) ends the image.
             break;
-        } else if out.len() + stride > opts.max_output_bytes {
+        } else if out.len() - base + stride > opts.max_output_bytes {
             return err(row, "output would exceed max_output_bytes");
         }
         let end = match opts.coding {
@@ -751,8 +794,9 @@ pub fn decode(data: &[u8], opts: &Options) -> Result<Vec<u8>, CcittError> {
                 Coding::ModifiedHuffman => return err(row, "EOL in Modified Huffman data"),
             }
         }
-        render_row(&cur, width, &mut row_buf, opts.black_is_1);
-        out.extend_from_slice(&row_buf);
+        let at = out.len();
+        out.resize(at + stride, 0);
+        render_row(&cur, width, &mut out[at..], opts.black_is_1);
         reference.clear();
         reference.extend_from_slice(&cur);
         reference.extend_from_slice(&[width; 3]);
@@ -763,7 +807,7 @@ pub fn decode(data: &[u8], opts: &Options) -> Result<Vec<u8>, CcittError> {
             return err(row, format!("only {row} of {rows} rows present"));
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Decode Group 4 (T.6) data of `width` x `height` pixels. `opts.coding`,
@@ -1010,6 +1054,31 @@ pub fn encode(pixels: &[u8], opts: &Options) -> Result<Vec<u8>, CcittError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paint_span_matches_per_bit() {
+        for width in 1..70usize {
+            let bytes = width.div_ceil(8);
+            for s in 0..=width {
+                for e in s..=width {
+                    for black_is_1 in [true, false] {
+                        let init = if black_is_1 { 0u8 } else { 0xFF };
+                        let mut want = vec![init; bytes];
+                        for x in s..e {
+                            if black_is_1 {
+                                want[x >> 3] |= 0x80 >> (x & 7);
+                            } else {
+                                want[x >> 3] &= !(0x80 >> (x & 7));
+                            }
+                        }
+                        let mut got = vec![init; bytes];
+                        paint_span(&mut got, s, e, black_is_1);
+                        assert_eq!(got, want, "{width} {s} {e} {black_is_1}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn tables_are_prefix_free_and_complete() {

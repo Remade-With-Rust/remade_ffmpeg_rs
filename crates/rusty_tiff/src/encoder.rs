@@ -65,6 +65,16 @@ pub trait TiffSample: Copy + private::Sealed {
     const BYTES: usize;
     /// Append the native-endian bytes.
     fn put_ne(self, out: &mut Vec<u8>);
+    /// The samples as native-endian bytes: borrowed for byte samples,
+    /// converted in one sized pass otherwise.
+    #[doc(hidden)]
+    fn ne_bytes(src: &[Self]) -> std::borrow::Cow<'_, [u8]> {
+        let mut out = Vec::with_capacity(src.len() * Self::BYTES);
+        for &s in src {
+            s.put_ne(&mut out);
+        }
+        std::borrow::Cow::Owned(out)
+    }
 }
 
 mod private {
@@ -80,10 +90,29 @@ macro_rules! sample_impl {
             fn put_ne(self, out: &mut Vec<u8>) {
                 out.extend_from_slice(&self.to_ne_bytes());
             }
+            /// Borrowed: every sample type here is plain old data, so the
+            /// native-endian bytes are the slice's own memory.
+            #[inline]
+            fn ne_bytes(src: &[Self]) -> std::borrow::Cow<'_, [u8]> {
+                std::borrow::Cow::Borrowed(bytemuck::cast_slice(src))
+            }
         }
     )*};
 }
-sample_impl!(u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
+sample_impl!(i8, u16, i16, u32, i32, u64, i64, f32, f64);
+
+impl private::Sealed for u8 {}
+impl TiffSample for u8 {
+    const BYTES: usize = 1;
+    #[inline]
+    fn put_ne(self, out: &mut Vec<u8>) {
+        out.push(self);
+    }
+    #[inline]
+    fn ne_bytes(src: &[Self]) -> std::borrow::Cow<'_, [u8]> {
+        std::borrow::Cow::Borrowed(src)
+    }
+}
 
 /// A pixel layout the encoder writes. See [`colortype`] for the provided ones.
 pub trait ColorType {
@@ -413,7 +442,16 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
         self
     }
 
-    /// Rows per strip (default: about 8 KiB per strip).
+    /// Rows per strip (default: about 8 KiB per strip, libtiff's convention,
+    /// which keeps a reader's working set small).
+    ///
+    /// Each strip is compressed on its own, so with Deflate (and to a lesser
+    /// degree LZW) small strips cost size: every strip restarts the
+    /// compressor's history. On a 1024x1024 RGB8 photo at level 6, 8 KiB
+    /// strips came out 38% larger than ~1 MB strips (the `tiff` crate's
+    /// default), and LZW about 3% larger. For smaller Deflate files, ask for
+    /// bigger strips, e.g. `rows_per_strip((1 << 20) / row_bytes)`; a reader
+    /// then needs a buffer of that size per strip.
     pub fn rows_per_strip(&mut self, rows: u32) {
         self.rows_per_strip = Some(rows.max(1));
         self.tiles = None;
@@ -486,11 +524,10 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
         if C::PHOTOMETRIC == photometric::PALETTE && !self.tags.contains_key(&320) {
             return Err(TiffError::usage("palette image without a colormap"));
         }
-        let mut native = Vec::with_capacity(data.len() * C::Inner::BYTES);
-        for &s in data {
-            s.put_ne(&mut native);
-        }
         let planar = self.planar && spp > 1;
+        // Samples of every type are viewed in place as native-endian bytes
+        // (no conversion pass, no image-sized copy).
+        let native = C::Inner::ne_bytes(data);
         let spp_chunk = if planar { 1 } else { spp };
         let (tiled, cw, ch) = if let Some((tw, th)) = self.tiles {
             (true, tw, th)
@@ -508,73 +545,118 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
         let bytes = usize::from(bits) / 8;
         let mut offsets = Vec::new();
         let mut counts = Vec::new();
+        // One chunk buffer, one PackBits output and one LZW table for every
+        // strip or tile, instead of a fresh allocation (and, for LZW, a
+        // fresh 64 KB table fill) per chunk.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut packed: Vec<u8> = Vec::new();
+        let mut lzw_enc: Option<lzw::LzwEncoder> = None;
+        let mut zlib_enc: Option<deflate::DeflateEncoder> = None;
+        // The predictor (and a big-endian byte swap) rewrite the chunk, so
+        // they need it in `buf`; otherwise a full-width strip can be handed
+        // to the codec straight from the input.
+        let rewrites = !matches!(self.predictor, Predictor::None)
+            || (cfg!(target_endian = "big") && bits >= 16);
         for plane in 0..planes {
             for cy in 0..down {
                 for cx in 0..across {
                     let y0 = cy * ch;
                     let x0 = cx * cw;
                     let rows = if tiled { ch } else { ch.min(h - y0) };
-                    let mut buf = vec![0u8; chunk_row * rows as usize];
-                    let vrows = rows.min(h - y0) as usize;
-                    let vcols = cw.min(w - x0) as usize;
-                    for r in 0..vrows {
-                        let src = &native[(y0 as usize + r) * full_row..][..full_row];
-                        let dst = &mut buf[r * chunk_row..][..chunk_row];
-                        if bits < 8 {
-                            let n = if planar {
-                                vcols
-                            } else {
-                                vcols * usize::from(spp)
-                            };
-                            for i in 0..n {
-                                let sbit = if planar {
-                                    ((x0 as usize + i) * usize::from(spp) + plane as usize)
-                                        * usize::from(bits)
-                                } else {
-                                    (x0 as usize * usize::from(spp) + i) * usize::from(bits)
-                                };
-                                let v = get_bits(src, sbit, usize::from(bits));
-                                set_bits(dst, i * usize::from(bits), usize::from(bits), v);
-                            }
-                        } else if planar {
-                            for i in 0..vcols {
-                                let s =
-                                    ((x0 as usize + i) * usize::from(spp) + plane as usize) * bytes;
-                                dst[i * bytes..][..bytes].copy_from_slice(&src[s..s + bytes]);
-                            }
+                    let len = chunk_row * rows as usize;
+                    // A whole-width strip of byte-aligned interleaved samples
+                    // is one contiguous stretch of the input.
+                    let contiguous =
+                        !tiled && !planar && bits >= 8 && x0 == 0 && cw == w && y0 + rows <= h;
+                    let chunk: &[u8] = if contiguous && !rewrites {
+                        &native[y0 as usize * full_row..][..len]
+                    } else {
+                        buf.clear();
+                        if contiguous {
+                            buf.extend_from_slice(&native[y0 as usize * full_row..][..len]);
                         } else {
-                            let s = x0 as usize * usize::from(spp) * bytes;
-                            let n = vcols * usize::from(spp) * bytes;
-                            dst[..n].copy_from_slice(&src[s..s + n]);
-                        }
-                    }
-                    let sppc = usize::from(spp_chunk);
-                    match self.predictor {
-                        Predictor::Horizontal => {
-                            predictor::apply_horizontal(&mut buf, chunk_row, sppc, bytes);
-                            if cfg!(target_endian = "big") {
-                                predictor::swap_bytes(&mut buf, bytes);
+                            // Tiles and planes: padding must read as zero.
+                            buf.resize(len, 0);
+                            let vrows = rows.min(h - y0) as usize;
+                            let vcols = cw.min(w - x0) as usize;
+                            for r in 0..vrows {
+                                let src = &native[(y0 as usize + r) * full_row..][..full_row];
+                                let dst = &mut buf[r * chunk_row..][..chunk_row];
+                                if bits < 8 {
+                                    let n = if planar {
+                                        vcols
+                                    } else {
+                                        vcols * usize::from(spp)
+                                    };
+                                    for i in 0..n {
+                                        let sbit = if planar {
+                                            ((x0 as usize + i) * usize::from(spp) + plane as usize)
+                                                * usize::from(bits)
+                                        } else {
+                                            (x0 as usize * usize::from(spp) + i) * usize::from(bits)
+                                        };
+                                        let v = get_bits(src, sbit, usize::from(bits));
+                                        set_bits(dst, i * usize::from(bits), usize::from(bits), v);
+                                    }
+                                } else if planar {
+                                    for i in 0..vcols {
+                                        let s = ((x0 as usize + i) * usize::from(spp)
+                                            + plane as usize)
+                                            * bytes;
+                                        dst[i * bytes..][..bytes]
+                                            .copy_from_slice(&src[s..s + bytes]);
+                                    }
+                                } else {
+                                    let s = x0 as usize * usize::from(spp) * bytes;
+                                    let n = vcols * usize::from(spp) * bytes;
+                                    dst[..n].copy_from_slice(&src[s..s + n]);
+                                }
                             }
                         }
-                        Predictor::FloatingPoint => {
-                            predictor::apply_float(&mut buf, chunk_row, sppc, bytes);
-                        }
-                        Predictor::None => {
-                            if cfg!(target_endian = "big") && bits >= 16 {
-                                predictor::swap_bytes(&mut buf, bytes);
+                        let sppc = usize::from(spp_chunk);
+                        match self.predictor {
+                            Predictor::Horizontal => {
+                                predictor::apply_horizontal(&mut buf, chunk_row, sppc, bytes);
+                                if cfg!(target_endian = "big") {
+                                    predictor::swap_bytes(&mut buf, bytes);
+                                }
+                            }
+                            Predictor::FloatingPoint => {
+                                predictor::apply_float(&mut buf, chunk_row, sppc, bytes);
+                            }
+                            Predictor::None => {
+                                if cfg!(target_endian = "big") && bits >= 16 {
+                                    predictor::swap_bytes(&mut buf, bytes);
+                                }
                             }
                         }
-                    }
-                    let coded = match comp {
-                        Compression::None => buf,
-                        Compression::Lzw => lzw::encode(&buf),
-                        Compression::Deflate(level) => deflate::encode(&buf, u32::from(level)),
+                        &buf
+                    };
+                    let lzw_out;
+                    let other_out;
+                    let coded: &[u8] = match comp {
+                        Compression::None => chunk,
+                        Compression::Lzw => {
+                            lzw_out = lzw_enc
+                                .get_or_insert_with(lzw::LzwEncoder::new)
+                                .encode(chunk);
+                            &lzw_out
+                        }
+                        Compression::Deflate(level) => {
+                            other_out = zlib_enc
+                                .get_or_insert_with(|| {
+                                    deflate::DeflateEncoder::new(u32::from(level))
+                                })
+                                .encode(chunk);
+                            &other_out
+                        }
                         Compression::PackBits => {
-                            let mut o = Vec::with_capacity(buf.len() + buf.len() / 64 + 8);
-                            for row in buf.chunks(chunk_row.max(1)) {
-                                packbits::encode_row(row, &mut o);
+                            packed.clear();
+                            packed.reserve(chunk.len() + chunk.len() / 64 + 8);
+                            for row in chunk.chunks(chunk_row.max(1)) {
+                                packbits::encode_row(row, &mut packed);
                             }
-                            o
+                            &packed
                         }
                         Compression::Fax3 | Compression::Fax4 => {
                             let coding = if comp == Compression::Fax4 {
@@ -583,12 +665,13 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
                                 ccitt::Coding::Group3_1D
                             };
                             let o = ccitt::Options::new(coding, cw).with_rows(rows);
-                            ccitt::encode(&buf, &o)?
+                            other_out = ccitt::encode(chunk, &o)?;
+                            &other_out
                         }
                     };
                     let off = self.enc.pos()?;
                     self.enc.check_offset(off + coded.len() as u64)?;
-                    self.enc.w.write_all(&coded)?;
+                    self.enc.w.write_all(coded)?;
                     offsets.push(off);
                     counts.push(coded.len() as u64);
                 }

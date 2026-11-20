@@ -5923,6 +5923,7 @@ dependencies = [
 name = "rusty_tiff"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "fax",
  "flate2",
  "rusty_alloc-api",

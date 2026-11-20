@@ -22,6 +22,11 @@ default = ["jpeg"]
 jpeg = ["dep:rusty_jpeg"]
 
 [dependencies]
+# Safe zero-copy views of sample slices as bytes (`cast_slice`): the encoder
+# writes u16..f64 samples without a conversion pass, as libtiff and the
+# `tiff` crate do with raw casts. Pure Rust; this crate stays
+# `#![forbid(unsafe_code)]`.
+bytemuck = "1"
 # DEFLATE (compression 8 and 32946) through flate2's PURE-RUST zlib-rs backend,
 # the same backend rusty_png ships by default. No C zlib anywhere.
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }

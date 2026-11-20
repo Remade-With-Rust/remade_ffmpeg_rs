@@ -3,36 +3,74 @@
 use crate::error::{TiffError, TiffResult};
 
 /// Decode into `out`, which must be filled exactly; extra input is ignored.
+#[cfg(test)]
 pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
+    let mut v = Vec::new();
+    decode_append(data, &mut v, out.len())?;
+    out.copy_from_slice(&v);
+    Ok(())
+}
+
+/// Runs this long or shorter are written byte by byte: TIFF PackBits data
+/// is mostly short runs (16-bit samples give 2-3 byte runs), and a libc
+/// `memset`/`memcpy` call per run cost more than the bytes (4.6 M memset
+/// calls at 22 instructions each on one 16-bit 1.5 Mpx image).
+const INLINE_RUN: usize = 16;
+
+/// Append exactly `n` decoded bytes to `out`; extra input is ignored.
+/// Nothing is zero-filled first, and `out` grows by at most `n`. (Writing
+/// by index into a zero-filled buffer instead measured +4.5% on 16-bit and
+/// +17% on 8-bit: this appends straight into the image. A second version
+/// with constant 16-byte over-copies/over-stores for short packets won 6%
+/// wall on the repeat-2 16-bit fixture but lost 12% wall on the 8-bit photo,
+/// whose long literals then cost a zero-fill pass plus a copy.)
+pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffResult<()> {
+    out.try_reserve_exact(n)
+        .map_err(|_| TiffError::limits(format!("cannot allocate {n} bytes")))?;
+    let target = out.len() + n;
     let mut i = 0usize;
-    let mut pos = 0usize;
-    while pos < out.len() {
+    // A strip whose data runs out early keeps what it decoded and is
+    // zero-filled to length, as the `tiff` crate does (damaged files often
+    // lose a strip's last byte or two).
+    while out.len() < target {
         let Some(&h) = data.get(i) else {
-            return Err(TiffError::format(format!(
-                "PackBits data ended after {pos} of {} bytes",
-                out.len()
-            )));
+            out.resize(target, 0);
+            return Ok(());
         };
         i += 1;
         let h = h as i8;
         if h >= 0 {
-            let n = h as usize + 1;
-            let src = data
-                .get(i..i + n)
-                .ok_or_else(|| TiffError::format("PackBits literal run past end of data"))?;
-            let take = n.min(out.len() - pos);
-            out[pos..pos + take].copy_from_slice(&src[..take]);
-            pos += take;
-            i += n;
+            let run = h as usize + 1;
+            // A literal cut off by the end of the data copies what is there.
+            let src = &data[i..data.len().min(i + run)];
+            let take = src.len().min(target - out.len());
+            if take <= INLINE_RUN {
+                for &b in &src[..take] {
+                    out.push(b);
+                }
+            } else {
+                out.extend_from_slice(&src[..take]);
+            }
+            i += run;
         } else if h != -128 {
-            let n = (1 - i32::from(h)) as usize;
-            let &b = data
-                .get(i)
-                .ok_or_else(|| TiffError::format("PackBits repeat past end of data"))?;
+            let run = (1 - i32::from(h)) as usize;
+            let Some(&b) = data.get(i) else {
+                out.resize(target, 0);
+                return Ok(());
+            };
             i += 1;
-            let take = n.min(out.len() - pos);
-            out[pos..pos + take].fill(b);
-            pos += take;
+            let take = run.min(target - out.len());
+            if take == 2 {
+                // The commonest repeat on 16-bit data: one fixed 2-byte
+                // append instead of two pushes.
+                out.extend_from_slice(&[b, b]);
+            } else if take <= INLINE_RUN {
+                for _ in 0..take {
+                    out.push(b);
+                }
+            } else {
+                out.resize(out.len() + take, b);
+            }
         }
     }
     Ok(())
@@ -45,33 +83,105 @@ pub(crate) fn encode_row(row: &[u8], out: &mut Vec<u8>) {
     let mut i = 0;
     while i < n {
         // Repeat run?
+        // A slice-iterator scan here measured the same (-0.6M on 16-bit,
+        // +0.1M on 8-bit): the loop's bounds checks are not the cost.
         let mut r = 1;
         while i + r < n && r < 128 && row[i + r] == row[i] {
             r += 1;
         }
         if r >= 2 {
-            out.push((1 - r as i32) as i8 as u8);
-            out.push(row[i]);
+            // Header and byte as one fixed 2-byte append (one capacity check).
+            out.extend_from_slice(&[(1 - r as i32) as i8 as u8, row[i]]);
             i += r;
             continue;
         }
         // Literal run until a repeat of 2+ starts or 128 bytes.
         let start = i;
-        i += 1;
-        while i < n && i - start < 128 {
-            if i + 1 < n && row[i] == row[i + 1] {
-                break;
-            }
-            i += 1;
-        }
+        i = literal_end(row, start + 1, n.min(start + 128));
         out.push((i - start - 1) as u8);
         out.extend_from_slice(&row[start..i]);
     }
 }
 
+/// The first `j` in `from..lim` where `row[j] == row[j + 1]` (a repeat
+/// starts), or `lim`.
+///
+/// Eight positions per step: XOR the eight bytes at `j` with the eight at
+/// `j + 1`, and a zero byte marks a repeat. In `(x - 0x01..) & !x & 0x80..`
+/// a borrow can flag a byte above a real zero but never below one, so the
+/// lowest flagged byte is the first repeat. A byte-at-a-time scan here was
+/// most of the encoder's cost (about 8 Ir a byte).
+#[inline]
+fn literal_end(row: &[u8], from: usize, lim: usize) -> usize {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let n = row.len();
+    let mut j = from;
+    while j + 9 <= n && j + 8 <= lim {
+        let a = u64::from_le_bytes(row[j..j + 8].try_into().unwrap());
+        let b = u64::from_le_bytes(row[j + 1..j + 9].try_into().unwrap());
+        let x = a ^ b;
+        let z = x.wrapping_sub(LO) & !x & HI;
+        if z != 0 {
+            return j + (z.trailing_zeros() / 8) as usize;
+        }
+        j += 8;
+    }
+    while j < lim {
+        if j + 1 < n && row[j] == row[j + 1] {
+            return j;
+        }
+        j += 1;
+    }
+    lim
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_end_matches_byte_scan() {
+        let mut seed = 5u32;
+        for len in 0..300usize {
+            let row: Vec<u8> = (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    // Small alphabet so repeats land everywhere, incl. 0x80/0x01 bytes.
+                    [0u8, 1, 0x80, 0x81, 0xff, 7][(seed >> 16) as usize % 6]
+                })
+                .collect();
+            for from in 0..=len {
+                for lim in from..=len.min(from + 140) {
+                    let mut want = from;
+                    while want < lim && !(want + 1 < len && row[want] == row[want + 1]) {
+                        want += 1;
+                    }
+                    assert_eq!(literal_end(&row, from, lim), want, "{len} {from} {lim}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_strip_zero_fills() {
+        let row: Vec<u8> = (0..300u32)
+            .map(|i| if i % 40 < 10 { 9 } else { (i * 13) as u8 })
+            .collect();
+        let mut enc = Vec::new();
+        encode_row(&row, &mut enc);
+        for cut in 1..=3 {
+            let mut out = Vec::new();
+            decode_append(&enc[..enc.len() - cut], &mut out, row.len()).unwrap();
+            assert_eq!(out.len(), row.len());
+            let good = out.iter().zip(&row).take_while(|(a, b)| a == b).count();
+            assert!(good >= row.len() - 130, "cut {cut}: {good}");
+            assert!(
+                out[good..].iter().all(|&b| b == 0) || good + 3 >= row.len(),
+                "cut {cut}"
+            );
+        }
+    }
 
     #[test]
     fn round_trip() {

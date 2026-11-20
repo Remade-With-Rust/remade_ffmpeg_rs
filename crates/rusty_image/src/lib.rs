@@ -39,6 +39,7 @@ pub mod pnm;
 mod probe;
 pub mod qoi;
 mod read;
+mod swizzle;
 pub mod tga;
 
 pub use probe::probe;

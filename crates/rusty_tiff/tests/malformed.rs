@@ -72,6 +72,61 @@ fn decode_all(file: &[u8], limits: Limits) -> Result<usize, TiffError> {
     Ok(pages)
 }
 
+/// TIFF 6.0 section 2: readers skip a field whose type code is undefined.
+/// A damaged type on an optional tag must not cost the image; on a required
+/// tag the image still fails (as missing).
+#[test]
+fn unknown_field_type_is_skipped() {
+    let clean = two_page();
+    let first = ifds(&clean)[0];
+    let pixels = |b: &[u8]| -> Result<Vec<u8>, TiffError> {
+        let mut d = Decoder::new(Cursor::new(b))?;
+        match d.read_image()? {
+            rusty_tiff::DecodingResult::U8(v) => Ok(v),
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    let want = pixels(&clean).unwrap();
+    let n = r16(&clean, first);
+    let tags: Vec<u16> = (0..n)
+        .map(|k| r16(&clean, first + 2 + k * 12) as u16)
+        .collect();
+    let optional = [282u16, 283, 284, 296, 305, 277]
+        .into_iter()
+        .find(|t| tags.contains(t))
+        .expect("an optional tag is written");
+    for (tag, should_decode) in [(optional, true), (256, false)] {
+        let mut b = clean.clone();
+        let ty = field_pos(&b, first, tag) - 6;
+        b[ty..ty + 2].copy_from_slice(&1028u16.to_le_bytes());
+        match (pixels(&b), should_decode) {
+            (Ok(v), true) => assert_eq!(v, want, "tag {tag}"),
+            (Err(_), false) => {}
+            (r, _) => panic!("tag {tag}: {:?}", r.map(|v| v.len())),
+        }
+    }
+}
+
+/// A duplicate tag keeps its last entry (as the `tiff` crate does): a bit
+/// flip turning BitsPerSample (258) into 259 leaves Compression = 8 ahead of
+/// the real Compression = 1, and the strip is uncompressed.
+#[test]
+fn duplicate_tag_keeps_the_last_entry() {
+    let (w, h) = (37u32, 21u32);
+    let px: Vec<u8> = (0..w * h).map(|i| (i * 13) as u8).collect();
+    let mut f = Cursor::new(Vec::new());
+    TiffEncoder::new(&mut f)
+        .unwrap()
+        .write_image::<colortype::Gray8>(w, h, &px)
+        .unwrap();
+    let mut b = f.into_inner();
+    let first = ifds(&b)[0];
+    let tag_pos = field_pos(&b, first, 258) - 8;
+    b[tag_pos..tag_pos + 2].copy_from_slice(&259u16.to_le_bytes());
+    let mut d = Decoder::new(Cursor::new(&b)).unwrap();
+    assert!(d.read_image().is_ok(), "duplicate Compression tag refused");
+}
+
 #[test]
 fn ifd_self_loop_errors() {
     let mut b = two_page();
@@ -150,12 +205,18 @@ fn lying_strip_byte_counts() {
         d.read_image().unwrap(),
         rusty_tiff::DecodingResult::U8(vec![7; 64])
     );
-    // Too small: short strip is an error.
+    // Too small: the strip keeps its bytes and the rest reads as zero (as
+    // the `tiff` crate does), rather than losing the image.
     let mut b = two_page();
     let p = field_pos(&b, first, 279);
     w32(&mut b, p, 10);
     let mut d = Decoder::new(Cursor::new(&b)).unwrap();
-    assert!(matches!(d.read_image(), Err(TiffError::Format(_))));
+    let mut want = vec![7u8; 10];
+    want.resize(64, 0);
+    assert_eq!(
+        d.read_image().unwrap(),
+        rusty_tiff::DecodingResult::U8(want)
+    );
 }
 
 #[test]
