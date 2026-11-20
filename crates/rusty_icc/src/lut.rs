@@ -75,13 +75,9 @@ impl Clut {
 
     fn encode_data(&self, w: &mut Writer) {
         if self.precision == 1 {
-            for &v in &self.data {
-                w.u8(((u32::from(v) + 128) / 257) as u8);
-            }
+            w.u8s_from_u16(&self.data);
         } else {
-            for &v in &self.data {
-                w.u16(v);
-            }
+            w.u16s(&self.data);
         }
     }
 }
@@ -318,12 +314,10 @@ impl Lut {
                     w.s15f16(m);
                 }
                 let put = |w: &mut Writer, t: &Vec<u16>| {
-                    for &v in t {
-                        if sixteen {
-                            w.u16(v);
-                        } else {
-                            w.u8(((u32::from(v) + 128) / 257) as u8);
-                        }
+                    if sixteen {
+                        w.u16s(t);
+                    } else {
+                        w.u8s_from_u16(t);
                     }
                 };
                 if sixteen {
