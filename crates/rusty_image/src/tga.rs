@@ -108,7 +108,15 @@ pub fn decode(data: &[u8]) -> Result<Image> {
             "tga: colour-mapped indices wider than the colour",
         ));
     }
-    let mut img = Image::zeroed(width as u32, height as u32, format)?;
+    // Raw pixels are read whole; an RLE packet takes at least 1 + `raw_bpp`
+    // bytes and yields at most 128 pixels.
+    let need = if rle {
+        (width * height).div_ceil(128) * (1 + raw_bpp)
+    } else {
+        width * height * raw_bpp
+    };
+    let mut img =
+        Image::zeroed_for_input(width as u32, height as u32, format, r.rest().len(), need)?;
     let n_raw = width * height * raw_bpp;
     // Without a colour map or 15/16-bit expansion the raw pixels are the
     // output layout: decode straight into the output buffer.

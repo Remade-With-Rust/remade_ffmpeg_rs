@@ -104,7 +104,16 @@ pub fn decode_with_meta(data: &[u8]) -> Result<(Image, Meta)> {
     let transposed = a1.ends_with('X');
     let (width, height) = if transposed { (n1, n2) } else { (n2, n1) };
     meta.orientation = dims.trim().to_string();
-    let mut img = Image::zeroed(width, height, PixelFormat::Rgb32F)?;
+    // Every scanline opens with a 4-byte pixel or RLE header, and a scanline
+    // of two or more pixels takes at least 8 bytes. Old-style RLE can cover
+    // a very wide scanline in a few bytes, so only the scanline count bounds.
+    let need = match (n1 as usize, n2 as usize) {
+        (_, 0) | (0, _) => 0,
+        (lines, 1) => lines.saturating_mul(4),
+        (lines, _) => lines.saturating_mul(8),
+    };
+    let have = data.len().saturating_sub(pos);
+    let mut img = Image::zeroed_for_input(width, height, PixelFormat::Rgb32F, have, need)?;
     if width == 0 || height == 0 {
         return Ok((img, meta));
     }

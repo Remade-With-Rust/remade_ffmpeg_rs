@@ -187,6 +187,27 @@ impl Image {
         })
     }
 
+    /// [`Image::zeroed`] for a decoder holding `have` input bytes, of which
+    /// the image needs at least `need`: the fewest bytes that could encode it
+    /// at the format's largest expansion. A header naming more pixels than
+    /// that is refused as [`Error::Truncated`] — the verdict the decoder would
+    /// reach anyway — before its buffer is allocated, so a damaged size field
+    /// cannot turn a 26-byte file into a 400 MB allocation. The size cap
+    /// keeps its precedence.
+    pub(crate) fn zeroed_for_input(
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        have: usize,
+        need: usize,
+    ) -> Result<Image> {
+        byte_len(width, height, format)?;
+        if have < need {
+            return Err(Error::Truncated);
+        }
+        Image::zeroed(width, height, format)
+    }
+
     /// The samples of a 16-bit image.
     pub fn as_u16(&self) -> Option<Vec<u16>> {
         (self.format.bytes_per_sample() == 2).then(|| {

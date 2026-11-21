@@ -257,7 +257,19 @@ pub fn decode(data: &[u8]) -> Result<Image> {
         _ => return Err(Error::invalid("pnm: unknown magic")),
     };
     let format = tuple.format();
-    let mut img = Image::zeroed(width, height, format)?;
+    // The fewest raster bytes that could hold the image: binary rasters are
+    // read whole; ASCII takes a character per PBM pixel, and a digit plus a
+    // separator per sample otherwise.
+    let samples = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(format.channels());
+    let need = match (tuple, ascii) {
+        (Tuple::Pbm, false) => (width as usize).div_ceil(8).saturating_mul(height as usize),
+        (Tuple::Pbm, true) => samples,
+        (_, true) => samples.saturating_mul(2).saturating_sub(1),
+        (_, false) => samples.saturating_mul(format.bytes_per_sample()),
+    };
+    let mut img = Image::zeroed_for_input(width, height, format, r.rest().len(), need)?;
     let (w, h) = (width as usize, height as usize);
     let buf = &mut img.pixels;
     let wide = format.bytes_per_sample() == 2;
