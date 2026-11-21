@@ -18,9 +18,10 @@ pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
 /// capacity (no zero-fill first: flate2 1.1.11 and later hand zlib-rs the
 /// spare capacity uninitialised; 1.1.9 zero-filled all of it on every call,
 /// which is why the manifest asks for 1.1.11). Capacity is reserved for
-/// exactly `n` more, so a decompression bomb costs at most `n` bytes;
-/// anything the inflater writes past `n` (only possible if the allocator
-/// handed back more capacity than asked) is truncated away.
+/// `n` more, so a decompression bomb costs at most `n` bytes beyond room
+/// the caller already holds: the inflater writes into all of the spare
+/// capacity, which for a tile band (reserved once for the whole band) is
+/// more than `n`, and anything past `n` is truncated away.
 ///
 /// `state` is the inflater, kept for all the chunks of an image and reset
 /// for each one: building a new one per chunk allocates and clears its
@@ -77,7 +78,10 @@ pub(crate) fn decode_append(
                 out.resize(target, 0);
                 return Ok(real);
             }
-            Err(e) => return Err(TiffError::format(format!("Deflate: {e}"))),
+            Err(e) => {
+                let produced = d.total_out();
+                return Err(inflate_error(&e, d, zlib, data, produced));
+            }
         };
         let progressed = d.total_in() != in_before || out.len() != out_before;
         if out.len() >= target {
@@ -106,6 +110,65 @@ pub(crate) fn decode_append(
                         .map_err(|_| TiffError::limits("cannot allocate"))?;
                 }
             }
+        }
+    }
+}
+
+/// The error for a chunk the inflater refused, with zlib's own message.
+///
+/// zlib-rs (0.6.x) loses the message of an error found by its fast loop,
+/// which runs while at least 260 bytes of output room and 15 of input are
+/// left: the loop records "invalid distance too far back" (or "invalid
+/// distance code", "invalid literal/length code"), sets the bad state and
+/// returns to the dispatcher, whose bad-state arm then overwrites the
+/// message with "repeated call with bad state" in the SAME call. This crate
+/// never calls an inflater again after it failed (each chunk resets it, the
+/// first error returns), so that text only ever means "the fast loop found
+/// it". Since the 16-bit band (0.1.4) a tile inflates into the room
+/// reserved for the whole band, so more errors are found by the fast loop
+/// than in 0.1.3 and the text changed for the same damaged file, with the
+/// same work done (one call, the same bytes in and out).
+///
+/// So on that text the chunk is inflated once more from the start, into a
+/// 256-byte window: below 260 bytes of room the fast loop never runs, the
+/// byte-at-a-time loop finds the same error at the same place and keeps its
+/// message. This runs only on a chunk that already failed, and stops at the
+/// output the failed pass reached (`produced`), so it costs at most that
+/// chunk's inflate once more.
+fn inflate_error(
+    e: &flate2::DecompressError,
+    d: &mut Decompress,
+    zlib: bool,
+    data: &[u8],
+    produced: u64,
+) -> TiffError {
+    let msg = e.to_string();
+    let msg = if msg.contains("repeated call with bad state") {
+        slow_loop_error(d, zlib, data, produced).unwrap_or(msg)
+    } else {
+        msg
+    };
+    TiffError::format(format!("Deflate: {msg}"))
+}
+
+/// Inflate `data` again from the start through zlib-rs's byte-at-a-time
+/// loop only, and return the error it stops on (`None` if it does not fail
+/// within `produced + 256` bytes of output, which a deterministic inflater
+/// cannot do on the input that just failed).
+fn slow_loop_error(d: &mut Decompress, zlib: bool, data: &[u8], produced: u64) -> Option<String> {
+    d.reset(zlib);
+    let mut window = [0u8; 256];
+    loop {
+        let (i, o) = (d.total_in(), d.total_out());
+        if o > produced {
+            return None;
+        }
+        let rest = data.get(i as usize..)?;
+        match d.decompress(rest, &mut window, FlushDecompress::None) {
+            Err(e) => return Some(e.to_string()),
+            Ok(Status::StreamEnd) => return None,
+            Ok(_) if d.total_in() == i && d.total_out() == o => return None,
+            Ok(_) => {}
         }
     }
 }
@@ -260,6 +323,69 @@ mod tests {
                 (w, g) => panic!("fresh {w:?} kept {g:?}"),
             }
         }
+    }
+
+    /// A zlib stream whose one fixed-Huffman block holds the literal `A` and
+    /// then a match 33 bytes back: "invalid distance too far back" one byte
+    /// in. 32 zero bytes follow so zlib-rs's fast loop (which needs 15 bytes
+    /// of input) is the one that finds it.
+    pub(crate) fn too_far_back_stream() -> Vec<u8> {
+        let mut bytes = vec![0x78, 0x9c];
+        let (mut acc, mut nbits) = (0u32, 0u32);
+        let mut put = |v: u32, n: u32, bytes: &mut Vec<u8>| {
+            acc |= v << nbits;
+            nbits += n;
+            while nbits >= 8 {
+                bytes.push(acc as u8);
+                acc >>= 8;
+                nbits -= 8;
+            }
+        };
+        // Huffman codes go most significant bit first.
+        let code = |c: u32, n: u32| c.reverse_bits() >> (32 - n);
+        put(1, 1, &mut bytes); // BFINAL
+        put(1, 2, &mut bytes); // BTYPE 01: fixed codes
+        put(code(0x30 + u32::from(b'A'), 8), 8, &mut bytes); // literal 'A'
+        put(code(1, 7), 7, &mut bytes); // length code 257: length 3
+        put(code(10, 5), 5, &mut bytes); // distance code 10: 33 + 4 extra bits
+        put(0, 4, &mut bytes);
+        put(0, 7, &mut bytes); // flush the last partial byte
+        bytes.extend_from_slice(&[0; 32]);
+        bytes
+    }
+
+    #[test]
+    fn fast_loop_error_keeps_its_message() {
+        // With room for the fast loop (n far above 260), zlib-rs reports this
+        // error as "repeated call with bad state" after one call; the slow
+        // replay recovers the real message.
+        let stream = too_far_back_stream();
+        for n in [64, 259, 260, 4096, 1 << 20] {
+            for state in [&mut None, &mut Some(Decompress::new(true))] {
+                let e = decode_append(&stream, &mut Vec::new(), n, state).unwrap_err();
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("invalid distance too far back"),
+                    "n {n}: {msg}"
+                );
+                assert!(!msg.contains("repeated call"), "n {n}: {msg}");
+                // The kept inflater still serves the next chunk.
+                if state.is_some() {
+                    let data = [5u8; 700];
+                    let mut out = Vec::new();
+                    decode_append(&encode(&data, 6), &mut out, 700, state).unwrap();
+                    assert_eq!(out, data);
+                }
+            }
+        }
+        // The raw inflater (damaged zlib header) gives the same message.
+        let mut raw = stream.clone();
+        raw[0] ^= 0x80;
+        assert!(!zlib_header_ok(raw[0], raw[1]));
+        let msg = decode_append(&raw, &mut Vec::new(), 4096, &mut None)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("invalid distance too far back"), "{msg}");
     }
 
     #[test]
