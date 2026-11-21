@@ -668,20 +668,32 @@ fn read_bitfield_rows(
 
 #[inline(never)]
 fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
+    if h.kind == Kind::Rle4 {
+        read_rle_as::<true>(r, h, buf)
+    } else {
+        read_rle_as::<false>(r, h, buf)
+    }
+}
+
+/// RLE4 (`RLE4`) or RLE8 rows. One out-of-line copy per kind, so neither
+/// kind's loop shares registers with the other's (a change to the RLE8
+/// stores alone moved the RLE4 rows by +1.9% while they shared one body).
+#[inline(never)]
+fn read_rle_as<const RLE4: bool>(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
     // The stream is consumed as a slice that shrinks from the front: every
     // operation starts with two bytes, taken with one length test, where two
     // `Reader::u8` calls were an overflow check and a range check each.
     let all = r.rest();
     let mut data = all;
-    rle_rows(&mut data, h, buf)?;
+    rle_rows::<RLE4>(&mut data, h, buf)?;
     r.skip(all.len() - data.len())
 }
 
 #[inline(always)]
-fn rle_rows(data: &mut &[u8], h: &Header, buf: &mut [u8]) -> Result<()> {
+fn rle_rows<const RLE4: bool>(data: &mut &[u8], h: &Header, buf: &mut [u8]) -> Result<()> {
     let ch = if h.alpha { 4 } else { 3 };
     let pal = h.palette.as_deref().expect("RLE kinds carry a palette");
-    let rle4 = h.kind == Kind::Rle4;
+    let rle4 = RLE4;
     let stride = h.width * ch;
     let corrupt = || Error::invalid("bmp: corrupt RLE data");
     // Zero pixels [from, width) of file row `ri`.
@@ -691,11 +703,16 @@ fn rle_rows(data: &mut &[u8], h: &Header, buf: &mut [u8]) -> Result<()> {
             buf[y * stride + from * ch..(y + 1) * stride].fill(0);
         }
     };
-    // `rb` is the current output row's offset, kept up to date below.
-    let set = |buf: &mut [u8], rb: usize, px: usize, idx: u8| {
-        let o = rb + px * ch;
-        buf[o..o + 3].copy_from_slice(&pal[idx as usize]);
-    };
+    // The palette padded to four bytes with a zero: a pixel is one 4-byte
+    // store. With four channels that leaves alpha at the zero it had
+    // (RLE never sets alpha); with three, the zero lands on the first byte
+    // of the next pixel, which the same packet then writes, so only a
+    // packet's last pixel needs a 3-byte store (the byte after it may
+    // belong to a pixel a delta skips, or to the row decoded before).
+    let mut pal4 = [[0u8; 4]; 256];
+    for (q, p) in pal4.iter_mut().zip(pal.iter()) {
+        q[..3].copy_from_slice(p);
+    }
 
     let mut ri = 0;
     while ri < h.height {
@@ -769,27 +786,34 @@ fn rle_rows(data: &mut &[u8], h: &Header, buf: &mut [u8]) -> Result<()> {
                             return Err(Error::Truncated);
                         };
                         *data = rest;
+                        // A literal running past the row is corrupt (the
+                        // whole decode fails, so no partial row matters).
+                        if n > h.width - px {
+                            return Err(corrupt());
+                        }
                         if rle4 {
-                            let mut left = n;
+                            // Two pixels a byte, high nibble first, into the
+                            // packet's own range of the row (it was a row
+                            // offset computed and a 3-byte range-checked
+                            // copy per nibble).
+                            let o = rb + px * ch;
+                            let dst = &mut buf[o..o + n * ch];
+                            let mut q = 0;
                             'nib: for &b in idx {
                                 for nib in [b >> 4, b & 15] {
-                                    if left == 0 {
+                                    let c = &pal4[usize::from(nib)];
+                                    if q + 4 > dst.len() {
+                                        if q < dst.len() {
+                                            dst[q..].copy_from_slice(&c[..3]);
+                                        }
                                         break 'nib;
                                     }
-                                    if px >= h.width {
-                                        return Err(corrupt());
-                                    }
-                                    set(buf, rb, px, nib);
-                                    px += 1;
-                                    left -= 1;
+                                    dst[q..q + 4].copy_from_slice(c);
+                                    q += ch;
                                 }
                             }
+                            px += n;
                         } else {
-                            // A literal running past the row is corrupt (the
-                            // whole decode fails, so no partial row matters).
-                            if n > h.width - px {
-                                return Err(corrupt());
-                            }
                             let mut o = rb + px * ch;
                             for &i in &idx[..n] {
                                 buf[o..o + 3].copy_from_slice(&pal[usize::from(i)]);
@@ -804,20 +828,24 @@ fn rle_rows(data: &mut &[u8], h: &Header, buf: &mut [u8]) -> Result<()> {
                 let index = arg;
                 let n = usize::from(control);
                 if rle4 {
-                    let mut left = n;
-                    'run: loop {
-                        for nib in [index >> 4, index & 15] {
-                            if left == 0 {
-                                break 'run;
-                            }
-                            if px >= h.width {
-                                return Err(corrupt());
-                            }
-                            set(buf, rb, px, nib);
-                            px += 1;
-                            left -= 1;
-                        }
+                    // The two nibbles alternate. A run past the row is
+                    // corrupt (RLE8 clamps, below).
+                    if n > h.width - px {
+                        return Err(corrupt());
                     }
+                    let c = [pal4[usize::from(index >> 4)], pal4[usize::from(index & 15)]];
+                    let o = rb + px * ch;
+                    let dst = &mut buf[o..o + n * ch];
+                    let (mut q, mut k) = (0, 0);
+                    while q + 4 <= dst.len() {
+                        dst[q..q + 4].copy_from_slice(&c[k & 1]);
+                        q += ch;
+                        k += 1;
+                    }
+                    if q < dst.len() {
+                        dst[q..].copy_from_slice(&c[k & 1][..3]);
+                    }
+                    px += n;
                 } else {
                     // A run longer than the row is clamped to it (ImageMagick
                     // writes such files).
