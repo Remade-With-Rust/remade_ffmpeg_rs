@@ -58,6 +58,12 @@ pub(crate) enum Op {
     EncodeXyz,
     LabToXyz,
     XyzToLab,
+    /// [`Op::XyzToLab`] then [`Op::EncodeLab`], then the [`Op::Scale`] that
+    /// may follow (legacy 16-bit Lab): one op for the three.
+    XyzToEncodedLab(Option<f64>),
+    /// The [`Op::Scale`] that may come first, then [`Op::DecodeLab`] and
+    /// [`Op::LabToXyz`]: one op for the three.
+    EncodedLabToXyz(Option<f64>),
     /// XYZ affine map.
     Affine(Mat3, [f64; 3]),
     Clamp01,
@@ -151,6 +157,27 @@ fn run(ops: &[Op], v: &mut [f64; 16], mut n: usize) -> usize {
             Op::XyzToLab => {
                 let l = xyz_to_lab(Xyz::new(v[0], v[1], v[2]), D50);
                 v[..3].copy_from_slice(&[l.l, l.a, l.b]);
+            }
+            Op::XyzToEncodedLab(k) => {
+                let l = xyz_to_lab(Xyz::new(v[0], v[1], v[2]), D50);
+                v[0] = clamp01(l.l / 100.0);
+                v[1] = clamp01((l.a + 128.0) / 255.0);
+                v[2] = clamp01((l.b + 128.0) / 255.0);
+                if let Some(k) = k {
+                    for x in v.iter_mut().take(n) {
+                        *x *= k;
+                    }
+                }
+            }
+            Op::EncodedLabToXyz(k) => {
+                if let Some(k) = k {
+                    for x in v.iter_mut().take(n) {
+                        *x *= k;
+                    }
+                }
+                let lab = Lab::new(v[0] * 100.0, v[1] * 255.0 - 128.0, v[2] * 255.0 - 128.0);
+                let x = lab_to_xyz(lab, D50);
+                v[..3].copy_from_slice(&x.to_array());
             }
             Op::Affine(m, off) => {
                 let r = mat_vec(m, [v[0], v[1], v[2]]);
@@ -1082,6 +1109,7 @@ pub(crate) fn build_chain(
     // loop reads them through `Chain::as_shaper`.
     if chain.as_shaper().is_none() {
         prepare_curves(&mut chain.ops);
+        chain.ops = fuse_lab(core::mem::take(&mut chain.ops));
     }
     Ok(chain)
 }
@@ -1177,6 +1205,40 @@ fn link_ops(profiles: &[&Profile], intents: &[Intent], bpc: &[bool]) -> Result<C
         out_ch,
         shaper,
     })
+}
+
+/// Joins the Lab encoding and decoding runs of `ops` into one op each (the
+/// same arithmetic in the same order).
+fn fuse_lab(ops: Vec<Op>) -> Vec<Op> {
+    let mut out: Vec<Op> = Vec::with_capacity(ops.len());
+    let mut it = ops.into_iter().peekable();
+    while let Some(op) = it.next() {
+        match op {
+            Op::XyzToLab if matches!(it.peek(), Some(Op::EncodeLab)) => {
+                it.next();
+                let k = match it.peek() {
+                    Some(&Op::Scale(k)) => {
+                        it.next();
+                        Some(k)
+                    }
+                    _ => None,
+                };
+                out.push(Op::XyzToEncodedLab(k));
+            }
+            Op::DecodeLab if matches!(it.peek(), Some(Op::LabToXyz)) => {
+                it.next();
+                match out.last() {
+                    Some(&Op::Scale(k)) => {
+                        out.pop();
+                        out.push(Op::EncodedLabToXyz(Some(k)));
+                    }
+                    _ => out.push(Op::EncodedLabToXyz(None)),
+                }
+            }
+            op => out.push(op),
+        }
+    }
+    out
 }
 
 /// Replaces curve stages by forms evaluated in line where every curve of the
@@ -1438,7 +1500,7 @@ mod tests {
                 .unwrap();
         let rel = Intent::RelativeColorimetric;
         let per = Intent::Perceptual;
-        let (mut fwd, mut inv, mut chains) = (0, 0, 0);
+        let (mut fwd, mut inv, mut fused, mut chains) = (0, 0, 0, 0);
         for (a, b, intent) in [
             (&srgb, &lab, rel),
             (&lab, &srgb, rel),
@@ -1455,10 +1517,14 @@ mod tests {
             assert!(chain.as_shaper().is_none());
             // The ops as linked, before `prepare_curves`.
             let plain = link_ops(&[a, b], &[intent, intent], &[false, false]).unwrap();
-            assert_eq!(plain.ops.len(), chain.ops.len());
+
             for op in &chain.ops {
                 fwd += usize::from(matches!(op, Op::FwdSegs(_)));
                 inv += usize::from(matches!(op, Op::InvSegs(_)));
+                fused += usize::from(matches!(
+                    op,
+                    Op::XyzToEncodedLab(_) | Op::EncodedLabToXyz(_)
+                ));
             }
             let coords = [
                 -0.25,
@@ -1494,7 +1560,37 @@ mod tests {
                 assert_eq!(plain.sample_grid(9), chain.sample_grid(9));
             }
         }
-        assert!(fwd > 0 && inv > 0 && chains >= 4, "{fwd} {inv} {chains}");
+        assert!(
+            fwd > 0 && inv > 0 && fused > 0 && chains >= 4,
+            "{fwd} {inv} {fused} {chains}"
+        );
+    }
+
+    #[test]
+    fn fused_lab_ops_match_the_separate_ops_bit_for_bit() {
+        let k = 1.0 / LAB_V2_TO_V4;
+        let runs: [Vec<Op>; 4] = [
+            vec![Op::XyzToLab, Op::EncodeLab, Op::Scale(k), Op::Clamp01],
+            vec![Op::XyzToLab, Op::EncodeLab, Op::Clamp01],
+            vec![Op::Scale(LAB_V2_TO_V4), Op::DecodeLab, Op::LabToXyz],
+            vec![Op::Clamp01, Op::DecodeLab, Op::LabToXyz, Op::XyzToLab],
+        ];
+        let xs = [-0.5, 0.0, 1e-4, 0.008, 0.2, 0.5, 0.9642, 1.0, 1.7, f64::NAN];
+        for plain in runs {
+            let fused = fuse_lab(plain.clone());
+            assert!(fused.len() < plain.len());
+            for (i, &a) in xs.iter().enumerate() {
+                for &b in &xs {
+                    for &c in &xs[i % 3..] {
+                        let mut want = [0.0; 16];
+                        want[..4].copy_from_slice(&[a, b, c, 0.25]);
+                        let mut got = want;
+                        assert_eq!(run(&plain, &mut want, 3), run(&fused, &mut got, 3));
+                        assert_eq!(want.map(f64::to_bits), got.map(f64::to_bits), "{a} {b} {c}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
