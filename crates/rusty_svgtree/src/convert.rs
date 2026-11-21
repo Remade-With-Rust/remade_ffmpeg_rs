@@ -48,13 +48,42 @@ struct Cache {
     /// the output tree, which bounds render work.
     work: usize,
     max_work: usize,
+    /// The builder every shape is built in, kept with its capacity: a shape
+    /// grows it only past the largest one before it, and leaves as an
+    /// exactly sized copy (see `Cache::finish_path`).
+    path_scratch: Option<PathBuilder>,
 }
+
+/// A shape with more points than this keeps the scratch builder's buffers as
+/// its own instead of being copied out of them (no second copy of a huge
+/// path is ever held).
+const SCRATCH_MAX_POINTS: usize = 1 << 16;
 
 impl Cache {
     /// Spends one unit of conversion work; `false` once the budget is gone.
     fn spend(&mut self) -> bool {
         self.work += 1;
         self.work <= self.max_work
+    }
+
+    /// The (empty) builder to build a shape in.
+    // Not `unwrap_or_default()`: `PathBuilder::default()` is not
+    // `PathBuilder::new()` (it does not inject the initial move-to).
+    #[allow(clippy::unwrap_or_default)]
+    fn path_builder(&mut self) -> PathBuilder {
+        self.path_scratch.take().unwrap_or_else(PathBuilder::new)
+    }
+
+    /// Finishes a shape built in `path_builder()`'s builder: the path is an
+    /// exactly sized copy, and the builder goes back to the scratch slot.
+    fn finish_path(&mut self, b: PathBuilder) -> Option<Arc<rusty_raster::Path>> {
+        let path = b.finish()?;
+        if path.points().len() > SCRATCH_MAX_POINTS {
+            return Some(Arc::new(path));
+        }
+        let out = path.clone();
+        self.path_scratch = Some(path.clear());
+        Some(Arc::new(out))
     }
 }
 
@@ -564,7 +593,7 @@ fn convert_element_impl(
         | EId::Polyline
         | EId::Polygon
         | EId::Path => {
-            if let Some(path) = convert_shape(node, state) {
+            if let Some(path) = convert_shape(node, state, cache) {
                 convert_path(node, path, state, cache, parent);
             }
         }
@@ -595,7 +624,7 @@ fn convert_clip_path_elements(clip: SvgNode, state: &State, cache: &mut Cache, p
                 tag,
                 EId::Rect | EId::Circle | EId::Ellipse | EId::Polyline | EId::Polygon | EId::Path
             ) {
-                if let Some(path) = convert_shape(node, state) {
+                if let Some(path) = convert_shape(node, state, cache) {
                     convert_path(node, path, state, cache, g);
                 }
             }
@@ -715,13 +744,13 @@ fn parse_blend_mode(v: &str) -> Option<BlendMode> {
 
 // ---------------------------------------------------------------- shapes --
 
-fn finish(b: PathBuilder) -> Option<Arc<rusty_raster::Path>> {
-    b.finish().map(Arc::new)
-}
-
-fn convert_shape(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>> {
+fn convert_shape(
+    node: SvgNode,
+    state: &State,
+    cache: &mut Cache,
+) -> Option<Arc<rusty_raster::Path>> {
     match node.tag_name()? {
-        EId::Rect => convert_rect(node, state),
+        EId::Rect => convert_rect(node, state, cache),
         EId::Circle => {
             let cx = node.convert_user_length(AId::Cx, state, Length::zero());
             let cy = node.convert_user_length(AId::Cy, state, Length::zero());
@@ -729,7 +758,7 @@ fn convert_shape(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>
             if !(r.is_finite() && r > 0.0) {
                 return None;
             }
-            ellipse_to_path(cx, cy, r, r)
+            ellipse_to_path(cx, cy, r, r, cache)
         }
         EId::Ellipse => {
             let cx = node.convert_user_length(AId::Cx, state, Length::zero());
@@ -738,24 +767,24 @@ fn convert_shape(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>
             if !(rx.is_finite() && rx > 0.0 && ry.is_finite() && ry > 0.0) {
                 return None;
             }
-            ellipse_to_path(cx, cy, rx, ry)
+            ellipse_to_path(cx, cy, rx, ry, cache)
         }
         EId::Line => {
             let x1 = node.convert_user_length(AId::X1, state, Length::zero());
             let y1 = node.convert_user_length(AId::Y1, state, Length::zero());
             let x2 = node.convert_user_length(AId::X2, state, Length::zero());
             let y2 = node.convert_user_length(AId::Y2, state, Length::zero());
-            let mut b = PathBuilder::new();
+            let mut b = cache.path_builder();
             b.move_to(x1, y1);
             b.line_to(x2, y2);
-            finish(b)
+            cache.finish_path(b)
         }
         EId::Polyline | EId::Polygon => {
             let pts = values::points(node.attribute(AId::Points)?);
             if pts.len() < 2 {
                 return None;
             }
-            let mut b = PathBuilder::new();
+            let mut b = cache.path_builder();
             for (i, (x, y)) in pts.into_iter().enumerate() {
                 if i == 0 {
                     b.move_to(x as f32, y as f32);
@@ -766,11 +795,11 @@ fn convert_shape(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>
             if node.tag_name() == Some(EId::Polygon) {
                 b.close();
             }
-            finish(b)
+            cache.finish_path(b)
         }
         EId::Path => {
             // Path data goes straight from the text into the builder.
-            let mut b = PathBuilder::new();
+            let mut b = cache.path_builder();
             values::path_data_with(node.attribute(AId::D)?, &mut |s| match s {
                 Seg::MoveTo(x, y) => b.move_to(x as f32, y as f32),
                 Seg::LineTo(x, y) => b.line_to(x as f32, y as f32),
@@ -780,7 +809,7 @@ fn convert_shape(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>
                 ),
                 Seg::Close => b.close(),
             });
-            finish(b)
+            cache.finish_path(b)
         }
         _ => None,
     }
@@ -812,7 +841,11 @@ fn builder_arc_to(b: &mut PathBuilder, rx: f32, ry: f32, x: f32, y: f32) {
     );
 }
 
-fn convert_rect(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>> {
+fn convert_rect(
+    node: SvgNode,
+    state: &State,
+    cache: &mut Cache,
+) -> Option<Arc<rusty_raster::Path>> {
     let width = node.convert_user_length(AId::Width, state, Length::zero());
     let height = node.convert_user_length(AId::Height, state, Length::zero());
     if !(width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0) {
@@ -832,7 +865,7 @@ fn convert_rect(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>>
             x, y, width, height,
         )?)));
     }
-    let mut b = PathBuilder::new();
+    let mut b = cache.path_builder();
     b.move_to(x + rx, y);
     b.line_to(x + width - rx, y);
     builder_arc_to(&mut b, rx, ry, x + width, y + ry);
@@ -843,7 +876,7 @@ fn convert_rect(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>>
     b.line_to(x, y + ry);
     builder_arc_to(&mut b, rx, ry, x + rx, y);
     b.close();
-    finish(b)
+    cache.finish_path(b)
 }
 
 fn resolve_rx_ry(node: SvgNode, state: &State) -> (f32, f32) {
@@ -870,15 +903,21 @@ fn resolve_rx_ry(node: SvgNode, state: &State) -> (f32, f32) {
     }
 }
 
-fn ellipse_to_path(cx: f32, cy: f32, rx: f32, ry: f32) -> Option<Arc<rusty_raster::Path>> {
-    let mut b = PathBuilder::new();
+fn ellipse_to_path(
+    cx: f32,
+    cy: f32,
+    rx: f32,
+    ry: f32,
+    cache: &mut Cache,
+) -> Option<Arc<rusty_raster::Path>> {
+    let mut b = cache.path_builder();
     b.move_to(cx + rx, cy);
     builder_arc_to(&mut b, rx, ry, cx, cy + ry);
     builder_arc_to(&mut b, rx, ry, cx - rx, cy);
     builder_arc_to(&mut b, rx, ry, cx, cy - ry);
     builder_arc_to(&mut b, rx, ry, cx + rx, cy);
     b.close();
-    finish(b)
+    cache.finish_path(b)
 }
 
 // ----------------------------------------------------------------- paths --
