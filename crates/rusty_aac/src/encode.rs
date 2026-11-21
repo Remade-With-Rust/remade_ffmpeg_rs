@@ -1832,7 +1832,24 @@ fn estimate_bits(xp: &Xpow, swb: &[u16], offsets: &Offsets, base: i32) -> usize 
 /// the exact coder then walks to the true boundary (identical to a full search, but
 /// only a couple of exact evaluations instead of eight). Body bits fall as `base`
 /// rises.
+#[cfg(test)]
 fn rate_loop(xp: &Xpow, swb: &[u16], offsets: &Offsets, target_bits: usize) -> i32 {
+    rate_loop_coded(xp, swb, offsets, target_bits).0
+}
+
+/// A frame as [`code_frame`] returns it: (codebooks, ICS body bits, `max_sfb`,
+/// quantized spectrum).
+type Coded = (Vec<u8>, usize, usize, Vec<i32>);
+
+/// [`rate_loop`], also returning the frame coded at the chosen base: the
+/// search's last fitting evaluation is that coding, so the caller need not
+/// code the frame again (it used to, one exact evaluation in three or four).
+fn rate_loop_coded(
+    xp: &Xpow,
+    swb: &[u16],
+    offsets: &Offsets,
+    target_bits: usize,
+) -> (i32, Vec<i32>, Coded) {
     let min_b = min_base(xp, swb, offsets);
     // Phase 1: binary-search the cheap estimate.
     let max_level = offsets.max_level();
@@ -1846,10 +1863,23 @@ fn rate_loop(xp: &Xpow, swb: &[u16], offsets: &Offsets, target_bits: usize) -> i
         }
     }
     // Phase 2: refine to the exact smallest fitting base with the real coder, reusing
-    // one quant buffer across the (few) exact evaluations.
+    // one quant buffer across the (few) exact evaluations and keeping the last
+    // fitting one (always the returned base's, when the search evaluated it).
     let mut quant = vec![0i32; xp.len()];
-    let mut exact =
-        |b: i32| code_core(xp, swb, &scalefactors(offsets, b), &mut quant).1 <= target_bits;
+    let mut best: Option<(i32, Coded)> = None;
+    let mut exact = |b: i32| {
+        let sf = scalefactors(offsets, b);
+        let (cbs, body, max_sfb) = code_core(xp, swb, &sf, &mut quant);
+        let fits = body <= target_bits;
+        if fits {
+            let keep = std::mem::take(&mut quant);
+            quant = best
+                .take()
+                .map_or_else(|| vec![0i32; xp.len()], |(_, old)| old.3);
+            best = Some((b, (cbs, body, max_sfb, keep)));
+        }
+        fits
+    };
     let mut base = lo;
     if exact(base) {
         while base > min_b && exact(base - 1) {
@@ -1860,7 +1890,14 @@ fn rate_loop(xp: &Xpow, swb: &[u16], offsets: &Offsets, target_bits: usize) -> i
             base += 1;
         }
     }
-    base
+    let sf = scalefactors(offsets, base);
+    match best {
+        Some((b, coded)) if b == base => (base, sf, coded),
+        _ => {
+            let coded = code_frame(xp, swb, &sf);
+            (base, sf, coded)
+        }
+    }
 }
 
 /// `section_data` (single group, long block): 4-bit codebook + 5-bit run-length
@@ -2050,9 +2087,7 @@ fn encode_channel_element(
     // after quantization. This pass exists to learn it.
     let offsets0 = perceptual_offsets(spec, swb, sample_rate, psy.tonality_smr, target_bits);
     let xp0 = Xpow::new(spec);
-    let base0 = rate_loop(&xp0, swb, &offsets0, target_bits);
-    let sf0 = scalefactors(&offsets0, base0);
-    let (cbs0, _, max_sfb0, quant0) = code_frame(&xp0, swb, &sf0);
+    let (_, sf0, (cbs0, _, max_sfb0, quant0)) = rate_loop_coded(&xp0, swb, &offsets0, target_bits);
 
     // Arm A3. Only engage when the coded range already reaches TNS_MAX_LONG, so
     // the decoder's span `min(TNS_MAX_LONG, max_sfb)` is pinned to TNS_MAX_LONG
@@ -2081,9 +2116,8 @@ fn encode_channel_element(
                 let offsets =
                     perceptual_offsets(&filtered, swb, sample_rate, psy.tonality_smr, target_bits);
                 let xp = Xpow::new(&filtered);
-                let base = rate_loop(&xp, swb, &offsets, target_bits);
-                let sf = scalefactors(&offsets, base);
-                let (mut cbs, _, msfb, quant) = code_frame(&xp, swb, &sf);
+                let (_, sf, (mut cbs, _, msfb, quant)) =
+                    rate_loop_coded(&xp, swb, &offsets, target_bits);
                 // Hold max_sfb at or above tns_max, padding with ZERO bands, so
                 // the decoder's TNS span is exactly the one we filtered.
                 let msfb = msfb.max(tns_max);
@@ -3070,9 +3104,7 @@ fn quantize_channel(
         (sf, quant)
     } else {
         let offsets = perceptual_offsets(spec, swb, sample_rate, psy.tonality_smr, target_bits);
-        let base = rate_loop(&xp, swb, &offsets, target_bits);
-        let sf = scalefactors(&offsets, base);
-        let (_, _, _, quant) = code_frame(&xp, swb, &sf);
+        let (_, sf, (_, _, _, quant)) = rate_loop_coded(&xp, swb, &offsets, target_bits);
         (sf, quant)
     }
 }
@@ -3219,25 +3251,17 @@ fn pair_body_bits(
     off1: &Offsets,
     swb: &[u16],
     base: i32,
-    is_short: bool,
-    quant: &mut [i32],
     groups: &[u8],
 ) -> usize {
-    let (b0, b1) = if is_short {
-        (
-            code_frame_short(xp0, swb, &scalefactors(off0, base), groups).1,
-            code_frame_short(xp1, swb, &scalefactors(off1, base), groups).1,
-        )
-    } else {
-        (
-            code_core(xp0, swb, &scalefactors(off0, base), quant).1,
-            code_core(xp1, swb, &scalefactors(off1, base), quant).1,
-        )
-    };
-    b0 + b1
+    code_frame_short(xp0, swb, &scalefactors(off0, base), groups).1
+        + code_frame_short(xp1, swb, &scalefactors(off1, base), groups).1
 }
 
-/// Smallest common base whose combined body fits `target_total` bits.
+/// Both channels' quantized spectra of a channel pair.
+type PairQuant = (Vec<i32>, Vec<i32>);
+
+/// Smallest common base whose combined body fits `target_total` bits, and for
+/// long blocks both channels' quantized spectra at it when the search kept them.
 #[allow(clippy::too_many_arguments)]
 fn joint_rate_loop(
     xp0: &Xpow,
@@ -3248,7 +3272,7 @@ fn joint_rate_loop(
     target_total: usize,
     is_short: bool,
     groups: &[u8],
-) -> i32 {
+) -> (i32, Option<PairQuant>) {
     let lo0 = if is_short {
         min_base_short(xp0)
     } else {
@@ -3261,18 +3285,41 @@ fn joint_rate_loop(
     };
     let mut lo = lo0.max(lo1);
     let mut hi = off0.max_level().max(off1.max_level());
-    let mut quant = vec![0i32; xp0.len().max(xp1.len())];
+    if is_short {
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if pair_body_bits(xp0, off0, xp1, off1, swb, mid, groups) <= target_total {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        return (lo, None);
+    }
+    // Long blocks: the same search, keeping both channels' quantized spectra
+    // from the last fitting level. That level is the answer whenever the search
+    // evaluated it, so the caller need not quantize the pair again.
+    let (mut q0, mut q1) = (vec![0i32; xp0.len()], vec![0i32; xp1.len()]);
+    let mut best: Option<(i32, Vec<i32>, Vec<i32>)> = None;
     while lo < hi {
         let mid = (lo + hi) / 2;
-        if pair_body_bits(xp0, off0, xp1, off1, swb, mid, is_short, &mut quant, groups)
-            <= target_total
-        {
+        let bits = code_core(xp0, swb, &scalefactors(off0, mid), &mut q0).1
+            + code_core(xp1, swb, &scalefactors(off1, mid), &mut q1).1;
+        if bits <= target_total {
             hi = mid;
+            let (k0, k1) = (std::mem::take(&mut q0), std::mem::take(&mut q1));
+            if let Some((_, o0, o1)) = best.take() {
+                (q0, q1) = (o0, o1);
+            } else {
+                (q0, q1) = (vec![0i32; xp0.len()], vec![0i32; xp1.len()]);
+            }
+            best = Some((mid, k0, k1));
         } else {
             lo = mid + 1;
         }
     }
-    lo
+    let kept = best.and_then(|(b, k0, k1)| (b == lo).then_some((k0, k1)));
+    (lo, kept)
 }
 
 /// **Arm A7 — intensity stereo.**
@@ -3446,7 +3493,7 @@ fn encode_cpe(
         let (mut o0, mut o1) = (off(&ch0), off(&ch1));
         Offsets::join(&mut o0, &mut o1);
         let (xp0, xp1) = (Xpow::new(&ch0), Xpow::new(&ch1));
-        let base = joint_rate_loop(
+        let (base, kept) = joint_rate_loop(
             &xp0,
             &o0,
             &xp1,
@@ -3457,15 +3504,13 @@ fn encode_cpe(
             &groups,
         );
         let (s0, s1) = (scalefactors(&o0, base), scalefactors(&o1, base));
-        let q0 = if is_short {
-            code_frame_short(&xp0, swb, &s0, &groups).3
-        } else {
-            code_frame(&xp0, swb, &s0).3
-        };
-        let q1 = if is_short {
-            code_frame_short(&xp1, swb, &s1, &groups).3
-        } else {
-            code_frame(&xp1, swb, &s1).3
+        let (q0, q1) = match kept {
+            Some(q) => q,
+            None if is_short => (
+                code_frame_short(&xp0, swb, &s0, &groups).3,
+                code_frame_short(&xp1, swb, &s1, &groups).3,
+            ),
+            None => (code_frame(&xp0, swb, &s0).3, code_frame(&xp1, swb, &s1).3),
         };
         (s0, q0, s1, q1)
     } else {
