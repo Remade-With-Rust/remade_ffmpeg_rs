@@ -137,23 +137,45 @@ fn undo_h16n<const N: usize>(row: &mut [u8]) {
     }
 }
 
+/// 8-bit forward differencing in place: `row[i] -= row[i - spp]`, back to
+/// front so every byte read is still an original one.
+///
+/// Blocks of 32 from the end: a block loads its own bytes and the bytes
+/// `spp` to their left (all still original: only bytes right of the block
+/// have been written), subtracts and stores. With both operands in
+/// fixed-size arrays the subtraction is two vector instructions; the
+/// byte-at-a-time loop, with its two bounds checks, was 7 Ir a byte.
+fn do_h8(row: &mut [u8], spp: usize) {
+    const B: usize = 32;
+    let mut i = row.len();
+    while i >= spp + B {
+        let cur: [u8; B] = row[i - B..i].try_into().unwrap();
+        let prev: [u8; B] = row[i - B - spp..i - spp].try_into().unwrap();
+        let mut d = [0u8; B];
+        for k in 0..B {
+            d[k] = cur[k].wrapping_sub(prev[k]);
+        }
+        row[i - B..i].copy_from_slice(&d);
+        i -= B;
+    }
+    for j in (spp..i).rev() {
+        row[j] = row[j].wrapping_sub(row[j - spp]);
+    }
+}
+
 /// Apply horizontal differencing on each `row_bytes` row.
 pub(crate) fn apply_horizontal(buf: &mut [u8], row_bytes: usize, spp: usize, bytes: usize) {
     if row_bytes == 0 {
         return;
     }
-    for row in buf.chunks_mut(row_bytes) {
-        match bytes {
-            1 => {
-                for i in (spp..row.len()).rev() {
-                    row[i] = row[i].wrapping_sub(row[i - spp]);
-                }
-            }
-            2 => do_h16(row, spp),
-            4 => do_h32(row, spp),
-            8 => do_h64(row, spp),
-            _ => {}
-        }
+    // The width is matched once per chunk, not once per row.
+    let rows = buf.chunks_mut(row_bytes);
+    match bytes {
+        1 => rows.for_each(|row| do_h8(row, spp)),
+        2 => rows.for_each(|row| do_h16(row, spp)),
+        4 => rows.for_each(|row| do_h32(row, spp)),
+        8 => rows.for_each(|row| do_h64(row, spp)),
+        _ => {}
     }
 }
 
@@ -357,6 +379,60 @@ mod tests {
                         apply_float(&mut a, row_bytes, spp, bytes);
                         ref_apply_float(&mut b, row_bytes, spp, bytes);
                         assert_eq!(a, b, "apply: bytes {bytes} spp {spp} px {px}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Horizontal differencing by its definition: sample by sample, back
+    /// to front (the oracle for the block kernels).
+    fn ref_apply_horizontal(buf: &mut [u8], row_bytes: usize, spp: usize, bytes: usize) {
+        let big = cfg!(target_endian = "big");
+        let rd = |b: &[u8]| {
+            let mut a = [0u8; 8];
+            if big {
+                a[8 - b.len()..].copy_from_slice(b);
+            } else {
+                a[..b.len()].copy_from_slice(b);
+            }
+            u64::from_ne_bytes(a)
+        };
+        for row in buf.chunks_mut(row_bytes) {
+            let stride = spp * bytes;
+            let mut i = row.len() - row.len() % bytes;
+            while i >= stride + bytes {
+                i -= bytes;
+                let v =
+                    rd(&row[i..i + bytes]).wrapping_sub(rd(&row[i - stride..i - stride + bytes]));
+                let a = v.to_ne_bytes();
+                let a = if big { &a[8 - bytes..] } else { &a[..bytes] };
+                row[i..i + bytes].copy_from_slice(a);
+            }
+        }
+    }
+
+    #[test]
+    fn forward_horizontal_matches_the_definition() {
+        let mut seed = 77u32;
+        for bytes in [1usize, 2, 4, 8] {
+            for spp in 1..=5usize {
+                for px in [1usize, 2, 5, 16, 17, 31, 32, 33, 64, 100] {
+                    let row_bytes = px * spp * bytes;
+                    // Whole rows, and a short last row cut inside a sample.
+                    for cut in [0usize, 1, 3] {
+                        let orig: Vec<u8> = (0..(row_bytes * 3).saturating_sub(cut))
+                            .map(|_| {
+                                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                                (seed >> 16) as u8
+                            })
+                            .collect();
+                        let (mut a, mut b) = (orig.clone(), orig.clone());
+                        apply_horizontal(&mut a, row_bytes, spp, bytes);
+                        ref_apply_horizontal(&mut b, row_bytes, spp, bytes);
+                        assert_eq!(a, b, "bytes {bytes} spp {spp} px {px} cut {cut}");
+                        undo_horizontal(&mut a, row_bytes, spp, bytes);
+                        assert_eq!(a, orig, "undo: bytes {bytes} spp {spp} px {px} cut {cut}");
                     }
                 }
             }
