@@ -94,6 +94,34 @@ fn cvt_trunc(v: f32) -> i32 {
     }
 }
 
+/// SSE2 tiny-skia's `floor`: truncate through `i32` (`cvttps2dq`), convert
+/// back, and step down by one where the round trip went up. Computed here
+/// without the conversion, which a Rust `as` cast would make lane by lane
+/// (it saturates; see `round_to_u8`), in three ranges:
+///
+/// - `|v| < 2^23`: `(v + m) - m` with `m = copysign(2^23, v)` is the nearest
+///   integer (see `round_ties_even_magnitude`), which is `floor(v)` or one
+///   above it, so the same step down applies. A zero is `+0.0` in both forms.
+/// - `2^23 <= |v| < 2^31`: `v` is an integer and survives the round trip.
+/// - anything else (`-2^31`, out of `i32` range, NaN): the conversion gives
+///   `i32::MIN`, and `-2^31 - 1` rounds back to `-2^31`.
+///
+/// Proven equal to the conversion form over every `f32` in the tests below.
+#[inline(always)]
+fn floor_through_i32(v: f32) -> f32 {
+    let magnitude = f32::from_bits(v.to_bits() & 0x7fff_ffff);
+    let magic = f32::from_bits((v.to_bits() & 0x8000_0000) | INTEGRAL.to_bits());
+    let nearest = (v + magic) - magic;
+    let small = nearest - if nearest > v { 1.0 } else { 0.0 };
+    if magnitude < INTEGRAL {
+        small
+    } else if magnitude < 2_147_483_648.0 {
+        v
+    } else {
+        -2_147_483_648.0
+    }
+}
+
 macro_rules! lanes_bin {
     ($ty:ident, $elem:ty, $n:expr, $tr:ident, $f:ident, |$a:ident, $b:ident| $e:expr) => {
         impl $tr for $ty {
@@ -142,16 +170,12 @@ impl f32x8 {
         Self(o)
     }
 
+    #[inline(always)]
     pub fn floor(self) -> Self {
-        // SSE2 tiny-skia: truncate through i32, then step down where the
-        // round trip went up.
-        let roundtrip = self.trunc_int().to_f32x8();
-        roundtrip
-            - roundtrip
-                .cmp_gt(self)
-                .blend(f32x8::splat(1.0), f32x8::default())
+        self.map(floor_through_i32)
     }
 
+    #[inline(always)]
     pub fn fract(self) -> Self {
         self - self.floor()
     }
@@ -722,7 +746,18 @@ mod tests {
         }
     }
 
+    /// `f32x8::floor` as first written (SSE2 tiny-skia's `floor`).
+    fn floor_ref(v: f32) -> f32 {
+        let roundtrip = cvt_trunc_ref(v) as f32;
+        roundtrip - if roundtrip > v { 1.0 } else { 0.0 }
+    }
+
     fn check(v: f32) {
+        assert_eq!(
+            f32x8::splat(v).floor().0[6].to_bits(),
+            floor_ref(v).to_bits(),
+            "floor({v:e})"
+        );
         assert_eq!(cvt_trunc(v), cvt_trunc_ref(v), "cvt_trunc({v:e})");
         assert_eq!(cvt_round(v), cvt_round_ref(v), "cvt_round({v:e})");
         assert_eq!(
