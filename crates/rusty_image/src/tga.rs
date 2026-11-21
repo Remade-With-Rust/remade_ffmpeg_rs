@@ -124,6 +124,9 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     // over the output afterwards. Row and column flips below move whole
     // pixels, so they do not care about channel order.
     let swz = direct && raw_bpp >= 3;
+    // Orientation: bit 5 = top-to-bottom, bit 4 = right-to-left.
+    let stride = width * raw_bpp;
+    let mut flip_rows = desc & 0x20 == 0 && height > 1;
     if rle {
         match raw_bpp {
             1 => expand_rle::<1>(&mut r, &mut raw, false)?,
@@ -131,6 +134,26 @@ pub fn decode(data: &[u8]) -> Result<Image> {
             3 => expand_rle::<3>(&mut r, &mut raw, swz)?,
             _ => expand_rle::<4>(&mut r, &mut raw, swz)?,
         }
+    } else if flip_rows {
+        // Uncompressed and stored bottom row first (the TGA default): each
+        // stored row goes straight to its place, in the same pass as the
+        // copy or the red/blue exchange. Reading the image top-down and
+        // then exchanging rows in place was two more passes over it.
+        let src = r.bytes(n_raw)?;
+        for (d, s) in raw
+            .chunks_exact_mut(stride)
+            .rev()
+            .zip(src.chunks_exact(stride))
+        {
+            if !swz {
+                d.copy_from_slice(s);
+            } else if raw_bpp == 3 {
+                bgr_copy::<3>(d, s);
+            } else {
+                bgr_copy::<4>(d, s);
+            }
+        }
+        flip_rows = false;
     } else if swz {
         let src = r.bytes(n_raw)?;
         if raw_bpp == 3 {
@@ -142,9 +165,7 @@ pub fn decode(data: &[u8]) -> Result<Image> {
         raw.copy_from_slice(r.bytes(n_raw)?);
     }
 
-    // Orientation: bit 5 = top-to-bottom, bit 4 = right-to-left.
-    let stride = width * raw_bpp;
-    if desc & 0x20 == 0 && height > 1 {
+    if flip_rows {
         for y in 0..height / 2 {
             let (top, bottom) = raw.split_at_mut((height - 1 - y) * stride);
             top[y * stride..(y + 1) * stride].swap_with_slice(&mut bottom[..stride]);
