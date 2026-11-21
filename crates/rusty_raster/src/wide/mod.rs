@@ -291,6 +291,30 @@ impl f32x8 {
         u32x8(o)
     }
 
+    /// `trunc_int` for lanes in `[0, 2^23)`, without a float-to-int
+    /// conversion (see `round_to_u8` for why that matters).
+    ///
+    /// `v + 2^23` is the nearest integer to `v`, plus 2^23, with that integer
+    /// in the low bits of the sum's bit pattern (the sum stays in
+    /// `[2^23, 2^24]`, and at 2^24 the pattern carries into the exponent as
+    /// plain binary addition would). Where the sum went up, step back by one.
+    ///
+    /// A lane outside `[0, 2^23)` (or NaN) gives an unspecified value.
+    #[inline(always)]
+    pub fn trunc_int_below_2p23(self) -> i32x8 {
+        let mut o = [0i32; 8];
+        for i in 0..8 {
+            let v = self.0[i];
+            let sum = v + INTEGRAL;
+            let went_up = (sum - INTEGRAL > v) as u32;
+            o[i] = sum
+                .to_bits()
+                .wrapping_sub(INTEGRAL.to_bits())
+                .wrapping_sub(went_up) as i32;
+        }
+        i32x8(o)
+    }
+
     pub fn trunc_int(self) -> i32x8 {
         let mut o = [0i32; 8];
         for i in 0..8 {
@@ -775,6 +799,33 @@ mod tests {
         );
     }
 
+    /// `trunc_int_below_2p23` against `trunc_int` on every `step`-th float in
+    /// `[0, 2^23)`, and around every power of two and the top of the range.
+    fn sweep_below_2p23(step: usize) {
+        let check = |bits: u32| {
+            let v = f32::from_bits(bits);
+            assert_eq!(
+                f32x8::splat(v).trunc_int_below_2p23().0[1],
+                cvt_trunc_ref(v),
+                "trunc_int_below_2p23({v:e})"
+            );
+        };
+        let top = INTEGRAL.to_bits();
+        for bits in (0..top).step_by(step) {
+            check(bits);
+        }
+        for e in 0..=23 {
+            let b = ((1u32 << e) as f32).to_bits();
+            for d in -3i32..=3 {
+                let bits = b.wrapping_add(d as u32);
+                if bits < top {
+                    check(bits);
+                }
+            }
+        }
+        check(0x8000_0000); // -0.0, what `max(0)` could let through
+    }
+
     /// `round_to_u8` against `round_int` on every `step`-th float in `[0, 255]`.
     fn sweep_bytes(step: usize) {
         for bits in (0..=255.0f32.to_bits()).step_by(step) {
@@ -833,6 +884,7 @@ mod tests {
     fn lane_conversions_match_libm_sampled() {
         sweep(4099);
         sweep_bytes(1021);
+        sweep_below_2p23(1021);
     }
 
     /// All 2^32 bit patterns. `cargo test --release -- --ignored lane_conversions`.
@@ -841,5 +893,6 @@ mod tests {
     fn lane_conversions_match_libm_exhaustive() {
         sweep(1);
         sweep_bytes(1);
+        sweep_below_2p23(1);
     }
 }

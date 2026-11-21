@@ -321,7 +321,17 @@ fn gather_ix(pixmap: PixmapRef, mut x: f32x8, mut y: f32x8) -> u32x8 {
     x = x.max(f32x8::default()).min(f32x8::splat(w));
     y = y.max(f32x8::default()).min(f32x8::splat(h));
 
-    (y.trunc_int() * i32x8::splat(pixmap.width() as i32) + x.trunc_int()).to_u32x8_bitcast()
+    // The clamps leave every lane in `[0, limit)` (`max` turns NaN into 0), so
+    // for any pixmap short of 2^23 pixels on a side the truncation needs no
+    // float-to-int conversion.
+    const NO_CONVERSION: u32 = 1 << 23;
+    let (ix, iy) = if pixmap.width() <= NO_CONVERSION && pixmap.height() <= NO_CONVERSION {
+        (x.trunc_int_below_2p23(), y.trunc_int_below_2p23())
+    } else {
+        (x.trunc_int(), y.trunc_int())
+    };
+
+    (iy * i32x8::splat(pixmap.width() as i32) + ix).to_u32x8_bitcast()
 }
 
 #[inline(always)]
