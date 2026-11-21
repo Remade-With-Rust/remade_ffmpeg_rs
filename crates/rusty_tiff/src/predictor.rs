@@ -64,7 +64,7 @@ macro_rules! hpred {
     };
 }
 
-hpred!(undo_h16, do_h16, u16, 2);
+hpred!(undo_h16, do_h16_tail, u16, 2);
 hpred!(undo_h32, do_h32, u32, 4);
 hpred!(undo_h64, do_h64, u64, 8);
 
@@ -161,6 +161,31 @@ fn do_h8(row: &mut [u8], spp: usize) {
     for j in (spp..i).rev() {
         row[j] = row[j].wrapping_sub(row[j - spp]);
     }
+}
+
+/// The same for native-endian 16-bit samples, 16 samples a block (the
+/// sample-at-a-time loop was 12 Ir a sample); `do_h16_tail` finishes the
+/// front of the row.
+fn do_h16(row: &mut [u8], spp: usize) {
+    const B: usize = 32;
+    let stride = spp * 2;
+    let mut i = row.len() - row.len() % 2;
+    while i >= stride + B {
+        let cur: [u8; B] = row[i - B..i].try_into().unwrap();
+        let prev: [u8; B] = row[i - B - stride..i - stride].try_into().unwrap();
+        let mut d = [0u8; B];
+        for ((d, c), p) in d
+            .chunks_exact_mut(2)
+            .zip(cur.chunks_exact(2))
+            .zip(prev.chunks_exact(2))
+        {
+            let v = u16::from_ne_bytes([c[0], c[1]]).wrapping_sub(u16::from_ne_bytes([p[0], p[1]]));
+            d.copy_from_slice(&v.to_ne_bytes());
+        }
+        row[i - B..i].copy_from_slice(&d);
+        i -= B;
+    }
+    do_h16_tail(&mut row[..i], spp);
 }
 
 /// Apply horizontal differencing on each `row_bytes` row.
