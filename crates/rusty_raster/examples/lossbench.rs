@@ -54,10 +54,30 @@ impl Rng {
     }
 }
 
+/// The downstream (Freehold) harness generator, verbatim, for the scenes
+/// that reproduce its gradient rows.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) as u32
+    }
+    fn f(&mut self, lo: f32, hi: f32) -> f32 {
+        lo + (self.next() as f32 / (1u64 << 31) as f32) * (hi - lo)
+    }
+    fn u8(&mut self) -> u8 {
+        (self.next() >> 8) as u8
+    }
+}
+
 macro_rules! scenes {
     ($arm:ident, $krate:ident) => {
         mod $arm {
-            use super::{Out, Rng, H, W};
+            use super::{Lcg, Out, Rng, H, W};
             use std::time::Instant;
             use $krate::*;
 
@@ -317,6 +337,81 @@ macro_rules! scenes {
                 hot_mask_fills(&mut mask, &paths);
                 mask_out(&mask, t.elapsed())
             }
+
+            /// The downstream harness's `grad_radial` / `grad_sweep` scenes
+            /// (raster-tools `scenes.rs`), ported call for call: a transparent
+            /// 1024x768 pixmap, `Lcg(0x5eed)`, 196 anti-aliased `fill_rect`s of
+            /// 20-160 px at [-40, w|h), each with its own gradient of
+            /// 2 + i%4 translucent stops and spread Pad/Reflect/Repeat by i%3.
+            /// The shader construction is inside the hot section, as it is
+            /// in theirs.
+            #[inline(never)]
+            fn hot_fh_gradients(pm: &mut Pixmap, sweep: bool) {
+                fn fh_stops(r: &mut Lcg, n: usize) -> Vec<GradientStop> {
+                    (0..n)
+                        .map(|i| {
+                            let a = 128 + r.u8() / 2;
+                            let c = Color::from_rgba8(r.u8(), r.u8(), r.u8(), a);
+                            GradientStop::new(i as f32 / (n - 1) as f32, c)
+                        })
+                        .collect()
+                }
+                let (fw, fh) = (W as f32, H as f32);
+                let mut r = Lcg(0x5eed);
+                let id = Transform::identity();
+                let modes = [SpreadMode::Pad, SpreadMode::Reflect, SpreadMode::Repeat];
+                for i in 0..(W * H / 4000) as usize {
+                    let (x, y) = (r.f(-40.0, fw), r.f(-40.0, fh));
+                    let (rw, rh) = (r.f(20.0, 160.0), r.f(20.0, 160.0));
+                    let st = fh_stops(&mut r, 2 + i % 4);
+                    let m = modes[i % 3];
+                    let shader = if sweep {
+                        SweepGradient::new(
+                            Point::from_xy(x + rw / 2.0, y + rh / 2.0),
+                            r.f(0.0, 90.0),
+                            r.f(180.0, 360.0),
+                            st,
+                            m,
+                            id,
+                        )
+                    } else {
+                        RadialGradient::new(
+                            Point::from_xy(x + rw * 0.4, y + rh * 0.4),
+                            r.f(0.0, 8.0),
+                            Point::from_xy(x + rw / 2.0, y + rh / 2.0),
+                            rw * 0.3,
+                            st,
+                            m,
+                            id,
+                        )
+                    };
+                    let Some(shader) = shader else { continue };
+                    let p = Paint {
+                        shader,
+                        ..Paint::default()
+                    };
+                    let Some(rect) = Rect::from_xywh(x, y, rw, rh) else {
+                        return;
+                    };
+                    pm.fill_rect(rect, &p, id, None);
+                }
+            }
+
+            fn fh_gradients(sweep: bool) -> Out {
+                let pm = Pixmap::new(W, H).unwrap();
+                timed(pm, |pm| hot_fh_gradients(pm, sweep))
+            }
+
+            /// Downstream `grad_radial`: two-point conical, r0 in [0, 8),
+            /// offset centres.
+            pub fn fh_conical() -> Out {
+                fh_gradients(false)
+            }
+
+            /// Downstream `grad_sweep`: partial arcs.
+            pub fn fh_sweep() -> Out {
+                fh_gradients(true)
+            }
         }
     };
 }
@@ -348,6 +443,8 @@ workloads!(
     sweep_b,
     mask_blobs,
     mask_big,
+    fh_conical,
+    fh_sweep,
 );
 
 fn anchor(name: &str, bytes: &[u8]) {
