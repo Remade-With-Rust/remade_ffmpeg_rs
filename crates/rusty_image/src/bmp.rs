@@ -666,7 +666,19 @@ fn read_bitfield_rows(
     Ok(r.pos())
 }
 
+#[inline(never)]
 fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
+    // The stream is consumed as a slice that shrinks from the front: every
+    // operation starts with two bytes, taken with one length test, where two
+    // `Reader::u8` calls were an overflow check and a range check each.
+    let all = r.rest();
+    let mut data = all;
+    rle_rows(&mut data, h, buf)?;
+    r.skip(all.len() - data.len())
+}
+
+#[inline(always)]
+fn rle_rows(data: &mut &[u8], h: &Header, buf: &mut [u8]) -> Result<()> {
     let ch = if h.alpha { 4 } else { 3 };
     let pal = h.palette.as_deref().expect("RLE kinds carry a palette");
     let rle4 = h.kind == Kind::Rle4;
@@ -679,9 +691,9 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
             buf[y * stride + from * ch..(y + 1) * stride].fill(0);
         }
     };
-    let set = |buf: &mut [u8], ri: usize, px: usize, idx: u8| {
-        let y = row(h, ri);
-        let o = y * stride + px * ch;
+    // `rb` is the current output row's offset, kept up to date below.
+    let set = |buf: &mut [u8], rb: usize, px: usize, idx: u8| {
+        let o = rb + px * ch;
         buf[o..o + 3].copy_from_slice(&pal[idx as usize]);
     };
 
@@ -693,9 +705,12 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
         // delta moves to another row (not per pixel, not per run).
         let mut rb = row(h, ri) * stride;
         loop {
-            let control = r.u8()?;
+            let Some((&[control, arg], rest)) = data.split_first_chunk::<2>() else {
+                return Err(Error::Truncated);
+            };
+            *data = rest;
             if control == 0 {
-                match r.u8()? {
+                match arg {
                     0 => {
                         zero_from(buf, ri, px);
                         break;
@@ -708,8 +723,10 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
                         return Ok(());
                     }
                     2 => {
-                        let dx = r.u8()?;
-                        let dy = r.u8()?;
+                        let Some((&[dx, dy], rest)) = data.split_first_chunk::<2>() else {
+                            return Err(Error::Truncated);
+                        };
+                        *data = rest;
                         if dy > 0 {
                             zero_from(buf, ri, px);
                             for _ in 1..dy {
@@ -748,7 +765,10 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
                         let n = usize::from(n);
                         let mut len = if rle4 { n.div_ceil(2) } else { n };
                         len += len & 1;
-                        let idx = r.bytes(len)?;
+                        let Some((idx, rest)) = data.split_at_checked(len) else {
+                            return Err(Error::Truncated);
+                        };
+                        *data = rest;
                         if rle4 {
                             let mut left = n;
                             'nib: for &b in idx {
@@ -759,7 +779,7 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
                                     if px >= h.width {
                                         return Err(corrupt());
                                     }
-                                    set(buf, ri, px, nib);
+                                    set(buf, rb, px, nib);
                                     px += 1;
                                     left -= 1;
                                 }
@@ -781,7 +801,7 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
                     }
                 }
             } else {
-                let index = r.u8()?;
+                let index = arg;
                 let n = usize::from(control);
                 if rle4 {
                     let mut left = n;
@@ -793,7 +813,7 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
                             if px >= h.width {
                                 return Err(corrupt());
                             }
-                            set(buf, ri, px, nib);
+                            set(buf, rb, px, nib);
                             px += 1;
                             left -= 1;
                         }
