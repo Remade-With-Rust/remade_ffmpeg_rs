@@ -452,9 +452,20 @@ fn low_bit_rows<const BITS: usize, const CH: usize>(
     Ok(())
 }
 
+/// Uncompressed 16, 24 and 32-bit rows.
+///
+/// Each layout has a row loop of its own, out of line ([`direct_rows`]).
+/// Inlined into `decode_mode` as one loop, the output buffer was a local
+/// `Vec` instead of a `&mut [u8]` argument, so LLVM could not tell it from
+/// the input and the 32-bit BGRA word loop did not vectorise (9.1 Ir a
+/// pixel, 4.2 out of line); the caller's reader sat behind a pointer, so
+/// every row's `bytes` and `skip` loaded, checked and stored its position;
+/// the layout was chosen again for every row, and the per-pixel tests of
+/// the shared loops (`ch == 4`, the kind) stayed inside; and any change to
+/// one layout's loop re-rolled the registers of all the others.
+#[inline(never)]
 fn read_direct(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
     let ch = if h.alpha { 4 } else { 3 };
-    let stride = h.width * ch;
     let (bytes_pp, pad) = match h.kind {
         Kind::Rgb16 | Kind::Bitfields16 => (2, h.width % 2 * 2),
         Kind::Rgb24 => (3, (4 - (h.width * 3) % 4) % 4),
@@ -473,64 +484,133 @@ fn read_direct(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
             && (f.a.len == 0 || f.a == Field { shift: 24, len: 8 })
     });
     let std_alpha = std_masks && fields.is_some_and(|f| f.a.len != 0);
-    for i in 0..h.height {
-        let src = r.bytes(h.width * bytes_pp)?;
-        r.skip(pad)?;
-        let y = row(h, i);
-        let dst = &mut buf[y * stride..(y + 1) * stride];
-        match (h.kind, ch) {
-            (Kind::Rgb24, 3) => crate::swizzle::swap_rb3(dst, src),
-            (Kind::Rgb32, 3) => {
-                for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
-                    px.copy_from_slice(&[s[2], s[1], s[0]]);
-                }
+    let g = RowGeom {
+        height: h.height,
+        top_down: h.top_down,
+        n: h.width * bytes_pp,
+        pad,
+        stride: h.width * ch,
+    };
+    let data = r.rest();
+    let used = match (h.kind, ch) {
+        (Kind::Rgb24, 3) => direct_rows(data, buf, g, crate::swizzle::swap_rb3)?,
+        (Kind::Rgb32, 3) => direct_rows(data, buf, g, |dst, src| {
+            for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
+                px.copy_from_slice(&[s[2], s[1], s[0]]);
             }
-            (Kind::Bitfields32, _) if std_masks => {
-                if ch == 4 {
-                    // BGRA -> RGBA as one word: swap bytes 0 and 2, and force
-                    // alpha opaque (decided once, not per pixel) when the
-                    // file has no alpha mask.
-                    let opaque = if std_alpha { 0 } else { 0xff00_0000u32 };
-                    for (px, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-                        let v = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-                        let v = v.swap_bytes().rotate_right(8) | opaque;
-                        px.copy_from_slice(&v.to_le_bytes());
-                    }
-                } else {
-                    for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
-                        px.copy_from_slice(&[s[2], s[1], s[0]]);
-                    }
+        })?,
+        (Kind::Bitfields32, 4) if std_masks => {
+            // BGRA -> RGBA as one word: swap bytes 0 and 2, and force alpha
+            // opaque (decided once, not per pixel) when the file has no
+            // alpha mask.
+            let opaque = if std_alpha { 0 } else { 0xff00_0000u32 };
+            direct_rows(data, buf, g, move |dst, src| {
+                for (px, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                    let v = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+                    let v = v.swap_bytes().rotate_right(8) | opaque;
+                    px.copy_from_slice(&v.to_le_bytes());
                 }
+            })?
+        }
+        (Kind::Bitfields32, _) if std_masks => direct_rows(data, buf, g, |dst, src| {
+            for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
+                px.copy_from_slice(&[s[2], s[1], s[0]]);
             }
-            (Kind::Rgb24 | Kind::Rgb32 | Kind::Rgba32, _) => {
-                for (px, s) in dst.chunks_exact_mut(ch).zip(src.chunks_exact(bytes_pp)) {
-                    px[0] = s[2];
-                    px[1] = s[1];
-                    px[2] = s[0];
-                    if ch == 4 {
-                        px[3] = if h.kind == Kind::Rgba32 { s[3] } else { 0xff };
-                    }
-                }
+        })?,
+        // 24 and 32-bit `BI_RGB` rows of an icon entry, which carries alpha.
+        (Kind::Rgb24, _) => direct_rows(data, buf, g, |dst, src| {
+            for (px, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
+                px.copy_from_slice(&[s[2], s[1], s[0], 0xff]);
             }
-            _ => {
-                let f = fields.expect("bitfield kinds carry masks");
-                for (px, s) in dst.chunks_exact_mut(ch).zip(src.chunks_exact(bytes_pp)) {
-                    let v = if bytes_pp == 2 {
-                        u32::from(u16::from_le_bytes([s[0], s[1]]))
-                    } else {
-                        u32::from_le_bytes([s[0], s[1], s[2], s[3]])
-                    };
-                    px[0] = f.r.read(v);
-                    px[1] = f.g.read(v);
-                    px[2] = f.b.read(v);
-                    if ch == 4 {
-                        px[3] = if f.a.len != 0 { f.a.read(v) } else { 0xff };
-                    }
-                }
+        })?,
+        (Kind::Rgb32, _) => direct_rows(data, buf, g, |dst, src| {
+            for (px, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                px.copy_from_slice(&[s[2], s[1], s[0], 0xff]);
+            }
+        })?,
+        (Kind::Rgba32, 3) => direct_rows(data, buf, g, |dst, src| {
+            for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
+                px.copy_from_slice(&[s[2], s[1], s[0]]);
+            }
+        })?,
+        (Kind::Rgba32, _) => direct_rows(data, buf, g, |dst, src| {
+            for (px, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                px.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+            }
+        })?,
+        _ => {
+            let f = fields.expect("bitfield kinds carry masks");
+            read_bitfield_rows(data, buf, g, bytes_pp, ch, &f)?
+        }
+    };
+    r.skip(used)
+}
+
+/// Where the stored rows of an uncompressed image go: `n` bytes of pixels
+/// then `pad` bytes of padding per stored row, `stride` bytes per output
+/// row, the first stored row at the bottom unless `top_down`.
+#[derive(Clone, Copy)]
+struct RowGeom {
+    height: usize,
+    top_down: bool,
+    n: usize,
+    pad: usize,
+    stride: usize,
+}
+
+/// Every stored row converted into its output row by `f`. Reads from the
+/// start of `data`; returns how many bytes the rows took. Out of line, one
+/// copy per layout.
+#[inline(never)]
+fn direct_rows(
+    data: &[u8],
+    buf: &mut [u8],
+    g: RowGeom,
+    mut f: impl FnMut(&mut [u8], &[u8]),
+) -> Result<usize> {
+    let mut r = Reader::new(data);
+    for i in 0..g.height {
+        let src = r.bytes(g.n)?;
+        r.skip(g.pad)?;
+        let y = if g.top_down { i } else { g.height - 1 - i };
+        f(&mut buf[y * g.stride..(y + 1) * g.stride], src);
+    }
+    Ok(r.pos())
+}
+
+/// The rows of a 16-bit image, or of a 32-bit one whose masks are not the
+/// standard 8-8-8(-8). Reads from the start of `data`; returns how many
+/// bytes the rows took.
+#[inline(never)]
+fn read_bitfield_rows(
+    data: &[u8],
+    buf: &mut [u8],
+    g: RowGeom,
+    bytes_pp: usize,
+    ch: usize,
+    f: &Fields,
+) -> Result<usize> {
+    let mut r = Reader::new(data);
+    for i in 0..g.height {
+        let src = r.bytes(g.n)?;
+        r.skip(g.pad)?;
+        let y = if g.top_down { i } else { g.height - 1 - i };
+        let dst = &mut buf[y * g.stride..(y + 1) * g.stride];
+        for (px, s) in dst.chunks_exact_mut(ch).zip(src.chunks_exact(bytes_pp)) {
+            let v = if bytes_pp == 2 {
+                u32::from(u16::from_le_bytes([s[0], s[1]]))
+            } else {
+                u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+            };
+            px[0] = f.r.read(v);
+            px[1] = f.g.read(v);
+            px[2] = f.b.read(v);
+            if ch == 4 {
+                px[3] = if f.a.len != 0 { f.a.read(v) } else { 0xff };
             }
         }
     }
-    Ok(())
+    Ok(r.pos())
 }
 
 fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
