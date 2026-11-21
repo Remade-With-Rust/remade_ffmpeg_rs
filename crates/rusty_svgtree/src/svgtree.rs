@@ -827,8 +827,10 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document, Error> {
         limits,
     };
 
-    // Style sheets and the id map, in one bounded iterative walk.
+    // Style sheets and the ids, in one bounded iterative walk. The ids are
+    // listed first and the map built at its final size, so it never rehashes.
     let mut stack = vec![root_el];
+    let mut ids: Vec<(&str, XId)> = Vec::new();
     let mut visited = 0usize;
     while let Some(id) = stack.pop() {
         visited += 1;
@@ -840,7 +842,7 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document, Error> {
             continue;
         }
         if let Some(v) = n.attr("id") {
-            b.id_map.entry(v).or_insert(id);
+            ids.push((v, id));
         }
         if xml.name(id) == "style"
             && matches!(xml.ns_uri(id), None | Some(SVG_NS))
@@ -849,14 +851,20 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document, Error> {
             let text = xml.xml_node_get_content(id);
             css::parse_sheet(&text, &mut b.sheet);
         }
-        // Push children in reverse for document order.
-        let mut kids = Vec::new();
+        // Push the children and reverse them where they lie: they pop in
+        // document order.
+        let first = stack.len();
         let mut c = xml.first_child(id);
         while let Some(k) = c {
-            kids.push(k);
+            stack.push(k);
             c = xml.next_sibling(k);
         }
-        stack.extend(kids.into_iter().rev());
+        stack[first..].reverse();
+    }
+    b.id_map.reserve(ids.len());
+    for (v, id) in ids {
+        // The first element with an id owns it.
+        b.id_map.entry(v).or_insert(id);
     }
 
     let root = XNode {
@@ -869,7 +877,8 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document, Error> {
     b.rule_index = css::RuleIndex::new(&b.sheet);
     b.parse_node(root_el, None, NodeId(0), false, 0)?;
 
-    let mut links = HashMap::new();
+    // No more ids than the XML had: sized once.
+    let mut links = HashMap::with_capacity(b.id_map.len());
     for (i, n) in b.doc.nodes.iter().enumerate() {
         if n.tag.is_none() {
             continue;
