@@ -775,11 +775,20 @@ fn store_8888(
     r: &u16x16, g: &u16x16, b: &u16x16, a: &u16x16,
     data: &mut [u8; STAGE_WIDTH * 4],
 ) {
+    // The low byte of each lane, packed into one `r | g << 8 | b << 16 |
+    // a << 24` word per pixel (the pixmap's byte order, little-endian) and
+    // stored four bytes at a time. Writing the 64 bytes one by one made
+    // LLVM spill the lanes to the stack and rebuild every pixel from single
+    // bytes.
+    let mut px = [0u32; STAGE_WIDTH];
     for i in 0..STAGE_WIDTH {
-        data[i * 4] = r.0[i] as u8;
-        data[i * 4 + 1] = g.0[i] as u8;
-        data[i * 4 + 2] = b.0[i] as u8;
-        data[i * 4 + 3] = a.0[i] as u8;
+        px[i] = u32::from(r.0[i] as u8)
+            | u32::from(g.0[i] as u8) << 8
+            | u32::from(b.0[i] as u8) << 16
+            | u32::from(a.0[i] as u8) << 24;
+    }
+    for (bytes, p) in data.chunks_exact_mut(4).zip(px) {
+        bytes.copy_from_slice(&p.to_le_bytes());
     }
 }
 
