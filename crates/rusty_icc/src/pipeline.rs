@@ -927,16 +927,19 @@ impl Chain {
             ),
             _ => (vec![axis; self.in_ch], &self.ops),
         };
-        let mut data = Vec::with_capacity(total * self.out_ch);
+        // Written in place, point by point, the points visited in order by an
+        // odometer over the axis indices (last input fastest) instead of a
+        // division and a remainder per input per point.
+        let mut data = vec![0.0f32; total * self.out_ch];
         // A tetrahedral CLUT right after the curves (CMYK and RGB LUT
         // inputs): its grid cell and fraction along an axis depend on that
         // axis value alone, so they are worked out once per axis value.
         if let Some((Op::Lut(Stage::Clut(c)), rest)) = tail.split_first() {
-            if grid_through_clut(c, &head, rest, (self.in_ch, self.out_ch), total, &mut data) {
+            if grid_through_clut(c, &head, rest, (self.in_ch, self.out_ch), &mut data) {
                 return data;
             }
         }
-        grid_ops(&head, tail, (self.in_ch, self.out_ch), total, &mut data);
+        grid_ops(&head, tail, (self.in_ch, self.out_ch), &mut data);
         data
     }
 
@@ -951,23 +954,19 @@ impl Chain {
 /// and then the rest of the ops. In its own frame, so the CLUT path beside it
 /// cannot reshape it.
 #[inline(never)]
-fn grid_ops(
-    head: &[Vec<f64>],
-    tail: &[Op],
-    (in_ch, out_ch): (usize, usize),
-    total: usize,
-    data: &mut Vec<f32>,
-) {
+fn grid_ops(head: &[Vec<f64>], tail: &[Op], (in_ch, out_ch): (usize, usize), data: &mut [f32]) {
     let g = head[0].len();
-    for idx in 0..total {
+    let mut at = [0usize; 16];
+    for point in data.chunks_exact_mut(out_ch) {
         let mut v = [0.0f64; 16];
-        let mut rem = idx;
-        for c in (0..in_ch).rev() {
-            v[c] = head[c][rem % g];
-            rem /= g;
+        for c in 0..in_ch {
+            v[c] = head[c][at[c]];
         }
         run(tail, &mut v, in_ch);
-        data.extend(v[..out_ch].iter().map(|&x| x as f32));
+        for (d, &x) in point.iter_mut().zip(&v) {
+            *d = x as f32;
+        }
+        advance(&mut at[..in_ch], g);
     }
 }
 
@@ -981,22 +980,21 @@ fn grid_through_clut(
     h: &[Vec<f64>],
     rest: &[Op],
     (in_ch, out_ch): (usize, usize),
-    total: usize,
-    data: &mut Vec<f32>,
+    data: &mut [f32],
 ) -> bool {
     let done = match (in_ch, c.outputs) {
         (3, 3) => c
             .fixed::<3, 3>()
-            .map(|f| grid_clut(&f, h, rest, total, out_ch, data)),
+            .map(|f| grid_clut(&f, h, rest, out_ch, data)),
         (3, 4) => c
             .fixed::<3, 4>()
-            .map(|f| grid_clut(&f, h, rest, total, out_ch, data)),
+            .map(|f| grid_clut(&f, h, rest, out_ch, data)),
         (4, 3) => c
             .fixed::<4, 3>()
-            .map(|f| grid_clut(&f, h, rest, total, out_ch, data)),
+            .map(|f| grid_clut(&f, h, rest, out_ch, data)),
         (4, 4) => c
             .fixed::<4, 4>()
-            .map(|f| grid_clut(&f, h, rest, total, out_ch, data)),
+            .map(|f| grid_clut(&f, h, rest, out_ch, data)),
         _ => None,
     };
     done.is_some()
@@ -1015,9 +1013,8 @@ fn grid_clut<const IN: usize, const OUT: usize>(
     f: &FixedClut<'_, IN, OUT>,
     head: &[Vec<f64>],
     rest: &[Op],
-    total: usize,
     out_ch: usize,
-    data: &mut Vec<f32>,
+    data: &mut [f32],
 ) {
     let cells: [Vec<(usize, f64)>; IN] = core::array::from_fn(|c| {
         head[c]
@@ -1026,18 +1023,33 @@ fn grid_clut<const IN: usize, const OUT: usize>(
             .collect()
     });
     let g = head[0].len();
-    for idx in 0..total {
+    let mut at = [0usize; IN];
+    for point in data.chunks_exact_mut(out_ch) {
         let mut v = [0.0f64; 16];
         let mut cell = [(0usize, 0.0f64); IN];
-        let mut rem = idx;
-        for c in (0..IN).rev() {
-            v[c] = head[c][rem % g];
-            cell[c] = cells[c][rem % g];
-            rem /= g;
+        for c in 0..IN {
+            v[c] = head[c][at[c]];
+            cell[c] = cells[c][at[c]];
         }
         f.at(&cell, &mut v);
         run(rest, &mut v, OUT);
-        data.extend(v[..out_ch].iter().map(|&x| x as f32));
+        for (d, &x) in point.iter_mut().zip(&v) {
+            *d = x as f32;
+        }
+        advance(&mut at, g);
+    }
+}
+
+/// Steps the axis indices `at` (last fastest, each below `g`) to the next
+/// grid point in row-major order.
+#[inline(always)]
+fn advance(at: &mut [usize], g: usize) {
+    for i in at.iter_mut().rev() {
+        *i += 1;
+        if *i < g {
+            return;
+        }
+        *i = 0;
     }
 }
 
