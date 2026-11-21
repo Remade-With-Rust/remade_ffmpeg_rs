@@ -1492,9 +1492,15 @@ fn store_8888_tail(
     r: &f32x8, g: &f32x8, b: &f32x8, a: &f32x8,
     tail: usize, data: &mut [u8],
 ) {
-    for (px, v) in data.chunks_exact_mut(4).zip(pack_8888(r, g, b, a)).take(tail) {
-        px.copy_from_slice(&v.to_le_bytes());
-    }
+    // All eight pixels are packed as vectors into a buffer and the tail's
+    // bytes copied out. Packing inside the per-pixel loop let LLVM sink the
+    // conversion into it and redo it lane by lane in scalar code for every
+    // pixel written. The same words reach the same bytes (at most `tail`
+    // whole pixels, and never past the end of `data`).
+    let mut buf = [0u8; STAGE_WIDTH * 4];
+    store_8888(r, g, b, a, &mut buf);
+    let n = tail.min(STAGE_WIDTH).min(data.len() / 4) * 4;
+    data[..n].copy_from_slice(&buf[..n]);
 }
 
 /// The eight pixels as `r | g << 8 | b << 16 | a << 24`, i.e. the pixmap's
