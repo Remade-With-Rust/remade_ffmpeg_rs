@@ -900,6 +900,29 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     if selection.is_empty() {
         return Err(Error::unsupported("no streams selected for the output"));
     }
+    // A still-image output holds one picture. Without `-map`, keep one video
+    // stream — the first one marked default (a JPEG MPF file's primary image,
+    // not its gain map or thumbnails), else the first — as FFmpeg picks a
+    // single best video stream. `-map 0:N` picks any other.
+    if output.maps.is_empty() {
+        let still = resolve_output_format(engine, output)
+            .ok()
+            .and_then(|name| engine.formats.by_name(&name))
+            .is_some_and(|f| f.mux_caps.still_image);
+        if still {
+            let is_video =
+                |&(inp, i): &(usize, usize)| input_streams[inp][i].media_type == MediaType::Video;
+            let keep = selection
+                .iter()
+                .copied()
+                .filter(is_video)
+                .find(|&(inp, i)| input_streams[inp][i].disposition.default == Some(true))
+                .or_else(|| selection.iter().copied().find(is_video));
+            if let Some(keep) = keep {
+                selection.retain(|s| !is_video(s) || *s == keep);
+            }
+        }
+    }
 
     // Single-codec containers can't stream-copy a foreign codec, so an unset
     // `-c:v` must mean TRANSCODE to the container's one codec, not copy (which
@@ -915,7 +938,7 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
             Some("yuv4mpegpipe") => Some((CodecId::RawVideo, true)),
             Some("webp") => Some((CodecId::Webp, false)),
             Some("png") => Some((CodecId::Png, false)),
-            Some("jpeg") => Some((CodecId::Jpeg, false)),
+            Some("jpeg") | Some("jpeg_mpf") => Some((CodecId::Jpeg, false)),
             Some("gif") => Some((CodecId::Gif, false)),
             Some("avif") => Some((CodecId::Avif, false)),
             Some("jpegxl") => Some((CodecId::Jxl, false)),
@@ -1021,6 +1044,13 @@ pub fn run(engine: &Engine, spec: &TranscodeSpec) -> Result<TranscodeReport> {
     if muxer_path_factory.is_none() {
         for (key, value) in output.format_options.iter() {
             muxer.set_option(key, value);
+        }
+    }
+    // Per-stream metadata rides along from the input stream (FFmpeg's default
+    // `-map_metadata`): a JPEG MPF remux keeps each image's MP Type.
+    for (out_index, &(inp, local)) in selection.iter().enumerate() {
+        if let Some(md) = demuxers[inp].stream_metadata(local) {
+            muxer.set_stream_metadata(out_index, md);
         }
     }
     muxer.write_header(&out_streams)?;

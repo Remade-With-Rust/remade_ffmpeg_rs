@@ -10,6 +10,7 @@ use std::process::ExitCode;
 
 use rff::probe::MediaInfo;
 use rff::Engine;
+use rff_core::Dictionary;
 
 /// Entry point used by `src/bin/ffprobe.rs`.
 pub fn run(args: Vec<String>) -> ExitCode {
@@ -75,12 +76,12 @@ pub fn run(args: Vec<String>) -> ExitCode {
             }
         };
     }
-    match rff::probe::probe(&engine, &input) {
-        Ok(info) => {
+    match rff::probe::probe_with_metadata(&engine, &input) {
+        Ok((info, tags)) => {
             if as_json {
-                print_json(&input, &info);
+                print_json(&input, &info, &tags);
             } else {
-                print_human(&input, &info);
+                print_human(&input, &info, &tags);
             }
             ExitCode::SUCCESS
         }
@@ -139,7 +140,7 @@ Convert to ({} targets):",
 }
 
 /// FFprobe-style human output.
-fn print_human(input: &str, info: &MediaInfo) {
+fn print_human(input: &str, info: &MediaInfo, tags: &[Dictionary]) {
     println!("Input #0, {}, from '{}':", info.format_name, input);
     for stream in &info.streams {
         let detail = match stream.media_type {
@@ -156,11 +157,17 @@ fn print_human(input: &str, info: &MediaInfo) {
             other => format!("{other}: {}", stream.codec_id),
         };
         println!("  Stream #0:{}: {detail}", stream.index);
+        if let Some(md) = tags.get(stream.index).filter(|d| !d.is_empty()) {
+            println!("    Metadata:");
+            for (k, v) in md.iter() {
+                println!("      {k:<16}: {v}");
+            }
+        }
     }
 }
 
 /// Minimal JSON output (hand-rolled to keep the CLI dependency-light).
-fn print_json(input: &str, info: &MediaInfo) {
+fn print_json(input: &str, info: &MediaInfo, tags: &[Dictionary]) {
     println!("{{");
     println!("  \"format\": {{");
     println!("    \"filename\": {},", json_str(input));
@@ -187,7 +194,19 @@ fn print_json(input: &str, info: &MediaInfo) {
         println!("      \"width\": {},", stream.width);
         println!("      \"height\": {},", stream.height);
         println!("      \"sample_rate\": {},", stream.sample_rate);
-        println!("      \"channels\": {}", stream.channels);
+        match tags.get(stream.index).filter(|d| !d.is_empty()) {
+            Some(md) => {
+                println!("      \"channels\": {},", stream.channels);
+                println!("      \"tags\": {{");
+                let n = md.len();
+                for (i, (k, v)) in md.iter().enumerate() {
+                    let sep = if i + 1 < n { "," } else { "" };
+                    println!("        {}: {}{sep}", json_str(k), json_str(v));
+                }
+                println!("      }}");
+            }
+            None => println!("      \"channels\": {}", stream.channels),
+        }
         println!("    }}{comma}");
     }
     println!("  ]");

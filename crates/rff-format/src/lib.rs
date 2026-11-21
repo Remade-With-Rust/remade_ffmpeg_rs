@@ -324,6 +324,14 @@ pub trait Demuxer: Send {
     fn metadata(&self) -> Option<&Dictionary> {
         None
     }
+
+    /// Stream `index`'s own metadata, in FFmpeg-style key names where FFmpeg
+    /// has one and the format's own otherwise (the JPEG MPF demuxer's
+    /// `mpf_type`). Available after [`read_header`](Demuxer::read_header);
+    /// `None` when the stream has none (the default).
+    fn stream_metadata(&self, _index: usize) -> Option<&Dictionary> {
+        None
+    }
 }
 
 /// One sample (packet) of a stream as the container's index records it.
@@ -531,6 +539,12 @@ pub trait Muxer: Send {
     /// [`write_header`](Muxer::write_header); formats without a metadata slot
     /// simply ignore it (the default).
     fn set_metadata(&mut self, _metadata: &Dictionary) {}
+
+    /// Hand the muxer output stream `index`'s metadata (what the demuxer's
+    /// [`Demuxer::stream_metadata`] gave for the stream it came from). Called
+    /// before [`write_header`](Muxer::write_header); formats without
+    /// per-stream metadata ignore it (the default).
+    fn set_stream_metadata(&mut self, _index: usize, _metadata: &Dictionary) {}
 
     /// A muxer option, FFmpeg-style (`movflags`, `+faststart`). Called before
     /// [`write_header`](Muxer::write_header). Returns whether the muxer knows

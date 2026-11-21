@@ -77,7 +77,9 @@ Demux **and** mux: `avi`, `mp4`/`m4a`, **`mov`** (QuickTime: ProRes,
 DNxHD/HR, PCM, timecode tracks, colour/HDR boxes; fragmented MP4 is read),
 **`matroska` (mkv/mka)**,
 **`webm`** (restricted doctype, codec-checked), `mpegts`, `flv`, `ogg`, `wav`,
-`flac`, `mp3`, `y4m`, `ivf`, `avif`, `png`, `jpeg`, `mjpeg`, `mpjpeg`, `rtp`, `gif`, `webp`, `jxl`,
+`flac`, `mp3`, `y4m`, `ivf`, `avif`, `png`, `jpeg`, **`jpeg_mpf`** (JPEG Multi-Picture
+Format: Ultra HDR gain maps, `.mpo` stereo pairs, camera previews — one stream
+per image, FFmpeg 9.1's layout), `mjpeg`, `mpjpeg`, `rtp`, `gif`, `webp`, `jxl`,
 `srt` (SubRip), `webvtt`, **HLS** (`.m3u8` + TS segments: mux via the
 registry's path-muxer, demux by expanding the playlist — local or HTTP(S),
 master or media — into one TS stream).

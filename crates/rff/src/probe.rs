@@ -7,7 +7,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use rff_core::{CodecId, Error, MediaType, Rational, Result};
+use rff_core::{CodecId, Dictionary, Error, MediaType, Rational, Result};
 
 use crate::Engine;
 
@@ -42,6 +42,17 @@ pub struct StreamInfo {
 /// [`Unimplemented`](rff_core::Error::Unimplemented) state. The plumbing is
 /// real; only the per-format parsing is pending.
 pub fn probe(engine: &Engine, path: impl AsRef<Path>) -> Result<MediaInfo> {
+    probe_with_metadata(engine, path).map(|(info, _)| info)
+}
+
+/// [`probe`], plus each stream's own metadata, in stream order (an empty
+/// [`Dictionary`] for a stream that has none) — the JPEG MPF demuxer's
+/// `mpf_type` (`primary`, `gain_map`, ...), for one. `ffprobe` prints it as
+/// the stream's `Metadata:` / `tags`.
+pub fn probe_with_metadata(
+    engine: &Engine,
+    path: impl AsRef<Path>,
+) -> Result<(MediaInfo, Vec<Dictionary>)> {
     let path = path.as_ref();
     let path_str = path
         .to_str()
@@ -50,6 +61,9 @@ pub fn probe(engine: &Engine, path: impl AsRef<Path>) -> Result<MediaInfo> {
     let mut demuxer = source.open_demuxer(engine, &format_name)?;
 
     let streams = demuxer.read_header()?;
+    let metadata = (0..streams.len())
+        .map(|i| demuxer.stream_metadata(i).cloned().unwrap_or_default())
+        .collect();
     let streams = streams
         .into_iter()
         .map(|s| StreamInfo {
@@ -64,10 +78,13 @@ pub fn probe(engine: &Engine, path: impl AsRef<Path>) -> Result<MediaInfo> {
         })
         .collect();
 
-    Ok(MediaInfo {
-        format_name,
-        streams,
-    })
+    Ok((
+        MediaInfo {
+            format_name,
+            streams,
+        },
+        metadata,
+    ))
 }
 
 /// Decide which container a path should be read as: an explicit `-f` override
