@@ -222,16 +222,31 @@ struct ShaperEngine {
 
 impl ShaperEngine {
     fn table(link: &ShaperLink, n: usize) -> Box<[f32]> {
-        link.in_curves
-            .iter()
-            .flat_map(|c| (0..n).map(move |i| c.eval(i as f64 / (n - 1) as f64) as f32))
-            .collect()
+        let curves = &link.in_curves;
+        let mut table = Vec::with_capacity(curves.len() * n);
+        for (k, c) in curves.iter().enumerate() {
+            // The channels of an RGB profile nearly always share one curve:
+            // the same curve gives the same values, so its row is copied.
+            if let Some(j) = curves[..k].iter().position(|p| p.same_as(c)) {
+                table.extend_from_within(j * n..(j + 1) * n);
+            } else {
+                table.extend((0..n).map(|i| c.eval(i as f64 / (n - 1) as f64) as f32));
+            }
+        }
+        table.into_boxed_slice()
     }
 
     fn new(link: ShaperLink) -> Self {
         let in8 = Self::table(&link, 256);
         let mut out = vec![[0.0f32; OUT_TABLE]; link.out_curves.len()].into_boxed_slice();
-        for (row, c) in out.iter_mut().zip(&link.out_curves) {
+        for (k, c) in link.out_curves.iter().enumerate() {
+            let (done, rest) = out.split_at_mut(k);
+            let row = &mut rest[0];
+            // As for the input tables: the same curve's row is copied.
+            if let Some(j) = link.out_curves[..k].iter().position(|p| p.same_as(c)) {
+                *row = done[j];
+                continue;
+            }
             // The same values either way; the prepared form skips a `pow`
             // per entry for sRGB-shaped curves.
             let prepared = InvCurve::new(c);

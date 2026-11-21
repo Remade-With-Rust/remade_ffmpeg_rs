@@ -120,6 +120,26 @@ impl Curve {
         clamp01(x)
     }
 
+    /// `true` when `other` is this curve bit for bit, so both give the same
+    /// value everywhere (`==` would also equate `0.0` with `-0.0`
+    /// parameters, which can differ in the sign of a zero result).
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Table(a), Self::Table(b)) => a == b,
+            (
+                Self::Parametric {
+                    function: fa,
+                    params: pa,
+                },
+                Self::Parametric {
+                    function: fb,
+                    params: pb,
+                },
+            ) => fa == fb && pa.iter().zip(pb).all(|(x, y)| x.to_bits() == y.to_bits()),
+            _ => false,
+        }
+    }
+
     pub(crate) fn parse(r: &mut Reader<'_>) -> Result<Self> {
         let sig = r.sig("curve type")?;
         r.skip(4, "curve reserved")?;
