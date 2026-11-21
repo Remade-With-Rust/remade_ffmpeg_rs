@@ -178,11 +178,11 @@ fn iso_layer12_vectors_decode_within_one_lsb() {
 }
 
 /// `l2-nonstandard-test32-size` is `l2-test32` with ONE byte of frame 12's
-/// allocation changed. The frame decodes to whatever those bits say, the
-/// synthesis tail carries it into frame 13, and every other frame must still
-/// match the clean stream's reference. (minimp3's own reference for this file
-/// drops the frame instead; neither the frame count nor the other frames
-/// should change, so the clean reference is the stricter oracle.)
+/// allocation changed, so that the frame asks for more bits than it holds. The
+/// frame is DROPPED, as minimp3 drops it: the output is minimp3's reference for
+/// this file, which is the clean stream's reference without frame 12 (and with
+/// the frame after it started from a cleared filterbank). It used to decode to
+/// whatever those bits said, the missing ones read as zeros.
 #[test]
 fn iso_corrupt_frame_costs_only_itself() {
     let Some(dir) = std::env::var_os("MP3_ISO_VECTORS") else {
@@ -191,19 +191,27 @@ fn iso_corrupt_frame_costs_only_itself() {
     };
     let dir = Path::new(&dir);
     let bit = iso_file(dir, "l2-nonstandard-test32-size.bit");
-    let refs = pcm16(&iso_file(dir, "l2-test32.pcm"));
+    let dropped = pcm16(&iso_file(dir, "l2-nonstandard-test32-size.pcm"));
+    let clean = pcm16(&iso_file(dir, "l2-test32.pcm"));
     let d = decode(&bit);
     let ours = to_s16(&d.samples);
-    assert_eq!(ours.len(), refs.len(), "frame count must not change");
     let per_frame = 1152 * 2;
-    let hit = 12 * per_frame..14 * per_frame;
+    assert_eq!(ours.len(), clean.len() - per_frame, "one frame dropped");
+    assert_eq!(ours.len(), dropped.len(), "as in minimp3's reference");
+    let worst = max_abs_diff(&ours, &dropped);
+    eprintln!("against minimp3's reference: max|e| {worst} LSB");
+    assert!(worst <= 1, "{worst}");
+    // And every frame but the dropped one and the one after it is the clean
+    // stream's.
+    let hit = 12 * per_frame..13 * per_frame;
     let mut worst = 0;
-    for (i, (a, b)) in ours.iter().zip(&refs).enumerate() {
+    for (i, a) in ours.iter().enumerate() {
         if !hit.contains(&i) {
+            let b = clean[if i < hit.start { i } else { i + per_frame }];
             worst = worst.max((a - b).abs());
         }
     }
-    eprintln!("outside frames 12-13: max|e| {worst} LSB");
+    eprintln!("outside frames 12-13 of the clean stream: max|e| {worst} LSB");
     assert!(worst <= 1, "{worst}");
 }
 
@@ -1057,15 +1065,25 @@ fn garbage_is_skipped_and_decoding_resumes() {
             "chunk {chunk}: lead garbage"
         );
     }
-    // Damage inside a frame: overwrite frame k's payload with garbage.
+    // Damage inside a frame: overwrite frame k's payload with garbage. The
+    // frame is dropped if what is left of its allocation no longer fits it (or
+    // decodes beyond the output bound), else it decodes, within the bound.
+    // Either way only it and the frame after it (the filterbank's memory)
+    // differ from the clean decode.
     let mut hurt = clean.clone();
     let junk = garbage(size - 8);
     hurt[k * size + 8..(k + 1) * size].copy_from_slice(&junk);
     let d = decode(&hurt);
-    assert_eq!(d.frames, frames);
-    let hit = k * per_frame..(k + 2) * per_frame;
-    for (i, (a, b)) in d.samples.iter().zip(&reference.samples).enumerate() {
+    assert!(d.frames == frames || d.frames == frames - 1, "{}", d.frames);
+    let dropped = (frames - d.frames) * per_frame;
+    let hit = k * per_frame..(k + 2) * per_frame - dropped;
+    for (i, a) in d.samples.iter().enumerate() {
+        assert!(
+            a.abs() <= rusty_mp3::MAX_OUTPUT_AMPLITUDE,
+            "sample {i}: {a}"
+        );
         if !hit.contains(&i) {
+            let b = reference.samples[if i < hit.start { i } else { i + dropped }];
             assert_eq!(
                 a.to_bits(),
                 b.to_bits(),
@@ -1073,11 +1091,22 @@ fn garbage_is_skipped_and_decoding_resumes() {
             );
         }
     }
-    // A damaged HEADER: that frame is lost, the rest resync.
+    // A damaged HEADER: that frame is lost, the rest resync -- as the frames
+    // they are. (Counting alone once passed while the nine frames after the
+    // damage were nine false Layer I free-format frames, found in a pattern
+    // that recurs in every frame of this steady signal, decoded as noise.)
     let mut hurt = clean.clone();
     hurt[k * size + 2] = 0xFF; // bitrate index 15: reserved
     let d = decode(&hurt);
     assert_eq!(d.frames, frames - 1);
+    let tail = 4 * per_frame;
+    assert!(
+        bits_eq(
+            &d.samples[d.samples.len() - tail..],
+            &reference.samples[reference.samples.len() - tail..]
+        ),
+        "the frames after a damaged header decode as in the clean stream"
+    );
 }
 
 /// Truncation at every byte of a short stream, chunked and whole: never a
@@ -1129,7 +1158,12 @@ fn hostile_bytes_never_panic() {
                 1 + trial
             },
         );
-        assert!(d.samples.iter().all(|v| v.is_finite()), "trial {trial}");
+        assert!(
+            d.samples
+                .iter()
+                .all(|v| v.abs() <= rusty_mp3::MAX_OUTPUT_AMPLITUDE),
+            "trial {trial}"
+        );
         let _ = decode_pipelined(&s);
     }
     // Pure noise with sync bytes and every Layer I/II header shape.
@@ -1151,7 +1185,9 @@ fn hostile_bytes_never_panic() {
         }
         let d = decode_chunked(&s, 1 + trial as usize * 97);
         assert!(
-            d.samples.iter().all(|v| v.is_finite()),
+            d.samples
+                .iter()
+                .all(|v| v.abs() <= rusty_mp3::MAX_OUTPUT_AMPLITUDE),
             "noise trial {trial}"
         );
         let _ = decode_pipelined(&s);

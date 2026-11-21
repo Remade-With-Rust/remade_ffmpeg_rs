@@ -530,21 +530,66 @@ impl Layer12Decode {
 
     /// Decode one whole frame (`frame` starts at the 4 header bytes and runs to
     /// the frame's end) into interleaved PCM: `samples_per_frame() *
-    /// channels()` floats. A short `frame` reads as zero bits past its end, so
-    /// truncated input decodes to quiet output rather than failing. For a
-    /// free-format frame the bitrate (which picks the Layer II table) comes from
-    /// `frame.len()`.
+    /// channels()` floats. For a free-format frame the bitrate (which picks the
+    /// Layer II table) comes from `frame.len()`.
+    ///
+    /// A frame [`try_decode_frame`](Self::try_decode_frame) refuses decodes to
+    /// SILENCE here (and the filterbank memory is cleared), so damaged input is
+    /// never louder than the stream; call that method to tell such a frame
+    /// from real silence and drop it.
     #[must_use]
     pub fn decode_frame(&mut self, header: &Layer12Header, frame: &[u8]) -> Vec<f32> {
+        match self.try_decode_frame(header, frame) {
+            Ok(pcm) => pcm,
+            Err(_) => vec![0f32; header.samples_per_frame() * header.channels()],
+        }
+    }
+
+    /// [`decode_frame`](Self::decode_frame), refusing a frame that cannot be
+    /// what an encoder wrote:
+    ///
+    /// * its allocation asks for more bits than the frame holds (the check
+    ///   minimp3 makes: `bs_frame->pos > bs_frame->limit`). A damaged
+    ///   allocation is the usual cause, and so is a frame cut short; the
+    ///   missing bits used to read as zeros, which requantize to the most
+    ///   negative level of every allocated subband -- full-scale noise;
+    /// * a Layer I allocation of 15, which ISO/IEC 11172-3 2.4.2.5 forbids;
+    /// * a decoded sample beyond [`MAX_OUTPUT_AMPLITUDE`](crate::MAX_OUTPUT_AMPLITUDE)
+    ///   (or not finite): the backstop for damage that is still valid syntax.
+    ///
+    /// A refused frame also clears the filterbank memory, as minimp3 restarts
+    /// its decoder, so nothing of it leaks into the next frame. A frame that
+    /// passes decodes exactly as it always did.
+    ///
+    /// # Errors
+    /// [`Error::InvalidData`] for a frame refused as above.
+    pub fn try_decode_frame(&mut self, header: &Layer12Header, frame: &[u8]) -> Result<Vec<f32>> {
         let start = 4 + if header.crc_protected { 2 } else { 0 };
         let payload = frame.get(start..).unwrap_or(&[]);
         let mut br = BitReader::new(payload);
         let channels = header.channels();
         let mut sb: SbSamples = [[[0.0; SUBBANDS]; 36]; 2];
+        let valid = match header.layer {
+            Layer::I => read_layer1(&mut br, header, &mut sb),
+            Layer::II => {
+                let kbps = header.effective_bitrate_kbps(frame.len());
+                read_layer2(&mut br, header, kbps, &mut sb);
+                true
+            }
+        };
+        if !valid {
+            self.reset();
+            return Err(Error::invalid("mpa frame: forbidden Layer I allocation"));
+        }
+        if br.bit_pos() > payload.len() * 8 {
+            self.reset();
+            return Err(Error::invalid(
+                "mpa frame: allocation asks for more bits than the frame holds",
+            ));
+        }
         let mut pcm = vec![0f32; header.samples_per_frame() * channels];
         match header.layer {
             Layer::I => {
-                read_layer1(&mut br, header, &mut sb);
                 for ch in 0..channels {
                     synthesis::polyphase_blocks(
                         &sb[ch][..12],
@@ -555,8 +600,6 @@ impl Layer12Decode {
                 }
             }
             Layer::II => {
-                let kbps = header.effective_bitrate_kbps(frame.len());
-                read_layer2(&mut br, header, kbps, &mut sb);
                 // Two 18-pass granules through the Layer III filterbank entries
                 // (and their SIMD kernels), subband-major as they expect.
                 for g in 0..2 {
@@ -585,12 +628,24 @@ impl Layer12Decode {
                 }
             }
         }
-        pcm
+        if !crate::within_output_bound(&pcm) {
+            self.reset();
+            return Err(Error::invalid(
+                "mpa frame: decodes beyond MAX_OUTPUT_AMPLITUDE",
+            ));
+        }
+        Ok(pcm)
+    }
+
+    /// Clear the filterbank memory (after a refused frame, or a seek).
+    pub fn reset(&mut self) {
+        self.fifo = [[0.0; 1024]; 2];
     }
 }
 
 /// Layer I side information and samples (ISO/IEC 11172-3 2.4.1.5 / 2.4.3.2).
-fn read_layer1(br: &mut BitReader<'_>, header: &Layer12Header, sb: &mut SbSamples) {
+/// `false`: the frame carries the forbidden allocation 15 (nothing is decoded).
+fn read_layer1(br: &mut BitReader<'_>, header: &Layer12Header, sb: &mut SbSamples) -> bool {
     let channels = header.channels();
     let bound = header.bound().min(SUBBANDS);
     let mut alloc = [[0u8; SUBBANDS]; 2];
@@ -605,6 +660,10 @@ fn read_layer1(br: &mut BitReader<'_>, header: &Layer12Header, sb: &mut SbSample
             alloc[0][i] = v;
             alloc[1][i] = v;
         }
+    }
+    // "1111" is forbidden (2.4.2.5): no encoder writes it, damage does.
+    if alloc.iter().flatten().any(|&a| a == 15) {
+        return false;
     }
     for i in 0..SUBBANDS {
         for ch in 0..channels {
@@ -639,6 +698,7 @@ fn read_layer1(br: &mut BitReader<'_>, header: &Layer12Header, sb: &mut SbSample
             }
         }
     }
+    true
 }
 
 /// Read and requantize one Layer II sample triple of qindex `q` for the given

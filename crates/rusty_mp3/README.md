@@ -167,6 +167,26 @@ cargo feature (off by default) adds two switches: `MP3_ISA=scalar` forces the
 portable kernels, and `MP3_CENSUS=1` prints, when a decoder is dropped, how
 much of the decode each kernel arm took.
 
+## Damaged input
+
+A frame that cannot be what an encoder wrote is dropped, not decoded:
+
+- Layer I/II: an allocation that asks for more bits than the frame holds (the
+  check minimp3 makes), or the forbidden Layer I allocation 15.
+- Layer III: side information with more than 288 `big_values` pairs, the
+  reserved block type, or granules longer than the main data the frame can
+  reach (the checks minimp3 and FFmpeg make). A granule whose main data lies
+  before what the decoder holds (a stream cut ahead of it) is silent, as in
+  FFmpeg.
+- Any layer: a frame with a sample beyond `MAX_OUTPUT_AMPLITUDE` (8.0, +18 dB
+  over full scale, the bound the encoder puts on its input). This is the
+  backstop for damage that is still valid syntax, and it is not a clamp: like
+  FFmpeg's float decoder, rusty_mp3 does not limit real audio to `[-1, 1]`.
+
+The frame-level decoders report such a frame as `Error::InvalidData`
+(`Mp3Decode::decode_frame`, `Layer12Decode::try_decode_frame`), and `Mp3Decoder`
+skips it. Intact streams decode bit for bit as before.
+
 ## Security
 
 The decoder treats every input byte as hostile, and a panic on malformed input

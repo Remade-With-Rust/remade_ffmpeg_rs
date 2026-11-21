@@ -341,8 +341,11 @@ impl Mp3Decode {
     /// path run exactly the same code.
     ///
     /// # Errors
-    /// Whatever [`decode_frame_entropy`](Self::decode_frame_entropy) returns:
-    /// a malformed side-information block.
+    /// Whatever [`decode_frame_entropy`](Self::decode_frame_entropy) returns
+    /// (a frame whose side information is invalid), and
+    /// [`Error::InvalidData`](crate::Error::InvalidData) for a frame that
+    /// decodes beyond [`MAX_OUTPUT_AMPLITUDE`](crate::MAX_OUTPUT_AMPLITUDE).
+    /// Such a frame is to be dropped; the decoder stays usable.
     pub fn decode_frame(
         &mut self,
         header: &FrameHeader,
@@ -368,6 +371,15 @@ impl Mp3Decode {
             frame_main_data,
             |side, spectrum| transform.granule_to_pcm(side, spectrum, channels, &mut pcm),
         )?;
+        // The backstop for damage that is still valid syntax: see
+        // `MAX_OUTPUT_AMPLITUDE`. The transform memory holds the same garbage,
+        // so it goes too; the reservoir is the entropy stage's and stays.
+        if !crate::within_output_bound(&pcm) {
+            *transform = TransformState::default();
+            return Err(Error::invalid(
+                "mp3 frame: decodes beyond MAX_OUTPUT_AMPLITUDE",
+            ));
+        }
         Ok(pcm)
     }
 
@@ -419,10 +431,38 @@ fn entropy(
     let channels = header.channel_mode.channels();
     let granules = header.version.granules();
 
-    // 1. Side information → the per-granule decode recipe.
-    let si: SideInfo = sideinfo::parse(header, side_info_bytes)?;
+    // 1. Side information → the per-granule decode recipe. A frame whose side
+    //    information is invalid is refused whole (as minimp3 and FFmpeg refuse
+    //    it): the granule lengths must also fit the main data the frame can
+    //    reach -- its own plus the `main_data_begin` bytes before it
+    //    (minimp3's `part_23_sum` check). The frame's main data still joins the
+    //    reservoir, so the frames after it find their back-pointers where the
+    //    stream put them.
+    let si: SideInfo = match sideinfo::parse(header, side_info_bytes) {
+        Ok(si) => si,
+        Err(e) => {
+            reservoir.carry(frame_main_data);
+            return Err(e);
+        }
+    };
+    let part2_3_bits: usize = si.granules[..granules]
+        .iter()
+        .flat_map(|g| &g[..channels])
+        .map(|g| usize::from(g.part2_3_length))
+        .sum();
+    if part2_3_bits > (frame_main_data.len() + usize::from(si.main_data_begin)) * 8 {
+        reservoir.carry(frame_main_data);
+        return Err(Error::invalid(
+            "mp3 side-info: part2_3_length beyond the frame's main data",
+        ));
+    }
 
-    // 2. Reassemble main data across the reservoir boundary.
+    // 2. Reassemble main data across the reservoir boundary. `missing_bits`:
+    //    how much of this frame's main data lies BEFORE what the reservoir
+    //    holds -- the stream was cut ahead of this frame, or frames before it
+    //    were lost. Zero in an intact stream.
+    let mut missing_bits =
+        usize::from(si.main_data_begin).saturating_sub(reservoir.available()) * 8;
     let main = reservoir.assemble(si.main_data_begin, frame_main_data);
 
     let mut bit_pos = 0usize;
@@ -431,6 +471,26 @@ fn entropy(
     let mut scalefac: [[scalefactors::ScaleFactors; 2]; 2] = Default::default();
     for gr in 0..granules {
         let mut spectrum = GranuleSpectrum::default();
+        if missing_bits > 0 {
+            // This granule starts in main data that is not there. Reading it
+            // from wherever the buffer happens to start decodes garbage (loud:
+            // it is Huffman data read out of phase), so it is SILENT instead,
+            // exactly as FFmpeg does it (`mp_decode_layer3`): a zero spectrum
+            // through the transform, and the next granule starts where this
+            // one's `part2_3_length`s say it ends.
+            let len: usize = si.granules[gr][..channels]
+                .iter()
+                .map(|g| usize::from(g.part2_3_length))
+                .sum();
+            if len >= missing_bits {
+                bit_pos = len - missing_bits;
+                missing_bits = 0;
+            } else {
+                missing_bits -= len;
+            }
+            granule(&si.granules[gr], &mut spectrum);
+            continue;
+        }
         for ch in 0..channels {
             let gi = &si.granules[gr][ch];
             // Block-type census: which IMDCT path this granule/channel takes.
