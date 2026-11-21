@@ -122,6 +122,22 @@ fn floor_through_i32(v: f32) -> f32 {
     }
 }
 
+/// `v as u16` (truncate toward zero, saturate, NaN to 0) without the
+/// float-to-int conversion, which LLVM would make lane by lane (see
+/// `round_to_u8`): clamp to `[0, 65535]` with NaN going to 0, then truncate as
+/// `trunc_int_below_2p23` does. Proven equal to the cast over every `f32` in
+/// the tests below.
+#[inline(always)]
+fn cast_u16(v: f32) -> u16 {
+    let v = if v > 0.0 { v } else { 0.0 };
+    let v = if v < 65535.0 { v } else { 65535.0 };
+    let sum = v + INTEGRAL;
+    let went_up = (sum - INTEGRAL > v) as u32;
+    sum.to_bits()
+        .wrapping_sub(INTEGRAL.to_bits())
+        .wrapping_sub(went_up) as u16
+}
+
 macro_rules! lanes_bin {
     ($ty:ident, $elem:ty, $n:expr, $tr:ident, $f:ident, |$a:ident, $b:ident| $e:expr) => {
         impl $tr for $ty {
@@ -626,13 +642,26 @@ impl f32x16 {
         Self(self.0.round(), self.1.round())
     }
 
-    pub fn save_to_u16x16(&self, dst: &mut u16x16) {
+    /// The body of `save_to_u16x16`, for a caller that wants it in line.
+    ///
+    /// One body cannot serve both lowp gradient stages: in line, the 2-stop
+    /// stage gains (grad_linear2 -32.7% against -30.8% with a call) and the
+    /// multi-stop stage, already short of registers, loses (grad_linear5
+    /// -14.3% against -15.4%). Hence two names.
+    #[inline(always)]
+    pub fn save_to_u16x16_inline(&self, dst: &mut u16x16) {
         // Do not use to_i32x8, because it involves rounding,
         // and Skia cast's without it.
         for i in 0..8 {
-            dst.0[i] = self.0 .0[i] as u16;
-            dst.0[i + 8] = self.1 .0[i] as u16;
+            dst.0[i] = cast_u16(self.0 .0[i]);
+            dst.0[i + 8] = cast_u16(self.1 .0[i]);
         }
+    }
+
+    /// The out-of-line handle on the same body.
+    #[inline(never)]
+    pub fn save_to_u16x16(&self, dst: &mut u16x16) {
+        self.save_to_u16x16_inline(dst);
     }
 }
 
@@ -783,6 +812,7 @@ mod tests {
             "floor({v:e})"
         );
         assert_eq!(cvt_trunc(v), cvt_trunc_ref(v), "cvt_trunc({v:e})");
+        assert_eq!(cast_u16(v), v as u16, "cast_u16({v:e})");
         assert_eq!(cvt_round(v), cvt_round_ref(v), "cvt_round({v:e})");
         assert_eq!(
             f32x8::splat(v).round().0[3].to_bits(),
@@ -863,6 +893,10 @@ mod tests {
             4_194_304.0,
             8_388_607.5,
             8_388_608.0,
+            65_534.5,
+            65_535.0,
+            65_535.5,
+            65_536.0,
             16_777_216.0,
             2_147_483_648.0,
             4_294_967_296.0,

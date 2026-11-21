@@ -634,13 +634,17 @@ fn evenly_spaced_2_stop_gradient(p: &mut Pipeline) {
     let ctx = &p.ctx.evenly_spaced_2_stop_gradient;
 
     let t = join(&p.r, &p.g);
-    round_f32_to_u16(
+    let (rf, gf, bf, af) = scale_for_u16(
         mad(t, f32x16::splat(ctx.factor.r), f32x16::splat(ctx.bias.r)),
         mad(t, f32x16::splat(ctx.factor.g), f32x16::splat(ctx.bias.g)),
         mad(t, f32x16::splat(ctx.factor.b), f32x16::splat(ctx.bias.b)),
         mad(t, f32x16::splat(ctx.factor.a), f32x16::splat(ctx.bias.a)),
-        &mut p.r, &mut p.g, &mut p.b, &mut p.a,
     );
+    // In line here, called in `gradient_lookup`: see `save_to_u16x16_inline`.
+    rf.save_to_u16x16_inline(&mut p.r);
+    gf.save_to_u16x16_inline(&mut p.g);
+    bf.save_to_u16x16_inline(&mut p.b);
+    af.save_to_u16x16_inline(&mut p.a);
 
     p.next_stage();
 }
@@ -700,20 +704,24 @@ fn gradient_lookup(
     let bb = gather!(&ctx.biases, b);
     let ba = gather!(&ctx.biases, a);
 
-    round_f32_to_u16(
+    let (rf, gf, bf, af) = scale_for_u16(
         mad(t, fr, br),
         mad(t, fg, bg),
         mad(t, fb, bb),
         mad(t, fa, ba),
-        r, g, b, a,
     );
+    rf.save_to_u16x16(r);
+    gf.save_to_u16x16(g);
+    bf.save_to_u16x16(b);
+    af.save_to_u16x16(a);
 }
 
+/// Colour channels in `[0, 1]` scaled to `[0.5, 255.5]`, ready to truncate
+/// to a lane (`save_to_u16x16`).
 #[inline(always)]
-fn round_f32_to_u16(
+fn scale_for_u16(
     rf: f32x16, gf: f32x16, bf: f32x16, af: f32x16,
-    r: &mut u16x16, g: &mut u16x16, b: &mut u16x16, a: &mut u16x16,
-) {
+) -> (f32x16, f32x16, f32x16, f32x16) {
     // TODO: may produce a slightly different result to Skia
     //       affects the two_stops_linear_mirror test
 
@@ -722,10 +730,7 @@ fn round_f32_to_u16(
     let bf = bf.normalize() * f32x16::splat(255.0) + f32x16::splat(0.5);
     let af = af * f32x16::splat(255.0) + f32x16::splat(0.5);
 
-    rf.save_to_u16x16(r);
-    gf.save_to_u16x16(g);
-    bf.save_to_u16x16(b);
-    af.save_to_u16x16(a);
+    (rf, gf, bf, af)
 }
 
 pub fn just_return(_: &mut Pipeline) {
