@@ -9,7 +9,7 @@ use crate::color::{
 };
 use crate::curve::{clamp01, Curve, FwdSeg, InvCurve, InvSeg, Sampled};
 use crate::error::{Error, Result};
-use crate::lut::{make_trilinear, Lut, Stage};
+use crate::lut::{make_trilinear, ClutEval, FixedClut, Lut, Stage};
 use crate::profile::{ColorSpace, Profile, ProfileClass};
 use crate::transform::Intent;
 
@@ -928,16 +928,15 @@ impl Chain {
             _ => (vec![axis; self.in_ch], &self.ops),
         };
         let mut data = Vec::with_capacity(total * self.out_ch);
-        for idx in 0..total {
-            let mut v = [0.0f64; 16];
-            let mut rem = idx;
-            for c in (0..self.in_ch).rev() {
-                v[c] = head[c][rem % g];
-                rem /= g;
+        // A tetrahedral CLUT right after the curves (CMYK and RGB LUT
+        // inputs): its grid cell and fraction along an axis depend on that
+        // axis value alone, so they are worked out once per axis value.
+        if let Some((Op::Lut(Stage::Clut(c)), rest)) = tail.split_first() {
+            if grid_through_clut(c, &head, rest, (self.in_ch, self.out_ch), total, &mut data) {
+                return data;
             }
-            run(tail, &mut v, self.in_ch);
-            data.extend(v[..self.out_ch].iter().map(|&x| x as f32));
         }
+        grid_ops(&head, tail, (self.in_ch, self.out_ch), total, &mut data);
         data
     }
 
@@ -945,6 +944,100 @@ impl Chain {
     /// `in_ch`) and receives the result.
     pub(crate) fn eval_in_place(&self, v: &mut [f64; 16]) {
         run(&self.ops, v, self.in_ch);
+    }
+}
+
+/// The general loop of [`Chain::sample_grid`]: per point, the head values
+/// and then the rest of the ops. In its own frame, so the CLUT path beside it
+/// cannot reshape it.
+#[inline(never)]
+fn grid_ops(
+    head: &[Vec<f64>],
+    tail: &[Op],
+    (in_ch, out_ch): (usize, usize),
+    total: usize,
+    data: &mut Vec<f32>,
+) {
+    let g = head[0].len();
+    for idx in 0..total {
+        let mut v = [0.0f64; 16];
+        let mut rem = idx;
+        for c in (0..in_ch).rev() {
+            v[c] = head[c][rem % g];
+            rem /= g;
+        }
+        run(tail, &mut v, in_ch);
+        data.extend(v[..out_ch].iter().map(|&x| x as f32));
+    }
+}
+
+/// The grid by [`grid_clut`] when the CLUT `c` has a fixed-shape kernel
+/// (`true`); `false`, with nothing done, otherwise. Out of line, so the
+/// general loop of `sample_grid` keeps its code (with this dispatch in its
+/// frame it cost +3 instructions per grid point: build3, buildbpc +0.19%).
+#[inline(never)]
+fn grid_through_clut(
+    c: &ClutEval,
+    h: &[Vec<f64>],
+    rest: &[Op],
+    (in_ch, out_ch): (usize, usize),
+    total: usize,
+    data: &mut Vec<f32>,
+) -> bool {
+    let done = match (in_ch, c.outputs) {
+        (3, 3) => c
+            .fixed::<3, 3>()
+            .map(|f| grid_clut(&f, h, rest, total, out_ch, data)),
+        (3, 4) => c
+            .fixed::<3, 4>()
+            .map(|f| grid_clut(&f, h, rest, total, out_ch, data)),
+        (4, 3) => c
+            .fixed::<4, 3>()
+            .map(|f| grid_clut(&f, h, rest, total, out_ch, data)),
+        (4, 4) => c
+            .fixed::<4, 4>()
+            .map(|f| grid_clut(&f, h, rest, total, out_ch, data)),
+        _ => None,
+    };
+    done.is_some()
+}
+
+/// [`Chain::sample_grid`] when the ops after the head curves start with a
+/// tetrahedral CLUT of `IN` inputs and `OUT` outputs: per point, the head
+/// values and their tabulated `(cell, fraction)` per axis, the lookup by
+/// [`FixedClut::at`] (exactly what the stage's `ClutEval::eval` gives for
+/// those values, written to the same slots) and then the rest of the ops.
+/// Out of line: inlined into `sample_grid`, its four instances re-rolled the
+/// general loop there (+12 instructions per grid point on every other grid
+/// build: build3, buildlab, buildproof +431K each).
+#[inline(never)]
+fn grid_clut<const IN: usize, const OUT: usize>(
+    f: &FixedClut<'_, IN, OUT>,
+    head: &[Vec<f64>],
+    rest: &[Op],
+    total: usize,
+    out_ch: usize,
+    data: &mut Vec<f32>,
+) {
+    let cells: [Vec<(usize, f64)>; IN] = core::array::from_fn(|c| {
+        head[c]
+            .iter()
+            .map(|&x| ClutEval::axis(f.points(c), x))
+            .collect()
+    });
+    let g = head[0].len();
+    for idx in 0..total {
+        let mut v = [0.0f64; 16];
+        let mut cell = [(0usize, 0.0f64); IN];
+        let mut rem = idx;
+        for c in (0..IN).rev() {
+            v[c] = head[c][rem % g];
+            cell[c] = cells[c][rem % g];
+            rem /= g;
+        }
+        f.at(&cell, &mut v);
+        run(rest, &mut v, OUT);
+        data.extend(v[..out_ch].iter().map(|&x| x as f32));
     }
 }
 
@@ -1238,8 +1331,22 @@ mod tests {
         let lab = Profile::new_lab_identity();
         let gray = Profile::new_gray(crate::color::D65_XY, Curve::gamma(2.2));
         let rel = Intent::RelativeColorimetric;
-        for (a, b, g) in [(&srgb, &lab, 9usize), (&lab, &srgb, 7), (&gray, &srgb, 33)] {
+        let cgats =
+            Profile::new_from_slice(include_bytes!("../tests/data/CGATS001Compat-v2-micro.icc"))
+                .unwrap();
+        for (a, b, g) in [
+            (&srgb, &lab, 9usize),
+            (&lab, &srgb, 7),
+            (&gray, &srgb, 33),
+            (&cgats, &srgb, 5),
+            (&cgats, &lab, 4),
+        ] {
             let chain = build_chain(&[a, b], &[rel, rel], &[false, false]).unwrap();
+            if std::ptr::eq(a, &cgats) {
+                // The tabulated-cell path of `sample_grid` is the one taken.
+                assert!(matches!(chain.ops[0], Op::Sampled(_)));
+                assert!(matches!(chain.ops[1], Op::Lut(Stage::Clut(_))));
+            }
             let data = chain.sample_grid(g);
             let total = (0..chain.in_ch).fold(1usize, |n, _| n * g);
             assert_eq!(data.len(), total * chain.out_ch);
