@@ -458,6 +458,147 @@ fn stroke_path(
 
 fn apply_clip(clip: &ClipPath, ctx: &mut Context, ts: Transform, pixmap: &mut Pixmap) {
     let (w, h) = (pixmap.width(), pixmap.height());
+    let Some((path, path_ts)) = single_clip_path(clip, ts) else {
+        apply_clip_masked(clip, ctx, ts, pixmap);
+        return;
+    };
+    // One filled path: what `apply_clip_masked` computes, without its RGBA
+    // scratch pixmap (the tests `pixel_rect_clip_matches_the_mask` and
+    // `single_path_clip_matches_the_mask` hold the two to equal bytes). Its
+    // bytes stay reserved meanwhile, so the layer budget decides exactly as
+    // it does there.
+    let bytes = u64::from(w) * u64::from(h) * 4;
+    if ctx.live_bytes.saturating_add(bytes) > ctx.max_live_bytes {
+        pixmap.fill(Color::TRANSPARENT);
+        return;
+    }
+    ctx.live_bytes += bytes;
+    if let Some(rect) = pixel_rect(path, path_ts, w, h) {
+        // A rectangle on pixel edges: every pixel fully inside it or fully
+        // outside it, mask 255 or 0, which `apply_mask` turns into
+        // "unchanged" or "transparent". Masks of 0 and 255 commute with the
+        // inner clip's, so this one goes first.
+        clear_outside(pixmap, rect);
+        if let Some(inner) = &clip.clip_path {
+            apply_clip(inner, ctx, ts, pixmap);
+        }
+    } else if let Some(mut mask) = Mask::new(w, h) {
+        // The path's coverage, straight into a mask: drawing it with `Clear`
+        // into opaque black leaves `255 - coverage`, which the inverted
+        // alpha mask turns back into the coverage. Applied after the inner
+        // clip, in the same order as there.
+        let fill = path.fill.as_ref().map_or(FillRule::Winding, |f| f.rule);
+        mask.fill_path(&path.data, fill, path.anti_alias, path_ts);
+        if let Some(inner) = &clip.clip_path {
+            apply_clip(inner, ctx, ts, pixmap);
+        }
+        pixmap.apply_mask(&mask);
+    } else {
+        pixmap.fill(Color::TRANSPARENT);
+    }
+    ctx.live_bytes -= bytes;
+}
+
+/// The one path a clip path draws, with the transform it is drawn with, when
+/// it is a single visible, colour-filled path with an area (possibly under
+/// transform-only groups); `None` for anything else.
+fn single_clip_path(clip: &ClipPath, ts: Transform) -> Option<(&tree::Path, Transform)> {
+    let mut ts = ts.pre_concat(clip.transform);
+    let mut g = &clip.root;
+    let path = loop {
+        let [child] = g.children.as_slice() else {
+            return None;
+        };
+        match child {
+            Node::Path(p) => break p,
+            // `draw_clip_children` reads only the transform of such a group.
+            Node::Group(c) if c.clip_path.is_none() => {
+                ts = ts.pre_concat(c.transform);
+                g = c;
+            }
+            _ => return None,
+        }
+    };
+    let fill = path.fill.as_ref()?;
+    if !path.visible || !matches!(fill.paint, tree::Paint::Color(_)) {
+        return None;
+    }
+    let b = path.data.bounds();
+    if b.width() == 0.0 || b.height() == 0.0 {
+        return None;
+    }
+    Some((path, ts))
+}
+
+/// The pixel rectangle `(left, top, right, bottom)` (clamped to `w x h`) a
+/// clip path drawn with `ts` covers, when it is a rectangle whose corners
+/// land on whole pixels; `None` for any other shape.
+fn pixel_rect(
+    path: &tree::Path,
+    ts: Transform,
+    w: u32,
+    h: u32,
+) -> Option<(usize, usize, usize, usize)> {
+    let mut segs = path.data.segments();
+    let (
+        Some(rusty_raster::PathSegment::MoveTo(_)),
+        Some(rusty_raster::PathSegment::LineTo(_)),
+        Some(rusty_raster::PathSegment::LineTo(_)),
+        Some(rusty_raster::PathSegment::LineTo(_)),
+        Some(rusty_raster::PathSegment::Close),
+        None,
+    ) = (
+        segs.next(),
+        segs.next(),
+        segs.next(),
+        segs.next(),
+        segs.next(),
+        segs.next(),
+    )
+    else {
+        return None;
+    };
+    let mut p: [rusty_raster::Point; 4] = path.data.points().try_into().ok()?;
+    // The rasteriser transforms the points with this same call.
+    ts.map_points(&mut p);
+    let whole = |v: f32| v.is_finite() && v.fract() == 0.0 && v.abs() <= 16_777_216.0;
+    if !p.iter().all(|q| whole(q.x) && whole(q.y)) {
+        return None;
+    }
+    let axis = (p[0].y == p[1].y && p[1].x == p[2].x && p[2].y == p[3].y && p[3].x == p[0].x)
+        || (p[0].x == p[1].x && p[1].y == p[2].y && p[2].x == p[3].x && p[3].y == p[0].y);
+    if !axis {
+        return None;
+    }
+    let (mut l, mut t, mut r, mut bo) = (p[0].x, p[0].y, p[0].x, p[0].y);
+    for q in &p[1..] {
+        l = l.min(q.x);
+        t = t.min(q.y);
+        r = r.max(q.x);
+        bo = bo.max(q.y);
+    }
+    let clamp = |v: f32, max: u32| v.clamp(0.0, max as f32) as usize;
+    Some((clamp(l, w), clamp(t, h), clamp(r, w), clamp(bo, h)))
+}
+
+/// Makes every pixel outside `(left, top, right, bottom)` transparent.
+fn clear_outside(pixmap: &mut Pixmap, (l, t, r, b): (usize, usize, usize, usize)) {
+    let stride = pixmap.width() as usize * 4;
+    let (l, r) = (l.min(r), r);
+    let data = pixmap.data_mut();
+    for (y, row) in data.chunks_exact_mut(stride).enumerate() {
+        if y < t || y >= b || l >= r {
+            row.fill(0);
+        } else {
+            row[..l * 4].fill(0);
+            row[r * 4..].fill(0);
+        }
+    }
+}
+
+/// Clips through a mask: the clip path drawn into a scratch pixmap.
+fn apply_clip_masked(clip: &ClipPath, ctx: &mut Context, ts: Transform, pixmap: &mut Pixmap) {
+    let (w, h) = (pixmap.width(), pixmap.height());
     let Some(mut clip_pixmap) = ctx.alloc(w, h) else {
         // Out of budget: clip everything rather than leak unclipped content.
         pixmap.fill(Color::TRANSPARENT);
@@ -632,6 +773,306 @@ mod tests {
                 .draw_pixmap(0, 0, src.as_ref(), &paint, Transform::identity(), None);
             assert!(dst.data() == &before[..], "opacity {opacity}");
         }
+    }
+
+    /// `apply_clip` (which takes the pixel-rectangle path where it can)
+    /// against the mask path on its own, byte for byte: rectangles on whole
+    /// pixels and off them, inside, across and outside the layer, both
+    /// windings, under scales, flips, 90-degree turns and transform-only
+    /// groups, with and without anti-aliasing, and with an inner clip.
+    #[test]
+    fn pixel_rect_clip_matches_the_mask() {
+        use std::sync::Arc;
+
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let rect_path = |l: f32, t: f32, r: f32, b: f32, ccw: bool, aa: bool| {
+            let mut pb = PathBuilder::new();
+            pb.move_to(l, t);
+            if ccw {
+                pb.line_to(l, b);
+                pb.line_to(r, b);
+                pb.line_to(r, t);
+            } else {
+                pb.line_to(r, t);
+                pb.line_to(r, b);
+                pb.line_to(l, b);
+            }
+            pb.close();
+            let data = Arc::new(pb.finish().unwrap());
+            let bbox = data.bounds();
+            Node::Path(Box::new(tree::Path {
+                visible: true,
+                fill: Some(tree::Fill {
+                    paint: tree::Paint::Color(tree::Color {
+                        red: 255,
+                        green: 255,
+                        blue: 255,
+                    }),
+                    opacity: 1.0,
+                    rule: FillRule::Winding,
+                }),
+                stroke: None,
+                paint_order: PaintOrder::FillAndStroke,
+                anti_alias: aa,
+                data,
+                bounding_box: bbox,
+                stroke_bounding_box: bbox,
+            }))
+        };
+        let mut fast_rounds = 0;
+        for round in 0..3000 {
+            let (w, h) = (1 + (next() % 40) as u32, 1 + (next() % 40) as u32);
+            let mut layer = Pixmap::new(w, h).unwrap();
+            for p in layer.data_mut().chunks_exact_mut(4) {
+                let a = (next() % 256) as u32;
+                let c = (next() % 256) as u32 * a / 255;
+                p.copy_from_slice(&[c as u8, (c / 2) as u8, (a - c) as u8, a as u8]);
+            }
+            // Device rectangle, mostly on whole pixels.
+            let mut dev = || (next() % 60) as f32 - 10.0;
+            let (mut l, t, mut r, mut b) = (dev(), dev(), dev(), dev());
+            if next() % 5 == 0 {
+                l += 0.25;
+            }
+            if next() % 7 == 0 {
+                b -= 0.5;
+            }
+            if l == r {
+                r += 1.0;
+            }
+            if t == b {
+                b += 1.0;
+            }
+            // A transform the rectangle is mapped through, and its inverse
+            // applied to the rectangle's corners.
+            let s = [1.0f32, 2.0, 4.0, 0.5, 0.25, -1.0, -2.0][(next() % 7) as usize];
+            let (tx, ty) = ((next() % 9) as f32 - 4.0, (next() % 9) as f32 - 4.0);
+            let turn = next() % 4 == 0;
+            let ts = if turn {
+                // (x, y) -> (-s y + tx, s x + ty)
+                Transform::from_row(0.0, s, -s, 0.0, tx, ty)
+            } else {
+                Transform::from_row(s, 0.0, 0.0, s, tx, ty)
+            };
+            let inv = |px: f32, py: f32| {
+                if turn {
+                    ((py - ty) / s, -(px - tx) / s)
+                } else {
+                    ((px - tx) / s, (py - ty) / s)
+                }
+            };
+            let (ul, ut) = inv(l, t);
+            let (ur, ub) = inv(r, b);
+            let aa = next() % 4 != 0;
+            let mut node = rect_path(
+                ul.min(ur),
+                ut.min(ub),
+                ul.max(ur),
+                ut.max(ub),
+                next() % 2 == 0,
+                aa,
+            );
+            if next() % 3 == 0 {
+                // Under a transform-only group (a translation by 2 of user space).
+                let g = Group {
+                    transform: Transform::from_translate(-2.0, 0.0),
+                    children: vec![match node {
+                        Node::Path(mut p) => {
+                            let moved = p
+                                .data
+                                .as_ref()
+                                .clone()
+                                .transform(Transform::from_translate(2.0, 0.0));
+                            p.data = Arc::new(moved.unwrap());
+                            Node::Path(p)
+                        }
+                        other => other,
+                    }],
+                    ..Group::default()
+                };
+                node = Node::Group(Box::new(g));
+            }
+            let inner = (next() % 4 == 0).then(|| {
+                Arc::new(ClipPath {
+                    transform: Transform::identity(),
+                    clip_path: None,
+                    root: Group {
+                        children: vec![rect_path(1.5, 0.0, 30.0, 25.0, false, true)],
+                        ..Group::default()
+                    },
+                })
+            });
+            let clip = ClipPath {
+                transform: Transform::identity(),
+                clip_path: inner,
+                root: Group {
+                    children: vec![node],
+                    ..Group::default()
+                },
+            };
+            if single_clip_path(&clip, ts)
+                .and_then(|(p, pts)| pixel_rect(p, pts, w, h))
+                .is_some()
+            {
+                fast_rounds += 1;
+            }
+            let mut want = layer.clone();
+            let mut ctx = Context::new(64, 64, 1 << 30, 1 << 20).unwrap();
+            apply_clip_masked(&clip, &mut ctx, ts, &mut want);
+            let mut got = layer.clone();
+            let mut ctx = Context::new(64, 64, 1 << 30, 1 << 20).unwrap();
+            apply_clip(&clip, &mut ctx, ts, &mut got);
+            assert_eq!(ctx.live_bytes, 0);
+            assert!(want.data() == got.data(), "round {round}");
+        }
+        // The fast path was taken in most rounds (and declined in others).
+        assert!((1000..2900).contains(&fast_rounds), "{fast_rounds}");
+    }
+
+    /// `apply_clip` against the mask path on its own, byte for byte, for
+    /// clips of one path of any shape: polygons and curves (rounded corners,
+    /// circles), both fill rules, with and without anti-aliasing, under
+    /// fractional scales, rotations and skews, partly or wholly outside the
+    /// layer, and with an inner clip.
+    #[test]
+    fn single_path_clip_matches_the_mask() {
+        use std::sync::Arc;
+
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut coord = || (next() % 4400) as f32 / 100.0 - 6.0;
+        let mut shapes = Vec::new();
+        for _ in 0..3000 {
+            let mut pb = PathBuilder::new();
+            pb.move_to(coord(), coord());
+            for _ in 0..2 + (coord() as i32).rem_euclid(5) {
+                if coord() > 15.0 {
+                    let (a, b, c, d, e, f) = (coord(), coord(), coord(), coord(), coord(), coord());
+                    pb.cubic_to(a, b, c, d, e, f);
+                } else {
+                    pb.line_to(coord(), coord());
+                }
+            }
+            pb.close();
+            if coord() > 30.0 {
+                // A second contour (both fill rules matter then).
+                pb.move_to(coord(), coord());
+                pb.line_to(coord(), coord());
+                pb.line_to(coord(), coord());
+                pb.close();
+            }
+            shapes.push(pb.finish());
+        }
+        // Rounded rectangles and circles, as icon clip paths have.
+        for i in 0..400 {
+            let r = 1.0 + (i % 7) as f32;
+            let (l, t) = ((i % 9) as f32 - 2.0, (i % 5) as f32 - 1.0);
+            let mut pb = PathBuilder::new();
+            pb.push_rect(rusty_raster::Rect::from_xywh(l, t, 20.0 + r, 14.0).unwrap());
+            shapes.push(PathBuilder::from_circle(l + 10.0, t + 8.0, r * 2.0));
+            let (rr, w, h) = (r, 24.0, 16.0);
+            pb.move_to(l + rr, t);
+            pb.line_to(l + w - rr, t);
+            pb.quad_to(l + w, t, l + w, t + rr);
+            pb.line_to(l + w, t + h - rr);
+            pb.cubic_to(l + w, t + h, l + w, t + h, l + w - rr, t + h);
+            pb.line_to(l + rr, t + h);
+            pb.quad_to(l, t + h, l, t + h - rr);
+            pb.line_to(l, t + rr);
+            pb.quad_to(l, t, l + rr, t);
+            pb.close();
+            shapes.push(pb.finish());
+        }
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            x >> 33
+        };
+        let mut taken = 0;
+        for (round, data) in shapes.into_iter().flatten().enumerate() {
+            let (w, h) = (1 + (next() % 48) as u32, 1 + (next() % 40) as u32);
+            let mut layer = Pixmap::new(w, h).unwrap();
+            for p in layer.data_mut().chunks_exact_mut(4) {
+                let a = (next() % 256) as u32;
+                let c = (next() % 256) as u32 * a / 255;
+                p.copy_from_slice(&[c as u8, (c / 3) as u8, (a - c) as u8, a as u8]);
+            }
+            let f = |n: u64| (n % 1000) as f32 / 250.0 - 2.0;
+            let ts = match next() % 4 {
+                0 => Transform::from_scale(2.0, 2.0),
+                1 => {
+                    Transform::from_row(1.0 + f(next()) / 4.0, 0.0, 0.0, 1.5, f(next()), f(next()))
+                }
+                2 => Transform::from_row(0.8, 0.3, -0.2, 1.1, 3.0 * f(next()), f(next())),
+                _ => Transform::from_row(f(next()), f(next()), f(next()), f(next()), 5.0, 5.0),
+            };
+            let bbox = data.bounds();
+            let path = tree::Path {
+                visible: true,
+                fill: Some(tree::Fill {
+                    paint: tree::Paint::Color(tree::Color {
+                        red: 0,
+                        green: 0,
+                        blue: 0,
+                    }),
+                    opacity: [1.0, 0.5][(next() % 2) as usize],
+                    rule: [FillRule::Winding, FillRule::EvenOdd][(next() % 2) as usize],
+                }),
+                stroke: None,
+                paint_order: PaintOrder::FillAndStroke,
+                anti_alias: next() % 5 != 0,
+                data: Arc::new(data),
+                bounding_box: bbox,
+                stroke_bounding_box: bbox,
+            };
+            let inner = (next() % 5 == 0).then(|| {
+                let mut pb = PathBuilder::new();
+                pb.push_oval(rusty_raster::Rect::from_xywh(2.5, 1.5, 30.0, 20.0).unwrap());
+                let data = Arc::new(pb.finish().unwrap());
+                let mut p = path.clone();
+                p.data = data;
+                Arc::new(ClipPath {
+                    transform: Transform::identity(),
+                    clip_path: None,
+                    root: Group {
+                        children: vec![Node::Path(Box::new(p))],
+                        ..Group::default()
+                    },
+                })
+            });
+            let clip = ClipPath {
+                transform: Transform::from_translate(f(next()), 0.0),
+                clip_path: inner,
+                root: Group {
+                    children: vec![Node::Path(Box::new(path))],
+                    ..Group::default()
+                },
+            };
+            if single_clip_path(&clip, ts).is_some() {
+                taken += 1;
+            }
+            let mut want = layer.clone();
+            let mut ctx = Context::new(64, 64, 1 << 30, 1 << 20).unwrap();
+            apply_clip_masked(&clip, &mut ctx, ts, &mut want);
+            let mut got = layer.clone();
+            let mut ctx = Context::new(64, 64, 1 << 30, 1 << 20).unwrap();
+            apply_clip(&clip, &mut ctx, ts, &mut got);
+            assert_eq!(ctx.live_bytes, 0);
+            assert!(want.data() == got.data(), "round {round}");
+        }
+        assert!(taken > 3000, "{taken}");
     }
 
     /// The trimmed composite against compositing the whole layer, on layers

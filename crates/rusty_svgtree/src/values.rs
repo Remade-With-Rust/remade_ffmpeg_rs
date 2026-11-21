@@ -1127,6 +1127,177 @@ pub(crate) fn path_data_with(text: &str, emit: &mut impl FnMut(Seg)) {
     }
 }
 
+/// An upper bound on the verbs and points `path_data_with` hands a
+/// `PathBuilder` for the path data `b`, from its tokens alone (no number is
+/// converted). `None` when it holds an arc, whose cubic count depends on the
+/// radii. The tokens are scanned exactly as `parse_raw_seg` and
+/// `Stream::parse_number` scan them; the count stops where the parser stops.
+/// (Counting a whole huge path this way costs about a third of parsing it,
+/// which is why `path_data_size_estimate` counts windows of it instead.)
+#[cfg(test)]
+fn path_data_size(b: &[u8]) -> Option<(usize, usize)> {
+    path_data_size_from(b, 0).map(|(v, p, _)| (v, p))
+}
+
+/// `path_data_size` for data that continues a segment of command `cmd`
+/// (lower-case; `0` for none), and the command in force at its end.
+fn path_data_size_from(b: &[u8], mut cmd: u8) -> Option<(usize, usize, u8)> {
+    let mut i = 0;
+    // One spare verb and point, for the start; a builder adds a move-to
+    // after a close that is not followed by one.
+    let (mut verbs, mut points) = (1usize, 1usize);
+    let mut closed = false;
+    loop {
+        while matches!(b.get(i), Some(b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')) {
+            i += 1;
+        }
+        let Some(&c) = b.get(i) else {
+            break;
+        };
+        if is_cmd(c) {
+            cmd = c.to_ascii_lowercase();
+            i += 1;
+        } else if !matches!(c, b'0'..=b'9' | b'.' | b'-' | b'+') || matches!(cmd, 0 | b'z') {
+            break;
+        }
+        // Numbers per segment, and what the segment becomes: a close, a
+        // move-to or a line, a quad or a cubic.
+        let (n, v, p) = match cmd {
+            b'z' => {
+                verbs += 1;
+                closed = true;
+                continue;
+            }
+            b'm' | b'l' => (2, 1, 1),
+            b'h' | b'v' => (1, 1, 1),
+            b't' => (2, 1, 2),
+            b'q' => (4, 1, 2),
+            b's' => (4, 1, 3),
+            b'c' => (6, 1, 3),
+            _ => return None,
+        };
+        for _ in 0..n {
+            if !skip_number(b, &mut i) {
+                return Some((verbs, points, cmd));
+            }
+            while matches!(b.get(i), Some(b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')) {
+                i += 1;
+            }
+            if b.get(i) == Some(&b',') {
+                i += 1;
+                while matches!(b.get(i), Some(b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')) {
+                    i += 1;
+                }
+            }
+        }
+        verbs += v;
+        points += p;
+        if closed && cmd != b'm' {
+            verbs += 1;
+            points += 1;
+        }
+        closed = false;
+    }
+    Some((verbs, points, cmd))
+}
+
+/// Windows `path_data_size_estimate` counts, spread evenly over the data.
+const SIZE_WINDOWS: usize = 32;
+
+/// The share of long data the windows cover, as a divisor.
+const SIZE_SAMPLE_DIVISOR: usize = 256;
+
+/// The shortest window, in bytes (a hundred-odd segments).
+const SIZE_MIN_WINDOW: usize = 512;
+
+/// `path_data_size` estimated from `SIZE_WINDOWS` windows spread over the
+/// data (together 1/`SIZE_SAMPLE_DIVISOR` of long data): the density of verbs
+/// and points per byte there, times the length, plus 1/16. For long data
+/// only: counting every byte costs about a third of a parse, and saves only
+/// the doubling copies. `None` when a window holds an arc, or nothing could
+/// be counted.
+pub(crate) fn path_data_size_estimate(text: &str) -> Option<(usize, usize)> {
+    let b = text.as_bytes();
+    let w = (b.len() / (SIZE_WINDOWS * SIZE_SAMPLE_DIVISOR)).max(SIZE_MIN_WINDOW);
+    let (mut verbs, mut points, mut bytes) = (0usize, 0usize, 0usize);
+    let mut cmd = 0u8;
+    for k in 0..SIZE_WINDOWS {
+        let at = k * (b.len() / SIZE_WINDOWS);
+        let end = at.saturating_add(w).min(b.len());
+        // From the window's first command letter (a token boundary, with
+        // the command known); where it has none (implicit repetition), from
+        // its first separator, under the command the windows before it ended
+        // in.
+        let (start, from) = match b[at..end].iter().position(|&c| is_cmd(c)) {
+            Some(i) => (at + i, 0),
+            None => match b[at..end].iter().position(|&c| c == b' ') {
+                Some(i) if !matches!(cmd, 0 | b'z') => (at + i, cmd),
+                _ => continue,
+            },
+        };
+        let (v, p, last) = path_data_size_from(&b[start..end], from)?;
+        cmd = last;
+        verbs += v - 1;
+        points += p - 1;
+        bytes += end - start;
+    }
+    if bytes == 0 || verbs == 0 {
+        return None;
+    }
+    let scale = |n: usize| {
+        let e = n as u128 * b.len() as u128 * 17 / (bytes as u128 * 16);
+        usize::try_from(e).unwrap_or(usize::MAX / 16) + 16
+    };
+    Some((scale(verbs), scale(points)))
+}
+
+/// Skips one number as `Stream::parse_number` scans it (leading spaces
+/// included); `false`, with `i` unspecified, where it finds none.
+fn skip_number(b: &[u8], i: &mut usize) -> bool {
+    let mut j = *i;
+    while matches!(b.get(j), Some(b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')) {
+        j += 1;
+    }
+    if matches!(b.get(j), Some(b'-' | b'+')) {
+        j += 1;
+    }
+    let int_start = j;
+    while matches!(b.get(j), Some(b'0'..=b'9')) {
+        j += 1;
+    }
+    let mut digits = j - int_start;
+    if b.get(j) == Some(&b'.') {
+        if matches!(b.get(j + 1), Some(b'0'..=b'9')) {
+            j += 1;
+            let f = j;
+            while matches!(b.get(j), Some(b'0'..=b'9')) {
+                j += 1;
+            }
+            digits += j - f;
+        } else if digits > 0 {
+            j += 1;
+        }
+    }
+    if digits == 0 {
+        return false;
+    }
+    if matches!(b.get(j), Some(b'e' | b'E')) && !matches!(b.get(j + 1), Some(b'm' | b'x')) {
+        let mut k = j + 1;
+        if matches!(b.get(k), Some(b'-' | b'+')) {
+            k += 1;
+        }
+        let e = k;
+        while matches!(b.get(k), Some(b'0'..=b'9')) {
+            k += 1;
+        }
+        if k > e {
+            j = k;
+        }
+    }
+    *i = j;
+    true
+}
+
 /// `path_data_with` collected into a `Vec`.
 #[cfg(test)]
 pub(crate) fn path_data(text: &str) -> Vec<Seg> {
@@ -1644,12 +1815,93 @@ mod tests {
     }
 
     /// The streaming parser against the two-pass one it replaced.
+    /// `path_data_size` is at least what a builder receives (`None` only
+    /// for data with an arc).
+    fn assert_size_bound(d: &str) {
+        let Some((verbs, points)) = path_data_size(d.as_bytes()) else {
+            assert!(d.bytes().any(|c| c.eq_ignore_ascii_case(&b'a')), "{d}");
+            return;
+        };
+        let mut b = rusty_raster::PathBuilder::new();
+        path_data_with(d, &mut |s| match s {
+            Seg::MoveTo(x, y) => b.move_to(x as f32, y as f32),
+            Seg::LineTo(x, y) => b.line_to(x as f32, y as f32),
+            Seg::Quad(x1, y1, x, y) => b.quad_to(x1 as f32, y1 as f32, x as f32, y as f32),
+            Seg::Cubic(x1, y1, x2, y2, x, y) => b.cubic_to(
+                x1 as f32, y1 as f32, x2 as f32, y2 as f32, x as f32, y as f32,
+            ),
+            Seg::Close => b.close(),
+        });
+        assert!(b.len() <= verbs, "{d}: {} verbs > {verbs}", b.len());
+        if let Some(p) = b.finish() {
+            let n = p.points().len();
+            assert!(n <= points, "{d}: {n} points > {points}");
+        }
+    }
+
+    /// The estimate of long, even data is at least what a builder receives
+    /// and at most a fifth more, implicit repetition included.
+    #[test]
+    fn path_data_size_estimate_is_close() {
+        let mut cases = vec![
+            "M0 0".to_string() + &" L123.5 456.25".repeat(30_000),
+            "M0 0 L".to_string() + &" 12 34".repeat(40_000),
+            "m0 0".to_string() + &" l1 1 l-1 1".repeat(30_000),
+            "M0 0".to_string() + &" C1 2 3 4 5 6".repeat(20_000),
+            "M0,0".to_string() + &"h10v10h-10z m1,1".repeat(15_000),
+        ];
+        cases.push(cases[0].clone() + &cases[3][4..]);
+        for d in &cases {
+            let (verbs, points) = path_data_size_estimate(d).unwrap();
+            let mut b = rusty_raster::PathBuilder::new();
+            path_data_with(d, &mut |s| match s {
+                Seg::MoveTo(x, y) => b.move_to(x as f32, y as f32),
+                Seg::LineTo(x, y) => b.line_to(x as f32, y as f32),
+                Seg::Quad(x1, y1, x, y) => b.quad_to(x1 as f32, y1 as f32, x as f32, y as f32),
+                Seg::Cubic(x1, y1, x2, y2, x, y) => b.cubic_to(
+                    x1 as f32, y1 as f32, x2 as f32, y2 as f32, x as f32, y as f32,
+                ),
+                Seg::Close => b.close(),
+            });
+            let (v, p) = (b.len(), b.finish().unwrap().points().len());
+            let head = &d[..16];
+            assert!(verbs >= v && verbs <= v + v / 5, "{head}: {verbs} for {v}");
+            assert!(
+                points >= p && points <= p + p / 5,
+                "{head}: {points} for {p}"
+            );
+        }
+        assert!(
+            path_data_size_estimate(&("M0 0".to_string() + &" a1 1 0 0 1 2 2".repeat(9000)))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn path_data_size_bounds() {
+        for d in [
+            "M1e5 2E-3L.5.5 1e 2e+1 3E-",
+            "M1em 2 L 3ex 4",
+            "M0 0 1 1 2 2 3 3z 4 4",
+            "M0 0zl1 1zl2 2z",
+            "m0 0h1v1h-1z m5 5 h1 v1",
+            "M0 0Q1 1 2 2T3 3 4 4t5 5",
+            "M0 0C1 1 2 2 3 3 4 4 5 5 6 6S1 1 2 2 3 3 4 4",
+            "M-1-2-3-4+5+6.7.8",
+            "M 1 2 L 3 , 4 ,5 6",
+            "M1 2 L3",
+        ] {
+            assert_size_bound(d);
+        }
+    }
+
     #[test]
     fn path_stream_matches_two_pass() {
         fn check(d: &str) {
             let got = format!("{:?}", path_data(d));
             let want = format!("{:?}", path_data_two_pass(d));
             assert_eq!(got, want, "{d}");
+            assert_size_bound(d);
         }
         for d in [
             "",

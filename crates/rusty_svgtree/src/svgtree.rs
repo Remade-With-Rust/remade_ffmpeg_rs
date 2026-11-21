@@ -348,11 +348,59 @@ impl AId {
     }
 }
 
+/// An attribute value: borrowed from the XML DOM's text (attributes and
+/// `style` declarations: no copy) or a fixed default, or owned (style-sheet
+/// declarations, whose text the builder holds only while it runs).
 #[derive(Clone, Debug)]
-struct Attr {
+enum Value<'x> {
+    Xml(&'x str),
+    Own(Box<str>),
+}
+
+impl Value<'_> {
+    fn as_str(&self) -> &str {
+        match self {
+            Value::Xml(s) => s,
+            Value::Own(s) => s,
+        }
+    }
+}
+
+/// Where a value being applied comes from: the XML text (kept by
+/// reference) or a style-sheet rule (copied, once it is known to be kept).
+#[derive(Clone, Copy)]
+enum Src<'x, 'v> {
+    Xml(&'x str),
+    Sheet(&'v str),
+}
+
+impl<'x> Src<'x, '_> {
+    fn trimmed(self) -> Self {
+        match self {
+            Src::Xml(s) => Src::Xml(crate::values::trim(s)),
+            Src::Sheet(s) => Src::Sheet(crate::values::trim(s)),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match *self {
+            Src::Xml(s) | Src::Sheet(s) => s,
+        }
+    }
+
+    fn keep(self) -> Value<'x> {
+        match self {
+            Src::Xml(s) => Value::Xml(s),
+            Src::Sheet(s) => Value::Own(s.into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Attr<'x> {
     name: AId,
     important: bool,
-    value: Box<str>,
+    value: Value<'x>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -372,18 +420,20 @@ struct NodeData {
     chain: AttrSet,
 }
 
-/// The resolved SVG document.
-pub(crate) struct Document {
+/// The resolved SVG document. Attribute values borrow the XML DOM's text,
+/// which therefore outlives it.
+pub(crate) struct Document<'x> {
     nodes: Vec<NodeData>,
-    attrs: Vec<Attr>,
-    links: HashMap<Box<str>, NodeId>,
+    attrs: Vec<Attr<'x>>,
+    /// Element ids, borrowed from the XML text like the attribute values.
+    links: HashMap<&'x str, NodeId>,
 }
 
 /// A borrowed node handle.
 #[derive(Clone, Copy)]
 pub(crate) struct SvgNode<'a> {
     id: NodeId,
-    doc: &'a Document,
+    doc: &'a Document<'a>,
 }
 
 impl PartialEq for SvgNode<'_> {
@@ -407,7 +457,7 @@ impl<'a> SvgNode<'a> {
         self.id
     }
 
-    pub(crate) fn document(&self) -> &'a Document {
+    pub(crate) fn document(&self) -> &'a Document<'a> {
         self.doc
     }
 
@@ -427,7 +477,7 @@ impl<'a> SvgNode<'a> {
         self.doc.attrs[d.attrs.start as usize..d.attrs.end as usize]
             .iter()
             .find(|a| a.name == name)
-            .map(|a| &*a.value)
+            .map(|a| a.value.as_str())
     }
 
     pub(crate) fn has_attribute(&self, name: AId) -> bool {
@@ -602,7 +652,7 @@ impl<'a> Iterator for HrefIter<'a> {
     }
 }
 
-impl Document {
+impl<'x> Document<'x> {
     pub(crate) fn root(&self) -> SvgNode<'_> {
         SvgNode {
             id: NodeId(0),
@@ -649,13 +699,22 @@ impl Document {
         id
     }
 
-    fn set_attribute_value(&mut self, node: NodeId, name: AId, value: &str) {
+    fn set_attribute_value(&mut self, node: NodeId, name: AId, value: &'x str) {
         let r = self.nodes[node.0 as usize].attrs.clone();
         for a in &mut self.attrs[r.start as usize..r.end as usize] {
             if a.name == name {
-                a.value = value.into();
+                a.value = Value::Xml(value);
             }
         }
+    }
+
+    /// The value of `node`'s attribute `name`, if it has one.
+    fn value(&self, node: NodeId, name: AId) -> Option<&Value<'x>> {
+        let r = self.nodes[node.0 as usize].attrs.clone();
+        self.attrs[r.start as usize..r.end as usize]
+            .iter()
+            .find(|a| a.name == name)
+            .map(|a| &a.value)
     }
 }
 
@@ -781,7 +840,7 @@ struct Builder<'a> {
     rule_index: Option<css::RuleIndex>,
     rule_scratch: Vec<u32>,
     id_map: HashMap<&'a str, XId>,
-    doc: Document,
+    doc: Document<'a>,
     limits: Limits,
 }
 
@@ -799,7 +858,7 @@ pub(crate) fn parse_xml(data: &[u8]) -> Result<XmlDoc, Error> {
 }
 
 /// Builds the resolved SVG document from the XML DOM.
-pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document, Error> {
+pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document<'_>, Error> {
     let root_el = xml.xml_doc_get_root_element().ok_or(Error::NotAnSvg)?;
     let mut b = Builder {
         xml,
@@ -877,18 +936,16 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document, Error> {
     b.rule_index = css::RuleIndex::new(&b.sheet);
     b.parse_node(root_el, None, NodeId(0), false, 0)?;
 
-    // No more ids than the XML had: sized once.
+    // No more ids than the XML had: sized once. An `id` only ever comes from
+    // an XML attribute (it is not a presentation attribute, and `inherit`
+    // copies the parent's), so every one is borrowed text.
     let mut links = HashMap::with_capacity(b.id_map.len());
     for (i, n) in b.doc.nodes.iter().enumerate() {
-        if n.tag.is_none() {
+        if n.tag.is_none() || !n.own.contains(AId::Id) {
             continue;
         }
-        let node = SvgNode {
-            id: NodeId(i as u32),
-            doc: &b.doc,
-        };
-        if let Some(id) = node.attribute(AId::Id) {
-            links.entry(id.into()).or_insert(NodeId(i as u32));
+        if let Some(Value::Xml(id)) = b.doc.value(NodeId(i as u32), AId::Id) {
+            links.entry(*id).or_insert(NodeId(i as u32));
         }
     }
     b.doc.links = links;
@@ -899,7 +956,7 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document, Error> {
     Ok(b.doc)
 }
 
-impl Builder<'_> {
+impl<'a> Builder<'a> {
     fn check_nodes(&self) -> Result<(), Error> {
         if self.doc.nodes.len() > self.limits.max_nodes {
             Err(Error::ElementsLimitReached)
@@ -997,7 +1054,7 @@ impl Builder<'_> {
 
     fn parse_element(
         &mut self,
-        x: XNode,
+        x: XNode<'a>,
         parent: NodeId,
         tag: EId,
         ignore_ids: bool,
@@ -1049,7 +1106,7 @@ impl Builder<'_> {
                 parent,
                 start,
                 name,
-                value,
+                Src::Xml(value),
                 false,
                 false,
             );
@@ -1061,7 +1118,7 @@ impl Builder<'_> {
                 parent,
                 start,
                 AId::Href,
-                h,
+                Src::Xml(h),
                 false,
                 false,
             );
@@ -1079,7 +1136,7 @@ impl Builder<'_> {
                 &mut self.css_budget,
                 |rule| {
                     for d in &rule.declarations {
-                        let (name, value) = (&d.name, &d.value);
+                        let (name, value) = (&d.name, Src::Sheet(&d.value));
                         apply_declaration(doc, &mut own, parent, start, name, value, d.important);
                     }
                 },
@@ -1088,6 +1145,11 @@ impl Builder<'_> {
         if let Some(style) = style {
             let doc = &mut self.doc;
             css::for_each_declaration(style, |name, value, important| {
+                let value = match &value {
+                    std::borrow::Cow::Borrowed(v) => Src::Xml(v),
+                    // Comments were stripped: a copy.
+                    std::borrow::Cow::Owned(v) => Src::Sheet(v),
+                };
                 apply_declaration(doc, &mut own, parent, start, name, value, important);
             });
         }
@@ -1100,13 +1162,13 @@ impl Builder<'_> {
 
 /// Applies one style declaration (from a style sheet rule or a `style`
 /// attribute) to the element being built, whose attributes start at `start`.
-fn apply_declaration(
-    doc: &mut Document,
+fn apply_declaration<'x>(
+    doc: &mut Document<'x>,
     own: &mut AttrSet,
     parent: NodeId,
     start: usize,
     name: &str,
-    value: &str,
+    value: Src<'x, '_>,
     important: bool,
 ) {
     if name == "marker" {
@@ -1121,21 +1183,21 @@ fn apply_declaration(
 /// Appends (or, with `replace`, overrides) an attribute of the element
 /// being built, whose attributes start at `start` and have the ids in `own`.
 #[allow(clippy::too_many_arguments)]
-fn append_attribute(
-    doc: &mut Document,
+fn append_attribute<'x>(
+    doc: &mut Document<'x>,
     own: &mut AttrSet,
     parent: NodeId,
     start: usize,
     name: AId,
-    value: &str,
+    value: Src<'x, '_>,
     important: bool,
     replace: bool,
 ) {
-    let value = crate::values::trim(value);
-    let resolved: Option<(Box<str>, bool)> = if value == "inherit" {
+    let value = value.trimmed();
+    let resolved: Option<(Value<'x>, bool)> = if value.as_str() == "inherit" {
         resolve_inherit(doc, parent, name)
     } else {
-        Some((value.into(), important))
+        Some((value.keep(), important))
     };
     let Some((value, important)) = resolved else {
         return;
@@ -1157,15 +1219,16 @@ fn append_attribute(
     });
 }
 
-fn resolve_inherit(doc: &Document, parent: NodeId, name: AId) -> Option<(Box<str>, bool)> {
+fn resolve_inherit<'x>(doc: &Document<'x>, parent: NodeId, name: AId) -> Option<(Value<'x>, bool)> {
     let p = SvgNode { id: parent, doc };
     let found = if name.is_inheritable() {
         p.ancestor_with_attribute(name)
     } else {
         Some(p).filter(|n| n.tag_name().is_some() && n.has_attribute(name))
-    };
+    }
+    .map(|n| n.id);
     if let Some(n) = found {
-        return n.attribute(name).map(|v| (v.into(), false));
+        return doc.value(n, name).map(|v| (v.clone(), false));
     }
     let def = match name {
         AId::ImageRendering | AId::ShapeRendering | AId::TextRendering => "auto",
@@ -1201,7 +1264,7 @@ fn resolve_inherit(doc: &Document, parent: NodeId, name: AId) -> Option<(Box<str
         AId::Visibility => "visible",
         _ => return None,
     };
-    Some((def.into(), false))
+    Some((Value::Xml(def), false))
 }
 
 /// Breaks 1- and 2-step reference cycles through `attr` (`clip-path` on a
