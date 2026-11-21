@@ -1,6 +1,6 @@
 [package]
 name = "rusty_tiff"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 # 1.88 because the default `jpeg` feature pulls in rusty_jpeg 0.4.8, which uses
 # safe `#[target_feature]` functions and safe intrinsic calls inside them
