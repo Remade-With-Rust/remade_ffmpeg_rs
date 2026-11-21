@@ -233,13 +233,14 @@ pub fn split_annexb(data: &[u8]) -> Vec<&[u8]> {
 /// from the SPS and PPS NALs. MP4 wraps it in an `avcC` box; Matroska stores it
 /// raw as CodecPrivate.
 pub fn build_avcc_record(sps: &[u8], pps: &[u8]) -> Vec<u8> {
-    let mut b = Vec::new();
-    b.push(1); // configurationVersion
-    b.push(*sps.get(1).unwrap_or(&0x42)); // AVCProfileIndication
-    b.push(*sps.get(2).unwrap_or(&0)); // profile_compatibility
-    b.push(*sps.get(3).unwrap_or(&30)); // AVCLevelIndication
-    b.push(0xFF); // 6 bits reserved + lengthSizeMinusOne = 3 (4-byte lengths)
-    b.push(0xE1); // 3 bits reserved + numOfSPS = 1
+    let mut b = vec![
+        1,                            // configurationVersion
+        *sps.get(1).unwrap_or(&0x42), // AVCProfileIndication
+        *sps.get(2).unwrap_or(&0),    // profile_compatibility
+        *sps.get(3).unwrap_or(&30),   // AVCLevelIndication
+        0xFF,                         // 6 bits reserved + lengthSizeMinusOne = 3 (4-byte lengths)
+        0xE1,                         // 3 bits reserved + numOfSPS = 1
+    ];
     b.extend_from_slice(&(sps.len() as u16).to_be_bytes());
     b.extend_from_slice(sps);
     b.push(1); // numOfPPS

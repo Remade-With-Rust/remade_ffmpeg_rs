@@ -67,8 +67,9 @@ use rff_core::{
     BlockAdditional, CodecId, ColorRange, Error, MasteringDisplay, MediaType, Packet, Result,
     SampleFormat,
 };
-use rff_format::avc::{build_avcc_record, split_annexb};
+use rff_format::avc::build_avcc_record;
 use rff_format::hvc::build_hvcc_record;
+use rff_format::nal::{NalFraming, NalSampleWriter, ParamSets, Stored};
 use rff_format::{Muxer, Output, SeekOutput, Stream};
 
 use crate::{
@@ -307,6 +308,9 @@ struct TrackPlan {
     is_avc: bool,
     /// HEVC: convert Annex-B packets to length-prefixed blocks.
     is_hevc: bool,
+    /// H.264 / HEVC: how packets arrive (Annex-B or already
+    /// length-prefixed) and how each becomes a block.
+    nal: Option<NalSampleWriter>,
     /// ProRes: drop the frame's 8-byte `size` + `icpf` header.
     is_prores: bool,
     /// AV1: CodecPrivate is harvested from the first packet's sequence header.
@@ -363,6 +367,7 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
         bit_depth: None,
         is_avc: false,
         is_hevc: false,
+        nal: None,
         is_prores: false,
         is_av1: false,
         vorbis_pending: 0,
@@ -400,6 +405,7 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
             }
             plan.codec = "V_MPEG4/ISO/AVC";
             plan.is_avc = true;
+            plan.nal = Some(NalSampleWriter::new(&s.extradata, false));
             plan.fallback_private = rff_format::avc::avcc_record_from_extradata(&s.extradata);
         }
         CodecId::Hevc => {
@@ -408,6 +414,7 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
             }
             plan.codec = "V_MPEGH/ISO/HEVC";
             plan.is_hevc = true;
+            plan.nal = Some(NalSampleWriter::new(&s.extradata, true));
             // An hvcC record or Annex-B VPS/SPS/PPS as extradata.
             plan.private = rff_format::hvc::hvcc_record_from_extradata(&s.extradata);
         }
@@ -978,35 +985,51 @@ fn prepare_block(tracks: &mut [TrackPlan], packet: &Packet) -> Result<Option<Buf
         return Ok(None);
     }
 
-    // H.264 / HEVC: Annex-B → length-prefixed block; hoist the parameter
-    // sets into CodecPrivate (the demuxer puts them back on keyframes).
-    let data = if plan.is_avc || plan.is_hevc {
+    // H.264 / HEVC: Annex-B → length-prefixed block, the parameter sets
+    // hoisted into CodecPrivate (the demuxer puts them back on keyframes); a
+    // packet already length-prefixed (raw samples, the record as extradata)
+    // keeps every byte; anything else is refused rather than shortened.
+    let data = if let Some(writer) = plan.nal.as_mut() {
         let hevc = plan.is_hevc;
         let mut sample = Vec::new();
-        let (mut vps, mut sps, mut pps) = (None, None, None);
-        for nal in split_annexb(&packet.data) {
-            let kind = nal
-                .first()
-                .map(|&b| if hevc { (b >> 1) & 0x3F } else { b & 0x1F });
-            match (hevc, kind) {
-                (false, Some(7)) | (true, Some(33)) => sps = Some(nal),
-                (false, Some(8)) | (true, Some(34)) => pps = Some(nal),
-                (true, Some(32)) => vps = Some(nal),
-                _ => {
-                    sample.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-                    sample.extend_from_slice(nal);
-                }
-            }
-        }
+        let stored = writer.write(&packet.data, &mut sample).map_err(|why| {
+            Error::invalid(format!(
+                "mkv mux: {} stream {idx}: {why}",
+                plan.stream.codec_id.name()
+            ))
+        })?;
         if plan.private.is_none() {
-            plan.private = match (sps, pps) {
-                (Some(s), Some(p)) if hevc => build_hvcc_record(vps.unwrap_or(&[]), s, p),
-                (Some(s), Some(p)) => Some(build_avcc_record(s, p)),
+            plan.private = match (writer.framing(), stored) {
+                // The record the samples were stored against, kept verbatim
+                // but for its length size (4, as written).
+                (Some(NalFraming::LengthPrefixed(_)), _) => {
+                    rff_format::nal::record_with_4byte_lengths(&plan.stream.extradata, hevc)
+                }
+                (
+                    _,
+                    Stored::Converted {
+                        params:
+                            ParamSets {
+                                vps,
+                                sps: Some(s),
+                                pps: Some(p),
+                            },
+                    },
+                ) => {
+                    if hevc {
+                        build_hvcc_record(vps.unwrap_or(&[]), s, p)
+                    } else {
+                        Some(build_avcc_record(s, p))
+                    }
+                }
                 // No parameter sets in band: those of the extradata.
                 _ => plan.fallback_private.clone(),
             };
         }
-        sample
+        match stored {
+            Stored::Verbatim => packet.data.clone(),
+            Stored::Converted { .. } => sample,
+        }
     } else if plan.is_prores {
         // Matroska drops the frame's first QuickTime atom header.
         match packet.data.get(4..8) {
