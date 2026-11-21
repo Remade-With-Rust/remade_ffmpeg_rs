@@ -1344,11 +1344,20 @@ fn load_8888(
 ) {
     // Surprisingly, `f32 * FACTOR` is way faster than `f32x8 * f32x8::splat(FACTOR)`.
     const FACTOR: f32 = 1.0 / 255.0;
+    // Each pixel is read as one little-endian word and its channels are
+    // shifted and masked out of it, which is vector code (two 16-byte loads,
+    // `psrld`/`pand`, `cvtdq2ps`). Indexing the 32 bytes one by one compiled
+    // to 32 `movzbl` loads and 24 `pinsrw`. The values are the same integers
+    // either way, so the floats are too.
+    let mut px = [0u32; STAGE_WIDTH];
+    for (p, bytes) in px.iter_mut().zip(data.chunks_exact(4)) {
+        *p = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    }
     for i in 0..STAGE_WIDTH {
-        r.0[i] = data[i * 4] as f32 * FACTOR;
-        g.0[i] = data[i * 4 + 1] as f32 * FACTOR;
-        b.0[i] = data[i * 4 + 2] as f32 * FACTOR;
-        a.0[i] = data[i * 4 + 3] as f32 * FACTOR;
+        r.0[i] = (px[i] & 0xff) as i32 as f32 * FACTOR;
+        g.0[i] = ((px[i] >> 8) & 0xff) as i32 as f32 * FACTOR;
+        b.0[i] = ((px[i] >> 16) & 0xff) as i32 as f32 * FACTOR;
+        a.0[i] = (px[i] >> 24) as i32 as f32 * FACTOR;
     }
 }
 
