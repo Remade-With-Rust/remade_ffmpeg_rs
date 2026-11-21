@@ -9,8 +9,8 @@
 //! group that would exceed the cap is skipped instead of allocated.
 
 use rusty_raster::{
-    BlendMode, Color, FillRule, FilterQuality, IntRect, Mask, MaskType, Paint, PathBuilder, Pixmap,
-    PixmapMut, PixmapPaint, SpreadMode, Transform,
+    BlendMode, Color, FillRule, FilterQuality, IntRect, IntSize, Mask, MaskType, Paint,
+    PathBuilder, Pixmap, PixmapMut, PixmapPaint, PixmapRef, SpreadMode, Transform,
 };
 
 use crate::tree::{self, ClipPath, Group, Node, PaintOrder};
@@ -146,6 +146,15 @@ fn render_group(
 
     let mut sub = ctx.alloc(ibbox.width(), ibbox.height())?;
     render_nodes(group, ctx, ts, &mut sub.as_mut());
+    // A layer nothing was drawn into stays empty whatever clips or masks it,
+    // and under source-over composites to nothing: it is done.
+    if group.blend_mode == BlendMode::SourceOver
+        && (group.clip_path.is_some() || group.mask.is_some())
+        && is_blank(sub.data())
+    {
+        ctx.free(&sub);
+        return Some(());
+    }
     if let Some(clip) = &group.clip_path {
         apply_clip(clip, ctx, ts, &mut sub);
     }
@@ -157,16 +166,133 @@ fn render_group(
         blend_mode: group.blend_mode,
         quality: FilterQuality::Nearest,
     };
-    pixmap.draw_pixmap(
-        ibbox.x(),
-        ibbox.y(),
-        sub.as_ref(),
-        &paint,
-        Transform::identity(),
-        None,
-    );
+    if !(group.blend_mode == BlendMode::SourceOver
+        && draw_layer_content(&sub, ibbox, &paint, ctx, pixmap))
+    {
+        pixmap.draw_pixmap(
+            ibbox.x(),
+            ibbox.y(),
+            sub.as_ref(),
+            &paint,
+            Transform::identity(),
+            None,
+        );
+    }
     ctx.free(&sub);
     Some(())
+}
+
+/// A layer is composited without its blank columns (from a copy) only when
+/// they are at least `1 / COLUMN_TRIM_SHARE` of its width.
+const COLUMN_TRIM_SHARE: usize = 8;
+
+/// Whether every byte is zero (every pixel transparent black).
+fn is_blank(bytes: &[u8]) -> bool {
+    let mut words = bytes.chunks_exact(8);
+    words.all(|c| c == [0u8; 8]) && words.remainder().iter().all(|&b| b == 0)
+}
+
+/// The rectangle `(left, top, right, bottom)` of an RGBA buffer outside of
+/// which every pixel is transparent black; `None` when they all are. The
+/// columns are widened to the whole width once too few of them are blank to
+/// be dropped (see `COLUMN_TRIM_SHARE`).
+fn content_bounds(data: &[u8], w: usize, h: usize) -> Option<(usize, usize, usize, usize)> {
+    let stride = w * 4;
+    if stride == 0 || data.len() != stride * h {
+        // Not a `w x h` buffer: nothing is known to be blank.
+        return Some((0, 0, w, h));
+    }
+    let row = |y: usize| &data[y * stride..(y + 1) * stride];
+    let mut top = 0;
+    while top < h && is_blank(row(top)) {
+        top += 1;
+    }
+    if top == h {
+        return None;
+    }
+    let mut bottom = h;
+    while is_blank(row(bottom - 1)) {
+        bottom -= 1;
+    }
+    // Only the part of each row outside the columns found so far is read.
+    let (mut left, mut right) = (w, 0);
+    for y in top..bottom {
+        if (left + (w - right)) * COLUMN_TRIM_SHARE < w {
+            // Too few columns are left to drop for a copy without them to
+            // be worth making (`draw_layer_content`): the rows are drawn
+            // whole, so the columns need not be looked at any more.
+            return Some((0, top, w, bottom));
+        }
+        let row = row(y);
+        if let Some(i) = row[..left * 4].chunks_exact(4).position(|p| p != [0u8; 4]) {
+            left = i;
+        }
+        if let Some(i) = row[right * 4..]
+            .chunks_exact(4)
+            .rposition(|p| p != [0u8; 4])
+        {
+            right += i + 1;
+        }
+    }
+    Some((left, top, right, bottom))
+}
+
+/// Composites a source-over layer `sub` (placed at `ibbox`) by drawing only
+/// the rectangle of it that holds anything. Under source-over a transparent
+/// source pixel leaves the destination pixel as it is (the test
+/// `transparent_source_leaves_destination` holds the rasteriser to that), and
+/// the rectangle keeps its integer position, so the pixels are those of
+/// compositing the whole layer. Returns `false` when the whole layer is to
+/// be drawn after all (nothing to trim).
+fn draw_layer_content(
+    sub: &Pixmap,
+    ibbox: IntRect,
+    paint: &PixmapPaint,
+    ctx: &Context,
+    pixmap: &mut PixmapMut,
+) -> bool {
+    let (w, h) = (sub.width() as usize, sub.height() as usize);
+    let stride = w * 4;
+    let data = sub.data();
+    let Some((left, top, right, bottom)) = content_bounds(data, w, h) else {
+        // Nothing in the layer: nothing to draw.
+        return true;
+    };
+    let (cw, ch) = (right - left, bottom - top);
+    if cw == w && ch == h {
+        return false;
+    }
+    let offset = |base: i32, by: usize| i32::try_from(by).ok().and_then(|v| base.checked_add(v));
+    let (Some(x), Some(y)) = (offset(ibbox.x(), left), offset(ibbox.y(), top)) else {
+        return false;
+    };
+    let (Ok(cw32), Ok(ch32)) = (u32::try_from(cw), u32::try_from(ch)) else {
+        return false;
+    };
+    let rows = &data[top * stride..bottom * stride];
+    // Whole rows are drawn where they are. Dropping columns takes a copy of
+    // what is left, made when it is worth one and the layer budget has room.
+    if (w - cw) * COLUMN_TRIM_SHARE >= w {
+        let len = cw * ch * 4;
+        let mut part: Vec<u8> = Vec::new();
+        if ctx.live_bytes.saturating_add(len as u64) <= ctx.max_live_bytes
+            && part.try_reserve_exact(len).is_ok()
+        {
+            for row in rows.chunks_exact(stride) {
+                part.extend_from_slice(&row[left * 4..right * 4]);
+            }
+            if let Some(part) = IntSize::from_wh(cw32, ch32).and_then(|s| Pixmap::from_vec(part, s))
+            {
+                pixmap.draw_pixmap(x, y, part.as_ref(), paint, Transform::identity(), None);
+                return true;
+            }
+        }
+    }
+    let Some(part) = PixmapRef::from_bytes(rows, sub.width(), ch32) else {
+        return false;
+    };
+    pixmap.draw_pixmap(ibbox.x(), y, part, paint, Transform::identity(), None);
+    true
 }
 
 // ----------------------------------------------------------------- paths --
@@ -475,4 +601,111 @@ fn render_image(
     };
     pixmap.fill_rect(rect, &paint, ts, None);
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `draw_layer_content` relies on: compositing a transparent source
+    /// pixel with source-over leaves the destination pixel as it was, for
+    /// every premultiplied destination pixel.
+    #[test]
+    fn transparent_source_leaves_destination() {
+        let mut dst = Pixmap::new(256, 256).unwrap();
+        for (i, p) in dst.data_mut().chunks_exact_mut(4).enumerate() {
+            // Every premultiplied (colour, alpha) pair, each channel on a
+            // different colour.
+            let (c, a) = ((i % 256) as u32, (i / 256) as u32);
+            let v = (c * a + 127) / 255;
+            p.copy_from_slice(&[v as u8, (v / 2) as u8, (a - v) as u8, a as u8]);
+        }
+        let before = dst.data().to_vec();
+        let src = Pixmap::new(256, 256).unwrap();
+        for opacity in [1.0, 0.5, 0.25, 0.0] {
+            let paint = PixmapPaint {
+                opacity,
+                blend_mode: BlendMode::SourceOver,
+                quality: FilterQuality::Nearest,
+            };
+            dst.as_mut()
+                .draw_pixmap(0, 0, src.as_ref(), &paint, Transform::identity(), None);
+            assert!(dst.data() == &before[..], "opacity {opacity}");
+        }
+    }
+
+    /// The trimmed composite against compositing the whole layer, on layers
+    /// with content in every position.
+    #[test]
+    fn trimmed_layer_composites_like_the_whole() {
+        let mut x = 0x0123_4567_89ab_cdefu64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let ctx = Context::new(64, 64, 1 << 30, 1 << 20).unwrap();
+        for round in 0..400 {
+            let (w, h) = (1 + (next() % 40) as u32, 1 + (next() % 40) as u32);
+            let mut sub = Pixmap::new(w, h).unwrap();
+            // Content inside a random rectangle (sometimes none at all).
+            let (l, t) = (
+                (next() % u64::from(w)) as u32,
+                (next() % u64::from(h)) as u32,
+            );
+            let (r, b) = (
+                l + (next() % u64::from(w - l + 1)) as u32,
+                t + (next() % u64::from(h - t + 1)) as u32,
+            );
+            for py in t..b {
+                for px in l..r {
+                    if next() % 4 != 0 {
+                        let a = (next() % 256) as u32;
+                        let c = (next() % 256) as u32 * a / 255;
+                        let i = ((py * w + px) * 4) as usize;
+                        sub.data_mut()[i..i + 4].copy_from_slice(&[
+                            c as u8,
+                            (c / 3) as u8,
+                            0,
+                            a as u8,
+                        ]);
+                    }
+                }
+            }
+            let mut whole = Pixmap::new(64, 64).unwrap();
+            for (i, p) in whole.data_mut().chunks_exact_mut(4).enumerate() {
+                let a = (i * 7 + round) % 256;
+                p.copy_from_slice(&[(a / 2) as u8, (a / 5) as u8, a as u8, a as u8]);
+            }
+            let mut trimmed = whole.clone();
+            let ibbox =
+                IntRect::from_xywh((next() % 30) as i32 - 5, (next() % 30) as i32 - 5, w, h)
+                    .unwrap();
+            let paint = PixmapPaint {
+                opacity: [1.0, 0.6][(next() % 2) as usize],
+                blend_mode: BlendMode::SourceOver,
+                quality: FilterQuality::Nearest,
+            };
+            whole.as_mut().draw_pixmap(
+                ibbox.x(),
+                ibbox.y(),
+                sub.as_ref(),
+                &paint,
+                Transform::identity(),
+                None,
+            );
+            if !draw_layer_content(&sub, ibbox, &paint, &ctx, &mut trimmed.as_mut()) {
+                trimmed.as_mut().draw_pixmap(
+                    ibbox.x(),
+                    ibbox.y(),
+                    sub.as_ref(),
+                    &paint,
+                    Transform::identity(),
+                    None,
+                );
+            }
+            assert!(whole.data() == trimmed.data(), "round {round}");
+        }
+    }
 }
