@@ -18,14 +18,34 @@ pub struct Meta {
     pub orientation: String,
 }
 
-/// RGBE to linear float, exactly as the `image` crate computes it:
-/// `2^(e - 136) * c`, with `e = 0` giving zero.
-fn to_f32(c: [u8; 3], e: u8) -> [f32; 3] {
-    let exp = f32::from_bits(if e > 1 {
-        u32::from(e - 1) << 23
+/// The scale of an exponent byte: `2^(e - 136)`, and zero for `e = 0`,
+/// built from the same bit pattern and the same multiplication `image`
+/// uses (all exact powers of two, so the table holds the same bits).
+static EXP_SCALE: [f32; 256] = {
+    let mut t = [0f32; 256];
+    let mut e = 0;
+    while e < 256 {
+        t[e] = exp_scale(e as u8);
+        e += 1;
+    }
+    t
+};
+
+/// `2^(e - 136)` as the `image` crate computes it (zero for `e = 0`).
+const fn exp_scale(e: u8) -> f32 {
+    f32::from_bits(if e > 1 {
+        ((e - 1) as u32) << 23
     } else {
-        u32::from(e) << 22
-    }) * 0.003_906_25;
+        (e as u32) << 22
+    }) * 0.003_906_25
+}
+
+/// RGBE to linear float, exactly as the `image` crate computes it:
+/// `2^(e - 136) * c`, with `e = 0` giving zero. The scale is one table load
+/// (a compare, a select, a shift, a move to a float register and a
+/// multiplication before).
+fn to_f32(c: [u8; 3], e: u8) -> [f32; 3] {
+    let exp = EXP_SCALE[usize::from(e)];
     [
         exp * f32::from(c[0]),
         exp * f32::from(c[1]),
@@ -381,6 +401,31 @@ fn rle_component(v: &[u8], out: &mut Vec<u8>) {
             }
         } else {
             out.extend_from_slice(&v[start..i]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{exp_scale, EXP_SCALE};
+
+    /// The const-evaluated exponent table holds the bits the run-time
+    /// formula produces, for every exponent byte.
+    #[test]
+    fn exp_table_matches_run_time_formula() {
+        for e in 0..=255u8 {
+            let e = std::hint::black_box(e);
+            let run_time = f32::from_bits(if e > 1 {
+                u32::from(e - 1) << 23
+            } else {
+                u32::from(e) << 22
+            }) * std::hint::black_box(0.003_906_25f32);
+            assert_eq!(
+                EXP_SCALE[usize::from(e)].to_bits(),
+                run_time.to_bits(),
+                "{e}"
+            );
+            assert_eq!(exp_scale(e).to_bits(), run_time.to_bits(), "{e}");
         }
     }
 }
