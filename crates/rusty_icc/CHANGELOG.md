@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_icc-v0.1.2...rusty_icc-v0.1.3) - 2026-11-21
+
+### Other
+
+- Merge pull request #180 from Remade-With-Rust/perf/loss-rows-icc
+- *(rusty_icc)* Lab encode and decode run as one op each
+- *(rusty_icc)* grid build walks its points with an odometer
+- *(rusty_icc)* grid build tabulates CLUT cells per axis value
+- *(rusty_icc)* sRGB-shaped forward curves in line in non-shaper chains
+- *(rusty_icc)* sRGB-shaped inverse curves in line in non-shaper chains
+- *(rusty_icc)* LUT table curves evaluated in line in the f32 chain
+- *(rusty_icc)* perceptual twins of the float CMYK, proof and build workloads
+
 ## [0.1.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_icc-v0.1.1...rusty_icc-v0.1.2) - 2026-11-21
 
 ### Other

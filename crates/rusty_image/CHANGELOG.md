@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_image-v0.1.2...rusty_image-v0.1.3) - 2026-11-21
+
+### Other
+
+- Merge pull request #175 from Remade-With-Rust/perf/loss-rows-image
+- *(rusty_image)* QOI decode stores a single-pixel op's pixel without a loop
+- *(rusty_image)* QOI decode hashes only the ops that make a colour
+
 ## [0.1.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_image-v0.1.1...rusty_image-v0.1.2) - 2026-11-21
 
 ### Fixed
