@@ -30,10 +30,6 @@ impl<'a> Stream<'a> {
         self.s.get(self.pos).copied()
     }
 
-    fn peek_at(&self, off: usize) -> Option<u8> {
-        self.s.get(self.pos + off).copied()
-    }
-
     pub(crate) fn advance(&mut self, n: usize) {
         self.pos = (self.pos + n).min(self.s.len());
     }
@@ -83,84 +79,77 @@ impl<'a> Stream<'a> {
     pub(crate) fn parse_number(&mut self) -> Option<f64> {
         self.skip_spaces();
         let start = self.pos;
-        let neg = match self.peek() {
+        // The token is scanned over a local slice, the cursor written back
+        // once: the digit loops then hold everything in registers.
+        let mut rest = &self.s[start..];
+        let neg = match rest.first() {
             Some(b'-') => {
-                self.pos += 1;
+                rest = &rest[1..];
                 true
             }
             Some(b'+') => {
-                self.pos += 1;
+                rest = &rest[1..];
                 false
             }
             _ => false,
         };
         // The decimal mantissa and exponent are accumulated while scanning,
         // so the common case needs no second pass over the text (see
-        // `exact_decimal`). `exact` drops once the mantissa no longer fits.
+        // `exact_decimal`). The mantissa wraps past `MAX_EXACT_DIGITS`
+        // digits; such a token goes to the general parser instead.
         let mut mant = 0u64;
-        let mut exact = true;
         let mut exp10 = 0i32;
-        let mut digits = 0usize;
-        while let Some(c @ b'0'..=b'9') = self.peek() {
-            self.pos += 1;
-            digits += 1;
-            if mant < MANT_ROOM {
-                mant = mant * 10 + u64::from(c - b'0');
-            } else {
-                exact = false;
+        let int_digits = scan_digits(&mut rest, &mut mant);
+        let mut digits = int_digits;
+        if let [b'.', tail @ ..] = rest {
+            if matches!(tail.first(), Some(b'0'..=b'9')) {
+                rest = tail;
+                let frac_digits = scan_digits(&mut rest, &mut mant);
+                digits += frac_digits;
+                // Unused (see below) when it does not fit.
+                exp10 = -(frac_digits.min(MAX_EXACT_DIGITS + 1) as i32);
+            } else if digits > 0 {
+                rest = tail;
             }
-        }
-        if self.peek() == Some(b'.') && matches!(self.peek_at(1), Some(b'0'..=b'9')) {
-            self.pos += 1;
-            while let Some(c @ b'0'..=b'9') = self.peek() {
-                self.pos += 1;
-                digits += 1;
-                if mant < MANT_ROOM {
-                    mant = mant * 10 + u64::from(c - b'0');
-                    exp10 -= 1;
-                } else {
-                    exact = false;
-                }
-            }
-        } else if self.peek() == Some(b'.') && digits > 0 {
-            self.pos += 1;
         }
         if digits == 0 {
             self.pos = start;
             return None;
         }
-        if matches!(self.peek(), Some(b'e' | b'E')) && !matches!(self.peek_at(1), Some(b'm' | b'x'))
-        {
-            let save = self.pos;
-            self.pos += 1;
-            let eneg = match self.peek() {
-                Some(b'-') => {
-                    self.pos += 1;
-                    true
+        if let [b'e' | b'E', tail @ ..] = rest {
+            if !matches!(tail.first(), Some(b'm' | b'x')) {
+                let mut tail = tail;
+                let eneg = match tail.first() {
+                    Some(b'-') => {
+                        tail = &tail[1..];
+                        true
+                    }
+                    Some(b'+') => {
+                        tail = &tail[1..];
+                        false
+                    }
+                    _ => false,
+                };
+                let mut ed = 0;
+                let mut e = 0i32;
+                while let [c @ b'0'..=b'9', t @ ..] = tail {
+                    tail = t;
+                    ed += 1;
+                    // Saturates far outside the exact range.
+                    e = (e * 10 + i32::from(c - b'0')).min(100_000);
                 }
-                Some(b'+') => {
-                    self.pos += 1;
-                    false
+                if ed != 0 {
+                    rest = tail;
+                    if eneg {
+                        exp10 -= e;
+                    } else {
+                        exp10 += e;
+                    }
                 }
-                _ => false,
-            };
-            let mut ed = 0;
-            let mut e = 0i32;
-            while let Some(c @ b'0'..=b'9') = self.peek() {
-                self.pos += 1;
-                ed += 1;
-                // Saturates far outside the exact range.
-                e = (e * 10 + i32::from(c - b'0')).min(100_000);
-            }
-            if ed == 0 {
-                self.pos = save;
-            } else if eneg {
-                exp10 -= e;
-            } else {
-                exp10 += e;
             }
         }
-        if exact {
+        self.pos = self.s.len() - rest.len();
+        if digits <= MAX_EXACT_DIGITS {
             if let Some(v) = exact_decimal(mant, exp10) {
                 return Some(if neg { -v } else { v });
             }
@@ -250,8 +239,29 @@ impl<'a> Stream<'a> {
     }
 }
 
-/// A mantissa below this takes one more decimal digit without overflowing.
-const MANT_ROOM: u64 = 1_000_000_000_000_000_000;
+/// The most decimal digits a `u64` mantissa always holds (`10^18 < 2^64`).
+const MAX_EXACT_DIGITS: usize = 18;
+
+/// Consumes the leading ASCII digits of `rest` into the decimal `mant`
+/// (wrapping once past `MAX_EXACT_DIGITS` digits in all) and returns how many
+/// there were.
+#[inline]
+fn scan_digits(rest: &mut &[u8], mant: &mut u64) -> usize {
+    let s = *rest;
+    let mut m = *mant;
+    let mut n = 0;
+    while let Some(&c) = s.get(n) {
+        let d = c.wrapping_sub(b'0');
+        if d > 9 {
+            break;
+        }
+        m = m.wrapping_mul(10).wrapping_add(u64::from(d));
+        n += 1;
+    }
+    *mant = m;
+    *rest = &s[n..];
+    n
+}
 
 /// Powers of ten that an `f64` holds exactly.
 const POW10: [f64; 23] = [
