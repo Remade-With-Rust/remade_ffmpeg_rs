@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.4.5...rff-cli-v0.4.6) - 2026-11-21
+
+### Fixed
+
+- *(packaging)* ship the Apache-2.0 LICENSE text in every published crate
+
+### Other
+
+- Merge pull request #157 from Remade-With-Rust/fix/licenses-alac
+
 ## [0.4.5](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.4.4...rff-cli-v0.4.5) - 2026-11-20
 
 ### Other

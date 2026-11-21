@@ -4,6 +4,16 @@ All notable changes to this crate. Security-relevant changes are listed first in
 each release, under **Security**. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.20](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-aac-v1.1.19...rff-codec-aac-v1.1.20) - 2026-11-21
+
+### Fixed
+
+- *(packaging)* ship the Apache-2.0 LICENSE text in every published crate
+
+### Other
+
+- *(supply-chain)* import the 0.6.3 audits for the vet stores
+
 ## [1.1.19](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-aac-v1.1.18...rff-codec-aac-v1.1.19) - 2026-11-19
 
 ### Other
