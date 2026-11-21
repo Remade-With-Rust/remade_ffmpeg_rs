@@ -1050,20 +1050,50 @@ fn gradient_colors(p: &mut Pipeline) {
     // (see `Gradient::push_stages`), so this is the same `1..len`.
     let stops = ctx.t_values.get(1..ctx.len).unwrap_or(&[]);
 
-    // The usual group sits between two stops. `shared_interval` finds that
+    // The usual group sits between two stops. `group_intervals` finds that
     // with one scan of the stops against the group's largest `t` and one
     // compare of its smallest, and then the per-lane count below (a compare
     // of all eight lanes against every stop) is not needed. Its result is
     // the same index the count gives each lane.
-    if let Some(k) = shared_interval(stops, &t) {
-        if let (Some(factor), Some(bias)) = (ctx.factors.get(k), ctx.biases.get(k)) {
-            let t = p.r;
-            p.r = mad(t, f32x8::splat(factor.r), f32x8::splat(bias.r));
-            p.g = mad(t, f32x8::splat(factor.g), f32x8::splat(bias.g));
-            p.b = mad(t, f32x8::splat(factor.b), f32x8::splat(bias.b));
-            p.a = mad(t, f32x8::splat(factor.a), f32x8::splat(bias.a));
-            return;
+    match group_intervals(stops, &t) {
+        Intervals::One(k) => {
+            if let (Some(factor), Some(bias)) = (ctx.factors.get(k), ctx.biases.get(k)) {
+                let t = p.r;
+                p.r = mad(t, f32x8::splat(factor.r), f32x8::splat(bias.r));
+                p.g = mad(t, f32x8::splat(factor.g), f32x8::splat(bias.g));
+                p.b = mad(t, f32x8::splat(factor.b), f32x8::splat(bias.b));
+                p.a = mad(t, f32x8::splat(factor.a), f32x8::splat(bias.a));
+                return;
+            }
         }
+        // A group that straddles one stop (small shapes, many stops, and
+        // Reflect/Repeat make these common: 37% of groups in a scene of 196
+        // small conical gradients) has lanes in interval `k` and lanes in
+        // `k + 1`. Both lines are evaluated for all eight lanes and each lane
+        // keeps the one its own count selects (`t >= split`): the same
+        // `t * factor + bias` per lane as `gradient_lookup`, without its 64
+        // bounds-checked scalar loads.
+        Intervals::Two(k, split) => {
+            if let (Some(f0), Some(b0), Some(f1), Some(b1)) = (
+                ctx.factors.get(k),
+                ctx.biases.get(k),
+                ctx.factors.get(k + 1),
+                ctx.biases.get(k + 1),
+            ) {
+                let t = p.r;
+                let upper = t.cmp_ge(f32x8::splat(split));
+                let line = |f: f32, b: f32, f_up: f32, b_up: f32| {
+                    upper.blend(mad(t, f32x8::splat(f_up), f32x8::splat(b_up)),
+                                mad(t, f32x8::splat(f), f32x8::splat(b)))
+                };
+                p.r = line(f0.r, b0.r, f1.r, b1.r);
+                p.g = line(f0.g, b0.g, f1.g, b1.g);
+                p.b = line(f0.b, b0.b, f1.b, b1.b);
+                p.a = line(f0.a, b0.a, f1.a, b1.a);
+                return;
+            }
+        }
+        Intervals::Many => {}
     }
 
     for stop in stops {
@@ -1106,17 +1136,29 @@ fn gradient_colors(p: &mut Pipeline) {
     }
 }
 
-/// The interval index all eight lanes of `t` share, if they share one.
+/// How the eight lanes of a gradient group fall into the stop intervals.
+enum Intervals {
+    /// Every lane is in interval `k`.
+    One(usize),
+    /// Lanes with `t >= split` are in interval `k + 1`, the others in `k`.
+    Two(usize, f32),
+    /// More than two intervals, or a NaN lane: count each lane.
+    Many,
+}
+
+/// The intervals the eight lanes of `t` fall in, when that is one or two.
 ///
 /// A lane's index is the number of `stops` it is `>=` (the count in
-/// `gradient`). `Gradient::push_stages` builds the stops non-decreasing, so
-/// that count is monotone in `t` and is the length of the prefix of stops at
-/// or below it. With `lo <= t <= hi` for every lane, every lane's count lies
-/// between `lo`'s and `hi`'s; when `lo` already reaches the last stop `hi`
-/// reaches, the two are equal and so is every lane's. A NaN lane (whose count
-/// is 0) is left to the per-lane path.
+/// `gradient_colors`). `Gradient::push_stages` builds the stops
+/// non-decreasing, so that count is monotone in `t` and is the length of the
+/// prefix of stops at or below it. With `lo <= t <= hi` for every lane, every
+/// lane's count lies between `lo`'s and `hi`'s. When `lo` already reaches the
+/// last stop `hi` reaches (`stops[k - 1]`), the two counts are equal and so is
+/// every lane's; when it reaches only the stop before (`stops[k - 2]`), each
+/// lane's count is `k - 1` or `k`, and it is `k` exactly when the lane reaches
+/// `stops[k - 1]`. A NaN lane (whose count is 0) is left to the per-lane path.
 #[inline(always)]
-fn shared_interval(stops: &[NormalizedF32], t: &[f32; STAGE_WIDTH]) -> Option<usize> {
+fn group_intervals(stops: &[NormalizedF32], t: &[f32; STAGE_WIDTH]) -> Intervals {
     let mut lo = t[0];
     let mut hi = t[0];
     let mut nan = t[0].is_nan();
@@ -1126,14 +1168,21 @@ fn shared_interval(stops: &[NormalizedF32], t: &[f32; STAGE_WIDTH]) -> Option<us
         nan |= v.is_nan();
     }
     if nan {
-        return None;
+        return Intervals::Many;
     }
 
     let k = stops.iter().take_while(|stop| hi >= stop.get()).count();
-    match k.checked_sub(1).map(|last| stops[last].get()) {
-        None => Some(0),
-        Some(last) if lo >= last => Some(k),
-        Some(_) => None,
+    let Some(last) = k.checked_sub(1) else {
+        return Intervals::One(0);
+    };
+    let split = stops[last].get();
+    if lo >= split {
+        return Intervals::One(k);
+    }
+    match last.checked_sub(1).map(|i| stops[i].get()) {
+        None => Intervals::Two(0, split),
+        Some(before) if lo >= before => Intervals::Two(last, split),
+        Some(_) => Intervals::Many,
     }
 }
 
@@ -1642,5 +1691,70 @@ mod tests {
                 assert_eq!(dst, expected, "len {len} opacity {opacity:?}");
             }
         }
+    }
+
+    /// `group_intervals` against the per-lane count it stands in for: every
+    /// lane's count must be the one `One`/`Two` claims. Groups are drawn from
+    /// the stops themselves, their neighbouring floats, and random values, so
+    /// lanes land exactly on stops (the `t >= split` boundary) and on hard
+    /// stops (repeated positions).
+    #[test]
+    fn group_intervals_matches_lane_counts() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let count = |stops: &[NormalizedF32], t: f32| stops.iter().filter(|s| t >= s.get()).count();
+        let (mut ones, mut twos) = (0, 0);
+        for case in 0..4000 {
+            let n = 1 + (next() % 6) as usize;
+            let mut pos: Vec<f32> = (0..n).map(|_| (next() % 1000) as f32 / 999.0).collect();
+            if case % 5 == 0 && n > 1 {
+                pos[1] = pos[0]; // a hard stop
+            }
+            pos.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let stops: Vec<NormalizedF32> = pos.iter().map(|&p| NormalizedF32::new_clamped(p)).collect();
+            let pick = |r: u64| -> f32 {
+                let s = pos[(r as usize / 7) % n];
+                match r % 7 {
+                    0 => s,
+                    1 => f32::from_bits(s.to_bits().wrapping_add(1)),
+                    2 => f32::from_bits(s.to_bits().wrapping_sub(1)),
+                    3 => s + 0.01,
+                    4 => s - 0.01,
+                    5 => (r % 10_000) as f32 / 9_999.0,
+                    _ => -0.0,
+                }
+            };
+            let base = pick(next());
+            let mut t = [0.0f32; STAGE_WIDTH];
+            for v in &mut t {
+                *v = if next() % 3 == 0 { base } else { pick(next()) };
+            }
+            if case % 97 == 0 {
+                t[3] = f32::NAN;
+            }
+            match group_intervals(&stops, &t) {
+                Intervals::One(k) => {
+                    ones += 1;
+                    for &v in &t {
+                        assert_eq!(count(&stops, v), k, "One({k}) stops {pos:?} t {t:?}");
+                    }
+                }
+                Intervals::Two(k, split) => {
+                    twos += 1;
+                    for &v in &t {
+                        let want = if v >= split { k + 1 } else { k };
+                        assert_eq!(count(&stops, v), want, "Two({k}, {split}) stops {pos:?} t {t:?}");
+                    }
+                }
+                Intervals::Many => {}
+            }
+        }
+        // The cases must reach both fast paths.
+        assert!(ones > 30 && twos > 100, "ones {ones} twos {twos}");
     }
 }
