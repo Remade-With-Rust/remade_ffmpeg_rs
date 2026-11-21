@@ -169,6 +169,35 @@ impl PixmapRef<'_> {
         }
         out
     }
+
+    /// `gather` for indices that are in range by construction: the taps of
+    /// `highp::sampler`, `row * width + column` of coordinates clamped to
+    /// `[0, height) x [0, width)` (NaN clamps to 0), so at most
+    /// `width * height - 1`; with a wider pixmap the wrapping `u32` sum is
+    /// still below the pixel count. The read is clamped to the last pixel
+    /// anyway (tiny-skia would panic on a bad index), and because `last` is
+    /// derived from this slice's length, LLVM drops the bounds check: a
+    /// compare and a conditional move per pixel instead of a compare and a
+    /// branch. (Written with `checked_sub`, or from the pixel count, the
+    /// check stays; with the out-of-range lane masked to zero the branch
+    /// comes back. The nearest `gather` stage keeps `gather`: there this form
+    /// measured +7.5% to +10% Ir.)
+    #[inline(always)]
+    pub(crate) fn gather_clamped(&self, index: u32x8) -> [u8; highp::STAGE_WIDTH * 4] {
+        let index: [u32; 8] = index.into();
+        let data = self.data();
+        let mut out = [0u8; highp::STAGE_WIDTH * 4];
+        if data.len() < 4 {
+            return out;
+        }
+        let last = (data.len() / 4).saturating_sub(1);
+        let data = &data[..(last + 1) * 4];
+        for (o, i) in out.chunks_exact_mut(4).zip(index) {
+            let i = (i as usize).min(last) * 4;
+            o.copy_from_slice(&data[i..i + 4]);
+        }
+        out
+    }
 }
 
 impl SubPixmapMut<'_> {

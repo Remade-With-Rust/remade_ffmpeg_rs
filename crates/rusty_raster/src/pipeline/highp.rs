@@ -972,7 +972,7 @@ fn sampler<const N: usize>(
             let mut gg = f32x8::default();
             let mut bb = f32x8::default();
             let mut aa = f32x8::default();
-            load_8888(&pixmap.gather(ix), &mut rr, &mut gg, &mut bb, &mut aa);
+            load_8888(&pixmap.gather_clamped(ix), &mut rr, &mut gg, &mut bb, &mut aa);
 
             let w = wx[i] * wy[j];
             *r = mad(w, rr, *r);
