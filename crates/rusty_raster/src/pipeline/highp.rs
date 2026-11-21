@@ -16,6 +16,7 @@ and we're using a manual implementation.
 */
 
 use crate::{SpreadMode, PixmapRef};
+use crate::path::NormalizedF32;
 
 use crate::geom::ScreenIntRect;
 use crate::pixmap::SubPixmapMut;
@@ -1020,12 +1021,34 @@ fn gradient(p: &mut Pipeline) {
     // N.B. The loop starts at 1 because idx 0 is the color to use before the first stop.
     let t: [f32; 8] = p.r.into();
     let mut idx = u32x8::default();
-    for i in 1..ctx.len {
+    // The stops past the first, as one slice: indexing `t_values[i]` per stop
+    // was a bounds check per stop per call. `t_values` holds `len` entries
+    // (see `Gradient::push_stages`), so this is the same `1..len`.
+    let stops = ctx.t_values.get(1..ctx.len).unwrap_or(&[]);
+
+    // The usual group sits between two stops. `shared_interval` finds that
+    // with one scan of the stops against the group's largest `t` and one
+    // compare of its smallest, and then the per-lane count below (a compare
+    // of all eight lanes against every stop) is not needed. Its result is
+    // the same index the count gives each lane.
+    if let Some(k) = shared_interval(stops, &t) {
+        if let (Some(factor), Some(bias)) = (ctx.factors.get(k), ctx.biases.get(k)) {
+            let t = p.r;
+            p.r = mad(t, f32x8::splat(factor.r), f32x8::splat(bias.r));
+            p.g = mad(t, f32x8::splat(factor.g), f32x8::splat(bias.g));
+            p.b = mad(t, f32x8::splat(factor.b), f32x8::splat(bias.b));
+            p.a = mad(t, f32x8::splat(factor.a), f32x8::splat(bias.a));
+            p.next_stage();
+            return;
+        }
+    }
+
+    for stop in stops {
         // `black_box` keeps LLVM from vectorising this loop across the stops
         // (eight accumulators, then eight horizontal sums per call); with the
         // stop opaque it compares all eight lanes against one stop at a time.
         // Only here: in the lowp stage the same hint measured slower.
-        let tt = core::hint::black_box(ctx.t_values[i].get());
+        let tt = core::hint::black_box(stop.get());
         let n: u32x8 = u32x8::from([
             (t[0] >= tt) as u32,
             (t[1] >= tt) as u32,
@@ -1060,6 +1083,37 @@ fn gradient(p: &mut Pipeline) {
     }
 
     p.next_stage();
+}
+
+/// The interval index all eight lanes of `t` share, if they share one.
+///
+/// A lane's index is the number of `stops` it is `>=` (the count in
+/// `gradient`). `Gradient::push_stages` builds the stops non-decreasing, so
+/// that count is monotone in `t` and is the length of the prefix of stops at
+/// or below it. With `lo <= t <= hi` for every lane, every lane's count lies
+/// between `lo`'s and `hi`'s; when `lo` already reaches the last stop `hi`
+/// reaches, the two are equal and so is every lane's. A NaN lane (whose count
+/// is 0) is left to the per-lane path.
+#[inline(always)]
+fn shared_interval(stops: &[NormalizedF32], t: &[f32; STAGE_WIDTH]) -> Option<usize> {
+    let mut lo = t[0];
+    let mut hi = t[0];
+    let mut nan = t[0].is_nan();
+    for &v in &t[1..] {
+        lo = if v < lo { v } else { lo };
+        hi = if v > hi { v } else { hi };
+        nan |= v.is_nan();
+    }
+    if nan {
+        return None;
+    }
+
+    let k = stops.iter().take_while(|stop| hi >= stop.get()).count();
+    match k.checked_sub(1).map(|last| stops[last].get()) {
+        None => Some(0),
+        Some(last) if lo >= last => Some(k),
+        Some(_) => None,
+    }
 }
 
 fn gradient_lookup(

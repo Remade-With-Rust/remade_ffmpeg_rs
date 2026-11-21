@@ -235,6 +235,9 @@ impl Gradient {
 
             ctx.len = ctx.factors.len();
 
+            // The highp `gradient` stage's `shared_interval` relies on this.
+            debug_assert!(ctx.t_values.windows(2).all(|w| w[0].get() <= w[1].get()));
+
             // All lists must have the same length.
             debug_assert_eq!(ctx.factors.len(), ctx.t_values.len());
             debug_assert_eq!(ctx.biases.len(), ctx.t_values.len());
