@@ -1007,29 +1007,41 @@ impl Builder<'_> {
         // The ids of the attributes appended so far.
         let mut own = AttrSet::default();
 
-        // 1. XML attributes.
-        let href = x.href();
+        // 1. XML attributes, in one pass: `href` (the unprefixed form
+        // preferred over `xlink:href`, as `XNode::href` does) and `style`
+        // are picked up on the way and applied after the others.
+        let (mut plain_href, mut xlink_href, mut style) = (None, None, None);
         let mut a = self.xml.first_attr(x.id);
         while let Some(aid) = a {
             a = self.xml.next_sibling(aid);
-            if self.xml.prefix(aid).is_some() {
-                continue;
-            }
             let name = self.xml.name(aid);
-            if matches!(name, "style" | "class" | "href") {
+            if let Some(prefix) = self.xml.prefix(aid) {
+                if name == "href" {
+                    let ns = self.xml.ns_uri(aid);
+                    if ns == Some(XLINK_NS) || (ns.is_none() && prefix == "xlink") {
+                        xlink_href = Some(self.xml.content(aid));
+                    }
+                }
                 continue;
             }
-            if ignore_ids && name == "id" {
-                continue;
-            }
-            // usvg honours these only from CSS.
-            if matches!(name, "mix-blend-mode" | "isolation" | "font-kerning") {
-                continue;
-            }
-            // An attribute nothing reads is not kept.
+            // One lookup of the name. An attribute nothing reads is not
+            // kept (`class` is read from the XML by the style matcher).
             let Some(name) = AId::from_name(name) else {
+                if style.is_none() && name == "style" {
+                    style = Some(self.xml.content(aid));
+                }
                 continue;
             };
+            match name {
+                AId::Href => {
+                    plain_href = Some(self.xml.content(aid));
+                    continue;
+                }
+                AId::Id if ignore_ids => continue,
+                // usvg honours these only from CSS.
+                AId::MixBlendMode | AId::Isolation | AId::FontKerning => continue,
+                _ => {}
+            }
             let value = self.xml.content(aid);
             append_attribute(
                 &mut self.doc,
@@ -1042,7 +1054,7 @@ impl Builder<'_> {
                 false,
             );
         }
-        if let Some(h) = href {
+        if let Some(h) = plain_href.or(xlink_href) {
             append_attribute(
                 &mut self.doc,
                 &mut own,
@@ -1073,7 +1085,7 @@ impl Builder<'_> {
                 },
             );
         }
-        if let Some(style) = x.attr("style") {
+        if let Some(style) = style {
             let doc = &mut self.doc;
             css::for_each_declaration(style, |name, value, important| {
                 apply_declaration(doc, &mut own, parent, start, name, value, important);
