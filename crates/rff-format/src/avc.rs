@@ -14,6 +14,7 @@
 
 /// Per-track H.264 config for AVCC→Annex-B conversion, parsed from an `avcC`
 /// (AVCDecoderConfigurationRecord) box.
+#[derive(Debug, Clone)]
 pub struct AvcConfig {
     /// Bytes in each NAL length prefix (1, 2 or 4).
     pub nal_len: usize,
@@ -244,7 +245,72 @@ pub fn build_avcc_record(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     b.push(1); // numOfPPS
     b.extend_from_slice(&(pps.len() as u16).to_be_bytes());
     b.extend_from_slice(pps);
+    // ISO/IEC 14496-15 5.3.3.1.2: High profiles (100, 110, 122, 144) add
+    // chroma_format, the bit depths and the SPS-extension count, as FFmpeg
+    // writes them; readers of a High-profile avcC expect the 4 bytes.
+    if matches!(sps.get(1), Some(100 | 110 | 122 | 144)) {
+        let (chroma, luma8, chroma8) = sps_chroma_depth(sps).unwrap_or((1, 0, 0));
+        b.push(0xFC | (chroma & 3) as u8);
+        b.push(0xF8 | (luma8 & 7) as u8);
+        b.push(0xF8 | (chroma8 & 7) as u8);
+        b.push(0); // numOfSequenceParameterSetExt
+    }
     b
+}
+
+/// An `avcC` record (4-byte NAL lengths) from a stream's extradata, which
+/// may be an `avcC` record (any NAL length: it is rebuilt) or Annex-B
+/// start-code SPS/PPS (a raw `.h264` source, some encoders). `None` when it
+/// holds no SPS and PPS.
+pub fn avcc_record_from_extradata(extradata: &[u8]) -> Option<Vec<u8>> {
+    let annexb;
+    let nals = match parse_avcc(extradata) {
+        Some(cfg) => {
+            annexb = cfg.headers_annexb;
+            split_annexb(&annexb)
+        }
+        None => split_annexb(extradata),
+    };
+    let of = |t: u8| {
+        nals.iter()
+            .copied()
+            .find(|n| n.first().map(|b| b & 0x1F) == Some(t))
+    };
+    Some(build_avcc_record(of(7)?, of(8)?))
+}
+
+/// `(chroma_format_idc, bit_depth_luma_minus8, bit_depth_chroma_minus8)`
+/// of an SPS NAL (header byte included); 4:2:0 8-bit for profiles that do
+/// not code them.
+pub fn sps_chroma_depth(nal: &[u8]) -> Option<(u32, u32, u32)> {
+    if nal.first()? & 0x1F != 7 {
+        return None;
+    }
+    let mut rbsp = Vec::with_capacity(nal.len());
+    let mut zeros = 0u32;
+    for &b in &nal[1..] {
+        if zeros >= 2 && b == 3 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        rbsp.push(b);
+    }
+    let mut r = Bits::new(&rbsp);
+    let profile_idc = r.bits(8)?;
+    r.bits(16)?;
+    r.ue()?;
+    if !matches!(
+        profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
+        return Some((1, 0, 0));
+    }
+    let chroma = r.ue()?;
+    if chroma == 3 {
+        r.bit()?;
+    }
+    Some((chroma, r.ue()?, r.ue()?))
 }
 
 /// Consume a `scaling_list()` of `size` entries (we only need the bits gone).
