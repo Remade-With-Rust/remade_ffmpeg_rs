@@ -101,6 +101,80 @@ fn draw_pixmap() {
     assert_eq!(pixmap, expected);
 }
 
+/// `draw_pixmap` without a transform takes the sprite path. It has to give the
+/// bytes of the general path, which is what filling the same rect with the
+/// same `Pattern` runs: every offset, clip, opacity and kind of source pixel.
+#[test]
+fn draw_pixmap_sprite_matches_pipeline() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+
+    for case in 0..160 {
+        let (sw, sh) = (1 + (next() % 70) as u32, 1 + (next() % 40) as u32);
+        let mut data = vec![0u8; (sw * sh * 4) as usize];
+        for (i, px) in data.chunks_exact_mut(4).enumerate() {
+            // Runs of transparent, opaque, translucent and (deliberately)
+            // not premultiplied pixels, long enough in most cases to fill
+            // whole groups of eight.
+            let v = next().to_le_bytes();
+            match (i / (1 + case % 29)) % 5 {
+                0 | 1 => px.fill(0),
+                2 => px.copy_from_slice(&[v[0], v[1], v[2], 255]),
+                3 => {
+                    let a = v[3];
+                    let m = |c: u8| (u16::from(c) * u16::from(a) / 255) as u8;
+                    px.copy_from_slice(&[m(v[0]), m(v[1]), m(v[2]), a]);
+                }
+                _ => px.copy_from_slice(&[v[0], v[1], v[2], v[3]]),
+            }
+        }
+        let src = Pixmap::from_vec(data, IntSize::from_wh(sw, sh).unwrap()).unwrap();
+
+        let (dw, dh) = (1 + (next() % 90) as u32, 1 + (next() % 50) as u32);
+        let mut canvas = Pixmap::new(dw, dh).unwrap();
+        for b in canvas.data_mut() {
+            *b = next() as u8;
+        }
+
+        let x = (next() % 200) as i32 - 100;
+        let y = (next() % 120) as i32 - 60;
+        let (x, y) = if case % 7 == 0 { (0, 0) } else { (x, y) };
+        let opacity = [1.0, 1.0, 0.7, 0.0, 0.31, 2.5, f32::NAN][case % 7];
+        let quality = [FilterQuality::Nearest, FilterQuality::Bilinear, FilterQuality::Bicubic][case % 3];
+
+        let mut sprite = canvas.clone();
+        let paint = PixmapPaint { opacity, blend_mode: BlendMode::SourceOver, quality };
+        sprite.draw_pixmap(x, y, src.as_ref(), &paint, Transform::identity(), None);
+
+        let mut general = canvas.clone();
+        let pattern = Paint {
+            shader: Pattern::new(
+                src.as_ref(),
+                SpreadMode::Pad,
+                quality,
+                opacity,
+                Transform::from_translate(x as f32, y as f32),
+            ),
+            blend_mode: BlendMode::SourceOver,
+            anti_alias: false,
+            force_hq_pipeline: false,
+            colorspace: ColorSpace::default(),
+        };
+        let rect = IntRect::from_xywh(x, y, sw, sh).unwrap().to_rect();
+        general.fill_rect(rect, &pattern, Transform::identity(), None);
+
+        assert!(
+            sprite == general,
+            "case {case}: {sw}x{sh} at ({x}, {y}) on {dw}x{dh}, opacity {opacity}"
+        );
+    }
+}
+
 #[test]
 fn draw_pixmap_ts() {
     let triangle = {

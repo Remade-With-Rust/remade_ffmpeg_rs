@@ -625,7 +625,31 @@ fn gradient(p: &mut Pipeline) {
         idx.0[14] += (t1[6] >= tt) as u16;
         idx.0[15] += (t1[7] >= tt) as u16;
     }
-    gradient_lookup(ctx, &idx, t, &mut p.r, &mut p.g, &mut p.b, &mut p.a);
+
+    // Stops are usually many pixels apart, so most groups of 16 sit between
+    // the same two stops and need one factor and one bias, not 16 of each
+    // gathered lane by lane into eight vectors. The arithmetic per lane is
+    // the general path's (`t * factor + bias` with the same two colours).
+    let first = idx.0[0];
+    let mut uniform = true;
+    for i in 1..STAGE_WIDTH {
+        uniform &= idx.0[i] == first;
+    }
+    match (uniform, ctx.factors.get(usize::from(first)), ctx.biases.get(usize::from(first))) {
+        (true, Some(factor), Some(bias)) => {
+            let (rf, gf, bf, af) = scale_for_u16(
+                mad(t, f32x16::splat(factor.r), f32x16::splat(bias.r)),
+                mad(t, f32x16::splat(factor.g), f32x16::splat(bias.g)),
+                mad(t, f32x16::splat(factor.b), f32x16::splat(bias.b)),
+                mad(t, f32x16::splat(factor.a), f32x16::splat(bias.a)),
+            );
+            rf.save_to_u16x16(&mut p.r);
+            gf.save_to_u16x16(&mut p.g);
+            bf.save_to_u16x16(&mut p.b);
+            af.save_to_u16x16(&mut p.a);
+        }
+        _ => gradient_lookup(ctx, &idx, t, &mut p.r, &mut p.g, &mut p.b, &mut p.a),
+    }
 
     p.next_stage();
 }
@@ -634,13 +658,17 @@ fn evenly_spaced_2_stop_gradient(p: &mut Pipeline) {
     let ctx = &p.ctx.evenly_spaced_2_stop_gradient;
 
     let t = join(&p.r, &p.g);
-    round_f32_to_u16(
+    let (rf, gf, bf, af) = scale_for_u16(
         mad(t, f32x16::splat(ctx.factor.r), f32x16::splat(ctx.bias.r)),
         mad(t, f32x16::splat(ctx.factor.g), f32x16::splat(ctx.bias.g)),
         mad(t, f32x16::splat(ctx.factor.b), f32x16::splat(ctx.bias.b)),
         mad(t, f32x16::splat(ctx.factor.a), f32x16::splat(ctx.bias.a)),
-        &mut p.r, &mut p.g, &mut p.b, &mut p.a,
     );
+    // In line here, called in `gradient_lookup`: see `save_to_u16x16_inline`.
+    rf.save_to_u16x16_inline(&mut p.r);
+    gf.save_to_u16x16_inline(&mut p.g);
+    bf.save_to_u16x16_inline(&mut p.b);
+    af.save_to_u16x16_inline(&mut p.a);
 
     p.next_stage();
 }
@@ -700,20 +728,24 @@ fn gradient_lookup(
     let bb = gather!(&ctx.biases, b);
     let ba = gather!(&ctx.biases, a);
 
-    round_f32_to_u16(
+    let (rf, gf, bf, af) = scale_for_u16(
         mad(t, fr, br),
         mad(t, fg, bg),
         mad(t, fb, bb),
         mad(t, fa, ba),
-        r, g, b, a,
     );
+    rf.save_to_u16x16(r);
+    gf.save_to_u16x16(g);
+    bf.save_to_u16x16(b);
+    af.save_to_u16x16(a);
 }
 
+/// Colour channels in `[0, 1]` scaled to `[0.5, 255.5]`, ready to truncate
+/// to a lane (`save_to_u16x16`).
 #[inline(always)]
-fn round_f32_to_u16(
+fn scale_for_u16(
     rf: f32x16, gf: f32x16, bf: f32x16, af: f32x16,
-    r: &mut u16x16, g: &mut u16x16, b: &mut u16x16, a: &mut u16x16,
-) {
+) -> (f32x16, f32x16, f32x16, f32x16) {
     // TODO: may produce a slightly different result to Skia
     //       affects the two_stops_linear_mirror test
 
@@ -722,10 +754,7 @@ fn round_f32_to_u16(
     let bf = bf.normalize() * f32x16::splat(255.0) + f32x16::splat(0.5);
     let af = af * f32x16::splat(255.0) + f32x16::splat(0.5);
 
-    rf.save_to_u16x16(r);
-    gf.save_to_u16x16(g);
-    bf.save_to_u16x16(b);
-    af.save_to_u16x16(a);
+    (rf, gf, bf, af)
 }
 
 pub fn just_return(_: &mut Pipeline) {
@@ -741,11 +770,19 @@ fn load_8888(
     data: &[u8; STAGE_WIDTH * 4],
     r: &mut u16x16, g: &mut u16x16, b: &mut u16x16, a: &mut u16x16,
 ) {
+    // Each pixel is read as one little-endian word and its channels are
+    // shifted and masked out of it: four 16-byte loads and packed shifts.
+    // Indexing the 64 bytes one by one compiled to 64 scalar byte loads and
+    // 64 scalar word stores.
+    let mut px = [0u32; STAGE_WIDTH];
+    for (p, bytes) in px.iter_mut().zip(data.chunks_exact(4)) {
+        *p = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    }
     for i in 0..STAGE_WIDTH {
-        r.0[i] = data[i * 4] as u16;
-        g.0[i] = data[i * 4 + 1] as u16;
-        b.0[i] = data[i * 4 + 2] as u16;
-        a.0[i] = data[i * 4 + 3] as u16;
+        r.0[i] = (px[i] & 0xff) as u16;
+        g.0[i] = ((px[i] >> 8) & 0xff) as u16;
+        b.0[i] = ((px[i] >> 16) & 0xff) as u16;
+        a.0[i] = (px[i] >> 24) as u16;
     }
 }
 
@@ -754,12 +791,30 @@ fn load_8888_tail(
     tail: usize, data: &[u8],
     r: &mut u16x16, g: &mut u16x16, b: &mut u16x16, a: &mut u16x16,
 ) {
-    // Fill a dummy array with `tail` values. `tail` is always in a 1..STAGE_WIDTH-1 range.
-    // This way we can reuse the `load_8888__` method and remove any branches.
-    let mut tmp = [0u8; STAGE_WIDTH * 4];
-    let n = tail.min(STAGE_WIDTH) * 4;
-    tmp[0..n].copy_from_slice(&data[0..n]);
-    load_8888(&tmp, r, g, b, a);
+    // `tail` is always in a 1..STAGE_WIDTH-1 range, and the lanes past it are
+    // zero either way.
+    //
+    // A short tail (anti-aliased edges and hairlines are 1-3 pixels) loads
+    // just its pixels. A long one is cheaper as before: copy the row into a
+    // zeroed 16-pixel buffer and convert all of it as vectors.
+    const SHORT: usize = 4;
+    if tail <= SHORT {
+        *r = u16x16::default();
+        *g = u16x16::default();
+        *b = u16x16::default();
+        *a = u16x16::default();
+        for (i, px) in data.chunks_exact(4).take(tail).enumerate() {
+            r.0[i] = u16::from(px[0]);
+            g.0[i] = u16::from(px[1]);
+            b.0[i] = u16::from(px[2]);
+            a.0[i] = u16::from(px[3]);
+        }
+    } else {
+        let mut tmp = [0u8; STAGE_WIDTH * 4];
+        let n = tail.min(STAGE_WIDTH) * 4;
+        tmp[0..n].copy_from_slice(&data[0..n]);
+        load_8888(&tmp, r, g, b, a);
+    }
 }
 
 #[inline(always)]
@@ -767,11 +822,20 @@ fn store_8888(
     r: &u16x16, g: &u16x16, b: &u16x16, a: &u16x16,
     data: &mut [u8; STAGE_WIDTH * 4],
 ) {
+    // The low byte of each lane, packed into one `r | g << 8 | b << 16 |
+    // a << 24` word per pixel (the pixmap's byte order, little-endian) and
+    // stored four bytes at a time. Writing the 64 bytes one by one made
+    // LLVM spill the lanes to the stack and rebuild every pixel from single
+    // bytes.
+    let mut px = [0u32; STAGE_WIDTH];
     for i in 0..STAGE_WIDTH {
-        data[i * 4] = r.0[i] as u8;
-        data[i * 4 + 1] = g.0[i] as u8;
-        data[i * 4 + 2] = b.0[i] as u8;
-        data[i * 4 + 3] = a.0[i] as u8;
+        px[i] = u32::from(r.0[i] as u8)
+            | u32::from(g.0[i] as u8) << 8
+            | u32::from(b.0[i] as u8) << 16
+            | u32::from(a.0[i] as u8) << 24;
+    }
+    for (bytes, p) in data.chunks_exact_mut(4).zip(px) {
+        bytes.copy_from_slice(&p.to_le_bytes());
     }
 }
 
@@ -850,4 +914,93 @@ fn join(lo: &u16x16, hi: &u16x16) -> f32x16 {
 fn mad(f: f32x16, m: f32x16, a: f32x16) -> f32x16 {
     // NEON vmlaq_f32 doesn't seem to affect performance in any way. Ignore it.
     f * m + a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// `load_8888` and `store_8888` as they were first written, one byte at
+    /// a time. They stay here as the oracle for the word-at-a-time forms.
+    fn load_ref(data: &[u8]) -> [u16x16; 4] {
+        let mut out = [u16x16::default(); 4];
+        for (i, px) in data.chunks_exact(4).take(STAGE_WIDTH).enumerate() {
+            for c in 0..4 {
+                out[c].0[i] = u16::from(px[c]);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn load_8888_matches_bytewise() {
+        for seed in 1..200 {
+            let data: [u8; STAGE_WIDTH * 4] = bytes(seed, STAGE_WIDTH * 4).try_into().unwrap();
+            let mut got = [u16x16::default(); 4];
+            let [r, g, b, a] = &mut got;
+            load_8888(&data, r, g, b, a);
+            assert_eq!(got, load_ref(&data));
+        }
+    }
+
+    #[test]
+    fn store_8888_matches_bytewise() {
+        for seed in 1..200 {
+            // Lanes above 255 too: a store keeps the low byte.
+            let raw = bytes(seed, STAGE_WIDTH * 8);
+            let mut lanes = [u16x16::default(); 4];
+            for c in 0..4 {
+                for i in 0..STAGE_WIDTH {
+                    let k = (c * STAGE_WIDTH + i) * 2;
+                    lanes[c].0[i] = u16::from_le_bytes([raw[k], raw[k + 1]]);
+                }
+            }
+            let mut expected = [0u8; STAGE_WIDTH * 4];
+            for i in 0..STAGE_WIDTH {
+                for c in 0..4 {
+                    expected[i * 4 + c] = lanes[c].0[i] as u8;
+                }
+            }
+            let mut got = [0u8; STAGE_WIDTH * 4];
+            store_8888(&lanes[0], &lanes[1], &lanes[2], &lanes[3], &mut got);
+            assert_eq!(got, expected);
+
+            for tail in 1..STAGE_WIDTH {
+                let mut got = [0xAAu8; STAGE_WIDTH * 4];
+                store_8888_tail(&lanes[0], &lanes[1], &lanes[2], &lanes[3], tail, &mut got);
+                assert_eq!(got[..tail * 4], expected[..tail * 4]);
+                assert!(got[tail * 4..].iter().all(|&b| b == 0xAA), "tail {tail} wrote past its end");
+            }
+        }
+    }
+
+    /// Every tail length, on both sides of the short-tail switch: the pixels
+    /// that are there, and zero in every lane past them.
+    #[test]
+    fn load_8888_tail_matches_zero_padded_load() {
+        for seed in 1..60 {
+            let data = bytes(seed, STAGE_WIDTH * 4);
+            for tail in 1..STAGE_WIDTH {
+                let mut padded = [0u8; STAGE_WIDTH * 4];
+                padded[..tail * 4].copy_from_slice(&data[..tail * 4]);
+                // Stale lanes going in: a tail load must overwrite all 16.
+                let mut got = [u16x16::splat(0xBEEF); 4];
+                let [r, g, b, a] = &mut got;
+                load_8888_tail(tail, &data, r, g, b, a);
+                assert_eq!(got, load_ref(&padded), "tail {tail}");
+            }
+        }
+    }
 }

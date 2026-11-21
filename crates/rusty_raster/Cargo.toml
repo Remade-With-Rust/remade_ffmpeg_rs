@@ -36,3 +36,7 @@ unsafe_code = "forbid"
 [[example]]
 name = "rasterbench"
 test = false
+
+[[example]]
+name = "veinbench"
+test = false

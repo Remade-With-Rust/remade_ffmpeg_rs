@@ -506,11 +506,10 @@ impl PixmapMut<'_> {
         let Some(rect) = IntRect::from_xywh(x, y, pixmap.width(), pixmap.height()) else {
             return;
         };
+        if self.draw_sprite(x, y, pixmap, paint, transform, mask) {
+            return;
+        }
         let rect = rect.to_rect();
-
-        // TODO: SkSpriteBlitter
-        // TODO: partially clipped
-        // TODO: clipped out
 
         // Translate pattern as well as bounds.
         let patt_transform = Transform::from_translate(x as f32, y as f32);
@@ -530,6 +529,74 @@ impl PixmapMut<'_> {
         };
 
         self.fill_rect(rect, &paint, transform, mask);
+    }
+
+    /// `draw_pixmap` as a sprite blit (Skia's `SkSpriteBlitter` case): no
+    /// transform, no mask, `SourceOver`. This is how a renderer composites a
+    /// group layer. Returns `false` when the call is not that case.
+    ///
+    /// The general path would fill the pixmap's rect with a `Pattern` whose
+    /// transform is the translation by `(x, y)`: per pixel, `seed_shader`
+    /// and `transform` compute the sample point `(dx + 0.5 - x, dy + 0.5 - y)`
+    /// and `gather` truncates it. Under the limits below every one of those
+    /// floats is exact and inside the source, so the sample is source pixel
+    /// `(dx - x, dy - y)` and nothing else: the rows can be walked directly.
+    /// What is done with each pixel is the pipeline's own arithmetic; see
+    /// `sprite_source_over_row`. (An identity or translate-only pattern is
+    /// sampled `Nearest` whatever `paint.quality` says.)
+    fn draw_sprite(
+        &mut self,
+        x: i32,
+        y: i32,
+        pixmap: PixmapRef,
+        paint: &PixmapPaint,
+        transform: Transform,
+        mask: Option<&Mask>,
+    ) -> bool {
+        // Far below 2^23, where `f32` stops holding halves, and with room
+        // for `x + width` in `i32`.
+        const EXACT: i32 = 1 << 20;
+        let exact = |v: i32| (-EXACT..=EXACT).contains(&v);
+        if !(transform.is_identity()
+            && mask.is_none()
+            && paint.blend_mode == BlendMode::SourceOver
+            && !DrawTiler::required(self.width(), self.height())
+            && exact(x)
+            && exact(y)
+            && pixmap.width() <= EXACT as u32
+            && pixmap.height() <= EXACT as u32)
+        {
+            return false;
+        }
+
+        // The pattern's own opacity handling: clamped, and no scaling stage
+        // at exactly 1.
+        let opacity = crate::path::NormalizedF32::new_clamped(paint.opacity);
+        let opacity = (opacity != crate::path::NormalizedF32::ONE).then(|| opacity.get());
+
+        // The sprite's rect clipped to the pixmap, as `scan::fill_rect` does.
+        let left = x.max(0);
+        let top = y.max(0);
+        let right = (x + pixmap.width() as i32).min(self.width() as i32);
+        let bottom = (y + pixmap.height() as i32).min(self.height() as i32);
+        if left >= right || top >= bottom {
+            return true; // Entirely outside: nothing is drawn on either path.
+        }
+
+        let len = (right - left) as usize * BYTES_PER_PIXEL;
+        let src_stride = pixmap.width() as usize * BYTES_PER_PIXEL;
+        let dst_stride = self.width() as usize * BYTES_PER_PIXEL;
+        let src = pixmap.data();
+        let dst = self.data_mut();
+        for row in top..bottom {
+            let s = (row - y) as usize * src_stride + (left - x) as usize * BYTES_PER_PIXEL;
+            let d = row as usize * dst_stride + left as usize * BYTES_PER_PIXEL;
+            let (Some(s), Some(d)) = (src.get(s..s + len), dst.get_mut(d..d + len)) else {
+                break; // Unreachable: both rows are inside their pixmaps.
+            };
+            pipeline::sprite_source_over_row(s, d, opacity);
+        }
+        true
     }
 
     /// Applies a masks.
