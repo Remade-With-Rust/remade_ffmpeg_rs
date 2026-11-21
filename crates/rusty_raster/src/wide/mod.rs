@@ -122,6 +122,25 @@ fn floor_through_i32(v: f32) -> f32 {
     }
 }
 
+/// 2^22: below it in magnitude, `floor_small` is exact.
+const FLOOR_SMALL: f32 = 4_194_304.0;
+
+/// 1.5 * 2^23, the rounding constant of `floor_small`.
+const ROUND_MID: f32 = 12_582_912.0;
+
+/// `floor_through_i32` for `|v| < 2^22`, in five operations instead of the
+/// three-way select: `v + 1.5 * 2^23` lies in `(2^23, 2^24)`, where
+/// consecutive floats are 1 apart, so the addition rounds `v` to the nearest
+/// integer (half to even, the constant being even) and the subtraction is
+/// exact; step down by one where that went up. Both forms compute the same
+/// nearest integer, and a zero comes out `+0.0` in both (`c - c`), so the
+/// bits agree. Callers must check the range (`f32x8::floor`).
+#[inline(always)]
+fn floor_small(v: f32) -> f32 {
+    let nearest = (v + ROUND_MID) - ROUND_MID;
+    nearest - if nearest > v { 1.0 } else { 0.0 }
+}
+
 /// `v as u16` (truncate toward zero, saturate, NaN to 0) without the
 /// float-to-int conversion, which LLVM would make lane by lane (see
 /// `round_to_u8`): clamp to `[0, 65535]` with NaN going to 0, then truncate as
@@ -186,9 +205,21 @@ impl f32x8 {
         Self(o)
     }
 
+    /// SSE2 tiny-skia's `floor` (see `floor_through_i32`). Coordinates and
+    /// gradient positions are nearly always far below 2^22, so when every
+    /// lane is (NaN is not), the eight lanes take `floor_small`; the test is
+    /// one compare per lane and one branch per eight.
     #[inline(always)]
     pub fn floor(self) -> Self {
-        self.map(floor_through_i32)
+        let mut small = true;
+        for v in self.0 {
+            small &= f32::from_bits(v.to_bits() & 0x7fff_ffff) < FLOOR_SMALL;
+        }
+        if small {
+            self.map(floor_small)
+        } else {
+            self.map(floor_through_i32)
+        }
     }
 
     #[inline(always)]
@@ -954,6 +985,50 @@ mod tests {
             for sign in [0u32, 0x8000_0000] {
                 for d in -3i32..=3 {
                     check(f32::from_bits((e.to_bits() | sign).wrapping_add(d as u32)));
+                }
+            }
+        }
+    }
+
+    /// `floor` takes the `floor_small` path only when all eight lanes are
+    /// below 2^22; a vector mixing small lanes with large, infinite or NaN
+    /// ones takes the general path. Every lane must match the oracle either
+    /// way, and the small lanes must agree across the two paths.
+    #[test]
+    fn floor_paths_agree_lane_by_lane() {
+        let small = [
+            -4_194_303.5f32,
+            -2.5,
+            -1.0,
+            -0.5,
+            -0.0,
+            0.0,
+            0.3,
+            4_194_303.75,
+        ];
+        let odd = [
+            4_194_304.0f32,
+            -4_194_304.0,
+            1e9,
+            f32::INFINITY,
+            f32::NAN,
+            -2_147_483_904.0,
+        ];
+        for &o in &odd {
+            for slot in 0..8 {
+                let mut lanes = small;
+                lanes[slot] = o;
+                let all_small = f32x8(small).floor();
+                let mixed = f32x8(lanes).floor();
+                for i in 0..8 {
+                    assert_eq!(
+                        mixed.0[i].to_bits(),
+                        floor_ref(lanes[i]).to_bits(),
+                        "{lanes:?}[{i}]"
+                    );
+                    if i != slot {
+                        assert_eq!(mixed.0[i].to_bits(), all_small.0[i].to_bits());
+                    }
                 }
             }
         }
