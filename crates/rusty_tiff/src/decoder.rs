@@ -1613,11 +1613,17 @@ fn expand_palette(
     };
     match raw {
         DecodingResult::U8(v) if bits < 8 => {
+            // Packed indices, most significant first: every stored byte
+            // holds `8 / bits` of them, so a byte is split with constant
+            // shifts instead of one `get_bits` call (a loop over the bits)
+            // per pixel: 111 Ir a pixel at 4 bits.
+            let table = rgb_table(map, entries);
             let stride = (w * bits).div_ceil(8);
-            for y in 0..h {
-                let row = &v[y * stride..][..stride];
-                for x in 0..w {
-                    push(&mut out, usize::from(get_bits(row, x * bits, bits)));
+            for row in v.chunks_exact(stride).take(h) {
+                match bits {
+                    4 => expand_packed_row::<4>(row, w, &table, &mut out),
+                    2 => expand_packed_row::<2>(row, w, &table, &mut out),
+                    _ => expand_packed_row::<1>(row, w, &table, &mut out),
                 }
             }
         }
@@ -1634,6 +1640,31 @@ fn expand_palette(
         _ => return Err(TiffError::unsupported("palette sample type")),
     }
     Ok(DecodingResult::U16(out))
+}
+
+/// Append the colours of one packed row of `w` `BITS`-bit palette indices.
+fn expand_packed_row<const BITS: usize>(
+    row: &[u8],
+    w: usize,
+    table: &[[u16; 3]; 256],
+    out: &mut Vec<u16>,
+) {
+    let per = 8 / BITS;
+    let mask = (1usize << BITS) - 1;
+    let full = (w / per).min(row.len());
+    for &b in &row[..full] {
+        for j in 0..per {
+            let idx = (usize::from(b) >> (8 - BITS * (j + 1))) & mask;
+            out.extend_from_slice(&table[idx]);
+        }
+    }
+    // The pixels of a last, partly used byte.
+    if let Some(&b) = row.get(full) {
+        for j in 0..w % per {
+            let idx = (usize::from(b) >> (8 - BITS * (j + 1))) & mask;
+            out.extend_from_slice(&table[idx]);
+        }
+    }
 }
 
 /// The colormap's first `entries` (at most 256) colours as `[r, g, b]`
@@ -1751,6 +1782,58 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn palette_expansion_matches_the_definition() {
+        let mut seed = 5u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) as u16
+        };
+        for bits in [1u16, 2, 4, 8] {
+            let entries = 1usize << bits;
+            let map: Vec<u16> = (0..3 * entries).map(|_| rnd()).collect();
+            for (w, h) in [
+                (1u32, 1u32),
+                (3, 2),
+                (7, 3),
+                (8, 2),
+                (9, 4),
+                (16, 1),
+                (37, 5),
+            ] {
+                let stride = (w as usize * usize::from(bits)).div_ceil(8);
+                let raw: Vec<u8> = (0..stride * h as usize).map(|_| rnd() as u8).collect();
+                // The definition: pixel by pixel, one bit at a time.
+                let mut want = Vec::new();
+                for y in 0..h as usize {
+                    let row = &raw[y * stride..][..stride];
+                    for x in 0..w as usize {
+                        let i =
+                            usize::from(get_bits(row, x * usize::from(bits), usize::from(bits)));
+                        want.extend_from_slice(&[map[i], map[entries + i], map[2 * entries + i]]);
+                    }
+                }
+                let info = ImageInfo {
+                    width: w,
+                    height: h,
+                    bits_per_sample: bits,
+                    samples_per_pixel: 1,
+                    sample_kind: SampleKind::Uint,
+                    photometric: photometric::PALETTE,
+                    compression: compression::NONE,
+                    predictor: 1,
+                    planar: false,
+                    tiled: false,
+                    chunk_dimensions: (w, h),
+                    extra_samples: Vec::new(),
+                    fill_order: 1,
+                };
+                let got = expand_palette(&DecodingResult::U8(raw), &info, &map).unwrap();
+                assert_eq!(got, DecodingResult::U16(want), "bits {bits} {w}x{h}");
             }
         }
     }
