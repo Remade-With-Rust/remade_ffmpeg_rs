@@ -814,10 +814,18 @@ fn rle_rows<const RLE4: bool>(data: &mut &[u8], h: &Header, buf: &mut [u8]) -> R
                             }
                             px += n;
                         } else {
-                            let mut o = rb + px * ch;
+                            // One range check for the packet, then a word
+                            // store per pixel (the loop test covers it).
+                            let o = rb + px * ch;
+                            let dst = &mut buf[o..o + n * ch];
+                            let mut q = 0;
                             for &i in &idx[..n] {
-                                buf[o..o + 3].copy_from_slice(&pal[usize::from(i)]);
-                                o += ch;
+                                if q + 4 > dst.len() {
+                                    dst[q..].copy_from_slice(&pal4[usize::from(i)][..3]);
+                                    break;
+                                }
+                                dst[q..q + 4].copy_from_slice(&pal4[usize::from(i)]);
+                                q += ch;
                             }
                             px += n;
                         }
@@ -850,14 +858,31 @@ fn rle_rows<const RLE4: bool>(data: &mut &[u8], h: &Header, buf: &mut [u8]) -> R
                     // A run longer than the row is clamped to it (ImageMagick
                     // writes such files).
                     let take = n.min(h.width - px);
-                    // Runs average about two pixels in real files: a plain
-                    // offset loop, no per-run slice or chunk setup (that
-                    // shape measured +15% Ir on the RLE8 fixture).
-                    let c = pal[usize::from(index)];
-                    let mut o = rb + px * ch;
-                    for _ in 0..take {
-                        buf[o..o + 3].copy_from_slice(&c);
-                        o += ch;
+                    // Runs average about two pixels in screenshots and about
+                    // eleven in photos. One range check for the run, then a
+                    // word store per pixel whose loop test is its bounds
+                    // check, and a 3-byte store for the last pixel of a
+                    // 3-channel run. (A per-run `chunks_exact` over a
+                    // run-time channel count measured +15% Ir: it divides.)
+                    if take < 4 {
+                        let c = pal[usize::from(index)];
+                        let mut o = rb + px * ch;
+                        for _ in 0..take {
+                            buf[o..o + 3].copy_from_slice(&c);
+                            o += ch;
+                        }
+                    } else {
+                        let c = pal4[usize::from(index)];
+                        let o = rb + px * ch;
+                        let dst = &mut buf[o..o + take * ch];
+                        let mut q = 0;
+                        while q + 4 <= dst.len() {
+                            dst[q..q + 4].copy_from_slice(&c);
+                            q += ch;
+                        }
+                        if q < dst.len() {
+                            dst[q..].copy_from_slice(&c[..3]);
+                        }
                     }
                     px += take;
                 }
