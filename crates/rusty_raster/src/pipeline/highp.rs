@@ -254,11 +254,35 @@ fn uniform_color(p: &mut Pipeline) {
     p.next_stage();
 }
 
-fn seed_shader(p: &mut Pipeline) {
+pub fn seed_shader(p: &mut Pipeline) {
     let iota = f32x8::from([0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]);
 
     p.r = f32x8::splat(p.dx as f32) + iota;
     p.g = f32x8::splat(p.dy as f32 + 0.5);
+    p.b = f32x8::splat(1.0);
+    p.a = f32x8::default();
+
+    p.dr = f32x8::default();
+    p.dg = f32x8::default();
+    p.db = f32x8::default();
+    p.da = f32x8::default();
+
+    p.next_stage();
+}
+
+/// `seed_shader` then `transform`, as one stage (`compile` fuses the pair,
+/// which opens every pattern and gradient pipeline with a non-identity
+/// transform): the same sums and products on the same floats, without a
+/// dispatch between them and without storing the seed's `r` and `g` only to
+/// read them back.
+pub fn seed_shader_transform(p: &mut Pipeline) {
+    let iota = f32x8::from([0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]);
+    let x = f32x8::splat(p.dx as f32) + iota;
+    let y = f32x8::splat(p.dy as f32 + 0.5);
+
+    let ts = &p.ctx.transform;
+    p.r = mad(x, f32x8::splat(ts.sx), mad(y, f32x8::splat(ts.kx), f32x8::splat(ts.tx)));
+    p.g = mad(x, f32x8::splat(ts.ky), mad(y, f32x8::splat(ts.sy), f32x8::splat(ts.ty)));
     p.b = f32x8::splat(1.0);
     p.a = f32x8::default();
 
@@ -820,7 +844,7 @@ fn sprite_source_over_8(
     store_8888(&r, &g, &b, &a, dst);
 }
 
-fn transform(p: &mut Pipeline) {
+pub fn transform(p: &mut Pipeline) {
     let ts = &p.ctx.transform;
 
     let tr = mad(p.r, f32x8::splat(ts.sx), mad(p.g, f32x8::splat(ts.kx), f32x8::splat(ts.tx)));
