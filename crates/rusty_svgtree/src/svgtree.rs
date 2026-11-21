@@ -109,6 +109,9 @@ macro_rules! attribute_ids {
         }
 
         impl AId {
+            /// How many attribute ids there are.
+            const COUNT: usize = [$($name,)*].len();
+
             fn from_name(name: &str) -> Option<AId> {
                 Some(match name {
                     $($name => AId::$variant,)*
@@ -117,6 +120,31 @@ macro_rules! attribute_ids {
             }
         }
     };
+}
+
+/// A set of attribute ids, one bit each.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AttrSet([u64; 2]);
+
+const _: () = assert!(AId::COUNT <= 128);
+
+impl AttrSet {
+    #[inline]
+    fn contains(self, id: AId) -> bool {
+        let i = id as usize;
+        self.0[i >> 6] & (1 << (i & 63)) != 0
+    }
+
+    #[inline]
+    fn insert(&mut self, id: AId) {
+        let i = id as usize;
+        self.0[i >> 6] |= 1 << (i & 63);
+    }
+
+    #[inline]
+    fn union(self, other: AttrSet) -> AttrSet {
+        AttrSet([self.0[0] | other.0[0], self.0[1] | other.0[1]])
+    }
 }
 
 attribute_ids! {
@@ -338,6 +366,10 @@ struct NodeData {
     next_sibling: Option<NodeId>,
     tag: Option<EId>,
     attrs: std::ops::Range<u32>,
+    /// The attributes this element has.
+    own: AttrSet,
+    /// The attributes this element or one of its ancestors has.
+    chain: AttrSet,
 }
 
 /// The resolved SVG document.
@@ -388,15 +420,26 @@ impl<'a> SvgNode<'a> {
     }
 
     pub(crate) fn attribute(&self, name: AId) -> Option<&'a str> {
-        let r = self.d().attrs.clone();
-        self.doc.attrs[r.start as usize..r.end as usize]
+        let d = self.d();
+        if !d.own.contains(name) {
+            return None;
+        }
+        self.doc.attrs[d.attrs.start as usize..d.attrs.end as usize]
             .iter()
             .find(|a| a.name == name)
             .map(|a| &*a.value)
     }
 
     pub(crate) fn has_attribute(&self, name: AId) -> bool {
-        self.attribute(name).is_some()
+        self.d().own.contains(name)
+    }
+
+    /// The nearest of self and its ancestor elements that has `name`.
+    pub(crate) fn ancestor_with_attribute(&self, name: AId) -> Option<SvgNode<'a>> {
+        if !self.d().chain.contains(name) {
+            return None;
+        }
+        self.ancestors().find(|n| n.has_attribute(name))
     }
 
     pub(crate) fn parent(&self) -> Option<SvgNode<'a>> {
@@ -438,7 +481,7 @@ impl<'a> SvgNode<'a> {
     /// `find_attribute`).
     pub(crate) fn find_attribute_node(&self, name: AId) -> Option<SvgNode<'a>> {
         if name.is_inheritable() {
-            self.ancestors().find(|n| n.has_attribute(name))
+            self.ancestor_with_attribute(name)
         } else if self.has_attribute(name) {
             Some(*self)
         } else {
@@ -575,8 +618,18 @@ impl Document {
         self.links.get(id).map(|&id| SvgNode { id, doc: self })
     }
 
-    fn append(&mut self, parent: NodeId, tag: EId, attrs: std::ops::Range<u32>) -> NodeId {
+    /// Appends an element whose attributes are `attrs`, which hold exactly
+    /// the ids in `own`.
+    fn append(
+        &mut self,
+        parent: NodeId,
+        tag: EId,
+        attrs: std::ops::Range<u32>,
+        own: AttrSet,
+    ) -> NodeId {
         let id = NodeId(self.nodes.len() as u32);
+        let p = parent.0 as usize;
+        let chain = own.union(self.nodes[p].chain);
         self.nodes.push(NodeData {
             parent: Some(parent),
             first_child: None,
@@ -584,8 +637,9 @@ impl Document {
             next_sibling: None,
             tag: Some(tag),
             attrs,
+            own,
+            chain,
         });
-        let p = parent.0 as usize;
         if let Some(last) = self.nodes[p].last_child {
             self.nodes[last.0 as usize].next_sibling = Some(id);
         } else {
@@ -764,6 +818,8 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document, Error> {
                 next_sibling: None,
                 tag: None,
                 attrs: 0..0,
+                own: AttrSet::default(),
+                chain: AttrSet::default(),
             }],
             attrs: Vec::new(),
             links: HashMap::new(),
@@ -939,6 +995,8 @@ impl Builder<'_> {
     ) -> Result<NodeId, Error> {
         self.check_nodes()?;
         let start = self.doc.attrs.len();
+        // The ids of the attributes appended so far.
+        let mut own = AttrSet::default();
 
         // 1. XML attributes.
         let href = x.href();
@@ -964,10 +1022,28 @@ impl Builder<'_> {
                 continue;
             };
             let value = self.xml.content(aid);
-            append_attribute(&mut self.doc, parent, start, name, value, false, false);
+            append_attribute(
+                &mut self.doc,
+                &mut own,
+                parent,
+                start,
+                name,
+                value,
+                false,
+                false,
+            );
         }
         if let Some(h) = href {
-            append_attribute(&mut self.doc, parent, start, AId::Href, h, false, false);
+            append_attribute(
+                &mut self.doc,
+                &mut own,
+                parent,
+                start,
+                AId::Href,
+                h,
+                false,
+                false,
+            );
         }
 
         // 2. Style sheet rules (sorted by specificity), then 3. `style`: each
@@ -982,7 +1058,8 @@ impl Builder<'_> {
                 &mut self.css_budget,
                 |rule| {
                     for d in &rule.declarations {
-                        apply_declaration(doc, parent, start, &d.name, &d.value, d.important);
+                        let (name, value) = (&d.name, &d.value);
+                        apply_declaration(doc, &mut own, parent, start, name, value, d.important);
                     }
                 },
             );
@@ -990,12 +1067,12 @@ impl Builder<'_> {
         if let Some(style) = x.attr("style") {
             let doc = &mut self.doc;
             css::for_each_declaration(style, |name, value, important| {
-                apply_declaration(doc, parent, start, name, value, important);
+                apply_declaration(doc, &mut own, parent, start, name, value, important);
             });
         }
 
         let end = self.doc.attrs.len();
-        let id = self.doc.append(parent, tag, start as u32..end as u32);
+        let id = self.doc.append(parent, tag, start as u32..end as u32, own);
         Ok(id)
     }
 }
@@ -1004,6 +1081,7 @@ impl Builder<'_> {
 /// attribute) to the element being built, whose attributes start at `start`.
 fn apply_declaration(
     doc: &mut Document,
+    own: &mut AttrSet,
     parent: NodeId,
     start: usize,
     name: &str,
@@ -1012,17 +1090,19 @@ fn apply_declaration(
 ) {
     if name == "marker" {
         for n in [AId::MarkerStart, AId::MarkerMid, AId::MarkerEnd] {
-            append_attribute(doc, parent, start, n, value, important, true);
+            append_attribute(doc, own, parent, start, n, value, important, true);
         }
     } else if let Some(name) = AId::from_name(name).filter(|n| n.is_presentation()) {
-        append_attribute(doc, parent, start, name, value, important, true);
+        append_attribute(doc, own, parent, start, name, value, important, true);
     }
 }
 
 /// Appends (or, with `replace`, overrides) an attribute of the element
-/// being built, whose attributes start at `start`.
+/// being built, whose attributes start at `start` and have the ids in `own`.
+#[allow(clippy::too_many_arguments)]
 fn append_attribute(
     doc: &mut Document,
+    own: &mut AttrSet,
     parent: NodeId,
     start: usize,
     name: AId,
@@ -1039,13 +1119,16 @@ fn append_attribute(
     let Some((value, important)) = resolved else {
         return;
     };
-    if let Some(existing) = doc.attrs[start..].iter_mut().find(|a| a.name == name) {
-        if replace && !existing.important {
-            existing.value = value;
-            existing.important = important;
+    if own.contains(name) {
+        if let Some(existing) = doc.attrs[start..].iter_mut().find(|a| a.name == name) {
+            if replace && !existing.important {
+                existing.value = value;
+                existing.important = important;
+            }
         }
         return;
     }
+    own.insert(name);
     doc.attrs.push(Attr {
         name,
         important,
@@ -1056,7 +1139,7 @@ fn append_attribute(
 fn resolve_inherit(doc: &Document, parent: NodeId, name: AId) -> Option<(Box<str>, bool)> {
     let p = SvgNode { id: parent, doc };
     let found = if name.is_inheritable() {
-        p.ancestors().find(|n| n.has_attribute(name))
+        p.ancestor_with_attribute(name)
     } else {
         Some(p).filter(|n| n.tag_name().is_some() && n.has_attribute(name))
     };

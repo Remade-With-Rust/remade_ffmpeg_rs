@@ -1265,7 +1265,7 @@ fn resolve_fill(node: SvgNode, has_bbox: bool, state: &State, cache: &mut Cache)
         });
     }
     let mut sub_opacity = 1.0;
-    let paint = if let Some(n) = node.ancestors().find(|n| n.has_attribute(AId::Fill)) {
+    let paint = if let Some(n) = node.ancestor_with_attribute(AId::Fill) {
         let value = n.attribute(AId::Fill)?;
         convert_paint(node, value, true, has_bbox, state, &mut sub_opacity, cache)?
     } else {
@@ -1296,7 +1296,7 @@ fn resolve_stroke(
         return None;
     }
     let mut sub_opacity = 1.0;
-    let n = node.ancestors().find(|n| n.has_attribute(AId::Stroke))?;
+    let n = node.ancestor_with_attribute(AId::Stroke)?;
     let value = n.attribute(AId::Stroke)?;
     let paint = convert_paint(node, value, false, has_bbox, state, &mut sub_opacity, cache)?;
     let width = resolve_length(node, AId::StrokeWidth, state, 1.0);
@@ -1338,7 +1338,7 @@ fn resolve_stroke(
 
 /// An inherited length (`stroke-width`, `stroke-dashoffset`).
 fn resolve_length(node: SvgNode, name: AId, state: &State, def: f32) -> f32 {
-    if let Some(n) = node.ancestors().find(|n| n.has_attribute(name)) {
+    if let Some(n) = node.ancestor_with_attribute(name) {
         if let Some(l) = n.length_attr(name) {
             return convert_length(l, n, name, Units::UserSpaceOnUse, state);
         }
@@ -1347,9 +1347,7 @@ fn resolve_length(node: SvgNode, name: AId, state: &State, def: f32) -> f32 {
 }
 
 fn conv_dasharray(node: SvgNode, state: &State) -> Option<Vec<f32>> {
-    let n = node
-        .ancestors()
-        .find(|n| n.has_attribute(AId::StrokeDasharray))?;
+    let n = node.ancestor_with_attribute(AId::StrokeDasharray)?;
     let list = values::length_list(n.attribute(AId::StrokeDasharray)?)?;
     let list: Vec<f32> = list
         .into_iter()
