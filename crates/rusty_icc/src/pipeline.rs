@@ -790,6 +790,12 @@ impl Chain {
         run(&self.ops, &mut v, self.in_ch);
         *out = v;
     }
+
+    /// [`Chain::eval`] on one array: `v` holds the colour (zero past
+    /// `in_ch`) and receives the result.
+    pub(crate) fn eval_in_place(&self, v: &mut [f64; 16]) {
+        run(&self.ops, v, self.in_ch);
+    }
 }
 
 /// Effective BPC flags (`LittleCMS` `_cmsLinkProfiles`): never for absolute

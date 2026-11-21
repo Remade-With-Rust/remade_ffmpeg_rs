@@ -500,14 +500,20 @@ impl Transform {
                 run_grid(g, src, dst, (sc, dc, in_ch, out_ch), (src_alpha, dst_alpha));
             }
             _ => {
-                if let (Some(f), Some(s)) = (self.chain.as_shaper(), T::f32s(src)) {
+                let src_lab = self.src_layout.is_lab();
+                let dst_lab = self.dst_layout.is_lab();
+                if let Some(s) = T::f32s(src) {
                     if let Some(d) = T::f32s_mut(dst) {
-                        run_shaper_f32(&f, s, d, (sc, dc), (src_alpha, dst_alpha));
+                        let alpha = (src_alpha, dst_alpha);
+                        if let Some(f) = self.chain.as_shaper() {
+                            run_shaper_f32(&f, s, d, (sc, dc), alpha);
+                        } else {
+                            let ch = (sc, dc, in_ch, out_ch);
+                            run_chain_f32(&self.chain, s, d, ch, alpha, (src_lab, dst_lab));
+                        }
                         return Ok(());
                     }
                 }
-                let src_lab = self.src_layout.is_lab();
-                let dst_lab = self.dst_layout.is_lab();
                 let mut input = [0.0f64; 16];
                 let mut out = [0.0f64; 16];
                 for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
@@ -553,6 +559,43 @@ fn run_shaper_f32(
         dp[0] = out[0] as f32;
         dp[1] = out[1] as f32;
         dp[2] = out[2] as f32;
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
+}
+
+/// `f32` pixels through the exact pipeline. Not generic, so the loop is
+/// compiled here, on one zero-tailed array per pixel that the chain works on
+/// in place; the generic loop is compiled in the caller's crate and pays a
+/// call and two 128-byte copies per pixel.
+fn run_chain_f32(
+    chain: &Chain,
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc, in_ch, out_ch): (usize, usize, usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+    (src_lab, dst_lab): (bool, bool),
+) {
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let mut v = [0.0f64; 16];
+        for c in 0..in_ch {
+            v[c] = f64::from(sp[c]);
+        }
+        if src_lab {
+            v[0] /= 100.0;
+            v[1] = (v[1] + 128.0) / 255.0;
+            v[2] = (v[2] + 128.0) / 255.0;
+        }
+        chain.eval_in_place(&mut v);
+        if dst_lab {
+            v[0] *= 100.0;
+            v[1] = v[1] * 255.0 - 128.0;
+            v[2] = v[2] * 255.0 - 128.0;
+        }
+        for c in 0..out_ch {
+            dp[c] = v[c] as f32;
+        }
         if dst_alpha {
             dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
         }
