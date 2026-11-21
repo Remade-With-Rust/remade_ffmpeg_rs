@@ -703,7 +703,83 @@ pub(crate) struct Chain {
     pub(crate) shaper: Option<ShaperLink>,
 }
 
+/// A chain that is one RGB matrix/TRC profile into another, viewed for a
+/// straight-line evaluation per colour: the operations [`run`] performs for
+/// the ops it borrows, in the same order (so every result is the same),
+/// without the per-op dispatch, the calls and the 16-channel scratch arrays.
+pub(crate) struct ShaperChain<'a> {
+    curves: &'a [Curve; 3],
+    /// The XYZ affine maps between the curves, the first `maps` of them.
+    affines: [(Mat3, [f64; 3]); 3],
+    maps: usize,
+    inverse: Inverse<'a>,
+}
+
+enum Inverse<'a> {
+    Break(&'a [InvCurve; 3]),
+    Plain(&'a [Curve; 3]),
+}
+
+impl ShaperChain<'_> {
+    /// One colour: exactly what [`Chain::eval`] gives for it.
+    #[inline]
+    pub(crate) fn eval(&self, x: [f64; 3]) -> [f64; 3] {
+        let [c0, c1, c2] = self.curves;
+        let mut v = [c0.eval(x[0]), c1.eval(x[1]), c2.eval(x[2])];
+        for (m, off) in &self.affines[..self.maps] {
+            let r = mat_vec(m, v);
+            v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
+        }
+        let v = v.map(clamp01);
+        match self.inverse {
+            Inverse::Break([i0, i1, i2]) => [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])],
+            Inverse::Plain([i0, i1, i2]) => [
+                i0.eval_inverse(v[0]),
+                i1.eval_inverse(v[1]),
+                i2.eval_inverse(v[2]),
+            ],
+        }
+    }
+}
+
 impl Chain {
+    /// The chain as a [`ShaperChain`], when its ops are exactly: three
+    /// device curves, XYZ affine maps (in, an optional PCS adjustment,
+    /// out), the clamp, three inverse device curves. Worked out per call
+    /// from the ops themselves (a few dozen instructions, nothing stored),
+    /// so building a transform costs nothing more.
+    pub(crate) fn as_shaper(&self) -> Option<ShaperChain<'_>> {
+        if self.in_ch != 3 || self.out_ch != 3 {
+            return None;
+        }
+        let [Op::Lut(Stage::Curves(curves)), mid @ .., Op::Clamp01, last] = self.ops.as_slice()
+        else {
+            return None;
+        };
+        let curves: &[Curve; 3] = curves.as_slice().try_into().ok()?;
+        let mut affines = [(IDENTITY, [0.0; 3]); 3];
+        if mid.len() > affines.len() {
+            return None;
+        }
+        for (slot, op) in affines.iter_mut().zip(mid) {
+            let Op::Affine(m, off) = op else {
+                return None;
+            };
+            *slot = (*m, *off);
+        }
+        let inverse = match last {
+            Op::InvBreakCurves(cs) => Inverse::Break(cs.as_slice().try_into().ok()?),
+            Op::InvCurves(cs) => Inverse::Plain(cs.as_slice().try_into().ok()?),
+            _ => return None,
+        };
+        Some(ShaperChain {
+            curves,
+            affines,
+            maps: mid.len(),
+            inverse,
+        })
+    }
+
     /// Evaluates one colour (normalised in, normalised out). Values past
     /// `in_ch` in `input` must be zero (callers keep zero-tailed arrays);
     /// `out` past `out_ch` is unspecified. Whole-array copies have a
@@ -874,5 +950,80 @@ impl GamutChain {
         let n = run(&self.proof_out, &mut v, 3);
         run(&self.proof_in, &mut v, n);
         (a, Lab::new(v[0], v[1], v[2]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fused_shaper_chain_matches_the_interpreter_bit_for_bit() {
+        use crate::color::{Xy, D65_XY};
+        let srgb = Profile::new_srgb();
+        let p3 = Profile::new_display_p3();
+        let lin = Profile::new_rgb(
+            D65_XY,
+            [
+                Xy::new(0.708, 0.292),
+                Xy::new(0.170, 0.797),
+                Xy::new(0.131, 0.046),
+            ],
+            Curve::gamma(1.0),
+        )
+        .unwrap();
+        let g22 = Profile::new_rgb(
+            D65_XY,
+            [
+                Xy::new(0.64, 0.33),
+                Xy::new(0.21, 0.71),
+                Xy::new(0.15, 0.06),
+            ],
+            Curve::gamma(2.2),
+        )
+        .unwrap();
+        let mut xs: Vec<f64> = (0..=64).map(|i| f64::from(i) / 64.0).collect();
+        xs.extend([
+            -0.25,
+            -0.0,
+            1.0e-9,
+            0.04045,
+            0.5000001,
+            1.25,
+            f64::NAN,
+            f64::INFINITY,
+        ]);
+        let abs = Intent::AbsoluteColorimetric;
+        let rel = Intent::RelativeColorimetric;
+        for (a, b, intent, bpc) in [
+            (&srgb, &p3, rel, false),
+            (&p3, &srgb, rel, true),
+            (&srgb, &lin, abs, false),
+            (&lin, &g22, rel, false),
+            (&g22, &srgb, Intent::Perceptual, true),
+        ] {
+            let chain = build_chain(&[a, b], &[intent, intent], &[bpc, bpc]).unwrap();
+            let fused = chain.as_shaper().expect("matrix-shaper pair");
+            for &r in &xs {
+                for &g in &xs {
+                    for &bl in &[0.0, 0.3, 1.0, f64::NAN, -1.0, 2.0] {
+                        let mut input = [0.0; 16];
+                        input[..3].copy_from_slice(&[r, g, bl]);
+                        let mut want = [0.0; 16];
+                        chain.eval(&input, &mut want);
+                        let got = fused.eval([r, g, bl]);
+                        assert_eq!(
+                            got.map(f64::to_bits),
+                            [want[0], want[1], want[2]].map(f64::to_bits),
+                            "{r} {g} {bl}"
+                        );
+                    }
+                }
+            }
+        }
+        // Chains through a LUT or to Lab are not fused.
+        let lab = Profile::new_lab_identity();
+        let chain = build_chain(&[&srgb, &lab], &[rel, rel], &[false, false]).unwrap();
+        assert!(chain.as_shaper().is_none());
     }
 }

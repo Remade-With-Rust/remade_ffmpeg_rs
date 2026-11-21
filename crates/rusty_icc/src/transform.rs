@@ -6,7 +6,7 @@ use crate::color::delta_e_2000;
 use crate::curve::{clamp01, InvCurve};
 use crate::error::{Error, Result};
 use crate::lut::ClutEval;
-use crate::pipeline::{build_chain, Chain, GamutChain, ShaperLink};
+use crate::pipeline::{build_chain, Chain, GamutChain, ShaperChain, ShaperLink};
 use crate::profile::{ColorSpace, Profile};
 
 /// ICC rendering intent.
@@ -134,6 +134,17 @@ pub trait Sample: Copy + Send + Sync + 'static + sealed::Sealed {
     fn opaque() -> Self;
     #[doc(hidden)]
     fn index(self) -> usize;
+    /// The slice as `f32` samples, when that is what it holds.
+    #[doc(hidden)]
+    fn f32s(s: &[Self]) -> Option<&[f32]> {
+        let _ = s;
+        None
+    }
+    #[doc(hidden)]
+    fn f32s_mut(s: &mut [Self]) -> Option<&mut [f32]> {
+        let _ = s;
+        None
+    }
 }
 
 impl Sample for u8 {
@@ -184,6 +195,12 @@ impl Sample for f32 {
     }
     fn index(self) -> usize {
         0
+    }
+    fn f32s(s: &[Self]) -> Option<&[f32]> {
+        Some(s)
+    }
+    fn f32s_mut(s: &mut [Self]) -> Option<&mut [f32]> {
+        Some(s)
     }
 }
 
@@ -483,6 +500,12 @@ impl Transform {
                 run_grid(g, src, dst, (sc, dc, in_ch, out_ch), (src_alpha, dst_alpha));
             }
             _ => {
+                if let (Some(f), Some(s)) = (self.chain.as_shaper(), T::f32s(src)) {
+                    if let Some(d) = T::f32s_mut(dst) {
+                        run_shaper_f32(&f, s, d, (sc, dc), (src_alpha, dst_alpha));
+                        return Ok(());
+                    }
+                }
                 let src_lab = self.src_layout.is_lab();
                 let dst_lab = self.dst_layout.is_lab();
                 let mut input = [0.0f64; 16];
@@ -512,6 +535,27 @@ impl Transform {
             }
         }
         Ok(())
+    }
+}
+
+/// `f32` pixels between two RGB matrix/TRC profiles. Not generic, so the
+/// whole per-pixel body (curves, matrices, inverse curves) is compiled here
+/// as one loop instead of a call into the op interpreter per pixel.
+fn run_shaper_f32(
+    f: &ShaperChain<'_>,
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) {
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let out = f.eval([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]);
+        dp[0] = out[0] as f32;
+        dp[1] = out[1] as f32;
+        dp[2] = out[2] as f32;
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
     }
 }
 
@@ -654,5 +698,80 @@ impl GamutCheck {
             *o = v > self.threshold;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `f32` loops against the per-colour reference: [`Chain::eval`] on
+    /// a zero-tailed array, with the Lab scaling and the alpha rule of the
+    /// documented layouts.
+    #[test]
+    fn f32_loops_match_chain_eval_bit_for_bit() {
+        let srgb = Profile::new_srgb();
+        let p3 = Profile::new_display_p3();
+        let lab = Profile::new_lab_identity();
+        let gray = Profile::new_gray(crate::color::D65_XY, crate::Curve::gamma(2.2));
+        let vals = [
+            -0.5f32,
+            0.0,
+            0.001,
+            0.2,
+            0.5,
+            0.999,
+            1.0,
+            1.5,
+            37.0,
+            -90.0,
+            f32::NAN,
+        ];
+        for (a, al, b, bl) in [
+            (&srgb, Layout::Rgb, &p3, Layout::Rgba),
+            (&srgb, Layout::Rgba, &p3, Layout::Rgb),
+            (&srgb, Layout::Rgba, &lab, Layout::Laba),
+            (&lab, Layout::Lab, &srgb, Layout::Rgba),
+            (&gray, Layout::GrayAlpha, &srgb, Layout::Rgb),
+            (&srgb, Layout::Rgb, &gray, Layout::GrayAlpha),
+        ] {
+            let intent = Intent::RelativeColorimetric;
+            let t = Transform::new(a, al, b, bl, intent, Options::default()).unwrap();
+            let (sc, dc) = (al.channels(), bl.channels());
+            let (ic, oc) = (al.color_channels(), bl.color_channels());
+            let mut src = Vec::new();
+            for i in 0..vals.len() * vals.len() {
+                for c in 0..sc {
+                    src.push(vals[(i / vals.len().pow((c % 2) as u32) + 3 * c) % vals.len()]);
+                }
+            }
+            let mut dst = vec![-7.0f32; src.len() / sc * dc];
+            t.transform(&src, &mut dst).unwrap();
+            for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact(dc)) {
+                let mut input = [0.0f64; 16];
+                for c in 0..ic {
+                    input[c] = f64::from(sp[c]);
+                }
+                if al.is_lab() {
+                    input[0] /= 100.0;
+                    input[1] = (input[1] + 128.0) / 255.0;
+                    input[2] = (input[2] + 128.0) / 255.0;
+                }
+                let mut out = [0.0f64; 16];
+                t.chain.eval(&input, &mut out);
+                if bl.is_lab() {
+                    out[0] *= 100.0;
+                    out[1] = out[1] * 255.0 - 128.0;
+                    out[2] = out[2] * 255.0 - 128.0;
+                }
+                for c in 0..oc {
+                    assert_eq!(dp[c].to_bits(), (out[c] as f32).to_bits(), "{al:?} {bl:?}");
+                }
+                if bl.has_alpha() {
+                    let want = if al.has_alpha() { sp[sc - 1] } else { 1.0 };
+                    assert_eq!(dp[dc - 1].to_bits(), want.to_bits());
+                }
+            }
+        }
     }
 }
