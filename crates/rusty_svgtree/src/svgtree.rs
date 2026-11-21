@@ -831,34 +831,32 @@ impl Builder<'_> {
                 continue;
             }
             let value = self.xml.content(aid);
-            self.append_attribute(parent, start, name, value, false, false);
+            append_attribute(&mut self.doc, parent, start, name, value, false, false);
         }
         if let Some(h) = href {
-            self.append_attribute(parent, start, "href", h, false, false);
+            append_attribute(&mut self.doc, parent, start, "href", h, false, false);
         }
 
-        // 2. Style sheet rules (sorted by specificity), then 3. `style`.
-        let mut decls: Vec<css::Declaration> = Vec::new();
+        // 2. Style sheet rules (sorted by specificity), then 3. `style`: each
+        // declaration is applied where it is found, in that order.
         if !self.sheet.is_empty() {
+            let doc = &mut self.doc;
             css::for_each_match(
                 &self.sheet,
                 self.rule_index.as_ref(),
                 &mut self.rule_scratch,
                 x,
                 &mut self.css_budget,
-                |rule| decls.extend(rule.declarations.iter().cloned()),
+                |rule| {
+                    for d in &rule.declarations {
+                        apply_declaration(doc, parent, start, &d.name, &d.value, d.important);
+                    }
+                },
             );
         }
         if let Some(style) = x.attr("style") {
-            decls.extend(css::parse_declarations(style));
-        }
-        for d in decls {
-            if d.name == "marker" {
-                for n in ["marker-start", "marker-mid", "marker-end"] {
-                    self.append_attribute(parent, start, n, &d.value, d.important, true);
-                }
-            } else if is_presentation(&d.name) {
-                self.append_attribute(parent, start, &d.name, &d.value, d.important, true);
+            for d in css::parse_declarations(style) {
+                apply_declaration(&mut self.doc, parent, start, &d.name, &d.value, d.important);
             }
         }
 
@@ -866,78 +864,91 @@ impl Builder<'_> {
         let id = self.doc.append(parent, tag, start as u32..end as u32);
         Ok(id)
     }
+}
 
-    /// Appends (or, with `replace`, overrides) an attribute of the element
-    /// being built, whose attributes start at `start`.
-    fn append_attribute(
-        &mut self,
-        parent: NodeId,
-        start: usize,
-        name: &str,
-        value: &str,
-        important: bool,
-        replace: bool,
-    ) {
-        let value = value.trim();
-        let resolved: Option<(Box<str>, bool)> = if value == "inherit" {
-            self.resolve_inherit(parent, name)
-        } else {
-            Some((value.into(), important))
-        };
-        let Some((value, important)) = resolved else {
-            return;
-        };
-        if let Some(existing) = self.doc.attrs[start..]
-            .iter_mut()
-            .find(|a| &*a.name == name)
-        {
-            if replace && !existing.important {
-                existing.value = value;
-                existing.important = important;
-            }
-            return;
+/// Applies one style declaration (from a style sheet rule or a `style`
+/// attribute) to the element being built, whose attributes start at `start`.
+fn apply_declaration(
+    doc: &mut Document,
+    parent: NodeId,
+    start: usize,
+    name: &str,
+    value: &str,
+    important: bool,
+) {
+    if name == "marker" {
+        for n in ["marker-start", "marker-mid", "marker-end"] {
+            append_attribute(doc, parent, start, n, value, important, true);
         }
-        self.doc.attrs.push(Attr {
-            name: name.into(),
-            value,
-            important,
-        });
+    } else if is_presentation(name) {
+        append_attribute(doc, parent, start, name, value, important, true);
     }
+}
 
-    fn resolve_inherit(&self, parent: NodeId, name: &str) -> Option<(Box<str>, bool)> {
-        let p = SvgNode {
-            id: parent,
-            doc: &self.doc,
-        };
-        let found = if is_inheritable(name) {
-            p.ancestors().find(|n| n.has_attribute(name))
-        } else {
-            Some(p).filter(|n| n.tag_name().is_some() && n.has_attribute(name))
-        };
-        if let Some(n) = found {
-            return n.attribute(name).map(|v| (v.into(), false));
+/// Appends (or, with `replace`, overrides) an attribute of the element
+/// being built, whose attributes start at `start`.
+fn append_attribute(
+    doc: &mut Document,
+    parent: NodeId,
+    start: usize,
+    name: &str,
+    value: &str,
+    important: bool,
+    replace: bool,
+) {
+    let value = value.trim();
+    let resolved: Option<(Box<str>, bool)> = if value == "inherit" {
+        resolve_inherit(doc, parent, name)
+    } else {
+        Some((value.into(), important))
+    };
+    let Some((value, important)) = resolved else {
+        return;
+    };
+    if let Some(existing) = doc.attrs[start..].iter_mut().find(|a| &*a.name == name) {
+        if replace && !existing.important {
+            existing.value = value;
+            existing.important = important;
         }
-        let def = match name {
-            "image-rendering" | "shape-rendering" | "text-rendering" => "auto",
-            "clip-path" | "filter" | "marker-end" | "marker-mid" | "marker-start" | "mask"
-            | "stroke" | "stroke-dasharray" | "text-decoration" => "none",
-            "font-stretch" | "font-style" | "font-variant" | "font-weight" | "letter-spacing"
-            | "word-spacing" => "normal",
-            "fill" | "flood-color" | "stop-color" => "black",
-            "fill-opacity" | "flood-opacity" | "opacity" | "stop-opacity" | "stroke-opacity" => "1",
-            "clip-rule" | "fill-rule" => "nonzero",
-            "display" => "inline",
-            "overflow" => "visible",
-            "stroke-dashoffset" => "0",
-            "stroke-linecap" => "butt",
-            "stroke-linejoin" => "miter",
-            "stroke-miterlimit" => "4",
-            "stroke-width" => "1",
-            "visibility" => "visible",
-            _ => return None,
-        };
-        Some((def.into(), false))
+        return;
     }
+    doc.attrs.push(Attr {
+        name: name.into(),
+        value,
+        important,
+    });
+}
+
+fn resolve_inherit(doc: &Document, parent: NodeId, name: &str) -> Option<(Box<str>, bool)> {
+    let p = SvgNode { id: parent, doc };
+    let found = if is_inheritable(name) {
+        p.ancestors().find(|n| n.has_attribute(name))
+    } else {
+        Some(p).filter(|n| n.tag_name().is_some() && n.has_attribute(name))
+    };
+    if let Some(n) = found {
+        return n.attribute(name).map(|v| (v.into(), false));
+    }
+    let def = match name {
+        "image-rendering" | "shape-rendering" | "text-rendering" => "auto",
+        "clip-path" | "filter" | "marker-end" | "marker-mid" | "marker-start" | "mask"
+        | "stroke" | "stroke-dasharray" | "text-decoration" => "none",
+        "font-stretch" | "font-style" | "font-variant" | "font-weight" | "letter-spacing"
+        | "word-spacing" => "normal",
+        "fill" | "flood-color" | "stop-color" => "black",
+        "fill-opacity" | "flood-opacity" | "opacity" | "stop-opacity" | "stroke-opacity" => "1",
+        "clip-rule" | "fill-rule" => "nonzero",
+        "display" => "inline",
+        "overflow" => "visible",
+        "stroke-dashoffset" => "0",
+        "stroke-linecap" => "butt",
+        "stroke-linejoin" => "miter",
+        "stroke-miterlimit" => "4",
+        "stroke-width" => "1",
+        "visibility" => "visible",
+        _ => return None,
+    };
+    Some((def.into(), false))
 }
 
 /// Breaks 1- and 2-step reference cycles through `attr` (`clip-path` on a
