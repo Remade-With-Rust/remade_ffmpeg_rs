@@ -1,7 +1,7 @@
 //! The TIFF decoder.
 
 use std::collections::HashSet;
-use std::io::{Read, Seek};
+use std::io::{IoSliceMut, Read, Seek};
 
 use crate::ccitt;
 use crate::error::{TiffError, TiffResult};
@@ -1402,6 +1402,15 @@ fn decode_tile_bands<R: Read + Seek>(
 ) -> TiffResult<DecodingResult> {
     let info = &img.info;
     let bits = info.bits_per_sample;
+    if bits == 16
+        && row_bytes(info.chunk_dimensions.0, img.spp_chunk(), 16)? >= DIRECT_TILE_ROW
+        && info.compression == compression::NONE
+        && !matches!(info.predictor, pred::HORIZONTAL | pred::FLOATING_POINT)
+        && info.fill_order != 2
+    {
+        let out = tiles_direct16(s, img, limits, total_bytes)?;
+        return Ok(typed_result(Out::U16(out), info.sample_kind, 16));
+    }
     if bits == 16 {
         let mut out: Vec<u16> = Vec::new();
         out.try_reserve_exact(total_bytes / 2)
@@ -1425,6 +1434,132 @@ fn decode_tile_bands<R: Read + Seek>(
         .map_err(|_| TiffError::limits(format!("cannot allocate {total_bytes} bytes")))?;
     tile_band_rows(s, img, limits, interpret, |r| out.extend_from_slice(r))?;
     Ok(typed_result(Out::U8(out), info.sample_kind, 8))
+}
+
+/// Tile rows at least this long (bytes) are read straight into the output
+/// ([`tiles_direct16`]); shorter ones go through the band. Measured by
+/// process ABBA on a sweep of square uncompressed tiles (band path = 1.0,
+/// paired median of 20, i7-14650HX): gray16 2048 wide, tile rows of 32 / 64
+/// / 128 / 256 / 512 / 1024 B: 1.379 / 1.318 / 1.436 / 1.135 / 0.891 /
+/// 0.783; RGB16 1024 wide, 96 / 192 / 384 / 768 / 1536 / 3072 B: 1.205 /
+/// 1.149 / 0.928 / 0.741 / 0.668 / 0.654. Short rows written straight into
+/// the image are many small strided writes, which lose to the band's
+/// sequential appends; from about 400 B the copy the band saves wins.
+const DIRECT_TILE_ROW: usize = 512;
+
+/// Uncompressed tiles of 16-bit samples with no predictor: each tile is read
+/// from the file straight into its rows of the output, one vectored read
+/// per tile ([`Stream::read_at_scatter`]: one buffer per row, the padding
+/// columns of a tile wider than the image into a scratch row), so every
+/// sample is copied once. The band path copied each tile into the band and
+/// then each row into the output; `tiff` 0.11 reads row by row into a
+/// zeroed output, a read call per row. Each band of rows is zeroed just
+/// before its tiles are read into it (a vectored read needs initialised
+/// buffers, and a chunk shorter than its rows relies on it: the rest reads
+/// as zero, as everywhere else), and a big-endian file is swapped in place.
+///
+/// Only the copy changes, so the work-removing part shows in instructions
+/// only when they price a copied byte the same however it is copied: with
+/// glibc's `rep movsb` disabled (valgrind counts each of its bytes), the
+/// whole 1024x1024 RGB16 decode with 256x256 tiles drops 274,324 of
+/// 26.90M instructions (one of the two copies of 6 MB); on the clock it is
+/// 0.68x the time (process ABBA, 24 of 24 pairs), and from 0.69x the speed
+/// of the `tiff` crate to 1.09x.
+fn tiles_direct16<R: Read + Seek>(
+    s: &mut Stream<R>,
+    img: &Image,
+    limits: &mut Budget<'_>,
+    total_bytes: usize,
+) -> TiffResult<Vec<u16>> {
+    let info = &img.info;
+    let (cw, ch) = info.chunk_dimensions;
+    let (across, down) = img.across_down();
+    let tile_row = row_bytes(cw, img.spp_chunk(), 16)?;
+    let px = usize::from(info.samples_per_pixel) * 2;
+    let out_row = info.width as usize * px;
+    let swap = s.big_endian != cfg!(target_endian = "big");
+    let mut out: Vec<u16> = Vec::new();
+    out.try_reserve_exact(total_bytes / 2)
+        .map_err(|_| TiffError::limits(format!("cannot allocate {total_bytes} bytes")))?;
+    let mut pad: Vec<u8> = Vec::new();
+    let mut scratch: Vec<u8> = Vec::new();
+    for cy in 0..down {
+        let y0 = (cy * ch) as usize;
+        let rows = ch.min(info.height - cy * ch) as usize;
+        // Zero one band of rows just before its tiles overwrite it (while
+        // it is still in cache), not the whole image up front.
+        grow_zeroed(&mut out, rows * out_row / 2);
+        for cx in 0..across {
+            let idx = (cy * across + cx) as usize;
+            let (offset, n, expected) = chunk_extent(s, img, idx, ch, tile_row, limits.limits)?;
+            // As in `decode_chunk_append`: a short chunk keeps what it has.
+            let have = (n as usize).min(expected);
+            let x0 = (cx * cw) as usize * px;
+            let seg = cw.min(info.width - cx * cw) as usize * px;
+            let skip = tile_row - seg;
+            if skip > 0 && pad.len() < skip * rows {
+                pad.resize(skip * rows, 0);
+            }
+            // The image's part of each of the tile's rows, with the padding
+            // between them; nothing past the last row's part is read.
+            let want = (rows - 1) * tile_row + seg;
+            let mut left = have.min(want);
+            let mut bufs = Vec::with_capacity(2 * rows);
+            let mut pads = pad.chunks_mut(skip.max(1));
+            let mut out_rows = out_bytes(&mut out)[y0 * out_row..]
+                .chunks_mut(out_row)
+                .take(rows);
+            if skip == 0 && left == want {
+                // Whole rows, back to back in the file: one buffer per row.
+                bufs.extend(
+                    out_rows
+                        .by_ref()
+                        .map(|row| IoSliceMut::new(&mut row[x0..x0 + seg])),
+                );
+                left = 0;
+            }
+            for row in out_rows {
+                if left == 0 {
+                    break;
+                }
+                let k = seg.min(left);
+                bufs.push(IoSliceMut::new(&mut row[x0..x0 + k]));
+                left -= k;
+                if skip > 0 && left > 0 {
+                    let k = skip.min(left);
+                    if let Some(p) = pads.next() {
+                        bufs.push(IoSliceMut::new(&mut p[..k]));
+                    }
+                    left -= k;
+                }
+            }
+            s.read_at_scatter(offset, &mut bufs, &mut scratch)?;
+            drop(bufs);
+            limits.chunk(n, have, expected)?;
+            if swap {
+                for row in out[y0 * out_row / 2..].chunks_mut(out_row / 2).take(rows) {
+                    for v in &mut row[x0 / 2..x0 / 2 + seg / 2] {
+                        *v = v.swap_bytes();
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Append `n` zero samples. On its own so that `resize` inlines here with
+/// the zero as a constant and becomes a memset: inlined into the tile loop
+/// it stayed a call with the value as an argument and wrote the zeros one
+/// sample at a time (+0.3 instructions a sample; `extend(repeat_n(0, n))`
+/// did the same).
+#[inline(never)]
+fn grow_zeroed(v: &mut Vec<u16>, n: usize) {
+    v.resize(v.len() + n, 0);
+}
+
+fn out_bytes(v: &mut [u16]) -> &mut [u8] {
+    bytemuck::cast_slice_mut(v)
 }
 
 /// The band loop of [`decode_tile_bands`]: hands each image row's part of
@@ -1527,6 +1662,40 @@ fn reverse_bits(buf: &mut [u8]) {
     }
 }
 
+/// The checks every chunk starts with. Returns the chunk's file offset, its
+/// stored bytes (the byte count clamped to the end of the file, as libtiff
+/// does; a stream that then decodes short is the codec's business) and the
+/// bytes it must decode to.
+fn chunk_extent<R>(
+    s: &Stream<R>,
+    img: &Image,
+    idx: usize,
+    rows: u32,
+    chunk_row_bytes: usize,
+    limits: &Limits,
+) -> TiffResult<(u64, u64, usize)> {
+    let expected = chunk_row_bytes
+        .checked_mul(rows as usize)
+        .ok_or_else(|| TiffError::limits("chunk size overflow"))?;
+    if expected > limits.intermediate_buffer_size {
+        return Err(TiffError::limits("chunk exceeds intermediate_buffer_size"));
+    }
+    let offset = img.offsets[idx];
+    let count = img.counts[idx];
+    if offset > s.len {
+        return Err(TiffError::format(format!(
+            "chunk {idx} offset {offset} past end of file"
+        )));
+    }
+    let n = count.min(s.len - offset);
+    if n > limits.intermediate_buffer_size as u64 {
+        return Err(TiffError::limits(
+            "compressed chunk exceeds intermediate_buffer_size",
+        ));
+    }
+    Ok((offset, n, expected))
+}
+
 /// Decompress and un-predict one chunk, appending exactly
 /// `chunk_row_bytes * rows` native-endian bytes to `dst`. Codecs write
 /// straight into `dst`'s spare capacity (no zero-fill), and uncompressed data
@@ -1542,27 +1711,7 @@ fn decode_chunk_append<R: Read + Seek>(
 ) -> TiffResult<()> {
     let limits = budget.limits;
     let info = &img.info;
-    let expected = chunk_row_bytes
-        .checked_mul(rows as usize)
-        .ok_or_else(|| TiffError::limits("chunk size overflow"))?;
-    if expected > limits.intermediate_buffer_size {
-        return Err(TiffError::limits("chunk exceeds intermediate_buffer_size"));
-    }
-    let offset = img.offsets[idx];
-    let count = img.counts[idx];
-    if offset > s.len {
-        return Err(TiffError::format(format!(
-            "chunk {idx} offset {offset} past end of file"
-        )));
-    }
-    // A byte count running past EOF is clamped (libtiff does the same); a
-    // stream that then decodes short is an error below.
-    let n = count.min(s.len - offset);
-    if n > limits.intermediate_buffer_size as u64 {
-        return Err(TiffError::limits(
-            "compressed chunk exceeds intermediate_buffer_size",
-        ));
-    }
+    let (offset, n, expected) = chunk_extent(s, img, idx, rows, chunk_row_bytes, limits)?;
     let comp = info.compression;
     // FillOrder 2: reverse the bits of every compressed byte, as libtiff
     // does for every codec except JPEG (verified against libtiff 4.7 on
