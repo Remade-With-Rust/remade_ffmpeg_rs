@@ -878,12 +878,23 @@ impl BitOut {
     }
 }
 
+/// The code and its length for one terminating or make-up `run`, or
+/// `(0, 0)` for a run that has no code.
+///
+/// The tables are in run order (64 terminating codes for 0..=63, then the
+/// make-up codes for 64, 128, ..=1728; the extended ones for 1792..=2560
+/// are in `EXTENDED`), so the entry is indexed. Searching the table for the
+/// run was up to 104 compares per code.
 fn code_for(table: &[(u16, u8, u16)], run: u32) -> (u32, u32) {
-    let hit = table
-        .iter()
-        .chain(EXTENDED)
-        .find(|&&(_, _, r)| u32::from(r) == run);
-    hit.map_or((0, 0), |&(c, l, _)| (u32::from(c), u32::from(l)))
+    let hit = if run < 64 {
+        table.get(run as usize)
+    } else if run <= 1728 {
+        table.get(63 + (run / 64) as usize)
+    } else {
+        EXTENDED.get((run.saturating_sub(1792) / 64) as usize)
+    };
+    hit.filter(|&&(_, _, r)| u32::from(r) == run)
+        .map_or((0, 0), |&(c, l, _)| (u32::from(c), u32::from(l)))
 }
 
 fn put_run(o: &mut BitOut, white: bool, mut run: u32) {
@@ -1149,6 +1160,20 @@ mod tests {
             want.push(acc << (8 - n));
         }
         assert_eq!(o.out, want);
+    }
+
+    #[test]
+    fn code_for_matches_a_table_search() {
+        for table in [WHITE, BLACK] {
+            for run in 0..3000u32 {
+                let want = table
+                    .iter()
+                    .chain(EXTENDED)
+                    .find(|&&(_, _, r)| u32::from(r) == run)
+                    .map_or((0, 0), |&(c, l, _)| (u32::from(c), u32::from(l)));
+                assert_eq!(code_for(table, run), want, "run {run}");
+            }
+        }
     }
 
     #[test]
