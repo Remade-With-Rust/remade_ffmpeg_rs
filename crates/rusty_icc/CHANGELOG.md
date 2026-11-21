@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_icc-v0.1.1...rusty_icc-v0.1.2) - 2026-11-21
+
+### Other
+
+- speed numbers in five image crate READMEs; rusty_tiff needs flate2 1.1.11
+- *(rusty_icc)* README section for the second performance pass
+- *(rusty_icc)* grey 8-bit sources read a 256-entry output table
+- *(rusty_icc)* 8- and 16-bit outputs skip the clamp the cast already does
+- *(rusty_icc)* integer device-link grid loops are compiled in the library
+- *(rusty_icc)* sRGB-shaped f32 matrix/TRC pairs evaluate their curves in line
+- *(rusty_icc)* CLUT front ends for 3 and 4 inputs, kernels out of line
+- *(rusty_icc)* 3- and 4-input CLUT front ends and fixed-width kernels [draft, unmeasured]
+- *(rusty_icc)* unit-gamma LUT curve stages as one clamp op [candidate win, not final]
+- *(rusty_icc)* tetrahedral lookups read four corners on fixed-width lanes
+- *(rusty_icc)* grid builds evaluate the device curves once per axis value
+- *(rusty_icc)* shaper tables are built once per distinct curve
+- *(rusty_icc)* CLUT grid cells are found with one cvttsd2si
+- *(rusty_icc)* sampled curves find their segment with one cvttsd2si
+- *(rusty_icc)* the general f32 loop is compiled in the library, in place
+- *(rusty_icc)* f32 pixels between two matrix/TRC profiles run one fused loop
+- *(rusty_icc)* the WSL bench copy keeps its Cargo.lock
+- *(rusty_icc)* black-point search builds its round-trip sides once
+- *(rusty_icc)* inverse sRGB-shaped curves keep their break value
+
 ## [0.1.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_icc-v0.1.0...rusty_icc-v0.1.1) - 2026-11-20
 
 ### Other

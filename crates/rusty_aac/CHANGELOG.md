@@ -6,6 +6,18 @@ each release, under **Security**. The project follows
 decoder output is stable (gated against the ISO/IEC 14496-26 conformance suite);
 encoder output may change in minor releases when quality improves.
 
+## [2.1.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v2.1.1...rusty_aac-v2.1.2) - 2026-11-21
+
+### Fixed
+
+- *(rusty_aac)* narrow-band SNR floor so tone-over-noise SNR rises with bitrate
+- *(rusty_aac)* busy 5.1 channels keep their level; bitrate lands on target ([#129](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/129))
+
+### Other
+
+- Merge pull request #167 from Remade-With-Rust/fix/aac-psy-snr
+- *(rusty_aac)* rate loops hand back the coding they already did
+
 ## [2.1.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_aac-v2.1.0...rusty_aac-v2.1.1) - 2026-11-19
 
 ### Fixed

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.7](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.4.6...rff-cli-v0.4.7) - 2026-11-21
+
+### Added
+
+- *(avif)* default-on `av1-asm` feature so rff-cli builds without NASM ([#172](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/172))
+
 ## [0.4.6](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.4.5...rff-cli-v0.4.6) - 2026-11-21
 
 ### Fixed
