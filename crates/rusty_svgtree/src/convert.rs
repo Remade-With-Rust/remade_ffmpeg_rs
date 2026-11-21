@@ -789,35 +789,29 @@ fn convert_shape(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>
             finish(b)
         }
         EId::Path => {
-            let segs = values::path_data(node.attribute("d")?);
-            segs_to_path(&segs)
+            // Path data goes straight from the text into the builder.
+            let mut b = PathBuilder::new();
+            values::path_data_with(node.attribute("d")?, &mut |s| match s {
+                Seg::MoveTo(x, y) => b.move_to(x as f32, y as f32),
+                Seg::LineTo(x, y) => b.line_to(x as f32, y as f32),
+                Seg::Quad(x1, y1, x, y) => b.quad_to(x1 as f32, y1 as f32, x as f32, y as f32),
+                Seg::Cubic(x1, y1, x2, y2, x, y) => b.cubic_to(
+                    x1 as f32, y1 as f32, x2 as f32, y2 as f32, x as f32, y as f32,
+                ),
+                Seg::Close => b.close(),
+            });
+            finish(b)
         }
         _ => None,
     }
 }
 
-fn segs_to_path(segs: &[Seg]) -> Option<Arc<rusty_raster::Path>> {
-    let mut b = PathBuilder::new();
-    for s in segs {
-        match *s {
-            Seg::MoveTo(x, y) => b.move_to(x as f32, y as f32),
-            Seg::LineTo(x, y) => b.line_to(x as f32, y as f32),
-            Seg::Quad(x1, y1, x, y) => b.quad_to(x1 as f32, y1 as f32, x as f32, y as f32),
-            Seg::Cubic(x1, y1, x2, y2, x, y) => b.cubic_to(
-                x1 as f32, y1 as f32, x2 as f32, y2 as f32, x as f32, y as f32,
-            ),
-            Seg::Close => b.close(),
-        }
-    }
-    finish(b)
-}
-
 /// usvg's `arc_to` on a builder: f32 endpoints widened to f64 for kurbo.
+/// The cubics go straight into the builder.
 fn builder_arc_to(b: &mut PathBuilder, rx: f32, ry: f32, x: f32, y: f32) {
     let Some(prev) = b.last_point() else {
         return;
     };
-    let mut segs = Vec::new();
     values::arc_to_cubics(
         f64::from(prev.x),
         f64::from(prev.y),
@@ -828,17 +822,14 @@ fn builder_arc_to(b: &mut PathBuilder, rx: f32, ry: f32, x: f32, y: f32) {
         true,
         f64::from(x),
         f64::from(y),
-        &mut segs,
-    );
-    for s in segs {
-        match s {
+        &mut |s| match s {
             Seg::Cubic(x1, y1, x2, y2, x, y) => b.cubic_to(
                 x1 as f32, y1 as f32, x2 as f32, y2 as f32, x as f32, y as f32,
             ),
             Seg::LineTo(x, y) => b.line_to(x as f32, y as f32),
             _ => {}
-        }
-    }
+        },
+    );
 }
 
 fn convert_rect(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>> {

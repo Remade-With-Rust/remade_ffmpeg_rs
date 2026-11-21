@@ -842,118 +842,134 @@ fn is_cmd(c: u8) -> bool {
     )
 }
 
-/// Parses the raw (unsimplified) segments, stopping at the first error.
-fn parse_raw(text: &str) -> Vec<Raw> {
-    let mut s = Stream::new(text);
-    let mut out = Vec::new();
-    let mut prev: Option<u8> = None;
-    loop {
-        s.skip_spaces();
-        let Some(c) = s.peek() else { break };
-        let cmd;
-        let mut implicit_m = false;
-        if is_cmd(c) {
-            if prev.is_none() && !c.eq_ignore_ascii_case(&b'm') {
-                break;
-            }
-            cmd = c;
-            s.advance(1);
-        } else if matches!(c, b'0'..=b'9' | b'.' | b'-' | b'+') {
-            match prev {
-                Some(p) if !p.eq_ignore_ascii_case(&b'z') => {
-                    // Implicit repetition; a repeated M/m is an L/l.
-                    if p == b'M' {
-                        cmd = b'L';
-                        implicit_m = true;
-                    } else if p == b'm' {
-                        cmd = b'l';
-                        implicit_m = true;
-                    } else {
-                        cmd = p;
-                    }
-                }
-                _ => break,
-            }
-        } else {
-            break;
+/// Parses one raw (unsimplified) segment at the cursor. `prev` is the
+/// previous command letter (an implicitly repeated `M`/`m` reads as `L`/`l`
+/// and is remembered as `M`/`m`). `None` at the end of the data and at the
+/// first error.
+fn parse_raw_seg(s: &mut Stream, prev: &mut Option<u8>) -> Option<Raw> {
+    s.skip_spaces();
+    let c = s.peek()?;
+    let cmd;
+    let mut implicit_m = false;
+    if is_cmd(c) {
+        if prev.is_none() && !c.eq_ignore_ascii_case(&b'm') {
+            return None;
         }
-        let abs = cmd.is_ascii_uppercase();
-        let seg = (|| -> Option<Raw> {
-            Some(match cmd.to_ascii_lowercase() {
-                b'm' => Raw::M(abs, s.parse_list_number()?, s.parse_list_number()?),
-                b'l' => Raw::L(abs, s.parse_list_number()?, s.parse_list_number()?),
-                b'h' => Raw::H(abs, s.parse_list_number()?),
-                b'v' => Raw::V(abs, s.parse_list_number()?),
-                b'c' => {
-                    let mut a = [0.0; 6];
-                    for v in &mut a {
-                        *v = s.parse_list_number()?;
-                    }
-                    Raw::C(abs, a)
+        cmd = c;
+        s.advance(1);
+    } else if matches!(c, b'0'..=b'9' | b'.' | b'-' | b'+') {
+        match *prev {
+            Some(p) if !p.eq_ignore_ascii_case(&b'z') => {
+                // Implicit repetition; a repeated M/m is an L/l.
+                if p == b'M' {
+                    cmd = b'L';
+                    implicit_m = true;
+                } else if p == b'm' {
+                    cmd = b'l';
+                    implicit_m = true;
+                } else {
+                    cmd = p;
                 }
-                b's' | b'q' => {
-                    let mut a = [0.0; 4];
-                    for v in &mut a {
-                        *v = s.parse_list_number()?;
-                    }
-                    if cmd.eq_ignore_ascii_case(&b's') {
-                        Raw::S(abs, a)
-                    } else {
-                        Raw::Q(abs, a)
-                    }
-                }
-                b't' => Raw::T(abs, s.parse_list_number()?, s.parse_list_number()?),
-                b'a' => {
-                    let rx = s.parse_list_number()?;
-                    let ry = s.parse_list_number()?;
-                    let rot = s.parse_list_number()?;
-                    let la = parse_flag(&mut s)?;
-                    let sw = parse_flag(&mut s)?;
-                    let x = s.parse_list_number()?;
-                    let y = s.parse_list_number()?;
-                    Raw::A(abs, [rx, ry, rot], la, sw, x, y)
-                }
-                _ => Raw::Z,
-            })
-        })();
-        let Some(seg) = seg else { break };
-        out.push(seg);
-        prev = Some(if implicit_m {
-            if abs {
-                b'M'
-            } else {
-                b'm'
             }
-        } else {
-            cmd
-        });
+            _ => return None,
+        }
+    } else {
+        return None;
     }
-    out
+    let abs = cmd.is_ascii_uppercase();
+    let seg = match cmd.to_ascii_lowercase() {
+        b'm' => Raw::M(abs, s.parse_list_number()?, s.parse_list_number()?),
+        b'l' => Raw::L(abs, s.parse_list_number()?, s.parse_list_number()?),
+        b'h' => Raw::H(abs, s.parse_list_number()?),
+        b'v' => Raw::V(abs, s.parse_list_number()?),
+        b'c' => {
+            let mut a = [0.0; 6];
+            for v in &mut a {
+                *v = s.parse_list_number()?;
+            }
+            Raw::C(abs, a)
+        }
+        b's' | b'q' => {
+            let mut a = [0.0; 4];
+            for v in &mut a {
+                *v = s.parse_list_number()?;
+            }
+            if cmd.eq_ignore_ascii_case(&b's') {
+                Raw::S(abs, a)
+            } else {
+                Raw::Q(abs, a)
+            }
+        }
+        b't' => Raw::T(abs, s.parse_list_number()?, s.parse_list_number()?),
+        b'a' => {
+            let rx = s.parse_list_number()?;
+            let ry = s.parse_list_number()?;
+            let rot = s.parse_list_number()?;
+            let la = parse_flag(s)?;
+            let sw = parse_flag(s)?;
+            let x = s.parse_list_number()?;
+            let y = s.parse_list_number()?;
+            Raw::A(abs, [rx, ry, rot], la, sw, x, y)
+        }
+        _ => Raw::Z,
+    };
+    *prev = Some(if implicit_m {
+        if abs {
+            b'M'
+        } else {
+            b'm'
+        }
+    } else {
+        cmd
+    });
+    Some(seg)
 }
 
-/// Parses and simplifies path data the way `svgtypes`' simplifying parser
-/// does (absolute coordinates, H/V to L, S/T to C/Q, arcs to cubics, an
-/// implicit `M` after `Z`).
-pub(crate) fn path_data(text: &str) -> Vec<Seg> {
-    let raw = parse_raw(text);
-    let mut out: Vec<Seg> = Vec::with_capacity(raw.len());
-    let (mut px, mut py) = (0.0f64, 0.0f64);
-    let (mut mx, mut my) = (0.0f64, 0.0f64);
-    // The previous raw segment, made absolute, for S/T reflection.
-    let mut prev_raw = Raw::M(true, 0.0, 0.0);
-    let mut prev_simple: Option<Seg> = None;
-    // The last smooth-quadratic control point (svgtypes' `prev_tx/ty`).
-    let mut last_t = (0.0f64, 0.0f64);
-    for seg in raw {
-        let start_len = out.len();
-        if prev_simple == Some(Seg::Close) && !matches!(seg, Raw::M(..) | Raw::Z) {
-            out.push(Seg::MoveTo(mx, my));
-            prev_simple = Some(Seg::MoveTo(mx, my));
+/// What the simplifier carries from one segment to the next.
+struct Simplifier {
+    /// The current point.
+    px: f64,
+    py: f64,
+    /// The start of the current subpath.
+    mx: f64,
+    my: f64,
+    /// The previous raw segment, made absolute, for S/T reflection.
+    prev_raw: Raw,
+    /// The last simplified segment was a `Close`.
+    prev_close: bool,
+    /// The last smooth-quadratic control point (svgtypes' `prev_tx/ty`).
+    last_t: (f64, f64),
+}
+
+impl Simplifier {
+    fn new() -> Self {
+        Simplifier {
+            px: 0.0,
+            py: 0.0,
+            mx: 0.0,
+            my: 0.0,
+            prev_raw: Raw::M(true, 0.0, 0.0),
+            prev_close: false,
+            last_t: (0.0, 0.0),
+        }
+    }
+
+    /// Simplifies one raw segment into `emit`.
+    fn push(&mut self, seg: Raw, emit: &mut impl FnMut(Seg)) {
+        let (px, py) = (self.px, self.py);
+        let (mx, my) = (self.mx, self.my);
+        let mut last = None;
+        let mut put = |s: Seg| {
+            last = Some(s);
+            emit(s);
+        };
+        if self.prev_close && !matches!(seg, Raw::M(..) | Raw::Z) {
+            put(Seg::MoveTo(mx, my));
         }
         match seg {
             Raw::M(abs, mut x, mut y) => {
                 if !abs {
-                    if prev_simple == Some(Seg::Close) {
+                    if self.prev_close {
                         x += mx;
                         y += my;
                     } else {
@@ -961,30 +977,30 @@ pub(crate) fn path_data(text: &str) -> Vec<Seg> {
                         y += py;
                     }
                 }
-                out.push(Seg::MoveTo(x, y));
-                prev_raw = seg;
+                put(Seg::MoveTo(x, y));
+                self.prev_raw = seg;
             }
             Raw::L(abs, mut x, mut y) => {
                 if !abs {
                     x += px;
                     y += py;
                 }
-                out.push(Seg::LineTo(x, y));
-                prev_raw = seg;
+                put(Seg::LineTo(x, y));
+                self.prev_raw = seg;
             }
             Raw::H(abs, mut x) => {
                 if !abs {
                     x += px;
                 }
-                out.push(Seg::LineTo(x, py));
-                prev_raw = seg;
+                put(Seg::LineTo(x, py));
+                self.prev_raw = seg;
             }
             Raw::V(abs, mut y) => {
                 if !abs {
                     y += py;
                 }
-                out.push(Seg::LineTo(px, y));
-                prev_raw = seg;
+                put(Seg::LineTo(px, y));
+                self.prev_raw = seg;
             }
             Raw::C(abs, mut a) => {
                 if !abs {
@@ -993,11 +1009,11 @@ pub(crate) fn path_data(text: &str) -> Vec<Seg> {
                         a[i * 2 + 1] += py;
                     }
                 }
-                out.push(Seg::Cubic(a[0], a[1], a[2], a[3], a[4], a[5]));
-                prev_raw = Raw::C(true, a);
+                put(Seg::Cubic(a[0], a[1], a[2], a[3], a[4], a[5]));
+                self.prev_raw = Raw::C(true, a);
             }
             Raw::S(abs, mut a) => {
-                let (x1, y1) = match prev_raw {
+                let (x1, y1) = match self.prev_raw {
                     Raw::C(_, c) => (c[4] * 2.0 - c[2], c[5] * 2.0 - c[3]),
                     Raw::S(_, c) => (c[2] * 2.0 - c[0], c[3] * 2.0 - c[1]),
                     _ => (px, py),
@@ -1008,8 +1024,8 @@ pub(crate) fn path_data(text: &str) -> Vec<Seg> {
                     a[2] += px;
                     a[3] += py;
                 }
-                out.push(Seg::Cubic(x1, y1, a[0], a[1], a[2], a[3]));
-                prev_raw = Raw::S(true, a);
+                put(Seg::Cubic(x1, y1, a[0], a[1], a[2], a[3]));
+                self.prev_raw = Raw::S(true, a);
             }
             Raw::Q(abs, mut a) => {
                 if !abs {
@@ -1018,60 +1034,80 @@ pub(crate) fn path_data(text: &str) -> Vec<Seg> {
                     a[2] += px;
                     a[3] += py;
                 }
-                out.push(Seg::Quad(a[0], a[1], a[2], a[3]));
-                prev_raw = Raw::Q(true, a);
+                put(Seg::Quad(a[0], a[1], a[2], a[3]));
+                self.prev_raw = Raw::Q(true, a);
             }
             Raw::T(abs, mut x, mut y) => {
                 // svgtypes tracks the last T control point separately.
-                let (x1, y1) = match prev_raw {
+                let (x1, y1) = match self.prev_raw {
                     Raw::Q(_, c) => (c[2] * 2.0 - c[0], c[3] * 2.0 - c[1]),
-                    Raw::T(..) => (px * 2.0 - last_t.0, py * 2.0 - last_t.1),
+                    Raw::T(..) => (px * 2.0 - self.last_t.0, py * 2.0 - self.last_t.1),
                     _ => (px, py),
                 };
-                last_t = (x1, y1);
+                self.last_t = (x1, y1);
                 if !abs {
                     x += px;
                     y += py;
                 }
-                out.push(Seg::Quad(x1, y1, x, y));
-                prev_raw = Raw::T(true, x, y);
+                put(Seg::Quad(x1, y1, x, y));
+                self.prev_raw = Raw::T(true, x, y);
             }
             Raw::A(abs, [rx, ry, rot], la, sw, mut x, mut y) => {
                 if !abs {
                     x += px;
                     y += py;
                 }
-                arc_to_cubics(px, py, rx, ry, rot, la, sw, x, y, &mut out);
-                prev_raw = seg;
+                arc_to_cubics(px, py, rx, ry, rot, la, sw, x, y, &mut put);
+                self.prev_raw = seg;
             }
             Raw::Z => {
-                if prev_simple != Some(Seg::Close) {
-                    out.push(Seg::Close);
+                if !self.prev_close {
+                    put(Seg::Close);
                 }
-                prev_raw = seg;
+                self.prev_raw = seg;
             }
         }
-        if out.len() > start_len {
-            let last = out[out.len() - 1];
-            prev_simple = Some(last);
+        if let Some(last) = last {
+            self.prev_close = last == Seg::Close;
             match last {
                 Seg::MoveTo(x, y) => {
-                    px = x;
-                    py = y;
-                    mx = x;
-                    my = y;
+                    self.px = x;
+                    self.py = y;
+                    self.mx = x;
+                    self.my = y;
                 }
                 Seg::LineTo(x, y) | Seg::Quad(_, _, x, y) | Seg::Cubic(_, _, _, _, x, y) => {
-                    px = x;
-                    py = y;
+                    self.px = x;
+                    self.py = y;
                 }
                 Seg::Close => {
-                    px = mx;
-                    py = my;
+                    self.px = mx;
+                    self.py = my;
                 }
             }
         }
     }
+}
+
+/// Parses and simplifies path data the way `svgtypes`' simplifying parser
+/// does (absolute coordinates, H/V to L, S/T to C/Q, arcs to cubics, an
+/// implicit `M` after `Z`), handing each simplified segment to `emit` as it
+/// is parsed: nothing is buffered, so a path costs no memory here beyond
+/// what the receiver keeps. Stops at the first error.
+pub(crate) fn path_data_with(text: &str, emit: &mut impl FnMut(Seg)) {
+    let mut s = Stream::new(text);
+    let mut prev = None;
+    let mut state = Simplifier::new();
+    while let Some(seg) = parse_raw_seg(&mut s, &mut prev) {
+        state.push(seg, emit);
+    }
+}
+
+/// `path_data_with` collected into a `Vec`.
+#[cfg(test)]
+pub(crate) fn path_data(text: &str) -> Vec<Seg> {
+    let mut out = Vec::new();
+    path_data_with(text, &mut |s| out.push(s));
     out
 }
 
@@ -1089,12 +1125,12 @@ pub(crate) fn arc_to_cubics(
     sweep: bool,
     x: f64,
     y: f64,
-    out: &mut Vec<Seg>,
+    out: &mut impl FnMut(Seg),
 ) {
     use std::f64::consts::{FRAC_PI_2, PI};
     let x_rotation = rot_deg.to_radians();
     if rx.abs() <= 1e-5 || ry.abs() <= 1e-5 || (fx == x && fy == y) {
-        out.push(Seg::LineTo(x, y));
+        out(Seg::LineTo(x, y));
         return;
     }
     let mut rx = rx.abs();
@@ -1120,7 +1156,7 @@ pub(crate) fn arc_to_cubics(
     let rypx = ry * p.0;
     let sum_of_sq = rxpy * rxpy + rypx * rypx;
     if sum_of_sq == 0.0 || !sum_of_sq.is_finite() {
-        out.push(Seg::LineTo(x, y));
+        out(Seg::LineTo(x, y));
         return;
     }
     let sign_coe = if large_arc == sweep { -1.0 } else { 1.0 };
@@ -1148,7 +1184,7 @@ pub(crate) fn arc_to_cubics(
     let n_err = (1.1163 * scaled_err).powf(1.0 / 6.0).max(3.999_999);
     let n = (n_err * sweep_angle.abs() * (1.0 / (2.0 * PI))).ceil();
     if !n.is_finite() || n < 1.0 {
-        out.push(Seg::LineTo(x, y));
+        out(Seg::LineTo(x, y));
         return;
     }
     // A finite cap: a 1e300 radius would otherwise ask for ~1e50 segments.
@@ -1174,7 +1210,7 @@ pub(crate) fn arc_to_cubics(
         let p2 = (p3.0 - arm_len * d1.0, p3.1 - arm_len * d1.1);
         angle0 = angle1;
         p0 = p3;
-        out.push(Seg::Cubic(
+        out(Seg::Cubic(
             center.0 + p1.0,
             center.1 + p1.1,
             center.0 + p2.0,
@@ -1324,6 +1360,318 @@ mod tests {
         assert!(path_data("L 10 10").is_empty());
         // Compact arc flags.
         assert!(path_data("M0 0a10 10 0 1110 10").len() > 1);
+    }
+
+    /// The two-pass parser `path_data_with` replaced (every raw segment into a
+    /// `Vec`, then every simplified segment into another), kept as its oracle.
+    fn parse_raw_two_pass(text: &str) -> Vec<Raw> {
+        let mut s = Stream::new(text);
+        let mut out = Vec::new();
+        let mut prev: Option<u8> = None;
+        loop {
+            s.skip_spaces();
+            let Some(c) = s.peek() else { break };
+            let cmd;
+            let mut implicit_m = false;
+            if is_cmd(c) {
+                if prev.is_none() && !c.eq_ignore_ascii_case(&b'm') {
+                    break;
+                }
+                cmd = c;
+                s.advance(1);
+            } else if matches!(c, b'0'..=b'9' | b'.' | b'-' | b'+') {
+                match prev {
+                    Some(p) if !p.eq_ignore_ascii_case(&b'z') => {
+                        // Implicit repetition; a repeated M/m is an L/l.
+                        if p == b'M' {
+                            cmd = b'L';
+                            implicit_m = true;
+                        } else if p == b'm' {
+                            cmd = b'l';
+                            implicit_m = true;
+                        } else {
+                            cmd = p;
+                        }
+                    }
+                    _ => break,
+                }
+            } else {
+                break;
+            }
+            let abs = cmd.is_ascii_uppercase();
+            let seg = (|| -> Option<Raw> {
+                Some(match cmd.to_ascii_lowercase() {
+                    b'm' => Raw::M(abs, s.parse_list_number()?, s.parse_list_number()?),
+                    b'l' => Raw::L(abs, s.parse_list_number()?, s.parse_list_number()?),
+                    b'h' => Raw::H(abs, s.parse_list_number()?),
+                    b'v' => Raw::V(abs, s.parse_list_number()?),
+                    b'c' => {
+                        let mut a = [0.0; 6];
+                        for v in &mut a {
+                            *v = s.parse_list_number()?;
+                        }
+                        Raw::C(abs, a)
+                    }
+                    b's' | b'q' => {
+                        let mut a = [0.0; 4];
+                        for v in &mut a {
+                            *v = s.parse_list_number()?;
+                        }
+                        if cmd.eq_ignore_ascii_case(&b's') {
+                            Raw::S(abs, a)
+                        } else {
+                            Raw::Q(abs, a)
+                        }
+                    }
+                    b't' => Raw::T(abs, s.parse_list_number()?, s.parse_list_number()?),
+                    b'a' => {
+                        let rx = s.parse_list_number()?;
+                        let ry = s.parse_list_number()?;
+                        let rot = s.parse_list_number()?;
+                        let la = parse_flag(&mut s)?;
+                        let sw = parse_flag(&mut s)?;
+                        let x = s.parse_list_number()?;
+                        let y = s.parse_list_number()?;
+                        Raw::A(abs, [rx, ry, rot], la, sw, x, y)
+                    }
+                    _ => Raw::Z,
+                })
+            })();
+            let Some(seg) = seg else { break };
+            out.push(seg);
+            prev = Some(if implicit_m {
+                if abs {
+                    b'M'
+                } else {
+                    b'm'
+                }
+            } else {
+                cmd
+            });
+        }
+        out
+    }
+
+    fn path_data_two_pass(text: &str) -> Vec<Seg> {
+        let raw = parse_raw_two_pass(text);
+        let mut out: Vec<Seg> = Vec::with_capacity(raw.len());
+        let (mut px, mut py) = (0.0f64, 0.0f64);
+        let (mut mx, mut my) = (0.0f64, 0.0f64);
+        // The previous raw segment, made absolute, for S/T reflection.
+        let mut prev_raw = Raw::M(true, 0.0, 0.0);
+        let mut prev_simple: Option<Seg> = None;
+        // The last smooth-quadratic control point (svgtypes' `prev_tx/ty`).
+        let mut last_t = (0.0f64, 0.0f64);
+        for seg in raw {
+            let start_len = out.len();
+            if prev_simple == Some(Seg::Close) && !matches!(seg, Raw::M(..) | Raw::Z) {
+                out.push(Seg::MoveTo(mx, my));
+                prev_simple = Some(Seg::MoveTo(mx, my));
+            }
+            match seg {
+                Raw::M(abs, mut x, mut y) => {
+                    if !abs {
+                        if prev_simple == Some(Seg::Close) {
+                            x += mx;
+                            y += my;
+                        } else {
+                            x += px;
+                            y += py;
+                        }
+                    }
+                    out.push(Seg::MoveTo(x, y));
+                    prev_raw = seg;
+                }
+                Raw::L(abs, mut x, mut y) => {
+                    if !abs {
+                        x += px;
+                        y += py;
+                    }
+                    out.push(Seg::LineTo(x, y));
+                    prev_raw = seg;
+                }
+                Raw::H(abs, mut x) => {
+                    if !abs {
+                        x += px;
+                    }
+                    out.push(Seg::LineTo(x, py));
+                    prev_raw = seg;
+                }
+                Raw::V(abs, mut y) => {
+                    if !abs {
+                        y += py;
+                    }
+                    out.push(Seg::LineTo(px, y));
+                    prev_raw = seg;
+                }
+                Raw::C(abs, mut a) => {
+                    if !abs {
+                        for i in 0..3 {
+                            a[i * 2] += px;
+                            a[i * 2 + 1] += py;
+                        }
+                    }
+                    out.push(Seg::Cubic(a[0], a[1], a[2], a[3], a[4], a[5]));
+                    prev_raw = Raw::C(true, a);
+                }
+                Raw::S(abs, mut a) => {
+                    let (x1, y1) = match prev_raw {
+                        Raw::C(_, c) => (c[4] * 2.0 - c[2], c[5] * 2.0 - c[3]),
+                        Raw::S(_, c) => (c[2] * 2.0 - c[0], c[3] * 2.0 - c[1]),
+                        _ => (px, py),
+                    };
+                    if !abs {
+                        a[0] += px;
+                        a[1] += py;
+                        a[2] += px;
+                        a[3] += py;
+                    }
+                    out.push(Seg::Cubic(x1, y1, a[0], a[1], a[2], a[3]));
+                    prev_raw = Raw::S(true, a);
+                }
+                Raw::Q(abs, mut a) => {
+                    if !abs {
+                        a[0] += px;
+                        a[1] += py;
+                        a[2] += px;
+                        a[3] += py;
+                    }
+                    out.push(Seg::Quad(a[0], a[1], a[2], a[3]));
+                    prev_raw = Raw::Q(true, a);
+                }
+                Raw::T(abs, mut x, mut y) => {
+                    // svgtypes tracks the last T control point separately.
+                    let (x1, y1) = match prev_raw {
+                        Raw::Q(_, c) => (c[2] * 2.0 - c[0], c[3] * 2.0 - c[1]),
+                        Raw::T(..) => (px * 2.0 - last_t.0, py * 2.0 - last_t.1),
+                        _ => (px, py),
+                    };
+                    last_t = (x1, y1);
+                    if !abs {
+                        x += px;
+                        y += py;
+                    }
+                    out.push(Seg::Quad(x1, y1, x, y));
+                    prev_raw = Raw::T(true, x, y);
+                }
+                Raw::A(abs, [rx, ry, rot], la, sw, mut x, mut y) => {
+                    if !abs {
+                        x += px;
+                        y += py;
+                    }
+                    arc_to_cubics(px, py, rx, ry, rot, la, sw, x, y, &mut |s| out.push(s));
+                    prev_raw = seg;
+                }
+                Raw::Z => {
+                    if prev_simple != Some(Seg::Close) {
+                        out.push(Seg::Close);
+                    }
+                    prev_raw = seg;
+                }
+            }
+            if out.len() > start_len {
+                let last = out[out.len() - 1];
+                prev_simple = Some(last);
+                match last {
+                    Seg::MoveTo(x, y) => {
+                        px = x;
+                        py = y;
+                        mx = x;
+                        my = y;
+                    }
+                    Seg::LineTo(x, y) | Seg::Quad(_, _, x, y) | Seg::Cubic(_, _, _, _, x, y) => {
+                        px = x;
+                        py = y;
+                    }
+                    Seg::Close => {
+                        px = mx;
+                        py = my;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The streaming parser against the two-pass one it replaced.
+    #[test]
+    fn path_stream_matches_two_pass() {
+        fn check(d: &str) {
+            let got = format!("{:?}", path_data(d));
+            let want = format!("{:?}", path_data_two_pass(d));
+            assert_eq!(got, want, "{d}");
+        }
+        for d in [
+            "",
+            "M10 10 h 20 v20 z m 5 5 l 1 1",
+            "M 10 20 L 30 40 L 50",
+            "L 10 10",
+            "M0 0a10 10 0 1110 10",
+            "m1 2 3 4 5 6z7 8 9 10",
+            "M1 2zL3 4",
+            "M1 2zzm3 4zl1 1",
+            "M0 0C1 1 2 2 3 3S5 5 6 6s1 1 2 2",
+            "M0 0S1 1 2 2",
+            "M0 0Q1 1 2 2T4 4t1 1T9 9",
+            "M0 0T1 1",
+            "M0 0L1 1T2 2",
+            "M0 0A5 5 0 0 1 10 0a5 5 30 1 0 -10 0Z",
+            "M0 0A0 5 0 0 1 10 0",
+            "M0 0A5 5 0 0 1 0 0",
+            "M0 0a1e300 1 0 0 1 1 1",
+            "M0 0a5 5 0 2 1 1 1",
+            "M0 0H10V10h-5v-5Z",
+            "M0,0 10,10-5-5.5.5",
+            "M0 0 L",
+            "M0 0 X 1 1",
+            "M0 0zm1 1",
+            "M0 0zM1 1",
+            "M0 0z 1 1",
+            "z",
+            "M 1e400 0 L 1 1",
+            "M1 1 m2 2 l3 3 M4 4 5 5",
+        ] {
+            check(d);
+        }
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let cmds = b"MmLlHhVvCcSsQqTtAaZz";
+        for _ in 0..20_000 {
+            let mut d = String::from(if next() % 16 == 0 { "" } else { "M 3 4 " });
+            for _ in 0..(next() % 12) {
+                let c = cmds[(next() % cmds.len() as u64) as usize];
+                d.push(char::from(c));
+                let want = match c.to_ascii_lowercase() {
+                    b'm' | b'l' | b't' => 2,
+                    b'h' | b'v' => 1,
+                    b'c' => 6,
+                    b's' | b'q' => 4,
+                    b'a' => 7,
+                    _ => 0,
+                };
+                // Sometimes one number short, or more (implicit repetition).
+                let n = match next() % 10 {
+                    0 if want > 0 => want - 1,
+                    1 => want * 2,
+                    _ => want,
+                };
+                for i in 0..n {
+                    let v = (next() % 2000) as f64 / 10.0 - 100.0;
+                    if c.eq_ignore_ascii_case(&b'a') && (i % 7 == 3 || i % 7 == 4) {
+                        d.push_str(if next() % 2 == 0 { " 0" } else { " 1" });
+                    } else {
+                        d.push_str(&format!(" {v}"));
+                    }
+                }
+                d.push(' ');
+            }
+            check(&d);
+        }
     }
 
     #[test]
