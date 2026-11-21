@@ -175,9 +175,15 @@ pub fn decode(data: &[u8]) -> Result<Image> {
             }
         }
     } else if rgb15 {
+        // R, G and B straight from their 5-bit fields: no B, G, R triple
+        // built first and no exchange pass over the output afterwards.
         for (s, o) in raw.chunks_exact(2).zip(out.chunks_exact_mut(3)) {
-            o.copy_from_slice(&expand15([s[0], s[1]]));
+            let v = u16::from_le_bytes([s[0], s[1]]);
+            o[0] = LUT5[usize::from((v >> 10) & 31)];
+            o[1] = LUT5[usize::from((v >> 5) & 31)];
+            o[2] = LUT5[usize::from(v & 31)];
         }
+        swapped = true;
     } else {
         *out = raw;
     }
