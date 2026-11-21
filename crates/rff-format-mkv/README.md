@@ -10,7 +10,9 @@ not a binding.
 - **Demux** — EBML track tree plus Cluster / (Simple)Block packet extraction,
   streamed (memory is one block, not the file).
 - **Mux** — Matroska and WebM, streamed on seekable outputs.
-- **Video**: AV1, VP9, VP8, H.264 (HEVC demux). **Audio**: Opus, Vorbis, AAC,
+- **Video**: AV1, VP9, VP8, H.264, HEVC, ProRes, DNxHD/DNxHR (VfW), APV,
+  MJPEG; MPEG-1/2 video, DTS and TrueHD are identified on demux, and every
+  track's CodecID string is on `Stream::codec_string`. **Audio**: Opus, Vorbis, AAC,
   FLAC, MP3, PCM, AC-3, E-AC-3, ALAC. **Subtitles**: SubRip, ASS (demux),
   WebVTT.
 - Colour / HDR metadata (MasteringMetadata, MaxCLL/MaxFALL), WebM alpha

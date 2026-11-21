@@ -186,6 +186,27 @@ pub fn build_hvcc_record(vps: &[u8], sps: &[u8], pps: &[u8]) -> Option<Vec<u8>> 
     Some(out)
 }
 
+/// An `hvcC` record (4-byte NAL lengths) from a stream's extradata: an
+/// `hvcC` record (kept when it already declares 4-byte lengths, else
+/// rebuilt) or Annex-B VPS/SPS/PPS. `None` when it holds no SPS and PPS.
+pub fn hvcc_record_from_extradata(extradata: &[u8]) -> Option<Vec<u8>> {
+    let annexb;
+    let nals = match parse_hvcc(extradata) {
+        Some(cfg) if cfg.nal_len == 4 => return Some(extradata.to_vec()),
+        Some(cfg) => {
+            annexb = cfg.headers_annexb;
+            crate::avc::split_annexb(&annexb)
+        }
+        None => crate::avc::split_annexb(extradata),
+    };
+    let of = |t: u8| {
+        nals.iter()
+            .copied()
+            .find(|n| n.first().map(|b| (b >> 1) & 0x3F) == Some(t))
+    };
+    build_hvcc_record(of(32).unwrap_or(&[]), of(33)?, of(34)?)
+}
+
 /// Finds the first NAL of `nal_type` in an Annex-B stream (header included).
 pub fn find_nal_annexb(data: &[u8], nal_type: u8) -> Option<&[u8]> {
     for nal in crate::avc::split_annexb(data) {

@@ -870,6 +870,19 @@ pub(crate) fn build_dfla(extradata: &[u8]) -> Option<Vec<u8>> {
     Some(fbx(b"dfLa", 0, 0, &b))
 }
 
+/// [`build_dfla`] with the STREAMINFO rewritten from the frames written
+/// (total samples, block and frame size bounds; FFmpeg's movenc does the
+/// same at the trailer).
+pub(crate) fn build_dfla_with(
+    extradata: &[u8],
+    stats: &rff_format::flac::FlacStats,
+) -> Option<Vec<u8>> {
+    let si: [u8; 34] = flac_streaminfo(extradata)?.try_into().ok()?;
+    let mut b = vec![0x80, 0, 0, 34];
+    b.extend_from_slice(&stats.rewrite(&si));
+    Some(fbx(b"dfLa", 0, 0, &b))
+}
+
 /// The STREAMINFO body inside a FLAC extradata blob, whichever of the usual
 /// forms it takes (bare 34 bytes, a block with its header, or `fLaC` + blocks).
 pub(crate) fn flac_streaminfo(extradata: &[u8]) -> Option<&[u8]> {
