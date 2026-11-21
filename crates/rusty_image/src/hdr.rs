@@ -328,6 +328,8 @@ pub fn encode(image: &Image) -> Result<Vec<u8>> {
         }
         if !(8..0x8000).contains(&w) {
             // Too short or too long for new-style RLE: flat pixels.
+            // (Four planes read in step: an index is the plain way to say it.)
+            #[allow(clippy::needless_range_loop)]
             for x in 0..w {
                 out.extend_from_slice(&[planes[0][x], planes[1][x], planes[2][x], planes[3][x]]);
             }
