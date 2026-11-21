@@ -129,9 +129,14 @@ fn decode_codes<const MSB: bool>(data: &[u8], out: &mut [u8]) -> TiffResult<usiz
         acc: 0,
         nbits: 0,
     };
-    // Per code >= 258: start of its first emission in `out`, and its length.
-    let mut start = vec![0u32; MAX_CODES];
-    let mut len = vec![0u16; MAX_CODES];
+    // Per code >= 258: start of its first emission in `out`, and its length,
+    // side by side in one fixed-size table indexed under a mask (one base
+    // pointer and no bounds checks in the loop, where two tables needed two
+    // pointers, kept on the stack, and a check each).
+    let mut table: Box<[Entry; MAX_CODES]> = vec![Entry::default(); MAX_CODES]
+        .into_boxed_slice()
+        .try_into()
+        .unwrap();
     let early = u16::from(MSB);
     let mut width = 9u32;
     let mut next = FIRST;
@@ -171,7 +176,8 @@ fn decode_codes<const MSB: bool>(data: &[u8], out: &mut [u8]) -> TiffResult<usiz
             pos += 1;
             1
         } else if code < next {
-            let (s0, l) = (start[code as usize] as usize, len[code as usize]);
+            let e = table[usize::from(code) & (MAX_CODES - 1)];
+            let (s0, l) = (e.start as usize, e.len);
             let take = usize::from(l).min(room);
             copy_back(out, s0, at, take);
             pos += take;
@@ -195,8 +201,10 @@ fn decode_codes<const MSB: bool>(data: &[u8], out: &mut [u8]) -> TiffResult<usiz
         // the longest defined since the last clear, so lengths stay at most
         // MAX_CODES + 1.)
         if (next as usize) < MAX_CODES {
-            start[next as usize] = pstart as u32;
-            len[next as usize] = plen + 1;
+            table[usize::from(next) & (MAX_CODES - 1)] = Entry {
+                start: pstart as u32,
+                len: plen + 1,
+            };
             next += 1;
             if width < 12 && next >= limit {
                 width += 1;
@@ -206,6 +214,14 @@ fn decode_codes<const MSB: bool>(data: &[u8], out: &mut [u8]) -> TiffResult<usiz
         (pstart, plen) = (at, elen);
     }
     Ok(n)
+}
+
+/// A decoder table entry: where a code's string was first emitted, and its
+/// length.
+#[derive(Clone, Copy, Debug, Default)]
+struct Entry {
+    start: u32,
+    len: u16,
 }
 
 /// A strip that ends at `pos` short of `out.len()`: clear the up to 15
