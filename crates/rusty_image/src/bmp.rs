@@ -592,11 +592,8 @@ fn read_direct(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
                 px.copy_from_slice(&[s[2], s[1], s[0]]);
             }
         })?,
-        (Kind::Rgba32, _) => direct_rows(data, buf, g, |dst, src| {
-            for (px, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-                px.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
-            }
-        })?,
+        // A 32-bit icon entry: BGRA to RGBA, a word at a time.
+        (Kind::Rgba32, _) => direct_rows(data, buf, g, crate::swizzle::swap_rb4)?,
         _ => {
             let f = fields.expect("bitfield kinds carry masks");
             read_bitfield_rows(data, buf, g, bytes_pp, ch, &f)?
