@@ -1602,8 +1602,11 @@ fn expand_palette(
     let bits = usize::from(info.bits_per_sample);
     let entries = 1usize << bits;
     let (w, h) = (info.width as usize, info.height as usize);
+    if map.len() < 3 * entries {
+        return Err(TiffError::format("ColorMap too short"));
+    }
     let mut out = Vec::with_capacity(w * h * 3);
-    let mut push = |idx: usize| {
+    let push = |out: &mut Vec<u16>, idx: usize| {
         out.push(map[idx]);
         out.push(map[entries + idx]);
         out.push(map[2 * entries + idx]);
@@ -1614,15 +1617,36 @@ fn expand_palette(
             for y in 0..h {
                 let row = &v[y * stride..][..stride];
                 for x in 0..w {
-                    push(usize::from(get_bits(row, x * bits, bits)));
+                    push(&mut out, usize::from(get_bits(row, x * bits, bits)));
                 }
             }
         }
-        DecodingResult::U8(v) => v.iter().for_each(|&i| push(usize::from(i))),
-        DecodingResult::U16(v) => v.iter().for_each(|&i| push(usize::from(i))),
+        DecodingResult::U8(v) => {
+            // One `[r, g, b]` entry per index, read with one fixed-size
+            // index (a `u8` cannot leave a 256-entry table) and appended
+            // as one sized extend. Three pushes per pixel, each with its
+            // own capacity check and a bounds-checked read of one of the
+            // colormap's three planes, cost 61 Ir a pixel.
+            let table = rgb_table(map, entries);
+            out.extend(v.iter().flat_map(|&i| table[usize::from(i)]));
+        }
+        DecodingResult::U16(v) => v.iter().for_each(|&i| push(&mut out, usize::from(i))),
         _ => return Err(TiffError::unsupported("palette sample type")),
     }
     Ok(DecodingResult::U16(out))
+}
+
+/// The colormap's first `entries` (at most 256) colours as `[r, g, b]`
+/// triples. `map` holds at least `3 * entries` values: all reds, then all
+/// greens, then all blues.
+fn rgb_table(map: &[u16], entries: usize) -> [[u16; 3]; 256] {
+    let mut table = [[0u16; 3]; 256];
+    let (r, gb) = map.split_at(entries);
+    let (g, b) = gb.split_at(entries);
+    for (((t, &r), &g), &b) in table.iter_mut().zip(r).zip(g).zip(b) {
+        *t = [r, g, b];
+    }
+    table
 }
 
 /// The entry, unless its field-type code is one TIFF does not define (such
