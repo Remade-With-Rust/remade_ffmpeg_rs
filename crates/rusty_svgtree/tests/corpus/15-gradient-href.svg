@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="100">
+<defs>
+<linearGradient id="base"><stop offset="0" stop-color="#e00"/><stop offset="0.5" stop-color="#ee0"/><stop offset="1" stop-color="#0e0"/></linearGradient>
+<linearGradient id="vert" xlink:href="#base" x2="0" y2="1"/>
+<linearGradient id="user" href="#vert" gradientUnits="userSpaceOnUse" x1="110" y1="0" x2="190" y2="0"/>
+<linearGradient id="one"><stop offset="0.5" stop-color="#08c"/></linearGradient>
+<linearGradient id="dup"><stop offset="0" stop-color="red"/><stop offset="0.5" stop-color="red"/><stop offset="0.5" stop-color="blue"/><stop offset="1" stop-color="blue"/></linearGradient>
+</defs>
+<rect x="10" y="10" width="40" height="80" fill="url(#vert)"/>
+<rect x="60" y="10" width="40" height="80" fill="url(#one)"/>
+<rect x="110" y="10" width="80" height="35" fill="url(#user)"/>
+<rect x="110" y="55" width="80" height="35" fill="url(#dup)"/>
+</svg>

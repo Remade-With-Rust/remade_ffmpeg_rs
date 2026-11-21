@@ -39,7 +39,7 @@ pub(crate) fn init_segment(track: &TrackOut, track_id: u32, timescale: u32, star
     };
     let trak = super::build_trak(track, track_id, &empty, 0, 0);
 
-    let mut moov_body = super::build_mvhd(1000, 0, track_id + 1);
+    let mut moov_body = super::build_mvhd(1000, 0, track_id + 1, 0);
     moov_body.extend_from_slice(&trak);
 
     // mvex/trex: per-fragment defaults (everything explicit in each trun).

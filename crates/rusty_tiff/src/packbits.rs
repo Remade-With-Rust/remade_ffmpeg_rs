@@ -18,13 +18,15 @@ pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
 const INLINE_RUN: usize = 16;
 
 /// Append exactly `n` decoded bytes to `out`; extra input is ignored.
+/// Returns how many of them were really decoded (the rest, when the data
+/// ran out, are zeros).
 /// Nothing is zero-filled first, and `out` grows by at most `n`. (Writing
 /// by index into a zero-filled buffer instead measured +4.5% on 16-bit and
 /// +17% on 8-bit: this appends straight into the image. A second version
 /// with constant 16-byte over-copies/over-stores for short packets won 6%
 /// wall on the repeat-2 16-bit fixture but lost 12% wall on the 8-bit photo,
 /// whose long literals then cost a zero-fill pass plus a copy.)
-pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffResult<()> {
+pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffResult<usize> {
     out.try_reserve_exact(n)
         .map_err(|_| TiffError::limits(format!("cannot allocate {n} bytes")))?;
     let target = out.len() + n;
@@ -34,8 +36,9 @@ pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffRes
     // lose a strip's last byte or two).
     while out.len() < target {
         let Some(&h) = data.get(i) else {
+            let real = n - (target - out.len());
             out.resize(target, 0);
-            return Ok(());
+            return Ok(real);
         };
         i += 1;
         let h = h as i8;
@@ -55,8 +58,9 @@ pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffRes
         } else if h != -128 {
             let run = (1 - i32::from(h)) as usize;
             let Some(&b) = data.get(i) else {
+                let real = n - (target - out.len());
                 out.resize(target, 0);
-                return Ok(());
+                return Ok(real);
             };
             i += 1;
             let take = run.min(target - out.len());
@@ -73,7 +77,7 @@ pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffRes
             }
         }
     }
-    Ok(())
+    Ok(n)
 }
 
 /// Encode one row (PackBits runs must not cross rows per TIFF 6; the caller

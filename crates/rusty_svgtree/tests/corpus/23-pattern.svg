@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200">
+<defs>
+<pattern id="p1" patternUnits="userSpaceOnUse" width="20" height="20"><rect width="10" height="10" fill="#c33"/><circle cx="15" cy="15" r="4" fill="#33c"/></pattern>
+<pattern id="p2" patternUnits="userSpaceOnUse" width="16" height="16" viewBox="0 0 4 4" patternTransform="rotate(20)"><path d="M0 0 L4 4" stroke="black" stroke-width="0.5"/></pattern>
+</defs>
+<rect x="10" y="10" width="180" height="80" fill="url(#p1)"/>
+<circle cx="100" cy="145" r="50" fill="url(#p2)" stroke="url(#p1)" stroke-width="5"/>
+</svg>

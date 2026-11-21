@@ -392,3 +392,73 @@ fn ccitt_garbage_with_huge_columns_is_bounded() {
         let _ = ccitt::decode_g4(&data, 1 << 20, 1 << 20, &o);
     }
 }
+
+/// One 64x64 Gray8 strip, then ImageWidth damaged to 60,000: the file holds
+/// about 4 KB (less when compressed) but declares 3.8 MB.
+fn inflated(comp: Compression) -> Vec<u8> {
+    let px: Vec<u8> = (0..64u32 * 64).map(|i| (i * 7) as u8).collect();
+    let mut f = Cursor::new(Vec::new());
+    {
+        let mut e = TiffEncoder::new(&mut f).unwrap().with_compression(comp);
+        let mut i = e.new_image::<colortype::Gray8>(64, 64).unwrap();
+        i.rows_per_strip(64);
+        i.write_data(&px).unwrap();
+    }
+    let mut b = f.into_inner();
+    let first = ifds(&b)[0];
+    let p = field_pos(&b, first, 256);
+    // ImageWidth is SHORT or LONG, value inline either way (little-endian).
+    w32(&mut b, p, 60_000);
+    let ty = p - 6;
+    b[ty..ty + 2].copy_from_slice(&4u16.to_le_bytes());
+    b
+}
+
+/// ArtCraft's report on 0.1.1: zero-filling short strips let a damaged size
+/// field turn a 53 KB file into 223 MB of zeros. The zero-fill is bounded by
+/// what the file really holds, before allocating (uncompressed) and after
+/// decoding (compressed, where the stored bytes alone cannot tell).
+#[test]
+fn damaged_size_field_cannot_inflate_the_image() {
+    for comp in [
+        Compression::None,
+        Compression::Lzw,
+        Compression::PackBits,
+        Compression::Deflate(6),
+    ] {
+        let b = inflated(comp);
+        assert!(b.len() < 8192, "{comp:?}: {} bytes", b.len());
+        // Default limits: refused.
+        let r = Decoder::new(Cursor::new(&b)).unwrap().read_image();
+        assert!(matches!(r, Err(TiffError::Format(_))), "{comp:?}: {r:?}");
+        // Explicitly unlimited: the old behaviour, zero-filled.
+        let mut d = Decoder::new(Cursor::new(&b))
+            .unwrap()
+            .with_limits(Limits::unlimited());
+        match d.read_image() {
+            Ok(rusty_tiff::DecodingResult::U8(v)) => assert_eq!(v.len(), 60_000 * 64),
+            r => panic!("{comp:?}: {:?}", r.map(|_| ())),
+        }
+    }
+}
+
+/// `max_fill_ratio = 0` is strict: a strip even a little short is an error;
+/// the default still recovers it.
+#[test]
+fn strict_fill_ratio_refuses_short_strips() {
+    let mut b = two_page();
+    let first = ifds(&b)[0];
+    let p = field_pos(&b, first, 279);
+    w32(&mut b, p, 60);
+    assert!(Decoder::new(Cursor::new(&b)).unwrap().read_image().is_ok());
+    let mut strict = Limits::default();
+    strict.max_fill_ratio = 0;
+    let mut d = Decoder::new(Cursor::new(&b)).unwrap().with_limits(strict);
+    assert!(matches!(d.read_image(), Err(TiffError::Format(_))));
+    // An intact file passes strict mode.
+    let ok = two_page();
+    let mut strict = Limits::default();
+    strict.max_fill_ratio = 0;
+    let mut d = Decoder::new(Cursor::new(&ok)).unwrap().with_limits(strict);
+    assert!(d.read_image().is_ok());
+}

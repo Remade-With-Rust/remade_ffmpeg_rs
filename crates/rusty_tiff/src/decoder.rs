@@ -22,15 +22,28 @@ pub struct Limits {
     pub ifd_value_size: usize,
     /// Maximum size in bytes of one compressed or decompressed chunk.
     pub intermediate_buffer_size: usize,
+    /// How much of a damaged image may be zero-filled. A strip or tile whose
+    /// data ends early keeps what it holds and the rest reads as zero, but
+    /// only while the zero-filled bytes stay within this many times the bytes
+    /// really decoded, plus 64 KiB (so small images always recover). Past
+    /// that the image is refused: a damaged size field (say `SamplesPerPixel`
+    /// = 12,800) must not turn a 53 KB file into hundreds of megabytes of
+    /// zeros. The same bound is applied before anything is allocated, from
+    /// the bytes the chunks hold and the most their compression can expand.
+    /// `0` is strict: any short chunk is an error. Default 64 (a file cut
+    /// down to about 1.5% of its image still decodes).
+    pub max_fill_ratio: u64,
 }
 
 impl Default for Limits {
-    /// 256 MiB image, 16 MiB tag value, 128 MiB chunk.
+    /// 256 MiB image, 16 MiB tag value, 128 MiB chunk, zero-fill up to 64
+    /// times the decoded data.
     fn default() -> Self {
         Self {
             decoding_buffer_size: 256 << 20,
             ifd_value_size: 16 << 20,
             intermediate_buffer_size: 128 << 20,
+            max_fill_ratio: 64,
         }
     }
 }
@@ -43,6 +56,7 @@ impl Limits {
             decoding_buffer_size: usize::MAX,
             ifd_value_size: usize::MAX,
             intermediate_buffer_size: usize::MAX,
+            max_fill_ratio: u64::MAX,
         }
     }
 }
@@ -1051,6 +1065,70 @@ fn copy_packed(out: &mut [u8], chunk: &[u8], g: &Geom, out_row_bytes: usize) {
     }
 }
 
+/// Zero-fill always allowed, whatever the ratio (unless it is 0).
+const FILL_FLOOR: u64 = 64 << 10;
+
+/// The limits, plus the zero-fill accounting of one image decode: how many
+/// bytes were really decoded, how many were zero-filled because a chunk
+/// ended early, and the most the chunks not yet decoded can still produce.
+struct Budget<'a> {
+    limits: &'a Limits,
+    /// Most bytes one stored byte can decode to with this compression.
+    per_byte: u64,
+    potential: u64,
+    real: u64,
+    filled: u64,
+}
+
+impl Budget<'_> {
+    /// Zero-fill allowed beside `real` decoded bytes.
+    fn allowed(&self, real: u64) -> u64 {
+        match self.limits.max_fill_ratio {
+            0 => 0,
+            r => real.saturating_mul(r).saturating_add(FILL_FLOOR),
+        }
+    }
+
+    /// One chunk is done: `stored` file bytes gave `real` of its `expected`
+    /// bytes. Errors as soon as the image can no longer end within budget,
+    /// even if every remaining chunk decodes to the most it could.
+    fn chunk(&mut self, stored: u64, real: usize, expected: usize) -> TiffResult<()> {
+        let real = real.min(expected);
+        self.potential = self
+            .potential
+            .saturating_sub(stored.saturating_mul(self.per_byte));
+        self.real += real as u64;
+        self.filled += (expected - real) as u64;
+        if self.filled > self.allowed(self.real.saturating_add(self.potential)) {
+            return Err(TiffError::format(format!(
+                "image data is mostly missing: {} bytes decoded, {} would be zero-filled",
+                self.real, self.filled
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The most bytes one stored byte can decode to: 1 uncompressed; 64 for
+/// PackBits (two bytes repeat 128); about 1362 for TIFF LZW (all-equal data
+/// between two clear codes); 1032 for Deflate; one row per bit for CCITT (a
+/// row can be a single code); a 2-bit 8x8 block for baseline JPEG, with
+/// margin.
+fn max_expansion(comp: u16, chunk_row_bytes: usize) -> u64 {
+    match comp {
+        compression::NONE => 1,
+        compression::PACKBITS => 64,
+        compression::LZW => 1400,
+        compression::DEFLATE | compression::OLD_DEFLATE => 1040,
+        compression::CCITT_RLE | compression::CCITT_FAX3 | compression::CCITT_FAX4 => {
+            (chunk_row_bytes as u64).saturating_mul(8)
+        }
+        compression::JPEG => 1024,
+        // Anything else is refused when its first chunk is decoded.
+        _ => u64::MAX,
+    }
+}
+
 fn decode_image<R: Read + Seek>(
     s: &mut Stream<R>,
     img: &Image,
@@ -1074,6 +1152,34 @@ fn decode_image<R: Read + Seek>(
         return Err(TiffError::limits(format!(
             "image needs {total_bytes} bytes, limit {}",
             limits.decoding_buffer_size
+        )));
+    }
+    // Before allocating: the image must be coverable by what its chunks
+    // hold, allowing the zero-fill budget for a file that was cut short.
+    let stored = img
+        .offsets
+        .iter()
+        .zip(&img.counts)
+        .fold(0u64, |a, (&off, &n)| {
+            a.saturating_add(n.min(s.len.saturating_sub(off)))
+        });
+    let (cw0, _) = info.chunk_dimensions;
+    let per_byte = max_expansion(info.compression, row_bytes(cw0, img.spp_chunk(), bits)?);
+    let mut budget = Budget {
+        limits,
+        per_byte,
+        potential: stored.saturating_mul(per_byte),
+        real: 0,
+        filled: 0,
+    };
+    let limits = &mut budget;
+    if total_bytes as u64
+        > limits
+            .potential
+            .saturating_add(limits.allowed(limits.potential))
+    {
+        return Err(TiffError::format(format!(
+            "image declares {total_bytes} bytes but its chunks hold {stored}: too little to decode"
         )));
     }
     let samples = total_bytes / (usize::from(bits.max(8)) / 8);
@@ -1146,7 +1252,7 @@ fn decode_image<R: Read + Seek>(
 fn decode_strips<R: Read + Seek>(
     s: &mut Stream<R>,
     img: &Image,
-    limits: &Limits,
+    limits: &mut Budget<'_>,
     interpret: bool,
     total_bytes: usize,
     samples: usize,
@@ -1273,10 +1379,11 @@ fn decode_chunk_append<R: Read + Seek>(
     img: &Image,
     idx: usize,
     (cw, rows, chunk_row_bytes): (u32, u32, usize),
-    limits: &Limits,
+    budget: &mut Budget<'_>,
     interpret: bool,
     dst: &mut Vec<u8>,
 ) -> TiffResult<()> {
+    let limits = budget.limits;
     let info = &img.info;
     let expected = chunk_row_bytes
         .checked_mul(rows as usize)
@@ -1313,6 +1420,7 @@ fn decode_chunk_append<R: Read + Seek>(
         let have = (n as usize).min(expected);
         s.read_at_into(offset, have, dst)?;
         dst.resize(start + expected, 0);
+        budget.chunk(n, have, expected)?;
         if reverse {
             reverse_bits(&mut dst[start..]);
         }
@@ -1321,10 +1429,10 @@ fn decode_chunk_append<R: Read + Seek>(
         if reverse {
             reverse_bits(&mut raw);
         }
-        match comp {
+        let real = match comp {
             compression::LZW => lzw::decode_append(&raw, dst, expected)?,
             compression::DEFLATE | compression::OLD_DEFLATE => {
-                deflate::decode_append(&raw, dst, expected)?;
+                deflate::decode_append(&raw, dst, expected)?
             }
             compression::PACKBITS => packbits::decode_append(&raw, dst, expected)?,
             compression::CCITT_RLE | compression::CCITT_FAX3 | compression::CCITT_FAX4 => {
@@ -1343,7 +1451,7 @@ fn decode_chunk_append<R: Read + Seek>(
                 o.max_output_bytes = limits.intermediate_buffer_size;
                 ccitt::decode_append(&raw, &o, dst)?;
                 dst.truncate(start + expected);
-                return Ok(());
+                return budget.chunk(n, expected, expected);
             }
             compression::JPEG => {
                 dst.resize(start + expected, 0);
@@ -1355,13 +1463,14 @@ fn decode_chunk_append<R: Read + Seek>(
                     limits,
                     interpret,
                 )?;
-                return Ok(());
+                return budget.chunk(n, expected, expected);
             }
             compression::OLD_JPEG => {
                 return Err(TiffError::unsupported("old-style JPEG (compression 6)"))
             }
             c => return Err(TiffError::unsupported(format!("compression {c}"))),
-        }
+        };
+        budget.chunk(n, real, expected)?;
     }
     let buf = &mut dst[start..];
     let bytes = usize::from(info.bits_per_sample) / 8;

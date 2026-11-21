@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="200" height="200">
+<rect x="0" y="0" width="40" height="20" fill="#e33" transform="translate(20 20)"/>
+<rect x="0" y="0" width="40" height="20" fill="#3e3" transform="translate(100 30) rotate(30)"/>
+<rect x="0" y="0" width="40" height="20" fill="#33e" transform="rotate(45 150 100) translate(130 90)"/>
+<rect x="0" y="0" width="20" height="20" fill="#e3e" transform="translate(20 100) scale(2 1.5)"/>
+<rect x="0" y="0" width="40" height="20" fill="#ee3" transform="translate(80 120) skewX(30)"/>
+<rect x="0" y="0" width="40" height="20" fill="#3ee" transform="matrix(1 0.3 -0.2 1 140 150)"/>
+<g transform="translate(20 160) scale(0.5)"><g transform="rotate(-10)"><circle cx="40" cy="40" r="30" fill="#333"/></g></g>
+</svg>

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="60mm" height="40mm">
+<rect x="5mm" y="5mm" width="20mm" height="10mm" fill="#a33"/>
+<rect x="30%" y="10%" width="20%" height="25%" fill="#3a3"/>
+<circle cx="72pt" cy="80pt" r="1em" fill="#33a" font-size="20"/>
+<rect x="1in" y="1.2cm" width="4pc" height="2em" fill="#888"/>
+</svg>
