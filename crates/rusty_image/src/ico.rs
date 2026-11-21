@@ -238,7 +238,11 @@ fn to_rgba8(image: &Image) -> Result<Vec<u8>> {
     }
 }
 
-fn write(entries: &[(Image, u16, u16)], cur: bool) -> Result<Vec<u8>> {
+/// Write an ICO (`cur` false) or CUR file from borrowed images with their
+/// hotspots. Nothing here copies an image: the entries are references and
+/// the layout check looks at the format alone (it used to build an RGBA copy
+/// of every image just to see whether that failed).
+pub(crate) fn write(entries: &[(&Image, u16, u16)], cur: bool) -> Result<Vec<u8>> {
     if entries.is_empty() || entries.len() > usize::from(u16::MAX) {
         return Err(Error::invalid("ico: 1 to 65535 entries"));
     }
@@ -249,7 +253,12 @@ fn write(entries: &[(Image, u16, u16)], cur: bool) -> Result<Vec<u8>> {
                 "ico: entries are 1 to 256 pixels a side",
             ));
         }
-        to_rgba8(img)?;
+        if !matches!(img.format, PixelFormat::Rgba8 | PixelFormat::Rgb8) {
+            return Err(Error::unsupported(format!(
+                "ico: encoding {:?} (Rgb8 and Rgba8)",
+                img.format
+            )));
+        }
         // 256-pixel entries as PNG (as Windows writes them), smaller as BMP.
         bodies.push(if img.width == 256 || img.height == 256 {
             encode_png(img)?
@@ -284,11 +293,12 @@ fn write(entries: &[(Image, u16, u16)], cur: bool) -> Result<Vec<u8>> {
 /// pixels a side): 256-pixel entries as PNG, smaller ones as 32-bit BMP
 /// with an AND mask.
 pub fn encode(images: &[Image]) -> Result<Vec<u8>> {
-    let e: Vec<(Image, u16, u16)> = images.iter().map(|i| (i.clone(), 0, 0)).collect();
+    let e: Vec<(&Image, u16, u16)> = images.iter().map(|i| (i, 0, 0)).collect();
     write(&e, false)
 }
 
 /// Encode a cursor: each image with its hotspot (x, y).
 pub fn encode_cur(entries: &[(Image, u16, u16)]) -> Result<Vec<u8>> {
-    write(entries, true)
+    let e: Vec<(&Image, u16, u16)> = entries.iter().map(|(i, x, y)| (i, *x, *y)).collect();
+    write(&e, true)
 }

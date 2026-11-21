@@ -1069,13 +1069,15 @@ pub fn encode_dib(image: &Image, kind: DibKind) -> Result<Vec<u8>> {
 /// Write an ICO entry's DIB: 32-bit `BI_RGB` (alpha in the fourth byte, as
 /// icons store it) with a doubled height and an AND mask from the alpha.
 pub(crate) fn encode_ico_dib(image: &Image) -> Result<Vec<u8>> {
-    let rgba = match image.format {
-        PixelFormat::Rgba8 => image.pixels.clone(),
+    // RGBA pixels are read in place; only RGB is widened into a copy.
+    let rgba: std::borrow::Cow<[u8]> = match image.format {
+        PixelFormat::Rgba8 => (&image.pixels[..]).into(),
         PixelFormat::Rgb8 => image
             .pixels
             .chunks_exact(3)
             .flat_map(|p| [p[0], p[1], p[2], 0xff])
-            .collect(),
+            .collect::<Vec<u8>>()
+            .into(),
         other => {
             return Err(Error::unsupported(format!(
                 "ico: encoding {other:?} (Rgb8 and Rgba8)"

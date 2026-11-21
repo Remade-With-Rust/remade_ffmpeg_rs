@@ -301,7 +301,7 @@ pub fn encode(image: &Image, format: Format) -> Result<Vec<u8>> {
         Format::Tga => tga::encode(image),
         Format::Hdr => hdr::encode(image),
         Format::Ico => ico::encode(std::slice::from_ref(image)),
-        Format::Cur => ico::encode_cur(&[(image.clone(), 0, 0)]),
+        Format::Cur => ico::write(&[(image, 0, 0)], true),
         Format::Pnm => pnm::encode(image),
         Format::Qoi => qoi::encode(image),
         other => Err(Error::unsupported(format!(
