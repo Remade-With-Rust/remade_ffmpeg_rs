@@ -103,6 +103,65 @@ impl Fields {
     }
 }
 
+/// A bitfield layout as lookup tables: channel `c` of pixel `v` is
+/// `tab[c][(v >> shift[c]) as u8 & mask[c]]`. A table holds the channel's
+/// expansion to eight bits ([`Field::read`]) for every value of the field,
+/// so a pixel is three or four shift-mask-load-store steps, where
+/// `Field::read` chose among eight expansions by the field's width for
+/// every channel of every pixel (63 Ir a 16-bit pixel).
+struct FieldTables {
+    shift: [u32; 4],
+    mask: [u8; 4],
+    tab: [[u8; 256]; 4],
+}
+
+impl FieldTables {
+    fn new(f: &Fields) -> FieldTables {
+        let mut t = FieldTables {
+            shift: [0; 4],
+            mask: [0; 4],
+            tab: [[0; 256]; 4],
+        };
+        for (c, field) in [f.r, f.g, f.b, f.a].into_iter().enumerate() {
+            if field.len == 0 {
+                // No such channel (only alpha can be absent): every pixel
+                // reads entry 0, opaque.
+                t.tab[c][0] = 0xff;
+                continue;
+            }
+            t.shift[c] = field.shift;
+            // 1 to 8 bits (`from_mask` narrows wider fields to their top 8).
+            t.mask[c] = (0xffu32 >> (8 - field.len)) as u8;
+            let unit = Field {
+                shift: 0,
+                len: field.len,
+            };
+            for v in 0..=u32::from(t.mask[c]) {
+                t.tab[c][v as usize] = unit.read(v);
+            }
+        }
+        t
+    }
+
+    /// One row: `S`-byte little-endian pixels (2 or 4) to `C` channels.
+    /// (Four parallel arrays read in step: an index is the plain way to
+    /// say it.)
+    #[inline(always)]
+    #[allow(clippy::needless_range_loop)]
+    fn row<const S: usize, const C: usize>(&self, dst: &mut [u8], src: &[u8]) {
+        for (px, s) in dst.chunks_exact_mut(C).zip(src.chunks_exact(S)) {
+            let v = if S == 2 {
+                u32::from(u16::from_le_bytes([s[0], s[1]]))
+            } else {
+                u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+            };
+            for c in 0..C {
+                px[c] = self.tab[c][usize::from((v >> self.shift[c]) as u8 & self.mask[c])];
+            }
+        }
+    }
+}
+
 const RGB555: Fields = Fields {
     r: Field { shift: 10, len: 5 },
     g: Field { shift: 5, len: 5 },
@@ -579,8 +638,8 @@ fn direct_rows(
 }
 
 /// The rows of a 16-bit image, or of a 32-bit one whose masks are not the
-/// standard 8-8-8(-8). Reads from the start of `data`; returns how many
-/// bytes the rows took.
+/// standard 8-8-8(-8), through [`FieldTables`]. Reads from the start of
+/// `data`; returns how many bytes the rows took.
 #[inline(never)]
 fn read_bitfield_rows(
     data: &[u8],
@@ -590,24 +649,18 @@ fn read_bitfield_rows(
     ch: usize,
     f: &Fields,
 ) -> Result<usize> {
+    let t = FieldTables::new(f);
     let mut r = Reader::new(data);
     for i in 0..g.height {
         let src = r.bytes(g.n)?;
         r.skip(g.pad)?;
         let y = if g.top_down { i } else { g.height - 1 - i };
         let dst = &mut buf[y * g.stride..(y + 1) * g.stride];
-        for (px, s) in dst.chunks_exact_mut(ch).zip(src.chunks_exact(bytes_pp)) {
-            let v = if bytes_pp == 2 {
-                u32::from(u16::from_le_bytes([s[0], s[1]]))
-            } else {
-                u32::from_le_bytes([s[0], s[1], s[2], s[3]])
-            };
-            px[0] = f.r.read(v);
-            px[1] = f.g.read(v);
-            px[2] = f.b.read(v);
-            if ch == 4 {
-                px[3] = if f.a.len != 0 { f.a.read(v) } else { 0xff };
-            }
+        match (bytes_pp, ch) {
+            (2, 3) => t.row::<2, 3>(dst, src),
+            (2, _) => t.row::<2, 4>(dst, src),
+            (_, 3) => t.row::<4, 3>(dst, src),
+            _ => t.row::<4, 4>(dst, src),
         }
     }
     Ok(r.pos())
@@ -969,4 +1022,69 @@ pub(crate) fn encode_ico_dib(image: &Image) -> Result<Vec<u8>> {
         out.extend_from_slice(&row);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The table form of a bitfield layout gives every pixel the bytes
+    /// `Field::read` gives it: every contiguous mask of a 16 and a 32-bit
+    /// pixel, in each channel position, with and without an alpha channel.
+    #[test]
+    fn field_tables_match_field_read() {
+        let mut seed = 0x2545_f491u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let other = Field { shift: 3, len: 5 };
+        let none = Field { shift: 0, len: 0 };
+        for bits in [16u32, 32] {
+            for len in 1..=bits {
+                for shift in 0..=bits - len {
+                    let x = Field::from_mask((u32::MAX >> (32 - len)) << shift, bits).unwrap();
+                    for which in 0..5 {
+                        let mut f = Fields {
+                            r: other,
+                            g: other,
+                            b: other,
+                            a: if which == 4 { none } else { other },
+                        };
+                        match which {
+                            0 => f.r = x,
+                            1 => f.g = x,
+                            2 => f.b = x,
+                            3 => f.a = x,
+                            _ => {}
+                        }
+                        let t = FieldTables::new(&f);
+                        let s = (bits / 8) as usize;
+                        let src: Vec<u8> = (0..64).flat_map(|_| next().to_le_bytes()).collect();
+                        for ch in [3usize, 4] {
+                            let mut got = vec![0u8; src.len() / s * ch];
+                            match (s, ch) {
+                                (2, 3) => t.row::<2, 3>(&mut got, &src),
+                                (2, _) => t.row::<2, 4>(&mut got, &src),
+                                (_, 3) => t.row::<4, 3>(&mut got, &src),
+                                _ => t.row::<4, 4>(&mut got, &src),
+                            }
+                            for (px, p) in got.chunks_exact(ch).zip(src.chunks_exact(s)) {
+                                let v = if s == 2 {
+                                    u32::from(u16::from_le_bytes([p[0], p[1]]))
+                                } else {
+                                    u32::from_le_bytes([p[0], p[1], p[2], p[3]])
+                                };
+                                let a = if f.a.len != 0 { f.a.read(v) } else { 0xff };
+                                let want = [f.r.read(v), f.g.read(v), f.b.read(v), a];
+                                assert_eq!(px, &want[..ch], "{bits}-bit {f:?} pixel {v:#x}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
