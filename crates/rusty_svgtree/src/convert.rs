@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use rusty_raster::{
     BlendMode, FillRule, FilterQuality, LineCap, LineJoin, MaskType, NonZeroRect, PathBuilder,
-    Rect, Size, SpreadMode, Transform,
+    PathStroker, Rect, Size, SpreadMode, Transform,
 };
 
 use crate::svgtree::{AId, Document, EId, NodeId, SvgNode};
@@ -52,6 +52,10 @@ struct Cache {
     /// grows it only past the largest one before it, and leaves as an
     /// exactly sized copy (see `Cache::finish_path`).
     path_scratch: Option<PathBuilder>,
+    /// The stroker the stroke bounding boxes are taken with, kept so its
+    /// per-contour scratch keeps its capacity (it resets all of its state at
+    /// the start of every stroke).
+    stroker: PathStroker,
 }
 
 /// A shape with more points than this keeps the scratch builder's buffers as
@@ -973,7 +977,10 @@ fn convert_path(
         .and_then(|s| {
             let mut rs = s.to_raster();
             rs.dash = None;
-            data.stroke(&rs, 1.0)?.compute_tight_bounds()
+            cache
+                .stroker
+                .stroke(&data, &rs, 1.0)?
+                .compute_tight_bounds()
         })
         .unwrap_or(bounding_box);
     let markers = if visible_attr && !state.in_clip_path && has_markers(node) {
