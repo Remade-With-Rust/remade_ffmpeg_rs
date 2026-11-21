@@ -99,12 +99,14 @@ pub fn decode(data: &[u8]) -> Result<Image> {
 /// The op stream into `len` bytes of `CH`-channel pixels. Reads go through
 /// `data.get`, so a cut-off stream is an error.
 ///
-/// The output is pre-sized and every pixel is one fixed 4-byte store: for
-/// three channels the fourth byte lands on the next pixel's first byte, which
-/// that pixel then overwrites (pixels are written strictly in order and every
-/// position below `len` is written), and only the last pixel, with no room
-/// for four bytes, takes a 3-byte store. A run's length is counted in bytes,
-/// so no division by the channel count per op.
+/// The output is pre-sized and walked as a shrinking slice. Every op but a
+/// run makes exactly one pixel, so it stores that pixel and steps on, with
+/// no loop: only a run loops (`fill`). A pixel is one fixed 4-byte store:
+/// for three channels the fourth byte lands on the next pixel's first byte,
+/// which that pixel then overwrites (pixels are written strictly in order
+/// and every position below `len` is written), and only a pixel with no
+/// room for four bytes takes a 3-byte store. A run's length is counted in
+/// bytes, so no division by the channel count per op.
 ///
 /// The specification writes `index[hash(px)] = px` after every op. Only the
 /// ops that make a new colour (DIFF, LUMA, RGB, RGBA) can change the index
@@ -125,24 +127,22 @@ fn decode_ops<const CH: usize>(data: &[u8], len: usize) -> Result<Vec<u8>> {
         index[hash_u32(px)] = px;
     }
     let mut pos = 0usize;
-    let mut o = 0usize;
-    while o < len {
+    let mut rest: &mut [u8] = &mut out;
+    while !rest.is_empty() {
         let b = *data.get(pos).ok_or(Error::Truncated)?;
         pos += 1;
         // Dispatch as a chain of range tests on the 2-bit tag. A `match`
         // here compiled to an indirect jump table, and on 3-channel data
         // its target mispredicted on 59% of ops (callgrind branch sim:
         // 797K of 1.36M), which Ir cannot see.
-        let end = if b < OP_DIFF {
+        if b < OP_DIFF {
             px = index[usize::from(b & 0x3f)];
             if px == 0 {
                 index[0] = 0;
             }
-            o + CH
         } else if b < OP_LUMA {
             px = add_bytes(px, DIFF_ADD[usize::from(b & 0x3f)]);
             index[hash_u32(px)] = px;
-            o + CH
         } else if b < OP_RUN {
             let b2 = *data.get(pos).ok_or(Error::Truncated)?;
             pos += 1;
@@ -154,10 +154,13 @@ fn decode_ops<const CH: usize>(data: &[u8], len: usize) -> Result<Vec<u8>> {
                 u32::from(dr) | (u32::from(dg) << 8) | (u32::from(db) << 16),
             );
             index[hash_u32(px)] = px;
-            o + CH
         } else if b < OP_RGB {
             // OP_RUN: the same pixel, up to 62 times, never past the end.
-            (o + (usize::from(b & 0x3f) + 1) * CH).min(len)
+            let n = ((usize::from(b & 0x3f) + 1) * CH).min(rest.len());
+            let (run, tail) = core::mem::take(&mut rest).split_at_mut(n);
+            fill::<CH>(run, px);
+            rest = tail;
+            continue;
         } else if b == OP_RGB {
             let c = data.get(pos..pos + 3).ok_or(Error::Truncated)?;
             px = (px & 0xff00_0000)
@@ -166,25 +169,39 @@ fn decode_ops<const CH: usize>(data: &[u8], len: usize) -> Result<Vec<u8>> {
                 | (u32::from(c[2]) << 16);
             pos += 3;
             index[hash_u32(px)] = px;
-            o + CH
         } else {
             let c = data.get(pos..pos + 4).ok_or(Error::Truncated)?;
             px = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             pos += 4;
             index[hash_u32(px)] = px;
-            o + CH
-        };
-        let bytes = px.to_le_bytes();
-        while o < end {
-            if let Some(d) = out.get_mut(o..o + 4) {
-                d.copy_from_slice(&bytes);
-            } else {
-                out[o..o + CH].copy_from_slice(&bytes[..CH]);
-            }
-            o += CH;
         }
+        let bytes = px.to_le_bytes();
+        let r = core::mem::take(&mut rest);
+        rest = if r.len() >= 4 {
+            r[..4].copy_from_slice(&bytes);
+            &mut r[CH..]
+        } else {
+            r[..CH].copy_from_slice(&bytes[..CH]);
+            &mut r[CH..]
+        };
     }
     Ok(out)
+}
+
+/// A run's pixels (`run.len()` is a whole number of `CH`-byte pixels): 4-byte
+/// stores stepping `CH` bytes while four bytes remain, which for three
+/// channels leaves exactly the last pixel, stored as three bytes. (Sized by
+/// `run.len()` instead, that last copy compiled to a `memcpy` call per run.)
+#[inline(always)]
+fn fill<const CH: usize>(mut run: &mut [u8], px: u32) {
+    let bytes = px.to_le_bytes();
+    while run.len() >= 4 {
+        run[..4].copy_from_slice(&bytes);
+        run = &mut run[CH..];
+    }
+    if let Some(last) = run.first_chunk_mut::<3>() {
+        last.copy_from_slice(&bytes[..3]);
+    }
 }
 
 /// Encode `Rgb8` or `Rgba8` as QOI (sRGB colour space flag).
