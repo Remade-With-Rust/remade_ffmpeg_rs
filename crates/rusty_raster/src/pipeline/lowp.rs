@@ -791,12 +791,30 @@ fn load_8888_tail(
     tail: usize, data: &[u8],
     r: &mut u16x16, g: &mut u16x16, b: &mut u16x16, a: &mut u16x16,
 ) {
-    // Fill a dummy array with `tail` values. `tail` is always in a 1..STAGE_WIDTH-1 range.
-    // This way we can reuse the `load_8888__` method and remove any branches.
-    let mut tmp = [0u8; STAGE_WIDTH * 4];
-    let n = tail.min(STAGE_WIDTH) * 4;
-    tmp[0..n].copy_from_slice(&data[0..n]);
-    load_8888(&tmp, r, g, b, a);
+    // `tail` is always in a 1..STAGE_WIDTH-1 range, and the lanes past it are
+    // zero either way.
+    //
+    // A short tail (anti-aliased edges and hairlines are 1-3 pixels) loads
+    // just its pixels. A long one is cheaper as before: copy the row into a
+    // zeroed 16-pixel buffer and convert all of it as vectors.
+    const SHORT: usize = 4;
+    if tail <= SHORT {
+        *r = u16x16::default();
+        *g = u16x16::default();
+        *b = u16x16::default();
+        *a = u16x16::default();
+        for (i, px) in data.chunks_exact(4).take(tail).enumerate() {
+            r.0[i] = u16::from(px[0]);
+            g.0[i] = u16::from(px[1]);
+            b.0[i] = u16::from(px[2]);
+            a.0[i] = u16::from(px[3]);
+        }
+    } else {
+        let mut tmp = [0u8; STAGE_WIDTH * 4];
+        let n = tail.min(STAGE_WIDTH) * 4;
+        tmp[0..n].copy_from_slice(&data[0..n]);
+        load_8888(&tmp, r, g, b, a);
+    }
 }
 
 #[inline(always)]
@@ -896,4 +914,93 @@ fn join(lo: &u16x16, hi: &u16x16) -> f32x16 {
 fn mad(f: f32x16, m: f32x16, a: f32x16) -> f32x16 {
     // NEON vmlaq_f32 doesn't seem to affect performance in any way. Ignore it.
     f * m + a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// `load_8888` and `store_8888` as they were first written, one byte at
+    /// a time. They stay here as the oracle for the word-at-a-time forms.
+    fn load_ref(data: &[u8]) -> [u16x16; 4] {
+        let mut out = [u16x16::default(); 4];
+        for (i, px) in data.chunks_exact(4).take(STAGE_WIDTH).enumerate() {
+            for c in 0..4 {
+                out[c].0[i] = u16::from(px[c]);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn load_8888_matches_bytewise() {
+        for seed in 1..200 {
+            let data: [u8; STAGE_WIDTH * 4] = bytes(seed, STAGE_WIDTH * 4).try_into().unwrap();
+            let mut got = [u16x16::default(); 4];
+            let [r, g, b, a] = &mut got;
+            load_8888(&data, r, g, b, a);
+            assert_eq!(got, load_ref(&data));
+        }
+    }
+
+    #[test]
+    fn store_8888_matches_bytewise() {
+        for seed in 1..200 {
+            // Lanes above 255 too: a store keeps the low byte.
+            let raw = bytes(seed, STAGE_WIDTH * 8);
+            let mut lanes = [u16x16::default(); 4];
+            for c in 0..4 {
+                for i in 0..STAGE_WIDTH {
+                    let k = (c * STAGE_WIDTH + i) * 2;
+                    lanes[c].0[i] = u16::from_le_bytes([raw[k], raw[k + 1]]);
+                }
+            }
+            let mut expected = [0u8; STAGE_WIDTH * 4];
+            for i in 0..STAGE_WIDTH {
+                for c in 0..4 {
+                    expected[i * 4 + c] = lanes[c].0[i] as u8;
+                }
+            }
+            let mut got = [0u8; STAGE_WIDTH * 4];
+            store_8888(&lanes[0], &lanes[1], &lanes[2], &lanes[3], &mut got);
+            assert_eq!(got, expected);
+
+            for tail in 1..STAGE_WIDTH {
+                let mut got = [0xAAu8; STAGE_WIDTH * 4];
+                store_8888_tail(&lanes[0], &lanes[1], &lanes[2], &lanes[3], tail, &mut got);
+                assert_eq!(got[..tail * 4], expected[..tail * 4]);
+                assert!(got[tail * 4..].iter().all(|&b| b == 0xAA), "tail {tail} wrote past its end");
+            }
+        }
+    }
+
+    /// Every tail length, on both sides of the short-tail switch: the pixels
+    /// that are there, and zero in every lane past them.
+    #[test]
+    fn load_8888_tail_matches_zero_padded_load() {
+        for seed in 1..60 {
+            let data = bytes(seed, STAGE_WIDTH * 4);
+            for tail in 1..STAGE_WIDTH {
+                let mut padded = [0u8; STAGE_WIDTH * 4];
+                padded[..tail * 4].copy_from_slice(&data[..tail * 4]);
+                // Stale lanes going in: a tail load must overwrite all 16.
+                let mut got = [u16x16::splat(0xBEEF); 4];
+                let [r, g, b, a] = &mut got;
+                load_8888_tail(tail, &data, r, g, b, a);
+                assert_eq!(got, load_ref(&padded), "tail {tail}");
+            }
+        }
+    }
 }
