@@ -56,12 +56,19 @@ struct Cache {
     /// per-contour scratch keeps its capacity (it resets all of its state at
     /// the start of every stroke).
     stroker: PathStroker,
+    /// The point count a huge path's builder was sized for (see
+    /// `Cache::path_data_builder`).
+    presized: Option<usize>,
 }
 
 /// A shape with more points than this keeps the scratch builder's buffers as
 /// its own instead of being copied out of them (no second copy of a huge
 /// path is ever held).
 const SCRATCH_MAX_POINTS: usize = 1 << 16;
+
+/// Path data at least this long is built in a builder sized by
+/// `values::path_data_size_estimate`.
+const PRESIZE_MIN_BYTES: usize = 1 << 16;
 
 impl Cache {
     /// Spends one unit of conversion work; `false` once the budget is gone.
@@ -78,11 +85,37 @@ impl Cache {
         self.path_scratch.take().unwrap_or_else(PathBuilder::new)
     }
 
+    /// The builder to build the path data `d` in: for huge data, one of
+    /// about its final size (instead of a chain of doubling copies, whose
+    /// last step holds the old and the new buffers at once).
+    fn path_data_builder(&mut self, d: &str) -> PathBuilder {
+        if d.len() >= PRESIZE_MIN_BYTES {
+            if let Some(b) = self.presized_builder(d) {
+                return b;
+            }
+        }
+        self.path_builder()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn presized_builder(&mut self, d: &str) -> Option<PathBuilder> {
+        let size = values::path_data_size_estimate(d);
+        self.presized = size.map(|(_, points)| points);
+        size.map(|(verbs, points)| PathBuilder::with_capacity(verbs, points))
+    }
+
     /// Finishes a shape built in `path_builder()`'s builder: the path is an
     /// exactly sized copy, and the builder goes back to the scratch slot.
     fn finish_path(&mut self, b: PathBuilder) -> Option<Arc<rusty_raster::Path>> {
         let path = b.finish()?;
         if path.points().len() > SCRATCH_MAX_POINTS {
+            // A presized builder left more than half empty (data that stops
+            // early, say) is not kept at that size.
+            let sized = self.presized.take();
+            if sized.is_some_and(|p| path.points().len() < p / 2) {
+                return Some(Arc::new(path.clone()));
+            }
             return Some(Arc::new(path));
         }
         let out = path.clone();
@@ -803,8 +836,9 @@ fn convert_shape(
         }
         EId::Path => {
             // Path data goes straight from the text into the builder.
-            let mut b = cache.path_builder();
-            values::path_data_with(node.attribute(AId::D)?, &mut |s| match s {
+            let d = node.attribute(AId::D)?;
+            let mut b = cache.path_data_builder(d);
+            values::path_data_with(d, &mut |s| match s {
                 Seg::MoveTo(x, y) => b.move_to(x as f32, y as f32),
                 Seg::LineTo(x, y) => b.line_to(x as f32, y as f32),
                 Seg::Quad(x1, y1, x, y) => b.quad_to(x1 as f32, y1 as f32, x as f32, y as f32),
