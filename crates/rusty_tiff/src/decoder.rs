@@ -1494,15 +1494,16 @@ fn decode_chunk_append<R: Read + Seek>(
                 return budget.chunk(n, expected, expected);
             }
             compression::JPEG => {
-                dst.resize(start + expected, 0);
                 decode_jpeg_chunk(
                     img,
                     &raw,
                     (cw, rows, chunk_row_bytes),
-                    &mut dst[start..],
+                    dst,
                     limits,
                     interpret,
                 )?;
+                // Rows the JPEG does not hold read as zero.
+                dst.resize(start + expected, 0);
                 return budget.chunk(n, expected, expected);
             }
             compression::OLD_JPEG => {
@@ -1529,12 +1530,16 @@ fn decode_chunk_append<R: Read + Seek>(
     Ok(())
 }
 
+/// Decode one JPEG strip or tile and append its rows to `dst`, each cut or
+/// zero-padded to `chunk_row_bytes`. The rows are appended (the caller
+/// reserved nothing and zero-fills only rows the JPEG lacks): zero-filling
+/// the chunk first and copying over it wrote every byte twice.
 #[cfg(feature = "jpeg")]
 fn decode_jpeg_chunk(
     img: &Image,
     raw: &[u8],
     (cw, rows, chunk_row_bytes): (u32, u32, usize),
-    buf: &mut [u8],
+    dst: &mut Vec<u8>,
     limits: &Limits,
     convert_ycbcr: bool,
 ) -> TiffResult<()> {
@@ -1556,8 +1561,14 @@ fn decode_jpeg_chunk(
     }
     let src_row = j.width as usize * usize::from(spp);
     let copy = src_row.min(chunk_row_bytes);
-    for r in 0..rows.min(j.height) as usize {
-        buf[r * chunk_row_bytes..][..copy].copy_from_slice(&j.data[r * src_row..][..copy]);
+    let have = rows.min(j.height) as usize;
+    dst.try_reserve_exact(chunk_row_bytes * rows as usize)
+        .map_err(|_| TiffError::limits("cannot allocate a JPEG chunk"))?;
+    for r in 0..have {
+        dst.extend_from_slice(&j.data[r * src_row..][..copy]);
+        if copy < chunk_row_bytes {
+            dst.resize(dst.len() + chunk_row_bytes - copy, 0);
+        }
     }
     Ok(())
 }
@@ -1567,7 +1578,7 @@ fn decode_jpeg_chunk(
     _img: &Image,
     _raw: &[u8],
     _geom: (u32, u32, usize),
-    _buf: &mut [u8],
+    _dst: &mut Vec<u8>,
     _limits: &Limits,
     _convert_ycbcr: bool,
 ) -> TiffResult<()> {
