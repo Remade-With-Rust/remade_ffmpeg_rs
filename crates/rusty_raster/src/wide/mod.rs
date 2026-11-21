@@ -196,10 +196,12 @@ impl f32x8 {
         self - self.floor()
     }
 
+    #[inline]
     pub fn normalize(self) -> Self {
         self.max(f32x8::default()).min(f32x8::splat(1.0))
     }
 
+    #[inline]
     pub fn to_i32x8_bitcast(self) -> i32x8 {
         let mut o = [0i32; 8];
         for i in 0..8 {
@@ -208,6 +210,7 @@ impl f32x8 {
         i32x8(o)
     }
 
+    #[inline]
     pub fn to_u32x8_bitcast(self) -> u32x8 {
         let mut o = [0u32; 8];
         for i in 0..8 {
@@ -216,21 +219,27 @@ impl f32x8 {
         u32x8(o)
     }
 
+    #[inline]
     pub fn cmp_eq(self, rhs: Self) -> Self {
         self.zip(rhs, |a, b| mask_f(a == b))
     }
+    #[inline]
     pub fn cmp_ne(self, rhs: Self) -> Self {
         self.zip(rhs, |a, b| mask_f(a != b))
     }
+    #[inline]
     pub fn cmp_ge(self, rhs: Self) -> Self {
         self.zip(rhs, |a, b| mask_f(a >= b))
     }
+    #[inline]
     pub fn cmp_gt(self, rhs: Self) -> Self {
         self.zip(rhs, |a, b| mask_f(a > b))
     }
+    #[inline]
     pub fn cmp_le(self, rhs: Self) -> Self {
         self.zip(rhs, |a, b| mask_f(a <= b))
     }
+    #[inline]
     pub fn cmp_lt(self, rhs: Self) -> Self {
         self.zip(rhs, |a, b| mask_f(a < b))
     }
@@ -247,20 +256,24 @@ impl f32x8 {
         Self(o)
     }
 
+    #[inline]
     pub fn abs(self) -> Self {
         self.map(|v| f32::from_bits(v.to_bits() & 0x7fff_ffff))
     }
 
     /// `maxps` semantics.
+    #[inline]
     pub fn max(self, rhs: Self) -> Self {
         self.zip(rhs, |a, b| if a > b { a } else { b })
     }
 
     /// `minps` semantics.
+    #[inline]
     pub fn min(self, rhs: Self) -> Self {
         self.zip(rhs, |a, b| if a < b { a } else { b })
     }
 
+    #[inline]
     pub fn is_finite(self) -> Self {
         self.map(|v| mask_f((v.to_bits() << 1) & 0xFF00_0000 != 0xFF00_0000))
     }
@@ -279,6 +292,7 @@ impl f32x8 {
         })
     }
 
+    #[inline]
     pub fn round_int(self) -> i32x8 {
         let mut o = [0i32; 8];
         for i in 0..8 {
@@ -331,6 +345,7 @@ impl f32x8 {
         i32x8(o)
     }
 
+    #[inline]
     pub fn trunc_int(self) -> i32x8 {
         let mut o = [0i32; 8];
         for i in 0..8 {
@@ -340,19 +355,23 @@ impl f32x8 {
     }
 
     /// Exact reciprocal. SSE2 tiny-skia uses the `rcpps` approximation here.
+    #[inline]
     pub fn recip_fast(self) -> Self {
         self.map(|v| 1.0 / v)
     }
 
+    #[inline]
     pub fn recip_sqrt(self) -> Self {
         self.map(|v| 1.0 / v.sqrt())
     }
 
+    #[inline]
     pub fn sqrt(self) -> Self {
         self.map(f32::sqrt)
     }
 
     #[allow(clippy::excessive_precision)]
+    #[inline]
     pub fn powf(self, exp: f32) -> Self {
         let x = self;
         // We assume sign(x) is positive so we can use vectorized i32->f32 conversions
@@ -388,12 +407,14 @@ impl f32x8 {
 }
 
 impl From<[f32; 8]> for f32x8 {
+    #[inline]
     fn from(v: [f32; 8]) -> Self {
         Self(v)
     }
 }
 
 impl From<f32x8> for [f32; 8] {
+    #[inline]
     fn from(v: f32x8) -> Self {
         v.0
     }
@@ -414,12 +435,14 @@ lanes_bin!(f32x8, f32, 8, BitXor, bitxor, |a, b| f32::from_bits(
 ));
 
 impl AddAssign for f32x8 {
+    #[inline]
     fn add_assign(&mut self, rhs: f32x8) {
         *self = *self + rhs;
     }
 }
 
 impl MulAssign for f32x8 {
+    #[inline]
     fn mul_assign(&mut self, rhs: f32x8) {
         *self = *self * rhs;
     }
@@ -427,6 +450,7 @@ impl MulAssign for f32x8 {
 
 impl Neg for f32x8 {
     type Output = Self;
+    #[inline]
     fn neg(self) -> Self {
         Self::default() - self
     }
@@ -434,6 +458,7 @@ impl Neg for f32x8 {
 
 impl Not for f32x8 {
     type Output = Self;
+    #[inline]
     fn not(self) -> Self {
         self.map(|v| f32::from_bits(!v.to_bits()))
     }
@@ -446,10 +471,12 @@ impl Not for f32x8 {
 pub struct i32x8(pub [i32; 8]);
 
 impl i32x8 {
+    #[inline]
     pub fn splat(n: i32) -> Self {
         Self([n; 8])
     }
 
+    #[inline]
     pub fn blend(self, t: Self, f: Self) -> Self {
         let mut o = [0i32; 8];
         for i in 0..8 {
@@ -458,6 +485,7 @@ impl i32x8 {
         Self(o)
     }
 
+    #[inline]
     fn cmp(self, rhs: Self, f: impl Fn(i32, i32) -> bool) -> Self {
         let mut o = [0i32; 8];
         for i in 0..8 {
@@ -466,16 +494,20 @@ impl i32x8 {
         Self(o)
     }
 
+    #[inline]
     pub fn cmp_eq(self, rhs: Self) -> Self {
         self.cmp(rhs, |a, b| a == b)
     }
+    #[inline]
     pub fn cmp_gt(self, rhs: Self) -> Self {
         self.cmp(rhs, |a, b| a > b)
     }
+    #[inline]
     pub fn cmp_lt(self, rhs: Self) -> Self {
         self.cmp(rhs, |a, b| a < b)
     }
 
+    #[inline]
     pub fn to_f32x8(self) -> f32x8 {
         let mut o = [0.0f32; 8];
         for i in 0..8 {
@@ -484,6 +516,7 @@ impl i32x8 {
         f32x8(o)
     }
 
+    #[inline]
     pub fn to_u32x8_bitcast(self) -> u32x8 {
         let mut o = [0u32; 8];
         for i in 0..8 {
@@ -492,6 +525,7 @@ impl i32x8 {
         u32x8(o)
     }
 
+    #[inline]
     pub fn to_f32x8_bitcast(self) -> f32x8 {
         let mut o = [0.0f32; 8];
         for i in 0..8 {
@@ -502,12 +536,14 @@ impl i32x8 {
 }
 
 impl From<[i32; 8]> for i32x8 {
+    #[inline]
     fn from(v: [i32; 8]) -> Self {
         Self(v)
     }
 }
 
 impl From<i32x8> for [i32; 8] {
+    #[inline]
     fn from(v: i32x8) -> Self {
         v.0
     }
@@ -526,10 +562,12 @@ lanes_bin!(i32x8, i32, 8, BitXor, bitxor, |a, b| a ^ b);
 pub struct u32x8(pub [u32; 8]);
 
 impl u32x8 {
+    #[inline]
     pub fn splat(n: u32) -> Self {
         Self([n; 8])
     }
 
+    #[inline]
     pub fn to_i32x8_bitcast(self) -> i32x8 {
         let mut o = [0i32; 8];
         for i in 0..8 {
@@ -538,6 +576,7 @@ impl u32x8 {
         i32x8(o)
     }
 
+    #[inline]
     pub fn to_f32x8_bitcast(self) -> f32x8 {
         let mut o = [0.0f32; 8];
         for i in 0..8 {
@@ -546,6 +585,7 @@ impl u32x8 {
         f32x8(o)
     }
 
+    #[inline]
     pub fn cmp_eq(self, rhs: Self) -> Self {
         let mut o = [0u32; 8];
         for i in 0..8 {
@@ -554,6 +594,7 @@ impl u32x8 {
         Self(o)
     }
 
+    #[inline]
     pub fn shl<const RHS: i32>(self) -> Self {
         let mut o = self.0;
         for v in &mut o {
@@ -562,6 +603,7 @@ impl u32x8 {
         Self(o)
     }
 
+    #[inline]
     pub fn shr<const RHS: i32>(self) -> Self {
         let mut o = self.0;
         for v in &mut o {
@@ -572,12 +614,14 @@ impl u32x8 {
 }
 
 impl From<[u32; 8]> for u32x8 {
+    #[inline]
     fn from(v: [u32; 8]) -> Self {
         Self(v)
     }
 }
 
 impl From<u32x8> for [u32; 8] {
+    #[inline]
     fn from(v: u32x8) -> Self {
         v.0
     }
@@ -589,6 +633,7 @@ lanes_bin!(u32x8, u32, 8, BitOr, bitor, |a, b| a | b);
 
 impl Not for u32x8 {
     type Output = Self;
+    #[inline]
     fn not(self) -> Self {
         let mut o = self.0;
         for v in &mut o {
