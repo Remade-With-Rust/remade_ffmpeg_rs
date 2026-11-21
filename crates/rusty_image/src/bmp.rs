@@ -339,7 +339,21 @@ fn decode_mode(data: &[u8], mode: Mode) -> Result<(Image, usize)> {
     } else {
         PixelFormat::Rgb8
     };
-    let mut img = Image::zeroed(h.width as u32, h.height as u32, format)?;
+    // Uncompressed rows are read whole, padding included, so the pixel array
+    // must all be in the file. RLE has no such bound: an end-of-line or
+    // end-of-bitmap escape may legally leave the rest of the image unwritten.
+    let w = h.width;
+    let stride = match h.kind {
+        Kind::Palette => (usize::from(h.bit_count) * w).div_ceil(32) * 4,
+        Kind::Rgb16 | Kind::Bitfields16 => w * 2 + w % 2 * 2,
+        Kind::Rgb24 => (w * 3).div_ceil(4) * 4,
+        Kind::Rgb32 | Kind::Rgba32 | Kind::Bitfields32 => w * 4,
+        Kind::Rle8 | Kind::Rle4 => 0,
+    };
+    let need = h
+        .data_offset
+        .saturating_add(h.height.saturating_mul(stride));
+    let mut img = Image::zeroed_for_input(w as u32, h.height as u32, format, data.len(), need)?;
     r.seek(h.data_offset)?;
     match h.kind {
         Kind::Palette => read_palette_pixels(&mut r, &h, &mut img.pixels)?,

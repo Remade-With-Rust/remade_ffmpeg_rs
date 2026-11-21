@@ -78,6 +78,11 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     };
     let len = crate::byte_len(width, height, format)?;
     let data = r.rest();
+    // One op byte yields at most 62 pixels (QOI_OP_RUN): refuse a header the
+    // stream cannot cover before `decode_ops` allocates its output.
+    if data.len() < (len / usize::from(channels)).div_ceil(62) {
+        return Err(Error::Truncated);
+    }
     let pixels = if channels == 3 {
         decode_ops::<3>(data, len)?
     } else {
