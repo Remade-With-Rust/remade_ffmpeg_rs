@@ -1274,15 +1274,8 @@ fn store_8888(
     r: &f32x8, g: &f32x8, b: &f32x8, a: &f32x8,
     data: &mut [u8; STAGE_WIDTH * 4],
 ) {
-    let r: [i32; 8] = unnorm(r).into();
-    let g: [i32; 8] = unnorm(g).into();
-    let b: [i32; 8] = unnorm(b).into();
-    let a: [i32; 8] = unnorm(a).into();
-    for i in 0..STAGE_WIDTH {
-        data[i * 4] = r[i] as u8;
-        data[i * 4 + 1] = g[i] as u8;
-        data[i * 4 + 2] = b[i] as u8;
-        data[i * 4 + 3] = a[i] as u8;
+    for (px, v) in data.chunks_exact_mut(4).zip(pack_8888(r, g, b, a)) {
+        px.copy_from_slice(&v.to_le_bytes());
     }
 }
 
@@ -1291,21 +1284,32 @@ fn store_8888_tail(
     r: &f32x8, g: &f32x8, b: &f32x8, a: &f32x8,
     tail: usize, data: &mut [u8],
 ) {
-    let r: [i32; 8] = unnorm(r).into();
-    let g: [i32; 8] = unnorm(g).into();
-    let b: [i32; 8] = unnorm(b).into();
-    let a: [i32; 8] = unnorm(a).into();
-    for i in 0..tail.min(STAGE_WIDTH) {
-        data[i * 4] = r[i] as u8;
-        data[i * 4 + 1] = g[i] as u8;
-        data[i * 4 + 2] = b[i] as u8;
-        data[i * 4 + 3] = a[i] as u8;
+    for (px, v) in data.chunks_exact_mut(4).zip(pack_8888(r, g, b, a)).take(tail) {
+        px.copy_from_slice(&v.to_le_bytes());
     }
 }
 
+/// The eight pixels as `r | g << 8 | b << 16 | a << 24`, i.e. the pixmap's
+/// RGBA byte order read as a little-endian word, so a store is one 4-byte
+/// write per pixel instead of four bounds-checked byte writes.
 #[inline(always)]
-fn unnorm(v: &f32x8) -> i32x8 {
-    (v.max(f32x8::default()).min(f32x8::splat(1.0)) * f32x8::splat(255.0)).round_int()
+fn pack_8888(r: &f32x8, g: &f32x8, b: &f32x8, a: &f32x8) -> [u32; 8] {
+    let (r, g, b, a) = (unnorm(r), unnorm(g), unnorm(b), unnorm(a));
+    let mut out = [0u32; 8];
+    for i in 0..STAGE_WIDTH {
+        out[i] = r.0[i] | (g.0[i] << 8) | (b.0[i] << 16) | (a.0[i] << 24);
+    }
+    out
+}
+
+/// `[0, 1]` to a byte: clamp (NaN becomes 0), scale, round half to even.
+///
+/// tiny-skia rounds with `round_int` (`cvtps2dq`) here; `round_to_u8` gives the
+/// same byte on the clamped range, proven over every `f32` in
+/// `wide::tests::lane_conversions_match_libm_exhaustive`.
+#[inline(always)]
+fn unnorm(v: &f32x8) -> u32x8 {
+    (v.max(f32x8::default()).min(f32x8::splat(1.0)) * f32x8::splat(255.0)).round_to_u8()
 }
 
 #[inline(always)]

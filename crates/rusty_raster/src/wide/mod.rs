@@ -247,6 +247,26 @@ impl f32x8 {
         i32x8(o)
     }
 
+    /// `round_int` for lanes already in `[0, 255]`, without a float-to-int
+    /// conversion.
+    ///
+    /// Adding 2^23 puts the sum in `[2^23, 2^24)`, where consecutive floats
+    /// are 1 apart, so the addition itself rounds to an integer (half to
+    /// even, 2^23 being even), and that integer, at most 255, is the low byte
+    /// of the sum's mantissa. A Rust `as` cast saturates, which LLVM lowers
+    /// lane by lane on baseline x86-64 (`cvttss2si` plus two compare-and-
+    /// select fix-ups per lane); this is one `addps` and one `pand`.
+    ///
+    /// A lane outside `[0, 255]` (or NaN) gives an unspecified byte.
+    #[inline(always)]
+    pub fn round_to_u8(self) -> u32x8 {
+        let mut o = [0u32; 8];
+        for i in 0..8 {
+            o[i] = (self.0[i] + INTEGRAL).to_bits() & 0xff;
+        }
+        u32x8(o)
+    }
+
     pub fn trunc_int(self) -> i32x8 {
         let mut o = [0i32; 8];
         for i in 0..8 {
@@ -710,6 +730,34 @@ mod tests {
             round_ref(v).to_bits(),
             "round({v:e})"
         );
+        // The highp store: clamp to [0, 1], scale to [0, 255], round to a
+        // byte. `round_to_u8` must give the byte `round_int` gave.
+        let x = f32x8::splat(v).max(f32x8::default()).min(f32x8::splat(1.0)) * f32x8::splat(255.0);
+        assert_eq!(
+            x.round_to_u8().0[5],
+            cvt_round_ref(x.0[5]) as u8 as u32,
+            "unnorm({v:e})"
+        );
+    }
+
+    /// `round_to_u8` against `round_int` on every `step`-th float in `[0, 255]`.
+    fn sweep_bytes(step: usize) {
+        for bits in (0..=255.0f32.to_bits()).step_by(step) {
+            let x = f32::from_bits(bits);
+            assert_eq!(
+                f32x8::splat(x).round_to_u8().0[2],
+                cvt_round_ref(x) as u32,
+                "round_to_u8({x:e})"
+            );
+        }
+        for k in 0..=255u32 {
+            for d in -2i32..=2 {
+                let x = f32::from_bits((k as f32 + 0.5).to_bits().wrapping_add(d as u32));
+                if (0.0..=255.0).contains(&x) {
+                    assert_eq!(f32x8::splat(x).round_to_u8().0[0], cvt_round_ref(x) as u32);
+                }
+            }
+        }
     }
 
     /// Every `step`-th bit pattern, plus the neighbourhoods where rounding,
@@ -749,6 +797,7 @@ mod tests {
     #[test]
     fn lane_conversions_match_libm_sampled() {
         sweep(4099);
+        sweep_bytes(1021);
     }
 
     /// All 2^32 bit patterns. `cargo test --release -- --ignored lane_conversions`.
@@ -756,5 +805,6 @@ mod tests {
     #[ignore = "exhaustive over every f32 bit pattern; run in release"]
     fn lane_conversions_match_libm_exhaustive() {
         sweep(1);
+        sweep_bytes(1);
     }
 }
