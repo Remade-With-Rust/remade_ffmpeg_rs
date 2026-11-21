@@ -272,6 +272,59 @@ impl RasterPipelineBlitter<'_, '_> {
         }
         ScreenIntRect::from_xywh(rect.x(), rect.y(), right - rect.x(), bottom - rect.y())
     }
+
+    /// `blit_anti_h` into a coverage mask (`new_mask`), without the pipeline.
+    ///
+    /// The mask pipeline for a partial-coverage run is `uniform_color(white)`,
+    /// `load_dst_u8`, `lerp_1_float`, `store_u8`: a lowp run of four stages
+    /// over 16 lanes and four channels, for a run that is usually one pixel
+    /// wide and a result that is one byte per pixel. Its arithmetic, on the
+    /// one channel that is stored, is
+    ///
+    /// `c = (coverage * 255 + 0.5) as u16` with `coverage = alpha / 255`
+    /// (both as `f32`, as `blit_anti_h` and `lerp_1_float` compute them), then
+    /// `d' = div255(d * (255 - c) + 255 * c)` with `div255(v) = (v + 255) >> 8`,
+    ///
+    /// which is done here per byte. Every term stays below 2^16, so the
+    /// pipeline's `u16` lanes never wrapped and this is the same integer.
+    fn blit_anti_h_mask(&mut self, mut x: u32, y: u32, aa: &[AlphaU8], runs: &[AlphaRun]) {
+        let mut offset = 0;
+        let mut run_opt = runs.first().copied().flatten();
+        while let Some(run) = run_opt {
+            let width = LengthU32::from(run);
+            let Some(&alpha) = aa.get(offset) else {
+                break;
+            };
+
+            match alpha {
+                ALPHA_U8_TRANSPARENT => {}
+                ALPHA_U8_OPAQUE => {
+                    self.blit_h(x, y, width);
+                }
+                alpha => {
+                    let coverage = alpha as f32 * (1.0 / 255.0);
+                    let c = u32::from((coverage * 255.0 + 0.5) as u16);
+                    let rect =
+                        ScreenIntRect::from_xywh(x, y, width.get(), 1).and_then(|r| self.clip(&r));
+                    if let Some(rect) = rect {
+                        let start = self.pixmap.offset(rect.x() as usize, rect.y() as usize);
+                        let end = start + rect.width() as usize;
+                        if let Some(row) = self.pixmap.data.get_mut(start..end) {
+                            let add = 255 * c + 255;
+                            let keep = 255 - c;
+                            for d in row {
+                                *d = ((u32::from(*d) * keep + add) >> 8) as u8;
+                            }
+                        }
+                    }
+                }
+            }
+
+            x = x.saturating_add(width.get());
+            offset += usize::from(run.get());
+            run_opt = runs.get(offset).copied().flatten();
+        }
+    }
 }
 
 impl Blitter for RasterPipelineBlitter<'_, '_> {
@@ -282,6 +335,11 @@ impl Blitter for RasterPipelineBlitter<'_, '_> {
     }
 
     fn blit_anti_h(&mut self, mut x: u32, y: u32, aa: &mut [AlphaU8], runs: &mut [AlphaRun]) {
+        if self.is_mask {
+            self.blit_anti_h_mask(x, y, aa, runs);
+            return;
+        }
+
         let mask_ctx = self.mask.map(|c| c.mask_ctx()).unwrap_or_default();
 
         let mut aa_offset = 0;
@@ -422,5 +480,72 @@ impl Blitter for RasterPipelineBlitter<'_, '_> {
 
         self.blit_mask_rp
             .run(clip, aa_mask_ctx, mask_ctx, self.pixmap_src, self.pixmap);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::IntSizeExt;
+    use core::num::NonZeroU16;
+
+    /// The pipeline `new_mask` builds for a partial-coverage run, run on one
+    /// row: the oracle for `blit_anti_h_mask`.
+    fn pipeline_lerp(row: &mut [u8], alpha: u8) {
+        let mut mask = crate::Mask::from_vec(
+            row.to_vec(),
+            crate::IntSize::from_wh(row.len() as u32, 1).unwrap(),
+        )
+        .unwrap();
+        let mut sub = mask.as_subpixmap();
+        let mut p = RasterPipelineBuilder::new();
+        p.push_uniform_color(Color::WHITE.premultiply());
+        p.push(pipeline::Stage::LoadDestinationU8);
+        p.push(pipeline::Stage::Lerp1Float);
+        p.push(pipeline::Stage::StoreU8);
+        let mut p = p.compile();
+        p.ctx.current_coverage = alpha as f32 * (1.0 / 255.0);
+        let rect = sub.size.to_screen_int_rect(0, 0);
+        p.run(
+            &rect,
+            pipeline::AAMaskCtx::default(),
+            pipeline::MaskCtx::default(),
+            PixmapRef::from_bytes(&[0, 0, 0, 0], 1, 1).unwrap(),
+            &mut sub,
+        );
+        row.copy_from_slice(mask.data());
+    }
+
+    /// One `blit_anti_h` on a mask row, all of it one run of `alpha`.
+    fn blitter_row(row: &mut [u8], alpha: u8) {
+        let width = row.len() as u32;
+        let mut mask =
+            crate::Mask::from_vec(row.to_vec(), crate::IntSize::from_wh(width, 1).unwrap())
+                .unwrap();
+        let mut sub = mask.as_subpixmap();
+        let mut blitter = RasterPipelineBlitter::new_mask(&mut sub).unwrap();
+        let mut aa = vec![0u8; row.len() + 1];
+        let mut runs: Vec<AlphaRun> = vec![None; row.len() + 1];
+        aa[0] = alpha;
+        runs[0] = NonZeroU16::new(width as u16);
+        blitter.blit_anti_h(0, 0, &mut aa, &mut runs);
+        row.copy_from_slice(mask.data());
+    }
+
+    #[test]
+    fn mask_anti_h_matches_pipeline() {
+        // 256 destination bytes, plus a 16-pixel group boundary and a tail.
+        let dest: Vec<u8> = (0..=255u8).chain(0..21).collect();
+        for alpha in 0..=255u8 {
+            let mut want = dest.clone();
+            match alpha {
+                0 => {}
+                255 => want.iter_mut().for_each(|d| *d = 255),
+                _ => pipeline_lerp(&mut want, alpha),
+            }
+            let mut got = dest.clone();
+            blitter_row(&mut got, alpha);
+            assert_eq!(got, want, "alpha {alpha}");
+        }
     }
 }

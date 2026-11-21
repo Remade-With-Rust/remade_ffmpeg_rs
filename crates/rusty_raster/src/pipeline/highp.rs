@@ -16,6 +16,7 @@ and we're using a manual implementation.
 */
 
 use crate::{SpreadMode, PixmapRef};
+use crate::path::NormalizedF32;
 
 use crate::geom::ScreenIntRect;
 use crate::pixmap::SubPixmapMut;
@@ -208,7 +209,7 @@ fn move_source_to_destination(p: &mut Pipeline) {
     p.next_stage();
 }
 
-fn premultiply(p: &mut Pipeline) {
+pub fn premultiply(p: &mut Pipeline) {
     p.r *= p.a;
     p.g *= p.a;
     p.b *= p.a;
@@ -332,6 +333,39 @@ fn gather_ix(pixmap: PixmapRef, mut x: f32x8, mut y: f32x8) -> u32x8 {
     };
 
     (iy * i32x8::splat(pixmap.width() as i32) + ix).to_u32x8_bitcast()
+}
+
+/// As in `gather_ix`: the clamps of `clamp_trunc` leave every lane in
+/// `[0, limit)` (`max` turns NaN into 0), so for any pixmap short of 2^23
+/// pixels on a side the truncation needs no float-to-int conversion.
+#[inline(always)]
+fn trunc_without_conversion(pixmap: PixmapRef) -> bool {
+    const NO_CONVERSION: u32 = 1 << 23;
+    pixmap.width() <= NO_CONVERSION && pixmap.height() <= NO_CONVERSION
+}
+
+/// A sample coordinate clamped to `[0, limit)` and truncated to an integer.
+#[inline(always)]
+fn clamp_trunc(v: f32x8, limit: u32, fast: bool) -> i32x8 {
+    // Exclusive -> inclusive.
+    let v = v.max(f32x8::default()).min(f32x8::splat(ulp_sub(limit as f32)));
+    if fast {
+        v.trunc_int_below_2p23()
+    } else {
+        v.trunc_int()
+    }
+}
+
+/// The column part of a gather index: `x` clamped and truncated.
+#[inline(always)]
+fn gather_column(pixmap: PixmapRef, x: f32x8, fast: bool) -> i32x8 {
+    clamp_trunc(x, pixmap.width(), fast)
+}
+
+/// The row part of a gather index: `y` clamped, truncated, times the width.
+#[inline(always)]
+fn gather_row(pixmap: PixmapRef, y: f32x8, fast: bool) -> i32x8 {
+    clamp_trunc(y, pixmap.height(), fast) * i32x8::splat(pixmap.width() as i32)
 }
 
 #[inline(always)]
@@ -843,7 +877,7 @@ fn bilinear(p: &mut Pipeline) {
     let wx = [one - fx, fx];
     let wy = [one - fy, fy];
 
-    sampler_2x2(p.pixmap_src, &p.ctx.sampler, x, y, &wx, &wy, &mut p.r, &mut p.g, &mut p.b, &mut p.a);
+    sampler(p.pixmap_src, &p.ctx.sampler, x, y, -0.5, &wx, &wy, &mut p.r, &mut p.g, &mut p.b, &mut p.a);
 
     p.next_stage();
 }
@@ -857,7 +891,7 @@ fn bicubic(p: &mut Pipeline) {
     let wx = [bicubic_far(one - fx), bicubic_near(one - fx), bicubic_near(fx), bicubic_far(fx)];
     let wy = [bicubic_far(one - fy), bicubic_near(one - fy), bicubic_near(fy), bicubic_far(fy)];
 
-    sampler_4x4(p.pixmap_src, &p.ctx.sampler, x, y, &wx, &wy, &mut p.r, &mut p.g, &mut p.b, &mut p.a);
+    sampler(p.pixmap_src, &p.ctx.sampler, x, y, -1.5, &wx, &wy, &mut p.r, &mut p.g, &mut p.b, &mut p.a);
 
     p.next_stage();
 }
@@ -890,92 +924,64 @@ fn bicubic_far(t: f32x8) -> f32x8 {
     (t * t) * mad(f32x8::splat(7.0/18.0), t, f32x8::splat(-6.0/18.0))
 }
 
+/// The `N x N` taps of a bilinear (`N = 2`, `start = -0.5`) or bicubic
+/// (`N = 4`, `start = -1.5`) sample, weighted and summed.
+///
+/// The taps sit on `N` columns and `N` rows, so each column's `x` is tiled,
+/// clamped and truncated once, and each row's `y` once (times the width),
+/// instead of both at every one of the `N * N` taps; a tap's index is then one
+/// addition. The coordinates are the same floats as before (the same
+/// `start + 1 + 1 ...` sums), and the index is the same `row * width + column`
+/// that `gather_ix` computes (which the nearest `gather` stage keeps: split
+/// into these helpers it measured +1.4% Ir there).
 #[inline(always)]
-fn sampler_2x2(
+fn sampler<const N: usize>(
     pixmap: PixmapRef,
     ctx: &super::SamplerCtx,
-    cx: f32x8, cy: f32x8,
-    wx: &[f32x8; 2], wy: &[f32x8; 2],
+    cx: f32x8, cy: f32x8, start: f32,
+    wx: &[f32x8; N], wy: &[f32x8; N],
     r: &mut f32x8, g: &mut f32x8, b: &mut f32x8, a: &mut f32x8,
 ) {
+    let fast = trunc_without_conversion(pixmap);
+    let one = f32x8::splat(1.0);
+
+    let mut columns = [i32x8::default(); N];
+    let mut x = cx + f32x8::splat(start);
+    for column in &mut columns {
+        let tiled = tile(x, ctx.spread_mode, pixmap.width() as f32, ctx.inv_width);
+        *column = gather_column(pixmap, tiled, fast);
+        x += one;
+    }
+
+    let mut rows = [i32x8::default(); N];
+    let mut y = cy + f32x8::splat(start);
+    for row in &mut rows {
+        let tiled = tile(y, ctx.spread_mode, pixmap.height() as f32, ctx.inv_height);
+        *row = gather_row(pixmap, tiled, fast);
+        y += one;
+    }
+
     *r = f32x8::default();
     *g = f32x8::default();
     *b = f32x8::default();
     *a = f32x8::default();
 
-    let one = f32x8::splat(1.0);
-    let start = -0.5;
-    let mut y = cy + f32x8::splat(start);
-    for j in 0..2 {
-        let mut x = cx + f32x8::splat(start);
-        for i in 0..2 {
+    for j in 0..N {
+        for i in 0..N {
+            let ix = (rows[j] + columns[i]).to_u32x8_bitcast();
             let mut rr = f32x8::default();
             let mut gg = f32x8::default();
             let mut bb = f32x8::default();
             let mut aa = f32x8::default();
-            sample(pixmap, ctx, x,y, &mut rr, &mut gg, &mut bb, &mut aa);
+            load_8888(&pixmap.gather_clamped(ix), &mut rr, &mut gg, &mut bb, &mut aa);
 
             let w = wx[i] * wy[j];
             *r = mad(w, rr, *r);
             *g = mad(w, gg, *g);
             *b = mad(w, bb, *b);
             *a = mad(w, aa, *a);
-
-            x += one;
         }
-
-        y += one;
     }
-}
-
-#[inline(always)]
-fn sampler_4x4(
-    pixmap: PixmapRef,
-    ctx: &super::SamplerCtx,
-    cx: f32x8, cy: f32x8,
-    wx: &[f32x8; 4], wy: &[f32x8; 4],
-    r: &mut f32x8, g: &mut f32x8, b: &mut f32x8, a: &mut f32x8,
-) {
-    *r = f32x8::default();
-    *g = f32x8::default();
-    *b = f32x8::default();
-    *a = f32x8::default();
-
-    let one = f32x8::splat(1.0);
-    let start = -1.5;
-    let mut y = cy + f32x8::splat(start);
-    for j in 0..4 {
-        let mut x = cx + f32x8::splat(start);
-        for i in 0..4 {
-            let mut rr = f32x8::default();
-            let mut gg = f32x8::default();
-            let mut bb = f32x8::default();
-            let mut aa = f32x8::default();
-            sample(pixmap, ctx, x,y, &mut rr, &mut gg, &mut bb, &mut aa);
-
-            let w = wx[i] * wy[j];
-            *r = mad(w, rr, *r);
-            *g = mad(w, gg, *g);
-            *b = mad(w, bb, *b);
-            *a = mad(w, aa, *a);
-
-            x += one;
-        }
-
-        y += one;
-    }
-}
-
-#[inline(always)]
-fn sample(
-    pixmap: PixmapRef, ctx: &super::SamplerCtx, mut x: f32x8, mut y: f32x8,
-    r: &mut f32x8, g: &mut f32x8, b: &mut f32x8, a: &mut f32x8,
-) {
-    x = tile(x, ctx.spread_mode, pixmap.width() as f32, ctx.inv_width);
-    y = tile(y, ctx.spread_mode, pixmap.height() as f32, ctx.inv_height);
-
-    let ix = gather_ix(pixmap, x, y);
-    load_8888(&pixmap.gather(ix), r, g, b, a);
 }
 
 #[inline(always)]
@@ -1009,18 +1015,93 @@ fn repeat_x1(p: &mut Pipeline) {
     p.next_stage();
 }
 
-fn gradient(p: &mut Pipeline) {
+pub fn gradient(p: &mut Pipeline) {
+    gradient_colors(p);
+
+    p.next_stage();
+}
+
+/// `gradient` followed by `premultiply`, as one stage.
+///
+/// Gradients with translucent stops push `Premultiply` right after
+/// `Gradient`; `RasterPipelineBuilder::compile` fuses the pair for highp,
+/// which saves a stage call and a store and reload of the four channels per
+/// eight pixels. The arithmetic is `premultiply`'s.
+pub fn gradient_premultiply(p: &mut Pipeline) {
+    gradient_colors(p);
+
+    p.r *= p.a;
+    p.g *= p.a;
+    p.b *= p.a;
+
+    p.next_stage();
+}
+
+/// The `gradient` stage's colours, left in `r, g, b, a`.
+#[inline(always)]
+fn gradient_colors(p: &mut Pipeline) {
     let ctx = &p.ctx.gradient;
 
     // N.B. The loop starts at 1 because idx 0 is the color to use before the first stop.
     let t: [f32; 8] = p.r.into();
     let mut idx = u32x8::default();
-    for i in 1..ctx.len {
+    // The stops past the first, as one slice: indexing `t_values[i]` per stop
+    // was a bounds check per stop per call. `t_values` holds `len` entries
+    // (see `Gradient::push_stages`), so this is the same `1..len`.
+    let stops = ctx.t_values.get(1..ctx.len).unwrap_or(&[]);
+
+    // The usual group sits between two stops. `group_intervals` finds that
+    // with one scan of the stops against the group's largest `t` and one
+    // compare of its smallest, and then the per-lane count below (a compare
+    // of all eight lanes against every stop) is not needed. Its result is
+    // the same index the count gives each lane.
+    match group_intervals(stops, &t) {
+        Intervals::One(k) => {
+            if let (Some(factor), Some(bias)) = (ctx.factors.get(k), ctx.biases.get(k)) {
+                let t = p.r;
+                p.r = mad(t, f32x8::splat(factor.r), f32x8::splat(bias.r));
+                p.g = mad(t, f32x8::splat(factor.g), f32x8::splat(bias.g));
+                p.b = mad(t, f32x8::splat(factor.b), f32x8::splat(bias.b));
+                p.a = mad(t, f32x8::splat(factor.a), f32x8::splat(bias.a));
+                return;
+            }
+        }
+        // A group that straddles one stop (small shapes, many stops, and
+        // Reflect/Repeat make these common: 37% of groups in a scene of 196
+        // small conical gradients) has lanes in interval `k` and lanes in
+        // `k + 1`. Both lines are evaluated for all eight lanes and each lane
+        // keeps the one its own count selects (`t >= split`): the same
+        // `t * factor + bias` per lane as `gradient_lookup`, without its 64
+        // bounds-checked scalar loads.
+        Intervals::Two(k, split) => {
+            if let (Some(f0), Some(b0), Some(f1), Some(b1)) = (
+                ctx.factors.get(k),
+                ctx.biases.get(k),
+                ctx.factors.get(k + 1),
+                ctx.biases.get(k + 1),
+            ) {
+                let t = p.r;
+                let upper = t.cmp_ge(f32x8::splat(split));
+                let line = |f: f32, b: f32, f_up: f32, b_up: f32| {
+                    upper.blend(mad(t, f32x8::splat(f_up), f32x8::splat(b_up)),
+                                mad(t, f32x8::splat(f), f32x8::splat(b)))
+                };
+                p.r = line(f0.r, b0.r, f1.r, b1.r);
+                p.g = line(f0.g, b0.g, f1.g, b1.g);
+                p.b = line(f0.b, b0.b, f1.b, b1.b);
+                p.a = line(f0.a, b0.a, f1.a, b1.a);
+                return;
+            }
+        }
+        Intervals::Many => {}
+    }
+
+    for stop in stops {
         // `black_box` keeps LLVM from vectorising this loop across the stops
         // (eight accumulators, then eight horizontal sums per call); with the
         // stop opaque it compares all eight lanes against one stop at a time.
         // Only here: in the lowp stage the same hint measured slower.
-        let tt = core::hint::black_box(ctx.t_values[i].get());
+        let tt = core::hint::black_box(stop.get());
         let n: u32x8 = u32x8::from([
             (t[0] >= tt) as u32,
             (t[1] >= tt) as u32,
@@ -1053,8 +1134,56 @@ fn gradient(p: &mut Pipeline) {
         }
         _ => gradient_lookup(ctx, &idx, p.r, &mut p.r, &mut p.g, &mut p.b, &mut p.a),
     }
+}
 
-    p.next_stage();
+/// How the eight lanes of a gradient group fall into the stop intervals.
+enum Intervals {
+    /// Every lane is in interval `k`.
+    One(usize),
+    /// Lanes with `t >= split` are in interval `k + 1`, the others in `k`.
+    Two(usize, f32),
+    /// More than two intervals, or a NaN lane: count each lane.
+    Many,
+}
+
+/// The intervals the eight lanes of `t` fall in, when that is one or two.
+///
+/// A lane's index is the number of `stops` it is `>=` (the count in
+/// `gradient_colors`). `Gradient::push_stages` builds the stops
+/// non-decreasing, so that count is monotone in `t` and is the length of the
+/// prefix of stops at or below it. With `lo <= t <= hi` for every lane, every
+/// lane's count lies between `lo`'s and `hi`'s. When `lo` already reaches the
+/// last stop `hi` reaches (`stops[k - 1]`), the two counts are equal and so is
+/// every lane's; when it reaches only the stop before (`stops[k - 2]`), each
+/// lane's count is `k - 1` or `k`, and it is `k` exactly when the lane reaches
+/// `stops[k - 1]`. A NaN lane (whose count is 0) is left to the per-lane path.
+#[inline(always)]
+fn group_intervals(stops: &[NormalizedF32], t: &[f32; STAGE_WIDTH]) -> Intervals {
+    let mut lo = t[0];
+    let mut hi = t[0];
+    let mut nan = t[0].is_nan();
+    for &v in &t[1..] {
+        lo = if v < lo { v } else { lo };
+        hi = if v > hi { v } else { hi };
+        nan |= v.is_nan();
+    }
+    if nan {
+        return Intervals::Many;
+    }
+
+    let k = stops.iter().take_while(|stop| hi >= stop.get()).count();
+    let Some(last) = k.checked_sub(1) else {
+        return Intervals::One(0);
+    };
+    let split = stops[last].get();
+    if lo >= split {
+        return Intervals::One(k);
+    }
+    match last.checked_sub(1).map(|i| stops[i].get()) {
+        None => Intervals::Two(0, split),
+        Some(before) if lo >= before => Intervals::Two(last, split),
+        Some(_) => Intervals::Many,
+    }
 }
 
 fn gradient_lookup(
@@ -1412,9 +1541,15 @@ fn store_8888_tail(
     r: &f32x8, g: &f32x8, b: &f32x8, a: &f32x8,
     tail: usize, data: &mut [u8],
 ) {
-    for (px, v) in data.chunks_exact_mut(4).zip(pack_8888(r, g, b, a)).take(tail) {
-        px.copy_from_slice(&v.to_le_bytes());
-    }
+    // All eight pixels are packed as vectors into a buffer and the tail's
+    // bytes copied out. Packing inside the per-pixel loop let LLVM sink the
+    // conversion into it and redo it lane by lane in scalar code for every
+    // pixel written. The same words reach the same bytes (at most `tail`
+    // whole pixels, and never past the end of `data`).
+    let mut buf = [0u8; STAGE_WIDTH * 4];
+    store_8888(r, g, b, a, &mut buf);
+    let n = tail.min(STAGE_WIDTH).min(data.len() / 4) * 4;
+    data[..n].copy_from_slice(&buf[..n]);
 }
 
 /// The eight pixels as `r | g << 8 | b << 16 | a << 24`, i.e. the pixmap's
@@ -1556,5 +1691,70 @@ mod tests {
                 assert_eq!(dst, expected, "len {len} opacity {opacity:?}");
             }
         }
+    }
+
+    /// `group_intervals` against the per-lane count it stands in for: every
+    /// lane's count must be the one `One`/`Two` claims. Groups are drawn from
+    /// the stops themselves, their neighbouring floats, and random values, so
+    /// lanes land exactly on stops (the `t >= split` boundary) and on hard
+    /// stops (repeated positions).
+    #[test]
+    fn group_intervals_matches_lane_counts() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let count = |stops: &[NormalizedF32], t: f32| stops.iter().filter(|s| t >= s.get()).count();
+        let (mut ones, mut twos) = (0, 0);
+        for case in 0..4000 {
+            let n = 1 + (next() % 6) as usize;
+            let mut pos: Vec<f32> = (0..n).map(|_| (next() % 1000) as f32 / 999.0).collect();
+            if case % 5 == 0 && n > 1 {
+                pos[1] = pos[0]; // a hard stop
+            }
+            pos.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let stops: Vec<NormalizedF32> = pos.iter().map(|&p| NormalizedF32::new_clamped(p)).collect();
+            let pick = |r: u64| -> f32 {
+                let s = pos[(r as usize / 7) % n];
+                match r % 7 {
+                    0 => s,
+                    1 => f32::from_bits(s.to_bits().wrapping_add(1)),
+                    2 => f32::from_bits(s.to_bits().wrapping_sub(1)),
+                    3 => s + 0.01,
+                    4 => s - 0.01,
+                    5 => (r % 10_000) as f32 / 9_999.0,
+                    _ => -0.0,
+                }
+            };
+            let base = pick(next());
+            let mut t = [0.0f32; STAGE_WIDTH];
+            for v in &mut t {
+                *v = if next() % 3 == 0 { base } else { pick(next()) };
+            }
+            if case % 97 == 0 {
+                t[3] = f32::NAN;
+            }
+            match group_intervals(&stops, &t) {
+                Intervals::One(k) => {
+                    ones += 1;
+                    for &v in &t {
+                        assert_eq!(count(&stops, v), k, "One({k}) stops {pos:?} t {t:?}");
+                    }
+                }
+                Intervals::Two(k, split) => {
+                    twos += 1;
+                    for &v in &t {
+                        let want = if v >= split { k + 1 } else { k };
+                        assert_eq!(count(&stops, v), want, "Two({k}, {split}) stops {pos:?} t {t:?}");
+                    }
+                }
+                Intervals::Many => {}
+            }
+        }
+        // The cases must reach both fast paths.
+        assert!(ones > 30 && twos > 100, "ones {ones} twos {twos}");
     }
 }
