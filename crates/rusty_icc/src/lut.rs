@@ -536,8 +536,10 @@ impl ClutEval {
         let p = clamp01(x) * (g - 1) as f64;
         // `p` is in `0..=g-1` (clamped above), so truncation is the floor;
         // `f64::floor` is a libm call on baseline x86-64 (no SSE4.1
-        // `roundsd`), the cast is one `cvttsd2si`.
-        let i0 = (p as usize).min(g - 1);
+        // `roundsd`). The conversion goes through `i64` (one `cvttsd2si`):
+        // for a value in that range it is the same index as the saturating
+        // `as usize`, which is a dozen instructions on x86-64.
+        let i0 = (p as i64 as usize).min(g - 1);
         (i0, p - i0 as f64)
     }
 
@@ -733,6 +735,42 @@ mod tests {
             let mut b2 = [0.0; 16];
             c.eval_axes(&axes, &mut b2);
             assert_eq!(a.map(f64::to_bits), b2.map(f64::to_bits));
+        }
+    }
+
+    #[test]
+    fn axis_matches_the_saturating_cast_form() {
+        // The form released in 0.1.1.
+        let old = |g: usize, x: f64| {
+            let p = clamp01(x) * (g - 1) as f64;
+            let i0 = (p as usize).min(g - 1);
+            (i0, p - i0 as f64)
+        };
+        let mut xs: Vec<f64> = (-50..=1050).map(|i| f64::from(i) / 1000.0).collect();
+        xs.extend([
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -0.0,
+            1.0 - f64::EPSILON,
+            1.0 + f64::EPSILON,
+            f64::MIN_POSITIVE,
+            1.0e300,
+        ]);
+        for g in [2usize, 3, 9, 17, 33, 129, 255, 4096, 65536] {
+            for i in 0..g {
+                let x = i as f64 / (g - 1) as f64;
+                xs.extend([
+                    x,
+                    f64::from_bits(x.to_bits().wrapping_sub(1)),
+                    f64::from_bits(x.to_bits() + 1),
+                ]);
+            }
+            for &x in &xs {
+                let (a, b) = (ClutEval::axis(g, x), old(g, x));
+                assert_eq!((a.0, a.1.to_bits()), (b.0, b.1.to_bits()), "g={g} x={x}");
+            }
+            xs.truncate(1109);
         }
     }
 
