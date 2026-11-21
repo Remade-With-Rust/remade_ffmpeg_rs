@@ -8,7 +8,10 @@ DST=${2:-/root/iccbench/rusty_icc}
 mkdir -p "$DST"
 # --checksum without -t: changed files get a fresh mtime, so cargo never
 # misses an edit because of clock skew between Windows and WSL.
-rsync -rl --checksum --delete --exclude target --exclude 'bench-lcms/target' "$SRC"/ "$DST"/
+# The copy's own Cargo.lock is kept: without it every build re-resolved the
+# dev-dependencies (a crates.io index update behind the shared package-cache
+# lock, and room for two arms to link different dependency versions).
+rsync -rl --checksum --delete --exclude target --exclude 'bench-lcms/target'   --exclude /Cargo.lock "$SRC"/ "$DST"/
 # Outside the repo workspace the inherited dev-dependency cannot resolve.
 sed -i 's/^rusty_alloc-api.workspace = true/rusty_alloc-api = "2.5.0"/' "$DST/Cargo.toml"
 echo "synced to $DST"
