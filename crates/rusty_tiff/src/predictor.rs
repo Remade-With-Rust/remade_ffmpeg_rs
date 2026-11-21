@@ -323,10 +323,15 @@ pub(crate) fn apply_float(buf: &mut [u8], row_bytes: usize, spp: usize, bytes: u
         }
         // (A row cut inside a sample: the cut bytes count as zero.)
         tmp.resize(n, 0);
-        for i in (spp..n).rev() {
-            tmp[i] = tmp[i].wrapping_sub(tmp[i - spp]);
+        // Difference out of place, from the planes back into the row: no
+        // byte read was written by this pass, so it runs forward and
+        // vectorises (and the row is not copied a second time). In place,
+        // back to front, then copied back, it was 12 Ir a byte.
+        let k = spp.min(n);
+        row[..k].copy_from_slice(&tmp[..k]);
+        for ((d, &a), &p) in row[k..].iter_mut().zip(&tmp[k..]).zip(&tmp[..n - k]) {
+            *d = a.wrapping_sub(p);
         }
-        row.copy_from_slice(&tmp[..n]);
     }
 }
 
