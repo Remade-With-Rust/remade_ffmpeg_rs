@@ -61,6 +61,12 @@ pub(crate) enum Op {
     /// (sRGB-shaped): the same values, without a `pow` per value for the
     /// curve's break point.
     InvBreakCurves(Vec<InvCurve>),
+    /// [`Op::InvBreakCurves`] when every curve is a regular function-3 one
+    /// (the sRGB curves at the device end of a chain through a LUT),
+    /// evaluated in line: the same values, without a call and the tests on
+    /// the curve kind per value, and with the reciprocal exponent worked out
+    /// once.
+    InvSegs(Vec<InvSeg>),
     /// Grey `Y` to D50 XYZ (1 to 3 channels).
     GrayToXyz,
     /// Grey value as `L*/100` to Lab (1 to 3 channels).
@@ -153,6 +159,11 @@ fn run(ops: &[Op], v: &mut [f64; 16], mut n: usize) -> usize {
                 }
             }
             Op::InvBreakCurves(cs) => {
+                for (x, c) in v.iter_mut().zip(cs) {
+                    *x = c.eval(*x);
+                }
+            }
+            Op::InvSegs(cs) => {
                 for (x, c) in v.iter_mut().zip(cs) {
                     *x = c.eval(*x);
                 }
@@ -945,6 +956,17 @@ pub(crate) fn build_chain(
     intents: &[Intent],
     bpc: &[bool],
 ) -> Result<Chain> {
+    let mut chain = link_ops(profiles, intents, bpc)?;
+    // A matrix/TRC pair keeps its curve ops as they are: the fused `f32`
+    // loop reads them through `Chain::as_shaper`.
+    if chain.as_shaper().is_none() {
+        prepare_curves(&mut chain.ops);
+    }
+    Ok(chain)
+}
+
+/// [`build_chain`] before its curve ops are prepared.
+fn link_ops(profiles: &[&Profile], intents: &[Intent], bpc: &[bool]) -> Result<Chain> {
     let first = profiles
         .first()
         .ok_or(Error::InvalidTransform("no profiles"))?;
@@ -1034,6 +1056,20 @@ pub(crate) fn build_chain(
         out_ch,
         shaper,
     })
+}
+
+/// Replaces curve stages by forms evaluated in line where every curve of the
+/// stage allows it (the same values: see [`InvSeg`]).
+fn prepare_curves(ops: &mut [Op]) {
+    for op in ops {
+        if let Op::InvBreakCurves(cs) = op {
+            if let Some(segs) = cs.iter().map(InvSeg::new).collect::<Option<Vec<_>>>() {
+                if !segs.is_empty() {
+                    *op = Op::InvSegs(segs);
+                }
+            }
+        }
+    }
 }
 
 /// Device values of `src` to L*a*b* as they would arrive at `proof`, then
@@ -1241,6 +1277,78 @@ mod tests {
         }
         // The prepared table op is reached by these profiles.
         assert!(sampled > 0);
+    }
+
+    /// Chains through LUT profiles with prepared curve ops against the same
+    /// chains with every op left as built, bit for bit.
+    #[test]
+    fn prepared_chain_curves_match_the_plain_ops_bit_for_bit() {
+        let srgb = Profile::new_srgb();
+        let lab = Profile::new_lab_identity();
+        let cgats =
+            Profile::new_from_slice(include_bytes!("../tests/data/CGATS001Compat-v2-micro.icc"))
+                .unwrap();
+        let v4 =
+            Profile::new_from_slice(include_bytes!("../tests/data/sRGB_v4_ICC_preference.icc"))
+                .unwrap();
+        let rel = Intent::RelativeColorimetric;
+        let per = Intent::Perceptual;
+        let (mut inv, mut chains) = (0, 0);
+        for (a, b, intent) in [
+            (&srgb, &lab, rel),
+            (&lab, &srgb, rel),
+            (&srgb, &cgats, rel),
+            (&cgats, &srgb, per),
+            (&srgb, &v4, per),
+            (&v4, &srgb, rel),
+        ] {
+            // The micro test profiles are one-directional.
+            let Ok(chain) = build_chain(&[a, b], &[intent, intent], &[false, false]) else {
+                continue;
+            };
+            chains += 1;
+            assert!(chain.as_shaper().is_none());
+            // The ops as linked, before `prepare_curves`.
+            let plain = link_ops(&[a, b], &[intent, intent], &[false, false]).unwrap();
+            assert_eq!(plain.ops.len(), chain.ops.len());
+            for op in &chain.ops {
+                inv += usize::from(matches!(op, Op::InvSegs(_)));
+            }
+            let coords = [
+                -0.25,
+                0.0,
+                0.01,
+                0.04,
+                0.33,
+                0.5,
+                0.77,
+                0.999,
+                1.0,
+                1.5,
+                f64::NAN,
+            ];
+            let n = chain.in_ch;
+            for k in 0..coords.len().pow(n as u32) {
+                let mut input = [0.0; 16];
+                for (c, x) in input.iter_mut().enumerate().take(n) {
+                    *x = coords[(k / coords.len().pow(c as u32)) % coords.len()];
+                }
+                let (mut want, mut got) = ([0.0; 16], [0.0; 16]);
+                plain.eval(&input, &mut want);
+                chain.eval(&input, &mut got);
+                let m = chain.out_ch;
+                assert_eq!(
+                    want[..m].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    got[..m].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{k}"
+                );
+            }
+            // The grid sampler reads the prepared head as it read the plain one.
+            if n == 3 {
+                assert_eq!(plain.sample_grid(9), chain.sample_grid(9));
+            }
+        }
+        assert!(inv > 0 && chains >= 4, "{inv} {chains}");
     }
 
     #[test]
