@@ -29,7 +29,12 @@ jpeg = ["dep:rusty_jpeg"]
 bytemuck = "1"
 # DEFLATE (compression 8 and 32946) through flate2's PURE-RUST zlib-rs backend,
 # the same backend rusty_png ships by default. No C zlib anywhere.
-flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+# At least 1.1.11: before it, flate2's zlib-rs backend zero-filled the WHOLE
+# spare capacity of the output Vec on every `decompress_vec` call. Strips
+# inflate onto the end of the image, so that was a memset of the rest of the
+# image per strip (1024 one-row strips of a 1536x1024 RGB image: 101 ms
+# against 26 ms to inflate them; the `tiff` crate took 30 ms).
+flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
 rusty_jpeg = { version = "0.4.8", optional = true }
 
 [dev-dependencies]

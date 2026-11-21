@@ -142,6 +142,43 @@ Where the gap now stands:
 - rusty_icc is scalar with no SIMD. Every integer output stays byte-identical
   to 0.1.0, so lcms2's fixed-point arithmetic is not an option without
   changing results.
+- These lcms2 numbers predate the second performance pass (below) and have
+  not been re-run since.
+
+### Against craft-cms and moxcms (after the second pass)
+
+Ratios are the other engine's time divided by rusty_icc's; above 1 means
+rusty_icc is faster. Output hashes equal 0.1.1's in all 17 cases, and every
+rusty_icc column of a 150-case dE00 table against LittleCMS's exact
+pipeline is unchanged to 4 decimals.
+
+| 1024x1024, one core | 0.1.1 | craft-cms (0.1.1 for reference) |
+|---|---:|---:|
+| sRGB -> FOGRA39 u8, perceptual / relative + BPC | 2.28 / 2.27 | 1.82 / 1.82 (0.66 / 0.65) |
+| FOGRA39 -> sRGB u8 | 3.04 | 2.74 (0.84) |
+| proof u8 | 2.17 | 2.53 (1.02) |
+| sRGB -> FOGRA39 u16 / sRGB -> P3 u16 | 1.68 / 1.11 | 1.83 / 1.95 (1.12 / 1.83) |
+| sRGB -> P3 f32 | 1.66 | 1.48 (1.01) |
+| sRGB -> P3 u8 / P3 -> sRGB u8 / sRGB -> linear Rec.2020 f32 | 1.11 / 1.11 / 1.54 | 1.00 / 1.08 / 1.02 |
+| **sRGB -> FOGRA39 f32, perceptual** | 1.24 | **0.82** (0.64) |
+| **FOGRA39 -> sRGB f32** | 1.46 | **0.98, level** (0.81) |
+| **proof f32** | 1.28 | **0.94** (0.77) |
+| `Transform::new` sRGB -> P3 / sRGB -> FOGRA39 | 4.30 / 1.49 | 1.68 / 1.25 |
+| **`Transform::new` FOGRA39 -> sRGB / proof** | 1.50 / 1.40 | **0.67 / 0.95** |
+
+8-bit CMYK now clearly beats craft-cms on one core, while float CMYK and
+float proofing are still behind it. craft-cms also splits rows over threads:
+with 4 cores its time divided by single-threaded rusty_icc's is
+**0.70 (sRGB -> FOGRA39 u8), 0.78 (sRGB -> P3 u16), 0.31 (sRGB -> FOGRA39 f32)
+and 0.36 (FOGRA39 -> sRGB f32)**. **moxcms 0.8.1 is still faster everywhere
+except proofing**: rusty_icc runs at 0.08-0.18x of it on matrix-shaper,
+0.53-0.94x on CMYK u8, 0.55x on CMYK u16 and 0.11-0.14x on float CMYK; proof
+u8 is 4.31x, because moxcms runs two transforms for a proof.
+
+Method: an independent run by a downstream team
+([PR #169 comment](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/169#issuecomment-7059019038)),
+PR head `32582737` against rusty_icc 0.1.1, craft-cms and moxcms 0.8.1, one
+pinned core, 20 alternating rounds, null arms 0.97-1.04.
 
 ### Performance pass (callgrind instruction counts)
 

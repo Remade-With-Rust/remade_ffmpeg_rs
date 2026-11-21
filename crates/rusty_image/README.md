@@ -45,11 +45,55 @@ and the same bytes (HDR floats bit for bit).
   `imagesize` does not recognise.
 - **Damaged input:** more than 17,000 truncated and bit-flipped copies decoded
   without a panic. A header claiming more than 1 GiB of pixels, or a BMP side
-  past 65,535, is refused before anything is allocated.
+  past 65,535, is refused before anything is allocated. Each decoder also
+  refuses, before allocating, an image whose declared size the bytes present
+  could not cover
+  ([PR #164](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/164)).
+  On 26,323 damaged BMP/DIB/CUR/ICO/TGA/QOI/HDR/PNM files the largest
+  allocation in one decode fell from 805 MB to 6.3 MB, and files allocating
+  over 16 MiB from 15 to 0, with no verdict or pixel changes
+  ([independent check](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/171#issuecomment-7059366157)).
+
+## Speed (after 0.1.1)
+
+A 22-commit instruction-count pass
+([PR #171](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/171)).
+Output is byte-identical to 0.1.1: all 17 timed workloads hash the same, the
+3,975-file intact set is identical, and 44,495 damaged files get the same
+verdicts and pixels. Ratios are the other decoder's time divided by
+rusty_image's; above 1 means rusty_image is faster.
+
+| decode unless noted, 1024x1024 | 0.1.1 | `image` 0.25.10 | craft-image-codecs |
+|---|---:|---:|---:|
+| BMP 1 / 2 / 4-bit palette | 1.96 / 1.73 / 1.66 | 1.63 / 1.49 / 1.48 | 1.28 / 1.27 / 1.46 |
+| BMP 8-bit grey / RLE8 | 1.29 / 1.17 | 1.62 / 2.07 | 1.57 / 2.09 |
+| BMP 24 / 32-bit | level / 1.07 | 2.05 / 1.96 | 2.04 / 1.95 |
+| TGA 32-bit RLE / 24-bit raw | level | 1.62 / 1.67 | 1.65 / 1.65 |
+| HDR RLE / flat | 1.11 / 1.15 | 1.08 / 1.13 | 1.42 / 1.83 |
+| QOI RGBA | 1.09 | 1.23 | 1.23 |
+| **QOI RGB** | level | **0.98** | **0.97 (level)** |
+| PPM 8 / 16-bit | level | level | 6.22 / 2.66 |
+| ICO encode: one PNG entry / BMP + PNG entries | 1.16 / 2.50 | 1.03 / 5.86 | n/a |
+
+"Level" against 0.1.1 means 0.97-1.03. craft-image-codecs uses `image`
+underneath for BMP, TGA, QOI and HDR and its own PNM reader, so its HDR
+column includes its wrapper's cost. The pass also fixed footer-less
+true-colour TGA files, which `probe` and `decode` used to miss (27 of 27 in
+the independent set now decode). The commits' own pinned walls were larger
+on the palette and 32-bit BMP rows; the table uses the independent figures.
+
+Method: an independent run by a downstream team
+([PR #171 comment](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/171#issuecomment-7059366157)),
+PR head `47c8594b`, one process per arm per round pinned to one core at High
+priority, 20 alternating rounds, minimum in-memory loop time, null arms
+0.97-1.02 (one flat-HDR null at 0.91, so read that row loosely). The pass's
+own instruction counts ran under
+[rusty_alloc](https://github.com/Remade-With-Rust/rusty_alloc), the house
+allocator.
 
 ## Against the C references (stb_image, qoi.h, ImageMagick 7, gdk-pixbuf)
 
-`bench-c/` decodes and encodes the same files with each engine, in one process (setup and method in `bench-c/README.md`).
+`bench-c/` decodes and encodes the same files with each engine, in one process (setup and method in `bench-c/README.md`). The speed tables in this section were measured before the pass above and have not been re-run.
 
 **Corpus:** 115 files.
 - 102 are small variants written by ImageMagick: every BMP depth (with and without RLE), core/V3/V5 headers, TGA raw/RLE/grey/colour-mapped, PNM ASCII and binary at 8 and 16-bit, PAM, HDR, QOI and ICO.
