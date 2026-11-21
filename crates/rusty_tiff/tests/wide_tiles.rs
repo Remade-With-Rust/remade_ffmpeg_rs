@@ -1,9 +1,12 @@
-//! Uncompressed 16-bit tiles with rows long enough to be read straight into
-//! the output (one vectored read per tile, no band). The oracle matrix uses
-//! 16- and 32-pixel tiles, which stay on the band path, so this file covers
-//! the direct path: against image-tiff in both byte orders, through readers
-//! that do and do not support vectored reads, and on short (truncated)
-//! tiles, whose missing bytes must read as zero exactly as on the band path.
+//! Uncompressed tiles, the two fast paths. Rows long enough are read straight
+//! into the output (one vectored read per tile, no band); the oracle matrix
+//! uses 16- and 32-pixel tiles, which stay on the band path, so this file
+//! covers the direct path: against image-tiff in both byte orders, through
+//! readers that do and do not support vectored reads, and on short
+//! (truncated) tiles, whose missing bytes must read as zero exactly as on
+//! the band path. Narrow tiles stored back to back are read a band at a
+//! time: covered against image-tiff, with tiles stored out of order, and
+//! with a short tile in a band.
 #![allow(clippy::pedantic)] // test harness code: oracle plumbing, not library API
 
 mod common;
@@ -11,7 +14,7 @@ mod common;
 use std::io::{BufReader, Cursor, IoSliceMut, Read, Seek, SeekFrom};
 
 use common::Rng;
-use rusty_tiff::encoder::{colortype, ColorType, Compression, TiffEncoder};
+use rusty_tiff::encoder::{colortype, ColorType, Compression, Predictor, TiffEncoder};
 use rusty_tiff::{Decoder, Limits};
 
 /// An uncompressed tiled image of random samples.
@@ -238,5 +241,114 @@ fn short_tiles_read_as_zero_past_their_bytes() {
                 "{name} tile {t} cut {cut} one buffer"
             );
         }
+    }
+}
+
+/// Narrow tiles (band path, read a band at a time when stored back to back):
+/// 16-bit and 8-bit, exact and padded, with and without the horizontal
+/// predictor on uncompressed data.
+fn narrow_files() -> Vec<(String, Vec<u8>)> {
+    fn one<C: ColorType>(
+        name: &str,
+        w: u32,
+        h: u32,
+        tw: u32,
+        th: u32,
+        pred: bool,
+        seed: u64,
+    ) -> (String, Vec<u8>)
+    where
+        C::Inner: From<u8>,
+    {
+        let mut r = Rng(seed);
+        let px: Vec<C::Inner> = (0..w as usize * h as usize * usize::from(C::SAMPLES))
+            .map(|_| C::Inner::from(r.next() as u8))
+            .collect();
+        let mut f = Cursor::new(Vec::new());
+        {
+            let mut e = TiffEncoder::new(&mut f).unwrap();
+            let mut i = e
+                .new_image::<C>(w, h)
+                .unwrap()
+                .with_compression(Compression::None);
+            if pred {
+                i = i.with_predictor(Predictor::Horizontal);
+            }
+            i.tiles(tw, th);
+            i.write_data(&px).unwrap();
+        }
+        (
+            format!("{name} {w}x{h} t{tw}x{th} pred {pred}"),
+            f.into_inner(),
+        )
+    }
+    vec![
+        one::<colortype::Gray16>("gray16", 200, 160, 48, 80, false, 1),
+        one::<colortype::Gray16>("gray16", 190, 150, 48, 80, false, 2),
+        one::<colortype::RGB16>("rgb16", 128, 96, 32, 32, false, 3),
+        one::<colortype::RGB16>("rgb16", 100, 70, 32, 32, true, 4),
+        one::<colortype::RGBA16>("rgba16", 64, 48, 16, 16, false, 5),
+        one::<colortype::RGB8>("rgb8", 100, 64, 16, 16, false, 6),
+        one::<colortype::Gray8>("gray8", 99, 33, 32, 16, true, 7),
+    ]
+}
+
+#[test]
+fn narrow_tile_bands_match_image_tiff_in_both_byte_orders() {
+    for (name, le) in narrow_files() {
+        let be = common::to_big_endian(&le).expect("uncompressed");
+        for (order, f) in [("LE", &le), ("BE", &be)] {
+            let ours = common::ours(f).unwrap_or_else(|e| panic!("{name} {order}: {e}"));
+            let theirs = common::theirs(f).unwrap_or_else(|e| panic!("{name} {order}: {e}"));
+            assert_eq!(ours, theirs, "{name} {order}");
+        }
+    }
+}
+
+/// The byte count list's position in the first IFD.
+fn list_of(f: &[u8], tag: u16, n_tiles: usize) -> usize {
+    let ifd = r32(f, 4) as usize;
+    let n = u16::from_le_bytes([f[ifd], f[ifd + 1]]) as usize;
+    let e = (0..n)
+        .map(|k| ifd + 2 + k * 12)
+        .find(|&e| u16::from_le_bytes([f[e], f[e + 1]]) == tag)
+        .unwrap();
+    if n_tiles == 1 {
+        e + 8
+    } else {
+        r32(f, e + 8) as usize
+    }
+}
+
+/// Tiles stored out of order (the first two of each band swapped in the
+/// file, offsets swapped to match) decode to the same pixels; a short tile
+/// in a band reads as zero past its bytes, as anywhere else.
+#[test]
+fn narrow_tile_bands_out_of_order_or_short() {
+    for (name, le) in narrow_files() {
+        let tiles = tiles_of(&le);
+        let want = decode(Cursor::new(&le));
+        let offs = list_of(&le, 324, tiles.len());
+        let cnts = list_of(&le, 325, tiles.len());
+        // Swap tiles 0 and 1 in storage (equal sizes: uncompressed).
+        let (o0, c0) = tiles[0];
+        let (o1, c1) = tiles[1];
+        assert_eq!(c0, c1, "{name}");
+        let mut swapped = le.clone();
+        swapped[o0..o0 + c0].copy_from_slice(&le[o1..o1 + c1]);
+        swapped[o1..o1 + c1].copy_from_slice(&le[o0..o0 + c0]);
+        swapped[offs..offs + 4].copy_from_slice(&(o1 as u32).to_le_bytes());
+        swapped[offs + 4..offs + 8].copy_from_slice(&(o0 as u32).to_le_bytes());
+        assert_eq!(decode(Cursor::new(&swapped)), want, "{name} swapped");
+        // Tile 1 cut short by 100 bytes.
+        let mut short = le.clone();
+        short[cnts + 4..cnts + 8].copy_from_slice(&((c1 - 100) as u32).to_le_bytes());
+        let mut oracle = le.clone();
+        oracle[o1 + c1 - 100..o1 + c1].fill(0);
+        assert_eq!(
+            decode(Cursor::new(&short)),
+            decode(Cursor::new(&oracle)),
+            "{name} short"
+        );
     }
 }

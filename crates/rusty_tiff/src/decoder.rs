@@ -1657,7 +1657,18 @@ fn tile_band_rows<R: Read + Seek>(
             .ok_or_else(too_big)?;
         band.clear();
         band.try_reserve_exact(need).map_err(|_| too_big())?;
-        for cx in 0..across {
+        let first = (cy * across) as usize;
+        let whole = rows == ch as usize
+            && read_band_whole(
+                s,
+                img,
+                first,
+                across as usize,
+                (ch, tile_row),
+                limits,
+                &mut band,
+            )?;
+        for cx in (0..across).filter(|_| !whole) {
             let at = band.len();
             decode_chunk_append(
                 s,
@@ -1849,13 +1860,20 @@ fn decode_chunk_append<R: Read + Seek>(
         };
         budget.chunk(n, real, expected)?;
     }
-    let buf = &mut dst[start..];
+    finish_chunk(&mut dst[start..], img, s.big_endian, chunk_row_bytes);
+    Ok(())
+}
+
+/// Byte order and predictor of decoded chunk data (whole rows of
+/// `chunk_row_bytes`, any number of them).
+fn finish_chunk(buf: &mut [u8], img: &Image, big_endian: bool, chunk_row_bytes: usize) {
+    let info = &img.info;
     let bytes = usize::from(info.bits_per_sample) / 8;
     let spp = usize::from(img.spp_chunk());
     match info.predictor {
         pred::FLOATING_POINT => predictor::undo_float(buf, chunk_row_bytes, spp, bytes),
         p => {
-            if s.big_endian != cfg!(target_endian = "big") {
+            if big_endian != cfg!(target_endian = "big") {
                 predictor::swap_bytes(buf, bytes);
             }
             if p == pred::HORIZONTAL {
@@ -1863,7 +1881,60 @@ fn decode_chunk_append<R: Read + Seek>(
             }
         }
     }
-    Ok(())
+}
+
+/// One band of uncompressed tiles stored back to back in the file, each
+/// whole (its byte count covers its rows) and all inside the image height:
+/// read with one read into `band` instead of one per tile, then given the
+/// same byte order, bit order, predictor and zero-fill accounting as
+/// `decode_chunk_append` gives each tile. Returns `false`, having changed
+/// nothing, for a band that is not like that (it then goes tile by tile,
+/// which also reports any bad tile exactly as before).
+///
+/// A tile read costs a seek and a read call (a system call for a `File`)
+/// plus the checks around it, which on narrow tiles is a large part of a
+/// tile: 48x80 gray16 tiles are 7.5 KB.
+fn read_band_whole<R: Read + Seek>(
+    s: &mut Stream<R>,
+    img: &Image,
+    first: usize,
+    across: usize,
+    (ch, tile_row): (u32, usize),
+    budget: &mut Budget<'_>,
+    band: &mut Vec<u8>,
+) -> TiffResult<bool> {
+    let info = &img.info;
+    if info.compression != compression::NONE {
+        return Ok(false);
+    }
+    let mut start = None;
+    let mut end = 0;
+    for idx in first..first + across {
+        let Ok((offset, n, expected)) = chunk_extent(s, img, idx, ch, tile_row, budget.limits)
+        else {
+            return Ok(false);
+        };
+        if (n as usize) < expected || start.is_some_and(|_| offset != end) {
+            return Ok(false);
+        }
+        start.get_or_insert(offset);
+        end = offset + expected as u64;
+    }
+    let Some(offset) = start else {
+        return Ok(false);
+    };
+    let at = band.len();
+    s.read_at_into(offset, (end - offset) as usize, band)?;
+    for idx in first..first + across {
+        let (_, n, expected) = chunk_extent(s, img, idx, ch, tile_row, budget.limits)?;
+        budget.chunk(n, expected, expected)?;
+    }
+    let buf = &mut band[at..];
+    if info.fill_order == 2 {
+        reverse_bits(buf);
+    }
+    finish_chunk(buf, img, s.big_endian, tile_row);
+    Ok(true)
 }
 
 /// Decode one JPEG strip or tile and append its rows to `dst`, each cut or
