@@ -531,15 +531,10 @@ fn convert_element(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut
         else {
             return;
         };
-        let mut pending = Vec::new();
-        if let Some(g) =
-            convert_group_into(node, state, false, cache, &mut pending, &mut |cache, g| {
-                convert_element(child, state, cache, g);
-            })
-        {
+        if let Some(g) = convert_group_into(node, state, false, cache, parent, &mut |cache, g| {
+            convert_element(child, state, cache, g);
+        }) {
             parent.children.push(Node::Group(Box::new(g)));
-        } else {
-            parent.children.append(&mut pending);
         }
         return;
     }
@@ -547,13 +542,10 @@ fn convert_element(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut
         convert_nested_svg(node, state, cache, parent);
         return;
     }
-    let mut pending = Vec::new();
-    if let Some(g) = convert_group_into(node, state, false, cache, &mut pending, &mut |cache, g| {
+    if let Some(g) = convert_group_into(node, state, false, cache, parent, &mut |cache, g| {
         convert_element_impl(tag, node, state, cache, g);
     }) {
         parent.children.push(Node::Group(Box::new(g)));
-    } else {
-        parent.children.append(&mut pending);
     }
 }
 
@@ -598,64 +590,34 @@ fn convert_clip_path_elements(clip: SvgNode, state: &State, cache: &mut Cache, p
             convert_use(node, state, cache, parent);
             continue;
         }
-        let mut pending = Vec::new();
-        if let Some(g) =
-            convert_group_into(node, state, false, cache, &mut pending, &mut |cache, g| {
-                if matches!(
-                    tag,
-                    EId::Rect
-                        | EId::Circle
-                        | EId::Ellipse
-                        | EId::Polyline
-                        | EId::Polygon
-                        | EId::Path
-                ) {
-                    if let Some(path) = convert_shape(node, state) {
-                        convert_path(node, path, state, cache, g);
-                    }
+        if let Some(g) = convert_group_into(node, state, false, cache, parent, &mut |cache, g| {
+            if matches!(
+                tag,
+                EId::Rect | EId::Circle | EId::Ellipse | EId::Polyline | EId::Polygon | EId::Path
+            ) {
+                if let Some(path) = convert_shape(node, state) {
+                    convert_path(node, path, state, cache, g);
                 }
-            })
-        {
+            }
+        }) {
             parent.children.push(Node::Group(Box::new(g)));
-        } else {
-            parent.children.append(&mut pending);
         }
     }
 }
 
-/// `convert_group` that hands unrequired groups' children to the caller
-/// through `pending` (the caller's group is borrowed by the closure scope).
+/// Converts `node` as a group whose content `collect` adds. A group that is
+/// not required (no opacity, transform, blend mode, isolation, clip path or
+/// mask of its own, and not a `g` or `use`) is never built: its content goes
+/// straight into `parent`. A required group is returned for the caller to
+/// place; `None` also means the element was dropped.
 fn convert_group_into(
     node: SvgNode,
     state: &State,
     force: bool,
     cache: &mut Cache,
-    pending: &mut Vec<Node>,
+    parent: &mut Group,
     collect: &mut dyn FnMut(&mut Cache, &mut Group),
 ) -> Option<Group> {
-    match convert_group_impl(node, state, force, cache, collect) {
-        GroupResult::Group(g) => Some(g),
-        GroupResult::Flatten(children) => {
-            *pending = children;
-            None
-        }
-        GroupResult::Drop => None,
-    }
-}
-
-enum GroupResult {
-    Group(Group),
-    Flatten(Vec<Node>),
-    Drop,
-}
-
-fn convert_group_impl(
-    node: SvgNode,
-    state: &State,
-    force: bool,
-    cache: &mut Cache,
-    collect: &mut dyn FnMut(&mut Cache, &mut Group),
-) -> GroupResult {
     let opacity = if state.in_clip_path {
         1.0
     } else {
@@ -668,6 +630,35 @@ fn convert_group_impl(
         .unwrap_or(BlendMode::SourceOver);
     let isolate = node.attribute(AId::Isolation).map(str::trim) == Some("isolate");
     let is_g_or_use = matches!(node.tag_name(), Some(EId::G | EId::Use));
+    let required = (opacity - 1.0).abs() > f32::EPSILON * 4.0
+        || !transform.is_identity()
+        || blend_mode != BlendMode::SourceOver
+        || isolate
+        || is_g_or_use
+        || force;
+
+    let clip_link = node.func_iri_attribute(AId::ClipPath);
+    let mask_link = if state.in_clip_path {
+        None
+    } else {
+        node.func_iri_attribute(AId::Mask)
+    };
+    // Filters are not implemented: a reference to a missing element
+    // disables rendering (as the spec and usvg require); a valid filter
+    // is ignored and the content drawn unfiltered (documented).
+    let filter_missing = !state.in_clip_path
+        && node.attribute(AId::Filter).is_some_and(|f| {
+            f.trim() != "none"
+                && values::func_iri(f).is_some()
+                && node.func_iri_attribute(AId::Filter).is_none()
+        });
+
+    if !required && clip_link.is_none() && mask_link.is_none() && !filter_missing {
+        // Nothing of its own to hold: the content is the parent's as it
+        // stands, in the same order.
+        collect(cache, parent);
+        return None;
+    }
 
     let mut g = Group {
         transform,
@@ -678,51 +669,26 @@ fn convert_group_impl(
     };
     collect(cache, &mut g);
 
-    let object_bbox = g.calculate_object_bbox();
-
     let mut clip_path = None;
-    if let Some(link) = node.func_iri_attribute(AId::ClipPath) {
-        clip_path = convert_clip_path(link, state, object_bbox, cache);
-        if clip_path.is_none() {
-            return GroupResult::Drop;
-        }
-    }
     let mut mask = None;
-    if !state.in_clip_path {
-        if let Some(link) = node.func_iri_attribute(AId::Mask) {
-            mask = convert_mask(link, state, object_bbox, cache);
-            if mask.is_none() {
-                return GroupResult::Drop;
-            }
+    if clip_link.is_some() || mask_link.is_some() {
+        let object_bbox = g.calculate_object_bbox();
+        if let Some(link) = clip_link {
+            clip_path = convert_clip_path(link, state, object_bbox, cache);
+            clip_path.as_ref()?;
         }
-        // Filters are not implemented: a reference to a missing element
-        // disables rendering (as the spec and usvg require); a valid filter
-        // is ignored and the content drawn unfiltered (documented).
-        if let Some(f) = node.attribute(AId::Filter) {
-            if f.trim() != "none"
-                && values::func_iri(f).is_some()
-                && node.func_iri_attribute(AId::Filter).is_none()
-            {
-                return GroupResult::Drop;
-            }
+        if let Some(link) = mask_link {
+            mask = convert_mask(link, state, object_bbox, cache);
+            mask.as_ref()?;
         }
     }
-
-    let required = (opacity - 1.0).abs() > f32::EPSILON * 4.0
-        || clip_path.is_some()
-        || mask.is_some()
-        || !transform.is_identity()
-        || blend_mode != BlendMode::SourceOver
-        || isolate
-        || is_g_or_use
-        || force;
-    if !required {
-        return GroupResult::Flatten(std::mem::take(&mut g.children));
+    if filter_missing {
+        return None;
     }
     g.clip_path = clip_path;
     g.mask = mask;
     g.calculate_bounding_boxes();
-    GroupResult::Group(g)
+    Some(g)
 }
 
 fn parse_blend_mode(v: &str) -> Option<BlendMode> {
@@ -2000,17 +1966,11 @@ fn convert_use(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Gro
         }
         if let Some(clip_rect) = get_clip_rect(node, child, &use_state) {
             let mut g = clip_element(clip_rect, orig_ts);
-            let mut pending = Vec::new();
-            if let Some(mut g2) = convert_group_into(
-                node,
-                &use_state,
-                true,
-                cache,
-                &mut pending,
-                &mut |cache, g2| {
+            if let Some(mut g2) =
+                convert_group_into(node, &use_state, true, cache, &mut g, &mut |cache, g2| {
                     use_convert_children(child, new_ts, &use_state, cache, g2);
-                },
-            ) {
+                })
+            {
                 g2.transform = Transform::identity();
                 g.children.push(Node::Group(Box::new(g2)));
             }
@@ -2024,21 +1984,13 @@ fn convert_use(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Gro
     }
     orig_ts = orig_ts.pre_concat(new_ts);
     if linked_to_symbol {
-        let mut pending = Vec::new();
-        if let Some(mut g) = convert_group_into(
-            node,
-            &use_state,
-            false,
-            cache,
-            &mut pending,
-            &mut |cache, g| {
+        if let Some(mut g) =
+            convert_group_into(node, &use_state, false, cache, parent, &mut |cache, g| {
                 use_convert_children(child, orig_ts, &use_state, cache, g);
-            },
-        ) {
+            })
+        {
             g.transform = Transform::identity();
             parent.children.push(Node::Group(Box::new(g)));
-        } else {
-            parent.children.append(&mut pending);
         }
     } else {
         if child.tag_name() == Some(EId::Svg) {
@@ -2128,30 +2080,19 @@ fn use_convert_children(
     parent: &mut Group,
 ) {
     let required = !transform.is_identity();
-    let mut pending = Vec::new();
-    let r = convert_group_into(
-        node,
-        state,
-        required,
-        cache,
-        &mut pending,
-        &mut |cache, g| {
-            g.transform = transform;
-            if state.in_clip_path {
-                convert_clip_path_elements(node, state, cache, g);
-            } else {
-                convert_children(node, state, cache, g);
-            }
-        },
-    );
+    let r = convert_group_into(node, state, required, cache, parent, &mut |cache, g| {
+        if state.in_clip_path {
+            convert_clip_path_elements(node, state, cache, g);
+        } else {
+            convert_children(node, state, cache, g);
+        }
+    });
     if let Some(mut g) = r {
-        // `convert_group` recomputed the transform from the attribute; the
-        // closure set the use transform first, so restore it.
+        // `convert_group_into` took the transform from the attribute; the
+        // group carries the `use` transform instead.
         g.transform = transform;
         g.calculate_bounding_boxes();
         parent.children.push(Node::Group(Box::new(g)));
-    } else {
-        parent.children.append(&mut pending);
     }
 }
 
