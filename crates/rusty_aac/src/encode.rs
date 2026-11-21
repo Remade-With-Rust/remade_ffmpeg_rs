@@ -565,12 +565,36 @@ fn masking_from_energy(
     n_coeffs: usize,
     tonality: Option<&[f32]>,
 ) -> Vec<f64> {
+    let spread = spread_energy(energy, swb, sample_rate, n_coeffs);
+    masking_from_spread(&spread, swb, sample_rate, n_coeffs, tonality)
+}
+
+/// Each band's spread energy: every band's energy as it reaches this band on
+/// the Bark scale, its own included at full weight.
+fn spread_energy(energy: &[f64], swb: &[u16], sample_rate: u32, n_coeffs: usize) -> Vec<f64> {
     let num_swb = swb.len() - 1;
     let mat = spreading_matrix(swb, sample_rate, n_coeffs);
     (0..num_swb)
         .map(|i| {
             let row = &mat[i * num_swb..(i + 1) * num_swb];
-            let spread: f64 = (0..num_swb).map(|j| energy[j] * row[j]).sum();
+            (0..num_swb).map(|j| energy[j] * row[j]).sum()
+        })
+        .collect()
+}
+
+/// The mask from [`spread_energy`]: a signal-to-mask ratio below the spread
+/// signal, floored at the threshold of hearing.
+fn masking_from_spread(
+    spread: &[f64],
+    swb: &[u16],
+    sample_rate: u32,
+    n_coeffs: usize,
+    tonality: Option<&[f32]>,
+) -> Vec<f64> {
+    let num_swb = swb.len() - 1;
+    (0..num_swb)
+        .map(|i| {
+            let spread = spread[i];
             let smr = match tonality {
                 None => SMR_FLAT,
                 Some(t) => {
@@ -761,7 +785,16 @@ pub(crate) fn band_tonality(spec: &[f32], swb: &[u16], nwin: usize, wlen: usize)
     out
 }
 
-fn perceptual_offsets(spec: &[f32], swb: &[u16], sample_rate: u32, tonality_smr: bool) -> Offsets {
+/// The long-block psy model: per-band offsets from the masking thresholds,
+/// the starved-frame reduction (see [`Offsets`]) and the [`peak_hold`] caps,
+/// which need the channel's `target_bits` to bound what they ask for.
+fn perceptual_offsets(
+    spec: &[f32],
+    swb: &[u16],
+    sample_rate: u32,
+    tonality_smr: bool,
+    target_bits: usize,
+) -> Offsets {
     let _prof = prof::scope(Stage::EncPsy);
     let num_swb = swb.len() - 1;
     let mut energy = vec![0.0f64; num_swb];
@@ -774,19 +807,30 @@ fn perceptual_offsets(spec: &[f32], swb: &[u16], sample_rate: u32, tonality_smr:
             + 1e-3;
     }
     let ton = tonality_smr.then(|| band_tonality(spec, swb, 1, FRAME_LEN));
-    let thr = masking_from_energy(&energy, swb, sample_rate, FRAME_LEN, ton.as_deref());
+    let spread = spread_energy(&energy, swb, sample_rate, FRAME_LEN);
+    let thr = masking_from_spread(&spread, swb, sample_rate, FRAME_LEN, ton.as_deref());
 
     let mut raw = vec![0.0f64; num_swb];
+    let mut noise_scale = vec![0.0f64; num_swb];
     for sfb in 0..num_swb {
         let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
         energy[sfb] = spec[s..e].iter().map(|&x| f64::from(x).powi(2)).sum();
-        let noise_scale: f64 = spec[s..e]
+        noise_scale[sfb] = spec[s..e]
             .iter()
             .map(|&x| f64::from(x.abs()).sqrt())
             .sum::<f64>()
             + 1e-6;
-        raw[sfb] = (thr[sfb] / noise_scale).log2() / 0.375;
+        raw[sfb] = (thr[sfb] / noise_scale[sfb]).log2() / 0.375;
     }
+    let cap = peak_hold(
+        spec,
+        swb,
+        sample_rate,
+        &energy,
+        &spread,
+        &noise_scale,
+        target_bits,
+    );
     // Center on the energy-bearing bands — empty bands have huge `thr/noise_scale`
     // (they quantize to ZERO anyway) and would otherwise skew a plain mean.
     let etot: f64 = energy.iter().sum::<f64>() + 1e-9;
@@ -804,12 +848,13 @@ fn perceptual_offsets(spec: &[f32], swb: &[u16], sample_rate: u32, tonality_smr:
     if thr_ref <= 0.0 {
         return Offsets::flat(off);
     }
-    let ratio = thr
+    let ratio: Vec<f32> = thr
         .iter()
         .map(|&t| ((t / thr_ref).sqrt().sqrt()).min(1.0) as f32)
         .collect();
     Offsets {
         off,
+        cap,
         ratio,
         thr_ref,
         // `raw + NMR0_SF_OFFSET` is where a band's noise meets its mask, so the
@@ -851,6 +896,9 @@ const NMR0_SF_OFFSET: f64 = 107.35;
 #[derive(Debug, Clone)]
 pub(crate) struct Offsets {
     off: Vec<i32>,
+    /// Per band, the highest scalefactor [`peak_hold`] allows (255 for none);
+    /// empty for no holds.
+    cap: Vec<i32>,
     /// Per band, `(thr / thr_ref)^¼` in `(0, 1]`; empty for no reduction
     /// (short blocks keep the uniform step).
     ratio: Vec<f32>,
@@ -875,6 +923,7 @@ impl Offsets {
     pub(crate) fn flat(off: Vec<i32>) -> Self {
         Self {
             off,
+            cap: Vec::new(),
             ratio: Vec::new(),
             thr_ref: 0.0,
             mask_base: i32::MAX,
@@ -882,12 +931,30 @@ impl Offsets {
     }
 
     /// The highest level the rate loop needs to search: every band at 255.
+    /// Past the family's top the caps are released one step a level, so any
+    /// budget, however small, stays reachable.
     pub(crate) fn max_level(&self) -> i32 {
+        self.top_level() + if self.cap.is_empty() { 0 } else { 255 }
+    }
+
+    /// The level at which every band without a hold has reached 255.
+    fn top_level(&self) -> i32 {
         if self.ratio.is_empty() || self.mask_base >= 255 {
             255
         } else {
             self.mask_base.max(0) + (255 - self.mask_base.max(0)) * STARVED_SUBSTEPS
         }
+    }
+
+    /// Apply the holds to the family's scalefactors at `level`.
+    fn held(&self, level: i32, mut sf: Vec<i32>) -> Vec<i32> {
+        if !self.cap.is_empty() {
+            let release = (level - self.top_level()).max(0);
+            for (s, &c) in sf.iter_mut().zip(&self.cap) {
+                *s = (*s).min((c + release).min(255));
+            }
+        }
+        sf
     }
 
     /// Share one reduction between the two channels of a pair coded at a common
@@ -914,23 +981,23 @@ impl Offsets {
     /// Per-band scalefactors at search level `level`, each clamped to the
     /// codeable range. Up to `mask_base` the level is the common base; past it,
     /// [`STARVED_SUBSTEPS`] levels make one base step for the loudest band, and
-    /// every other band rises by the reduction on top. Never below the uniform
-    /// `base + off[b]`, so [`min_base`]'s no-clamp floor holds, and
+    /// every other band rises by the reduction on top; a [`peak_hold`] cap then
+    /// bounds its band from above. Never below the uniform `base + off[b]` or,
+    /// for a held band, its cap, both at or over [`min_base`]'s no-clamp floor;
     /// non-decreasing in `level`, so the rate loop's search stays monotone.
     pub(crate) fn sf(&self, level: i32) -> Vec<i32> {
-        if level <= self.mask_base || self.ratio.is_empty() {
-            return self
-                .off
-                .iter()
-                .map(|&o| (level + o).clamp(0, 255))
-                .collect();
+        let fam = level.min(self.top_level());
+        if fam <= self.mask_base || self.ratio.is_empty() {
+            let sf = self.off.iter().map(|&o| (fam + o).clamp(0, 255)).collect();
+            return self.held(level, sf);
         }
-        let d = f64::from(level - self.mask_base) / f64::from(STARVED_SUBSTEPS);
+        let d = f64::from(fam - self.mask_base) / f64::from(STARVED_SUBSTEPS);
         let base = f64::from(self.mask_base) + d;
         // The loudest band's threshold rises by 2^(0.375·d), its fourth root by
         // u = 2^(0.09375·d), so r = u − 1 in units of that root.
         let u = (0.093_75 * d).exp2();
-        self.off
+        let sf = self
+            .off
             .iter()
             .zip(&self.ratio)
             .map(|(&o, &q)| {
@@ -939,8 +1006,103 @@ impl Offsets {
                 let extra = (4.0 / 0.375 * ((q + u - 1.0) / (q * u)).log2()).max(0.0);
                 ((base + f64::from(o) + extra).round() as i32).clamp(0, 255)
             })
-            .collect()
+            .collect();
+        self.held(level, sf)
     }
+}
+
+/// The SNR, in dB, at which [`peak_hold`] holds a dominant band.
+///
+/// Measured on the downstream 5.1 gate signal (a 0.25 tone per channel over
+/// 0.03 x uniform noise) and the 57-row PEAQ table, with
+/// [`PEAK_HOLD_DOMINANCE`] at 30: 24 dB gives 20.8 dB SNR at 320 kbps 5.1 and
+/// a PEAQ mean of +0.033 (33 rows better, 14 worse, worst -0.065); 27 dB gives
+/// 21.5 dB but worst row -0.091 and 20 rows worse.
+const PEAK_HOLD_SNR_DB: f64 = 24.0;
+
+/// How much a band's own energy must exceed what every other band spreads into
+/// it for [`peak_hold`] to hold it.
+///
+/// At 1, flat noise passes in nearly every band and the holds starve the tone
+/// (5.6 dB on the gate at 128 kbps 5.1); at 10, harmonic music passes too
+/// (guitar rows down to -0.36 ODG); at 100 or more, a tone straddling a band
+/// edge fails it and its channel's level drifts (+0.6..+0.85 dB on the #129
+/// repro). 30 separates the tones from both.
+const PEAK_HOLD_DOMINANCE: f64 = 30.0;
+
+/// The largest share of a frame's bits the holds may ask for; past it the
+/// hold SNR comes down for every held band alike. 0.15 and 0.25 measured the
+/// same; 0.08 cost the gate 2 dB at 128 kbps 5.1.
+const PEAK_HOLD_BIT_SHARE: f64 = 0.25;
+
+/// The narrow-band SNR floor: a per-band scalefactor cap that holds every
+/// *dominant* band (one whose own energy is at least [`PEAK_HOLD_DOMINANCE`]
+/// times what the other bands spread into it, i.e. a tone standing clear of
+/// its surroundings) at [`PEAK_HOLD_SNR_DB`], or at the threshold in quiet,
+/// whichever is coarser. Empty when no band qualifies.
+///
+/// Why: the uniform noise-to-mask family never lets a tone's band beat its
+/// 18 dB mask until every band of a broadband noise bed under it has reached
+/// its own mask too, about 144 kbps a channel for white noise. Below that, a
+/// tone over noise came back at a flat ~16 dB SNR from 128 to 512 kbps 5.1
+/// (88-96% of the error within 150 Hz of the tone), and its level swung by up
+/// to 0.6 dB with the rate. A cap costs a held band its share of the frame
+/// but no syntax: the scalefactor is the band's own.
+///
+/// The holds ask for about one bit a line per 6 dB; when that is more than
+/// [`PEAK_HOLD_BIT_SHARE`] of `target_bits`, the hold SNR is scaled down. A
+/// cap never goes under the band's no-clamp floor (see [`min_base`]). Long
+/// blocks only.
+fn peak_hold(
+    spec: &[f32],
+    swb: &[u16],
+    sample_rate: u32,
+    energy: &[f64],
+    spread: &[f64],
+    noise_scale: &[f64],
+    target_bits: usize,
+) -> Vec<i32> {
+    let num_swb = swb.len() - 1;
+    let dominant: Vec<bool> = (0..num_swb)
+        .map(|b| {
+            // `spread` was built from `energy + 1e-3`; what is left after the
+            // band's own part is what every other band spreads into it.
+            let others = (spread[b] - energy[b] - 1e-3).max(0.0);
+            energy[b] > 0.0 && energy[b] >= PEAK_HOLD_DOMINANCE * others
+        })
+        .collect();
+    if !dominant.iter().any(|&d| d) {
+        return Vec::new();
+    }
+    let lines: usize = (0..num_swb)
+        .filter(|&b| dominant[b])
+        .map(|b| usize::from(swb[b + 1] - swb[b]))
+        .sum();
+    let ask = lines as f64 * PEAK_HOLD_SNR_DB / 6.02;
+    let hold_db = PEAK_HOLD_SNR_DB * (PEAK_HOLD_BIT_SHARE * target_bits as f64 / ask).min(1.0);
+    let m = 10f64.powf(-hold_db / 10.0);
+    let ath = ath_long(swb, sample_rate, FRAME_LEN);
+    (0..num_swb)
+        .map(|b| {
+            if !dominant[b] {
+                return 255;
+            }
+            let (s, e) = (swb[b] as usize, swb[b + 1] as usize);
+            let noise = (energy[b] * m).max(ath[b]);
+            let cap = ((noise / noise_scale[b]).log2() / 0.375 + NMR0_SF_OFFSET).round();
+            // Never under the band's no-clamp floor (see `min_base`).
+            let maxp = spec[s..e]
+                .iter()
+                .fold(0f64, |a, &x| a.max(f64::from(x.abs())))
+                .powf(0.75);
+            let min_sf = if maxp <= 1e-9 {
+                0.0
+            } else {
+                (100.0 - (f64::from(MAX_QUANT) / maxp).log2() / 0.1875).ceil()
+            };
+            cap.max(min_sf).clamp(0.0, 255.0) as i32
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1886,7 +2048,7 @@ fn encode_channel_element(
 ) {
     // Pass 1, un-filtered: the TNS span depends on max_sfb, which only exists
     // after quantization. This pass exists to learn it.
-    let offsets0 = perceptual_offsets(spec, swb, sample_rate, psy.tonality_smr);
+    let offsets0 = perceptual_offsets(spec, swb, sample_rate, psy.tonality_smr, target_bits);
     let xp0 = Xpow::new(spec);
     let base0 = rate_loop(&xp0, swb, &offsets0, target_bits);
     let sf0 = scalefactors(&offsets0, base0);
@@ -1916,7 +2078,8 @@ fn encode_channel_element(
         let mut filtered = spec.to_vec();
         match tns_analyze_long(&mut filtered, swb, fs_index, max_sfb0) {
             Some(t) => {
-                let offsets = perceptual_offsets(&filtered, swb, sample_rate, psy.tonality_smr);
+                let offsets =
+                    perceptual_offsets(&filtered, swb, sample_rate, psy.tonality_smr, target_bits);
                 let xp = Xpow::new(&filtered);
                 let base = rate_loop(&xp, swb, &offsets, target_bits);
                 let sf = scalefactors(&offsets, base);
@@ -2906,7 +3069,7 @@ fn quantize_channel(
         let (_, _, _, quant, _) = code_frame_short(&xp, swb, &sf, groups);
         (sf, quant)
     } else {
-        let offsets = perceptual_offsets(spec, swb, sample_rate, psy.tonality_smr);
+        let offsets = perceptual_offsets(spec, swb, sample_rate, psy.tonality_smr, target_bits);
         let base = rate_loop(&xp, swb, &offsets, target_bits);
         let sf = scalefactors(&offsets, base);
         let (_, _, _, quant) = code_frame(&xp, swb, &sf);
@@ -3277,7 +3440,7 @@ fn encode_cpe(
             if is_short {
                 short_offsets(spec, swb, sample_rate, psy, &groups)
             } else {
-                perceptual_offsets(spec, swb, sample_rate, psy.tonality_smr)
+                perceptual_offsets(spec, swb, sample_rate, psy.tonality_smr, target_bits)
             }
         };
         let (mut o0, mut o1) = (off(&ch0), off(&ch1));
@@ -4846,10 +5009,10 @@ mod tests {
 
         let t = Instant::now();
         for _ in 0..iters {
-            let _ = perceptual_offsets(&spec, swb, sr, false);
+            let _ = perceptual_offsets(&spec, swb, sr, false, 3000);
         }
         let psy = t.elapsed();
-        let offsets = perceptual_offsets(&spec, swb, sr, false);
+        let offsets = perceptual_offsets(&spec, swb, sr, false, 3000);
 
         let t = Instant::now();
         for _ in 0..iters {
@@ -5238,7 +5401,7 @@ mod tests {
         };
 
         let flat = metric(&Offsets::flat(vec![0i32; swb.len() - 1]));
-        let psy = metric(&perceptual_offsets(&spec, swb, sr, false));
+        let psy = metric(&perceptual_offsets(&spec, swb, sr, false, 3000));
         eprintln!(
             "flat: max_nmr={:.2} mean={:.1}dB | psy: max_nmr={:.2} mean={:.1}dB",
             flat.0, flat.1, psy.0, psy.1
@@ -6593,6 +6756,111 @@ mod fidelity_129 {
         let kept = mid.clone();
         lfe_band_limit(&mut mid);
         assert_eq!(mid, kept);
+    }
+
+    /// The downstream 5.1 gate signal: one 0.25 tone per channel (500, 700, 900, 60,
+    /// 1300, 1700 Hz in L R C LFE Ls Rs order) with a slow swell, over
+    /// independent 0.03 x uniform(-0.5, 0.5) noise. `ch` = 1 is its first
+    /// channel alone.
+    fn tone_over_noise(n: usize, ch: usize, sr: u32) -> Vec<f32> {
+        let tones = [500.0f32, 700.0, 900.0, 60.0, 1300.0, 1700.0];
+        let mut seed = 0x1234_5678u32;
+        let mut v = vec![0f32; n * ch];
+        for i in 0..n {
+            let t = i as f32 / sr as f32;
+            let swell = 0.6 + 0.4 * (2.0 * std::f32::consts::PI * 0.7 * t).sin();
+            for (c, f) in tones.iter().enumerate().take(ch) {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = 0.03 * ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5);
+                v[i * ch + c] = 0.25 * swell * (2.0 * std::f32::consts::PI * f * t).sin() + noise;
+            }
+        }
+        v
+    }
+
+    /// Encode and decode `pcm`; return the SNR over all channels and the
+    /// level (dB, decoded RMS over source RMS) of each channel, over the clip
+    /// at the encoder's 1024-sample delay.
+    fn snr_levels(pcm: &[f32], ch: usize, sr: u32, kbps: u32) -> (f64, Vec<f64>) {
+        let mut dec = crate::decode::Decoder::new(sr);
+        let mut out: Vec<f32> = Vec::new();
+        for p in packets(pcm, ch, sr, kbps) {
+            out.extend(dec.decode(&p.data, None).expect("decode").samples);
+        }
+        let n = pcm.len() / ch;
+        let (mut sx, mut se) = (0f64, 0f64);
+        let mut levels = Vec::with_capacity(ch);
+        for c in 0..ch {
+            let (mut xx, mut yy) = (0f64, 0f64);
+            for i in 0..n {
+                let x = f64::from(pcm[i * ch + c]);
+                let y = f64::from(out[(i + FRAME_LEN) * ch + c]);
+                xx += x * x;
+                yy += y * y;
+                se += (y - x) * (y - x);
+            }
+            sx += xx;
+            levels.push(10.0 * (yy / xx).log10());
+        }
+        (10.0 * (sx / se).log10(), levels)
+    }
+
+    /// On a tone over noise the SNR rises with the bitrate, reaches 20 dB at
+    /// 320 kbps 5.1, and every channel keeps its level within 0.3 dB. Before
+    /// the narrow-band SNR floor ([`peak_hold`]) it sat at 15.8-16.9 dB from
+    /// 128 to 512 kbps 5.1 (15.6-18.3 dB from 32 to 128 kbps mono) and levels
+    /// swung by up to 0.6 dB.
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret")]
+    fn tone_over_noise_snr_rises_with_the_bitrate() {
+        let sr = 48_000u32;
+        let n = sr as usize * 2;
+        for (ch, rates, at_320) in [
+            (6, &[128, 192, 320, 512][..], true),
+            (1, &[32, 64, 96, 128, 192][..], false),
+        ] {
+            let pcm = tone_over_noise(n, ch, sr);
+            let mut last = f64::NEG_INFINITY;
+            for &kbps in rates {
+                let (snr, levels) = snr_levels(&pcm, ch, sr, kbps);
+                assert!(
+                    snr > last,
+                    "{ch} ch: {snr:.2} dB at {kbps} kbps, not above {last:.2} dB"
+                );
+                last = snr;
+                if at_320 && kbps == 320 {
+                    assert!(snr >= 20.0, "5.1 at 320 kbps: {snr:.2} dB");
+                }
+                if ch == 1 {
+                    assert!(snr >= 19.0, "mono at {kbps} kbps: {snr:.2} dB");
+                }
+                for (c, lv) in levels.iter().enumerate() {
+                    assert!(
+                        lv.abs() <= 0.3,
+                        "{ch} ch at {kbps} kbps: channel {c} level {lv:+.2} dB"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The #129 repro (tones over independent noise, every element busy)
+    /// keeps every channel within 0.5 dB from 128 to 320 kbps. Before the
+    /// narrow-band SNR floor Ls drifted by +0.8 to +1.0 dB at 128-192 kbps.
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret")]
+    fn every_repro_channel_keeps_its_level_at_128_to_320() {
+        let sr = 48_000u32;
+        let pcm = busy_5_1(sr as usize * 3, sr);
+        for kbps in [128, 192, 256, 320] {
+            let (_, levels) = snr_levels(&pcm, 6, sr, kbps);
+            for (c, lv) in levels.iter().enumerate() {
+                assert!(
+                    lv.abs() <= 0.5,
+                    "{kbps} kbps: channel {c} level {lv:+.2} dB"
+                );
+            }
+        }
     }
 
     /// The raw access units average the target bitrate, within 1%, and no
