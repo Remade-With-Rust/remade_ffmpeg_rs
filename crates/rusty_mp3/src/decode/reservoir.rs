@@ -45,6 +45,21 @@ impl Reservoir {
         &self.buf
     }
 
+    /// How many bytes the next frame can reach back into (at most 512).
+    #[must_use]
+    pub fn available(&self) -> usize {
+        self.buf.len().min(RESERVOIR_BYTES)
+    }
+
+    /// Take in the main data of a frame that is NOT decoded (its side
+    /// information is invalid), keeping what was carried before it: the
+    /// frames after it address the reservoir as if it had been.
+    pub fn carry(&mut self, frame_main_data: &[u8]) {
+        let keep = self.available();
+        self.buf.drain(..self.buf.len() - keep);
+        self.buf.extend_from_slice(frame_main_data);
+    }
+
     /// Drop carried-over state (seek / discontinuity).
     pub fn reset(&mut self) {
         self.buf.clear();

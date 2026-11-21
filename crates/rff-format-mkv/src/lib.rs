@@ -43,6 +43,8 @@
 //! frame header are still restored, since those are Matroska storage
 //! quirks, not the codec's stored form.
 
+#[cfg(test)]
+mod codec_tests;
 mod encoding;
 mod index;
 #[cfg(test)]
@@ -85,6 +87,9 @@ pub fn register(registry: &mut FormatRegistry) {
             CodecId::H264,
             CodecId::Hevc,
             CodecId::ProRes,
+            CodecId::DnxHd,
+            CodecId::Apv,
+            CodecId::Jpeg,
             CodecId::Opus,
             CodecId::Vorbis,
             CodecId::Aac,
@@ -157,6 +162,7 @@ const ID_PIXEL_HEIGHT: u32 = 0xBA;
 const ID_FRAME_RATE: u32 = 0x2383E3;
 const ID_AUDIO: u32 = 0xE1;
 const ID_SAMPLING_FREQUENCY: u32 = 0xB5;
+const ID_OUTPUT_SAMPLING_FREQUENCY: u32 = 0x78B5;
 const ID_CHANNELS: u32 = 0x9F;
 const ID_BIT_DEPTH: u32 = 0x6264;
 const ID_CODEC_DELAY: u32 = 0x56AA;
@@ -745,6 +751,7 @@ impl BlockHead {
 /// Per-track facts the block parsing, timing and frame shaping need — split
 /// from the reader so the index scan can borrow both. Every `Vec` is indexed
 /// by stream index.
+#[derive(Clone)]
 struct Tracks {
     /// Maps a Matroska track number to our 0-based stream index.
     track_map: Vec<(u64, usize)>,
@@ -767,6 +774,9 @@ struct Tracks {
     codings: Vec<Vec<encoding::Coding>>,
     /// Audio sample rate (DiscardPadding is converted to samples at it).
     sample_rate: Vec<u32>,
+    /// `A_PCM/INT/BIG`: bytes per sample to reverse into little-endian
+    /// (0: none).
+    pcm_swap: Vec<usize>,
     timestamp_scale: u64,
     /// [`Demuxer::set_raw_samples`]: no Annex-B conversion, no ASS reduction.
     raw: bool,
@@ -783,6 +793,7 @@ impl Tracks {
             codec_delay: Vec::new(),
             codings: Vec::new(),
             sample_rate: Vec::new(),
+            pcm_swap: Vec::new(),
             timestamp_scale: 1_000_000, // default: 1 ms
             raw: false,
         }
@@ -881,6 +892,11 @@ impl Tracks {
         }
         if self.raw {
             return Some(frame.to_vec());
+        }
+        if let Some(&n) = self.pcm_swap.get(index).filter(|&&n| n > 1) {
+            let mut le = frame.to_vec();
+            le.chunks_exact_mut(n).for_each(<[u8]>::reverse);
+            return Some(le);
         }
         Some(match self.avc.get(index).and_then(|a| a.as_ref()) {
             Some(cfg) => {
@@ -1008,7 +1024,9 @@ struct MkvDemuxer {
     /// Where the first Cluster's header starts (the index scan starts there).
     clusters_at: Option<u64>,
     /// The random-access index, built on the first `sample_index` call.
-    index: Option<index::Index>,
+    index: Option<std::sync::Arc<index::Index>>,
+    /// The seekable input, shared, for [`rff_format::SampleIndex::sample_source`].
+    shared: Option<rff_format::SharedInput>,
     parsed: bool,
     /// `Info` and global `Tags` ([`Demuxer::metadata`]).
     metadata: rff_core::Dictionary,
@@ -1022,7 +1040,11 @@ impl MkvDemuxer {
     /// Over a seekable input: the same streaming demuxer, plus random access.
     fn new_seekable(mut input: SeekInput) -> MkvDemuxer {
         let base = input.stream_position().unwrap_or(0);
-        MkvDemuxer::with_inner(Inner::Seek(input), base)
+        // Shared, so sample sources can read beside the packet walk.
+        let shared = rff_format::SharedInput::new(input);
+        let mut d = MkvDemuxer::with_inner(Inner::Seek(Box::new(shared.clone())), base);
+        d.shared = Some(shared);
+        d
     }
 
     fn with_inner(inner: Inner, base: u64) -> MkvDemuxer {
@@ -1043,6 +1065,7 @@ impl MkvDemuxer {
             index: None,
             parsed: false,
             metadata: rff_core::Dictionary::new(),
+            shared: None,
         }
     }
 
@@ -1283,6 +1306,7 @@ impl MkvDemuxer {
         let mut track_type = 0u64;
         let (mut width, mut height) = (0u32, 0u32);
         let (mut rate, mut channels) = (0u32, 0u16);
+        let mut output_rate = 0u32;
         let mut bit_depth = 0u64;
         let mut default_duration_ns = 0u64;
         let mut frame_rate = 0.0f64;
@@ -1338,6 +1362,9 @@ impl MkvDemuxer {
                         let Some((asz, _)) = a.read_size() else { break };
                         match aid {
                             ID_SAMPLING_FREQUENCY => rate = a.read_float(asz as usize) as u32,
+                            ID_OUTPUT_SAMPLING_FREQUENCY => {
+                                output_rate = a.read_float(asz as usize) as u32
+                            }
                             ID_CHANNELS => channels = a.read_uint(asz as usize) as u16,
                             ID_BIT_DEPTH => bit_depth = a.read_uint(asz as usize),
                             _ => a.skip(asz as usize),
@@ -1376,7 +1403,23 @@ impl MkvDemuxer {
         }
         self.t.codings.push(codings.frames);
 
-        let codec_id = map_codec(&codec);
+        let codec_id = map_codec_private(&codec, &codec_private);
+        // OutputSamplingFrequency (HE-AAC's SBR rate) is what the decoder
+        // outputs, so it is the stream's rate, as matroskadec has it.
+        let out_rate = if output_rate > 0 { output_rate } else { rate };
+        // Legacy `A_AAC/MPEG{2,4}/<profile>[/SBR]` IDs carry no CodecPrivate:
+        // the AudioSpecificConfig is built from the ID, rate and channels.
+        if codec_id == CodecId::Aac && codec != "A_AAC" && codec_private.is_empty() {
+            codec_private = legacy_aac_config(&codec, rate, out_rate, channels);
+        }
+        // Big-endian PCM comes out little-endian, rff's PCM contract.
+        let pcm_swap = match (codec.as_str(), bit_depth) {
+            ("A_PCM/INT/BIG", 16 | 0) => 2,
+            ("A_PCM/INT/BIG", 24) => 3,
+            ("A_PCM/INT/BIG", 32) => 4,
+            _ => 0,
+        };
+        self.t.pcm_swap.push(pcm_swap);
         let is_ass = matches!(codec.as_str(), "S_TEXT/ASS" | "S_TEXT/SSA");
         self.t.ass.push(is_ass);
         self.t.prores.push(codec_id == CodecId::ProRes);
@@ -1390,7 +1433,7 @@ impl MkvDemuxer {
         }
         self.t.default_duration_ns.push(default_duration_ns);
         self.t.codec_delay.push(codec_delay);
-        self.t.sample_rate.push(rate);
+        self.t.sample_rate.push(out_rate);
         let index = self.streams.len();
         let mut s = Stream::new(index, codec_id);
         s.media_type = match track_type {
@@ -1401,8 +1444,9 @@ impl MkvDemuxer {
         };
         s.width = width;
         s.height = height;
-        s.sample_rate = rate;
+        s.sample_rate = out_rate;
         s.channels = channels;
+        s.codec_string = Some(codec.clone());
         s.codec_delay_ns = codec_delay;
         s.seek_preroll_ns = seek_preroll;
         if s.media_type == MediaType::Video {
@@ -1424,7 +1468,8 @@ impl MkvDemuxer {
         if codec_id == CodecId::Pcm {
             s.sample_format = match (codec.as_str(), bit_depth) {
                 ("A_PCM/FLOAT/IEEE", 64) => Some(SampleFormat::F64),
-                ("A_PCM/FLOAT/IEEE", _) => Some(SampleFormat::F32),
+                ("A_PCM/FLOAT/IEEE", 32 | 0) => Some(SampleFormat::F32),
+                ("A_PCM/FLOAT/IEEE", _) => None,
                 (_, 8) => Some(SampleFormat::U8),
                 (_, 0 | 16) => Some(SampleFormat::S16),
                 (_, 24) => Some(SampleFormat::S24),
@@ -1458,6 +1503,12 @@ impl MkvDemuxer {
                     s.codec_tag = Some(tag);
                 }
                 Vec::new()
+            }
+            // V_MS/VFW/FOURCC: a BITMAPINFOHEADER; its fourcc is the codec
+            // tag (`AVdn`, `MJPG`) and what follows it the extradata.
+            _ if codec == "V_MS/VFW/FOURCC" && codec_private.len() >= 40 => {
+                s.codec_tag = <[u8; 4]>::try_from(&codec_private[16..20]).ok();
+                codec_private[40..].to_vec()
             }
             _ => codec_private,
         };
@@ -1615,7 +1666,7 @@ impl Demuxer for MkvDemuxer {
             return None;
         }
         if self.index.is_none() {
-            self.index = Some(self.build_index().ok()?);
+            self.index = Some(std::sync::Arc::new(self.build_index().ok()?));
         }
         Some(self)
     }
@@ -1647,6 +1698,48 @@ fn seek_target(seekhead: &[u8], target: u32) -> Option<u64> {
         })
 }
 
+/// The codec of a track from its CodecID and (for `V_MS/VFW/FOURCC`) its
+/// CodecPrivate.
+fn map_codec_private(codec: &str, private: &[u8]) -> CodecId {
+    if codec == "V_MS/VFW/FOURCC" {
+        return match private.get(16..20) {
+            Some(b"AVdn" | b"AVdh") => CodecId::DnxHd,
+            Some(b"MJPG" | b"mjpg" | b"AVRn" | b"MJPA") => CodecId::Jpeg,
+            _ => CodecId::None,
+        };
+    }
+    map_codec(codec)
+}
+
+/// An AudioSpecificConfig for a legacy `A_AAC/MPEG2/...` / `A_AAC/MPEG4/...`
+/// CodecID, as matroskadec builds it: the profile from the ID (MAIN 1, LC 2,
+/// SSR 3, anything else 4 = LTP), the rate index and channel count, and for
+/// `.../SBR` a backward-compatible SBR extension at the output rate.
+fn legacy_aac_config(codec: &str, rate: u32, out_rate: u32, channels: u16) -> Vec<u8> {
+    let profile = ["MAIN", "LC", "SSR"]
+        .iter()
+        .position(|p| codec.contains(p))
+        .map_or(4, |i| i as u32 + 1);
+    let ch = u32::from(channels.min(15));
+    let Some(sri) = rff_format::aac::exact_frequency_index(rate) else {
+        // A rate outside the table: the escape form (no SBR then).
+        let bits: u64 = u64::from(profile) << 35
+            | 15 << 31
+            | u64::from(rate.min((1 << 24) - 1)) << 7
+            | u64::from(ch) << 3;
+        return bits.to_be_bytes()[3..].to_vec();
+    };
+    let mut asc = vec![
+        (profile << 3 | (sri & 0x0E) >> 1) as u8,
+        ((sri & 1) << 7 | ch << 3) as u8,
+    ];
+    if codec.contains("SBR") {
+        let ext = rff_format::aac::exact_frequency_index(out_rate).unwrap_or(sri);
+        asc.extend_from_slice(&[0x56, 0xE5, 0x80 | (ext << 3) as u8]);
+    }
+    asc
+}
+
 fn map_codec(codec: &str) -> CodecId {
     match codec {
         "V_AV1" => CodecId::Avif, // our AV1 (rav1d) decoder
@@ -1655,6 +1748,14 @@ fn map_codec(codec: &str) -> CodecId {
         "V_MPEG4/ISO/AVC" => CodecId::H264,
         "V_MPEGH/ISO/HEVC" => CodecId::Hevc,
         "V_PRORES" => CodecId::ProRes,
+        "V_MJPEG" => CodecId::Jpeg,
+        "V_APV" => CodecId::Apv,
+        "V_MPEG1" => CodecId::Mpeg1Video,
+        "V_MPEG2" => CodecId::Mpeg2Video,
+        c if c.starts_with("A_AAC/MPEG2/") || c.starts_with("A_AAC/MPEG4/") => CodecId::Aac,
+        c if c == "A_DTS" || c.starts_with("A_DTS/") => CodecId::Dts,
+        "A_TRUEHD" => CodecId::TrueHd,
+        "A_PCM/INT/BIG" => CodecId::Pcm,
         "A_OPUS" => CodecId::Opus,
         "A_VORBIS" => CodecId::Vorbis,
         "A_AAC" => CodecId::Aac,
@@ -2419,7 +2520,10 @@ mod tests {
         elem(&mut file, ID_INFO, &info);
         let sps = [0x67u8, 0x64, 0x00, 0x1F, 0xAC];
         let pps = [0x68u8, 0xEE, 0x3C];
-        let avcc = rff_format::avc::build_avcc_record(&sps, &pps);
+        // The goldens predate the High-profile avcC extension (4 trailing
+        // bytes); the fixture keeps the record they were recorded with.
+        let mut avcc = rff_format::avc::build_avcc_record(&sps, &pps);
+        avcc.truncate(avcc.len() - 4);
         let mut tracks = track_entry(1, 1, "V_MPEG4/ISO/AVC", &avcc, &[]);
         let mut audio = Vec::new();
         elem(

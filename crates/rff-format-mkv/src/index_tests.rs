@@ -906,9 +906,11 @@ fn webm_still_refuses_the_matroska_only_codecs() {
         let err = mux.write_header(&[Stream::new(0, codec)]).unwrap_err();
         assert!(err.to_string().contains("webm"), "{err}");
     }
-    // DNxHD and APV have no Matroska codec ID.
-    for codec in [CodecId::DnxHd, CodecId::Apv] {
-        let mut mux = MkvMuxer::new(Box::new(Vec::new()), false);
+    // DNxHD (V_MS/VFW/FOURCC) and APV (V_APV) are Matroska-only too.
+    for codec in [CodecId::DnxHd, CodecId::Apv, CodecId::Jpeg] {
+        let mut mux = MkvMuxer::new(Box::new(Vec::new()), true);
         assert!(mux.write_header(&[Stream::new(0, codec)]).is_err());
+        let mut mux = MkvMuxer::new(Box::new(Vec::new()), false);
+        assert!(mux.write_header(&[Stream::new(0, codec)]).is_ok());
     }
 }
