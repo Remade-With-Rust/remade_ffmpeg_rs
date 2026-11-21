@@ -457,6 +457,15 @@ impl RasterPipelineBuilder {
                 .iter()
                 .map(|stage| highp::STAGES[*stage as usize] as highp::StageFn)
                 .collect();
+            // `Gradient` then `Premultiply` (a gradient with translucent stops)
+            // runs as one stage.
+            if let Some(i) = functions.windows(2).position(|w| {
+                highp::fn_ptr(w[0]) == highp::fn_ptr(highp::gradient)
+                    && highp::fn_ptr(w[1]) == highp::fn_ptr(highp::premultiply)
+            }) {
+                functions[i] = highp::gradient_premultiply as highp::StageFn;
+                functions.remove(i + 1);
+            }
             functions.push(highp::just_return as highp::StageFn);
 
             // I wasn't able to reproduce Skia's load_8888_/store_8888_ performance.

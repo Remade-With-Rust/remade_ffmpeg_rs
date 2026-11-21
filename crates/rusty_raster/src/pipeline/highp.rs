@@ -209,7 +209,7 @@ fn move_source_to_destination(p: &mut Pipeline) {
     p.next_stage();
 }
 
-fn premultiply(p: &mut Pipeline) {
+pub fn premultiply(p: &mut Pipeline) {
     p.r *= p.a;
     p.g *= p.a;
     p.b *= p.a;
@@ -1015,7 +1015,31 @@ fn repeat_x1(p: &mut Pipeline) {
     p.next_stage();
 }
 
-fn gradient(p: &mut Pipeline) {
+pub fn gradient(p: &mut Pipeline) {
+    gradient_colors(p);
+
+    p.next_stage();
+}
+
+/// `gradient` followed by `premultiply`, as one stage.
+///
+/// Gradients with translucent stops push `Premultiply` right after
+/// `Gradient`; `RasterPipelineBuilder::compile` fuses the pair for highp,
+/// which saves a stage call and a store and reload of the four channels per
+/// eight pixels. The arithmetic is `premultiply`'s.
+pub fn gradient_premultiply(p: &mut Pipeline) {
+    gradient_colors(p);
+
+    p.r *= p.a;
+    p.g *= p.a;
+    p.b *= p.a;
+
+    p.next_stage();
+}
+
+/// The `gradient` stage's colours, left in `r, g, b, a`.
+#[inline(always)]
+fn gradient_colors(p: &mut Pipeline) {
     let ctx = &p.ctx.gradient;
 
     // N.B. The loop starts at 1 because idx 0 is the color to use before the first stop.
@@ -1038,7 +1062,6 @@ fn gradient(p: &mut Pipeline) {
             p.g = mad(t, f32x8::splat(factor.g), f32x8::splat(bias.g));
             p.b = mad(t, f32x8::splat(factor.b), f32x8::splat(bias.b));
             p.a = mad(t, f32x8::splat(factor.a), f32x8::splat(bias.a));
-            p.next_stage();
             return;
         }
     }
@@ -1081,8 +1104,6 @@ fn gradient(p: &mut Pipeline) {
         }
         _ => gradient_lookup(ctx, &idx, p.r, &mut p.r, &mut p.g, &mut p.b, &mut p.a),
     }
-
-    p.next_stage();
 }
 
 /// The interval index all eight lanes of `t` share, if they share one.
