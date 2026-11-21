@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_tiff-v0.1.1...rusty_tiff-v0.1.2) - 2026-11-21
+
+### Fixed
+
+- *(rusty_tiff)* bound how much of a damaged image may be zero-filled
+
+### Other
+
+- *(rusty_tiff)* backticks for SamplesPerPixel in the max_fill_ratio doc (clippy doc_markdown)
+
 ## [0.1.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_tiff-v0.1.0...rusty_tiff-v0.1.1) - 2026-11-20
 
 ### Added

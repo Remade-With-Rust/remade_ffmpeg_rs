@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-alac-v0.6.3...rff-codec-alac-v0.7.0) - 2026-11-21
+
+### Fixed
+
+- *(packaging)* ship the Apache-2.0 LICENSE text in every published crate
+
+### Other
+
+- *(alac)* reuse the residual and shifted-byte buffers across frames
+- *(alac)* sign extension without a width test
+- *(alac)* interleave the output a whole frame at a time
+- *(alac)* inline decode_scalar into the residual loop
+
 ## [0.6.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-alac-v0.6.2...rff-codec-alac-v0.6.3) - 2026-11-19
 
 ### Other

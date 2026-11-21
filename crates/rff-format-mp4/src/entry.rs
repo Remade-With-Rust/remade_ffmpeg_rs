@@ -124,7 +124,16 @@ pub(crate) fn read_visual_children(stream: &mut Stream, children: &[u8]) {
             }
             // vpcC v1: profile, level, depth(4) chroma(3) range(1), primaries,
             // transfer, matrix, init size(16) + init data.
-            b"vpcC" if p.len() >= 12 && p[0] == 1 && !colr_seen => {
+            // The av1C record is the stream's extradata, as FFmpeg and
+            // Matroska (`V_AV1` CodecPrivate) give it.
+            b"av1C" if p.len() >= 4 && p[0] == 0x81 => stream.extradata = p.to_vec(),
+            // The vpcC record (FullBox header included) becomes extradata,
+            // so a remux writes the same profile, level and chroma siting.
+            b"vpcC" if p.len() >= 12 && p[0] == 1 => {
+                stream.extradata = p.to_vec();
+                if colr_seen {
+                    continue;
+                }
                 stream.color = ColorInfo {
                     primaries: u16::from(p[7]),
                     transfer: u16::from(p[8]),
@@ -135,6 +144,15 @@ pub(crate) fn read_visual_children(stream: &mut Stream, children: &[u8]) {
                 } else {
                     ColorRange::Limited
                 };
+            }
+            // fiel (QuickTime; ISO readers take it too): field count, then
+            // the detail code Matroska's FieldOrder shares.
+            b"fiel" if p.len() >= 2 => {
+                stream.field_order = Some(match (p[0], p[1]) {
+                    (1, _) => 0,
+                    (_, 0) => 2,
+                    (_, detail) => detail,
+                });
             }
             // apvC: FullBox, then APVDecoderConfigurationRecord.
             b"apvC" if p.len() > 4 => stream.extradata = p[4..].to_vec(),
@@ -186,6 +204,14 @@ pub(crate) fn visual_children(stream: &Stream, qt: bool) -> Vec<u8> {
         pu32(&mut b, v);
         out.extend_from_slice(&bx(b"pasp", &b));
     }
+    if let Some(order) = stream.field_order {
+        let (fields, detail) = match order {
+            0 => (1, 0),
+            2 => (2, 0),
+            d => (2, d),
+        };
+        out.extend_from_slice(&bx(b"fiel", &[fields, detail]));
+    }
     if let Some(c) = stream.clean_aperture {
         let mut b = Vec::new();
         for v in [
@@ -203,6 +229,44 @@ pub(crate) fn visual_children(stream: &Stream, qt: bool) -> Vec<u8> {
         out.extend_from_slice(&bx(b"clap", &b));
     }
     out
+}
+
+/// A `tkhd` / `mvhd` matrix at `at`, or `None` when it is the identity
+/// (or the box is too short to hold one).
+pub(crate) fn read_matrix(b: &[u8], at: usize) -> Option<[i32; 9]> {
+    let raw = b.get(at..at + 36)?;
+    let mut m = [0i32; 9];
+    for (k, v) in m.iter_mut().enumerate() {
+        *v = be32(raw, 4 * k) as i32;
+    }
+    (m != [0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x4000_0000]).then_some(m)
+}
+
+/// An `mdhd` language code → an ISO 639-2 code. `None` for `und`, for a
+/// Macintosh language code (below 0x400) and for nonsense.
+pub(crate) fn mdhd_language(code: u32) -> Option<String> {
+    if !(0x400..=0x7FFF).contains(&code) {
+        return None;
+    }
+    let letters: Vec<u8> = (0..3)
+        .rev()
+        .map(|k| ((code >> (5 * k)) & 0x1F) as u8 + 0x60)
+        .collect();
+    if !letters.iter().all(u8::is_ascii_lowercase) || letters == b"und" {
+        return None;
+    }
+    String::from_utf8(letters).ok()
+}
+
+/// The packed `mdhd` code for a language: an ISO 639-2 three-letter code
+/// packs as itself, anything else (none, a BCP 47 tag) as `und`.
+pub(crate) fn mdhd_language_code(lang: Option<&str>) -> u16 {
+    match lang.map(str::as_bytes) {
+        Some(&[a, b, c]) if [a, b, c].iter().all(u8::is_ascii_lowercase) => [a, b, c]
+            .iter()
+            .fold(0u16, |v, &l| v << 5 | u16::from(l - 0x60)),
+        _ => 0x55C4, // 'und'
+    }
 }
 
 /// ProRes profile from the frame header when the stream carries no tag:
@@ -224,6 +288,48 @@ pub(crate) fn dnx_tag(stream: &Stream) -> [u8; 4] {
         .codec_tag
         .filter(|t| DNX_TAGS.contains(t))
         .unwrap_or(*b"AVdn")
+}
+
+/// A `vpcC` box from what a VP9 stream's extradata already says: a `vpcC`
+/// record (an MP4 source; written back verbatim), or Matroska's `V_VP9`
+/// CodecPrivate feature list (profile, level, bit depth, chroma
+/// subsampling: IDs 1-4), completed with the stream's colour. `None` when
+/// the extradata is neither, and the muxer reads the first keyframe instead.
+pub(crate) fn vpcc_from_extradata(stream: &Stream) -> Option<Vec<u8>> {
+    let e = &stream.extradata;
+    if e.len() >= 12 && e[0] == 1 && e[1..4] == [0, 0, 0] {
+        return Some(bx(b"vpcC", e));
+    }
+    let (mut profile, mut level, mut depth, mut chroma) = (None, None, None, None);
+    let mut i = 0;
+    while i + 2 <= e.len() {
+        let (id, len) = (e[i], usize::from(e[i + 1]));
+        let v = *e.get(i + 2)?;
+        if len != 1 {
+            return None;
+        }
+        match id {
+            1 => profile = Some(v),
+            2 => level = Some(v),
+            3 => depth = Some(v),
+            4 => chroma = Some(v),
+            _ => return None,
+        }
+        i += 3;
+    }
+    let profile = profile?;
+    let full = stream.color_range == ColorRange::Full;
+    let narrow = |v: u16| u8::try_from(v).unwrap_or(2);
+    let mut b = vec![
+        profile,
+        level.unwrap_or_else(|| vp9_level(stream.width, stream.height)),
+        (depth.unwrap_or(8) << 4) | (chroma.unwrap_or(1).min(3) << 1) | u8::from(full),
+        narrow(stream.color.primaries),
+        narrow(stream.color.transfer),
+        narrow(stream.color.matrix),
+    ];
+    pu16(&mut b, 0);
+    Some(fbx(b"vpcC", 1, 0, &b))
 }
 
 /// `vpcC` (version 1) for a VP9 stream, from its first keyframe's
@@ -437,6 +543,111 @@ pub(crate) fn parse_audio_entry(entry: &[u8], qt_layout: bool) -> AudioEntry {
     a
 }
 
+/// The rate an audio track really runs at, recovered whatever the writer
+/// put in the 16.16 `samplerate` field: a QuickTime v2 description's float,
+/// an ISO `srat` box, else the codec configuration (AudioSpecificConfig,
+/// FLAC STREAMINFO, ALAC cookie) when the field cannot hold it — which also
+/// repairs files whose 96 kHz was written wrapped as 30464 Hz — or is 0.
+pub(crate) fn true_sample_rate(a: &AudioEntry, codec: CodecId, extradata: &[u8]) -> u32 {
+    if a.v2 {
+        return a.sample_rate;
+    }
+    if let Some(rate) = a.child(b"srat").and_then(|p| p.get(4..8)) {
+        let rate = be32(rate, 0);
+        if rate > 0 {
+            return rate;
+        }
+    }
+    let config = match codec {
+        CodecId::Aac => rff_format::aac::asc_sample_rate(extradata),
+        CodecId::Flac => flac_streaminfo(extradata)
+            .map(|si| u32::from(si[10]) << 12 | u32::from(si[11]) << 4 | u32::from(si[12]) >> 4),
+        CodecId::Alac => extradata.get(20..24).map(|r| be32(r, 0)),
+        _ => None,
+    };
+    match config {
+        Some(rate) if rate > 0 && (rate > 0xFFFF || a.sample_rate == 0) => rate,
+        _ => a.sample_rate,
+    }
+}
+
+/// The fields of a QuickTime version 2 sound description after the data
+/// reference index (QuickTime File Format, "Sound Sample Description
+/// (Version 2)"), for a compressed codec: the rate as a float64, so any
+/// rate is exact. `frames_per_packet` 0 means variable.
+pub(crate) fn sound_v2_fields(rate: u32, channels: u16, frames_per_packet: u32) -> Vec<u8> {
+    let mut e = Vec::new();
+    pu16(&mut e, 2); // version
+    pu16(&mut e, 0); // revision
+    pu32(&mut e, 0); // vendor
+    pu16(&mut e, 3); // always 3
+    pu16(&mut e, 16); // always 16
+    pu16(&mut e, 0xFFFE); // always -2
+    pu16(&mut e, 0); // always 0
+    pu32(&mut e, 65536); // always 65536
+    pu32(&mut e, 72); // sizeOfStructOnly
+    e.extend_from_slice(&f64::from(rate).to_bits().to_be_bytes());
+    pu32(&mut e, u32::from(channels));
+    pu32(&mut e, 0x7F00_0000);
+    pu32(&mut e, 0); // constBitsPerChannel: compressed
+    pu32(&mut e, 0); // formatSpecificFlags
+    pu32(&mut e, 0); // constBytesPerAudioPacket: variable
+    pu32(&mut e, frames_per_packet); // constLPCMFramesPerAudioPacket
+    e
+}
+
+/// `dOps` (OpusSpecificBox, "Encapsulation of Opus in ISO Base Media File
+/// Format" 4.3.2) for a stream: from its `OpusHead` extradata when it has
+/// one (pre-skip, input rate, gain and the channel mapping table kept), else
+/// from its channels and rate, with the codec delay as the pre-skip.
+pub(crate) fn build_dops(stream: &Stream) -> Vec<u8> {
+    let h = &stream.extradata;
+    let mut b = Vec::new();
+    if h.len() >= 19 && h.starts_with(b"OpusHead") {
+        b.push(0); // Version
+        b.push(h[9]); // OutputChannelCount
+        b.extend_from_slice(&[h[11], h[10]]); // PreSkip (LE -> BE)
+        b.extend_from_slice(&[h[15], h[14], h[13], h[12]]); // InputSampleRate
+        b.extend_from_slice(&[h[17], h[16]]); // OutputGain
+        b.push(h[18]); // ChannelMappingFamily
+        if h[18] != 0 {
+            // StreamCount, CoupledCount, ChannelMapping[OutputChannelCount]
+            let end = (21 + usize::from(h[9])).min(h.len());
+            b.extend_from_slice(h.get(19..end).unwrap_or(&[]));
+        }
+    } else {
+        let pre_skip = (u128::from(stream.codec_delay_ns) * 48_000 / 1_000_000_000)
+            .min(u128::from(u16::MAX)) as u16;
+        b.push(0);
+        b.push(stream.channels.clamp(1, 255) as u8);
+        pu16(&mut b, pre_skip);
+        pu32(&mut b, stream.sample_rate);
+        pu16(&mut b, 0); // OutputGain
+        b.push(0); // ChannelMappingFamily 0: mono / stereo
+    }
+    bx(b"dOps", &b)
+}
+
+/// `dOps` payload → `OpusHead` (RFC 7845 5.1), the extradata rff (and
+/// Matroska, and FFmpeg) carry for Opus.
+pub(crate) fn dops_to_opus_head(d: &[u8]) -> Option<Vec<u8>> {
+    if d.len() < 11 || d[0] != 0 {
+        return None;
+    }
+    let mut h = b"OpusHead".to_vec();
+    h.push(1); // version
+    h.push(d[1]);
+    h.extend_from_slice(&[d[3], d[2]]);
+    h.extend_from_slice(&[d[7], d[6], d[5], d[4]]);
+    h.extend_from_slice(&[d[9], d[8]]);
+    h.push(d[10]);
+    if d[10] != 0 {
+        let end = (13 + usize::from(d[1])).min(d.len());
+        h.extend_from_slice(d.get(11..end)?);
+    }
+    Some(h)
+}
+
 /// How a PCM track's bytes sit on disk relative to rff's little-endian
 /// [`SampleFormat`]s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -636,7 +847,8 @@ pub(crate) fn pcm_entry(stream: &Stream, out: &PcmOut) -> Vec<u8> {
         pu16(&mut e, bits);
         pu16(&mut e, 0); // compression id
         pu16(&mut e, 0); // packet size
-        pu32(&mut e, stream.sample_rate << 16);
+                         // Only rates up to 65535 Hz get a v0/v1 entry (`pcm_out`).
+        pu32(&mut e, stream.sample_rate.min(0xFFFF) << 16);
         if out.version == 1 {
             let bps = format.bytes_per_sample() as u32;
             pu32(&mut e, 1); // samples per packet

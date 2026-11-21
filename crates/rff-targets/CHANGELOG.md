@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.22](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-targets-v0.2.21...rff-targets-v0.2.22) - 2026-11-21
+
+### Fixed
+
+- *(packaging)* ship the Apache-2.0 LICENSE text in every published crate
+
 ## [0.2.21](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-targets-v0.2.20...rff-targets-v0.2.21) - 2026-11-19
 
 ### Other

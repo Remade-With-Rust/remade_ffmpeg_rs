@@ -16,6 +16,10 @@ not a binding.
 - Colour / HDR metadata (MasteringMetadata, MaxCLL/MaxFALL), WebM alpha
   (`AlphaMode` + BlockAdditions), CodecDelay / SeekPreRoll, and on demux
   ContentEncodings (header stripping, zlib; encrypted tracks are refused).
+- Track `Name`, `Language`/`LanguageBCP47`, the track flags, interlacing,
+  `StereoMode`, `PixelCrop*` (as `clean_aperture`), display size (as
+  `pixel_aspect`), `Projection` roll (as a rotation), `Info` title / date /
+  writing app and global `Tags` (`Demuxer::metadata`), read and written.
 - Pure Rust, no C/FFI.
 
 ## Usage

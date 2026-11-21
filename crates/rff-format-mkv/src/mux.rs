@@ -93,9 +93,6 @@ const ID_SEEK_HEAD: u32 = 0x114D_9B74;
 const ID_SEEK: u32 = 0x4DBB;
 const ID_SEEK_ID: u32 = 0x53AB;
 const ID_SEEK_POSITION: u32 = 0x53AC;
-const ID_MUXING_APP: u32 = 0x4D80;
-const ID_WRITING_APP: u32 = 0x5741;
-const ID_TITLE: u32 = 0x7BA9;
 const ID_TRACK_UID: u32 = 0x73C5;
 const ID_FLAG_LACING: u32 = 0x9C;
 const ID_CUE_POINT: u32 = 0xBB;
@@ -128,7 +125,7 @@ fn put_size(out: &mut Vec<u8>, v: u64) {
 }
 
 /// Append a full element: id + size + body.
-fn put_elem(out: &mut Vec<u8>, id: u32, body: &[u8]) {
+pub(crate) fn put_elem(out: &mut Vec<u8>, id: u32, body: &[u8]) {
     put_id(out, id);
     put_size(out, body.len() as u64);
     out.extend_from_slice(body);
@@ -140,7 +137,7 @@ fn uint_body(v: u64) -> Vec<u8> {
     (0..n).rev().map(|i| (v >> (8 * i)) as u8).collect()
 }
 
-fn put_uint(out: &mut Vec<u8>, id: u32, v: u64) {
+pub(crate) fn put_uint(out: &mut Vec<u8>, id: u32, v: u64) {
     put_elem(out, id, &uint_body(v));
 }
 
@@ -169,11 +166,11 @@ fn put_uint_fixed8(out: &mut Vec<u8>, id: u32, v: u64) {
     put_elem(out, id, &v.to_be_bytes());
 }
 
-fn put_float(out: &mut Vec<u8>, id: u32, v: f64) {
+pub(crate) fn put_float(out: &mut Vec<u8>, id: u32, v: f64) {
     put_elem(out, id, &v.to_be_bytes());
 }
 
-fn put_string(out: &mut Vec<u8>, id: u32, s: &str) {
+pub(crate) fn put_string(out: &mut Vec<u8>, id: u32, s: &str) {
     put_elem(out, id, s.as_bytes());
 }
 
@@ -368,11 +365,18 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
         )))
     };
     match s.codec_id {
-        CodecId::Vp9 => plan.codec = "V_VP9",
+        CodecId::Vp9 => {
+            plan.codec = "V_VP9";
+            plan.private = vp9_private(&s.extradata);
+        }
         CodecId::Vp8 => plan.codec = "V_VP8",
         CodecId::Avif => {
             plan.codec = "V_AV1";
             plan.is_av1 = true;
+            // An av1C record as extradata (an MP4 source) is the CodecPrivate.
+            if s.extradata.len() >= 4 && s.extradata[0] == 0x81 {
+                plan.private = Some(s.extradata.clone());
+            }
         }
         CodecId::H264 => {
             if webm {
@@ -500,6 +504,34 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
     plan.delay_ms =
         ((u128::from(plan.codec_delay_ns) + 500_000) / 1_000_000).min(i64::MAX as u128) as i64;
     Ok(plan)
+}
+
+/// `V_VP9` CodecPrivate (the codec feature list: profile, level, bit depth,
+/// chroma subsampling, IDs 1-4) from a stream's extradata: kept when it is
+/// one already (a Matroska source), built from an MP4 `vpcC` record.
+fn vp9_private(extradata: &[u8]) -> Option<Vec<u8>> {
+    let e = extradata;
+    if e.len() >= 12 && e[0] == 1 && e[1..4] == [0, 0, 0] {
+        return Some(vec![
+            1,
+            1,
+            e[4],
+            2,
+            1,
+            e[5],
+            3,
+            1,
+            e[6] >> 4,
+            4,
+            1,
+            (e[6] >> 1) & 7,
+        ]);
+    }
+    let features = !e.is_empty()
+        && e.len() % 3 == 0
+        && e.chunks_exact(3)
+            .all(|c| (1..=4).contains(&c[0]) && c[1] == 1);
+    features.then(|| e.to_vec())
 }
 
 /// An `hvcC` CodecPrivate from a stream's `extradata`, when it holds one.
@@ -631,7 +663,10 @@ fn ebml_header(webm: bool) -> Vec<u8> {
 
 /// The Info element. Returns it with the offset (within the element) of the
 /// Duration *element*, when one was written.
-fn info_element(duration_ms: Option<f64>, title: Option<&str>) -> (Vec<u8>, Option<usize>) {
+fn info_element(
+    duration_ms: Option<f64>,
+    metadata: &rff_core::Dictionary,
+) -> (Vec<u8>, Option<usize>) {
     let mut info = Vec::new();
     put_uint(&mut info, ID_TIMESTAMP_SCALE, 1_000_000); // 1 ms ticks
     let duration_at = duration_ms.map(|d| {
@@ -639,19 +674,8 @@ fn info_element(duration_ms: Option<f64>, title: Option<&str>) -> (Vec<u8>, Opti
         put_float(&mut info, ID_DURATION, d);
         at
     });
-    if let Some(title) = title {
-        put_string(&mut info, ID_TITLE, title);
-    }
-    put_string(
-        &mut info,
-        ID_MUXING_APP,
-        concat!("rff ", env!("CARGO_PKG_VERSION")),
-    );
-    put_string(
-        &mut info,
-        ID_WRITING_APP,
-        concat!("rff ", env!("CARGO_PKG_VERSION")),
-    );
+    // Title, DateUTC (creation_time), MuxingApp, WritingApp (encoder).
+    crate::props::info_elements(metadata, &mut info);
     let mut elem = Vec::new();
     put_elem(&mut elem, ID_INFO, &info);
     let header_len = elem.len() - info.len();
@@ -675,6 +699,7 @@ fn tracks_element(tracks: &[TrackPlan]) -> Vec<u8> {
         put_uint(&mut te, ID_TRACK_TYPE, track_type);
         put_uint(&mut te, ID_FLAG_LACING, 0);
         put_string(&mut te, ID_CODEC_ID, plan.codec);
+        crate::props::track_elements(s, &mut te);
         if let Some(private) = &plan.private {
             put_elem(&mut te, ID_CODEC_PRIVATE, private);
         }
@@ -700,6 +725,7 @@ fn tracks_element(tracks: &[TrackPlan]) -> Vec<u8> {
                 if let Some(colour) = colour_element(s) {
                     v.extend_from_slice(&colour);
                 }
+                crate::props::video_elements(s, &mut v);
                 put_elem(&mut te, ID_VIDEO, &v);
             }
             MediaType::Audio => {
@@ -983,8 +1009,8 @@ pub struct MkvMuxer {
     webm: bool,
     tracks: Vec<TrackPlan>,
     blocks: Vec<BufBlock>,
-    /// `-metadata title=...` → the Segment Info Title element.
-    title: Option<String>,
+    /// `set_metadata`: Info (title, creation_time, encoder) and Tags.
+    metadata: rff_core::Dictionary,
 }
 
 impl MkvMuxer {
@@ -994,14 +1020,14 @@ impl MkvMuxer {
             webm,
             tracks: Vec::new(),
             blocks: Vec::new(),
-            title: None,
+            metadata: rff_core::Dictionary::new(),
         }
     }
 }
 
 impl Muxer for MkvMuxer {
     fn set_metadata(&mut self, metadata: &rff_core::Dictionary) {
-        self.title = metadata.get("title").map(str::to_owned);
+        self.metadata = metadata.clone();
     }
 
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
@@ -1039,11 +1065,12 @@ impl Muxer for MkvMuxer {
             .unwrap_or(0);
         let (info_elem, _) = info_element(
             (duration_ms > 0).then_some(duration_ms as f64),
-            self.title.as_deref(),
+            &self.metadata,
         );
 
-        // --- Tracks ---
-        let tracks_elem = tracks_element(&self.tracks);
+        // --- Tracks (and Tags, right after) ---
+        let mut tracks_elem = tracks_element(&self.tracks);
+        tracks_elem.extend_from_slice(&crate::props::tags_element(&self.metadata));
 
         // A missing H.264 config means no SPS/PPS ever appeared — the file
         // would be undecodable; refuse rather than write it silently broken.
@@ -1233,7 +1260,7 @@ pub struct MkvStreamingMuxer {
     out: SeekOutput,
     webm: bool,
     tracks: Vec<TrackPlan>,
-    title: Option<String>,
+    metadata: rff_core::Dictionary,
     is_video: Vec<bool>,
     is_sub: Vec<bool>,
     /// Per-track queues, each in arrival (= decode) order.
@@ -1269,7 +1296,7 @@ impl MkvStreamingMuxer {
             out,
             webm,
             tracks: Vec::new(),
-            title: None,
+            metadata: rff_core::Dictionary::new(),
             is_video: Vec::new(),
             is_sub: Vec::new(),
             queues: Vec::new(),
@@ -1349,8 +1376,9 @@ impl MkvStreamingMuxer {
 
         // Duration is always written (an 8-byte float placeholder) and patched
         // at the trailer — or turned into a Void if the file has no duration.
-        let (info, duration_at) = info_element(Some(0.0), self.title.as_deref());
-        let tracks = tracks_element(&self.tracks);
+        let (info, duration_at) = info_element(Some(0.0), &self.metadata);
+        let mut tracks = tracks_element(&self.tracks);
+        tracks.extend_from_slice(&crate::props::tags_element(&self.metadata));
         let seekhead_len = build_seekhead(0, 0, 0).len() as u64;
         let info_pos = seekhead_len;
         let tracks_pos = info_pos + info.len() as u64;
@@ -1455,7 +1483,7 @@ impl MkvStreamingMuxer {
 
 impl Muxer for MkvStreamingMuxer {
     fn set_metadata(&mut self, metadata: &rff_core::Dictionary) {
-        self.title = metadata.get("title").map(str::to_owned);
+        self.metadata = metadata.clone();
     }
 
     fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
