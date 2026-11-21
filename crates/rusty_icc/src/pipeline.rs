@@ -41,6 +41,11 @@ pub(crate) enum Op {
     /// input and output tables), evaluated in line: the values the stage
     /// gives, without a stage call and a curve call per channel.
     Sampled(Vec<Sampled>),
+    /// A stage of per-channel curves that are all regular two-segment
+    /// parametric ones (the sRGB curves at the device end of a chain through
+    /// a LUT), evaluated in line: the values the stage gives, without a stage
+    /// call, a curve call per channel and the tests on the curve kind.
+    FwdSegs(Vec<FwdSeg>),
     /// Multiply every channel.
     Scale(f64),
     /// v4-normalised Lab to real Lab.
@@ -109,6 +114,11 @@ fn run(ops: &[Op], v: &mut [f64; 16], mut n: usize) -> usize {
                 }
             }
             Op::Sampled(cs) => run_sampled(cs, v),
+            Op::FwdSegs(cs) => {
+                for (x, c) in v.iter_mut().zip(cs) {
+                    *x = c.eval(*x);
+                }
+            }
             Op::Scale(k) => {
                 for x in v.iter_mut().take(n) {
                     *x *= k;
@@ -903,6 +913,12 @@ impl Chain {
                     .collect(),
                 tail,
             ),
+            Some((Op::FwdSegs(cs), tail)) if cs.len() == self.in_ch => (
+                cs.iter()
+                    .map(|c| axis.iter().map(|&x| c.eval(x)).collect())
+                    .collect(),
+                tail,
+            ),
             Some((Op::Sampled(cs), tail)) if cs.len() == self.in_ch => (
                 cs.iter()
                     .map(|c| axis.iter().map(|&x| c.eval(x)).collect())
@@ -1059,15 +1075,25 @@ fn link_ops(profiles: &[&Profile], intents: &[Intent], bpc: &[bool]) -> Result<C
 }
 
 /// Replaces curve stages by forms evaluated in line where every curve of the
-/// stage allows it (the same values: see [`InvSeg`]).
+/// stage allows it (the same values: see [`FwdSeg`] and [`InvSeg`]).
 fn prepare_curves(ops: &mut [Op]) {
     for op in ops {
-        if let Op::InvBreakCurves(cs) = op {
-            if let Some(segs) = cs.iter().map(InvSeg::new).collect::<Option<Vec<_>>>() {
-                if !segs.is_empty() {
-                    *op = Op::InvSegs(segs);
+        match op {
+            Op::Lut(Stage::Curves(cs)) => {
+                if let Some(segs) = cs.iter().map(FwdSeg::new).collect::<Option<Vec<_>>>() {
+                    if !segs.is_empty() {
+                        *op = Op::FwdSegs(segs);
+                    }
                 }
             }
+            Op::InvBreakCurves(cs) => {
+                if let Some(segs) = cs.iter().map(InvSeg::new).collect::<Option<Vec<_>>>() {
+                    if !segs.is_empty() {
+                        *op = Op::InvSegs(segs);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1293,7 +1319,7 @@ mod tests {
                 .unwrap();
         let rel = Intent::RelativeColorimetric;
         let per = Intent::Perceptual;
-        let (mut inv, mut chains) = (0, 0);
+        let (mut fwd, mut inv, mut chains) = (0, 0, 0);
         for (a, b, intent) in [
             (&srgb, &lab, rel),
             (&lab, &srgb, rel),
@@ -1312,6 +1338,7 @@ mod tests {
             let plain = link_ops(&[a, b], &[intent, intent], &[false, false]).unwrap();
             assert_eq!(plain.ops.len(), chain.ops.len());
             for op in &chain.ops {
+                fwd += usize::from(matches!(op, Op::FwdSegs(_)));
                 inv += usize::from(matches!(op, Op::InvSegs(_)));
             }
             let coords = [
@@ -1348,7 +1375,7 @@ mod tests {
                 assert_eq!(plain.sample_grid(9), chain.sample_grid(9));
             }
         }
-        assert!(inv > 0 && chains >= 4, "{inv} {chains}");
+        assert!(fwd > 0 && inv > 0 && chains >= 4, "{fwd} {inv} {chains}");
     }
 
     #[test]
