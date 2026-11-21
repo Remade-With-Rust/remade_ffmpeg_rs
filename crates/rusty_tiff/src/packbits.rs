@@ -46,8 +46,18 @@ pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffRes
             let run = h as usize + 1;
             // A literal cut off by the end of the data copies what is there.
             let src = &data[i..data.len().min(i + run)];
-            let take = src.len().min(target - out.len());
-            if take <= INLINE_RUN {
+            let room = target - out.len();
+            let take = src.len().min(room);
+            if take <= INLINE_RUN && room >= INLINE_RUN && data.len() - i >= INLINE_RUN {
+                // A short literal: one constant 16-byte append, cut back to
+                // the literal. The bytes past it stay within this chunk's
+                // reserved room (no reallocation) and are dropped at once.
+                // A push per byte (a capacity check and a length update
+                // each) cost about 5 instructions a byte.
+                let at = out.len();
+                out.extend_from_slice(&data[i..i + INLINE_RUN]);
+                out.truncate(at + take);
+            } else if take <= INLINE_RUN {
                 for &b in &src[..take] {
                     out.push(b);
                 }
