@@ -132,54 +132,66 @@ pub fn decode_with_meta(data: &[u8]) -> Result<(Image, Meta)> {
     let mut scan = vec![[0u8; 4]; len];
     let mut r = crate::read::Reader::new(data);
     r.seek(pos)?;
-    let standard = a1 == "-Y" && a2 == "+X";
+    // Where a scanline goes is settled once per scanline, not per pixel.
+    // Not transposed: scanline `s` is output row `s` (`-Y`) or its mirror
+    // from the bottom (`+Y`), filled left to right (`+X`) or right to left.
+    // Transposed: it is output column `s` (`+X`) or its mirror (`-X`),
+    // filled top to bottom (`-Y`) or bottom to top.
+    let first_forward = matches!(a1, "-Y" | "+X");
+    let second_forward = matches!(a2, "+X" | "-Y");
+    let row_bytes = width as usize * 12;
     for s in 0..lines {
-        if standard {
-            let rest = r.rest();
-            let new_rle = rest.len() >= 4 && rest[0] == 2 && rest[1] == 2 && rest[2] < 128;
-            if !new_rle {
-                // Flat / old-RLE scanline in standard orientation: convert
-                // straight from the file bytes into the output row, with no
-                // intermediate scanline copy. Measured +8.6M Ir (6%) but
-                // -10% wall (0.29 s -> 0.26 s, 6/6 interleaved pairs): the
-                // store-then-reload through the scanline buffer cost more
-                // than the extra instructions. The clock wins.
-                read_flat_f32(&mut r, &mut img.pixels[s * len * 12..(s + 1) * len * 12])?;
-                continue;
-            }
-        }
-        read_scanline(&mut r, &mut scan)?;
-        if standard {
-            // Scanline s is output row s: one row slice, fixed 12-byte stores.
-            let row = &mut img.pixels[s * len * 12..(s + 1) * len * 12];
-            for (d, px) in row.chunks_exact_mut(12).zip(&scan) {
-                let f = to_f32([px[0], px[1], px[2]], px[3]);
-                d[0..4].copy_from_slice(&f[0].to_ne_bytes());
-                d[4..8].copy_from_slice(&f[1].to_ne_bytes());
-                d[8..12].copy_from_slice(&f[2].to_ne_bytes());
+        let line = if first_forward { s } else { lines - 1 - s };
+        if transposed {
+            read_scanline(&mut r, &mut scan)?;
+            let rows = img.pixels.chunks_exact_mut(row_bytes);
+            let at = line * 12;
+            if second_forward {
+                for (row, px) in rows.zip(&scan) {
+                    put_f32(&mut row[at..at + 12], px);
+                }
+            } else {
+                for (row, px) in rows.rev().zip(&scan) {
+                    put_f32(&mut row[at..at + 12], px);
+                }
             }
             continue;
         }
-        for (p, px) in scan.iter().enumerate() {
-            let (x, y) = if transposed {
-                (
-                    if a1 == "+X" { s } else { lines - 1 - s },
-                    if a2 == "-Y" { p } else { len - 1 - p },
-                )
-            } else {
-                (
-                    if a2 == "+X" { p } else { len - 1 - p },
-                    if a1 == "-Y" { s } else { lines - 1 - s },
-                )
-            };
-            let o = (y * width as usize + x) * 12;
-            let f = to_f32([px[0], px[1], px[2]], px[3]);
-            for (k, v) in f.iter().enumerate() {
-                img.pixels[o + k * 4..o + k * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+        let row = &mut img.pixels[line * row_bytes..(line + 1) * row_bytes];
+        if !second_forward {
+            read_scanline(&mut r, &mut scan)?;
+            for (d, px) in row.chunks_exact_mut(12).rev().zip(&scan) {
+                put_f32(d, px);
             }
+            continue;
+        }
+        let rest = r.rest();
+        let new_rle = rest.len() >= 4 && rest[0] == 2 && rest[1] == 2 && rest[2] < 128;
+        if !new_rle {
+            // Flat / old-RLE scanline read left to right: convert straight
+            // from the file bytes into the output row, with no intermediate
+            // scanline copy. Measured +8.6M Ir (6%) but -10% wall (0.29 s ->
+            // 0.26 s, 6/6 interleaved pairs): the store-then-reload through
+            // the scanline buffer cost more than the extra instructions.
+            // The clock wins.
+            read_flat_f32(&mut r, row)?;
+            continue;
+        }
+        read_scanline(&mut r, &mut scan)?;
+        for (d, px) in row.chunks_exact_mut(12).zip(&scan) {
+            put_f32(d, px);
         }
     }
     Ok((img, meta))
+}
+
+/// Store one RGBE pixel as three native-order floats in `d` (12 bytes).
+#[inline(always)]
+fn put_f32(d: &mut [u8], px: &[u8; 4]) {
+    let f = to_f32([px[0], px[1], px[2]], px[3]);
+    d[0..4].copy_from_slice(&f[0].to_ne_bytes());
+    d[4..8].copy_from_slice(&f[1].to_ne_bytes());
+    d[8..12].copy_from_slice(&f[2].to_ne_bytes());
 }
 
 /// One flat or old-RLE scanline of `row.len() / 12` pixels, decoded straight
