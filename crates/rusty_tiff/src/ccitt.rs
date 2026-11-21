@@ -858,15 +858,17 @@ struct BitOut {
 }
 
 impl BitOut {
+    /// Append the low `len` bits of `code` (at most 24), most significant
+    /// first. `n` (under 8) bits wait in the low end of `acc`; the code is
+    /// shifted in whole and every complete byte leaves, so a code costs a
+    /// shift and one or two pushes, where it was a loop turn per bit.
+    #[inline]
     fn put(&mut self, code: u32, len: u32) {
-        for i in (0..len).rev() {
-            self.acc = (self.acc << 1) | ((code >> i) & 1);
-            self.n += 1;
-            if self.n == 8 {
-                self.out.push(self.acc as u8);
-                self.acc = 0;
-                self.n = 0;
-            }
+        self.acc = (self.acc << len) | (code & ((1 << len) - 1));
+        self.n += len;
+        while self.n >= 8 {
+            self.n -= 8;
+            self.out.push((self.acc >> self.n) as u8);
         }
     }
     fn align(&mut self) {
@@ -876,12 +878,23 @@ impl BitOut {
     }
 }
 
+/// The code and its length for one terminating or make-up `run`, or
+/// `(0, 0)` for a run that has no code.
+///
+/// The tables are in run order (64 terminating codes for 0..=63, then the
+/// make-up codes for 64, 128, ..=1728; the extended ones for 1792..=2560
+/// are in `EXTENDED`), so the entry is indexed. Searching the table for the
+/// run was up to 104 compares per code.
 fn code_for(table: &[(u16, u8, u16)], run: u32) -> (u32, u32) {
-    let hit = table
-        .iter()
-        .chain(EXTENDED)
-        .find(|&&(_, _, r)| u32::from(r) == run);
-    hit.map_or((0, 0), |&(c, l, _)| (u32::from(c), u32::from(l)))
+    let hit = if run < 64 {
+        table.get(run as usize)
+    } else if run <= 1728 {
+        table.get(63 + (run / 64) as usize)
+    } else {
+        EXTENDED.get((run.saturating_sub(1792) / 64) as usize)
+    };
+    hit.filter(|&&(_, _, r)| u32::from(r) == run)
+        .map_or((0, 0), |&(c, l, _)| (u32::from(c), u32::from(l)))
 }
 
 fn put_run(o: &mut BitOut, white: bool, mut run: u32) {
@@ -900,15 +913,32 @@ fn put_run(o: &mut BitOut, white: bool, mut run: u32) {
     o.put(c, l);
 }
 
+/// The changing elements of a packed row: every pixel whose colour differs
+/// from the pixel on its left (white before the row).
+///
+/// A byte at a time: with black as 1, `b ^ (b >> 1 | left << 7)` has a bit
+/// set exactly where a pixel differs from its left neighbour, so a byte
+/// without a change (most of a scanned page) costs one test, and each change
+/// is one `leading_zeros`. Testing one pixel per loop turn was 17 Ir a pixel.
 fn row_changes(row: &[u8], width: u32, black_is_1: bool, out: &mut Vec<u32>) {
     out.clear();
-    let mut prev_black = false;
-    for x in 0..width as usize {
-        let bit = (row[x >> 3] >> (7 - (x & 7))) & 1 == 1;
-        let black = bit == black_is_1;
-        if black != prev_black {
-            out.push(x as u32);
-            prev_black = black;
+    let width = width as usize;
+    let flip = if black_is_1 { 0 } else { 0xFF };
+    // The pixel left of the current byte (1 = black).
+    let mut left = 0u8;
+    for (i, &raw) in row[..width.div_ceil(8)].iter().enumerate() {
+        let b = raw ^ flip;
+        let mut t = b ^ ((b >> 1) | (left << 7));
+        left = b & 1;
+        let base = i * 8;
+        if base + 8 > width {
+            // The last byte: its pad bits are not pixels.
+            t &= !(0xFFu8 >> (width - base));
+        }
+        while t != 0 {
+            let k = t.leading_zeros();
+            out.push(base as u32 + k);
+            t &= !(0x80u8 >> k);
         }
     }
 }
@@ -1054,6 +1084,97 @@ pub fn encode(pixels: &[u8], opts: &Options) -> Result<Vec<u8>, CcittError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_changes_matches_per_pixel_scan() {
+        let mut seed = 21u32;
+        let mut out = Vec::new();
+        for width in [1u32, 2, 7, 8, 9, 15, 16, 17, 63, 64, 65, 200] {
+            for density in [0u32, 1, 8, 128, 255] {
+                for black_is_1 in [false, true] {
+                    let row: Vec<u8> = (0..width.div_ceil(8))
+                        .map(|_| {
+                            // Runs of equal bits of varying length (and
+                            // plain noise at the top density).
+                            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                            let r = (seed >> 16) as u8;
+                            if u32::from(r) < density {
+                                (seed >> 8) as u8
+                            } else if r & 1 == 0 {
+                                0
+                            } else {
+                                0xFF
+                            }
+                        })
+                        .collect();
+                    let mut want = Vec::new();
+                    let mut prev_black = false;
+                    for x in 0..width as usize {
+                        let bit = (row[x >> 3] >> (7 - (x & 7))) & 1 == 1;
+                        let black = bit == black_is_1;
+                        if black != prev_black {
+                            want.push(x as u32);
+                            prev_black = black;
+                        }
+                    }
+                    row_changes(&row, width, black_is_1, &mut out);
+                    assert_eq!(out, want, "width {width} density {density} {black_is_1}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bit_writer_matches_per_bit_writes() {
+        let mut seed = 9u32;
+        let mut o = BitOut {
+            out: Vec::new(),
+            acc: 0,
+            n: 0,
+        };
+        // The definition: one bit at a time into a byte.
+        let (mut want, mut acc, mut n) = (Vec::new(), 0u8, 0u32);
+        for i in 0..5000u32 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let len = (seed >> 16) % 14;
+            let code = seed >> 8;
+            o.put(code, len);
+            for k in (0..len).rev() {
+                acc = (acc << 1) | ((code >> k) & 1) as u8;
+                n += 1;
+                if n == 8 {
+                    want.push(acc);
+                    (acc, n) = (0, 0);
+                }
+            }
+            if i % 97 == 0 {
+                o.align();
+                if n > 0 {
+                    want.push(acc << (8 - n));
+                    (acc, n) = (0, 0);
+                }
+            }
+        }
+        o.align();
+        if n > 0 {
+            want.push(acc << (8 - n));
+        }
+        assert_eq!(o.out, want);
+    }
+
+    #[test]
+    fn code_for_matches_a_table_search() {
+        for table in [WHITE, BLACK] {
+            for run in 0..3000u32 {
+                let want = table
+                    .iter()
+                    .chain(EXTENDED)
+                    .find(|&&(_, _, r)| u32::from(r) == run)
+                    .map_or((0, 0), |&(c, l, _)| (u32::from(c), u32::from(l)));
+                assert_eq!(code_for(table, run), want, "run {run}");
+            }
+        }
+    }
 
     #[test]
     fn paint_span_matches_per_bit() {

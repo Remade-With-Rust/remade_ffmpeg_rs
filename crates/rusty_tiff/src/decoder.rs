@@ -1003,8 +1003,21 @@ fn copy_typed<T: Sample>(out: &mut [T], chunk: &[u8], g: &Geom) {
         let src = &chunk[r * g.chunk_row_bytes..];
         let y = g.y0 + r;
         if g.planar {
-            for i in 0..g.cols {
-                out[(y * g.width + g.x0 + i) * g.spp + g.plane] = T::from_ne(&src[i * T::N..]);
+            // One sample of every pixel of the row. The pixel is a
+            // fixed-size chunk for 2 to 4 samples, so the write is one store
+            // at a constant stride; indexing `out` per sample (a multiply
+            // and a bounds check each) was 10 Ir a sample.
+            let base = (y * g.width + g.x0) * g.spp;
+            let row = &mut out[base..base + g.cols * g.spp];
+            match g.spp {
+                2 => scatter::<T, 2>(row, src, g.plane),
+                3 => scatter::<T, 3>(row, src, g.plane),
+                4 => scatter::<T, 4>(row, src, g.plane),
+                _ => {
+                    for (px, s) in row.chunks_exact_mut(g.spp).zip(src.chunks_exact(T::N)) {
+                        px[g.plane] = T::from_ne(s);
+                    }
+                }
             }
         } else {
             let base = (y * g.width + g.x0) * g.spp;
@@ -1013,6 +1026,16 @@ fn copy_typed<T: Sample>(out: &mut [T], chunk: &[u8], g: &Geom) {
                 *d = T::from_ne(s);
             }
         }
+    }
+}
+
+/// Write the samples in `src` to sample `plane` of each `SPP`-sample pixel
+/// of `row`.
+fn scatter<T: Sample, const SPP: usize>(row: &mut [T], src: &[u8], plane: usize) {
+    assert!(plane < SPP);
+    for (px, s) in row.chunks_exact_mut(SPP).zip(src.chunks_exact(T::N)) {
+        let px: &mut [T; SPP] = px.try_into().unwrap();
+        px[plane] = T::from_ne(s);
     }
 }
 
@@ -1050,6 +1073,23 @@ fn copy_packed(out: &mut [u8], chunk: &[u8], g: &Geom, out_row_bytes: usize) {
             dst.copy_from_slice(src);
             continue;
         }
+        let bit0 = g.x0 * g.spp * g.bits;
+        if !g.planar && bit0.is_multiple_of(8) {
+            // A tile that starts on a byte of the output row (every tile of
+            // a TIFF with the required multiple-of-16 tile width): whole
+            // bytes are copied, and a last partial byte is merged under a
+            // mask so the bits right of the tile stay as they were. Moving
+            // one bit at a time was 386 Ir per output byte.
+            let nbits = g.cols * g.spp * g.bits;
+            let (full, rem) = (nbits / 8, nbits % 8);
+            let d = &mut dst[bit0 / 8..];
+            d[..full].copy_from_slice(&src[..full]);
+            if rem != 0 {
+                let m = !(0xFFu8 >> rem);
+                d[full] = (d[full] & !m) | (src[full] & m);
+            }
+            continue;
+        }
         if g.planar {
             for i in 0..g.cols {
                 let v = get_bits(src, i * g.bits, g.bits);
@@ -1068,11 +1108,13 @@ fn copy_packed(out: &mut [u8], chunk: &[u8], g: &Geom, out_row_bytes: usize) {
 /// Zero-fill always allowed, whatever the ratio (unless it is 0).
 const FILL_FLOOR: u64 = 64 << 10;
 
-/// The limits, plus the zero-fill accounting of one image decode: how many
-/// bytes were really decoded, how many were zero-filled because a chunk
-/// ended early, and the most the chunks not yet decoded can still produce.
+/// The state of one image decode. The limits, plus the zero-fill
+/// accounting: how many bytes were really decoded, how many were zero-filled
+/// because a chunk ended early, and the most the chunks not yet decoded can
+/// still produce. And the inflater the Deflate chunks share (reset for each).
 struct Budget<'a> {
     limits: &'a Limits,
+    inflate: Option<flate2::Decompress>,
     /// Most bytes one stored byte can decode to with this compression.
     per_byte: u64,
     potential: u64,
@@ -1167,6 +1209,7 @@ fn decode_image<R: Read + Seek>(
     let per_byte = max_expansion(info.compression, row_bytes(cw0, img.spp_chunk(), bits)?);
     let mut budget = Budget {
         limits,
+        inflate: None,
         per_byte,
         potential: stored.saturating_mul(per_byte),
         real: 0,
@@ -1185,6 +1228,9 @@ fn decode_image<R: Read + Seek>(
     let samples = total_bytes / (usize::from(bits.max(8)) / 8);
     if !info.tiled && img.planes() == 1 {
         return decode_strips(s, img, limits, interpret, total_bytes, samples);
+    }
+    if info.tiled && img.planes() == 1 && bits == 8 {
+        return decode_tile_bands(s, img, limits, interpret, total_bytes);
     }
     let mut out = match bits {
         1 | 2 | 4 => Out::Packed(zeroed(total_bytes)?),
@@ -1323,6 +1369,79 @@ fn decode_strips<R: Read + Seek>(
     Ok(typed_result(out, info.sample_kind, bits))
 }
 
+/// Tiled images with one plane of 8-bit samples: one row of tiles (a band)
+/// is decoded into one buffer, then the band's image rows are appended to
+/// the output, each tile's part cut to the image width.
+///
+/// The output is never zero-filled. The general path allocates the image
+/// zeroed and overwrites it tile by tile, which sends every byte to memory
+/// twice; on the clock that made an uncompressed tiled decode from memory
+/// 0.86-0.89x the speed of the `tiff` crate, where a stripped one is 1.5x.
+/// With the band it is 0.96-1.04x: 2-11% faster than before on
+/// uncompressed and PackBits tiles (median of 400-600 interleaved rounds;
+/// LZW and Deflate are bound by the codec and do not move).
+///
+/// 8-bit only, because the clock said so: at 16 bits the same band path
+/// measured no gain (median +1.6%, 261 of 600 pairs), and neither did
+/// zero-filling the output a band at a time.
+///
+/// Memory: beside the image, one band. A tile is cut to the rows the image
+/// uses as soon as it is decoded, so the band holds at most those rows of
+/// every tile plus one whole tile, however much taller than the image the
+/// tiles are.
+fn decode_tile_bands<R: Read + Seek>(
+    s: &mut Stream<R>,
+    img: &Image,
+    limits: &mut Budget<'_>,
+    interpret: bool,
+    total_bytes: usize,
+) -> TiffResult<DecodingResult> {
+    let info = &img.info;
+    let (cw, ch) = info.chunk_dimensions;
+    let (across, down) = img.across_down();
+    let tile_row = row_bytes(cw, img.spp_chunk(), 8)?;
+    let px = usize::from(info.samples_per_pixel);
+    let too_big = || TiffError::limits("cannot allocate a band of tiles");
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(total_bytes)
+        .map_err(|_| TiffError::limits(format!("cannot allocate {total_bytes} bytes")))?;
+    let mut band: Vec<u8> = Vec::new();
+    for cy in 0..down {
+        let rows = ch.min(info.height - cy * ch) as usize;
+        // Bytes of each tile the image uses (its first `rows` rows).
+        let keep = rows * tile_row;
+        // Room for every tile's kept rows, and for the whole of the tile
+        // being decoded, so the band never reallocates inside the loop.
+        let need = tile_row
+            .checked_mul(ch as usize)
+            .and_then(|t| (across as usize - 1).checked_mul(keep)?.checked_add(t))
+            .ok_or_else(too_big)?;
+        band.clear();
+        band.try_reserve_exact(need).map_err(|_| too_big())?;
+        for cx in 0..across {
+            let at = band.len();
+            decode_chunk_append(
+                s,
+                img,
+                (cy * across + cx) as usize,
+                (cw, ch, tile_row),
+                limits,
+                interpret,
+                &mut band,
+            )?;
+            band.truncate(at + keep);
+        }
+        for r in 0..rows {
+            for cx in 0..across {
+                let cols = cw.min(info.width - cx * cw) as usize;
+                let at = cx as usize * keep + r * tile_row;
+                out.extend_from_slice(&band[at..at + cols * px]);
+            }
+        }
+    }
+    Ok(typed_result(Out::U8(out), info.sample_kind, 8))
+}
+
 fn typed_result(out: Out, kind: SampleKind, bits: u16) -> DecodingResult {
     match (out, kind) {
         (Out::Packed(v) | Out::U8(v), SampleKind::Uint | SampleKind::Float) => {
@@ -1432,7 +1551,7 @@ fn decode_chunk_append<R: Read + Seek>(
         let real = match comp {
             compression::LZW => lzw::decode_append(&raw, dst, expected)?,
             compression::DEFLATE | compression::OLD_DEFLATE => {
-                deflate::decode_append(&raw, dst, expected)?
+                deflate::decode_append(&raw, dst, expected, &mut budget.inflate)?
             }
             compression::PACKBITS => packbits::decode_append(&raw, dst, expected)?,
             compression::CCITT_RLE | compression::CCITT_FAX3 | compression::CCITT_FAX4 => {
@@ -1454,15 +1573,16 @@ fn decode_chunk_append<R: Read + Seek>(
                 return budget.chunk(n, expected, expected);
             }
             compression::JPEG => {
-                dst.resize(start + expected, 0);
                 decode_jpeg_chunk(
                     img,
                     &raw,
                     (cw, rows, chunk_row_bytes),
-                    &mut dst[start..],
+                    dst,
                     limits,
                     interpret,
                 )?;
+                // Rows the JPEG does not hold read as zero.
+                dst.resize(start + expected, 0);
                 return budget.chunk(n, expected, expected);
             }
             compression::OLD_JPEG => {
@@ -1489,12 +1609,16 @@ fn decode_chunk_append<R: Read + Seek>(
     Ok(())
 }
 
+/// Decode one JPEG strip or tile and append its rows to `dst`, each cut or
+/// zero-padded to `chunk_row_bytes`. The rows are appended (the caller
+/// reserved nothing and zero-fills only rows the JPEG lacks): zero-filling
+/// the chunk first and copying over it wrote every byte twice.
 #[cfg(feature = "jpeg")]
 fn decode_jpeg_chunk(
     img: &Image,
     raw: &[u8],
     (cw, rows, chunk_row_bytes): (u32, u32, usize),
-    buf: &mut [u8],
+    dst: &mut Vec<u8>,
     limits: &Limits,
     convert_ycbcr: bool,
 ) -> TiffResult<()> {
@@ -1516,8 +1640,14 @@ fn decode_jpeg_chunk(
     }
     let src_row = j.width as usize * usize::from(spp);
     let copy = src_row.min(chunk_row_bytes);
-    for r in 0..rows.min(j.height) as usize {
-        buf[r * chunk_row_bytes..][..copy].copy_from_slice(&j.data[r * src_row..][..copy]);
+    let have = rows.min(j.height) as usize;
+    dst.try_reserve_exact(chunk_row_bytes * rows as usize)
+        .map_err(|_| TiffError::limits("cannot allocate a JPEG chunk"))?;
+    for r in 0..have {
+        dst.extend_from_slice(&j.data[r * src_row..][..copy]);
+        if copy < chunk_row_bytes {
+            dst.resize(dst.len() + chunk_row_bytes - copy, 0);
+        }
     }
     Ok(())
 }
@@ -1527,7 +1657,7 @@ fn decode_jpeg_chunk(
     _img: &Image,
     _raw: &[u8],
     _geom: (u32, u32, usize),
-    _buf: &mut [u8],
+    _dst: &mut Vec<u8>,
     _limits: &Limits,
     _convert_ycbcr: bool,
 ) -> TiffResult<()> {
@@ -1536,12 +1666,15 @@ fn decode_jpeg_chunk(
     ))
 }
 
-// Invert only the grey channel (sample 0 of each pixel).
+// Invert only the grey channel (sample 0 of each pixel). Plain grey takes
+// one straight pass, which vectorises; with extra samples the pass steps a
+// pixel at a time. Testing `i % n == 0` on every sample was a division per
+// sample: 11.7 Ir a sample on 8-bit grey.
 fn each<T>(v: &mut [T], n: usize, f: impl Fn(&mut T)) {
-    for (i, x) in v.iter_mut().enumerate() {
-        if i % n == 0 {
-            f(x);
-        }
+    if n == 1 {
+        v.iter_mut().for_each(f);
+    } else {
+        v.iter_mut().step_by(n).for_each(f);
     }
 }
 
@@ -1585,27 +1718,82 @@ fn expand_palette(
     let bits = usize::from(info.bits_per_sample);
     let entries = 1usize << bits;
     let (w, h) = (info.width as usize, info.height as usize);
+    if map.len() < 3 * entries {
+        return Err(TiffError::format("ColorMap too short"));
+    }
     let mut out = Vec::with_capacity(w * h * 3);
-    let mut push = |idx: usize| {
+    let push = |out: &mut Vec<u16>, idx: usize| {
         out.push(map[idx]);
         out.push(map[entries + idx]);
         out.push(map[2 * entries + idx]);
     };
     match raw {
         DecodingResult::U8(v) if bits < 8 => {
+            // Packed indices, most significant first: every stored byte
+            // holds `8 / bits` of them, so a byte is split with constant
+            // shifts instead of one `get_bits` call (a loop over the bits)
+            // per pixel: 111 Ir a pixel at 4 bits.
+            let table = rgb_table(map, entries);
             let stride = (w * bits).div_ceil(8);
-            for y in 0..h {
-                let row = &v[y * stride..][..stride];
-                for x in 0..w {
-                    push(usize::from(get_bits(row, x * bits, bits)));
+            for row in v.chunks_exact(stride).take(h) {
+                match bits {
+                    4 => expand_packed_row::<4>(row, w, &table, &mut out),
+                    2 => expand_packed_row::<2>(row, w, &table, &mut out),
+                    _ => expand_packed_row::<1>(row, w, &table, &mut out),
                 }
             }
         }
-        DecodingResult::U8(v) => v.iter().for_each(|&i| push(usize::from(i))),
-        DecodingResult::U16(v) => v.iter().for_each(|&i| push(usize::from(i))),
+        DecodingResult::U8(v) => {
+            // One `[r, g, b]` entry per index, read with one fixed-size
+            // index (a `u8` cannot leave a 256-entry table) and appended
+            // as one sized extend. Three pushes per pixel, each with its
+            // own capacity check and a bounds-checked read of one of the
+            // colormap's three planes, cost 61 Ir a pixel.
+            let table = rgb_table(map, entries);
+            out.extend(v.iter().flat_map(|&i| table[usize::from(i)]));
+        }
+        DecodingResult::U16(v) => v.iter().for_each(|&i| push(&mut out, usize::from(i))),
         _ => return Err(TiffError::unsupported("palette sample type")),
     }
     Ok(DecodingResult::U16(out))
+}
+
+/// Append the colours of one packed row of `w` `BITS`-bit palette indices.
+fn expand_packed_row<const BITS: usize>(
+    row: &[u8],
+    w: usize,
+    table: &[[u16; 3]; 256],
+    out: &mut Vec<u16>,
+) {
+    let per = 8 / BITS;
+    let mask = (1usize << BITS) - 1;
+    let full = (w / per).min(row.len());
+    for &b in &row[..full] {
+        for j in 0..per {
+            let idx = (usize::from(b) >> (8 - BITS * (j + 1))) & mask;
+            out.extend_from_slice(&table[idx]);
+        }
+    }
+    // The pixels of a last, partly used byte.
+    if let Some(&b) = row.get(full) {
+        for j in 0..w % per {
+            let idx = (usize::from(b) >> (8 - BITS * (j + 1))) & mask;
+            out.extend_from_slice(&table[idx]);
+        }
+    }
+}
+
+/// The colormap's first `entries` (at most 256) colours as `[r, g, b]`
+/// triples. `map` holds at least `3 * entries` values: all reds, then all
+/// greens, then all blues.
+fn rgb_table(map: &[u16], entries: usize) -> [[u16; 3]; 256] {
+    let mut table = [[0u16; 3]; 256];
+    let (r, gb) = map.split_at(entries);
+    let (g, b) = gb.split_at(entries);
+    for (((t, &r), &g), &b) in table.iter_mut().zip(r).zip(g).zip(b) {
+        *t = [r, g, b];
+    }
+    table
 }
 
 /// The entry, unless its field-type code is one TIFF does not define (such
@@ -1638,6 +1826,212 @@ mod tests {
             };
             assert_eq!(c.to_ne_bytes(), want);
             assert_eq!(c.into_ne_bytes(), want);
+        }
+    }
+
+    /// The assembly reference: every sample moved one bit at a time.
+    fn copy_packed_bits(out: &mut [u8], chunk: &[u8], g: &Geom, out_row_bytes: usize) {
+        for r in 0..g.rows {
+            let src = &chunk[r * g.chunk_row_bytes..][..g.chunk_row_bytes];
+            let dst = &mut out[(g.y0 + r) * out_row_bytes..][..out_row_bytes];
+            let n = if g.planar { g.cols } else { g.cols * g.spp };
+            for i in 0..n {
+                let v = get_bits(src, i * g.bits, g.bits);
+                let at = if g.planar {
+                    ((g.x0 + i) * g.spp + g.plane) * g.bits
+                } else {
+                    (g.x0 * g.spp + i) * g.bits
+                };
+                set_bits(dst, at, g.bits, v);
+            }
+        }
+    }
+
+    #[test]
+    fn copy_packed_matches_per_bit_moves() {
+        let mut seed = 7u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) as usize
+        };
+        for bits in [1usize, 2, 4] {
+            for spp in [1usize, 3] {
+                for planar in [false, true] {
+                    for (width, cw) in [(40usize, 16usize), (37, 16), (21, 5), (9, 9), (64, 24)] {
+                        let (height, ch) = (5usize, 3usize);
+                        let out_row = (width * spp * bits).div_ceil(8);
+                        let spp_chunk = if planar { 1 } else { spp };
+                        let chunk_row = (cw * spp_chunk * bits).div_ceil(8);
+                        // Start from set bits, so a bit the copy must leave
+                        // alone is seen if it gets cleared.
+                        let mut a = vec![0xA5u8; out_row * height];
+                        let mut b = a.clone();
+                        for plane in 0..if planar { spp } else { 1 } {
+                            for y0 in (0..height).step_by(ch) {
+                                for x0 in (0..width).step_by(cw) {
+                                    let chunk: Vec<u8> =
+                                        (0..chunk_row * ch).map(|_| rnd() as u8).collect();
+                                    let g = Geom {
+                                        width,
+                                        spp,
+                                        planar,
+                                        plane,
+                                        x0,
+                                        y0,
+                                        cols: cw.min(width - x0),
+                                        rows: ch.min(height - y0),
+                                        chunk_row_bytes: chunk_row,
+                                        bits,
+                                    };
+                                    // The reference never takes the strip
+                                    // shortcut (which also copies pad bits).
+                                    if !(x0 == 0 && chunk_row == out_row && !planar) {
+                                        copy_packed(&mut a, &chunk, &g, out_row);
+                                        copy_packed_bits(&mut b, &chunk, &g, out_row);
+                                    }
+                                }
+                            }
+                        }
+                        assert_eq!(
+                            a, b,
+                            "bits {bits} spp {spp} planar {planar} w {width} cw {cw}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn palette_expansion_matches_the_definition() {
+        let mut seed = 5u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) as u16
+        };
+        for bits in [1u16, 2, 4, 8] {
+            let entries = 1usize << bits;
+            let map: Vec<u16> = (0..3 * entries).map(|_| rnd()).collect();
+            for (w, h) in [
+                (1u32, 1u32),
+                (3, 2),
+                (7, 3),
+                (8, 2),
+                (9, 4),
+                (16, 1),
+                (37, 5),
+            ] {
+                let stride = (w as usize * usize::from(bits)).div_ceil(8);
+                let raw: Vec<u8> = (0..stride * h as usize).map(|_| rnd() as u8).collect();
+                // The definition: pixel by pixel, one bit at a time.
+                let mut want = Vec::new();
+                for y in 0..h as usize {
+                    let row = &raw[y * stride..][..stride];
+                    for x in 0..w as usize {
+                        let i =
+                            usize::from(get_bits(row, x * usize::from(bits), usize::from(bits)));
+                        want.extend_from_slice(&[map[i], map[entries + i], map[2 * entries + i]]);
+                    }
+                }
+                let info = ImageInfo {
+                    width: w,
+                    height: h,
+                    bits_per_sample: bits,
+                    samples_per_pixel: 1,
+                    sample_kind: SampleKind::Uint,
+                    photometric: photometric::PALETTE,
+                    compression: compression::NONE,
+                    predictor: 1,
+                    planar: false,
+                    tiled: false,
+                    chunk_dimensions: (w, h),
+                    extra_samples: Vec::new(),
+                    fill_order: 1,
+                };
+                let got = expand_palette(&DecodingResult::U8(raw), &info, &map).unwrap();
+                assert_eq!(got, DecodingResult::U16(want), "bits {bits} {w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn each_visits_sample_zero_of_every_pixel() {
+        for n in 1..=5usize {
+            for len in [0usize, 1, 2, 5, 16, 33, 64] {
+                let orig: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+                let mut want = orig.clone();
+                for (i, x) in want.iter_mut().enumerate() {
+                    if i % n == 0 {
+                        *x = !*x;
+                    }
+                }
+                let mut got = orig.clone();
+                each(&mut got, n, |x| *x = !*x);
+                assert_eq!(got, want, "n {n} len {len}");
+            }
+        }
+    }
+
+    /// Tiles decoded through the band path against the pixels they were
+    /// written from: tiles wider and taller than the image, partial last
+    /// columns and rows, one-pixel tiles, with and without a codec.
+    #[test]
+    fn tile_bands_reassemble_the_image() {
+        use crate::encoder::{colortype, Compression, TiffEncoder};
+        use std::io::Cursor;
+        let mut seed = 3u32;
+        for (w, h) in [(1u32, 1u32), (5, 3), (16, 16), (37, 21), (64, 9), (100, 70)] {
+            let rgb: Vec<u8> = (0..w * h * 3)
+                .map(|i| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    // Runs and noise, so PackBits and LZW both have work.
+                    if (i / 24) % 3 == 0 {
+                        7
+                    } else {
+                        (seed >> 16) as u8
+                    }
+                })
+                .collect();
+            let grey: Vec<u8> = rgb.iter().step_by(3).copied().collect();
+            for (tw, th) in [
+                (16u32, 16u32),
+                (1, 1),
+                (5, 7),
+                (48, 16),
+                (16, 96),
+                (128, 128),
+            ] {
+                for comp in [Compression::None, Compression::PackBits, Compression::Lzw] {
+                    let mut f = Cursor::new(Vec::new());
+                    let mut e = TiffEncoder::new(&mut f).unwrap();
+                    let mut img = e
+                        .new_image::<colortype::RGB8>(w, h)
+                        .unwrap()
+                        .with_compression(comp);
+                    img.tiles(tw, th);
+                    img.write_data(&rgb).unwrap();
+                    let mut img = e
+                        .new_image::<colortype::Gray8>(w, h)
+                        .unwrap()
+                        .with_compression(comp);
+                    img.tiles(tw, th);
+                    img.write_data(&grey).unwrap();
+                    let file = f.into_inner();
+                    let mut d = Decoder::new(Cursor::new(&file)).unwrap();
+                    let what = format!("{w}x{h} tiles {tw}x{th} {comp:?}");
+                    assert_eq!(
+                        d.read_image().unwrap(),
+                        DecodingResult::U8(rgb.clone()),
+                        "{what}"
+                    );
+                    d.next_image().unwrap();
+                    assert_eq!(
+                        d.read_image().unwrap(),
+                        DecodingResult::U8(grey.clone()),
+                        "{what}"
+                    );
+                }
+            }
         }
     }
 

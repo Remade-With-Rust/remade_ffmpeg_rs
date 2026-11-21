@@ -411,6 +411,104 @@ impl<W: Write + Seek> TiffEncoder<W> {
     }
 }
 
+/// Where a tile or a plane's chunk sits in the image.
+struct ChunkGeom {
+    /// First column and row of the chunk.
+    x0: usize,
+    y0: usize,
+    /// The plane it holds (planar only).
+    plane: usize,
+    planar: bool,
+    /// Rows and columns of the chunk that lie inside the image.
+    vrows: usize,
+    vcols: usize,
+    /// Bytes per image row and per chunk row.
+    full_row: usize,
+    chunk_row: usize,
+    /// Bytes of the whole chunk, padding included.
+    len: usize,
+}
+
+/// Assemble a chunk that is not one stretch of the input (a tile, one plane,
+/// packed sub-byte rows) in `buf`; padding reads as zero.
+///
+/// Kept out of line: `write_data` is one loop over the chunks whose common
+/// case hands a strip to the codec straight from the input, and with this
+/// block inlined an edit to any assembly arm moved the strip loop too (one
+/// reshaped the planar arm and cost the strip loop 81 Ir a strip).
+#[inline(never)]
+fn assemble<C: ColorType>(buf: &mut Vec<u8>, native: &[u8], g: &ChunkGeom) {
+    let bits = C::BITS_PER_SAMPLE;
+    let spp = C::SAMPLES;
+    let bytes = usize::from(bits) / 8;
+    let (x0, plane, planar) = (g.x0, g.plane, g.planar);
+    let (vcols, full_row, chunk_row) = (g.vcols, g.full_row, g.chunk_row);
+    if bits >= 8 && !planar {
+        // Interleaved tiles: each row is appended, then the zeros that pad
+        // it to the tile width, then the rows of padding below the image.
+        // Zero-filling the whole tile first wrote every byte of an interior
+        // tile twice.
+        let s = x0 * usize::from(spp) * bytes;
+        let n = vcols * usize::from(spp) * bytes;
+        for r in 0..g.vrows {
+            let src = &native[(g.y0 + r) * full_row..][..full_row];
+            buf.extend_from_slice(&src[s..s + n]);
+            if n < chunk_row {
+                buf.resize(buf.len() + chunk_row - n, 0);
+            }
+        }
+        buf.resize(g.len, 0);
+        return;
+    }
+    buf.resize(g.len, 0);
+    for r in 0..g.vrows {
+        let src = &native[(g.y0 + r) * full_row..][..full_row];
+        let dst = &mut buf[r * chunk_row..][..chunk_row];
+        let px_bits = usize::from(spp) * usize::from(bits);
+        let bit0 = x0 * px_bits;
+        if bits < 8 && !planar && bit0.is_multiple_of(8) {
+            // A strip, or a tile that starts on a byte of the input row:
+            // whole bytes are copied and a last partial byte is masked, so
+            // the pad bits are written as zero whatever the caller left in
+            // them. Moving one bit per loop turn cost 196 Ir per output
+            // byte.
+            let nbits = vcols * px_bits;
+            let (full, rem) = (nbits / 8, nbits % 8);
+            let s = &src[bit0 / 8..];
+            dst[..full].copy_from_slice(&s[..full]);
+            if rem != 0 {
+                dst[full] = s[full] & !(0xFFu8 >> rem);
+            }
+        } else if bits < 8 {
+            let n = if planar {
+                vcols
+            } else {
+                vcols * usize::from(spp)
+            };
+            for i in 0..n {
+                let sbit = if planar {
+                    ((x0 + i) * usize::from(spp) + plane) * usize::from(bits)
+                } else {
+                    (x0 * usize::from(spp) + i) * usize::from(bits)
+                };
+                let v = get_bits(src, sbit, usize::from(bits));
+                set_bits(dst, i * usize::from(bits), usize::from(bits), v);
+            }
+        } else {
+            // One sample of every pixel: the row is walked in whole pixels
+            // (their size is fixed by the colour type) and the plane's
+            // sample is one fixed-size move. Indexing source and
+            // destination per sample was 10 Ir a sample at 8 bits.
+            let step = usize::from(spp) * bytes;
+            let off = plane * bytes;
+            let pixels = src[x0 * step..][..vcols * step].chunks_exact(step);
+            for (d, px) in dst[..vcols * bytes].chunks_exact_mut(bytes).zip(pixels) {
+                d.copy_from_slice(&px[off..off + bytes]);
+            }
+        }
+    }
+}
+
 /// One image being written. Created by [`TiffEncoder::new_image`].
 pub struct ImageEncoder<'a, W: Write + Seek, C: ColorType> {
     enc: &'a mut TiffEncoder<W>,
@@ -575,43 +673,18 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
                         if contiguous {
                             buf.extend_from_slice(&native[y0 as usize * full_row..][..len]);
                         } else {
-                            // Tiles and planes: padding must read as zero.
-                            buf.resize(len, 0);
-                            let vrows = rows.min(h - y0) as usize;
-                            let vcols = cw.min(w - x0) as usize;
-                            for r in 0..vrows {
-                                let src = &native[(y0 as usize + r) * full_row..][..full_row];
-                                let dst = &mut buf[r * chunk_row..][..chunk_row];
-                                if bits < 8 {
-                                    let n = if planar {
-                                        vcols
-                                    } else {
-                                        vcols * usize::from(spp)
-                                    };
-                                    for i in 0..n {
-                                        let sbit = if planar {
-                                            ((x0 as usize + i) * usize::from(spp) + plane as usize)
-                                                * usize::from(bits)
-                                        } else {
-                                            (x0 as usize * usize::from(spp) + i) * usize::from(bits)
-                                        };
-                                        let v = get_bits(src, sbit, usize::from(bits));
-                                        set_bits(dst, i * usize::from(bits), usize::from(bits), v);
-                                    }
-                                } else if planar {
-                                    for i in 0..vcols {
-                                        let s = ((x0 as usize + i) * usize::from(spp)
-                                            + plane as usize)
-                                            * bytes;
-                                        dst[i * bytes..][..bytes]
-                                            .copy_from_slice(&src[s..s + bytes]);
-                                    }
-                                } else {
-                                    let s = x0 as usize * usize::from(spp) * bytes;
-                                    let n = vcols * usize::from(spp) * bytes;
-                                    dst[..n].copy_from_slice(&src[s..s + n]);
-                                }
-                            }
+                            let g = ChunkGeom {
+                                x0: x0 as usize,
+                                y0: y0 as usize,
+                                plane: plane as usize,
+                                planar,
+                                vrows: rows.min(h - y0) as usize,
+                                vcols: cw.min(w - x0) as usize,
+                                full_row,
+                                chunk_row,
+                                len,
+                            };
+                            assemble::<C>(&mut buf, &native, &g);
                         }
                         let sppc = usize::from(spp_chunk);
                         match self.predictor {
@@ -742,5 +815,75 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
             e.insert(292, Value::Long(vec![0]));
         }
         self.enc.write_ifd(&e, self.detached)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn encode<C: ColorType<Inner = u8>>(
+        (w, h): (u32, u32),
+        tiles: Option<(u32, u32)>,
+        comp: Compression,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut f = Cursor::new(Vec::new());
+        let mut e = TiffEncoder::new(&mut f).unwrap();
+        let mut img = e.new_image::<C>(w, h).unwrap().with_compression(comp);
+        if let Some((tw, th)) = tiles {
+            img.tiles(tw, th);
+        }
+        img.write_data(data).unwrap();
+        f.into_inner()
+    }
+
+    /// The pad bits of a packed row belong to the caller: the file must not
+    /// depend on them (they are written as zero), for strips, for tiles
+    /// that start on a byte and for tiles that start inside one.
+    #[test]
+    fn sub_byte_pad_bits_are_written_as_zero() {
+        fn case<C: ColorType<Inner = u8>>(w: u32, h: u32) {
+            let bits = u32::from(C::BITS_PER_SAMPLE);
+            let stride = (w * bits).div_ceil(8) as usize;
+            let used = (w * bits) % 8;
+            let mut seed = w * 31 + bits;
+            let mut clean: Vec<u8> = (0..stride * h as usize)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    (seed >> 16) as u8
+                })
+                .collect();
+            let mut dirty = clean.clone();
+            if used != 0 {
+                let pad = 0xFFu8 >> used;
+                for (c, d) in clean
+                    .chunks_exact_mut(stride)
+                    .zip(dirty.chunks_exact_mut(stride))
+                {
+                    c[stride - 1] &= !pad;
+                    d[stride - 1] |= pad;
+                }
+            }
+            for tiles in [None, Some((16, 16)), Some((5, 4)), Some((24, 3))] {
+                for comp in [Compression::None, Compression::PackBits, Compression::Lzw] {
+                    let a = encode::<C>((w, h), tiles, comp, &clean);
+                    let b = encode::<C>((w, h), tiles, comp, &dirty);
+                    assert_eq!(a, b, "{w}x{h} {bits}-bit {tiles:?} {comp:?}");
+                    let mut d = crate::Decoder::new(Cursor::new(&a)).unwrap();
+                    assert_eq!(
+                        d.read_image_raw().unwrap(),
+                        crate::DecodingResult::U8(clean.clone()),
+                        "decode {w}x{h} {bits}-bit {tiles:?} {comp:?}"
+                    );
+                }
+            }
+        }
+        for (w, h) in [(1, 1), (7, 3), (8, 2), (13, 5), (37, 9), (64, 4)] {
+            case::<colortype::Gray1>(w, h);
+            case::<colortype::Gray2>(w, h);
+            case::<colortype::Gray4>(w, h);
+        }
     }
 }
