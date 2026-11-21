@@ -625,7 +625,31 @@ fn gradient(p: &mut Pipeline) {
         idx.0[14] += (t1[6] >= tt) as u16;
         idx.0[15] += (t1[7] >= tt) as u16;
     }
-    gradient_lookup(ctx, &idx, t, &mut p.r, &mut p.g, &mut p.b, &mut p.a);
+
+    // Stops are usually many pixels apart, so most groups of 16 sit between
+    // the same two stops and need one factor and one bias, not 16 of each
+    // gathered lane by lane into eight vectors. The arithmetic per lane is
+    // the general path's (`t * factor + bias` with the same two colours).
+    let first = idx.0[0];
+    let mut uniform = true;
+    for i in 1..STAGE_WIDTH {
+        uniform &= idx.0[i] == first;
+    }
+    match (uniform, ctx.factors.get(usize::from(first)), ctx.biases.get(usize::from(first))) {
+        (true, Some(factor), Some(bias)) => {
+            let (rf, gf, bf, af) = scale_for_u16(
+                mad(t, f32x16::splat(factor.r), f32x16::splat(bias.r)),
+                mad(t, f32x16::splat(factor.g), f32x16::splat(bias.g)),
+                mad(t, f32x16::splat(factor.b), f32x16::splat(bias.b)),
+                mad(t, f32x16::splat(factor.a), f32x16::splat(bias.a)),
+            );
+            rf.save_to_u16x16(&mut p.r);
+            gf.save_to_u16x16(&mut p.g);
+            bf.save_to_u16x16(&mut p.b);
+            af.save_to_u16x16(&mut p.a);
+        }
+        _ => gradient_lookup(ctx, &idx, t, &mut p.r, &mut p.g, &mut p.b, &mut p.a),
+    }
 
     p.next_stage();
 }
