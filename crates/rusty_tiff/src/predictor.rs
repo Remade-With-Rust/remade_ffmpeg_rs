@@ -192,16 +192,38 @@ pub(crate) fn undo_float(buf: &mut [u8], row_bytes: usize, spp: usize, bytes: us
         tmp.extend_from_slice(row);
         accumulate8(&mut tmp, spp);
         let wc = n / bytes;
-        for k in 0..wc {
-            for b in 0..bytes {
-                // Plane b holds the b-th most significant byte.
-                let v = tmp[b * wc + k];
-                let dst = if cfg!(target_endian = "big") {
-                    b
-                } else {
-                    bytes - 1 - b
-                };
-                row[k * bytes + dst] = v;
+        // Plane b holds the b-th most significant byte of every sample.
+        // The planes are zipped per sample width, which vectorises; one
+        // indexed store per byte through a run-time width was 13.4 Ir a
+        // byte (67% of an uncompressed 32-bit float decode).
+        match bytes {
+            2 => {
+                let (p0, p1) = tmp.split_at(wc);
+                for ((d, &a), &b) in row.chunks_exact_mut(2).zip(p0).zip(p1) {
+                    d.copy_from_slice(&u16::from_be_bytes([a, b]).to_ne_bytes());
+                }
+            }
+            4 => {
+                let (p0, r) = tmp.split_at(wc);
+                let (p1, r) = r.split_at(wc);
+                let (p2, p3) = r.split_at(wc);
+                let px = row.chunks_exact_mut(4);
+                for ((((d, &a), &b), &c), &e) in px.zip(p0).zip(p1).zip(p2).zip(p3) {
+                    d.copy_from_slice(&u32::from_be_bytes([a, b, c, e]).to_ne_bytes());
+                }
+            }
+            _ => {
+                for k in 0..wc {
+                    for b in 0..bytes {
+                        let v = tmp[b * wc + k];
+                        let dst = if cfg!(target_endian = "big") {
+                            b
+                        } else {
+                            bytes - 1 - b
+                        };
+                        row[k * bytes + dst] = v;
+                    }
+                }
             }
         }
     }
@@ -252,6 +274,91 @@ mod tests {
                 let mut got = orig.clone();
                 swap_bytes(&mut got, n);
                 assert_eq!(got, want, "n {n} len {len}");
+            }
+        }
+    }
+
+    /// The float predictor's definition, one byte at a time (the oracle for
+    /// the per-width kernels).
+    fn ref_undo_float(buf: &mut [u8], row_bytes: usize, spp: usize, bytes: usize) {
+        for row in buf.chunks_mut(row_bytes) {
+            let n = row.len();
+            let mut tmp = row.to_vec();
+            for i in spp..n {
+                tmp[i] = tmp[i].wrapping_add(tmp[i - spp]);
+            }
+            let wc = n / bytes;
+            for k in 0..wc {
+                for b in 0..bytes {
+                    let dst = if cfg!(target_endian = "big") {
+                        b
+                    } else {
+                        bytes - 1 - b
+                    };
+                    row[k * bytes + dst] = tmp[b * wc + k];
+                }
+            }
+        }
+    }
+
+    fn ref_apply_float(buf: &mut [u8], row_bytes: usize, spp: usize, bytes: usize) {
+        for row in buf.chunks_mut(row_bytes) {
+            let n = row.len();
+            let mut tmp = vec![0u8; n];
+            let wc = n / bytes;
+            for k in 0..wc {
+                for b in 0..bytes {
+                    let src = if cfg!(target_endian = "big") {
+                        b
+                    } else {
+                        bytes - 1 - b
+                    };
+                    tmp[b * wc + k] = row[k * bytes + src];
+                }
+            }
+            for i in (spp..n).rev() {
+                tmp[i] = tmp[i].wrapping_sub(tmp[i - spp]);
+            }
+            row.copy_from_slice(&tmp);
+        }
+    }
+
+    #[test]
+    fn float_predictor_matches_the_definition() {
+        let mut seed = 99u32;
+        for bytes in [2usize, 4, 8] {
+            for spp in 1..=5usize {
+                // Whole rows, and a buffer whose last row is cut inside a
+                // sample (the callers never pass one; the kernels must still
+                // agree with the definition there).
+                for (px, cut) in [
+                    (1usize, 0usize),
+                    (2, 0),
+                    (3, 0),
+                    (7, 0),
+                    (16, 0),
+                    (33, 5),
+                    (40, 1),
+                ] {
+                    let row_bytes = px * spp * bytes;
+                    let orig: Vec<u8> = (0..row_bytes * 3 - cut)
+                        .map(|_| {
+                            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                            (seed >> 16) as u8
+                        })
+                        .collect();
+                    let (mut a, mut b) = (orig.clone(), orig.clone());
+                    undo_float(&mut a, row_bytes, spp, bytes);
+                    ref_undo_float(&mut b, row_bytes, spp, bytes);
+                    assert_eq!(a, b, "undo: bytes {bytes} spp {spp} px {px}");
+                    // (A cut row leaves the forward predictor's tail undefined.)
+                    if cut == 0 {
+                        let (mut a, mut b) = (orig.clone(), orig.clone());
+                        apply_float(&mut a, row_bytes, spp, bytes);
+                        ref_apply_float(&mut b, row_bytes, spp, bytes);
+                        assert_eq!(a, b, "apply: bytes {bytes} spp {spp} px {px}");
+                    }
+                }
             }
         }
     }
