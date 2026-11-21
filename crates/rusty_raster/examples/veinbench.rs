@@ -217,6 +217,16 @@ fn hot_mask_fill(mask: &mut Mask, path: &Path, aa: bool) {
 }
 
 #[inline(never)]
+fn hot_apply_mask(pm: &mut Pixmap, mask: &Mask) {
+    pm.apply_mask(mask);
+}
+
+#[inline(never)]
+fn hot_mask_from_pixmap(pm: &Pixmap, ty: MaskType) -> Mask {
+    Mask::from_pixmap(pm.as_ref(), ty)
+}
+
+#[inline(never)]
 fn hot_many_small(pm: &mut Pixmap, n: u32) {
     let mut rng = Rng::new(4242);
     for i in 0..n {
@@ -700,6 +710,92 @@ fn wl_pattern_repeat() -> Out {
     })
 }
 
+/// A group layer as an SVG renderer composites it: transparent, with a few
+/// opaque and translucent shapes and their anti-aliased edges.
+fn layer() -> Pixmap {
+    let mut pm = Pixmap::new(W, H).unwrap();
+    let mut rng = Rng::new(123);
+    for i in 0..14 {
+        let alpha = if i % 5 == 4 { 140 } else { 255 };
+        let paint = solid(rng.color(Some(alpha)), true);
+        let (x, y, s) = (rng.f(20.0, 420.0), rng.f(20.0, 420.0), rng.f(20.0, 90.0));
+        let path = if i % 2 == 0 {
+            PathBuilder::from_circle(x, y, s * 0.5).unwrap()
+        } else {
+            PathBuilder::from_rect(Rect::from_xywh(x, y, s, s * 0.6).unwrap())
+        };
+        pm.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+    pm
+}
+
+fn layer_draw(opacity: f32, x: i32, y: i32, reps: u32) -> Out {
+    let src = layer();
+    let pp = PixmapPaint {
+        opacity,
+        blend_mode: BlendMode::SourceOver,
+        quality: FilterQuality::Nearest,
+    };
+    timed(busy_canvas(), |pm| {
+        for _ in 0..reps {
+            hot_draw_pixmap(pm, &src, &pp, x, y, Transform::identity());
+        }
+    })
+}
+
+/// The layer composite at full opacity, layer and canvas the same size.
+fn wl_layer_opaque() -> Out {
+    layer_draw(1.0, 0, 0, 6)
+}
+
+/// The layer composite with group opacity, partly off the canvas.
+fn wl_layer_alpha() -> Out {
+    layer_draw(0.7, 37, -21, 4)
+}
+
+fn wl_apply_mask() -> Out {
+    let mut mask = Mask::new(W, H).unwrap();
+    mask.fill_path(
+        &star(256.0, 256.0, 250.0, 120.0, 24),
+        FillRule::Winding,
+        true,
+        Transform::identity(),
+    );
+    timed(busy_canvas(), |pm| {
+        for _ in 0..8 {
+            hot_apply_mask(pm, &mask);
+        }
+    })
+}
+
+fn wl_mask_from_pixmap() -> Out {
+    let src = busy_canvas();
+    let t = Instant::now();
+    let mut lum = hot_mask_from_pixmap(&src, MaskType::Luminance);
+    let mut alpha = hot_mask_from_pixmap(&src, MaskType::Alpha);
+    for _ in 0..3 {
+        lum = hot_mask_from_pixmap(&src, MaskType::Luminance);
+        alpha = hot_mask_from_pixmap(&src, MaskType::Alpha);
+    }
+    let d = t.elapsed();
+    let mut pm = Pixmap::new(W, H).unwrap();
+    for ((px, l), a) in pm
+        .data_mut()
+        .chunks_exact_mut(4)
+        .zip(lum.data())
+        .zip(alpha.data())
+    {
+        px.copy_from_slice(&[*l, *l, *l, *a]);
+    }
+    (pm, d)
+}
+
 fn wl_many_small() -> Out {
     timed(canvas(), |pm| hot_many_small(pm, 6000))
 }
@@ -746,6 +842,10 @@ const WORKLOADS: &[Workload] = &[
     ("pattern_repeat", wl_pattern_repeat),
     ("many_small", wl_many_small),
     ("path_build", wl_path_build),
+    ("layer_opaque", wl_layer_opaque),
+    ("layer_alpha", wl_layer_alpha),
+    ("apply_mask", wl_apply_mask),
+    ("mask_from_pixmap", wl_mask_from_pixmap),
 ];
 
 fn anchor(name: &str, pm: &Pixmap) {
