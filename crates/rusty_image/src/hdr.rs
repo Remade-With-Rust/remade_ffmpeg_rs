@@ -130,6 +130,8 @@ pub fn decode_with_meta(data: &[u8]) -> Result<(Image, Meta)> {
     }
     let (lines, len) = (n1 as usize, n2 as usize);
     let mut scan = vec![[0u8; 4]; len];
+    // The four component rows of a new-style RLE scanline.
+    let mut planes = vec![0u8; len * 4];
     let mut r = crate::read::Reader::new(data);
     r.seek(pos)?;
     // Where a scanline goes is settled once per scanline, not per pixel.
@@ -143,7 +145,7 @@ pub fn decode_with_meta(data: &[u8]) -> Result<(Image, Meta)> {
     for s in 0..lines {
         let line = if first_forward { s } else { lines - 1 - s };
         if transposed {
-            read_scanline(&mut r, &mut scan)?;
+            read_scanline(&mut r, &mut scan, &mut planes)?;
             let rows = img.pixels.chunks_exact_mut(row_bytes);
             let at = line * 12;
             if second_forward {
@@ -159,7 +161,7 @@ pub fn decode_with_meta(data: &[u8]) -> Result<(Image, Meta)> {
         }
         let row = &mut img.pixels[line * row_bytes..(line + 1) * row_bytes];
         if !second_forward {
-            read_scanline(&mut r, &mut scan)?;
+            read_scanline(&mut r, &mut scan, &mut planes)?;
             for (d, px) in row.chunks_exact_mut(12).rev().zip(&scan) {
                 put_f32(d, px);
             }
@@ -177,9 +179,16 @@ pub fn decode_with_meta(data: &[u8]) -> Result<(Image, Meta)> {
             read_flat_f32(&mut r, row)?;
             continue;
         }
-        read_scanline(&mut r, &mut scan)?;
-        for (d, px) in row.chunks_exact_mut(12).zip(&scan) {
-            put_f32(d, px);
+        // New-style RLE read left to right: the four component rows are
+        // decoded and converted straight into the output row.
+        r.skip(4)?;
+        read_rle_planes(&mut r, &mut planes, len)?;
+        let (red, rest) = planes.split_at(len);
+        let (green, rest) = rest.split_at(len);
+        let (blue, exp) = rest.split_at(len);
+        let rgbe = red.iter().zip(green).zip(blue).zip(exp);
+        for (d, (((&r, &g), &b), &e)) in row.chunks_exact_mut(12).zip(rgbe) {
+            put_f32(d, &[r, g, b, e]);
         }
     }
     Ok((img, meta))
@@ -240,35 +249,60 @@ fn read_flat_f32(r: &mut crate::read::Reader, row: &mut [u8]) -> Result<()> {
     r.skip(used)
 }
 
-fn read_scanline(r: &mut crate::read::Reader, buf: &mut [[u8; 4]]) -> Result<()> {
+/// The body of a new-style RLE scanline (after its four-byte header): the
+/// red, green, blue and exponent rows of `width` bytes each, one after the
+/// other in `planes`.
+///
+/// The format stores the scanline a component at a time, so each component
+/// is decoded into a row of its own, where a literal is one copy and a run
+/// one fill. Writing every byte straight to its pixel was a range-checked
+/// store at a stride of four per byte (29 Ir a pixel).
+fn read_rle_planes(r: &mut crate::read::Reader, planes: &mut [u8], width: usize) -> Result<()> {
+    for plane in planes.chunks_exact_mut(width) {
+        let mut x = 0;
+        while x < width {
+            let n = r.u8()?;
+            if n <= 128 {
+                let n = usize::from(n);
+                if x + n > width {
+                    return Err(Error::invalid("hdr: scanline overrun"));
+                }
+                plane[x..x + n].copy_from_slice(r.bytes(n)?);
+                x += n;
+            } else {
+                let n = usize::from(n - 128);
+                if x + n > width {
+                    return Err(Error::invalid("hdr: scanline overrun"));
+                }
+                let v = r.u8()?;
+                plane[x..x + n].fill(v);
+                x += n;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One scanline of `buf.len()` RGBE pixels into `buf`. `planes` is scratch
+/// space of four times that many bytes.
+fn read_scanline(
+    r: &mut crate::read::Reader,
+    buf: &mut [[u8; 4]],
+    planes: &mut [u8],
+) -> Result<()> {
     let width = buf.len();
     let first = r.array::<4>()?;
     if first[0] == 2 && first[1] == 2 && first[2] < 128 {
-        for c in 0..4 {
-            let mut x = 0;
-            while x < width {
-                let n = r.u8()?;
-                if n <= 128 {
-                    let n = usize::from(n);
-                    if x + n > width {
-                        return Err(Error::invalid("hdr: scanline overrun"));
-                    }
-                    for (i, &v) in r.bytes(n)?.iter().enumerate() {
-                        buf[x + i][c] = v;
-                    }
-                    x += n;
-                } else {
-                    let n = usize::from(n - 128);
-                    if x + n > width {
-                        return Err(Error::invalid("hdr: scanline overrun"));
-                    }
-                    let v = r.u8()?;
-                    for p in &mut buf[x..x + n] {
-                        p[c] = v;
-                    }
-                    x += n;
-                }
-            }
+        // New-style RLE: decode the four component rows, then interleave
+        // them into pixels (for the mirrored and transposed orientations;
+        // the usual one converts from the component rows directly).
+        read_rle_planes(r, planes, width)?;
+        let (red, rest) = planes.split_at(width);
+        let (green, rest) = rest.split_at(width);
+        let (blue, exp) = rest.split_at(width);
+        let rgbe = red.iter().zip(green).zip(blue).zip(exp);
+        for (px, (((&r, &g), &b), &e)) in buf.iter_mut().zip(rgbe) {
+            *px = [r, g, b, e];
         }
         return Ok(());
     }

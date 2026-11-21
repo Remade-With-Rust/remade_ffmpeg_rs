@@ -1100,3 +1100,72 @@ fn probe_reads_pam_with_binary_pixels() {
     let img = rusty_image::decode(&f).unwrap();
     assert_eq!((img.width, img.height), (3, 2));
 }
+
+/// New-style RLE scanlines under each of the eight orientation headers: the
+/// same scanlines decode to the usual orientation's pixels, mirrored or
+/// transposed. (`image` reads only `-Y +X`, so the reference here is our own
+/// decode of that one, which the oracle test above pins to `image`.)
+#[test]
+fn hdr_rle_in_every_orientation() {
+    let mut rng = Rng(0x0e1e);
+    for (n1, n2) in [(5usize, 9usize), (7, 16), (3, 40), (2, 130)] {
+        // Runs and noise, so both packet kinds occur.
+        let mut floats = Vec::new();
+        let mut cur = [0.5f32; 3];
+        for _ in 0..n1 * n2 {
+            if rng.below(3) == 0 {
+                cur = [
+                    rng.below(4000) as f32 / 7.0,
+                    rng.below(300) as f32 / 900.0,
+                    rng.below(90) as f32,
+                ];
+            }
+            floats.extend(cur.iter().flat_map(|v| v.to_ne_bytes()));
+        }
+        let img = Image::new(n2 as u32, n1 as u32, PixelFormat::Rgb32F, floats).unwrap();
+        let f = rusty_image::encode(&img, Format::Hdr).unwrap();
+        let head = format!("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y {n1} +X {n2}\n");
+        assert!(f.starts_with(head.as_bytes()));
+        let body = &f[head.len()..];
+        assert_eq!(body[..2], [2, 2], "the encoder wrote new-style RLE");
+        let usual = rusty_image::decode(&f).unwrap();
+        for (a1, a2) in [
+            ("-Y", "+X"),
+            ("-Y", "-X"),
+            ("+Y", "+X"),
+            ("+Y", "-X"),
+            ("+X", "-Y"),
+            ("+X", "+Y"),
+            ("-X", "-Y"),
+            ("-X", "+Y"),
+        ] {
+            let mut g =
+                format!("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n{a1} {n1} {a2} {n2}\n").into_bytes();
+            g.extend_from_slice(body);
+            let got = rusty_image::decode(&g).unwrap();
+            let transposed = a1.ends_with('X');
+            let (w, h) = if transposed { (n1, n2) } else { (n2, n1) };
+            assert_eq!((got.width as usize, got.height as usize), (w, h));
+            for s in 0..n1 {
+                for p in 0..n2 {
+                    let (x, y) = if transposed {
+                        (
+                            if a1 == "+X" { s } else { n1 - 1 - s },
+                            if a2 == "-Y" { p } else { n2 - 1 - p },
+                        )
+                    } else {
+                        (
+                            if a2 == "+X" { p } else { n2 - 1 - p },
+                            if a1 == "-Y" { s } else { n1 - 1 - s },
+                        )
+                    };
+                    assert_eq!(
+                        got.pixels[(y * w + x) * 12..][..12],
+                        usual.pixels[(s * n2 + p) * 12..][..12],
+                        "{a1} {a2}: scanline {s} pixel {p}"
+                    );
+                }
+            }
+        }
+    }
+}
