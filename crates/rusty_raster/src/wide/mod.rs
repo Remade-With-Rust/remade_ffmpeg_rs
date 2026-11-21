@@ -53,11 +53,17 @@ fn cvt_round(v: f32) -> i32 {
 }
 
 /// `cvttps2dq`: truncate; NaN and out-of-range give `i32::MIN`.
+///
+/// An `as` cast already truncates toward zero and already saturates a value
+/// below `i32::MIN` to `i32::MIN`, so the only inputs it gets "wrong" are NaN
+/// (0) and values at or above 2^31 (`i32::MAX`); one comparison routes both to
+/// `i32::MIN`. Calling `f32::trunc` first would be a libm `truncf` call per
+/// lane on a baseline x86-64 build (no SSE4.1 `roundps`), and it keeps the
+/// lane loop from vectorising.
 #[inline(always)]
 fn cvt_trunc(v: f32) -> i32 {
-    let r = v.trunc();
-    if r >= -2_147_483_648.0 && r < 2_147_483_648.0 {
-        r as i32
+    if v < 2_147_483_648.0 {
+        v as i32
     } else {
         i32::MIN
     }
@@ -633,5 +639,71 @@ impl Not for u16x16 {
             *v = !*v;
         }
         Self(o)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lane conversions as they were first written, on top of libm
+    /// `trunc`. They stay here as the oracle for the libm-free forms above.
+    fn cvt_trunc_ref(v: f32) -> i32 {
+        let r = v.trunc();
+        if r >= -2_147_483_648.0 && r < 2_147_483_648.0 {
+            r as i32
+        } else {
+            i32::MIN
+        }
+    }
+
+    fn check(v: f32) {
+        assert_eq!(cvt_trunc(v), cvt_trunc_ref(v), "cvt_trunc({v:e})");
+    }
+
+    /// Every `step`-th bit pattern, plus the neighbourhoods where rounding,
+    /// range and NaN handling change.
+    fn sweep(step: usize) {
+        for bits in (0..=u32::MAX).step_by(step) {
+            check(f32::from_bits(bits));
+        }
+        let edges = [
+            0.0f32,
+            0.5,
+            1.0,
+            1.5,
+            2.5,
+            255.0,
+            254.5,
+            4_194_304.0,
+            8_388_607.5,
+            8_388_608.0,
+            16_777_216.0,
+            2_147_483_648.0,
+            4_294_967_296.0,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        for e in edges {
+            for sign in [0u32, 0x8000_0000] {
+                for d in -3i32..=3 {
+                    check(f32::from_bits((e.to_bits() | sign).wrapping_add(d as u32)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lane_conversions_match_libm_sampled() {
+        sweep(4099);
+    }
+
+    /// All 2^32 bit patterns. `cargo test --release -- --ignored lane_conversions`.
+    #[test]
+    #[ignore = "exhaustive over every f32 bit pattern; run in release"]
+    fn lane_conversions_match_libm_exhaustive() {
+        sweep(1);
     }
 }
