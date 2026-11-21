@@ -129,6 +129,24 @@ fn ascii_bits(data: &[u8], buf: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
+/// One packed PBM byte as eight `L8` pixels: most significant bit first, a
+/// set bit black (0), a clear bit white (255).
+static PBM_BYTE: [[u8; 8]; 256] = {
+    let mut t = [[0u8; 8]; 256];
+    let mut b = 0;
+    while b < 256 {
+        let mut k = 0;
+        while k < 8 {
+            if (b >> (7 - k)) & 1 == 0 {
+                t[b][k] = 255;
+            }
+            k += 1;
+        }
+        b += 1;
+    }
+    t
+};
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tuple {
     Pbm,
@@ -312,12 +330,22 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     let wide = format.bytes_per_sample() == 2;
     match (tuple, ascii) {
         (Tuple::Pbm, false) => {
+            // A packed byte is eight finished pixels from a table: one
+            // 8-byte store, where a shift, a mask and a bounds-checked store
+            // per pixel wrote 0/1 for the scaling pass to turn into 0/255.
             let line = w.div_ceil(8);
             let packed = r.bytes(line * h)?;
-            for y in 0..h {
-                for x in 0..w {
-                    let bit = (packed[y * line + x / 8] >> (7 - x % 8)) & 1;
-                    buf[y * w + x] = 1 - bit;
+            if w > 0 {
+                for (row, src) in buf.chunks_exact_mut(w).zip(packed.chunks_exact(line)) {
+                    let mut cells = row.chunks_exact_mut(8);
+                    for (px, &b) in cells.by_ref().zip(src) {
+                        px.copy_from_slice(&PBM_BYTE[usize::from(b)]);
+                    }
+                    let tail = cells.into_remainder();
+                    if let Some(&b) = src.get(w / 8) {
+                        let n = tail.len();
+                        tail.copy_from_slice(&PBM_BYTE[usize::from(b)][..n]);
+                    }
                 }
             }
         }
@@ -345,9 +373,10 @@ pub fn decode(data: &[u8]) -> Result<Image> {
             }
         }
     }
-    // Scale to the full range (with `image`'s f32 rounding).
+    // Scale to the full range (with `image`'s f32 rounding). PBM pixels are
+    // written as 0 / 255 already.
     let target: u32 = if wide { 0xffff } else { 0xff };
-    if maxval != target {
+    if maxval != target && tuple != Tuple::Pbm {
         let factor = target as f32 / maxval as f32;
         if wide {
             scale16(buf, factor);
