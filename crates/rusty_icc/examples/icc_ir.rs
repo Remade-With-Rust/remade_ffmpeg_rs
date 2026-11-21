@@ -223,17 +223,27 @@ fn hot_gamut_u8(g: &GamutCheck, src: &[u8], out: &mut [f64]) {
 }
 
 fn proofing(src: &Profile, proof: &Profile, dst: &Profile) -> Transform {
+    proofing_intent(src, proof, dst, Intent::RelativeColorimetric)
+}
+
+/// A proof with `intent` into the proof device (relative colorimetric out).
+fn proofing_intent(src: &Profile, proof: &Profile, dst: &Profile, intent: Intent) -> Transform {
     Transform::new_proofing(
         src,
         Layout::Rgb,
         proof,
         dst,
         Layout::Rgb,
-        Intent::RelativeColorimetric,
+        intent,
         Intent::RelativeColorimetric,
         Options::default(),
     )
     .unwrap()
+}
+
+#[inline(never)]
+fn hot_build_proof_intent(src: &Profile, proof: &Profile, dst: &Profile, i: Intent) -> Transform {
+    proofing_intent(black_box(src), black_box(proof), black_box(dst), i)
 }
 
 fn src_u8(ch: usize) -> Vec<u8> {
@@ -398,7 +408,7 @@ const MODES: &str = "p3u8 p3u16 fogu8 fog16 labf32 labinf32 build3 build4 parse 
 p3f32 lin2020f32 fogf32 fogrgbf32 v4f32 v4inf32 prof32 toprof32 prooff32 \
 grayu8 togray16 prou8 v4u8 cgatsu8 labu8 lab16in proofu8 gamutu8 \
 smallp3u8 smallfogu8 smallfog16 smallp3f32 \
-buildp3 buildgray buildlab buildv4 buildproof buildbpc first16 parsev4";
+buildp3 buildgray buildlab buildv4 buildproof buildbpc first16 parsev4 fogpf32 fogrgbpf32 proofpf32 build4p buildproofp";
 
 #[allow(clippy::too_many_lines)]
 fn main() {
@@ -489,6 +499,31 @@ fn main() {
             timed(|| hot_first16(&srgb, &p3, &s, &mut o));
         }
         "parsev4" => parse(V4_PREF),
+        // Perceptual twins of the float CMYK, proof and build rows (the
+        // downstream comparison runs sRGB -> FOGRA39 perceptual).
+        "fogpf32" => {
+            let p = Intent::Perceptual;
+            let t = Transform::new(&srgb, rgb, &fogra(), cmyk, p, Options::default()).unwrap();
+            tr_f32(&t, false);
+        }
+        "fogrgbpf32" => {
+            let p = Intent::Perceptual;
+            let t = Transform::new(&fogra(), cmyk, &srgb, rgb, p, Options::default()).unwrap();
+            tr_f32(&t, false);
+        }
+        "proofpf32" => tr_f32(
+            &proofing_intent(&srgb, &fogra(), &srgb, Intent::Perceptual),
+            false,
+        ),
+        "build4p" => build_opts(&fogra(), cmyk, &srgb, rgb, Intent::Perceptual, false),
+        "buildproofp" => {
+            let f = fogra();
+            let p = Intent::Perceptual;
+            build_anchor(&hot_build_proof_intent(&srgb, &f, &srgb, p));
+            timed(|| {
+                black_box(hot_build_proof_intent(&srgb, &f, &srgb, p));
+            });
+        }
         _ => eprintln!("modes: {MODES}"),
     }
 }

@@ -7,9 +7,9 @@
 use crate::color::{
     lab_to_xyz, mat_inv, mat_mul, mat_vec, xyz_to_lab, Lab, Mat3, Xyz, D50, IDENTITY,
 };
-use crate::curve::{clamp01, Curve, FwdSeg, InvCurve, InvSeg};
+use crate::curve::{clamp01, Curve, FwdSeg, InvCurve, InvSeg, Sampled};
 use crate::error::{Error, Result};
-use crate::lut::{make_trilinear, Lut, Stage};
+use crate::lut::{make_trilinear, ClutEval, FixedClut, Lut, Stage};
 use crate::profile::{ColorSpace, Profile, ProfileClass};
 use crate::transform::Intent;
 
@@ -37,6 +37,15 @@ pub(crate) enum Op {
     /// channels: the clamp those curves amount to, without a stage call and
     /// a curve evaluation per channel.
     UnitCurves(usize),
+    /// A LUT stage of per-channel curves that are all sampled tables (LUT
+    /// input and output tables), evaluated in line: the values the stage
+    /// gives, without a stage call and a curve call per channel.
+    Sampled(Vec<Sampled>),
+    /// A stage of per-channel curves that are all regular two-segment
+    /// parametric ones (the sRGB curves at the device end of a chain through
+    /// a LUT), evaluated in line: the values the stage gives, without a stage
+    /// call, a curve call per channel and the tests on the curve kind.
+    FwdSegs(Vec<FwdSeg>),
     /// Multiply every channel.
     Scale(f64),
     /// v4-normalised Lab to real Lab.
@@ -49,6 +58,12 @@ pub(crate) enum Op {
     EncodeXyz,
     LabToXyz,
     XyzToLab,
+    /// [`Op::XyzToLab`] then [`Op::EncodeLab`], then the [`Op::Scale`] that
+    /// may follow (legacy 16-bit Lab): one op for the three.
+    XyzToEncodedLab(Option<f64>),
+    /// The [`Op::Scale`] that may come first, then [`Op::DecodeLab`] and
+    /// [`Op::LabToXyz`]: one op for the three.
+    EncodedLabToXyz(Option<f64>),
     /// XYZ affine map.
     Affine(Mat3, [f64; 3]),
     Clamp01,
@@ -57,6 +72,12 @@ pub(crate) enum Op {
     /// (sRGB-shaped): the same values, without a `pow` per value for the
     /// curve's break point.
     InvBreakCurves(Vec<InvCurve>),
+    /// [`Op::InvBreakCurves`] when every curve is a regular function-3 one
+    /// (the sRGB curves at the device end of a chain through a LUT),
+    /// evaluated in line: the same values, without a call and the tests on
+    /// the curve kind per value, and with the reciprocal exponent worked out
+    /// once.
+    InvSegs(Vec<InvSeg>),
     /// Grey `Y` to D50 XYZ (1 to 3 channels).
     GrayToXyz,
     /// Grey value as `L*/100` to Lab (1 to 3 channels).
@@ -81,6 +102,10 @@ fn lut_op(stage: Stage) -> Op {
         Stage::Curves(cs) if !cs.is_empty() && cs.iter().all(Curve::is_unit_gamma) => {
             Op::UnitCurves(cs.len())
         }
+        Stage::Curves(cs) => match cs.iter().map(Sampled::new).collect::<Option<Vec<_>>>() {
+            Some(prepared) if !prepared.is_empty() => Op::Sampled(prepared),
+            _ => Op::Lut(Stage::Curves(cs)),
+        },
         stage => Op::Lut(stage),
     }
 }
@@ -92,6 +117,12 @@ fn run(ops: &[Op], v: &mut [f64; 16], mut n: usize) -> usize {
             Op::UnitCurves(k) => {
                 for x in v.iter_mut().take(*k) {
                     *x = if *x > 0.0 { x.min(1.0) } else { 0.0 };
+                }
+            }
+            Op::Sampled(cs) => run_sampled(cs, v),
+            Op::FwdSegs(cs) => {
+                for (x, c) in v.iter_mut().zip(cs) {
+                    *x = c.eval(*x);
                 }
             }
             Op::Scale(k) => {
@@ -127,6 +158,27 @@ fn run(ops: &[Op], v: &mut [f64; 16], mut n: usize) -> usize {
                 let l = xyz_to_lab(Xyz::new(v[0], v[1], v[2]), D50);
                 v[..3].copy_from_slice(&[l.l, l.a, l.b]);
             }
+            Op::XyzToEncodedLab(k) => {
+                let l = xyz_to_lab(Xyz::new(v[0], v[1], v[2]), D50);
+                v[0] = clamp01(l.l / 100.0);
+                v[1] = clamp01((l.a + 128.0) / 255.0);
+                v[2] = clamp01((l.b + 128.0) / 255.0);
+                if let Some(k) = k {
+                    for x in v.iter_mut().take(n) {
+                        *x *= k;
+                    }
+                }
+            }
+            Op::EncodedLabToXyz(k) => {
+                if let Some(k) = k {
+                    for x in v.iter_mut().take(n) {
+                        *x *= k;
+                    }
+                }
+                let lab = Lab::new(v[0] * 100.0, v[1] * 255.0 - 128.0, v[2] * 255.0 - 128.0);
+                let x = lab_to_xyz(lab, D50);
+                v[..3].copy_from_slice(&x.to_array());
+            }
             Op::Affine(m, off) => {
                 let r = mat_vec(m, [v[0], v[1], v[2]]);
                 for i in 0..3 {
@@ -144,6 +196,11 @@ fn run(ops: &[Op], v: &mut [f64; 16], mut n: usize) -> usize {
                 }
             }
             Op::InvBreakCurves(cs) => {
+                for (x, c) in v.iter_mut().zip(cs) {
+                    *x = c.eval(*x);
+                }
+            }
+            Op::InvSegs(cs) => {
                 for (x, c) in v.iter_mut().zip(cs) {
                     *x = c.eval(*x);
                 }
@@ -169,6 +226,18 @@ fn run(ops: &[Op], v: &mut [f64; 16], mut n: usize) -> usize {
         }
     }
     n
+}
+
+/// [`Op::Sampled`]: the tables in line, in a frame of their own. In line in
+/// [`run`], the loop kept its constants in registers across the whole op
+/// loop, and every other op's calls (`cbrt`, `pow`, the stage calls) then
+/// reloaded them: +16 instructions per colour on chains without a table
+/// stage (labf32 +1.19%, v4f32 +1.14%).
+#[inline(never)]
+fn run_sampled(cs: &[Sampled], v: &mut [f64; 16]) {
+    for (x, c) in v.iter_mut().zip(cs) {
+        *x = c.eval(*x);
+    }
 }
 
 /// A matrix-shaper side: device-linear values relate to PCS XYZ by
@@ -871,19 +940,33 @@ impl Chain {
                     .collect(),
                 tail,
             ),
+            Some((Op::FwdSegs(cs), tail)) if cs.len() == self.in_ch => (
+                cs.iter()
+                    .map(|c| axis.iter().map(|&x| c.eval(x)).collect())
+                    .collect(),
+                tail,
+            ),
+            Some((Op::Sampled(cs), tail)) if cs.len() == self.in_ch => (
+                cs.iter()
+                    .map(|c| axis.iter().map(|&x| c.eval(x)).collect())
+                    .collect(),
+                tail,
+            ),
             _ => (vec![axis; self.in_ch], &self.ops),
         };
-        let mut data = Vec::with_capacity(total * self.out_ch);
-        for idx in 0..total {
-            let mut v = [0.0f64; 16];
-            let mut rem = idx;
-            for c in (0..self.in_ch).rev() {
-                v[c] = head[c][rem % g];
-                rem /= g;
+        // Written in place, point by point, the points visited in order by an
+        // odometer over the axis indices (last input fastest) instead of a
+        // division and a remainder per input per point.
+        let mut data = vec![0.0f32; total * self.out_ch];
+        // A tetrahedral CLUT right after the curves (CMYK and RGB LUT
+        // inputs): its grid cell and fraction along an axis depend on that
+        // axis value alone, so they are worked out once per axis value.
+        if let Some((Op::Lut(Stage::Clut(c)), rest)) = tail.split_first() {
+            if grid_through_clut(c, &head, rest, (self.in_ch, self.out_ch), &mut data) {
+                return data;
             }
-            run(tail, &mut v, self.in_ch);
-            data.extend(v[..self.out_ch].iter().map(|&x| x as f32));
         }
+        grid_ops(&head, tail, (self.in_ch, self.out_ch), &mut data);
         data
     }
 
@@ -891,6 +974,109 @@ impl Chain {
     /// `in_ch`) and receives the result.
     pub(crate) fn eval_in_place(&self, v: &mut [f64; 16]) {
         run(&self.ops, v, self.in_ch);
+    }
+}
+
+/// The general loop of [`Chain::sample_grid`]: per point, the head values
+/// and then the rest of the ops. In its own frame, so the CLUT path beside it
+/// cannot reshape it.
+#[inline(never)]
+fn grid_ops(head: &[Vec<f64>], tail: &[Op], (in_ch, out_ch): (usize, usize), data: &mut [f32]) {
+    let g = head[0].len();
+    let mut at = [0usize; 16];
+    for point in data.chunks_exact_mut(out_ch) {
+        let mut v = [0.0f64; 16];
+        for c in 0..in_ch {
+            v[c] = head[c][at[c]];
+        }
+        run(tail, &mut v, in_ch);
+        for (d, &x) in point.iter_mut().zip(&v) {
+            *d = x as f32;
+        }
+        advance(&mut at[..in_ch], g);
+    }
+}
+
+/// The grid by [`grid_clut`] when the CLUT `c` has a fixed-shape kernel
+/// (`true`); `false`, with nothing done, otherwise. Out of line, so the
+/// general loop of `sample_grid` keeps its code (with this dispatch in its
+/// frame it cost +3 instructions per grid point: build3, buildbpc +0.19%).
+#[inline(never)]
+fn grid_through_clut(
+    c: &ClutEval,
+    h: &[Vec<f64>],
+    rest: &[Op],
+    (in_ch, out_ch): (usize, usize),
+    data: &mut [f32],
+) -> bool {
+    let done = match (in_ch, c.outputs) {
+        (3, 3) => c
+            .fixed::<3, 3>()
+            .map(|f| grid_clut(&f, h, rest, out_ch, data)),
+        (3, 4) => c
+            .fixed::<3, 4>()
+            .map(|f| grid_clut(&f, h, rest, out_ch, data)),
+        (4, 3) => c
+            .fixed::<4, 3>()
+            .map(|f| grid_clut(&f, h, rest, out_ch, data)),
+        (4, 4) => c
+            .fixed::<4, 4>()
+            .map(|f| grid_clut(&f, h, rest, out_ch, data)),
+        _ => None,
+    };
+    done.is_some()
+}
+
+/// [`Chain::sample_grid`] when the ops after the head curves start with a
+/// tetrahedral CLUT of `IN` inputs and `OUT` outputs: per point, the head
+/// values and their tabulated `(cell, fraction)` per axis, the lookup by
+/// [`FixedClut::at`] (exactly what the stage's `ClutEval::eval` gives for
+/// those values, written to the same slots) and then the rest of the ops.
+/// Out of line: inlined into `sample_grid`, its four instances re-rolled the
+/// general loop there (+12 instructions per grid point on every other grid
+/// build: build3, buildlab, buildproof +431K each).
+#[inline(never)]
+fn grid_clut<const IN: usize, const OUT: usize>(
+    f: &FixedClut<'_, IN, OUT>,
+    head: &[Vec<f64>],
+    rest: &[Op],
+    out_ch: usize,
+    data: &mut [f32],
+) {
+    let cells: [Vec<(usize, f64)>; IN] = core::array::from_fn(|c| {
+        head[c]
+            .iter()
+            .map(|&x| ClutEval::axis(f.points(c), x))
+            .collect()
+    });
+    let g = head[0].len();
+    let mut at = [0usize; IN];
+    for point in data.chunks_exact_mut(out_ch) {
+        let mut v = [0.0f64; 16];
+        let mut cell = [(0usize, 0.0f64); IN];
+        for c in 0..IN {
+            v[c] = head[c][at[c]];
+            cell[c] = cells[c][at[c]];
+        }
+        f.at(&cell, &mut v);
+        run(rest, &mut v, OUT);
+        for (d, &x) in point.iter_mut().zip(&v) {
+            *d = x as f32;
+        }
+        advance(&mut at, g);
+    }
+}
+
+/// Steps the axis indices `at` (last fastest, each below `g`) to the next
+/// grid point in row-major order.
+#[inline(always)]
+fn advance(at: &mut [usize], g: usize) {
+    for i in at.iter_mut().rev() {
+        *i += 1;
+        if *i < g {
+            return;
+        }
+        *i = 0;
     }
 }
 
@@ -918,6 +1104,18 @@ pub(crate) fn build_chain(
     intents: &[Intent],
     bpc: &[bool],
 ) -> Result<Chain> {
+    let mut chain = link_ops(profiles, intents, bpc)?;
+    // A matrix/TRC pair keeps its curve ops as they are: the fused `f32`
+    // loop reads them through `Chain::as_shaper`.
+    if chain.as_shaper().is_none() {
+        prepare_curves(&mut chain.ops);
+        chain.ops = fuse_lab(core::mem::take(&mut chain.ops));
+    }
+    Ok(chain)
+}
+
+/// [`build_chain`] before its curve ops are prepared.
+fn link_ops(profiles: &[&Profile], intents: &[Intent], bpc: &[bool]) -> Result<Chain> {
     let first = profiles
         .first()
         .ok_or(Error::InvalidTransform("no profiles"))?;
@@ -1007,6 +1205,64 @@ pub(crate) fn build_chain(
         out_ch,
         shaper,
     })
+}
+
+/// Joins the Lab encoding and decoding runs of `ops` into one op each (the
+/// same arithmetic in the same order).
+fn fuse_lab(ops: Vec<Op>) -> Vec<Op> {
+    let mut out: Vec<Op> = Vec::with_capacity(ops.len());
+    let mut it = ops.into_iter().peekable();
+    while let Some(op) = it.next() {
+        match op {
+            Op::XyzToLab if matches!(it.peek(), Some(Op::EncodeLab)) => {
+                it.next();
+                let k = match it.peek() {
+                    Some(&Op::Scale(k)) => {
+                        it.next();
+                        Some(k)
+                    }
+                    _ => None,
+                };
+                out.push(Op::XyzToEncodedLab(k));
+            }
+            Op::DecodeLab if matches!(it.peek(), Some(Op::LabToXyz)) => {
+                it.next();
+                match out.last() {
+                    Some(&Op::Scale(k)) => {
+                        out.pop();
+                        out.push(Op::EncodedLabToXyz(Some(k)));
+                    }
+                    _ => out.push(Op::EncodedLabToXyz(None)),
+                }
+            }
+            op => out.push(op),
+        }
+    }
+    out
+}
+
+/// Replaces curve stages by forms evaluated in line where every curve of the
+/// stage allows it (the same values: see [`FwdSeg`] and [`InvSeg`]).
+fn prepare_curves(ops: &mut [Op]) {
+    for op in ops {
+        match op {
+            Op::Lut(Stage::Curves(cs)) => {
+                if let Some(segs) = cs.iter().map(FwdSeg::new).collect::<Option<Vec<_>>>() {
+                    if !segs.is_empty() {
+                        *op = Op::FwdSegs(segs);
+                    }
+                }
+            }
+            Op::InvBreakCurves(cs) => {
+                if let Some(segs) = cs.iter().map(InvSeg::new).collect::<Option<Vec<_>>>() {
+                    if !segs.is_empty() {
+                        *op = Op::InvSegs(segs);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Device values of `src` to L*a*b* as they would arrive at `proof`, then
@@ -1149,8 +1405,22 @@ mod tests {
         let lab = Profile::new_lab_identity();
         let gray = Profile::new_gray(crate::color::D65_XY, Curve::gamma(2.2));
         let rel = Intent::RelativeColorimetric;
-        for (a, b, g) in [(&srgb, &lab, 9usize), (&lab, &srgb, 7), (&gray, &srgb, 33)] {
+        let cgats =
+            Profile::new_from_slice(include_bytes!("../tests/data/CGATS001Compat-v2-micro.icc"))
+                .unwrap();
+        for (a, b, g) in [
+            (&srgb, &lab, 9usize),
+            (&lab, &srgb, 7),
+            (&gray, &srgb, 33),
+            (&cgats, &srgb, 5),
+            (&cgats, &lab, 4),
+        ] {
             let chain = build_chain(&[a, b], &[rel, rel], &[false, false]).unwrap();
+            if std::ptr::eq(a, &cgats) {
+                // The tabulated-cell path of `sample_grid` is the one taken.
+                assert!(matches!(chain.ops[0], Op::Sampled(_)));
+                assert!(matches!(chain.ops[1], Op::Lut(Stage::Clut(_))));
+            }
             let data = chain.sample_grid(g);
             let total = (0..chain.in_ch).fold(1usize, |n, _| n * g);
             assert_eq!(data.len(), total * chain.out_ch);
@@ -1166,6 +1436,158 @@ mod tests {
                 for o in 0..chain.out_ch {
                     let got = data[idx * chain.out_ch + o];
                     assert_eq!(got.to_bits(), (out[o] as f32).to_bits(), "point {idx}");
+                }
+            }
+        }
+    }
+
+    /// Every LUT tag of the test profiles: its stages as prepared ops
+    /// against the same stages run as plain stages, bit for bit.
+    #[test]
+    fn prepared_lut_ops_match_the_plain_stages_bit_for_bit() {
+        let files: [&[u8]; 3] = [
+            include_bytes!("../tests/data/CGATS001Compat-v2-micro.icc"),
+            include_bytes!("../tests/data/sRGB_v4_ICC_preference.icc"),
+            include_bytes!("../tests/data/LAB.icc"),
+        ];
+        let mut sampled = 0;
+        for bytes in files {
+            let p = Profile::new_from_slice(bytes).unwrap();
+            for sig in [*b"A2B0", *b"A2B1", *b"A2B2", *b"B2A0", *b"B2A1", *b"B2A2"] {
+                let Ok(Some(lut)) = p.lut_tag(sig) else {
+                    continue;
+                };
+                let plain: Vec<Op> = lut.stages().into_iter().map(Op::Lut).collect();
+                let prepared: Vec<Op> = lut.stages().into_iter().map(lut_op).collect();
+                sampled += prepared
+                    .iter()
+                    .filter(|op| matches!(op, Op::Sampled(_)))
+                    .count();
+                let n = lut.inputs();
+                let coords = [-0.25, 0.0, 0.1, 0.33, 0.5, 0.77, 0.999, 1.0, 1.5, f64::NAN];
+                for k in 0..coords.len().pow(n.min(4) as u32) {
+                    let mut a = [0.0; 16];
+                    for (c, x) in a.iter_mut().enumerate().take(n) {
+                        *x = coords[(k / coords.len().pow((c % 4) as u32)) % coords.len()];
+                    }
+                    let mut b = a;
+                    let na = run(&plain, &mut a, n);
+                    let nb = run(&prepared, &mut b, n);
+                    assert_eq!(na, nb);
+                    assert_eq!(
+                        a[..na].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        b[..nb].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "{sig:?} {k}"
+                    );
+                }
+            }
+        }
+        // The prepared table op is reached by these profiles.
+        assert!(sampled > 0);
+    }
+
+    /// Chains through LUT profiles with prepared curve ops against the same
+    /// chains with every op left as built, bit for bit.
+    #[test]
+    fn prepared_chain_curves_match_the_plain_ops_bit_for_bit() {
+        let srgb = Profile::new_srgb();
+        let lab = Profile::new_lab_identity();
+        let cgats =
+            Profile::new_from_slice(include_bytes!("../tests/data/CGATS001Compat-v2-micro.icc"))
+                .unwrap();
+        let v4 =
+            Profile::new_from_slice(include_bytes!("../tests/data/sRGB_v4_ICC_preference.icc"))
+                .unwrap();
+        let rel = Intent::RelativeColorimetric;
+        let per = Intent::Perceptual;
+        let (mut fwd, mut inv, mut fused, mut chains) = (0, 0, 0, 0);
+        for (a, b, intent) in [
+            (&srgb, &lab, rel),
+            (&lab, &srgb, rel),
+            (&srgb, &cgats, rel),
+            (&cgats, &srgb, per),
+            (&srgb, &v4, per),
+            (&v4, &srgb, rel),
+        ] {
+            // The micro test profiles are one-directional.
+            let Ok(chain) = build_chain(&[a, b], &[intent, intent], &[false, false]) else {
+                continue;
+            };
+            chains += 1;
+            assert!(chain.as_shaper().is_none());
+            // The ops as linked, before `prepare_curves`.
+            let plain = link_ops(&[a, b], &[intent, intent], &[false, false]).unwrap();
+
+            for op in &chain.ops {
+                fwd += usize::from(matches!(op, Op::FwdSegs(_)));
+                inv += usize::from(matches!(op, Op::InvSegs(_)));
+                fused += usize::from(matches!(
+                    op,
+                    Op::XyzToEncodedLab(_) | Op::EncodedLabToXyz(_)
+                ));
+            }
+            let coords = [
+                -0.25,
+                0.0,
+                0.01,
+                0.04,
+                0.33,
+                0.5,
+                0.77,
+                0.999,
+                1.0,
+                1.5,
+                f64::NAN,
+            ];
+            let n = chain.in_ch;
+            for k in 0..coords.len().pow(n as u32) {
+                let mut input = [0.0; 16];
+                for (c, x) in input.iter_mut().enumerate().take(n) {
+                    *x = coords[(k / coords.len().pow(c as u32)) % coords.len()];
+                }
+                let (mut want, mut got) = ([0.0; 16], [0.0; 16]);
+                plain.eval(&input, &mut want);
+                chain.eval(&input, &mut got);
+                let m = chain.out_ch;
+                assert_eq!(
+                    want[..m].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    got[..m].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{k}"
+                );
+            }
+            // The grid sampler reads the prepared head as it read the plain one.
+            if n == 3 {
+                assert_eq!(plain.sample_grid(9), chain.sample_grid(9));
+            }
+        }
+        assert!(
+            fwd > 0 && inv > 0 && fused > 0 && chains >= 4,
+            "{fwd} {inv} {fused} {chains}"
+        );
+    }
+
+    #[test]
+    fn fused_lab_ops_match_the_separate_ops_bit_for_bit() {
+        let k = 1.0 / LAB_V2_TO_V4;
+        let runs: [Vec<Op>; 4] = [
+            vec![Op::XyzToLab, Op::EncodeLab, Op::Scale(k), Op::Clamp01],
+            vec![Op::XyzToLab, Op::EncodeLab, Op::Clamp01],
+            vec![Op::Scale(LAB_V2_TO_V4), Op::DecodeLab, Op::LabToXyz],
+            vec![Op::Clamp01, Op::DecodeLab, Op::LabToXyz, Op::XyzToLab],
+        ];
+        let xs = [-0.5, 0.0, 1e-4, 0.008, 0.2, 0.5, 0.9642, 1.0, 1.7, f64::NAN];
+        for plain in runs {
+            let fused = fuse_lab(plain.clone());
+            assert!(fused.len() < plain.len());
+            for (i, &a) in xs.iter().enumerate() {
+                for &b in &xs {
+                    for &c in &xs[i % 3..] {
+                        let mut want = [0.0; 16];
+                        want[..4].copy_from_slice(&[a, b, c, 0.25]);
+                        let mut got = want;
+                        assert_eq!(run(&plain, &mut want, 3), run(&fused, &mut got, 3));
+                        assert_eq!(want.map(f64::to_bits), got.map(f64::to_bits), "{a} {b} {c}");
+                    }
                 }
             }
         }
