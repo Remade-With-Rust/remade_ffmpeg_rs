@@ -41,11 +41,36 @@ fn mask_f(b: bool) -> f32 {
     }
 }
 
+/// 2^23. From here up every `f32` is an integer.
+const INTEGRAL: f32 = 8_388_608.0;
+
+/// Rounds half to even without libm; the sign of a zero result is not kept.
+///
+/// For `|v| < 2^23`, adding 2^23 with `v`'s sign puts the sum in
+/// `[2^23, 2^24)`, where consecutive floats are 1 apart, so the addition
+/// itself rounds to an integer under the default rounding mode, and because
+/// 2^23 is even a tie lands on the even integer of `v`. Subtracting 2^23
+/// again is exact. Larger magnitudes are integers already, and NaN fails the
+/// comparison and passes through. `f32::round_ties_even` would be a libm
+/// `rintf` call per lane on a baseline x86-64 build (no SSE4.1 `roundps`).
+#[inline(always)]
+fn round_ties_even_magnitude(v: f32) -> f32 {
+    let magic = f32::from_bits((v.to_bits() & 0x8000_0000) | INTEGRAL.to_bits());
+    if v.abs() < INTEGRAL {
+        (v + magic) - magic
+    } else {
+        v
+    }
+}
+
 /// `cvtps2dq`: round half to even; NaN and out-of-range give `i32::MIN`.
+///
+/// As in `cvt_trunc`, the cast saturates a value below `i32::MIN` to
+/// `i32::MIN` by itself, so one comparison covers NaN and `>= 2^31`.
 #[inline(always)]
 fn cvt_round(v: f32) -> i32 {
-    let r = v.round_ties_even();
-    if r >= -2_147_483_648.0 && r < 2_147_483_648.0 {
+    let r = round_ties_even_magnitude(v);
+    if r < 2_147_483_648.0 {
         r as i32
     } else {
         i32::MIN
@@ -647,7 +672,8 @@ mod tests {
     use super::*;
 
     /// The lane conversions as they were first written, on top of libm
-    /// `trunc`. They stay here as the oracle for the libm-free forms above.
+    /// `trunc` and `rint`. They stay here as the oracle for the libm-free
+    /// forms above.
     fn cvt_trunc_ref(v: f32) -> i32 {
         let r = v.trunc();
         if r >= -2_147_483_648.0 && r < 2_147_483_648.0 {
@@ -657,8 +683,18 @@ mod tests {
         }
     }
 
+    fn cvt_round_ref(v: f32) -> i32 {
+        let r = v.round_ties_even();
+        if r >= -2_147_483_648.0 && r < 2_147_483_648.0 {
+            r as i32
+        } else {
+            i32::MIN
+        }
+    }
+
     fn check(v: f32) {
         assert_eq!(cvt_trunc(v), cvt_trunc_ref(v), "cvt_trunc({v:e})");
+        assert_eq!(cvt_round(v), cvt_round_ref(v), "cvt_round({v:e})");
     }
 
     /// Every `step`-th bit pattern, plus the neighbourhoods where rounding,
