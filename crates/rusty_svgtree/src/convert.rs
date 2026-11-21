@@ -9,7 +9,7 @@ use rusty_raster::{
     Rect, Size, SpreadMode, Transform,
 };
 
-use crate::svgtree::{Document, EId, NodeId, SvgNode};
+use crate::svgtree::{AId, Document, EId, NodeId, SvgNode};
 use crate::tree::{
     BaseGradient, ClipPath, Color, Fill, Group, Image, ImageKind, LinearGradient, Mask, Node,
     Paint, PaintOrder, Path, Pattern, RadialGradient, Stop, Stroke,
@@ -74,15 +74,15 @@ fn ts_from_matrix(m: values::Matrix) -> Transform {
 }
 
 impl<'a> SvgNode<'a> {
-    fn length_attr(&self, name: &str) -> Option<Length> {
+    fn length_attr(&self, name: AId) -> Option<Length> {
         values::length(self.attribute(name)?)
     }
 
-    fn opacity_attr(&self, name: &str) -> Option<f32> {
+    fn opacity_attr(&self, name: AId) -> Option<f32> {
         values::opacity(self.attribute(name)?)
     }
 
-    fn convert_length(&self, name: &str, units: Units, state: &State, def: Length) -> f32 {
+    fn convert_length(&self, name: AId, units: Units, state: &State, def: Length) -> f32 {
         convert_length(
             self.length_attr(name).unwrap_or(def),
             *self,
@@ -92,24 +92,24 @@ impl<'a> SvgNode<'a> {
         )
     }
 
-    fn convert_user_length(&self, name: &str, state: &State, def: Length) -> f32 {
+    fn convert_user_length(&self, name: AId, state: &State, def: Length) -> f32 {
         self.convert_length(name, Units::UserSpaceOnUse, state, def)
     }
 
     fn parse_viewbox(&self) -> Option<NonZeroRect> {
-        let vb = values::view_box(self.attribute("viewBox")?)?;
+        let vb = values::view_box(self.attribute(AId::ViewBox)?)?;
         NonZeroRect::from_xywh(vb[0] as f32, vb[1] as f32, vb[2] as f32, vb[3] as f32)
     }
 
     fn aspect(&self) -> AspectRatio {
-        self.attribute("preserveAspectRatio")
+        self.attribute(AId::PreserveAspectRatio)
             .and_then(values::aspect_ratio)
             .unwrap_or_default()
     }
 
     /// A transform attribute; invalid (non-finite or degenerate) becomes
     /// identity, as usvg does. `transform-origin` is applied.
-    fn resolve_transform(&self, name: &str, state: &State) -> Transform {
+    fn resolve_transform(&self, name: AId, state: &State) -> Transform {
         let mut ts = match self.attribute(name).and_then(values::transform) {
             Some(m) => {
                 let t = ts_from_matrix(m);
@@ -121,10 +121,10 @@ impl<'a> SvgNode<'a> {
             }
             None => Transform::identity(),
         };
-        if let Some(origin) = self.attribute("transform-origin") {
+        if let Some(origin) = self.attribute(AId::TransformOrigin) {
             if let Some((ox, oy)) = parse_transform_origin(origin) {
-                let dx = convert_length(ox, *self, "width", Units::UserSpaceOnUse, state);
-                let dy = convert_length(oy, *self, "height", Units::UserSpaceOnUse, state);
+                let dx = convert_length(ox, *self, AId::Width, Units::UserSpaceOnUse, state);
+                let dy = convert_length(oy, *self, AId::Height, Units::UserSpaceOnUse, state);
                 ts = Transform::identity()
                     .pre_translate(dx, dy)
                     .pre_concat(ts)
@@ -135,7 +135,7 @@ impl<'a> SvgNode<'a> {
     }
 
     /// `transform` that parses to a non-invertible matrix hides the element.
-    fn has_valid_transform(&self, name: &str) -> bool {
+    fn has_valid_transform(&self, name: AId) -> bool {
         match self.attribute(name).and_then(values::transform) {
             Some(m) => ts_from_matrix(m).is_valid(),
             None => true,
@@ -143,8 +143,8 @@ impl<'a> SvgNode<'a> {
     }
 
     fn is_visible_element(&self, opt: &Options) -> bool {
-        self.attribute("display").map(str::trim) != Some("none")
-            && self.has_valid_transform("transform")
+        self.attribute(AId::Display).map(values::trim) != Some("none")
+            && self.has_valid_transform(AId::Transform)
             && switch_condition_passed(*self, opt)
     }
 }
@@ -172,7 +172,7 @@ fn parse_transform_origin(text: &str) -> Option<(Length, Length)> {
     }
 }
 
-fn convert_length(length: Length, node: SvgNode, name: &str, units: Units, state: &State) -> f32 {
+fn convert_length(length: Length, node: SvgNode, name: AId, units: Units, state: &State) -> f32 {
     let dpi = state.opt.dpi;
     let n = length.number as f32;
     match length.unit {
@@ -190,10 +190,24 @@ fn convert_length(length: Length, node: SvgNode, name: &str, units: Units, state
             } else {
                 let vb = state.view_box;
                 match name {
-                    "cx" | "dx" | "fx" | "markerWidth" | "refX" | "rx" | "width" | "x" | "x1"
-                    | "x2" => vb.width() * n / 100.0,
-                    "cy" | "dy" | "fy" | "height" | "markerHeight" | "refY" | "ry" | "y" | "y1"
-                    | "y2" => vb.height() * n / 100.0,
+                    AId::Cx
+                    | AId::Fx
+                    | AId::MarkerWidth
+                    | AId::RefX
+                    | AId::Rx
+                    | AId::Width
+                    | AId::X
+                    | AId::X1
+                    | AId::X2 => vb.width() * n / 100.0,
+                    AId::Cy
+                    | AId::Fy
+                    | AId::Height
+                    | AId::MarkerHeight
+                    | AId::RefY
+                    | AId::Ry
+                    | AId::Y
+                    | AId::Y1
+                    | AId::Y2 => vb.height() * n / 100.0,
                     _ => {
                         let len = ((vb.width().powi(2) + vb.height().powi(2)) / 2.0).sqrt();
                         len * n / 100.0
@@ -208,7 +222,7 @@ fn resolve_font_size(node: SvgNode, state: &State) -> f32 {
     let nodes: Vec<SvgNode> = node.ancestors().collect();
     let mut font_size = state.opt.font_size;
     for n in nodes.iter().rev().skip(1) {
-        let Some(v) = n.attribute("font-size") else {
+        let Some(v) = n.attribute(AId::FontSize) else {
             continue;
         };
         if let Some(length) = values::length(v) {
@@ -274,10 +288,10 @@ const FEATURES: &[&str] = &[
 /// `switch` / conditional processing: `requiredExtensions` fails,
 /// `systemLanguage` must match one of the configured languages.
 fn switch_condition_passed(node: SvgNode, opt: &Options) -> bool {
-    if node.has_attribute("requiredExtensions") {
+    if node.has_attribute(AId::RequiredExtensions) {
         return false;
     }
-    if let Some(features) = node.attribute("requiredFeatures") {
+    if let Some(features) = node.attribute(AId::RequiredFeatures) {
         for feature in features.split(' ') {
             let known = feature
                 .strip_prefix("http://www.w3.org/TR/SVG11/feature#")
@@ -287,7 +301,7 @@ fn switch_condition_passed(node: SvgNode, opt: &Options) -> bool {
             }
         }
     }
-    if let Some(langs) = node.attribute("systemLanguage") {
+    if let Some(langs) = node.attribute(AId::SystemLanguage) {
         let mut ok = false;
         for lang in langs.split(',') {
             let lang = lang.trim();
@@ -383,7 +397,7 @@ pub(crate) fn convert_doc(doc: &Document, opt: &Options) -> Result<Converted, Er
     let root_ts = view_box_to_transform(view_box, aspect, size);
     // usvg honours a non-standard `background-color` on the root element.
     let background = svg
-        .attribute("background-color")
+        .attribute(AId::BackgroundColor)
         .and_then(values::paint)
         .and_then(|p| match p {
             values::Paint::Color(c) => Some(c),
@@ -439,8 +453,8 @@ fn resolve_svg_size(svg: SvgNode, opt: &Options) -> (Result<Size, Error>, bool) 
         opt,
     };
     let def = Length::new(100.0, Unit::Percent);
-    let mut width = svg.length_attr("width").unwrap_or(def);
-    let mut height = svg.length_attr("height").unwrap_or(def);
+    let mut width = svg.length_attr(AId::Width).unwrap_or(def);
+    let mut height = svg.length_attr(AId::Height).unwrap_or(def);
     let view_box = svg.parse_viewbox();
     let restore_viewbox =
         if (width.unit == Unit::Percent || height.unit == Unit::Percent) && view_box.is_none() {
@@ -465,22 +479,22 @@ fn resolve_svg_size(svg: SvgNode, opt: &Options) -> (Result<Size, Error>, bool) 
         let w = if width.unit == Unit::Percent {
             vbox.width() * (width.number as f32 / 100.0)
         } else {
-            convert_length(width, svg, "width", Units::UserSpaceOnUse, &state)
+            convert_length(width, svg, AId::Width, Units::UserSpaceOnUse, &state)
         };
         let h = if height.unit == Unit::Percent {
             vbox.height() * (height.number as f32 / 100.0)
         } else {
-            convert_length(height, svg, "height", Units::UserSpaceOnUse, &state)
+            convert_length(height, svg, AId::Height, Units::UserSpaceOnUse, &state)
         };
-        match (svg.length_attr("width"), svg.length_attr("height")) {
+        match (svg.length_attr(AId::Width), svg.length_attr(AId::Height)) {
             (Some(_), None) => Size::from_wh(w, vbox.height() * w / vbox.width()),
             (None, Some(_)) => Size::from_wh(vbox.width() * h / vbox.height(), h),
             _ => Size::from_wh(w, h),
         }
     } else {
         Size::from_wh(
-            convert_length(width, svg, "width", Units::UserSpaceOnUse, &state),
-            convert_length(height, svg, "height", Units::UserSpaceOnUse, &state),
+            convert_length(width, svg, AId::Width, Units::UserSpaceOnUse, &state),
+            convert_length(height, svg, AId::Height, Units::UserSpaceOnUse, &state),
         )
     };
     let size = size.filter(|s| s.width().is_finite() && s.height().is_finite());
@@ -517,15 +531,10 @@ fn convert_element(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut
         else {
             return;
         };
-        let mut pending = Vec::new();
-        if let Some(g) =
-            convert_group_into(node, state, false, cache, &mut pending, &mut |cache, g| {
-                convert_element(child, state, cache, g);
-            })
-        {
+        if let Some(g) = convert_group_into(node, state, false, cache, parent, &mut |cache, g| {
+            convert_element(child, state, cache, g);
+        }) {
             parent.children.push(Node::Group(Box::new(g)));
-        } else {
-            parent.children.append(&mut pending);
         }
         return;
     }
@@ -533,13 +542,10 @@ fn convert_element(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut
         convert_nested_svg(node, state, cache, parent);
         return;
     }
-    let mut pending = Vec::new();
-    if let Some(g) = convert_group_into(node, state, false, cache, &mut pending, &mut |cache, g| {
+    if let Some(g) = convert_group_into(node, state, false, cache, parent, &mut |cache, g| {
         convert_element_impl(tag, node, state, cache, g);
     }) {
         parent.children.push(Node::Group(Box::new(g)));
-    } else {
-        parent.children.append(&mut pending);
     }
 }
 
@@ -584,76 +590,75 @@ fn convert_clip_path_elements(clip: SvgNode, state: &State, cache: &mut Cache, p
             convert_use(node, state, cache, parent);
             continue;
         }
-        let mut pending = Vec::new();
-        if let Some(g) =
-            convert_group_into(node, state, false, cache, &mut pending, &mut |cache, g| {
-                if matches!(
-                    tag,
-                    EId::Rect
-                        | EId::Circle
-                        | EId::Ellipse
-                        | EId::Polyline
-                        | EId::Polygon
-                        | EId::Path
-                ) {
-                    if let Some(path) = convert_shape(node, state) {
-                        convert_path(node, path, state, cache, g);
-                    }
+        if let Some(g) = convert_group_into(node, state, false, cache, parent, &mut |cache, g| {
+            if matches!(
+                tag,
+                EId::Rect | EId::Circle | EId::Ellipse | EId::Polyline | EId::Polygon | EId::Path
+            ) {
+                if let Some(path) = convert_shape(node, state) {
+                    convert_path(node, path, state, cache, g);
                 }
-            })
-        {
+            }
+        }) {
             parent.children.push(Node::Group(Box::new(g)));
-        } else {
-            parent.children.append(&mut pending);
         }
     }
 }
 
-/// `convert_group` that hands unrequired groups' children to the caller
-/// through `pending` (the caller's group is borrowed by the closure scope).
+/// Converts `node` as a group whose content `collect` adds. A group that is
+/// not required (no opacity, transform, blend mode, isolation, clip path or
+/// mask of its own, and not a `g` or `use`) is never built: its content goes
+/// straight into `parent`. A required group is returned for the caller to
+/// place; `None` also means the element was dropped.
 fn convert_group_into(
     node: SvgNode,
     state: &State,
     force: bool,
     cache: &mut Cache,
-    pending: &mut Vec<Node>,
+    parent: &mut Group,
     collect: &mut dyn FnMut(&mut Cache, &mut Group),
 ) -> Option<Group> {
-    match convert_group_impl(node, state, force, cache, collect) {
-        GroupResult::Group(g) => Some(g),
-        GroupResult::Flatten(children) => {
-            *pending = children;
-            None
-        }
-        GroupResult::Drop => None,
-    }
-}
-
-enum GroupResult {
-    Group(Group),
-    Flatten(Vec<Node>),
-    Drop,
-}
-
-fn convert_group_impl(
-    node: SvgNode,
-    state: &State,
-    force: bool,
-    cache: &mut Cache,
-    collect: &mut dyn FnMut(&mut Cache, &mut Group),
-) -> GroupResult {
     let opacity = if state.in_clip_path {
         1.0
     } else {
-        node.opacity_attr("opacity").unwrap_or(1.0)
+        node.opacity_attr(AId::Opacity).unwrap_or(1.0)
     };
-    let transform = node.resolve_transform("transform", state);
+    let transform = node.resolve_transform(AId::Transform, state);
     let blend_mode = node
-        .attribute("mix-blend-mode")
+        .attribute(AId::MixBlendMode)
         .and_then(parse_blend_mode)
         .unwrap_or(BlendMode::SourceOver);
-    let isolate = node.attribute("isolation").map(str::trim) == Some("isolate");
+    let isolate = node.attribute(AId::Isolation).map(values::trim) == Some("isolate");
     let is_g_or_use = matches!(node.tag_name(), Some(EId::G | EId::Use));
+    let required = (opacity - 1.0).abs() > f32::EPSILON * 4.0
+        || !transform.is_identity()
+        || blend_mode != BlendMode::SourceOver
+        || isolate
+        || is_g_or_use
+        || force;
+
+    let clip_link = node.func_iri_attribute(AId::ClipPath);
+    let mask_link = if state.in_clip_path {
+        None
+    } else {
+        node.func_iri_attribute(AId::Mask)
+    };
+    // Filters are not implemented: a reference to a missing element
+    // disables rendering (as the spec and usvg require); a valid filter
+    // is ignored and the content drawn unfiltered (documented).
+    let filter_missing = !state.in_clip_path
+        && node.attribute(AId::Filter).is_some_and(|f| {
+            f.trim() != "none"
+                && values::func_iri(f).is_some()
+                && node.func_iri_attribute(AId::Filter).is_none()
+        });
+
+    if !required && clip_link.is_none() && mask_link.is_none() && !filter_missing {
+        // Nothing of its own to hold: the content is the parent's as it
+        // stands, in the same order.
+        collect(cache, parent);
+        return None;
+    }
 
     let mut g = Group {
         transform,
@@ -664,51 +669,26 @@ fn convert_group_impl(
     };
     collect(cache, &mut g);
 
-    let object_bbox = g.calculate_object_bbox();
-
     let mut clip_path = None;
-    if let Some(link) = node.func_iri_attribute("clip-path") {
-        clip_path = convert_clip_path(link, state, object_bbox, cache);
-        if clip_path.is_none() {
-            return GroupResult::Drop;
-        }
-    }
     let mut mask = None;
-    if !state.in_clip_path {
-        if let Some(link) = node.func_iri_attribute("mask") {
-            mask = convert_mask(link, state, object_bbox, cache);
-            if mask.is_none() {
-                return GroupResult::Drop;
-            }
+    if clip_link.is_some() || mask_link.is_some() {
+        let object_bbox = g.calculate_object_bbox();
+        if let Some(link) = clip_link {
+            clip_path = convert_clip_path(link, state, object_bbox, cache);
+            clip_path.as_ref()?;
         }
-        // Filters are not implemented: a reference to a missing element
-        // disables rendering (as the spec and usvg require); a valid filter
-        // is ignored and the content drawn unfiltered (documented).
-        if let Some(f) = node.attribute("filter") {
-            if f.trim() != "none"
-                && values::func_iri(f).is_some()
-                && node.func_iri_attribute("filter").is_none()
-            {
-                return GroupResult::Drop;
-            }
+        if let Some(link) = mask_link {
+            mask = convert_mask(link, state, object_bbox, cache);
+            mask.as_ref()?;
         }
     }
-
-    let required = (opacity - 1.0).abs() > f32::EPSILON * 4.0
-        || clip_path.is_some()
-        || mask.is_some()
-        || !transform.is_identity()
-        || blend_mode != BlendMode::SourceOver
-        || isolate
-        || is_g_or_use
-        || force;
-    if !required {
-        return GroupResult::Flatten(std::mem::take(&mut g.children));
+    if filter_missing {
+        return None;
     }
     g.clip_path = clip_path;
     g.mask = mask;
     g.calculate_bounding_boxes();
-    GroupResult::Group(g)
+    Some(g)
 }
 
 fn parse_blend_mode(v: &str) -> Option<BlendMode> {
@@ -743,17 +723,17 @@ fn convert_shape(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>
     match node.tag_name()? {
         EId::Rect => convert_rect(node, state),
         EId::Circle => {
-            let cx = node.convert_user_length("cx", state, Length::zero());
-            let cy = node.convert_user_length("cy", state, Length::zero());
-            let r = node.convert_user_length("r", state, Length::zero());
+            let cx = node.convert_user_length(AId::Cx, state, Length::zero());
+            let cy = node.convert_user_length(AId::Cy, state, Length::zero());
+            let r = node.convert_user_length(AId::R, state, Length::zero());
             if !(r.is_finite() && r > 0.0) {
                 return None;
             }
             ellipse_to_path(cx, cy, r, r)
         }
         EId::Ellipse => {
-            let cx = node.convert_user_length("cx", state, Length::zero());
-            let cy = node.convert_user_length("cy", state, Length::zero());
+            let cx = node.convert_user_length(AId::Cx, state, Length::zero());
+            let cy = node.convert_user_length(AId::Cy, state, Length::zero());
             let (rx, ry) = resolve_rx_ry(node, state);
             if !(rx.is_finite() && rx > 0.0 && ry.is_finite() && ry > 0.0) {
                 return None;
@@ -761,17 +741,17 @@ fn convert_shape(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>
             ellipse_to_path(cx, cy, rx, ry)
         }
         EId::Line => {
-            let x1 = node.convert_user_length("x1", state, Length::zero());
-            let y1 = node.convert_user_length("y1", state, Length::zero());
-            let x2 = node.convert_user_length("x2", state, Length::zero());
-            let y2 = node.convert_user_length("y2", state, Length::zero());
+            let x1 = node.convert_user_length(AId::X1, state, Length::zero());
+            let y1 = node.convert_user_length(AId::Y1, state, Length::zero());
+            let x2 = node.convert_user_length(AId::X2, state, Length::zero());
+            let y2 = node.convert_user_length(AId::Y2, state, Length::zero());
             let mut b = PathBuilder::new();
             b.move_to(x1, y1);
             b.line_to(x2, y2);
             finish(b)
         }
         EId::Polyline | EId::Polygon => {
-            let pts = values::points(node.attribute("points")?);
+            let pts = values::points(node.attribute(AId::Points)?);
             if pts.len() < 2 {
                 return None;
             }
@@ -789,35 +769,29 @@ fn convert_shape(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>
             finish(b)
         }
         EId::Path => {
-            let segs = values::path_data(node.attribute("d")?);
-            segs_to_path(&segs)
+            // Path data goes straight from the text into the builder.
+            let mut b = PathBuilder::new();
+            values::path_data_with(node.attribute(AId::D)?, &mut |s| match s {
+                Seg::MoveTo(x, y) => b.move_to(x as f32, y as f32),
+                Seg::LineTo(x, y) => b.line_to(x as f32, y as f32),
+                Seg::Quad(x1, y1, x, y) => b.quad_to(x1 as f32, y1 as f32, x as f32, y as f32),
+                Seg::Cubic(x1, y1, x2, y2, x, y) => b.cubic_to(
+                    x1 as f32, y1 as f32, x2 as f32, y2 as f32, x as f32, y as f32,
+                ),
+                Seg::Close => b.close(),
+            });
+            finish(b)
         }
         _ => None,
     }
 }
 
-fn segs_to_path(segs: &[Seg]) -> Option<Arc<rusty_raster::Path>> {
-    let mut b = PathBuilder::new();
-    for s in segs {
-        match *s {
-            Seg::MoveTo(x, y) => b.move_to(x as f32, y as f32),
-            Seg::LineTo(x, y) => b.line_to(x as f32, y as f32),
-            Seg::Quad(x1, y1, x, y) => b.quad_to(x1 as f32, y1 as f32, x as f32, y as f32),
-            Seg::Cubic(x1, y1, x2, y2, x, y) => b.cubic_to(
-                x1 as f32, y1 as f32, x2 as f32, y2 as f32, x as f32, y as f32,
-            ),
-            Seg::Close => b.close(),
-        }
-    }
-    finish(b)
-}
-
 /// usvg's `arc_to` on a builder: f32 endpoints widened to f64 for kurbo.
+/// The cubics go straight into the builder.
 fn builder_arc_to(b: &mut PathBuilder, rx: f32, ry: f32, x: f32, y: f32) {
     let Some(prev) = b.last_point() else {
         return;
     };
-    let mut segs = Vec::new();
     values::arc_to_cubics(
         f64::from(prev.x),
         f64::from(prev.y),
@@ -828,27 +802,24 @@ fn builder_arc_to(b: &mut PathBuilder, rx: f32, ry: f32, x: f32, y: f32) {
         true,
         f64::from(x),
         f64::from(y),
-        &mut segs,
-    );
-    for s in segs {
-        match s {
+        &mut |s| match s {
             Seg::Cubic(x1, y1, x2, y2, x, y) => b.cubic_to(
                 x1 as f32, y1 as f32, x2 as f32, y2 as f32, x as f32, y as f32,
             ),
             Seg::LineTo(x, y) => b.line_to(x as f32, y as f32),
             _ => {}
-        }
-    }
+        },
+    );
 }
 
 fn convert_rect(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>> {
-    let width = node.convert_user_length("width", state, Length::zero());
-    let height = node.convert_user_length("height", state, Length::zero());
+    let width = node.convert_user_length(AId::Width, state, Length::zero());
+    let height = node.convert_user_length(AId::Height, state, Length::zero());
     if !(width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0) {
         return None;
     }
-    let x = node.convert_user_length("x", state, Length::zero());
-    let y = node.convert_user_length("y", state, Length::zero());
+    let x = node.convert_user_length(AId::X, state, Length::zero());
+    let y = node.convert_user_length(AId::Y, state, Length::zero());
     let (mut rx, mut ry) = resolve_rx_ry(node, state);
     if rx > width / 2.0 {
         rx = width / 2.0;
@@ -876,8 +847,8 @@ fn convert_rect(node: SvgNode, state: &State) -> Option<Arc<rusty_raster::Path>>
 }
 
 fn resolve_rx_ry(node: SvgNode, state: &State) -> (f32, f32) {
-    let mut rx = node.length_attr("rx");
-    let mut ry = node.length_attr("ry");
+    let mut rx = node.length_attr(AId::Rx);
+    let mut ry = node.length_attr(AId::Ry);
     if rx.is_some_and(|v| v.number.is_sign_negative()) {
         rx = None;
     }
@@ -888,14 +859,14 @@ fn resolve_rx_ry(node: SvgNode, state: &State) -> (f32, f32) {
     match (rx, ry) {
         (None, None) => (0.0, 0.0),
         (Some(rx), None) => {
-            let v = conv(rx, "rx");
+            let v = conv(rx, AId::Rx);
             (v, v)
         }
         (None, Some(ry)) => {
-            let v = conv(ry, "ry");
+            let v = conv(ry, AId::Ry);
             (v, v)
         }
-        (Some(rx), Some(ry)) => (conv(rx, "rx"), conv(ry, "ry")),
+        (Some(rx), Some(ry)) => (conv(rx, AId::Rx), conv(ry, AId::Ry)),
     }
 }
 
@@ -930,17 +901,17 @@ fn convert_path(
     let mut fill = resolve_fill(node, has_bbox, state, cache);
     let mut stroke = resolve_stroke(node, has_bbox, state, cache);
     let visible_attr = node
-        .find_attribute("visibility")
-        .map(str::trim)
+        .find_attribute(AId::Visibility)
+        .map(values::trim)
         .unwrap_or("visible")
         == "visible";
     let mut visible = visible_attr;
     let anti_alias = !matches!(
-        node.find_attribute("shape-rendering").map(str::trim),
+        node.find_attribute(AId::ShapeRendering).map(values::trim),
         Some("optimizeSpeed" | "crispEdges")
     );
     let (paint_order, markers_pos) = node
-        .find_attribute("paint-order")
+        .find_attribute(AId::PaintOrder)
         .map(parse_paint_order)
         .unwrap_or((PaintOrder::FillAndStroke, 2));
     if fill.is_none() && stroke.is_none() {
@@ -1016,7 +987,7 @@ fn convert_path(
     }
 }
 
-fn marker_link<'a>(node: SvgNode<'a>, name: &str) -> Option<SvgNode<'a>> {
+fn marker_link<'a>(node: SvgNode<'a>, name: AId) -> Option<SvgNode<'a>> {
     let n = node.find_attribute_node(name)?;
     n.func_iri_attribute(name)
 }
@@ -1028,9 +999,9 @@ fn has_markers(node: SvgNode) -> bool {
     {
         return false;
     }
-    ["marker-start", "marker-mid", "marker-end"]
+    [AId::MarkerStart, AId::MarkerMid, AId::MarkerEnd]
         .iter()
-        .any(|n| marker_link(node, n).is_some())
+        .any(|n| marker_link(node, *n).is_some())
 }
 
 fn convert_markers(
@@ -1043,9 +1014,9 @@ fn convert_markers(
     use crate::marker::{self, MarkerKind, Orientation};
     let segs = marker::segments(data);
     for (attr, kind) in [
-        ("marker-start", MarkerKind::Start),
-        ("marker-mid", MarkerKind::Middle),
-        ("marker-end", MarkerKind::End),
+        (AId::MarkerStart, MarkerKind::Start),
+        (AId::MarkerMid, MarkerKind::Middle),
+        (AId::MarkerEnd, MarkerKind::End),
     ] {
         let Some(mnode) = marker_link(node, attr) else {
             continue;
@@ -1056,30 +1027,30 @@ fn convert_markers(
         if state.parent_markers.len() >= MAX_REF_DEPTH {
             continue;
         }
-        let stroke_scale = match mnode.attribute("markerUnits").map(str::trim) {
+        let stroke_scale = match mnode.attribute(AId::MarkerUnits).map(values::trim) {
             Some("userSpaceOnUse") => 1.0,
-            _ => resolve_length(node, "stroke-width", state, 1.0),
+            _ => resolve_length(node, AId::StrokeWidth, state, 1.0),
         };
         if !(stroke_scale.is_finite() && stroke_scale > 0.0) {
             continue;
         }
         let Some(rect) = NonZeroRect::from_xywh(
-            mnode.convert_user_length("refX", state, Length::zero()),
-            mnode.convert_user_length("refY", state, Length::zero()),
-            mnode.convert_user_length("markerWidth", state, Length::new(3.0, Unit::None)),
-            mnode.convert_user_length("markerHeight", state, Length::new(3.0, Unit::None)),
+            mnode.convert_user_length(AId::RefX, state, Length::zero()),
+            mnode.convert_user_length(AId::RefY, state, Length::zero()),
+            mnode.convert_user_length(AId::MarkerWidth, state, Length::new(3.0, Unit::None)),
+            mnode.convert_user_length(AId::MarkerHeight, state, Length::new(3.0, Unit::None)),
         ) else {
             continue;
         };
         let view_box = mnode.parse_viewbox().map(|vb| (vb, mnode.aspect()));
-        let overflow = mnode.attribute("overflow").map(str::trim);
+        let overflow = mnode.attribute(AId::Overflow).map(values::trim);
         let clip = if matches!(overflow, None | Some("hidden" | "scroll")) {
             let r = view_box.map_or_else(|| rect.size().to_non_zero_rect(0.0, 0.0), |v| v.0);
             clip_element(r, Transform::identity()).clip_path
         } else {
             None
         };
-        let orient = match mnode.attribute("orient").map(str::trim) {
+        let orient = match mnode.attribute(AId::Orient).map(values::trim) {
             Some("auto") => Orientation::Auto,
             Some("auto-start-reverse") => Orientation::AutoStartReverse,
             Some(v) => Orientation::Angle(parse_angle(v).unwrap_or(0.0)),
@@ -1244,7 +1215,7 @@ fn push_pattern_transform(root: &mut Group, transform: Transform) {
 // ----------------------------------------------------------------- style --
 
 fn resolve_fill(node: SvgNode, has_bbox: bool, state: &State, cache: &mut Cache) -> Option<Fill> {
-    let rule = |n: SvgNode, attr: &str| match n.find_attribute(attr).map(str::trim) {
+    let rule = |n: SvgNode, attr: AId| match n.find_attribute(attr).map(values::trim) {
         Some("evenodd") => FillRule::EvenOdd,
         _ => FillRule::Winding,
     };
@@ -1256,12 +1227,12 @@ fn resolve_fill(node: SvgNode, has_bbox: bool, state: &State, cache: &mut Cache)
                 blue: 0,
             }),
             opacity: 1.0,
-            rule: rule(node, "clip-rule"),
+            rule: rule(node, AId::ClipRule),
         });
     }
     let mut sub_opacity = 1.0;
-    let paint = if let Some(n) = node.ancestors().find(|n| n.has_attribute("fill")) {
-        let value = n.attribute("fill")?;
+    let paint = if let Some(n) = node.ancestor_with_attribute(AId::Fill) {
+        let value = n.attribute(AId::Fill)?;
         convert_paint(node, value, true, has_bbox, state, &mut sub_opacity, cache)?
     } else {
         Paint::Color(Color {
@@ -1271,13 +1242,13 @@ fn resolve_fill(node: SvgNode, has_bbox: bool, state: &State, cache: &mut Cache)
         })
     };
     let fill_opacity = node
-        .find_attribute("fill-opacity")
+        .find_attribute(AId::FillOpacity)
         .and_then(values::opacity)
         .unwrap_or(1.0);
     Some(Fill {
         paint,
         opacity: sub_opacity * fill_opacity,
-        rule: rule(node, "fill-rule"),
+        rule: rule(node, AId::FillRule),
     })
 }
 
@@ -1291,29 +1262,29 @@ fn resolve_stroke(
         return None;
     }
     let mut sub_opacity = 1.0;
-    let n = node.ancestors().find(|n| n.has_attribute("stroke"))?;
-    let value = n.attribute("stroke")?;
+    let n = node.ancestor_with_attribute(AId::Stroke)?;
+    let value = n.attribute(AId::Stroke)?;
     let paint = convert_paint(node, value, false, has_bbox, state, &mut sub_opacity, cache)?;
-    let width = resolve_length(node, "stroke-width", state, 1.0);
+    let width = resolve_length(node, AId::StrokeWidth, state, 1.0);
     if !(width.is_finite() && width > 0.0) {
         return None;
     }
     let miterlimit = node
-        .find_attribute("stroke-miterlimit")
+        .find_attribute(AId::StrokeMiterlimit)
         .and_then(values::number)
         .map(|v| v as f32)
         .unwrap_or(4.0);
     let miterlimit = if miterlimit < 1.0 { 1.0 } else { miterlimit };
     let stroke_opacity = node
-        .find_attribute("stroke-opacity")
+        .find_attribute(AId::StrokeOpacity)
         .and_then(values::opacity)
         .unwrap_or(1.0);
-    let linecap = match node.find_attribute("stroke-linecap").map(str::trim) {
+    let linecap = match node.find_attribute(AId::StrokeLinecap).map(values::trim) {
         Some("round") => LineCap::Round,
         Some("square") => LineCap::Square,
         _ => LineCap::Butt,
     };
-    let linejoin = match node.find_attribute("stroke-linejoin").map(str::trim) {
+    let linejoin = match node.find_attribute(AId::StrokeLinejoin).map(values::trim) {
         Some("round") => LineJoin::Round,
         Some("bevel") => LineJoin::Bevel,
         Some("miter-clip") => LineJoin::MiterClip,
@@ -1327,13 +1298,13 @@ fn resolve_stroke(
         linecap,
         linejoin,
         dasharray: conv_dasharray(node, state),
-        dashoffset: resolve_length(node, "stroke-dashoffset", state, 0.0),
+        dashoffset: resolve_length(node, AId::StrokeDashoffset, state, 0.0),
     })
 }
 
 /// An inherited length (`stroke-width`, `stroke-dashoffset`).
-fn resolve_length(node: SvgNode, name: &str, state: &State, def: f32) -> f32 {
-    if let Some(n) = node.ancestors().find(|n| n.has_attribute(name)) {
+fn resolve_length(node: SvgNode, name: AId, state: &State, def: f32) -> f32 {
+    if let Some(n) = node.ancestor_with_attribute(name) {
         if let Some(l) = n.length_attr(name) {
             return convert_length(l, n, name, Units::UserSpaceOnUse, state);
         }
@@ -1342,13 +1313,11 @@ fn resolve_length(node: SvgNode, name: &str, state: &State, def: f32) -> f32 {
 }
 
 fn conv_dasharray(node: SvgNode, state: &State) -> Option<Vec<f32>> {
-    let n = node
-        .ancestors()
-        .find(|n| n.has_attribute("stroke-dasharray"))?;
-    let list = values::length_list(n.attribute("stroke-dasharray")?)?;
+    let n = node.ancestor_with_attribute(AId::StrokeDasharray)?;
+    let list = values::length_list(n.attribute(AId::StrokeDasharray)?)?;
     let list: Vec<f32> = list
         .into_iter()
-        .map(|l| convert_length(l, n, "stroke-dasharray", Units::UserSpaceOnUse, state))
+        .map(|l| convert_length(l, n, AId::StrokeDasharray, Units::UserSpaceOnUse, state))
         .collect();
     if list.iter().any(|v| v.is_sign_negative() || !v.is_finite()) {
         return None;
@@ -1366,7 +1335,7 @@ fn conv_dasharray(node: SvgNode, state: &State) -> Option<Vec<f32>> {
 }
 
 fn current_color(node: SvgNode) -> values::Color {
-    node.find_attribute("color")
+    node.find_attribute(AId::Color)
         .and_then(values::color)
         .unwrap_or(values::Color::BLACK)
 }
@@ -1467,9 +1436,9 @@ impl BaseGradient {
     }
 }
 
-fn units_attr(node: SvgNode, name: &str, def: Units) -> Units {
+fn units_attr(node: SvgNode, name: AId, def: Units) -> Units {
     let n = resolve_attr(node, name);
-    match n.attribute(name).map(str::trim) {
+    match n.attribute(name).map(values::trim) {
         Some("userSpaceOnUse") => Units::UserSpaceOnUse,
         Some("objectBoundingBox") => Units::ObjectBoundingBox,
         _ => def,
@@ -1478,26 +1447,31 @@ fn units_attr(node: SvgNode, name: &str, def: Units) -> Units {
 
 /// The node in the `href` chain that defines `name` (gradient attribute
 /// inheritance).
-fn resolve_attr<'a>(node: SvgNode<'a>, name: &str) -> SvgNode<'a> {
+fn resolve_attr<'a>(node: SvgNode<'a>, name: AId) -> SvgNode<'a> {
     if node.has_attribute(name) {
         return node;
     }
     let Some(tag) = node.tag_name() else {
         return node;
     };
-    let shared = matches!(name, "gradientUnits" | "spreadMethod" | "gradientTransform");
+    let shared = matches!(
+        name,
+        AId::GradientUnits | AId::SpreadMethod | AId::GradientTransform
+    );
     for link in node.href_iter() {
         let Some(lt) = link.tag_name() else {
             return node;
         };
         let ok = match tag {
             EId::LinearGradient => {
-                (matches!(name, "x1" | "y1" | "x2" | "y2") && lt == EId::LinearGradient)
+                (matches!(name, AId::X1 | AId::Y1 | AId::X2 | AId::Y2) && lt == EId::LinearGradient)
                     || (shared && lt.is_gradient())
             }
             EId::RadialGradient => {
-                (matches!(name, "cx" | "cy" | "r" | "fx" | "fy" | "fr")
-                    && lt == EId::RadialGradient)
+                (matches!(
+                    name,
+                    AId::Cx | AId::Cy | AId::R | AId::Fx | AId::Fy | AId::Fr
+                ) && lt == EId::RadialGradient)
                     || (shared && lt.is_gradient())
             }
             EId::Pattern => lt == EId::Pattern,
@@ -1513,7 +1487,7 @@ fn resolve_attr<'a>(node: SvgNode<'a>, name: &str) -> SvgNode<'a> {
     node
 }
 
-fn resolve_number(node: SvgNode, name: &str, units: Units, state: &State, def: Length) -> f32 {
+fn resolve_number(node: SvgNode, name: AId, units: Units, state: &State, def: Length) -> f32 {
     resolve_attr(node, name).convert_length(name, units, state, def)
 }
 
@@ -1549,7 +1523,7 @@ fn convert_stops(grad: SvgNode) -> Vec<Stop> {
         if stop.tag_name() != Some(EId::Stop) {
             continue;
         }
-        let offset = match stop.length_attr("offset") {
+        let offset = match stop.length_attr(AId::Offset) {
             Some(l) => match l.unit {
                 Unit::None => l.number,
                 Unit::Percent => l.number / 100.0,
@@ -1559,12 +1533,12 @@ fn convert_stops(grad: SvgNode) -> Vec<Stop> {
         };
         prev_offset = offset;
         let offset = (offset as f32).clamp(0.0, 1.0);
-        let c = match stop.attribute("stop-color").map(str::trim) {
+        let c = match stop.attribute(AId::StopColor).map(values::trim) {
             Some("currentColor") => current_color(stop),
             Some(v) => values::color(v).unwrap_or(values::Color::BLACK),
             None => values::Color::BLACK,
         };
-        let stop_opacity = stop.opacity_attr("stop-opacity").unwrap_or(1.0);
+        let stop_opacity = stop.opacity_attr(AId::StopOpacity).unwrap_or(1.0);
         stops.push(Stop {
             offset,
             color: Color {
@@ -1609,9 +1583,9 @@ fn convert_stops(grad: SvgNode) -> Vec<Stop> {
 }
 
 fn spread_attr(node: SvgNode) -> SpreadMode {
-    match resolve_attr(node, "spreadMethod")
-        .attribute("spreadMethod")
-        .map(str::trim)
+    match resolve_attr(node, AId::SpreadMethod)
+        .attribute(AId::SpreadMethod)
+        .map(values::trim)
     {
         Some("reflect") => SpreadMode::Reflect,
         Some("repeat") => SpreadMode::Repeat,
@@ -1633,9 +1607,9 @@ fn convert_gradient(node: SvgNode, state: &State) -> Option<ServerOrColor> {
         let s = stops.first()?;
         return Some(ServerOrColor::Color(s.color, s.opacity));
     }
-    let units = units_attr(node, "gradientUnits", Units::ObjectBoundingBox);
+    let units = units_attr(node, AId::GradientUnits, Units::ObjectBoundingBox);
     let transform =
-        resolve_attr(node, "gradientTransform").resolve_transform("gradientTransform", state);
+        resolve_attr(node, AId::GradientTransform).resolve_transform(AId::GradientTransform, state);
     let base = BaseGradient {
         transform,
         spread: spread_attr(node),
@@ -1645,10 +1619,16 @@ fn convert_gradient(node: SvgNode, state: &State) -> Option<ServerOrColor> {
     let obb = base.obb;
     if node.tag_name() == Some(EId::LinearGradient) {
         let g = LinearGradient {
-            x1: resolve_number(node, "x1", units, state, Length::zero()),
-            y1: resolve_number(node, "y1", units, state, Length::zero()),
-            x2: resolve_number(node, "x2", units, state, Length::new(100.0, Unit::Percent)),
-            y2: resolve_number(node, "y2", units, state, Length::zero()),
+            x1: resolve_number(node, AId::X1, units, state, Length::zero()),
+            y1: resolve_number(node, AId::Y1, units, state, Length::zero()),
+            x2: resolve_number(
+                node,
+                AId::X2,
+                units,
+                state,
+                Length::new(100.0, Unit::Percent),
+            ),
+            y2: resolve_number(node, AId::Y2, units, state, Length::zero()),
             base,
         };
         return Some(ServerOrColor::Server(
@@ -1656,24 +1636,36 @@ fn convert_gradient(node: SvgNode, state: &State) -> Option<ServerOrColor> {
             obb,
         ));
     }
-    let r = resolve_number(node, "r", units, state, Length::new(50.0, Unit::Percent));
+    let r = resolve_number(node, AId::R, units, state, Length::new(50.0, Unit::Percent));
     if !(r.is_finite() && r > 0.0) {
         let s = base.stops.last()?;
         return Some(ServerOrColor::Color(s.color, s.opacity));
     }
-    let fr = resolve_number(node, "fr", units, state, Length::zero());
-    let cx = resolve_number(node, "cx", units, state, Length::new(50.0, Unit::Percent));
-    let cy = resolve_number(node, "cy", units, state, Length::new(50.0, Unit::Percent));
+    let fr = resolve_number(node, AId::Fr, units, state, Length::zero());
+    let cx = resolve_number(
+        node,
+        AId::Cx,
+        units,
+        state,
+        Length::new(50.0, Unit::Percent),
+    );
+    let cy = resolve_number(
+        node,
+        AId::Cy,
+        units,
+        state,
+        Length::new(50.0, Unit::Percent),
+    );
     let fx = resolve_number(
         node,
-        "fx",
+        AId::Fx,
         units,
         state,
         Length::new(f64::from(cx), Unit::None),
     );
     let fy = resolve_number(
         node,
-        "fy",
+        AId::Fy,
         units,
         state,
         Length::new(f64::from(cy), Unit::None),
@@ -1701,19 +1693,19 @@ fn convert_pattern(node: SvgNode, state: &State, cache: &mut Cache) -> Option<Se
         .href_iter()
         .take_while(|l| l.tag_name() == Some(EId::Pattern))
         .find(|l| l.has_children())?;
-    let units = units_attr(node, "patternUnits", Units::ObjectBoundingBox);
-    let content_units = units_attr(node, "patternContentUnits", Units::UserSpaceOnUse);
+    let units = units_attr(node, AId::PatternUnits, Units::ObjectBoundingBox);
+    let content_units = units_attr(node, AId::PatternContentUnits, Units::UserSpaceOnUse);
     let transform =
-        resolve_attr(node, "patternTransform").resolve_transform("patternTransform", state);
+        resolve_attr(node, AId::PatternTransform).resolve_transform(AId::PatternTransform, state);
     let rect = NonZeroRect::from_xywh(
-        resolve_number(node, "x", units, state, Length::zero()),
-        resolve_number(node, "y", units, state, Length::zero()),
-        resolve_number(node, "width", units, state, Length::zero()),
-        resolve_number(node, "height", units, state, Length::zero()),
+        resolve_number(node, AId::X, units, state, Length::zero()),
+        resolve_number(node, AId::Y, units, state, Length::zero()),
+        resolve_number(node, AId::Width, units, state, Length::zero()),
+        resolve_number(node, AId::Height, units, state, Length::zero()),
     )?;
-    let vb_node = resolve_attr(node, "viewBox");
+    let vb_node = resolve_attr(node, AId::ViewBox);
     let view_box = vb_node.parse_viewbox();
-    let aspect = resolve_attr(node, "preserveAspectRatio").aspect();
+    let aspect = resolve_attr(node, AId::PreserveAspectRatio).aspect();
     cache.active.push(node.id());
     let mut root = Group::default();
     let obb = units == Units::ObjectBoundingBox || content_units == Units::ObjectBoundingBox;
@@ -1771,17 +1763,17 @@ fn convert_clip_path(
         return None;
     }
     // Only a parseable-but-invalid transform disables the clip.
-    let mut transform = match node.attribute("transform") {
+    let mut transform = match node.attribute(AId::Transform) {
         None => Transform::identity(),
         Some(v) => {
             let m = values::transform(v)?;
             if !ts_from_matrix(m).is_valid() {
                 return None;
             }
-            node.resolve_transform("transform", state)
+            node.resolve_transform(AId::Transform, state)
         }
     };
-    let units = match node.attribute("clipPathUnits").map(str::trim) {
+    let units = match node.attribute(AId::ClipPathUnits).map(values::trim) {
         Some("objectBoundingBox") => Units::ObjectBoundingBox,
         _ => Units::UserSpaceOnUse,
     };
@@ -1797,7 +1789,7 @@ fn convert_clip_path(
     cache.active.push(node.id());
     let mut clip_path = None;
     let mut ok = true;
-    if let Some(link) = node.func_iri_attribute("clip-path") {
+    if let Some(link) = node.func_iri_attribute(AId::ClipPath) {
         clip_path = convert_clip_path(link, state, object_bbox, cache);
         ok = clip_path.is_some();
     }
@@ -1835,11 +1827,11 @@ fn convert_mask(
     if cache.active.contains(&node.id()) || cache.active.len() >= MAX_REF_DEPTH {
         return None;
     }
-    let units = match node.attribute("maskUnits").map(str::trim) {
+    let units = match node.attribute(AId::MaskUnits).map(values::trim) {
         Some("userSpaceOnUse") => Units::UserSpaceOnUse,
         _ => Units::ObjectBoundingBox,
     };
-    let content_units = match node.attribute("maskContentUnits").map(str::trim) {
+    let content_units = match node.attribute(AId::MaskContentUnits).map(values::trim) {
         Some("objectBoundingBox") => Units::ObjectBoundingBox,
         _ => Units::UserSpaceOnUse,
     };
@@ -1850,10 +1842,10 @@ fn convert_mask(
         }
     }
     let rect = NonZeroRect::from_xywh(
-        node.convert_length("x", units, state, Length::new(-10.0, Unit::Percent)),
-        node.convert_length("y", units, state, Length::new(-10.0, Unit::Percent)),
-        node.convert_length("width", units, state, Length::new(120.0, Unit::Percent)),
-        node.convert_length("height", units, state, Length::new(120.0, Unit::Percent)),
+        node.convert_length(AId::X, units, state, Length::new(-10.0, Unit::Percent)),
+        node.convert_length(AId::Y, units, state, Length::new(-10.0, Unit::Percent)),
+        node.convert_length(AId::Width, units, state, Length::new(120.0, Unit::Percent)),
+        node.convert_length(AId::Height, units, state, Length::new(120.0, Unit::Percent)),
     )?;
     let mut rect = rect;
     let mut mask_all = false;
@@ -1863,7 +1855,7 @@ fn convert_mask(
             None => mask_all = true,
         }
     }
-    let kind = if node.attribute("mask-type").map(str::trim) == Some("alpha") {
+    let kind = if node.attribute(AId::MaskType).map(values::trim) == Some("alpha") {
         MaskType::Alpha
     } else {
         MaskType::Luminance
@@ -1883,7 +1875,7 @@ fn convert_mask(
     cache.active.push(node.id());
     let mut sub_mask = None;
     let mut ok = true;
-    if let Some(link) = node.func_iri_attribute("mask") {
+    if let Some(link) = node.func_iri_attribute(AId::Mask) {
         sub_mask = convert_mask(link, state, object_bbox, cache);
         ok = sub_mask.is_some();
     }
@@ -1944,11 +1936,11 @@ fn convert_use(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Gro
         resolve_fill(node, true, state, cache),
         resolve_stroke(node, true, state, cache),
     ));
-    let mut orig_ts = node.resolve_transform("transform", state);
+    let mut orig_ts = node.resolve_transform(AId::Transform, state);
     let mut new_ts = Transform::identity();
     {
-        let x = node.convert_user_length("x", &use_state, Length::zero());
-        let y = node.convert_user_length("y", &use_state, Length::zero());
+        let x = node.convert_user_length(AId::X, &use_state, Length::zero());
+        let y = node.convert_user_length(AId::Y, &use_state, Length::zero());
         new_ts = new_ts.pre_translate(x, y);
     }
     let linked_to_symbol = child.tag_name() == Some(EId::Symbol);
@@ -1957,13 +1949,13 @@ fn convert_use(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Gro
             let def = Length::new(100.0, Unit::Percent);
             let x = use_state.view_box.x();
             let y = use_state.view_box.y();
-            let w = if node.has_attribute("width") {
-                node.convert_user_length("width", &use_state, def)
+            let w = if node.has_attribute(AId::Width) {
+                node.convert_user_length(AId::Width, &use_state, def)
             } else {
                 use_state.view_box.width()
             };
-            let h = if node.has_attribute("height") {
-                node.convert_user_length("height", &use_state, def)
+            let h = if node.has_attribute(AId::Height) {
+                node.convert_user_length(AId::Height, &use_state, def)
             } else {
                 use_state.view_box.height()
             };
@@ -1974,17 +1966,11 @@ fn convert_use(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Gro
         }
         if let Some(clip_rect) = get_clip_rect(node, child, &use_state) {
             let mut g = clip_element(clip_rect, orig_ts);
-            let mut pending = Vec::new();
-            if let Some(mut g2) = convert_group_into(
-                node,
-                &use_state,
-                true,
-                cache,
-                &mut pending,
-                &mut |cache, g2| {
+            if let Some(mut g2) =
+                convert_group_into(node, &use_state, true, cache, &mut g, &mut |cache, g2| {
                     use_convert_children(child, new_ts, &use_state, cache, g2);
-                },
-            ) {
+                })
+            {
                 g2.transform = Transform::identity();
                 g.children.push(Node::Group(Box::new(g2)));
             }
@@ -1998,31 +1984,23 @@ fn convert_use(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Gro
     }
     orig_ts = orig_ts.pre_concat(new_ts);
     if linked_to_symbol {
-        let mut pending = Vec::new();
-        if let Some(mut g) = convert_group_into(
-            node,
-            &use_state,
-            false,
-            cache,
-            &mut pending,
-            &mut |cache, g| {
+        if let Some(mut g) =
+            convert_group_into(node, &use_state, false, cache, parent, &mut |cache, g| {
                 use_convert_children(child, orig_ts, &use_state, cache, g);
-            },
-        ) {
+            })
+        {
             g.transform = Transform::identity();
             parent.children.push(Node::Group(Box::new(g)));
-        } else {
-            parent.children.append(&mut pending);
         }
     } else {
         if child.tag_name() == Some(EId::Svg) {
             let def = Length::new(100.0, Unit::Percent);
             use_state.use_size = (None, None);
-            if node.has_attribute("width") {
-                use_state.use_size.0 = Some(node.convert_user_length("width", &use_state, def));
+            if node.has_attribute(AId::Width) {
+                use_state.use_size.0 = Some(node.convert_user_length(AId::Width, &use_state, def));
             }
-            if node.has_attribute("height") {
-                use_state.use_size.1 = Some(node.convert_user_length("height", &use_state, def));
+            if node.has_attribute(AId::Height) {
+                use_state.use_size.1 = Some(node.convert_user_length(AId::Height, &use_state, def));
             }
         }
         use_convert_children(node, orig_ts, &use_state, cache, parent);
@@ -2030,10 +2008,10 @@ fn convert_use(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Gro
 }
 
 fn convert_nested_svg(node: SvgNode, state: &State, cache: &mut Cache, parent: &mut Group) {
-    let mut orig_ts = node.resolve_transform("transform", state);
+    let mut orig_ts = node.resolve_transform(AId::Transform, state);
     let mut new_ts = Transform::identity();
-    let x = node.convert_user_length("x", state, Length::zero());
-    let y = node.convert_user_length("y", state, Length::zero());
+    let x = node.convert_user_length(AId::X, state, Length::zero());
+    let y = node.convert_user_length(AId::Y, state, Length::zero());
     new_ts = new_ts.pre_translate(x, y);
     if let Some(ts) = viewbox_transform(node, node, state) {
         new_ts = new_ts.pre_concat(ts);
@@ -2102,36 +2080,25 @@ fn use_convert_children(
     parent: &mut Group,
 ) {
     let required = !transform.is_identity();
-    let mut pending = Vec::new();
-    let r = convert_group_into(
-        node,
-        state,
-        required,
-        cache,
-        &mut pending,
-        &mut |cache, g| {
-            g.transform = transform;
-            if state.in_clip_path {
-                convert_clip_path_elements(node, state, cache, g);
-            } else {
-                convert_children(node, state, cache, g);
-            }
-        },
-    );
+    let r = convert_group_into(node, state, required, cache, parent, &mut |cache, g| {
+        if state.in_clip_path {
+            convert_clip_path_elements(node, state, cache, g);
+        } else {
+            convert_children(node, state, cache, g);
+        }
+    });
     if let Some(mut g) = r {
-        // `convert_group` recomputed the transform from the attribute; the
-        // closure set the use transform first, so restore it.
+        // `convert_group_into` took the transform from the attribute; the
+        // group carries the `use` transform instead.
         g.transform = transform;
         g.calculate_bounding_boxes();
         parent.children.push(Node::Group(Box::new(g)));
-    } else {
-        parent.children.append(&mut pending);
     }
 }
 
 fn get_clip_rect(use_node: SvgNode, symbol: SvgNode, state: &State) -> Option<NonZeroRect> {
     if matches!(
-        symbol.attribute("overflow").map(str::trim),
+        symbol.attribute(AId::Overflow).map(values::trim),
         Some("visible" | "auto")
     ) {
         return None;
@@ -2139,12 +2106,12 @@ fn get_clip_rect(use_node: SvgNode, symbol: SvgNode, state: &State) -> Option<No
     if use_node.tag_name() == Some(EId::Svg)
         && state.use_size.0.is_none()
         && state.use_size.1.is_none()
-        && !(use_node.has_attribute("width") && use_node.has_attribute("height"))
+        && !(use_node.has_attribute(AId::Width) && use_node.has_attribute(AId::Height))
     {
         return None;
     }
-    let x = use_node.convert_user_length("x", state, Length::zero());
-    let y = use_node.convert_user_length("y", state, Length::zero());
+    let x = use_node.convert_user_length(AId::X, state, Length::zero());
+    let y = use_node.convert_user_length(AId::Y, state, Length::zero());
     let (mut w, mut h) = use_node_size(use_node, state);
     if use_node.tag_name() == Some(EId::Svg) {
         w = state.use_size.0.unwrap_or(w);
@@ -2159,8 +2126,8 @@ fn get_clip_rect(use_node: SvgNode, symbol: SvgNode, state: &State) -> Option<No
 fn use_node_size(node: SvgNode, state: &State) -> (f32, f32) {
     let def = Length::new(100.0, Unit::Percent);
     (
-        node.convert_user_length("width", state, def),
-        node.convert_user_length("height", state, def),
+        node.convert_user_length(AId::Width, state, def),
+        node.convert_user_length(AId::Height, state, def),
     )
 }
 
@@ -2178,35 +2145,35 @@ fn viewbox_transform(node: SvgNode, linked: SvgNode, state: &State) -> Option<Tr
 // ---------------------------------------------------------------- images --
 
 fn convert_image(node: SvgNode, state: &State, parent: &mut Group) {
-    let Some(href) = node.attribute("href") else {
+    let Some(href) = node.attribute(AId::Href) else {
         return;
     };
     let Some((kind, actual)) = crate::image::load_href(href, state.opt) else {
         return;
     };
     let visible = node
-        .find_attribute("visibility")
-        .map(str::trim)
+        .find_attribute(AId::Visibility)
+        .map(values::trim)
         .unwrap_or("visible")
         == "visible";
-    let quality = match node.find_attribute("image-rendering").map(str::trim) {
+    let quality = match node.find_attribute(AId::ImageRendering).map(values::trim) {
         Some("optimizeSpeed" | "crisp-edges" | "pixelated") => FilterQuality::Nearest,
         Some("smooth") => FilterQuality::Bilinear,
         _ => FilterQuality::Bicubic,
     };
-    let x = node.convert_user_length("x", state, Length::zero());
-    let y = node.convert_user_length("y", state, Length::zero());
+    let x = node.convert_user_length(AId::X, state, Length::zero());
+    let y = node.convert_user_length(AId::Y, state, Length::zero());
     let mut width = node.convert_user_length(
-        "width",
+        AId::Width,
         state,
         Length::new(f64::from(actual.width()), Unit::None),
     );
     let mut height = node.convert_user_length(
-        "height",
+        AId::Height,
         state,
         Length::new(f64::from(actual.height()), Unit::None),
     );
-    match (node.length_attr("width"), node.length_attr("height")) {
+    match (node.length_attr(AId::Width), node.length_attr(AId::Height)) {
         (Some(_), None) => height = actual.height() * (width / actual.width()),
         (None, Some(_)) => width = actual.width() * (height / actual.height()),
         _ => {}

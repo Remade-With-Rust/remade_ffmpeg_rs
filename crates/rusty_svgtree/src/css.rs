@@ -6,6 +6,8 @@
 //! are stably sorted by specificity, as `simplecss` (what usvg uses) does.
 //! At-rules are skipped. Anything unparseable is skipped, never fatal.
 
+use std::collections::HashMap;
+
 /// One `name: value` declaration.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Declaration {
@@ -100,6 +102,150 @@ impl Selector {
         }
         match_from(&self.ancestors, e, budget)
     }
+}
+
+/// What an element must carry for a rule's subject compound to match: a
+/// necessary condition, read off the selector once.
+enum SubjectKey<'a> {
+    Id(&'a str),
+    Class(&'a str),
+    Tag(&'a str),
+    Any,
+}
+
+impl Selector {
+    fn subject_key(&self) -> SubjectKey<'_> {
+        let mut class = None;
+        for sub in &self.subject.subs {
+            match sub {
+                SubSel::Attr(name, AttrOp::Eq(v)) if name == "id" => return SubjectKey::Id(v),
+                SubSel::Attr(name, AttrOp::Includes(v)) if name == "class" => {
+                    class = class.or(Some(v.as_str()));
+                }
+                _ => {}
+            }
+        }
+        match (class, &self.subject.tag) {
+            (Some(c), _) => SubjectKey::Class(c),
+            (None, Some(t)) => SubjectKey::Tag(t),
+            (None, None) => SubjectKey::Any,
+        }
+    }
+}
+
+/// The rules of a sheet, bucketed by what their subject compound requires of
+/// an element (an `id`, else a class, else a tag name), so an element is
+/// tested only against the rules it could match.
+#[derive(Default)]
+pub(crate) struct RuleIndex {
+    by_id: HashMap<Box<str>, Vec<u32>>,
+    by_class: HashMap<Box<str>, Vec<u32>>,
+    by_tag: HashMap<Box<str>, Vec<u32>>,
+    any: Vec<u32>,
+}
+
+/// Sheets shorter than this are matched rule by rule: looking an element up
+/// in the index costs about as much as testing this many rules against it.
+const INDEX_MIN_RULES: usize = 8;
+
+impl RuleIndex {
+    /// The index of a sheet long enough to gain from one.
+    pub(crate) fn new(rules: &[Rule]) -> Option<Self> {
+        (rules.len() >= INDEX_MIN_RULES).then(|| RuleIndex::build(rules))
+    }
+
+    fn build(rules: &[Rule]) -> Self {
+        let mut ix = RuleIndex::default();
+        for (i, rule) in rules.iter().enumerate() {
+            // A sheet cannot hold 2^32 rules; one past that would simply
+            // never be a candidate.
+            let Ok(i) = u32::try_from(i) else { break };
+            match rule.selector.subject_key() {
+                SubjectKey::Id(v) => ix.by_id.entry(v.into()).or_default().push(i),
+                SubjectKey::Class(v) => ix.by_class.entry(v.into()).or_default().push(i),
+                SubjectKey::Tag(v) => ix.by_tag.entry(v.into()).or_default().push(i),
+                SubjectKey::Any => ix.any.push(i),
+            }
+        }
+        ix
+    }
+
+    /// The rules `e` could match, going by its tag name, `id` and `class`,
+    /// ascending (rule order).
+    fn candidates<E: Element>(&self, e: E, out: &mut Vec<u32>) {
+        out.clear();
+        let mut lists = 0;
+        let mut add = |list: Option<&Vec<u32>>| {
+            if let Some(list) = list {
+                out.extend_from_slice(list);
+                lists += 1;
+            }
+        };
+        add(Some(&self.any).filter(|l| !l.is_empty()));
+        if !self.by_tag.is_empty() {
+            add(self.by_tag.get(e.local_name()));
+        }
+        if !self.by_id.is_empty() {
+            if let Some(id) = e.attribute("id") {
+                add(self.by_id.get(id));
+            }
+        }
+        if !self.by_class.is_empty() {
+            if let Some(class) = e.attribute("class") {
+                for word in class.split_ascii_whitespace() {
+                    add(self.by_class.get(word));
+                }
+            }
+        }
+        if lists > 1 {
+            // Each list is ascending; a repeated class word repeats one.
+            out.sort_unstable();
+            out.dedup();
+        }
+    }
+}
+
+/// Calls `hit` for each rule that matches `e`, in rule order. With an
+/// `index` (built from `rules`), only the rules it cannot rule out are
+/// tested.
+///
+/// A rule ruled out by the index would have failed its subject compound,
+/// which spends one unit of `budget` while any is left. The same units are
+/// charged here, so matching runs out at exactly the rule where testing
+/// every rule in turn runs out.
+pub(crate) fn for_each_match<E: Element>(
+    rules: &[Rule],
+    index: Option<&RuleIndex>,
+    scratch: &mut Vec<u32>,
+    e: E,
+    budget: &mut u64,
+    mut hit: impl FnMut(&Rule),
+) {
+    let Some(index) = index else {
+        for rule in rules {
+            if rule.selector.matches(e, budget) {
+                hit(rule);
+            }
+        }
+        return;
+    };
+    index.candidates(e, scratch);
+    let mut next = 0usize;
+    for &i in scratch.iter() {
+        let i = i as usize;
+        *budget = budget.saturating_sub((i - next) as u64);
+        if *budget == 0 {
+            return;
+        }
+        next = i + 1;
+        let Some(rule) = rules.get(i) else {
+            return;
+        };
+        if rule.selector.matches(e, budget) {
+            hit(rule);
+        }
+    }
+    *budget = budget.saturating_sub(rules.len().saturating_sub(next) as u64);
 }
 
 fn match_from<E: Element>(rest: &[(Combinator, Compound)], e: E, budget: &mut u64) -> bool {
@@ -394,35 +540,84 @@ fn parse_selector(c: &mut Cur) -> Option<Selector> {
 /// `style` attribute or between `{` and `}`.
 pub(crate) fn parse_declarations(text: &str) -> Vec<Declaration> {
     let mut out = Vec::new();
-    for item in split_top_level(text, b';') {
-        let Some(colon) = item.find(':') else {
-            continue;
-        };
-        let name = item[..colon].trim();
-        let mut value = item[colon + 1..].trim();
-        if name.is_empty() || value.is_empty() {
-            continue;
-        }
-        let mut important = false;
-        if let Some(i) = value.rfind('!') {
-            if value[i + 1..].trim().eq_ignore_ascii_case("important") {
-                important = true;
-                value = value[..i].trim_end();
-            }
-        }
-        // Strip comments inside values.
-        let value = strip_comments(value);
-        let name = strip_comments(name);
-        if name.is_empty() || value.is_empty() {
-            continue;
-        }
+    for_each_declaration(text, |name, value, important| {
         out.push(Declaration {
-            name: name.to_ascii_lowercase(),
-            value,
+            name: name.to_string(),
+            value: value.to_string(),
             important,
         });
-    }
+    });
     out
+}
+
+/// Calls `f(name, value, important)` for each declaration of a block body,
+/// in order: the name lower-cased, comments stripped from both. Nothing is
+/// allocated for a declaration that has no comment and no upper-case letter
+/// in its name.
+pub(crate) fn for_each_declaration(text: &str, mut f: impl FnMut(&str, &str, bool)) {
+    // Split on `;` outside quotes and parentheses.
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut start = 0;
+    for (i, &c) in text.as_bytes().iter().enumerate() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'"' | b'\'' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b';' if depth <= 0 => {
+                    declaration(&text[start..i], &mut f);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    declaration(&text[start..], &mut f);
+}
+
+/// One `name: value [!important]` item of a declaration block.
+fn declaration(item: &str, f: &mut impl FnMut(&str, &str, bool)) {
+    let Some(colon) = item.find(':') else {
+        return;
+    };
+    let name = item[..colon].trim();
+    let mut value = item[colon + 1..].trim();
+    if name.is_empty() || value.is_empty() {
+        return;
+    }
+    let mut important = false;
+    if let Some(i) = value.rfind('!') {
+        if value[i + 1..].trim().eq_ignore_ascii_case("important") {
+            important = true;
+            value = value[..i].trim_end();
+        }
+    }
+    // Strip comments inside names and values. Both are trimmed already, so
+    // one without a comment is the text as it stands.
+    let value_buf;
+    let value = if value.contains("/*") {
+        value_buf = strip_comments(value);
+        value_buf.as_str()
+    } else {
+        value
+    };
+    let name_buf;
+    let name = if name.contains("/*") || name.bytes().any(|c| c.is_ascii_uppercase()) {
+        name_buf = strip_comments(name).to_ascii_lowercase();
+        name_buf.as_str()
+    } else {
+        name
+    };
+    if name.is_empty() || value.is_empty() {
+        return;
+    }
+    f(name, value, important);
 }
 
 fn strip_comments(s: &str) -> String {
@@ -440,36 +635,6 @@ fn strip_comments(s: &str) -> String {
     }
     out.push_str(rest);
     out.trim().to_string()
-}
-
-/// Splits on `sep` outside quotes and parentheses.
-fn split_top_level(text: &str, sep: u8) -> Vec<&str> {
-    let b = text.as_bytes();
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut quote: Option<u8> = None;
-    let mut start = 0;
-    for (i, &c) in b.iter().enumerate() {
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                b'"' | b'\'' => quote = Some(c),
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                _ if c == sep && depth <= 0 => {
-                    out.push(&text[start..i]);
-                    start = i + 1;
-                }
-                _ => {}
-            },
-        }
-    }
-    out.push(&text[start..]);
-    out
 }
 
 /// Parses a style sheet, appending to `rules`. Re-sorts by specificity.
@@ -597,5 +762,181 @@ mod tests {
         // Type selectors sort before class selectors.
         assert!(rules[0].selector.subject.tag.is_some());
         assert!(rules[0].declarations[0].important);
+    }
+
+    #[test]
+    fn declarations() {
+        let got = parse_declarations(
+            "Fill : red /* c */ ; stroke:url(a;b) !IMPORTANT; /*x*/ : y; font-family: 'a;b'; \
+             bad; opacity: /* only */; STROKE-width/**/: 2; color: blue ! important ;x:",
+        );
+        let want = [
+            ("fill", "red", false),
+            ("stroke", "url(a;b)", true),
+            ("font-family", "'a;b'", false),
+            ("stroke-width", "2", false),
+            ("color", "blue", true),
+        ];
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        for (d, (name, value, important)) in got.iter().zip(want) {
+            assert_eq!(
+                (d.name.as_str(), d.value.as_str(), d.important),
+                (name, value, important)
+            );
+        }
+    }
+
+    /// A node of a small test tree.
+    struct TreeNode {
+        name: &'static str,
+        id: Option<&'static str>,
+        class: Option<&'static str>,
+        parent: Option<usize>,
+        prev: Option<usize>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct T<'a> {
+        nodes: &'a [TreeNode],
+        i: usize,
+    }
+
+    impl Element for T<'_> {
+        fn local_name(&self) -> &str {
+            self.nodes[self.i].name
+        }
+        fn attribute(&self, name: &str) -> Option<&str> {
+            match name {
+                "id" => self.nodes[self.i].id,
+                "class" => self.nodes[self.i].class,
+                _ => None,
+            }
+        }
+        fn parent_element(&self) -> Option<Self> {
+            self.nodes[self.i].parent.map(|i| T {
+                nodes: self.nodes,
+                i,
+            })
+        }
+        fn prev_sibling_element(&self) -> Option<Self> {
+            self.nodes[self.i].prev.map(|i| T {
+                nodes: self.nodes,
+                i,
+            })
+        }
+    }
+
+    /// Indexed matching against testing every rule in turn: the same rules
+    /// match and the same budget is left, for every starting budget
+    /// (including ones that run out part-way through the sheet).
+    #[test]
+    fn index_matches_like_a_full_scan() {
+        let mut x = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let names = ["g", "rect", "path", "a"];
+        let ids = [None, None, Some("i1"), Some("i2"), Some("")];
+        let classes = [
+            None,
+            Some("x"),
+            Some("y"),
+            Some("x y"),
+            Some("y  x x"),
+            Some("z"),
+            Some(""),
+        ];
+        let compounds = [
+            "*",
+            "g",
+            "rect",
+            "path",
+            ".x",
+            ".y",
+            ".x.y",
+            "#i1",
+            "#i2",
+            "rect.x",
+            "g#i1",
+            "[class~=x]",
+            "[class~=\"\"]",
+            "[id=i2]",
+            "[id]",
+            "[class=x]",
+            ":first-child",
+            "path:first-child",
+            ":hover",
+            ".q",
+        ];
+        for round in 0..300 {
+            let mut nodes: Vec<TreeNode> = Vec::new();
+            let mut last_child: Vec<Option<usize>> = Vec::new();
+            for i in 0..12usize {
+                let parent = (i > 0).then(|| (next() % i as u64) as usize);
+                let prev = parent.and_then(|p| last_child[p]);
+                if let Some(p) = parent {
+                    last_child[p] = Some(i);
+                }
+                last_child.push(None);
+                nodes.push(TreeNode {
+                    name: names[(next() % names.len() as u64) as usize],
+                    id: ids[(next() % ids.len() as u64) as usize],
+                    class: classes[(next() % classes.len() as u64) as usize],
+                    parent,
+                    prev,
+                });
+            }
+            let mut text = String::new();
+            for _ in 0..(1 + next() % 14) {
+                for part in 0..(1 + next() % 3) {
+                    if part > 0 {
+                        text.push_str([" ", " > ", " + "][(next() % 3) as usize]);
+                    }
+                    text.push_str(compounds[(next() % compounds.len() as u64) as usize]);
+                }
+                text.push_str(" { fill: red } ");
+            }
+            let mut rules = Vec::new();
+            parse_sheet(&text, &mut rules);
+            let index = RuleIndex::build(&rules);
+            let mut scratch = Vec::new();
+            for i in 0..nodes.len() {
+                let e = T { nodes: &nodes, i };
+                for start in [0u64, 1, 2, 3, 4, 5, 7, 9, 12, 16, 25, 40, 1000] {
+                    let mut want_budget = start;
+                    let want: Vec<usize> = (0..rules.len())
+                        .filter(|&r| rules[r].selector.matches(e, &mut want_budget))
+                        .collect();
+                    let mut got_budget = start;
+                    let mut got = Vec::new();
+                    let mut push = |rule: &Rule| {
+                        got.push(rules.iter().position(|r| std::ptr::eq(r, rule)).unwrap());
+                    };
+                    for_each_match(
+                        &rules,
+                        Some(&index),
+                        &mut scratch,
+                        e,
+                        &mut got_budget,
+                        &mut push,
+                    );
+                    // Without an index every rule is tested in turn.
+                    let mut plain_budget = start;
+                    let mut plain = Vec::new();
+                    for_each_match(&rules, None, &mut scratch, e, &mut plain_budget, |rule| {
+                        plain.push(rules.iter().position(|r| std::ptr::eq(r, rule)).unwrap());
+                    });
+                    assert_eq!((&plain, plain_budget), (&want, want_budget));
+                    assert_eq!(
+                        (got, got_budget),
+                        (want, want_budget),
+                        "round {round} node {i} budget {start}: {text}"
+                    );
+                }
+            }
+        }
     }
 }
