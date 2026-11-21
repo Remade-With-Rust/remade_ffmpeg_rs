@@ -700,6 +700,92 @@ pub fn source_over_rgba_tail(p: &mut Pipeline) {
     p.next_stage();
 }
 
+/// One row of a sprite: premultiplied RGBA8 `src` composited source-over onto
+/// `dst`, pixel for pixel. `opacity` is the pattern opacity when it is not 1.
+///
+/// This is `draw_pixmap` without a transform. The pipeline it would otherwise
+/// build is `seed_shader, transform, gather, [scale_1_float], source_over_rgba`,
+/// and for an integer translation the first three stages only compute "source
+/// pixel `(dx - x, dy - y)`", in floats, for every pixel. Here the caller
+/// hands over the two rows and the arithmetic that is left is the pipeline's
+/// own, operation for operation (`sprite_source_over_8`), so the bytes are
+/// the same.
+///
+/// Two shortcuts skip that arithmetic for a group of eight source pixels:
+///
+/// - all zero: `d * (1 - 0) + 0` is `d`, and a byte survives the trip to
+///   `f32` and back, so the destination keeps its bytes;
+/// - all opaque, at full opacity: alpha 255 loads as exactly 1.0, so the
+///   result is `d * 0 + s`, the source's own bytes.
+///
+/// Both rest on facts about `load_8888`/`store_8888` that the tests below
+/// check for every byte value.
+pub fn sprite_source_over_row(src: &[u8], dst: &mut [u8], opacity: Option<f32>) {
+    const GROUP: usize = STAGE_WIDTH * 4;
+    let mut src_groups = src.chunks_exact(GROUP);
+    let mut dst_groups = dst.chunks_exact_mut(GROUP);
+    for (s, d) in (&mut src_groups).zip(&mut dst_groups) {
+        let (Ok(s), Ok(d)) = (<&[u8; GROUP]>::try_from(s), <&mut [u8; GROUP]>::try_from(d)) else {
+            continue; // chunks_exact yields exactly GROUP bytes
+        };
+        let mut any = 0u32;
+        let mut all = u32::MAX;
+        for px in s.chunks_exact(4) {
+            let px = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+            any |= px;
+            all &= px;
+        }
+        if any == 0 {
+            continue;
+        }
+        if all >> 24 == 0xff && opacity.is_none() {
+            *d = *s;
+            continue;
+        }
+        sprite_source_over_8(s, d, opacity);
+    }
+
+    // The tail, as the pipeline does it: missing lanes are zero and are not
+    // written back. Lanes do not interact.
+    let (s, d) = (src_groups.remainder(), dst_groups.into_remainder());
+    let n = s.len().min(d.len());
+    if n != 0 {
+        let mut s8 = [0u8; GROUP];
+        let mut d8 = [0u8; GROUP];
+        s8[..n].copy_from_slice(&s[..n]);
+        d8[..n].copy_from_slice(&d[..n]);
+        sprite_source_over_8(&s8, &mut d8, opacity);
+        d[..n].copy_from_slice(&d8[..n]);
+    }
+}
+
+/// `gather` (the load), `scale_1_float` and `source_over_rgba` for eight pixels.
+#[inline(always)]
+fn sprite_source_over_8(
+    src: &[u8; STAGE_WIDTH * 4], dst: &mut [u8; STAGE_WIDTH * 4], opacity: Option<f32>,
+) {
+    let (mut r, mut g, mut b, mut a) =
+        (f32x8::default(), f32x8::default(), f32x8::default(), f32x8::default());
+    load_8888(src, &mut r, &mut g, &mut b, &mut a);
+
+    if let Some(c) = opacity {
+        let c = f32x8::splat(c);
+        r *= c;
+        g *= c;
+        b *= c;
+        a *= c;
+    }
+
+    let (mut dr, mut dg, mut db, mut da) =
+        (f32x8::default(), f32x8::default(), f32x8::default(), f32x8::default());
+    load_8888(dst, &mut dr, &mut dg, &mut db, &mut da);
+    r = mad(dr, inv(a), r);
+    g = mad(dg, inv(a), g);
+    b = mad(db, inv(a), b);
+    a = mad(da, inv(a), a);
+    store_8888(&r, &g, &b, &a, dst);
+}
+
 fn transform(p: &mut Pipeline) {
     let ts = &p.ctx.transform;
 
@@ -1340,4 +1426,103 @@ fn mad(f: f32x8, m: f32x8, a: f32x8) -> f32x8 {
 #[inline(always)]
 fn lerp(from: f32x8, to: f32x8, t: f32x8) -> f32x8 {
     mad(to - from, t, from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn splat_px(px: [u8; 4]) -> [u8; STAGE_WIDTH * 4] {
+        let mut out = [0u8; STAGE_WIDTH * 4];
+        for o in out.chunks_exact_mut(4) {
+            o.copy_from_slice(&px);
+        }
+        out
+    }
+
+    /// What the sprite shortcuts rest on: a byte survives `load_8888` then
+    /// `store_8888`, and 255 loads as exactly 1.0.
+    #[test]
+    fn bytes_survive_load_and_store() {
+        for v in 0..=255u8 {
+            let src = splat_px([v, v, v, v]);
+            let (mut r, mut g, mut b, mut a) =
+                (f32x8::default(), f32x8::default(), f32x8::default(), f32x8::default());
+            load_8888(&src, &mut r, &mut g, &mut b, &mut a);
+            if v == 255 {
+                assert_eq!(a.0[0].to_bits(), 1.0f32.to_bits());
+            }
+            let mut out = [0u8; STAGE_WIDTH * 4];
+            store_8888(&r, &g, &b, &a, &mut out);
+            assert_eq!(out, src, "byte {v}");
+        }
+    }
+
+    /// The arithmetic agrees with both shortcuts for every source and
+    /// destination byte: a transparent source leaves the destination alone
+    /// at any opacity, and an opaque one replaces it at full opacity.
+    #[test]
+    fn sprite_shortcuts_are_what_the_arithmetic_gives() {
+        for d in 0..=255u8 {
+            for opacity in [None, Some(0.0), Some(0.3), Some(0.999)] {
+                let before = splat_px([d, d / 2, 255 - d, d]);
+                let mut dst = before;
+                sprite_source_over_8(&[0u8; STAGE_WIDTH * 4], &mut dst, opacity);
+                assert_eq!(dst, before, "transparent over {d} at {opacity:?}");
+            }
+            for s in 0..=255u8 {
+                let src = splat_px([s, 255 - s, s / 3, 255]);
+                let mut dst = splat_px([d, d, 255 - d, d]);
+                sprite_source_over_8(&src, &mut dst, None);
+                assert_eq!(dst, src, "opaque {s} over {d}");
+            }
+        }
+    }
+
+    /// The row function (shortcuts, groups of eight, tail) against the plain
+    /// arithmetic one pixel at a time.
+    #[test]
+    fn sprite_row_matches_per_pixel_arithmetic() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for len in [1usize, 3, 7, 8, 9, 16, 23, 64, 67] {
+            for opacity in [None, Some(0.0), Some(0.25), Some(0.7)] {
+                let mut src = vec![0u8; len * 4];
+                let mut dst = vec![0u8; len * 4];
+                for (i, px) in src.chunks_exact_mut(4).enumerate() {
+                    // Runs of 19 transparent, opaque and mixed pixels (so
+                    // whole groups of eight take each shortcut), some of
+                    // them not premultiplied: the arithmetic does not care.
+                    let kind = i / 19 + len;
+                    let v = next().to_le_bytes();
+                    match kind % 4 {
+                        0 => px.fill(0),
+                        1 => px.copy_from_slice(&[v[0], v[1], v[2], 255]),
+                        _ => px.copy_from_slice(&[v[0], v[1], v[2], v[3]]),
+                    }
+                }
+                for b in dst.iter_mut() {
+                    *b = next() as u8;
+                }
+
+                let mut expected = dst.clone();
+                for (s, d) in src.chunks_exact(4).zip(expected.chunks_exact_mut(4)) {
+                    let mut s8 = [0u8; STAGE_WIDTH * 4];
+                    let mut d8 = [0u8; STAGE_WIDTH * 4];
+                    s8[..4].copy_from_slice(s);
+                    d8[..4].copy_from_slice(d);
+                    sprite_source_over_8(&s8, &mut d8, opacity);
+                    d.copy_from_slice(&d8[..4]);
+                }
+
+                sprite_source_over_row(&src, &mut dst, opacity);
+                assert_eq!(dst, expected, "len {len} opacity {opacity:?}");
+            }
+        }
+    }
 }

@@ -54,6 +54,7 @@ use crate::{Color, PremultipliedColor, SpreadMode};
 use crate::{PixmapRef, Transform};
 
 pub use blitter::RasterPipelineBlitter;
+pub(crate) use highp::sprite_source_over_row;
 
 use crate::geom::ScreenIntRect;
 use crate::pixmap::SubPixmapMut;
