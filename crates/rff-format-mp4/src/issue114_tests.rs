@@ -727,8 +727,11 @@ fn co64_offsets_past_4_gib_index_exactly() {
     assert_eq!(stored.iter().map(|s| s.offset).collect::<Vec<_>>(), offsets);
     // The seekable reader asks for exactly those offsets.
     let mut d = Mp4Demuxer::with_source(Source::Done);
-    d.stored = vec![stored];
-    d.by_track = vec![vec![]];
+    d.t = Arc::new(Tables {
+        stored: vec![stored],
+        by_track: vec![vec![]],
+        ..Tables::default()
+    });
     assert_eq!(d.raw_sample_info(0, 2).unwrap().offset, tib);
 }
 

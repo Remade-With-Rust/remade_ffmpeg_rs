@@ -13,6 +13,7 @@
 pub mod aac;
 pub mod av1;
 pub mod avc;
+pub mod flac;
 pub mod hvc;
 pub mod time;
 
@@ -113,6 +114,11 @@ pub struct Stream {
     /// Matroska `StereoMode` (0 mono, 1 side by side left first, ...), when
     /// the container records it.
     pub stereo_mode: Option<u8>,
+    /// The container's own codec identifier when it is a string: the
+    /// Matroska `CodecID` (`V_MPEG4/ISO/AVC`, `A_DTS`, `V_MS/VFW/FOURCC`).
+    /// Set for every track a demuxer reads one for, so a caller can tell
+    /// apart codecs rff has no [`CodecId`] for ([`CodecId::None`]).
+    pub codec_string: Option<String>,
 }
 
 /// A stream's track flags, as Matroska records them (`FlagDefault`,
@@ -230,6 +236,7 @@ impl Stream {
             disposition: Disposition::default(),
             field_order: None,
             stereo_mode: None,
+            codec_string: None,
         }
     }
 }
@@ -410,6 +417,110 @@ pub trait SampleIndex {
     /// [`read_sample`](SampleIndex::read_sample) shapes it.
     fn read_raw_sample(&mut self, stream: usize, index: u64) -> Result<Packet> {
         self.read_sample(stream, index)
+    }
+
+    /// A shareable, `&self` view of this index for reading samples from
+    /// several places at once (an editor's media pool): cheap to clone (an
+    /// `Arc`), `Send + Sync`, and independent of this demuxer's
+    /// [`read_packet`](Demuxer::read_packet) position and of every other
+    /// source. Each call gives a source with its own read position; they
+    /// share the index tables and the input (reads take turns on it). Packets
+    /// are shaped as [`read_sample`](SampleIndex::read_sample) shapes them
+    /// at the time of the call (see [`Demuxer::set_raw_samples`]). `None`
+    /// from demuxers that cannot share their input (the default).
+    fn sample_source(&mut self) -> Option<std::sync::Arc<dyn SampleSource>> {
+        None
+    }
+}
+
+/// `&self` random access to a demuxed file's samples: see
+/// [`SampleIndex::sample_source`]. The methods mirror [`SampleIndex`]'s.
+pub trait SampleSource: Send + Sync {
+    fn sample_count(&self, stream: usize) -> u64;
+    fn sample_info(&self, stream: usize, index: u64) -> Option<SampleInfo>;
+    fn read_sample(&self, stream: usize, index: u64) -> Result<Packet>;
+    fn sync_at_or_before(&self, stream: usize, pts: i64) -> Option<u64>;
+    fn edit_list(&self, _stream: usize) -> &[EditEntry] {
+        &[]
+    }
+    fn movie_timescale(&self) -> Option<u32> {
+        None
+    }
+    fn raw_sample_count(&self, stream: usize) -> u64 {
+        self.sample_count(stream)
+    }
+    fn raw_sample_info(&self, stream: usize, index: u64) -> Option<SampleInfo> {
+        self.sample_info(stream, index)
+    }
+    fn read_raw_sample(&self, stream: usize, index: u64) -> Result<Packet> {
+        self.read_sample(stream, index)
+    }
+}
+
+/// One input shared by several readers, each with its own position: a
+/// `Read + Seek` handle over a [`SeekInput`] behind a mutex. Every read
+/// seeks the shared input to this handle's position first (skipped when it
+/// is already there), so handles never disturb each other. Cloning gives a
+/// handle at the same position. What demuxers use to hand out
+/// [`SampleSource`]s without reopening the file.
+#[derive(Clone)]
+pub struct SharedInput {
+    /// The input and where it currently stands (`None`: unknown).
+    inner: std::sync::Arc<std::sync::Mutex<(SeekInput, Option<u64>)>>,
+    pos: u64,
+}
+
+impl SharedInput {
+    /// Share `input`; the handle starts at the input's current position.
+    pub fn new(mut input: SeekInput) -> SharedInput {
+        let pos = input.stream_position().unwrap_or(0);
+        SharedInput {
+            inner: std::sync::Arc::new(std::sync::Mutex::new((input, Some(pos)))),
+            pos,
+        }
+    }
+}
+
+type SharedState = std::sync::Mutex<(SeekInput, Option<u64>)>;
+
+fn lock_shared(
+    inner: &SharedState,
+) -> std::io::Result<std::sync::MutexGuard<'_, (SeekInput, Option<u64>)>> {
+    inner
+        .lock()
+        .map_err(|_| std::io::Error::other("shared input poisoned"))
+}
+
+impl Read for SharedInput {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut g = lock_shared(&self.inner)?;
+        let (input, at) = &mut *g;
+        if *at != Some(self.pos) {
+            *at = None;
+            input.seek(std::io::SeekFrom::Start(self.pos))?;
+        }
+        let n = input.read(buf)?;
+        self.pos += n as u64;
+        *at = Some(self.pos);
+        Ok(n)
+    }
+}
+
+impl Seek for SharedInput {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before start");
+        self.pos = match pos {
+            std::io::SeekFrom::Start(n) => n,
+            std::io::SeekFrom::Current(d) => self.pos.checked_add_signed(d).ok_or_else(invalid)?,
+            std::io::SeekFrom::End(d) => {
+                let mut g = lock_shared(&self.inner)?;
+                let (input, at) = &mut *g;
+                let end = input.seek(std::io::SeekFrom::End(0))?;
+                *at = Some(end);
+                end.checked_add_signed(d).ok_or_else(invalid)?
+            }
+        };
+        Ok(self.pos)
     }
 }
 
@@ -726,6 +837,28 @@ mod tests {
 
     fn streams(mut d: Box<dyn Demuxer>) -> usize {
         d.read_header().unwrap().len()
+    }
+
+    #[test]
+    fn shared_input_handles_keep_their_own_positions() {
+        let data: Vec<u8> = (0..=255).collect();
+        let mut a = SharedInput::new(Box::new(Cursor::new(data)));
+        let mut b = a.clone();
+        b.seek(std::io::SeekFrom::Start(200)).unwrap();
+        let mut x = [0u8; 3];
+        a.read_exact(&mut x).unwrap();
+        assert_eq!(x, [0, 1, 2]);
+        b.read_exact(&mut x).unwrap();
+        assert_eq!(x, [200, 201, 202]);
+        a.read_exact(&mut x).unwrap();
+        assert_eq!(x, [3, 4, 5]);
+        assert_eq!(b.seek(std::io::SeekFrom::End(-1)).unwrap(), 255);
+        let t = std::thread::spawn(move || {
+            let mut y = [0u8; 1];
+            b.read_exact(&mut y).unwrap();
+            y[0]
+        });
+        assert_eq!(t.join().unwrap(), 255);
     }
 
     #[test]

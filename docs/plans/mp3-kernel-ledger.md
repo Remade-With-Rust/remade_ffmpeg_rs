@@ -9,16 +9,20 @@ kernel, from the emitted assembly.
 **Regenerate:**
 
 ```sh
-cargo build --release -p rff-cli --bin rff           # the SHIPPING binary
+# The shipping binary, plus the switches: `MP3_CENSUS` and `MP3_ISA` are read
+# only with rusty_mp3's `env-tuning` feature (off by default since 2026-11).
+cargo build --release -p rff-cli -p rusty_mp3 --bin rff --features rusty_mp3/env-tuning
 MP3_CENSUS=1 target/release/rff -i x.mp3 -c:a pcm_s16le out.wav   # kernel-reach census on stderr
 MP3_CENSUS=1 MP3_ISA=scalar target/release/rff -i x.mp3 -c:a pcm_s16le out_s.wav
 cargo rustc -p rusty_mp3 --release --lib -- --emit=asm
 python tools/bench/vec_census.py target/release/deps/rusty_mp3-*.s decode:: encode::
+cargo build --release -p rusty_mp3 --example decprof --features env-tuning
 MP3_NOHASH=1 python tools/bench/pinab.py "MP3_ISA=scalar:<decprof.exe>" <decprof.exe> corpus/dl/mus_piano.mp3 1 20
 ```
 
 `MP3_ISA=scalar` (read once) forces every kernel onto its scalar twin; the census
-counts every arm, tallied once per granule.
+counts every arm, tallied once per granule. Both need a build with rusty_mp3's
+`env-tuning` cargo feature: a default build never reads the environment.
 
 ---
 

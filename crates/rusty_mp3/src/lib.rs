@@ -69,6 +69,35 @@ pub struct DecodedAudio {
     pub samples: Vec<f32>,
 }
 
+/// The largest sample magnitude a decoded frame may hold: 8x (+18 dB over) full
+/// scale, the same bound the encoder puts on its input
+/// ([`MAX_INPUT_AMPLITUDE`]). A frame with a sample beyond it (or a non-finite
+/// one) is refused and DROPPED like a frame with invalid side information, and
+/// the filterbank memory is cleared.
+///
+/// This is the backstop behind the validity checks, for damage that is still
+/// valid syntax: bytes that only look like frames can ask for every Layer I/II
+/// subband at its ceiling (about 64x full scale after synthesis) or for Layer
+/// III's largest gain on its largest Huffman values (beyond 1e9). It is NOT a
+/// clamp: real audio is not touched. Decoded PCM is deliberately not limited to
+/// `[-1, 1]` -- like FFmpeg's float decoder, and unlike minimp3's and FFmpeg's
+/// 16-bit outputs, which saturate there -- because lossy coding overshoots full
+/// scale routinely (a full-scale Layer II stream peaks near 1.07) and those
+/// samples are the stream's.
+pub const MAX_OUTPUT_AMPLITUDE: f32 = 8.0;
+
+/// Whether every sample of a decoded frame is finite and within
+/// [`MAX_OUTPUT_AMPLITUDE`]. Branch-free over the frame so it vectorizes; a NaN
+/// fails the comparison, so it is refused too.
+#[inline]
+pub(crate) fn within_output_bound(pcm: &[f32]) -> bool {
+    let mut ok = true;
+    for s in pcm {
+        ok &= s.abs() <= MAX_OUTPUT_AMPLITUDE;
+    }
+    ok
+}
+
 /// Stream-level MP3 decoder: [`push`](Mp3Decoder::push) raw bytes (packets may
 /// split/join frames — the decoder frame-syncs internally, skipping ID3 and
 /// garbage), then drain decoded PCM with [`next_frame`](Mp3Decoder::next_frame).
@@ -113,21 +142,37 @@ fn is_tag_start(b: &[u8]) -> bool {
 }
 
 /// The Layer I/II header `b` starts, if it can be the next frame of `h`'s
-/// stream: [`same_stream`](layer12::Layer12Header::same_stream), and the same
-/// CRC protection and channel count.
+/// stream: [`same_stream`](layer12::Layer12Header::same_stream) -- version,
+/// layer, sample rate and free-format-ness, which is what minimp3's
+/// `hdr_compare` asks and what `rff-format-mp3` frames by.
+///
+/// It used to ask every stream for the same CRC flag and channel count as
+/// well. Those may change inside a stream, and asking for them made this syncer
+/// refuse GOOD frames a demuxer had vouched for: with the frame after two good
+/// mono frames damaged into a stereo header, neither good frame was confirmed
+/// and only the damaged one decoded. They are still asked of FREE-FORMAT
+/// candidates, whose size is whatever distance the next such header is at: a
+/// three-byte pattern that recurs in every frame of a steady Layer II stream
+/// would otherwise confirm itself as a free-format stream and swallow the real
+/// frames. Other false syncs are refused by what they decode to
+/// ([`layer12::Layer12Decode::try_decode_frame`]).
 fn next_in_stream(h: &layer12::Layer12Header, b: &[u8]) -> Option<layer12::Layer12Header> {
     let n = layer12::Layer12Header::parse(*b.first_chunk::<4>()?).ok()?;
-    (h.same_stream(&n) && h.crc_protected == n.crc_protected && h.channels() == n.channels())
-        .then_some(n)
+    let strict =
+        !h.is_free_format() || (h.crc_protected == n.crc_protected && h.channels() == n.channels());
+    (h.same_stream(&n) && strict).then_some(n)
 }
 
 fn continues_stream(h: &layer12::Layer12Header, b: &[u8]) -> bool {
     next_in_stream(h, b).is_some()
 }
 
-/// `MP3_CENSUS=1`: print the kernel-reach census when a decoder is dropped, so the
-/// SHIPPING binary (the rff CLI, any embedding application) can prove which
-/// kernel arms its decode actually took -- not only this crate's examples.
+/// `MP3_CENSUS=1` (with the `env-tuning` cargo feature): print the kernel-reach
+/// census when a decoder is dropped, so a real binary (the rff CLI, any
+/// embedding application) can prove which kernel arms its decode actually took
+/// -- not only this crate's examples. Without the feature -- the default, and
+/// what ships -- the environment is never read and nothing is printed.
+#[cfg(feature = "env-tuning")]
 impl Drop for Mp3Decoder {
     fn drop(&mut self) {
         if std::env::var_os("MP3_CENSUS").is_some() {
@@ -199,7 +244,13 @@ impl Mp3Decoder {
         let lo = pos + h.min_free_format_size();
         let hi = (pos + layer12::MAX_FREE_FORMAT_FRAME).min(self.buf.len().saturating_sub(4));
         let buf = &self.buf;
-        let found = (lo..=hi).find(|&i| buf[i] == 0xFF && continues_stream(h, &buf[i..]))?;
+        // A Layer I frame is a whole number of 4-byte slots: a "next header" at
+        // any other distance is not one (rows of an uncompressed picture pass
+        // for free-format Layer I otherwise).
+        let slots =
+            |i: usize| h.layer != layer12::Layer::I || (i - pos - h.padding_bytes()) % 4 == 0;
+        let found =
+            (lo..=hi).find(|&i| buf[i] == 0xFF && slots(i) && continues_stream(h, &buf[i..]))?;
         // Remembered only once a frame of this size is taken (`layer12_step`):
         // a size measured from garbage must not stick.
         Some(found - pos)
@@ -320,27 +371,45 @@ impl Mp3Decoder {
         // After Layer III frames, a Layer I/II header must prove itself by the
         // next header: one inside Layer III garbage must not swallow real frames.
         let strict = self.last_layer == 3;
-        if strict || !self.contiguous {
+        // Found by searching (and confirmed), rather than by sitting where the
+        // previous frame ended.
+        let searched = strict || !self.contiguous;
+        if searched {
             match self.confirm(&h, pos, end, strict) {
                 None => return Step::Wait,
                 Some(false) => return Step::Skip,
                 Some(true) => {}
             }
         }
-        if h.is_free_format() {
-            self.free_size = Some(size - h.padding_bytes());
-        }
+        // A frame that cannot be decoded sanely is dropped, not emitted (see
+        // `Layer12Decode::try_decode_frame`).
+        let mut refused = false;
         if let Some(took) = self.dry_run.as_mut() {
             *took = true;
-        } else {
-            let pcm = self.layer12.decode_frame(&h, &self.buf[pos..end]);
+        } else if let Ok(pcm) = self.layer12.try_decode_frame(&h, &self.buf[pos..end]) {
             self.queue.push_back(DecodedAudio {
                 sample_rate: h.sample_rate,
                 channels: if h.channels() == 2 { 2 } else { 1 },
                 samples: pcm,
             });
+        } else {
+            refused = true;
         }
-        self.contiguous = true;
+        if refused && searched {
+            // A header found by searching whose frame is refused was a false
+            // sync, however well the bytes after it played along (a pattern
+            // that recurs in every frame of a steady stream confirms itself as
+            // a free-format stream). Its bytes are NOT consumed: they hold the
+            // real frames.
+            return Step::Skip;
+        }
+        if h.is_free_format() {
+            self.free_size = Some(size - h.padding_bytes());
+        }
+        // A refused frame that sat where the stream put it is damage: its
+        // bytes are consumed, and -- as minimp3 searches for sync afresh -- the
+        // header after it must prove itself again.
+        self.contiguous = !refused;
         self.last_layer = match h.layer {
             layer12::Layer::I => 1,
             layer12::Layer::II => 2,
@@ -616,6 +685,13 @@ pub fn decode_pipelined(bytes: &[u8]) -> Vec<DecodedAudio> {
                     Vec::with_capacity(work.len() * crate::frame::GRANULE_LINES * channels);
                 for mut g in work {
                     tstate.granule_to_pcm(&g.side, &mut g.spectrum, channels, &mut pcm);
+                }
+                // The serial path's backstop (`Mp3Decode::decode_frame`): a
+                // frame beyond the output bound is dropped and the transform
+                // state cleared.
+                if !within_output_bound(&pcm) {
+                    tstate = decode::TransformState::new();
+                    continue;
                 }
                 out.push(DecodedAudio {
                     sample_rate: header.sample_rate,

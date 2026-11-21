@@ -26,6 +26,13 @@ exclude = ["lab-results/", "supply-chain/"]
 # stage per granule and channel. Off by default -- it sat on the shipping path.
 # `cargo run --release --example decprof --features profile -- <file.mp3>`.
 profile = []
+# Measurement switches read from the ENVIRONMENT: `MP3_ISA=scalar` forces the
+# scalar decode kernels (same output, slower) and `MP3_CENSUS=1` prints the
+# kernel-reach census to stderr when an `Mp3Decoder` is dropped. Off by default:
+# a shipping decoder must not change what it does, or print, because of a
+# variable in its environment. For the ISA A/B and the census:
+# `cargo run --release --example decprof --features env-tuning -- <file.mp3>`.
+env-tuning = []
 # The MP3 encoder experiment harness (brick registry, corpus, metrics, variant
 # sweeps). Opt-in — zero weight on the default build.
 lab = []
