@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mp3-v0.7.0...rff-format-mp3-v0.8.0) - 2026-11-21
+
+### Fixed
+
+- *(mp3)* bound free-format frames in rff-format-mp3 at the top table bitrate
+- *(rff-format-mp3)* a frame needs its stream to vouch for it
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into fix/mp3-damaged-frames
+
 ## [0.7.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mp3-v0.6.3...rff-format-mp3-v0.7.0) - 2026-11-21
 
 ### Fixed

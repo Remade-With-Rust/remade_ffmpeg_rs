@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-core-v0.7.0...rff-core-v0.8.0) - 2026-11-21
+
+### Added
+
+- *(rff-format, rff-core)* codec IDs, FLAC/AAC/avcC helpers and a shareable SampleSource ([#114](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/114))
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into feat/mp4-mkv-114b
+
 ## [0.7.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-core-v0.6.3...rff-core-v0.7.0) - 2026-11-21
 
 ### Fixed
