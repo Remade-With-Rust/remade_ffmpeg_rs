@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-v0.6.3...rff-format-v0.7.0) - 2026-11-21
+
+### Added
+
+- *(rff-format)* display matrix, track language/name/flags, metadata and stored-table APIs ([#114](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/114))
+
+### Other
+
+- Merge pull request #157 from Remade-With-Rust/fix/licenses-alac
+
 ## [0.6.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-v0.6.0...rff-format-v0.6.1) - 2026-11-18
 
 ### Added

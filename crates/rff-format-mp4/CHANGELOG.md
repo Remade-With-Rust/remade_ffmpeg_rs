@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mp4-v0.6.3...rff-format-mp4-v0.7.0) - 2026-11-21
+
+### Added
+
+- *(rff-format-mp4)* rotation, dOps/av1C/vpcC, stored table + movie timescale, udta, spooled faststart; fix >=64 kHz rates and 32-bit offsets ([#114](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/114))
+
+### Other
+
+- Merge pull request #157 from Remade-With-Rust/fix/licenses-alac
+- *(rff-format-mp4, rff-format-mkv)* list the #114 features in the crate READMEs
+
 ## [0.6.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mp4-v0.6.1...rff-format-mp4-v0.6.2) - 2026-11-19
 
 ### Fixed
