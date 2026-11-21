@@ -186,14 +186,17 @@ fn decode_codes<const MSB: bool>(data: &[u8], out: &mut [u8]) -> TiffResult<usiz
                 out[pos] = out[pstart];
                 pos += 1;
             }
-            plen.saturating_add(1)
+            plen + 1
         } else {
             return Err(TiffError::format(format!("LZW: invalid code {code}")));
         };
         // Add prev + first(this string): plen + 1 bytes from prev's start.
+        // (No length can overflow: a string is at most one byte longer than
+        // the longest defined since the last clear, so lengths stay at most
+        // MAX_CODES + 1.)
         if (next as usize) < MAX_CODES {
             start[next as usize] = pstart as u32;
-            len[next as usize] = plen.saturating_add(1);
+            len[next as usize] = plen + 1;
             next += 1;
             if width < 12 && next >= limit {
                 width += 1;
