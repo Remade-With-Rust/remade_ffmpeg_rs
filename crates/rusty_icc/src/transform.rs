@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 use crate::color::delta_e_2000;
 use crate::curve::{clamp01, InvCurve};
 use crate::error::{Error, Result};
-use crate::lut::ClutEval;
+use crate::lut::{ClutEval, FixedClut};
 use crate::pipeline::{build_chain, Chain, GamutChain, ShaperChain, ShaperLink};
 use crate::profile::{ColorSpace, Profile};
 
@@ -145,6 +145,28 @@ pub trait Sample: Copy + Send + Sync + 'static + sealed::Sealed {
         let _ = s;
         None
     }
+    /// The slice as `u8` samples, when that is what it holds.
+    #[doc(hidden)]
+    fn u8s(s: &[Self]) -> Option<&[u8]> {
+        let _ = s;
+        None
+    }
+    #[doc(hidden)]
+    fn u8s_mut(s: &mut [Self]) -> Option<&mut [u8]> {
+        let _ = s;
+        None
+    }
+    /// The slice as `u16` samples, when that is what it holds.
+    #[doc(hidden)]
+    fn u16s(s: &[Self]) -> Option<&[u16]> {
+        let _ = s;
+        None
+    }
+    #[doc(hidden)]
+    fn u16s_mut(s: &mut [Self]) -> Option<&mut [u16]> {
+        let _ = s;
+        None
+    }
 }
 
 impl Sample for u8 {
@@ -162,6 +184,12 @@ impl Sample for u8 {
     fn index(self) -> usize {
         usize::from(self)
     }
+    fn u8s(s: &[Self]) -> Option<&[u8]> {
+        Some(s)
+    }
+    fn u8s_mut(s: &mut [Self]) -> Option<&mut [u8]> {
+        Some(s)
+    }
 }
 
 impl Sample for u16 {
@@ -178,6 +206,12 @@ impl Sample for u16 {
     }
     fn index(self) -> usize {
         usize::from(self)
+    }
+    fn u16s(s: &[Self]) -> Option<&[u16]> {
+        Some(s)
+    }
+    fn u16s_mut(s: &mut [Self]) -> Option<&mut [u16]> {
+        Some(s)
     }
 }
 
@@ -500,7 +534,20 @@ impl Transform {
                 }
             }
             (Engine::Grid(g), SampleKind::U8 | SampleKind::U16) => {
-                run_grid(g, src, dst, (sc, dc, in_ch, out_ch), (src_alpha, dst_alpha));
+                let (ch, alpha) = ((sc, dc, in_ch, out_ch), (src_alpha, dst_alpha));
+                if let Some(s) = T::u8s(src) {
+                    if let Some(d) = T::u8s_mut(dst) {
+                        run_grid_u8(g, s, d, ch, alpha);
+                        return Ok(());
+                    }
+                }
+                if let Some(s) = T::u16s(src) {
+                    if let Some(d) = T::u16s_mut(dst) {
+                        run_grid_u16(g, s, d, ch, alpha);
+                        return Ok(());
+                    }
+                }
+                run_grid(g, src, dst, ch, alpha);
             }
             _ => {
                 let src_lab = self.src_layout.is_lab();
@@ -645,6 +692,110 @@ fn run_chain_f32(
         }
         if dst_alpha {
             dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
+}
+
+/// Every 8-bit value's `(cell, fraction)` on a grid axis.
+type AxisTable = [(usize, f64); 256];
+
+/// The 8-bit device-link grid loop. Not generic, so it is compiled here, with
+/// the lookup in line, instead of in the crate of the caller with a call
+/// into the library per pixel.
+fn run_grid_u8(
+    g: &ClutEval,
+    src: &[u8],
+    dst: &mut [u8],
+    ch: (usize, usize, usize, usize),
+    alpha: (bool, bool),
+) {
+    if !fixed_shape(g, ch.2, ch.3) {
+        return run_grid(g, src, dst, ch, alpha);
+    }
+    // The (cell, fraction) of every 8-bit value, by the expressions wider
+    // samples use per value, once per call instead of per pixel.
+    let points = g.points(0);
+    let table: AxisTable = core::array::from_fn(|v| ClutEval::axis(points, (v as u8).to_unit()));
+    grid_shaped(g, src, dst, ch, alpha, |_, v| table[usize::from(v)]);
+}
+
+/// The 16-bit device-link grid loop, likewise.
+fn run_grid_u16(
+    g: &ClutEval,
+    src: &[u16],
+    dst: &mut [u16],
+    ch: (usize, usize, usize, usize),
+    alpha: (bool, bool),
+) {
+    if !grid_shaped(g, src, dst, ch, alpha, |points, v| {
+        ClutEval::axis(points, v.to_unit())
+    }) {
+        run_grid(g, src, dst, ch, alpha);
+    }
+}
+
+/// `true` when [`grid_shaped`] has a loop for this grid.
+fn fixed_shape(g: &ClutEval, in_ch: usize, out_ch: usize) -> bool {
+    match (in_ch, out_ch) {
+        (3, 3) => g.fixed::<3, 3>().is_some(),
+        (3, 4) => g.fixed::<3, 4>().is_some(),
+        (4, 3) => g.fixed::<4, 3>().is_some(),
+        (4, 4) => g.fixed::<4, 4>().is_some(),
+        _ => false,
+    }
+}
+
+/// Runs the loop for the shape of the grid when there is one with fixed
+/// channel counts (RGB, Lab or CMYK in and out); `false`, with nothing
+/// done, otherwise. `cell(points, sample)` is the `(cell, fraction)` of a
+/// sample on an axis of that many grid points.
+#[inline(always)]
+fn grid_shaped<T: Sample, C: Fn(usize, T) -> (usize, f64) + Copy>(
+    g: &ClutEval,
+    src: &[T],
+    dst: &mut [T],
+    (sc, dc, in_ch, out_ch): (usize, usize, usize, usize),
+    alpha: (bool, bool),
+    cell: C,
+) -> bool {
+    macro_rules! shape {
+        ($i:literal, $o:literal) => {
+            if let Some(f) = g.fixed::<$i, $o>() {
+                grid_fixed::<T, $i, $o, C>(&f, src, dst, (sc, dc), alpha, cell);
+                return true;
+            }
+        };
+    }
+    match (in_ch, out_ch) {
+        (3, 3) => shape!(3, 3),
+        (3, 4) => shape!(3, 4),
+        (4, 3) => shape!(4, 3),
+        (4, 4) => shape!(4, 4),
+        _ => {}
+    }
+    false
+}
+
+/// The grid loop for `IN` colour channels in and `OUT` out: the same
+/// lookups and conversions as [`run_grid`], with every per-channel index a
+/// constant and the shape of the CLUT settled before the loop.
+fn grid_fixed<T: Sample, const IN: usize, const OUT: usize, C: Fn(usize, T) -> (usize, f64)>(
+    f: &FixedClut<'_, IN, OUT>,
+    src: &[T],
+    dst: &mut [T],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+    cell: C,
+) {
+    let mut out = [0.0f64; 16];
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let cells: [(usize, f64); IN] = core::array::from_fn(|c| cell(f.points(c), sp[c]));
+        f.at(&cells, &mut out);
+        for c in 0..OUT {
+            dp[c] = T::from_unit(out[c]);
+        }
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { T::opaque() };
         }
     }
 }
@@ -794,6 +945,59 @@ impl GamutCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fixed-shape grid loops against the general one, on a synthetic
+    /// device-link grid: every shape, both integer widths, with and without
+    /// alpha on either side.
+    #[test]
+    fn fixed_grid_loops_match_the_general_loop() {
+        fn noise(n: usize, seed: u64) -> Vec<u16> {
+            let mut s = seed;
+            (0..n)
+                .map(|i| {
+                    s = s
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    // Grid points and both ends among the noise.
+                    match i % 7 {
+                        0 => 0,
+                        1 => 65535,
+                        2 => 0x8080,
+                        _ => (s >> 40) as u16,
+                    }
+                })
+                .collect()
+        }
+        for (in_ch, out_ch) in [(3usize, 3usize), (3, 4), (4, 3), (4, 4), (1, 3), (3, 1)] {
+            let g = 5usize;
+            let total = g.pow(in_ch as u32) * out_ch;
+            let data: Vec<f32> = (0..total)
+                .map(|i| ((i * 7919 + 13) % 1009) as f32 / 1008.0)
+                .collect();
+            let clut = ClutEval::from_f32(vec![g; in_ch], out_ch, data);
+            assert_eq!(fixed_shape(&clut, in_ch, out_ch), in_ch > 1 && out_ch > 1);
+            for (src_alpha, dst_alpha) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let (sc, dc) = (
+                    in_ch + usize::from(src_alpha),
+                    out_ch + usize::from(dst_alpha),
+                );
+                let ch = (sc, dc, in_ch, out_ch);
+                let alpha = (src_alpha, dst_alpha);
+                let src16 = noise(sc * 400, 7 + sc as u64);
+                let src8: Vec<u8> = src16.iter().map(|v| (v >> 8) as u8).collect();
+                let (mut a8, mut b8) = (vec![1u8; dc * 400], vec![2u8; dc * 400]);
+                run_grid_u8(&clut, &src8, &mut a8, ch, alpha);
+                run_grid(&clut, &src8, &mut b8, ch, alpha);
+                assert_eq!(a8, b8, "u8 {in_ch}->{out_ch} {alpha:?}");
+                let (mut a16, mut b16) = (vec![1u16; dc * 400], vec![2u16; dc * 400]);
+                run_grid_u16(&clut, &src16, &mut a16, ch, alpha);
+                run_grid(&clut, &src16, &mut b16, ch, alpha);
+                assert_eq!(a16, b16, "u16 {in_ch}->{out_ch} {alpha:?}");
+            }
+        }
+    }
 
     /// The `f32` loops against the per-colour reference: [`Chain::eval`] on
     /// a zero-tailed array, with the Lab scaling and the alpha rule of the

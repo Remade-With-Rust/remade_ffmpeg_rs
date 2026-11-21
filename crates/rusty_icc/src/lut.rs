@@ -501,7 +501,84 @@ pub(crate) struct ClutEval {
     pub(crate) trilinear: bool,
 }
 
+/// A tetrahedral CLUT viewed for a loop of lookups with exactly `IN` inputs
+/// (3 or 4) and `OUT` outputs: the per-axis sizes and strides read once into
+/// arrays and the kernel fixed, so nothing about the shape of the CLUT is
+/// tested per lookup.
+pub(crate) struct FixedClut<'a, const IN: usize, const OUT: usize> {
+    clut: &'a ClutEval,
+    grid: [usize; IN],
+    strides: [usize; IN],
+}
+
+impl<const IN: usize, const OUT: usize> FixedClut<'_, IN, OUT> {
+    /// Grid points along input `i`.
+    pub(crate) fn points(&self, i: usize) -> usize {
+        self.grid[i]
+    }
+
+    /// The lookup at the given `(cell, fraction)` per axis (from
+    /// [`ClutEval::axis`]) into `out[..OUT]`: exactly what
+    /// [`ClutEval::eval_axes`] gives.
+    #[inline(always)]
+    pub(crate) fn at(&self, cells: &[(usize, f64); IN], out: &mut [f64; 16]) {
+        let mut origin = 0usize;
+        let mut frac = [0.0f64; IN];
+        let mut step = [0usize; IN];
+        for i in 0..IN {
+            let (i0, f) = cells[i];
+            origin += i0 * self.strides[i];
+            frac[i] = f;
+            step[i] = if i0 + 1 < self.grid[i] {
+                self.strides[i]
+            } else {
+                0
+            };
+        }
+        let done = match (frac.as_slice(), step.as_slice()) {
+            (&[f0, f1, f2], &[s0, s1, s2]) => {
+                self.clut
+                    .tetra_walk::<OUT>(origin, [f0, f1, f2], [s0, s1, s2], out)
+            }
+            (&[f0, f1, f2, f3], &[s0, s1, s2, s3]) => {
+                self.clut
+                    .tetra4_walk::<OUT>(origin, [f0, f1, f2, f3], [s0, s1, s2, s3], out)
+            }
+            _ => false,
+        };
+        if !done {
+            self.clut.eval_cells(cells, out);
+        }
+    }
+}
+
 impl ClutEval {
+    /// This CLUT as a [`FixedClut`], when it is tetrahedral with exactly
+    /// `IN` inputs and `OUT` outputs.
+    pub(crate) fn fixed<const IN: usize, const OUT: usize>(
+        &self,
+    ) -> Option<FixedClut<'_, IN, OUT>> {
+        if self.outputs != OUT || self.trilinear || OUT > 16 {
+            return None;
+        }
+        Some(FixedClut {
+            clut: self,
+            grid: self.grid.as_slice().try_into().ok()?,
+            strides: self.strides.as_slice().try_into().ok()?,
+        })
+    }
+
+    /// [`ClutEval::eval_axes`] for the rare lookup a fixed kernel declines.
+    #[cold]
+    #[inline(never)]
+    fn eval_cells<const IN: usize>(&self, cells: &[(usize, f64); IN], out: &mut [f64; 16]) {
+        let mut axes = [(0usize, 0.0f64); 16];
+        for (a, c) in axes.iter_mut().zip(cells) {
+            *a = *c;
+        }
+        self.eval_axes(&axes, out);
+    }
+
     pub(crate) fn new(c: &Clut) -> Self {
         Self::from_f32(
             c.grid.iter().map(|&g| usize::from(g)).collect(),
@@ -799,6 +876,21 @@ impl ClutEval {
     /// the data: the caller then takes the recursion.
     #[inline]
     fn tetra4_fixed<const N: usize>(
+        &self,
+        origin: usize,
+        r: [f64; 4],
+        step: [usize; 4],
+        out: &mut [f64; 16],
+    ) -> bool {
+        self.tetra4_walk::<N>(origin, r, step, out)
+    }
+
+    /// The body of [`ClutEval::tetra4_fixed`], in line wherever it is used
+    /// (as [`ClutEval::tetra_walk`] is): [`ClutEval::eval`] keeps the code
+    /// it had through that handle, the integer grid loops take their own
+    /// copy.
+    #[inline(always)]
+    fn tetra4_walk<const N: usize>(
         &self,
         origin: usize,
         [rw, rx, ry, rz]: [f64; 4],
@@ -1284,6 +1376,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fixed_clut_matches_eval_axes_bit_for_bit() {
+        const C: [f64; 7] = [-0.5, 0.0, 0.3, 1.0 / 3.0, 0.5, 1.0, 1.5];
+        fn check<const IN: usize, const OUT: usize>(grid: [usize; IN], short: usize) {
+            let mut c = test_clut(&grid, OUT);
+            c.data.truncate(c.data.len() - short);
+            let f = c.fixed::<IN, OUT>().expect("shape");
+            for k in 0..C.len().pow(IN as u32) {
+                let mut axes = [(0usize, 0.0f64); 16];
+                let mut cells = [(0usize, 0.0f64); IN];
+                for i in 0..IN {
+                    cells[i] = ClutEval::axis(grid[i], C[k / C.len().pow(i as u32) % C.len()]);
+                    axes[i] = cells[i];
+                }
+                let (mut fast, mut slow) = ([7.0; 16], [7.0; 16]);
+                f.at(&cells, &mut fast);
+                c.eval_axes(&axes, &mut slow);
+                assert_eq!(bits(&fast, 16), bits(&slow, 16), "{grid:?} {cells:?}");
+            }
+        }
+        for short in [0, 5] {
+            check::<3, 3>([5, 4, 3], short);
+            check::<3, 4>([5, 4, 3], short);
+            check::<4, 3>([3, 4, 5, 3], short);
+            check::<4, 4>([3, 4, 5, 3], short);
+        }
+        let mut c = test_clut(&[3, 3, 3], 3);
+        assert!(c.fixed::<3, 4>().is_none());
+        assert!(c.fixed::<4, 3>().is_none());
+        c.trilinear = true;
+        assert!(c.fixed::<3, 3>().is_none());
     }
 
     #[test]
