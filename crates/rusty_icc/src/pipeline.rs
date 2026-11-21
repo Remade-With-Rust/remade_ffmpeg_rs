@@ -791,6 +791,41 @@ impl Chain {
         *out = v;
     }
 
+    /// The chain sampled on a regular grid of `g` points per input (first
+    /// input slowest, `out_ch` values per point): [`Chain::eval`] at every
+    /// `(i0, i1, ..) / (g - 1)`.
+    ///
+    /// When the chain starts with per-channel curves (every matrix/TRC
+    /// input and most LUT inputs), they are evaluated once per axis value
+    /// instead of once per grid point. A grid point's coordinates are
+    /// exactly those axis values, so every result is the same: three libm
+    /// `pow` calls per point of a 33^3 grid become 99 calls in all.
+    pub(crate) fn sample_grid(&self, g: usize) -> Vec<f32> {
+        let total = (0..self.in_ch).fold(1usize, |a, _| a * g);
+        let axis: Vec<f64> = (0..g).map(|i| i as f64 / (g - 1) as f64).collect();
+        let (head, tail): (Vec<Vec<f64>>, &[Op]) = match self.ops.split_first() {
+            Some((Op::Lut(Stage::Curves(cs)), tail)) if cs.len() == self.in_ch => (
+                cs.iter()
+                    .map(|c| axis.iter().map(|&x| c.eval(x)).collect())
+                    .collect(),
+                tail,
+            ),
+            _ => (vec![axis; self.in_ch], &self.ops),
+        };
+        let mut data = Vec::with_capacity(total * self.out_ch);
+        for idx in 0..total {
+            let mut v = [0.0f64; 16];
+            let mut rem = idx;
+            for c in (0..self.in_ch).rev() {
+                v[c] = head[c][rem % g];
+                rem /= g;
+            }
+            run(tail, &mut v, self.in_ch);
+            data.extend(v[..self.out_ch].iter().map(|&x| x as f32));
+        }
+        data
+    }
+
     /// [`Chain::eval`] on one array: `v` holds the colour (zero past
     /// `in_ch`) and receives the result.
     pub(crate) fn eval_in_place(&self, v: &mut [f64; 16]) {
@@ -1031,5 +1066,33 @@ mod tests {
         let lab = Profile::new_lab_identity();
         let chain = build_chain(&[&srgb, &lab], &[rel, rel], &[false, false]).unwrap();
         assert!(chain.as_shaper().is_none());
+    }
+
+    #[test]
+    fn sample_grid_matches_eval_at_every_point() {
+        let srgb = Profile::new_srgb();
+        let lab = Profile::new_lab_identity();
+        let gray = Profile::new_gray(crate::color::D65_XY, Curve::gamma(2.2));
+        let rel = Intent::RelativeColorimetric;
+        for (a, b, g) in [(&srgb, &lab, 9usize), (&lab, &srgb, 7), (&gray, &srgb, 33)] {
+            let chain = build_chain(&[a, b], &[rel, rel], &[false, false]).unwrap();
+            let data = chain.sample_grid(g);
+            let total = (0..chain.in_ch).fold(1usize, |n, _| n * g);
+            assert_eq!(data.len(), total * chain.out_ch);
+            for idx in 0..total {
+                let mut input = [0.0; 16];
+                let mut rem = idx;
+                for c in (0..chain.in_ch).rev() {
+                    input[c] = (rem % g) as f64 / (g - 1) as f64;
+                    rem /= g;
+                }
+                let mut out = [0.0; 16];
+                chain.eval(&input, &mut out);
+                for o in 0..chain.out_ch {
+                    let got = data[idx * chain.out_ch + o];
+                    assert_eq!(got.to_bits(), (out[o] as f32).to_bits(), "point {idx}");
+                }
+            }
+        }
     }
 }

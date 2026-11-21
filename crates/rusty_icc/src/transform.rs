@@ -437,19 +437,7 @@ impl Transform {
             Engine::Shaper(ShaperEngine::new(link))
         } else {
             let g = grid_points(chain.in_ch);
-            let total = (0..chain.in_ch).fold(1usize, |a, _| a * g);
-            let mut data = Vec::with_capacity(total * chain.out_ch);
-            let mut input = [0.0f64; 16];
-            let mut out = [0.0f64; 16];
-            for idx in 0..total {
-                let mut rem = idx;
-                for c in (0..chain.in_ch).rev() {
-                    input[c] = (rem % g) as f64 / (g - 1) as f64;
-                    rem /= g;
-                }
-                chain.eval(&input, &mut out);
-                data.extend(out[..chain.out_ch].iter().map(|&v| v as f32));
-            }
+            let data = chain.sample_grid(g);
             Engine::Grid(ClutEval::from_f32(vec![g; chain.in_ch], chain.out_ch, data))
         };
         Ok(Self {
