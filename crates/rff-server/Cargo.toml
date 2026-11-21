@@ -18,7 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 rusty_alloc-api.workspace = true
-rff.workspace = true
+rff = { workspace = true, features = ["default"] }
 rff-core.workspace = true
 rff-auth.workspace = true
 tokio.workspace = true

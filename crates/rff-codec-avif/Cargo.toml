@@ -22,14 +22,29 @@ rusty_av1e.workspace = true
 # via its native safe Rust API (`rust_api`).
 rusty_av1d.workspace = true
 
-# Native targets get the full-speed AV1 build: nasm SIMD kernels + rayon
-# tile-threading (the same feature set video-tests/analyzer-av1 builds with;
-# CI already installs nasm on all three OS legs for the h264-asm path).
-# wasm32 stays on the base no-asm/no-threading build: the asm feature is
-# x86_64/aarch64-only, and rayon thread spawns panic on wasm at runtime
-# (same lesson as rusty_png's forced-serial DEFLATE).
+# Native targets get rayon tile-threading; wasm32 stays on the base
+# no-threading build (rayon thread spawns panic on wasm at runtime, the same
+# lesson as rusty_png's forced-serial DEFLATE).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rusty_av1e = { workspace = true, features = ["asm", "threading"] }
-# (rusty_av1d >= 1.2.1 ships `src/arm/asm-offsets.h`; 1.2.0 left it out of the
-# package, which broke `asm` on every ARM target — issue #14.)
-rusty_av1d = { workspace = true, features = ["asm"] }
+rusty_av1e = { workspace = true, features = ["threading"] }
+
+# The dav1d/rav1e hand-written assembly, behind the default-on `av1-asm`
+# feature. These are the SAME two dependencies as above, declared a second
+# time as optional with `asm` on: Cargo merges same-named entries, and
+# `dep:` switches on only these optional, target-gated edges. So `av1-asm`
+# adds `asm` on native targets and is a no-op on wasm, where a build never
+# asks for NASM even with default features on. (A separate table because a
+# TOML table cannot repeat a key; `target_family = "wasm"` covers wasm32.)
+# (rusty_av1d >= 1.2.1 ships `src/arm/asm-offsets.h`; 1.2.0 left it out of
+# the package, which broke `asm` on every ARM target, issue #14.)
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+rusty_av1e = { workspace = true, features = ["asm"], optional = true }
+rusty_av1d = { workspace = true, features = ["asm"], optional = true }
+
+[features]
+default = ["av1-asm"]
+# Hand-written AV1 SIMD assembly (dav1d decode kernels, rav1e encode kernels).
+# On x86-64 these are assembled with NASM. Build with `--no-default-features`
+# to drop the NASM requirement; AVIF encode and decode then run the slower
+# Rust fallback, with byte-identical output.
+av1-asm = ["dep:rusty_av1e", "dep:rusty_av1d"]

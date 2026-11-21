@@ -89,7 +89,8 @@ rff-targets = { path = "crates/rff-targets", version = "0.2.22" }
 rff-codec-h264 = { path = "crates/rff-codec-h264", version = "0.3.18" }
 rff-codec-hevc = { path = "crates/rff-codec-hevc", version = "0.2.19" }
 rff-codec-opus = { path = "crates/rff-codec-opus", version = "0.3.18" }
-rff-codec-avif = { path = "crates/rff-codec-avif", version = "0.7.0" }
+# default-features = false: the facade forwards `av1-asm` (NASM) as its own feature.
+rff-codec-avif = { path = "crates/rff-codec-avif", version = "0.7.0", default-features = false }
 rff-format-avi = { path = "crates/rff-format-avi", version = "0.7.0" }
 rff-format-avif = { path = "crates/rff-format-avif", version = "0.7.0" }
 rff-codec-png = { path = "crates/rff-codec-png", version = "0.7.0" }
@@ -150,7 +151,10 @@ rff-format-ass = { path = "crates/rff-format-ass", version = "0.7.0" }
 rff-format-webvtt = { path = "crates/rff-format-webvtt", version = "0.7.0" }
 rff-filter = { path = "crates/rff-filter", version = "0.7.0" }
 rff-resample = { path = "crates/rff-resample", version = "0.7.0" }
-rff = { path = "crates/rff", version = "0.7.0", package = "remade-ffmpeg" }
+# default-features = false so rff-cli can expose the facade's features as its
+# own (`cargo install rff-cli --no-default-features`, issue #172). Members that
+# want the facade's defaults ask for `features = ["default"]`.
+rff = { path = "crates/rff", version = "0.7.0", package = "remade-ffmpeg", default-features = false }
 rff-auth = { path = "crates/rff-auth", version = "0.7.0" }
 
 # Third-party (all permissive â€” MIT/Apache-2.0; CI-enforced by cargo-deny).
@@ -160,8 +164,8 @@ rff-auth = { path = "crates/rff-auth", version = "0.7.0" }
 # names â€” so no `package =` alias is needed anymore). This removed rff's last
 # git dependencies: the whole tree is registry-resolvable. The workspace entry
 # stays `default-features = false` so wasm32 builds get the no-asm/no-threading
-# base; rff-codec-avif re-adds `asm` + `threading` for non-wasm targets (nasm
-# is installed locally and on all three CI legs via the h264-asm setup step).
+# base; rff-codec-avif re-adds `threading` for non-wasm targets, and `asm`
+# behind its default-on `av1-asm` feature (needs NASM on x86-64; issue #172).
 # The registry versions are toolkit MAIN (the merged no-asm fix + the
 # prom_av1e content-dispatch tier), ahead of the old b471be0 branch pin.
 rusty_av1e = { version = "0.8.0", default-features = false }

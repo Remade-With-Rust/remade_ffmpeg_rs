@@ -11,7 +11,8 @@ env:
 # `rff-ui` (the Dioxus front-end) is excluded from build-requiring jobs: it
 # needs a system webview toolchain and pulls MPL deps, and is never part of the
 # core or the published binaries — the same scoping as `default-members` and
-# `deny.toml`. The default build also needs `nasm` for the `h264-asm` path.
+# `deny.toml`. The default build also needs `nasm` for the `av1-asm` path
+# (dav1d/rav1e assembly); the `no-nasm` job covers the build without it.
 
 jobs:
   fmt:
@@ -56,6 +57,31 @@ jobs:
       # excessive-precision in codec constant tables. Surfaced here; tightening
       # to a hard gate is a tracked follow-up cleanup.
       - run: cargo clippy --workspace --exclude rff-ui --all-targets
+
+  # `cargo install rff-cli --no-default-features` must build on a machine with
+  # no NASM (issue #172). No setup-nasm step here on purpose: the job fails if
+  # anything in that graph still reaches for the assembler, and it fails before
+  # building if `nasm-rs` is in the dependency tree at all.
+  no-nasm:
+    name: rff-cli without NASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: nasm-rs must not be in the --no-default-features tree
+        run: |
+          cargo tree -p rff-cli --no-default-features --locked -e normal,build --prefix none > tree.txt
+          if grep -q '^nasm-rs ' tree.txt; then
+            cargo tree -p rff-cli --no-default-features --locked -i nasm-rs
+            echo "::error::nasm-rs is in the rff-cli --no-default-features dependency tree"
+            exit 1
+          fi
+      - name: NASM must be absent from the runner
+        run: |
+          if command -v nasm; then sudo rm -f "$(command -v nasm)"; fi
+          ! command -v nasm
+      - run: cargo build -p rff-cli --release --no-default-features --locked
 
   deny:
     name: cargo-deny

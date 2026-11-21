@@ -99,7 +99,7 @@ fn transcode_sniffs_extensionless_input() {
 
     let report = rff::transcode::run(&engine, &spec).expect("transcode a sniffed input");
     assert!(report.frames_decoded >= 1);
-    assert!(matches!(rff::probe::probe(&engine, &out_path), Ok(_)));
+    assert!(rff::probe::probe(&engine, &out_path).is_ok());
 
     let _ = fs::remove_file(&in_path);
     let _ = fs::remove_file(&out_path);

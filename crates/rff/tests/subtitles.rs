@@ -3,7 +3,7 @@
 //! each conversion is a (relabelled) stream copy.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rff::core::CodecId;
 use rff::transcode::{InputSpec, OutputSpec, TranscodeSpec};
@@ -15,14 +15,14 @@ fn tmp(name: &str, ext: &str) -> PathBuf {
 
 const SRT: &str = "1\n00:00:01,000 --> 00:00:02,500\nHello there\n\n2\n00:00:03,000 --> 00:00:04,000\nSecond cue\n";
 
-fn convert(engine: &Engine, from: &PathBuf, to: &PathBuf, codec: Option<CodecId>) {
+fn convert(engine: &Engine, from: &Path, to: &Path, codec: Option<CodecId>) {
     let spec = TranscodeSpec {
         inputs: vec![InputSpec {
-            path: from.clone(),
+            path: from.to_path_buf(),
             format: None,
         }],
         outputs: vec![OutputSpec {
-            path: to.clone(),
+            path: to.to_path_buf(),
             overwrite: true,
             subtitle_codec: codec,
             ..Default::default()

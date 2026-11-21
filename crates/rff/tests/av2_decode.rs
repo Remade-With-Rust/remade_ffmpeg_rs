@@ -43,16 +43,11 @@ fn decodes_av2_ivf_byte_identical_to_the_reference() {
 
     let mut out: Vec<u8> = Vec::new();
     let mut frames = 0usize;
-    loop {
-        match demuxer.read_packet() {
-            Ok(pkt) => {
-                let _ = decoder.send_packet(&pkt);
-                while let Ok(Frame::Video(v)) = decoder.receive_frame() {
-                    append_planes(&mut out, &v);
-                    frames += 1;
-                }
-            }
-            Err(_) => break,
+    while let Ok(pkt) = demuxer.read_packet() {
+        let _ = decoder.send_packet(&pkt);
+        while let Ok(Frame::Video(v)) = decoder.receive_frame() {
+            append_planes(&mut out, &v);
+            frames += 1;
         }
     }
     decoder.flush();

@@ -81,8 +81,12 @@ rff-codec-openh264 = { workspace = true, optional = true }
 # NEON on aarch64) in a single isolated crate: no assembler, no C, no `nasm`.
 # The feature keeps its historical name. Build with `--no-default-features`
 # for the pure scalar path.
-default = ["h264-asm"]
+default = ["h264-asm", "av1-asm"]
 h264-asm = ["rff-codec-h264/asm"]
+# AV1 (AVIF) encode/decode with the dav1d/rav1e hand-written assembly. This one
+# DOES need NASM on x86-64. Without it AVIF runs the Rust fallback: identical
+# output, slower. A no-op on wasm32. (issue #172)
+av1-asm = ["rff-codec-avif/av1-asm"]
 # Enable `https://` streaming input (rustls + RustCrypto provider, pure Rust).
 # Off by default; pulls the optional TLS dependency tree only when requested.
 https = ["rff-io/https"]
@@ -100,7 +104,7 @@ md-5 = "0.10"
 lewton.workspace = true
 
 # Document the scalar configuration (identical public API; nothing on docs.rs
-# runs the kernels), plus `https` so the TLS input path is covered.
+# runs the kernels, and docs.rs has no NASM for `av1-asm`), plus `https` so the TLS input path is covered.
 [package.metadata.docs.rs]
 no-default-features = true
 features = ["https"]

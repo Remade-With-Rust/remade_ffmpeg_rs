@@ -35,7 +35,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # The default build enables `h264-asm`, which assembles with nasm.
+      # The default build enables `av1-asm` (dav1d/rav1e assembly), which
+      # assembles with nasm.
       - uses: ilammy/setup-nasm@v1
 
       # `drop-in-names` additionally builds the `ffmpeg`/`ffprobe` executables.

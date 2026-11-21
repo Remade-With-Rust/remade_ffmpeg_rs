@@ -78,7 +78,7 @@ fn stream(codec: CodecId) -> Stream {
 
 /// Open a byte-sink muxer for `f`. Path muxers (HLS/DASH) are driven separately.
 fn open(f: &Format) -> Option<Box<dyn rff_format::Muxer>> {
-    f.muxer.map(|factory| factory(Box::new(Sink::default())))
+    f.muxer.map(|factory| factory(Box::<Sink>::default()))
 }
 
 fn engine() -> rff::Engine {
