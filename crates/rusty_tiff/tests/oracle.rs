@@ -45,7 +45,7 @@ impl Gen for f32 {
     fn gen(r: &mut Rng, i: usize) -> Self {
         if i % 97 < 6 {
             F32_SPECIAL[i % 97]
-        } else if (i / 5) % 2 == 0 {
+        } else if (i / 5).is_multiple_of(2) {
             i as f32 * 0.37 - 10.0
         } else {
             f32::from_bits((r.next() >> 32) as u32 & 0x3FFF_FFFF)
@@ -61,9 +61,9 @@ impl Gen for f32 {
 }
 impl Gen for f64 {
     fn gen(r: &mut Rng, i: usize) -> Self {
-        if i % 89 == 0 {
+        if i.is_multiple_of(89) {
             f64::NAN
-        } else if (i / 5) % 2 == 0 {
+        } else if (i / 5).is_multiple_of(2) {
             i as f64 * 0.37 - 10.0
         } else {
             f64::from_bits(r.next() & 0x3FFF_FFFF_FFFF_FFFF)

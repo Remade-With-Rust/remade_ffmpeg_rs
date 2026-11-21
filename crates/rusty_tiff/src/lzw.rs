@@ -483,7 +483,7 @@ mod eoi_tests {
             let data: Vec<u8> = (0..n)
                 .map(|i| {
                     seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
-                    if (seed >> 20) % 4 == 0 {
+                    if (seed >> 20).is_multiple_of(4) {
                         (seed >> 24) as u8
                     } else {
                         (i / 50) as u8 & 1
