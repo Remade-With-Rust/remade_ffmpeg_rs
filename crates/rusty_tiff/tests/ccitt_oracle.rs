@@ -19,7 +19,7 @@ fn image(w: u32, h: u32, seed: u64) -> Vec<u8> {
     let mut px = vec![0u8; stride * h as usize];
     let mut r = Rng(seed | 1);
     for y in 0..h as usize {
-        if y > 0 && r.next() % 3 == 0 {
+        if y > 0 && r.next().is_multiple_of(3) {
             // Near-copy of the row above: vertical-mode coverage.
             let (a, b) = px.split_at_mut(y * stride);
             b[..stride].copy_from_slice(&a[(y - 1) * stride..]);
@@ -28,7 +28,7 @@ fn image(w: u32, h: u32, seed: u64) -> Vec<u8> {
             continue;
         }
         let mut x = 0usize;
-        let mut black = r.next() % 2 == 0;
+        let mut black = r.next().is_multiple_of(2);
         while x < w as usize {
             let run = match r.next() % 6 {
                 0 => r.next() % 3000,

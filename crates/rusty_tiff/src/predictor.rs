@@ -101,9 +101,23 @@ pub(crate) fn undo_horizontal(buf: &mut [u8], row_bytes: usize, spp: usize, byte
 /// bytes not a multiple of `N`) is added to the last pixel, as the generic
 /// loop does.
 fn undo_h8<const N: usize>(row: &mut [u8]) {
-    let mut px = row.chunks_exact_mut(N);
-    let Some(first) = px.next() else { return };
+    let Some((first, rest)) = row.split_at_mut_checked(N) else {
+        return;
+    };
     let mut acc: [u8; N] = (&*first).try_into().unwrap();
+    // Four pixels a step: the same running sums, with fewer loop counter
+    // updates and exit tests (the pixel-at-a-time loop, which the compiler
+    // unrolled to two pixels, spent 4 of every 16 instructions on them).
+    let mut quads = rest.chunks_exact_mut(4 * N);
+    for q in &mut quads {
+        for p in q.chunks_exact_mut(N) {
+            for k in 0..N {
+                acc[k] = acc[k].wrapping_add(p[k]);
+                p[k] = acc[k];
+            }
+        }
+    }
+    let mut px = quads.into_remainder().chunks_exact_mut(N);
     for p in &mut px {
         for k in 0..N {
             acc[k] = acc[k].wrapping_add(p[k]);
@@ -354,6 +368,33 @@ mod tests {
                 let mut got = orig.clone();
                 swap_bytes(&mut got, n);
                 assert_eq!(got, want, "n {n} len {len}");
+            }
+        }
+    }
+
+    /// 8-bit horizontal undo against its definition (`row[i] += row[i -
+    /// spp]`, one byte at a time), across the four-pixel steps, short rows
+    /// and a trailing partial pixel.
+    #[test]
+    fn undo_h8_matches_the_definition() {
+        for spp in 1..=5usize {
+            for row_bytes in [
+                0usize, 1, 2, 3, 5, 11, 12, 13, 15, 16, 17, 47, 48, 49, 3072, 3073,
+            ] {
+                let orig: Vec<u8> = (0..row_bytes * 3)
+                    .map(|i| (i * 131 + i / 7 + 11) as u8)
+                    .collect();
+                let mut want = orig.clone();
+                if row_bytes > 0 {
+                    for row in want.chunks_mut(row_bytes) {
+                        for i in spp..row.len() {
+                            row[i] = row[i].wrapping_add(row[i - spp]);
+                        }
+                    }
+                }
+                let mut got = orig.clone();
+                undo_horizontal(&mut got, row_bytes, spp, 1);
+                assert_eq!(got, want, "spp {spp} row_bytes {row_bytes}");
             }
         }
     }

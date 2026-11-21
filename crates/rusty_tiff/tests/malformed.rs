@@ -363,7 +363,7 @@ fn mutation_fuzz_never_panics() {
                 _ => m[pos] = 0,
             }
         }
-        if r.next() % 8 == 0 {
+        if r.next().is_multiple_of(8) {
             let cut = (r.next() as usize) % m.len();
             m.truncate(cut);
         }

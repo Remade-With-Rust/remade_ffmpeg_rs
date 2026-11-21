@@ -1229,7 +1229,7 @@ fn decode_image<R: Read + Seek>(
     if !info.tiled && img.planes() == 1 {
         return decode_strips(s, img, limits, interpret, total_bytes, samples);
     }
-    if info.tiled && img.planes() == 1 && bits == 8 {
+    if info.tiled && img.planes() == 1 && (bits == 8 || bits == 16) {
         return decode_tile_bands(s, img, limits, interpret, total_bytes);
     }
     let mut out = match bits {
@@ -1369,7 +1369,7 @@ fn decode_strips<R: Read + Seek>(
     Ok(typed_result(out, info.sample_kind, bits))
 }
 
-/// Tiled images with one plane of 8-bit samples: one row of tiles (a band)
+/// Tiled images with one plane of 8- or 16-bit samples: one row of tiles (a band)
 /// is decoded into one buffer, then the band's image rows are appended to
 /// the output, each tile's part cut to the image width.
 ///
@@ -1381,9 +1381,13 @@ fn decode_strips<R: Read + Seek>(
 /// uncompressed and PackBits tiles (median of 400-600 interleaved rounds;
 /// LZW and Deflate are bound by the codec and do not move).
 ///
-/// 8-bit only, because the clock said so: at 16 bits the same band path
-/// measured no gain (median +1.6%, 261 of 600 pairs), and neither did
-/// zero-filling the output a band at a time.
+/// At 16 bits the rows are appended as `u16` slices viewed straight from
+/// the band (one copy, no per-sample conversion). A first 16-bit band that
+/// converted sample by sample measured no gain on the clock (median +1.6%,
+/// 261 of 600 pairs) and more instructions than the general path; as one
+/// copy it removes the zero-fill and the conversion pass (-0.6% of the
+/// whole uncompressed 16-bit run's instructions, about -2.8% of the decode,
+/// and -0.1..-0.3% on compressed 16-bit tiles).
 ///
 /// Memory: beside the image, one band. A tile is cut to the rows the image
 /// uses as soon as it is decoded, so the band holds at most those rows of
@@ -1397,14 +1401,48 @@ fn decode_tile_bands<R: Read + Seek>(
     total_bytes: usize,
 ) -> TiffResult<DecodingResult> {
     let info = &img.info;
-    let (cw, ch) = info.chunk_dimensions;
-    let (across, down) = img.across_down();
-    let tile_row = row_bytes(cw, img.spp_chunk(), 8)?;
-    let px = usize::from(info.samples_per_pixel);
-    let too_big = || TiffError::limits("cannot allocate a band of tiles");
+    let bits = info.bits_per_sample;
+    if bits == 16 {
+        let mut out: Vec<u16> = Vec::new();
+        out.try_reserve_exact(total_bytes / 2)
+            .map_err(|_| TiffError::limits(format!("cannot allocate {total_bytes} bytes")))?;
+        tile_band_rows(s, img, limits, interpret, |r| {
+            // The band rows start on even offsets of a heap buffer, so they
+            // are u16-aligned and append as one copy; the per-sample
+            // conversion is kept for any that are not.
+            match bytemuck::try_cast_slice::<u8, u16>(r) {
+                Ok(v) => out.extend_from_slice(v),
+                Err(_) => out.extend(
+                    r.chunks_exact(2)
+                        .map(|c| u16::from_ne_bytes(c.try_into().unwrap())),
+                ),
+            }
+        })?;
+        return Ok(typed_result(Out::U16(out), info.sample_kind, 16));
+    }
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(total_bytes)
         .map_err(|_| TiffError::limits(format!("cannot allocate {total_bytes} bytes")))?;
+    tile_band_rows(s, img, limits, interpret, |r| out.extend_from_slice(r))?;
+    Ok(typed_result(Out::U8(out), info.sample_kind, 8))
+}
+
+/// The band loop of [`decode_tile_bands`]: hands each image row's part of
+/// each tile, in image order, to `emit`.
+fn tile_band_rows<R: Read + Seek>(
+    s: &mut Stream<R>,
+    img: &Image,
+    limits: &mut Budget<'_>,
+    interpret: bool,
+    mut emit: impl FnMut(&[u8]),
+) -> TiffResult<()> {
+    let info = &img.info;
+    let (cw, ch) = info.chunk_dimensions;
+    let (across, down) = img.across_down();
+    let bits = info.bits_per_sample;
+    let tile_row = row_bytes(cw, img.spp_chunk(), bits)?;
+    let px = usize::from(info.samples_per_pixel) * usize::from(bits / 8);
+    let too_big = || TiffError::limits("cannot allocate a band of tiles");
     let mut band: Vec<u8> = Vec::new();
     for cy in 0..down {
         let rows = ch.min(info.height - cy * ch) as usize;
@@ -1435,11 +1473,11 @@ fn decode_tile_bands<R: Read + Seek>(
             for cx in 0..across {
                 let cols = cw.min(info.width - cx * cw) as usize;
                 let at = cx as usize * keep + r * tile_row;
-                out.extend_from_slice(&band[at..at + cols * px]);
+                emit(&band[at..at + cols * px]);
             }
         }
     }
-    Ok(typed_result(Out::U8(out), info.sample_kind, 8))
+    Ok(())
 }
 
 fn typed_result(out: Out, kind: SampleKind, bits: u16) -> DecodingResult {
