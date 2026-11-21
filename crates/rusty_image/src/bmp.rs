@@ -1069,15 +1069,9 @@ pub fn encode_dib(image: &Image, kind: DibKind) -> Result<Vec<u8>> {
 /// Write an ICO entry's DIB: 32-bit `BI_RGB` (alpha in the fourth byte, as
 /// icons store it) with a doubled height and an AND mask from the alpha.
 pub(crate) fn encode_ico_dib(image: &Image) -> Result<Vec<u8>> {
-    // RGBA pixels are read in place; only RGB is widened into a copy.
-    let rgba: std::borrow::Cow<[u8]> = match image.format {
-        PixelFormat::Rgba8 => (&image.pixels[..]).into(),
-        PixelFormat::Rgb8 => image
-            .pixels
-            .chunks_exact(3)
-            .flat_map(|p| [p[0], p[1], p[2], 0xff])
-            .collect::<Vec<u8>>()
-            .into(),
+    let ch = match image.format {
+        PixelFormat::Rgba8 => 4,
+        PixelFormat::Rgb8 => 3,
         other => {
             return Err(Error::unsupported(format!(
                 "ico: encoding {other:?} (Rgb8 and Rgba8)"
@@ -1085,29 +1079,49 @@ pub(crate) fn encode_ico_dib(image: &Image) -> Result<Vec<u8>> {
         }
     };
     let (w, h) = (image.width as usize, image.height as usize);
-    let mut out = Vec::new();
+    let mask_row = w.div_ceil(32) * 4;
+    let (pixels_len, mask_len) = (w * h * 4, mask_row * h);
+    // The whole entry is sized once and written in place: the pixels
+    // straight from the image a row at a time (one word exchange per RGBA
+    // pixel) and the mask a byte (eight alphas) at a time. Appending four
+    // bytes a pixel to an unreserved Vec, from an RGBA copy of the image,
+    // and building every mask row in a Vec of its own was 51 Ir a pixel.
+    let mut out = Vec::with_capacity(INFO as usize + pixels_len + mask_len);
     out.extend_from_slice(&INFO.to_le_bytes());
     out.extend_from_slice(&(w as i32).to_le_bytes());
     out.extend_from_slice(&((h * 2) as i32).to_le_bytes());
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&32u16.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
-    let mask_row = w.div_ceil(32) * 4;
-    out.extend_from_slice(&((w * h * 4 + mask_row * h) as u32).to_le_bytes());
+    out.extend_from_slice(&((pixels_len + mask_len) as u32).to_le_bytes());
     out.extend_from_slice(&[0u8; 16]);
-    for y in (0..h).rev() {
-        for p in rgba[y * w * 4..(y + 1) * w * 4].chunks_exact(4) {
-            out.extend_from_slice(&[p[2], p[1], p[0], p[3]]);
-        }
-    }
-    for y in (0..h).rev() {
-        let mut row = vec![0u8; mask_row];
-        for x in 0..w {
-            if rgba[(y * w + x) * 4 + 3] == 0 {
-                row[x / 8] |= 0x80 >> (x % 8);
+    let base = out.len();
+    out.resize(base + pixels_len + mask_len, 0);
+    let (xor, and) = out[base..].split_at_mut(pixels_len);
+    // Bottom row first, BGRA.
+    let rows = image.pixels.chunks_exact(w * ch).rev();
+    for (dst, src) in xor.chunks_exact_mut(w * 4).zip(rows) {
+        if ch == 4 {
+            crate::swizzle::swap_rb4(dst, src);
+        } else {
+            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
+                d.copy_from_slice(&[s[2], s[1], s[0], 0xff]);
             }
         }
-        out.extend_from_slice(&row);
+    }
+    // The AND mask: a set bit for every fully transparent pixel (none in an
+    // RGB image, whose mask stays zero).
+    if ch == 4 {
+        let rows = image.pixels.chunks_exact(w * 4).rev();
+        for (mask, src) in and.chunks_exact_mut(mask_row).zip(rows) {
+            for (m, cell) in mask.iter_mut().zip(src.chunks(32)) {
+                let mut bits = 0u8;
+                for (k, px) in cell.chunks_exact(4).enumerate() {
+                    bits |= u8::from(px[3] == 0) << (7 - k);
+                }
+                *m = bits;
+            }
+        }
     }
     Ok(out)
 }
@@ -1174,5 +1188,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The entry writer as it was before it wrote in place (an RGBA copy,
+    /// four bytes pushed a pixel, a Vec per mask row): the byte oracle.
+    fn encode_ico_dib_reference(image: &Image) -> Vec<u8> {
+        let rgba: Vec<u8> = match image.format {
+            PixelFormat::Rgba8 => image.pixels.clone(),
+            _ => image
+                .pixels
+                .chunks_exact(3)
+                .flat_map(|p| [p[0], p[1], p[2], 0xff])
+                .collect(),
+        };
+        let (w, h) = (image.width as usize, image.height as usize);
+        let mut out = Vec::new();
+        out.extend_from_slice(&INFO.to_le_bytes());
+        out.extend_from_slice(&(w as i32).to_le_bytes());
+        out.extend_from_slice(&((h * 2) as i32).to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&32u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let mask_row = w.div_ceil(32) * 4;
+        out.extend_from_slice(&((w * h * 4 + mask_row * h) as u32).to_le_bytes());
+        out.extend_from_slice(&[0u8; 16]);
+        for y in (0..h).rev() {
+            for p in rgba[y * w * 4..(y + 1) * w * 4].chunks_exact(4) {
+                out.extend_from_slice(&[p[2], p[1], p[0], p[3]]);
+            }
+        }
+        for y in (0..h).rev() {
+            let mut row = vec![0u8; mask_row];
+            for x in 0..w {
+                if rgba[(y * w + x) * 4 + 3] == 0 {
+                    row[x / 8] |= 0x80 >> (x % 8);
+                }
+            }
+            out.extend_from_slice(&row);
+        }
+        out
+    }
+
+    /// `encode_ico_dib` writes exactly the bytes the old writer wrote, for
+    /// RGB and RGBA entries of every width from 1 to 70 (mask rows of one to
+    /// three words, partial mask bytes) with fully transparent pixels mixed
+    /// in, and refuses other formats.
+    #[test]
+    fn ico_dib_matches_reference_writer() {
+        let mut seed = 0x9e37_79b9u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for w in 1..=70u32 {
+            let h = 1 + next() % 9;
+            for format in [PixelFormat::Rgb8, PixelFormat::Rgba8] {
+                let n = (w * h) as usize * format.bytes_per_pixel();
+                let mut px: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+                if format == PixelFormat::Rgba8 {
+                    for a in px.iter_mut().skip(3).step_by(4) {
+                        if next() % 3 == 0 {
+                            *a = 0;
+                        }
+                    }
+                }
+                let img = Image::new(w, h, format, px).unwrap();
+                assert_eq!(
+                    encode_ico_dib(&img).unwrap(),
+                    encode_ico_dib_reference(&img),
+                    "{format:?} {w}x{h}"
+                );
+            }
+        }
+        let grey = Image::new(4, 4, PixelFormat::L8, vec![7; 16]).unwrap();
+        assert!(encode_ico_dib(&grey).is_err());
     }
 }
