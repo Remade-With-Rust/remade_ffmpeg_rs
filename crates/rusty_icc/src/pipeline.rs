@@ -7,7 +7,7 @@
 use crate::color::{
     lab_to_xyz, mat_inv, mat_mul, mat_vec, xyz_to_lab, Lab, Mat3, Xyz, D50, IDENTITY,
 };
-use crate::curve::{clamp01, Curve};
+use crate::curve::{clamp01, Curve, FwdSeg, InvCurve, InvSeg};
 use crate::error::{Error, Result};
 use crate::lut::{make_trilinear, Lut, Stage};
 use crate::profile::{ColorSpace, Profile, ProfileClass};
@@ -32,6 +32,11 @@ pub(crate) enum Pcs {
 pub(crate) enum Op {
     /// A LUT stage over normalised values.
     Lut(Stage),
+    /// A LUT stage of per-channel curves that are all identities written as
+    /// a power of 1 (how v4 profiles spell "no curve"), over this many
+    /// channels: the clamp those curves amount to, without a stage call and
+    /// a curve evaluation per channel.
+    UnitCurves(usize),
     /// Multiply every channel.
     Scale(f64),
     /// v4-normalised Lab to real Lab.
@@ -48,6 +53,10 @@ pub(crate) enum Op {
     Affine(Mat3, [f64; 3]),
     Clamp01,
     InvCurves(Vec<Curve>),
+    /// [`Op::InvCurves`] when every curve is a two-segment parametric one
+    /// (sRGB-shaped): the same values, without a `pow` per value for the
+    /// curve's break point.
+    InvBreakCurves(Vec<InvCurve>),
     /// Grey `Y` to D50 XYZ (1 to 3 channels).
     GrayToXyz,
     /// Grey value as `L*/100` to Lab (1 to 3 channels).
@@ -58,10 +67,33 @@ pub(crate) enum Op {
     LabToGray,
 }
 
+/// The inverse-curves op for `curves`, prepared when every curve allows it.
+fn inv_curves(curves: Vec<Curve>) -> Op {
+    match curves.iter().map(InvCurve::new).collect::<Option<Vec<_>>>() {
+        Some(prepared) => Op::InvBreakCurves(prepared),
+        None => Op::InvCurves(curves),
+    }
+}
+
+/// The op for one LUT stage.
+fn lut_op(stage: Stage) -> Op {
+    match stage {
+        Stage::Curves(cs) if !cs.is_empty() && cs.iter().all(Curve::is_unit_gamma) => {
+            Op::UnitCurves(cs.len())
+        }
+        stage => Op::Lut(stage),
+    }
+}
+
 fn run(ops: &[Op], v: &mut [f64; 16], mut n: usize) -> usize {
     for op in ops {
         match op {
             Op::Lut(s) => n = s.apply(v, n),
+            Op::UnitCurves(k) => {
+                for x in v.iter_mut().take(*k) {
+                    *x = if *x > 0.0 { x.min(1.0) } else { 0.0 };
+                }
+            }
             Op::Scale(k) => {
                 for x in v.iter_mut().take(n) {
                     *x *= k;
@@ -109,6 +141,11 @@ fn run(ops: &[Op], v: &mut [f64; 16], mut n: usize) -> usize {
             Op::InvCurves(cs) => {
                 for (x, c) in v.iter_mut().zip(cs) {
                     *x = c.eval_inverse(*x);
+                }
+            }
+            Op::InvBreakCurves(cs) => {
+                for (x, c) in v.iter_mut().zip(cs) {
+                    *x = c.eval(*x);
                 }
             }
             Op::GrayToXyz => {
@@ -217,7 +254,7 @@ fn abstract_side(p: &Profile) -> Result<Side> {
         // `_cmsReadDevicelinkLUT` also interpolates Lab-PCS CLUTs trilinearly.
         make_trilinear(&mut stages);
     }
-    ops.extend(stages.into_iter().map(Op::Lut));
+    ops.extend(stages.into_iter().map(lut_op));
     decode_ops(&mut ops, pcs, legacy16);
     Ok(Side {
         ops,
@@ -249,7 +286,7 @@ pub(crate) fn input_side(p: &Profile, intent: Intent) -> Result<Side> {
         if legacy16 && cs == ColorSpace::Lab {
             ops.push(Op::Scale(1.0 / LAB_V2_TO_V4));
         }
-        ops.extend(lut.stages().into_iter().map(Op::Lut));
+        ops.extend(lut.stages().into_iter().map(lut_op));
         decode_ops(&mut ops, pcs, legacy16);
         return Ok(Side {
             ops,
@@ -342,7 +379,7 @@ pub(crate) fn output_side(p: &Profile, intent: Intent) -> Result<Side> {
             // interpolate trilinearly.
             make_trilinear(&mut stages);
         }
-        ops.extend(stages.into_iter().map(Op::Lut));
+        ops.extend(stages.into_iter().map(lut_op));
         if legacy16 && cs == ColorSpace::Lab {
             ops.push(Op::Scale(LAB_V2_TO_V4));
         }
@@ -371,7 +408,7 @@ pub(crate) fn output_side(p: &Profile, intent: Intent) -> Result<Side> {
                 (Op::LabToGray, None)
             };
             Ok(Side {
-                ops: vec![first, Op::Clamp01, Op::InvCurves(vec![c])],
+                ops: vec![first, Op::Clamp01, inv_curves(vec![c])],
                 pcs,
                 shaper,
             })
@@ -389,7 +426,7 @@ pub(crate) fn output_side(p: &Profile, intent: Intent) -> Result<Side> {
             }
             ops.push(Op::Affine(inv, [0.0; 3]));
             ops.push(Op::Clamp01);
-            ops.push(Op::InvCurves(curves.clone()));
+            ops.push(inv_curves(curves.clone()));
             let shaper = (pcs == Pcs::Xyz).then_some(Shaper {
                 curves,
                 matrix: inv,
@@ -449,19 +486,35 @@ fn black_as_darker_colorant(p: &Profile, intent: Intent) -> Xyz {
     clip_black(to_lab(&v, side.pcs))
 }
 
-/// Lab through `p`'s output side for `intent`, then back through its
-/// relative-colorimetric input side (`CreateRoundtripXForm`).
-fn roundtrip(p: &Profile, intent: Intent, lab: Lab) -> Result<Lab> {
-    let out = output_side(p, intent)?;
-    let inn = input_side(p, Intent::RelativeColorimetric)?;
-    let mut v = [0.0; 16];
-    match out.pcs {
-        Pcs::Lab => v[..3].copy_from_slice(&[lab.l, lab.a, lab.b]),
-        Pcs::Xyz => v[..3].copy_from_slice(&lab_to_xyz(lab, D50).to_array()),
+/// Lab through a profile's output side for an intent, then back through
+/// its relative-colorimetric input side (`CreateRoundtripXForm`). Built
+/// once and evaluated per colour: building a side converts the profile's
+/// whole CLUT, and the destination black-point search evaluates 256
+/// colours, so building it per colour was most of a `Transform::new` with
+/// black-point compensation.
+struct Roundtrip {
+    out: Side,
+    inn: Side,
+}
+
+impl Roundtrip {
+    fn new(p: &Profile, intent: Intent) -> Result<Self> {
+        Ok(Self {
+            out: output_side(p, intent)?,
+            inn: input_side(p, Intent::RelativeColorimetric)?,
+        })
     }
-    let n = run(&out.ops, &mut v, 3);
-    run(&inn.ops, &mut v, n);
-    Ok(to_lab(&v, inn.pcs))
+
+    fn eval(&self, lab: Lab) -> Lab {
+        let mut v = [0.0; 16];
+        match self.out.pcs {
+            Pcs::Lab => v[..3].copy_from_slice(&[lab.l, lab.a, lab.b]),
+            Pcs::Xyz => v[..3].copy_from_slice(&lab_to_xyz(lab, D50).to_array()),
+        }
+        let n = run(&self.out.ops, &mut v, 3);
+        run(&self.inn.ops, &mut v, n);
+        to_lab(&v, self.inn.pcs)
+    }
 }
 
 /// `BlackPointUsingPerceptualBlack`.
@@ -469,7 +522,8 @@ fn black_using_perceptual(p: &Profile) -> Xyz {
     if !p.intent_supported(Intent::Perceptual, true) {
         return Xyz::default();
     }
-    roundtrip(p, Intent::Perceptual, Lab::default()).map_or(Xyz::default(), clip_black)
+    Roundtrip::new(p, Intent::Perceptual)
+        .map_or(Xyz::default(), |r| clip_black(r.eval(Lab::default())))
 }
 
 /// `cmsDetectBlackPoint`.
@@ -556,6 +610,9 @@ pub(crate) fn detect_destination_black_point(p: &Profile, intent: Intent) -> Xyz
     } else {
         Lab::default()
     };
+    let Ok(roundtrip) = Roundtrip::new(p, intent) else {
+        return Xyz::default();
+    };
     let mut in_ramp = [0.0; 256];
     let mut out_ramp = [0.0; 256];
     for l in 0..256 {
@@ -564,9 +621,7 @@ pub(crate) fn detect_destination_black_point(p: &Profile, intent: Intent) -> Xyz
             initial.a.clamp(-50.0, 50.0),
             initial.b.clamp(-50.0, 50.0),
         );
-        let Ok(d) = roundtrip(p, intent, lab) else {
-            return Xyz::default();
-        };
+        let d = roundtrip.eval(lab);
         in_ramp[l] = lab.l;
         out_ramp[l] = d.l;
     }
@@ -668,7 +723,124 @@ pub(crate) struct Chain {
     pub(crate) shaper: Option<ShaperLink>,
 }
 
+/// A chain that is one RGB matrix/TRC profile into another, viewed for a
+/// straight-line evaluation per colour: the operations [`run`] performs for
+/// the ops it borrows, in the same order (so every result is the same),
+/// without the per-op dispatch, the calls and the 16-channel scratch arrays.
+pub(crate) struct ShaperChain<'a> {
+    curves: &'a [Curve; 3],
+    /// The XYZ affine maps between the curves, the first `maps` of them.
+    affines: [(Mat3, [f64; 3]); 3],
+    maps: usize,
+    inverse: Inverse<'a>,
+}
+
+enum Inverse<'a> {
+    Break(&'a [InvCurve; 3]),
+    Plain(&'a [Curve; 3]),
+}
+
+/// A [`ShaperChain`] whose six curves are all regular two-segment ones (an
+/// sRGB-shaped profile into another, the common display case), each as
+/// constants for evaluation in line: no call and no per-curve test per
+/// value.
+pub(crate) struct SegChain {
+    curves: [FwdSeg; 3],
+    affines: [(Mat3, [f64; 3]); 3],
+    maps: usize,
+    inverse: [InvSeg; 3],
+}
+
+impl SegChain {
+    /// One colour: exactly what [`Chain::eval`] gives for it.
+    #[inline]
+    pub(crate) fn eval(&self, x: [f64; 3]) -> [f64; 3] {
+        let [c0, c1, c2] = &self.curves;
+        let mut v = [c0.eval(x[0]), c1.eval(x[1]), c2.eval(x[2])];
+        for (m, off) in &self.affines[..self.maps] {
+            let r = mat_vec(m, v);
+            v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
+        }
+        let v = v.map(clamp01);
+        let [i0, i1, i2] = &self.inverse;
+        [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])]
+    }
+}
+
+impl ShaperChain<'_> {
+    /// The chain as a [`SegChain`], when every curve allows it.
+    pub(crate) fn segments(&self) -> Option<SegChain> {
+        let Inverse::Break([i0, i1, i2]) = self.inverse else {
+            return None;
+        };
+        let [c0, c1, c2] = self.curves;
+        Some(SegChain {
+            curves: [FwdSeg::new(c0)?, FwdSeg::new(c1)?, FwdSeg::new(c2)?],
+            affines: self.affines,
+            maps: self.maps,
+            inverse: [InvSeg::new(i0)?, InvSeg::new(i1)?, InvSeg::new(i2)?],
+        })
+    }
+
+    /// One colour: exactly what [`Chain::eval`] gives for it.
+    #[inline]
+    pub(crate) fn eval(&self, x: [f64; 3]) -> [f64; 3] {
+        let [c0, c1, c2] = self.curves;
+        let mut v = [c0.eval(x[0]), c1.eval(x[1]), c2.eval(x[2])];
+        for (m, off) in &self.affines[..self.maps] {
+            let r = mat_vec(m, v);
+            v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
+        }
+        let v = v.map(clamp01);
+        match self.inverse {
+            Inverse::Break([i0, i1, i2]) => [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])],
+            Inverse::Plain([i0, i1, i2]) => [
+                i0.eval_inverse(v[0]),
+                i1.eval_inverse(v[1]),
+                i2.eval_inverse(v[2]),
+            ],
+        }
+    }
+}
+
 impl Chain {
+    /// The chain as a [`ShaperChain`], when its ops are exactly: three
+    /// device curves, XYZ affine maps (in, an optional PCS adjustment,
+    /// out), the clamp, three inverse device curves. Worked out per call
+    /// from the ops themselves (a few dozen instructions, nothing stored),
+    /// so building a transform costs nothing more.
+    pub(crate) fn as_shaper(&self) -> Option<ShaperChain<'_>> {
+        if self.in_ch != 3 || self.out_ch != 3 {
+            return None;
+        }
+        let [Op::Lut(Stage::Curves(curves)), mid @ .., Op::Clamp01, last] = self.ops.as_slice()
+        else {
+            return None;
+        };
+        let curves: &[Curve; 3] = curves.as_slice().try_into().ok()?;
+        let mut affines = [(IDENTITY, [0.0; 3]); 3];
+        if mid.len() > affines.len() {
+            return None;
+        }
+        for (slot, op) in affines.iter_mut().zip(mid) {
+            let Op::Affine(m, off) = op else {
+                return None;
+            };
+            *slot = (*m, *off);
+        }
+        let inverse = match last {
+            Op::InvBreakCurves(cs) => Inverse::Break(cs.as_slice().try_into().ok()?),
+            Op::InvCurves(cs) => Inverse::Plain(cs.as_slice().try_into().ok()?),
+            _ => return None,
+        };
+        Some(ShaperChain {
+            curves,
+            affines,
+            maps: mid.len(),
+            inverse,
+        })
+    }
+
     /// Evaluates one colour (normalised in, normalised out). Values past
     /// `in_ch` in `input` must be zero (callers keep zero-tailed arrays);
     /// `out` past `out_ch` is unspecified. Whole-array copies have a
@@ -678,6 +850,47 @@ impl Chain {
         let mut v = *input;
         run(&self.ops, &mut v, self.in_ch);
         *out = v;
+    }
+
+    /// The chain sampled on a regular grid of `g` points per input (first
+    /// input slowest, `out_ch` values per point): [`Chain::eval`] at every
+    /// `(i0, i1, ..) / (g - 1)`.
+    ///
+    /// When the chain starts with per-channel curves (every matrix/TRC
+    /// input and most LUT inputs), they are evaluated once per axis value
+    /// instead of once per grid point. A grid point's coordinates are
+    /// exactly those axis values, so every result is the same: three libm
+    /// `pow` calls per point of a 33^3 grid become 99 calls in all.
+    pub(crate) fn sample_grid(&self, g: usize) -> Vec<f32> {
+        let total = (0..self.in_ch).fold(1usize, |a, _| a * g);
+        let axis: Vec<f64> = (0..g).map(|i| i as f64 / (g - 1) as f64).collect();
+        let (head, tail): (Vec<Vec<f64>>, &[Op]) = match self.ops.split_first() {
+            Some((Op::Lut(Stage::Curves(cs)), tail)) if cs.len() == self.in_ch => (
+                cs.iter()
+                    .map(|c| axis.iter().map(|&x| c.eval(x)).collect())
+                    .collect(),
+                tail,
+            ),
+            _ => (vec![axis; self.in_ch], &self.ops),
+        };
+        let mut data = Vec::with_capacity(total * self.out_ch);
+        for idx in 0..total {
+            let mut v = [0.0f64; 16];
+            let mut rem = idx;
+            for c in (0..self.in_ch).rev() {
+                v[c] = head[c][rem % g];
+                rem /= g;
+            }
+            run(tail, &mut v, self.in_ch);
+            data.extend(v[..self.out_ch].iter().map(|&x| x as f32));
+        }
+        data
+    }
+
+    /// [`Chain::eval`] on one array: `v` holds the colour (zero past
+    /// `in_ch`) and receives the result.
+    pub(crate) fn eval_in_place(&self, v: &mut [f64; 16]) {
+        run(&self.ops, v, self.in_ch);
     }
 }
 
@@ -839,5 +1052,171 @@ impl GamutChain {
         let n = run(&self.proof_out, &mut v, 3);
         run(&self.proof_in, &mut v, n);
         (a, Lab::new(v[0], v[1], v[2]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fused_shaper_chain_matches_the_interpreter_bit_for_bit() {
+        use crate::color::{Xy, D65_XY};
+        let srgb = Profile::new_srgb();
+        let p3 = Profile::new_display_p3();
+        let lin = Profile::new_rgb(
+            D65_XY,
+            [
+                Xy::new(0.708, 0.292),
+                Xy::new(0.170, 0.797),
+                Xy::new(0.131, 0.046),
+            ],
+            Curve::gamma(1.0),
+        )
+        .unwrap();
+        let g22 = Profile::new_rgb(
+            D65_XY,
+            [
+                Xy::new(0.64, 0.33),
+                Xy::new(0.21, 0.71),
+                Xy::new(0.15, 0.06),
+            ],
+            Curve::gamma(2.2),
+        )
+        .unwrap();
+        let mut xs: Vec<f64> = (0..=64).map(|i| f64::from(i) / 64.0).collect();
+        xs.extend([
+            -0.25,
+            -0.0,
+            1.0e-9,
+            0.04045,
+            0.5000001,
+            1.25,
+            f64::NAN,
+            f64::INFINITY,
+        ]);
+        let abs = Intent::AbsoluteColorimetric;
+        let rel = Intent::RelativeColorimetric;
+        for (a, b, intent, bpc) in [
+            (&srgb, &p3, rel, false),
+            (&p3, &srgb, rel, true),
+            (&srgb, &lin, abs, false),
+            (&lin, &g22, rel, false),
+            (&g22, &srgb, Intent::Perceptual, true),
+        ] {
+            let chain = build_chain(&[a, b], &[intent, intent], &[bpc, bpc]).unwrap();
+            let fused = chain.as_shaper().expect("matrix-shaper pair");
+            // sRGB and Display P3 both ways are all two-segment curves.
+            let segments = fused.segments();
+            assert_eq!(
+                segments.is_some(),
+                std::ptr::eq(a, &srgb) && std::ptr::eq(b, &p3)
+                    || std::ptr::eq(a, &p3) && std::ptr::eq(b, &srgb)
+            );
+            for &r in &xs {
+                for &g in &xs {
+                    for &bl in &[0.0, 0.3, 1.0, f64::NAN, -1.0, 2.0] {
+                        let mut input = [0.0; 16];
+                        input[..3].copy_from_slice(&[r, g, bl]);
+                        let mut want = [0.0; 16];
+                        chain.eval(&input, &mut want);
+                        let got = fused.eval([r, g, bl]);
+                        assert_eq!(
+                            got.map(f64::to_bits),
+                            [want[0], want[1], want[2]].map(f64::to_bits),
+                            "{r} {g} {bl}"
+                        );
+                        if let Some(seg) = &segments {
+                            assert_eq!(
+                                seg.eval([r, g, bl]).map(f64::to_bits),
+                                got.map(f64::to_bits),
+                                "segments {r} {g} {bl}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Chains through a LUT or to Lab are not fused.
+        let lab = Profile::new_lab_identity();
+        let chain = build_chain(&[&srgb, &lab], &[rel, rel], &[false, false]).unwrap();
+        assert!(chain.as_shaper().is_none());
+    }
+
+    #[test]
+    fn sample_grid_matches_eval_at_every_point() {
+        let srgb = Profile::new_srgb();
+        let lab = Profile::new_lab_identity();
+        let gray = Profile::new_gray(crate::color::D65_XY, Curve::gamma(2.2));
+        let rel = Intent::RelativeColorimetric;
+        for (a, b, g) in [(&srgb, &lab, 9usize), (&lab, &srgb, 7), (&gray, &srgb, 33)] {
+            let chain = build_chain(&[a, b], &[rel, rel], &[false, false]).unwrap();
+            let data = chain.sample_grid(g);
+            let total = (0..chain.in_ch).fold(1usize, |n, _| n * g);
+            assert_eq!(data.len(), total * chain.out_ch);
+            for idx in 0..total {
+                let mut input = [0.0; 16];
+                let mut rem = idx;
+                for c in (0..chain.in_ch).rev() {
+                    input[c] = (rem % g) as f64 / (g - 1) as f64;
+                    rem /= g;
+                }
+                let mut out = [0.0; 16];
+                chain.eval(&input, &mut out);
+                for o in 0..chain.out_ch {
+                    let got = data[idx * chain.out_ch + o];
+                    assert_eq!(got.to_bits(), (out[o] as f32).to_bits(), "point {idx}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unit_curve_stage_matches_curve_eval_bit_for_bit() {
+        let forms = [
+            Curve::gamma(1.0),
+            Curve::parametric(1, &[1.0, 1.0, 0.0]).unwrap(),
+            Curve::Parametric {
+                function: 1,
+                params: [1.0, 1.0, -0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+            Curve::Table(vec![256]),
+        ];
+        let xs = [
+            -1.0,
+            -0.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            1.0e-300,
+            0.25,
+            0.999_999_999,
+            1.0,
+            1.0 + f64::EPSILON,
+            7.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        for c in &forms {
+            assert!(c.is_unit_gamma());
+            let op = lut_op(Stage::Curves(vec![c.clone(); 3]));
+            assert!(matches!(op, Op::UnitCurves(3)));
+            for &x in &xs {
+                let mut v = [0.0; 16];
+                v[..4].copy_from_slice(&[x, x, x, x]);
+                assert_eq!(run(std::slice::from_ref(&op), &mut v, 3), 3);
+                for got in &v[..3] {
+                    assert_eq!(got.to_bits(), c.eval(x).to_bits(), "{c:?} at {x}");
+                }
+                // Channels past the curves are left alone.
+                assert_eq!(v[3].to_bits(), x.to_bits());
+            }
+        }
+        // Not every identity: an empty `curv` keeps the sign of a zero, and
+        // mixed stages stay per-curve.
+        assert!(!Curve::identity().is_unit_gamma());
+        assert!(!Curve::gamma(2.2).is_unit_gamma());
+        let mixed = lut_op(Stage::Curves(vec![Curve::gamma(1.0), Curve::srgb()]));
+        assert!(matches!(mixed, Op::Lut(Stage::Curves(_))));
     }
 }

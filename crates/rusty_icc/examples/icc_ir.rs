@@ -6,15 +6,31 @@
 //! Every run prints work-parity anchors: the pixel/byte count and an FNV-1a
 //! of the output bytes. If an anchor moves, the experiment changed.
 //!
-//! Profiles: built-ins, plus Coated FOGRA39 from `RUSTY_ICC_FOGRA39`.
+//! `icc_ir MODE REPS` also times the hot call `REPS` more times with a
+//! monotonic in-process clock and prints `time_ns min .. median ..` on a
+//! second line (the wall check: pin the process and interleave two builds,
+//! see `bench-lcms/wall.sh`).
+//!
+//! Profiles: built-ins, the repository test profiles (`tests/data`), plus
+//! Coated FOGRA39 from `RUSTY_ICC_FOGRA39`.
 
 #[global_allocator]
 static GLOBAL_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 
-use rusty_icc::{Intent, Layout, Options, Profile, Transform};
+use rusty_icc::color::{Xy, D65_XY};
+use rusty_icc::{Curve, GamutCheck, Intent, Layout, Options, Profile, Transform};
 use std::hint::black_box;
+use std::time::Instant;
 
 const SIDE: usize = 256;
+/// Pixels per call of the `small*` workloads: the 256x256 image as 1024
+/// separate calls, so per-call setup shows.
+const SMALL: usize = 64;
+
+const GREY_V4: &[u8] = include_bytes!("../tests/data/sGrey-v4.icc");
+const V4_PREF: &[u8] = include_bytes!("../tests/data/sRGB_v4_ICC_preference.icc");
+const PROPHOTO_V2: &[u8] = include_bytes!("../tests/data/ProPhoto-v2-micro.icc");
+const CGATS_V2: &[u8] = include_bytes!("../tests/data/CGATS001Compat-v2-micro.icc");
 
 fn fnv(bytes: impl IntoIterator<Item = u8>) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -56,6 +72,24 @@ fn fogra() -> Profile {
     Profile::new_from_slice(&std::fs::read(path).expect("read FOGRA39")).expect("parse")
 }
 
+fn data(bytes: &[u8]) -> Profile {
+    Profile::new_from_slice(bytes).expect("parse test profile")
+}
+
+/// Rec. 2020 primaries with a linear tone curve.
+fn linear_rec2020() -> Profile {
+    Profile::new_rgb(
+        D65_XY,
+        [
+            Xy::new(0.708, 0.292),
+            Xy::new(0.170, 0.797),
+            Xy::new(0.131, 0.046),
+        ],
+        Curve::gamma(1.0),
+    )
+    .expect("linear Rec.2020")
+}
+
 fn xf(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) -> Transform {
     Transform::new(
         src,
@@ -66,6 +100,31 @@ fn xf(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) -> Transform {
         Options::default(),
     )
     .unwrap()
+}
+
+/// Extra timed repetitions (second argument), 0 under callgrind.
+fn reps() -> usize {
+    std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Times `f` `reps()` times and prints the minimum and median.
+fn timed(mut f: impl FnMut()) {
+    let n = reps();
+    if n == 0 {
+        return;
+    }
+    let mut t: Vec<u128> = (0..n)
+        .map(|_| {
+            let s = Instant::now();
+            f();
+            s.elapsed().as_nanos()
+        })
+        .collect();
+    t.sort_unstable();
+    println!("time_ns min {} median {} reps {}", t[0], t[n / 2], n);
 }
 
 #[inline(never)]
@@ -84,8 +143,73 @@ fn hot_transform_f32(t: &Transform, src: &[f32], dst: &mut [f32]) {
 }
 
 #[inline(never)]
+fn hot_small_u8(t: &Transform, src: &[u8], dst: &mut [u8], sc: usize, dc: usize) {
+    for (s, d) in src
+        .chunks_exact(SMALL * sc)
+        .zip(dst.chunks_exact_mut(SMALL * dc))
+    {
+        t.transform(black_box(s), black_box(d)).unwrap();
+    }
+}
+
+#[inline(never)]
+fn hot_small_u16(t: &Transform, src: &[u16], dst: &mut [u16], sc: usize, dc: usize) {
+    for (s, d) in src
+        .chunks_exact(SMALL * sc)
+        .zip(dst.chunks_exact_mut(SMALL * dc))
+    {
+        t.transform(black_box(s), black_box(d)).unwrap();
+    }
+}
+
+#[inline(never)]
+fn hot_small_f32(t: &Transform, src: &[f32], dst: &mut [f32], sc: usize, dc: usize) {
+    for (s, d) in src
+        .chunks_exact(SMALL * sc)
+        .zip(dst.chunks_exact_mut(SMALL * dc))
+    {
+        t.transform(black_box(s), black_box(d)).unwrap();
+    }
+}
+
+#[inline(never)]
 fn hot_build(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) -> Transform {
     xf(black_box(src), sl, black_box(dst), dl)
+}
+
+#[inline(never)]
+fn hot_build_opts(
+    src: &Profile,
+    sl: Layout,
+    dst: &Profile,
+    dl: Layout,
+    intent: Intent,
+    bpc: bool,
+) -> Transform {
+    Transform::new(
+        black_box(src),
+        sl,
+        black_box(dst),
+        dl,
+        intent,
+        Options {
+            black_point_compensation: bpc,
+        },
+    )
+    .unwrap()
+}
+
+#[inline(never)]
+fn hot_build_proof(src: &Profile, proof: &Profile, dst: &Profile) -> Transform {
+    proofing(black_box(src), black_box(proof), black_box(dst))
+}
+
+/// `Transform::new` plus the first 16-bit call (64 pixels): the lazily built
+/// 16-bit input tables are part of what a small 16-bit job pays.
+#[inline(never)]
+fn hot_first16(src: &Profile, dst: &Profile, s: &[u16], o: &mut [u16]) {
+    let t = xf(black_box(src), Layout::Rgb, black_box(dst), Layout::Rgb);
+    t.transform(black_box(s), black_box(o)).unwrap();
 }
 
 #[inline(never)]
@@ -93,39 +217,41 @@ fn hot_parse_encode(bytes: &[u8]) -> Vec<u8> {
     Profile::new_from_slice(black_box(bytes)).unwrap().encode()
 }
 
-fn run_u8(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) {
-    let t = xf(src, sl, dst, dl);
-    let s: Vec<u8> = image(sl.channels())
+#[inline(never)]
+fn hot_gamut_u8(g: &GamutCheck, src: &[u8], out: &mut [f64]) {
+    g.delta_e(black_box(src), black_box(out)).unwrap();
+}
+
+fn proofing(src: &Profile, proof: &Profile, dst: &Profile) -> Transform {
+    Transform::new_proofing(
+        src,
+        Layout::Rgb,
+        proof,
+        dst,
+        Layout::Rgb,
+        Intent::RelativeColorimetric,
+        Intent::RelativeColorimetric,
+        Options::default(),
+    )
+    .unwrap()
+}
+
+fn src_u8(ch: usize) -> Vec<u8> {
+    image(ch)
         .iter()
         .map(|&u| (u * 255.0).round() as u8)
-        .collect();
-    let mut o = vec![0u8; SIDE * SIDE * dl.channels()];
-    t.transform(&s[..sl.channels()], &mut o[..dl.channels()])
-        .unwrap(); // warm lazy state
-    hot_transform_u8(&t, &s, &mut o);
-    println!("pixels {} fnv {:016x}", SIDE * SIDE, fnv(o.iter().copied()));
+        .collect()
 }
 
-fn run_u16(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) {
-    let t = xf(src, sl, dst, dl);
-    let s: Vec<u16> = image(sl.channels())
+fn src_u16(ch: usize) -> Vec<u16> {
+    image(ch)
         .iter()
         .map(|&u| (u * 65535.0).round() as u16)
-        .collect();
-    let mut o = vec![0u16; SIDE * SIDE * dl.channels()];
-    t.transform(&s[..sl.channels()], &mut o[..dl.channels()])
-        .unwrap();
-    hot_transform_u16(&t, &s, &mut o);
-    println!(
-        "pixels {} fnv {:016x}",
-        SIDE * SIDE,
-        fnv(o.iter().flat_map(|v| v.to_le_bytes()))
-    );
+        .collect()
 }
 
-fn run_f32(src: &Profile, sl: Layout, dst: &Profile, dl: Layout, lab_in: bool) {
-    let t = xf(src, sl, dst, dl);
-    let mut s: Vec<f32> = image(sl.channels()).iter().map(|&u| u as f32).collect();
+fn src_f32(ch: usize, lab_in: bool) -> Vec<f32> {
+    let mut s: Vec<f32> = image(ch).iter().map(|&u| u as f32).collect();
     if lab_in {
         for px in s.chunks_exact_mut(3) {
             px[0] *= 100.0;
@@ -133,8 +259,14 @@ fn run_f32(src: &Profile, sl: Layout, dst: &Profile, dl: Layout, lab_in: bool) {
             px[2] = px[2] * 255.0 - 128.0;
         }
     }
-    let mut o = vec![0f32; SIDE * SIDE * dl.channels()];
-    hot_transform_f32(&t, &s, &mut o);
+    s
+}
+
+fn anchor_u8(o: &[u8]) {
+    println!("pixels {} fnv {:016x}", SIDE * SIDE, fnv(o.iter().copied()));
+}
+
+fn anchor_u16(o: &[u16]) {
     println!(
         "pixels {} fnv {:016x}",
         SIDE * SIDE,
@@ -142,41 +274,221 @@ fn run_f32(src: &Profile, sl: Layout, dst: &Profile, dl: Layout, lab_in: bool) {
     );
 }
 
+fn anchor_f32(o: &[f32]) {
+    println!(
+        "pixels {} fnv {:016x}",
+        SIDE * SIDE,
+        fnv(o.iter().flat_map(|v| v.to_le_bytes()))
+    );
+}
+
+fn tr_u8(t: &Transform) {
+    let (sl, dl) = (t.src_layout(), t.dst_layout());
+    let s = src_u8(sl.channels());
+    let mut o = vec![0u8; SIDE * SIDE * dl.channels()];
+    t.transform(&s[..sl.channels()], &mut o[..dl.channels()])
+        .unwrap(); // warm lazy state
+    hot_transform_u8(t, &s, &mut o);
+    anchor_u8(&o);
+    timed(|| hot_transform_u8(t, &s, &mut o));
+}
+
+fn run_u8(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) {
+    tr_u8(&xf(src, sl, dst, dl));
+}
+
+fn tr_u16(t: &Transform) {
+    let (sl, dl) = (t.src_layout(), t.dst_layout());
+    let s = src_u16(sl.channels());
+    let mut o = vec![0u16; SIDE * SIDE * dl.channels()];
+    t.transform(&s[..sl.channels()], &mut o[..dl.channels()])
+        .unwrap();
+    hot_transform_u16(t, &s, &mut o);
+    anchor_u16(&o);
+    timed(|| hot_transform_u16(t, &s, &mut o));
+}
+
+fn run_u16(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) {
+    tr_u16(&xf(src, sl, dst, dl));
+}
+
+fn tr_f32(t: &Transform, lab_in: bool) {
+    let (sl, dl) = (t.src_layout(), t.dst_layout());
+    let s = src_f32(sl.channels(), lab_in);
+    let mut o = vec![0f32; SIDE * SIDE * dl.channels()];
+    hot_transform_f32(t, &s, &mut o);
+    anchor_f32(&o);
+    timed(|| hot_transform_f32(t, &s, &mut o));
+}
+
+fn run_f32(src: &Profile, sl: Layout, dst: &Profile, dl: Layout, lab_in: bool) {
+    tr_f32(&xf(src, sl, dst, dl), lab_in);
+}
+
+fn small_u8(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) {
+    let t = xf(src, sl, dst, dl);
+    let (sc, dc) = (sl.channels(), dl.channels());
+    let s = src_u8(sc);
+    let mut o = vec![0u8; SIDE * SIDE * dc];
+    t.transform(&s[..sc], &mut o[..dc]).unwrap();
+    hot_small_u8(&t, &s, &mut o, sc, dc);
+    anchor_u8(&o);
+    timed(|| hot_small_u8(&t, &s, &mut o, sc, dc));
+}
+
+fn small_u16(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) {
+    let t = xf(src, sl, dst, dl);
+    let (sc, dc) = (sl.channels(), dl.channels());
+    let s = src_u16(sc);
+    let mut o = vec![0u16; SIDE * SIDE * dc];
+    t.transform(&s[..sc], &mut o[..dc]).unwrap();
+    hot_small_u16(&t, &s, &mut o, sc, dc);
+    anchor_u16(&o);
+    timed(|| hot_small_u16(&t, &s, &mut o, sc, dc));
+}
+
+fn small_f32(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) {
+    let t = xf(src, sl, dst, dl);
+    let (sc, dc) = (sl.channels(), dl.channels());
+    let s = src_f32(sc, false);
+    let mut o = vec![0f32; SIDE * SIDE * dc];
+    hot_small_f32(&t, &s, &mut o, sc, dc);
+    anchor_f32(&o);
+    timed(|| hot_small_f32(&t, &s, &mut o, sc, dc));
+}
+
+/// Anchor of a built transform: its output on a fixed 64-pixel ramp.
+fn build_anchor(t: &Transform) {
+    let (n, m) = (
+        t.src_layout().color_channels(),
+        t.dst_layout().color_channels(),
+    );
+    let s: Vec<u16> = (0..n * 64).map(|i| (i * 1031 % 65536) as u16).collect();
+    let mut o = vec![0u16; 64 * m];
+    t.transform(&s, &mut o).unwrap();
+    println!(
+        "pixels 64 fnv {:016x}",
+        fnv(o.iter().flat_map(|v| v.to_le_bytes()))
+    );
+}
+
+fn build(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) {
+    build_anchor(&hot_build(src, sl, dst, dl));
+    timed(|| {
+        black_box(hot_build(src, sl, dst, dl));
+    });
+}
+
+fn build_opts(src: &Profile, sl: Layout, dst: &Profile, dl: Layout, intent: Intent, bpc: bool) {
+    build_anchor(&hot_build_opts(src, sl, dst, dl, intent, bpc));
+    timed(|| {
+        black_box(hot_build_opts(src, sl, dst, dl, intent, bpc));
+    });
+}
+
+fn parse(bytes: &[u8]) {
+    let out = hot_parse_encode(bytes);
+    println!("bytes {} fnv {:016x}", out.len(), fnv(out.iter().copied()));
+    timed(|| {
+        black_box(hot_parse_encode(bytes));
+    });
+}
+
+const MODES: &str = "p3u8 p3u16 fogu8 fog16 labf32 labinf32 build3 build4 parse \
+p3f32 lin2020f32 fogf32 fogrgbf32 v4f32 v4inf32 prof32 toprof32 prooff32 \
+grayu8 togray16 prou8 v4u8 cgatsu8 labu8 lab16in proofu8 gamutu8 \
+smallp3u8 smallfogu8 smallfog16 smallp3f32 \
+buildp3 buildgray buildlab buildv4 buildproof buildbpc first16 parsev4";
+
+#[allow(clippy::too_many_lines)]
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
     let srgb = Profile::new_srgb();
     let p3 = Profile::new_display_p3();
     let lab = Profile::new_lab_identity();
+    let (rgb, cmyk, gray, labl) = (Layout::Rgb, Layout::Cmyk, Layout::Gray, Layout::Lab);
     match mode.as_str() {
-        "p3u8" => run_u8(&srgb, Layout::Rgb, &p3, Layout::Rgb),
-        "p3u16" => run_u16(&srgb, Layout::Rgb, &p3, Layout::Rgb),
-        "fogu8" => run_u8(&srgb, Layout::Rgb, &fogra(), Layout::Cmyk),
-        "fog16" => run_u16(&fogra(), Layout::Cmyk, &srgb, Layout::Rgb),
-        "labf32" => run_f32(&srgb, Layout::Rgb, &lab, Layout::Lab, false),
-        "labinf32" => run_f32(&lab, Layout::Lab, &srgb, Layout::Rgb, true),
-        "build3" | "build4" => {
-            let f = fogra();
-            let t = if mode == "build3" {
-                hot_build(&srgb, Layout::Rgb, &f, Layout::Cmyk)
-            } else {
-                hot_build(&f, Layout::Cmyk, &srgb, Layout::Rgb)
-            };
-            // Anchor: the transform's output on a fixed ramp.
-            let n = if mode == "build3" { 3 } else { 4 };
-            let s: Vec<u16> = (0..n * 64).map(|i| (i * 1031 % 65536) as u16).collect();
-            let mut o = vec![0u16; 64 * if mode == "build3" { 4 } else { 3 }];
-            t.transform(&s, &mut o).unwrap();
-            println!(
-                "pixels 64 fnv {:016x}",
-                fnv(o.iter().flat_map(|v| v.to_le_bytes()))
-            );
-        }
+        // The nine workloads of the 0.1.0 -> 0.1.1 pass.
+        "p3u8" => run_u8(&srgb, rgb, &p3, rgb),
+        "p3u16" => run_u16(&srgb, rgb, &p3, rgb),
+        "fogu8" => run_u8(&srgb, rgb, &fogra(), cmyk),
+        "fog16" => run_u16(&fogra(), cmyk, &srgb, rgb),
+        "labf32" => run_f32(&srgb, rgb, &lab, labl, false),
+        "labinf32" => run_f32(&lab, labl, &srgb, rgb, true),
+        "build3" => build(&srgb, rgb, &fogra(), cmyk),
+        "build4" => build(&fogra(), cmyk, &srgb, rgb),
         "parse" => {
             let path = std::env::var("RUSTY_ICC_FOGRA39").expect("RUSTY_ICC_FOGRA39");
-            let bytes = std::fs::read(path).unwrap();
-            let out = hot_parse_encode(&bytes);
-            println!("bytes {} fnv {:016x}", out.len(), fnv(out.iter().copied()));
+            parse(&std::fs::read(path).unwrap());
         }
-        _ => eprintln!("modes: p3u8 p3u16 fogu8 fog16 labf32 labinf32 build3 build4 parse"),
+        // f32, exact pipeline.
+        "p3f32" => run_f32(&srgb, rgb, &p3, rgb, false),
+        "lin2020f32" => run_f32(&srgb, rgb, &linear_rec2020(), rgb, false),
+        "fogf32" => run_f32(&srgb, rgb, &fogra(), cmyk, false),
+        "fogrgbf32" => run_f32(&fogra(), cmyk, &srgb, rgb, false),
+        "v4f32" => run_f32(&srgb, rgb, &data(V4_PREF), rgb, false),
+        "v4inf32" => run_f32(&data(V4_PREF), rgb, &srgb, rgb, false),
+        "prof32" => run_f32(&data(PROPHOTO_V2), rgb, &srgb, rgb, false),
+        "toprof32" => run_f32(&srgb, rgb, &data(PROPHOTO_V2), rgb, false),
+        "prooff32" => tr_f32(&proofing(&srgb, &fogra(), &srgb), false),
+        // Integer: matrix-shaper (grey, sampled curves) and grids.
+        "grayu8" => run_u8(&data(GREY_V4), gray, &srgb, rgb),
+        "togray16" => run_u16(&srgb, rgb, &data(GREY_V4), gray),
+        "prou8" => run_u8(&data(PROPHOTO_V2), rgb, &srgb, rgb),
+        "v4u8" => run_u8(&srgb, rgb, &data(V4_PREF), rgb),
+        "cgatsu8" => run_u8(&data(CGATS_V2), cmyk, &srgb, rgb),
+        "labu8" => run_u8(&srgb, rgb, &lab, labl),
+        "lab16in" => run_u16(&lab, labl, &srgb, rgb),
+        "proofu8" => tr_u8(&proofing(&srgb, &fogra(), &srgb)),
+        "gamutu8" => {
+            let g = GamutCheck::new(
+                &srgb,
+                rgb,
+                &fogra(),
+                Intent::RelativeColorimetric,
+                Options::default(),
+                2.0,
+            )
+            .unwrap();
+            let s = src_u8(3);
+            let mut o = vec![0f64; SIDE * SIDE];
+            hot_gamut_u8(&g, &s, &mut o);
+            println!(
+                "pixels {} fnv {:016x}",
+                SIDE * SIDE,
+                fnv(o.iter().flat_map(|v| v.to_le_bytes()))
+            );
+            timed(|| hot_gamut_u8(&g, &s, &mut o));
+        }
+        // The same image as 1024 calls of 64 pixels.
+        "smallp3u8" => small_u8(&srgb, rgb, &p3, rgb),
+        "smallfogu8" => small_u8(&srgb, rgb, &fogra(), cmyk),
+        "smallfog16" => small_u16(&fogra(), cmyk, &srgb, rgb),
+        "smallp3f32" => small_f32(&srgb, rgb, &p3, rgb),
+        // Transform::new.
+        "buildp3" => build(&srgb, rgb, &p3, rgb),
+        "buildgray" => build(&data(GREY_V4), gray, &srgb, rgb),
+        "buildlab" => build(&srgb, rgb, &lab, labl),
+        "buildv4" => build(&srgb, rgb, &data(V4_PREF), rgb),
+        "buildproof" => {
+            let f = fogra();
+            build_anchor(&hot_build_proof(&srgb, &f, &srgb));
+            timed(|| {
+                black_box(hot_build_proof(&srgb, &f, &srgb));
+            });
+        }
+        "buildbpc" => build_opts(&srgb, rgb, &fogra(), cmyk, Intent::Perceptual, true),
+        "first16" => {
+            let s: Vec<u16> = (0..3 * SMALL).map(|i| (i * 1031 % 65536) as u16).collect();
+            let mut o = vec![0u16; 3 * SMALL];
+            hot_first16(&srgb, &p3, &s, &mut o);
+            println!(
+                "pixels {SMALL} fnv {:016x}",
+                fnv(o.iter().flat_map(|v| v.to_le_bytes()))
+            );
+            timed(|| hot_first16(&srgb, &p3, &s, &mut o));
+        }
+        "parsev4" => parse(V4_PREF),
+        _ => eprintln!("modes: {MODES}"),
     }
 }

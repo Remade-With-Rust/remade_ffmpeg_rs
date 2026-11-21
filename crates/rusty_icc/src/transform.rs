@@ -3,10 +3,10 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::color::delta_e_2000;
-use crate::curve::clamp01;
+use crate::curve::InvCurve;
 use crate::error::{Error, Result};
-use crate::lut::ClutEval;
-use crate::pipeline::{build_chain, Chain, GamutChain, ShaperLink};
+use crate::lut::{ClutEval, FixedClut};
+use crate::pipeline::{build_chain, Chain, GamutChain, ShaperChain, ShaperLink};
 use crate::profile::{ColorSpace, Profile};
 
 /// ICC rendering intent.
@@ -134,6 +134,39 @@ pub trait Sample: Copy + Send + Sync + 'static + sealed::Sealed {
     fn opaque() -> Self;
     #[doc(hidden)]
     fn index(self) -> usize;
+    /// The slice as `f32` samples, when that is what it holds.
+    #[doc(hidden)]
+    fn f32s(s: &[Self]) -> Option<&[f32]> {
+        let _ = s;
+        None
+    }
+    #[doc(hidden)]
+    fn f32s_mut(s: &mut [Self]) -> Option<&mut [f32]> {
+        let _ = s;
+        None
+    }
+    /// The slice as `u8` samples, when that is what it holds.
+    #[doc(hidden)]
+    fn u8s(s: &[Self]) -> Option<&[u8]> {
+        let _ = s;
+        None
+    }
+    #[doc(hidden)]
+    fn u8s_mut(s: &mut [Self]) -> Option<&mut [u8]> {
+        let _ = s;
+        None
+    }
+    /// The slice as `u16` samples, when that is what it holds.
+    #[doc(hidden)]
+    fn u16s(s: &[Self]) -> Option<&[u16]> {
+        let _ = s;
+        None
+    }
+    #[doc(hidden)]
+    fn u16s_mut(s: &mut [Self]) -> Option<&mut [u16]> {
+        let _ = s;
+        None
+    }
 }
 
 impl Sample for u8 {
@@ -143,13 +176,24 @@ impl Sample for u8 {
         f64::from(self) / 255.0
     }
     fn from_unit(v: f64) -> Self {
-        (clamp01(v) * 255.0 + 0.5) as Self
+        // No `clamp01(v)` first: the float-to-integer cast saturates and
+        // maps NaN to 0, so every `v` gives the value the clamped form gave
+        // (`v >= 1` lands at or above 255.5 and `v < 0` below 0.5, which
+        // truncate or saturate to the same ends; proven over a sweep in
+        // `from_unit_matches_the_clamped_form`).
+        (v * 255.0 + 0.5) as Self
     }
     fn opaque() -> Self {
         Self::MAX
     }
     fn index(self) -> usize {
         usize::from(self)
+    }
+    fn u8s(s: &[Self]) -> Option<&[u8]> {
+        Some(s)
+    }
+    fn u8s_mut(s: &mut [Self]) -> Option<&mut [u8]> {
+        Some(s)
     }
 }
 
@@ -160,13 +204,20 @@ impl Sample for u16 {
         f64::from(self) / 65535.0
     }
     fn from_unit(v: f64) -> Self {
-        (clamp01(v) * 65535.0 + 0.5) as Self
+        // As for `u8`: the saturating cast already does the clamp's job.
+        (v * 65535.0 + 0.5) as Self
     }
     fn opaque() -> Self {
         Self::MAX
     }
     fn index(self) -> usize {
         usize::from(self)
+    }
+    fn u16s(s: &[Self]) -> Option<&[u16]> {
+        Some(s)
+    }
+    fn u16s_mut(s: &mut [Self]) -> Option<&mut [u16]> {
+        Some(s)
     }
 }
 
@@ -185,6 +236,12 @@ impl Sample for f32 {
     fn index(self) -> usize {
         0
     }
+    fn f32s(s: &[Self]) -> Option<&[f32]> {
+        Some(s)
+    }
+    fn f32s_mut(s: &mut [Self]) -> Option<&mut [f32]> {
+        Some(s)
+    }
 }
 
 /// Entries of the inverse-curve output tables, indexed by `sqrt(linear)`
@@ -201,23 +258,49 @@ struct ShaperEngine {
     in8: Box<[f32]>,
     in16: OnceLock<Box<[f32]>>,
     out: Box<[[f32; OUT_TABLE]]>,
+    /// For a one-channel 8-bit source: the colour values the loop writes for
+    /// every input byte (first `GREY_OUT` of each entry), from [`Self::run`]
+    /// over a ramp, so a lookup gives exactly what the loop gives. Built by
+    /// the first call with at least 256 pixels.
+    grey8: OnceLock<Box<[[u8; 3]; 256]>>,
 }
 
 impl ShaperEngine {
     fn table(link: &ShaperLink, n: usize) -> Box<[f32]> {
-        link.in_curves
-            .iter()
-            .flat_map(|c| (0..n).map(move |i| c.eval(i as f64 / (n - 1) as f64) as f32))
-            .collect()
+        let curves = &link.in_curves;
+        let mut table = Vec::with_capacity(curves.len() * n);
+        for (k, c) in curves.iter().enumerate() {
+            // The channels of an RGB profile nearly always share one curve:
+            // the same curve gives the same values, so its row is copied.
+            if let Some(j) = curves[..k].iter().position(|p| p.same_as(c)) {
+                table.extend_from_within(j * n..(j + 1) * n);
+            } else {
+                table.extend((0..n).map(|i| c.eval(i as f64 / (n - 1) as f64) as f32));
+            }
+        }
+        table.into_boxed_slice()
     }
 
     fn new(link: ShaperLink) -> Self {
         let in8 = Self::table(&link, 256);
         let mut out = vec![[0.0f32; OUT_TABLE]; link.out_curves.len()].into_boxed_slice();
-        for (row, c) in out.iter_mut().zip(&link.out_curves) {
+        for (k, c) in link.out_curves.iter().enumerate() {
+            let (done, rest) = out.split_at_mut(k);
+            let row = &mut rest[0];
+            // As for the input tables: the same curve's row is copied.
+            if let Some(j) = link.out_curves[..k].iter().position(|p| p.same_as(c)) {
+                *row = done[j];
+                continue;
+            }
+            // The same values either way; the prepared form skips a `pow`
+            // per entry for sRGB-shaped curves.
+            let prepared = InvCurve::new(c);
             for (i, v) in row.iter_mut().enumerate() {
                 let t = i as f64 / (OUT_TABLE - 1) as f64;
-                *v = c.eval_inverse(t * t) as f32;
+                let y = t * t;
+                *v = prepared
+                    .as_ref()
+                    .map_or_else(|| c.eval_inverse(y), |p| p.eval(y)) as f32;
             }
         }
         let m = link.m.map(|r| r.map(|v| v as f32));
@@ -229,7 +312,61 @@ impl ShaperEngine {
             in8,
             in16: OnceLock::new(),
             out,
+            grey8: OnceLock::new(),
         }
+    }
+
+    /// [`Self::run_loop`] for one 8-bit colour channel in and `k` out (`k` as
+    /// the caller dispatches: 3 for three output channels, 1 otherwise), through
+    /// [`ShaperEngine::grey8`]. `false`, with nothing done, while the table
+    /// is not built and `src` has fewer than 256 pixels (building it costs
+    /// 256 pixels of the loop).
+    #[allow(clippy::too_many_arguments)]
+    fn run_grey8(
+        &self,
+        src: &[u8],
+        dst: &mut [u8],
+        sc: usize,
+        dc: usize,
+        src_alpha: bool,
+        dst_alpha: bool,
+        k: usize,
+    ) -> bool {
+        let table = match self.grey8.get() {
+            Some(t) => t,
+            None if src.len() / sc >= 256 => self.grey8.get_or_init(|| {
+                let ramp: [u8; 256] = core::array::from_fn(|v| v as u8);
+                let mut flat = [0u8; 768];
+                let mut t = Box::new([[0u8; 3]; 256]);
+                if k == 3 {
+                    self.run_loop::<u8, 1, 3>(&self.in8, &ramp, &mut flat, 1, 3, false, false);
+                    for (row, v) in t.iter_mut().zip(flat.chunks_exact(3)) {
+                        row.copy_from_slice(v);
+                    }
+                } else {
+                    self.run_loop::<u8, 1, 1>(
+                        &self.in8,
+                        &ramp,
+                        &mut flat[..256],
+                        1,
+                        1,
+                        false,
+                        false,
+                    );
+                    for (row, v) in t.iter_mut().zip(&flat[..256]) {
+                        row[0] = *v;
+                    }
+                }
+                t
+            }),
+            None => return false,
+        };
+        if k == 3 {
+            grey8_loop::<3>(table, src, dst, sc, dc, src_alpha, dst_alpha);
+        } else {
+            grey8_loop::<1>(table, src, dst, sc, dc, src_alpha, dst_alpha);
+        }
+        true
     }
 
     fn in16(&self) -> &[f32] {
@@ -250,10 +387,36 @@ impl ShaperEngine {
         table[i] + (table[i + 1] - table[i]) * f
     }
 
+    /// The integer path: [`Self::run_loop`], or for one 8-bit channel in
+    /// its table ([`Self::run_grey8`]).
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn run<T: Sample, const IN: usize, const OUT: usize>(
+        &self,
+        tables: &[f32],
+        src: &[T],
+        dst: &mut [T],
+        sc: usize,
+        dc: usize,
+        src_alpha: bool,
+        dst_alpha: bool,
+    ) {
+        if IN == 1 {
+            if let Some(s) = T::u8s(src) {
+                if let Some(d) = T::u8s_mut(dst) {
+                    if self.run_grey8(s, d, sc, dc, src_alpha, dst_alpha, OUT) {
+                        return;
+                    }
+                }
+            }
+        }
+        self.run_loop::<T, IN, OUT>(tables, src, dst, sc, dc, src_alpha, dst_alpha);
+    }
+
     /// The integer hot loop, monomorphised on the colour channel counts so
     /// every per-channel index is a constant.
     #[allow(clippy::too_many_arguments)]
-    fn run<T: Sample, const IN: usize, const OUT: usize>(
+    fn run_loop<T: Sample, const IN: usize, const OUT: usize>(
         &self,
         tables: &[f32],
         src: &[T],
@@ -399,19 +562,7 @@ impl Transform {
             Engine::Shaper(ShaperEngine::new(link))
         } else {
             let g = grid_points(chain.in_ch);
-            let total = (0..chain.in_ch).fold(1usize, |a, _| a * g);
-            let mut data = Vec::with_capacity(total * chain.out_ch);
-            let mut input = [0.0f64; 16];
-            let mut out = [0.0f64; 16];
-            for idx in 0..total {
-                let mut rem = idx;
-                for c in (0..chain.in_ch).rev() {
-                    input[c] = (rem % g) as f64 / (g - 1) as f64;
-                    rem /= g;
-                }
-                chain.eval(&input, &mut out);
-                data.extend(out[..chain.out_ch].iter().map(|&v| v as f32));
-            }
+            let data = chain.sample_grid(g);
             Engine::Grid(ClutEval::from_f32(vec![g; chain.in_ch], chain.out_ch, data))
         };
         Ok(Self {
@@ -474,11 +625,36 @@ impl Transform {
                 }
             }
             (Engine::Grid(g), SampleKind::U8 | SampleKind::U16) => {
-                run_grid(g, src, dst, (sc, dc, in_ch, out_ch), (src_alpha, dst_alpha));
+                let (ch, alpha) = ((sc, dc, in_ch, out_ch), (src_alpha, dst_alpha));
+                if let Some(s) = T::u8s(src) {
+                    if let Some(d) = T::u8s_mut(dst) {
+                        run_grid_u8(g, s, d, ch, alpha);
+                        return Ok(());
+                    }
+                }
+                if let Some(s) = T::u16s(src) {
+                    if let Some(d) = T::u16s_mut(dst) {
+                        run_grid_u16(g, s, d, ch, alpha);
+                        return Ok(());
+                    }
+                }
+                run_grid(g, src, dst, ch, alpha);
             }
             _ => {
                 let src_lab = self.src_layout.is_lab();
                 let dst_lab = self.dst_layout.is_lab();
+                if let Some(s) = T::f32s(src) {
+                    if let Some(d) = T::f32s_mut(dst) {
+                        let alpha = (src_alpha, dst_alpha);
+                        if let Some(f) = self.chain.as_shaper() {
+                            run_shaper_f32(&f, s, d, (sc, dc), alpha);
+                        } else {
+                            let ch = (sc, dc, in_ch, out_ch);
+                            run_chain_f32(&self.chain, s, d, ch, alpha, (src_lab, dst_lab));
+                        }
+                        return Ok(());
+                    }
+                }
                 let mut input = [0.0f64; 16];
                 let mut out = [0.0f64; 16];
                 for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
@@ -506,6 +682,233 @@ impl Transform {
             }
         }
         Ok(())
+    }
+}
+
+/// The loop of [`ShaperEngine::run_grey8`]: `K` colour values per pixel from
+/// the table, the alpha channel as [`ShaperEngine::run`] writes it.
+#[allow(clippy::too_many_arguments)]
+fn grey8_loop<const K: usize>(
+    table: &[[u8; 3]; 256],
+    src: &[u8],
+    dst: &mut [u8],
+    sc: usize,
+    dc: usize,
+    src_alpha: bool,
+    dst_alpha: bool,
+) {
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let row = &table[usize::from(sp[0])];
+        dp[..K].copy_from_slice(&row[..K]);
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { u8::MAX };
+        }
+    }
+}
+
+/// `f32` pixels between two RGB matrix/TRC profiles. Not generic, so the
+/// whole per-pixel body (curves, matrices, inverse curves) is compiled here
+/// as one loop instead of a call into the op interpreter per pixel.
+fn run_shaper_f32(
+    f: &ShaperChain<'_>,
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) {
+    // sRGB-shaped curves at both ends: their own loop, with the curve
+    // arithmetic in line. Each loop in its own frame, so the general one
+    // keeps the code it had (one shared frame cost every other pair of
+    // curves 3 Ir per pixel, the general loop after the test in its frame
+    // 1 Ir per pixel).
+    if !run_segments_f32(f, src, dst, (sc, dc), (src_alpha, dst_alpha)) {
+        run_curves_f32(f, src, dst, (sc, dc), (src_alpha, dst_alpha));
+    }
+}
+
+/// [`run_shaper_f32`] for any curves.
+#[inline(never)]
+fn run_curves_f32(
+    f: &ShaperChain<'_>,
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) {
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let out = f.eval([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]);
+        dp[0] = out[0] as f32;
+        dp[1] = out[1] as f32;
+        dp[2] = out[2] as f32;
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
+}
+
+/// [`run_shaper_f32`] when the chain is a [`SegChain`] (`true`); `false`,
+/// with nothing done, otherwise.
+#[inline(never)]
+fn run_segments_f32(
+    f: &ShaperChain<'_>,
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) -> bool {
+    let Some(seg) = f.segments() else {
+        return false;
+    };
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let out = seg.eval([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]);
+        dp[0] = out[0] as f32;
+        dp[1] = out[1] as f32;
+        dp[2] = out[2] as f32;
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
+    true
+}
+
+/// `f32` pixels through the exact pipeline. Not generic, so the loop is
+/// compiled here, on one zero-tailed array per pixel that the chain works on
+/// in place; the generic loop is compiled in the caller's crate and pays a
+/// call and two 128-byte copies per pixel.
+fn run_chain_f32(
+    chain: &Chain,
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc, in_ch, out_ch): (usize, usize, usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+    (src_lab, dst_lab): (bool, bool),
+) {
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let mut v = [0.0f64; 16];
+        for c in 0..in_ch {
+            v[c] = f64::from(sp[c]);
+        }
+        if src_lab {
+            v[0] /= 100.0;
+            v[1] = (v[1] + 128.0) / 255.0;
+            v[2] = (v[2] + 128.0) / 255.0;
+        }
+        chain.eval_in_place(&mut v);
+        if dst_lab {
+            v[0] *= 100.0;
+            v[1] = v[1] * 255.0 - 128.0;
+            v[2] = v[2] * 255.0 - 128.0;
+        }
+        for c in 0..out_ch {
+            dp[c] = v[c] as f32;
+        }
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
+}
+
+/// Every 8-bit value's `(cell, fraction)` on a grid axis.
+type AxisTable = [(usize, f64); 256];
+
+/// The 8-bit device-link grid loop. Not generic, so it is compiled here, with
+/// the lookup in line, instead of in the crate of the caller with a call
+/// into the library per pixel.
+fn run_grid_u8(
+    g: &ClutEval,
+    src: &[u8],
+    dst: &mut [u8],
+    ch: (usize, usize, usize, usize),
+    alpha: (bool, bool),
+) {
+    if !fixed_shape(g, ch.2, ch.3) {
+        return run_grid(g, src, dst, ch, alpha);
+    }
+    // The (cell, fraction) of every 8-bit value, by the expressions wider
+    // samples use per value, once per call instead of per pixel.
+    let points = g.points(0);
+    let table: AxisTable = core::array::from_fn(|v| ClutEval::axis(points, (v as u8).to_unit()));
+    grid_shaped(g, src, dst, ch, alpha, |_, v| table[usize::from(v)]);
+}
+
+/// The 16-bit device-link grid loop, likewise.
+fn run_grid_u16(
+    g: &ClutEval,
+    src: &[u16],
+    dst: &mut [u16],
+    ch: (usize, usize, usize, usize),
+    alpha: (bool, bool),
+) {
+    if !grid_shaped(g, src, dst, ch, alpha, |points, v| {
+        ClutEval::axis(points, v.to_unit())
+    }) {
+        run_grid(g, src, dst, ch, alpha);
+    }
+}
+
+/// `true` when [`grid_shaped`] has a loop for this grid.
+fn fixed_shape(g: &ClutEval, in_ch: usize, out_ch: usize) -> bool {
+    match (in_ch, out_ch) {
+        (3, 3) => g.fixed::<3, 3>().is_some(),
+        (3, 4) => g.fixed::<3, 4>().is_some(),
+        (4, 3) => g.fixed::<4, 3>().is_some(),
+        (4, 4) => g.fixed::<4, 4>().is_some(),
+        _ => false,
+    }
+}
+
+/// Runs the loop for the shape of the grid when there is one with fixed
+/// channel counts (RGB, Lab or CMYK in and out); `false`, with nothing
+/// done, otherwise. `cell(points, sample)` is the `(cell, fraction)` of a
+/// sample on an axis of that many grid points.
+#[inline(always)]
+fn grid_shaped<T: Sample, C: Fn(usize, T) -> (usize, f64) + Copy>(
+    g: &ClutEval,
+    src: &[T],
+    dst: &mut [T],
+    (sc, dc, in_ch, out_ch): (usize, usize, usize, usize),
+    alpha: (bool, bool),
+    cell: C,
+) -> bool {
+    macro_rules! shape {
+        ($i:literal, $o:literal) => {
+            if let Some(f) = g.fixed::<$i, $o>() {
+                grid_fixed::<T, $i, $o, C>(&f, src, dst, (sc, dc), alpha, cell);
+                return true;
+            }
+        };
+    }
+    match (in_ch, out_ch) {
+        (3, 3) => shape!(3, 3),
+        (3, 4) => shape!(3, 4),
+        (4, 3) => shape!(4, 3),
+        (4, 4) => shape!(4, 4),
+        _ => {}
+    }
+    false
+}
+
+/// The grid loop for `IN` colour channels in and `OUT` out: the same
+/// lookups and conversions as [`run_grid`], with every per-channel index a
+/// constant and the shape of the CLUT settled before the loop.
+fn grid_fixed<T: Sample, const IN: usize, const OUT: usize, C: Fn(usize, T) -> (usize, f64)>(
+    f: &FixedClut<'_, IN, OUT>,
+    src: &[T],
+    dst: &mut [T],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+    cell: C,
+) {
+    let mut out = [0.0f64; 16];
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let cells: [(usize, f64); IN] = core::array::from_fn(|c| cell(f.points(c), sp[c]));
+        f.at(&cells, &mut out);
+        for c in 0..OUT {
+            dp[c] = T::from_unit(out[c]);
+        }
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { T::opaque() };
+        }
     }
 }
 
@@ -648,5 +1051,245 @@ impl GamutCheck {
             *o = v > self.threshold;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fixed-shape grid loops against the general one, on a synthetic
+    /// device-link grid: every shape, both integer widths, with and without
+    /// alpha on either side.
+    #[test]
+    fn fixed_grid_loops_match_the_general_loop() {
+        fn noise(n: usize, seed: u64) -> Vec<u16> {
+            let mut s = seed;
+            (0..n)
+                .map(|i| {
+                    s = s
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    // Grid points and both ends among the noise.
+                    match i % 7 {
+                        0 => 0,
+                        1 => 65535,
+                        2 => 0x8080,
+                        _ => (s >> 40) as u16,
+                    }
+                })
+                .collect()
+        }
+        for (in_ch, out_ch) in [(3usize, 3usize), (3, 4), (4, 3), (4, 4), (1, 3), (3, 1)] {
+            let g = 5usize;
+            let total = g.pow(in_ch as u32) * out_ch;
+            let data: Vec<f32> = (0..total)
+                .map(|i| ((i * 7919 + 13) % 1009) as f32 / 1008.0)
+                .collect();
+            let clut = ClutEval::from_f32(vec![g; in_ch], out_ch, data);
+            assert_eq!(fixed_shape(&clut, in_ch, out_ch), in_ch > 1 && out_ch > 1);
+            for (src_alpha, dst_alpha) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let (sc, dc) = (
+                    in_ch + usize::from(src_alpha),
+                    out_ch + usize::from(dst_alpha),
+                );
+                let ch = (sc, dc, in_ch, out_ch);
+                let alpha = (src_alpha, dst_alpha);
+                let src16 = noise(sc * 400, 7 + sc as u64);
+                let src8: Vec<u8> = src16.iter().map(|v| (v >> 8) as u8).collect();
+                let (mut a8, mut b8) = (vec![1u8; dc * 400], vec![2u8; dc * 400]);
+                run_grid_u8(&clut, &src8, &mut a8, ch, alpha);
+                run_grid(&clut, &src8, &mut b8, ch, alpha);
+                assert_eq!(a8, b8, "u8 {in_ch}->{out_ch} {alpha:?}");
+                let (mut a16, mut b16) = (vec![1u16; dc * 400], vec![2u16; dc * 400]);
+                run_grid_u16(&clut, &src16, &mut a16, ch, alpha);
+                run_grid(&clut, &src16, &mut b16, ch, alpha);
+                assert_eq!(a16, b16, "u16 {in_ch}->{out_ch} {alpha:?}");
+            }
+        }
+    }
+
+    /// The `f32` loops against the per-colour reference: [`Chain::eval`] on
+    /// a zero-tailed array, with the Lab scaling and the alpha rule of the
+    /// documented layouts.
+    #[test]
+    fn f32_loops_match_chain_eval_bit_for_bit() {
+        let srgb = Profile::new_srgb();
+        let p3 = Profile::new_display_p3();
+        let lab = Profile::new_lab_identity();
+        let gray = Profile::new_gray(crate::color::D65_XY, crate::Curve::gamma(2.2));
+        let vals = [
+            -0.5f32,
+            0.0,
+            0.001,
+            0.2,
+            0.5,
+            0.999,
+            1.0,
+            1.5,
+            37.0,
+            -90.0,
+            f32::NAN,
+        ];
+        for (a, al, b, bl) in [
+            (&srgb, Layout::Rgb, &p3, Layout::Rgba),
+            (&srgb, Layout::Rgba, &p3, Layout::Rgb),
+            (&srgb, Layout::Rgba, &lab, Layout::Laba),
+            (&lab, Layout::Lab, &srgb, Layout::Rgba),
+            (&gray, Layout::GrayAlpha, &srgb, Layout::Rgb),
+            (&srgb, Layout::Rgb, &gray, Layout::GrayAlpha),
+        ] {
+            let intent = Intent::RelativeColorimetric;
+            let t = Transform::new(a, al, b, bl, intent, Options::default()).unwrap();
+            let (sc, dc) = (al.channels(), bl.channels());
+            let (ic, oc) = (al.color_channels(), bl.color_channels());
+            let mut src = Vec::new();
+            for i in 0..vals.len() * vals.len() {
+                for c in 0..sc {
+                    src.push(vals[(i / vals.len().pow((c % 2) as u32) + 3 * c) % vals.len()]);
+                }
+            }
+            let mut dst = vec![-7.0f32; src.len() / sc * dc];
+            t.transform(&src, &mut dst).unwrap();
+            for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact(dc)) {
+                let mut input = [0.0f64; 16];
+                for c in 0..ic {
+                    input[c] = f64::from(sp[c]);
+                }
+                if al.is_lab() {
+                    input[0] /= 100.0;
+                    input[1] = (input[1] + 128.0) / 255.0;
+                    input[2] = (input[2] + 128.0) / 255.0;
+                }
+                let mut out = [0.0f64; 16];
+                t.chain.eval(&input, &mut out);
+                if bl.is_lab() {
+                    out[0] *= 100.0;
+                    out[1] = out[1] * 255.0 - 128.0;
+                    out[2] = out[2] * 255.0 - 128.0;
+                }
+                for c in 0..oc {
+                    assert_eq!(dp[c].to_bits(), (out[c] as f32).to_bits(), "{al:?} {bl:?}");
+                }
+                if bl.has_alpha() {
+                    let want = if al.has_alpha() { sp[sc - 1] } else { 1.0 };
+                    assert_eq!(dp[dc - 1].to_bits(), want.to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn from_unit_matches_the_clamped_form() {
+        use crate::curve::clamp01;
+        // The form released in 0.1.1, clamp first.
+        let old8 = |v: f64| (clamp01(v) * 255.0 + 0.5) as u8;
+        let old16 = |v: f64| (clamp01(v) * 65535.0 + 0.5) as u16;
+        let mut vs = vec![
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -0.0,
+            0.0,
+            1.0,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            1.0 - f64::EPSILON,
+            1.0 + f64::EPSILON,
+            -1.0,
+            -1.0e300,
+            1.0e300,
+            0.5 / 255.0,
+            254.5 / 255.0,
+            65534.5 / 65535.0,
+        ];
+        // A dense sweep past both ends and every rounding boundary of both
+        // widths with its two neighbours.
+        vs.extend((-2000..=12_000).map(|i| f64::from(i) / 10_000.0));
+        for k in 0..=65535u32 {
+            let b = (f64::from(k) + 0.5) / 65535.0;
+            vs.extend([
+                b,
+                f64::from_bits(b.to_bits() - 1),
+                f64::from_bits(b.to_bits() + 1),
+            ]);
+        }
+        for k in 0..=255u32 {
+            let b = (f64::from(k) + 0.5) / 255.0;
+            vs.extend([
+                b,
+                f64::from_bits(b.to_bits() - 1),
+                f64::from_bits(b.to_bits() + 1),
+            ]);
+        }
+        for v in vs {
+            assert_eq!(<u8 as Sample>::from_unit(v), old8(v), "u8 at {v:e}");
+            assert_eq!(<u16 as Sample>::from_unit(v), old16(v), "u16 at {v:e}");
+        }
+    }
+
+    /// The grey 8-bit output table against the engine's loop: every byte, with
+    /// and without alpha on either side, one and three output channels, and
+    /// the small-call path that does not build the table.
+    #[test]
+    fn grey8_table_matches_the_shaper_loop() {
+        let grey = Profile::new_gray(crate::color::D65_XY, crate::curve::Curve::gamma(1.8));
+        let srgb = Profile::new_srgb();
+        for (src_layout, dst_layout) in [
+            (Layout::Gray, Layout::Rgb),
+            (Layout::GrayAlpha, Layout::Rgba),
+            (Layout::Gray, Layout::Rgba),
+            (Layout::GrayAlpha, Layout::Rgb),
+            (Layout::Gray, Layout::Gray),
+            (Layout::GrayAlpha, Layout::GrayAlpha),
+        ] {
+            let (from, to) = if dst_layout.color_channels() == 3 {
+                (&grey, &srgb)
+            } else {
+                (&grey, &grey)
+            };
+            let t = Transform::new(
+                from,
+                src_layout,
+                to,
+                dst_layout,
+                Intent::Perceptual,
+                Options::default(),
+            )
+            .unwrap();
+            let Engine::Shaper(e) = &t.engine else {
+                panic!("matrix-shaper expected");
+            };
+            let (sc, dc) = (src_layout.channels(), dst_layout.channels());
+            let k = if dst_layout.color_channels() == 3 {
+                3
+            } else {
+                1
+            };
+            let src: Vec<u8> = (0..300 * sc).map(|i| (i * 37 % 256) as u8).collect();
+            let (sa, da) = (src_layout.has_alpha(), dst_layout.has_alpha());
+            let mut want = vec![7u8; 300 * dc];
+            if k == 3 {
+                e.run_loop::<u8, 1, 3>(&e.in8, &src, &mut want, sc, dc, sa, da);
+            } else {
+                e.run_loop::<u8, 1, 1>(&e.in8, &src, &mut want, sc, dc, sa, da);
+            }
+            // Fewer than 256 pixels and no table yet: declined.
+            let mut got = vec![7u8; 255 * dc];
+            assert!(!e.run_grey8(&src[..255 * sc], &mut got, sc, dc, sa, da, k));
+            assert!(e.grey8.get().is_none());
+            let mut got = vec![7u8; 300 * dc];
+            assert!(e.run_grey8(&src, &mut got, sc, dc, sa, da, k));
+            assert_eq!(got, want, "{src_layout:?} -> {dst_layout:?}");
+            // Built: small calls take it too, and the public path agrees.
+            let mut got = vec![7u8; 3 * dc];
+            assert!(e.run_grey8(&src[..3 * sc], &mut got, sc, dc, sa, da, k));
+            assert_eq!(got, want[..3 * dc]);
+            let mut got = vec![7u8; 300 * dc];
+            t.transform(&src, &mut got).unwrap();
+            assert_eq!(got, want);
+        }
     }
 }
