@@ -425,7 +425,8 @@ struct NodeData {
 pub(crate) struct Document<'x> {
     nodes: Vec<NodeData>,
     attrs: Vec<Attr<'x>>,
-    links: HashMap<Box<str>, NodeId>,
+    /// Element ids, borrowed from the XML text like the attribute values.
+    links: HashMap<&'x str, NodeId>,
 }
 
 /// A borrowed node handle.
@@ -935,18 +936,16 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document<'_>, Error>
     b.rule_index = css::RuleIndex::new(&b.sheet);
     b.parse_node(root_el, None, NodeId(0), false, 0)?;
 
-    // No more ids than the XML had: sized once.
+    // No more ids than the XML had: sized once. An `id` only ever comes from
+    // an XML attribute (it is not a presentation attribute, and `inherit`
+    // copies the parent's), so every one is borrowed text.
     let mut links = HashMap::with_capacity(b.id_map.len());
     for (i, n) in b.doc.nodes.iter().enumerate() {
-        if n.tag.is_none() {
+        if n.tag.is_none() || !n.own.contains(AId::Id) {
             continue;
         }
-        let node = SvgNode {
-            id: NodeId(i as u32),
-            doc: &b.doc,
-        };
-        if let Some(id) = node.attribute(AId::Id) {
-            links.entry(id.into()).or_insert(NodeId(i as u32));
+        if let Some(Value::Xml(id)) = b.doc.value(NodeId(i as u32), AId::Id) {
+            links.entry(*id).or_insert(NodeId(i as u32));
         }
     }
     b.doc.links = links;
