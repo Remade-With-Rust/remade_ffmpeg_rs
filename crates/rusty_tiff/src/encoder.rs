@@ -411,6 +411,89 @@ impl<W: Write + Seek> TiffEncoder<W> {
     }
 }
 
+/// Where one plane's chunk, or a chunk of packed sub-byte rows, sits in the
+/// image.
+struct ChunkGeom {
+    /// First column and row of the chunk.
+    x0: usize,
+    y0: usize,
+    /// The plane it holds (planar only).
+    plane: usize,
+    planar: bool,
+    /// Rows and columns of the chunk that lie inside the image.
+    vrows: usize,
+    vcols: usize,
+    /// Bytes per image row and per chunk row.
+    full_row: usize,
+    chunk_row: usize,
+    /// Bytes of the whole chunk, padding included.
+    len: usize,
+}
+
+/// Assemble in `buf` a chunk that is built sample by sample: one plane of
+/// an image, or packed sub-byte rows. Padding reads as zero.
+///
+/// Out of line on purpose. `write_data` is one loop over the chunks whose
+/// common case hands a strip to the codec straight from the input; with
+/// these arms inlined in it, reshaping the planar one moved the strip loop
+/// too (81 Ir a strip). Out of line, the strip loop is also a little
+/// shorter than it was.
+#[inline(never)]
+fn assemble<C: ColorType>(buf: &mut Vec<u8>, native: &[u8], g: &ChunkGeom) {
+    let bits = C::BITS_PER_SAMPLE;
+    let spp = C::SAMPLES;
+    let bytes = usize::from(bits) / 8;
+    let (x0, plane, planar) = (g.x0, g.plane, g.planar);
+    let (vcols, full_row, chunk_row) = (g.vcols, g.full_row, g.chunk_row);
+    buf.resize(g.len, 0);
+    for r in 0..g.vrows {
+        let src = &native[(g.y0 + r) * full_row..][..full_row];
+        let dst = &mut buf[r * chunk_row..][..chunk_row];
+        let px_bits = usize::from(spp) * usize::from(bits);
+        let bit0 = x0 * px_bits;
+        if bits < 8 && !planar && bit0.is_multiple_of(8) {
+            // A strip, or a tile that starts on a byte of the input row:
+            // whole bytes are copied and a last partial byte is masked, so
+            // the pad bits are written as zero whatever the caller left in
+            // them. Moving one bit per loop turn cost 196 Ir per output
+            // byte.
+            let nbits = vcols * px_bits;
+            let (full, rem) = (nbits / 8, nbits % 8);
+            let s = &src[bit0 / 8..];
+            dst[..full].copy_from_slice(&s[..full]);
+            if rem != 0 {
+                dst[full] = s[full] & !(0xFFu8 >> rem);
+            }
+        } else if bits < 8 {
+            let n = if planar {
+                vcols
+            } else {
+                vcols * usize::from(spp)
+            };
+            for i in 0..n {
+                let sbit = if planar {
+                    ((x0 + i) * usize::from(spp) + plane) * usize::from(bits)
+                } else {
+                    (x0 * usize::from(spp) + i) * usize::from(bits)
+                };
+                let v = get_bits(src, sbit, usize::from(bits));
+                set_bits(dst, i * usize::from(bits), usize::from(bits), v);
+            }
+        } else {
+            // One sample of every pixel: the row is walked in whole pixels
+            // (their size is fixed by the colour type) and the plane's
+            // sample is one fixed-size move. Indexing source and
+            // destination per sample was 10 Ir a sample at 8 bits.
+            let step = usize::from(spp) * bytes;
+            let off = plane * bytes;
+            let pixels = src[x0 * step..][..vcols * step].chunks_exact(step);
+            for (d, px) in dst[..vcols * bytes].chunks_exact_mut(bytes).zip(pixels) {
+                d.copy_from_slice(&px[off..off + bytes]);
+            }
+        }
+    }
+}
+
 /// One image being written. Created by [`TiffEncoder::new_image`].
 pub struct ImageEncoder<'a, W: Write + Seek, C: ColorType> {
     enc: &'a mut TiffEncoder<W>,
@@ -574,60 +657,31 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
                         buf.clear();
                         if contiguous {
                             buf.extend_from_slice(&native[y0 as usize * full_row..][..len]);
-                        } else {
-                            // Tiles and planes: padding must read as zero.
+                        } else if bits >= 8 && !planar {
+                            // Interleaved tiles: padding must read as zero.
                             buf.resize(len, 0);
                             let vrows = rows.min(h - y0) as usize;
                             let vcols = cw.min(w - x0) as usize;
+                            let s = x0 as usize * usize::from(spp) * bytes;
+                            let n = vcols * usize::from(spp) * bytes;
                             for r in 0..vrows {
                                 let src = &native[(y0 as usize + r) * full_row..][..full_row];
                                 let dst = &mut buf[r * chunk_row..][..chunk_row];
-                                let px_bits = usize::from(spp) * usize::from(bits);
-                                let bit0 = x0 as usize * px_bits;
-                                if bits < 8 && !planar && bit0.is_multiple_of(8) {
-                                    // A strip, or a tile that starts on a byte
-                                    // of the input row: whole bytes are copied
-                                    // and a last partial byte is masked, so the
-                                    // pad bits are written as zero whatever the
-                                    // caller left in them. Moving one bit per
-                                    // loop turn cost 196 Ir per output byte.
-                                    let nbits = vcols * px_bits;
-                                    let (full, rem) = (nbits / 8, nbits % 8);
-                                    let s = &src[bit0 / 8..];
-                                    dst[..full].copy_from_slice(&s[..full]);
-                                    if rem != 0 {
-                                        dst[full] = s[full] & !(0xFFu8 >> rem);
-                                    }
-                                } else if bits < 8 {
-                                    let n = if planar {
-                                        vcols
-                                    } else {
-                                        vcols * usize::from(spp)
-                                    };
-                                    for i in 0..n {
-                                        let sbit = if planar {
-                                            ((x0 as usize + i) * usize::from(spp) + plane as usize)
-                                                * usize::from(bits)
-                                        } else {
-                                            (x0 as usize * usize::from(spp) + i) * usize::from(bits)
-                                        };
-                                        let v = get_bits(src, sbit, usize::from(bits));
-                                        set_bits(dst, i * usize::from(bits), usize::from(bits), v);
-                                    }
-                                } else if planar {
-                                    for i in 0..vcols {
-                                        let s = ((x0 as usize + i) * usize::from(spp)
-                                            + plane as usize)
-                                            * bytes;
-                                        dst[i * bytes..][..bytes]
-                                            .copy_from_slice(&src[s..s + bytes]);
-                                    }
-                                } else {
-                                    let s = x0 as usize * usize::from(spp) * bytes;
-                                    let n = vcols * usize::from(spp) * bytes;
-                                    dst[..n].copy_from_slice(&src[s..s + n]);
-                                }
+                                dst[..n].copy_from_slice(&src[s..s + n]);
                             }
+                        } else {
+                            let g = ChunkGeom {
+                                x0: x0 as usize,
+                                y0: y0 as usize,
+                                plane: plane as usize,
+                                planar,
+                                vrows: rows.min(h - y0) as usize,
+                                vcols: cw.min(w - x0) as usize,
+                                full_row,
+                                chunk_row,
+                                len,
+                            };
+                            assemble::<C>(&mut buf, &native, &g);
                         }
                         let sppc = usize::from(spp_chunk);
                         match self.predictor {
