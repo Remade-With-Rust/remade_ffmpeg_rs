@@ -3,7 +3,7 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::color::delta_e_2000;
-use crate::curve::{clamp01, InvCurve};
+use crate::curve::InvCurve;
 use crate::error::{Error, Result};
 use crate::lut::{ClutEval, FixedClut};
 use crate::pipeline::{build_chain, Chain, GamutChain, ShaperChain, ShaperLink};
@@ -176,7 +176,12 @@ impl Sample for u8 {
         f64::from(self) / 255.0
     }
     fn from_unit(v: f64) -> Self {
-        (clamp01(v) * 255.0 + 0.5) as Self
+        // No `clamp01(v)` first: the float-to-integer cast saturates and
+        // maps NaN to 0, so every `v` gives the value the clamped form gave
+        // (`v >= 1` lands at or above 255.5 and `v < 0` below 0.5, which
+        // truncate or saturate to the same ends; proven over a sweep in
+        // `from_unit_matches_the_clamped_form`).
+        (v * 255.0 + 0.5) as Self
     }
     fn opaque() -> Self {
         Self::MAX
@@ -199,7 +204,8 @@ impl Sample for u16 {
         f64::from(self) / 65535.0
     }
     fn from_unit(v: f64) -> Self {
-        (clamp01(v) * 65535.0 + 0.5) as Self
+        // As for `u8`: the saturating cast already does the clamp's job.
+        (v * 65535.0 + 0.5) as Self
     }
     fn opaque() -> Self {
         Self::MAX
@@ -1066,6 +1072,55 @@ mod tests {
                     assert_eq!(dp[dc - 1].to_bits(), want.to_bits());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn from_unit_matches_the_clamped_form() {
+        use crate::curve::clamp01;
+        // The form released in 0.1.1, clamp first.
+        let old8 = |v: f64| (clamp01(v) * 255.0 + 0.5) as u8;
+        let old16 = |v: f64| (clamp01(v) * 65535.0 + 0.5) as u16;
+        let mut vs = vec![
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -0.0,
+            0.0,
+            1.0,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            1.0 - f64::EPSILON,
+            1.0 + f64::EPSILON,
+            -1.0,
+            -1.0e300,
+            1.0e300,
+            0.5 / 255.0,
+            254.5 / 255.0,
+            65534.5 / 65535.0,
+        ];
+        // A dense sweep past both ends and every rounding boundary of both
+        // widths with its two neighbours.
+        vs.extend((-2000..=12_000).map(|i| f64::from(i) / 10_000.0));
+        for k in 0..=65535u32 {
+            let b = (f64::from(k) + 0.5) / 65535.0;
+            vs.extend([
+                b,
+                f64::from_bits(b.to_bits() - 1),
+                f64::from_bits(b.to_bits() + 1),
+            ]);
+        }
+        for k in 0..=255u32 {
+            let b = (f64::from(k) + 0.5) / 255.0;
+            vs.extend([
+                b,
+                f64::from_bits(b.to_bits() - 1),
+                f64::from_bits(b.to_bits() + 1),
+            ]);
+        }
+        for v in vs {
+            assert_eq!(<u8 as Sample>::from_unit(v), old8(v), "u8 at {v:e}");
+            assert_eq!(<u16 as Sample>::from_unit(v), old16(v), "u16 at {v:e}");
         }
     }
 }
