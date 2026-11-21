@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::io::{IoSliceMut, Read, Seek};
+use std::mem::take;
 
 use crate::ccitt;
 use crate::error::{TiffError, TiffResult};
@@ -1488,6 +1489,7 @@ fn tiles_direct16<R: Read + Seek>(
         .map_err(|_| TiffError::limits(format!("cannot allocate {total_bytes} bytes")))?;
     let mut pad: Vec<u8> = Vec::new();
     let mut scratch: Vec<u8> = Vec::new();
+    let mut iov: Vec<IoSliceMut<'static>> = Vec::new();
     for cy in 0..down {
         let y0 = (cy * ch) as usize;
         let rows = ch.min(info.height - cy * ch) as usize;
@@ -1509,37 +1511,33 @@ fn tiles_direct16<R: Read + Seek>(
             // between them; nothing past the last row's part is read.
             let want = (rows - 1) * tile_row + seg;
             let mut left = have.min(want);
-            let mut bufs = Vec::with_capacity(2 * rows);
+            let mut bufs = reuse(take(&mut iov));
             let mut pads = pad.chunks_mut(skip.max(1));
-            let mut out_rows = out_bytes(&mut out)[y0 * out_row..]
+            let out_rows = out_bytes(&mut out)[y0 * out_row..]
                 .chunks_mut(out_row)
                 .take(rows);
             if skip == 0 && left == want {
                 // Whole rows, back to back in the file: one buffer per row.
-                bufs.extend(
-                    out_rows
-                        .by_ref()
-                        .map(|row| IoSliceMut::new(&mut row[x0..x0 + seg])),
-                );
-                left = 0;
-            }
-            for row in out_rows {
-                if left == 0 {
-                    break;
-                }
-                let k = seg.min(left);
-                bufs.push(IoSliceMut::new(&mut row[x0..x0 + k]));
-                left -= k;
-                if skip > 0 && left > 0 {
-                    let k = skip.min(left);
-                    if let Some(p) = pads.next() {
-                        bufs.push(IoSliceMut::new(&mut p[..k]));
+                bufs.extend(out_rows.map(|row| IoSliceMut::new(&mut row[x0..x0 + seg])));
+            } else {
+                for row in out_rows {
+                    if left == 0 {
+                        break;
                     }
+                    let k = seg.min(left);
+                    bufs.push(IoSliceMut::new(&mut row[x0..x0 + k]));
                     left -= k;
+                    if skip > 0 && left > 0 {
+                        let k = skip.min(left);
+                        if let Some(p) = pads.next() {
+                            bufs.push(IoSliceMut::new(&mut p[..k]));
+                        }
+                        left -= k;
+                    }
                 }
             }
             s.read_at_scatter(offset, &mut bufs, &mut scratch)?;
-            drop(bufs);
+            iov = reuse(bufs);
             limits.chunk(n, have, expected)?;
             if swap {
                 for row in out[y0 * out_row / 2..].chunks_mut(out_row / 2).take(rows) {
@@ -1551,6 +1549,15 @@ fn tiles_direct16<R: Read + Seek>(
         }
     }
     Ok(out)
+}
+
+/// An empty buffer list keeping `v`'s allocation, for buffers of another
+/// lifetime: the list is rebuilt for every tile and each list borrows that
+/// tile's rows, so one `Vec` cannot hold them all, but its memory can be
+/// handed on (an in-place `collect` of an empty list allocates nothing).
+fn reuse<'b>(mut v: Vec<IoSliceMut<'_>>) -> Vec<IoSliceMut<'b>> {
+    v.clear();
+    v.into_iter().map(|_| IoSliceMut::new(&mut [])).collect()
 }
 
 /// Append `n` zero samples. On its own so that `resize` inlines here with
