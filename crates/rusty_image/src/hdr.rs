@@ -208,43 +208,52 @@ fn put_f32(d: &mut [u8], px: &[u8; 4]) {
 /// [`read_scanline`]'s flat path; a run repeats the previous output pixel.
 fn read_flat_f32(r: &mut crate::read::Reader, row: &mut [u8]) -> Result<()> {
     let width = row.len() / 12;
-    let put = |d: &mut [u8], c: &[u8]| {
-        let f = to_f32([c[0], c[1], c[2]], c[3]);
-        d[0..4].copy_from_slice(&f[0].to_ne_bytes());
-        d[4..8].copy_from_slice(&f[1].to_ne_bytes());
-        d[8..12].copy_from_slice(&f[2].to_ne_bytes());
-    };
     let is_run =
-        |c: &[u8]| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) & 0x00ff_ffff == 0x0001_0101;
-    let mut chunks = r.rest().chunks_exact(4);
-    let first = chunks.next().ok_or(Error::Truncated)?;
-    if is_run(first) {
-        return Err(Error::invalid("hdr: scanline starts with a run"));
-    }
-    put(&mut row[..12], first);
-    let (mut used, mut x, mut mult) = (4usize, 1usize, 1usize);
+        |c: &[u8; 4]| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) & 0x00ff_ffff == 0x0001_0101;
+    let data = r.rest();
+    let (mut used, mut x, mut mult) = (0usize, 0usize, 1usize);
     while x < width {
-        let c = chunks.next().ok_or(Error::Truncated)?;
-        used += 4;
-        if is_run(c) {
-            let n = usize::from(c[3])
-                .checked_mul(mult)
-                .ok_or_else(|| Error::invalid("hdr: run overflow"))?;
-            mult = mult.saturating_mul(256);
-            if x + n > width {
-                return Err(Error::invalid("hdr: scanline overrun"));
+        // The pixels up to the next run marker (in a flat file, the whole
+        // scanline): output and input are walked in step, so a pixel is
+        // the run test and the conversion, with no index arithmetic and no
+        // range check of its own (41 Ir a pixel with them).
+        let mut n = 0;
+        let pixels = row[x * 12..].chunks_exact_mut(12);
+        for (d, c) in pixels.zip(data[used..].chunks_exact(4)) {
+            let c: &[u8; 4] = c.try_into().unwrap();
+            if is_run(c) {
+                break;
             }
-            let (done, rest) = row.split_at_mut(x * 12);
-            let p = &done[(x - 1) * 12..];
-            for d in rest[..n * 12].chunks_exact_mut(12) {
-                d.copy_from_slice(p);
-            }
-            x += n;
-        } else {
-            mult = 1;
-            put(&mut row[x * 12..x * 12 + 12], c);
-            x += 1;
+            put_f32(d, c);
+            n += 1;
         }
+        if n > 0 {
+            mult = 1;
+            x += n;
+            used += n * 4;
+            if x == width {
+                break;
+            }
+        }
+        // A run marker, or the end of the data.
+        let c = data.get(used..used + 4).ok_or(Error::Truncated)?;
+        used += 4;
+        if x == 0 {
+            return Err(Error::invalid("hdr: scanline starts with a run"));
+        }
+        let n = usize::from(c[3])
+            .checked_mul(mult)
+            .ok_or_else(|| Error::invalid("hdr: run overflow"))?;
+        mult = mult.saturating_mul(256);
+        if x + n > width {
+            return Err(Error::invalid("hdr: scanline overrun"));
+        }
+        let (done, rest) = row.split_at_mut(x * 12);
+        let p = &done[(x - 1) * 12..];
+        for d in rest[..n * 12].chunks_exact_mut(12) {
+            d.copy_from_slice(p);
+        }
+        x += n;
     }
     r.skip(used)
 }
@@ -453,7 +462,41 @@ fn rle_component(v: &[u8], out: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{exp_scale, EXP_SCALE};
+    use super::{decode, exp_scale, EXP_SCALE};
+
+    fn flat_file(w: usize, scanline: &[u8]) -> Vec<u8> {
+        let mut f = format!("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X {w}\n").into_bytes();
+        f.extend_from_slice(scanline);
+        f
+    }
+
+    /// Old-style runs in a flat scanline: consecutive run markers multiply
+    /// (the second counts 256s), a literal pixel resets that, and the
+    /// errors (a scanline starting with a run, an overrun, truncation) hold.
+    #[test]
+    fn flat_scanline_runs_and_errors() {
+        let (p, q) = ([9u8, 8, 7, 130], [1u8, 2, 3, 129]);
+        let px = |c: [u8; 4]| -> Vec<u8> {
+            super::to_f32([c[0], c[1], c[2]], c[3])
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect()
+        };
+        // p, run of 2, then run of 1 x 256: 259 pixels of p, then q, run 3.
+        let mut line = [p, [1, 1, 1, 2], [1, 1, 1, 1], q, [1, 1, 1, 3]].concat();
+        let img = decode(&flat_file(263, &line)).unwrap();
+        let mut want = px(p).repeat(259);
+        want.extend(px(q).repeat(4));
+        assert_eq!(img.pixels, want);
+        // One pixel short of what the runs write is an overrun; one pixel
+        // more is truncated data.
+        assert!(decode(&flat_file(262, &line)).is_err());
+        assert!(decode(&flat_file(264, &line)).is_err());
+        line.truncate(line.len() - 1);
+        assert!(decode(&flat_file(263, &line)).is_err());
+        assert!(decode(&flat_file(3, &[[1, 1, 1, 2], p].concat())).is_err());
+        assert!(decode(&flat_file(2, &[])).is_err());
+    }
 
     /// The const-evaluated exponent table holds the bits the run-time
     /// formula produces, for every exponent byte.
