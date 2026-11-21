@@ -7,7 +7,7 @@
 use crate::color::{
     lab_to_xyz, mat_inv, mat_mul, mat_vec, xyz_to_lab, Lab, Mat3, Xyz, D50, IDENTITY,
 };
-use crate::curve::{clamp01, Curve, FwdSeg, InvCurve, InvSeg};
+use crate::curve::{clamp01, Curve, FwdSeg, InvCurve, InvSeg, Sampled};
 use crate::error::{Error, Result};
 use crate::lut::{make_trilinear, Lut, Stage};
 use crate::profile::{ColorSpace, Profile, ProfileClass};
@@ -37,6 +37,10 @@ pub(crate) enum Op {
     /// channels: the clamp those curves amount to, without a stage call and
     /// a curve evaluation per channel.
     UnitCurves(usize),
+    /// A LUT stage of per-channel curves that are all sampled tables (LUT
+    /// input and output tables), evaluated in line: the values the stage
+    /// gives, without a stage call and a curve call per channel.
+    Sampled(Vec<Sampled>),
     /// Multiply every channel.
     Scale(f64),
     /// v4-normalised Lab to real Lab.
@@ -81,6 +85,10 @@ fn lut_op(stage: Stage) -> Op {
         Stage::Curves(cs) if !cs.is_empty() && cs.iter().all(Curve::is_unit_gamma) => {
             Op::UnitCurves(cs.len())
         }
+        Stage::Curves(cs) => match cs.iter().map(Sampled::new).collect::<Option<Vec<_>>>() {
+            Some(prepared) if !prepared.is_empty() => Op::Sampled(prepared),
+            _ => Op::Lut(Stage::Curves(cs)),
+        },
         stage => Op::Lut(stage),
     }
 }
@@ -94,6 +102,7 @@ fn run(ops: &[Op], v: &mut [f64; 16], mut n: usize) -> usize {
                     *x = if *x > 0.0 { x.min(1.0) } else { 0.0 };
                 }
             }
+            Op::Sampled(cs) => run_sampled(cs, v),
             Op::Scale(k) => {
                 for x in v.iter_mut().take(n) {
                     *x *= k;
@@ -169,6 +178,18 @@ fn run(ops: &[Op], v: &mut [f64; 16], mut n: usize) -> usize {
         }
     }
     n
+}
+
+/// [`Op::Sampled`]: the tables in line, in a frame of their own. In line in
+/// [`run`], the loop kept its constants in registers across the whole op
+/// loop, and every other op's calls (`cbrt`, `pow`, the stage calls) then
+/// reloaded them: +16 instructions per colour on chains without a table
+/// stage (labf32 +1.19%, v4f32 +1.14%).
+#[inline(never)]
+fn run_sampled(cs: &[Sampled], v: &mut [f64; 16]) {
+    for (x, c) in v.iter_mut().zip(cs) {
+        *x = c.eval(*x);
+    }
 }
 
 /// A matrix-shaper side: device-linear values relate to PCS XYZ by
@@ -871,6 +892,12 @@ impl Chain {
                     .collect(),
                 tail,
             ),
+            Some((Op::Sampled(cs), tail)) if cs.len() == self.in_ch => (
+                cs.iter()
+                    .map(|c| axis.iter().map(|&x| c.eval(x)).collect())
+                    .collect(),
+                tail,
+            ),
             _ => (vec![axis; self.in_ch], &self.ops),
         };
         let mut data = Vec::with_capacity(total * self.out_ch);
@@ -1169,6 +1196,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every LUT tag of the test profiles: its stages as prepared ops
+    /// against the same stages run as plain stages, bit for bit.
+    #[test]
+    fn prepared_lut_ops_match_the_plain_stages_bit_for_bit() {
+        let files: [&[u8]; 3] = [
+            include_bytes!("../tests/data/CGATS001Compat-v2-micro.icc"),
+            include_bytes!("../tests/data/sRGB_v4_ICC_preference.icc"),
+            include_bytes!("../tests/data/LAB.icc"),
+        ];
+        let mut sampled = 0;
+        for bytes in files {
+            let p = Profile::new_from_slice(bytes).unwrap();
+            for sig in [*b"A2B0", *b"A2B1", *b"A2B2", *b"B2A0", *b"B2A1", *b"B2A2"] {
+                let Ok(Some(lut)) = p.lut_tag(sig) else {
+                    continue;
+                };
+                let plain: Vec<Op> = lut.stages().into_iter().map(Op::Lut).collect();
+                let prepared: Vec<Op> = lut.stages().into_iter().map(lut_op).collect();
+                sampled += prepared
+                    .iter()
+                    .filter(|op| matches!(op, Op::Sampled(_)))
+                    .count();
+                let n = lut.inputs();
+                let coords = [-0.25, 0.0, 0.1, 0.33, 0.5, 0.77, 0.999, 1.0, 1.5, f64::NAN];
+                for k in 0..coords.len().pow(n.min(4) as u32) {
+                    let mut a = [0.0; 16];
+                    for (c, x) in a.iter_mut().enumerate().take(n) {
+                        *x = coords[(k / coords.len().pow((c % 4) as u32)) % coords.len()];
+                    }
+                    let mut b = a;
+                    let na = run(&plain, &mut a, n);
+                    let nb = run(&prepared, &mut b, n);
+                    assert_eq!(na, nb);
+                    assert_eq!(
+                        a[..na].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        b[..nb].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "{sig:?} {k}"
+                    );
+                }
+            }
+        }
+        // The prepared table op is reached by these profiles.
+        assert!(sampled > 0);
     }
 
     #[test]

@@ -337,6 +337,57 @@ impl InvSeg {
     }
 }
 
+/// A sampled curve (`curvType` with two or more entries, every LUT input and
+/// output table) prepared for evaluation in line: what [`Curve::eval`]
+/// computes for it, without the call, the tests on the curve kind and the
+/// table length, the integer-to-float conversions of the samples and of the
+/// table length per value, and the final clamp, which cannot change a value
+/// interpolated between two samples of `0..=65535` (see [`Sampled::eval`]).
+#[derive(Debug, Clone)]
+pub(crate) struct Sampled {
+    /// Per segment `i`: sample `i` and the difference to sample `i + 1`,
+    /// both exact in `f64` (the samples are `u16`).
+    seg: Box<[[f64; 2]]>,
+    /// Entries minus one, as `f64`.
+    scale: f64,
+}
+
+impl Sampled {
+    /// `None` for every curve that is not a table of at least two entries.
+    pub(crate) fn new(curve: &Curve) -> Option<Self> {
+        let Curve::Table(t) = curve else {
+            return None;
+        };
+        if t.len() < 2 {
+            return None;
+        }
+        Some(Self {
+            seg: t
+                .windows(2)
+                .map(|w| [f64::from(w[0]), f64::from(w[1]) - f64::from(w[0])])
+                .collect(),
+            scale: (t.len() - 1) as f64,
+        })
+    }
+
+    /// Exactly [`Curve::eval`] of the table this was made from.
+    ///
+    /// The index is the same (`seg.len() - 1 == n - 2`), `b - a` is exact,
+    /// and the clamp of the result is dropped because it never acts: with
+    /// `0 <= f <= 1` the rounded product `(b - a) * f` lies between `0` and
+    /// `b - a` (rounding is monotone), so the rounded sum lies between `a`
+    /// and `b`, inside `0..=65535`, and the quotient by 65535 inside `0..=1`
+    /// (never NaN: the clamped `x` is finite).
+    #[inline(always)]
+    pub(crate) fn eval(&self, x: f64) -> f64 {
+        let pos = clamp01(x) * self.scale;
+        let i = (pos as i64 as usize).min(self.seg.len() - 1);
+        let f = pos - i as f64;
+        let [a, d] = self.seg[i];
+        (a + d * f) / 65535.0
+    }
+}
+
 pub(crate) fn clamp01(v: f64) -> f64 {
     if v >= 0.0 {
         v.min(1.0)
@@ -643,6 +694,70 @@ mod tests {
         assert!(FwdSeg::new(&f4).is_none());
         assert!(InvSeg::new(&InvCurve::new(&f4).unwrap()).is_none());
         assert!(FwdSeg::new(&Curve::gamma(2.2)).is_none());
+    }
+
+    #[test]
+    fn sampled_matches_the_table_curve_bit_for_bit() {
+        let mut xs: Vec<f64> = (0..=50_000).map(|i| f64::from(i) / 50_000.0).collect();
+        xs.extend([
+            -1.0,
+            -0.0,
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1e-300,
+            1.0 - f64::EPSILON,
+        ]);
+        let mut s = 0x1234_5678u32;
+        let mut noise = |n: usize| -> Vec<u16> {
+            (0..n)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 17;
+                    s ^= s << 5;
+                    (s >> 16) as u16
+                })
+                .collect()
+        };
+        let tables = [
+            vec![0, 65535],
+            vec![65535, 0],
+            vec![0, 0, 0],
+            vec![65535; 5],
+            vec![7, 65535, 0, 65535, 1],
+            (0..256).map(|i| (i * 257) as u16).collect(),
+            (0..4096u32).map(|i| (i * 65535 / 4095) as u16).collect(),
+            (0..1024u32).rev().map(|i| (i * 64) as u16).collect(),
+            noise(17),
+            noise(4096),
+        ];
+        for t in tables {
+            let c = Curve::Table(t.clone());
+            let s = Sampled::new(&c).expect("table");
+            let n = t.len();
+            let grid: Vec<f64> = (0..n)
+                .flat_map(|i| {
+                    let x = i as f64 / (n - 1) as f64;
+                    [
+                        x,
+                        f64::from_bits(x.to_bits().wrapping_sub(1)),
+                        f64::from_bits(x.to_bits() + 1),
+                    ]
+                })
+                .collect();
+            for &x in xs.iter().chain(&grid) {
+                assert_eq!(s.eval(x).to_bits(), c.eval(x).to_bits(), "n={n} x={x}");
+            }
+        }
+        for c in [
+            Curve::identity(),
+            Curve::Table(vec![300]),
+            Curve::srgb(),
+            Curve::gamma(2.2),
+        ] {
+            assert!(Sampled::new(&c).is_none());
+        }
     }
 
     #[test]
