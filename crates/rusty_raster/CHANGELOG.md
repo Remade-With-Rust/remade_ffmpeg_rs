@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_raster-v0.1.2...rusty_raster-v0.1.3) - 2026-11-21
+
+### Other
+
+- *(rusty_raster)* fuse highp Gather + Scale1Float into one stage
+- *(rusty_raster)* nearest gather computes its index in f32
+- *(rusty_raster)* fuse highp SeedShader + Transform into one stage
+- *(rusty_raster)* f32x8::floor takes a five-op path below 2^22
+- *(rusty_raster)* #[inline] on the highp lane methods
+
 ## [0.1.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_raster-v0.1.1...rusty_raster-v0.1.2) - 2026-11-21
 
 ### Other
