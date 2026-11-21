@@ -254,11 +254,35 @@ fn uniform_color(p: &mut Pipeline) {
     p.next_stage();
 }
 
-fn seed_shader(p: &mut Pipeline) {
+pub fn seed_shader(p: &mut Pipeline) {
     let iota = f32x8::from([0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]);
 
     p.r = f32x8::splat(p.dx as f32) + iota;
     p.g = f32x8::splat(p.dy as f32 + 0.5);
+    p.b = f32x8::splat(1.0);
+    p.a = f32x8::default();
+
+    p.dr = f32x8::default();
+    p.dg = f32x8::default();
+    p.db = f32x8::default();
+    p.da = f32x8::default();
+
+    p.next_stage();
+}
+
+/// `seed_shader` then `transform`, as one stage (`compile` fuses the pair,
+/// which opens every pattern and gradient pipeline with a non-identity
+/// transform): the same sums and products on the same floats, without a
+/// dispatch between them and without storing the seed's `r` and `g` only to
+/// read them back.
+pub fn seed_shader_transform(p: &mut Pipeline) {
+    let iota = f32x8::from([0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]);
+    let x = f32x8::splat(p.dx as f32) + iota;
+    let y = f32x8::splat(p.dy as f32 + 0.5);
+
+    let ts = &p.ctx.transform;
+    p.r = mad(x, f32x8::splat(ts.sx), mad(y, f32x8::splat(ts.kx), f32x8::splat(ts.tx)));
+    p.g = mad(x, f32x8::splat(ts.ky), mad(y, f32x8::splat(ts.sy), f32x8::splat(ts.ty)));
     p.b = f32x8::splat(1.0);
     p.a = f32x8::default();
 
@@ -314,6 +338,23 @@ pub fn gather(p: &mut Pipeline) {
     p.next_stage();
 }
 
+/// `gather` then `scale_1_float` (a nearest pattern with an opacity below
+/// one), as one stage: `compile` fuses the pair. The same loads and the same
+/// products, without a dispatch between them and without storing the four
+/// channels only to read them back.
+pub fn gather_scale_1_float(p: &mut Pipeline) {
+    let ix = gather_ix(p.pixmap_src, p.r, p.g);
+    let (mut r, mut g, mut b, mut a) = (f32x8::default(), f32x8::default(), f32x8::default(), f32x8::default());
+    load_8888(&p.pixmap_src.gather(ix), &mut r, &mut g, &mut b, &mut a);
+    let c = f32x8::splat(p.ctx.current_coverage);
+    p.r = r * c;
+    p.g = g * c;
+    p.b = b * c;
+    p.a = a * c;
+
+    p.next_stage();
+}
+
 #[inline(always)]
 fn gather_ix(pixmap: PixmapRef, mut x: f32x8, mut y: f32x8) -> u32x8 {
     // Exclusive -> inclusive.
@@ -321,6 +362,10 @@ fn gather_ix(pixmap: PixmapRef, mut x: f32x8, mut y: f32x8) -> u32x8 {
     let h = ulp_sub(pixmap.height() as f32);
     x = x.max(f32x8::default()).min(f32x8::splat(w));
     y = y.max(f32x8::default()).min(f32x8::splat(h));
+
+    if u64::from(pixmap.width()) * u64::from(pixmap.height()) <= 1 << 23 {
+        return gather_ix_small(x, y, pixmap.width() as f32);
+    }
 
     // The clamps leave every lane in `[0, limit)` (`max` turns NaN into 0), so
     // for any pixmap short of 2^23 pixels on a side the truncation needs no
@@ -333,6 +378,32 @@ fn gather_ix(pixmap: PixmapRef, mut x: f32x8, mut y: f32x8) -> u32x8 {
     };
 
     (iy * i32x8::splat(pixmap.width() as i32) + ix).to_u32x8_bitcast()
+}
+
+/// `gather_ix` for a pixmap of at most 2^23 pixels, from coordinates already
+/// clamped to `[0, width) x [0, height)`, computed in `f32`.
+///
+/// Each coordinate is truncated in float (`v + 2^23` rounds to the nearest
+/// integer, step down where it went up), then `row * width + column` is a
+/// sum of integers below the pixel count, so below 2^23, which `f32` holds
+/// exactly; one more `+ 2^23` puts that integer in the low mantissa bits.
+/// That is one conversion for the index instead of one per coordinate, and
+/// no integer multiply, which SSE2 lacks for 32-bit lanes (LLVM had made it
+/// a scalar `imul` per lane). The index is the same integer.
+#[inline(always)]
+fn gather_ix_small(x: f32x8, y: f32x8, width: f32) -> u32x8 {
+    const INTEGRAL: f32 = 8_388_608.0;
+    #[inline(always)]
+    fn trunc(v: f32) -> f32 {
+        let nearest = (v + INTEGRAL) - INTEGRAL;
+        nearest - if nearest > v { 1.0 } else { 0.0 }
+    }
+    let mut ix = [0u32; STAGE_WIDTH];
+    for i in 0..STAGE_WIDTH {
+        let index = trunc(y.0[i]) * width + trunc(x.0[i]);
+        ix[i] = (index + INTEGRAL).to_bits().wrapping_sub(INTEGRAL.to_bits());
+    }
+    u32x8::from(ix)
 }
 
 /// As in `gather_ix`: the clamps of `clamp_trunc` leave every lane in
@@ -426,7 +497,7 @@ fn lerp_u8(p: &mut Pipeline) {
     p.next_stage();
 }
 
-fn scale_1_float(p: &mut Pipeline) {
+pub fn scale_1_float(p: &mut Pipeline) {
     let c = f32x8::splat(p.ctx.current_coverage);
     p.r *= c;
     p.g *= c;
@@ -820,7 +891,7 @@ fn sprite_source_over_8(
     store_8888(&r, &g, &b, &a, dst);
 }
 
-fn transform(p: &mut Pipeline) {
+pub fn transform(p: &mut Pipeline) {
     let ts = &p.ctx.transform;
 
     let tr = mad(p.r, f32x8::splat(ts.sx), mad(p.g, f32x8::splat(ts.kx), f32x8::splat(ts.tx)));
@@ -1605,6 +1676,57 @@ mod tests {
             o.copy_from_slice(&px);
         }
         out
+    }
+
+    /// `gather_ix` (whose pixmaps of up to 2^23 pixels take the float index
+    /// of `gather_ix_small`) against the index computed in integers from the
+    /// same clamped coordinates, at the edges of the clamp, for NaN and the
+    /// infinities, and at pseudo-random points, on pixmaps up to and just
+    /// past the 2^23-pixel limit.
+    #[test]
+    fn gather_index_matches_integer_form() {
+        fn reference(w: u32, h: u32, x: f32, y: f32) -> u32 {
+            let clamp = |v: f32, limit: u32| {
+                let top = f32::from_bits((limit as f32).to_bits() - 1);
+                let v = if v > 0.0 { v } else { 0.0 };
+                (if v < top { v } else { top }).trunc() as u64
+            };
+            (clamp(y, h) * u64::from(w) + clamp(x, w)) as u32
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for (w, h) in [(1, 1), (3, 5), (64, 64), (160, 120), (4096, 2048), (2048, 4096), (4097, 2048)] {
+            let data = vec![0u8; w as usize * h as usize * 4];
+            let pixmap = PixmapRef::from_bytes(&data, w, h).unwrap();
+            let (fw, fh) = (w as f32, h as f32);
+            let mut xs = vec![
+                0.0, -0.0, 1e-30, 0.5, 0.999_999_9, 1.0, fw - 1.0, fw - 0.5,
+                f32::from_bits(fw.to_bits() - 1), fw, fw + 1.0, -1.0, -1e30, 1e30,
+                f32::NAN, f32::INFINITY, f32::NEG_INFINITY,
+            ];
+            let mut ys: Vec<f32> = xs.iter().map(|&v| if v == fw { fh } else { v }).collect();
+            ys.push(f32::from_bits(fh.to_bits() - 1));
+            ys.push(fh - 1.0);
+            for _ in 0..64 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let u = (seed >> 40) as f32 / (1u64 << 24) as f32;
+                xs.push(-fw + 3.0 * fw * u);
+                ys.push(-fh + 3.0 * fh * (1.0 - u));
+            }
+            for (k, &y0) in ys.iter().enumerate() {
+                let mut x = [0.0f32; STAGE_WIDTH];
+                let mut y = [0.0f32; STAGE_WIDTH];
+                for i in 0..STAGE_WIDTH {
+                    x[i] = xs[(k * 3 + i) % xs.len()];
+                    y[i] = if i % 2 == 0 { y0 } else { ys[(k + i) % ys.len()] };
+                }
+                let got: [u32; STAGE_WIDTH] = gather_ix(pixmap, f32x8::from(x), f32x8::from(y)).into();
+                for i in 0..STAGE_WIDTH {
+                    assert_eq!(got[i], reference(w, h, x[i], y[i]), "{w}x{h} at ({}, {})", x[i], y[i]);
+                }
+            }
+        }
     }
 
     /// What the sprite shortcuts rest on: a byte survives `load_8888` then
