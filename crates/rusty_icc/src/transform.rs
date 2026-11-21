@@ -258,6 +258,11 @@ struct ShaperEngine {
     in8: Box<[f32]>,
     in16: OnceLock<Box<[f32]>>,
     out: Box<[[f32; OUT_TABLE]]>,
+    /// For a one-channel 8-bit source: the colour values the loop writes for
+    /// every input byte (first `GREY_OUT` of each entry), from [`Self::run`]
+    /// over a ramp, so a lookup gives exactly what the loop gives. Built by
+    /// the first call with at least 256 pixels.
+    grey8: OnceLock<Box<[[u8; 3]; 256]>>,
 }
 
 impl ShaperEngine {
@@ -307,7 +312,61 @@ impl ShaperEngine {
             in8,
             in16: OnceLock::new(),
             out,
+            grey8: OnceLock::new(),
         }
+    }
+
+    /// [`Self::run_loop`] for one 8-bit colour channel in and `k` out (`k` as
+    /// the caller dispatches: 3 for three output channels, 1 otherwise), through
+    /// [`ShaperEngine::grey8`]. `false`, with nothing done, while the table
+    /// is not built and `src` has fewer than 256 pixels (building it costs
+    /// 256 pixels of the loop).
+    #[allow(clippy::too_many_arguments)]
+    fn run_grey8(
+        &self,
+        src: &[u8],
+        dst: &mut [u8],
+        sc: usize,
+        dc: usize,
+        src_alpha: bool,
+        dst_alpha: bool,
+        k: usize,
+    ) -> bool {
+        let table = match self.grey8.get() {
+            Some(t) => t,
+            None if src.len() / sc >= 256 => self.grey8.get_or_init(|| {
+                let ramp: [u8; 256] = core::array::from_fn(|v| v as u8);
+                let mut flat = [0u8; 768];
+                let mut t = Box::new([[0u8; 3]; 256]);
+                if k == 3 {
+                    self.run_loop::<u8, 1, 3>(&self.in8, &ramp, &mut flat, 1, 3, false, false);
+                    for (row, v) in t.iter_mut().zip(flat.chunks_exact(3)) {
+                        row.copy_from_slice(v);
+                    }
+                } else {
+                    self.run_loop::<u8, 1, 1>(
+                        &self.in8,
+                        &ramp,
+                        &mut flat[..256],
+                        1,
+                        1,
+                        false,
+                        false,
+                    );
+                    for (row, v) in t.iter_mut().zip(&flat[..256]) {
+                        row[0] = *v;
+                    }
+                }
+                t
+            }),
+            None => return false,
+        };
+        if k == 3 {
+            grey8_loop::<3>(table, src, dst, sc, dc, src_alpha, dst_alpha);
+        } else {
+            grey8_loop::<1>(table, src, dst, sc, dc, src_alpha, dst_alpha);
+        }
+        true
     }
 
     fn in16(&self) -> &[f32] {
@@ -328,10 +387,36 @@ impl ShaperEngine {
         table[i] + (table[i + 1] - table[i]) * f
     }
 
+    /// The integer path: [`Self::run_loop`], or for one 8-bit channel in
+    /// its table ([`Self::run_grey8`]).
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn run<T: Sample, const IN: usize, const OUT: usize>(
+        &self,
+        tables: &[f32],
+        src: &[T],
+        dst: &mut [T],
+        sc: usize,
+        dc: usize,
+        src_alpha: bool,
+        dst_alpha: bool,
+    ) {
+        if IN == 1 {
+            if let Some(s) = T::u8s(src) {
+                if let Some(d) = T::u8s_mut(dst) {
+                    if self.run_grey8(s, d, sc, dc, src_alpha, dst_alpha, OUT) {
+                        return;
+                    }
+                }
+            }
+        }
+        self.run_loop::<T, IN, OUT>(tables, src, dst, sc, dc, src_alpha, dst_alpha);
+    }
+
     /// The integer hot loop, monomorphised on the colour channel counts so
     /// every per-channel index is a constant.
     #[allow(clippy::too_many_arguments)]
-    fn run<T: Sample, const IN: usize, const OUT: usize>(
+    fn run_loop<T: Sample, const IN: usize, const OUT: usize>(
         &self,
         tables: &[f32],
         src: &[T],
@@ -597,6 +682,27 @@ impl Transform {
             }
         }
         Ok(())
+    }
+}
+
+/// The loop of [`ShaperEngine::run_grey8`]: `K` colour values per pixel from
+/// the table, the alpha channel as [`ShaperEngine::run`] writes it.
+#[allow(clippy::too_many_arguments)]
+fn grey8_loop<const K: usize>(
+    table: &[[u8; 3]; 256],
+    src: &[u8],
+    dst: &mut [u8],
+    sc: usize,
+    dc: usize,
+    src_alpha: bool,
+    dst_alpha: bool,
+) {
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let row = &table[usize::from(sp[0])];
+        dp[..K].copy_from_slice(&row[..K]);
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { u8::MAX };
+        }
     }
 }
 
@@ -1121,6 +1227,69 @@ mod tests {
         for v in vs {
             assert_eq!(<u8 as Sample>::from_unit(v), old8(v), "u8 at {v:e}");
             assert_eq!(<u16 as Sample>::from_unit(v), old16(v), "u16 at {v:e}");
+        }
+    }
+
+    /// The grey 8-bit output table against the engine's loop: every byte, with
+    /// and without alpha on either side, one and three output channels, and
+    /// the small-call path that does not build the table.
+    #[test]
+    fn grey8_table_matches_the_shaper_loop() {
+        let grey = Profile::new_gray(crate::color::D65_XY, crate::curve::Curve::gamma(1.8));
+        let srgb = Profile::new_srgb();
+        for (src_layout, dst_layout) in [
+            (Layout::Gray, Layout::Rgb),
+            (Layout::GrayAlpha, Layout::Rgba),
+            (Layout::Gray, Layout::Rgba),
+            (Layout::GrayAlpha, Layout::Rgb),
+            (Layout::Gray, Layout::Gray),
+            (Layout::GrayAlpha, Layout::GrayAlpha),
+        ] {
+            let (from, to) = if dst_layout.color_channels() == 3 {
+                (&grey, &srgb)
+            } else {
+                (&grey, &grey)
+            };
+            let t = Transform::new(
+                from,
+                src_layout,
+                to,
+                dst_layout,
+                Intent::Perceptual,
+                Options::default(),
+            )
+            .unwrap();
+            let Engine::Shaper(e) = &t.engine else {
+                panic!("matrix-shaper expected");
+            };
+            let (sc, dc) = (src_layout.channels(), dst_layout.channels());
+            let k = if dst_layout.color_channels() == 3 {
+                3
+            } else {
+                1
+            };
+            let src: Vec<u8> = (0..300 * sc).map(|i| (i * 37 % 256) as u8).collect();
+            let (sa, da) = (src_layout.has_alpha(), dst_layout.has_alpha());
+            let mut want = vec![7u8; 300 * dc];
+            if k == 3 {
+                e.run_loop::<u8, 1, 3>(&e.in8, &src, &mut want, sc, dc, sa, da);
+            } else {
+                e.run_loop::<u8, 1, 1>(&e.in8, &src, &mut want, sc, dc, sa, da);
+            }
+            // Fewer than 256 pixels and no table yet: declined.
+            let mut got = vec![7u8; 255 * dc];
+            assert!(!e.run_grey8(&src[..255 * sc], &mut got, sc, dc, sa, da, k));
+            assert!(e.grey8.get().is_none());
+            let mut got = vec![7u8; 300 * dc];
+            assert!(e.run_grey8(&src, &mut got, sc, dc, sa, da, k));
+            assert_eq!(got, want, "{src_layout:?} -> {dst_layout:?}");
+            // Built: small calls take it too, and the public path agrees.
+            let mut got = vec![7u8; 3 * dc];
+            assert!(e.run_grey8(&src[..3 * sc], &mut got, sc, dc, sa, da, k));
+            assert_eq!(got, want[..3 * dc]);
+            let mut got = vec![7u8; 300 * dc];
+            t.transform(&src, &mut got).unwrap();
+            assert_eq!(got, want);
         }
     }
 }
