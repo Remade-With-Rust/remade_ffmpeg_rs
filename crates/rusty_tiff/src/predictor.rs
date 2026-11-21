@@ -276,25 +276,53 @@ pub(crate) fn undo_float(buf: &mut [u8], row_bytes: usize, spp: usize, bytes: us
     }
 }
 
+/// Append the `N` byte planes of `row`'s native-endian `N`-byte samples to
+/// `tmp`, most significant byte first: one pass per plane, each a fixed
+/// stride over the row.
+fn split_planes<const N: usize>(row: &[u8], tmp: &mut Vec<u8>) {
+    for b in 0..N {
+        let src = if cfg!(target_endian = "big") {
+            b
+        } else {
+            N - 1 - b
+        };
+        tmp.extend(row.chunks_exact(N).map(|s| s[src]));
+    }
+}
+
 /// Apply the floating-point predictor to native-endian samples.
 pub(crate) fn apply_float(buf: &mut [u8], row_bytes: usize, spp: usize, bytes: usize) {
     if row_bytes == 0 || bytes == 0 {
         return;
     }
-    let mut tmp = vec![0u8; row_bytes];
+    // The planes are appended to an empty buffer (nothing is zero-filled
+    // per call, and a call is one strip) by a per-width pass; one scattered
+    // store per byte through a run-time width was 13 Ir a byte.
+    let mut tmp = Vec::with_capacity(row_bytes);
     for row in buf.chunks_mut(row_bytes) {
         let n = row.len();
-        let wc = n / bytes;
-        for k in 0..wc {
-            for b in 0..bytes {
-                let src = if cfg!(target_endian = "big") {
-                    b
-                } else {
-                    bytes - 1 - b
-                };
-                tmp[b * wc + k] = row[k * bytes + src];
+        tmp.clear();
+        match bytes {
+            2 => split_planes::<2>(row, &mut tmp),
+            4 => split_planes::<4>(row, &mut tmp),
+            8 => split_planes::<8>(row, &mut tmp),
+            _ => {
+                let wc = n / bytes;
+                tmp.resize(wc * bytes, 0);
+                for k in 0..wc {
+                    for b in 0..bytes {
+                        let src = if cfg!(target_endian = "big") {
+                            b
+                        } else {
+                            bytes - 1 - b
+                        };
+                        tmp[b * wc + k] = row[k * bytes + src];
+                    }
+                }
             }
         }
+        // (A row cut inside a sample: the cut bytes count as zero.)
+        tmp.resize(n, 0);
         for i in (spp..n).rev() {
             tmp[i] = tmp[i].wrapping_sub(tmp[i - spp]);
         }
@@ -398,13 +426,10 @@ mod tests {
                     undo_float(&mut a, row_bytes, spp, bytes);
                     ref_undo_float(&mut b, row_bytes, spp, bytes);
                     assert_eq!(a, b, "undo: bytes {bytes} spp {spp} px {px}");
-                    // (A cut row leaves the forward predictor's tail undefined.)
-                    if cut == 0 {
-                        let (mut a, mut b) = (orig.clone(), orig.clone());
-                        apply_float(&mut a, row_bytes, spp, bytes);
-                        ref_apply_float(&mut b, row_bytes, spp, bytes);
-                        assert_eq!(a, b, "apply: bytes {bytes} spp {spp} px {px}");
-                    }
+                    let (mut a, mut b) = (orig.clone(), orig.clone());
+                    apply_float(&mut a, row_bytes, spp, bytes);
+                    ref_apply_float(&mut b, row_bytes, spp, bytes);
+                    assert_eq!(a, b, "apply: bytes {bytes} spp {spp} px {px}");
                 }
             }
         }
