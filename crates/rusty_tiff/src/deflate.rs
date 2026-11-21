@@ -19,7 +19,7 @@ pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
 /// more, so a decompression bomb costs at most `n` bytes; anything the
 /// inflater writes past `n` (only possible if the allocator handed back
 /// more capacity than asked) is truncated away.
-pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffResult<()> {
+pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffResult<usize> {
     out.try_reserve_exact(n)
         .map_err(|_| TiffError::limits(format!("cannot allocate {n} bytes")))?;
     let base = out.len();
@@ -37,7 +37,7 @@ pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffRes
     loop {
         if out.len() >= target {
             out.truncate(target);
-            return Ok(());
+            return Ok(n);
         }
         let in_before = d.total_in();
         let out_before = out.len();
@@ -50,33 +50,36 @@ pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffRes
             // as the `tiff` crate does. Any other failure is an error.
             Err(_) if out.len() >= target => {
                 out.truncate(target);
-                return Ok(());
+                return Ok(n);
             }
             // A failed check on a payload that did not fully inflate keeps
             // what did and zero-fills the rest, as the `tiff` crate does.
             Err(e) if e.to_string().contains("data check") => {
+                let real = out.len() - base;
                 out.resize(target, 0);
-                return Ok(());
+                return Ok(real);
             }
             Err(e) => return Err(TiffError::format(format!("Deflate: {e}"))),
         };
         let progressed = d.total_in() != in_before || out.len() != out_before;
         if out.len() >= target {
             out.truncate(target);
-            return Ok(());
+            return Ok(n);
         }
         match status {
             // The stream (or the strip's data) ended short of the rows: keep
             // what inflated and zero-fill the rest, like a short LZW or
             // PackBits strip.
             Status::StreamEnd => {
+                let real = out.len() - base;
                 out.resize(target, 0);
-                return Ok(());
+                return Ok(real);
             }
             Status::Ok | Status::BufError => {
                 if !progressed {
+                    let real = out.len() - base;
                     out.resize(target, 0);
-                    return Ok(());
+                    return Ok(real);
                 }
                 if out.len() == out.capacity() {
                     // Capacity exhausted below the target cannot happen with
