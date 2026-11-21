@@ -29,7 +29,12 @@ fn hash(p: [u8; 4]) -> usize {
 #[inline]
 fn hash_u32(v: u32) -> usize {
     let v = u64::from(v);
-    let w = (v & 0x00ff_00ff) | ((v & 0xff00_ff00) << 24);
+    // `v | v << 24` puts r, b, g, a in bytes 0, 2, 4, 6 (byte 3 mixes a
+    // with the shifted r and is masked off with the other odd bytes). As
+    // two separately masked halves, LLVM kept an extra `and` and `mov` in
+    // the arms that hash (+1 Ir an RGBA op once the hash left the shared
+    // tail).
+    let w = (v | (v << 24)) & 0x00ff_00ff_00ff_00ff;
     ((w.wrapping_mul((3 << 48) | (7 << 32) | (5 << 16) | 11) >> 48) & 63) as usize
 }
 
@@ -100,12 +105,25 @@ pub fn decode(data: &[u8]) -> Result<Image> {
 /// position below `len` is written), and only the last pixel, with no room
 /// for four bytes, takes a 3-byte store. A run's length is counted in bytes,
 /// so no division by the channel count per op.
+///
+/// The specification writes `index[hash(px)] = px` after every op. Only the
+/// ops that make a new colour (DIFF, LUMA, RGB, RGBA) can change the index
+/// that way, so only they hash: after any op `index[hash(px)] == px` holds,
+/// which makes the write a no-op for a run (`px` unchanged) and for an index
+/// op whose slot was written by an earlier hash store (its colour hashes to
+/// that slot). The exceptions are handled where they arise: a never-written
+/// slot holds zero, whose hash is slot 0, so an index op that yields zero
+/// writes slot 0; and before the first op `px` is in no slot, so a stream
+/// that opens with a run stores it first, as that run would have.
 fn decode_ops<const CH: usize>(data: &[u8], len: usize) -> Result<Vec<u8>> {
     let mut out = vec![0u8; len];
     // Pixels packed little-endian (r in the low byte): an index op is one
     // load, the hash reads the word directly and a pixel is one store.
     let mut index = [0u32; 64];
     let mut px = 0xff00_0000u32;
+    if data.first().is_some_and(|b| (OP_RUN..OP_RGB).contains(b)) {
+        index[hash_u32(px)] = px;
+    }
     let mut pos = 0usize;
     let mut o = 0usize;
     while o < len {
@@ -117,9 +135,13 @@ fn decode_ops<const CH: usize>(data: &[u8], len: usize) -> Result<Vec<u8>> {
         // 797K of 1.36M), which Ir cannot see.
         let end = if b < OP_DIFF {
             px = index[usize::from(b & 0x3f)];
+            if px == 0 {
+                index[0] = 0;
+            }
             o + CH
         } else if b < OP_LUMA {
             px = add_bytes(px, DIFF_ADD[usize::from(b & 0x3f)]);
+            index[hash_u32(px)] = px;
             o + CH
         } else if b < OP_RUN {
             let b2 = *data.get(pos).ok_or(Error::Truncated)?;
@@ -131,6 +153,7 @@ fn decode_ops<const CH: usize>(data: &[u8], len: usize) -> Result<Vec<u8>> {
                 px,
                 u32::from(dr) | (u32::from(dg) << 8) | (u32::from(db) << 16),
             );
+            index[hash_u32(px)] = px;
             o + CH
         } else if b < OP_RGB {
             // OP_RUN: the same pixel, up to 62 times, never past the end.
@@ -142,14 +165,15 @@ fn decode_ops<const CH: usize>(data: &[u8], len: usize) -> Result<Vec<u8>> {
                 | (u32::from(c[1]) << 8)
                 | (u32::from(c[2]) << 16);
             pos += 3;
+            index[hash_u32(px)] = px;
             o + CH
         } else {
             let c = data.get(pos..pos + 4).ok_or(Error::Truncated)?;
             px = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             pos += 4;
+            index[hash_u32(px)] = px;
             o + CH
         };
-        index[hash_u32(px)] = px;
         let bytes = px.to_le_bytes();
         while o < end {
             if let Some(d) = out.get_mut(o..o + 4) {
@@ -307,7 +331,7 @@ fn encode_ops<const CH: usize>(pixels: &[u8], out: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{add_bytes, hash, DIFF_ADD};
+    use super::{add_bytes, decode_ops, hash, DIFF_ADD};
 
     #[test]
     fn packed_byte_add_wraps_per_channel() {
@@ -355,5 +379,135 @@ mod tests {
             assert_eq!(hash(p), want, "{p:?}");
         }
         assert_eq!(hash([255; 4]), (255 * 26) % 64);
+    }
+
+    /// The specification's decoder (qoi.h) as written: `px` as four bytes,
+    /// the index written after every op, a run counted down one pixel at a
+    /// time. `None` where the stream ends before `len` bytes are produced.
+    fn reference_decode(data: &[u8], ch: usize, len: usize) -> Option<Vec<u8>> {
+        let mut index = [[0u8; 4]; 64];
+        let mut px = [0u8, 0, 0, 255];
+        let mut out = Vec::with_capacity(len);
+        let (mut p, mut run) = (0usize, 0usize);
+        while out.len() < len {
+            if run > 0 {
+                run -= 1;
+            } else {
+                let b1 = *data.get(p)?;
+                p += 1;
+                if b1 == 0xfe {
+                    px[..3].copy_from_slice(data.get(p..p + 3)?);
+                    p += 3;
+                } else if b1 == 0xff {
+                    px.copy_from_slice(data.get(p..p + 4)?);
+                    p += 4;
+                } else {
+                    match b1 >> 6 {
+                        0 => px = index[usize::from(b1)],
+                        1 => {
+                            px[0] = px[0].wrapping_add(((b1 >> 4) & 3).wrapping_sub(2));
+                            px[1] = px[1].wrapping_add(((b1 >> 2) & 3).wrapping_sub(2));
+                            px[2] = px[2].wrapping_add((b1 & 3).wrapping_sub(2));
+                        }
+                        2 => {
+                            let b2 = *data.get(p)?;
+                            p += 1;
+                            let vg = (b1 & 0x3f).wrapping_sub(32);
+                            px[0] = px[0].wrapping_add(vg.wrapping_sub(8).wrapping_add(b2 >> 4));
+                            px[1] = px[1].wrapping_add(vg);
+                            px[2] = px[2].wrapping_add(vg.wrapping_sub(8).wrapping_add(b2 & 0x0f));
+                        }
+                        _ => run = usize::from(b1 & 0x3f),
+                    }
+                }
+                index[hash(px)] = px;
+            }
+            out.extend_from_slice(&px[..ch]);
+        }
+        Some(out)
+    }
+
+    /// Random op streams aimed at the index's corner cases (a run as the
+    /// first op, index ops on never-written slots, the zero colour, a colour
+    /// hashing to slot 0, alpha changes in 3-channel streams), runs past the
+    /// end, cut-off streams and both pixel stores (word and last pixel),
+    /// against the specification's decoder.
+    #[test]
+    fn decode_ops_matches_the_specification_decoder() {
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 32) as u32
+        };
+        let (mut decoded, mut cut) = (0, 0);
+        for i in 0..20_000 {
+            let ch = if i % 2 == 0 { 3 } else { 4 };
+            let pixels = 1 + (next() % 300) as usize;
+            let mut f = Vec::new();
+            let mut n = 0usize;
+            let opens_with_run = next() % 4 == 0;
+            while n < pixels {
+                let k = if n == 0 && opens_with_run {
+                    50
+                } else {
+                    next() % 100
+                };
+                if k < 30 {
+                    let slot = if next() % 2 == 0 {
+                        next() % 4
+                    } else {
+                        next() % 64
+                    };
+                    f.push(slot as u8);
+                } else if k < 42 {
+                    f.push(0x40 | (next() % 64) as u8);
+                } else if k < 54 {
+                    f.extend_from_slice(&[0x80 | (next() % 64) as u8, next() as u8]);
+                } else if k < 70 {
+                    let run = 1 + next() % 62;
+                    f.push(0xc0 | (run - 1) as u8);
+                    n += run as usize;
+                    continue;
+                } else if k < 85 {
+                    f.push(0xfe);
+                    if next() % 3 == 0 {
+                        // (1, 0, 56) with opaque alpha hashes to slot 0.
+                        f.extend_from_slice(&[1, 0, 56]);
+                    } else {
+                        for _ in 0..3 {
+                            f.push(if next() % 3 == 0 { 0 } else { next() as u8 });
+                        }
+                    }
+                } else {
+                    f.push(0xff);
+                    for _ in 0..4 {
+                        f.push(if next() % 3 == 0 { 0 } else { next() as u8 });
+                    }
+                }
+                n += 1;
+            }
+            if next() % 8 == 0 {
+                f.truncate(next() as usize % (f.len() + 1));
+            }
+            let len = pixels * ch;
+            let got = if ch == 3 {
+                decode_ops::<3>(&f, len)
+            } else {
+                decode_ops::<4>(&f, len)
+            };
+            let want = reference_decode(&f, ch, len);
+            assert_eq!(got.as_ref().ok(), want.as_ref(), "stream {i}: {f:02x?}");
+            if want.is_some() {
+                decoded += 1;
+            } else {
+                cut += 1;
+            }
+        }
+        assert!(
+            decoded > 15_000 && cut > 500,
+            "{decoded} decoded, {cut} cut"
+        );
     }
 }
