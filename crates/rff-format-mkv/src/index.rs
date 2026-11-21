@@ -44,7 +44,9 @@
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 
 use rff_core::{Error, Packet, Result};
-use rff_format::{SampleIndex, SampleInfo};
+use std::sync::{Arc, Mutex};
+
+use rff_format::{SampleIndex, SampleInfo, SampleSource, SharedInput};
 
 use crate::{
     discard_samples, parse_block_additions, read_byte, split_laces, Ebml, Inner, MkvDemuxer, Src,
@@ -444,43 +446,126 @@ impl SampleIndex for MkvDemuxer {
     }
 
     fn read_sample(&mut self, stream: usize, index: u64) -> Result<Packet> {
-        let e = self
-            .entry(stream, index)
-            .cloned()
-            .ok_or_else(|| Error::invalid(format!("mkv: stream {stream} has no sample {index}")))?;
-        let stored = self.src.read_at(e.offset, u64::from(e.size))?;
-        if stored.len() < e.size as usize {
-            return Err(Error::invalid(format!(
-                "mkv: sample {index} of stream {stream} is cut short by end of input"
-            )));
-        }
-        let mut additions = Vec::new();
-        let places = self
+        let idx = self
             .index
-            .as_ref()
-            .and_then(|i| i.additions.get(e.additions as usize))
-            .cloned()
-            .unwrap_or_default();
-        for (at, len) in places {
-            additions.extend(parse_block_additions(&self.src.read_at(at, len)?));
-        }
-        let data = self.t.shape(stream, &stored, e.sync).ok_or_else(|| {
-            Error::invalid(format!(
-                "mkv: sample {index} of stream {stream} does not decode (corrupt \
-                 ContentEncoding)"
-            ))
-        })?;
-        let mut p = Packet::from_data(stream, data);
-        p.pts = e.pts_known.then_some(e.pts);
-        p.duration = e.duration;
-        p.flags.keyframe = e.sync;
-        p.discard_padding = e.discard_padding;
-        p.additions = additions;
-        Ok(p)
+            .clone()
+            .ok_or_else(|| Error::invalid("mkv: no index"))?;
+        let src = &mut self.src;
+        read_entry(
+            &idx,
+            &self.t,
+            &mut |at, len| src.read_at(at, len),
+            stream,
+            index,
+        )
+    }
+
+    /// The index (shared, an `Arc`) and the track shaping rules, reading
+    /// through its own handle on the shared input.
+    fn sample_source(&mut self) -> Option<Arc<dyn SampleSource>> {
+        Some(Arc::new(MkvSampleSource {
+            index: Arc::clone(self.index.as_ref()?),
+            t: self.t.clone(),
+            input: Mutex::new(self.shared.clone()?),
+        }))
     }
 
     fn sync_at_or_before(&self, stream: usize, pts: i64) -> Option<u64> {
         let sync = self.index.as_ref()?.sync.get(stream)?;
+        let n = sync.partition_point(|&(p, _)| p <= pts);
+        n.checked_sub(1).map(|i| sync[i].1)
+    }
+}
+
+/// Read frame `index` of `stream` through `read_at` (file offset, length)
+/// and shape it as `read_packet` does.
+fn read_entry(
+    idx: &Index,
+    t: &Tracks,
+    read_at: &mut dyn FnMut(u64, u64) -> io::Result<Vec<u8>>,
+    stream: usize,
+    index: u64,
+) -> Result<Packet> {
+    let e = idx
+        .entries
+        .get(stream)
+        .and_then(|e| e.get(usize::try_from(index).ok()?))
+        .cloned()
+        .ok_or_else(|| Error::invalid(format!("mkv: stream {stream} has no sample {index}")))?;
+    let stored = read_at(e.offset, u64::from(e.size))?;
+    if stored.len() < e.size as usize {
+        return Err(Error::invalid(format!(
+            "mkv: sample {index} of stream {stream} is cut short by end of input"
+        )));
+    }
+    let mut additions = Vec::new();
+    let places = idx
+        .additions
+        .get(e.additions as usize)
+        .cloned()
+        .unwrap_or_default();
+    for (at, len) in places {
+        additions.extend(parse_block_additions(&read_at(at, len)?));
+    }
+    let data = t.shape(stream, &stored, e.sync).ok_or_else(|| {
+        Error::invalid(format!(
+            "mkv: sample {index} of stream {stream} does not decode (corrupt \
+             ContentEncoding)"
+        ))
+    })?;
+    let mut p = Packet::from_data(stream, data);
+    p.pts = e.pts_known.then_some(e.pts);
+    p.duration = e.duration;
+    p.flags.keyframe = e.sync;
+    p.discard_padding = e.discard_padding;
+    p.additions = additions;
+    Ok(p)
+}
+
+/// [`SampleIndex::sample_source`] for Matroska.
+struct MkvSampleSource {
+    index: Arc<Index>,
+    t: Tracks,
+    input: Mutex<SharedInput>,
+}
+
+impl SampleSource for MkvSampleSource {
+    fn sample_count(&self, stream: usize) -> u64 {
+        self.index.entries.get(stream).map_or(0, |e| e.len() as u64)
+    }
+
+    fn sample_info(&self, stream: usize, index: u64) -> Option<SampleInfo> {
+        let e = self
+            .index
+            .entries
+            .get(stream)?
+            .get(usize::try_from(index).ok()?)?;
+        Some(SampleInfo {
+            offset: e.offset,
+            size: e.size,
+            dts: e.pts,
+            pts: e.pts,
+            duration: e.duration,
+            sync: e.sync,
+        })
+    }
+
+    fn read_sample(&self, stream: usize, index: u64) -> Result<Packet> {
+        let mut input = self
+            .input
+            .lock()
+            .map_err(|_| Error::invalid("mkv: sample source poisoned"))?;
+        let mut read_at = |at: u64, len: u64| -> io::Result<Vec<u8>> {
+            input.seek(SeekFrom::Start(at))?;
+            let mut v = Vec::new();
+            (&mut *input).take(len).read_to_end(&mut v)?;
+            Ok(v)
+        };
+        read_entry(&self.index, &self.t, &mut read_at, stream, index)
+    }
+
+    fn sync_at_or_before(&self, stream: usize, pts: i64) -> Option<u64> {
+        let sync = self.index.sync.get(stream)?;
         let n = sync.partition_point(|&(p, _)| p <= pts);
         n.checked_sub(1).map(|i| sync[i].1)
     }
