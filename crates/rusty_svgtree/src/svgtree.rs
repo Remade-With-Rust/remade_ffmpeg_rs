@@ -96,106 +96,235 @@ impl EId {
     }
 }
 
-/// Presentation attributes: settable from CSS and the `style` attribute.
-fn is_presentation(name: &str) -> bool {
-    matches!(
-        name,
-        "alignment-baseline"
-            | "baseline-shift"
-            | "background-color"
-            | "clip-path"
-            | "clip-rule"
-            | "color"
-            | "color-interpolation"
-            | "color-interpolation-filters"
-            | "color-rendering"
-            | "direction"
-            | "display"
-            | "dominant-baseline"
-            | "fill"
-            | "fill-opacity"
-            | "fill-rule"
-            | "filter"
-            | "flood-color"
-            | "flood-opacity"
-            | "font-family"
-            | "font-kerning"
-            | "font-size"
-            | "font-size-adjust"
-            | "font-stretch"
-            | "font-style"
-            | "font-variant"
-            | "font-weight"
-            | "image-rendering"
-            | "isolation"
-            | "letter-spacing"
-            | "lighting-color"
-            | "marker-end"
-            | "marker-mid"
-            | "marker-start"
-            | "mask"
-            | "mask-type"
-            | "mix-blend-mode"
-            | "opacity"
-            | "overflow"
-            | "paint-order"
-            | "shape-rendering"
-            | "stop-color"
-            | "stop-opacity"
-            | "stroke"
-            | "stroke-dasharray"
-            | "stroke-dashoffset"
-            | "stroke-linecap"
-            | "stroke-linejoin"
-            | "stroke-miterlimit"
-            | "stroke-opacity"
-            | "stroke-width"
-            | "text-anchor"
-            | "text-decoration"
-            | "text-rendering"
-            | "transform"
-            | "transform-origin"
-            | "unicode-bidi"
-            | "vector-effect"
-            | "visibility"
-            | "word-spacing"
-            | "writing-mode"
-    )
+macro_rules! attribute_ids {
+    ($($variant:ident = $name:literal,)*) => {
+        /// The attributes we keep, by name: every presentation attribute and
+        /// every other attribute the converter reads. An element's other
+        /// attributes are dropped while the document is built (nothing could
+        /// look them up).
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        #[repr(u8)]
+        pub(crate) enum AId {
+            $($variant,)*
+        }
+
+        impl AId {
+            fn from_name(name: &str) -> Option<AId> {
+                Some(match name {
+                    $($name => AId::$variant,)*
+                    _ => return None,
+                })
+            }
+        }
+    };
 }
 
-fn is_non_inheritable(name: &str) -> bool {
-    matches!(
-        name,
-        "alignment-baseline"
-            | "baseline-shift"
-            | "clip-path"
-            | "display"
-            | "dominant-baseline"
-            | "filter"
-            | "flood-color"
-            | "flood-opacity"
-            | "mask"
-            | "opacity"
-            | "overflow"
-            | "lighting-color"
-            | "stop-color"
-            | "stop-opacity"
-            | "text-decoration"
-            | "transform"
-            | "transform-origin"
-    )
+attribute_ids! {
+    AlignmentBaseline = "alignment-baseline",
+    BaselineShift = "baseline-shift",
+    BackgroundColor = "background-color",
+    ClipPath = "clip-path",
+    ClipRule = "clip-rule",
+    Color = "color",
+    ColorInterpolation = "color-interpolation",
+    ColorInterpolationFilters = "color-interpolation-filters",
+    ColorRendering = "color-rendering",
+    Direction = "direction",
+    Display = "display",
+    DominantBaseline = "dominant-baseline",
+    Fill = "fill",
+    FillOpacity = "fill-opacity",
+    FillRule = "fill-rule",
+    Filter = "filter",
+    FloodColor = "flood-color",
+    FloodOpacity = "flood-opacity",
+    FontFamily = "font-family",
+    FontKerning = "font-kerning",
+    FontSize = "font-size",
+    FontSizeAdjust = "font-size-adjust",
+    FontStretch = "font-stretch",
+    FontStyle = "font-style",
+    FontVariant = "font-variant",
+    FontWeight = "font-weight",
+    ImageRendering = "image-rendering",
+    Isolation = "isolation",
+    LetterSpacing = "letter-spacing",
+    LightingColor = "lighting-color",
+    MarkerEnd = "marker-end",
+    MarkerMid = "marker-mid",
+    MarkerStart = "marker-start",
+    Mask = "mask",
+    MaskType = "mask-type",
+    MixBlendMode = "mix-blend-mode",
+    Opacity = "opacity",
+    Overflow = "overflow",
+    PaintOrder = "paint-order",
+    ShapeRendering = "shape-rendering",
+    StopColor = "stop-color",
+    StopOpacity = "stop-opacity",
+    Stroke = "stroke",
+    StrokeDasharray = "stroke-dasharray",
+    StrokeDashoffset = "stroke-dashoffset",
+    StrokeLinecap = "stroke-linecap",
+    StrokeLinejoin = "stroke-linejoin",
+    StrokeMiterlimit = "stroke-miterlimit",
+    StrokeOpacity = "stroke-opacity",
+    StrokeWidth = "stroke-width",
+    TextAnchor = "text-anchor",
+    TextDecoration = "text-decoration",
+    TextRendering = "text-rendering",
+    Transform = "transform",
+    TransformOrigin = "transform-origin",
+    UnicodeBidi = "unicode-bidi",
+    VectorEffect = "vector-effect",
+    Visibility = "visibility",
+    WordSpacing = "word-spacing",
+    WritingMode = "writing-mode",
+    Id = "id",
+    Href = "href",
+    Width = "width",
+    Height = "height",
+    X = "x",
+    Y = "y",
+    Cx = "cx",
+    Cy = "cy",
+    R = "r",
+    Rx = "rx",
+    Ry = "ry",
+    X1 = "x1",
+    Y1 = "y1",
+    X2 = "x2",
+    Y2 = "y2",
+    Fx = "fx",
+    Fy = "fy",
+    Fr = "fr",
+    D = "d",
+    Points = "points",
+    ViewBox = "viewBox",
+    PreserveAspectRatio = "preserveAspectRatio",
+    Offset = "offset",
+    GradientUnits = "gradientUnits",
+    GradientTransform = "gradientTransform",
+    SpreadMethod = "spreadMethod",
+    PatternUnits = "patternUnits",
+    PatternContentUnits = "patternContentUnits",
+    PatternTransform = "patternTransform",
+    ClipPathUnits = "clipPathUnits",
+    MaskUnits = "maskUnits",
+    MaskContentUnits = "maskContentUnits",
+    MarkerUnits = "markerUnits",
+    MarkerWidth = "markerWidth",
+    MarkerHeight = "markerHeight",
+    RefX = "refX",
+    RefY = "refY",
+    Orient = "orient",
+    RequiredExtensions = "requiredExtensions",
+    RequiredFeatures = "requiredFeatures",
+    SystemLanguage = "systemLanguage",
 }
 
-/// Whether an attribute is inherited by descendants.
-pub(crate) fn is_inheritable(name: &str) -> bool {
-    is_presentation(name) && !is_non_inheritable(name)
+impl AId {
+    /// Presentation attributes: settable from CSS and the `style` attribute.
+    fn is_presentation(self) -> bool {
+        matches!(
+            self,
+            AId::AlignmentBaseline
+                | AId::BaselineShift
+                | AId::BackgroundColor
+                | AId::ClipPath
+                | AId::ClipRule
+                | AId::Color
+                | AId::ColorInterpolation
+                | AId::ColorInterpolationFilters
+                | AId::ColorRendering
+                | AId::Direction
+                | AId::Display
+                | AId::DominantBaseline
+                | AId::Fill
+                | AId::FillOpacity
+                | AId::FillRule
+                | AId::Filter
+                | AId::FloodColor
+                | AId::FloodOpacity
+                | AId::FontFamily
+                | AId::FontKerning
+                | AId::FontSize
+                | AId::FontSizeAdjust
+                | AId::FontStretch
+                | AId::FontStyle
+                | AId::FontVariant
+                | AId::FontWeight
+                | AId::ImageRendering
+                | AId::Isolation
+                | AId::LetterSpacing
+                | AId::LightingColor
+                | AId::MarkerEnd
+                | AId::MarkerMid
+                | AId::MarkerStart
+                | AId::Mask
+                | AId::MaskType
+                | AId::MixBlendMode
+                | AId::Opacity
+                | AId::Overflow
+                | AId::PaintOrder
+                | AId::ShapeRendering
+                | AId::StopColor
+                | AId::StopOpacity
+                | AId::Stroke
+                | AId::StrokeDasharray
+                | AId::StrokeDashoffset
+                | AId::StrokeLinecap
+                | AId::StrokeLinejoin
+                | AId::StrokeMiterlimit
+                | AId::StrokeOpacity
+                | AId::StrokeWidth
+                | AId::TextAnchor
+                | AId::TextDecoration
+                | AId::TextRendering
+                | AId::Transform
+                | AId::TransformOrigin
+                | AId::UnicodeBidi
+                | AId::VectorEffect
+                | AId::Visibility
+                | AId::WordSpacing
+                | AId::WritingMode
+        )
+    }
+
+    fn is_non_inheritable(self) -> bool {
+        matches!(
+            self,
+            AId::AlignmentBaseline
+                | AId::BaselineShift
+                | AId::ClipPath
+                | AId::Display
+                | AId::DominantBaseline
+                | AId::Filter
+                | AId::FloodColor
+                | AId::FloodOpacity
+                | AId::Mask
+                | AId::Opacity
+                | AId::Overflow
+                | AId::LightingColor
+                | AId::StopColor
+                | AId::StopOpacity
+                | AId::TextDecoration
+                | AId::Transform
+                | AId::TransformOrigin
+        )
+    }
+
+    /// Whether the attribute is inherited by descendants.
+    pub(crate) fn is_inheritable(self) -> bool {
+        self.is_presentation() && !self.is_non_inheritable()
+    }
 }
 
 #[derive(Clone, Debug)]
 struct Attr {
-    name: Box<str>,
-    value: Box<str>,
+    name: AId,
     important: bool,
+    value: Box<str>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -255,18 +384,18 @@ impl<'a> SvgNode<'a> {
     }
 
     pub(crate) fn element_id(&self) -> &'a str {
-        self.attribute("id").unwrap_or("")
+        self.attribute(AId::Id).unwrap_or("")
     }
 
-    pub(crate) fn attribute(&self, name: &str) -> Option<&'a str> {
+    pub(crate) fn attribute(&self, name: AId) -> Option<&'a str> {
         let r = self.d().attrs.clone();
         self.doc.attrs[r.start as usize..r.end as usize]
             .iter()
-            .find(|a| &*a.name == name)
+            .find(|a| a.name == name)
             .map(|a| &*a.value)
     }
 
-    pub(crate) fn has_attribute(&self, name: &str) -> bool {
+    pub(crate) fn has_attribute(&self, name: AId) -> bool {
         self.attribute(name).is_some()
     }
 
@@ -307,8 +436,8 @@ impl<'a> SvgNode<'a> {
     /// Looks an attribute up on self or, if inheritable, on ancestors; a
     /// non-inheritable attribute is also taken from the direct parent (usvg's
     /// `find_attribute`).
-    pub(crate) fn find_attribute_node(&self, name: &str) -> Option<SvgNode<'a>> {
-        if is_inheritable(name) {
+    pub(crate) fn find_attribute_node(&self, name: AId) -> Option<SvgNode<'a>> {
+        if name.is_inheritable() {
             self.ancestors().find(|n| n.has_attribute(name))
         } else if self.has_attribute(name) {
             Some(*self)
@@ -317,18 +446,18 @@ impl<'a> SvgNode<'a> {
         }
     }
 
-    pub(crate) fn find_attribute(&self, name: &str) -> Option<&'a str> {
+    pub(crate) fn find_attribute(&self, name: AId) -> Option<&'a str> {
         self.find_attribute_node(name)?.attribute(name)
     }
 
     /// Resolves an `href` (`#id`) to a node.
     pub(crate) fn href(&self) -> Option<SvgNode<'a>> {
-        let v = self.attribute("href")?;
+        let v = self.attribute(AId::Href)?;
         self.doc.element_by_id(crate::values::iri(v)?)
     }
 
     /// Resolves a `url(#id)` attribute to a node.
-    pub(crate) fn func_iri_attribute(&self, name: &str) -> Option<SvgNode<'a>> {
+    pub(crate) fn func_iri_attribute(&self, name: AId) -> Option<SvgNode<'a>> {
         let v = self.attribute(name)?;
         self.doc.element_by_id(crate::values::func_iri(v)?)
     }
@@ -466,10 +595,10 @@ impl Document {
         id
     }
 
-    fn set_attribute_value(&mut self, node: NodeId, name: &str, value: &str) {
+    fn set_attribute_value(&mut self, node: NodeId, name: AId, value: &str) {
         let r = self.nodes[node.0 as usize].attrs.clone();
         for a in &mut self.attrs[r.start as usize..r.end as usize] {
-            if &*a.name == name {
+            if a.name == name {
                 a.value = value.into();
             }
         }
@@ -693,15 +822,15 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document, Error> {
             id: NodeId(i as u32),
             doc: &b.doc,
         };
-        if let Some(id) = node.attribute("id") {
+        if let Some(id) = node.attribute(AId::Id) {
             links.entry(id.into()).or_insert(NodeId(i as u32));
         }
     }
     b.doc.links = links;
-    fix_recursive_links(&mut b.doc, EId::ClipPath, "clip-path");
-    fix_recursive_links(&mut b.doc, EId::Mask, "mask");
-    fix_recursive_patterns(&mut b.doc, "fill");
-    fix_recursive_patterns(&mut b.doc, "stroke");
+    fix_recursive_links(&mut b.doc, EId::ClipPath, AId::ClipPath);
+    fix_recursive_links(&mut b.doc, EId::Mask, AId::Mask);
+    fix_recursive_patterns(&mut b.doc, AId::Fill);
+    fix_recursive_patterns(&mut b.doc, AId::Stroke);
     Ok(b.doc)
 }
 
@@ -830,11 +959,15 @@ impl Builder<'_> {
             if matches!(name, "mix-blend-mode" | "isolation" | "font-kerning") {
                 continue;
             }
+            // An attribute nothing reads is not kept.
+            let Some(name) = AId::from_name(name) else {
+                continue;
+            };
             let value = self.xml.content(aid);
             append_attribute(&mut self.doc, parent, start, name, value, false, false);
         }
         if let Some(h) = href {
-            append_attribute(&mut self.doc, parent, start, "href", h, false, false);
+            append_attribute(&mut self.doc, parent, start, AId::Href, h, false, false);
         }
 
         // 2. Style sheet rules (sorted by specificity), then 3. `style`: each
@@ -878,10 +1011,10 @@ fn apply_declaration(
     important: bool,
 ) {
     if name == "marker" {
-        for n in ["marker-start", "marker-mid", "marker-end"] {
+        for n in [AId::MarkerStart, AId::MarkerMid, AId::MarkerEnd] {
             append_attribute(doc, parent, start, n, value, important, true);
         }
-    } else if is_presentation(name) {
+    } else if let Some(name) = AId::from_name(name).filter(|n| n.is_presentation()) {
         append_attribute(doc, parent, start, name, value, important, true);
     }
 }
@@ -892,7 +1025,7 @@ fn append_attribute(
     doc: &mut Document,
     parent: NodeId,
     start: usize,
-    name: &str,
+    name: AId,
     value: &str,
     important: bool,
     replace: bool,
@@ -906,7 +1039,7 @@ fn append_attribute(
     let Some((value, important)) = resolved else {
         return;
     };
-    if let Some(existing) = doc.attrs[start..].iter_mut().find(|a| &*a.name == name) {
+    if let Some(existing) = doc.attrs[start..].iter_mut().find(|a| a.name == name) {
         if replace && !existing.important {
             existing.value = value;
             existing.important = important;
@@ -914,15 +1047,15 @@ fn append_attribute(
         return;
     }
     doc.attrs.push(Attr {
-        name: name.into(),
-        value,
+        name,
         important,
+        value,
     });
 }
 
-fn resolve_inherit(doc: &Document, parent: NodeId, name: &str) -> Option<(Box<str>, bool)> {
+fn resolve_inherit(doc: &Document, parent: NodeId, name: AId) -> Option<(Box<str>, bool)> {
     let p = SvgNode { id: parent, doc };
-    let found = if is_inheritable(name) {
+    let found = if name.is_inheritable() {
         p.ancestors().find(|n| n.has_attribute(name))
     } else {
         Some(p).filter(|n| n.tag_name().is_some() && n.has_attribute(name))
@@ -931,22 +1064,37 @@ fn resolve_inherit(doc: &Document, parent: NodeId, name: &str) -> Option<(Box<st
         return n.attribute(name).map(|v| (v.into(), false));
     }
     let def = match name {
-        "image-rendering" | "shape-rendering" | "text-rendering" => "auto",
-        "clip-path" | "filter" | "marker-end" | "marker-mid" | "marker-start" | "mask"
-        | "stroke" | "stroke-dasharray" | "text-decoration" => "none",
-        "font-stretch" | "font-style" | "font-variant" | "font-weight" | "letter-spacing"
-        | "word-spacing" => "normal",
-        "fill" | "flood-color" | "stop-color" => "black",
-        "fill-opacity" | "flood-opacity" | "opacity" | "stop-opacity" | "stroke-opacity" => "1",
-        "clip-rule" | "fill-rule" => "nonzero",
-        "display" => "inline",
-        "overflow" => "visible",
-        "stroke-dashoffset" => "0",
-        "stroke-linecap" => "butt",
-        "stroke-linejoin" => "miter",
-        "stroke-miterlimit" => "4",
-        "stroke-width" => "1",
-        "visibility" => "visible",
+        AId::ImageRendering | AId::ShapeRendering | AId::TextRendering => "auto",
+        AId::ClipPath
+        | AId::Filter
+        | AId::MarkerEnd
+        | AId::MarkerMid
+        | AId::MarkerStart
+        | AId::Mask
+        | AId::Stroke
+        | AId::StrokeDasharray
+        | AId::TextDecoration => "none",
+        AId::FontStretch
+        | AId::FontStyle
+        | AId::FontVariant
+        | AId::FontWeight
+        | AId::LetterSpacing
+        | AId::WordSpacing => "normal",
+        AId::Fill | AId::FloodColor | AId::StopColor => "black",
+        AId::FillOpacity
+        | AId::FloodOpacity
+        | AId::Opacity
+        | AId::StopOpacity
+        | AId::StrokeOpacity => "1",
+        AId::ClipRule | AId::FillRule => "nonzero",
+        AId::Display => "inline",
+        AId::Overflow => "visible",
+        AId::StrokeDashoffset => "0",
+        AId::StrokeLinecap => "butt",
+        AId::StrokeLinejoin => "miter",
+        AId::StrokeMiterlimit => "4",
+        AId::StrokeWidth => "1",
+        AId::Visibility => "visible",
         _ => return None,
     };
     Some((def.into(), false))
@@ -956,7 +1104,7 @@ fn resolve_inherit(doc: &Document, parent: NodeId, name: &str) -> Option<(Box<st
 /// `clipPath`'s content pointing back at it), exactly as usvg does: the
 /// offending attribute becomes `none`. Longer cycles are caught by the
 /// converter's recursion guard.
-fn fix_recursive_links(doc: &mut Document, eid: EId, attr: &str) {
+fn fix_recursive_links(doc: &mut Document, eid: EId, attr: AId) {
     let mut fixes: Vec<NodeId> = Vec::new();
     let mut steps = 0usize;
     'outer: {
@@ -991,7 +1139,7 @@ fn fix_recursive_links(doc: &mut Document, eid: EId, attr: &str) {
 }
 
 /// Pattern content painting with its own pattern: the paint becomes `none`.
-fn fix_recursive_patterns(doc: &mut Document, attr: &str) {
+fn fix_recursive_patterns(doc: &mut Document, attr: AId) {
     let mut fixes: Vec<NodeId> = Vec::new();
     let mut steps = 0usize;
     'outer: {
