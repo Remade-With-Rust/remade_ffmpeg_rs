@@ -60,9 +60,9 @@ fn read_wav(engine: &Engine, path: &Path) -> (Stream, Vec<u8>) {
 /// filled with its index (so duplicates are detectable).
 fn write_y4m(path: &Path, frames: usize) {
     let mut f = fs::File::create(path).unwrap();
-    write!(f, "YUV4MPEG2 W16 H16 F25:1 Ip A1:1 C420mpeg2\n").unwrap();
+    writeln!(f, "YUV4MPEG2 W16 H16 F25:1 Ip A1:1 C420mpeg2").unwrap();
     for i in 0..frames {
-        write!(f, "FRAME\n").unwrap();
+        writeln!(f, "FRAME").unwrap();
         f.write_all(&vec![(16 + i) as u8; 16 * 16]).unwrap(); // Y
         f.write_all(&[128u8; 8 * 8]).unwrap(); // U
         f.write_all(&[128u8; 8 * 8]).unwrap(); // V

@@ -24,4 +24,4 @@ rusty_alloc-api.workspace = true
 #   cargo build -p rff-ui
 # For web/mobile targets, swap the feature and use the `dx` CLI (dioxus-cli).
 dioxus = { version = "0.6", features = ["desktop"] }
-rff.workspace = true
+rff = { workspace = true, features = ["default"] }

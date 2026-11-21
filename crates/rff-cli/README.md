@@ -41,11 +41,13 @@ Want the drop-in `ffmpeg`/`ffprobe` names so existing scripts work unchanged?
 cargo install rff-cli --features drop-in-names
 ```
 
-> **Build prerequisite — `nasm`.** The default build enables `h264-asm`
-> (`rusty_h264`'s hand-written SIMD kernels), which assembles with
-> [`nasm`](https://nasm.us). Install it (`winget install NASM` /
-> `brew install nasm` / `apt install nasm`), or use
-> `--no-default-features` for the pure-Rust scalar H.264 path.
+> **Build prerequisite — `nasm`.** The default build enables `av1-asm`
+> (the dav1d/rav1e hand-written assembly behind AV1/AVIF), which on x86-64
+> assembles with [`nasm`](https://nasm.us). Install it (`winget install NASM` /
+> `brew install nasm` / `apt install nasm`).
+> No NASM? `cargo install rff-cli --no-default-features` builds without it;
+> AV1/AVIF encode is then about 3× slower and decode 1.5–3× slower (same
+> output, byte for byte).
 
 **Trademark.** This is an independent, clean-room reimplementation, **not
 affiliated with, endorsed by, or derived from the source code of the FFmpeg

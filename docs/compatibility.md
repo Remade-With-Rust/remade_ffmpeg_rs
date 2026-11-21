@@ -35,8 +35,10 @@ licensed (CI-enforced by `cargo-deny`).
 | WebP | ✅ | ✅ | image-webp (pure Rust) | validated |
 | JPEG XL | ✅ | — | jxl-oxide (pure Rust) | validated |
 
-> **H.264 SIMD:** the default build uses `rusty_h264` with its hand-written
-> assembly kernels on (`h264-asm`, needs `nasm`) — no C. A separate **opt-in** C
+> **H.264 SIMD:** the default build uses `rusty_h264` with its SIMD kernels
+> on (`h264-asm`, portable Rust SIMD, no `nasm`) — no C. AV1/AVIF uses the
+> dav1d/rav1e assembly by default (`av1-asm`, needs `nasm` on x86-64; build
+> with `--no-default-features` to go without). A separate **opt-in** C
 > path (`--features h264-openh264`, Cisco openh264) exists only as a cross-check.
 >
 > ⚖ = patent-relevant — see [Patents](#patents).

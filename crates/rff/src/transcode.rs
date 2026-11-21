@@ -251,7 +251,7 @@ impl Trim {
     }
 
     fn keeps(&self, t: f64) -> bool {
-        t >= self.start - 1e-9 && self.end.map_or(true, |e| t < e - 1e-9)
+        t >= self.start - 1e-9 && self.end.is_none_or(|e| t < e - 1e-9)
     }
 }
 
@@ -1339,7 +1339,7 @@ fn decode_overlay_frame(
     let mut got_eof = false;
     loop {
         let frame = match demuxer.read_packet() {
-            Ok(pkt) if pkt.stream_index as usize != vidx => continue,
+            Ok(pkt) if pkt.stream_index != vidx => continue,
             Ok(pkt) => {
                 decoder.send_packet(&pkt)?;
                 decoder.receive_frame()

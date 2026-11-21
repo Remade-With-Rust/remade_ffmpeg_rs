@@ -36,12 +36,20 @@ path = "src/bin/ffprobe.rs"
 required-features = ["drop-in-names"]
 
 [dependencies]
-rff.workspace = true
+# The facade's default features, spelled out (the workspace entry is
+# `default-features = false`) so that `av1-asm` below is reachable with
+# `--no-default-features`. `h264-asm` is portable Rust SIMD: no NASM.
+rff = { workspace = true, features = ["h264-asm"] }
 rff-core.workspace = true
 rusty_alloc-api.workspace = true
 
 [features]
-default = []
+default = ["av1-asm"]
+# AV1/AVIF hand-written assembly (dav1d/rav1e). Needs NASM on x86-64. No NASM?
+#   cargo install rff-cli --no-default-features
+# builds without it; AVIF encode/decode then run the slower Rust fallback
+# (same output). (issue #172)
+av1-asm = ["rff/av1-asm"]
 # Additionally install the drop-in `ffmpeg` and `ffprobe` executables, so
 # existing scripts and muscle memory just work:
 #   cargo install rff-cli --features drop-in-names
@@ -56,7 +64,6 @@ h264-openh264 = ["rff/h264-openh264"]
 # `rff`/`rffprobe` with `--features https`. Off by default.
 https = ["rff/https"]
 
-# `rff-cli`'s own default feature set is empty, but it depends on `rff` with
-# default features (which enable `h264-asm` → needs `nasm`, absent on docs.rs).
+# The default `av1-asm` feature needs NASM, which docs.rs does not have.
 [package.metadata.docs.rs]
 no-default-features = true

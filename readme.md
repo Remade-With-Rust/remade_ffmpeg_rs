@@ -93,6 +93,8 @@ cargo install rff-cli --features drop-in-names  # also ffmpeg + ffprobe
 cargo add remade-ffmpeg                         # the engine as a library
 ```
 
+No NASM? `cargo install rff-cli --no-default-features` builds without it; AV1/AVIF encode is then about 3× slower and decode 1.5–3× slower (same output).
+
 The drop-in names are opt-in because they shadow a real FFmpeg on your `PATH`. Prebuilt archives with both name pairs are on [Releases](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/releases).
 
 ## Quick start

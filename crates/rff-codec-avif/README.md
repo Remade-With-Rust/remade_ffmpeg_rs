@@ -6,11 +6,11 @@
 
 The **AVIF** still-image codec adapter for **remade_ffmpeg_rs** — an AV1 intra
 frame, decoded and encoded by our [rusty-av1-toolkit](https://github.com/Remade-With-Rust/rusty-av1-toolkit)
-forks. **100% pure Rust, no C/FFI, no `nasm`.**
+forks. **No C/FFI.**
 
 - **Decode and encode**, 8- and 10-bit, via [`rusty_av1d`](https://crates.io/crates/rusty_av1d) (our fork of **rav1d**, the Rust port of VideoLAN's dav1d) and [`rusty_av1e`](https://crates.io/crates/rusty_av1e) (our fork of **rav1e**).
 - Our encoder fork runs **~1.10× faster than stock rav1e at byte-identical output**, or up to **~1.69× faster** in opt-in `--racecar` mode.
-- Built with `default-features = false` so no assembler toolchain is required — the decode path stays 100% safe Rust.
+- The default `av1-asm` feature turns on the dav1d/rav1e hand-written SIMD assembly, which needs [`nasm`](https://nasm.us) on x86-64. Build with `default-features = false` for a pure-Rust build with no assembler: byte-identical output, with encode about 3× and decode 1.5–3× slower. On wasm32 the feature is a no-op.
 - AV1/AVIF is royalty-free.
 
 ## Usage
