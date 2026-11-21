@@ -1108,11 +1108,13 @@ fn copy_packed(out: &mut [u8], chunk: &[u8], g: &Geom, out_row_bytes: usize) {
 /// Zero-fill always allowed, whatever the ratio (unless it is 0).
 const FILL_FLOOR: u64 = 64 << 10;
 
-/// The limits, plus the zero-fill accounting of one image decode: how many
-/// bytes were really decoded, how many were zero-filled because a chunk
-/// ended early, and the most the chunks not yet decoded can still produce.
+/// The state of one image decode. The limits, plus the zero-fill
+/// accounting: how many bytes were really decoded, how many were zero-filled
+/// because a chunk ended early, and the most the chunks not yet decoded can
+/// still produce. And the inflater the Deflate chunks share (reset for each).
 struct Budget<'a> {
     limits: &'a Limits,
+    inflate: Option<flate2::Decompress>,
     /// Most bytes one stored byte can decode to with this compression.
     per_byte: u64,
     potential: u64,
@@ -1207,6 +1209,7 @@ fn decode_image<R: Read + Seek>(
     let per_byte = max_expansion(info.compression, row_bytes(cw0, img.spp_chunk(), bits)?);
     let mut budget = Budget {
         limits,
+        inflate: None,
         per_byte,
         potential: stored.saturating_mul(per_byte),
         real: 0,
@@ -1472,7 +1475,7 @@ fn decode_chunk_append<R: Read + Seek>(
         let real = match comp {
             compression::LZW => lzw::decode_append(&raw, dst, expected)?,
             compression::DEFLATE | compression::OLD_DEFLATE => {
-                deflate::decode_append(&raw, dst, expected)?
+                deflate::decode_append(&raw, dst, expected, &mut budget.inflate)?
             }
             compression::PACKBITS => packbits::decode_append(&raw, dst, expected)?,
             compression::CCITT_RLE | compression::CCITT_FAX3 | compression::CCITT_FAX4 => {

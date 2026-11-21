@@ -9,7 +9,7 @@ use crate::error::{TiffError, TiffResult};
 #[cfg(test)]
 pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
     let mut v = Vec::new();
-    decode_append(data, &mut v, out.len())?;
+    decode_append(data, &mut v, out.len(), &mut None)?;
     out.copy_from_slice(&v);
     Ok(())
 }
@@ -19,7 +19,16 @@ pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
 /// more, so a decompression bomb costs at most `n` bytes; anything the
 /// inflater writes past `n` (only possible if the allocator handed back
 /// more capacity than asked) is truncated away.
-pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffResult<usize> {
+///
+/// `state` is the inflater, kept for all the chunks of an image and reset
+/// for each one: building a new one per chunk allocates and clears its
+/// state and window every time (6.5% of a decode with default 8 KB strips).
+pub(crate) fn decode_append(
+    data: &[u8],
+    out: &mut Vec<u8>,
+    n: usize,
+    state: &mut Option<Decompress>,
+) -> TiffResult<usize> {
     out.try_reserve_exact(n)
         .map_err(|_| TiffError::limits(format!("cannot allocate {n} bytes")))?;
     let base = out.len();
@@ -29,10 +38,17 @@ pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffRes
     // raw deflate stream behind it, as libtiff-free readers such as
     // image-tiff do: a bit flip in the header no longer loses pixels the
     // stream itself still holds. Intact headers take the checked zlib path.
-    let (mut d, data) = if data.len() >= 2 && !zlib_header_ok(data[0], data[1]) {
-        (Decompress::new(false), &data[2..])
+    let (zlib, data) = if data.len() >= 2 && !zlib_header_ok(data[0], data[1]) {
+        (false, &data[2..])
     } else {
-        (Decompress::new(true), data)
+        (true, data)
+    };
+    let d = match state {
+        Some(d) => {
+            d.reset(zlib);
+            d
+        }
+        None => state.insert(Decompress::new(zlib)),
     };
     loop {
         if out.len() >= target {
@@ -200,6 +216,47 @@ mod tests {
             let mut out = vec![0u8; data.len()];
             decode(&enc, &mut out).unwrap();
             assert_eq!(out, data);
+        }
+    }
+
+    #[test]
+    fn inflater_reused_across_chunks() {
+        // One inflater for every chunk of an image: intact headers, damaged
+        // headers (raw fallback), a failed stream and a short one, in any
+        // order, each give what a fresh inflater gives.
+        let a: Vec<u8> = (0..30_000u32)
+            .map(|i| (i % 249) as u8 ^ (i >> 8) as u8)
+            .collect();
+        let b: Vec<u8> = (0..9_000u32).map(|i| (i * 7 % 256) as u8).collect();
+        let ea = encode(&a, 6);
+        let mut eb = encode(&b, 1);
+        eb[0] ^= 0x01; // damaged header: inflated as raw deflate
+        assert!(!zlib_header_ok(eb[0], eb[1]));
+        let short = encode(&[9, 8, 7], 6);
+        let garbage = [0x78, 0x9c, 0xff, 0xff, 0xff];
+        let chunks: [(&[u8], usize); 6] = [
+            (&ea, a.len()),
+            (&eb, b.len()),
+            (&garbage, 64),
+            (&short, 16),
+            (&eb, b.len()),
+            (&ea, a.len()),
+        ];
+        let mut state = None;
+        for (data, n) in chunks {
+            let mut fresh = Vec::new();
+            let want = decode_append(data, &mut fresh, n, &mut None);
+            let mut kept = vec![0x55u8; 3];
+            let got = decode_append(data, &mut kept, n, &mut state);
+            match (want, got) {
+                (Ok(w), Ok(g)) => {
+                    assert_eq!(w, g);
+                    assert_eq!(&kept[..3], &[0x55; 3]);
+                    assert_eq!(kept[3..], fresh[..]);
+                }
+                (Err(_), Err(_)) => {}
+                (w, g) => panic!("fresh {w:?} kept {g:?}"),
+            }
         }
     }
 
