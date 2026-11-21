@@ -10,7 +10,8 @@
 /// The sample width is fixed per arm, so each loop is a load, a byte swap
 /// and a store that the compiler vectorises. One loop over a run-time width
 /// (`chunks_exact_mut(n)` + `reverse`) cost 20 Ir per 16-bit sample: 87% of
-/// a big-endian 16-bit decode.
+/// a big-endian 16-bit decode, which went from 107.9M to 21.8M Ir (and from
+/// 17.7 to 5.6 ms).
 pub(crate) fn swap_bytes(buf: &mut [u8], n: usize) {
     fn swap<const N: usize>(buf: &mut [u8]) {
         for c in buf.chunks_exact_mut(N) {
