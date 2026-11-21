@@ -949,14 +949,30 @@ fn dib_pixels(image: &Image, d: &Dib, out: &mut Vec<u8>) {
     let base = out.len();
     out.resize(base + d.pixels_len, 0);
     let pixels = &mut out[base..];
+    let g = (w * ch, w * bpp, d.row_bytes, h);
+    match image.format {
+        PixelFormat::L8 => dib_rows(&image.pixels, pixels, g, |d, s| d.copy_from_slice(s)),
+        PixelFormat::Rgb8 => dib_rows(&image.pixels, pixels, g, crate::swizzle::swap_rb3),
+        _ => dib_rows(&image.pixels, pixels, g, crate::swizzle::swap_rb4),
+    }
+}
+
+/// Image rows (`n_src` bytes each) to bottom-up file rows (`n_dst` bytes at
+/// a pitch of `row_bytes`), each through `f`. Out of line, one copy per
+/// format, the format decided once instead of in every row (and no
+/// format's loop sharing registers with another's).
+#[inline(never)]
+fn dib_rows(
+    src: &[u8],
+    dst: &mut [u8],
+    (n_src, n_dst, row_bytes, h): (usize, usize, usize, usize),
+    mut f: impl FnMut(&mut [u8], &[u8]),
+) {
     for y in 0..h {
-        let src = &image.pixels[y * w * ch..(y + 1) * w * ch];
-        let dst = &mut pixels[(h - 1 - y) * d.row_bytes..][..w * bpp];
-        match image.format {
-            PixelFormat::L8 => dst.copy_from_slice(src),
-            PixelFormat::Rgb8 => crate::swizzle::swap_rb3(dst, src),
-            _ => crate::swizzle::swap_rb4(dst, src),
-        }
+        f(
+            &mut dst[(h - 1 - y) * row_bytes..][..n_dst],
+            &src[y * n_src..(y + 1) * n_src],
+        );
     }
 }
 
