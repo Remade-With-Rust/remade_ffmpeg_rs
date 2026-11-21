@@ -6,10 +6,27 @@
 //! big-endian byte planes by definition (libtiff `fpAcc`/`fpDiff`).
 
 /// Reverse the byte order of every `n`-byte sample in place.
+///
+/// The sample width is fixed per arm, so each loop is a load, a byte swap
+/// and a store that the compiler vectorises. One loop over a run-time width
+/// (`chunks_exact_mut(n)` + `reverse`) cost 20 Ir per 16-bit sample: 87% of
+/// a big-endian 16-bit decode.
 pub(crate) fn swap_bytes(buf: &mut [u8], n: usize) {
-    if n > 1 {
-        for c in buf.chunks_exact_mut(n) {
+    fn swap<const N: usize>(buf: &mut [u8]) {
+        for c in buf.chunks_exact_mut(N) {
+            let c: &mut [u8; N] = c.try_into().unwrap();
             c.reverse();
+        }
+    }
+    match n {
+        0 | 1 => {}
+        2 => swap::<2>(buf),
+        4 => swap::<4>(buf),
+        8 => swap::<8>(buf),
+        _ => {
+            for c in buf.chunks_exact_mut(n) {
+                c.reverse();
+            }
         }
     }
 }
@@ -197,6 +214,25 @@ pub(crate) fn apply_float(buf: &mut [u8], row_bytes: usize, spp: usize, bytes: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swap_bytes_reverses_each_sample() {
+        for n in [0usize, 1, 2, 3, 4, 8] {
+            // Lengths with a trailing partial sample, which stays as it is.
+            for len in [0usize, 1, 7, 16, 37, 64, 67] {
+                let orig: Vec<u8> = (0..len).map(|i| (i * 29 + 3) as u8).collect();
+                let mut want = orig.clone();
+                if n > 1 {
+                    for c in want.chunks_exact_mut(n) {
+                        c.reverse();
+                    }
+                }
+                let mut got = orig.clone();
+                swap_bytes(&mut got, n);
+                assert_eq!(got, want, "n {n} len {len}");
+            }
+        }
+    }
 
     #[test]
     fn round_trips() {
