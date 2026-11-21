@@ -7,7 +7,7 @@
 use crate::color::{
     lab_to_xyz, mat_inv, mat_mul, mat_vec, xyz_to_lab, Lab, Mat3, Xyz, D50, IDENTITY,
 };
-use crate::curve::{clamp01, Curve};
+use crate::curve::{clamp01, Curve, InvCurve};
 use crate::error::{Error, Result};
 use crate::lut::{make_trilinear, Lut, Stage};
 use crate::profile::{ColorSpace, Profile, ProfileClass};
@@ -48,6 +48,10 @@ pub(crate) enum Op {
     Affine(Mat3, [f64; 3]),
     Clamp01,
     InvCurves(Vec<Curve>),
+    /// [`Op::InvCurves`] when every curve is a two-segment parametric one
+    /// (sRGB-shaped): the same values, without a `pow` per value for the
+    /// curve's break point.
+    InvBreakCurves(Vec<InvCurve>),
     /// Grey `Y` to D50 XYZ (1 to 3 channels).
     GrayToXyz,
     /// Grey value as `L*/100` to Lab (1 to 3 channels).
@@ -56,6 +60,14 @@ pub(crate) enum Op {
     XyzToGray,
     /// Lab to `L*/100` (3 to 1 channels).
     LabToGray,
+}
+
+/// The inverse-curves op for `curves`, prepared when every curve allows it.
+fn inv_curves(curves: Vec<Curve>) -> Op {
+    match curves.iter().map(InvCurve::new).collect::<Option<Vec<_>>>() {
+        Some(prepared) => Op::InvBreakCurves(prepared),
+        None => Op::InvCurves(curves),
+    }
 }
 
 fn run(ops: &[Op], v: &mut [f64; 16], mut n: usize) -> usize {
@@ -109,6 +121,11 @@ fn run(ops: &[Op], v: &mut [f64; 16], mut n: usize) -> usize {
             Op::InvCurves(cs) => {
                 for (x, c) in v.iter_mut().zip(cs) {
                     *x = c.eval_inverse(*x);
+                }
+            }
+            Op::InvBreakCurves(cs) => {
+                for (x, c) in v.iter_mut().zip(cs) {
+                    *x = c.eval(*x);
                 }
             }
             Op::GrayToXyz => {
@@ -371,7 +388,7 @@ pub(crate) fn output_side(p: &Profile, intent: Intent) -> Result<Side> {
                 (Op::LabToGray, None)
             };
             Ok(Side {
-                ops: vec![first, Op::Clamp01, Op::InvCurves(vec![c])],
+                ops: vec![first, Op::Clamp01, inv_curves(vec![c])],
                 pcs,
                 shaper,
             })
@@ -389,7 +406,7 @@ pub(crate) fn output_side(p: &Profile, intent: Intent) -> Result<Side> {
             }
             ops.push(Op::Affine(inv, [0.0; 3]));
             ops.push(Op::Clamp01);
-            ops.push(Op::InvCurves(curves.clone()));
+            ops.push(inv_curves(curves.clone()));
             let shaper = (pcs == Pcs::Xyz).then_some(Shaper {
                 curves,
                 matrix: inv,

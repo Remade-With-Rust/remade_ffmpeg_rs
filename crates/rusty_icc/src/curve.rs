@@ -115,7 +115,7 @@ impl Curve {
         let y = clamp01(y);
         let x = match self {
             Self::Table(t) => inverse_table(t, y),
-            Self::Parametric { function, params } => inverse_param(*function, params, y),
+            Self::Parametric { function, params } => inverse_param(*function, params, y, None),
         };
         clamp01(x)
     }
@@ -168,6 +168,42 @@ impl Curve {
                 }
             }
         }
+    }
+}
+
+/// A two-segment parametric curve (functions 3 and 4, the shape of sRGB
+/// and Rec. 709) prepared for repeated inverse evaluation: its break value
+/// is worked out once instead of with a libm `pow` per value.
+#[derive(Debug, Clone)]
+pub(crate) struct InvCurve {
+    function: u16,
+    params: [f64; 7],
+    brk: f64,
+}
+
+impl InvCurve {
+    /// `None` for every other curve kind (their inverse has no per-curve
+    /// constant worth keeping; use [`Curve::eval_inverse`]).
+    pub(crate) fn new(curve: &Curve) -> Option<Self> {
+        match curve {
+            Curve::Parametric { function, params } if matches!(function, 3 | 4) => Some(Self {
+                function: *function,
+                params: *params,
+                brk: inverse_break(*function, params),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Exactly [`Curve::eval_inverse`] of the curve this was made from.
+    pub(crate) fn eval(&self, y: f64) -> f64 {
+        let y = clamp01(y);
+        clamp01(inverse_param(
+            self.function,
+            &self.params,
+            y,
+            Some(self.brk),
+        ))
     }
 }
 
@@ -299,8 +335,24 @@ fn eval_param(function: u16, p: &[f64; 7], x: f64) -> f64 {
     }
 }
 
-fn inverse_param(function: u16, p: &[f64; 7], y: f64) -> f64 {
-    let [g, a, b, c, d, e, f] = *p;
+/// The output value at which the inverse of a two-segment parametric curve
+/// (functions 3 and 4) switches segment: the curve's value at its break
+/// point `d`. It depends on the curve alone.
+fn inverse_break(function: u16, p: &[f64; 7]) -> f64 {
+    let [g, a, b, _, d, e, _] = *p;
+    if function == 4 {
+        pow_pos(a * d + b, g) + e
+    } else {
+        pow_pos(a * d + b, g)
+    }
+}
+
+/// `brk` is [`inverse_break`] when the caller has it already
+/// ([`InvCurve`]); `None` computes it here, one libm `pow` per call.
+/// Inlined into both callers so each gets its own straight-line copy.
+#[inline(always)]
+fn inverse_param(function: u16, p: &[f64; 7], y: f64, brk: Option<f64>) -> f64 {
+    let [g, a, b, c, _, e, f] = *p;
     if g.abs() < 1e-9 {
         return 0.0;
     }
@@ -324,7 +376,7 @@ fn inverse_param(function: u16, p: &[f64; 7], y: f64) -> f64 {
             }
         }
         3 => {
-            let disc = pow_pos(a * d + b, g);
+            let disc = brk.unwrap_or_else(|| inverse_break(function, p));
             if y >= disc {
                 if a.abs() < 1e-9 {
                     0.0
@@ -338,7 +390,7 @@ fn inverse_param(function: u16, p: &[f64; 7], y: f64) -> f64 {
             }
         }
         4 => {
-            let disc = pow_pos(a * d + b, g) + e;
+            let disc = brk.unwrap_or_else(|| inverse_break(function, p));
             if y >= disc {
                 if a.abs() < 1e-9 {
                     0.0
@@ -367,6 +419,33 @@ mod tests {
             let y = c.eval(x);
             assert!((c.eval_inverse(y) - x).abs() < 1e-6, "x={x}");
         }
+    }
+
+    #[test]
+    fn prepared_inverse_matches_eval_inverse_bit_for_bit() {
+        let curves = [
+            Curve::srgb(),
+            Curve::rec709(),
+            Curve::parametric(4, &[2.2, 0.9, 0.1, 0.08, 0.05, 0.02, 0.01]).unwrap(),
+            Curve::parametric(3, &[1.0, 1.0, 0.0, 1.0, 0.5]).unwrap(),
+            // Degenerate parameters take the early-out arms.
+            Curve::parametric(3, &[2.4, 0.0, 0.1, 0.0, 0.2]).unwrap(),
+            Curve::parametric(4, &[0.0, 1.0, 0.0, 0.5, 0.3, 0.0, 0.0]).unwrap(),
+        ];
+        for c in &curves {
+            let inv = InvCurve::new(c).expect("two-segment curve");
+            let mut ys: Vec<f64> = (0..=20_000).map(|i| f64::from(i) / 20_000.0).collect();
+            ys.extend([-1.0, -0.0, 1.5, f64::NAN, f64::INFINITY, 1e-300, 0.04045]);
+            if let Curve::Parametric { function, params } = c {
+                let b = inverse_break(*function, params);
+                ys.extend([b, b - f64::EPSILON, b + f64::EPSILON]);
+            }
+            for y in ys {
+                assert_eq!(inv.eval(y).to_bits(), c.eval_inverse(y).to_bits(), "y={y}");
+            }
+        }
+        assert!(InvCurve::new(&Curve::gamma(2.2)).is_none());
+        assert!(InvCurve::new(&Curve::Table(vec![0, 65535])).is_none());
     }
 
     #[test]

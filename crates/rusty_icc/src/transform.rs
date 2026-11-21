@@ -3,7 +3,7 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::color::delta_e_2000;
-use crate::curve::clamp01;
+use crate::curve::{clamp01, InvCurve};
 use crate::error::{Error, Result};
 use crate::lut::ClutEval;
 use crate::pipeline::{build_chain, Chain, GamutChain, ShaperLink};
@@ -215,9 +215,15 @@ impl ShaperEngine {
         let in8 = Self::table(&link, 256);
         let mut out = vec![[0.0f32; OUT_TABLE]; link.out_curves.len()].into_boxed_slice();
         for (row, c) in out.iter_mut().zip(&link.out_curves) {
+            // The same values either way; the prepared form skips a `pow`
+            // per entry for sRGB-shaped curves.
+            let prepared = InvCurve::new(c);
             for (i, v) in row.iter_mut().enumerate() {
                 let t = i as f64 / (OUT_TABLE - 1) as f64;
-                *v = c.eval_inverse(t * t) as f32;
+                let y = t * t;
+                *v = prepared
+                    .as_ref()
+                    .map_or_else(|| c.eval_inverse(y), |p| p.eval(y)) as f32;
             }
         }
         let m = link.m.map(|r| r.map(|v| v as f32));
