@@ -1169,3 +1169,53 @@ fn hdr_rle_in_every_orientation() {
         }
     }
 }
+
+/// An uncompressed true-colour TGA with no ID, no colour map and no footer
+/// starts `00 00 02 00 00 00`, which is also the ICO/CUR signature with an
+/// entry count of zero. `probe` and `decode` used to stop at that signature
+/// and report nothing (`decode_as(.., Tga)` worked).
+#[test]
+fn footerless_true_colour_tga_is_recognised() {
+    let mut rng = Rng(0x76a);
+    for (depth, desc) in [
+        (24u8, 0u8),
+        (24, 0x20),
+        (32, 8),
+        (32, 0x28),
+        (16, 0),
+        (16, 1),
+    ] {
+        let (w, h) = (5u16, 3u16);
+        let mut f = vec![0u8, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        f.extend_from_slice(&w.to_le_bytes());
+        f.extend_from_slice(&h.to_le_bytes());
+        f.push(depth);
+        f.push(desc);
+        f.extend(rng.bytes(usize::from(w) * usize::from(h) * usize::from(depth / 8)));
+        let name = format!("{depth}-bit, descriptor {desc:#x}");
+        assert_eq!(
+            rusty_image::probe(&f),
+            Some((Format::Tga, u32::from(w), u32::from(h))),
+            "{name}"
+        );
+        let size = imagesize::blob_size(&f).expect("imagesize reads it");
+        assert_eq!((size.width, size.height), (5, 3), "{name}");
+        let img = rusty_image::decode(&f).expect("decode recognises it");
+        assert_eq!(img, rusty_image::tga::decode(&f).unwrap(), "{name}");
+        let theirs = oracle(&f, ImageFormat::Tga).unwrap();
+        assert_eq!(img.pixels, theirs.as_bytes(), "{name}");
+    }
+    // What was recognised before still is, as the same thing: an icon and a
+    // cursor (a directory with entries), and a TGA that carries its footer.
+    let px = Image::new(2, 2, PixelFormat::Rgba8, rng.bytes(16)).unwrap();
+    let ico = rusty_image::encode(&px, Format::Ico).unwrap();
+    assert_eq!(rusty_image::probe(&ico), Some((Format::Ico, 2, 2)));
+    let cur = rusty_image::encode(&px, Format::Cur).unwrap();
+    assert_eq!(rusty_image::probe(&cur), Some((Format::Cur, 2, 2)));
+    let tga = rusty_image::encode(&px, Format::Tga).unwrap();
+    assert_eq!(rusty_image::probe(&tga), Some((Format::Tga, 2, 2)));
+    // An icon directory with no entries is still nothing.
+    assert_eq!(rusty_image::probe(&[0, 0, 1, 0, 0, 0]), None);
+    assert_eq!(rusty_image::probe(&[0, 0, 2, 0, 0, 0]), None);
+    assert!(rusty_image::decode(&[0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+}
