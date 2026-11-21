@@ -593,8 +593,9 @@ struct Builder<'a> {
     css_budget: u64,
     sheet: Vec<css::Rule>,
     /// `sheet` bucketed by what each rule's subject needs (built once the
-    /// whole sheet is parsed), and the scratch list of rules to test.
-    rule_index: css::RuleIndex,
+    /// whole sheet is parsed, for a sheet long enough to gain from it), and
+    /// the scratch list of rules to test.
+    rule_index: Option<css::RuleIndex>,
     rule_scratch: Vec<u32>,
     id_map: HashMap<&'a str, XId>,
     doc: Document,
@@ -623,7 +624,7 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document, Error> {
         use_check_steps: 0,
         css_budget: CSS_MATCH_BUDGET,
         sheet: Vec::new(),
-        rule_index: css::RuleIndex::default(),
+        rule_index: None,
         rule_scratch: Vec::new(),
         id_map: HashMap::new(),
         doc: Document {
@@ -841,7 +842,7 @@ impl Builder<'_> {
         if !self.sheet.is_empty() {
             css::for_each_match(
                 &self.sheet,
-                &self.rule_index,
+                self.rule_index.as_ref(),
                 &mut self.rule_scratch,
                 x,
                 &mut self.css_budget,

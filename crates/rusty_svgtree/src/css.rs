@@ -144,8 +144,17 @@ pub(crate) struct RuleIndex {
     any: Vec<u32>,
 }
 
+/// Sheets shorter than this are matched rule by rule: looking an element up
+/// in the index costs about as much as testing this many rules against it.
+const INDEX_MIN_RULES: usize = 8;
+
 impl RuleIndex {
-    pub(crate) fn new(rules: &[Rule]) -> Self {
+    /// The index of a sheet long enough to gain from one.
+    pub(crate) fn new(rules: &[Rule]) -> Option<Self> {
+        (rules.len() >= INDEX_MIN_RULES).then(|| RuleIndex::build(rules))
+    }
+
+    fn build(rules: &[Rule]) -> Self {
         let mut ix = RuleIndex::default();
         for (i, rule) in rules.iter().enumerate() {
             // A sheet cannot hold 2^32 rules; one past that would simply
@@ -161,9 +170,9 @@ impl RuleIndex {
         ix
     }
 
-    /// The rules an element with this tag name, `id` and `class` could
-    /// match, ascending (rule order).
-    fn candidates(&self, tag: &str, id: Option<&str>, class: Option<&str>, out: &mut Vec<u32>) {
+    /// The rules `e` could match, going by its tag name, `id` and `class`,
+    /// ascending (rule order).
+    fn candidates<E: Element>(&self, e: E, out: &mut Vec<u32>) {
         out.clear();
         let mut lists = 0;
         let mut add = |list: Option<&Vec<u32>>| {
@@ -173,13 +182,19 @@ impl RuleIndex {
             }
         };
         add(Some(&self.any).filter(|l| !l.is_empty()));
-        add(self.by_tag.get(tag));
-        if let Some(id) = id {
-            add(self.by_id.get(id));
+        if !self.by_tag.is_empty() {
+            add(self.by_tag.get(e.local_name()));
         }
-        if let Some(class) = class {
-            for word in class.split_ascii_whitespace() {
-                add(self.by_class.get(word));
+        if !self.by_id.is_empty() {
+            if let Some(id) = e.attribute("id") {
+                add(self.by_id.get(id));
+            }
+        }
+        if !self.by_class.is_empty() {
+            if let Some(class) = e.attribute("class") {
+                for word in class.split_ascii_whitespace() {
+                    add(self.by_class.get(word));
+                }
             }
         }
         if lists > 1 {
@@ -190,27 +205,31 @@ impl RuleIndex {
     }
 }
 
-/// Calls `hit` for each rule that matches `e`, in rule order, testing only
-/// the rules `index` (built from `rules`) cannot rule out.
+/// Calls `hit` for each rule that matches `e`, in rule order. With an
+/// `index` (built from `rules`), only the rules it cannot rule out are
+/// tested.
 ///
-/// A rule ruled out here would have failed its subject compound, which
-/// spends one unit of `budget` while any is left. The same units are charged
-/// here, so matching runs out at exactly the rule where testing every rule
-/// in turn runs out.
+/// A rule ruled out by the index would have failed its subject compound,
+/// which spends one unit of `budget` while any is left. The same units are
+/// charged here, so matching runs out at exactly the rule where testing
+/// every rule in turn runs out.
 pub(crate) fn for_each_match<E: Element>(
     rules: &[Rule],
-    index: &RuleIndex,
+    index: Option<&RuleIndex>,
     scratch: &mut Vec<u32>,
     e: E,
     budget: &mut u64,
     mut hit: impl FnMut(&Rule),
 ) {
-    index.candidates(
-        e.local_name(),
-        e.attribute("id"),
-        e.attribute("class"),
-        scratch,
-    );
+    let Some(index) = index else {
+        for rule in rules {
+            if rule.selector.matches(e, budget) {
+                hit(rule);
+            }
+        }
+        return;
+    };
+    index.candidates(e, scratch);
     let mut next = 0usize;
     for &i in scratch.iter() {
         let i = i as usize;
@@ -841,7 +860,7 @@ mod tests {
             }
             let mut rules = Vec::new();
             parse_sheet(&text, &mut rules);
-            let index = RuleIndex::new(&rules);
+            let index = RuleIndex::build(&rules);
             let mut scratch = Vec::new();
             for i in 0..nodes.len() {
                 let e = T { nodes: &nodes, i };
@@ -852,9 +871,24 @@ mod tests {
                         .collect();
                     let mut got_budget = start;
                     let mut got = Vec::new();
-                    for_each_match(&rules, &index, &mut scratch, e, &mut got_budget, |rule| {
+                    let mut push = |rule: &Rule| {
                         got.push(rules.iter().position(|r| std::ptr::eq(r, rule)).unwrap());
+                    };
+                    for_each_match(
+                        &rules,
+                        Some(&index),
+                        &mut scratch,
+                        e,
+                        &mut got_budget,
+                        &mut push,
+                    );
+                    // Without an index every rule is tested in turn.
+                    let mut plain_budget = start;
+                    let mut plain = Vec::new();
+                    for_each_match(&rules, None, &mut scratch, e, &mut plain_budget, |rule| {
+                        plain.push(rules.iter().position(|r| std::ptr::eq(r, rule)).unwrap());
                     });
+                    assert_eq!((&plain, plain_budget), (&want, want_budget));
                     assert_eq!(
                         (got, got_budget),
                         (want, want_budget),
