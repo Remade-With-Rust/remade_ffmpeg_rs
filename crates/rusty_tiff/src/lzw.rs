@@ -12,15 +12,17 @@ const EOI: u16 = 257;
 const FIRST: u16 = 258;
 const MAX_CODES: usize = 4096;
 
-struct BitReader<'a> {
+/// `MSB`: the bit order (TIFF 6 data is MSB-first, old-style LSB-first). It
+/// is a type parameter, so the per-code tests of it and the selects between
+/// the two forms compile out of the decode loop.
+struct BitReader<'a, const MSB: bool> {
     data: &'a [u8],
     pos: usize,
     acc: u64,
     nbits: u32,
-    msb: bool,
 }
 
-impl BitReader<'_> {
+impl<const MSB: bool> BitReader<'_, MSB> {
     /// Next `width`-bit code (9..=12), or `None` at end of data.
     ///
     /// The accumulator holds `nbits` unread bits (MSB-first: the low
@@ -32,7 +34,7 @@ impl BitReader<'_> {
         if self.nbits < width {
             if let Some(w) = self.data.get(self.pos..self.pos + 4) {
                 let w: [u8; 4] = w.try_into().unwrap();
-                if self.msb {
+                if MSB {
                     self.acc = (self.acc << 32) | u64::from(u32::from_be_bytes(w));
                 } else {
                     self.acc |= u64::from(u32::from_le_bytes(w)) << self.nbits;
@@ -43,7 +45,7 @@ impl BitReader<'_> {
                 while self.nbits < width {
                     let b = *self.data.get(self.pos)?;
                     self.pos += 1;
-                    if self.msb {
+                    if MSB {
                         self.acc = (self.acc << 8) | u64::from(b);
                     } else {
                         self.acc |= u64::from(b) << self.nbits;
@@ -54,7 +56,7 @@ impl BitReader<'_> {
         }
         let mask = (1u64 << width) - 1;
         self.nbits -= width;
-        let code = if self.msb {
+        let code = if MSB {
             // Bits above `nbits + width` are already consumed: masking the
             // code is enough, the accumulator never needs clearing (it holds
             // at most 31 + 32 bits, so the shift never overflows).
@@ -110,19 +112,27 @@ pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffRes
 /// Decode into `out`; returns how many bytes were produced (fewer than
 /// `out.len()` when the data or an end-of-information code ends it early).
 fn decode_into(data: &[u8], out: &mut [u8]) -> TiffResult<usize> {
-    let n = out.len();
     let old_style = data.len() >= 2 && data[0] == 0 && (data[1] & 1) != 0;
-    let mut br = BitReader {
+    if old_style {
+        decode_codes::<false>(data, out)
+    } else {
+        decode_codes::<true>(data, out)
+    }
+}
+
+/// The decode loop for one bit order (`MSB`: TIFF 6, with early change).
+fn decode_codes<const MSB: bool>(data: &[u8], out: &mut [u8]) -> TiffResult<usize> {
+    let n = out.len();
+    let mut br = BitReader::<MSB> {
         data,
         pos: 0,
         acc: 0,
         nbits: 0,
-        msb: !old_style,
     };
     // Per code >= 258: start of its first emission in `out`, and its length.
     let mut start = vec![0u32; MAX_CODES];
     let mut len = vec![0u16; MAX_CODES];
-    let early = u16::from(!old_style);
+    let early = u16::from(MSB);
     let mut width = 9u32;
     let mut next = FIRST;
     let mut limit = (1u16 << width) - early;
