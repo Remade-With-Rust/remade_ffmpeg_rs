@@ -1,12 +1,12 @@
 # rusty_svgtree
 
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rusty_svgtree/LICENSE)
 [![Remade With Rust](https://img.shields.io/badge/Remade%20With-Rust-000?logo=rust&logoColor=fff)](https://github.com/remade-with-rust)
 
 **A pure-Rust SVG parser and renderer.** `Tree::from_data` parses SVG into a
 simplified render tree (the shape of usvg's: styles resolved, lengths in user
 units, `use` expanded, paint servers in user space); `render` draws it with
-the house [`rusty_raster`](../rusty_raster) rasteriser. XML comes from the
+the house [`rusty_raster`](https://crates.io/crates/rusty_raster) rasteriser. XML comes from the
 house [`rusty_xml`](https://crates.io/crates/rusty_xml) parser, embedded PNG
 and JPEG from `rusty_png` and `rusty_jpeg`. `#![forbid(unsafe_code)]`, no C.
 
