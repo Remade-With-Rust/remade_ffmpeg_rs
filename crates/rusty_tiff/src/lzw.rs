@@ -97,14 +97,14 @@ pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
 /// arrives, before `n` bytes) keeps the bytes it did decode and the rest stay
 /// zero, as the `tiff` crate does: damaged files commonly lose a strip's last
 /// byte or two, and refusing the whole image for that loses every good pixel.
-/// An invalid code is still an error.
-pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffResult<()> {
+/// An invalid code is still an error. Returns the bytes really decoded (the
+/// caller bounds how much zero-fill an image may hold).
+pub(crate) fn decode_append(data: &[u8], out: &mut Vec<u8>, n: usize) -> TiffResult<usize> {
     let base = out.len();
     out.try_reserve_exact(n)
         .map_err(|_| TiffError::limits(format!("cannot allocate {n} bytes")))?;
     out.resize(base + n, 0);
-    decode_into(data, &mut out[base..])?;
-    Ok(())
+    decode_into(data, &mut out[base..])
 }
 
 /// Decode into `out`; returns how many bytes were produced (fewer than

@@ -239,3 +239,30 @@ fn damaged_packets_error_without_panicking() {
         .unwrap();
     assert!(dec.receive_frame().is_ok());
 }
+
+/// The sign extension as it was before it lost its width test, kept as
+/// the oracle for the branch-free one.
+fn sign_extend_ref(v: i32, bits: u32) -> i32 {
+    if bits == 0 || bits >= 32 {
+        return v;
+    }
+    let s = 32 - bits;
+    (v << s) >> s
+}
+
+#[test]
+fn sign_extend_matches_the_tested_form() {
+    let mut x = 0x0BAD_F00Du32;
+    let mut values = vec![0, 1, -1, i32::MIN, i32::MAX];
+    values.extend((0..1000).map(|_| {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        x as i32
+    }));
+    for bits in 0..=32 {
+        for &v in &values {
+            assert_eq!(sign_extend(v, bits), sign_extend_ref(v, bits), "{v} {bits}");
+        }
+    }
+}

@@ -14,6 +14,7 @@ pub mod aac;
 pub mod av1;
 pub mod avc;
 pub mod hvc;
+pub mod time;
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
@@ -87,6 +88,112 @@ pub struct Stream {
     /// How far before a seek target decoding must start to converge, in
     /// nanoseconds (Matroska `SeekPreRoll`; 80 ms for Opus).
     pub seek_preroll_ns: u64,
+    // --- Presentation (#114) ---
+    /// How the decoded picture is transformed for display: the 3×3 matrix of
+    /// an MP4 `tkhd` (`a b u / c d v / x y w`, with `a b c d x y` in 16.16
+    /// and `u v w` in 2.30 fixed point), kept verbatim so a remux writes it
+    /// back unchanged. `None` means identity. Matroska carries a pure rotation
+    /// of it as `Projection` / `ProjectionPoseRoll`. See [`Stream::rotation`]
+    /// and [`Stream::set_rotation`].
+    pub display_matrix: Option<[i32; 9]>,
+    /// The track language: an ISO 639-2 code (`eng`, `und`) from MP4 `mdhd`
+    /// or Matroska `Language`, or a BCP 47 tag from Matroska
+    /// `LanguageBCP47`. `None` when the container says nothing.
+    pub language: Option<String>,
+    /// The track's human-readable name (Matroska `Name`).
+    pub name: Option<String>,
+    /// Track flags (Matroska `FlagDefault`, `FlagForced`, ...).
+    pub disposition: Disposition,
+    /// Interlacing, as the QuickTime `fiel` detail / Matroska `FieldOrder`
+    /// code (the two share their values): 0 progressive, 1 top field first,
+    /// 6 bottom field first, 9 bottom field first stored first, 14 top field
+    /// first stored first, 2 interlaced but undetermined. `None` when the
+    /// container says nothing.
+    pub field_order: Option<u8>,
+    /// Matroska `StereoMode` (0 mono, 1 side by side left first, ...), when
+    /// the container records it.
+    pub stereo_mode: Option<u8>,
+}
+
+/// A stream's track flags, as Matroska records them (`FlagDefault`,
+/// `FlagEnabled`, `FlagForced`, `FlagHearingImpaired`, `FlagVisualImpaired`,
+/// `FlagOriginal`, `FlagCommentary`). `default` and `enabled` are `None` when
+/// the container leaves them at its default (in Matroska both default to
+/// set), so a fresh stream changes nothing in the output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Disposition {
+    pub default: Option<bool>,
+    pub enabled: Option<bool>,
+    pub forced: bool,
+    pub hearing_impaired: bool,
+    pub visual_impaired: bool,
+    pub original: bool,
+    pub commentary: bool,
+}
+
+/// The display matrix that rotates a `width`×`height` picture clockwise by
+/// `degrees` (any angle; quarter turns are exact). Quarter turns carry the
+/// translation QuickTime writers put in `tkhd` so the picture lands at the
+/// origin (`0 1 0 / -1 0 0 / h 0 1` for 90°, as an iPhone writes it).
+pub fn rotation_matrix(degrees: f64, width: u32, height: u32) -> [i32; 9] {
+    const ONE: i32 = 1 << 16;
+    const W: i32 = 1 << 30;
+    let fixed = |v: u32| i32::try_from(i64::from(v) << 16).unwrap_or(i32::MAX);
+    let (w, h) = (fixed(width), fixed(height));
+    let turn = degrees.rem_euclid(360.0);
+    match turn {
+        0.0 => [ONE, 0, 0, 0, ONE, 0, 0, 0, W],
+        90.0 => [0, ONE, 0, -ONE, 0, 0, h, 0, W],
+        180.0 => [-ONE, 0, 0, 0, -ONE, 0, w, h, W],
+        270.0 => [0, -ONE, 0, ONE, 0, 0, 0, w, W],
+        t => {
+            let (s, c) = t.to_radians().sin_cos();
+            let q = |v: f64| (v * f64::from(ONE)).round() as i32;
+            [q(c), q(s), 0, q(-s), q(c), 0, 0, 0, W]
+        }
+    }
+}
+
+/// The clockwise rotation (degrees in `[0, 360)`) a display matrix applies,
+/// or `None` when it is not a pure rotation (a flip, a scale, a shear).
+pub fn matrix_rotation(m: &[i32; 9]) -> Option<f64> {
+    let f = |v: i32| f64::from(v) / 65536.0;
+    let (a, b, c, d) = (f(m[0]), f(m[1]), f(m[3]), f(m[4]));
+    let tol = 1e-3;
+    if (a - d).abs() > tol || (b + c).abs() > tol || (a * a + b * b - 1.0).abs() > 2.0 * tol {
+        return None;
+    }
+    let deg = b.atan2(a).to_degrees().rem_euclid(360.0);
+    // Snap what is within rounding of a whole degree (16.16 cos/sin).
+    let snapped = deg.round();
+    let deg = if (deg - snapped).abs() < 1e-2 {
+        snapped.rem_euclid(360.0)
+    } else {
+        deg
+    };
+    Some(deg)
+}
+
+impl Stream {
+    /// The clockwise rotation to apply for display, in degrees: 0 without a
+    /// display matrix, `None` when the matrix is not a pure rotation.
+    pub fn rotation(&self) -> Option<f64> {
+        match &self.display_matrix {
+            None => Some(0.0),
+            Some(m) => matrix_rotation(m),
+        }
+    }
+
+    /// Ask for the picture to be shown rotated `degrees` clockwise (set
+    /// [`width`](Stream::width)/[`height`](Stream::height) first: quarter
+    /// turns record a translation by them). 0 clears the matrix.
+    pub fn set_rotation(&mut self, degrees: f64) {
+        self.display_matrix = if degrees.rem_euclid(360.0) == 0.0 {
+            None
+        } else {
+            Some(rotation_matrix(degrees, self.width, self.height))
+        };
+    }
 }
 
 impl Stream {
@@ -117,6 +224,12 @@ impl Stream {
             alpha_mode: false,
             codec_delay_ns: 0,
             seek_preroll_ns: 0,
+            display_matrix: None,
+            language: None,
+            name: None,
+            disposition: Disposition::default(),
+            field_order: None,
+            stereo_mode: None,
         }
     }
 }
@@ -194,6 +307,15 @@ pub trait Demuxer: Send {
     fn set_raw_samples(&mut self, _raw: bool) -> bool {
         false
     }
+
+    /// The file's global metadata, in FFmpeg's key names (`title`,
+    /// `artist`, `comment`, `encoder`, `creation_time`, ...): MP4 `udta`
+    /// (`meta/ilst` and QuickTime `©xxx` atoms), Matroska `Info` and global
+    /// `Tags`. Available after [`read_header`](Demuxer::read_header); `None`
+    /// from demuxers that read none (the default).
+    fn metadata(&self) -> Option<&Dictionary> {
+        None
+    }
 }
 
 /// One sample (packet) of a stream as the container's index records it.
@@ -258,6 +380,37 @@ pub trait SampleIndex {
     fn movie_timescale(&self) -> Option<u32> {
         None
     }
+
+    /// Samples in the stream's stored sample table: what
+    /// [`raw_sample_info`](SampleIndex::raw_sample_info) numbers. Without an
+    /// edit list this is [`sample_count`](SampleIndex::sample_count); an MP4
+    /// edit list can replay samples or leave some out of the edited index.
+    fn raw_sample_count(&self, stream: usize) -> u64 {
+        self.sample_count(stream)
+    }
+
+    /// Sample `index` of the stored sample table, in decode order, with the
+    /// edit list **not** applied: for MP4 the `stbl` row verbatim, `dts` the
+    /// sum of the `stts` deltas before it (0 for the first sample), `pts` =
+    /// `dts` + its `ctts` offset, `duration` its `stts` delta, all in the
+    /// media time scale (the stream's time base). An editor applies
+    /// [`edit_list`](SampleIndex::edit_list) itself on this — for example
+    /// AAC encoder priming (the first edit's `media_time`) and padding (where
+    /// its `segment_duration` ends) — and a muxer given these samples and the
+    /// same edit list ([`Muxer::set_edit_list`]) writes the same table back.
+    /// Defaults to [`sample_info`](SampleIndex::sample_info) for containers
+    /// without edit lists.
+    fn raw_sample_info(&self, stream: usize, index: u64) -> Option<SampleInfo> {
+        self.sample_info(stream, index)
+    }
+
+    /// Read stored sample `index` (numbered as
+    /// [`raw_sample_info`](SampleIndex::raw_sample_info) numbers them) as a
+    /// packet timed by that entry, shaped as
+    /// [`read_sample`](SampleIndex::read_sample) shapes it.
+    fn read_raw_sample(&mut self, stream: usize, index: u64) -> Result<Packet> {
+        self.read_sample(stream, index)
+    }
 }
 
 /// Writes a container format: declare streams, write packets, finalize.
@@ -276,7 +429,8 @@ pub trait Muxer: Send {
 
     /// Write `edits` as stream `stream`'s edit list instead of the one the
     /// muxer would derive (encoder delay, trims, a start delay). Segment
-    /// durations are in the muxer's movie time scale (1/1000 s for MP4), media
+    /// durations are in the muxer's movie time scale (1/1000 s for MP4 unless
+    /// `set_option("movie_timescale", ..)` picks another), media
     /// times in the stream's time base, -1 for an empty edit. Called before
     /// [`write_trailer`](Muxer::write_trailer). Returns whether the container
     /// has edit lists; the default has none.
@@ -572,6 +726,27 @@ mod tests {
 
     fn streams(mut d: Box<dyn Demuxer>) -> usize {
         d.read_header().unwrap().len()
+    }
+
+    #[test]
+    fn rotation_matrices_round_trip() {
+        for deg in [0.0, 90.0, 180.0, 270.0, 30.0, 315.0] {
+            let m = rotation_matrix(deg, 1920, 1080);
+            assert_eq!(matrix_rotation(&m), Some(deg), "{deg}");
+        }
+        // An iPhone portrait clip: rotate 90 degrees clockwise, translated by the height.
+        let m = rotation_matrix(-270.0, 1920, 1080);
+        assert_eq!(m, [0, 0x10000, 0, -0x10000, 0, 0, 1080 << 16, 0, 1 << 30]);
+        // A horizontal flip is not a rotation.
+        let flip = [-0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 1 << 30];
+        assert_eq!(matrix_rotation(&flip), None);
+        let mut s = Stream::new(0, CodecId::H264);
+        (s.width, s.height) = (640, 480);
+        assert_eq!(s.rotation(), Some(0.0));
+        s.set_rotation(90.0);
+        assert_eq!(s.rotation(), Some(90.0));
+        s.set_rotation(360.0);
+        assert_eq!(s.display_matrix, None);
     }
 
     #[test]
