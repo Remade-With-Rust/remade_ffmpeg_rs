@@ -40,3 +40,7 @@ test = false
 [[example]]
 name = "veinbench"
 test = false
+
+[[example]]
+name = "lossbench"
+test = false
