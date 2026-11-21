@@ -103,6 +103,65 @@ impl Fields {
     }
 }
 
+/// A bitfield layout as lookup tables: channel `c` of pixel `v` is
+/// `tab[c][(v >> shift[c]) as u8 & mask[c]]`. A table holds the channel's
+/// expansion to eight bits ([`Field::read`]) for every value of the field,
+/// so a pixel is three or four shift-mask-load-store steps, where
+/// `Field::read` chose among eight expansions by the field's width for
+/// every channel of every pixel (63 Ir a 16-bit pixel).
+struct FieldTables {
+    shift: [u32; 4],
+    mask: [u8; 4],
+    tab: [[u8; 256]; 4],
+}
+
+impl FieldTables {
+    fn new(f: &Fields) -> FieldTables {
+        let mut t = FieldTables {
+            shift: [0; 4],
+            mask: [0; 4],
+            tab: [[0; 256]; 4],
+        };
+        for (c, field) in [f.r, f.g, f.b, f.a].into_iter().enumerate() {
+            if field.len == 0 {
+                // No such channel (only alpha can be absent): every pixel
+                // reads entry 0, opaque.
+                t.tab[c][0] = 0xff;
+                continue;
+            }
+            t.shift[c] = field.shift;
+            // 1 to 8 bits (`from_mask` narrows wider fields to their top 8).
+            t.mask[c] = (0xffu32 >> (8 - field.len)) as u8;
+            let unit = Field {
+                shift: 0,
+                len: field.len,
+            };
+            for v in 0..=u32::from(t.mask[c]) {
+                t.tab[c][v as usize] = unit.read(v);
+            }
+        }
+        t
+    }
+
+    /// One row: `S`-byte little-endian pixels (2 or 4) to `C` channels.
+    /// (Four parallel arrays read in step: an index is the plain way to
+    /// say it.)
+    #[inline(always)]
+    #[allow(clippy::needless_range_loop)]
+    fn row<const S: usize, const C: usize>(&self, dst: &mut [u8], src: &[u8]) {
+        for (px, s) in dst.chunks_exact_mut(C).zip(src.chunks_exact(S)) {
+            let v = if S == 2 {
+                u32::from(u16::from_le_bytes([s[0], s[1]]))
+            } else {
+                u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+            };
+            for c in 0..C {
+                px[c] = self.tab[c][usize::from((v >> self.shift[c]) as u8 & self.mask[c])];
+            }
+        }
+    }
+}
+
 const RGB555: Fields = Fields {
     r: Field { shift: 10, len: 5 },
     g: Field { shift: 5, len: 5 },
@@ -378,15 +437,15 @@ fn read_palette_pixels(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()>
     let bits = usize::from(h.bit_count);
     let row_bytes = (bits * h.width).div_ceil(32) * 4;
     let stride = h.width * ch;
+    // A padded palette (alpha 0xff): a pixel is one 4-byte store. With three
+    // channels the fourth byte lands on the next pixel's first byte, which
+    // that pixel overwrites; a row's last pixel takes a 3-byte store.
+    let mut pal4 = [[0u8, 0, 0, 0xff]; 256];
+    for (q, p) in pal4.iter_mut().zip(pal.iter()) {
+        q[..3].copy_from_slice(p);
+    }
     if bits == 8 {
-        // One index per byte: each pixel is one 4-byte store from a padded
-        // palette (alpha 0xff). With three channels the fourth byte lands on
-        // the next pixel's first byte, which that pixel overwrites; the
-        // row's last pixel takes a 3-byte store.
-        let mut pal4 = [[0u8, 0, 0, 0xff]; 256];
-        for (q, p) in pal4.iter_mut().zip(pal.iter()) {
-            q[..3].copy_from_slice(p);
-        }
+        // One index per byte.
         for i in 0..h.height {
             let src = &r.bytes(row_bytes)?[..h.width];
             let y = row(h, i);
@@ -406,31 +465,80 @@ fn read_palette_pixels(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()>
         }
         return Ok(());
     }
-    if ch == 4 {
-        buf.chunks_exact_mut(4).for_each(|p| p[3] = 0xff);
+    // 1, 2 or 4 bits, each with its own copy of the loop so the pixels per
+    // byte and every shift are constants.
+    match (bits, ch) {
+        (1, 3) => low_bit_rows::<1, 3>(r, h, buf, &pal4),
+        (1, _) => low_bit_rows::<1, 4>(r, h, buf, &pal4),
+        (2, 3) => low_bit_rows::<2, 3>(r, h, buf, &pal4),
+        (2, _) => low_bit_rows::<2, 4>(r, h, buf, &pal4),
+        (_, 3) => low_bit_rows::<4, 3>(r, h, buf, &pal4),
+        _ => low_bit_rows::<4, 4>(r, h, buf, &pal4),
     }
-    // 1, 2 or 4 bits: `per_byte` is a power of two, so the byte and the bit
-    // position come from a shift and a mask, not a division per pixel.
-    let per_byte = 8 / bits;
-    let lg = per_byte.trailing_zeros();
-    let mask = ((1u16 << bits) - 1) as u8;
+}
+
+/// Rows of 1, 2 or 4-bit palette indices (`BITS`, most significant first) as
+/// `CH`-byte pixels (3, or 4 with alpha 0xff).
+///
+/// The row is walked a source byte at a time: its 8, 4 or 2 pixels go to
+/// fixed offsets of one exactly-sized output cell, so there is no byte
+/// index, shift computation or bounds check per pixel (25 Ir a pixel
+/// before), and the alpha of an RGBA row comes with the padded palette
+/// entry instead of from a pass over the whole image first. The pixels of a
+/// row's last, partly used byte are written one at a time. Out of line, one
+/// function per depth and layout, so the 8-bit loop in the caller keeps its
+/// registers.
+#[inline(never)]
+fn low_bit_rows<const BITS: usize, const CH: usize>(
+    r: &mut Reader,
+    h: &Header,
+    buf: &mut [u8],
+    pal4: &[[u8; 4]; 256],
+) -> Result<()> {
+    let per_byte = 8 / BITS;
+    let mask = (1u8 << BITS) - 1;
+    let row_bytes = (BITS * h.width).div_ceil(32) * 4;
+    let stride = h.width * CH;
     for i in 0..h.height {
         let src = r.bytes(row_bytes)?;
         let y = row(h, i);
         let dst = &mut buf[y * stride..(y + 1) * stride];
-        for (x, px) in dst.chunks_exact_mut(ch).enumerate() {
-            let byte = src[x >> lg];
-            let shift = 8 - bits * ((x & (per_byte - 1)) + 1);
-            let idx = (byte >> shift) & mask;
-            px[..3].copy_from_slice(&pal[idx as usize]);
+        let mut cells = dst.chunks_exact_mut(per_byte * CH);
+        for (cell, &b) in cells.by_ref().zip(src) {
+            for k in 0..per_byte {
+                let e = &pal4[usize::from((b >> (8 - BITS * (k + 1))) & mask)];
+                if CH == 4 || k + 1 < per_byte {
+                    cell[k * CH..k * CH + 4].copy_from_slice(e);
+                } else {
+                    cell[k * CH..k * CH + 3].copy_from_slice(&e[..3]);
+                }
+            }
+        }
+        let tail = cells.into_remainder();
+        if let Some(&b) = src.get(h.width / per_byte).filter(|_| !tail.is_empty()) {
+            for (k, px) in tail.chunks_exact_mut(CH).enumerate() {
+                let e = &pal4[usize::from((b >> (8 - BITS * (k + 1))) & mask)];
+                px.copy_from_slice(&e[..CH]);
+            }
         }
     }
     Ok(())
 }
 
+/// Uncompressed 16, 24 and 32-bit rows.
+///
+/// Each layout has a row loop of its own, out of line ([`direct_rows`]).
+/// Inlined into `decode_mode` as one loop, the output buffer was a local
+/// `Vec` instead of a `&mut [u8]` argument, so LLVM could not tell it from
+/// the input and the 32-bit BGRA word loop did not vectorise (9.1 Ir a
+/// pixel, 4.2 out of line); the caller's reader sat behind a pointer, so
+/// every row's `bytes` and `skip` loaded, checked and stored its position;
+/// the layout was chosen again for every row, and the per-pixel tests of
+/// the shared loops (`ch == 4`, the kind) stayed inside; and any change to
+/// one layout's loop re-rolled the registers of all the others.
+#[inline(never)]
 fn read_direct(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
     let ch = if h.alpha { 4 } else { 3 };
-    let stride = h.width * ch;
     let (bytes_pp, pad) = match h.kind {
         Kind::Rgb16 | Kind::Bitfields16 => (2, h.width % 2 * 2),
         Kind::Rgb24 => (3, (4 - (h.width * 3) % 4) % 4),
@@ -449,70 +557,154 @@ fn read_direct(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
             && (f.a.len == 0 || f.a == Field { shift: 24, len: 8 })
     });
     let std_alpha = std_masks && fields.is_some_and(|f| f.a.len != 0);
-    for i in 0..h.height {
-        let src = r.bytes(h.width * bytes_pp)?;
-        r.skip(pad)?;
-        let y = row(h, i);
-        let dst = &mut buf[y * stride..(y + 1) * stride];
-        match (h.kind, ch) {
-            (Kind::Rgb24, 3) => crate::swizzle::swap_rb3(dst, src),
-            (Kind::Rgb32, 3) => {
-                for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
-                    px.copy_from_slice(&[s[2], s[1], s[0]]);
-                }
+    let g = RowGeom {
+        height: h.height,
+        top_down: h.top_down,
+        n: h.width * bytes_pp,
+        pad,
+        stride: h.width * ch,
+    };
+    let data = r.rest();
+    let used = match (h.kind, ch) {
+        (Kind::Rgb24, 3) => direct_rows(data, buf, g, crate::swizzle::swap_rb3)?,
+        (Kind::Rgb32, 3) => direct_rows(data, buf, g, |dst, src| {
+            for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
+                px.copy_from_slice(&[s[2], s[1], s[0]]);
             }
-            (Kind::Bitfields32, _) if std_masks => {
-                if ch == 4 {
-                    // BGRA -> RGBA as one word: swap bytes 0 and 2, and force
-                    // alpha opaque (decided once, not per pixel) when the
-                    // file has no alpha mask.
-                    let opaque = if std_alpha { 0 } else { 0xff00_0000u32 };
-                    for (px, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-                        let v = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-                        let v = v.swap_bytes().rotate_right(8) | opaque;
-                        px.copy_from_slice(&v.to_le_bytes());
-                    }
-                } else {
-                    for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
-                        px.copy_from_slice(&[s[2], s[1], s[0]]);
-                    }
+        })?,
+        (Kind::Bitfields32, 4) if std_masks => {
+            // BGRA -> RGBA as one word: swap bytes 0 and 2, and force alpha
+            // opaque (decided once, not per pixel) when the file has no
+            // alpha mask.
+            let opaque = if std_alpha { 0 } else { 0xff00_0000u32 };
+            direct_rows(data, buf, g, move |dst, src| {
+                for (px, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                    let v = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+                    let v = v.swap_bytes().rotate_right(8) | opaque;
+                    px.copy_from_slice(&v.to_le_bytes());
                 }
-            }
-            (Kind::Rgb24 | Kind::Rgb32 | Kind::Rgba32, _) => {
-                for (px, s) in dst.chunks_exact_mut(ch).zip(src.chunks_exact(bytes_pp)) {
-                    px[0] = s[2];
-                    px[1] = s[1];
-                    px[2] = s[0];
-                    if ch == 4 {
-                        px[3] = if h.kind == Kind::Rgba32 { s[3] } else { 0xff };
-                    }
-                }
-            }
-            _ => {
-                let f = fields.expect("bitfield kinds carry masks");
-                for (px, s) in dst.chunks_exact_mut(ch).zip(src.chunks_exact(bytes_pp)) {
-                    let v = if bytes_pp == 2 {
-                        u32::from(u16::from_le_bytes([s[0], s[1]]))
-                    } else {
-                        u32::from_le_bytes([s[0], s[1], s[2], s[3]])
-                    };
-                    px[0] = f.r.read(v);
-                    px[1] = f.g.read(v);
-                    px[2] = f.b.read(v);
-                    if ch == 4 {
-                        px[3] = if f.a.len != 0 { f.a.read(v) } else { 0xff };
-                    }
-                }
-            }
+            })?
         }
-    }
-    Ok(())
+        (Kind::Bitfields32, _) if std_masks => direct_rows(data, buf, g, |dst, src| {
+            for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
+                px.copy_from_slice(&[s[2], s[1], s[0]]);
+            }
+        })?,
+        // 24 and 32-bit `BI_RGB` rows of an icon entry, which carries alpha.
+        (Kind::Rgb24, _) => direct_rows(data, buf, g, |dst, src| {
+            for (px, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
+                px.copy_from_slice(&[s[2], s[1], s[0], 0xff]);
+            }
+        })?,
+        (Kind::Rgb32, _) => direct_rows(data, buf, g, |dst, src| {
+            for (px, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                px.copy_from_slice(&[s[2], s[1], s[0], 0xff]);
+            }
+        })?,
+        (Kind::Rgba32, 3) => direct_rows(data, buf, g, |dst, src| {
+            for (px, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
+                px.copy_from_slice(&[s[2], s[1], s[0]]);
+            }
+        })?,
+        // A 32-bit icon entry: BGRA to RGBA, a word at a time.
+        (Kind::Rgba32, _) => direct_rows(data, buf, g, crate::swizzle::swap_rb4)?,
+        _ => {
+            let f = fields.expect("bitfield kinds carry masks");
+            read_bitfield_rows(data, buf, g, bytes_pp, ch, &f)?
+        }
+    };
+    r.skip(used)
 }
 
+/// Where the stored rows of an uncompressed image go: `n` bytes of pixels
+/// then `pad` bytes of padding per stored row, `stride` bytes per output
+/// row, the first stored row at the bottom unless `top_down`.
+#[derive(Clone, Copy)]
+struct RowGeom {
+    height: usize,
+    top_down: bool,
+    n: usize,
+    pad: usize,
+    stride: usize,
+}
+
+/// Every stored row converted into its output row by `f`. Reads from the
+/// start of `data`; returns how many bytes the rows took. Out of line, one
+/// copy per layout.
+#[inline(never)]
+fn direct_rows(
+    data: &[u8],
+    buf: &mut [u8],
+    g: RowGeom,
+    mut f: impl FnMut(&mut [u8], &[u8]),
+) -> Result<usize> {
+    let mut r = Reader::new(data);
+    for i in 0..g.height {
+        let src = r.bytes(g.n)?;
+        r.skip(g.pad)?;
+        let y = if g.top_down { i } else { g.height - 1 - i };
+        f(&mut buf[y * g.stride..(y + 1) * g.stride], src);
+    }
+    Ok(r.pos())
+}
+
+/// The rows of a 16-bit image, or of a 32-bit one whose masks are not the
+/// standard 8-8-8(-8), through [`FieldTables`]. Reads from the start of
+/// `data`; returns how many bytes the rows took.
+#[inline(never)]
+fn read_bitfield_rows(
+    data: &[u8],
+    buf: &mut [u8],
+    g: RowGeom,
+    bytes_pp: usize,
+    ch: usize,
+    f: &Fields,
+) -> Result<usize> {
+    let t = FieldTables::new(f);
+    let mut r = Reader::new(data);
+    for i in 0..g.height {
+        let src = r.bytes(g.n)?;
+        r.skip(g.pad)?;
+        let y = if g.top_down { i } else { g.height - 1 - i };
+        let dst = &mut buf[y * g.stride..(y + 1) * g.stride];
+        match (bytes_pp, ch) {
+            (2, 3) => t.row::<2, 3>(dst, src),
+            (2, _) => t.row::<2, 4>(dst, src),
+            (_, 3) => t.row::<4, 3>(dst, src),
+            _ => t.row::<4, 4>(dst, src),
+        }
+    }
+    Ok(r.pos())
+}
+
+#[inline(never)]
 fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
+    if h.kind == Kind::Rle4 {
+        read_rle_as::<true>(r, h, buf)
+    } else {
+        read_rle_as::<false>(r, h, buf)
+    }
+}
+
+/// RLE4 (`RLE4`) or RLE8 rows. One out-of-line copy per kind, so neither
+/// kind's loop shares registers with the other's (a change to the RLE8
+/// stores alone moved the RLE4 rows by +1.9% while they shared one body).
+#[inline(never)]
+fn read_rle_as<const RLE4: bool>(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
+    // The stream is consumed as a slice that shrinks from the front: every
+    // operation starts with two bytes, taken with one length test, where two
+    // `Reader::u8` calls were an overflow check and a range check each.
+    let all = r.rest();
+    let mut data = all;
+    rle_rows::<RLE4>(&mut data, h, buf)?;
+    r.skip(all.len() - data.len())
+}
+
+#[inline(always)]
+fn rle_rows<const RLE4: bool>(data: &mut &[u8], h: &Header, buf: &mut [u8]) -> Result<()> {
     let ch = if h.alpha { 4 } else { 3 };
     let pal = h.palette.as_deref().expect("RLE kinds carry a palette");
-    let rle4 = h.kind == Kind::Rle4;
+    let rle4 = RLE4;
     let stride = h.width * ch;
     let corrupt = || Error::invalid("bmp: corrupt RLE data");
     // Zero pixels [from, width) of file row `ri`.
@@ -522,11 +714,16 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
             buf[y * stride + from * ch..(y + 1) * stride].fill(0);
         }
     };
-    let set = |buf: &mut [u8], ri: usize, px: usize, idx: u8| {
-        let y = row(h, ri);
-        let o = y * stride + px * ch;
-        buf[o..o + 3].copy_from_slice(&pal[idx as usize]);
-    };
+    // The palette padded to four bytes with a zero: a pixel is one 4-byte
+    // store. With four channels that leaves alpha at the zero it had
+    // (RLE never sets alpha); with three, the zero lands on the first byte
+    // of the next pixel, which the same packet then writes, so only a
+    // packet's last pixel needs a 3-byte store (the byte after it may
+    // belong to a pixel a delta skips, or to the row decoded before).
+    let mut pal4 = [[0u8; 4]; 256];
+    for (q, p) in pal4.iter_mut().zip(pal.iter()) {
+        q[..3].copy_from_slice(p);
+    }
 
     let mut ri = 0;
     while ri < h.height {
@@ -536,9 +733,12 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
         // delta moves to another row (not per pixel, not per run).
         let mut rb = row(h, ri) * stride;
         loop {
-            let control = r.u8()?;
+            let Some((&[control, arg], rest)) = data.split_first_chunk::<2>() else {
+                return Err(Error::Truncated);
+            };
+            *data = rest;
             if control == 0 {
-                match r.u8()? {
+                match arg {
                     0 => {
                         zero_from(buf, ri, px);
                         break;
@@ -551,8 +751,10 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
                         return Ok(());
                     }
                     2 => {
-                        let dx = r.u8()?;
-                        let dy = r.u8()?;
+                        let Some((&[dx, dy], rest)) = data.split_first_chunk::<2>() else {
+                            return Err(Error::Truncated);
+                        };
+                        *data = rest;
                         if dy > 0 {
                             zero_from(buf, ri, px);
                             for _ in 1..dy {
@@ -591,32 +793,50 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
                         let n = usize::from(n);
                         let mut len = if rle4 { n.div_ceil(2) } else { n };
                         len += len & 1;
-                        let idx = r.bytes(len)?;
+                        let Some((idx, rest)) = data.split_at_checked(len) else {
+                            return Err(Error::Truncated);
+                        };
+                        *data = rest;
+                        // A literal running past the row is corrupt (the
+                        // whole decode fails, so no partial row matters).
+                        if n > h.width - px {
+                            return Err(corrupt());
+                        }
                         if rle4 {
-                            let mut left = n;
+                            // Two pixels a byte, high nibble first, into the
+                            // packet's own range of the row (it was a row
+                            // offset computed and a 3-byte range-checked
+                            // copy per nibble).
+                            let o = rb + px * ch;
+                            let dst = &mut buf[o..o + n * ch];
+                            let mut q = 0;
                             'nib: for &b in idx {
                                 for nib in [b >> 4, b & 15] {
-                                    if left == 0 {
+                                    let c = &pal4[usize::from(nib)];
+                                    if q + 4 > dst.len() {
+                                        if q < dst.len() {
+                                            dst[q..].copy_from_slice(&c[..3]);
+                                        }
                                         break 'nib;
                                     }
-                                    if px >= h.width {
-                                        return Err(corrupt());
-                                    }
-                                    set(buf, ri, px, nib);
-                                    px += 1;
-                                    left -= 1;
+                                    dst[q..q + 4].copy_from_slice(c);
+                                    q += ch;
                                 }
                             }
+                            px += n;
                         } else {
-                            // A literal running past the row is corrupt (the
-                            // whole decode fails, so no partial row matters).
-                            if n > h.width - px {
-                                return Err(corrupt());
-                            }
-                            let mut o = rb + px * ch;
+                            // One range check for the packet, then a word
+                            // store per pixel (the loop test covers it).
+                            let o = rb + px * ch;
+                            let dst = &mut buf[o..o + n * ch];
+                            let mut q = 0;
                             for &i in &idx[..n] {
-                                buf[o..o + 3].copy_from_slice(&pal[usize::from(i)]);
-                                o += ch;
+                                if q + 4 > dst.len() {
+                                    dst[q..].copy_from_slice(&pal4[usize::from(i)][..3]);
+                                    break;
+                                }
+                                dst[q..q + 4].copy_from_slice(&pal4[usize::from(i)]);
+                                q += ch;
                             }
                             px += n;
                         }
@@ -624,35 +844,56 @@ fn read_rle(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()> {
                     }
                 }
             } else {
-                let index = r.u8()?;
+                let index = arg;
                 let n = usize::from(control);
                 if rle4 {
-                    let mut left = n;
-                    'run: loop {
-                        for nib in [index >> 4, index & 15] {
-                            if left == 0 {
-                                break 'run;
-                            }
-                            if px >= h.width {
-                                return Err(corrupt());
-                            }
-                            set(buf, ri, px, nib);
-                            px += 1;
-                            left -= 1;
-                        }
+                    // The two nibbles alternate. A run past the row is
+                    // corrupt (RLE8 clamps, below).
+                    if n > h.width - px {
+                        return Err(corrupt());
                     }
+                    let c = [pal4[usize::from(index >> 4)], pal4[usize::from(index & 15)]];
+                    let o = rb + px * ch;
+                    let dst = &mut buf[o..o + n * ch];
+                    let (mut q, mut k) = (0, 0);
+                    while q + 4 <= dst.len() {
+                        dst[q..q + 4].copy_from_slice(&c[k & 1]);
+                        q += ch;
+                        k += 1;
+                    }
+                    if q < dst.len() {
+                        dst[q..].copy_from_slice(&c[k & 1][..3]);
+                    }
+                    px += n;
                 } else {
                     // A run longer than the row is clamped to it (ImageMagick
                     // writes such files).
                     let take = n.min(h.width - px);
-                    // Runs average about two pixels in real files: a plain
-                    // offset loop, no per-run slice or chunk setup (that
-                    // shape measured +15% Ir on the RLE8 fixture).
-                    let c = pal[usize::from(index)];
-                    let mut o = rb + px * ch;
-                    for _ in 0..take {
-                        buf[o..o + 3].copy_from_slice(&c);
-                        o += ch;
+                    // Runs average about two pixels in screenshots and about
+                    // eleven in photos. One range check for the run, then a
+                    // word store per pixel whose loop test is its bounds
+                    // check, and a 3-byte store for the last pixel of a
+                    // 3-channel run. (A per-run `chunks_exact` over a
+                    // run-time channel count measured +15% Ir: it divides.)
+                    if take < 4 {
+                        let c = pal[usize::from(index)];
+                        let mut o = rb + px * ch;
+                        for _ in 0..take {
+                            buf[o..o + 3].copy_from_slice(&c);
+                            o += ch;
+                        }
+                    } else {
+                        let c = pal4[usize::from(index)];
+                        let o = rb + px * ch;
+                        let dst = &mut buf[o..o + take * ch];
+                        let mut q = 0;
+                        while q + 4 <= dst.len() {
+                            dst[q..q + 4].copy_from_slice(&c);
+                            q += ch;
+                        }
+                        if q < dst.len() {
+                            dst[q..].copy_from_slice(&c[..3]);
+                        }
                     }
                     px += take;
                 }
@@ -719,14 +960,30 @@ fn dib_pixels(image: &Image, d: &Dib, out: &mut Vec<u8>) {
     let base = out.len();
     out.resize(base + d.pixels_len, 0);
     let pixels = &mut out[base..];
+    let g = (w * ch, w * bpp, d.row_bytes, h);
+    match image.format {
+        PixelFormat::L8 => dib_rows(&image.pixels, pixels, g, |d, s| d.copy_from_slice(s)),
+        PixelFormat::Rgb8 => dib_rows(&image.pixels, pixels, g, crate::swizzle::swap_rb3),
+        _ => dib_rows(&image.pixels, pixels, g, crate::swizzle::swap_rb4),
+    }
+}
+
+/// Image rows (`n_src` bytes each) to bottom-up file rows (`n_dst` bytes at
+/// a pitch of `row_bytes`), each through `f`. Out of line, one copy per
+/// format, the format decided once instead of in every row (and no
+/// format's loop sharing registers with another's).
+#[inline(never)]
+fn dib_rows(
+    src: &[u8],
+    dst: &mut [u8],
+    (n_src, n_dst, row_bytes, h): (usize, usize, usize, usize),
+    mut f: impl FnMut(&mut [u8], &[u8]),
+) {
     for y in 0..h {
-        let src = &image.pixels[y * w * ch..(y + 1) * w * ch];
-        let dst = &mut pixels[(h - 1 - y) * d.row_bytes..][..w * bpp];
-        match image.format {
-            PixelFormat::L8 => dst.copy_from_slice(src),
-            PixelFormat::Rgb8 => crate::swizzle::swap_rb3(dst, src),
-            _ => crate::swizzle::swap_rb4(dst, src),
-        }
+        f(
+            &mut dst[(h - 1 - y) * row_bytes..][..n_dst],
+            &src[y * n_src..(y + 1) * n_src],
+        );
     }
 }
 
@@ -826,13 +1083,9 @@ pub fn encode_dib(image: &Image, kind: DibKind) -> Result<Vec<u8>> {
 /// Write an ICO entry's DIB: 32-bit `BI_RGB` (alpha in the fourth byte, as
 /// icons store it) with a doubled height and an AND mask from the alpha.
 pub(crate) fn encode_ico_dib(image: &Image) -> Result<Vec<u8>> {
-    let rgba = match image.format {
-        PixelFormat::Rgba8 => image.pixels.clone(),
-        PixelFormat::Rgb8 => image
-            .pixels
-            .chunks_exact(3)
-            .flat_map(|p| [p[0], p[1], p[2], 0xff])
-            .collect(),
+    let ch = match image.format {
+        PixelFormat::Rgba8 => 4,
+        PixelFormat::Rgb8 => 3,
         other => {
             return Err(Error::unsupported(format!(
                 "ico: encoding {other:?} (Rgb8 and Rgba8)"
@@ -840,29 +1093,190 @@ pub(crate) fn encode_ico_dib(image: &Image) -> Result<Vec<u8>> {
         }
     };
     let (w, h) = (image.width as usize, image.height as usize);
-    let mut out = Vec::new();
+    let mask_row = w.div_ceil(32) * 4;
+    let (pixels_len, mask_len) = (w * h * 4, mask_row * h);
+    // The whole entry is sized once and written in place: the pixels
+    // straight from the image a row at a time (one word exchange per RGBA
+    // pixel) and the mask a byte (eight alphas) at a time. Appending four
+    // bytes a pixel to an unreserved Vec, from an RGBA copy of the image,
+    // and building every mask row in a Vec of its own was 51 Ir a pixel.
+    let mut out = Vec::with_capacity(INFO as usize + pixels_len + mask_len);
     out.extend_from_slice(&INFO.to_le_bytes());
     out.extend_from_slice(&(w as i32).to_le_bytes());
     out.extend_from_slice(&((h * 2) as i32).to_le_bytes());
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&32u16.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
-    let mask_row = w.div_ceil(32) * 4;
-    out.extend_from_slice(&((w * h * 4 + mask_row * h) as u32).to_le_bytes());
+    out.extend_from_slice(&((pixels_len + mask_len) as u32).to_le_bytes());
     out.extend_from_slice(&[0u8; 16]);
-    for y in (0..h).rev() {
-        for p in rgba[y * w * 4..(y + 1) * w * 4].chunks_exact(4) {
-            out.extend_from_slice(&[p[2], p[1], p[0], p[3]]);
-        }
-    }
-    for y in (0..h).rev() {
-        let mut row = vec![0u8; mask_row];
-        for x in 0..w {
-            if rgba[(y * w + x) * 4 + 3] == 0 {
-                row[x / 8] |= 0x80 >> (x % 8);
+    let base = out.len();
+    out.resize(base + pixels_len + mask_len, 0);
+    let (xor, and) = out[base..].split_at_mut(pixels_len);
+    // Bottom row first, BGRA.
+    let rows = image.pixels.chunks_exact(w * ch).rev();
+    for (dst, src) in xor.chunks_exact_mut(w * 4).zip(rows) {
+        if ch == 4 {
+            crate::swizzle::swap_rb4(dst, src);
+        } else {
+            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
+                d.copy_from_slice(&[s[2], s[1], s[0], 0xff]);
             }
         }
-        out.extend_from_slice(&row);
+    }
+    // The AND mask: a set bit for every fully transparent pixel (none in an
+    // RGB image, whose mask stays zero).
+    if ch == 4 {
+        let rows = image.pixels.chunks_exact(w * 4).rev();
+        for (mask, src) in and.chunks_exact_mut(mask_row).zip(rows) {
+            for (m, cell) in mask.iter_mut().zip(src.chunks(32)) {
+                let mut bits = 0u8;
+                for (k, px) in cell.chunks_exact(4).enumerate() {
+                    bits |= u8::from(px[3] == 0) << (7 - k);
+                }
+                *m = bits;
+            }
+        }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The table form of a bitfield layout gives every pixel the bytes
+    /// `Field::read` gives it: every contiguous mask of a 16 and a 32-bit
+    /// pixel, in each channel position, with and without an alpha channel.
+    #[test]
+    fn field_tables_match_field_read() {
+        let mut seed = 0x2545_f491u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let other = Field { shift: 3, len: 5 };
+        let none = Field { shift: 0, len: 0 };
+        for bits in [16u32, 32] {
+            for len in 1..=bits {
+                for shift in 0..=bits - len {
+                    let x = Field::from_mask((u32::MAX >> (32 - len)) << shift, bits).unwrap();
+                    for which in 0..5 {
+                        let mut f = Fields {
+                            r: other,
+                            g: other,
+                            b: other,
+                            a: if which == 4 { none } else { other },
+                        };
+                        match which {
+                            0 => f.r = x,
+                            1 => f.g = x,
+                            2 => f.b = x,
+                            3 => f.a = x,
+                            _ => {}
+                        }
+                        let t = FieldTables::new(&f);
+                        let s = (bits / 8) as usize;
+                        let src: Vec<u8> = (0..64).flat_map(|_| next().to_le_bytes()).collect();
+                        for ch in [3usize, 4] {
+                            let mut got = vec![0u8; src.len() / s * ch];
+                            match (s, ch) {
+                                (2, 3) => t.row::<2, 3>(&mut got, &src),
+                                (2, _) => t.row::<2, 4>(&mut got, &src),
+                                (_, 3) => t.row::<4, 3>(&mut got, &src),
+                                _ => t.row::<4, 4>(&mut got, &src),
+                            }
+                            for (px, p) in got.chunks_exact(ch).zip(src.chunks_exact(s)) {
+                                let v = if s == 2 {
+                                    u32::from(u16::from_le_bytes([p[0], p[1]]))
+                                } else {
+                                    u32::from_le_bytes([p[0], p[1], p[2], p[3]])
+                                };
+                                let a = if f.a.len != 0 { f.a.read(v) } else { 0xff };
+                                let want = [f.r.read(v), f.g.read(v), f.b.read(v), a];
+                                assert_eq!(px, &want[..ch], "{bits}-bit {f:?} pixel {v:#x}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The entry writer as it was before it wrote in place (an RGBA copy,
+    /// four bytes pushed a pixel, a Vec per mask row): the byte oracle.
+    fn encode_ico_dib_reference(image: &Image) -> Vec<u8> {
+        let rgba: Vec<u8> = match image.format {
+            PixelFormat::Rgba8 => image.pixels.clone(),
+            _ => image
+                .pixels
+                .chunks_exact(3)
+                .flat_map(|p| [p[0], p[1], p[2], 0xff])
+                .collect(),
+        };
+        let (w, h) = (image.width as usize, image.height as usize);
+        let mut out = Vec::new();
+        out.extend_from_slice(&INFO.to_le_bytes());
+        out.extend_from_slice(&(w as i32).to_le_bytes());
+        out.extend_from_slice(&((h * 2) as i32).to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&32u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let mask_row = w.div_ceil(32) * 4;
+        out.extend_from_slice(&((w * h * 4 + mask_row * h) as u32).to_le_bytes());
+        out.extend_from_slice(&[0u8; 16]);
+        for y in (0..h).rev() {
+            for p in rgba[y * w * 4..(y + 1) * w * 4].chunks_exact(4) {
+                out.extend_from_slice(&[p[2], p[1], p[0], p[3]]);
+            }
+        }
+        for y in (0..h).rev() {
+            let mut row = vec![0u8; mask_row];
+            for x in 0..w {
+                if rgba[(y * w + x) * 4 + 3] == 0 {
+                    row[x / 8] |= 0x80 >> (x % 8);
+                }
+            }
+            out.extend_from_slice(&row);
+        }
+        out
+    }
+
+    /// `encode_ico_dib` writes exactly the bytes the old writer wrote, for
+    /// RGB and RGBA entries of every width from 1 to 70 (mask rows of one to
+    /// three words, partial mask bytes) with fully transparent pixels mixed
+    /// in, and refuses other formats.
+    #[test]
+    fn ico_dib_matches_reference_writer() {
+        let mut seed = 0x9e37_79b9u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for w in 1..=70u32 {
+            let h = 1 + next() % 9;
+            for format in [PixelFormat::Rgb8, PixelFormat::Rgba8] {
+                let n = (w * h) as usize * format.bytes_per_pixel();
+                let mut px: Vec<u8> = (0..n).map(|_| next() as u8).collect();
+                if format == PixelFormat::Rgba8 {
+                    for a in px.iter_mut().skip(3).step_by(4) {
+                        if next() % 3 == 0 {
+                            *a = 0;
+                        }
+                    }
+                }
+                let img = Image::new(w, h, format, px).unwrap();
+                assert_eq!(
+                    encode_ico_dib(&img).unwrap(),
+                    encode_ico_dib_reference(&img),
+                    "{format:?} {w}x{h}"
+                );
+            }
+        }
+        let grey = Image::new(4, 4, PixelFormat::L8, vec![7; 16]).unwrap();
+        assert!(encode_ico_dib(&grey).is_err());
+    }
 }

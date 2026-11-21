@@ -50,9 +50,17 @@ pub(crate) fn sniff(d: &[u8]) -> Option<Format> {
         Some(Format::Hdr)
     } else if d.len() >= 2 && d[0] == b'P' && (b'1'..=b'7').contains(&d[1]) {
         Some(Format::Pnm)
-    } else if d.len() >= 6 && d[..2] == [0, 0] && (d[2] == 1 || d[2] == 2) && d[3] == 0 {
-        let count = le16(d, 4)?;
-        (count > 0).then_some(if d[2] == 1 { Format::Ico } else { Format::Cur })
+    } else if d.len() >= 6
+        && d[..2] == [0, 0]
+        && (d[2] == 1 || d[2] == 2)
+        && d[3] == 0
+        && (d[4] != 0 || d[5] != 0)
+    {
+        // An ICO/CUR directory with at least one entry. With a count of
+        // zero these six bytes are also how an uncompressed true-colour TGA
+        // with no ID, no colour map and no footer starts (`00 00 02 00 00
+        // 00`), so that case goes on to the TGA header check.
+        Some(if d[2] == 1 { Format::Ico } else { Format::Cur })
     } else if looks_like_tga(d) {
         Some(Format::Tga)
     } else {

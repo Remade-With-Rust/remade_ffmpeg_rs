@@ -18,14 +18,34 @@ pub struct Meta {
     pub orientation: String,
 }
 
-/// RGBE to linear float, exactly as the `image` crate computes it:
-/// `2^(e - 136) * c`, with `e = 0` giving zero.
-fn to_f32(c: [u8; 3], e: u8) -> [f32; 3] {
-    let exp = f32::from_bits(if e > 1 {
-        u32::from(e - 1) << 23
+/// The scale of an exponent byte: `2^(e - 136)`, and zero for `e = 0`,
+/// built from the same bit pattern and the same multiplication `image`
+/// uses (all exact powers of two, so the table holds the same bits).
+static EXP_SCALE: [f32; 256] = {
+    let mut t = [0f32; 256];
+    let mut e = 0;
+    while e < 256 {
+        t[e] = exp_scale(e as u8);
+        e += 1;
+    }
+    t
+};
+
+/// `2^(e - 136)` as the `image` crate computes it (zero for `e = 0`).
+const fn exp_scale(e: u8) -> f32 {
+    f32::from_bits(if e > 1 {
+        ((e - 1) as u32) << 23
     } else {
-        u32::from(e) << 22
-    }) * 0.003_906_25;
+        (e as u32) << 22
+    }) * 0.003_906_25
+}
+
+/// RGBE to linear float, exactly as the `image` crate computes it:
+/// `2^(e - 136) * c`, with `e = 0` giving zero. The scale is one table load
+/// (a compare, a select, a shift, a move to a float register and a
+/// multiplication before).
+fn to_f32(c: [u8; 3], e: u8) -> [f32; 3] {
+    let exp = EXP_SCALE[usize::from(e)];
     [
         exp * f32::from(c[0]),
         exp * f32::from(c[1]),
@@ -119,56 +139,77 @@ pub fn decode_with_meta(data: &[u8]) -> Result<(Image, Meta)> {
     }
     let (lines, len) = (n1 as usize, n2 as usize);
     let mut scan = vec![[0u8; 4]; len];
+    // The four component rows of a new-style RLE scanline.
+    let mut planes = vec![0u8; len * 4];
     let mut r = crate::read::Reader::new(data);
     r.seek(pos)?;
-    let standard = a1 == "-Y" && a2 == "+X";
+    // Where a scanline goes is settled once per scanline, not per pixel.
+    // Not transposed: scanline `s` is output row `s` (`-Y`) or its mirror
+    // from the bottom (`+Y`), filled left to right (`+X`) or right to left.
+    // Transposed: it is output column `s` (`+X`) or its mirror (`-X`),
+    // filled top to bottom (`-Y`) or bottom to top.
+    let first_forward = matches!(a1, "-Y" | "+X");
+    let second_forward = matches!(a2, "+X" | "-Y");
+    let row_bytes = width as usize * 12;
     for s in 0..lines {
-        if standard {
-            let rest = r.rest();
-            let new_rle = rest.len() >= 4 && rest[0] == 2 && rest[1] == 2 && rest[2] < 128;
-            if !new_rle {
-                // Flat / old-RLE scanline in standard orientation: convert
-                // straight from the file bytes into the output row, with no
-                // intermediate scanline copy. Measured +8.6M Ir (6%) but
-                // -10% wall (0.29 s -> 0.26 s, 6/6 interleaved pairs): the
-                // store-then-reload through the scanline buffer cost more
-                // than the extra instructions. The clock wins.
-                read_flat_f32(&mut r, &mut img.pixels[s * len * 12..(s + 1) * len * 12])?;
-                continue;
-            }
-        }
-        read_scanline(&mut r, &mut scan)?;
-        if standard {
-            // Scanline s is output row s: one row slice, fixed 12-byte stores.
-            let row = &mut img.pixels[s * len * 12..(s + 1) * len * 12];
-            for (d, px) in row.chunks_exact_mut(12).zip(&scan) {
-                let f = to_f32([px[0], px[1], px[2]], px[3]);
-                d[0..4].copy_from_slice(&f[0].to_ne_bytes());
-                d[4..8].copy_from_slice(&f[1].to_ne_bytes());
-                d[8..12].copy_from_slice(&f[2].to_ne_bytes());
+        let line = if first_forward { s } else { lines - 1 - s };
+        if transposed {
+            read_scanline(&mut r, &mut scan, &mut planes)?;
+            let rows = img.pixels.chunks_exact_mut(row_bytes);
+            let at = line * 12;
+            if second_forward {
+                for (row, px) in rows.zip(&scan) {
+                    put_f32(&mut row[at..at + 12], px);
+                }
+            } else {
+                for (row, px) in rows.rev().zip(&scan) {
+                    put_f32(&mut row[at..at + 12], px);
+                }
             }
             continue;
         }
-        for (p, px) in scan.iter().enumerate() {
-            let (x, y) = if transposed {
-                (
-                    if a1 == "+X" { s } else { lines - 1 - s },
-                    if a2 == "-Y" { p } else { len - 1 - p },
-                )
-            } else {
-                (
-                    if a2 == "+X" { p } else { len - 1 - p },
-                    if a1 == "-Y" { s } else { lines - 1 - s },
-                )
-            };
-            let o = (y * width as usize + x) * 12;
-            let f = to_f32([px[0], px[1], px[2]], px[3]);
-            for (k, v) in f.iter().enumerate() {
-                img.pixels[o + k * 4..o + k * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+        let row = &mut img.pixels[line * row_bytes..(line + 1) * row_bytes];
+        if !second_forward {
+            read_scanline(&mut r, &mut scan, &mut planes)?;
+            for (d, px) in row.chunks_exact_mut(12).rev().zip(&scan) {
+                put_f32(d, px);
             }
+            continue;
+        }
+        let rest = r.rest();
+        let new_rle = rest.len() >= 4 && rest[0] == 2 && rest[1] == 2 && rest[2] < 128;
+        if !new_rle {
+            // Flat / old-RLE scanline read left to right: convert straight
+            // from the file bytes into the output row, with no intermediate
+            // scanline copy. Measured +8.6M Ir (6%) but -10% wall (0.29 s ->
+            // 0.26 s, 6/6 interleaved pairs): the store-then-reload through
+            // the scanline buffer cost more than the extra instructions.
+            // The clock wins.
+            read_flat_f32(&mut r, row)?;
+            continue;
+        }
+        // New-style RLE read left to right: the four component rows are
+        // decoded and converted straight into the output row.
+        r.skip(4)?;
+        read_rle_planes(&mut r, &mut planes, len)?;
+        let (red, rest) = planes.split_at(len);
+        let (green, rest) = rest.split_at(len);
+        let (blue, exp) = rest.split_at(len);
+        let rgbe = red.iter().zip(green).zip(blue).zip(exp);
+        for (d, (((&r, &g), &b), &e)) in row.chunks_exact_mut(12).zip(rgbe) {
+            put_f32(d, &[r, g, b, e]);
         }
     }
     Ok((img, meta))
+}
+
+/// Store one RGBE pixel as three native-order floats in `d` (12 bytes).
+#[inline(always)]
+fn put_f32(d: &mut [u8], px: &[u8; 4]) {
+    let f = to_f32([px[0], px[1], px[2]], px[3]);
+    d[0..4].copy_from_slice(&f[0].to_ne_bytes());
+    d[4..8].copy_from_slice(&f[1].to_ne_bytes());
+    d[8..12].copy_from_slice(&f[2].to_ne_bytes());
 }
 
 /// One flat or old-RLE scanline of `row.len() / 12` pixels, decoded straight
@@ -176,76 +217,110 @@ pub fn decode_with_meta(data: &[u8]) -> Result<(Image, Meta)> {
 /// [`read_scanline`]'s flat path; a run repeats the previous output pixel.
 fn read_flat_f32(r: &mut crate::read::Reader, row: &mut [u8]) -> Result<()> {
     let width = row.len() / 12;
-    let put = |d: &mut [u8], c: &[u8]| {
-        let f = to_f32([c[0], c[1], c[2]], c[3]);
-        d[0..4].copy_from_slice(&f[0].to_ne_bytes());
-        d[4..8].copy_from_slice(&f[1].to_ne_bytes());
-        d[8..12].copy_from_slice(&f[2].to_ne_bytes());
-    };
     let is_run =
-        |c: &[u8]| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) & 0x00ff_ffff == 0x0001_0101;
-    let mut chunks = r.rest().chunks_exact(4);
-    let first = chunks.next().ok_or(Error::Truncated)?;
-    if is_run(first) {
-        return Err(Error::invalid("hdr: scanline starts with a run"));
-    }
-    put(&mut row[..12], first);
-    let (mut used, mut x, mut mult) = (4usize, 1usize, 1usize);
+        |c: &[u8; 4]| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) & 0x00ff_ffff == 0x0001_0101;
+    let data = r.rest();
+    let (mut used, mut x, mut mult) = (0usize, 0usize, 1usize);
     while x < width {
-        let c = chunks.next().ok_or(Error::Truncated)?;
-        used += 4;
-        if is_run(c) {
-            let n = usize::from(c[3])
-                .checked_mul(mult)
-                .ok_or_else(|| Error::invalid("hdr: run overflow"))?;
-            mult = mult.saturating_mul(256);
-            if x + n > width {
-                return Err(Error::invalid("hdr: scanline overrun"));
+        // The pixels up to the next run marker (in a flat file, the whole
+        // scanline): output and input are walked in step, so a pixel is
+        // the run test and the conversion, with no index arithmetic and no
+        // range check of its own (41 Ir a pixel with them).
+        let mut n = 0;
+        let pixels = row[x * 12..].chunks_exact_mut(12);
+        for (d, c) in pixels.zip(data[used..].chunks_exact(4)) {
+            let c: &[u8; 4] = c.try_into().unwrap();
+            if is_run(c) {
+                break;
             }
-            let (done, rest) = row.split_at_mut(x * 12);
-            let p = &done[(x - 1) * 12..];
-            for d in rest[..n * 12].chunks_exact_mut(12) {
-                d.copy_from_slice(p);
-            }
-            x += n;
-        } else {
-            mult = 1;
-            put(&mut row[x * 12..x * 12 + 12], c);
-            x += 1;
+            put_f32(d, c);
+            n += 1;
         }
+        if n > 0 {
+            mult = 1;
+            x += n;
+            used += n * 4;
+            if x == width {
+                break;
+            }
+        }
+        // A run marker, or the end of the data.
+        let c = data.get(used..used + 4).ok_or(Error::Truncated)?;
+        used += 4;
+        if x == 0 {
+            return Err(Error::invalid("hdr: scanline starts with a run"));
+        }
+        let n = usize::from(c[3])
+            .checked_mul(mult)
+            .ok_or_else(|| Error::invalid("hdr: run overflow"))?;
+        mult = mult.saturating_mul(256);
+        if x + n > width {
+            return Err(Error::invalid("hdr: scanline overrun"));
+        }
+        let (done, rest) = row.split_at_mut(x * 12);
+        let p = &done[(x - 1) * 12..];
+        for d in rest[..n * 12].chunks_exact_mut(12) {
+            d.copy_from_slice(p);
+        }
+        x += n;
     }
     r.skip(used)
 }
 
-fn read_scanline(r: &mut crate::read::Reader, buf: &mut [[u8; 4]]) -> Result<()> {
+/// The body of a new-style RLE scanline (after its four-byte header): the
+/// red, green, blue and exponent rows of `width` bytes each, one after the
+/// other in `planes`.
+///
+/// The format stores the scanline a component at a time, so each component
+/// is decoded into a row of its own, where a literal is one copy and a run
+/// one fill. Writing every byte straight to its pixel was a range-checked
+/// store at a stride of four per byte (29 Ir a pixel).
+fn read_rle_planes(r: &mut crate::read::Reader, planes: &mut [u8], width: usize) -> Result<()> {
+    for plane in planes.chunks_exact_mut(width) {
+        let mut x = 0;
+        while x < width {
+            let n = r.u8()?;
+            if n <= 128 {
+                let n = usize::from(n);
+                if x + n > width {
+                    return Err(Error::invalid("hdr: scanline overrun"));
+                }
+                plane[x..x + n].copy_from_slice(r.bytes(n)?);
+                x += n;
+            } else {
+                let n = usize::from(n - 128);
+                if x + n > width {
+                    return Err(Error::invalid("hdr: scanline overrun"));
+                }
+                let v = r.u8()?;
+                plane[x..x + n].fill(v);
+                x += n;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One scanline of `buf.len()` RGBE pixels into `buf`. `planes` is scratch
+/// space of four times that many bytes.
+fn read_scanline(
+    r: &mut crate::read::Reader,
+    buf: &mut [[u8; 4]],
+    planes: &mut [u8],
+) -> Result<()> {
     let width = buf.len();
     let first = r.array::<4>()?;
     if first[0] == 2 && first[1] == 2 && first[2] < 128 {
-        for c in 0..4 {
-            let mut x = 0;
-            while x < width {
-                let n = r.u8()?;
-                if n <= 128 {
-                    let n = usize::from(n);
-                    if x + n > width {
-                        return Err(Error::invalid("hdr: scanline overrun"));
-                    }
-                    for (i, &v) in r.bytes(n)?.iter().enumerate() {
-                        buf[x + i][c] = v;
-                    }
-                    x += n;
-                } else {
-                    let n = usize::from(n - 128);
-                    if x + n > width {
-                        return Err(Error::invalid("hdr: scanline overrun"));
-                    }
-                    let v = r.u8()?;
-                    for p in &mut buf[x..x + n] {
-                        p[c] = v;
-                    }
-                    x += n;
-                }
-            }
+        // New-style RLE: decode the four component rows, then interleave
+        // them into pixels (for the mirrored and transposed orientations;
+        // the usual one converts from the component rows directly).
+        read_rle_planes(r, planes, width)?;
+        let (red, rest) = planes.split_at(width);
+        let (green, rest) = rest.split_at(width);
+        let (blue, exp) = rest.split_at(width);
+        let rgbe = red.iter().zip(green).zip(blue).zip(exp);
+        for (px, (((&r, &g), &b), &e)) in buf.iter_mut().zip(rgbe) {
+            *px = [r, g, b, e];
         }
         return Ok(());
     }
@@ -337,6 +412,8 @@ pub fn encode(image: &Image) -> Result<Vec<u8>> {
         }
         if !(8..0x8000).contains(&w) {
             // Too short or too long for new-style RLE: flat pixels.
+            // (Four planes read in step: an index is the plain way to say it.)
+            #[allow(clippy::needless_range_loop)]
             for x in 0..w {
                 out.extend_from_slice(&[planes[0][x], planes[1][x], planes[2][x], planes[3][x]]);
             }
@@ -388,6 +465,65 @@ fn rle_component(v: &[u8], out: &mut Vec<u8>) {
             }
         } else {
             out.extend_from_slice(&v[start..i]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode, exp_scale, EXP_SCALE};
+
+    fn flat_file(w: usize, scanline: &[u8]) -> Vec<u8> {
+        let mut f = format!("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X {w}\n").into_bytes();
+        f.extend_from_slice(scanline);
+        f
+    }
+
+    /// Old-style runs in a flat scanline: consecutive run markers multiply
+    /// (the second counts 256s), a literal pixel resets that, and the
+    /// errors (a scanline starting with a run, an overrun, truncation) hold.
+    #[test]
+    fn flat_scanline_runs_and_errors() {
+        let (p, q) = ([9u8, 8, 7, 130], [1u8, 2, 3, 129]);
+        let px = |c: [u8; 4]| -> Vec<u8> {
+            super::to_f32([c[0], c[1], c[2]], c[3])
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect()
+        };
+        // p, run of 2, then run of 1 x 256: 259 pixels of p, then q, run 3.
+        let mut line = [p, [1, 1, 1, 2], [1, 1, 1, 1], q, [1, 1, 1, 3]].concat();
+        let img = decode(&flat_file(263, &line)).unwrap();
+        let mut want = px(p).repeat(259);
+        want.extend(px(q).repeat(4));
+        assert_eq!(img.pixels, want);
+        // One pixel short of what the runs write is an overrun; one pixel
+        // more is truncated data.
+        assert!(decode(&flat_file(262, &line)).is_err());
+        assert!(decode(&flat_file(264, &line)).is_err());
+        line.truncate(line.len() - 1);
+        assert!(decode(&flat_file(263, &line)).is_err());
+        assert!(decode(&flat_file(3, &[[1, 1, 1, 2], p].concat())).is_err());
+        assert!(decode(&flat_file(2, &[])).is_err());
+    }
+
+    /// The const-evaluated exponent table holds the bits the run-time
+    /// formula produces, for every exponent byte.
+    #[test]
+    fn exp_table_matches_run_time_formula() {
+        for e in 0..=255u8 {
+            let e = std::hint::black_box(e);
+            let run_time = f32::from_bits(if e > 1 {
+                u32::from(e - 1) << 23
+            } else {
+                u32::from(e) << 22
+            }) * std::hint::black_box(0.003_906_25f32);
+            assert_eq!(
+                EXP_SCALE[usize::from(e)].to_bits(),
+                run_time.to_bits(),
+                "{e}"
+            );
+            assert_eq!(exp_scale(e).to_bits(), run_time.to_bits(), "{e}");
         }
     }
 }

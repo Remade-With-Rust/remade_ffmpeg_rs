@@ -108,11 +108,20 @@ fn decode_entry(data: &[u8], d: &Dir) -> Result<(Image, bool)> {
     let mask_len = mask_row * h;
     if data_end >= end + mask_len {
         let mask = body.get(end..end + mask_len).ok_or(Error::Truncated)?;
-        for y in 0..h {
-            let row = &mask[y * mask_row..(y + 1) * mask_row];
-            for x in 0..w {
-                if row[x / 8] & (0x80 >> (x % 8)) != 0 {
-                    img.pixels[((h - y - 1) * w + x) * 4 + 3] = 0;
+        // The mask is walked a byte (eight pixels) at a time, bottom row
+        // first like the pixels. A zero byte, which is most of the mask of
+        // an icon with real alpha, is skipped whole; the pixels of any other
+        // byte have their alpha cleared without a branch (`bit - 1` is 0x00
+        // for a set bit and 0xff for a clear one). Testing a bit and making
+        // a bounds-checked store per pixel was 15 Ir a pixel.
+        let rows = img.pixels.chunks_exact_mut(w * 4).rev();
+        for (out, row) in rows.zip(mask.chunks_exact(mask_row)) {
+            for (cell, &m) in out.chunks_mut(32).zip(row) {
+                if m == 0 {
+                    continue;
+                }
+                for (k, px) in cell.chunks_exact_mut(4).enumerate() {
+                    px[3] &= ((m >> (7 - k)) & 1).wrapping_sub(1);
                 }
             }
         }
@@ -229,7 +238,11 @@ fn to_rgba8(image: &Image) -> Result<Vec<u8>> {
     }
 }
 
-fn write(entries: &[(Image, u16, u16)], cur: bool) -> Result<Vec<u8>> {
+/// Write an ICO (`cur` false) or CUR file from borrowed images with their
+/// hotspots. Nothing here copies an image: the entries are references and
+/// the layout check looks at the format alone (it used to build an RGBA copy
+/// of every image just to see whether that failed).
+pub(crate) fn write(entries: &[(&Image, u16, u16)], cur: bool) -> Result<Vec<u8>> {
     if entries.is_empty() || entries.len() > usize::from(u16::MAX) {
         return Err(Error::invalid("ico: 1 to 65535 entries"));
     }
@@ -240,7 +253,12 @@ fn write(entries: &[(Image, u16, u16)], cur: bool) -> Result<Vec<u8>> {
                 "ico: entries are 1 to 256 pixels a side",
             ));
         }
-        to_rgba8(img)?;
+        if !matches!(img.format, PixelFormat::Rgba8 | PixelFormat::Rgb8) {
+            return Err(Error::unsupported(format!(
+                "ico: encoding {:?} (Rgb8 and Rgba8)",
+                img.format
+            )));
+        }
         // 256-pixel entries as PNG (as Windows writes them), smaller as BMP.
         bodies.push(if img.width == 256 || img.height == 256 {
             encode_png(img)?
@@ -275,11 +293,12 @@ fn write(entries: &[(Image, u16, u16)], cur: bool) -> Result<Vec<u8>> {
 /// pixels a side): 256-pixel entries as PNG, smaller ones as 32-bit BMP
 /// with an AND mask.
 pub fn encode(images: &[Image]) -> Result<Vec<u8>> {
-    let e: Vec<(Image, u16, u16)> = images.iter().map(|i| (i.clone(), 0, 0)).collect();
+    let e: Vec<(&Image, u16, u16)> = images.iter().map(|i| (i, 0, 0)).collect();
     write(&e, false)
 }
 
 /// Encode a cursor: each image with its hotspot (x, y).
 pub fn encode_cur(entries: &[(Image, u16, u16)]) -> Result<Vec<u8>> {
-    write(entries, true)
+    let e: Vec<(&Image, u16, u16)> = entries.iter().map(|(i, x, y)| (i, *x, *y)).collect();
+    write(&e, true)
 }

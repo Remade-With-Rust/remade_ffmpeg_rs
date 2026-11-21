@@ -132,6 +132,9 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     // over the output afterwards. Row and column flips below move whole
     // pixels, so they do not care about channel order.
     let swz = direct && raw_bpp >= 3;
+    // Orientation: bit 5 = top-to-bottom, bit 4 = right-to-left.
+    let stride = width * raw_bpp;
+    let mut flip_rows = desc & 0x20 == 0 && height > 1;
     if rle {
         match raw_bpp {
             1 => expand_rle::<1>(&mut r, &mut raw, false)?,
@@ -139,6 +142,26 @@ pub fn decode(data: &[u8]) -> Result<Image> {
             3 => expand_rle::<3>(&mut r, &mut raw, swz)?,
             _ => expand_rle::<4>(&mut r, &mut raw, swz)?,
         }
+    } else if flip_rows {
+        // Uncompressed and stored bottom row first (the TGA default): each
+        // stored row goes straight to its place, in the same pass as the
+        // copy or the red/blue exchange. Reading the image top-down and
+        // then exchanging rows in place was two more passes over it.
+        let src = r.bytes(n_raw)?;
+        for (d, s) in raw
+            .chunks_exact_mut(stride)
+            .rev()
+            .zip(src.chunks_exact(stride))
+        {
+            if !swz {
+                d.copy_from_slice(s);
+            } else if raw_bpp == 3 {
+                bgr_copy::<3>(d, s);
+            } else {
+                bgr_copy::<4>(d, s);
+            }
+        }
+        flip_rows = false;
     } else if swz {
         let src = r.bytes(n_raw)?;
         if raw_bpp == 3 {
@@ -150,9 +173,7 @@ pub fn decode(data: &[u8]) -> Result<Image> {
         raw.copy_from_slice(r.bytes(n_raw)?);
     }
 
-    // Orientation: bit 5 = top-to-bottom, bit 4 = right-to-left.
-    let stride = width * raw_bpp;
-    if desc & 0x20 == 0 && height > 1 {
+    if flip_rows {
         for y in 0..height / 2 {
             let (top, bottom) = raw.split_at_mut((height - 1 - y) * stride);
             top[y * stride..(y + 1) * stride].swap_with_slice(&mut bottom[..stride]);
@@ -168,33 +189,82 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     }
 
     let out = &mut img.pixels;
+    let mut swapped = swz;
     if let Some((entry, bytes)) = &map {
         let get = |i: usize| -> Result<&[u8]> {
             let at = entry * i.checked_sub(map_origin).ok_or_else(bad_index)?;
             bytes.get(at..at + entry).ok_or_else(bad_index)
         };
         if raw_bpp == 1 {
-            for (&i, o) in raw.iter().zip(out.chunks_exact_mut(*entry)) {
-                o.copy_from_slice(get(usize::from(i))?);
-            }
+            map_pixels8(&raw, out, *entry, bytes, map_origin)?;
+            swapped = true;
         } else {
             for (i, o) in raw.chunks_exact(2).zip(out.chunks_exact_mut(*entry)) {
                 o.copy_from_slice(get(usize::from(u16::from_le_bytes([i[0], i[1]])))?);
             }
         }
     } else if rgb15 {
+        // R, G and B straight from their 5-bit fields: no B, G, R triple
+        // built first and no exchange pass over the output afterwards.
         for (s, o) in raw.chunks_exact(2).zip(out.chunks_exact_mut(3)) {
-            o.copy_from_slice(&expand15([s[0], s[1]]));
+            let v = u16::from_le_bytes([s[0], s[1]]);
+            o[0] = LUT5[usize::from((v >> 10) & 31)];
+            o[1] = LUT5[usize::from((v >> 5) & 31)];
+            o[2] = LUT5[usize::from(v & 31)];
         }
+        swapped = true;
     } else {
         *out = raw;
     }
-    if !swz && matches!(format, PixelFormat::Rgb8 | PixelFormat::Rgba8) {
+    if !swapped && matches!(format, PixelFormat::Rgb8 | PixelFormat::Rgba8) {
         for p in out.chunks_exact_mut(out_bpp) {
             p.swap(0, 2);
         }
     }
     Ok(img)
+}
+
+/// Colour-map lookup for 8-bit indices: `out` gets `entry` bytes (3 or 4)
+/// for every index in `raw`, already RGB(A). `map` holds whole BGR(A)
+/// entries, the first one for index `origin`.
+///
+/// The map becomes a 256-entry table of finished pixels (so there is no
+/// red/blue exchange pass afterwards) and the indices are range-checked in
+/// one pass of their own. A pixel is then an index load and a fixed-size
+/// copy, where it was a checked offset, a slice lookup and a
+/// variable-length `memcpy` call (66 Ir a pixel). Out of line, so the rest
+/// of `decode` keeps its registers.
+#[inline(never)]
+fn map_pixels8(raw: &[u8], out: &mut [u8], entry: usize, map: &[u8], origin: usize) -> Result<()> {
+    // Valid indices are lo..hi. Unless that is all 256 of them, the span
+    // fits a byte and one wrapping subtraction tests both ends (an empty
+    // span fails every index; `raw` is never empty).
+    let lo = origin.min(256);
+    let hi = (origin + map.len() / entry).min(256);
+    if hi - lo < 256 {
+        let (lo8, span) = (lo as u8, (hi - lo) as u8);
+        if raw
+            .iter()
+            .fold(false, |a, &i| a | (i.wrapping_sub(lo8) >= span))
+        {
+            return Err(bad_index());
+        }
+    }
+    let mut table = [[0u8; 4]; 256];
+    for (t, e) in table[lo..hi].iter_mut().zip(map.chunks_exact(entry)) {
+        t[..entry].copy_from_slice(e);
+        t.swap(0, 2);
+    }
+    if entry == 4 {
+        for (&i, o) in raw.iter().zip(out.chunks_exact_mut(4)) {
+            o.copy_from_slice(&table[usize::from(i)]);
+        }
+    } else {
+        for (&i, o) in raw.iter().zip(out.chunks_exact_mut(3)) {
+            o.copy_from_slice(&table[usize::from(i)][..3]);
+        }
+    }
+    Ok(())
 }
 
 /// Expand RLE packets of `B`-byte pixels into `raw` (filled exactly; a
