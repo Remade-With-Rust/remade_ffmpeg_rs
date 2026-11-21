@@ -11,7 +11,8 @@ Each kernel is a twin of a safe scalar function that stays in the tree as its
 **oracle** (`*_simd_matches_scalar` tests, `assert_eq!` — the twins are
 bit-identical by construction: output index = lane, original accumulation order,
 separate mul + add, never FMA). The scalar twin is also the fallback on every CPU
-without the ISA, and is forced for A/B with `MP3_ISA=scalar`.
+without the ISA, and is forced for A/B with `MP3_ISA=scalar` in a build with the
+`env-tuning` feature (a default build never reads the environment).
 
 The two obligations, and how each is discharged:
 
@@ -61,7 +62,8 @@ without a row above (H-11).
   covered by the oracle tests and the bounds argument above.
 - Sanitizers on the lib suite: ASan + LeakSanitizer, TSan, MSan -- all clean.
 - Byte identity of the whole pipeline across arms: 720/720 decode hashes,
-  `MP3_ISA=scalar` vs default (docs: `docs/plans/mp3-kernel-ledger.md`).
+  `MP3_ISA=scalar` (`env-tuning` build) vs default (docs:
+  `docs/plans/mp3-kernel-ledger.md`).
 
 ## Changing this file
 

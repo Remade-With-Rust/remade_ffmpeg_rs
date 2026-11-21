@@ -36,7 +36,8 @@ pub mod synthesis;
 /// per stereo frame on the shipping path, which is real time on a decoder doing a
 /// frame in a few microseconds. Without the feature [`time`] is a plain call. The
 /// deterministic censuses (block types, kernel reach) stay on: they cost a
-/// handful of relaxed adds per frame and back `MP3_CENSUS`.
+/// handful of relaxed adds per frame and back `MP3_CENSUS` (the `env-tuning`
+/// feature).
 pub mod prof {
     use std::sync::atomic::{AtomicU64, Ordering};
     // No clock on the browser target -- see `time` below.
@@ -186,12 +187,15 @@ pub mod prof {
 
 /// Which instruction set the decode kernels may use.
 ///
-/// `MP3_ISA=scalar` forces every kernel onto its scalar twin, read ONCE per
-/// process. It exists for two measurements no build flag can give cleanly: the
-/// ISA-rung A/B (the value of every vector kernel at once, same binary both
-/// arms) and the scalar-arm census (proof that the slow arm is not also what
-/// production runs). Both arms are bit-identical by construction, so flipping it
-/// changes speed only.
+/// With the `env-tuning` cargo feature, `MP3_ISA=scalar` forces every kernel
+/// onto its scalar twin, read ONCE per process. It exists for two measurements
+/// no build flag can give cleanly: the ISA-rung A/B (the value of every vector
+/// kernel at once, same binary both arms) and the scalar-arm census (proof that
+/// the slow arm is not also what production runs). Both arms are bit-identical
+/// by construction, so flipping it changes speed only.
+///
+/// The feature is off by default: a shipping decoder never reads the
+/// environment, so no variable can change which kernels it runs.
 pub mod isa {
     /// A SIMD twin exists AND can run on this CPU (raw, ignores the override):
     /// AVX by runtime detection on x86_64; NEON on aarch64, where it is baseline
@@ -213,13 +217,23 @@ pub mod isa {
         }
     }
 
+    /// `MP3_ISA=scalar` in the environment (`env-tuning` builds only).
+    #[cfg(feature = "env-tuning")]
+    fn forced_scalar() -> bool {
+        matches!(std::env::var("MP3_ISA").as_deref(), Ok("scalar"))
+    }
+
+    /// Without `env-tuning` nothing can force the scalar kernels.
+    #[cfg(not(feature = "env-tuning"))]
+    const fn forced_scalar() -> bool {
+        false
+    }
+
     /// Whether the shipping path takes the SIMD kernels: available AND not forced off.
     #[inline]
     pub fn use_simd() -> bool {
         static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *V.get_or_init(|| {
-            simd_available() && !matches!(std::env::var("MP3_ISA").as_deref(), Ok("scalar"))
-        })
+        *V.get_or_init(|| simd_available() && !forced_scalar())
     }
 }
 

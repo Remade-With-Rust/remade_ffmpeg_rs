@@ -125,9 +125,12 @@ fn continues_stream(h: &layer12::Layer12Header, b: &[u8]) -> bool {
     next_in_stream(h, b).is_some()
 }
 
-/// `MP3_CENSUS=1`: print the kernel-reach census when a decoder is dropped, so the
-/// SHIPPING binary (the rff CLI, any embedding application) can prove which
-/// kernel arms its decode actually took -- not only this crate's examples.
+/// `MP3_CENSUS=1` (with the `env-tuning` cargo feature): print the kernel-reach
+/// census when a decoder is dropped, so a real binary (the rff CLI, any
+/// embedding application) can prove which kernel arms its decode actually took
+/// -- not only this crate's examples. Without the feature -- the default, and
+/// what ships -- the environment is never read and nothing is printed.
+#[cfg(feature = "env-tuning")]
 impl Drop for Mp3Decoder {
     fn drop(&mut self) {
         if std::env::var_os("MP3_CENSUS").is_some() {

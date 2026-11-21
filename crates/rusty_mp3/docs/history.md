@@ -47,7 +47,8 @@ Every kernel is **bit-identical** to its scalar twin (separate mul+add, never
 FMA). Each encoder change was byte-identical to its predecessor on 72/72 corpus
 encodes, and decode hashes match across arms on 720/720 streams. NEON was
 verified under qemu-aarch64; speed on real ARM hardware has not been measured.
-`MP3_ISA=scalar` forces the scalar path.
+`MP3_ISA=scalar` forces the scalar path (now only in a build with the
+`env-tuning` cargo feature: a default build does not read the environment).
 
 ## Encoder quality (0.8.0)
 

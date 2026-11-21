@@ -162,8 +162,10 @@ least as fast.
 | WebAssembly (`wasm32-unknown-unknown`, `wasm32-wasip1`) | Portable | Bit-identical to native, with no host imports |
 | Any other Rust target | Portable | Supported |
 
-Setting `MP3_ISA=scalar` in the environment forces the portable kernels, for
-A/B testing.
+A release build never reads the environment. For A/B testing, the `env-tuning`
+cargo feature (off by default) adds two switches: `MP3_ISA=scalar` forces the
+portable kernels, and `MP3_CENSUS=1` prints, when a decoder is dropped, how
+much of the decode each kernel arm took.
 
 ## Security
 
