@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mp4-v0.7.0...rff-format-mp4-v0.8.0) - 2026-11-21
+
+### Added
+
+- *(rff-format-mp4)* Annex-B extradata, FLAC STREAMINFO rewrite, #115 round trips, sample sources ([#114](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/114))
+
+### Fixed
+
+- *(mp4,mkv)* keep raw length-prefixed H.264/HEVC samples on mux
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into feat/mp4-mkv-114b
+
 ## [0.7.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-format-mp4-v0.6.3...rff-format-mp4-v0.7.0) - 2026-11-21
 
 ### Added

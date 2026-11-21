@@ -7,6 +7,17 @@ decoder output is bit-exact and stable; encoder output may change in minor
 releases when quality improves. Engineering notes for releases before 1.0.0
 are in [`docs/history.md`](docs/history.md).
 
+## [1.2.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_mp3-v1.1.0...rusty_mp3-v1.2.0) - 2026-11-21
+
+### Added
+
+- *(rusty_mp3)* refuse frames that cannot be decoded sanely
+
+### Fixed
+
+- *(mp3)* frame raw bytes by the demuxer's rule; no silent decode of non-audio
+- *(rusty_mp3)* read MP3_CENSUS and MP3_ISA only with the env-tuning feature
+
 ## [1.1.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_mp3-v1.0.6...rusty_mp3-v1.1.0) - 2026-11-19
 
 ### Added
