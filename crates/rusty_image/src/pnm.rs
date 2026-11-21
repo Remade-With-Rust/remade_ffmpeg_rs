@@ -460,19 +460,147 @@ pub fn encode(image: &Image) -> Result<Vec<u8>> {
             )))
         }
     };
+    out.reserve_exact(image.pixels.len());
+    let base = out.len();
+    out.extend_from_slice(&image.pixels);
     if image.format.bytes_per_sample() == 2 {
-        for c in image.pixels.chunks_exact(2) {
-            out.extend_from_slice(&u16::from_ne_bytes([c[0], c[1]]).to_be_bytes());
+        // Native to big-endian in place, after one copy: appending two
+        // bytes a sample was a capacity check and a 2-byte memcpy each
+        // (13 Ir a sample) into a buffer that doubled 22 times on the way.
+        for c in out[base..].chunks_exact_mut(2) {
+            let v = u16::from_ne_bytes([c[0], c[1]]);
+            c.copy_from_slice(&v.to_be_bytes());
         }
-    } else {
-        out.extend_from_slice(&image.pixels);
     }
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::round_scaled;
+    use super::{ascii_bits, ascii_raster, is_space, round_scaled};
+    use crate::read::Reader;
+    use crate::{Error, Result};
+
+    /// The raster loops as they were before the slice-iterator parsers: one
+    /// `Reader::u8` per byte, 16-bit checked arithmetic.
+    fn reader_sample(r: &mut Reader, max: u32) -> Result<u16> {
+        let mut v: u16 = 0;
+        let mut any = false;
+        while let Ok(b) = r.u8() {
+            if is_space(b) {
+                if any {
+                    break;
+                }
+                continue;
+            }
+            if !b.is_ascii_digit() {
+                return Err(Error::invalid("pnm: bad digit in raster"));
+            }
+            v = v
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(u16::from(b - b'0')))
+                .ok_or_else(|| Error::invalid("pnm: sample overflow"))?;
+            any = true;
+        }
+        if !any {
+            return Err(Error::Truncated);
+        }
+        if u32::from(v) > max {
+            return Err(Error::invalid("pnm: sample overflow"));
+        }
+        Ok(v)
+    }
+
+    fn reader_raster(data: &[u8], samples: usize, wide: bool) -> Result<Vec<u8>> {
+        let mut r = Reader::new(data);
+        let mut out = Vec::new();
+        for _ in 0..samples {
+            if wide {
+                out.extend_from_slice(&reader_sample(&mut r, 0xffff)?.to_ne_bytes());
+            } else {
+                out.push(reader_sample(&mut r, 0xff)? as u8);
+            }
+        }
+        Ok(out)
+    }
+
+    fn reader_bits(data: &[u8], pixels: usize) -> Result<Vec<u8>> {
+        let mut r = Reader::new(data);
+        let mut out = vec![0u8; pixels];
+        for b in out.iter_mut() {
+            loop {
+                match r.u8()? {
+                    c if is_space(c) => continue,
+                    b'0' => *b = 255,
+                    b'1' => *b = 0,
+                    _ => return Err(Error::invalid("pbm: unexpected byte in raster")),
+                }
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The slice-iterator parsers return what the `Reader` loops returned,
+    /// pixels or error, on valid, damaged and truncated rasters.
+    #[test]
+    fn ascii_rasters_match_reader_loops() {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let spaces = [b' ', b'\n', b'\t', b'\r', 0x0b, 0x0c];
+        for case in 0..30_000 {
+            let samples = 1 + next(12) as usize;
+            let bits = case % 3 == 0;
+            let mut text = Vec::new();
+            for _ in 0..samples + next(2) as usize {
+                for _ in 0..next(3) {
+                    text.push(spaces[next(6) as usize]);
+                }
+                if bits {
+                    text.push(b"01"[next(2) as usize]);
+                } else {
+                    // Mostly in range for 8 bits, sometimes past 16.
+                    let v = match next(10) {
+                        0 => next(70_000),
+                        1 => next(100_000_000_000),
+                        2 => 250 + next(10),
+                        _ => next(256),
+                    };
+                    text.extend_from_slice(v.to_string().as_bytes());
+                    if next(20) == 0 {
+                        text.insert(text.len() - 1, b'0'); // a leading zero
+                    }
+                    text.push(spaces[next(6) as usize]);
+                }
+            }
+            // Damage: a stray byte, or a cut.
+            match next(8) {
+                0 if !text.is_empty() => {
+                    let at = next(text.len() as u64) as usize;
+                    text[at] = [b'#', b'-', b'2', b'a', 0xff, b'9', b' '][next(7) as usize];
+                }
+                1 => text.truncate(next(text.len() as u64 + 1) as usize),
+                _ => {}
+            }
+            if bits {
+                let mut got = vec![0u8; samples];
+                let got = ascii_bits(&text, &mut got).map(|()| got);
+                assert_eq!(got, reader_bits(&text, samples), "P1 {text:?}");
+            } else {
+                let mut got = vec![0u8; samples];
+                let got = ascii_raster::<1>(&text, &mut got, 0xff).map(|()| got);
+                assert_eq!(got, reader_raster(&text, samples, false), "8-bit {text:?}");
+                let mut got = vec![0u8; samples * 2];
+                let got = ascii_raster::<2>(&text, &mut got, 0xffff).map(|()| got);
+                assert_eq!(got, reader_raster(&text, samples, true), "16-bit {text:?}");
+            }
+        }
+    }
 
     /// The libm-free rounding is `f32::round` for every sample and maxval
     /// (all of them at 8 bits, every 16-bit sample for a spread of maxvals).
