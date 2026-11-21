@@ -402,6 +402,69 @@ macro_rules! scenes {
                 timed(pm, |pm| hot_fh_gradients(pm, sweep))
             }
 
+            /// The downstream harness's 64x64 pattern texture (raster-tools
+            /// `scenes.rs` `texture()`), verbatim: an 8 px checker of opaque
+            /// and alpha-180 cells, one channel per cell from `Lcg(7)`.
+            fn fh_texture() -> Pixmap {
+                let mut t = Pixmap::new(64, 64).unwrap();
+                let mut r = Lcg(7);
+                for y in 0..64u32 {
+                    for x in 0..64u32 {
+                        let c = if (x / 8 + y / 8) % 2 == 0 {
+                            ColorU8::from_rgba(r.u8(), 40, 200, 255)
+                        } else {
+                            ColorU8::from_rgba(250, r.u8(), 30, 180)
+                        };
+                        let i = ((y * 64 + x) * 4) as usize;
+                        let p = c.premultiply();
+                        t.data_mut()[i..i + 4].copy_from_slice(&[
+                            p.red(),
+                            p.green(),
+                            p.blue(),
+                            p.alpha(),
+                        ]);
+                    }
+                }
+                t
+            }
+
+            /// The downstream harness's `pattern_nearest` (and `_bilinear`,
+            /// `_bicubic`) scene, ported call for call: a transparent
+            /// 1024x768 pixmap, six anti-aliased `fill_rect`s of a w/6 x h
+            /// column, each rotated 3 degrees about the centre, with a
+            /// pattern of the 64x64 texture under `[1.7 0.3 -0.4 1.3
+            /// 11i 5]`, spread Repeat/Pad/Reflect by i%3, opacity 0.9. The
+            /// texture and the shaders are built inside the hot section, as
+            /// they are in theirs.
+            #[inline(never)]
+            fn hot_fh_pattern(pm: &mut Pixmap, q: FilterQuality) {
+                let tex = fh_texture();
+                let (fw, fh) = (W as f32, H as f32);
+                for i in 0..6 {
+                    let t = Transform::from_row(1.7, 0.3, -0.4, 1.3, i as f32 * 11.0, 5.0);
+                    let spread = [SpreadMode::Repeat, SpreadMode::Pad, SpreadMode::Reflect][i % 3];
+                    let p = Paint {
+                        shader: Pattern::new(tex.as_ref(), spread, q, 0.9, t),
+                        ..Paint::default()
+                    };
+                    let Some(rect) = Rect::from_xywh(i as f32 * fw / 6.0, 0.0, fw / 6.0, fh) else {
+                        return;
+                    };
+                    pm.fill_rect(
+                        rect,
+                        &p,
+                        Transform::from_rotate_at(3.0, fw / 2.0, fh / 2.0),
+                        None,
+                    );
+                }
+            }
+
+            /// Downstream `pattern_nearest`.
+            pub fn fh_nearest() -> Out {
+                let pm = Pixmap::new(W, H).unwrap();
+                timed(pm, |pm| hot_fh_pattern(pm, FilterQuality::Nearest))
+            }
+
             /// Downstream `grad_radial`: two-point conical, r0 in [0, 8),
             /// offset centres.
             pub fn fh_conical() -> Out {
@@ -445,6 +508,7 @@ workloads!(
     mask_big,
     fh_conical,
     fh_sweep,
+    fh_nearest,
 );
 
 fn anchor(name: &str, bytes: &[u8]) {
