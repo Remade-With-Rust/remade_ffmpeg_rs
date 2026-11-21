@@ -411,8 +411,7 @@ impl<W: Write + Seek> TiffEncoder<W> {
     }
 }
 
-/// Where one plane's chunk, or a chunk of packed sub-byte rows, sits in the
-/// image.
+/// Where a tile or a plane's chunk sits in the image.
 struct ChunkGeom {
     /// First column and row of the chunk.
     x0: usize,
@@ -430,14 +429,13 @@ struct ChunkGeom {
     len: usize,
 }
 
-/// Assemble in `buf` a chunk that is built sample by sample: one plane of
-/// an image, or packed sub-byte rows. Padding reads as zero.
+/// Assemble a chunk that is not one stretch of the input (a tile, one plane,
+/// packed sub-byte rows) in `buf`; padding reads as zero.
 ///
-/// Out of line on purpose. `write_data` is one loop over the chunks whose
-/// common case hands a strip to the codec straight from the input; with
-/// these arms inlined in it, reshaping the planar one moved the strip loop
-/// too (81 Ir a strip). Out of line, the strip loop is also a little
-/// shorter than it was.
+/// Kept out of line: `write_data` is one loop over the chunks whose common
+/// case hands a strip to the codec straight from the input, and with this
+/// block inlined an edit to any assembly arm moved the strip loop too (one
+/// reshaped the planar arm and cost the strip loop 81 Ir a strip).
 #[inline(never)]
 fn assemble<C: ColorType>(buf: &mut Vec<u8>, native: &[u8], g: &ChunkGeom) {
     let bits = C::BITS_PER_SAMPLE;
@@ -445,6 +443,23 @@ fn assemble<C: ColorType>(buf: &mut Vec<u8>, native: &[u8], g: &ChunkGeom) {
     let bytes = usize::from(bits) / 8;
     let (x0, plane, planar) = (g.x0, g.plane, g.planar);
     let (vcols, full_row, chunk_row) = (g.vcols, g.full_row, g.chunk_row);
+    if bits >= 8 && !planar {
+        // Interleaved tiles: each row is appended, then the zeros that pad
+        // it to the tile width, then the rows of padding below the image.
+        // Zero-filling the whole tile first wrote every byte of an interior
+        // tile twice.
+        let s = x0 * usize::from(spp) * bytes;
+        let n = vcols * usize::from(spp) * bytes;
+        for r in 0..g.vrows {
+            let src = &native[(g.y0 + r) * full_row..][..full_row];
+            buf.extend_from_slice(&src[s..s + n]);
+            if n < chunk_row {
+                buf.resize(buf.len() + chunk_row - n, 0);
+            }
+        }
+        buf.resize(g.len, 0);
+        return;
+    }
     buf.resize(g.len, 0);
     for r in 0..g.vrows {
         let src = &native[(g.y0 + r) * full_row..][..full_row];
@@ -657,18 +672,6 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
                         buf.clear();
                         if contiguous {
                             buf.extend_from_slice(&native[y0 as usize * full_row..][..len]);
-                        } else if bits >= 8 && !planar {
-                            // Interleaved tiles: padding must read as zero.
-                            buf.resize(len, 0);
-                            let vrows = rows.min(h - y0) as usize;
-                            let vcols = cw.min(w - x0) as usize;
-                            let s = x0 as usize * usize::from(spp) * bytes;
-                            let n = vcols * usize::from(spp) * bytes;
-                            for r in 0..vrows {
-                                let src = &native[(y0 as usize + r) * full_row..][..full_row];
-                                let dst = &mut buf[r * chunk_row..][..chunk_row];
-                                dst[..n].copy_from_slice(&src[s..s + n]);
-                            }
                         } else {
                             let g = ChunkGeom {
                                 x0: x0 as usize,
