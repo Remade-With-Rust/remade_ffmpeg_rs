@@ -301,6 +301,24 @@ fn stream_follows(h: &FrameInfo, size: usize, buf: &[u8]) -> bool {
     true
 }
 
+/// The largest free-format frame of `h`'s stream, padding included: the frame
+/// at the layer's highest table bitrate (Layer I 448, Layer II 384 kbps; 256
+/// and 160 at the MPEG-2 rates). ISO/IEC 11172-3 does not require a decoder to
+/// support free-format bitrates above those (FFmpeg supports no free format at
+/// all), and the rows of an uncompressed picture otherwise pass for free-format
+/// frames of 2 to 3 KB. The same bound as `rusty_mp3`'s
+/// `Layer12Header::max_free_format_size`.
+fn max_free_size(h: &FrameInfo) -> usize {
+    let mpeg1 = h.key.0 == 0b11;
+    let top = BITRATE_L12[usize::from(!mpeg1) * 2 + usize::from(h.layer - 1)][14] as usize;
+    let rate = (h.sample_rate as usize).max(1);
+    if h.layer == 1 {
+        (12 * top * 1000 / rate) * 4 + h.pad
+    } else {
+        144 * top * 1000 / rate + h.pad
+    }
+}
+
 /// Free-format frame size at the start of `buf`: the distance to the next
 /// header of the stream (`None` if none is in reach). As in minimp3, the
 /// header after THAT one must be the stream's too -- the first was found by
@@ -309,7 +327,8 @@ fn stream_follows(h: &FrameInfo, size: usize, buf: &[u8]) -> bool {
 /// frame is a whole number of 4-byte slots.
 fn free_size_in(h: &FrameInfo, buf: &[u8], at_end: bool) -> Option<usize> {
     let min = if h.layer == 1 { 24 } else { 48 };
-    (min..=MAX_FREE_FRAME.min(buf.len().saturating_sub(4))).find(|&i| {
+    let max = max_free_size(h).min(MAX_FREE_FRAME);
+    (min..=max.min(buf.len().saturating_sub(4))).find(|&i| {
         if buf[i] != 0xFF || (h.layer == 1 && (i - h.pad) % 4 != 0) {
             return false;
         }
@@ -1319,6 +1338,28 @@ mod tests {
             assert_eq!(p.6.len(), 500 + i % 2, "frame {i}");
             assert_eq!(p.6[4], 7 + i as u8);
         }
+    }
+
+    /// A free-format frame is no longer than the frame at the layer's highest
+    /// table bitrate (Layer II at 44.1 kHz: 384 kbps, 1,253 bytes): rows of an
+    /// uncompressed picture otherwise pass for free-format frames of 2 to 3 KB.
+    #[test]
+    fn free_format_frames_beyond_the_top_bitrate_are_not_frames() {
+        let stream = |size: usize| {
+            let mut file = Vec::new();
+            for i in 0..12u8 {
+                let mut f = vec![0xFF, 0xFD, 0x00, 0x04];
+                f.resize(size, 7 + i);
+                file.extend_from_slice(&f);
+            }
+            drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(file)))))
+        };
+        let (head, packets, _) = stream(1253);
+        assert!(head.contains("Mp2"), "{head}");
+        assert_eq!(packets.len(), 12);
+        let (head, packets, _) = stream(1300);
+        assert!(head.starts_with("Err"), "{head}");
+        assert!(packets.is_empty());
     }
 
     /// Sync-heavy garbage around and between Layer II frames: every frame the
