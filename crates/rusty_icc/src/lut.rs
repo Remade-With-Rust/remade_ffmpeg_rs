@@ -646,6 +646,86 @@ impl ClutEval {
         }
     }
 
+    /// The grid point at `origin` and the three successive differences on
+    /// the way through `origin + q1` and `origin + q2` to `origin + far`,
+    /// `N` values each. `None` when one of the four is not wholly inside
+    /// the data.
+    #[inline(always)]
+    fn corner_chain<const N: usize>(
+        &self,
+        origin: usize,
+        q1: usize,
+        q2: usize,
+        far: usize,
+    ) -> Option<[[f64; N]; 4]> {
+        let c = |d: usize| -> Option<&[f32; N]> { self.data.get(origin + d..)?.first_chunk::<N>() };
+        let (p3, p0, p1, p2) = (c(far)?, c(0)?, c(q1)?, c(q2)?);
+        let mut d = [[0.0f64; N]; 4];
+        for o in 0..N {
+            let v0 = f64::from(p0[o]);
+            let v1 = f64::from(p1[o]);
+            let v2 = f64::from(p2[o]);
+            let v3 = f64::from(p3[o]);
+            d[0][o] = v0;
+            d[1][o] = v1 - v0;
+            d[2][o] = v2 - v1;
+            d[3][o] = v3 - v2;
+        }
+        Some(d)
+    }
+
+    /// The tetrahedral sum when there are exactly `N` output values per
+    /// grid point (3 and 4 cover RGB, Lab and CMYK).
+    ///
+    /// A tetrahedron is a walk over four corners, from the cell origin to
+    /// the far corner, and its three edge differences `P(a) - P(b)` are the
+    /// three steps of that walk: the general loop reads seven corner slices
+    /// (three of them twice), this reads the four once, as fixed-size
+    /// arrays, so the lanes are unrolled and vectorised and each corner
+    /// costs one range test. Per value it is the same subtractions,
+    /// products and sums in the same order, so results are bit-identical.
+    ///
+    /// `false`, with `out` untouched, when a corner is not wholly inside
+    /// the data (only a hand-built inconsistent [`Clut`]): the caller then
+    /// takes the general loop, which reads such a corner as zeros.
+    #[inline]
+    fn tetra_fixed<const N: usize>(
+        &self,
+        origin: usize,
+        [rx, ry, rz]: [f64; 3],
+        [x, y, z]: [usize; 3],
+        out: &mut [f64; 16],
+    ) -> bool {
+        let far = x + y + z;
+        // `walk!(q1, q2, i, j, k)`: the walk goes through `q1` then `q2`,
+        // and its steps number `i`, `j`, `k` (1, 2, 3 in walk order) are the
+        // differences the general loop multiplies by `rx`, `ry`, `rz`.
+        macro_rules! walk {
+            ($q1:expr, $q2:expr, $i:literal, $j:literal, $k:literal) => {{
+                let Some(d) = self.corner_chain::<N>(origin, $q1, $q2, far) else {
+                    return false;
+                };
+                for o in 0..N {
+                    out[o] = d[0][o] + d[$i][o] * rx + d[$j][o] * ry + d[$k][o] * rz;
+                }
+            }};
+        }
+        if rx >= ry && ry >= rz {
+            walk!(x, x + y, 1, 2, 3);
+        } else if rx >= rz && rz >= ry {
+            walk!(x, x + z, 1, 3, 2);
+        } else if rz >= rx && rx >= ry {
+            walk!(z, x + z, 2, 3, 1);
+        } else if ry >= rx && rx >= rz {
+            walk!(y, x + y, 2, 1, 3);
+        } else if ry >= rz && rz >= rx {
+            walk!(y, y + z, 3, 1, 2);
+        } else {
+            walk!(z, y + z, 3, 2, 1);
+        }
+        true
+    }
+
     fn tetra(
         &self,
         dim: usize,
@@ -656,6 +736,14 @@ impl ClutEval {
     ) {
         let (rx, ry, rz) = (frac[dim], frac[dim + 1], frac[dim + 2]);
         let (x, y, z) = (step[dim], step[dim + 1], step[dim + 2]);
+        let done = match self.outputs {
+            3 => self.tetra_fixed::<3>(origin, [rx, ry, rz], [x, y, z], out),
+            4 => self.tetra_fixed::<4>(origin, [rx, ry, rz], [x, y, z], out),
+            _ => false,
+        };
+        if done {
+            return;
+        }
         // Each `(a, b)` pair is the corner offsets of `c = P(a) - P(b)`; the
         // per-channel arithmetic is the reference's, so results are
         // bit-identical. Corners are fetched as slices (one bounds check
@@ -771,6 +859,118 @@ mod tests {
                 assert_eq!((a.0, a.1.to_bits()), (b.0, b.1.to_bits()), "g={g} x={x}");
             }
             xs.truncate(1109);
+        }
+    }
+
+    /// `eval` by the general path: axis arrays, then the recursion.
+    fn eval_general(c: &ClutEval, p: &[f64]) -> [f64; 16] {
+        let mut frac = [0.0; 16];
+        let mut step = [0usize; 16];
+        let mut origin = 0;
+        for (i, &v) in p.iter().enumerate() {
+            let (i0, f) = ClutEval::axis(c.grid[i], v);
+            origin += i0 * c.strides[i];
+            frac[i] = f;
+            step[i] = if i0 + 1 < c.grid[i] { c.strides[i] } else { 0 };
+        }
+        let mut out = [0.0; 16];
+        c.interp(p.len(), 0, origin, &frac, &step, &mut out);
+        out
+    }
+
+    fn bits(v: &[f64; 16], n: usize) -> Vec<u64> {
+        v[..n].iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// Interior points, exact grid points (zero fractions), both ends of
+    /// an axis and out-of-range inputs.
+    const COORDS: [f64; 10] = [-0.5, 0.0, 0.25, 0.3, 1.0 / 3.0, 0.5, 0.71, 0.75, 1.0, 1.5];
+
+    fn test_clut(grid: &[usize], outputs: usize) -> ClutEval {
+        let data: Vec<f32> = (0..grid.iter().product::<usize>() * outputs)
+            .map(|i| ((i * 7919 + 13) % 1009) as f32 / 1008.0)
+            .collect();
+        ClutEval::from_f32(grid.to_vec(), outputs, data)
+    }
+
+    /// The tetrahedral sum written out per value with checked reads (the
+    /// 0.1.1 kernel), for the tetrahedron `tetra` would pick.
+    fn tetra_reference(c: &ClutEval, p: [f64; 3]) -> [f64; 16] {
+        let mut r = [0.0; 3];
+        let mut s = [0usize; 3];
+        let mut origin = 0;
+        for i in 0..3 {
+            let (i0, f) = ClutEval::axis(c.grid[i], p[i]);
+            origin += i0 * c.strides[i];
+            r[i] = f;
+            s[i] = if i0 + 1 < c.grid[i] { c.strides[i] } else { 0 };
+        }
+        let ([rx, ry, rz], [x, y, z]) = (r, s);
+        let [(a1, b1), (a2, b2), (a3, b3)] = if rx >= ry && ry >= rz {
+            [(x, 0), (x + y, x), (x + y + z, x + y)]
+        } else if rx >= rz && rz >= ry {
+            [(x, 0), (x + y + z, x + z), (x + z, x)]
+        } else if rz >= rx && rx >= ry {
+            [(x + z, z), (x + y + z, x + z), (z, 0)]
+        } else if ry >= rx && rx >= rz {
+            [(x + y, y), (y, 0), (x + y + z, x + y)]
+        } else if ry >= rz && rz >= rx {
+            [(x + y + z, y + z), (y, 0), (y + z, y)]
+        } else {
+            [(x + y + z, y + z), (y + z, z), (z, 0)]
+        };
+        let mut out = [0.0; 16];
+        for (o, v) in out.iter_mut().enumerate().take(c.outputs) {
+            // A corner that is not wholly inside the data reads as zeros.
+            let at = |d: usize| {
+                if origin + d + c.outputs <= c.data.len() {
+                    f64::from(c.data[origin + d + o])
+                } else {
+                    0.0
+                }
+            };
+            *v = at(0) + (at(a1) - at(b1)) * rx + (at(a2) - at(b2)) * ry + (at(a3) - at(b3)) * rz;
+        }
+        out
+    }
+
+    #[test]
+    fn tetrahedral_kernel_matches_the_per_value_form_bit_for_bit() {
+        for outputs in [1usize, 3, 4, 7] {
+            let c = test_clut(&[5, 4, 3], outputs);
+            for &x in &COORDS {
+                for &y in &COORDS {
+                    for &z in &COORDS {
+                        let mut fast = [0.0; 16];
+                        c.eval(&[x, y, z], &mut fast);
+                        let slow = tetra_reference(&c, [x, y, z]);
+                        assert_eq!(bits(&fast, outputs), bits(&slow, outputs), "{x} {y} {z}");
+                        assert_eq!(
+                            bits(&fast, outputs),
+                            bits(&eval_general(&c, &[x, y, z]), outputs)
+                        );
+                    }
+                }
+            }
+        }
+        // Data shorter than the grid says: the fixed-width kernel declines
+        // and the general loop reads the missing corners as zeros.
+        for outputs in [3usize, 4] {
+            let short = ClutEval::from_f32(vec![2, 2, 2], outputs, vec![0.5; 8 * outputs - 5]);
+            for p in [
+                [0.6, 0.7, 0.8],
+                [0.9, 0.2, 0.1],
+                [0.1, 0.2, 0.9],
+                [0.0, 0.0, 0.0],
+            ] {
+                let mut out = [9.0; 16];
+                short.eval(&p, &mut out);
+                let want = tetra_reference(&short, p);
+                assert_eq!(bits(&out, outputs), bits(&want, outputs), "{p:?}");
+            }
+            let mut out = [9.0; 16];
+            short.eval(&[0.6, 0.7, 0.8], &mut out);
+            assert!(out[0] < 0.5);
         }
     }
 
