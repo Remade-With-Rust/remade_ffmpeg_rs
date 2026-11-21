@@ -31,6 +31,31 @@ by **[Mata Network](https://www.mata.network/)**.
 - **PSNR against Cairo:** Cairo anti-aliases differently. tiny-skia scores exactly the same against it.
 - **Speed against Cairo:** this crate is faster on large paths and strokes, at parity on many small paths, and behind on gradients.
 - **Speed against tiny-skia:** 5–13% behind on geometry and 30% behind on gradients. That is the cost of the scalar lane types that replaced tiny-skia's `unsafe` SSE2 intrinsics; making them auto-vectorise is the next speed step.
+- These numbers were measured on 0.1.0, before the speed pass below, and have not been re-run.
+
+## Speed against tiny-skia (after 0.1.0)
+
+A 15-commit instruction-count pass ([PR #166](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/166)), still without `unsafe`. Pixels are byte-identical to 0.1.0 on all 138 renders of the independent run (46 scenes at 3 sizes), and the 645-scene tiny-skia oracle is unchanged. The ratios are tiny-skia's time divided by this crate's (above 1 means this crate is faster); the last column is the speed-up over 0.1.0.
+
+| scene, 1024x768 | 0.1.0 vs tiny-skia | now vs tiny-skia | now vs 0.1.0 |
+|---|---:|---:|---:|
+| all 29 blend modes | 0.501 | 1.154 | 2.31x |
+| `draw_pixmap`, scaled | 0.612 | 1.099 | 1.80x |
+| linear gradients | 0.733 | 1.073 | 1.47x |
+| hairline and thin strokes | 0.893 | 1.182 | 1.32x |
+| 1,966 transformed rects | 0.939 | 1.085 | 1.16x |
+| strokes, every join and cap | 0.921 | 1.075 | 1.17x |
+| dashed strokes (noisy) | 0.966 | 1.051 | 1.09x |
+| fills under a path clip mask (noisy) | 0.882 | 1.054 | 1.20x |
+| fills under a luminance mask | 0.857 | 1.073 | 1.25x |
+| **3,932 small AA cubic blobs** | 0.907 | **0.985** | 1.09x |
+| **3,000-vertex even-odd star** | 0.930 | **0.983** | 1.06x |
+| **sweep gradients** | 0.503 | **0.961** | 1.91x |
+| **two-point conical gradients** | 0.459 | **0.906** | 1.98x |
+| **pattern, nearest / bilinear / bicubic** | 0.320 / 0.268 / 0.260 | **0.874 / 0.849 / 0.838** | 2.73x / 3.17x / 3.22x |
+| **`Mask::fill_path` coverage** | 0.852 | **0.841** | **0.986x (unchanged)** |
+
+Patterns, conical gradients and `Mask::fill_path` (unchanged by the pass in this scene) are the remaining gaps of more than 5%. Method: an independent run by a downstream team ([PR #166 comment](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/166#issuecomment-7059394355)), PR head `3e747a1` against rusty_raster 0.1.0 and tiny-skia 0.12 (`std` + `simd`), one process per arm per round pinned to one P-core at High priority, 20 rounds in alternating order, the same system allocator in every arm, null arm 1.004.
 
 ## What is verified
 
@@ -165,7 +190,9 @@ takes any `&mut [u8]` of `w * h * 4` premultiplied RGBA bytes.
 
 - Same feature set as tiny-skia 0.12: no text, no image filters, no
   GPU path. Output is 8-bit premultiplied RGBA only.
-- **Speed: about 1.7x slower than tiny-skia today.** Measured with
+- **Speed on 0.1.0: about 1.7x slower than tiny-skia** over the whole oracle
+  corpus (not re-run since the speed pass; see the scene table near the
+  top for current numbers). Measured with
   `examples/rasterbench.rs` on the 645-scene oracle corpus:
   - Setup: both crates in one process under `rusty_alloc`, pinned to one core
     at High priority, each arm timed on its own monotonic clock, ABBA rounds,
@@ -177,5 +204,6 @@ takes any `&mut [u8]` of `w * h * 4` premultiplied RGBA bytes.
   - Work parity: 645 scenes rendered per arm.
 
   tiny-skia runs SSE2 intrinsics; the lanes here are scalar arrays that LLVM
-  auto-vectorises. That is the leading suspect for the gap, but it is not yet
-  profiled. Closing it without `unsafe` is the next piece of work.
+  auto-vectorises. Two of the speed pass's five veins removed per-lane libm
+  calls and scalarised float-to-int conversions from those lanes, without
+  `unsafe`.

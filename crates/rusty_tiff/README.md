@@ -55,6 +55,42 @@ past `Limits`:
   random bytes, truncation; 5,031 still decoded; slowest 5.9 ms, total
   0.38 s, 16 MiB decode limit).
 
+## Speed against the `tiff` crate (after 0.1.2)
+
+A 22-commit instruction-count pass
+([PR #165](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/165))
+plus a flate2 floor of 1.1.11 (older flate2 zero-filled the rest of the image
+on every Deflate strip). Decoded output is byte-identical to 0.1.2: every
+timed file hashes the same, the 3,975-file intact set is identical, and
+44,495 damaged files get the same verdicts. Ratios are the other decoder's
+time divided by rusty_tiff's; above 1 means rusty_tiff is faster.
+
+| RGB8 unless noted, 1024x1024 | `tiff` 0.11.3 | craft-image-codecs |
+|---|---:|---:|
+| Deflate strips | 1.05-1.07 | 1.09-1.10 |
+| Deflate + predictor strips | 1.32-1.36 | 1.30-1.31 |
+| LZW / LZW + predictor strips | 1.63 / 2.52-2.58 | 1.63 / 2.50-2.54 |
+| RGB16 LZW + predictor / Deflate strips | 1.65-1.68 / 1.00 | 1.64-1.67 / 1.03 |
+| uncompressed / PackBits strips | 1.18 / 1.21-1.23 | 1.17-1.18 / 1.37-1.45 |
+| 256x256 tiles: uncompressed / LZW / Deflate | 1.10-1.11 / 1.70 / 1.39-1.41 | 1.19-1.21 / 1.69-1.70 / 1.13-1.14 |
+| **256x256 tiles: PackBits** | **0.98-1.01 (level)** | 1.20-1.25 |
+| **craft-image-codecs on 4 threads: LZW strips / Deflate strips / LZW tiles** | | **0.61 / 0.51 / 0.81** |
+
+rusty_tiff decodes on one thread, so craft-image-codecs' parallel bands still
+win on wall time. Against 0.1.2, uncompressed tiles are 1.18x faster,
+PackBits tiles 1.08x and Deflate tiles 1.09-1.11x; Deflate strips are 1.38x
+(1.40x with the predictor), a gain that comes from flate2 1.1.11, since with
+flate2 1.1.10 they are level. **LZW tiles (0.96x) and LZW + predictor strips
+(0.98x) are slightly slower than 0.1.2**; everything else is level
+(0.99-1.01). **16-bit uncompressed tiles are still about 0.87-0.90x of
+`tiff`** from memory (PR #165's own harness; the independent set had no
+16-bit tiled file).
+
+Method: an independent run by a downstream team
+([PR #165 comment](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/165#issuecomment-7059018748)),
+PR head `3002cfbe` with flate2 1.1.11, in-memory (`Cursor`) decodes on one
+pinned core, 20 alternating rounds, null arms 0.97-1.04.
+
 ## Against libtiff
 
 Measured 2026-11-19 against libtiff 4.7.0 (Ubuntu 26.04 in WSL2, the
@@ -117,8 +153,8 @@ uncompressed bytes per second at the minimum time:
 libtiff is faster at every decode (1.25-1.84x) and at Deflate encode
 (1.35-1.69x; libtiff uses libdeflate, rusty_tiff zlib-rs, and libtiff's
 output is 2.4% / 0.1% smaller). rusty_tiff is faster at LZW encode
-(1.26x / 1.57x) with byte-identical output sizes. No speed work has been
-done on this crate yet; these are first numbers, not a campaign result.
+(1.26x / 1.57x) with byte-identical output sizes. These libtiff numbers
+were taken before the speed pass above and have not been re-run since.
 
 Method: both arms in one process (`tiffvs dec|enc`), pinned with
 `taskset -c 6 nice -n -5`, leading arm alternated every pair (ABBA), 20
