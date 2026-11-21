@@ -316,17 +316,54 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     if maxval != target {
         let factor = target as f32 / maxval as f32;
         if wide {
-            for c in buf.chunks_exact_mut(2) {
-                let v = (f32::from(u16::from_ne_bytes([c[0], c[1]])) * factor).round() as u16;
-                c.copy_from_slice(&v.to_ne_bytes());
-            }
+            scale16(buf, factor);
         } else {
-            for v in buf.iter_mut() {
-                *v = (f32::from(*v) * factor).round() as u8;
-            }
+            scale8(buf, factor);
         }
     }
     Ok(img)
+}
+
+/// `(sample * factor).round()` capped at `cap` (an integer below 2^23),
+/// without the libm call and without a float-to-integer conversion.
+///
+/// `f32::round` is a `roundf` call per sample on baseline x86-64 (20 of the
+/// 33 instructions a sample cost), and Rust's saturating `as` cast does not
+/// vectorise either, so both steps are done in float arithmetic that does:
+///
+/// - `(x + 2^23) - 2^23` is `x` rounded to the nearest integer, ties to
+///   even (floats in `[2^23, 2^24)` are the integers), for `0 <= x < 2^23`;
+/// - `x - r` is then exact, and rounding half away from zero differs from
+///   ties-to-even only on a tie that went down, where `x - r == 0.5`;
+/// - the integer `w` is read from the mantissa of `w + 2^23`.
+///
+/// Capping first changes nothing: `cap` is an integer, so anything above it
+/// rounds to at least `cap`, where the cast to the sample type saturated.
+#[inline(always)]
+fn round_scaled(sample: f32, factor: f32, cap: f32) -> u32 {
+    const TWO23: f32 = 8_388_608.0;
+    let x = sample * factor;
+    let x = if x > cap { cap } else { x };
+    let r = (x + TWO23) - TWO23;
+    let w = r + if x - r == 0.5 { 1.0 } else { 0.0 };
+    (w + TWO23).to_bits() & 0x007f_ffff
+}
+
+/// Scale 8-bit samples by `factor` (255 / maxval), as `image` rounds them.
+#[inline(never)]
+fn scale8(buf: &mut [u8], factor: f32) {
+    for v in buf.iter_mut() {
+        *v = round_scaled(f32::from(*v), factor, 255.0) as u8;
+    }
+}
+
+/// Scale native-order 16-bit samples by `factor` (65535 / maxval).
+#[inline(never)]
+fn scale16(buf: &mut [u8], factor: f32) {
+    for c in buf.chunks_exact_mut(2) {
+        let v = round_scaled(f32::from(u16::from_ne_bytes([c[0], c[1]])), factor, 65535.0);
+        c.copy_from_slice(&(v as u16).to_ne_bytes());
+    }
 }
 
 /// Encode as binary PGM (`L8`, `L16`), PPM (`Rgb8`, `Rgb16`) or PAM (the
@@ -368,4 +405,35 @@ pub fn encode(image: &Image) -> Result<Vec<u8>> {
         out.extend_from_slice(&image.pixels);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::round_scaled;
+
+    /// The libm-free rounding is `f32::round` for every sample and maxval
+    /// (all of them at 8 bits, every 16-bit sample for a spread of maxvals).
+    #[test]
+    fn scaling_matches_f32_round() {
+        for maxval in 1..=255u32 {
+            let factor = 255.0 / maxval as f32;
+            for v in 0..=255u8 {
+                let want = (f32::from(v) * factor).round() as u8;
+                assert_eq!(
+                    round_scaled(f32::from(v), factor, 255.0) as u8,
+                    want,
+                    "{v}/{maxval}"
+                );
+            }
+        }
+        let edges = [256u32, 257, 1023, 4095, 32767, 32768, 65534, 65535];
+        for maxval in (256..=65535u32).step_by(211).chain(edges) {
+            let factor = 65535.0 / maxval as f32;
+            for v in 0..=65535u16 {
+                let want = (f32::from(v) * factor).round() as u16;
+                let got = round_scaled(f32::from(v), factor, 65535.0) as u16;
+                assert_eq!(got, want, "{v}/{maxval}");
+            }
+        }
+    }
 }
