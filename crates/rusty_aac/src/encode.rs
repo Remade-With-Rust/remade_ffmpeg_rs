@@ -761,7 +761,7 @@ pub(crate) fn band_tonality(spec: &[f32], swb: &[u16], nwin: usize, wlen: usize)
     out
 }
 
-fn perceptual_offsets(spec: &[f32], swb: &[u16], sample_rate: u32, tonality_smr: bool) -> Vec<i32> {
+fn perceptual_offsets(spec: &[f32], swb: &[u16], sample_rate: u32, tonality_smr: bool) -> Offsets {
     let _prof = prof::scope(Stage::EncPsy);
     let num_swb = swb.len() - 1;
     let mut energy = vec![0.0f64; num_swb];
@@ -791,9 +791,156 @@ fn perceptual_offsets(spec: &[f32], swb: &[u16], sample_rate: u32, tonality_smr:
     // (they quantize to ZERO anyway) and would otherwise skew a plain mean.
     let etot: f64 = energy.iter().sum::<f64>() + 1e-9;
     let center: f64 = (0..num_swb).map(|i| raw[i] * energy[i]).sum::<f64>() / etot;
-    raw.iter()
+    let off = raw
+        .iter()
         .map(|&r| ((r - center).round() as i32).clamp(-60, 60))
-        .collect()
+        .collect();
+    // The starved-frame reduction (see `Offsets`): every band's mask relative to
+    // the loudest energy-bearing band's, in the fourth-root domain.
+    let thr_ref = (0..num_swb)
+        .filter(|&i| energy[i] > 0.0)
+        .map(|i| thr[i])
+        .fold(0f64, f64::max);
+    if thr_ref <= 0.0 {
+        return Offsets::flat(off);
+    }
+    let ratio = thr
+        .iter()
+        .map(|&t| ((t / thr_ref).sqrt().sqrt()).min(1.0) as f32)
+        .collect();
+    Offsets {
+        off,
+        ratio,
+        thr_ref,
+        // `raw + NMR0_SF_OFFSET` is where a band's noise meets its mask, so the
+        // base putting the bands at their masks is `center + NMR0_SF_OFFSET`.
+        mask_base: (center + NMR0_SF_OFFSET).round() as i32,
+    }
+}
+
+/// Where a band's quantization noise meets its mask, relative to `raw` in
+/// [`perceptual_offsets`]: the uniform-rounding noise of the `x^0.75` quantizer
+/// is `(4/27)·2^(0.375·(sf−100))·Σ√|x|`, so noise = `thr` at
+/// `sf = 100 + log2(thr/Σ√|x|)/0.375 + log2(27/4)/0.375`. The 100 is the
+/// scalefactor origin; `raw` is measured from it, and `log2(27/4)/0.375 = 7.35`.
+const NMR0_SF_OFFSET: f64 = 107.35;
+
+/// Per-band scalefactor offsets from the psy model, and what [`Offsets::sf`]
+/// needs to keep a starved frame's loud bands accurate.
+///
+/// The rate loop searches one `base` and codes band `b` at `base + off[b]`:
+/// a uniform step, so every band's noise-to-mask ratio moves together. That is
+/// right while the budget covers the masks. Past them (`base > mask_base`) it is
+/// not: a loud tone over quiet broadband noise at 53 kbps a channel (a 5.1
+/// stream at 320 kbps) had every band raised 13 dB over its mask, which left
+/// the noise bands coded as a few stray ±1s, still taking 95% of the bits, and
+/// the tone with a single quantizer level: 6 dB SNR, its level set by which
+/// side of one step it landed on (`remade_ffmpeg_rs#129`).
+///
+/// Past the masks the thresholds are raised the 3GPP way instead (TS 26.403
+/// §5.6.1.2, the reduction FDK-AAC and FFmpeg's psy model use):
+/// `thr' = (thr^¼ + r)^4`, with `r` set so the loudest band rises exactly as the
+/// uniform step would. A quiet band's threshold climbs towards `r^4` far faster
+/// than a loud band's, so the bits it was wasting go to the bands that carry
+/// the signal. Below the masks (`base <= mask_base`) nothing changes.
+///
+/// One base step past the masks already lifts a band 50 dB under the loudest by
+/// 11 steps, so the rate loop's search variable (the *level*) runs in
+/// [`STARVED_SUBSTEPS`] sub-steps of the base there; a whole-step search left
+/// up to half the frame unspent.
+#[derive(Debug, Clone)]
+pub(crate) struct Offsets {
+    off: Vec<i32>,
+    /// Per band, `(thr / thr_ref)^¼` in `(0, 1]`; empty for no reduction
+    /// (short blocks keep the uniform step).
+    ratio: Vec<f32>,
+    /// The loudest band's mask, which `ratio` is relative to.
+    thr_ref: f64,
+    /// The base at which the bands' quantization noise reaches their masks.
+    mask_base: i32,
+}
+
+/// Levels per base step past the masks (see [`Offsets`]).
+const STARVED_SUBSTEPS: i32 = 8;
+
+impl std::ops::Deref for Offsets {
+    type Target = [i32];
+    fn deref(&self) -> &[i32] {
+        &self.off
+    }
+}
+
+impl Offsets {
+    /// Offsets with no starved-frame reduction: always the uniform step.
+    pub(crate) fn flat(off: Vec<i32>) -> Self {
+        Self {
+            off,
+            ratio: Vec::new(),
+            thr_ref: 0.0,
+            mask_base: i32::MAX,
+        }
+    }
+
+    /// The highest level the rate loop needs to search: every band at 255.
+    pub(crate) fn max_level(&self) -> i32 {
+        if self.ratio.is_empty() || self.mask_base >= 255 {
+            255
+        } else {
+            self.mask_base.max(0) + (255 - self.mask_base.max(0)) * STARVED_SUBSTEPS
+        }
+    }
+
+    /// Share one reduction between the two channels of a pair coded at a common
+    /// level: ratios against the louder channel's loudest band, and the later of
+    /// the two mask bases, so the uniform region (and its output) is unchanged.
+    pub(crate) fn join(a: &mut Self, b: &mut Self) {
+        if a.ratio.is_empty() || b.ratio.is_empty() {
+            *a = Self::flat(std::mem::take(&mut a.off));
+            *b = Self::flat(std::mem::take(&mut b.off));
+            return;
+        }
+        let thr_ref = a.thr_ref.max(b.thr_ref);
+        let mask_base = a.mask_base.max(b.mask_base);
+        for o in [a, b] {
+            let k = (o.thr_ref / thr_ref).sqrt().sqrt() as f32;
+            for q in &mut o.ratio {
+                *q *= k;
+            }
+            o.thr_ref = thr_ref;
+            o.mask_base = mask_base;
+        }
+    }
+
+    /// Per-band scalefactors at search level `level`, each clamped to the
+    /// codeable range. Up to `mask_base` the level is the common base; past it,
+    /// [`STARVED_SUBSTEPS`] levels make one base step for the loudest band, and
+    /// every other band rises by the reduction on top. Never below the uniform
+    /// `base + off[b]`, so [`min_base`]'s no-clamp floor holds, and
+    /// non-decreasing in `level`, so the rate loop's search stays monotone.
+    pub(crate) fn sf(&self, level: i32) -> Vec<i32> {
+        if level <= self.mask_base || self.ratio.is_empty() {
+            return self
+                .off
+                .iter()
+                .map(|&o| (level + o).clamp(0, 255))
+                .collect();
+        }
+        let d = f64::from(level - self.mask_base) / f64::from(STARVED_SUBSTEPS);
+        let base = f64::from(self.mask_base) + d;
+        // The loudest band's threshold rises by 2^(0.375·d), its fourth root by
+        // u = 2^(0.09375·d), so r = u − 1 in units of that root.
+        let u = (0.093_75 * d).exp2();
+        self.off
+            .iter()
+            .zip(&self.ratio)
+            .map(|(&o, &q)| {
+                let q = f64::from(q).max(1e-6);
+                // Steps beyond the uniform rise: log2(thr' / (thr·u^4)) / 0.375.
+                let extra = (4.0 / 0.375 * ((q + u - 1.0) / (q * u)).log2()).max(0.0);
+                ((base + f64::from(o) + extra).round() as i32).clamp(0, 255)
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -903,6 +1050,31 @@ pub(crate) fn element_plan(channels: usize) -> Option<Vec<Elem>> {
 
 const MAX_QUANT: i32 = 8191;
 
+/// Spectral lines an `lfe_channel_element` normally codes: the lowest 12, 281
+/// Hz at 48 kHz (FFmpeg's encoder codes the same three bands).
+const LFE_LINES: usize = 12;
+
+/// Above [`LFE_LINES`], an LFE frame is coded only when that part carries at
+/// least this fraction of the frame's energy (-20 dB).
+const LFE_HIGH_FRACTION: f64 = 0.01;
+
+/// Band-limit an LFE frame's spectrum to its lowest [`LFE_LINES`] lines, unless
+/// the content above them is substantial.
+///
+/// The LFE feeds a subwoofer. Coded full band, a 55 Hz tone over -41 dBFS
+/// broadband noise spent its share on the noise and came back at 15 dB SNR
+/// instead of 26 (`remade_ffmpeg_rs#129`); the bits it leaves now go to the
+/// other elements through the frame's pooling. A mix that does route real
+/// content above 281 Hz to the LFE (more than 1% of its energy) keeps it, so
+/// the channel still comes back at its level.
+fn lfe_band_limit(spec: &mut [f32]) {
+    let energy = |x: &[f32]| x.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>();
+    let (low, high) = (energy(&spec[..LFE_LINES]), energy(&spec[LFE_LINES..]));
+    if high < LFE_HIGH_FRACTION * (low + high) {
+        spec[LFE_LINES..].fill(0.0);
+    }
+}
+
 /// The per-channel ICS body budget's ceiling: the 6144-bit decoder input buffer
 /// per channel (ISO 14496-3 §4.5.3) less the element (7) and frame (59) overhead.
 const MAX_CHANNEL_BITS: usize = 6144 - 7 - 59;
@@ -929,7 +1101,7 @@ fn quantize(x: f32, gg: i32) -> i32 {
         return 0;
     }
     let scale = 2f64.powf(-0.1875 * f64::from(gg - 100));
-    let q = ((f64::from(x.abs()).powf(0.75) * scale).round() as i32).min(MAX_QUANT);
+    let q = nearest_level(f64::from(x.abs()).powf(0.75) * scale);
     if x < 0.0 {
         -q
     } else {
@@ -1080,10 +1252,10 @@ fn section_bits(cbs: &[u8]) -> usize {
     bits
 }
 
-/// Per-band scalefactors from a common `base` plus the psy offsets, each clamped
-/// to the codeable range. Offsets span ≤48, so band-to-band deltas stay < 60.
-fn scalefactors(offsets: &[i32], base: i32) -> Vec<i32> {
-    offsets.iter().map(|&o| (base + o).clamp(0, 255)).collect()
+/// Per-band scalefactors from a common `base` plus the psy offsets (see
+/// [`Offsets::sf`]), each clamped to the codeable range.
+fn scalefactors(offsets: &Offsets, base: i32) -> Vec<i32> {
+    offsets.sf(base)
 }
 
 /// `global_gain` = the first coded band's scalefactor (the differential reference);
@@ -1147,12 +1319,42 @@ fn has_avx512() -> bool {
     *AVX512.get_or_init(|| std::is_x86_feature_detected!("avx512f"))
 }
 
-/// Quantize one band into `out`: `out[k] = sign[k]·min(round(pow[k]·scale), MAX_QUANT)`.
+/// Where `|x|^0.75·scale` stops coding as 0 and becomes 1 is `0.5^0.75 =
+/// 0.5946`, the point whose reconstruction `x = q^(4/3)` is equally far from 0
+/// and from 1. Below [`NEAREST_T1`] the quantizer adds this, `1 - 0.5^0.75`,
+/// before flooring, so 0.5946 becomes 1.
+const NEAREST_BIAS: f64 = 0.405_396_442_498_639_5;
+/// The point between 1 and 2: `((1 + 2^(4/3)) / 2)^0.75`. Flooring with
+/// [`NEAREST_BIAS`] keeps everything under it at 1.
+const NEAREST_T1: f64 = 1.527_987_809_325_255;
+
+/// The quantizer level whose reconstruction is nearest the input, for
+/// `v = |x|^0.75·scale >= 0`, clamped to `MAX_QUANT`.
+///
+/// The decoder rebuilds `|x| = q^(4/3)` (times the step), so rounding `v` to
+/// the nearest integer is not rounding `x` to the nearest level: every `v` in
+/// `[0.5, 0.595)` codes as 1 and comes back up to 2.5x too loud, and every `v`
+/// in `[1.5, 1.528)` codes as 2. At coarse steps, which a starved channel runs
+/// at (a 5.1 stream at 320 kbps is 53 kbps a channel), those levels carry most
+/// of the signal, and round-half-up made whole channels 2-4 dB louder than
+/// their input (`remade_ffmpeg_rs#129`). Above 2 the midpoints sit within
+/// 0.017 of `k + 0.5`, so plain rounding is kept there.
+#[inline]
+fn nearest_level(v: f64) -> i32 {
+    if v < NEAREST_T1 {
+        (v + NEAREST_BIAS).floor() as i32
+    } else {
+        (v.round() as i32).min(MAX_QUANT)
+    }
+}
+
+/// Quantize one band into `out`: `out[k] = sign[k]·nearest_level(pow[k]·scale)`.
 /// This is the encoder's hottest kernel — the rate loop runs it ~11× per frame — so it
 /// has an AVX2 path. AVX2 has no round-half-away-from-zero, so the twins use
 /// `floor(v + HALF_DOWN)` with `HALF_DOWN` the double just below ½: for `v ≥ 0` that
 /// equals `round(v)` exactly. (`floor(v + 0.5)` does NOT — at the double just below ½
-/// the sum rounds up to 1.0 — which `quantize_simd_matches_scalar` pins.)
+/// the sum rounds up to 1.0 — which `quantize_simd_matches_scalar` pins.) Below
+/// [`NEAREST_T1`] the twins add [`NEAREST_BIAS`] instead, one compare-and-blend.
 fn quantize_band(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) {
     // The twins read `pow`/`sign` for every index of `out`; re-slicing here makes
     // that bound local (a short input panics instead of reading past its end).
@@ -1184,14 +1386,14 @@ const HALF_DOWN: f64 = 0.499_999_999_999_999_94;
 
 fn quantize_band_scalar(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) {
     for k in 0..out.len() {
-        let q = ((pow[k] * scale).round() as i32).min(MAX_QUANT);
-        out[k] = sign[k] * q;
+        out[k] = sign[k] * nearest_level(pow[k] * scale);
     }
 }
 
 /// AVX2 quantize — four coefficients per iteration. Bit-exact with the scalar path
-/// (`floor(v + HALF_DOWN) == round(v)` for `v ≥ 0`, and the clamp is applied before
-/// the f64→i32 narrowing so nothing overflows).
+/// (`floor(v + HALF_DOWN) == round(v)` for `v ≥ 0`, and `floor(v + NEAREST_BIAS)`
+/// below [`NEAREST_T1`], exactly the scalar's two cases; the clamp is applied
+/// before the f64→i32 narrowing so nothing overflows).
 ///
 /// # Safety
 ///
@@ -1206,10 +1408,12 @@ unsafe fn quantize_band_avx2(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i
     let vscale = _mm256_set1_pd(scale);
     let vhalf = _mm256_set1_pd(HALF_DOWN);
     let vmax = _mm256_set1_pd(f64::from(MAX_QUANT));
+    let (vt1, vbias) = (_mm256_set1_pd(NEAREST_T1), _mm256_set1_pd(NEAREST_BIAS));
     let mut i = 0;
     while i + 4 <= n {
         let v = _mm256_mul_pd(_mm256_loadu_pd(pow.as_ptr().add(i)), vscale);
-        let r = _mm256_floor_pd(_mm256_add_pd(v, vhalf)); // = round(v) for v ≥ 0
+        let add = _mm256_blendv_pd(vhalf, vbias, _mm256_cmp_pd::<_CMP_LT_OQ>(v, vt1));
+        let r = _mm256_floor_pd(_mm256_add_pd(v, add)); // = nearest_level(v) for v ≥ 0
         let qabs = _mm256_cvttpd_epi32(_mm256_min_pd(r, vmax)); // clamp then f64→i32
         let s = _mm_loadu_si128(sign.as_ptr().add(i).cast::<__m128i>());
         _mm_storeu_si128(
@@ -1219,15 +1423,15 @@ unsafe fn quantize_band_avx2(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i
         i += 4;
     }
     while i < n {
-        let q = ((pow[i] * scale).round() as i32).min(MAX_QUANT);
-        out[i] = sign[i] * q;
+        out[i] = sign[i] * nearest_level(pow[i] * scale);
         i += 1;
     }
 }
 
 /// AVX-512 quantize — eight coefficients per iteration (2× the AVX2 width). Bit-exact:
 /// for the quantizer's always-nonnegative input, `trunc(min(v+HALF_DOWN, MAX+0.5))`
-/// equals `min(round(v), MAX)`, so a single truncating narrow does round+clamp.
+/// equals `min(round(v), MAX)`, so a single truncating narrow does round+clamp;
+/// below [`NEAREST_T1`] the addend is [`NEAREST_BIAS`] instead (a masked blend).
 /// Runtime-gated above AVX2; on AVX2-only hosts this path never runs (untested there —
 /// the math mirrors the AVX2 kernel exactly, and its tail is the shared scalar reference).
 ///
@@ -1248,10 +1452,12 @@ unsafe fn quantize_band_avx512(pow: &[f64], sign: &[i32], scale: f64, out: &mut 
     let vscale = _mm512_set1_pd(scale);
     let vhalf = _mm512_set1_pd(HALF_DOWN);
     let vmaxph = _mm512_set1_pd(f64::from(MAX_QUANT) + 0.5); // clamp v+0.5 so trunc yields MAX
+    let (vt1, vbias) = (_mm512_set1_pd(NEAREST_T1), _mm512_set1_pd(NEAREST_BIAS));
     let mut i = 0;
     while i + 8 <= n {
         let v = _mm512_mul_pd(_mm512_loadu_pd(pow.as_ptr().add(i)), vscale);
-        let c = _mm512_min_pd(_mm512_add_pd(v, vhalf), vmaxph);
+        let add = _mm512_mask_blend_pd(_mm512_cmp_pd_mask::<_CMP_LT_OQ>(v, vt1), vhalf, vbias);
+        let c = _mm512_min_pd(_mm512_add_pd(v, add), vmaxph);
         let qabs = _mm512_cvttpd_epi32(c); // 8 f64 → 8 i32; trunc = floor for c ≥ 0
         let s = _mm256_loadu_si256(sign.as_ptr().add(i).cast::<__m256i>());
         _mm256_storeu_si256(
@@ -1261,8 +1467,7 @@ unsafe fn quantize_band_avx512(pow: &[f64], sign: &[i32], scale: f64, out: &mut 
         i += 8;
     }
     while i < n {
-        let q = ((pow[i] * scale).round() as i32).min(MAX_QUANT);
-        out[i] = sign[i] * q;
+        out[i] = sign[i] * nearest_level(pow[i] * scale);
         i += 1;
     }
 }
@@ -1413,7 +1618,7 @@ fn code_frame(xp: &Xpow, swb: &[u16], sf: &[i32]) -> (Vec<u8>, usize, usize, Vec
 
 /// The smallest common `base` such that no band clamps its loudest coefficient
 /// past `MAX_QUANT` (each band's own no-clamp floor, minus that band's offset).
-fn min_base(xp: &Xpow, swb: &[u16], offsets: &[i32]) -> i32 {
+fn min_base(xp: &Xpow, swb: &[u16], offsets: &Offsets) -> i32 {
     let num_swb = swb.len() - 1;
     let mut floor = 0i32;
     for sfb in 0..num_swb {
@@ -1431,9 +1636,10 @@ fn min_base(xp: &Xpow, swb: &[u16], offsets: &[i32]) -> i32 {
 /// Fast body-bit estimate at a candidate `base`: quantize (cheap) and price each
 /// coefficient from the `coef_bits` table — no codebook search. Monotone in `base`,
 /// so it seeds the search; the exact refinement corrects it.
-fn estimate_bits(xp: &Xpow, swb: &[u16], offsets: &[i32], base: i32) -> usize {
+fn estimate_bits(xp: &Xpow, swb: &[u16], offsets: &Offsets, base: i32) -> usize {
     let _prof = prof::scope(Stage::EncEstimate);
     let scale = scale_table();
+    let sf = offsets.sf(base);
     let ct = coef_bits();
     let num_swb = swb.len() - 1;
     let mut bits = 22usize; // global_gain + ics_info + flags, approx
@@ -1441,7 +1647,7 @@ fn estimate_bits(xp: &Xpow, swb: &[u16], offsets: &[i32], base: i32) -> usize {
     for sfb in 0..num_swb {
         let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
         let w = e - s;
-        let sc = scale[(base + offsets[sfb]).clamp(0, 255) as usize];
+        let sc = scale[sf[sfb] as usize];
         quantize_band(&xp.pow[s..e], &xp.sign[s..e], sc, &mut qbuf[..w]);
         let mut band = 0usize;
         let mut nonzero = false;
@@ -1464,10 +1670,11 @@ fn estimate_bits(xp: &Xpow, swb: &[u16], offsets: &[i32], base: i32) -> usize {
 /// the exact coder then walks to the true boundary (identical to a full search, but
 /// only a couple of exact evaluations instead of eight). Body bits fall as `base`
 /// rises.
-fn rate_loop(xp: &Xpow, swb: &[u16], offsets: &[i32], target_bits: usize) -> i32 {
+fn rate_loop(xp: &Xpow, swb: &[u16], offsets: &Offsets, target_bits: usize) -> i32 {
     let min_b = min_base(xp, swb, offsets);
     // Phase 1: binary-search the cheap estimate.
-    let (mut lo, mut hi) = (min_b, 255i32);
+    let max_level = offsets.max_level();
+    let (mut lo, mut hi) = (min_b, max_level);
     while lo < hi {
         let mid = (lo + hi) / 2;
         if estimate_bits(xp, swb, offsets, mid) <= target_bits {
@@ -1487,7 +1694,7 @@ fn rate_loop(xp: &Xpow, swb: &[u16], offsets: &[i32], target_bits: usize) -> i32
             base -= 1;
         }
     } else {
-        while base < 255 && !exact(base) {
+        while base < max_level && !exact(base) {
             base += 1;
         }
     }
@@ -2482,14 +2689,14 @@ fn short_offsets(
     sample_rate: u32,
     psy: PsyCfg,
     groups: &[u8],
-) -> Vec<i32> {
-    if psy.window_grouping {
+) -> Offsets {
+    Offsets::flat(if psy.window_grouping {
         perceptual_offsets_short_grouped(spec, swb, sample_rate, psy.tonality_smr, groups)
     } else if psy.short_block_psy {
         perceptual_offsets_short(spec, swb, sample_rate, psy.tonality_smr)
     } else {
         vec![0i32; groups.len() * (swb.len() - 1)]
-    }
+    })
 }
 
 /// The window grouping for a short frame whose `ics_info` the `specs` share:
@@ -2506,7 +2713,7 @@ fn short_grouping(specs: &[&[f32]], psy: PsyCfg) -> Vec<u8> {
 fn rate_loop_short(
     xp: &Xpow,
     swb: &[u16],
-    offsets: &[i32],
+    offsets: &Offsets,
     target_bits: usize,
     groups: &[u8],
 ) -> i32 {
@@ -2844,9 +3051,9 @@ fn write_channel_data(
 #[allow(clippy::too_many_arguments)]
 fn pair_body_bits(
     xp0: &Xpow,
-    off0: &[i32],
+    off0: &Offsets,
     xp1: &Xpow,
-    off1: &[i32],
+    off1: &Offsets,
     swb: &[u16],
     base: i32,
     is_short: bool,
@@ -2871,9 +3078,9 @@ fn pair_body_bits(
 #[allow(clippy::too_many_arguments)]
 fn joint_rate_loop(
     xp0: &Xpow,
-    off0: &[i32],
+    off0: &Offsets,
     xp1: &Xpow,
-    off1: &[i32],
+    off1: &Offsets,
     swb: &[u16],
     target_total: usize,
     is_short: bool,
@@ -2890,7 +3097,7 @@ fn joint_rate_loop(
         min_base(xp1, swb, off1)
     };
     let mut lo = lo0.max(lo1);
-    let mut hi = 255i32;
+    let mut hi = off0.max_level().max(off1.max_level());
     let mut quant = vec![0i32; xp0.len().max(xp1.len())];
     while lo < hi {
         let mid = (lo + hi) / 2;
@@ -3066,14 +3273,15 @@ fn encode_cpe(
     let joint_ok = pair_correlation(spec_l, spec_r) >= JOINT_STEREO_MIN_CORR;
 
     let (sf0, quant0, sf1, quant1) = if psy.stereo_bit_split && joint_ok {
-        let off = |spec: &[f32]| -> Vec<i32> {
+        let off = |spec: &[f32]| -> Offsets {
             if is_short {
                 short_offsets(spec, swb, sample_rate, psy, &groups)
             } else {
                 perceptual_offsets(spec, swb, sample_rate, psy.tonality_smr)
             }
         };
-        let (o0, o1) = (off(&ch0), off(&ch1));
+        let (mut o0, mut o1) = (off(&ch0), off(&ch1));
+        Offsets::join(&mut o0, &mut o1);
         let (xp0, xp1) = (Xpow::new(&ch0), Xpow::new(&ch1));
         let base = joint_rate_loop(
             &xp0,
@@ -3253,8 +3461,49 @@ struct Tables {
     swb_s: &'static [u16],
     sine_s: Vec<f32>,
     kbd_s: Vec<f32>,
-    per_channel: usize,
     plan: Vec<Elem>,
+}
+
+/// Frames per bit-reservoir segment. The reservoir restarts empty at every
+/// multiple of this frame index, so a segment encodes on its own: whole-clip
+/// encodes fan segments out across threads, streaming encodes walk them in
+/// order, and both produce the same bytes whatever the thread count.
+const RESERVOIR_SEGMENT: usize = 32;
+
+/// The bit reservoir: bits the stream is ahead of (positive) or behind its
+/// constant-rate channel.
+///
+/// Each frame is coded to the largest budget it fits, and the rate loop's
+/// steps are coarse (one scalefactor step moves a frame by 5-15% of its bits),
+/// so frames land short of their budget by half a step on average. With no
+/// carry that shortfall was simply lost: 2.5-9% under the target bitrate, and
+/// 13% for mono at 53 kbps (`remade_ffmpeg_rs#129`). Banking it and adding the
+/// bank to the next frame's budget makes the stream's average land on the
+/// target (an overshoot banks negative and is taken back the same way), while
+/// the bank stays about one frame's shortfall, far inside the decoder buffer
+/// (6144 bits a channel, ISO 14496-3 §4.5.3).
+#[derive(Debug, Clone, Copy, Default)]
+struct Reservoir {
+    bank: i64,
+}
+
+impl Reservoir {
+    /// Frame `b`'s budget: what the channel delivers for it plus the bank,
+    /// never past the decoder buffer.
+    fn budget(&mut self, b: usize, mean: usize, channels: usize) -> usize {
+        if b % RESERVOIR_SEGMENT == 0 {
+            self.bank = 0;
+        }
+        let cap = (6144 * channels) as i64;
+        let floor = (mean as i64 / 2).min(cap);
+        (mean as i64 + self.bank).clamp(floor, cap) as usize
+    }
+
+    /// Settle frame `b` after it coded to `used` bits.
+    fn spend(&mut self, mean: usize, used: usize, channels: usize) {
+        let max_bank = (6144 * channels).saturating_sub(mean) as i64;
+        self.bank = (self.bank + mean as i64 - used as i64).clamp(-(mean as i64) / 2, max_bank);
+    }
 }
 
 /// The transient detector run a frame at a time, for streaming: the same rule
@@ -3310,6 +3559,8 @@ struct Streaming {
     analysed: usize,
     /// The next frame to encode.
     next: usize,
+    /// The bit reservoir, carried from frame to frame.
+    reservoir: Reservoir,
 }
 
 /// AAC-LC encoder. Push PCM with [`push_pcm`](AacEncoder::push_pcm) (or
@@ -3578,9 +3829,17 @@ impl AacEncoder {
         kbd_s: &[f32],
         seqs: &[Vec<WindowSequence>],
         shapes: &[bool],
-        per_channel: usize,
+        frame_budget: usize,
         plan: &[Elem],
     ) -> (Vec<u8>, i64) {
+        // Per-channel ICS-body budget: the frame less END (3 bits), split
+        // evenly, less each element's own header (7). Never above the decoder
+        // input buffer (ISO 14496-3 §4.5.3: 6144 bits per channel) less that
+        // overhead: an absurd bitrate must not yield a block a conforming
+        // decoder cannot hold.
+        let per_channel = (frame_budget.saturating_sub(3) / self.channels.max(1))
+            .saturating_sub(7)
+            .min(MAX_CHANNEL_BITS);
         let prev = |ch: usize| -> std::borrow::Cow<'_, [f32; FRAME_LEN]> {
             if b == 0 {
                 std::borrow::Cow::Owned([0f32; FRAME_LEN])
@@ -3689,7 +3948,10 @@ impl AacEncoder {
                             sine_s,
                             kbd_s,
                         );
-                        let spec = analyze_long(&p, &c, &win);
+                        let mut spec = analyze_long(&p, &c, &win);
+                        if matches!(elem, Elem::Lfe(_)) {
+                            lfe_band_limit(&mut spec);
+                        }
                         encode_channel_element(
                             w,
                             tag,
@@ -3707,39 +3969,75 @@ impl AacEncoder {
             }
             wr
         };
+        let nch = |e: &Elem| if matches!(e, Elem::Cpe(..)) { 2 } else { 1 };
+        // The LFE first. Band-limited, it seldom needs its share, and what it
+        // leaves is split among the other channels before they are coded;
+        // left to the pooling below, it made every element of nearly every 5.1
+        // frame encode twice.
+        let mut lfe = None;
+        let mut lfe_at = usize::MAX;
+        let mut share = per_channel;
+        if plan.len() > 1 {
+            if let Some(li) = plan.iter().position(|e| matches!(e, Elem::Lfe(_))) {
+                let w = encode_elem(li, &plan[li], per_channel);
+                let spare = (per_channel + 7).saturating_sub(w.bit_len());
+                share = (per_channel + spare / (self.channels - 1)).min(MAX_CHANNEL_BITS);
+                lfe = Some((li, w));
+                lfe_at = li;
+            }
+        }
+        let budgets: Vec<usize> = plan
+            .iter()
+            .map(|e| {
+                let pc = if matches!(e, Elem::Lfe(_)) {
+                    per_channel
+                } else {
+                    share
+                };
+                pc * nch(e)
+            })
+            .collect();
         let mut writers: Vec<BitWriter> = plan
             .iter()
             .enumerate()
-            .map(|(ei, e)| encode_elem(ei, e, per_channel))
+            .map(|(ei, e)| match lfe.take() {
+                Some((li, w)) if li == ei => w,
+                other => {
+                    lfe = other;
+                    encode_elem(ei, e, budgets[ei] / nch(e))
+                }
+            })
             .collect();
         // Multichannel: hand the bits that some elements leave unused (silence,
-        // an LFE, simple content) to the elements that used their whole share,
-        // and re-encode those. The budget had been split evenly and never
-        // pooled, so a 5.1 stream with only its centre active coded that
-        // centre at a sixth of the bitrate (remade_ffmpeg_rs#129). One element
-        // (mono, stereo) has nothing to pool, so its output is unchanged.
+        // simple content) to the elements that used their whole share, and
+        // re-encode those. The budget had been split evenly and never pooled,
+        // so a 5.1 stream with only its centre active coded that centre at a
+        // sixth of the bitrate (remade_ffmpeg_rs#129). One element (mono,
+        // stereo) has nothing to pool, so its output is unchanged.
         if plan.len() > 1 {
-            let nch = |e: &Elem| if matches!(e, Elem::Cpe(..)) { 2 } else { 1 };
-            let budget = |e: &Elem| per_channel * nch(e);
             // An element that used half its budget or more was limited by it:
             // the rate loop's base steps are coarse at small budgets, so a
-            // limited element can land well short of its target. Silence and an
-            // LFE use a few dozen bits.
-            let binding = |e: &Elem, used: usize| 2 * used >= budget(e);
+            // limited element can land well short of its target. Silence uses
+            // a few dozen bits.
+            // A pre-coded LFE has already handed on what it left.
+            let binding = |ei: usize, used: usize| ei != lfe_at && 2 * used >= budgets[ei];
             let mut spare = 0usize;
             let mut binding_ch = 0usize;
-            for (e, w) in plan.iter().zip(&writers) {
-                if binding(e, w.bit_len()) {
+            for (ei, (e, w)) in plan.iter().zip(&writers).enumerate() {
+                if ei == lfe_at {
+                    continue;
+                }
+                if binding(ei, w.bit_len()) {
                     binding_ch += nch(e);
                 } else {
-                    spare += budget(e) - w.bit_len();
+                    spare += budgets[ei] - w.bit_len();
                 }
             }
             if binding_ch > 0 && spare >= 64 * binding_ch {
-                let more = (per_channel + spare / binding_ch).min(MAX_CHANNEL_BITS);
-                if more > per_channel {
+                let more = (share + spare / binding_ch).min(MAX_CHANNEL_BITS);
+                if more > share {
                     for (ei, e) in plan.iter().enumerate() {
-                        if binding(e, writers[ei].bit_len()) {
+                        if binding(ei, writers[ei].bit_len()) {
                             writers[ei] = encode_elem(ei, e, more);
                         }
                     }
@@ -3836,18 +4134,25 @@ impl AacEncoder {
     /// Encode all buffered frames to raw access units. Frames are independent, so
     /// they fan out across worker threads (ffmpeg's AAC encoder is single-threaded).
     fn tables(&self) -> Tables {
-        let frame_budget = (self.bitrate as usize * FRAME_LEN / self.sample_rate.max(1) as usize)
-            .saturating_sub(59);
         Tables {
             swb: swb_offsets(true, self.fs_index),
             swb_s: swb_offsets(false, self.fs_index),
             sine_s: crate::dsp::sine_window(SHORT_N),
             kbd_s: crate::dsp::kbd_window(SHORT_N, 6.0),
-            per_channel: (frame_budget / self.channels.max(1))
-                .saturating_sub(7)
-                .min(MAX_CHANNEL_BITS),
             plan: element_plan(self.channels).expect("channel count validated in init"),
         }
+    }
+
+    /// Bits the target bitrate delivers for frame `b`, as whole bits whose
+    /// running sum never drifts from `bitrate × time` (at 44.1 kHz a frame is
+    /// not a whole number of bits). The target is the raw access unit, the
+    /// payload an MP4 stores; an ADTS header (56 bits) comes on top, as with
+    /// FFmpeg's encoder.
+    fn frame_bits(&self, b: usize) -> usize {
+        let per = u64::from(self.bitrate) * FRAME_LEN as u64;
+        let sr = u64::from(self.sample_rate.max(1));
+        let b = b as u64;
+        ((b + 1) * per / sr - b * per / sr) as usize
     }
 
     /// Sub-block energies of frame `f` of channel `ch`, zero past the input.
@@ -3882,9 +4187,11 @@ impl AacEncoder {
                 shapes: Vec::new(),
                 analysed: 0,
                 next: 0,
+                reservoir: Reservoir::default(),
             }));
         }
         let mut st = self.stream.take().expect("just set");
+        let mut reservoir = st.reservoir;
         if st.seqs.is_empty() {
             st.seqs = vec![Vec::new(); st.tables.plan.len()];
         }
@@ -3938,19 +4245,16 @@ impl AacEncoder {
         let t = &st.tables;
         let out: Vec<(Vec<u8>, i64)> = (st.next..ready)
             .map(|b| {
-                self.encode_frame(
-                    b,
-                    t.swb,
-                    t.swb_s,
-                    &t.sine_s,
-                    &t.kbd_s,
-                    &st.seqs,
-                    &st.shapes,
-                    t.per_channel,
-                    &t.plan,
-                )
+                let mean = self.frame_bits(b);
+                let budget = reservoir.budget(b, mean, self.channels);
+                let au = self.encode_frame(
+                    b, t.swb, t.swb_s, &t.sine_s, &t.kbd_s, &st.seqs, &st.shapes, budget, &t.plan,
+                );
+                reservoir.spend(mean, au.0.len() * 8, self.channels);
+                au
             })
             .collect();
+        st.reservoir = reservoir;
         st.next = st.next.max(ready);
         self.queue.extend(out);
         // The next frame needs its previous block for the MDCT overlap.
@@ -3973,15 +4277,6 @@ impl AacEncoder {
         let kbd_s = crate::dsp::kbd_window(SHORT_N, 6.0);
         let n = self.chans.first().map_or(0, std::vec::Vec::len);
         let nblocks = n.div_ceil(FRAME_LEN) + 1;
-        // Per-channel ICS-body budget from the target bitrate (minus framing).
-        let frame_budget = (self.bitrate as usize * FRAME_LEN / self.sample_rate.max(1) as usize)
-            .saturating_sub(59); // ADTS header (56) + END (3)
-                                 // Never above the decoder input buffer (ISO 14496-3 §4.5.3: 6144 bits per
-                                 // channel) less the element and framing overhead: an absurd bitrate must
-                                 // not yield a block a conforming decoder cannot hold.
-        let per_channel = (frame_budget / self.channels.max(1))
-            .saturating_sub(7) // element overhead
-            .min(MAX_CHANNEL_BITS);
 
         // The ISO element sequence for this channel count (validated at init, so
         // the unwrap cannot fire here).
@@ -4019,34 +4314,40 @@ impl AacEncoder {
             &shapes[..],
             &plan[..],
         );
-        let frame = |b: usize| {
-            self.encode_frame(
-                b,
-                swb,
-                swb_s,
-                sine_s,
-                kbd_s,
-                seqs,
-                shapes,
-                per_channel,
-                plan,
-            )
+        // Frames `range` in order, carrying the bit reservoir, which restarts at
+        // every RESERVOIR_SEGMENT boundary (so any range of whole segments
+        // encodes the same alone as in sequence).
+        let frames = |range: std::ops::Range<usize>| {
+            let mut reservoir = Reservoir::default();
+            range
+                .map(|b| {
+                    let mean = self.frame_bits(b);
+                    let budget = reservoir.budget(b, mean, self.channels);
+                    let au =
+                        self.encode_frame(b, swb, swb_s, sine_s, kbd_s, seqs, shapes, budget, plan);
+                    reservoir.spend(mean, au.0.len() * 8, self.channels);
+                    au
+                })
+                .collect::<Vec<_>>()
         };
 
+        let segments = nblocks.div_ceil(RESERVOIR_SEGMENT);
         let nthreads = std::thread::available_parallelism()
             .map_or(1, std::num::NonZero::get)
-            .min(nblocks.max(1));
+            .min(segments);
         if nthreads <= 1 || nblocks < 16 {
-            return (0..nblocks).map(frame).collect(); // serial for tiny inputs
+            return frames(0..nblocks); // serial for tiny inputs
         }
-        // Fan out contiguous frame ranges; concatenating the parts keeps them ordered.
-        let chunk = nblocks.div_ceil(nthreads);
+        // Fan out contiguous runs of whole segments; concatenating the parts
+        // keeps them ordered.
+        let chunk = segments.div_ceil(nthreads) * RESERVOIR_SEGMENT;
         let parts: Vec<Vec<(Vec<u8>, i64)>> = std::thread::scope(|s| {
             (0..nthreads)
                 .map(|t| {
                     s.spawn(move || {
+                        let start = (t * chunk).min(nblocks);
                         let end = ((t + 1) * chunk).min(nblocks);
-                        (t * chunk..end).map(frame).collect::<Vec<_>>()
+                        frames(start..end)
                     })
                 })
                 .collect::<Vec<_>>()
@@ -4604,6 +4905,10 @@ mod tests {
             2.5,
             below(2.5),
             1e-300,
+            1.0 - NEAREST_BIAS,
+            below(1.0 - NEAREST_BIAS),
+            NEAREST_T1,
+            below(NEAREST_T1),
         ];
         vals.extend([
             8190.5,
@@ -4905,7 +5210,7 @@ mod tests {
         // Worst-case NMR (perceptual quality is set by the loudest audible artifact)
         // and mean NMR in dB, over the energy-bearing bands.
         let xp = Xpow::new(&spec);
-        let metric = |offsets: &[i32]| -> (f64, f64) {
+        let metric = |offsets: &Offsets| -> (f64, f64) {
             let base = rate_loop(&xp, swb, offsets, target);
             let sf = scalefactors(offsets, base);
             let thr = masking_thresholds(&spec, swb, sr);
@@ -4932,7 +5237,7 @@ mod tests {
             (max_nmr, sum_db / n.max(1) as f64)
         };
 
-        let flat = metric(&vec![0i32; swb.len() - 1]);
+        let flat = metric(&Offsets::flat(vec![0i32; swb.len() - 1]));
         let psy = metric(&perceptual_offsets(&spec, swb, sr, false));
         eprintln!(
             "flat: max_nmr={:.2} mean={:.1}dB | psy: max_nmr={:.2} mean={:.1}dB",
@@ -6179,5 +6484,140 @@ mod fidelity_129 {
         assert!((0.99..=1.01).contains(&g), "centre gain {g}");
         assert!(snr > 45.0, "5.1 centre alone at 320 kbps: {snr:.1} dB");
         assert!(others < 1e-3, "silent channels stay silent: {others}");
+    }
+
+    /// One 0.25 sine per channel (220, 330, 440, 55, 660, 880 Hz in L R C LFE
+    /// Ls Rs order) over independent 0.03 x uniform(-0.5, 0.5) noise: the
+    /// #129 repro with every element busy.
+    fn busy_5_1(n: usize, sr: u32) -> Vec<f32> {
+        let tones = [220.0f32, 330.0, 440.0, 55.0, 660.0, 880.0];
+        let mut seed = 0x2545_f491u32;
+        let mut v = vec![0f32; n * 6];
+        for i in 0..n {
+            for (c, f) in tones.iter().enumerate() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = 0.03 * ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5);
+                let t = i as f32 / sr as f32;
+                v[i * 6 + c] = 0.25 * (2.0 * std::f32::consts::PI * f * t).sin() + noise;
+            }
+        }
+        v
+    }
+
+    /// Encode `pcm` and return the packets.
+    fn packets(pcm: &[f32], ch: usize, sr: u32, kbps: u32) -> Vec<EncodedPacket> {
+        let mut e = AacEncoder::new(AacEncoderConfig {
+            bitrate_bps: kbps * 1000,
+            ..Default::default()
+        });
+        e.push_pcm(pcm, ch as u16, sr).unwrap();
+        e.finish();
+        std::iter::from_fn(|| e.next_packet().ok()).collect()
+    }
+
+    /// The decoder rebuilds `q^(4/3)`, so the quantizer must pick the level
+    /// whose reconstruction is nearest, not the nearest integer to `|x|^0.75`.
+    #[test]
+    fn the_quantizer_picks_the_nearest_reconstruction() {
+        for i in 0..=3_000 {
+            let v = f64::from(i) * 1e-3;
+            let x = v.powf(4.0 / 3.0);
+            let nearest = (0..6)
+                .min_by(|&a, &b| {
+                    let da = (x - f64::from(a).powf(4.0 / 3.0)).abs();
+                    let db = (x - f64::from(b).powf(4.0 / 3.0)).abs();
+                    da.partial_cmp(&db).unwrap()
+                })
+                .unwrap();
+            let got = nearest_level(v);
+            // Above 2 the midpoints sit within 0.017 of k + 0.5 and plain
+            // rounding is kept there.
+            if v < 2.0 || (v.fract() - 0.5).abs() > 0.02 {
+                assert_eq!(got, nearest, "v = {v}");
+            } else {
+                assert!((got - nearest).abs() <= 1, "v = {v}");
+            }
+        }
+    }
+
+    /// A 5.1 stream with all six channels busy at 320 kbps (53 kbps a
+    /// channel): every channel comes back at its own level. On 2.1.1 the
+    /// best-fit gains were 1.25 / 1.42 / 1.31 / 1.22 / 1.49 / 1.20.
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret")]
+    fn every_busy_5_1_channel_keeps_its_level() {
+        let sr = 48_000;
+        let n = sr as usize * 3;
+        let pcm = busy_5_1(n, sr);
+        let mut dec = crate::decode::Decoder::new(sr);
+        let mut out: Vec<f32> = Vec::new();
+        for p in packets(&pcm, 6, sr, 320) {
+            out.extend(dec.decode(&p.data, None).expect("decode").samples);
+        }
+        for c in 0..6 {
+            let (mut xy, mut xx) = (0f64, 0f64);
+            for i in n / 4..n * 3 / 4 {
+                let x = f64::from(pcm[i * 6 + c]);
+                xy += x * f64::from(out[(i + FRAME_LEN) * 6 + c]);
+                xx += x * x;
+            }
+            let g = xy / xx;
+            assert!((0.93..=1.07).contains(&g), "channel {c}: gain {g:.3}");
+        }
+    }
+
+    /// An LFE frame drops its quiet content above 281 Hz (a sub-bass tone
+    /// over a noise floor) but keeps content that is really there.
+    #[test]
+    fn the_lfe_drops_only_a_quiet_top() {
+        let sr = 48_000.0f32;
+        let win: Vec<f32> = crate::dsp::sine_window(2 * FRAME_LEN);
+        let spectrum = |f: f32, noise: f32| {
+            let mut seed = 0x9e37_79b9u32;
+            let mut x = [[0f32; FRAME_LEN]; 2];
+            for (b, blk) in x.iter_mut().enumerate() {
+                for (i, v) in blk.iter_mut().enumerate() {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let t = (b * FRAME_LEN + i) as f32 / sr;
+                    *v = 0.25 * (2.0 * std::f32::consts::PI * f * t).sin()
+                        + noise * ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5);
+                }
+            }
+            analyze_long(&x[0], &x[1], &win)
+        };
+        let mut sub = spectrum(55.0, 0.03);
+        lfe_band_limit(&mut sub);
+        assert!(sub[LFE_LINES..].iter().all(|&v| v == 0.0));
+        assert!(sub[..LFE_LINES].iter().any(|&v| v != 0.0));
+        let mut mid = spectrum(1000.0, 0.0);
+        let kept = mid.clone();
+        lfe_band_limit(&mut mid);
+        assert_eq!(mid, kept);
+    }
+
+    /// The raw access units average the target bitrate, within 1%, and no
+    /// unit outgrows the decoder buffer (6144 bits a channel). On 2.1.1 the
+    /// streams came out 3-13% short.
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret")]
+    fn the_stream_lands_on_its_bitrate() {
+        let sr = 48_000u32;
+        let n = sr as usize * 3;
+        let five_one = busy_5_1(n, sr);
+        let stereo: Vec<f32> = (0..n * 2).map(|i| five_one[(i / 2) * 6 + i % 2]).collect();
+        let mono: Vec<f32> = (0..n).map(|i| five_one[i * 6 + 2]).collect();
+        for (pcm, ch, kbps) in [(&mono, 1, 64), (&stereo, 2, 128), (&five_one, 6, 320)] {
+            let pk = packets(pcm, ch, sr, kbps);
+            let bits: usize = pk.iter().map(|p| p.data.len() * 8).sum();
+            let rate = bits as f64 * f64::from(sr) / (pk.len() * FRAME_LEN) as f64;
+            let err = rate / f64::from(kbps * 1000) - 1.0;
+            assert!(
+                err.abs() < 0.01,
+                "{ch} ch at {kbps} kbps: {:+.2}%",
+                err * 100.0
+            );
+            let most = pk.iter().map(|p| p.data.len() * 8).max().unwrap();
+            assert!(most <= 6144 * ch, "{ch} ch: a {most}-bit unit");
+        }
     }
 }

@@ -15,3 +15,6 @@ categories = ["multimedia", "parser-implementations"]
 [dependencies]
 rff-core.workspace = true
 rff-format.workspace = true
+
+[dev-dependencies]
+rff-format-mkv.workspace = true

@@ -49,6 +49,43 @@ pub fn asc_sample_rate(asc: &[u8]) -> Option<u32> {
     }
 }
 
+/// The sampling frequency index for `rate`, when the table names it.
+pub fn exact_frequency_index(rate: u32) -> Option<u32> {
+    RATES.iter().position(|&r| r == rate).map(|i| i as u32)
+}
+
+/// The SBR output rate an AudioSpecificConfig signals (HE-AAC): explicit
+/// (audio object type 5 or 29, the extension rate right after the core
+/// one) or backward compatible (the `0x2B7` sync extension after an AAC-LC
+/// GASpecificConfig, as FFmpeg's Matroska demuxer synthesises it). `None`
+/// for plain AAC.
+pub fn asc_sbr_rate(asc: &[u8]) -> Option<u32> {
+    let bit = |i: usize| -> Option<u32> { Some(u32::from(asc.get(i / 8)? >> (7 - i % 8) & 1)) };
+    let read = |from: usize, n: usize| -> Option<u32> {
+        (from..from + n).try_fold(0u32, |v, i| Some(v << 1 | bit(i)?))
+    };
+    let rate_at = |pos: usize| -> Option<(u32, usize)> {
+        match read(pos, 4)? {
+            15 => Some((read(pos + 4, 24)?, pos + 28)),
+            i => Some((*RATES.get(i as usize)?, pos + 4)),
+        }
+    };
+    let aot = read(0, 5)?;
+    let (_, mut pos) = rate_at(5)?;
+    if aot == 5 || aot == 29 {
+        pos += 4; // channel configuration
+        return rate_at(pos).map(|(r, _)| r);
+    }
+    if aot != 2 {
+        return None;
+    }
+    pos += 4 + 3; // channel configuration, GASpecificConfig (frameLength, dependsOnCore, extension)
+    if read(pos, 11)? == 0x2B7 && read(pos + 11, 5)? == 5 && read(pos + 16, 1)? == 1 {
+        return rate_at(pos + 17).map(|(r, _)| r);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +100,18 @@ mod tests {
             );
         }
         assert_eq!(audio_specific_config(48_000, 2), [0x11, 0x90]);
+    }
+
+    #[test]
+    fn sbr_rates_are_found_either_way() {
+        // LC 22.05 kHz stereo + backward-compatible SBR to 44.1 kHz.
+        assert_eq!(
+            asc_sbr_rate(&[0x13, 0x90, 0x56, 0xE5, 0x80 | (4 << 3)]),
+            Some(44_100)
+        );
+        // Explicit: AOT 5, core 24 kHz (index 6), stereo, ext 48 kHz (3), AOT 2.
+        let bits: u32 = 5 << 27 | 6 << 23 | 2 << 19 | 3 << 15 | 2 << 10;
+        assert_eq!(asc_sbr_rate(&bits.to_be_bytes()), Some(48_000));
+        assert_eq!(asc_sbr_rate(&[0x11, 0x90]), None);
     }
 }

@@ -31,9 +31,13 @@
 //!   when it names a ProRes profile, else `apcn`.
 //! * PCM: `A_PCM/INT/LIT` at BitDepth 8 (unsigned, as the codec mapping
 //!   requires), 16, 24 or 32, and `A_PCM/FLOAT/IEEE` at 32 or 64.
-//! * DNxHD/DNxHR and APV are refused: Matroska has no native codec ID for
-//!   either (DNx would need a `V_QUICKTIME`/`V_MS/VFW/FOURCC` wrapper; APV
-//!   has no mapping at all).
+//! * DNxHD/DNxHR have no native Matroska ID: they go in the VfW mapping
+//!   (`V_MS/VFW/FOURCC`, a BITMAPINFOHEADER naming `AVdn`/`AVdh`), as
+//!   FFmpeg's matroskaenc writes them. APV is `V_APV` with its
+//!   configuration record as CodecPrivate, MJPEG `V_MJPEG`.
+//! * FLAC's STREAMINFO is rewritten at the trailer from the frames written
+//!   (total samples, block and frame size bounds), patched in place on the
+//!   streaming muxer.
 //! * Vorbis: three setup headers either packed in `extradata` (u32-LE length
 //!   prefixed, the rff contract) or arriving as the first three packets (a
 //!   fresh `rusty_vorbis` encode) become the Xiph-laced CodecPrivate.
@@ -64,7 +68,7 @@ use rff_core::{
     SampleFormat,
 };
 use rff_format::avc::{build_avcc_record, split_annexb};
-use rff_format::hvc::{build_hvcc_record, parse_hvcc};
+use rff_format::hvc::build_hvcc_record;
 use rff_format::{Muxer, Output, SeekOutput, Stream};
 
 use crate::{
@@ -95,6 +99,7 @@ const ID_SEEK_ID: u32 = 0x53AB;
 const ID_SEEK_POSITION: u32 = 0x53AC;
 const ID_TRACK_UID: u32 = 0x73C5;
 const ID_FLAG_LACING: u32 = 0x9C;
+const ID_OUTPUT_SAMPLING_FREQUENCY: u32 = 0x78B5;
 const ID_CUE_POINT: u32 = 0xBB;
 const ID_CUE_TIME: u32 = 0xB3;
 const ID_CUE_TRACK_POSITIONS: u32 = 0xB7;
@@ -315,6 +320,14 @@ struct TrackPlan {
     delay_ms: i64,
     /// `SeekPreRoll` to write (ns, 0 = none).
     seek_preroll_ns: u64,
+    /// H.264: an `avcC` from the stream's extradata (a record or Annex-B
+    /// SPS/PPS), used when the first packet carries no parameter sets.
+    fallback_private: Option<Vec<u8>>,
+    /// FLAC: what the written frames say, for the STREAMINFO rewrite.
+    flac: Option<rff_format::flac::FlacStats>,
+    /// FLAC on the streaming muxer: where the CodecPrivate's STREAMINFO
+    /// body landed (relative to the file start), patched at the trailer.
+    flac_si_at: Option<u64>,
 }
 
 /// One buffered frame, timestamp already in milliseconds.
@@ -357,6 +370,9 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
         codec_delay_ns: 0,
         delay_ms: 0,
         seek_preroll_ns: 0,
+        fallback_private: None,
+        flac: None,
+        flac_si_at: None,
     };
     let webm_reject = |name: &str| {
         Err(Error::unsupported(format!(
@@ -384,6 +400,7 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
             }
             plan.codec = "V_MPEG4/ISO/AVC";
             plan.is_avc = true;
+            plan.fallback_private = rff_format::avc::avcc_record_from_extradata(&s.extradata);
         }
         CodecId::Hevc => {
             if webm {
@@ -391,7 +408,28 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
             }
             plan.codec = "V_MPEGH/ISO/HEVC";
             plan.is_hevc = true;
-            plan.private = hvcc_from_extradata(&s.extradata);
+            // An hvcC record or Annex-B VPS/SPS/PPS as extradata.
+            plan.private = rff_format::hvc::hvcc_record_from_extradata(&s.extradata);
+        }
+        CodecId::Jpeg | CodecId::DnxHd | CodecId::Apv if webm => {
+            return webm_reject(s.codec_id.name());
+        }
+        CodecId::Jpeg => plan.codec = "V_MJPEG",
+        // DNxHD/DNxHR have no native Matroska ID: the VfW mapping, a
+        // BITMAPINFOHEADER naming `AVdn`/`AVdh`, as FFmpeg's matroskaenc
+        // writes them.
+        CodecId::DnxHd => {
+            plan.codec = "V_MS/VFW/FOURCC";
+            let tag = s
+                .codec_tag
+                .filter(|t| t == b"AVdn" || t == b"AVdh")
+                .unwrap_or(*b"AVdn");
+            plan.private = Some(bitmap_info_header(s, tag));
+        }
+        // APV: V_APV, CodecPrivate = the APVDecoderConfigurationRecord.
+        CodecId::Apv => {
+            plan.codec = "V_APV";
+            plan.private = (!s.extradata.is_empty()).then(|| s.extradata.clone());
         }
         CodecId::ProRes => {
             if webm {
@@ -437,6 +475,7 @@ fn plan_track(s: &Stream, webm: bool) -> Result<TrackPlan> {
             }
             plan.codec = "A_FLAC";
             plan.private = Some(flac_private(s));
+            plan.flac = Some(Default::default());
         }
         CodecId::Mp3 => {
             if webm {
@@ -534,22 +573,31 @@ fn vp9_private(extradata: &[u8]) -> Option<Vec<u8>> {
     features.then(|| e.to_vec())
 }
 
-/// An `hvcC` CodecPrivate from a stream's `extradata`, when it holds one.
-/// Blocks are written with 4-byte NAL lengths, so a record declaring another
-/// length is rebuilt from its parameter sets rather than copied (a copied
-/// `lengthSizeMinusOne` would misframe every block).
-fn hvcc_from_extradata(extradata: &[u8]) -> Option<Vec<u8>> {
-    let cfg = parse_hvcc(extradata)?;
-    if cfg.nal_len == 4 {
-        return Some(extradata.to_vec());
+/// A 40-byte BITMAPINFOHEADER for the `V_MS/VFW/FOURCC` mapping.
+fn bitmap_info_header(s: &Stream, fourcc: [u8; 4]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(40);
+    b.extend_from_slice(&40u32.to_le_bytes()); // biSize
+    b.extend_from_slice(&(s.width as i32).to_le_bytes());
+    b.extend_from_slice(&(s.height as i32).to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    b.extend_from_slice(&24u16.to_le_bytes()); // biBitCount
+    b.extend_from_slice(&fourcc); // biCompression
+    let image = u64::from(s.width) * u64::from(s.height) * 3;
+    b.extend_from_slice(&u32::try_from(image).unwrap_or(0).to_le_bytes());
+    b.extend_from_slice(&[0; 16]); // ppm x/y, colours used/important
+    b
+}
+
+/// FLAC CodecPrivate with its STREAMINFO rewritten from the frames written
+/// (`fLaC`, a STREAMINFO block header, then the 34-byte body first).
+fn flac_rewritten(private: &[u8], stats: &rff_format::flac::FlacStats) -> Option<Vec<u8>> {
+    if private.len() < 42 || !private.starts_with(b"fLaC") || private[4] & 0x7F != 0 {
+        return None;
     }
-    let nals = split_annexb(&cfg.headers_annexb);
-    let find = |t: u8| {
-        nals.iter()
-            .copied()
-            .find(|n| n.first().map(|b| (b >> 1) & 0x3F) == Some(t))
-    };
-    build_hvcc_record(find(32).unwrap_or(&[]), find(33)?, find(34)?)
+    let si: [u8; 34] = private[8..42].try_into().ok()?;
+    let mut out = private.to_vec();
+    out[8..42].copy_from_slice(&stats.rewrite(&si));
+    Some(out)
 }
 
 /// The ProRes profiles a `V_PRORES` CodecPrivate names.
@@ -564,6 +612,20 @@ fn prores_fourcc(s: &Stream) -> [u8; 4] {
     }
 }
 
+/// What only the end of the stream settles in a CodecPrivate: the
+/// extradata's parameter sets for an H.264 stream that never carried any in
+/// band, and FLAC's STREAMINFO from the frames written.
+fn finalize_private(plan: &mut TrackPlan) {
+    if plan.is_avc && plan.private.is_none() {
+        plan.private = plan.fallback_private.clone();
+    }
+    if let (Some(stats), Some(private)) = (&plan.flac, &plan.private) {
+        if let Some(p) = flac_rewritten(private, stats) {
+            plan.private = Some(p);
+        }
+    }
+}
+
 /// Codecs whose CodecPrivate only the stream can supply: refuse to write a
 /// header without it, since the file would open but decode nothing.
 fn check_privates(tracks: &[TrackPlan]) -> Result<()> {
@@ -572,6 +634,13 @@ fn check_privates(tracks: &[TrackPlan]) -> Result<()> {
             return Err(Error::invalid(
                 "mkv mux: the alac stream needs its magic cookie as extradata (the \
                  CodecPrivate) — without it the output would open but decode nothing",
+            ));
+        }
+        if plan.stream.codec_id == CodecId::Apv && plan.private.is_none() {
+            return Err(Error::invalid(
+                "mkv mux: the apv stream needs its configuration record as extradata \
+                 (the V_APV CodecPrivate) — without it the output would open but decode \
+                 nothing",
             ));
         }
     }
@@ -730,7 +799,22 @@ fn tracks_element(tracks: &[TrackPlan]) -> Vec<u8> {
             }
             MediaType::Audio => {
                 let mut a = Vec::new();
-                put_float(&mut a, ID_SAMPLING_FREQUENCY, s.sample_rate.max(1) as f64);
+                // HE-AAC: the AudioSpecificConfig's core rate, and the SBR
+                // rate the stream plays at as OutputSamplingFrequency (as
+                // matroskaenc writes them).
+                let sbr = (plan.codec == "A_AAC")
+                    .then_some(plan.private.as_deref())
+                    .flatten()
+                    .and_then(|asc| {
+                        let out = rff_format::aac::asc_sbr_rate(asc)?;
+                        let core = rff_format::aac::asc_sample_rate(asc)?;
+                        (out == s.sample_rate && core != out).then_some(core)
+                    });
+                let rate = sbr.unwrap_or(s.sample_rate);
+                put_float(&mut a, ID_SAMPLING_FREQUENCY, rate.max(1) as f64);
+                if sbr.is_some() {
+                    put_float(&mut a, ID_OUTPUT_SAMPLING_FREQUENCY, s.sample_rate as f64);
+                }
                 put_uint(&mut a, ID_CHANNELS, s.channels.max(1) as u64);
                 if let Some(bd) = plan.bit_depth {
                     put_uint(&mut a, ID_BIT_DEPTH, bd);
@@ -918,7 +1002,8 @@ fn prepare_block(tracks: &mut [TrackPlan], packet: &Packet) -> Result<Option<Buf
             plan.private = match (sps, pps) {
                 (Some(s), Some(p)) if hevc => build_hvcc_record(vps.unwrap_or(&[]), s, p),
                 (Some(s), Some(p)) => Some(build_avcc_record(s, p)),
-                _ => None,
+                // No parameter sets in band: those of the extradata.
+                _ => plan.fallback_private.clone(),
             };
         }
         sample
@@ -931,6 +1016,9 @@ fn prepare_block(tracks: &mut [TrackPlan], packet: &Packet) -> Result<Option<Buf
     } else {
         if plan.is_av1 && plan.private.is_none() {
             plan.private = rff_format::av1::config_record(&packet.data);
+        }
+        if let Some(stats) = &mut plan.flac {
+            stats.push(&packet.data);
         }
         packet.data.clone()
     };
@@ -1069,6 +1157,9 @@ impl Muxer for MkvMuxer {
         );
 
         // --- Tracks (and Tags, right after) ---
+        for plan in &mut self.tracks {
+            finalize_private(plan);
+        }
         let mut tracks_elem = tracks_element(&self.tracks);
         tracks_elem.extend_from_slice(&crate::props::tags_element(&self.metadata));
 
@@ -1377,6 +1468,11 @@ impl MkvStreamingMuxer {
         // Duration is always written (an 8-byte float placeholder) and patched
         // at the trailer — or turned into a Void if the file has no duration.
         let (info, duration_at) = info_element(Some(0.0), &self.metadata);
+        for plan in &mut self.tracks {
+            if plan.is_avc && plan.private.is_none() {
+                plan.private = plan.fallback_private.clone();
+            }
+        }
         let mut tracks = tracks_element(&self.tracks);
         tracks.extend_from_slice(&crate::props::tags_element(&self.metadata));
         let seekhead_len = build_seekhead(0, 0, 0).len() as u64;
@@ -1389,6 +1485,19 @@ impl MkvStreamingMuxer {
             self.segment_data + info_pos + duration_at.expect("duration written") as u64;
         self.write(&seekhead)?;
         self.write(&info)?;
+        // FLAC: remember where each STREAMINFO body sits, to rewrite it once
+        // the frames are known (its size never changes).
+        let tracks_at = self.pos;
+        for plan in &mut self.tracks {
+            if let (Some(_), Some(private)) = (&plan.flac, &plan.private) {
+                if flac_rewritten(private, &Default::default()).is_some() {
+                    plan.flac_si_at = tracks
+                        .windows(private.len())
+                        .position(|w| w == private.as_slice())
+                        .map(|at| tracks_at + at as u64 + 8);
+                }
+            }
+        }
         self.write(&tracks)?;
         self.header_written = true;
         Ok(())
@@ -1566,6 +1675,19 @@ impl Muxer for MkvStreamingMuxer {
             self.patch(self.duration_at, &void)?;
         }
         self.patch(self.seekhead_cues_at, &cues_pos.to_be_bytes())?;
+        // FLAC: the STREAMINFO the frames describe.
+        let rewrites: Vec<(u64, Vec<u8>)> = self
+            .tracks
+            .iter()
+            .filter_map(|p| {
+                let at = p.flac_si_at?;
+                let new = flac_rewritten(p.private.as_deref()?, p.flac.as_ref()?)?;
+                Some((at, new[8..42].to_vec()))
+            })
+            .collect();
+        for (at, si) in rewrites {
+            self.patch(at, &si)?;
+        }
         self.out.flush()?;
         Ok(())
     }

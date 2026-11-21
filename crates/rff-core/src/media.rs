@@ -110,6 +110,14 @@ pub enum CodecId {
     Mp2,
     /// MPEG-1/2 Audio Layer I (MP1). Decode only.
     Mp1,
+    /// MPEG-1 video. Identified (Matroska `V_MPEG1`), no codec.
+    Mpeg1Video,
+    /// MPEG-2 video (H.262). Identified (Matroska `V_MPEG2`), no codec.
+    Mpeg2Video,
+    /// DTS / DTS-HD audio. Identified (Matroska `A_DTS`), no codec.
+    Dts,
+    /// Dolby TrueHD audio. Identified (Matroska `A_TRUEHD`), no codec.
+    TrueHd,
 }
 
 impl CodecId {
@@ -151,6 +159,10 @@ impl CodecId {
             CodecId::AdpcmImaQt => "adpcm_ima_qt",
             CodecId::Mp2 => "mp2",
             CodecId::Mp1 => "mp1",
+            CodecId::Mpeg1Video => "mpeg1video",
+            CodecId::Mpeg2Video => "mpeg2video",
+            CodecId::Dts => "dts",
+            CodecId::TrueHd => "truehd",
         }
     }
 
@@ -185,6 +197,8 @@ impl CodecId {
             | CodecId::AdpcmImaWav
             | CodecId::AdpcmImaQt => MediaType::Audio,
             CodecId::Mp2 | CodecId::Mp1 => MediaType::Audio,
+            CodecId::Mpeg1Video | CodecId::Mpeg2Video => MediaType::Video,
+            CodecId::Dts | CodecId::TrueHd => MediaType::Audio,
         }
     }
 
@@ -244,6 +258,10 @@ impl CodecId {
             "adpcm_ima_qt" | "ima4" => Some(CodecId::AdpcmImaQt),
             "mp2" | "mp2float" => Some(CodecId::Mp2),
             "mp1" | "mp1float" => Some(CodecId::Mp1),
+            "mpeg1video" => Some(CodecId::Mpeg1Video),
+            "mpeg2video" | "mpeg2" => Some(CodecId::Mpeg2Video),
+            "dts" | "dca" => Some(CodecId::Dts),
+            "truehd" | "mlp" => Some(CodecId::TrueHd),
             _ => None,
         }
     }
