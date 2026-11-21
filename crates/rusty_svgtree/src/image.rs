@@ -225,43 +225,75 @@ fn decode_png(data: &[u8], max_pixels: u64) -> Option<Pixmap> {
             return None;
         }
     }
-    let mut buf = vec![0; reader.output_buffer_size()];
+    let mut buf = vec![0u8; reader.output_buffer_size()];
     let out = reader.next_frame(&mut buf).ok()?;
     if out.bit_depth != rusty_png::BitDepth::Eight {
         return None;
     }
     let size = IntSize::from_wh(out.width, out.height)?;
     let n = (out.width as usize).checked_mul(out.height as usize)?;
-    let mut rgba = Vec::with_capacity(n.checked_mul(4)?);
-    match out.color_type {
-        rusty_png::ColorType::Rgb => {
-            for p in buf.chunks_exact(3).take(n) {
-                rgba.extend_from_slice(&[p[0], p[1], p[2], 255]);
+    let rgba = match out.color_type {
+        // Opaque: nothing to premultiply (`premultiply_u8(c, 255) == c`).
+        rusty_png::ColorType::Rgb => rgb_to_rgba(&buf, n)?,
+        rusty_png::ColorType::Grayscale => gray_to_rgba(&buf, 1, n)?,
+        rusty_png::ColorType::Rgba => {
+            // Premultiplied where it was decoded: no second buffer.
+            buf.truncate(n.checked_mul(4)?);
+            if buf.len() != n * 4 {
+                return None;
             }
-        }
-        rusty_png::ColorType::Rgba => rgba.extend_from_slice(buf.get(..n * 4)?),
-        rusty_png::ColorType::Grayscale => {
-            for &g in buf.iter().take(n) {
-                rgba.extend_from_slice(&[g, g, g, 255]);
+            for p in buf.chunks_exact_mut(4) {
+                let a = p[3];
+                if a != 255 {
+                    p[0] = premultiply_u8(p[0], a);
+                    p[1] = premultiply_u8(p[1], a);
+                    p[2] = premultiply_u8(p[2], a);
+                }
             }
+            buf
         }
         rusty_png::ColorType::GrayscaleAlpha => {
-            for p in buf.chunks_exact(2).take(n) {
-                rgba.extend_from_slice(&[p[0], p[0], p[0], p[1]]);
+            let src = buf.get(..n.checked_mul(2)?)?;
+            let mut rgba = vec![0u8; n.checked_mul(4)?];
+            for (d, s) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(2)) {
+                let v = premultiply_u8(s[0], s[1]);
+                d[0] = v;
+                d[1] = v;
+                d[2] = v;
+                d[3] = s[1];
             }
+            rgba
         }
         rusty_png::ColorType::Indexed => return None,
-    }
-    if rgba.len() != n * 4 {
-        return None;
-    }
-    for p in rgba.chunks_exact_mut(4) {
-        let a = p[3];
-        p[0] = premultiply_u8(p[0], a);
-        p[1] = premultiply_u8(p[1], a);
-        p[2] = premultiply_u8(p[2], a);
-    }
+    };
     Pixmap::from_vec(rgba, size)
+}
+
+/// `n` opaque RGBA pixels from `n` RGB ones.
+#[cfg(feature = "raster-images")]
+fn rgb_to_rgba(src: &[u8], n: usize) -> Option<Vec<u8>> {
+    let src = src.get(..n.checked_mul(3)?)?;
+    let mut rgba = vec![255u8; n.checked_mul(4)?];
+    for (d, s) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
+        d[0] = s[0];
+        d[1] = s[1];
+        d[2] = s[2];
+    }
+    Some(rgba)
+}
+
+/// `n` opaque RGBA pixels from `n` grey ones of `step` bytes each (the first
+/// byte is the level).
+#[cfg(feature = "raster-images")]
+fn gray_to_rgba(src: &[u8], step: usize, n: usize) -> Option<Vec<u8>> {
+    let src = src.get(..n.checked_mul(step)?)?;
+    let mut rgba = vec![255u8; n.checked_mul(4)?];
+    for (d, s) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(step)) {
+        d[0] = s[0];
+        d[1] = s[0];
+        d[2] = s[0];
+    }
+    Some(rgba)
 }
 
 #[cfg(feature = "raster-images")]
@@ -278,34 +310,23 @@ fn decode_jpeg(data: &[u8], max_pixels: u64) -> Option<Pixmap> {
     );
     let pixels = d.decode().ok()?;
     let n = (w as usize).checked_mul(h as usize)?;
-    let mut rgba = Vec::with_capacity(n.checked_mul(4)?);
-    match info.pixel_format {
-        rusty_jpeg::PixelFormat::L8 => {
-            for &g in pixels.iter().take(n) {
-                rgba.extend_from_slice(&[g, g, g, 255]);
-            }
-        }
-        rusty_jpeg::PixelFormat::L16 => {
-            for p in pixels.chunks_exact(2).take(n) {
-                rgba.extend_from_slice(&[p[0], p[0], p[0], 255]);
-            }
-        }
-        rusty_jpeg::PixelFormat::RGB24 => {
-            for p in pixels.chunks_exact(3).take(n) {
-                rgba.extend_from_slice(&[p[0], p[1], p[2], 255]);
-            }
-        }
+    let rgba = match info.pixel_format {
+        rusty_jpeg::PixelFormat::L8 => gray_to_rgba(&pixels, 1, n)?,
+        rusty_jpeg::PixelFormat::L16 => gray_to_rgba(&pixels, 2, n)?,
+        rusty_jpeg::PixelFormat::RGB24 => rgb_to_rgba(&pixels, n)?,
         rusty_jpeg::PixelFormat::CMYK32 => {
-            for p in pixels.chunks_exact(4).take(n) {
+            let src = pixels.get(..n.checked_mul(4)?)?;
+            let mut rgba = vec![255u8; n.checked_mul(4)?];
+            for (d, p) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
                 let k = u32::from(p[3]);
                 let f = |c: u8| ((u32::from(c) * k + 127) / 255) as u8;
-                rgba.extend_from_slice(&[f(p[0]), f(p[1]), f(p[2]), 255]);
+                d[0] = f(p[0]);
+                d[1] = f(p[1]);
+                d[2] = f(p[2]);
             }
+            rgba
         }
-    }
-    if rgba.len() != n * 4 {
-        return None;
-    }
+    };
     Pixmap::from_vec(rgba, IntSize::from_wh(w, h)?)
 }
 
@@ -318,6 +339,14 @@ mod tests {
         assert_eq!(base64_decode(b"aGVsbG8="), b"hello");
         assert_eq!(base64_decode(b"aGVs\nbG8"), b"hello");
         assert_eq!(base64_decode(b"!!!"), b"");
+    }
+
+    /// Opaque pixels skip the premultiply: it would not change them.
+    #[test]
+    fn premultiply_by_255_is_identity() {
+        for c in 0..=255u8 {
+            assert_eq!(premultiply_u8(c, 255), c);
+        }
     }
 
     /// The decoder one character at a time: the oracle for the grouped one.
