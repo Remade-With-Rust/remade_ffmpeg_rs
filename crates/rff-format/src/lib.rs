@@ -15,6 +15,7 @@ pub mod av1;
 pub mod avc;
 pub mod flac;
 pub mod hvc;
+pub mod nal;
 pub mod time;
 
 use std::collections::HashMap;
@@ -775,7 +776,7 @@ impl FormatRegistry {
     /// byte sink). Callers writing a file should prefer this -- it is what lets
     /// MP4/Matroska/AVI/WAV stream instead of buffering the whole output.
     pub fn open_muxer_seekable(&self, name: &str, output: SeekOutput) -> Result<Box<dyn Muxer>> {
-        if !self.by_name.get(name).is_some_and(|f| f.muxer.is_some()) {
+        if self.by_name.get(name).is_none_or(|f| f.muxer.is_none()) {
             return Err(Error::MuxerNotFound(name.to_string()));
         }
         match self.seekable_muxers.get(name) {

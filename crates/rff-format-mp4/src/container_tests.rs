@@ -223,8 +223,9 @@ fn mov_carries_prores_pcm_timecode_and_colour() {
         assert_eq!((v.codec_id, v.codec_tag), (CodecId::ProRes, Some(*b"apch")));
         assert_eq!((v.width, v.height), (1920, 1080));
         assert_eq!(v.color, streams[0].color);
-        // QuickTime's `nclc` has no range flag; limited is its default.
-        assert_eq!(v.color_range, ColorRange::Unspecified);
+        // A known range is written as `nclx` (QuickTime's `nclc` has no
+        // range flag), so limited comes back as limited.
+        assert_eq!(v.color_range, ColorRange::Limited);
         assert_eq!(v.pixel_aspect, streams[0].pixel_aspect);
         assert_eq!(v.clean_aperture, streams[0].clean_aperture);
         assert_eq!(v.mastering_display, streams[0].mastering_display);

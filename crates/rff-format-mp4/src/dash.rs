@@ -14,7 +14,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rff_core::{CodecId, Error, MediaType, Packet, Result};
-use rff_format::avc::{build_avcc_record, split_annexb};
 use rff_format::{Muxer, Stream};
 
 use super::fmp4::{self, FragSample};
@@ -72,27 +71,21 @@ impl Muxer for DashMuxer {
                 packet.stream_index
             )));
         };
-        // Same normalisation as the plain MP4 muxer: H.264 Annex-B → AVCC with
-        // the avcC hoisted; AV1 harvests its config from the first packet.
+        // The plain MP4 muxer's normalisation: H.264 Annex-B → AVCC with the
+        // avcC hoisted, or a length-prefixed packet kept as it is (an error
+        // when it is neither); AV1 harvests its config from the first packet.
         let data = if track.out.stream.codec_id == CodecId::H264 {
-            let mut sample = Vec::new();
-            let (mut sps, mut pps) = (None, None);
-            for nal in split_annexb(&packet.data) {
-                match nal.first().map(|b| b & 0x1F) {
-                    Some(7) => sps = Some(nal.to_vec()),
-                    Some(8) => pps = Some(nal.to_vec()),
-                    _ => {
-                        sample.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-                        sample.extend_from_slice(nal);
+            let mut scratch = Vec::new();
+            track
+                .out
+                .sample_bytes(&packet.data, &mut scratch)
+                .map_err(|e| match e {
+                    Error::InvalidData(m) => {
+                        Error::InvalidData(m.replacen("mp4 mux", "dash mux", 1))
                     }
-                }
-            }
-            if track.out.config.is_none() {
-                if let (Some(s), Some(p)) = (&sps, &pps) {
-                    track.out.config = Some(bx(b"avcC", &build_avcc_record(s, p)));
-                }
-            }
-            sample
+                    e => e,
+                })?
+                .to_vec()
         } else {
             if track.out.stream.codec_id == CodecId::Avif && track.out.config.is_none() {
                 track.out.config =

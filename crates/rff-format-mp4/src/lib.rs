@@ -35,6 +35,8 @@ mod issue114_tests;
 #[cfg(test)]
 mod issue114b_tests;
 mod meta;
+#[cfg(test)]
+mod raw_remux_tests;
 
 use std::borrow::Cow;
 use std::io::{BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -285,7 +287,8 @@ impl SampleLoc {
     }
 }
 
-use rff_format::avc::{avcc_to_annexb, parse_avcc, split_annexb, AvcConfig};
+use rff_format::avc::{avcc_to_annexb, parse_avcc, AvcConfig};
+use rff_format::nal::{NalFraming, NalSampleWriter, ParamSets, Stored};
 
 /// Where sample bytes come from once the header is parsed.
 enum Source {
@@ -1114,6 +1117,10 @@ fn parse_track(trak: &[u8], index: usize, timing: (u32, bool), qt: bool) -> Opti
             CodecId::Eac3 => stream.extradata = a.child(b"dec3").unwrap_or(&[]).to_vec(),
             CodecId::Opus => {
                 if let Some(head) = a.child(b"dOps").and_then(entry::dops_to_opus_head) {
+                    // The pre-skip (48 kHz samples) as the codec delay, as
+                    // Matroska's `CodecDelay` reports it for the same stream.
+                    let pre_skip = u64::from(u16::from_le_bytes([head[10], head[11]]));
+                    stream.codec_delay_ns = pre_skip * 1_000_000_000 / 48_000;
                     stream.extradata = head;
                 }
             }
@@ -2092,11 +2099,20 @@ struct TrackOut {
     last_duration: i64,
     /// FLAC: what the written frames say, for the `dfLa` STREAMINFO.
     flac: Option<rff_format::flac::FlacStats>,
+    /// H.264 / HEVC: whether packets arrive Annex-B or already
+    /// length-prefixed, and how each becomes a stored sample.
+    nal: Option<NalSampleWriter>,
 }
 
 impl TrackOut {
     fn new(stream: &Stream, fourcc: [u8; 4]) -> TrackOut {
+        let nal = match stream.codec_id {
+            CodecId::H264 => Some(NalSampleWriter::new(&stream.extradata, false)),
+            CodecId::Hevc => Some(NalSampleWriter::new(&stream.extradata, true)),
+            _ => None,
+        };
         TrackOut {
+            nal,
             stream: stream.clone(),
             fourcc,
             config: None,
@@ -2174,53 +2190,66 @@ impl TrackOut {
         Ok(t)
     }
 
-    /// The bytes MP4 stores for a packet. H.264 goes from Annex-B to 4-byte
-    /// length prefixes (built in `scratch`), its first in-band SPS/PPS pair
-    /// hoisted into `avcC`; AV1 and audio are stored as they are, AV1 taking
-    /// its `av1C` from the first sample that carries a sequence header.
-    fn sample_bytes<'a>(&mut self, data: &'a [u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
+    /// The bytes MP4 stores for a packet. H.264 / HEVC are stored with 4-byte
+    /// length prefixes: an Annex-B packet is converted (built in `scratch`),
+    /// its first in-band parameter sets hoisted into `avcC` / `hvcC`; a
+    /// packet that is already length-prefixed (raw samples, with the record
+    /// as extradata) keeps every byte and the record becomes the config box.
+    /// A packet that is neither is an error, never a silently shortened
+    /// sample. AV1 and audio are stored as they are, AV1 taking its `av1C`
+    /// from the first sample that carries a sequence header.
+    fn sample_bytes<'a>(&mut self, data: &'a [u8], scratch: &'a mut Vec<u8>) -> Result<&'a [u8]> {
         match self.stream.codec_id {
-            CodecId::H264 => {
+            codec @ (CodecId::H264 | CodecId::Hevc) => {
+                let hevc = codec == CodecId::Hevc;
+                let writer = self
+                    .nal
+                    .as_mut()
+                    .expect("H.264/HEVC tracks have a NAL writer");
                 scratch.clear();
-                let (mut sps, mut pps) = (None, None);
-                for nal in split_annexb(data) {
-                    match nal.first().map(|b| b & 0x1F) {
-                        Some(7) => sps = Some(nal),
-                        Some(8) => pps = Some(nal),
-                        _ => {
-                            pu32(scratch, nal.len() as u32);
-                            scratch.extend_from_slice(nal);
+                let stored = writer.write(data, scratch).map_err(|why| {
+                    Error::invalid(format!(
+                        "mp4 mux: {} stream {}: {why}",
+                        codec.name(),
+                        self.stream.index
+                    ))
+                })?;
+                let params = match stored {
+                    Stored::Verbatim => None,
+                    Stored::Converted { params } => Some(params),
+                };
+                if self.config.is_none() {
+                    let tag = if hevc { b"hvcC" } else { b"avcC" };
+                    self.config = match writer.framing() {
+                        // The record the samples were stored against, kept
+                        // verbatim but for its length size (4, as written).
+                        Some(NalFraming::LengthPrefixed(_)) => {
+                            rff_format::nal::record_with_4byte_lengths(&self.stream.extradata, hevc)
+                                .map(|r| bx(tag, &r))
                         }
-                    }
+                        _ => match params {
+                            Some(ParamSets {
+                                sps: Some(s),
+                                pps: Some(p),
+                                vps,
+                            }) if hevc => vps.and_then(|v| {
+                                rff_format::hvc::build_hvcc_record(v, s, p).map(|r| bx(tag, &r))
+                            }),
+                            Some(ParamSets {
+                                sps: Some(s),
+                                pps: Some(p),
+                                ..
+                            }) => Some(build_avcc(s, p)),
+                            _ => None,
+                        },
+                    };
                 }
-                if let (Some(s), Some(p)) = (sps, pps) {
-                    if self.config.is_none() {
-                        self.config = Some(build_avcc(s, p));
-                    }
-                }
-                scratch
+                Ok(match stored {
+                    Stored::Verbatim => data,
+                    Stored::Converted { .. } => scratch,
+                })
             }
-            CodecId::Hevc => {
-                scratch.clear();
-                let (mut vps, mut sps, mut pps) = (None, None, None);
-                for nal in split_annexb(data) {
-                    match nal.first().map(|b| (b >> 1) & 0x3F) {
-                        Some(32) => vps = Some(nal),
-                        Some(33) => sps = Some(nal),
-                        Some(34) => pps = Some(nal),
-                        _ => {
-                            pu32(scratch, nal.len() as u32);
-                            scratch.extend_from_slice(nal);
-                        }
-                    }
-                }
-                if let (Some(v), Some(s), Some(p), None) = (vps, sps, pps, &self.config) {
-                    self.config =
-                        rff_format::hvc::build_hvcc_record(v, s, p).map(|r| bx(b"hvcC", &r));
-                }
-                scratch
-            }
-            CodecId::Pcm => match &self.pcm {
+            CodecId::Pcm => Ok(match &self.pcm {
                 Some(out) if out.layout.big_endian || out.layout.signed8 => {
                     scratch.clear();
                     scratch.extend_from_slice(data);
@@ -2228,7 +2257,7 @@ impl TrackOut {
                     scratch
                 }
                 _ => data,
-            },
+            }),
             codec => {
                 if self.config.is_none() {
                     self.config = match codec {
@@ -2247,7 +2276,7 @@ impl TrackOut {
                 if codec == CodecId::ProRes && self.sizes.is_empty() {
                     self.fourcc = entry::prores_tag(&self.stream, Some(data));
                 }
-                data
+                Ok(data)
             }
         }
     }
@@ -2739,7 +2768,7 @@ fn write_buffered<W: Write + ?Sized>(
         let Some(track) = tracks.get_mut(idx) else {
             continue;
         };
-        let sample = track.sample_bytes(&bytes, &mut scratch);
+        let sample = track.sample_bytes(&bytes, &mut scratch)?;
         track.push_sample(sample.len(), keyframe, pts, dts)?;
         track.last_duration = duration;
         data[idx].push(sample.to_vec());
@@ -3106,7 +3135,7 @@ impl Muxer for Mp4StreamMuxer {
         let Some(track) = self.tracks.get_mut(t) else {
             return Ok(());
         };
-        let sample = track.sample_bytes(&packet.data, &mut self.scratch);
+        let sample = track.sample_bytes(&packet.data, &mut self.scratch)?;
         track.push_sample(sample.len(), packet.is_keyframe(), packet.pts, packet.dts)?;
         track.last_duration = packet.duration;
         track.place(self.pos, self.last_track == Some(t));
@@ -4308,7 +4337,7 @@ mod tests {
     #[test]
     fn split_annexb_handles_4byte_start_codes() {
         let data = [0, 0, 0, 1, 0x67, 0xAA, 0, 0, 0, 1, 0x68, 0xBB, 0xCC];
-        let nals = split_annexb(&data);
+        let nals = rff_format::avc::split_annexb(&data);
         assert_eq!(nals, vec![&[0x67u8, 0xAA][..], &[0x68, 0xBB, 0xCC][..]]);
     }
 

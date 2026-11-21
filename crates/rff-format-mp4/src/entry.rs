@@ -163,15 +163,15 @@ pub(crate) fn read_visual_children(stream: &mut Stream, children: &[u8]) {
 
 /// The descriptive boxes for a visual sample entry, in FilmCraft's (and
 /// QuickTime's) order: `colr`, `mdcv`, `clli`, `pasp`, `clap`. ISO gets
-/// `nclx`; QuickTime gets `nclc`, as FFmpeg's movenc writes, except for a
-/// full-range stream, where `nclc` (which has no range flag) would lose the
-/// range and `nclx` keeps it.
+/// `nclx`; QuickTime gets `nclc`, as FFmpeg's movenc writes, except when the
+/// range is known (full or limited): `nclc` has no range flag and would lose
+/// it, so those get `nclx`, which QuickTime writers (iPhone, FilmCraft) use too.
 pub(crate) fn visual_children(stream: &Stream, qt: bool) -> Vec<u8> {
     let mut out = Vec::new();
     let range_known = stream.color_range != ColorRange::Unspecified;
     let full = stream.color_range == ColorRange::Full;
-    if !stream.color.is_unspecified() || (!qt && range_known) || full {
-        let nclc = qt && !full;
+    if !stream.color.is_unspecified() || range_known {
+        let nclc = qt && !range_known;
         let mut b = Vec::new();
         b.extend_from_slice(if nclc { b"nclc" } else { b"nclx" });
         pu16(&mut b, stream.color.primaries);

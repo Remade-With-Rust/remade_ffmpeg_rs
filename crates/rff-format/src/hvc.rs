@@ -32,7 +32,7 @@ pub fn parse_hvcc(hvcc: &[u8]) -> Option<AvcConfig> {
             let nal = hvcc.get(i..i + len)?;
             // Only the parameter sets are worth prepending (32 VPS, 33 SPS,
             // 34 PPS); a record may also carry prefix SEI arrays.
-            if matches!(nal_type, 32 | 33 | 34) {
+            if matches!(nal_type, 32..=34) {
                 headers.extend_from_slice(&[0, 0, 0, 1]);
                 headers.extend_from_slice(nal);
             }
@@ -209,12 +209,9 @@ pub fn hvcc_record_from_extradata(extradata: &[u8]) -> Option<Vec<u8>> {
 
 /// Finds the first NAL of `nal_type` in an Annex-B stream (header included).
 pub fn find_nal_annexb(data: &[u8], nal_type: u8) -> Option<&[u8]> {
-    for nal in crate::avc::split_annexb(data) {
-        if !nal.is_empty() && (nal[0] >> 1) & 0x3f == nal_type {
-            return Some(nal);
-        }
-    }
-    None
+    crate::avc::split_annexb(data)
+        .into_iter()
+        .find(|nal| !nal.is_empty() && (nal[0] >> 1) & 0x3f == nal_type)
 }
 
 fn be16(d: &[u8], i: usize) -> Option<u16> {
