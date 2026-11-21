@@ -143,7 +143,7 @@ impl<'a> SvgNode<'a> {
     }
 
     fn is_visible_element(&self, opt: &Options) -> bool {
-        self.attribute(AId::Display).map(str::trim) != Some("none")
+        self.attribute(AId::Display).map(values::trim) != Some("none")
             && self.has_valid_transform(AId::Transform)
             && switch_condition_passed(*self, opt)
     }
@@ -628,7 +628,7 @@ fn convert_group_into(
         .attribute(AId::MixBlendMode)
         .and_then(parse_blend_mode)
         .unwrap_or(BlendMode::SourceOver);
-    let isolate = node.attribute(AId::Isolation).map(str::trim) == Some("isolate");
+    let isolate = node.attribute(AId::Isolation).map(values::trim) == Some("isolate");
     let is_g_or_use = matches!(node.tag_name(), Some(EId::G | EId::Use));
     let required = (opacity - 1.0).abs() > f32::EPSILON * 4.0
         || !transform.is_identity()
@@ -902,12 +902,12 @@ fn convert_path(
     let mut stroke = resolve_stroke(node, has_bbox, state, cache);
     let visible_attr = node
         .find_attribute(AId::Visibility)
-        .map(str::trim)
+        .map(values::trim)
         .unwrap_or("visible")
         == "visible";
     let mut visible = visible_attr;
     let anti_alias = !matches!(
-        node.find_attribute(AId::ShapeRendering).map(str::trim),
+        node.find_attribute(AId::ShapeRendering).map(values::trim),
         Some("optimizeSpeed" | "crispEdges")
     );
     let (paint_order, markers_pos) = node
@@ -1027,7 +1027,7 @@ fn convert_markers(
         if state.parent_markers.len() >= MAX_REF_DEPTH {
             continue;
         }
-        let stroke_scale = match mnode.attribute(AId::MarkerUnits).map(str::trim) {
+        let stroke_scale = match mnode.attribute(AId::MarkerUnits).map(values::trim) {
             Some("userSpaceOnUse") => 1.0,
             _ => resolve_length(node, AId::StrokeWidth, state, 1.0),
         };
@@ -1043,14 +1043,14 @@ fn convert_markers(
             continue;
         };
         let view_box = mnode.parse_viewbox().map(|vb| (vb, mnode.aspect()));
-        let overflow = mnode.attribute(AId::Overflow).map(str::trim);
+        let overflow = mnode.attribute(AId::Overflow).map(values::trim);
         let clip = if matches!(overflow, None | Some("hidden" | "scroll")) {
             let r = view_box.map_or_else(|| rect.size().to_non_zero_rect(0.0, 0.0), |v| v.0);
             clip_element(r, Transform::identity()).clip_path
         } else {
             None
         };
-        let orient = match mnode.attribute(AId::Orient).map(str::trim) {
+        let orient = match mnode.attribute(AId::Orient).map(values::trim) {
             Some("auto") => Orientation::Auto,
             Some("auto-start-reverse") => Orientation::AutoStartReverse,
             Some(v) => Orientation::Angle(parse_angle(v).unwrap_or(0.0)),
@@ -1215,7 +1215,7 @@ fn push_pattern_transform(root: &mut Group, transform: Transform) {
 // ----------------------------------------------------------------- style --
 
 fn resolve_fill(node: SvgNode, has_bbox: bool, state: &State, cache: &mut Cache) -> Option<Fill> {
-    let rule = |n: SvgNode, attr: AId| match n.find_attribute(attr).map(str::trim) {
+    let rule = |n: SvgNode, attr: AId| match n.find_attribute(attr).map(values::trim) {
         Some("evenodd") => FillRule::EvenOdd,
         _ => FillRule::Winding,
     };
@@ -1279,12 +1279,12 @@ fn resolve_stroke(
         .find_attribute(AId::StrokeOpacity)
         .and_then(values::opacity)
         .unwrap_or(1.0);
-    let linecap = match node.find_attribute(AId::StrokeLinecap).map(str::trim) {
+    let linecap = match node.find_attribute(AId::StrokeLinecap).map(values::trim) {
         Some("round") => LineCap::Round,
         Some("square") => LineCap::Square,
         _ => LineCap::Butt,
     };
-    let linejoin = match node.find_attribute(AId::StrokeLinejoin).map(str::trim) {
+    let linejoin = match node.find_attribute(AId::StrokeLinejoin).map(values::trim) {
         Some("round") => LineJoin::Round,
         Some("bevel") => LineJoin::Bevel,
         Some("miter-clip") => LineJoin::MiterClip,
@@ -1438,7 +1438,7 @@ impl BaseGradient {
 
 fn units_attr(node: SvgNode, name: AId, def: Units) -> Units {
     let n = resolve_attr(node, name);
-    match n.attribute(name).map(str::trim) {
+    match n.attribute(name).map(values::trim) {
         Some("userSpaceOnUse") => Units::UserSpaceOnUse,
         Some("objectBoundingBox") => Units::ObjectBoundingBox,
         _ => def,
@@ -1533,7 +1533,7 @@ fn convert_stops(grad: SvgNode) -> Vec<Stop> {
         };
         prev_offset = offset;
         let offset = (offset as f32).clamp(0.0, 1.0);
-        let c = match stop.attribute(AId::StopColor).map(str::trim) {
+        let c = match stop.attribute(AId::StopColor).map(values::trim) {
             Some("currentColor") => current_color(stop),
             Some(v) => values::color(v).unwrap_or(values::Color::BLACK),
             None => values::Color::BLACK,
@@ -1585,7 +1585,7 @@ fn convert_stops(grad: SvgNode) -> Vec<Stop> {
 fn spread_attr(node: SvgNode) -> SpreadMode {
     match resolve_attr(node, AId::SpreadMethod)
         .attribute(AId::SpreadMethod)
-        .map(str::trim)
+        .map(values::trim)
     {
         Some("reflect") => SpreadMode::Reflect,
         Some("repeat") => SpreadMode::Repeat,
@@ -1773,7 +1773,7 @@ fn convert_clip_path(
             node.resolve_transform(AId::Transform, state)
         }
     };
-    let units = match node.attribute(AId::ClipPathUnits).map(str::trim) {
+    let units = match node.attribute(AId::ClipPathUnits).map(values::trim) {
         Some("objectBoundingBox") => Units::ObjectBoundingBox,
         _ => Units::UserSpaceOnUse,
     };
@@ -1827,11 +1827,11 @@ fn convert_mask(
     if cache.active.contains(&node.id()) || cache.active.len() >= MAX_REF_DEPTH {
         return None;
     }
-    let units = match node.attribute(AId::MaskUnits).map(str::trim) {
+    let units = match node.attribute(AId::MaskUnits).map(values::trim) {
         Some("userSpaceOnUse") => Units::UserSpaceOnUse,
         _ => Units::ObjectBoundingBox,
     };
-    let content_units = match node.attribute(AId::MaskContentUnits).map(str::trim) {
+    let content_units = match node.attribute(AId::MaskContentUnits).map(values::trim) {
         Some("objectBoundingBox") => Units::ObjectBoundingBox,
         _ => Units::UserSpaceOnUse,
     };
@@ -1855,7 +1855,7 @@ fn convert_mask(
             None => mask_all = true,
         }
     }
-    let kind = if node.attribute(AId::MaskType).map(str::trim) == Some("alpha") {
+    let kind = if node.attribute(AId::MaskType).map(values::trim) == Some("alpha") {
         MaskType::Alpha
     } else {
         MaskType::Luminance
@@ -2098,7 +2098,7 @@ fn use_convert_children(
 
 fn get_clip_rect(use_node: SvgNode, symbol: SvgNode, state: &State) -> Option<NonZeroRect> {
     if matches!(
-        symbol.attribute(AId::Overflow).map(str::trim),
+        symbol.attribute(AId::Overflow).map(values::trim),
         Some("visible" | "auto")
     ) {
         return None;
@@ -2153,10 +2153,10 @@ fn convert_image(node: SvgNode, state: &State, parent: &mut Group) {
     };
     let visible = node
         .find_attribute(AId::Visibility)
-        .map(str::trim)
+        .map(values::trim)
         .unwrap_or("visible")
         == "visible";
-    let quality = match node.find_attribute(AId::ImageRendering).map(str::trim) {
+    let quality = match node.find_attribute(AId::ImageRendering).map(values::trim) {
         Some("optimizeSpeed" | "crisp-edges" | "pixelated") => FilterQuality::Nearest,
         Some("smooth") => FilterQuality::Bilinear,
         _ => FilterQuality::Bicubic,

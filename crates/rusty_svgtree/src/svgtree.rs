@@ -1131,7 +1131,7 @@ fn append_attribute(
     important: bool,
     replace: bool,
 ) {
-    let value = value.trim();
+    let value = crate::values::trim(value);
     let resolved: Option<(Box<str>, bool)> = if value == "inherit" {
         resolve_inherit(doc, parent, name)
     } else {

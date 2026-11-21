@@ -319,6 +319,20 @@ impl Length {
     }
 }
 
+/// `str::trim`, with a quick answer for text that starts and ends on a
+/// printable ASCII character: nothing to trim there, and attribute values
+/// (stored trimmed) nearly always do.
+#[inline]
+pub(crate) fn trim(s: &str) -> &str {
+    let printable = |c: Option<&u8>| matches!(c, Some(b'!'..=b'~'));
+    let b = s.as_bytes();
+    if printable(b.first()) && printable(b.last()) {
+        s
+    } else {
+        s.trim()
+    }
+}
+
 /// A whole-string number (trailing spaces allowed).
 pub(crate) fn number(text: &str) -> Option<f64> {
     let mut s = Stream::new(text);
@@ -572,7 +586,7 @@ pub(crate) enum PaintFallback {
 
 /// Parses a paint value.
 pub(crate) fn paint(text: &str) -> Option<Paint<'_>> {
-    let t = text.trim();
+    let t = trim(text);
     match t {
         "none" => return Some(Paint::None),
         "currentColor" => return Some(Paint::CurrentColor),
@@ -647,7 +661,7 @@ pub(crate) fn func_iri(text: &str) -> Option<&str> {
 
 /// An IRI (`href`): `#id`, possibly surrounded by spaces.
 pub(crate) fn iri(text: &str) -> Option<&str> {
-    let t = text.trim();
+    let t = trim(text);
     t.strip_prefix('#').filter(|s| !s.is_empty())
 }
 
@@ -1239,6 +1253,32 @@ pub(crate) fn starts_with_ci(text: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trim_matches_str_trim() {
+        for t in [
+            "",
+            " ",
+            "a",
+            " a",
+            "a ",
+            " a b ",
+            "\ta\n",
+            "\u{a0}a",
+            "a\u{3000}",
+            "\u{7f}",
+            "~",
+            "!",
+            "a\u{85}",
+            "\u{1680}x\u{2028}",
+            "\u{e9}",
+            " \u{e9} ",
+            "#fff",
+            "url(#a) ",
+        ] {
+            assert_eq!(trim(t), t.trim(), "{t:?}");
+        }
+    }
 
     #[test]
     fn numbers() {
