@@ -568,10 +568,10 @@ impl ClutEval {
                 ],
             );
             let done = match (self.outputs, self.trilinear) {
-                (3, false) => self.tetra_walk::<3>(origin, f, step, out),
-                (4, false) => self.tetra_walk::<4>(origin, f, step, out),
-                (3, true) => self.trilinear_fixed::<3>(origin, f, step, out),
-                (4, true) => self.trilinear_fixed::<4>(origin, f, step, out),
+                (3, false) => self.kernel3::<3, false>(origin, f, step, out),
+                (4, false) => self.kernel3::<4, false>(origin, f, step, out),
+                (3, true) => self.kernel3::<3, true>(origin, f, step, out),
+                (4, true) => self.kernel3::<4, true>(origin, f, step, out),
                 _ => false,
             };
             if done {
@@ -595,8 +595,8 @@ impl ClutEval {
                 if i3 + 1 < *g3 { *s3 } else { 0 },
             ];
             let done = match self.outputs {
-                3 => self.tetra4_fixed::<3>(origin, [f0, f1, f2, f3], step, out),
-                4 => self.tetra4_fixed::<4>(origin, [f0, f1, f2, f3], step, out),
+                3 => self.kernel4::<3>(origin, [f0, f1, f2, f3], step, out),
+                4 => self.kernel4::<4>(origin, [f0, f1, f2, f3], step, out),
                 _ => false,
             };
             if done {
@@ -699,6 +699,39 @@ impl ClutEval {
                 }
             }
         }
+    }
+
+    /// The kernel of a three-input front end of [`ClutEval::eval`], one
+    /// symbol per output count and interpolation. Out of line, so `eval`
+    /// stays small: with all six kernels inlined it was 3.3K instructions,
+    /// and the three-input integer path (lab16in) ran 8-13% slower on the
+    /// clock while it executed 30% fewer instructions (three probes).
+    #[inline(never)]
+    fn kernel3<const N: usize, const TRILINEAR: bool>(
+        &self,
+        origin: usize,
+        f: [f64; 3],
+        step: [usize; 3],
+        out: &mut [f64; 16],
+    ) -> bool {
+        if TRILINEAR {
+            self.trilinear_fixed::<N>(origin, f, step, out)
+        } else {
+            self.tetra_walk::<N>(origin, f, step, out)
+        }
+    }
+
+    /// The kernel of the four-input front end of [`ClutEval::eval`], out of
+    /// line likewise.
+    #[inline(never)]
+    fn kernel4<const N: usize>(
+        &self,
+        origin: usize,
+        f: [f64; 4],
+        step: [usize; 4],
+        out: &mut [f64; 16],
+    ) -> bool {
+        self.tetra4_fixed::<N>(origin, f, step, out)
     }
 
     /// Trilinear interpolation over three inputs when there are exactly `N`
