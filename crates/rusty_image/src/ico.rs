@@ -108,11 +108,20 @@ fn decode_entry(data: &[u8], d: &Dir) -> Result<(Image, bool)> {
     let mask_len = mask_row * h;
     if data_end >= end + mask_len {
         let mask = body.get(end..end + mask_len).ok_or(Error::Truncated)?;
-        for y in 0..h {
-            let row = &mask[y * mask_row..(y + 1) * mask_row];
-            for x in 0..w {
-                if row[x / 8] & (0x80 >> (x % 8)) != 0 {
-                    img.pixels[((h - y - 1) * w + x) * 4 + 3] = 0;
+        // The mask is walked a byte (eight pixels) at a time, bottom row
+        // first like the pixels. A zero byte, which is most of the mask of
+        // an icon with real alpha, is skipped whole; the pixels of any other
+        // byte have their alpha cleared without a branch (`bit - 1` is 0x00
+        // for a set bit and 0xff for a clear one). Testing a bit and making
+        // a bounds-checked store per pixel was 15 Ir a pixel.
+        let rows = img.pixels.chunks_exact_mut(w * 4).rev();
+        for (out, row) in rows.zip(mask.chunks_exact(mask_row)) {
+            for (cell, &m) in out.chunks_mut(32).zip(row) {
+                if m == 0 {
+                    continue;
+                }
+                for (k, px) in cell.chunks_exact_mut(4).enumerate() {
+                    px[3] &= ((m >> (7 - k)) & 1).wrapping_sub(1);
                 }
             }
         }
