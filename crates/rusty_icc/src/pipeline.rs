@@ -466,19 +466,35 @@ fn black_as_darker_colorant(p: &Profile, intent: Intent) -> Xyz {
     clip_black(to_lab(&v, side.pcs))
 }
 
-/// Lab through `p`'s output side for `intent`, then back through its
-/// relative-colorimetric input side (`CreateRoundtripXForm`).
-fn roundtrip(p: &Profile, intent: Intent, lab: Lab) -> Result<Lab> {
-    let out = output_side(p, intent)?;
-    let inn = input_side(p, Intent::RelativeColorimetric)?;
-    let mut v = [0.0; 16];
-    match out.pcs {
-        Pcs::Lab => v[..3].copy_from_slice(&[lab.l, lab.a, lab.b]),
-        Pcs::Xyz => v[..3].copy_from_slice(&lab_to_xyz(lab, D50).to_array()),
+/// Lab through a profile's output side for an intent, then back through
+/// its relative-colorimetric input side (`CreateRoundtripXForm`). Built
+/// once and evaluated per colour: building a side converts the profile's
+/// whole CLUT, and the destination black-point search evaluates 256
+/// colours, so building it per colour was most of a `Transform::new` with
+/// black-point compensation.
+struct Roundtrip {
+    out: Side,
+    inn: Side,
+}
+
+impl Roundtrip {
+    fn new(p: &Profile, intent: Intent) -> Result<Self> {
+        Ok(Self {
+            out: output_side(p, intent)?,
+            inn: input_side(p, Intent::RelativeColorimetric)?,
+        })
     }
-    let n = run(&out.ops, &mut v, 3);
-    run(&inn.ops, &mut v, n);
-    Ok(to_lab(&v, inn.pcs))
+
+    fn eval(&self, lab: Lab) -> Lab {
+        let mut v = [0.0; 16];
+        match self.out.pcs {
+            Pcs::Lab => v[..3].copy_from_slice(&[lab.l, lab.a, lab.b]),
+            Pcs::Xyz => v[..3].copy_from_slice(&lab_to_xyz(lab, D50).to_array()),
+        }
+        let n = run(&self.out.ops, &mut v, 3);
+        run(&self.inn.ops, &mut v, n);
+        to_lab(&v, self.inn.pcs)
+    }
 }
 
 /// `BlackPointUsingPerceptualBlack`.
@@ -486,7 +502,8 @@ fn black_using_perceptual(p: &Profile) -> Xyz {
     if !p.intent_supported(Intent::Perceptual, true) {
         return Xyz::default();
     }
-    roundtrip(p, Intent::Perceptual, Lab::default()).map_or(Xyz::default(), clip_black)
+    Roundtrip::new(p, Intent::Perceptual)
+        .map_or(Xyz::default(), |r| clip_black(r.eval(Lab::default())))
 }
 
 /// `cmsDetectBlackPoint`.
@@ -573,6 +590,9 @@ pub(crate) fn detect_destination_black_point(p: &Profile, intent: Intent) -> Xyz
     } else {
         Lab::default()
     };
+    let Ok(roundtrip) = Roundtrip::new(p, intent) else {
+        return Xyz::default();
+    };
     let mut in_ramp = [0.0; 256];
     let mut out_ramp = [0.0; 256];
     for l in 0..256 {
@@ -581,9 +601,7 @@ pub(crate) fn detect_destination_black_point(p: &Profile, intent: Intent) -> Xyz
             initial.a.clamp(-50.0, 50.0),
             initial.b.clamp(-50.0, 50.0),
         );
-        let Ok(d) = roundtrip(p, intent, lab) else {
-            return Xyz::default();
-        };
+        let d = roundtrip.eval(lab);
         in_ramp[l] = lab.l;
         out_ramp[l] = d.l;
     }
