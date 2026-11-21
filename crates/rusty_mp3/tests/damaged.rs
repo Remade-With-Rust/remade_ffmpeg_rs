@@ -82,10 +82,18 @@ fn a_bit_flipped_silent_layer1_file_stays_silent() {
             }
             Err(e) => assert!(matches!(e, rusty_mp3::Error::InvalidData(_)), "{e}"),
         }
-        // The infallible entry point mutes what the fallible one refuses.
-        let muted = Layer12Decode::new().decode_frame(&h, frame);
+        // The infallible entry point mutes what the fallible one refuses, once
+        // the decoder has decoded a frame of the stream (here the first)...
+        let mut warm = Layer12Decode::new();
+        let first = Layer12Header::parse([hurt[0], hurt[1], hurt[2], hurt[3]]).unwrap();
+        assert_eq!(warm.decode_frame(&first, &hurt[..48]).len(), 384);
+        let muted = warm.decode_frame(&h, frame);
         assert_eq!(muted.len(), 384 * h.channels());
         assert_eq!(peak(&muted), 0.0, "frame {k}");
+        // ...and gives nothing for it before any frame has decoded: bytes of
+        // which nothing decodes are not passed off as a silent stream.
+        let cold = Layer12Decode::new().decode_frame(&h, frame);
+        assert_eq!(cold.is_empty(), k != 0, "frame {k}");
     }
     assert_eq!(kept, [0], "the undamaged frame, and only it");
     // The stream decoder agrees: the one good frame, as minimp3 gives it.
@@ -129,7 +137,7 @@ fn the_forbidden_layer1_allocation_is_refused() {
     frame.resize(672, 0);
     frame[4] = 0xF0; // subband 0: allocation 15
     assert!(Layer12Decode::new().try_decode_frame(&h, &frame).is_err());
-    assert_eq!(peak(&Layer12Decode::new().decode_frame(&h, &frame)), 0.0);
+    assert!(Layer12Decode::new().decode_frame(&h, &frame).is_empty());
     frame[4] = 0xE0; // allocation 14 is a frame like any other
     let pcm = Layer12Decode::new().try_decode_frame(&h, &frame).unwrap();
     assert!(peak(&pcm) > 0.5 && peak(&pcm) <= MAX_OUTPUT_AMPLITUDE);
@@ -148,7 +156,7 @@ fn a_frame_beyond_the_output_bound_is_dropped() {
     frame[4..20].fill(0xCC); // 32 allocations of 12; scalefactors and samples 0
     let mut dec = Layer12Decode::new();
     assert!(dec.try_decode_frame(&h, &frame).is_err());
-    assert_eq!(peak(&dec.decode_frame(&h, &frame)), 0.0);
+    assert!(dec.decode_frame(&h, &frame).is_empty());
     // In a stream: ten of them between silent frames leave only the silence.
     let quiet = {
         let mut f = header.to_vec();
@@ -262,4 +270,165 @@ fn a_layer3_stream_cut_ahead_of_its_reservoir_starts_silent() {
     );
     assert!(peak(&pcm) <= 1.5 * clean_peak, "peak {}", peak(&pcm));
     assert!(pcm.iter().all(|s| s.abs() <= MAX_OUTPUT_AMPLITUDE));
+}
+
+/// Bytes with no sync pattern in them, for embedding frames in.
+fn junk(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i * 7 % 251) as u8 & 0x7F).collect()
+}
+
+/// A Layer III header is not a frame until its stream vouches for it, by the
+/// rule `rff-format-mp3` frames by (minimp3's): up to ten headers of its
+/// stream after it, each where the frame before ends, unless the data ends
+/// first. `Mp3Decoder` fed raw bytes used to take a Layer III header on sight,
+/// so a picture decoded as 5,760 frames of noise peaking at 7.45.
+#[test]
+fn a_layer3_frame_needs_its_stream_to_vouch_for_it() {
+    let (mp3, starts) = layer3_stream();
+    let k = starts[20];
+    let three = &mp3[k..starts[23]];
+    let one = &mp3[k..starts[21]];
+    let cat = |parts: &[&[u8]]| parts.concat();
+
+    // One real frame inside other bytes: nothing.
+    assert_eq!(decode(&cat(&[&junk(1000), one, &junk(1000)])).0, 0);
+    // Three back to back, then more junk: fewer than ten headers vouch for
+    // the first, and junk -- neither a tag nor zero padding -- ends the walk.
+    assert_eq!(decode(&cat(&[&junk(1000), three, &junk(1000)])).0, 0);
+    // The same three ending the data, or followed by a tag, are a stream.
+    assert_eq!(decode(&cat(&[&junk(1000), three])).0, 3);
+    assert_eq!(decode(&cat(&[&junk(1000), three, b"TAG", &junk(125)])).0, 3);
+    // One frame holding all the data is a stream too (as it demuxes).
+    let mut lone = Mp3Decoder::new();
+    lone.push(one);
+    lone.flush();
+    let mut n = 0;
+    while lone.next_frame().is_ok() {
+        n += 1;
+    }
+    assert!(n <= 1, "{n}");
+
+    // A damaged header mid-stream: the frame before it is dropped with it, as
+    // the demuxer drops both, and the stream resumes where ten headers vouch.
+    let (clean_frames, _) = decode(&mp3);
+    let mut hurt = mp3.clone();
+    hurt[starts[30] + 2] ^= 0x0C; // sample-rate index: another stream
+    let (frames, _) = decode(&hurt);
+    assert_eq!(frames, clean_frames - 2);
+    // Fed a few bytes at a time, it decides the same.
+    let mut dec = Mp3Decoder::new();
+    let mut streamed = 0;
+    for chunk in hurt.chunks(97) {
+        dec.push(chunk);
+        while dec.next_frame().is_ok() {
+            streamed += 1;
+        }
+    }
+    dec.flush();
+    while dec.next_frame().is_ok() {
+        streamed += 1;
+    }
+    assert_eq!(streamed, frames);
+    // And the two-thread decoder agrees sample for sample.
+    let serial = decode(&hurt).1;
+    let piped: Vec<f32> = rusty_mp3::decode_pipelined(&hurt)
+        .into_iter()
+        .flat_map(|f| f.samples)
+        .collect();
+    assert_eq!(serial, piped);
+}
+
+/// A frame whose every granule reaches back into main data that is not there
+/// decodes to silence (FFmpeg's `mp_decode_layer3`), and at the start of a
+/// real stream cut ahead of its reservoir that silence keeps its place. But
+/// bytes that give nothing else are not audio: such frames are held until a
+/// frame of real audio comes, and dropped if none does.
+#[test]
+fn frames_of_nothing_but_missing_main_data_are_not_a_stream() {
+    let (mp3, starts) = layer3_stream();
+    let k = starts[20];
+    let header = FrameHeader::parse([mp3[k], mp3[k + 1], mp3[k + 2], mp3[k + 3]]).unwrap();
+    assert!(!header.crc_protected);
+    // main_data_begin is the first 9 bits of the side information: 511, more
+    // than any granule of this frame holds, and nothing before it.
+    let mut frame = mp3[k..starts[21]].to_vec();
+    frame[4] = 0xFF;
+    frame[5] |= 0x80;
+    let mut dec = Mp3Decode::new();
+    let side = &frame[4..4 + header.side_info_len()];
+    let pcm = dec
+        .decode_frame(&header, side, &frame[4 + header.side_info_len()..])
+        .unwrap();
+    assert!(dec.last_frame_concealed());
+    assert!(pcm.iter().all(|&s| s == 0.0));
+
+    // Alone: nothing (it used to be one frame of silence).
+    assert_eq!(decode(&frame).0, 0);
+    assert!(rusty_mp3::decode_pipelined(&frame).is_empty());
+    // Ahead of the intact stream: kept, in its place.
+    let mut joined = frame.clone();
+    joined.extend_from_slice(&mp3[starts[21]..]);
+    let (frames, pcm) = decode(&joined);
+    assert_eq!(frames, starts.len() - 20);
+    assert!(pcm[..1152].iter().all(|&s| s == 0.0));
+    let piped: Vec<f32> = rusty_mp3::decode_pipelined(&joined)
+        .into_iter()
+        .flat_map(|f| f.samples)
+        .collect();
+    assert_eq!(pcm, piped);
+}
+
+/// Two Layer III streams joined end to end at different sample rates (a
+/// concatenation): every frame of both decodes, as before. The frame ending
+/// the first stream is followed by a header of another stream, which vouches
+/// for itself.
+#[test]
+fn two_layer3_streams_joined_at_different_rates_both_decode() {
+    let encode = |rate: u32| {
+        let pcm: Vec<f32> = (0..rate).map(|i| 0.3 * (i as f32 * 0.05).sin()).collect();
+        let mut enc = Mp3Encoder::new(Mp3EncoderConfig {
+            bitrate_kbps: 128,
+            vbr_quality: None,
+        });
+        enc.push_pcm_f32(&pcm, 1, rate).unwrap();
+        enc.finish();
+        let mut mp3 = Vec::new();
+        while let Ok(p) = enc.next_packet() {
+            mp3.extend_from_slice(&p);
+        }
+        mp3
+    };
+    let (a, b) = (encode(44100), encode(48000));
+    let (fa, pa) = decode(&a);
+    let (fb, pb) = decode(&b);
+    let joined = [a, b].concat();
+    let (fj, pj) = decode(&joined);
+    assert_eq!(fj, fa + fb);
+    assert_eq!(pj.len(), pa.len() + pb.len());
+    let piped: Vec<f32> = rusty_mp3::decode_pipelined(&joined)
+        .into_iter()
+        .flat_map(|f| f.samples)
+        .collect();
+    assert_eq!(pj, piped);
+}
+
+/// A free-format Layer I/II frame is no longer than the frame at the layer's
+/// highest table bitrate (Layer II at 44.1 kHz: 384 kbps, 1,253 bytes). ISO/IEC
+/// 11172-3 does not require more of a decoder; the rows of an uncompressed
+/// picture confirmed themselves as 706 kbps free-format Layer II and decoded
+/// to noise peaking at 7.45.
+#[test]
+fn free_format_frames_beyond_the_top_bitrate_are_not_frames() {
+    let stream = |size: usize| {
+        let mut file = Vec::new();
+        for _ in 0..12 {
+            file.extend_from_slice(&[0xFF, 0xFD, 0x00, 0x04]);
+            file.resize(file.len() + size - 4, 0);
+        }
+        file
+    };
+    let h = Layer12Header::parse([0xFF, 0xFD, 0x00, 0x04]).unwrap();
+    assert_eq!(h.max_free_format_size(), 1253);
+    assert_eq!(decode(&stream(1253)).0, 12);
+    assert_eq!(decode(&stream(1300)).0, 0);
 }

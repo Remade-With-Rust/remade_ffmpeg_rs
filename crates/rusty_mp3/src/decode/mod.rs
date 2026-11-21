@@ -322,6 +322,9 @@ pub struct Mp3Decode {
     reservoir: reservoir::Reservoir,
     /// The transform half (IMDCT overlap + synthesis FIFO).
     transform: TransformState,
+    /// Every granule of the last frame decoded was silence standing in for
+    /// main data that is not there (see [`Self::last_frame_concealed`]).
+    last_concealed: bool,
 }
 
 impl Mp3Decode {
@@ -363,8 +366,10 @@ impl Mp3Decode {
         let Self {
             reservoir,
             transform,
+            last_concealed,
         } = self;
-        entropy(
+        *last_concealed = false;
+        *last_concealed = entropy(
             reservoir,
             header,
             side_info_bytes,
@@ -376,6 +381,7 @@ impl Mp3Decode {
         // so it goes too; the reservoir is the entropy stage's and stays.
         if !crate::within_output_bound(&pcm) {
             *transform = TransformState::default();
+            *last_concealed = false;
             return Err(Error::invalid(
                 "mp3 frame: decodes beyond MAX_OUTPUT_AMPLITUDE",
             ));
@@ -401,7 +407,8 @@ impl Mp3Decode {
         // The pipelined decoder hands granules to another thread, so it needs
         // them OWNED; this is the one place they are collected.
         let mut out = Vec::with_capacity(header.version.granules());
-        entropy(
+        self.last_concealed = false;
+        self.last_concealed = entropy(
             &mut self.reservoir,
             header,
             side_info_bytes,
@@ -415,19 +422,36 @@ impl Mp3Decode {
         )?;
         Ok(out)
     }
+
+    /// Whether every granule of the frame the last successful
+    /// [`decode_frame`](Self::decode_frame) (or
+    /// [`decode_frame_entropy`](Self::decode_frame_entropy)) returned is
+    /// silence standing in for main data that is not there: the frame reaches
+    /// back into a bit reservoir the decoder never saw (the stream was cut
+    /// ahead of it, or frames before it were lost), so none of its audio could
+    /// be decoded. `false` after a refused frame.
+    ///
+    /// Such frames keep their place at the start of a real stream (FFmpeg
+    /// gives the same silence), but a "stream" of nothing else is not audio:
+    /// [`crate::Mp3Decoder`] holds them back until a frame of real audio comes.
+    #[must_use]
+    pub fn last_frame_concealed(&self) -> bool {
+        self.last_concealed
+    }
 }
 
 /// The entropy stage over one frame, handing each finished granule to
 /// `granule` by reference (its side info and its spectrum, ready for the
 /// transform stage). A free function over the reservoir alone, so a caller can
 /// lend it the reservoir while holding the transform state for `granule`.
+/// `Ok(true)`: every granule was silence standing in for missing main data.
 fn entropy(
     reservoir: &mut reservoir::Reservoir,
     header: &FrameHeader,
     side_info_bytes: &[u8],
     frame_main_data: &[u8],
     mut granule: impl FnMut(&[GranuleSideInfo; 2], &mut GranuleSpectrum),
-) -> Result<()> {
+) -> Result<bool> {
     let channels = header.channel_mode.channels();
     let granules = header.version.granules();
 
@@ -463,6 +487,7 @@ fn entropy(
     //    were lost. Zero in an intact stream.
     let mut missing_bits =
         usize::from(si.main_data_begin).saturating_sub(reservoir.available()) * 8;
+    let mut concealed = 0usize;
     let main = reservoir.assemble(si.main_data_begin, frame_main_data);
 
     let mut bit_pos = 0usize;
@@ -489,6 +514,7 @@ fn entropy(
                 missing_bits -= len;
             }
             granule(&si.granules[gr], &mut spectrum);
+            concealed += 1;
             continue;
         }
         for ch in 0..channels {
@@ -545,7 +571,7 @@ fn entropy(
 
         granule(&si.granules[gr], &mut spectrum);
     }
-    Ok(())
+    Ok(concealed == granules)
 }
 
 /// Entry used by the public decoder once the bricks are in place.
