@@ -364,15 +364,15 @@ fn read_palette_pixels(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()>
     let bits = usize::from(h.bit_count);
     let row_bytes = (bits * h.width).div_ceil(32) * 4;
     let stride = h.width * ch;
+    // A padded palette (alpha 0xff): a pixel is one 4-byte store. With three
+    // channels the fourth byte lands on the next pixel's first byte, which
+    // that pixel overwrites; a row's last pixel takes a 3-byte store.
+    let mut pal4 = [[0u8, 0, 0, 0xff]; 256];
+    for (q, p) in pal4.iter_mut().zip(pal.iter()) {
+        q[..3].copy_from_slice(p);
+    }
     if bits == 8 {
-        // One index per byte: each pixel is one 4-byte store from a padded
-        // palette (alpha 0xff). With three channels the fourth byte lands on
-        // the next pixel's first byte, which that pixel overwrites; the
-        // row's last pixel takes a 3-byte store.
-        let mut pal4 = [[0u8, 0, 0, 0xff]; 256];
-        for (q, p) in pal4.iter_mut().zip(pal.iter()) {
-            q[..3].copy_from_slice(p);
-        }
+        // One index per byte.
         for i in 0..h.height {
             let src = &r.bytes(row_bytes)?[..h.width];
             let y = row(h, i);
@@ -392,23 +392,61 @@ fn read_palette_pixels(r: &mut Reader, h: &Header, buf: &mut [u8]) -> Result<()>
         }
         return Ok(());
     }
-    if ch == 4 {
-        buf.chunks_exact_mut(4).for_each(|p| p[3] = 0xff);
+    // 1, 2 or 4 bits, each with its own copy of the loop so the pixels per
+    // byte and every shift are constants.
+    match (bits, ch) {
+        (1, 3) => low_bit_rows::<1, 3>(r, h, buf, &pal4),
+        (1, _) => low_bit_rows::<1, 4>(r, h, buf, &pal4),
+        (2, 3) => low_bit_rows::<2, 3>(r, h, buf, &pal4),
+        (2, _) => low_bit_rows::<2, 4>(r, h, buf, &pal4),
+        (_, 3) => low_bit_rows::<4, 3>(r, h, buf, &pal4),
+        _ => low_bit_rows::<4, 4>(r, h, buf, &pal4),
     }
-    // 1, 2 or 4 bits: `per_byte` is a power of two, so the byte and the bit
-    // position come from a shift and a mask, not a division per pixel.
-    let per_byte = 8 / bits;
-    let lg = per_byte.trailing_zeros();
-    let mask = ((1u16 << bits) - 1) as u8;
+}
+
+/// Rows of 1, 2 or 4-bit palette indices (`BITS`, most significant first) as
+/// `CH`-byte pixels (3, or 4 with alpha 0xff).
+///
+/// The row is walked a source byte at a time: its 8, 4 or 2 pixels go to
+/// fixed offsets of one exactly-sized output cell, so there is no byte
+/// index, shift computation or bounds check per pixel (25 Ir a pixel
+/// before), and the alpha of an RGBA row comes with the padded palette
+/// entry instead of from a pass over the whole image first. The pixels of a
+/// row's last, partly used byte are written one at a time. Out of line, one
+/// function per depth and layout, so the 8-bit loop in the caller keeps its
+/// registers.
+#[inline(never)]
+fn low_bit_rows<const BITS: usize, const CH: usize>(
+    r: &mut Reader,
+    h: &Header,
+    buf: &mut [u8],
+    pal4: &[[u8; 4]; 256],
+) -> Result<()> {
+    let per_byte = 8 / BITS;
+    let mask = (1u8 << BITS) - 1;
+    let row_bytes = (BITS * h.width).div_ceil(32) * 4;
+    let stride = h.width * CH;
     for i in 0..h.height {
         let src = r.bytes(row_bytes)?;
         let y = row(h, i);
         let dst = &mut buf[y * stride..(y + 1) * stride];
-        for (x, px) in dst.chunks_exact_mut(ch).enumerate() {
-            let byte = src[x >> lg];
-            let shift = 8 - bits * ((x & (per_byte - 1)) + 1);
-            let idx = (byte >> shift) & mask;
-            px[..3].copy_from_slice(&pal[idx as usize]);
+        let mut cells = dst.chunks_exact_mut(per_byte * CH);
+        for (cell, &b) in cells.by_ref().zip(src) {
+            for k in 0..per_byte {
+                let e = &pal4[usize::from((b >> (8 - BITS * (k + 1))) & mask)];
+                if CH == 4 || k + 1 < per_byte {
+                    cell[k * CH..k * CH + 4].copy_from_slice(e);
+                } else {
+                    cell[k * CH..k * CH + 3].copy_from_slice(&e[..3]);
+                }
+            }
+        }
+        let tail = cells.into_remainder();
+        if let Some(&b) = src.get(h.width / per_byte).filter(|_| !tail.is_empty()) {
+            for (k, px) in tail.chunks_exact_mut(CH).enumerate() {
+                let e = &pal4[usize::from((b >> (8 - BITS * (k + 1))) & mask)];
+                px.copy_from_slice(&e[..CH]);
+            }
         }
     }
     Ok(())
