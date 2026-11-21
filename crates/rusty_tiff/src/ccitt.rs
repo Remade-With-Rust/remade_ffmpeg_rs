@@ -900,15 +900,32 @@ fn put_run(o: &mut BitOut, white: bool, mut run: u32) {
     o.put(c, l);
 }
 
+/// The changing elements of a packed row: every pixel whose colour differs
+/// from the pixel on its left (white before the row).
+///
+/// A byte at a time: with black as 1, `b ^ (b >> 1 | left << 7)` has a bit
+/// set exactly where a pixel differs from its left neighbour, so a byte
+/// without a change (most of a scanned page) costs one test, and each change
+/// is one `leading_zeros`. Testing one pixel per loop turn was 17 Ir a pixel.
 fn row_changes(row: &[u8], width: u32, black_is_1: bool, out: &mut Vec<u32>) {
     out.clear();
-    let mut prev_black = false;
-    for x in 0..width as usize {
-        let bit = (row[x >> 3] >> (7 - (x & 7))) & 1 == 1;
-        let black = bit == black_is_1;
-        if black != prev_black {
-            out.push(x as u32);
-            prev_black = black;
+    let width = width as usize;
+    let flip = if black_is_1 { 0 } else { 0xFF };
+    // The pixel left of the current byte (1 = black).
+    let mut left = 0u8;
+    for (i, &raw) in row[..width.div_ceil(8)].iter().enumerate() {
+        let b = raw ^ flip;
+        let mut t = b ^ ((b >> 1) | (left << 7));
+        left = b & 1;
+        let base = i * 8;
+        if base + 8 > width {
+            // The last byte: its pad bits are not pixels.
+            t &= !(0xFFu8 >> (width - base));
+        }
+        while t != 0 {
+            let k = t.leading_zeros();
+            out.push(base as u32 + k);
+            t &= !(0x80u8 >> k);
         }
     }
 }
@@ -1054,6 +1071,45 @@ pub fn encode(pixels: &[u8], opts: &Options) -> Result<Vec<u8>, CcittError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_changes_matches_per_pixel_scan() {
+        let mut seed = 21u32;
+        let mut out = Vec::new();
+        for width in [1u32, 2, 7, 8, 9, 15, 16, 17, 63, 64, 65, 200] {
+            for density in [0u32, 1, 8, 128, 255] {
+                for black_is_1 in [false, true] {
+                    let row: Vec<u8> = (0..width.div_ceil(8))
+                        .map(|_| {
+                            // Runs of equal bits of varying length (and
+                            // plain noise at the top density).
+                            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                            let r = (seed >> 16) as u8;
+                            if u32::from(r) < density {
+                                (seed >> 8) as u8
+                            } else if r & 1 == 0 {
+                                0
+                            } else {
+                                0xFF
+                            }
+                        })
+                        .collect();
+                    let mut want = Vec::new();
+                    let mut prev_black = false;
+                    for x in 0..width as usize {
+                        let bit = (row[x >> 3] >> (7 - (x & 7))) & 1 == 1;
+                        let black = bit == black_is_1;
+                        if black != prev_black {
+                            want.push(x as u32);
+                            prev_black = black;
+                        }
+                    }
+                    row_changes(&row, width, black_is_1, &mut out);
+                    assert_eq!(out, want, "width {width} density {density} {black_is_1}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn paint_span_matches_per_bit() {
