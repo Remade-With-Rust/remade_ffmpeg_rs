@@ -4,6 +4,12 @@ All notable changes to this crate. Security-relevant changes are listed first in
 each release, under **Security**. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.21](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-aac-v1.1.20...rff-codec-aac-v1.1.21) - 2026-11-21
+
+### Other
+
+- updated the following local packages: rff-core, rff-codec, rusty_aac
+
 ## [1.1.20](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-aac-v1.1.19...rff-codec-aac-v1.1.20) - 2026-11-21
 
 ### Fixed

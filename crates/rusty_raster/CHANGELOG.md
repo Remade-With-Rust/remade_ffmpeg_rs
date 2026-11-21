@@ -1,0 +1,32 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_raster-v0.1.0...rusty_raster-v0.1.1) - 2026-11-21
+
+### Other
+
+- *(rusty_raster)* highp gradient stop search, one stop at a time
+- Revert "WIP perf(rusty_raster): gather index computed in floats"
+- WIP perf(rusty_raster): gather index computed in floats (Linux gate owed, clock flat)
+- *(rusty_raster)* lowp tail load reads only a short tail's pixels
+- *(rusty_raster)* highp gradient, one lookup for a group between two stops
+- *(rusty_raster)* lowp gradient, one lookup for a group between two stops
+- *(rusty_raster)* lowp gradient colours to lanes without a scalar cast
+- *(rusty_raster)* lowp store_8888 as one packed word per pixel
+- *(rusty_raster)* lowp load_8888 from one word per pixel
+- *(rusty_raster)* highp load_8888 from one word per pixel
+- *(rusty_raster)* sprite blit for draw_pixmap without a transform
+- *(rusty_raster)* gather index without a float-to-int conversion
+- *(rusty_raster)* f32x8::floor without the i32 round trip
+- *(rusty_raster)* veinbench layer and mask workloads
+- *(rusty_raster)* highp store without a float-to-int conversion
+- *(rusty_raster)* branch-free f32x8::round for the lowp tiling stages
+- *(rusty_raster)* round lanes without libm rintf
+- *(rusty_raster)* truncate lanes without libm truncf
+- *(rusty_raster)* veinbench, a deterministic instruction-count instrument
