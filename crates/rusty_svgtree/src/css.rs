@@ -6,6 +6,8 @@
 //! are stably sorted by specificity, as `simplecss` (what usvg uses) does.
 //! At-rules are skipped. Anything unparseable is skipped, never fatal.
 
+use std::collections::HashMap;
+
 /// One `name: value` declaration.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Declaration {
@@ -100,6 +102,131 @@ impl Selector {
         }
         match_from(&self.ancestors, e, budget)
     }
+}
+
+/// What an element must carry for a rule's subject compound to match: a
+/// necessary condition, read off the selector once.
+enum SubjectKey<'a> {
+    Id(&'a str),
+    Class(&'a str),
+    Tag(&'a str),
+    Any,
+}
+
+impl Selector {
+    fn subject_key(&self) -> SubjectKey<'_> {
+        let mut class = None;
+        for sub in &self.subject.subs {
+            match sub {
+                SubSel::Attr(name, AttrOp::Eq(v)) if name == "id" => return SubjectKey::Id(v),
+                SubSel::Attr(name, AttrOp::Includes(v)) if name == "class" => {
+                    class = class.or(Some(v.as_str()));
+                }
+                _ => {}
+            }
+        }
+        match (class, &self.subject.tag) {
+            (Some(c), _) => SubjectKey::Class(c),
+            (None, Some(t)) => SubjectKey::Tag(t),
+            (None, None) => SubjectKey::Any,
+        }
+    }
+}
+
+/// The rules of a sheet, bucketed by what their subject compound requires of
+/// an element (an `id`, else a class, else a tag name), so an element is
+/// tested only against the rules it could match.
+#[derive(Default)]
+pub(crate) struct RuleIndex {
+    by_id: HashMap<Box<str>, Vec<u32>>,
+    by_class: HashMap<Box<str>, Vec<u32>>,
+    by_tag: HashMap<Box<str>, Vec<u32>>,
+    any: Vec<u32>,
+}
+
+impl RuleIndex {
+    pub(crate) fn new(rules: &[Rule]) -> Self {
+        let mut ix = RuleIndex::default();
+        for (i, rule) in rules.iter().enumerate() {
+            // A sheet cannot hold 2^32 rules; one past that would simply
+            // never be a candidate.
+            let Ok(i) = u32::try_from(i) else { break };
+            match rule.selector.subject_key() {
+                SubjectKey::Id(v) => ix.by_id.entry(v.into()).or_default().push(i),
+                SubjectKey::Class(v) => ix.by_class.entry(v.into()).or_default().push(i),
+                SubjectKey::Tag(v) => ix.by_tag.entry(v.into()).or_default().push(i),
+                SubjectKey::Any => ix.any.push(i),
+            }
+        }
+        ix
+    }
+
+    /// The rules an element with this tag name, `id` and `class` could
+    /// match, ascending (rule order).
+    fn candidates(&self, tag: &str, id: Option<&str>, class: Option<&str>, out: &mut Vec<u32>) {
+        out.clear();
+        let mut lists = 0;
+        let mut add = |list: Option<&Vec<u32>>| {
+            if let Some(list) = list {
+                out.extend_from_slice(list);
+                lists += 1;
+            }
+        };
+        add(Some(&self.any).filter(|l| !l.is_empty()));
+        add(self.by_tag.get(tag));
+        if let Some(id) = id {
+            add(self.by_id.get(id));
+        }
+        if let Some(class) = class {
+            for word in class.split_ascii_whitespace() {
+                add(self.by_class.get(word));
+            }
+        }
+        if lists > 1 {
+            // Each list is ascending; a repeated class word repeats one.
+            out.sort_unstable();
+            out.dedup();
+        }
+    }
+}
+
+/// Calls `hit` for each rule that matches `e`, in rule order, testing only
+/// the rules `index` (built from `rules`) cannot rule out.
+///
+/// A rule ruled out here would have failed its subject compound, which
+/// spends one unit of `budget` while any is left. The same units are charged
+/// here, so matching runs out at exactly the rule where testing every rule
+/// in turn runs out.
+pub(crate) fn for_each_match<E: Element>(
+    rules: &[Rule],
+    index: &RuleIndex,
+    scratch: &mut Vec<u32>,
+    e: E,
+    budget: &mut u64,
+    mut hit: impl FnMut(&Rule),
+) {
+    index.candidates(
+        e.local_name(),
+        e.attribute("id"),
+        e.attribute("class"),
+        scratch,
+    );
+    let mut next = 0usize;
+    for &i in scratch.iter() {
+        let i = i as usize;
+        *budget = budget.saturating_sub((i - next) as u64);
+        if *budget == 0 {
+            return;
+        }
+        next = i + 1;
+        let Some(rule) = rules.get(i) else {
+            return;
+        };
+        if rule.selector.matches(e, budget) {
+            hit(rule);
+        }
+    }
+    *budget = budget.saturating_sub(rules.len().saturating_sub(next) as u64);
 }
 
 fn match_from<E: Element>(rest: &[(Combinator, Compound)], e: E, budget: &mut u64) -> bool {
@@ -597,5 +724,144 @@ mod tests {
         // Type selectors sort before class selectors.
         assert!(rules[0].selector.subject.tag.is_some());
         assert!(rules[0].declarations[0].important);
+    }
+
+    /// A node of a small test tree.
+    struct TreeNode {
+        name: &'static str,
+        id: Option<&'static str>,
+        class: Option<&'static str>,
+        parent: Option<usize>,
+        prev: Option<usize>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct T<'a> {
+        nodes: &'a [TreeNode],
+        i: usize,
+    }
+
+    impl Element for T<'_> {
+        fn local_name(&self) -> &str {
+            self.nodes[self.i].name
+        }
+        fn attribute(&self, name: &str) -> Option<&str> {
+            match name {
+                "id" => self.nodes[self.i].id,
+                "class" => self.nodes[self.i].class,
+                _ => None,
+            }
+        }
+        fn parent_element(&self) -> Option<Self> {
+            self.nodes[self.i].parent.map(|i| T {
+                nodes: self.nodes,
+                i,
+            })
+        }
+        fn prev_sibling_element(&self) -> Option<Self> {
+            self.nodes[self.i].prev.map(|i| T {
+                nodes: self.nodes,
+                i,
+            })
+        }
+    }
+
+    /// Indexed matching against testing every rule in turn: the same rules
+    /// match and the same budget is left, for every starting budget
+    /// (including ones that run out part-way through the sheet).
+    #[test]
+    fn index_matches_like_a_full_scan() {
+        let mut x = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let names = ["g", "rect", "path", "a"];
+        let ids = [None, None, Some("i1"), Some("i2"), Some("")];
+        let classes = [
+            None,
+            Some("x"),
+            Some("y"),
+            Some("x y"),
+            Some("y  x x"),
+            Some("z"),
+            Some(""),
+        ];
+        let compounds = [
+            "*",
+            "g",
+            "rect",
+            "path",
+            ".x",
+            ".y",
+            ".x.y",
+            "#i1",
+            "#i2",
+            "rect.x",
+            "g#i1",
+            "[class~=x]",
+            "[class~=\"\"]",
+            "[id=i2]",
+            "[id]",
+            "[class=x]",
+            ":first-child",
+            "path:first-child",
+            ":hover",
+            ".q",
+        ];
+        for round in 0..300 {
+            let mut nodes: Vec<TreeNode> = Vec::new();
+            let mut last_child: Vec<Option<usize>> = Vec::new();
+            for i in 0..12usize {
+                let parent = (i > 0).then(|| (next() % i as u64) as usize);
+                let prev = parent.and_then(|p| last_child[p]);
+                if let Some(p) = parent {
+                    last_child[p] = Some(i);
+                }
+                last_child.push(None);
+                nodes.push(TreeNode {
+                    name: names[(next() % names.len() as u64) as usize],
+                    id: ids[(next() % ids.len() as u64) as usize],
+                    class: classes[(next() % classes.len() as u64) as usize],
+                    parent,
+                    prev,
+                });
+            }
+            let mut text = String::new();
+            for _ in 0..(1 + next() % 14) {
+                for part in 0..(1 + next() % 3) {
+                    if part > 0 {
+                        text.push_str([" ", " > ", " + "][(next() % 3) as usize]);
+                    }
+                    text.push_str(compounds[(next() % compounds.len() as u64) as usize]);
+                }
+                text.push_str(" { fill: red } ");
+            }
+            let mut rules = Vec::new();
+            parse_sheet(&text, &mut rules);
+            let index = RuleIndex::new(&rules);
+            let mut scratch = Vec::new();
+            for i in 0..nodes.len() {
+                let e = T { nodes: &nodes, i };
+                for start in [0u64, 1, 2, 3, 4, 5, 7, 9, 12, 16, 25, 40, 1000] {
+                    let mut want_budget = start;
+                    let want: Vec<usize> = (0..rules.len())
+                        .filter(|&r| rules[r].selector.matches(e, &mut want_budget))
+                        .collect();
+                    let mut got_budget = start;
+                    let mut got = Vec::new();
+                    for_each_match(&rules, &index, &mut scratch, e, &mut got_budget, |rule| {
+                        got.push(rules.iter().position(|r| std::ptr::eq(r, rule)).unwrap());
+                    });
+                    assert_eq!(
+                        (got, got_budget),
+                        (want, want_budget),
+                        "round {round} node {i} budget {start}: {text}"
+                    );
+                }
+            }
+        }
     }
 }

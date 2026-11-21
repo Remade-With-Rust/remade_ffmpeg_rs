@@ -592,6 +592,10 @@ struct Builder<'a> {
     /// Work budget for style-sheet matching (compound tests).
     css_budget: u64,
     sheet: Vec<css::Rule>,
+    /// `sheet` bucketed by what each rule's subject needs (built once the
+    /// whole sheet is parsed), and the scratch list of rules to test.
+    rule_index: css::RuleIndex,
+    rule_scratch: Vec<u32>,
     id_map: HashMap<&'a str, XId>,
     doc: Document,
     limits: Limits,
@@ -619,6 +623,8 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document, Error> {
         use_check_steps: 0,
         css_budget: CSS_MATCH_BUDGET,
         sheet: Vec::new(),
+        rule_index: css::RuleIndex::default(),
+        rule_scratch: Vec::new(),
         id_map: HashMap::new(),
         doc: Document {
             nodes: vec![NodeData {
@@ -674,6 +680,7 @@ pub(crate) fn build(xml: &XmlDoc, limits: Limits) -> Result<Document, Error> {
     if root.svg_tag() != Some(EId::Svg) {
         return Err(Error::NotAnSvg);
     }
+    b.rule_index = css::RuleIndex::new(&b.sheet);
     b.parse_node(root_el, None, NodeId(0), false, 0)?;
 
     let mut links = HashMap::new();
@@ -831,10 +838,15 @@ impl Builder<'_> {
 
         // 2. Style sheet rules (sorted by specificity), then 3. `style`.
         let mut decls: Vec<css::Declaration> = Vec::new();
-        for rule in &self.sheet {
-            if rule.selector.matches(x, &mut self.css_budget) {
-                decls.extend(rule.declarations.iter().cloned());
-            }
+        if !self.sheet.is_empty() {
+            css::for_each_match(
+                &self.sheet,
+                &self.rule_index,
+                &mut self.rule_scratch,
+                x,
+                &mut self.css_budget,
+                |rule| decls.extend(rule.declarations.iter().cloned()),
+            );
         }
         if let Some(style) = x.attr("style") {
             decls.extend(css::parse_declarations(style));
