@@ -238,6 +238,105 @@ impl InvCurve {
     }
 }
 
+/// A two-segment parametric curve of function 3 (sRGB, Rec. 709, Display
+/// P3) for evaluation in line: what [`Curve::eval`] computes for it, with
+/// the tests that depend on the curve alone already made and its
+/// parameters at hand.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FwdSeg {
+    g: f64,
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+}
+
+impl FwdSeg {
+    /// `None` for every other curve, and for an exponent of exactly 1
+    /// (which [`Curve::eval`] does not send through `pow`).
+    pub(crate) fn new(curve: &Curve) -> Option<Self> {
+        match curve {
+            Curve::Parametric {
+                function: 3,
+                params: [g, a, b, c, d, ..],
+            } if *g != 1.0 => Some(Self {
+                g: *g,
+                a: *a,
+                b: *b,
+                c: *c,
+                d: *d,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Exactly [`Curve::eval`] of the curve this was made from.
+    #[inline(always)]
+    pub(crate) fn eval(&self, x: f64) -> f64 {
+        let x = clamp01(x);
+        let y = if x >= self.d {
+            let base = self.a * x + self.b;
+            if base > 0.0 {
+                base.powf(self.g)
+            } else {
+                0.0
+            }
+        } else {
+            self.c * x
+        };
+        clamp01(y)
+    }
+}
+
+/// The inverse of a function-3 curve for evaluation in line: what
+/// [`InvCurve::eval`] computes for it, with the tests that depend on the
+/// curve alone already made and the reciprocal exponent worked out once
+/// (the same division, so the same value) instead of per evaluation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InvSeg {
+    ig: f64,
+    a: f64,
+    b: f64,
+    c: f64,
+    brk: f64,
+}
+
+impl InvSeg {
+    /// `None` unless the curve is of function 3 and takes none of the
+    /// degenerate arms of the inverse (a zero exponent, gain or slope) and
+    /// its reciprocal exponent is not exactly 1.
+    pub(crate) fn new(inv: &InvCurve) -> Option<Self> {
+        let [g, a, b, c, ..] = inv.params;
+        if inv.function != 3 || g.abs() < 1e-9 || a.abs() < 1e-9 || c.abs() < 1e-9 {
+            return None;
+        }
+        let ig = 1.0 / g;
+        if ig == 1.0 {
+            return None;
+        }
+        Some(Self {
+            ig,
+            a,
+            b,
+            c,
+            brk: inv.brk,
+        })
+    }
+
+    /// Exactly [`InvCurve::eval`] of the curve this was made from.
+    #[inline(always)]
+    pub(crate) fn eval(&self, y: f64) -> f64 {
+        let y = clamp01(y);
+        let x = if y >= self.brk {
+            let p = if y > 0.0 { y.powf(self.ig) } else { 0.0 };
+            (p - self.b) / self.a
+        } else {
+            y / self.c
+        };
+        clamp01(x)
+    }
+}
+
 pub(crate) fn clamp01(v: f64) -> f64 {
     if v >= 0.0 {
         v.min(1.0)
@@ -481,6 +580,69 @@ mod tests {
         }
         assert!(InvCurve::new(&Curve::gamma(2.2)).is_none());
         assert!(InvCurve::new(&Curve::Table(vec![0, 65535])).is_none());
+    }
+
+    #[test]
+    fn in_line_segments_match_the_curve_bit_for_bit() {
+        let mut vs: Vec<f64> = (0..=40_000).map(|i| f64::from(i) / 40_000.0).collect();
+        vs.extend([
+            -1.0,
+            -0.0,
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1e-300,
+            0.04045,
+            0.081,
+        ]);
+        let regular = [
+            Curve::srgb(),
+            Curve::rec709(),
+            Curve::parametric(3, &[1.8, 0.9, 0.1, 0.25, 0.3]).unwrap(),
+            // A negative offset: the power segment starts below zero.
+            Curve::parametric(3, &[2.2, 1.2, -0.2, 0.1, 0.1]).unwrap(),
+        ];
+        for c in &regular {
+            let (f, inv) = (FwdSeg::new(c).unwrap(), InvCurve::new(c).unwrap());
+            let i = InvSeg::new(&inv).unwrap();
+            let Curve::Parametric { function, params } = c else {
+                unreachable!()
+            };
+            let brk = inverse_break(*function, params);
+            let d = params[4];
+            let near = [brk, d].map(|v| {
+                [
+                    v,
+                    f64::from_bits(v.to_bits().wrapping_sub(1)),
+                    f64::from_bits(v.to_bits() + 1),
+                ]
+            });
+            for &v in vs.iter().chain(near.iter().flatten()) {
+                assert_eq!(f.eval(v).to_bits(), c.eval(v).to_bits(), "forward {v}");
+                assert_eq!(i.eval(v).to_bits(), inv.eval(v).to_bits(), "inverse {v}");
+                assert_eq!(
+                    i.eval(v).to_bits(),
+                    c.eval_inverse(v).to_bits(),
+                    "inverse {v}"
+                );
+            }
+        }
+        // Curves that take other arms keep the general evaluation.
+        let unit = Curve::parametric(3, &[1.0, 1.0, 0.0, 1.0, 0.5]).unwrap();
+        assert!(FwdSeg::new(&unit).is_none());
+        assert!(InvSeg::new(&InvCurve::new(&unit).unwrap()).is_none());
+        for degenerate in [
+            Curve::parametric(3, &[2.4, 0.0, 0.1, 0.5, 0.2]).unwrap(),
+            Curve::parametric(3, &[2.4, 1.0, 0.1, 0.0, 0.2]).unwrap(),
+            Curve::parametric(3, &[0.0, 1.0, 0.0, 0.5, 0.3]).unwrap(),
+        ] {
+            assert!(InvSeg::new(&InvCurve::new(&degenerate).unwrap()).is_none());
+        }
+        let f4 = Curve::parametric(4, &[2.2, 0.9, 0.1, 0.08, 0.05, 0.02, 0.01]).unwrap();
+        assert!(FwdSeg::new(&f4).is_none());
+        assert!(InvSeg::new(&InvCurve::new(&f4).unwrap()).is_none());
+        assert!(FwdSeg::new(&Curve::gamma(2.2)).is_none());
     }
 
     #[test]

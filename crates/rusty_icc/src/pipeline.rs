@@ -7,7 +7,7 @@
 use crate::color::{
     lab_to_xyz, mat_inv, mat_mul, mat_vec, xyz_to_lab, Lab, Mat3, Xyz, D50, IDENTITY,
 };
-use crate::curve::{clamp01, Curve, InvCurve};
+use crate::curve::{clamp01, Curve, FwdSeg, InvCurve, InvSeg};
 use crate::error::{Error, Result};
 use crate::lut::{make_trilinear, Lut, Stage};
 use crate::profile::{ColorSpace, Profile, ProfileClass};
@@ -740,7 +740,48 @@ enum Inverse<'a> {
     Plain(&'a [Curve; 3]),
 }
 
+/// A [`ShaperChain`] whose six curves are all regular two-segment ones (an
+/// sRGB-shaped profile into another, the common display case), each as
+/// constants for evaluation in line: no call and no per-curve test per
+/// value.
+pub(crate) struct SegChain {
+    curves: [FwdSeg; 3],
+    affines: [(Mat3, [f64; 3]); 3],
+    maps: usize,
+    inverse: [InvSeg; 3],
+}
+
+impl SegChain {
+    /// One colour: exactly what [`Chain::eval`] gives for it.
+    #[inline]
+    pub(crate) fn eval(&self, x: [f64; 3]) -> [f64; 3] {
+        let [c0, c1, c2] = &self.curves;
+        let mut v = [c0.eval(x[0]), c1.eval(x[1]), c2.eval(x[2])];
+        for (m, off) in &self.affines[..self.maps] {
+            let r = mat_vec(m, v);
+            v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
+        }
+        let v = v.map(clamp01);
+        let [i0, i1, i2] = &self.inverse;
+        [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])]
+    }
+}
+
 impl ShaperChain<'_> {
+    /// The chain as a [`SegChain`], when every curve allows it.
+    pub(crate) fn segments(&self) -> Option<SegChain> {
+        let Inverse::Break([i0, i1, i2]) = self.inverse else {
+            return None;
+        };
+        let [c0, c1, c2] = self.curves;
+        Some(SegChain {
+            curves: [FwdSeg::new(c0)?, FwdSeg::new(c1)?, FwdSeg::new(c2)?],
+            affines: self.affines,
+            maps: self.maps,
+            inverse: [InvSeg::new(i0)?, InvSeg::new(i1)?, InvSeg::new(i2)?],
+        })
+    }
+
     /// One colour: exactly what [`Chain::eval`] gives for it.
     #[inline]
     pub(crate) fn eval(&self, x: [f64; 3]) -> [f64; 3] {
@@ -1065,6 +1106,13 @@ mod tests {
         ] {
             let chain = build_chain(&[a, b], &[intent, intent], &[bpc, bpc]).unwrap();
             let fused = chain.as_shaper().expect("matrix-shaper pair");
+            // sRGB and Display P3 both ways are all two-segment curves.
+            let segments = fused.segments();
+            assert_eq!(
+                segments.is_some(),
+                std::ptr::eq(a, &srgb) && std::ptr::eq(b, &p3)
+                    || std::ptr::eq(a, &p3) && std::ptr::eq(b, &srgb)
+            );
             for &r in &xs {
                 for &g in &xs {
                     for &bl in &[0.0, 0.3, 1.0, f64::NAN, -1.0, 2.0] {
@@ -1078,6 +1126,13 @@ mod tests {
                             [want[0], want[1], want[2]].map(f64::to_bits),
                             "{r} {g} {bl}"
                         );
+                        if let Some(seg) = &segments {
+                            assert_eq!(
+                                seg.eval([r, g, bl]).map(f64::to_bits),
+                                got.map(f64::to_bits),
+                                "segments {r} {g} {bl}"
+                            );
+                        }
                     }
                 }
             }

@@ -557,6 +557,25 @@ fn run_shaper_f32(
     (sc, dc): (usize, usize),
     (src_alpha, dst_alpha): (bool, bool),
 ) {
+    // sRGB-shaped curves at both ends: their own loop, with the curve
+    // arithmetic in line. Each loop in its own frame, so the general one
+    // keeps the code it had (one shared frame cost every other pair of
+    // curves 3 Ir per pixel, the general loop after the test in its frame
+    // 1 Ir per pixel).
+    if !run_segments_f32(f, src, dst, (sc, dc), (src_alpha, dst_alpha)) {
+        run_curves_f32(f, src, dst, (sc, dc), (src_alpha, dst_alpha));
+    }
+}
+
+/// [`run_shaper_f32`] for any curves.
+#[inline(never)]
+fn run_curves_f32(
+    f: &ShaperChain<'_>,
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) {
     for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
         let out = f.eval([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]);
         dp[0] = out[0] as f32;
@@ -566,6 +585,31 @@ fn run_shaper_f32(
             dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
         }
     }
+}
+
+/// [`run_shaper_f32`] when the chain is a [`SegChain`] (`true`); `false`,
+/// with nothing done, otherwise.
+#[inline(never)]
+fn run_segments_f32(
+    f: &ShaperChain<'_>,
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) -> bool {
+    let Some(seg) = f.segments() else {
+        return false;
+    };
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let out = seg.eval([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]);
+        dp[0] = out[0] as f32;
+        dp[1] = out[1] as f32;
+        dp[2] = out[2] as f32;
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
+    true
 }
 
 /// `f32` pixels through the exact pipeline. Not generic, so the loop is
