@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_tiff-v0.1.3...rusty_tiff-v0.1.4) - 2026-11-21
+
+### Other
+
+- Merge pull request #178 from Remade-With-Rust/perf/loss-rows-tiff
+- *(rusty_tiff)* 16-bit tiles through the band path, rows appended as u16 slices
+- *(rusty_tiff)* PackBits decode: 17..32-byte literals as one 32-byte append
+- *(rusty_tiff)* PackBits decode: short literals as one 16-byte append
+- *(rusty_tiff)* 8-bit horizontal predictor undo: four pixels a step
+- *(rusty_tiff)* LZW decode: one fixed-size table of entries
+- *(rusty_tiff)* LZW decode: string lengths without a saturating add
+- *(rusty_tiff)* LZW decode: bit order as a type parameter
+- *(rusty_tiff)* clippy --all-targets clean (manual_is_multiple_of in tests)
+
 ## [0.1.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_tiff-v0.1.2...rusty_tiff-v0.1.3) - 2026-11-21
 
 ### Other

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_svgtree-v0.1.1...rusty_svgtree-v0.1.2) - 2026-11-21
+
+### Other
+
+- Merge pull request #177 from Remade-With-Rust/perf/loss-rows-svgtree
+- *(rusty_svgtree)* draw a one-path clip straight into a coverage mask (vein: clip paths drawn through an RGBA scratch layer, win 2)
+- *(rusty_svgtree)* apply a pixel-aligned rectangle clip without a mask (vein: clip paths drawn through an RGBA scratch layer, win 1)
+- *(rusty_svgtree)* build a huge path at about its final size (vein: copies of a huge path while it is parsed, win 2)
+- *(rusty_svgtree)* borrow element ids in the id map
+- *(rusty_svgtree)* keep the stroke-bounding-box stroker across paths
+- *(rusty_svgtree)* build shapes in one reused builder, copied out at their size
+- *(rusty_svgtree)* borrow attribute values from the XML DOM (vein: copies of a huge path while it is parsed, win 1)
+- *(rusty_svgtree)* svgveins `both` mode, the whole per-document cost
+
 ## [0.1.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_svgtree-v0.1.0...rusty_svgtree-v0.1.1) - 2026-11-21
 
 ### Other

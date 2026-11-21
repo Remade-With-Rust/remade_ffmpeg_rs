@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_raster-v0.1.1...rusty_raster-v0.1.2) - 2026-11-21
+
+### Other
+
+- Merge pull request #176 from Remade-With-Rust/perf/loss-rows-raster
+- *(rusty_raster)* highp gradient groups that straddle one stop skip the lookup
+- *(rusty_raster)* highp tail stores pack all eight pixels as vectors
+- lossbench, the downstream gradient scenes
+- *(rusty_raster)* highp gradient and premultiply as one stage
+- *(rusty_raster)* highp gradient finds a shared interval with one scan
+- *(rusty_raster)* filtered taps gather without a bounds branch per pixel
+- *(rusty_raster)* bilinear/bicubic taps share their column and row coordinates
+- *(rusty_raster)* mask coverage runs written without the pipeline
+- lossbench, the trailing rows against tiny-skia
+
 ## [0.1.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_raster-v0.1.0...rusty_raster-v0.1.1) - 2026-11-21
 
 ### Other
