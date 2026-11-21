@@ -1029,7 +1029,26 @@ fn gradient(p: &mut Pipeline) {
         ]);
         idx = idx + n;
     }
-    gradient_lookup(ctx, &idx, p.r, &mut p.r, &mut p.g, &mut p.b, &mut p.a);
+
+    // As in the lowp stage: when all 8 pixels sit between the same two stops
+    // (the usual case), one factor and one bias serve every lane and the
+    // 64 bounds-checked scalar loads of `gradient_lookup` are not needed.
+    // The arithmetic per lane is the same `t * factor + bias`.
+    let first = idx.0[0];
+    let mut uniform = true;
+    for i in 1..STAGE_WIDTH {
+        uniform &= idx.0[i] == first;
+    }
+    match (uniform, ctx.factors.get(first as usize), ctx.biases.get(first as usize)) {
+        (true, Some(factor), Some(bias)) => {
+            let t = p.r;
+            p.r = mad(t, f32x8::splat(factor.r), f32x8::splat(bias.r));
+            p.g = mad(t, f32x8::splat(factor.g), f32x8::splat(bias.g));
+            p.b = mad(t, f32x8::splat(factor.b), f32x8::splat(bias.b));
+            p.a = mad(t, f32x8::splat(factor.a), f32x8::splat(bias.a));
+        }
+        _ => gradient_lookup(ctx, &idx, p.r, &mut p.r, &mut p.g, &mut p.b, &mut p.a),
+    }
 
     p.next_stage();
 }
