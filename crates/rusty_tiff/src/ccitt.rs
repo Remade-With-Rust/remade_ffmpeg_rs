@@ -858,15 +858,17 @@ struct BitOut {
 }
 
 impl BitOut {
+    /// Append the low `len` bits of `code` (at most 24), most significant
+    /// first. `n` (under 8) bits wait in the low end of `acc`; the code is
+    /// shifted in whole and every complete byte leaves, so a code costs a
+    /// shift and one or two pushes, where it was a loop turn per bit.
+    #[inline]
     fn put(&mut self, code: u32, len: u32) {
-        for i in (0..len).rev() {
-            self.acc = (self.acc << 1) | ((code >> i) & 1);
-            self.n += 1;
-            if self.n == 8 {
-                self.out.push(self.acc as u8);
-                self.acc = 0;
-                self.n = 0;
-            }
+        self.acc = (self.acc << len) | (code & ((1 << len) - 1));
+        self.n += len;
+        while self.n >= 8 {
+            self.n -= 8;
+            self.out.push((self.acc >> self.n) as u8);
         }
     }
     fn align(&mut self) {
@@ -1109,6 +1111,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bit_writer_matches_per_bit_writes() {
+        let mut seed = 9u32;
+        let mut o = BitOut {
+            out: Vec::new(),
+            acc: 0,
+            n: 0,
+        };
+        // The definition: one bit at a time into a byte.
+        let (mut want, mut acc, mut n) = (Vec::new(), 0u8, 0u32);
+        for i in 0..5000u32 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let len = (seed >> 16) % 14;
+            let code = seed >> 8;
+            o.put(code, len);
+            for k in (0..len).rev() {
+                acc = (acc << 1) | ((code >> k) & 1) as u8;
+                n += 1;
+                if n == 8 {
+                    want.push(acc);
+                    (acc, n) = (0, 0);
+                }
+            }
+            if i % 97 == 0 {
+                o.align();
+                if n > 0 {
+                    want.push(acc << (8 - n));
+                    (acc, n) = (0, 0);
+                }
+            }
+        }
+        o.align();
+        if n > 0 {
+            want.push(acc << (8 - n));
+        }
+        assert_eq!(o.out, want);
     }
 
     #[test]
