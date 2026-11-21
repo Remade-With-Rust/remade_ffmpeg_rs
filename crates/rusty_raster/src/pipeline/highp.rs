@@ -334,6 +334,39 @@ fn gather_ix(pixmap: PixmapRef, mut x: f32x8, mut y: f32x8) -> u32x8 {
     (iy * i32x8::splat(pixmap.width() as i32) + ix).to_u32x8_bitcast()
 }
 
+/// As in `gather_ix`: the clamps of `clamp_trunc` leave every lane in
+/// `[0, limit)` (`max` turns NaN into 0), so for any pixmap short of 2^23
+/// pixels on a side the truncation needs no float-to-int conversion.
+#[inline(always)]
+fn trunc_without_conversion(pixmap: PixmapRef) -> bool {
+    const NO_CONVERSION: u32 = 1 << 23;
+    pixmap.width() <= NO_CONVERSION && pixmap.height() <= NO_CONVERSION
+}
+
+/// A sample coordinate clamped to `[0, limit)` and truncated to an integer.
+#[inline(always)]
+fn clamp_trunc(v: f32x8, limit: u32, fast: bool) -> i32x8 {
+    // Exclusive -> inclusive.
+    let v = v.max(f32x8::default()).min(f32x8::splat(ulp_sub(limit as f32)));
+    if fast {
+        v.trunc_int_below_2p23()
+    } else {
+        v.trunc_int()
+    }
+}
+
+/// The column part of a gather index: `x` clamped and truncated.
+#[inline(always)]
+fn gather_column(pixmap: PixmapRef, x: f32x8, fast: bool) -> i32x8 {
+    clamp_trunc(x, pixmap.width(), fast)
+}
+
+/// The row part of a gather index: `y` clamped, truncated, times the width.
+#[inline(always)]
+fn gather_row(pixmap: PixmapRef, y: f32x8, fast: bool) -> i32x8 {
+    clamp_trunc(y, pixmap.height(), fast) * i32x8::splat(pixmap.width() as i32)
+}
+
 #[inline(always)]
 fn ulp_sub(v: f32) -> f32 {
     // Somewhat similar to v - f32::EPSILON
@@ -843,7 +876,7 @@ fn bilinear(p: &mut Pipeline) {
     let wx = [one - fx, fx];
     let wy = [one - fy, fy];
 
-    sampler_2x2(p.pixmap_src, &p.ctx.sampler, x, y, &wx, &wy, &mut p.r, &mut p.g, &mut p.b, &mut p.a);
+    sampler(p.pixmap_src, &p.ctx.sampler, x, y, -0.5, &wx, &wy, &mut p.r, &mut p.g, &mut p.b, &mut p.a);
 
     p.next_stage();
 }
@@ -857,7 +890,7 @@ fn bicubic(p: &mut Pipeline) {
     let wx = [bicubic_far(one - fx), bicubic_near(one - fx), bicubic_near(fx), bicubic_far(fx)];
     let wy = [bicubic_far(one - fy), bicubic_near(one - fy), bicubic_near(fy), bicubic_far(fy)];
 
-    sampler_4x4(p.pixmap_src, &p.ctx.sampler, x, y, &wx, &wy, &mut p.r, &mut p.g, &mut p.b, &mut p.a);
+    sampler(p.pixmap_src, &p.ctx.sampler, x, y, -1.5, &wx, &wy, &mut p.r, &mut p.g, &mut p.b, &mut p.a);
 
     p.next_stage();
 }
@@ -890,92 +923,64 @@ fn bicubic_far(t: f32x8) -> f32x8 {
     (t * t) * mad(f32x8::splat(7.0/18.0), t, f32x8::splat(-6.0/18.0))
 }
 
+/// The `N x N` taps of a bilinear (`N = 2`, `start = -0.5`) or bicubic
+/// (`N = 4`, `start = -1.5`) sample, weighted and summed.
+///
+/// The taps sit on `N` columns and `N` rows, so each column's `x` is tiled,
+/// clamped and truncated once, and each row's `y` once (times the width),
+/// instead of both at every one of the `N * N` taps; a tap's index is then one
+/// addition. The coordinates are the same floats as before (the same
+/// `start + 1 + 1 ...` sums), and the index is the same `row * width + column`
+/// that `gather_ix` computes (which the nearest `gather` stage keeps: split
+/// into these helpers it measured +1.4% Ir there).
 #[inline(always)]
-fn sampler_2x2(
+fn sampler<const N: usize>(
     pixmap: PixmapRef,
     ctx: &super::SamplerCtx,
-    cx: f32x8, cy: f32x8,
-    wx: &[f32x8; 2], wy: &[f32x8; 2],
+    cx: f32x8, cy: f32x8, start: f32,
+    wx: &[f32x8; N], wy: &[f32x8; N],
     r: &mut f32x8, g: &mut f32x8, b: &mut f32x8, a: &mut f32x8,
 ) {
+    let fast = trunc_without_conversion(pixmap);
+    let one = f32x8::splat(1.0);
+
+    let mut columns = [i32x8::default(); N];
+    let mut x = cx + f32x8::splat(start);
+    for column in &mut columns {
+        let tiled = tile(x, ctx.spread_mode, pixmap.width() as f32, ctx.inv_width);
+        *column = gather_column(pixmap, tiled, fast);
+        x += one;
+    }
+
+    let mut rows = [i32x8::default(); N];
+    let mut y = cy + f32x8::splat(start);
+    for row in &mut rows {
+        let tiled = tile(y, ctx.spread_mode, pixmap.height() as f32, ctx.inv_height);
+        *row = gather_row(pixmap, tiled, fast);
+        y += one;
+    }
+
     *r = f32x8::default();
     *g = f32x8::default();
     *b = f32x8::default();
     *a = f32x8::default();
 
-    let one = f32x8::splat(1.0);
-    let start = -0.5;
-    let mut y = cy + f32x8::splat(start);
-    for j in 0..2 {
-        let mut x = cx + f32x8::splat(start);
-        for i in 0..2 {
+    for j in 0..N {
+        for i in 0..N {
+            let ix = (rows[j] + columns[i]).to_u32x8_bitcast();
             let mut rr = f32x8::default();
             let mut gg = f32x8::default();
             let mut bb = f32x8::default();
             let mut aa = f32x8::default();
-            sample(pixmap, ctx, x,y, &mut rr, &mut gg, &mut bb, &mut aa);
+            load_8888(&pixmap.gather(ix), &mut rr, &mut gg, &mut bb, &mut aa);
 
             let w = wx[i] * wy[j];
             *r = mad(w, rr, *r);
             *g = mad(w, gg, *g);
             *b = mad(w, bb, *b);
             *a = mad(w, aa, *a);
-
-            x += one;
         }
-
-        y += one;
     }
-}
-
-#[inline(always)]
-fn sampler_4x4(
-    pixmap: PixmapRef,
-    ctx: &super::SamplerCtx,
-    cx: f32x8, cy: f32x8,
-    wx: &[f32x8; 4], wy: &[f32x8; 4],
-    r: &mut f32x8, g: &mut f32x8, b: &mut f32x8, a: &mut f32x8,
-) {
-    *r = f32x8::default();
-    *g = f32x8::default();
-    *b = f32x8::default();
-    *a = f32x8::default();
-
-    let one = f32x8::splat(1.0);
-    let start = -1.5;
-    let mut y = cy + f32x8::splat(start);
-    for j in 0..4 {
-        let mut x = cx + f32x8::splat(start);
-        for i in 0..4 {
-            let mut rr = f32x8::default();
-            let mut gg = f32x8::default();
-            let mut bb = f32x8::default();
-            let mut aa = f32x8::default();
-            sample(pixmap, ctx, x,y, &mut rr, &mut gg, &mut bb, &mut aa);
-
-            let w = wx[i] * wy[j];
-            *r = mad(w, rr, *r);
-            *g = mad(w, gg, *g);
-            *b = mad(w, bb, *b);
-            *a = mad(w, aa, *a);
-
-            x += one;
-        }
-
-        y += one;
-    }
-}
-
-#[inline(always)]
-fn sample(
-    pixmap: PixmapRef, ctx: &super::SamplerCtx, mut x: f32x8, mut y: f32x8,
-    r: &mut f32x8, g: &mut f32x8, b: &mut f32x8, a: &mut f32x8,
-) {
-    x = tile(x, ctx.spread_mode, pixmap.width() as f32, ctx.inv_width);
-    y = tile(y, ctx.spread_mode, pixmap.height() as f32, ctx.inv_height);
-
-    let ix = gather_ix(pixmap, x, y);
-    load_8888(&pixmap.gather(ix), r, g, b, a);
 }
 
 #[inline(always)]
