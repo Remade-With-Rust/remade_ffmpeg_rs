@@ -218,6 +218,108 @@ Integer and float outputs are bit-identical to 0.1.0.
   call sites): fogu8 -18.7% but fog16 +11.8% and build +1.5%. The body was
   split per call site instead.
 
+### Second performance pass (39 workloads, 15 bricks)
+
+**Instrument.**
+- `examples/icc_ir.rs` now has 39 workloads (256x256 pixels each, or one
+  construction, parse or encode): 8-bit, 16-bit and f32 transforms through
+  every engine, 64-pixel calls (`small*`), and `Transform::new` on its own
+  (`build*`, `first16` = construction plus the first 16-bit call).
+- Counted under callgrind in WSL with only the `hot_*` functions collected;
+  every line prints the pixel or byte count and an FNV of the output, and
+  all 39 anchors were unchanged by every brick.
+- Every brick passed `cargo fmt --check`, clippy with `-D warnings` and the
+  full suite with FOGRA39 (unit, malformed, the moxcms oracle, profiles,
+  doctest) before it was committed.
+- Exactness ladder: a re-run of the same binary gives the same count, except
+  `parse`/`parsev4` (HashMap seed, about +-150) and `buildbpc` (allocator
+  addresses); a rebuild moves untouched workloads by 0 to ~50. A WSL restart
+  can shift a workload by a fixed amount (smallp3f32 +12,288 for the same
+  binary), so every comparison below is between arms counted in one session.
+
+Every integer and float output is bit-identical to 0.1.1. No approximation
+was used: no baked curve tables with an error bound, no fixed point, no
+replacement for libm `pow` or `cbrt`.
+
+| workload | Ir before | Ir after | change | Ir/pixel |
+|---|---:|---:|---:|---:|
+| sRGB -> P3, u8 (`p3u8`) | 10,223,776 | 9,502,859 | -7.1% | 145 |
+| sRGB -> FOGRA39, u8 (`fogu8`) | 28,859,525 | 11,219,622 | -61.1% | 171 |
+| FOGRA39 -> sRGB, u16 (`fog16`) | 56,188,182 | 21,180,350 | -62.3% | 323 |
+| CGATS CMYK -> sRGB, u8 (`cgatsu8`) | 46,129,832 | 15,933,154 | -65.5% | 243 |
+| Lab -> sRGB, u16 (`lab16in`) | 33,445,435 | 14,936,758 | -55.3% | 228 |
+| grey -> sRGB, u8 (`grayu8`) | 9,626,541 | 593,104 | -93.8% | 9 |
+| sRGB -> P3, f32 (`p3f32`) | 122,844,078 | 65,293,965 | -46.8% | 996 |
+| ProPhoto -> sRGB, f32 (`prof32`) | 96,208,547 | 45,484,173 | -52.7% | 694 |
+| sRGB -> Lab, f32 (`labf32`) | 100,058,095 | 88,065,099 | -12.0% | 1344 |
+| Lab -> sRGB, f32 (`labinf32`) | 91,382,641 | 50,164,125 | -45.1% | 765 |
+| sRGB -> FOGRA39, f32 (`fogf32`) | 200,066,031 | 151,110,706 | -24.5% | 2306 |
+| proofing sRGB/FOGRA39/sRGB, f32 (`prooff32`) | 375,167,167 | 267,037,105 | -28.8% | 4075 |
+| `Transform::new` sRGB -> P3 (`buildp3`) | 16,685,199 | 3,400,428 | -79.6% | - |
+| `Transform::new` FOGRA39 -> sRGB (`build4`) | 236,660,196 | 134,553,592 | -43.1% | - |
+| `Transform::new` with black-point compensation (`buildbpc`) | 208,558,566 | 65,187,054 | -68.7% | - |
+| new + first 16-bit call (`first16`) | 55,936,485 | 15,507,473 | -72.3% | - |
+
+No workload of the 39 is above its count before the pass (`parse` and
+`parsev4` moved by seed noise only). Wall, before against after (`chrt -f`
+and `taskset`, 16 ABBA pairs, in-process minimum; after/before floor, all
+16/16 faster unless noted): p3u8 0.890 (14/16), fogu8 0.601, fog16 0.562,
+labf32 0.774, labinf32 0.661, p3f32 0.616, fogf32 0.803, toprof32 0.805,
+lab16in 0.752, grayu8 0.029, build4 0.621, first16 0.276.
+
+**Bricks**, five veins, three each, one commit per brick with its Ir table
+and wall check in the commit body:
+
+| vein | brick | main effect (Ir) |
+|---|---|---|
+| curve evaluation | the inverse of sRGB-shaped curves keeps its break value instead of a `pow` per value | p3f32 -23.6%, labinf32 -31.8% |
+| curve evaluation | sampled-curve segment index with one `cvttsd2si` | prof32 -3.3%, build4 -2.3% |
+| curve evaluation | LUT stages of unit-gamma curves are one clamp op | labinf32 -14.5%, buildlab -13.4%, labf32 -8.7% |
+| CLUT interpolation | grid cell with one `cvttsd2si` | lab16in -4.3%, fog16 -3.3% |
+| CLUT interpolation | tetrahedral kernel reads four corners on fixed-width lanes | fogu8 -15.9%, fog16 -11.1% |
+| CLUT interpolation | 3- and 4-input front ends straight into fixed-width kernels (trilinear, tetrahedral, 4-input) | fog16 -39.1%, lab16in -26.5%, build3 -25.7%, fogf32 -21.1% |
+| f32 pipeline | fused loop for matrix/TRC pairs, compiled in the library | p3f32 -21.5%, lin2020f32 -30.2% |
+| f32 pipeline | the general f32 loop compiled in the library, chain evaluated in place | labinf32 -5.9%, labf32 -3.4% |
+| f32 pipeline | sRGB-shaped matrix/TRC pairs evaluate their curves in line | p3f32 -11.4%, smallp3f32 -10.7% |
+| `Transform::new` | black-point search builds its round-trip sides once | buildbpc -46.6% |
+| `Transform::new` | shaper tables built once per distinct curve | first16 -68.1%, buildp3 -63.9% |
+| `Transform::new` | grid builds evaluate device curves once per axis value | buildlab -37.6%, build3 -19.4% |
+| integer paths | device-link grid loops compiled in the library with fixed channel counts | cgatsu8 -59.2%, fogu8 -51.4%, fog16 -25.0% |
+| integer paths | `from_unit` skips the clamp the saturating cast already does | togray16 -8.6%, p3u8 -7.1% |
+| integer paths | grey 8-bit sources read a 256-entry output table filled by the loop itself | grayu8 -93.3% |
+
+**Refuted, with numbers in the commit bodies:**
+- seven-corner tetrahedral lanes with a range test per corner: fogu8 +5 Ir
+  per pixel (21 tests materialised with `setcc` and spills);
+- the unit-gamma op as a `Stage` variant: +0.21..0.25% on 11 workloads;
+- the fused f32 form stored in `Chain` (builds +600..1,375 Ir), or boxed
+  (+33..975 Ir);
+- the 3-input front end with a by-value `tetra` shared with the recursion:
+  fogu8 +6.75%, fog16 +8.4%;
+- all CLUT kernels inlined into `ClutEval::eval` (3.3K instructions):
+  lab16in 30% fewer instructions but 8-13% slower on the clock, in three
+  probes; landed with each kernel out of line;
+- the in-line sRGB curve loop sharing a frame with the general loop: +3 Ir
+  per pixel on the other curve pairs;
+- the 8-bit axis table cached in the engine, three shapes: cgatsu8 +2.36%,
+  +1.95%, and fogu8/fog16 +2.5..3%;
+- the grey table check in `Transform::transform`: +12 Ir per 8-bit
+  matrix-shaper call;
+- `from_unit` without the clamp before the grid loops moved: fog16/lab16in
+  +2 Ir per pixel (it waited, then landed);
+- the inverse of sampled curves through a bucket index: toprof32 -20.5% but
+  +0.04..0.99% on 20 other workloads (a new op arm re-rolls the interpreter).
+  Not landed.
+
+**What exactness leaves on the table.**
+- libm `pow` is ~112 Ir a call through glibc and six calls per pixel on the
+  f32 matrix/TRC path: about 730 of p3f32's 996 Ir per pixel. That path is
+  near its exact ceiling; going further needs an approximate or table-driven
+  `pow`.
+- `cbrt` (XYZ to Lab) is ~100 Ir a call, three per pixel: about 23% of
+  labf32 now.
+- None of this pass needed `unsafe`.
+
 ## Other checks
 
 **Oracle: [`moxcms`](https://crates.io/crates/moxcms) 0.9.1** (dev-dependency
