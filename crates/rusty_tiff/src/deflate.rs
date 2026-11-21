@@ -15,10 +15,12 @@ pub(crate) fn decode(data: &[u8], out: &mut [u8]) -> TiffResult<()> {
 }
 
 /// Inflate exactly `n` bytes onto the end of `out`, straight into its spare
-/// capacity (no zero-fill first). Capacity is reserved for exactly `n`
-/// more, so a decompression bomb costs at most `n` bytes; anything the
-/// inflater writes past `n` (only possible if the allocator handed back
-/// more capacity than asked) is truncated away.
+/// capacity (no zero-fill first: flate2 1.1.11 and later hand zlib-rs the
+/// spare capacity uninitialised; 1.1.9 zero-filled all of it on every call,
+/// which is why the manifest asks for 1.1.11). Capacity is reserved for
+/// exactly `n` more, so a decompression bomb costs at most `n` bytes;
+/// anything the inflater writes past `n` (only possible if the allocator
+/// handed back more capacity than asked) is truncated away.
 ///
 /// `state` is the inflater, kept for all the chunks of an image and reset
 /// for each one: building a new one per chunk allocates and clears its

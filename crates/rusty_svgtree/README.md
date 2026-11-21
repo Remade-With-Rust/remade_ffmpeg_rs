@@ -1,12 +1,12 @@
 # rusty_svgtree
 
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/blob/main/crates/rusty_svgtree/LICENSE)
 [![Remade With Rust](https://img.shields.io/badge/Remade%20With-Rust-000?logo=rust&logoColor=fff)](https://github.com/remade-with-rust)
 
 **A pure-Rust SVG parser and renderer.** `Tree::from_data` parses SVG into a
 simplified render tree (the shape of usvg's: styles resolved, lengths in user
 units, `use` expanded, paint servers in user space); `render` draws it with
-the house [`rusty_raster`](../rusty_raster) rasteriser. XML comes from the
+the house [`rusty_raster`](https://crates.io/crates/rusty_raster) rasteriser. XML comes from the
 house [`rusty_xml`](https://crates.io/crates/rusty_xml) parser, embedded PNG
 and JPEG from `rusty_png` and `rusty_jpeg`. `#![forbid(unsafe_code)]`, no C.
 
@@ -30,7 +30,19 @@ by **[Mata Network](https://www.mata.network/)**.
 | time | 992 ms | **518 ms** | **481 ms** |
 | relative to rusty_svgtree | 1.00x | 1.91x faster | 2.06x faster |
 
-This crate is about half the speed of both, and is not profiled yet. Part of the gap is `rusty_raster`'s scalar lanes, which run 0.70-0.95x of tiny-skia. Over the full 105 files the totals look reversed (resvg spends seconds on filters this crate skips), so that comparison is not reported as a speed result.
+On 0.1.0 this crate was about half the speed of both. Part of the gap was `rusty_raster`'s scalar lanes, which ran 0.70-0.95x of tiny-skia. Over the full 105 files the totals look reversed (resvg spends seconds on filters this crate skips), so that comparison is not reported as a speed result. This table was measured before the speed pass below and has not been re-run.
+
+### Speed against resvg (after 0.1.0)
+
+A 15-commit instruction-count pass on this crate ([PR #170](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/170)), measured on top of the `rusty_raster` speed pass ([PR #166](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/166)). Output is byte-identical to 0.1.0 on 1,255 real SVGs and on all 1,695 files of the resvg v0.45.1 test suite. Ratios are resvg's time divided by this crate's; above 1 means this crate is faster.
+
+| workload | 0.1.0 | now | resvg 0.48.1 | now vs resvg | now vs 0.1.0 |
+|---|---:|---:|---:|---:|---:|
+| **400 UI icons at 48 px** | 23.4 ms | 20.4 ms | 20.6 ms | **0.996 (level)** | 1.150 |
+| 71 illustrations at 512 px | 187 ms | 132 ms | 139 ms | 1.038 | 1.450 |
+| 13 large documents (0.4-1.2 MB) at 512 px | 344 ms | 244 ms | 271 ms | 1.126 | 1.398 |
+
+On 0.1.0 these rows ran at 0.72-0.87x of resvg. Parsing alone (`Tree::from_data`) is now 1.057x / 1.002x / 1.294x of usvg 0.48.1 on the same three sets (0.1.0: 0.855 / 0.741 / 0.750). **Memory is still higher than resvg's on extreme paths:** a path with a million segments peaks at 34 MB, down from 131 MB in 0.1.0, against resvg's 24 MB. Method: an independent run by a downstream team ([PR #170 comment](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/170#issuecomment-7059394686)), PR head `dbe48b7` with `rusty_raster` at `3e747a1`, one process per arm per round pinned to one P-core at High priority, 20 rounds in alternating order, the same allocator in every arm, null arm 1.005.
 
 ## What is verified
 
