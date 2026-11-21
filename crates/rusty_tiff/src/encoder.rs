@@ -582,7 +582,23 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
                             for r in 0..vrows {
                                 let src = &native[(y0 as usize + r) * full_row..][..full_row];
                                 let dst = &mut buf[r * chunk_row..][..chunk_row];
-                                if bits < 8 {
+                                let px_bits = usize::from(spp) * usize::from(bits);
+                                let bit0 = x0 as usize * px_bits;
+                                if bits < 8 && !planar && bit0.is_multiple_of(8) {
+                                    // A strip, or a tile that starts on a byte
+                                    // of the input row: whole bytes are copied
+                                    // and a last partial byte is masked, so the
+                                    // pad bits are written as zero whatever the
+                                    // caller left in them. Moving one bit per
+                                    // loop turn cost 196 Ir per output byte.
+                                    let nbits = vcols * px_bits;
+                                    let (full, rem) = (nbits / 8, nbits % 8);
+                                    let s = &src[bit0 / 8..];
+                                    dst[..full].copy_from_slice(&s[..full]);
+                                    if rem != 0 {
+                                        dst[full] = s[full] & !(0xFFu8 >> rem);
+                                    }
+                                } else if bits < 8 {
                                     let n = if planar {
                                         vcols
                                     } else {
@@ -742,5 +758,75 @@ impl<W: Write + Seek, C: ColorType> ImageEncoder<'_, W, C> {
             e.insert(292, Value::Long(vec![0]));
         }
         self.enc.write_ifd(&e, self.detached)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn encode<C: ColorType<Inner = u8>>(
+        (w, h): (u32, u32),
+        tiles: Option<(u32, u32)>,
+        comp: Compression,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut f = Cursor::new(Vec::new());
+        let mut e = TiffEncoder::new(&mut f).unwrap();
+        let mut img = e.new_image::<C>(w, h).unwrap().with_compression(comp);
+        if let Some((tw, th)) = tiles {
+            img.tiles(tw, th);
+        }
+        img.write_data(data).unwrap();
+        f.into_inner()
+    }
+
+    /// The pad bits of a packed row belong to the caller: the file must not
+    /// depend on them (they are written as zero), for strips, for tiles
+    /// that start on a byte and for tiles that start inside one.
+    #[test]
+    fn sub_byte_pad_bits_are_written_as_zero() {
+        fn case<C: ColorType<Inner = u8>>(w: u32, h: u32) {
+            let bits = u32::from(C::BITS_PER_SAMPLE);
+            let stride = (w * bits).div_ceil(8) as usize;
+            let used = (w * bits) % 8;
+            let mut seed = w * 31 + bits;
+            let mut clean: Vec<u8> = (0..stride * h as usize)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    (seed >> 16) as u8
+                })
+                .collect();
+            let mut dirty = clean.clone();
+            if used != 0 {
+                let pad = 0xFFu8 >> used;
+                for (c, d) in clean
+                    .chunks_exact_mut(stride)
+                    .zip(dirty.chunks_exact_mut(stride))
+                {
+                    c[stride - 1] &= !pad;
+                    d[stride - 1] |= pad;
+                }
+            }
+            for tiles in [None, Some((16, 16)), Some((5, 4)), Some((24, 3))] {
+                for comp in [Compression::None, Compression::PackBits, Compression::Lzw] {
+                    let a = encode::<C>((w, h), tiles, comp, &clean);
+                    let b = encode::<C>((w, h), tiles, comp, &dirty);
+                    assert_eq!(a, b, "{w}x{h} {bits}-bit {tiles:?} {comp:?}");
+                    let mut d = crate::Decoder::new(Cursor::new(&a)).unwrap();
+                    assert_eq!(
+                        d.read_image_raw().unwrap(),
+                        crate::DecodingResult::U8(clean.clone()),
+                        "decode {w}x{h} {bits}-bit {tiles:?} {comp:?}"
+                    );
+                }
+            }
+        }
+        for (w, h) in [(1, 1), (7, 3), (8, 2), (13, 5), (37, 9), (64, 4)] {
+            case::<colortype::Gray1>(w, h);
+            case::<colortype::Gray2>(w, h);
+            case::<colortype::Gray4>(w, h);
+        }
     }
 }
