@@ -475,6 +475,15 @@ impl RasterPipelineBuilder {
                 functions[i] = highp::seed_shader_transform as highp::StageFn;
                 functions.remove(i + 1);
             }
+            // `Gather` then `Scale1Float` (a nearest pattern with an opacity
+            // below one) runs as one stage.
+            if let Some(i) = functions.windows(2).position(|w| {
+                highp::fn_ptr(w[0]) == highp::fn_ptr(highp::gather)
+                    && highp::fn_ptr(w[1]) == highp::fn_ptr(highp::scale_1_float)
+            }) {
+                functions[i] = highp::gather_scale_1_float as highp::StageFn;
+                functions.remove(i + 1);
+            }
             functions.push(highp::just_return as highp::StageFn);
 
             // I wasn't able to reproduce Skia's load_8888_/store_8888_ performance.

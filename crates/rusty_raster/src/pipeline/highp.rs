@@ -338,6 +338,23 @@ pub fn gather(p: &mut Pipeline) {
     p.next_stage();
 }
 
+/// `gather` then `scale_1_float` (a nearest pattern with an opacity below
+/// one), as one stage: `compile` fuses the pair. The same loads and the same
+/// products, without a dispatch between them and without storing the four
+/// channels only to read them back.
+pub fn gather_scale_1_float(p: &mut Pipeline) {
+    let ix = gather_ix(p.pixmap_src, p.r, p.g);
+    let (mut r, mut g, mut b, mut a) = (f32x8::default(), f32x8::default(), f32x8::default(), f32x8::default());
+    load_8888(&p.pixmap_src.gather(ix), &mut r, &mut g, &mut b, &mut a);
+    let c = f32x8::splat(p.ctx.current_coverage);
+    p.r = r * c;
+    p.g = g * c;
+    p.b = b * c;
+    p.a = a * c;
+
+    p.next_stage();
+}
+
 #[inline(always)]
 fn gather_ix(pixmap: PixmapRef, mut x: f32x8, mut y: f32x8) -> u32x8 {
     // Exclusive -> inclusive.
@@ -480,7 +497,7 @@ fn lerp_u8(p: &mut Pipeline) {
     p.next_stage();
 }
 
-fn scale_1_float(p: &mut Pipeline) {
+pub fn scale_1_float(p: &mut Pipeline) {
     let c = f32x8::splat(p.ctx.current_coverage);
     p.r *= c;
     p.g *= c;
