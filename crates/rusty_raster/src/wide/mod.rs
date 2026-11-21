@@ -225,19 +225,17 @@ impl f32x8 {
         self.map(|v| mask_f((v.to_bits() << 1) & 0xFF00_0000 != 0xFF00_0000))
     }
 
+    #[inline]
     pub fn round(self) -> Self {
+        // tiny-skia's portable round: values with |v| >= 2^23 (and NaN) pass
+        // through; everything else rounds half to even and keeps the sign of
+        // `v`, including on a zero result (so |v| < 0.5 is a signed zero).
+        // Written without a branch and without `f32::round_ties_even` (a libm
+        // `rintf` call per lane on baseline x86-64), so the lanes vectorise.
         self.map(|v| {
-            // tiny-skia's portable round: values with |v| >= 2^23 pass
-            // through; |v| < 0.5 becomes a signed zero; the rest round half
-            // to even (the `x + 2^23 - 2^23` trick).
-            let e = (v.to_bits() >> 23) & 0xff;
-            if e >= 0x7f + 23 {
-                v
-            } else if e < 0x7f - 1 {
-                v * 0.0
-            } else {
-                v.round_ties_even()
-            }
+            let sign = v.to_bits() & 0x8000_0000;
+            let r = round_ties_even_magnitude(v);
+            f32::from_bits(r.to_bits() | sign)
         })
     }
 
@@ -692,9 +690,26 @@ mod tests {
         }
     }
 
+    /// `f32x8::round` as first written (tiny-skia's portable `round`).
+    fn round_ref(v: f32) -> f32 {
+        let e = (v.to_bits() >> 23) & 0xff;
+        if e >= 0x7f + 23 {
+            v
+        } else if e < 0x7f - 1 {
+            v * 0.0
+        } else {
+            v.round_ties_even()
+        }
+    }
+
     fn check(v: f32) {
         assert_eq!(cvt_trunc(v), cvt_trunc_ref(v), "cvt_trunc({v:e})");
         assert_eq!(cvt_round(v), cvt_round_ref(v), "cvt_round({v:e})");
+        assert_eq!(
+            f32x8::splat(v).round().0[3].to_bits(),
+            round_ref(v).to_bits(),
+            "round({v:e})"
+        );
     }
 
     /// Every `step`-th bit pattern, plus the neighbourhoods where rounding,
