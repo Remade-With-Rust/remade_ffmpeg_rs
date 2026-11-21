@@ -1415,16 +1415,19 @@ fn decode_tile_bands<R: Read + Seek>(
         let mut out: Vec<u16> = Vec::new();
         out.try_reserve_exact(total_bytes / 2)
             .map_err(|_| TiffError::limits(format!("cannot allocate {total_bytes} bytes")))?;
-        tile_band_rows(s, img, limits, interpret, |r| {
-            // The band rows start on even offsets of a heap buffer, so they
-            // are u16-aligned and append as one copy; the per-sample
-            // conversion is kept for any that are not.
-            match bytemuck::try_cast_slice::<u8, u16>(r) {
-                Ok(v) => out.extend_from_slice(v),
-                Err(_) => out.extend(
-                    r.chunks_exact(2)
-                        .map(|c| u16::from_ne_bytes(c.try_into().unwrap())),
-                ),
+        tile_band_rows(s, img, limits, interpret, |band, g| {
+            // The band is a heap buffer, so it is u16-aligned and its rows
+            // append as u16 slices viewed straight from it; the per-sample
+            // conversion is kept for a band that is not.
+            match bytemuck::try_cast_slice::<u8, u16>(band) {
+                Ok(b) => emit_band(&mut out, b, g.halved()),
+                Err(_) => g.for_each_part(|at, n| {
+                    out.extend(
+                        band[at..at + n]
+                            .chunks_exact(2)
+                            .map(|c| u16::from_ne_bytes(c.try_into().unwrap())),
+                    );
+                }),
             }
         })?;
         return Ok(typed_result(Out::U16(out), info.sample_kind, 16));
@@ -1432,7 +1435,9 @@ fn decode_tile_bands<R: Read + Seek>(
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(total_bytes)
         .map_err(|_| TiffError::limits(format!("cannot allocate {total_bytes} bytes")))?;
-    tile_band_rows(s, img, limits, interpret, |r| out.extend_from_slice(r))?;
+    tile_band_rows(s, img, limits, interpret, |band, g| {
+        emit_band(&mut out, band, g);
+    })?;
     Ok(typed_result(Out::U8(out), info.sample_kind, 8))
 }
 
@@ -1562,14 +1567,75 @@ fn out_bytes(v: &mut [u16]) -> &mut [u8] {
     bytemuck::cast_slice_mut(v)
 }
 
-/// The band loop of [`decode_tile_bands`]: hands each image row's part of
-/// each tile, in image order, to `emit`.
+/// Where a decoded band's image rows are: tile `k`'s kept rows start at
+/// `k * keep`, its row `r` at `r * tile_row` within them, and each image
+/// row takes the first `seg` elements of that row from every tile but the
+/// last, which gives `last` (cut to the image width). In elements of the
+/// band's type.
+#[derive(Clone, Copy)]
+struct BandRows {
+    rows: usize,
+    across: usize,
+    keep: usize,
+    tile_row: usize,
+    seg: usize,
+    last: usize,
+}
+
+impl BandRows {
+    /// The same geometry in 16-bit samples (every field is even then).
+    fn halved(self) -> Self {
+        Self {
+            keep: self.keep / 2,
+            tile_row: self.tile_row / 2,
+            seg: self.seg / 2,
+            last: self.last / 2,
+            ..self
+        }
+    }
+
+    /// Every part (start, length), in image order.
+    fn for_each_part(self, mut f: impl FnMut(usize, usize)) {
+        for r in 0..self.rows {
+            for k in 0..self.across {
+                let n = if k + 1 == self.across {
+                    self.last
+                } else {
+                    self.seg
+                };
+                f(k * self.keep + r * self.tile_row, n);
+            }
+        }
+    }
+}
+
+/// Append a decoded band's image rows to `out`, in image order.
+///
+/// Out of line, so the loop keeps its few values in registers: inlined into
+/// the band loop of `decode_tile_bands` (whose frame holds the whole decode)
+/// each row part cost about 50 instructions besides its copy, most of them
+/// stack loads and stores, which on 48-pixel gray16 tiles (14,700 parts) was
+/// more than the copies themselves.
+#[inline(never)]
+fn emit_band<T: Copy>(out: &mut Vec<T>, band: &[T], g: BandRows) {
+    for r in 0..g.rows {
+        let mut at = r * g.tile_row;
+        for _ in 1..g.across {
+            out.extend_from_slice(&band[at..at + g.seg]);
+            at += g.keep;
+        }
+        out.extend_from_slice(&band[at..at + g.last]);
+    }
+}
+
+/// The band loop of [`decode_tile_bands`]: decodes each band of tiles and
+/// hands it, with where its image rows are, to `emit`.
 fn tile_band_rows<R: Read + Seek>(
     s: &mut Stream<R>,
     img: &Image,
     limits: &mut Budget<'_>,
     interpret: bool,
-    mut emit: impl FnMut(&[u8]),
+    mut emit: impl FnMut(&[u8], BandRows),
 ) -> TiffResult<()> {
     let info = &img.info;
     let (cw, ch) = info.chunk_dimensions;
@@ -1604,13 +1670,17 @@ fn tile_band_rows<R: Read + Seek>(
             )?;
             band.truncate(at + keep);
         }
-        for r in 0..rows {
-            for cx in 0..across {
-                let cols = cw.min(info.width - cx * cw) as usize;
-                let at = cx as usize * keep + r * tile_row;
-                emit(&band[at..at + cols * px]);
-            }
-        }
+        // Every tile but the last lies inside the image width.
+        let last = cw.min(info.width - (across - 1) * cw) as usize * px;
+        let g = BandRows {
+            rows,
+            across: across as usize,
+            keep,
+            tile_row,
+            seg: cw as usize * px,
+            last,
+        };
+        emit(&band, g);
     }
     Ok(())
 }
