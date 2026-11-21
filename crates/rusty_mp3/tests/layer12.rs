@@ -1015,13 +1015,19 @@ fn stream_l2() -> (Vec<u8>, usize) {
 
 /// Garbage between and after frames: the garbage is skipped, every real
 /// frame is decoded, and the decode is bit-identical to the clean stream's.
-/// Garbage BEFORE the first frame: Layer III-shaped false syncs in it decode as
-/// Layer III used to (that path is unchanged), but every real frame after it
-/// still decodes bit-identically.
+/// Garbage BEFORE the first frame: every real frame after it still decodes
+/// bit-identically.
+///
+/// A run of frames found by searching is a stream when ten headers of it
+/// follow its first frame (or the data ends first), as `rff-format-mp3` and
+/// minimp3 frame it: a run of fewer than eleven frames between junk is not.
+/// So each run here is longer than that: 15 frames, junk, 27 frames, junk.
 #[test]
 fn garbage_is_skipped_and_decoding_resumes() {
-    let (clean, size) = stream_l2();
+    let input = signal(48000, 2, 1.0, 0.7, false);
+    let (clean, size) = (encode(&input, Cfg::l2(48000, 256, 0)), 768);
     let frames = clean.len() / size;
+    assert!(frames >= 40, "{frames}");
     let reference = decode(&clean);
     let per_frame = 1152 * 2;
     let mut rnd = xorshift(0x1234_5678);
@@ -1041,7 +1047,7 @@ fn garbage_is_skipped_and_decoding_resumes() {
     let lead = garbage(5000);
     let mid = garbage(3000);
     let tail = garbage(2000);
-    let k = 10;
+    let k = 15;
     let mut file = clean[..k * size].to_vec();
     file.extend_from_slice(&mid);
     file.extend_from_slice(&clean[k * size..]);
@@ -1227,7 +1233,10 @@ fn layer12_garbage_in_layer3_stream_is_not_decoded() {
     file.extend_from_slice(&mp3[at..]);
     let d = decode(&file);
     assert!(d.samples.iter().all(|v| v.is_finite()));
-    assert_eq!(d.frames, clean.frames, "no Layer II frame invented");
+    // No Layer II frame is invented; and the Layer III frame before the stray
+    // bytes is dropped, since no header of its stream follows it (minimp3's
+    // rule, and how `rff-format-mp3` frames the same bytes).
+    assert_eq!(d.frames, clean.frames - 1, "no Layer II frame invented");
 }
 
 // ---------------------------------------------------------------------------

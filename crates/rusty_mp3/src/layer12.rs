@@ -246,6 +246,24 @@ impl Layer12Header {
         (self.size_at(table_min) / 2).max(8)
     }
 
+    /// The largest free-format frame of this stream, in bytes, padding
+    /// included: the frame at the layer's highest table bitrate (Layer I 448,
+    /// Layer II 384 kbps; 256 and 160 at the MPEG-2 rates). ISO/IEC 11172-3
+    /// does not require a decoder to support free-format bitrates above those,
+    /// and FFmpeg supports no free format at all. The rows of an uncompressed
+    /// picture confirmed themselves as 706 kbps free-format Layer II (2,307
+    /// bytes at 44.1 kHz) and decoded to noise peaking at 7.45.
+    #[must_use]
+    pub fn max_free_format_size(&self) -> usize {
+        let top = match (self.version, self.layer) {
+            (MpegVersion::V1, Layer::I) => 448,
+            (MpegVersion::V1, Layer::II) => 384,
+            (_, Layer::I) => 256,
+            (_, Layer::II) => 160,
+        };
+        self.size_at(top)
+    }
+
     /// The bitrate (kbps) of a frame `frame_len` bytes long: the header's for a
     /// table bitrate, derived from the size for free format.
     ///
@@ -512,12 +530,16 @@ type SbSamples = [[[f32; SUBBANDS]; 36]; 2];
 #[derive(Clone)]
 pub struct Layer12Decode {
     fifo: [[f32; 1024]; 2],
+    /// A frame has decoded (passed [`try_decode_frame`](Self::try_decode_frame)):
+    /// this decoder is reading a real stream.
+    decoded: bool,
 }
 
 impl Default for Layer12Decode {
     fn default() -> Self {
         Self {
             fifo: [[0.0; 1024]; 2],
+            decoded: false,
         }
     }
 }
@@ -533,15 +555,23 @@ impl Layer12Decode {
     /// channels()` floats. For a free-format frame the bitrate (which picks the
     /// Layer II table) comes from `frame.len()`.
     ///
-    /// A frame [`try_decode_frame`](Self::try_decode_frame) refuses decodes to
-    /// SILENCE here (and the filterbank memory is cleared), so damaged input is
-    /// never louder than the stream; call that method to tell such a frame
-    /// from real silence and drop it.
+    /// A frame [`try_decode_frame`](Self::try_decode_frame) refuses (and the
+    /// filterbank memory is cleared), so damaged input is never louder than
+    /// the stream:
+    ///
+    /// * once this decoder has decoded a frame, decodes to SILENCE of the
+    ///   frame's length, standing in for the damaged frame of a real stream;
+    /// * before that, decodes to NOTHING (an empty `Vec`): bytes of which no
+    ///   frame has decoded are not a stream, and a "decode" of them that is
+    ///   silence from end to end would pass them off as one.
+    ///
+    /// Call that method to tell a refused frame from real silence and drop it.
     #[must_use]
     pub fn decode_frame(&mut self, header: &Layer12Header, frame: &[u8]) -> Vec<f32> {
         match self.try_decode_frame(header, frame) {
             Ok(pcm) => pcm,
-            Err(_) => vec![0f32; header.samples_per_frame() * header.channels()],
+            Err(_) if self.decoded => vec![0f32; header.samples_per_frame() * header.channels()],
+            Err(_) => Vec::new(),
         }
     }
 
@@ -634,10 +664,13 @@ impl Layer12Decode {
                 "mpa frame: decodes beyond MAX_OUTPUT_AMPLITUDE",
             ));
         }
+        self.decoded = true;
         Ok(pcm)
     }
 
-    /// Clear the filterbank memory (after a refused frame, or a seek).
+    /// Clear the filterbank memory (after a refused frame, or a seek). Whether
+    /// a frame has decoded yet ([`decode_frame`](Self::decode_frame)) is kept:
+    /// it is still the same stream.
     pub fn reset(&mut self) {
         self.fifo = [[0.0; 1024]; 2];
     }

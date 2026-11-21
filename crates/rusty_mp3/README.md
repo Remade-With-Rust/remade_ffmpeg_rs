@@ -182,10 +182,27 @@ A frame that cannot be what an encoder wrote is dropped, not decoded:
   over full scale, the bound the encoder puts on its input). This is the
   backstop for damage that is still valid syntax, and it is not a clamp: like
   FFmpeg's float decoder, rusty_mp3 does not limit real audio to `[-1, 1]`.
+  Real streams do exceed full scale: an ISO 11172-4 conformance vector
+  (`l3-si_huff`) peaks at 7.85, and encodes of hard-clipped masters at 2.5
+  (LAME, 96 kbps) to 5.4 (shine), in FFmpeg's float decoder as in this one.
 
 The frame-level decoders report such a frame as `Error::InvalidData`
 (`Mp3Decode::decode_frame`, `Layer12Decode::try_decode_frame`), and `Mp3Decoder`
-skips it. Intact streams decode bit for bit as before.
+skips it. `Layer12Decode::decode_frame` gives silence for it once a frame of
+the stream has decoded, and nothing before. Intact streams decode bit for bit
+as before.
+
+`Mp3Decoder` frames raw bytes by the rule `rff-format-mp3` applies (minimp3's):
+a header is not a frame until its stream vouches for it. A frame that starts
+where the one before it ended is taken when the header after it continues the
+stream (Layer III; a Layer I/II frame there is taken on sight, and refused for
+what it decodes to). Anywhere else (the first frame, after damage or junk) up
+to ten headers of its stream must follow it, each where the frame before ends,
+unless the data, a tag or zero padding ends first after at least one. A leading
+ID3v2 tag is skipped by its size. Layer III frames that are nothing but silence
+for missing main data are held until the stream gives real audio, and dropped
+if it never does. So bytes that only look like MPEG audio (pictures, movies)
+give nothing, instead of noise or a silent "decode".
 
 ## Security
 

@@ -124,6 +124,59 @@ pub struct Mp3Decoder {
     /// recording in `took` whether a Layer I/II frame was taken. Used by
     /// [`decode_pipelined`] to learn whether the serial path takes any.
     dry_run: Option<bool>,
+    /// A byte of the input has been consumed (a frame taken or a byte
+    /// skipped): the scan is no longer at the start of the data.
+    started: bool,
+    /// Version and sample rate of the last frame taken, while it was a Layer
+    /// III frame: the stream a Layer III header must belong to in order to
+    /// continue it.
+    l3_stream: Option<(header::MpegVersion, u32)>,
+    /// Where the Layer III frames' silence for missing main data waits until
+    /// the stream has given real audio (see [`Concealed`]).
+    concealed: Concealed,
+    /// Bytes of a leading `ID3v2` tag still to be dropped.
+    id3_skip: usize,
+}
+
+/// Layer III frames whose every granule is silence standing in for main data
+/// that is not there ([`Mp3Decode::last_frame_concealed`]) are held back until
+/// the stream gives a frame of real audio, then released in order ahead of it.
+/// A stream that never does -- bytes that only look like frames -- gives
+/// nothing, instead of a "decode" that is silence from end to end.
+///
+/// A real stream cut ahead of its bit reservoir starts with such frames, and
+/// they keep their place (FFmpeg's `mp_decode_layer3` gives the same silence):
+/// at most [`MAX_HELD`] of them, since every frame's main data refills the
+/// reservoir, whose back-pointer reaches 511 bytes at most, and the smallest
+/// Layer III frame carries 57 bytes of it. Beyond that only the newest are
+/// kept.
+#[derive(Default)]
+struct Concealed {
+    /// A frame of real audio has been emitted.
+    real: bool,
+    held: VecDeque<DecodedAudio>,
+}
+
+/// See [`Concealed`]: 511 / 57 < 9 frames, with margin.
+const MAX_HELD: usize = 16;
+
+impl Concealed {
+    /// Queue `frame` on `queue` -- or hold it, when it is wholly concealed and
+    /// no real audio has come yet. A real frame releases what is held first.
+    fn emit(&mut self, queue: &mut VecDeque<DecodedAudio>, frame: DecodedAudio, concealed: bool) {
+        if concealed && !self.real {
+            if self.held.len() == MAX_HELD {
+                self.held.pop_front();
+            }
+            self.held.push_back(frame);
+            return;
+        }
+        if !concealed {
+            self.real = true;
+            queue.append(&mut self.held);
+        }
+        queue.push_back(frame);
+    }
 }
 
 /// What the Layer I/II syncer decided at one candidate header.
@@ -134,6 +187,21 @@ enum Step {
     Skip,
     /// Undecidable until more input arrives.
     Wait,
+}
+
+/// Length of the `ID3v2` tag `b` starts with (header, body and footer), if it
+/// starts with one: `ID3`, a version, flags and a syncsafe size.
+fn id3v2_len(b: &[u8]) -> Option<usize> {
+    let h = b.get(..10)?;
+    if &h[..3] != b"ID3" || h[3] == 0xFF || h[4] == 0xFF || h[6..10].iter().any(|&x| x & 0x80 != 0)
+    {
+        return None;
+    }
+    let size = h[6..10]
+        .iter()
+        .fold(0usize, |a, &x| (a << 7) | usize::from(x));
+    let footer = if h[5] & 0x10 != 0 { 10 } else { 0 };
+    Some(10 + size + footer)
 }
 
 /// Bytes that can legitimately follow the last frame of a stream: a tag.
@@ -165,6 +233,254 @@ fn next_in_stream(h: &layer12::Layer12Header, b: &[u8]) -> Option<layer12::Layer
 
 fn continues_stream(h: &layer12::Layer12Header, b: &[u8]) -> bool {
     next_in_stream(h, b).is_some()
+}
+
+/// How many headers after a Layer III frame found by searching must be its
+/// stream's, each where the frame before ends, unless the data ends first
+/// (minimp3's `MAX_FRAME_SYNC_MATCHES`, as `rff-format-mp3` frames by).
+const MAX_SYNC_MATCHES: usize = 10;
+
+/// The Layer III header `b` starts, if it can be the next frame of `h`'s
+/// stream: the same version and sample rate (minimp3's `hdr_compare`; a Layer
+/// III header is never free format here).
+fn next_layer3(h: &FrameHeader, b: &[u8]) -> Option<FrameHeader> {
+    let n = FrameHeader::parse(*b.first_chunk::<4>()?).ok()?;
+    (n.version == h.version && n.sample_rate == h.sample_rate && n.frame_size() >= 4).then_some(n)
+}
+
+/// Whether the stream vouches for the Layer III frame `h` that fills
+/// `buf[pos..pos + size]`: minimp3's rule (`mp3dec_decode_frame`,
+/// `mp3d_find_frame`, `mp3d_match_frame`), the one `rff-format-mp3` applies.
+/// `None`: undecidable until more input arrives (never when `eof`).
+///
+/// * [`Place::Anchored`] (no byte was skipped to reach it: it starts where
+///   the previous frame ended, or where the data began): the last frame of the
+///   data, which nothing but a tag can follow, is taken; and at
+///   [`Place::Continuing`] (the previous frame was of the same stream) so is a
+///   frame whose next header continues the stream.
+/// * Anywhere else -- the first frame, after damage or junk -- up to
+///   [`MAX_SYNC_MATCHES`] headers of its stream must follow it, each where the
+///   frame before ends. The walk ends early, and well, at the end of the data,
+///   a tag or zero padding once at least one header has matched.
+///
+/// One departure from minimp3, which `rff-format-mp3` keeps: a stream may end
+/// where another Layer III stream starts (a file joined to one at another
+/// rate) -- after at least one matching header, or right after a frame that
+/// continued its stream -- when that stream vouches for itself in turn.
+/// minimp3 drops the frame before such a switch, and a stream of fewer than
+/// eleven frames before it; every frame of both streams decoded before, and
+/// still does. (Were this decoder to drop that frame as well, each switch the
+/// demuxer hands over would cost two frames.)
+///
+/// A header alone is not a frame: a picture, a movie or any file with enough
+/// `0xFF` bytes holds Layer III headers, and their frames decode to noise.
+fn layer3_vouched(
+    buf: &[u8],
+    pos: usize,
+    h: &FrameHeader,
+    size: usize,
+    eof: bool,
+    place: Place,
+) -> Option<bool> {
+    layer3_walk(buf, pos, h, size, eof, place, true)
+}
+
+/// Where a candidate Layer III frame sits ([`layer3_vouched`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// Bytes were skipped to reach it (or a Layer I/II stream came before).
+    Searched,
+    /// Where the data began, or the previous frame (of another stream) ended.
+    Anchored,
+    /// Where the previous frame, of the same stream, ended.
+    Continuing,
+}
+
+/// [`layer3_vouched`]; `switch`: a switch to another stream may end the walk
+/// (only at the top level, so a run of switches cannot recurse without end).
+fn layer3_walk(
+    buf: &[u8],
+    pos: usize,
+    h: &FrameHeader,
+    size: usize,
+    eof: bool,
+    place: Place,
+    switch: bool,
+) -> Option<bool> {
+    // The stream starting at `at`, if it is another Layer III stream that
+    // vouches for itself.
+    let switch_at = |at: usize| -> Option<bool> {
+        let rest = buf.get(at..)?;
+        let n = rest
+            .first_chunk::<4>()
+            .and_then(|&nb| FrameHeader::parse(nb).ok())
+            .filter(|n| n.frame_size() >= 4);
+        match n {
+            Some(n) if switch => {
+                layer3_walk(buf, at, &n, n.frame_size(), eof, Place::Searched, false)
+            }
+            _ => Some(false),
+        }
+    };
+    let end = pos + size;
+    if place != Place::Searched {
+        let rest = buf.get(end..)?;
+        if rest.len() < 4 && !eof {
+            return None;
+        }
+        if rest.is_empty() || is_tag_start(rest) {
+            return Some(true);
+        }
+        if place == Place::Continuing {
+            if next_layer3(h, rest).is_some() {
+                return Some(true);
+            }
+            match switch_at(end) {
+                Some(true) => return Some(true),
+                None => return None,
+                Some(false) => {}
+            }
+        }
+    }
+    let mut at = end;
+    for matched in 0..MAX_SYNC_MATCHES {
+        let rest = buf.get(at..).unwrap_or(&[]);
+        if rest.len() < 4 {
+            return if eof { Some(matched > 0) } else { None };
+        }
+        if is_tag_start(rest) || rest.starts_with(&[0; 4]) {
+            return Some(matched > 0);
+        }
+        let Some(n) = next_layer3(h, rest) else {
+            return if matched > 0 {
+                switch_at(at)
+            } else {
+                Some(false)
+            };
+        };
+        at += n.frame_size();
+    }
+    Some(true)
+}
+
+/// [`layer3_vouched`] for a Layer I/II frame found by searching (the first
+/// one, or after damage or junk), as `rff-format-mp3` frames it: up to
+/// [`MAX_SYNC_MATCHES`] headers of its stream after it, each where the frame
+/// before ends (a free-format stream keeps its size; only the padding
+/// varies), unless the data, a tag or zero padding ends the walk after at
+/// least one -- or, `at_start`, the frame is all the data or a tag follows it.
+///
+/// Layer I/II frames are also refused for what they decode to
+/// ([`layer12::Layer12Decode::try_decode_frame`]), but valid syntax with a
+/// sample within [`MAX_OUTPUT_AMPLITUDE`] passes that. Two confirming headers
+/// let the rows of uncompressed pictures through as Layer II peaking at 7.87;
+/// ten rarely line up. (Rows that repeat exactly can: a picture whose rows
+/// confirmed themselves as 706 kbps free-format Layer II is refused by the
+/// free-format size bound, [`layer12::Layer12Header::max_free_format_size`].)
+fn layer12_vouched(
+    buf: &[u8],
+    pos: usize,
+    h: &layer12::Layer12Header,
+    size: usize,
+    eof: bool,
+    at_start: bool,
+) -> Option<bool> {
+    layer12_walk(buf, pos, h, size, eof, at_start, true)
+}
+
+/// [`layer12_vouched`]; `switch` as in [`layer3_walk`].
+fn layer12_walk(
+    buf: &[u8],
+    pos: usize,
+    h: &layer12::Layer12Header,
+    size: usize,
+    eof: bool,
+    at_start: bool,
+    switch: bool,
+) -> Option<bool> {
+    // The stream starting at `at`, if it is another Layer I/II stream that
+    // vouches for itself (a free-format one measured first).
+    let switch_at = |at: usize| -> Option<bool> {
+        let Some(n) = buf
+            .get(at..)
+            .and_then(|r| r.first_chunk::<4>())
+            .and_then(|&nb| layer12::Layer12Header::parse(nb).ok())
+            .filter(|_| switch)
+        else {
+            return Some(false);
+        };
+        let size = match n.frame_size() {
+            Some(s) => s,
+            None => match measure_free_size(buf, at, &n) {
+                Some(s) => s,
+                None if eof || buf.len() - at > layer12::MAX_FREE_FORMAT_FRAME + 4 => {
+                    return Some(false)
+                }
+                None => return None,
+            },
+        };
+        if size <= 4 + if n.crc_protected { 2 } else { 0 } {
+            return Some(false);
+        }
+        layer12_walk(buf, at, &n, size, eof, false, false)
+    };
+    let end = pos + size;
+    if at_start {
+        let rest = buf.get(end..)?;
+        if rest.len() < 4 && !eof {
+            return None;
+        }
+        if rest.is_empty() || is_tag_start(rest) {
+            return Some(true);
+        }
+    }
+    let free = h.is_free_format().then(|| size - h.padding_bytes());
+    let mut at = end;
+    for matched in 0..MAX_SYNC_MATCHES {
+        let rest = buf.get(at..).unwrap_or(&[]);
+        if rest.len() < 4 {
+            return if eof { Some(matched > 0) } else { None };
+        }
+        if is_tag_start(rest) || rest.starts_with(&[0; 4]) {
+            return Some(matched > 0);
+        }
+        let Some(n) = rest
+            .first_chunk::<4>()
+            .and_then(|&nb| layer12::Layer12Header::parse(nb).ok())
+            .filter(|n| h.same_stream(n))
+        else {
+            return if matched > 0 {
+                switch_at(at)
+            } else {
+                Some(false)
+            };
+        };
+        let step = match free {
+            Some(unpadded) => unpadded + n.padding_bytes(),
+            None => n.frame_size().unwrap_or(0),
+        };
+        if step <= 4 {
+            return Some(false);
+        }
+        at += step;
+    }
+    Some(true)
+}
+
+/// Size of the free-format Layer I/II frame `h` at `pos`: the distance to the
+/// next header of its stream, no longer than
+/// [`max_free_format_size`](layer12::Layer12Header::max_free_format_size).
+fn measure_free_size(buf: &[u8], pos: usize, h: &layer12::Layer12Header) -> Option<usize> {
+    let lo = pos + h.min_free_format_size();
+    let longest = h.max_free_format_size().min(layer12::MAX_FREE_FORMAT_FRAME);
+    let hi = (pos + longest).min(buf.len().saturating_sub(4));
+    // A Layer I frame is a whole number of 4-byte slots: a "next header" at
+    // any other distance is not one (rows of an uncompressed picture pass for
+    // free-format Layer I otherwise).
+    let slots = |i: usize| h.layer != layer12::Layer::I || (i - pos - h.padding_bytes()) % 4 == 0;
+    let found =
+        (lo..=hi).find(|&i| buf[i] == 0xFF && slots(i) && continues_stream(h, &buf[i..]))?;
+    Some(found - pos)
 }
 
 /// `MP3_CENSUS=1` (with the `env-tuning` cargo feature): print the kernel-reach
@@ -241,19 +557,9 @@ impl Mp3Decoder {
                 _ => return Some(size),
             }
         }
-        let lo = pos + h.min_free_format_size();
-        let hi = (pos + layer12::MAX_FREE_FORMAT_FRAME).min(self.buf.len().saturating_sub(4));
-        let buf = &self.buf;
-        // A Layer I frame is a whole number of 4-byte slots: a "next header" at
-        // any other distance is not one (rows of an uncompressed picture pass
-        // for free-format Layer I otherwise).
-        let slots =
-            |i: usize| h.layer != layer12::Layer::I || (i - pos - h.padding_bytes()) % 4 == 0;
-        let found =
-            (lo..=hi).find(|&i| buf[i] == 0xFF && slots(i) && continues_stream(h, &buf[i..]))?;
         // Remembered only once a frame of this size is taken (`layer12_step`):
         // a size measured from garbage must not stick.
-        Some(found - pos)
+        measure_free_size(&self.buf, pos, h)
     }
 
     /// Whether the Layer I/II frame `h` at `pos..end` is confirmed by what
@@ -380,6 +686,13 @@ impl Mp3Decoder {
                 Some(false) => return Step::Skip,
                 Some(true) => {}
             }
+            // And the rule `rff-format-mp3` frames by (see `layer12_vouched`).
+            let at_start = !self.started && pos == 0;
+            match layer12_vouched(&self.buf, pos, &h, size, self.eof, at_start) {
+                None => return Step::Wait,
+                Some(false) => return Step::Skip,
+                Some(true) => {}
+            }
         }
         // A frame that cannot be decoded sanely is dropped, not emitted (see
         // `Layer12Decode::try_decode_frame`).
@@ -387,11 +700,12 @@ impl Mp3Decoder {
         if let Some(took) = self.dry_run.as_mut() {
             *took = true;
         } else if let Ok(pcm) = self.layer12.try_decode_frame(&h, &self.buf[pos..end]) {
-            self.queue.push_back(DecodedAudio {
+            let frame = DecodedAudio {
                 sample_rate: h.sample_rate,
                 channels: if h.channels() == 2 { 2 } else { 1 },
                 samples: pcm,
-            });
+            };
+            self.concealed.emit(&mut self.queue, frame, false);
         } else {
             refused = true;
         }
@@ -421,6 +735,32 @@ impl Mp3Decoder {
     /// main-data, decode it, and queue a [`DecodedAudio`]. Leaves a trailing partial
     /// frame in `buf` for the next push.
     fn parse_frames(&mut self) {
+        // A leading ID3v2 tag (or a chain of them) is skipped by its declared
+        // size, as `rff-format-mp3` and minimp3's file reader skip it: the
+        // data begins after it. Without that, a frame right after the tag was
+        // one found by searching, and a file of one frame after a tag (or of
+        // fewer than eleven before junk) did not decode. Nothing inside the
+        // tag (cover art) is scanned for frames either.
+        while !self.started {
+            if self.id3_skip > 0 {
+                let n = self.id3_skip.min(self.buf.len());
+                self.buf.drain(..n);
+                self.id3_skip -= n;
+                if self.id3_skip > 0 {
+                    return;
+                }
+            }
+            match id3v2_len(&self.buf) {
+                Some(len) => self.id3_skip = len,
+                None if !self.eof
+                    && self.buf.len() < 10
+                    && b"ID3".starts_with(&self.buf[..self.buf.len().min(3)]) =>
+                {
+                    return;
+                }
+                None => break,
+            }
+        }
         let mut pos = 0;
         while pos + 4 <= self.buf.len() {
             // Sync = 11 set bits: 0xFF then top 3 bits of the next byte.
@@ -463,10 +803,34 @@ impl Mp3Decoder {
             if pos + frame_size > self.buf.len() {
                 break; // incomplete frame — wait for more data
             }
+            // The stream must vouch for the frame (`layer3_vouched`), exactly
+            // as `rff-format-mp3` frames it: a header on its own is not one.
+            let in_layer12 = matches!(self.last_layer, 1 | 2);
+            let place = if in_layer12 {
+                Place::Searched
+            } else if self.contiguous
+                && self.last_layer == 3
+                && self.l3_stream == Some((header.version, header.sample_rate))
+            {
+                Place::Continuing
+            } else if self.contiguous || (!self.started && pos == 0) {
+                Place::Anchored
+            } else {
+                Place::Searched
+            };
+            match layer3_vouched(&self.buf, pos, &header, frame_size, self.eof, place) {
+                None => break,
+                Some(false) => {
+                    pos += 1;
+                    self.contiguous = false;
+                    continue;
+                }
+                Some(true) => {}
+            }
             // Inside a Layer I/II stream (only there: a Layer III stream never
             // sets `last_layer` to 1 or 2), a Layer III header is garbage until
             // the two headers after it confirm it.
-            if matches!(self.last_layer, 1 | 2) {
+            if in_layer12 {
                 match self.layer3_confirmed(&header, pos + frame_size) {
                     None => break,
                     Some(false) => {
@@ -496,15 +860,21 @@ impl Mp3Decoder {
                 // Sync decisions only: the frame is taken either way.
             } else if let Ok(pcm) = self.state.decode_frame(&header, side_info, main_data) {
                 let channels = header.channel_mode.channels().max(1);
-                self.queue.push_back(DecodedAudio {
+                let frame = DecodedAudio {
                     sample_rate: header.sample_rate,
                     channels: channels as u16,
                     samples: pcm,
-                });
+                };
+                let concealed = self.state.last_frame_concealed();
+                self.concealed.emit(&mut self.queue, frame, concealed);
             }
             pos += frame_size;
             self.contiguous = true;
             self.last_layer = 3;
+            self.l3_stream = Some((header.version, header.sample_rate));
+        }
+        if pos > 0 {
+            self.started = true;
         }
         self.buf.drain(0..pos);
     }
@@ -634,52 +1004,83 @@ pub fn decode_pipelined(bytes: &[u8]) -> Vec<DecodedAudio> {
 
         // Bounded so a fast entropy stage cannot buffer the whole file's spectra
         // into memory ahead of the transform stage; this is the pipeline depth.
-        let (tx, rx) = sync_channel::<(FrameHeader, Vec<decode::GranuleWork>)>(32);
-        let mut out: Vec<DecodedAudio> = Vec::new();
+        let (tx, rx) = sync_channel::<(FrameHeader, Vec<decode::GranuleWork>, bool)>(32);
+        let mut queue: VecDeque<DecodedAudio> = VecDeque::new();
+        let mut concealed = Concealed::default();
 
         std::thread::scope(|scope| {
             scope.spawn(move || {
                 let mut state = Mp3Decode::new();
+                // Past leading ID3v2 tags, as the serial decoder skips them.
                 let mut pos = 0usize;
+                while let Some(len) = bytes.get(pos..).and_then(id3v2_len) {
+                    pos = pos.saturating_add(len).min(bytes.len());
+                }
+                let start = pos;
+                // The serial syncer's state for Layer III (`Mp3Decoder`): no
+                // byte skipped since the last frame, and that frame's stream.
+                let mut contiguous = false;
+                let mut stream: Option<(header::MpegVersion, u32)> = None;
                 while pos + 4 <= bytes.len() {
                     if bytes[pos] != 0xFF || bytes[pos + 1] & 0xE0 != 0xE0 {
                         pos += 1;
+                        contiguous = false;
                         continue;
                     }
                     let hb = [bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]];
                     let Ok(header) = FrameHeader::parse(hb) else {
                         pos += 1;
+                        contiguous = false;
                         continue;
                     };
                     let frame_size = header.frame_size();
                     if frame_size < 4 || pos + frame_size > bytes.len() {
                         if frame_size < 4 {
                             pos += 1;
+                            contiguous = false;
                             continue;
                         }
                         break; // trailing partial frame
+                    }
+                    let place =
+                        if contiguous && stream == Some((header.version, header.sample_rate)) {
+                            Place::Continuing
+                        } else if contiguous || pos == start {
+                            Place::Anchored
+                        } else {
+                            Place::Searched
+                        };
+                    let vouched = layer3_vouched(bytes, pos, &header, frame_size, true, place);
+                    if vouched != Some(true) {
+                        pos += 1;
+                        contiguous = false;
+                        continue;
                     }
                     let crc = if header.crc_protected { 2 } else { 0 };
                     let si_start = pos + 4 + crc;
                     let main_start = si_start + header.side_info_len();
                     if main_start > pos + frame_size {
                         pos += 1;
+                        contiguous = false;
                         continue;
                     }
                     let side = &bytes[si_start..main_start];
                     let main = &bytes[main_start..pos + frame_size];
+                    pos += frame_size;
+                    contiguous = true;
+                    stream = Some((header.version, header.sample_rate));
                     if let Ok(work) = state.decode_frame_entropy(&header, side, main) {
-                        if tx.send((header, work)).is_err() {
+                        let hidden = state.last_frame_concealed();
+                        if tx.send((header, work, hidden)).is_err() {
                             break; // receiver gone
                         }
                     }
-                    pos += frame_size;
                 }
             });
 
             // Transform stage runs on this thread, owning the overlap and the FIFO.
             let mut tstate = decode::TransformState::new();
-            for (header, work) in rx {
+            for (header, work, hidden) in rx {
                 let channels = header.channel_mode.channels().max(1);
                 let mut pcm =
                     Vec::with_capacity(work.len() * crate::frame::GRANULE_LINES * channels);
@@ -693,14 +1094,15 @@ pub fn decode_pipelined(bytes: &[u8]) -> Vec<DecodedAudio> {
                     tstate = decode::TransformState::new();
                     continue;
                 }
-                out.push(DecodedAudio {
+                let frame = DecodedAudio {
                     sample_rate: header.sample_rate,
                     channels: channels as u16,
                     samples: pcm,
-                });
+                };
+                concealed.emit(&mut queue, frame, hidden);
             }
         });
-        out
+        queue.into()
     }
 }
 
