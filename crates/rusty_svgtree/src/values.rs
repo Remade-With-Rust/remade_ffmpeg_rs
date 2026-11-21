@@ -83,19 +83,44 @@ impl<'a> Stream<'a> {
     pub(crate) fn parse_number(&mut self) -> Option<f64> {
         self.skip_spaces();
         let start = self.pos;
-        if matches!(self.peek(), Some(b'+' | b'-')) {
-            self.pos += 1;
-        }
+        let neg = match self.peek() {
+            Some(b'-') => {
+                self.pos += 1;
+                true
+            }
+            Some(b'+') => {
+                self.pos += 1;
+                false
+            }
+            _ => false,
+        };
+        // The decimal mantissa and exponent are accumulated while scanning,
+        // so the common case needs no second pass over the text (see
+        // `exact_decimal`). `exact` drops once the mantissa no longer fits.
+        let mut mant = 0u64;
+        let mut exact = true;
+        let mut exp10 = 0i32;
         let mut digits = 0usize;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
+        while let Some(c @ b'0'..=b'9') = self.peek() {
             self.pos += 1;
             digits += 1;
+            if mant < MANT_ROOM {
+                mant = mant * 10 + u64::from(c - b'0');
+            } else {
+                exact = false;
+            }
         }
         if self.peek() == Some(b'.') && matches!(self.peek_at(1), Some(b'0'..=b'9')) {
             self.pos += 1;
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
+            while let Some(c @ b'0'..=b'9') = self.peek() {
                 self.pos += 1;
                 digits += 1;
+                if mant < MANT_ROOM {
+                    mant = mant * 10 + u64::from(c - b'0');
+                    exp10 -= 1;
+                } else {
+                    exact = false;
+                }
             }
         } else if self.peek() == Some(b'.') && digits > 0 {
             self.pos += 1;
@@ -108,18 +133,46 @@ impl<'a> Stream<'a> {
         {
             let save = self.pos;
             self.pos += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.pos += 1;
-            }
+            let eneg = match self.peek() {
+                Some(b'-') => {
+                    self.pos += 1;
+                    true
+                }
+                Some(b'+') => {
+                    self.pos += 1;
+                    false
+                }
+                _ => false,
+            };
             let mut ed = 0;
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
+            let mut e = 0i32;
+            while let Some(c @ b'0'..=b'9') = self.peek() {
                 self.pos += 1;
                 ed += 1;
+                // Saturates far outside the exact range.
+                e = (e * 10 + i32::from(c - b'0')).min(100_000);
             }
             if ed == 0 {
                 self.pos = save;
+            } else if eneg {
+                exp10 -= e;
+            } else {
+                exp10 += e;
             }
         }
+        if exact {
+            if let Some(v) = exact_decimal(mant, exp10) {
+                return Some(if neg { -v } else { v });
+            }
+        }
+        self.parse_number_text(start)
+    }
+
+    /// The general case: the scanned token through the standard library's
+    /// correctly rounded parser.
+    #[cold]
+    #[inline(never)]
+    fn parse_number_text(&self, start: usize) -> Option<f64> {
         let text = std::str::from_utf8(&self.s[start..self.pos]).ok()?;
         let v: f64 = text.parse().ok()?;
         if v.is_finite() {
@@ -195,6 +248,33 @@ impl<'a> Stream<'a> {
         }
         std::str::from_utf8(&self.s[start..self.pos]).unwrap_or("")
     }
+}
+
+/// A mantissa below this takes one more decimal digit without overflowing.
+const MANT_ROOM: u64 = 1_000_000_000_000_000_000;
+
+/// Powers of ten that an `f64` holds exactly.
+const POW10: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+];
+
+/// `mant * 10^exp10` when one IEEE operation gives the correctly rounded
+/// result (Clinger's fast path): the mantissa and the power of ten are both
+/// exact in an `f64`, so their product or quotient is rounded once, to the
+/// same value the standard library's parser returns for the same digits.
+/// `None` outside that range.
+#[inline]
+fn exact_decimal(mant: u64, exp10: i32) -> Option<f64> {
+    if mant > (1 << 53) || !(-22..=22).contains(&exp10) {
+        return None;
+    }
+    let v = mant as f64;
+    Some(if exp10 < 0 {
+        v / POW10[(-exp10) as usize]
+    } else {
+        v * POW10[exp10 as usize]
+    })
 }
 
 /// CSS length units.
@@ -1123,6 +1203,94 @@ mod tests {
         assert_eq!(number("abc"), None);
         assert_eq!(length("1em").map(|l| l.unit), Some(Unit::Em));
         assert_eq!(length("10%").map(|l| l.number), Some(10.0));
+    }
+
+    /// The scanning fast path against the standard library's parser, bit for
+    /// bit, on edge cases and on generated tokens of every shape.
+    #[test]
+    fn number_fast_path_matches_std() {
+        fn check(t: &str) {
+            let mut s = Stream::new(t);
+            let got = s.parse_number();
+            assert!(s.at_end(), "{t}");
+            let want = t.parse::<f64>().ok().filter(|v| v.is_finite());
+            assert_eq!(got.map(f64::to_bits), want.map(f64::to_bits), "{t}");
+        }
+        for t in [
+            "0",
+            "-0",
+            "+0",
+            "-0.0e5",
+            "1.",
+            ".5",
+            "-.5e-3",
+            "9007199254740992",
+            "9007199254740993",
+            "9007199254740993e1",
+            "1e22",
+            "1e23",
+            "1e-22",
+            "1e-23",
+            "123456789012345678",
+            "999999999999999999",
+            "1000000000000000000",
+            "1234567890123456789",
+            "12345678901234567890",
+            "0.000000000000000000001",
+            "0.0000000000000000000001",
+            "00000000000000000000001",
+            "1e00000000000000000002",
+            "1e-00000000000000000002",
+            "179769313486231570e291",
+            "4.9e-324",
+            "1e400",
+            "1e-400",
+            "1e99999999999",
+            "2.2250738585072011e-308",
+            "0.1",
+            "0.3",
+            "123.456",
+            "5e-1",
+        ] {
+            check(t);
+        }
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..200_000 {
+            let r = next();
+            let mut t = String::new();
+            match r % 3 {
+                0 => t.push('-'),
+                1 if r % 7 == 0 => t.push('+'),
+                _ => {}
+            }
+            let int_digits = (r >> 4) % 21;
+            let frac_digits = (r >> 10) % 21;
+            for _ in 0..int_digits {
+                t.push(char::from(b'0' + (next() % 10) as u8));
+            }
+            if frac_digits > 0 || int_digits == 0 {
+                t.push('.');
+                for _ in 0..frac_digits.max(1) {
+                    t.push(char::from(b'0' + (next() % 10) as u8));
+                }
+            }
+            if (r >> 20) % 4 == 0 {
+                t.push(if (r >> 22) % 2 == 0 { 'e' } else { 'E' });
+                match (r >> 23) % 3 {
+                    0 => t.push('-'),
+                    1 => t.push('+'),
+                    _ => {}
+                }
+                t.push_str(&((r >> 26) % 40).to_string());
+            }
+            check(&t);
+        }
     }
 
     #[test]
