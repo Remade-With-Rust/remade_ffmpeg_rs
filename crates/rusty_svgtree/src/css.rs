@@ -540,35 +540,84 @@ fn parse_selector(c: &mut Cur) -> Option<Selector> {
 /// `style` attribute or between `{` and `}`.
 pub(crate) fn parse_declarations(text: &str) -> Vec<Declaration> {
     let mut out = Vec::new();
-    for item in split_top_level(text, b';') {
-        let Some(colon) = item.find(':') else {
-            continue;
-        };
-        let name = item[..colon].trim();
-        let mut value = item[colon + 1..].trim();
-        if name.is_empty() || value.is_empty() {
-            continue;
-        }
-        let mut important = false;
-        if let Some(i) = value.rfind('!') {
-            if value[i + 1..].trim().eq_ignore_ascii_case("important") {
-                important = true;
-                value = value[..i].trim_end();
-            }
-        }
-        // Strip comments inside values.
-        let value = strip_comments(value);
-        let name = strip_comments(name);
-        if name.is_empty() || value.is_empty() {
-            continue;
-        }
+    for_each_declaration(text, |name, value, important| {
         out.push(Declaration {
-            name: name.to_ascii_lowercase(),
-            value,
+            name: name.to_string(),
+            value: value.to_string(),
             important,
         });
-    }
+    });
     out
+}
+
+/// Calls `f(name, value, important)` for each declaration of a block body,
+/// in order: the name lower-cased, comments stripped from both. Nothing is
+/// allocated for a declaration that has no comment and no upper-case letter
+/// in its name.
+pub(crate) fn for_each_declaration(text: &str, mut f: impl FnMut(&str, &str, bool)) {
+    // Split on `;` outside quotes and parentheses.
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut start = 0;
+    for (i, &c) in text.as_bytes().iter().enumerate() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'"' | b'\'' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b';' if depth <= 0 => {
+                    declaration(&text[start..i], &mut f);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    declaration(&text[start..], &mut f);
+}
+
+/// One `name: value [!important]` item of a declaration block.
+fn declaration(item: &str, f: &mut impl FnMut(&str, &str, bool)) {
+    let Some(colon) = item.find(':') else {
+        return;
+    };
+    let name = item[..colon].trim();
+    let mut value = item[colon + 1..].trim();
+    if name.is_empty() || value.is_empty() {
+        return;
+    }
+    let mut important = false;
+    if let Some(i) = value.rfind('!') {
+        if value[i + 1..].trim().eq_ignore_ascii_case("important") {
+            important = true;
+            value = value[..i].trim_end();
+        }
+    }
+    // Strip comments inside names and values. Both are trimmed already, so
+    // one without a comment is the text as it stands.
+    let value_buf;
+    let value = if value.contains("/*") {
+        value_buf = strip_comments(value);
+        value_buf.as_str()
+    } else {
+        value
+    };
+    let name_buf;
+    let name = if name.contains("/*") || name.bytes().any(|c| c.is_ascii_uppercase()) {
+        name_buf = strip_comments(name).to_ascii_lowercase();
+        name_buf.as_str()
+    } else {
+        name
+    };
+    if name.is_empty() || value.is_empty() {
+        return;
+    }
+    f(name, value, important);
 }
 
 fn strip_comments(s: &str) -> String {
@@ -586,36 +635,6 @@ fn strip_comments(s: &str) -> String {
     }
     out.push_str(rest);
     out.trim().to_string()
-}
-
-/// Splits on `sep` outside quotes and parentheses.
-fn split_top_level(text: &str, sep: u8) -> Vec<&str> {
-    let b = text.as_bytes();
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut quote: Option<u8> = None;
-    let mut start = 0;
-    for (i, &c) in b.iter().enumerate() {
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                b'"' | b'\'' => quote = Some(c),
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                _ if c == sep && depth <= 0 => {
-                    out.push(&text[start..i]);
-                    start = i + 1;
-                }
-                _ => {}
-            },
-        }
-    }
-    out.push(&text[start..]);
-    out
 }
 
 /// Parses a style sheet, appending to `rules`. Re-sorts by specificity.
@@ -743,6 +762,28 @@ mod tests {
         // Type selectors sort before class selectors.
         assert!(rules[0].selector.subject.tag.is_some());
         assert!(rules[0].declarations[0].important);
+    }
+
+    #[test]
+    fn declarations() {
+        let got = parse_declarations(
+            "Fill : red /* c */ ; stroke:url(a;b) !IMPORTANT; /*x*/ : y; font-family: 'a;b'; \
+             bad; opacity: /* only */; STROKE-width/**/: 2; color: blue ! important ;x:",
+        );
+        let want = [
+            ("fill", "red", false),
+            ("stroke", "url(a;b)", true),
+            ("font-family", "'a;b'", false),
+            ("stroke-width", "2", false),
+            ("color", "blue", true),
+        ];
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        for (d, (name, value, important)) in got.iter().zip(want) {
+            assert_eq!(
+                (d.name.as_str(), d.value.as_str(), d.important),
+                (name, value, important)
+            );
+        }
     }
 
     /// A node of a small test tree.

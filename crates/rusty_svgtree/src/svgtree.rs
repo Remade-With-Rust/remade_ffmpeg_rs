@@ -855,9 +855,10 @@ impl Builder<'_> {
             );
         }
         if let Some(style) = x.attr("style") {
-            for d in css::parse_declarations(style) {
-                apply_declaration(&mut self.doc, parent, start, &d.name, &d.value, d.important);
-            }
+            let doc = &mut self.doc;
+            css::for_each_declaration(style, |name, value, important| {
+                apply_declaration(doc, parent, start, name, value, important);
+            });
         }
 
         let end = self.doc.attrs.len();
