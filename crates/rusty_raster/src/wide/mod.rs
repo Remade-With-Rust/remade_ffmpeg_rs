@@ -331,35 +331,6 @@ impl f32x8 {
         i32x8(o)
     }
 
-    /// `floor` for lanes in `[0, 2^23)`, staying in `f32`: the nearest
-    /// integer (`(v + 2^23) - 2^23`), minus one where that went up. The
-    /// float twin of `trunc_int_below_2p23`.
-    ///
-    /// A lane outside `[0, 2^23)` (or NaN) gives an unspecified value.
-    #[inline(always)]
-    pub fn floor_below_2p23(self) -> Self {
-        self.map(|v| {
-            let nearest = (v + INTEGRAL) - INTEGRAL;
-            nearest - if nearest > v { 1.0 } else { 0.0 }
-        })
-    }
-
-    /// Lanes holding integers in `[0, 2^23)` to those integers: after adding
-    /// 2^23 the integer is the low 23 bits of the bit pattern, and nothing
-    /// rounds because the input is already integral.
-    ///
-    /// Any other lane gives an unspecified value.
-    #[inline(always)]
-    pub fn integral_to_u32_below_2p23(self) -> u32x8 {
-        let mut o = [0u32; 8];
-        for i in 0..8 {
-            o[i] = (self.0[i] + INTEGRAL)
-                .to_bits()
-                .wrapping_sub(INTEGRAL.to_bits());
-        }
-        u32x8(o)
-    }
-
     pub fn trunc_int(self) -> i32x8 {
         let mut o = [0i32; 8];
         for i in 0..8 {
@@ -867,18 +838,6 @@ mod tests {
                 f32x8::splat(v).trunc_int_below_2p23().0[1],
                 cvt_trunc_ref(v),
                 "trunc_int_below_2p23({v:e})"
-            );
-            // The float twin, and the way back to an integer.
-            let floor = f32x8::splat(v).floor_below_2p23();
-            assert_eq!(
-                floor.0[4].to_bits(),
-                (cvt_trunc_ref(v) as f32).to_bits(),
-                "floor_below_2p23({v:e})"
-            );
-            assert_eq!(
-                floor.integral_to_u32_below_2p23().0[7],
-                cvt_trunc_ref(v) as u32,
-                "integral_to_u32_below_2p23({v:e})"
             );
         };
         let top = INTEGRAL.to_bits();

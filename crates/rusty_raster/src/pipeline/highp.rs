@@ -325,18 +325,6 @@ fn gather_ix(pixmap: PixmapRef, mut x: f32x8, mut y: f32x8) -> u32x8 {
     // for any pixmap short of 2^23 pixels on a side the truncation needs no
     // float-to-int conversion.
     const NO_CONVERSION: u32 = 1 << 23;
-
-    // And for a pixmap of at most 2^23 pixels in all, `row * width + column`
-    // can be computed in `f32` too: the floors are integers, the product and
-    // the sum stay below 2^23, so every step is exact. That keeps the whole
-    // index in vector registers; an `i32` lane multiply has no SSE2
-    // instruction and compiled to a scalar `imul` per lane, which dragged
-    // the truncation into scalar code with it.
-    if u64::from(pixmap.width()) * u64::from(pixmap.height()) <= u64::from(NO_CONVERSION) {
-        let row = y.floor_below_2p23() * f32x8::splat(pixmap.width() as f32);
-        return (row + x.floor_below_2p23()).integral_to_u32_below_2p23();
-    }
-
     let (ix, iy) = if pixmap.width() <= NO_CONVERSION && pixmap.height() <= NO_CONVERSION {
         (x.trunc_int_below_2p23(), y.trunc_int_below_2p23())
     } else {
@@ -1471,66 +1459,6 @@ fn lerp(from: f32x8, to: f32x8, t: f32x8) -> f32x8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `gather_ix` takes the float route for pixmaps of at most 2^23 pixels
-    /// and the integer route above that. Both must give `row * width +
-    /// column` of the clamped, truncated coordinates.
-    #[test]
-    fn gather_index_is_row_times_width_plus_column() {
-        let mut seed = 0x1234_5678_9abc_def1u64;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        // Sizes on both sides of the 2^23-pixel switch, including the extremes
-        // of the float route (2^23 x 1, 1 x 2^23, 2896 x 2896).
-        let sizes = [
-            (1u32, 1u32), (7, 5), (160, 120), (2896, 2896), (8_388_608, 1), (1, 8_388_608),
-            (4096, 2048), (4096, 2049), (2897, 2896), (8_388_609, 1), (3, 2_796_203),
-        ];
-        for (w, h) in sizes {
-            // About 32 MB of zeros each; `gather_ix` only reads the size.
-            let data = vec![0u8; w as usize * h as usize * 4];
-            let pixmap = PixmapRef::from_bytes(&data, w, h).unwrap();
-            for round in 0..2000 {
-                let mut xs = [0.0f32; 8];
-                let mut ys = [0.0f32; 8];
-                for i in 0..8 {
-                    let (a, b) = (next(), next());
-                    // Mostly inside, sometimes far outside, on the last
-                    // pixel, or NaN.
-                    xs[i] = match a % 16 {
-                        0 => -3.5,
-                        1 => w as f32 + 9.0,
-                        2 => w as f32 - 0.25,
-                        3 => f32::NAN,
-                        4 => f32::INFINITY,
-                        _ => (a >> 16) as f32 / (1u64 << 48) as f32 * w as f32,
-                    };
-                    ys[i] = match b % 16 {
-                        0 => -0.0,
-                        1 => h as f32 + 1.0,
-                        2 => h as f32 - 0.5,
-                        3 => f32::NAN,
-                        _ => (b >> 16) as f32 / (1u64 << 48) as f32 * h as f32,
-                    };
-                }
-                let ix = gather_ix(pixmap, f32x8::from(xs), f32x8::from(ys));
-                for i in 0..8 {
-                    let clamp = |v: f32, limit: u32| {
-                        let v = if v > 0.0 { v } else { 0.0 };
-                        let top = ulp_sub(limit as f32);
-                        if v < top { v } else { top }
-                    };
-                    let (cx, cy) = (clamp(xs[i], w), clamp(ys[i], h));
-                    let expected = (cy as i32).wrapping_mul(w as i32).wrapping_add(cx as i32) as u32;
-                    assert_eq!(ix.0[i], expected, "{w}x{h} round {round}: ({}, {})", xs[i], ys[i]);
-                }
-            }
-        }
-    }
 
     fn splat_px(px: [u8; 4]) -> [u8; STAGE_WIDTH * 4] {
         let mut out = [0u8; STAGE_WIDTH * 4];
