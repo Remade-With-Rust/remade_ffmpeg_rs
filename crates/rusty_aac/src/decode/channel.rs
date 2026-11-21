@@ -385,7 +385,8 @@ fn skip_gain_control(r: &mut BitReader, seq: WindowSequence) -> Result<()> {
 #[derive(Clone)]
 pub struct ChannelData {
     pub band_type: [u8; 128],
-    /// Regular: scalefactor offset; intensity: clipped position; noise: clipped energy.
+    /// Regular: scalefactor offset; intensity: position; noise: energy (each
+    /// range-checked by `decode_ics`).
     pub sfo: [i32; 128],
     pub tns: Tns,
     /// Spectral coefficients, windows at a stride of 128.
@@ -476,7 +477,17 @@ pub fn decode_ics(
                 ZERO_HCB => cd.sfo[idx] = 0,
                 INTENSITY_HCB | INTENSITY_HCB2 => {
                     off2 += i32::from(SCALEFACTOR_BOOK.decode(r)?) - 60;
-                    cd.sfo[idx] = off2.clamp(-155, 100);
+                    // Intensity positions and noise energies share the
+                    // regular scalefactor's dynamic range (0..=255 there, so
+                    // a gain of 2^(-100/4)..2^(155/4)). FFmpeg clips values
+                    // outside it and reports the case as unimplemented; only
+                    // a damaged frame reaches it, and a clipped noise band at
+                    // 2^(155/4) decodes ~10^4 over full scale. Refuse the
+                    // frame instead, like an out-of-range scalefactor.
+                    if !(-155..=100).contains(&off2) {
+                        return Err(Error::invalid("aac: intensity position out of range"));
+                    }
+                    cd.sfo[idx] = off2;
                 }
                 NOISE_HCB => {
                     if noise_flag {
@@ -485,7 +496,10 @@ pub fn decode_ics(
                     } else {
                         off1 += i32::from(SCALEFACTOR_BOOK.decode(r)?) - 60;
                     }
-                    cd.sfo[idx] = off1.clamp(-100, 155);
+                    if !(-100..=155).contains(&off1) {
+                        return Err(Error::invalid("aac: noise energy out of range"));
+                    }
+                    cd.sfo[idx] = off1;
                 }
                 _ => {
                     off0 += i32::from(SCALEFACTOR_BOOK.decode(r)?) - 60;
@@ -710,4 +724,137 @@ pub fn decode_ics(
     }
     cd.quant = quant;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::encode::BitWriter;
+    use crate::tables::SCALEFACTOR_BOOK;
+    use crate::{AacDecoder, AudioSpecificConfig, Error};
+
+    fn decoder(channels: u16) -> AacDecoder {
+        AacDecoder::with_config(AudioSpecificConfig {
+            object_type: 2,
+            sample_rate: 44_100,
+            channels,
+        })
+    }
+
+    fn sf_delta(w: &mut BitWriter, delta: i32) {
+        let (code, len) = SCALEFACTOR_BOOK.code(usize::try_from(delta + 60).unwrap());
+        w.write(code, u32::from(len));
+    }
+
+    /// `ics_info` for one long window, `max_sfb` bands, no prediction.
+    fn ics_info(w: &mut BitWriter, max_sfb: u32) {
+        w.write(0, 1); // ics_reserved_bit
+        w.write(0, 2); // ONLY_LONG_SEQUENCE
+        w.write(0, 1); // window_shape
+        w.write(max_sfb, 6);
+        w.write(0, 1); // predictor_data_present
+    }
+
+    /// One section of `cb` over `n` bands (long window: 5-bit lengths).
+    fn section(w: &mut BitWriter, cb: u32, n: u32) {
+        w.write(cb, 4);
+        w.write(n, 5);
+    }
+
+    fn no_tools(w: &mut BitWriter) {
+        w.write(0, 1); // pulse_data_present
+        w.write(0, 1); // tns_data_present
+        w.write(0, 1); // gain_control_data_present
+    }
+
+    /// A mono access unit: one SCE whose bands are all PNS. The first noise
+    /// energy is the 9-bit PCM value `first9` (offset `- 256` from
+    /// `global_gain - 90`), the rest are Huffman deltas.
+    fn sce_noise(global_gain: u32, first9: u32, deltas: &[i32]) -> Vec<u8> {
+        let n = 1 + u32::try_from(deltas.len()).unwrap();
+        let mut w = BitWriter::new();
+        w.write(0, 3); // ID_SCE
+        w.write(0, 4);
+        w.write(global_gain, 8);
+        ics_info(&mut w, n);
+        section(&mut w, 13, n); // NOISE_HCB
+        w.write(first9, 9);
+        for &d in deltas {
+            sf_delta(&mut w, d);
+        }
+        no_tools(&mut w);
+        w.write(7, 3); // ID_END
+        w.into_bytes()
+    }
+
+    /// A stereo access unit: a common-window CPE, channel 0 silent and every
+    /// band of channel 1 intensity-coded with the given position deltas.
+    fn cpe_intensity(deltas: &[i32]) -> Vec<u8> {
+        let n = u32::try_from(deltas.len()).unwrap();
+        let mut w = BitWriter::new();
+        w.write(1, 3); // ID_CPE
+        w.write(0, 4);
+        w.write(1, 1); // common_window
+        ics_info(&mut w, n);
+        w.write(0, 2); // ms_mask_present
+        w.write(100, 8); // channel 0: global_gain
+        section(&mut w, 0, n); // ZERO_HCB
+        no_tools(&mut w);
+        w.write(100, 8); // channel 1: global_gain
+        section(&mut w, 15, n); // INTENSITY_HCB
+        for &d in deltas {
+            sf_delta(&mut w, d);
+        }
+        no_tools(&mut w);
+        w.write(7, 3); // ID_END
+        w.into_bytes()
+    }
+
+    fn peak(samples: &[f32]) -> f32 {
+        samples.iter().fold(0f32, |m, &x| m.max(x.abs()))
+    }
+
+    /// The mechanism behind a damaged `corrupt_pce_6_1.aac`: one flipped bit sends a
+    /// PNS energy to 254/255, which used to be clipped to 155 and decoded at
+    /// 3.99e4 x full scale (FFmpeg 8.0.1 does the same on that packet).
+    #[test]
+    fn noise_energy_outside_window_refuses_the_frame() {
+        let mut dec = decoder(1);
+        // global_gain 100: energies start at 10.
+        let ok = dec.decode(&sce_noise(100, 256 + 10, &[]), None).unwrap();
+        assert!(
+            peak(&ok.samples) <= 1.0,
+            "valid PNS frame peaks at {}",
+            peak(&ok.samples)
+        );
+        // The window's edges still decode (bit-identical to before)...
+        dec.decode(&sce_noise(100, 256 + 145, &[]), None).unwrap();
+        dec.decode(&sce_noise(0, 256 - 10, &[]), None).unwrap();
+        // ...one step past either edge is refused, by the PCM start or a delta.
+        for au in [
+            sce_noise(100, 256 + 146, &[]),
+            sce_noise(100, 511, &[]),
+            sce_noise(0, 256 - 11, &[]),
+            sce_noise(100, 256 + 100, &[46]),
+            sce_noise(100, 256 + 145, &[1]),
+        ] {
+            let err = decoder(1).decode(&au, None).unwrap_err();
+            assert!(matches!(err, Error::InvalidData(_)), "{err:?}");
+        }
+        // A refused frame leaves the decoder usable.
+        assert!(dec.decode(&sce_noise(100, 511, &[]), None).is_err());
+        let next = dec.decode(&sce_noise(100, 256 + 10, &[]), None).unwrap();
+        assert!(peak(&next.samples) <= 1.0);
+    }
+
+    #[test]
+    fn intensity_position_outside_window_refuses_the_frame() {
+        decoder(2).decode(&cpe_intensity(&[60, 40]), None).unwrap();
+        decoder(2)
+            .decode(&cpe_intensity(&[-60, -60, -35]), None)
+            .unwrap();
+        for au in [cpe_intensity(&[60, 41]), cpe_intensity(&[-60, -60, -36])] {
+            let err = decoder(2).decode(&au, None).unwrap_err();
+            assert!(matches!(err, Error::InvalidData(_)), "{err:?}");
+        }
+    }
 }
