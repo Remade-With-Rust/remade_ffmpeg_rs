@@ -32,6 +32,11 @@ pub(crate) enum Pcs {
 pub(crate) enum Op {
     /// A LUT stage over normalised values.
     Lut(Stage),
+    /// A LUT stage of per-channel curves that are all identities written as
+    /// a power of 1 (how v4 profiles spell "no curve"), over this many
+    /// channels: the clamp those curves amount to, without a stage call and
+    /// a curve evaluation per channel.
+    UnitCurves(usize),
     /// Multiply every channel.
     Scale(f64),
     /// v4-normalised Lab to real Lab.
@@ -70,10 +75,25 @@ fn inv_curves(curves: Vec<Curve>) -> Op {
     }
 }
 
+/// The op for one LUT stage.
+fn lut_op(stage: Stage) -> Op {
+    match stage {
+        Stage::Curves(cs) if !cs.is_empty() && cs.iter().all(Curve::is_unit_gamma) => {
+            Op::UnitCurves(cs.len())
+        }
+        stage => Op::Lut(stage),
+    }
+}
+
 fn run(ops: &[Op], v: &mut [f64; 16], mut n: usize) -> usize {
     for op in ops {
         match op {
             Op::Lut(s) => n = s.apply(v, n),
+            Op::UnitCurves(k) => {
+                for x in v.iter_mut().take(*k) {
+                    *x = if *x > 0.0 { x.min(1.0) } else { 0.0 };
+                }
+            }
             Op::Scale(k) => {
                 for x in v.iter_mut().take(n) {
                     *x *= k;
@@ -234,7 +254,7 @@ fn abstract_side(p: &Profile) -> Result<Side> {
         // `_cmsReadDevicelinkLUT` also interpolates Lab-PCS CLUTs trilinearly.
         make_trilinear(&mut stages);
     }
-    ops.extend(stages.into_iter().map(Op::Lut));
+    ops.extend(stages.into_iter().map(lut_op));
     decode_ops(&mut ops, pcs, legacy16);
     Ok(Side {
         ops,
@@ -266,7 +286,7 @@ pub(crate) fn input_side(p: &Profile, intent: Intent) -> Result<Side> {
         if legacy16 && cs == ColorSpace::Lab {
             ops.push(Op::Scale(1.0 / LAB_V2_TO_V4));
         }
-        ops.extend(lut.stages().into_iter().map(Op::Lut));
+        ops.extend(lut.stages().into_iter().map(lut_op));
         decode_ops(&mut ops, pcs, legacy16);
         return Ok(Side {
             ops,
@@ -359,7 +379,7 @@ pub(crate) fn output_side(p: &Profile, intent: Intent) -> Result<Side> {
             // interpolate trilinearly.
             make_trilinear(&mut stages);
         }
-        ops.extend(stages.into_iter().map(Op::Lut));
+        ops.extend(stages.into_iter().map(lut_op));
         if legacy16 && cs == ColorSpace::Lab {
             ops.push(Op::Scale(LAB_V2_TO_V4));
         }
@@ -1094,5 +1114,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn unit_curve_stage_matches_curve_eval_bit_for_bit() {
+        let forms = [
+            Curve::gamma(1.0),
+            Curve::parametric(1, &[1.0, 1.0, 0.0]).unwrap(),
+            Curve::Parametric {
+                function: 1,
+                params: [1.0, 1.0, -0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+            Curve::Table(vec![256]),
+        ];
+        let xs = [
+            -1.0,
+            -0.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            1.0e-300,
+            0.25,
+            0.999_999_999,
+            1.0,
+            1.0 + f64::EPSILON,
+            7.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        for c in &forms {
+            assert!(c.is_unit_gamma());
+            let op = lut_op(Stage::Curves(vec![c.clone(); 3]));
+            assert!(matches!(op, Op::UnitCurves(3)));
+            for &x in &xs {
+                let mut v = [0.0; 16];
+                v[..4].copy_from_slice(&[x, x, x, x]);
+                assert_eq!(run(std::slice::from_ref(&op), &mut v, 3), 3);
+                for got in &v[..3] {
+                    assert_eq!(got.to_bits(), c.eval(x).to_bits(), "{c:?} at {x}");
+                }
+                // Channels past the curves are left alone.
+                assert_eq!(v[3].to_bits(), x.to_bits());
+            }
+        }
+        // Not every identity: an empty `curv` keeps the sign of a zero, and
+        // mixed stages stay per-curve.
+        assert!(!Curve::identity().is_unit_gamma());
+        assert!(!Curve::gamma(2.2).is_unit_gamma());
+        let mixed = lut_op(Stage::Curves(vec![Curve::gamma(1.0), Curve::srgb()]));
+        assert!(matches!(mixed, Op::Lut(Stage::Curves(_))));
     }
 }

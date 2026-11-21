@@ -94,6 +94,17 @@ impl Curve {
         }
     }
 
+    /// `true` for an identity written as a power of exactly 1 (`para`
+    /// function 0 or 1, or a one-entry `curv`): [`Curve::eval`] of such a
+    /// curve is `x` clamped to `0..=1`, with `0.0` for everything that is
+    /// not above zero.
+    pub(crate) fn is_unit_gamma(&self) -> bool {
+        match self {
+            Self::Table(t) => t.len() == 1 && t[0] == 256,
+            Self::Parametric { .. } => self.is_identity(),
+        }
+    }
+
     /// Evaluates the curve at `x` (clamped to `0..=1`); the result is clamped
     /// to `0..=1`.
     #[must_use]
