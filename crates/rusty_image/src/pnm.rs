@@ -51,33 +51,82 @@ fn next_u32(r: &mut Reader) -> Result<u32> {
     }
 }
 
-/// One ASCII sample (for P1-P3), at most `max`.
-fn ascii_sample(r: &mut Reader, max: u32) -> Result<u16> {
-    let mut v: u16 = 0;
-    let mut any = false;
-    while let Ok(b) = r.u8() {
-        if is_space(b) {
-            if any {
-                break;
+/// The ASCII raster of a P2/P3 file: one sample of `W` bytes (1, or 2 in
+/// native order) per whitespace-separated number, each at most `max`. A
+/// number is preceded by any amount of whitespace and followed by one
+/// whitespace byte or the end of the data.
+///
+/// The whole raster is parsed over a slice iterator held in locals: a
+/// pointer compare per byte, where a `Reader::u8` per byte was an overflow
+/// check, a range check and a one-byte copy behind a call per sample. Each
+/// sample is two short loops with no state between them: skip whitespace up
+/// to the first digit, then take digits up to the whitespace byte that ends
+/// the number. A digit is recognised by one compare (`b - '0' <= 9`) ahead
+/// of the whitespace test, since most bytes are digits. The value
+/// accumulates in a `u32`; the `> 0xffff` test after each digit rejects
+/// exactly what a 16-bit checked multiply-and-add did, at the same byte.
+#[inline(never)]
+fn ascii_raster<const W: usize>(data: &[u8], buf: &mut [u8], max: u32) -> Result<()> {
+    let mut it = data.iter();
+    for out in buf.chunks_exact_mut(W) {
+        let mut v = loop {
+            let Some(&b) = it.next() else {
+                return Err(Error::Truncated);
+            };
+            let d = b.wrapping_sub(b'0');
+            if d <= 9 {
+                break u32::from(d);
             }
-            continue;
+            if !is_space(b) {
+                return Err(Error::invalid("pnm: bad digit in raster"));
+            }
+        };
+        for &b in it.by_ref() {
+            let d = b.wrapping_sub(b'0');
+            if d > 9 {
+                if is_space(b) {
+                    break;
+                }
+                return Err(Error::invalid("pnm: bad digit in raster"));
+            }
+            v = v * 10 + u32::from(d);
+            if v > 0xffff {
+                return Err(Error::invalid("pnm: sample overflow"));
+            }
         }
-        if !b.is_ascii_digit() {
-            return Err(Error::invalid("pnm: bad digit in raster"));
+        if v > max {
+            return Err(Error::invalid("pnm: sample overflow"));
         }
-        v = v
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(u16::from(b - b'0')))
-            .ok_or_else(|| Error::invalid("pnm: sample overflow"))?;
-        any = true;
+        if W == 2 {
+            out.copy_from_slice(&(v as u16).to_ne_bytes());
+        } else {
+            out[0] = v as u8;
+        }
     }
-    if !any {
-        return Err(Error::Truncated);
+    Ok(())
+}
+
+/// The ASCII raster of a P1 file: one `0` (white, 255) or `1` (black, 0)
+/// per pixel, whitespace allowed anywhere between them.
+#[inline(never)]
+fn ascii_bits(data: &[u8], buf: &mut [u8]) -> Result<()> {
+    let mut it = data.iter();
+    for out in buf.iter_mut() {
+        *out = loop {
+            let Some(&b) = it.next() else {
+                return Err(Error::Truncated);
+            };
+            // '0' -> 255, '1' -> 0.
+            let d = b.wrapping_sub(b'0');
+            if d <= 1 {
+                break d.wrapping_sub(1);
+            }
+            if !is_space(b) {
+                return Err(Error::invalid("pbm: unexpected byte in raster"));
+            }
+        };
     }
-    if u32::from(v) > max {
-        return Err(Error::invalid("pnm: sample overflow"));
-    }
-    Ok(v)
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -273,28 +322,13 @@ pub fn decode(data: &[u8]) -> Result<Image> {
             }
         }
         (Tuple::Pbm, true) => {
-            for b in buf.iter_mut() {
-                loop {
-                    match r.u8()? {
-                        c if is_space(c) => continue,
-                        b'0' => *b = 255,
-                        b'1' => *b = 0,
-                        _ => return Err(Error::invalid("pbm: unexpected byte in raster")),
-                    }
-                    break;
-                }
-            }
+            ascii_bits(r.rest(), buf)?;
         }
         (_, true) => {
-            let max = if wide { 0xffff } else { 0xff };
             if wide {
-                for c in buf.chunks_exact_mut(2) {
-                    c.copy_from_slice(&ascii_sample(&mut r, max)?.to_ne_bytes());
-                }
+                ascii_raster::<2>(r.rest(), buf, 0xffff)?;
             } else {
-                for b in buf.iter_mut() {
-                    *b = ascii_sample(&mut r, max)? as u8;
-                }
+                ascii_raster::<1>(r.rest(), buf, 0xff)?;
             }
         }
         (_, false) => {
