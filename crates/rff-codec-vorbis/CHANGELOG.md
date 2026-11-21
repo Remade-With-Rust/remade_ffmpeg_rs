@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-vorbis-v0.6.3...rff-codec-vorbis-v0.7.0) - 2026-11-21
+
+### Fixed
+
+- *(packaging)* ship the Apache-2.0 LICENSE text in every published crate
+
 ## [0.4.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-codec-vorbis-v0.3.1...rff-codec-vorbis-v0.4.0) - 2026-10-24
 
 ### Fixed
