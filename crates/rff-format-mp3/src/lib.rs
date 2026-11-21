@@ -11,6 +11,16 @@
 //! free format), locking onto the layer of the first frame and labelling the
 //! stream [`CodecId::Mp1`] / [`CodecId::Mp2`] / [`CodecId::Mp3`] by it.
 //!
+//! A header is not enough to be a frame: with no container around them, the
+//! frames have to vouch for each other. Both the demuxer and the content
+//! sniffing use minimp3's rule (`mp3d_find_frame` / `mp3d_match_frame`): a
+//! frame counts when the header after it is of the same stream (version,
+//! layer, sample rate), and where the stream is not yet established, when a
+//! run of such headers follows it. A frame damaged near its header, and bytes
+//! of another kind of file that happen to look like a header, are therefore
+//! dropped rather than handed to the decoder. The rule is spelled out on the
+//! demuxer type.
+//!
 //! Frame parsing here is a container concern (finding frame boundaries), kept
 //! self-contained — the same small MPEG-1/2/2.5 header fields the decoder
 //! reads, but only as far as the byte layout needs.
@@ -63,6 +73,13 @@ const BITRATE_V2: [u32; 16] = [
 /// Base sample rates (Hz) by index, MPEG-1; halved for MPEG-2, quartered for 2.5.
 const SAMPLE_RATE: [u32; 4] = [44100, 48000, 32000, 0];
 
+/// What stays put from frame to frame of one stream, exactly as minimp3's
+/// `hdr_compare` reads it: the version bits, the layer, the sample-rate index
+/// and whether the bitrate is free format. The bitrate, the padding, the CRC
+/// flag and the channel mode may change from frame to frame.
+type StreamKey = (u32, u8, usize, bool);
+
+#[derive(Clone, Copy)]
 struct FrameInfo {
     /// 1, 2 or 3.
     layer: u8,
@@ -71,11 +88,16 @@ struct FrameInfo {
     /// Decoded samples this frame yields (Layer III: 1152 MPEG-1, 576
     /// MPEG-2/2.5; Layer I 384, Layer II 1152).
     samples: u32,
-    /// Total frame length in bytes (header + side info + main data + padding).
+    /// Total frame length in bytes (header + side info + main data + padding);
+    /// 0 for a free-format frame, whose length is the distance to the next
+    /// header.
     size: usize,
     /// Byte offset of the Xing/Info tag within the frame (after header/CRC/side
     /// info) — used to recognise and drop the header frame.
     tag_offset: usize,
+    key: StreamKey,
+    /// Bytes the padding bit added (4 in Layer I, 1 otherwise, or 0).
+    pad: usize,
 }
 
 /// Parse a 4-byte MPEG audio Layer III frame header. Returns `None` for a bad
@@ -136,6 +158,8 @@ fn parse_header(b: &[u8]) -> Option<FrameInfo> {
         samples,
         size,
         tag_offset: 4 + crc + side_info_len,
+        key: (version, 3, sr_idx, false),
+        pad: padding,
     })
 }
 
@@ -164,22 +188,17 @@ const BITRATE_L12: [[u32; 16]; 4] = [
 ];
 /// Largest free-format frame searched for (bytes).
 const MAX_FREE_FRAME: usize = 4096;
+/// The longest frame a table bitrate gives: MPEG-2.5 Layer II, 160 kbps at
+/// 8 kHz, padded.
+const MAX_FRAME: usize = 2881;
+/// How many headers after a frame found by searching must be its stream's,
+/// each where the frame before it ends, unless the data ends first (minimp3's
+/// `MAX_FRAME_SYNC_MATCHES`).
+const MAX_MATCHES: usize = 10;
 
-/// A Layer I / II frame header: geometry plus the fields that must stay put
-/// from frame to frame of one stream.
-struct L12Header {
-    /// `size` is 0 for a free-format frame (its size is the distance to the
-    /// next header).
-    info: FrameInfo,
-    /// Version bits, layer, sample-rate index, CRC flag, free format: equal
-    /// across the frames of one stream.
-    key: (u32, u8, usize, bool, bool),
-    /// Bytes the padding bit added (4 in Layer I, 1 in Layer II, or 0).
-    pad: usize,
-}
-
-/// Parse a Layer I or II header (`None` for anything else, or reserved fields).
-fn parse_l12_header(b: &[u8]) -> Option<L12Header> {
+/// Parse a Layer I or II header (`None` for anything else, or reserved
+/// fields). `size` is 0 for a free-format frame.
+fn parse_l12_header(b: &[u8]) -> Option<FrameInfo> {
     let h = u32::from_be_bytes(*b.first_chunk::<4>()?);
     if (h >> 21) & 0x7FF != 0x7FF {
         return None;
@@ -217,26 +236,36 @@ fn parse_l12_header(b: &[u8]) -> Option<L12Header> {
         )
     };
     let size = if br_idx == 0 { 0 } else { size };
-    let crc = (h >> 16) & 1 == 0;
     let channels: u16 = if (h >> 6) & 0x3 == 0b11 { 1 } else { 2 };
-    Some(L12Header {
-        info: FrameInfo {
-            layer,
-            sample_rate,
-            channels,
-            samples,
-            size,
-            tag_offset: 0,
-        },
-        key: (version, layer, sr_idx, crc, br_idx == 0),
+    Some(FrameInfo {
+        layer,
+        sample_rate,
+        channels,
+        samples,
+        size,
+        tag_offset: 0,
+        key: (version, layer, sr_idx, br_idx == 0),
         pad,
     })
 }
 
-/// The header `b` starts, if it can follow `h` in one stream (same version,
-/// layer, rate, CRC flag, free-format-ness and channel count).
-fn l12_next(h: &L12Header, b: &[u8]) -> Option<L12Header> {
-    parse_l12_header(b).filter(|n| n.key == h.key && n.info.channels == h.info.channels)
+/// The frame header of any layer `b` starts with, if it is one.
+fn parse_any(b: &[u8]) -> Option<FrameInfo> {
+    if b.len() < 4 || b[0] != 0xFF || b[1] & 0xE0 != 0xE0 {
+        return None;
+    }
+    if b[1] & 0x04 == 0 {
+        // Layer III (or the reserved layer, which never parses).
+        parse_header(b)
+    } else {
+        parse_l12_header(b)
+    }
+}
+
+/// The header `b` starts with, if it can follow `h` in one stream (minimp3's
+/// `hdr_compare`: same version, layer, sample rate and free-format-ness).
+fn next_in_stream(h: &FrameInfo, b: &[u8]) -> Option<FrameInfo> {
+    parse_any(b).filter(|n| n.key == h.key)
 }
 
 /// Bytes that can follow the last frame of a stream: a tag.
@@ -244,77 +273,87 @@ fn is_tag_start(b: &[u8]) -> bool {
     b.starts_with(b"TAG") || b.starts_with(b"APE") || b.starts_with(b"ID3") || b.starts_with(b"LYR")
 }
 
-/// Free-format frame size at the start of `buf`: the distance to the next
-/// header of the stream (`None` if none is in reach).
-fn free_size_in(h: &L12Header, buf: &[u8]) -> Option<usize> {
-    let min = if h.info.layer == 1 { 24 } else { 48 };
-    (min..=MAX_FREE_FRAME.min(buf.len().saturating_sub(4)))
-        .find(|&i| buf[i] == 0xFF && l12_next(h, &buf[i..]).is_some())
-}
-
-/// Whether a Layer I/II frame `h` of `size` bytes at the start of `buf` is
-/// confirmed by the two headers of its stream after it (or a tag, or the end
-/// of the data exactly at a frame boundary, in their place). `at_end`: `buf`
-/// runs to the end of the input, so nothing more can arrive.
-fn l12_confirmed(h: &L12Header, size: usize, buf: &[u8], at_end: bool) -> bool {
-    let (mut at, mut prev_pad, mut size) = (size, h.pad, size);
-    let free = h.key.4;
-    let levels = if free { 3 } else { 2 };
-    for depth in 0..levels {
-        let Some(next) = buf.get(at..) else {
-            // The confirming frame runs past the data. Its header already
-            // matched, which is confirmation enough even at the end of the
-            // input: a file cut inside its second frame still has a whole
-            // first one (#125 follow-up; Layer III takes the same view).
-            return depth > 0;
-        };
-        if next.len() < 4 {
-            return depth > 0 || (next.is_empty() && at_end);
+/// Whether the frame `h` of `size` bytes at the start of `buf` is followed by
+/// its stream: minimp3's `mp3d_match_frame`. Up to [`MAX_MATCHES`] headers
+/// must follow, each of `h`'s stream and each where the frame before it ends;
+/// the walk ends early, and well, where the data ends (or a tag or zero
+/// padding begins) after at least ONE of them matched -- so a frame whose
+/// successor is cut off by the end of the file still counts (#125), and a lone
+/// header does not. `buf` must reach the end of the input or hold the whole
+/// walk.
+fn stream_follows(h: &FrameInfo, size: usize, buf: &[u8]) -> bool {
+    // A free-format stream keeps its frame length; only the padding varies.
+    let free = h.key.3.then(|| size - h.pad);
+    let mut at = size;
+    for matched in 0..MAX_MATCHES {
+        let rest = buf.get(at..).unwrap_or(&[]);
+        if rest.len() < 4 || is_tag_start(rest) || rest[..4] == [0; 4] {
+            return matched > 0;
         }
-        if is_tag_start(next) {
-            return true;
-        }
-        let Some(n) = l12_next(h, next) else {
-            // Free format searched for the first level; a stream switch is
-            // fine at the last.
-            return free && depth == 2 && parse_l12_header(next).is_some();
+        let Some(next) = next_in_stream(h, rest) else {
+            return false;
         };
-        let n_size = if free {
-            size - prev_pad + n.pad
-        } else {
-            n.info.size
+        at += match free {
+            Some(unpadded) => unpadded + next.pad,
+            None => next.size,
         };
-        at += n_size;
-        prev_pad = n.pad;
-        size = n_size;
     }
     true
 }
 
-/// Probe score for a Layer I/II stream: a confirmed frame near the start.
-fn probe_l12(data: &[u8]) -> i32 {
+/// Free-format frame size at the start of `buf`: the distance to the next
+/// header of the stream (`None` if none is in reach). As in minimp3, the
+/// header after THAT one must be the stream's too -- the first was found by
+/// looking for it, so on its own it proves nothing -- or, with `at_end` (the
+/// data ends with `buf`), the second frame may end the data exactly. A Layer I
+/// frame is a whole number of 4-byte slots.
+fn free_size_in(h: &FrameInfo, buf: &[u8], at_end: bool) -> Option<usize> {
+    let min = if h.layer == 1 { 24 } else { 48 };
+    (min..=MAX_FREE_FRAME.min(buf.len().saturating_sub(4))).find(|&i| {
+        if buf[i] != 0xFF || (h.layer == 1 && (i - h.pad) % 4 != 0) {
+            return false;
+        }
+        let Some(next) = next_in_stream(h, &buf[i..]) else {
+            return false;
+        };
+        match buf.get(i + (i - h.pad + next.pad)..) {
+            Some(rest) if rest.len() >= 4 => {
+                is_tag_start(rest) || next_in_stream(h, rest).is_some()
+            }
+            Some(rest) => rest.is_empty() && at_end,
+            None => false,
+        }
+    })
+}
+
+/// Offset of the first frame in `data` that minimp3's sync rule
+/// (`mp3d_find_frame`) takes: a valid header whose whole frame is there and
+/// whose stream follows it ([`stream_follows`]) -- or, at offset 0 only, a
+/// frame that is all of `data` (a one-frame file).
+fn find_frame(data: &[u8]) -> Option<usize> {
     let mut i = 0;
     while i + 4 <= data.len() {
-        if data[i] == 0xFF && data[i + 1] & 0xE4 == 0xE4 {
-            if let Some(h) = parse_l12_header(&data[i..]) {
-                let size = if h.key.4 {
-                    free_size_in(&h, &data[i..])
-                } else {
-                    Some(h.info.size)
-                };
-                // The probe buffer is a prefix: running out of it is not the
-                // end of the file.
-                if size.is_some_and(|s| l12_confirmed(&h, s, &data[i..], false)) {
-                    return if i < 4 { 80 } else { 40 };
+        let buf = &data[i..];
+        if let Some(h) = parse_any(buf) {
+            let size = if h.key.3 {
+                free_size_in(&h, buf, true)
+            } else {
+                Some(h.size)
+            };
+            if let Some(size) = size.filter(|&s| s > 6 && s <= buf.len()) {
+                if (i == 0 && size == buf.len()) || stream_follows(&h, size, buf) {
+                    return Some(i);
                 }
             }
         }
         i += 1;
     }
-    0
+    None
 }
 
-/// First byte offset of a valid frame sync at or after `start`.
+/// First byte offset of a Layer III header at or after `start` (the legacy
+/// whole-buffer walk's sync, kept for the equivalence tests).
+#[cfg(test)]
 fn find_sync(buf: &[u8], start: usize) -> Option<usize> {
     let mut i = start;
     while i + 4 <= buf.len() {
@@ -341,20 +380,19 @@ fn id3v2_len(buf: &[u8]) -> usize {
     10 + size
 }
 
-/// Sniff MP3 by an ID3 tag or a valid frame sync near the start.
+/// Sniff MPEG audio by an ID3 tag, or by a frame near the start that its
+/// stream vouches for (minimp3's rule, [`find_frame`]): one header on its own
+/// -- which a movie, a picture or any file with enough `0xFF` bytes holds
+/// somewhere -- is not a stream. `data` is a prefix of the file, or all of it.
 fn probe_mp3(data: &[u8]) -> i32 {
     if data.len() >= 3 && &data[0..3] == b"ID3" {
         return 90;
     }
-    let l3 = match find_sync(data, 0) {
-        Some(i) if i < 4 => 80, // sync right at the front
-        Some(_) => 40,          // sync after some junk — weaker
+    match find_frame(data) {
+        Some(i) if i < 4 => 80, // a frame right at the front
+        Some(_) => 40,          // a frame after some junk — weaker
         None => 0,
-    };
-    if l3 == 80 {
-        return l3;
     }
-    l3.max(probe_l12(data))
 }
 
 // ── demuxer ───────────────────────────────────────────────────────────────────
@@ -367,15 +405,30 @@ const ID3V1_LEN: usize = 128;
 const APE_HEADER_LEN: usize = 32;
 
 /// Streaming MP3 demuxer. `read_header` skips a leading ID3v2 tag (by its
-/// declared size, without buffering it) and parses the first frame header;
-/// `read_packet` then walks frame by frame through a small window (a frame
-/// is at most ~1.4 KB), so peak memory is O(one frame), not O(file) (issue
-/// #26). Works on pipes.
+/// declared size, without buffering it) and finds the first frame;
+/// `read_packet` then walks frame by frame through a small window, so peak
+/// memory is O(a few frames), not O(file) (issue #26). Works on pipes.
 ///
-/// Frame finding is exactly the whole-buffer walk's: scan byte by byte for a
-/// valid header, take `size` bytes, drop Xing/Info frames, and stop at a
-/// trailing partial frame. In addition, a trailing ID3v1 tag and an APEv2
-/// tag are skipped rather than scanned for false syncs.
+/// **Which bytes are a frame** is minimp3's rule (`mp3dec_decode_frame` /
+/// `mp3d_find_frame`), for every layer: a header is not enough, the stream has
+/// to vouch for the frame.
+///
+/// * A frame that continues the stream -- it starts where the frame before it
+///   ended, with a header of the same version, layer and sample rate -- is
+///   taken when the header right after it continues the stream too.
+/// * Anywhere else (the first frame, after damage or junk) a frame is taken
+///   only when up to [`MAX_MATCHES`] headers of its stream follow it, each
+///   where the frame before ends; the data may end first once one has matched.
+/// * The last frame has no header after it: it is taken when it starts where
+///   the frame before it ended (or the data began) and ends the data exactly,
+///   or a trailing tag follows it. So a file holding exactly one frame demuxes.
+///
+/// So a frame whose header is damaged -- its length is then wrong, and the next
+/// header is not where it says -- is dropped instead of handed to the decoder
+/// as noise, together with the frame before it, which nothing vouches for
+/// either; and bytes that only look like a frame are not one. Xing/Info frames
+/// are dropped, and a trailing ID3v1 tag and an APEv2 tag are skipped rather
+/// than scanned.
 struct Mp3Demuxer {
     /// The source before `read_header`.
     input: Option<Input>,
@@ -387,13 +440,14 @@ struct Mp3Demuxer {
     /// The input has reported end of file.
     eof: bool,
     next_pts: i64,
-    /// Layer locked from the first frame (0 before `read_header`). A Layer III
-    /// stream never looks at Layer I/II headers (as before they existed here);
-    /// a Layer I/II stream takes only headers of its own layer.
+    /// Layer locked from the first frame (0 before `read_header`): a stream
+    /// takes only headers of its own layer.
     layer: u8,
-    /// The previous frame ended exactly at `pos`: a Layer I/II header there is
-    /// taken without confirmation.
-    after_frame: bool,
+    /// `pos` is where the data began or the previous frame ended: no byte has
+    /// been skipped to get here.
+    contiguous: bool,
+    /// The previous frame's stream.
+    prev: Option<StreamKey>,
     /// Measured free-format frame size, without padding.
     free_size: Option<usize>,
     /// `read_packet` has reported the end: it keeps doing so.
@@ -410,7 +464,8 @@ impl Mp3Demuxer {
             eof: false,
             next_pts: 0,
             layer: 0,
-            after_frame: false,
+            contiguous: true,
+            prev: None,
             free_size: None,
             done: false,
         }
@@ -466,110 +521,76 @@ impl Mp3Demuxer {
         Ok(())
     }
 
-    /// A Layer I/II frame at `pos`, if one is there: its geometry (with the
-    /// free-format size resolved). `contiguous`: the previous frame ended
-    /// here, so the header needs no confirmation.
-    fn l12_frame(&mut self, contiguous: bool) -> std::io::Result<Option<FrameInfo>> {
-        let Some(h) = parse_l12_header(&self.buf[self.pos..]) else {
-            return Ok(None);
-        };
-        if self.layer != 0 && h.info.layer != self.layer {
-            return Ok(None);
+    /// Whether the stream vouches for the frame `h` of `size` bytes at `pos`
+    /// (see the type's docs). `true` leaves the whole frame in the window.
+    fn vouched(&mut self, h: &FrameInfo, size: usize) -> std::io::Result<bool> {
+        if size <= 6 {
+            return Ok(false);
         }
-        let size = if h.key.4 {
-            // Free format: the measured size while the header after it agrees,
-            // else measure (again) by searching for the next header.
-            let cached = self.free_size.map(|s| s + h.pad);
-            let fits = match cached {
-                Some(s) => {
-                    self.fill(s + 4)?;
-                    let next = &self.buf[self.pos..];
-                    next.len() < s + 4
-                        || is_tag_start(&next[s..])
-                        || parse_l12_header(&next[s..]).is_some()
-                }
-                None => false,
-            };
-            if fits {
-                cached
-            } else {
-                self.fill(MAX_FREE_FRAME + 4)?;
-                free_size_in(&h, &self.buf[self.pos..])
-            }
-        } else {
-            Some(h.info.size)
-        };
-        let Some(size) = size.filter(|&s| s > 6) else {
-            return Ok(None);
-        };
-        if !contiguous {
-            // Room for the frame and the two after it (or as far as the input
-            // goes); no Layer I/II frame is longer than `MAX_FREE_FRAME`.
-            let look = size + 2 * MAX_FREE_FRAME + 4;
-            let complete = self.fill(look)?;
-            if !l12_confirmed(&h, size, &self.buf[self.pos..], !complete) {
-                return Ok(None);
-            }
-        }
-        if h.key.4 {
-            self.free_size = Some(size - h.pad);
-        }
-        Ok(Some(FrameInfo { size, ..h.info }))
-    }
-
-    /// Whether the Layer III frame at `pos` is followed by two more Layer III
-    /// headers, each where the frame before it ends (or by a tag, or by the
-    /// end of the input, in their place).
-    fn l3_confirmed(&mut self, info: &FrameInfo) -> std::io::Result<bool> {
-        // The largest Layer III frame is 1441 bytes.
-        let complete = self.fill(info.size + 2 * 1441 + 4)?;
+        // The frame and the header after it.
+        let more = self.fill(size + 4)?;
         let buf = &self.buf[self.pos..];
-        let mut at = info.size;
-        for _ in 0..2 {
-            match buf.get(at..) {
-                // Past or at the end of the input: nothing contradicts it.
-                None => return Ok(true),
-                Some(next) if next.len() < 4 => return Ok(!complete || next.is_empty()),
-                Some(next) if is_tag_start(next) => return Ok(true),
-                Some(next) => match parse_header(next) {
-                    Some(n) => at += n.size,
-                    None => return Ok(false),
-                },
+        let Some(rest) = buf.get(size..) else {
+            return Ok(false); // cut off by the end of the input
+        };
+        if self.contiguous {
+            // The last frame: nothing can follow it but a tag.
+            if (rest.is_empty() && !more) || is_tag_start(rest) {
+                return Ok(true);
+            }
+            // Mid-stream: the next header is enough.
+            if self.prev == Some(h.key) && next_in_stream(h, rest).is_some() {
+                return Ok(true);
             }
         }
-        Ok(true)
+        // Found by searching: the whole walk (or as far as the input goes).
+        let longest = if h.key.3 { size + 4 } else { MAX_FRAME };
+        self.fill(size + MAX_MATCHES * longest + 4)?;
+        Ok(stream_follows(h, size, &self.buf[self.pos..]))
     }
 
-    /// Advance to the next valid frame header and return its geometry; `None`
-    /// at end of input. Every step consumes at least one byte or returns.
+    /// The frame at `pos`, if one the stream vouches for is there: its
+    /// geometry, with the free-format size resolved.
+    fn frame_here(&mut self) -> std::io::Result<Option<FrameInfo>> {
+        let Some(h) = parse_any(&self.buf[self.pos..]) else {
+            return Ok(None);
+        };
+        if self.layer != 0 && h.layer != self.layer {
+            return Ok(None);
+        }
+        if !h.key.3 {
+            return Ok(self.vouched(&h, h.size)?.then_some(h));
+        }
+        // Free format: the measured size while the stream agrees with it, else
+        // measure (again) by searching for the next header.
+        let cached = self.free_size.map(|s| s + h.pad);
+        if let Some(size) = cached {
+            if self.vouched(&h, size)? {
+                return Ok(Some(FrameInfo { size, ..h }));
+            }
+        }
+        let complete = self.fill(2 * (MAX_FREE_FRAME + 4) + 4)?;
+        let measured = free_size_in(&h, &self.buf[self.pos..], !complete);
+        if let Some(size) = measured.filter(|&s| Some(s) != cached) {
+            if self.vouched(&h, size)? {
+                self.free_size = Some(size - h.pad);
+                return Ok(Some(FrameInfo { size, ..h }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Advance to the next frame and return its geometry; `None` at end of
+    /// input. Every step consumes at least one byte or returns.
     fn next_sync(&mut self) -> std::io::Result<Option<FrameInfo>> {
-        let mut contiguous = self.after_frame;
         loop {
             if !self.fill(4)? {
                 return Ok(None);
             }
-            let b = &self.buf[self.pos..];
-            if b[0] == 0xFF && b[1] & 0xE0 == 0xE0 {
-                if b[1] & 0x04 == 0 {
-                    // Layer III (or the reserved layer, which never parses).
-                    // Taken on sight once the stream is known to be Layer III,
-                    // exactly as before; the FIRST frame must be confirmed,
-                    // or a Layer III-shaped false sync in garbage ahead of a
-                    // Layer I/II stream would lock the demuxer to Layer III.
-                    if self.layer == 0 || self.layer == 3 {
-                        if let Some(info) = parse_header(b) {
-                            if self.layer == 3 || self.l3_confirmed(&info)? {
-                                return Ok(Some(info));
-                            }
-                        }
-                    }
-                } else if self.layer != 3 {
-                    if let Some(info) = self.l12_frame(contiguous)? {
-                        return Ok(Some(info));
-                    }
-                }
+            if let Some(info) = self.frame_here()? {
+                return Ok(Some(info));
             }
-            contiguous = false;
+            self.contiguous = false;
             let b = &self.buf[self.pos..];
             if b.starts_with(b"TAG") {
                 // ID3v1 iff exactly its 128 bytes remain.
@@ -638,15 +659,13 @@ impl Demuxer for Mp3Demuxer {
                 self.done = true;
                 return Err(Error::Eof);
             };
-            if !self.fill(info.size)? {
-                self.done = true;
-                return Err(Error::Eof); // trailing partial frame
-            }
+            // `next_sync` left the whole frame in the window.
             let frame = &self.buf[self.pos..self.pos + info.size];
             let header_frame = is_header_frame(frame, &info);
             let data = (!header_frame).then(|| frame.to_vec());
             self.pos += info.size;
-            self.after_frame = true;
+            self.contiguous = true;
+            self.prev = Some(info.key);
 
             // Drop the Xing/Info header frame (silent; metadata only).
             let Some(data) = data else { continue };
@@ -812,10 +831,18 @@ mod tests {
     }
 
     #[test]
-    fn probe_recognizes_sync_and_id3() {
-        assert_eq!(probe_mp3(&HDR), 80);
+    fn probe_recognizes_frames_and_id3() {
+        let two = cat(&[&make_frame(HDR, 1), &make_frame(HDR, 2)]);
+        assert_eq!(probe_mp3(&two), 80);
+        // A prefix cut inside the second frame: its header still vouches.
+        assert_eq!(probe_mp3(&two[..500]), 80);
+        assert_eq!(probe_mp3(&cat(&[&[0u8; 100], &two])), 40);
         assert_eq!(probe_mp3(b"ID3\x04\x00\x00\x00\x00\x00\x00"), 90);
         assert_eq!(probe_mp3(b"RIFFxxxxWAVE"), 0);
+        // A header alone is not a stream (it scored 80 before).
+        assert_eq!(probe_mp3(&HDR), 0);
+        // The 4096-byte head the engine sniffs, of a long stream.
+        assert_eq!(probe_mp3(&frames(40)[..4096]), 80);
     }
 
     #[test]
@@ -1023,13 +1050,14 @@ mod tests {
         t.extend((0..payload).map(|i| (i % 251) as u8));
         t
     }
-    /// MPEG-1 128k stereo (+padding), MPEG-1 320k mono with CRC, MPEG-2 64k,
-    /// MPEG-2.5 32k: a mix of frame sizes and sample counts.
+    /// One MPEG-1 44.1 kHz stream whose frames differ in everything a stream
+    /// may vary: 128k stereo (+padding), 320k mono with CRC, 64k joint stereo,
+    /// 192k dual channel -- a mix of frame sizes.
     const HDRS: [[u8; 4]; 4] = [
         [0xFF, 0xFB, 0x92, 0x00],
         [0xFF, 0xFA, 0xE0, 0xC0],
-        [0xFF, 0xF3, 0x80, 0x00],
-        [0xFF, 0xE3, 0x40, 0x40],
+        [0xFF, 0xFB, 0x50, 0x60],
+        [0xFF, 0xFB, 0xB0, 0x80],
     ];
     fn frames(n: usize) -> Vec<u8> {
         let mut f = Vec::new();
@@ -1068,7 +1096,6 @@ mod tests {
             ("id3 past eof", cat(&[&id3v2(10_000)[..500], &frames(0)])),
             ("tiny id3", b"ID3\x04\x00".to_vec()),
             ("leading garbage", cat(&[&garbage, &frames(7)])),
-            ("garbage between", cat(&[&frames(5), &garbage, &frames(5)])),
             (
                 "partial tail",
                 cat(&[&frames(5), &make_frame(HDR, 9)[..300]]),
@@ -1200,7 +1227,7 @@ mod tests {
     const L2_LSF: [u8; 4] = [0xFF, 0xF5, 0xA4, 0xC0];
 
     fn l12_frame(hdr: [u8; 4], fill: u8) -> Vec<u8> {
-        let size = parse_l12_header(&hdr).unwrap().info.size;
+        let size = parse_l12_header(&hdr).unwrap().size;
         let mut f = hdr.to_vec();
         f.resize(size, fill);
         f
@@ -1294,8 +1321,10 @@ mod tests {
         }
     }
 
-    /// Sync-heavy garbage around and between Layer II frames: every real frame
-    /// comes out, nothing else; truncation anywhere never panics.
+    /// Sync-heavy garbage around and between Layer II frames: every frame the
+    /// stream vouches for comes out, nothing else -- not the garbage, and not
+    /// the last frame before each run of garbage, whose next header is not
+    /// there (minimp3 drops it too); truncation anywhere never panics.
     #[test]
     fn layer2_garbage_and_truncation() {
         let mut x = 0x9E37_79B9_u32;
@@ -1313,20 +1342,21 @@ mod tests {
                 })
                 .collect()
         };
-        let frames = l12_frames(L2, 12);
+        let frames = l12_frames(L2, 28);
         let size = 626;
         let file = cat(&[
             &garbage(4000),
-            &frames[..5 * size],
+            &frames[..14 * size],
             &garbage(3000),
-            &frames[5 * size..],
+            &frames[14 * size..],
             &garbage(1500),
         ]);
         for chunk in [usize::MAX, 333] {
             let (input, _) = counting(file.clone(), chunk);
             let (_, packets, _) = drive(Box::new(Mp3Demuxer::new(input)));
             let got: Vec<u8> = packets.iter().flat_map(|p| p.6.clone()).collect();
-            assert_eq!(got, frames, "chunk {chunk}");
+            let want = cat(&[&frames[..13 * size], &frames[14 * size..27 * size]]);
+            assert!(got == want, "chunk {chunk}: {} packets", packets.len());
         }
         let short = cat(&[&l12_frames(L1, 3), &l12_frames(L2_LSF, 2)]);
         for cut in 0..short.len() {
@@ -1337,23 +1367,178 @@ mod tests {
     }
 
     /// A Layer III stream ignores Layer I/II-shaped bytes (as it always did),
-    /// and a Layer II stream ignores Layer III-shaped ones.
+    /// and a Layer II stream ignores Layer III-shaped ones. The frame right
+    /// before the foreign bytes goes with them: its next header is not its
+    /// stream's.
     #[test]
     fn the_first_frame_locks_the_layer() {
-        let file = cat(&[&frames(3), &l12_frames(L2, 3), &frames(2)]);
-        let (head, packets, _) = drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(
-            file.clone(),
-        )))));
+        let file = cat(&[&frames(12), &l12_frames(L2, 3), &frames(12)]);
+        let (head, packets, _) = drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(file)))));
         assert!(head.contains("Mp3"));
-        assert_eq!(packets.len(), 5);
+        assert_eq!(packets.len(), 11 + 12);
         assert!(
             packets.iter().all(|p| p.6[1] & 0x06 == 0x02),
             "Layer III only"
         );
-        assert_same_as_legacy("l3 with l2 inside", &file, &[1, usize::MAX]);
-        let file = cat(&[&l12_frames(L2, 3), &frames(3), &l12_frames(L2, 2)]);
+        let file = cat(&[&l12_frames(L2, 12), &frames(3), &l12_frames(L2, 12)]);
         let (head, packets, _) = drive(Box::new(Mp3Demuxer::new(Box::new(Cursor::new(file)))));
         assert!(head.contains("Mp2"));
-        assert_eq!(packets.len(), 5);
+        assert_eq!(packets.len(), 11 + 12);
+    }
+
+    // ---- the stream has to vouch for a frame (minimp3's sync rule) ----
+
+    /// The packets (as their fill bytes) a file demuxes to, the same whatever
+    /// the read chunking; `None` when no stream is found.
+    fn fills(file: &[u8]) -> Option<Vec<u8>> {
+        let mut seen = None;
+        for chunk in [usize::MAX, 1, 7, 1000] {
+            let (input, _) = counting(file.to_vec(), chunk);
+            let (head, packets, _) = drive(Box::new(Mp3Demuxer::new(input)));
+            let got = (!head.starts_with("Err")).then(|| packets.iter().map(|p| p.6[10]).collect());
+            assert!(seen.is_none() || seen == Some(got.clone()), "chunk {chunk}");
+            seen = Some(got);
+        }
+        seen.flatten()
+    }
+    /// `n` frames of header `hdr`, filled with 1, 2, 3...
+    fn run_of(hdr: [u8; 4], n: usize) -> Vec<Vec<u8>> {
+        (1..=n as u8).map(|i| any_frame(hdr, i)).collect()
+    }
+    fn any_frame(hdr: [u8; 4], fill: u8) -> Vec<u8> {
+        let mut f = hdr.to_vec();
+        f.resize(parse_any(&hdr).unwrap().size, fill);
+        f
+    }
+
+    /// Bytes that pass a single-header check -- a valid header in a file that
+    /// is not MPEG audio -- are neither sniffed as MP3 nor demuxed. (Both
+    /// happened before: any Layer III header was a frame on sight.)
+    #[test]
+    fn a_lone_header_in_other_bytes_is_not_a_stream() {
+        for hdr in [HDR, L2, L1] {
+            let mut junk: Vec<u8> = (0..4000u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8 & 0x7F)
+                .collect();
+            junk[1000..1004].copy_from_slice(&hdr);
+            assert_eq!(probe_mp3(&junk), 0, "{hdr:02X?}");
+            assert_eq!(fills(&junk), None, "{hdr:02X?}");
+            // Right at the front, as a movie or a picture may happen to start.
+            junk[..4].copy_from_slice(&hdr);
+            assert_eq!(probe_mp3(&junk), 0, "{hdr:02X?}");
+            assert_eq!(fills(&junk), None, "{hdr:02X?}");
+        }
+        // Two headers a frame apart, then junk: still one match short of the
+        // ten the rule asks for in the middle of a file.
+        let mut junk = vec![0x11u8; 20_000];
+        junk[100..104].copy_from_slice(&HDR);
+        junk[517..521].copy_from_slice(&HDR);
+        assert_eq!(fills(&junk), None);
+    }
+
+    /// A frame followed by a header of another stream (here: another sample
+    /// rate, as one flipped bit makes of a good header) is not taken, and
+    /// neither is the frame that header starts: the next frame's header is
+    /// not where its (wrong) length says. The stream resumes at the first
+    /// frame a run of matching headers confirms. minimp3 drops the same two.
+    #[test]
+    fn a_frame_before_a_mismatched_header_is_dropped() {
+        for hdr in [HDR, L2, L1] {
+            let mut f = run_of(hdr, 6);
+            f[1][2] ^= 0x04; // frame 2: 44.1 <-> 48 kHz
+            assert!(parse_any(&f[1]).is_some(), "still a valid header");
+            assert_eq!(fills(&f.concat()), Some(vec![3, 4, 5, 6]), "{hdr:02X?}");
+            // Once the stream is established (ten headers followed the first
+            // frame), damage costs those two frames and no more.
+            let kept: Vec<u8> = (1..=16).filter(|i| ![12, 13].contains(i)).collect();
+            let mut f = run_of(hdr, 16);
+            f[12][2] ^= 0x04;
+            assert_eq!(fills(&f.concat()), Some(kept.clone()), "{hdr:02X?}");
+            // The sync word itself gone.
+            let mut f = run_of(hdr, 16);
+            f[12][0] = 0;
+            assert_eq!(fills(&f.concat()), Some(kept), "{hdr:02X?}");
+            // Damage among the FIRST frames: no run of ten vouches for the
+            // frames ahead of it, so the stream starts after it.
+            let mut f = run_of(hdr, 8);
+            f[5][2] ^= 0x04;
+            assert_eq!(fills(&f.concat()), Some(vec![7, 8]), "{hdr:02X?}");
+        }
+        // A header damaged in its BITRATE is still of the stream, so the frame
+        // before it stays; the damaged frame's length is wrong, so it goes.
+        let mut f = run_of(HDR, 16);
+        f[12][2] ^= 0x40;
+        let kept: Vec<u8> = (1..=16).filter(|&i| i != 13).collect();
+        assert_eq!(fills(&f.concat()), Some(kept));
+    }
+
+    /// The last frame of a file has no header after it. It is taken when it
+    /// ends the data exactly, or a tag follows it -- which keeps the one-frame
+    /// file (#125) -- and not when stray bytes follow it (as minimp3).
+    #[test]
+    fn the_last_frame_and_the_one_frame_file() {
+        let mut id3v1 = b"TAG".to_vec();
+        id3v1.resize(ID3V1_LEN, b' ');
+        for hdr in [HDR, L2, L1, L2_LSF] {
+            let one = any_frame(hdr, 1);
+            assert_eq!(fills(&one), Some(vec![1]), "{hdr:02X?}: one frame");
+            assert_eq!(probe_mp3(&one), 80, "{hdr:02X?}: one frame sniffs");
+            assert_eq!(fills(&cat(&[&id3v2(40), &one])), Some(vec![1]));
+            assert_eq!(fills(&cat(&[&one, &id3v1])), Some(vec![1]));
+            assert_eq!(fills(&cat(&[&one, &[0u8; 3]])), None, "{hdr:02X?}");
+            let f = run_of(hdr, 3).concat();
+            assert_eq!(fills(&f), Some(vec![1, 2, 3]));
+            assert_eq!(fills(&cat(&[&f, &id3v1])), Some(vec![1, 2, 3]));
+            assert_eq!(fills(&cat(&[&f, &[0u8; 2]])), Some(vec![1, 2]));
+            // Zero padding ends a stream like the end of the data does (the
+            // frames before the last are vouched for); other bytes there say
+            // the run of headers before them was not a stream.
+            assert_eq!(fills(&cat(&[&f, &[0u8; 64]])), Some(vec![1, 2]));
+            assert_eq!(fills(&cat(&[&f, &[0x55u8; 64]])), None, "{hdr:02X?}");
+            // A frame cut short confirms the one before it and is not a frame.
+            assert_eq!(fills(&f[..f.len() - 9]), Some(vec![1, 2]));
+            // One frame after junk is a lone header again.
+            assert_eq!(fills(&cat(&[&[0x22u8; 50], &one])), None, "{hdr:02X?}");
+        }
+    }
+
+    /// Two streams end to end: the last frame of the first is not followed by
+    /// its own stream and goes; the second stream is found by its own run.
+    #[test]
+    fn a_change_of_stream_costs_one_frame() {
+        let a = run_of(L2, 14).concat(); // 44.1 kHz
+        let b = run_of([0xFF, 0xFD, 0xA4, 0x04], 4).concat(); // 48 kHz
+        let want: Vec<u8> = (1..=13).chain(1..=4).collect();
+        assert_eq!(fills(&cat(&[&a, &b])), Some(want));
+    }
+
+    /// A free-format Layer I frame is a whole number of 4-byte slots, and its
+    /// size is only believed when the header after the next one agrees.
+    #[test]
+    fn free_format_sizes_are_checked() {
+        let free_l1 = [0xFF, 0xFF, 0x00, 0xC0];
+        let h = parse_any(&free_l1).unwrap();
+        let build = |size: usize, n: usize| -> Vec<u8> {
+            let mut f = Vec::new();
+            for i in 0..n {
+                f.extend_from_slice(&free_l1);
+                f.resize((i + 1) * size, 3);
+            }
+            f
+        };
+        assert_eq!(free_size_in(&h, &build(100, 3), false), Some(100));
+        assert_eq!(
+            free_size_in(&h, &build(102, 3), false),
+            None,
+            "not whole slots"
+        );
+        // Two frames and the end of the data; two frames and junk.
+        assert_eq!(free_size_in(&h, &build(100, 2), true), Some(100));
+        assert_eq!(free_size_in(&h, &build(100, 2), false), None);
+        assert_eq!(
+            free_size_in(&h, &cat(&[&build(100, 2), &[9u8; 50]]), true),
+            None
+        );
+        assert_eq!(fills(&build(100, 4)), Some(vec![3, 3, 3, 3]));
     }
 }
