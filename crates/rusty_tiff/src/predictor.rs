@@ -163,10 +163,14 @@ pub(crate) fn undo_float(buf: &mut [u8], row_bytes: usize, spp: usize, bytes: us
     if row_bytes == 0 || bytes == 0 {
         return;
     }
-    let mut tmp = vec![0u8; row_bytes];
+    // The row copy is appended to an empty buffer: `vec![0; row_bytes]`
+    // zero-filled a row per call, and a call is one strip (often one row):
+    // 4.4% of the instructions of an uncompressed float decode.
+    let mut tmp = Vec::with_capacity(row_bytes);
     for row in buf.chunks_mut(row_bytes) {
         let n = row.len();
-        tmp[..n].copy_from_slice(row);
+        tmp.clear();
+        tmp.extend_from_slice(row);
         for i in spp..n {
             tmp[i] = tmp[i].wrapping_add(tmp[i - spp]);
         }
