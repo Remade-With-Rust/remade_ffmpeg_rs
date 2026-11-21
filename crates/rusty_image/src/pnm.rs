@@ -51,33 +51,53 @@ fn next_u32(r: &mut Reader) -> Result<u32> {
     }
 }
 
-/// One ASCII sample (for P1-P3), at most `max`.
-fn ascii_sample(r: &mut Reader, max: u32) -> Result<u16> {
-    let mut v: u16 = 0;
-    let mut any = false;
-    while let Ok(b) = r.u8() {
-        if is_space(b) {
-            if any {
-                break;
+/// The ASCII raster of a P2/P3 file: one sample of `W` bytes (1, or 2 in
+/// native order) per whitespace-separated number, each at most `max`. A
+/// number is preceded by any amount of whitespace and followed by one
+/// whitespace byte or the end of the data.
+///
+/// The whole raster is parsed in one loop over a slice iterator held in
+/// locals: a pointer compare per byte, where a `Reader::u8` per byte was an
+/// overflow check, a range check and a one-byte copy behind a call per
+/// sample (116 Ir a sample on a P3 photo). A digit is recognised by one
+/// compare (`b - '0' <= 9`) ahead of the whitespace test, since most bytes
+/// are digits. The value accumulates in a `u32`; the `> 0xffff` test after
+/// each digit rejects exactly what a 16-bit checked multiply-and-add did,
+/// at the same byte.
+fn ascii_raster<const W: usize>(data: &[u8], buf: &mut [u8], max: u32) -> Result<()> {
+    let mut it = data.iter();
+    for out in buf.chunks_exact_mut(W) {
+        let mut v: u32 = 0;
+        let mut any = false;
+        for &b in it.by_ref() {
+            let d = b.wrapping_sub(b'0');
+            if d <= 9 {
+                v = v * 10 + u32::from(d);
+                if v > 0xffff {
+                    return Err(Error::invalid("pnm: sample overflow"));
+                }
+                any = true;
+            } else if is_space(b) {
+                if any {
+                    break;
+                }
+            } else {
+                return Err(Error::invalid("pnm: bad digit in raster"));
             }
-            continue;
         }
-        if !b.is_ascii_digit() {
-            return Err(Error::invalid("pnm: bad digit in raster"));
+        if !any {
+            return Err(Error::Truncated);
         }
-        v = v
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(u16::from(b - b'0')))
-            .ok_or_else(|| Error::invalid("pnm: sample overflow"))?;
-        any = true;
+        if v > max {
+            return Err(Error::invalid("pnm: sample overflow"));
+        }
+        if W == 2 {
+            out.copy_from_slice(&(v as u16).to_ne_bytes());
+        } else {
+            out[0] = v as u8;
+        }
     }
-    if !any {
-        return Err(Error::Truncated);
-    }
-    if u32::from(v) > max {
-        return Err(Error::invalid("pnm: sample overflow"));
-    }
-    Ok(v)
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -286,15 +306,10 @@ pub fn decode(data: &[u8]) -> Result<Image> {
             }
         }
         (_, true) => {
-            let max = if wide { 0xffff } else { 0xff };
             if wide {
-                for c in buf.chunks_exact_mut(2) {
-                    c.copy_from_slice(&ascii_sample(&mut r, max)?.to_ne_bytes());
-                }
+                ascii_raster::<2>(r.rest(), buf, 0xffff)?;
             } else {
-                for b in buf.iter_mut() {
-                    *b = ascii_sample(&mut r, max)? as u8;
-                }
+                ascii_raster::<1>(r.rest(), buf, 0xff)?;
             }
         }
         (_, false) => {
