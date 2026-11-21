@@ -238,8 +238,12 @@ fn eval_table(t: &[u16], x: f64) -> f64 {
         n => {
             let pos = x * (n - 1) as f64;
             // `x` is clamped to `0..=1` by the caller, so `pos >= 0` and the
-            // cast truncation is the floor (no libm call).
-            let i = (pos as usize).min(n - 2);
+            // cast truncation is the floor (no libm call). `pos` is also at
+            // most `n - 1`, far below `i64::MAX` for any table that fits in
+            // memory, so the signed conversion (one `cvttsd2si`) gives the
+            // same index as the saturating `as usize` (a dozen instructions
+            // on x86-64).
+            let i = (pos as i64 as usize).min(n - 2);
             let f = pos - i as f64;
             let a = f64::from(t[i]);
             let b = f64::from(t[i + 1]);
