@@ -1003,8 +1003,21 @@ fn copy_typed<T: Sample>(out: &mut [T], chunk: &[u8], g: &Geom) {
         let src = &chunk[r * g.chunk_row_bytes..];
         let y = g.y0 + r;
         if g.planar {
-            for i in 0..g.cols {
-                out[(y * g.width + g.x0 + i) * g.spp + g.plane] = T::from_ne(&src[i * T::N..]);
+            // One sample of every pixel of the row. The pixel is a
+            // fixed-size chunk for 2 to 4 samples, so the write is one store
+            // at a constant stride; indexing `out` per sample (a multiply
+            // and a bounds check each) was 10 Ir a sample.
+            let base = (y * g.width + g.x0) * g.spp;
+            let row = &mut out[base..base + g.cols * g.spp];
+            match g.spp {
+                2 => scatter::<T, 2>(row, src, g.plane),
+                3 => scatter::<T, 3>(row, src, g.plane),
+                4 => scatter::<T, 4>(row, src, g.plane),
+                _ => {
+                    for (px, s) in row.chunks_exact_mut(g.spp).zip(src.chunks_exact(T::N)) {
+                        px[g.plane] = T::from_ne(s);
+                    }
+                }
             }
         } else {
             let base = (y * g.width + g.x0) * g.spp;
@@ -1013,6 +1026,16 @@ fn copy_typed<T: Sample>(out: &mut [T], chunk: &[u8], g: &Geom) {
                 *d = T::from_ne(s);
             }
         }
+    }
+}
+
+/// Write the samples in `src` to sample `plane` of each `SPP`-sample pixel
+/// of `row`.
+fn scatter<T: Sample, const SPP: usize>(row: &mut [T], src: &[u8], plane: usize) {
+    assert!(plane < SPP);
+    for (px, s) in row.chunks_exact_mut(SPP).zip(src.chunks_exact(T::N)) {
+        let px: &mut [T; SPP] = px.try_into().unwrap();
+        px[plane] = T::from_ne(s);
     }
 }
 
