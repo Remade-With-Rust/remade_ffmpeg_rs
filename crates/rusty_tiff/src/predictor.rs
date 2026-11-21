@@ -157,6 +157,25 @@ pub(crate) fn apply_horizontal(buf: &mut [u8], row_bytes: usize, spp: usize, byt
     }
 }
 
+/// Byte-wise running sum with stride `spp` (`row[i] += row[i - spp]`), with
+/// the per-sample accumulators of [`undo_h8`] for 1 to 4 samples per pixel
+/// (the indexed loop, which re-reads `row[i - spp]` through a bounds check,
+/// cost 4.3 Ir a byte more: 17.8% of the instructions of an uncompressed
+/// float decode and 37% of its time).
+fn accumulate8(row: &mut [u8], spp: usize) {
+    match spp {
+        1 => undo_h8::<1>(row),
+        2 => undo_h8::<2>(row),
+        3 => undo_h8::<3>(row),
+        4 => undo_h8::<4>(row),
+        _ => {
+            for i in spp..row.len() {
+                row[i] = row[i].wrapping_add(row[i - spp]);
+            }
+        }
+    }
+}
+
 /// Undo the floating-point predictor: byte accumulation with stride `spp`,
 /// then reassemble the big-endian byte planes into native-endian samples.
 pub(crate) fn undo_float(buf: &mut [u8], row_bytes: usize, spp: usize, bytes: usize) {
@@ -171,9 +190,7 @@ pub(crate) fn undo_float(buf: &mut [u8], row_bytes: usize, spp: usize, bytes: us
         let n = row.len();
         tmp.clear();
         tmp.extend_from_slice(row);
-        for i in spp..n {
-            tmp[i] = tmp[i].wrapping_add(tmp[i - spp]);
-        }
+        accumulate8(&mut tmp, spp);
         let wc = n / bytes;
         for k in 0..wc {
             for b in 0..bytes {
