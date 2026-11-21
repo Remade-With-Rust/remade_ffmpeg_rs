@@ -1016,7 +1016,11 @@ fn gradient(p: &mut Pipeline) {
     let t: [f32; 8] = p.r.into();
     let mut idx = u32x8::default();
     for i in 1..ctx.len {
-        let tt = ctx.t_values[i].get();
+        // `black_box` keeps LLVM from vectorising this loop across the stops
+        // (eight accumulators, then eight horizontal sums per call); with the
+        // stop opaque it compares all eight lanes against one stop at a time.
+        // Only here: in the lowp stage the same hint measured slower.
+        let tt = core::hint::black_box(ctx.t_values[i].get());
         let n: u32x8 = u32x8::from([
             (t[0] >= tt) as u32,
             (t[1] >= tt) as u32,
