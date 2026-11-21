@@ -741,11 +741,19 @@ fn load_8888(
     data: &[u8; STAGE_WIDTH * 4],
     r: &mut u16x16, g: &mut u16x16, b: &mut u16x16, a: &mut u16x16,
 ) {
+    // Each pixel is read as one little-endian word and its channels are
+    // shifted and masked out of it: four 16-byte loads and packed shifts.
+    // Indexing the 64 bytes one by one compiled to 64 scalar byte loads and
+    // 64 scalar word stores.
+    let mut px = [0u32; STAGE_WIDTH];
+    for (p, bytes) in px.iter_mut().zip(data.chunks_exact(4)) {
+        *p = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    }
     for i in 0..STAGE_WIDTH {
-        r.0[i] = data[i * 4] as u16;
-        g.0[i] = data[i * 4 + 1] as u16;
-        b.0[i] = data[i * 4 + 2] as u16;
-        a.0[i] = data[i * 4 + 3] as u16;
+        r.0[i] = (px[i] & 0xff) as u16;
+        g.0[i] = ((px[i] >> 8) & 0xff) as u16;
+        b.0[i] = ((px[i] >> 16) & 0xff) as u16;
+        a.0[i] = (px[i] >> 24) as u16;
     }
 }
 
