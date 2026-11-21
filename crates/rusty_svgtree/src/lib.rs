@@ -127,6 +127,8 @@ impl Tree {
     /// Parses SVG bytes (UTF-8 or any encoding `rusty_xml` detects).
     pub fn from_data(data: &[u8], opt: &Options) -> Result<Tree, Error> {
         let xml = svgtree::parse_xml(data)?;
+        // The document borrows its attribute values from the XML DOM, which
+        // therefore lives until the conversion is done.
         let doc = svgtree::build(
             &xml,
             svgtree::Limits {
@@ -134,8 +136,9 @@ impl Tree {
                 max_depth: opt.max_depth,
             },
         )?;
-        drop(xml);
         let converted = convert::convert_doc(&doc, opt)?;
+        drop(doc);
+        drop(xml);
         let s = converted.size;
         if f64::from(s.width()) * f64::from(s.height()) > opt.max_canvas_pixels as f64 {
             return Err(Error::InvalidSize);

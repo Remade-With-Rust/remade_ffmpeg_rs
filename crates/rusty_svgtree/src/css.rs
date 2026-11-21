@@ -6,6 +6,7 @@
 //! are stably sorted by specificity, as `simplecss` (what usvg uses) does.
 //! At-rules are skipped. Anything unparseable is skipped, never fatal.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// One `name: value` declaration.
@@ -543,7 +544,7 @@ pub(crate) fn parse_declarations(text: &str) -> Vec<Declaration> {
     for_each_declaration(text, |name, value, important| {
         out.push(Declaration {
             name: name.to_string(),
-            value: value.to_string(),
+            value: value.into_owned(),
             important,
         });
     });
@@ -553,8 +554,8 @@ pub(crate) fn parse_declarations(text: &str) -> Vec<Declaration> {
 /// Calls `f(name, value, important)` for each declaration of a block body,
 /// in order: the name lower-cased, comments stripped from both. Nothing is
 /// allocated for a declaration that has no comment and no upper-case letter
-/// in its name.
-pub(crate) fn for_each_declaration(text: &str, mut f: impl FnMut(&str, &str, bool)) {
+/// in its name, and its value is borrowed from `text`.
+pub(crate) fn for_each_declaration<'t>(text: &'t str, mut f: impl FnMut(&str, Cow<'t, str>, bool)) {
     // Split on `;` outside quotes and parentheses.
     let mut depth = 0i32;
     let mut quote: Option<u8> = None;
@@ -582,7 +583,7 @@ pub(crate) fn for_each_declaration(text: &str, mut f: impl FnMut(&str, &str, boo
 }
 
 /// One `name: value [!important]` item of a declaration block.
-fn declaration(item: &str, f: &mut impl FnMut(&str, &str, bool)) {
+fn declaration<'t>(item: &'t str, f: &mut impl FnMut(&str, Cow<'t, str>, bool)) {
     let Some(colon) = item.find(':') else {
         return;
     };
@@ -600,12 +601,10 @@ fn declaration(item: &str, f: &mut impl FnMut(&str, &str, bool)) {
     }
     // Strip comments inside names and values. Both are trimmed already, so
     // one without a comment is the text as it stands.
-    let value_buf;
     let value = if value.contains("/*") {
-        value_buf = strip_comments(value);
-        value_buf.as_str()
+        Cow::Owned(strip_comments(value))
     } else {
-        value
+        Cow::Borrowed(value)
     };
     let name_buf;
     let name = if name.contains("/*") || name.bytes().any(|c| c.is_ascii_uppercase()) {
