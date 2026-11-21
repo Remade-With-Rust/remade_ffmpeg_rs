@@ -32,6 +32,8 @@ mod faststart;
 pub mod fmp4;
 #[cfg(test)]
 mod issue114_tests;
+#[cfg(test)]
+mod issue114b_tests;
 mod meta;
 
 use std::borrow::Cow;
@@ -41,10 +43,13 @@ use rff_core::{CodecId, Error, MediaType, Packet, Rational, Result, Timecode};
 
 use entry::PcmLayout;
 pub use faststart::faststart_in_place;
+use std::sync::{Arc, Mutex};
+
 use rff_format::{
     Demuxer, EditEntry, Format, FormatRegistry, Input, MuxCaps, Muxer, Output, ReadSeek,
     SampleIndex, SampleInfo, SeekInput, SeekOutput, Stream,
 };
+use rff_format::{SampleSource, SharedInput};
 
 /// What the `mp4` (ISO) muxer carries. H.264 and AAC lead: callers that pick
 /// a container's first codec of a media type get the widely playable pair.
@@ -254,6 +259,7 @@ fn find<'a>(boxes: &[([u8; 4], &'a [u8])], typ: &[u8; 4]) -> Option<&'a [u8]> {
 /// Offsets and sizes stay `u64`: a file past 4 GiB must index the same on a
 /// 32-bit target (wasm32) as on a 64-bit one, so nothing here is narrowed to
 /// `usize` until a buffer is actually sliced (and then checked).
+#[derive(Clone, Copy)]
 struct SampleLoc {
     stream_index: usize,
     offset: u64,
@@ -266,6 +272,19 @@ struct SampleLoc {
     keyframe: bool,
 }
 
+impl SampleLoc {
+    fn info(&self) -> SampleInfo {
+        SampleInfo {
+            offset: self.offset,
+            size: u32::try_from(self.size).unwrap_or(u32::MAX),
+            dts: self.dts,
+            pts: self.pts,
+            duration: self.duration,
+            sync: self.keyframe,
+        }
+    }
+}
+
 use rff_format::avc::{avcc_to_annexb, parse_avcc, split_annexb, AvcConfig};
 
 /// Where sample bytes come from once the header is parsed.
@@ -275,26 +294,27 @@ enum Source {
     Seekable(SeekInput),
     /// Stream fallback: a non-seekable input can't jump to `moov` at the end
     /// of the file and back, so it is buffered whole and sliced per sample.
-    Buffered(Vec<u8>),
+    Buffered(Arc<Vec<u8>>),
     /// Seekable: only `moov` was read; each sample is fetched by offset.
     /// `cur` is the reader's position, so contiguous samples need no seek.
     Random {
-        reader: BufReader<SeekInput>,
+        reader: BufReader<SharedInput>,
         cur: u64,
     },
     /// Header already taken (or failed).
     Done,
 }
 
-struct Mp4Demuxer {
-    src: Source,
+/// The index tables, built once by `read_header` and then only read: shared
+/// (an `Arc`) with every [`SampleSource`] the demuxer hands out.
+#[derive(Default)]
+struct Tables {
     samples: Vec<SampleLoc>,
     /// Indexed by stream_index; `Some` for H.264 tracks needing conversion.
     avc: Vec<Option<AvcConfig>>,
     /// Indexed by stream_index; `Some` for PCM tracks, whose on-disk byte
     /// order or signedness may differ from rff's little-endian formats.
     pcm: Vec<Option<PcmLayout>>,
-    pos: usize,
     /// Per stream: positions in `samples` of its samples, in decode order
     /// ([`SampleIndex`]).
     by_track: Vec<Vec<u32>>,
@@ -303,16 +323,105 @@ struct Mp4Demuxer {
     /// Per stream: the `elst` entries.
     edits: Vec<Vec<EditEntry>>,
     movie_timescale: u32,
+    /// Per stream: the stored sample table, no edit list applied
+    /// ([`SampleIndex::raw_sample_info`]).
+    stored: Vec<Vec<SampleLoc>>,
+}
+
+impl Tables {
+    fn sample_info(&self, stream: usize, index: u64) -> Option<SampleInfo> {
+        let at = *self
+            .by_track
+            .get(stream)?
+            .get(usize::try_from(index).ok()?)?;
+        Some(self.samples[at as usize].info())
+    }
+
+    fn loc(&self, stream: usize, index: u64) -> Result<SampleLoc> {
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| self.by_track.get(stream)?.get(i).copied())
+            .map(|at| self.samples[at as usize])
+            .ok_or_else(|| Error::invalid("mp4 demux: no such sample"))
+    }
+
+    fn raw_loc(&self, stream: usize, index: u64) -> Result<SampleLoc> {
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| self.stored.get(stream)?.get(i).copied())
+            .ok_or_else(|| Error::invalid("mp4 demux: no such sample"))
+    }
+
+    fn sync_at_or_before(&self, stream: usize, pts: i64) -> Option<u64> {
+        let s = self.sync.get(stream)?;
+        let n = s.partition_point(|&(p, _)| p <= pts);
+        // The latest-shown sync sample at or before `pts`; among equal pts the
+        // one decoded last (sorted by (pts, number)).
+        n.checked_sub(1).map(|i| u64::from(s[i].1))
+    }
+}
+
+struct Mp4Demuxer {
+    src: Source,
+    t: Arc<Tables>,
+    pos: usize,
     /// Streams [`Demuxer::set_discard`] dropped: `read_packet` passes over
     /// their samples without fetching them.
     discard: Vec<bool>,
     /// [`Demuxer::set_raw_samples`]: hand samples out as stored.
     raw: bool,
-    /// Per stream: the stored sample table, no edit list applied
-    /// ([`SampleIndex::raw_sample_info`]).
-    stored: Vec<Vec<SampleLoc>>,
     /// `udta` / `meta` / `mvhd` metadata ([`Demuxer::metadata`]).
     metadata: rff_core::Dictionary,
+    /// The seekable input, shared, for [`SampleIndex::sample_source`].
+    shared: Option<SharedInput>,
+}
+
+/// [`SampleIndex::sample_source`] for MP4: the demuxer's tables (shared)
+/// and a reader of its own over the shared input.
+struct Mp4SampleSource {
+    t: Arc<Tables>,
+    src: Mutex<Source>,
+    raw: bool,
+}
+
+impl SampleSource for Mp4SampleSource {
+    fn sample_count(&self, stream: usize) -> u64 {
+        self.t.by_track.get(stream).map_or(0, |t| t.len() as u64)
+    }
+    fn sample_info(&self, stream: usize, index: u64) -> Option<SampleInfo> {
+        self.t.sample_info(stream, index)
+    }
+    fn read_sample(&self, stream: usize, index: u64) -> Result<Packet> {
+        let loc = self.t.loc(stream, index)?;
+        let mut src = self
+            .src
+            .lock()
+            .map_err(|_| Error::invalid("mp4 demux: sample source poisoned"))?;
+        fetch(&mut src, &self.t, self.raw, &loc)
+    }
+    fn sync_at_or_before(&self, stream: usize, pts: i64) -> Option<u64> {
+        self.t.sync_at_or_before(stream, pts)
+    }
+    fn edit_list(&self, stream: usize) -> &[EditEntry] {
+        self.t.edits.get(stream).map_or(&[], Vec::as_slice)
+    }
+    fn movie_timescale(&self) -> Option<u32> {
+        (self.t.movie_timescale > 0).then_some(self.t.movie_timescale)
+    }
+    fn raw_sample_count(&self, stream: usize) -> u64 {
+        self.t.stored.get(stream).map_or(0, |t| t.len() as u64)
+    }
+    fn raw_sample_info(&self, stream: usize, index: u64) -> Option<SampleInfo> {
+        self.t.raw_loc(stream, index).ok().map(|l| l.info())
+    }
+    fn read_raw_sample(&self, stream: usize, index: u64) -> Result<Packet> {
+        let loc = self.t.raw_loc(stream, index)?;
+        let mut src = self
+            .src
+            .lock()
+            .map_err(|_| Error::invalid("mp4 demux: sample source poisoned"))?;
+        fetch(&mut src, &self.t, self.raw, &loc)
+    }
 }
 
 impl Mp4Demuxer {
@@ -329,26 +438,28 @@ impl Mp4Demuxer {
     fn with_source(src: Source) -> Mp4Demuxer {
         Mp4Demuxer {
             src,
-            samples: Vec::new(),
-            avc: Vec::new(),
-            pcm: Vec::new(),
+            t: Arc::new(Tables::default()),
             pos: 0,
-            by_track: Vec::new(),
-            sync: Vec::new(),
-            edits: Vec::new(),
-            movie_timescale: 0,
             discard: Vec::new(),
             raw: false,
-            stored: Vec::new(),
             metadata: rff_core::Dictionary::new(),
+            shared: None,
         }
     }
 
     /// Read one indexed sample's bytes and shape them as a packet (Annex-B
     /// for H.264 / HEVC and little-endian PCM, unless `raw`).
     fn fetch(&mut self, loc: &SampleLoc) -> Result<Packet> {
+        fetch(&mut self.src, &self.t, self.raw, loc)
+    }
+}
+
+/// Read one indexed sample's bytes from `src` and shape them as a packet
+/// (Annex-B for H.264 / HEVC and little-endian PCM, unless `raw_out`).
+fn fetch(src: &mut Source, t: &Tables, raw_out: bool, loc: &SampleLoc) -> Result<Packet> {
+    {
         let out_of_range = || Error::invalid(OUT_OF_RANGE);
-        let raw: Cow<[u8]> = match &mut self.src {
+        let raw: Cow<[u8]> = match src {
             Source::Buffered(buf) => {
                 let start = usize::try_from(loc.offset).map_err(|_| out_of_range())?;
                 let len = usize::try_from(loc.size).map_err(|_| out_of_range())?;
@@ -391,8 +502,8 @@ impl Mp4Demuxer {
         // prepending the parameter sets on keyframes so the decoder is
         // self-contained. Raw mode keeps the stored form (and the config
         // record is the stream's extradata).
-        let data = match &self.avc[loc.stream_index] {
-            Some(cfg) if !self.raw => {
+        let data = match &t.avc[loc.stream_index] {
+            Some(cfg) if !raw_out => {
                 let mut out = Vec::with_capacity(cfg.headers_annexb.len() + raw.len() + 16);
                 if loc.keyframe {
                     out.extend_from_slice(&cfg.headers_annexb);
@@ -403,8 +514,8 @@ impl Mp4Demuxer {
             // A sample read from a seekable file is moved, not copied.
             _ => {
                 let mut data = raw.into_owned();
-                if !self.raw {
-                    if let Some(Some(pcm)) = self.pcm.get(loc.stream_index) {
+                if !raw_out {
+                    if let Some(Some(pcm)) = t.pcm.get(loc.stream_index) {
                         pcm.convert(&mut data);
                     }
                 }
@@ -419,11 +530,14 @@ impl Mp4Demuxer {
         packet.flags.keyframe = loc.keyframe;
         Ok(packet)
     }
+}
 
+impl Mp4Demuxer {
     /// Build streams + the file-ordered sample table from `moov` (and the
     /// fragments' `moof`s), and say which timecode samples to read.
     fn parse_moov(&mut self, top: &TopLevel) -> Result<(Vec<Stream>, Vec<PendingTimecode>)> {
         let moov_children = child_boxes(&top.moov);
+        let mut tab = Tables::default();
         // Movie timescale (mvhd), the unit of edit-list segment durations.
         let movie_timescale = find(&moov_children, b"mvhd").map_or(0, |mvhd| {
             if mvhd.first() == Some(&1) {
@@ -467,9 +581,9 @@ impl Mp4Demuxer {
                     streams.push(t.stream);
                     tracks.push(t.samples);
                     stored.push(t.stored);
-                    self.avc.push(t.avc);
-                    self.pcm.push(t.pcm);
-                    self.edits.push(t.edits);
+                    tab.avc.push(t.avc);
+                    tab.pcm.push(t.pcm);
+                    tab.edits.push(t.edits);
                     tmcd_refs.push(t.tmcd_refs);
                 }
                 Some(Parsed::Timecode {
@@ -485,7 +599,7 @@ impl Mp4Demuxer {
         }
         // A fragmented file's samples live in its `moof`s, after the (empty) index.
         append_fragments(&top.moofs, &mut frags, &mut tracks, &mut stored);
-        self.stored = stored;
+        tab.stored = stored;
         for (stream, samples) in streams.iter_mut().zip(&tracks) {
             stream.nb_frames = Some(samples.len() as u64);
             if stream.duration.is_none() && !samples.is_empty() {
@@ -517,9 +631,9 @@ impl Mp4Demuxer {
         // Yield samples in file order (natural interleave), each track's in its own
         // order: an edit list can replay samples, so a track's index isn't always in
         // offset order.
-        self.movie_timescale = movie_timescale;
-        self.by_track = tracks.iter().map(|t| Vec::with_capacity(t.len())).collect();
-        self.sync = tracks
+        tab.movie_timescale = movie_timescale;
+        tab.by_track = tracks.iter().map(|t| Vec::with_capacity(t.len())).collect();
+        tab.sync = tracks
             .iter()
             .map(|t| {
                 let mut s: Vec<(i64, u32)> = t
@@ -540,9 +654,10 @@ impl Mp4Demuxer {
             let i = next[t];
             next[t] += 1;
             let loc = &tracks[t][i];
-            self.by_track[t].push(self.samples.len() as u32);
-            self.samples.push(SampleLoc { ..*loc });
+            tab.by_track[t].push(tab.samples.len() as u32);
+            tab.samples.push(SampleLoc { ..*loc });
         }
+        self.t = Arc::new(tab);
         Ok((streams, pending))
     }
 }
@@ -690,10 +805,13 @@ impl Demuxer for Mp4Demuxer {
                     let sample = buf.get(at..at.saturating_add(4));
                     tc.apply(&mut streams, sample);
                 }
-                self.src = Source::Buffered(buf);
+                self.src = Source::Buffered(Arc::new(buf));
                 Ok(streams)
             }
-            Source::Seekable(mut input) => {
+            Source::Seekable(input) => {
+                // Shared, so sample sources can read beside this demuxer.
+                let mut input = SharedInput::new(input);
+                self.shared = Some(input.clone());
                 let top = read_top_level(&mut input)?;
                 let (mut streams, timecodes) = self.parse_moov(&top)?;
                 for tc in timecodes {
@@ -716,7 +834,7 @@ impl Demuxer for Mp4Demuxer {
 
     fn read_packet(&mut self) -> Result<Packet> {
         loop {
-            let Some(loc) = self.samples.get(self.pos) else {
+            let Some(loc) = self.t.samples.get(self.pos) else {
                 return Err(Error::Eof);
             };
             self.pos += 1;
@@ -765,75 +883,59 @@ const OUT_OF_RANGE: &str = "mp4 demux: sample out of range";
 
 impl SampleIndex for Mp4Demuxer {
     fn sample_count(&self, stream: usize) -> u64 {
-        self.by_track.get(stream).map_or(0, |t| t.len() as u64)
+        self.t.by_track.get(stream).map_or(0, |t| t.len() as u64)
     }
 
     fn sample_info(&self, stream: usize, index: u64) -> Option<SampleInfo> {
-        let at = *self
-            .by_track
-            .get(stream)?
-            .get(usize::try_from(index).ok()?)?;
-        let l = &self.samples[at as usize];
-        Some(SampleInfo {
-            offset: l.offset,
-            size: u32::try_from(l.size).unwrap_or(u32::MAX),
-            dts: l.dts,
-            pts: l.pts,
-            duration: l.duration,
-            sync: l.keyframe,
-        })
+        self.t.sample_info(stream, index)
     }
 
     fn read_sample(&mut self, stream: usize, index: u64) -> Result<Packet> {
-        let at = usize::try_from(index)
-            .ok()
-            .and_then(|i| self.by_track.get(stream)?.get(i).copied())
-            .ok_or_else(|| Error::invalid("mp4 demux: no such sample"))?;
-        let loc = SampleLoc {
-            ..self.samples[at as usize]
-        };
+        let loc = self.t.loc(stream, index)?;
         self.fetch(&loc)
     }
 
     fn sync_at_or_before(&self, stream: usize, pts: i64) -> Option<u64> {
-        let s = self.sync.get(stream)?;
-        let n = s.partition_point(|&(p, _)| p <= pts);
-        // The latest-shown sync sample at or before `pts`; among equal pts the
-        // one decoded last (sorted by (pts, number)).
-        n.checked_sub(1).map(|i| u64::from(s[i].1))
+        self.t.sync_at_or_before(stream, pts)
     }
 
     fn edit_list(&self, stream: usize) -> &[EditEntry] {
-        self.edits.get(stream).map_or(&[], Vec::as_slice)
+        self.t.edits.get(stream).map_or(&[], Vec::as_slice)
     }
 
     fn movie_timescale(&self) -> Option<u32> {
-        (self.movie_timescale > 0).then_some(self.movie_timescale)
+        (self.t.movie_timescale > 0).then_some(self.t.movie_timescale)
     }
 
     fn raw_sample_count(&self, stream: usize) -> u64 {
-        self.stored.get(stream).map_or(0, |t| t.len() as u64)
+        self.t.stored.get(stream).map_or(0, |t| t.len() as u64)
     }
 
     fn raw_sample_info(&self, stream: usize, index: u64) -> Option<SampleInfo> {
-        let l = self.stored.get(stream)?.get(usize::try_from(index).ok()?)?;
-        Some(SampleInfo {
-            offset: l.offset,
-            size: u32::try_from(l.size).unwrap_or(u32::MAX),
-            dts: l.dts,
-            pts: l.pts,
-            duration: l.duration,
-            sync: l.keyframe,
-        })
+        self.t.raw_loc(stream, index).ok().map(|l| l.info())
     }
 
     fn read_raw_sample(&mut self, stream: usize, index: u64) -> Result<Packet> {
-        let loc = usize::try_from(index)
-            .ok()
-            .and_then(|i| self.stored.get(stream)?.get(i))
-            .map(|l| SampleLoc { ..*l })
-            .ok_or_else(|| Error::invalid("mp4 demux: no such sample"))?;
+        let loc = self.t.raw_loc(stream, index)?;
         self.fetch(&loc)
+    }
+
+    /// The tables are shared (an `Arc`); the source reads through its own
+    /// handle on the shared input (or the shared buffer of a piped file).
+    fn sample_source(&mut self) -> Option<Arc<dyn SampleSource>> {
+        let src = match &self.src {
+            Source::Buffered(buf) => Source::Buffered(Arc::clone(buf)),
+            Source::Random { .. } => Source::Random {
+                reader: BufReader::with_capacity(64 * 1024, self.shared.clone()?),
+                cur: u64::MAX,
+            },
+            _ => return None,
+        };
+        Some(Arc::new(Mp4SampleSource {
+            t: Arc::clone(&self.t),
+            src: Mutex::new(src),
+            raw: self.raw,
+        }))
     }
 }
 
@@ -1988,6 +2090,8 @@ struct TrackOut {
     /// The newest packet's duration (stream time base; 0 = unknown): the
     /// last sample's `stts` delta, which no later timestamp can give.
     last_duration: i64,
+    /// FLAC: what the written frames say, for the `dfLa` STREAMINFO.
+    flac: Option<rff_format::flac::FlacStats>,
 }
 
 impl TrackOut {
@@ -2005,6 +2109,7 @@ impl TrackOut {
             pcm: None,
             edits: None,
             last_duration: 0,
+            flac: None,
         }
     }
 
@@ -2050,6 +2155,9 @@ impl TrackOut {
         let mut t = TrackOut::new(stream, fourcc);
         t.qt = qt;
         t.pcm = pcm;
+        if stream.codec_id == CodecId::Flac {
+            t.flac = Some(Default::default());
+        }
         let extra = &stream.extradata;
         t.config = match stream.codec_id {
             CodecId::Apv if !extra.is_empty() => Some(fbx(b"apvC", 0, 0, extra)),
@@ -2131,6 +2239,9 @@ impl TrackOut {
                         _ => None,
                     };
                 }
+                if let Some(stats) = &mut self.flac {
+                    stats.push(data);
+                }
                 // An untagged ProRes stream takes its profile from the first
                 // frame's chroma format (the moov is written last).
                 if codec == CodecId::ProRes && self.sizes.is_empty() {
@@ -2205,13 +2316,10 @@ fn require_configs(tracks: &mut [TrackOut]) -> Result<()> {
                 // samples are written with 4-byte length prefixes, and a
                 // copied record declaring a different `nal_len` would be a
                 // corruption of its own.
-                track.config = parse_avcc(&track.stream.extradata).and_then(|cfg| {
-                    let nals = split_annexb(&cfg.headers_annexb);
-                    let nal_type = |n: &&[u8]| n.first().map(|b| b & 0x1F);
-                    let sps = nals.iter().find(|n| nal_type(n) == Some(7))?;
-                    let pps = nals.iter().find(|n| nal_type(n) == Some(8))?;
-                    Some(build_avcc(sps, pps))
-                });
+                // An Annex-B SPS/PPS as extradata (a raw .h264 source)
+                // works the same way.
+                track.config = rff_format::avc::avcc_record_from_extradata(&track.stream.extradata)
+                    .map(|r| bx(b"avcC", &r));
                 if track.config.is_none() {
                     return Err(Error::invalid(
                         "mp4 mux: the h264 stream carries no SPS/PPS, in-band or \
@@ -2223,16 +2331,9 @@ fn require_configs(tracks: &mut [TrackOut]) -> Result<()> {
             CodecId::Hevc => {
                 // An hvcC in extradata (a remux): rebuild it around 4-byte
                 // NAL lengths, which is how the samples are written.
-                track.config =
-                    rff_format::hvc::parse_hvcc(&track.stream.extradata).and_then(|cfg| {
-                        let nals = split_annexb(&cfg.headers_annexb);
-                        let of = |t: u8| {
-                            nals.iter()
-                                .find(|n| n.first().map(|b| (b >> 1) & 0x3F) == Some(t))
-                        };
-                        let r = rff_format::hvc::build_hvcc_record(of(32)?, of(33)?, of(34)?)?;
-                        Some(bx(b"hvcC", &r))
-                    });
+                // ...or Annex-B VPS/SPS/PPS.
+                track.config = rff_format::hvc::hvcc_record_from_extradata(&track.stream.extradata)
+                    .map(|r| bx(b"hvcC", &r));
                 if track.config.is_none() {
                     return Err(Error::invalid(
                         "mp4 mux: the hevc stream carries no VPS/SPS/PPS, in-band or \
@@ -3638,6 +3739,11 @@ fn build_stbl(track: &TrackOut, plan: &TimingPlan) -> Vec<u8> {
                 entry.extend_from_slice(&build_esds(&asc));
             } else if s.codec_id == CodecId::Mp3 {
                 entry.extend_from_slice(&build_esds_mp3());
+            } else if let (Some(stats), CodecId::Flac) = (&track.flac, s.codec_id) {
+                // dfLa with the STREAMINFO the frames written describe.
+                if let Some(cfg) = entry::build_dfla_with(&s.extradata, stats) {
+                    entry.extend_from_slice(&cfg);
+                }
             } else if let Some(cfg) = &track.config {
                 entry.extend_from_slice(cfg); // dfLa, alac, dac3, dec3
             }
@@ -5001,7 +5107,7 @@ mod tests {
         };
         assert_eq!(dem.parse_moov(&top).unwrap().0.len(), 2);
         let (mut big_n, mut small_n) = (0, 0);
-        for loc in &dem.samples {
+        for loc in &dem.t.samples {
             if loc.stream_index == 0 {
                 assert_eq!(loc.size, BIG as u64);
                 assert_eq!(loc.offset, 44 + (big_n * (BIG + 3)) as u64);
@@ -5012,7 +5118,7 @@ mod tests {
             }
         }
         assert_eq!((big_n, small_n), (N, N));
-        let last = dem.samples.iter().map(|l| l.offset).max().unwrap();
+        let last = dem.t.samples.iter().map(|l| l.offset).max().unwrap();
         assert!(last > u32::MAX as u64);
     }
 

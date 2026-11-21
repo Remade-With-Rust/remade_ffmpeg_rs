@@ -28,7 +28,10 @@ use crate::header::{FrameHeader, MpegVersion};
 ///
 /// # Errors
 /// [`Error::InvalidData`](crate::Error::InvalidData) when a granule sets
-/// window switching with the reserved `block_type` 0.
+/// window switching with the reserved `block_type` 0, or claims more than 288
+/// `big_values` pairs (576 lines is all a granule has) -- the two fields
+/// minimp3 (`L3_read_side_info`) and FFmpeg (`mp_decode_layer3`) refuse a
+/// frame for.
 pub fn parse(header: &FrameHeader, bytes: &[u8]) -> Result<SideInfo> {
     let mut r = BitReader::new(bytes);
     let mut si = SideInfo::default();
@@ -53,6 +56,9 @@ pub fn parse(header: &FrameHeader, bytes: &[u8]) -> Result<SideInfo> {
             let g = &mut si.granules[gr][ch];
             g.part2_3_length = r.read_u16(12);
             g.big_values = r.read_u16(9);
+            if g.big_values > 288 {
+                return Err(Error::invalid("mp3 side-info: big_values beyond 288"));
+            }
             g.global_gain = r.read_u8(8);
             g.scalefac_compress = r.read_u16(if mpeg1 { 4 } else { 9 });
             g.window_switching = r.read_bool();
