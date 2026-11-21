@@ -1050,6 +1050,23 @@ fn copy_packed(out: &mut [u8], chunk: &[u8], g: &Geom, out_row_bytes: usize) {
             dst.copy_from_slice(src);
             continue;
         }
+        let bit0 = g.x0 * g.spp * g.bits;
+        if !g.planar && bit0.is_multiple_of(8) {
+            // A tile that starts on a byte of the output row (every tile of
+            // a TIFF with the required multiple-of-16 tile width): whole
+            // bytes are copied, and a last partial byte is merged under a
+            // mask so the bits right of the tile stay as they were. Moving
+            // one bit at a time was 386 Ir per output byte.
+            let nbits = g.cols * g.spp * g.bits;
+            let (full, rem) = (nbits / 8, nbits % 8);
+            let d = &mut dst[bit0 / 8..];
+            d[..full].copy_from_slice(&src[..full]);
+            if rem != 0 {
+                let m = !(0xFFu8 >> rem);
+                d[full] = (d[full] & !m) | (src[full] & m);
+            }
+            continue;
+        }
         if g.planar {
             for i in 0..g.cols {
                 let v = get_bits(src, i * g.bits, g.bits);
@@ -1638,6 +1655,79 @@ mod tests {
             };
             assert_eq!(c.to_ne_bytes(), want);
             assert_eq!(c.into_ne_bytes(), want);
+        }
+    }
+
+    /// The assembly reference: every sample moved one bit at a time.
+    fn copy_packed_bits(out: &mut [u8], chunk: &[u8], g: &Geom, out_row_bytes: usize) {
+        for r in 0..g.rows {
+            let src = &chunk[r * g.chunk_row_bytes..][..g.chunk_row_bytes];
+            let dst = &mut out[(g.y0 + r) * out_row_bytes..][..out_row_bytes];
+            let n = if g.planar { g.cols } else { g.cols * g.spp };
+            for i in 0..n {
+                let v = get_bits(src, i * g.bits, g.bits);
+                let at = if g.planar {
+                    ((g.x0 + i) * g.spp + g.plane) * g.bits
+                } else {
+                    (g.x0 * g.spp + i) * g.bits
+                };
+                set_bits(dst, at, g.bits, v);
+            }
+        }
+    }
+
+    #[test]
+    fn copy_packed_matches_per_bit_moves() {
+        let mut seed = 7u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) as usize
+        };
+        for bits in [1usize, 2, 4] {
+            for spp in [1usize, 3] {
+                for planar in [false, true] {
+                    for (width, cw) in [(40usize, 16usize), (37, 16), (21, 5), (9, 9), (64, 24)] {
+                        let (height, ch) = (5usize, 3usize);
+                        let out_row = (width * spp * bits).div_ceil(8);
+                        let spp_chunk = if planar { 1 } else { spp };
+                        let chunk_row = (cw * spp_chunk * bits).div_ceil(8);
+                        // Start from set bits, so a bit the copy must leave
+                        // alone is seen if it gets cleared.
+                        let mut a = vec![0xA5u8; out_row * height];
+                        let mut b = a.clone();
+                        for plane in 0..if planar { spp } else { 1 } {
+                            for y0 in (0..height).step_by(ch) {
+                                for x0 in (0..width).step_by(cw) {
+                                    let chunk: Vec<u8> =
+                                        (0..chunk_row * ch).map(|_| rnd() as u8).collect();
+                                    let g = Geom {
+                                        width,
+                                        spp,
+                                        planar,
+                                        plane,
+                                        x0,
+                                        y0,
+                                        cols: cw.min(width - x0),
+                                        rows: ch.min(height - y0),
+                                        chunk_row_bytes: chunk_row,
+                                        bits,
+                                    };
+                                    // The reference never takes the strip
+                                    // shortcut (which also copies pad bits).
+                                    if !(x0 == 0 && chunk_row == out_row && !planar) {
+                                        copy_packed(&mut a, &chunk, &g, out_row);
+                                        copy_packed_bits(&mut b, &chunk, &g, out_row);
+                                    }
+                                }
+                            }
+                        }
+                        assert_eq!(
+                            a, b,
+                            "bits {bits} spp {spp} planar {planar} w {width} cw {cw}"
+                        );
+                    }
+                }
+            }
         }
     }
 
