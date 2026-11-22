@@ -1804,6 +1804,25 @@ fn chunk_extent<R>(
     chunk_row_bytes: usize,
     limits: &Limits,
 ) -> TiffResult<(u64, u64, usize)> {
+    chunk_extent_body(s, img, idx, rows, chunk_row_bytes, limits)
+}
+
+/// [`chunk_extent`]'s body, in line in `decode_chunk_append` (with
+/// [`finish_chunk_body`]) as it was before the two were split out of it:
+/// as calls they cost every strip about 46 instructions (two frames), 0.03%
+/// of an LZW decode, and in line about 5. The band read of uncompressed
+/// tiles keeps the out-of-line [`chunk_extent`] and [`finish_chunk`], as
+/// before.
+#[allow(clippy::inline_always)] // measured, see above
+#[inline(always)]
+fn chunk_extent_body<R>(
+    s: &Stream<R>,
+    img: &Image,
+    idx: usize,
+    rows: u32,
+    chunk_row_bytes: usize,
+    limits: &Limits,
+) -> TiffResult<(u64, u64, usize)> {
     let expected = chunk_row_bytes
         .checked_mul(rows as usize)
         .ok_or_else(|| TiffError::limits("chunk size overflow"))?;
@@ -1841,7 +1860,7 @@ fn decode_chunk_append<R: Read + Seek>(
 ) -> TiffResult<()> {
     let limits = budget.limits;
     let info = &img.info;
-    let (offset, n, expected) = chunk_extent(s, img, idx, rows, chunk_row_bytes, limits)?;
+    let (offset, n, expected) = chunk_extent_body(s, img, idx, rows, chunk_row_bytes, limits)?;
     let comp = info.compression;
     // FillOrder 2: reverse the bits of every compressed byte, as libtiff
     // does for every codec except JPEG (verified against libtiff 4.7 on
@@ -1909,13 +1928,21 @@ fn decode_chunk_append<R: Read + Seek>(
         };
         budget.chunk(n, real, expected)?;
     }
-    finish_chunk(&mut dst[start..], img, s.big_endian, chunk_row_bytes);
+    finish_chunk_body(&mut dst[start..], img, s.big_endian, chunk_row_bytes);
     Ok(())
+}
+
+/// [`finish_chunk_body`] out of line, for the band read of uncompressed
+/// tiles.
+fn finish_chunk(buf: &mut [u8], img: &Image, big_endian: bool, chunk_row_bytes: usize) {
+    finish_chunk_body(buf, img, big_endian, chunk_row_bytes);
 }
 
 /// Byte order and predictor of decoded chunk data (whole rows of
 /// `chunk_row_bytes`, any number of them).
-fn finish_chunk(buf: &mut [u8], img: &Image, big_endian: bool, chunk_row_bytes: usize) {
+#[allow(clippy::inline_always)] // measured, see `chunk_extent_body`
+#[inline(always)]
+fn finish_chunk_body(buf: &mut [u8], img: &Image, big_endian: bool, chunk_row_bytes: usize) {
     let info = &img.info;
     let bytes = usize::from(info.bits_per_sample) / 8;
     let spp = usize::from(img.spp_chunk());
