@@ -598,12 +598,24 @@ pub struct SubPixmapMut<'a> {
     pub real_width: usize,
 }
 
+/// Below this size a refused allocation is ordinary out-of-memory, not a
+/// hostile-geometry request, so the fallibility probe is skipped.
+const PROBE_MIN_LEN: usize = 1 << 16;
+
 /// A zeroed buffer, or `None` when the allocator refuses the request.
+///
+/// The buffer comes from `vec![0; len]`, which lowers to the allocator's
+/// zeroed allocation: on large requests that is fresh OS pages with no writes,
+/// where `resize(len, 0)` wrote every byte (issue #198, ~100x slower `new`
+/// under the system allocator). Fallibility is kept by first asking for the
+/// same size with `try_reserve_exact` and releasing it; an oversized request
+/// still returns `None` instead of aborting.
 pub(crate) fn try_zeroed(len: usize) -> Option<Vec<u8>> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(len).ok()?;
-    v.resize(len, 0);
-    Some(v)
+    if len >= PROBE_MIN_LEN {
+        let mut probe: Vec<u8> = Vec::new();
+        probe.try_reserve_exact(len).ok()?;
+    }
+    Some(vec![0; len])
 }
 
 fn fill_bytes(data: &mut [u8], color: Color) {
