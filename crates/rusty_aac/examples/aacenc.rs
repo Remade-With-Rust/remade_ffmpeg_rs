@@ -12,9 +12,13 @@
 //! Arms: `a1` short-block psy, `grp` window grouping (arm 1a), `a2` tonality SMR, `a3` TNS, `a6` PNS,
 //! `a7` intensity stereo, `a9` level-invariant transients, `a13` demand-based
 //! stereo bit split, `kbd`/`autoshape` window shape. With no arms it is byte-identical to the shipped defaults.
+//! Low-rate tools (default on): `nosect`/`nothp` switch the section trellis or the
+//! high-passed transient detector off; `bw=<hz|auto|full>`, `fd=<strength>`,
+//! `smr=<dB>` set the bandwidth, frame-demand strength and mask SMR; `legacy` is
+//! the 2.1.2 encoder.
 
 use rusty_aac::lab::wav;
-use rusty_aac::{AacEncoder, AacEncoderConfig, AdtsHeader, WindowShape};
+use rusty_aac::{AacEncoder, AacEncoderConfig, AdtsHeader, Bandwidth, WindowShape};
 
 #[global_allocator]
 static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
@@ -51,6 +55,26 @@ fn main() {
     if on("a6") {
         cfg.pns = true;
     }
+    // `legacy`: the rusty_aac 2.1.2 encoder (every low-rate tool off).
+    if on("legacy") {
+        cfg.bandwidth = Bandwidth::Full;
+        cfg.frame_demand = 0.0;
+        cfg.section_trellis = false;
+        cfg.transient_highpass = false;
+        cfg.mask_smr_db = 18.0;
+    }
+    if on("nosect") {
+        cfg.section_trellis = false;
+    }
+    if on("nothp") {
+        cfg.transient_highpass = false;
+    }
+    if on("sect") {
+        cfg.section_trellis = true;
+    }
+    if on("thp") {
+        cfg.transient_highpass = true;
+    }
     if on("a7") {
         cfg.intensity = true;
     }
@@ -75,6 +99,24 @@ fn main() {
     if on("autoshape") {
         cfg.window_shape = WindowShape::Auto;
     }
+    // key=value knobs.
+    for a in &arms {
+        let Some((k, v)) = a.split_once('=') else {
+            continue;
+        };
+        match k {
+            "bw" => {
+                cfg.bandwidth = match v {
+                    "full" => Bandwidth::Full,
+                    "auto" => Bandwidth::Auto,
+                    hz => Bandwidth::Hz(hz.parse().expect("bw=<hz|auto|full>")),
+                }
+            }
+            "fd" => cfg.frame_demand = v.parse().expect("fd=<f32>"),
+            "smr" => cfg.mask_smr_db = v.parse().expect("smr=<dB>"),
+            _ => panic!("unknown knob {k}"),
+        }
+    }
 
     let w = wav::read(src).expect("read wav");
     let mut enc = AacEncoder::new(cfg);
@@ -94,4 +136,8 @@ fn main() {
         out.extend_from_slice(&p.data);
     }
     std::fs::write(dst, &out).expect("write out");
+    if std::env::var_os("AACENC_WORK").is_some() {
+        let (evals, bands) = rusty_aac::encode::work::take();
+        eprintln!("work: code_frame evals {evals}, quantized bands {bands}");
+    }
 }
