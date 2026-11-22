@@ -552,7 +552,70 @@ impl<const IN: usize, const OUT: usize> FixedClut<'_, IN, OUT> {
     }
 }
 
+/// A CLUT of exactly three inputs and `N` outputs viewed for a loop of
+/// lookups in line: the per-axis sizes and strides read once into arrays.
+/// Unlike [`FixedClut`] it takes trilinear CLUTs (every Lab-indexed output
+/// table) too.
+pub(crate) struct Clut3Ref<'a, const N: usize> {
+    clut: &'a ClutEval,
+    grid: [usize; 3],
+    strides: [usize; 3],
+}
+
+impl<'a, const N: usize> Clut3Ref<'a, N> {
+    /// `None` unless `clut` has exactly three inputs and `N` outputs.
+    pub(crate) fn new(clut: &'a ClutEval) -> Option<Self> {
+        if clut.outputs != N {
+            return None;
+        }
+        Some(Self {
+            clut,
+            grid: clut.grid.as_slice().try_into().ok()?,
+            strides: clut.strides.as_slice().try_into().ok()?,
+        })
+    }
+
+    pub(crate) fn trilinear(&self) -> bool {
+        self.clut.trilinear
+    }
+
+    /// The lookup at `x` into `out[..N]`: exactly what [`ClutEval::eval`]
+    /// gives (its three-input front end and kernel, in line), with the
+    /// interpolation `TRILINEAR` says the CLUT uses.
+    #[inline(always)]
+    pub(crate) fn lookup<const TRILINEAR: bool>(&self, x: [f64; 3], out: &mut [f64; 16]) {
+        let [g0, g1, g2] = self.grid;
+        let [s0, s1, s2] = self.strides;
+        let (i0, f0) = ClutEval::axis(g0, x[0]);
+        let (i1, f1) = ClutEval::axis(g1, x[1]);
+        let (i2, f2) = ClutEval::axis(g2, x[2]);
+        let origin = i0 * s0 + i1 * s1 + i2 * s2;
+        let f = [f0, f1, f2];
+        let step = [
+            if i0 + 1 < g0 { s0 } else { 0 },
+            if i1 + 1 < g1 { s1 } else { 0 },
+            if i2 + 1 < g2 { s2 } else { 0 },
+        ];
+        let done = if TRILINEAR {
+            self.clut.trilinear_fixed::<N>(origin, f, step, out)
+        } else {
+            self.clut.tetra_walk::<N>(origin, f, step, out)
+        };
+        if !done {
+            self.clut.eval_declined(x, out);
+        }
+    }
+}
+
 impl ClutEval {
+    /// [`Clut3Ref::lookup`] for the lookup a kernel declines (a corner
+    /// outside the data: only a hand-built inconsistent [`Clut`]).
+    #[cold]
+    #[inline(never)]
+    fn eval_declined(&self, x: [f64; 3], out: &mut [f64; 16]) {
+        self.eval(&x, out);
+    }
+
     /// This CLUT as a [`FixedClut`], when it is tetrahedral with exactly
     /// `IN` inputs and `OUT` outputs.
     pub(crate) fn fixed<const IN: usize, const OUT: usize>(

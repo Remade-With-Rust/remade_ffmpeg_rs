@@ -6,7 +6,7 @@ use crate::color::delta_e_2000;
 use crate::curve::InvCurve;
 use crate::error::{Error, Result};
 use crate::lut::{ClutEval, FixedClut};
-use crate::pipeline::{build_chain, Chain, GamutChain, ShaperChain, ShaperLink};
+use crate::pipeline::{build_chain, Chain, GamutChain, LutOutChain, ShaperChain, ShaperLink};
 use crate::profile::{ColorSpace, Profile};
 
 /// ICC rendering intent.
@@ -648,6 +648,10 @@ impl Transform {
                         let alpha = (src_alpha, dst_alpha);
                         if let Some(f) = self.chain.as_shaper() {
                             run_shaper_f32(&f, s, d, (sc, dc), alpha);
+                        } else if let Some(l) = self.chain.as_lut_out::<4>() {
+                            run_lut_out_f32(&l, s, d, (sc, dc), alpha);
+                        } else if let Some(l) = self.chain.as_lut_out::<3>() {
+                            run_lut_out_f32(&l, s, d, (sc, dc), alpha);
                         } else {
                             let ch = (sc, dc, in_ch, out_ch);
                             run_chain_f32(&self.chain, s, d, ch, alpha, (src_lab, dst_lab));
@@ -769,6 +773,28 @@ fn run_segments_f32(
         }
     }
     true
+}
+
+/// `f32` pixels through a [`LutOutChain`], one loop per output count.
+#[inline(never)]
+fn run_lut_out_f32<const N: usize>(
+    l: &LutOutChain<'_, N>,
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) {
+    let mut out = [0.0f64; 16];
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let v = l.curves([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]);
+        l.rest(v, &mut out);
+        for c in 0..N {
+            dp[c] = out[c] as f32;
+        }
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
 }
 
 /// `f32` pixels through the exact pipeline. Not generic, so the loop is
@@ -1114,6 +1140,182 @@ mod tests {
     /// The `f32` loops against the per-colour reference: [`Chain::eval`] on
     /// a zero-tailed array, with the Lab scaling and the alpha rule of the
     /// documented layouts.
+    /// A Lab-PCS LUT output profile of `n` device channels (`space`) built
+    /// for the tests: `B2A0..2` of 3 to `n` and `A2B0..2` of `n` to 3, as
+    /// `lut16` (or `lut8`) tags with nonlinear `in_len`-entry input tables,
+    /// 9-point CLUTs of scrambled smooth values and `out_len`-entry output
+    /// tables, at `version`.
+    pub(crate) fn test_lut_profile(
+        space: crate::ColorSpace,
+        n: usize,
+        version: u32,
+        (in_len, out_len): (usize, usize),
+        sixteen: bool,
+    ) -> Profile {
+        use crate::lut::{Clut, LegacyLut, Lut};
+        use crate::profile::ProfileClass;
+        use crate::tag::Tag;
+        let q = |v: f64| (v.clamp(0.0, 1.0) * 65535.0).round() as u16;
+        let q8 = |v: f64| {
+            if sixteen {
+                q(v)
+            } else {
+                u16::from((v.clamp(0.0, 1.0) * 255.0).round() as u8) * 257
+            }
+        };
+        let table = |len: usize, k: usize| -> Vec<u16> {
+            (0..len)
+                .map(|i| {
+                    let x = i as f64 / (len - 1) as f64;
+                    q8(x.powf(0.7 + 0.2 * k as f64))
+                })
+                .collect()
+        };
+        let clut = |ins: usize, outs: usize, lab: bool| -> Clut {
+            let g = 9usize;
+            let total = g.pow(ins as u32);
+            let mut data = Vec::with_capacity(total * outs);
+            for p in 0..total {
+                let mut sum = 0.0;
+                let mut r = p;
+                for _ in 0..ins {
+                    sum += (r % g) as f64 / (g - 1) as f64;
+                    r /= g;
+                }
+                for o in 0..outs {
+                    let wobble = ((p * 7919 + o * 104_729) % 97) as f64 / 970.0;
+                    let v = if lab && o == 0 {
+                        1.0 - sum / ins as f64 * 0.9
+                    } else if lab {
+                        0.5 + (wobble - 0.05) * 2.0
+                    } else {
+                        (sum / ins as f64 * (0.6 + 0.1 * o as f64) + wobble).fract()
+                    };
+                    data.push(q8(v));
+                }
+            }
+            Clut {
+                grid: vec![g as u8; ins],
+                outputs: outs,
+                data,
+                precision: if sixteen { 2 } else { 1 },
+            }
+        };
+        let lut = |ins: usize, outs: usize, lab: bool| -> Lut {
+            let l = LegacyLut {
+                matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                input_tables: (0..ins)
+                    .map(|k| table(if sixteen { in_len } else { 256 }, k))
+                    .collect(),
+                clut: clut(ins, outs, lab),
+                output_tables: (0..outs)
+                    .map(|k| table(if sixteen { out_len } else { 256 }, k + 1))
+                    .collect(),
+            };
+            if sixteen {
+                Lut::Lut16(l)
+            } else {
+                Lut::Lut8(l)
+            }
+        };
+        let mut p = Profile::blank(ProfileClass::Output, space, crate::ColorSpace::Lab);
+        p.header.version = version;
+        p.set_tag(*b"wtpt", Tag::Xyz(vec![crate::color::D50]));
+        for (b2a, a2b) in [
+            (*b"B2A0", *b"A2B0"),
+            (*b"B2A1", *b"A2B1"),
+            (*b"B2A2", *b"A2B2"),
+        ] {
+            p.set_tag(b2a, Tag::Lut(lut(3, n, false)));
+            p.set_tag(a2b, Tag::Lut(lut(n, 3, true)));
+        }
+        p
+    }
+
+    #[test]
+    fn lut_out_loop_matches_chain_eval_bit_for_bit() {
+        // sRGB into Lab-PCS LUT outputs (CMYK and RGB, v2 and v4 so with
+        // and without black-point compensation's second affine map, lut16
+        // and lut8, short and long tables): every float the loop meets,
+        // including NaN, infinities, -0.0 and out-of-range values, against
+        // the interpreter.
+        use crate::ColorSpace;
+        let srgb = Profile::new_srgb();
+        let vals = [
+            -0.5f32,
+            -0.0,
+            0.0,
+            1e-9,
+            0.001,
+            0.04,
+            0.2,
+            0.5,
+            0.75,
+            0.999,
+            1.0,
+            1.5,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        let mut ran = [0usize; 2];
+        for (space, layout, n) in [
+            (ColorSpace::Cmyk, Layout::Cmyk, 4),
+            (ColorSpace::Rgb, Layout::Rgb, 3),
+        ] {
+            for (version, tables, sixteen) in [
+                (0x0210_0000, (256, 256), true),
+                (0x0430_0000, (4096, 2), true),
+                (0x0210_0000, (256, 256), false),
+            ] {
+                let dst = test_lut_profile(space, n, version, tables, sixteen);
+                for intent in [Intent::Perceptual, Intent::RelativeColorimetric] {
+                    for al in [Layout::Rgb, Layout::Rgba] {
+                        for bpc in [false, true] {
+                            let o = Options {
+                                black_point_compensation: bpc,
+                            };
+                            let t = Transform::new(&srgb, al, &dst, layout, intent, o).unwrap();
+                            let shaped = if n == 4 {
+                                t.chain.as_lut_out::<4>().is_some()
+                            } else {
+                                t.chain.as_lut_out::<3>().is_some()
+                            };
+                            assert!(shaped, "{space:?} {version:x} {intent:?}");
+                            ran[n - 3] += 1;
+                            let (sc, dc) = (al.channels(), layout.channels());
+                            let mut src = Vec::new();
+                            let m = vals.len();
+                            for i in 0..m.pow(3) {
+                                src.extend([vals[i % m], vals[i / m % m], vals[i / m / m % m]]);
+                                if sc == 4 {
+                                    src.push(0.25);
+                                }
+                            }
+                            let mut out_px = vec![-7.0f32; src.len() / sc * dc];
+                            t.transform(&src, &mut out_px).unwrap();
+                            for (sp, dp) in src.chunks_exact(sc).zip(out_px.chunks_exact(dc)) {
+                                let mut input = [0.0f64; 16];
+                                for c in 0..3 {
+                                    input[c] = f64::from(sp[c]);
+                                }
+                                let mut out = [0.0f64; 16];
+                                t.chain.eval(&input, &mut out);
+                                for c in 0..n {
+                                    assert_eq!(
+                                        dp[c].to_bits(),
+                                        (out[c] as f32).to_bits(),
+                                        "{sp:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(ran[0] > 0 && ran[1] > 0, "{ran:?}");
+    }
+
     #[test]
     fn f32_loops_match_chain_eval_bit_for_bit() {
         let srgb = Profile::new_srgb();

@@ -9,7 +9,7 @@ use crate::color::{
 };
 use crate::curve::{clamp01, Curve, FwdSeg, InvCurve, InvSeg, Sampled};
 use crate::error::{Error, Result};
-use crate::lut::{make_trilinear, ClutEval, FixedClut, Lut, Stage};
+use crate::lut::{make_trilinear, Clut3Ref, ClutEval, FixedClut, Lut, Stage};
 use crate::profile::{ColorSpace, Profile, ProfileClass};
 use crate::transform::Intent;
 
@@ -836,6 +836,66 @@ impl SegChain {
     }
 }
 
+/// A chain from an RGB matrix/TRC profile into a Lab-PCS LUT output profile
+/// (sRGB to a CMYK printer: the common float CMYK row), viewed for a
+/// straight-line evaluation per colour: the operations [`run`] performs for
+/// the ops it borrows, in the same order (so every result is the same),
+/// without the per-op dispatch, the stage calls, the 128-byte copy of the
+/// colour array per CLUT lookup and the tests on the CLUT's shape. The ops
+/// are: three function-3 curves, one or two XYZ affine maps, the Lab
+/// encoding (with the legacy 16-bit scale, if any), the LUT's input tables,
+/// its CLUT (three inputs, `N` outputs, trilinear as every Lab-indexed
+/// output CLUT is), its output tables and the final clamp.
+pub(crate) struct LutOutChain<'a, const N: usize> {
+    curves: &'a [FwdSeg; 3],
+    affines: [(Mat3, [f64; 3]); 2],
+    maps: usize,
+    lab_scale: Option<f64>,
+    pre: &'a [Sampled; 3],
+    clut: Clut3Ref<'a, N>,
+    post: &'a [Sampled; N],
+}
+
+impl<const N: usize> LutOutChain<'_, N> {
+    /// The device curves of one colour (`x` normalised, as the chain takes
+    /// it): the values the chain's first op gives.
+    #[inline(always)]
+    pub(crate) fn curves(&self, x: [f64; 3]) -> [f64; 3] {
+        let [c0, c1, c2] = self.curves;
+        [c0.eval(x[0]), c1.eval(x[1]), c2.eval(x[2])]
+    }
+
+    /// The rest of the chain on the values [`LutOutChain::curves`] gives,
+    /// into `out[..N]`: exactly what [`Chain::eval`] gives for the colour.
+    #[inline(always)]
+    pub(crate) fn rest(&self, mut v: [f64; 3], out: &mut [f64; 16]) {
+        for (m, off) in &self.affines[..self.maps] {
+            let r = mat_vec(m, v);
+            v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
+        }
+        let l = xyz_to_lab(Xyz::new(v[0], v[1], v[2]), D50);
+        let mut e = [
+            clamp01(l.l / 100.0),
+            clamp01((l.a + 128.0) / 255.0),
+            clamp01((l.b + 128.0) / 255.0),
+        ];
+        if let Some(k) = self.lab_scale {
+            for x in &mut e {
+                *x *= k;
+            }
+        }
+        let [p0, p1, p2] = self.pre;
+        let e = [p0.eval(e[0]), p1.eval(e[1]), p2.eval(e[2])];
+        self.clut.lookup::<true>(e, out);
+        for (x, c) in out.iter_mut().zip(self.post) {
+            *x = c.eval(*x);
+        }
+        for x in out.iter_mut().take(N) {
+            *x = clamp01(*x);
+        }
+    }
+}
+
 impl ShaperChain<'_> {
     /// The chain as a [`SegChain`], when every curve allows it.
     pub(crate) fn segments(&self) -> Option<SegChain> {
@@ -907,6 +967,44 @@ impl Chain {
             affines,
             maps: mid.len(),
             inverse,
+        })
+    }
+
+    /// The chain as a [`LutOutChain`] of `N` outputs, when its ops have
+    /// exactly that shape. Worked out per call from the ops themselves, as
+    /// [`Chain::as_shaper`] is.
+    pub(crate) fn as_lut_out<const N: usize>(&self) -> Option<LutOutChain<'_, N>> {
+        if self.in_ch != 3 || self.out_ch != N {
+            return None;
+        }
+        let [Op::FwdSegs(curves), rest @ ..] = self.ops.as_slice() else {
+            return None;
+        };
+        let mut rest = rest;
+        let mut affines = [(IDENTITY, [0.0; 3]); 2];
+        let mut maps = 0;
+        while let [Op::Affine(m, off), tail @ ..] = rest {
+            *affines.get_mut(maps)? = (*m, *off);
+            maps += 1;
+            rest = tail;
+        }
+        let [Op::XyzToEncodedLab(lab_scale), Op::Sampled(pre), Op::Lut(Stage::Clut(clut)), Op::Sampled(post), Op::Clamp01] =
+            rest
+        else {
+            return None;
+        };
+        let clut = Clut3Ref::new(clut)?;
+        if maps == 0 || !clut.trilinear() {
+            return None;
+        }
+        Some(LutOutChain {
+            curves: curves.as_slice().try_into().ok()?,
+            affines,
+            maps,
+            lab_scale: *lab_scale,
+            pre: pre.as_slice().try_into().ok()?,
+            clut,
+            post: post.as_slice().try_into().ok()?,
         })
     }
 
