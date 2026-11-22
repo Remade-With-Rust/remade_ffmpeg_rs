@@ -520,6 +520,25 @@ pub(crate) fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32) ->
 /// shipping as a constant. Kept as the byte-identical fallback.
 const SMR_FLAT: f64 = 0.0158; // 10^(-18/10)
 
+thread_local! {
+    /// The flat signal-to-mask ratio (linear) of the frame this thread is
+    /// coding, from [`AacEncoderConfig::mask_smr_db`]: set per frame by
+    /// `encode_frame` and per segment by the frame-demand pre-pass (each wholly
+    /// on one worker thread), so the psy model needs no extra argument for it.
+    /// [`SMR_FLAT`] (18 dB) outside an encode.
+    static MASK_SMR: std::cell::Cell<f64> = const { std::cell::Cell::new(SMR_FLAT) };
+}
+
+/// The linear ratio for a flat SMR of `db` decibels: [`SMR_FLAT`] itself at
+/// 18 dB, so that setting keeps the 2.1.2 masks bit for bit.
+fn smr_ratio(db: f32) -> f64 {
+    if (f64::from(db) - 18.0).abs() < 1e-9 {
+        SMR_FLAT
+    } else {
+        10f64.powf(-f64::from(db) / 10.0)
+    }
+}
+
 /// The psychoacoustic arms in flight, threaded down to every coding path.
 ///
 /// A struct rather than loose bools because these arms compose: A1 decides
@@ -596,7 +615,7 @@ fn masking_from_spread(
         .map(|i| {
             let spread = spread[i];
             let smr = match tonality {
-                None => SMR_FLAT,
+                None => MASK_SMR.with(std::cell::Cell::get),
                 Some(t) => {
                     let center = f64::midpoint(f64::from(swb[i]), f64::from(swb[i + 1]));
                     let bark = hz_to_bark(center * f64::from(sample_rate) * 0.5 / n_coeffs as f64);
@@ -4133,6 +4152,14 @@ pub struct AacEncoderConfig {
     /// 64 kbps frame, against 3% for FFmpeg. Default `false`
     /// (byte-identical).
     pub section_trellis: bool,
+    /// The psychoacoustic model's flat signal-to-mask ratio, in dB: how far
+    /// below each band's spread energy its masking threshold sits, before the
+    /// threshold in quiet and the starved-frame reduction. Default `18.0`, the
+    /// 2.1.2 encoder (bit for bit). A deeper mask makes the rate loop reach
+    /// the starved-frame reduction sooner, which keeps the precision of a
+    /// frame's loud, tonal bands and coarsens its quiet ones: at 64 kbps a
+    /// sung voice's 0-4 kHz went from 16-20 dB SNR to 19-23 dB.
+    pub mask_smr_db: f32,
 }
 
 impl Default for AacEncoderConfig {
@@ -4158,6 +4185,7 @@ impl Default for AacEncoderConfig {
             frame_demand: 0.0,
             transient_highpass: false,
             section_trellis: false,
+            mask_smr_db: 18.0,
         }
     }
 }
@@ -4313,6 +4341,7 @@ pub struct AacEncoder {
     frame_demand: f32,
     transient_highpass: bool,
     section_trellis: bool,
+    mask_smr_db: f32,
     win: Vec<f32>,
     /// The KBD long window (α = 4.0), matching the decoder's. Built once.
     win_kbd: Vec<f32>,
@@ -4358,6 +4387,11 @@ impl AacEncoder {
             },
             transient_highpass: config.transient_highpass,
             section_trellis: config.section_trellis,
+            mask_smr_db: if config.mask_smr_db.is_finite() {
+                config.mask_smr_db.clamp(6.0, 40.0)
+            } else {
+                18.0
+            },
             win: Vec::new(),
             win_kbd: Vec::new(),
             chans: Vec::new(),
@@ -4599,6 +4633,7 @@ impl AacEncoder {
             }
         };
         SECTION_TRELLIS.with(|c| c.set(self.section_trellis));
+        MASK_SMR.with(|c| c.set(smr_ratio(self.mask_smr_db)));
         let bw_hz = self.bandwidth_hz();
         let cut_long = cutoff_line(bw_hz, self.sample_rate, swb, FRAME_LEN);
         let cut_short = cutoff_line(bw_hz, self.sample_rate, swb_s, SHORT_HALF);
@@ -4946,6 +4981,7 @@ impl AacEncoder {
         if self.frame_demand <= 0.0 {
             return None;
         }
+        MASK_SMR.with(|c| c.set(smr_ratio(self.mask_smr_db)));
         let cut = cutoff_line(self.bandwidth_hz(), self.sample_rate, swb, FRAME_LEN);
         let cap = (MAX_CHANNEL_BITS + 7) * self.channels;
         let means: Vec<usize> = seg.clone().map(|b| self.frame_bits(b)).collect();

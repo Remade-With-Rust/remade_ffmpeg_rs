@@ -95,6 +95,7 @@ fn main() {
                 }
             }
             "fd" => cfg.frame_demand = v.parse().expect("fd=<f32>"),
+            "smr" => cfg.mask_smr_db = v.parse().expect("smr=<dB>"),
             _ => panic!("unknown knob {k}"),
         }
     }
