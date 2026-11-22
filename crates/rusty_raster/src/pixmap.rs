@@ -630,9 +630,43 @@ pub(crate) fn try_zeroed(len: usize) -> Option<Vec<u8>> {
 
 fn fill_bytes(data: &mut [u8], color: Color) {
     let c = color.premultiply().to_color_u8();
-    let c = [c.red(), c.green(), c.blue(), c.alpha()];
-    for p in data.chunks_exact_mut(BYTES_PER_PIXEL) {
-        p.copy_from_slice(&c);
+    fill_pixels(data, [c.red(), c.green(), c.blue(), c.alpha()]);
+}
+
+/// Writes the pixel `c` to every whole 4-byte pixel of `data` (a trailing
+/// partial pixel, if any, is left alone, as `chunks_exact_mut(4)` would).
+///
+/// Shaped so its speed does not depend on the auto-vectoriser. The obvious
+/// `chunks_exact_mut(4)` + `copy_from_slice(&c)` loop is vectorised in some
+/// builds and not in others: inlined into a caller under thin LTO with 16
+/// codegen units (CADCraft's release profile), it became four single-byte
+/// stores per pixel, ~1 ms on a 1600x1200 fill against tiny-skia's ~0.4 ms.
+/// Here a pixel whose four bytes match is one `memset`; any other pixel is
+/// written once, doubled with `copy_within` up to a 4 KiB block, and that
+/// block is copied across the rest with `memcpy` (from L1, so it runs at
+/// store speed).
+pub(crate) fn fill_pixels(data: &mut [u8], c: [u8; 4]) {
+    const BLOCK: usize = 4096;
+    let whole = data.len() & !(BYTES_PER_PIXEL - 1);
+    let data = &mut data[..whole];
+    if c[1] == c[0] && c[2] == c[0] && c[3] == c[0] {
+        data.fill(c[0]);
+        return;
+    }
+    let Some(first) = data.get_mut(..BYTES_PER_PIXEL) else {
+        return;
+    };
+    first.copy_from_slice(&c);
+    let block = whole.min(BLOCK);
+    let mut done = BYTES_PER_PIXEL;
+    while done < block {
+        let n = done.min(block - done);
+        data.copy_within(..n, done);
+        done += n;
+    }
+    let (head, rest) = data.split_at_mut(block);
+    for chunk in rest.chunks_mut(BLOCK) {
+        chunk.copy_from_slice(&head[..chunk.len()]);
     }
 }
 
@@ -748,5 +782,38 @@ mod try_zeroed_tests {
         v.truncate(3);
         v.shrink_to_fit();
         assert_eq!(v, [0, 0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod fill_pixels_tests {
+    use super::fill_pixels;
+
+    /// `fill_pixels` writes exactly what the per-pixel `copy_from_slice` loop
+    /// it replaced writes, at every length around its 16-byte blocks
+    /// (including a trailing partial pixel, which both leave alone), for
+    /// uniform and non-uniform pixels.
+    #[test]
+    fn matches_the_per_pixel_loop() {
+        let colors = [
+            [0, 0, 0, 0],
+            [255, 255, 255, 255],
+            [7, 7, 7, 7],
+            [33, 40, 48, 255],
+            [1, 2, 3, 4],
+            [0, 0, 0, 255],
+            [255, 0, 0, 0],
+        ];
+        for c in colors {
+            for len in (0..=100).chain([1023, 1024, 1025, 4096 + 13]) {
+                let mut want: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+                let mut got = want.clone();
+                for p in want.chunks_exact_mut(4) {
+                    p.copy_from_slice(&c);
+                }
+                fill_pixels(&mut got, c);
+                assert_eq!(got, want, "color {c:?} len {len}");
+            }
+        }
     }
 }
