@@ -642,11 +642,14 @@ fn fill_bytes(data: &mut [u8], color: Color) {
 /// codegen units (CADCraft's release profile), it became four single-byte
 /// stores per pixel, ~1 ms on a 1600x1200 fill against tiny-skia's ~0.4 ms.
 /// Here a pixel whose four bytes match is one `memset`; any other pixel is
-/// written once, doubled with `copy_within` up to a 4 KiB block, and that
+/// written once, doubled with `copy_within` up to a 16 KiB block, and that
 /// block is copied across the rest with `memcpy` (from L1, so it runs at
-/// store speed).
+/// store speed). The block size is measured: 4 KiB blocks ran ~15% slower
+/// than 0.1.5's vectorised loop once the target no longer fit in cache (eight
+/// live 1600x1200 pixmaps), 16 KiB matched it there and in cache, 32 KiB and
+/// up lost in cache.
 pub(crate) fn fill_pixels(data: &mut [u8], c: [u8; 4]) {
-    const BLOCK: usize = 4096;
+    const BLOCK: usize = 16 * 1024;
     let whole = data.len() & !(BYTES_PER_PIXEL - 1);
     let data = &mut data[..whole];
     if c[1] == c[0] && c[2] == c[0] && c[3] == c[0] {
@@ -790,7 +793,7 @@ mod fill_pixels_tests {
     use super::fill_pixels;
 
     /// `fill_pixels` writes exactly what the per-pixel `copy_from_slice` loop
-    /// it replaced writes, at every length around its 16-byte blocks
+    /// it replaced writes, at every length around its doubling steps and blocks
     /// (including a trailing partial pixel, which both leave alone), for
     /// uniform and non-uniform pixels.
     #[test]
@@ -805,7 +808,15 @@ mod fill_pixels_tests {
             [255, 0, 0, 0],
         ];
         for c in colors {
-            for len in (0..=100).chain([1023, 1024, 1025, 4096 + 13]) {
+            for len in (0..=100).chain([
+                1023,
+                1024,
+                1025,
+                4096 + 13,
+                16384,
+                16384 + 4,
+                3 * 16384 + 52,
+            ]) {
                 let mut want: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
                 let mut got = want.clone();
                 for p in want.chunks_exact_mut(4) {
