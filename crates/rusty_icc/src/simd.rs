@@ -20,7 +20,7 @@
 //!   0 and the scalar twin does everything.
 
 use crate::fast::{FastChain, FastShaperView};
-use crate::transform::OUT_TABLE;
+use crate::transform::{Sample, OUT_TABLE};
 
 /// The tables and matrix of a three-channel matrix-shaper transform
 /// (`ShaperEngine` in `transform.rs`), borrowed for one call: input tables of
@@ -172,6 +172,78 @@ pub(crate) fn shaper_u16(
     }
     let _ = (t, src, dst, sc, dc, alpha);
     0
+}
+
+/// The integer device-link grid loop for three inputs and four outputs
+/// (`grid_fixed::<T, 3, 4, _>` in `transform.rs`, whose lookup is
+/// `ClutEval::tetra_select`): RGB or RGBA (`sc` 3 or 4) 8- or 16-bit
+/// samples in, CMYK without alpha out. `cube` is the grid, `g` points per
+/// axis, row-major with the first input slowest and four values per point;
+/// `cell(sample)` is the sample's `(cell, fraction)` on an axis (cell below
+/// `g`). Every pixel is done (the loop has no lanes to fill), bit for bit
+/// as the scalar loop does it; returns the pixels done, 0 when the shape or
+/// the CPU does not fit (the scalar loop then does them).
+pub(crate) fn grid34<T: Sample, C: Fn(T) -> (usize, f64)>(
+    cube: &[f32],
+    g: usize,
+    cell: C,
+    src: &[T],
+    dst: &mut [T],
+    (sc, dc): (usize, usize),
+    dst_alpha: bool,
+) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let fits = (2..=4096).contains(&g)
+            && g.checked_pow(3).and_then(|n| n.checked_mul(4)) == Some(cube.len());
+        if fits && matches!(sc, 3 | 4) && dc == 4 && !dst_alpha && avx2() {
+            let Some(cube) = x86::Cube::new(cube, g) else {
+                return 0;
+            };
+            use crate::transform::SampleKind;
+            let done = match T::KIND {
+                SampleKind::U16 => match T::u16s_mut(dst) {
+                    // SAFETY: AVX2 was detected on this CPU (the `if`
+                    // above); the kernel bounds its own reads and writes
+                    // (by the slices it is given and the `Cube`'s length).
+                    Some(d) => unsafe { x86::grid34_u16(&cube, &cell, src, sc, d) },
+                    None => 0,
+                },
+                SampleKind::U8 => match T::u8s_mut(dst) {
+                    // SAFETY: as for the 16-bit arm: AVX2 detected above.
+                    Some(d) => unsafe { x86::grid34_u8(&cube, &cell, src, sc, d) },
+                    None => 0,
+                },
+                SampleKind::F32 => 0,
+            };
+            count(done);
+            return done;
+        }
+    }
+    let _ = (cube, g, cell, src, dst, sc, dc, dst_alpha);
+    0
+}
+
+/// Test hook: the grid kernel's lookup at `cells` (its four `f64` lanes)
+/// and its quantisation of `q` to 16 and 8 bits, for the `f64`-level
+/// oracle tests (the output-level ones cannot see a reassociated sum or a
+/// flipped tie: 16-bit quantisation hides a last-bit difference). `None`
+/// without AVX2 or for a grid `grid34` declines.
+#[cfg(test)]
+pub(crate) fn grid34_parts(
+    cube: &[f32],
+    g: usize,
+    cells: [(usize, f64); 3],
+    q: [f64; 4],
+) -> Option<([f64; 4], [i32; 4], [i32; 4])> {
+    #[cfg(target_arch = "x86_64")]
+    if avx2() {
+        let c = x86::Cube::new(cube, g)?;
+        // SAFETY: AVX2 detected on the line above.
+        return Some(unsafe { x86::grid34_parts(&c, cells, q) });
+    }
+    let _ = (cube, g, cells, q);
+    None
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1344,6 +1416,254 @@ mod x86 {
             (FastChain::Out(o), (4, 4)) => run_out::<4, 4>(o, src, dst, copy_alpha),
             (FastChain::In(i, 4), (4, 3)) => run_in::<3>(i, src, dst),
             (FastChain::In(i, 4), (4, 4)) => run_in::<4>(i, src, dst),
+            _ => 0,
+        }
+    }
+
+    // ---- integer device-link grid: three inputs, four outputs ----
+
+    /// A grid of four `f32`s per point, at least one point long (what
+    /// [`point`] relies on), `g` points per axis, first input slowest.
+    pub(super) struct Cube<'a> {
+        data: &'a [f32],
+        /// `data.len() - 4`: the last offset a point can start at.
+        top: usize,
+        g: usize,
+        /// Strides in `f32`s.
+        s: [usize; 3],
+    }
+
+    impl<'a> Cube<'a> {
+        /// `None` when `data` has fewer than four values.
+        pub(super) fn new(data: &'a [f32], g: usize) -> Option<Self> {
+            Some(Self {
+                data,
+                top: data.len().checked_sub(4)?,
+                g,
+                s: [4 * g * g, 4 * g, 4],
+            })
+        }
+    }
+
+    /// The grid point at `off` (in `f32`s), clamped to the last point, as
+    /// four `f64`s (exact: every `f32` is an `f64`).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn point(c: &Cube<'_>, off: usize) -> __m256d {
+        let off = off.min(c.top);
+        // SAFETY: `c.top` is `c.data.len() - 4` (`Cube::new` declines a
+        // shorter `data`, and nothing else sets the field) and `off` is at
+        // most `c.top` (the line above), so the 16 bytes read at
+        // `data + off` lie inside `data`; the load is unaligned.
+        unsafe { _mm256_cvtps_pd(_mm_loadu_ps(c.data.as_ptr().add(off))) }
+    }
+
+    /// `ClutEval::tetra_select::<4>` at three `(cell, fraction)`s: the same
+    /// corners, the same differences, products and sums in the same order
+    /// (no FMA), the four outputs in the four lanes. Cells below `g` read
+    /// the corners the scalar reads (the walk's four, all inside a grid of
+    /// `g^3` points); the clamp in [`point`] only bounds the reads.
+    ///
+    /// The corner offsets are formed in vector registers, lane per axis:
+    /// written as scalar masks, LLVM's cmov conversion turned some
+    /// instances of them back into the branches `tetra_select` exists to
+    /// remove (the 8-bit kernel ran 1.5x slower than the scalar loop).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn tetra34(c: &Cube<'_>, [(c0, rx), (c1, ry), (c2, rz)]: [(usize, f64); 3]) -> __m256d {
+        let [s0, s1, s2] = c.s;
+        let origin = c0 * s0 + c1 * s1 + c2 * s2;
+        // Lanes x, y, z, (none). Steps: the stride where `cell + 1 < g`,
+        // i.e. `g - 1 > cell` (cells and strides are far below 2^63).
+        let strides = _mm256_set_epi64x(0, s2 as i64, s1 as i64, s0 as i64);
+        let cells = _mm256_set_epi64x(0, c2 as i64, c1 as i64, c0 as i64);
+        let top = _mm256_set1_epi64x(c.g as i64 - 1);
+        let steps = _mm256_and_si256(_mm256_cmpgt_epi64(top, cells), strides);
+        // [rx >= ry, rx >= rz, ry >= rz, true]: x before y, x before z,
+        // y before z (the walk's order, ties to the earlier axis).
+        let f = _mm256_set_pd(0.0, rz, ry, rx);
+        let m = _mm256_castpd_si256(_mm256_cmp_pd::<_CMP_GE_OQ>(
+            _mm256_permute4x64_pd::<0b11_01_00_00>(f),
+            _mm256_permute4x64_pd::<0b11_10_10_01>(f),
+        ));
+        // The corner before each axis step: the steps of the axes ahead.
+        // x: y if y before x (!xy), z if z before x (!xz);
+        // y: x if xy, z if !yz; z: x if xz, y if yz.
+        let first = _mm256_and_si256(
+            _mm256_xor_si256(
+                _mm256_permute4x64_epi64::<0b11_01_00_00>(m),
+                _mm256_set_epi64x(0, 0, 0, -1),
+            ),
+            _mm256_permute4x64_epi64::<0b11_00_00_01>(steps),
+        );
+        let second = _mm256_and_si256(
+            _mm256_xor_si256(
+                _mm256_permute4x64_epi64::<0b11_10_10_01>(m),
+                _mm256_set_epi64x(0, 0, -1, -1),
+            ),
+            _mm256_permute4x64_epi64::<0b11_01_10_10>(steps),
+        );
+        // [before x, before y, before z, origin] and the corners after.
+        let before = _mm256_add_epi64(
+            _mm256_add_epi64(_mm256_set1_epi64x(origin as i64), first),
+            second,
+        );
+        let after = _mm256_add_epi64(before, steps);
+        let off = |v: __m128i| {
+            (
+                _mm_cvtsi128_si64(v) as usize,
+                _mm_extract_epi64::<1>(v) as usize,
+            )
+        };
+        let (bx, by) = off(_mm256_castsi256_si128(before));
+        let (bz, _) = off(_mm256_extracti128_si256::<1>(before));
+        let (ax, ay) = off(_mm256_castsi256_si128(after));
+        let (az, _) = off(_mm256_extracti128_si256::<1>(after));
+        let dx = _mm256_sub_pd(point(c, ax), point(c, bx));
+        let dy = _mm256_sub_pd(point(c, ay), point(c, by));
+        let dz = _mm256_sub_pd(point(c, az), point(c, bz));
+        let acc = _mm256_add_pd(point(c, origin), _mm256_mul_pd(dx, _mm256_set1_pd(rx)));
+        let acc = _mm256_add_pd(acc, _mm256_mul_pd(dy, _mm256_set1_pd(ry)));
+        _mm256_add_pd(acc, _mm256_mul_pd(dz, _mm256_set1_pd(rz)))
+    }
+
+    /// `Sample::from_unit` on four lanes: `(v * scale + 0.5)` truncated
+    /// with the saturating cast's ends (`max` with 0 first, which also maps
+    /// NaN to 0 as the cast does: `maxpd` returns its second operand then;
+    /// then `min` with `scale`), as `i32`s.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn quantise_pd(v: __m256d, scale: f64) -> __m128i {
+        let s = _mm256_set1_pd(scale);
+        let q = _mm256_add_pd(_mm256_mul_pd(v, s), _mm256_set1_pd(0.5));
+        _mm256_cvttpd_epi32(_mm256_min_pd(_mm256_max_pd(q, _mm256_setzero_pd()), s))
+    }
+
+    /// The 16-bit grid kernel (`SC` samples per source pixel, the first
+    /// three looked up).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn run34_u16<T: Copy, C: Fn(T) -> (usize, f64), const SC: usize>(
+        c: &Cube<'_>,
+        cell: &C,
+        src: &[T],
+        dst: &mut [u16],
+    ) -> usize {
+        let mut done = 0;
+        for (sp, dp) in src.chunks_exact(SC).zip(dst.chunks_exact_mut(4)) {
+            let v = tetra34(c, [cell(sp[0]), cell(sp[1]), cell(sp[2])]);
+            let w = _mm_packus_epi32(quantise_pd(v, 65535.0), _mm_setzero_si128());
+            let b = _mm_cvtsi128_si64(w) as u64;
+            dp.copy_from_slice(&[
+                b as u16,
+                (b >> 16) as u16,
+                (b >> 32) as u16,
+                (b >> 48) as u16,
+            ]);
+            done += 1;
+        }
+        done
+    }
+
+    /// The 8-bit grid kernel.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn run34_u8<T: Copy, C: Fn(T) -> (usize, f64), const SC: usize>(
+        c: &Cube<'_>,
+        cell: &C,
+        src: &[T],
+        dst: &mut [u8],
+    ) -> usize {
+        let mut done = 0;
+        for (sp, dp) in src.chunks_exact(SC).zip(dst.chunks_exact_mut(4)) {
+            let v = tetra34(c, [cell(sp[0]), cell(sp[1]), cell(sp[2])]);
+            let w = _mm_packus_epi32(quantise_pd(v, 255.0), _mm_setzero_si128());
+            let b = _mm_cvtsi128_si32(_mm_packus_epi16(w, w)) as u32;
+            dp.copy_from_slice(&b.to_le_bytes());
+            done += 1;
+        }
+        done
+    }
+
+    /// The four lanes of a vector, in order.
+    #[cfg(test)]
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn lanes_pd(v: __m256d) -> [f64; 4] {
+        let (lo, hi) = (_mm256_castpd256_pd128(v), _mm256_extractf128_pd::<1>(v));
+        [
+            _mm_cvtsd_f64(lo),
+            _mm_cvtsd_f64(_mm_unpackhi_pd(lo, lo)),
+            _mm_cvtsd_f64(hi),
+            _mm_cvtsd_f64(_mm_unpackhi_pd(hi, hi)),
+        ]
+    }
+
+    #[cfg(test)]
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn lanes_epi32(v: __m128i) -> [i32; 4] {
+        [
+            _mm_extract_epi32::<0>(v),
+            _mm_extract_epi32::<1>(v),
+            _mm_extract_epi32::<2>(v),
+            _mm_extract_epi32::<3>(v),
+        ]
+    }
+
+    /// [`super::grid34_parts`].
+    ///
+    /// # Safety
+    /// The CPU must support AVX2.
+    #[cfg(test)]
+    #[target_feature(enable = "avx2")]
+    pub(super) fn grid34_parts(
+        c: &Cube<'_>,
+        cells: [(usize, f64); 3],
+        q: [f64; 4],
+    ) -> ([f64; 4], [i32; 4], [i32; 4]) {
+        let q = _mm256_set_pd(q[3], q[2], q[1], q[0]);
+        (
+            lanes_pd(tetra34(c, cells)),
+            lanes_epi32(quantise_pd(q, 65535.0)),
+            lanes_epi32(quantise_pd(q, 255.0)),
+        )
+    }
+
+    /// The 16-bit three-in, four-out grid kernel.
+    ///
+    /// # Safety
+    /// The CPU must support AVX2.
+    #[target_feature(enable = "avx2")]
+    pub(super) fn grid34_u16<T: Copy, C: Fn(T) -> (usize, f64)>(
+        c: &Cube<'_>,
+        cell: &C,
+        src: &[T],
+        sc: usize,
+        dst: &mut [u16],
+    ) -> usize {
+        match sc {
+            3 => run34_u16::<T, C, 3>(c, cell, src, dst),
+            4 => run34_u16::<T, C, 4>(c, cell, src, dst),
+            _ => 0,
+        }
+    }
+
+    /// The 8-bit three-in, four-out grid kernel.
+    ///
+    /// # Safety
+    /// The CPU must support AVX2.
+    #[target_feature(enable = "avx2")]
+    pub(super) fn grid34_u8<T: Copy, C: Fn(T) -> (usize, f64)>(
+        c: &Cube<'_>,
+        cell: &C,
+        src: &[T],
+        sc: usize,
+        dst: &mut [u8],
+    ) -> usize {
+        match sc {
+            3 => run34_u8::<T, C, 3>(c, cell, src, dst),
+            4 => run34_u8::<T, C, 4>(c, cell, src, dst),
             _ => 0,
         }
     }
