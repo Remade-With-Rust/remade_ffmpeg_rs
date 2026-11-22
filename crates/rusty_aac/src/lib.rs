@@ -57,7 +57,7 @@ mod tables_ext;
 pub use bits::BitReader;
 pub use encode::{
     audio_specific_config_bytes, auto_bandwidth_hz, write_adts_header, write_audio_specific_config,
-    AacEncoder, AacEncoderConfig, Bandwidth, EncodedPacket, WindowShape,
+    AacEncoder, AacEncoderConfig, AacTuning, Bandwidth, EncodedPacket, WindowShape,
 };
 pub use error::{Error, Result};
 

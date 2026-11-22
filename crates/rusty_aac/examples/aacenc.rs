@@ -18,7 +18,7 @@
 //! the 2.1.2 encoder.
 
 use rusty_aac::lab::wav;
-use rusty_aac::{AacEncoder, AacEncoderConfig, AdtsHeader, Bandwidth, WindowShape};
+use rusty_aac::{AacEncoder, AacEncoderConfig, AacTuning, AdtsHeader, Bandwidth, WindowShape};
 
 #[global_allocator]
 static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
@@ -55,25 +55,23 @@ fn main() {
     if on("a6") {
         cfg.pns = true;
     }
-    // `legacy`: the rusty_aac 2.1.2 encoder (every low-rate tool off).
-    if on("legacy") {
-        cfg.bandwidth = Bandwidth::Full;
-        cfg.frame_demand = 0.0;
-        cfg.section_trellis = false;
-        cfg.transient_highpass = false;
-        cfg.mask_smr_db = 18.0;
-    }
+    // The low-rate tools; `legacy` is the rusty_aac 2.1.2 encoder.
+    let mut tuning = if on("legacy") {
+        AacTuning::legacy()
+    } else {
+        AacTuning::default()
+    };
     if on("nosect") {
-        cfg.section_trellis = false;
+        tuning.section_trellis = false;
     }
     if on("nothp") {
-        cfg.transient_highpass = false;
+        tuning.transient_highpass = false;
     }
     if on("sect") {
-        cfg.section_trellis = true;
+        tuning.section_trellis = true;
     }
     if on("thp") {
-        cfg.transient_highpass = true;
+        tuning.transient_highpass = true;
     }
     if on("a7") {
         cfg.intensity = true;
@@ -106,20 +104,20 @@ fn main() {
         };
         match k {
             "bw" => {
-                cfg.bandwidth = match v {
+                tuning.bandwidth = match v {
                     "full" => Bandwidth::Full,
                     "auto" => Bandwidth::Auto,
                     hz => Bandwidth::Hz(hz.parse().expect("bw=<hz|auto|full>")),
                 }
             }
-            "fd" => cfg.frame_demand = v.parse().expect("fd=<f32>"),
-            "smr" => cfg.mask_smr_db = v.parse().expect("smr=<dB>"),
+            "fd" => tuning.frame_demand = v.parse().expect("fd=<f32>"),
+            "smr" => tuning.mask_smr_db = v.parse().expect("smr=<dB>"),
             _ => panic!("unknown knob {k}"),
         }
     }
 
     let w = wav::read(src).expect("read wav");
-    let mut enc = AacEncoder::new(cfg);
+    let mut enc = AacEncoder::with_tuning(cfg, tuning);
     enc.push_pcm(&w.samples, w.channels, w.sample_rate)
         .expect("push_pcm");
     enc.finish();

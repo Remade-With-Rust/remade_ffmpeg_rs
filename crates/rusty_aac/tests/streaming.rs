@@ -2,7 +2,7 @@
 //! complete, a few frames of memory, and the priming / padding an MP4 edit
 //! list needs.
 
-use rusty_aac::{AacDecoder, AacEncoder, AacEncoderConfig, AudioSpecificConfig};
+use rusty_aac::{AacDecoder, AacEncoder, AacEncoderConfig, AacTuning, AudioSpecificConfig};
 
 const RATE: u32 = 48_000;
 
@@ -34,8 +34,8 @@ fn signal(frames: usize, channels: usize, seed: u64) -> Vec<f32> {
     out
 }
 
-fn whole(cfg: AacEncoderConfig, pcm: &[f32], ch: u16) -> Vec<(Vec<u8>, i64)> {
-    let mut e = AacEncoder::new(cfg);
+fn whole(cfg: AacEncoderConfig, tuning: AacTuning, pcm: &[f32], ch: u16) -> Vec<(Vec<u8>, i64)> {
+    let mut e = AacEncoder::with_tuning(cfg, tuning);
     e.push_pcm(pcm, ch, RATE).unwrap();
     e.finish();
     std::iter::from_fn(|| e.next_packet().ok().map(|p| (p.data, p.pts))).collect()
@@ -45,11 +45,12 @@ fn whole(cfg: AacEncoderConfig, pcm: &[f32], ch: u16) -> Vec<(Vec<u8>, i64)> {
 /// packets and how many came out before `finish`.
 fn streamed(
     cfg: AacEncoderConfig,
+    tuning: AacTuning,
     pcm: &[f32],
     ch: u16,
     seed: u64,
 ) -> (Vec<(Vec<u8>, i64)>, usize, AacEncoder) {
-    let mut e = AacEncoder::new(cfg);
+    let mut e = AacEncoder::with_tuning(cfg, tuning);
     e.set_streaming(true);
     let mut s = seed;
     let n = pcm.len() / ch as usize;
@@ -100,14 +101,15 @@ fn with_the_absolute_detector_streaming_is_byte_identical_to_finish() {
     // streaming encode codes every frame at its constant-rate share.
     let cfg = AacEncoderConfig {
         relative_transients: false,
-        frame_demand: 0.0,
         ..Default::default()
     };
+    let mut tuning = AacTuning::default();
+    tuning.frame_demand = 0.0;
     for ch in [1u16, 2, 6] {
         for frames in [1usize, 500, 1024, 1025, 3 * 1024 + 1, 48_007] {
             let pcm = signal(frames, ch as usize, frames as u64);
-            let want = whole(cfg, &pcm, ch);
-            let (got, _, _) = streamed(cfg, &pcm, ch, 7 + frames as u64);
+            let want = whole(cfg, tuning, &pcm, ch);
+            let (got, _, _) = streamed(cfg, tuning, &pcm, ch, 7 + frames as u64);
             assert_eq!(got, want, "{ch} ch, {frames} frames");
         }
     }
@@ -136,8 +138,14 @@ fn packets_come_out_while_the_pcm_arrives() {
 fn default_streaming_decodes_as_well_as_the_whole_clip() {
     for ch in [1u16, 2] {
         let pcm = signal(5 * RATE as usize, ch as usize, 3);
-        let want = whole(AacEncoderConfig::default(), &pcm, ch);
-        let (got, early, enc) = streamed(AacEncoderConfig::default(), &pcm, ch, 11);
+        let want = whole(AacEncoderConfig::default(), AacTuning::default(), &pcm, ch);
+        let (got, early, enc) = streamed(
+            AacEncoderConfig::default(),
+            AacTuning::default(),
+            &pcm,
+            ch,
+            11,
+        );
         assert_eq!(got.len(), want.len());
         // At most the two lookahead frames, a partial frame and the flush frame wait for `finish`.
         assert!(
@@ -163,7 +171,13 @@ fn default_streaming_decodes_as_well_as_the_whole_clip() {
 fn priming_and_padding_place_the_input_in_the_decoded_output() {
     let n = 10_000;
     let pcm = signal(n, 1, 5);
-    let (packets, _, enc) = streamed(AacEncoderConfig::default(), &pcm, 1, 2);
+    let (packets, _, enc) = streamed(
+        AacEncoderConfig::default(),
+        AacTuning::default(),
+        &pcm,
+        1,
+        2,
+    );
     let (priming, padding) = (
         enc.priming_samples() as usize,
         enc.padding_samples().unwrap() as usize,
