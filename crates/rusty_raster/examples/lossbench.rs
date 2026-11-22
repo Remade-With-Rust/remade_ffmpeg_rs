@@ -459,10 +459,74 @@ macro_rules! scenes {
                 }
             }
 
+            /// The downstream harness's `fill_evenodd_star` scene, ported call
+            /// for call: a transparent 1024x768 pixmap, one closed polyline of
+            /// 3001 vertices stepping 1499/3001 of a turn around an ellipse
+            /// of 0.48 w x 0.48 h, filled even-odd and anti-aliased with
+            /// rgba(30, 60, 200, 230). The path is built inside the hot
+            /// section, as it is in theirs.
+            #[inline(never)]
+            fn hot_fh_star(pm: &mut Pixmap) {
+                let (fw, fh) = (W as f32, H as f32);
+                let mut pb = PathBuilder::new();
+                let n = 3001;
+                for i in 0..n {
+                    let a = i as f32 * std::f32::consts::PI * 2.0 * 1499.0 / n as f32;
+                    let (x, y) = (
+                        fw / 2.0 + a.cos() * fw * 0.48,
+                        fh / 2.0 + a.sin() * fh * 0.48,
+                    );
+                    if i == 0 {
+                        pb.move_to(x, y)
+                    } else {
+                        pb.line_to(x, y)
+                    }
+                }
+                pb.close();
+                let Some(path) = pb.finish() else {
+                    return;
+                };
+                let mut p = Paint::default();
+                p.set_color_rgba8(30, 60, 200, 230);
+                pm.fill_path(&path, &p, FillRule::EvenOdd, Transform::identity(), None);
+            }
+
+            /// Downstream `fill_evenodd_star`.
+            pub fn fh_star() -> Out {
+                let pm = Pixmap::new(W, H).unwrap();
+                timed(pm, hot_fh_star)
+            }
+
             /// Downstream `pattern_nearest`.
             pub fn fh_nearest() -> Out {
                 let pm = Pixmap::new(W, H).unwrap();
                 timed(pm, |pm| hot_fh_pattern(pm, FilterQuality::Nearest))
+            }
+
+            /// The whole of one downstream timed loop, as the raster-tools
+            /// `speed` harness times it: `Pixmap::new`, the scene, `take`,
+            /// and a byte sum of the output (`black_box`ed), so the canvas
+            /// allocation and its zeroing count as they do there.
+            #[inline(never)]
+            fn hot_timed_full(f: impl FnOnce(&mut Pixmap)) -> Out {
+                let t = Instant::now();
+                let mut pm = Pixmap::new(W, H).unwrap();
+                f(&mut pm);
+                let data = pm.take();
+                let sum: u64 = data.iter().map(|&b| u64::from(b)).sum();
+                std::hint::black_box(sum);
+                let d = t.elapsed();
+                (data, d)
+            }
+
+            /// `fh_nearest`, timed as the downstream harness times it.
+            pub fn fhx_nearest() -> Out {
+                hot_timed_full(|pm| hot_fh_pattern(pm, FilterQuality::Nearest))
+            }
+
+            /// `fh_star`, timed as the downstream harness times it.
+            pub fn fhx_star() -> Out {
+                hot_timed_full(hot_fh_star)
             }
 
             /// Downstream `grad_radial`: two-point conical, r0 in [0, 8),
@@ -509,6 +573,9 @@ workloads!(
     fh_conical,
     fh_sweep,
     fh_nearest,
+    fh_star,
+    fhx_nearest,
+    fhx_star,
 );
 
 fn anchor(name: &str, bytes: &[u8]) {

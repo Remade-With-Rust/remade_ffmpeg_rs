@@ -107,6 +107,16 @@ impl AlphaRuns {
             debug_assert!(tmp <= 256);
             *a = (tmp - (tmp >> 8)) as u8;
 
+            // The start pixel is now a run start (`break_run(.., x, 1)` cut
+            // there), and the next span on this row cannot begin left of it,
+            // so it is a valid hint. tiny-skia returns the previous hint for
+            // a span that is only a partial pixel, and the next span walks
+            // again from there: on a dense even-odd fill (a 3000-vertex star)
+            // that re-walk was a third of the whole fill. The walk only reads
+            // runs and every run start before `x` stays a run start until
+            // the row is flushed, so a later hint cuts the same runs.
+            last_alpha_offset = alpha_offset + x;
+
             runs_offset += x + 1;
             alpha_offset += x + 1;
             x = 0;
