@@ -962,8 +962,36 @@ impl Pow2Dct4 {
     pub(crate) fn dct4(&self, x: &[f32], out: &mut [f32], scratch: &mut [[f32; 2]]) {
         let m = self.l / 2;
         let v = &mut scratch[..m];
+        // The QMF synthesis runs this twice per slot (~243K calls on HE v1), so
+        // both rotations take the SSE twins the IMDCT already uses (four
+        // entries per trip, the scalar's exact products and sums).
+        #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+        if m % 4 == 0 {
+            let (x, out) = (&x[..self.l], &mut out[..self.l]);
+            // SAFETY: SSE is baseline on x86-64. `x` is exactly `l = 2m` long,
+            // `v` and `pre` exactly `m`, `m % 4 == 0` (`rotate_in_sse`'s
+            // contract); viewing the initialised `v` as `MaybeUninit` only lets
+            // the twin overwrite it, which it does for every element.
+            unsafe {
+                let vu =
+                    &mut *(std::ptr::from_mut::<[[f32; 2]]>(v) as *mut [MaybeUninit<[f32; 2]>]);
+                self.rotate_in_sse(x, vu);
+            }
+            self.fft.run(v);
+            // SAFETY: SSE is baseline; `v` and `post` hold `m` entries, `out`
+            // exactly `2m`, `m % 4 == 0` (`dct4_post_sse`'s contract).
+            unsafe { self.dct4_post_sse(v, out) };
+            return;
+        }
         self.rotate_in(x, v);
         self.fft.run(v);
+        self.dct4_post_scalar(v, out);
+    }
+
+    /// The post-rotation of [`Self::dct4`], scalar (the oracle for the SSE
+    /// twin, and the path on other targets).
+    #[inline(always)]
+    fn dct4_post_scalar(&self, v: &[[f32; 2]], out: &mut [f32]) {
         // out[2q] comes from v[q]; out[2q+1] = out[L-1-2p] from v[p], p = m-1-q.
         let post = v.iter().zip(&self.post);
         for ((o, (&[vr, vi], &[c, s])), (&[ur, ui], &[uc, us])) in out[..self.l]
@@ -1101,6 +1129,51 @@ impl Pow2Dct4 {
             let a = _mm_mul_ps(_mm_xor_ps(t, neg), sc);
             let u = _mm_add_ps(_mm_mul_ps(ur, uc), _mm_mul_ps(ui, us));
             let b = _mm_mul_ps(_mm_xor_ps(u, neg), sc);
+            _mm_storeu_ps(op.add(2 * q), _mm_unpacklo_ps(a, b));
+            _mm_storeu_ps(op.add(2 * q + 4), _mm_unpackhi_ps(a, b));
+            q += 4;
+        }
+    }
+
+    /// SSE twin of [`Self::dct4_post_scalar`], four `q` per trip: the same two
+    /// products and one sum/difference per lane, no FMA (bit-identical,
+    /// checked in `imdct_rotations_sse_match_scalar`). The loads and shuffles are
+    /// [`Self::post_sse`]'s; only the arithmetic differs (no sign flip or scale).
+    ///
+    /// # Safety
+    /// `v.len() == self.post.len() == m`, `out.len() == 2m`, `m % 4 == 0`. A
+    /// trip at `q` reads `v/post[q..q+4]` and `v/post[m-4-q..m-q]` and writes
+    /// `out[2q..2q+8]`.
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[inline(always)]
+    unsafe fn dct4_post_sse(&self, v: &[[f32; 2]], out: &mut [f32]) {
+        use std::arch::x86_64::*;
+        let m = self.l / 2;
+        debug_assert!(v.len() == m && self.post.len() == m && out.len() == 2 * m && m % 4 == 0);
+        let vp = v.as_ptr().cast::<f32>();
+        let pp = self.post.as_ptr().cast::<f32>();
+        let op = out.as_mut_ptr();
+        let mut q = 0;
+        while q < m {
+            let v0 = _mm_loadu_ps(vp.add(2 * q));
+            let v1 = _mm_loadu_ps(vp.add(2 * q + 4));
+            let vr = _mm_shuffle_ps::<0b10_00_10_00>(v0, v1);
+            let vi = _mm_shuffle_ps::<0b11_01_11_01>(v0, v1);
+            let p0 = _mm_loadu_ps(pp.add(2 * q));
+            let p1 = _mm_loadu_ps(pp.add(2 * q + 4));
+            let c = _mm_shuffle_ps::<0b10_00_10_00>(p0, p1);
+            let s = _mm_shuffle_ps::<0b11_01_11_01>(p0, p1);
+            // Mirrored entries m-1-q, m-2-q, m-3-q, m-4-q.
+            let u0 = _mm_loadu_ps(vp.add(2 * (m - 4 - q)));
+            let u1 = _mm_loadu_ps(vp.add(2 * (m - 2 - q)));
+            let ur = _mm_shuffle_ps::<0b00_10_00_10>(u1, u0);
+            let ui = _mm_shuffle_ps::<0b01_11_01_11>(u1, u0);
+            let w0 = _mm_loadu_ps(pp.add(2 * (m - 4 - q)));
+            let w1 = _mm_loadu_ps(pp.add(2 * (m - 2 - q)));
+            let uc = _mm_shuffle_ps::<0b00_10_00_10>(w1, w0);
+            let us = _mm_shuffle_ps::<0b01_11_01_11>(w1, w0);
+            let a = _mm_add_ps(_mm_mul_ps(vr, c), _mm_mul_ps(vi, s));
+            let b = _mm_sub_ps(_mm_mul_ps(ur, us), _mm_mul_ps(ui, uc));
             _mm_storeu_ps(op.add(2 * q), _mm_unpacklo_ps(a, b));
             _mm_storeu_ps(op.add(2 * q + 4), _mm_unpackhi_ps(a, b));
             q += 4;
@@ -1595,6 +1668,19 @@ mod imdct_rotation_twins {
                 assert!(
                     oa.iter().zip(&ob).all(|(p, q)| p.to_bits() == q.to_bits()),
                     "post l={l}"
+                );
+                // The DCT-IV's own post-rotation twin.
+                #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+                // SAFETY: SSE is baseline; `va` holds m entries, `oa` 2m, m % 4 == 0.
+                unsafe {
+                    plan.dct4_post_sse(&va, &mut oa);
+                }
+                #[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
+                plan.dct4_post_scalar(&va, &mut oa);
+                plan.dct4_post_scalar(&va, &mut ob);
+                assert!(
+                    oa.iter().zip(&ob).all(|(p, q)| p.to_bits() == q.to_bits()),
+                    "dct4 post l={l}"
                 );
             }
         }
