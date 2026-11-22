@@ -127,7 +127,71 @@ pub fn mdct(time: &[f32]) -> Vec<f32> {
 /// a power of two and equal `im.len()`. Pure in-house `f64` — the fast MDCT's engine.
 /// Uses precomputed per-stage twiddles (`tw_c`/`tw_s`, flattened over stages) so a
 /// transform is pure multiply-add — no runtime trig or twiddle recurrence.
-fn fft(re: &mut [f64], im: &mut [f64], tw_c: &[f64], tw_s: &[f64]) {
+///
+/// The bit reversal is the plan's precomputed swap list, the one-butterfly first
+/// stage has no inner loop, and each later stage walks its blocks as split
+/// halves so the butterfly loop has no aliasing for the compiler to fear. Every
+/// butterfly computes exactly [`fft_ref`]'s products, sums and stores in its
+/// order (no reassociation, no FMA), so the result is bit-identical
+/// (`fft_matches_reference_bit_exact`).
+fn fft(re: &mut [f64], im: &mut [f64], tw_c: &[f64], tw_s: &[f64], swaps: &[(u32, u32)]) {
+    let n = re.len();
+    let im = &mut im[..n];
+    for &(i, j) in swaps {
+        re.swap(i as usize, j as usize);
+        im.swap(i as usize, j as usize);
+    }
+    if n < 2 {
+        return;
+    }
+    // First stage (len 2): one butterfly per block, twiddle `tw[0]`.
+    let (cr, ci) = (tw_c[0], tw_s[0]);
+    for (r, i) in re.chunks_exact_mut(2).zip(im.chunks_exact_mut(2)) {
+        let tr = cr * r[1] - ci * i[1];
+        let ti = cr * i[1] + ci * r[1];
+        r[1] = r[0] - tr;
+        i[1] = i[0] - ti;
+        r[0] += tr;
+        i[0] += ti;
+    }
+    let mut off = 1usize;
+    let mut len = 4usize;
+    while len <= n {
+        let half = len / 2;
+        let (wc, ws) = (&tw_c[off..off + half], &tw_s[off..off + half]);
+        for (rb, ib) in re.chunks_exact_mut(len).zip(im.chunks_exact_mut(len)) {
+            let (ra, rb) = rb.split_at_mut(half);
+            let (ia, ib) = ib.split_at_mut(half);
+            let lanes = ra.iter_mut().zip(rb).zip(ia.iter_mut().zip(ib));
+            for (((ar, br), (ai, bi)), (&cr, &ci)) in lanes.zip(wc.iter().zip(ws)) {
+                let tr = cr * *br - ci * *bi;
+                let ti = cr * *bi + ci * *br;
+                *br = *ar - tr;
+                *bi = *ai - ti;
+                *ar += tr;
+                *ai += ti;
+            }
+        }
+        off += half;
+        len <<= 1;
+    }
+}
+
+/// The bit-reversal permutation of an `n`-point transform as its swaps
+/// (`i < rev(i)` only), in the order the reference loop performs them.
+fn bitrev_swaps(n: usize) -> Vec<(u32, u32)> {
+    let bits = n.trailing_zeros();
+    (1..n)
+        .filter_map(|i| {
+            let j = ((i as u32).reverse_bits() >> (32 - bits)) as usize;
+            (i < j).then_some((i as u32, j as u32))
+        })
+        .collect()
+}
+
+/// The straightforward FFT [`fft`] restructures: the bit-exactness oracle.
+#[cfg(test)]
+fn fft_ref(re: &mut [f64], im: &mut [f64], tw_c: &[f64], tw_s: &[f64]) {
     let n = re.len();
     // Bit-reversal permutation.
     let mut j = 0usize;
@@ -176,6 +240,8 @@ struct MdctTwiddles {
     post_s: Vec<f64>,
     fft_c: Vec<f64>,
     fft_s: Vec<f64>,
+    /// The M-point FFT's bit-reversal swaps.
+    swaps: Vec<(u32, u32)>,
 }
 
 impl MdctTwiddles {
@@ -214,6 +280,7 @@ impl MdctTwiddles {
             post_s,
             fft_c,
             fft_s,
+            swaps: bitrev_swaps(m),
         }
     }
 }
@@ -272,7 +339,7 @@ pub fn mdct_fast(x: &[f32]) -> Vec<f32> {
         re.set_len(m);
         im.set_len(m);
     }
-    fft(&mut re, &mut im, &tw.fft_c, &tw.fft_s);
+    fft(&mut re, &mut im, &tw.fft_c, &tw.fft_s, &tw.swaps);
     // Post-rotate W = V·e^{-iπp/L}; X[2p]=Re(W), X[L-1-2p]=-Im(W); output scaled ×2.
     let mut out = Vec::<f32>::with_capacity(l);
     let op = out.spare_capacity_mut();
@@ -316,7 +383,7 @@ pub fn imdct_fast(spec: &[f32]) -> Vec<f32> {
         re[p] = yr * tw.pre_c[p] + yi * tw.pre_s[p];
         im[p] = yi * tw.pre_c[p] - yr * tw.pre_s[p];
     }
-    fft(&mut re, &mut im, &tw.fft_c, &tw.fft_s);
+    fft(&mut re, &mut im, &tw.fft_c, &tw.fft_s, &tw.swaps);
     // z = D·X (the core produces 2·D·X; the ×2 and the spec's 2/N fold into 1/N).
     let scale = 1.0 / n as f64;
     let mut z = vec![0f64; l];
@@ -1149,6 +1216,36 @@ pub fn kbd_window(n: usize, alpha: f64) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The restructured f64 FFT is the reference loop's arithmetic in the same
+    /// order: bit for bit equal on random input at every size up to 1024
+    /// (including the MDCT's 64 and 512), with the MDCT plans' own twiddles.
+    #[test]
+    fn fft_matches_reference_bit_exact() {
+        let mut seed = 0xff7_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 6.0e4
+        };
+        for bits in 0..=10 {
+            let m = 1usize << bits;
+            let tw = MdctTwiddles::build(4 * m);
+            let swaps = bitrev_swaps(m);
+            for _ in 0..20 {
+                let re: Vec<f64> = (0..m).map(|_| next()).collect();
+                let im: Vec<f64> = (0..m).map(|_| next()).collect();
+                let (mut r1, mut i1, mut r2, mut i2) = (re.clone(), im.clone(), re, im);
+                fft(&mut r1, &mut i1, &tw.fft_c, &tw.fft_s, &swaps);
+                fft_ref(&mut r2, &mut i2, &tw.fft_c, &tw.fft_s);
+                for k in 0..m {
+                    assert_eq!(r1[k].to_bits(), r2[k].to_bits(), "m={m} re[{k}]");
+                    assert_eq!(i1[k].to_bits(), i2[k].to_bits(), "m={m} im[{k}]");
+                }
+            }
+        }
+    }
 
     /// The fast FFT-based MDCT must match the direct O(N²) oracle at both block
     /// sizes, on raw and encoder-scaled (×32768) input.
