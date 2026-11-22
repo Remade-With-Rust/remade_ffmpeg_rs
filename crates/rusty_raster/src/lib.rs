@@ -10,7 +10,8 @@
 //! their BSD-3-Clause notices (see `LICENSE-BSD-3-Clause` and `NOTICE.md`). What
 //! the fork changes:
 //!
-//! - `#![forbid(unsafe_code)]` and no dependencies: the SIMD lane types are
+//! - No dependencies and `#![deny(unsafe_code)]`, with one audited exception
+//!   (the zeroed pixel-buffer allocation in `pixmap.rs`): the SIMD lane types are
 //!   scalar arrays that reproduce tiny-skia's SSE2 lane semantics, and
 //!   `bytemuck`, `arrayref`, `arrayvec`, `strict-num`, `log` and `png` are gone
 //!   (PNG goes through the house `rusty_png` behind the default `png-format`
@@ -32,7 +33,7 @@
 //! assert_ne!(pixmap.data()[(32 * 64 + 32) * 4 + 3], 0);
 //! ```
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(missing_copy_implementations)]
 #![warn(missing_debug_implementations)]

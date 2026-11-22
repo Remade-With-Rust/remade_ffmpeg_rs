@@ -10,7 +10,7 @@ license = "Apache-2.0 AND BSD-3-Clause"
 repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
 authors = ["Mata Network <https://www.mata.network>"]
-description = "Pure-Rust 2D rasteriser with a tiny-skia-shaped API: anti-aliased fill and stroke (joins, caps, dashes, hairlines), gradients, blend modes, masks and pixmap drawing. A hardened, forbid(unsafe_code), dependency-free fork of tiny-skia 0.12, pixel-identical to it on a 300+ test corpus."
+description = "Pure-Rust 2D rasteriser with a tiny-skia-shaped API: anti-aliased fill and stroke (joins, caps, dashes, hairlines), gradients, blend modes, masks and pixmap drawing. A hardened, dependency-free fork (one audited unsafe allocation helper) of tiny-skia 0.12, pixel-identical to it on a 300+ test corpus."
 readme = "README.md"
 keywords = ["2d", "rasterizer", "graphics", "vector", "skia"]
 categories = ["graphics", "rendering"]
@@ -31,7 +31,7 @@ tiny-skia = "0.12.0"
 rusty_alloc-api.workspace = true
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [[example]]
 name = "rasterbench"
