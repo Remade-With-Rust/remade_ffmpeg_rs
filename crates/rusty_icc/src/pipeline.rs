@@ -900,17 +900,39 @@ impl SegChain {
 /// its CLUT (three inputs, `N` outputs, trilinear as every Lab-indexed
 /// output CLUT is), its output tables and the final clamp.
 pub(crate) struct LutOutChain<'a, const N: usize> {
-    curves: &'a [FwdSeg; 3],
-    affines: [(Mat3, [f64; 3]); 2],
-    maps: usize,
+    pub(crate) curves: &'a [FwdSeg; 3],
+    pub(crate) affines: [(Mat3, [f64; 3]); 2],
+    pub(crate) maps: usize,
     /// Per map: `true` when it is a diagonal matrix with non-zero offsets
     /// (black-point compensation), applied as three products and sums.
     diagonal: [bool; 2],
     /// The legacy 16-bit Lab scale, or 1 without one (both in `0..=1`).
-    lab_scale: Option<f64>,
-    pre: &'a [Sampled; 3],
-    clut: Clut3Ref<'a, N>,
-    post: &'a [Sampled; N],
+    pub(crate) lab_scale: Option<f64>,
+    pub(crate) pre: &'a [Sampled; 3],
+    pub(crate) clut: Clut3Ref<'a, N>,
+    pub(crate) post: &'a [Sampled; N],
+}
+
+/// Per-channel curves of a LUT stage as a chain holds them: sampled tables,
+/// or identities written as a power of 1 (the clamp they amount to).
+pub(crate) enum StageCurves<'a> {
+    Sampled(&'a [Sampled]),
+    Unit,
+}
+
+/// A chain from a Lab-PCS LUT input profile into an RGB matrix/TRC one
+/// (Coated FOGRA39 to sRGB: the other float CMYK row), viewed for the fast
+/// path: the LUT's input tables, its CLUT, its output tables, the Lab
+/// decoding (with the legacy 16-bit scale, if any), the XYZ affine maps, the
+/// clamp and the inverse device curves.
+pub(crate) struct LutInChain<'a> {
+    pub(crate) pre: StageCurves<'a>,
+    pub(crate) clut: &'a ClutEval,
+    pub(crate) post: StageCurves<'a>,
+    pub(crate) lab_scale: Option<f64>,
+    pub(crate) affines: [(Mat3, [f64; 3]); 2],
+    pub(crate) maps: usize,
+    pub(crate) inverse: &'a [InvSeg; 3],
 }
 
 impl<const N: usize> LutOutChain<'_, N> {
@@ -1127,6 +1149,50 @@ impl Chain {
             pre: pre.as_slice().try_into().ok()?,
             clut,
             post: post.as_slice().try_into().ok()?,
+        })
+    }
+
+    /// The chain as a [`LutInChain`] (`in_ch` inputs into 3 outputs), when
+    /// its ops have exactly that shape.
+    pub(crate) fn as_lut_in(&self) -> Option<LutInChain<'_>> {
+        if self.out_ch != 3 {
+            return None;
+        }
+        fn curves(op: &Op, n: usize) -> Option<StageCurves<'_>> {
+            match op {
+                Op::Sampled(cs) if cs.len() == n => Some(StageCurves::Sampled(cs)),
+                Op::UnitCurves(k) if *k == n => Some(StageCurves::Unit),
+                _ => None,
+            }
+        }
+        let [pre, Op::Lut(Stage::Clut(clut)), post, Op::EncodedLabToXyz(lab_scale), rest @ ..] =
+            self.ops.as_slice()
+        else {
+            return None;
+        };
+        let (pre, post) = (curves(pre, self.in_ch)?, curves(post, 3)?);
+        let mut rest = rest;
+        let mut affines = [(IDENTITY, [0.0; 3]); 2];
+        let mut maps = 0;
+        while let [Op::Affine(m, off), tail @ ..] = rest {
+            *affines.get_mut(maps)? = (*m, *off);
+            maps += 1;
+            rest = tail;
+        }
+        let [Op::Clamp01, Op::InvSegs(inv)] = rest else {
+            return None;
+        };
+        if clut.outputs != 3 || clut.dims().len() != self.in_ch {
+            return None;
+        }
+        Some(LutInChain {
+            pre,
+            clut,
+            post,
+            lab_scale: *lab_scale,
+            affines,
+            maps,
+            inverse: inv.as_slice().try_into().ok()?,
         })
     }
 

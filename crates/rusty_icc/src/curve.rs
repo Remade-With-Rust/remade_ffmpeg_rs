@@ -244,11 +244,11 @@ impl InvCurve {
 /// parameters at hand.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FwdSeg {
-    g: f64,
-    a: f64,
-    b: f64,
-    c: f64,
-    d: f64,
+    pub(crate) g: f64,
+    pub(crate) a: f64,
+    pub(crate) b: f64,
+    pub(crate) c: f64,
+    pub(crate) d: f64,
 }
 
 impl FwdSeg {
@@ -294,11 +294,11 @@ impl FwdSeg {
 /// (the same division, so the same value) instead of per evaluation.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct InvSeg {
-    ig: f64,
-    a: f64,
-    b: f64,
-    c: f64,
-    brk: f64,
+    pub(crate) ig: f64,
+    pub(crate) a: f64,
+    pub(crate) b: f64,
+    pub(crate) c: f64,
+    pub(crate) brk: f64,
 }
 
 impl InvSeg {
@@ -347,9 +347,9 @@ impl InvSeg {
 pub(crate) struct Sampled {
     /// Per segment `i`: sample `i` and the difference to sample `i + 1`,
     /// both exact in `f64` (the samples are `u16`).
-    seg: Box<[[f64; 2]]>,
+    pub(crate) seg: Box<[[f64; 2]]>,
     /// Entries minus one, as `f64`.
-    scale: f64,
+    pub(crate) scale: f64,
     /// The last segment's index (entries minus two), signed, so the index
     /// and its conversion back to `f64` stay in `i64` (one `cvtsi2sd`
     /// instead of the unsigned conversion sequence of a `usize`).

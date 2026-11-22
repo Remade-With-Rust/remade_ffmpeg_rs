@@ -6,11 +6,13 @@ use std::sync::{Arc, OnceLock};
 use crate::color::delta_e_2000;
 use crate::curve::InvCurve;
 use crate::error::{Error, Result};
+use crate::fast::{FastChain, FastShaper};
 use crate::lut::{ClutEval, FixedClut};
 use crate::pipeline::{
     build_chain, u8_point, Chain, GamutChain, LutOutChain, SegChain, ShaperChain, ShaperLink,
 };
 use crate::profile::{ColorSpace, Profile};
+use crate::simd;
 
 /// ICC rendering intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -104,6 +106,39 @@ pub struct Options {
     /// for absolute colorimetric; as in `LittleCMS`, perceptual and
     /// saturation transforms into ICC v4 profiles always compensate.
     pub black_point_compensation: bool,
+}
+
+/// How a transform evaluates `f32` pixels ([`Transform::with_precision`]).
+/// Integer pixels are exact either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum Precision {
+    /// The exact pipeline (the default): every `f32` pixel goes through the
+    /// profiles' curves, matrices and tables in `f64`.
+    #[default]
+    Exact,
+    /// `f32` arithmetic with curve tables, as fast colour engines do:
+    ///
+    /// - matrix/TRC RGB to matrix/TRC RGB: 4096-cell forward and inverse
+    ///   curve tables (two-segment curves keep their linear toe exact) and
+    ///   the 3x3 map in `f32`: within 1e-5 of the exact path per channel
+    ///   (measured worst 2.3e-6), output clamped to `0..=1` as the exact
+    ///   path's is;
+    /// - matrix/TRC RGB into a Lab-PCS LUT output profile (RGB to CMYK) and a
+    ///   Lab-PCS LUT input profile into matrix/TRC RGB (CMYK to RGB): the
+    ///   profiles' own LUT tables and CLUT, interpolated as the exact path
+    ///   interpolates them, in `f32`, with the analytic curves and the
+    ///   L\*a\*b\* cube root by tables: within CIEDE2000 0.001 of the exact path
+    ///   (measured on Coated FOGRA39, both directions and intents).
+    ///
+    /// Deterministic: a fixed sequence of `f32` operations (no FMA), the same
+    /// with or without SIMD and on every target, except the few pixels of a
+    /// matrix-shaper transform whose linear value lands within 4e-6 of an
+    /// output curve's segment break: those take the exact path. Other
+    /// transforms (other LUT shapes, Lab or grey on either side) and
+    /// matrix-shaper ones whose tables miss the bound (a pure power-law output
+    /// curve such as Adobe RGB's) keep the exact path.
+    Fast,
 }
 
 mod sealed {
@@ -249,13 +284,17 @@ impl Sample for f32 {
 
 /// Entries of the inverse-curve output tables, indexed by `sqrt(linear)`
 /// so the steep start of a gamma inverse is sampled densely.
-const OUT_TABLE: usize = 16384;
+pub(crate) const OUT_TABLE: usize = 16384;
 
 /// Matrix-shaper engine for integer samples. Tables are flat, one fixed-size
 /// row per channel (`TABLE_LEN` input entries, `OUT_TABLE` output entries),
 /// so the hot loop slices a row once and its indexing is provably in bounds.
 struct ShaperEngine {
     link: ShaperLink,
+    /// Per input channel, the first channel whose curve is the same (so its
+    /// table row holds the same values): the SIMD kernels read that row, so
+    /// three channels of one curve share one row's cache lines.
+    row_of: [usize; 3],
     m: [[f32; 3]; 3],
     off: [f32; 3],
     in8: Box<[f32]>,
@@ -266,6 +305,138 @@ struct ShaperEngine {
     /// over a ramp, so a lookup gives exactly what the loop gives. Built by
     /// the first call with at least 256 pixels.
     grey8: OnceLock<Box<[[u8; 3]; 256]>>,
+    /// Per output channel, the first channel whose output curve is the same
+    /// (so its output table row holds the same values).
+    out_of: [usize; 3],
+    /// For three 8-bit output channels: the exact 8-bit codes of each output
+    /// table by threshold ([`U8Codes`]), `None` when a table does not
+    /// qualify. Built by the first 8-bit call the AVX2 kernel serves.
+    codes8: OnceLock<Option<[Arc<U8Codes>; 3]>>,
+    /// [`Precision::Fast`] tables, built by the first fast `f32` call;
+    /// `None` when they miss the error budget (the exact path then serves).
+    fast: OnceLock<Option<FastShaper>>,
+}
+
+/// The 8-bit code of every linear value through one `sqrt`-indexed output
+/// table, by threshold. [`ShaperEngine::lookup_out`] then
+/// [`Sample::from_unit`] is a non-decreasing step function of the value
+/// (checked when this is built: see [`U8Codes::new`]), so the code of `v`
+/// is the number of steps at or below `v`. The steps are found exactly, by
+/// bisection over the `f32` bit patterns, and filed in buckets of the
+/// value's bit pattern (`2^b` per octave) holding at most one step each: a
+/// bucket's entry is its first code plus one (bits 23 and up) and the low
+/// bits of its step (bits 0..23; `1 << shift` when it has none).
+pub(crate) struct U8Codes {
+    pub(crate) table: Box<[u32]>,
+    /// Subtracted from the clamped value's bit pattern (then clamped at 0)
+    /// before the bucket (`>> shift`) and the in-bucket position (low bits).
+    pub(crate) base: i32,
+    pub(crate) shift: u32,
+}
+
+impl U8Codes {
+    /// `from_unit(lookup_out(table, v))` for `u8`: the function filed.
+    fn code(table: &[f32; OUT_TABLE], v: f32) -> u8 {
+        u8::from_unit(f64::from(ShaperEngine::lookup_out(table, v)))
+    }
+
+    /// `None` unless the table's codes are a non-decreasing function of the
+    /// clamped value (proven here, see the comments) and fit the buckets.
+    fn new(t: &[f32; OUT_TABLE]) -> Option<Self> {
+        const ONE: u32 = 0x3F80_0000;
+        let u = |y: f32| u8::from_unit(f64::from(y));
+        // Within cell `i` the value is `t[i] + (t[i+1] - t[i]) * f`, with `f`
+        // in 0..=1 a non-decreasing function of the value (the clamp, `sqrt`,
+        // the product and the truncation all round monotonically); with a
+        // non-negative difference every rounding step after it is monotone.
+        if !t.windows(2).all(|w| w[1] - w[0] >= 0.0) {
+            return None;
+        }
+        // Across the boundary into cell `i`: cell `i - 1` gives at most its
+        // value at the largest position below `i` (an `f32`, so at most the
+        // float before `i`, and that minus `i - 1` is exact); cell `i`
+        // starts at `t[i]`. The codes must not fall there.
+        for i in 1..OUT_TABLE - 1 {
+            let f = f32::from_bits((i as f32).to_bits() - 1) - (i - 1) as f32;
+            let left = t[i - 1] + (t[i] - t[i - 1]) * f;
+            if u(left) > u(t[i]) {
+                return None;
+            }
+        }
+        // The steps: for each code above the code of 0, the smallest value in
+        // 0..=1 reaching it (bisection on the bit pattern, which orders the
+        // non-negative floats).
+        let at = |bits: u32| Self::code(t, f32::from_bits(bits));
+        let (c0, c1) = (at(0), at(ONE));
+        let mut steps = Vec::with_capacity(usize::from(c1 - c0));
+        for k in c0 + 1..=c1 {
+            let (mut lo, mut hi) = (0u32, ONE);
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if at(mid) >= k {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            steps.push(hi);
+        }
+        // Two codes at one value cannot be told apart by one step.
+        if steps.windows(2).any(|w| w[0] == w[1]) {
+            return None;
+        }
+        // Buckets from the octave of the first step (every value below it is
+        // code `c0`): `base` is one less than that octave's first bit
+        // pattern, so every step's offset is at least 1, and every value below
+        // the octave lands at offset 0, under every step.
+        let octave = steps.first().map_or(ONE, |&b| b & 0x7F80_0000);
+        if octave < 64 << 23 {
+            return None;
+        }
+        let base = octave - 1;
+        for b in 7..=12u32 {
+            let shift = 23 - b;
+            let n = ((ONE - base) >> shift) as usize + 1;
+            let mut table = vec![0u32; n];
+            let mut next = 0usize;
+            let mut ok = true;
+            for (j, e) in table.iter_mut().enumerate() {
+                let start = (j as u32) << shift;
+                let end = start + (1 << shift);
+                let first = u32::from(c0) + next as u32;
+                let mut low = 1u32 << shift;
+                if let Some(&st) = steps.get(next) {
+                    if st - base < end {
+                        low = st - base - start;
+                        next += 1;
+                        if steps.get(next).is_some_and(|&s2| s2 - base < end) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                *e = ((first + 1) << 23) | low;
+            }
+            if ok && next == steps.len() {
+                return Some(Self {
+                    table: table.into_boxed_slice(),
+                    base: base as i32,
+                    shift,
+                });
+            }
+        }
+        None
+    }
+
+    /// The code of `v` by the table: the scalar form of the kernel's lookup.
+    #[cfg(test)]
+    fn lookup(&self, v: f32) -> u8 {
+        let c = if v > 0.0 { v.min(1.0) } else { 0.0 };
+        let off = (c.to_bits() as i32 - self.base).max(0) as u32;
+        let e = self.table[(off >> self.shift) as usize];
+        let low = off & ((1 << self.shift) - 1);
+        ((e >> 23) - u32::from(low < (e & 0x7F_FFFF))) as u8
+    }
 }
 
 impl ShaperEngine {
@@ -308,8 +479,24 @@ impl ShaperEngine {
         }
         let m = link.m.map(|r| r.map(|v| v as f32));
         let off = link.off.map(|v| v as f32);
+        let row_of = core::array::from_fn(|k| {
+            let cs = &link.in_curves;
+            cs.get(k)
+                .and_then(|c| cs[..k].iter().position(|p| p.same_as(c)))
+                .unwrap_or(k)
+        });
+        let out_of = core::array::from_fn(|k| {
+            let cs = &link.out_curves;
+            cs.get(k)
+                .and_then(|c| cs[..k].iter().position(|p| p.same_as(c)))
+                .unwrap_or(k)
+        });
         Self {
+            out_of,
+            codes8: OnceLock::new(),
+            fast: OnceLock::new(),
             link,
+            row_of,
             m,
             off,
             in8,
@@ -372,6 +559,60 @@ impl ShaperEngine {
         true
     }
 
+    /// [`U8Codes`] of the three output tables (one per distinct curve,
+    /// shared), or `None` when one does not qualify.
+    fn build_codes8(&self) -> Option<[Arc<U8Codes>; 3]> {
+        if self.out.len() != 3 {
+            return None;
+        }
+        let mut made: [Option<Arc<U8Codes>>; 3] = [None, None, None];
+        for k in 0..3 {
+            let j = self.out_of[k];
+            made[k] = Some(match &made[j] {
+                Some(c) if j < k => Arc::clone(c),
+                _ => Arc::new(U8Codes::new(&self.out[k])?),
+            });
+        }
+        let [Some(a), Some(b), Some(c)] = made else {
+            return None;
+        };
+        Some([a, b, c])
+    }
+
+    /// The fast `f32` path, when its tables qualify: `false`, with nothing
+    /// done, otherwise. The AVX2 kernel takes the leading multiple of 8
+    /// pixels and the scalar twin the rest (the same values either way).
+    fn run_fast_f32(
+        &self,
+        src: &[f32],
+        dst: &mut [f32],
+        sc_dc: (usize, usize),
+        alpha: (bool, bool),
+        exact: &ShaperChain<'_>,
+    ) -> bool {
+        let fast = self
+            .fast
+            .get_or_init(|| FastShaper::new(&self.link.in_curves, &self.link.out_curves));
+        let Some(f) = fast else {
+            return false;
+        };
+        let view = f.view(self.m, self.off);
+        let mut near = Vec::new();
+        let done = simd::shaper_f32_fast(&view, src, dst, sc_dc, alpha, &mut near);
+        let (s, d) = (&src[done * sc_dc.0..], &mut dst[done * sc_dc.1..]);
+        view.run(s, d, sc_dc, alpha, (done, &mut near));
+        // The few pixels whose fast linear value sits next to an output
+        // curve's break: the exact path's values.
+        for k in near {
+            let sp = &src[k * sc_dc.0..];
+            let out = exact.eval([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]);
+            for (c, v) in out.iter().enumerate() {
+                dst[k * sc_dc.1 + c] = *v as f32;
+            }
+        }
+        true
+    }
+
     fn in16(&self) -> &[f32] {
         self.in16.get_or_init(|| Self::table(&self.link, 65536))
     }
@@ -413,7 +654,72 @@ impl ShaperEngine {
                 }
             }
         }
+        let done = if IN == 3 && OUT == 3 {
+            self.run_simd(tables, src, dst, (sc, dc), (src_alpha, dst_alpha))
+        } else {
+            0
+        };
+        let (src, dst) = (&src[done * sc..], &mut dst[done * dc..]);
         self.run_loop::<T, IN, OUT>(tables, src, dst, sc, dc, src_alpha, dst_alpha);
+    }
+
+    /// [`Self::run_loop`] for three channels in and out, in the AVX2 kernel
+    /// ([`simd::shaper_u8`], [`simd::shaper_u16`]) on the leading multiple of
+    /// 8 pixels: the same values, bit for bit. Returns the pixels done (0
+    /// without AVX2, on other targets, or for other layouts).
+    fn run_simd<T: Sample>(
+        &self,
+        tables: &[f32],
+        src: &[T],
+        dst: &mut [T],
+        sc_dc: (usize, usize),
+        alpha: (bool, bool),
+    ) -> usize {
+        let [o0, o1, o2] = match &self.out[..] {
+            [a, b, c] => [a, b, c],
+            _ => return 0,
+        };
+        let row = |k: usize, n: usize| tables.get(self.row_of[k] * n..(self.row_of[k] + 1) * n);
+        if let (Some(s), Some(d)) = (T::u8s(src), T::u8s_mut(dst)) {
+            let rows =
+                [row(0, 256), row(1, 256), row(2, 256)].map(|r| r.and_then(|r| r.try_into().ok()));
+            let [Some(r0), Some(r1), Some(r2)] = rows else {
+                return 0;
+            };
+            let t = simd::ShaperTables {
+                rows: [r0, r1, r2],
+                outs: [o0, o1, o2],
+                m: self.m,
+                off: self.off,
+            };
+            if s.len() < 8 * sc_dc.0 || !simd::avx2() {
+                return 0;
+            }
+            let codes = self.codes8.get_or_init(|| self.build_codes8());
+            let codes = codes.as_ref().map(|c| {
+                c.each_ref().map(|u| simd::Codes8 {
+                    table: &u.table,
+                    base: u.base,
+                    shift: u.shift,
+                })
+            });
+            return simd::shaper_u8(&t, codes.as_ref(), s, d, sc_dc, alpha);
+        }
+        if let (Some(s), Some(d)) = (T::u16s(src), T::u16s_mut(dst)) {
+            let rows = [row(0, 65536), row(1, 65536), row(2, 65536)]
+                .map(|r| r.and_then(|r| r.try_into().ok()));
+            let [Some(r0), Some(r1), Some(r2)] = rows else {
+                return 0;
+            };
+            let t = simd::ShaperTables {
+                rows: [r0, r1, r2],
+                outs: [o0, o1, o2],
+                m: self.m,
+                off: self.off,
+            };
+            return simd::shaper_u16(&t, s, d, sc_dc, alpha);
+        }
+        0
     }
 
     /// The integer hot loop, monomorphised on the colour channel counts so
@@ -450,7 +756,7 @@ impl ShaperEngine {
 }
 
 enum Engine {
-    Shaper(ShaperEngine),
+    Shaper(Box<ShaperEngine>),
     Grid(ClutEval),
 }
 
@@ -478,6 +784,10 @@ pub struct Transform {
     /// first 8-bit call under [`AXIS8_CALL_PIXELS`] pixels and kept for
     /// the next ones (a bigger call builds its own, as it always has).
     axis8: OnceLock<Box<AxisTable>>,
+    precision: Precision,
+    /// [`Precision::Fast`] on a LUT chain (float CMYK), built by the first
+    /// fast `f32` call (`None`: no fast path).
+    fast_chain: OnceLock<Option<FastChain>>,
 }
 
 /// Pixels from which an 8-bit grid call builds its own table (256 axis
@@ -608,7 +918,7 @@ impl Transform {
             ));
         }
         let engine = if let Some(link) = chain.shaper.clone() {
-            Engine::Shaper(ShaperEngine::new(link))
+            Engine::Shaper(Box::new(ShaperEngine::new(link)))
         } else {
             let g = grid_points(chain.in_ch);
             let data = chain.sample_grid(g);
@@ -623,7 +933,51 @@ impl Transform {
             axis16: OnceLock::new(),
             pixels16: AtomicUsize::new(0),
             axis8: OnceLock::new(),
+            precision: Precision::Exact,
+            fast_chain: OnceLock::new(),
         })
+    }
+
+    /// This transform with `f32` pixels evaluated at `precision`
+    /// ([`Precision::Exact`] by default). Integer pixels are unaffected.
+    #[must_use]
+    pub fn with_precision(mut self, precision: Precision) -> Self {
+        self.precision = precision;
+        self
+    }
+
+    /// How `f32` pixels are evaluated.
+    #[must_use]
+    pub const fn precision(&self) -> Precision {
+        self.precision
+    }
+
+    /// [`Precision::Fast`] for `f32` pixels: `false`, with nothing done,
+    /// when this transform has no fast path (the exact one then serves).
+    fn run_fast_f32(
+        &self,
+        src: &[f32],
+        dst: &mut [f32],
+        sc_dc: (usize, usize),
+        (in_ch, out_ch): (usize, usize),
+        alpha: (bool, bool),
+    ) -> bool {
+        match &self.engine {
+            Engine::Shaper(e) if in_ch == 3 && out_ch == 3 => match self.chain.as_shaper() {
+                Some(exact) => e.run_fast_f32(src, dst, sc_dc, alpha, &exact),
+                None => false,
+            },
+            Engine::Grid(_) if !self.src_layout.is_lab() && !self.dst_layout.is_lab() => {
+                match self.fast_chain.get_or_init(|| FastChain::new(&self.chain)) {
+                    Some(f) if f.channels() == (in_ch, out_ch) => {
+                        f.run(src, dst, sc_dc, alpha);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     /// The source layout.
@@ -652,7 +1006,7 @@ impl Transform {
     pub fn transform<T: Sample>(&self, src: &[T], dst: &mut [T]) -> Result<()> {
         let sc = self.src_layout.channels();
         let dc = self.dst_layout.channels();
-        if src.len() % sc != 0 || dst.len() != src.len() / sc * dc {
+        if !src.len().is_multiple_of(sc) || dst.len() != src.len() / sc * dc {
             return Err(Error::BufferSize {
                 src: src.len(),
                 dst: dst.len(),
@@ -718,6 +1072,11 @@ impl Transform {
                 if let Some(s) = T::f32s(src) {
                     if let Some(d) = T::f32s_mut(dst) {
                         let alpha = (src_alpha, dst_alpha);
+                        if self.precision == Precision::Fast
+                            && self.run_fast_f32(s, d, (sc, dc), (in_ch, out_ch), alpha)
+                        {
+                            return Ok(());
+                        }
                         let head = if !src_lab && mostly_u8_points(s, sc, in_ch) {
                             self.u8_head
                                 .get_or_init(|| self.chain.head_on_u8_points())
@@ -1380,7 +1739,7 @@ impl GamutCheck {
     /// [`Error::BufferSize`] when `out` does not hold one value per pixel.
     pub fn delta_e<T: Sample>(&self, src: &[T], out: &mut [f64]) -> Result<()> {
         let sc = self.layout.channels();
-        if src.len() % sc != 0 || out.len() != src.len() / sc {
+        if !src.len().is_multiple_of(sc) || out.len() != src.len() / sc {
             return Err(Error::BufferSize {
                 src: src.len(),
                 dst: out.len(),
@@ -2012,6 +2371,614 @@ mod tests {
             let mut got = vec![7u8; 300 * dc];
             t.transform(&src, &mut got).unwrap();
             assert_eq!(got, want);
+        }
+    }
+
+    /// Every RGB matrix-shaper pair the kernels serve: built-ins, Adobe RGB
+    /// (pure gamma), linear-light Rec. 2020, and the sampled-curve `ProPhoto`
+    /// test profile, in both directions, with both intents and BPC.
+    fn shaper_pairs() -> Vec<(String, Transform, Transform)> {
+        use crate::color::{Xy, D65_XY};
+        use crate::curve::Curve;
+        let srgb = Profile::new_srgb();
+        let p3 = Profile::new_display_p3();
+        let rec2020 = Profile::new_rec2020();
+        let prim2020 = [
+            Xy::new(0.708, 0.292),
+            Xy::new(0.170, 0.797),
+            Xy::new(0.131, 0.046),
+        ];
+        let lin2020 = Profile::new_rgb(D65_XY, prim2020, Curve::gamma(1.0)).unwrap();
+        let adobe_prim = [
+            Xy::new(0.64, 0.33),
+            Xy::new(0.21, 0.71),
+            Xy::new(0.15, 0.06),
+        ];
+        let adobe = Profile::new_rgb(D65_XY, adobe_prim, Curve::gamma(563.0 / 256.0)).unwrap();
+        let pro =
+            Profile::new_from_slice(include_bytes!("../tests/data/ProPhoto-v2-micro.icc")).unwrap();
+        let named = [
+            ("srgb", &srgb),
+            ("p3", &p3),
+            ("rec2020", &rec2020),
+            ("lin2020", &lin2020),
+            ("adobe", &adobe),
+            ("prophoto", &pro),
+        ];
+        let mut out = Vec::new();
+        for (a, pa) in named {
+            for (b, pb) in named {
+                if a == b && a != "srgb" {
+                    continue;
+                }
+                for (intent, bpc) in [
+                    (Intent::RelativeColorimetric, false),
+                    (Intent::Perceptual, true),
+                ] {
+                    let opts = Options {
+                        black_point_compensation: bpc,
+                    };
+                    let mk = |sl, dl| Transform::new(pa, sl, pb, dl, intent, opts).unwrap();
+                    let (rgb, rgba) =
+                        (mk(Layout::Rgb, Layout::Rgb), mk(Layout::Rgba, Layout::Rgba));
+                    assert!(rgb.is_matrix_shaper(), "{a} -> {b}");
+                    out.push((format!("{a}->{b} {intent:?} bpc={bpc}"), rgb, rgba));
+                }
+            }
+        }
+        out
+    }
+
+    /// The scalar oracle of the matrix-shaper path: `run_loop` alone.
+    fn shaper_oracle<T: Sample>(t: &Transform, src: &[T], dst: &mut [T]) {
+        let Engine::Shaper(e) = &t.engine else {
+            panic!("matrix-shaper expected");
+        };
+        let tables = if T::KIND == SampleKind::U8 {
+            &e.in8[..]
+        } else {
+            e.in16()
+        };
+        let (sc, dc) = (t.src_layout.channels(), t.dst_layout.channels());
+        let (sa, da) = (t.src_layout.has_alpha(), t.dst_layout.has_alpha());
+        e.run_loop::<T, 3, 3>(tables, src, dst, sc, dc, sa, da);
+    }
+
+    fn xorshift(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    /// 8-bit sample pixels: every combination of edge values, then
+    /// pseudo-random ones (an odd count, so the kernels' tails run too).
+    fn sample_u8(n: usize, ch: usize) -> Vec<u8> {
+        let edges = [0u8, 1, 2, 127, 128, 253, 254, 255];
+        let mut v = Vec::new();
+        for &r in &edges {
+            for &g in &edges {
+                for &b in &edges {
+                    v.extend_from_slice(&[r, g, b, r ^ g ^ b][..ch]);
+                }
+            }
+        }
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        while v.len() < n * ch {
+            let x = xorshift(&mut s);
+            v.extend_from_slice(&x.to_le_bytes()[..ch]);
+        }
+        v.truncate(n * ch);
+        v
+    }
+
+    fn sample_u16(n: usize, ch: usize) -> Vec<u16> {
+        let edges = [0u16, 1, 2, 255, 256, 32767, 32768, 65533, 65534, 65535];
+        let mut v = Vec::new();
+        for &r in &edges {
+            for &g in &edges {
+                for &b in &edges {
+                    v.extend_from_slice(&[r, g, b, r ^ g ^ b][..ch]);
+                }
+            }
+        }
+        let mut s = 0xD1B5_4A32_D192_ED03u64;
+        while v.len() < n * ch {
+            let x = xorshift(&mut s);
+            for k in 0..ch {
+                v.push((x >> (16 * k)) as u16);
+            }
+        }
+        v.truncate(n * ch);
+        v
+    }
+
+    /// The same chain with other layouts.
+    fn relayout(t: &Transform, sl: Layout, dl: Layout) -> Transform {
+        Transform::from_chain((*t.chain).clone(), sl, dl).unwrap()
+    }
+
+    /// The public 8- and 16-bit matrix-shaper path (AVX2 kernel where the
+    /// CPU has it) against its scalar oracle, bit for bit: every pair, RGB
+    /// and RGBA on both sides, edges plus pseudo-random pixels.
+    #[test]
+    fn shaper_kernels_match_the_scalar_loop() {
+        let n = 20_003;
+        for (name, rgb, _) in shaper_pairs() {
+            for (sl, dl) in [
+                (Layout::Rgb, Layout::Rgb),
+                (Layout::Rgb, Layout::Rgba),
+                (Layout::Rgba, Layout::Rgb),
+                (Layout::Rgba, Layout::Rgba),
+            ] {
+                let t = relayout(&rgb, sl, dl);
+                let src = sample_u8(n, sl.channels());
+                let mut want = vec![0u8; n * dl.channels()];
+                let mut got = vec![1u8; n * dl.channels()];
+                shaper_oracle(&t, &src, &mut want);
+                t.transform(&src, &mut got).unwrap();
+                assert!(got == want, "u8 {name} {sl:?}->{dl:?}");
+                let src = sample_u16(n, sl.channels());
+                let mut want = vec![0u16; n * dl.channels()];
+                let mut got = vec![1u16; n * dl.channels()];
+                shaper_oracle(&t, &src, &mut want);
+                t.transform(&src, &mut got).unwrap();
+                assert!(got == want, "u16 {name} {sl:?}->{dl:?}");
+            }
+        }
+    }
+
+    /// 16-bit edge sweeps: each channel through all 65536 values with the
+    /// other two at 0, 32768 and 65535, every pair, against the oracle.
+    #[test]
+    fn shaper_u16_kernel_matches_on_channel_sweeps() {
+        let mut src = Vec::with_capacity(9 * 65536 * 3);
+        for c in 0..3 {
+            for other in [0u16, 32768, 65535] {
+                for v in 0..=u16::MAX {
+                    let mut px = [other; 3];
+                    px[c] = v;
+                    src.extend_from_slice(&px);
+                }
+            }
+        }
+        let mut want = vec![0u16; src.len()];
+        let mut got = vec![1u16; src.len()];
+        for (name, rgb, _) in shaper_pairs() {
+            shaper_oracle(&rgb, &src, &mut want);
+            rgb.transform(&src, &mut got).unwrap();
+            assert!(got == want, "u16 sweep {name}");
+        }
+    }
+
+    /// Every one of the 16,777,216 8-bit RGB colours, every pair, against the
+    /// oracle (`cargo test --release -- --ignored shaper_u8_exhaustive`).
+    #[test]
+    #[ignore = "exhaustive: 2^24 colours per pair"]
+    fn shaper_u8_exhaustive() {
+        let src: Vec<u8> = (0..1u32 << 24)
+            .flat_map(|v| [(v >> 16) as u8, (v >> 8) as u8, v as u8])
+            .collect();
+        let mut want = vec![0u8; src.len()];
+        let mut got = vec![1u8; src.len()];
+        let mut pairs = 0;
+        for (name, rgb, _) in shaper_pairs() {
+            shaper_oracle(&rgb, &src, &mut want);
+            rgb.transform(&src, &mut got).unwrap();
+            if let Some(i) = got.iter().zip(&want).position(|(a, b)| a != b) {
+                let px = i / 3;
+                panic!(
+                    "u8 exhaustive {name}: pixel {px:06x} kernel {:?} oracle {:?}",
+                    &got[3 * px..3 * px + 3],
+                    &want[3 * px..3 * px + 3]
+                );
+            }
+            pairs += 1;
+        }
+        eprintln!("shaper_u8_exhaustive: {pairs} pairs x 2^24 colours identical");
+    }
+
+    /// Reachability: on an AVX2 CPU the public 8- and 16-bit paths run the
+    /// kernel on every whole group of 8 pixels (the census counts them).
+    #[test]
+    fn shaper_kernels_are_reached() {
+        if !simd::avx2() {
+            eprintln!("no AVX2: the scalar loop serves every pixel");
+            return;
+        }
+        let (_, t, _) = shaper_pairs().swap_remove(0);
+        let census = || simd::CENSUS.load(Ordering::Relaxed);
+        let src = sample_u8(1001, 3);
+        let mut dst = vec![0u8; src.len()];
+        let before = census();
+        t.transform(&src, &mut dst).unwrap();
+        assert!(census() - before >= 1000, "u8 kernel not reached");
+        let src = sample_u16(1001, 3);
+        let mut dst = vec![0u16; src.len()];
+        let before = census();
+        t.transform(&src, &mut dst).unwrap();
+        assert!(census() - before >= 1000, "u16 kernel not reached");
+    }
+
+    /// [`U8Codes`] against the function it files, `from_unit(lookup_out(v))`,
+    /// for every output table of every pair: around every step (the 64 bit
+    /// patterns either side), on a dense stride of bit patterns over 0..=1,
+    /// and at the specials (NaN, infinities, negatives, past 1). Also: every
+    /// pair's tables qualify (so the kernel takes the threshold path).
+    #[test]
+    fn u8_codes_match_the_output_tables() {
+        let mut tables = 0;
+        for (name, rgb, _) in shaper_pairs() {
+            let Engine::Shaper(e) = &rgb.engine else {
+                panic!("matrix-shaper expected");
+            };
+            for (k, out) in e.out.iter().enumerate() {
+                let c = U8Codes::new(out).unwrap_or_else(|| panic!("{name}: table {k} declined"));
+                tables += 1;
+                let check = |v: f32| {
+                    assert_eq!(
+                        c.lookup(v),
+                        U8Codes::code(out, v),
+                        "{name} table {k} v {v:e} ({:08x})",
+                        v.to_bits()
+                    );
+                };
+                for &v in &[
+                    f32::NAN,
+                    -f32::NAN,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    -0.0,
+                    0.0,
+                ] {
+                    check(v);
+                }
+                for v in [-1.0f32, -1e-30, 1.0, 1.000_000_1, 2.0, f32::MAX] {
+                    check(v);
+                }
+                for bits in (0..=0x3F80_0000u32).step_by(997) {
+                    check(f32::from_bits(bits));
+                }
+                // Around each step of the table (found from the entries).
+                for (j, &en) in c.table.iter().enumerate() {
+                    let low = en & 0x7F_FFFF;
+                    if low >= 1 << c.shift {
+                        continue;
+                    }
+                    let step = ((j as u32) << c.shift) + low + c.base as u32;
+                    for b in step.saturating_sub(64)..=(step + 64).min(0x3F80_0000) {
+                        check(f32::from_bits(b));
+                    }
+                }
+            }
+        }
+        assert!(tables > 0);
+    }
+
+    /// `f32` test pixels for the fast paths: a 33-point lattice in each
+    /// channel (`k / 32`), the 8-bit points, pseudo-random values in 0..=1,
+    /// and out-of-range ones (negative, past 1, -0.0, NaN, infinities).
+    fn sample_f32(n: usize, ch: usize, out_of_range: bool) -> Vec<f32> {
+        let mut v = Vec::new();
+        let lattice: Vec<f32> = (0..=32).map(|k| k as f32 / 32.0).collect();
+        for &a in &lattice {
+            for &b in &lattice {
+                for &c in lattice.iter().step_by(4) {
+                    v.extend_from_slice(&[a, b, c, 1.0 - a, 0.5][..ch]);
+                }
+            }
+        }
+        let mut s = 0xA076_1D64_78BD_642Fu64;
+        let specials = [
+            -0.0f32,
+            -1e-6,
+            -0.5,
+            1.0 + 1e-6,
+            1.5,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        while v.len() < n * ch {
+            let x = xorshift(&mut s);
+            for k in 0..ch {
+                let r = (x >> (13 * k)) as u16;
+                let val = match r % 16 {
+                    0 if out_of_range => specials[usize::from(r >> 4) % specials.len()],
+                    1 => f32::from(r as u8) / 255.0,
+                    _ => f32::from(r) / 65535.0,
+                };
+                v.push(val);
+            }
+        }
+        v.truncate(n * ch);
+        v
+    }
+
+    /// The fast matrix-shaper path's scalar twin for `t`.
+    fn fast_oracle(t: &Transform, src: &[f32], dst: &mut [f32]) {
+        let Engine::Shaper(e) = &t.engine else {
+            panic!("matrix-shaper expected");
+        };
+        let f = e
+            .fast
+            .get_or_init(|| FastShaper::new(&e.link.in_curves, &e.link.out_curves))
+            .as_ref()
+            .expect("fast tables");
+        let view = f.view(e.m, e.off);
+        let sc_dc = (t.src_layout.channels(), t.dst_layout.channels());
+        let alpha = (t.src_layout.has_alpha(), t.dst_layout.has_alpha());
+        let mut near = Vec::new();
+        view.run(src, dst, sc_dc, alpha, (0, &mut near));
+        let chain = t.chain.as_shaper().expect("shaper chain");
+        for k in near {
+            let sp = &src[k * sc_dc.0..];
+            let out = chain.eval([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]);
+            for (c, v) in out.iter().enumerate() {
+                dst[k * sc_dc.1 + c] = *v as f32;
+            }
+        }
+    }
+
+    /// Which pairs have fast tables (and which keep the exact path).
+    fn fast_shaper_pairs() -> Vec<(String, Transform)> {
+        let mut out = Vec::new();
+        for (name, rgb, _) in shaper_pairs() {
+            let t = rgb.with_precision(Precision::Fast);
+            let Engine::Shaper(e) = &t.engine else {
+                unreachable!()
+            };
+            let ok = e
+                .fast
+                .get_or_init(|| FastShaper::new(&e.link.in_curves, &e.link.out_curves))
+                .is_some();
+            // Pure power-law output curves (Adobe RGB 2.2, ProPhoto 1.8)
+            // are infinitely steep at 0, and the ProPhoto test profile's
+            // coarse sampled curves have kinks a 4096-entry table misses by
+            // more than 1e-6: those keep the exact path. Every pair of the
+            // parametric and identity profiles must qualify.
+            let family = |p: &str| ["srgb", "p3", "rec2020", "lin2020"].contains(&p);
+            let (a, b) = name.split_once(' ').unwrap().0.split_once("->").unwrap();
+            if family(a) && family(b) {
+                assert!(ok, "{name}: no fast tables");
+            }
+            if !ok {
+                eprintln!("fast shaper {name}: exact path (tables declined)");
+            }
+            if ok {
+                out.push((name, t));
+            }
+        }
+        out
+    }
+
+    /// The fast `f32` matrix-shaper kernel against its scalar twin, bit for
+    /// bit (determinism with and without SIMD): every qualifying pair, every
+    /// RGB/RGBA layout, in- and out-of-range values.
+    #[test]
+    fn fast_shaper_kernel_matches_its_scalar_twin() {
+        let n = 20_003;
+        for (name, t) in fast_shaper_pairs() {
+            for (sl, dl) in [
+                (Layout::Rgb, Layout::Rgb),
+                (Layout::Rgb, Layout::Rgba),
+                (Layout::Rgba, Layout::Rgb),
+                (Layout::Rgba, Layout::Rgba),
+            ] {
+                let t = relayout(&t, sl, dl).with_precision(Precision::Fast);
+                let src = sample_f32(n, sl.channels(), true);
+                let mut want = vec![0f32; n * dl.channels()];
+                let mut got = vec![1f32; n * dl.channels()];
+                fast_oracle(&t, &src, &mut want);
+                t.transform(&src, &mut got).unwrap();
+                let same = got
+                    .iter()
+                    .zip(&want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+                assert!(same, "fast f32 {name} {sl:?}->{dl:?}");
+            }
+        }
+    }
+
+    /// The fast matrix-shaper error budget: within 1e-5 of the exact path
+    /// per channel for every qualifying pair, on the lattice, the 8-bit
+    /// points, pseudo-random values and out-of-range ones (the exact path
+    /// clamps; so does the fast one, with no new clipping); NaN in gives
+    /// what the exact path gives. Prints the worst error per pair.
+    #[test]
+    fn fast_shaper_error_budget() {
+        let n = 300_007;
+        let src = sample_f32(n, 3, true);
+        let mut worst_all = 0f32;
+        for (name, fast) in fast_shaper_pairs() {
+            let exact = relayout(&fast, Layout::Rgb, Layout::Rgb);
+            let mut want = vec![0f32; src.len()];
+            let mut got = vec![0f32; src.len()];
+            exact.transform(&src, &mut want).unwrap();
+            fast.transform(&src, &mut got).unwrap();
+            let mut worst = (0f32, 0usize);
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert!((0.0..=1.0).contains(a), "{name}: fast {a} out of range");
+                let d = (a - b).abs();
+                if d > worst.0 {
+                    worst = (d, i);
+                }
+            }
+            let px = worst.1 / 3;
+            assert!(
+                worst.0 <= 1e-5,
+                "{name}: |fast - exact| {:e} at {:?}",
+                worst.0,
+                &src[3 * px..3 * px + 3]
+            );
+            worst_all = worst_all.max(worst.0);
+            eprintln!("fast shaper {name}: max |fast - exact| {:.3e}", worst.0);
+        }
+        eprintln!("fast shaper: worst over all pairs {worst_all:.3e}");
+    }
+
+    /// Reachability: the public fast `f32` path runs the AVX2 kernel.
+    #[test]
+    fn fast_shaper_kernel_is_reached() {
+        if !simd::avx2() {
+            eprintln!("no AVX2: the scalar twin serves every pixel");
+            return;
+        }
+        let (_, t) = fast_shaper_pairs().swap_remove(0);
+        let src = sample_f32(1001, 3, false);
+        let mut dst = vec![0f32; src.len()];
+        let before = simd::CENSUS.load(Ordering::Relaxed);
+        t.transform(&src, &mut dst).unwrap();
+        assert!(simd::CENSUS.load(Ordering::Relaxed) - before >= 1000);
+    }
+
+    /// The fast matrix-shaper error budget on dense sweeps: all 2^24 colours
+    /// whose channels are 8-bit points (`k / 255`, the shape of float data
+    /// decoded from 8-bit images) and a 257^3 lattice (`k / 256`), every
+    /// qualifying pair (`cargo test --release -- --ignored fast_shaper_dense`).
+    #[test]
+    #[ignore = "dense: 2^24 + 257^3 colours per pair"]
+    fn fast_shaper_dense() {
+        let points: Vec<f32> = (0..1u32 << 24)
+            .flat_map(|v| [v >> 16, (v >> 8) & 255, v & 255].map(|k| k as f32 / 255.0))
+            .collect();
+        let lattice: Vec<f32> = (0..257u32 * 257 * 257)
+            .flat_map(|v| [v / (257 * 257), (v / 257) % 257, v % 257].map(|k| k as f32 / 256.0))
+            .collect();
+        let mut worst_all = 0f32;
+        for (name, fast) in fast_shaper_pairs() {
+            if name.contains("Perceptual") {
+                continue; // matrix-shaper intents share one matrix
+            }
+            let exact = relayout(&fast, Layout::Rgb, Layout::Rgb);
+            for (set, src) in [("8-bit points", &points), ("257^3 lattice", &lattice)] {
+                let mut want = vec![0f32; src.len()];
+                let mut got = vec![0f32; src.len()];
+                exact.transform(src, &mut want).unwrap();
+                fast.transform(src, &mut got).unwrap();
+                let (worst, at) = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .enumerate()
+                    .fold((0f32, 0), |m, (i, d)| if d > m.0 { (d, i) } else { m });
+                eprintln!(
+                    "fast shaper dense {name} {set}: max |fast - exact| {worst:.3e} at {:?} -> fast {} exact {}",
+                    &src[at / 3 * 3..at / 3 * 3 + 3],
+                    got[at],
+                    want[at]
+                );
+                assert!(worst <= 1e-5, "{name} {set}: {worst:e}");
+                worst_all = worst_all.max(worst);
+            }
+        }
+        eprintln!("fast shaper dense: worst {worst_all:.3e}");
+    }
+
+    /// LUT chains with a fast path: sRGB <-> a synthetic lut16 CMYK profile,
+    /// in every RGB/RGBA and CMYK/CMYKA layout, both intents.
+    fn fast_chain_transforms() -> Vec<(String, Transform)> {
+        let srgb = Profile::new_srgb();
+        let cmyk = test_lut_profile(crate::ColorSpace::Cmyk, 4, 0x0430_0000, (4096, 2), true);
+        let mut out = Vec::new();
+        for intent in [Intent::Perceptual, Intent::RelativeColorimetric] {
+            let o = Options::default();
+            for (sl, dl) in [
+                (Layout::Rgb, Layout::Cmyk),
+                (Layout::Rgba, Layout::Cmyka),
+                (Layout::Rgb, Layout::Cmyka),
+                (Layout::Rgba, Layout::Cmyk),
+            ] {
+                let t = Transform::new(&srgb, sl, &cmyk, dl, intent, o).unwrap();
+                out.push((format!("srgb->cmyk {sl:?}->{dl:?} {intent:?}"), t));
+                let t = Transform::new(&cmyk, dl, &srgb, sl, intent, o).unwrap();
+                out.push((format!("cmyk->srgb {dl:?}->{sl:?} {intent:?}"), t));
+            }
+        }
+        out.into_iter()
+            .map(|(n, t)| (n, t.with_precision(Precision::Fast)))
+            .collect()
+    }
+
+    /// The fast LUT-chain kernel against its scalar twin, bit for bit, in-
+    /// and out-of-range input, and the census: the kernel is reached.
+    #[test]
+    fn fast_chain_kernel_matches_its_scalar_twin() {
+        let n = 20_003;
+        for (name, t) in fast_chain_transforms() {
+            let (sc, dc) = (t.src_layout.channels(), t.dst_layout.channels());
+            let src = sample_f32(n, sc, true);
+            let mut got = vec![1f32; n * dc];
+            let before = simd::CENSUS.load(Ordering::Relaxed);
+            t.transform(&src, &mut got).unwrap();
+            // The kernel takes whole groups of 8 pixels in every shape but
+            // CMYKA (five samples), which the scalar twin serves.
+            if simd::avx2() && sc < 5 && dc < 5 {
+                let reached = simd::CENSUS.load(Ordering::Relaxed) - before;
+                assert!(reached >= (n / 8 * 8) as u64, "{name}: kernel not reached");
+            }
+            let f = t
+                .fast_chain
+                .get()
+                .and_then(Option::as_ref)
+                .expect("fast chain");
+            let mut want = vec![0f32; n * dc];
+            let alpha = (t.src_layout.has_alpha(), t.dst_layout.has_alpha());
+            f.run_scalar(&src, &mut want, (sc, dc), alpha);
+            if let Some(k) = got
+                .iter()
+                .zip(&want)
+                .position(|(a, b)| a.to_bits() != b.to_bits())
+            {
+                let px = k / dc;
+                panic!(
+                    "fast chain {name}: pixel {px} in {:?} kernel {:?} twin {:?}",
+                    &src[px * sc..px * sc + sc],
+                    &got[px * dc..px * dc + dc],
+                    &want[px * dc..px * dc + dc]
+                );
+            }
+            let colour = t.dst_layout.color_channels();
+            let in_range = got
+                .chunks_exact(dc)
+                .all(|p| p[..colour].iter().all(|v| (0.0..=1.0).contains(v)));
+            assert!(in_range, "{name}: range");
+            // Against the exact path: CIEDE2000 through the destination
+            // profile (the budget is 1.0 worst, 0.1 mean; the chain fast path
+            // sits near 1e-3).
+            let exact =
+                Transform::from_chain((*t.chain).clone(), t.src_layout, t.dst_layout).unwrap();
+            let mut ex = vec![0f32; n * dc];
+            exact.transform(&src, &mut ex).unwrap();
+            let lab = Profile::new_lab_identity();
+            let dst_profile = if name.starts_with("srgb->cmyk") {
+                test_lut_profile(crate::ColorSpace::Cmyk, 4, 0x0430_0000, (4096, 2), true)
+            } else {
+                Profile::new_srgb()
+            };
+            let to_lab = Transform::new(
+                &dst_profile,
+                t.dst_layout,
+                &lab,
+                Layout::Lab,
+                Intent::RelativeColorimetric,
+                Options::default(),
+            )
+            .unwrap();
+            let (mut la, mut lb) = (vec![0f32; n * 3], vec![0f32; n * 3]);
+            to_lab.transform(&got, &mut la).unwrap();
+            to_lab.transform(&ex, &mut lb).unwrap();
+            let de = la
+                .chunks_exact(3)
+                .zip(lb.chunks_exact(3))
+                .map(|(a, b)| {
+                    crate::color::delta_e_2000(
+                        crate::color::Lab::new(a[0].into(), a[1].into(), a[2].into()),
+                        crate::color::Lab::new(b[0].into(), b[1].into(), b[2].into()),
+                    )
+                })
+                .fold(0f64, f64::max);
+            assert!(de < 0.05, "{name}: dE2000 {de}");
         }
     }
 }
