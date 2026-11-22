@@ -487,6 +487,45 @@ impl Stage {
     }
 }
 
+/// The `N` values of the grid point at flat offset `at`, when wholly inside
+/// `data`.
+#[inline(always)]
+fn tri_corner<const N: usize>(data: &[f32], at: usize) -> Option<&[f32; N]> {
+    data.get(at..)?.first_chunk::<N>()
+}
+
+/// Trilinear interpolation along the last input, from the grid point at
+/// `at` to the one `s2` further, at fraction `f2`.
+#[inline(always)]
+fn tri_line<const N: usize>(data: &[f32], at: usize, s2: usize, f2: f64) -> Option<[f64; N]> {
+    let (pa, pb) = (tri_corner::<N>(data, at)?, tri_corner::<N>(data, at + s2)?);
+    let mut r = [0.0f64; N];
+    for o in 0..N {
+        let (a, b) = (f64::from(pa[o]), f64::from(pb[o]));
+        r[o] = a + (b - a) * f2;
+    }
+    Some(r)
+}
+
+/// Along the middle input between two [`tri_line`]s, the upper skipped when
+/// its step or fraction is zero.
+#[inline(always)]
+fn tri_plane<const N: usize>(
+    data: &[f32],
+    at: usize,
+    (s1, s2): (usize, usize),
+    (f1, f2): (f64, f64),
+) -> Option<[f64; N]> {
+    let mut lo = tri_line::<N>(data, at, s2, f2)?;
+    if s1 != 0 && f1 != 0.0 {
+        let hi = tri_line::<N>(data, at + s1, s2, f2)?;
+        for o in 0..N {
+            lo[o] += (hi[o] - lo[o]) * f1;
+        }
+    }
+    Some(lo)
+}
+
 /// A CLUT ready for interpolation: `f32` values over `0..=1`.
 #[derive(Debug, Clone)]
 pub(crate) struct ClutEval {
@@ -552,7 +591,70 @@ impl<const IN: usize, const OUT: usize> FixedClut<'_, IN, OUT> {
     }
 }
 
+/// A CLUT of exactly three inputs and `N` outputs viewed for a loop of
+/// lookups in line: the per-axis sizes and strides read once into arrays.
+/// Unlike [`FixedClut`] it takes trilinear CLUTs (every Lab-indexed output
+/// table) too.
+pub(crate) struct Clut3Ref<'a, const N: usize> {
+    clut: &'a ClutEval,
+    grid: [usize; 3],
+    strides: [usize; 3],
+}
+
+impl<'a, const N: usize> Clut3Ref<'a, N> {
+    /// `None` unless `clut` has exactly three inputs and `N` outputs.
+    pub(crate) fn new(clut: &'a ClutEval) -> Option<Self> {
+        if clut.outputs != N {
+            return None;
+        }
+        Some(Self {
+            clut,
+            grid: clut.grid.as_slice().try_into().ok()?,
+            strides: clut.strides.as_slice().try_into().ok()?,
+        })
+    }
+
+    pub(crate) fn trilinear(&self) -> bool {
+        self.clut.trilinear
+    }
+
+    /// The lookup at `x` into `out[..N]`: exactly what [`ClutEval::eval`]
+    /// gives (its three-input front end and kernel, in line), with the
+    /// interpolation `TRILINEAR` says the CLUT uses.
+    #[inline(always)]
+    pub(crate) fn lookup<const TRILINEAR: bool>(&self, x: [f64; 3], out: &mut [f64; 16]) {
+        let [g0, g1, g2] = self.grid;
+        let [s0, s1, s2] = self.strides;
+        let (i0, f0) = ClutEval::axis(g0, x[0]);
+        let (i1, f1) = ClutEval::axis(g1, x[1]);
+        let (i2, f2) = ClutEval::axis(g2, x[2]);
+        let origin = i0 * s0 + i1 * s1 + i2 * s2;
+        let f = [f0, f1, f2];
+        let step = [
+            if i0 + 1 < g0 { s0 } else { 0 },
+            if i1 + 1 < g1 { s1 } else { 0 },
+            if i2 + 1 < g2 { s2 } else { 0 },
+        ];
+        let done = if TRILINEAR {
+            self.clut.trilinear_walk::<N>(origin, f, step, out)
+        } else {
+            self.clut.tetra_walk::<N>(origin, f, step, out)
+        };
+        if !done {
+            self.clut.eval_declined(x, out);
+        }
+    }
+}
+
 impl ClutEval {
+    /// [`Clut3Ref::lookup`] for the lookup a kernel declines (a corner
+    /// outside the data: only a hand-built inconsistent [`Clut`]).
+    #[cold]
+    #[inline(never)]
+    fn eval_declined(&self, x: [f64; 3], out: &mut [f64; 16]) {
+        self.eval(&x, out);
+    }
+
     /// This CLUT as a [`FixedClut`], when it is tetrahedral with exactly
     /// `IN` inputs and `OUT` outputs.
     pub(crate) fn fixed<const IN: usize, const OUT: usize>(
@@ -829,33 +931,32 @@ impl ClutEval {
         [s0, s1, s2]: [usize; 3],
         out: &mut [f64; 16],
     ) -> bool {
-        let c = |d: usize| -> Option<&[f32; N]> { self.data.get(origin + d..)?.first_chunk::<N>() };
-        // Along the last input, from the corner at offset `off`.
-        let line = |off: usize| -> Option<[f64; N]> {
-            let (pa, pb) = (c(off)?, c(off + s2)?);
-            let mut r = [0.0f64; N];
-            for o in 0..N {
-                let (a, b) = (f64::from(pa[o]), f64::from(pb[o]));
-                r[o] = a + (b - a) * f2;
-            }
-            Some(r)
-        };
-        // Along the middle input, between two such lines.
-        let plane = |off: usize| -> Option<[f64; N]> {
-            let mut lo = line(off)?;
-            if s1 != 0 && f1 != 0.0 {
-                let hi = line(off + s1)?;
-                for o in 0..N {
-                    lo[o] += (hi[o] - lo[o]) * f1;
-                }
-            }
-            Some(lo)
-        };
-        let Some(mut lo) = plane(0) else {
+        self.trilinear_walk::<N>(origin, [f0, f1, f2], [s0, s1, s2], out)
+    }
+
+    /// The body of [`ClutEval::trilinear_fixed`], in line wherever it is
+    /// used (as [`ClutEval::tetra_walk`] is): [`ClutEval::eval`] keeps its
+    /// copy through that handle, and each float loop over a [`Clut3Ref`]
+    /// takes its own (with two such loops the handle stopped being inlined
+    /// into them: +48 instructions per pixel).
+    #[inline(always)]
+    fn trilinear_walk<const N: usize>(
+        &self,
+        origin: usize,
+        [f0, f1, f2]: [f64; 3],
+        [s0, s1, s2]: [usize; 3],
+        out: &mut [f64; 16],
+    ) -> bool {
+        // The line and plane steps are functions forced in line: as
+        // closures they were a call per plane (two per lookup) with the
+        // corner state spilled around it. The arithmetic is unchanged.
+        let data = &self.data[..];
+        let at = origin;
+        let Some(mut lo) = tri_plane::<N>(data, at, (s1, s2), (f1, f2)) else {
             return false;
         };
         if s0 != 0 && f0 != 0.0 {
-            let Some(hi) = plane(s0) else {
+            let Some(hi) = tri_plane::<N>(data, at + s0, (s1, s2), (f1, f2)) else {
                 return false;
             };
             for o in 0..N {

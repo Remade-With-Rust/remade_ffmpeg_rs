@@ -9,6 +9,7 @@
 set -euo pipefail
 A=/root/iccbench/arms/$1; B=/root/iccbench/arms/$2; CPU=$3; PAIRS=$4; REPS=$5; shift 5
 export RUSTY_ICC_FOGRA39=${RUSTY_ICC_FOGRA39:-/root/iccbench/CoatedFOGRA39.icc}
+export RUSTY_ICC_FOGRA39_V4=${RUSTY_ICC_FOGRA39_V4:-/root/iccbench/CoatedFOGRA39-v4.icc}
 echo "method: taskset -c $CPU; $PAIRS ABBA pairs; $REPS in-process reps per run, min; A=$(basename "$A") B=$(basename "$B"); load $(cut -d' ' -f1-3 /proc/loadavg)"
 run() { taskset -c "$CPU" "$1" "$2" "$REPS" | awk '/^time_ns/ {print $3}'; }
 for m in "$@"; do

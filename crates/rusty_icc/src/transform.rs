@@ -1,12 +1,15 @@
 //! Colour transforms between profiles.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::color::delta_e_2000;
 use crate::curve::InvCurve;
 use crate::error::{Error, Result};
 use crate::lut::{ClutEval, FixedClut};
-use crate::pipeline::{build_chain, Chain, GamutChain, ShaperChain, ShaperLink};
+use crate::pipeline::{
+    build_chain, u8_point, Chain, GamutChain, LutOutChain, SegChain, ShaperChain, ShaperLink,
+};
 use crate::profile::{ColorSpace, Profile};
 
 /// ICC rendering intent.
@@ -463,6 +466,52 @@ pub struct Transform {
     dst_layout: Layout,
     chain: Arc<Chain>,
     engine: Engine,
+    /// [`Chain::head_on_u8_points`], built by the first `f32` call whose
+    /// pixels are 8-bit points.
+    u8_head: OnceLock<Option<Box<[[f64; 256]]>>>,
+    /// The grid's `(cell, fraction)` for every 16-bit value
+    /// ([`Axis16`]), built once 16-bit calls have brought at least
+    /// [`AXIS16_MIN_PIXELS`] pixels (counted in `pixels16`).
+    axis16: OnceLock<Axis16>,
+    pixels16: AtomicUsize,
+    /// The grid's `(cell, fraction)` for every 8-bit value, built by the
+    /// first 8-bit call under [`AXIS8_CALL_PIXELS`] pixels and kept for
+    /// the next ones (a bigger call builds its own, as it always has).
+    axis8: OnceLock<Box<AxisTable>>,
+}
+
+/// Pixels from which an 8-bit grid call builds its own table (256 axis
+/// evaluations, under 1 instruction per pixel from here) instead of reading
+/// the transform's: a call of 64 pixels spent 60 per pixel building it.
+const AXIS8_CALL_PIXELS: usize = 4096;
+
+/// Pixels a 16-bit grid call needs to build [`Axis16`] (65536 axis
+/// evaluations, about what 16384 four-channel pixels spend on them).
+const AXIS16_MIN_PIXELS: usize = 16384;
+
+/// [`ClutEval::axis`] of every 16-bit sample on an axis of the device-link
+/// grid (every axis has the same point count): the cells and fractions
+/// apart, 640 KiB, so a 16-bit lookup reads its `(cell, fraction)` per
+/// channel instead of converting, dividing, clamping and truncating.
+struct Axis16 {
+    cell: Box<[u16]>,
+    frac: Box<[f64]>,
+}
+
+impl Axis16 {
+    fn new(points: usize) -> Self {
+        let (cell, frac) = (0..=u16::MAX)
+            .map(|v| {
+                let (c, f) = ClutEval::axis(points, v.to_unit());
+                // At most 4096 points per axis, so the cell fits.
+                (u16::try_from(c).unwrap_or(u16::MAX), f)
+            })
+            .unzip::<_, _, Vec<_>, Vec<_>>();
+        Self {
+            cell: cell.into_boxed_slice(),
+            frac: frac.into_boxed_slice(),
+        }
+    }
 }
 
 impl core::fmt::Debug for Transform {
@@ -570,6 +619,10 @@ impl Transform {
             dst_layout,
             chain: Arc::new(chain),
             engine,
+            u8_head: OnceLock::new(),
+            axis16: OnceLock::new(),
+            pixels16: AtomicUsize::new(0),
+            axis8: OnceLock::new(),
         })
     }
 
@@ -628,13 +681,32 @@ impl Transform {
                 let (ch, alpha) = ((sc, dc, in_ch, out_ch), (src_alpha, dst_alpha));
                 if let Some(s) = T::u8s(src) {
                     if let Some(d) = T::u8s_mut(dst) {
-                        run_grid_u8(g, s, d, ch, alpha);
+                        if s.len() / sc >= AXIS8_CALL_PIXELS {
+                            run_grid_u8(g, s, d, ch, alpha);
+                        } else {
+                            run_grid_u8_shared(g, &self.axis8, s, d, ch, alpha);
+                        }
                         return Ok(());
                     }
                 }
                 if let Some(s) = T::u16s(src) {
                     if let Some(d) = T::u16s_mut(dst) {
-                        run_grid_u16(g, s, d, ch, alpha);
+                        let same_axes = (1..in_ch).all(|i| g.points(i) == g.points(0));
+                        let table = match self.axis16.get() {
+                            Some(t) => Some(t),
+                            None if same_axes
+                                && self.pixels16.fetch_add(s.len() / sc, Ordering::Relaxed)
+                                    + s.len() / sc
+                                    >= AXIS16_MIN_PIXELS =>
+                            {
+                                Some(self.axis16.get_or_init(|| Axis16::new(g.points(0))))
+                            }
+                            None => None,
+                        };
+                        match table {
+                            Some(t) if same_axes => run_grid_u16_table(g, t, s, d, ch, alpha),
+                            _ => run_grid_u16(g, s, d, ch, alpha),
+                        }
                         return Ok(());
                     }
                 }
@@ -646,11 +718,49 @@ impl Transform {
                 if let Some(s) = T::f32s(src) {
                     if let Some(d) = T::f32s_mut(dst) {
                         let alpha = (src_alpha, dst_alpha);
+                        let head = if !src_lab && mostly_u8_points(s, sc, in_ch) {
+                            self.u8_head
+                                .get_or_init(|| self.chain.head_on_u8_points())
+                                .as_deref()
+                        } else {
+                            None
+                        };
                         if let Some(f) = self.chain.as_shaper() {
-                            run_shaper_f32(&f, s, d, (sc, dc), alpha);
+                            match head {
+                                Some([r0, r1, r2, ..]) => {
+                                    run_shaper_f32_u8_points(
+                                        &f,
+                                        [r0, r1, r2],
+                                        s,
+                                        d,
+                                        (sc, dc),
+                                        alpha,
+                                    );
+                                }
+                                _ => run_shaper_f32(&f, s, d, (sc, dc), alpha),
+                            }
+                            return Ok(());
+                        }
+                        if let Some(l) = self.chain.as_lut_out::<4>() {
+                            run_lut_out_f32(&l, head, s, d, (sc, dc), alpha);
+                        } else if let Some(l) = self.chain.as_lut_out::<3>() {
+                            run_lut_out_f32(&l, head, s, d, (sc, dc), alpha);
                         } else {
                             let ch = (sc, dc, in_ch, out_ch);
-                            run_chain_f32(&self.chain, s, d, ch, alpha, (src_lab, dst_lab));
+                            match head {
+                                Some(rows) => run_chain_f32_u8_points(
+                                    &self.chain,
+                                    rows,
+                                    s,
+                                    d,
+                                    ch,
+                                    alpha,
+                                    dst_lab,
+                                ),
+                                None => {
+                                    run_chain_f32(&self.chain, s, d, ch, alpha, (src_lab, dst_lab))
+                                }
+                            }
                         }
                         return Ok(());
                     }
@@ -771,6 +881,140 @@ fn run_segments_f32(
     true
 }
 
+/// [`run_shaper_f32`] when the device curves of every sample that is an
+/// 8-bit point come from `rows` ([`Chain::head_on_u8_points`]); any other
+/// sample is evaluated (the same value either way). One loop per kind of
+/// chain, each in its own frame, so the pixel loops keep their code.
+fn run_shaper_f32_u8_points(
+    f: &ShaperChain<'_>,
+    rows: [&[f64; 256]; 3],
+    src: &[f32],
+    dst: &mut [f32],
+    sc_dc: (usize, usize),
+    alpha: (bool, bool),
+) {
+    match f.segments() {
+        Some(seg) => run_segments_f32_u8_points(&seg, rows, src, dst, sc_dc, alpha),
+        None => run_curves_f32_u8_points(f, rows, src, dst, sc_dc, alpha),
+    }
+}
+
+/// [`run_shaper_f32_u8_points`] for a [`SegChain`].
+#[inline(never)]
+fn run_segments_f32_u8_points(
+    seg: &SegChain,
+    rows: [&[f64; 256]; 3],
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) {
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let v = match (u8_point(sp[0]), u8_point(sp[1]), u8_point(sp[2])) {
+            (Some(a), Some(b), Some(c)) => [rows[0][a], rows[1][b], rows[2][c]],
+            _ => seg.curves([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]),
+        };
+        let out = seg.rest(v);
+        dp[0] = out[0] as f32;
+        dp[1] = out[1] as f32;
+        dp[2] = out[2] as f32;
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
+}
+
+/// [`run_shaper_f32_u8_points`] for any other [`ShaperChain`].
+#[inline(never)]
+fn run_curves_f32_u8_points(
+    f: &ShaperChain<'_>,
+    rows: [&[f64; 256]; 3],
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) {
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let v = match (u8_point(sp[0]), u8_point(sp[1]), u8_point(sp[2])) {
+            (Some(a), Some(b), Some(c)) => [rows[0][a], rows[1][b], rows[2][c]],
+            _ => f.curves([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]),
+        };
+        let out = f.rest(v);
+        dp[0] = out[0] as f32;
+        dp[1] = out[1] as f32;
+        dp[2] = out[2] as f32;
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
+}
+
+/// `f32` pixels through a [`LutOutChain`], one loop per output count; with
+/// `head` ([`Chain::head_on_u8_points`]) the curves of every sample that is
+/// an 8-bit point come from that table.
+fn run_lut_out_f32<const N: usize>(
+    l: &LutOutChain<'_, N>,
+    head: Option<&[[f64; 256]]>,
+    src: &[f32],
+    dst: &mut [f32],
+    sc_dc: (usize, usize),
+    alpha: (bool, bool),
+) {
+    match head {
+        Some([r0, r1, r2, ..]) => run_lut_out_u8_points(l, [r0, r1, r2], src, dst, sc_dc, alpha),
+        _ => run_lut_out_plain(l, src, dst, sc_dc, alpha),
+    }
+}
+
+/// [`run_lut_out_f32`] without a table.
+#[inline(never)]
+fn run_lut_out_plain<const N: usize>(
+    l: &LutOutChain<'_, N>,
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) {
+    let mut out = [0.0f64; 16];
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let v = l.curves([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]);
+        l.rest(v, &mut out);
+        for c in 0..N {
+            dp[c] = out[c] as f32;
+        }
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
+}
+
+/// [`run_lut_out_f32`] with the table: per sample the row entry when the
+/// sample is an 8-bit point, the curve otherwise (the same value).
+#[inline(never)]
+fn run_lut_out_u8_points<const N: usize>(
+    l: &LutOutChain<'_, N>,
+    rows: [&[f64; 256]; 3],
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) {
+    let mut out = [0.0f64; 16];
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let v = match (u8_point(sp[0]), u8_point(sp[1]), u8_point(sp[2])) {
+            (Some(a), Some(b), Some(c)) => [rows[0][a], rows[1][b], rows[2][c]],
+            _ => l.curves([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]),
+        };
+        l.rest(v, &mut out);
+        for c in 0..N {
+            dp[c] = out[c] as f32;
+        }
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
+}
+
 /// `f32` pixels through the exact pipeline. Not generic, so the loop is
 /// compiled here, on one zero-tailed array per pixel that the chain works on
 /// in place; the generic loop is compiled in the caller's crate and pays a
@@ -808,6 +1052,74 @@ fn run_chain_f32(
     }
 }
 
+/// `true` when the first pixel's colour samples are all 8-bit points
+/// ([`u8_point`]) and at least 7 in 8 of the first 64 pixels' are: float
+/// pixels widened from 8-bit data, which [`run_chain_f32_u8_points`] serves
+/// from a table. Other data is turned away by its first sample.
+fn mostly_u8_points(src: &[f32], sc: usize, in_ch: usize) -> bool {
+    let Some(first) = src.get(..in_ch) else {
+        return false;
+    };
+    if !first.iter().all(|&x| u8_point(x).is_some()) {
+        return false;
+    }
+    let mut seen = 0usize;
+    let mut hits = 0usize;
+    for px in src.chunks_exact(sc).take(64) {
+        for &x in &px[..in_ch] {
+            seen += 1;
+            hits += usize::from(u8_point(x).is_some());
+        }
+    }
+    seen > 0 && hits * 8 >= seen * 7
+}
+
+/// [`run_chain_f32`] for a source that is not Lab, with the chain's first
+/// op looked up in `rows` ([`Chain::head_on_u8_points`]) for every sample
+/// that is an 8-bit point and evaluated by the chain for any other: the
+/// same values either way.
+#[inline(never)]
+fn run_chain_f32_u8_points(
+    chain: &Chain,
+    rows: &[[f64; 256]],
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc, in_ch, out_ch): (usize, usize, usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+    dst_lab: bool,
+) {
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let mut v = [0.0f64; 16];
+        let mut all = true;
+        for (c, row) in rows.iter().enumerate().take(in_ch) {
+            match u8_point(sp[c]) {
+                Some(k) => v[c] = row[k],
+                None => all = false,
+            }
+        }
+        if all {
+            chain.eval_tail_in_place(&mut v);
+        } else {
+            v = [0.0f64; 16];
+            for c in 0..in_ch {
+                v[c] = f64::from(sp[c]);
+            }
+            chain.eval_in_place(&mut v);
+        }
+        if dst_lab {
+            v[0] *= 100.0;
+            v[1] = v[1] * 255.0 - 128.0;
+            v[2] = v[2] * 255.0 - 128.0;
+        }
+        for c in 0..out_ch {
+            dp[c] = v[c] as f32;
+        }
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
+}
+
 /// Every 8-bit value's `(cell, fraction)` on a grid axis.
 type AxisTable = [(usize, f64); 256];
 
@@ -831,6 +1143,33 @@ fn run_grid_u8(
     grid_shaped(g, src, dst, ch, alpha, |_, v| table[usize::from(v)]);
 }
 
+/// [`run_grid_u8`] for a small call: the table is the transform's, built
+/// by the first such call. In its own frame, so the loop of the big calls
+/// keeps its code (sharing a frame with a second instance of the loop cost
+/// it 1 to 5 instructions per pixel: fogu8 +0.52..2.92%).
+#[inline(never)]
+fn run_grid_u8_shared(
+    g: &ClutEval,
+    shared: &OnceLock<Box<AxisTable>>,
+    src: &[u8],
+    dst: &mut [u8],
+    ch: (usize, usize, usize, usize),
+    alpha: (bool, bool),
+) {
+    let table: &AxisTable = shared.get_or_init(|| {
+        let points = g.points(0);
+        Box::new(core::array::from_fn(|v| {
+            ClutEval::axis(points, (v as u8).to_unit())
+        }))
+    });
+    // Every other shape through `run_grid_u8` itself: a second caller of
+    // its helpers (`fixed_shape`, `run_grid`) re-rolled its loops (cgatsu8
+    // +0.41%).
+    if !grid_shaped(g, src, dst, ch, alpha, |_, v| table[usize::from(v)]) {
+        run_grid_u8(g, src, dst, ch, alpha);
+    }
+}
+
 /// The 16-bit device-link grid loop, likewise.
 fn run_grid_u16(
     g: &ClutEval,
@@ -841,6 +1180,30 @@ fn run_grid_u16(
 ) {
     if !grid_shaped(g, src, dst, ch, alpha, |points, v| {
         ClutEval::axis(points, v.to_unit())
+    }) {
+        run_grid(g, src, dst, ch, alpha);
+    }
+}
+
+/// [`run_grid_u16`] with every sample's `(cell, fraction)` read from `t`
+/// (the values the per-sample expressions give).
+fn run_grid_u16_table(
+    g: &ClutEval,
+    t: &Axis16,
+    src: &[u16],
+    dst: &mut [u16],
+    ch: (usize, usize, usize, usize),
+    alpha: (bool, bool),
+) {
+    let (Ok(cell), Ok(frac)) = (
+        <&[u16; 65536]>::try_from(&t.cell[..]),
+        <&[f64; 65536]>::try_from(&t.frac[..]),
+    ) else {
+        return run_grid_u16(g, src, dst, ch, alpha);
+    };
+    if !grid_shaped(g, src, dst, ch, alpha, |_, v| {
+        let v = usize::from(v);
+        (usize::from(cell[v]), frac[v])
     }) {
         run_grid(g, src, dst, ch, alpha);
     }
@@ -1103,6 +1466,11 @@ mod tests {
                 run_grid_u8(&clut, &src8, &mut a8, ch, alpha);
                 run_grid(&clut, &src8, &mut b8, ch, alpha);
                 assert_eq!(a8, b8, "u8 {in_ch}->{out_ch} {alpha:?}");
+                let shared = OnceLock::new();
+                for _ in 0..2 {
+                    run_grid_u8_shared(&clut, &shared, &src8, &mut a8, ch, alpha);
+                    assert_eq!(a8, b8, "u8 shared {in_ch}->{out_ch} {alpha:?}");
+                }
                 let (mut a16, mut b16) = (vec![1u16; dc * 400], vec![2u16; dc * 400]);
                 run_grid_u16(&clut, &src16, &mut a16, ch, alpha);
                 run_grid(&clut, &src16, &mut b16, ch, alpha);
@@ -1114,6 +1482,311 @@ mod tests {
     /// The `f32` loops against the per-colour reference: [`Chain::eval`] on
     /// a zero-tailed array, with the Lab scaling and the alpha rule of the
     /// documented layouts.
+    /// A Lab-PCS LUT output profile of `n` device channels (`space`) built
+    /// for the tests: `B2A0..2` of 3 to `n` and `A2B0..2` of `n` to 3, as
+    /// `lut16` (or `lut8`) tags with nonlinear `in_len`-entry input tables,
+    /// 9-point CLUTs of scrambled smooth values and `out_len`-entry output
+    /// tables, at `version`.
+    pub(crate) fn test_lut_profile(
+        space: crate::ColorSpace,
+        n: usize,
+        version: u32,
+        (in_len, out_len): (usize, usize),
+        sixteen: bool,
+    ) -> Profile {
+        use crate::lut::{Clut, LegacyLut, Lut};
+        use crate::profile::ProfileClass;
+        use crate::tag::Tag;
+        let q = |v: f64| (v.clamp(0.0, 1.0) * 65535.0).round() as u16;
+        let q8 = |v: f64| {
+            if sixteen {
+                q(v)
+            } else {
+                u16::from((v.clamp(0.0, 1.0) * 255.0).round() as u8) * 257
+            }
+        };
+        let table = |len: usize, k: usize| -> Vec<u16> {
+            (0..len)
+                .map(|i| {
+                    let x = i as f64 / (len - 1) as f64;
+                    q8(x.powf(0.7 + 0.2 * k as f64))
+                })
+                .collect()
+        };
+        let clut = |ins: usize, outs: usize, lab: bool| -> Clut {
+            let g = 9usize;
+            let total = g.pow(ins as u32);
+            let mut data = Vec::with_capacity(total * outs);
+            for p in 0..total {
+                let mut sum = 0.0;
+                let mut r = p;
+                for _ in 0..ins {
+                    sum += (r % g) as f64 / (g - 1) as f64;
+                    r /= g;
+                }
+                for o in 0..outs {
+                    let wobble = ((p * 7919 + o * 104_729) % 97) as f64 / 970.0;
+                    let v = if lab && o == 0 {
+                        1.0 - sum / ins as f64 * 0.9
+                    } else if lab {
+                        0.5 + (wobble - 0.05) * 2.0
+                    } else {
+                        (sum / ins as f64 * (0.6 + 0.1 * o as f64) + wobble).fract()
+                    };
+                    data.push(q8(v));
+                }
+            }
+            Clut {
+                grid: vec![g as u8; ins],
+                outputs: outs,
+                data,
+                precision: if sixteen { 2 } else { 1 },
+            }
+        };
+        let lut = |ins: usize, outs: usize, lab: bool| -> Lut {
+            let l = LegacyLut {
+                matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                input_tables: (0..ins)
+                    .map(|k| table(if sixteen { in_len } else { 256 }, k))
+                    .collect(),
+                clut: clut(ins, outs, lab),
+                output_tables: (0..outs)
+                    .map(|k| table(if sixteen { out_len } else { 256 }, k + 1))
+                    .collect(),
+            };
+            if sixteen {
+                Lut::Lut16(l)
+            } else {
+                Lut::Lut8(l)
+            }
+        };
+        let mut p = Profile::blank(ProfileClass::Output, space, crate::ColorSpace::Lab);
+        p.header.version = version;
+        p.set_tag(*b"wtpt", Tag::Xyz(vec![crate::color::D50]));
+        for (b2a, a2b) in [
+            (*b"B2A0", *b"A2B0"),
+            (*b"B2A1", *b"A2B1"),
+            (*b"B2A2", *b"A2B2"),
+        ] {
+            p.set_tag(b2a, Tag::Lut(lut(3, n, false)));
+            p.set_tag(a2b, Tag::Lut(lut(n, 3, true)));
+        }
+        p
+    }
+
+    #[test]
+    fn lut_out_loop_matches_chain_eval_bit_for_bit() {
+        // sRGB into Lab-PCS LUT outputs (CMYK and RGB, v2 and v4 so with
+        // and without black-point compensation's second affine map, lut16
+        // and lut8, short and long tables): every float the loop meets,
+        // including NaN, infinities, -0.0 and out-of-range values, against
+        // the interpreter.
+        use crate::ColorSpace;
+        let srgb = Profile::new_srgb();
+        let vals = [
+            -0.5f32,
+            -0.0,
+            0.0,
+            1e-9,
+            0.001,
+            0.04,
+            0.2,
+            0.5,
+            0.75,
+            0.999,
+            1.0,
+            1.5,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        let mut ran = [0usize; 2];
+        let mut diagonals = 0;
+        for (space, layout, n) in [
+            (ColorSpace::Cmyk, Layout::Cmyk, 4),
+            (ColorSpace::Rgb, Layout::Rgb, 3),
+        ] {
+            for (version, tables, sixteen) in [
+                (0x0210_0000, (256, 256), true),
+                (0x0430_0000, (4096, 2), true),
+                (0x0210_0000, (256, 256), false),
+            ] {
+                let dst = test_lut_profile(space, n, version, tables, sixteen);
+                for intent in [Intent::Perceptual, Intent::RelativeColorimetric] {
+                    for al in [Layout::Rgb, Layout::Rgba] {
+                        for bpc in [false, true] {
+                            let o = Options {
+                                black_point_compensation: bpc,
+                            };
+                            let t = Transform::new(&srgb, al, &dst, layout, intent, o).unwrap();
+                            let (shaped, diagonal) = if n == 4 {
+                                let l = t.chain.as_lut_out::<4>();
+                                (l.is_some(), l.is_some_and(|l| l.has_diagonal_map()))
+                            } else {
+                                let l = t.chain.as_lut_out::<3>();
+                                (l.is_some(), l.is_some_and(|l| l.has_diagonal_map()))
+                            };
+                            diagonals += usize::from(diagonal);
+                            assert!(shaped, "{space:?} {version:x} {intent:?}");
+                            ran[n - 3] += 1;
+                            let (sc, dc) = (al.channels(), layout.channels());
+                            let mut src = Vec::new();
+                            let m = vals.len();
+                            for i in 0..m.pow(3) {
+                                src.extend([vals[i % m], vals[i / m % m], vals[i / m / m % m]]);
+                                if sc == 4 {
+                                    src.push(0.25);
+                                }
+                            }
+                            let mut out_px = vec![-7.0f32; src.len() / sc * dc];
+                            t.transform(&src, &mut out_px).unwrap();
+                            for (sp, dp) in src.chunks_exact(sc).zip(out_px.chunks_exact(dc)) {
+                                let mut input = [0.0f64; 16];
+                                for c in 0..3 {
+                                    input[c] = f64::from(sp[c]);
+                                }
+                                let mut out = [0.0f64; 16];
+                                t.chain.eval(&input, &mut out);
+                                for c in 0..n {
+                                    assert_eq!(
+                                        dp[c].to_bits(),
+                                        (out[c] as f32).to_bits(),
+                                        "{sp:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            ran[0] > 0 && ran[1] > 0 && diagonals > 0,
+            "{ran:?} {diagonals}"
+        );
+    }
+
+    #[test]
+    fn u8_point_recognises_exactly_the_8_bit_samples() {
+        for k in 0..256usize {
+            let x = k as f32 / 255.0;
+            assert_eq!(u8_point(x), Some(k));
+            for y in [
+                f32::from_bits(x.to_bits() + 1),
+                f32::from_bits(x.to_bits().wrapping_sub(1)),
+            ] {
+                assert_eq!(u8_point(y), None, "{k}");
+            }
+        }
+        for x in [
+            -0.0f32,
+            f32::NAN,
+            -1.0,
+            1.5,
+            255.0,
+            f32::INFINITY,
+            -1e30,
+            1e30,
+            0.5,
+        ] {
+            assert_eq!(u8_point(x), None, "{x}");
+        }
+    }
+
+    #[test]
+    fn u8_point_input_matches_chain_eval_bit_for_bit() {
+        // Float pixels widened from 8-bit values take the first op from a
+        // table (`run_chain_f32_u8_points`); the odd sample that is not an
+        // 8-bit point (one in nine here, under the 1-in-8 the detection
+        // allows) sends its pixel through the chain whole.
+        let srgb = Profile::new_srgb();
+        let lab = Profile::new_lab_identity();
+        let cmyk =
+            Profile::new_from_slice(include_bytes!("../tests/data/CGATS001Compat-v2-micro.icc"))
+                .unwrap();
+        let v4 =
+            Profile::new_from_slice(include_bytes!("../tests/data/sRGB_v4_ICC_preference.icc"))
+                .unwrap();
+        let p3 = Profile::new_display_p3();
+        let g22 = Profile::new_rgb(
+            crate::color::D65_XY,
+            [
+                crate::color::Xy::new(0.64, 0.33),
+                crate::color::Xy::new(0.3, 0.6),
+                crate::color::Xy::new(0.15, 0.06),
+            ],
+            crate::Curve::gamma(2.2),
+        )
+        .unwrap();
+        let lut4 = test_lut_profile(crate::ColorSpace::Cmyk, 4, 0x0430_0000, (4096, 2), true);
+        let lut3 = test_lut_profile(crate::ColorSpace::Rgb, 3, 0x0210_0000, (256, 256), false);
+        let odd = [0.3f32, -0.25, f32::NAN, 1.25, -0.0, 0.5];
+        let (mut ran, mut tabled) = (0, 0);
+        for (a, al, b, bl) in [
+            (&srgb, Layout::Rgb, &cmyk, Layout::Cmyk),
+            (&srgb, Layout::Rgba, &cmyk, Layout::Cmyk),
+            (&cmyk, Layout::Cmyk, &srgb, Layout::Rgba),
+            (&srgb, Layout::Rgb, &lab, Layout::Lab),
+            (&srgb, Layout::Rgb, &v4, Layout::Rgb),
+            (&v4, Layout::Rgb, &srgb, Layout::Rgb),
+            (&srgb, Layout::Rgb, &lut4, Layout::Cmyk),
+            (&srgb, Layout::Rgba, &lut4, Layout::Cmyka),
+            (&srgb, Layout::Rgb, &lut3, Layout::Rgb),
+            (&srgb, Layout::Rgb, &p3, Layout::Rgb),
+            (&srgb, Layout::Rgba, &g22, Layout::Rgba),
+            (&g22, Layout::Rgb, &srgb, Layout::Rgb),
+        ] {
+            for intent in [Intent::Perceptual, Intent::RelativeColorimetric] {
+                // (The micro test profiles lack some intents' tables.)
+                let Ok(t) = Transform::new(a, al, b, bl, intent, Options::default()) else {
+                    continue;
+                };
+                ran += 1;
+                let (sc, dc) = (al.channels(), bl.channels());
+                let (ic, oc) = (al.color_channels(), bl.color_channels());
+                let mut src = Vec::new();
+                for i in 0..2048usize {
+                    for c in 0..sc {
+                        let j = i * sc + c;
+                        src.push(if j % 9 == 4 {
+                            odd[j / 9 % odd.len()]
+                        } else {
+                            ((i * 37 + c * 101) % 256) as f32 / 255.0
+                        });
+                    }
+                }
+                assert!(mostly_u8_points(&src, sc, ic));
+                let mut dst = vec![-7.0f32; src.len() / sc * dc];
+                t.transform(&src, &mut dst).unwrap();
+                tabled += usize::from(t.u8_head.get().is_some_and(Option::is_some));
+                for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact(dc)) {
+                    let mut input = [0.0f64; 16];
+                    for c in 0..ic {
+                        input[c] = f64::from(sp[c]);
+                    }
+                    let mut out = [0.0f64; 16];
+                    t.chain.eval(&input, &mut out);
+                    if bl.is_lab() {
+                        out[0] *= 100.0;
+                        out[1] = out[1] * 255.0 - 128.0;
+                        out[2] = out[2] * 255.0 - 128.0;
+                    }
+                    for c in 0..oc {
+                        assert_eq!(
+                            dp[c].to_bits(),
+                            (out[c] as f32).to_bits(),
+                            "{al:?} {bl:?} {sp:?}"
+                        );
+                    }
+                    if bl.has_alpha() {
+                        let want = if al.has_alpha() { sp[sc - 1] } else { 1.0 };
+                        assert_eq!(dp[dc - 1].to_bits(), want.to_bits());
+                    }
+                }
+            }
+        }
+        assert!(ran >= 20 && tabled >= 18, "{ran} {tabled}");
+    }
+
     #[test]
     fn f32_loops_match_chain_eval_bit_for_bit() {
         let srgb = Profile::new_srgb();
@@ -1233,6 +1906,55 @@ mod tests {
     /// The grey 8-bit output table against the engine's loop: every byte, with
     /// and without alpha on either side, one and three output channels, and
     /// the small-call path that does not build the table.
+    #[test]
+    fn axis16_table_matches_the_per_sample_grid_loop() {
+        // A 16-bit call big enough to build the table, every 16-bit value on
+        // every channel, through 4-input (17-point) and 3-input (33-point)
+        // grids, against the per-sample loop.
+        use crate::ColorSpace;
+        let srgb = Profile::new_srgb();
+        let cmyk = test_lut_profile(ColorSpace::Cmyk, 4, 0x0210_0000, (256, 256), true);
+        for (a, al, b, bl) in [
+            (&cmyk, Layout::Cmyk, &srgb, Layout::Rgb),
+            (&cmyk, Layout::Cmyka, &srgb, Layout::Rgba),
+            (&srgb, Layout::Rgb, &cmyk, Layout::Cmyk),
+        ] {
+            let t = Transform::new(a, al, b, bl, Intent::Perceptual, Options::default()).unwrap();
+            let Engine::Grid(g) = &t.engine else {
+                panic!("grid")
+            };
+            let (sc, dc) = (al.channels(), bl.channels());
+            let px = 65536 + 3;
+            let src: Vec<u16> = (0..px * sc)
+                .map(|i| ((i / sc) as u32 * (1 + 2 * (i % sc) as u32) % 65536) as u16)
+                .collect();
+            let mut got = vec![0u16; px * dc];
+            t.transform(&src, &mut got).unwrap();
+            assert!(t.axis16.get().is_some());
+            let mut want = vec![1u16; px * dc];
+            let ch = (sc, dc, al.color_channels(), bl.color_channels());
+            run_grid_u16(g, &src, &mut want, ch, (al.has_alpha(), bl.has_alpha()));
+            assert_eq!(got, want, "{al:?} {bl:?}");
+            // A small call after the table exists uses it too.
+            let mut got2 = vec![0u16; 64 * dc];
+            t.transform(&src[..64 * sc], &mut got2).unwrap();
+            assert_eq!(got2, want[..64 * dc]);
+            // Small calls build it once they add up to enough pixels.
+            let t = Transform::new(a, al, b, bl, Intent::Perceptual, Options::default()).unwrap();
+            for (k, (s, w)) in src
+                .chunks(64 * sc)
+                .zip(want.chunks(64 * dc))
+                .take(300)
+                .enumerate()
+            {
+                let mut got3 = vec![0u16; w.len()];
+                t.transform(s, &mut got3).unwrap();
+                assert_eq!(got3, w);
+                assert_eq!(t.axis16.get().is_some(), (k + 1) * 64 >= AXIS16_MIN_PIXELS);
+            }
+        }
+    }
+
     #[test]
     fn grey8_table_matches_the_shaper_loop() {
         let grey = Profile::new_gray(crate::color::D65_XY, crate::curve::Curve::gamma(1.8));

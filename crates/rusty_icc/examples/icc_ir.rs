@@ -12,7 +12,8 @@
 //! see `bench-lcms/wall.sh`).
 //!
 //! Profiles: built-ins, the repository test profiles (`tests/data`), plus
-//! Coated FOGRA39 from `RUSTY_ICC_FOGRA39`.
+//! Coated FOGRA39 from `RUSTY_ICC_FOGRA39` (v2) and `RUSTY_ICC_FOGRA39_V4`
+//! (v4, the `fog4*` modes).
 
 #[global_allocator]
 static GLOBAL_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
@@ -70,6 +71,13 @@ fn image(ch: usize) -> Vec<f64> {
 fn fogra() -> Profile {
     let path = std::env::var("RUSTY_ICC_FOGRA39").expect("RUSTY_ICC_FOGRA39");
     Profile::new_from_slice(&std::fs::read(path).expect("read FOGRA39")).expect("parse")
+}
+
+/// A v4 Coated FOGRA39 (`lut16` tables, 4096-entry input curves) from
+/// `RUSTY_ICC_FOGRA39_V4`: the profile the downstream comparison uses.
+fn fogra_v4() -> Profile {
+    let path = std::env::var("RUSTY_ICC_FOGRA39_V4").expect("RUSTY_ICC_FOGRA39_V4");
+    Profile::new_from_slice(&std::fs::read(path).expect("read FOGRA39 v4")).expect("parse")
 }
 
 fn data(bytes: &[u8]) -> Profile {
@@ -322,6 +330,23 @@ fn run_u16(src: &Profile, sl: Layout, dst: &Profile, dl: Layout) {
     tr_u16(&xf(src, sl, dst, dl));
 }
 
+/// The image as 8-bit values widened to `f32` (`v as f32 / 255.0`): how
+/// float pixels decoded from 8-bit files arrive (the downstream comparison's
+/// input).
+fn src_f32_from_u8(ch: usize) -> Vec<f32> {
+    src_u8(ch).iter().map(|&v| f32::from(v) / 255.0).collect()
+}
+
+/// [`tr_f32`] on [`src_f32_from_u8`] input.
+fn tr_f32_from_u8(t: &Transform) {
+    let (sl, dl) = (t.src_layout(), t.dst_layout());
+    let s = src_f32_from_u8(sl.channels());
+    let mut o = vec![0f32; SIDE * SIDE * dl.channels()];
+    hot_transform_f32(t, &s, &mut o);
+    anchor_f32(&o);
+    timed(|| hot_transform_f32(t, &s, &mut o));
+}
+
 fn tr_f32(t: &Transform, lab_in: bool) {
     let (sl, dl) = (t.src_layout(), t.dst_layout());
     let s = src_f32(sl.channels(), lab_in);
@@ -408,7 +433,7 @@ const MODES: &str = "p3u8 p3u16 fogu8 fog16 labf32 labinf32 build3 build4 parse 
 p3f32 lin2020f32 fogf32 fogrgbf32 v4f32 v4inf32 prof32 toprof32 prooff32 \
 grayu8 togray16 prou8 v4u8 cgatsu8 labu8 lab16in proofu8 gamutu8 \
 smallp3u8 smallfogu8 smallfog16 smallp3f32 \
-buildp3 buildgray buildlab buildv4 buildproof buildbpc first16 parsev4 fogpf32 fogrgbpf32 proofpf32 build4p buildproofp";
+buildp3 buildgray buildlab buildv4 buildproof buildbpc first16 parsev4 fogpf32 fogrgbpf32 proofpf32 build4p buildproofp fogpf32q fog4pf32 fog4pf32q p3f32q lin2020f32q fog4rgbf32q";
 
 #[allow(clippy::too_many_lines)]
 fn main() {
@@ -524,6 +549,29 @@ fn main() {
                 black_box(hot_build_proof_intent(&srgb, &f, &srgb, p));
             });
         }
+        // Float rows on 8-bit-derived input (`*q`) and on the v4 FOGRA39
+        // (`fog4*`): the downstream comparison's shapes.
+        "fogpf32q" => {
+            let p = Intent::Perceptual;
+            let t = Transform::new(&srgb, rgb, &fogra(), cmyk, p, Options::default()).unwrap();
+            tr_f32_from_u8(&t);
+        }
+        "fog4pf32" | "fog4pf32q" => {
+            let p = Intent::Perceptual;
+            let t = Transform::new(&srgb, rgb, &fogra_v4(), cmyk, p, Options::default()).unwrap();
+            if mode.ends_with('q') {
+                tr_f32_from_u8(&t);
+            } else {
+                tr_f32(&t, false);
+            }
+        }
+        "fog4rgbf32q" => {
+            let p = Intent::Perceptual;
+            let t = Transform::new(&fogra_v4(), cmyk, &srgb, rgb, p, Options::default()).unwrap();
+            tr_f32_from_u8(&t);
+        }
+        "p3f32q" => tr_f32_from_u8(&xf(&srgb, rgb, &p3, rgb)),
+        "lin2020f32q" => tr_f32_from_u8(&xf(&srgb, rgb, &linear_rec2020(), rgb)),
         _ => eprintln!("modes: {MODES}"),
     }
 }

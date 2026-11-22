@@ -111,6 +111,14 @@ fn lab_f_inv(t: f64) -> f64 {
 /// XYZ to L*a*b* relative to `white` (the `LittleCMS` formulation).
 #[must_use]
 pub fn xyz_to_lab(xyz: Xyz, white: Xyz) -> Lab {
+    xyz_to_lab_in_line(xyz, white)
+}
+
+/// The body of [`xyz_to_lab`], in line wherever it is used: a straight-line
+/// float chain takes its own copy (no call, the result in registers), every
+/// other caller keeps calling the out-of-line [`xyz_to_lab`].
+#[inline(always)]
+pub(crate) fn xyz_to_lab_in_line(xyz: Xyz, white: Xyz) -> Lab {
     let fx = lab_f(xyz.x / white.x);
     let fy = lab_f(xyz.y / white.y);
     let fz = lab_f(xyz.z / white.z);
