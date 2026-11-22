@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_icc-v0.1.3...rusty_icc-v0.1.4) - 2026-11-22
+
+### Other
+
+- *(rusty_icc)* small 8-bit grid calls share one axis table per transform
+- *(rusty_icc)* 16-bit grid samples read their cell and fraction from a table
+- *(rusty_icc)* no second clamp before the inverse curves
+- *(rusty_icc)* matrix-shaper float pixels from 8-bit data look their curves up
+- *(rusty_icc)* the Lab encoding in line, BPC as a diagonal map, one clamp
+- *(rusty_icc)* float pixels from 8-bit data look their first curves up
+- *(rusty_icc)* LUT tables and the trilinear kernel without their overheads
+- *(rusty_icc)* sRGB into a Lab-PCS LUT output runs straight-line in f32
+
 ## [0.1.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_icc-v0.1.2...rusty_icc-v0.1.3) - 2026-11-21
 
 ### Other
