@@ -487,6 +487,45 @@ impl Stage {
     }
 }
 
+/// The `N` values of the grid point at flat offset `at`, when wholly inside
+/// `data`.
+#[inline(always)]
+fn tri_corner<const N: usize>(data: &[f32], at: usize) -> Option<&[f32; N]> {
+    data.get(at..)?.first_chunk::<N>()
+}
+
+/// Trilinear interpolation along the last input, from the grid point at
+/// `at` to the one `s2` further, at fraction `f2`.
+#[inline(always)]
+fn tri_line<const N: usize>(data: &[f32], at: usize, s2: usize, f2: f64) -> Option<[f64; N]> {
+    let (pa, pb) = (tri_corner::<N>(data, at)?, tri_corner::<N>(data, at + s2)?);
+    let mut r = [0.0f64; N];
+    for o in 0..N {
+        let (a, b) = (f64::from(pa[o]), f64::from(pb[o]));
+        r[o] = a + (b - a) * f2;
+    }
+    Some(r)
+}
+
+/// Along the middle input between two [`tri_line`]s, the upper skipped when
+/// its step or fraction is zero.
+#[inline(always)]
+fn tri_plane<const N: usize>(
+    data: &[f32],
+    at: usize,
+    (s1, s2): (usize, usize),
+    (f1, f2): (f64, f64),
+) -> Option<[f64; N]> {
+    let mut lo = tri_line::<N>(data, at, s2, f2)?;
+    if s1 != 0 && f1 != 0.0 {
+        let hi = tri_line::<N>(data, at + s1, s2, f2)?;
+        for o in 0..N {
+            lo[o] += (hi[o] - lo[o]) * f1;
+        }
+    }
+    Some(lo)
+}
+
 /// A CLUT ready for interpolation: `f32` values over `0..=1`.
 #[derive(Debug, Clone)]
 pub(crate) struct ClutEval {
@@ -892,33 +931,16 @@ impl ClutEval {
         [s0, s1, s2]: [usize; 3],
         out: &mut [f64; 16],
     ) -> bool {
-        let c = |d: usize| -> Option<&[f32; N]> { self.data.get(origin + d..)?.first_chunk::<N>() };
-        // Along the last input, from the corner at offset `off`.
-        let line = |off: usize| -> Option<[f64; N]> {
-            let (pa, pb) = (c(off)?, c(off + s2)?);
-            let mut r = [0.0f64; N];
-            for o in 0..N {
-                let (a, b) = (f64::from(pa[o]), f64::from(pb[o]));
-                r[o] = a + (b - a) * f2;
-            }
-            Some(r)
-        };
-        // Along the middle input, between two such lines.
-        let plane = |off: usize| -> Option<[f64; N]> {
-            let mut lo = line(off)?;
-            if s1 != 0 && f1 != 0.0 {
-                let hi = line(off + s1)?;
-                for o in 0..N {
-                    lo[o] += (hi[o] - lo[o]) * f1;
-                }
-            }
-            Some(lo)
-        };
-        let Some(mut lo) = plane(0) else {
+        // The line and plane steps are functions forced in line: as
+        // closures they were a call per plane (two per lookup) with the
+        // corner state spilled around it. The arithmetic is unchanged.
+        let data = &self.data[..];
+        let at = origin;
+        let Some(mut lo) = tri_plane::<N>(data, at, (s1, s2), (f1, f2)) else {
             return false;
         };
         if s0 != 0 && f0 != 0.0 {
-            let Some(hi) = plane(s0) else {
+            let Some(hi) = tri_plane::<N>(data, at + s0, (s1, s2), (f1, f2)) else {
                 return false;
             };
             for o in 0..N {

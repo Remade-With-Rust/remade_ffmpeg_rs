@@ -350,6 +350,10 @@ pub(crate) struct Sampled {
     seg: Box<[[f64; 2]]>,
     /// Entries minus one, as `f64`.
     scale: f64,
+    /// The last segment's index (entries minus two), signed, so the index
+    /// and its conversion back to `f64` stay in `i64` (one `cvtsi2sd`
+    /// instead of the unsigned conversion sequence of a `usize`).
+    last: i64,
 }
 
 impl Sampled {
@@ -367,6 +371,7 @@ impl Sampled {
                 .map(|w| [f64::from(w[0]), f64::from(w[1]) - f64::from(w[0])])
                 .collect(),
             scale: (t.len() - 1) as f64,
+            last: i64::try_from(t.len() - 2).ok()?,
         })
     }
 
@@ -381,9 +386,11 @@ impl Sampled {
     #[inline(always)]
     pub(crate) fn eval(&self, x: f64) -> f64 {
         let pos = clamp01(x) * self.scale;
-        let i = (pos as i64 as usize).min(self.seg.len() - 1);
+        // The same index as `(pos as i64 as usize).min(seg.len() - 1)`
+        // (`pos` is in `0..=n-1`), converted back exactly.
+        let i = (pos as i64).min(self.last);
         let f = pos - i as f64;
-        let [a, d] = self.seg[i];
+        let [a, d] = self.seg[i as usize];
         (a + d * f) / 65535.0
     }
 }

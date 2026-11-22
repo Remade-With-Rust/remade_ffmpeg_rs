@@ -887,11 +887,12 @@ impl<const N: usize> LutOutChain<'_, N> {
         let [p0, p1, p2] = self.pre;
         let e = [p0.eval(e[0]), p1.eval(e[1]), p2.eval(e[2])];
         self.clut.lookup::<true>(e, out);
+        // The chain's final clamp is left out: it never acts on what a
+        // sampled table gives (between two of its samples over 65535, so in
+        // `0..=1`, and never -0.0 since the samples are not), and the `N`
+        // tables cover every channel it clamps.
         for (x, c) in out.iter_mut().zip(self.post) {
             *x = c.eval(*x);
-        }
-        for x in out.iter_mut().take(N) {
-            *x = clamp01(*x);
         }
     }
 }
