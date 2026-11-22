@@ -6,7 +6,9 @@ use crate::color::delta_e_2000;
 use crate::curve::InvCurve;
 use crate::error::{Error, Result};
 use crate::lut::{ClutEval, FixedClut};
-use crate::pipeline::{build_chain, Chain, GamutChain, LutOutChain, ShaperChain, ShaperLink};
+use crate::pipeline::{
+    build_chain, u8_point, Chain, GamutChain, LutOutChain, ShaperChain, ShaperLink,
+};
 use crate::profile::{ColorSpace, Profile};
 
 /// ICC rendering intent.
@@ -463,6 +465,9 @@ pub struct Transform {
     dst_layout: Layout,
     chain: Arc<Chain>,
     engine: Engine,
+    /// [`Chain::head_on_u8_points`], built by the first `f32` call whose
+    /// pixels are 8-bit points.
+    u8_head: OnceLock<Option<Box<[[f64; 256]]>>>,
 }
 
 impl core::fmt::Debug for Transform {
@@ -570,6 +575,7 @@ impl Transform {
             dst_layout,
             chain: Arc::new(chain),
             engine,
+            u8_head: OnceLock::new(),
         })
     }
 
@@ -648,13 +654,35 @@ impl Transform {
                         let alpha = (src_alpha, dst_alpha);
                         if let Some(f) = self.chain.as_shaper() {
                             run_shaper_f32(&f, s, d, (sc, dc), alpha);
-                        } else if let Some(l) = self.chain.as_lut_out::<4>() {
-                            run_lut_out_f32(&l, s, d, (sc, dc), alpha);
+                            return Ok(());
+                        }
+                        let head = if !src_lab && mostly_u8_points(s, sc, in_ch) {
+                            self.u8_head
+                                .get_or_init(|| self.chain.head_on_u8_points())
+                                .as_deref()
+                        } else {
+                            None
+                        };
+                        if let Some(l) = self.chain.as_lut_out::<4>() {
+                            run_lut_out_f32(&l, head, s, d, (sc, dc), alpha);
                         } else if let Some(l) = self.chain.as_lut_out::<3>() {
-                            run_lut_out_f32(&l, s, d, (sc, dc), alpha);
+                            run_lut_out_f32(&l, head, s, d, (sc, dc), alpha);
                         } else {
                             let ch = (sc, dc, in_ch, out_ch);
-                            run_chain_f32(&self.chain, s, d, ch, alpha, (src_lab, dst_lab));
+                            match head {
+                                Some(rows) => run_chain_f32_u8_points(
+                                    &self.chain,
+                                    rows,
+                                    s,
+                                    d,
+                                    ch,
+                                    alpha,
+                                    dst_lab,
+                                ),
+                                None => {
+                                    run_chain_f32(&self.chain, s, d, ch, alpha, (src_lab, dst_lab))
+                                }
+                            }
                         }
                         return Ok(());
                     }
@@ -775,9 +803,26 @@ fn run_segments_f32(
     true
 }
 
-/// `f32` pixels through a [`LutOutChain`], one loop per output count.
-#[inline(never)]
+/// `f32` pixels through a [`LutOutChain`], one loop per output count; with
+/// `head` ([`Chain::head_on_u8_points`]) the curves of every sample that is
+/// an 8-bit point come from that table.
 fn run_lut_out_f32<const N: usize>(
+    l: &LutOutChain<'_, N>,
+    head: Option<&[[f64; 256]]>,
+    src: &[f32],
+    dst: &mut [f32],
+    sc_dc: (usize, usize),
+    alpha: (bool, bool),
+) {
+    match head {
+        Some([r0, r1, r2, ..]) => run_lut_out_u8_points(l, [r0, r1, r2], src, dst, sc_dc, alpha),
+        _ => run_lut_out_plain(l, src, dst, sc_dc, alpha),
+    }
+}
+
+/// [`run_lut_out_f32`] without a table.
+#[inline(never)]
+fn run_lut_out_plain<const N: usize>(
     l: &LutOutChain<'_, N>,
     src: &[f32],
     dst: &mut [f32],
@@ -787,6 +832,33 @@ fn run_lut_out_f32<const N: usize>(
     let mut out = [0.0f64; 16];
     for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
         let v = l.curves([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]);
+        l.rest(v, &mut out);
+        for c in 0..N {
+            dp[c] = out[c] as f32;
+        }
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
+}
+
+/// [`run_lut_out_f32`] with the table: per sample the row entry when the
+/// sample is an 8-bit point, the curve otherwise (the same value).
+#[inline(never)]
+fn run_lut_out_u8_points<const N: usize>(
+    l: &LutOutChain<'_, N>,
+    rows: [&[f64; 256]; 3],
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+) {
+    let mut out = [0.0f64; 16];
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let v = match (u8_point(sp[0]), u8_point(sp[1]), u8_point(sp[2])) {
+            (Some(a), Some(b), Some(c)) => [rows[0][a], rows[1][b], rows[2][c]],
+            _ => l.curves([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]),
+        };
         l.rest(v, &mut out);
         for c in 0..N {
             dp[c] = out[c] as f32;
@@ -820,6 +892,74 @@ fn run_chain_f32(
             v[2] = (v[2] + 128.0) / 255.0;
         }
         chain.eval_in_place(&mut v);
+        if dst_lab {
+            v[0] *= 100.0;
+            v[1] = v[1] * 255.0 - 128.0;
+            v[2] = v[2] * 255.0 - 128.0;
+        }
+        for c in 0..out_ch {
+            dp[c] = v[c] as f32;
+        }
+        if dst_alpha {
+            dp[dc - 1] = if src_alpha { sp[sc - 1] } else { 1.0 };
+        }
+    }
+}
+
+/// `true` when the first pixel's colour samples are all 8-bit points
+/// ([`u8_point`]) and at least 7 in 8 of the first 64 pixels' are: float
+/// pixels widened from 8-bit data, which [`run_chain_f32_u8_points`] serves
+/// from a table. Other data is turned away by its first sample.
+fn mostly_u8_points(src: &[f32], sc: usize, in_ch: usize) -> bool {
+    let Some(first) = src.get(..in_ch) else {
+        return false;
+    };
+    if !first.iter().all(|&x| u8_point(x).is_some()) {
+        return false;
+    }
+    let mut seen = 0usize;
+    let mut hits = 0usize;
+    for px in src.chunks_exact(sc).take(64) {
+        for &x in &px[..in_ch] {
+            seen += 1;
+            hits += usize::from(u8_point(x).is_some());
+        }
+    }
+    seen > 0 && hits * 8 >= seen * 7
+}
+
+/// [`run_chain_f32`] for a source that is not Lab, with the chain's first
+/// op looked up in `rows` ([`Chain::head_on_u8_points`]) for every sample
+/// that is an 8-bit point and evaluated by the chain for any other: the
+/// same values either way.
+#[inline(never)]
+fn run_chain_f32_u8_points(
+    chain: &Chain,
+    rows: &[[f64; 256]],
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc, in_ch, out_ch): (usize, usize, usize, usize),
+    (src_alpha, dst_alpha): (bool, bool),
+    dst_lab: bool,
+) {
+    for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact_mut(dc)) {
+        let mut v = [0.0f64; 16];
+        let mut all = true;
+        for (c, row) in rows.iter().enumerate().take(in_ch) {
+            match u8_point(sp[c]) {
+                Some(k) => v[c] = row[k],
+                None => all = false,
+            }
+        }
+        if all {
+            chain.eval_tail_in_place(&mut v);
+        } else {
+            v = [0.0f64; 16];
+            for c in 0..in_ch {
+                v[c] = f64::from(sp[c]);
+            }
+            chain.eval_in_place(&mut v);
+        }
         if dst_lab {
             v[0] *= 100.0;
             v[1] = v[1] * 255.0 - 128.0;
@@ -1314,6 +1454,114 @@ mod tests {
             }
         }
         assert!(ran[0] > 0 && ran[1] > 0, "{ran:?}");
+    }
+
+    #[test]
+    fn u8_point_recognises_exactly_the_8_bit_samples() {
+        for k in 0..256usize {
+            let x = k as f32 / 255.0;
+            assert_eq!(u8_point(x), Some(k));
+            for y in [
+                f32::from_bits(x.to_bits() + 1),
+                f32::from_bits(x.to_bits().wrapping_sub(1)),
+            ] {
+                assert_eq!(u8_point(y), None, "{k}");
+            }
+        }
+        for x in [
+            -0.0f32,
+            f32::NAN,
+            -1.0,
+            1.5,
+            255.0,
+            f32::INFINITY,
+            -1e30,
+            1e30,
+            0.5,
+        ] {
+            assert_eq!(u8_point(x), None, "{x}");
+        }
+    }
+
+    #[test]
+    fn u8_point_input_matches_chain_eval_bit_for_bit() {
+        // Float pixels widened from 8-bit values take the first op from a
+        // table (`run_chain_f32_u8_points`); the odd sample that is not an
+        // 8-bit point (one in nine here, under the 1-in-8 the detection
+        // allows) sends its pixel through the chain whole.
+        let srgb = Profile::new_srgb();
+        let lab = Profile::new_lab_identity();
+        let cmyk =
+            Profile::new_from_slice(include_bytes!("../tests/data/CGATS001Compat-v2-micro.icc"))
+                .unwrap();
+        let v4 =
+            Profile::new_from_slice(include_bytes!("../tests/data/sRGB_v4_ICC_preference.icc"))
+                .unwrap();
+        let lut4 = test_lut_profile(crate::ColorSpace::Cmyk, 4, 0x0430_0000, (4096, 2), true);
+        let lut3 = test_lut_profile(crate::ColorSpace::Rgb, 3, 0x0210_0000, (256, 256), false);
+        let odd = [0.3f32, -0.25, f32::NAN, 1.25, -0.0, 0.5];
+        let (mut ran, mut tabled) = (0, 0);
+        for (a, al, b, bl) in [
+            (&srgb, Layout::Rgb, &cmyk, Layout::Cmyk),
+            (&srgb, Layout::Rgba, &cmyk, Layout::Cmyk),
+            (&cmyk, Layout::Cmyk, &srgb, Layout::Rgba),
+            (&srgb, Layout::Rgb, &lab, Layout::Lab),
+            (&srgb, Layout::Rgb, &v4, Layout::Rgb),
+            (&v4, Layout::Rgb, &srgb, Layout::Rgb),
+            (&srgb, Layout::Rgb, &lut4, Layout::Cmyk),
+            (&srgb, Layout::Rgba, &lut4, Layout::Cmyka),
+            (&srgb, Layout::Rgb, &lut3, Layout::Rgb),
+        ] {
+            for intent in [Intent::Perceptual, Intent::RelativeColorimetric] {
+                // (The micro test profiles lack some intents' tables.)
+                let Ok(t) = Transform::new(a, al, b, bl, intent, Options::default()) else {
+                    continue;
+                };
+                ran += 1;
+                let (sc, dc) = (al.channels(), bl.channels());
+                let (ic, oc) = (al.color_channels(), bl.color_channels());
+                let mut src = Vec::new();
+                for i in 0..2048usize {
+                    for c in 0..sc {
+                        let j = i * sc + c;
+                        src.push(if j % 9 == 4 {
+                            odd[j / 9 % odd.len()]
+                        } else {
+                            ((i * 37 + c * 101) % 256) as f32 / 255.0
+                        });
+                    }
+                }
+                assert!(mostly_u8_points(&src, sc, ic));
+                let mut dst = vec![-7.0f32; src.len() / sc * dc];
+                t.transform(&src, &mut dst).unwrap();
+                tabled += usize::from(t.u8_head.get().is_some_and(Option::is_some));
+                for (sp, dp) in src.chunks_exact(sc).zip(dst.chunks_exact(dc)) {
+                    let mut input = [0.0f64; 16];
+                    for c in 0..ic {
+                        input[c] = f64::from(sp[c]);
+                    }
+                    let mut out = [0.0f64; 16];
+                    t.chain.eval(&input, &mut out);
+                    if bl.is_lab() {
+                        out[0] *= 100.0;
+                        out[1] = out[1] * 255.0 - 128.0;
+                        out[2] = out[2] * 255.0 - 128.0;
+                    }
+                    for c in 0..oc {
+                        assert_eq!(
+                            dp[c].to_bits(),
+                            (out[c] as f32).to_bits(),
+                            "{al:?} {bl:?} {sp:?}"
+                        );
+                    }
+                    if bl.has_alpha() {
+                        let want = if al.has_alpha() { sp[sc - 1] } else { 1.0 };
+                        assert_eq!(dp[dc - 1].to_bits(), want.to_bits());
+                    }
+                }
+            }
+        }
+        assert!(ran >= 14 && tabled >= 12, "{ran} {tabled}");
     }
 
     #[test]

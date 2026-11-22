@@ -636,7 +636,7 @@ impl<'a, const N: usize> Clut3Ref<'a, N> {
             if i2 + 1 < g2 { s2 } else { 0 },
         ];
         let done = if TRILINEAR {
-            self.clut.trilinear_fixed::<N>(origin, f, step, out)
+            self.clut.trilinear_walk::<N>(origin, f, step, out)
         } else {
             self.clut.tetra_walk::<N>(origin, f, step, out)
         };
@@ -925,6 +925,22 @@ impl ClutEval {
     /// values as zeros one by one.
     #[inline]
     fn trilinear_fixed<const N: usize>(
+        &self,
+        origin: usize,
+        [f0, f1, f2]: [f64; 3],
+        [s0, s1, s2]: [usize; 3],
+        out: &mut [f64; 16],
+    ) -> bool {
+        self.trilinear_walk::<N>(origin, [f0, f1, f2], [s0, s1, s2], out)
+    }
+
+    /// The body of [`ClutEval::trilinear_fixed`], in line wherever it is
+    /// used (as [`ClutEval::tetra_walk`] is): [`ClutEval::eval`] keeps its
+    /// copy through that handle, and each float loop over a [`Clut3Ref`]
+    /// takes its own (with two such loops the handle stopped being inlined
+    /// into them: +48 instructions per pixel).
+    #[inline(always)]
+    fn trilinear_walk<const N: usize>(
         &self,
         origin: usize,
         [f0, f1, f2]: [f64; 3],

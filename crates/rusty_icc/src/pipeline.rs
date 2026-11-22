@@ -27,6 +27,31 @@ pub(crate) enum Pcs {
     Lab,
 }
 
+/// The `f32` value of every 8-bit sample, `f32::from(k) / 255.0` (how float
+/// pixels decoded from 8-bit data arrive).
+pub(crate) static U8_POINTS: [f32; 256] = {
+    let mut t = [0.0f32; 256];
+    let mut k = 0;
+    while k < 256 {
+        t[k] = k as f32 / 255.0;
+        k += 1;
+    }
+    t
+};
+
+/// The 8-bit sample whose [`U8_POINTS`] value `x` is, if it is one.
+#[inline(always)]
+pub(crate) fn u8_point(x: f32) -> Option<usize> {
+    // `x * 255` lands within an ulp of `k` for the point of `k`, so the
+    // rounded value is the only candidate; the bit comparison settles it
+    // (and rejects `-0.0`, NaN and everything between the points).
+    let k = (x * 255.0 + 0.5) as i32 as usize;
+    match U8_POINTS.get(k) {
+        Some(p) if p.to_bits() == x.to_bits() => Some(k),
+        _ => None,
+    }
+}
+
 /// One pipeline operation over up to 16 channels.
 #[derive(Debug, Clone)]
 pub(crate) enum Op {
@@ -1073,6 +1098,42 @@ impl Chain {
     /// `in_ch`) and receives the result.
     pub(crate) fn eval_in_place(&self, v: &mut [f64; 16]) {
         run(&self.ops, v, self.in_ch);
+    }
+
+    /// When the chain starts with per-channel curves (the sRGB curves of a
+    /// matrix/TRC source, a LUT's input tables): the values they give at
+    /// the 256 points `f32::from(k) / 255.0`, one row per input channel, so
+    /// that float pixels widened from 8-bit values (where every sample is
+    /// such a point) look their first op up instead of evaluating it. Each
+    /// entry is [`run`] of that op on the point, so a lookup gives exactly
+    /// what the op gives. `None` for every other first op.
+    pub(crate) fn head_on_u8_points(&self) -> Option<Box<[[f64; 256]]>> {
+        let head = self.ops.first()?;
+        let per_channel = match head {
+            Op::FwdSegs(cs) => cs.len() == self.in_ch,
+            Op::Sampled(cs) => cs.len() == self.in_ch,
+            Op::Lut(Stage::Curves(cs)) => cs.len() == self.in_ch,
+            _ => false,
+        };
+        if !per_channel {
+            return None;
+        }
+        let mut rows = vec![[0.0f64; 256]; self.in_ch].into_boxed_slice();
+        for (k, x) in U8_POINTS.iter().enumerate() {
+            let mut v = [0.0f64; 16];
+            v[..self.in_ch].fill(f64::from(*x));
+            run(core::slice::from_ref(head), &mut v, self.in_ch);
+            for (row, y) in rows.iter_mut().zip(v) {
+                row[k] = y;
+            }
+        }
+        Some(rows)
+    }
+
+    /// The chain after its first op: with the values that op gives in `v`,
+    /// [`Chain::eval_in_place`] of the colour they came from.
+    pub(crate) fn eval_tail_in_place(&self, v: &mut [f64; 16]) {
+        run(self.ops.get(1..).unwrap_or(&[]), v, self.in_ch);
     }
 }
 
