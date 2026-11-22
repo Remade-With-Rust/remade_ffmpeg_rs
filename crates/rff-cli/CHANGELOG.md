@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.14](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.4.13...rff-cli-v0.4.14) - 2026-11-22
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.4.13](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rff-cli-v0.4.12...rff-cli-v0.4.13) - 2026-11-22
 
 ### Other
