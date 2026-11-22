@@ -202,14 +202,15 @@ pub(crate) fn grid34<T: Sample, C: Fn(T) -> (usize, f64)>(
             };
             use crate::transform::SampleKind;
             let done = match T::KIND {
-                // SAFETY (both arms): AVX2 was detected on this CPU on the
-                // line above; the kernels bound their own reads and writes
-                // (by the slices they are given and the `Cube`'s length).
                 SampleKind::U16 => match T::u16s_mut(dst) {
+                    // SAFETY: AVX2 was detected on this CPU (the `if`
+                    // above); the kernel bounds its own reads and writes
+                    // (by the slices it is given and the `Cube`'s length).
                     Some(d) => unsafe { x86::grid34_u16(&cube, &cell, src, sc, d) },
                     None => 0,
                 },
                 SampleKind::U8 => match T::u8s_mut(dst) {
+                    // SAFETY: as for the 16-bit arm: AVX2 detected above.
                     Some(d) => unsafe { x86::grid34_u8(&cube, &cell, src, sc, d) },
                     None => 0,
                 },
