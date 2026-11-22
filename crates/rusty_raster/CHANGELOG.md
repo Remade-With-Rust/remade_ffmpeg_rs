@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_raster-v0.1.5...rusty_raster-v0.1.6) - 2026-11-22
+
+### Other
+
+- *(rusty_raster)* copy fill blocks of 16 KiB, not 4 KiB
+- *(rusty_raster)* build u16x16 lane ops with array::from_fn
+- *(rusty_raster)* lossbench rows for app-shaped fills
+- *(rusty_raster)* fill a pixmap without relying on the auto-vectoriser
+
 ## [0.1.5](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_raster-v0.1.4...rusty_raster-v0.1.5) - 2026-11-22
 
 ### Other

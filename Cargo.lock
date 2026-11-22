@@ -5120,7 +5120,7 @@ dependencies = [
 
 [[package]]
 name = "rff-cli"
-version = "0.4.13"
+version = "0.4.14"
 dependencies = [
  "remade-ffmpeg",
  "rff-core",
@@ -5568,7 +5568,7 @@ version = "0.8.3"
 
 [[package]]
 name = "rff-server"
-version = "0.3.30"
+version = "0.3.31"
 dependencies = [
  "axum",
  "remade-ffmpeg",
@@ -6041,7 +6041,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_raster"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "rusty_alloc-api",
  "rusty_png",
@@ -6050,7 +6050,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_svgtree"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "resvg",
  "rusty_alloc-api",
