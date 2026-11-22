@@ -1,0 +1,652 @@
+//! x86-64 AVX2 kernels: the only `unsafe` in the crate.
+//!
+//! Rules every kernel here follows (the audit list is in the pull request
+//! that added the module, and in `README.md`):
+//!
+//! - A kernel is a safe `#[target_feature(enable = "avx2")]` function. The
+//!   `unsafe` is confined to (a) the one call into it from a public entry
+//!   point, made only after `is_x86_feature_detected!("avx2")` said yes, and
+//!   (b) the raw-pointer loads, stores and gathers in the small helpers
+//!   below, each bounded by a fixed-size array reference or by an index clamp
+//!   written on the line before it.
+//! - Every kernel has a scalar twin: the code it stands in for, which stays
+//!   in the tree as the oracle of the tests and as the path on every other
+//!   CPU and target. In exact mode the kernel and its twin agree bit for bit
+//!   (the same IEEE operations in the same order, lane by lane: no FMA, no
+//!   reassociation).
+//! - An entry point returns how many pixels it did (a multiple of 8, from the
+//!   front); the caller runs the scalar twin on the rest. On targets other
+//!   than x86-64, and on x86-64 CPUs without AVX2, every entry point returns
+//!   0 and the scalar twin does everything.
+
+use crate::transform::OUT_TABLE;
+
+/// The tables and matrix of a three-channel matrix-shaper transform
+/// (`ShaperEngine` in `transform.rs`), borrowed for one call: input tables of
+/// `N` entries (256 for 8-bit, 65536 for 16-bit samples), one per input
+/// channel, the 3x3 matrix and offset, and the `sqrt`-indexed output tables.
+// Read only by the x86-64 kernels.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) struct ShaperTables<'a, const N: usize> {
+    pub(crate) rows: [&'a [f32; N]; 3],
+    pub(crate) outs: [&'a [f32; OUT_TABLE]; 3],
+    pub(crate) m: [[f32; 3]; 3],
+    pub(crate) off: [f32; 3],
+}
+
+/// One output channel's exact 8-bit codes by threshold (`U8Codes` in
+/// `transform.rs`), borrowed for one call.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) struct Codes8<'a> {
+    pub(crate) table: &'a [u32],
+    pub(crate) base: i32,
+    pub(crate) shift: u32,
+}
+
+/// Pixels the kernels have done, for the reachability census of the tests
+/// (counted once per call, never per pixel; test builds only).
+#[cfg(test)]
+pub(crate) static CENSUS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn count(done: usize) {
+    CENSUS.fetch_add(done as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[inline(always)]
+fn count(_: usize) {}
+
+/// `true` when this CPU runs the AVX2 kernels.
+#[inline]
+pub(crate) fn avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// The 8-bit matrix-shaper loop (`ShaperEngine::run_loop::<u8, 3, 3>`) on
+/// the leading multiple of 8 pixels: interleaved RGB or RGBA in and out,
+/// alpha copied (`alpha.0 && alpha.1`) or set opaque as the scalar loop
+/// does. With `codes` (one per output channel, each table non-empty) the
+/// output tables and the quantisation are replaced by the threshold lookup,
+/// which gives the same codes. Returns the pixels done.
+pub(crate) fn shaper_u8(
+    t: &ShaperTables<'_, 256>,
+    codes: Option<&[Codes8<'_>; 3]>,
+    src: &[u8],
+    dst: &mut [u8],
+    (sc, dc): (usize, usize),
+    alpha: (bool, bool),
+) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let codes = codes.filter(|c| c.iter().all(|c| !c.table.is_empty() && c.shift < 32));
+        if matches!((sc, dc), (3 | 4, 3 | 4)) && avx2() {
+            // SAFETY: AVX2 was detected on this CPU on the line above; the
+            // kernel has no other precondition (it bounds its own reads and
+            // writes by the slices it is given, and `codes` tables are
+            // non-empty, checked on the line before).
+            let done = unsafe { x86::shaper_u8(t, codes, src, dst, (sc, dc), alpha.0 && alpha.1) };
+            count(done);
+            return done;
+        }
+    }
+    let _ = (t, codes, src, dst, sc, dc, alpha);
+    0
+}
+
+/// [`shaper_u8`] for 16-bit samples.
+pub(crate) fn shaper_u16(
+    t: &ShaperTables<'_, 65536>,
+    src: &[u16],
+    dst: &mut [u16],
+    (sc, dc): (usize, usize),
+    alpha: (bool, bool),
+) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if matches!((sc, dc), (3 | 4, 3 | 4)) && avx2() {
+            // SAFETY: as in `shaper_u8`: AVX2 detected just above.
+            let done = unsafe { x86::shaper_u16(t, src, dst, (sc, dc), alpha.0 && alpha.1) };
+            count(done);
+            return done;
+        }
+    }
+    let _ = (t, src, dst, sc, dc, alpha);
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use super::{Codes8, ShaperTables, OUT_TABLE};
+    use core::arch::x86_64::*;
+
+    // ---- memory helpers: every raw-pointer access of the module ----
+
+    /// Sixteen bytes from a 16-byte array.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn load128(p: &[u8; 16]) -> __m128i {
+        // SAFETY: `p` refers to 16 readable bytes; the load is unaligned.
+        unsafe { _mm_loadu_si128(p.as_ptr().cast()) }
+    }
+
+    /// Eight bytes from an 8-byte array, in the low half (upper half zero).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn load64(p: &[u8; 8]) -> __m128i {
+        // SAFETY: `p` refers to 8 readable bytes; `movq` reads exactly 8.
+        unsafe { _mm_loadl_epi64(p.as_ptr().cast()) }
+    }
+
+    /// Thirty-two bytes from a 32-byte array.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn load256(p: &[u8; 32]) -> __m256i {
+        // SAFETY: `p` refers to 32 readable bytes; the load is unaligned.
+        unsafe { _mm256_loadu_si256(p.as_ptr().cast()) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn store128(p: &mut [u8; 16], v: __m128i) {
+        // SAFETY: `p` refers to 16 writable bytes; the store is unaligned.
+        unsafe { _mm_storeu_si128(p.as_mut_ptr().cast(), v) }
+    }
+
+    /// Eight 16-bit samples.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn load_words(p: &[u16; 8]) -> __m128i {
+        // SAFETY: `p` refers to 16 readable bytes; the load is unaligned.
+        unsafe { _mm_loadu_si128(p.as_ptr().cast()) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn store_words(p: &mut [u16; 8], v: __m128i) {
+        // SAFETY: `p` refers to 16 writable bytes; the store is unaligned.
+        unsafe { _mm_storeu_si128(p.as_mut_ptr().cast(), v) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn store64(p: &mut [u8; 8], v: __m128i) {
+        // SAFETY: `p` refers to 8 writable bytes; `movq` writes exactly 8.
+        unsafe { _mm_storel_epi64(p.as_mut_ptr().cast(), v) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn store256(p: &mut [u8; 32], v: __m256i) {
+        // SAFETY: `p` refers to 32 writable bytes; the store is unaligned.
+        unsafe { _mm256_storeu_si256(p.as_mut_ptr().cast(), v) }
+    }
+
+    /// `table[idx & (N - 1)]` per lane, for a power-of-two `N` (every
+    /// caller's indices are already in range, so the mask changes nothing
+    /// for them; it is what bounds the reads).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn gather<const N: usize>(table: &[f32; N], idx: __m256i) -> __m256 {
+        const { assert!(N.is_power_of_two() && N <= 1 << 30) };
+        let idx = _mm256_and_si256(idx, _mm256_set1_epi32((N - 1) as i32));
+        // SAFETY: every lane of `idx` is in 0..=N-1 (masked on the line
+        // above), so each 4-byte read at `table + 4 * idx` lies inside the
+        // N `f32`s `table` refers to.
+        unsafe { _mm256_i32gather_ps::<4>(table.as_ptr(), idx) }
+    }
+
+    /// `table[idx]` per lane, for a table of at least one entry and `idx`
+    /// lanes that are non-negative (the caller's `max` with 0): clamped to
+    /// the table's last entry here.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn gather_u32(table: &[u32], idx: __m256i) -> __m256i {
+        let Some(top) = table.len().checked_sub(1) else {
+            return _mm256_setzero_si256();
+        };
+        let top = top.min(i32::MAX as usize) as i32;
+        let idx = _mm256_min_epu32(idx, _mm256_set1_epi32(top));
+        // SAFETY: `table` is non-empty (`checked_sub` above) and every lane
+        // of `idx`, read as unsigned, is at most `len - 1` (the unsigned
+        // `min` above; `top` saturating at i32::MAX only shrinks the range),
+        // so each 4-byte read lies inside it.
+        unsafe { _mm256_i32gather_epi32::<4>(table.as_ptr().cast(), idx) }
+    }
+
+    /// A `pshufb` control from 16 bytes.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn mask(m: [u8; 16]) -> __m128i {
+        load128(&m)
+    }
+
+    /// `p[..N]` as an array reference (the callers pass exact chunks, so the
+    /// test folds away).
+    #[inline(always)]
+    fn arr<const N: usize>(p: &[u8]) -> &[u8; N] {
+        p.first_chunk::<N>()
+            .expect("chunk of the kernel's own width")
+    }
+
+    #[inline(always)]
+    fn arr_mut<const N: usize>(p: &mut [u8]) -> &mut [u8; N] {
+        p.first_chunk_mut::<N>()
+            .expect("chunk of the kernel's own width")
+    }
+
+    // ---- shuffle controls (built at compile time) ----
+
+    const Z: u8 = 0x80;
+
+    /// Byte `k` of channel `c` (of 3) from interleaved 8-bit RGB, for the
+    /// 16-byte block `j` of the source: the source byte `3k + c` when it is
+    /// in that block, else zero. Bytes 8..16 of the result are zero.
+    const fn rgb8_in(c: usize, j: usize) -> [u8; 16] {
+        let mut m = [Z; 16];
+        let mut k = 0;
+        while k < 8 {
+            let b = 3 * k + c;
+            if b / 16 == j {
+                m[k] = (b % 16) as u8;
+            }
+            k += 1;
+        }
+        m
+    }
+
+    /// The four 32-bit lanes `0x00BBGGRR` of one 128-bit half to 12 packed
+    /// bytes `RGBRGBRGBRGB` (bytes 12..16 zero).
+    const RGB8_OUT: [u8; 16] = [0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, Z, Z, Z, Z];
+
+    /// Word `k` of channel `c` (of 3) from interleaved 16-bit RGB, for the
+    /// 16-byte block `j` (words `8j..8j+8`) of the source.
+    const fn rgb16_in(c: usize, j: usize) -> [u8; 16] {
+        let mut m = [Z; 16];
+        let mut k = 0;
+        while k < 8 {
+            let w = 3 * k + c;
+            if w / 8 == j {
+                m[2 * k] = (2 * (w % 8)) as u8;
+                m[2 * k + 1] = (2 * (w % 8) + 1) as u8;
+            }
+            k += 1;
+        }
+        m
+    }
+
+    /// For output block `j` (words `8j..8j+8` of interleaved 16-bit RGB):
+    /// the words that come from channel `c`'s eight packed words.
+    const fn rgb16_out(c: usize, j: usize) -> [u8; 16] {
+        let mut m = [Z; 16];
+        let mut w = 0;
+        while w < 8 {
+            let at = 8 * j + w;
+            if at % 3 == c {
+                let k = at / 3;
+                m[2 * w] = (2 * k) as u8;
+                m[2 * w + 1] = (2 * k + 1) as u8;
+            }
+            w += 1;
+        }
+        m
+    }
+
+    // ---- the matrix-shaper core ----
+
+    /// The colour values of eight pixels before quantisation: per output
+    /// channel `ShaperEngine::lookup_out(out[o], m[o] . lin + off[o])` with
+    /// `lin[c] = rows[c][idx[c]]`, the scalar loop's operations in its
+    /// order, lane by lane.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn mix<const N: usize>(t: &ShaperTables<'_, N>, idx: [__m256i; 3]) -> [__m256; 3] {
+        let l0 = gather(t.rows[0], idx[0]);
+        let l1 = gather(t.rows[1], idx[1]);
+        let l2 = gather(t.rows[2], idx[2]);
+        let mut v = [_mm256_setzero_ps(); 3];
+        for (o, v) in v.iter_mut().enumerate() {
+            let r = t.m[o];
+            // `r[0] * l0 + r[1] * l1 + r[2] * l2 + off`, left to right.
+            *v = _mm256_add_ps(
+                _mm256_add_ps(
+                    _mm256_add_ps(
+                        _mm256_mul_ps(_mm256_set1_ps(r[0]), l0),
+                        _mm256_mul_ps(_mm256_set1_ps(r[1]), l1),
+                    ),
+                    _mm256_mul_ps(_mm256_set1_ps(r[2]), l2),
+                ),
+                _mm256_set1_ps(t.off[o]),
+            );
+        }
+        v
+    }
+
+    /// `if v > 0 { v.min(1) } else { 0 }`: `maxps` returns its second
+    /// operand when the first is NaN and for two zeros, so NaN and -0.0
+    /// become +0.0 as in the scalar form.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn clamp01(v: __m256) -> __m256 {
+        _mm256_min_ps(_mm256_max_ps(v, _mm256_setzero_ps()), _mm256_set1_ps(1.0))
+    }
+
+    /// The 8-bit codes of `v` by threshold (`U8Codes::lookup`): bucket and
+    /// in-bucket position from the clamped value's bit pattern, the entry's
+    /// first code plus one, minus one when the position is below its step.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn codes8(v: __m256, c: &Codes8<'_>) -> __m256i {
+        let bits = _mm256_castps_si256(clamp01(v));
+        let off = _mm256_max_epi32(
+            _mm256_sub_epi32(bits, _mm256_set1_epi32(c.base)),
+            _mm256_setzero_si256(),
+        );
+        let shift = _mm_cvtsi32_si128(c.shift as i32);
+        let e = gather_u32(c.table, _mm256_srl_epi32(off, shift));
+        let low = _mm256_and_si256(off, _mm256_set1_epi32(((1u32 << c.shift) - 1) as i32));
+        let step = _mm256_and_si256(e, _mm256_set1_epi32(0x7F_FFFF));
+        // `cmpgt` is -1 where the step is above the position.
+        _mm256_add_epi32(_mm256_srli_epi32::<23>(e), _mm256_cmpgt_epi32(step, low))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn shade<const N: usize>(t: &ShaperTables<'_, N>, idx: [__m256i; 3]) -> [__m256; 3] {
+        let v = mix(t, idx);
+        let scale = _mm256_set1_ps((OUT_TABLE - 1) as f32);
+        let last = _mm256_set1_epi32((OUT_TABLE - 2) as i32);
+        let step = _mm256_set1_epi32(1);
+        let mut y = [_mm256_setzero_ps(); 3];
+        for (o, y) in y.iter_mut().enumerate() {
+            let c = clamp01(v[o]);
+            let pos = _mm256_mul_ps(_mm256_sqrt_ps(c), scale);
+            let i = _mm256_min_epi32(_mm256_cvttps_epi32(pos), last);
+            let f = _mm256_sub_ps(pos, _mm256_cvtepi32_ps(i));
+            let a = gather(t.outs[o], i);
+            let b = gather(t.outs[o], _mm256_add_epi32(i, step));
+            *y = _mm256_add_ps(a, _mm256_mul_ps(_mm256_sub_ps(b, a), f));
+        }
+        y
+    }
+
+    /// `Sample::from_unit(f64::from(y))` for `u8` (`max` 255) or `u16`
+    /// (65535): `y * max + 0.5` in `f64`, truncated, saturated (NaN to 0).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn quantise(y: __m256, max: f64) -> __m256i {
+        let k = _mm256_set1_pd(max);
+        let h = _mm256_set1_pd(0.5);
+        let z = _mm256_setzero_pd();
+        let lo = _mm256_cvtps_pd(_mm256_castps256_ps128(y));
+        let hi = _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(y));
+        // `maxpd` takes its second operand (0) for NaN; the saturating cast
+        // of a value in 0..=max is its truncation.
+        let lo = _mm256_min_pd(_mm256_max_pd(_mm256_add_pd(_mm256_mul_pd(lo, k), h), z), k);
+        let hi = _mm256_min_pd(_mm256_max_pd(_mm256_add_pd(_mm256_mul_pd(hi, k), h), z), k);
+        _mm256_set_m128i(_mm256_cvttpd_epi32(hi), _mm256_cvttpd_epi32(lo))
+    }
+
+    // ---- 8-bit pixels ----
+
+    /// Eight pixels of interleaved 8-bit RGB (`SC` 3) or RGBA (`SC` 4) as
+    /// four lanes of 32-bit channel values (alpha 0 for RGB).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn load_u8<const SC: usize>(p: &[u8]) -> [__m256i; 4] {
+        if SC == 4 {
+            let v = load256(arr::<32>(p));
+            let ff = _mm256_set1_epi32(0xff);
+            [
+                _mm256_and_si256(v, ff),
+                _mm256_and_si256(_mm256_srli_epi32::<8>(v), ff),
+                _mm256_and_si256(_mm256_srli_epi32::<16>(v), ff),
+                _mm256_srli_epi32::<24>(v),
+            ]
+        } else {
+            let p: &[u8; 24] = arr::<24>(p);
+            let a = load128(arr::<16>(&p[..16]));
+            let b = load64(arr::<8>(&p[16..]));
+            let ch = |c: usize| -> __m256i {
+                // Safe intrinsics in a closure: the closure inherits the
+                // enclosing function's target features.
+                _mm256_cvtepu8_epi32(_mm_or_si128(
+                    _mm_shuffle_epi8(a, mask(rgb8_in(c, 0))),
+                    _mm_shuffle_epi8(b, mask(rgb8_in(c, 1))),
+                ))
+            };
+            [ch(0), ch(1), ch(2), _mm256_setzero_si256()]
+        }
+    }
+
+    /// Eight pixels of 8-bit codes (each lane 0..=255) to interleaved RGB
+    /// (`DC` 3) or RGBA (`DC` 4, alpha from `a`).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn store_u8<const DC: usize>(p: &mut [u8], [r, g, b, a]: [__m256i; 4]) {
+        let w = _mm256_or_si256(
+            _mm256_or_si256(r, _mm256_slli_epi32::<8>(g)),
+            _mm256_slli_epi32::<16>(b),
+        );
+        if DC == 4 {
+            store256(
+                arr_mut::<32>(p),
+                _mm256_or_si256(w, _mm256_slli_epi32::<24>(a)),
+            );
+        } else {
+            let p: &mut [u8; 24] = arr_mut::<24>(p);
+            let m = _mm256_broadcastsi128_si256(mask(RGB8_OUT));
+            let packed = _mm256_shuffle_epi8(w, m);
+            let lo = _mm256_castsi256_si128(packed);
+            let hi = _mm256_extracti128_si256::<1>(packed);
+            // Bytes 0..12 from the low half (its store also writes 12..16,
+            // which the high half's 12 bytes then overwrite).
+            store128(arr_mut::<16>(&mut p[..16]), lo);
+            store64(arr_mut::<8>(&mut p[12..20]), hi);
+            p[20..24].copy_from_slice(&(_mm_extract_epi32::<2>(hi) as u32).to_le_bytes());
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn run_u8<const SC: usize, const DC: usize>(
+        t: &ShaperTables<'_, 256>,
+        codes: Option<&[Codes8<'_>; 3]>,
+        src: &[u8],
+        dst: &mut [u8],
+        copy_alpha: bool,
+    ) -> usize {
+        let opaque = _mm256_set1_epi32(0xff);
+        let mut done = 0;
+        let pairs = src.chunks_exact(8 * SC).zip(dst.chunks_exact_mut(8 * DC));
+        if let Some(c) = codes {
+            for (s, d) in pairs {
+                let [r, g, b, a] = load_u8::<SC>(s);
+                let v = mix(t, [r, g, b]);
+                let a = if copy_alpha { a } else { opaque };
+                let q = [
+                    codes8(v[0], &c[0]),
+                    codes8(v[1], &c[1]),
+                    codes8(v[2], &c[2]),
+                ];
+                store_u8::<DC>(d, [q[0], q[1], q[2], a]);
+                done += 8;
+            }
+            return done;
+        }
+        for (s, d) in pairs {
+            let [r, g, b, a] = load_u8::<SC>(s);
+            let y = shade(t, [r, g, b]);
+            let a = if copy_alpha { a } else { opaque };
+            store_u8::<DC>(
+                d,
+                [
+                    quantise(y[0], 255.0),
+                    quantise(y[1], 255.0),
+                    quantise(y[2], 255.0),
+                    a,
+                ],
+            );
+            done += 8;
+        }
+        done
+    }
+
+    /// The 8-bit kernel.
+    ///
+    /// # Safety
+    /// The CPU must support AVX2.
+    #[target_feature(enable = "avx2")]
+    pub(super) fn shaper_u8(
+        t: &ShaperTables<'_, 256>,
+        codes: Option<&[Codes8<'_>; 3]>,
+        src: &[u8],
+        dst: &mut [u8],
+        sc_dc: (usize, usize),
+        copy_alpha: bool,
+    ) -> usize {
+        match sc_dc {
+            (3, 3) => run_u8::<3, 3>(t, codes, src, dst, copy_alpha),
+            (3, 4) => run_u8::<3, 4>(t, codes, src, dst, copy_alpha),
+            (4, 3) => run_u8::<4, 3>(t, codes, src, dst, copy_alpha),
+            (4, 4) => run_u8::<4, 4>(t, codes, src, dst, copy_alpha),
+            _ => 0,
+        }
+    }
+
+    // ---- 16-bit pixels ----
+
+    /// Eight pixels of interleaved 16-bit RGB (`SC` 3) or RGBA (`SC` 4) as
+    /// four lanes of 32-bit channel values (alpha 0 for RGB).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn load_u16<const SC: usize>(p: &[u16]) -> [__m256i; 4] {
+        let block = |k: usize| -> __m128i {
+            load_words(
+                p[8 * k..]
+                    .first_chunk::<8>()
+                    .expect("chunk of the kernel's own width"),
+            )
+        };
+        if SC == 4 {
+            let v0 = _mm256_set_m128i(block(1), block(0));
+            let v1 = _mm256_set_m128i(block(3), block(2));
+            let even_odd = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+            let p0 = _mm256_permutevar8x32_epi32(v0, even_odd);
+            let p1 = _mm256_permutevar8x32_epi32(v1, even_odd);
+            let rg = _mm256_permute2x128_si256::<0x20>(p0, p1);
+            let ba = _mm256_permute2x128_si256::<0x31>(p0, p1);
+            let lo = _mm256_set1_epi32(0xffff);
+            [
+                _mm256_and_si256(rg, lo),
+                _mm256_srli_epi32::<16>(rg),
+                _mm256_and_si256(ba, lo),
+                _mm256_srli_epi32::<16>(ba),
+            ]
+        } else {
+            let blk = [block(0), block(1), block(2)];
+            let ch = |c: usize| -> __m256i {
+                let mut v = _mm_shuffle_epi8(blk[0], mask(rgb16_in(c, 0)));
+                v = _mm_or_si128(v, _mm_shuffle_epi8(blk[1], mask(rgb16_in(c, 1))));
+                v = _mm_or_si128(v, _mm_shuffle_epi8(blk[2], mask(rgb16_in(c, 2))));
+                _mm256_cvtepu16_epi32(v)
+            };
+            [ch(0), ch(1), ch(2), _mm256_setzero_si256()]
+        }
+    }
+
+    /// Eight pixels of 16-bit codes (each lane 0..=65535) to interleaved
+    /// RGB (`DC` 3) or RGBA (`DC` 4, alpha from `a`).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn store_u16<const DC: usize>(p: &mut [u16], [r, g, b, a]: [__m256i; 4]) {
+        let put = |p: &mut [u16], k: usize, v: __m128i| {
+            store_words(
+                p[8 * k..]
+                    .first_chunk_mut::<8>()
+                    .expect("chunk of the kernel's own width"),
+                v,
+            );
+        };
+        if DC == 4 {
+            let rg = _mm256_or_si256(r, _mm256_slli_epi32::<16>(g));
+            let ba = _mm256_or_si256(b, _mm256_slli_epi32::<16>(a));
+            let lo = _mm256_unpacklo_epi32(rg, ba);
+            let hi = _mm256_unpackhi_epi32(rg, ba);
+            let o0 = _mm256_permute2x128_si256::<0x20>(lo, hi);
+            let o1 = _mm256_permute2x128_si256::<0x31>(lo, hi);
+            put(p, 0, _mm256_castsi256_si128(o0));
+            put(p, 1, _mm256_extracti128_si256::<1>(o0));
+            put(p, 2, _mm256_castsi256_si128(o1));
+            put(p, 3, _mm256_extracti128_si256::<1>(o1));
+        } else {
+            let pack = |v: __m256i| {
+                _mm_packus_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v))
+            };
+            let ch = [pack(r), pack(g), pack(b)];
+            for j in 0..3 {
+                let mut v = _mm_shuffle_epi8(ch[0], mask(rgb16_out(0, j)));
+                v = _mm_or_si128(v, _mm_shuffle_epi8(ch[1], mask(rgb16_out(1, j))));
+                v = _mm_or_si128(v, _mm_shuffle_epi8(ch[2], mask(rgb16_out(2, j))));
+                put(p, j, v);
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn run_u16<const SC: usize, const DC: usize>(
+        t: &ShaperTables<'_, 65536>,
+        src: &[u16],
+        dst: &mut [u16],
+        copy_alpha: bool,
+    ) -> usize {
+        let opaque = _mm256_set1_epi32(0xffff);
+        let mut done = 0;
+        for (s, d) in src.chunks_exact(8 * SC).zip(dst.chunks_exact_mut(8 * DC)) {
+            let [r, g, b, a] = load_u16::<SC>(s);
+            let y = shade(t, [r, g, b]);
+            let a = if copy_alpha { a } else { opaque };
+            store_u16::<DC>(
+                d,
+                [
+                    quantise(y[0], 65535.0),
+                    quantise(y[1], 65535.0),
+                    quantise(y[2], 65535.0),
+                    a,
+                ],
+            );
+            done += 8;
+        }
+        done
+    }
+
+    /// The 16-bit kernel.
+    ///
+    /// # Safety
+    /// The CPU must support AVX2.
+    #[target_feature(enable = "avx2")]
+    pub(super) fn shaper_u16(
+        t: &ShaperTables<'_, 65536>,
+        src: &[u16],
+        dst: &mut [u16],
+        sc_dc: (usize, usize),
+        copy_alpha: bool,
+    ) -> usize {
+        match sc_dc {
+            (3, 3) => run_u16::<3, 3>(t, src, dst, copy_alpha),
+            (3, 4) => run_u16::<3, 4>(t, src, dst, copy_alpha),
+            (4, 3) => run_u16::<4, 3>(t, src, dst, copy_alpha),
+            (4, 4) => run_u16::<4, 4>(t, src, dst, copy_alpha),
+            _ => 0,
+        }
+    }
+}

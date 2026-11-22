@@ -11,6 +11,7 @@ use crate::pipeline::{
     build_chain, u8_point, Chain, GamutChain, LutOutChain, SegChain, ShaperChain, ShaperLink,
 };
 use crate::profile::{ColorSpace, Profile};
+use crate::simd;
 
 /// ICC rendering intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -249,13 +250,17 @@ impl Sample for f32 {
 
 /// Entries of the inverse-curve output tables, indexed by `sqrt(linear)`
 /// so the steep start of a gamma inverse is sampled densely.
-const OUT_TABLE: usize = 16384;
+pub(crate) const OUT_TABLE: usize = 16384;
 
 /// Matrix-shaper engine for integer samples. Tables are flat, one fixed-size
 /// row per channel (`TABLE_LEN` input entries, `OUT_TABLE` output entries),
 /// so the hot loop slices a row once and its indexing is provably in bounds.
 struct ShaperEngine {
     link: ShaperLink,
+    /// Per input channel, the first channel whose curve is the same (so its
+    /// table row holds the same values): the SIMD kernels read that row, so
+    /// three channels of one curve share one row's cache lines.
+    row_of: [usize; 3],
     m: [[f32; 3]; 3],
     off: [f32; 3],
     in8: Box<[f32]>,
@@ -266,6 +271,135 @@ struct ShaperEngine {
     /// over a ramp, so a lookup gives exactly what the loop gives. Built by
     /// the first call with at least 256 pixels.
     grey8: OnceLock<Box<[[u8; 3]; 256]>>,
+    /// Per output channel, the first channel whose output curve is the same
+    /// (so its output table row holds the same values).
+    out_of: [usize; 3],
+    /// For three 8-bit output channels: the exact 8-bit codes of each output
+    /// table by threshold ([`U8Codes`]), `None` when a table does not
+    /// qualify. Built by the first 8-bit call the AVX2 kernel serves.
+    codes8: OnceLock<Option<[Arc<U8Codes>; 3]>>,
+}
+
+/// The 8-bit code of every linear value through one `sqrt`-indexed output
+/// table, by threshold. [`ShaperEngine::lookup_out`] then
+/// [`Sample::from_unit`] is a non-decreasing step function of the value
+/// (checked when this is built: see [`U8Codes::new`]), so the code of `v`
+/// is the number of steps at or below `v`. The steps are found exactly, by
+/// bisection over the `f32` bit patterns, and filed in buckets of the
+/// value's bit pattern (`2^b` per octave) holding at most one step each: a
+/// bucket's entry is its first code plus one (bits 23 and up) and the low
+/// bits of its step (bits 0..23; `1 << shift` when it has none).
+pub(crate) struct U8Codes {
+    pub(crate) table: Box<[u32]>,
+    /// Subtracted from the clamped value's bit pattern (then clamped at 0)
+    /// before the bucket (`>> shift`) and the in-bucket position (low bits).
+    pub(crate) base: i32,
+    pub(crate) shift: u32,
+}
+
+impl U8Codes {
+    /// `from_unit(lookup_out(table, v))` for `u8`: the function filed.
+    fn code(table: &[f32; OUT_TABLE], v: f32) -> u8 {
+        u8::from_unit(f64::from(ShaperEngine::lookup_out(table, v)))
+    }
+
+    /// `None` unless the table's codes are a non-decreasing function of the
+    /// clamped value (proven here, see the comments) and fit the buckets.
+    fn new(t: &[f32; OUT_TABLE]) -> Option<Self> {
+        const ONE: u32 = 0x3F80_0000;
+        let u = |y: f32| u8::from_unit(f64::from(y));
+        // Within cell `i` the value is `t[i] + (t[i+1] - t[i]) * f`, with `f`
+        // in 0..=1 a non-decreasing function of the value (the clamp, `sqrt`,
+        // the product and the truncation all round monotonically); with a
+        // non-negative difference every rounding step after it is monotone.
+        if !t.windows(2).all(|w| w[1] - w[0] >= 0.0) {
+            return None;
+        }
+        // Across the boundary into cell `i`: cell `i - 1` gives at most its
+        // value at the largest position below `i` (an `f32`, so at most the
+        // float before `i`, and that minus `i - 1` is exact); cell `i`
+        // starts at `t[i]`. The codes must not fall there.
+        for i in 1..OUT_TABLE - 1 {
+            let f = f32::from_bits((i as f32).to_bits() - 1) - (i - 1) as f32;
+            let left = t[i - 1] + (t[i] - t[i - 1]) * f;
+            if u(left) > u(t[i]) {
+                return None;
+            }
+        }
+        // The steps: for each code above the code of 0, the smallest value in
+        // 0..=1 reaching it (bisection on the bit pattern, which orders the
+        // non-negative floats).
+        let at = |bits: u32| Self::code(t, f32::from_bits(bits));
+        let (c0, c1) = (at(0), at(ONE));
+        let mut steps = Vec::with_capacity(usize::from(c1 - c0));
+        for k in c0 + 1..=c1 {
+            let (mut lo, mut hi) = (0u32, ONE);
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if at(mid) >= k {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            steps.push(hi);
+        }
+        // Two codes at one value cannot be told apart by one step.
+        if steps.windows(2).any(|w| w[0] == w[1]) {
+            return None;
+        }
+        // Buckets from the octave of the first step (every value below it is
+        // code `c0`): `base` is one less than that octave's first bit
+        // pattern, so every step's offset is at least 1, and every value below
+        // the octave lands at offset 0, under every step.
+        let octave = steps.first().map_or(ONE, |&b| b & 0x7F80_0000);
+        if octave < 64 << 23 {
+            return None;
+        }
+        let base = octave - 1;
+        for b in 7..=12u32 {
+            let shift = 23 - b;
+            let n = ((ONE - base) >> shift) as usize + 1;
+            let mut table = vec![0u32; n];
+            let mut next = 0usize;
+            let mut ok = true;
+            for (j, e) in table.iter_mut().enumerate() {
+                let start = (j as u32) << shift;
+                let end = start + (1 << shift);
+                let first = u32::from(c0) + next as u32;
+                let mut low = 1u32 << shift;
+                if let Some(&st) = steps.get(next) {
+                    if st - base < end {
+                        low = st - base - start;
+                        next += 1;
+                        if steps.get(next).is_some_and(|&s2| s2 - base < end) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                *e = ((first + 1) << 23) | low;
+            }
+            if ok && next == steps.len() {
+                return Some(Self {
+                    table: table.into_boxed_slice(),
+                    base: base as i32,
+                    shift,
+                });
+            }
+        }
+        None
+    }
+
+    /// The code of `v` by the table: the scalar form of the kernel's lookup.
+    #[cfg(test)]
+    fn lookup(&self, v: f32) -> u8 {
+        let c = if v > 0.0 { v.min(1.0) } else { 0.0 };
+        let off = (c.to_bits() as i32 - self.base).max(0) as u32;
+        let e = self.table[(off >> self.shift) as usize];
+        let low = off & ((1 << self.shift) - 1);
+        ((e >> 23) - u32::from(low < (e & 0x7F_FFFF))) as u8
+    }
 }
 
 impl ShaperEngine {
@@ -308,8 +442,23 @@ impl ShaperEngine {
         }
         let m = link.m.map(|r| r.map(|v| v as f32));
         let off = link.off.map(|v| v as f32);
+        let row_of = core::array::from_fn(|k| {
+            let cs = &link.in_curves;
+            cs.get(k)
+                .and_then(|c| cs[..k].iter().position(|p| p.same_as(c)))
+                .unwrap_or(k)
+        });
+        let out_of = core::array::from_fn(|k| {
+            let cs = &link.out_curves;
+            cs.get(k)
+                .and_then(|c| cs[..k].iter().position(|p| p.same_as(c)))
+                .unwrap_or(k)
+        });
         Self {
+            out_of,
+            codes8: OnceLock::new(),
             link,
+            row_of,
             m,
             off,
             in8,
@@ -372,6 +521,26 @@ impl ShaperEngine {
         true
     }
 
+    /// [`U8Codes`] of the three output tables (one per distinct curve,
+    /// shared), or `None` when one does not qualify.
+    fn build_codes8(&self) -> Option<[Arc<U8Codes>; 3]> {
+        if self.out.len() != 3 {
+            return None;
+        }
+        let mut made: [Option<Arc<U8Codes>>; 3] = [None, None, None];
+        for k in 0..3 {
+            let j = self.out_of[k];
+            made[k] = Some(match &made[j] {
+                Some(c) if j < k => Arc::clone(c),
+                _ => Arc::new(U8Codes::new(&self.out[k])?),
+            });
+        }
+        let [Some(a), Some(b), Some(c)] = made else {
+            return None;
+        };
+        Some([a, b, c])
+    }
+
     fn in16(&self) -> &[f32] {
         self.in16.get_or_init(|| Self::table(&self.link, 65536))
     }
@@ -413,7 +582,72 @@ impl ShaperEngine {
                 }
             }
         }
+        let done = if IN == 3 && OUT == 3 {
+            self.run_simd(tables, src, dst, (sc, dc), (src_alpha, dst_alpha))
+        } else {
+            0
+        };
+        let (src, dst) = (&src[done * sc..], &mut dst[done * dc..]);
         self.run_loop::<T, IN, OUT>(tables, src, dst, sc, dc, src_alpha, dst_alpha);
+    }
+
+    /// [`Self::run_loop`] for three channels in and out, in the AVX2 kernel
+    /// ([`simd::shaper_u8`], [`simd::shaper_u16`]) on the leading multiple of
+    /// 8 pixels: the same values, bit for bit. Returns the pixels done (0
+    /// without AVX2, on other targets, or for other layouts).
+    fn run_simd<T: Sample>(
+        &self,
+        tables: &[f32],
+        src: &[T],
+        dst: &mut [T],
+        sc_dc: (usize, usize),
+        alpha: (bool, bool),
+    ) -> usize {
+        let [o0, o1, o2] = match &self.out[..] {
+            [a, b, c] => [a, b, c],
+            _ => return 0,
+        };
+        let row = |k: usize, n: usize| tables.get(self.row_of[k] * n..(self.row_of[k] + 1) * n);
+        if let (Some(s), Some(d)) = (T::u8s(src), T::u8s_mut(dst)) {
+            let rows =
+                [row(0, 256), row(1, 256), row(2, 256)].map(|r| r.and_then(|r| r.try_into().ok()));
+            let [Some(r0), Some(r1), Some(r2)] = rows else {
+                return 0;
+            };
+            let t = simd::ShaperTables {
+                rows: [r0, r1, r2],
+                outs: [o0, o1, o2],
+                m: self.m,
+                off: self.off,
+            };
+            if s.len() < 8 * sc_dc.0 || !simd::avx2() {
+                return 0;
+            }
+            let codes = self.codes8.get_or_init(|| self.build_codes8());
+            let codes = codes.as_ref().map(|c| {
+                c.each_ref().map(|u| simd::Codes8 {
+                    table: &u.table,
+                    base: u.base,
+                    shift: u.shift,
+                })
+            });
+            return simd::shaper_u8(&t, codes.as_ref(), s, d, sc_dc, alpha);
+        }
+        if let (Some(s), Some(d)) = (T::u16s(src), T::u16s_mut(dst)) {
+            let rows = [row(0, 65536), row(1, 65536), row(2, 65536)]
+                .map(|r| r.and_then(|r| r.try_into().ok()));
+            let [Some(r0), Some(r1), Some(r2)] = rows else {
+                return 0;
+            };
+            let t = simd::ShaperTables {
+                rows: [r0, r1, r2],
+                outs: [o0, o1, o2],
+                m: self.m,
+                off: self.off,
+            };
+            return simd::shaper_u16(&t, s, d, sc_dc, alpha);
+        }
+        0
     }
 
     /// The integer hot loop, monomorphised on the colour channel counts so
@@ -450,7 +684,7 @@ impl ShaperEngine {
 }
 
 enum Engine {
-    Shaper(ShaperEngine),
+    Shaper(Box<ShaperEngine>),
     Grid(ClutEval),
 }
 
@@ -608,7 +842,7 @@ impl Transform {
             ));
         }
         let engine = if let Some(link) = chain.shaper.clone() {
-            Engine::Shaper(ShaperEngine::new(link))
+            Engine::Shaper(Box::new(ShaperEngine::new(link)))
         } else {
             let g = grid_points(chain.in_ch);
             let data = chain.sample_grid(g);
@@ -652,7 +886,7 @@ impl Transform {
     pub fn transform<T: Sample>(&self, src: &[T], dst: &mut [T]) -> Result<()> {
         let sc = self.src_layout.channels();
         let dc = self.dst_layout.channels();
-        if src.len() % sc != 0 || dst.len() != src.len() / sc * dc {
+        if !src.len().is_multiple_of(sc) || dst.len() != src.len() / sc * dc {
             return Err(Error::BufferSize {
                 src: src.len(),
                 dst: dst.len(),
@@ -1380,7 +1614,7 @@ impl GamutCheck {
     /// [`Error::BufferSize`] when `out` does not hold one value per pixel.
     pub fn delta_e<T: Sample>(&self, src: &[T], out: &mut [f64]) -> Result<()> {
         let sc = self.layout.channels();
-        if src.len() % sc != 0 || out.len() != src.len() / sc {
+        if !src.len().is_multiple_of(sc) || out.len() != src.len() / sc {
             return Err(Error::BufferSize {
                 src: src.len(),
                 dst: out.len(),
@@ -2013,5 +2247,286 @@ mod tests {
             t.transform(&src, &mut got).unwrap();
             assert_eq!(got, want);
         }
+    }
+
+    /// Every RGB matrix-shaper pair the kernels serve: built-ins, Adobe RGB
+    /// (pure gamma), linear-light Rec. 2020, and the sampled-curve `ProPhoto`
+    /// test profile, in both directions, with both intents and BPC.
+    fn shaper_pairs() -> Vec<(String, Transform, Transform)> {
+        use crate::color::{Xy, D65_XY};
+        use crate::curve::Curve;
+        let srgb = Profile::new_srgb();
+        let p3 = Profile::new_display_p3();
+        let rec2020 = Profile::new_rec2020();
+        let prim2020 = [
+            Xy::new(0.708, 0.292),
+            Xy::new(0.170, 0.797),
+            Xy::new(0.131, 0.046),
+        ];
+        let lin2020 = Profile::new_rgb(D65_XY, prim2020, Curve::gamma(1.0)).unwrap();
+        let adobe_prim = [
+            Xy::new(0.64, 0.33),
+            Xy::new(0.21, 0.71),
+            Xy::new(0.15, 0.06),
+        ];
+        let adobe = Profile::new_rgb(D65_XY, adobe_prim, Curve::gamma(563.0 / 256.0)).unwrap();
+        let pro =
+            Profile::new_from_slice(include_bytes!("../tests/data/ProPhoto-v2-micro.icc")).unwrap();
+        let named = [
+            ("srgb", &srgb),
+            ("p3", &p3),
+            ("rec2020", &rec2020),
+            ("lin2020", &lin2020),
+            ("adobe", &adobe),
+            ("prophoto", &pro),
+        ];
+        let mut out = Vec::new();
+        for (a, pa) in named {
+            for (b, pb) in named {
+                if a == b && a != "srgb" {
+                    continue;
+                }
+                for (intent, bpc) in [
+                    (Intent::RelativeColorimetric, false),
+                    (Intent::Perceptual, true),
+                ] {
+                    let opts = Options {
+                        black_point_compensation: bpc,
+                    };
+                    let mk = |sl, dl| Transform::new(pa, sl, pb, dl, intent, opts).unwrap();
+                    let (rgb, rgba) =
+                        (mk(Layout::Rgb, Layout::Rgb), mk(Layout::Rgba, Layout::Rgba));
+                    assert!(rgb.is_matrix_shaper(), "{a} -> {b}");
+                    out.push((format!("{a}->{b} {intent:?} bpc={bpc}"), rgb, rgba));
+                }
+            }
+        }
+        out
+    }
+
+    /// The scalar oracle of the matrix-shaper path: `run_loop` alone.
+    fn shaper_oracle<T: Sample>(t: &Transform, src: &[T], dst: &mut [T]) {
+        let Engine::Shaper(e) = &t.engine else {
+            panic!("matrix-shaper expected");
+        };
+        let tables = if T::KIND == SampleKind::U8 {
+            &e.in8[..]
+        } else {
+            e.in16()
+        };
+        let (sc, dc) = (t.src_layout.channels(), t.dst_layout.channels());
+        let (sa, da) = (t.src_layout.has_alpha(), t.dst_layout.has_alpha());
+        e.run_loop::<T, 3, 3>(tables, src, dst, sc, dc, sa, da);
+    }
+
+    fn xorshift(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    /// 8-bit sample pixels: every combination of edge values, then
+    /// pseudo-random ones (an odd count, so the kernels' tails run too).
+    fn sample_u8(n: usize, ch: usize) -> Vec<u8> {
+        let edges = [0u8, 1, 2, 127, 128, 253, 254, 255];
+        let mut v = Vec::new();
+        for &r in &edges {
+            for &g in &edges {
+                for &b in &edges {
+                    v.extend_from_slice(&[r, g, b, r ^ g ^ b][..ch]);
+                }
+            }
+        }
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        while v.len() < n * ch {
+            let x = xorshift(&mut s);
+            v.extend_from_slice(&x.to_le_bytes()[..ch]);
+        }
+        v.truncate(n * ch);
+        v
+    }
+
+    fn sample_u16(n: usize, ch: usize) -> Vec<u16> {
+        let edges = [0u16, 1, 2, 255, 256, 32767, 32768, 65533, 65534, 65535];
+        let mut v = Vec::new();
+        for &r in &edges {
+            for &g in &edges {
+                for &b in &edges {
+                    v.extend_from_slice(&[r, g, b, r ^ g ^ b][..ch]);
+                }
+            }
+        }
+        let mut s = 0xD1B5_4A32_D192_ED03u64;
+        while v.len() < n * ch {
+            let x = xorshift(&mut s);
+            for k in 0..ch {
+                v.push((x >> (16 * k)) as u16);
+            }
+        }
+        v.truncate(n * ch);
+        v
+    }
+
+    /// The same chain with other layouts.
+    fn relayout(t: &Transform, sl: Layout, dl: Layout) -> Transform {
+        Transform::from_chain((*t.chain).clone(), sl, dl).unwrap()
+    }
+
+    /// The public 8- and 16-bit matrix-shaper path (AVX2 kernel where the
+    /// CPU has it) against its scalar oracle, bit for bit: every pair, RGB
+    /// and RGBA on both sides, edges plus pseudo-random pixels.
+    #[test]
+    fn shaper_kernels_match_the_scalar_loop() {
+        let n = 20_003;
+        for (name, rgb, _) in shaper_pairs() {
+            for (sl, dl) in [
+                (Layout::Rgb, Layout::Rgb),
+                (Layout::Rgb, Layout::Rgba),
+                (Layout::Rgba, Layout::Rgb),
+                (Layout::Rgba, Layout::Rgba),
+            ] {
+                let t = relayout(&rgb, sl, dl);
+                let src = sample_u8(n, sl.channels());
+                let mut want = vec![0u8; n * dl.channels()];
+                let mut got = vec![1u8; n * dl.channels()];
+                shaper_oracle(&t, &src, &mut want);
+                t.transform(&src, &mut got).unwrap();
+                assert!(got == want, "u8 {name} {sl:?}->{dl:?}");
+                let src = sample_u16(n, sl.channels());
+                let mut want = vec![0u16; n * dl.channels()];
+                let mut got = vec![1u16; n * dl.channels()];
+                shaper_oracle(&t, &src, &mut want);
+                t.transform(&src, &mut got).unwrap();
+                assert!(got == want, "u16 {name} {sl:?}->{dl:?}");
+            }
+        }
+    }
+
+    /// 16-bit edge sweeps: each channel through all 65536 values with the
+    /// other two at 0, 32768 and 65535, every pair, against the oracle.
+    #[test]
+    fn shaper_u16_kernel_matches_on_channel_sweeps() {
+        let mut src = Vec::with_capacity(9 * 65536 * 3);
+        for c in 0..3 {
+            for other in [0u16, 32768, 65535] {
+                for v in 0..=u16::MAX {
+                    let mut px = [other; 3];
+                    px[c] = v;
+                    src.extend_from_slice(&px);
+                }
+            }
+        }
+        let mut want = vec![0u16; src.len()];
+        let mut got = vec![1u16; src.len()];
+        for (name, rgb, _) in shaper_pairs() {
+            shaper_oracle(&rgb, &src, &mut want);
+            rgb.transform(&src, &mut got).unwrap();
+            assert!(got == want, "u16 sweep {name}");
+        }
+    }
+
+    /// Every one of the 16,777,216 8-bit RGB colours, every pair, against the
+    /// oracle (`cargo test --release -- --ignored shaper_u8_exhaustive`).
+    #[test]
+    #[ignore = "exhaustive: 2^24 colours per pair"]
+    fn shaper_u8_exhaustive() {
+        let src: Vec<u8> = (0..1u32 << 24)
+            .flat_map(|v| [(v >> 16) as u8, (v >> 8) as u8, v as u8])
+            .collect();
+        let mut want = vec![0u8; src.len()];
+        let mut got = vec![1u8; src.len()];
+        let mut pairs = 0;
+        for (name, rgb, _) in shaper_pairs() {
+            shaper_oracle(&rgb, &src, &mut want);
+            rgb.transform(&src, &mut got).unwrap();
+            if let Some(i) = got.iter().zip(&want).position(|(a, b)| a != b) {
+                let px = i / 3;
+                panic!(
+                    "u8 exhaustive {name}: pixel {px:06x} kernel {:?} oracle {:?}",
+                    &got[3 * px..3 * px + 3],
+                    &want[3 * px..3 * px + 3]
+                );
+            }
+            pairs += 1;
+        }
+        eprintln!("shaper_u8_exhaustive: {pairs} pairs x 2^24 colours identical");
+    }
+
+    /// Reachability: on an AVX2 CPU the public 8- and 16-bit paths run the
+    /// kernel on every whole group of 8 pixels (the census counts them).
+    #[test]
+    fn shaper_kernels_are_reached() {
+        if !simd::avx2() {
+            eprintln!("no AVX2: the scalar loop serves every pixel");
+            return;
+        }
+        let (_, t, _) = shaper_pairs().swap_remove(0);
+        let census = || simd::CENSUS.load(Ordering::Relaxed);
+        let src = sample_u8(1001, 3);
+        let mut dst = vec![0u8; src.len()];
+        let before = census();
+        t.transform(&src, &mut dst).unwrap();
+        assert!(census() - before >= 1000, "u8 kernel not reached");
+        let src = sample_u16(1001, 3);
+        let mut dst = vec![0u16; src.len()];
+        let before = census();
+        t.transform(&src, &mut dst).unwrap();
+        assert!(census() - before >= 1000, "u16 kernel not reached");
+    }
+
+    /// [`U8Codes`] against the function it files, `from_unit(lookup_out(v))`,
+    /// for every output table of every pair: around every step (the 64 bit
+    /// patterns either side), on a dense stride of bit patterns over 0..=1,
+    /// and at the specials (NaN, infinities, negatives, past 1). Also: every
+    /// pair's tables qualify (so the kernel takes the threshold path).
+    #[test]
+    fn u8_codes_match_the_output_tables() {
+        let mut tables = 0;
+        for (name, rgb, _) in shaper_pairs() {
+            let Engine::Shaper(e) = &rgb.engine else {
+                panic!("matrix-shaper expected");
+            };
+            for (k, out) in e.out.iter().enumerate() {
+                let c = U8Codes::new(out).unwrap_or_else(|| panic!("{name}: table {k} declined"));
+                tables += 1;
+                let check = |v: f32| {
+                    assert_eq!(
+                        c.lookup(v),
+                        U8Codes::code(out, v),
+                        "{name} table {k} v {v:e} ({:08x})",
+                        v.to_bits()
+                    );
+                };
+                for &v in &[
+                    f32::NAN,
+                    -f32::NAN,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    -0.0,
+                    0.0,
+                ] {
+                    check(v);
+                }
+                for v in [-1.0f32, -1e-30, 1.0, 1.000_000_1, 2.0, f32::MAX] {
+                    check(v);
+                }
+                for bits in (0..=0x3F80_0000u32).step_by(997) {
+                    check(f32::from_bits(bits));
+                }
+                // Around each step of the table (found from the entries).
+                for (j, &en) in c.table.iter().enumerate() {
+                    let low = en & 0x7F_FFFF;
+                    if low >= 1 << c.shift {
+                        continue;
+                    }
+                    let step = ((j as u32) << c.shift) + low + c.base as u32;
+                    for b in step.saturating_sub(64)..=(step + 64).min(0x3F80_0000) {
+                        check(f32::from_bits(b));
+                    }
+                }
+            }
+        }
+        assert!(tables > 0);
     }
 }
