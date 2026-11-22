@@ -1,5 +1,6 @@
 //! Colour transforms between profiles.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::color::delta_e_2000;
@@ -468,6 +469,40 @@ pub struct Transform {
     /// [`Chain::head_on_u8_points`], built by the first `f32` call whose
     /// pixels are 8-bit points.
     u8_head: OnceLock<Option<Box<[[f64; 256]]>>>,
+    /// The grid's `(cell, fraction)` for every 16-bit value
+    /// ([`Axis16`]), built once 16-bit calls have brought at least
+    /// [`AXIS16_MIN_PIXELS`] pixels (counted in `pixels16`).
+    axis16: OnceLock<Axis16>,
+    pixels16: AtomicUsize,
+}
+
+/// Pixels a 16-bit grid call needs to build [`Axis16`] (65536 axis
+/// evaluations, about what 16384 four-channel pixels spend on them).
+const AXIS16_MIN_PIXELS: usize = 16384;
+
+/// [`ClutEval::axis`] of every 16-bit sample on an axis of the device-link
+/// grid (every axis has the same point count): the cells and fractions
+/// apart, 640 KiB, so a 16-bit lookup reads its `(cell, fraction)` per
+/// channel instead of converting, dividing, clamping and truncating.
+struct Axis16 {
+    cell: Box<[u16]>,
+    frac: Box<[f64]>,
+}
+
+impl Axis16 {
+    fn new(points: usize) -> Self {
+        let (cell, frac) = (0..=u16::MAX)
+            .map(|v| {
+                let (c, f) = ClutEval::axis(points, v.to_unit());
+                // At most 4096 points per axis, so the cell fits.
+                (u16::try_from(c).unwrap_or(u16::MAX), f)
+            })
+            .unzip::<_, _, Vec<_>, Vec<_>>();
+        Self {
+            cell: cell.into_boxed_slice(),
+            frac: frac.into_boxed_slice(),
+        }
+    }
 }
 
 impl core::fmt::Debug for Transform {
@@ -576,6 +611,8 @@ impl Transform {
             chain: Arc::new(chain),
             engine,
             u8_head: OnceLock::new(),
+            axis16: OnceLock::new(),
+            pixels16: AtomicUsize::new(0),
         })
     }
 
@@ -640,7 +677,22 @@ impl Transform {
                 }
                 if let Some(s) = T::u16s(src) {
                     if let Some(d) = T::u16s_mut(dst) {
-                        run_grid_u16(g, s, d, ch, alpha);
+                        let same_axes = (1..in_ch).all(|i| g.points(i) == g.points(0));
+                        let table = match self.axis16.get() {
+                            Some(t) => Some(t),
+                            None if same_axes
+                                && self.pixels16.fetch_add(s.len() / sc, Ordering::Relaxed)
+                                    + s.len() / sc
+                                    >= AXIS16_MIN_PIXELS =>
+                            {
+                                Some(self.axis16.get_or_init(|| Axis16::new(g.points(0))))
+                            }
+                            None => None,
+                        };
+                        match table {
+                            Some(t) if same_axes => run_grid_u16_table(g, t, s, d, ch, alpha),
+                            _ => run_grid_u16(g, s, d, ch, alpha),
+                        }
                         return Ok(());
                     }
                 }
@@ -1087,6 +1139,30 @@ fn run_grid_u16(
 ) {
     if !grid_shaped(g, src, dst, ch, alpha, |points, v| {
         ClutEval::axis(points, v.to_unit())
+    }) {
+        run_grid(g, src, dst, ch, alpha);
+    }
+}
+
+/// [`run_grid_u16`] with every sample's `(cell, fraction)` read from `t`
+/// (the values the per-sample expressions give).
+fn run_grid_u16_table(
+    g: &ClutEval,
+    t: &Axis16,
+    src: &[u16],
+    dst: &mut [u16],
+    ch: (usize, usize, usize, usize),
+    alpha: (bool, bool),
+) {
+    let (Ok(cell), Ok(frac)) = (
+        <&[u16; 65536]>::try_from(&t.cell[..]),
+        <&[f64; 65536]>::try_from(&t.frac[..]),
+    ) else {
+        return run_grid_u16(g, src, dst, ch, alpha);
+    };
+    if !grid_shaped(g, src, dst, ch, alpha, |_, v| {
+        let v = usize::from(v);
+        (usize::from(cell[v]), frac[v])
     }) {
         run_grid(g, src, dst, ch, alpha);
     }
@@ -1784,6 +1860,55 @@ mod tests {
     /// The grey 8-bit output table against the engine's loop: every byte, with
     /// and without alpha on either side, one and three output channels, and
     /// the small-call path that does not build the table.
+    #[test]
+    fn axis16_table_matches_the_per_sample_grid_loop() {
+        // A 16-bit call big enough to build the table, every 16-bit value on
+        // every channel, through 4-input (17-point) and 3-input (33-point)
+        // grids, against the per-sample loop.
+        use crate::ColorSpace;
+        let srgb = Profile::new_srgb();
+        let cmyk = test_lut_profile(ColorSpace::Cmyk, 4, 0x0210_0000, (256, 256), true);
+        for (a, al, b, bl) in [
+            (&cmyk, Layout::Cmyk, &srgb, Layout::Rgb),
+            (&cmyk, Layout::Cmyka, &srgb, Layout::Rgba),
+            (&srgb, Layout::Rgb, &cmyk, Layout::Cmyk),
+        ] {
+            let t = Transform::new(a, al, b, bl, Intent::Perceptual, Options::default()).unwrap();
+            let Engine::Grid(g) = &t.engine else {
+                panic!("grid")
+            };
+            let (sc, dc) = (al.channels(), bl.channels());
+            let px = 65536 + 3;
+            let src: Vec<u16> = (0..px * sc)
+                .map(|i| ((i / sc) as u32 * (1 + 2 * (i % sc) as u32) % 65536) as u16)
+                .collect();
+            let mut got = vec![0u16; px * dc];
+            t.transform(&src, &mut got).unwrap();
+            assert!(t.axis16.get().is_some());
+            let mut want = vec![1u16; px * dc];
+            let ch = (sc, dc, al.color_channels(), bl.color_channels());
+            run_grid_u16(g, &src, &mut want, ch, (al.has_alpha(), bl.has_alpha()));
+            assert_eq!(got, want, "{al:?} {bl:?}");
+            // A small call after the table exists uses it too.
+            let mut got2 = vec![0u16; 64 * dc];
+            t.transform(&src[..64 * sc], &mut got2).unwrap();
+            assert_eq!(got2, want[..64 * dc]);
+            // Small calls build it once they add up to enough pixels.
+            let t = Transform::new(a, al, b, bl, Intent::Perceptual, Options::default()).unwrap();
+            for (k, (s, w)) in src
+                .chunks(64 * sc)
+                .zip(want.chunks(64 * dc))
+                .take(300)
+                .enumerate()
+            {
+                let mut got3 = vec![0u16; w.len()];
+                t.transform(s, &mut got3).unwrap();
+                assert_eq!(got3, w);
+                assert_eq!(t.axis16.get().is_some(), (k + 1) * 64 >= AXIS16_MIN_PIXELS);
+            }
+        }
+    }
+
     #[test]
     fn grey8_table_matches_the_shaper_loop() {
         let grey = Profile::new_gray(crate::color::D65_XY, crate::curve::Curve::gamma(1.8));
