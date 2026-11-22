@@ -474,7 +474,16 @@ pub struct Transform {
     /// [`AXIS16_MIN_PIXELS`] pixels (counted in `pixels16`).
     axis16: OnceLock<Axis16>,
     pixels16: AtomicUsize,
+    /// The grid's `(cell, fraction)` for every 8-bit value, built by the
+    /// first 8-bit call under [`AXIS8_CALL_PIXELS`] pixels and kept for
+    /// the next ones (a bigger call builds its own, as it always has).
+    axis8: OnceLock<Box<AxisTable>>,
 }
+
+/// Pixels from which an 8-bit grid call builds its own table (256 axis
+/// evaluations, under 1 instruction per pixel from here) instead of reading
+/// the transform's: a call of 64 pixels spent 60 per pixel building it.
+const AXIS8_CALL_PIXELS: usize = 4096;
 
 /// Pixels a 16-bit grid call needs to build [`Axis16`] (65536 axis
 /// evaluations, about what 16384 four-channel pixels spend on them).
@@ -613,6 +622,7 @@ impl Transform {
             u8_head: OnceLock::new(),
             axis16: OnceLock::new(),
             pixels16: AtomicUsize::new(0),
+            axis8: OnceLock::new(),
         })
     }
 
@@ -671,7 +681,11 @@ impl Transform {
                 let (ch, alpha) = ((sc, dc, in_ch, out_ch), (src_alpha, dst_alpha));
                 if let Some(s) = T::u8s(src) {
                     if let Some(d) = T::u8s_mut(dst) {
-                        run_grid_u8(g, s, d, ch, alpha);
+                        if s.len() / sc >= AXIS8_CALL_PIXELS {
+                            run_grid_u8(g, s, d, ch, alpha);
+                        } else {
+                            run_grid_u8_shared(g, &self.axis8, s, d, ch, alpha);
+                        }
                         return Ok(());
                     }
                 }
@@ -1129,6 +1143,33 @@ fn run_grid_u8(
     grid_shaped(g, src, dst, ch, alpha, |_, v| table[usize::from(v)]);
 }
 
+/// [`run_grid_u8`] for a small call: the table is the transform's, built
+/// by the first such call. In its own frame, so the loop of the big calls
+/// keeps its code (sharing a frame with a second instance of the loop cost
+/// it 1 to 5 instructions per pixel: fogu8 +0.52..2.92%).
+#[inline(never)]
+fn run_grid_u8_shared(
+    g: &ClutEval,
+    shared: &OnceLock<Box<AxisTable>>,
+    src: &[u8],
+    dst: &mut [u8],
+    ch: (usize, usize, usize, usize),
+    alpha: (bool, bool),
+) {
+    let table: &AxisTable = shared.get_or_init(|| {
+        let points = g.points(0);
+        Box::new(core::array::from_fn(|v| {
+            ClutEval::axis(points, (v as u8).to_unit())
+        }))
+    });
+    // Every other shape through `run_grid_u8` itself: a second caller of
+    // its helpers (`fixed_shape`, `run_grid`) re-rolled its loops (cgatsu8
+    // +0.41%).
+    if !grid_shaped(g, src, dst, ch, alpha, |_, v| table[usize::from(v)]) {
+        run_grid_u8(g, src, dst, ch, alpha);
+    }
+}
+
 /// The 16-bit device-link grid loop, likewise.
 fn run_grid_u16(
     g: &ClutEval,
@@ -1425,6 +1466,11 @@ mod tests {
                 run_grid_u8(&clut, &src8, &mut a8, ch, alpha);
                 run_grid(&clut, &src8, &mut b8, ch, alpha);
                 assert_eq!(a8, b8, "u8 {in_ch}->{out_ch} {alpha:?}");
+                let shared = OnceLock::new();
+                for _ in 0..2 {
+                    run_grid_u8_shared(&clut, &shared, &src8, &mut a8, ch, alpha);
+                    assert_eq!(a8, b8, "u8 shared {in_ch}->{out_ch} {alpha:?}");
+                }
                 let (mut a16, mut b16) = (vec![1u16; dc * 400], vec![2u16; dc * 400]);
                 run_grid_u16(&clut, &src16, &mut a16, ch, alpha);
                 run_grid(&clut, &src16, &mut b16, ch, alpha);
