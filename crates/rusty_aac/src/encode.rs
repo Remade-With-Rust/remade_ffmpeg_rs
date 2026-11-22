@@ -544,14 +544,14 @@ const SMR_FLAT: f64 = 0.0158; // 10^(-18/10)
 
 thread_local! {
     /// The flat signal-to-mask ratio (linear) of the frame this thread is
-    /// coding, from [`AacEncoderConfig::mask_smr_db`]: set per frame by
+    /// coding, from [`AacTuning::mask_smr_db`]: set per frame by
     /// `encode_frame` and per segment by the frame-demand pre-pass (each wholly
     /// on one worker thread), so the psy model needs no extra argument for it.
     /// [`SMR_FLAT`] (18 dB) outside an encode.
     static MASK_SMR: std::cell::Cell<f64> = const { std::cell::Cell::new(SMR_FLAT) };
 }
 
-/// [`AacEncoderConfig::mask_smr_db`] applies to streams under this rate a
+/// [`AacTuning::mask_smr_db`] applies to streams under this rate a
 /// channel; from it up the mask is the 2.1.2 18 dB. Measured (PEAQ, all
 /// low-rate tools on): 24 dB is worth +0.41 BD-ODG on stereo vocal at 48-64
 /// kbps a channel, but cost stereo vocal 0.15 ODG at 96 kbps a channel (192
@@ -1686,7 +1686,7 @@ fn section_bits(cbs: &[u8]) -> usize {
 }
 
 thread_local! {
-    /// [`AacEncoderConfig::section_trellis`] for the frame this thread is
+    /// [`AacTuning::section_trellis`] for the frame this thread is
     /// coding, set once per frame by `encode_frame` (frames code on worker
     /// threads, each frame wholly on one), so the coding kernels need no extra
     /// argument for it.
@@ -4532,6 +4532,7 @@ pub enum WindowShape {
 /// and short blocks alike, for every channel except the LFE (which has its own
 /// band limit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Bandwidth {
     /// Code the whole spectrum at every bitrate: the encoder as it shipped in
     /// 2.1.2 (byte-identical).
@@ -4597,7 +4598,7 @@ fn cutoff_line(hz: Option<u32>, sample_rate: u32, swb: &[u16], n_coeffs: usize) 
 }
 
 /// Bounds on a frame's share of its segment under
-/// [`AacEncoderConfig::frame_demand`], as multiples of the constant-rate share.
+/// [`AacTuning::frame_demand`], as multiples of the constant-rate share.
 const DEMAND_MIN_SHARE: f64 = 0.35;
 const DEMAND_MAX_SHARE: f64 = 2.5;
 
@@ -4680,6 +4681,54 @@ pub struct AacEncoderConfig {
     /// **Arm A13** — split a channel pair's bit budget by perceptual demand
     /// rather than evenly. Default `false` (byte-identical).
     pub stereo_bit_split: bool,
+}
+
+impl Default for AacEncoderConfig {
+    fn default() -> Self {
+        Self {
+            bitrate_bps: 128_000,
+            window_shape: WindowShape::Sine,
+            shape_tonality_pct: 0.5,
+            short_block_psy: false,
+            window_grouping: false,
+            tonality_smr: false,
+            tns: false,
+            // DEFAULT ON — measured wins vs the previous default, PEAQ ODG:
+            //   A9  mean +0.267, worst +0.000 (percussive +1.8, clean speech
+            //       +1.1..+2.6, exactly 0.00 on every other class)
+            //   A13 guitar stereo +1.17 @128k, piano stereo +0.22, routed by
+            //       pair correlation so wide stereo is not harmed
+            relative_transients: true,
+            pns: false,
+            intensity: false,
+            stereo_bit_split: true,
+        }
+    }
+}
+
+/// The low-rate coding tools added in 2.2: the section trellis, the
+/// high-passed transient detector, the coding bandwidth, frame-demand bit
+/// allocation and the mask SMR.
+///
+/// Kept apart from [`AacEncoderConfig`] so that config keeps the field set it
+/// had in 2.1 (a struct literal naming every field still compiles). Pass one
+/// to [`AacEncoder::with_tuning`]; [`AacEncoder::new`] uses
+/// [`AacTuning::default`], the shipping tools. [`AacTuning::legacy`] is the
+/// 2.1.2 encoder, bit for bit.
+///
+/// `#[non_exhaustive]`: build one from [`Default`] or [`AacTuning::legacy`]
+/// and set the fields you want.
+///
+/// ```
+/// use rusty_aac::{AacEncoder, AacEncoderConfig, AacTuning};
+/// let mut tuning = AacTuning::default();
+/// tuning.frame_demand = 0.0; // every frame at its constant-rate share
+/// let enc = AacEncoder::with_tuning(AacEncoderConfig::default(), tuning);
+/// assert_eq!(enc.tuning(), tuning);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct AacTuning {
     /// Coding bandwidth policy. Default [`Bandwidth::Auto`];
     /// [`Bandwidth::Full`] is the 2.1.2 encoder.
     pub bandwidth: Bandwidth,
@@ -4717,39 +4766,33 @@ pub struct AacEncoderConfig {
     pub mask_smr_db: f32,
 }
 
-impl Default for AacEncoderConfig {
+impl Default for AacTuning {
+    /// The shipping tools — measured vs 2.1.2, PEAQ BD-ODG over 6 real clips at
+    /// 64-128 kbps, each tool alone: section trellis +0.223 (every clip and
+    /// rate better), high-passed transients +0.087, frame demand 0.5 +0.031
+    /// (synthetic +0.25), bandwidth `Auto` +0.015 (synthetic noise +2.0);
+    /// together +0.291; mask SMR 24 dB +0.097 on top (stereo vocal +0.41).
     fn default() -> Self {
         Self {
-            bitrate_bps: 128_000,
-            window_shape: WindowShape::Sine,
-            shape_tonality_pct: 0.5,
-            short_block_psy: false,
-            window_grouping: false,
-            tonality_smr: false,
-            tns: false,
-            // DEFAULT ON — measured wins vs the previous default, PEAQ ODG:
-            //   A9  mean +0.267, worst +0.000 (percussive +1.8, clean speech
-            //       +1.1..+2.6, exactly 0.00 on every other class)
-            //   A13 guitar stereo +1.17 @128k, piano stereo +0.22, routed by
-            //       pair correlation so wide stereo is not harmed
-            relative_transients: true,
-            pns: false,
-            intensity: false,
-            stereo_bit_split: true,
-            // DEFAULT ON (the low-rate campaign) — measured vs 2.1.2, PEAQ
-            // BD-ODG over 6 real clips at 64-128 kbps, each tool alone:
-            //   section trellis     +0.223 (every clip and rate better)
-            //   transient highpass  +0.087 (guitar +0.21, stereo guitar +0.23)
-            //   frame demand 0.5    +0.031 (synthetic +0.25: dynamic content)
-            //   bandwidth Auto      +0.015 (synthetic noise/noisy speech +2.0)
-            // and together +0.291, no clip below +0.13.
             bandwidth: Bandwidth::Auto,
             frame_demand: 0.5,
             transient_highpass: true,
             section_trellis: true,
-            // and on top of those: mask SMR 24 dB +0.097 (stereo vocal +0.41,
-            // per channel +0.32/+0.42; piano -0.03), under 96 kbps a channel.
             mask_smr_db: 24.0,
+        }
+    }
+}
+
+impl AacTuning {
+    /// Every 2.2 tool off: the `rusty_aac` 2.1.2 encoder, bit for bit.
+    #[must_use]
+    pub const fn legacy() -> Self {
+        Self {
+            bandwidth: Bandwidth::Full,
+            frame_demand: 0.0,
+            transient_highpass: false,
+            section_trellis: false,
+            mask_smr_db: 18.0,
         }
     }
 }
@@ -4926,8 +4969,17 @@ pub struct AacEncoder {
 }
 
 impl AacEncoder {
+    /// An encoder with `config` and the shipping low-rate tools
+    /// ([`AacTuning::default`]).
     #[must_use]
     pub fn new(config: AacEncoderConfig) -> Self {
+        Self::with_tuning(config, AacTuning::default())
+    }
+
+    /// An encoder with `config` and the low-rate tools set by `tuning`
+    /// ([`AacTuning::legacy`] for the 2.1.2 encoder).
+    #[must_use]
+    pub fn with_tuning(config: AacEncoderConfig, tuning: AacTuning) -> Self {
         Self {
             sample_rate: 0,
             channels: 0,
@@ -4943,16 +4995,16 @@ impl AacEncoder {
             pns: config.pns,
             intensity: config.intensity,
             stereo_bit_split: config.stereo_bit_split,
-            bandwidth: config.bandwidth,
-            frame_demand: if config.frame_demand.is_finite() {
-                config.frame_demand.clamp(0.0, 4.0)
+            bandwidth: tuning.bandwidth,
+            frame_demand: if tuning.frame_demand.is_finite() {
+                tuning.frame_demand.clamp(0.0, 4.0)
             } else {
                 0.0
             },
-            transient_highpass: config.transient_highpass,
-            section_trellis: config.section_trellis,
-            mask_smr_db: if config.mask_smr_db.is_finite() {
-                config.mask_smr_db.clamp(6.0, 40.0)
+            transient_highpass: tuning.transient_highpass,
+            section_trellis: tuning.section_trellis,
+            mask_smr_db: if tuning.mask_smr_db.is_finite() {
+                tuning.mask_smr_db.clamp(6.0, 40.0)
             } else {
                 18.0
             },
@@ -4969,6 +5021,19 @@ impl AacEncoder {
         }
     }
 
+    /// The low-rate tools this encoder codes with (out-of-range strengths
+    /// clamped as [`with_tuning`](Self::with_tuning) applied them).
+    #[must_use]
+    pub fn tuning(&self) -> AacTuning {
+        AacTuning {
+            bandwidth: self.bandwidth,
+            frame_demand: self.frame_demand,
+            transient_highpass: self.transient_highpass,
+            section_trellis: self.section_trellis,
+            mask_smr_db: self.mask_smr_db,
+        }
+    }
+
     /// Encode as the PCM arrives instead of all at [`finish`](Self::finish):
     /// after each push, every frame whose window decisions are final (two
     /// frames behind the input) is encoded and queued for
@@ -4982,9 +5047,9 @@ impl AacEncoder {
     /// clip's, so quiet openings can switch to short blocks at slightly
     /// different frames; [`WindowShape::Auto`] codes every frame with the
     /// sine window; and every frame gets its constant-rate share of the bits
-    /// (frame-demand allocation, [`AacEncoderConfig::frame_demand`], needs a
+    /// (frame-demand allocation, [`AacTuning::frame_demand`], needs a
     /// whole reservoir segment ahead). With `relative_transients: false` and
-    /// `frame_demand: 0.0` the packets are byte-identical to the whole-clip
+    /// [`AacTuning::frame_demand`] 0 the packets are byte-identical to the whole-clip
     /// encode.
     pub fn set_streaming(&mut self, on: bool) {
         if self.total_in == 0 && !self.flushed {
@@ -5410,7 +5475,7 @@ impl AacEncoder {
         (rdb.into_bytes(), (b * FRAME_LEN) as i64)
     }
 
-    /// The mask SMR this stream codes with: [`AacEncoderConfig::mask_smr_db`]
+    /// The mask SMR this stream codes with: [`AacTuning::mask_smr_db`]
     /// for mono and stereo under [`MASK_SMR_MAX_BPS_PER_CHANNEL`]; the 2.1.2 18 dB from
     /// there up, and for 3 or more channels (no multichannel layout was
     /// measured).
@@ -5540,7 +5605,7 @@ impl AacEncoder {
     }
 
     /// One reservoir segment's frame bit targets under
-    /// [`AacEncoderConfig::frame_demand`] (indexed from `seg.start`), and each
+    /// [`AacTuning::frame_demand`] (indexed from `seg.start`), and each
     /// frame's per-channel sine-window long spectrum the demand was measured
     /// on, for `encode_frame` to reuse where it codes a frame with that very
     /// window. `None` (every frame its constant-rate share) when the knob is
@@ -8405,8 +8470,8 @@ mod fidelity_129 {
 mod lowrate {
     use super::*;
 
-    fn encode(pcm: &[f32], ch: u16, sr: u32, cfg: AacEncoderConfig) -> Vec<Vec<u8>> {
-        let mut e = AacEncoder::new(cfg);
+    fn encode(pcm: &[f32], ch: u16, sr: u32, cfg: (AacEncoderConfig, AacTuning)) -> Vec<Vec<u8>> {
+        let mut e = AacEncoder::with_tuning(cfg.0, cfg.1);
         e.push_pcm(pcm, ch, sr).unwrap();
         e.finish();
         let mut out = Vec::new();
@@ -8627,24 +8692,17 @@ mod lowrate {
         let sr = 44_100u32;
         let st = music(sr, 40);
         let mono: Vec<f32> = st.iter().step_by(2).copied().collect();
-        let all = AacEncoderConfig {
+        let cfg = AacEncoderConfig {
             bitrate_bps: 64_000,
+            ..Default::default()
+        };
+        let tools = AacTuning {
             bandwidth: Bandwidth::Hz(17_000),
-            frame_demand: 0.5,
-            section_trellis: true,
-            transient_highpass: true,
-            ..Default::default()
+            ..AacTuning::default()
         };
+        let all = (cfg, tools);
         // The 2.1.2 encoder: every tool of this campaign off.
-        let plain = AacEncoderConfig {
-            bitrate_bps: 64_000,
-            bandwidth: Bandwidth::Full,
-            frame_demand: 0.0,
-            section_trellis: false,
-            transient_highpass: false,
-            mask_smr_db: 18.0,
-            ..Default::default()
-        };
+        let plain = (cfg, AacTuning::legacy());
         for (pcm, ch) in [(&st, 2u16), (&mono, 1)] {
             let base = encode(pcm, ch, sr, plain);
             let on = encode(pcm, ch, sr, all);
@@ -8667,7 +8725,7 @@ mod lowrate {
             );
             // Streaming: frame demand needs the whole segment and falls back
             // to the constant-rate share; everything else applies.
-            let mut e = AacEncoder::new(all);
+            let mut e = AacEncoder::with_tuning(all.0, all.1);
             e.set_streaming(true);
             e.push_pcm(pcm, ch, sr).unwrap();
             e.finish();
