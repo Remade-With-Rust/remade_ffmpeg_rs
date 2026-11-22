@@ -2762,7 +2762,54 @@ fn assign_sequences(transient: &[bool]) -> Vec<WindowSequence> {
 /// Cheapest codebook (and its bit cost) for one SFB across all short windows of a
 /// single group, matched to how the decoder reads it (per-SFB codebook, per-window
 /// coefficients).
+///
+/// The same one-walk pricing as [`best_codebook_for_band`], accumulated over the
+/// group's windows; [`best_codebook_short_ref`], the per-book search it
+/// replaced, is the test oracle.
 fn best_codebook_short(
+    quant: &[i32],
+    swb: &[u16],
+    sfb: usize,
+    win0: usize,
+    nwin: usize,
+) -> (u8, usize) {
+    let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+    let band = |win: usize| &quant[win * SHORT_HALF + s..win * SHORT_HALF + e];
+    let wins = win0..win0 + nwin;
+    if (e - s) % 2 != 0 {
+        // No book can code an odd band (cold: every AAC band width is a
+        // multiple of 4).
+        return if wins.clone().all(|w| band(w).iter().all(|&v| v == 0)) {
+            (ZERO_HCB, 0)
+        } else {
+            (ESC_HCB, usize::MAX)
+        };
+    }
+    let t = cost_tables();
+    let mut cost = BandCost::default();
+    for win in wins.clone() {
+        cost.add2(t, band(win));
+    }
+    if cost.maxq == 0 {
+        return (ZERO_HCB, 0);
+    }
+    if cost.maxq <= 2 && (e - s) % 4 == 0 {
+        for win in wins.clone() {
+            cost.add4(t, band(win));
+        }
+    }
+    if cost.maxq >= 16 {
+        for win in wins {
+            cost.add_esc(band(win));
+        }
+    }
+    cost.best(e - s)
+}
+
+/// The per-book search [`best_codebook_short`] replaced: the oracle its tests
+/// compare against.
+#[cfg(test)]
+fn best_codebook_short_ref(
     quant: &[i32],
     swb: &[u16],
     sfb: usize,
@@ -5348,6 +5395,32 @@ mod tests {
                     best_codebook_for_band_ref(&band, 0, width),
                     "width {width} band {band:?}"
                 );
+            }
+        }
+    }
+
+    /// The short-window search over a group of windows (each window's band at its
+    /// own `SHORT_HALF` stride) against the per-book search it replaced.
+    #[test]
+    fn short_codebook_cost_matches_per_book_search() {
+        let mut seed = 0x5407_u64;
+        // Long-window and short-window band edges, plus a non-4-aligned and an
+        // odd band, so the dim-4 and no-book cases are reached too.
+        let swb: [u16; 10] = [0, 4, 8, 16, 28, 44, 60, 66, 69, 128];
+        for _ in 0..3000 {
+            let mut quant = vec![0i32; FRAME_LEN];
+            for w in 0..8 {
+                let band = random_band(&mut seed, SHORT_HALF);
+                quant[w * SHORT_HALF..(w + 1) * SHORT_HALF].copy_from_slice(&band);
+            }
+            for sfb in 0..swb.len() - 1 {
+                for (w0, nwin) in [(0, 8), (0, 1), (2, 3), (5, 3), (7, 1)] {
+                    assert_eq!(
+                        best_codebook_short(&quant, &swb, sfb, w0, nwin),
+                        best_codebook_short_ref(&quant, &swb, sfb, w0, nwin),
+                        "sfb {sfb} windows {w0}+{nwin}"
+                    );
+                }
             }
         }
     }
