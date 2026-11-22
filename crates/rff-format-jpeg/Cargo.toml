@@ -1,6 +1,6 @@
 [package]
 name = "rff-format-jpeg"
-description = "Remade FFmpeg (Rust): JPEG single-image container (file = codec stream)."
+description = "Remade FFmpeg (Rust): JPEG image container (file = codec stream) and JPEG Multi-Picture Format (MPF: Ultra HDR gain maps, .mpo) demux/mux."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

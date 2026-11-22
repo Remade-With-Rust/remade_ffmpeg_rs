@@ -8,8 +8,44 @@ The **JPEG** single-image container for **remade_ffmpeg_rs** — for still image
 the file *is* the codec stream, and this crate models that.
 
 - **Demux + mux** — a one-stream, one-packet container wrapping the whole file.
+- **JPEG Multi-Picture Format (MPF)** — demux and mux, our equivalent of
+  FFmpeg 9.1's `jpeg_mpf` (see below).
 - Pairs with [`rff-codec-jpeg`](https://crates.io/crates/rff-codec-jpeg).
-- Pure Rust, no C/FFI.
+- Pure Rust, no C/FFI, `#![forbid(unsafe_code)]`.
+
+## JPEG Multi-Picture Format
+
+MPF (CIPA DC-007) stores several JPEG images in one file: an `APP2` `MPF\0`
+index in the first image lists the others, appended after its `EOI`. It is
+what HDR gain-map photos (Ultra HDR / ISO 21496-1: an SDR image plus a
+gain-map JPEG), stereo `.mpo` pairs and camera previews are made of.
+
+- **Demux** — one stream per image, in index order, each one packet holding
+  that image's bytes exactly (FFmpeg 9.1's stream layout). Stream metadata
+  names the image: `mpf_type` (`primary`, `gain_map`, `disparity`,
+  `multi_angle`, `panorama`, `large_thumbnail_vga`, ..., `undefined`),
+  `mpf_type_code`, `mpf_entry`, `mpf_flags`, `mpf_source`. Big- and
+  little-endian indexes are read; every offset and size is bounds-checked.
+- **Mux** — `-f jpeg_mpf` (or a `.mpo` name) writes N JPEG streams as one MPF
+  file, laid out byte for byte as FFmpeg 9.1's muxer writes it. Stream 0 is
+  the primary image; an image carrying ISO 21496-1 metadata becomes its gain
+  map (with the Ultra HDR segments FFmpeg adds to the primary); an `mpf_type`
+  stream tag picks any other type, so an MPF remux keeps its types.
+- **Without an index** — when a JPEG has no usable MP Index but whole JPEGs
+  follow its `EOI`, each becomes a stream of its own (`mpf_source=trailing`).
+  FFmpeg reads such a file as one image; anything after the `EOI` that is not
+  a JPEG (a motion photo's MP4) still stays part of the one image.
+
+```sh
+rff -i photo.jpg -map 0:1 gainmap.jpg      # extract the second image (stream copy)
+rff -i left.jpg -i right.jpg -map 0 -map 1 -f jpeg_mpf pair.jpg
+rffprobe photo.jpg                          # streams + their mpf_type
+```
+
+`rff` stream-copies the extracted image (byte-identical); FFmpeg re-encodes it
+unless given `-c copy`. The index parser and writer are the `mpf` module: no
+I/O, `core` + `alloc` only. Reading or applying the gain-map metadata itself
+is out of scope.
 
 ## Usage
 

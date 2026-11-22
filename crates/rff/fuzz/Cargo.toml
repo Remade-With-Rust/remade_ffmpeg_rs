@@ -6,6 +6,7 @@
 #   cargo install cargo-fuzz
 #   cargo +nightly fuzz run demux            # fuzz the demuxers
 #   cargo +nightly fuzz run decode           # fuzz the decoders
+#   cargo +nightly fuzz run mpf              # fuzz the JPEG MPF index
 #   cargo +nightly fuzz run decode -- -runs=100000   # bounded run (CI)
 [package]
 name = "rff-fuzz"
@@ -22,10 +23,18 @@ libfuzzer-sys = "0.4"
 # crates.io); its library, and so this dependency's name, is still `rff`.
 rff = { path = "..", package = "remade-ffmpeg" }
 rff-core = { path = "../../rff-core" }
+rff-format-jpeg = { path = "../../rff-format-jpeg" }
 
 [[bin]]
 name = "demux"
 path = "fuzz_targets/demux.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mpf"
+path = "fuzz_targets/mpf.rs"
 test = false
 doc = false
 bench = false
