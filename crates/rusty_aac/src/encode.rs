@@ -1351,11 +1351,221 @@ impl Xpow {
     }
 }
 
+/// Codeword lengths of every spectral codebook, packed so ONE walk over a band
+/// prices all eleven books at once (`codec-eliminate-redundancy` move #4).
+///
+/// The books come in pairs that share a tuple index (1/2, 3/4, 5/6, 7/8, 9/10:
+/// same `dim`, `lav` and signedness, different code lengths), and every
+/// unsigned dim-2 book (7..=11) can be indexed by the magnitudes clamped to 16.
+/// So per tuple one index and one or two table loads add every eligible book's
+/// codeword length into 16-bit lanes of an integer accumulator. A lane can hold
+/// any band: the longest codeword is 19 bits and a call sees at most 1024 tuples
+/// (19 456 < 65 536), so lanes never carry into each other.
+///
+/// A book whose `lav` cannot hold a tuple stores 0 in its lane there; such a book
+/// is never consulted, because a band is only priced with books whose `lav`
+/// covers the band's peak.
+struct CostTables {
+    /// Books 1 | 2 << 16 at the signed dim-4 index `27a + 9b + 3c + d + 40`.
+    s12: [u32; 81],
+    /// Books 3 | 4 << 16 at the unsigned dim-4 index `27|a| + 9|b| + 3|c| + |d|`.
+    u34: [u32; 81],
+    /// Books 5 | 6 << 16 at the signed dim-2 index `9a + b + 40`.
+    s56: [u32; 81],
+    /// Books 7 | 8 << 16 | 9 << 32 | 10 << 48 at `17 min(|a|,16) + min(|b|,16)`.
+    u7_10: [u64; 289],
+    /// Book 11 at the same index.
+    u11: [u32; 289],
+}
+
+fn cost_tables() -> &'static CostTables {
+    static T: OnceLock<CostTables> = OnceLock::new();
+    T.get_or_init(|| {
+        let len = |cb: u8, tuple: &[i32]| -> u64 {
+            tuple_index(&CODEBOOKS[cb as usize], tuple)
+                .map_or(0, |i| u64::from(spectral_book(cb).code(i as usize).1))
+        };
+        let mut t = CostTables {
+            s12: [0; 81],
+            u34: [0; 81],
+            s56: [0; 81],
+            u7_10: [0; 289],
+            u11: [0; 289],
+        };
+        for i in 0..81i32 {
+            let d = [i / 27, i / 9 % 3, i / 3 % 3, i % 3];
+            let signed = d.map(|x| x - 1);
+            t.s12[i as usize] = (len(1, &signed) | len(2, &signed) << 16) as u32;
+            t.u34[i as usize] = (len(3, &d) | len(4, &d) << 16) as u32;
+            let pair = [i / 9 - 4, i % 9 - 4];
+            t.s56[i as usize] = (len(5, &pair) | len(6, &pair) << 16) as u32;
+        }
+        for i in 0..289i32 {
+            let pair = [i / 17, i % 17];
+            t.u7_10[i as usize] =
+                len(7, &pair) | len(8, &pair) << 16 | len(9, &pair) << 32 | len(10, &pair) << 48;
+            t.u11[i as usize] = len(11, &pair) as u32;
+        }
+        t
+    })
+}
+
+/// Every book's bit cost over the tuples added so far ([`CostTables`] lanes,
+/// plus the sign bits every unsigned book pays and book 11's escapes), and the
+/// peak magnitude that decides which books may code the band.
+#[derive(Default)]
+struct BandCost {
+    a12: u32,
+    a34: u32,
+    a56: u32,
+    a7_10: u64,
+    a11: u32,
+    /// Non-zero coefficients: one sign bit each in every unsigned book.
+    nz: u32,
+    /// Book 11's escape sequences.
+    esc: u32,
+    /// The largest magnitude seen.
+    maxq: u32,
+}
+
+impl BandCost {
+    /// The dim-2 books over `q` (an even number of coefficients), and the peak.
+    ///
+    /// Books 5/6 are indexed by the values clamped to their `lav` so the index is
+    /// always in range; where a value exceeds 4 the lane is never read (the band's
+    /// peak then rules books 5/6 out), so the clamp changes no cost that is used.
+    #[inline(always)]
+    fn add2(&mut self, t: &CostTables, q: &[i32]) {
+        for p in q.chunks_exact(2) {
+            let (a, b) = (p[0].unsigned_abs(), p[1].unsigned_abs());
+            self.maxq = self.maxq.max(a).max(b);
+            self.a56 += t.s56[(9 * p[0].clamp(-4, 4) + p[1].clamp(-4, 4) + 40) as usize];
+            let i = (17 * a.min(16) + b.min(16)) as usize;
+            self.a7_10 += t.u7_10[i];
+            self.a11 += t.u11[i];
+            self.nz += u32::from(a != 0) + u32::from(b != 0);
+        }
+    }
+
+    /// The dim-4 books over `q` (a multiple of 4 coefficients), only valid once
+    /// the peak is known to be at most 2 (book 1/2 lanes only at most 1).
+    #[inline(always)]
+    fn add4(&mut self, t: &CostTables, q: &[i32]) {
+        let books12 = self.maxq <= 1;
+        for c in q.chunks_exact(4) {
+            if books12 {
+                let i = 27 * c[0] + 9 * c[1] + 3 * c[2] + c[3] + 40;
+                self.a12 += t.s12[i as usize];
+            }
+            let u = 27 * c[0].unsigned_abs()
+                + 9 * c[1].unsigned_abs()
+                + 3 * c[2].unsigned_abs()
+                + c[3].unsigned_abs();
+            self.a34 += t.u34[u as usize];
+        }
+    }
+
+    /// Book 11's escape sequences over `q` (magnitudes of 16 and up).
+    #[cold]
+    fn add_esc(&mut self, q: &[i32]) {
+        for &c in q {
+            let m = c.unsigned_abs();
+            if m >= 16 {
+                self.esc += escape_bits(m) as u32;
+            }
+        }
+    }
+
+    /// The cheapest eligible book for a band of `width` coefficients per window,
+    /// and its bits: books tried in order 1..=11, a later book winning only when
+    /// strictly cheaper (the per-book search's tie-break). Eligible are the books
+    /// whose `lav` holds the peak (the `lav`s rise with the book number, so they
+    /// are a suffix) and whose `dim` divides the width.
+    fn best(&self, width: usize) -> (u8, usize) {
+        let lane = |v: u64, k: u32| (v >> (16 * k)) & 0xffff;
+        let nz = u64::from(self.nz);
+        let (a12, a34, a56) = (
+            u64::from(self.a12),
+            u64::from(self.a34),
+            u64::from(self.a56),
+        );
+        let cost: [u64; 12] = [
+            0,
+            lane(a12, 0),
+            lane(a12, 1),
+            lane(a34, 0) + nz,
+            lane(a34, 1) + nz,
+            lane(a56, 0),
+            lane(a56, 1),
+            lane(self.a7_10, 0) + nz,
+            lane(self.a7_10, 1) + nz,
+            lane(self.a7_10, 2) + nz,
+            lane(self.a7_10, 3) + nz,
+            u64::from(self.a11) + nz + u64::from(self.esc),
+        ];
+        let mut first = match self.maxq {
+            1 => 1,
+            2 => 3,
+            3 | 4 => 5,
+            5..=7 => 7,
+            8..=12 => 9,
+            _ => 11,
+        };
+        if width % 4 != 0 {
+            first = first.max(5);
+        }
+        let mut best = (ESC_HCB, usize::MAX);
+        if width % 2 != 0 {
+            return best;
+        }
+        for (cb, &bits) in cost.iter().enumerate().skip(first) {
+            if (bits as usize) < best.1 {
+                best = (cb as u8, bits as usize);
+            }
+        }
+        best
+    }
+}
+
 /// The cheapest representable spectral codebook for one SFB's coefficients, and
 /// its bit cost. ZERO for a silent band; dim-4 books only for 4-aligned bands.
 /// Books whose LAV can't hold the band's peak are skipped up front (only the
 /// escape book covers arbitrarily large values).
+///
+/// One walk prices every book ([`BandCost`]). The per-book search it replaced
+/// ([`best_codebook_for_band_ref`], kept as the test oracle) re-walked the band
+/// once per candidate book through an out-of-line [`spectral_bits`] per tuple,
+/// and was 75% of all encoder instructions.
 fn best_codebook_for_band(quant: &[i32], s: usize, e: usize) -> (u8, usize) {
+    let q = &quant[s..e];
+    if q.len() % 2 != 0 {
+        // No book can code an odd band; only its silence matters (cold: every
+        // AAC band width is a multiple of 4).
+        return if q.iter().all(|&v| v == 0) {
+            (ZERO_HCB, 0)
+        } else {
+            (ESC_HCB, usize::MAX)
+        };
+    }
+    let t = cost_tables();
+    let mut cost = BandCost::default();
+    cost.add2(t, q);
+    if cost.maxq == 0 {
+        return (ZERO_HCB, 0);
+    }
+    if cost.maxq <= 2 && q.len() % 4 == 0 {
+        cost.add4(t, q);
+    }
+    if cost.maxq >= 16 {
+        cost.add_esc(q);
+    }
+    cost.best(q.len())
+}
+
+/// The per-book search [`best_codebook_for_band`] replaced: the oracle its tests
+/// compare against.
+#[cfg(test)]
+fn best_codebook_for_band_ref(quant: &[i32], s: usize, e: usize) -> (u8, usize) {
     let maxq = quant[s..e]
         .iter()
         .map(|&q| q.unsigned_abs())
@@ -5095,6 +5305,53 @@ mod tests {
     /// the AVX2/scalar `min(round(v), MAX)`. The intrinsics can't run on a non-AVX-512
     /// host, but the identity they rely on — for the quantizer's always-nonnegative
     /// input — is checkable in scalar, so the untested path's *math* is pinned here.
+    /// A small deterministic generator for the codebook-cost oracle tests: bands
+    /// whose peak lands in every book tier (0, 1, 2, 3-4, 5-7, 8-12, 13-15, the
+    /// escape range up to `MAX_QUANT`), mixed with zeros, at every width the
+    /// tables use plus odd and non-4-aligned ones.
+    fn random_band(seed: &mut u64, width: usize) -> Vec<i32> {
+        let mut next = || {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*seed >> 33) as u32
+        };
+        let peak = [0u32, 1, 2, 4, 7, 12, 15, 16, 40, 300, MAX_QUANT as u32][next() as usize % 11];
+        (0..width)
+            .map(|_| {
+                let r = next();
+                if r % 3 == 0 || peak == 0 {
+                    0
+                } else {
+                    let m = (r >> 2) % (peak + 1);
+                    if r & 2 == 0 {
+                        m as i32
+                    } else {
+                        -(m as i32)
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// The walk-once codebook cost must pick the same book at the same bit count
+    /// as the per-book search it replaced, for long bands and for short-window
+    /// groups.
+    #[test]
+    fn codebook_cost_matches_per_book_search() {
+        let mut seed = 0x5eed_u64;
+        for width in [2usize, 4, 6, 8, 12, 16, 20, 28, 32, 48, 64, 96, 3] {
+            for _ in 0..4000 {
+                let band = random_band(&mut seed, width);
+                assert_eq!(
+                    best_codebook_for_band(&band, 0, width),
+                    best_codebook_for_band_ref(&band, 0, width),
+                    "width {width} band {band:?}"
+                );
+            }
+        }
+    }
+
     /// The quantize twins must equal the scalar oracle exactly — including at the
     /// adversarial rounding points (the double just below each `k + 0.5`, where
     /// `v + 0.5` rounds UP in f64 and a naive `floor(v + 0.5)` overshoots), at the
