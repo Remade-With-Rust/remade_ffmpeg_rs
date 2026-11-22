@@ -4025,6 +4025,37 @@ fn cutoff_line(hz: Option<u32>, sample_rate: u32, swb: &[u16], n_coeffs: usize) 
         .unwrap_or(usize::MAX)
 }
 
+/// Bounds on a frame's share of its segment under
+/// [`AacEncoderConfig::frame_demand`], as multiples of the constant-rate share.
+const DEMAND_MIN_SHARE: f64 = 0.35;
+const DEMAND_MAX_SHARE: f64 = 2.5;
+
+/// Per-frame weights (multiples of the constant-rate share, mean 1) from the
+/// frames' perceptual entropies `pe`: `(pe / mean)^alpha`, clamped to
+/// [`DEMAND_MIN_SHARE`, `DEMAND_MAX_SHARE`] and renormalised to mean 1.
+fn frame_demand_weights(pe: &[f64], alpha: f64) -> Vec<f64> {
+    let n = pe.len().max(1) as f64;
+    let mean = pe.iter().sum::<f64>() / n;
+    if mean <= 0.0 || alpha <= 0.0 {
+        return vec![1.0; pe.len()];
+    }
+    let mut w: Vec<f64> = pe
+        .iter()
+        .map(|&p| (p.max(0.0) / mean).powf(alpha))
+        .collect();
+    for _ in 0..4 {
+        let m = w.iter().sum::<f64>() / n;
+        if m <= 0.0 {
+            return vec![1.0; pe.len()];
+        }
+        for x in &mut w {
+            *x = (*x / m).clamp(DEMAND_MIN_SHARE, DEMAND_MAX_SHARE);
+        }
+    }
+    let m = w.iter().sum::<f64>() / n;
+    w.iter().map(|x| x / m).collect()
+}
+
 /// Zero every line at or above `cut` in each of `nwin` windows of `wlen` lines.
 fn band_limit(spec: &mut [f32], cut: usize, wlen: usize) {
     if cut >= wlen {
@@ -4081,6 +4112,14 @@ pub struct AacEncoderConfig {
     /// Coding bandwidth policy. Default [`Bandwidth::Full`], the 2.1.2
     /// encoder (byte-identical).
     pub bandwidth: Bandwidth,
+    /// Inter-frame bit allocation strength: each frame of a 32-frame
+    /// reservoir segment gets the segment's bits in proportion to its
+    /// perceptual entropy raised to this power (clamped to 0.35-2.5 times the
+    /// constant-rate share), so the segment, and the stream, keep their rate.
+    /// Default `0.0`: every frame the constant-rate share, the 2.1.2 encoder
+    /// (byte-identical). Whole-clip encodes only: a streaming encode always
+    /// uses the constant-rate share.
+    pub frame_demand: f32,
     /// Run the level-invariant transient detector (arm A9) on a high-passed
     /// signal (second difference, +12 dB/octave). A plucked or struck note
     /// whose attack lives in its high frequencies, over a sustained body that
@@ -4116,6 +4155,7 @@ impl Default for AacEncoderConfig {
             intensity: false,
             stereo_bit_split: true,
             bandwidth: Bandwidth::Full,
+            frame_demand: 0.0,
             transient_highpass: false,
             section_trellis: false,
         }
@@ -4270,6 +4310,7 @@ pub struct AacEncoder {
     intensity: bool,
     stereo_bit_split: bool,
     bandwidth: Bandwidth,
+    frame_demand: f32,
     transient_highpass: bool,
     section_trellis: bool,
     win: Vec<f32>,
@@ -4310,6 +4351,11 @@ impl AacEncoder {
             intensity: config.intensity,
             stereo_bit_split: config.stereo_bit_split,
             bandwidth: config.bandwidth,
+            frame_demand: if config.frame_demand.is_finite() {
+                config.frame_demand.clamp(0.0, 4.0)
+            } else {
+                0.0
+            },
             transient_highpass: config.transient_highpass,
             section_trellis: config.section_trellis,
             win: Vec::new(),
@@ -4336,9 +4382,12 @@ impl AacEncoder {
     /// the level-invariant transient detector (on by default) floors its
     /// running average at the mean energy seen so far rather than the whole
     /// clip's, so quiet openings can switch to short blocks at slightly
-    /// different frames; and [`WindowShape::Auto`] codes every frame with the
-    /// sine window. With `relative_transients: false` the packets are
-    /// byte-identical to the whole-clip encode.
+    /// different frames; [`WindowShape::Auto`] codes every frame with the
+    /// sine window; and every frame gets its constant-rate share of the bits
+    /// (frame-demand allocation, [`AacEncoderConfig::frame_demand`], needs a
+    /// whole reservoir segment ahead). With `relative_transients: false` and
+    /// `frame_demand: 0.0` the packets are byte-identical to the whole-clip
+    /// encode.
     pub fn set_streaming(&mut self, on: bool) {
         if self.total_in == 0 && !self.flushed {
             self.streaming = on;
@@ -4514,6 +4563,7 @@ impl AacEncoder {
         shapes: &[bool],
         frame_budget: usize,
         plan: &[Elem],
+        pre: Option<&[Option<Vec<f32>>]>,
     ) -> (Vec<u8>, i64) {
         // Per-channel ICS-body budget: the frame less END (3 bits), split
         // evenly, less each element's own header (7). Never above the decoder
@@ -4539,6 +4589,15 @@ impl AacEncoder {
             shapes.get(b - 1).copied().unwrap_or(false)
         };
         let short_win: &[f32] = if cur_kbd { kbd_s } else { sine_s };
+        // The demand pre-pass's spectrum of channel `ch` (sine window, band
+        // limited), when this frame codes it with exactly that window.
+        let cached = |ch: usize, seq: WindowSequence| -> Option<Vec<f32>> {
+            if seq == WindowSequence::OnlyLong && !prev_kbd && !cur_kbd {
+                pre.and_then(|p| p.get(ch).cloned().flatten())
+            } else {
+                None
+            }
+        };
         SECTION_TRELLIS.with(|c| c.set(self.section_trellis));
         let bw_hz = self.bandwidth_hz();
         let cut_long = cutoff_line(bw_hz, self.sample_rate, swb, FRAME_LEN);
@@ -4596,10 +4655,13 @@ impl AacEncoder {
                             sine_s,
                             kbd_s,
                         );
-                        let mut sl = analyze_long(&p0, &c0, &win);
-                        let mut sr_ = analyze_long(&p1, &c1, &win);
-                        band_limit(&mut sl, cut_long, FRAME_LEN);
-                        band_limit(&mut sr_, cut_long, FRAME_LEN);
+                        let fresh = |p: &[f32; FRAME_LEN], c: &[f32; FRAME_LEN]| {
+                            let mut x = analyze_long(p, c, &win);
+                            band_limit(&mut x, cut_long, FRAME_LEN);
+                            x
+                        };
+                        let sl = cached(l, seq).unwrap_or_else(|| fresh(&p0, &c0));
+                        let sr_ = cached(r, seq).unwrap_or_else(|| fresh(&p1, &c1));
                         encode_cpe(
                             w,
                             tag,
@@ -4640,7 +4702,10 @@ impl AacEncoder {
                             sine_s,
                             kbd_s,
                         );
-                        let mut spec = analyze_long(&p, &c, &win);
+                        let mut spec = match (elem, cached(ch, seq)) {
+                            (Elem::Sce(_), Some(x)) => x,
+                            _ => analyze_long(&p, &c, &win),
+                        };
                         if matches!(elem, Elem::Lfe(_)) {
                             lfe_band_limit(&mut spec);
                         } else {
@@ -4862,6 +4927,87 @@ impl AacEncoder {
         ((b + 1) * per / sr - b * per / sr) as usize
     }
 
+    /// One reservoir segment's frame bit targets under
+    /// [`AacEncoderConfig::frame_demand`] (indexed from `seg.start`), and each
+    /// frame's per-channel sine-window long spectrum the demand was measured
+    /// on, for `encode_frame` to reuse where it codes a frame with that very
+    /// window. `None` (every frame its constant-rate share) when the knob is
+    /// off.
+    ///
+    /// The targets sum to the segment's constant-rate bits, so a segment still
+    /// encodes alone and the stream's rate is unchanged.
+    #[allow(clippy::type_complexity)]
+    fn segment_demand(
+        &self,
+        seg: std::ops::Range<usize>,
+        swb: &[u16],
+        plan: &[Elem],
+    ) -> Option<(Vec<usize>, Vec<Vec<Option<Vec<f32>>>>)> {
+        if self.frame_demand <= 0.0 {
+            return None;
+        }
+        let cut = cutoff_line(self.bandwidth_hz(), self.sample_rate, swb, FRAME_LEN);
+        let cap = (MAX_CHANNEL_BITS + 7) * self.channels;
+        let means: Vec<usize> = seg.clone().map(|b| self.frame_bits(b)).collect();
+        let (pe, specs): (Vec<f64>, Vec<_>) = seg.map(|b| self.frame_pe(b, swb, plan, cut)).unzip();
+        let w = frame_demand_weights(&pe, f64::from(self.frame_demand));
+        let targets = means
+            .iter()
+            .zip(&w)
+            .map(|(&m, &w)| ((m as f64 * w).round() as usize).min(cap))
+            .collect();
+        Some((targets, specs))
+    }
+
+    /// Perceptual entropy of frame `b`, summed over every channel but the LFE:
+    /// `sum_b n_b * 0.5 * log2(1 + E_b / thr_b)` on a sine-window long MDCT of
+    /// the frame, against the long-block mask (flat SMR, threshold in quiet),
+    /// within the coding bandwidth. A demand estimate only: it is computed
+    /// the same way whatever window sequence the frame is coded with.
+    /// Also returns each channel's spectrum (LFE: `None`).
+    fn frame_pe(
+        &self,
+        b: usize,
+        swb: &[u16],
+        plan: &[Elem],
+        cut: usize,
+    ) -> (f64, Vec<Option<Vec<f32>>>) {
+        let num_swb = swb.len() - 1;
+        let mut specs = vec![None; self.channels];
+        let chans = plan.iter().flat_map(|e| match *e {
+            Elem::Cpe(l, r) => vec![l, r],
+            Elem::Sce(c) => vec![c],
+            Elem::Lfe(_) => vec![],
+        });
+        let mut pe = 0.0;
+        for ch in chans {
+            let prev = if b == 0 {
+                std::borrow::Cow::Owned([0f32; FRAME_LEN])
+            } else {
+                self.block_cow(ch, b - 1)
+            };
+            let mut spec = analyze_long(&prev, &self.block_cow(ch, b), &self.win);
+            band_limit(&mut spec, cut, FRAME_LEN);
+            let energy: Vec<f64> = (0..num_swb)
+                .map(|i| {
+                    let (s, e) = (usize::from(swb[i]), usize::from(swb[i + 1]));
+                    spec[s..e]
+                        .iter()
+                        .map(|&x| f64::from(x).powi(2))
+                        .sum::<f64>()
+                        + 1e-3
+                })
+                .collect();
+            let thr = masking_from_energy(&energy, swb, self.sample_rate, FRAME_LEN, None);
+            for i in 0..num_swb {
+                let n = f64::from(swb[i + 1] - swb[i]);
+                pe += n * 0.5 * (1.0 + energy[i] / thr[i].max(1e-30)).log2();
+            }
+            specs[ch] = Some(spec);
+        }
+        (pe, specs)
+    }
+
     /// Sub-block energies of frame `f` of channel `ch`, zero past the input.
     /// With `highpass`, of the high-passed signal (see [`sub_block_energy`]);
     /// its first two samples need the previous block, which is still held
@@ -4968,6 +5114,7 @@ impl AacEncoder {
                 let budget = reservoir.budget(b, mean, self.channels);
                 let au = self.encode_frame(
                     b, t.swb, t.swb_s, &t.sine_s, &t.kbd_s, &st.seqs, &st.shapes, budget, &t.plan,
+                    None,
                 );
                 reservoir.spend(mean, au.0.len() * 8, self.channels);
                 au
@@ -5038,16 +5185,26 @@ impl AacEncoder {
         // encodes the same alone as in sequence).
         let frames = |range: std::ops::Range<usize>| {
             let mut reservoir = Reservoir::default();
-            range
-                .map(|b| {
-                    let mean = self.frame_bits(b);
+            let mut out = Vec::with_capacity(range.len());
+            let mut s = range.start;
+            while s < range.end {
+                let e = ((s / RESERVOIR_SEGMENT + 1) * RESERVOIR_SEGMENT).min(range.end);
+                let seg = self.segment_demand(s..e, swb, plan);
+                for b in s..e {
+                    let (mean, pre) = match &seg {
+                        Some((t, sp)) => (t[b - s], Some(&sp[b - s][..])),
+                        None => (self.frame_bits(b), None),
+                    };
                     let budget = reservoir.budget(b, mean, self.channels);
-                    let au =
-                        self.encode_frame(b, swb, swb_s, sine_s, kbd_s, seqs, shapes, budget, plan);
+                    let au = self.encode_frame(
+                        b, swb, swb_s, sine_s, kbd_s, seqs, shapes, budget, plan, pre,
+                    );
                     reservoir.spend(mean, au.0.len() * 8, self.channels);
-                    au
-                })
-                .collect::<Vec<_>>()
+                    out.push(au);
+                }
+                s = e;
+            }
+            out
         };
 
         let segments = nblocks.div_ceil(RESERVOIR_SEGMENT);
@@ -7513,6 +7670,34 @@ mod lowrate {
         let zero = [true, false, true, false, true, false, false];
         let got = zero_band_sf(&cbs, &sf, |i| zero[i]);
         assert_eq!(got, vec![99, 99, 140, 110, 110, 40, 112]);
+    }
+
+    /// Frame-demand weights keep the segment mean, honour their bounds, and
+    /// are flat at strength 0.
+    #[test]
+    fn demand_weights_preserve_the_segment_rate() {
+        let pe: Vec<f64> = (0..32)
+            .map(|i| {
+                if i % 7 == 0 {
+                    9000.0
+                } else {
+                    100.0 + 30.0 * f64::from(i)
+                }
+            })
+            .collect();
+        for alpha in [0.0, 0.5, 1.0, 2.0] {
+            let w = frame_demand_weights(&pe, alpha);
+            let m = w.iter().sum::<f64>() / w.len() as f64;
+            assert!((m - 1.0).abs() < 1e-9, "alpha {alpha}: mean {m}");
+            if alpha == 0.0 {
+                assert!(w.iter().all(|&x| x == 1.0));
+            }
+            assert!(
+                w.iter().all(|&x| x > 0.2 && x < 3.0),
+                "alpha {alpha}: {w:?}"
+            );
+        }
+        assert_eq!(frame_demand_weights(&[0.0; 4], 1.0), vec![1.0; 4]);
     }
 
     /// The automatic cutoff applies under 192 kbps and 128 kbps a channel,

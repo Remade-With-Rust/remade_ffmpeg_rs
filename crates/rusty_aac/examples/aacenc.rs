@@ -94,6 +94,7 @@ fn main() {
                     hz => Bandwidth::Hz(hz.parse().expect("bw=<hz|auto|full>")),
                 }
             }
+            "fd" => cfg.frame_demand = v.parse().expect("fd=<f32>"),
             _ => panic!("unknown knob {k}"),
         }
     }
