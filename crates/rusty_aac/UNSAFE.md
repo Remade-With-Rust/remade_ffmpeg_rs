@@ -1,6 +1,6 @@
 # `unsafe` in rusty_aac
 
-**Last audited**: 2026-10-04 (use-protection-please, H-16). **Policy**: `unsafe` exists
+**Last audited**: 2026-11-21 (DCT-IV rotation twins row; 2026-10-04 use-protection-please, H-16). **Policy**: `unsafe` exists
 for exactly two purposes — explicit SIMD intrinsics, and filling freshly allocated
 capacity without a redundant zero fill. No FFI, no `transmute`, no `static mut`, no
 `Box::leak`, no manual `Send`/`Sync`. Every `unsafe` block carries a `// SAFETY:`
@@ -34,9 +34,11 @@ The two obligations, and how each is discharged:
 | File | Kernel(s) | Bound (set by the safe caller) | Oracle test |
 |---|---|---|---|
 | `src/dsp.rs` | `Radix2Fft::run_avx`, `run_neon` (FFT under every IMDCT and both SBR QMF banks) | `buf` re-sliced to `n`; twiddles `stw.len() == n - 2` by construction | `fft_simd_matches_scalar`, `run_bitrev_matches_run` |
+| `src/dsp.rs` | `Pow2Dct4::rotate_in_sse`, `post_sse`, `dct4_post_sse` (IMDCT and QMF-synthesis DCT-IV pre/post rotations) | `x` re-sliced to `l = 2m`, `v`/`out` to `m`/`2m` by the dispatcher, `m % 4 == 0` | `imdct_rotations_sse_match_scalar`, `dct4_and_imdct_half_match_reference` |
 | `src/decode/synth.rs` | `fmul_window_sse`, `fmul_window_neon` (IMDCT overlap window) | all four slices re-sliced to `len` / `2·len` | `fmul_window_matches_reference` |
-| `src/sbr/qmf.rs` | `qmf_window_sse/_avx/_neon` (synthesis window), `ana_fold_avx` (analysis window + fold + pre-twiddle), `split_slot_avx`, `dct_post_avx` | `vb` / `win` re-sliced to `20·b` / `10·b`; `seg` to 320; fixed arrays elsewhere | `qmf_window_matches_scalar` (also the SSE twin directly), `ana_fold_matches_scalar`, `split_slot_matches_scalar`, `dct_post_matches_scalar` |
-| `src/encode.rs` | `quantize_band_avx2`, `quantize_band_avx512` (opt-in feature), `xpow_avx2_raw` | `pow` / `sign` re-sliced to `out.len()` in `quantize_band`; `xpow_avx2_raw` writes `spec.len()` elements of capacity reserved for exactly that | `quantize_simd_matches_scalar`, `xpow_avx2_matches_scalar_with_tail` |
+| `src/sbr/qmf.rs` | `qmf_window_sse/_avx/_neon` (synthesis window), `ana_fold_avx` (analysis window + fold + pre-twiddle), `ana_post_avx` (analysis post-twiddle), `split_slot_avx`, `dct_post_avx` | `vb` / `win` re-sliced to `20·b` / `10·b`; `seg` to 320; fixed arrays elsewhere | `qmf_window_matches_scalar` (also the SSE twin directly), `ana_fold_matches_scalar`, `ana_post_matches_scalar`, `split_slot_matches_scalar`, `dct_post_matches_scalar` |
+| `src/sbr/dec.rs` | `hf_sums_avx` (inverse-filter covariance window sums, eight bands per pass) | `rows`/`out` sliced to exactly 8 by the caller; reads `rows[r][i]`, `r < 8`, `i < 40`, with unaligned 64-bit loads | `hf_sums_avx_matches_scalar` |
+| `src/encode.rs` | `quantize_band_avx2` (and its frame loop `quantize_bands_avx2`), `quantize_band_avx512` (opt-in feature), `xpow_avx2_raw` | `pow` / `sign` re-sliced to `out.len()` in `quantize_band`, and each band sliced with checked indexing in `quantize_bands_avx2`; `xpow_avx2_raw` writes `spec.len()` elements of capacity reserved for exactly that | `quantize_simd_matches_scalar`, `quantize_frame_matches_per_band_scalar`, `xpow_avx2_matches_scalar_with_tail` |
 
 ## Class 2 — filling fresh capacity
 

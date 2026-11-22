@@ -452,37 +452,12 @@ impl RasterPipelineBuilder {
             .all(|stage| !lowp::fn_ptr_eq(lowp::STAGES[*stage as usize], lowp::null_fn));
 
         if self.force_hq_pipeline || !is_lowp_compatible {
-            let mut functions: ArrayVec<_, MAX_STAGES> = self
-                .stages
-                .iter()
-                .map(|stage| highp::STAGES[*stage as usize] as highp::StageFn)
-                .collect();
-            // `Gradient` then `Premultiply` (a gradient with translucent stops)
-            // runs as one stage.
-            if let Some(i) = functions.windows(2).position(|w| {
-                highp::fn_ptr(w[0]) == highp::fn_ptr(highp::gradient)
-                    && highp::fn_ptr(w[1]) == highp::fn_ptr(highp::premultiply)
-            }) {
-                functions[i] = highp::gradient_premultiply as highp::StageFn;
-                functions.remove(i + 1);
-            }
-            // `SeedShader` then `Transform` (patterns, and gradients with a
-            // non-identity transform) runs as one stage.
-            if let Some(i) = functions.windows(2).position(|w| {
-                highp::fn_ptr(w[0]) == highp::fn_ptr(highp::seed_shader)
-                    && highp::fn_ptr(w[1]) == highp::fn_ptr(highp::transform)
-            }) {
-                functions[i] = highp::seed_shader_transform as highp::StageFn;
-                functions.remove(i + 1);
-            }
-            // `Gather` then `Scale1Float` (a nearest pattern with an opacity
-            // below one) runs as one stage.
-            if let Some(i) = functions.windows(2).position(|w| {
-                highp::fn_ptr(w[0]) == highp::fn_ptr(highp::gather)
-                    && highp::fn_ptr(w[1]) == highp::fn_ptr(highp::scale_1_float)
-            }) {
-                functions[i] = highp::gather_scale_1_float as highp::StageFn;
-                functions.remove(i + 1);
+            let mut functions: ArrayVec<highp::StageFn, MAX_STAGES> = ArrayVec::new();
+            let mut rest = self.stages.as_slice();
+            while !rest.is_empty() {
+                let (function, covered) = highp_stage(rest);
+                functions.push(function);
+                rest = &rest[covered..];
             }
             functions.push(highp::just_return as highp::StageFn);
 
@@ -491,22 +466,7 @@ impl RasterPipelineBuilder {
             // In Rust, any branching in load/store code drastically affects the performance.
             // So instead, we're using two "programs": one for "full stages" and one for "tail stages".
             // While the only difference is the load/store methods.
-            let mut tail_functions = functions.clone();
-            for fun in &mut tail_functions {
-                if highp::fn_ptr(*fun) == highp::fn_ptr(highp::load_dst) {
-                    *fun = highp::load_dst_tail as highp::StageFn;
-                } else if highp::fn_ptr(*fun) == highp::fn_ptr(highp::store) {
-                    *fun = highp::store_tail as highp::StageFn;
-                } else if highp::fn_ptr(*fun) == highp::fn_ptr(highp::load_dst_u8) {
-                    *fun = highp::load_dst_u8_tail as highp::StageFn;
-                } else if highp::fn_ptr(*fun) == highp::fn_ptr(highp::store_u8) {
-                    *fun = highp::store_u8_tail as highp::StageFn;
-                } else if highp::fn_ptr(*fun) == highp::fn_ptr(highp::source_over_rgba) {
-                    // SourceOverRgba calls load/store manually, without the pipeline,
-                    // therefore we have to switch it too.
-                    *fun = highp::source_over_rgba_tail as highp::StageFn;
-                }
-            }
+            let tail_functions = highp_tail(&functions);
 
             RasterPipeline {
                 kind: RasterPipelineKind::High {
@@ -549,6 +509,58 @@ impl RasterPipelineBuilder {
                 ctx: self.ctx,
             }
         }
+    }
+}
+
+/// `functions` with the stages that read or write the destination swapped
+/// for their tail forms, for the last `< STAGE_WIDTH` pixels of a row.
+fn highp_tail(
+    functions: &ArrayVec<highp::StageFn, MAX_STAGES>,
+) -> ArrayVec<highp::StageFn, MAX_STAGES> {
+    let mut tail_functions = functions.clone();
+    for fun in &mut tail_functions {
+        if highp::fn_ptr(*fun) == highp::fn_ptr(highp::load_dst) {
+            *fun = highp::load_dst_tail as highp::StageFn;
+        } else if highp::fn_ptr(*fun) == highp::fn_ptr(highp::store) {
+            *fun = highp::store_tail as highp::StageFn;
+        } else if highp::fn_ptr(*fun) == highp::fn_ptr(highp::load_dst_u8) {
+            *fun = highp::load_dst_u8_tail as highp::StageFn;
+        } else if highp::fn_ptr(*fun) == highp::fn_ptr(highp::store_u8) {
+            *fun = highp::store_u8_tail as highp::StageFn;
+        } else if highp::fn_ptr(*fun) == highp::fn_ptr(highp::source_over_rgba) {
+            // SourceOverRgba calls load/store manually, without the pipeline,
+            // therefore we have to switch it too.
+            *fun = highp::source_over_rgba_tail as highp::StageFn;
+        }
+    }
+    tail_functions
+}
+
+/// The highp function for the stages at the start of `stages`, and how many
+/// of them it covers: one, or a run that executes as one fused stage, with
+/// the same arithmetic in the same order:
+///
+/// - `Gradient`, `Premultiply`: a gradient with translucent stops;
+/// - `SeedShader`, `Transform`: patterns, and gradients with a non-identity
+///   transform;
+/// - `Repeat` / `Reflect`, `Gather`, and `Scale1Float` after them: a nearest
+///   pattern with a Repeat / Reflect spread and an opacity below one;
+/// - `Gather`, `Scale1Float`: the same with a Pad spread.
+///
+/// Matching on the stage list is one pass with no function-pointer compares,
+/// which `compile` runs for every fill.
+fn highp_stage(stages: &[Stage]) -> (highp::StageFn, usize) {
+    use Stage::*;
+    match stages {
+        [Gradient, Premultiply, ..] => (highp::gradient_premultiply, 2),
+        [SeedShader, Transform, ..] => (highp::seed_shader_transform, 2),
+        [Repeat, Gather, Scale1Float, ..] => (highp::repeat_gather_scale_1_float, 3),
+        [Reflect, Gather, Scale1Float, ..] => (highp::reflect_gather_scale_1_float, 3),
+        [Repeat, Gather, ..] => (highp::repeat_gather, 2),
+        [Reflect, Gather, ..] => (highp::reflect_gather, 2),
+        [Gather, Scale1Float, ..] => (highp::gather_scale_1_float, 2),
+        [stage, ..] => (highp::STAGES[*stage as usize], 1),
+        [] => (highp::just_return, 1),
     }
 }
 
@@ -609,6 +621,129 @@ impl RasterPipeline {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fusion_tests {
+    use super::*;
+    use crate::geom::IntSizeExt;
+    use crate::{
+        ColorSpace, FilterQuality, GradientStop, LinearGradient, Pattern, Pixmap, Point, Shader,
+    };
+
+    /// `p`'s stages compiled one highp function per stage, without fusions.
+    fn unfused(p: RasterPipelineBuilder) -> RasterPipeline {
+        let mut functions: ArrayVec<highp::StageFn, MAX_STAGES> = p
+            .stages
+            .iter()
+            .map(|stage| highp::STAGES[*stage as usize] as highp::StageFn)
+            .collect();
+        functions.push(highp::just_return as highp::StageFn);
+        let tail_functions = highp_tail(&functions);
+        RasterPipeline {
+            kind: RasterPipelineKind::High {
+                functions,
+                tail_functions,
+            },
+            ctx: p.ctx,
+        }
+    }
+
+    fn stage_count(p: &RasterPipeline) -> usize {
+        match p.kind {
+            RasterPipelineKind::High { ref functions, .. } => functions.len(),
+            RasterPipelineKind::Low { ref functions, .. } => functions.len(),
+        }
+    }
+
+    /// Renders `shader` source-over onto a 37 x 11 canvas (four full
+    /// groups of eight and a five-pixel tail per row) through the fused and
+    /// the unfused pipeline; returns both images and both stage counts.
+    fn render(shader: &Shader, src: PixmapRef) -> ([Vec<u8>; 2], [usize; 2]) {
+        let build = || {
+            let mut p = RasterPipelineBuilder::new();
+            p.set_force_hq_pipeline(true);
+            assert!(shader.push_stages(ColorSpace::Linear, &mut p));
+            p.push(Stage::LoadDestination);
+            p.push(Stage::SourceOver);
+            p.push(Stage::Store);
+            p
+        };
+        let mut images = [Vec::new(), Vec::new()];
+        let mut counts = [0; 2];
+        for (k, mut pipeline) in [build().compile(), unfused(build())]
+            .into_iter()
+            .enumerate()
+        {
+            let mut dst = Pixmap::new(37, 11).unwrap();
+            dst.fill(Color::from_rgba8(20, 90, 160, 200));
+            let rect = dst.size().to_screen_int_rect(0, 0);
+            pipeline.run(
+                &rect,
+                AAMaskCtx::default(),
+                MaskCtx::default(),
+                src,
+                &mut dst.as_mut().as_subpixmap(),
+            );
+            counts[k] = stage_count(&pipeline);
+            images[k] = dst.take();
+        }
+        (images, counts)
+    }
+
+    /// Every fusion `compile` makes renders the bytes the separate stages
+    /// render: nearest patterns under each spread with and without opacity
+    /// (Repeat / Reflect + Gather [+ Scale1Float], Gather + Scale1Float,
+    /// SeedShader + Transform), bilinear patterns, and a translucent
+    /// transformed gradient (Gradient + Premultiply).
+    #[test]
+    fn fused_stages_render_the_unfused_bytes() {
+        let mut data = Vec::new();
+        for i in 0..35u32 {
+            let a = 40 + (i * 37) % 216;
+            data.extend_from_slice(&[
+                (a * (i % 3) / 2) as u8,
+                (a * (i % 5) / 4) as u8,
+                (a / 3) as u8,
+                a as u8,
+            ]);
+        }
+        let src = PixmapRef::from_bytes(&data, 7, 5).unwrap();
+        let transforms = [
+            Transform::from_row(1.7, 0.3, -0.4, 1.3, 2.5, -3.25),
+            Transform::from_row(-0.9, 0.2, 0.15, 1.1, 30.0, 4.0),
+        ];
+        for quality in [FilterQuality::Nearest, FilterQuality::Bilinear] {
+            for spread in [SpreadMode::Pad, SpreadMode::Repeat, SpreadMode::Reflect] {
+                for opacity in [1.0, 0.6] {
+                    for ts in transforms {
+                        let shader = Pattern::new(src, spread, quality, opacity, ts);
+                        let ([fused, plain], [nf, np]) = render(&shader, src);
+                        assert_eq!(fused, plain, "{quality:?} {spread:?} {opacity} {ts:?}");
+                        assert!(
+                            nf < np,
+                            "nothing fused for {quality:?} {spread:?} {opacity}"
+                        );
+                    }
+                }
+            }
+        }
+        let gradient = LinearGradient::new(
+            Point::from_xy(3.0, 1.0),
+            Point::from_xy(30.0, 9.0),
+            vec![
+                GradientStop::new(0.0, Color::from_rgba8(250, 20, 40, 90)),
+                GradientStop::new(0.5, Color::from_rgba8(10, 200, 90, 255)),
+                GradientStop::new(1.0, Color::from_rgba8(30, 40, 220, 160)),
+            ],
+            SpreadMode::Reflect,
+            Transform::from_row(0.9, 0.1, -0.2, 1.2, 1.5, 0.5),
+        )
+        .unwrap();
+        let ([fused, plain], [nf, np]) = render(&gradient, src);
+        assert_eq!(fused, plain, "gradient");
+        assert!(nf < np, "nothing fused for the gradient");
     }
 }
 

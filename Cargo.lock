@@ -2636,7 +2636,7 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "hevc-duel"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rusty_jpeg",
  "windows-sys 0.59.0",
@@ -4965,7 +4965,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remade-ffmpeg"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "lewton",
  "md-5",
@@ -5113,14 +5113,14 @@ dependencies = [
 
 [[package]]
 name = "rff-auth"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "rff-cli"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "remade-ffmpeg",
  "rff-core",
@@ -5129,14 +5129,14 @@ dependencies = [
 
 [[package]]
 name = "rff-codec"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
 ]
 
 [[package]]
 name = "rff-codec-aac"
-version = "1.1.21"
+version = "1.1.22"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5145,7 +5145,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-alac"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5153,7 +5153,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-av2"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5162,7 +5162,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-avif"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5172,7 +5172,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-flac"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5181,7 +5181,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-gif"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5190,7 +5190,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-h264"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5199,7 +5199,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-hevc"
-version = "0.2.20"
+version = "0.2.21"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5208,7 +5208,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-jpeg"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5217,7 +5217,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-jxl"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "jxl-oxide",
  "rff-codec",
@@ -5226,7 +5226,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-mp3"
-version = "1.1.3"
+version = "1.1.4"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5235,7 +5235,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-openh264"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "openh264",
  "rff-codec",
@@ -5244,7 +5244,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-opus"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5253,7 +5253,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-pcm"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5261,7 +5261,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-png"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5270,7 +5270,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-rawvideo"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5278,7 +5278,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-vorbis"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "lewton",
  "rff-codec",
@@ -5288,7 +5288,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-vp9"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5298,7 +5298,7 @@ dependencies = [
 
 [[package]]
 name = "rff-codec-webp"
-version = "0.2.20"
+version = "0.2.21"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5307,28 +5307,28 @@ dependencies = [
 
 [[package]]
 name = "rff-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "rff-filter"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
 ]
 
 [[package]]
 name = "rff-format"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
 ]
 
 [[package]]
 name = "rff-format-aiff"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5336,7 +5336,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-ass"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5345,7 +5345,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-av2f"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5354,7 +5354,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-avi"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5362,7 +5362,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-avif"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5370,7 +5370,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-caf"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5378,7 +5378,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-flac"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5386,7 +5386,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-flv"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5394,7 +5394,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-gif"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5402,7 +5402,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-hls"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5412,7 +5412,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-ivf"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5420,7 +5420,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-jpeg"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5428,7 +5428,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-jxl"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "jxl-oxide",
  "rff-core",
@@ -5437,7 +5437,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-mjpeg"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5446,7 +5446,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-mkv"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "miniz_oxide 0.8.9",
  "rff-core",
@@ -5456,7 +5456,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-mp3"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5464,7 +5464,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-mp4"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5473,7 +5473,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-ogg"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5481,7 +5481,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-png"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5490,7 +5490,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-rtp"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5502,7 +5502,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-srt"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5511,7 +5511,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-ts"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5519,7 +5519,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-wav"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5527,7 +5527,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-webp"
-version = "0.2.20"
+version = "0.2.21"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5536,7 +5536,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-webvtt"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5545,7 +5545,7 @@ dependencies = [
 
 [[package]]
 name = "rff-format-y4m"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rff-format",
@@ -5553,7 +5553,7 @@ dependencies = [
 
 [[package]]
 name = "rff-io"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rff-core",
  "rustls",
@@ -5564,11 +5564,11 @@ dependencies = [
 
 [[package]]
 name = "rff-resample"
-version = "0.8.0"
+version = "0.8.1"
 
 [[package]]
 name = "rff-server"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "axum",
  "remade-ffmpeg",
@@ -5584,11 +5584,11 @@ dependencies = [
 
 [[package]]
 name = "rff-subtitle"
-version = "0.8.0"
+version = "0.8.1"
 
 [[package]]
 name = "rff-targets"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "rff-codec",
  "rff-core",
@@ -5597,7 +5597,7 @@ dependencies = [
 
 [[package]]
 name = "rff-ui"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "dioxus",
  "remade-ffmpeg",
@@ -5975,7 +5975,7 @@ version = "0.7.1"
 
 [[package]]
 name = "rusty_icc"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "moxcms 0.9.2",
  "rusty_alloc-api",
@@ -6062,7 +6062,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_tiff"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytemuck",
  "fax",

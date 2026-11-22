@@ -5,12 +5,18 @@
 //! bitstream byte-identical cannot move any anchor.
 //!
 //! ```text
-//! aacencir <file.f32> <channels> <sample_rate>
+//! aacencir <file.f32> <channels> <sample_rate> [bitrate_bps]
 //! ```
 //!
 //! Frames encode in parallel on `available_parallelism()` threads with a static
 //! partition and blocking joins, so the instruction total is fixed for a given
-//! machine; check the same-binary spread before trusting a delta.
+//! machine; check the same-binary spread before trusting a delta. Under callgrind,
+//! pin it (`taskset -c 2`): `available_parallelism()` honours the affinity mask,
+//! so the encoder takes its serial path and the count is exact (spread 0).
+//!
+//! It also prints `total <ms> ms`, the wall time of the encode alone (file read
+//! excluded), so `tools/bench/pinab.py` can A/B two builds on the same binary
+//! the instruction counts came from.
 
 use rusty_aac::{AacEncoder, AacEncoderConfig};
 
@@ -19,8 +25,10 @@ static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [file, channels, rate] = &args[..] else {
-        panic!("usage: aacencir <file.f32> <channels> <sample_rate>");
+    let (file, channels, rate, bitrate) = match &args[..] {
+        [f, c, r] => (f, c, r, None),
+        [f, c, r, b] => (f, c, r, Some(b)),
+        _ => panic!("usage: aacencir <file.f32> <channels> <sample_rate> [bitrate_bps]"),
     };
     let (channels, rate): (u16, u32) = (channels.parse().unwrap(), rate.parse().unwrap());
     let raw = std::fs::read(file).expect("read pcm");
@@ -28,7 +36,12 @@ fn main() {
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect();
-    let mut enc = AacEncoder::new(AacEncoderConfig::default());
+    let t0 = std::time::Instant::now();
+    let mut cfg = AacEncoderConfig::default();
+    if let Some(b) = bitrate {
+        cfg.bitrate_bps = b.parse().expect("bitrate_bps");
+    }
+    let mut enc = AacEncoder::new(cfg);
     enc.push_pcm(&pcm, channels, rate).expect("push");
     enc.finish();
     let (mut packets, mut bytes, mut sum) = (0u64, 0u64, 0xcbf2_9ce4_8422_2325u64);
@@ -39,5 +52,7 @@ fn main() {
             sum = (sum ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
         }
     }
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
     println!("anchors packets {packets} bytes {bytes} checksum {sum:016x}");
+    println!("total {ms:.3} ms");
 }
