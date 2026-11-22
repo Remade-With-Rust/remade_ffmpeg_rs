@@ -37,6 +37,7 @@ The two obligations, and how each is discharged:
 | `src/dsp.rs` | `Pow2Dct4::rotate_in_sse`, `post_sse`, `dct4_post_sse` (IMDCT and QMF-synthesis DCT-IV pre/post rotations) | `x` re-sliced to `l = 2m`, `v`/`out` to `m`/`2m` by the dispatcher, `m % 4 == 0` | `imdct_rotations_sse_match_scalar`, `dct4_and_imdct_half_match_reference` |
 | `src/decode/synth.rs` | `fmul_window_sse`, `fmul_window_neon` (IMDCT overlap window) | all four slices re-sliced to `len` / `2·len` | `fmul_window_matches_reference` |
 | `src/sbr/qmf.rs` | `qmf_window_sse/_avx/_neon` (synthesis window), `ana_fold_avx` (analysis window + fold + pre-twiddle), `ana_post_avx` (analysis post-twiddle), `split_slot_avx`, `dct_post_avx` | `vb` / `win` re-sliced to `20·b` / `10·b`; `seg` to 320; fixed arrays elsewhere | `qmf_window_matches_scalar` (also the SSE twin directly), `ana_fold_matches_scalar`, `ana_post_matches_scalar`, `split_slot_matches_scalar`, `dct_post_matches_scalar` |
+| `src/sbr/dec.rs` | `hf_sums_avx` (inverse-filter covariance window sums, eight bands per pass) | `rows`/`out` sliced to exactly 8 by the caller; reads `rows[r][i]`, `r < 8`, `i < 40`, with unaligned 64-bit loads | `hf_sums_avx_matches_scalar` |
 | `src/encode.rs` | `quantize_band_avx2`, `quantize_band_avx512` (opt-in feature), `xpow_avx2_raw` | `pow` / `sign` re-sliced to `out.len()` in `quantize_band`; `xpow_avx2_raw` writes `spec.len()` elements of capacity reserved for exactly that | `quantize_simd_matches_scalar`, `xpow_avx2_matches_scalar_with_tail` |
 
 ## Class 2 — filling fresh capacity
