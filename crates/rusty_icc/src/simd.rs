@@ -19,7 +19,7 @@
 //!   than x86-64, and on x86-64 CPUs without AVX2, every entry point returns
 //!   0 and the scalar twin does everything.
 
-use crate::fast::FastShaperView;
+use crate::fast::{FastChain, FastShaperView};
 use crate::transform::OUT_TABLE;
 
 /// The tables and matrix of a three-channel matrix-shaper transform
@@ -130,6 +130,29 @@ pub(crate) fn shaper_f32_fast(
     0
 }
 
+/// The fast `f32` LUT-chain loop ([`FastChain::run_scalar`]) on the leading
+/// pixels: the same values, bit for bit. Returns the pixels done.
+pub(crate) fn chain_f32_fast(
+    f: &FastChain,
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    alpha: (bool, bool),
+) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (i, o) = f.channels();
+        if matches!((sc, dc), (3 | 4, 3 | 4)) && sc >= i && dc >= o && avx2() {
+            // SAFETY: as in `shaper_u8`: AVX2 detected just above.
+            let done = unsafe { x86::chain_f32_fast(f, src, dst, (sc, dc), alpha.0 && alpha.1) };
+            count(done);
+            return done;
+        }
+    }
+    let _ = (f, src, dst, sc, dc, alpha);
+    0
+}
+
 /// [`shaper_u8`] for 16-bit samples.
 pub(crate) fn shaper_u16(
     t: &ShaperTables<'_, 65536>,
@@ -153,7 +176,11 @@ pub(crate) fn shaper_u16(
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{Codes8, FastShaperView, ShaperTables, OUT_TABLE};
+    use super::{Codes8, FastChain, FastShaperView, ShaperTables, OUT_TABLE};
+    use crate::fast::{
+        FastClut, FastLutIn, FastLutOut, LabF, Table1, LABF_BASE, LABF_CELLS, LABF_LIMIT,
+        LABF_SHIFT, LABF_TOP,
+    };
     use crate::fast::{FastCurve, CELLS, FAST_TABLE, GUARD};
     use core::arch::x86_64::*;
 
@@ -914,6 +941,409 @@ mod x86 {
             (3, 4) => run_f32::<3, 4>(t, src, dst, copy_alpha, near),
             (4, 3) => run_f32::<4, 3>(t, src, dst, copy_alpha, near),
             (4, 4) => run_f32::<4, 4>(t, src, dst, copy_alpha, near),
+            _ => 0,
+        }
+    }
+
+    // ---- fast `f32` LUT chains ----
+
+    /// `Table1::eval` on eight clamped lanes: the cell `min(trunc(x * scale),
+    /// last)` (unsigned), `a + d * (pos - i)`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn table1(t: &Table1, x: __m256) -> __m256 {
+        let pos = _mm256_mul_ps(x, _mm256_set1_ps(t.scale));
+        let last = t.last.min(t.cells.len().saturating_sub(1) as u32);
+        let i = _mm256_min_epu32(_mm256_cvttps_epi32(pos), _mm256_set1_epi32(last as i32));
+        let f = _mm256_sub_ps(pos, _mm256_cvtepi32_ps(i));
+        if t.cells.is_empty() {
+            return x;
+        }
+        // SAFETY: `cells` is non-empty (tested above) and every lane of `i`,
+        // read as unsigned, is at most `last <= cells.len() - 1` (the `min`
+        // above), so each 8-byte read at `cells + 8 * i` is one whole cell.
+        let (lo, hi) = unsafe {
+            (
+                _mm256_i32gather_epi64::<8>(t.cells.as_ptr().cast(), _mm256_castsi256_si128(i)),
+                _mm256_i32gather_epi64::<8>(
+                    t.cells.as_ptr().cast(),
+                    _mm256_extracti128_si256::<1>(i),
+                ),
+            )
+        };
+        let (a, d) = split_cells(lo, hi);
+        _mm256_add_ps(a, _mm256_mul_ps(d, f))
+    }
+
+    /// Two gathers of four `[a, d]` cells back to lane order.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn split_cells(lo: __m256i, hi: __m256i) -> (__m256, __m256) {
+        let (lo, hi) = (_mm256_castsi256_ps(lo), _mm256_castsi256_ps(hi));
+        let a = _mm256_castpd_ps(_mm256_permute4x64_pd::<0xD8>(_mm256_castps_pd(
+            _mm256_shuffle_ps::<0x88>(lo, hi),
+        )));
+        let d = _mm256_castpd_ps(_mm256_permute4x64_pd::<0xD8>(_mm256_castps_pd(
+            _mm256_shuffle_ps::<0xDD>(lo, hi),
+        )));
+        (a, d)
+    }
+
+    /// A stage of tables on clamped lanes (`crate::fast::apply`).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn stage(t: &Option<Table1>, x: __m256) -> __m256 {
+        let c = clamp01(x);
+        match t {
+            Some(t) => table1(t, c),
+            None => c,
+        }
+    }
+
+    /// `LabF::eval` on eight lanes.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn lab_f(l: &LabF, t: __m256) -> __m256 {
+        let lin = _mm256_add_ps(
+            _mm256_mul_ps(_mm256_set1_ps(841.0 / 108.0), t),
+            _mm256_set1_ps(16.0 / 116.0),
+        );
+        let low = _mm256_cmp_ps::<_CMP_LE_OQ>(t, _mm256_set1_ps(LABF_LIMIT));
+        // `if t < TOP { t } else { TOP }`: `minps` takes its second operand
+        // unless the first is less.
+        let tc = _mm256_min_ps(t, _mm256_set1_ps(LABF_TOP));
+        // Lanes at or below the limit take the linear part; their bucket is
+        // computed from the limit instead, so every index is in range.
+        let tc = _mm256_max_ps(tc, _mm256_set1_ps(LABF_LIMIT));
+        let off = _mm256_sub_epi32(_mm256_castps_si256(tc), _mm256_set1_epi32(LABF_BASE as i32));
+        let i = _mm256_min_epu32(
+            _mm256_srli_epi32::<{ LABF_SHIFT as i32 }>(off),
+            _mm256_set1_epi32(LABF_CELLS as i32 - 1),
+        );
+        let f = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(_mm256_and_si256(
+                off,
+                _mm256_set1_epi32((1 << LABF_SHIFT) - 1),
+            )),
+            _mm256_set1_ps(1.0 / (1u32 << LABF_SHIFT) as f32),
+        );
+        // SAFETY: every lane of `i`, read as unsigned, is at most
+        // LABF_CELLS - 1 (the `min` above), so each 8-byte read is one whole
+        // cell of the LABF_CELLS `cells` refers to.
+        let (lo, hi) = unsafe {
+            (
+                _mm256_i32gather_epi64::<8>(l.cells.as_ptr().cast(), _mm256_castsi256_si128(i)),
+                _mm256_i32gather_epi64::<8>(
+                    l.cells.as_ptr().cast(),
+                    _mm256_extracti128_si256::<1>(i),
+                ),
+            )
+        };
+        let (a, d) = split_cells(lo, hi);
+        _mm256_blendv_ps(_mm256_add_ps(a, _mm256_mul_ps(d, f)), lin, low)
+    }
+
+    /// `crate::fast::lab_f_inv` on eight lanes.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn lab_f_inv(t: __m256) -> __m256 {
+        let lin = _mm256_mul_ps(
+            _mm256_set1_ps(108.0 / 841.0),
+            _mm256_sub_ps(t, _mm256_set1_ps(16.0 / 116.0)),
+        );
+        let cube = _mm256_mul_ps(_mm256_mul_ps(t, t), t);
+        let low = _mm256_cmp_ps::<_CMP_LE_OQ>(t, _mm256_set1_ps(24.0 / 116.0));
+        _mm256_blendv_ps(cube, lin, low)
+    }
+
+    /// One CLUT point.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn node(p: &[f32; 4]) -> __m128 {
+        // SAFETY: `p` refers to 16 readable bytes; the load is unaligned.
+        unsafe { _mm_loadu_ps(p.as_ptr()) }
+    }
+
+    /// `a + (b - a) * f` lane-wise (`crate::fast::lerp4`), `f` broadcast.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn lerp(a: __m128, b: __m128, f: __m128) -> __m128 {
+        _mm_add_ps(a, _mm_mul_ps(_mm_sub_ps(b, a), f))
+    }
+
+    /// Lane `j` of an integer vector.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn lane(v: __m256i, j: usize) -> usize {
+        _mm256_cvtsi256_si32(_mm256_permutevar8x32_epi32(v, _mm256_set1_epi32(j as i32))) as u32
+            as usize
+    }
+
+    /// Lane `j` of a float vector, in all four lanes of a 128-bit one.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn bcast(v: __m256, j: usize) -> __m128 {
+        _mm256_castps256_ps128(_mm256_permutevar8x32_ps(v, _mm256_set1_epi32(j as i32)))
+    }
+
+    /// `FastClut::axis` on eight lanes: (cell, fraction).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn axis(c: &FastClut, k: usize, x: __m256) -> (__m256i, __m256) {
+        let p = _mm256_mul_ps(clamp01(x), _mm256_set1_ps((c.g[k] - 1) as f32));
+        let i = _mm256_min_epu32(_mm256_cvttps_epi32(p), _mm256_set1_epi32(c.g[k] as i32 - 2));
+        (i, _mm256_sub_ps(p, _mm256_cvtepi32_ps(i)))
+    }
+
+    /// The tetrahedra of eight cells (`crate::fast::order` per lane): the
+    /// `ORDER` code and the fractions from the largest to the smallest.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn sorted(f: [__m256; 3]) -> (__m256i, [__m256; 3]) {
+        let ge = |a: __m256, b: __m256| {
+            _mm256_srli_epi32::<31>(_mm256_castps_si256(_mm256_cmp_ps::<_CMP_GE_OQ>(a, b)))
+        };
+        let code = _mm256_or_si256(
+            _mm256_or_si256(ge(f[0], f[1]), _mm256_slli_epi32::<1>(ge(f[1], f[2]))),
+            _mm256_slli_epi32::<2>(ge(f[0], f[2])),
+        );
+        let hi = _mm256_max_ps(_mm256_max_ps(f[0], f[1]), f[2]);
+        let lo = _mm256_min_ps(_mm256_min_ps(f[0], f[1]), f[2]);
+        let mid = _mm256_max_ps(
+            _mm256_min_ps(f[0], f[1]),
+            _mm256_min_ps(_mm256_max_ps(f[0], f[1]), f[2]),
+        );
+        (code, [hi, mid, lo])
+    }
+
+    /// One tetrahedral lookup (`FastClut::tetra`): corners along the axes in
+    /// `ORDER[code]`, weights the sorted fractions (the same values the
+    /// scalar picks by axis).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn tetra(c: &FastClut, base: usize, code: usize, s: [usize; 3], w: [__m128; 3]) -> __m128 {
+        let [a, b, _] = crate::fast::ORDER[code & 7];
+        let p0 = node(&c.nodes[base]);
+        let p1 = node(&c.nodes[base + s[a]]);
+        let p2 = node(&c.nodes[base + s[a] + s[b]]);
+        let p3 = node(&c.nodes[base + s[0] + s[1] + s[2]]);
+        let v = _mm_add_ps(p0, _mm_mul_ps(_mm_sub_ps(p1, p0), w[0]));
+        let v = _mm_add_ps(v, _mm_mul_ps(_mm_sub_ps(p2, p1), w[1]));
+        _mm_add_ps(v, _mm_mul_ps(_mm_sub_ps(p3, p2), w[2]))
+    }
+
+    /// Eight four-lane results to four channel vectors in pixel order.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn transpose(r: [__m128; 8]) -> [__m256; 4] {
+        let pair = |a: __m128, b: __m128| _mm256_insertf128_ps::<1>(_mm256_castps128_ps256(a), b);
+        let (a0, a1, a2, a3) = (
+            pair(r[0], r[4]),
+            pair(r[1], r[5]),
+            pair(r[2], r[6]),
+            pair(r[3], r[7]),
+        );
+        let t0 = _mm256_unpacklo_ps(a0, a1);
+        let t1 = _mm256_unpackhi_ps(a0, a1);
+        let t2 = _mm256_unpacklo_ps(a2, a3);
+        let t3 = _mm256_unpackhi_ps(a2, a3);
+        [
+            _mm256_shuffle_ps::<0x44>(t0, t2),
+            _mm256_shuffle_ps::<0xEE>(t0, t2),
+            _mm256_shuffle_ps::<0x44>(t1, t3),
+            _mm256_shuffle_ps::<0xEE>(t1, t3),
+        ]
+    }
+
+    /// Three-input CLUT lookups of eight pixels (`FastClut::lookup3`).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn clut3(c: &FastClut, x: [__m256; 3]) -> [__m256; 4] {
+        let (i0, f0) = axis(c, 0, x[0]);
+        let (i1, f1) = axis(c, 1, x[1]);
+        let (i2, f2) = axis(c, 2, x[2]);
+        let s = [c.strides[0], c.strides[1], c.strides[2]];
+        let base = _mm256_add_epi32(
+            _mm256_add_epi32(
+                _mm256_mullo_epi32(i0, _mm256_set1_epi32(s[0] as i32)),
+                _mm256_mullo_epi32(i1, _mm256_set1_epi32(s[1] as i32)),
+            ),
+            _mm256_mullo_epi32(i2, _mm256_set1_epi32(s[2] as i32)),
+        );
+        let mut r = [_mm_setzero_ps(); 8];
+        if c.trilinear {
+            let nd = &c.nodes;
+            let (a, b, cc) = (s[0], s[1], s[2]);
+            for (j, r) in r.iter_mut().enumerate() {
+                let o = lane(base, j);
+                let (w0, w1, w2) = (bcast(f0, j), bcast(f1, j), bcast(f2, j));
+                let l00 = lerp(node(&nd[o]), node(&nd[o + cc]), w2);
+                let l01 = lerp(node(&nd[o + b]), node(&nd[o + b + cc]), w2);
+                let l10 = lerp(node(&nd[o + a]), node(&nd[o + a + cc]), w2);
+                let l11 = lerp(node(&nd[o + a + b]), node(&nd[o + a + b + cc]), w2);
+                *r = lerp(lerp(l00, l01, w1), lerp(l10, l11, w1), w0);
+            }
+        } else {
+            let (code, w) = sorted([f0, f1, f2]);
+            for (j, r) in r.iter_mut().enumerate() {
+                let ww = [bcast(w[0], j), bcast(w[1], j), bcast(w[2], j)];
+                *r = tetra(c, lane(base, j), lane(code, j), s, ww);
+            }
+        }
+        transpose(r)
+    }
+
+    /// Four-input CLUT lookups of eight pixels (`FastClut::lookup4`).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn clut4(c: &FastClut, x: [__m256; 4]) -> [__m256; 4] {
+        let (iw, fw) = axis(c, 0, x[0]);
+        let (i1, f1) = axis(c, 1, x[1]);
+        let (i2, f2) = axis(c, 2, x[2]);
+        let (i3, f3) = axis(c, 3, x[3]);
+        let s = [c.strides[1], c.strides[2], c.strides[3]];
+        let st = |i: __m256i, s: usize| _mm256_mullo_epi32(i, _mm256_set1_epi32(s as i32));
+        let base = _mm256_add_epi32(
+            _mm256_add_epi32(st(iw, c.strides[0]), st(i1, s[0])),
+            _mm256_add_epi32(st(i2, s[1]), st(i3, s[2])),
+        );
+        let (code, w) = sorted([f1, f2, f3]);
+        let mut r = [_mm_setzero_ps(); 8];
+        for (j, r) in r.iter_mut().enumerate() {
+            let (o, k) = (lane(base, j), lane(code, j));
+            let ww = [bcast(w[0], j), bcast(w[1], j), bcast(w[2], j)];
+            let lo = tetra(c, o, k, s, ww);
+            let hi = tetra(c, o + c.strides[0], k, s, ww);
+            *r = lerp(lo, hi, bcast(fw, j));
+        }
+        transpose(r)
+    }
+
+    /// RGB into a LUT output profile, eight pixels at a time (`FastLutOut`):
+    /// curves, map, Lab encoding, input tables, CLUT, output tables, clamp,
+    /// all on channel vectors.
+    #[target_feature(enable = "avx2")]
+    fn run_out<const SC: usize, const DC: usize>(
+        o: &FastLutOut,
+        src: &[f32],
+        dst: &mut [f32],
+        copy_alpha: bool,
+    ) -> usize {
+        let k = _mm256_set1_ps(o.lab_scale);
+        let mut done = 0;
+        for (s, d) in src.chunks_exact(8 * SC).zip(dst.chunks_exact_mut(8 * DC)) {
+            let [r, g, b, a] = load_f32::<SC>(s);
+            let x = [r, g, b];
+            let mut lin = [_mm256_setzero_ps(); 3];
+            for c in 0..3 {
+                lin[c] = forward(&o.fwd[c], clamp01(x[c]));
+            }
+            let t = product(&o.m, &o.off, lin);
+            let fx = lab_f(&o.lab, t[0]);
+            let fy = lab_f(&o.lab, t[1]);
+            let fz = lab_f(&o.lab, t[2]);
+            let l = _mm256_sub_ps(
+                _mm256_mul_ps(_mm256_set1_ps(116.0), fy),
+                _mm256_set1_ps(16.0),
+            );
+            let aa = _mm256_mul_ps(_mm256_set1_ps(500.0), _mm256_sub_ps(fx, fy));
+            let bb = _mm256_mul_ps(_mm256_set1_ps(200.0), _mm256_sub_ps(fy, fz));
+            let inv255 = _mm256_set1_ps(1.0 / 255.0);
+            let c128 = _mm256_set1_ps(128.0);
+            let enc = [
+                clamp01(_mm256_mul_ps(l, _mm256_set1_ps(0.01))),
+                clamp01(_mm256_mul_ps(_mm256_add_ps(aa, c128), inv255)),
+                clamp01(_mm256_mul_ps(_mm256_add_ps(bb, c128), inv255)),
+            ];
+            let mut e = [_mm256_setzero_ps(); 3];
+            for c in 0..3 {
+                e[c] = stage(&o.pre[c], _mm256_mul_ps(enc[c], k));
+            }
+            let v = clut3(&o.clut, e);
+            let mut y = [_mm256_setzero_ps(); 4];
+            for c in 0..4 {
+                y[c] = clamp01(stage(&o.post[c], v[c]));
+            }
+            if DC == 4 && o.outputs == 4 {
+                store_f32::<4>(d, y);
+            } else if DC == 3 {
+                store_f32::<3>(d, y);
+            } else {
+                // Three outputs and alpha.
+                let al = if copy_alpha { a } else { _mm256_set1_ps(1.0) };
+                store_f32::<4>(d, [y[0], y[1], y[2], al]);
+            }
+            done += 8;
+        }
+        done
+    }
+
+    /// A four-input LUT input profile into RGB, eight pixels at a time
+    /// (`FastLutIn`), all on channel vectors.
+    #[target_feature(enable = "avx2")]
+    fn run_in<const DC: usize>(i: &FastLutIn, src: &[f32], dst: &mut [f32]) -> usize {
+        let k = _mm256_set1_ps(i.lab_scale);
+        let mut done = 0;
+        for (s, d) in src.chunks_exact(32).zip(dst.chunks_exact_mut(8 * DC)) {
+            let x = load_f32::<4>(s);
+            let mut e = [_mm256_setzero_ps(); 4];
+            for c in 0..4 {
+                e[c] = stage(&i.pre[c], x[c]);
+            }
+            let v = clut4(&i.clut, e);
+            let p = [0, 1, 2].map(|c| _mm256_mul_ps(stage(&i.post[c], v[c]), k));
+            let l = _mm256_mul_ps(p[0], _mm256_set1_ps(100.0));
+            let c128 = _mm256_set1_ps(128.0);
+            let c255 = _mm256_set1_ps(255.0);
+            let a = _mm256_sub_ps(_mm256_mul_ps(p[1], c255), c128);
+            let b = _mm256_sub_ps(_mm256_mul_ps(p[2], c255), c128);
+            let fy = _mm256_mul_ps(
+                _mm256_add_ps(l, _mm256_set1_ps(16.0)),
+                _mm256_set1_ps(1.0 / 116.0),
+            );
+            let t = [
+                lab_f_inv(_mm256_add_ps(fy, _mm256_mul_ps(_mm256_set1_ps(0.002), a))),
+                lab_f_inv(fy),
+                lab_f_inv(_mm256_sub_ps(fy, _mm256_mul_ps(_mm256_set1_ps(0.005), b))),
+            ];
+            let lin = product(&i.m, &i.off, t);
+            let y = [0, 1, 2].map(|c| clamp01(inverse(&i.inv[c], clamp01(lin[c]))));
+            if DC == 3 {
+                store_f32::<3>(d, [y[0], y[1], y[2], _mm256_setzero_ps()]);
+            } else {
+                store_f32::<4>(d, [y[0], y[1], y[2], _mm256_set1_ps(1.0)]);
+            }
+            done += 8;
+        }
+        done
+    }
+
+    /// The fast `f32` LUT-chain kernel.
+    ///
+    /// # Safety
+    /// The CPU must support AVX2.
+    #[target_feature(enable = "avx2")]
+    pub(super) fn chain_f32_fast(
+        f: &FastChain,
+        src: &[f32],
+        dst: &mut [f32],
+        sc_dc: (usize, usize),
+        copy_alpha: bool,
+    ) -> usize {
+        // Shapes the vector stores cover: four outputs into CMYK, three
+        // into RGB or RGBA; CMYK in (no alpha) into RGB or RGBA. The rest
+        // (CMYKA either side) take the scalar twin.
+        match (f, sc_dc) {
+            (FastChain::Out(o), (3, 3)) if o.outputs == 3 => {
+                run_out::<3, 3>(o, src, dst, copy_alpha)
+            }
+            (FastChain::Out(o), (3, 4)) => run_out::<3, 4>(o, src, dst, copy_alpha),
+            (FastChain::Out(o), (4, 3)) if o.outputs == 3 => {
+                run_out::<4, 3>(o, src, dst, copy_alpha)
+            }
+            (FastChain::Out(o), (4, 4)) => run_out::<4, 4>(o, src, dst, copy_alpha),
+            (FastChain::In(i, 4), (4, 3)) => run_in::<3>(i, src, dst),
+            (FastChain::In(i, 4), (4, 4)) => run_in::<4>(i, src, dst),
             _ => 0,
         }
     }

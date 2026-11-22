@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use crate::color::delta_e_2000;
 use crate::curve::InvCurve;
 use crate::error::{Error, Result};
-use crate::fast::FastShaper;
+use crate::fast::{FastChain, FastShaper};
 use crate::lut::{ClutEval, FixedClut};
 use crate::pipeline::{
     build_chain, u8_point, Chain, GamutChain, LutOutChain, SegChain, ShaperChain, ShaperLink,
@@ -117,17 +117,27 @@ pub enum Precision {
     /// profiles' curves, matrices and tables in `f64`.
     #[default]
     Exact,
-    /// Tables and the device-link grid in `f32`, as fast colour engines do:
-    /// matrix-shaper RGB to RGB through 4096-entry forward and 16384-entry
-    /// inverse curve tables (within 1e-5 of the exact path per channel,
-    /// output clamped to `0..=1` as the exact path is), every other non-Lab
-    /// transform through its device-link grid (33 points per axis for three
-    /// inputs, 17 for four) interpolated tetrahedrally (within CIEDE2000 1.0
-    /// of the exact path on the measured corpus). Deterministic: the same
-    /// `f32` operations in the same order on every target, with or without
-    /// SIMD. Transforms whose tables cannot meet the bound (a pure power-law
-    /// output curve such as Adobe RGB's, Lab on either side, grey) keep the
-    /// exact path.
+    /// `f32` arithmetic with curve tables, as fast colour engines do:
+    ///
+    /// - matrix/TRC RGB to matrix/TRC RGB: 4096-cell forward and inverse
+    ///   curve tables (two-segment curves keep their linear toe exact) and
+    ///   the 3x3 map in `f32`: within 1e-5 of the exact path per channel
+    ///   (measured worst 2.3e-6), output clamped to `0..=1` as the exact
+    ///   path's is;
+    /// - matrix/TRC RGB into a Lab-PCS LUT output profile (RGB to CMYK) and a
+    ///   Lab-PCS LUT input profile into matrix/TRC RGB (CMYK to RGB): the
+    ///   profiles' own LUT tables and CLUT, interpolated as the exact path
+    ///   interpolates them, in `f32`, with the analytic curves and the
+    ///   L\*a\*b\* cube root by tables: within CIEDE2000 0.001 of the exact path
+    ///   (measured on Coated FOGRA39, both directions and intents).
+    ///
+    /// Deterministic: a fixed sequence of `f32` operations (no FMA), the same
+    /// with or without SIMD and on every target, except the few pixels of a
+    /// matrix-shaper transform whose linear value lands within 4e-6 of an
+    /// output curve's segment break: those take the exact path. Other
+    /// transforms (other LUT shapes, Lab or grey on either side) and
+    /// matrix-shaper ones whose tables miss the bound (a pure power-law output
+    /// curve such as Adobe RGB's) keep the exact path.
     Fast,
 }
 
@@ -775,6 +785,9 @@ pub struct Transform {
     /// the next ones (a bigger call builds its own, as it always has).
     axis8: OnceLock<Box<AxisTable>>,
     precision: Precision,
+    /// [`Precision::Fast`] on a LUT chain (float CMYK), built by the first
+    /// fast `f32` call (`None`: no fast path).
+    fast_chain: OnceLock<Option<FastChain>>,
 }
 
 /// Pixels from which an 8-bit grid call builds its own table (256 axis
@@ -921,6 +934,7 @@ impl Transform {
             pixels16: AtomicUsize::new(0),
             axis8: OnceLock::new(),
             precision: Precision::Exact,
+            fast_chain: OnceLock::new(),
         })
     }
 
@@ -953,6 +967,15 @@ impl Transform {
                 Some(exact) => e.run_fast_f32(src, dst, sc_dc, alpha, &exact),
                 None => false,
             },
+            Engine::Grid(_) if !self.src_layout.is_lab() && !self.dst_layout.is_lab() => {
+                match self.fast_chain.get_or_init(|| FastChain::new(&self.chain)) {
+                    Some(f) if f.channels() == (in_ch, out_ch) => {
+                        f.run(src, dst, sc_dc, alpha);
+                        true
+                    }
+                    _ => false,
+                }
+            }
             _ => false,
         }
     }
@@ -2641,7 +2664,7 @@ mod tests {
         for &a in &lattice {
             for &b in &lattice {
                 for &c in lattice.iter().step_by(4) {
-                    v.extend_from_slice(&[a, b, c, 1.0 - a][..ch]);
+                    v.extend_from_slice(&[a, b, c, 1.0 - a, 0.5][..ch]);
                 }
             }
         }
@@ -2659,7 +2682,7 @@ mod tests {
         while v.len() < n * ch {
             let x = xorshift(&mut s);
             for k in 0..ch {
-                let r = (x >> (16 * k)) as u16;
+                let r = (x >> (13 * k)) as u16;
                 let val = match r % 16 {
                     0 if out_of_range => specials[usize::from(r >> 4) % specials.len()],
                     1 => f32::from(r as u8) / 255.0,
@@ -2850,5 +2873,112 @@ mod tests {
             }
         }
         eprintln!("fast shaper dense: worst {worst_all:.3e}");
+    }
+
+    /// LUT chains with a fast path: sRGB <-> a synthetic lut16 CMYK profile,
+    /// in every RGB/RGBA and CMYK/CMYKA layout, both intents.
+    fn fast_chain_transforms() -> Vec<(String, Transform)> {
+        let srgb = Profile::new_srgb();
+        let cmyk = test_lut_profile(crate::ColorSpace::Cmyk, 4, 0x0430_0000, (4096, 2), true);
+        let mut out = Vec::new();
+        for intent in [Intent::Perceptual, Intent::RelativeColorimetric] {
+            let o = Options::default();
+            for (sl, dl) in [
+                (Layout::Rgb, Layout::Cmyk),
+                (Layout::Rgba, Layout::Cmyka),
+                (Layout::Rgb, Layout::Cmyka),
+                (Layout::Rgba, Layout::Cmyk),
+            ] {
+                let t = Transform::new(&srgb, sl, &cmyk, dl, intent, o).unwrap();
+                out.push((format!("srgb->cmyk {sl:?}->{dl:?} {intent:?}"), t));
+                let t = Transform::new(&cmyk, dl, &srgb, sl, intent, o).unwrap();
+                out.push((format!("cmyk->srgb {dl:?}->{sl:?} {intent:?}"), t));
+            }
+        }
+        out.into_iter()
+            .map(|(n, t)| (n, t.with_precision(Precision::Fast)))
+            .collect()
+    }
+
+    /// The fast LUT-chain kernel against its scalar twin, bit for bit, in-
+    /// and out-of-range input, and the census: the kernel is reached.
+    #[test]
+    fn fast_chain_kernel_matches_its_scalar_twin() {
+        let n = 20_003;
+        for (name, t) in fast_chain_transforms() {
+            let (sc, dc) = (t.src_layout.channels(), t.dst_layout.channels());
+            let src = sample_f32(n, sc, true);
+            let mut got = vec![1f32; n * dc];
+            let before = simd::CENSUS.load(Ordering::Relaxed);
+            t.transform(&src, &mut got).unwrap();
+            // The kernel takes whole groups of 8 pixels in every shape but
+            // CMYKA (five samples), which the scalar twin serves.
+            if simd::avx2() && sc < 5 && dc < 5 {
+                let reached = simd::CENSUS.load(Ordering::Relaxed) - before;
+                assert!(reached >= (n / 8 * 8) as u64, "{name}: kernel not reached");
+            }
+            let f = t
+                .fast_chain
+                .get()
+                .and_then(Option::as_ref)
+                .expect("fast chain");
+            let mut want = vec![0f32; n * dc];
+            let alpha = (t.src_layout.has_alpha(), t.dst_layout.has_alpha());
+            f.run_scalar(&src, &mut want, (sc, dc), alpha);
+            if let Some(k) = got
+                .iter()
+                .zip(&want)
+                .position(|(a, b)| a.to_bits() != b.to_bits())
+            {
+                let px = k / dc;
+                panic!(
+                    "fast chain {name}: pixel {px} in {:?} kernel {:?} twin {:?}",
+                    &src[px * sc..px * sc + sc],
+                    &got[px * dc..px * dc + dc],
+                    &want[px * dc..px * dc + dc]
+                );
+            }
+            let colour = t.dst_layout.color_channels();
+            let in_range = got
+                .chunks_exact(dc)
+                .all(|p| p[..colour].iter().all(|v| (0.0..=1.0).contains(v)));
+            assert!(in_range, "{name}: range");
+            // Against the exact path: CIEDE2000 through the destination
+            // profile (the budget is 1.0 worst, 0.1 mean; the chain fast path
+            // sits near 1e-3).
+            let exact =
+                Transform::from_chain((*t.chain).clone(), t.src_layout, t.dst_layout).unwrap();
+            let mut ex = vec![0f32; n * dc];
+            exact.transform(&src, &mut ex).unwrap();
+            let lab = Profile::new_lab_identity();
+            let dst_profile = if name.starts_with("srgb->cmyk") {
+                test_lut_profile(crate::ColorSpace::Cmyk, 4, 0x0430_0000, (4096, 2), true)
+            } else {
+                Profile::new_srgb()
+            };
+            let to_lab = Transform::new(
+                &dst_profile,
+                t.dst_layout,
+                &lab,
+                Layout::Lab,
+                Intent::RelativeColorimetric,
+                Options::default(),
+            )
+            .unwrap();
+            let (mut la, mut lb) = (vec![0f32; n * 3], vec![0f32; n * 3]);
+            to_lab.transform(&got, &mut la).unwrap();
+            to_lab.transform(&ex, &mut lb).unwrap();
+            let de = la
+                .chunks_exact(3)
+                .zip(lb.chunks_exact(3))
+                .map(|(a, b)| {
+                    crate::color::delta_e_2000(
+                        crate::color::Lab::new(a[0].into(), a[1].into(), a[2].into()),
+                        crate::color::Lab::new(b[0].into(), b[1].into(), b[2].into()),
+                    )
+                })
+                .fold(0f64, f64::max);
+            assert!(de < 0.05, "{name}: dE2000 {de}");
+        }
     }
 }

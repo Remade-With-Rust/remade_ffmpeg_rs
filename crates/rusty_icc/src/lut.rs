@@ -596,7 +596,7 @@ impl<const IN: usize, const OUT: usize> FixedClut<'_, IN, OUT> {
 /// Unlike [`FixedClut`] it takes trilinear CLUTs (every Lab-indexed output
 /// table) too.
 pub(crate) struct Clut3Ref<'a, const N: usize> {
-    clut: &'a ClutEval,
+    pub(crate) clut: &'a ClutEval,
     grid: [usize; 3],
     strides: [usize; 3],
 }
@@ -725,6 +725,16 @@ impl ClutEval {
     /// Grid points along input `i`.
     pub(crate) fn points(&self, i: usize) -> usize {
         self.grid[i]
+    }
+
+    /// Grid points per input.
+    pub(crate) fn dims(&self) -> &[usize] {
+        &self.grid
+    }
+
+    /// The grid values, row-major, first input slowest, `outputs` per point.
+    pub(crate) fn data(&self) -> &[f32] {
+        &self.data
     }
 
     pub(crate) fn eval(&self, x: &[f64], out: &mut [f64; 16]) {
