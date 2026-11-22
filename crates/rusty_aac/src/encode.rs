@@ -542,6 +542,33 @@ pub(crate) fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32) ->
 /// shipping as a constant. Kept as the byte-identical fallback.
 const SMR_FLAT: f64 = 0.0158; // 10^(-18/10)
 
+thread_local! {
+    /// The flat signal-to-mask ratio (linear) of the frame this thread is
+    /// coding, from [`AacTuning::mask_smr_db`]: set per frame by
+    /// `encode_frame` and per segment by the frame-demand pre-pass (each wholly
+    /// on one worker thread), so the psy model needs no extra argument for it.
+    /// [`SMR_FLAT`] (18 dB) outside an encode.
+    static MASK_SMR: std::cell::Cell<f64> = const { std::cell::Cell::new(SMR_FLAT) };
+}
+
+/// [`AacTuning::mask_smr_db`] applies to streams under this rate a
+/// channel; from it up the mask is the 2.1.2 18 dB. Measured (PEAQ, all
+/// low-rate tools on): 24 dB is worth +0.41 BD-ODG on stereo vocal at 48-64
+/// kbps a channel, but cost stereo vocal 0.15 ODG at 96 kbps a channel (192
+/// kbps stereo) and mono vocal 0.08-0.13 at 96-160 kbps; at 18 dB every clip
+/// there is within 0.02 of 2.1.2 or better.
+const MASK_SMR_MAX_BPS_PER_CHANNEL: u32 = 96_000;
+
+/// The linear ratio for a flat SMR of `db` decibels: [`SMR_FLAT`] itself at
+/// 18 dB, so that setting keeps the 2.1.2 masks bit for bit.
+fn smr_ratio(db: f32) -> f64 {
+    if (f64::from(db) - 18.0).abs() < 1e-9 {
+        SMR_FLAT
+    } else {
+        10f64.powf(-f64::from(db) / 10.0)
+    }
+}
+
 /// The psychoacoustic arms in flight, threaded down to every coding path.
 ///
 /// A struct rather than loose bools because these arms compose: A1 decides
@@ -618,7 +645,7 @@ fn masking_from_spread(
         .map(|i| {
             let spread = spread[i];
             let smr = match tonality {
-                None => SMR_FLAT,
+                None => MASK_SMR.with(std::cell::Cell::get),
                 Some(t) => {
                     let center = f64::midpoint(f64::from(swb[i]), f64::from(swb[i + 1]));
                     let bark = hz_to_bark(center * f64::from(sample_rate) * 0.5 / n_coeffs as f64);
@@ -1504,6 +1531,20 @@ impl BandCost {
     /// whose `lav` holds the peak (the `lav`s rise with the book number, so they
     /// are a suffix) and whose `dim` divides the width.
     fn best(&self, width: usize) -> (u8, usize) {
+        let cost = self.costs(width);
+        let mut best = (ESC_HCB, usize::MAX);
+        for (cb, &bits) in cost.iter().enumerate().skip(1) {
+            if bits != u32::MAX && (bits as usize) < best.1 {
+                best = (cb as u8, bits as usize);
+            }
+        }
+        best
+    }
+
+    /// Every book's bits for the band (index 0 unused), `u32::MAX` for a book
+    /// that cannot code it: the eligibility rule of [`best`](Self::best). The
+    /// section trellis prices all of them at once (see [`band_book_costs`]).
+    fn costs(&self, width: usize) -> [u32; 12] {
         let lane = |v: u64, k: u32| (v >> (16 * k)) & 0xffff;
         let nz = u64::from(self.nz);
         let (a12, a34, a56) = (
@@ -1536,16 +1577,14 @@ impl BandCost {
         if width % 4 != 0 {
             first = first.max(5);
         }
-        let mut best = (ESC_HCB, usize::MAX);
+        let mut out = [u32::MAX; 12];
         if width % 2 != 0 {
-            return best;
+            return out;
         }
-        for (cb, &bits) in cost.iter().enumerate().skip(first) {
-            if (bits as usize) < best.1 {
-                best = (cb as u8, bits as usize);
-            }
+        for cb in first..12 {
+            out[cb] = u32::try_from(cost[cb]).unwrap_or(u32::MAX - 1);
         }
-        best
+        out
     }
 }
 
@@ -1644,6 +1683,333 @@ fn section_bits(cbs: &[u8]) -> usize {
         k += len;
     }
     bits
+}
+
+thread_local! {
+    /// [`AacTuning::section_trellis`] for the frame this thread is
+    /// coding, set once per frame by `encode_frame` (frames code on worker
+    /// threads, each frame wholly on one), so the coding kernels need no extra
+    /// argument for it.
+    static SECTION_TRELLIS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn section_trellis_on() -> bool {
+    SECTION_TRELLIS.with(std::cell::Cell::get)
+}
+
+/// Bits of the scalefactor of an all-zero band carried inside another
+/// codebook's section: its scalefactor is sent as a zero delta (see
+/// [`zero_band_sf`]), the one-bit `SCALEFACTOR_BOOK` code.
+const CARRIED_ZERO_SF_BITS: u32 = 1;
+
+/// Spectral bits of one band (one window group of a short frame:
+/// `nwin` windows of `wlen` lines from `win0`) under every codebook 0..=11;
+/// `u32::MAX` where the book cannot code it. Book 0 (`ZERO_HCB`) is free for
+/// an all-zero band and impossible otherwise.
+fn band_book_costs(
+    quant: &[i32],
+    s: usize,
+    e: usize,
+    win0: usize,
+    nwin: usize,
+    wlen: usize,
+) -> [u32; 12] {
+    let mut out = [u32::MAX; 12];
+    let mut maxq = 0u32;
+    for w in win0..win0 + nwin {
+        for &q in &quant[w * wlen + s..w * wlen + e] {
+            maxq = maxq.max(q.unsigned_abs());
+        }
+    }
+    if maxq == 0 {
+        // An all-zero band: every book codes it as its zero tuple repeated,
+        // a per-book constant, so no tuple need be looked up.
+        out[0] = 0;
+        let zt = zero_tuple_bits();
+        let tuples_per = |dim: usize| ((e - s) / dim * nwin) as u32;
+        for cb in 1..=11usize {
+            let dim = CODEBOOKS[cb].dim as usize;
+            if (e - s) % dim == 0 {
+                out[cb] = tuples_per(dim) * zt[cb] + CARRIED_ZERO_SF_BITS;
+            }
+        }
+        return out;
+    }
+    if (e - s) % 2 != 0 {
+        // Cold: every AAC band width is a multiple of 4.
+        return band_book_costs_ref(quant, s, e, win0, nwin, wlen);
+    }
+    // One walk prices every book, the kernel `best_codebook_for_band` and
+    // `best_codebook_short` choose from.
+    let band = |w: usize| &quant[w * wlen + s..w * wlen + e];
+    let t = cost_tables();
+    let mut cost = BandCost::default();
+    for w in win0..win0 + nwin {
+        cost.add2(t, band(w));
+    }
+    if cost.maxq <= 2 && (e - s) % 4 == 0 {
+        for w in win0..win0 + nwin {
+            cost.add4(t, band(w));
+        }
+    }
+    if cost.maxq >= 16 {
+        for w in win0..win0 + nwin {
+            cost.add_esc(band(w));
+        }
+    }
+    cost.costs(e - s)
+}
+
+/// [`band_book_costs`] for a non-zero band by a per-book search through
+/// [`spectral_bits`]: the cold path for an odd band width and the oracle of
+/// the one-walk pricing's test.
+#[cold]
+fn band_book_costs_ref(
+    quant: &[i32],
+    s: usize,
+    e: usize,
+    win0: usize,
+    nwin: usize,
+    wlen: usize,
+) -> [u32; 12] {
+    let mut out = [u32::MAX; 12];
+    let maxq = (win0..win0 + nwin)
+        .flat_map(|w| quant[w * wlen + s..w * wlen + e].iter())
+        .map(|q| q.unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    for cb in 1..=11u8 {
+        let meta = &CODEBOOKS[cb as usize];
+        let dim = meta.dim as usize;
+        if (e - s) % dim != 0 || (!meta.esc && u32::from(meta.lav) < maxq) {
+            continue;
+        }
+        let mut bits = 0u32;
+        let mut ok = true;
+        'w: for w in win0..win0 + nwin {
+            let base = w * wlen;
+            let mut i = s;
+            while i < e {
+                if let Some(b) = spectral_bits(cb as usize, &quant[base + i..base + i + dim]) {
+                    bits += b as u32;
+                } else {
+                    ok = false;
+                    break 'w;
+                }
+                i += dim;
+            }
+        }
+        if ok {
+            out[cb as usize] = bits;
+        }
+    }
+    out
+}
+
+/// Bits of each book's all-zero tuple (index 0 unused).
+fn zero_tuple_bits() -> &'static [u32; 12] {
+    static T: OnceLock<[u32; 12]> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [0u32; 12];
+        for (cb, b) in t.iter_mut().enumerate().skip(1) {
+            let dim = CODEBOOKS[cb].dim as usize;
+            *b = spectral_bits(cb, &[0i32; 4][..dim]).unwrap_or(u32::MAX as usize / 4096) as u32;
+        }
+        t
+    })
+}
+
+/// **Section trellis.** The per-band codebooks of one window group that
+/// minimise spectral bits plus `section_data`, by a Viterbi over (band,
+/// codebook): a section costs `hdr` bits (4-bit codebook + one length field),
+/// so it can pay to code a band with a larger book than its cheapest, or to
+/// carry an all-zero band inside a neighbouring section, rather than open a
+/// new section. `costs` is [`band_book_costs`] per band. Length-escape fields
+/// of long runs are not priced here; the exact count is `section_bits`.
+fn trellis_books(costs: &[[u32; 12]], hdr: u32) -> Vec<u8> {
+    const INF: u64 = u64::MAX / 4;
+    let n = costs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut dp = vec![[INF; 12]; n];
+    let mut from = vec![[0u8; 12]; n];
+    for cb in 0..12 {
+        if costs[0][cb] != u32::MAX {
+            dp[0][cb] = u64::from(hdr) + u64::from(costs[0][cb]);
+        }
+    }
+    for b in 1..n {
+        // Best predecessor overall (a section break) and per book (a run).
+        let (mut best, mut arg) = (INF, 0u8);
+        for p in 0..12 {
+            if dp[b - 1][p] < best {
+                best = dp[b - 1][p];
+                arg = p as u8;
+            }
+        }
+        for cb in 0..12 {
+            let c = costs[b][cb];
+            if c == u32::MAX {
+                continue;
+            }
+            let stay = dp[b - 1][cb];
+            let brk = best.saturating_add(u64::from(hdr));
+            let (v, f) = if stay <= brk {
+                (stay, cb as u8)
+            } else {
+                (brk, arg)
+            };
+            dp[b][cb] = v.saturating_add(u64::from(c));
+            from[b][cb] = f;
+        }
+    }
+    let mut cb = (0..12).min_by_key(|&c| dp[n - 1][c]).unwrap_or(11) as u8;
+    let mut out = vec![0u8; n];
+    for b in (0..n).rev() {
+        out[b] = cb;
+        cb = from[b][cb as usize];
+    }
+    out
+}
+
+/// Scalefactors in coded order (`cbs` order) with every all-zero band that a
+/// section carries under a regular codebook (`is_zero(i)`) given the previous
+/// regular band's scalefactor, or the first one's if none precedes it: a zero
+/// delta, one bit, and never a step the ±60 delta range cannot code. The
+/// band's value does not matter to the decoder (its lines are all zero).
+fn zero_band_sf(cbs: &[u8], sf: &[i32], is_zero: impl Fn(usize) -> bool) -> Vec<i32> {
+    let mut out = sf.to_vec();
+    let regular = |i: usize| cbs[i] != ZERO_HCB && cbs[i] < NOISE_HCB;
+    let first = (0..cbs.len())
+        .find(|&i| regular(i) && !is_zero(i))
+        .map(|i| sf[i]);
+    let mut last = first;
+    for i in 0..cbs.len() {
+        if !regular(i) {
+            continue;
+        }
+        if is_zero(i) {
+            if let Some(v) = last {
+                out[i] = v;
+            }
+        } else {
+            last = Some(sf[i]);
+        }
+    }
+    out
+}
+
+/// Long-block codebooks for `quant` over `0..max_sfb`: the cheapest book per
+/// band, or the [`trellis_books`] choice when the section trellis is on.
+fn long_books(quant: &[i32], swb: &[u16], max_sfb: usize) -> (Vec<u8>, usize) {
+    if section_trellis_on() {
+        let costs: Vec<[u32; 12]> = (0..max_sfb)
+            .map(|b| {
+                band_book_costs(
+                    quant,
+                    usize::from(swb[b]),
+                    usize::from(swb[b + 1]),
+                    0,
+                    1,
+                    FRAME_LEN,
+                )
+            })
+            .collect();
+        let cbs = trellis_books(&costs, 9);
+        let bits = cbs
+            .iter()
+            .zip(&costs)
+            .map(|(&c, k)| k[c as usize] as usize)
+            .sum();
+        return (cbs, bits);
+    }
+    let mut cbs = Vec::with_capacity(max_sfb);
+    let mut spec_bits = 0usize;
+    for sfb in 0..max_sfb {
+        let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+        let (cb, bits) = best_codebook_for_band(quant, s, e);
+        cbs.push(cb);
+        spec_bits += bits;
+    }
+    (cbs, spec_bits)
+}
+
+/// Short-block codebooks for one window group (windows `w0..w0+nwin`), as
+/// [`long_books`].
+fn short_books(
+    quant: &[i32],
+    swb: &[u16],
+    max_sfb: usize,
+    w0: usize,
+    nwin: usize,
+) -> (Vec<u8>, usize) {
+    if section_trellis_on() {
+        let costs: Vec<[u32; 12]> = (0..max_sfb)
+            .map(|b| {
+                band_book_costs(
+                    quant,
+                    usize::from(swb[b]),
+                    usize::from(swb[b + 1]),
+                    w0,
+                    nwin,
+                    SHORT_HALF,
+                )
+            })
+            .collect();
+        let cbs = trellis_books(&costs, 7);
+        let bits = cbs
+            .iter()
+            .zip(&costs)
+            .map(|(&c, k)| k[c as usize] as usize)
+            .sum();
+        return (cbs, bits);
+    }
+    let mut cbs = Vec::with_capacity(max_sfb);
+    let mut bits = 0usize;
+    for sfb in 0..max_sfb {
+        let (cb, b) = best_codebook_short(quant, swb, sfb, w0, nwin);
+        cbs.push(cb);
+        bits += b;
+    }
+    (cbs, bits)
+}
+
+/// Is band `sfb` of window group (`w0`, `nwin`) all zero in `quant`?
+fn band_is_zero(
+    quant: &[i32],
+    swb: &[u16],
+    sfb: usize,
+    w0: usize,
+    nwin: usize,
+    wlen: usize,
+) -> bool {
+    let (s, e) = (usize::from(swb[sfb]), usize::from(swb[sfb + 1]));
+    (w0..w0 + nwin).all(|w| quant[w * wlen + s..w * wlen + e].iter().all(|&q| q == 0))
+}
+
+/// [`zero_band_sf`] for a long block's (`cbs`, `sf`, `quant`).
+fn zero_band_sf_long(cbs: &[u8], sf: &[i32], quant: &[i32], swb: &[u16]) -> Vec<i32> {
+    zero_band_sf(cbs, sf, |i| band_is_zero(quant, swb, i, 0, 1, FRAME_LEN))
+}
+
+/// [`zero_band_sf`] for a short block's group-major (`cbs`, `sf_flat`).
+fn zero_band_sf_short(
+    cbs: &[u8],
+    sf_flat: &[i32],
+    quant: &[i32],
+    swb: &[u16],
+    groups: &[u8],
+    max_sfb: usize,
+) -> Vec<i32> {
+    if max_sfb == 0 {
+        return sf_flat.to_vec();
+    }
+    let starts: Vec<(usize, usize)> = group_windows(groups).collect();
+    zero_band_sf(cbs, sf_flat, |i| {
+        let (g, sfb) = (i / max_sfb, i % max_sfb);
+        band_is_zero(quant, swb, sfb, starts[g].0, starts[g].1, SHORT_HALF)
+    })
 }
 
 /// Per-band scalefactors from a common `base` plus the psy offsets (see
@@ -1985,17 +2351,15 @@ fn code_core(xp: &Xpow, swb: &[u16], sf: &[i32], quant: &mut [i32]) -> (Vec<u8>,
             max_sfb = sfb + 1;
         }
     }
-    let mut cbs = Vec::with_capacity(max_sfb);
-    let mut spec_bits = 0usize;
-    for sfb in 0..max_sfb {
-        let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
-        let (cb, bits) = best_codebook_for_band(quant, s, e);
-        cbs.push(cb);
-        spec_bits += bits;
-    }
-    let gg = global_gain(&cbs, sf);
+    let (cbs, spec_bits) = long_books(quant, swb, max_sfb);
+    let sf_bits = if section_trellis_on() {
+        let sfz = zero_band_sf_long(&cbs, sf, quant, swb);
+        scalefactor_bits(&cbs, &sfz, global_gain(&cbs, &sfz))
+    } else {
+        scalefactor_bits(&cbs, sf, global_gain(&cbs, sf))
+    };
     // global_gain(8) + ics_info(~11) + 3 flag bits + sections + scalefactors + spectrum.
-    let body = 8 + 11 + 3 + section_bits(&cbs) + scalefactor_bits(&cbs, sf, gg) + spec_bits;
+    let body = 8 + 11 + 3 + section_bits(&cbs) + sf_bits + spec_bits;
     (cbs, body, max_sfb)
 }
 
@@ -2501,6 +2865,9 @@ fn encode_channel_element(
             }
         }
     }
+    if section_trellis_on() {
+        sf = zero_band_sf_long(&cbs, &sf, &quant, swb);
+    }
     let gg = global_gain(&cbs, &sf);
 
     w.write(elem_id, 3);
@@ -2806,17 +3173,41 @@ pub(crate) fn detect_transients(chan: &[f32], nframes: usize) -> Vec<bool> {
 /// Used by the Rung 0 shape gate as a transient veto; it is also the signal arm
 /// A9 will replace the detector's threshold with.
 pub(crate) fn frame_attack_ratios(chan: &[f32], nframes: usize) -> Vec<f32> {
+    frame_attack_ratios_with(chan, nframes, false)
+}
+
+/// Energy of the [`SHORT_HALF`]-sample sub-block of `chan` starting at
+/// `start` (samples past the end are silence). With `highpass`, of the
+/// second difference `x[n] - 2x[n-1] + x[n-2]` instead (samples before 0 are
+/// silence): a +12 dB/octave tilt, so an attack carried by its high
+/// frequencies stands out over a sustained low-frequency body.
+fn sub_block_energy(chan: &[f32], start: usize, highpass: bool) -> f64 {
+    let at = |i: usize| f64::from(chan.get(i).copied().unwrap_or(0.0));
+    (start..start + SHORT_HALF)
+        .map(|n| {
+            let x = if highpass {
+                let x1 = if n >= 1 { at(n - 1) } else { 0.0 };
+                let x2 = if n >= 2 { at(n - 2) } else { 0.0 };
+                at(n) - 2.0 * x1 + x2
+            } else {
+                at(n)
+            };
+            x * x
+        })
+        .sum()
+}
+
+/// [`frame_attack_ratios`] on plain (`highpass = false`) or high-passed
+/// sub-block energies (see [`sub_block_energy`]).
+pub(crate) fn frame_attack_ratios_with(chan: &[f32], nframes: usize, highpass: bool) -> Vec<f32> {
     let mut sub: Vec<f64> = Vec::with_capacity(nframes * 8);
     for f in 0..nframes {
         for sb in 0..8 {
-            let start = f * FRAME_LEN + sb * SHORT_HALF;
-            let e: f64 = (0..SHORT_HALF)
-                .map(|i| {
-                    let x = f64::from(chan.get(start + i).copied().unwrap_or(0.0));
-                    x * x
-                })
-                .sum();
-            sub.push(e);
+            sub.push(sub_block_energy(
+                chan,
+                f * FRAME_LEN + sb * SHORT_HALF,
+                highpass,
+            ));
         }
     }
     let mean_e = sub.iter().sum::<f64>() / sub.len().max(1) as f64;
@@ -2857,9 +3248,13 @@ pub(crate) fn frame_attack_ratios(chan: &[f32], nframes: usize) -> Vec<f32> {
 /// This is not merely a quality knob: arm A1 (short-block psy) can only reach
 /// frames that are coded as short blocks, so a detector that never fires makes A1
 /// unmeasurable. A9 is A1's prerequisite.
-pub(crate) fn detect_transients_relative(chan: &[f32], nframes: usize) -> Vec<bool> {
+pub(crate) fn detect_transients_relative(
+    chan: &[f32],
+    nframes: usize,
+    highpass: bool,
+) -> Vec<bool> {
     const RATIO: f32 = 10.0;
-    let ratios = frame_attack_ratios(chan, nframes);
+    let ratios = frame_attack_ratios_with(chan, nframes, highpass);
     (0..nframes)
         .map(|f| f > 0 && ratios.get(f).copied().unwrap_or(1.0) > RATIO)
         .collect()
@@ -3120,14 +3515,15 @@ fn code_frame_short(
     let mut section_bits = 0usize;
     for (w0, nwin) in group_windows(groups) {
         let start = cbs.len();
-        for sfb in 0..max_sfb {
-            let (cb, bits) = best_codebook_short(&quant, swb, sfb, w0, nwin);
-            cbs.push(cb);
-            spec_bits += bits;
-        }
+        let (g_cbs, bits) = short_books(&quant, swb, max_sfb, w0, nwin);
+        cbs.extend_from_slice(&g_cbs);
+        spec_bits += bits;
         section_bits += section_bits_short(&cbs[start..]);
     }
-    let sf_flat = flatten_short_sf(sf, num_swb, max_sfb, groups.len());
+    let mut sf_flat = flatten_short_sf(sf, num_swb, max_sfb, groups.len());
+    if section_trellis_on() {
+        sf_flat = zero_band_sf_short(&cbs, &sf_flat, &quant, swb, groups, max_sfb);
+    }
     let gg = global_gain(&cbs, &sf_flat);
     // global_gain(8) + ics_info(short ~18) + 3 flags + sections + scalefactors + spectrum.
     let body = 8 + 18 + 3 + section_bits + scalefactor_bits(&cbs, &sf_flat, gg) + spec_bits;
@@ -3311,6 +3707,11 @@ fn rate_loop_short(
     target_bits: usize,
     groups: &[u8],
 ) -> i32 {
+    if section_trellis_on() {
+        let est = |b: i32| estimate_bits_short(xp, swb, offsets, b, groups);
+        let exact = |b: i32| code_frame_short(xp, swb, &scalefactors(offsets, b), groups).1;
+        return seeded_level(min_base_short(xp), 255, target_bits, est, exact);
+    }
     let mut lo = min_base_short(xp);
     let mut hi = 255i32;
     while lo < hi {
@@ -3323,6 +3724,86 @@ fn rate_loop_short(
         }
     }
     lo
+}
+
+/// The short-block analogue of [`estimate_bits`]: every window of every
+/// group quantized at `base`, each coefficient priced from `coef_bits`, and a
+/// flat 7 bits a coded band (section and scalefactor). Seeds the search only.
+fn estimate_bits_short(
+    xp: &Xpow,
+    swb: &[u16],
+    offsets: &Offsets,
+    base: i32,
+    groups: &[u8],
+) -> usize {
+    let _prof = prof::scope(Stage::EncEstimate);
+    let scale = scale_table();
+    let sf = offsets.sf(base);
+    let ct = coef_bits();
+    let num_swb = swb.len() - 1;
+    let mut bits = 29usize; // global_gain + short ics_info + flags, approx
+    let mut qbuf = [0i32; SHORT_HALF];
+    for (g, (w0, nwin)) in group_windows(groups).enumerate() {
+        for sfb in 0..num_swb {
+            let (s, e) = (usize::from(swb[sfb]), usize::from(swb[sfb + 1]));
+            let sc = scale[sf[g * num_swb + sfb].clamp(0, 255) as usize];
+            let (mut band, mut nonzero) = (0usize, false);
+            for win in w0..w0 + nwin {
+                let at = win * SHORT_HALF;
+                quantize_band(
+                    &xp.pow[at + s..at + e],
+                    &xp.sign[at + s..at + e],
+                    sc,
+                    &mut qbuf[..e - s],
+                );
+                for &q in &qbuf[..e - s] {
+                    let m = q.unsigned_abs() as usize;
+                    if m != 0 {
+                        nonzero = true;
+                        band += usize::from(ct[m.min(ct.len() - 1)]);
+                    }
+                }
+            }
+            if nonzero {
+                bits += 7 + band;
+            }
+        }
+    }
+    bits
+}
+
+/// The smallest level in `[min_level, max_level]` whose `exact` bits fit
+/// `target`: a binary search on the cheap `est` seeds a walk with `exact`
+/// (the search shape of [`rate_loop_coded`]). Same answer as a binary search
+/// on `exact` wherever the exact bits fall monotonically in the level, for a
+/// handful of exact evaluations instead of one a step.
+fn seeded_level(
+    min_level: i32,
+    max_level: i32,
+    target: usize,
+    est: impl Fn(i32) -> usize,
+    exact: impl Fn(i32) -> usize,
+) -> i32 {
+    let (mut lo, mut hi) = (min_level, max_level);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if est(mid) <= target {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let mut level = lo;
+    if exact(level) <= target {
+        while level > min_level && exact(level - 1) <= target {
+            level -= 1;
+        }
+    } else {
+        while level < max_level && exact(level) > target {
+            level += 1;
+        }
+    }
+    level
 }
 
 /// `short_block` `section_data` (4-bit codebook + 3-bit run increments, esc = 7).
@@ -3528,17 +4009,10 @@ fn joint_max_sfb(q0: &[i32], q1: &[i32], swb: &[u16], is_short: bool) -> usize {
 fn codebooks(quant: &[i32], swb: &[u16], is_short: bool, max_sfb: usize, groups: &[u8]) -> Vec<u8> {
     if is_short {
         group_windows(groups)
-            .flat_map(|(w0, nwin)| {
-                (0..max_sfb).map(move |sfb| best_codebook_short(quant, swb, sfb, w0, nwin).0)
-            })
+            .flat_map(|(w0, nwin)| short_books(quant, swb, max_sfb, w0, nwin).0)
             .collect()
     } else {
-        (0..max_sfb)
-            .map(|sfb| {
-                let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
-                best_codebook_for_band(quant, s, e).0
-            })
-            .collect()
+        long_books(quant, swb, max_sfb).0
     }
 }
 
@@ -3575,7 +4049,15 @@ fn write_channel_data(
 ) {
     let sf_flat;
     let sf = if is_short {
-        sf_flat = flatten_short_sf(sf, swb.len() - 1, max_sfb, groups.len());
+        let f = flatten_short_sf(sf, swb.len() - 1, max_sfb, groups.len());
+        sf_flat = if section_trellis_on() {
+            zero_band_sf_short(cbs, &f, quant, swb, groups, max_sfb)
+        } else {
+            f
+        };
+        &sf_flat[..]
+    } else if section_trellis_on() {
+        sf_flat = zero_band_sf_long(cbs, sf, quant, swb);
         &sf_flat[..]
     } else {
         sf
@@ -3677,6 +4159,14 @@ fn joint_rate_loop(
     };
     let mut lo = lo0.max(lo1);
     let mut hi = off0.max_level().max(off1.max_level());
+    if is_short && section_trellis_on() {
+        let est = |b: i32| {
+            estimate_bits_short(xp0, swb, off0, b, groups)
+                + estimate_bits_short(xp1, swb, off1, b, groups)
+        };
+        let exact = |b: i32| pair_body_bits(xp0, off0, xp1, off1, swb, b, groups);
+        return (seeded_level(lo, hi, target_total, est, exact), None);
+    }
     if is_short {
         while lo < hi {
             let mid = (lo + hi) / 2;
@@ -3687,6 +4177,9 @@ fn joint_rate_loop(
             }
         }
         return (lo, None);
+    }
+    if section_trellis_on() {
+        return joint_rate_loop_seeded(xp0, off0, xp1, off1, swb, target_total, lo, hi);
     }
     // Long blocks: the same search, keeping both channels' quantized spectra
     // from the last fitting level. That level is the answer whenever the search
@@ -3712,6 +4205,62 @@ fn joint_rate_loop(
     }
     let kept = best.and_then(|(b, k0, k1)| (b == lo).then_some((k0, k1)));
     (lo, kept)
+}
+
+/// The long-block [`joint_rate_loop`] under the section trellis: the search
+/// shape of [`rate_loop_coded`], a binary search on the cheap estimate that
+/// seeds a walk with the exact coder to the smallest common level whose pair
+/// fits. The plain binary search ran the exact coder (now with its trellis) at
+/// every one of its ~9 steps, for both channels; this runs it two or three
+/// times. Same answer wherever the exact bits fall monotonically in the level.
+#[allow(clippy::too_many_arguments)]
+fn joint_rate_loop_seeded(
+    xp0: &Xpow,
+    off0: &Offsets,
+    xp1: &Xpow,
+    off1: &Offsets,
+    swb: &[u16],
+    target_total: usize,
+    min_level: i32,
+    max_level: i32,
+) -> (i32, Option<PairQuant>) {
+    let (mut lo, mut hi) = (min_level, max_level);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if estimate_bits(xp0, swb, off0, mid) + estimate_bits(xp1, swb, off1, mid) <= target_total {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let (mut q0, mut q1) = (vec![0i32; xp0.len()], vec![0i32; xp1.len()]);
+    let mut best: Option<(i32, Vec<i32>, Vec<i32>)> = None;
+    let mut exact = |b: i32| {
+        let bits = code_core(xp0, swb, &scalefactors(off0, b), &mut q0).1
+            + code_core(xp1, swb, &scalefactors(off1, b), &mut q1).1;
+        let fits = bits <= target_total;
+        if fits {
+            let (k0, k1) = (std::mem::take(&mut q0), std::mem::take(&mut q1));
+            (q0, q1) = match best.take() {
+                Some((_, o0, o1)) => (o0, o1),
+                None => (vec![0i32; xp0.len()], vec![0i32; xp1.len()]),
+            };
+            best = Some((b, k0, k1));
+        }
+        fits
+    };
+    let mut level = lo;
+    if exact(level) {
+        while level > min_level && exact(level - 1) {
+            level -= 1;
+        }
+    } else {
+        while level < max_level && !exact(level) {
+            level += 1;
+        }
+    }
+    let kept = best.and_then(|(b, k0, k1)| (b == level).then_some((k0, k1)));
+    (level, kept)
 }
 
 /// **Arm A7 — intensity stereo.**
@@ -3977,6 +4526,118 @@ pub enum WindowShape {
     Auto,
 }
 
+/// Coding bandwidth policy: the highest frequency the encoder codes.
+///
+/// Bands that start at or above the cutoff are not coded (`ZERO_HCB`), in long
+/// and short blocks alike, for every channel except the LFE (which has its own
+/// band limit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Bandwidth {
+    /// Code the whole spectrum at every bitrate: the encoder as it shipped in
+    /// 2.1.2 (byte-identical).
+    Full,
+    /// A cutoff from the bitrate and channel count (see [`auto_bandwidth_hz`]).
+    /// The default.
+    #[default]
+    Auto,
+    /// A fixed cutoff in Hz.
+    Hz(u32),
+}
+
+/// The [`Bandwidth::Auto`] cutoff in Hz for a stream of `bitrate_bps` over
+/// `channels` at `sample_rate`, or `None` for the whole spectrum.
+///
+/// 17 kHz while the stream is under 192 kbps in total and at most 128 kbps a
+/// channel; the whole spectrum above. Measured (PEAQ, `rusty_aac` 2.1.2 vs the same
+/// encoder band-limited, decoder FFmpeg 8.1.2):
+///
+/// * real music, 64-128 kbps: 17 kHz +0.015 BD-ODG over 6 clips, within
+///   ±0.04 on every one: the rate loop already leaves little above it;
+/// * flat-spectrum content (noise, noisy speech), 64-128 kbps: +2.1 and +2.0
+///   BD-ODG. Coding 17-22 kHz costs a flat spectrum about a quarter of its
+///   bits, and PEAQ marks the 18-20 kHz region on such content hard: both
+///   FFmpeg versions lose ~2 ODG between 96 kbps (18 kHz cutoff) and 128 kbps
+///   (20 kHz) on the same clip;
+/// * at 256 kbps stereo (128 kbps a channel) real music started to lose
+///   (-0.06 on one clip, -0.08 on one channel scored alone), hence the
+///   total-rate ceiling: from 192 kbps up the bandwidth is the 2.1.2 one.
+///
+/// Mono and stereo only: no multichannel layout was measured, so 3 or more
+/// channels keep the whole spectrum, as in 2.1.2.
+#[must_use]
+pub fn auto_bandwidth_hz(bitrate_bps: u32, channels: u16, sample_rate: u32) -> Option<u32> {
+    let per_channel = bitrate_bps / u32::from(channels.max(1));
+    (channels <= 2
+        && bitrate_bps < AUTO_BANDWIDTH_MAX_BPS
+        && per_channel <= AUTO_BANDWIDTH_MAX_BPS_PER_CHANNEL)
+        .then_some(AUTO_BANDWIDTH_HZ)
+        .filter(|&hz| hz < sample_rate / 2)
+}
+
+/// The [`Bandwidth::Auto`] cutoff (see [`auto_bandwidth_hz`]).
+const AUTO_BANDWIDTH_HZ: u32 = 17_000;
+/// [`Bandwidth::Auto`] limits only streams under this total rate.
+const AUTO_BANDWIDTH_MAX_BPS: u32 = 192_000;
+/// [`Bandwidth::Auto`] limits only streams at or under this rate a channel.
+const AUTO_BANDWIDTH_MAX_BPS_PER_CHANNEL: u32 = 128_000;
+
+/// The first spectral line not coded under `hz` for a window of `n_coeffs`
+/// lines (`usize::MAX` for no limit): the start of the first band at or above
+/// the cutoff, so the limit always falls on a band edge.
+fn cutoff_line(hz: Option<u32>, sample_rate: u32, swb: &[u16], n_coeffs: usize) -> usize {
+    let Some(hz) = hz else {
+        return usize::MAX;
+    };
+    let line =
+        (u64::from(hz) * 2 * n_coeffs as u64).div_ceil(u64::from(sample_rate.max(1))) as usize;
+    swb.iter()
+        .map(|&s| usize::from(s))
+        .find(|&s| s >= line)
+        .unwrap_or(usize::MAX)
+}
+
+/// Bounds on a frame's share of its segment under
+/// [`AacTuning::frame_demand`], as multiples of the constant-rate share.
+const DEMAND_MIN_SHARE: f64 = 0.35;
+const DEMAND_MAX_SHARE: f64 = 2.5;
+
+/// Per-frame weights (multiples of the constant-rate share, mean 1) from the
+/// frames' perceptual entropies `pe`: `(pe / mean)^alpha`, clamped to
+/// [`DEMAND_MIN_SHARE`, `DEMAND_MAX_SHARE`] and renormalised to mean 1.
+fn frame_demand_weights(pe: &[f64], alpha: f64) -> Vec<f64> {
+    let n = pe.len().max(1) as f64;
+    let mean = pe.iter().sum::<f64>() / n;
+    if mean <= 0.0 || alpha <= 0.0 {
+        return vec![1.0; pe.len()];
+    }
+    let mut w: Vec<f64> = pe
+        .iter()
+        .map(|&p| (p.max(0.0) / mean).powf(alpha))
+        .collect();
+    for _ in 0..4 {
+        let m = w.iter().sum::<f64>() / n;
+        if m <= 0.0 {
+            return vec![1.0; pe.len()];
+        }
+        for x in &mut w {
+            *x = (*x / m).clamp(DEMAND_MIN_SHARE, DEMAND_MAX_SHARE);
+        }
+    }
+    let m = w.iter().sum::<f64>() / n;
+    w.iter().map(|x| x / m).collect()
+}
+
+/// Zero every line at or above `cut` in each of `nwin` windows of `wlen` lines.
+fn band_limit(spec: &mut [f32], cut: usize, wlen: usize) {
+    if cut >= wlen {
+        return;
+    }
+    for w in spec.chunks_mut(wlen) {
+        w[cut..].fill(0.0);
+    }
+}
+
 /// Encoder options.
 #[derive(Debug, Clone, Copy)]
 pub struct AacEncoderConfig {
@@ -4041,6 +4702,97 @@ impl Default for AacEncoderConfig {
             pns: false,
             intensity: false,
             stereo_bit_split: true,
+        }
+    }
+}
+
+/// The low-rate coding tools added in 2.2: the section trellis, the
+/// high-passed transient detector, the coding bandwidth, frame-demand bit
+/// allocation and the mask SMR.
+///
+/// Kept apart from [`AacEncoderConfig`] so that config keeps the field set it
+/// had in 2.1 (a struct literal naming every field still compiles). Pass one
+/// to [`AacEncoder::with_tuning`]; [`AacEncoder::new`] uses
+/// [`AacTuning::default`], the shipping tools. [`AacTuning::legacy`] is the
+/// 2.1.2 encoder, bit for bit.
+///
+/// `#[non_exhaustive]`: build one from [`Default`] or [`AacTuning::legacy`]
+/// and set the fields you want.
+///
+/// ```
+/// use rusty_aac::{AacEncoder, AacEncoderConfig, AacTuning};
+/// let mut tuning = AacTuning::default();
+/// tuning.frame_demand = 0.0; // every frame at its constant-rate share
+/// let enc = AacEncoder::with_tuning(AacEncoderConfig::default(), tuning);
+/// assert_eq!(enc.tuning(), tuning);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct AacTuning {
+    /// Coding bandwidth policy. Default [`Bandwidth::Auto`];
+    /// [`Bandwidth::Full`] is the 2.1.2 encoder.
+    pub bandwidth: Bandwidth,
+    /// Inter-frame bit allocation strength: each frame of a 32-frame
+    /// reservoir segment gets the segment's bits in proportion to its
+    /// perceptual entropy raised to this power (clamped to 0.35-2.5 times the
+    /// constant-rate share), so the segment, and the stream, keep their rate.
+    /// Default `0.5`; `0.0` gives every frame the constant-rate share, the
+    /// 2.1.2 encoder. Whole-clip encodes only: a streaming encode always uses
+    /// the constant-rate share.
+    pub frame_demand: f32,
+    /// Run the level-invariant transient detector (arm A9) on a high-passed
+    /// signal (second difference, +12 dB/octave). A plucked or struck note
+    /// whose attack lives in its high frequencies, over a sustained body that
+    /// dominates the plain energy, is then switched to short blocks. Default
+    /// `true`; `false` is the 2.1.2 detector. No effect with
+    /// `relative_transients` off.
+    pub transient_highpass: bool,
+    /// Choose each frame's codebooks by a Viterbi trellis over `section_data`
+    /// (spectral bits plus section headers, an all-zero band free to ride in
+    /// a neighbouring section) instead of the cheapest book band by band,
+    /// which opened a new 9-bit section at nearly every band: 16-17% of a
+    /// 64 kbps frame, against 3% for FFmpeg. Default `true`; `false` is the
+    /// 2.1.2 encoder.
+    pub section_trellis: bool,
+    /// The psychoacoustic model's flat signal-to-mask ratio, in dB: how far
+    /// below each band's spread energy its masking threshold sits, before the
+    /// threshold in quiet and the starved-frame reduction, for mono and stereo
+    /// streams under 96 kbps a channel (from 96 kbps a channel up, and for 3
+    /// or more channels, the mask is 18 dB whatever this says).
+    /// Default `24.0`; `18.0` is the 2.1.2 encoder (bit for bit). A deeper mask makes the
+    /// rate loop reach the starved-frame reduction sooner, which keeps the
+    /// precision of a frame's loud, tonal bands and coarsens its quiet ones:
+    /// at 64 kbps a sung voice's 0-4 kHz went from 16-20 dB SNR to 19-23 dB.
+    pub mask_smr_db: f32,
+}
+
+impl Default for AacTuning {
+    /// The shipping tools — measured vs 2.1.2, PEAQ BD-ODG over 6 real clips at
+    /// 64-128 kbps, each tool alone: section trellis +0.223 (every clip and
+    /// rate better), high-passed transients +0.087, frame demand 0.5 +0.031
+    /// (synthetic +0.25), bandwidth `Auto` +0.015 (synthetic noise +2.0);
+    /// together +0.291; mask SMR 24 dB +0.097 on top (stereo vocal +0.41).
+    fn default() -> Self {
+        Self {
+            bandwidth: Bandwidth::Auto,
+            frame_demand: 0.5,
+            transient_highpass: true,
+            section_trellis: true,
+            mask_smr_db: 24.0,
+        }
+    }
+}
+
+impl AacTuning {
+    /// Every 2.2 tool off: the `rusty_aac` 2.1.2 encoder, bit for bit.
+    #[must_use]
+    pub const fn legacy() -> Self {
+        Self {
+            bandwidth: Bandwidth::Full,
+            frame_demand: 0.0,
+            transient_highpass: false,
+            section_trellis: false,
+            mask_smr_db: 18.0,
         }
     }
 }
@@ -4192,6 +4944,11 @@ pub struct AacEncoder {
     pns: bool,
     intensity: bool,
     stereo_bit_split: bool,
+    bandwidth: Bandwidth,
+    frame_demand: f32,
+    transient_highpass: bool,
+    section_trellis: bool,
+    mask_smr_db: f32,
     win: Vec<f32>,
     /// The KBD long window (α = 4.0), matching the decoder's. Built once.
     win_kbd: Vec<f32>,
@@ -4212,8 +4969,17 @@ pub struct AacEncoder {
 }
 
 impl AacEncoder {
+    /// An encoder with `config` and the shipping low-rate tools
+    /// ([`AacTuning::default`]).
     #[must_use]
     pub fn new(config: AacEncoderConfig) -> Self {
+        Self::with_tuning(config, AacTuning::default())
+    }
+
+    /// An encoder with `config` and the low-rate tools set by `tuning`
+    /// ([`AacTuning::legacy`] for the 2.1.2 encoder).
+    #[must_use]
+    pub fn with_tuning(config: AacEncoderConfig, tuning: AacTuning) -> Self {
         Self {
             sample_rate: 0,
             channels: 0,
@@ -4229,6 +4995,19 @@ impl AacEncoder {
             pns: config.pns,
             intensity: config.intensity,
             stereo_bit_split: config.stereo_bit_split,
+            bandwidth: tuning.bandwidth,
+            frame_demand: if tuning.frame_demand.is_finite() {
+                tuning.frame_demand.clamp(0.0, 4.0)
+            } else {
+                0.0
+            },
+            transient_highpass: tuning.transient_highpass,
+            section_trellis: tuning.section_trellis,
+            mask_smr_db: if tuning.mask_smr_db.is_finite() {
+                tuning.mask_smr_db.clamp(6.0, 40.0)
+            } else {
+                18.0
+            },
             win: Vec::new(),
             win_kbd: Vec::new(),
             chans: Vec::new(),
@@ -4239,6 +5018,19 @@ impl AacEncoder {
             base_block: 0,
             streaming: false,
             stream: None,
+        }
+    }
+
+    /// The low-rate tools this encoder codes with (out-of-range strengths
+    /// clamped as [`with_tuning`](Self::with_tuning) applied them).
+    #[must_use]
+    pub fn tuning(&self) -> AacTuning {
+        AacTuning {
+            bandwidth: self.bandwidth,
+            frame_demand: self.frame_demand,
+            transient_highpass: self.transient_highpass,
+            section_trellis: self.section_trellis,
+            mask_smr_db: self.mask_smr_db,
         }
     }
 
@@ -4253,9 +5045,12 @@ impl AacEncoder {
     /// the level-invariant transient detector (on by default) floors its
     /// running average at the mean energy seen so far rather than the whole
     /// clip's, so quiet openings can switch to short blocks at slightly
-    /// different frames; and [`WindowShape::Auto`] codes every frame with the
-    /// sine window. With `relative_transients: false` the packets are
-    /// byte-identical to the whole-clip encode.
+    /// different frames; [`WindowShape::Auto`] codes every frame with the
+    /// sine window; and every frame gets its constant-rate share of the bits
+    /// (frame-demand allocation, [`AacTuning::frame_demand`], needs a
+    /// whole reservoir segment ahead). With `relative_transients: false` and
+    /// [`AacTuning::frame_demand`] 0 the packets are byte-identical to the whole-clip
+    /// encode.
     pub fn set_streaming(&mut self, on: bool) {
         if self.total_in == 0 && !self.flushed {
             self.streaming = on;
@@ -4431,6 +5226,7 @@ impl AacEncoder {
         shapes: &[bool],
         frame_budget: usize,
         plan: &[Elem],
+        pre: Option<&[Option<Vec<f32>>]>,
     ) -> (Vec<u8>, i64) {
         // Per-channel ICS-body budget: the frame less END (3 bits), split
         // evenly, less each element's own header (7). Never above the decoder
@@ -4456,6 +5252,20 @@ impl AacEncoder {
             shapes.get(b - 1).copied().unwrap_or(false)
         };
         let short_win: &[f32] = if cur_kbd { kbd_s } else { sine_s };
+        // The demand pre-pass's spectrum of channel `ch` (sine window, band
+        // limited), when this frame codes it with exactly that window.
+        let cached = |ch: usize, seq: WindowSequence| -> Option<Vec<f32>> {
+            if seq == WindowSequence::OnlyLong && !prev_kbd && !cur_kbd {
+                pre.and_then(|p| p.get(ch).cloned().flatten())
+            } else {
+                None
+            }
+        };
+        SECTION_TRELLIS.with(|c| c.set(self.section_trellis));
+        MASK_SMR.with(|c| c.set(smr_ratio(self.effective_smr_db())));
+        let bw_hz = self.bandwidth_hz();
+        let cut_long = cutoff_line(bw_hz, self.sample_rate, swb, FRAME_LEN);
+        let cut_short = cutoff_line(bw_hz, self.sample_rate, swb_s, SHORT_HALF);
         let psy = PsyCfg {
             short_block_psy: self.short_block_psy,
             window_grouping: self.window_grouping,
@@ -4483,8 +5293,10 @@ impl AacEncoder {
                     let (p0, c0, p1, c1) =
                         (prev(l), self.block_cow(l, b), prev(r), self.block_cow(r, b));
                     if seq == WindowSequence::EightShort {
-                        let sl = analyze_short(&p0, &c0, short_win);
-                        let sr_ = analyze_short(&p1, &c1, short_win);
+                        let mut sl = analyze_short(&p0, &c0, short_win);
+                        let mut sr_ = analyze_short(&p1, &c1, short_win);
+                        band_limit(&mut sl, cut_short, SHORT_HALF);
+                        band_limit(&mut sr_, cut_short, SHORT_HALF);
                         encode_cpe(
                             w,
                             tag,
@@ -4507,8 +5319,13 @@ impl AacEncoder {
                             sine_s,
                             kbd_s,
                         );
-                        let sl = analyze_long(&p0, &c0, &win);
-                        let sr_ = analyze_long(&p1, &c1, &win);
+                        let fresh = |p: &[f32; FRAME_LEN], c: &[f32; FRAME_LEN]| {
+                            let mut x = analyze_long(p, c, &win);
+                            band_limit(&mut x, cut_long, FRAME_LEN);
+                            x
+                        };
+                        let sl = cached(l, seq).unwrap_or_else(|| fresh(&p0, &c0));
+                        let sr_ = cached(r, seq).unwrap_or_else(|| fresh(&p1, &c1));
                         encode_cpe(
                             w,
                             tag,
@@ -4527,7 +5344,8 @@ impl AacEncoder {
                     let (p, c) = (prev(ch), self.block_cow(ch, b));
                     let id = elem.id();
                     if seq == WindowSequence::EightShort {
-                        let spec = analyze_short(&p, &c, short_win);
+                        let mut spec = analyze_short(&p, &c, short_win);
+                        band_limit(&mut spec, cut_short, SHORT_HALF);
                         encode_channel_element_short(
                             w,
                             tag,
@@ -4548,9 +5366,14 @@ impl AacEncoder {
                             sine_s,
                             kbd_s,
                         );
-                        let mut spec = analyze_long(&p, &c, &win);
+                        let mut spec = match (elem, cached(ch, seq)) {
+                            (Elem::Sce(_), Some(x)) => x,
+                            _ => analyze_long(&p, &c, &win),
+                        };
                         if matches!(elem, Elem::Lfe(_)) {
                             lfe_band_limit(&mut spec);
+                        } else {
+                            band_limit(&mut spec, cut_long, FRAME_LEN);
                         }
                         encode_channel_element(
                             w,
@@ -4652,10 +5475,36 @@ impl AacEncoder {
         (rdb.into_bytes(), (b * FRAME_LEN) as i64)
     }
 
+    /// The mask SMR this stream codes with: [`AacTuning::mask_smr_db`]
+    /// for mono and stereo under [`MASK_SMR_MAX_BPS_PER_CHANNEL`]; the 2.1.2 18 dB from
+    /// there up, and for 3 or more channels (no multichannel layout was
+    /// measured).
+    fn effective_smr_db(&self) -> f32 {
+        let per_channel = self.bitrate / self.channels.max(1) as u32;
+        if per_channel >= MASK_SMR_MAX_BPS_PER_CHANNEL || self.channels > 2 {
+            18.0
+        } else {
+            self.mask_smr_db
+        }
+    }
+
+    /// The coding cutoff in Hz under the configured [`Bandwidth`] policy, or
+    /// `None` for the whole spectrum.
+    fn bandwidth_hz(&self) -> Option<u32> {
+        match self.bandwidth {
+            Bandwidth::Full => None,
+            Bandwidth::Auto => {
+                auto_bandwidth_hz(self.bitrate, self.channels as u16, self.sample_rate)
+            }
+            Bandwidth::Hz(hz) => Some(hz),
+        }
+        .filter(|&hz| hz < self.sample_rate / 2)
+    }
+
     /// Transient flags for one channel, under the configured detector (arm A9).
     fn transients(&self, chan: &[f32], nframes: usize) -> Vec<bool> {
         if self.relative_transients {
-            detect_transients_relative(chan, nframes)
+            detect_transients_relative(chan, nframes, self.transient_highpass)
         } else {
             detect_transients(chan, nframes)
         }
@@ -4755,18 +5604,111 @@ impl AacEncoder {
         ((b + 1) * per / sr - b * per / sr) as usize
     }
 
+    /// One reservoir segment's frame bit targets under
+    /// [`AacTuning::frame_demand`] (indexed from `seg.start`), and each
+    /// frame's per-channel sine-window long spectrum the demand was measured
+    /// on, for `encode_frame` to reuse where it codes a frame with that very
+    /// window. `None` (every frame its constant-rate share) when the knob is
+    /// off.
+    ///
+    /// The targets sum to the segment's constant-rate bits, so a segment still
+    /// encodes alone and the stream's rate is unchanged.
+    #[allow(clippy::type_complexity)]
+    fn segment_demand(
+        &self,
+        seg: std::ops::Range<usize>,
+        swb: &[u16],
+        plan: &[Elem],
+    ) -> Option<(Vec<usize>, Vec<Vec<Option<Vec<f32>>>>)> {
+        if self.frame_demand <= 0.0 {
+            return None;
+        }
+        MASK_SMR.with(|c| c.set(smr_ratio(self.effective_smr_db())));
+        let cut = cutoff_line(self.bandwidth_hz(), self.sample_rate, swb, FRAME_LEN);
+        let cap = (MAX_CHANNEL_BITS + 7) * self.channels;
+        let means: Vec<usize> = seg.clone().map(|b| self.frame_bits(b)).collect();
+        let (pe, specs): (Vec<f64>, Vec<_>) = seg.map(|b| self.frame_pe(b, swb, plan, cut)).unzip();
+        let w = frame_demand_weights(&pe, f64::from(self.frame_demand));
+        let targets = means
+            .iter()
+            .zip(&w)
+            .map(|(&m, &w)| ((m as f64 * w).round() as usize).min(cap))
+            .collect();
+        Some((targets, specs))
+    }
+
+    /// Perceptual entropy of frame `b`, summed over every channel but the LFE:
+    /// `sum_b n_b * 0.5 * log2(1 + E_b / thr_b)` on a sine-window long MDCT of
+    /// the frame, against the long-block mask (flat SMR, threshold in quiet),
+    /// within the coding bandwidth. A demand estimate only: it is computed
+    /// the same way whatever window sequence the frame is coded with.
+    /// Also returns each channel's spectrum (LFE: `None`).
+    fn frame_pe(
+        &self,
+        b: usize,
+        swb: &[u16],
+        plan: &[Elem],
+        cut: usize,
+    ) -> (f64, Vec<Option<Vec<f32>>>) {
+        let num_swb = swb.len() - 1;
+        let mut specs = vec![None; self.channels];
+        let chans = plan.iter().flat_map(|e| match *e {
+            Elem::Cpe(l, r) => vec![l, r],
+            Elem::Sce(c) => vec![c],
+            Elem::Lfe(_) => vec![],
+        });
+        let mut pe = 0.0;
+        for ch in chans {
+            let prev = if b == 0 {
+                std::borrow::Cow::Owned([0f32; FRAME_LEN])
+            } else {
+                self.block_cow(ch, b - 1)
+            };
+            let mut spec = analyze_long(&prev, &self.block_cow(ch, b), &self.win);
+            band_limit(&mut spec, cut, FRAME_LEN);
+            let energy: Vec<f64> = (0..num_swb)
+                .map(|i| {
+                    let (s, e) = (usize::from(swb[i]), usize::from(swb[i + 1]));
+                    spec[s..e]
+                        .iter()
+                        .map(|&x| f64::from(x).powi(2))
+                        .sum::<f64>()
+                        + 1e-3
+                })
+                .collect();
+            let thr = masking_from_energy(&energy, swb, self.sample_rate, FRAME_LEN, None);
+            for i in 0..num_swb {
+                let n = f64::from(swb[i + 1] - swb[i]);
+                pe += n * 0.5 * (1.0 + energy[i] / thr[i].max(1e-30)).log2();
+            }
+            specs[ch] = Some(spec);
+        }
+        (pe, specs)
+    }
+
     /// Sub-block energies of frame `f` of channel `ch`, zero past the input.
-    fn sub_energies(&self, ch: usize, f: usize) -> [f64; 8] {
+    /// With `highpass`, of the high-passed signal (see [`sub_block_energy`]);
+    /// its first two samples need the previous block, which is still held
+    /// (or, at the stream's start, silence, as in the whole-clip detector).
+    fn sub_energies(&self, ch: usize, f: usize, highpass: bool) -> [f64; 8] {
         let chan = &self.chans[ch];
         let at = (f - self.base_block) * FRAME_LEN;
-        std::array::from_fn(|sb| {
-            (0..SHORT_HALF)
-                .map(|i| {
-                    let x = f64::from(chan.get(at + sb * SHORT_HALF + i).copied().unwrap_or(0.0));
-                    x * x
-                })
-                .sum()
-        })
+        if highpass && self.base_block > 0 {
+            // `chan[0]` is not the stream's first sample: give the filter the
+            // two samples before `at` from the buffer (held back to block
+            // `base_block`, so `at >= FRAME_LEN` whenever `f > base_block`).
+            return std::array::from_fn(|sb| {
+                let start = at + sb * SHORT_HALF;
+                if start >= 2 {
+                    // Past the buffered input (the flush frames) this is an
+                    // empty slice, and the energy that of silence.
+                    sub_block_energy(chan.get(start - 2..).unwrap_or(&[]), 2, true)
+                } else {
+                    sub_block_energy(chan, start, true)
+                }
+            });
+        }
+        std::array::from_fn(|sb| sub_block_energy(chan, at + sb * SHORT_HALF, highpass))
     }
 
     /// Streaming: analyse the frames now complete, finalise the window
@@ -4805,7 +5747,8 @@ impl AacEncoder {
         while st.analysed < avail {
             let f = st.analysed;
             for ch in 0..self.channels {
-                let sub = self.sub_energies(ch, f);
+                let sub =
+                    self.sub_energies(ch, f, self.relative_transients && self.transient_highpass);
                 let flag = st.det[ch].frame(&sub, f, self.relative_transients);
                 st.flags[ch].push(flag);
             }
@@ -4849,6 +5792,7 @@ impl AacEncoder {
                 let budget = reservoir.budget(b, mean, self.channels);
                 let au = self.encode_frame(
                     b, t.swb, t.swb_s, &t.sine_s, &t.kbd_s, &st.seqs, &st.shapes, budget, &t.plan,
+                    None,
                 );
                 reservoir.spend(mean, au.0.len() * 8, self.channels);
                 au
@@ -4919,16 +5863,26 @@ impl AacEncoder {
         // encodes the same alone as in sequence).
         let frames = |range: std::ops::Range<usize>| {
             let mut reservoir = Reservoir::default();
-            range
-                .map(|b| {
-                    let mean = self.frame_bits(b);
+            let mut out = Vec::with_capacity(range.len());
+            let mut s = range.start;
+            while s < range.end {
+                let e = ((s / RESERVOIR_SEGMENT + 1) * RESERVOIR_SEGMENT).min(range.end);
+                let seg = self.segment_demand(s..e, swb, plan);
+                for b in s..e {
+                    let (mean, pre) = match &seg {
+                        Some((t, sp)) => (t[b - s], Some(&sp[b - s][..])),
+                        None => (self.frame_bits(b), None),
+                    };
                     let budget = reservoir.budget(b, mean, self.channels);
-                    let au =
-                        self.encode_frame(b, swb, swb_s, sine_s, kbd_s, seqs, shapes, budget, plan);
+                    let au = self.encode_frame(
+                        b, swb, swb_s, sine_s, kbd_s, seqs, shapes, budget, plan, pre,
+                    );
                     reservoir.spend(mean, au.0.len() * 8, self.channels);
-                    au
-                })
-                .collect::<Vec<_>>()
+                    out.push(au);
+                }
+                s = e;
+            }
+            out
         };
 
         let segments = nblocks.div_ceil(RESERVOIR_SEGMENT);
@@ -7505,6 +8459,283 @@ mod fidelity_129 {
             );
             let most = pk.iter().map(|p| p.data.len() * 8).max().unwrap();
             assert!(most <= 6144 * ch, "{ch} ch: a {most}-bit unit");
+        }
+    }
+}
+
+/// The low-rate campaign's tools: the section trellis, the frame-demand
+/// allocation, the coding bandwidth, the high-passed transient detector and
+/// the mask SMR.
+#[cfg(test)]
+mod lowrate {
+    use super::*;
+
+    fn encode(pcm: &[f32], ch: u16, sr: u32, cfg: (AacEncoderConfig, AacTuning)) -> Vec<Vec<u8>> {
+        let mut e = AacEncoder::with_tuning(cfg.0, cfg.1);
+        e.push_pcm(pcm, ch, sr).unwrap();
+        e.finish();
+        let mut out = Vec::new();
+        while let Ok(p) = e.next_packet() {
+            out.push(p.data);
+        }
+        out
+    }
+
+    /// Interleaved PCM of a packet list through this crate's decoder, and
+    /// its channel count.
+    fn decode(packets: &[Vec<u8>], sr: u32) -> (Vec<f32>, usize) {
+        let mut dec = crate::decode::Decoder::new(sr);
+        let mut out = Vec::new();
+        let mut ch = 1;
+        for p in packets {
+            let a = dec.decode(p, None).expect("decode");
+            ch = a.channels.max(1) as usize;
+            out.extend_from_slice(&a.samples);
+        }
+        (out, ch)
+    }
+
+    /// Music-like stereo: a harmonic tone with plucked attacks, a panned
+    /// second voice, and broadband noise, so every tool has something to do.
+    fn music(sr: u32, frames: usize) -> Vec<f32> {
+        use std::f32::consts::PI;
+        let n = frames * FRAME_LEN;
+        let mut seed = 0x1234_5678u32;
+        let mut noise = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        let mut out = Vec::with_capacity(2 * n);
+        for i in 0..n {
+            let t = i as f32 / sr as f32;
+            let k = i % (3 * FRAME_LEN);
+            let env = (-(k as f32) / 900.0).exp();
+            let mut a = 0.0;
+            for h in 1..=8 {
+                a += (0.3 / h as f32) * (2.0 * PI * 196.0 * h as f32 * t).sin();
+            }
+            let b = 0.2 * (2.0 * PI * 523.0 * t).sin();
+            let nz = 0.05 * noise();
+            out.push(a * env + 0.8 * b + nz);
+            out.push(0.6 * a * env + 0.2 * b + nz);
+        }
+        out
+    }
+
+    /// Reconstruction SNR; the decoded stream leads by the 1024-sample priming.
+    fn snr_db(src: &[f32], dec: &[f32], ch: usize) -> f64 {
+        let lag = FRAME_LEN * ch;
+        let n = src.len().min(dec.len().saturating_sub(lag));
+        let (mut s, mut e) = (0f64, 0f64);
+        for i in 0..n {
+            let (x, y) = (f64::from(src[i]), f64::from(dec[i + lag]));
+            s += x * x;
+            e += (x - y) * (x - y);
+        }
+        10.0 * (s / e.max(1e-30)).log10()
+    }
+
+    /// The trellis is optimal: its choice costs no more than any assignment,
+    /// checked by brute force over every assignment of small band sets.
+    #[test]
+    fn section_trellis_is_optimal() {
+        let mut seed = 7u32;
+        let mut rnd = move |m: u32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (seed >> 16) % m
+        };
+        let cost = |costs: &[[u32; 12]], cbs: &[u8], hdr: u32| -> u64 {
+            let mut c = 0u64;
+            for (b, &cb) in cbs.iter().enumerate() {
+                if costs[b][cb as usize] == u32::MAX {
+                    return u64::MAX;
+                }
+                c += u64::from(costs[b][cb as usize]);
+                if b == 0 || cbs[b - 1] != cb {
+                    c += u64::from(hdr);
+                }
+            }
+            c
+        };
+        for _ in 0..40 {
+            let n = 1 + rnd(4) as usize;
+            let costs: Vec<[u32; 12]> = (0..n)
+                .map(|_| {
+                    let mut k = [u32::MAX; 12];
+                    for x in k.iter_mut().skip(1) {
+                        if rnd(3) != 0 {
+                            *x = rnd(40);
+                        }
+                    }
+                    k[11] = rnd(60); // the escape book always codes
+                    if rnd(3) == 0 {
+                        k[0] = 0;
+                    }
+                    k
+                })
+                .collect();
+            let got = cost(&costs, &trellis_books(&costs, 9), 9);
+            let mut best = u64::MAX;
+            for code in 0..12usize.pow(n as u32) {
+                let cbs: Vec<u8> = (0..n)
+                    .map(|b| ((code / 12usize.pow(b as u32)) % 12) as u8)
+                    .collect();
+                best = best.min(cost(&costs, &cbs, 9));
+            }
+            assert_eq!(got, best, "trellis not optimal for {costs:?}");
+        }
+    }
+
+    /// The one-walk book pricing the trellis uses gives every book the bits
+    /// the per-book search does, long and short, across peak magnitudes.
+    #[test]
+    fn band_book_costs_match_per_book_search() {
+        let mut seed = 0x9e37_79b9_u64;
+        let mut rnd = move |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for _ in 0..3000 {
+            let width = [4usize, 8, 12, 16, 32][rnd(5) as usize];
+            let (nwin, wlen) = if rnd(2) == 0 {
+                (1, 1024)
+            } else {
+                (1 + rnd(4) as usize, 128)
+            };
+            let peak = [1i64, 2, 4, 7, 12, 15, 16, 40, 8191][rnd(9) as usize];
+            let mut quant = vec![0i32; nwin * wlen];
+            for w in 0..nwin {
+                for i in 0..width {
+                    if rnd(3) != 0 {
+                        let m = rnd(peak as u64 + 1) as i32;
+                        quant[w * wlen + 8 + i] = if rnd(2) == 0 { m } else { -m };
+                    }
+                }
+            }
+            let (s, e) = (8, 8 + width);
+            if (0..nwin).all(|w| quant[w * wlen + s..w * wlen + e].iter().all(|&q| q == 0)) {
+                continue;
+            }
+            assert_eq!(
+                band_book_costs(&quant, s, e, 0, nwin, wlen),
+                band_book_costs_ref(&quant, s, e, 0, nwin, wlen),
+                "width {width}, nwin {nwin}, peak {peak}"
+            );
+        }
+    }
+
+    /// A zero band carried in a section takes the previous coded band's
+    /// scalefactor (a zero delta); one before any coded band, the first's.
+    #[test]
+    fn carried_zero_bands_send_a_zero_delta() {
+        let cbs = [5u8, 5, 0, 7, 7, 13, 7];
+        let sf = [120, 99, 140, 110, 30, 40, 112];
+        let zero = [true, false, true, false, true, false, false];
+        let got = zero_band_sf(&cbs, &sf, |i| zero[i]);
+        assert_eq!(got, vec![99, 99, 140, 110, 110, 40, 112]);
+    }
+
+    /// Frame-demand weights keep the segment mean, honour their bounds, and
+    /// are flat at strength 0.
+    #[test]
+    fn demand_weights_preserve_the_segment_rate() {
+        let pe: Vec<f64> = (0..32)
+            .map(|i| {
+                if i % 7 == 0 {
+                    9000.0
+                } else {
+                    100.0 + 30.0 * f64::from(i)
+                }
+            })
+            .collect();
+        for alpha in [0.0, 0.5, 1.0, 2.0] {
+            let w = frame_demand_weights(&pe, alpha);
+            let m = w.iter().sum::<f64>() / w.len() as f64;
+            assert!((m - 1.0).abs() < 1e-9, "alpha {alpha}: mean {m}");
+            if alpha == 0.0 {
+                assert!(w.iter().all(|&x| x == 1.0));
+            }
+            assert!(
+                w.iter().all(|&x| x > 0.2 && x < 3.0),
+                "alpha {alpha}: {w:?}"
+            );
+        }
+        assert_eq!(frame_demand_weights(&[0.0; 4], 1.0), vec![1.0; 4]);
+    }
+
+    /// The automatic cutoff applies under 192 kbps and 128 kbps a channel,
+    /// never at or above Nyquist; the cutoff falls on a band edge.
+    #[test]
+    fn bandwidth_table_and_cutoff() {
+        assert_eq!(auto_bandwidth_hz(64_000, 1, 44_100), Some(17_000));
+        assert_eq!(auto_bandwidth_hz(128_000, 1, 44_100), Some(17_000));
+        assert_eq!(auto_bandwidth_hz(160_000, 1, 44_100), None);
+        assert_eq!(auto_bandwidth_hz(160_000, 2, 44_100), Some(17_000));
+        assert_eq!(auto_bandwidth_hz(192_000, 2, 44_100), None);
+        assert_eq!(auto_bandwidth_hz(320_000, 6, 48_000), None);
+        assert_eq!(auto_bandwidth_hz(128_000, 6, 48_000), None);
+        assert_eq!(auto_bandwidth_hz(64_000, 2, 32_000), None);
+        let swb = swb_offsets(true, crate::sf_index_for_rate(44_100).unwrap());
+        let cut = cutoff_line(Some(17_000), 44_100, swb, FRAME_LEN);
+        assert!(swb.iter().any(|&s| usize::from(s) == cut));
+        assert!(cut as f64 * 22_050.0 / 1024.0 >= 17_000.0);
+        assert_eq!(cutoff_line(None, 44_100, swb, FRAME_LEN), usize::MAX);
+    }
+
+    /// Every tool on: decodable at the right length, finite, a faithful copy,
+    /// on rate, stereo and mono, whole-clip and streaming.
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow to interpret")]
+    fn every_tool_round_trips() {
+        let sr = 44_100u32;
+        let st = music(sr, 40);
+        let mono: Vec<f32> = st.iter().step_by(2).copied().collect();
+        let cfg = AacEncoderConfig {
+            bitrate_bps: 64_000,
+            ..Default::default()
+        };
+        let tools = AacTuning {
+            bandwidth: Bandwidth::Hz(17_000),
+            ..AacTuning::default()
+        };
+        let all = (cfg, tools);
+        // The 2.1.2 encoder: every tool of this campaign off.
+        let plain = (cfg, AacTuning::legacy());
+        for (pcm, ch) in [(&st, 2u16), (&mono, 1)] {
+            let base = encode(pcm, ch, sr, plain);
+            let on = encode(pcm, ch, sr, all);
+            assert_ne!(base, on, "{ch} ch: the tools must change the stream");
+            let (db, _) = decode(&base, sr);
+            let (d, dch) = decode(&on, sr);
+            assert_eq!(dch, usize::from(ch));
+            assert_eq!(d.len(), db.len(), "{ch} ch: length");
+            assert!(d.iter().all(|v| v.is_finite()));
+            let (s0, s1) = (snr_db(pcm, &db, dch), snr_db(pcm, &d, dch));
+            assert!(
+                s1 > 3.0 && s1 > s0 - 3.0,
+                "{ch} ch: snr {s1:.1} dB vs {s0:.1} dB"
+            );
+            let bits: usize = on.iter().map(|p| p.len() * 8).sum();
+            let rate = bits as f64 * f64::from(sr) / (on.len() * FRAME_LEN) as f64;
+            assert!(
+                (rate / 64_000.0 - 1.0).abs() < 0.02,
+                "{ch} ch: rate {rate:.0}"
+            );
+            // Streaming: frame demand needs the whole segment and falls back
+            // to the constant-rate share; everything else applies.
+            let mut e = AacEncoder::with_tuning(all.0, all.1);
+            e.set_streaming(true);
+            e.push_pcm(pcm, ch, sr).unwrap();
+            e.finish();
+            let mut sp = Vec::new();
+            while let Ok(p) = e.next_packet() {
+                sp.push(p.data);
+            }
+            let (ds, _) = decode(&sp, sr);
+            assert_eq!(ds.len(), db.len());
+            assert!(snr_db(pcm, &ds, dch) > 3.0);
         }
     }
 }

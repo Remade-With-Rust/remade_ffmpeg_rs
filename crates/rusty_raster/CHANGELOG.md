@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_raster-v0.1.3...rusty_raster-v0.1.4) - 2026-11-22
+
+### Other
+
+- *(rusty_raster)* compound assignment in tile_gather (clippy)
+- *(rusty_raster)* fuse Repeat/Reflect into the nearest gather; fuse on the stage list
+- *(rusty_raster)* pin try_zeroed's contract; calloc probe refuted
+- *(rusty_raster)* AlphaRuns::add returns the start pixel as the next hint
+
 ## [0.1.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_raster-v0.1.2...rusty_raster-v0.1.3) - 2026-11-21
 
 ### Other

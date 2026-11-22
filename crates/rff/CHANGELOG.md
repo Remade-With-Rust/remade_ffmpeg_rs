@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/remade-ffmpeg-v0.8.1...remade-ffmpeg-v0.8.2) - 2026-11-22
+
+### Other
+
+- updated the following local packages: rff-codec-aac
+
 ## [0.8.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/remade-ffmpeg-v0.8.0...remade-ffmpeg-v0.8.1) - 2026-11-22
 
 ### Added

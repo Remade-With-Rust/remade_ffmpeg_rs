@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_svgtree-v0.1.3...rusty_svgtree-v0.1.4) - 2026-11-22
+
+### Other
+
+- updated the following local packages: rusty_raster
+
 ## [0.1.3](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_svgtree-v0.1.2...rusty_svgtree-v0.1.3) - 2026-11-21
 
 ### Other
