@@ -355,6 +355,56 @@ pub fn gather_scale_1_float(p: &mut Pipeline) {
     p.next_stage();
 }
 
+/// `repeat` or `reflect`, then `gather`, then (with `SCALE`) `scale_1_float`,
+/// as one stage: `compile` fuses the run for a nearest pattern with a Repeat
+/// or Reflect spread. The tiled coordinates go straight to the index instead
+/// of through `r` and `g`; the arithmetic is the stages' own, in their order.
+#[inline(always)]
+fn tile_gather<const REFLECT: bool, const SCALE: bool>(p: &mut Pipeline) {
+    let (lx, ly) = (&p.ctx.limit_x, &p.ctx.limit_y);
+    let (x, y) = if REFLECT {
+        (exclusive_reflect(p.r, lx.scale, lx.inv_scale), exclusive_reflect(p.g, ly.scale, ly.inv_scale))
+    } else {
+        (exclusive_repeat(p.r, lx.scale, lx.inv_scale), exclusive_repeat(p.g, ly.scale, ly.inv_scale))
+    };
+    let ix = gather_ix(p.pixmap_src, x, y);
+    let (mut r, mut g, mut b, mut a) = (f32x8::default(), f32x8::default(), f32x8::default(), f32x8::default());
+    load_8888(&p.pixmap_src.gather(ix), &mut r, &mut g, &mut b, &mut a);
+    if SCALE {
+        let c = f32x8::splat(p.ctx.current_coverage);
+        r = r * c;
+        g = g * c;
+        b = b * c;
+        a = a * c;
+    }
+    p.r = r;
+    p.g = g;
+    p.b = b;
+    p.a = a;
+
+    p.next_stage();
+}
+
+/// `repeat` then `gather` (see `tile_gather`).
+pub fn repeat_gather(p: &mut Pipeline) {
+    tile_gather::<false, false>(p);
+}
+
+/// `reflect` then `gather` (see `tile_gather`).
+pub fn reflect_gather(p: &mut Pipeline) {
+    tile_gather::<true, false>(p);
+}
+
+/// `repeat`, `gather`, `scale_1_float` (see `tile_gather`).
+pub fn repeat_gather_scale_1_float(p: &mut Pipeline) {
+    tile_gather::<false, true>(p);
+}
+
+/// `reflect`, `gather`, `scale_1_float` (see `tile_gather`).
+pub fn reflect_gather_scale_1_float(p: &mut Pipeline) {
+    tile_gather::<true, true>(p);
+}
+
 #[inline(always)]
 fn gather_ix(pixmap: PixmapRef, mut x: f32x8, mut y: f32x8) -> u32x8 {
     // Exclusive -> inclusive.
@@ -906,7 +956,7 @@ pub fn transform(p: &mut Pipeline) {
 // The gather stages will hard clamp the output of these stages to [0,limit)...
 // we just need to do the basic repeat or mirroring.
 
-fn reflect(p: &mut Pipeline) {
+pub fn reflect(p: &mut Pipeline) {
     let ctx = &p.ctx.limit_x;
     p.r = exclusive_reflect(p.r, ctx.scale, ctx.inv_scale);
 
@@ -924,7 +974,7 @@ fn exclusive_reflect(v: f32x8, limit: f32, inv_limit: f32) -> f32x8 {
         * ((v - limit) * (inv_limit * f32x8::splat(0.5))).floor() - limit).abs()
 }
 
-fn repeat(p: &mut Pipeline) {
+pub fn repeat(p: &mut Pipeline) {
     let ctx = &p.ctx.limit_x;
     p.r = exclusive_repeat(p.r, ctx.scale, ctx.inv_scale);
 
