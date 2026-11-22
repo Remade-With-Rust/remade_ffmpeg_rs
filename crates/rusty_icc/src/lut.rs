@@ -577,7 +577,7 @@ impl<const IN: usize, const OUT: usize> FixedClut<'_, IN, OUT> {
         let done = match (frac.as_slice(), step.as_slice()) {
             (&[f0, f1, f2], &[s0, s1, s2]) => {
                 self.clut
-                    .tetra_walk::<OUT>(origin, [f0, f1, f2], [s0, s1, s2], out)
+                    .tetra_select::<OUT>(origin, [f0, f1, f2], [s0, s1, s2], out)
             }
             (&[f0, f1, f2, f3], &[s0, s1, s2, s3]) => {
                 self.clut
@@ -1143,6 +1143,49 @@ impl ClutEval {
         true
     }
 
+    /// [`ClutEval::tetra_walk`] without its six-way branch, for the integer
+    /// grid loops: the same corners, differences, products and sums, so the
+    /// same bits.
+    ///
+    /// The six `if`s of the walk pick the axis order by descending fraction,
+    /// ties going to the earlier axis (x before y before z). That order is
+    /// three pairwise facts (x before y iff `rx >= ry`, x before z iff
+    /// `rx >= rz`, y before z iff `ry >= rz`), so the corner a walk stands
+    /// on before it steps along an axis is the sum of the steps of the axes
+    /// ahead of it, and the walk difference the general loop multiplies by
+    /// `rx` is `P(before_x + x) - P(before_x)` (likewise `ry`, `rz`). Every
+    /// such corner is one of the walk's four, so it declines exactly when
+    /// the walk does. On photographic content the six-way branch went the
+    /// other way often enough to cost more than the seven loads and the
+    /// masks that replace it.
+    #[inline(always)]
+    fn tetra_select<const N: usize>(
+        &self,
+        origin: usize,
+        [rx, ry, rz]: [f64; 3],
+        [x, y, z]: [usize; 3],
+        out: &mut [f64; 16],
+    ) -> bool {
+        let (xy, xz, yz) = (rx >= ry, rx >= rz, ry >= rz);
+        let m = |c: bool, s: usize| usize::from(c).wrapping_neg() & s;
+        let bx = m(!xy, y) + m(!xz, z);
+        let by = m(xy, x) + m(!yz, z);
+        let bz = m(xz, x) + m(yz, y);
+        let c = |d: usize| -> Option<&[f32; N]> { self.data.get(origin + d..)?.first_chunk::<N>() };
+        let (Some(p0), Some(pax), Some(pbx), Some(pay), Some(pby), Some(paz), Some(pbz)) =
+            (c(0), c(bx + x), c(bx), c(by + y), c(by), c(bz + z), c(bz))
+        else {
+            return false;
+        };
+        for o in 0..N {
+            let dx = f64::from(pax[o]) - f64::from(pbx[o]);
+            let dy = f64::from(pay[o]) - f64::from(pby[o]);
+            let dz = f64::from(paz[o]) - f64::from(pbz[o]);
+            out[o] = f64::from(p0[o]) + dx * rx + dy * ry + dz * rz;
+        }
+        true
+    }
+
     fn tetra(
         &self,
         dim: usize,
@@ -1520,6 +1563,45 @@ mod tests {
         assert!(c.fixed::<4, 3>().is_none());
         c.trilinear = true;
         assert!(c.fixed::<3, 3>().is_none());
+    }
+
+    /// `tetra_select` against `tetra_walk` on every pattern of ties between
+    /// the three fractions (and zero fractions), with each step present or
+    /// absent, on a CLUT that fits and on one cut short (both decline).
+    #[test]
+    fn tetra_select_matches_the_walk_bit_for_bit() {
+        const F: [f64; 6] = [0.0, 0.25, 1.0 / 3.0, 0.5, 0.75, 0.999];
+        fn check<const N: usize>(short: usize) {
+            let mut c = test_clut(&[4, 4, 4], N);
+            c.data.truncate(c.data.len() - short);
+            let [s0, s1, s2] = [16 * N, 4 * N, N];
+            for origin in [
+                0,
+                s0 + s1 + s2,
+                2 * s0 + 2 * s1 + 2 * s2,
+                3 * (s0 + s1 + s2),
+            ] {
+                for k in 0..F.len().pow(3) {
+                    let r = [F[k % 6], F[k / 6 % 6], F[k / 36]];
+                    for m in 0..8 {
+                        let st = [
+                            if m & 1 != 0 { s0 } else { 0 },
+                            if m & 2 != 0 { s1 } else { 0 },
+                            if m & 4 != 0 { s2 } else { 0 },
+                        ];
+                        let (mut a, mut b) = ([7.0; 16], [7.0; 16]);
+                        let da = c.tetra_select::<N>(origin, r, st, &mut a);
+                        let db = c.tetra_walk::<N>(origin, r, st, &mut b);
+                        assert_eq!(da, db, "{origin} {r:?} {st:?}");
+                        assert_eq!(bits(&a, 16), bits(&b, 16), "{origin} {r:?} {st:?}");
+                    }
+                }
+            }
+        }
+        for short in [0, 3] {
+            check::<3>(short);
+            check::<4>(short);
+        }
     }
 
     #[test]
