@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_webp-v0.2.1...rusty_webp-v0.2.2) - 2026-11-22
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.2.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_webp-v0.2.0...rusty_webp-v0.2.1) - 2026-11-14
 
 ### Other

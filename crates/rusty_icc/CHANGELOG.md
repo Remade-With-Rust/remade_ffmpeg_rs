@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_icc-v0.1.5...rusty_icc-v0.1.6) - 2026-11-22
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.1.5](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_icc-v0.1.4...rusty_icc-v0.1.5) - 2026-11-22
 
 ### Added

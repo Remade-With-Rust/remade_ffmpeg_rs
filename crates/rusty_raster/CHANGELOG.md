@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_raster-v0.1.4...rusty_raster-v0.1.5) - 2026-11-22
+
+### Other
+
+- *(rusty_raster)* small try_zeroed sizes under Miri
+- *(rusty_raster)* fenced alloc_zeroed for try_zeroed ([#198](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/198))
+- *(rusty_raster)* zeroed allocation for Pixmap::new / Mask::new ([#198](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/pull/198))
+
 ## [0.1.4](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_raster-v0.1.3...rusty_raster-v0.1.4) - 2026-11-22
 
 ### Other
