@@ -6,6 +6,7 @@ use std::sync::{Arc, OnceLock};
 use crate::color::delta_e_2000;
 use crate::curve::InvCurve;
 use crate::error::{Error, Result};
+use crate::fast::FastShaper;
 use crate::lut::{ClutEval, FixedClut};
 use crate::pipeline::{
     build_chain, u8_point, Chain, GamutChain, LutOutChain, SegChain, ShaperChain, ShaperLink,
@@ -105,6 +106,29 @@ pub struct Options {
     /// for absolute colorimetric; as in `LittleCMS`, perceptual and
     /// saturation transforms into ICC v4 profiles always compensate.
     pub black_point_compensation: bool,
+}
+
+/// How a transform evaluates `f32` pixels ([`Transform::with_precision`]).
+/// Integer pixels are exact either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum Precision {
+    /// The exact pipeline (the default): every `f32` pixel goes through the
+    /// profiles' curves, matrices and tables in `f64`.
+    #[default]
+    Exact,
+    /// Tables and the device-link grid in `f32`, as fast colour engines do:
+    /// matrix-shaper RGB to RGB through 4096-entry forward and 16384-entry
+    /// inverse curve tables (within 1e-5 of the exact path per channel,
+    /// output clamped to `0..=1` as the exact path is), every other non-Lab
+    /// transform through its device-link grid (33 points per axis for three
+    /// inputs, 17 for four) interpolated tetrahedrally (within CIEDE2000 1.0
+    /// of the exact path on the measured corpus). Deterministic: the same
+    /// `f32` operations in the same order on every target, with or without
+    /// SIMD. Transforms whose tables cannot meet the bound (a pure power-law
+    /// output curve such as Adobe RGB's, Lab on either side, grey) keep the
+    /// exact path.
+    Fast,
 }
 
 mod sealed {
@@ -278,6 +302,9 @@ struct ShaperEngine {
     /// table by threshold ([`U8Codes`]), `None` when a table does not
     /// qualify. Built by the first 8-bit call the AVX2 kernel serves.
     codes8: OnceLock<Option<[Arc<U8Codes>; 3]>>,
+    /// [`Precision::Fast`] tables, built by the first fast `f32` call;
+    /// `None` when they miss the error budget (the exact path then serves).
+    fast: OnceLock<Option<FastShaper>>,
 }
 
 /// The 8-bit code of every linear value through one `sqrt`-indexed output
@@ -457,6 +484,7 @@ impl ShaperEngine {
         Self {
             out_of,
             codes8: OnceLock::new(),
+            fast: OnceLock::new(),
             link,
             row_of,
             m,
@@ -539,6 +567,40 @@ impl ShaperEngine {
             return None;
         };
         Some([a, b, c])
+    }
+
+    /// The fast `f32` path, when its tables qualify: `false`, with nothing
+    /// done, otherwise. The AVX2 kernel takes the leading multiple of 8
+    /// pixels and the scalar twin the rest (the same values either way).
+    fn run_fast_f32(
+        &self,
+        src: &[f32],
+        dst: &mut [f32],
+        sc_dc: (usize, usize),
+        alpha: (bool, bool),
+        exact: &ShaperChain<'_>,
+    ) -> bool {
+        let fast = self
+            .fast
+            .get_or_init(|| FastShaper::new(&self.link.in_curves, &self.link.out_curves));
+        let Some(f) = fast else {
+            return false;
+        };
+        let view = f.view(self.m, self.off);
+        let mut near = Vec::new();
+        let done = simd::shaper_f32_fast(&view, src, dst, sc_dc, alpha, &mut near);
+        let (s, d) = (&src[done * sc_dc.0..], &mut dst[done * sc_dc.1..]);
+        view.run(s, d, sc_dc, alpha, (done, &mut near));
+        // The few pixels whose fast linear value sits next to an output
+        // curve's break: the exact path's values.
+        for k in near {
+            let sp = &src[k * sc_dc.0..];
+            let out = exact.eval([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]);
+            for (c, v) in out.iter().enumerate() {
+                dst[k * sc_dc.1 + c] = *v as f32;
+            }
+        }
+        true
     }
 
     fn in16(&self) -> &[f32] {
@@ -712,6 +774,7 @@ pub struct Transform {
     /// first 8-bit call under [`AXIS8_CALL_PIXELS`] pixels and kept for
     /// the next ones (a bigger call builds its own, as it always has).
     axis8: OnceLock<Box<AxisTable>>,
+    precision: Precision,
 }
 
 /// Pixels from which an 8-bit grid call builds its own table (256 axis
@@ -857,7 +920,41 @@ impl Transform {
             axis16: OnceLock::new(),
             pixels16: AtomicUsize::new(0),
             axis8: OnceLock::new(),
+            precision: Precision::Exact,
         })
+    }
+
+    /// This transform with `f32` pixels evaluated at `precision`
+    /// ([`Precision::Exact`] by default). Integer pixels are unaffected.
+    #[must_use]
+    pub fn with_precision(mut self, precision: Precision) -> Self {
+        self.precision = precision;
+        self
+    }
+
+    /// How `f32` pixels are evaluated.
+    #[must_use]
+    pub const fn precision(&self) -> Precision {
+        self.precision
+    }
+
+    /// [`Precision::Fast`] for `f32` pixels: `false`, with nothing done,
+    /// when this transform has no fast path (the exact one then serves).
+    fn run_fast_f32(
+        &self,
+        src: &[f32],
+        dst: &mut [f32],
+        sc_dc: (usize, usize),
+        (in_ch, out_ch): (usize, usize),
+        alpha: (bool, bool),
+    ) -> bool {
+        match &self.engine {
+            Engine::Shaper(e) if in_ch == 3 && out_ch == 3 => match self.chain.as_shaper() {
+                Some(exact) => e.run_fast_f32(src, dst, sc_dc, alpha, &exact),
+                None => false,
+            },
+            _ => false,
+        }
     }
 
     /// The source layout.
@@ -952,6 +1049,11 @@ impl Transform {
                 if let Some(s) = T::f32s(src) {
                     if let Some(d) = T::f32s_mut(dst) {
                         let alpha = (src_alpha, dst_alpha);
+                        if self.precision == Precision::Fast
+                            && self.run_fast_f32(s, d, (sc, dc), (in_ch, out_ch), alpha)
+                        {
+                            return Ok(());
+                        }
                         let head = if !src_lab && mostly_u8_points(s, sc, in_ch) {
                             self.u8_head
                                 .get_or_init(|| self.chain.head_on_u8_points())
@@ -2528,5 +2630,225 @@ mod tests {
             }
         }
         assert!(tables > 0);
+    }
+
+    /// `f32` test pixels for the fast paths: a 33-point lattice in each
+    /// channel (`k / 32`), the 8-bit points, pseudo-random values in 0..=1,
+    /// and out-of-range ones (negative, past 1, -0.0, NaN, infinities).
+    fn sample_f32(n: usize, ch: usize, out_of_range: bool) -> Vec<f32> {
+        let mut v = Vec::new();
+        let lattice: Vec<f32> = (0..=32).map(|k| k as f32 / 32.0).collect();
+        for &a in &lattice {
+            for &b in &lattice {
+                for &c in lattice.iter().step_by(4) {
+                    v.extend_from_slice(&[a, b, c, 1.0 - a][..ch]);
+                }
+            }
+        }
+        let mut s = 0xA076_1D64_78BD_642Fu64;
+        let specials = [
+            -0.0f32,
+            -1e-6,
+            -0.5,
+            1.0 + 1e-6,
+            1.5,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        while v.len() < n * ch {
+            let x = xorshift(&mut s);
+            for k in 0..ch {
+                let r = (x >> (16 * k)) as u16;
+                let val = match r % 16 {
+                    0 if out_of_range => specials[usize::from(r >> 4) % specials.len()],
+                    1 => f32::from(r as u8) / 255.0,
+                    _ => f32::from(r) / 65535.0,
+                };
+                v.push(val);
+            }
+        }
+        v.truncate(n * ch);
+        v
+    }
+
+    /// The fast matrix-shaper path's scalar twin for `t`.
+    fn fast_oracle(t: &Transform, src: &[f32], dst: &mut [f32]) {
+        let Engine::Shaper(e) = &t.engine else {
+            panic!("matrix-shaper expected");
+        };
+        let f = e
+            .fast
+            .get_or_init(|| FastShaper::new(&e.link.in_curves, &e.link.out_curves))
+            .as_ref()
+            .expect("fast tables");
+        let view = f.view(e.m, e.off);
+        let sc_dc = (t.src_layout.channels(), t.dst_layout.channels());
+        let alpha = (t.src_layout.has_alpha(), t.dst_layout.has_alpha());
+        let mut near = Vec::new();
+        view.run(src, dst, sc_dc, alpha, (0, &mut near));
+        let chain = t.chain.as_shaper().expect("shaper chain");
+        for k in near {
+            let sp = &src[k * sc_dc.0..];
+            let out = chain.eval([f64::from(sp[0]), f64::from(sp[1]), f64::from(sp[2])]);
+            for (c, v) in out.iter().enumerate() {
+                dst[k * sc_dc.1 + c] = *v as f32;
+            }
+        }
+    }
+
+    /// Which pairs have fast tables (and which keep the exact path).
+    fn fast_shaper_pairs() -> Vec<(String, Transform)> {
+        let mut out = Vec::new();
+        for (name, rgb, _) in shaper_pairs() {
+            let t = rgb.with_precision(Precision::Fast);
+            let Engine::Shaper(e) = &t.engine else {
+                unreachable!()
+            };
+            let ok = e
+                .fast
+                .get_or_init(|| FastShaper::new(&e.link.in_curves, &e.link.out_curves))
+                .is_some();
+            // Pure power-law output curves (Adobe RGB 2.2, ProPhoto 1.8)
+            // are infinitely steep at 0, and the ProPhoto test profile's
+            // coarse sampled curves have kinks a 4096-entry table misses by
+            // more than 1e-6: those keep the exact path. Every pair of the
+            // parametric and identity profiles must qualify.
+            let family = |p: &str| ["srgb", "p3", "rec2020", "lin2020"].contains(&p);
+            let (a, b) = name.split_once(' ').unwrap().0.split_once("->").unwrap();
+            if family(a) && family(b) {
+                assert!(ok, "{name}: no fast tables");
+            }
+            if !ok {
+                eprintln!("fast shaper {name}: exact path (tables declined)");
+            }
+            if ok {
+                out.push((name, t));
+            }
+        }
+        out
+    }
+
+    /// The fast `f32` matrix-shaper kernel against its scalar twin, bit for
+    /// bit (determinism with and without SIMD): every qualifying pair, every
+    /// RGB/RGBA layout, in- and out-of-range values.
+    #[test]
+    fn fast_shaper_kernel_matches_its_scalar_twin() {
+        let n = 20_003;
+        for (name, t) in fast_shaper_pairs() {
+            for (sl, dl) in [
+                (Layout::Rgb, Layout::Rgb),
+                (Layout::Rgb, Layout::Rgba),
+                (Layout::Rgba, Layout::Rgb),
+                (Layout::Rgba, Layout::Rgba),
+            ] {
+                let t = relayout(&t, sl, dl).with_precision(Precision::Fast);
+                let src = sample_f32(n, sl.channels(), true);
+                let mut want = vec![0f32; n * dl.channels()];
+                let mut got = vec![1f32; n * dl.channels()];
+                fast_oracle(&t, &src, &mut want);
+                t.transform(&src, &mut got).unwrap();
+                let same = got
+                    .iter()
+                    .zip(&want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+                assert!(same, "fast f32 {name} {sl:?}->{dl:?}");
+            }
+        }
+    }
+
+    /// The fast matrix-shaper error budget: within 1e-5 of the exact path
+    /// per channel for every qualifying pair, on the lattice, the 8-bit
+    /// points, pseudo-random values and out-of-range ones (the exact path
+    /// clamps; so does the fast one, with no new clipping); NaN in gives
+    /// what the exact path gives. Prints the worst error per pair.
+    #[test]
+    fn fast_shaper_error_budget() {
+        let n = 300_007;
+        let src = sample_f32(n, 3, true);
+        let mut worst_all = 0f32;
+        for (name, fast) in fast_shaper_pairs() {
+            let exact = relayout(&fast, Layout::Rgb, Layout::Rgb);
+            let mut want = vec![0f32; src.len()];
+            let mut got = vec![0f32; src.len()];
+            exact.transform(&src, &mut want).unwrap();
+            fast.transform(&src, &mut got).unwrap();
+            let mut worst = (0f32, 0usize);
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert!((0.0..=1.0).contains(a), "{name}: fast {a} out of range");
+                let d = (a - b).abs();
+                if d > worst.0 {
+                    worst = (d, i);
+                }
+            }
+            let px = worst.1 / 3;
+            assert!(
+                worst.0 <= 1e-5,
+                "{name}: |fast - exact| {:e} at {:?}",
+                worst.0,
+                &src[3 * px..3 * px + 3]
+            );
+            worst_all = worst_all.max(worst.0);
+            eprintln!("fast shaper {name}: max |fast - exact| {:.3e}", worst.0);
+        }
+        eprintln!("fast shaper: worst over all pairs {worst_all:.3e}");
+    }
+
+    /// Reachability: the public fast `f32` path runs the AVX2 kernel.
+    #[test]
+    fn fast_shaper_kernel_is_reached() {
+        if !simd::avx2() {
+            eprintln!("no AVX2: the scalar twin serves every pixel");
+            return;
+        }
+        let (_, t) = fast_shaper_pairs().swap_remove(0);
+        let src = sample_f32(1001, 3, false);
+        let mut dst = vec![0f32; src.len()];
+        let before = simd::CENSUS.load(Ordering::Relaxed);
+        t.transform(&src, &mut dst).unwrap();
+        assert!(simd::CENSUS.load(Ordering::Relaxed) - before >= 1000);
+    }
+
+    /// The fast matrix-shaper error budget on dense sweeps: all 2^24 colours
+    /// whose channels are 8-bit points (`k / 255`, the shape of float data
+    /// decoded from 8-bit images) and a 257^3 lattice (`k / 256`), every
+    /// qualifying pair (`cargo test --release -- --ignored fast_shaper_dense`).
+    #[test]
+    #[ignore = "dense: 2^24 + 257^3 colours per pair"]
+    fn fast_shaper_dense() {
+        let points: Vec<f32> = (0..1u32 << 24)
+            .flat_map(|v| [v >> 16, (v >> 8) & 255, v & 255].map(|k| k as f32 / 255.0))
+            .collect();
+        let lattice: Vec<f32> = (0..257u32 * 257 * 257)
+            .flat_map(|v| [v / (257 * 257), (v / 257) % 257, v % 257].map(|k| k as f32 / 256.0))
+            .collect();
+        let mut worst_all = 0f32;
+        for (name, fast) in fast_shaper_pairs() {
+            if name.contains("Perceptual") {
+                continue; // matrix-shaper intents share one matrix
+            }
+            let exact = relayout(&fast, Layout::Rgb, Layout::Rgb);
+            for (set, src) in [("8-bit points", &points), ("257^3 lattice", &lattice)] {
+                let mut want = vec![0f32; src.len()];
+                let mut got = vec![0f32; src.len()];
+                exact.transform(src, &mut want).unwrap();
+                fast.transform(src, &mut got).unwrap();
+                let (worst, at) = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .enumerate()
+                    .fold((0f32, 0), |m, (i, d)| if d > m.0 { (d, i) } else { m });
+                eprintln!(
+                    "fast shaper dense {name} {set}: max |fast - exact| {worst:.3e} at {:?} -> fast {} exact {}",
+                    &src[at / 3 * 3..at / 3 * 3 + 3],
+                    got[at],
+                    want[at]
+                );
+                assert!(worst <= 1e-5, "{name} {set}: {worst:e}");
+                worst_all = worst_all.max(worst);
+            }
+        }
+        eprintln!("fast shaper dense: worst {worst_all:.3e}");
     }
 }

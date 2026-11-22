@@ -44,6 +44,7 @@ mod bytes;
 pub mod color;
 mod curve;
 mod error;
+mod fast;
 mod lut;
 mod md5;
 mod pipeline;
@@ -62,4 +63,4 @@ pub use profile::{ColorSpace, Header, Profile, ProfileClass, TagSignature};
 pub use tag::{LocalizedString, Tag};
 #[doc(hidden)]
 pub use transform::SampleKind;
-pub use transform::{GamutCheck, Intent, Layout, Options, Sample, Transform};
+pub use transform::{GamutCheck, Intent, Layout, Options, Precision, Sample, Transform};

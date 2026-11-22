@@ -19,6 +19,7 @@
 //!   than x86-64, and on x86-64 CPUs without AVX2, every entry point returns
 //!   0 and the scalar twin does everything.
 
+use crate::fast::FastShaperView;
 use crate::transform::OUT_TABLE;
 
 /// The tables and matrix of a three-channel matrix-shaper transform
@@ -104,6 +105,31 @@ pub(crate) fn shaper_u8(
     0
 }
 
+/// The fast `f32` matrix-shaper loop ([`FastShaperView::run`]) on the
+/// leading multiple of 8 pixels: the same values, bit for bit. Returns the
+/// pixels done.
+pub(crate) fn shaper_f32_fast(
+    t: &FastShaperView<'_>,
+    src: &[f32],
+    dst: &mut [f32],
+    (sc, dc): (usize, usize),
+    alpha: (bool, bool),
+    near: &mut Vec<usize>,
+) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if matches!((sc, dc), (3 | 4, 3 | 4)) && avx2() {
+            // SAFETY: as in `shaper_u8`: AVX2 detected just above.
+            let done =
+                unsafe { x86::shaper_f32_fast(t, src, dst, (sc, dc), alpha.0 && alpha.1, near) };
+            count(done);
+            return done;
+        }
+    }
+    let _ = (t, src, dst, sc, dc, alpha, near);
+    0
+}
+
 /// [`shaper_u8`] for 16-bit samples.
 pub(crate) fn shaper_u16(
     t: &ShaperTables<'_, 65536>,
@@ -127,7 +153,8 @@ pub(crate) fn shaper_u16(
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{Codes8, ShaperTables, OUT_TABLE};
+    use super::{Codes8, FastShaperView, ShaperTables, OUT_TABLE};
+    use crate::fast::{FastCurve, CELLS, FAST_TABLE, GUARD};
     use core::arch::x86_64::*;
 
     // ---- memory helpers: every raw-pointer access of the module ----
@@ -314,9 +341,17 @@ mod x86 {
         let l0 = gather(t.rows[0], idx[0]);
         let l1 = gather(t.rows[1], idx[1]);
         let l2 = gather(t.rows[2], idx[2]);
+        product(&t.m, &t.off, [l0, l1, l2])
+    }
+
+    /// Per output channel `o`: `m[o][0] * l[0] + m[o][1] * l[1] +
+    /// m[o][2] * l[2] + off[o]`, left to right.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn product(m: &[[f32; 3]; 3], off: &[f32; 3], [l0, l1, l2]: [__m256; 3]) -> [__m256; 3] {
         let mut v = [_mm256_setzero_ps(); 3];
         for (o, v) in v.iter_mut().enumerate() {
-            let r = t.m[o];
+            let r = m[o];
             // `r[0] * l0 + r[1] * l1 + r[2] * l2 + off`, left to right.
             *v = _mm256_add_ps(
                 _mm256_add_ps(
@@ -326,7 +361,7 @@ mod x86 {
                     ),
                     _mm256_mul_ps(_mm256_set1_ps(r[2]), l2),
                 ),
-                _mm256_set1_ps(t.off[o]),
+                _mm256_set1_ps(off[o]),
             );
         }
         v
@@ -646,6 +681,239 @@ mod x86 {
             (3, 4) => run_u16::<3, 4>(t, src, dst, copy_alpha),
             (4, 3) => run_u16::<4, 3>(t, src, dst, copy_alpha),
             (4, 4) => run_u16::<4, 4>(t, src, dst, copy_alpha),
+            _ => 0,
+        }
+    }
+
+    // ---- fast `f32` pixels ----
+
+    /// Eight `f32`s.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn load_ps(p: &[f32; 8]) -> __m256 {
+        // SAFETY: `p` refers to 32 readable bytes; the load is unaligned.
+        unsafe { _mm256_loadu_ps(p.as_ptr()) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn store_ps(p: &mut [f32; 8], v: __m256) {
+        // SAFETY: `p` refers to 32 writable bytes; the store is unaligned.
+        unsafe { _mm256_storeu_ps(p.as_mut_ptr(), v) }
+    }
+
+    /// [`crate::fast::interp`] on eight lanes: the cell `i = min(trunc(pos),
+    /// CELLS - 1)` (unsigned: a negative index would cap too), `[a, d]` from
+    /// it, `a + d * (pos - i)`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn interp(t: &[[f32; 2]; CELLS], pos: __m256) -> __m256 {
+        let i = _mm256_min_epu32(
+            _mm256_cvttps_epi32(pos),
+            _mm256_set1_epi32(CELLS as i32 - 1),
+        );
+        let f = _mm256_sub_ps(pos, _mm256_cvtepi32_ps(i));
+        // SAFETY: every lane of `i`, read as unsigned, is at most CELLS - 1
+        // (the `min` above), so each 8-byte read at `t + 8 * i` is one whole
+        // cell inside the CELLS cells `t` refers to.
+        let (lo, hi) = unsafe {
+            (
+                _mm256_i32gather_epi64::<8>(t.as_ptr().cast(), _mm256_castsi256_si128(i)),
+                _mm256_i32gather_epi64::<8>(t.as_ptr().cast(), _mm256_extracti128_si256::<1>(i)),
+            )
+        };
+        // Cells (a0 d0 a1 d1 | a2 d2 a3 d3) and (a4 d4 ..): even lanes are
+        // `a`, odd ones `d`, back into lane order.
+        let (lo, hi) = (_mm256_castsi256_ps(lo), _mm256_castsi256_ps(hi));
+        let a = _mm256_castpd_ps(_mm256_permute4x64_pd::<0xD8>(_mm256_castps_pd(
+            _mm256_shuffle_ps::<0x88>(lo, hi),
+        )));
+        let d = _mm256_castpd_ps(_mm256_permute4x64_pd::<0xD8>(_mm256_castps_pd(
+            _mm256_shuffle_ps::<0xDD>(lo, hi),
+        )));
+        _mm256_add_ps(a, _mm256_mul_ps(d, f))
+    }
+
+    /// [`FastCurve::forward_at`] on eight lanes.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn forward(f: &FastCurve, x: __m256) -> __m256 {
+        let scale = _mm256_set1_ps((FAST_TABLE - 1) as f32);
+        let t = interp(&f.table, _mm256_mul_ps(x, scale));
+        match f.toe {
+            Some((d, k)) => {
+                let below = _mm256_cmp_ps::<_CMP_LT_OQ>(x, _mm256_set1_ps(d));
+                _mm256_blendv_ps(t, _mm256_mul_ps(x, _mm256_set1_ps(k)), below)
+            }
+            None => t,
+        }
+    }
+
+    /// [`FastCurve::inverse_at`] on eight lanes.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn inverse(f: &FastCurve, y: __m256) -> __m256 {
+        let scale = _mm256_set1_ps((FAST_TABLE - 1) as f32);
+        let t = interp(&f.table, _mm256_mul_ps(_mm256_sqrt_ps(y), scale));
+        match f.toe {
+            Some((brk, k)) => {
+                let below = _mm256_cmp_ps::<_CMP_LT_OQ>(y, _mm256_set1_ps(brk));
+                _mm256_blendv_ps(t, _mm256_mul_ps(y, _mm256_set1_ps(k)), below)
+            }
+            None => t,
+        }
+    }
+
+    /// Eight pixels of interleaved `f32` RGB (`SC` 3) or RGBA (`SC` 4) as
+    /// channel vectors in pixel order (alpha 0 for RGB).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn load_f32<const SC: usize>(p: &[f32]) -> [__m256; 4] {
+        let v = |k: usize| load_ps(p[8 * k..].first_chunk::<8>().expect("kernel width"));
+        if SC == 4 {
+            let (v0, v1, v2, v3) = (v(0), v(1), v(2), v(3));
+            let t0 = _mm256_unpacklo_ps(v0, v1);
+            let t1 = _mm256_unpackhi_ps(v0, v1);
+            let t2 = _mm256_unpacklo_ps(v2, v3);
+            let t3 = _mm256_unpackhi_ps(v2, v3);
+            // (p0 p2 p4 p6 | p1 p3 p5 p7) back to pixel order.
+            let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+            let o = |x: __m256| _mm256_permutevar8x32_ps(x, order);
+            [
+                o(_mm256_shuffle_ps::<0x44>(t0, t2)),
+                o(_mm256_shuffle_ps::<0xEE>(t0, t2)),
+                o(_mm256_shuffle_ps::<0x44>(t1, t3)),
+                o(_mm256_shuffle_ps::<0xEE>(t1, t3)),
+            ]
+        } else {
+            let (v0, v1, v2) = (v(0), v(1), v(2));
+            // Channel c of pixel k is sample 3k + c: blend each sample into
+            // place from the vector holding it, then permute into pixel order.
+            let r = _mm256_permutevar8x32_ps(
+                _mm256_blend_ps::<0b0010_0100>(_mm256_blend_ps::<0b1001_0010>(v0, v1), v2),
+                _mm256_setr_epi32(0, 3, 6, 1, 4, 7, 2, 5),
+            );
+            let g = _mm256_permutevar8x32_ps(
+                _mm256_blend_ps::<0b0100_1001>(_mm256_blend_ps::<0b0010_0100>(v0, v1), v2),
+                _mm256_setr_epi32(1, 4, 7, 2, 5, 0, 3, 6),
+            );
+            let b = _mm256_permutevar8x32_ps(
+                _mm256_blend_ps::<0b1001_0010>(_mm256_blend_ps::<0b0100_1001>(v0, v1), v2),
+                _mm256_setr_epi32(2, 5, 0, 3, 6, 1, 4, 7),
+            );
+            [r, g, b, _mm256_setzero_ps()]
+        }
+    }
+
+    /// Eight pixels of channel vectors (pixel order) to interleaved `f32`
+    /// RGB (`DC` 3) or RGBA (`DC` 4).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn store_f32<const DC: usize>(p: &mut [f32], [r, g, b, a]: [__m256; 4]) {
+        let mut put = |k: usize, v: __m256| {
+            store_ps(p[8 * k..].first_chunk_mut::<8>().expect("kernel width"), v);
+        };
+        if DC == 4 {
+            // Pixel order to (p0 p2 p4 p6 | p1 p3 p5 p7), then the transpose.
+            let order = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+            let o = |x: __m256| _mm256_permutevar8x32_ps(x, order);
+            let (r, g, b, a) = (o(r), o(g), o(b), o(a));
+            let t0 = _mm256_unpacklo_ps(r, g);
+            let t1 = _mm256_unpacklo_ps(b, a);
+            let t2 = _mm256_unpackhi_ps(r, g);
+            let t3 = _mm256_unpackhi_ps(b, a);
+            put(0, _mm256_shuffle_ps::<0x44>(t0, t1));
+            put(1, _mm256_shuffle_ps::<0xEE>(t0, t1));
+            put(2, _mm256_shuffle_ps::<0x44>(t2, t3));
+            put(3, _mm256_shuffle_ps::<0xEE>(t2, t3));
+        } else {
+            let r = _mm256_permutevar8x32_ps(r, _mm256_setr_epi32(0, 3, 6, 1, 4, 7, 2, 5));
+            let g = _mm256_permutevar8x32_ps(g, _mm256_setr_epi32(5, 0, 3, 6, 1, 4, 7, 2));
+            let b = _mm256_permutevar8x32_ps(b, _mm256_setr_epi32(2, 5, 0, 3, 6, 1, 4, 7));
+            put(
+                0,
+                _mm256_blend_ps::<0b0010_0100>(_mm256_blend_ps::<0b1001_0010>(r, g), b),
+            );
+            put(
+                1,
+                _mm256_blend_ps::<0b0010_0100>(_mm256_blend_ps::<0b1001_0010>(b, r), g),
+            );
+            put(
+                2,
+                _mm256_blend_ps::<0b0010_0100>(_mm256_blend_ps::<0b1001_0010>(g, b), r),
+            );
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn run_f32<const SC: usize, const DC: usize>(
+        t: &FastShaperView<'_>,
+        src: &[f32],
+        dst: &mut [f32],
+        copy_alpha: bool,
+        near: &mut Vec<usize>,
+    ) -> usize {
+        let abs = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
+        let guard = _mm256_set1_ps(GUARD);
+        let one = _mm256_set1_ps(1.0);
+        let mut done = 0;
+        for (s, d) in src.chunks_exact(8 * SC).zip(dst.chunks_exact_mut(8 * DC)) {
+            let [r, g, b, a] = load_f32::<SC>(s);
+            let x = [r, g, b];
+            let mut lin = [_mm256_setzero_ps(); 3];
+            for c in 0..3 {
+                let v = clamp01(x[c]);
+                lin[c] = match t.fwd[c] {
+                    Some(f) => forward(f, v),
+                    None => v,
+                };
+            }
+            let v = product(&t.m, &t.off, lin);
+            let mut y = [_mm256_setzero_ps(); 3];
+            let mut close = _mm256_setzero_ps();
+            for o in 0..3 {
+                let v = clamp01(v[o]);
+                y[o] = match t.inv[o] {
+                    Some(f) => {
+                        if let Some((brk, _)) = f.toe {
+                            let d = _mm256_and_ps(_mm256_sub_ps(v, _mm256_set1_ps(brk)), abs);
+                            close = _mm256_or_ps(close, _mm256_cmp_ps::<_CMP_LT_OQ>(d, guard));
+                        }
+                        clamp01(inverse(f, v))
+                    }
+                    None => v,
+                };
+            }
+            let mut bits = _mm256_movemask_ps(close) as u32;
+            while bits != 0 {
+                near.push(done + bits.trailing_zeros() as usize);
+                bits &= bits - 1;
+            }
+            let a = if copy_alpha { a } else { one };
+            store_f32::<DC>(d, [y[0], y[1], y[2], a]);
+            done += 8;
+        }
+        done
+    }
+
+    /// The fast `f32` kernel.
+    ///
+    /// # Safety
+    /// The CPU must support AVX2.
+    #[target_feature(enable = "avx2")]
+    pub(super) fn shaper_f32_fast(
+        t: &FastShaperView<'_>,
+        src: &[f32],
+        dst: &mut [f32],
+        sc_dc: (usize, usize),
+        copy_alpha: bool,
+        near: &mut Vec<usize>,
+    ) -> usize {
+        match sc_dc {
+            (3, 3) => run_f32::<3, 3>(t, src, dst, copy_alpha, near),
+            (3, 4) => run_f32::<3, 4>(t, src, dst, copy_alpha, near),
+            (4, 3) => run_f32::<4, 3>(t, src, dst, copy_alpha, near),
+            (4, 4) => run_f32::<4, 4>(t, src, dst, copy_alpha, near),
             _ => 0,
         }
     }
