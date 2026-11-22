@@ -599,11 +599,33 @@ pub struct SubPixmapMut<'a> {
 }
 
 /// A zeroed buffer, or `None` when the allocator refuses the request.
+///
+/// Goes straight to the global allocator's `alloc_zeroed`, which on large
+/// requests hands back fresh OS pages without writing them. The previous
+/// `try_reserve_exact` + `resize(len, 0)` wrote every byte (issue #198:
+/// ~0.5-0.8 ms per 1600x1200 pixmap). Safe code cannot get this: `vec![0; len]`
+/// aborts on failure, and probing with `try_reserve_exact` first frees a block
+/// the allocator then hands back as dirty and zeroes by hand. An oversized
+/// request still returns `None` instead of aborting (#138).
+///
+/// This is the crate's only `unsafe`.
+#[allow(unsafe_code)]
 pub(crate) fn try_zeroed(len: usize) -> Option<Vec<u8>> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(len).ok()?;
-    v.resize(len, 0);
-    Some(v)
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    // `Layout::array` rejects sizes over `isize::MAX`; align is 1.
+    let layout = std::alloc::Layout::array::<u8>(len).ok()?;
+    // SAFETY: `layout` has non-zero size (len > 0, checked above).
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` was just allocated by the global allocator with the layout
+    // of `[u8; len]` (size `len`, align 1 = `align_of::<u8>()`), so capacity
+    // `len` matches the allocation; all `len` bytes are initialised (zeroed);
+    // ownership moves into the Vec, which frees it with that same layout.
+    Some(unsafe { Vec::from_raw_parts(ptr, len, len) })
 }
 
 fn fill_bytes(data: &mut [u8], color: Color) {
@@ -690,5 +712,41 @@ mod tests {
         assert!(try_zeroed(0).unwrap().is_empty());
         assert!(try_zeroed(isize::MAX as usize).is_none());
         assert!(try_zeroed(usize::MAX).is_none());
+    }
+}
+
+#[cfg(test)]
+mod try_zeroed_tests {
+    use super::try_zeroed;
+
+    #[test]
+    fn zeroed_and_sized() {
+        // Miri interprets every byte check; keep its sizes small.
+        let sizes: &[usize] = if cfg!(miri) {
+            &[0, 1, 7, 4096]
+        } else {
+            &[0, 1, 7, 4096, 1 << 20, 7_680_000]
+        };
+        for &len in sizes {
+            let v = try_zeroed(len).unwrap();
+            assert_eq!(v.len(), len);
+            assert!(v.capacity() >= len);
+            assert!(v.iter().all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn oversized_is_none_not_abort() {
+        assert!(try_zeroed(usize::MAX).is_none());
+        assert!(try_zeroed(isize::MAX as usize + 1).is_none());
+    }
+
+    #[test]
+    fn grows_and_drops_like_a_vec() {
+        let mut v = try_zeroed(1 << 17).unwrap();
+        v.push(1);
+        v.truncate(3);
+        v.shrink_to_fit();
+        assert_eq!(v, [0, 0, 0]);
     }
 }

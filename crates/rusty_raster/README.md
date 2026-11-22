@@ -5,7 +5,7 @@ and stroke (every join and cap, dashes, hairlines), non-zero and even-odd
 fill rules, linear, two-point-conical and sweep gradients with pad, repeat
 and reflect spread, all Porter-Duff and SVG blend modes, alpha and
 luminance masks, and pixmap drawing with nearest, bilinear and bicubic
-sampling. `#![forbid(unsafe_code)]`, no dependencies (PNG I/O through the
+sampling. `#![deny(unsafe_code)]` with one audited exception (the zeroed pixel-buffer allocation), no dependencies (PNG I/O through the
 house `rusty_png`, behind the default `png-format` feature).
 
 It is a hardened fork of [tiny-skia](https://github.com/linebender/tiny-skia)
