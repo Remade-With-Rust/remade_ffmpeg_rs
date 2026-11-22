@@ -1531,6 +1531,20 @@ impl BandCost {
     /// whose `lav` holds the peak (the `lav`s rise with the book number, so they
     /// are a suffix) and whose `dim` divides the width.
     fn best(&self, width: usize) -> (u8, usize) {
+        let cost = self.costs(width);
+        let mut best = (ESC_HCB, usize::MAX);
+        for (cb, &bits) in cost.iter().enumerate().skip(1) {
+            if bits != u32::MAX && (bits as usize) < best.1 {
+                best = (cb as u8, bits as usize);
+            }
+        }
+        best
+    }
+
+    /// Every book's bits for the band (index 0 unused), `u32::MAX` for a book
+    /// that cannot code it: the eligibility rule of [`best`](Self::best). The
+    /// section trellis prices all of them at once (see [`band_book_costs`]).
+    fn costs(&self, width: usize) -> [u32; 12] {
         let lane = |v: u64, k: u32| (v >> (16 * k)) & 0xffff;
         let nz = u64::from(self.nz);
         let (a12, a34, a56) = (
@@ -1563,16 +1577,14 @@ impl BandCost {
         if width % 4 != 0 {
             first = first.max(5);
         }
-        let mut best = (ESC_HCB, usize::MAX);
+        let mut out = [u32::MAX; 12];
         if width % 2 != 0 {
-            return best;
+            return out;
         }
-        for (cb, &bits) in cost.iter().enumerate().skip(first) {
-            if (bits as usize) < best.1 {
-                best = (cb as u8, bits as usize);
-            }
+        for cb in first..12 {
+            out[cb] = u32::try_from(cost[cb]).unwrap_or(u32::MAX - 1);
         }
-        best
+        out
     }
 }
 
@@ -1723,6 +1735,49 @@ fn band_book_costs(
         }
         return out;
     }
+    if (e - s) % 2 != 0 {
+        // Cold: every AAC band width is a multiple of 4.
+        return band_book_costs_ref(quant, s, e, win0, nwin, wlen);
+    }
+    // One walk prices every book, the kernel `best_codebook_for_band` and
+    // `best_codebook_short` choose from.
+    let band = |w: usize| &quant[w * wlen + s..w * wlen + e];
+    let t = cost_tables();
+    let mut cost = BandCost::default();
+    for w in win0..win0 + nwin {
+        cost.add2(t, band(w));
+    }
+    if cost.maxq <= 2 && (e - s) % 4 == 0 {
+        for w in win0..win0 + nwin {
+            cost.add4(t, band(w));
+        }
+    }
+    if cost.maxq >= 16 {
+        for w in win0..win0 + nwin {
+            cost.add_esc(band(w));
+        }
+    }
+    cost.costs(e - s)
+}
+
+/// [`band_book_costs`] for a non-zero band by a per-book search through
+/// [`spectral_bits`]: the cold path for an odd band width and the oracle of
+/// the one-walk pricing's test.
+#[cold]
+fn band_book_costs_ref(
+    quant: &[i32],
+    s: usize,
+    e: usize,
+    win0: usize,
+    nwin: usize,
+    wlen: usize,
+) -> [u32; 12] {
+    let mut out = [u32::MAX; 12];
+    let maxq = (win0..win0 + nwin)
+        .flat_map(|w| quant[w * wlen + s..w * wlen + e].iter())
+        .map(|q| q.unsigned_abs())
+        .max()
+        .unwrap_or(0);
     for cb in 1..=11u8 {
         let meta = &CODEBOOKS[cb as usize];
         let dim = meta.dim as usize;
@@ -1745,7 +1800,7 @@ fn band_book_costs(
             }
         }
         if ok {
-            out[cb as usize] = bits + if maxq == 0 { CARRIED_ZERO_SF_BITS } else { 0 };
+            out[cb as usize] = bits;
         }
     }
     out
@@ -8463,6 +8518,46 @@ mod lowrate {
                 best = best.min(cost(&costs, &cbs, 9));
             }
             assert_eq!(got, best, "trellis not optimal for {costs:?}");
+        }
+    }
+
+    /// The one-walk book pricing the trellis uses gives every book the bits
+    /// the per-book search does, long and short, across peak magnitudes.
+    #[test]
+    fn band_book_costs_match_per_book_search() {
+        let mut seed = 0x9e37_79b9_u64;
+        let mut rnd = move |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for _ in 0..3000 {
+            let width = [4usize, 8, 12, 16, 32][rnd(5) as usize];
+            let (nwin, wlen) = if rnd(2) == 0 {
+                (1, 1024)
+            } else {
+                (1 + rnd(4) as usize, 128)
+            };
+            let peak = [1i64, 2, 4, 7, 12, 15, 16, 40, 8191][rnd(9) as usize];
+            let mut quant = vec![0i32; nwin * wlen];
+            for w in 0..nwin {
+                for i in 0..width {
+                    if rnd(3) != 0 {
+                        let m = rnd(peak as u64 + 1) as i32;
+                        quant[w * wlen + 8 + i] = if rnd(2) == 0 { m } else { -m };
+                    }
+                }
+            }
+            let (s, e) = (8, 8 + width);
+            if (0..nwin).all(|w| quant[w * wlen + s..w * wlen + e].iter().all(|&q| q == 0)) {
+                continue;
+            }
+            assert_eq!(
+                band_book_costs(&quant, s, e, 0, nwin, wlen),
+                band_book_costs_ref(&quant, s, e, 0, nwin, wlen),
+                "width {width}, nwin {nwin}, peak {peak}"
+            );
         }
     }
 
