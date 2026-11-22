@@ -153,6 +153,14 @@ fn every_kind_of_reader_gives_the_same_pixels() {
             decode(OneBuffer(Cursor::new(&le))),
             "{name} one buffer"
         );
+        // A one-buffer reader sends every band after the first through the
+        // band path, byte swap included.
+        let be = common::to_big_endian(&le).unwrap();
+        assert_eq!(
+            decode(Cursor::new(&be)),
+            decode(OneBuffer(Cursor::new(&be))),
+            "{name} BE one buffer"
+        );
         assert_eq!(want, decode(Trickle(Cursor::new(&le))), "{name} trickle");
         if k % 5 == 2 {
             let p = dir.join("t.tif");

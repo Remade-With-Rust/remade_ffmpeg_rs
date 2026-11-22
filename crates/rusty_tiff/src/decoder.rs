@@ -1409,7 +1409,7 @@ fn decode_tile_bands<R: Read + Seek>(
         && !matches!(info.predictor, pred::HORIZONTAL | pred::FLOATING_POINT)
         && info.fill_order != 2
     {
-        let out = tiles_direct16(s, img, limits, total_bytes)?;
+        let out = tiles_direct16(s, img, limits, interpret, total_bytes)?;
         return Ok(typed_result(Out::U16(out), info.sample_kind, 16));
     }
     if bits == 16 {
@@ -1417,19 +1417,7 @@ fn decode_tile_bands<R: Read + Seek>(
         out.try_reserve_exact(total_bytes / 2)
             .map_err(|_| TiffError::limits(format!("cannot allocate {total_bytes} bytes")))?;
         tile_band_rows(s, img, limits, interpret, |band, g| {
-            // The band is a heap buffer, so it is u16-aligned and its rows
-            // append as u16 slices viewed straight from it; the per-sample
-            // conversion is kept for a band that is not.
-            match bytemuck::try_cast_slice::<u8, u16>(band) {
-                Ok(b) => emit_band(&mut out, b, g.halved()),
-                Err(_) => g.for_each_part(|at, n| {
-                    out.extend(
-                        band[at..at + n]
-                            .chunks_exact(2)
-                            .map(|c| u16::from_ne_bytes(c.try_into().unwrap())),
-                    );
-                }),
-            }
+            emit_band16(&mut out, band, g);
         })?;
         return Ok(typed_result(Out::U16(out), info.sample_kind, 16));
     }
@@ -1475,6 +1463,7 @@ fn tiles_direct16<R: Read + Seek>(
     s: &mut Stream<R>,
     img: &Image,
     limits: &mut Budget<'_>,
+    interpret: bool,
     total_bytes: usize,
 ) -> TiffResult<Vec<u16>> {
     let info = &img.info;
@@ -1490,7 +1479,18 @@ fn tiles_direct16<R: Read + Seek>(
     let mut pad: Vec<u8> = Vec::new();
     let mut scratch: Vec<u8> = Vec::new();
     let mut iov: Vec<IoSliceMut<'static>> = Vec::new();
+    // Cleared by the first read that shows the reader fills one buffer per
+    // call; the bands after it go through the band path (one read per band
+    // of tiles stored back to back), which for such a reader costs fewer
+    // calls and no zeroing.
+    let mut vectored = true;
+    let mut band: Vec<u8> = Vec::new();
     for cy in 0..down {
+        if !vectored {
+            let g = decode_band_cold(s, img, cy, limits, interpret, &mut band)?;
+            emit_band16(&mut out, &band, g);
+            continue;
+        }
         let y0 = (cy * ch) as usize;
         let rows = ch.min(info.height - cy * ch) as usize;
         // Zero one band of rows just before its tiles overwrite it (while
@@ -1536,7 +1536,7 @@ fn tiles_direct16<R: Read + Seek>(
                     }
                 }
             }
-            s.read_at_scatter(offset, &mut bufs, &mut scratch)?;
+            s.read_at_scatter(offset, &mut bufs, &mut scratch, &mut vectored)?;
             iov = reuse(bufs);
             limits.chunk(n, have, expected)?;
             if swap {
@@ -1635,6 +1635,22 @@ fn emit_band<T: Copy>(out: &mut Vec<T>, band: &[T], g: BandRows) {
     }
 }
 
+/// [`emit_band`] for a band of 16-bit samples. The band is a heap buffer, so
+/// it is u16-aligned and its rows append as u16 slices viewed straight from
+/// it; the per-sample conversion is kept for a band that is not.
+fn emit_band16(out: &mut Vec<u16>, band: &[u8], g: BandRows) {
+    match bytemuck::try_cast_slice::<u8, u16>(band) {
+        Ok(b) => emit_band(out, b, g.halved()),
+        Err(_) => g.for_each_part(|at, n| {
+            out.extend(
+                band[at..at + n]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_ne_bytes(c.try_into().unwrap())),
+            );
+        }),
+    }
+}
+
 /// The band loop of [`decode_tile_bands`]: decodes each band of tiles and
 /// hands it, with where its image rows are, to `emit`.
 fn tile_band_rows<R: Read + Seek>(
@@ -1644,63 +1660,89 @@ fn tile_band_rows<R: Read + Seek>(
     interpret: bool,
     mut emit: impl FnMut(&[u8], BandRows),
 ) -> TiffResult<()> {
+    let (_, down) = img.across_down();
+    let mut band: Vec<u8> = Vec::new();
+    for cy in 0..down {
+        let g = decode_band(s, img, cy, limits, interpret, &mut band)?;
+        emit(&band, g);
+    }
+    Ok(())
+}
+
+/// [`decode_band`] out of line, for the direct path's fallback: it runs
+/// only for a reader that fills one buffer per call, and keeping the band
+/// decode out of `tiles_direct16` leaves that loop as it was.
+#[cold]
+#[inline(never)]
+fn decode_band_cold<R: Read + Seek>(
+    s: &mut Stream<R>,
+    img: &Image,
+    cy: u32,
+    limits: &mut Budget<'_>,
+    interpret: bool,
+    band: &mut Vec<u8>,
+) -> TiffResult<BandRows> {
+    decode_band(s, img, cy, limits, interpret, band)
+}
+
+/// Decode band `cy` of tiles into `band` (replacing what it held) and say
+/// where its image rows are. Inlined into the band loop: as a call per band
+/// it cost about 300 instructions a band (+10,041 on 32x32 RGB16 tiles).
+#[allow(clippy::inline_always)] // measured, see above
+#[inline(always)]
+fn decode_band<R: Read + Seek>(
+    s: &mut Stream<R>,
+    img: &Image,
+    cy: u32,
+    limits: &mut Budget<'_>,
+    interpret: bool,
+    band: &mut Vec<u8>,
+) -> TiffResult<BandRows> {
     let info = &img.info;
     let (cw, ch) = info.chunk_dimensions;
-    let (across, down) = img.across_down();
+    let (across, _) = img.across_down();
     let bits = info.bits_per_sample;
     let tile_row = row_bytes(cw, img.spp_chunk(), bits)?;
     let px = usize::from(info.samples_per_pixel) * usize::from(bits / 8);
     let too_big = || TiffError::limits("cannot allocate a band of tiles");
-    let mut band: Vec<u8> = Vec::new();
-    for cy in 0..down {
-        let rows = ch.min(info.height - cy * ch) as usize;
-        // Bytes of each tile the image uses (its first `rows` rows).
-        let keep = rows * tile_row;
-        // Room for every tile's kept rows, and for the whole of the tile
-        // being decoded, so the band never reallocates inside the loop.
-        let need = tile_row
-            .checked_mul(ch as usize)
-            .and_then(|t| (across as usize - 1).checked_mul(keep)?.checked_add(t))
-            .ok_or_else(too_big)?;
-        band.clear();
-        band.try_reserve_exact(need).map_err(|_| too_big())?;
-        let first = (cy * across) as usize;
-        let whole = rows == ch as usize
-            && read_band_whole(
-                s,
-                img,
-                first,
-                across as usize,
-                (ch, tile_row),
-                limits,
-                &mut band,
-            )?;
-        for cx in (0..across).filter(|_| !whole) {
-            let at = band.len();
-            decode_chunk_append(
-                s,
-                img,
-                (cy * across + cx) as usize,
-                (cw, ch, tile_row),
-                limits,
-                interpret,
-                &mut band,
-            )?;
-            band.truncate(at + keep);
-        }
-        // Every tile but the last lies inside the image width.
-        let last = cw.min(info.width - (across - 1) * cw) as usize * px;
-        let g = BandRows {
-            rows,
-            across: across as usize,
-            keep,
-            tile_row,
-            seg: cw as usize * px,
-            last,
-        };
-        emit(&band, g);
+    let rows = ch.min(info.height - cy * ch) as usize;
+    // Bytes of each tile the image uses (its first `rows` rows).
+    let keep = rows * tile_row;
+    // Room for every tile's kept rows, and for the whole of the tile
+    // being decoded, so the band never reallocates inside the loop.
+    let need = tile_row
+        .checked_mul(ch as usize)
+        .and_then(|t| (across as usize - 1).checked_mul(keep)?.checked_add(t))
+        .ok_or_else(too_big)?;
+    band.clear();
+    band.try_reserve_exact(need).map_err(|_| too_big())?;
+    let first = (cy * across) as usize;
+    let whole = rows == ch as usize
+        && read_band_whole(s, img, first, across as usize, (ch, tile_row), limits, band)?;
+    for cx in (0..across).filter(|_| !whole) {
+        let at = band.len();
+        decode_chunk_append(
+            s,
+            img,
+            (cy * across + cx) as usize,
+            (cw, ch, tile_row),
+            limits,
+            interpret,
+            band,
+        )?;
+        band.truncate(at + keep);
     }
-    Ok(())
+    // Every tile but the last lies inside the image width.
+    let last = cw.min(info.width - (across - 1) * cw) as usize * px;
+    let g = BandRows {
+        rows,
+        across: across as usize,
+        keep,
+        tile_row,
+        seg: cw as usize * px,
+        last,
+    };
+    Ok(g)
 }
 
 fn typed_result(out: Out, kind: SampleKind, bits: u16) -> DecodingResult {

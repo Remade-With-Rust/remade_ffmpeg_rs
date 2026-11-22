@@ -86,12 +86,14 @@ impl<R: Read + Seek> Stream<R> {
     /// A reader that fills only one buffer per call (the default
     /// `read_vectored`, which a Windows `File` uses) would cost a call per
     /// buffer, so as soon as a call stops at the end of its first buffer the
-    /// rest is read in one go into `scratch` and copied out.
+    /// rest is read in one go into `scratch` and copied out, and `vectored`
+    /// is cleared; while it is clear, every read goes that way.
     pub(crate) fn read_at_scatter(
         &mut self,
         offset: u64,
         mut bufs: &mut [IoSliceMut<'_>],
         scratch: &mut Vec<u8>,
+        vectored: &mut bool,
     ) -> TiffResult<()> {
         let total: usize = bufs.iter().map(|b| b.len()).sum();
         let short = |done: usize| {
@@ -99,10 +101,12 @@ impl<R: Read + Seek> Stream<R> {
                 "range at {offset} ended after {done} of {total} bytes"
             ))
         };
-        self.inner.seek(SeekFrom::Start(offset))?;
         let mut done = 0;
-        IoSliceMut::advance_slices(&mut bufs, 0);
-        while let Some(first) = bufs.first().map(|b| b.len()) {
+        if *vectored {
+            self.inner.seek(SeekFrom::Start(offset))?;
+            IoSliceMut::advance_slices(&mut bufs, 0);
+        }
+        while let Some(first) = bufs.first().map(|b| b.len()).filter(|_| *vectored) {
             let k = match self.inner.read_vectored(bufs) {
                 Ok(0) => return Err(short(done)),
                 Ok(k) => k,
@@ -115,18 +119,20 @@ impl<R: Read + Seek> Stream<R> {
             }
             IoSliceMut::advance_slices(&mut bufs, k);
             if k <= first && !bufs.is_empty() {
-                let rest = total - done;
-                scratch.clear();
-                self.read_at_into(offset + done as u64, rest, scratch)
-                    .map_err(|_| short(done))?;
-                let mut src = &scratch[..];
-                for b in bufs.iter_mut() {
-                    let (head, tail) = src.split_at(b.len());
-                    b.copy_from_slice(head);
-                    src = tail;
-                }
-                return Ok(());
+                *vectored = false;
             }
+        }
+        if bufs.is_empty() {
+            return Ok(());
+        }
+        scratch.clear();
+        self.read_at_into(offset + done as u64, total - done, scratch)
+            .map_err(|_| short(done))?;
+        let mut src = &scratch[..];
+        for b in bufs.iter_mut() {
+            let (head, tail) = src.split_at(b.len());
+            b.copy_from_slice(head);
+            src = tail;
         }
         Ok(())
     }
