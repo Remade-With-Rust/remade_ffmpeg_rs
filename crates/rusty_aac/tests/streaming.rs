@@ -96,8 +96,11 @@ fn snr_at(input: &[f32], decoded: &[f32], ch: usize, offset: usize) -> f64 {
 
 #[test]
 fn with_the_absolute_detector_streaming_is_byte_identical_to_finish() {
+    // Frame-demand allocation needs a whole reservoir segment ahead, so a
+    // streaming encode codes every frame at its constant-rate share.
     let cfg = AacEncoderConfig {
         relative_transients: false,
+        frame_demand: 0.0,
         ..Default::default()
     };
     for ch in [1u16, 2, 6] {
