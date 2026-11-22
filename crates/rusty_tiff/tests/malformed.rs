@@ -462,3 +462,75 @@ fn strict_fill_ratio_refuses_short_strips() {
     let mut d = Decoder::new(Cursor::new(&ok)).unwrap().with_limits(strict);
     assert!(d.read_image().is_ok());
 }
+
+/// ArtCraft's report on 0.1.4: on bit-flipped 16-bit Deflate tiles the error
+/// text changed from "invalid distance too far back" (0.1.3) to "repeated
+/// call with bad state". The inflater was called once, as before; zlib-rs
+/// overwrites the message of an error its fast loop finds, and the 16-bit
+/// band gives that loop the room to run. The message is the real one again.
+#[test]
+fn damaged_deflate_tile_keeps_the_inflate_message() {
+    // A zlib stream: one fixed-Huffman block, literal 'A', then a match 33
+    // bytes back (bits listed least significant first), then zero padding.
+    let bad: Vec<u8> = {
+        let mut bits: Vec<u8> = vec![1, 1, 0]; // BFINAL, BTYPE 01
+        let mut code = |c: u32, n: u32| (0..n).rev().for_each(|i| bits.push((c >> i & 1) as u8));
+        code(0x30 + 65, 8); // literal 'A'
+        code(1, 7); // length code 257: length 3
+        code(10, 5); // distance code 10: 33 + 4 extra bits (all 0)
+        bits.extend([0; 4]);
+        let mut b = vec![0x78, 0x9c];
+        b.extend(
+            bits.chunks(8)
+                .map(|c| c.iter().enumerate().fold(0u8, |a, (i, &v)| a | v << i)),
+        );
+        b.extend([0u8; 32]);
+        b
+    };
+    for (w, h, pred) in [(37u32, 29u32, false), (130, 67, true)] {
+        let px: Vec<u16> = (0..w * h)
+            .map(|i| (i.wrapping_mul(2654435761) >> 19) as u16)
+            .collect();
+        let mut f = Cursor::new(Vec::new());
+        {
+            let mut e = TiffEncoder::new(&mut f).unwrap();
+            let mut i = e
+                .new_image::<colortype::Gray16>(w, h)
+                .unwrap()
+                .with_compression(Compression::Deflate(6));
+            if pred {
+                i = i.with_predictor(Predictor::Horizontal);
+            }
+            i.tiles(16, 16);
+            i.write_data(&px).unwrap();
+        }
+        let mut b = f.into_inner();
+        let mut d = Decoder::new(Cursor::new(&b)).unwrap();
+        let offs = d
+            .get_tag(rusty_tiff::Tag::TileOffsets)
+            .unwrap()
+            .to_u64_vec()
+            .unwrap();
+        let counts = d
+            .get_tag(rusty_tiff::Tag::TileByteCounts)
+            .unwrap()
+            .to_u64_vec()
+            .unwrap();
+        // The second tile of the first band: decoded with the band's room
+        // after it, as in the reported files.
+        let (o, n) = (offs[1] as usize, counts[1] as usize);
+        assert!(n >= bad.len(), "{n}");
+        b[o..o + bad.len()].copy_from_slice(&bad);
+        let e = Decoder::new(Cursor::new(&b))
+            .unwrap()
+            .read_image()
+            .unwrap_err();
+        assert!(matches!(e, TiffError::Format(_)), "{e:?}");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("invalid distance too far back"),
+            "{w}x{h}: {msg}"
+        );
+        assert!(!msg.contains("repeated call"), "{w}x{h}: {msg}");
+    }
+}

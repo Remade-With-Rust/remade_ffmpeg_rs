@@ -4,7 +4,7 @@
 //! allocated, so a lying count or offset costs an error, not memory.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{ErrorKind, IoSliceMut, Read, Seek, SeekFrom};
 
 use crate::error::{TiffError, TiffResult};
 use crate::tags::{Tag, Type};
@@ -73,6 +73,66 @@ impl<R: Read + Seek> Stream<R> {
                 "range at {offset} ended after {} of {n} bytes",
                 out.len() - before
             )));
+        }
+        Ok(())
+    }
+
+    /// Read the bytes at `offset` straight into `bufs`, in order, filling
+    /// every buffer: one vectored read where the reader supports it (a
+    /// `Cursor` copies into all of them in one call; a Unix `File` issues
+    /// one `readv`; a `BufReader` passes a read this large straight to its
+    /// inner reader). The caller has range-checked the bytes.
+    ///
+    /// A reader that fills only one buffer per call (the default
+    /// `read_vectored`, which a Windows `File` uses) would cost a call per
+    /// buffer, so as soon as a call stops at the end of its first buffer the
+    /// rest is read in one go into `scratch` and copied out, and `vectored`
+    /// is cleared; while it is clear, every read goes that way.
+    pub(crate) fn read_at_scatter(
+        &mut self,
+        offset: u64,
+        mut bufs: &mut [IoSliceMut<'_>],
+        scratch: &mut Vec<u8>,
+        vectored: &mut bool,
+    ) -> TiffResult<()> {
+        let total: usize = bufs.iter().map(|b| b.len()).sum();
+        let short = |done: usize| {
+            TiffError::format(format!(
+                "range at {offset} ended after {done} of {total} bytes"
+            ))
+        };
+        let mut done = 0;
+        if *vectored {
+            self.inner.seek(SeekFrom::Start(offset))?;
+            IoSliceMut::advance_slices(&mut bufs, 0);
+        }
+        while let Some(first) = bufs.first().map(|b| b.len()).filter(|_| *vectored) {
+            let k = match self.inner.read_vectored(bufs) {
+                Ok(0) => return Err(short(done)),
+                Ok(k) => k,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            };
+            done += k;
+            if done == total {
+                return Ok(());
+            }
+            IoSliceMut::advance_slices(&mut bufs, k);
+            if k <= first && !bufs.is_empty() {
+                *vectored = false;
+            }
+        }
+        if bufs.is_empty() {
+            return Ok(());
+        }
+        scratch.clear();
+        self.read_at_into(offset + done as u64, total - done, scratch)
+            .map_err(|_| short(done))?;
+        let mut src = &scratch[..];
+        for b in bufs.iter_mut() {
+            let (head, tail) = src.split_at(b.len());
+            b.copy_from_slice(head);
+            src = tail;
         }
         Ok(())
     }
