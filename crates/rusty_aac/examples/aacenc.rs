@@ -14,7 +14,7 @@
 //! stereo bit split, `kbd`/`autoshape` window shape. With no arms it is byte-identical to the shipped defaults.
 
 use rusty_aac::lab::wav;
-use rusty_aac::{AacEncoder, AacEncoderConfig, AdtsHeader, WindowShape};
+use rusty_aac::{AacEncoder, AacEncoderConfig, AdtsHeader, Bandwidth, WindowShape};
 
 #[global_allocator]
 static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
@@ -80,6 +80,22 @@ fn main() {
     }
     if on("autoshape") {
         cfg.window_shape = WindowShape::Auto;
+    }
+    // key=value knobs.
+    for a in &arms {
+        let Some((k, v)) = a.split_once('=') else {
+            continue;
+        };
+        match k {
+            "bw" => {
+                cfg.bandwidth = match v {
+                    "full" => Bandwidth::Full,
+                    "auto" => Bandwidth::Auto,
+                    hz => Bandwidth::Hz(hz.parse().expect("bw=<hz|auto|full>")),
+                }
+            }
+            _ => panic!("unknown knob {k}"),
+        }
     }
 
     let w = wav::read(src).expect("read wav");

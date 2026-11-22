@@ -3960,6 +3960,81 @@ pub enum WindowShape {
     Auto,
 }
 
+/// Coding bandwidth policy: the highest frequency the encoder codes.
+///
+/// Bands that start at or above the cutoff are not coded (`ZERO_HCB`), in long
+/// and short blocks alike, for every channel except the LFE (which has its own
+/// band limit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Bandwidth {
+    /// Code the whole spectrum at every bitrate: the encoder as it shipped in
+    /// 2.1.2 (byte-identical). The default.
+    #[default]
+    Full,
+    /// A cutoff from the bitrate and channel count (see [`auto_bandwidth_hz`]).
+    Auto,
+    /// A fixed cutoff in Hz.
+    Hz(u32),
+}
+
+/// The [`Bandwidth::Auto`] cutoff in Hz for a stream of `bitrate_bps` over
+/// `channels` at `sample_rate`, or `None` for the whole spectrum.
+///
+/// [`AUTO_BANDWIDTH_HZ`] while the stream is under [`AUTO_BANDWIDTH_MAX_BPS`]
+/// in total and at most [`AUTO_BANDWIDTH_MAX_BPS_PER_CHANNEL`] a channel;
+/// the whole spectrum above. Measured (PEAQ, rusty_aac 2.1.2 vs the same
+/// encoder band-limited, decoder FFmpeg 8.1.2):
+///
+/// * real music, 64-128 kbps: 17 kHz +0.015 BD-ODG over 6 clips, within
+///   ±0.04 on every one: the rate loop already leaves little above it;
+/// * flat-spectrum content (noise, noisy speech), 64-128 kbps: +2.1 and +2.0
+///   BD-ODG. Coding 17-22 kHz costs a flat spectrum about a quarter of its
+///   bits, and PEAQ marks the 18-20 kHz region on such content hard: both
+///   FFmpeg versions lose ~2 ODG between 96 kbps (18 kHz cutoff) and 128 kbps
+///   (20 kHz) on the same clip;
+/// * at 256 kbps stereo (128 kbps a channel) real music started to lose
+///   (-0.06 on one clip, -0.08 on one channel scored alone), hence the
+///   total-rate ceiling: from 192 kbps up the bandwidth is the 2.1.2 one.
+#[must_use]
+pub fn auto_bandwidth_hz(bitrate_bps: u32, channels: u16, sample_rate: u32) -> Option<u32> {
+    let per_channel = bitrate_bps / u32::from(channels.max(1));
+    (bitrate_bps < AUTO_BANDWIDTH_MAX_BPS && per_channel <= AUTO_BANDWIDTH_MAX_BPS_PER_CHANNEL)
+        .then_some(AUTO_BANDWIDTH_HZ)
+        .filter(|&hz| hz < sample_rate / 2)
+}
+
+/// The [`Bandwidth::Auto`] cutoff (see [`auto_bandwidth_hz`]).
+const AUTO_BANDWIDTH_HZ: u32 = 17_000;
+/// [`Bandwidth::Auto`] limits only streams under this total rate.
+const AUTO_BANDWIDTH_MAX_BPS: u32 = 192_000;
+/// [`Bandwidth::Auto`] limits only streams at or under this rate a channel.
+const AUTO_BANDWIDTH_MAX_BPS_PER_CHANNEL: u32 = 128_000;
+
+/// The first spectral line not coded under `hz` for a window of `n_coeffs`
+/// lines (`usize::MAX` for no limit): the start of the first band at or above
+/// the cutoff, so the limit always falls on a band edge.
+fn cutoff_line(hz: Option<u32>, sample_rate: u32, swb: &[u16], n_coeffs: usize) -> usize {
+    let Some(hz) = hz else {
+        return usize::MAX;
+    };
+    let line =
+        (u64::from(hz) * 2 * n_coeffs as u64).div_ceil(u64::from(sample_rate.max(1))) as usize;
+    swb.iter()
+        .map(|&s| usize::from(s))
+        .find(|&s| s >= line)
+        .unwrap_or(usize::MAX)
+}
+
+/// Zero every line at or above `cut` in each of `nwin` windows of `wlen` lines.
+fn band_limit(spec: &mut [f32], cut: usize, wlen: usize) {
+    if cut >= wlen {
+        return;
+    }
+    for w in spec.chunks_mut(wlen) {
+        w[cut..].fill(0.0);
+    }
+}
+
 /// Encoder options.
 #[derive(Debug, Clone, Copy)]
 pub struct AacEncoderConfig {
@@ -4003,6 +4078,9 @@ pub struct AacEncoderConfig {
     /// **Arm A13** — split a channel pair's bit budget by perceptual demand
     /// rather than evenly. Default `false` (byte-identical).
     pub stereo_bit_split: bool,
+    /// Coding bandwidth policy. Default [`Bandwidth::Full`], the 2.1.2
+    /// encoder (byte-identical).
+    pub bandwidth: Bandwidth,
     /// Run the level-invariant transient detector (arm A9) on a high-passed
     /// signal (second difference, +12 dB/octave). A plucked or struck note
     /// whose attack lives in its high frequencies, over a sustained body that
@@ -4037,6 +4115,7 @@ impl Default for AacEncoderConfig {
             pns: false,
             intensity: false,
             stereo_bit_split: true,
+            bandwidth: Bandwidth::Full,
             transient_highpass: false,
             section_trellis: false,
         }
@@ -4190,6 +4269,7 @@ pub struct AacEncoder {
     pns: bool,
     intensity: bool,
     stereo_bit_split: bool,
+    bandwidth: Bandwidth,
     transient_highpass: bool,
     section_trellis: bool,
     win: Vec<f32>,
@@ -4229,6 +4309,7 @@ impl AacEncoder {
             pns: config.pns,
             intensity: config.intensity,
             stereo_bit_split: config.stereo_bit_split,
+            bandwidth: config.bandwidth,
             transient_highpass: config.transient_highpass,
             section_trellis: config.section_trellis,
             win: Vec::new(),
@@ -4459,6 +4540,9 @@ impl AacEncoder {
         };
         let short_win: &[f32] = if cur_kbd { kbd_s } else { sine_s };
         SECTION_TRELLIS.with(|c| c.set(self.section_trellis));
+        let bw_hz = self.bandwidth_hz();
+        let cut_long = cutoff_line(bw_hz, self.sample_rate, swb, FRAME_LEN);
+        let cut_short = cutoff_line(bw_hz, self.sample_rate, swb_s, SHORT_HALF);
         let psy = PsyCfg {
             short_block_psy: self.short_block_psy,
             window_grouping: self.window_grouping,
@@ -4486,8 +4570,10 @@ impl AacEncoder {
                     let (p0, c0, p1, c1) =
                         (prev(l), self.block_cow(l, b), prev(r), self.block_cow(r, b));
                     if seq == WindowSequence::EightShort {
-                        let sl = analyze_short(&p0, &c0, short_win);
-                        let sr_ = analyze_short(&p1, &c1, short_win);
+                        let mut sl = analyze_short(&p0, &c0, short_win);
+                        let mut sr_ = analyze_short(&p1, &c1, short_win);
+                        band_limit(&mut sl, cut_short, SHORT_HALF);
+                        band_limit(&mut sr_, cut_short, SHORT_HALF);
                         encode_cpe(
                             w,
                             tag,
@@ -4510,8 +4596,10 @@ impl AacEncoder {
                             sine_s,
                             kbd_s,
                         );
-                        let sl = analyze_long(&p0, &c0, &win);
-                        let sr_ = analyze_long(&p1, &c1, &win);
+                        let mut sl = analyze_long(&p0, &c0, &win);
+                        let mut sr_ = analyze_long(&p1, &c1, &win);
+                        band_limit(&mut sl, cut_long, FRAME_LEN);
+                        band_limit(&mut sr_, cut_long, FRAME_LEN);
                         encode_cpe(
                             w,
                             tag,
@@ -4530,7 +4618,8 @@ impl AacEncoder {
                     let (p, c) = (prev(ch), self.block_cow(ch, b));
                     let id = elem.id();
                     if seq == WindowSequence::EightShort {
-                        let spec = analyze_short(&p, &c, short_win);
+                        let mut spec = analyze_short(&p, &c, short_win);
+                        band_limit(&mut spec, cut_short, SHORT_HALF);
                         encode_channel_element_short(
                             w,
                             tag,
@@ -4554,6 +4643,8 @@ impl AacEncoder {
                         let mut spec = analyze_long(&p, &c, &win);
                         if matches!(elem, Elem::Lfe(_)) {
                             lfe_band_limit(&mut spec);
+                        } else {
+                            band_limit(&mut spec, cut_long, FRAME_LEN);
                         }
                         encode_channel_element(
                             w,
@@ -4653,6 +4744,19 @@ impl AacEncoder {
         }
         rdb.write(ID_END, 3);
         (rdb.into_bytes(), (b * FRAME_LEN) as i64)
+    }
+
+    /// The coding cutoff in Hz under the configured [`Bandwidth`] policy, or
+    /// `None` for the whole spectrum.
+    fn bandwidth_hz(&self) -> Option<u32> {
+        match self.bandwidth {
+            Bandwidth::Full => None,
+            Bandwidth::Auto => {
+                auto_bandwidth_hz(self.bitrate, self.channels as u16, self.sample_rate)
+            }
+            Bandwidth::Hz(hz) => Some(hz),
+        }
+        .filter(|&hz| hz < self.sample_rate / 2)
     }
 
     /// Transient flags for one channel, under the configured detector (arm A9).
@@ -7409,5 +7513,23 @@ mod lowrate {
         let zero = [true, false, true, false, true, false, false];
         let got = zero_band_sf(&cbs, &sf, |i| zero[i]);
         assert_eq!(got, vec![99, 99, 140, 110, 110, 40, 112]);
+    }
+
+    /// The automatic cutoff applies under 192 kbps and 128 kbps a channel,
+    /// never at or above Nyquist; the cutoff falls on a band edge.
+    #[test]
+    fn bandwidth_table_and_cutoff() {
+        assert_eq!(auto_bandwidth_hz(64_000, 1, 44_100), Some(17_000));
+        assert_eq!(auto_bandwidth_hz(128_000, 1, 44_100), Some(17_000));
+        assert_eq!(auto_bandwidth_hz(160_000, 1, 44_100), None);
+        assert_eq!(auto_bandwidth_hz(160_000, 2, 44_100), Some(17_000));
+        assert_eq!(auto_bandwidth_hz(192_000, 2, 44_100), None);
+        assert_eq!(auto_bandwidth_hz(320_000, 6, 48_000), None);
+        assert_eq!(auto_bandwidth_hz(64_000, 2, 32_000), None);
+        let swb = swb_offsets(true, crate::sf_index_for_rate(44_100).unwrap());
+        let cut = cutoff_line(Some(17_000), 44_100, swb, FRAME_LEN);
+        assert!(swb.iter().any(|&s| usize::from(s) == cut));
+        assert!(cut as f64 * 22_050.0 / 1024.0 >= 17_000.0);
+        assert_eq!(cutoff_line(None, 44_100, swb, FRAME_LEN), usize::MAX);
     }
 }
