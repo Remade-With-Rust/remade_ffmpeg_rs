@@ -33,10 +33,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 // ---------------------------------------------------------------------------
 // Bit writer — MSB-first, the mirror of the decoder's `BitReader`.
 // ---------------------------------------------------------------------------
+///
+/// Bits gather in a 64-bit accumulator and leave it 32 at a time, so a write is
+/// a shift, an or and (every fourth byte) one 4-byte store, not a loop over its
+/// bits: the per-bit writer it replaced, with its bit-by-bit `append`, was 6% of
+/// encoding.
 pub struct BitWriter {
     buf: Vec<u8>,
-    cur: u8,
-    nbits: u8,
+    /// The pending bits, in the low `nbits` bits (higher bits are stale).
+    acc: u64,
+    /// Pending bit count, always below 32 between calls.
+    nbits: u32,
 }
 
 impl BitWriter {
@@ -44,34 +51,45 @@ impl BitWriter {
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
-            cur: 0,
+            acc: 0,
             nbits: 0,
         }
     }
 
-    /// Append the low `n` bits of `val`, most-significant bit first.
+    /// Append the low `n` bits of `val` (`n <= 32`), most-significant bit first.
+    #[inline]
     pub fn write(&mut self, val: u32, n: u32) {
-        for i in (0..n).rev() {
-            self.cur = (self.cur << 1) | ((val >> i) & 1) as u8;
-            self.nbits += 1;
-            if self.nbits == 8 {
-                self.buf.push(self.cur);
-                self.cur = 0;
-                self.nbits = 0;
-            }
+        debug_assert!(n <= 32, "BitWriter::write takes at most 32 bits");
+        let mask = (1u64 << n) - 1;
+        // `nbits < 32` and `n <= 32`, so the pending bits still fit in 64.
+        self.acc = (self.acc << n) | (u64::from(val) & mask);
+        self.nbits += n;
+        if self.nbits >= 32 {
+            self.nbits -= 32;
+            self.buf
+                .extend_from_slice(&((self.acc >> self.nbits) as u32).to_be_bytes());
         }
     }
 
+    #[inline]
     pub fn write_bool(&mut self, b: bool) {
         self.write(u32::from(b), 1);
     }
 
     /// Append everything `other` holds, bit for bit.
     pub fn append(&mut self, other: &Self) {
-        for &byte in &other.buf {
-            self.write(u32::from(byte), 8);
+        if self.nbits == 0 {
+            self.buf.extend_from_slice(&other.buf);
+        } else {
+            let mut words = other.buf.chunks_exact(4);
+            for w in &mut words {
+                self.write(u32::from_be_bytes([w[0], w[1], w[2], w[3]]), 32);
+            }
+            for &byte in words.remainder() {
+                self.write(u32::from(byte), 8);
+            }
         }
-        self.write(u32::from(other.cur), u32::from(other.nbits));
+        self.write(other.acc as u32, other.nbits);
     }
 
     /// Total bits written so far.
@@ -83,9 +101,13 @@ impl BitWriter {
     /// Pad to a byte boundary with zero bits and return the bytes.
     #[must_use]
     pub fn into_bytes(mut self) -> Vec<u8> {
-        if self.nbits != 0 {
-            self.cur <<= 8 - self.nbits;
-            self.buf.push(self.cur);
+        let mut n = self.nbits;
+        while n >= 8 {
+            n -= 8;
+            self.buf.push((self.acc >> n) as u8);
+        }
+        if n != 0 {
+            self.buf.push((self.acc << (8 - n)) as u8);
         }
         self.buf
     }
@@ -5546,6 +5568,50 @@ mod tests {
         w.write(0b1111, 4);
         assert_eq!(w.bit_len(), 8);
         assert_eq!(w.into_bytes(), vec![0b1011_1111]);
+    }
+
+    /// The word-buffered writer against a one-bool-per-bit reference: random
+    /// widths 0..=32 (with junk above the width), interleaved appends of writers
+    /// at every alignment, `bit_len` after every step, and the padded bytes.
+    #[test]
+    fn bitwriter_matches_bit_vector() {
+        fn pack(bits: &[bool]) -> Vec<u8> {
+            bits.chunks(8)
+                .map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .fold(0u8, |b, (i, &x)| b | (u8::from(x) << (7 - i)))
+                })
+                .collect()
+        }
+        let mut seed = 0xb17_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 32) as u32
+        };
+        for _ in 0..300 {
+            let (mut w, mut bits) = (BitWriter::new(), Vec::new());
+            for _ in 0..(next() % 200) {
+                if next() % 8 == 0 {
+                    let (mut o, mut obits) = (BitWriter::new(), Vec::new());
+                    for _ in 0..(next() % 20) {
+                        let (v, n) = (next(), next() % 33);
+                        o.write(v, n);
+                        obits.extend((0..n).rev().map(|i| (v >> i) & 1 == 1));
+                    }
+                    w.append(&o);
+                    bits.extend(obits);
+                } else {
+                    let (v, n) = (next(), next() % 33);
+                    w.write(v, n);
+                    bits.extend((0..n).rev().map(|i| (v >> i) & 1 == 1));
+                }
+                assert_eq!(w.bit_len(), bits.len());
+            }
+            assert_eq!(w.into_bytes(), pack(&bits));
+        }
     }
 
     #[test]
