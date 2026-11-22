@@ -1618,6 +1618,33 @@ fn grid_fixed<T: Sample, const IN: usize, const OUT: usize, C: Fn(usize, T) -> (
     src: &[T],
     dst: &mut [T],
     (sc, dc): (usize, usize),
+    alpha: (bool, bool),
+    cell: C,
+) {
+    // RGB(A) to CMYK: the AVX2 kernel when this CPU has one (its scalar
+    // twin is the loop below, bit for bit).
+    let done = match f.uniform() {
+        Some((cube, g)) if IN == 3 && OUT == 4 => {
+            crate::simd::grid34(cube, g, |v| cell(g, v), src, dst, (sc, dc), alpha.1)
+        }
+        _ => 0,
+    };
+    let (src, dst) = (&src[done * sc..], &mut dst[done * dc..]);
+    grid_fixed_scalar(f, src, dst, (sc, dc), alpha, cell);
+}
+
+/// The scalar loop of [`grid_fixed`]: the oracle of its kernels and the
+/// path on every other CPU, target and shape.
+fn grid_fixed_scalar<
+    T: Sample,
+    const IN: usize,
+    const OUT: usize,
+    C: Fn(usize, T) -> (usize, f64),
+>(
+    f: &FixedClut<'_, IN, OUT>,
+    src: &[T],
+    dst: &mut [T],
+    (sc, dc): (usize, usize),
     (src_alpha, dst_alpha): (bool, bool),
     cell: C,
 ) {
@@ -2980,5 +3007,267 @@ mod tests {
                 .fold(0f64, f64::max);
             assert!(de < 0.05, "{name}: dE2000 {de}");
         }
+    }
+
+    // ---- the RGB -> CMYK grid kernel (`simd::grid34`) ----
+
+    /// The scalar twin of the grid kernel on a transform's grid: the loop
+    /// `grid_fixed` runs on every other CPU (cells by the per-sample
+    /// expression, which the tables reproduce bit for bit).
+    fn grid34_oracle<T: Sample>(t: &Transform, src: &[T], dst: &mut [T]) {
+        let Engine::Grid(g) = &t.engine else {
+            panic!("not a grid transform")
+        };
+        let f = g.fixed::<3, 4>().expect("three inputs, four outputs");
+        let (sc, dc) = (t.src_layout.channels(), t.dst_layout.channels());
+        let alpha = (t.src_layout.has_alpha(), t.dst_layout.has_alpha());
+        grid_fixed_scalar(&f, src, dst, (sc, dc), alpha, |points, v: T| {
+            ClutEval::axis(points, v.to_unit())
+        });
+    }
+
+    /// sRGB (RGB and RGBA) into the synthetic CMYK LUT profiles (v2 lut8,
+    /// v4 lut16), relative and perceptual.
+    fn grid34_transforms() -> Vec<(String, Transform)> {
+        let mut v = Vec::new();
+        let srgb = Profile::new_srgb();
+        for (version, tables, sixteen) in [
+            (0x0210_0000, (256, 256), false),
+            (0x0430_0000, (4096, 2), true),
+        ] {
+            let cmyk = test_lut_profile(crate::ColorSpace::Cmyk, 4, version, tables, sixteen);
+            for intent in [Intent::RelativeColorimetric, Intent::Perceptual] {
+                for sl in [Layout::Rgb, Layout::Rgba] {
+                    let t =
+                        Transform::new(&srgb, sl, &cmyk, Layout::Cmyk, intent, Options::default())
+                            .unwrap();
+                    v.push((format!("{version:x} {intent:?} {sl:?}"), t));
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn grid34_kernel_matches_its_scalar_twin() {
+        for (name, t) in grid34_transforms() {
+            let sc = t.src_layout.channels();
+            // Under and over the 8-bit table threshold and the 16-bit one.
+            for n in [1001, AXIS8_CALL_PIXELS + 3, AXIS16_MIN_PIXELS + 5] {
+                let src = sample_u8(n, sc);
+                let (mut a, mut b) = (vec![0u8; n * 4], vec![1u8; n * 4]);
+                t.transform(&src, &mut a).unwrap();
+                grid34_oracle(&t, &src, &mut b);
+                assert_eq!(a, b, "{name} u8 n={n}");
+                let src = sample_u16(n, sc);
+                let (mut a, mut b) = (vec![0u16; n * 4], vec![1u16; n * 4]);
+                t.transform(&src, &mut a).unwrap();
+                grid34_oracle(&t, &src, &mut b);
+                assert_eq!(a, b, "{name} u16 n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn grid34_kernel_is_reached() {
+        if !simd::avx2() {
+            eprintln!("no AVX2: the scalar loop serves every pixel");
+            return;
+        }
+        let census = || simd::CENSUS.load(Ordering::Relaxed);
+        for (name, t) in grid34_transforms() {
+            let sc = t.src_layout.channels();
+            for n in [1001, AXIS8_CALL_PIXELS + 3] {
+                let src = sample_u8(n, sc);
+                let mut dst = vec![0u8; n * 4];
+                let before = census();
+                t.transform(&src, &mut dst).unwrap();
+                assert!(
+                    census() - before >= n as u64,
+                    "{name}: u8 kernel not reached (n={n})"
+                );
+            }
+            // Before and after the 16-bit axis table exists.
+            for n in [1001, AXIS16_MIN_PIXELS + 5, 1001] {
+                let src = sample_u16(n, sc);
+                let mut dst = vec![0u16; n * 4];
+                let before = census();
+                t.transform(&src, &mut dst).unwrap();
+                assert!(
+                    census() - before >= n as u64,
+                    "{name}: u16 kernel not reached (n={n})"
+                );
+            }
+        }
+    }
+
+    /// The kernel's lookup lanes against `FixedClut::at` (whose 3-input
+    /// lookup is `tetra_select`) bit for bit, on every transform's grid:
+    /// cells at both ends and inside (the top cell has no step), fractions
+    /// from a set full of ties (and zero) and pseudo-random ones.
+    #[test]
+    fn grid34_lookup_matches_the_scalar_bits() {
+        if !simd::avx2() {
+            eprintln!("no AVX2: nothing to compare");
+            return;
+        }
+        const F: [f64; 6] = [0.0, 0.125, 0.25, 1.0 / 3.0, 0.5, 0.999_999];
+        let mut s = 0x5DEE_CE66_D1CE_4E5Bu64;
+        let mut checked = 0;
+        for (name, t) in grid34_transforms() {
+            let Engine::Grid(g) = &t.engine else {
+                panic!("{name}: not a grid")
+            };
+            let f = g.fixed::<3, 4>().unwrap();
+            let (cube, pts) = f.uniform().unwrap();
+            let cs = [0, 1, pts / 2, pts - 2, pts - 1];
+            let mut fr: Vec<[f64; 3]> = (0..216)
+                .map(|k| [F[k % 6], F[k / 6 % 6], F[k / 36]])
+                .collect();
+            for _ in 0..2000 {
+                let x = xorshift(&mut s);
+                let u = |k: u32| f64::from((x >> k) as u16) / 65536.0;
+                fr.push([u(0), u(16), u(32)]);
+            }
+            for &c0 in &cs {
+                for &c1 in &cs {
+                    for &c2 in &cs {
+                        for r in &fr {
+                            let cells = [(c0, r[0]), (c1, r[1]), (c2, r[2])];
+                            let mut want = [0.0; 16];
+                            f.at(&cells, &mut want);
+                            let (got, _, _) =
+                                simd::grid34_parts(cube, pts, cells, [0.0; 4]).unwrap();
+                            let w: Vec<u64> = want[..4].iter().map(|v| v.to_bits()).collect();
+                            let g: Vec<u64> = got.iter().map(|v| v.to_bits()).collect();
+                            assert_eq!(g, w, "{name} {cells:?}");
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 100_000);
+    }
+
+    /// The kernel's quantisation against `Sample::from_unit` for 16 and 8
+    /// bits: around every half step of a dense stride of codes (the bit
+    /// patterns either side), and at the specials (negatives, past 1,
+    /// infinities, NaN, -0).
+    #[test]
+    fn grid34_quantise_matches_from_unit() {
+        if !simd::avx2() {
+            eprintln!("no AVX2: nothing to compare");
+            return;
+        }
+        let cube = vec![0.0f32; 2 * 2 * 2 * 4];
+        let mut vs = vec![
+            -1.0,
+            -1e-300,
+            -0.0,
+            0.0,
+            1.0,
+            1.0 + 1e-12,
+            2.0,
+            1e300,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            -f64::NAN,
+        ];
+        for scale in [65535.0f64, 255.0] {
+            for k in (0..=65535u32).step_by(7).chain([65534, 65535]) {
+                let half = (f64::from(k) + 0.5) / scale;
+                for d in -3i64..=3 {
+                    vs.push(f64::from_bits(half.to_bits().wrapping_add_signed(d)));
+                }
+            }
+        }
+        for q in vs.chunks(4) {
+            let mut q4 = [0.0; 4];
+            q4[..q.len()].copy_from_slice(q);
+            let (_, w, b) = simd::grid34_parts(&cube, 2, [(0, 0.0); 3], q4).unwrap();
+            for i in 0..4 {
+                assert_eq!(w[i], i32::from(u16::from_unit(q4[i])), "16-bit {:e}", q4[i]);
+                assert_eq!(b[i], i32::from(u8::from_unit(q4[i])), "8-bit {:e}", q4[i]);
+            }
+        }
+    }
+
+    /// The kernel against its scalar twin on Coated FOGRA39 (v2 `lut8` from
+    /// `RUSTY_ICC_FOGRA39`, v4 `lut16` from `RUSTY_ICC_FOGRA39_V4`; neither
+    /// is redistributable), relative and perceptual, RGB in: 16-bit, every
+    /// channel through all 65536 values with the other two at each of 0,
+    /// 32768 and 65535, then 10^6 pseudo-random pixels (in calls of a few
+    /// sizes, so both cell paths serve); 8-bit, all 2^24 colours.
+    #[test]
+    #[ignore = "needs RUSTY_ICC_FOGRA39 / RUSTY_ICC_FOGRA39_V4; ~1 min"]
+    fn grid34_kernel_fogra39_sweeps() {
+        let srgb = Profile::new_srgb();
+        let mut profiles = 0;
+        for var in ["RUSTY_ICC_FOGRA39", "RUSTY_ICC_FOGRA39_V4"] {
+            let Ok(path) = std::env::var(var) else {
+                eprintln!("{var} not set: skipped");
+                continue;
+            };
+            profiles += 1;
+            let fogra = Profile::new_from_slice(&std::fs::read(path).unwrap()).unwrap();
+            for intent in [Intent::RelativeColorimetric, Intent::Perceptual] {
+                let name = format!("{var} {intent:?}");
+                let t = Transform::new(
+                    &srgb,
+                    Layout::Rgb,
+                    &fogra,
+                    Layout::Cmyk,
+                    intent,
+                    Options::default(),
+                )
+                .unwrap();
+                let mut src: Vec<u16> = Vec::with_capacity(9 * 3 * 65536 * 3);
+                for ch in 0..3 {
+                    for a in [0u16, 32768, 65535] {
+                        for b in [0u16, 32768, 65535] {
+                            for v in 0..=u16::MAX {
+                                let mut p = [a, a, a];
+                                p[(ch + 1) % 3] = a;
+                                p[(ch + 2) % 3] = b;
+                                p[ch] = v;
+                                src.extend_from_slice(&p);
+                            }
+                        }
+                    }
+                }
+                let mut s = 0x0123_4567_89AB_CDEFu64;
+                for _ in 0..1_000_000 {
+                    let x = xorshift(&mut s);
+                    src.extend_from_slice(&[x as u16, (x >> 16) as u16, (x >> 32) as u16]);
+                }
+                let n = src.len() / 3;
+                let (mut a, mut b) = (vec![0u16; n * 4], vec![1u16; n * 4]);
+                // A small first call (cells by expression), then the rest
+                // in big calls (the axis table).
+                let mut at = 0;
+                for len in [777usize, 4000, 20_000, n] {
+                    let len = len.min(n - at);
+                    t.transform(&src[at * 3..(at + len) * 3], &mut a[at * 4..(at + len) * 4])
+                        .unwrap();
+                    at += len;
+                }
+                assert_eq!(at, n);
+                grid34_oracle(&t, &src, &mut b);
+                let bad = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+                assert_eq!(bad, 0, "{name}: 16-bit samples differ ({n} px)");
+                eprintln!("{name}: 16-bit {n} px identical");
+                let src: Vec<u8> = (0..1u32 << 24)
+                    .flat_map(|v| [(v >> 16) as u8, (v >> 8) as u8, v as u8])
+                    .collect();
+                let (mut a, mut b) = (vec![0u8; 4 << 24], vec![1u8; 4 << 24]);
+                t.transform(&src, &mut a).unwrap();
+                grid34_oracle(&t, &src, &mut b);
+                assert_eq!(a, b, "{name}: 8-bit samples differ");
+                eprintln!("{name}: 8-bit 2^24 identical");
+            }
+        }
+        eprintln!("{profiles} FOGRA39 profiles swept");
     }
 }

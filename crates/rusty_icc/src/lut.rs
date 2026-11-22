@@ -556,6 +556,21 @@ impl<const IN: usize, const OUT: usize> FixedClut<'_, IN, OUT> {
         self.grid[i]
     }
 
+    /// The values and the points per axis `g` when every axis has `g`
+    /// points and the values are exactly the `g^IN` points of `OUT`, row
+    /// major (the device-link grids `Transform` samples).
+    pub(crate) fn uniform(&self) -> Option<(&[f32], usize)> {
+        let g = self.grid[0];
+        let mut s = OUT;
+        for i in (0..IN).rev() {
+            if self.grid[i] != g || self.strides[i] != s {
+                return None;
+            }
+            s = s.checked_mul(g)?;
+        }
+        (self.clut.data.len() == s).then_some((&self.clut.data[..], g))
+    }
+
     /// The lookup at the given `(cell, fraction)` per axis (from
     /// [`ClutEval::axis`]) into `out[..OUT]`: exactly what
     /// [`ClutEval::eval_axes`] gives.

@@ -520,8 +520,8 @@ Not implemented: device-link and named-colour profiles, `D2Bx`/`B2Dx`
 iccMAX (v5), XYZ as a pixel layout, more than 4 device channels, BGR/planar
 layouts, mixed input/output sample types, adaptation states other than full,
 use of the `gamt` tag, and SIMD beyond the x86-64 AVX2 kernels (the 8- and
-16-bit matrix-shaper loop and the fast `f32` paths; aarch64 and wasm32 run
-the scalar code). API notes against the issue's sketch:
+16-bit matrix-shaper loop, the 8- and 16-bit RGB to CMYK grid loop and the
+fast `f32` paths; aarch64 and wasm32 run the scalar code). API notes against the issue's sketch:
 `new_proofing` also takes the two layouts and `Options`, and gamut checking
 is a separate `GamutCheck` returning a per-pixel mask rather than an alarm
 colour.
