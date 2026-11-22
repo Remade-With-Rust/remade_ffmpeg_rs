@@ -133,16 +133,39 @@ fn decode_codes<const MSB: bool>(data: &[u8], out: &mut [u8]) -> TiffResult<usiz
     // side by side in one fixed-size table indexed under a mask (one base
     // pointer and no bounds checks in the loop, where two tables needed two
     // pointers, kept on the stack, and a check each).
-    let mut table: Box<[Entry; MAX_CODES]> = vec![Entry::default(); MAX_CODES]
-        .into_boxed_slice()
-        .try_into()
-        .unwrap();
+    //
+    // The entries' contents never matter (a code is read only after it was
+    // defined since the last clear); the table is filled only because it
+    // must be initialised. It is filled from a zero LLVM cannot see as a
+    // constant, so the fill loop (two stores an entry, 8,192 a strip) stores
+    // a register: from `Entry::default()` every store carried its zero as an
+    // immediate (`movl $0` 8 bytes, `movw $0` 7 bytes, against 4 and 5), and
+    // that loop's cost moved with where the linker put it. rusty_tiff 0.1.5
+    // read 2-3% slower than 0.1.4 on 8 KiB LZW strips with this decoder
+    // unchanged, and moving the same build's code by 16 bytes reproduced the
+    // difference. As a zero-fill (`memset`, through an entry with no padding)
+    // the setup was cheaper still, but the decode loop's register assignment
+    // came out worse: 3-5% slower on tiles and one-strip images.
+    let z = std::hint::black_box(0u16);
+    let mut table: Box<[Entry; MAX_CODES]> = vec![
+        Entry {
+            start: u32::from(z),
+            len: z
+        };
+        MAX_CODES
+    ]
+    .into_boxed_slice()
+    .try_into()
+    .unwrap();
     let early = u16::from(MSB);
     let mut width = 9u32;
     let mut next = FIRST;
     let mut limit = (1u16 << width) - early;
     // The previous code's emission: start and length (0 = no previous code).
-    let (mut pstart, mut plen) = (0usize, 0u16);
+    // Lengths are `u32` here and `u16` only in the table: as `u16` the loop
+    // carried 16-bit moves and zero-extensions for them (-1.8% to -2.5% of
+    // every LZW decode's instructions as `u32`).
+    let (mut pstart, mut plen) = (0usize, 0u32);
     let mut pos = 0usize;
 
     while pos < n {
@@ -171,20 +194,20 @@ fn decode_codes<const MSB: bool>(data: &[u8], out: &mut [u8]) -> TiffResult<usiz
         }
         let at = pos;
         let room = n - at;
-        let elen: u16 = if code < 256 {
+        let elen: u32 = if code < 256 {
             out[pos] = code as u8;
             pos += 1;
             1
         } else if code < next {
             let e = table[usize::from(code) & (MAX_CODES - 1)];
-            let (s0, l) = (e.start as usize, e.len);
-            let take = usize::from(l).min(room);
+            let (s0, l) = (e.start as usize, u32::from(e.len));
+            let take = (l as usize).min(room);
             copy_back(out, s0, at, take);
             pos += take;
             l
         } else if code == next && (next as usize) < MAX_CODES {
             // KwKwK: the string is prev + first(prev).
-            let l = usize::from(plen);
+            let l = plen as usize;
             let take = l.min(room);
             copy_back(out, pstart, at, take);
             pos += take;
@@ -203,7 +226,7 @@ fn decode_codes<const MSB: bool>(data: &[u8], out: &mut [u8]) -> TiffResult<usiz
         if (next as usize) < MAX_CODES {
             table[usize::from(next) & (MAX_CODES - 1)] = Entry {
                 start: pstart as u32,
-                len: plen + 1,
+                len: (plen + 1) as u16,
             };
             next += 1;
             if width < 12 && next >= limit {
