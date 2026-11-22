@@ -721,7 +721,13 @@ mod try_zeroed_tests {
 
     #[test]
     fn zeroed_and_sized() {
-        for len in [0usize, 1, 7, 4096, 1 << 20, 7_680_000] {
+        // Miri interprets every byte check; keep its sizes small.
+        let sizes: &[usize] = if cfg!(miri) {
+            &[0, 1, 7, 4096]
+        } else {
+            &[0, 1, 7, 4096, 1 << 20, 7_680_000]
+        };
+        for &len in sizes {
             let v = try_zeroed(len).unwrap();
             assert_eq!(v.len(), len);
             assert!(v.capacity() >= len);
