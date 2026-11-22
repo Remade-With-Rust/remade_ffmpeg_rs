@@ -1247,16 +1247,33 @@ fn hf_inverse_filter(
     alpha0: &mut [Cpx; 64],
     alpha1: &mut [Cpx; 64],
 ) {
+    // The window sums of every band first: eight bands per AVX pass where the
+    // CPU has it (each lane one band's own sequential sums), the rest scalar.
+    let mut sums = [[0f32; 5]; 64];
+    let k0 = k0.min(64).min(x_low.len());
+    // `k`: the bands the AVX pass covered.
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    let k = {
+        let mut k = 0;
+        if std::is_x86_feature_detected!("avx") {
+            while k + 8 <= k0 {
+                let (rows, out) = (&x_low[k..k + 8], &mut sums[k..k + 8]);
+                // SAFETY: AVX detected just above; `rows` and `out` are exactly
+                // the eight entries `hf_sums_avx` reads and writes.
+                unsafe { hf_sums_avx(rows, out) };
+                k += 8;
+            }
+        }
+        k
+    };
+    #[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
+    let k = 0;
+    for (x, out) in x_low[k..k0].iter().zip(&mut sums[k..k0]) {
+        *out = hf_sums_scalar(x);
+    }
     for k in 0..k0 {
         let x = &x_low[k];
-        let (mut r0, mut r1, mut i1, mut r2, mut i2) = (0f32, 0f32, 0f32, 0f32, 0f32);
-        for i in 1..38 {
-            r0 += x[i][0] * x[i][0] + x[i][1] * x[i][1];
-            r1 += x[i][0] * x[i + 1][0] + x[i][1] * x[i + 1][1];
-            i1 += x[i][0] * x[i + 1][1] - x[i][1] * x[i + 1][0];
-            r2 += x[i][0] * x[i + 2][0] + x[i][1] * x[i + 2][1];
-            i2 += x[i][0] * x[i + 2][1] - x[i][1] * x[i + 2][0];
-        }
+        let [r0, r1, i1, r2, i2] = sums[k];
         // phi(i, j) over the window, in the standard's notation.
         let phi01 = [
             r2 + x[0][0] * x[2][0] + x[0][1] * x[2][1],
@@ -1295,6 +1312,101 @@ fn hf_inverse_filter(
             alpha0[k] = a0;
             alpha1[k] = a1;
         }
+    }
+}
+
+/// One band's covariance window sums `[r0, r1, i1, r2, i2]`: `Σ x[i]·x[i]*`,
+/// `Σ x[i]·x[i+1]*` (real and imaginary) and `Σ x[i]·x[i+2]*` over
+/// `i = 1..38`, accumulated in that order (the scalar oracle of
+/// [`hf_sums_avx`]).
+#[inline]
+fn hf_sums_scalar(x: &[Cpx; 40]) -> [f32; 5] {
+    let (mut r0, mut r1, mut i1, mut r2, mut i2) = (0f32, 0f32, 0f32, 0f32, 0f32);
+    for i in 1..38 {
+        r0 += x[i][0] * x[i][0] + x[i][1] * x[i][1];
+        r1 += x[i][0] * x[i + 1][0] + x[i][1] * x[i + 1][1];
+        i1 += x[i][0] * x[i + 1][1] - x[i][1] * x[i + 1][0];
+        r2 += x[i][0] * x[i + 2][0] + x[i][1] * x[i + 2][1];
+        i2 += x[i][0] * x[i + 2][1] - x[i][1] * x[i + 2][0];
+    }
+    [r0, r1, i1, r2, i2]
+}
+
+/// AVX twin of [`hf_sums_scalar`] for eight bands at once: lane `l` carries
+/// band `LANE_BAND[l]`, whose slot `i` is gathered from its row, so every lane
+/// performs exactly that band's scalar sequence (the same two products, one
+/// sum or difference and one accumulation per step, no FMA, no reordering
+/// across steps). Bit-identical (`hf_sums_avx_matches_scalar`). Slots
+/// `i + 1` and `i + 2` are carried in registers, so each step gathers one.
+///
+/// # Safety
+/// AVX must be available; `rows.len() >= 8` and `out.len() >= 8`. Reads
+/// `rows[r][i]` for `r < 8`, `i < 40`.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx")]
+unsafe fn hf_sums_avx(rows: &[[Cpx; 40]], out: &mut [[f32; 5]]) {
+    use std::arch::x86_64::*;
+    /// The band each lane holds after the even/odd split below.
+    const LANE_BAND: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
+    debug_assert!(rows.len() >= 8 && out.len() >= 8);
+    let base = rows.as_ptr().cast::<u8>();
+    // Slot `i` of all eight bands as (re, im) vectors; a row is 40 complex
+    // values of 8 bytes, read with unaligned 64-bit loads (`Cpx` is only
+    // 4-aligned).
+    let slot = |i: usize| {
+        let pair = |a: usize, b: usize| {
+            _mm_castsi128_ps(_mm_unpacklo_epi64(
+                _mm_loadu_si64(base.add(8 * (40 * a + i))),
+                _mm_loadu_si64(base.add(8 * (40 * b + i))),
+            ))
+        };
+        let lo = _mm256_set_m128(pair(2, 3), pair(0, 1));
+        let hi = _mm256_set_m128(pair(6, 7), pair(4, 5));
+        (
+            _mm256_shuffle_ps::<0b10_00_10_00>(lo, hi),
+            _mm256_shuffle_ps::<0b11_01_11_01>(lo, hi),
+        )
+    };
+    let z = _mm256_setzero_ps();
+    let (mut r0, mut r1, mut i1, mut r2, mut i2) = (z, z, z, z, z);
+    let (mut a, mut b, mut c) = (slot(1), slot(2), slot(3));
+    for i in 1..38 {
+        r0 = _mm256_add_ps(
+            r0,
+            _mm256_add_ps(_mm256_mul_ps(a.0, a.0), _mm256_mul_ps(a.1, a.1)),
+        );
+        r1 = _mm256_add_ps(
+            r1,
+            _mm256_add_ps(_mm256_mul_ps(a.0, b.0), _mm256_mul_ps(a.1, b.1)),
+        );
+        i1 = _mm256_add_ps(
+            i1,
+            _mm256_sub_ps(_mm256_mul_ps(a.0, b.1), _mm256_mul_ps(a.1, b.0)),
+        );
+        r2 = _mm256_add_ps(
+            r2,
+            _mm256_add_ps(_mm256_mul_ps(a.0, c.0), _mm256_mul_ps(a.1, c.1)),
+        );
+        i2 = _mm256_add_ps(
+            i2,
+            _mm256_sub_ps(_mm256_mul_ps(a.0, c.1), _mm256_mul_ps(a.1, c.0)),
+        );
+        if i + 3 < 40 {
+            (a, b, c) = (b, c, slot(i + 3));
+        }
+    }
+    let mut lanes = [[0f32; 8]; 5];
+    for (dst, v) in lanes.iter_mut().zip([r0, r1, i1, r2, i2]) {
+        _mm256_storeu_ps(dst.as_mut_ptr(), v);
+    }
+    for (l, &band) in LANE_BAND.iter().enumerate() {
+        out[band] = [
+            lanes[0][l],
+            lanes[1][l],
+            lanes[2][l],
+            lanes[3][l],
+            lanes[4][l],
+        ];
     }
 }
 
@@ -1802,6 +1914,34 @@ pub fn apply(dec: &Decoder, el: &mut Element, ty: u8, n: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The eight-band AVX window sums equal each band's scalar sums bit for
+    /// bit, on rows mixing magnitudes over a wide exponent range.
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[test]
+    fn hf_sums_avx_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx") {
+            return;
+        }
+        let mut seed = 0x6a09_e667u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let e = (seed >> 24) as i32 - 128;
+            (seed as i32 as f32) * 2f32.powi(e / 10 - 31)
+        };
+        for _ in 0..200 {
+            let rows: Vec<[Cpx; 40]> = (0..8)
+                .map(|_| std::array::from_fn(|_| [rnd(), rnd()]))
+                .collect();
+            let mut got = [[0f32; 5]; 8];
+            // SAFETY: AVX checked above; eight rows and eight outputs.
+            unsafe { hf_sums_avx(&rows, &mut got) };
+            for (r, g) in rows.iter().zip(&got) {
+                let want = hf_sums_scalar(r);
+                assert_eq!(g.map(f32::to_bits), want.map(f32::to_bits));
+            }
+        }
+    }
 
     #[test]
     fn sbr_books_are_prefix_complete() {
