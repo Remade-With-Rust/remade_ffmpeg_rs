@@ -175,6 +175,31 @@ macro_rules! lanes_bin {
     };
 }
 
+/// `lanes_bin!` built with `core::array::from_fn` instead of a loop over a
+/// default-initialised array. Same arithmetic per lane; the shape only
+/// changes what LLVM's SLP vectoriser makes of chains of these ops. Used for
+/// `u16x16` (the lowp pipeline): with the loop shape, `lerp_1_float` under
+/// thin LTO + 16 codegen units came out as a lane-shuffling mix of `pinsrw`
+/// and `pand`/`pandn` blends at 161 instructions per call, against
+/// tiny-skia's 91 (`pmullw`, `paddw`, `psrlw` per channel). The `f32x8` /
+/// `i32x8` / `u32x8` ops keep the loop shape: switching them measured +0.2%
+/// on the bicubic pattern rows.
+macro_rules! lanes_bin_fn {
+    ($ty:ident, $tr:ident, $f:ident, |$a:ident, $b:ident| $e:expr) => {
+        impl $tr for $ty {
+            type Output = Self;
+            #[inline(always)]
+            fn $f(self, rhs: Self) -> Self {
+                Self(core::array::from_fn(|i| {
+                    let $a = self.0[i];
+                    let $b = rhs.0[i];
+                    $e
+                }))
+            }
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 // f32x8
 
@@ -814,15 +839,13 @@ impl u16x16 {
 
 // tiny-skia uses plain `+`/`-`/`*` here, which wrap in a release build; the
 // explicit wrapping ops keep debug builds (and the oracle tests) identical.
-lanes_bin!(u16x16, u16, 16, Add, add, |a, b| a.wrapping_add(b));
-lanes_bin!(u16x16, u16, 16, Sub, sub, |a, b| a.wrapping_sub(b));
-lanes_bin!(u16x16, u16, 16, Mul, mul, |a, b| a.wrapping_mul(b));
-lanes_bin!(u16x16, u16, 16, Div, div, |a, b| a
-    .checked_div(b)
-    .unwrap_or(0));
-lanes_bin!(u16x16, u16, 16, BitAnd, bitand, |a, b| a & b);
-lanes_bin!(u16x16, u16, 16, BitOr, bitor, |a, b| a | b);
-lanes_bin!(u16x16, u16, 16, Shr, shr, |a, b| a
+lanes_bin_fn!(u16x16, Add, add, |a, b| a.wrapping_add(b));
+lanes_bin_fn!(u16x16, Sub, sub, |a, b| a.wrapping_sub(b));
+lanes_bin_fn!(u16x16, Mul, mul, |a, b| a.wrapping_mul(b));
+lanes_bin_fn!(u16x16, Div, div, |a, b| a.checked_div(b).unwrap_or(0));
+lanes_bin_fn!(u16x16, BitAnd, bitand, |a, b| a & b);
+lanes_bin_fn!(u16x16, BitOr, bitor, |a, b| a | b);
+lanes_bin_fn!(u16x16, Shr, shr, |a, b| a
     .checked_shr(u32::from(b))
     .unwrap_or(0));
 
