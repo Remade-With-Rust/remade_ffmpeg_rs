@@ -1251,17 +1251,23 @@ fn hf_inverse_filter(
     // CPU has it (each lane one band's own sequential sums), the rest scalar.
     let mut sums = [[0f32; 5]; 64];
     let k0 = k0.min(64).min(x_low.len());
-    let mut k = 0;
+    // `k`: the bands the AVX pass covered.
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
-    if std::is_x86_feature_detected!("avx") {
-        while k + 8 <= k0 {
-            let (rows, out) = (&x_low[k..k + 8], &mut sums[k..k + 8]);
-            // SAFETY: AVX detected just above; `rows` and `out` are exactly the
-            // eight entries `hf_sums_avx` reads and writes.
-            unsafe { hf_sums_avx(rows, out) };
-            k += 8;
+    let k = {
+        let mut k = 0;
+        if std::is_x86_feature_detected!("avx") {
+            while k + 8 <= k0 {
+                let (rows, out) = (&x_low[k..k + 8], &mut sums[k..k + 8]);
+                // SAFETY: AVX detected just above; `rows` and `out` are exactly
+                // the eight entries `hf_sums_avx` reads and writes.
+                unsafe { hf_sums_avx(rows, out) };
+                k += 8;
+            }
         }
-    }
+        k
+    };
+    #[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
+    let k = 0;
     for (x, out) in x_low[k..k0].iter().zip(&mut sums[k..k0]) {
         *out = hf_sums_scalar(x);
     }
