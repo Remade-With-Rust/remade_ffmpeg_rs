@@ -856,7 +856,10 @@ impl SegChain {
             let r = mat_vec(m, v);
             v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
         }
-        let v = v.map(clamp01);
+        // No clamp of `v` here, though the chain clamps before its inverse
+        // curves: every inverse evaluation clamps its input first, and the
+        // clamp is idempotent (NaN to 0, -0.0 kept), so a second one is the
+        // first's value.
         let [i0, i1, i2] = &self.inverse;
         [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])]
     }
@@ -877,7 +880,10 @@ impl SegChain {
             let r = mat_vec(m, v);
             v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
         }
-        let v = v.map(clamp01);
+        // No clamp of `v` here, though the chain clamps before its inverse
+        // curves: every inverse evaluation clamps its input first, and the
+        // clamp is idempotent (NaN to 0, -0.0 kept), so a second one is the
+        // first's value.
         let [i0, i1, i2] = &self.inverse;
         [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])]
     }
@@ -994,7 +1000,10 @@ impl ShaperChain<'_> {
             let r = mat_vec(m, v);
             v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
         }
-        let v = v.map(clamp01);
+        // No clamp of `v` here, though the chain clamps before its inverse
+        // curves: every inverse evaluation clamps its input first, and the
+        // clamp is idempotent (NaN to 0, -0.0 kept), so a second one is the
+        // first's value.
         match self.inverse {
             Inverse::Break([i0, i1, i2]) => [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])],
             Inverse::Plain([i0, i1, i2]) => [
@@ -1021,7 +1030,10 @@ impl ShaperChain<'_> {
             let r = mat_vec(m, v);
             v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
         }
-        let v = v.map(clamp01);
+        // No clamp of `v` here, though the chain clamps before its inverse
+        // curves: every inverse evaluation clamps its input first, and the
+        // clamp is idempotent (NaN to 0, -0.0 kept), so a second one is the
+        // first's value.
         match self.inverse {
             Inverse::Break([i0, i1, i2]) => [i0.eval(v[0]), i1.eval(v[1]), i2.eval(v[2])],
             Inverse::Plain([i0, i1, i2]) => [
