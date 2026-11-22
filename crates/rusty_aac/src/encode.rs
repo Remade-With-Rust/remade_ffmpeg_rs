@@ -2281,6 +2281,78 @@ fn pns_bands(
     out
 }
 
+/// The bits [`spectral_emit`] writes for every whole `dim`-tuple of `q` with
+/// spectral book `cb` (1..=11; every tuple representable, magnitudes at most
+/// `MAX_QUANT`), in fewer writes: the book and its table are looked up once per
+/// band, each codeword goes out together with its sign bits as one write (at
+/// most 19 + 4 bits), and each escape sequence as one write (`2N + 5 <= 21`
+/// bits for `N <= 8`). `spectral_emit` stays the per-tuple reference.
+///
+/// Each book gets its own instance of the loop ([`emit_book`]), so the tuple
+/// index is straight-line arithmetic on constants instead of
+/// [`tuple_index`]'s run-time `dim`/`lav` walk.
+fn emit_band(w: &mut BitWriter, cb: u8, q: &[i32]) {
+    let book = spectral_book(cb);
+    match cb {
+        1 | 2 => emit_book::<4, false, 1, false>(w, book, q),
+        3 | 4 => emit_book::<4, true, 2, false>(w, book, q),
+        5 | 6 => emit_book::<2, false, 4, false>(w, book, q),
+        7 | 8 => emit_book::<2, true, 7, false>(w, book, q),
+        9 | 10 => emit_book::<2, true, 12, false>(w, book, q),
+        11 => emit_book::<2, true, 16, true>(w, book, q),
+        _ => panic!("not a spectral codebook: {cb}"),
+    }
+}
+
+/// [`emit_band`] for one book shape: `DIM`-tuples, magnitudes plus sign bits
+/// when `UNSIGNED`, values up to `LAV` (book 11, `ESC`, clamps to `LAV` and
+/// escape-codes the rest). An unrepresentable tuple panics, as
+/// [`spectral_emit`] does.
+fn emit_book<const DIM: usize, const UNSIGNED: bool, const LAV: u32, const ESC: bool>(
+    w: &mut BitWriter,
+    book: &crate::huffman::HuffBook,
+    q: &[i32],
+) {
+    let modulo = if UNSIGNED { LAV + 1 } else { 2 * LAV + 1 };
+    for t in q.chunks_exact(DIM) {
+        let mut idx = 0u32;
+        for &c in t {
+            let mag = c.unsigned_abs();
+            assert!(ESC || mag <= LAV, "representable tuple");
+            let digit = if !UNSIGNED {
+                (c + LAV as i32) as u32
+            } else if ESC {
+                mag.min(LAV)
+            } else {
+                mag
+            };
+            idx = idx * modulo + digit;
+        }
+        let (code, len) = book.code(idx as usize);
+        let (mut val, mut n) = (code, u32::from(len));
+        if UNSIGNED {
+            for &c in t {
+                if c != 0 {
+                    val = (val << 1) | u32::from(c < 0);
+                    n += 1;
+                }
+            }
+        }
+        w.write(val, n);
+        if ESC {
+            for &c in t {
+                let m = c.unsigned_abs();
+                if m >= LAV {
+                    // N ones, a zero, then N + 4 bits of m - 2^(N+4) (ISO §4.6.3.3).
+                    let e = m.ilog2() - 4;
+                    let prefix = ((1u32 << e) - 1) << 1;
+                    w.write((prefix << (e + 4)) | (m - (1 << (e + 4))), 2 * e + 5);
+                }
+            }
+        }
+    }
+}
+
 /// `spectral_data`: per regular SFB, code coefficient tuples with the band's book.
 fn write_spectrum(w: &mut BitWriter, quant: &[i32], cbs: &[u8], swb: &[u16]) {
     for (sfb, &cb) in cbs.iter().enumerate() {
@@ -2289,13 +2361,8 @@ fn write_spectrum(w: &mut BitWriter, quant: &[i32], cbs: &[u8], swb: &[u16]) {
         if cb == ZERO_HCB || cb >= NOISE_HCB {
             continue;
         }
-        let dim = CODEBOOKS[cb as usize].dim as usize;
         let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
-        let mut i = s;
-        while i + dim <= e {
-            spectral_emit(cb as usize, &quant[i..i + dim], w);
-            i += dim;
-        }
+        emit_band(w, cb, &quant[s..e]);
     }
 }
 
@@ -3244,15 +3311,10 @@ fn write_spectrum_short(
             if cb == ZERO_HCB {
                 continue;
             }
-            let dim = CODEBOOKS[cb as usize].dim as usize;
             let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
             for win in w0..w0 + nwin {
                 let base = win * SHORT_HALF;
-                let mut i = s;
-                while i + dim <= e {
-                    spectral_emit(cb as usize, &quant[base + i..base + i + dim], w);
-                    i += dim;
-                }
+                emit_band(w, cb, &quant[base + s..base + e]);
             }
         }
     }
@@ -5568,6 +5630,40 @@ mod tests {
         w.write(0b1111, 4);
         assert_eq!(w.bit_len(), 8);
         assert_eq!(w.into_bytes(), vec![0b1011_1111]);
+    }
+
+    /// `emit_band` writes exactly the bits of `spectral_emit` tuple by tuple, for
+    /// every book, with bands whose peak the book can hold (escapes up to
+    /// `MAX_QUANT` for book 11), at a random starting bit alignment.
+    #[test]
+    fn emit_band_matches_spectral_emit() {
+        let mut seed = 0xe417_u64;
+        for cb in 1..=11u8 {
+            let meta = &CODEBOOKS[cb as usize];
+            let lav = if meta.esc {
+                MAX_QUANT as u32
+            } else {
+                u32::from(meta.lav)
+            };
+            let mut done = 0;
+            while done < 2000 {
+                let band = random_band(&mut seed, 32);
+                if band.iter().any(|q| q.unsigned_abs() > lav) {
+                    continue;
+                }
+                done += 1;
+                let lead = (seed >> 40) as u32 % 32;
+                let (mut a, mut b) = (BitWriter::new(), BitWriter::new());
+                a.write(0x5a5a_5a5a, lead);
+                b.write(0x5a5a_5a5a, lead);
+                emit_band(&mut a, cb, &band);
+                for t in band.chunks_exact(meta.dim as usize) {
+                    spectral_emit(cb as usize, t, &mut b);
+                }
+                assert_eq!(a.bit_len(), b.bit_len(), "cb {cb} band {band:?}");
+                assert_eq!(a.into_bytes(), b.into_bytes(), "cb {cb} band {band:?}");
+            }
+        }
     }
 
     /// The word-buffered writer against a one-bool-per-bit reference: random
