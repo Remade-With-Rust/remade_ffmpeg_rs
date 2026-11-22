@@ -1503,12 +1503,11 @@ fn band_book_costs(
             let base = w * wlen;
             let mut i = s;
             while i < e {
-                match spectral_bits(cb as usize, &quant[base + i..base + i + dim]) {
-                    Some(b) => bits += b as u32,
-                    None => {
-                        ok = false;
-                        break 'w;
-                    }
+                if let Some(b) = spectral_bits(cb as usize, &quant[base + i..base + i + dim]) {
+                    bits += b as u32;
+                } else {
+                    ok = false;
+                    break 'w;
                 }
                 i += dim;
             }
@@ -1541,11 +1540,11 @@ fn zero_tuple_bits() -> &'static [u32; 12] {
 /// new section. `costs` is [`band_book_costs`] per band. Length-escape fields
 /// of long runs are not priced here; the exact count is `section_bits`.
 fn trellis_books(costs: &[[u32; 12]], hdr: u32) -> Vec<u8> {
+    const INF: u64 = u64::MAX / 4;
     let n = costs.len();
     if n == 0 {
         return Vec::new();
     }
-    const INF: u64 = u64::MAX / 4;
     let mut dp = vec![[INF; 12]; n];
     let mut from = vec![[0u8; 12]; n];
     for cb in 0..12 {
@@ -4101,9 +4100,8 @@ pub enum Bandwidth {
 /// The [`Bandwidth::Auto`] cutoff in Hz for a stream of `bitrate_bps` over
 /// `channels` at `sample_rate`, or `None` for the whole spectrum.
 ///
-/// [`AUTO_BANDWIDTH_HZ`] while the stream is under [`AUTO_BANDWIDTH_MAX_BPS`]
-/// in total and at most [`AUTO_BANDWIDTH_MAX_BPS_PER_CHANNEL`] a channel;
-/// the whole spectrum above. Measured (PEAQ, rusty_aac 2.1.2 vs the same
+/// 17 kHz while the stream is under 192 kbps in total and at most 128 kbps a
+/// channel; the whole spectrum above. Measured (PEAQ, `rusty_aac` 2.1.2 vs the same
 /// encoder band-limited, decoder FFmpeg 8.1.2):
 ///
 /// * real music, 64-128 kbps: 17 kHz +0.015 BD-ODG over 6 clips, within
