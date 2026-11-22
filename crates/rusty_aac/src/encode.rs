@@ -1796,6 +1796,7 @@ fn quantize_band_scalar(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) 
 /// writes `out[i..i + 4]` for `i + 4 <= out.len()`; the tail is safe indexing.
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn quantize_band_avx2(pow: &[f64], sign: &[i32], scale: f64, out: &mut [i32]) {
     use std::arch::x86_64::*;
     let n = out.len();
@@ -1973,13 +1974,8 @@ fn code_core(xp: &Xpow, swb: &[u16], sf: &[i32], quant: &mut [i32]) -> (Vec<u8>,
     work::bump_code_frame();
     let num_swb = swb.len() - 1;
     work::bump_quant_bands((swb.len() - 1) as u64);
-    let scale = scale_table();
     let prof_q = prof::scope(Stage::EncQuant);
-    for sfb in 0..num_swb {
-        let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
-        let sc = scale[sf[sfb].clamp(0, 255) as usize];
-        quantize_band(&xp.pow[s..e], &xp.sign[s..e], sc, &mut quant[s..e]);
-    }
+    quantize_frame(xp, swb, sf, quant);
     drop(prof_q);
     let _prof_cb = prof::scope(Stage::EncCodebook);
     let mut max_sfb = 0usize;
@@ -2001,6 +1997,61 @@ fn code_core(xp: &Xpow, swb: &[u16], sf: &[i32], quant: &mut [i32]) -> (Vec<u8>,
     // global_gain(8) + ics_info(~11) + 3 flag bits + sections + scalefactors + spectrum.
     let body = 8 + 11 + 3 + section_bits(&cbs) + scalefactor_bits(&cbs, sf, gg) + spec_bits;
     (cbs, body, max_sfb)
+}
+
+/// Quantize every band of a long frame at its scalefactor into `quant`, each
+/// band exactly as [`quantize_band`] does. One ISA dispatch per frame: with
+/// AVX2 the band loop runs inside [`quantize_bands_avx2`], so the per-band
+/// dispatch, call and constant setup (the rate loop quantizes ~690K bands per
+/// 18 s of stereo) are paid once.
+fn quantize_frame(xp: &Xpow, swb: &[u16], sf: &[i32], quant: &mut [i32]) {
+    let scale = scale_table();
+    let num_swb = swb.len() - 1;
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    {
+        // The opt-in AVX-512 kernel stays on the per-band path.
+        #[cfg(feature = "simd-avx512")]
+        let avx512 = has_avx512();
+        #[cfg(not(feature = "simd-avx512"))]
+        let avx512 = false;
+        if !avx512 && has_avx2() {
+            // SAFETY: AVX2 detected at runtime; `quantize_bands_avx2` cuts each
+            // band out of `pow`, `sign` and `quant` with checked slicing, so
+            // every kernel call gets three slices of one length.
+            unsafe { quantize_bands_avx2(&xp.pow, &xp.sign, swb, sf, scale, quant) };
+            prof::count(Kernel::Quantize, true, usize::from(swb[num_swb] - swb[0]));
+            return;
+        }
+    }
+    for sfb in 0..num_swb {
+        let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+        let sc = scale[sf[sfb].clamp(0, 255) as usize];
+        quantize_band(&xp.pow[s..e], &xp.sign[s..e], sc, &mut quant[s..e]);
+    }
+}
+
+/// The band loop of [`quantize_frame`] compiled for AVX2, so
+/// [`quantize_band_avx2`] inlines into it.
+///
+/// # Safety
+///
+/// AVX2 must be available. Bounds are checked: each band is sliced out of
+/// `pow`, `sign` and `out` with safe indexing before the kernel sees it.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_bands_avx2(
+    pow: &[f64],
+    sign: &[i32],
+    swb: &[u16],
+    sf: &[i32],
+    scale: &[f64; 256],
+    out: &mut [i32],
+) {
+    for sfb in 0..swb.len() - 1 {
+        let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+        let sc = scale[sf[sfb].clamp(0, 255) as usize];
+        quantize_band_avx2(&pow[s..e], &sign[s..e], sc, &mut out[s..e]);
+    }
 }
 
 /// Owned-buffer wrapper over [`code_core`] for the one-shot callers (final coding).
@@ -5506,6 +5557,37 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The frame-level quantizer (one dispatch, the band loop inside the AVX2
+    /// function) equals the scalar per-band quantizer on every band, with
+    /// scalefactors spanning and exceeding the clamped 0..=255 range.
+    #[test]
+    fn quantize_frame_matches_per_band_scalar() {
+        let swb = swb_offsets(true, 4); // 44.1 kHz long bands
+        let mut seed = 0x9e37_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as u32
+        };
+        for _ in 0..50 {
+            let spec: Vec<f32> = (0..FRAME_LEN)
+                .map(|_| (next() as f32 / u32::MAX as f32 - 0.25) * 40_000.0)
+                .collect();
+            let xp = Xpow::new(&spec);
+            let sf: Vec<i32> = (1..swb.len()).map(|_| next() as i32 % 300 - 20).collect();
+            let mut got = vec![0i32; FRAME_LEN];
+            quantize_frame(&xp, swb, &sf, &mut got);
+            let mut want = vec![0i32; FRAME_LEN];
+            for sfb in 0..swb.len() - 1 {
+                let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+                let sc = scale_table()[sf[sfb].clamp(0, 255) as usize];
+                quantize_band_scalar(&xp.pow[s..e], &xp.sign[s..e], sc, &mut want[s..e]);
+            }
+            assert_eq!(got, want);
         }
     }
 
