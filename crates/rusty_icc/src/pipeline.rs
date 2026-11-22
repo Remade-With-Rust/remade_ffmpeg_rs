@@ -5,7 +5,8 @@
 //! are comparable with it.
 
 use crate::color::{
-    lab_to_xyz, mat_inv, mat_mul, mat_vec, xyz_to_lab, Lab, Mat3, Xyz, D50, IDENTITY,
+    lab_to_xyz, mat_inv, mat_mul, mat_vec, xyz_to_lab, xyz_to_lab_in_line, Lab, Mat3, Xyz, D50,
+    IDENTITY,
 };
 use crate::curve::{clamp01, Curve, FwdSeg, InvCurve, InvSeg, Sampled};
 use crate::error::{Error, Result};
@@ -875,6 +876,10 @@ pub(crate) struct LutOutChain<'a, const N: usize> {
     curves: &'a [FwdSeg; 3],
     affines: [(Mat3, [f64; 3]); 2],
     maps: usize,
+    /// Per map: `true` when it is a diagonal matrix with non-zero offsets
+    /// (black-point compensation), applied as three products and sums.
+    diagonal: [bool; 2],
+    /// The legacy 16-bit Lab scale, or 1 without one (both in `0..=1`).
     lab_scale: Option<f64>,
     pre: &'a [Sampled; 3],
     clut: Clut3Ref<'a, N>,
@@ -882,6 +887,12 @@ pub(crate) struct LutOutChain<'a, const N: usize> {
 }
 
 impl<const N: usize> LutOutChain<'_, N> {
+    /// `true` when one of the maps runs as a diagonal (for the tests).
+    #[cfg(test)]
+    pub(crate) fn has_diagonal_map(&self) -> bool {
+        self.diagonal[..self.maps].contains(&true)
+    }
+
     /// The device curves of one colour (`x` normalised, as the chain takes
     /// it): the values the chain's first op gives.
     #[inline(always)]
@@ -894,11 +905,24 @@ impl<const N: usize> LutOutChain<'_, N> {
     /// into `out[..N]`: exactly what [`Chain::eval`] gives for the colour.
     #[inline(always)]
     pub(crate) fn rest(&self, mut v: [f64; 3], out: &mut [f64; 16]) {
-        for (m, off) in &self.affines[..self.maps] {
-            let r = mat_vec(m, v);
-            v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
+        for ((m, off), &diagonal) in self.affines[..self.maps].iter().zip(&self.diagonal) {
+            if diagonal {
+                // The full product's off-diagonal terms are `0 * v` = a zero
+                // of either sign for the finite values met here (curve
+                // outputs and their affine images), which leaves a non-zero
+                // sum unchanged; a zero sum, of either sign, then takes the
+                // non-zero offset as the result in both forms.
+                v = [
+                    m[0][0] * v[0] + off[0],
+                    m[1][1] * v[1] + off[1],
+                    m[2][2] * v[2] + off[2],
+                ];
+            } else {
+                let r = mat_vec(m, v);
+                v = [r[0] + off[0], r[1] + off[1], r[2] + off[2]];
+            }
         }
-        let l = xyz_to_lab(Xyz::new(v[0], v[1], v[2]), D50);
+        let l = xyz_to_lab_in_line(Xyz::new(v[0], v[1], v[2]), D50);
         let mut e = [
             clamp01(l.l / 100.0),
             clamp01((l.a + 128.0) / 255.0),
@@ -909,8 +933,11 @@ impl<const N: usize> LutOutChain<'_, N> {
                 *x *= k;
             }
         }
+        // The tables' own clamp is left out: the clamped encoding times a
+        // scale in `0..=1` is already in `0..=1` (or -0.0), where it returns
+        // the value itself.
         let [p0, p1, p2] = self.pre;
-        let e = [p0.eval(e[0]), p1.eval(e[1]), p2.eval(e[2])];
+        let e = [p0.eval_unit(e[0]), p1.eval_unit(e[1]), p2.eval_unit(e[2])];
         self.clut.lookup::<true>(e, out);
         // The chain's final clamp is left out: it never acts on what a
         // sampled table gives (between two of its samples over 65535, so in
@@ -1020,13 +1047,22 @@ impl Chain {
             return None;
         };
         let clut = Clut3Ref::new(clut)?;
-        if maps == 0 || !clut.trilinear() {
+        if maps == 0 || !clut.trilinear() || lab_scale.is_some_and(|k| !(0.0..=1.0).contains(&k)) {
             return None;
         }
+        let diagonal = affines.map(|(m, off)| {
+            let zero = |x: f64| x == 0.0;
+            [m[0][1], m[0][2], m[1][0], m[1][2], m[2][0], m[2][1]]
+                .into_iter()
+                .all(zero)
+                && off.iter().all(|&o| o != 0.0)
+                && m.iter().flatten().all(|x| x.is_finite())
+        });
         Some(LutOutChain {
             curves: curves.as_slice().try_into().ok()?,
             affines,
             maps,
+            diagonal,
             lab_scale: *lab_scale,
             pre: pre.as_slice().try_into().ok()?,
             clut,

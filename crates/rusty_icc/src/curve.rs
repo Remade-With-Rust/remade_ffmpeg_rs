@@ -385,7 +385,14 @@ impl Sampled {
     /// (never NaN: the clamped `x` is finite).
     #[inline(always)]
     pub(crate) fn eval(&self, x: f64) -> f64 {
-        let pos = clamp01(x) * self.scale;
+        self.eval_unit(clamp01(x))
+    }
+
+    /// [`Sampled::eval`] of a value the caller knows is in `0..=1` (or
+    /// -0.0), where the clamp it starts with returns the value itself.
+    #[inline(always)]
+    pub(crate) fn eval_unit(&self, x: f64) -> f64 {
+        let pos = x * self.scale;
         // The same index as `(pos as i64 as usize).min(seg.len() - 1)`
         // (`pos` is in `0..=n-1`), converted back exactly.
         let i = (pos as i64).min(self.last);

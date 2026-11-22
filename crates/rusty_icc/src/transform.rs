@@ -1398,6 +1398,7 @@ mod tests {
             f32::NAN,
         ];
         let mut ran = [0usize; 2];
+        let mut diagonals = 0;
         for (space, layout, n) in [
             (ColorSpace::Cmyk, Layout::Cmyk, 4),
             (ColorSpace::Rgb, Layout::Rgb, 3),
@@ -1415,11 +1416,14 @@ mod tests {
                                 black_point_compensation: bpc,
                             };
                             let t = Transform::new(&srgb, al, &dst, layout, intent, o).unwrap();
-                            let shaped = if n == 4 {
-                                t.chain.as_lut_out::<4>().is_some()
+                            let (shaped, diagonal) = if n == 4 {
+                                let l = t.chain.as_lut_out::<4>();
+                                (l.is_some(), l.is_some_and(|l| l.has_diagonal_map()))
                             } else {
-                                t.chain.as_lut_out::<3>().is_some()
+                                let l = t.chain.as_lut_out::<3>();
+                                (l.is_some(), l.is_some_and(|l| l.has_diagonal_map()))
                             };
+                            diagonals += usize::from(diagonal);
                             assert!(shaped, "{space:?} {version:x} {intent:?}");
                             ran[n - 3] += 1;
                             let (sc, dc) = (al.channels(), layout.channels());
@@ -1453,7 +1457,10 @@ mod tests {
                 }
             }
         }
-        assert!(ran[0] > 0 && ran[1] > 0, "{ran:?}");
+        assert!(
+            ran[0] > 0 && ran[1] > 0 && diagonals > 0,
+            "{ran:?} {diagonals}"
+        );
     }
 
     #[test]
