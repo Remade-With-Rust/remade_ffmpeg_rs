@@ -1623,13 +1623,15 @@ fn grid_fixed<T: Sample, const IN: usize, const OUT: usize, C: Fn(usize, T) -> (
 ) {
     // RGB(A) to CMYK: the AVX2 kernel when this CPU has one (its scalar
     // twin is the loop below, bit for bit).
-    let done = match f.uniform() {
-        Some((cube, g)) if IN == 3 && OUT == 4 => {
-            crate::simd::grid34(cube, g, |v| cell(g, v), src, dst, (sc, dc), alpha.1)
+    // The shape test first: it is constant, so the other monomorphs keep
+    // exactly the scalar loop.
+    if IN == 3 && OUT == 4 {
+        if let Some((cube, g)) = f.uniform() {
+            let done = crate::simd::grid34(cube, g, |v| cell(g, v), src, dst, (sc, dc), alpha.1);
+            let (src, dst) = (&src[done * sc..], &mut dst[done * dc..]);
+            return grid_fixed_scalar(f, src, dst, (sc, dc), alpha, cell);
         }
-        _ => 0,
-    };
-    let (src, dst) = (&src[done * sc..], &mut dst[done * dc..]);
+    }
     grid_fixed_scalar(f, src, dst, (sc, dc), alpha, cell);
 }
 
