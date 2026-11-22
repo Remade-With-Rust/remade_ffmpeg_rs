@@ -372,10 +372,10 @@ fn tile_gather<const REFLECT: bool, const SCALE: bool>(p: &mut Pipeline) {
     load_8888(&p.pixmap_src.gather(ix), &mut r, &mut g, &mut b, &mut a);
     if SCALE {
         let c = f32x8::splat(p.ctx.current_coverage);
-        r = r * c;
-        g = g * c;
-        b = b * c;
-        a = a * c;
+        r *= c;
+        g *= c;
+        b *= c;
+        a *= c;
     }
     p.r = r;
     p.g = g;
