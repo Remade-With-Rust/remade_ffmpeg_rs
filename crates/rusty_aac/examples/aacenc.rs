@@ -51,6 +51,9 @@ fn main() {
     if on("a6") {
         cfg.pns = true;
     }
+    if on("sect") {
+        cfg.section_trellis = true;
+    }
     if on("a7") {
         cfg.intensity = true;
     }
@@ -94,4 +97,8 @@ fn main() {
         out.extend_from_slice(&p.data);
     }
     std::fs::write(dst, &out).expect("write out");
+    if std::env::var_os("AACENC_WORK").is_some() {
+        let (evals, bands) = rusty_aac::encode::work::take();
+        eprintln!("work: code_frame evals {evals}, quantized bands {bands}");
+    }
 }

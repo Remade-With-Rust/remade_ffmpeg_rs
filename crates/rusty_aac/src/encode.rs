@@ -1414,6 +1414,291 @@ fn section_bits(cbs: &[u8]) -> usize {
     bits
 }
 
+thread_local! {
+    /// [`AacEncoderConfig::section_trellis`] for the frame this thread is
+    /// coding, set once per frame by `encode_frame` (frames code on worker
+    /// threads, each frame wholly on one), so the coding kernels need no extra
+    /// argument for it.
+    static SECTION_TRELLIS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn section_trellis_on() -> bool {
+    SECTION_TRELLIS.with(std::cell::Cell::get)
+}
+
+/// Bits of the scalefactor of an all-zero band carried inside another
+/// codebook's section: its scalefactor is sent as a zero delta (see
+/// [`zero_band_sf`]), the one-bit `SCALEFACTOR_BOOK` code.
+const CARRIED_ZERO_SF_BITS: u32 = 1;
+
+/// Spectral bits of one band (one window group of a short frame:
+/// `nwin` windows of `wlen` lines from `win0`) under every codebook 0..=11;
+/// `u32::MAX` where the book cannot code it. Book 0 (`ZERO_HCB`) is free for
+/// an all-zero band and impossible otherwise.
+fn band_book_costs(
+    quant: &[i32],
+    s: usize,
+    e: usize,
+    win0: usize,
+    nwin: usize,
+    wlen: usize,
+) -> [u32; 12] {
+    let mut out = [u32::MAX; 12];
+    let mut maxq = 0u32;
+    for w in win0..win0 + nwin {
+        for &q in &quant[w * wlen + s..w * wlen + e] {
+            maxq = maxq.max(q.unsigned_abs());
+        }
+    }
+    if maxq == 0 {
+        // An all-zero band: every book codes it as its zero tuple repeated,
+        // a per-book constant, so no tuple need be looked up.
+        out[0] = 0;
+        let zt = zero_tuple_bits();
+        let tuples_per = |dim: usize| ((e - s) / dim * nwin) as u32;
+        for cb in 1..=11usize {
+            let dim = CODEBOOKS[cb].dim as usize;
+            if (e - s) % dim == 0 {
+                out[cb] = tuples_per(dim) * zt[cb] + CARRIED_ZERO_SF_BITS;
+            }
+        }
+        return out;
+    }
+    for cb in 1..=11u8 {
+        let meta = &CODEBOOKS[cb as usize];
+        let dim = meta.dim as usize;
+        if (e - s) % dim != 0 || (!meta.esc && u32::from(meta.lav) < maxq) {
+            continue;
+        }
+        let mut bits = 0u32;
+        let mut ok = true;
+        'w: for w in win0..win0 + nwin {
+            let base = w * wlen;
+            let mut i = s;
+            while i < e {
+                match spectral_bits(cb as usize, &quant[base + i..base + i + dim]) {
+                    Some(b) => bits += b as u32,
+                    None => {
+                        ok = false;
+                        break 'w;
+                    }
+                }
+                i += dim;
+            }
+        }
+        if ok {
+            out[cb as usize] = bits + if maxq == 0 { CARRIED_ZERO_SF_BITS } else { 0 };
+        }
+    }
+    out
+}
+
+/// Bits of each book's all-zero tuple (index 0 unused).
+fn zero_tuple_bits() -> &'static [u32; 12] {
+    static T: OnceLock<[u32; 12]> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [0u32; 12];
+        for (cb, b) in t.iter_mut().enumerate().skip(1) {
+            let dim = CODEBOOKS[cb].dim as usize;
+            *b = spectral_bits(cb, &[0i32; 4][..dim]).unwrap_or(u32::MAX as usize / 4096) as u32;
+        }
+        t
+    })
+}
+
+/// **Section trellis.** The per-band codebooks of one window group that
+/// minimise spectral bits plus `section_data`, by a Viterbi over (band,
+/// codebook): a section costs `hdr` bits (4-bit codebook + one length field),
+/// so it can pay to code a band with a larger book than its cheapest, or to
+/// carry an all-zero band inside a neighbouring section, rather than open a
+/// new section. `costs` is [`band_book_costs`] per band. Length-escape fields
+/// of long runs are not priced here; the exact count is `section_bits`.
+fn trellis_books(costs: &[[u32; 12]], hdr: u32) -> Vec<u8> {
+    let n = costs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    const INF: u64 = u64::MAX / 4;
+    let mut dp = vec![[INF; 12]; n];
+    let mut from = vec![[0u8; 12]; n];
+    for cb in 0..12 {
+        if costs[0][cb] != u32::MAX {
+            dp[0][cb] = u64::from(hdr) + u64::from(costs[0][cb]);
+        }
+    }
+    for b in 1..n {
+        // Best predecessor overall (a section break) and per book (a run).
+        let (mut best, mut arg) = (INF, 0u8);
+        for p in 0..12 {
+            if dp[b - 1][p] < best {
+                best = dp[b - 1][p];
+                arg = p as u8;
+            }
+        }
+        for cb in 0..12 {
+            let c = costs[b][cb];
+            if c == u32::MAX {
+                continue;
+            }
+            let stay = dp[b - 1][cb];
+            let brk = best.saturating_add(u64::from(hdr));
+            let (v, f) = if stay <= brk {
+                (stay, cb as u8)
+            } else {
+                (brk, arg)
+            };
+            dp[b][cb] = v.saturating_add(u64::from(c));
+            from[b][cb] = f;
+        }
+    }
+    let mut cb = (0..12).min_by_key(|&c| dp[n - 1][c]).unwrap_or(11) as u8;
+    let mut out = vec![0u8; n];
+    for b in (0..n).rev() {
+        out[b] = cb;
+        cb = from[b][cb as usize];
+    }
+    out
+}
+
+/// Scalefactors in coded order (`cbs` order) with every all-zero band that a
+/// section carries under a regular codebook (`is_zero(i)`) given the previous
+/// regular band's scalefactor, or the first one's if none precedes it: a zero
+/// delta, one bit, and never a step the ±60 delta range cannot code. The
+/// band's value does not matter to the decoder (its lines are all zero).
+fn zero_band_sf(cbs: &[u8], sf: &[i32], is_zero: impl Fn(usize) -> bool) -> Vec<i32> {
+    let mut out = sf.to_vec();
+    let regular = |i: usize| cbs[i] != ZERO_HCB && cbs[i] < NOISE_HCB;
+    let first = (0..cbs.len())
+        .find(|&i| regular(i) && !is_zero(i))
+        .map(|i| sf[i]);
+    let mut last = first;
+    for i in 0..cbs.len() {
+        if !regular(i) {
+            continue;
+        }
+        if is_zero(i) {
+            if let Some(v) = last {
+                out[i] = v;
+            }
+        } else {
+            last = Some(sf[i]);
+        }
+    }
+    out
+}
+
+/// Long-block codebooks for `quant` over `0..max_sfb`: the cheapest book per
+/// band, or the [`trellis_books`] choice when the section trellis is on.
+fn long_books(quant: &[i32], swb: &[u16], max_sfb: usize) -> (Vec<u8>, usize) {
+    if section_trellis_on() {
+        let costs: Vec<[u32; 12]> = (0..max_sfb)
+            .map(|b| {
+                band_book_costs(
+                    quant,
+                    usize::from(swb[b]),
+                    usize::from(swb[b + 1]),
+                    0,
+                    1,
+                    FRAME_LEN,
+                )
+            })
+            .collect();
+        let cbs = trellis_books(&costs, 9);
+        let bits = cbs
+            .iter()
+            .zip(&costs)
+            .map(|(&c, k)| k[c as usize] as usize)
+            .sum();
+        return (cbs, bits);
+    }
+    let mut cbs = Vec::with_capacity(max_sfb);
+    let mut spec_bits = 0usize;
+    for sfb in 0..max_sfb {
+        let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+        let (cb, bits) = best_codebook_for_band(quant, s, e);
+        cbs.push(cb);
+        spec_bits += bits;
+    }
+    (cbs, spec_bits)
+}
+
+/// Short-block codebooks for one window group (windows `w0..w0+nwin`), as
+/// [`long_books`].
+fn short_books(
+    quant: &[i32],
+    swb: &[u16],
+    max_sfb: usize,
+    w0: usize,
+    nwin: usize,
+) -> (Vec<u8>, usize) {
+    if section_trellis_on() {
+        let costs: Vec<[u32; 12]> = (0..max_sfb)
+            .map(|b| {
+                band_book_costs(
+                    quant,
+                    usize::from(swb[b]),
+                    usize::from(swb[b + 1]),
+                    w0,
+                    nwin,
+                    SHORT_HALF,
+                )
+            })
+            .collect();
+        let cbs = trellis_books(&costs, 7);
+        let bits = cbs
+            .iter()
+            .zip(&costs)
+            .map(|(&c, k)| k[c as usize] as usize)
+            .sum();
+        return (cbs, bits);
+    }
+    let mut cbs = Vec::with_capacity(max_sfb);
+    let mut bits = 0usize;
+    for sfb in 0..max_sfb {
+        let (cb, b) = best_codebook_short(quant, swb, sfb, w0, nwin);
+        cbs.push(cb);
+        bits += b;
+    }
+    (cbs, bits)
+}
+
+/// Is band `sfb` of window group (`w0`, `nwin`) all zero in `quant`?
+fn band_is_zero(
+    quant: &[i32],
+    swb: &[u16],
+    sfb: usize,
+    w0: usize,
+    nwin: usize,
+    wlen: usize,
+) -> bool {
+    let (s, e) = (usize::from(swb[sfb]), usize::from(swb[sfb + 1]));
+    (w0..w0 + nwin).all(|w| quant[w * wlen + s..w * wlen + e].iter().all(|&q| q == 0))
+}
+
+/// [`zero_band_sf`] for a long block's (`cbs`, `sf`, `quant`).
+fn zero_band_sf_long(cbs: &[u8], sf: &[i32], quant: &[i32], swb: &[u16]) -> Vec<i32> {
+    zero_band_sf(cbs, sf, |i| band_is_zero(quant, swb, i, 0, 1, FRAME_LEN))
+}
+
+/// [`zero_band_sf`] for a short block's group-major (`cbs`, `sf_flat`).
+fn zero_band_sf_short(
+    cbs: &[u8],
+    sf_flat: &[i32],
+    quant: &[i32],
+    swb: &[u16],
+    groups: &[u8],
+    max_sfb: usize,
+) -> Vec<i32> {
+    if max_sfb == 0 {
+        return sf_flat.to_vec();
+    }
+    let starts: Vec<(usize, usize)> = group_windows(groups).collect();
+    zero_band_sf(cbs, sf_flat, |i| {
+        let (g, sfb) = (i / max_sfb, i % max_sfb);
+        band_is_zero(quant, swb, sfb, starts[g].0, starts[g].1, SHORT_HALF)
+    })
+}
+
 /// Per-band scalefactors from a common `base` plus the psy offsets (see
 /// [`Offsets::sf`]), each clamped to the codeable range.
 fn scalefactors(offsets: &Offsets, base: i32) -> Vec<i32> {
@@ -1757,17 +2042,15 @@ fn code_core(xp: &Xpow, swb: &[u16], sf: &[i32], quant: &mut [i32]) -> (Vec<u8>,
             max_sfb = sfb + 1;
         }
     }
-    let mut cbs = Vec::with_capacity(max_sfb);
-    let mut spec_bits = 0usize;
-    for sfb in 0..max_sfb {
-        let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
-        let (cb, bits) = best_codebook_for_band(quant, s, e);
-        cbs.push(cb);
-        spec_bits += bits;
-    }
-    let gg = global_gain(&cbs, sf);
+    let (cbs, spec_bits) = long_books(quant, swb, max_sfb);
+    let sf_bits = if section_trellis_on() {
+        let sfz = zero_band_sf_long(&cbs, sf, quant, swb);
+        scalefactor_bits(&cbs, &sfz, global_gain(&cbs, &sfz))
+    } else {
+        scalefactor_bits(&cbs, sf, global_gain(&cbs, sf))
+    };
     // global_gain(8) + ics_info(~11) + 3 flag bits + sections + scalefactors + spectrum.
-    let body = 8 + 11 + 3 + section_bits(&cbs) + scalefactor_bits(&cbs, sf, gg) + spec_bits;
+    let body = 8 + 11 + 3 + section_bits(&cbs) + sf_bits + spec_bits;
     (cbs, body, max_sfb)
 }
 
@@ -2150,6 +2433,9 @@ fn encode_channel_element(
                 }
             }
         }
+    }
+    if section_trellis_on() {
+        sf = zero_band_sf_long(&cbs, &sf, &quant, swb);
     }
     let gg = global_gain(&cbs, &sf);
 
@@ -2723,14 +3009,15 @@ fn code_frame_short(
     let mut section_bits = 0usize;
     for (w0, nwin) in group_windows(groups) {
         let start = cbs.len();
-        for sfb in 0..max_sfb {
-            let (cb, bits) = best_codebook_short(&quant, swb, sfb, w0, nwin);
-            cbs.push(cb);
-            spec_bits += bits;
-        }
+        let (g_cbs, bits) = short_books(&quant, swb, max_sfb, w0, nwin);
+        cbs.extend_from_slice(&g_cbs);
+        spec_bits += bits;
         section_bits += section_bits_short(&cbs[start..]);
     }
-    let sf_flat = flatten_short_sf(sf, num_swb, max_sfb, groups.len());
+    let mut sf_flat = flatten_short_sf(sf, num_swb, max_sfb, groups.len());
+    if section_trellis_on() {
+        sf_flat = zero_band_sf_short(&cbs, &sf_flat, &quant, swb, groups, max_sfb);
+    }
     let gg = global_gain(&cbs, &sf_flat);
     // global_gain(8) + ics_info(short ~18) + 3 flags + sections + scalefactors + spectrum.
     let body = 8 + 18 + 3 + section_bits + scalefactor_bits(&cbs, &sf_flat, gg) + spec_bits;
@@ -3136,17 +3423,10 @@ fn joint_max_sfb(q0: &[i32], q1: &[i32], swb: &[u16], is_short: bool) -> usize {
 fn codebooks(quant: &[i32], swb: &[u16], is_short: bool, max_sfb: usize, groups: &[u8]) -> Vec<u8> {
     if is_short {
         group_windows(groups)
-            .flat_map(|(w0, nwin)| {
-                (0..max_sfb).map(move |sfb| best_codebook_short(quant, swb, sfb, w0, nwin).0)
-            })
+            .flat_map(|(w0, nwin)| short_books(quant, swb, max_sfb, w0, nwin).0)
             .collect()
     } else {
-        (0..max_sfb)
-            .map(|sfb| {
-                let (s, e) = (swb[sfb] as usize, swb[sfb + 1] as usize);
-                best_codebook_for_band(quant, s, e).0
-            })
-            .collect()
+        long_books(quant, swb, max_sfb).0
     }
 }
 
@@ -3183,7 +3463,15 @@ fn write_channel_data(
 ) {
     let sf_flat;
     let sf = if is_short {
-        sf_flat = flatten_short_sf(sf, swb.len() - 1, max_sfb, groups.len());
+        let f = flatten_short_sf(sf, swb.len() - 1, max_sfb, groups.len());
+        sf_flat = if section_trellis_on() {
+            zero_band_sf_short(cbs, &f, quant, swb, groups, max_sfb)
+        } else {
+            f
+        };
+        &sf_flat[..]
+    } else if section_trellis_on() {
+        sf_flat = zero_band_sf_long(cbs, sf, quant, swb);
         &sf_flat[..]
     } else {
         sf
@@ -3296,6 +3584,9 @@ fn joint_rate_loop(
         }
         return (lo, None);
     }
+    if section_trellis_on() {
+        return joint_rate_loop_seeded(xp0, off0, xp1, off1, swb, target_total, lo, hi);
+    }
     // Long blocks: the same search, keeping both channels' quantized spectra
     // from the last fitting level. That level is the answer whenever the search
     // evaluated it, so the caller need not quantize the pair again.
@@ -3320,6 +3611,62 @@ fn joint_rate_loop(
     }
     let kept = best.and_then(|(b, k0, k1)| (b == lo).then_some((k0, k1)));
     (lo, kept)
+}
+
+/// The long-block [`joint_rate_loop`] under the section trellis: the search
+/// shape of [`rate_loop_coded`], a binary search on the cheap estimate that
+/// seeds a walk with the exact coder to the smallest common level whose pair
+/// fits. The plain binary search ran the exact coder (now with its trellis) at
+/// every one of its ~9 steps, for both channels; this runs it two or three
+/// times. Same answer wherever the exact bits fall monotonically in the level.
+#[allow(clippy::too_many_arguments)]
+fn joint_rate_loop_seeded(
+    xp0: &Xpow,
+    off0: &Offsets,
+    xp1: &Xpow,
+    off1: &Offsets,
+    swb: &[u16],
+    target_total: usize,
+    min_level: i32,
+    max_level: i32,
+) -> (i32, Option<PairQuant>) {
+    let (mut lo, mut hi) = (min_level, max_level);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if estimate_bits(xp0, swb, off0, mid) + estimate_bits(xp1, swb, off1, mid) <= target_total {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let (mut q0, mut q1) = (vec![0i32; xp0.len()], vec![0i32; xp1.len()]);
+    let mut best: Option<(i32, Vec<i32>, Vec<i32>)> = None;
+    let mut exact = |b: i32| {
+        let bits = code_core(xp0, swb, &scalefactors(off0, b), &mut q0).1
+            + code_core(xp1, swb, &scalefactors(off1, b), &mut q1).1;
+        let fits = bits <= target_total;
+        if fits {
+            let (k0, k1) = (std::mem::take(&mut q0), std::mem::take(&mut q1));
+            (q0, q1) = match best.take() {
+                Some((_, o0, o1)) => (o0, o1),
+                None => (vec![0i32; xp0.len()], vec![0i32; xp1.len()]),
+            };
+            best = Some((b, k0, k1));
+        }
+        fits
+    };
+    let mut level = lo;
+    if exact(level) {
+        while level > min_level && exact(level - 1) {
+            level -= 1;
+        }
+    } else {
+        while level < max_level && !exact(level) {
+            level += 1;
+        }
+    }
+    let kept = best.and_then(|(b, k0, k1)| (b == level).then_some((k0, k1)));
+    (level, kept)
 }
 
 /// **Arm A7 — intensity stereo.**
@@ -3628,6 +3975,13 @@ pub struct AacEncoderConfig {
     /// **Arm A13** — split a channel pair's bit budget by perceptual demand
     /// rather than evenly. Default `false` (byte-identical).
     pub stereo_bit_split: bool,
+    /// Choose each frame's codebooks by a Viterbi trellis over `section_data`
+    /// (spectral bits plus section headers, an all-zero band free to ride in
+    /// a neighbouring section) instead of the cheapest book band by band,
+    /// which opened a new 9-bit section at nearly every band: 16-17% of a
+    /// 64 kbps frame, against 3% for FFmpeg. Default `false`
+    /// (byte-identical).
+    pub section_trellis: bool,
 }
 
 impl Default for AacEncoderConfig {
@@ -3649,6 +4003,7 @@ impl Default for AacEncoderConfig {
             pns: false,
             intensity: false,
             stereo_bit_split: true,
+            section_trellis: false,
         }
     }
 }
@@ -3800,6 +4155,7 @@ pub struct AacEncoder {
     pns: bool,
     intensity: bool,
     stereo_bit_split: bool,
+    section_trellis: bool,
     win: Vec<f32>,
     /// The KBD long window (α = 4.0), matching the decoder's. Built once.
     win_kbd: Vec<f32>,
@@ -3837,6 +4193,7 @@ impl AacEncoder {
             pns: config.pns,
             intensity: config.intensity,
             stereo_bit_split: config.stereo_bit_split,
+            section_trellis: config.section_trellis,
             win: Vec::new(),
             win_kbd: Vec::new(),
             chans: Vec::new(),
@@ -4064,6 +4421,7 @@ impl AacEncoder {
             shapes.get(b - 1).copied().unwrap_or(false)
         };
         let short_win: &[f32] = if cur_kbd { kbd_s } else { sine_s };
+        SECTION_TRELLIS.with(|c| c.set(self.section_trellis));
         let psy = PsyCfg {
             short_block_psy: self.short_block_psy,
             window_grouping: self.window_grouping,
@@ -6932,5 +7290,75 @@ mod fidelity_129 {
             let most = pk.iter().map(|p| p.data.len() * 8).max().unwrap();
             assert!(most <= 6144 * ch, "{ch} ch: a {most}-bit unit");
         }
+    }
+}
+
+/// The low-rate campaign's tools: the section trellis, the frame-demand
+/// allocation, the coding bandwidth, the high-passed transient detector and
+/// the mask SMR.
+#[cfg(test)]
+mod lowrate {
+    use super::*;
+
+    /// The trellis is optimal: its choice costs no more than any assignment,
+    /// checked by brute force over every assignment of small band sets.
+    #[test]
+    fn section_trellis_is_optimal() {
+        let mut seed = 7u32;
+        let mut rnd = move |m: u32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (seed >> 16) % m
+        };
+        let cost = |costs: &[[u32; 12]], cbs: &[u8], hdr: u32| -> u64 {
+            let mut c = 0u64;
+            for (b, &cb) in cbs.iter().enumerate() {
+                if costs[b][cb as usize] == u32::MAX {
+                    return u64::MAX;
+                }
+                c += u64::from(costs[b][cb as usize]);
+                if b == 0 || cbs[b - 1] != cb {
+                    c += u64::from(hdr);
+                }
+            }
+            c
+        };
+        for _ in 0..40 {
+            let n = 1 + rnd(4) as usize;
+            let costs: Vec<[u32; 12]> = (0..n)
+                .map(|_| {
+                    let mut k = [u32::MAX; 12];
+                    for x in k.iter_mut().skip(1) {
+                        if rnd(3) != 0 {
+                            *x = rnd(40);
+                        }
+                    }
+                    k[11] = rnd(60); // the escape book always codes
+                    if rnd(3) == 0 {
+                        k[0] = 0;
+                    }
+                    k
+                })
+                .collect();
+            let got = cost(&costs, &trellis_books(&costs, 9), 9);
+            let mut best = u64::MAX;
+            for code in 0..12usize.pow(n as u32) {
+                let cbs: Vec<u8> = (0..n)
+                    .map(|b| ((code / 12usize.pow(b as u32)) % 12) as u8)
+                    .collect();
+                best = best.min(cost(&costs, &cbs, 9));
+            }
+            assert_eq!(got, best, "trellis not optimal for {costs:?}");
+        }
+    }
+
+    /// A zero band carried in a section takes the previous coded band's
+    /// scalefactor (a zero delta); one before any coded band, the first's.
+    #[test]
+    fn carried_zero_bands_send_a_zero_delta() {
+        let cbs = [5u8, 5, 0, 7, 7, 13, 7];
+        let sf = [120, 99, 140, 110, 30, 40, 112];
+        let zero = [true, false, true, false, true, false, false];
+        let got = zero_band_sf(&cbs, &sf, |i| zero[i]);
+        assert_eq!(got, vec![99, 99, 140, 110, 110, 40, 112]);
     }
 }
