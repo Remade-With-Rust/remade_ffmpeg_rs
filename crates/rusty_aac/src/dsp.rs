@@ -737,12 +737,57 @@ impl Radix2Fft {
     /// `s + 2·half <= n` and `j + 4 <= half`, and twiddles `stw[half - 2 + j .. +4]`
     /// with `2·half - 2 <= stw.len() = n - 2`. The `half == 2` stage reads and
     /// writes `buf[s..s+4]` for `s + 4 <= n` and the twiddles `stw[0..2]`.
+    ///
+    /// For `n >= 8` the first three stages run fused, eight points at a time
+    /// held in two registers (the stage-3 butterflies of a block of eight only
+    /// pair its two halves), so those stages cost one load and one store per
+    /// four points instead of three of each. Every butterfly is the same
+    /// arithmetic as the unfused stages; only the round trips through memory
+    /// (exact for `f32`) are gone. The fused pass reads and writes
+    /// `buf[s..s + 8]` for `s + 8 <= n` and the twiddles `stw[0..6]`.
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     #[target_feature(enable = "avx")]
     unsafe fn run_avx(&self, buf: &mut [[f32; 2]], permuted: bool) {
         use std::arch::x86_64::*;
         let n = self.n;
         let p = buf.as_mut_ptr().cast::<f32>();
+        if n >= 8 {
+            if !permuted {
+                for &(i, j) in &self.swaps {
+                    buf.swap(i as usize, j as usize);
+                }
+            }
+            let p = buf.as_mut_ptr().cast::<f32>();
+            let tw = self.stw.as_ptr().cast::<f32>();
+            let w2 = _mm_loadu_ps(tw);
+            let (wr2, wi2) = (_mm_moveldup_ps(w2), _mm_movehdup_ps(w2));
+            let w4 = _mm256_loadu_ps(tw.add(4));
+            let (wr4, wi4) = (_mm256_moveldup_ps(w4), _mm256_movehdup_ps(w4));
+            // Stages 1 and 2 on four points in one register: the first stage as
+            // below, then the half-2 butterflies between its two 128-bit halves.
+            let stage12 = |q: *const f32| {
+                let x = _mm256_loadu_ps(q);
+                let y = _mm256_castpd_ps(_mm256_permute_pd::<0b0101>(_mm256_castps_pd(x)));
+                let r = _mm256_blend_ps::<0b1100_1100>(_mm256_add_ps(x, y), _mm256_sub_ps(y, x));
+                let a = _mm256_castps256_ps128(r);
+                let b = _mm256_extractf128_ps::<1>(r);
+                let bs = _mm_permute_ps::<0b10_11_00_01>(b);
+                let t = _mm_addsub_ps(_mm_mul_ps(b, wr2), _mm_mul_ps(bs, wi2));
+                _mm256_set_m128(_mm_sub_ps(a, t), _mm_add_ps(a, t))
+            };
+            let mut s = 0;
+            while s < n {
+                let a = stage12(p.add(2 * s));
+                let b = stage12(p.add(2 * s + 8));
+                let bs = _mm256_permute_ps::<0b10_11_00_01>(b);
+                let t = _mm256_addsub_ps(_mm256_mul_ps(b, wr4), _mm256_mul_ps(bs, wi4));
+                _mm256_storeu_ps(p.add(2 * s), _mm256_add_ps(a, t));
+                _mm256_storeu_ps(p.add(2 * s + 8), _mm256_sub_ps(a, t));
+                s += 8;
+            }
+            self.stages_avx(p, 8);
+            return;
+        }
         if n >= 4 {
             if !permuted {
                 for &(i, j) in &self.swaps {
@@ -764,7 +809,21 @@ impl Radix2Fft {
         } else {
             self.permute_and_first_stage(buf, permuted);
         }
-        let mut half = 2;
+        self.stages_avx(p, 2);
+    }
+
+    /// The radix-2 stages of [`Self::run_avx`] from half-length `half` up.
+    ///
+    /// # Safety
+    /// AVX must be available, and `p` must point at the `n = self.n` complex
+    /// values (`2n` floats) of the transform; the stages before `half` have
+    /// run. Bounds as in `run_avx`.
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx")]
+    #[inline]
+    unsafe fn stages_avx(&self, p: *mut f32, mut half: usize) {
+        use std::arch::x86_64::*;
+        let n = self.n;
         while half < n {
             if half == 2 {
                 // Two butterflies per 128-bit op; both twiddles are the same in
