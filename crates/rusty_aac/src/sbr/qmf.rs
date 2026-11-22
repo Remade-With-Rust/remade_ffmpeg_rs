@@ -77,11 +77,62 @@ pub(super) fn qmf_analysis(input: &[f32], buf: &mut [f32], w: &mut [[Cpx; 32]; 3
     for (l, slot) in w.iter_mut().enumerate().take(2 * nts) {
         ana_fold(p, &buf[32 * l..32 * l + 320], &mut a);
         p.fft64.run_bitrev(&mut a);
-        for (k, out) in slot.iter_mut().enumerate() {
-            *out = cmul(a[k], p.ana_post[k]);
-        }
+        ana_post(p, &a, slot);
     }
     buf.copy_within(ns..ns + 288, 0);
+}
+
+/// The analysis post-twiddle, `out[k] = a[k]·ana_post[k]` for the 32 bands.
+#[inline]
+fn ana_post(p: &Plans, a: &[Cpx; 64], out: &mut [Cpx; 32]) {
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    if p.avx {
+        // SAFETY: AVX detected in `plans()`; `a` holds 64 entries, `out` 32 and
+        // `ana_post` 32 (built in `plans()`), the lengths `ana_post_avx` reads.
+        unsafe { ana_post_avx(p, a, out) };
+        return;
+    }
+    ana_post_scalar(p, a, out);
+}
+
+/// The scalar oracle of [`ana_post`].
+fn ana_post_scalar(p: &Plans, a: &[Cpx; 64], out: &mut [Cpx; 32]) {
+    for (k, o) in out.iter_mut().enumerate() {
+        *o = cmul(a[k], p.ana_post[k]);
+    }
+}
+
+/// AVX twin of [`ana_post`], four complex products per op: `a·Re(w) -/+
+/// swap(a)·Im(w)` via `addsub` is the scalar's `a0·b0 − a1·b1` and
+/// `a1·b0 + a0·b1` (the same two products and one sum or difference per lane;
+/// the operands of the sum commute exactly), with no FMA, as in the FFT twin.
+/// Bit-identical (`ana_post_matches_scalar`).
+///
+/// # Safety
+/// AVX must be available; `p.ana_post.len() >= 32`. A trip at `k` reads
+/// `a[k..k + 4]` and `ana_post[k..k + 4]` and writes `out[k..k + 4]`, `k + 4 <= 32`.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx")]
+unsafe fn ana_post_avx(p: &Plans, a: &[Cpx; 64], out: &mut [Cpx; 32]) {
+    use std::arch::x86_64::*;
+    debug_assert!(p.ana_post.len() >= 32);
+    let (ap, wp, op) = (
+        a.as_ptr().cast::<f32>(),
+        p.ana_post.as_ptr().cast::<f32>(),
+        out.as_mut_ptr().cast::<f32>(),
+    );
+    let mut k = 0;
+    while k < 32 {
+        let x = _mm256_loadu_ps(ap.add(2 * k));
+        let w = _mm256_loadu_ps(wp.add(2 * k));
+        let xs = _mm256_permute_ps::<0b10_11_00_01>(x);
+        let t = _mm256_addsub_ps(
+            _mm256_mul_ps(x, _mm256_moveldup_ps(w)),
+            _mm256_mul_ps(xs, _mm256_movehdup_ps(w)),
+        );
+        _mm256_storeu_ps(op.add(2 * k), t);
+        k += 4;
+    }
 }
 
 /// The analysis front end for one slot: window the 320-sample segment, fold it
@@ -511,6 +562,25 @@ mod tests {
             ana_fold_scalar(p, &seg, &mut b);
             let bits = |x: &[Cpx; 64]| x.iter().flatten().map(|v| v.to_bits()).collect::<Vec<_>>();
             assert_eq!(bits(&a), bits(&b));
+        }
+    }
+
+    #[test]
+    fn ana_post_matches_scalar() {
+        let mut seed = 0x1b87_3593u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let e = (seed >> 24) as i32 - 128;
+            (seed as i32 as f32) * 2f32.powi(e / 8 - 31)
+        };
+        let p = plans();
+        for _ in 0..500 {
+            let a: [Cpx; 64] = std::array::from_fn(|_| [rnd(), rnd()]);
+            let (mut x, mut y) = ([[7f32; 2]; 32], [[7f32; 2]; 32]);
+            ana_post(p, &a, &mut x);
+            ana_post_scalar(p, &a, &mut y);
+            let bits = |v: &[Cpx; 32]| v.iter().flatten().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&x), bits(&y));
         }
     }
 
