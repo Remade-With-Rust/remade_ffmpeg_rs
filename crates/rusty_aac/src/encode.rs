@@ -2742,17 +2742,41 @@ pub(crate) fn detect_transients(chan: &[f32], nframes: usize) -> Vec<bool> {
 /// Used by the Rung 0 shape gate as a transient veto; it is also the signal arm
 /// A9 will replace the detector's threshold with.
 pub(crate) fn frame_attack_ratios(chan: &[f32], nframes: usize) -> Vec<f32> {
+    frame_attack_ratios_with(chan, nframes, false)
+}
+
+/// Energy of the [`SHORT_HALF`]-sample sub-block of `chan` starting at
+/// `start` (samples past the end are silence). With `highpass`, of the
+/// second difference `x[n] - 2x[n-1] + x[n-2]` instead (samples before 0 are
+/// silence): a +12 dB/octave tilt, so an attack carried by its high
+/// frequencies stands out over a sustained low-frequency body.
+fn sub_block_energy(chan: &[f32], start: usize, highpass: bool) -> f64 {
+    let at = |i: usize| f64::from(chan.get(i).copied().unwrap_or(0.0));
+    (start..start + SHORT_HALF)
+        .map(|n| {
+            let x = if highpass {
+                let x1 = if n >= 1 { at(n - 1) } else { 0.0 };
+                let x2 = if n >= 2 { at(n - 2) } else { 0.0 };
+                at(n) - 2.0 * x1 + x2
+            } else {
+                at(n)
+            };
+            x * x
+        })
+        .sum()
+}
+
+/// [`frame_attack_ratios`] on plain (`highpass = false`) or high-passed
+/// sub-block energies (see [`sub_block_energy`]).
+pub(crate) fn frame_attack_ratios_with(chan: &[f32], nframes: usize, highpass: bool) -> Vec<f32> {
     let mut sub: Vec<f64> = Vec::with_capacity(nframes * 8);
     for f in 0..nframes {
         for sb in 0..8 {
-            let start = f * FRAME_LEN + sb * SHORT_HALF;
-            let e: f64 = (0..SHORT_HALF)
-                .map(|i| {
-                    let x = f64::from(chan.get(start + i).copied().unwrap_or(0.0));
-                    x * x
-                })
-                .sum();
-            sub.push(e);
+            sub.push(sub_block_energy(
+                chan,
+                f * FRAME_LEN + sb * SHORT_HALF,
+                highpass,
+            ));
         }
     }
     let mean_e = sub.iter().sum::<f64>() / sub.len().max(1) as f64;
@@ -2793,9 +2817,13 @@ pub(crate) fn frame_attack_ratios(chan: &[f32], nframes: usize) -> Vec<f32> {
 /// This is not merely a quality knob: arm A1 (short-block psy) can only reach
 /// frames that are coded as short blocks, so a detector that never fires makes A1
 /// unmeasurable. A9 is A1's prerequisite.
-pub(crate) fn detect_transients_relative(chan: &[f32], nframes: usize) -> Vec<bool> {
+pub(crate) fn detect_transients_relative(
+    chan: &[f32],
+    nframes: usize,
+    highpass: bool,
+) -> Vec<bool> {
     const RATIO: f32 = 10.0;
-    let ratios = frame_attack_ratios(chan, nframes);
+    let ratios = frame_attack_ratios_with(chan, nframes, highpass);
     (0..nframes)
         .map(|f| f > 0 && ratios.get(f).copied().unwrap_or(1.0) > RATIO)
         .collect()
@@ -3975,6 +4003,12 @@ pub struct AacEncoderConfig {
     /// **Arm A13** — split a channel pair's bit budget by perceptual demand
     /// rather than evenly. Default `false` (byte-identical).
     pub stereo_bit_split: bool,
+    /// Run the level-invariant transient detector (arm A9) on a high-passed
+    /// signal (second difference, +12 dB/octave). A plucked or struck note
+    /// whose attack lives in its high frequencies, over a sustained body that
+    /// dominates the plain energy, is then switched to short blocks. Default
+    /// `false` (byte-identical). No effect with `relative_transients` off.
+    pub transient_highpass: bool,
     /// Choose each frame's codebooks by a Viterbi trellis over `section_data`
     /// (spectral bits plus section headers, an all-zero band free to ride in
     /// a neighbouring section) instead of the cheapest book band by band,
@@ -4003,6 +4037,7 @@ impl Default for AacEncoderConfig {
             pns: false,
             intensity: false,
             stereo_bit_split: true,
+            transient_highpass: false,
             section_trellis: false,
         }
     }
@@ -4155,6 +4190,7 @@ pub struct AacEncoder {
     pns: bool,
     intensity: bool,
     stereo_bit_split: bool,
+    transient_highpass: bool,
     section_trellis: bool,
     win: Vec<f32>,
     /// The KBD long window (α = 4.0), matching the decoder's. Built once.
@@ -4193,6 +4229,7 @@ impl AacEncoder {
             pns: config.pns,
             intensity: config.intensity,
             stereo_bit_split: config.stereo_bit_split,
+            transient_highpass: config.transient_highpass,
             section_trellis: config.section_trellis,
             win: Vec::new(),
             win_kbd: Vec::new(),
@@ -4621,7 +4658,7 @@ impl AacEncoder {
     /// Transient flags for one channel, under the configured detector (arm A9).
     fn transients(&self, chan: &[f32], nframes: usize) -> Vec<bool> {
         if self.relative_transients {
-            detect_transients_relative(chan, nframes)
+            detect_transients_relative(chan, nframes, self.transient_highpass)
         } else {
             detect_transients(chan, nframes)
         }
@@ -4722,17 +4759,28 @@ impl AacEncoder {
     }
 
     /// Sub-block energies of frame `f` of channel `ch`, zero past the input.
-    fn sub_energies(&self, ch: usize, f: usize) -> [f64; 8] {
+    /// With `highpass`, of the high-passed signal (see [`sub_block_energy`]);
+    /// its first two samples need the previous block, which is still held
+    /// (or, at the stream's start, silence, as in the whole-clip detector).
+    fn sub_energies(&self, ch: usize, f: usize, highpass: bool) -> [f64; 8] {
         let chan = &self.chans[ch];
         let at = (f - self.base_block) * FRAME_LEN;
-        std::array::from_fn(|sb| {
-            (0..SHORT_HALF)
-                .map(|i| {
-                    let x = f64::from(chan.get(at + sb * SHORT_HALF + i).copied().unwrap_or(0.0));
-                    x * x
-                })
-                .sum()
-        })
+        if highpass && self.base_block > 0 {
+            // `chan[0]` is not the stream's first sample: give the filter the
+            // two samples before `at` from the buffer (held back to block
+            // `base_block`, so `at >= FRAME_LEN` whenever `f > base_block`).
+            return std::array::from_fn(|sb| {
+                let start = at + sb * SHORT_HALF;
+                if start >= 2 {
+                    // Past the buffered input (the flush frames) this is an
+                    // empty slice, and the energy that of silence.
+                    sub_block_energy(chan.get(start - 2..).unwrap_or(&[]), 2, true)
+                } else {
+                    sub_block_energy(chan, start, true)
+                }
+            });
+        }
+        std::array::from_fn(|sb| sub_block_energy(chan, at + sb * SHORT_HALF, highpass))
     }
 
     /// Streaming: analyse the frames now complete, finalise the window
@@ -4771,7 +4819,8 @@ impl AacEncoder {
         while st.analysed < avail {
             let f = st.analysed;
             for ch in 0..self.channels {
-                let sub = self.sub_energies(ch, f);
+                let sub =
+                    self.sub_energies(ch, f, self.relative_transients && self.transient_highpass);
                 let flag = st.det[ch].frame(&sub, f, self.relative_transients);
                 st.flags[ch].push(flag);
             }

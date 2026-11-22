@@ -54,6 +54,9 @@ fn main() {
     if on("sect") {
         cfg.section_trellis = true;
     }
+    if on("thp") {
+        cfg.transient_highpass = true;
+    }
     if on("a7") {
         cfg.intensity = true;
     }
