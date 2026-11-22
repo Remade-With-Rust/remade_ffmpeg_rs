@@ -7,6 +7,12 @@ decoder output is bit-exact and stable; encoder output may change in minor
 releases when quality improves. Engineering notes for releases before 1.0.0
 are in [`docs/history.md`](docs/history.md).
 
+## [1.2.1](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_mp3-v1.2.0...rusty_mp3-v1.2.1) - 2026-11-22
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [1.2.0](https://github.com/Remade-With-Rust/remade_ffmpeg_rs/compare/rusty_mp3-v1.1.0...rusty_mp3-v1.2.0) - 2026-11-21
 
 ### Added
